@@ -166,3 +166,27 @@ def test_no_forced_embedding_sharing():
     # has_own_embed_tokens / has_own_lm_head instead of force-sharing.
     p = _make_proposer({"dspark_noise_token_id": 7, **_LAYER_IDS})
     assert p._force_share_target_embeddings is False
+
+
+@pytest.mark.parametrize(
+    "model_type,layer_fields,expected",
+    [
+        ("deepseek_v41", {"dspark_target_layer_ids": [37, 38, 39]}, [37, 38, 39]),
+        (
+            "deepseek_v41",
+            {"eagle_aux_hidden_state_layer_ids": [38, 39, 40]},
+            [38, 39, 40],
+        ),
+        ("qwen3", {"dspark_target_layer_ids": [1, 15, 30]}, [2, 16, 31]),
+        (
+            "qwen3",
+            {"eagle_aux_hidden_state_layer_ids": [2, 16, 31]},
+            [2, 16, 31],
+        ),
+    ],
+)
+def test_target_aux_capture_layer_mapping(model_type, layer_fields, expected):
+    p = _make_proposer(
+        {"model_type": model_type, "dspark_noise_token_id": 7, **layer_fields}
+    )
+    assert p._target_aux_layer_ids() == expected

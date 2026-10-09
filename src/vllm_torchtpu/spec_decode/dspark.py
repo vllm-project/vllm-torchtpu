@@ -86,6 +86,18 @@ class DSparkProposer(DFlashProposer):
         # DFlash 1 + K layout.
         return K if self.sample_from_anchor else K + 1
 
+    def _target_aux_layer_ids(self) -> list[int]:
+        hf_config = self.speculative_config.draft_model_config.hf_config
+        hf_dict = hf_config.to_dict()
+        if hf_dict.get("model_type") == "deepseek_v41":
+            aux_ids = hf_dict.get("eagle_aux_hidden_state_layer_ids")
+            if aux_ids:
+                return list(aux_ids)
+            # V4.1 DSpark conditions on layer inputs, which the delayed mHC
+            # target captures at the same index, rather than layer outputs.
+            return list(self._target_layer_ids)
+        return super()._target_aux_layer_ids()
+
     def load_model(self, target_model) -> None:
         super().load_model(target_model)
         for attr in (

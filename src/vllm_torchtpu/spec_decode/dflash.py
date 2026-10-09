@@ -138,10 +138,13 @@ class DFlashProposer:
         layout overrides this to K (the anchor is the first prediction)."""
         return K + 1
 
+    def _target_aux_layer_ids(self) -> list[int]:
+        return [idx + 1 for idx in self._target_layer_ids]
+
     def load_model(self, target_model) -> None:
         """Load the draft model, share embeddings, and tag target layers."""
         # Tag the target model to extract aux hidden states
-        target_layers = [idx + 1 for idx in self._target_layer_ids]
+        target_layers = self._target_aux_layer_ids()
         if hasattr(target_model, "set_aux_hidden_state_layers"):
             target_model.set_aux_hidden_state_layers(tuple(target_layers))
         elif hasattr(target_model, "model") and hasattr(
@@ -153,7 +156,8 @@ class DFlashProposer:
                 "Target model does not support _set_aux_hidden_state_layers"
             )
         logger.info(
-            "Tagged target model for DFlash auxiliary hidden states extraction."
+            "Tagged target model for draft auxiliary hidden states: %s",
+            target_layers,
         )
 
         # Snapshot the target's attention layer names before the draft model
