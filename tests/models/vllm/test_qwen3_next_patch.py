@@ -17,7 +17,6 @@ patch and the FP8 fusions."""
 import hashlib
 import inspect
 from types import SimpleNamespace
-from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -38,13 +37,13 @@ from vllm_torchtpu.models.vllm.qwen3_next_patch import (
     UPSTREAM_DECODER_LAYER_FORWARD,
     UPSTREAM_MODEL_FORWARD,
     UPSTREAM_MTP_FORWARD,
-    _check_tokens_divide_by_tp,
     compute_fused_gate_and_shared_expert,
     maybe_flip_gdn_in_proj_qkvz_weight,
     maybe_patch_qwen3_next,
     maybe_setup_fused_gate_se,
     pallas_sigmoid_gate_quant,
     patched_decoder_layer_forward,
+    patched_model_forward,
     patched_mtp_forward,
     patched_sparse_moe_forward,
     sigmoid_gate_quant_reference,
@@ -63,8 +62,8 @@ PINNED_MODEL_FORWARD_HASH = (
     "a9c1265f14e88e54138394b9038db621813bb6357a9077ad50d1691db0ac4398"
 )
 # patched_mtp_forward copies this drafter forward (Qwen3Next and Qwen3.5 share
-# its source), and tpu_platform admits MTP under SP because it chunks before
-# the MTP layer and all-gathers after the final norm.
+# its source), and tpu_platform admits MTP under SP because its layer slices
+# the rows after attention and it all-gathers after the final norm.
 PINNED_MTP_FORWARD_HASH = (
     "54034d76e48fccf2cd98bcf05b831207580ad9e8886e6e387193e1bd70e9e472"
 )
@@ -130,8 +129,8 @@ def test_upstream_mtp_forwards_unchanged():
     )
     assert _source_hash(UPSTREAM_QWEN3_5_MTP_FORWARD) == PINNED_MTP_FORWARD_HASH, (
         "Upstream Qwen3_5MultiTokenPredictor.forward has drifted. Re-sync "
-        "patched_mtp_forward and re-check that it still chunks and all-gathers "
-        "under SP before admitting MTP in tpu_platform.py."
+        "patched_mtp_forward and re-check that its layer still slices and it "
+        "all-gathers under SP before admitting MTP in tpu_platform.py."
     )
 
 
@@ -336,48 +335,119 @@ def test_patched_decoder_layer_forward_fp8_gather(monkeypatch):
     assert x_s.shape == (num_tokens, 1)
 
 
-def test_patched_decoder_layer_forward_mtp_entry_prechunked(monkeypatch):
-    """Verify MTP layer entry: residual=None with pre-chunked hidden_states."""
-    full_num_tokens = 16
-    tp_world_size = 8
-    chunk = full_num_tokens // tp_world_size
-    hidden_size = 64
+def _record_all_gathers(monkeypatch) -> list[int]:
+    """Record the rows each (fake) all-gather receives."""
+    rows: list[int] = []
+    gather = patch_mod.tensor_model_parallel_all_gather
 
-    _fake_tp_collectives(monkeypatch, tp_world_size)
-    _sequence_parallel(monkeypatch, min_rows=0)
+    def all_gather(x, dim=0):
+        rows.append(x.shape[dim])
+        return gather(x, dim)
 
-    layer = MagicMock()
-    layer.use_attn_reduce_scatter_for_moe = True
-    layer.layer_type = "linear_attention"
-    layer.layer_scale = False
-    layer.input_layernorm.side_effect = lambda h, r=None: (h, r) if r is not None else h
-    layer.linear_attn.side_effect = lambda hidden_states: hidden_states
-    layer.post_attention_layernorm.side_effect = lambda h, r: (h, r)
-    layer.mlp.side_effect = lambda h, already_sequence_parallel=False: h
+    monkeypatch.setattr(patch_mod, "tensor_model_parallel_all_gather", all_gather)
+    return rows
 
-    prechunked_hidden = torch.randn(chunk, hidden_size)
-    positions = torch.arange(full_num_tokens).unsqueeze(0)
 
-    out_h, out_r = patched_decoder_layer_forward(
-        layer,
-        hidden_states=prechunked_hidden,
-        residual=None,
-        positions=positions,
+def test_patched_decoder_layer_forward_first_layer_replicated(monkeypatch):
+    """The first layer (residual None) runs attention on the replicated rows
+    without an all-gather, then the reduce-scatter and the residual both leave
+    this rank's slice for the MoE."""
+
+    tp = 2
+    _fake_tp_collectives(monkeypatch, tp)
+    gathered = _record_all_gathers(monkeypatch)
+    _sequence_parallel(monkeypatch, min_rows=0, fp8_gather=True)
+
+    attn_calls: list[dict[str, object]] = []
+    mlp_kwargs: list[dict[str, object]] = []
+    layer = _sp_dummy_layer(attn_calls, mlp_kwargs)
+    layer._tpu_sp_rank = torch.tensor([0], dtype=torch.int32)
+    num_tokens = 8
+    chunk = num_tokens // tp
+    hidden = torch.randn(num_tokens, 64)
+
+    patched_h, patched_r = patched_decoder_layer_forward(
+        layer, hidden, None, torch.arange(num_tokens)
     )
 
-    assert out_h.shape == (chunk, hidden_size)
-    assert out_r.shape == (chunk, hidden_size)
+    attn_shard = (hidden[:chunk] * 1.05 + 1.0) * tp
+    torch.testing.assert_close(patched_h, attn_shard * 1.1 * 2.0)
+    torch.testing.assert_close(patched_r, hidden[:chunk] + attn_shard * 0.1)
+    assert gathered == []
+    # Replicated rows reach attention unquantized, even with fp8 gather on.
+    assert attn_calls == [{}]
+    assert mlp_kwargs == [{"already_sequence_parallel": True}]
 
 
-def _dummy_mtp(layer_rows: list[int]):
-    """An MTP predictor whose single layer records the rows it receives."""
+def test_patched_model_forward_sequence_parallel(monkeypatch):
+    """The model does not chunk at entry: the first layer gets every row and
+    slices them, later layers get the slice, and the final norm's output (with
+    the aux hidden states) is all-gathered back to every row."""
+
+    tp = 2
+    _fake_tp_collectives(monkeypatch, tp)
+    gathered = _record_all_gathers(monkeypatch)
+    _sequence_parallel(monkeypatch, min_rows=0)
+    monkeypatch.setattr(
+        patch_mod,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    seen: list[tuple[int, bool]] = []
+
+    class Layer:
+        def __init__(self):
+            self.inner = _sp_dummy_layer([], [])
+            self._tpu_sp_rank = torch.tensor([0], dtype=torch.int32)
+            self.inner._tpu_sp_rank = self._tpu_sp_rank
+
+        def __call__(self, positions, hidden_states, residual):
+            seen.append((hidden_states.shape[0], residual is None))
+            return patched_decoder_layer_forward(
+                self.inner, hidden_states, residual, positions
+            )
+
+    def add_aux(aux, layer_idx, hidden_states, residual):
+        if layer_idx in (0, 2):
+            aux.append(hidden_states if residual is None else hidden_states + residual)
+        return aux
+
+    num_tokens = 8
+    chunk = num_tokens // tp
+    embeds = torch.randn(num_tokens, 64)
+    model = SimpleNamespace(
+        use_sequence_parallel=True,
+        start_layer=0,
+        end_layer=2,
+        layers=[Layer(), Layer()],
+        embed_input_ids=lambda ids: embeds,
+        norm=lambda h, r: (h + r, r),
+        _maybe_add_hidden_state=add_aux,
+    )
+
+    hidden, aux = patched_model_forward(
+        model, torch.zeros(num_tokens, dtype=torch.long), torch.arange(num_tokens)
+    )
+
+    assert seen == [(num_tokens, True), (chunk, False)]
+    # Layer 1's attention input, then the final hidden + aux gather.
+    assert gathered == [chunk, chunk]
+    assert hidden.shape == (num_tokens, 64)
+    assert [a.shape for a in aux] == [(num_tokens, 64), (num_tokens, 64)]
+    torch.testing.assert_close(aux[0][:chunk], embeds[:chunk])
+
+
+def _dummy_mtp(layer_rows: list[int], out_rows_divisor: int):
+    """An MTP predictor whose single layer records the rows it receives and
+    returns 1/`out_rows_divisor` of them, like a layer slicing after attention."""
 
     class Layer:
         use_attn_reduce_scatter_for_moe = True
 
         def __call__(self, positions, hidden_states, residual):
             layer_rows.append(hidden_states.shape[0])
-            return hidden_states, hidden_states
+            out = hidden_states.narrow(0, 0, hidden_states.shape[0] // out_rows_divisor)
+            return out, out
 
     return SimpleNamespace(
         num_mtp_layers=1,
@@ -392,8 +462,9 @@ def _dummy_mtp(layer_rows: list[int]):
 
 @pytest.mark.parametrize("with_step0_gather", [False, True])
 def test_patched_mtp_forward_sequence_parallel(monkeypatch, with_step0_gather):
-    """The drafter chunks before its layer and gathers after the norm, unless
-    the step-0 post-attention gather keeps its rows replicated."""
+    """The drafter hands its layer every row and gathers the layer's slice
+    after the norm, unless the step-0 post-attention gather keeps its rows
+    replicated."""
 
     tp = 2
     _fake_tp_collectives(monkeypatch, tp)
@@ -403,13 +474,8 @@ def test_patched_mtp_forward_sequence_parallel(monkeypatch, with_step0_gather):
         "get_pp_group",
         lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
     )
-    monkeypatch.setattr(
-        patch_mod.qwen3_next,
-        "sequence_parallel_chunk",
-        lambda x: x.narrow(0, 0, x.shape[0] // tp),
-    )
     layer_rows: list[int] = []
-    model = _dummy_mtp(layer_rows)
+    model = _dummy_mtp(layer_rows, 1 if with_step0_gather else tp)
     num_tokens = 8
     indices = torch.arange(2) if with_step0_gather else None
     with step0_post_attn_gather_context(indices):
@@ -419,21 +485,8 @@ def test_patched_mtp_forward_sequence_parallel(monkeypatch, with_step0_gather):
             positions=torch.arange(num_tokens),
             hidden_states=torch.ones(num_tokens, 4),
         )
-    assert layer_rows == [num_tokens if with_step0_gather else num_tokens // tp]
+    assert layer_rows == [num_tokens]
     assert out.shape == (num_tokens, 4)
-
-
-def test_check_tokens_divide_by_tp():
-    """Divisibility check passes when divisible, raises RuntimeError when not."""
-    patch_target = (
-        "vllm_torchtpu.models.vllm.qwen3_next_patch."
-        "get_tensor_model_parallel_world_size"
-    )
-    with patch(patch_target, return_value=8):
-        _check_tokens_divide_by_tp(16)
-        _check_tokens_divide_by_tp(8)
-        with pytest.raises(RuntimeError):
-            _check_tokens_divide_by_tp(7)
 
 
 def test_forward_patch_skipped_with_flags_off(restore_forwards):
