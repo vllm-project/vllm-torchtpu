@@ -719,9 +719,10 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
     def test_split_q_lse_bit_identical(self, query_tokens, seq_q, topk_cap):
         """Split q (`q_pe=`) and lane-dense lse against the concat path.
 
-        TPU_DCP_MLA_SPLIT_Q_LSE: the kernel joins q_nope and q_pe in VMEM and
-        carries lse as f32[T, H]. Every arm (split only, lse only, both) must
-        match the incumbent bit for bit on every row, padding rows included
+        TPU_MLA_SPARSE_SPLIT_Q (with the lse the DCP caller asks for): the
+        kernel joins q_nope and q_pe in VMEM and carries lse as f32[T, H].
+        Every arm (split only, lse only, both) must match the incumbent bit
+        for bit on every row, padding rows included
         (they keep q_nope / the sentinel in both), and keep the DCP empty-row
         contract (lse == -inf, out finite) after the `owns` mask.
         """
