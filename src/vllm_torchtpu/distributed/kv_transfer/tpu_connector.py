@@ -3809,8 +3809,8 @@ class TPURaidenConnectorWorker:
             # (TPU_RAIDEN_TRANSFER_PARALLELISM = PP * PCP) lowering its own
             # tokens and GDN heads of its stage's layers.
             # TODO(yinlin): reachable once pp_validation admits context-parallel
-            # stages, which needs a torch_tpu that builds a stage's meshes over
-            # the stage's process group (google-pytorch/torch_tpu#4387).
+            # stages, i.e. once the pinned torch_tpu builds a stage group's meshes
+            # (google-pytorch/torch_tpu#4387, for a group made standalone).
             dcp_size = int(parallel_config.decode_context_parallel_size)
             if (
                 _raiden_seq_on_lane_layout()
@@ -3913,11 +3913,15 @@ class TPURaidenConnectorWorker:
         destination = derive_gdn_head_geometry(
             source.num_kq_heads, source.num_v_heads, _raiden_dst_shards()
         )
-        # A sharded source with a whole number of destination shards per
-        # rank fans its heads out, copying Q/K rows to every destination
+        # A sharded pipeline source with a whole number of destination shards
+        # per rank fans its heads out, copying Q/K rows to every destination
         # replica (seq_on_lane.lower_gdn_state_fanout_spans_sol).
+        # TODO(yinlin): admit the fan-out for other producers once startup
+        # rejects the shapes the [Q|K|V] conv lowering cannot represent; they
+        # keep the refusal below until then.
         if (
-            source.parallel_size > 1
+            _engine_is_pipeline(self.vllm_config)
+            and source.parallel_size > 1
             and destination.parallel_size > source.parallel_size
             and destination.parallel_size % source.parallel_size == 0
         ):
@@ -3936,9 +3940,9 @@ class TPURaidenConnectorWorker:
             and source.parallel_size % destination.parallel_size
         ):
             raise ValueError(
-                "GDN destination shards must divide producer parallelism, or "
-                "be a multiple of it, unless the producer holds the full "
-                f"state: source={source.parallel_size}, "
+                "GDN destination shards must divide producer parallelism (or, "
+                "for a pipeline producer, be a multiple of it), unless the "
+                f"producer holds the full state: source={source.parallel_size}, "
                 f"destination={destination.parallel_size}"
             )
 

@@ -319,6 +319,8 @@ def test_pd_topology_rejects_invalid_layout_or_dcp(monkeypatch, layout, dcp):
     [
         (4, 2, 4, 4, 32, "Q/K replication"),
         (1, 1, 8, 4, 32, "Q/K replication"),
+        (2, 2, 8, 16, 32, "producer parallelism"),  # Fan-out outside a pipeline.
+        (8, 1, 32, 16, 128, "Q/K replication"),  # Fan-out outside a pipeline.
         (4, 1, 6, 12, 24, "producer parallelism"),
     ],
 )
@@ -351,10 +353,7 @@ def test_gdn_unsupported_resharding_fails_before_store_or_pool_registration(
         (8, 1, 2, 16, 32),  # Existing PCP -> TP2.
         (1, 1, 8, 16, 32),  # Existing full-state producer fan-out.
         (1, 1, 1, 16, 32),
-        (8, 1, 32, 16, 128),  # PP4 x PCP8 stage: fan-out grows Q/K replicas.
-        (2, 2, 8, 16, 32),  # Sharded fan-out without Q/K replication.
         (8, 2, 16, 8, 64),  # Half-width PCP8 x TP2 -> TP16: 1:1.
-        (8, 1, 16, 8, 64),  # Half-width PP2 x PCP8 stage -> TP16: fan-out.
     ],
 )
 def test_gdn_supported_transfer_geometry(monkeypatch, pcp, tp, dtp, k, v):
@@ -366,8 +365,8 @@ def test_gdn_supported_transfer_geometry(monkeypatch, pcp, tp, dtp, k, v):
     worker._validate_gdn_transfer_geometry(worker._gdn_head_geometry())
 
 
-def _pp_pcp_worker(monkeypatch, pp=4, pcp=8, tp=1, producer=True):
-    _environment(monkeypatch, pcp=pp * pcp, tp=tp, dtp=32)
+def _pp_pcp_worker(monkeypatch, pp=4, pcp=8, tp=1, producer=True, dtp=32):
+    _environment(monkeypatch, pcp=pp * pcp, tp=tp, dtp=dtp)
     worker = _make_raiden_worker(
         is_producer=producer,
         pcp_size=pcp,
@@ -464,6 +463,21 @@ def test_pp_pcp_gdn_geometry_fans_out_to_tp32(monkeypatch):
         geometry.kq_replication_factor,
     ) == (8, 2, 16, 1)
     worker._validate_gdn_transfer_geometry(geometry)
+
+
+@pytest.mark.parametrize(
+    "pp,pcp,dtp,k,v",
+    [
+        (4, 8, 32, 16, 128),  # PP4 x PCP8 -> TP32: fan-out grows Q/K replicas.
+        (2, 8, 16, 8, 64),  # Half-width PP2 x PCP8 -> TP16.
+    ],
+)
+def test_pp_pcp_gdn_fan_out_is_admitted(monkeypatch, pp, pcp, dtp, k, v):
+    worker = _pp_pcp_worker(monkeypatch, pp=pp, pcp=pcp, dtp=dtp)
+    config = worker.vllm_config.model_config.hf_config
+    config.linear_num_key_heads = k
+    config.linear_num_value_heads = v
+    worker._validate_gdn_transfer_geometry(worker._gdn_head_geometry())
 
 
 def _pp_pcp_scheduler(monkeypatch, parallelism):
