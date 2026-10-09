@@ -246,7 +246,8 @@ def _patch_wan_ffn_gelu_fence() -> None:
 
 
 # TODO: Remove once vLLM-Omni synchronizes the device at the end of its
-# startup warmup (e.g. current_omni_platform.synchronize() in _dummy_run).
+# startup warmup (e.g. self.executor.collective_rpc("synchronize_device") in
+# _dummy_run).
 def _patch_diffusion_startup_warmup_sync() -> None:
     """Synchronize the device after vLLM-Omni's diffusion startup warmup.
 
