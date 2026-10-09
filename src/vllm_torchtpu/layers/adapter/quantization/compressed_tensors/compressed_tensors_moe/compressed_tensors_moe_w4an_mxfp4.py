@@ -27,16 +27,10 @@ from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_ten
     release_memory_to_os,
 )
 from vllm_torchtpu.layers.core.quantization import e8m0_to_fp32
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.adapter.quantization.configs import TpuRoutedExperts
-
-
-def _fresh(t: torch.Tensor) -> torch.Tensor:
-    """Allocate a fresh contiguous device buffer (breaks view/stride chains so
-    the torch_tpu pallas boundary ships a plain row-major buffer)."""
-    return torch.empty(t.shape, dtype=t.dtype, device=t.device).copy_(t)
 
 
 class VllmCompressedTensorsW4ANMxfp4MoEMethod(
@@ -196,25 +190,25 @@ class VllmCompressedTensorsW4ANMxfp4MoEMethod(
 
             # Apply XLA fused requantization and kmajor layout shift
             w13_weight, w13_scale_4d = requant_load_kmajor_fp4(
-                _fresh(w13_weight_packed), w13_scale, requant_block
+                fresh_buffer(w13_weight_packed), w13_scale, requant_block
             )
             w2_weight, w2_scale_4d = requant_load_kmajor_fp4(
-                _fresh(w2_weight_packed), w2_scale, requant_block
+                fresh_buffer(w2_weight_packed), w2_scale, requant_block
             )
         else:
 
             def _to_kernel_scale(scale: torch.Tensor) -> torch.Tensor:
                 # scale shape: [E, N, num_blocks]
                 # gmm_v2 scale layout: [E, num_blocks, 1, N]
-                return _fresh(scale.movedim(-1, 1).unsqueeze(-2))
+                return fresh_buffer(scale.movedim(-1, 1).unsqueeze(-2))
 
             w13_scale_4d = _to_kernel_scale(w13_scale)
             w2_scale_4d = _to_kernel_scale(w2_scale)
 
             # Unpack to native fp4 in the kernel's K-major layout once at load
             # [E, N, K/2] uint8 -> [E, K/2, N] torch.float4_e2m1fn_x2
-            w13_weight = load_kmajor_fp4(_fresh(w13_weight_packed))
-            w2_weight = load_kmajor_fp4(_fresh(w2_weight_packed))
+            w13_weight = load_kmajor_fp4(fresh_buffer(w13_weight_packed))
+            w2_weight = load_kmajor_fp4(fresh_buffer(w2_weight_packed))
 
         # Clean up CPU scratchpads
         for parameter in (

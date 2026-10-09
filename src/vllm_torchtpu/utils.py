@@ -348,3 +348,20 @@ def synchronize_tensors(
     from torch_tpu._internal import sync
 
     sync.synchronize(tensors=tensors, wait=wait)
+
+
+def fresh_buffer(t: torch.Tensor) -> torch.Tensor:
+    """Return a copy of `t` backed by a fresh device buffer of its own shape.
+
+    torch_tpu hands a compiled executable the buffer behind each argument. If a
+    persistent tensor's storage is a buffer of a different shape (e.g. it is a
+    view, or was filled by `copy_` from a view), torch_tpu re-materializes it as
+    a standalone `tt_jit_as_strided` program before every forward. Calling this
+    once at load time removes that per-step program.
+
+    `torch.empty(...).copy_(t)` is not enough: torch_tpu may satisfy a
+    same-shape, same-dtype `copy_` by aliasing the destination's storage to
+    `t`'s base buffer, which keeps the shape mismatch. The `+ 0` forces a real
+    op whose output buffer has `t`'s logical shape.
+    """
+    return torch.clone(t, memory_format=torch.contiguous_format) + 0
