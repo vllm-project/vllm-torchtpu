@@ -228,9 +228,11 @@ A stage may instead span a prefill context-parallel group
 (`--prefill-context-parallel-size`), which splits each chunk's attention over
 the stage's cores; MoE models then need `--enable-expert-parallel`. This needs
 a torch_tpu that compiles a stage's kernels and collectives for the stage's
-devices only (google-pytorch/torch_tpu#4387). A two-core stage must not be the
-two cores of one chip: set `VLLM_TPU_DEVICE_ORDER` to the device each local
-rank binds, e.g. `0,2,1,3,4,6,5,7` for four stages of two cores on one host.
+devices only (the 2026-09-28 build of google-pytorch/torch_tpu#4387); on a
+torch_tpu that builds world-size meshes only, the platform refuses such stages.
+A two-core stage must not be the two cores of one chip: set
+`VLLM_TPU_DEVICE_ORDER` to the device each local rank binds, e.g.
+`0,2,1,3,4,6,5,7` for four stages of two cores on one host.
 
 ```bash
 python3 examples/offline_inference.py \

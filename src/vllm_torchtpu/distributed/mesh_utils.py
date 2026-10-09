@@ -182,6 +182,9 @@ def get_stage_mesh(
     """
     from torch_tpu._internal.pallas import get_pallas_mesh
 
+    # TODO(yinlin): torch_tpu releases refuse a mesh smaller than the world
+    # here, and pp_validation turns such stages away; make the stage group
+    # standalone once the pinned torch_tpu has google-pytorch/torch_tpu#4387.
     mesh = get_pallas_mesh(
         axis_names=axis_names,
         mesh_shape=mesh_shape,
