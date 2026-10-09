@@ -461,20 +461,24 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
 
     @parameterized.product(
         (
-            {"query_tokens": 16, "real_tokens": 13, "chunk": 64},
-            {"query_tokens": 128, "real_tokens": 100, "chunk": 64},
-            {"query_tokens": 128, "real_tokens": 128, "chunk": 128},
+            {"query_tokens": 16, "real_tokens": 13, "chunk": 64, "late": False},
+            {"query_tokens": 128, "real_tokens": 100, "chunk": 64, "late": False},
+            {"query_tokens": 128, "real_tokens": 128, "chunk": 128, "late": False},
+            # Only the last chunk overflows the cap.
+            {"query_tokens": 128, "real_tokens": 128, "chunk": 64, "late": True},
         ),
         topk_cap=(256, 512),
     )
     def test_topk_cap_matches_uncapped(
-        self, query_tokens, real_tokens, chunk, topk_cap
+        self, query_tokens, real_tokens, chunk, topk_cap, late
     ):
         """`topk_cap` against the uncapped SparseCore path, per real row.
 
         Counts span 1 to topk, so chunks hold rows within the cap, rows one
         past it, and rows reaching every window (2048), i.e. the in-kernel
-        multi-window fix-up and the window-major live bound.
+        multi-window fix-up and the window-major live bound. `late` caps every
+        row before the last chunk, so earlier chunks gather fewer windows than
+        the once-per-call window prep (`capped_window_indices`) translates.
         """
         if jax.devices()[0].platform != "tpu":
             self.skipTest("SparseCore cache-layout attention requires a TPU")
@@ -488,6 +492,10 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             query_tokens,
         )
         rng.shuffle(counts)
+        if late:
+            counts[: query_tokens - chunk] = np.minimum(
+                counts[: query_tokens - chunk], topk_cap
+            )
         live = np.arange(topk)[None, :] < counts[:, None]
         topk_idx = jnp.where(jnp.asarray(live), problem["topk"], -1)
         cu_q_lens = jnp.array([0, real_tokens], jnp.int32)
@@ -511,6 +519,9 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
                 **extra,
             )
 
+        # The capped run takes the window prep, not the full-width fallback.
+        capped_jaxpr = str(jax.make_jaxpr(lambda: run(topk_cap=topk_cap))())
+        self.assertIn("capped_window_indices", capped_jaxpr)
         (ref, ref_lse), (out, lse) = jax.block_until_ready(
             (run(), run(topk_cap=topk_cap))
         )
@@ -529,6 +540,82 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             np.abs(real - np.asarray(problem["q"], np.float32)[:real_tokens]).max(),
             2e-2,
         )
+
+    @parameterized.product(
+        (
+            {"page_size": 256, "total_pages": 2085, "pages_per_seq": 256},
+            {"page_size": 96, "total_pages": 1001, "pages_per_seq": 300},
+        ),
+        (
+            {"num_tokens": 16, "chunk": 16, "topk": 2048, "cap": 512},
+            {"num_tokens": 512, "chunk": 256, "topk": 2048, "cap": 512},
+            {"num_tokens": 128, "chunk": 64, "topk": 512, "cap": 128},
+        ),
+        block_tokens=(None, 8),
+    )
+    def test_capped_window_indices_match_reference(
+        self,
+        page_size,
+        total_pages,
+        pages_per_seq,
+        num_tokens,
+        chunk,
+        topk,
+        cap,
+        block_tokens,
+    ):
+        """`prepare_capped_window_indices` == window-major `prepare_gather_indices`.
+
+        Every live window, bit for bit, incl. the `-1` scatter (non-power-of-2
+        page counts and page sizes take the in-kernel f32 divmod).
+        """
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("Mosaic kernel requires a TPU")
+        rng = np.random.default_rng(num_tokens + topk + page_size)
+        num_seqs = 3
+        page_table = jnp.asarray(
+            rng.integers(0, total_pages, size=num_seqs * pages_per_seq), jnp.int32
+        )
+        cu_q_lens = jnp.array(
+            [0, num_tokens // 4, num_tokens // 2, num_tokens], jnp.int32
+        )
+        counts = rng.integers(0, topk + 1, size=num_tokens)
+        logical = rng.integers(0, pages_per_seq * page_size, size=(num_tokens, topk))
+        topk_idx = jnp.asarray(
+            np.where(np.arange(topk)[None] < counts[:, None], logical, -1), jnp.int32
+        )
+        _, phys = sparse_mla.prepare_gather_indices(
+            topk_idx,
+            page_table,
+            cu_q_lens,
+            page_size=page_size,
+            total_num_pages=total_pages,
+        )
+        windows = topk // cap
+        want = (
+            np.asarray(phys)
+            .reshape(num_tokens // chunk, chunk, windows, cap)
+            .transpose(0, 2, 1, 3)
+        )
+
+        def got(lw, total=total_pages):
+            out = sparse_mla.prepare_capped_window_indices(
+                topk_idx,
+                page_table,
+                cu_q_lens,
+                jnp.int32(lw),
+                chunk_size=chunk,
+                topk_cap=cap,
+                page_size=page_size,
+                total_num_pages=total,
+                block_tokens=block_tokens,
+            )
+            return np.asarray(out).reshape(num_tokens // chunk, windows, chunk, cap)
+
+        for lw in range(1, windows + 1):
+            np.testing.assert_array_equal(got(lw)[:, :lw], want[:, :lw])
+        # Positive control: a different scatter modulus moves the padding rows.
+        self.assertFalse(np.array_equal(got(windows, total_pages + 1), want))
 
     def test_topk_cap_validation(self):
         q = jnp.zeros((16, 8, HEAD_DIM), jnp.bfloat16)

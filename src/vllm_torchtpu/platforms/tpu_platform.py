@@ -406,6 +406,8 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
         "VLLM_TPU_INDEXER_KV_CACHE_MODE",
+        "TPU_DCP_INDEXER_A2A_MERGE",
+        "TPU_DCP_INDEXER_A2A_MIN_TOKENS",
         "TPU_USE_RAIDEN_KV_CACHE_MANAGER",
         "TPU_RAIDEN_GLM_ADMISSION",
         "TPU_KV_RESHARD_TRANSPORT",
@@ -438,14 +440,13 @@ class TpuPlatform(Platform):
         """Local physical chip count on this host, stable across contexts.
 
         Without this override, `device_count()` resolves dynamically to
-        `torch.tpu.device_count()` (see torch_tpu's device module), which
-        returns the *local* chip count outside any torch.distributed group
-        but drops to 1 (chips bound to this rank) once a real multi-host
-        `tpu_dist` process group is active — vLLM workers are one-process-
-        per-chip, so every rank observes exactly 1 there. Callers like
-        MessageQueue.create_from_process_group_single_reader use this value
-        as "how many ranks share this host" (the CUDA convention, where
-        device_count() stays host-wide regardless of the process's own
+        `torch.accelerator.device_count()`, which returns the *local* chip count
+        outside any torch.distributed group but drops to 1 (chips bound to this
+        rank) once a real multi-host `tpu_dist` process group is active — vLLM
+        workers are one-process-per-chip, so every rank observes exactly 1 there.
+        Callers like MessageQueue.create_from_process_group_single_reader use
+        this value as "how many ranks share this host" (the CUDA convention,
+        where device_count() stays host-wide regardless of the process's own
         device binding), so the dynamic proxy silently breaks cross-host
         same-node detection for every rank but the reader itself. Scanning
         /dev/vfio (or /dev/accel*) directly sidesteps the distributed
@@ -454,6 +455,38 @@ class TpuPlatform(Platform):
         from vllm_torchtpu.tpu_info import get_num_chips
 
         return get_num_chips()
+
+    @classmethod
+    def is_available(cls) -> bool:
+        return torch.accelerator.is_available()
+
+    @classmethod
+    def current_device(cls) -> int:
+        return torch.accelerator.current_device_index()
+
+    @classmethod
+    def current_device_index(cls) -> int:
+        return torch.accelerator.current_device_index()
+
+    @classmethod
+    def set_device(cls, device: torch.device | int) -> None:
+        torch.accelerator.set_device_index(device)
+
+    @classmethod
+    def set_device_index(cls, device: torch.device | int) -> None:
+        torch.accelerator.set_device_index(device)
+
+    @classmethod
+    def synchronize(cls, device: torch.device | int | None = None) -> None:
+        torch.accelerator.synchronize(device)
+
+    @classmethod
+    def current_stream(cls, device: torch.device | None = None) -> torch.Stream:
+        return torch.accelerator.current_stream(device)
+
+    @classmethod
+    def set_stream(cls, stream: torch.Stream) -> None:
+        torch.accelerator.set_stream(stream)
 
     @classmethod
     def get_worker_distributed_backend(cls, world_size: int) -> str:
@@ -702,6 +735,9 @@ class TpuPlatform(Platform):
 
             patch_executor_for_pp_wave(vllm_config)
             _configure_pipeline_chunks(vllm_config)
+            from vllm_torchtpu.core.pp_lazy_step import patch_engine_core_for_lazy_push
+
+            patch_engine_core_for_lazy_push(vllm_config)
 
         from vllm.config import CompilationMode
 
@@ -1282,10 +1318,15 @@ def _configure_sequence_parallel_moe(vllm_config: VllmConfig) -> None:
     parallel_config = vllm_config.parallel_config
     if not parallel_config.use_sequence_parallel_moe:
         return
-    if vllm_config.speculative_config is not None:
+    # The Qwen3.5 MoE drafter forward (Qwen3_5MultiTokenPredictor) already
+    # chunks to the local token shard and all-gathers after the final norm.
+    if (
+        vllm_config.speculative_config is not None
+        and vllm_config.speculative_config.method != "mtp"
+    ):
         raise ValueError(
-            "TPU_MOE_SEQUENCE_PARALLEL=1 does not yet cover the speculative "
-            "drafter; disable speculative decoding or wait for #1562."
+            "TPU_MOE_SEQUENCE_PARALLEL=1 covers only the MTP drafter; "
+            f"got speculative method {vllm_config.speculative_config.method!r}."
         )
     archs = vllm_config.model_config.architectures or []
     if not any(a.startswith("Qwen3_5Moe") for a in archs):

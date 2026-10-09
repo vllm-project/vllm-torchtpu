@@ -9,6 +9,7 @@ queries) are mocked at construction time so that all tests run without a real
 TPU.
 """
 
+import contextlib
 import sys
 import threading
 import time
@@ -280,6 +281,7 @@ def _make_raiden_scheduler(
     dp_size: int = 1,
     tp_size: int = 1,
     pcp_size: int = 1,
+    pp_size: int = 1,
     architecture: str | None = None,
     kv_ips: Any = "127.0.0.1",
     kv_ports: Any = 9100,
@@ -294,6 +296,7 @@ def _make_raiden_scheduler(
         dp_size=dp_size,
         tp_size=tp_size,
         pcp_size=pcp_size,
+        pp_size=pp_size,
     )
     with (
         patch(f"{_MOD}.dist_utils.get_kv_ips", return_value=kv_ips),
@@ -494,10 +497,9 @@ class TestTPUConnector:
         connector.update_state_after_alloc(req, blocks, 16)
         sched.update_state_after_alloc.assert_called_once_with(req, blocks, 16)
 
-        # build_connector_meta receives scheduler_output but strips it before
-        # delegating — verify the downstream call has no arguments.
+        # build_connector_meta hands scheduler_output to the scheduler half.
         connector.build_connector_meta(sched_out)
-        sched.build_connector_meta.assert_called_once_with()
+        sched.build_connector_meta.assert_called_once_with(sched_out)
 
         connector.request_finished(req, [1, 2])
         sched.request_finished.assert_called_once_with(req, [1, 2])
@@ -2134,6 +2136,7 @@ class _FakeRaidenControllerFacade:
     def __init__(self):
         self.register_work_unit_calls = []
         self.register_request_blocks_calls = []
+        self.release_request_blocks_calls = []
         self.complete_request_blocks_calls = []
         self.cancel_request_blocks_calls = []
         self.start_transfer_calls = []
@@ -2153,6 +2156,9 @@ class _FakeRaidenControllerFacade:
 
     def register_request_blocks(self, **kwargs):
         self.register_request_blocks_calls.append(kwargs)
+
+    def release_request_blocks(self, **kwargs):
+        self.release_request_blocks_calls.append(kwargs)
 
     def complete_request_blocks(self, **kwargs):
         self.complete_request_blocks_calls.append(kwargs)
@@ -6808,3 +6814,484 @@ class TestGlmPipelineParallelProducer:
         assert [reg.tag for reg in spans] == ["mla.nope.l1", "mla.rope.l1"]
         assert all(len(reg.spans) == 3 for reg in spans)
         assert call["block_ids"] == [10, 11, 12]
+
+
+# ---------------------------------------------------------------------------
+# Pipeline producer: Stage-3 registration in the prompt-completing step
+# ---------------------------------------------------------------------------
+
+_STAGE3_CONTROLLER = "prefill-controller.test:27000"
+
+
+@contextlib.contextmanager
+def _stage3_producer_env(*uuids: int):
+    """Raiden Stage-3 transport with transfer parallelism 8, minting the
+    given uuids in order (a further get_uuid call raises StopIteration)."""
+    with (
+        patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+        patch(
+            f"{_MOD}.tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS",
+            _STAGE3_CONTROLLER,
+            create=True,
+        ),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 8, create=True),
+        patch(f"{_MOD}.get_uuid", side_effect=list(uuids)),
+        patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=30.0),
+    ):
+        yield
+
+
+@contextlib.contextmanager
+def _stage3_worker_env():
+    with (
+        patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 8, create=True),
+    ):
+        yield
+
+
+def _stage3_request(
+    req_id: str, prompt_tokens: int, *, max_tokens: int = 1, resumable: bool = False
+) -> MagicMock:
+    """A producer request whose whole prompt is computed at finish."""
+    req = MagicMock()
+    req.request_id = req_id
+    req.num_prompt_tokens = prompt_tokens
+    req.prompt_token_ids = [0] * prompt_tokens
+    req.num_computed_tokens = prompt_tokens
+    req.max_tokens = max_tokens
+    req.resumable = resumable
+    req.kv_transfer_params = None
+    req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+    return req
+
+
+def _scheduler_output(
+    *, new_reqs=(), cached_reqs=(), num_scheduled_tokens=None, preempted_req_ids=()
+):
+    """SchedulerOutput stand-in.
+
+    new_reqs: (req_id, per-group block ids, num_computed_tokens) triples.
+    cached_reqs: (req_id, per-group new block ids or None,
+    num_computed_tokens, resumed) tuples.
+    """
+    return SimpleNamespace(
+        scheduled_new_reqs=[
+            SimpleNamespace(
+                req_id=req_id, block_ids=block_ids, num_computed_tokens=computed
+            )
+            for req_id, block_ids, computed in new_reqs
+        ],
+        scheduled_cached_reqs=SimpleNamespace(
+            req_ids=[entry[0] for entry in cached_reqs],
+            resumed_req_ids={entry[0] for entry in cached_reqs if entry[3]},
+            new_block_ids=[entry[1] for entry in cached_reqs],
+            num_computed_tokens=[entry[2] for entry in cached_reqs],
+        ),
+        num_scheduled_tokens=dict(num_scheduled_tokens or {}),
+        preempted_req_ids=set(preempted_req_ids),
+    )
+
+
+def _stage3_send(
+    uuid: int,
+    *,
+    block_ids=(100, 101),
+    num_tokens: int = 8_191,
+    expiration_time: float = 1e20,
+) -> MagicMock:
+    return MagicMock(
+        uuid=uuid,
+        local_block_ids=list(block_ids),
+        num_tokens=num_tokens,
+        expiration_time=expiration_time,
+    )
+
+
+class TestPipelineParallelRegisterAhead:
+    """A PP8 producer publishes a request's Stage-3 send in the step whose
+    chunk completes the prompt; the finish adopts or releases that uuid."""
+
+    # Two 16-token scheduler blocks; the transfer excludes the last token.
+    PROMPT = 32
+
+    def _register_ahead(self, producer, req, block_ids=(100, 101)):
+        """Schedules the whole prompt in one step and returns its metadata."""
+        producer.update_state_after_alloc(req, MagicMock(), 0)
+        return producer.build_connector_meta(
+            _scheduler_output(
+                new_reqs=[(req.request_id, (list(block_ids),), 0)],
+                num_scheduled_tokens={req.request_id: self.PROMPT},
+            )
+        )
+
+    def test_stage3_pp_registers_in_prompt_completing_step(self):
+        producer = _make_raiden_scheduler(is_producer=True, pp_size=8)
+        req = _stage3_request("early", self.PROMPT)
+        with _stage3_producer_env(777):
+            meta = self._register_ahead(producer, req)
+            delay, params = producer.request_finished(req, [100, 101])
+            after_finish = producer.build_connector_meta(_scheduler_output())
+
+        send = meta.reqs_to_send["early"]
+        assert send.uuid == 777
+        assert send.num_tokens == self.PROMPT - 1
+        assert send.local_block_ids == [100, 101]
+        assert meta.reqs_to_release == {}
+        assert delay
+        assert params["uuid"] == 777
+        assert params["num_tokens"] == self.PROMPT - 1
+        # The finish adopted the published uuid: no second SendMeta.
+        assert after_finish.reqs_to_send == {}
+        assert after_finish.reqs_to_release == {}
+        assert producer._stage3_early_sends == {}
+        assert producer._stage3_early_requests == {}
+        assert producer._stage3_block_tables == {}
+
+    def test_stage3_pp_chunked_prompt_registers_only_when_complete(self):
+        producer = _make_raiden_scheduler(is_producer=True, pp_size=8)
+        req = _stage3_request("chunked", self.PROMPT)
+        with _stage3_producer_env(777):
+            producer.update_state_after_alloc(req, MagicMock(), 0)
+            first = producer.build_connector_meta(
+                _scheduler_output(
+                    new_reqs=[("chunked", ([100],), 0)],
+                    num_scheduled_tokens={"chunked": 16},
+                )
+            )
+            second = producer.build_connector_meta(
+                _scheduler_output(
+                    cached_reqs=[("chunked", ([101],), 16, False)],
+                    num_scheduled_tokens={"chunked": 16},
+                )
+            )
+            delay, params = producer.request_finished(req, [100, 101])
+
+        assert first.reqs_to_send == {}
+        send = second.reqs_to_send["chunked"]
+        assert send.uuid == 777
+        assert send.local_block_ids == [100, 101]
+        assert send.num_tokens == self.PROMPT - 1
+        assert delay
+        assert params["uuid"] == 777
+
+    def test_stage3_pp_abort_releases_ahead_registration(self):
+        producer = _make_raiden_scheduler(is_producer=True, pp_size=8)
+        req = _stage3_request("aborted", self.PROMPT)
+        with _stage3_producer_env(777):
+            self._register_ahead(producer, req)
+            req.status = RequestStatus.FINISHED_ABORTED
+            delay, params = producer.request_finished(req, [100, 101])
+            meta = producer.build_connector_meta(_scheduler_output())
+
+        assert (delay, params) == (False, None)
+        assert meta.reqs_to_release == {"aborted": 777}
+        assert meta.reqs_to_send == {}
+        assert producer._stage3_finished_sends == {}
+        assert producer._stage3_early_sends == {}
+        assert producer._stage3_early_requests == {}
+        assert producer._stage3_block_tables == {}
+
+    def test_stage3_pp_preemption_releases_and_reregisters_fresh_uuid(self):
+        producer = _make_raiden_scheduler(is_producer=True, pp_size=8)
+        req = _stage3_request("preempted", self.PROMPT)
+        with _stage3_producer_env(777, 778):
+            self._register_ahead(producer, req)
+            preempted = producer.build_connector_meta(
+                _scheduler_output(preempted_req_ids={"preempted"})
+            )
+            assert producer._stage3_finished_sends == {}
+            resumed = producer.build_connector_meta(
+                _scheduler_output(
+                    cached_reqs=[("preempted", ([200, 201],), 0, True)],
+                    num_scheduled_tokens={"preempted": self.PROMPT},
+                )
+            )
+            delay, params = producer.request_finished(req, [200, 201])
+            after_finish = producer.build_connector_meta(_scheduler_output())
+
+        assert preempted.reqs_to_release == {"preempted": 777}
+        assert preempted.reqs_to_send == {}
+        send = resumed.reqs_to_send["preempted"]
+        assert send.uuid == 778
+        assert send.local_block_ids == [200, 201]
+        assert resumed.reqs_to_release == {}
+        assert delay
+        assert params["uuid"] == 778
+        assert after_finish.reqs_to_send == {}
+        assert after_finish.reqs_to_release == {}
+
+    def test_stage3_pp_shorter_finish_mints_fresh_transfer(self):
+        producer = _make_raiden_scheduler(is_producer=True, pp_size=8)
+        req = _stage3_request("shorter", self.PROMPT)
+        with _stage3_producer_env(777, 778):
+            self._register_ahead(producer, req)
+            # One block's worth of tokens fewer than the published send.
+            req.num_computed_tokens = 16
+            delay, params = producer.request_finished(req, [100, 101])
+            meta = producer.build_connector_meta(_scheduler_output())
+
+        assert delay
+        assert params["uuid"] == 778
+        assert params["num_tokens"] == 16
+        assert meta.reqs_to_release == {"shorter": 777}
+        send = meta.reqs_to_send["shorter"]
+        assert send.uuid == 778
+        assert send.local_block_ids == [100]
+        assert send.num_tokens == 16
+        assert [record[0] for record in producer._stage3_finished_sends.values()] == [
+            778
+        ]
+
+    def test_stage3_pp_conflicting_duplicate_finish_keeps_first_registration(self):
+        producer = _make_raiden_scheduler(is_producer=True, pp_size=8)
+        req = _stage3_request("duplicate", self.PROMPT)
+        with _stage3_producer_env(777):
+            delay, params = producer.request_finished(req, [100, 101])
+            assert delay and params["uuid"] == 777
+            req.num_computed_tokens = 17
+            # Not published ahead: the conflict mints no fresh transfer.
+            assert producer.request_finished(req, [100, 101]) == (True, params)
+            meta = producer.build_connector_meta(_scheduler_output())
+
+        assert list(meta.reqs_to_send) == ["duplicate"]
+        assert meta.reqs_to_send["duplicate"].num_tokens == self.PROMPT - 1
+        assert meta.reqs_to_release == {}
+
+    @pytest.mark.parametrize(("max_tokens", "resumable"), ((4, False), (1, True)))
+    def test_stage3_pp_skips_requests_that_may_outlive_the_prompt(
+        self, max_tokens, resumable
+    ):
+        producer = _make_raiden_scheduler(is_producer=True, pp_size=8)
+        req = _stage3_request(
+            "later", self.PROMPT, max_tokens=max_tokens, resumable=resumable
+        )
+        with _stage3_producer_env(777):
+            meta = self._register_ahead(producer, req)
+            delay, params = producer.request_finished(req, [100, 101])
+            finish_meta = producer.build_connector_meta(_scheduler_output())
+
+        assert meta.reqs_to_send == {}
+        assert producer._stage3_early_sends == {}
+        # The finish registers as before.
+        assert delay
+        assert params["uuid"] == 777
+        assert finish_meta.reqs_to_send["later"].uuid == 777
+        assert finish_meta.reqs_to_release == {}
+
+    def test_stage3_pp_released_early_records_do_not_exhaust_dedup(self):
+        producer = _make_raiden_scheduler(is_producer=True, pp_size=8)
+        with (
+            _stage3_producer_env(1, 2, 3, 4),
+            patch(f"{_MOD}._STAGE3_FINISH_DEDUP_LIMIT", 2),
+        ):
+            for index in range(2):
+                req = _stage3_request(f"aborted-{index}", self.PROMPT)
+                meta = self._register_ahead(producer, req)
+                assert meta.reqs_to_send[req.request_id].uuid == index + 1
+                req.status = RequestStatus.FINISHED_ABORTED
+                assert producer.request_finished(req, [100, 101]) == (False, None)
+                released = producer.build_connector_meta(_scheduler_output())
+                assert released.reqs_to_release == {req.request_id: index + 1}
+            assert producer._stage3_finished_sends == {}
+            for index in range(2, 4):
+                req = _stage3_request(f"live-{index}", self.PROMPT)
+                meta = self._register_ahead(producer, req)
+                assert meta.reqs_to_send[req.request_id].uuid == index + 1
+        assert list(producer._stage3_finished_sends) == ["live-2", "live-3"]
+
+    def test_stage3_pcp_build_meta_ignores_scheduler_output(self):
+        producer = _make_raiden_scheduler(is_producer=True, block_size=4096, pcp_size=8)
+        req = _stage3_request("pcp", 65_024)
+        with _stage3_producer_env(777):
+            producer.update_state_after_alloc(req, MagicMock(), 0)
+            meta = producer.build_connector_meta(
+                _scheduler_output(
+                    new_reqs=[("pcp", ([100, 101],), 0)],
+                    num_scheduled_tokens={"pcp": 65_024},
+                )
+            )
+            delay, params = producer.request_finished(req, [100, 101])
+            finish_meta = producer.build_connector_meta(_scheduler_output())
+
+        assert meta.reqs_to_send == {}
+        assert meta.reqs_to_release == {}
+        assert producer._stage3_early_requests == {}
+        assert producer._stage3_early_sends == {}
+        assert delay
+        assert params["uuid"] == 777
+        assert finish_meta.reqs_to_send["pcp"].uuid == 777
+        assert finish_meta.reqs_to_release == {}
+
+
+class TestPipelineParallelRegisterAheadWorker:
+    """A pipeline stage registers ahead of the finish, retires released
+    uuids, and arms the TTL and status probe from finished_req_ids."""
+
+    @staticmethod
+    def _stage_worker():
+        worker = _make_raiden_worker(
+            tp_rank=0,
+            tp_size=1,
+            is_producer=True,
+            dp_size=1,
+            pcp_size=1,
+            block_size=4096,
+            pp_size=8,
+        )
+        engine = _FakeRaidenEngine()
+        engine.poll_results = []
+        facade = _FakeRaidenControllerFacade()
+        worker._raiden_transfer_engine = engine
+        worker._raiden_controller_facade = facade
+        worker._raiden_controller_address = _STAGE3_CONTROLLER
+        worker._raiden_work_unit = SimpleNamespace(
+            job_name="prefill",
+            job_replica_id="producer-engine-rank3",
+            data_name="kv.fa",
+            data_replica_idx=0,
+        )
+        worker._local_raiden_transfer_rank = MagicMock(return_value=3)
+        from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import (
+            PoolEntry,
+            PoolManifest,
+            RegionSpec,
+        )
+
+        # One FA pool whose live bytes span the 4096-token page (two bytes
+        # per token), so an 8,191-token send lowers onto two blocks; the
+        # stage holds no state pools.
+        worker._raiden_manifest = PoolManifest(
+            binding="private_typed",
+            storages=[object()],
+            pools=[
+                PoolEntry(
+                    tag="fa",
+                    layer_name="model.layers.3.x",
+                    storage_index=0,
+                    base_offset_bytes=0,
+                    block_stride_bytes=8192,
+                    num_blocks=4,
+                    regions=(RegionSpec("live", 0, 8192, 8192, 1),),
+                    dtype_tag="uint8",
+                ),
+            ],
+        )
+        worker._stage3_state_group_count = 0
+        return worker, facade
+
+    def test_v3_stage3_release_meta_drops_registration_silently(self):
+        worker, facade = self._stage_worker()
+        register = TPUConnectorMetadata()
+        register.reqs_to_send["early"] = _stage3_send(1234)
+        release = TPUConnectorMetadata(reqs_to_release={"early": 1234})
+        register_again = TPUConnectorMetadata()
+        register_again.reqs_to_send["early"] = _stage3_send(1235)
+        with _stage3_worker_env():
+            worker.process_send_load(register)
+            assert worker._stage3_registered_sends["early"].finish_pending
+            worker.process_send_load(release)
+            assert worker._stage3_registered_sends == {}
+            assert worker.get_finished() == (set(), set())
+            worker.process_send_load(register_again)
+
+        assert facade.release_request_blocks_calls == [
+            {"req_id": "early", "uuid": 1234}
+        ]
+        assert [call["uuid"] for call in facade.register_request_blocks_calls] == [
+            1234,
+            1235,
+        ]
+        assert worker._stage3_registered_sends["early"].uuid == 1235
+        assert facade.cancel_request_blocks_calls == []
+        assert facade.complete_request_blocks_calls == []
+        assert worker._stage3_terminal_sends == {}
+        assert worker._done_sending == set()
+
+    def test_v3_stage3_release_with_mismatched_uuid_is_noop(self):
+        worker, facade = self._stage_worker()
+        register = TPUConnectorMetadata()
+        register.reqs_to_send["early"] = _stage3_send(1234)
+        stale_release = TPUConnectorMetadata(reqs_to_release={"early": 999})
+        # One metadata carrying the release of the published uuid and the
+        # fresh registration of its replacement.
+        replace_meta = TPUConnectorMetadata(reqs_to_release={"early": 1234})
+        replace_meta.reqs_to_send["early"] = _stage3_send(
+            1235, block_ids=[100], num_tokens=4_095
+        )
+        with _stage3_worker_env():
+            worker.process_send_load(register)
+            worker.process_send_load(stale_release)
+            assert facade.release_request_blocks_calls == []
+            assert worker._stage3_registered_sends["early"].uuid == 1234
+            worker.process_send_load(replace_meta)
+
+        # The release ran before the registration: it matched uuid 1234 and
+        # the fresh registration survived it.
+        assert facade.release_request_blocks_calls == [
+            {"req_id": "early", "uuid": 1234}
+        ]
+        registration = worker._stage3_registered_sends["early"]
+        assert registration.uuid == 1235
+        assert registration.local_block_ids == (100,)
+        assert registration.finish_pending
+        assert [call["uuid"] for call in facade.register_request_blocks_calls] == [
+            1234,
+            1235,
+        ]
+
+    def test_v3_stage3_pipeline_registration_is_armed_by_finished_req_ids(self):
+        worker, facade = self._stage_worker()
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_send["early"] = _stage3_send(
+            1234, expiration_time=time.perf_counter() - 1.0
+        )
+        # The store has no row yet (a lagging stage would see UNKNOWN too).
+        facade.request_block_statuses[("early", 1234)] = 1
+        with (
+            _stage3_worker_env(),
+            patch(f"{_MOD}.dist_utils.get_stage3_status_probe_s", return_value=1e-9),
+            patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=30.0),
+        ):
+            worker.process_send_load(meta)
+            pending = worker._stage3_registered_sends["early"]
+            assert pending.finish_pending
+            assert pending.expiration_time == float("inf")
+            # Pending: the UNKNOWN row is not probed and nothing expires.
+            assert worker.get_finished() == (set(), set())
+            assert worker.get_finished() == (set(), set())
+            assert facade.cancel_request_blocks_calls == []
+            assert facade.get_request_block_status_calls == []
+            # The scheduler's finish arms the registration.
+            assert worker.get_finished({"early"}) == (set(), set())
+            registration = worker._stage3_registered_sends["early"]
+            assert not registration.finish_pending
+            assert registration.expiration_time > time.perf_counter()
+            # Armed, the probe runs as for a finish-time registration.
+            assert worker.get_finished() == ({"early"}, set())
+
+        assert facade.get_request_block_status_calls == [[("early", 1234)]]
+        assert facade.cancel_request_blocks_calls == []
+        assert worker._stage3_registered_sends == {}
+        assert "early" in worker._stage3_terminal_sends
+
+    def test_v3_stage3_pipeline_armed_registration_expires_by_ttl(self):
+        worker, facade = self._stage_worker()
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_send["early"] = _stage3_send(
+            1234, expiration_time=time.perf_counter() - 1.0
+        )
+        with (
+            _stage3_worker_env(),
+            patch(f"{_MOD}.dist_utils.get_stage3_status_probe_s", return_value=0.0),
+            patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=0.0),
+        ):
+            worker.process_send_load(meta)
+            assert worker.get_finished() == (set(), set())
+            assert facade.cancel_request_blocks_calls == []
+            # Armed with a zero TTL, the same sweep cancels it unclaimed.
+            assert worker.get_finished({"early"}) == ({"early"}, set())
+
+        assert facade.cancel_request_blocks_calls == [{"req_id": "early", "uuid": 1234}]
+        assert worker._stage3_registered_sends == {}
+        assert "early" in worker._stage3_terminal_sends

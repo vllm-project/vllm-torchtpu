@@ -218,6 +218,35 @@ def test_mesh_rejects_pallas_ids_that_are_not_the_groups(monkeypatch):
 
 
 @pytest.mark.tpu_test
+def test_mesh_covers_the_stage_under_pipeline_parallelism(monkeypatch):
+    """An EP group that is one pipeline stage gets a mesh of its own devices,
+    built from its process group."""
+    import torch.distributed as dist
+    from torch_tpu._internal import pallas as pallas_module
+
+    monkeypatch.setattr(dist, "get_world_size", lambda *a, **k: 8)
+    monkeypatch.setattr(
+        parallel_state,
+        "get_pp_group",
+        lambda: SimpleNamespace(world_size=4, rank_in_group=3),
+    )
+    group = SimpleNamespace(world_size=2, ranks=[6, 7], device_group=object())
+    monkeypatch.setattr(ep, "get_ep_group", lambda: group)
+    monkeypatch.setattr(ep, "ep_device_ids", lambda: (2, 3))
+    mesh = SimpleNamespace(
+        devices=SimpleNamespace(flat=[SimpleNamespace(id=2), SimpleNamespace(id=3)])
+    )
+    made = Mock(return_value=mesh)
+    monkeypatch.setattr(pallas_module, "get_pallas_mesh", made)
+    monkeypatch.setattr(jax.sharding, "Mesh", _fake_mesh)
+
+    assert [d.id for d in ep.build_ep_mesh().devices.flat] == [2, 3]
+    made.assert_called_once_with(
+        axis_names=("d",), mesh_shape=(2,), process_group=group.device_group
+    )
+
+
+@pytest.mark.tpu_test
 def test_mesh_rejects_a_group_smaller_than_the_world(monkeypatch):
     """get_pallas_mesh spans the whole torch.distributed world and cannot
     describe a sub-group, so a smaller EP group has to fail rather than build

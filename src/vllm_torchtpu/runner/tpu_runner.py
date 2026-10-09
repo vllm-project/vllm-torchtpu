@@ -136,7 +136,17 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpeculativeDecodingManager,
 )
 from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
-from vllm_torchtpu.runner.structured_decoding_manager import StructuredDecodingManager
+from vllm_torchtpu.runner.tpu_pooling import (
+    StaticPoolerChunkOutput,
+    StaticPoolerSpec,
+    build_dummy_static_pool_inputs,
+    build_static_pool_inputs,
+    gate_unfinished,
+    iter_pooler_precompile_grid,
+    resolve_static_pooler_spec,
+    static_pool,
+    unpack_static_pool_output,
+)
 from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID,
     AsyncPreResults,
@@ -148,6 +158,7 @@ from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 from vllm_torchtpu.spec_decode.utils import DraftChunkInputs, normalize_draft_config
+from vllm_torchtpu.structured_decoding import StructuredDecodingManager
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
 from vllm_torchtpu.tracing.utils import (
@@ -437,13 +448,12 @@ def _validate_libtpu_version() -> None:
 
 @contextlib.contextmanager
 def _torch_tpu_wrapper():
-    """Alias torch.cuda.* to torch.tpu.* during inherited GPUModelRunner init.
+    """Alias torch.cuda.* to torch.accelerator.* during inherited GPUModelRunner
+    init.
 
     Mirrors vllm/v1/worker/xpu_model_runner.py:_torch_cuda_wrapper. The parent
     GPUModelRunner constructs torch.cuda.Stream/Event for comm and async copy;
-    this wrapper makes those resolve to the TPU equivalents (verified present
-    on torch.tpu: Stream, Event, current_stream, default_stream, stream,
-    set_stream, synchronize, set_device, current_device, device_count).
+    this wrapper makes those resolve to the accelerator equivalents.
 
     The 5 APIs not on torch.tpu are stubbed:
       - mem_get_info -> torch.accelerator.get_memory_info (works on TPU)
@@ -452,22 +462,24 @@ def _torch_tpu_wrapper():
         disable cudagraphs in __init__ via compilation_config overrides.
     """
     saved = {}
-    aliased = (
-        "Stream",
-        "Event",
-        "current_stream",
-        "default_stream",
-        "stream",
-        "set_stream",
-        "synchronize",
-        "set_device",
-        "current_device",
-        "device_count",
-        "is_available",
-    )
-    for name in aliased:
+    accelerator_aliases = {
+        "current_device": torch.accelerator.current_device_index,
+        "set_device": torch.accelerator.set_device_index,
+        "is_available": torch.accelerator.is_available,
+        "device_count": torch.accelerator.device_count,
+        "synchronize": torch.accelerator.synchronize,
+        "current_stream": torch.accelerator.current_stream,
+        "set_stream": torch.accelerator.set_stream,
+    }
+    tpu = getattr(torch, "tpu", None)
+    tpu_aliases = ("Stream", "Event", "default_stream", "stream")
+    for name, func in accelerator_aliases.items():
         saved[name] = getattr(torch.cuda, name, None)
-        setattr(torch.cuda, name, getattr(torch.tpu, name))
+        setattr(torch.cuda, name, func)
+    for name in tpu_aliases:
+        saved[name] = getattr(torch.cuda, name, None)
+        if tpu is not None and hasattr(tpu, name):
+            setattr(torch.cuda, name, getattr(tpu, name))
     saved["mem_get_info"] = getattr(torch.cuda, "mem_get_info", None)
     torch.cuda.mem_get_info = lambda *a, **kw: torch.accelerator.get_memory_info()
     saved["empty_cache"] = getattr(torch.cuda, "empty_cache", None)
@@ -595,6 +607,9 @@ class TPUModelRunner(GPUModelRunner):
         self.is_pooling_model = (
             self.model_config is not None and self.model_config.runner_type == "pooling"
         )
+        # Resolved in load_model; None keeps the eager pooler path.
+        self._static_pooler_spec: StaticPoolerSpec | None = None
+        self._static_pooler_reason = "not resolved"
 
         if self.is_pooling_model:
             from vllm_torchtpu.runner.tpu_pooling import (
@@ -3784,42 +3799,18 @@ class TPUModelRunner(GPUModelRunner):
                     layout_plan,
                 )
                 logits = torch.empty((0,), device=self.device)
-
-                # Slice to this chunk's request window. When the batch runs as a
-                # single chunk this is a no-op ([0:num_reqs]); with multiple
-                # chunks, unsliced metadata would not match the cursor below.
-                pooling_metadata = self.input_batch.get_pooling_metadata()[
-                    start_index : start_index + num_reqs
-                ]
-                # num_scheduled_tokens_np, seq_lens_cpu for this chunk
-                req_ids = self.input_batch.req_ids[start_index : start_index + num_reqs]
-                num_scheduled_tokens_np = np.array(
-                    [
-                        scheduler_output.num_scheduled_tokens[req_id]
-                        for req_id in req_ids
-                    ],
-                    dtype=np.int32,
+                pooler_output_list.append(
+                    self._pool_chunk(
+                        scheduler_output,
+                        hidden_states,
+                        start_index,
+                        num_reqs,
+                        num_tokens_padded,
+                        padded_num_reqs,
+                        logits_indices,
+                        layout_plan,
+                    )
                 )
-                total_scheduled_tokens = int(num_scheduled_tokens_np.sum())
-                unpadded_hidden_states = hidden_states[:total_scheduled_tokens]
-
-                num_scheduled_tokens_cpu = torch.from_numpy(num_scheduled_tokens_np)
-                seq_lens_cpu = (
-                    self.input_batch.num_computed_tokens_cpu_tensor[
-                        start_index : start_index + num_reqs
-                    ]
-                    + num_scheduled_tokens_cpu
-                )
-                pooling_metadata.build_pooling_cursor(
-                    num_scheduled_tokens_np=num_scheduled_tokens_np,
-                    seq_lens_cpu=seq_lens_cpu,
-                    device=self.device,
-                )
-                pooler_output = self.model.pooler(
-                    hidden_states=unpadded_hidden_states,
-                    pooling_metadata=pooling_metadata,
-                )
-                pooler_output_list.append(pooler_output)
             else:
                 sample_hidden_states = (
                     sequence_layout_planner.maybe_select_logits_hidden_states(
@@ -3910,6 +3901,100 @@ class TPUModelRunner(GPUModelRunner):
         if self.is_pooling_model:
             return self.sample_tokens(None)
         return None
+
+    def _pool_chunk(
+        self,
+        scheduler_output: "SchedulerOutput",
+        hidden_states: torch.Tensor,
+        start_index: int,
+        num_reqs: int,
+        num_tokens_padded: int,
+        padded_num_reqs: int,
+        logits_indices: torch.Tensor | None,
+        layout_plan: Any,
+    ) -> Any:
+        """Pool one chunk of requests.
+
+        Eligible chunks run the AOT-compiled static pooler on the padded
+        ``[num_tokens_padded, H]`` bucket (a precompiled (T_pad, R_pad)
+        program) and defer the D2H to sample_tokens. Everything else runs the
+        eager vLLM pooler. Both paths emit None for requests whose prefill is
+        not finished: vLLM finishes a pooling request on its first non-None
+        output, so a chunked LAST prefill must not emit an early row.
+        """
+        end_index = start_index + num_reqs
+        req_ids = self.input_batch.req_ids[start_index:end_index]
+        num_scheduled_tokens_np = np.array(
+            [scheduler_output.num_scheduled_tokens[req_id] for req_id in req_ids],
+            dtype=np.int32,
+        )
+        num_computed_np = np.asarray(
+            self.input_batch.num_computed_tokens_cpu[start_index:end_index]
+        )
+        prompt_lens_np = np.array(
+            [self.requests[req_id].num_prompt_tokens for req_id in req_ids],
+            dtype=np.int64,
+        )
+        finished_np = (num_computed_np + num_scheduled_tokens_np) == prompt_lens_np
+
+        spec = self._static_pooler_spec
+        default_layout = layout_plan is None or (
+            getattr(layout_plan, "kind", SequenceLayoutKind.ALL)
+            is SequenceLayoutKind.ALL
+            and getattr(layout_plan, "logits_indices_cpu", None) is None
+        )
+        if (
+            spec is not None
+            and default_layout
+            and hidden_states.shape[0] == num_tokens_padded
+        ):
+            static_inputs = build_static_pool_inputs(
+                spec,
+                [self.requests[req_id].pooling_params for req_id in req_ids],
+                prompt_lens_np,
+                num_computed_np,
+                num_scheduled_tokens_np,
+                num_tokens_padded,
+                padded_num_reqs,
+                self.device,
+                last_token_idx=logits_indices,
+            )
+            if static_inputs is not None:
+                # Skip the pooler and its D2H when nothing finished this step.
+                padded = (
+                    static_pool(hidden_states, static_inputs, spec)
+                    if static_inputs.finished.any()
+                    else None
+                )
+                return StaticPoolerChunkOutput(
+                    padded=padded,
+                    num_reqs=static_inputs.num_reqs,
+                    finished=static_inputs.finished,
+                    out_dims=static_inputs.out_dims,
+                )
+
+        # Eager fallback. The metadata is sliced to this chunk so it matches
+        # the chunk-sized cursor built below.
+        pooling_metadata = self.input_batch.get_pooling_metadata()[
+            start_index:end_index
+        ]
+        total_scheduled_tokens = int(num_scheduled_tokens_np.sum())
+        unpadded_hidden_states = hidden_states[:total_scheduled_tokens]
+        num_scheduled_tokens_cpu = torch.from_numpy(num_scheduled_tokens_np)
+        seq_lens_cpu = (
+            self.input_batch.num_computed_tokens_cpu_tensor[start_index:end_index]
+            + num_scheduled_tokens_cpu
+        )
+        pooling_metadata.build_pooling_cursor(
+            num_scheduled_tokens_np=num_scheduled_tokens_np,
+            seq_lens_cpu=seq_lens_cpu,
+            device=self.device,
+        )
+        pooler_output = self.model.pooler(
+            hidden_states=unpadded_hidden_states,
+            pooling_metadata=pooling_metadata,
+        )
+        return gate_unfinished(pooler_output, finished_np)
 
     def take_draft_token_ids(self) -> DraftTokenIds | None:
         if self.spec_decode_manager is None:
@@ -4302,6 +4387,7 @@ class TPUModelRunner(GPUModelRunner):
             req_ids = cast(
                 list[str], self.input_batch.req_ids[: self.input_batch.num_reqs]
             )
+            self._update_num_xla_graphs("pooling_step")
         elif is_spec_step:
             cur_start_idx = 0
             all_greedy = self.input_batch.all_greedy
@@ -4725,6 +4811,9 @@ class TPUModelRunner(GPUModelRunner):
         pooler_output: list[torch.Tensor | None] = []
         if self.is_pooling_model:
             for out in state.pooler_output_list:
+                if isinstance(out, StaticPoolerChunkOutput):
+                    pooler_output.extend(unpack_static_pool_output(out))
+                    continue
                 # Move to CPU as expected by vLLM
                 if isinstance(out, torch.Tensor):
                     pooler_output.extend(list(out.cpu().unbind(dim=0)))
@@ -4821,6 +4910,8 @@ class TPUModelRunner(GPUModelRunner):
             )
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
+        if self.is_pooling_model:
+            self._resolve_static_pooler()
         if self.parallel_config.pipeline_parallel_size > 1:
             # A sparse model's layers share one top-k index table, and under a
             # pipeline the layer that writes it and the layers that reuse it
@@ -5430,6 +5521,14 @@ class TPUModelRunner(GPUModelRunner):
         granularity = chunk_granularity(
             self.cache_config.block_size, self.max_num_tokens, block_aligned
         )
+        if self._pcp_enabled:
+            # A context-parallel step holds whole query blocks on every rank.
+            from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import (
+                PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
+            )
+
+            query_block = PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE
+            granularity = -(-granularity // query_block) * query_block
         self._pp_chunk_granularity = granularity
         extra = sorted(
             set(chunk_buckets(self.max_num_tokens, granularity))
@@ -5470,8 +5569,14 @@ class TPUModelRunner(GPUModelRunner):
                     "core. Use a smaller --max-num-batched-tokens, or "
                     "fewer --max-num-seqs or a shorter --max-model-len."
                 )
+        # A bucket counts this rank's rows; under prefill context parallelism
+        # a step of that many rows per rank is pcp times as long, and the
+        # scheduler sizes steps in tokens.
+        pcp = self.parallel_config.prefill_context_parallel_size
+        step = self.scheduler_config.max_num_batched_tokens
+        buckets = [b for b in self.num_tokens_paddings if b * pcp <= step]
         points = profile_points(
-            self.num_tokens_paddings, self.max_num_tokens, self.max_model_len, schedule
+            buckets, self.max_num_tokens, self.max_model_len, schedule
         )
         samples = []
         started = time.perf_counter()
@@ -5489,7 +5594,7 @@ class TPUModelRunner(GPUModelRunner):
                 assert elapsed_ms is not None
                 timings.append(elapsed_ms)
             ms = min(timings)
-            samples.append((int(tokens), int(prefix), float(ms)))
+            samples.append((int(tokens) * pcp, int(prefix), float(ms)))
         logger.info(
             "Pipeline step profile (%d points, %.1f s): %s",
             len(samples),
@@ -5499,7 +5604,8 @@ class TPUModelRunner(GPUModelRunner):
         granularity = self._pp_chunk_granularity
         assert granularity is not None
         return {
-            "granularity": int(granularity),
+            # The scheduler sizes steps in tokens, like the samples above.
+            "granularity": int(granularity) * pcp,
             "samples": samples,
             "schedule": schedule,
         }
@@ -5952,6 +6058,10 @@ class TPUModelRunner(GPUModelRunner):
     def _precompile_sampling_subgraphs(self) -> None:
         """Compile sampling-path subgraphs so their bottom-HBM reservations
         are visible to vLLM's available-memory probe in profile_run."""
+        if self.is_pooling_model:
+            # Pooling never computes logits or samples; the pooler has its
+            # own precompile (_precompile_pooler_subgraphs).
+            return
         if not self._pp_is_last:
             # Only the last stage holds the lm_head and samples.
             return
@@ -5964,6 +6074,61 @@ class TPUModelRunner(GPUModelRunner):
         self._precompile_structured_decoding()
         self._precompile_sample_from_logits()
         self._precompile_gather_logprobs()
+
+    def _resolve_static_pooler(self) -> None:
+        """Pick the static compiled pooler for eligible embed poolers."""
+        if envs.VLLM_TPU_STATIC_POOLER:
+            self._static_pooler_spec, self._static_pooler_reason = (
+                resolve_static_pooler_spec(self.model, self.model_config)
+            )
+        else:
+            self._static_pooler_spec = None
+            self._static_pooler_reason = "disabled by VLLM_TPU_STATIC_POOLER=0"
+        if self._static_pooler_spec is not None:
+            logger.info("Static pooler enabled: %s", self._static_pooler_spec)
+        else:
+            logger.info(
+                "Static pooler disabled (%s); using the eager pooler.",
+                self._static_pooler_reason,
+            )
+        if not self.enforce_eager and not envs.TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT:
+            logger.warning(
+                "Pooling model in compiled mode without "
+                "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT: the pooler and other "
+                "helper executables are recompiled on every start."
+            )
+
+    def _precompile_pooler_subgraphs(self) -> None:
+        """AOT-compile the static pooler over the reachable (token, request)
+        bucket grid.
+
+        Uses the runtime buckets (num_tokens_paddings x num_reqs_paddings) with
+        the logits precompile's pruning, and runs under no_grad like
+        execute_model so the Dynamo guards match at serve time.
+        """
+        if not self.is_pooling_model or not self._pp_is_last:
+            return
+        spec = self._static_pooler_spec
+        if spec is None:
+            logger.info("Skipping pooler precompile: %s", self._static_pooler_reason)
+            return
+        hsize = self.model_config.get_hidden_size()
+        with self._precompile_timed("static pooler"), torch.no_grad():
+            dummy_hidden = None
+            for num_tokens, num_reqs in iter_pooler_precompile_grid(
+                self.num_tokens_paddings, self.num_reqs_paddings, self.max_num_reqs
+            ):
+                if dummy_hidden is None or dummy_hidden.shape[0] != num_tokens:
+                    dummy_hidden = torch.zeros(
+                        (num_tokens, hsize),
+                        device=self.device,
+                        dtype=self._hidden_states_dtype,
+                    )
+                inputs = build_dummy_static_pool_inputs(
+                    spec, num_tokens, num_reqs, self.device
+                )
+                synchronize_tensors(static_pool(dummy_hidden, inputs, spec))
+                logger.info("  -- num_tokens: %d, num_seqs: %d", num_tokens, num_reqs)
 
     def capture_model(self) -> None:
         """Precompile every torch.compile subgraph across all input buckets."""
@@ -5991,6 +6156,7 @@ class TPUModelRunner(GPUModelRunner):
                 self._precompile_backbone()
 
             self._precompile_sampling_subgraphs()
+            self._precompile_pooler_subgraphs()
             self._precompile_mamba_rollback_helpers()
 
             # Precompile multimodal vision encoder graphs
@@ -6716,9 +6882,11 @@ class TPUModelRunner(GPUModelRunner):
             synchronize_device()
 
             # Sampling subgraphs (Phase A) — uses the restored cache_dir.
+            # Pooling models compile their pooler grid here instead.
             if not self.enforce_eager:
                 with self.maybe_setup_dummy_loras(self.lora_config):
                     self._precompile_sampling_subgraphs()
+                    self._precompile_pooler_subgraphs()
 
     def _resolve_tpu_group_backend(
         self,

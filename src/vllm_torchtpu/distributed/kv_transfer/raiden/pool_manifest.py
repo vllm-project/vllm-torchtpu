@@ -1152,7 +1152,7 @@ def materialize_storages(manifest: PoolManifest) -> None:
         if hasattr(storage, "cpu"):
             try:  # noqa: SIM105 (non-torch test fakes)
                 storage[:1].cpu()
-            except Exception:  # pragma: no cover - non-torch fakes
+            except Exception:  # pragma: no cover - non-torch fakes  # noqa: S110
                 pass
 
 

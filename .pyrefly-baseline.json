@@ -78,82 +78,7 @@
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
       "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `loop`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `make_async_copy`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `loop`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `make_async_copy`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `run_scoped`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `SemaphoreType`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `pallas_call`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `PrefetchScalarGridSpec`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `BlockSpec`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `ANY`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `BlockSpec`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `ANY`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `BlockSpec`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `ANY`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `custom_jax_kernel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `None`"
     },
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
@@ -269,36 +194,6 @@
       "path": "src/vllm_torchtpu/executors/ray_distributed_executor_v2.py",
       "name": "not-iterable",
       "concise_description": "Type `None` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/config.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `bool | int` is not assignable to parameter `overlap` with type `bool` in function `state_rows_per_token`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/config.py",
-      "name": "bad-argument-type",
-      "concise_description": "Unpacked keyword argument `bool | int | Unknown` is not assignable to parameter `overlap` with type `bool` in function `Dimensions.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/config.py",
-      "name": "bad-argument-type",
-      "concise_description": "Unpacked keyword argument `bool | int | Unknown` is not assignable to parameter `has_rope_cache` with type `bool` in function `Dimensions.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/core_attention/mla.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | None` is not assignable to parameter `static_q_len` with type `int` in function `_mla_ragged_paged_attention_kernel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/core_attention/mla_swa.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | None` is not assignable to parameter `static_q_len` with type `int` in function `_mla_sliding_window_ragged_paged_attention_kernel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk/streamindex_topk.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `reshape`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/host.py",
@@ -1026,29 +921,9 @@
       "concise_description": "Object of class `NoneType` has no attribute `e_score_correction_bias`"
     },
     {
-      "path": "src/vllm_torchtpu/layers/adapter/quantization/fp8.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `tuple[Literal[1], Literal[2]]` is not assignable to parameter `axis` with type `int` in function `vllm_torchtpu.layers.core.quantization.dequantize_tensor`"
-    },
-    {
       "path": "src/vllm_torchtpu/layers/adapter/vision_attention.py",
       "name": "not-callable",
       "concise_description": "Expected a callable, got `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/attention_interface.py",
-      "name": "unsupported-operation",
-      "concise_description": "`**` is not supported between `None` and `float`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/attention_interface.py",
-      "name": "unsupported-operation",
-      "concise_description": "`**` is not supported between `None` and `float`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/attention_interface.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `float | None` is not assignable to parameter `sm_scale` with type `float` in function `sharded_ragged_paged_attention`"
     },
     {
       "path": "src/vllm_torchtpu/layers/core/fused_moe_gmm.py",
@@ -1064,36 +939,6 @@
       "path": "src/vllm_torchtpu/layers/core/fused_moe_gmm.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `vmem_capacity_bytes`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/quantization.py",
-      "name": "bad-assignment",
-      "concise_description": "`list[int]` is not assignable to variable `axis` with type `int`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/quantization.py",
-      "name": "not-iterable",
-      "concise_description": "Type `int` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/quantization.py",
-      "name": "not-iterable",
-      "concise_description": "Type `int` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/quantization.py",
-      "name": "bad-assignment",
-      "concise_description": "`list[int]` is not assignable to variable `axis` with type `int`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/quantization.py",
-      "name": "not-iterable",
-      "concise_description": "Type `int` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/quantization.py",
-      "name": "not-iterable",
-      "concise_description": "Type `int` is not iterable"
     },
     {
       "path": "src/vllm_torchtpu/layers/core/sequence_layout.py",
@@ -1254,11 +1099,6 @@
       "path": "src/vllm_torchtpu/tpu_info.py",
       "name": "bad-return",
       "concise_description": "Returned type `None` is not assignable to declared return type `str`"
-    },
-    {
-      "path": "src/vllm_torchtpu/utils.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `(obj: object, /) -> int` is not assignable to declared return type `(Any) -> bytes`"
     }
   ]
 }

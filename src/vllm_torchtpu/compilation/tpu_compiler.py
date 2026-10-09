@@ -132,6 +132,9 @@ _TPU_COMPILE_ENV_IGNORED = {
     # are keyed by shape inside the same cache.
     "TPU_PP_DYNAMIC_CHUNKS",
     "TPU_PP_CHUNK_SLACK",
+    # Engine-side timing of the pipeline pushes; the workers' programs are
+    # the same either way.
+    "TPU_PP_LAZY_PUSH",
     # Startup and host-side knobs: ports, an IPC secret, two raiden startup
     # checks, the raiden offload storage tier, offload retry and drain
     # limits, a weight-load sync cadence, a debug log switch, and the
@@ -160,6 +163,10 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
     # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
+    # Pooling: the static pooler is a separate backend="tpu" helper outside the
+    # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
+    "VLLM_TPU_STATIC_POOLER",
+    "VLLM_TPU_POOLING_KV_CACHE_TOKENS",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
@@ -190,6 +197,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # shape and the device order (the DeviceAssignment) the kernel runs on.
     "vllm_torchtpu/distributed/ep_mesh.py",
     "vllm_torchtpu/distributed/pcp.py",
+    # Same reason: dcp.py owns the DCP kernels' mesh shape and device order.
+    "vllm_torchtpu/distributed/dcp.py",
     "vllm_torchtpu/distributed/pallas_shapes.py",
     "vllm_torchtpu/layers/adapter/linear_common.py",
     "vllm_torchtpu/layers/adapter/router_topk.py",

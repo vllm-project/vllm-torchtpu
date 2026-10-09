@@ -53,7 +53,7 @@ _copy_op.register_fake(_fake_copy)
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def copy_mamba_state_blocks(
     pools: list[torch.Tensor], src: torch.Tensor, dst: torch.Tensor
-) -> torch.Tensor:
+) -> torch.Tensor | None:
     """``pool[dst[i]] = pool[src[i]]`` on every pool, as one program.
 
     A hybrid model's unified pool is split over several raw buffers, and a

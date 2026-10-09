@@ -4,7 +4,7 @@ import os
 import time
 from collections.abc import Callable, Mapping, Sequence
 from functools import wraps
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import jax
 import torch
@@ -58,6 +58,23 @@ def get_dp_size(parallel_config) -> int:
         int(os.environ.get("TORCH_TPU_DP_SIZE", "0"))
         or parallel_config.data_parallel_size
     )
+
+
+def min_across_ep_dp(parallel_config, value: int) -> int:
+    """Return the minimum of `value` across the DP engines coupled by EP.
+
+    EP-coupled engines must compile identical programs, so a value baked into
+    them (such as the KV cache size) has to agree; uncoupled engines keep theirs.
+    """
+    if get_dp_size(parallel_config) == 1 or not parallel_config.enable_expert_parallel:
+        return value
+    from vllm.distributed.parallel_state import get_dp_group
+
+    t = torch.tensor([value], dtype=torch.int64, device="cpu")
+    torch.distributed.all_reduce(
+        t, op=torch.distributed.ReduceOp.MIN, group=get_dp_group().cpu_group
+    )
+    return int(t.item())
 
 
 def hbm_usage_bytes(devices: Any) -> list[tuple[int, int]]:
@@ -239,7 +256,7 @@ def get_dtype_packing(dtype):
     return 32 // bits
 
 
-def get_hash_fn_by_name(hash_fn_name: str) -> Callable[[Any], bytes]:
+def get_hash_fn_by_name(hash_fn_name: str) -> Callable[[Any], bytes | int]:
     """
     A wrapper function of vllm.utils.hashing.get_hash_fn_by_name to support builtin
     """
@@ -290,7 +307,7 @@ def tpu_bind_kv_cache(
             if isinstance(cache, (list, tuple)):
                 runner_kv_caches.extend(cache)
             else:
-                runner_kv_caches.append(cache)
+                runner_kv_caches.append(cast(torch.Tensor, cache))
 
     for layer_name, kv_cache in kv_caches.items():
         forward_context[layer_name].kv_cache = kv_cache

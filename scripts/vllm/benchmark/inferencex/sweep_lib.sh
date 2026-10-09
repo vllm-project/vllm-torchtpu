@@ -60,6 +60,12 @@ save_now() {
 # sourced.
 ix_server_url() { echo "${IX_SERVER_URL:-http://127.0.0.1:$PORT}"; }
 
+# ix_engine_url: where /metrics lives. Usually the same server, but a P/D pair is
+# driven through a proxy that has no /metrics of its own - the queue depth and the
+# preemption counters belong to one engine, not to a pair - so a caller in that
+# shape points this at the engine whose queue it wants to watch, the decode one.
+ix_engine_url() { echo "${IX_ENGINE_URL:-$(ix_server_url)}"; }
+
 # --max-time on every poll: an engine that is wedged but still listening would
 # otherwise block the caller forever, and wait_server_idle only checks its
 # deadline between polls, so its timeout would never fire.
@@ -71,7 +77,7 @@ server_alive() { curl -sf --max-time 10 "$(ix_server_url)/v1/models" >/dev/null;
 # "unreachable" from "drained" instead of reading both as 0.
 ix_engine_queue_depth() {
     local body
-    body=$(curl -s --max-time 30 "$(ix_server_url)/metrics") || return 1
+    body=$(curl -s --max-time 30 "$(ix_engine_url)/metrics") || return 1
     [ -n "$body" ] || return 1
     printf '%s' "$body" \
         | awk '/^vllm:num_requests_(running|waiting)( |\{)/{s+=$NF} END{print s+0}'
@@ -81,7 +87,7 @@ ix_engine_queue_depth() {
 # preemptions (a preempted request is re-prefilled from its KV state) and
 # finished requests. Printed as "preemptions=N finished=M".
 ix_engine_counters() {
-    curl -s --max-time 30 "$(ix_server_url)/metrics" | awk '
+    curl -s --max-time 30 "$(ix_engine_url)/metrics" | awk '
         /^vllm:num_preemptions_total( |\{)/ {p+=$NF}
         /^vllm:request_success_total( |\{)/ {f+=$NF}
         END {printf "preemptions=%d finished=%d\n", p, f}'

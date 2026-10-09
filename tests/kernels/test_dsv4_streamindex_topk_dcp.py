@@ -13,6 +13,8 @@
 # limitations under the License.
 """Tests for DCP (decode context parallel) StreamIndex Top-K"""
 
+import re
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -84,7 +86,7 @@ def _require_sparsecore():
     try:
         if pltpu.get_tpu_info().sparse_core is not None:
             return
-    except Exception:  # no TPU at all
+    except Exception:  # no TPU at all  # noqa: S110
         pass
     pytest.skip("needs SparseCore")
 
@@ -123,9 +125,39 @@ def test_sparsecore_pack_matches_xla(num_rows, width, keep_rate):
     vals = _sparse_fixture(num_rows, width, keep_rate)
 
     want = np.asarray(_xla_pack_reference(jnp.asarray(vals)))
-    got = np.asarray(dcp_sc_compact.pack_nonnegative(jnp.asarray(vals)))
+    got = np.asarray(dcp_sc_compact.pack_owned_winners(jnp.asarray(vals)))
 
     np.testing.assert_array_equal(got, want)
+
+
+@pytest.mark.parametrize("dcp_size", [2, 4, 8, 16])
+def test_sparsecore_fused_pack_matches_reference(dcp_size):
+    """Fused SparseCore gather + pack matches take_along_axis + reference pack."""
+    _require_sparsecore()
+    num_rows, k = 16, 128
+    rng = np.random.default_rng(20261003)
+    # Slots can come from any rank [0, dcp_size * k)
+    slots = np.stack(
+        [
+            rng.choice(dcp_size * k, size=k, replace=False).astype(np.int32)
+            for _ in range(num_rows)
+        ]
+    )
+    slots[0, -5:] = -1
+    idxs = rng.integers(0, 100000, size=(num_rows, k), dtype=np.int32)
+    idxs[1, -3:] = -1
+
+    for r in range(dcp_size):
+        lo = r * k
+        hi = lo + k
+        ours = (slots >= lo) & (slots < hi)
+        safe = np.maximum(slots, 0)
+        merged = np.where(ours, np.take_along_axis(idxs, safe % k, axis=1), -1)
+        want = _xla_pack_reference(jnp.asarray(merged))
+        got = dcp_sc_compact.pack_owned_winners(
+            jnp.asarray(slots), jnp.asarray(idxs), r
+        )
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 
 def _simulate_merge(num_rows, k, span, dcp_size, interleave_c, seed=20260929):
@@ -162,6 +194,18 @@ def _simulate_merge(num_rows, k, span, dcp_size, interleave_c, seed=20260929):
     return local_idxs, slots, want
 
 
+def _resolve_owned_winners(local_idxs, slots, k, dcp_rank):
+    """Stage 3 of `streamindex_topk_dcp`, which inlines it: keep and pack ours.
+
+    The candidate all-gather is rank-major, so flat column `c` came from rank
+    `c // k` at that rank's own slot `c % k`.
+    """
+    safe = jnp.maximum(slots, 0)
+    ours = (slots >= 0) & (jnp.floor_divide(safe, k) == dcp_rank)
+    mine = jnp.take_along_axis(local_idxs, jnp.mod(safe, k), axis=1)
+    return dcp_sc_compact.pack_owned_winners(jnp.where(ours, mine, -1))
+
+
 @pytest.mark.parametrize("dcp_size,interleave_c", [(2, 1), (4, 4), (8, 4), (8, 64)])
 def test_resolve_partitions_the_global_topk(dcp_size, interleave_c):
     """The ranks' packed outputs reassemble the global top-k, each entry once."""
@@ -172,7 +216,7 @@ def test_resolve_partitions_the_global_topk(dcp_size, interleave_c):
     lists = np.stack(
         [
             np.asarray(
-                dcp_sc_compact.resolve_owned_winners(
+                _resolve_owned_winners(
                     jnp.asarray(local_idxs[r]), jnp.asarray(slots), k, jnp.int32(r)
                 )
             )
@@ -267,10 +311,13 @@ def _dcp_case(dcp_size, seed):
 
 @pytest.mark.multichip
 @pytest.mark.parametrize("dcp_size", [2, 4, 8])
-def test_dcp_reassembles_the_unsharded_global_topk(dcp_size):
-    """Union the per-rank lists back together; it must be the global top-k"""
+@pytest.mark.parametrize("a2a_merge", [False, True])
+def test_dcp_reassembles_the_unsharded_global_topk(dcp_size, a2a_merge):
+    """Union the per-rank lists back together; it must be the global top-k.
+    Both merge paths; the unsharded reference is all they must agree on."""
     _need_devices(dcp_size)
     rec, args, kwargs = _dcp_case(dcp_size, 0)
+    kwargs["a2a_merge"] = a2a_merge
     q, weights = args[0], args[1]
 
     pages = KV_LEN // PAGE_SIZE
@@ -305,6 +352,72 @@ def test_dcp_reassembles_the_unsharded_global_topk(dcp_size):
         want = set(reference[t][reference[t] >= 0].tolist())
         assert got == want, (
             f"token {t}: {len(want - got)} missing, {len(got - want)} spurious"
+        )
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 4, 8])
+@pytest.mark.parametrize("chunk_tokens", [None, 64])
+def test_a2a_merge_matches_the_all_gather_merge(dcp_size, chunk_tokens):
+    """Slot for slot, not just as a set: the packed order is the contract."""
+    _need_devices(dcp_size)
+    _, args, kwargs = _dcp_case(dcp_size, 5)
+    kwargs["chunk_tokens"] = chunk_tokens
+
+    # Both paths carry cp_rank_as_data's all-to-all; the a2a merge adds exactly
+    # one. The default is what a bucket below TPU_DCP_INDEXER_A2A_MIN_TOKENS runs.
+    def num_a2a(**kw):
+        hlo = streamindex_topk_dcp.lower(*args, **kwargs, **kw).as_text()
+        return len(re.findall(r"all[_-]to[_-]all", hlo))
+
+    n_default, n_a2a = num_a2a(), num_a2a(a2a_merge=True)
+    assert n_a2a == n_default + 1, (
+        f"all-to-alls: default {n_default}, a2a {n_a2a}; the default merge paid"
+        " the all-to-all, or the a2a path ran the all-gather merge"
+    )
+
+    gather = np.asarray(streamindex_topk_dcp(*args, **kwargs))
+    a2a = np.asarray(streamindex_topk_dcp(*args, **kwargs, a2a_merge=True))
+    np.testing.assert_array_equal(a2a, gather)
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 4, 8])
+def test_all_to_all_round_trip_preserves_token_order(dcp_size):
+    """The a2a scatter and the all-gather restore must agree on block order;
+    if they do not, every rank merges a full, plausible, wrong token."""
+    _need_devices(dcp_size)
+    rows, width = 4 * dcp_size, 8
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:dcp_size]), (DCP_AXIS_NAME,))
+
+    def _local(token_ids):
+        # Every rank starts with the same [rows, width] of token ids.
+        scattered = jax.lax.all_to_all(
+            token_ids, DCP_AXIS_NAME, split_axis=0, concat_axis=1, tiled=True
+        )
+        # [rows/dcp, dcp * width]: every peer sent this rank the same block.
+        blocks = scattered.reshape(-1, dcp_size, width)
+        return jax.lax.all_gather(blocks[:, 0, :], DCP_AXIS_NAME, axis=0, tiled=True)
+
+    token_ids = jnp.broadcast_to(
+        jnp.arange(rows, dtype=jnp.int32)[:, None], (rows, width)
+    )
+    out = jax.jit(
+        jax.shard_map(
+            _local,
+            mesh=mesh,
+            in_specs=(P(),),
+            out_specs=P(DCP_AXIS_NAME),
+            check_vma=False,
+        )
+    )(token_ids)
+
+    got = np.asarray(out).reshape(dcp_size, rows, width)
+    for r in range(dcp_size):
+        np.testing.assert_array_equal(
+            got[r],
+            np.asarray(token_ids),
+            err_msg=f"rank {r} came back with the token axis permuted",
         )
 
 

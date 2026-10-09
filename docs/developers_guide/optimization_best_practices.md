@@ -116,7 +116,7 @@ most often in review; for the underlying hardware model, see §3.
   (`NotImplementedError` for MoE initially) → `process_weights_after_loading`
   reshaping to TPU-friendly shapes → `apply` dispatching to the kernel →
   unit test that loads and runs a real model. Home:
-  `layers/vllm/quantization/`, subclassing the upstream vLLM method (R-3.1).
+  `layers/adapter/quantization/`, subclassing the upstream vLLM method (R-3.1).
 - **Q-3** **Numeric verification is non-negotiable**: before/after eval
   (e.g. MMLU/gsm8k) plus serving benchmark on the identical rig, with exact
   repro commands in the PR, in separate "Numeric validation" and

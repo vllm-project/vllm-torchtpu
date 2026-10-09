@@ -212,6 +212,69 @@ def _resolve_indexer_kv_cache_mode(
     return "pallas", kv_layout
 
 
+def _dcp_indexer_a2a_for_bucket(
+    num_tokens: int, enabled: bool, min_tokens: int
+) -> bool:
+    """Whether the DCP indexer merge for this token bucket uses the all-to-all.
+
+    `num_tokens` is the static padded bucket, so this picks one merge per
+    compiled variant: decode-sized buckets keep the all-gather merge and
+    prefill-sized ones (>= `min_tokens`) take the all-to-all.
+    """
+    return enabled and num_tokens >= min_tokens
+
+
+def _topk_rows_update_jax(buf: jax.Array, rows: jax.Array) -> jax.Array:
+    """`buf[:rows.shape[0]] = rows` as one row update of a donated buffer."""
+    return jax.lax.dynamic_update_slice(buf, rows.astype(buf.dtype), (0, 0))
+
+
+# The shared top-k table's row update, donating the table.
+#
+# `buf[:n] = rows` on the module buffer reaches XLA as a graph input that is
+# mutated but not donated -- aot_autograd returns the new value and writes it
+# back after the graph -- plus a view write lowered as two row updates of the
+# same base. Both force a full `[max_num_batched_tokens, width]` copy of the
+# table in every indexed layer. Routing the write through a donating op with a
+# `copy_` writeback (the KV-cache pattern) marks the table a buffer donor, so
+# XLA updates it in place. Built at import, not lazily: dynamo cannot trace the
+# op's construction from inside a compiled forward.
+_TOPK_ROWS_UPDATE_OP = pallas.jax_op(
+    "pallas::indexer_topk_rows_update", _topk_rows_update_jax, donate_argnums=(0,)
+)
+
+
+# torch.compile traces the forward with fake tensors (shape and dtype, no data),
+# so it can't run the JAX function to learn what this op returns. This fake
+# tells it: a tensor shaped like `buf`, i.e. the whole updated table, which the
+# caller copies back into `buf`. The real `_topk_rows_update_jax` runs only
+# when the compiled graph executes.
+def _fake_topk_rows_update(buf: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+    del rows
+    return torch.empty_like(buf)
+
+
+_TOPK_ROWS_UPDATE_OP.register_fake(_fake_topk_rows_update)
+
+
+def _topk_rows(
+    buf: torch.Tensor, topk_tokens: int, num_tokens: int, topk_indices: torch.Tensor
+) -> torch.Tensor:
+    """The `[num_tokens, buf.shape[1]]` rows the -1 fill plus partial write
+    would leave at the top of `buf`: the top-k, then -1, clamped to `buf`.
+
+    The top-k kernels return one row per query token, so only the columns
+    ever need -1 padding.
+    """
+    num_tokens = min(num_tokens, buf.shape[0])
+    rows = topk_indices[:num_tokens, :topk_tokens].to(buf.dtype)
+    assert rows.shape[0] == num_tokens, (rows.shape, num_tokens)
+    pad_cols = buf.shape[1] - rows.shape[1]
+    if pad_cols:
+        rows = torch.nn.functional.pad(rows, (0, pad_cols), value=-1)
+    return rows
+
+
 def _cp_scatter_indexer_k(
     cache_kv: jax.Array,
     k_packed: jax.Array,
@@ -464,6 +527,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # Chunking cuts the replicated query-token axis, which is orthogonal to
         # the KV axis DCP shards, so the same knob applies here unchanged.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+        a2a_merge = envs.TPU_DCP_INDEXER_A2A_MERGE
+        a2a_min_tokens = envs.TPU_DCP_INDEXER_A2A_MIN_TOKENS
         kv_cache_mode = (
             envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
             if envs.is_indexer_kv_cache_mode_explicit()
@@ -517,6 +582,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 num_queries_per_block=(1, 128, 128),
                 kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
+                a2a_merge=_dcp_indexer_a2a_for_bucket(
+                    q.shape[0], a2a_merge, a2a_min_tokens
+                ),
             )
             return cache_kv, local_topk
 
@@ -653,12 +721,24 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 distribution,
             )
 
-        self.topk_indices_buffer[: hidden_states.shape[0]] = -1
-        num_out = min(topk_indices.shape[0], self.topk_indices_buffer.shape[0])
-        # Both branches return `topk_tokens`-wide rows.
-        topk = self.topk_tokens
-        self.topk_indices_buffer[:num_out, :topk] = topk_indices[:num_out]
-        return self.topk_indices_buffer
+        return self._write_topk_rows(hidden_states.shape[0], topk_indices)
+
+    def _write_topk_rows(
+        self, num_tokens: int, topk_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """The rows the -1 fill plus partial write would leave, in one update.
+
+        Writes the `_topk_rows` with a single row update through a donating op
+        (see `_TOPK_ROWS_UPDATE_OP`), so XLA updates the table in place: same
+        contents, no full-table copy per indexed layer. Returns those rows
+        rather than the buffer, so attention reads them instead of a whole
+        `[max_num_batched_tokens, width]` buffer version. The buffer still gets
+        the same contents for the layers that reuse it.
+        """
+        buf = self.topk_indices_buffer
+        rows = _topk_rows(buf, self.topk_tokens, num_tokens, topk_indices)
+        buf.copy_(_TOPK_ROWS_UPDATE_OP(buf, rows))
+        return rows
 
 
 class VllmTPUIndexerCache(DeepseekV32IndexerCache):

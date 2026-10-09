@@ -147,7 +147,7 @@ def release_memory_to_os() -> None:
     gc.collect()
     try:  # noqa: SIM105 (malloc_trim exists only on glibc)
         ctypes.CDLL(None).malloc_trim(0)
-    except Exception:
+    except Exception:  # noqa: S110
         pass
 
 

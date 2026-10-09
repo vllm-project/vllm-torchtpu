@@ -10,6 +10,10 @@ from vllm.model_executor.models.interfaces import (
 from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner.mm_video_chunking import (
+    embed_multimodal_chunked,
+    get_video_chunk_patch_size,
+)
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
@@ -234,6 +238,35 @@ class MMEncoderManager(EncoderCudaGraphManager):
             self.graph_misses += num_items
             with torch.inference_mode():
                 return self.model.encoder_eager_forward(mm_kwargs, path=path)
+
+    def _execute_local(
+        self,
+        mm_kwargs: dict[str, Any],
+    ) -> list[torch.Tensor]:
+        """Execute locally, temporally chunking videos that exceed max budget."""
+        item_specs = self._get_item_specs(mm_kwargs)
+        total_tokens = sum(spec.output_tokens for spec in item_specs)
+        max_budget = max(self.token_budgets, default=0)
+        # When total batch tokens exceed the largest compiled bucket
+        # (max_budget), embed_multimodal_chunked temporally splits oversized
+        # videos so each call to upstream _execute_local fits in a compiled
+        # bucket, avoiding unbucketed eager fallback, XLA recompilation, and
+        # VMEM OOM on long videos.
+        if total_tokens > max_budget > 0:
+            total_patches = sum(spec.input_size for spec in item_specs)
+            max_patches = get_video_chunk_patch_size(
+                self.vllm_config.model_config,
+                default_max_patches=max_budget * total_patches // total_tokens,
+            )
+            if max_patches > 0:
+                return list(
+                    embed_multimodal_chunked(
+                        lambda **kw: super(MMEncoderManager, self)._execute_local(kw),
+                        mm_kwargs,
+                        max_patches,
+                    )
+                )
+        return super()._execute_local(mm_kwargs)
 
     @torch.no_grad()
     def execute_dp_coordinated(

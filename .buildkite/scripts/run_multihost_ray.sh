@@ -96,7 +96,7 @@ run_ray_multihost() {
   # Run the benchmark command inside the head container
   set +e
   echo "--- Running command in head container: $*"
-  docker exec -w /root/torchtpu-vllm node bash -c '
+  docker exec -w /workspace/vllm-torchtpu node bash -c '
     umask 000
     rm -rf /perf_eval_results/*
     "$@"

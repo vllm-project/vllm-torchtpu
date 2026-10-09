@@ -62,7 +62,7 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
             quant_cfg = getattr(hf_config, "quantization_config", None) or {}
             if isinstance(quant_cfg, dict) and quant_cfg.get("scale_fmt") == "ue8m0":
                 return True
-        except Exception:
+        except Exception:  # noqa: S110
             pass
         return super().is_scale_e8m0
 

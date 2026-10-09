@@ -54,6 +54,8 @@ AXIS = "d"
 # Columns of the intermediate the requantization does at a time. Chunking
 # it keeps the live bf16 intermediate down; the width is a tuned choice.
 QCHUNK = 512
+# Output columns the four-bit FFN contracts at a time.
+FP4_OUTPUT_CHUNK = 256
 # How many tile heights the FFN body is emitted at, where it is emitted at
 # more than one. A tile runs the smallest rung that covers its live rows, so
 # an expert's short tail tile stops computing a full tile_m of rows nothing
@@ -353,7 +355,8 @@ def expert_ffn_blockscale(
     their own scales, w1s_blocks [nb1, 2*inter] and w2s_blocks [nb2, hidden].
 
     Each contraction block carries its own scale, on blocks already widened
-    to fp8: w1_block(b) and w2_block(b) return weight k-block b in fp8, and
+    to fp8: w1_block(b, n_start, n_end) and w2_block(b, n_start, n_end) return columns
+    [n_start, n_end) of weight k-block b in fp8, and
     the widening is the CALLER's. It has to be, because it is a Mosaic
     bitcast on a VMEM reference, which has no host form and so cannot be
     shared with the eight-bit body the way the rest of this function is.
@@ -363,31 +366,33 @@ def expert_ffn_blockscale(
     """
     n_blocks1, n_blocks2 = w1s_blocks.shape[0], w2s_blocks.shape[0]
     inter = w1s_blocks.shape[-1] // 2
-    acc1 = None
-    for b in range(n_blocks1):
-        part = lax.dot_general(
-            act_q[:, b * qb : (b + 1) * qb],
-            w1_block(b),
-            DN,
-            preferred_element_type=jnp.float32,
-        )
-        part = part * w1s_blocks[b][None, :]
-        acc1 = part if acc1 is None else acc1 + part
+    hidden = w2s_blocks.shape[-1]
+
+    def contract(lhs, rhs_block, scales, n_blocks, n_out):
+        chunks = []
+        for n_start in range(0, n_out, FP4_OUTPUT_CHUNK):
+            n_end = min(n_start + FP4_OUTPUT_CHUNK, n_out)
+            acc = None
+            for b in range(n_blocks):
+                part = lax.dot_general(
+                    lhs[:, b * qb : (b + 1) * qb],
+                    rhs_block(b, n_start, n_end),
+                    DN,
+                    preferred_element_type=jnp.float32,
+                )
+                part = part * scales[b : (b + 1), n_start:n_end]
+                acc = part if acc is None else acc + part
+            assert acc is not None
+            chunks.append(acc)
+        return jnp.concatenate(chunks, axis=-1)
+
+    acc1 = contract(act_q, w1_block, w1s_blocks, n_blocks1, 2 * inter)
     # The block scales are already inside acc1, so the halves this builds
     # are the true activation values and owe no further weight scale.
     mid_q, mid_scale = _intermediate_rows(
         acc1, act_scale, inter, w1s=None, act_fn=act_fn, w1b=w1b
     )
-    acc2 = None
-    for b in range(n_blocks2):
-        part = lax.dot_general(
-            mid_q[:, b * qb : (b + 1) * qb],
-            w2_block(b),
-            DN,
-            preferred_element_type=jnp.float32,
-        )
-        part = part * w2s_blocks[b][None, :]
-        acc2 = part if acc2 is None else acc2 + part
+    acc2 = contract(mid_q, w2_block, w2s_blocks, n_blocks2, hidden)
     return acc2, mid_scale
 
 
@@ -1012,21 +1017,39 @@ def _build_fused_ep_moe_kernel(
             # Each widens one k-block: u32 [qb/8, N] -> fp4 [qb, N] -> fp8.
             packed_rows = rhs_qb // PACK4
 
-            def w1_block(b):
-                if wait_slab is not None:
+            def w1_block(b, n_start, n_end):
+                # N.B. b is the contraction-block index.
+                if wait_slab is not None and n_start == 0:
                     wait_slab(w1_copy, b)
                 block = pltpu.bitcast(
-                    w1_vm[slot, pl.ds(b * packed_rows, packed_rows), :], FP4
+                    w1_vm[
+                        slot,
+                        pl.ds(b * packed_rows, packed_rows),
+                        pl.ds(n_start, n_end - n_start),
+                    ],
+                    FP4,
                 ).astype(FP8)
-                if slab_retired is not None and b == hidden // rhs_qb - 1:
+                # slab_retired starts the next expert's gate/up DMA into the
+                # same VMEM slot. That is only safe after the last read of
+                # the current slab.
+                if (
+                    slab_retired is not None
+                    and b == hidden // rhs_qb - 1
+                    and n_end == 2 * inter
+                ):
                     slab_retired()
                 return block
 
-            def w2_block(b):
-                if wait_slab is not None:
+            def w2_block(b, n_start, n_end):
+                if wait_slab is not None and n_start == 0:
                     wait_slab(w2_copy, b)
                 return pltpu.bitcast(
-                    w2_vm[slot, pl.ds(b * packed_rows, packed_rows), :], FP4
+                    w2_vm[
+                        slot,
+                        pl.ds(b * packed_rows, packed_rows),
+                        pl.ds(n_start, n_end - n_start),
+                    ],
+                    FP4,
                 ).astype(FP8)
 
             return w1_block, w2_block

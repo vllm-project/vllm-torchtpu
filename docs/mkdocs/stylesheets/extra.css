@@ -26,6 +26,11 @@ body[data-md-color-scheme="slate"] .md-nav__item--section > label.md-nav__link .
   font-weight: 700;
 }
 
+/* Indent second-layer nav items under section titles */
+[dir="ltr"] .md-nav__item--section > .md-nav {
+  margin-left: 0.15rem;
+}
+
 /* Custom 3-Column Grid for Persona Cards */
 @media screen and (min-width: 961px) {
   .grid.cards.three-columns > ul {

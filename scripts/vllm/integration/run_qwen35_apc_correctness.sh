@@ -25,12 +25,22 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 # max_num_seqs=1 removes batching nondeterminism, so a cold/warm difference is
 # the cache and nothing else. mamba_cache_mode resolves to align on its own.
+#
+# Two token buckets instead of the default ten (16 to 8192, ~45s of compile
+# each). With one sequence a decode step is 1 token and pads to 16; the smokes'
+# prefills run 24 to 4755 tokens, cold or as the uncached tail of a hit, and
+# all pad to 8192, which has to stay: a step above the largest bucket fails the
+# runner's padding assert. Padding the ~70 prefills costs seconds; the eight
+# buckets dropped cost ~6 minutes of boot.
+COMPILATION_CONFIG='{"backend":"vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor","compile_sizes":[16,8192],"inductor_compile_config":{"enable_auto_functionalized_v2":false,"size_asserts":false,"alignment_asserts":false,"scalar_asserts":false}}'
+
 vllm serve "$MODEL" \
   --tensor-parallel-size 4 \
   --enable-expert-parallel \
   --max-model-len 16384 \
   --max-num-batched-tokens 8192 \
   --max-num-seqs 1 \
+  --compilation-config "$COMPILATION_CONFIG" \
   --port "$PORT" \
   --enable-prefix-caching \
   --enable-prompt-tokens-details \

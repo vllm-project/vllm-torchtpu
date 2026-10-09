@@ -1,0 +1,3 @@
+timestamp,vllm_commit_hash,vllm_torchtpu_commit_hash
+2026-10-08 11:30:28,v0.29.0,b94bc6d4f26b4d02913be229dea0b447d6dee547
+2026-10-09 11:26:21,v0.29.0,e778d85d86569f8b88d340e98aca414b1a422266

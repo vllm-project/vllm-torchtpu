@@ -584,7 +584,7 @@ class StreamIndexOBufferedRef(pltpu.BufferedRef):
         sublane_start = bkv_idx * self.num_sublanes
 
         pltpu.make_async_copy(
-            vmem_src.at[pl.ds(0, total_sz)],  # pytype: disable=attribute-error
+            self._unpadded_slice(vmem_src, total_sz),
             scores_hbm.at[
                 pl.ds(dst_start, total_sz),
                 pl.ds(sublane_start, self.num_sublanes),
@@ -616,8 +616,18 @@ class StreamIndexOBufferedRef(pltpu.BufferedRef):
             chunk_idx=self.chunk_idx,
         )
 
-        pltpu.make_async_copy(
-            vmem_src.at[pl.ds(0, total_sz)],
-            vmem_src.at[pl.ds(0, total_sz)],
-            sem,
-        ).wait()
+        unpadded_src = self._unpadded_slice(vmem_src, total_sz)
+        pltpu.make_async_copy(unpadded_src, unpadded_src, sem).wait()
+
+    def _unpadded_slice(self, vmem_src: Any, total_sz: int | jax.Array):
+        """Slices out valid tokens and unpadded sublanes (`num_sublanes`).
+
+        The buffer may give each token more rows (`score_pitch`) than it copies out,
+        so that the kernel's sublane-strided stores into it stay free of bank
+        conflicts.
+
+        Args:
+          vmem_src: one [tokens, rows per token, 128] buffer slot.
+          total_sz: number of tokens copied out.
+        """
+        return vmem_src.at[pl.ds(0, total_sz), pl.ds(0, self.num_sublanes)]

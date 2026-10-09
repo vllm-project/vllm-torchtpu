@@ -1,0 +1,247 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Kimi-K3 1P1D serving the InferenceX AgentX trace replay: prefill and decode
+# each TP8 x DP4 x EP32 on a 2x2x4 slice (k3_1p1d.sh), driven by a chipless
+# client pod that owns the proxy and the benchmark (k3_agentx_client_pod.sh).
+# The client runs off the slices because aiperf's replay is the measurement.
+#
+# Exclusive-topology gives each engine role a slice of its own rather than
+# splitting both across the two. ${WORKLOAD_NAME} and ${IMAGE} are substituted
+# before submission, so a literal dollar is $$; every container is `workload`.
+
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  annotations:
+    tpu-ci.google.com/defaults: standard
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  # <jobset>-<role>-0-<index> under a headless service named for the JobSet,
+  # which is how each host finds its role's hosts and prefill finds decode.
+  network:
+    enableDNSHostnames: true
+  # Both engines serve until told to stop, so the client finishing is what
+  # finishes the run; JobSet then tears the engines down.
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - client
+  replicatedJobs:
+    # A group of its own per role: GKE's TPU webhook derives MEGASCALE_NUM_SLICES
+    # from the group, and two roles sharing one would each wait in libtpu for a
+    # second slice that never joins.
+    - name: prefill
+      groupName: prefill
+      replicas: 1
+      template:
+        spec:
+          parallelism: 4
+          completions: 4
+          # Indexed because enableDNSHostnames requires it.
+          completionMode: Indexed
+          # Over the fleet's default: two cold K3 boots stream 1.5 TB each and
+          # compile before the client's first point.
+          activeDeadlineSeconds: 28800
+          backoffLimit: 0
+          template:
+            spec:
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: 2x2x4
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              containers:
+                - name: workload
+                  image: ${IMAGE}
+                  command: ["/bin/bash", "/workspace/vllm-torchtpu/.buildkite/kubernetes/k3_1p1d.sh", "prefill"]
+                  env:
+                    # Host i of this role is <prefix>i.<domain>.
+                    - name: ROLE_HOST_PREFIX
+                      value: ${WORKLOAD_NAME}-prefill-0-
+                    - name: ROLE_HOST_DOMAIN
+                      value: ${WORKLOAD_NAME}
+                    - name: DECODE_HOST
+                      value: ${WORKLOAD_NAME}-decode-0-0.${WORKLOAD_NAME}
+                    - name: NUM_HOSTS
+                      value: "4"
+                    # Both roles and the client read this one config.
+                    - name: K3_PD_CONFIG
+                      value: kimi-k3-tp8-dp4-ep-agentx
+                    # Serve only; the client pod drives the run.
+                    - name: K3_PD_EXTERNAL_CLIENT
+                      value: "1"
+                    # The downward API, so it cannot come from the script.
+                    - name: POD_IP
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: status.podIP
+                    - name: TPU_ACCELERATOR_TYPE
+                      value: tpu7x
+                    # As the v7x-16 perf steps: the boot's temporary files are
+                    # tens of GB, more than the container's disk.
+                    - name: TMPDIR
+                      value: /dev/shm
+                    - name: VLLM_XLA_CACHE_PATH
+                      value: /cache/jax/xla
+                    - name: VLLM_CACHE_ROOT
+                      value: /cache/jax/vllm
+                  ports:
+                    - containerPort: 8000
+                  # Only the chips: memory comes from the shape's profile, and a
+                  # cpu request can stop the pool scaling up at all.
+                  resources:
+                    limits:
+                      google.com/tpu: "4"
+                    requests:
+                      google.com/tpu: "4"
+                  volumeMounts:
+                    # profile_cache must not persist, or a later run loads the
+                    # kv=0 graph instead of compiling it.
+                    - name: vllm-profile-cache
+                      mountPath: /cache/jax/vllm/profile_cache
+              volumes:
+                - name: vllm-profile-cache
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 16Gi
+
+    - name: decode
+      groupName: decode
+      replicas: 1
+      template:
+        spec:
+          parallelism: 4
+          completions: 4
+          completionMode: Indexed
+          activeDeadlineSeconds: 28800
+          backoffLimit: 0
+          template:
+            spec:
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: 2x2x4
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              containers:
+                - name: workload
+                  image: ${IMAGE}
+                  command: ["/bin/bash", "/workspace/vllm-torchtpu/.buildkite/kubernetes/k3_1p1d.sh", "decode"]
+                  env:
+                    # Host i of this role is <prefix>i.<domain>.
+                    - name: ROLE_HOST_PREFIX
+                      value: ${WORKLOAD_NAME}-decode-0-
+                    - name: ROLE_HOST_DOMAIN
+                      value: ${WORKLOAD_NAME}
+                    - name: DECODE_HOST
+                      value: ${WORKLOAD_NAME}-decode-0-0.${WORKLOAD_NAME}
+                    - name: NUM_HOSTS
+                      value: "4"
+                    # Both roles and the client read this one config.
+                    - name: K3_PD_CONFIG
+                      value: kimi-k3-tp8-dp4-ep-agentx
+                    # Serve only; the client pod drives the run.
+                    - name: K3_PD_EXTERNAL_CLIENT
+                      value: "1"
+                    - name: POD_IP
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: status.podIP
+                    - name: TPU_ACCELERATOR_TYPE
+                      value: tpu7x
+                    - name: TMPDIR
+                      value: /dev/shm
+                    - name: VLLM_XLA_CACHE_PATH
+                      value: /cache/jax/xla
+                    - name: VLLM_CACHE_ROOT
+                      value: /cache/jax/vllm
+                  ports:
+                    - containerPort: 8000
+                  resources:
+                    limits:
+                      google.com/tpu: "4"
+                    requests:
+                      google.com/tpu: "4"
+                  volumeMounts:
+                    - name: vllm-profile-cache
+                      mountPath: /cache/jax/vllm/profile_cache
+              volumes:
+                - name: vllm-profile-cache
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: 16Gi
+
+    # Chipless, so it is scheduled by its requests onto a worker-cpu node rather
+    # than onto a slice, as qwen3.5-397b-1p1d.yaml's benchmark role is.
+    - name: client
+      # Both engines: the proxy fronts the pair, so both must answer /health.
+      dependsOn:
+        - name: prefill
+          status: Ready
+        - name: decode
+          status: Ready
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          # Longer than the engines': it waits out both boots, then runs the
+          # ladder.
+          activeDeadlineSeconds: 32400
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/compute-class: worker-cpu
+              serviceAccountName: tpu-workload
+              containers:
+                - name: workload
+                  image: ${IMAGE}
+                  command: ["/bin/bash", "/workspace/vllm-torchtpu/.buildkite/kubernetes/k3_agentx_client_pod.sh"]
+                  env:
+                    # Each engine head is <name>-<role>-0-0.<name>.
+                    - name: WORKLOAD_NAME
+                      value: ${WORKLOAD_NAME}
+                    # The same config the engines booted; read here for the cases.
+                    - name: K3_PD_CONFIG
+                      value: kimi-k3-tp8-dp4-ep-agentx
+                    # Physical chips the pair holds: 4 hosts x google.com/tpu 4
+                    # per slice, twice. What is billed per chip-hour, and so what
+                    # tokens per dollar is costed over - not the 64 ranks on them.
+                    - name: AGENTX_CHIPS
+                      value: "32"
+                    # This pod's results are the step's only output.
+                    - name: ARTIFACTS_DIR
+                      value: perf_eval_results
+                    # On a chipless pod the torchtpu plugin makes vLLM's CLI
+                    # call torch.device("tpu"), and `import torch` auto-imports
+                    # torch_tpu, whose native init aborts without libtpu.
+                    - name: VLLM_PLUGINS
+                      value: ""
+                    - name: TORCH_DEVICE_BACKEND_AUTOLOAD
+                      value: "0"
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: TMPDIR
+                      value: /tmp
+                  # Guaranteed (request == limit): it shares a worker-cpu node.
+                  # The memory is aiperf tokenizing 100k-token traces; the disk
+                  # is the corpus and the InferenceX checkout.
+                  resources:
+                    requests:
+                      cpu: "12"
+                      memory: "32Gi"
+                      ephemeral-storage: "30Gi"
+                    limits:
+                      cpu: "12"
+                      memory: "32Gi"
+                      ephemeral-storage: "30Gi"

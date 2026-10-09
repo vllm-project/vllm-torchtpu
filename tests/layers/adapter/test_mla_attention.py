@@ -30,6 +30,7 @@ from vllm_torchtpu.layers.adapter.attention import (
 from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
     VllmMLAAttention,
     VllmMultiHeadLatentAttentionWrapper,
+    _dcp_indexer_a2a_for_bucket,
 )
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
@@ -812,6 +813,11 @@ def test_qrep_local_view_matches_the_head_all_gather_order(monkeypatch):
         group = _FakeHeadGatherGroup(per_rank, rank)
         monkeypatch.setattr(cp_mla, "get_dcp_group", lambda g=group: g)
         torch.testing.assert_close(cp_mla.all_gather_heads(per_rank[rank]), grouped)
+        nope_dcp, pe_dcp = cp_mla.all_gather_q_nope_pe_heads(
+            per_rank[rank][..., :3], per_rank[rank][..., 3:], 3
+        )
+        torch.testing.assert_close(nope_dcp, grouped[..., :3])
+        torch.testing.assert_close(pe_dcp, grouped[..., 3:])
         torch.testing.assert_close(
             _FakeQProj(group_size, rank)._local_view(grouped), per_rank[rank]
         )
@@ -905,10 +911,11 @@ def test_mla_forward_qrep_skips_the_gather_and_absorbs_group_heads(monkeypatch):
         )
     )
 
-    def _explode(_tensor):
+    def _explode(*_args):
         raise AssertionError("qrep must not all-gather the query heads")
 
     monkeypatch.setattr(attention_adapter, "all_gather_heads", _explode)
+    monkeypatch.setattr(attention_adapter, "all_gather_q_nope_pe_heads", _explode)
     monkeypatch.setattr(
         attention_adapter,
         "merge_lse_partials_scatter_heads",
@@ -971,6 +978,48 @@ def test_mla_forward_without_qrep_still_gathers(monkeypatch):
     assert len(gathered) == 2
     assert all(t.shape[1] == local_heads for t in gathered)
 
+    # Also verify the default fused Q gather path (`all_gather_q_nope_pe_heads`)
+    fused_calls = []
+    monkeypatch.setattr(
+        attention_adapter,
+        "all_gather_heads",
+        cp_mla.all_gather_heads,
+    )
+    monkeypatch.setattr(
+        attention_adapter,
+        "all_gather_q_nope_pe_heads",
+        lambda nope, pe, rank: (
+            fused_calls.append((nope, pe, rank)),
+            (nope.repeat(1, dcp_size, 1), pe.repeat(1, dcp_size, 1)),
+        )[1],
+    )
+    impl.forward(
+        layer=layer,
+        **inputs,
+        topk_indices=torch.zeros((num_tokens, 8), dtype=torch.int32),
+    )
+    assert len(fused_calls) == 1
+    assert fused_calls[0][0].shape[1] == local_heads
+    assert fused_calls[0][1].shape[1] == local_heads
+    assert fused_calls[0][2] == layer.kv_lora_rank
+
+    # Negative control: disabling TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER falls back
+    # to two separate all_gather_heads calls.
+    unfused_calls = []
+    monkeypatch.setenv("TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", "0")
+    monkeypatch.setattr(
+        attention_adapter,
+        "all_gather_heads",
+        lambda t: (unfused_calls.append(t), t.repeat(1, dcp_size, 1))[1],
+    )
+    impl.forward(
+        layer=layer,
+        **inputs,
+        topk_indices=torch.zeros((num_tokens, 8), dtype=torch.int32),
+    )
+    assert len(unfused_calls) == 2
+    assert len(fused_calls) == 1
+
 
 def test_mla_forward_uses_context_without_runtime_kv_scale_state():
     attention = VllmMLAAttention.__new__(VllmMLAAttention)
@@ -1026,6 +1075,46 @@ def test_indexer_kv_cache_mode_env_validation(monkeypatch):
     monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", "invalid_mode")
     with pytest.raises(ValueError, match="VLLM_TPU_INDEXER_KV_CACHE_MODE"):
         envs.environment_variables["VLLM_TPU_INDEXER_KV_CACHE_MODE"]()
+
+
+@pytest.mark.parametrize(
+    "num_tokens,enabled,min_tokens,expected",
+    [
+        (16, True, 64, False),  # decode bucket keeps the all-gather merge
+        (32, True, 64, False),
+        (64, True, 64, True),  # the threshold itself takes the all-to-all
+        (4096, True, 64, True),
+        (4096, False, 64, False),  # the flag off wins at every bucket
+        (16, False, 0, False),
+        (16, True, 0, True),  # min_tokens=0: all-to-all at every bucket
+    ],
+)
+def test_dcp_indexer_a2a_is_chosen_per_bucket(
+    num_tokens, enabled, min_tokens, expected
+):
+    assert _dcp_indexer_a2a_for_bucket(num_tokens, enabled, min_tokens) is expected
+
+
+def test_dcp_indexer_a2a_env_defaults_and_forwarding(monkeypatch):
+    """Off by default, threshold 64, and both reach the workers on multi-host."""
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    monkeypatch.delenv("TPU_DCP_INDEXER_A2A_MERGE", raising=False)
+    monkeypatch.delenv("TPU_DCP_INDEXER_A2A_MIN_TOKENS", raising=False)
+    assert envs.environment_variables["TPU_DCP_INDEXER_A2A_MERGE"]() is False
+    assert envs.environment_variables["TPU_DCP_INDEXER_A2A_MIN_TOKENS"]() == 64
+
+    monkeypatch.setenv("TPU_DCP_INDEXER_A2A_MERGE", "1")
+    monkeypatch.setenv("TPU_DCP_INDEXER_A2A_MIN_TOKENS", "256")
+    assert envs.environment_variables["TPU_DCP_INDEXER_A2A_MERGE"]() is True
+    assert envs.environment_variables["TPU_DCP_INDEXER_A2A_MIN_TOKENS"]() == 256
+
+    monkeypatch.setenv("TPU_DCP_INDEXER_A2A_MIN_TOKENS", "-1")
+    with pytest.raises(ValueError, match="TPU_DCP_INDEXER_A2A_MIN_TOKENS"):
+        envs.environment_variables["TPU_DCP_INDEXER_A2A_MIN_TOKENS"]()
+
+    assert "TPU_DCP_INDEXER_A2A_MERGE" in TpuPlatform.additional_env_vars
+    assert "TPU_DCP_INDEXER_A2A_MIN_TOKENS" in TpuPlatform.additional_env_vars
 
 
 def test_resolve_indexer_kv_cache_mode_and_fallback_warning(monkeypatch, caplog):

@@ -392,3 +392,105 @@ def test_factory_requires_enabled_and_supported(monkeypatch, enabled, supported)
         constructor.assert_not_called()
     if not enabled:
         supports.assert_not_called()
+
+
+def test_execute_local_chunks_oversized_video_into_compiled_budgets(compile_mock):
+    """Chunk an oversized video so each chunk hits a compiled budget graph."""
+    model = Mock()
+    model.get_encoder_cudagraph_config.return_value = SimpleNamespace(
+        padding_logics={},
+        paths={
+            "default": SimpleNamespace(min_token_budget=None, allow_zero_tokens=False),
+        },
+    )
+    # 4 patches per output token (e.g. spatial_merge_size = 2)
+    model.prepare_encoder_cudagraph_capture_inputs.side_effect = (
+        lambda budget, *args, path: SimpleNamespace(
+            values={"pixel_values": torch.zeros(budget * 4, 2)}
+        )
+    )
+
+    def get_item_specs(mm_kwargs):
+        grid = mm_kwargs["video_grid_thw"]
+        grid_list = grid.tolist() if hasattr(grid, "tolist") else list(grid)
+        return [
+            SimpleNamespace(
+                input_size=int(t) * int(h) * int(w),
+                output_tokens=int(t) * (int(h) // 2) * (int(w) // 2),
+                get_path_output_tokens=lambda path, t=t, h=h, w=w: (
+                    int(t) * (int(h) // 2) * (int(w) // 2)
+                ),
+            )
+            for t, h, w in grid_list
+        ]
+
+    def select_items(mm_kwargs, indices):
+        grid = mm_kwargs["video_grid_thw"]
+        grid_list = grid.tolist() if hasattr(grid, "tolist") else list(grid)
+        pixels = mm_kwargs["pixel_values_videos"]
+        selected_grid = [grid_list[i] for i in indices]
+        return {
+            "pixel_values_videos": pixels,
+            "video_grid_thw": torch.tensor(selected_grid, dtype=torch.int64),
+        }
+
+    def prepare_replay(mm_kwargs, *args, path):
+        return SimpleNamespace(
+            values={"pixel_values": mm_kwargs["pixel_values_videos"]}
+        )
+
+    def postprocess(
+        outputs, indices, per_item_out_tokens, dest, clone, batch_mm_kwargs
+    ):
+        out = outputs["default"]
+        offset = 0
+        for idx in indices:
+            n = per_item_out_tokens[idx]
+            dest[idx] = out[offset : offset + n].clone()
+            offset += n
+
+    model.get_encoder_cudagraph_item_specs.side_effect = get_item_specs
+    model.select_encoder_cudagraph_items.side_effect = select_items
+    model.prepare_encoder_cudagraph_replay_buffers.side_effect = prepare_replay
+    model.postprocess_encoder_output.side_effect = postprocess
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            dtype=torch.float32,
+            multimodal_config=SimpleNamespace(
+                get_limit_per_prompt=lambda _: 0,
+                mm_encoder_tp_mode="weights",
+                video_pruning_rate=None,
+            ),
+        ),
+        compilation_config=SimpleNamespace(
+            cudagraph_mm_encoder=True,
+            encoder_cudagraph_token_budgets=[4, 8],
+            encoder_cudagraph_max_vision_items_per_batch=2,
+            encoder_cudagraph_max_frames_per_batch=0,
+        ),
+    )
+    mgr = mm.MMEncoderManager(config, torch.device("cpu"), model)
+
+    # Forward projects every group of 4 patch rows to 1 output token by summing
+    def compiled_forward(values, *, path):
+        pv = values["pixel_values"]
+        return pv.reshape(-1, 4, 2).sum(dim=1)
+
+    mgr._compiled_budget_forward.side_effect = compiled_forward
+
+    # Video with t=5, h=4, w=4 -> 80 patches -> 20 output tokens (> max budget 8).
+    # Max budget 8 tokens = 32 patches = 2 frames of 4x4, so chunks into:
+    # t=2 (8 tokens, budget 8), t=2 (8 tokens, budget 8), t=1 (4 tokens, budget 4).
+    pixels = torch.arange(160, dtype=torch.float32).reshape(80, 2)
+    mm_kwargs = {
+        "pixel_values_videos": pixels,
+        "video_grid_thw": torch.tensor([[5, 4, 4]], dtype=torch.int64),
+    }
+    outputs = mgr._execute_local(mm_kwargs)
+    assert len(outputs) == 1
+    expected = pixels.reshape(20, 4, 2).sum(dim=1)
+    torch.testing.assert_close(outputs[0], expected)
+    assert mgr.graph_hits == 3
+    assert mgr.graph_misses == 0
+    model.encoder_eager_forward.assert_not_called()

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -192,9 +193,8 @@ def inner_kernel(
 
 def kernel_fn(
     # prefetched inputs (scalar)
-    block_table_ref,
+    token_pages_ref,
     positions_ref,
-    token_to_req_indices_ref,
     kv_slot_mapping_ref,
     is_first_mask_ref,
     is_first_mask_rope_ref,
@@ -211,7 +211,6 @@ def kernel_fn(
     window_scratch_ref,
     *,
     cfgs: config.Configs,
-    block_table_stride: int,
 ):
     """Pallas kernel entry point."""
     grid_size = grid_size_ref[...]
@@ -222,9 +221,7 @@ def kernel_fn(
         state_cache_ref=state_cache_ref,
         cos_sin_cache_ref=cos_sin_cache_ref,
         positions_ref=positions_ref,
-        block_table_ref=block_table_ref,
-        block_table_stride=block_table_stride,
-        token_to_req_indices_ref=token_to_req_indices_ref,
+        token_pages_ref=token_pages_ref,
         kv_slot_mapping_ref=kv_slot_mapping_ref,
         is_first_mask_ref=is_first_mask_ref,
         is_first_mask_rope_ref=is_first_mask_rope_ref,
@@ -388,13 +385,21 @@ def compress_norm_rope_store(
         # TODO: this is confusing, should probably find a better name for it
         pack_factor=cfgs.hbm_pack,
     )
+    # Look up each token's state pages here so the kernel keeps only those
+    # entries in SMEM; the full block table does not fit at long context lengths.
+    pages_per_token = cfgs.pages_to_buffer_per_token
+    offsets = jnp.arange(1 - pages_per_token, 1, dtype=positions.dtype)
+    window_blocks = jnp.maximum(
+        positions[:, None] // state_block_size + offsets[None, :], 0
+    )
+    rows = token_to_req_indices[:, None] * block_table_stride
+    token_pages = block_table[rows + window_blocks].reshape(-1)
     # Outer pallas_call operands, in call order. Optional operands are passed as
     # None to keep kernel_fn's argument positions fixed; pallas drops the Nones
     # when indexing, so alias indices count only the operands actually present.
     scalar_prefetch = (
-        block_table,
+        token_pages,
         positions,
-        token_to_req_indices,
         kv_slot_mapping,
         is_first_mask,
         is_first_mask_rope,
@@ -424,7 +429,9 @@ def compress_norm_rope_store(
     )
     out_shapes = (
         jax.ShapeDtypeStruct(cache.shape, cache.dtype),
-        jax.ShapeDtypeStruct(rope_cache.shape, rope_cache.dtype)
+        jax.ShapeDtypeStruct(
+            cast(jax.Array, rope_cache).shape, cast(jax.Array, rope_cache).dtype
+        )
         if cfgs.dims.has_rope_cache
         else None,
     )
@@ -441,7 +448,7 @@ def compress_norm_rope_store(
     )
 
     out_cache, out_rope_cache = pl.pallas_call(
-        functools.partial(kernel_fn, cfgs=cfgs, block_table_stride=block_table_stride),
+        functools.partial(kernel_fn, cfgs=cfgs),
         out_shape=out_shapes,
         grid_spec=grid_spec,
         input_output_aliases=aliases,

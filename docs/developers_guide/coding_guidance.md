@@ -26,7 +26,7 @@ Two meta-principles organize this document set:
    hardware APIs, sharding specs, or cost models is derived at the point of
    use — never duplicated into a config knob, env var, magic number, or
    redundant member variable. (Rationale: see the
-   [Appendix](#appendix--rationale-for-derive-dont-declare).)
+   [Appendix](#appendix-rationale-for-derive-dont-declare).)
 
 ---
 
@@ -59,7 +59,7 @@ Two meta-principles organize this document set:
   `Optional[int]`), builtin generics (`list[int]`), `StrEnum` for string
   enums. Type-annotate public function signatures. The repo runs `pyrefly`
   at the `default` preset in pre-commit and in CI (see
-  [Type checking](developers_guide/type_checking.md)); code must pass both
+  [Type checking](type_checking.md)); code must pass both
   checks.
 - **R-1.6** Every new file carries the Apache 2.0 license header (copy from a
   sibling file).
@@ -87,11 +87,11 @@ plain wheel; this repo injects TPU behavior through vLLM's
 bridged into torch as custom ops via `torch_tpu._internal.pallas.jax_op`
 (plus the sharded variant, `distributed/sharded_jax_op.py`). This is **one
 example** of the bridge pattern — there are many call sites
-(`layers/vllm/custom_ops/*_op.py`, `fused_moe.py`, `linear_common.py`, …),
+(`layers/adapter/custom_ops/*_op.py`, `fused_moe.py`, `linear_common.py`, …),
 not a single entry point:
 
 ```python
-# layers/vllm/linear_common.py — one instance of the kernel-bridge pattern
+# layers/adapter/linear_common.py — one instance of the kernel-bridge pattern
 op = pallas.jax_op("pallas::quantized_matmul_kernel",
                    functools.partial(quantized_matmul_kernel, ...))
 ```
@@ -101,14 +101,14 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
   | Directory | Role | Allowed dependencies |
   |---|---|---|
   | `kernels/` | JAX/Pallas kernels, tuned tables, kernel-eligibility predicates | jax/pallas + small pure helpers (`utils.py`, `logger.py`). **No vLLM imports, no torch** (torch only inside dedicated adapter files, e.g. `vllm_adapter.py`, that bridge a kernel to the torch side), no env reads |
-  | `layers/common/` | Shared numeric/layout logic usable from any front-end | jax first; keep torch and vLLM imports at the boundary and minimal |
-  | `layers/vllm/` | The vLLM/torch-facing layer: quant methods, fused-MoE wiring, attention backends, `custom_ops/` jax_op bridges | torch, vLLM, layers/common, kernels |
+  | `layers/core/` | Shared numeric/layout logic usable from any front-end | jax first; keep torch and vLLM imports at the boundary and minimal |
+  | `layers/adapter/` | The vLLM/torch-facing layer: quant methods, fused-MoE wiring, attention backends, `custom_ops/` jax_op bridges | torch, vLLM, layers/core, kernels |
   | `platforms/`, `runner/`, `worker/`, `executors/` | vLLM integration surface | thin translation only |
 
 - **R-2.2** **Interface files stay thin.** `platforms/`, `runner/`, and the
-  `layers/vllm/custom_ops/*_op.py` bridges only translate between vLLM/torch
+  `layers/adapter/custom_ops/*_op.py` bridges only translate between vLLM/torch
   and the JAX side. Hardware-specific implementation belongs in
-  `layers/common/` or inside the kernel. No model-specific logic in
+  `layers/core/` or inside the kernel. No model-specific logic in
   model-agnostic files.
 - **R-2.3** **Kernels are self-contained modules.** Everything a kernel needs
   arrives via arguments: no `envs`/`os.environ` reads inside a kernel (the
@@ -140,7 +140,7 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
   | Area | Read first |
   |---|---|
   | `kernels/` | R-2.3, R-2.4, and §1 (Performance) of [optimization_best_practices.md](optimization_best_practices.md) (perf evidence, tuned tables, envelopes) |
-  | `layers/vllm/quantization/`, `layers/common/quantization.py` | §2 (Quantization) of [optimization_best_practices.md](optimization_best_practices.md) (numeric verification, memory validation) |
+  | `layers/adapter/quantization/`, `layers/core/quantization.py` | §2 (Quantization) of [optimization_best_practices.md](optimization_best_practices.md) (numeric verification, memory validation) |
   | `env_override.py`, `__init__.py` startup patches, version pins in `pyproject.toml` | R-2.5, R-2.6 (pins are load-bearing) |
   | `platforms/`, `runner/`, `custom_ops/*_op.py` bridges | R-2.2 (interface files stay thin) |
 
@@ -171,8 +171,8 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
   subclass the common attention/MoE/RoPE implementation — never carry private
   copies. If the common path can't express what a model needs, extend the
   common path.
-- **R-3.3** Shared logic has a designated home (`layers/common/quantization.py`,
-  `layers/common/utils.py`, `utils.py`). When flagging duplication, name the
+- **R-3.3** Shared logic has a designated home (`layers/core/quantization.py`,
+  `layers/core/utils.py`, `utils.py`). When flagging duplication, name the
   exact target file, not just "dedupe".
 - **R-3.4** **When the defect is upstream, fix it upstream** (vLLM, torch-tpu,
   JAX). An emergency local workaround is acceptable only with an explicit
@@ -258,7 +258,7 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
   ```
 
   The anti-pattern is the literal `P("model")` repeated across
-  `layers/common/` (e.g. `gdn_attention.py`, `attention_interface.py`) —
+  `layers/core/` (e.g. `gdn_attention.py`, `attention_interface.py`) —
   every copy is a place a mesh-layout change can miss. New code uses a
   constant; touched code migrates.
 - **R-4.6** **Config flows through vLLM's typed config**, never

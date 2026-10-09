@@ -193,11 +193,21 @@ def test_head_gather_puts_this_ranks_heads_in_its_own_block(rank, monkeypatch):
         got[:, rank * 3 : (rank + 1) * 3].numpy(), per_rank[rank].numpy()
     )
 
+    nope_dcp, pe_dcp = cp_mla.all_gather_q_nope_pe_heads(
+        per_rank[rank][..., :5], per_rank[rank][..., 5:], 5
+    )
+    np.testing.assert_array_equal(nope_dcp.numpy(), got[..., :5].numpy())
+    np.testing.assert_array_equal(pe_dcp.numpy(), got[..., 5:].numpy())
+
 
 def test_head_gather_is_a_noop_without_a_group(monkeypatch):
     monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: None)
     q = torch.ones(2, 3, 4)
     assert cp_mla.all_gather_heads(q) is q
+    q_pe = torch.ones(2, 3, 2)
+    nope_out, pe_out = cp_mla.all_gather_q_nope_pe_heads(q, q_pe, 4)
+    assert nope_out is q
+    assert pe_out is q_pe
 
 
 def test_scatter_merge_is_a_noop_without_a_group(monkeypatch):

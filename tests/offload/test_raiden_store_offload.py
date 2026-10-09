@@ -1456,6 +1456,16 @@ class TestWorkerSideConnector(unittest.TestCase):
         self.assertEqual(conn.get_block_ids_with_load_errors(), {10, 11})
         self.assertEqual(conn.get_block_ids_with_load_errors(), set())
 
+    def test_load_errors_group_index_is_unscoped(self):
+        # The runner calls this whenever failed block ids are reported.
+        conn = self._make_worker_connector()
+        conn._connector_metadata = self._meta(
+            failed_load_device_block_ids=[10, 11],
+        )
+        conn.get_finished(set())
+        self.assertEqual(conn.get_block_ids_with_load_errors(), {10, 11})
+        self.assertIsNone(conn.get_block_ids_with_load_errors_group_index())
+
     def test_build_connector_worker_meta_drains_state(self):
         conn = self._make_worker_connector()
         self.assertIsNone(conn.build_connector_worker_meta())
@@ -2535,6 +2545,10 @@ class _FakeParallelismConfig:
     def __init__(self):
         self.tp_size = -1
         self.tp_rank = -1
+        self.pcp_size = -1
+        self.pcp_rank = -1
+        self.pp_size = -1
+        self.pp_rank = -1
 
 
 class _FakeBackendConfig:
@@ -2800,6 +2814,16 @@ class TestStorageConfig(unittest.TestCase):
                 {},
                 "parallel config",
             ),
+            "PCP size property": (
+                {properties: {"pcp_size": 2}},
+                {},
+                "parallel config",
+            ),
+            "PP size property": (
+                {properties: {"pp_size": 2}},
+                {},
+                "parallel config",
+            ),
             "nested property value": (
                 {properties: {"a": {"b": 1}}},
                 {},
@@ -2887,17 +2911,24 @@ class TestStorageBackendConfigs(unittest.TestCase):
             FAKE_STORAGE_IMPL, _storage_config(), rs.StorageRankCoords(0, 4)
         )
         self.assertEqual(cfg.type, "posix")
-        # The store finds a block by its shard files, whose paths need the TP
-        # size. Raiden reads it from parallelism; the pinned build reads the
-        # tp_size property. The store holds no shard, so it has no TP rank.
-        self.assertEqual((cfg.parallelism.tp_size, cfg.parallelism.tp_rank), (4, -1))
+        # The store finds a block by its shard files, whose paths come from the
+        # declared parallelism axes. The store holds no shard, so it sets sizes
+        # only, leaving ranks at -1.
+        self.assertEqual(
+            (
+                cfg.parallelism.tp_size,
+                cfg.parallelism.tp_rank,
+                cfg.parallelism.pcp_size,
+                cfg.parallelism.pp_size,
+            ),
+            (4, -1, -1, -1),
+        )
         self.assertEqual(
             cfg.properties,
             {
                 "root_dir": "/mnt/kv",
                 "model_name": "org/model",
                 "capacity_bytes": str(1 << 30),
-                "tp_size": "4",
             },
         )
 
@@ -2929,7 +2960,17 @@ class TestStorageBackendConfigs(unittest.TestCase):
             FAKE_STORAGE_IMPL, _storage_config(), rs.StorageRankCoords(2, 4)
         )
         self.assertEqual(cfg.type, "posix")
-        self.assertEqual((cfg.parallelism.tp_rank, cfg.parallelism.tp_size), (2, 4))
+        self.assertEqual(
+            (
+                cfg.parallelism.tp_rank,
+                cfg.parallelism.tp_size,
+                cfg.parallelism.pcp_rank,
+                cfg.parallelism.pcp_size,
+                cfg.parallelism.pp_rank,
+                cfg.parallelism.pp_size,
+            ),
+            (2, 4, -1, -1, -1, -1),
+        )
         self.assertEqual(
             cfg.properties,
             {
@@ -2967,6 +3008,9 @@ class TestStorageBackendConfigs(unittest.TestCase):
             {"tp_rank": 0, "tp_size": 1, "pcp_rank": 2, "pcp_size": 2},
             {"tp_rank": 0, "tp_size": 1, "pcp_rank": -1, "pcp_size": 2},
             {"tp_rank": 0, "tp_size": 1, "pcp_rank": 0, "pcp_size": 0},
+            {"tp_rank": 0, "tp_size": 1, "pp_rank": 2, "pp_size": 2},
+            {"tp_rank": 0, "tp_size": 1, "pp_rank": -1, "pp_size": 2},
+            {"tp_rank": 0, "tp_size": 1, "pp_rank": 0, "pp_size": 0},
         )
         for kwargs in cases:
             with self.subTest(**kwargs), self.assertRaises(ValueError):
@@ -2975,25 +3019,37 @@ class TestStorageBackendConfigs(unittest.TestCase):
     def test_pcp_ranks_get_their_own_shard_files(self):
         from vllm_torchtpu.offload import raiden_store as rs
 
-        # PCP-major, as in raiden P/D registration.
-        coords = rs.StorageRankCoords(tp_rank=1, tp_size=2, pcp_rank=3, pcp_size=4)
-        self.assertEqual((coords.storage_rank, coords.storage_size), (7, 8))
-        # Every (PCP, TP) pair gets a file of its own, and none is skipped.
+        # PP -> PCP -> TP major order.
+        coords = rs.StorageRankCoords(
+            tp_rank=1, tp_size=2, pcp_rank=3, pcp_size=4, pp_rank=1, pp_size=2
+        )
+        self.assertEqual((coords.storage_rank, coords.storage_size), (15, 16))
+        # Every (PP, PCP, TP) tuple gets a distinct storage_rank.
         ranks = sorted(
-            rs.StorageRankCoords(tp, 2, pcp_rank=pcp, pcp_size=4).storage_rank
+            rs.StorageRankCoords(
+                tp, 2, pcp_rank=pcp, pcp_size=4, pp_rank=pp, pp_size=2
+            ).storage_rank
+            for pp in range(2)
             for pcp in range(4)
             for tp in range(2)
         )
-        self.assertEqual(ranks, list(range(8)))
-        # PCP=8, TP=1: PCP rank 5 writes tp8_r5, and the store looks for a
-        # block's files under tp8.
+        self.assertEqual(ranks, list(range(16)))
+        # PCP=8, TP=1: PCP is declared alongside TP=1 (pcp8_r5_tp1_r0).
         worker = rs.build_worker_storage_backend_config(
             FAKE_STORAGE_IMPL,
             _storage_config(),
             rs.StorageRankCoords(0, 1, pcp_rank=5, pcp_size=8),
         )
         self.assertEqual(
-            (worker.parallelism.tp_rank, worker.parallelism.tp_size), (5, 8)
+            (
+                worker.parallelism.tp_rank,
+                worker.parallelism.tp_size,
+                worker.parallelism.pcp_rank,
+                worker.parallelism.pcp_size,
+                worker.parallelism.pp_rank,
+                worker.parallelism.pp_size,
+            ),
+            (0, 1, 5, 8, -1, -1),
         )
         store = rs.build_store_storage_backend_config(
             FAKE_STORAGE_IMPL,
@@ -3001,7 +3057,12 @@ class TestStorageBackendConfigs(unittest.TestCase):
             rs.StorageRankCoords(0, 1, pcp_size=8),
         )
         self.assertEqual(
-            (store.parallelism.tp_size, store.properties["tp_size"]), (8, "8")
+            (
+                store.parallelism.tp_size,
+                store.parallelism.pcp_size,
+                store.parallelism.pp_size,
+            ),
+            (1, 8, -1),
         )
 
     def test_worker_coords_come_from_tp_and_pcp_groups(self):
@@ -3018,10 +3079,17 @@ class TestStorageBackendConfigs(unittest.TestCase):
             ),
             patch("vllm_torchtpu.distributed.pcp.get_pcp_rank", return_value=1),
             patch("vllm_torchtpu.distributed.pcp.get_pcp_world_size", return_value=2),
+            patch(
+                "vllm.distributed.parallel_state.get_pp_group",
+                return_value=SimpleNamespace(rank_in_group=1, world_size=2),
+            ),
         ):
             coords = rs.worker_storage_rank_coords()
         self.assertEqual(
-            coords, rs.StorageRankCoords(tp_rank=3, tp_size=4, pcp_rank=1, pcp_size=2)
+            coords,
+            rs.StorageRankCoords(
+                tp_rank=3, tp_size=4, pcp_rank=1, pcp_size=2, pp_rank=1, pp_size=2
+            ),
         )
 
 
@@ -3036,7 +3104,15 @@ class TestStorageSpec(unittest.TestCase):
         self.root = tmp.name
 
     def _get_manager_and_worker(
-        self, spec, *, tp_rank=2, tp_world_size=4, pcp_rank=0, pcp_world_size=1
+        self,
+        spec,
+        *,
+        tp_rank=2,
+        tp_world_size=4,
+        pcp_rank=0,
+        pcp_world_size=1,
+        pp_rank=0,
+        pp_world_size=1,
     ):
         with (
             _fake_tpu_sync(FAKE_STORAGE_IMPL),
@@ -3063,6 +3139,12 @@ class TestStorageSpec(unittest.TestCase):
             patch(
                 "vllm_torchtpu.distributed.pcp.get_pcp_world_size",
                 return_value=pcp_world_size,
+            ),
+            patch(
+                "vllm.distributed.parallel_state.get_pp_group",
+                return_value=SimpleNamespace(
+                    rank_in_group=pp_rank, world_size=pp_world_size
+                ),
             ),
         ):
             spec.get_manager()
@@ -3095,7 +3177,9 @@ class TestStorageSpec(unittest.TestCase):
         (store_cfg,) = manager_kwargs["secondary_backend_configs"]
         self.assertEqual(store_cfg.properties["root_dir"], self.root)
         self.assertEqual(store_cfg.parallelism.tp_size, 4)
-        self.assertEqual(store_cfg.properties["tp_size"], "4")
+        self.assertEqual(store_cfg.parallelism.pcp_size, -1)
+        self.assertEqual(store_cfg.parallelism.pp_size, -1)
+        self.assertNotIn("tp_size", store_cfg.properties)
         self.assertEqual(store_cfg.properties["direct_io"], "true")
         # The worker registers under its world rank but writes as its TP rank.
         self.assertEqual(worker_kwargs["rank"], 6)
@@ -3113,11 +3197,18 @@ class TestStorageSpec(unittest.TestCase):
             spec, tp_rank=0, tp_world_size=1, pcp_rank=5, pcp_world_size=8
         )
         (store_cfg,) = manager_kwargs["secondary_backend_configs"]
-        self.assertEqual(store_cfg.parallelism.tp_size, 8)
-        self.assertEqual(store_cfg.properties["tp_size"], "8")
+        self.assertEqual(
+            (store_cfg.parallelism.tp_size, store_cfg.parallelism.pcp_size), (1, 8)
+        )
         (worker_cfg,) = worker_kwargs["backend_configs"]
         self.assertEqual(
-            (worker_cfg.parallelism.tp_rank, worker_cfg.parallelism.tp_size), (5, 8)
+            (
+                worker_cfg.parallelism.tp_rank,
+                worker_cfg.parallelism.tp_size,
+                worker_cfg.parallelism.pcp_rank,
+                worker_cfg.parallelism.pcp_size,
+            ),
+            (0, 1, 5, 8),
         )
 
     def test_worker_groups_must_match_config(self):
@@ -3125,7 +3216,7 @@ class TestStorageSpec(unittest.TestCase):
         with self.assertRaisesRegex(AssertionError, "worker group sizes TP=2"):
             self._get_manager_and_worker(spec, tp_rank=0, tp_world_size=2)
         spec = _build_spec({"raiden_storage_path": self.root}, tp_size=1, pcp_size=8)
-        with self.assertRaisesRegex(AssertionError, "PCP=4 != configured"):
+        with self.assertRaisesRegex(AssertionError, "PCP=4, PP=1 != configured"):
             self._get_manager_and_worker(
                 spec, tp_rank=0, tp_world_size=1, pcp_rank=0, pcp_world_size=4
             )
@@ -3147,6 +3238,23 @@ class TestStorageSpec(unittest.TestCase):
             )
         self.assertEqual(spec.storage_config.root_dir, self.root)
         warning.assert_called_once()
+        manager_kwargs, worker_kwargs = self._get_manager_and_worker(
+            spec, pp_rank=1, pp_world_size=2
+        )
+        (store_cfg,) = manager_kwargs["secondary_backend_configs"]
+        self.assertEqual(
+            (store_cfg.parallelism.tp_size, store_cfg.parallelism.pp_size), (4, 2)
+        )
+        (worker_cfg,) = worker_kwargs["backend_configs"]
+        self.assertEqual(
+            (
+                worker_cfg.parallelism.tp_rank,
+                worker_cfg.parallelism.tp_size,
+                worker_cfg.parallelism.pp_rank,
+                worker_cfg.parallelism.pp_size,
+            ),
+            (2, 4, 1, 2),
+        )
 
 
 class TestStoragePlumbing(unittest.TestCase):
