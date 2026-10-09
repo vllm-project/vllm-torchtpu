@@ -911,9 +911,13 @@ def _pick_partition(b: int, n: int, k: int) -> int:
 
     subcore utilization across subcores while fitting in VMEM and VMEM_SHARED.
     """
-    # A cooperative group must fit on one SparseCore's 16 subcores; past that,
-    # slices grow beyond MAX_SLICE_WORDS and run single-buffered (~5% slower).
-    p_min = min(16, _cdiv(n, MAX_SLICE_WORDS))
+    # A cooperative group must fit on one SparseCore's 16 subcores. Its
+    # subcores hold a row's part in up to two MAX_SLICE_WORDS buffers, which
+    # one part may fill alone (single-buffered): fewer subcores per row means
+    # more rows per wave, and every wave pays a fixed synchronization cost.
+    p_min = (
+        1 if n <= MAX_SLICE_WORDS else min(16, max(2, _cdiv(n, 2 * MAX_SLICE_WORDS)))
+    )
     p = 1
     while p < p_min:
         p *= 2

@@ -185,21 +185,20 @@ def _run(scores: np.ndarray, k: int, row_lengths: np.ndarray) -> np.ndarray:
 # production can reach. The expected `P` is asserted separately, not assumed --
 # see
 # `test_partition_factor_is_what_these_tests_assume`. `P` at the 128K shape is
-# 8 rather than 4 because `MAX_SLICE_WORDS` is the *single-buffer* budget and
-# the resident slice is now double-buffered by `emit_pipeline`, so `p_min`
-# doubled.
+# 4: rows are split by their own length into parts of up to two
+# `MAX_SLICE_WORDS`, which a subcore holds single-buffered.
 SHAPES = [
     pytest.param(64, N_SHORT, 2048, 1, id="p1-b64-n10240"),
     pytest.param(16, N_SHORT, 2048, 2, id="p2-b16-n10240"),
-    pytest.param(16, N_128K, 2048, 8, id="p8-b16-n133120"),
-    pytest.param(64, N_128K, 2048, 8, id="p8-b64-n133120"),
-    pytest.param(16, N_128K, 512, 8, id="p8-b16-n133120-k512"),
+    pytest.param(16, N_128K, 2048, 4, id="p4-b16-n133120"),
+    pytest.param(64, N_128K, 2048, 4, id="p4-b64-n133120"),
+    pytest.param(16, N_128K, 512, 4, id="p4-b16-n133120-k512"),
     # The other end of the production bucket ladder. `_dp_coordinated_step`
     # all-reduce-MAXes the token count across the 16 DP ranks, so a step in
     # which any one rank prefills drags every rank to the top bucket -- 1024 at
     # `--max-num-batched-tokens=1024`. It is as much a production shape as 16
     # is, and it is the one that needs 64x as many stage-1 waves as `b=16`.
-    pytest.param(1024, N_128K, 2048, 8, id="p8-b1024-n133120"),
+    pytest.param(1024, N_128K, 2048, 4, id="p4-b1024-n133120"),
 ]
 
 
@@ -311,7 +310,7 @@ def test_topk_concentrated_in_the_last_partition():
     candidate blocks are pure padding and stage 2 has to discard them without
     letting a padded entry outrank a real one.
     """
-    b, n, k, p = 16, N_128K, 2048, 8
+    b, n, k, p = 16, N_128K, 2048, 4
     assert _pick_partition(b, n, k) == p
     rng = np.random.default_rng(SEED)
     scores = np.full((b, n), -1e30, np.float32)
@@ -440,10 +439,10 @@ def _stage_group_ids(monkeypatch, b, n, k, **kwargs) -> list[int | None]:
     [
         (SINGLE_STAGE, 1, dict(scheduling_group_id=3), [3]),
         (SINGLE_STAGE, 1, {}, [None]),
-        (COOPERATIVE, 8, dict(scheduling_group_id=3), [3]),
-        (COOPERATIVE, 8, {}, [None]),
+        (COOPERATIVE, 4, dict(scheduling_group_id=3), [3]),
+        (COOPERATIVE, 4, {}, [None]),
     ],
-    ids=["p1", "p1_none", "p8", "p8_none"],
+    ids=["p1", "p1_none", "p4", "p4_none"],
 )
 def test_each_stage_gets_the_group_id_it_was_given(
     monkeypatch, shape, expected_p, kwargs, expected
@@ -459,7 +458,7 @@ def test_scheduling_group_ids_reach_the_lowered_hlo():
     something. The id has to survive as a frontend attribute, or the call is
     annotated only in the source."""
     b, n, k = COOPERATIVE
-    assert _pick_partition(b, n, k) == 8
+    assert _pick_partition(b, n, k) == 4
     scores = jnp.zeros((b, n), jnp.float32)
     row_lengths = jnp.full((b,), n, jnp.int32)
 
