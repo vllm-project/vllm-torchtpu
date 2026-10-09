@@ -83,6 +83,20 @@ if [[ "${BUILDKITE_MESSAGE:-}" =~ \[skip[[:space:]]ci\] || "${BUILDKITE_MESSAGE:
   exit 0
 fi
 
+# True when every path in $1 is documentation or another file no step reads
+# (docs, md, icons, CODEOWNERS, LICENSE, .git-blame-ignore-revs,
+# .pyrefly-baseline.json). The pre-commit GitHub Action checks
+# .pyrefly-baseline.json and no Buildkite step reads it.
+# .pyrefly-baseline-full.json stays out of this list: only the Buildkite type
+# check reads it.
+only_docs_changed() {
+  local files="$1"
+  local non_skippable
+  non_skippable=$(echo "${files}" | grep -vE "(\.md$|\.ico$|\.png$|^README$|^docs\/|^\.github\/CODEOWNERS$|^LICENSE$|^\.git-blame-ignore-revs$|^\.pyrefly-baseline\.json$)" || true)
+  [[ -n "${files}" && -z "${non_skippable}" ]]
+}
+
+FILES_CHANGED=""
 if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
   BASE_BRANCH=${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-"main"}
   echo "PR detected. Target branch: ${BASE_BRANCH}"
@@ -94,18 +108,19 @@ if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQU
   if [[ -z "${FILES_CHANGED}" ]]; then
     FILES_CHANGED=$(git diff-tree --no-commit-id --name-only -r -m "${BUILDKITE_COMMIT:-HEAD}")
   fi
+elif [[ "${BUILDKITE_SOURCE:-}" != "schedule" ]]; then
+  # Any other build is of a commit, which on main is the squash merge of one PR,
+  # so its diff against its parent is the whole change. Not a scheduled build:
+  # the nightly tests main as it stands, whatever its last commit touched.
+  git fetch origin "${BUILDKITE_COMMIT:-HEAD}" --depth=2 --quiet || true
+  FILES_CHANGED=$(git diff --name-only "${BUILDKITE_COMMIT:-HEAD}^" "${BUILDKITE_COMMIT:-HEAD}" 2>/dev/null || true)
+fi
 
+if [[ -n "${FILES_CHANGED}" ]]; then
   echo "Files changed:"
   echo "${FILES_CHANGED}"
 
-  # Filter out files we want to skip builds for (docs, md, icons, CODEOWNERS, LICENSE,
-  # .git-blame-ignore-revs, .pyrefly-baseline.json). The pre-commit GitHub Action
-  # checks .pyrefly-baseline.json and no Buildkite step reads it.
-  # .pyrefly-baseline-full.json stays out of this list: only the Buildkite type
-  # check reads it.
-  NON_SKIPPABLE_FILES=$(echo "${FILES_CHANGED}" | grep -vE "(\.md$|\.ico$|\.png$|^README$|^docs\/|^\.github\/CODEOWNERS$|^LICENSE$|^\.git-blame-ignore-revs$|^\.pyrefly-baseline\.json$)" || true)
-
-  if [[ -z "${NON_SKIPPABLE_FILES}" && -n "${FILES_CHANGED}" ]]; then
+  if only_docs_changed "${FILES_CHANGED}"; then
     echo "Only documentation/non-code files changed. Skipping CI build."
     exit 0
   else
