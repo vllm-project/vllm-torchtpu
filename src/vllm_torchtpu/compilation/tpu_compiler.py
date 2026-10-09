@@ -513,6 +513,24 @@ def _single_size(compile_range: Range) -> int | None:
     return compile_range.start if compile_range.is_single_size() else None
 
 
+def _inline_int_placeholders(graph: fx.GraphModule, example_inputs: list[Any]) -> None:
+    """Bake a single-size compile's concrete ints into `graph` in place.
+
+    aot_autograd turns every int input back into a SymInt while a ShapeEnv is
+    live, so size arithmetic on the token count (`s // tp * tp` from the
+    sequence-parallel chunk and all-gather) reaches `torch.empty` symbolic and
+    fx_to_mlir rejects it. The placeholders stay, so the calling convention
+    and graph_signature are unchanged; only their uses see the constant.
+    """
+    inlined = False
+    for node, value in zip(shape_variants._placeholder_nodes(graph), example_inputs):
+        if type(value) is int and node.users:
+            node.replace_all_uses_with(value)
+            inlined = True
+    if inlined:
+        graph.recompile()
+
+
 class TpuCompilerAdaptor(CompilerInterface):
     """CompilerInterface implementation for TPU.
 
@@ -871,6 +889,8 @@ class TpuCompilerAdaptor(CompilerInterface):
         # and vLLM keeps its own reference to `graph`. Only the output node
         # moves, so the placeholder signature is unaffected.
         graph = copy.deepcopy(graph)
+        if size is not None:
+            _inline_int_placeholders(graph, example_inputs)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
         caching = (
@@ -996,9 +1016,12 @@ class TpuCompilerAdaptor(CompilerInterface):
 
         logger.info("[TpuCompilerAdaptor] Loading compiled artifact from %s", path)
 
-        # Same deepcopy + output-tuple rewrite as `compile`, so the graph the
-        # artifact is checked against is shaped the way it was when saved.
+        # Same deepcopy, int inlining and output-tuple rewrite as `compile`, so
+        # the graph the artifact is checked against is shaped the way it was
+        # when saved, and the fallback compile below sees static sizes too.
         graph = copy.deepcopy(graph)
+        if size is not None:
+            _inline_int_placeholders(graph, example_inputs)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
         compiled_fn = self._replay(path, graph, was_wrapped)
