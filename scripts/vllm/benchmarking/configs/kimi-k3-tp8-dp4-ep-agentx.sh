@@ -12,13 +12,10 @@
 #   compile_sizes           adds 1,2,4 so the buckets bracket the ladder
 #   serve flags             adds the tool-call parser the traces need
 #   AGENTX_*                the cases and the row labels, which the base has no use for
-#   decode connector        transfer + host offload -> transfer alone, the
-#                           deployment this benchmark has been measured with
 #
 # Nothing else differs. k3_agentx_client_pod.sh reads AGENTX_CONC_LIST from
 # here, as agentx_sweep.sh does for the aggregate lane, so the cases live in one
 # file.
-K3_1P1D_DECODE_OFFLOAD="${K3_1P1D_DECODE_OFFLOAD:-0}"
 # shellcheck source=/dev/null
 source "$(dirname "${BASH_SOURCE[0]}")/kimi-k3-tp8-dp4-ep-1p1d.sh"
 
