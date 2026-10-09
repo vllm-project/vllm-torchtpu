@@ -225,6 +225,7 @@ class DFlashProposer:
         draft_vllm_config = copy.copy(self.vllm_config)
         draft_model_config = copy.copy(self.speculative_config.draft_model_config)
         draft_model_config.runner_type = "draft"
+        draft_vllm_config.model_config = draft_model_config
         with (
             set_model_tag("dflash_head"),
             set_vllm_model_wrapper_context(mesh=self.runner.mesh),

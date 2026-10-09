@@ -37,11 +37,16 @@ from vllm_torchtpu.model_loader_patches import (
 _LOCAL = {0, 1, 27}
 
 
-def test_local_expert_ids_use_loader_ownership_mapping():
+@pytest.mark.parametrize(
+    "runner_type,expected_experts", [("generate", 896), ("draft", 128)]
+)
+def test_local_expert_ids_use_loader_ownership_mapping(runner_type, expected_experts):
     """Run:AI filtering must honor hierarchical EP's loader patch."""
     model_config = SimpleNamespace(
         is_moe=True,
         get_num_experts=lambda: 896,
+        runner_type=runner_type,
+        hf_config=SimpleNamespace(dspark_n_routed_experts=128),
     )
     parallel_config = SimpleNamespace(
         enable_expert_parallel=True,
@@ -85,7 +90,7 @@ def test_local_expert_ids_use_loader_ownership_mapping():
     with patch.dict(sys.modules, fake_modules):
         assert _compute_local_expert_ids() == chip_aware_ids
 
-    compute_ids.assert_called_once_with(896, 32, 11, placement="linear")
+    compute_ids.assert_called_once_with(expected_experts, 32, 11, placement="linear")
 
 
 def test_skips_nonlocal_expert_packed_and_scale():

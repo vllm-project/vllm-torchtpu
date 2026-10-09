@@ -148,6 +148,10 @@ def _compute_local_expert_ids() -> set[int] | None:
     if parallel_config.enable_eplb:
         return None
     num_experts = model_config.get_num_experts()
+    if getattr(model_config, "runner_type", None) == "draft":
+        num_experts = (
+            getattr(model_config.hf_config, "dspark_n_routed_experts", 0) or num_experts
+        )
     if num_experts <= 0:
         return None
 
