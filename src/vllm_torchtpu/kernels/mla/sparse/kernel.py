@@ -492,6 +492,7 @@ def _attention_kernel(
     # Width of the stored output (q_nope's in split-q mode, else head_dim).
     o_dim = head_dim
     if split_q:
+        assert q_pe_hbm_ref is not None
         head_dim = align_to(head_dim + q_pe_hbm_ref.shape[-1], 128)
     nope_dim = kv_cache_utils.WORD_BYTES * kv_cache_utils.TILE_LANE_BYTES
     assert kv_lens_ref.shape[0] == num_tokens
