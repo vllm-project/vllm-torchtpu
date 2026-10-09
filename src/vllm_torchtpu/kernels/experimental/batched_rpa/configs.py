@@ -31,7 +31,7 @@ class BlockSizes:
     bq_c_sz: int
     bkv_sz: int
     batch_size: int
-    n_buffer: int
+    n_buffer: int = 2
 
 
 @dataclasses.dataclass(frozen=True)
@@ -80,6 +80,17 @@ class KVLayout(enum.StrEnum):
                 return "snh"
             case KVLayout.HEAD_ALONG_SUBLANE:
                 return "nhs"
+
+
+# Inputs need three slots. The fetch for a tile is issued throughout the
+# preceding tile rather than all at once at its start, so it cannot be waited
+# on right away -- it needs one extra tile in flight for the DMA to land.
+NUM_INPUT_SLOTS = 3
+
+# Outputs only need two. The writeback issued at step N is waited at the top of
+# step N + 2, which is exactly when slot N % 2 comes back around, so the DMA
+# still gets all of step N + 1 to land.
+NUM_OUTPUT_SLOTS = 2
 
 
 @dataclasses.dataclass(frozen=True)
@@ -205,6 +216,20 @@ class RpaConfigs:
     @property
     def n_buffer(self) -> int:
         return self.block.n_buffer
+
+    def seq_range(
+        self, distribution: jax.Array
+    ) -> tuple[jax.typing.ArrayLike, jax.typing.ArrayLike]:
+        """Sequences this kernel call schedules.
+
+        Batched RPA has no specialised prefill-only path, so MIXED also covers the
+        prefill-only segment [distribution[0], distribution[1]).
+        """
+        if self.mode == RpaCase.DECODE:
+            return 0, distribution[0]
+        if self.mode == RpaCase.MIXED:
+            return distribution[0], distribution[2]
+        raise ValueError(f"Batched RPA does not dispatch {self.mode}; use MIXED.")
 
     # Define derived values.
 
@@ -382,6 +407,29 @@ class RpaConfigs:
         )
 
     @property
+    def kv_token_align(self) -> int:
+        """DMA token granularity: the 128-lane tile for SEQ_ALONG_LANE, else 1.
+
+        SEQ_ALONG_LANE packs tokens along the lane dim, so every DMA token count
+        must be a multiple of the 128-lane tile. HEAD_ALONG_SUBLANE puts tokens on
+        the sublane dim, where single tokens are addressable.
+        """
+        if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
+            return pltpu.get_tpu_info().num_lanes
+        return 1
+
+    @property
+    def kv_vmem_lanes(self) -> int:
+        """Lane-dim size of the KV VMEM buffer; SEQ_ALONG_LANE only."""
+        # o = kv from cache, n = kv from new, - = pad. Each [] is a 128-lane cell:
+        #
+        #   want  [onnn][nnnn]
+        #   got   [o---][---n][nnnn][nn--]
+        #
+        # because we fetch at 128-lane boundary, we need 2 extra padding slots
+        return self.block.bkv_sz + 2 * self.kv_token_align
+
+    @property
     def kv_vmem_shape(self):
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return (
@@ -389,7 +437,7 @@ class RpaConfigs:
                 self.model.num_kv_heads * 2,
                 self.aligned_kv_head_dim // self.serve.packing_kv,
                 self.serve.packing_kv,
-                self.block.bkv_sz + 2 * self.serve.page_size,
+                self.kv_vmem_lanes,
             )
         return (
             self.block.batch_size,
