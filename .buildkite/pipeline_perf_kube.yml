@@ -48,7 +48,6 @@ x-shape-2-core: &shape_2_core "tpu7x-standard-1t/1x1x1"
 
 steps:
   - group: ":kubernetes: Perf and Eval on TPU"
-    key: "perf_tpu"
     steps:
       - label: ":kubernetes: Perf/Eval: General suite (TPU v7x-8)"
         <<: *perf_step
@@ -203,146 +202,130 @@ steps:
         commands:
           - .buildkite/kubernetes/run.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimik-2.6-w4a16-tp8-ep --run-lm-eval
 
-  # The three v7x-16 steps below are two-host slices, so they go through
-  # run_multihost.sh and the JobSets in manifests/. They depend on nothing but
-  # the image: the fleet places each JobSet in a 2x2x2 slice of its own, and
-  # Kueue starts them as the cohort has chips to lend that profile.
-  - label: ":kubernetes: Perf/Eval: Nightly glm-5.2-fp8-dp16-ep (TPU v7x-16)"
-    key: "perf_nightly_glm_5_2_fp8_dp16_ep"
-    # Without build_docker this submits a sixteen-chip workload against a tag
-    # that was never pushed and holds the fleet in ImagePullBackOff.
-    depends_on:
-      - "build_docker"
-    if: 'build.env("NIGHTLY") == "1"'
-    timeout_in_minutes: 1440
-    agents:
-      queue: "kube"
-    env:
-      TPU_ACCELERATOR_TYPE: "tpu7x"
-      VLLM_ENGINE_READY_TIMEOUT_S: "7200"
-      BENCHMARK_WARMUP_RUNS: "1"
-    plugins:
-      - *kube_plugin
-    commands:
-      - .buildkite/kubernetes/run_multihost.sh --topology 2x2x2 bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config glm-5.2-fp8-dp16-ep --run-lm-eval
+      # The three v7x-16 steps below are two-host slices, so they go through
+      # run_multihost.sh and the JobSets in manifests/. They depend on nothing but
+      # the image: the fleet places each JobSet in a 2x2x2 slice of its own, and
+      # Kueue starts them as the cohort has chips to lend that profile.
+      - label: ":kubernetes: Perf/Eval: Nightly glm-5.2-fp8-dp16-ep (TPU v7x-16)"
+        # Without build_docker this submits a sixteen-chip workload against a tag
+        # that was never pushed and holds the fleet in ImagePullBackOff.
+        depends_on:
+          - "build_docker"
+        if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 1440
+        agents:
+          queue: "kube"
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+          BENCHMARK_WARMUP_RUNS: "1"
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run_multihost.sh --topology 2x2x2 bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config glm-5.2-fp8-dp16-ep --run-lm-eval
 
-  - label: ":kubernetes: Perf/Eval: Nightly deepseek-v4-pro-dp16-ep (TPU v7x-16)"
-    key: "perf_nightly_deepseek_v4_pro_dp16_ep"
-    depends_on:
-      - "build_docker"
-    if: 'build.env("NIGHTLY") == "1"'
-    timeout_in_minutes: 1440
-    agents:
-      queue: "kube"
-    env:
-      TPU_ACCELERATOR_TYPE: "tpu7x"
-      VLLM_ENGINE_READY_TIMEOUT_S: "14400"
-      BENCHMARK_WARMUP_RUNS: "1"
-      # See common.sh: the compile and the capture together outgrow the pod's
-      # ephemeral storage, and dshm is 128Gi.
-      TMPDIR: "/dev/shm"
-      RAY_TMPDIR: "/tmp"
-    plugins:
-      - *kube_plugin
-    commands:
-      - .buildkite/kubernetes/run_multihost.sh --topology 2x2x2 bash .buildkite/kubernetes/benchmark_with_profile.sh deepseek-v4-pro-dp16-ep --run-lm-eval
+      - label: ":kubernetes: Perf/Eval: Nightly deepseek-v4-pro-dp16-ep (TPU v7x-16)"
+        depends_on:
+          - "build_docker"
+        if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 1440
+        agents:
+          queue: "kube"
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "14400"
+          BENCHMARK_WARMUP_RUNS: "1"
+          # See common.sh: the compile and the capture together outgrow the pod's
+          # ephemeral storage, and dshm is 128Gi.
+          TMPDIR: "/dev/shm"
+          RAY_TMPDIR: "/tmp"
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run_multihost.sh --topology 2x2x2 bash .buildkite/kubernetes/benchmark_with_profile.sh deepseek-v4-pro-dp16-ep --run-lm-eval
 
-  # GLM-5.2 again, and deliberately the same config: what is under test is the
-  # bootstrap, not the model. This path is vLLM's own multi-node data
-  # parallelism - one `vllm serve` per host naming a shared
-  # --data-parallel-address, the second --headless - which
-  # src/vllm_torchtpu/distributed/tpu_mp_multihost.py turns into a TorchTPU
-  # slice. The Ray step above never exercises it.
-  #
-  # DATA_PARALLELISM_LOCAL is a step variable on bare metal; here it is
-  # DP_LOCAL in the manifest, beside the parallelism it has to agree with.
-  - label: ":kubernetes: Perf: Nightly glm-5.2-fp8-mp-dp16-ep (TPU v7x-16)"
-    key: "perf_nightly_glm_5_2_fp8_mp_dp16_ep"
-    depends_on:
-      - "build_docker"
-    if: 'build.env("NIGHTLY") == "1"'
-    timeout_in_minutes: 1440
-    agents:
-      queue: "kube"
-    env:
-      TPU_ACCELERATOR_TYPE: "tpu7x"
-      VLLM_ENGINE_READY_TIMEOUT_S: "7200"
-      BENCHMARK_WARMUP_RUNS: "1"
-    plugins:
-      - *kube_plugin
-    commands:
-      - .buildkite/kubernetes/run_multihost.sh --topology 2x2x2 --backend mp glm-5.2-fp8-dp16-ep
+      # GLM-5.2 again, and deliberately the same config: what is under test is the
+      # bootstrap, not the model. This path is vLLM's own multi-node data
+      # parallelism - one `vllm serve` per host naming a shared
+      # --data-parallel-address, the second --headless - which
+      # src/vllm_torchtpu/distributed/tpu_mp_multihost.py turns into a TorchTPU
+      # slice. The Ray step above never exercises it.
+      #
+      # DATA_PARALLELISM_LOCAL is a step variable on bare metal; here it is
+      # DP_LOCAL in the manifest, beside the parallelism it has to agree with.
+      - label: ":kubernetes: Perf: Nightly glm-5.2-fp8-mp-dp16-ep (TPU v7x-16)"
+        depends_on:
+          - "build_docker"
+        if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 1440
+        agents:
+          queue: "kube"
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
+          BENCHMARK_WARMUP_RUNS: "1"
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run_multihost.sh --topology 2x2x2 --backend mp glm-5.2-fp8-dp16-ep
 
-  # Qwen3.5-397B as one prefill and one decode engine with KV transfer between
-  # them. Its pods load their results into BigQuery (BQ_UPLOAD), in the same
-  # table and through the same parse_gke_results.py as before, tagged
-  # runner=kube by CI_RUNNER. It holds eight chips on 2x2x1, so it queues with
-  # the v7x-8 steps rather than taking chips from them.
-  - label: ":kubernetes: Perf: Nightly Qwen3.5-397B 1P1D P/D benchmark"
-    key: "perf_nightly_qwen35_397b_1p1d"
-    depends_on: "build_docker"
-    if: 'build.env("NIGHTLY") == "1"'
-    timeout_in_minutes: 1440
-    agents:
-      queue: "kube"
-    env:
-      CREATED_BY: "${BUILDKITE_SOURCE:-buildkite}"
-      BQ_UPLOAD: "1"
-    plugins:
-      - *kube_plugin
-    commands:
-      - .buildkite/kubernetes/run_multihost.sh --manifest qwen3.5-397b-1p1d.yaml
+      # Qwen3.5-397B as one prefill and one decode engine with KV transfer between
+      # them. Its pods load their results into BigQuery (BQ_UPLOAD), in the same
+      # table and through the same parse_gke_results.py as before, tagged
+      # runner=kube by CI_RUNNER. It holds eight chips on 2x2x1, so it queues with
+      # the v7x-8 steps rather than taking chips from them.
+      - label: ":kubernetes: Perf: Nightly Qwen3.5-397B 1P1D P/D benchmark"
+        depends_on: "build_docker"
+        if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 1440
+        agents:
+          queue: "kube"
+        env:
+          CREATED_BY: "${BUILDKITE_SOURCE:-buildkite}"
+          BQ_UPLOAD: "1"
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run_multihost.sh --manifest qwen3.5-397b-1p1d.yaml
 
-  # The Kimi-K3 step runs last. It takes the 2x2x4 queue's own chips, which the
-  # v7x-8 and v7x-16 steps above borrow while it is idle; started alongside
-  # those steps, Kueue would evict them to give the chips back. So it waits for
-  # everything before it, failed or not.
-  #
-  # Prefill TP8 x DP4 x EP32 to decode TP8 x DP4 x EP32, each on its own 2x2x4
-  # slice.
-  - label: ":kubernetes: Perf/Eval: Nightly Kimi-K3 1P1D (TPU v7x 2x2x4 x2)"
-    key: "perf_nightly_kimi_k3_1p1d"
-    depends_on:
-      - "build_docker"
-      - step: "perf_tpu"
-        allow_failure: true
-      - step: "perf_nightly_glm_5_2_fp8_dp16_ep"
-        allow_failure: true
-      - step: "perf_nightly_deepseek_v4_pro_dp16_ep"
-        allow_failure: true
-      - step: "perf_nightly_glm_5_2_fp8_mp_dp16_ep"
-        allow_failure: true
-      - step: "perf_nightly_qwen35_397b_1p1d"
-        allow_failure: true
-    if: 'build.env("NIGHTLY") == "1"'
-    timeout_in_minutes: 1440
-    agents:
-      queue: "kube"
-    plugins:
-      - *kube_plugin
-    commands:
-      - .buildkite/kubernetes/run_multihost.sh --manifest kimi-k3-1p1d-4dp8tp.yaml
+      # Both Kimi-K3 pairs take two 2x2x4 slices, the queue's whole nominal
+      # quota, so they run one at a time through an org-wide concurrency group
+      # that any other two-slice step can join. They start with the rest of the
+      # lane: 2x2x4 reclaims only from lower-priority borrowers (ci-infra #755),
+      # so Kueue hands a pair its slices as the steps borrowing them finish
+      # rather than evicting those steps.
+      #
+      # Prefill TP8 x DP4 x EP32 to decode TP8 x DP4 x EP32, each on its own 2x2x4
+      # slice.
+      - label: ":kubernetes: Perf/Eval: Nightly Kimi-K3 1P1D (TPU v7x 2x2x4 x2)"
+        depends_on:
+          - "build_docker"
+        concurrency_group: "tpu/v7x-2x2x4"
+        concurrency: 1
+        if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 1440
+        agents:
+          queue: "kube"
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run_multihost.sh --manifest kimi-k3-1p1d-4dp8tp.yaml
 
-  # The second Kimi-K3 pair: the same TP8 x DP4 x EP32 shape, replaying the
-  # InferenceX AgentX trace corpus from a chipless client pod instead of running
-  # the correctness stages. This is the workload the submission is scored on.
-  #
-  # Last, and after the correctness pair rather than beside it: each pair takes
-  # two 2x2x4 slices, so two at once is four and Kueue would evict one to serve
-  # the other. One dependency is enough - that step already waits for everything
-  # the chips are borrowed by - and failure is allowed, since this lane needs the
-  # chips free rather than the steps before it green.
-  - label: ":kubernetes: :tpu: Perf: Nightly Kimi-K3 AgentX 1P1D (TPU v7x 2x2x4 x2)"
-    key: "perf_nightly_kimi_k3_agentx_1p1d"
-    depends_on:
-      - "build_docker"
-      - step: "perf_nightly_kimi_k3_1p1d"
-        allow_failure: true
-    if: 'build.env("NIGHTLY") == "1"'
-    timeout_in_minutes: 1440
-    agents:
-      queue: "kube"
-    plugins:
-      - *kube_plugin
-    commands:
-      - .buildkite/kubernetes/run_multihost.sh --manifest kimi-k3-agentx-1p1d.yaml
+      # The second Kimi-K3 pair: the same TP8 x DP4 x EP32 shape, replaying the
+      # InferenceX AgentX trace corpus from a chipless client pod instead of running
+      # the correctness stages. This is the workload the submission is scored on.
+      # It shares the correctness pair's concurrency group, so the two never hold
+      # four slices at once.
+      - label: ":kubernetes: :tpu: Perf: Nightly Kimi-K3 AgentX 1P1D (TPU v7x 2x2x4 x2)"
+        depends_on:
+          - "build_docker"
+        concurrency_group: "tpu/v7x-2x2x4"
+        concurrency: 1
+        if: 'build.env("NIGHTLY") == "1"'
+        timeout_in_minutes: 1440
+        agents:
+          queue: "kube"
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run_multihost.sh --manifest kimi-k3-agentx-1p1d.yaml
