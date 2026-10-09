@@ -31,6 +31,9 @@ from vllm_torchtpu.kernels.collectives.hierrs_tc.wrapper import (
 # the row-streaming kernel is also ahead on memory: it streams through VMEM,
 # where the micro-batched one needs 3 bytes per element of work buffers.
 STREAM_MIN_BYTES = 16 << 20
+# Below this many input bytes per device the FP8 quantize pass costs more than
+# the halved wire bytes save on tpu7x-8, so the call keeps the BF16 wire.
+FP8_MIN_BYTES = 16 << 20
 
 
 def uses_stream(rows: int, hidden: int, itemsize: int) -> bool:
@@ -40,20 +43,53 @@ def uses_stream(rows: int, hidden: int, itemsize: int) -> bool:
     )
 
 
-def make_reduce_scatter_fn(mesh, order: tuple[int, ...], *, axis_name: str):
+def make_reduce_scatter_fn(
+    mesh,
+    order: tuple[int, ...],
+    *,
+    axis_name: str,
+    fp8_comm: bool = False,
+    fp8_static_scale: float | None = None,
+):
     """Reduce-scatter in which mesh index i gets the block of rank `order[i]`.
 
     Both kernels read the blocks in that order themselves, so the input is
-    never copied to reorder it.
+    never copied to reorder it. With `fp8_comm`, calls of at least
+    FP8_MIN_BYTES per device send FP8 between chips, scaled by
+    `fp8_static_scale`.
     """
+    if fp8_static_scale is not None and fp8_static_scale <= 0:
+        raise ValueError(f"fp8_static_scale must be > 0, got {fp8_static_scale}")
+    if fp8_comm and fp8_static_scale is None:
+        raise ValueError(
+            "fp8_comm needs fp8_static_scale: the row-streaming kernel has no "
+            "dynamic FP8 scale."
+        )
     num_devices = len(order)
 
     def local(part: jax.Array) -> jax.Array:
         rows, hidden = part.shape
+        fp8 = fp8_comm and part.nbytes >= FP8_MIN_BYTES
         if uses_stream(rows, hidden, part.dtype.itemsize):
-            return reduce_scatter_stream_local(part, axis_name=axis_name, order=order)
+            if not fp8:
+                return reduce_scatter_stream_local(
+                    part, axis_name=axis_name, order=order
+                )
+            assert fp8_static_scale is not None
+            return reduce_scatter_stream_local(
+                part,
+                axis_name=axis_name,
+                order=order,
+                fp8_comm=True,
+                fp8_static_scale=fp8_static_scale,
+            )
         return hierarchical_reduce_scatter_local(
-            part, num_devices=num_devices, axis_name=axis_name, order=order
+            part,
+            num_devices=num_devices,
+            axis_name=axis_name,
+            order=order,
+            fp8_comm=fp8,
+            fp8_static_scale=fp8_static_scale if fp8 else None,
         )
 
     def reduce_scatter(x: jax.Array) -> jax.Array:

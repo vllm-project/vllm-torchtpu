@@ -31,11 +31,11 @@ from vllm_torchtpu import envs
 
 # The layout constants this kernel is built against, and the host module
 # whose accounting decides what it may declare.
+from vllm_torchtpu.kernels.fp8_wire import quant_apply, row_scale, rowquant_fp8
 from vllm_torchtpu.kernels.fused_moe.v2 import host
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     FP4,
     FP8,
-    FP8_MAX,
     HIDDEN_LANE_BLOCK,
     OUT_PARITIES,
     PACK4,
@@ -183,40 +183,8 @@ def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
     return tuple(range(step, tile_m + 1, step))
 
 
-def _row_scale(amax):
-    """The row scale and its inverse, with the rows that have no usable one.
-
-    A row whose maximum is zero has nothing to scale by, and a row whose
-    maximum is not finite has nothing USEFUL to scale by: the reciprocal of
-    an infinite maximum is zero, so every finite value in that row would
-    multiply to zero and only the infinity would survive, as a NaN. That
-    leaves a plausible-looking mostly-zero row where the row's real content
-    was, and sends an infinite scale over the wire for the combine at the
-    destination shard to multiply back in. Both cases are answered the same
-    way, by the caller zeroing the row whole against `usable`: an obviously
-    empty row rather than a quietly wrong one.
-    """
-    scale = amax.astype(jnp.float32) / FP8_MAX
-    usable = jnp.isfinite(scale) & (scale > 0)
-    scale = jnp.where(usable, scale, 0.0)
-    sinv = jnp.where(usable, 1.0 / jnp.where(usable, scale, 1.0), 0.0)
-    return scale, sinv, usable
-
-
-def rowquant_fp8(x):
-    """Per-row dynamic fp8 quant, reducing and applying in bf16."""
-    amax = jnp.max(jnp.abs(x), axis=-1, keepdims=True)
-    scale, sinv, usable = _row_scale(amax)
-    return _quant_apply(x, sinv.astype(x.dtype), usable), scale
-
-
 def _absmax_rows(x):
     return jnp.max(jnp.abs(x), axis=-1, keepdims=True)
-
-
-def _quant_apply(x, sinv_native, usable):
-    """Quantize a row, or zero it whole where its scale is unusable."""
-    return jnp.where(usable, x * sinv_native, jnp.zeros_like(x)).astype(FP8)
 
 
 def wire_row_and_scale(
@@ -308,10 +276,10 @@ def _intermediate_rows(acc1, act_scale, inter, *, w1s, act_fn, w1b, requantize=T
             amax = chunk_amax if amax is None else jnp.maximum(amax, chunk_amax)
     if not requantize:
         return jnp.concatenate(mid_chunks, axis=-1), None
-    mid_scale, mid_sinv, usable = _row_scale(amax)
+    mid_scale, mid_sinv, usable = row_scale(amax)
     sinv_bf16 = mid_sinv.astype(jnp.bfloat16)
     mid_q = jnp.concatenate(
-        [_quant_apply(chunk, sinv_bf16, usable) for chunk in mid_chunks], axis=-1
+        [quant_apply(chunk, sinv_bf16, usable) for chunk in mid_chunks], axis=-1
     )
     return mid_q, mid_scale
 
