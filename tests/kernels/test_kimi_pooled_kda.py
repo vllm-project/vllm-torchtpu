@@ -25,7 +25,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.kda_attention_op import (
 # Kimi-Linear TP8 shard geometry on an MLA pool.
 NUM_HEADS, HEAD_DIM, KERNEL_SIZE = 4, 128, 4
 NUM_BLOCKS, BLOCK_SIZE, PACK, LANES = 5, 107, 2, 640
-TOK_BYTES = PACK * LANES * 2  # bf16
+TOK_BYTES = PACK * LANES * 2  # bf16; an fp8 pool packs 4 tokens in the same row
 
 SSM_ELEMS = NUM_HEADS * HEAD_DIM * HEAD_DIM
 CONV_ELEMS = (KERNEL_SIZE - 1) * 3 * NUM_HEADS * HEAD_DIM
@@ -85,14 +85,29 @@ def _initial_states(rng, num_seqs):
     return conv, ssm
 
 
-def _pack_pool(conv_init, ssm_init, block_ids, conv_shard_heads=None):
+def _pool_pack(pool_dtype):
+    """Tokens one packed row holds: the packing axis fills a 32-bit word."""
+    return 4 // jnp.dtype(pool_dtype).itemsize
+
+
+def _raw(pool):
+    """The pool's bytes, for exact before/after comparisons."""
+    raw_dtype = jnp.uint16 if jnp.dtype(pool.dtype).itemsize == 2 else jnp.uint8
+    return np.asarray(pool.view(raw_dtype))
+
+
+def _pack_pool(
+    conv_init, ssm_init, block_ids, conv_shard_heads=None, pool_dtype=jnp.bfloat16
+):
     """Write the given states into the pool's state regions; the rest of the
     pool (including block 0 and the attention rows of every block) keeps its
     sentinel bytes."""
     rng = np.random.default_rng(99)
     pool = jnp.asarray(
-        rng.standard_normal((NUM_BLOCKS, BLOCK_SIZE, PACK, LANES)).astype(np.float32),
-        dtype=jnp.bfloat16,
+        rng.standard_normal(
+            (NUM_BLOCKS, BLOCK_SIZE, _pool_pack(pool_dtype), LANES)
+        ).astype(np.float32),
+        dtype=pool_dtype,
     )
     idx = jnp.asarray(block_ids, dtype=jnp.int32)
 
@@ -215,6 +230,7 @@ def _run_pooled(
     )
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     ("query_lens", "seq_lens", "decode_end", "conv_shard_heads"),
     [
@@ -232,6 +248,27 @@ def _run_pooled(
 def test_pooled_kda_matches_dense_bitwise(
     query_lens, seq_lens, decode_end, conv_shard_heads
 ):
+    _check_pooled_matches_dense(
+        query_lens, seq_lens, decode_end, conv_shard_heads, jnp.bfloat16
+    )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "conv_shard_heads", [None, 1], ids=["one-shard", "rank-blocked"]
+)
+def test_pooled_kda_fp8_pool_keeps_bf16_conv(conv_shard_heads):
+    """An fp8 KV pool changes how many tokens an attention row packs, not the
+    KDA state. Conv stays bf16 in the rows that block sizing and the Raiden
+    manifest reserve for it, so it round-trips the pool bit for bit."""
+    _check_pooled_matches_dense(
+        [1, 5, 3], [9, 5, 11], 1, conv_shard_heads, jnp.float8_e4m3fn
+    )
+
+
+def _check_pooled_matches_dense(
+    query_lens, seq_lens, decode_end, conv_shard_heads, pool_dtype
+):
     num_seqs = len(query_lens)
     rng = np.random.default_rng(0)
     inputs = _inputs(rng, query_lens, seq_lens)
@@ -243,14 +280,14 @@ def test_pooled_kda_matches_dense_bitwise(
         inputs, conv_init, ssm_init, distribution
     )
 
-    pool = _pack_pool(conv_init, ssm_init, block_ids, conv_shard_heads)
-    before = np.asarray(pool.view(jnp.uint16))
+    pool = _pack_pool(conv_init, ssm_init, block_ids, conv_shard_heads, pool_dtype)
+    before = _raw(pool)
     out_pool, pool_after = _run_pooled(
         inputs,
         pool,
         block_ids,
         distribution,
-        pool_block_tokens=BLOCK_SIZE * PACK,
+        pool_block_tokens=BLOCK_SIZE * _pool_pack(pool_dtype),
         conv_shard_heads=conv_shard_heads,
     )
 
@@ -281,7 +318,8 @@ def test_pooled_kda_matches_dense_bitwise(
 
     # Everything outside the state regions is untouched: block 0, unlisted
     # blocks, and the attention token rows of the state blocks.
-    after = np.asarray(pool_after.view(jnp.uint16))
+    assert pool_after.dtype == pool.dtype
+    after = _raw(pool_after)
     for block in range(NUM_BLOCKS):
         if block not in block_ids:
             np.testing.assert_array_equal(after[block], before[block])
@@ -310,6 +348,7 @@ def test_pooled_kda_rejects_oversized_state():
         )
 
 
+@pytest.mark.tpu_test
 def test_pooled_kda_manager_block_split():
     """Manager ids on a pool born at kernel-block granularity (split > 1).
 
@@ -375,6 +414,7 @@ def test_pooled_kda_manager_block_split():
             np.testing.assert_array_equal(after[block], seed[block])
 
 
+@pytest.mark.tpu_test
 def test_pooled_kda_multistep_state_evolution():
     """State must round-trip the pool across a chunked prefill and decodes.
 

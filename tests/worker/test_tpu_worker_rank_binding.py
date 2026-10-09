@@ -113,6 +113,105 @@ def test_spawned_worker_binding_rejects_out_of_range_local_rank():
         )
 
 
+def test_spawned_pcp_without_local_rank_env_uses_local_rank_arg():
+    """When LOCAL_RANK is not in env (e.g. under Ray), use local_rank arg
+    and LOCAL_WORLD_SIZE.
+    """
+    b = binding.get_tpu_worker_binding(
+        _parallel_config(),
+        rank=2,
+        local_rank=3,
+        env={"LOCAL_WORLD_SIZE": "8"},
+        use_spawned_pcp_local_rank=True,
+    )
+
+    assert b.local_rank == 3
+    assert b.init_local_rank == 3
+    assert b.local_world_size == 8
+    assert b.as_env()["LOCAL_RANK"] == "3"
+    assert b.as_env()["LOCAL_WORLD_SIZE"] == "8"
+
+
+def test_spawned_pcp_without_local_rank_env_under_ep_uses_local_rank_arg():
+    """Under EP with DP>1, absence of LOCAL_RANK uses native_local_rank and
+    LOCAL_WORLD_SIZE.
+    """
+    env = {
+        "TORCH_TPU_DP_SIZE": "2",
+        "LOCAL_WORLD_SIZE": "8",
+    }
+    pc = _parallel_config(
+        world_size=4,
+        data_parallel_size=2,
+        data_parallel_index=1,
+        data_parallel_rank_local=1,
+        prefill_context_parallel_size=4,
+        enable_expert_parallel=True,
+    )
+
+    b = binding.get_tpu_worker_binding(
+        pc,
+        rank=2,
+        local_rank=3,
+        env=env,
+        use_spawned_pcp_local_rank=True,
+    )
+
+    # native_local_rank = dp_rank_local * world_size + local_rank = 1 * 4 + 3 = 7
+    assert b.local_rank == 7
+    assert b.init_local_rank == 7
+    assert b.native_local_rank == 7
+    assert b.as_env()["LOCAL_RANK"] == "7"
+
+
+def test_spawned_pcp_with_empty_local_rank_env_uses_local_rank_arg():
+    """Empty LOCAL_RANK string in env is treated as absent."""
+    b = binding.get_tpu_worker_binding(
+        _parallel_config(),
+        rank=2,
+        local_rank=3,
+        env={"LOCAL_RANK": "", "LOCAL_WORLD_SIZE": "8"},
+        use_spawned_pcp_local_rank=True,
+    )
+
+    assert b.local_rank == 3
+    assert b.init_local_rank == 3
+    assert b.local_world_size == 8
+    assert b.as_env()["LOCAL_RANK"] == "3"
+    assert b.as_env()["LOCAL_WORLD_SIZE"] == "8"
+
+
+def test_repeated_binding_with_offset_does_not_compound_local_world_size():
+    """Repeated get_tpu_worker_binding calls sharing env (parent spawn loop +
+    child init_device) must not re-add TPU_LOCAL_RANK_OFFSET into
+    LOCAL_WORLD_SIZE.
+    """
+    pc = _parallel_config(
+        world_size=2,
+        local_world_size=2,
+        prefill_context_parallel_size=1,
+        data_parallel_size=1,
+    )
+    env = {"TPU_LOCAL_RANK_OFFSET": "4"}
+
+    for rank in (0, 1):
+        parent_binding = binding.get_tpu_worker_binding(
+            pc, rank=rank, local_rank=rank, env=env
+        )
+        env.update(parent_binding.as_env())
+        child_binding = binding.get_tpu_worker_binding(
+            pc,
+            rank=rank,
+            local_rank=rank,
+            env=dict(env),
+            use_spawned_pcp_local_rank=True,
+        )
+        assert parent_binding.local_rank == 4 + rank
+        assert parent_binding.local_world_size == 6
+        assert child_binding.local_rank == 4 + rank
+        assert child_binding.local_world_size == 6
+
+
 def test_dp_binding_applies_offset_without_remapping():
     """Under DP the rank shifts by the DP block and the chip offset.
 

@@ -145,6 +145,7 @@ run_mp_multihost() {
   # Start head container locally
   echo "--- Starting mp head on ${HEAD_INTERNAL_IP}"
   bash "${RUN_CLUSTER_MP}" "${IMAGE_TAG}" "${HOST_HF_HOME}" "${HEAD_SERVE_CMD}" "${CONTAINER_ENV_HEAD[@]}" &
+  HEAD_PID=$!
 
   # The container holds the only copy of the head's output, and the collection
   # below cannot reach it once it is gone - which is exactly the case where the
@@ -153,7 +154,7 @@ run_mp_multihost() {
   HEAD_LOG="${PWD}/perf_eval_results/head_server.log"
   mkdir -p "$(dirname "${HEAD_LOG}")"
   (
-    for _ in $(seq 1 60); do
+    while kill -0 "${HEAD_PID}" 2>/dev/null; do
       docker logs -f node >>"${HEAD_LOG}" 2>&1 && break
       sleep 2
     done
@@ -173,7 +174,8 @@ run_mp_multihost() {
     # server that is still booting, and this loop cannot tell them apart. On
     # 2026-09-22 the head died four minutes in and the step polled the corpse
     # for the remaining 176, then found no container left to take logs from.
-    if ! docker inspect -f '{{.State.Running}}' node 2>/dev/null | grep -qx true; then
+    # Ask the launcher, not docker: there is no container while the image pulls.
+    if ! kill -0 "${HEAD_PID}" 2>/dev/null; then
       head_gone=1
       break
     fi
@@ -195,7 +197,7 @@ run_mp_multihost() {
   # Run the benchmark/eval flow inside the head container
   set +e
   echo "--- Running eval flow in head container for config=${CONFIG_NAME}"
-  docker exec -w /root/torchtpu-vllm node bash -c '
+  docker exec -w /workspace/vllm-torchtpu node bash -c '
     umask 000
     rm -rf /perf_eval_results/*
     bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config "$1" --host localhost --port "$2" --results-dir /perf_eval_results/"$1" "${@:3}"

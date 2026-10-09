@@ -29,6 +29,8 @@ from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
     apply_top_k_top_p,
 )
 
+pytestmark = pytest.mark.tpu_test
+
 
 @pytest.fixture(autouse=True)
 def _raise_dynamo_recompile_limit():
@@ -317,6 +319,40 @@ def test_rejection_sampler_greedy_scenarios(case: RejectionSamplerCase, device):
     assert torch.equal(output, expected), (
         f"case '{case.name}': expected {expected.tolist()}, got {output.tolist()}"
     )
+
+
+@pytest.mark.parametrize("case", GREEDY_CASES, ids=lambda c: c.name)
+def test_rejection_sampler_greedy_from_target_argmax(
+    case: RejectionSamplerCase, device
+):
+    """TPU_GREEDY_TOP_TOKENS verifies on the target's argmax tokens; the
+    result must equal the target_logits path."""
+    sampler = RejectionSampler()
+    segment_ids, group_indices = _segment_info(case.num_draft_per_seq, device)
+    inputs = dict(
+        draft_token_ids=torch.tensor(
+            case.draft_tokens, dtype=torch.int32, device=device
+        ),
+        num_draft_tokens=torch.tensor(
+            case.num_draft_per_seq, dtype=torch.int32, device=device
+        ),
+        bonus_token_ids=torch.tensor(
+            case.bonus_tokens, dtype=torch.int64, device=device
+        ),
+        segment_ids=segment_ids,
+        group_indices=group_indices,
+        max_draft_tokens=max(case.num_draft_per_seq),
+    )
+    target_logits = _target_logits_from_tokens(case.target_tokens, device)
+
+    from_logits = sampler(target_logits=target_logits, **inputs)
+    from_argmax = sampler(
+        target_logits=None,
+        target_argmax=torch.argmax(target_logits, dim=-1),
+        **inputs,
+    )
+
+    assert torch.equal(from_argmax, from_logits)
 
 
 def test_rejection_sampler_synthetic_converts_to_conditional_rates(device):
@@ -627,6 +663,33 @@ def test_rejection_sampler_synthetic_random_placeholder_recovers_target(device):
     assert torch.equal(output, expected)
 
 
+def test_rejection_sampler_synthetic_random_one_hot_target_recovers_draft(device):
+    # top_k=1 makes the target one-hot at the draft, so a synthetic rejection
+    # leaves no residual mass and the row recovers the draft itself.
+    sampler = _synthetic_sampler([0.0], device)
+    target_logits = torch.tensor([[0.0, 1.0, 9.0, 2.0]], device=device)
+    segment_ids, group_indices = _segment_info([1], device)
+
+    output = sampler(
+        draft_token_ids=torch.tensor([2], dtype=torch.int32, device=device),
+        num_draft_tokens=torch.tensor([1], dtype=torch.int32, device=device),
+        target_logits=target_logits,
+        bonus_token_ids=torch.tensor([3], dtype=torch.int32, device=device),
+        segment_ids=segment_ids,
+        group_indices=group_indices,
+        max_draft_tokens=1,
+        temperatures=torch.ones((1, 1), device=device),
+        top_k=torch.ones((1, 1), dtype=torch.int32, device=device),
+        top_p=torch.ones((1, 1), device=device),
+        accept_u=torch.zeros(1, device=device),
+        recover_u=torch.tensor([[0.99, 0.99, 0.01, 0.99]], device=device),
+        do_sampling=True,
+    )
+
+    expected = torch.tensor([[2, -1]], dtype=torch.int32, device=device)
+    assert torch.equal(output, expected)
+
+
 def test_rejection_sampler_synthetic_mixed_batch_recovers_greedy_argmax(device):
     sampler = _synthetic_sampler([0.0], device)
     draft_token_ids = torch.tensor([3, 1], dtype=torch.int32, device=device)
@@ -661,7 +724,10 @@ def test_rejection_sampler_synthetic_mixed_batch_recovers_greedy_argmax(device):
     assert torch.equal(output, expected)
 
 
-def test_rejection_sampler_random_top_k_forces_recovery(device):
+# torch.rand can return exactly 0.0; a draft that top-k masks out has
+# p(x) == 0 and must still be rejected.
+@pytest.mark.parametrize("accept_u_value", [0.01, 0.0])
+def test_rejection_sampler_random_top_k_forces_recovery(device, accept_u_value):
     sampler = RejectionSampler()
     draft_token_ids = torch.tensor([1], dtype=torch.int32, device=device)
     num_draft_tokens = torch.tensor([1], dtype=torch.int32, device=device)
@@ -674,7 +740,7 @@ def test_rejection_sampler_random_top_k_forces_recovery(device):
     temperatures = torch.ones((1, 1), dtype=torch.float32, device=device)
     top_k = torch.tensor([[1]], dtype=torch.int32, device=device)
     top_p = torch.ones((1, 1), dtype=torch.float32, device=device)
-    accept_u = torch.tensor([0.01], dtype=torch.float32, device=device)
+    accept_u = torch.tensor([accept_u_value], dtype=torch.float32, device=device)
     recover_u = torch.full_like(target_logits, 0.5)
 
     output = sampler(
@@ -697,13 +763,106 @@ def test_rejection_sampler_random_top_k_forces_recovery(device):
     assert torch.equal(output, expected)
 
 
+@pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
+@pytest.mark.parametrize(
+    "logits,draft_token,accept_u,expected_greedy",
+    [
+        pytest.param([5.0, 5.0, 0.0], 0, 0.99, [0, 2], id="accept-first-tie"),
+        pytest.param([5.0, 5.0, 0.0], 1, 0.1, [0, -1], id="reject-second-tie"),
+        pytest.param([5.0, 5.0, 0.0], 2, 0.1, [0, -1], id="recover-first-tie"),
+        pytest.param([5.0, 0.0, 0.0], 1, 0.0, [0, -1], id="reject-zero-draw"),
+        pytest.param([5.0, 0.0, 0.0], 0, 0.99, [0, 2], id="accept-sole-maximum"),
+    ],
+)
+@pytest.mark.parametrize(
+    "random_accept_u,expected_random",
+    [(0.1, [1, 2]), (0.75, [0, -1])],
+)
+def test_rejection_sampler_mixed_batch_preserves_greedy_decisions(
+    device,
+    dtype,
+    logits,
+    draft_token,
+    accept_u,
+    expected_greedy,
+    random_accept_u,
+    expected_random,
+):
+    sampler = RejectionSampler()
+    segment_ids, group_indices = _segment_info([1, 1], device)
+
+    output = sampler(
+        draft_token_ids=torch.tensor(
+            [draft_token, 1], dtype=torch.int32, device=device
+        ),
+        num_draft_tokens=torch.tensor([1, 1], dtype=torch.int32, device=device),
+        target_logits=torch.tensor(
+            [logits, [5.0, 5.0, 0.0]], dtype=dtype, device=device
+        ),
+        bonus_token_ids=torch.tensor([2, 2], dtype=torch.int32, device=device),
+        segment_ids=segment_ids,
+        group_indices=group_indices,
+        max_draft_tokens=1,
+        temperatures=torch.tensor([[0.0], [1.0]], device=device),
+        top_k=torch.zeros((2, 1), dtype=torch.int32, device=device),
+        top_p=torch.ones((2, 1), device=device),
+        accept_u=torch.tensor([accept_u, random_accept_u], device=device),
+        # Favor the second tied token during random recovery. Greedy recovery
+        # must still return the first argmax, independently of this noise.
+        recover_u=torch.tensor([[0.1, 0.99, 0.5], [0.5, 0.5, 0.5]], device=device),
+        do_sampling=True,
+    )
+
+    expected = torch.tensor(
+        [expected_greedy, expected_random], dtype=torch.int32, device=device
+    )
+    assert torch.equal(output, expected)
+
+
+@pytest.mark.parametrize(
+    "acceptance_rate,draft_token,expected",
+    [
+        pytest.param(1.0, 1, [[1, 2], [1, 2]], id="accept-non-argmax"),
+        pytest.param(0.0, 0, [[0, -1], [0, -1]], id="reject-first-tie"),
+        pytest.param(0.0, 1, [[0, -1], [0, -1]], id="reject-second-tie"),
+    ],
+)
+def test_rejection_sampler_synthetic_mixed_ties_follow_acceptance_schedule(
+    device,
+    acceptance_rate,
+    draft_token,
+    expected,
+):
+    sampler = _synthetic_sampler([acceptance_rate], device)
+    segment_ids, group_indices = _segment_info([1, 1], device)
+
+    output = sampler(
+        draft_token_ids=torch.tensor(
+            [draft_token, 1], dtype=torch.int32, device=device
+        ),
+        num_draft_tokens=torch.tensor([1, 1], dtype=torch.int32, device=device),
+        target_logits=torch.tensor([[5.0, 5.0, 0.0], [5.0, 5.0, 0.0]], device=device),
+        bonus_token_ids=torch.tensor([2, 2], dtype=torch.int32, device=device),
+        segment_ids=segment_ids,
+        group_indices=group_indices,
+        max_draft_tokens=1,
+        temperatures=torch.tensor([[0.0], [1.0]], device=device),
+        top_k=torch.zeros((2, 1), dtype=torch.int32, device=device),
+        top_p=torch.ones((2, 1), device=device),
+        accept_u=torch.full((2,), 0.1, device=device),
+        recover_u=torch.tensor([[0.1, 0.99, 0.5], [0.5, 0.5, 0.5]], device=device),
+        do_sampling=True,
+    )
+
+    assert torch.equal(output, torch.tensor(expected, dtype=torch.int32, device=device))
+
+
 def test_rejection_sampler_random_greedy_row_accepts_argmax(device):
     # A temperature-0 (greedy) request routed through the random path must
     # accept the draft token deterministically iff it equals the target argmax,
     # even when the raw softmax over the target logits is far from one-hot.
     # `accept_u` is pinned high (0.99) so a soft-softmax accept probability
-    # (~0.52 here) would spuriously reject -- the temperature->one-hot collapse
-    # is what makes this pass.
+    # (~0.52 here) would spuriously reject.
     sampler = RejectionSampler()
     draft_token_ids = torch.tensor([0, 3], dtype=torch.int32, device=device)
     num_draft_tokens = torch.tensor([2], dtype=torch.int32, device=device)
@@ -801,3 +960,33 @@ def test_rejection_sampler_ignores_padded_segment_sentinel(device):
 
     expected = torch.tensor([[1, 9], [8, -1]], dtype=torch.int32, device=device)
     assert torch.equal(output, expected)
+
+
+@pytest.mark.tpu_test
+def test_random_rejection_sample_with_candidate_blocks_matches_full_vocab(device):
+    num_reqs, k, vocab_size = 4, 3, 128 * 200
+    tokens = num_reqs * k
+    gen = torch.Generator().manual_seed(0)
+    logits = torch.randn(tokens, vocab_size, generator=gen) * 3
+    random_drafts = torch.randint(0, vocab_size, (tokens,), generator=gen)
+    even = torch.arange(tokens) % 2 == 0
+    drafts = torch.where(even, logits.argmax(dim=-1), random_drafts)
+    kwargs = dict(
+        draft_token_ids=drafts.to(torch.int32).to(device),
+        num_draft_tokens=torch.full((num_reqs,), k, dtype=torch.int32, device=device),
+        target_logits=logits.to(device),
+        bonus_token_ids=torch.arange(num_reqs, dtype=torch.int32, device=device),
+        segment_ids=torch.arange(num_reqs, device=device).repeat_interleave(k),
+        group_indices=torch.arange(k, device=device).repeat(num_reqs),
+        max_draft_tokens=k,
+        temperatures=torch.full((tokens, 1), 0.6, device=device),
+        top_k=torch.full((tokens, 1), 20, dtype=torch.int32, device=device),
+        top_p=torch.full((tokens, 1), 0.95, device=device),
+        accept_u=torch.rand(tokens, generator=gen).to(device),
+        recover_u=torch.rand(tokens, vocab_size, generator=gen).to(device),
+        do_sampling=True,
+    )
+    sampler = RejectionSampler()
+    expected = sampler(**kwargs)
+    result = sampler(**kwargs, topk_candidates=64)
+    torch.testing.assert_close(result, expected)

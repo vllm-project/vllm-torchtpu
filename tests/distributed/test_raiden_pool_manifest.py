@@ -13,9 +13,12 @@ import pytest
 
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 
-from .raiden_test_utils import FakeTensor, dsv4_materialization, glm_named_kv_caches
-
-pytestmark = pytest.mark.cpu_test
+from .raiden_test_utils import (
+    FakeTensor,
+    dsv4_materialization,
+    glm_named_kv_caches,
+    kimi_pool_manifest,
+)
 
 
 def _fa_group(layer_names, *, block_size, num_kv_heads, head_size):
@@ -1174,3 +1177,45 @@ def test_glm_manifest_per_layer_tags():
         "mla_nope_rows"
     }
     assert set(manifest.geometry_by_tag()) == {"mla.nope", "mla.rope", "dsa.idx"}
+
+
+def test_kimi_fp8_pool_keeps_the_bf16_pool_byte_geometry():
+    """An fp8 K3 pool packs four tokens per row instead of two, in the same
+    2,560 bytes, and its KDA state regions do not move."""
+    bf16 = kimi_pool_manifest(3, kv_dtype="bfloat16")
+    fp8 = kimi_pool_manifest(3, kv_dtype="float8_e4m3fn")
+
+    assert bf16.storages[0].shape[1:] == (81, 2, 640)
+    assert fp8.storages[0].shape[1:] == (81, 4, 640)
+    assert [pool.tag for pool in fp8.pools] == [pool.tag for pool in bf16.pools]
+    for bf16_pool, fp8_pool in zip(bf16.pools, fp8.pools):
+        assert fp8_pool.base_offset_bytes == bf16_pool.base_offset_bytes
+        assert fp8_pool.block_stride_bytes == bf16_pool.block_stride_bytes == 207360
+        assert fp8_pool.regions == bf16_pool.regions
+        assert (bf16_pool.dtype_tag, fp8_pool.dtype_tag) == (
+            "bfloat16",
+            "float8_e4m3fn",
+        )
+    conv, ssm, fa = fp8.pools
+    # SSM is f32 and conv is bf16 whatever the pool dtype: 77 + 4 rows.
+    assert ssm.live_bytes_per_block == 3 * 128 * 128 * 4
+    assert conv.base_offset_bytes == 77 * 2560
+    assert conv.live_bytes_per_block == 4 * 2560
+    assert fa.regions[0].unit_bytes == 2560
+
+
+@pytest.mark.parametrize(
+    ("shape", "itemsize", "dtype", "match"),
+    [
+        ((4, 81, 4, 640), 1, "torch.float8_e5m2", "must be bf16 or fp8"),
+        ((4, 81, 4, 640), 1, "torch.uint8", "must be bf16 or fp8"),
+        # A packing axis that does not fill the 32-bit word.
+        ((4, 162, 2, 640), 1, "torch.float8_e4m3fn", "invalid packed-row geometry"),
+        ((4, 81, 4, 320), 2, "torch.bfloat16", "invalid packed-row geometry"),
+    ],
+    ids=["fp8-e5m2", "uint8", "fp8-packing-2", "bf16-packing-4"],
+)
+def test_kimi_manifest_rejects_a_pool_it_cannot_describe(shape, itemsize, dtype, match):
+    pool = FakeTensor(shape, itemsize, dtype=dtype)
+    with pytest.raises(rpm.ManifestError, match=match):
+        kimi_pool_manifest(3, pool=pool)

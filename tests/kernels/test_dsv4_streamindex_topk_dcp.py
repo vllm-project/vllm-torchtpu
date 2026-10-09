@@ -17,15 +17,19 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME,
-    _select_owned_winners,
     cp_local_to_global,
     cp_rank_as_data,
+    dcp_sc_compact,
+    metadata,
     streamindex_topk,
     streamindex_topk_dcp,
 )
+
+pytestmark = pytest.mark.tpu_test
 
 P = jax.sharding.PartitionSpec
 
@@ -33,13 +37,12 @@ P = jax.sharding.PartitionSpec
 @pytest.mark.multichip
 @pytest.mark.parametrize("dcp_size", [2, 4, 8])
 def test_candidate_all_gather_is_rank_major(dcp_size):
-    """The merge reads a winner's position in its own list as `slot % k`.
+    """The merge resolves a winner as rank `slot // k`, position `slot % k`.
 
-    The source rank now travels as its own lane, so the chunk *order* no longer
-    matters -- but the chunk *width* still does, and nothing else in the merge
-    would notice it changing: every rank would resolve the wrong candidate and
-    still return a full, plausible, silently wrong list. Asserting the full
-    rank-major arange pins width and order together.
+    Both readings assume this layout, and nothing else in the merge would
+    notice it changing: every rank would resolve the wrong candidate and still
+    return a full, plausible, silently wrong list. Asserting the full
+    rank-major arange pins order and chunk width together.
     """
     devices = jax.devices()
     if len(devices) < dcp_size:
@@ -76,37 +79,151 @@ def test_candidate_all_gather_is_rank_major(dcp_size):
         )
 
 
-def _filter_all_ranks(merged, dcp_size, interleave_c):
-    """What the `dcp_size` ranks each keep, stacked as [dcp_size, rows, k]."""
-    return np.stack(
+def _require_sparsecore():
+    """Probe in a test body: a chip touch at collection breaks spawned workers."""
+    try:
+        if pltpu.get_tpu_info().sparse_core is not None:
+            return
+    except Exception:  # no TPU at all  # noqa: S110
+        pass
+    pytest.skip("needs SparseCore")
+
+
+def _xla_pack_reference(vals):
+    """The scatter the kernel replaced, unreachable in `src`, kept as an oracle."""
+    num_rows, width = vals.shape
+    keep = vals >= 0
+
+    # Exclusive prefix count of kept entries gives the destination slot, < width.
+    slot = jnp.cumsum(keep, axis=1, dtype=jnp.int32) - keep
+    rows = jnp.arange(num_rows, dtype=jnp.int32)[:, None]
+
+    # Column `width` is a dump for the dropped entries, sliced off at the end.
+    out = jnp.full((num_rows, width + 1), -1, dtype=jnp.int32)
+    out = out.at[rows, jnp.where(keep, slot, width)].set(jnp.where(keep, vals, -1))
+    return out[:, :width]
+
+
+def _sparse_fixture(num_rows=16, width=128, keep_rate=0.5, seed=20260906):
+    """Non-negative values with `-1` holes; row 0 is full and row 1 is empty."""
+    rng = np.random.default_rng(seed)
+    vals = rng.integers(0, 1 << 20, size=(num_rows, width)).astype(np.int32)
+    vals[rng.random((num_rows, width)) > keep_rate] = -1
+    vals[0] = rng.integers(0, 1 << 20, size=width).astype(np.int32)
+    if num_rows > 1:
+        vals[1] = -1
+    return vals
+
+
+@pytest.mark.parametrize("num_rows,width", [(16, 128), (1, 16), (33, 256)])
+@pytest.mark.parametrize("keep_rate", [0.1, 0.5, 0.9])
+def test_sparsecore_pack_matches_xla(num_rows, width, keep_rate):
+    """Elementwise, not just as a set: both packs must emit in ascending order."""
+    _require_sparsecore()
+    vals = _sparse_fixture(num_rows, width, keep_rate)
+
+    want = np.asarray(_xla_pack_reference(jnp.asarray(vals)))
+    got = np.asarray(dcp_sc_compact.pack_owned_winners(jnp.asarray(vals)))
+
+    np.testing.assert_array_equal(got, want)
+
+
+@pytest.mark.parametrize("dcp_size", [2, 4, 8, 16])
+def test_sparsecore_fused_pack_matches_reference(dcp_size):
+    """Fused SparseCore gather + pack matches take_along_axis + reference pack."""
+    _require_sparsecore()
+    num_rows, k = 16, 128
+    rng = np.random.default_rng(20261003)
+    # Slots can come from any rank [0, dcp_size * k)
+    slots = np.stack(
+        [
+            rng.choice(dcp_size * k, size=k, replace=False).astype(np.int32)
+            for _ in range(num_rows)
+        ]
+    )
+    slots[0, -5:] = -1
+    idxs = rng.integers(0, 100000, size=(num_rows, k), dtype=np.int32)
+    idxs[1, -3:] = -1
+
+    for r in range(dcp_size):
+        lo = r * k
+        hi = lo + k
+        ours = (slots >= lo) & (slots < hi)
+        safe = np.maximum(slots, 0)
+        merged = np.where(ours, np.take_along_axis(idxs, safe % k, axis=1), -1)
+        want = _xla_pack_reference(jnp.asarray(merged))
+        got = dcp_sc_compact.pack_owned_winners(
+            jnp.asarray(slots), jnp.asarray(idxs), r
+        )
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+
+
+def _simulate_merge(num_rows, k, span, dcp_size, interleave_c, seed=20260929):
+    """Stages 1-3 of `streamindex_topk_dcp` in numpy, as `resolve` receives them.
+
+    Returns each rank's rank-local candidate list, the merged flat slot columns,
+    and the true global top-k the ranks must reassemble between them.
+    """
+    rng = np.random.default_rng(seed)
+    # Distinct scores, so the top-k is unambiguous and the partition is exact.
+    scores = rng.permutation(num_rows * span).reshape(num_rows, span).astype(np.float32)
+    owner = (np.arange(span) // interleave_c) % dcp_size
+
+    local_idxs = np.full((dcp_size, num_rows, k), -1, np.int32)
+    local_scores = np.full((dcp_size, num_rows, k), -np.inf, np.float32)
+    for r in range(dcp_size):
+        owned = np.flatnonzero(owner == r)
+        for t in range(num_rows):
+            best = owned[np.argsort(-scores[t, owned])][:k]
+            local_idxs[r, t, : len(best)] = np.asarray(
+                metadata.cp_global_to_local(jnp.asarray(best), dcp_size, interleave_c)
+            )
+            local_scores[r, t, : len(best)] = scores[t, best]
+
+    # Stage 2 is rank-major, so rank r's k candidates land at columns [r*k, r*k+k).
+    gathered = np.concatenate(list(local_scores), axis=1)
+    slots = np.full((num_rows, k), -1, np.int32)
+    for t in range(num_rows):
+        order = np.argsort(-gathered[t])[:k]
+        order = order[np.isfinite(gathered[t, order])]
+        slots[t, : len(order)] = order
+
+    want = [set(np.argsort(-scores[t])[:k].tolist()) for t in range(num_rows)]
+    return local_idxs, slots, want
+
+
+def _resolve_owned_winners(local_idxs, slots, k, dcp_rank):
+    """Stage 3 of `streamindex_topk_dcp`, which inlines it: keep and pack ours.
+
+    The candidate all-gather is rank-major, so flat column `c` came from rank
+    `c // k` at that rank's own slot `c % k`.
+    """
+    safe = jnp.maximum(slots, 0)
+    ours = (slots >= 0) & (jnp.floor_divide(safe, k) == dcp_rank)
+    mine = jnp.take_along_axis(local_idxs, jnp.mod(safe, k), axis=1)
+    return dcp_sc_compact.pack_owned_winners(jnp.where(ours, mine, -1))
+
+
+@pytest.mark.parametrize("dcp_size,interleave_c", [(2, 1), (4, 4), (8, 4), (8, 64)])
+def test_resolve_partitions_the_global_topk(dcp_size, interleave_c):
+    """The ranks' packed outputs reassemble the global top-k, each entry once."""
+    _require_sparsecore()
+    num_rows, k, span = 8, 32, 4096
+    local_idxs, slots, want = _simulate_merge(num_rows, k, span, dcp_size, interleave_c)
+
+    lists = np.stack(
         [
             np.asarray(
-                _select_owned_winners(
-                    jnp.asarray(merged), dcp_size, interleave_c, jnp.int32(r)
+                _resolve_owned_winners(
+                    jnp.asarray(local_idxs[r]), jnp.asarray(slots), k, jnp.int32(r)
                 )
             )
             for r in range(dcp_size)
         ]
     )
-
-
-@pytest.mark.parametrize("dcp_size,interleave_c", [(2, 1), (4, 4), (8, 4), (8, 64)])
-def test_owner_filters_partition_the_list(dcp_size, interleave_c):
-    rng = np.random.default_rng(20260906)
-    num_rows, k, span = 16, 128, 4096
-    merged = np.stack(
-        [
-            rng.choice(span, size=k, replace=False).astype(np.int32)
-            for _ in range(num_rows)
-        ]
-    )
-    merged[0, -5:] = -1
-
-    lists = _filter_all_ranks(merged, dcp_size, interleave_c)
     assert lists.shape == (dcp_size, num_rows, k)
 
     for t in range(num_rows):
-        want = set(merged[t][merged[t] >= 0].tolist())
         got = []
         for r in range(dcp_size):
             row = lists[r, t]
@@ -118,7 +235,7 @@ def test_owner_filters_partition_the_list(dcp_size, interleave_c):
         # Multiplicity, not just set equality: the LSE merge double-counts a
         # position delivered to two ranks.
         assert len(got) == len(set(got))
-        assert set(got) == want
+        assert set(got) == want[t]
 
 
 # ===================================================================== #
@@ -253,3 +370,154 @@ def test_dcp_chunking_does_not_change_the_result(chunk_tokens, dcp_size):
         streamindex_topk_dcp(*args, **kwargs, chunk_tokens=chunk_tokens)
     )
     np.testing.assert_array_equal(chunked, unchunked)
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 4, 8])
+def test_dcp_append_and_topk_match_across_xla_has_and_sal(dcp_size):
+    """DCP append + streamindex_topk_dcp produces identical local_topk across
+    XLA HAS, Pallas HAS, and Pallas SAL."""
+    from vllm_torchtpu.kernels.deepseek_v4 import streamindex_topk as st_lib
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+        KVLayout,
+        coalesced_kv_append_dcp,
+        get_dcp_page_and_slot,
+    )
+
+    _need_devices(dcp_size)
+    _, args, kwargs = _dcp_case(dcp_size, 23)
+    q, weights, shards_has, seq_lens, page_indices, cu_q_lens, distribution = args
+    mesh = kwargs["mesh"]
+    interleave_size = kwargs["interleave_size"]
+    vpages = shards_has.shape[0] // dcp_size
+
+    # New step tokens (129 bytes = 128 fp8 + 1 e8m0 scale) to append over the
+    # last Q_LEN positions of the sequence.
+    step_rec = _global_records(Q_LEN, seed=101)[:, : D_IDX + 1]
+
+    sharded = jax.sharding.PartitionSpec(DCP_AXIS_NAME)
+    replicated = jax.sharding.PartitionSpec()
+
+    def _xla_dcp_append(cache_shard, k_packed, seq_lens_a, pages_a, cu_q_a):
+        rank = cp_rank_as_data(DCP_AXIS_NAME, dcp_size)
+        page, slot = get_dcp_page_and_slot(
+            Q_LEN,
+            seq_lens_a,
+            pages_a,
+            cu_q_a,
+            rank,
+            page_size=PAGE_SIZE,
+            num_pages=vpages,
+            dcp_size=dcp_size,
+            interleave_size=interleave_size,
+        )
+        k_pad = jnp.pad(k_packed, ((0, 0), (0, WIDTH - k_packed.shape[-1])))
+        return cache_shard.at[page, slot // 4, slot % 4].set(k_pad)
+
+    def _pallas_dcp_append(layout):
+        def _fn(cache_shard, k_packed, seq_lens_a, pages_a, cu_q_a):
+            rank = cp_rank_as_data(DCP_AXIS_NAME, dcp_size)
+            return coalesced_kv_append_dcp(
+                cache_shard,
+                k_packed,
+                seq_lens_a,
+                pages_a,
+                cu_q_a,
+                rank,
+                dcp_size=dcp_size,
+                interleave_size=interleave_size,
+                kv_layout=layout,
+            )
+
+        return _fn
+
+    in_specs = (sharded, replicated, replicated, replicated, replicated)
+    cache_xla = jax.jit(
+        jax.shard_map(
+            _xla_dcp_append,
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=sharded,
+            check_vma=False,
+        )
+    )(shards_has, step_rec, seq_lens, page_indices, cu_q_lens)
+
+    cache_has = jax.jit(
+        jax.shard_map(
+            _pallas_dcp_append(KVLayout.HEAD_ALONG_SUBLANE),
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=sharded,
+            check_vma=False,
+        )
+    )(shards_has, step_rec, seq_lens, page_indices, cu_q_lens)
+
+    shards_sal_host = jnp.concatenate(
+        [
+            st_lib.convert_cache_to_seq_along_lane(
+                np.asarray(shards_has).reshape(
+                    dcp_size, vpages, PAGE_SIZE // 4, 4, WIDTH
+                )[r],
+                actual_head_dim=D_IDX,
+            )
+            for r in range(dcp_size)
+        ],
+        axis=0,
+    )
+    shards_sal = jax.device_put(
+        shards_sal_host, jax.sharding.NamedSharding(mesh, sharded)
+    )
+    cache_sal = jax.jit(
+        jax.shard_map(
+            _pallas_dcp_append(KVLayout.SEQ_ALONG_LANE),
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=sharded,
+            check_vma=False,
+        )
+    )(shards_sal, step_rec, seq_lens, page_indices, cu_q_lens)
+
+    np.testing.assert_array_equal(np.asarray(cache_has), np.asarray(cache_xla))
+
+    topk_xla = np.asarray(
+        streamindex_topk_dcp(
+            q,
+            weights,
+            cache_xla,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
+            **kwargs,
+        )
+    )
+    topk_has = np.asarray(
+        streamindex_topk_dcp(
+            q,
+            weights,
+            cache_has,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            kv_layout=KVLayout.HEAD_ALONG_SUBLANE,
+            **kwargs,
+        )
+    )
+    topk_sal = np.asarray(
+        streamindex_topk_dcp(
+            q,
+            weights,
+            cache_sal,
+            seq_lens,
+            page_indices,
+            cu_q_lens,
+            distribution,
+            kv_layout=KVLayout.SEQ_ALONG_LANE,
+            **kwargs,
+        )
+    )
+
+    np.testing.assert_array_equal(topk_has, topk_xla)
+    np.testing.assert_array_equal(topk_sal, topk_xla)

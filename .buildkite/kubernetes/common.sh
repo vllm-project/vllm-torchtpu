@@ -25,17 +25,20 @@
 # surfaces twenty minutes later as ImagePullBackOff on a TPU node that scaled up
 # to sit idle.
 #
-# A step may still name its own image, which the disagg lane does - it builds
-# one of its own rather than using the CI image.
+# A step on another variant of the image - the -omni build - names it with
+# DOCKER_IMAGE_SUFFIX, as run_in_docker.sh reads it on bare metal. A step may
+# also name its own image, which the disagg lane does - it builds one of its
+# own rather than using the CI image.
 if [[ -z "${WORKLOAD_IMAGE:-}" ]]; then
-  WORKLOAD_IMAGE=$(buildkite-agent meta-data get "CI_IMAGE_TAG" --default "" \
-    2>/dev/null || true)
+  WORKLOAD_IMAGE=$(buildkite-agent meta-data get "CI_IMAGE_TAG${DOCKER_IMAGE_SUFFIX:-}" \
+    --default "" 2>/dev/null || true)
 fi
 if [[ -z "${WORKLOAD_IMAGE:-}" ]]; then
   # Falling back to :latest would run whatever happened to be pushed last and
   # report the answer as this commit's.
-  echo "$0: no CI_IMAGE_TAG metadata and no WORKLOAD_IMAGE. The image build" \
-       "step has to run before this one, or the step has to name an image." >&2
+  echo "$0: no CI_IMAGE_TAG${DOCKER_IMAGE_SUFFIX:-} metadata and no WORKLOAD_IMAGE." \
+       "The image build step has to run before this one, or the step has to" \
+       "name an image." >&2
   exit 2
 fi
 export WORKLOAD_IMAGE
@@ -44,7 +47,7 @@ export WORKLOAD_IMAGE
 # forwards only what --env names.
 export FORCE_COLOR="1"
 export TQDM_MININTERVAL="30"
-export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU="0.0.0"
+export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU_CORE="0.0.0"
 export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken"
 export UV_NO_CACHE="1"
 
@@ -60,10 +63,11 @@ export SKIP_SPANNER_UPLOAD="1"
 FORWARD=(
   # cpu on the cpu queue; unset on a TPU host, where JAX finds the chips.
   JAX_PLATFORMS
-  FORCE_COLOR TQDM_MININTERVAL SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU
+  FORCE_COLOR TQDM_MININTERVAL SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU_CORE
   UV_INDEX_TORCH_TPU_REGISTRY_USERNAME UV_NO_CACHE
   CI_RUNNER SKIP_SPANNER_UPLOAD
-  BENCHMARK_WARMUP_RUNS RUN_CODE_EVAL RUN_TYPE MODEL_PATH MODEL_URI EVAL_SOFT_FAIL
+  BENCHMARK_WARMUP_RUNS RUN_CODE_EVAL RUN_LM_EVAL RUN_TYPE MODEL_PATH MODEL_URI
+  EVAL_SOFT_FAIL
   # Lets a one-off build force an xprof capture; unset leaves the day rule in
   # benchmark_with_profile.sh to decide.
   CAPTURE_PROFILE
@@ -71,11 +75,16 @@ FORWARD=(
   # writes ~40 GB of inductor cache per host and a capture run ~30 GB of temp
   # JSON, which is an evicted pod if it lands on ephemeral storage.
   TMPDIR RAY_TMPDIR
+  # vLLM's compile caches default to ~/.cache/vllm, on the pod's ephemeral
+  # storage. A step that compiles a large model points them at /cache/jax.
+  VLLM_CACHE_ROOT VLLM_XLA_CACHE_PATH
   SERVED_MODEL_NAME RUN_ROOT VLLM_ENGINE_READY_TIMEOUT_S
   TPU_ACCELERATOR_TYPE TPU_MULTIHOST_BACKEND TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL
   USE_MOE_SPARSE_CORE P4D2_BIND_HOST PROXY_PORT
   # Set by bootstrap.sh; benchmark configs branch on it.
   NIGHTLY CREATED_BY
+  # The P/D benchmark loads its results into BigQuery when this is set.
+  BQ_UPLOAD
   # Carries the -m filter into bktec's collection step; see the sharded steps
   # in pipeline_tests_kube.yml.
   PYTEST_ADDOPTS

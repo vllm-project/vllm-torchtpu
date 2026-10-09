@@ -45,18 +45,22 @@ def _cpu_model_tests(monkeypatch):
     # queries registered devices; keep it from opening a distributed TPU
     # client merely to inspect the current device while tracing CPU code.
     #
-    # torch.tpu is registered by importing torch_tpu, which the cpu_test job
+    # torch.tpu is registered by importing torch_tpu, which the CPU test job
     # never does: tests/conftest.py imports it only under --use-tpu, and
     # importing it here would claim the accelerator in the pytest parent and
     # lock out every spawned child. With no device module registered there is
     # nothing for Dynamo to query, so there is nothing to stub either.
     tpu = getattr(torch, "tpu", None)
-    if tpu is None:
-        return
-    monkeypatch.setattr(tpu, "is_available", lambda: False)
-    monkeypatch.setattr(tpu, "current_device", lambda: 0)
-    monkeypatch.setattr(tpu, "device_count", lambda: 0)
-    monkeypatch.setattr(tpu, "manual_seed_all", lambda seed: None)
+    if tpu is not None:
+        monkeypatch.setattr(tpu, "is_available", lambda: False)
+        monkeypatch.setattr(tpu, "current_device", lambda: 0)
+        monkeypatch.setattr(tpu, "device_count", lambda: 0)
+        monkeypatch.setattr(tpu, "manual_seed_all", lambda seed: None)
+
+    if hasattr(torch, "accelerator"):
+        monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
+        monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+        monkeypatch.setattr(torch.accelerator, "device_count", lambda: 0)
 
 
 def test_kimi_architectures_are_registered() -> None:
@@ -212,7 +216,6 @@ def test_checkpoint_name_mapping_is_conditional_for_mla() -> None:
     assert weight.shard_id == 0
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize("tied", [False, True], ids=["untied", "tied"])
 def test_weight_loader_preserves_lm_head_skip_and_streaming(tied) -> None:
     model = KimiLinearForCausalLM.__new__(KimiLinearForCausalLM)
@@ -513,6 +516,7 @@ def test_model_is_registered_for_torch_compile() -> None:
     assert TorchCompileWithNoGuardsWrapper in KimiModel.__bases__
 
 
+@pytest.mark.tpu_test
 def test_kimi_linear_mla_keeps_its_checkpoint_layout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -586,6 +590,7 @@ def test_kimi_linear_mla_keeps_its_checkpoint_layout(
     )
 
 
+@pytest.mark.tpu_test
 def test_mla_fuses_output_gate_with_lora_a_projections(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -696,6 +701,7 @@ def _mla_config(**overrides) -> KimiLinearConfig:
     return KimiLinearConfig(**kwargs)
 
 
+@pytest.mark.tpu_test
 def test_mla_requires_nope(monkeypatch: pytest.MonkeyPatch) -> None:
     """The TPU MLA layer only implements the NoPE variant. A config that
     asks for the RoPE-inside-MLA variant is rejected up front."""
@@ -705,6 +711,7 @@ def test_mla_requires_nope(monkeypatch: pytest.MonkeyPatch) -> None:
         MultiHeadLatentAttention(config, VllmConfig(), prefix="a")
 
 
+@pytest.mark.tpu_test
 def test_mla_rejects_incomplete_config(monkeypatch: pytest.MonkeyPatch) -> None:
     """All four MLA head dimensions must be set. Leaving one as `None`
     produces an error that lists every field, so the user can see which
@@ -715,6 +722,7 @@ def test_mla_rejects_incomplete_config(monkeypatch: pytest.MonkeyPatch) -> None:
         MultiHeadLatentAttention(config, VllmConfig(), prefix="b")
 
 
+@pytest.mark.tpu_test
 def test_mla_rejects_heads_not_divisible_by_tp(monkeypatch: pytest.MonkeyPatch) -> None:
     """Attention heads are split evenly across tensor-parallel ranks, so
     4 heads cannot be spread over 3 ranks."""
@@ -996,15 +1004,16 @@ def _patch_kda_construction_deps(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         kimi_attention,
         "build_kimi_dispatched_kda_op",
-        lambda *a, **k: (lambda *args, **kwargs: None),
+        lambda *a, **k: lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
         kimi_attention,
         "build_kimi_pooled_kda_op",
-        lambda *a, **k: (lambda *args, **kwargs: None),
+        lambda *a, **k: lambda *args, **kwargs: None,
     )
 
 
+@pytest.mark.tpu_test
 def test_kda_construction_wires_projections_and_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1037,6 +1046,7 @@ def test_kda_construction_wires_projections_and_state(
     )
 
 
+@pytest.mark.tpu_test
 def test_kda_construction_full_rank_gate_builds_separate_projections(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1058,6 +1068,7 @@ def test_kda_construction_full_rank_gate_builds_separate_projections(
     assert layer.g_b_proj is None
 
 
+@pytest.mark.tpu_test
 def test_kda_construction_rejects_duplicate_prefix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1078,6 +1089,7 @@ def test_kda_construction_rejects_duplicate_prefix(
             )
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("num_spec_tokens", [0, 5, 7])
 def test_kda_construction_passes_speculative_window_to_op(
     monkeypatch: pytest.MonkeyPatch, num_spec_tokens: int
@@ -2411,3 +2423,148 @@ def test_sp_prefill_divisible_shapes_preserve_token_ownership(
         torch.testing.assert_close(auxiliary[0], hidden + 1)
     torch.testing.assert_close(actual, hidden + 1)
     assert calls == ([0] * (2 if capture_aux else 1) if expected_sp else [])
+
+
+def _encoder_cudagraph_stub(merge=(2, 2)) -> SimpleNamespace:
+    # The encoder-cudagraph protocol methods only read the vision tower's
+    # merge kernel; call them unbound on a stub rather than build MoonViT.
+    return SimpleNamespace(
+        vision_tower=SimpleNamespace(merge_kernel_size=merge),
+        _grid_thw_list=KimiK3ForConditionalGeneration._grid_thw_list,
+    )
+
+
+def test_kimi_k3_opts_into_encoder_cudagraph() -> None:
+    # This is the switch MMEncoderManager keys on: without it,
+    # cudagraph_mm_encoder is silently inert for Kimi and MoonViT stays eager,
+    # compiling per image resolution.
+    from vllm.model_executor.models.interfaces import supports_encoder_cudagraph
+
+    assert supports_encoder_cudagraph(KimiK3ForConditionalGeneration)
+
+
+def test_kimi_k3_encoder_cudagraph_item_specs() -> None:
+    stub = _encoder_cudagraph_stub()
+    grid = torch.tensor([[1, 4, 6], [1, 2, 2], [2, 8, 4]])
+
+    specs = KimiK3ForConditionalGeneration.get_encoder_cudagraph_item_specs(
+        stub, {"grid_thws": grid}
+    )
+
+    # Input is patches (t*h*w); output is tokens after the 2x2 merge.
+    assert [s.input_size for s in specs] == [24, 4, 64]
+    assert [s.output_tokens for s in specs] == [6, 1, 16]
+
+
+def test_kimi_k3_select_encoder_cudagraph_items_gathers_each_items_patches() -> None:
+    stub = _encoder_cudagraph_stub()
+    grid = torch.tensor([[1, 2, 2], [1, 4, 2], [1, 2, 6]])
+    sizes = [4, 8, 12]
+    # Row r of pixel_values carries the value of the item it belongs to, so a
+    # wrong offset shows up as the wrong item's rows.
+    pixel_values = torch.cat(
+        [torch.full((n, 3, 2, 2), float(i)) for i, n in enumerate(sizes)]
+    )
+    mm_kwargs = {"pixel_values": pixel_values, "grid_thws": grid}
+
+    picked = KimiK3ForConditionalGeneration.select_encoder_cudagraph_items(
+        stub, mm_kwargs, [2, 0]
+    )
+
+    expected = torch.cat([torch.full((12, 3, 2, 2), 2.0), torch.zeros(4, 3, 2, 2)])
+    torch.testing.assert_close(picked["pixel_values"], expected)
+    torch.testing.assert_close(picked["grid_thws"], grid[[2, 0]])
+
+    empty = KimiK3ForConditionalGeneration.select_encoder_cudagraph_items(
+        stub, mm_kwargs, []
+    )
+    assert empty["pixel_values"].shape == (0, 3, 2, 2)
+    assert empty["grid_thws"].shape == (0, 3)
+
+
+@pytest.mark.parametrize(
+    ("batched", "model_len", "expected_max"), [(8192, 24576, 8192), (8192, 4096, 4096)]
+)
+def test_kimi_k3_encoder_cudagraph_budget_range(
+    batched: int, model_len: int, expected_max: int
+) -> None:
+    vllm_config = SimpleNamespace(
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=batched),
+        model_config=SimpleNamespace(max_model_len=model_len),
+    )
+
+    budget_range = KimiK3ForConditionalGeneration.get_encoder_cudagraph_budget_range(
+        _encoder_cudagraph_stub(), vllm_config
+    )
+
+    assert budget_range == (64, expected_max)
+
+
+def test_kimi_vision_qkv_materialization_is_skipped_while_compiling(
+    monkeypatch,
+) -> None:
+    # The eager-mode materialization calls a native sync that Dynamo cannot
+    # trace; inside the budget forward's fullgraph compile it must be a no-op
+    # or the whole encoder compile aborts.
+    from vllm_torchtpu.models.vllm.kimi_k3 import kimi_vit
+
+    def fail(*args, **kwargs):
+        raise AssertionError("synchronize_tensors reached while compiling")
+
+    monkeypatch.setattr(kimi_vit, "synchronize_tensors", fail)
+    monkeypatch.setattr(torch.compiler, "is_compiling", lambda: True)
+    qkv = SimpleNamespace(device=SimpleNamespace(type="tpu"))
+
+    assert kimi_vit._materialize_vision_qkv(None, (), (qkv, None)) is None
+
+
+@pytest.mark.parametrize(
+    ("budget", "items", "grid"),
+    [
+        # 128 tokens per item: one row, the layout before rows could wrap.
+        (8192, 64, [1, 2, 256]),
+        # 1024 tokens per item would be 2048 patches in one row, past the
+        # 512-wide rope table; it wraps to 4 rows of 512.
+        (8192, 8, [1, 8, 512]),
+    ],
+)
+def test_kimi_k3_encoder_cudagraph_capture_grid_fits_rope_table(
+    budget: int, items: int, grid: list[int]
+) -> None:
+    seen = {}
+
+    def metadata(grid_config, *, max_batch_size, max_seqlen_override, device):
+        seen.update(grid=grid_config, max_seqlen=max_seqlen_override)
+        return {}
+
+    stub = _encoder_cudagraph_stub()
+    stub.vision_tower.encoder = SimpleNamespace(
+        rope_2d=SimpleNamespace(max_height=512, max_width=512)
+    )
+    # 1x1 patches keep the dummy pixel tensor small; only its row count matters.
+    stub.vision_tower.patch_embed = SimpleNamespace(
+        patch_size=(1, 1), proj=SimpleNamespace(in_channels=1)
+    )
+    stub.vision_tower.prepare_encoder_cudagraph_metadata = metadata
+
+    inputs = KimiK3ForConditionalGeneration.prepare_encoder_cudagraph_capture_inputs(
+        stub, budget, items, 1, torch.device("cpu"), torch.float32
+    )
+
+    assert seen["grid"] == [grid] * items
+    t, h, w = grid
+    assert sum(t * (h // 2) * (w // 2) for _ in range(items)) >= budget
+    assert seen["max_seqlen"] >= max(budget * 4, t * h * w)
+    assert inputs.values["pixel_values"].shape[0] == items * t * h * w
+
+
+def test_kimi_k3_encoder_cudagraph_capture_rejects_budget_past_rope_table() -> None:
+    stub = _encoder_cudagraph_stub()
+    stub.vision_tower.encoder = SimpleNamespace(
+        rope_2d=SimpleNamespace(max_height=16, max_width=16)
+    )
+
+    with pytest.raises(ValueError, match="RoPE table"):
+        KimiK3ForConditionalGeneration.prepare_encoder_cudagraph_capture_inputs(
+            stub, 1000, 1, 1, torch.device("cpu"), torch.float32
+        )

@@ -1,0 +1,33 @@
+name: Ready Label
+
+# TPU CI (buildkite/vllm-torchtpu-ci/pr) only runs on PRs labeled `ready`.
+# Without the label nothing in Buildkite says why that status never arrives,
+# so this check fails until a code owner or maintainer adds it. It reads only
+# the event payload, with no checkout and no token, so it also works on fork
+# PRs.
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled, unlabeled]
+
+permissions: {}
+
+concurrency:
+  group: ready-label-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  ready-label:
+    name: Check for Ready Label
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - name: Require the ready label
+        env:
+          HAS_READY: ${{ contains(github.event.pull_request.labels.*.name, 'ready') }}
+        run: |
+          if [[ "${HAS_READY}" == "true" ]]; then
+            echo "Found the 'ready' label."
+            exit 0
+          fi
+          echo "::error::Add the 'ready' label to run TPU CI. A code owner or maintainer adds it once the PR is ready for TPU testing."
+          exit 1

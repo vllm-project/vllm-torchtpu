@@ -77,6 +77,7 @@ def _fake_gather_sharded_weight(module):
     return weight, weight.shape[0], weight.shape[1], weight.device
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     "data, target_len, expected",
     [
@@ -95,6 +96,7 @@ def test_maybe_pad_dim0(device, data, target_len, expected):
     assert torch.equal(out, torch.tensor(expected, device=device))
 
 
+@pytest.mark.tpu_test
 def test_maybe_pad_dim0_rejects_3d(device):
     with pytest.raises(ValueError):
         _maybe_pad_dim0(torch.zeros((2, 2, 2), device=device), 4)
@@ -310,6 +312,7 @@ class _CarryAggregationAfterGatherPlan:
         return tensor
 
 
+@pytest.mark.tpu_test
 def test_prepare_draft_inputs(device):
     proposer = _make_proposer(draft_tp=1)
     proposer.runner = SimpleNamespace(
@@ -359,6 +362,7 @@ def test_prepare_draft_inputs(device):
     assert torch.equal(draft_input_ids, expected_ids)
 
 
+@pytest.mark.tpu_test
 def test_prepare_draft_inputs_chunk_offset(device):
     """A non-zero start_index must slice the batch-level sampled tokens and
     rejection counts by the chunk's offset."""
@@ -406,6 +410,7 @@ def test_prepare_draft_inputs_chunk_offset(device):
     assert torch.equal(draft_input_ids, expected_ids)
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("seed_source", ["host", "device_seed", "next_tokens_device"])
 def test_prepare_draft_inputs_pcp_mtp_seeds_request_major_then_localizes(
     device, seed_source
@@ -477,6 +482,7 @@ def test_prepare_draft_inputs_pcp_mtp_seeds_request_major_then_localizes(
         assert np.array_equal(rejected, np.zeros(2, dtype=np.int32))
 
 
+@pytest.mark.tpu_test
 def test_prepare_draft_inputs_all_layout_keeps_device_seed_gathers(device, monkeypatch):
     import vllm_torchtpu.spec_decode.eagle3 as e3
 
@@ -586,6 +592,7 @@ def test_propose_delegates_carry_aggregation_after_gather():
     assert events == ["gather", "aggregate", "propose_token"]
 
 
+@pytest.mark.tpu_test
 def test_prepare_draft_inputs_async_device(device):
     """Async device path derives the seed token, the seed *position*
     (last_token_indices) and the rejected count from the on-device rejection
@@ -652,6 +659,7 @@ def test_prepare_draft_inputs_async_device(device):
     assert dev_rej.cpu().tolist() == host_rej.tolist() == [1, 3]
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("num_speculative_tokens", [1, 3, 8])
 @pytest.mark.parametrize("chunk_sizes", [[2], [2, 2], [3, 1]])
 @pytest.mark.parametrize("return_device", [False, True])
@@ -812,6 +820,7 @@ def test_draft_combine_input_size_with_aux_hidden_state():
     assert proposer._draft_combine_input_size() == 24576
 
 
+@pytest.mark.tpu_test
 def test_propose_without_aux_hidden_state(device):
     hidden_size = 8
     proposer = _make_proposer(draft_tp=1)
@@ -897,6 +906,7 @@ def test_propose_empty_batch():
     )
 
 
+@pytest.mark.tpu_test
 def test_propose_pads_to_coordinated_chunk_bound(device):
     """Under EP-DP lockstep, a rank with fewer chunks than the coordinated
     bound must pad with run_dp_dummy_draft chunks so draft-forward counts pair
@@ -1151,6 +1161,7 @@ def test_run_dp_dummy_draft_positions_match_draft_graph_rank(monkeypatch, uses_m
     assert first["chunk"].attn_ctx.position_ids_override.shape == (64,)
 
 
+@pytest.mark.tpu_test
 def test_build_draft_attn_metadata_loop_cache(device):
     """Loop iterations >= 2 must reuse the step-1 metadata objects with only
     seq_lens swapped (advanced by +1), value-identical to a full rebuild."""
@@ -1239,6 +1250,7 @@ def test_build_draft_attn_metadata_loop_cache(device):
     assert dc.is_dataclass(md2["draft.attn.0"])
 
 
+@pytest.mark.tpu_test
 def test_build_draft_attn_metadata_propagates_chunk_layout_descriptor(device):
     """Rebuilding draft metadata must preserve the target chunk's PCP
     descriptor; defaulting it to ALL selects an incompatible attention path."""
@@ -1301,6 +1313,207 @@ def test_build_draft_attn_metadata_propagates_chunk_layout_descriptor(device):
     assert captured_descriptors == [descriptor]
 
 
+def _target_md_chunk(device, attn_metadata, position_ids_override=None):
+    """A 2-request chunk whose target forward built `attn_metadata`."""
+    return SimpleNamespace(
+        num_reqs=2,
+        start_index=0,
+        query_start_loc_np=np.array([0, 4, 8], dtype=np.int32),
+        attn_ctx=SimpleNamespace(
+            use_max_model_len=True,
+            seq_lens=torch.tensor(
+                [5, 9, 0, 0, 0, 0, 0, 0], dtype=torch.int32, device=device
+            ),
+            query_start_loc=torch.tensor(
+                [0, 4, 8, 8, 8, 8, 8, 8, 8], dtype=torch.int32, device=device
+            ),
+            request_distribution=torch.tensor(
+                [0, 2, 2], dtype=torch.int32, device=device
+            ),
+            position_ids_override=position_ids_override,
+            sequence_layout_descriptor=SequenceLayoutDescriptor(),
+        ),
+        attn_metadata=attn_metadata,
+    )
+
+
+def _md_reuse_runner(device):
+    def no_rebuild(**_kwargs):
+        raise AssertionError("draft metadata was rebuilt")
+
+    return SimpleNamespace(
+        _has_mamba_state=True,
+        _unified_kv_layout=True,
+        num_reqs_max_model_len=8,
+        num_reqs_most_model_len=8,
+        device=device,
+        _attn_metadata_builder_ctx=None,
+        empty_slot_mappings={},
+        _build_attention_metadata=no_rebuild,
+    )
+
+
+@pytest.mark.tpu_test
+def test_build_draft_attn_metadata_reuses_target_metadata(device):
+    """With the target forward's metadata on the chunk, step 0 returns its
+    draft-layer entries and loop steps swap only seq_lens / query_start_loc /
+    request_distribution, with no rebuild. Mamba state and the unified pool,
+    which disable the rebuild-path loop cache, do not matter here."""
+    from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer._draft_attn_layer_names = {"draft.attn.0", "draft.attn.1"}
+    proposer.runner = _md_reuse_runner(device)
+    chunk = _target_md_chunk(device, None)
+    chunk_ctx = chunk.attn_ctx
+    shared = AttentionMetadata(
+        input_positions=torch.zeros(8, device=device),
+        block_tables=torch.arange(16, dtype=torch.int32, device=device),
+        seq_lens=chunk_ctx.seq_lens,
+        query_start_loc=chunk_ctx.query_start_loc,
+        request_distribution=chunk_ctx.request_distribution,
+    )
+    mamba = AttentionMetadata(input_positions=torch.zeros(8, device=device))
+    chunk.attn_metadata = {
+        "target.attn.0": shared,
+        "draft.attn.0": shared,
+        "draft.attn.1": shared,
+        "target.gdn.0": mamba,
+    }
+
+    md0 = proposer._build_draft_attn_metadata(
+        chunk, step_idx=0, seq_lens_delta=0, num_rejected_np=None
+    )
+    assert md0 == {"draft.attn.0": shared, "draft.attn.1": shared}
+
+    loop_input_deltas = []
+    loop_step_attn_inputs = proposer._loop_step_attn_inputs
+
+    def counting_loop_step_attn_inputs(*args, **kwargs):
+        loop_input_deltas.append(kwargs["seq_lens_delta"])
+        return loop_step_attn_inputs(*args, **kwargs)
+
+    proposer._loop_step_attn_inputs = counting_loop_step_attn_inputs
+    loop_qsl = torch.arange(9, dtype=torch.int32, device=device)
+    loop_rd = torch.tensor([2, 2, 2], dtype=torch.int32, device=device)
+    rej = torch.tensor([1, 0, 0, 0, 0, 0, 0, 0], dtype=torch.int32, device=device)
+    for step in (1, 2, 3):
+        md = proposer._build_draft_attn_metadata(
+            chunk,
+            step_idx=step,
+            seq_lens_delta=step,
+            num_rejected_np=None,
+            num_rejected_dev=rej,
+            loop_query_start_loc=loop_qsl,
+            loop_request_distribution=loop_rd,
+        )
+        assert set(md) == {"draft.attn.0", "draft.attn.1"}
+        # Layers sharing one metadata object still share one after the swap.
+        assert md["draft.attn.0"] is md["draft.attn.1"]
+        step_md = md["draft.attn.0"]
+        assert step_md is not shared
+        assert step_md.block_tables is shared.block_tables
+        assert step_md.query_start_loc is loop_qsl
+        assert step_md.request_distribution is loop_rd
+        expect = chunk_ctx.seq_lens + step - rej
+        assert torch.equal(step_md.seq_lens.cpu(), expect.cpu()), step
+    # Steps >= 2 advance step 1's seq_lens rather than recomputing them.
+    assert loop_input_deltas == [1]
+    # The target's own metadata is untouched.
+    assert shared.seq_lens is chunk_ctx.seq_lens
+    assert shared.query_start_loc is chunk_ctx.query_start_loc
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "gap", ["missing_draft_layer", "dummy_chunk", "kv_shared_draft"]
+)
+def test_build_draft_attn_metadata_rebuilds_without_target_coverage(device, gap):
+    """No reuse when the target metadata lacks a draft layer, the chunk is an
+    EP-DP dummy (fixed positions), or the draft reads the target's KV cache
+    (Gemma-4 MTP gets the group's full dict from the rebuild): the draft
+    metadata is rebuilt."""
+    from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer._draft_attn_layer_names = {"draft.attn.0"}
+    runner = _md_reuse_runner(device)
+    runner._has_mamba_state = False
+    proposer.runner = runner
+    md = AttentionMetadata(input_positions=torch.zeros(8, device=device))
+    if gap == "missing_draft_layer":
+        chunk = _target_md_chunk(device, {"target.attn.0": md})
+    elif gap == "kv_shared_draft":
+        proposer._draft_kv_shared = True
+        chunk = _target_md_chunk(device, {"draft.attn.0": md})
+    else:
+        chunk = _target_md_chunk(
+            device,
+            {"draft.attn.0": md},
+            position_ids_override=torch.zeros(8, dtype=torch.int32, device=device),
+        )
+    rebuilt = AttentionMetadata(input_positions=torch.ones(8, device=device))
+    calls = []
+
+    def rebuild(**kw):
+        calls.append(kw)
+        return {"draft.attn.0": rebuilt}, None
+
+    runner._build_attention_metadata = rebuild
+    out = proposer._build_draft_attn_metadata(
+        chunk, step_idx=0, seq_lens_delta=0, num_rejected_np=None
+    )
+    assert len(calls) == 1
+    assert out == {"draft.attn.0": rebuilt}
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("kv_shared", [False, True], ids=["advancing", "kv_shared"])
+def test_build_draft_attn_metadata_loop_cache_follows_seq_lens_delta(device, kv_shared):
+    """A rebuilt loop step is reused by the steps after it, with seq_lens
+    moved by the change in seq_lens_delta: +1 per step for a draft that
+    appends a token, none for a KV-sharing draft (Gemma-4 MTP), whose
+    seq_lens stay at step 1's."""
+    from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer._draft_attn_layer_names = {"draft.attn.0"}
+    proposer._draft_kv_shared = kv_shared
+    runner = _md_reuse_runner(device)
+    runner._has_mamba_state = False
+    runner._unified_kv_layout = False
+    proposer.runner = runner
+    chunk = _target_md_chunk(device, None)
+    rebuilds = []
+
+    def rebuild(**_kwargs):
+        seq_lens = runner._attn_metadata_builder_ctx.seq_lens
+        rebuilds.append(seq_lens)
+        md = AttentionMetadata(
+            input_positions=torch.zeros(8, device=device), seq_lens=seq_lens
+        )
+        return {"draft.attn.0": md}, None
+
+    runner._build_attention_metadata = rebuild
+    loop_qsl = torch.arange(9, dtype=torch.int32, device=device)
+    loop_rd = torch.tensor([2, 2, 2], dtype=torch.int32, device=device)
+    rej = torch.tensor([1, 0, 0, 0, 0, 0, 0, 0], dtype=torch.int32, device=device)
+    for step in (1, 2, 3):
+        delta = 0 if kv_shared else step
+        md = proposer._build_draft_attn_metadata(
+            chunk,
+            step_idx=step,
+            seq_lens_delta=delta,
+            num_rejected_np=None,
+            num_rejected_dev=rej,
+            loop_query_start_loc=loop_qsl,
+            loop_request_distribution=loop_rd,
+        )
+        expect = chunk.attn_ctx.seq_lens + delta - rej
+        assert torch.equal(md["draft.attn.0"].seq_lens.cpu(), expect.cpu()), step
+    assert len(rebuilds) == 1
+
+
 def test_load_draft_model_saves_and_wraps_with_draft_config(monkeypatch):
     """The exact copied config used to construct the draft must also be the
     TPU wrapper config; recovering it from an optional model attribute is not
@@ -1344,6 +1557,7 @@ def test_load_draft_model_saves_and_wraps_with_draft_config(monkeypatch):
     assert wrapper_configs == [proposer.draft_vllm_config]
 
 
+@pytest.mark.tpu_test
 def test_forward_draft_uses_saved_draft_config_in_both_contexts(monkeypatch, device):
     """Both vLLM forward metadata and the TPU wrapper must observe the saved
     draft config so PCP descriptor and interleave configuration agree."""
@@ -1417,6 +1631,7 @@ def test_pcp_mtp_draft_cache_specs_require_full_attention():
         proposer._validate_pcp_draft_model(draft_attn_layer_names)
 
 
+@pytest.mark.tpu_test
 def test_build_draft_attn_metadata_cache_cleared_per_propose(device):
     """A new propose() run must not reuse a previous step's cached metadata
     for a recycled chunk id — the cache is cleared at propose entry."""

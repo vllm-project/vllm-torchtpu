@@ -1,13 +1,16 @@
 import contextlib
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
 import torch.distributed as dist
 from torch.nn import Parameter
 from vllm.distributed.parallel_state import get_tp_group
-from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 
 from vllm_torchtpu.layers.core.sequence_layout import (
     AllSequenceLayoutPlanner,
@@ -95,12 +98,13 @@ def _force_draft_tp1():
 
 
 def gather_sharded_weight(
-    sharded_module: torch.nn.Module,
+    sharded_module: VocabParallelEmbedding,
 ) -> tuple[torch.Tensor, int, int, torch.device]:
     """Gathers a sharded weight tensor across TP into a full replicated tensor."""
     tp_group = get_tp_group().cpu_group
     org_vocab = sharded_module.org_vocab_size
     dim = sharded_module.embedding_dim
+    weight = cast(torch.Tensor, sharded_module.weight)
 
     si = sharded_module.shard_indices
     num_added = si.added_vocab_end_index - si.added_vocab_start_index
@@ -111,18 +115,18 @@ def gather_sharded_weight(
 
     num_org = si.org_vocab_end_index - si.org_vocab_start_index
     full = torch.zeros(org_vocab, dim, dtype=torch.float32)
-    my_rows = sharded_module.weight.data[:num_org].to(torch.float32).cpu()
+    my_rows = weight.data[:num_org].to(torch.float32).cpu()
     full[si.org_vocab_start_index : si.org_vocab_end_index] = my_rows
     dist.all_reduce(full, group=tp_group)
 
-    draft_dtype = sharded_module.weight.dtype
-    draft_device = sharded_module.weight.device
+    draft_dtype = weight.dtype
+    draft_device = weight.device
     full_dev = full.to(draft_dtype).to(draft_device)
     return full_dev, org_vocab, dim, draft_device
 
 
 def populate_draft_embed_from_target(
-    draft_model: torch.nn.Module, target_embed: torch.nn.Module
+    draft_model: torch.nn.Module, target_embed: VocabParallelEmbedding
 ) -> None:
     """Fill the draft's own (tp=1, full-vocab) embed_tokens with the
     target's embedding, assembled on the host.
@@ -233,7 +237,7 @@ def resolve_draft_logits_processor(draft_model: torch.nn.Module):
 
 
 def populate_draft_lm_head_from_target(
-    draft_model: torch.nn.Module, target_lm_head: torch.nn.Module
+    draft_model: torch.nn.Module, target_lm_head: VocabParallelEmbedding
 ) -> None:
     shared_heads = list(iter_mtp_shared_heads(draft_model))
     if shared_heads:

@@ -6,7 +6,7 @@ import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import os
 import time
-from typing import TYPE_CHECKING, Union
+from typing import TYPE_CHECKING, Protocol, Union, cast
 
 import portpicker
 import torch
@@ -29,15 +29,28 @@ from vllm_torchtpu.platforms.tpu_block_size_utils import (
 
 if TYPE_CHECKING:
     from vllm.config import ModelConfig, VllmConfig
-    from vllm.multimodal.processing import ProcessorInputs
+    from vllm.inputs import EngineInput
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm.v1.attention.selector import AttentionSelectorConfig
+
+    class _TpuAttentionBackend(Protocol):
+        """Typing-only view of the TPU classmethods on our attention backends."""
+
+        @staticmethod
+        def get_page_size(vllm_config: VllmConfig) -> int: ...
+
+        @staticmethod
+        def get_min_page_size(vllm_config: VllmConfig) -> int: ...
+
+        @classmethod
+        def get_preferred_block_size(cls, default_block_size: int) -> int: ...
+
 else:
     ModelConfig = None
     VllmConfig = None
-    ProcessorInputs = None
+    EngineInput = None
     PoolingParams = None
     AttentionBackendEnum = None
     SamplingParams = None
@@ -297,7 +310,7 @@ def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
     Both mistakes below produce a run that looks healthy and writes no
     traces, which is only discovered once the benchmark has finished.
     """
-    assert "phased_profiling_dir" not in vllm_config.additional_config, (
+    assert "phased_profiling_dir" not in cast(dict, vllm_config.additional_config), (
         "Legacy additional_config['phased_profiling_dir'] is no longer "
         "supported. Set USE_PHASED_PROFILER=true and "
         "--profiler-config.torch_profiler_dir=<dir> instead."
@@ -392,6 +405,10 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_V2_SHARDED_PLAN",
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
+        "VLLM_TPU_INDEXER_KV_CACHE_MODE",
+        "TPU_USE_RAIDEN_KV_CACHE_MANAGER",
+        "TPU_RAIDEN_GLM_ADMISSION",
+        "TPU_KV_RESHARD_TRANSPORT",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import
@@ -421,14 +438,13 @@ class TpuPlatform(Platform):
         """Local physical chip count on this host, stable across contexts.
 
         Without this override, `device_count()` resolves dynamically to
-        `torch.tpu.device_count()` (see torch_tpu's device module), which
-        returns the *local* chip count outside any torch.distributed group
-        but drops to 1 (chips bound to this rank) once a real multi-host
-        `tpu_dist` process group is active — vLLM workers are one-process-
-        per-chip, so every rank observes exactly 1 there. Callers like
-        MessageQueue.create_from_process_group_single_reader use this value
-        as "how many ranks share this host" (the CUDA convention, where
-        device_count() stays host-wide regardless of the process's own
+        `torch.accelerator.device_count()`, which returns the *local* chip count
+        outside any torch.distributed group but drops to 1 (chips bound to this
+        rank) once a real multi-host `tpu_dist` process group is active — vLLM
+        workers are one-process-per-chip, so every rank observes exactly 1 there.
+        Callers like MessageQueue.create_from_process_group_single_reader use
+        this value as "how many ranks share this host" (the CUDA convention,
+        where device_count() stays host-wide regardless of the process's own
         device binding), so the dynamic proxy silently breaks cross-host
         same-node detection for every rank but the reader itself. Scanning
         /dev/vfio (or /dev/accel*) directly sidesteps the distributed
@@ -437,6 +453,38 @@ class TpuPlatform(Platform):
         from vllm_torchtpu.tpu_info import get_num_chips
 
         return get_num_chips()
+
+    @classmethod
+    def is_available(cls) -> bool:
+        return torch.accelerator.is_available()
+
+    @classmethod
+    def current_device(cls) -> int:
+        return torch.accelerator.current_device_index()
+
+    @classmethod
+    def current_device_index(cls) -> int:
+        return torch.accelerator.current_device_index()
+
+    @classmethod
+    def set_device(cls, device: torch.device | int) -> None:
+        torch.accelerator.set_device_index(device)
+
+    @classmethod
+    def set_device_index(cls, device: torch.device | int) -> None:
+        torch.accelerator.set_device_index(device)
+
+    @classmethod
+    def synchronize(cls, device: torch.device | int | None = None) -> None:
+        torch.accelerator.synchronize(device)
+
+    @classmethod
+    def current_stream(cls, device: torch.device | None = None) -> torch.Stream:
+        return torch.accelerator.current_stream(device)
+
+    @classmethod
+    def set_stream(cls, stream: torch.Stream) -> None:
+        torch.accelerator.set_stream(stream)
 
     @classmethod
     def get_worker_distributed_backend(cls, world_size: int) -> str:
@@ -503,6 +551,8 @@ class TpuPlatform(Platform):
         cls,
         selected_backend: "AttentionBackendEnum",
         attn_selector_config: "AttentionSelectorConfig",
+        # vLLM's selector passes num_heads by keyword; unused here.
+        num_heads: int | None = None,
         **kwargs,
     ) -> str:
         from vllm.v1.attention.backends.registry import AttentionBackendEnum
@@ -544,7 +594,9 @@ class TpuPlatform(Platform):
         raise NotImplementedError
 
     @classmethod
-    def get_current_memory_usage(cls, device: torch.device | None = None) -> float:
+    def get_current_memory_usage(
+        cls, device: torch.types.Device | None = None
+    ) -> float:
         if not torch.tpu.is_initialized():
             return 0.0
         free, total = torch.accelerator.get_memory_info(device)
@@ -599,7 +651,7 @@ class TpuPlatform(Platform):
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:
-        assert "sharding" not in vllm_config.additional_config, (
+        assert "sharding" not in cast(dict, vllm_config.additional_config), (
             "Legacy additional_config['sharding'] is no longer supported. "
             "Use --data-parallel-size and --enable-expert-parallel instead."
         )
@@ -631,6 +683,7 @@ class TpuPlatform(Platform):
             get_flashinfer_layout_string,
             resolve_kv_cache_layout,
         )
+        from vllm.v1.kv_cache_layout import KVCacheLayout as VllmKVCacheLayout
 
         from vllm_torchtpu.layers.adapter.attention import (
             PallasAttentionBackend,
@@ -649,6 +702,17 @@ class TpuPlatform(Platform):
         ):
             supported = ["BLHNC"]
         layout = resolve_kv_cache_layout(vllm_config, [supported])
+        # The hd64 kernel allocates HEAD_ALONG_SUBLANE pages even under HND.
+        if (
+            layout is VllmKVCacheLayout.LBHNC
+            and vllm_config.model_config is not None
+            and vllm_config.model_config.get_head_size() == 64
+        ):
+            raise NotImplementedError(
+                "VLLM_KV_CACHE_LAYOUT=HND selects the SEQ_ALONG_LANE KV cache "
+                "layout, which the head_dim==64 RPA kernel does not "
+                "implement. Use VLLM_KV_CACHE_LAYOUT=NHD for this model."
+            )
         kv_cache_layout = get_flashinfer_layout_string(layout)
         pcp_config = PcpStaticSupportValidator.validate_platform_config(
             vllm_config,
@@ -669,6 +733,9 @@ class TpuPlatform(Platform):
 
             patch_executor_for_pp_wave(vllm_config)
             _configure_pipeline_chunks(vllm_config)
+            from vllm_torchtpu.core.pp_lazy_step import patch_engine_core_for_lazy_push
+
+            patch_engine_core_for_lazy_push(vllm_config)
 
         from vllm.config import CompilationMode
 
@@ -707,13 +774,28 @@ class TpuPlatform(Platform):
         # will compile for.
         if compilation_config.compile_sizes is None:
             scheduler_config = vllm_config.scheduler_config
-            compilation_config.compile_sizes = _get_token_paddings(
-                min_token_size=16,
-                max_token_size=scheduler_config.max_num_batched_tokens,
-                extra_bucket_sizes=envs.TPU_TOKEN_BUCKET_EXTRA,
+            budget = scheduler_config.max_num_batched_tokens
+            extra_bucket_sizes = list(envs.TPU_TOKEN_BUCKET_EXTRA)
+            if envs.TPU_TOKEN_BUCKET_LINEAR:
+                extra_bucket_sizes += _get_linear_token_paddings(
+                    budget,
+                    vllm_config.model_config.max_model_len
+                    + scheduler_config.max_num_seqs,
+                )
+            compilation_config.compile_sizes = cast(
+                list[int | str],
+                _get_token_paddings(
+                    min_token_size=16,
+                    max_token_size=budget,
+                    extra_bucket_sizes=extra_bucket_sizes,
+                ),
             )
         else:
             compilation_config.compile_sizes = sorted(compilation_config.compile_sizes)
+
+        if envs.TPU_MOE_SEQUENCE_PARALLEL:
+            _configure_sequence_parallel_moe(vllm_config)
+
         # Clear compile_ranges_split_points — TPU always pads to exact
         # compile_sizes so catch-all ranges are never used.
         compilation_config.compile_ranges_split_points = []
@@ -973,7 +1055,9 @@ class TpuPlatform(Platform):
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:
         cache_config = vllm_config.cache_config
-        backend_cls = cls._find_non_ssm_backend(vllm_config)
+        backend_cls = cast(
+            "type[_TpuAttentionBackend] | None", cls._find_non_ssm_backend(vllm_config)
+        )
 
         if backend_cls is None:
             return
@@ -1052,7 +1136,7 @@ class TpuPlatform(Platform):
     @classmethod
     def validate_request(
         cls,
-        processed_inputs: ProcessorInputs,
+        processed_inputs: EngineInput,
         params: Union["SamplingParams", PoolingParams],
     ) -> None:
         """Raises if this request is unsupported on this platform"""
@@ -1105,6 +1189,47 @@ def _get_exponential_token_paddings(
         paddings.append(num)
         num *= 2
     paddings.append(max_token_size)
+    return paddings
+
+
+# Linear buckets above a quarter of the token budget, every budget/32 rows:
+# 512 at the 16384 budget the TP8 Qwen3.5 recipes serve. A pass there pads by
+# at most 1/8 instead of up to 1/2 with doubling.
+_LINEAR_BUCKETS_FROM_BUDGET_FRACTION = 4
+_LINEAR_BUCKET_STEPS_PER_BUDGET = 32
+# Each bucket is one more backbone (and MTP drafter) program per rank, and the
+# compiled programs stay resident in host memory: about 13 GB per bucket on
+# TP8 Qwen3.5-397B with MTP, so the 13 buckets at budget/32 drove that pod
+# past its 512 GiB while precompiling. The step widens by whole budget/32
+# multiples until the buckets fit under this cap.
+_MAX_LINEAR_BUCKETS = 7
+
+
+def _get_linear_token_paddings(max_token_size: int, longest_pass: int) -> list[int]:
+    """Multiples of the linear step above max_token_size / 4, up to the
+    longest pass one prompt can make (the model length plus the decode rows
+    riding along) and at most max_token_size. A prompt-sized pass costs per
+    row, so padding it to the next power of two wastes up to half of it.
+    At most _MAX_LINEAR_BUCKETS of them: the step is the smallest multiple
+    of budget/32 that keeps within the cap."""
+    base = max(16, -(-max_token_size // _LINEAR_BUCKET_STEPS_PER_BUDGET // 16) * 16)
+    floor = max_token_size // _LINEAR_BUCKETS_FROM_BUDGET_FRACTION
+    step = base
+    while True:
+        start = floor // step + 1
+        stop = min(-(-longest_pass // step) * step, max_token_size)
+        paddings = list(range(start * step, stop + 1, step))
+        if len(paddings) <= _MAX_LINEAR_BUCKETS:
+            break
+        step += base
+    if paddings:
+        logger.info(
+            "Linear token buckets every %d rows from %d to %d (%d buckets)",
+            step,
+            paddings[0],
+            paddings[-1],
+            len(paddings),
+        )
     return paddings
 
 
@@ -1162,3 +1287,73 @@ def _get_token_paddings(
         )
     logger.info("Using token paddings: %s", paddings)
     return paddings
+
+
+def _is_sequence_parallel_bucket(size: int, tp: int) -> bool:
+    # Each rank receives size // tp rows; require 8-token alignment or
+    # validated power-of-two decode sizes (2, 4) with at least 2 rows per rank
+    # to avoid single-token shape specialization in Dynamo.
+    rows, rem = divmod(size, tp)
+    return rem == 0 and (rows % 8 == 0 or rows in (2, 4))
+
+
+def _configure_sequence_parallel_moe(vllm_config: VllmConfig) -> None:
+    """Validate architecture and filter compile buckets for sequence-parallel MoE.
+
+    Keeps compile sizes where each tensor-parallel rank receives an 8-token aligned
+    shard or a validated power-of-two decode shard (2, 4 rows).
+    """
+    parallel_config = vllm_config.parallel_config
+    if not parallel_config.use_sequence_parallel_moe:
+        return
+    # The Qwen3.5 MoE drafter forward (Qwen3_5MultiTokenPredictor) already
+    # chunks to the local token shard and all-gathers after the final norm.
+    if (
+        vllm_config.speculative_config is not None
+        and vllm_config.speculative_config.method != "mtp"
+    ):
+        raise ValueError(
+            "TPU_MOE_SEQUENCE_PARALLEL=1 covers only the MTP drafter; "
+            f"got speculative method {vllm_config.speculative_config.method!r}."
+        )
+    archs = vllm_config.model_config.architectures or []
+    if not any(a.startswith("Qwen3_5Moe") for a in archs):
+        raise ValueError(
+            "TPU_MOE_SEQUENCE_PARALLEL=1 is validated only for Qwen3.5 MoE, "
+            f"got {archs}."
+        )
+    if parallel_config.pipeline_parallel_size > 1:
+        raise ValueError(
+            "TPU_MOE_SEQUENCE_PARALLEL=1 does not support pipeline parallelism "
+            f"(pipeline_parallel_size={parallel_config.pipeline_parallel_size})."
+        )
+    if not envs.USE_MOE_FUSED_EP_KERNEL:
+        logger.warning(
+            "TPU_MOE_SEQUENCE_PARALLEL=1 without USE_MOE_FUSED_EP_KERNEL=1 "
+            "moves the same collective bytes as the default path."
+        )
+    tp = parallel_config.tensor_parallel_size
+    cc = vllm_config.compilation_config
+    if cc.compile_sizes is None:
+        return
+    original = [int(s) for s in cc.compile_sizes]
+    kept = [s for s in original if _is_sequence_parallel_bucket(s, tp)]
+    if not kept:
+        raise ValueError(
+            f"TPU_MOE_SEQUENCE_PARALLEL=1 left no valid compile sizes "
+            f"for tp={tp}: {original}"
+        )
+    if max(kept) != max(original):
+        raise ValueError(
+            f"TPU_MOE_SEQUENCE_PARALLEL=1 dropped largest compile size "
+            f"{max(original)} (tp={tp}): {original} -> {kept}. The largest "
+            "compile size must split into 2, 4, or a multiple of 8 rows per "
+            "TP rank."
+        )
+    if dropped := sorted(set(original) - set(kept)):
+        logger.info(
+            "Sequence-parallel MoE dropped compile sizes %s (tp=%d).",
+            dropped,
+            tp,
+        )
+    cc.compile_sizes = cast(list[int | str], kept)

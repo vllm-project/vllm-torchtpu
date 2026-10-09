@@ -16,7 +16,7 @@
 from __future__ import annotations
 
 import functools
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import jax
 import torch
@@ -57,6 +57,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer imp
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    get_pallas_op_mesh,
     get_vllm_model_wrapper_context,
 )
 
@@ -129,7 +130,8 @@ def _name_float(value: float) -> str:
     return f"{value:.6g}".replace(".", "p").replace("-", "m").replace("+", "")
 
 
-def _live_cache(entry: object) -> torch.Tensor | None:
+# `Any`, not `object`: without torch stubs, isinstance cannot narrow `object`.
+def _live_cache(entry: Any) -> torch.Tensor | None:
     """The array bound to a layer, or None while it has none.
 
     vLLM binds a numel==0 placeholder until `initialize_kv_cache` runs, so an
@@ -142,6 +144,11 @@ class VllmDeepseekV4MLAAttention(
     dsv4_attention.DeepseekV4Attention, AttentionLayerBase
 ):
     """Sparse MLA attention on TPU, over the SWA and compressed-KV caches."""
+
+    # Set with object.__setattr__ in __init__ to avoid registering a submodule.
+    mla_attn: VllmDeepseekV4MLAAttention
+    # Set to True on DSpark draft layers; read with getattr(..., False).
+    non_causal_multi_token_decode: bool
 
     def __init__(
         self,
@@ -291,7 +298,7 @@ class VllmDeepseekV4MLAAttention(
 
     def _build_attn_op(self):
         vllm_context = get_vllm_model_wrapper_context()
-        mesh = vllm_context.mesh
+        mesh = get_pallas_op_mesh()
 
         swa_only = self.compress_ratio <= 1
         is_csa = self.compress_ratio == 4
@@ -329,13 +336,15 @@ class VllmDeepseekV4MLAAttention(
 
         built_from_real_caches = swa_tensor is not None
 
+        # The wrapper context types vllm_config as object.
+        vllm_config = cast(VllmConfig, vllm_context.vllm_config)
         cfg_lps = VllmDeepseekV4SWACache._swa_block_size(
-            vllm_context.vllm_config.cache_config.block_size, self.window_size
+            vllm_config.cache_config.block_size, self.window_size
         )
         if cfg_lps != logical_page_size:
             logical_page_size = cfg_lps
 
-        hf_config = vllm_context.vllm_config.model_config.hf_config
+        hf_config = vllm_config.model_config.hf_config
         sm_scale = (
             getattr(self.mla_attn, "scale", None)
             or getattr(self.mla_attn, "softmax_scale", None)
@@ -466,7 +475,7 @@ class VllmDeepseekV4MLAAttention(
             op = pallas.jax_op(
                 op_name,
                 functools.partial(_qnorm_rope_jax, eps=eps),
-                mesh=get_vllm_model_wrapper_context().mesh,
+                mesh=get_pallas_op_mesh(),
                 input_partition_specs=(
                     P(None, "model", None),  # q
                     P(),  # positions
@@ -491,7 +500,7 @@ class VllmDeepseekV4MLAAttention(
             op = pallas.jax_op(
                 op_name,
                 _rope_jax,
-                mesh=get_vllm_model_wrapper_context().mesh,
+                mesh=get_pallas_op_mesh(),
                 input_partition_specs=(
                     P(),  # kv
                     P(),  # positions
@@ -739,7 +748,7 @@ class VllmDeepseekV4MLAAttention(
             op = pallas.jax_op(
                 op_name,
                 functools.partial(_o_proj_jax, head_dim=head_dim),
-                mesh=get_vllm_model_wrapper_context().mesh,
+                mesh=get_pallas_op_mesh(),
                 input_partition_specs=(
                     P(None, "model", None),  # o
                     P(),  # positions
@@ -759,7 +768,7 @@ class VllmDeepseekV4MLAAttention(
                   self.n_local_groups * self.o_lora_rank).
         """
         del act_dtype
-        weight = self.wo_a.weight
+        weight = cast(torch.Tensor, self.wo_a.weight)
         transposed = (
             self.n_local_heads * self.head_dim // self.n_local_groups,
             self.n_local_groups * self.o_lora_rank,
@@ -782,7 +791,7 @@ class VllmDeepseekV4MLAAttention(
         The kernel is the only `wo_a` path, so an unmet condition is a
         configuration error.
         """
-        weight = self.wo_a.weight
+        weight = cast(torch.Tensor, self.wo_a.weight)
         scale = getattr(self.wo_a, "weight_scale", None)
 
         # Both MXU operands are fp8: the kernel quantizes the activations

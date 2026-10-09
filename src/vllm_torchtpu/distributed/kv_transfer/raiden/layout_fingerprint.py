@@ -222,7 +222,7 @@ def measured_kimi_k3_layout_fingerprint(
     if not any(pool.tag == TAG_FA for pool in manifest.pools):
         raise ValueError("Kimi layout fingerprint requires an FA pool")
     version = package_version or importlib.metadata.version
-    payload = {
+    payload: dict[str, Any] = {
         "schema": KIMI_K3_LAYOUT_FINGERPRINT_SCHEMA,
         "torch_tpu": version("torch_tpu"),
         "libtpu": version("libtpu"),

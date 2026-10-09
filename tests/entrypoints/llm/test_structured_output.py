@@ -44,6 +44,8 @@ from vllm import LLM, SamplingParams
 from vllm.distributed import cleanup_dist_env_and_memory
 from vllm.sampling_params import StructuredOutputsParams
 
+pytestmark = pytest.mark.tpu_test
+
 MODEL_NAME = "Qwen/Qwen3-0.6B"
 
 CHOICES = ["Positive", "Negative"]

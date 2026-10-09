@@ -47,12 +47,6 @@ if [ "$#" -lt 1 ]; then
   exit 1
 fi
 
-# Set HF_TOKEN from GCP Secret Manager if not already in /etc/environment
-# (same bootstrap as run_in_docker.sh).
-if ! grep -q "^HF_TOKEN=" /etc/environment 2>/dev/null; then
-  gcloud secrets versions access latest --secret=bm-agent-hf-token --quiet | \
-  sudo tee -a /etc/environment > /dev/null <<< "HF_TOKEN=$(cat)" || true
-fi
 if [ -f /etc/environment ]; then
   # shellcheck disable=SC1091
   source /etc/environment || true
@@ -209,7 +203,7 @@ CONTAINER_ENV_COMMON=(
   -e BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-}"
   -e FORCE_COLOR="1"
   -e TQDM_MININTERVAL="30"
-  -e SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU="0.0.0"
+  -e SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU_CORE="0.0.0"
   ${USE_MOE_SPARSE_CORE:+-e USE_MOE_SPARSE_CORE="${USE_MOE_SPARSE_CORE}"}
   ${CAPTURE_PROFILE:+-e CAPTURE_PROFILE="${CAPTURE_PROFILE}"}
   # RAY_TMPDIR keeps Ray on /tmp; following TMPDIR breaks log collection.

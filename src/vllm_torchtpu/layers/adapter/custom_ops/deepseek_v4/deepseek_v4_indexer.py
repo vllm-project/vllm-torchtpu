@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+from typing import TYPE_CHECKING, cast
 
 import jax
 import jax.numpy as jnp
@@ -33,9 +34,12 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor 
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-    get_vllm_model_wrapper_context,
+    get_pallas_op_mesh,
 )
 from vllm_torchtpu.utils import align_to
+
+if TYPE_CHECKING:
+    from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 logger = init_logger(__name__)
 
@@ -148,8 +152,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         object.__setattr__(self.compressor, "k_cache", self.k_cache)
 
     def _build_indexer_op(self):
-        vllm_context = get_vllm_model_wrapper_context()
-        mesh = vllm_context.mesh
+        mesh = get_pallas_op_mesh()
 
         wrapped_fn = functools.partial(
             _indexer_jax,
@@ -225,7 +228,11 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
                 (q.shape[0], self.topk_tokens), dtype=torch.int32, device=q.device
             )
 
-        attn_ctx = get_forward_context().attn_metadata
+        # The TPU runner stores its own AttentionMetadata, not the vLLM base class.
+        attn_ctx = cast(
+            "dict[str, AttentionMetadata] | AttentionMetadata",
+            get_forward_context().attn_metadata,
+        )
         if isinstance(attn_ctx, dict):
             prefix_key = getattr(getattr(self, "k_cache", None), "prefix", None)
             if prefix_key not in attn_ctx:

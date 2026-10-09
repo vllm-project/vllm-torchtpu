@@ -28,16 +28,9 @@ steps:
         commands:
           - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-35B-A3B-FP8/"
           - |
-            # qwen3-30b-a3b-nvfp4-tp8-ep is temporarily out of this list.
-            # Updating torch_tpu from dev20260912075415 to dev20260924000658
-            # cut NVFP4 W4A16 decode throughput on this config by 20.5%
-            # (10330 -> 8208 tok/s), so the 5% gate fails on every run. The
-            # cause is in the wheel, not here -- a PR that changes only the
-            # `torch-tpu==` pin reproduces it, and qwen3-coder-30b-fp8-tp8-ep,
-            # same TP8 + EP topology, is unaffected on it. b/566000496 is
-            # with the torchtpu team. Put the line back when that lands.
             bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_configs.sh \
               qwen3-coder-30b-fp8-tp8-ep \
+              qwen3-30b-a3b-nvfp4-tp8-ep \
               qwen3.5-35b-fp8-tp4-ep \
               deepseek-v2-tp8-ep \
               gemma-4-31b-fp8-dp4-tp2-multimodal \
@@ -263,30 +256,5 @@ steps:
           EVAL_SOFT_FAIL: "1"
         commands:
           - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimik-2.6-w4a16-tp8-ep --run-lm-eval --results-dir /perf_eval_results/kimik-2.6-w4a16-tp8-ep"
-        artifact_paths:
-          - "perf_eval_results/**/*"
-
-      # Kimi-K3 on the multihost tpu7x-32 pod (4 hosts x 8 chips): TP=32
-      # with EP: an 8k in / 1k out latency probe and MMLU-Pro accuracy eval.
-      # The 1561 GB checkpoint streams from GCS with EP-sharded runai
-      # streaming (--enable-ep-weight-filter, #373) — the pod has no data
-      # disk that fits it. Runs through run_multihost.sh (Ray head+worker
-      # containers), same as the GLM v7x-16 steps above. The generous
-      # timeout covers checkpoint streaming, cold compilation, and eval.
-      # To validate or recalibrate performance, run this
-      # step from a branch-local dev yml (see pipeline_dev.yml) and feed
-      # two runs' perf_eval_results to check_regression.py --calibrate.
-      - label: "Perf/Eval: Nightly kimi-k3-tp32-ep (TPU v7x-32)"
-        key: "perf_nightly_kimi_k3_tp32_ep"
-        if: 'build.env("NIGHTLY") == "1"'
-        timeout_in_minutes: 420
-        agents:
-          queue: "tpu_v7x_32_queue"
-        env:
-          TPU_ACCELERATOR_TYPE: "tpu7x"
-          VLLM_ENGINE_READY_TIMEOUT_S: "14400"
-          BENCHMARK_WARMUP_RUNS: "1"
-        commands:
-          - "bash .buildkite/scripts/run_multihost.sh bash ./scripts/vllm/benchmarking/run_eval_flow.sh --config kimi-k3-tp32-ep --run-lm-eval --results-dir /perf_eval_results/kimi-k3-tp32-ep"
         artifact_paths:
           - "perf_eval_results/**/*"

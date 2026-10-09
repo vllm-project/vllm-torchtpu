@@ -77,11 +77,18 @@ class KVLayout(enum.Enum):
 # Determined from microbenchmarks for 8k/1k and 256k/1k.
 DEFAULT_BUFFER_COUNT: tuple[int, int, int] = (4, 3, 3)
 
+
 # Source of `_scheduling_group_id`s for the chunked TensorCore/SparseCore
 # pipeline. One counter for the process, because the ids are global to a
 # compiled program and a model traces this kernel once per layer: two layers
 # sharing an id would be ONE group to XLA, and the legalizer would either
 # annotate everything on the path between them or fail the compile.
+#
+# The ids end up in the HLO, so they are part of the compile cache key. The
+# compiler restarts the counter for every program it builds (see
+# `reset_scheduling_group_ids`): otherwise the ids, and with them the key,
+# depend on which programs this process traced before, and two ranks building
+# the same bucket in a different order miss each other's cached executable.
 _scheduling_group_ids = itertools.count(1)
 _scheduling_group_ids_lock = threading.Lock()
 
@@ -104,3 +111,15 @@ def reserve_scheduling_group_ids(count: int) -> int:
         for _ in range(count - 1):
             next(_scheduling_group_ids)
     return first
+
+
+def reset_scheduling_group_ids() -> None:
+    """Restarts the ids at 1, for the start of a new compiled program.
+
+    Ids only need to be unique within one program, so the next program can
+    reuse them; resetting makes a program's ids, and so its cache key, the same
+    whatever this process compiled before.
+    """
+    global _scheduling_group_ids
+    with _scheduling_group_ids_lock:
+        _scheduling_group_ids = itertools.count(1)

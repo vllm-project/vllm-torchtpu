@@ -18,11 +18,22 @@ This lives outside eagle3.py because that module uses postponed annotations,
 which ``support_torch_compile`` cannot read.
 """
 
+from typing import Any, Protocol
+
 import torch
 from torch import nn
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.sequence import IntermediateTensors
+
+
+class MtpDraftModel(Protocol):
+    """What the loop calls on the MTP draft. The draft is an nn.Module, but
+    nn.Module types its attributes as Tensor | Module, so name the calls."""
+
+    def forward(self, *args: Any, **kwargs: Any) -> Any: ...
+
+    def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor: ...
 
 
 class _MtpFusedLoop(nn.Module):
@@ -31,7 +42,7 @@ class _MtpFusedLoop(nn.Module):
         *,
         vllm_config: VllmConfig,
         prefix: str = "",
-        mtp: nn.Module,
+        mtp: MtpDraftModel,
         num_steps: int,
     ) -> None:
         super().__init__()
@@ -83,7 +94,7 @@ def build_mtp_fused_loop(
     *,
     vllm_config: VllmConfig,
     prefix: str,
-    mtp: nn.Module,
+    mtp: MtpDraftModel,
     num_steps: int,
     dynamic_arg_dims: dict,
 ) -> nn.Module:

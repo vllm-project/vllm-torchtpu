@@ -53,7 +53,7 @@ _copy_op.register_fake(_fake_copy)
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def copy_mamba_state_blocks(
     pools: list[torch.Tensor], src: torch.Tensor, dst: torch.Tensor
-) -> torch.Tensor:
+) -> torch.Tensor | None:
     """``pool[dst[i]] = pool[src[i]]`` on every pool, as one program.
 
     A hybrid model's unified pool is split over several raw buffers, and a
@@ -67,6 +67,11 @@ def copy_mamba_state_blocks(
         new_pool, marker = _copy_op(pool, src, dst)
         pool.copy_(new_pool)
     return marker
+
+
+# The copy is layout-agnostic (any block-major pool); this name is for
+# callers that copy attention KV blocks, e.g. prefix-cache CoW.
+copy_pool_blocks = copy_mamba_state_blocks
 
 
 def _copy_step_budget_bytes() -> int:

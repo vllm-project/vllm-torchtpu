@@ -24,6 +24,8 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUCopyState,
 )
 
+pytestmark = pytest.mark.tpu_test
+
 
 @pytest.fixture
 def device():
@@ -56,6 +58,10 @@ def make_runner(device, monkeypatch, k):
         else None
     )
     runner.scheduler_config = SimpleNamespace(async_scheduling=True)
+    # One engine, so no DP lockstep (_dp_lockstep_enabled reads this).
+    runner.parallel_config = SimpleNamespace(
+        data_parallel_size=1, enable_expert_parallel=False
+    )
     runner.use_async_scheduling = True
     runner.use_async_spec_decode = k > 0
     runner.prev_num_draft_tokens = SimpleNamespace(np=np.zeros(4, dtype=np.int32))

@@ -99,7 +99,7 @@ def _mla_ragged_paged_attention_kernel(
     m_ref,  # [batch_size, bq_sz * num_q_heads],
     acc_ref,  # [batch_size, bq_sz * num_q_heads, head_dim],
     *,
-    static_q_len: int,
+    static_q_len: int | None,
     sm_scale: float,
     bkv_p,
     bq_sz,

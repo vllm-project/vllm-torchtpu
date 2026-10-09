@@ -185,6 +185,8 @@ def resolve_block_major_contract(
     import numpy as np
     import torch
 
+    assert isinstance(per_block_shape, tuple)
+    assert isinstance(kv_dtype, torch.dtype)
     fragment_row_bytes = (
         int(np.prod(per_block_shape)) * torch.empty(0, dtype=kv_dtype).element_size()
     )

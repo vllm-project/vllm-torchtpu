@@ -26,6 +26,7 @@ from vllm_torchtpu.runner.speculative_decoding_manager import (
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
 
 
+@pytest.mark.tpu_test
 def test_speculative_decoding_manager_metadata_indices(device):
     # Mock TPUModelRunner
     mock_runner = MagicMock()
@@ -107,6 +108,7 @@ def _make_manager_with_eagle3_drafter(num_reqs=2):
     mock_runner.speculative_config.method = "eagle3"
     mock_drafter = MagicMock(spec=Eagle3Proposer)
     mock_runner.drafter = mock_drafter
+    mock_runner._async_drafter = mock_drafter
     manager = SpeculativeDecodingManager(mock_runner)
     return manager, mock_runner, mock_drafter
 
@@ -265,6 +267,7 @@ def _fresh_metadata_manager(device, input_ids):
     return SpeculativeDecodingManager(mock_runner)
 
 
+@pytest.mark.tpu_test
 def test_spec_decode_metadata_cache_hit_reuses_index_tensors(device):
     # Same (num_draft_tokens, cu_num_scheduled_tokens, padded_num_reqs) ->
     # the 7 index tensors are reused (same device objects, no re-transfer),
@@ -296,6 +299,29 @@ def test_spec_decode_metadata_cache_hit_reuses_index_tensors(device):
     assert torch.equal(m2.draft_token_ids.cpu(), ref.draft_token_ids.cpu())
 
 
+@pytest.mark.tpu_test
+def test_spec_decode_metadata_deferred_draft_token_ids(device):
+    # Deferral leaves draft_token_ids unset and keeps its host copy, on the
+    # uncached and the cached path; uploading that copy gives the values the
+    # eager path uploads.
+    input_ids = torch.tensor([1, 2, 3, 4, 5, 6, 7, 8, 9, 10], dtype=torch.int32)
+    nd = np.array([3, 2], dtype=np.int32)
+    cu = np.array([4, 7], dtype=np.int32)
+    manager = _fresh_metadata_manager(device, input_ids)
+    for step_ids in (input_ids, input_ids + 100):  # uncached, then cache hit
+        manager.runner.input_ids_cpu = step_ids
+        md = manager.get_spec_decode_metadata(nd, cu, 4, defer_draft_token_ids=True)
+        assert md.draft_token_ids is None
+        ref = _fresh_metadata_manager(device, step_ids).get_spec_decode_metadata(
+            nd, cu, 4
+        )
+        assert ref.deferred_draft_token_ids_cpu is None
+        uploaded = md.upload_deferred_draft_token_ids(device)
+        assert uploaded.device.type == device.type
+        assert torch.equal(uploaded.cpu(), ref.draft_token_ids.cpu())
+
+
+@pytest.mark.tpu_test
 def test_spec_decode_metadata_cache_miss_on_changed_inputs(device):
     # Any change in the key inputs must rebuild, with values matching an
     # uncached build.

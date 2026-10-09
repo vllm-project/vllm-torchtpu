@@ -29,8 +29,9 @@ def apply_omni_tpu_patches() -> None:
     #
     # REMOVAL / FIX CONDITION:
     # This patch can be removed/reduced once:
-    # 1. OmniTpuPlatform.record_device_event() implements hardware synchronization
-    #    (torch.tpu.synchronize()) to ensure execution completes before COMPUTE_DONE.
+    # 1. OmniTpuPlatform.record_device_event() implements hardware
+    #    synchronization (torch.accelerator.synchronize()) to ensure execution
+    #    completes before COMPUTE_DONE.
     # 2. AOT compilation caching stabilizes startup compile times.
     # -------------------------------------------------------------------------
     import os

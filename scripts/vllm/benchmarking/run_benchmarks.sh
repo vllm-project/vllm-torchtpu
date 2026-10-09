@@ -33,6 +33,12 @@
 #                         attribution. Recorded as capture_profile + profile_dir
 #                         in config.json.
 #   PROFILE_NUM_PROMPTS   prompts for that run (default: the cell's concurrency).
+#
+# Structured decoding:
+#   BENCHMARK_EXTRA_BODY  JSON merged into every request body via
+#                         --extra-body, e.g. a `structured_outputs` grammar.
+#                         Passed as one quoted argument; EXTRA_BENCH_ARGS is
+#                         word-split and globbed, which mangles JSON.
 
 set -euo pipefail
 
@@ -120,6 +126,12 @@ ENABLE_EP=false
 QUANTIZATION=""
 ISL_OSL_CONFIGS="512:512"
 CONCURRENCY_OPTIONS="1"
+# Benchmark prompts: "random" (default) sizes them from ISL_OSL_CONFIGS; any
+# other vllm bench serve --dataset-name (e.g. sharegpt with DATASET_PATH)
+# takes prompts from the dataset. For sharegpt the OSL still sets the output
+# length; ISL is then only the cell label.
+DATASET_NAME="${DATASET_NAME:-random}"
+DATASET_PATH="${DATASET_PATH:-}"
 RANDOM_RANGE_RATIO=""
 NUM_PROMPTS=""
 # How RANDOM_RANGE_RATIO is interpreted:
@@ -140,6 +152,9 @@ BENCHMARK_TEMPERATURE="${BENCHMARK_TEMPERATURE:-}"
 # passthrough that configs extend with "${EXTRA_BENCH_ARGS:+$EXTRA_BENCH_ARGS }".
 # E.g. --trust-remote-code for models whose repo ships a custom tokenizer.
 EXTRA_BENCH_ARGS="${EXTRA_BENCH_ARGS:-}"
+# JSON for --extra-body, kept apart from EXTRA_BENCH_ARGS so it reaches the
+# client as one argument (see header). Empty => flag not passed.
+BENCHMARK_EXTRA_BODY="${BENCHMARK_EXTRA_BODY:-}"
 # Server async scheduling (--async-scheduling / --no-async-scheduling).
 # Resolution order: env > config > harness default (true). Left empty here
 # so a config can tell "unset" from "forced by the operator".
@@ -166,6 +181,18 @@ if [ "$ASYNC_SCHEDULING" != "true" ] && [ "$ASYNC_SCHEDULING" != "false" ]; then
     exit 1
 fi
 KV_CACHE_DTYPE="${KV_CACHE_DTYPE:-fp8}"
+# Fail on bad JSON here rather than after server startup and compile, at the
+# first `vllm bench serve`. The compact form goes into config.json so a
+# constrained run's metadata differs from an unconstrained one.
+if [ -n "$BENCHMARK_EXTRA_BODY" ]; then
+    benchmark_extra_body_json=$(python3 -c 'import json, sys; print(json.dumps(json.loads(sys.argv[1])))' "$BENCHMARK_EXTRA_BODY") ||
+        {
+            echo "ERROR: BENCHMARK_EXTRA_BODY is not valid JSON" >&2
+            exit 1
+        }
+else
+    benchmark_extra_body_json=null
+fi
 
 if [ -z "$MODEL" ]; then
     echo "ERROR: Config must set MODEL"
@@ -190,9 +217,12 @@ fi
 
 PORT="${PORT:-8000}"
 
-# Verify vllm bench serve is available
-if ! python3 -m vllm.entrypoints.cli.main bench serve --help &>/dev/null; then
-    echo "ERROR: 'vllm bench serve' not available. Is vLLM installed?"
+# Verify vLLM is installed. find_spec locates the package without importing it:
+# the `vllm bench serve --help` this replaces imported all of vLLM, 6-50s per
+# config with the chips idle, and a missing subcommand still fails the first
+# benchmark call with its own error.
+if ! python3 -c 'import importlib.util, sys; sys.exit(importlib.util.find_spec("vllm") is None)'; then
+    echo "ERROR: vLLM is not installed."
     exit 1
 fi
 echo "Using benchmark tool: vllm bench serve"
@@ -432,6 +462,35 @@ run_benchmark_once() {
         fi
     fi
 
+    local extra_body_arg=()
+    if [ -n "$BENCHMARK_EXTRA_BODY" ]; then
+        extra_body_arg=(--extra-body "$BENCHMARK_EXTRA_BODY")
+    fi
+
+    local dataset_args=()
+    if [ "${DATASET_NAME:-random}" = "random" ]; then
+        dataset_args=(
+            --dataset-name random
+            --random-input-len "$bench_input_len"
+            --random-output-len "$bench_output_len"
+            --random-range-ratio "$bench_range_ratio"
+        )
+    else
+        # Prompts come from the dataset, so ISL is only the cell label.
+        # vllm bench serve takes each ShareGPT request's output length from
+        # its reference answer unless --sharegpt-output-len is given; pass
+        # the config's OSL so the cell decodes the length it is named for.
+        dataset_args=(
+            --dataset-name "$DATASET_NAME"
+        )
+        if [ -n "${DATASET_PATH:-}" ]; then
+            dataset_args+=(--dataset-path "$DATASET_PATH")
+        fi
+        if [ "$DATASET_NAME" = "sharegpt" ]; then
+            dataset_args+=(--sharegpt-output-len "$bench_output_len")
+        fi
+    fi
+
     set +e
     vllm bench serve \
         --backend vllm \
@@ -440,10 +499,7 @@ run_benchmark_once() {
         --trust-remote-code \
         --host "$HOST" \
         --port "$PORT" \
-        --dataset-name random \
-        --random-input-len "$bench_input_len" \
-        --random-output-len "$bench_output_len" \
-        --random-range-ratio "$bench_range_ratio" \
+        "${dataset_args[@]}" \
         --num-prompts "$num_prompts" \
         --max-concurrency "$concurrency" \
         --request-rate inf \
@@ -453,6 +509,7 @@ run_benchmark_once() {
         --result-filename "$result_file" \
         $profile_arg \
         ${EXTRA_BENCH_ARGS:+$EXTRA_BENCH_ARGS} \
+        "${extra_body_arg[@]}" \
         "${temperature_arg[@]}" \
         --seed 42 2>&1 | tee -a "$bench_log"
     local bench_exit=${PIPESTATUS[0]}
@@ -543,12 +600,14 @@ cat > "$RESULTS_DIR/config.json" << EOF
     "enable_ep": $ENABLE_EP,
     "quantization": "${QUANTIZATION:-none}",
     "isl_osl_configs": "$ISL_OSL_CONFIGS",
+    "dataset_name": "$DATASET_NAME",
     "concurrency_options": "$CONCURRENCY_OPTIONS",
     "num_prompts": ${NUM_PROMPTS:-320},
     "random_range_ratio": $RANDOM_RANGE_RATIO,
     "range_ratio_style": "$RANGE_RATIO_STYLE",
     "benchmark_warmup_runs": $BENCHMARK_WARMUP_RUNS,
     "benchmark_temperature": $benchmark_temperature_json,
+    "benchmark_extra_body": $benchmark_extra_body_json,
     "max_model_len": $max_model_len,
     "max_num_batched_tokens": $max_batched_tokens,
     "max_num_seqs": $max_num_seqs,

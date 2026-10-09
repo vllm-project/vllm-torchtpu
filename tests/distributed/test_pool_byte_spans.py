@@ -24,10 +24,8 @@ from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (
 )
 from vllm_torchtpu.distributed.kv_transfer.raiden.pool_manifest import RegionSpec
 
-from .raiden_test_utils import kimi_pool_manifest
+from .raiden_test_utils import KIMI_KV_ITEMSIZE, kimi_pool_manifest
 from .test_raiden_fa_layout_calibration_tpu import _apply_xla_tiled_layout
-
-pytestmark = pytest.mark.cpu_test
 
 # Qwen3.5-35B TP8 shard, QK pair-blocked: one 1024-byte QK token plus one
 # 1024-byte V token per tap.
@@ -141,12 +139,18 @@ def _kda_physical_state(state, pool, shard_heads=None):
     return _apply_xla_tiled_layout(padded, (2, 1, 0), ((2, 128), (2, 1))).tobytes()
 
 
+@pytest.mark.parametrize("kv_dtype", ["bfloat16", "float8_e4m3fn"])
 @pytest.mark.parametrize("parallelism,dst_shards", [(32, 32), (32, 8)])
-def test_kda_reshard_matches_rank_blocked_kernel_layout(parallelism, dst_shards):
+def test_kda_reshard_matches_rank_blocked_kernel_layout(
+    parallelism, dst_shards, kv_dtype
+):
+    # The KDA regions are the same bytes under either KV dtype, so the bf16
+    # oracle below describes an fp8 pool too.
+    packing = 4 // KIMI_KV_ITEMSIZE[kv_dtype]
     local_heads = 96 // parallelism
-    source_manifest = kimi_pool_manifest(local_heads)
+    source_manifest = kimi_pool_manifest(local_heads, kv_dtype=kv_dtype)
     fan_in = parallelism // dst_shards
-    destination_manifest = kimi_pool_manifest(local_heads * fan_in)
+    destination_manifest = kimi_pool_manifest(local_heads * fan_in, kv_dtype=kv_dtype)
     fingerprints = []
     for manifest, fragments in ((source_manifest, 1), (destination_manifest, fan_in)):
         assert [pool.tag for pool in manifest.pools] == [
@@ -167,10 +171,14 @@ def test_kda_reshard_matches_rank_blocked_kernel_layout(parallelism, dst_shards)
         fingerprints.append(
             measured_kimi_k3_layout_fingerprint(
                 manifest,
-                page_tokens=manifest.storages[0].shape[1] * 2,
+                page_tokens=manifest.storages[0].shape[1] * packing,
                 state_fragment_heads=local_heads,
                 state_fragments=fragments,
-                layout_getter=lambda tensor: ([3, 2, 1, 0], [[2, 128], [2, 1]], 0),
+                layout_getter=lambda tensor: (
+                    [3, 2, 1, 0],
+                    [[packing, 128], [packing, 1]],
+                    0,
+                ),
                 package_version=lambda package: "test",
             )
         )
@@ -223,6 +231,67 @@ def test_kda_reshard_matches_rank_blocked_kernel_layout(parallelism, dst_shards)
             )
             assert destination == _kda_physical_state(state, dest_pool, local_heads)
             np.testing.assert_array_equal(coverage[rank], 1)
+
+
+def _kimi_fingerprint(kv_dtype):
+    packing = 4 // KIMI_KV_ITEMSIZE[kv_dtype]
+    manifest = kimi_pool_manifest(3, kv_dtype=kv_dtype)
+    return measured_kimi_k3_layout_fingerprint(
+        manifest,
+        page_tokens=manifest.storages[0].shape[1] * packing,
+        state_fragment_heads=3,
+        state_fragments=1,
+        layout_getter=lambda tensor: (
+            [3, 2, 1, 0],
+            [[packing, 128], [packing, 1]],
+            0,
+        ),
+        package_version=lambda package: "test",
+    )
+
+
+def test_kimi_fingerprint_separates_bf16_and_fp8_pools():
+    """A prefill and a decode that disagree on the KV dtype must not pair."""
+    bf16_fingerprint, bf16_payload = _kimi_fingerprint("bfloat16")
+    fp8_fingerprint, fp8_payload = _kimi_fingerprint("float8_e4m3fn")
+
+    assert bf16_fingerprint != fp8_fingerprint
+    assert bf16_payload["layouts"]["fa"]["element_size_in_bits"] == 16
+    assert fp8_payload["layouts"]["fa"]["element_size_in_bits"] == 8
+    # Rows are the same bytes; only what a row holds differs.
+    assert (
+        bf16_payload["layouts"]["fa"]["row_bytes"]
+        == fp8_payload["layouts"]["fa"]["row_bytes"]
+        == 2560
+    )
+
+
+@pytest.mark.parametrize(
+    ("kv_dtype", "tail_tokens", "tail_rows"),
+    [("bfloat16", 5, 3), ("float8_e4m3fn", 5, 2), ("float8_e4m3fn", 4, 1)],
+)
+def test_kimi_fa_row_spans_trim_the_tail_to_the_dtype_row(
+    kv_dtype, tail_tokens, tail_rows
+):
+    manifest = kimi_pool_manifest(3, kv_dtype=kv_dtype)
+    fa = manifest.pools[-1]
+    rows, packing = manifest.storages[0].shape[1:3]
+    page_tokens = rows * packing
+
+    registration = lower_glm_row_spans(
+        tag="fa",
+        num_tokens=page_tokens + tail_tokens,
+        transfer_rank=0,
+        parallelism=1,
+        page_tokens=page_tokens,
+        live_bytes_per_block=fa.live_bytes_per_block,
+        row_bytes=fa.regions[0].unit_bytes,
+        block_ids=[7, 9],
+    )
+
+    full_page, tail = registration.spans
+    assert full_page.size_bytes == fa.live_bytes_per_block == 207360
+    assert tail.size_bytes == tail_rows * 2560
 
 
 def test_gdn_conv_pair_shards_reassemble_rank_blocks():

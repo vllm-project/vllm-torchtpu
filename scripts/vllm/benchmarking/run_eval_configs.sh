@@ -11,6 +11,22 @@ if [ "${#configs[@]}" -eq 0 ]; then
     exit 0
 fi
 
+# The server log only says that a TPU runtime failed; libtpu's own logs say
+# why (a port it could not bind, a slice member it lost). Saves the ones written
+# since the marker file $1 into $2, next to the failed config's results.
+tpu_log_dir="${TPU_LOG_DIR:-/tmp/tpu_logs}"
+save_tpu_logs() {
+    local since="$1" dest="$2" files=()
+    [ -d "$tpu_log_dir" ] || return 0
+    mapfile -t files < <(cd "$tpu_log_dir" && find . -type f -newer "$since")
+    [ "${#files[@]}" -gt 0 ] || return 0
+    mkdir -p "$dest"
+    # Processes still exiting can grow a file mid-read; tar then exits 1 but
+    # still writes the archive.
+    tar -czf "$dest/tpu_logs.tar.gz" -C "$tpu_log_dir" "${files[@]}" || true
+    echo "Saved ${#files[@]} libtpu log files to $dest/tpu_logs.tar.gz"
+}
+
 fail=0
 for (( i = 0; i < ${#configs[@]}; i++ )); do
     # Select configs where (index % job_count) == job_index
@@ -37,11 +53,15 @@ for (( i = 0; i < ${#configs[@]}; i++ )); do
     # host disk. Left unpruned, later configs fail with ENOSPC.
     rm -rf /root/.cache/vllm/torch_compile_cache
 
+    results_dir="${ARTIFACTS_DIR:-/perf_eval_results}/$config_name"
     eval_args=(
         --config "$config_name"
-        --run-lm-eval
-        --results-dir "${ARTIFACTS_DIR:-/perf_eval_results}/$config_name"
+        --results-dir "$results_dir"
     )
+    # Perf-only steps set RUN_LM_EVAL=0.
+    if [ "${RUN_LM_EVAL:-1}" = "1" ]; then
+        eval_args+=(--run-lm-eval)
+    fi
     if [ "${RUN_CODE_EVAL:-0}" = "1" ]; then
         eval_args+=(--run-code-eval)
     fi
@@ -49,10 +69,13 @@ for (( i = 0; i < ${#configs[@]}; i++ )); do
         eval_args+=(--run-mm-eval)
     fi
 
+    started="$(mktemp)"
     if ! bash ./scripts/vllm/benchmarking/run_eval_flow.sh "${eval_args[@]}"; then
         echo "::error::Perf/Eval failed for config: $config_name"
         fail=1
+        save_tpu_logs "$started" "$results_dir"
     fi
+    rm -f "$started"
 done
 
 exit "$fail"

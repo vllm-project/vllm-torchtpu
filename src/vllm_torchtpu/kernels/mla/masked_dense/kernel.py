@@ -208,7 +208,7 @@ def _mla_ragged_paged_attention_kernel(
         pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
         # We use `k_scale` for the PV step as well since MLA uses a shared
         # compressed latent for k/v and k_scale ~= v_scale.
-        # TODO(b/539630772): Add a separate v_scale param and apply it to the
+        # TODO: Add a separate v_scale param and apply it to the
         # PV step.
         if k_scale != 1.0:
             pv *= k_scale
@@ -612,6 +612,7 @@ def masked_dense_ragged_paged_attention(
     num_kv_pages_per_block: tuple[int, int, int] | int | None = None,
     num_queries_per_block: tuple[int, int, int] | int | None = None,
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
+    sequence_start: jax.Array | None = None,
 ) -> jax.Array:
     """Masked-dense DSA MLA ragged paged attention supporting mixed batches.
 
@@ -663,6 +664,11 @@ def masked_dense_ragged_paged_attention(
         prefill, mixed) case.
       num_queries_per_block: query tokens per block, per case.
       vmem_limit_bytes: the vmem limit for the pallas kernel.
+      sequence_start: first sequence to attend, as a device scalar. When set,
+        sequences `[0, sequence_start)` are assumed already attended by the
+        caller: the decode and prefill-only launches are skipped, the mixed
+        launch covers `[sequence_start, distribution[2])`, and the rows of the
+        earlier sequences are returned unchanged.
 
     Returns:
       The output of attention, `[max_num_tokens, num_q_heads, head_dim]`.
@@ -871,24 +877,30 @@ def masked_dense_ragged_paged_attention(
             mask_hbm_reshaped,
         )
 
-    # Decode-only
-    q = run_mla_kernel(
-        q,
-        cache_kv_nope,
-        cache_kv_rope,
-        kv_lens,
-        mask_hbm,
-        page_indices,
-        cu_q_lens,
-        start_seq_idx=jnp.array(0, dtype=jnp.int32),
-        end_seq_idx=distribution[0],
-        static_q_len=1,
-        num_kv_pages_per_block=num_kv_pages_per_blocks[0],
-        num_queries_per_block=num_queries_per_blocks[0],
-        case=MlaCase.DECODE,
-    )
+    if sequence_start is None:
+        # Decode-only
+        q = run_mla_kernel(
+            q,
+            cache_kv_nope,
+            cache_kv_rope,
+            kv_lens,
+            mask_hbm,
+            page_indices,
+            cu_q_lens,
+            start_seq_idx=jnp.array(0, dtype=jnp.int32),
+            end_seq_idx=distribution[0],
+            static_q_len=1,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+            num_queries_per_block=num_queries_per_blocks[0],
+            case=MlaCase.DECODE,
+        )
 
-    if chunk_prefill_size is None:
+    if sequence_start is not None:
+        # The caller has already attended sequences `[0, sequence_start)`.
+        # Only the mixed launch runs, starting there; earlier rows keep their
+        # values because the output aliases `q`.
+        mixed_start = sequence_start
+    elif chunk_prefill_size is None:
         # Without a static prefill length there is no prefill-only launch, so
         # the mixed launch has to start where the decode segment ended.
         # Starting it at `distribution[1]` instead would silently skip every

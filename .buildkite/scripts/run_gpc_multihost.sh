@@ -29,11 +29,6 @@
 #   avoiding local disk exhaustion on 100 GB CI boot disks.
 set -euo pipefail
 
-# Populate HF_TOKEN from GCP Secret Manager if not already configured in /etc/environment.
-if ! grep -q "^HF_TOKEN=" /etc/environment 2>/dev/null; then
-  gcloud secrets versions access latest --secret=bm-agent-hf-token --quiet | \
-  sudo tee -a /etc/environment > /dev/null <<< "HF_TOKEN=$(cat)" || true
-fi
 if [ -f /etc/environment ]; then
   # shellcheck disable=SC1091
   source /etc/environment || true
@@ -200,7 +195,7 @@ ssh_retry "${SSH_USER}@${WORKER_IP}" \
      -e GPC_ROLE=worker \
      -e GPC_HEAD_IP='${HEAD_INTERNAL_IP}' \
      -e GPC_MY_IP='${WORKER_IP}' \
-     -w /root/torchtpu-vllm \
+     -w /workspace/vllm-torchtpu \
      '${IMAGE_TAG}' \
      bash scripts/vllm/integration/run_qwen35_gpc_correctness.sh"
 
@@ -215,7 +210,7 @@ docker run -d --name gpc-head --privileged --net=host --shm-size=64g \
   -e GPC_HEAD_IP="${HEAD_INTERNAL_IP}" \
   -e GPC_MY_IP="${HEAD_INTERNAL_IP}" \
   -e GPC_PEER_IP="${WORKER_IP}" \
-  -w /root/torchtpu-vllm \
+  -w /workspace/vllm-torchtpu \
   "${IMAGE_TAG}" \
   bash -c 'umask 000; bash scripts/vllm/integration/run_qwen35_gpc_correctness.sh'
 docker logs -f gpc-head &

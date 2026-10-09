@@ -278,6 +278,7 @@ def _require_tpu() -> None:
         pytest.fail(f"Expected JAX TPU backend, got {backend}.")
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("masked", [False, True])
 @pytest.mark.parametrize(
     "num_tokens,topk,hidden,uses_v3",
@@ -541,6 +542,7 @@ def test_output_onehot_owner_kernel_respects_mode(mode, owner_called):
     assert call.kwargs == {"num_tokens": 2}
 
 
+@pytest.mark.tpu_test
 def test_fused_moe_local_routing_matches_reference():
     _require_tpu()
 
@@ -697,6 +699,7 @@ def _make_ep_inputs(num_local_experts, seed=0):
     return (hidden_states, w1, w2, w1_bias, w2_bias, topk_weights, local_ids, topk)
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     "num_local_experts,experts_start",
     [
@@ -746,6 +749,7 @@ def test_fused_moe_global_id_remap_matches_local(num_local_experts, experts_star
     )
 
 
+@pytest.mark.tpu_test
 def test_fused_moe_global_id_remap_masks_out_of_range():
     """Non-local global ids must contribute zero (range check + jnp.where)."""
     _require_tpu()
@@ -793,6 +797,7 @@ def test_fused_moe_global_id_remap_masks_out_of_range():
     )
 
 
+@pytest.mark.tpu_test
 def test_fused_moe_func_int4_packed_matches_reference():
     _require_tpu()
 

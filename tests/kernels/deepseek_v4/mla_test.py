@@ -16,10 +16,13 @@
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import absltest, parameterized
 
 # Import the kernels
 from vllm_torchtpu.kernels.deepseek_v4.core_attention import mla
+
+pytestmark = pytest.mark.tpu_test
 
 
 def cdiv(a, b):

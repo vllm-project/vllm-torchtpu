@@ -203,8 +203,13 @@ class TestTpuCompilerCache:
             "TPU_SIDE_CHANNEL_PORT",
             "TPU_USE_RAIDEN_CONNECTOR",
             "DEBUG_TPU_LOCAL_RANK_OFFSET",
+            "EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK",
             "RAIDEN_DISABLE_SINGLETON_WORKER",
             "RAIDEN_SHM_KEY",
+            "RAIDEN_STORAGE_CAPACITY_GB",
+            "RAIDEN_STORAGE_PATH",
+            "RAIDEN_STORAGE_PROPERTIES",
+            "RAIDEN_STORAGE_TYPE",
             "SPEC_WARMUP",
             "TORCH_TPU_BASE_PORT",
             "TORCH_TPU_MP_RENDEZVOUS_PORT",
@@ -448,3 +453,22 @@ class TestTpuCompilerCache:
         compiler = TpuCompilerAdaptor()
         compiler.initialize_cache(cache_dir="/tmp/test_cache_dir")
         assert compiler.cache_dir == "/tmp/test_cache_dir"
+
+    def test_run_backend_restarts_scheduling_group_ids(self, monkeypatch):
+        """A bucket's HLO, and so its cache key, must not depend on what the
+        rank compiled before it."""
+        from vllm_torchtpu.compilation import tpu_compiler
+        from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
+        from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
+
+        firsts = []
+
+        def fake_backend(graph, example_inputs):
+            firsts.append(config.reserve_scheduling_group_ids(3))
+            return lambda *args: args
+
+        monkeypatch.setattr(tpu_compiler, "_tpu_backend", fake_backend)
+        compiler = TpuCompilerAdaptor()
+        compiler._run_backend(None, [])
+        compiler._run_backend(None, [])
+        assert firsts == [1, 1]

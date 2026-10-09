@@ -15,7 +15,10 @@
 import torch
 from vllm.model_executor.layers import linear as vllm_linear
 from vllm.model_executor.layers.fused_moe import RoutedExperts
-from vllm.model_executor.layers.quantization import register_quantization_config
+from vllm.model_executor.layers.quantization import (
+    QuantizationMethods,
+    register_quantization_config,
+)
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
 from vllm.models.deepseek_v4.quant_config import DeepseekV4FP8Config
@@ -59,12 +62,12 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
             quant_cfg = getattr(hf_config, "quantization_config", None) or {}
             if isinstance(quant_cfg, dict) and quant_cfg.get("scale_fmt") == "ue8m0":
                 return True
-        except Exception:
+        except Exception:  # noqa: S110
             pass
         return super().is_scale_e8m0
 
     @classmethod
-    def get_name(cls) -> str:
+    def get_name(cls) -> QuantizationMethods:
         return DEEPSEEK_V4_FP8
 
     def get_quant_method(

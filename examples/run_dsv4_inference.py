@@ -51,7 +51,7 @@ def check_tpu_device_availability(timeout_seconds=60):
                     shutil.rmtree(p, ignore_errors=True)
                 else:
                     shutil.os.remove(p)
-            except Exception:
+            except Exception:  # noqa: S110
                 pass
 
     print(

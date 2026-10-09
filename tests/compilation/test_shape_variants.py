@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Per-token-bucket graph specialization (b/545443817).
+"""Per-token-bucket graph specialization.
 
 vLLM's real compile pipeline (``@support_torch_compile`` -> ``VllmBackend`` ->
 ``PiecewiseBackend`` -> the real ``TpuCompilerAdaptor``) drives a fake torch_tpu

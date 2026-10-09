@@ -204,103 +204,8 @@ def _patch_vllm_config_hash_ignore_diagnostics() -> None:
     )
 
 
-def _patch_default_moe_runner_select_forward() -> None:
-    """Keep DefaultMoERunner on the direct ``_moe_forward`` path under OOT.
-
-    Upstream gates this on ``is_tpu()``; under our OOT plugin that's False
-    and we'd take ``torch.ops.vllm.moe_forward``, which captures weight
-    tensors as closures and trips torch_tpu's MLIR builder.
-    """
-    from vllm.model_executor.layers.fused_moe.runner import moe_runner as _dmr
-
-    if getattr(_dmr.MoERunner, "_tpu_select_forward_patch", False):
-        return
-
-    def patched_select(self):
-        return (
-            _dmr._moe_forward
-            if self.shared_experts is None
-            else _dmr._moe_forward_shared
-        )
-
-    _dmr.MoERunner._select_forward = patched_select
-    _dmr.MoERunner._tpu_select_forward_patch = True
-    logger.info("Applied TPU patch: DefaultMoERunner uses direct _moe_forward.")
-
-
-def _patch_moe_runner_fused_output_is_reduced() -> None:
-    """Tell vLLM the fused EP MoE kernel already reduced its output.
-
-    `fused_moe_ep` returns this rank's tokens combined over ALL experts -- the
-    kernel pushes each result row back to the chip that owns the token, so
-    there is nothing left to reduce. vLLM does not know that: it decides from
-    `MoERunner._fused_output_is_reduced`, which reads
-    `quant_method.moe_kernel.output_is_reduced()`, and the TPU fp8 method never
-    sets `moe_kernel` -- it declares itself through `supports_internal_mk`
-    instead. So `moe_runner.py` all-reduces the already-combined output
-    whenever `tp_size > 1 or ep_size > 1`.
-
-    Today it changes no answer, and the reason is worth stating exactly rather
-    than calling it luck: `prebuild_fused_moe_ep` refuses tp_size > 1, so the
-    kernel only ever arms with a tensor-parallel group of world size one, where
-    all three all-reduces this flag gates are `return input_`. The patch is the
-    guard that keeps that true if the TP refusal is ever lifted, at which point
-    the unpatched path would silently multiply every routed MoE output by
-    tp_size, with no test to catch it and no log to mention it.
-
-    Reporting True here is the correct signal rather than deleting the
-    all-reduce, because the SHARED expert genuinely is TP-partial
-    (`Qwen3NextMLP(..., reduce_results=False)`): the same flag routes it to
-    `_maybe_reduce_shared_expert_output`, which reduces it on its own.
-    """
-    # Only installed where the kernel can arm. `prebuild_fused_moe_ep` returns
-    # on its first statement unless this flag is set, so with the flag off the
-    # patch provably cannot change an answer and would only leave an upstream
-    # class mutated in every other TPU deployment. The cost of the gate is that
-    # the unguarded `_fused_output_is_reduced` read below stops failing loudly
-    # on an upstream rename in runs that do not use the kernel; if arming ever
-    # grows a non-env path, this gate has to go with it.
-    if not envs.USE_MOE_FUSED_EP_KERNEL:
-        return
-
-    from vllm.model_executor.layers.fused_moe.runner import moe_runner as _mr
-
-    if getattr(_mr.MoERunner, "_tpu_fused_output_reduced_patch", False):
-        return
-
-    original = _mr.MoERunner._fused_output_is_reduced
-
-    @property
-    def patched(self):
-        # `skip_final_all_reduce` asserts the fused output is NOT pre-reduced,
-        # and in that mode the model reduces externally anyway, so leave it be.
-        if getattr(self.moe_config, "skip_final_all_reduce", False):
-            return original.fget(self)
-        try:
-            from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
-        except ImportError:
-            return original.fget(self)
-        # Asked of the layer's own quant method, because arming is per layer:
-        # a model whose layers do not all qualify must not have one armed layer
-        # answer for the rest.
-        from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (
-            adaptive_fused_moe_supported,
-        )
-
-        owner = getattr(self, "_quant_method", None)
-        return (
-            fused_moe_ep_supported(owner)
-            or adaptive_fused_moe_supported(owner)
-            or original.fget(self)
-        )
-
-    _mr.MoERunner._fused_output_is_reduced = patched
-    _mr.MoERunner._tpu_fused_output_reduced_patch = True
-    logger.info("Applied TPU patch: the fused EP MoE output is pre-reduced.")
-
-
 def _patch_moe_explicit_pcp_collectives() -> None:
-    """Give each PCP MoE implementation exactly one collective owner.
+    """Keep PCP dispatch/combine explicit unless MoE chunk pipelining owns it.
 
     vLLM treats PCP+EP as an all-to-all-kernel configuration and therefore
     skips the explicit PCP all-gather/reduce-scatter in ``MoERunner``.  The
@@ -310,13 +215,9 @@ def _patch_moe_explicit_pcp_collectives() -> None:
 
     Chunk pipelining is a process-wide configuration, so it can select the
     contract through ``FusedMoEParallelConfig.use_all2all_kernels``.  The fused
-    EP kernel is different: it is armed per layer after checking that layer's
-    weights, routing and device resources.  Patch ``MoERunner`` as well so an
-    armed layer suppresses the outer PCP pair, while a refused layer in the
-    same model still gets the explicit fallback collectives.
+    EP kernel is armed per layer instead; ``VllmMoERunner`` handles that case.
     """
     from vllm.model_executor.layers.fused_moe import FusedMoEParallelConfig
-    from vllm.model_executor.layers.fused_moe.runner import moe_runner as _moe_runner
 
     if not getattr(
         FusedMoEParallelConfig, "_tpu_explicit_pcp_collectives_patch", False
@@ -341,47 +242,9 @@ def _patch_moe_explicit_pcp_collectives() -> None:
         )
         FusedMoEParallelConfig._tpu_explicit_pcp_collectives_patch = True
 
-    runner_cls = _moe_runner.MoERunner
-    if not getattr(runner_cls, "_tpu_fused_ep_pcp_collectives_patch", False):
-        upstream_dispatch = runner_cls._maybe_dispatch
-        upstream_combine = runner_cls._maybe_combine
-
-        def fused_ep_owns_pcp_collectives(self) -> bool:
-            if self.moe_config.pcp_size <= 1:
-                return False
-            from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.vllm_adapter import (  # noqa: E501
-                adaptive_fused_moe_supported,
-            )
-            from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
-
-            owner = getattr(self, "_quant_method", None)
-            return fused_moe_ep_supported(owner) or adaptive_fused_moe_supported(owner)
-
-        def maybe_dispatch(self, hidden_states, router_logits):
-            if fused_ep_owns_pcp_collectives(self):
-                # An armed fused method also reports supports_internal_mk, so
-                # upstream's generic DP/EP dispatch is a no-op.  The only work
-                # being bypassed here is its explicit PCP all-gather pair.
-                return hidden_states, router_logits
-            return upstream_dispatch(self, hidden_states, router_logits)
-
-        def maybe_combine(self, shared_output, hidden_states):
-            if fused_ep_owns_pcp_collectives(self):
-                # The fused program has already pushed and summed routed rows
-                # back onto their token-owning PCP rank.  Preserve upstream's
-                # return shape for a separately-computed shared expert.
-                if self.shared_experts is not None:
-                    return shared_output, hidden_states
-                return hidden_states
-            return upstream_combine(self, shared_output, hidden_states)
-
-        runner_cls._maybe_dispatch = maybe_dispatch
-        runner_cls._maybe_combine = maybe_combine
-        runner_cls._tpu_fused_ep_pcp_collectives_patch = True
-
     logger.info(
         "Applied TPU patch: use explicit PCP collectives unless MoE "
-        "chunk pipelining or an armed fused EP layer owns them."
+        "chunk pipelining owns them."
     )
 
 
@@ -565,20 +428,32 @@ def _patch_vllm_compile_all_ranges() -> None:
         logger.info("Applied TPU patch: compile_all_ranges.")
 
 
-def _patch_disable_sequence_parallel_moe() -> None:
-    """Disable vLLM's sequence-parallel MoE on TPU.
+def _patch_sequence_parallel_moe_admission() -> None:
+    """Gate vLLM's sequence-parallel MoE on TPU.
 
-    The sequence-parallel path is tied to vLLM all2all MoE backends. The TPU
-    communicator handles EP with unsplit token buffers.
+    Off by default. With TPU_MOE_SEQUENCE_PARALLEL=1, admit it at DP1
+    when EP is on and TP > 1. The GPU all2all-backend and DP > 1 conjuncts do
+    not apply on TPU. EP is required: without it the row-parallel expert sum
+    is never reduced.
     """
     from vllm.config.parallel import ParallelConfig
 
     if getattr(ParallelConfig, "_tpu_no_sp_moe_patch", False):
         return
 
-    ParallelConfig.use_sequence_parallel_moe = property(lambda self: False)
+    if envs.TPU_MOE_SEQUENCE_PARALLEL:
+        ParallelConfig.use_sequence_parallel_moe = property(
+            lambda self: self.enable_expert_parallel
+            and self.tensor_parallel_size > 1
+            and self.data_parallel_size == 1
+        )
+    else:
+        ParallelConfig.use_sequence_parallel_moe = property(lambda self: False)
     ParallelConfig._tpu_no_sp_moe_patch = True
-    logger.info("Applied TPU patch: disable sequence-parallel MoE.")
+    logger.info(
+        "Applied TPU patch: sequence-parallel MoE %s.",
+        "admitted" if envs.TPU_MOE_SEQUENCE_PARALLEL else "disabled",
+    )
 
 
 def _patch_multiproc_worker_global_rank_env() -> None:
@@ -604,6 +479,21 @@ def _patch_multiproc_worker_global_rank_env() -> None:
         pc = vllm_config.parallel_config
         binding = get_tpu_worker_binding(pc, rank, local_rank, env=_os.environ)
         _os.environ.update(binding.as_env())
+        # VLLM_TPU_DEVICE_ORDER lists a physical device per local rank, so
+        # consecutive ranks (a two-device pipeline stage) can sit on different
+        # chips; TorchTPU reads TPU_VISIBLE_DEVICES at import, hence set here.
+        order = envs.VLLM_TPU_DEVICE_ORDER
+        if order:
+            device = [int(x) for x in order.split(",")][binding.local_rank]
+            _os.environ["TPU_VISIBLE_CHIPS"] = str(device)
+            _os.environ["TPU_VISIBLE_DEVICES"] = str(device)
+            logger.info(
+                "Applied TPU patch: worker spawn env local rank %d -> device %d "
+                "(VLLM_TPU_DEVICE_ORDER=%s)",
+                binding.local_rank,
+                device,
+                order,
+            )
         logger.info(
             "Applied TPU patch: worker spawn env RANK=%d LOCAL_RANK=%d "
             "WORLD_SIZE=%d LOCAL_WORLD_SIZE=%d "
@@ -632,10 +522,12 @@ def _run_engine_core_with_tpu_patches(*args, **kwargs):
 
     patch_registry.apply("engine_core")
     from vllm_torchtpu.core.pp_chunk_scheduler import patch_engine_core_for_pp_chunks
+    from vllm_torchtpu.core.pp_lazy_step import patch_engine_core_for_lazy_push
     from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_wave
 
     patch_executor_for_pp_wave(kwargs.get("vllm_config"))
     patch_engine_core_for_pp_chunks(kwargs.get("vllm_config"))
+    patch_engine_core_for_lazy_push(kwargs.get("vllm_config"))
 
     from vllm.v1.engine.core import EngineCoreProc
 
@@ -732,6 +624,8 @@ def _patch_vllm_kimi_kda_layer_counts() -> None:
     """Patch ModelConfig.get_num_layers_by_block_type to report accurate counts
     for Kimi models with KDA using linear_attn_config (e.g. Kimi-K3).
     """
+    from typing import Literal
+
     from vllm.config.model import ModelConfig
 
     if getattr(ModelConfig, "_tpu_kimi_kda_layer_counts_patched", False):
@@ -740,7 +634,9 @@ def _patch_vllm_kimi_kda_layer_counts() -> None:
     original_get_num_layers = ModelConfig.get_num_layers_by_block_type
 
     def patched_get_num_layers_by_block_type(
-        self, parallel_config, block_type="attention"
+        self,
+        parallel_config,
+        block_type: Literal["attention", "linear_attention", "mamba"] = "attention",
     ) -> int:
         try:
             return original_get_num_layers(self, parallel_config, block_type)
@@ -1066,6 +962,218 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         logger.info("Applied TPU patch: hybrid full-attention + Mamba PCP block sizes.")
 
 
+def _dcp_fine_prefix_match_unit(kv_cache_config, vllm_config) -> int | None:
+    """Return the fine prefix-hit unit for a single-group DCP model, or None.
+
+    Opt-in: only a single full-attention (incl. MLA) group under DCP with
+    prefix caching, no PCP, no KV connector, and an explicit
+    ``--prefix-match-unit`` smaller than the logical block (block_size * dcp).
+    Everything else keeps upstream behavior (hash == scheduler block).
+    """
+    from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
+    from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
+    from vllm.v1.kv_cache_spec_registry import KVCacheSpecRegistry
+
+    cache_config = vllm_config.cache_config
+    parallel_config = vllm_config.parallel_config
+    unit = cache_config.prefix_match_unit
+    dcp = parallel_config.decode_context_parallel_size
+    groups = kv_cache_config.kv_cache_groups
+    if (
+        unit is None
+        or not cache_config.enable_prefix_caching
+        or dcp <= 1
+        or parallel_config.prefill_context_parallel_size != 1
+        # Connectors (P/D, offload) consume block hashes at block granularity.
+        or vllm_config.kv_transfer_config is not None
+        or len(groups) != 1
+    ):
+        return None
+    spec = groups[0].kv_cache_spec
+    leaves = (
+        spec.kv_cache_specs.values()
+        if isinstance(spec, UniformTypeKVCacheSpecs)
+        else (spec,)
+    )
+    # Only layers managed by FullAttentionManager (full attention and MLA,
+    # incl. the DSA indexer cache), which implements fine-grained lookup and
+    # partial-hit CoW. SWA / R-SWA / chunked-local / mamba are excluded.
+    if not all(
+        KVCacheSpecRegistry.get_manager_class(leaf) is FullAttentionManager
+        for leaf in leaves
+    ):
+        return None
+    logical_block = cache_config.block_size * dcp
+    if unit >= logical_block:
+        return None
+    if logical_block % unit != 0:
+        raise ValueError(
+            f"Invalid prefix_match_unit={unit}; the DCP logical block size "
+            f"block_size*dcp={logical_block} must be divisible by it."
+        )
+    return unit
+
+
+def _patch_vllm_dcp_fine_prefix_hits() -> None:
+    """Prefix-cache hits finer than the DCP logical block (single group).
+
+    Under DCP a single-group model's manager block is ``block_size * dcp``
+    tokens (e.g. 256 * 16 = 4096), and upstream hashes at that granularity,
+    so a shared prefix only hits in 4096-token steps. With
+    ``--prefix-match-unit U`` (U < block_size * dcp) this patch:
+
+    1. resolves ``(scheduler_block_size, hash_block_size)`` to
+       ``(block_size * dcp, U)`` (request hashing then runs every U tokens);
+    2. lets ``UnitaryKVCacheCoordinator`` accept ``hash < block`` and look up
+       hits at U alignment. ``FullAttentionManager`` already implements the
+       fine-grained probe, the prompt-tail partial entry, the one-hash-unit
+       EAGLE/MTP drop, and copy-on-write of the shared tail block; the
+       scheduler forwards those CoW pairs as ``kv_cache_block_copies``,
+       which the TPU runner applies per layer (see
+       ``TPUModelRunner._apply_dense_kv_cache_block_copies``).
+
+    The physical block size and allocation are unchanged.
+    """
+    import functools
+    import inspect
+    import sys
+
+    from vllm.v1.core import kv_cache_coordinator, kv_cache_utils
+
+    # (1) Block-size resolution. Wrap whatever is installed (the hybrid PCP
+    # wrapper runs first in the registry) and republish the direct-name
+    # imports, as EngineCore imports the function by name.
+    resolve = kv_cache_utils.resolve_kv_cache_block_sizes
+    if not getattr(resolve, "_tpu_dcp_fine_prefix_patch", False):
+        previous_resolve = resolve
+
+        @functools.wraps(previous_resolve)
+        def resolve_kv_cache_block_sizes(kv_cache_config, vllm_config):
+            unit = _dcp_fine_prefix_match_unit(kv_cache_config, vllm_config)
+            if unit is None:
+                if (
+                    vllm_config.cache_config.prefix_match_unit is not None
+                    and vllm_config.parallel_config.decode_context_parallel_size > 1
+                    and len(kv_cache_config.kv_cache_groups) == 1
+                ):
+                    logger.warning(
+                        "prefix_match_unit=%s is not applied under DCP for this "
+                        "config (needs prefix caching, no PCP, no KV connector, "
+                        "a single full-attention/MLA group, and a unit smaller "
+                        "than block_size*dcp); prefix hits stay block-aligned.",
+                        vllm_config.cache_config.prefix_match_unit,
+                    )
+                return previous_resolve(kv_cache_config, vllm_config)
+            dcp = vllm_config.parallel_config.decode_context_parallel_size
+            scheduler_block_size = vllm_config.cache_config.block_size * dcp
+            logger.info(
+                "DCP fine-grained prefix hits: scheduler_block_size=%d "
+                "hash_block_size=%d (dcp=%d)",
+                scheduler_block_size,
+                unit,
+                dcp,
+            )
+            return scheduler_block_size, unit
+
+        resolve_kv_cache_block_sizes._tpu_dcp_fine_prefix_patch = True
+        kv_cache_utils.resolve_kv_cache_block_sizes = resolve_kv_cache_block_sizes
+        resolve = resolve_kv_cache_block_sizes
+    for module_name in ("vllm.v1.engine.core", "vllm.v1.kv_offload.base"):
+        module = sys.modules.get(module_name)
+        if module is not None and hasattr(module, "resolve_kv_cache_block_sizes"):
+            module.resolve_kv_cache_block_sizes = resolve
+
+    # (2) Coordinator. Patch the class (not the factory, which the hybrid PCP
+    # patch owns) so a hash finer than the manager block is accepted only in
+    # the DCP single-group case; otherwise the upstream __init__ runs as-is.
+    cls = kv_cache_coordinator.UnitaryKVCacheCoordinator
+    if getattr(cls, "_tpu_dcp_fine_prefix_patch", False):
+        return
+    original_init = cls.__init__
+    original_find = cls.find_longest_cache_hit
+    base_init = kv_cache_coordinator.KVCacheCoordinator.__init__
+    # Bind by name instead of restating upstream's parameter list, so a new
+    # upstream parameter is forwarded rather than breaking this wrapper.
+    init_signature = inspect.signature(original_init)
+
+    @functools.wraps(original_init)
+    def __init__(self, *args, **kwargs):
+        bound = init_signature.bind(self, *args, **kwargs)
+        bound.apply_defaults()
+        init_args = dict(bound.arguments)
+        del init_args["self"]
+        kv_cache_config = init_args["kv_cache_config"]
+        hash_block_size = init_args["hash_block_size"]
+        num_prefill_lookahead = init_args.get("num_prefill_lookahead", 0)
+        fine = (
+            init_args["enable_caching"]
+            and init_args["dcp_world_size"] > 1
+            and init_args["pcp_world_size"] == 1
+            and len(kv_cache_config.kv_cache_groups) == 1
+            and hash_block_size < init_args["scheduler_block_size"]
+        )
+        if not fine:
+            original_init(self, *args, **kwargs)
+            return
+        # Upstream's __init__ forwards all of its arguments to the base
+        # __init__, then sets the attributes below. Mirror that minus its
+        # hash_block_size == block_size assert.
+        base_init(self, **init_args)
+        manager = self.single_type_managers[0]
+        self.kv_cache_spec = kv_cache_config.kv_cache_groups[0].kv_cache_spec
+        self.dcp_world_size = manager.dcp_world_size
+        self.pcp_world_size = init_args["pcp_world_size"]
+        self.block_size = manager.block_size
+        self.hash_block_size = hash_block_size
+        manager.use_eagle = 0 in self.eagle_group_ids
+        if not type(manager).supports_fine_grained_hash_lookup:
+            raise ValueError(
+                f"{type(manager).__name__} does not support prefix hits finer "
+                "than its block; unset --prefix-match-unit."
+            )
+        if self.block_size % hash_block_size != 0:
+            raise ValueError(
+                f"prefix_match_unit={hash_block_size} must divide the DCP "
+                f"manager block size {self.block_size}."
+            )
+        # EAGLE/MTP drops one hash unit (not a whole block) from each hit; it
+        # must still cover the multi-module prefill lookahead.
+        if self.eagle_group_ids and hash_block_size < num_prefill_lookahead:
+            raise ValueError(
+                f"prefix_match_unit={hash_block_size} must be >= "
+                f"num_speculative_tokens={num_prefill_lookahead}."
+            )
+        self.enable_partial_hash_hits = True
+        # Lets cache_blocks' reachability mask and the partial-tail entry use
+        # hash-unit boundaries.
+        manager.cache_hit_alignment_tokens = hash_block_size
+
+    @functools.wraps(original_find)
+    def find_longest_cache_hit(self, block_hashes, max_cache_hit_length):
+        if not self.enable_partial_hash_hits:
+            return original_find(self, block_hashes, max_cache_hit_length)
+        # Same as upstream but aligned to the hash unit, which switches
+        # FullAttentionManager to its fine-grained probe; a hit ending inside
+        # a block is then CoW-copied by the manager on allocation.
+        hit_blocks, hit_length = self.single_type_managers[0].find_longest_cache_hit(
+            block_hashes=block_hashes,
+            max_length=max_cache_hit_length,
+            kv_cache_group_ids=[0],
+            block_pool=self.block_pool,
+            kv_cache_spec=self.kv_cache_spec,
+            drop_eagle_block=0 in self.eagle_group_ids,
+            alignment_tokens=self.hash_block_size,
+            dcp_world_size=self.dcp_world_size,
+            pcp_world_size=self.pcp_world_size,
+        )
+        return hit_blocks, hit_length, 0
+
+    cls.__init__ = __init__
+    cls.find_longest_cache_hit = find_longest_cache_hit
+    cls._tpu_dcp_fine_prefix_patch = True
+    logger.info("Applied TPU patch: DCP single-group fine-grained prefix hits.")
+
+
 def _patch_vllm_merge_multimodal_embeddings() -> None:
     """Patch vLLM's _merge_multimodal_embeddings to use static indexing on TPU.
 
@@ -1364,6 +1472,9 @@ def _patch_vllm_force_v1_runner_tpu() -> None:
     list. The other native checks and TPU's combination checks still apply.
     An explicit VLLM_USE_V2_MODEL_RUNNER retains upstream precedence.
     """
+    from collections.abc import Callable
+    from typing import Any, cast
+
     from vllm.config.vllm import VllmConfig
 
     if getattr(VllmConfig, "_tpu_force_v1_runner_patch", False):
@@ -1378,15 +1489,17 @@ def _patch_vllm_force_v1_runner_tpu() -> None:
         )
         return
 
+    original_fget = cast(Callable[[Any], bool], original_prop.fget)
+
     def patched_use_v2(self):
         import vllm.envs as envs
 
         if envs.VLLM_USE_V2_MODEL_RUNNER is not None:
-            return original_prop.fget(self)
+            return original_fget(self)
         device_config = getattr(self, "device_config", None)
         if device_config is not None and device_config.device_type == "tpu":
             return False
-        return original_prop.fget(self)
+        return original_fget(self)
 
     original_unsupported = VllmConfig._get_v1_model_runner_unsupported_features
 
@@ -1607,6 +1720,7 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             )
 
     def patched_forward(self, input_):
+        input_mask = None
         if self.tp_size > 1:
             masked_input, input_mask = vpe.get_masked_input_and_mask(
                 input_,
@@ -1638,6 +1752,7 @@ def _patch_vllm_vocab_parallel_embedding() -> None:
             masked_input = input_
         output_parallel = self.quant_method.embedding(self, masked_input.long())
         if self.tp_size > 1:
+            assert input_mask is not None
             output_parallel.masked_fill_(input_mask.unsqueeze(-1), 0)
             from vllm.distributed import tensor_model_parallel_all_reduce
 

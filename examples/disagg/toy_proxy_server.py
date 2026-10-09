@@ -15,7 +15,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -375,7 +375,11 @@ def get_next_client(app, service_type: str):
 
 
 async def send_request_to_prefill(
-    client_info: dict, endpoint: str, req_data: dict, request_id: str
+    client_info: dict,
+    endpoint: str,
+    req_data: dict,
+    request_id: str,
+    forwarded: dict | None = None,
 ):
     """
     Send a request to a service using a client from the pool.
@@ -392,6 +396,7 @@ async def send_request_to_prefill(
         "Content-Type": "application/json",
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         "X-Request-Id": request_id,
+        **(forwarded or {}),
     }
 
     return await _post_with_retries(
@@ -400,7 +405,11 @@ async def send_request_to_prefill(
 
 
 async def render_completion_prompt(
-    client_info: dict, endpoint: str, req_data: dict, request_id: str
+    client_info: dict,
+    endpoint: str,
+    req_data: dict,
+    request_id: str,
+    forwarded: dict | None = None,
 ):
     """
     Render/tokenize a completion request once so downstream P/D requests can
@@ -410,6 +419,7 @@ async def render_completion_prompt(
         "Content-Type": "application/json",
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         "X-Request-Id": request_id,
+        **(forwarded or {}),
     }
 
     return await _post_with_retries(
@@ -418,7 +428,11 @@ async def render_completion_prompt(
 
 
 async def stream_from_decode(
-    client_info: dict, endpoint: str, req_data: dict, request_id: str
+    client_info: dict,
+    endpoint: str,
+    req_data: dict,
+    request_id: str,
+    forwarded: dict | None = None,
 ):
     """
     Asynchronously stream response from a service using a client from the pool.
@@ -427,6 +441,7 @@ async def stream_from_decode(
         "Content-Type": "application/json",
         "Authorization": f"Bearer {os.environ.get('OPENAI_API_KEY')}",
         "X-Request-Id": request_id,
+        **(forwarded or {}),
     }
 
     for attempt in range(_MAX_ATTEMPTS):
@@ -479,6 +494,12 @@ async def _handle_completions(api: str, request: Request):
         t_request_recv_perf = time.perf_counter()
         req_data = await request.json()
         request_id = str(uuid.uuid4())
+        # vLLM sends a request carrying X-data-parallel-rank to that DP rank of
+        # the engine. Passed to both hops, so that a client can hold a request
+        # to one prefill replica and one decode replica.
+        forwarded = {}
+        if (dp_rank := request.headers.get("X-data-parallel-rank")) is not None:
+            forwarded["X-data-parallel-rank"] = dp_rank
         print(
             f"PERF PROXY req_received req_id={request_id} ts={time.time():.6f}",
             flush=True,
@@ -489,7 +510,7 @@ async def _handle_completions(api: str, request: Request):
         render_endpoint = _render_endpoint_for_api(api)
         if render_endpoint is not None:
             render_response = await render_completion_prompt(
-                prefill_client_info, render_endpoint, req_data, request_id
+                prefill_client_info, render_endpoint, req_data, request_id, forwarded
             )
             req_data = _replace_prompt_with_rendered_token_ids(
                 req_data, render_response.json()
@@ -503,7 +524,7 @@ async def _handle_completions(api: str, request: Request):
             flush=True,
         )
         response = await send_request_to_prefill(
-            prefill_client_info, api, req_data, request_id
+            prefill_client_info, api, req_data, request_id, forwarded
         )
         t_prefill_recv = time.time()
         t_prefill_recv_perf = time.perf_counter()
@@ -543,7 +564,7 @@ async def _handle_completions(api: str, request: Request):
             )
             first = True
             async for chunk in stream_from_decode(
-                decode_client_info, api, req_data, request_id=request_id
+                decode_client_info, api, req_data, request_id, forwarded
             ):
                 if first:
                     t_first = time.time()
@@ -562,7 +583,16 @@ async def _handle_completions(api: str, request: Request):
                     first = False
                 yield chunk
 
-        return StreamingResponse(generate_stream(), media_type="application/json")
+        # text/event-stream when the caller asked for a stream, which is what
+        # the decode instance is actually sending back. Declared as
+        # application/json, a client parses each SSE frame - "data: {...}" prefix
+        # and all - as one JSON document, and every request fails; aiperf's
+        # agentic replay does exactly that, while the non-streaming callers this
+        # proxy had until now (check_completions.py, lm_eval) never noticed.
+        media_type = (
+            "text/event-stream" if req_data.get("stream") else "application/json"
+        )
+        return StreamingResponse(generate_stream(), media_type=media_type)
 
     except Exception as e:
         import sys
@@ -583,6 +613,20 @@ async def handle_completions(request: Request):
 @app.post("/v1/chat/completions")
 async def handle_chat_completions(request: Request):
     return await _handle_completions("/v1/chat/completions", request)
+
+
+@app.get("/v1/models")
+async def models():
+    """The decode instance's model list, which is the pair's.
+
+    Part of the OpenAI surface this proxy presents: a client resolves the served
+    model name here, and the ModelCard's max_model_len is how a benchmark client
+    learns the window it is replaying against. Both instances serve the same
+    model; decode is the one that finishes a request.
+    """
+    client = app.state.decode_clients[0]["client"]
+    response = await client.get("/v1/models")
+    return JSONResponse(status_code=response.status_code, content=response.json())
 
 
 @app.get("/healthcheck")

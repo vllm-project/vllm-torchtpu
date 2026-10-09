@@ -647,7 +647,7 @@ def _pooled_kda_regions(
             f"page={page_bytes}"
         )
     if str(ssm_dtype) != "torch.float32" or row_bytes % 4:
-        raise ManifestError("KDA transfer requires f32 SSM and bf16 pool rows")
+        raise ManifestError("KDA transfer requires f32 SSM and word-aligned pool rows")
     return {
         TAG_GDN_SSM: (
             0,
@@ -958,6 +958,11 @@ def build_qwen35_pool_manifest(
     return _bind_pool_manifest(entries, raw_tensors)
 
 
+# KV dtypes the Kimi pool is admitted with. The KDA state regions keep their
+# own dtypes inside the pool (gdn_pool_layout), whichever of these it has.
+_KIMI_POOL_DTYPE_TAGS = frozenset({"bfloat16", "float8_e4m3fn"})
+
+
 def build_kimi_k3_pool_manifest(
     *,
     named_kv_caches: Mapping[str, Any],
@@ -983,13 +988,16 @@ def build_kimi_k3_pool_manifest(
         shape = tuple(int(dim) for dim in tensor.shape)
         spec = _group_spec_for_layer(kv_cache_groups, layer_name)
         page_bytes = int(spec.page_size_bytes)
-        if len(shape) != 4 or _dtype_tag(tensor) != "bfloat16":
+        dtype_tag = _dtype_tag(tensor)
+        if len(shape) != 4 or dtype_tag not in _KIMI_POOL_DTYPE_TAGS:
             raise ManifestError(
-                f"Kimi cache {layer_name} must be bf16 "
-                f"[blocks, rows, packing, width], got {shape}"
+                f"Kimi cache {layer_name} must be bf16 or fp8 "
+                f"[blocks, rows, packing, width], got {dtype_tag} {shape}"
             )
         num_blocks, rows, packing, width = shape
-        if min(shape) <= 0 or packing != 2:
+        # The packing axis fills one 32-bit word, so a packed row is
+        # 4 * width bytes for either dtype and only its token count differs.
+        if min(shape) <= 0 or packing * _element_size(tensor) != 4:
             raise ManifestError(
                 f"Kimi cache {layer_name} has invalid packed-row geometry"
             )
@@ -1144,7 +1152,7 @@ def materialize_storages(manifest: PoolManifest) -> None:
         if hasattr(storage, "cpu"):
             try:  # noqa: SIM105 (non-torch test fakes)
                 storage[:1].cpu()
-            except Exception:  # pragma: no cover - non-torch fakes
+            except Exception:  # pragma: no cover - non-torch fakes  # noqa: S110
                 pass
 
 

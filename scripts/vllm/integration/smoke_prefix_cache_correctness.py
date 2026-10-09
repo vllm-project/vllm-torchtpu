@@ -61,6 +61,16 @@ SHORT_QA = [
 
 BAD_MARKERS = ["<think>", "Thinking Process", "====", "\ufffd"]
 
+# What turns reasoning off differs by chat template: Qwen3.5 reads
+# enable_thinking, Kimi-K3 reads thinking. main() replaces this from
+# --chat-template-kwargs.
+CHAT_TEMPLATE_KWARGS: dict = {"enable_thinking": False}
+
+# The suites give an answer just enough tokens to end in. Kimi-K3 closes its
+# response and message channels after the answer, six tokens the others do not
+# spend, so main() can raise every suite's budget from --min-max-tokens.
+MIN_MAX_TOKENS = 0
+
 
 def env_int(name: str, default: int) -> int:
     raw = os.environ.get(name, str(default))
@@ -109,9 +119,9 @@ def chat(url: str, model: str, prompt: str, max_tokens: int, timeout: int) -> di
     payload = {
         "model": model,
         "messages": [{"role": "user", "content": prompt}],
-        "max_tokens": max_tokens,
+        "max_tokens": max(max_tokens, MIN_MAX_TOKENS),
         "temperature": 0.0,
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": CHAT_TEMPLATE_KWARGS,
     }
     status, parsed, elapsed = post_json(url, payload, timeout)
     result = {
@@ -649,6 +659,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--timeout", type=int, default=env_int("P4D2_CORRECTNESS_TIMEOUT", 600)
     )
+    parser.add_argument(
+        "--chat-template-kwargs",
+        type=json.loads,
+        help="JSON object sent as chat_template_kwargs with every request, "
+        'in place of {"enable_thinking": false}.',
+    )
+    parser.add_argument(
+        "--min-max-tokens",
+        type=int,
+        default=0,
+        help="Send at least this max_tokens, whatever a suite asks for.",
+    )
     parser.add_argument("--quick-probe-only", action="store_true")
     parser.add_argument(
         "--prefix-hit-probe-only",
@@ -691,6 +713,11 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    if args.chat_template_kwargs is not None:
+        CHAT_TEMPLATE_KWARGS.clear()
+        CHAT_TEMPLATE_KWARGS.update(args.chat_template_kwargs)
+    global MIN_MAX_TOKENS
+    MIN_MAX_TOKENS = args.min_max_tokens
     url = f"http://{args.host}:{args.port}/v1/chat/completions"
     if args.quick_probe_only:
         return run_quick_probe(url, args.model, args.timeout)

@@ -47,7 +47,7 @@
 # * The build step tags the image with $BUILDKITE_COMMIT and every TPU step
 #   pulls that exact tag, so all steps must depend_on `build_docker`.
 # * run_in_docker.sh runs your command inside the image at
-#   /root/torchtpu-vllm — that is a COPY of the repo at this commit, not the
+#   /workspace/vllm-torchtpu — that is a COPY of the repo at this commit, not the
 #   agent's checkout. Reference paths like `examples/...` / `tests/...`
 #   relative to the repo root.
 # * Anything written to /perf_eval_results inside the container is copied back

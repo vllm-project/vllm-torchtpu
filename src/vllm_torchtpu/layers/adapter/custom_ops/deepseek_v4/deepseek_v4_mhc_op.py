@@ -32,7 +32,7 @@ from vllm_torchtpu.kernels.deepseek_v4.mhc import (
     pre_kernel,
 )
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-    get_vllm_model_wrapper_context,
+    get_pallas_op_mesh,
 )
 
 # Every mHC tensor is token-major, so its leading axis is the attention-DP
@@ -192,7 +192,7 @@ def _mhc_pre_op(
                 hc_post_mult_value=hc_post_mult_value,
                 sinkhorn_repeat=sinkhorn_repeat,
             ),
-            mesh=get_vllm_model_wrapper_context().mesh,
+            mesh=get_pallas_op_mesh(),
             input_partition_specs=(
                 P(ATTN_DATA_AXIS, None, None),  # residual
                 P(),  # fn
@@ -217,7 +217,7 @@ def get_mhc_post_op():
         op = pallas.jax_op(
             op_name,
             _mhc_post_jax,
-            mesh=get_vllm_model_wrapper_context().mesh,
+            mesh=get_pallas_op_mesh(),
             input_partition_specs=(
                 P(ATTN_DATA_AXIS, None),  # x
                 P(ATTN_DATA_AXIS, None, None),  # residual
@@ -252,7 +252,7 @@ def _mhc_fused_post_pre_op(
                 hc_post_mult_value=hc_post_mult_value,
                 sinkhorn_repeat=sinkhorn_repeat,
             ),
-            mesh=get_vllm_model_wrapper_context().mesh,
+            mesh=get_pallas_op_mesh(),
             input_partition_specs=(
                 P(ATTN_DATA_AXIS, None),  # x
                 P(ATTN_DATA_AXIS, None, None),  # residual

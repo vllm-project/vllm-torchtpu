@@ -77,7 +77,7 @@ for attempt in $(seq 1 "${MAX_ATTEMPTS}"); do
 
     git add pyproject.toml
     # [skip ci] is crucial to prevent infinite Buildkite loop triggers
-    git -C "${WORKTREE_DIR}" -c "user.name=Buildkite Bot" -c "user.email=buildkite-bot@users.noreply.github.com" commit -s -m "[skip ci] Update vLLM LKG to ${NEW_LKG_HASH}"
+    git -C "${WORKTREE_DIR}" -c "user.name=vllm-ci-bot[bot]" -c "user.email=vllm-ci-bot[bot]@users.noreply.github.com" commit -s -m "[skip ci] Update vLLM LKG to ${NEW_LKG_HASH}"
 
     echo "Pushing updated version to remote ${TARGET_BRANCH}..."
     git push origin HEAD:"${TARGET_BRANCH}"

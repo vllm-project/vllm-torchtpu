@@ -12,6 +12,10 @@ from types import ModuleType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
+from vllm.config.parallel import ParallelConfig
+
+import vllm_torchtpu.envs as envs
+from vllm_torchtpu import _patch_sequence_parallel_moe_admission
 
 _REGISTRY_PATH = (
     Path(__file__).resolve().parents[2] / "src/vllm_torchtpu/patch_registry.py"
@@ -210,16 +214,22 @@ def test_manifest_preserves_lifecycle_dependencies():
     assert stages["import"] == ["_patch_jax_pallas_fori_lowering"]
     assert stages["engine_core"] == [
         "_patch_vllm_hybrid_pcp_block_sizes",
+        "_patch_vllm_dcp_fine_prefix_hits",
         "_patch_vllm_mamba_split_scheduler_block_size",
         "_patch_vllm_offloading_config_build",
         "_patch_vllm_hybrid_kv_load_failure_recovery",
         "_patch_vllm_same_step_prefix_hits",
+        "patch_disable_eagle_block_drop",
         "_patch_vllm_merge_multimodal_embeddings",
     ]
     assert stages["platform_activation"] == (
         stages["worker_init"] + stages["model_load"]
     )
-    assert stages["model_load"] == ["maybe_patch_qwen2_5_vl", "maybe_patch_qwen3_vl"]
+    assert stages["model_load"] == [
+        "maybe_patch_qwen2_5_vl",
+        "maybe_patch_qwen3_vl",
+        "maybe_patch_qwen3_next",
+    ]
     assert "patch_moe_expert_write_staging" in stages["worker_init"]
     for names in (stages["platform_activation"], stages["worker_init"]):
         assert names.index("_patch_vllm_force_v1_runner_tpu") < names.index(
@@ -314,3 +324,65 @@ def test_fork_during_application_retains_completed_patches(registry):
         parent.close()
         child.close()
     assert seen == ["completed", "pending"]
+
+
+def test_sequence_parallel_moe_admission(monkeypatch):
+    # Save original property and guard flag so teardown restores them cleanly
+    monkeypatch.setattr(
+        ParallelConfig,
+        "use_sequence_parallel_moe",
+        ParallelConfig.use_sequence_parallel_moe,
+    )
+    if hasattr(ParallelConfig, "_tpu_no_sp_moe_patch"):
+        monkeypatch.setattr(
+            ParallelConfig,
+            "_tpu_no_sp_moe_patch",
+            ParallelConfig._tpu_no_sp_moe_patch,
+        )
+    else:
+        monkeypatch.setattr(
+            ParallelConfig,
+            "_tpu_no_sp_moe_patch",
+            False,
+            raising=False,
+        )
+
+    # Case 1: envs.TPU_MOE_SEQUENCE_PARALLEL = False
+    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", False)
+    if hasattr(ParallelConfig, "_tpu_no_sp_moe_patch"):
+        del ParallelConfig._tpu_no_sp_moe_patch
+    _patch_sequence_parallel_moe_admission()
+    cfg = Mock(
+        enable_expert_parallel=True, tensor_parallel_size=8, data_parallel_size=1
+    )
+    assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg)
+
+    # Case 2: envs.TPU_MOE_SEQUENCE_PARALLEL = True
+    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", True)
+    if hasattr(ParallelConfig, "_tpu_no_sp_moe_patch"):
+        del ParallelConfig._tpu_no_sp_moe_patch
+    _patch_sequence_parallel_moe_admission()
+
+    # EP=False, TP=8, DP=1 -> False
+    cfg_no_ep = Mock(
+        enable_expert_parallel=False, tensor_parallel_size=8, data_parallel_size=1
+    )
+    assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg_no_ep)
+
+    # EP=True, TP=1, DP=1 -> False
+    cfg_tp1 = Mock(
+        enable_expert_parallel=True, tensor_parallel_size=1, data_parallel_size=1
+    )
+    assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg_tp1)
+
+    # EP=True, TP=8, DP=2 -> False
+    cfg_dp2 = Mock(
+        enable_expert_parallel=True, tensor_parallel_size=8, data_parallel_size=2
+    )
+    assert not ParallelConfig.use_sequence_parallel_moe.fget(cfg_dp2)
+
+    # EP=True, TP=8, DP=1 -> True
+    cfg_sp = Mock(
+        enable_expert_parallel=True, tensor_parallel_size=8, data_parallel_size=1
+    )
+    assert ParallelConfig.use_sequence_parallel_moe.fget(cfg_sp)

@@ -18,22 +18,22 @@
 
 const COMMAND_DATA = {
     "uv_pip": {
-        cmd: `# 1. Create a working directory:\nmkdir ~/work-dir\ncd ~/work-dir\n\n# 2. Install uv and set up a Python virtual environment:\n# If you prefer standard pip, simply use \`python3.12 -m venv vllm_env\`\ncurl -LsSf https://astral.sh/uv/install.sh | sh\nsource $HOME/.local/bin/env\nuv venv vllm_env --python 3.12\nsource vllm_env/bin/activate\n\n# 3. Use the following command to install vllm-tpu using uv or pip:\nuv pip install vllm-tpu\n# Or instead: pip install vllm-tpu`,
-        inst: "Install the latest official release using uv pip for any supported TPU."
+        cmd: `# 1. Authenticate with GCP Artifact Registry (for torch_tpu wheels):\ngcloud auth application-default login\n\n# 2. Clone the repository and install with uv:\ngit clone https://github.com/vllm-project/vllm-torchtpu.git\ncd vllm-torchtpu\nuv sync --group vllm\nsource .venv/bin/activate`,
+        inst: "Install <code>vllm-torchtpu</code> and its pinned <code>vllm</code> and <code>torch_tpu</code> dependencies into a managed virtual environment using <code>uv</code>."
     },
     "docker": {
         "latest": {
-            cmd: `export DOCKER_URI=vllm/vllm-tpu:latest\nsudo docker run -it --rm --name $USER-vllm --privileged --net=host \\\n  -v /dev/shm:/dev/shm \\\n  --shm-size 150gb \\\n  -p 8000:8000 \\\n  --entrypoint /bin/bash \${DOCKER_URI}`,
-            inst: "Run the official <strong>release</strong> Docker container (<code>vllm/vllm-tpu:latest</code>). Include the <code>--privileged</code>, <code>--net=host</code>, and <code>--shm-size=150gb</code> options to enable TPU interaction and shared memory."
+            cmd: `export DOCKER_URI=us-central1-docker.pkg.dev/tpu-pytorch-releases/docker/development:tpu7x_20260405\ngcloud auth configure-docker us-central1-docker.pkg.dev --quiet\nsudo docker run -it --rm --name $USER-vllm --privileged --net=host \\\n  -v /dev/shm:/dev/shm \\\n  --shm-size 150gb \\\n  -p 8000:8000 \\\n  --entrypoint /bin/bash \${DOCKER_URI}`,
+            inst: "Run the pre-built <strong>TPU development</strong> container with <code>torch_tpu</code>, <code>libtpu</code>, and <code>jax</code> pre-installed. Include <code>--privileged</code>, <code>--net=host</code>, and <code>--shm-size=150gb</code> to enable TPU access and shared memory."
         },
         "nightly": {
-            cmd: `export DOCKER_URI=vllm/vllm-tpu:nightly\nsudo docker run -it --rm --name $USER-vllm --privileged --net=host \\\n  -v /dev/shm:/dev/shm \\\n  --shm-size 150gb \\\n  -p 8000:8000 \\\n  --entrypoint /bin/bash \${DOCKER_URI}`,
-            inst: "Run the pre-built <strong>nightly</strong> Docker container (<code>vllm/vllm-tpu:nightly</code>) containing the latest development changes. Include the <code>--privileged</code>, <code>--net=host</code>, and <code>--shm-size=150gb</code> options to enable TPU interaction and shared memory."
+            cmd: `git clone https://github.com/vllm-project/vllm-torchtpu.git\ncd vllm-torchtpu\ndocker build -f docker/Dockerfile -t vllm-torchtpu:dev .\nsudo docker run -it --rm --name $USER-vllm --privileged --net=host \\\n  -v /dev/shm:/dev/shm \\\n  --shm-size 150gb \\\n  -p 8000:8000 \\\n  --entrypoint /bin/bash vllm-torchtpu:dev`,
+            inst: "Build and run the <strong>vllm-torchtpu</strong> image from <code>docker/Dockerfile</code> containing the latest repository source."
         }
     },
     "source": {
-        cmd: `# 1. Install system dependencies:\nsudo apt-get update && sudo apt-get install -y libopenblas-base libopenmpi-dev libomp-dev\n\n# 2. Clone the vllm and tpu-inference repositories:\ngit clone https://github.com/vllm-project/tpu-inference.git\nexport VLLM_COMMIT_HASH=$(cat tpu-inference/.buildkite/vllm_lkg.version)\ngit clone https://github.com/vllm-project/vllm.git\ncd vllm\ngit checkout "\${VLLM_COMMIT_HASH}"\ncd ..\n\n# 3. Install uv and set up a Python virtual environment:\ncurl -LsSf https://astral.sh/uv/install.sh | sh\nsource $HOME/.local/bin/env\nuv venv vllm_env --python 3.12\nsource vllm_env/bin/activate\n\n# 4. Install vllm from source, targeting the TPU device:\ncd vllm\nuv pip install -r requirements/tpu.txt --torch-backend=cpu\nVLLM_TARGET_DEVICE="tpu" uv pip install -e . --no-build-isolation\ncd ..\n\n# 5. Install tpu-inference from source:\ncd tpu-inference\nuv pip install -e .\ncd ..`,
-        inst: "For debugging or development purposes, you can install <code>tpu-inference</code> from source. <code>tpu-inference</code> is a plugin for <code>vllm</code>, so you need to install both from source."
+        cmd: `# 1. Authenticate with GCP Artifact Registry:\ngcloud auth application-default login\n\n# 2. Clone vllm-torchtpu and create a virtual environment:\ngit clone https://github.com/vllm-project/vllm-torchtpu.git\ncd vllm-torchtpu\nuv venv --python 3.12 --seed\nsource .venv/bin/activate\n\n# 3. Install in editable mode with vllm and dev dependencies:\nuv pip install --prerelease=allow -e . --group vllm --group dev\n\n# 4. (Optional) Editable vllm checkout for cross-repo development:\ngit clone --branch v0.29.0 --depth 1 https://github.com/vllm-project/vllm.git ../vllm\nVLLM_TARGET_DEVICE=empty uv pip install -e ../vllm --no-deps`,
+        inst: "For development or debugging, install <code>vllm-torchtpu</code> in editable mode with <code>--group vllm --group dev</code>. Optionally mount an editable <code>vllm</code> checkout."
     }
 };
 
@@ -45,7 +45,7 @@ function highlightShell(code) {
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;');
-    const tokenRegex = /("[^"]*"|'[^']*'|\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*|--[a-zA-Z0-9_-]+|-[a-zA-Z0-9]+|&&|\|\||\||\\|\b(?:export|source|sudo|cd|mkdir|git|uv|pip|curl|gcloud|docker|apt-get|python|python3\.12)\b|\b(?:install|run|clone|checkout|update|venv|create|compute|tpus|queued-resources|tpu-vm|ssh|alpha)\b)/g;
+    const tokenRegex = /("[^"]*"|'[^']*'|\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*|--[a-zA-Z0-9_-]+|-[a-zA-Z0-9]+|&&|\|\||\||\\|\b(?:export|source|sudo|cd|mkdir|git|uv|pip|curl|gcloud|docker|apt-get|python|python3\.12)\b|\b(?:install|run|clone|checkout|update|venv|create|compute|tpus|queued-resources|tpu-vm|ssh|alpha|sync|auth|build)\b)/g;
     return escaped.split('\n').map(line => {
         if (/^\s*#/.test(line)) {
             return '<span class="c1">' + line + '</span>';
@@ -99,6 +99,14 @@ function updateCommandGenerator() {
 }
 
 const PROVISION_DATA = {
+    "v7x": {
+        runtime: "v2-alpha-tpuv7x",
+        zone: "us-central1-c",
+        accel_prefix: "tpu7x-",
+        uses_core_count: true,
+        supports_flex: true,
+        valid_chips: [1, 4, 8, 16, 32, 64]
+    },
     "v6e": {
         runtime: "v2-alpha-tpuv6e",
         zone: "us-east5-a",

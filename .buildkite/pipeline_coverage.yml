@@ -24,8 +24,6 @@
 #   results out of the container with 'cp -r .../*', which skips dotfiles.
 # * The combine step runs on a cpu agent outside docker; it installs
 #   coverage with pip --user because those agents lack python3-venv.
-# * tests/omni/models is ignored: it needs vllm_omni, which the dev image
-#   lacks, and a collection error would stop pytest (masked by '|| true').
 
 steps:
 
@@ -48,7 +46,7 @@ steps:
           test -f .coveragerc || { echo "[coverage] .coveragerc missing in the image; branch/parallel/subprocess settings would be silently dropped"; exit 1; };
           COVERAGE_FILE=/perf_eval_results/coverage_2chip.dat \
           python3 -m pytest -q --timeout=1800 -m "not nightly and not multichip" \
-            --cov=vllm_torchtpu --cov-report= --ignore=tests/omni/models tests/ || true;
+            --cov=vllm_torchtpu --cov-report= tests/ || true;
           ls -la /perf_eval_results/'
     artifact_paths:
       - "perf_eval_results/coverage_2chip.dat*"
@@ -65,7 +63,7 @@ steps:
           test -f .coveragerc || { echo "[coverage] .coveragerc missing in the image; branch/parallel/subprocess settings would be silently dropped"; exit 1; };
           COVERAGE_FILE=/perf_eval_results/coverage_8chip.dat \
           python3 -m pytest -q --timeout=3600 -m "not nightly and multichip" \
-            --cov=vllm_torchtpu --cov-report= --ignore=tests/omni/models tests/ || true;
+            --cov=vllm_torchtpu --cov-report= tests/ || true;
           ls -la /perf_eval_results/'
     artifact_paths:
       - "perf_eval_results/coverage_8chip.dat*"

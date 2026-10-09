@@ -63,6 +63,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     U32_SUBLANE_TILE,
     token_gather_smem_bytes,
 )
+from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -375,6 +376,8 @@ def fused_moe_ep(
             _squeeze_channel_scale_checked(w1_scale),
             _squeeze_channel_scale_checked(w2_scale),
         )
+    if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+        router_logits = token_padding.mask_router_logits_for_padding(router_logits)
     extra = tuple(t for t in (score_bias, hash_ids) if t is not None)
     return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
 
@@ -559,8 +562,9 @@ def prebuild_fused_moe_ep(
         )
         return None
     global _RANK_BUFFER
-    # The kernel's index is this rank's position in the mesh, which since
-    # #3522 is ordered by rank, so the position is the EP rank.
+    # The kernel's index is this rank's position in the mesh, which is ordered
+    # by device id unless PCP or DCP is on, so it is not necessarily the EP rank;
+    # `ep_rank_order` has the mapping.
     _RANK_BUFFER = torch.tensor(
         [[ep_mesh_index()]], dtype=torch.int32, device=layer.w13_weight.device
     )
@@ -677,17 +681,14 @@ def prebuild_fused_moe_ep(
         routed_scale,
         token_replica_groups,
     )
-    # Two knobs stop applying the moment this arms, and neither would say so on
-    # its own: the fused call returns before `apply_monolithic` reaches either
-    # the padding mask or the chunked path. Padding costs expert work and
-    # transport rather than correctness -- and it is not free at warmup, where
-    # `_dummy_run` marks the whole batch as padding.
-    if envs.TPU_MOE_SKIP_PADDED_TOKENS or envs.TPU_MOE_COLLECTION_CHUNK_SIZE:
+    # Chunked collection stops applying the moment this arms: the fused call
+    # returns before `apply_monolithic` reaches the chunked path, and the
+    # kernel exchanges inside its own program.
+    if envs.TPU_MOE_COLLECTION_CHUNK_SIZE:
         logger.warning_once(
-            "Fused EP MoE armed, so TPU_MOE_SKIP_PADDED_TOKENS=%s and "
-            "TPU_MOE_COLLECTION_CHUNK_SIZE=%s are not in effect for this "
-            "layer: the kernel routes and exchanges inside its own program.",
-            envs.TPU_MOE_SKIP_PADDED_TOKENS,
+            "Fused EP MoE armed, so TPU_MOE_COLLECTION_CHUNK_SIZE=%s is not "
+            "in effect for this layer: the kernel routes and exchanges inside "
+            "its own program.",
             envs.TPU_MOE_COLLECTION_CHUNK_SIZE,
         )
     return op

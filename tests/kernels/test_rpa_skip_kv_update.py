@@ -97,6 +97,7 @@ def _build_packed_cache(
     return flat.reshape(cache_shape)
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("cfg", [V3, HD64], ids=lambda c: c["name"])
 @pytest.mark.parametrize("impl", ["pallas", "ref"])
 @pytest.mark.parametrize(
@@ -240,6 +241,7 @@ def _build_batched_cache(
     return np.asarray(cache.astype(jnp.float32))
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     "kv_len, q_len, distribution",
     [
@@ -365,6 +367,7 @@ def test_skip_kv_update_batched(kv_len, q_len, distribution):
     )
 
 
+@pytest.mark.tpu_test
 def test_batched_seq_along_lane_matches_head_along_sublane():
     """`kv_layout=SEQ_ALONG_LANE` must be numerically equivalent to the default
     `HEAD_ALONG_SUBLANE` layout for identical logical Q/K/V: layout only

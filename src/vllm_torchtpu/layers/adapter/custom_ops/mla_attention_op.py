@@ -14,7 +14,7 @@
 """Out-of-tree (OOT) custom operator layers and wrappers for
 Multi-Head Latent Attention (MLA)."""
 
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -26,7 +26,10 @@ from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import mla_attention
 from vllm.model_executor.layers.attention.attention import get_attention_context
 from vllm.model_executor.layers.attention.mla_attention import MLAAttention
-from vllm.model_executor.layers.linear import ColumnParallelLinear
+from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
+    DCPGroupColumnParallelLinear,
+)
 from vllm.model_executor.layers.mla import MLAModules, MultiHeadLatentAttentionWrapper
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.rotary_embedding.common import rotate_gptj, rotate_neox
@@ -43,7 +46,13 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group, get_or_create_dcp_mesh
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME,
+    KVLayout,
+    coalesced_kv_append,
+    coalesced_kv_append_dcp,
     cp_rank_as_data,
+    get_kv_cache_shape,
+    indexer_kv_layout,
+    kv_cache_append,
     streamindex_topk,
     streamindex_topk_dcp,
 )
@@ -53,13 +62,17 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
 from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
+    PallasMLAttentionBackendImpl,
     VllmTPUDeepseekV32IndexerBackend,
 )
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
+
+logger = init_logger(__name__)
 
 # Skip indexer scoring when every sequence in the batch is shorter than
 # `index_topk`, where the top-k is the identity and the scores decide nothing.
@@ -67,6 +80,187 @@ from vllm_torchtpu.utils import synchronize_tensors
 # traffic and not at all once any request in the batch is past `index_topk`
 # tokens.
 STREAMIDX_ENABLE_EARLY_EXIT = True
+
+_INDEXER_KV_CACHE_FALLBACK_LOGGED: set[tuple[str, str]] = set()
+_INDEXER_KV_CACHE_INFO_LOGGED: set[tuple[str, str, str, tuple[int, ...]]] = set()
+
+
+def _warn_indexer_kv_cache_fallback_once(mode: str, reason: str) -> None:
+    key = (mode, reason)
+    if key in _INDEXER_KV_CACHE_FALLBACK_LOGGED:
+        return
+    _INDEXER_KV_CACHE_FALLBACK_LOGGED.add(key)
+    logger.warning(
+        "VLLM_TPU_INDEXER_KV_CACHE_MODE=%r falling back to 'xla': %s",
+        mode,
+        reason,
+    )
+
+
+def _log_indexer_kv_cache_once(
+    mode: str,
+    writer: str,
+    kv_layout: KVLayout,
+    cache_shape: tuple[int, ...],
+) -> None:
+    layout_tag = "SAL" if kv_layout == KVLayout.SEQ_ALONG_LANE else "HAS"
+    shape_tuple = tuple(int(d) for d in cache_shape)
+    key = (mode, writer, layout_tag, shape_tuple)
+    if key in _INDEXER_KV_CACHE_INFO_LOGGED:
+        return
+    _INDEXER_KV_CACHE_INFO_LOGGED.add(key)
+    logger.info(
+        "indexer kv cache: mode=%s writer=%s layout=%s cache_shape=%s",
+        mode,
+        writer,
+        layout_tag,
+        shape_tuple,
+    )
+
+
+def _unsupported_indexer_kv_cache_reason(
+    cache_kv: jax.Array,
+    k_packed: jax.Array,
+    kv_layout: KVLayout,
+) -> str | None:
+    """Returns a human-readable reason if `cache_kv`/`k_packed` cannot use Pallas."""
+    backend = jax.default_backend()
+    if backend != "tpu":
+        return f"backend={backend!r} is not 'tpu'"
+    try:
+        kv_cache_append.check_scatter_rows_supported(cache_kv, k_packed, kv_layout)
+    except ValueError as exc:
+        return str(exc)
+    return None
+
+
+def _resolve_indexer_kv_cache_mode(
+    cache_kv: jax.Array,
+    k_packed: jax.Array,
+    *,
+    mode: str | None = None,
+) -> tuple[str, KVLayout]:
+    """Resolves the indexer K-cache `(writer, kv_layout)` for `cache_kv` and `k_packed`.
+
+    Layout is decided once by `indexer_kv_layout(block_size, mode=...)` and
+    validated against `get_kv_cache_shape`. `writer` is `'pallas'` for `'has'`
+    and `'sal'`, or `'xla'` for `'xla'`. XLA fallback is only permitted when
+    `kv_layout == KVLayout.HEAD_ALONG_SUBLANE`; `SEQ_ALONG_LANE` on a non-TPU
+    backend or unsupported geometry raises `ValueError`.
+    """
+    raw_mode = envs.VLLM_TPU_INDEXER_KV_CACHE_MODE if mode is None else mode
+    resolved = raw_mode.strip().lower()
+    if resolved not in ("xla", "has", "sal"):
+        raise ValueError(
+            f"Invalid VLLM_TPU_INDEXER_KV_CACHE_MODE={raw_mode!r}; "
+            "expected one of ('xla', 'has', 'sal')."
+        )
+    if cache_kv.ndim != 4:
+        raise ValueError(
+            f"Expected 4-D cache_kv, got {cache_kv.ndim}-D shape {cache_kv.shape}."
+        )
+    if k_packed.ndim != 2:
+        raise ValueError(
+            f"Expected 2-D k_packed, got {k_packed.ndim}-D shape {k_packed.shape}."
+        )
+
+    raw_width = int(k_packed.shape[-1])
+    actual_head_dim = (
+        raw_width - max(1, raw_width // 128) if raw_width % 64 != 0 else raw_width
+    )
+    sal_sublane_groups = ((actual_head_dim + 127) // 128) * 128 // 4 + 1
+    block_size = (
+        int(cache_kv.shape[3])
+        if int(cache_kv.shape[1]) == sal_sublane_groups
+        else int(cache_kv.shape[1]) * 4
+    )
+    kv_layout = indexer_kv_layout(block_size, mode=mode)
+    effective_mode = (
+        "has"
+        if resolved == "sal" and kv_layout == KVLayout.HEAD_ALONG_SUBLANE
+        else resolved
+    )
+    expected_shape = get_kv_cache_shape(
+        int(cache_kv.shape[0]),
+        block_size,
+        actual_head_dim,
+        kv_layout,
+    )
+    if tuple(int(d) for d in cache_kv.shape) != expected_shape:
+        raise ValueError(
+            f"cache_kv shape {tuple(cache_kv.shape)} does not match expected "
+            f"{kv_layout.name} shape {expected_shape} for "
+            f"VLLM_TPU_INDEXER_KV_CACHE_MODE={resolved!r}."
+        )
+
+    if effective_mode == "xla":
+        _log_indexer_kv_cache_once(effective_mode, "xla", kv_layout, cache_kv.shape)
+        return "xla", kv_layout
+
+    reason = _unsupported_indexer_kv_cache_reason(cache_kv, k_packed, kv_layout)
+    if reason is not None:
+        if kv_layout == KVLayout.SEQ_ALONG_LANE:
+            raise ValueError(
+                f"VLLM_TPU_INDEXER_KV_CACHE_MODE={resolved!r} with layout "
+                f"{kv_layout.name} cannot fall back to 'xla': {reason}"
+            )
+        _warn_indexer_kv_cache_fallback_once(effective_mode, reason)
+        _log_indexer_kv_cache_once(effective_mode, "xla", kv_layout, cache_kv.shape)
+        return "xla", kv_layout
+
+    _log_indexer_kv_cache_once(effective_mode, "pallas", kv_layout, cache_kv.shape)
+    return "pallas", kv_layout
+
+
+def _topk_rows_update_jax(buf: jax.Array, rows: jax.Array) -> jax.Array:
+    """`buf[:rows.shape[0]] = rows` as one row update of a donated buffer."""
+    return jax.lax.dynamic_update_slice(buf, rows.astype(buf.dtype), (0, 0))
+
+
+# The shared top-k table's row update, donating the table.
+#
+# `buf[:n] = rows` on the module buffer reaches XLA as a graph input that is
+# mutated but not donated -- aot_autograd returns the new value and writes it
+# back after the graph -- plus a view write lowered as two row updates of the
+# same base. Both force a full `[max_num_batched_tokens, width]` copy of the
+# table in every indexed layer. Routing the write through a donating op with a
+# `copy_` writeback (the KV-cache pattern) marks the table a buffer donor, so
+# XLA updates it in place. Built at import, not lazily: dynamo cannot trace the
+# op's construction from inside a compiled forward.
+_TOPK_ROWS_UPDATE_OP = pallas.jax_op(
+    "pallas::indexer_topk_rows_update", _topk_rows_update_jax, donate_argnums=(0,)
+)
+
+
+# torch.compile traces the forward with fake tensors (shape and dtype, no data),
+# so it can't run the JAX function to learn what this op returns. This fake
+# tells it: a tensor shaped like `buf`, i.e. the whole updated table, which the
+# caller copies back into `buf`. The real `_topk_rows_update_jax` runs only
+# when the compiled graph executes.
+def _fake_topk_rows_update(buf: torch.Tensor, rows: torch.Tensor) -> torch.Tensor:
+    del rows
+    return torch.empty_like(buf)
+
+
+_TOPK_ROWS_UPDATE_OP.register_fake(_fake_topk_rows_update)
+
+
+def _topk_rows(
+    buf: torch.Tensor, topk_tokens: int, num_tokens: int, topk_indices: torch.Tensor
+) -> torch.Tensor:
+    """The `[num_tokens, buf.shape[1]]` rows the -1 fill plus partial write
+    would leave at the top of `buf`: the top-k, then -1, clamped to `buf`.
+
+    The top-k kernels return one row per query token, so only the columns
+    ever need -1 padding.
+    """
+    num_tokens = min(num_tokens, buf.shape[0])
+    rows = topk_indices[:num_tokens, :topk_tokens].to(buf.dtype)
+    assert rows.shape[0] == num_tokens, (rows.shape, num_tokens)
+    pad_cols = buf.shape[1] - rows.shape[1]
+    if pad_cols:
+        rows = torch.nn.functional.pad(rows, (0, pad_cols), value=-1)
+    return rows
 
 
 def _cp_scatter_indexer_k(
@@ -80,6 +274,8 @@ def _cp_scatter_indexer_k(
     cp_size: int,
     interleave_size: int,
     axis_name: str = DCP_AXIS_NAME,
+    writer: str = "xla",
+    kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
 ) -> jax.Array:
     """Scatter this step's indexer K rows into the DCP-sharded K cache.
 
@@ -96,9 +292,28 @@ def _cp_scatter_indexer_k(
 
     `axis_name`/`cp_size` name the axis the cache is split over.
     """
+    if writer not in ("xla", "pallas"):
+        raise ValueError(f"Expected writer in ('xla', 'pallas'), got {writer!r}.")
+    if writer == "xla" and kv_layout != KVLayout.HEAD_ALONG_SUBLANE:
+        raise ValueError(
+            f"writer='xla' only supports HEAD_ALONG_SUBLANE, got {kv_layout}."
+        )
 
     def _local(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens):
         rank = cp_rank_as_data(axis_name, cp_size)
+        if writer == "pallas":
+            return coalesced_kv_append_dcp(
+                cache_kv,
+                k_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                rank,
+                dcp_size=cp_size,
+                interleave_size=interleave_size,
+                kv_layout=kv_layout,
+            )
+
         _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
         page_size = block_size_per_kv_packing * kv_packing
         # The latent cache is guarded on its own page size in
@@ -180,6 +395,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                     "whichever axis it is given and has no layout for two at "
                     "once."
                 )
+            assert parallel_config is not None
             self.topk_op_dcp = self._build_streamidx_dcp_op(
                 dcp_size, parallel_config.cp_kv_cache_interleave_size
             )
@@ -189,6 +405,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # None means unchunked. The kernel falls back to a single unpipelined
         # pass when `max_num_tokens` is not a multiple of the chunk.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+        kv_cache_mode = (
+            envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
+            if envs.is_indexer_kv_cache_mode_explicit()
+            else None
+        )
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -202,28 +423,45 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             cu_q_lens: jax.Array,  # i32 [num_seqs + 1]
             distribution: jax.Array,  # i32 [3]
         ) -> tuple[jax.Array, jax.Array]:
-            _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
-            block_size = block_size_per_kv_packing * kv_packing
-            # Cache rows are padded to the 128-lane HBM width; pad the packed
-            # fp8+scale rows to match before scattering.
-            k_packed = jnp.pad(k_packed, ((0, 0), (0, lkv_dim - k_packed.shape[-1])))
+            writer, kv_layout = _resolve_indexer_kv_cache_mode(
+                cache_kv, k_packed, mode=kv_cache_mode
+            )
+            if writer == "xla":
+                _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
+                block_size = block_size_per_kv_packing * kv_packing
+                # Cache rows are padded to the 128-lane HBM width; pad the packed
+                # fp8+scale rows to match before scattering.
+                k_packed = jnp.pad(
+                    k_packed, ((0, 0), (0, lkv_dim - k_packed.shape[-1]))
+                )
 
-            # Insert this step's K rows into the KV cache.
-            tok = jnp.arange(k_packed.shape[0], dtype=jnp.int32)
-            seq_id = jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(
-                jnp.int32
-            )
-            q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
-            pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
-            page = jnp.where(
-                tok < cu_q_lens[-1],
-                page_indices.reshape(seq_lens.shape[0], -1)[seq_id, pos // block_size],
-                jnp.int32(2**30),
-            )
-            slot = pos % block_size
-            cache_kv = cache_kv.at[page, slot // kv_packing, slot % kv_packing].set(
-                k_packed
-            )
+                # Insert this step's K rows into the KV cache.
+                tok = jnp.arange(k_packed.shape[0], dtype=jnp.int32)
+                seq_id = jnp.searchsorted(cu_q_lens[1:], tok, side="right").astype(
+                    jnp.int32
+                )
+                q_len = cu_q_lens[seq_id + 1] - cu_q_lens[seq_id]
+                pos = seq_lens[seq_id] - q_len + (tok - cu_q_lens[seq_id])
+                page = jnp.where(
+                    tok < cu_q_lens[-1],
+                    page_indices.reshape(seq_lens.shape[0], -1)[
+                        seq_id, pos // block_size
+                    ],
+                    jnp.int32(2**30),
+                )
+                slot = pos % block_size
+                cache_kv = cache_kv.at[page, slot // kv_packing, slot % kv_packing].set(
+                    k_packed
+                )
+            else:
+                cache_kv = coalesced_kv_append(
+                    cache_kv,
+                    k_packed,
+                    seq_lens,
+                    page_indices,
+                    cu_q_lens,
+                    kv_layout=kv_layout,
+                )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
             topk_indices = streamindex_topk(
@@ -241,6 +479,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 num_kv_pages_per_block=(2, 2, 2),
                 num_queries_per_block=(1, 128, 128),
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
+                kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
             )
             return cache_kv, topk_indices
@@ -276,6 +515,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # Chunking cuts the replicated query-token axis, which is orthogonal to
         # the KV axis DCP shards, so the same knob applies here unchanged.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+        kv_cache_mode = (
+            envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
+            if envs.is_indexer_kv_cache_mode_explicit()
+            else None
+        )
 
         def _streamidx_topk_dcp_jax(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
@@ -287,8 +531,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             cu_q_lens: jax.Array,
             distribution: jax.Array,
         ) -> tuple[jax.Array, jax.Array]:
+            writer, kv_layout = _resolve_indexer_kv_cache_mode(
+                cache_kv, k_packed, mode=kv_cache_mode
+            )
             # `_cp_scatter_indexer_k` pads the packed fp8+scale rows out to
-            # the cache's 128-lane width itself.
+            # the cache's record width itself.
             cache_kv = _cp_scatter_indexer_k(
                 cache_kv,
                 k_packed,
@@ -299,6 +546,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 cp_size=dcp_size,
                 interleave_size=interleave_size,
                 axis_name=DCP_AXIS_NAME,
+                writer=writer,
+                kv_layout=kv_layout,
             )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
@@ -317,6 +566,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 interleave_size=interleave_size,
                 num_kv_pages_per_block=(2, 2, 2),
                 num_queries_per_block=(1, 128, 128),
+                kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
             )
             return cache_kv, local_topk
@@ -454,12 +704,24 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 distribution,
             )
 
-        self.topk_indices_buffer[: hidden_states.shape[0]] = -1
-        num_out = min(topk_indices.shape[0], self.topk_indices_buffer.shape[0])
-        # Both branches return `topk_tokens`-wide rows.
-        topk = self.topk_tokens
-        self.topk_indices_buffer[:num_out, :topk] = topk_indices[:num_out]
-        return self.topk_indices_buffer
+        return self._write_topk_rows(hidden_states.shape[0], topk_indices)
+
+    def _write_topk_rows(
+        self, num_tokens: int, topk_indices: torch.Tensor
+    ) -> torch.Tensor:
+        """The rows the -1 fill plus partial write would leave, in one update.
+
+        Writes the `_topk_rows` with a single row update through a donating op
+        (see `_TOPK_ROWS_UPDATE_OP`), so XLA updates the table in place: same
+        contents, no full-table copy per indexed layer. Returns those rows
+        rather than the buffer, so attention reads them instead of a whole
+        `[max_num_batched_tokens, width]` buffer version. The buffer still gets
+        the same contents for the layers that reuse it.
+        """
+        buf = self.topk_indices_buffer
+        rows = _topk_rows(buf, self.topk_tokens, num_tokens, topk_indices)
+        buf.copy_(_TOPK_ROWS_UPDATE_OP(buf, rows))
+        return rows
 
 
 class VllmTPUIndexerCache(DeepseekV32IndexerCache):
@@ -498,7 +760,7 @@ class VllmTPUIndexer(Indexer):
         indexer.k_cache.head_dim = (
             indexer.head_dim + indexer.head_dim // indexer.quant_block_size
         )
-        return indexer
+        return cast("VllmTPUIndexer", indexer)
 
     def forward(
         self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
@@ -583,6 +845,7 @@ class VllmTPUMLAAttention(MLAAttention):
         dcp_q_replicate: bool = False,
         use_sparse: bool = False,
         indexer: object | None = None,
+        topk_indices_buffer: torch.Tensor | None = None,
         **extra_impl_args,
     ):
         torch.nn.Module.__init__(self)
@@ -632,6 +895,9 @@ class VllmTPUMLAAttention(MLAAttention):
         # process_weights_after_loading gathers W_UK_T on the flag too, and
         # this class does that itself once the weight is on device.
         self.dcp_q_replicate = dcp_q_replicate
+        # The shared top-k table. A layer that reuses an earlier layer's
+        # indices has no indexer, so this is where its top-k width is stated.
+        self.topk_indices_buffer = topk_indices_buffer
 
         # For compatibility reasons.
         self.prefix = prefix
@@ -654,8 +920,9 @@ class VllmTPUMLAAttention(MLAAttention):
         # lines below once `W_UK_T`/`W_UV` are extracted, and it never runs a
         # forward pass, so this view is the only consumer either way.
         flipped = getattr(self.kv_b_proj, WEIGHT_FLIPPED_ATTR, False)
+        kv_b_weight = None
         if flipped:
-            kv_b_weight = self.kv_b_proj.weight
+            kv_b_weight = cast(torch.Tensor, self.kv_b_proj.weight)
             self.kv_b_proj.weight = Parameter(
                 kv_b_weight.transpose(0, 1).contiguous(), requires_grad=False
             )
@@ -663,6 +930,7 @@ class VllmTPUMLAAttention(MLAAttention):
             super().process_weights_after_loading(act_dtype)
         finally:
             if flipped:
+                assert kv_b_weight is not None
                 self.kv_b_proj.weight = Parameter(kv_b_weight, requires_grad=False)
 
         device = torch.device("tpu")
@@ -735,17 +1003,18 @@ class VllmTPUMLAAttention(MLAAttention):
             )
             synchronize_tensors(tensors)
 
-        q_scale, k_scale, v_scale = self.impl._get_kv_scales(self)
-        self.mla_op = self.impl._build_mla_op(
+        impl = cast(PallasMLAttentionBackendImpl, self.impl)
+        q_scale, k_scale, v_scale = impl._get_kv_scales(self)
+        self.mla_op = impl._build_mla_op(
             self, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
         )
-        self.sparse_mla_op = self.impl._build_sparse_mla_op(self)
+        self.sparse_mla_op = impl._build_sparse_mla_op(self)
 
-        dcp_size = getattr(self.impl, "dcp_size", 1)
+        dcp_size = getattr(impl, "dcp_size", 1)
         self.sparse_mla_dcp_op = None
         if dcp_size > 1:
-            self.sparse_mla_dcp_op = self.impl._build_sparse_mla_dcp_op(
-                self, dcp_size, self.impl.dcp_interleave_size
+            self.sparse_mla_dcp_op = impl._build_sparse_mla_dcp_op(
+                self, dcp_size, impl.dcp_interleave_size
             )
 
     def forward(
@@ -758,7 +1027,7 @@ class VllmTPUMLAAttention(MLAAttention):
     ) -> torch.Tensor:
         attn_metadata, _, kv_cache, _ = get_attention_context(self.layer_name)
 
-        return self.impl.forward(
+        return cast(PallasMLAttentionBackendImpl, self.impl).forward(
             layer=self,
             q=q,
             kv_c_normed=kv_c_normed,
@@ -831,7 +1100,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # including `DeepseekV2MLAAttention.indexer`.
         indexer = mla_modules.indexer
         if indexer is not None:
-            indexer = VllmTPUIndexer.rebind(indexer)
+            indexer = VllmTPUIndexer.rebind(cast(Indexer, indexer))
         self.indexer = indexer
         self.indexer_rope_emb = mla_modules.indexer_rotary_emb
         self.is_sparse = mla_modules.is_sparse
@@ -861,10 +1130,11 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             cache_config=cache_config,
             quant_config=quant_config,
             prefix=f"{prefix}.attn",
-            kv_b_proj=self.kv_b_proj,
+            kv_b_proj=cast(ColumnParallelLinear, self.kv_b_proj),
             dcp_q_replicate=self.dcp_q_replicate and self.is_sparse,
             use_sparse=self.is_sparse,
             indexer=self.indexer,
+            topk_indices_buffer=self.topk_indices_buffer,
             non_causal_multi_token_decode=non_causal_multi_token_decode,
         )
 
@@ -876,6 +1146,8 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
 
     def process_weights_after_loading(self, act_dtype: torch.dtype):
         if hasattr(super(), "process_weights_after_loading"):
+            # torch's stubs resolve this hasattr-guarded method as a Tensor.
+            # pyrefly: ignore[not-callable]
             super().process_weights_after_loading(act_dtype)
         if self.rotary_emb is not None and hasattr(self.rotary_emb, "cos_sin_cache"):
             device = torch.device("tpu")
@@ -893,6 +1165,9 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         output_gate = None
 
         if self.kimi_preprocess is not None:
+            assert self.fused_qkv_a_proj is not None
+            assert self.q_a_layernorm is not None
+            assert self.q_b_proj is not None
             q_c, kv_c_normed, k_pe, output_gate = self.kimi_preprocess(
                 hidden_states,
                 self.fused_qkv_a_proj.weight,
@@ -902,45 +1177,46 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                 prefill_group is not None,
             )
             q = self.q_b_proj(q_c)[0]
-        elif self.q_lora_rank is not None:
-            assert self.fused_qkv_a_proj is not None, (
-                "fused_qkv_a_proj is required when q_lora_rank is not None"
-            )
-            assert self.q_a_layernorm is not None, (
-                "q_a_layernorm is required when q_lora_rank is not None"
-            )
-            assert self.q_b_proj is not None, (
-                "q_b_proj is required when q_lora_rank is not None"
-            )
-
-            qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
-            if self.gate_is_fused:
-                q_c, kv_lora, output_gate = qkv_lora.split(
-                    [
-                        self.q_lora_rank,
-                        self.kv_lora_rank + self.qk_rope_head_dim,
-                        self.num_heads * self.v_head_dim,
-                    ],
-                    dim=-1,
-                )
-            else:
-                q_c, kv_lora = qkv_lora.split(
-                    [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
-                    dim=-1,
-                )
-            q_c = self.q_a_layernorm(q_c)
-            q = self.q_b_proj(q_c)[0]
         else:
-            assert self.kv_a_proj_with_mqa is not None, (
-                "kv_a_proj_with_mqa is required when q_lora_rank is None"
-            )
-            assert self.q_proj is not None, (
-                "q_proj is required when q_lora_rank is None"
-            )
-            kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
-            q = self.q_proj(hidden_states)[0]
+            if self.q_lora_rank is not None:
+                assert self.fused_qkv_a_proj is not None, (
+                    "fused_qkv_a_proj is required when q_lora_rank is not None"
+                )
+                assert self.q_a_layernorm is not None, (
+                    "q_a_layernorm is required when q_lora_rank is not None"
+                )
+                assert self.q_b_proj is not None, (
+                    "q_b_proj is required when q_lora_rank is not None"
+                )
 
-        if self.kimi_preprocess is None:
+                qkv_lora = self.fused_qkv_a_proj(hidden_states)[0]
+                if self.gate_is_fused:
+                    q_c, kv_lora, output_gate = qkv_lora.split(
+                        [
+                            self.q_lora_rank,
+                            self.kv_lora_rank + self.qk_rope_head_dim,
+                            self.num_heads * self.v_head_dim,
+                        ],
+                        dim=-1,
+                    )
+                else:
+                    q_c, kv_lora = qkv_lora.split(
+                        [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim],
+                        dim=-1,
+                    )
+                q_c = self.q_a_layernorm(q_c)
+                q = self.q_b_proj(q_c)[0]
+            else:
+                assert self.kv_a_proj_with_mqa is not None, (
+                    "kv_a_proj_with_mqa is required when q_lora_rank is None"
+                )
+                assert self.q_proj is not None, (
+                    "q_proj is required when q_lora_rank is None"
+                )
+                kv_lora = self.kv_a_proj_with_mqa(hidden_states)[0]
+                q = self.q_proj(hidden_states)[0]
+
+            assert kv_lora is not None
             kv_c, k_pe = kv_lora.split(
                 [self.kv_lora_rank, self.qk_rope_head_dim], dim=-1
             )
@@ -973,6 +1249,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
             else:
                 # reuse the indices an earlier layer wrote into the shared buffer.
                 topk_index = self.topk_indices_buffer
+            assert topk_index is not None
             topk_indices = topk_index[: hidden_states.shape[0]]
 
             # print(f"top_k_indices.shape: {topk_indices.shape}, topk_indices: {topk_indices[0]}")  # noqa: E501
@@ -987,7 +1264,9 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         if self.dcp_q_replicate:
             if self.is_sparse:
                 q_dcp_replicated = (q_nope, q_pe)
-            local_view = self._q_proj_layer()._local_view
+            local_view = cast(
+                DCPGroupColumnParallelLinear, self._q_proj_layer()
+            )._local_view
             q_nope, q_pe = local_view(q_nope), local_view(q_pe)
 
         attn_out = self.mla_attn(
@@ -1025,9 +1304,6 @@ class VllmDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
         assert key is not None
         query_rot = query[..., : self.rotary_dim]
         key_rot = key[..., : self.rotary_dim]
-        if self.rotary_dim < self.head_size:
-            query_pass = query[..., self.rotary_dim :]
-            key_pass = key[..., self.rotary_dim :]
 
         pos = torch.add(positions, offsets) if offsets is not None else positions
         cos_sin = self.cos_sin_cache.index_select(0, pos)
@@ -1044,8 +1320,8 @@ class VllmDeepseekScalingRotaryEmbedding(DeepseekScalingRotaryEmbedding):
         key_rot = key_rot * cos + rotate_fn(key_rot) * sin
 
         if self.rotary_dim < self.head_size:
-            query = torch.cat((query_rot, query_pass), dim=-1)
-            key = torch.cat((key_rot, key_pass), dim=-1)
+            query = torch.cat((query_rot, query[..., self.rotary_dim :]), dim=-1)
+            key = torch.cat((key_rot, key[..., self.rotary_dim :]), dim=-1)
         else:
             query = query_rot
             key = key_rot

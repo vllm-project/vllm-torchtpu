@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 from torch import nn
 from vllm.config import VllmConfig
@@ -380,9 +382,12 @@ class MultiHeadLatentAttention(nn.Module):
             and getattr(projection, WEIGHT_FLIPPED_ATTR, False)
         ):
             return
+        assert self.q_a_layernorm is not None
         eps = self.q_a_layernorm.variance_epsilon
         if eps != self.kv_a_layernorm.variance_epsilon:
             raise ValueError("K3 MLA preprocessing requires matching norm epsilons")
+        # torch's Module.__setattr__ stub rejects a function as the value.
+        # pyrefly: ignore[bad-argument-type]
         pack, wrapper.kimi_preprocess = group.mla_ops(eps)
         with torch.no_grad():
             wrapper.kimi_gate_weight = pack(weight)
@@ -394,6 +399,7 @@ class MultiHeadLatentAttention(nn.Module):
         sequence_parallel: bool = False,
     ) -> torch.Tensor:
         group = self.prefill_group if sequence_parallel else get_tp_group()
+        assert group is not None
         if (
             sequence_parallel
             and getattr(self.mla_attn, "kimi_preprocess", None) is None
@@ -655,6 +661,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             return
         projections = (self.fused_qkvb_proj, self.g_proj, self.f_a_proj)
         expected = ((7168, 1155), (7168, 384), (7168, 128))
+        weights = []
         for projection, shape in zip(projections, expected):
             weight = getattr(projection, "weight", None)
             if (
@@ -664,8 +671,9 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 or not getattr(projection, WEIGHT_FLIPPED_ATTR, False)
             ):
                 return
+            weights.append(weight)
         # q/k/v occupy 1152 columns; pad the 3 beta columns to an MXU tile.
-        qkvb, gate, fa = (p.weight for p in projections)
+        qkvb, gate, fa = weights
         with torch.no_grad():
             packed = torch.cat((qkvb, qkvb.new_zeros((7168, 125)), gate, fa), dim=-1)
             # Materialize the layout once, avoiding a lazy cat at every call.
@@ -680,6 +688,9 @@ class KimiDeltaAttention(nn.Module, MambaBase):
     ) -> torch.Tensor:
         del positions
         group = self.prefill_group if sequence_parallel else get_tp_group()
+        assert group is not None
+        # Set and read only on the low-rank gate path.
+        gate_input: torch.Tensor | None = None
         if self.packed_prefill_weight is not None:
             # Every token bucket must capture the same parameter list: the
             # serving compiler hands executables between traces by input ABI.
@@ -756,12 +767,12 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 self.A_log,
                 self.dt_bias,
                 self.o_norm.weight,
-                metadata.query_start_loc,
-                metadata.mamba_state_indices,
-                metadata.seq_lens,
-                metadata.request_distribution,
-                window_distribution,
-                slot_read_offsets,
+                cast(torch.Tensor, metadata.query_start_loc),
+                cast(torch.Tensor, metadata.mamba_state_indices),
+                cast(torch.Tensor, metadata.seq_lens),
+                cast(torch.Tensor, metadata.request_distribution),
+                cast(torch.Tensor, window_distribution),
+                cast(torch.Tensor, slot_read_offsets),
             ).flatten(1)
 
         if sequence_parallel and isinstance(group, FusedPrefillCollectives):
@@ -809,8 +820,8 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             self.A_log,
             self.dt_bias,
             self.o_norm.weight,
-            metadata.query_start_loc,
-            state_indices,
-            metadata.seq_lens,
-            metadata.request_distribution,
+            cast(torch.Tensor, metadata.query_start_loc),
+            cast(torch.Tensor, state_indices),
+            cast(torch.Tensor, metadata.seq_lens),
+            cast(torch.Tensor, metadata.request_distribution),
         )

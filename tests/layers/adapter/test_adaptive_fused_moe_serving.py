@@ -7,13 +7,13 @@ from unittest.mock import Mock
 import pytest
 import torch
 from jax.experimental.pallas import tpu as pltpu
+from vllm.model_executor.layers.fused_moe.runner import moe_runner as mr
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import vllm_adapter as bridge
 from vllm_torchtpu.layers.adapter import fused_moe_ep as legacy
+from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
 from vllm_torchtpu.layers.adapter.quantization import fp8, nvfp4
-
-pytestmark = pytest.mark.cpu_test
 
 
 @pytest.mark.parametrize(
@@ -216,30 +216,28 @@ def test_admission_failure_never_falls_back(setup, monkeypatch, fp4, failure):
 
 @pytest.mark.parametrize("armed", [False, True])
 def test_adaptive_runner_owns_reduction_and_pcp(monkeypatch, armed):
-    from vllm.model_executor.layers.fused_moe.runner import moe_runner as mr
-
-    import vllm_torchtpu
-
-    class Runner:
-        _fused_output_is_reduced = property(lambda self: False)
-
-        def _maybe_dispatch(self, x, gate):
-            return "outer_dispatch", gate
-
-        def _maybe_combine(self, shared, x):
-            return shared, "outer_combine"
-
-    monkeypatch.setattr(mr, "MoERunner", Runner)
+    # Stand-ins for upstream's outer PCP collectives, so the test can see
+    # whether VllmMoERunner deferred to them.
+    monkeypatch.setattr(
+        mr.MoERunner, "_maybe_dispatch", lambda self, x, gate: ("outer_dispatch", gate)
+    )
+    monkeypatch.setattr(
+        mr.MoERunner,
+        "_maybe_combine",
+        lambda self, shared, x: (shared, "outer_combine"),
+    )
     monkeypatch.setenv("MOE_FUSED_EP_KERNEL_IMPL", "adaptive")
     monkeypatch.setenv("USE_MOE_FUSED_EP_KERNEL", "0")
-    vllm_torchtpu._patch_moe_runner_fused_output_is_reduced()
-    vllm_torchtpu._patch_moe_explicit_pcp_collectives()
-    runner = Runner()
-    runner.shared_experts = object()
-    runner.moe_config = SimpleNamespace(pcp_size=8, skip_final_all_reduce=False)
-    runner._quant_method = SimpleNamespace()
+    # moe_kernel=None makes upstream's own answer False, so True can only come
+    # from the adaptive op being armed on this layer.
+    quant_method = SimpleNamespace(moe_kernel=None)
     if armed:
-        setattr(runner._quant_method, bridge.FUSED_MOE_EP_OP_ATTR, object())
+        setattr(quant_method, bridge.FUSED_MOE_EP_OP_ATTR, object())
+    runner = VllmMoERunner.__new__(VllmMoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.routed_experts = SimpleNamespace(quant_method=quant_method)
+    runner._shared_experts = object()
+    runner.moe_config = SimpleNamespace(pcp_size=8, skip_final_all_reduce=False)
     assert runner._fused_output_is_reduced is armed
     assert runner._maybe_dispatch("x", "gate") == (
         ("x", "gate") if armed else ("outer_dispatch", "gate")

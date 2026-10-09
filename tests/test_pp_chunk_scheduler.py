@@ -208,11 +208,12 @@ def test_the_step_limit_spreads_the_pending_prefill_over_the_stages():
         scheduler.schedule()
     # 32K over 8 stages: 4K steps.
     assert scheduler._step_limit == 4096
-    # 8K left of a prompt: one granule per stage is the floor.
+    # 8K left of a prompt: 2K steps pad to the 4K bucket and take as long
+    # as 4K ones, so two 4K steps finish sooner than four.
     scheduler = _scheduler(cost=model, running=[_request(24576, 32768)])
     with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
         scheduler.schedule()
-    assert scheduler._step_limit == 2048
+    assert scheduler._step_limit == 4096
     # Waiting requests count; enough work keeps full steps.
     waiting = [_request(0, 65536, f"w{i}") for i in range(4)]
     scheduler = _scheduler(cost=model, running=lone, waiting=waiting)
@@ -229,6 +230,27 @@ def test_the_step_limit_spreads_the_pending_prefill_over_the_stages():
     with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
         scheduler.schedule()
     assert scheduler._step_limit is None
+
+
+def test_the_step_limit_keeps_a_prompt_whole_when_halves_are_no_faster():
+    # A 4K step costs more than an 8K one: a lone 8K prompt on 4 stages
+    # leaves sooner as one step (4 steps of 109 ms) than as two (5 of 118).
+    buckets = [4096, 8192, 12288, 16384]
+    linear = {4096: 118.0, 8192: 109.0, 12288: 133.0, 16384: 164.0}
+    model = StepCostModel(buckets, linear, 3.3e-8, 330.0, 4096)
+    scheduler = _scheduler(cost=model, running=[_request(0, 8192)])
+    scheduler._pp_size = 4
+    with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+        scheduler.schedule()
+        assert scheduler._step_limit == 8192
+        # Two such prompts: one each per step, not both in one.
+        scheduler.waiting = [_request(0, 8192, "w")]
+        scheduler.schedule()
+        assert scheduler._step_limit == 8192
+        # Four: still one prompt per step, all four stages busy.
+        scheduler.waiting = [_request(0, 8192, f"w{i}") for i in range(3)]
+        scheduler.schedule()
+        assert scheduler._step_limit == 8192
 
 
 def test_schedule_resets_the_step_accounting():
@@ -333,3 +355,24 @@ def test_engine_core_patch_is_skipped_without_dynamic_chunks(monkeypatch):
     monkeypatch.setattr(engine_core, "EngineCore", FakeCore)
     patch_engine_core_for_pp_chunks(_config(cls=None))
     assert not hasattr(FakeCore, "_tpu_pp_chunks_patch")
+
+
+def test_the_step_estimate_prices_the_step_the_cost_model_sees():
+    cost = _model()
+    scheduler = _scheduler(cost=cost)
+    # schedule() has already counted the step's tokens as computed
+    scheduler.requests = {
+        "a": _request(12288, 32768, "a"),
+        "d": _request(8193, 8192, "d", num_tokens=8193),
+    }
+    step = SimpleNamespace(
+        num_scheduled_tokens={"a": 4096, "d": 1, "gone": 7},
+        total_num_scheduled_tokens=4104,
+    )
+    pairs = 4096 * 8192 + 1 * 8192
+    squares = 4096**2 + 1 + 49
+    assert scheduler.step_estimate_ms(step) == cost.step_ms(8192, pairs, squares)
+    # past the largest bucket the step is priced at that bucket
+    step.total_num_scheduled_tokens = 20000
+    assert scheduler.step_estimate_ms(step) == cost.step_ms(16384, pairs, squares)
+    assert _scheduler().step_estimate_ms(step) is None

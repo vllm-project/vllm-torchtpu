@@ -28,10 +28,6 @@ set -euo pipefail
 # ---------------------------------------------------------------------------
 # Bootstrap environment & credentials
 # ---------------------------------------------------------------------------
-if ! grep -q "^HF_TOKEN=" /etc/environment 2>/dev/null; then
-  gcloud secrets versions access latest --secret=bm-agent-hf-token --quiet | \
-  sudo tee -a /etc/environment > /dev/null <<< "HF_TOKEN=$(cat)" || true
-fi
 if [ -f /etc/environment ]; then
   # shellcheck disable=SC1091
   source /etc/environment || true
@@ -207,7 +203,7 @@ CONTAINER_ENV_COMMON=(
   -e HF_TOKEN="${HF_TOKEN:-}"
   -e FORCE_COLOR="1"
   -e TQDM_MININTERVAL="30"
-  -e SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU="0.0.0"
+  -e SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU_CORE="0.0.0"
   -e TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL="${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL:-1}"
   -e PREFILL_HOST="${HEAD_INTERNAL_IP}"
   -e DECODE_HOST="${WORKER_IP}"
@@ -222,10 +218,15 @@ CONTAINER_ENV_COMMON=(
   -e DECODE_CTRL_PORT="${DECODE_CTRL_PORT:-28000}"
   -e PREFILL_TPU_KV_TRANSFER_PORT="${PREFILL_TPU_KV_TRANSFER_PORT:-9100}"
   -e DECODE_TPU_KV_TRANSFER_PORT="${DECODE_TPU_KV_TRANSFER_PORT:-9200}"
-  -e TPU_RAIDEN_TRANSFER_PARALLELISM="${TPU_RAIDEN_TRANSFER_PARALLELISM:-${PREFILL_PCP:-8}}"
+  -e TPU_RAIDEN_TRANSFER_PARALLELISM="${TPU_RAIDEN_TRANSFER_PARALLELISM:-$(( ${PREFILL_PCP:-8} * ${PREFILL_TP:-1} ))}"
   -e PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE="${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE:-128}"
   -e STARTUP_TIMEOUT_S="${STARTUP_TIMEOUT_S:-900}"
   -e RUN_ROOT="${DISAGG_RUN_ROOT}"
+  ${DECODE_DCP:+-e DECODE_DCP="${DECODE_DCP}"}
+  ${TPU_RAIDEN_DST_SHARDS:+-e TPU_RAIDEN_DST_SHARDS="${TPU_RAIDEN_DST_SHARDS}"}
+  ${VLLM_KV_CACHE_LAYOUT:+-e VLLM_KV_CACHE_LAYOUT="${VLLM_KV_CACHE_LAYOUT}"}
+  ${PREFILL_BLOCK_SIZE:+-e PREFILL_BLOCK_SIZE="${PREFILL_BLOCK_SIZE}"}
+  ${DECODE_BLOCK_SIZE:+-e DECODE_BLOCK_SIZE="${DECODE_BLOCK_SIZE}"}
   ${PREFILL_DP:+-e PREFILL_DP="${PREFILL_DP}"}
   ${ENABLE_PREFIX_CACHING:+-e ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING}"}
   ${ASYNC_SCHEDULING:+-e ASYNC_SCHEDULING="${ASYNC_SCHEDULING}"}
@@ -253,7 +254,7 @@ echo "--- Starting disagg-worker (ROLE=decode) on ${WORKER_IP}"
 ssh_retry "${SSH_USER}@${WORKER_IP}" "gcloud auth configure-docker us-central1-docker.pkg.dev --quiet >/dev/null 2>&1 || true; docker pull ${IMAGE_TAG} || true"
 
 # shellcheck disable=SC2029
-ssh_retry "${SSH_USER}@${WORKER_IP}" "docker run -d --name disagg-worker --privileged --net=host --shm-size=128g --device /dev/fuse -w /root/torchtpu-vllm -v \${HOME}/hf_home:/root/.cache/huggingface -v \${HOME}/persist/perf_eval_results:/perf_eval_results -e ROLE=decode ${CONTAINER_ENV_COMMON[*]} ${IMAGE_TAG} bash -c 'umask 000; rm -rf /perf_eval_results/*; bash ${DISAGG_SCRIPT}'"
+ssh_retry "${SSH_USER}@${WORKER_IP}" "docker run -d --name disagg-worker --privileged --net=host --shm-size=128g --device /dev/fuse -w /workspace/vllm-torchtpu -v \${HOME}/hf_home:/root/.cache/huggingface -v \${HOME}/persist/perf_eval_results:/perf_eval_results -e ROLE=decode ${CONTAINER_ENV_COMMON[*]} ${IMAGE_TAG} bash -c 'umask 000; rm -rf /perf_eval_results/*; bash ${DISAGG_SCRIPT}'"
 
 # ---------------------------------------------------------------------------
 # Start Head container (ROLE=head)
@@ -263,7 +264,7 @@ docker pull "${IMAGE_TAG}" || true
 
 set +e
 docker run --name disagg-head --privileged --net=host --shm-size=128g --device /dev/fuse \
-  -w /root/torchtpu-vllm \
+  -w /workspace/vllm-torchtpu \
   -v "${HOST_HF_HOME}:/root/.cache/huggingface" \
   -v "${PERSIST_ROOT}/perf_eval_results:/perf_eval_results" \
   -e ROLE=head \

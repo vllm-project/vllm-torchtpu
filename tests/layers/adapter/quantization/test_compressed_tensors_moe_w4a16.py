@@ -164,17 +164,17 @@ class FakeRoutedExperts(RoutedExperts):
 class TestW4MoEUpstreamHooks:
     """Inherited hooks must not read state the skipped __init__ never set."""
 
-    def test_hooks_do_not_need_upstream_backend(self):
-        # vLLM calls get_fused_moe_quant_config on the first forward pass. Since
-        # v0.29 the inherited version reads self.wna16_backend, which only the
-        # upstream __init__ sets, and Kimi-K2.6 died there at engine start.
+    def test_eplb_hook_does_not_need_upstream_backend(self):
+        # RoutedExperts.__init__ reads supports_eplb when EPLB is enabled, and
+        # the inherited version reads self.wna16_backend, which only the
+        # upstream __init__ sets. get_fused_moe_quant_config has the same
+        # problem; test_moe_runner.py covers VllmMoERunner never calling it.
         layer = FakeRoutedExperts(experts_per_token=2)
         method = VllmCompressedTensorsW4A16MoEMethod(
             FakeQuantArgs(), None, layer.moe_config
         )
 
         assert not hasattr(method, "wna16_backend")
-        assert method.get_fused_moe_quant_config(layer) is None
         assert method.supports_eplb is False
 
 
@@ -275,6 +275,7 @@ class TestW4MoEWeightPreprocessing:
             assert layer.w13_weight_packed[1, 0, 0].item() == expected_carrier
 
 
+@pytest.mark.tpu_test
 class TestW4MoECorrectness:
     """Verify computation correctness of W4 MoE."""
 

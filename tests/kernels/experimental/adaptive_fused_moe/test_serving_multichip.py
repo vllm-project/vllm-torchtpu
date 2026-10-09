@@ -28,10 +28,9 @@ LAUNCH_TIMEOUT_SECONDS = 480
 
 
 def _prepare_worker_env():
-    from torch_tpu._internal.distributed.launchers.singlehost_wrapper import (
-        prepare_tpu_environment,
-    )
     from torch_tpu._internal.utils import hardware
+
+    from tests.distributed.tpu_test_utils import prepare_tpu_environment
 
     if hardware.get_tpu_device_count() < WORLD_SIZE:
         pytest.skip("requires eight TPU devices")
