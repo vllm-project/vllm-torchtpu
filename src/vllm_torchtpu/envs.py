@@ -88,6 +88,7 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
+    TPU_RECLAIM_COMPILE_MEMORY: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
@@ -710,6 +711,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_PP_CHUNK_SLACK": lambda: float(os.getenv("TPU_PP_CHUNK_SLACK", "0.1")),
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE": env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
+    # Trade compile-boundary cleanup time for lower resident host memory.
+    "TPU_RECLAIM_COMPILE_MEMORY": env_bool("TPU_RECLAIM_COMPILE_MEMORY", default=False),
     # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
     # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
     # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.

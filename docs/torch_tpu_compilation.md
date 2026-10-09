@@ -19,6 +19,27 @@ export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="/path/to/persistent_cache"
    - **Scope**: Stores PyTorch Dynamo FX graph bytecode, Guard expressions, AOTAutograd tracing artifacts (`torch_compile_cache/torch_aot_compile`), and `TpuCompilerAdaptor` metadata pickle handles (`artifact_compile_range_*`).
    - **Note**: `VLLM_CACHE_ROOT` manages Python framework artifacts and is completely independent of the C++ PJRT compiled binary executables managed by `TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT`.
 
+## Host memory during compilation
+
+Large graphs can leave freed allocations resident in the host allocator between
+compilation buckets. If startup runs out of host memory, opt in to reclamation:
+
+```bash
+export TPU_RECLAIM_COMPILE_MEMORY=1
+```
+
+After each successful compiler `compile` or `load` call returns, the adaptor runs
+Python garbage collection and glibc `malloc_trim(0)`. Waiting until the call
+returns lets temporary compiler objects go out of scope before collection.
+Returned executables and their live references remain intact. Cache loading
+also uses this boundary because a cache miss can compile a graph.
+
+The flag defaults to `0`. It requires Linux with glibc as the active host
+allocator; enabling it with another allocator raises an error before the
+compiler call. It adds cleanup time at each boundary and cannot reclaim live
+allocations or prevent every host OOM. It does not change the compilation cache
+key.
+
 ## Compilation Debugging & Telemetry
 
 ### `VLLM_XLA_CHECK_RECOMPILATION` (Runtime Recompilation Detector)

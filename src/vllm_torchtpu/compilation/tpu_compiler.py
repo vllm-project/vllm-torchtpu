@@ -29,6 +29,7 @@ from vllm.config.utils import Range
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.compilation.host_memory import reclaim_after_compile
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -98,6 +99,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE",
     "VLLM_XLA_CHECK_RECOMPILATION",
     "TPU_PARALLEL_PRECOMPILE",
+    "TPU_RECLAIM_COMPILE_MEMORY",
     # KV-transfer wiring: ports, socket paths, staging pool, pool sizes,
     # timeouts. Same reasoning as the Raiden group above. Every registry
     # entry not named here joins the cache key, so omitting these would
@@ -556,6 +558,7 @@ class TpuCompilerAdaptor(CompilerInterface):
             )
             return None
 
+    @reclaim_after_compile(lambda: envs.TPU_RECLAIM_COMPILE_MEMORY)
     def compile(
         self,
         graph: fx.GraphModule,
@@ -638,6 +641,7 @@ class TpuCompilerAdaptor(CompilerInterface):
             shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
         return compiled_fn, handle
 
+    @reclaim_after_compile(lambda: envs.TPU_RECLAIM_COMPILE_MEMORY)
     def load(
         self,
         handle: Any,
