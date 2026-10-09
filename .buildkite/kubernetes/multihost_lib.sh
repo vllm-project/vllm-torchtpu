@@ -78,17 +78,21 @@ head_listening() {
 # listening. This is how a worker leaves: nothing kills these pods, so one that
 # waited on its own processes would hold its chips until the JobSet deadline.
 #
-# Three consecutive misses, not one: a DNS blip on the headless service looks
-# identical to a closed port from here, and leaving is irreversible.
+# Gone for 20s straight, not one miss: a DNS blip on the headless service looks
+# identical to a closed port from here, and leaving is irreversible. Probing
+# every 2s keeps that window but notices the end within ~20s; three misses
+# 15s apart held the worker's chips ~70s after the head had exited.
 wait_for_head_to_go() {
-  local misses=0
-  while [ "$misses" -lt 3 ]; do
+  local gone_since=""
+  while true; do
     if head_listening "$1" "$2"; then
-      misses=0
-    else
-      misses=$((misses + 1))
+      gone_since=""
+    elif [ -z "$gone_since" ]; then
+      gone_since=$SECONDS
+    elif [ $((SECONDS - gone_since)) -ge 20 ]; then
+      return 0
     fi
-    sleep 15
+    sleep 2
   done
 }
 
