@@ -128,7 +128,11 @@ def test_compressor_op_is_built_lazily_and_cached():
 
 
 def test_transpose_wkv_wgate_allocates_fresh_buffer():
-    """Transposed weight must live in a fresh contiguous buffer, not a view."""
+    """The transposed weight gets its own buffer even if `.contiguous()` is a no-op.
+
+    On CPU `.contiguous()` already copies, so it is patched to return `self`,
+    mimicking the torch_tpu view chain that the fresh buffer + `copy_` breaks.
+    """
     compressor = VllmDeepseekCompressor.__new__(VllmDeepseekCompressor)
     torch.nn.Module.__init__(compressor)
     orig = torch.arange(12, dtype=torch.float32).reshape(3, 4)
@@ -138,7 +142,8 @@ def test_transpose_wkv_wgate_allocates_fresh_buffer():
     )
     compressor._wkv_wgate_transposed = False
 
-    compressor.transpose_wkv_wgate()
+    with patch.object(torch.Tensor, "contiguous", lambda self, *a, **k: self):
+        compressor.transpose_wkv_wgate()
 
     w = compressor.fused_wkv_wgate.weight
     assert compressor._wkv_wgate_transposed is True
@@ -146,3 +151,6 @@ def test_transpose_wkv_wgate_allocates_fresh_buffer():
     assert w.is_contiguous()
     assert w.untyped_storage().data_ptr() != orig_ptr
     assert torch.equal(w, orig.t())
+
+    compressor.transpose_wkv_wgate()  # A second call must not flip it back.
+    assert compressor.fused_wkv_wgate.weight is w
