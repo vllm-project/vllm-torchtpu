@@ -733,11 +733,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # instead of an all-gather over the candidate axis. Same result.
     "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=False),
     # Smallest padded token bucket that takes the all-to-all merge when
-    # TPU_DCP_INDEXER_A2A_MERGE is on; smaller buckets keep the all-gather one.
-    # The all-to-all pays a second dependent collective to merge T / dcp rows
-    # instead of T, which loses at decode-sized buckets (a DCP=8 microbench:
-    # +4-11% at T=16) and wins from T=64 (-2-7%) to T>=256 (-7-24%). The bucket
-    # is static, so each compiled variant picks one merge with no runtime cost.
+    # TPU_DCP_INDEXER_A2A_MERGE is on. The bucket is static, so each compiled
+    # variant picks one merge with no runtime cost.
     "TPU_DCP_INDEXER_A2A_MIN_TOKENS": env_nonnegative_int(
         "TPU_DCP_INDEXER_A2A_MIN_TOKENS", 64
     ),
