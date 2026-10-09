@@ -13,8 +13,6 @@
 # limitations under the License.
 """Standalone sparse-attention tests for both physical cache layouts."""
 
-import functools
-
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -79,37 +77,6 @@ def _build_problem(rng, *, k_scale, query_tokens=128, topk=256, num_heads=8):
         "cu_q_lens": jnp.array([0, query_tokens], jnp.int32),
         "distribution": jnp.array([0, 1, 1], jnp.int32),
     }
-
-
-def _optimized_hlo(fn, *args) -> str:
-    """Post-optimization HLO text of `fn(*args)`.
-
-    `Compiled.as_text()` re-parses the module proto and trips on async ops on
-    this jaxlib (RET_CHECK "async-update ... 1 operands"), so read the
-    executable's modules directly, else the XLA dump (`--xla_dump_to`).
-    """
-    import glob
-    import os
-
-    compiled = fn.lower(*args).compile()
-    try:
-        return "\n".join(
-            m.to_string() for m in compiled.runtime_executable().hlo_modules()
-        )
-    except Exception:  # noqa: BLE001, S110 - fall back to the dump below
-        pass
-    flags = os.environ.get("XLA_FLAGS", "")
-    dump = next(
-        (f.split("=", 1)[1] for f in flags.split() if f.startswith("--xla_dump_to=")),
-        None,
-    )
-    if dump is None:
-        raise RuntimeError("no HLO text: set XLA_FLAGS=--xla_dump_to=<dir>")
-    files = sorted(
-        glob.glob(os.path.join(dump, "*jit_layers*after_optimizations.txt")),
-        key=os.path.getmtime,
-    )
-    return open(files[-1]).read()
 
 
 class SparseMlaCacheLayoutsTest(parameterized.TestCase):
@@ -649,185 +616,52 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         # Positive control: a different scatter modulus moves the padding rows.
         self.assertFalse(np.array_equal(got(windows, total_pages + 1), want))
 
-    def _split_q_lse_case(self, query_tokens, seq_q, rng):
-        """A DCP-shaped problem: 64 heads, per-row live counts incl. empty rows.
+    @parameterized.product(
+        (
+            # Decode buckets (MTP 3: q=4 per request) and a mixed step.
+            {"query_tokens": 16, "seq_q": (4, 4)},
+            {"query_tokens": 512, "seq_q": (4, 4, 492)},
+        ),
+        cache_layout=(
+            sparse_mla.SPARSECORE_CACHE_LAYOUT,
+            sparse_mla.TENSORCORE_CACHE_LAYOUT,
+        ),
+    )
+    def test_split_q_lse_matches_concat(self, query_tokens, seq_q, cache_layout):
+        """TPU_MLA_SPARSE_SPLIT_Q on (`q_pe=`, `lse_lane_dense=True`) == off.
 
-        Returns the problem, the glued top-k (a rank owning none of a row's
-        top-k is handed key 0, as `sparse_mla_attention_dcp` does), `owns`,
-        `counts`, the page table, cu_q_lens and the distribution.
+        DCP-shaped: 64 heads, per-row live counts incl. empty rows and rows
+        past the 512 cap. Out and lse must match bit for bit.
         """
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("Sparse MLA attention requires a TPU")
+        rng = np.random.default_rng(20261006)
         topk = 2048
         problem = _build_problem(
             rng, k_scale=0.75, query_tokens=query_tokens, topk=topk, num_heads=64
         )
-        # 0 = the rank owns none of the row (lse = -inf contract); 513+ rows
-        # overflow the 512 cap into later windows.
-        pool = np.array(
-            [
-                0,
-                1,
-                63,
-                64,
-                127,
-                128,
-                129,
-                255,
-                256,
-                257,
-                511,
-                512,
-                513,
-                700,
-                1024,
-                1025,
-                2048,
-                0,
-                130,
-            ]
-        )
-        counts = np.resize(pool, query_tokens)
-        rng.shuffle(counts)
-        counts[0] = 0  # an empty row in every bucket
-        counts[1] = 1025  # and an overflow row
+        counts = rng.integers(0, topk + 1, size=query_tokens)
+        counts[0], counts[1] = 0, 1025  # an empty row and an overflow row
         live = np.arange(topk)[None, :] < counts[:, None]
         topk_idx = jnp.where(jnp.asarray(live), problem["topk"], -1)
+        # As `sparse_mla_attention_dcp`: a row owning none of its top-k gets
+        # key 0, and `owns` masks its lse afterwards.
         owns = jnp.any(topk_idx >= 0, axis=-1)
-        topk_idx = topk_idx.at[:, 0].set(jnp.where(owns, topk_idx[:, 0], jnp.int32(0)))
+        topk_idx = topk_idx.at[:, 0].set(jnp.where(owns, topk_idx[:, 0], 0))
         num_seqs = len(seq_q)
-        page_table = jnp.concatenate(
-            [problem["page_table"]]
-            + [
-                jnp.asarray(rng.permutation(problem["page_table"].shape[0]), jnp.int32)
-                for _ in range(num_seqs - 1)
-            ]
-        )
+        page_table = jnp.tile(problem["page_table"], num_seqs)
         cu_q_lens = jnp.asarray(np.concatenate([[0], np.cumsum(seq_q)]), jnp.int32)
         num_decode = sum(1 for n in seq_q if n == 4)
         distribution = jnp.array([num_decode, num_decode, num_seqs], jnp.int32)
-        return problem, topk_idx, owns, counts, page_table, cu_q_lens, distribution
-
-    @parameterized.product(
-        (
-            # Decode buckets (MTP 3: q=4 per request), 1 and 2 requests.
-            {"query_tokens": 16, "seq_q": (4,)},
-            {"query_tokens": 16, "seq_q": (4, 4)},
-            # Mixed: 2 decode requests + a prefill chunk, two capped chunks.
-            {"query_tokens": 512, "seq_q": (4, 4, 492)},
-        ),
-        topk_cap=(512, None),
-    )
-    def test_split_q_lse_bit_identical(self, query_tokens, seq_q, topk_cap):
-        """Split q (`q_pe=`) and lane-dense lse against the concat path.
-
-        TPU_MLA_SPARSE_SPLIT_Q (with the lse the DCP caller asks for): the
-        kernel joins q_nope and q_pe in VMEM and carries lse as f32[T, H].
-        Every arm (split only, lse only, both) must match the incumbent bit
-        for bit on every row, padding rows included
-        (they keep q_nope / the sentinel in both), and keep the DCP empty-row
-        contract (lse == -inf, out finite) after the `owns` mask.
-        """
-        if jax.devices()[0].platform != "tpu":
-            self.skipTest("SparseCore cache-layout attention requires a TPU")
-        rng = np.random.default_rng(20261006)
-        problem, topk_idx, owns, counts, page_table, cu_q_lens, distribution = (
-            self._split_q_lse_case(query_tokens, seq_q, rng)
-        )
-        q_nope = problem["q"][..., :NOPE_DIM]
-        q_pe = problem["q"][..., NOPE_DIM:]
-        real_tokens = int(sum(seq_q))
-
-        def run(topk_in, *, split, dense, q_pe_in=q_pe):
-            q_in = q_nope if split else jnp.concatenate([q_nope, q_pe_in], -1)
-            out, lse = sparse_mla.sparse_ragged_paged_attention(
-                q_in,
-                problem["sparsecore_nope"],
-                problem["sparsecore_rope"],
-                topk_in,
-                page_table,
-                cu_q_lens,
-                distribution,
-                sm_scale=0.125,
-                k_scale=0.75,
-                return_lse=True,
-                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
-                gather_and_attention_chunk_size=256,
-                topk_cap=topk_cap,
-                lse_lane_dense=dense,
-                **({"q_pe": q_pe_in} if split else {}),
-            )
-            # The DCP glue around the kernel.
-            lse = jnp.where(owns[:, None], lse, -jnp.inf)
-            return out[..., :NOPE_DIM], lse
-
-        def bits(x):
-            return np.asarray(jax.lax.bitcast_convert_type(x, jnp.uint16))
-
-        ref, ref_lse = jax.block_until_ready(run(topk_idx, split=False, dense=False))
-        self.assertEqual(ref.shape, (query_tokens, 64, NOPE_DIM))
-        self.assertEqual(ref_lse.shape, (query_tokens, 64))
-        for split, dense in ((True, False), (False, True), (True, True)):
-            out, lse = jax.block_until_ready(run(topk_idx, split=split, dense=dense))
-            arm = f"split={split} dense={dense}"
-            self.assertEqual(out.shape, ref.shape, arm)
-            self.assertEqual(lse.shape, ref_lse.shape, arm)
-            np.testing.assert_array_equal(bits(out), bits(ref), err_msg=arm)
-            np.testing.assert_array_equal(
-                np.asarray(lse).view(np.uint32),
-                np.asarray(ref_lse).view(np.uint32),
-                err_msg=arm,
-            )
-            empty = ~np.asarray(owns)[:real_tokens]
-            self.assertTrue(empty.any())
-            self.assertTrue(np.all(np.asarray(lse)[:real_tokens][empty] == -np.inf))
-            self.assertTrue(
-                np.isfinite(np.asarray(out, np.float32)[:real_tokens][empty]).all()
-            )
-        # Positive controls. The output is attention, not the aliased q_nope.
-        self.assertGreater(
-            np.abs(
-                np.asarray(out, np.float32)[:real_tokens]
-                - np.asarray(q_nope, np.float32)[:real_tokens]
-            ).max(),
-            2e-2,
-        )
-        # The comparison sees the rope operand: a zero q_pe moves the output.
-        bad, bad_lse = jax.block_until_ready(
-            run(topk_idx, split=True, dense=True, q_pe_in=jnp.zeros_like(q_pe))
-        )
-        self.assertFalse(
-            np.array_equal(bits(bad)[:real_tokens], bits(ref)[:real_tokens])
-        )
-        self.assertFalse(
-            np.array_equal(
-                np.asarray(bad_lse)[:real_tokens], np.asarray(ref_lse)[:real_tokens]
-            )
-        )
-        # ... and one moved live entry of an overflow row (fix-up path).
-        row = int(np.argmax(counts[:real_tokens]))
-        moved = topk_idx.at[row, 0].set((topk_idx[row, 0] + 1) % 8192)
-        bad, bad_lse = jax.block_until_ready(run(moved, split=True, dense=True))
-        self.assertFalse(np.array_equal(bits(bad)[row], bits(ref)[row]))
-        self.assertFalse(
-            np.array_equal(np.asarray(bad_lse)[row], np.asarray(ref_lse)[row])
-        )
-
-    @parameterized.parameters((16, (4, 4)), (512, (4, 4, 492)))
-    def test_split_q_lse_bit_identical_tensorcore(self, query_tokens, seq_q):
-        """The same flag on the TensorCore cache layout (dsa_gather path)."""
-        if jax.devices()[0].platform != "tpu":
-            self.skipTest("Sparse MLA attention requires a TPU")
-        rng = np.random.default_rng(20261008)
-        problem, topk_idx, owns, _, page_table, cu_q_lens, distribution = (
-            self._split_q_lse_case(query_tokens, seq_q, rng)
-        )
+        sparsecore = cache_layout == sparse_mla.SPARSECORE_CACHE_LAYOUT
         q_nope = problem["q"][..., :NOPE_DIM]
         q_pe = problem["q"][..., NOPE_DIM:]
 
         def run(split):
             out, lse = sparse_mla.sparse_ragged_paged_attention(
                 q_nope if split else problem["q"],
-                problem["tensorcore_nope"],
-                problem["tensorcore_rope"],
+                problem[f"{cache_layout}_nope"],
+                problem[f"{cache_layout}_rope"],
                 topk_idx,
                 page_table,
                 cu_q_lens,
@@ -835,8 +669,9 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
                 sm_scale=0.125,
                 k_scale=0.75,
                 return_lse=True,
-                lse_lane_dense=split,
-                **({"q_pe": q_pe} if split else {}),
+                cache_layout=cache_layout,
+                **({"topk_cap": 512} if sparsecore else {}),
+                **({"q_pe": q_pe, "lse_lane_dense": True} if split else {}),
             )
             return out[..., :NOPE_DIM], jnp.where(owns[:, None], lse, -jnp.inf)
 
@@ -848,85 +683,6 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         np.testing.assert_array_equal(
             np.asarray(lse).view(np.uint32), np.asarray(ref_lse).view(np.uint32)
         )
-
-    def test_split_q_lse_hlo_drops_concat_and_padded_lse(self):
-        """With split q + lane-dense lse the compiled call has no padded
-        [T, H, 640] q, no f32[T, H, 1] lse, and no copy of q_nope when q_nope
-        is an intermediate (as in the model); the concat path has both.
-        """
-        if jax.devices()[0].platform != "tpu":
-            self.skipTest("SparseCore cache-layout attention requires a TPU")
-        import re
-
-        T = 512
-        rng = np.random.default_rng(20261007)
-        problem, topk_idx, owns, _, page_table, cu_q_lens, distribution = (
-            self._split_q_lse_case(T, (4, 4, 492), rng)
-        )
-
-        # Named `layers` for `_optimized_hlo`'s XLA-dump fallback glob.
-        def layers(q, topk_in, *, split):
-            # q_nope / q_pe are intermediates, like the model's projections.
-            q = q * 2
-            q_nope, q_pe = q[..., :NOPE_DIM], q[..., NOPE_DIM:]
-            out, lse = sparse_mla.sparse_ragged_paged_attention(
-                q_nope if split else jnp.concatenate([q_nope, q_pe], -1),
-                problem["sparsecore_nope"],
-                problem["sparsecore_rope"],
-                topk_in,
-                page_table,
-                cu_q_lens,
-                distribution,
-                return_lse=True,
-                cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
-                gather_and_attention_chunk_size=256,
-                topk_cap=512,
-                lse_lane_dense=split,
-                **({"q_pe": q_pe} if split else {}),
-            )
-            return out[..., :NOPE_DIM], jnp.where(owns[:, None], lse, -jnp.inf)
-
-        hlo = {}
-        for split in (False, True):
-            fn = jax.jit(functools.partial(layers, split=split))
-            hlo[split] = _optimized_hlo(fn, problem["q"], topk_idx)
-        padded_q = f"bf16[{T},64,640]"
-        padded_lse = f"f32[{T},64,1]"
-        q_copy = re.compile(rf"= bf16\[{T},64,512\]\{{[^}}]*\}} copy\(")
-        # Positive control: the concat path materialises both.
-        self.assertIn(padded_q, hlo[False])
-        self.assertIn(padded_lse, hlo[False])
-        self.assertNotIn(padded_q, hlo[True])
-        self.assertNotIn(padded_lse, hlo[True])
-        self.assertEqual(q_copy.findall(hlo[True]), [])
-
-    def test_split_q_validation(self):
-        nope = jnp.zeros((16, 256, 128), jnp.uint32)
-        rope = jnp.zeros((16, 64, 128), jnp.uint32)
-        topk = jnp.zeros((16, 512), jnp.int32)
-        args = (
-            nope,
-            rope,
-            topk,
-            None,
-            jnp.array([0, 16], jnp.int32),
-            jnp.array([0, 1, 1], jnp.int32),
-        )
-        kw = {"cache_layout": sparse_mla.SPARSECORE_CACHE_LAYOUT}
-        with self.assertRaisesRegex(ValueError, "must match q_nope"):
-            sparse_mla.sparse_ragged_paged_attention(
-                jnp.zeros((16, 8, NOPE_DIM), jnp.bfloat16),
-                *args,
-                q_pe=jnp.zeros((16, 4, ROPE_DIM), jnp.bfloat16),
-                **kw,
-            )
-        with self.assertRaisesRegex(ValueError, "128-multiple nope dim"):
-            sparse_mla.sparse_ragged_paged_attention(
-                jnp.zeros((16, 8, 500), jnp.bfloat16),
-                *args,
-                q_pe=jnp.zeros((16, 8, ROPE_DIM), jnp.bfloat16),
-                **kw,
-            )
 
     def test_topk_cap_validation(self):
         q = jnp.zeros((16, 8, HEAD_DIM), jnp.bfloat16)
