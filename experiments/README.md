@@ -68,6 +68,11 @@ experiments/
 │   ├── 14_gemma4_1of4_canonical_weight_scaling_eval_fast.yaml   # 1:4 SparseGPT constant weight multiplier sweeps
 │   ├── 15_gemma4_2of4_256c4_canonical_weight_scaling_eval_fast.yaml # 2:4 (256 c4) weight scaling sweeps
 │   ├── 16_gemma4_1of4_256c4_canonical_weight_scaling_eval_fast.yaml # 1:4 (256 c4) weight scaling sweeps
+│   ├── gemma4/                                                  # Gemma-4 12B / 26B-A4B / 31B MMLU-Pro sweep configs
+│   │   ├── eval_front_to_back_12b_mmlu_pro.yaml                 # 12B front-to-back prefix 2:4 sweep
+│   │   ├── eval_front_to_back_26b_a4b_mmlu_pro.yaml             # 26B-A4B front-to-back prefix 2:4 sweep
+│   │   ├── eval_front_to_back_31b_mmlu_pro.yaml                 # 31B front-to-back prefix 2:4 sweep
+│   │   └── eval_custom_layers_31b_mmlu_pro.yaml                 # 31B arbitrary non-prefix layer sets (TPU SparseGPT)
 │   └── test_advanced_trace.yaml                                 # JAX/XLA profiler trace test configuration
 ├── core/                                                        # Core interfaces, models, builders, and recorders
 │   ├── __init__.py                                              # Package initialization
@@ -82,6 +87,7 @@ experiments/
 │   ├── base_resolver.py                                         # Abstract base class for all checkpoint resolvers
 │   ├── base_sparsity_resolver.py                                # Unified base class with owner-marked cache reaping
 │   ├── dataset_providers.py                                     # Calibration dataset providers (C4, WikiText, custom)
+│   ├── lrc_resolver.py                                          # Low-Rank Compensated (LRC) 2:4 resolver
 │   ├── model_splicer.py                                         # Cross-shard layer splicer with disk shard integrity check
 │   ├── naive_magnitude_resolver.py                              # Data-free magnitude pruning resolver
 │   ├── registry.py                                              # Central resolver factory
@@ -133,33 +139,86 @@ experiments/
 
 You can create 2:4 or 1:4 structured sparse checkpoints standalone without running a parameter sweep.
 
-### A. Standalone SparseGPT Pruning (Hessian-Compensated)
-Runs second-order error-compensated pruning using calibration data (e.g. C4 dataset):
+### A. Standalone SparseGPT Pruning (Full Model or Arbitrary Layer Indices)
+Runs second-order error-compensated pruning using calibration data (e.g. C4 dataset) on either CPU (`calibrator="cpu"`) or TPU (`calibrator="tpu"`, ~2.6 s per Gemma-4 31B layer vs ~370 s on CPU).
+
+#### 1. Prune all 60 layers (or a contiguous `[minlayer, maxlayer)` range)
 
 ```python
 from sparsity import prune_gemma4
 
 prune_gemma4(
-    model_path="/mnt/pd/huggingface_cache/hub/models--google--gemma-4-31B-it/snapshots/842da3794eaa0b77d5f08bae87a17459d91ff475",
+    model_path="google/gemma-4-31B-it",
     dataset="c4",
     nsamples=256,              # Number of calibration sequences
-    prunen=2,                  # N in N:M (2 for 2:4 50% sparse, 1 for 1:4 75% sparse)
-    prunem=4,                  # M in N:M
-    minlayer=0,                # Start layer index
-    maxlayer=60,               # End layer index
-    save_path="/mnt/pd/sparse_checkpoints/my_gemma4_2of4_256c4_full"
+    prunen=2,                  # Kept weights per block of M (2:4 = 50% sparse, 1:4 = 75% sparse)
+    prunem=4,
+    minlayer=0,
+    maxlayer=60,
+    calibrator="tpu",          # "tpu" (JAX on TPU, ~5 min for 31B) or "cpu" (PyTorch reference)
+    save_path="/mnt/pd/sparse_checkpoints/gemma4_31b_2of4_tpu_256c4_full",
 )
 ```
 
-Pass `calibrator="tpu"` (or `resolver_config: {use_tpu_sparsegpt: true}` in a
-sweep config) to run the same pipeline with the JAX calibrator in
-`sparsity/tpu_gemma4.py`: ~2.6 s per Gemma-4 31B layer instead of ~370 s, same
-checkpoint format. Because SparseGPT's top-k mask choice is discontinuous the
-two calibrators are separate lineages (~97% mask agreement, indistinguishable
-MMLU-Pro); cached checkpoints carry a `_tpu` tag so prefixes are only ever
-spliced within a lineage, and `SparseGptResolver` runs the TPU calibrator in a
-child process (`python -m sparsity.tpu_gemma4 --json ...`) because libtpu
-admits one process per TPU and vLLM needs the chips right afterwards.
+#### 2. Prune an arbitrary set of layer indices (`sparse_layer_indices`)
+Pass `sparse_layer_indices` (any set of 0-based layer indices in `0 .. 59` for 31B or `0 .. 47` for 12B) to sparsify only those layers while keeping all other layers, embeddings, and vision weights bit-identical to the dense base checkpoint. Unpruned middle layers still execute in the forward pass so downstream pruned layers calibrate against their true activations, and calibration stops automatically after `max(sparse_layer_indices)`:
+
+```python
+from sparsity import prune_gemma4
+
+# Example: Barbell-36 on Gemma-4 31B (prune [0..21] and [46..59], keep middle [22..45] dense)
+barbell_36 = set(range(0, 22)) | set(range(46, 60))
+
+prune_gemma4(
+    model_path="google/gemma-4-31B-it",
+    dataset="c4",
+    nsamples=256,
+    prunen=2,
+    prunem=4,
+    sparse_layer_indices=barbell_36,
+    calibrator="tpu",
+    save_path="/mnt/pd/sparse_checkpoints/gemma4_31b_2of4_tpu_256c4_barbell36",
+)
+```
+
+You can also invoke the TPU calibrator directly from the command line via `python -m sparsity.tpu_gemma4 --json`:
+
+```bash
+python -u -m sparsity.tpu_gemma4 --json '{
+  "model_path": "google/gemma-4-31B-it",
+  "dataset": "c4",
+  "nsamples": 256,
+  "prunen": 2,
+  "prunem": 4,
+  "sparse_layer_indices": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,46,47,48,49,50,51,52,53,54,55,56,57,58,59],
+  "save_path": "/mnt/pd/sparse_checkpoints/gemma4_31b_2of4_tpu_256c4_barbell28"
+}'
+```
+
+#### 3. Sweep arbitrary layer sets with `run_sweep_orchestrator.py`
+In a sweep YAML (see `configs/gemma4/eval_custom_layers_31b_mmlu_pro.yaml`), set `use_tpu_sparsegpt: true` under `model_resolver.config` and list explicit 0-based layer index sets under `sweep_matrix.layers`:
+
+```yaml
+model_resolver:
+  module: resolvers.sparsegpt_resolver
+  function: resolve_model
+  config:
+    base_model: google/gemma-4-31B-it
+    reference_sparse_model: gemma4_31b_2of4_tpu_256c4_full
+    use_tpu_sparsegpt: true
+    prunen: 2
+    prunem: 4
+    nsamples: 256
+
+sweep_matrix:
+  layers:
+    - []                                                                          # Dense baseline
+    - [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59]  # Barbell-28
+```
+
+For each coordinate in `sweep_matrix.layers`:
+- Prefix sets (`[0..k-1]`) are spliced from `reference_sparse_model` in ~18 s when available (inheriting the `_tpu` lineage tag so CPU and TPU checkpoints never alias).
+- Non-prefix sets automatically bypass reference splicing and run `python -m sparsity.tpu_gemma4 --json ...` in a child process (so `libtpu` releases the TPU chips on exit before vLLM starts), caching the checkpoint under `..._256c4_tpu_layers_<N>l_<sha1>`.
 
 ### B. Standalone Naive Magnitude Pruning (Data-Free)
 Applies top-K magnitude pruning along the contracting dimension (dim=-1) across all linear projection weights without calibration:
@@ -201,7 +260,6 @@ model_resolver:
   config:
     base_model: google/gemma-4-12B-it
     reference_sparse_model: null
-    strategy: first_to_last
     prunen: 2
     prunem: 4
     nsamples: 64

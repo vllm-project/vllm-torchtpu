@@ -1,0 +1,51 @@
+# Goal: MMLU-Pro Quality Evaluation for Gemma 4 31B with Arbitrary (Non-Prefix) 2:4 Sparse Layer Sets
+# calibrated on demand via JAX TPU SparseGPT (~2.6 s/layer in a child process).
+#
+# How `sweep_matrix.layers` works with `use_tpu_sparsegpt: true`:
+#   - `[]`: evaluates the unpruned 60-layer dense baseline.
+#   - Prefix `[0..k-1]`: splices from `reference_sparse_model` in ~18s if present on disk,
+#     otherwise calibrates on TPU.
+#   - Arbitrary non-prefix sets (e.g. Barbell `[0..21] + [46..59]` or Tail `[30..59]`):
+#     automatically bypasses reference splicing (since downstream layers must be calibrated
+#     on the true activations of the kept dense middle layers), runs `sparsity.tpu_gemma4`
+#     in a child process to free the TPU before vLLM starts, caches the resulting checkpoint
+#     under a SHA-1 content-addressed name (`..._256c4_tpu_layers_<N>l_<sha1>`), and evaluates.
+mode: eval
+
+tensor_parallel_size: 4
+dtype: bfloat16
+max_model_len: 8192
+
+engine_args:
+  kv_cache_dtype: fp8
+  max_num_batched_tokens: 4096
+  max_num_seqs: 256
+  gpu_memory_utilization: 0.85
+  enable_prefix_caching: false
+  disable_chunked_mm_input: true
+
+evaluation:
+  tasks: mmlu_pro
+  batch_size: auto
+
+model_resolver:
+  module: resolvers.sparsegpt_resolver
+  function: resolve_model
+  config:
+    base_model: google/gemma-4-31B-it
+    reference_sparse_model: gemma4_31b_2of4_tpu_256c4_full
+    use_tpu_sparsegpt: true
+    prunen: 2
+    prunem: 4
+    nsamples: 256
+
+sweep_matrix:
+  layers:
+    # 0 / 60 layers sparse (Dense anchor)
+    - []
+    # 28 / 60 layers sparse (Barbell-28: prune [0..13] and [46..59], keep middle [14..45] dense)
+    - [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59]
+    # 36 / 60 layers sparse (Barbell-36: prune [0..21] and [46..59], keep middle [22..45] dense)
+    - [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59]
+    # 30 / 60 layers sparse (Tail-30: keep front [0..29] dense, prune back [30..59])
+    - [30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59]
