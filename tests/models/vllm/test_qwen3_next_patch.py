@@ -249,7 +249,7 @@ def _fake_tp_collectives(monkeypatch, tp, all_reduced=None):
 
 
 def test_patched_decoder_layer_forward_sequence_parallel(monkeypatch):
-    """Verify the SP branch runs all-gather, narrow, reduce-scatter, and SP MLP."""
+    """Verify the SP branch runs all-gather, reduce-scatter, and SP MLP."""
 
     tp = 2
     _fake_tp_collectives(monkeypatch, tp)
