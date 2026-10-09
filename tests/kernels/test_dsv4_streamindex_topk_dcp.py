@@ -13,6 +13,8 @@
 # limitations under the License.
 """Tests for DCP (decode context parallel) StreamIndex Top-K"""
 
+import re
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -362,16 +364,16 @@ def test_a2a_merge_matches_the_all_gather_merge(dcp_size, chunk_tokens):
     _, args, kwargs = _dcp_case(dcp_size, 5)
     kwargs["chunk_tokens"] = chunk_tokens
 
-    # The default merge must not pay the all-to-all: it is what a token bucket
-    # below TPU_DCP_INDEXER_A2A_MIN_TOKENS compiles.
-    hlo = streamindex_topk_dcp.lower(*args, **kwargs).as_text()
-    assert "all_to_all" not in hlo and "all-to-all" not in hlo, (
-        "the default merge lowered an all-to-all"
-    )
-    hlo = streamindex_topk_dcp.lower(*args, **kwargs, a2a_merge=True).as_text()
-    assert "all_to_all" in hlo or "all-to-all" in hlo, (
-        "no all-to-all in the a2a path: it ran the all-gather merge, so this"
-        " comparison would pass trivially"
+    # Both paths carry cp_rank_as_data's all-to-all; the a2a merge adds exactly
+    # one. The default is what a bucket below TPU_DCP_INDEXER_A2A_MIN_TOKENS runs.
+    def num_a2a(**kw):
+        hlo = streamindex_topk_dcp.lower(*args, **kwargs, **kw).as_text()
+        return len(re.findall(r"all[_-]to[_-]all", hlo))
+
+    n_default, n_a2a = num_a2a(), num_a2a(a2a_merge=True)
+    assert n_a2a == n_default + 1, (
+        f"all-to-alls: default {n_default}, a2a {n_a2a}; the default merge paid"
+        " the all-to-all, or the a2a path ran the all-gather merge"
     )
 
     gather = np.asarray(streamindex_topk_dcp(*args, **kwargs))
