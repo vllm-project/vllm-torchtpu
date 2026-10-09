@@ -3808,6 +3808,9 @@ class TPURaidenConnectorWorker:
             # PP x PCP prefill: every stage-local PCP rank is a source unit
             # (TPU_RAIDEN_TRANSFER_PARALLELISM = PP * PCP) lowering its own
             # tokens and GDN heads of its stage's layers.
+            # TODO(yinlin): reachable once pp_validation admits context-parallel
+            # stages, which needs a torch_tpu that builds a stage's meshes over
+            # the stage's process group (google-pytorch/torch_tpu#4387).
             dcp_size = int(parallel_config.decode_context_parallel_size)
             if (
                 _raiden_seq_on_lane_layout()
