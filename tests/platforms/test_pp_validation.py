@@ -98,9 +98,13 @@ def test_linear_attention_stages_are_fine_without_kv_transfer():
     validate_pipeline_parallel_config(_config(pp=8, layer_types=HYBRID_24))
 
 
-def test_rejects_tensor_parallel_stages():
-    with pytest.raises(NotImplementedError, match="tensor-parallel-size 1"):
-        validate_pipeline_parallel_config(_config(pp=2, tp=4))
+def test_accepts_tensor_parallel_stages():
+    validate_pipeline_parallel_config(_config(pp=2, tp=4))
+
+
+def test_rejects_tensor_and_context_parallelism_in_one_stage():
+    with pytest.raises(NotImplementedError, match="one of them per stage"):
+        validate_pipeline_parallel_config(_config(pp=2, tp=2, pcp=2))
 
 
 def test_accepts_context_parallel_stages():

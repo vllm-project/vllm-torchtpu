@@ -6,9 +6,10 @@ each stage sends one buffer to the next stage and receives one from the
 previous stage (the last stage's buffer goes to stage 0, which ignores it).
 Because every stage takes part in every hand-off, launch number p on one
 stage pairs with launch number p on every other stage. A stage of several
-devices (a context-parallel group) hands off once per device: each device
-holds its own rows of the chunk and permutes them with the devices holding
-the same rows in the other stages, its column.
+devices (a context- or tensor-parallel group) hands off once per device: each
+device holds its own rows of the chunk (its replica of them under tensor
+parallelism) and permutes them with the devices holding the same rows in the
+other stages, its column.
 
 What travels is the sum of hidden states and residual, one tensor in the
 model dtype. The receiving stage's first norm adds hidden states and
@@ -108,15 +109,39 @@ def pp_rank_flags(parallel_config: Any) -> tuple[bool, bool]:
     return bool(group.is_first_rank), bool(group.is_last_rank)
 
 
+def stage_position() -> tuple[int, int]:
+    """This worker's position in its pipeline stage's device group and the
+    size of that group.
+
+    A stage spans devices as a prefill context-parallel group or as a
+    tensor-parallel group. vLLM lays the axes out with tp innermost, so the
+    position is ``pcp_rank * tp_size + tp_rank`` (either axis may be trivial).
+    """
+    from vllm.distributed.parallel_state import get_tp_group
+
+    from vllm_torchtpu.distributed.pcp import get_pcp_rank, get_pcp_world_size
+
+    tp = get_tp_group()
+    tp_size = int(tp.world_size)
+    return (
+        get_pcp_rank() * tp_size + int(tp.rank_in_group),
+        get_pcp_world_size() * tp_size,
+    )
+
+
 def stage_chips() -> int:
     """How many chips this worker's pipeline stage spans."""
+    from vllm.distributed.parallel_state import get_tp_group
+
     from vllm_torchtpu.distributed.chip_topology import get_chip_topology
-    from vllm_torchtpu.distributed.pcp import get_pcp_group_layout
+    from vllm_torchtpu.distributed.mesh_utils import get_cp_group_layout
+    from vllm_torchtpu.distributed.pcp import get_pcp_group, get_pcp_world_size
 
     topology = get_chip_topology()
     if topology is None:
         return 1
-    device_ids = set(get_pcp_group_layout().device_ids)
+    group = get_pcp_group() if get_pcp_world_size() > 1 else get_tp_group()
+    device_ids = set(get_cp_group_layout(group).device_ids)
     return sum(1 for chip in topology.chips if device_ids & set(chip))
 
 
@@ -157,16 +182,13 @@ class PPWave:
     ):
         from vllm.distributed.parallel_state import get_pp_group
 
-        from vllm_torchtpu.distributed.pcp import get_pcp_rank, get_pcp_world_size
-
         group = get_pp_group()
         self.rank = int(group.rank_in_group)
         self.size = int(group.world_size)
         self.last = self.size - 1
         # This device's column in its stage: the same column of every stage
         # holds the same token rows.
-        self.column = get_pcp_rank()
-        self.columns = get_pcp_world_size()
+        self.column, self.columns = stage_position()
         extras = [key for key in template if key not in (HIDDEN_STATES, RESIDUAL)]
         if (
             set(template) != {HIDDEN_STATES, RESIDUAL, *extras}
