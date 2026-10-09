@@ -20,18 +20,24 @@ import jax
 import jax.experimental.pallas.tpu as pltpu
 import jax.numpy as jnp
 
+FP8_E4M3_MAX = 448.0
+# 128 f32 lanes = 512 B, the minimum DMA inner slice.
+SCALE_LANE = 128
+
 
 def next_multiple_of(val: int, multiple: int) -> int:
     return ((val + multiple - 1) // multiple) * multiple
 
 
-_MB_STAGE_TARGET_BYTES = 2 << 20
+# The FP8 wire pays a fixed quantize/staging cost per micro-batch, so it wants
+# fewer, larger stages.
+_MB_STAGE_TARGET_BYTES = {False: 2 << 20, True: 8 << 20}  # by fp8_comm
 # Above this, hc_chunk_size shrinks to a single vector width at hidden 4096.
 _MAX_MICRO_BATCHES = 8
 # The work buffers persist across calls. At one micro-batch the phase-2 copy
 # can read running_sum_ref before the accumulate's write to it lands, and so
 # send the previous call's sums. A second micro-batch hides this by timing;
-# it shows only with a fresh input per call.
+# it shows only with a fresh input per call. Both wires keep the floor.
 _MIN_SAFE_MICRO_BATCHES = 2
 _MIN_LANES_PER_HC_CHUNK = 512
 _LANES = 128
@@ -48,9 +54,15 @@ def splits_hidden_evenly(
 
 
 def pick_num_micro_batches(
-    local_seq_len: int, hidden_dim_size: int, itemsize: int, *, num_devices: int
+    local_seq_len: int,
+    hidden_dim_size: int,
+    itemsize: int,
+    fp8_comm: bool,
+    *,
+    num_devices: int,
 ) -> int:
-    stages = (local_seq_len * hidden_dim_size * itemsize) // _MB_STAGE_TARGET_BYTES
+    stage_bytes = _MB_STAGE_TARGET_BYTES[bool(fp8_comm)]
+    stages = (local_seq_len * hidden_dim_size * itemsize) // stage_bytes
     mb = 1 << max(0, stages.bit_length() - 1)
     mb = min(mb, max(1, hidden_dim_size // _MIN_LANES_PER_HC_CHUNK))
     mb = max(mb, _MIN_SAFE_MICRO_BATCHES)
@@ -71,6 +83,9 @@ class Config:
     hidden_dim_size: int
     local_seq_len: int  # after padding
     dtype: jnp.dtype
+    fp8_comm: bool = False
+    # None: per-chunk dynamic scale. See TPU_MOE_EP_HIER_RS_FP8_STATIC_SCALE.
+    fp8_static_scale: float | None = None
     _num_micro_batches: int | None = None
 
     def __post_init__(self):
@@ -112,6 +127,7 @@ class Config:
             self.local_seq_len,
             self.hidden_dim_size,
             jnp.dtype(self.dtype).itemsize,
+            self.fp8_comm,
             num_devices=self.num_devices,
         )
 
@@ -130,3 +146,8 @@ class Config:
     @property
     def packing_factor(self) -> int:
         return 4 // jnp.dtype(self.dtype).itemsize
+
+    @property
+    def skip_scale_dma(self) -> bool:
+        # A static scale is a constant on both ends, so it is never sent.
+        return self.fp8_comm and self.fp8_static_scale is not None

@@ -30,6 +30,9 @@ logger = init_logger(__name__)
 OP_NAME = "pallas::hier_reduce_scatter"
 
 STREAM_MIN_BYTES = 16 << 20
+# Below this many input bytes per device the FP8 quantize pass costs more than
+# the halved wire bytes save on tpu7x-8, so the call keeps the BF16 wire.
+FP8_MIN_BYTES = 16 << 20
 
 
 class _Armed(NamedTuple):
@@ -66,6 +69,9 @@ def make_reduce_scatter_fn(
     order: tuple[int, ...],
     *,
     axis_name: str,
+    fp8_comm: bool = False,
+    fp8_static_scale: float | None = None,
+    fp8_min_bytes: int = FP8_MIN_BYTES,
     stream: bool = True,
     stream_min_bytes: int = STREAM_MIN_BYTES,
 ):
@@ -92,12 +98,32 @@ def make_reduce_scatter_fn(
         blocks = part.reshape(num_devices, rows // num_devices, hidden)
         return blocks[perm].reshape(rows, hidden)
 
+    if fp8_static_scale is not None and fp8_static_scale <= 0:
+        raise ValueError(f"fp8_static_scale must be > 0, got {fp8_static_scale}")
+
     def local(part: jax.Array) -> jax.Array:
         rows = part.shape[0]
-        if stream and part.nbytes >= stream_min_bytes and supports_stream(rows):
+        fp8 = fp8_comm and part.nbytes >= fp8_min_bytes
+        use_stream = (
+            stream and part.nbytes >= stream_min_bytes and supports_stream(rows)
+        )
+        if use_stream and not fp8:
             return reduce_scatter_stream_local(part, axis_name=axis_name, order=order)
+        # The row-streaming kernel's FP8 wire is static-scale only.
+        if use_stream and fp8_static_scale is not None:
+            return reduce_scatter_stream_local(
+                part,
+                axis_name=axis_name,
+                order=order,
+                fp8_comm=True,
+                fp8_static_scale=fp8_static_scale,
+            )
         return hierarchical_reduce_scatter_local(
-            permute(part), num_devices=num_devices, axis_name=axis_name
+            permute(part),
+            num_devices=num_devices,
+            axis_name=axis_name,
+            fp8_comm=fp8,
+            fp8_static_scale=fp8_static_scale,
         )
 
     def reduce_scatter(x: jax.Array) -> jax.Array:
@@ -117,6 +143,13 @@ def prebuild_hier_reduce_scatter() -> bool:
     global _ARMED
     if _ARMED is not None or not envs.TPU_MOE_EP_HIER_RS:
         return _ARMED is not None
+    fp8 = envs.TPU_MOE_EP_HIER_RS_ICI_DTYPE == "fp8"
+    scale = envs.TPU_MOE_EP_HIER_RS_FP8_STATIC_SCALE
+    if scale is not None and scale <= 0:
+        raise ValueError(
+            f"TPU_MOE_EP_HIER_RS_FP8_STATIC_SCALE must be a positive number, got "
+            f"{scale}. Unset it for per-chunk dynamic scaling."
+        )
     reason = _unsupported_world_reason()
     if reason is not None:
         logger.warning_once(
@@ -140,7 +173,13 @@ def prebuild_hier_reduce_scatter() -> bool:
     order = ep_rank_order()
     ep = get_ep_group()
     assert mesh is not None and order is not None and ep is not None
-    reduce_scatter = make_reduce_scatter_fn(mesh, order, axis_name=EP_AXIS_NAME)
+    reduce_scatter = make_reduce_scatter_fn(
+        mesh,
+        order,
+        axis_name=EP_AXIS_NAME,
+        fp8_comm=fp8,
+        fp8_static_scale=scale,
+    )
     op = sharded_jax_op(
         OP_NAME,
         reduce_scatter,
@@ -152,9 +191,15 @@ def prebuild_hier_reduce_scatter() -> bool:
     op.register_fake(lambda x: x.new_empty((x.shape[0] // num_devices, x.shape[1])))
     _ARMED = _Armed(op=op, ranks=tuple(int(r) for r in ep.ranks))
     logger.info_once(
-        "MoE combine reduce-scatter runs on hierrs_tc: %d devices, ici_dtype=bf16, "
+        "MoE combine reduce-scatter runs on hierrs_tc: %d devices, ici_dtype=%s%s, "
         "rank at each mesh index=%s.",
         num_devices,
+        envs.TPU_MOE_EP_HIER_RS_ICI_DTYPE,
+        ""
+        if not fp8
+        else f", static scale {scale}"
+        if scale is not None
+        else ", dynamic scale (micro-batched kernel only)",
         order,
     )
     return True
