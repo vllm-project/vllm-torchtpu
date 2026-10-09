@@ -159,6 +159,7 @@ docker run --rm --name "${CONTAINER_NAME}" "${DEVICE_ARGS[@]}" --net=host --shm-
   ${VLLM_ENGINE_READY_TIMEOUT_S:+-e VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S}"} \
   "${TEST_SUITE_VARS[@]}" \
   "${BQ_EVAL_VARS[@]}" \
+  ${DSV41_SHEETS_SERVICE_ACCOUNT:+-e DSV41_SHEETS_SERVICE_ACCOUNT} \
   "${IMAGE_TAG}" \
   bash -c '
     umask 000

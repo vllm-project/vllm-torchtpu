@@ -140,6 +140,47 @@ entry of that config, writing `<results-dir>/decode/sweep.md`:
   --config deepseek-v41-flash-tp8-ep-100k-decode --results-dir <DIR>
 ```
 
+### C64 DSpark and Engram offload CI
+
+The `epic/dsv41` lane includes
+`deepseek-v41-flash-tp8-ep-100k-decode-c64-dspark-offload`: C64, 100,000 input
+tokens, 12,000 output tokens, TP8/EP8/DP1, FP8 KV, DSpark K=5, and Engram CPU
+offload. It uses 8192-token prefill chunks and `[64,384,8192]` compile buckets.
+SP and local Q are off; SparseCore MoE is on. These settings are separate from
+the C4/C8/C16 baseline. The job warms up, measures one round, and keeps all
+benchmark and server artifacts. It has no throughput regression threshold yet.
+
+After a complete valid round, `run_dsv41_c64_ci.sh` writes to the
+[`decode-100k-ci` tab](https://docs.google.com/spreadsheets/d/1A2nrPEJgRd6wYGSqW5IZwaHDYph6viYH40kuRaBMpzw/edit#gid=1542472756).
+Columns A:R remain intact on existing rows. Columns S:Z hold C64 peak-window
+throughput, stream ITL P50, TTFT P50, full-overlap throughput, job URL, agent,
+workload, and effective TPOT. Stream ITL P50 may be zero when DSpark returns
+several tokens in one chunk. Effective TPOT is derived as
+`1000 * 64 / full_overlap_throughput` in milliseconds; it is not a percentile.
+The build number and commit identify the row. Retrying the job updates
+that row; the Buildkite concurrency group serializes these writers. Other sheet
+writers must preserve S:Z and avoid replacing the whole tab.
+
+The upload rejects incomplete output, invalid concurrency overlap, missing or
+nonzero preemptions, and missing metrics. It preserves `sheet-row.json` before
+upload and writes `sheet-upload.json` only after a successful API response.
+An upload failure fails the CI step while retaining its benchmark artifacts.
+For a local row preview, run `upload_decode_sheet.py --dry-run` with the summary,
+spreadsheet ID, sheet ID, and the run's `BUILDKITE_BUILD_NUMBER`,
+`BUILDKITE_BUILD_URL`, `BUILDKITE_JOB_ID`, and `BUILDKITE_COMMIT` in the environment.
+
+The CI image's `benchmarking` extra includes the Google auth client. Upload uses
+Application Default Credentials with the Sheets scope. Grant the CI identity
+Editor access to the spreadsheet and enable the Sheets API in its project.
+When the agent's credentials cannot request the Sheets scope, set
+`DSV41_SHEETS_SERVICE_ACCOUNT` in the Buildkite agent environment to a dedicated
+sheet writer. The source identity needs Service Account Token Creator on that
+account, the IAM Credentials API must be enabled, and that account needs Editor
+access to the sheet. See the
+[Google auth impersonation guide](https://google-auth.readthedocs.io/en/latest/reference/google.auth.impersonated_credentials.html).
+No personal OAuth credentials or service-account keys are stored in the repo.
+The PR does not provision those permissions; verify them before enabling upload.
+
 ## Prerequisites
 
 - vLLM installed (provides `benchmark_serving.py`)
