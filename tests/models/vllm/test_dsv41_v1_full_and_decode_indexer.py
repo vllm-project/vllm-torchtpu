@@ -1316,7 +1316,7 @@ class TestV1Model:
         model.start_layer = 0
         model.end_layer = 4
         model._ced_boundary = 2
-        model.use_mega_moe = True
+        model.use_native_mega_moe = True
         model.engram_hash = None
         model.use_sequence_parallel = False
         model.aux_hidden_state_layers = []
@@ -1451,7 +1451,7 @@ class TestV1Model:
         model.start_layer = 0
         model.end_layer = 1
         model._ced_boundary = 1
-        model.use_mega_moe = True
+        model.use_native_mega_moe = True
         model.engram_hash = None
         model.use_sequence_parallel = False
         model.aux_hidden_state_layers = []
@@ -1513,7 +1513,7 @@ class TestV1Model:
         model.start_layer = 0
         model.end_layer = 1
         model._ced_boundary = 1
-        model.use_mega_moe = False
+        model.use_native_mega_moe = False
         model.use_sequence_parallel = False
         model.aux_hidden_state_layers = []
         model._mtp_hidden_buffer = None
@@ -1689,7 +1689,7 @@ class TestV1Model:
         model.start_layer = 0
         model.end_layer = 1
         model._ced_boundary = 1
-        model.use_mega_moe = False
+        model.use_native_mega_moe = False
         model.engram_hash = None
         model.use_sequence_parallel = True
         model.aux_hidden_state_layers = [0, 1]
@@ -1793,7 +1793,7 @@ class TestV1Model:
         model.start_layer = 0
         model.end_layer = 1
         model._ced_boundary = 1
-        model.use_mega_moe = False
+        model.use_native_mega_moe = False
         model.engram_hash = None
         model.use_sequence_parallel = False
         model.aux_hidden_state_layers = []

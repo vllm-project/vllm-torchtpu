@@ -422,13 +422,13 @@ class TestCommonNgramHashStateFull:
             common_engram.ParallelEngramEmbedding.__init__(
                 emb, 100, 16, (4, 4), cpu_offload=None
             )
-            assert emb.cpu_offload is True
+            assert emb.host_offload is True
 
             emb2 = object.__new__(common_engram.ParallelEngramEmbedding)
             common_engram.ParallelEngramEmbedding.__init__(
                 emb2, 100, 16, (4, 4), cpu_offload=False
             )
-            assert emb2.cpu_offload is False
+            assert emb2.host_offload is False
 
         # _allocate_weights
         w1, s1 = emb._allocate_weights()
@@ -535,7 +535,7 @@ class TestCommonNgramHashStateFull:
             assert engram._staged_raw is not None
             assert engram._host_raw.shape == (4, 2, 16)
 
-            engram.embed_tokens.cpu_offload = False
+            engram.embed_tokens.host_offload = False
             engram._init_staging(max_tokens=4, head_dim=16)
             assert engram._staged_raw is None
 
@@ -1051,25 +1051,25 @@ class TestV2ModelHostEngramStaging:
             (ids.dtype if ids is not None else None, stage)
         )
 
-        # Case 1: self.use_mega_moe=True and input_ids on cpu
-        model.use_mega_moe = True
+        # Case 1: self.use_native_mega_moe=True and input_ids on cpu
+        model.use_native_mega_moe = True
         input_ids = torch.tensor([1, 2], dtype=torch.int32, device="cpu")
         model.forward(input_ids, torch.tensor([0, 1]))
         assert prep_called[-1] == (torch.int64, "full")
 
-        # Case 2: self.use_mega_moe=False -> input_ids kept as-is
-        model.use_mega_moe = False
+        # Case 2: self.use_native_mega_moe=False -> input_ids kept as-is
+        model.use_native_mega_moe = False
         input_ids = torch.tensor([1, 2], dtype=torch.int32, device="cpu")
         model.forward(input_ids, torch.tensor([0, 1]))
         assert prep_called[-1] == (torch.int32, "full")
 
         # Case 3: input_ids is None -> kept as-is
-        model.use_mega_moe = True
+        model.use_native_mega_moe = True
         model.forward(None, None)
         assert prep_called[-1] == (None, "full")
 
         # Case 4: input_ids device is not cpu (mocked cuda/tpu device)
-        model.use_mega_moe = True
+        model.use_native_mega_moe = True
         cuda_ids = MagicMock()
         cuda_ids.device.type = "cuda"
         cuda_ids.dtype = torch.int32

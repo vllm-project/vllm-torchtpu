@@ -476,10 +476,10 @@ class TestModelEngramMethods:
         model.end_layer = 1
         model.engram_dp_shared_memory = True
         model.engram_swa_prefix = "swa_0"
-        model.use_mega_moe = False
+        model.use_native_mega_moe = False
 
         engram = SimpleNamespace(
-            embed_tokens=SimpleNamespace(cpu_offload=cpu_offload),
+            embed_tokens=SimpleNamespace(host_offload=cpu_offload),
             layer_hash_index=0,
             prepare_embeddings=MagicMock(),
         )
@@ -862,7 +862,7 @@ class TestModelEngramMethods:
         # 9. stage == "encoder" scopes layer iteration to _ced_boundary
         model_enc = self._create_mock_model(cpu_offload=True)
         dec_engram = SimpleNamespace(
-            embed_tokens=SimpleNamespace(cpu_offload=True),
+            embed_tokens=SimpleNamespace(host_offload=True),
             layer_hash_index=0,
             prepare_embeddings=MagicMock(),
         )
@@ -910,7 +910,7 @@ class TestModelForward:
         ced_enabled: bool = True,
         sp_enabled: bool = False,
         cpu_offload: bool = False,
-        use_mega_moe: bool = False,
+        use_native_mega_moe: bool = False,
     ) -> DeepseekV41Model:
         model = DeepseekV41Model.__new__(DeepseekV41Model)
         model._ced_enabled = ced_enabled
@@ -920,7 +920,7 @@ class TestModelForward:
         model.start_layer = 0
         model.end_layer = 2
         model.use_sequence_parallel = sp_enabled
-        model.use_mega_moe = use_mega_moe
+        model.use_native_mega_moe = use_native_mega_moe
         model.config = SimpleNamespace(hidden_size=64)
         model._engram_prepared_outside_stage = False
         model._has_cpu_offloaded_engram = MagicMock(return_value=cpu_offload)
@@ -936,7 +936,7 @@ class TestModelForward:
 
     def test_forward_offload_engram_mega_moe_int64(self) -> None:
         model = self._create_model(
-            ced_enabled=False, cpu_offload=True, use_mega_moe=True
+            ced_enabled=False, cpu_offload=True, use_native_mega_moe=True
         )
         model.full_stage = MagicMock(return_value=torch.zeros((2, 64)))
         inp = torch.tensor([1, 2], dtype=torch.int32)
@@ -1055,7 +1055,7 @@ class TestModelForwardStage:
         self,
         *,
         stage_sp: bool = False,
-        use_mega_moe: bool = False,
+        use_native_mega_moe: bool = False,
         mtp: bool = False,
     ) -> DeepseekV41Model:
         model = DeepseekV41Model.__new__(DeepseekV41Model)
@@ -1063,7 +1063,7 @@ class TestModelForwardStage:
         model.end_layer = 2
         model._ced_boundary = 1
         model.use_sequence_parallel = stage_sp
-        model.use_mega_moe = use_mega_moe
+        model.use_native_mega_moe = use_native_mega_moe
         model._engram_prepared_outside_stage = False
         model._has_cpu_offloaded_engram = MagicMock(return_value=False)
         model._prepare_engram = MagicMock(return_value=(None, None))
@@ -1232,7 +1232,7 @@ class TestModelForwardStage:
             assert model._mtp_hidden_buffer[0, 0].item() != 0.0
 
     def test_forward_stage_moe_skip_padding_and_mega_moe(self) -> None:
-        model = self._create_stage_model(stage_sp=True, use_mega_moe=True)
+        model = self._create_stage_model(stage_sp=True, use_native_mega_moe=True)
         pos = torch.tensor([0, 1, 2, 3])
         inp = torch.tensor([1, 2, 3, 4], dtype=torch.int32)
         mock_ctx = SimpleNamespace(is_padding=torch.zeros((4,), dtype=torch.bool))

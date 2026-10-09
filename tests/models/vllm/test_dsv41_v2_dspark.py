@@ -311,7 +311,7 @@ def test_ced_aux_hidden_states_propagation(monkeypatch: pytest.MonkeyPatch):
         start_layer=0,
         end_layer=4,
         _stage_uses_sequence_parallel=lambda stage: False,
-        use_mega_moe=False,
+        use_native_mega_moe=False,
         _has_cpu_offloaded_engram=lambda: False,
         _prepare_engram=lambda *a, **kw: (None, None),
         aux_hidden_state_layers=(1, 2, 3),
@@ -476,9 +476,9 @@ class _FakeDraftAttn(nn.Module):
 
 
 class _FakeDraftFFN(nn.Module):
-    def __init__(self, hidden_size: int, use_mega_moe: bool = False):
+    def __init__(self, hidden_size: int, use_native_mega_moe: bool = False):
         super().__init__()
-        self.use_mega_moe = use_mega_moe
+        self.use_native_mega_moe = use_native_mega_moe
         self.gate = nn.Module()
         self.gate.e_score_correction_bias = nn.Parameter(torch.zeros(4))
         self.shared_experts = nn.Module()
@@ -804,12 +804,12 @@ def test_dspark_load_weights(monkeypatch: pytest.MonkeyPatch):
     assert "model.layers.0.ffn.experts.w13_weight_scale" in loaded
     assert draft_lm.model.confidence_head is None
 
-    # Test use_mega_moe=True and confidence_head loaded
+    # Test use_native_mega_moe=True and confidence_head loaded
     vllm_cfg2 = _make_dspark_vllm_config(
         enable_confidence_head=True, expert_dtype="fp8"
     )
     draft_lm2 = v2_dspark.DSparkDeepseekV41ForCausalLM(vllm_config=vllm_cfg2)
-    draft_lm2.model.layers[0].ffn.use_mega_moe = True
+    draft_lm2.model.layers[0].ffn.use_native_mega_moe = True
     monkeypatch.setattr(
         v2_dspark.upstream,
         "make_deepseek_v4_expert_params_mapping",

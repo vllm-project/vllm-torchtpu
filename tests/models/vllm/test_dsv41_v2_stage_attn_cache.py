@@ -338,7 +338,7 @@ class TestStageAttentionCacheScope:
         model.start_layer = 0
         model.end_layer = 2
         model.use_sequence_parallel = False
-        model.use_mega_moe = False
+        model.use_native_mega_moe = False
         model._has_cpu_offloaded_engram = lambda: False
         model._prepare_engram = lambda *a, **kw: (None, None)
         model._stage_uses_sequence_parallel = lambda stage: False

@@ -656,7 +656,7 @@ class TestModelDecodeEngram:
         model.end_layer = 1
 
         mock_engram = SimpleNamespace(
-            embed_tokens=SimpleNamespace(cpu_offload=cpu_offload),
+            embed_tokens=SimpleNamespace(host_offload=cpu_offload),
             layer_hash_index=0,
             prepare_embeddings=MagicMock(),
         )
