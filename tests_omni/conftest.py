@@ -164,9 +164,7 @@ class _OmniRunnerManager:
                 assert self._active_runner is not None
                 return self._active_runner
             self.close()
-            self._active_runner = OmniRunner(
-                model, deploy_config=stage_cfg, **extra
-            )
+            self._active_runner = OmniRunner(model, deploy_config=stage_cfg, **extra)
             self._active_key = key
             return self._active_runner
 
