@@ -642,19 +642,22 @@ def _topk_body(
                 )
 
         def pipeline_step_coop(scores_vmem, len_slice_vmem):
-            if p != num_subcores:
-                _run_step(scores_vmem, len_slice_vmem)
-                return
-            # One row per SparseCore per wave, so all 16 subcores agree when it
-            # is empty and can skip its histogram, barriers and emit together.
-            # Padded token rows are empty, and a large bucket holds thousands.
-            row = pl.program_id(0) * groups_per_chip + core
-            row_len = jnp.where(row < b, vec_at(len_slice_vmem, 0), 0)
-            pl.when(row_len > 0)(
+            # The subcores of one SparseCore share barriers, so they skip a
+            # wave only together: when none of the core's rows in it has
+            # anything to select (lane 1 of the lengths entry, see
+            # `_sc_topk_direct`). Padded token rows are empty, and a large
+            # bucket holds thousands of them.
+            core_busy = len_slice_vmem[pl.ds(0, LANES)][1] > 0
+            pl.when(core_busy)(
                 functools.partial(_run_step, scores_vmem, len_slice_vmem)
             )
             if write_empty:
-                pl.when((row_len == 0) & (row < b) & (sub == 0))(
+                row = (
+                    pl.program_id(0) * groups_per_chip
+                    + core * groups_per_core
+                    + group_id
+                )
+                pl.when(~core_busy & (row < b) & (s == 0))(
                     functools.partial(write_empty_row, row)
                 )
 
@@ -719,9 +722,16 @@ def _sc_topk_direct(
         words = jnp.pad(words, ((0, pad_b), (0, pad_n)))
 
     lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, padded_b - b))
+    lanes = [lengths]
     if p > 1:
-        lengths = jnp.repeat(lengths, p)
-    lengths_2d = jnp.pad(lengths[:, None], ((0, 0), (0, LANES - 1)))
+        # Lane 1: whether the SparseCore a row lands on has any non-empty row
+        # in that wave. Rows of wave w are w * groups_per_chip + [0, 32 // p).
+        core_busy = jnp.any(
+            (lengths > 0).reshape(num_waves, 2, groups_per_chip // 2), axis=-1
+        )
+        core_busy = jnp.repeat(core_busy.reshape(-1), groups_per_chip // 2)
+        lanes = [jnp.repeat(lengths, p), jnp.repeat(core_busy.astype(jnp.int32), p)]
+    lengths_2d = jnp.pad(jnp.stack(lanes, axis=1), ((0, 0), (0, LANES - len(lanes))))
 
     extra_inputs = ()
     if local_idxs is not None:
