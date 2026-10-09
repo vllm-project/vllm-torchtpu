@@ -1063,6 +1063,7 @@ def _effective_row_lengths(
         "cp_size",
         "interleave_size",
         "return_scores",
+        "uniform_q_len",
     ),
 )
 def streamindex_topk(
@@ -1091,6 +1092,7 @@ def streamindex_topk(
     cp_rank: jax.Array | int = 0,
     interleave_size: int = 1,
     return_scores: bool = False,
+    uniform_q_len: int | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1146,6 +1148,12 @@ def streamindex_topk(
         serves every rank.
       interleave_size: CP chunk-interleave width in uncompressed tokens. Must be a
         multiple of `compression_ratio`.
+      uniform_q_len: the query length every sequence in
+        `[distribution[0], distribution[1])` has -- speculative-decoding verify
+        windows, for instance. That segment is then scored by its own pass with
+        a static q length and the (decode, prefill, mixed) block sizes' prefill
+        entry, instead of the decode passes, which assume one query token. None
+        keeps the segment on the decode passes.
       return_scores: also return the score of each selected position, which is
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
@@ -1410,15 +1418,32 @@ def streamindex_topk(
                 ),
             )
         )
+        uniform = (
+            ()
+            if uniform_q_len is None
+            else (
+                dict(
+                    num_kv_pages_per_block=num_kv_pages_per_blocks[1],
+                    num_queries_per_block=num_queries_per_blocks[1],
+                    buffer_count=buffer_counts[1],
+                    start_seq_idx=distribution[0],
+                    end_seq_idx=distribution[1],
+                    static_q_len=uniform_q_len,
+                    seq_batch_size=1,
+                    case=MlaCase.PREFILL,
+                ),
+            )
+        )
         return (
             *batched_decode,
             # Handle num_decode_seqs % decode_req_batch_size != 0 case.
             dict(
                 start_seq_idx=decode_batch_end,
-                end_seq_idx=distribution[1],
+                end_seq_idx=distribution[0 if uniform else 1],
                 seq_batch_size=1,
                 **decode_cfg,
             ),
+            *uniform,
             dict(
                 num_kv_pages_per_block=num_kv_pages_per_blocks[2],
                 num_queries_per_block=num_queries_per_blocks[2],
