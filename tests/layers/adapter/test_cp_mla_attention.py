@@ -67,6 +67,8 @@ class _FakeGroup:
 
     def reduce_scatter(self, tensor, dim=-1):
         total = self._reduced(tensor.dtype)
+        if dim == 0:
+            total = total.transpose(0, 1)
         width = total.shape[dim] // self.world_size
         return total.narrow(dim, self.rank_in_group * width, width)
 
@@ -160,7 +162,7 @@ def test_a_token_no_rank_owns_is_zero_not_nan(monkeypatch):
 
 
 class _HeadGatherGroup:
-    """Serves only `all_gather(dim=1)`, from a stack of per-rank head slices."""
+    """Serves `all_gather(dim=0)` (head-major) or `dim=1` from per-rank slices."""
 
     def __init__(self, per_rank, rank):
         self.world_size = len(per_rank)
@@ -168,6 +170,10 @@ class _HeadGatherGroup:
         self._per_rank = per_rank
 
     def all_gather(self, tensor, dim=0):
+        if dim == 0:
+            expected_hm = self._per_rank[self.rank_in_group].transpose(0, 1)
+            assert tensor.shape == expected_hm.shape
+            return torch.cat([r.transpose(0, 1) for r in self._per_rank], dim=0)
         assert dim == 1
         assert tensor.shape == self._per_rank[self.rank_in_group].shape
         return torch.cat(list(self._per_rank), dim=1)

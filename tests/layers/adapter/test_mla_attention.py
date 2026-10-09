@@ -786,7 +786,7 @@ class _FakeQProj:
 
 
 class _FakeHeadGatherGroup:
-    """Serves `all_gather(dim=1)` from a known per-rank stack."""
+    """Serves `all_gather(dim=0)` (head-major) or `dim=1` from a per-rank stack."""
 
     def __init__(self, per_rank, rank):
         self.world_size = len(per_rank)
@@ -794,6 +794,10 @@ class _FakeHeadGatherGroup:
         self._per_rank = per_rank
 
     def all_gather(self, tensor, dim=0):
+        if dim == 0:
+            expected_hm = self._per_rank[self.rank_in_group].transpose(0, 1)
+            torch.testing.assert_close(tensor, expected_hm)
+            return torch.cat([r.transpose(0, 1) for r in self._per_rank], dim=0)
         assert dim == 1
         torch.testing.assert_close(tensor, self._per_rank[self.rank_in_group])
         return torch.cat(self._per_rank, dim=1)

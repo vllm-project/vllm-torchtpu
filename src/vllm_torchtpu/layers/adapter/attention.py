@@ -1960,12 +1960,18 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             parallel_config, "cp_kv_cache_interleave_size", 1
         )
         self._dcp_mesh = None
-
         if self.dcp_size > 1 and envs.TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER:
             logger.info_once(
                 "Applied TPU patch: TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER - one "
                 "all-gather of concatenated (q_nope, q_pe) whenever q is "
                 "not replicated and both share a dtype (dcp=%d).",
+                self.dcp_size,
+            )
+        if self.dcp_size > 1 and envs.TPU_DCP_HEAD_MAJOR_COLLECTIVES:
+            logger.info_once(
+                "Applied TPU patch: TPU_DCP_HEAD_MAJOR_COLLECTIVES - "
+                "head-major dim=0 collectives in all_gather_heads and "
+                "merge_lse_partials_scatter_heads (dcp=%d).",
                 self.dcp_size,
             )
         if self.dcp_size > 1:
@@ -2403,7 +2409,11 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         ql_nope = torch.bmm(q_nope_t, w_uk_t)
         if w_uk_t_scale is not None:
             ql_nope = ql_nope * w_uk_t_scale
-        ql_nope = ql_nope.transpose(0, 1).to(input_dtype)
+        ql_nope = (
+            ql_nope.to(input_dtype).transpose(0, 1)
+            if ql_nope.dtype != input_dtype
+            else ql_nope.transpose(0, 1)
+        )
 
         q_scale, k_scale, v_scale = self._get_kv_scales(layer)
 
