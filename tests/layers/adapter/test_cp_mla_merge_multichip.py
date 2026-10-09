@@ -27,6 +27,7 @@ import os
 import signal
 import subprocess
 import sys
+import threading
 import time
 import traceback
 from pathlib import Path
@@ -376,11 +377,126 @@ def _run_worker(result_dir: Path, bench_tokens: list[int]) -> None:
 
 
 # --------------------------------------------------------------------- pytest
-def _launch(result_dir: Path, extra: list[str]) -> subprocess.CompletedProcess[str]:
+# /proc/net/tcp state codes.
+_TCP_STATES = {
+    "01": "ESTABLISHED",
+    "02": "SYN_SENT",
+    "03": "SYN_RECV",
+    "04": "FIN_WAIT1",
+    "05": "FIN_WAIT2",
+    "06": "TIME_WAIT",
+    "07": "CLOSE",
+    "08": "CLOSE_WAIT",
+    "09": "LAST_ACK",
+    "0A": "LISTEN",
+    "0B": "CLOSING",
+}
+_LOOPBACK = ("127.", "::1:")
+
+
+def _hex_endpoint(endpoint: str) -> str:
+    """`0100007F:1F90` -> `127.0.0.1:8080`, for v4 and v6 rows alike."""
+    import ipaddress
+
+    addr, port = endpoint.rsplit(":", 1)
+    raw = bytes.fromhex(addr)
+    # The kernel prints each 32-bit word of the address in host byte order.
+    raw = b"".join(raw[i : i + 4][::-1] for i in range(0, len(raw), 4))
+    ip = ipaddress.ip_address(raw)
+    # A v4 peer on a dual-stack socket shows up as ::ffff:a.b.c.d.
+    ip = getattr(ip, "ipv4_mapped", None) or ip
+    return f"{ip}:{int(port, 16)}"
+
+
+def _sockets_on(ports: set[int]) -> list[tuple[int, str, str, str]]:
+    """(port, state, remote, inode) of every socket bound to one of `ports`.
+
+    /proc/net/tcp lists the whole network namespace, so it includes sockets
+    of other containers in the pod whose processes this one cannot see.
+    """
+    found = []
+    for table in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            rows = Path(table).read_text(encoding="utf-8").splitlines()[1:]
+        except OSError:
+            continue
+        for row in rows:
+            fields = row.split()
+            port = int(fields[1].rsplit(":", 1)[1], 16)
+            if port in ports:
+                state = _TCP_STATES.get(fields[3], fields[3])
+                found.append((port, state, _hex_endpoint(fields[2]), fields[9]))
+    return found
+
+
+def _socket_owner(inode: str) -> str:
+    target = f"socket:[{inode}]"
+    for link in Path("/proc").glob("[0-9]*/fd/*"):
+        try:
+            if os.readlink(link) == target:
+                pid = link.parts[2]
+                comm = Path(f"/proc/{pid}/comm").read_text(encoding="utf-8")
+                return f"pid {pid} ({comm.strip()})"
+        except OSError:
+            continue
+    return "a process this container cannot see"
+
+
+class _PortWatch(threading.Thread):
+    """Samples the sockets on the slice builder ports while the workers run.
+
+    The launch env picks those ports free in this process, and the workers
+    bind them seconds later. A socket that takes one in between - in a pod
+    the gcsfuse sidecar shares the network namespace and opens connections
+    all the time - can keep that worker's server from starting, and the
+    other ranks then wait for it until startup times out. The report names
+    the ports no worker ever listened on and every non-loopback socket seen
+    on them.
+    """
+
+    def __init__(self, ports: set[int]):
+        super().__init__(daemon=True)
+        self.ports = ports
+        self.listened: set[int] = set()
+        self.foreign: dict[tuple[int, str], str] = {}
+        self._done = threading.Event()
+
+    def run(self) -> None:
+        while not self._done.is_set():
+            for port, state, remote, inode in _sockets_on(self.ports):
+                if state == "LISTEN":
+                    self.listened.add(port)
+                elif (
+                    not remote.startswith(_LOOPBACK)
+                    and (port, inode) not in self.foreign
+                ):
+                    self.foreign[(port, inode)] = (
+                        f"port {port} {state} remote {remote}, "
+                        f"owner {_socket_owner(inode)}, at {time.strftime('%H:%M:%S')}"
+                    )
+            self._done.wait(0.5)
+
+    def stop(self) -> None:
+        self._done.set()
+        self.join(timeout=10)
+
+    def report(self) -> str:
+        never = sorted(self.ports - self.listened)
+        foreign = list(self.foreign.values())
+        return (
+            f"slice builder ports {sorted(self.ports)}; "
+            f"no worker listened on: {never or 'none'}; "
+            f"non-loopback sockets seen on them: {foreign or 'none'}"
+        )
+
+
+def _launch(
+    result_dir: Path, extra: list[str], env: dict[str, str]
+) -> subprocess.CompletedProcess[str]:
     process = subprocess.Popen(
         _worker_command(result_dir, extra),
         cwd=Path(__file__).resolve().parents[3],
-        env=_prepare_worker_env(),
+        env=env,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
@@ -447,12 +563,35 @@ def test_all_to_all_merge_on_real_collectives(tmp_path):
     extra = []
     if os.environ.get("DCP_MERGE_BENCH_TOKENS"):
         extra = ["--bench-tokens", os.environ["DCP_MERGE_BENCH_TOKENS"]]
-    completed = _launch(result_dir, extra)
+    from tests.tpu_release import tpu_device_owners, wait_for_tpu_release
+
+    # The previous test's worker group may still be releasing its chips, and
+    # a worker that cannot open its chip never joins the slice.
+    held = tpu_device_owners()
+    if held:
+        print(f"TPU device nodes still held before launch: {held}")
+    wait_for_tpu_release()
+    env = _prepare_worker_env()
+    addresses = env.get("TORCH_TPU_SLICEBUILDER_ADDRESSES", "")
+    watch = _PortWatch({int(a.rsplit(":", 1)[1]) for a in addresses.split(",") if a})
+    watch.start()
+    try:
+        completed = _launch(result_dir, extra, env)
+    finally:
+        watch.stop()
     results = _results(result_dir, WORLD_SIZE)
     for line in (completed.stdout or "").splitlines():
         if line.startswith("BENCH "):
             print(line)
     print(json.dumps(results[0], indent=1))
+    failed = any("error" in r for r in results)
+    if failed or completed.returncode != 0:
+        print(watch.report())
+    if failed:
+        # The per-rank results only carry the exception text; the cause is in
+        # the workers' own output and libtpu errors.
+        print("worker output (tail):")
+        print((completed.stdout or "")[-12000:])
     assert completed.returncode == 0 or any("error" in r for r in results), (
         completed.stdout[-12000:]
     )
