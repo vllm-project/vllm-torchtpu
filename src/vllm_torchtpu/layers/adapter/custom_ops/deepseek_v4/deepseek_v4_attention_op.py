@@ -57,6 +57,7 @@ def _run_swa(
     logical_page_size: int,
     swa_only: bool,
     non_causal_block: bool = False,
+    verify_q_len: int | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Sliding-window pass: updates the SWA cache and returns its partials.
 
@@ -89,6 +90,7 @@ def _run_swa(
         q_compute_block_size=4,
         unnormalized_output=not swa_only,
         non_causal_block=non_causal_block,
+        chunk_prefill_size=verify_q_len,
     )
 
 
@@ -115,8 +117,14 @@ def _attention_hca(
     swa_only: bool,
     two_caches_same_buffer: bool,
     non_causal_block: bool = False,
+    verify_q_len: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    """SWA-only layers, and HCA layers over a single raw-bf16 latent array."""
+    """SWA-only layers, and HCA layers over a single raw-bf16 latent array.
+
+    `verify_q_len`: requests [distribution[0], distribution[1]) are speculative
+    verify windows of exactly this many tokens; they run the kernels' static
+    query-length pass instead of the mixed one.
+    """
     if main_cache_kv.shape[0] == 0 or (swa_only and sw_cache.shape[0] == 0):
         # Profiling-shape trace: the kernel is skipped. Unused inputs stay in
         # the compiled signature because torch_tpu jits with keep_unused=True.
@@ -139,6 +147,7 @@ def _attention_hca(
         logical_page_size=logical_page_size,
         swa_only=swa_only,
         non_causal_block=non_causal_block,
+        verify_q_len=verify_q_len,
     )
 
     if swa_only:
@@ -165,6 +174,7 @@ def _attention_hca(
         # The following parameters are tuned based on microbenchmark results.
         num_kv_pages_per_block=(128, 64, 64),
         num_queries_per_block=(1, 32, 32),
+        chunk_prefill_size=verify_q_len,
     )
     return output, updated_sw_cache
 
@@ -192,8 +202,13 @@ def _attention_csa(
     swa_only: bool,
     two_caches_same_buffer: bool,
     non_causal_block: bool = False,
+    verify_q_len: int | None = None,
 ) -> tuple[jax.Array, jax.Array]:
-    """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays."""
+    """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays.
+
+    `verify_q_len` as in `_attention_hca`; the sparse gather is per token and
+    reads only distribution[2].
+    """
     if main_cache_kv.shape[0] == 0 or main_cache_rope.shape[0] == 0:
         return jnp.zeros(q.shape, dtype=q.dtype), sw_cache
 
@@ -214,6 +229,7 @@ def _attention_csa(
         logical_page_size=logical_page_size,
         swa_only=False,
         non_causal_block=non_causal_block,
+        verify_q_len=verify_q_len,
     )
 
     if two_caches_same_buffer:
