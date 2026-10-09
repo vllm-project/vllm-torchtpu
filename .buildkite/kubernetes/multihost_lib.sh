@@ -78,10 +78,13 @@ head_listening() {
 # listening. This is how a worker leaves: nothing kills these pods, so one that
 # waited on its own processes would hold its chips until the JobSet deadline.
 #
-# Gone for 20s straight, not one miss: a DNS blip on the headless service looks
-# identical to a closed port from here, and leaving is irreversible. Probing
-# every 2s keeps that window but notices the end within ~20s; three misses
-# 15s apart held the worker's chips ~70s after the head had exited.
+# The multihost manifests end the Job when the head succeeds (successPolicy on
+# index 0), and Kubernetes terminates the workers then; this is the fallback,
+# for a head that fails or a manifest without that rule. Gone for 20s
+# straight, not one miss: a DNS blip on the headless service looks identical
+# to a closed port from here, and leaving is irreversible. Probing every 2s
+# keeps that window but notices the end within ~20s; three misses 15s apart
+# held the worker's chips ~70s after the head had exited.
 wait_for_head_to_go() {
   local gone_since=""
   while true; do
