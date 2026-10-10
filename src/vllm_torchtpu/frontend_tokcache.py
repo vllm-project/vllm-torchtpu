@@ -379,8 +379,8 @@ def _build_cache_for(tokenizer) -> PrefixTokenCache | None:
         return None
     return PrefixTokenCache(
         encode, boundary_id,
-        max_entries=_env_int("QX_TOKENIZE_PREFIX_CACHE_ENTRIES", 64),
-        max_tokens=_env_int("QX_TOKENIZE_PREFIX_CACHE_MAX_TOKENS", 16_000_000),
+        max_entries=_env_int("QX_TOKENIZE_PREFIX_CACHE_ENTRIES", 512),
+        max_tokens=_env_int("QX_TOKENIZE_PREFIX_CACHE_MAX_TOKENS", 64_000_000),
         min_tokens=_env_int("QX_TOKENIZE_PREFIX_CACHE_MIN_TOKENS", 2048),
         verify_first=_env_int("QX_TOKENIZE_PREFIX_CACHE_VERIFY_FIRST", 8),
         verify_every=_env_int("QX_TOKENIZE_PREFIX_CACHE_VERIFY_EVERY", 0),
