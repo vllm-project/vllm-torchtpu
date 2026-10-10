@@ -170,6 +170,9 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
         return compiled(*args, **kwargs)
 
     qx_fast_compiled._qx_fast_state = state  # type: ignore[attr-defined]
+    qx_fast_compiled._torchdynamo_orig_callable = getattr(  # type: ignore[attr-defined]
+        compiled, "_torchdynamo_orig_callable", fn
+    )
     return qx_fast_compiled
 
 
