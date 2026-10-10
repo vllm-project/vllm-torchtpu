@@ -98,9 +98,6 @@ steps:
       - label: "DeepSeek-V4.1-Flash: C64 DSpark + Engram offload decode"
         key: "dsv41_flash_tp8_ep_c64_dspark_offload_decode"
         timeout_in_minutes: 180
-        # Serialize read/update of the shared sheet across builds and retries.
-        concurrency: 1
-        concurrency_group: "dsv41-c64-decode-sheet"
         agents:
           queue: "tpu_v7x_8_queue"
         env:
@@ -108,14 +105,14 @@ steps:
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
         commands:
           # C64, 98k input / 5k output, DSpark K=5, Engram CPU offload.
-          # Only non-PR epic/dsv41 builds upload; upload errors are warnings.
-          # Upload uses ADC, optionally impersonating the service account in
-          # DSV41_SHEETS_SERVICE_ACCOUNT. It needs Editor access to the sheet.
+          # Use the same benchmark runner and artifacts as C4/C8/C16.
           - >-
             bash .buildkite/scripts/run_in_docker.sh
             env MODEL_URI=gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
             EXTRA_SERVE_ARGS=--language-model-only
-            bash ./scripts/vllm/benchmarking/run_dsv41_c64_ci.sh
+            bash ./scripts/vllm/benchmarking/run_decode_benchmark.sh
+            --config deepseek-v41-flash-tp8-ep-100k-decode-c64-dspark-offload
+            --results-dir /perf_eval_results/deepseek-v41-flash-tp8-ep-100k-decode-c64-dspark-offload
         artifact_paths:
           - "perf_eval_results/**/*"
 
