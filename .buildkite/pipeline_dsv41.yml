@@ -108,6 +108,7 @@ steps:
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
         commands:
           # C64, 98k input / 5k output, DSpark K=5, Engram CPU offload.
+          # Only non-PR epic/dsv41 builds upload; upload errors are warnings.
           # Upload uses ADC, optionally impersonating the service account in
           # DSV41_SHEETS_SERVICE_ACCOUNT. It needs Editor access to the sheet.
           - >-

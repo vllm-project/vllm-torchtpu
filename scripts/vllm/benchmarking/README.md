@@ -151,8 +151,11 @@ SP and local Q are off; SparseCore MoE is on. These settings are separate from
 the C4/C8/C16 baseline. The job warms up, measures one round, and keeps all
 benchmark and server artifacts. It has no throughput regression threshold yet.
 
-After a complete valid round, `run_dsv41_c64_ci.sh` writes to the
+After a complete valid round on a non-PR `epic/dsv41` build,
+`run_dsv41_c64_ci.sh` writes to the
 [`decode-100k-ci` tab](https://docs.google.com/spreadsheets/d/1A2nrPEJgRd6wYGSqW5IZwaHDYph6viYH40kuRaBMpzw/edit#gid=1542472756).
+PR builds, other branches, and runs without explicit Buildkite branch/PR
+metadata keep benchmark artifacts without accessing Sheets.
 Columns A:R remain intact on existing rows. Columns S:Z hold C64 peak-window
 throughput, stream ITL P50, TTFT P50, full-overlap throughput, job URL, agent,
 workload, and effective TPOT. Stream ITL P50 may be zero when DSpark returns
@@ -165,7 +168,9 @@ writers must preserve S:Z and avoid replacing the whole tab.
 The upload rejects incomplete output, invalid concurrency overlap, missing or
 nonzero preemptions, and missing metrics. It preserves `sheet-row.json` before
 upload and writes `sheet-upload.json` only after a successful API response.
-An upload failure fails the CI step while retaining its benchmark artifacts.
+An upload failure emits a warning and retains the benchmark artifacts without
+failing the CI step, matching `run_eval_flow.sh`. Benchmark failures still fail
+the step and prevent upload.
 For a local row preview, run `upload_decode_sheet.py --dry-run` with the summary,
 spreadsheet ID, sheet ID, and the run's `BUILDKITE_BUILD_NUMBER`,
 `BUILDKITE_BUILD_URL`, `BUILDKITE_JOB_ID`, and `BUILDKITE_COMMIT` in the environment.
