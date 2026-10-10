@@ -126,10 +126,13 @@ def test_torch_merge_matches_the_reference(dcp_size, monkeypatch):
 
 @pytest.mark.parametrize("enabled", [False, True])
 def test_rs_bf16_flag_sets_the_reduce_scatter_dtype(enabled, monkeypatch):
-    """TPU_DCP_LSE_MERGE_RS_BF16 rounds the terms to the output dtype before the
+    """TPU_DCP_RS_OUT_PRECISION rounds the terms to the output dtype before the
     reduce-scatter; off, they cross in f32. The result keeps the output dtype."""
     monkeypatch.setattr(
-        cp_mla.envs, "TPU_DCP_LSE_MERGE_RS_BF16", enabled, raising=False
+        cp_mla.envs,
+        "TPU_DCP_RS_OUT_PRECISION",
+        enabled,
+        raising=False,
     )
     outputs, lses = _partials(np.random.default_rng(5), 4)
     outputs = outputs.to(torch.bfloat16)
@@ -150,8 +153,8 @@ def test_rs_bf16_flag_sets_the_reduce_scatter_dtype(enabled, monkeypatch):
 
 def test_rs_bf16_flag_leaves_the_drafter_in_f32(monkeypatch):
     """The MTP drafter (is_backbone=False) keeps the f32 reduce-scatter even
-    with TPU_DCP_LSE_MERGE_RS_BF16 on."""
-    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_RS_BF16", True, raising=False)
+    with TPU_DCP_RS_OUT_PRECISION on."""
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_RS_OUT_PRECISION", True, raising=False)
     outputs, lses = _partials(np.random.default_rng(6), 4)
     outputs = outputs.to(torch.bfloat16)
     group = _FakeGroup(outputs, lses, 0)
@@ -174,7 +177,7 @@ def test_rs_bf16_flag_leaves_the_drafter_in_f32(monkeypatch):
 def test_glm52_fp8_default_reduce_scatters_in_bf16(monkeypatch):
     """GLM-5.2-FP8 (bf16 activations, 64 heads, kv_lora_rank 512) at DCP=16:
     with the flag at its default, the merge passes rs_dtype=bf16."""
-    monkeypatch.delenv("TPU_DCP_LSE_MERGE_RS_BF16", raising=False)
+    monkeypatch.delenv("TPU_DCP_RS_OUT_PRECISION", raising=False)
     dcp, heads, kv_lora_rank = 16, 64, 512
     outputs, lses = _partials(
         np.random.default_rng(52),
