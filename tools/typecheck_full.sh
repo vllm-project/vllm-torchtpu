@@ -27,7 +27,7 @@ if [[ -z "${TYPECHECK_IN_PLACE:-}" && ! -f /.dockerenv && ! -f /run/.containeren
     echo "tools/typecheck_full.sh runs in the CI image and needs Docker." >&2
     exit 1
   fi
-  nightly="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-dev:latest"
+  nightly="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/vllm-torchtpu-dev:latest"
   image="${TYPECHECK_IMAGE:-${nightly}}"
   old_id="$(docker image inspect --format '{{.Id}}' "${image}" 2>/dev/null || true)"
   if [[ "${image}" == "${nightly}" || -z "${old_id}" ]]; then

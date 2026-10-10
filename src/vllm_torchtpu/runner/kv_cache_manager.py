@@ -11,7 +11,7 @@ import copy
 import dataclasses
 import math
 from collections.abc import Callable, Iterable
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 import torch
 from vllm.config import get_layers_from_vllm_config, set_current_vllm_config
@@ -67,6 +67,7 @@ from vllm_torchtpu.kv_cache_spec_normalizer import normalize_kv_cache_specs_for_
 from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
     PallasMLAttentionBackend,
+    VllmTPUDeepseekV32IndexerBackend,
 )
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilder
 from vllm_torchtpu.logger import init_logger
@@ -78,7 +79,29 @@ from vllm_torchtpu.runner.kv_cache_dsv4 import DsV4KVCacheAllocator
 from vllm_torchtpu.utils import synchronize_tensors
 
 if TYPE_CHECKING:
+    from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+
+    class _TpuKVCacheBackend(Protocol):
+        """Typing-only view of the KV cache methods on TPU attention backends."""
+
+        @staticmethod
+        def get_kv_cache_shape(
+            num_blocks: int,
+            block_size: int,
+            num_kv_heads: int,
+            head_size: int,
+            cache_dtype_str: str | torch.dtype = "auto",
+        ) -> tuple[int, ...]: ...
+
+        @staticmethod
+        def get_kv_cache_page_size_bytes(
+            block_size: int,
+            num_kv_heads: int,
+            head_size: int,
+            cache_dtype_str: str | torch.dtype = "auto",
+        ) -> int: ...
+
 
 logger = init_logger(__name__)
 
@@ -484,9 +507,13 @@ class KVCacheManager:
 
         # With fp8 KV cache the shared layer reads the target's cached K/V and
         # dequantizes with its OWN scales, so mismatched scales/dtype would
-        # silently corrupt attention.
-        attn_quant = attn_module.impl.kv_cache_quantized_dtype
-        target_quant = target_module.impl.kv_cache_quantized_dtype
+        # silently corrupt attention. TPU attention layers use the Pallas impl.
+        attn_quant = cast(
+            "PallasAttentionBackendImpl", attn_module.impl
+        ).kv_cache_quantized_dtype
+        target_quant = cast(
+            "PallasAttentionBackendImpl", target_module.impl
+        ).kv_cache_quantized_dtype
         # Trigger the check if EITHER side is fp8: the asymmetric case (only one
         # side quantized) is just as unsafe -- e.g. the shared layer reads the
         # target's packed fp8 bytes as bf16 -- and must error rather than
@@ -604,7 +631,10 @@ class KVCacheManager:
         to make sure every layer is pinned to the *same* one.
         """
         attn_page_sizes = set()
-        backend_cls = TpuPlatform._find_non_ssm_backend(self.runner.vllm_config)
+        backend_cls = cast(
+            "type[_TpuKVCacheBackend] | None",
+            TpuPlatform._find_non_ssm_backend(self.runner.vllm_config),
+        )
         for m in layers.values():
             if isinstance(m, Attention):
                 assert backend_cls is not None
@@ -673,7 +703,10 @@ class KVCacheManager:
             if isinstance(first_attn_module, Attention)
             else 1
         )
-        attention_backend = TpuPlatform._find_non_ssm_backend(self.runner.vllm_config)
+        attention_backend = cast(
+            "type[_TpuKVCacheBackend] | None",
+            TpuPlatform._find_non_ssm_backend(self.runner.vllm_config),
+        )
         assert attention_backend is not None
         attn_page_size_bytes = attention_backend.get_kv_cache_page_size_bytes(
             self.runner.block_size,
@@ -802,8 +835,10 @@ class KVCacheManager:
         budget = utils.compute_hbm_budget(
             [self.runner.device], self.runner.cache_config.gpu_memory_utilization
         )
-        return budget.available - utils.estimate_kv_connector_hbm_reserve(
-            self.runner.vllm_config
+        return utils.min_across_ep_dp(
+            self.runner.vllm_config.parallel_config,
+            budget.available
+            - utils.estimate_kv_connector_hbm_reserve(self.runner.vllm_config),
         )
 
     def _maybe_set_compact_mamba_num_blocks_override(
@@ -1274,7 +1309,10 @@ class KVCacheManager:
         if self.runner._unified_kv_layout:
             self._initialize_unified_kv_cache(kv_cache_config)
             return
-        backend_cls = TpuPlatform._find_non_ssm_backend(self.runner.vllm_config)
+        backend_cls = cast(
+            "type[_TpuKVCacheBackend] | None",
+            TpuPlatform._find_non_ssm_backend(self.runner.vllm_config),
+        )
 
         for group in kv_cache_config.kv_cache_groups:
             spec = group.kv_cache_spec
@@ -1621,7 +1659,12 @@ class KVCacheManager:
                     # Each device partition consistently retains a complete, unsliced
                     # replication of the compressed latent cache structure across
                     # multi-chip execution loops.
-                    kv_cache_shape = PallasMLAttentionBackend.get_kv_cache_shape(
+                    mla_backend_cls = (
+                        VllmTPUDeepseekV32IndexerBackend
+                        if isinstance(attn_module, DeepseekV32IndexerCache)
+                        else PallasMLAttentionBackend
+                    )
+                    kv_cache_shape = mla_backend_cls.get_kv_cache_shape(
                         num_blocks,
                         kv_cache_spec.block_size,
                         kv_cache_spec.num_kv_heads,

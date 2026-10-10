@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Google LLC
-"""In-place Pallas partial slot update for KV cache pools (b/546309078).
+"""In-place Pallas partial slot update for KV cache pools.
 
 ``index_copy_`` lowers to ``stablehlo.scatter``. XLA is functional, so scatter
 means "produce a whole new tensor"; on an eager single-op graph there is no

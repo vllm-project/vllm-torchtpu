@@ -57,6 +57,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer imp
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    get_pallas_op_mesh,
     get_vllm_model_wrapper_context,
 )
 
@@ -297,7 +298,7 @@ class VllmDeepseekV4MLAAttention(
 
     def _build_attn_op(self):
         vllm_context = get_vllm_model_wrapper_context()
-        mesh = vllm_context.mesh
+        mesh = get_pallas_op_mesh()
 
         swa_only = self.compress_ratio <= 1
         is_csa = self.compress_ratio == 4
@@ -335,13 +336,15 @@ class VllmDeepseekV4MLAAttention(
 
         built_from_real_caches = swa_tensor is not None
 
+        # The wrapper context types vllm_config as object.
+        vllm_config = cast(VllmConfig, vllm_context.vllm_config)
         cfg_lps = VllmDeepseekV4SWACache._swa_block_size(
-            vllm_context.vllm_config.cache_config.block_size, self.window_size
+            vllm_config.cache_config.block_size, self.window_size
         )
         if cfg_lps != logical_page_size:
             logical_page_size = cfg_lps
 
-        hf_config = vllm_context.vllm_config.model_config.hf_config
+        hf_config = vllm_config.model_config.hf_config
         sm_scale = (
             getattr(self.mla_attn, "scale", None)
             or getattr(self.mla_attn, "softmax_scale", None)
@@ -472,7 +475,7 @@ class VllmDeepseekV4MLAAttention(
             op = pallas.jax_op(
                 op_name,
                 functools.partial(_qnorm_rope_jax, eps=eps),
-                mesh=get_vllm_model_wrapper_context().mesh,
+                mesh=get_pallas_op_mesh(),
                 input_partition_specs=(
                     P(None, "model", None),  # q
                     P(),  # positions
@@ -497,7 +500,7 @@ class VllmDeepseekV4MLAAttention(
             op = pallas.jax_op(
                 op_name,
                 _rope_jax,
-                mesh=get_vllm_model_wrapper_context().mesh,
+                mesh=get_pallas_op_mesh(),
                 input_partition_specs=(
                     P(),  # kv
                     P(),  # positions
@@ -745,7 +748,7 @@ class VllmDeepseekV4MLAAttention(
             op = pallas.jax_op(
                 op_name,
                 functools.partial(_o_proj_jax, head_dim=head_dim),
-                mesh=get_vllm_model_wrapper_context().mesh,
+                mesh=get_pallas_op_mesh(),
                 input_partition_specs=(
                     P(None, "model", None),  # o
                     P(),  # positions

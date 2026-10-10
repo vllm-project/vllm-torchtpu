@@ -37,7 +37,9 @@ from typing import Any
 
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group
+from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
 
 
 def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
@@ -60,8 +62,24 @@ def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
     return group.all_gather(q.contiguous(), dim=1)
 
 
+def all_gather_q_nope_pe_heads(
+    ql_nope: torch.Tensor,
+    q_pe: torch.Tensor,
+    kv_lora_rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fused all-gather of `(ql_nope, q_pe)` across DCP ranks in a single call."""
+    group = get_dcp_group()
+    if group is None or int(group.world_size) == 1:
+        return ql_nope, q_pe
+    q_dcp = group.all_gather(torch.cat([ql_nope, q_pe], dim=-1), dim=1)
+    return (
+        q_dcp[..., :kv_lora_rank].contiguous(),
+        q_dcp[..., kv_lora_rank:].contiguous(),
+    )
+
+
 def merge_lse_partials_scatter_heads(
-    output: torch.Tensor, lse: torch.Tensor
+    output: torch.Tensor, lse: torch.Tensor, is_backbone: bool = True
 ) -> torch.Tensor:
     """Combine this rank's partial attention output with its peers'.
 
@@ -75,6 +93,10 @@ def merge_lse_partials_scatter_heads(
          Leaves every rank holding every `lse_r`.
       2. reduce-scatter the weighted outputs
 
+    With TPU_DCP_LSE_MERGE_A2A set, the backbone's steps of at most
+    TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS tokens instead take
+    `merge_lse_partials_all_to_all`, which gives the same result.
+
     Args:
       output: `[num_tokens, tp_local_num_heads * dcp_size, kv_lora_rank]`,
         this rank's partial.
@@ -82,6 +104,12 @@ def merge_lse_partials_scatter_heads(
         Entries are `-inf` for tokens this rank owns none of the top-k for;
         such a rank was still fed a dummy key (the kernel requires
         `kv_len >= 1`) and its output must not be weighted in.
+      is_backbone: True if the caller is the backbone, the only model that is
+        traced separately per token bucket. Only then may the merge compare
+        the token count to TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS, since that
+        comparison is fixed at trace time. Pass False from the MTP drafter,
+        which is traced once for every bucket: it always takes the
+        reduce-scatter, exactly as with TPU_DCP_LSE_MERGE_A2A unset.
 
     Returns:
       `[num_tokens, tp_local_num_heads, kv_lora_rank]` in `output.dtype` --
@@ -91,43 +119,68 @@ def merge_lse_partials_scatter_heads(
     if group is None or int(group.world_size) == 1:
         return output
 
-    weighted = _weight_by_lse(output, lse, group)
-    return group.reduce_scatter(weighted, dim=1).to(output.dtype)
+    # This `if` runs while tracing, so its answer is baked into the graph.
+    # Only the backbone is traced once per bucket group, so only it can pick
+    # by size: the all-to-all wins at decode sizes, the reduce-scatter above
+    # because it sums in the network. The MTP drafter has one graph for every
+    # bucket; comparing its token count would pin that graph to the first
+    # size traced. `is_backbone` is checked before the token count, so the
+    # drafter never compares it.
+    if (
+        envs.TPU_DCP_LSE_MERGE_A2A
+        and is_backbone
+        and output.shape[0] <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
+    ):
+        return merge_lse_partials_all_to_all(output, lse, group)
+
+    return cp_lse_ag_out_rs(output, lse, group)
 
 
-def _weight_by_lse(output: torch.Tensor, lse: torch.Tensor, group: Any) -> torch.Tensor:
-    """This rank's `softmax_r(lse) * o_r` term, in f32."""
-    lse_f32 = lse.to(torch.float32).contiguous()
-    # [world_size, num_tokens, num_heads]: small, and it removes the need for
-    # any further reduction over the denominator.
-    gathered = group.all_gather(lse_f32.unsqueeze(0), dim=0)
-    if not isinstance(gathered, torch.Tensor):
-        gathered = torch.cat(list(gathered), dim=0)
+def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:
+    """Block `d` of `x`'s leading axis goes to rank `d`; block `r` of the
+    result came from rank `r`."""
+    from torch.distributed import _functional_collectives as funcol
 
-    finite = torch.isfinite(gathered)
-    shift = torch.where(
-        finite, gathered, torch.full_like(gathered, float("-inf"))
-    ).amax(dim=0)
-    # A token with no contributor on any rank would give inf - inf; pin the
-    # shift to 0 there and let the zero denominator carry the result to zero.
-    empty = ~torch.isfinite(shift)
-    shift = torch.where(empty, torch.zeros_like(shift), shift)
+    out = funcol.all_to_all_single(x.contiguous(), None, None, group.device_group)
+    return funcol.wait_tensor(out)
 
+
+def merge_lse_partials_all_to_all(
+    output: torch.Tensor, lse: torch.Tensor, group: Any
+) -> torch.Tensor:
+    """Same result as the reduce-scatter merge, via all-to-all.
+
+    Each rank sends head block `d` of its partial and lse to rank `d`, then
+    merges its own heads locally in f32. Faster for small token counts.
+    """
+    world = int(group.world_size)
+    num_tokens, num_heads, vdim = output.shape
+    local = num_heads // world
+    # Destination-major: [world, T, local, V] and [world, T, local].
+    o_send = output.reshape(num_tokens, world, local, vdim).transpose(0, 1)
+    l_send = lse.to(torch.float32).reshape(num_tokens, world, local).transpose(0, 1)
+    o_recv = _all_to_all(o_send, group)
+    l_recv = _all_to_all(l_send, group)
+    return _merge_received(o_recv, l_recv).to(output.dtype)
+
+
+def _merge_received(o_recv: torch.Tensor, l_recv: torch.Tensor) -> torch.Tensor:
+    """`[R, T, h, V]` partials and `[R, T, h]` lse -> the f32 `[T, h, V]` merge."""
+    finite = torch.isfinite(l_recv)
+    shift = torch.where(finite, l_recv, torch.full_like(l_recv, float("-inf"))).amax(
+        dim=0
+    )
+    shift = torch.where(torch.isfinite(shift), shift, torch.zeros_like(shift))
     weights = torch.where(
-        finite, torch.exp(gathered - shift.unsqueeze(0)), torch.zeros_like(gathered)
+        finite, torch.exp(l_recv - shift.unsqueeze(0)), torch.zeros_like(l_recv)
     )
     denom = weights.sum(dim=0)
-    safe_denom = torch.where(denom > 0, denom, torch.ones_like(denom))
-
-    # This rank's row of `gathered` is `lse_f32` itself. Weighting from the
-    # local copy instead of indexing by rank keeps the rank out of the traced
-    # program, so every DCP rank compiles the same executable.
-    mine = (
-        torch.where(
-            torch.isfinite(lse_f32),
-            torch.exp(lse_f32 - shift),
-            torch.zeros_like(lse_f32),
-        )
-        / safe_denom
+    weights = weights / torch.where(denom > 0, denom, torch.ones_like(denom))
+    # The compiler lowers multiply-then-sum to a dot that rounds f32 operands to
+    # bf16. Splitting the weights into a bf16 part and a residual keeps it exact.
+    o_f32 = o_recv.to(torch.float32)
+    w_hi = weights.to(torch.bfloat16).to(torch.float32)
+    w_lo = weights - w_hi
+    return (o_f32 * w_hi.unsqueeze(-1)).sum(dim=0) + (o_f32 * w_lo.unsqueeze(-1)).sum(
+        dim=0
     )
-    return (output.to(torch.float32) * mine.unsqueeze(-1)).contiguous()

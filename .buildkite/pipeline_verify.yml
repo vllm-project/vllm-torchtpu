@@ -23,86 +23,27 @@ steps:
      commands:
        - bash .buildkite/scripts/upload_models_and_features.sh
 
-   - label: "Check Metadata Health"
-     key: "check_metadata_health"
+   - label: "Support matrices and verified commit"
      <<: *run-on-nightly-or-tag
+     key: "nightly_report"
+     # The suites the matrices are built from, and the nightly tests-lane steps a
+     # verified commit pair also needs passed. It runs whatever their outcome.
      depends_on:
-       - step: "v6e-group"
-         allow_failure: true
-       - step: "v7x-group"
-         allow_failure: true
+       - "v6e-group"
+       - "v7x-group"
+       - "typecheck_full"
+       - "unit_tests_cpu_nightly"
+       - "unit_tests_general_nightly"
+       - "unit_tests_multichip_nightly"
+       - "unit_tests_spec_decode_nightly"
+       - "unit_tests_spec_decode_multichip_nightly"
+       - "unit_tests_omni_nightly"
+     allow_dependency_failure: true
      agents:
        queue: cpu
-     commands: |
-        if [ "$(buildkite-agent meta-data get stop_support_matrix --default 'false')" = "true" ]; then
-          echo "--- 🛑 Detected critical metadata failure. Blocking support matrix generation."
-          exit 1
-        fi
-        echo "✅ Metadata healthy. Proceeding..."
-
-   - label: "v6 Generate support matrices"
-     <<: *run-on-nightly-or-tag
-     key: "v6_generate_matrices"
-     depends_on: "check_metadata_health"
-     agents: { queue: cpu }
      env:
-       TPU_VERSION: "v6e"
-     command: |
-      if [ "$(buildkite-agent meta-data get run_v6_matrix --default 'false')" = "true" ]; then
-          bash .buildkite/scripts/generate_support_matrices.sh
-        else
-          echo "--- Skipping v6 matrix generation (No v6 test data found)"
-        fi
-
-   - label: "v7 Generate support matrices"
-     <<: *run-on-nightly-or-tag
-     key: "v7_generate_matrices"
-     depends_on: "check_metadata_health"
-     agents: { queue: cpu }
-     env:
-      TPU_VERSION: "v7x"
-     command: |
-      if [ "$(buildkite-agent meta-data get run_v7_matrix --default 'false')" = "true" ]; then
-        bash .buildkite/scripts/generate_support_matrices.sh
-      else
-        echo "--- Skipping v7 matrix generation (No v7 test data found)"
-      fi
-
-   - label: "Commit support matrices if is nightly build or release tag specified"
-     # commit_support_matrices and record_verified_commit_hashes push to origin with
-     # the checkout's GitHub App credentials. They run for main nightlies and release
-     # tags only, not for release-branch nightlies (branch != main, no tag).
-     if: (build.env("NIGHTLY") == "1" && build.branch == "main") || build.tag =~ /^v?[0-9]+(\.[a-zA-Z0-9]+)*([a-zA-Z]+[0-9]*)?$/
-     key: commit_support_matrices
-     depends_on:
-       - "v6_generate_matrices"
-       - "v7_generate_matrices"
-     agents:
-       queue: cpu
-     command:
-       - bash .buildkite/scripts/commit_support_matrices.sh
-
-   - label: "Notify test results"
-     <<: *run-on-nightly-or-tag
-     key: notify_test_results
-     depends_on:
-       - "commit_support_matrices"
-       - "v6_generate_matrices"
-       - "v7_generate_matrices"
-     agents:
-       queue: cpu
+       # Bootstrap's choice of fleet, which can come from the commit message
+       # rather than the build's env.
+       CI_FLEET: "${CI_FLEET:-bare}"
      commands:
-       - bash .buildkite/scripts/notify_test_results.sh
-
-   - label: "Record verified commit hashes"
-     # Pushes to origin on main nightlies only - see commit_support_matrices above.
-     if: build.env("NIGHTLY") == "1" && build.branch == "main"
-     key: record_verified_commit_hashes
-     depends_on:
-       - notify_test_results
-       - tpu6e_tpu_test_notification
-       - tpu7x_tpu_test_notification
-     agents:
-       queue: cpu
-     command:
-       - bash .buildkite/scripts/commit_verified_commit_hashes.sh
+       - bash .buildkite/scripts/nightly_report.sh

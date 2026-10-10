@@ -4,7 +4,7 @@
     HND         -> SEQ_ALONG_LANE, tokens on lanes and head_dim in the words
 
 Only the second makes an fp8 page smaller than a bf16 page when a rank holds a
-single KV head (b/510425663).
+single KV head.
 """
 
 import contextlib
@@ -31,8 +31,9 @@ KVLayout = batched_rpa_configs.KVLayout
 BASE = PallasAttentionBackend
 BATCHED = PallasBatchedRPAAttentionBackend
 
-# (num_kv_heads, head_size); 1 KV head is the b/510425663 case (a TP=4 rank of
-# a 4-KV-head model), 128 and 256 are the head widths in use on this backend.
+# (num_kv_heads, head_size); 1 KV head (a TP=4 rank of a 4-KV-head model) is the
+# case where only SEQ_ALONG_LANE halves the fp8 page. 128 and 256 are the head
+# widths in use on this backend.
 HEAD_CASES = [(1, 128), (1, 256), (2, 128), (4, 128), (8, 128), (8, 256)]
 # Subset for properties that only carry a value through rather than recompute it.
 HEAD_CASES_CORE = [(1, 128), (2, 128), (8, 256)]

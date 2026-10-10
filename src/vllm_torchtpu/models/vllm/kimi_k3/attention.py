@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 from torch import nn
 from vllm.config import VllmConfig
@@ -687,6 +689,8 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         del positions
         group = self.prefill_group if sequence_parallel else get_tp_group()
         assert group is not None
+        # Set and read only on the low-rank gate path.
+        gate_input: torch.Tensor | None = None
         if self.packed_prefill_weight is not None:
             # Every token bucket must capture the same parameter list: the
             # serving compiler hands executables between traces by input ABI.
@@ -763,12 +767,12 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 self.A_log,
                 self.dt_bias,
                 self.o_norm.weight,
-                metadata.query_start_loc,
-                metadata.mamba_state_indices,
-                metadata.seq_lens,
-                metadata.request_distribution,
-                window_distribution,
-                slot_read_offsets,
+                cast(torch.Tensor, metadata.query_start_loc),
+                cast(torch.Tensor, metadata.mamba_state_indices),
+                cast(torch.Tensor, metadata.seq_lens),
+                cast(torch.Tensor, metadata.request_distribution),
+                cast(torch.Tensor, window_distribution),
+                cast(torch.Tensor, slot_read_offsets),
             ).flatten(1)
 
         if sequence_parallel and isinstance(group, FusedPrefillCollectives):
@@ -816,8 +820,8 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             self.A_log,
             self.dt_bias,
             self.o_norm.weight,
-            metadata.query_start_loc,
-            state_indices,
-            metadata.seq_lens,
-            metadata.request_distribution,
+            cast(torch.Tensor, metadata.query_start_loc),
+            cast(torch.Tensor, state_indices),
+            cast(torch.Tensor, metadata.seq_lens),
+            cast(torch.Tensor, metadata.request_distribution),
         )

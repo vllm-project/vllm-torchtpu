@@ -84,6 +84,14 @@ def _release_tpu_between_tests(request):
 #       baselines anyway. They gate throughput, not correctness.
 
 
+# Every engine in this file runs max_model_len=256 with at most 10 short prompts,
+# so no step goes over 256 tokens: a batch-10 prefill is ~200, and a batch-10
+# verify with 15 draft tokens is 160. vLLM's default budget here is
+# max_model_len * max_num_seqs (2560 at bs10, 1024 at bs4), which only adds
+# 512..2560 token buckets that every engine compiles and no step uses.
+MAX_NUM_BATCHED_TOKENS = 256
+
+
 def _is_v7x():
     return (tpu_info.get_tpu_type() or "").startswith("tpu7x")
 
@@ -453,6 +461,7 @@ def _test_correctness_helper(
 
         kwargs = {
             "max_model_len": 256,
+            "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS,
             "max_num_seqs": max_num_seqs,
             "tensor_parallel_size": _get_tensor_parallel_size(),
             "async_scheduling": async_scheduling,
@@ -698,6 +707,7 @@ def test_qwen35_mtp_logprobs_greedy(
     prompts = get_mtp_test_prompts()
     kwargs = {
         "max_model_len": 256,
+        "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS,
         "max_num_seqs": max_num_seqs,
         "tensor_parallel_size": _get_tensor_parallel_size(),
         "async_scheduling": async_scheduling,
@@ -746,6 +756,7 @@ def _test_performance_helper(
 
         kwargs = {
             "max_model_len": 256,
+            "max_num_batched_tokens": MAX_NUM_BATCHED_TOKENS,
             "max_num_seqs": max_num_seqs,
             "tensor_parallel_size": _get_tensor_parallel_size(),
             "enable_prefix_caching": False,
@@ -975,6 +986,7 @@ def test_sd_supports_non_greedy(
                 "num_speculative_tokens": 3,
             },
             max_model_len=256,
+            max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
             max_num_seqs=4,
             tensor_parallel_size=_get_tensor_parallel_size(),
             async_scheduling=False,
@@ -1015,6 +1027,7 @@ def test_sd_correctness_greedy_multi_chunk(
         test_prompts = get_ngram_test_prompts()
         kwargs = dict(
             max_model_len=256,
+            max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
             max_num_seqs=4,
             tensor_parallel_size=_get_tensor_parallel_size(),
             async_scheduling=False,
@@ -1150,6 +1163,7 @@ def test_structured_output_spec_decode_correctness_greedy(
         ]
         kwargs = dict(
             max_model_len=256,
+            max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
             max_num_seqs=4,
             tensor_parallel_size=_get_tensor_parallel_size(),
             async_scheduling=False,
@@ -1258,6 +1272,7 @@ def test_structured_output_spec_decode_non_greedy(
             model=model_name,
             speculative_config=_structured_spec_ngram_config(),
             max_model_len=256,
+            max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
             max_num_seqs=4,
             tensor_parallel_size=_get_tensor_parallel_size(),
             async_scheduling=False,
@@ -1317,6 +1332,7 @@ def test_structured_output_eagle3_greedy(
         ]
         kwargs = dict(
             max_model_len=256,
+            max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
             max_num_seqs=4,
             tensor_parallel_size=_get_tensor_parallel_size(),
             async_scheduling=async_scheduling,
@@ -1449,6 +1465,7 @@ def test_structured_output_eagle3_async_adversarial_choice(
                 "draft_tensor_parallel_size": 1,
             },
             max_model_len=256,
+            max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
             max_num_seqs=4,
             tensor_parallel_size=_get_tensor_parallel_size(),
             async_scheduling=True,
@@ -1541,6 +1558,7 @@ def test_eagle3_correctness_greedy_multi_chunk(
         test_prompts = get_eagle3_test_prompts()
         kwargs = dict(
             max_model_len=256,
+            max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
             max_num_seqs=4,
             tensor_parallel_size=_get_tensor_parallel_size(),
             enable_prefix_caching=False,
@@ -1618,6 +1636,7 @@ def test_eagle3_sharded_draft(
         test_prompts = get_eagle3_test_prompts()
         kwargs = dict(
             max_model_len=256,
+            max_num_batched_tokens=MAX_NUM_BATCHED_TOKENS,
             max_num_seqs=4,
             tensor_parallel_size=tp,
             enable_prefix_caching=False,
@@ -1732,6 +1751,7 @@ _ACCEPTED_METRIC = SPEC_ACCEPTED_METRIC + "_total"
 # in-process run built from the same kwargs.
 _SERVE_TRANSLATED_KEYS = {
     "max_model_len",
+    "max_num_batched_tokens",
     "max_num_seqs",
     "tensor_parallel_size",
     "data_parallel_size",
@@ -1761,6 +1781,7 @@ def _serve_args(kwargs: dict) -> list[str]:
     args: list[str] = []
     for key in (
         "max_model_len",
+        "max_num_batched_tokens",
         "max_num_seqs",
         "tensor_parallel_size",
         "data_parallel_size",

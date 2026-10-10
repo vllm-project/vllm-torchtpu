@@ -653,8 +653,8 @@ def test_build_pcp_streaming_callable_returns_stock_jax_callable(monkeypatch):
 
     It used to be a local subclass so it could size shard_map outputs from
     ``lowered._out_named_shardings``; stock derived them from
-    ``lowered.out_avals``, which jax.export records as replicated. Since
-    cl/975923205 stock takes ``output_partition_specs`` directly, so the
+    ``lowered.out_avals``, which jax.export records as replicated. Now
+    stock takes ``output_partition_specs`` directly, so the
     subclass is unnecessary -- and while it existed it silently dropped every
     argument stock's __call__ gained, ``mesh_device_ids`` included. Asserting
     the exact type is what keeps a subclass from creeping back in.

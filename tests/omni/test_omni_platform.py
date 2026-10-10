@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 import os
 import sys
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 import torch
@@ -10,6 +10,7 @@ from .mock_omni import vllm_omni_mock  # isort: split
 
 import vllm_omni
 from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
+from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
 
 from vllm_torchtpu.omni import register_omni_tpu_platform
 from vllm_torchtpu.omni.attention import TpuSDPABackend, TpuSDPAImpl
@@ -56,6 +57,70 @@ def test_platform_attributes():
 
 def test_device_control_env_var():
     assert OmniTpuPlatform.device_control_env_var == "TPU_VISIBLE_CHIPS"
+
+
+def test_shared_slicebuilder_addresses(monkeypatch):
+    # Every worker derives the same list from the shared MASTER_PORT.
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "localhost:1")
+    OmniTpuPlatform._set_shared_slicebuilder_addresses(2)
+    assert (
+        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"]
+        == "localhost:29501,localhost:29502"
+    )
+    # A correctly sized inherited list (e.g. another stage's) is replaced too.
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "a:1,b:2")
+    OmniTpuPlatform._set_shared_slicebuilder_addresses(2)
+    assert (
+        os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"]
+        == "localhost:29501,localhost:29502"
+    )
+
+
+def test_dist_backend_after_world_size_pop(monkeypatch):
+    # Building the worker's VllmConfig pops WORLD_SIZE after set_device; the
+    # size set_device recorded must keep multi-rank groups on tpu_dist.
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "a:1,b:2")
+    monkeypatch.setattr(OmniTpuPlatform, "_worker_world_size", 1)
+    monkeypatch.setattr(
+        OmniTpuPlatform,
+        "_prepare_singlehost_tpu_env",
+        staticmethod(lambda world_size: None),
+    )
+    monkeypatch.setattr(torch, "accelerator", MagicMock(), raising=False)
+    with patch("torch.empty"), patch("torch.device"):
+        OmniTpuPlatform.set_device(None)
+    monkeypatch.delenv("WORLD_SIZE")
+    assert OmniTpuPlatform().dist_backend == "tpu_dist"
+
+
+@pytest.mark.parametrize("chips, warns", [(None, False), ("0,1", False), ("1,2", True)])
+def test_set_device_warns_on_pinned_multi_rank_stage(monkeypatch, chips, warns):
+    # Ranks bind chips 0..N-1 by local rank, so a stage pinned to other chips
+    # (e.g. a diffusion stage in a multi-stage pipeline) is flagged.
+    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    monkeypatch.setenv("TORCH_TPU_SLICEBUILDER_ADDRESSES", "localhost:1")
+    if chips is None:
+        monkeypatch.delenv("TPU_VISIBLE_CHIPS", raising=False)
+    else:
+        monkeypatch.setenv("TPU_VISIBLE_CHIPS", chips)
+    monkeypatch.setattr(OmniTpuPlatform, "_worker_world_size", 1)
+    monkeypatch.setattr(
+        OmniTpuPlatform,
+        "_prepare_singlehost_tpu_env",
+        staticmethod(lambda world_size: None),
+    )
+    monkeypatch.setattr(torch, "accelerator", MagicMock(), raising=False)
+    with (
+        patch("vllm_torchtpu.omni.platform.logger.warning") as mock_warning,
+        patch("torch.empty"),
+        patch("torch.device"),
+    ):
+        OmniTpuPlatform.set_device(None)
+    assert mock_warning.called == warns
 
 
 def test_memory_methods(monkeypatch):
@@ -159,6 +224,28 @@ def test_ltx2_safe_decode_output():
     runtime.output = (None, None)
     res = runtime._decode_output(**decode_kwargs)
     assert res.output == (None, None)
+
+
+@pytest.mark.parametrize(
+    "rope_cls_name",
+    ["QwenEmbedRope", "QwenEmbedLayer3DRope"],
+)
+def test_qwen_image_rope_txt_freqs_clone(rope_cls_name):
+    apply_omni_model_specific_patches()
+
+    rope_cls = getattr(qwen_image_transformer, rope_cls_name)
+    rope = rope_cls()
+
+    vid_freqs, txt_freqs = rope.forward([(1, 2, 2)], [3], torch.device("cpu"))
+
+    assert not txt_freqs._is_view()
+    assert (
+        txt_freqs.untyped_storage().data_ptr()
+        != rope.pos_freqs.untyped_storage().data_ptr()
+    )
+    assert torch.equal(txt_freqs, rope.pos_freqs[2:5])
+    assert txt_freqs.dtype == torch.complex64
+    assert torch.equal(vid_freqs, rope.pos_freqs[:2])
 
 
 def test_safe_pack_tensor_if_large():

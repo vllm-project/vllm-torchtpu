@@ -51,12 +51,16 @@ def _cpu_model_tests(monkeypatch):
     # lock out every spawned child. With no device module registered there is
     # nothing for Dynamo to query, so there is nothing to stub either.
     tpu = getattr(torch, "tpu", None)
-    if tpu is None:
-        return
-    monkeypatch.setattr(tpu, "is_available", lambda: False)
-    monkeypatch.setattr(tpu, "current_device", lambda: 0)
-    monkeypatch.setattr(tpu, "device_count", lambda: 0)
-    monkeypatch.setattr(tpu, "manual_seed_all", lambda seed: None)
+    if tpu is not None:
+        monkeypatch.setattr(tpu, "is_available", lambda: False)
+        monkeypatch.setattr(tpu, "current_device", lambda: 0)
+        monkeypatch.setattr(tpu, "device_count", lambda: 0)
+        monkeypatch.setattr(tpu, "manual_seed_all", lambda seed: None)
+
+    if hasattr(torch, "accelerator"):
+        monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
+        monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+        monkeypatch.setattr(torch.accelerator, "device_count", lambda: 0)
 
 
 def test_kimi_architectures_are_registered() -> None:
@@ -1000,12 +1004,12 @@ def _patch_kda_construction_deps(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         kimi_attention,
         "build_kimi_dispatched_kda_op",
-        lambda *a, **k: (lambda *args, **kwargs: None),
+        lambda *a, **k: lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
         kimi_attention,
         "build_kimi_pooled_kda_op",
-        lambda *a, **k: (lambda *args, **kwargs: None),
+        lambda *a, **k: lambda *args, **kwargs: None,
     )
 
 

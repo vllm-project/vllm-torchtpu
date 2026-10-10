@@ -193,7 +193,49 @@ run_lm_eval() {
             ;;
     esac
 
-    echo "Running lm_eval for task: $task..."
+    # lm-eval builds every request (contexts, few-shot examples) before sending
+    # the first, ~40s per task with the server idle, and each config rebuilt the
+    # same ones. They follow from the arguments below, the lm-eval version and
+    # our task definitions, not from the model: local-chat-completions leaves
+    # the chat template to the server and fingerprints requests with an empty
+    # tokenizer name. So they are cached per combination in the shared cache,
+    # $HF_HOME/hub (a gcsfuse bucket on kube, the host's model cache on bare
+    # metal), for every config and later run. lm-eval's own cache key leaves
+    # out --limit, --gen_kwargs and the task YAML contents, so the directory
+    # name carries all of it.
+    local request_spec=() skip_next=0 arg
+    for arg in "${lm_eval_args[@]}"; do
+        if [ "$skip_next" = 1 ]; then
+            skip_next=0
+            continue
+        fi
+        case "$arg" in
+            --output_path|--model_args) skip_next=1; continue ;;
+        esac
+        request_spec+=("$arg")
+    done
+    request_spec+=("extra_model_args=$EXTRA_LM_EVAL_MODEL_ARGS")
+    # A tokenizer setting makes requests depend on the model after all.
+    if [[ "$EXTRA_LM_EVAL_MODEL_ARGS" == *tokeniz* ]]; then
+        request_spec+=("model=$MODEL")
+    fi
+    # Best effort: if any input can't be read, the task runs uncached.
+    local request_key="" request_cache=""
+    request_key=$({
+        python3 -c 'import importlib.metadata as m; print(m.version("lm_eval"))'
+        printf '%s\n' "${request_spec[@]}"
+        (cd "$SCRIPT_DIR/lm_eval_tasks" && find . -type f -print0 | sort -z | xargs -0 sha256sum)
+    } | sha256sum | cut -c1-16) || request_key=""
+    if [ -n "$request_key" ]; then
+        request_cache="${LM_EVAL_REQUEST_CACHE_ROOT:-${HF_HOME:-$HOME/.cache/huggingface}/hub/lm_eval_requests}/$request_key"
+        if mkdir -p "$request_cache"; then
+            lm_eval_args+=(--cache_requests true)
+        else
+            request_cache=""
+        fi
+    fi
+
+    echo "Running lm_eval for task: $task (request cache: ${request_cache:-off})..."
     echo "[cmd] lm_eval ${lm_eval_args[*]}"
     # lm-eval's progress bar redraws with carriage returns and ends its line
     # only when the run does. Container runtimes log by line, so an eval with
@@ -202,7 +244,7 @@ run_lm_eval() {
     # Turning each redraw into its own line makes every TQDM_MININTERVAL tick
     # visible; stdbuf stops tr holding them in a block buffer. pipefail keeps
     # lm_eval's exit status.
-    lm_eval "${lm_eval_args[@]}" 2>&1 | stdbuf -oL tr '\r' '\n'
+    LM_HARNESS_CACHE_PATH="$request_cache" lm_eval "${lm_eval_args[@]}" 2>&1 | stdbuf -oL tr '\r' '\n'
 
     if [ -f "$baseline" ]; then
         echo "=== Checking Eval Regression for $task ==="
@@ -356,16 +398,17 @@ if [ "$RUN_MM_EVAL" = "1" ]; then
 fi
 
 # ========================================================
-# 7. Upload results to Spanner and BigQuery (dual write during migration)
+# 7. Upload results to BigQuery (and Spanner, if asked)
 # ========================================================
-echo "=== Uploading results to Spanner and BigQuery ==="
+echo "=== Uploading results ==="
 UPLOAD_ARGS=("--results-dir" "$RESULTS_DIR")
 if [ "${SKIP_DB_UPLOAD:-0}" = "1" ] || [ "${SKIP_DB_UPLOAD:-}" = "true" ] || [ "$SKIP_DB_UPLOAD_FLAG" = "1" ]; then
     UPLOAD_ARGS+=("--skip-db-upload")
 fi
-# Spanner only. A fleet that reports into the shared BigQuery table but keeps
-# no Spanner record of its own sets this; the guard above still wins.
-if [ "${SKIP_SPANNER_UPLOAD:-0}" = "1" ] || [ "${SKIP_SPANNER_UPLOAD:-}" = "true" ]; then
+# Spanner is opt-in: its rows duplicate the BigQuery ones, keyed by the same
+# RecordId. SKIP_SPANNER_UPLOAD=0 writes it as well; the guard above still
+# skips both.
+if [ "${SKIP_SPANNER_UPLOAD:-1}" != "0" ] && [ "${SKIP_SPANNER_UPLOAD:-}" != "false" ]; then
     UPLOAD_ARGS+=("--skip-spanner")
 fi
 

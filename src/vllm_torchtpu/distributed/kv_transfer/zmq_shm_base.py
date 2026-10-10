@@ -77,7 +77,7 @@ def _get_default_ipc_key() -> bytes:
         if os.path.exists("/etc/machine-id"):
             with open("/etc/machine-id") as f:
                 machine_id = f.read().strip()
-    except Exception:
+    except Exception:  # noqa: S110
         pass
     user_id = str(os.getuid()) if hasattr(os, "getuid") else "0"
     base_secret = f"vllm-torchtpu-ipc-auth-{machine_id}-{user_id}".encode()

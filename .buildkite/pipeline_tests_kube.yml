@@ -72,7 +72,20 @@ x-shape-single: &shape_single "${KUBE_SHAPE_SINGLE:-tpu7x-standard-1t/1x1x1}"
 x-shape-multi: &shape_multi "${KUBE_SHAPE_MULTI:-tpu7x-standard-4t/2x2x1}"
 
 steps:
+  # pyrefly in the CI image against .pyrefly-baseline-full.json, as on bare
+  # metal. The pod already runs that image, but typecheck_full.sh decides it is
+  # outside a container by looking for /.dockerenv, which a pod does not have,
+  # and would try to start Docker.
+  - label: ":kubernetes: Type Check - Full Environment"
+    key: "typecheck_full"
+    <<: *cpu_unit_test_defaults
+    plugins:
+      - *kube_plugin
+    commands:
+      - .buildkite/kubernetes/run.sh env TYPECHECK_IN_PLACE=1 bash tools/typecheck_full.sh
+
   - label: ":kubernetes: Unit Tests - CPU (PR)"
+    key: "unit_tests_cpu_pr"
     <<: *cpu_unit_test_defaults
     if: 'build.env("NIGHTLY") != "1"'
     plugins:
@@ -84,6 +97,7 @@ steps:
           test-cmd: "pytest -sv --timeout=600 -m 'not tpu_test and not multichip and not nightly' --junit-xml={{resultPath}} {{testExamples}}"
 
   - label: ":kubernetes: Unit Tests - CPU (Nightly)"
+    key: "unit_tests_cpu_nightly"
     <<: *cpu_unit_test_defaults
     if: 'build.env("NIGHTLY") == "1"'
     plugins:
@@ -103,6 +117,7 @@ steps:
       # Split by file, not by example, so a file that shares one engine
       # across its tests starts it in one shard only.
       - label: ":kubernetes: Unit Tests - General (PR)"
+        key: "unit_tests_general_pr"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") != "1"'
         parallelism: 3
@@ -116,6 +131,7 @@ steps:
               test-cmd: "pytest -sv --timeout=600 -m 'tpu_test and not nightly and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: ":kubernetes: Unit Tests - Multichip (PR)"
+        key: "unit_tests_multichip_pr"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") != "1"'
         env:
@@ -131,6 +147,7 @@ steps:
       # and acceptance-rate tests run nightly. Split by example because the
       # suite is a single file.
       - label: ":kubernetes: Unit Tests - Speculative Decoding (PR)"
+        key: "unit_tests_spec_decode_pr"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") != "1"'
         parallelism: 3
@@ -150,6 +167,7 @@ steps:
               test-cmd: "pytest -sv --timeout=1800 -m 'not nightly and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: ":kubernetes: Unit Tests - Speculative Decoding Multichip (PR)"
+        key: "unit_tests_spec_decode_multichip_pr"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") != "1"'
         env:
@@ -168,6 +186,7 @@ steps:
       # come through the shared cache, downloaded by the first run that needs
       # them.
       - label: ":kubernetes: Unit Tests - Omni (PR)"
+        key: "unit_tests_omni_pr"
         <<: *tpu_step
         depends_on: "build_docker_omni"
         if: 'build.env("NIGHTLY") != "1"'
@@ -188,6 +207,7 @@ steps:
               test-cmd: "pytest -sv --timeout=1200 -m 'not nightly and omni' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: ":kubernetes: Unit Tests - Speculative Decoding (Nightly)"
+        key: "unit_tests_spec_decode_nightly"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") == "1"'
         parallelism: 3
@@ -206,6 +226,7 @@ steps:
       # self-skip on the one-chip shape above, so this step is the only place
       # they run.
       - label: ":kubernetes: Unit Tests - Speculative Decoding Multichip (Nightly)"
+        key: "unit_tests_spec_decode_multichip_nightly"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") == "1"'
         env:
@@ -227,6 +248,7 @@ steps:
               test-cmd: "pytest -sv --timeout=3600 -m 'multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: ":kubernetes: Unit Tests - General (Nightly)"
+        key: "unit_tests_general_nightly"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") == "1"'
         env:
@@ -239,6 +261,7 @@ steps:
               test-cmd: "pytest -sv --timeout=600 -m 'tpu_test and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: ":kubernetes: Unit Tests - Multichip (Nightly)"
+        key: "unit_tests_multichip_nightly"
         <<: *tpu_step
         if: 'build.env("NIGHTLY") == "1"'
         env:
@@ -251,6 +274,7 @@ steps:
               test-cmd: "pytest -sv --timeout=600 -m 'multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: ":kubernetes: Unit Tests - Omni (Nightly)"
+        key: "unit_tests_omni_nightly"
         <<: *tpu_step
         depends_on: "build_docker_omni"
         if: 'build.env("NIGHTLY") == "1"'

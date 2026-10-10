@@ -177,12 +177,12 @@ class _MockCollectiveGroup:
         self.call_log = []
 
     def all_gather(self, tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
-        self.call_log.append(("all_gather", tensor.shape))
+        self.call_log.append(("all_gather", tensor.shape, tensor.dtype))
         # Replicate along dim=0 across world_size
         return torch.cat([tensor] * self.world_size, dim=dim)
 
     def reduce_scatter(self, tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
-        self.call_log.append(("reduce_scatter", tensor.shape))
+        self.call_log.append(("reduce_scatter", tensor.shape, tensor.dtype))
         chunks = tensor.chunk(self.world_size, dim=dim)
         return chunks[self.rank_in_group]
 
@@ -303,6 +303,192 @@ def test_pcp_uses_chunk_pipeline_and_not_dp_collectives():
     assert len([c for c in pcp_group.call_log if c[0] == "all_gather"]) == 6
     assert len([c for c in pcp_group.call_log if c[0] == "reduce_scatter"]) == 2
     assert dp_group.call_log == []
+
+
+def test_fp8_all_gather_is_off_by_default():
+    """The flag is opt-in: nothing quantizes the gather unless it is set."""
+    with patch.dict(os.environ, {}, clear=True):
+        assert envs.TPU_MOE_FP8_ALL_GATHER is False
+
+
+def test_fp8_all_gather_alone_claims_the_collectives():
+    """The fp8 method has to own the gather to be the one quantizing it.
+
+    Chunk pipelining is off here, so this is the flag's own doing: without it
+    vLLM would issue the all-gather itself, in the activations' full width,
+    and the layer would never see the tokens before the wire.
+    """
+    prop = VllmFp8MoEMethodTPU.supports_internal_mk
+    with (
+        patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0),
+        patch.object(envs, "TPU_MOE_FP8_ALL_GATHER", True),
+    ):
+        assert prop.fget(None) is True
+
+    # No other method reads the flag, so none of them changes hands over it.
+    for method_cls in (
+        VllmUnquantizedFusedMoEMethod,
+        VllmMxfp4MoEMethod,
+        VllmNvfp4MoEMethod,
+        VllmCompressedTensorsW4A16MoEMethod,
+        VllmCompressedTensorsW4ANMxfp4MoEMethod,
+    ):
+        with (
+            patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 0),
+            patch.object(envs, "TPU_MOE_FP8_ALL_GATHER", True),
+        ):
+            assert method_cls.supports_internal_mk.fget(None) is False
+
+
+def _run_with_fp8_all_gather(
+    hidden_states, *, group, chunk_size=0, fp8_all_gather=True
+):
+    """Drive pipelined_fused_moe_gmm with an identity kernel.
+
+    Standing in for the real kernel with the identity lets the assertions be
+    about what the pipeline handed it: the gather is the only thing the flag
+    touches, so a kernel that returns its input turns the whole call into a
+    round trip of the activations through the wire.
+    """
+    seq_len, hidden_dim = hidden_states.shape
+    topk = 2
+    calls = []
+
+    def mock_kernel_fn(**kwargs):
+        calls.append(kwargs)
+        return kwargs["hidden_states"]
+
+    with (
+        patch.object(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", chunk_size),
+        patch.object(envs, "TPU_MOE_FP8_ALL_GATHER", fp8_all_gather),
+        patch(
+            "vllm_torchtpu.layers.adapter.pipelined_fused_moe.get_pcp_group",
+            return_value=None,
+        ),
+        patch(
+            "vllm_torchtpu.layers.adapter.pipelined_fused_moe.get_dp_group",
+            return_value=group,
+        ),
+        patch(
+            "vllm_torchtpu.layers.adapter.pipelined_fused_moe.fused_moe_gmm",
+            side_effect=mock_kernel_fn,
+        ),
+    ):
+        out = pipelined_fused_moe_gmm(
+            hidden_states=hidden_states,
+            w1=torch.empty(0),
+            w2=torch.empty(0),
+            w1_scale=None,
+            w2_scale=None,
+            w1_bias=None,
+            w2_bias=None,
+            topk_weights=torch.ones(seq_len, topk, dtype=hidden_states.dtype) / topk,
+            topk_ids=torch.zeros(seq_len, topk, dtype=torch.int32),
+            experts_start=None,
+            topk=topk,
+            activation="silu",
+        )
+    assert out.shape == (seq_len, hidden_dim)
+    return out, calls
+
+
+def test_fp8_all_gather_puts_eight_bit_rows_on_the_wire():
+    group = _MockCollectiveGroup(world_size=4, rank=0)
+    hidden_states = torch.randn(64, 1536, dtype=torch.bfloat16)
+
+    out, calls = _run_with_fp8_all_gather(hidden_states, group=group)
+
+    # The rows cross as int8 -- the same eight bits as fp8, in a dtype every
+    # collective backend carries -- next to one f32 scale per row. The routing
+    # tensors gathered after them keep their own dtypes and are not the point.
+    gathers = [(c[1], c[2]) for c in group.call_log if c[0] == "all_gather"]
+    assert gathers[0] == (hidden_states.shape, torch.int8)
+    assert gathers[1] == ((64, 1), torch.float32)
+    assert not [
+        dtype
+        for shape, dtype in gathers
+        if shape == hidden_states.shape and dtype is not torch.int8
+    ]
+
+    # The narrow form stops at the wire: the kernel is handed the activations
+    # back in their own dtype and full width, exactly as it would be with the
+    # flag off, so nothing downstream has to know the gather was quantized.
+    kwargs = calls[0]
+    assert kwargs["hidden_states"].shape == (64 * 4, 1536)
+    assert kwargs["hidden_states"].dtype is torch.bfloat16
+
+    # e4m3 keeps four mantissa bits, so a round trip lands within 1/32.
+    torch.testing.assert_close(
+        out, hidden_states, rtol=1.0 / 32, atol=float(hidden_states.abs().max()) / 32
+    )
+
+
+def test_fp8_all_gather_takes_a_hidden_size_no_block_would_divide():
+    """Per-row scales make the hidden size the gather's business, not a
+    precondition: 576 is not a multiple of any width the gmm blocks in, and it
+    still crosses whole, unpadded, one scale per row."""
+    group = _MockCollectiveGroup(world_size=2, rank=0)
+    hidden_states = torch.randn(8, 576, dtype=torch.bfloat16)
+
+    out, calls = _run_with_fp8_all_gather(hidden_states, group=group)
+
+    gathers = [(c[1], c[2]) for c in group.call_log if c[0] == "all_gather"]
+    assert gathers[0] == ((8, 576), torch.int8)
+    assert gathers[1] == ((8, 1), torch.float32)
+    assert calls[0]["hidden_states"].shape == (16, 576)
+    torch.testing.assert_close(
+        out, hidden_states, rtol=1.0 / 32, atol=float(hidden_states.abs().max()) / 32
+    )
+
+
+def test_fp8_all_gather_restores_every_chunk_of_the_pipeline():
+    """Each chunk is quantized and restored against its own rows.
+
+    Two chunks are in flight at once here, and each carries a scale derived
+    from its own tokens. Restoring a chunk against the other one's scale would
+    leave the concatenated output nowhere near the input.
+    """
+    group = _MockCollectiveGroup(world_size=4, rank=0)
+    hidden_states = torch.randn(64, 512, dtype=torch.bfloat16)
+    # 64 local tokens * 4 ranks / 128 = 2 chunks.
+    out, calls = _run_with_fp8_all_gather(hidden_states, group=group, chunk_size=128)
+
+    assert len(calls) == 2
+    for kwargs in calls:
+        assert kwargs["hidden_states"].shape == (32 * 4, 512)
+        assert kwargs["hidden_states"].dtype is torch.bfloat16
+
+    torch.testing.assert_close(
+        out, hidden_states, rtol=1.0 / 32, atol=float(hidden_states.abs().max()) / 32
+    )
+
+
+def test_fp8_all_gather_declines_on_a_single_rank():
+    """Nothing crosses the wire on one rank, so rounding would buy nothing."""
+    group = _MockCollectiveGroup(world_size=1, rank=0)
+    hidden_states = torch.randn(64, 512, dtype=torch.bfloat16)
+
+    out, calls = _run_with_fp8_all_gather(hidden_states, group=group)
+
+    assert not [
+        c for c in group.call_log if c[0] == "all_gather" and c[2] is torch.int8
+    ]
+    assert calls[0]["hidden_states"].dtype is torch.bfloat16
+    # Declining means no rounding at all, so this is exact, not approximate.
+    assert torch.equal(out, hidden_states)
+
+
+def test_fp8_all_gather_off_leaves_the_gather_in_full_width():
+    group = _MockCollectiveGroup(world_size=4, rank=0)
+    hidden_states = torch.randn(64, 128, dtype=torch.bfloat16)
+
+    out, calls = _run_with_fp8_all_gather(
+        hidden_states, group=group, fp8_all_gather=False
+    )
+
+    assert [c[2] for c in group.call_log if c[0] == "all_gather"][0] is torch.bfloat16
+    assert calls[0]["hidden_states"].dtype is torch.bfloat16
+    assert torch.equal(out, hidden_states)
 
 
 class TestMoEForwardPrecisionBranches:

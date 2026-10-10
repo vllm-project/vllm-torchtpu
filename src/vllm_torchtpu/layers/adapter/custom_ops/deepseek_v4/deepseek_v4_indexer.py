@@ -34,7 +34,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor 
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-    get_vllm_model_wrapper_context,
+    get_pallas_op_mesh,
 )
 from vllm_torchtpu.utils import align_to
 
@@ -103,8 +103,10 @@ def _indexer_jax(
             k=k,
             compression_ratio=compression_ratio,
             # The following parameters are tuned based on microbenchmark results.
-            num_kv_pages_per_block=(3, 2, 2),
+            num_kv_pages_per_block=(16, 8, 8),
             num_queries_per_block=(1, 128, 128),
+            decode_req_batch_size=4,
+            chunk_tokens=128,
         )
 
     return _indexer_local(
@@ -152,8 +154,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         object.__setattr__(self.compressor, "k_cache", self.k_cache)
 
     def _build_indexer_op(self):
-        vllm_context = get_vllm_model_wrapper_context()
-        mesh = vllm_context.mesh
+        mesh = get_pallas_op_mesh()
 
         wrapped_fn = functools.partial(
             _indexer_jax,

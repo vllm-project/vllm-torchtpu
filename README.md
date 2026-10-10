@@ -124,7 +124,7 @@ VLLM_TARGET_DEVICE="empty" pip install --pre -e . --group vllm
 The local installation of `vllm` is optional. Follow these steps when
 one need to develop with `vllm` directly.
 
-> **Note:** Currently, `vllm==0.27.0` is supported.
+> **Note:** Currently, `vllm==0.29.0` is supported.
 
 #### Option A: Using `uv` (Recommended)
 
@@ -133,7 +133,7 @@ one need to develop with `vllm` directly.
 source ~/uv_venv/bin/activate
 
 # Clone vLLM to allow making local patches for debugging
-git clone --depth 1 --branch v0.27.0 https://github.com/vllm-project/vllm.git ../vllm
+git clone --depth 1 --branch v0.29.0 https://github.com/vllm-project/vllm.git ../vllm
 
 # Install vLLM in editable mode
 VLLM_TARGET_DEVICE="empty" uv pip install  --no-deps -e ../vllm
@@ -146,7 +146,7 @@ VLLM_TARGET_DEVICE="empty" uv pip install  --no-deps -e ../vllm
 source ~/pip_venv/bin/activate
 
 # Clone vLLM to allow making local patches for debugging
-git clone --depth 1 --branch v0.27.0 https://github.com/vllm-project/vllm.git ../vllm
+git clone --depth 1 --branch v0.29.0 https://github.com/vllm-project/vllm.git ../vllm
 
 # Install vLLM in editable mode
 VLLM_TARGET_DEVICE="empty" pip install --no-deps -e ../vllm
@@ -223,6 +223,16 @@ Each pipeline stage runs a slice of the layers on one core and hands its
 hidden states to the next stage with a collective-permute over ICI. Tensor
 parallelism inside a stage is not supported yet, so the worker count is
 `pipeline_parallel_size`.
+
+A stage may instead span a prefill context-parallel group
+(`--prefill-context-parallel-size`), which splits each chunk's attention over
+the stage's cores; MoE models then need `--enable-expert-parallel`. This needs
+a torch_tpu that compiles a stage's kernels and collectives for the stage's
+devices only (the 2026-09-28 build of google-pytorch/torch_tpu#4387); on a
+torch_tpu that builds world-size meshes only, the platform refuses such stages.
+A two-core stage must not be the two cores of one chip: set
+`VLLM_TPU_DEVICE_ORDER` to the device each local rank binds, e.g.
+`0,2,1,3,4,6,5,7` for four stages of two cores on one host.
 
 ```bash
 python3 examples/offline_inference.py \

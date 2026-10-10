@@ -1,7 +1,7 @@
 import functools
 import math
 from collections.abc import Callable
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -150,7 +150,6 @@ def paged_attention_with_guarded_smem(
     lengths: jax.Array,
     page_indices: jax.Array,
 ):
-    # Addresses b/336316706. Summary:
     # Paged attention kernel stores `lengths` (batch_size * 4 bytes) and
     # `page_indices` (batch_size * num_blocks_per_seq * 4 bytes) in SMEM.
     # Capacity of SMEM is quite limited which is also TPU version dependent.
@@ -287,7 +286,7 @@ def apply_splash(q, k, v, window_size, attn_logits_soft_cap, is_mqa) -> jax.Arra
     attn = jax.vmap(attn)
     outputs = attn(q, k, v, None)
 
-    return outputs
+    return cast(jax.Array, outputs)
 
 
 def sharded_splash_attention(
@@ -493,7 +492,7 @@ def attention_bundled(
     )
 
     if head_dim_original is None:
-        head_dim_original = q.shape[-1]
+        head_dim_original = cast(int, q.shape[-1])
     md = attention_metadata
     if sm_scale is None:
         sm_scale = head_dim_original**-0.5
@@ -607,10 +606,10 @@ def attention(
     # k,v: (T, K, H)
 
     if head_dim_original is None:
-        head_dim_original = q.shape[-1]
+        head_dim_original = cast(int, q.shape[-1])
 
     if sm_scale is None:
-        sm_scale = head_dim_original**-0.5
+        sm_scale = cast(float, head_dim_original**-0.5)
 
     md = attention_metadata
 
@@ -621,10 +620,10 @@ def attention(
         k,
         v,
         kv_cache,
-        md.seq_lens,
-        md.block_tables,
-        md.query_start_loc,
-        md.request_distribution,
+        cast(jax.Array, md.seq_lens),
+        cast(jax.Array, md.block_tables),
+        cast(jax.Array, md.query_start_loc),
+        cast(jax.Array, md.request_distribution),
         sinks,
         sm_scale=sm_scale,
         attention_chunk_size=attention_chunk_size,
@@ -1155,7 +1154,27 @@ def sparse_mla_attention_dcp(
         owns = jnp.any(topk_idx >= 0, axis=-1)
         topk_idx = topk_idx.at[:, 0].set(jnp.where(owns, topk_idx[:, 0], jnp.int32(0)))
 
-        q = jnp.concatenate([ql_nope, q_pe], axis=-1)
+        # Split q: the kernel joins q_nope and q_pe in VMEM (no padded
+        # [T, H, 640] concat). The merge below needs the lse, so it also comes
+        # out lane-dense as f32[T, H] rather than f32[T, H, 1].
+        if envs.TPU_MLA_SPARSE_SPLIT_Q:
+            q, split_kwargs = ql_nope, {"q_pe": q_pe, "lse_lane_dense": True}
+        else:
+            q, split_kwargs = jnp.concatenate([ql_nope, q_pe], axis=-1), {}
+        # The capped path (and its chunk) applies only where the kernel takes
+        # it: SparseCore caches and a top-k wider than the cap.
+        topk_cap = envs.TPU_DCP_MLA_TOPK_CAP
+        if not (
+            topk_cap
+            and cache_layout == sparse_mla_kernel.SPARSECORE_CACHE_LAYOUT
+            and topk_idx.shape[-1] > topk_cap
+        ):
+            topk_cap = None
+        chunk_kwargs = (
+            {"gather_and_attention_chunk_size": envs.TPU_DCP_MLA_TOPK_CAP_CHUNK}
+            if topk_cap
+            else {}
+        )
         # Virtual page ordinal -> physical block in this rank's own shard, the
         # same resolution the scatter above and `streamindex_topk_dcp` use.
         local_block_tables = jnp.mod(block_tables_, jnp.int32(nope_spec.num_pages))
@@ -1172,6 +1191,11 @@ def sparse_mla_attention_dcp(
             return_lse=True,
             # The kernel defaults to tensorcore; the caches follow the spec.
             cache_layout=cache_layout,
+            # Ranks own ~topk/dcp of each row: a static top-k width with an
+            # exact in-kernel overflow pass for the rows that need more.
+            topk_cap=topk_cap,
+            **chunk_kwargs,
+            **split_kwargs,
         )
         lse = jnp.where(owns[:, None], lse, -jnp.inf)
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).

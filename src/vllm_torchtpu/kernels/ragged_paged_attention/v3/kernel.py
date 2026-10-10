@@ -1920,7 +1920,7 @@ def ragged_paged_attention(
                     pltpu.with_memory_space_constraint(kv_cache, pltpu.HBM),
                 )
         else:
-            # TODO(b/494285697): v6 has issues with pinning aliased memory.
+            # TODO: v6 has issues with pinning aliased memory.
             def run(scalar_prefetches, q, kv, kv_cache):
                 return kernel(*scalar_prefetches, q, kv, kv_cache)
 

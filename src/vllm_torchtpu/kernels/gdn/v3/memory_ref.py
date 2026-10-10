@@ -301,9 +301,12 @@ class StateBufferedRef(BaseBufferedRef):
             # Resume from the checkpoint of the last accepted token.
             state_idx += self._read_offset(s_idx)
 
+            # Into the dedicated incoming-state position (see
+            # `GDNConfig.state_in_pos`), never a checkpoint position that an
+            # in-flight copy_out of this slot may still be reading.
             pltpu.make_async_copy(
                 self._src_slice(src_ref, state_idx, dma_size),
-                vmem_ref.at[idx, pl.ds(0, dma_size)],
+                vmem_ref.at[idx, pl.ds(self.cfg.state_in_pos, dma_size)],
                 sem,
             ).start()
 
@@ -457,7 +460,9 @@ class ExternalStateBufferedRef(StateBufferedRef):
 
             pltpu.make_async_copy(
                 self._region_slice(src_ref, state_idx, nblocks),
-                vmem_ref.at[idx, 0, pl.ds(0, nblocks)],
+                # Dedicated incoming-state position; see
+                # `GDNConfig.state_in_pos`.
+                vmem_ref.at[idx, self.cfg.state_in_pos, pl.ds(0, nblocks)],
                 sem,
             ).start()
 
@@ -650,14 +655,14 @@ def create_allocs(
         # without speculative decoding, where window_size is 1).
         conv_shape = (
             cfg.seq_tile_size,
-            cfg.window_size,
+            cfg.state_window_alloc,
             cfg.prev_kernel_size,
             1,
             cfg.dim_size,
         )
         recurrent_shape = (
             cfg.seq_tile_size,
-            cfg.window_size,
+            cfg.state_window_alloc,
             cfg.num_v_heads,
             cfg.kq_head_dim,
             cfg.v_head_dim,
@@ -688,13 +693,13 @@ def create_allocs(
             # Whole-block DMA transfers complete pages, retaining all inner dims.
             conv_shape = (
                 cfg.seq_tile_size,
-                cfg.window_size,
+                cfg.state_window_alloc,
                 plan.conv.nblocks,
                 *conv_state_ref.shape[1:],
             )
             recurrent_shape = (
                 cfg.seq_tile_size,
-                cfg.window_size,
+                cfg.state_window_alloc,
                 plan.recurrent.nblocks,
                 *recurrent_state_ref.shape[1:],
             )
@@ -702,14 +707,14 @@ def create_allocs(
             payload = conv_state_ref.shape[2:]
             conv_shape = (
                 cfg.seq_tile_size,
-                cfg.window_size,
+                cfg.state_window_alloc,
                 plan.conv.nblocks,
                 plan.conv.nrows,
                 *payload,
             )
             recurrent_shape = (
                 cfg.seq_tile_size,
-                cfg.window_size,
+                cfg.state_window_alloc,
                 plan.recurrent.nblocks,
                 plan.recurrent.nrows,
                 *payload,

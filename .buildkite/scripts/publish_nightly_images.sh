@@ -57,7 +57,7 @@ cd "${REPO_ROOT}"
 TARGETS=("ci" "dev" "prod")
 
 for TARGET in "${TARGETS[@]}"; do
-  IMAGE_NAME="${REGISTRY}/torchtpu-vllm-${TARGET}"
+  IMAGE_NAME="${REGISTRY}/vllm-torchtpu-${TARGET}"
   DATE_IMAGE="${IMAGE_NAME}:${DATE_TAG}"
   LATEST_IMAGE="${IMAGE_NAME}:${LATEST_TAG}"
 
@@ -67,12 +67,26 @@ for TARGET in "${TARGETS[@]}"; do
   echo "--- :docker: Tagging as ${LATEST_IMAGE}"
   docker tag "${DATE_IMAGE}" "${LATEST_IMAGE}"
 
+  # Step 1: Tag and push extra legacy torchtpu-vllm images for backward compatibility
+  # so existing consumers continue working smoothly until migration is finalized.
+  EXTRA_IMAGE_NAME="${REGISTRY}/torchtpu-vllm-${TARGET}"
+  EXTRA_DATE_IMAGE="${EXTRA_IMAGE_NAME}:${DATE_TAG}"
+  EXTRA_LATEST_IMAGE="${EXTRA_IMAGE_NAME}:${LATEST_TAG}"
+
+  echo "--- :docker: Tagging extra legacy images for backward compatibility (${EXTRA_DATE_IMAGE}, ${EXTRA_LATEST_IMAGE})"
+  docker tag "${DATE_IMAGE}" "${EXTRA_DATE_IMAGE}"
+  docker tag "${DATE_IMAGE}" "${EXTRA_LATEST_IMAGE}"
+
   echo "--- :docker: Pushing ${DATE_IMAGE} and ${LATEST_IMAGE} to Artifact Registry"
   docker push "${DATE_IMAGE}"
   docker push "${LATEST_IMAGE}"
 
+  echo "--- :docker: Pushing extra images ${EXTRA_DATE_IMAGE} and ${EXTRA_LATEST_IMAGE} to Artifact Registry"
+  docker push "${EXTRA_DATE_IMAGE}"
+  docker push "${EXTRA_LATEST_IMAGE}"
+
   echo "--- Cleaning up locally built image tags for ${TARGET}"
-  docker rmi "${DATE_IMAGE}" "${LATEST_IMAGE}" || true
+  docker rmi "${DATE_IMAGE}" "${LATEST_IMAGE}" "${EXTRA_DATE_IMAGE}" "${EXTRA_LATEST_IMAGE}" || true
 done
 
 echo "--- Successfully built and published all nightly images!"
