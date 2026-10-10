@@ -1,7 +1,12 @@
-"""Low-overhead IPC frame serialization helpers for vLLM ZMQ EngineCore sockets.
+"""Direct guard-checked cache-entry dispatch and GLOBAL_STATE guard filtering
+for ``torch.compile(backend="tpu", fullgraph=True, dynamic=False)`` functions.
 
-Provides optional fast-path frame packing and tensor buffer serialization for
-multiprocess frontend/backend communication.
+* ``QX_FAST_COMPILED_CALL=1``: wraps compiled plain functions to evaluate each
+  cached entry's ``guard_manager.check(f_locals)`` in MRU order and invoke the
+  transformed Python code object directly on a guard hit.
+* ``QX_TPU_DROP_GLOBAL_STATE_GUARD=1``: filters out Dynamo ``GLOBAL_STATE``
+  guards (CPU intra-op ``num_threads``, ``grad_mode``) so warmup entries are
+  reused across threads while preserving all tensor and value guards.
 """
 
 from __future__ import annotations
@@ -104,7 +109,8 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
                 if mru_idx < 0 and gm.check(f_locals):
                     mru_idx = len(built)
                 built.append((gm, direct))
-            if mru_idx < 0:
+            # MRU entry must accept the frame the slow call just ran with.
+            if mru_idx < 0 or not built[mru_idx][0].check(f_locals):
                 return
             if mru_idx > 0:
                 built.insert(0, built.pop(mru_idx))
