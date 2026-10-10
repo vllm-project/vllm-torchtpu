@@ -531,6 +531,41 @@ def test_forward_masks_padded_router_logits_when_enabled(monkeypatch):
         token_padding.set_padding_state(None)
 
 
+def test_forward_masks_padding_after_uniform_random_simulation(monkeypatch):
+    """Padded rows stay NaN and real rows finite under uniform_random.
+
+    Masking first would put NaN into the simulation's mean anchor and so into
+    every row, leaving every token unrouted.
+    """
+    from vllm_torchtpu.layers.adapter import moe_routing, token_padding
+
+    seen = []
+    owner = SimpleNamespace()
+    setattr(
+        owner, bridge.FUSED_MOE_EP_OP_ATTR, lambda *args: seen.append(args) or args[0]
+    )
+    hidden = torch.zeros(4, 8)
+    weights = torch.empty(0)
+    scales = torch.ones(1, 1)
+    logits = torch.ones(4, 8, dtype=torch.bfloat16)
+    monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", True)
+    monkeypatch.setattr(moe_routing, "_SIMULATION_STRATEGY", object())
+    monkeypatch.setattr(moe_routing, "_strategy_name", moe_routing._UNIFORM_RANDOM)
+    token_padding.set_padding_state(
+        token_padding.TokenPaddingState(
+            local_padding_mask=torch.tensor([False, True, False, True])
+        )
+    )
+    try:
+        bridge.fused_moe_ep(owner, hidden, weights, weights, scales, scales, logits)
+    finally:
+        token_padding.set_padding_state(None)
+    gating = seen[-1][5]
+    assert gating.dtype == torch.float32
+    assert torch.isfinite(gating[[0, 2]]).all()
+    assert torch.isnan(gating[[1, 3]]).all()
+
+
 @pytest.mark.parametrize(
     "order,expected",
     [
