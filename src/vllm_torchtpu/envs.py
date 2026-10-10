@@ -112,6 +112,7 @@ if TYPE_CHECKING:
     TPU_P2P_WAIT_PULL_TIMEOUT: int = 120
     TPU_RAIDEN_STAGE3_STATUS_PROBE_S: float = 1.0
     TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT: bool = True
+    TPU_RAIDEN_STAGE3_REGISTER_AHEAD: bool = True
     TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S: float = 30.0
     TPU_RAIDEN_TEST_REGISTRATION_DELAY_S: float = 0.0
     TPU_KV_STAGE_WAIT_TIMEOUT_SECS: float = 30.0
@@ -812,6 +813,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # On by default; inline-load mode overrides it back to off.
     "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT": env_bool(
         "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT", default=True
+    ),
+    # On by default: a PCP, TP or DP Stage-3 producer registers a request's
+    # KV blocks in the step that completes its prompt rather than in the step
+    # after its finish response (pipeline producers always do).
+    "TPU_RAIDEN_STAGE3_REGISTER_AHEAD": env_bool(
+        "TPU_RAIDEN_STAGE3_REGISTER_AHEAD", default=True
     ),
     # Seconds, bounded by TPU_P2P_WAIT_PULL_TIMEOUT downstream.
     "TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S": env_float(

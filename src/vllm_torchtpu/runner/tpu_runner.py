@@ -554,6 +554,21 @@ class TPUModelRunner(GPUModelRunner):
             or self.speculative_config.method == "dflash"
         )
 
+    @property
+    def _fence_spec_kv_under_token_copy(self) -> bool:
+        """A KV producer whose Stage-3 registration is published ahead of
+        the finish must have every KV write of a step, the drafter's
+        included, executed before that step's sampled tokens reach the
+        host (the consumer pulls as soon as the first token is out)."""
+        if not self._is_async_drafter:
+            return False
+        transfer_config = self.vllm_config.kv_transfer_config
+        return (
+            transfer_config is not None
+            and bool(transfer_config.is_kv_producer)
+            and dist_utils.get_stage3_register_ahead_enabled()
+        )
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -4678,6 +4693,22 @@ class TPUModelRunner(GPUModelRunner):
                         return_device=is_async,
                         device_seed=device_seed,
                     )
+
+        if copy_state is not None and self._fence_spec_kv_under_token_copy:
+            # A Raiden producer registers a request's KV blocks ahead of its
+            # finish, so a consumer may pull as soon as the first token is
+            # out, while the drafter's KV writes above are still deferred.
+            # Enqueue the drafter's graph now through its own output (the
+            # draft tokens depend on the draft-layer attention that performs
+            # those writes) and move the sampled-token copy's ready event
+            # behind it, so the host sees this step's tokens only once every
+            # KV write of the step has executed. Rooting the enqueue on the
+            # draft tokens keeps the graph to the drafter itself; rooting it
+            # on the KV cache tensors was measured to enqueue work the size
+            # of the whole forward again.
+            if isinstance(eagle3_drafts, torch.Tensor):
+                synchronize_tensors([eagle3_drafts], wait=False)
+            copy_state.fence_pending_device_work()
 
         # Save, poll and clear the KV connector only after the drafter. Its
         # forward above writes the draft layers' KV into the blocks the target

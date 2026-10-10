@@ -410,9 +410,9 @@ class _Stage3PendingSubmit:
     registrations were not yet visible at the source controller.
 
     The registration travels out-of-band and reaches the producer workers
-    no later than the scheduler step after the finish response (a pipeline
-    producer registers in the prompt-completing step), so a consumer query
-    can legitimately arrive first. Instead of spinning the worker step
+    no later than the scheduler step after the finish response (a producer
+    that registers ahead does so in the prompt-completing step), so a
+    consumer query can legitimately arrive first. Instead of spinning the worker step
     in an inline poll, the request is re-attempted once per scheduler step
     from get_finished() until defer_deadline.
     """
@@ -1527,14 +1527,26 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
 
     def _stage3_register_ahead_enabled(self) -> bool:
         """Whether this producer publishes a request's Stage-3 send in the
-        step that completes its prompt (pipeline producers only)."""
+        step that completes its prompt.
+
+        Always for a pipeline producer, whose last stage would otherwise
+        register several steps late. By TPU_RAIDEN_STAGE3_REGISTER_AHEAD for
+        PCP, TP and DP producers: their finish-time registration rides the
+        step after the finish response, and under async scheduling that
+        step first waits for the next batch's forward (and, with a drafter,
+        for every KV write) before it registers, so the consumer's load
+        parks on the deferred-submit path for a whole prefill step. GLM,
+        DSv4 and Kimi-K3 producers keep finish-time registration."""
         return (
             self.is_producer
             and _use_raiden_stage3_transport()
             and not _use_raiden_glm_admission()
             and not _use_raiden_dsv4_admission()
             and not _uses_tp_stage3_source(self.vllm_config)
-            and _engine_is_pipeline(self.vllm_config)
+            and (
+                _engine_is_pipeline(self.vllm_config)
+                or dist_utils.get_stage3_register_ahead_enabled()
+            )
         )
 
     def on_new_request(self, request: "Request") -> None:
@@ -2080,9 +2092,11 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         return meta
 
     def _stage3_register_ahead(self, scheduler_output: SchedulerOutput) -> None:
-        """Publishes a pipeline producer's Stage-3 send in the step whose
-        chunk completes the prompt, so every stage registers its blocks
-        while executing that step.
+        """Publishes a producer's Stage-3 send in the step whose chunk
+        completes the prompt, so every transfer rank (pipeline stage, PCP
+        or TP rank, or the single DP rank) registers its blocks while
+        executing that step, before the finish response can reach a
+        consumer.
 
         Only requests that finish right after their prompt (max_tokens == 1,
         not resumable) are published here; the finish adopts the uuid through
@@ -2144,6 +2158,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 mamba_block_ids,
                 num_tokens,
                 computed_tokens=computed_tokens,
+                ahead=True,
             )
             if delay_free_blocks:
                 self._stage3_early_sends[req_id] = int(params["uuid"])
@@ -2252,9 +2267,11 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         *,
         computed_tokens: int,
         group_block_ids: list[list[int]] | None = None,
+        ahead: bool = False,
     ) -> tuple[bool, dict[str, Any]]:
         """Enqueues the request's Stage-3 SendMeta for the workers and
-        returns the consumer-facing transfer parameters."""
+        returns the consumer-facing transfer parameters. ``ahead`` marks a
+        send published in the prompt-completing step, before the finish."""
         parallel_config = self.vllm_config.parallel_config
         pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
         if (
@@ -2472,6 +2489,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             num_tokens=num_tokens,
             mamba_state_block_ids=mamba_state_block_ids,
             group_block_ids=normalized_group_block_ids,
+            registered_ahead=ahead,
         )
         params: dict[str, Any] = {
             "req_id": request.request_id,
@@ -3890,9 +3908,9 @@ class TPURaidenConnectorWorker:
     ) -> None:
         engine = self._ensure_raiden_transfer_engine()
         if self.is_producer:
-            if (
-                metadata.reqs_to_send
-                and self.vllm_config.speculative_config is not None
+            if self.vllm_config.speculative_config is not None and any(
+                getattr(req_meta, "registered_ahead", False) is not True
+                for req_meta in metadata.reqs_to_send.values()
             ):
                 # Publishing a source lets Raiden read its pinned buffers
                 # immediately, including on a no-forward scheduler step.
@@ -3900,6 +3918,10 @@ class TPURaidenConnectorWorker:
                 # materialize the model's typed KV views and wait before
                 # handing them to the external transfer engine. Admission's
                 # raw storage buffers alone do not express those writes.
+                # A send published ahead of the finish is registered before
+                # its own forward: the runner instead fences every KV write
+                # of that step under the sampled-token copy (sample_tokens),
+                # which the consumer's pull is gated on.
                 synchronize_tensors(self._flattened_kv_cache_tensors(), wait=True)
             if self._raiden_stage3_enabled():
                 if _use_raiden_dsv4_admission():
@@ -4012,9 +4034,11 @@ class TPURaidenConnectorWorker:
         widen the out-of-band registration race by delaying the producer's
         registration step, reproducing a saturated producer whose
         registration-carrying step runs long after the finish response.
-        On a pipeline producer the sleep runs before the prompt-completing
-        forward and delays the finish response by the same amount, so it
-        widens the race only for PCP and DP producers."""
+        On a producer that registers ahead the sleep runs before the
+        prompt-completing forward and delays the finish response by the
+        same amount, so it widens the race only for finish-time
+        registration (TPU_RAIDEN_STAGE3_REGISTER_AHEAD=0, GLM, DSv4,
+        Kimi-K3)."""
         delay_s = dist_utils.get_stage3_test_registration_delay_s()
         if delay_s > 0 and metadata.reqs_to_send:
             logger.warning(
@@ -4256,12 +4280,19 @@ class TPURaidenConnectorWorker:
                     uuid,
                 )
                 continue
+            # Registered ahead of the scheduler's finish (every pipeline
+            # stage; a PCP, TP or DP rank for a send published in the
+            # prompt-completing step): no TTL and no status probe until
+            # finished_req_ids names the request.
+            registered_ahead = (
+                pipeline or getattr(req_meta, "registered_ahead", False) is True
+            )
             self._stage3_registered_sends[req_id] = _Stage3RegisteredSend(
                 uuid=uuid,
                 local_block_ids=local_ids,
                 num_tokens=num_tokens,
-                expiration_time=float("inf") if pipeline else expiration_time,
-                finish_pending=pipeline,
+                expiration_time=(float("inf") if registered_ahead else expiration_time),
+                finish_pending=registered_ahead,
             )
             if not any(reg.spans for reg in pool_spans):
                 # This PCP rank owns no physical page for the request. It has
@@ -5117,8 +5148,8 @@ class TPURaidenConnectorWorker:
 
         vLLM returns producer transfer parameters from update_from_output(),
         while the D5 block registrations reach producer workers no later than
-        the next scheduler step (a pipeline producer registers in the
-        prompt-completing step). The source controller fails before receiver
+        the next scheduler step (a producer that registers ahead does so in
+        the prompt-completing step). The source controller fails before receiver
         arming when those registrations are incomplete, so retry only that
         precise, side-effect-free error for a short bounded interval.
         """
