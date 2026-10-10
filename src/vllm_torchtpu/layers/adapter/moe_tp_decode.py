@@ -394,6 +394,9 @@ def _get_op(mesh, statics: _OpStatics):
         )
 
     name = "pallas::moe_tp_decode" + (f"_{len(_OPS)}" if _OPS else "")
+    # torch_tpu annotates the partition specs as tuples of axis-name tuples, but
+    # jax_op takes PartitionSpecs at runtime, as main's other call sites pass them.
+    # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
         name, fn, mesh=mesh, input_partition_specs=specs, output_partition_specs=P(axis)
     )
@@ -425,6 +428,8 @@ def _selftest_op(mesh, spec: all_reduce.AllReduceSpec):
             *(jax.device_put(a, NamedSharding(mesh, s)) for a, s in zip(args, specs))
         )
 
+    # PartitionSpecs, as in _get_op (torch_tpu's annotation is narrower).
+    # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
         f"pallas::moe_tp_decode_selftest_{len(_SELFTEST_OPS)}",
         fn,
