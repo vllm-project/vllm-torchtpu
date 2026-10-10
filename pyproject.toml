@@ -46,9 +46,10 @@ dependencies = [
     # Imported directly by src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py, so
     # declared here rather than leaned on as a vLLM transitive.
     #
-    # Match vLLM v0.31.1rc0. The omni extra still requires transformers<5.15
-    # through vllm-omni 0.29.0rc1 and needs a compatible release before merge.
-    "transformers>=5.16.1,<5.19",
+    # Keep the existing <5.15 ceiling for vllm-omni 0.29.0rc1 compatibility.
+    # This conflicts with vLLM v0.31.1rc0's >=5.16.1 requirement; dependency
+    # resolution remains blocked until the version ranges are reconciled.
+    "transformers>=5.10.4,<5.15",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
     # cpu.txt, ...) except tpu.txt, so it's missing
