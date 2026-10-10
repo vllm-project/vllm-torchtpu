@@ -316,3 +316,295 @@ def test_cross_turn_lru_replaces_old_turn_and_auto_evicts_on_get_new_blocks():
     assert len(allocated) == total_available_with_lru
     assert len(r._conv_lru) == 0
     assert state2 in allocated
+
+
+def test_safe_prompt_tail_offset_handles_qwen_think_4_token_overwrite():
+    # prompt=3201 (3201 % 640 == 1 < 4): eff_prompt=3197 -> full=2560, fine=3072, pre_full=1920.
+    r, pool, req, attn, _, _ = _setup(prompt=3201, osl=200, bs=640)
+    req.shared_prefix_boundary = 0
+    pre_state = Block(301, block_hash=("s_pre", 1920 // HB - 1))
+    full_state = Block(302, block_hash=("s_full", 2560 // HB - 1))
+    fine_state = Block(303, block_hash=("s_fine", 3072 // HB - 1))
+    pool.cached[(1920 // HB - 1, 1)] = pre_state
+    pool.cached[(2560 // HB - 1, 1)] = full_state
+    pool.cached[(3072 // HB - 1, 1)] = fine_state
+    pool.free_block_queue.q.extend([pre_state, full_state, fine_state])
+
+    # 1. Prefill split stops at pre_full=1920, then full=2560, then fine=3072.
+    r.prepare_prefill_split(req, 0, 3201)
+    assert req.shared_prefix_boundary == 1920
+    assert r.adjust_prefill_split(req, 0, 3200) == 1920
+
+    r.prepare_prefill_split(req, 1920, 1281)
+    assert req.shared_prefix_boundary == 2560
+    assert r.adjust_prefill_split(req, 1920, 1280) == 640
+
+    assert r.adjust_prefill_split(req, 2560, 640) == 512  # 2560 -> 3072
+
+    # 2. Pin running and release retains untainted full_state (2560) + fine_state (3072)
+    #    in _conv_lru and pre_state (1920) in _fork_lru.
+    r.pin_running([req])
+    assert r._pinned["r"][0] == [full_state, fine_state]
+    assert r._fork_pinned["r"][0] == [pre_state]
+
+    snap = r.snapshot_attention_blocks(req)
+    _scheduler_free(pool, attn)
+    r.on_request_freed(req, snap)
+    assert full_state.ref_cnt == 1 and fine_state.ref_cnt == 1
+    assert pre_state.ref_cnt == 1
+    assert len(r._conv_lru) == 1 and len(r._fork_lru) == 1
+
+
+def test_smart_fork_checkpoints_pre_final_block_and_promotes_root_anchor():
+    r, pool, req1, attn1, _, _ = _setup(prompt=19900, osl=200, bs=640)
+    req1.request_id = "req-0"
+    r.coordinator.single_type_managers[0].req_to_blocks[req1.request_id] = attn1
+    pre_19200 = Block(501, block_hash=("s", 19200 // HB - 1))
+    full_19840 = Block(502, block_hash=("s", 19840 // HB - 1))
+    pool.cached[(19200 // HB - 1, 1)] = pre_19200
+    pool.cached[(19840 // HB - 1, 1)] = full_19840
+    pool.free_block_queue.q.extend([pre_19200, full_19840])
+
+    r.pin_running([req1])
+    snap1 = r.snapshot_attention_blocks(req1)
+    _scheduler_free(pool, attn1)
+    r.on_request_freed(req1, snap1)
+    assert pre_19200.ref_cnt == 1 and full_19840.ref_cnt == 1
+
+    # When subagent_001 advances through turn1 and turn2, turn0's root full_19840
+    # is promoted into _fork_lru rather than unpinned.
+    for t_idx, prm in [(1, 21200), (2, 22500)]:
+        tot = prm + 200
+        req_t = SimpleNamespace(
+            request_id=f"req-{t_idx}",
+            num_prompt_tokens=prm,
+            num_tokens=tot,
+            num_computed_tokens=tot,
+            block_hashes=list(range(tot // HB)),
+        )
+        f640 = (prm // 640) * 640
+        st = Block(510 + t_idx, block_hash=("s", f640 // HB - 1))
+        pool.cached[(f640 // HB - 1, 1)] = st
+        pool.free_block_queue.q.append(st)
+        r.pin_running([req_t])
+        r.on_request_freed(req_t, [])
+
+    assert full_19840.ref_cnt == 1
+    assert any(full_19840 in e.blocks for e in r._fork_lru.values())
+
+
+def test_compact_prior_turn_retains_full_block_and_frees_partial_tail():
+    # Turn 1 has full_state (640) + partial_state (768).
+    r, pool, req1, attn1, partial1, _ = _setup(prompt=800, osl=200, bs=640)
+    req1.request_id = "convB_turn1"
+    r.coordinator.single_type_managers[0].req_to_blocks["convB_turn1"] = attn1
+    full1 = Block(601, block_hash=("s_full1", 640 // HB - 1))
+    pool.cached[(640 // HB - 1, 1)] = full1
+    pool.free_block_queue.q.insert(0, full1)
+
+    r.pin_running([req1])
+    snap1 = r.snapshot_attention_blocks(req1)
+    _scheduler_free(pool, attn1)
+    r.on_request_freed(req1, snap1)
+    assert full1.ref_cnt == 1 and partial1.ref_cnt == 1
+    assert r.num_pinned_blocks() == 2
+
+    # Turn 2 of convB finishes at 1440 (full2=1280, partial2=1408):
+    # Turn 1 is compacted in-place -> partial1 is freed (ref_cnt=0), full1 stays pinned (ref_cnt=1).
+    prm2, tot2 = 1440, 1640
+    req2 = SimpleNamespace(
+        request_id="convB_turn2",
+        num_prompt_tokens=prm2,
+        num_tokens=tot2,
+        num_computed_tokens=tot2,
+        block_hashes=list(range(tot2 // HB)),
+    )
+    full2 = Block(602, block_hash=("s_full2", 1280 // HB - 1))
+    partial2 = Block(603, block_hash=("s_part2", 1408 // HB - 1))
+    pool.cached[(1280 // HB - 1, 1)] = full2
+    pool.cached[(1408 // HB - 1, 1)] = partial2
+    pool.free_block_queue.q.extend([full2, partial2])
+
+    r.pin_running([req2])
+    r.on_request_freed(req2, [])
+    assert partial1.ref_cnt == 0 and partial1 in pool.free_block_queue.q
+    assert full1.ref_cnt == 1
+    assert full2.ref_cnt == 1 and partial2.ref_cnt == 1
+    assert r.num_pinned_blocks() == 3
+
+    # Enforcing max_pinned_blocks=2 evicts the compacted prior-turn entry (full1) first,
+    # keeping the active latest turn (full2, partial2) intact.
+    r.max_pinned_blocks = 2
+    r._enforce_pinned_block_cap()
+    assert full1.ref_cnt == 0
+    assert full2.ref_cnt == 1 and partial2.ref_cnt == 1
+    assert r.num_pinned_blocks() == 2
+
+
+def test_mamba_manager_cache_partial_tail_hook_with_safe_tail_offset():
+    pool = Pool()
+    attn_mgr = SimpleNamespace(block_size=640, req_to_blocks={}, dcp_world_size=1)
+    partial_blk = Block(701, block_hash=("p", 2688 // HB - 1))
+
+    class HookableMambaMgr:
+        def __init__(self):
+            self.block_size = 640
+            self.dcp_world_size = 1
+            self.req_to_blocks = {"r_safe": [Block(700)] * 4 + [partial_blk]}
+            self._partial_hit_reqs = {}
+
+        def _cache_partial_tail_block(self, request, num_tokens):
+            latest = (request.num_prompt_tokens // HB) * HB
+            if num_tokens != latest:
+                return None
+            self._partial_hit_reqs[request.request_id] = (4, partial_blk)
+            return ("hash", num_tokens)
+
+    mamba_mgr = HookableMambaMgr()
+    groups = [
+        SpecGroup(FullAttentionSpec(), [0], FakeAttnManager, False),
+        SpecGroup(MambaSpec(), [1], FakeMambaManager, False),
+    ]
+    coord = SimpleNamespace(
+        attention_groups=groups,
+        single_type_managers=[attn_mgr, mamba_mgr],
+        block_pool=pool,
+        _cache_hit_alignment_tokens=HB,
+    )
+    kvm = SimpleNamespace(coordinator=coord, enable_caching=True)
+    r = HybridStateRetention(kvm)
+
+    # prompt=2817 (2817 % 128 == 1 < 4) -> safe fine boundary is 2688, tainted boundary is 2816.
+    req = SimpleNamespace(
+        request_id="r_safe",
+        num_prompt_tokens=2817,
+        num_tokens=2817,
+        num_computed_tokens=2688,
+        block_hashes=list(range(2817 // HB)),
+    )
+    assert mamba_mgr._cache_partial_tail_block(req, 2688) == ("hash", 2688)
+    assert req.num_prompt_tokens == 2817  # restored after hook
+    assert r._tracked_blocks["r_safe"][(1, 2688)] == (partial_blk, 2688)
+    # Tainted 2816 boundary is ignored and does not overwrite 2688.
+    assert mamba_mgr._cache_partial_tail_block(req, 2816) is None
+
+
+
+
+# ---------------------------------------------------------------- v20: fork
+# candidate and fork key decisions use cache state only, never the request id.
+
+
+def _fork_setup(prompt=6500, bs=640):
+    r, pool, req, attn, _, _ = _setup(prompt=prompt, osl=200, bs=bs)
+    req.shared_prefix_boundary = 0
+    return r, pool, req, attn
+
+
+def _req(rid, prompt, osl=200, hashes=None):
+    tot = prompt + osl
+    return SimpleNamespace(
+        request_id=rid,
+        num_prompt_tokens=prompt,
+        num_tokens=tot,
+        num_computed_tokens=0,
+        shared_prefix_boundary=0,
+        block_hashes=list(hashes if hashes is not None else range(tot // HB)),
+    )
+
+
+def _finish(r, pool, req, states):
+    """Run a request's lifecycle after prefill: its Mamba snapshots
+    (``states``: token offset -> block) are cached and released, it decodes
+    and finishes."""
+    for off, blk in states.items():
+        pool.cached[(req.block_hashes[off // HB - 1], 1)] = blk
+        pool.free_block_queue.q.append(blk)
+    req.num_computed_tokens = req.num_tokens
+    req.is_finished = lambda: True
+    r.pin_running([req])
+    r.on_request_freed(req, [])
+
+
+def _decisions_and_keys(rids):
+    """Replay the same cache-state sequence with the given request ids:
+    a cold root (prompt 6500), its continuation (extends the root's tail),
+    a second request extending the root's tail, and a request that shares
+    only the root's first 3840 tokens."""
+    r, pool, _, _ = _fork_setup()
+    out = []
+    bid = iter(range(1000, 2000))
+
+    root = _req(rids[0], 6500)
+    out.append(r._is_fork_candidate(root, 0))
+    r.prepare_prefill_split(root, 0, 6500)
+    out.append(root.shared_prefix_boundary)
+    _finish(r, pool, root, {o: Block(next(bid), block_hash=("s", o))
+                            for o in (5760, 6400)})
+
+    cont = _req(rids[1], 8000)  # same prefix as root, more tokens
+    out.append(r._is_fork_candidate(cont, 6400))
+    sib = _req(rids[2], 9000)  # also extends root's tail (6400)
+    out.append(r._is_fork_candidate(sib, 6400))
+    hashes = list(range(30)) + [("other", i) for i in range(30, 60)]
+    inner = _req(rids[3], 7300, hashes=hashes)
+    out.append(r._is_fork_candidate(inner, 3840))
+    for q, stops in ((cont, (7680, 7936)), (sib, (8960,))):
+        out.append(r.prefill_checkpoint_stops(q, 6400))
+        _finish(r, pool, q, {o: Block(next(bid), block_hash=("s", o))
+                             for o in stops})
+    return out, list(r._fork_lru.keys()), list(r._conv_lru.keys())
+
+
+def test_fork_decisions_and_keys_independent_of_request_id_format():
+    agentx_like = [
+        "rootA_turn0",
+        "rootA_turn1",
+        "rootA::sa:subagent_001_103f4c24_turn0",
+        "rootA::aux:001_turn0",
+    ]
+    generic = [
+        "chatcmpl-1f0e6c5a",
+        "chatcmpl-9b2d7e41",
+        "chatcmpl-77aa0c13",
+        "cmpl-0c4e8d2f-0",
+    ]
+    a = _decisions_and_keys(agentx_like)
+    b = _decisions_and_keys(generic)
+    assert a == b
+    decisions, fork_keys, _ = a
+    # cold root (start == 0): candidate, checkpoints pre_full = 6400 - 640.
+    assert decisions[0] is True and decisions[1] == 5760
+    # partial prefix hits (start > 0): not fork candidates.
+    assert decisions[2:5] == [False, False, False]
+    assert decisions[5] == [7680, 7936]
+    assert decisions[6] == [8960]
+    # Fork anchors are keyed by block hash: root's pre_full 5760 (idx 44)
+    # and root's tail 6400 (idx 49), promoted from the conversation LRU once
+    # it fell beyond keep_prior.
+    assert fork_keys == [
+        ("fork_hash", 44, 44), ("fork_hash", 49, 49)
+    ]
+
+
+def test_fork_decision_is_taken_at_first_chunk_and_dropped_at_finish():
+    r, pool, _, _ = _fork_setup()
+    req = _req("x", 6500)
+    assert r._is_fork_candidate(req, 0) is True
+    # Later chunks (start > 0) reuse the first-chunk decision.
+    assert r._is_fork_candidate(req, 2560) is True
+    assert r.prefill_checkpoint_stops(req, 2560)[0] == 5760
+    # Preemption keeps it; finishing drops it.
+    req.is_finished = lambda: False
+    r.on_request_freed(req, [])
+    assert r._fork_decision == {"x": True}
+    req.is_finished = lambda: True
+    r.on_request_freed(req, [])
+    assert r._fork_decision == {}
+
+
+def test_fork_candidate_off_without_smart_fork():
+    r, pool, _, _ = _fork_setup()
+    r.smart_fork = False
+    assert r._is_fork_candidate(_req("y", 6500), 0) is False
+    assert r._fork_decision == {}
