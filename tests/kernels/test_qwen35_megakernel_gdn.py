@@ -153,6 +153,69 @@ def test_standalone_gdn_block_interpret():
     )
 
 
+def test_scatter_pool_states_direct_conv_aligned_conv_rows():
+    """Regression test for `scatter_pool_states` when `qkv_128 = 16` (`QKV = 2048`):
+    `conv_rows = 48 == conv_rows_pad` while `(4 * qkv_128) % 16 == 0` (`64 != 48`)."""
+    c = K.MKConfig(
+        R=1,
+        B=2,
+        T=2,
+        L=2,
+        att_every=2,
+        H=512,
+        NH=2,
+        NKV=1,
+        HD=256,
+        KH=4,
+        VH=8,
+        KD=128,
+        VD=128,
+        E=128,
+        TOPK=2,
+        I=256,
+        IS=256,
+        ctx=256,
+        paged_kv=True,
+        num_pages=32,
+        page_size=128,
+        max_pages_per_seq=2,
+        ckpt_k=2,
+    )
+    assert c.QKV == 2048  # qkv_128 = 16 -> conv_rows = 48 == conv_rows_pad
+    rng = np.random.default_rng(7)
+    raw = (jnp.zeros((c.num_pages, 2, 64, 4, c.page_size), dtype=K.FP8),)
+    pos = jnp.array([4, 5], dtype=jnp.int32)
+    pt = jnp.array([[1, 0]], dtype=jnp.int32)
+    ckpt = jnp.arange(4, 4 + c.NS * c.T, dtype=jnp.int32).reshape(1, c.NS, c.T)
+    knew = jnp.asarray(rng.standard_normal((1, c.MR, c.HD)), dtype=K.FP8)
+    vnew = jnp.asarray(rng.standard_normal((1, c.MR, c.HD)), dtype=K.FP8)
+    conv_out = jnp.asarray(
+        rng.standard_normal((1, c.NS, c.HR, c.QKV)), dtype=jnp.bfloat16
+    )
+    rec_out = jnp.asarray(
+        rng.standard_normal((1, c.B * c.vh, c.KD, c.VD)), dtype=jnp.bfloat16
+    )
+
+    raw_out = pool_io.scatter_pool_states(
+        c, raw, pos, pt, knew, vnew, conv_out, rec_out, ckpt, interpret=True
+    )
+    for t in range(c.T):
+        roff = jnp.full((1, c.NS), t, dtype=jnp.int32)
+        g_conv, g_rec = pool_io.gather_gdn_states(
+            c, raw_out, ckpt, roff, interpret=True
+        )
+        np.testing.assert_array_equal(
+            np.asarray(g_conv[:, :, :3, :], dtype=np.float32),
+            np.asarray(conv_out[:, :, 1 + t : 4 + t, :], dtype=np.float32),
+        )
+        for s in range(c.NS):
+            b = s * c.T + t
+            np.testing.assert_array_equal(
+                np.asarray(g_rec[:, s * c.vh : (s + 1) * c.vh], dtype=np.float32),
+                np.asarray(rec_out[:, b * c.vh : (b + 1) * c.vh], dtype=np.float32),
+            )
+
+
 def test_gpr_three_stage_matches_fused_at_tp16_checkpoint_geometry():
     """3-stage pool I/O of a > 16-row verify bucket (GatedDeltaNet inputs read straight from the
     checkpoint pages (pool_gather / GPR), partial conv-page scatter) against fused pool I/O at

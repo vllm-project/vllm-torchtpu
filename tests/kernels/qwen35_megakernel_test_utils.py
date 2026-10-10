@@ -21,6 +21,7 @@ from types import SimpleNamespace
 import jax
 from jax import lax
 import jax.numpy as jnp
+import numpy as np
 import torch
 
 from vllm_torchtpu.kernels.qwen35_megakernel import (
@@ -320,3 +321,30 @@ def jnp_leaves(packed):
         )
         for k in K.W_NAMES
     ]
+
+
+def unpack_rec_checkpoint(
+    raw_pages_u8: np.ndarray, vh: int, kd: int = 128, vd: int = 128
+):
+    """Unpack `(rec_pages, 2, 64, 4, 128) uint8` into `(vh, kd, vd) float32` via Pallas layout."""
+    ssm_u32_rows = (vh * kd) // 2
+    rec_pages = raw_pages_u8.shape[0]
+    u32_val = (
+        np.swapaxes(raw_pages_u8, -2, -1)
+        .copy()
+        .view(np.uint32)
+        .reshape(-1, rec_pages * 128, 128)[:, :ssm_u32_rows, :]
+    )
+    bf16_val = np.swapaxes(
+        u32_val[..., None].view(jnp.dtype(K.BF16)), -2, -1
+    ).reshape(-1, vh, kd, vd)
+    return bf16_val.astype(np.float32)
+
+
+def unpack_conv_checkpoint(raw_page_u8: np.ndarray, qkv: int):
+    """Unpack `(..., 2, 64, 4, 128) uint8` into `(..., 3, qkv) float32` via Pallas layout."""
+    conv_rows = (3 * qkv) // 128
+    bf16_256 = np.swapaxes(
+        np.swapaxes(raw_page_u8, -2, -1).copy().view(jnp.dtype(K.BF16)), -2, -1
+    ).reshape(-1, 256, 128)
+    return bf16_256[:, :conv_rows, :].reshape(-1, 3, qkv).astype(np.float32)

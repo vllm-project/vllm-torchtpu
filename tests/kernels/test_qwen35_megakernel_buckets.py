@@ -19,7 +19,11 @@ from __future__ import annotations
 import dataclasses
 import importlib
 
+import jax
+import jax.numpy as jnp
+from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
+import numpy as np
 import pytest
 import torch
 
@@ -27,7 +31,11 @@ from vllm_torchtpu.kernels.qwen35_megakernel import megakernel as K
 from vllm_torchtpu.kernels.qwen35_megakernel import pool_io
 from vllm_torchtpu.kernels.qwen35_megakernel import vllm_adapter as VA
 
-from qwen35_megakernel_test_utils import bare_mk
+from qwen35_megakernel_test_utils import (
+    bare_mk,
+    unpack_conv_checkpoint,
+    unpack_rec_checkpoint,
+)
 
 VERIFY_ENV = (
     "VLLM_TPU_QWEN35_MK_VERIFY_BUCKETS",
@@ -253,3 +261,332 @@ def test_build_bucket_op_names_and_hlo_fallback(monkeypatch):
             assert suffix == {4: True, 32: True, 64: True}
             assert made[:2] == [(4, True, True), (4, False, False)]
             assert not any(mk._bucket_fused.values()) and not mk.fused_pool_io
+
+
+def test_wide_verify_buckets_numerical_parity_and_tail_sequences():
+    """Verify numerical parity across small fused (`B=16`), 3-stage GPR (`B=32, 40`), and wide
+    fused (`B=64`) verify buckets for a multi-layer hybrid GDN + full-attention stack
+    (`L=4, att_every=4, T=4`), including active sequences placed in tail slots `s >= 8`
+    (`b = 32..63`) and mixed `read_offsets >= 0` / `read_offsets == -1`."""
+    mesh = Mesh(np.array(jax.devices("cpu")[:1]), ("tp",))
+    c_base = K.MKConfig(
+        R=1,
+        B=16,
+        L=4,
+        att_every=4,
+        H=512,
+        NH=4,
+        NKV=1,
+        HD=256,
+        KH=2,
+        VH=4,
+        KD=128,
+        VD=128,
+        E=128,
+        TOPK=2,
+        I=128,
+        IS=128,
+        ctx=256,
+        T=4,
+        paged_kv=True,
+        num_pages=384,
+        page_size=128,
+        max_pages_per_seq=2,
+        ckpt_k=4,
+    )
+    tiles_base = dataclasses.replace(
+        K.default_tiles(c_base),
+        nbd=4,
+        nbe=4,
+        nkv=2,
+        hier=0,
+        rsag=False,
+        kv_blk=256,
+        kv_sub=128,
+    )
+    shapes = K.weight_shapes(c_base, tiles_base)
+    rng = np.random.default_rng(42)
+    w_leaves = [
+        jnp.asarray(rng.standard_normal(s).astype(np.float32) * 0.02, dtype=dt)
+        for k in K.W_NAMES
+        for s, dt in (shapes[k],)
+    ]
+
+    raw_init_u8 = rng.integers(
+        0, 40, size=(c_base.num_pages, 2, 64, 4, c_base.page_size), dtype=np.uint8
+    )
+    raw_init = jnp.asarray(raw_init_u8).view(K.FP8)
+
+    n_act = 2
+    act_tokens = rng.standard_normal((n_act * 4, c_base.H)).astype(np.float32) * 0.1
+    act_roff = np.array([0, -1], dtype=np.int32)
+    act_pos = np.array([[16, 17, 18, 19], [0, 1, 2, 3]], dtype=np.int32)
+    act_pt = np.array([[1, 2], [3, 4]], dtype=np.int32)
+    act_ckpt = np.zeros((3, n_act, 4), dtype=np.int32)
+    slot = 16
+    for sub in range(3):
+        for s in range(n_act):
+            for k in range(4):
+                act_ckpt[sub, s, k] = slot
+                slot += 1
+
+    def run_bucket(b: int, place_at_tail: bool):
+        fused = (b <= 24) or (b >= 56)
+        c = dataclasses.replace(c_base, B=b, fused_pool_io=fused)
+        tiles = dataclasses.replace(
+            K.default_tiles(c),
+            nbd=4,
+            nbe=4,
+            nkv=2,
+            hier=0,
+            rsag=False,
+            kv_blk=256,
+            kv_sub=128,
+        )
+        ns = b // 4
+        s0 = (ns - n_act) if place_at_tail else 0
+        x = np.zeros((b, c.H), dtype=np.float32)
+        x[s0 * 4 : (s0 + n_act) * 4] = act_tokens
+        pos = np.full((b,), -1, dtype=np.int32)
+        pos[s0 * 4 : (s0 + n_act) * 4] = act_pos.reshape(-1)
+        pt = np.zeros((ns, c.max_pages_per_seq), dtype=np.int32)
+        pt[s0 : s0 + n_act] = act_pt
+        ckpt = np.zeros((3, ns, 4), dtype=np.int32)
+        ckpt[:, s0 : s0 + n_act, :] = act_ckpt
+        roff = np.full((3, ns), -1, dtype=np.int32)
+        roff[:, s0 : s0 + n_act] = act_roff[None, :]
+
+        step, _, _, _ = pool_io.make_flat_pooled_step(
+            mesh,
+            c,
+            tiles,
+            interpret=True,
+            skip=frozenset({"experts"}),
+            fused_pool_io=fused,
+        )
+        outs = step(
+            jnp.asarray(pos),
+            jnp.asarray(x, dtype=K.BF16),
+            *w_leaves,
+            raw_init,
+            jnp.asarray(pt),
+            jnp.asarray(ckpt),
+            jnp.asarray(roff),
+        )
+        out_act = np.asarray(outs[0][:b], dtype=np.float32)[s0 * 4 : (s0 + n_act) * 4]
+        raw_u8 = np.asarray(outs[1].view(jnp.uint8))
+        return out_act, raw_u8
+
+    ref_out, ref_raw = run_bucket(16, place_at_tail=False)
+    ref_32 = None
+    kv_pages = act_pt[:, 0]
+
+    for b, tail in ((32, False), (40, True), (64, True)):
+        out, raw = run_bucket(b, place_at_tail=tail)
+        fused = (b <= 24) or (b >= 56)
+        assert np.all(np.isfinite(out)), f"Non-finite output in B={b}"
+        np.testing.assert_array_equal(
+            raw[kv_pages], ref_raw[kv_pages], err_msg=f"KV page mismatch at B={b}"
+        )
+        if fused:
+            np.testing.assert_array_equal(
+                out, ref_out, err_msg=f"Fused hidden mismatch at B={b} (tail={tail})"
+            )
+        else:
+            if ref_32 is None:
+                ref_32 = (out, raw)
+            else:
+                np.testing.assert_array_equal(
+                    out, ref_32[0], err_msg=f"3-stage GPR hidden mismatch at B={b}"
+                )
+            np.testing.assert_allclose(out, ref_out, atol=2e-2, rtol=2e-2)
+
+        for sub in range(3):
+            for s in range(n_act):
+                for t in range(4):
+                    p0 = int(act_ckpt[sub, s, t]) * c_base.gdn_pages
+                    rec_val = unpack_rec_checkpoint(
+                        raw[p0 : p0 + c_base.rec_pages], c_base.vh
+                    )
+                    ref_rec = unpack_rec_checkpoint(
+                        ref_raw[p0 : p0 + c_base.rec_pages], c_base.vh
+                    )
+                    conv_val = unpack_conv_checkpoint(
+                        raw[p0 + c_base.rec_pages], c_base.QKV
+                    )
+                    ref_conv = unpack_conv_checkpoint(
+                        ref_raw[p0 + c_base.rec_pages], c_base.QKV
+                    )
+                    if fused:
+                        np.testing.assert_array_equal(rec_val, ref_rec)
+                        np.testing.assert_array_equal(conv_val, ref_conv)
+                    else:
+                        ref32_rec = unpack_rec_checkpoint(
+                            ref_32[1][p0 : p0 + c_base.rec_pages], c_base.vh
+                        )
+                        ref32_conv = unpack_conv_checkpoint(
+                            ref_32[1][p0 + c_base.rec_pages], c_base.QKV
+                        )
+                        np.testing.assert_array_equal(rec_val, ref32_rec)
+                        np.testing.assert_array_equal(conv_val, ref32_conv)
+                        np.testing.assert_allclose(
+                            rec_val, ref_rec, atol=2e-2, rtol=2e-2
+                        )
+                        np.testing.assert_allclose(
+                            conv_val, ref_conv, atol=2e-2, rtol=2e-2
+                        )
+
+
+def test_wide_verify_buckets_split_gq_pack_parity():
+    """Verify multi-rank `R=2, G=2, SPLIT=True, GQ=True` (`MLW = 128 // NS = 12, 8` at
+    `B = 40, 64`) numerical parity and tail-sequence handling (`s >= 8`, `b = 32..63`)."""
+    mesh = Mesh(np.array(jax.devices("cpu")[:2]), ("tp",))
+    # R=2, NKV=1 -> G=2 (SPLIT=True); NH=8 -> nh=4, T=4 -> QG=16 (GQ=True, MLW=128//NS).
+    c_base = K.MKConfig(
+        R=2,
+        B=16,
+        L=2,
+        att_every=2,
+        H=512,
+        NH=8,
+        NKV=1,
+        HD=256,
+        KH=2,
+        VH=4,
+        KD=128,
+        VD=128,
+        E=128,
+        TOPK=2,
+        I=256,
+        IS=256,
+        ctx=256,
+        T=4,
+        paged_kv=True,
+        num_pages=192,
+        page_size=128,
+        max_pages_per_seq=2,
+        ckpt_k=4,
+    )
+    tiles_base = dataclasses.replace(
+        K.default_tiles(c_base),
+        nbd=4,
+        nbe=4,
+        nkv=2,
+        hier=0,
+        rsag=False,
+        kv_blk=256,
+        kv_sub=128,
+    )
+    shapes = K.weight_shapes(c_base, tiles_base)
+    rng = np.random.default_rng(99)
+    w_leaves = []
+    for k in K.W_NAMES:
+        s, dt = shapes[k]
+        arr = rng.standard_normal((c_base.R, *s)).astype(np.float32) * 0.02
+        w_leaves.append(K.fold(jnp.asarray(arr, dtype=dt)))
+
+    raw_init_u8 = rng.integers(
+        0,
+        40,
+        size=(c_base.R * c_base.num_pages, 2, 64, 4, c_base.page_size),
+        dtype=np.uint8,
+    )
+    raw_init = jnp.asarray(raw_init_u8).view(K.FP8)
+
+    n_act = 2
+    act_tokens = rng.standard_normal((n_act * 4, c_base.H)).astype(np.float32) * 0.1
+    act_roff = np.array([0, -1], dtype=np.int32)
+    act_pos = np.array([[16, 17, 18, 19], [0, 1, 2, 3]], dtype=np.int32)
+    act_pt = np.array([[1, 2], [3, 4]], dtype=np.int32)
+    act_ckpt = np.arange(16, 16 + n_act * 4, dtype=np.int32).reshape(1, n_act, 4)
+
+    def run_bucket(b: int, place_at_tail: bool):
+        fused = (b <= 24) or (b >= 56)
+        c = dataclasses.replace(c_base, B=b, fused_pool_io=fused)
+        tiles = dataclasses.replace(
+            K.default_tiles(c),
+            nbd=4,
+            nbe=4,
+            nkv=2,
+            hier=0,
+            rsag=False,
+            kv_blk=256,
+            kv_sub=128,
+        )
+        ns = b // 4
+        s0 = (ns - n_act) if place_at_tail else 0
+        x = np.zeros((b, c.H), dtype=np.float32)
+        x[s0 * 4 : (s0 + n_act) * 4] = act_tokens
+        pos = np.full((b,), -1, dtype=np.int32)
+        pos[s0 * 4 : (s0 + n_act) * 4] = act_pos.reshape(-1)
+        pt = np.zeros((ns, c.max_pages_per_seq), dtype=np.int32)
+        pt[s0 : s0 + n_act] = act_pt
+        ckpt = np.zeros((1, ns, 4), dtype=np.int32)
+        ckpt[:, s0 : s0 + n_act, :] = act_ckpt
+        roff = np.full((1, ns), -1, dtype=np.int32)
+        roff[:, s0 : s0 + n_act] = act_roff[None, :]
+
+        step, _, _, _ = pool_io.make_flat_pooled_step(
+            mesh,
+            c,
+            tiles,
+            interpret=True,
+            skip=frozenset({"experts"}),
+            fused_pool_io=fused,
+        )
+        outs = step(
+            jnp.tile(jnp.asarray(pos), (c.R,)),
+            jnp.tile(jnp.asarray(x, dtype=K.BF16), (c.R, 1)),
+            *w_leaves,
+            raw_init,
+            jnp.tile(jnp.asarray(pt), (c.R, 1)),
+            jnp.tile(jnp.asarray(ckpt), (c.R, 1, 1)),
+            jnp.tile(jnp.asarray(roff), (c.R, 1)),
+        )
+        out_r0 = np.asarray(outs[0][:b], dtype=np.float32)[s0 * 4 : (s0 + n_act) * 4]
+        out_r1 = np.asarray(outs[0][c.M : c.M + b], dtype=np.float32)[
+            s0 * 4 : (s0 + n_act) * 4
+        ]
+        out_ranks = np.stack([out_r0, out_r1], axis=0)
+        raw_u8 = np.asarray(outs[1].view(jnp.uint8)).reshape(
+            c.R, c.num_pages, 2, 64, 4, c.page_size
+        )
+        return out_ranks, raw_u8
+
+    ref_out, ref_raw = run_bucket(16, place_at_tail=False)
+    kv_pages = act_pt[:, 0]
+
+    for b in (40, 64):
+        out, raw = run_bucket(b, place_at_tail=True)
+        fused = b >= 56
+        np.testing.assert_array_equal(raw[:, kv_pages], ref_raw[:, kv_pages])
+        if fused:
+            np.testing.assert_array_equal(out, ref_out)
+        else:
+            np.testing.assert_allclose(out, ref_out, atol=2e-2, rtol=2e-2)
+        for s in range(n_act):
+            for t in range(4):
+                p0 = int(act_ckpt[0, s, t]) * c_base.gdn_pages
+                for r in range(c_base.R):
+                    rec_val = unpack_rec_checkpoint(
+                        raw[r, p0 : p0 + c_base.rec_pages], c_base.vh
+                    )
+                    ref_rec = unpack_rec_checkpoint(
+                        ref_raw[r, p0 : p0 + c_base.rec_pages], c_base.vh
+                    )
+                    conv_val = unpack_conv_checkpoint(
+                        raw[r, p0 + c_base.rec_pages], c_base.QKV
+                    )
+                    ref_conv = unpack_conv_checkpoint(
+                        ref_raw[r, p0 + c_base.rec_pages], c_base.QKV
+                    )
+                    if fused:
+                        np.testing.assert_array_equal(rec_val, ref_rec)
+                        np.testing.assert_array_equal(conv_val, ref_conv)
+                    else:
+                        np.testing.assert_allclose(
+                            rec_val, ref_rec, atol=2e-2, rtol=2e-2
+                        )
+                        np.testing.assert_allclose(
+                            conv_val, ref_conv, atol=2e-2, rtol=2e-2
+                        )

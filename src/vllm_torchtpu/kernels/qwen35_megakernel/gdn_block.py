@@ -347,10 +347,11 @@ class GDNBlock:
             ybuf[:, :c.NLI] = rnd(y * sm(slot, "in_s", c.NLI))
         with sc("gdn_conv"):
             if GPR:
+                sub_ = lax.rem(o, ctx.G_PER_ATT)
                 hr_rows_128 = c.HR * qkv_128
                 conv_row_iota = lax.broadcasted_iota(I32, (c.HR, QKV), 0)
                 for s_ in range(NS):
-                    @pl.when(gdn_dma.is_seq_active(s_))
+                    @pl.when(gdn_dma.is_gdn_in_active(sub_, s_))
                     def _():
                         gdn_dma.gpr_conv_copy(raw_refs[0], s_, 0, sem.at[0]).wait()
                 for s_ in range(NS):
@@ -363,7 +364,7 @@ class GDNBlock:
                             2 * GCONV_ROWS, 128
                         )
                     raw_hr = raw_hr[:hr_rows_128, :].reshape(c.HR, QKV).astype(F32)
-                    keep = jnp.logical_and(gdn_dma.is_seq_active(s_), conv_row_iota < 3)
+                    keep = jnp.logical_and(gdn_dma.is_gdn_in_active(sub_, s_), conv_row_iota < 3)
                     convb[s_] = jnp.where(keep, raw_hr, 0.0)
             else:
                 pltpu.make_async_copy(ST["conv"].at[o], convb, sem.at[0]).wait()

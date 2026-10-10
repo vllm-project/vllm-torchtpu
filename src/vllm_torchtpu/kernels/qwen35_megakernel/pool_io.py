@@ -194,8 +194,12 @@ def gather_gdn_states(
                 slot = ckpt_ref[s, roff]
                 return slot * (GDN_PAGES * G_PER_ATT) + sub * GDN_PAGES
 
+        def is_in_active(sub, s):
+            roff = roff_ref[sub, s] if roff_is_2d else roff_ref[s]
+            return jnp.logical_and(is_active(s), roff >= 0)
+
         def start_page_read(raw_ref, sub, s, p_slot):
-            @pl.when(is_active(s))
+            @pl.when(is_in_active(sub, s))
             def _():
                 pb = page_base_for(sub, s)
                 pltpu.make_async_copy(
@@ -205,10 +209,14 @@ def gather_gdn_states(
         def finish_page_read(raw_ref, sub, s, p_slot, g_slot, r_slot, r_sub):
             @pl.when(is_active(s))
             def _():
-                pb = page_base_for(sub, s)
-                pltpu.make_async_copy(
-                    raw_ref.at[pl.ds(pb, GDN_PAGES)], page_buf.at[p_slot], sem_in.at[p_slot]
-                ).wait()
+                has_in = (roff_ref[sub, s] if roff_is_2d else roff_ref[s]) >= 0
+
+                @pl.when(has_in)
+                def _():
+                    pb = page_base_for(sub, s)
+                    pltpu.make_async_copy(
+                        raw_ref.at[pl.ds(pb, GDN_PAGES)], page_buf.at[p_slot], sem_in.at[p_slot]
+                    ).wait()
 
                 # Unpack SSM state: pages 0..REC_PAGES-1 -> (ssm_u32_rows, 128) u32 -> (vh, KD, VD) bf16
                 u32_val = (
@@ -216,6 +224,7 @@ def gather_gdn_states(
                     .bitcast(U32)
                     .reshape(SSM_U32_CAP, 128)[:ssm_u32_rows, :]
                 )
+                u32_val = jnp.where(has_in, u32_val, jnp.uint32(0))
                 s_km = pltpu.bitcast(u32_val, BF16).reshape(vh, KD, VD)
                 h0 = s * vh if isinstance(s, int) else pl.multiple_of(s * vh, vh)
                 rec_buf[r_slot, r_sub, pl.ds(h0, vh)] = s_km
@@ -228,7 +237,9 @@ def gather_gdn_states(
                         .reshape(c.HR, QKV)
                         .astype(conv_dt)
                     )
-                    conv_buf[g_slot, sub, s] = jnp.where(conv_row_iota < 3, raw_hr, 0.0)
+                    conv_buf[g_slot, sub, s] = jnp.where(
+                        jnp.logical_and(has_in, conv_row_iota < 3), raw_hr, 0.0
+                    )
                 else:
                     # Unpack Conv state: page REC_PAGES -> (conv_rows_pad, 128) bf16 (tile-aligned)
                     c0 = (
@@ -236,10 +247,13 @@ def gather_gdn_states(
                         if isinstance(s, int)
                         else pl.multiple_of(s * conv_rows_pad, conv_rows_pad)
                     )
-                    conv_buf[g_slot, sub, pl.ds(c0, conv_rows_pad), :] = (
+                    c_val = (
                         page_buf.at[p_slot, REC_PAGES]
                         .bitcast(BF16)
                         .reshape(256, 128)[:conv_rows_pad, :]
+                    )
+                    conv_buf[g_slot, sub, pl.ds(c0, conv_rows_pad), :] = jnp.where(
+                        has_in, c_val, jnp.bfloat16(0.0)
                     )
 
         total_gdn = c.NATT * G_PER_ATT
@@ -773,7 +787,9 @@ def scatter_pool_states(
                             )
                             page_buf.at[slot, t * GDN_PAGES + REC_PAGES].bitcast(BF16).reshape(
                                 256, 128
-                            )[:conv_rows_pad, :] = w4.reshape(conv_rows_pad, 128)
+                            )[:conv_rows_pad, :] = w4.reshape(4 * qkv_128, 128)[
+                                :conv_rows_pad, :
+                            ]
                         else:
                             taps_128 = (
                                 conv_buf[slot, 0, 1 + t : 4 + t, :]
