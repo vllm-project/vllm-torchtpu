@@ -669,9 +669,7 @@ class TPUModelRunner(GPUModelRunner):
                 return build_pooling_metadata(batch, getattr(self, "requests", None))
 
             from vllm.v1.worker.gpu_input_batch import InputBatch as GPUInputBatch
-            from vllm.v1.worker.tpu_input_batch import InputBatch as TPUInputBatch
 
-            TPUInputBatch.get_pooling_metadata = get_pooling_metadata
             GPUInputBatch.get_pooling_metadata = get_pooling_metadata
             self.input_batch.get_pooling_metadata = lambda: get_pooling_metadata(
                 self.input_batch

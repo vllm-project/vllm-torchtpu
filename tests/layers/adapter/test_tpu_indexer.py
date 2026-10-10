@@ -41,7 +41,7 @@ import vllm.model_executor.custom_op as custom_op_mod
 import vllm.model_executor.layers.linear as linear_mod
 import vllm.model_executor.models.deepseek_v2 as deepseek_v2
 import vllm.model_executor.parameter as parameter_mod
-from vllm.config import CacheConfig
+from vllm.config import CacheConfig, VllmConfig, set_current_vllm_config
 from vllm.config.compilation import CompilationConfig, CompilationMode
 from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbedding
 from vllm.model_executor.models.deepseek_v2 import DeepseekV32IndexerCache, Indexer
@@ -136,6 +136,8 @@ def _build_indexer(dtype=torch.float32, n_head=N_HEAD, buffer_tokens=32):
         patch.object(parameter_mod, "get_tensor_model_parallel_rank", lambda: 0),
         patch.object(parameter_mod, "get_tensor_model_parallel_world_size", lambda: 1),
         _default_dtype(dtype),
+        # The in-tree layers read the current config while being built.
+        set_current_vllm_config(VllmConfig()),
     ):
         indexer = Indexer(
             vllm_config=vllm_config,

@@ -73,6 +73,7 @@ def _vllm_config(
             mamba_page_size_padded=mamba_page_size_padded,
             mamba_cache_mode=None,
             use_kda_recoverssm=False,
+            use_replayssm=False,
         ),
         speculative_config=None,
         num_speculative_tokens=0,

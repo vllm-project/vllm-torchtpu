@@ -226,7 +226,6 @@ def test_manifest_preserves_lifecycle_dependencies():
         stages["worker_init"] + stages["model_load"]
     )
     assert stages["model_load"] == [
-        "maybe_patch_qwen2_5_vl",
         "maybe_patch_qwen3_vl",
         "maybe_patch_qwen3_next",
     ]

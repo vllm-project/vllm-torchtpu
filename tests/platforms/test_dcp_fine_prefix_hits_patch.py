@@ -105,7 +105,6 @@ def test_resolve_gated_to_single_group_dcp():
     for config in (
         _stub_config(unit=None),
         _stub_config(caching=False),
-        _stub_config(connector=True),
         _stub_config(unit=LOGICAL_BLOCK),
     ):
         assert _resolve(mla, config) == (LOGICAL_BLOCK, LOGICAL_BLOCK)
@@ -117,10 +116,14 @@ def test_resolve_gated_to_single_group_dcp():
         dtype=torch.bfloat16,
         sliding_window=128,
     )
-    assert _resolve(_kv_cache_config(swa), _stub_config()) == (
-        LOGICAL_BLOCK,
-        LOGICAL_BLOCK,
-    )
+    # Since vLLM v0.31 upstream rejects a single-group unit it cannot apply
+    # while hashing is on, instead of silently staying block-aligned.
+    for kv_cache_config, config in (
+        (mla, _stub_config(connector=True)),
+        (_kv_cache_config(swa), _stub_config()),
+    ):
+        with pytest.raises(ValueError, match="Invalid prefix_match_unit"):
+            _resolve(kv_cache_config, config)
     with pytest.raises(ValueError, match="divisible"):
         _resolve(mla, _stub_config(unit=384))
 
