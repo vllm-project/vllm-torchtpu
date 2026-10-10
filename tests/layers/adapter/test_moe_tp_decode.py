@@ -23,6 +23,7 @@ from vllm.model_executor.layers.fused_moe.routed_experts import RoutedExperts
 from vllm.model_executor.layers.fused_moe.runner import moe_runner as moe_runner_mod
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.layers.adapter import moe_routing, moe_tp_decode, token_padding
 from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import VllmMoERunner
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
@@ -185,7 +186,10 @@ class _Log:
 def harness(monkeypatch):
     torch.manual_seed(0)
     h = _Harness()
-    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "1")
+    # Set the attribute, not the environment: a test that monkeypatched this
+    # attribute earlier in the session leaves it set on the module, where it
+    # shadows envs.__getattr__ and with it any environment value.
+    monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", True)
     monkeypatch.setattr(
         pltpu,
         "get_tpu_info",
@@ -364,14 +368,14 @@ def test_refused_layer_keeps_its_path(harness, spec, reason):
 
 
 def test_refuses_without_the_padding_mask(harness, monkeypatch):
-    monkeypatch.setenv("TPU_MOE_SKIP_PADDED_TOKENS", "0")
+    monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", False)
     model = harness.model({})
     assert moe_tp_decode.arm(model) == 0
     assert "TPU_MOE_SKIP_PADDED_TOKENS" in harness.logs[-1]
 
 
 def test_refuses_when_the_moe_path_owns_its_collectives(harness, monkeypatch):
-    monkeypatch.setenv("TPU_MOE_FP8_ALL_GATHER", "1")
+    monkeypatch.setattr(envs, "TPU_MOE_FP8_ALL_GATHER", True)
     model = harness.model({})
     assert moe_tp_decode.arm(model) == 0
     assert "owns its collectives" in harness.logs[-1]
