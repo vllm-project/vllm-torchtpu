@@ -148,6 +148,29 @@ def test_rs_bf16_flag_sets_the_reduce_scatter_dtype(enabled, monkeypatch):
     assert got.dtype == torch.bfloat16
 
 
+def test_rs_bf16_flag_leaves_the_drafter_in_f32(monkeypatch):
+    """The MTP drafter (is_backbone=False) keeps the f32 reduce-scatter even
+    with TPU_DCP_LSE_MERGE_RS_BF16 on."""
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_RS_BF16", True, raising=False)
+    outputs, lses = _partials(np.random.default_rng(6), 4)
+    outputs = outputs.to(torch.bfloat16)
+    group = _FakeGroup(outputs, lses, 0)
+    seen = []
+    inner = group.reduce_scatter
+
+    def spy(tensor, dim=-1):
+        seen.append(tensor.dtype)
+        return inner(tensor, dim)
+
+    group.reduce_scatter = spy
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
+    got = cp_mla.merge_lse_partials_scatter_heads(
+        outputs[0], lses[0], is_backbone=False
+    )
+    assert seen == [torch.float32]
+    assert got.dtype == torch.bfloat16
+
+
 def test_glm52_fp8_default_reduce_scatters_in_bf16(monkeypatch):
     """GLM-5.2-FP8 (bf16 activations, 64 heads, kv_lora_rank 512) at DCP=16:
     with the flag at its default, the merge passes rs_dtype=bf16."""

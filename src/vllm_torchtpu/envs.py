@@ -393,8 +393,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # faster. Only the backbone uses the all-to-all; the MTP drafter, traced
     # once for every bucket, always takes the reduce-scatter.
     "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS": env_int("TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", 64),
-    # MLA merge reduce-scatter in the output dtype (bf16): half f32's bytes.
-    # 0 restores the f32 reduce-scatter.
+    # Backbone MLA merge reduce-scatter in the output dtype (bf16): half f32's
+    # bytes. The MTP drafter stays f32; 0 restores f32 for the backbone too.
     "TPU_DCP_LSE_MERGE_RS_BF16": env_bool("TPU_DCP_LSE_MERGE_RS_BF16", default=True),
     # Sparse MLA split q (`sparse_ragged_paged_attention(q_pe=...)`): hand
     # q_nope and q_pe to the kernel as separate operands. The kernel joins
