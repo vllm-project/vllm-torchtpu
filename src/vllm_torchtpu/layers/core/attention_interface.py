@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import functools
 import math
 from collections.abc import Callable
@@ -1154,7 +1167,13 @@ def sparse_mla_attention_dcp(
         owns = jnp.any(topk_idx >= 0, axis=-1)
         topk_idx = topk_idx.at[:, 0].set(jnp.where(owns, topk_idx[:, 0], jnp.int32(0)))
 
-        q = jnp.concatenate([ql_nope, q_pe], axis=-1)
+        # Split q: the kernel joins q_nope and q_pe in VMEM (no padded
+        # [T, H, 640] concat). The merge below needs the lse, so it also comes
+        # out lane-dense as f32[T, H] rather than f32[T, H, 1].
+        if envs.TPU_MLA_SPARSE_SPLIT_Q:
+            q, split_kwargs = ql_nope, {"q_pe": q_pe, "lse_lane_dense": True}
+        else:
+            q, split_kwargs = jnp.concatenate([ql_nope, q_pe], axis=-1), {}
         # The capped path (and its chunk) applies only where the kernel takes
         # it: SparseCore caches and a top-k wider than the cap.
         topk_cap = envs.TPU_DCP_MLA_TOPK_CAP
@@ -1189,6 +1208,7 @@ def sparse_mla_attention_dcp(
             # exact in-kernel overflow pass for the rows that need more.
             topk_cap=topk_cap,
             **chunk_kwargs,
+            **split_kwargs,
         )
         lse = jnp.where(owns[:, None], lse, -jnp.inf)
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).

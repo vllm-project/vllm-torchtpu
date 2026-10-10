@@ -5,7 +5,7 @@
 from __future__ import annotations
 
 import zlib
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
 from torch import nn
@@ -28,6 +28,11 @@ from vllm_torchtpu.layers.adapter.moe_hierarchical import (
 
 from .collective_ops import FusedPrefillCollectives
 from .layers import KimiMLP
+
+if TYPE_CHECKING:
+    from vllm_torchtpu.layers.adapter.quantization.compressed_tensors.compressed_tensors_moe.compressed_tensors_moe_w4an_mxfp4 import (  # noqa: E501
+        VllmCompressedTensorsW4ANMxfp4MoEMethod,
+    )
 
 
 class KimiRoutedOutputTransform(nn.Module):
@@ -272,9 +277,9 @@ class KimiMoE(nn.Module):
             latent, weights, ids = group.gather_moe_inputs(
                 latent, weights, ids, num_experts=self.gate.output_size
             )
-            output = routed.quant_method.apply_with_routing(
-                routed, latent, weights, ids
-            )
+            output = cast(
+                "VllmCompressedTensorsW4ANMxfp4MoEMethod", routed.quant_method
+            ).apply_with_routing(routed, latent, weights, ids)
         else:
             output = routed.quant_method.apply_monolithic(routed, latent, router_logits)
         output = (

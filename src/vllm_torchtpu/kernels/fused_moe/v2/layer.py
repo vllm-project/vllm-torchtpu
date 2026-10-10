@@ -18,6 +18,7 @@ expert-parallel mesh axis: quantize, dispatch, kernel, combine.
 """
 
 import threading
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -30,6 +31,8 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     ROWBLK,
     U32_SUBLANE_TILE,
     GatheredPairs,
+    RoutingTables,
+    ShardRoutingTables,
     WeightFormat,
     act_scale_slab_rows,
     align_up,
@@ -638,7 +641,7 @@ def fused_ep_moe_v2(
         # dropped; nothing reads them, and the slab's own rows are the same
         # either way.
         if form.quantized_activations:
-            scale_bits = jnp.repeat(scale_bits_g, topk)
+            scale_bits = jnp.repeat(cast(jax.Array, scale_bits_g), topk)
             scale_rows = act_scale_slab_rows(ragged_stride)
             scale_slab = lax.bitcast_convert_type(
                 jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
@@ -695,17 +698,21 @@ def fused_ep_moe_v2(
 
         # The destination's own table: one arrival row per selection slot.
         pos = (
-            routing.pos
+            cast(ShardRoutingTables, routing).pos
             if sharded_plan
             else lax.dynamic_slice(
-                routing.arrival_row, (me * t_local, 0), (t_local, topk)
+                cast(RoutingTables, routing).arrival_row,
+                (me * t_local, 0),
+                (t_local, topk),
             )
         )
         mirror_pos = (
-            routing.mirror_pos
+            cast(ShardRoutingTables, routing).mirror_pos
             if sharded_plan
             else lax.dynamic_slice(
-                routing.mirror_row, (me * t_local, 0), (t_local, topk)
+                cast(RoutingTables, routing).mirror_row,
+                (me * t_local, 0),
+                (t_local, topk),
             )
         )
         combined = _combine_arrivals(
@@ -779,7 +786,7 @@ def fused_ep_moe_v2(
         has_w1_bias and w1_bias.dtype,
         has_w2_bias and w2_bias.dtype,
         scoring_fn,
-        has_score_bias and score_bias.dtype,
+        has_score_bias and cast(jax.Array, score_bias).dtype,
         has_hash_ids and hash_topk_ids.dtype,
         float(routed_scaling_factor),
     )

@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import dataclasses
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -75,11 +76,13 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
     ):
         # src_ref: (kv_cache_hbm, new_kv_hbm, schedule_ref, page_indices_ref)
         kv_cache_hbm, new_kv_hbm, schedule_ref, page_indices_ref = src_ref
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
         block_idx = jnp.maximum(grid_indices[0], 0)
 
-        vmem_dst_lane = self.window_ref.at[slot]
+        vmem_dst_lane = cast(jax.Ref, self.window_ref.at[slot])
         for b in range(self.cfgs.batch_size):
             for i in range(self.cfgs.bkv_p_cache):
                 p_idx, dst_off, dma_valid = schedule_ref.get_dma_kv_cache(
@@ -125,11 +128,13 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         grid_indices: tuple[int | jax.Array, ...],
     ):
         kv_out_ref, _, schedule_ref, page_indices_ref = dst_ref
+        assert self.sem_sends is not None
+        assert self.window_ref is not None
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
         block_idx = grid_indices[0]
 
-        vmem_src_lane = self.window_ref.at[slot]
+        vmem_src_lane = cast(jax.Ref, self.window_ref.at[slot])
         for b in range(self.cfgs.batch_size):
             do_writeback = schedule_ref.do_writeback[block_idx, b] == 1
             for i in range(self.cfgs.bkv_p_new):
@@ -153,6 +158,7 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         grid_indices: tuple[int | jax.Array, ...],
     ):
         _, _, schedule_ref, _ = src_ref
+        assert self.sem_recvs is not None
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
         block_idx = grid_indices[0]
@@ -174,6 +180,7 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         grid_indices: tuple[int | jax.Array, ...],
     ):
         _, _, schedule_ref, _ = dst_ref
+        assert self.sem_sends is not None
         slot = self.current_wait_out_slot
         sem = self.sem_sends.at[slot]
         block_idx = grid_indices[0]
@@ -231,11 +238,15 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
     ):
         # src_ref: (kv_cache_hbm, new_kv_hbm, schedule_ref, page_indices_ref)
         kv_cache_hbm, new_kv_hbm, schedule_ref, page_indices_ref = src_ref
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
         block_idx = jnp.maximum(grid_indices[0], 0)
 
-        vmem_dst = self.window_ref.at[slot, :, :, : self.cfgs.kv_hbm_stride]
+        vmem_dst = cast(
+            jax.Ref, self.window_ref.at[slot, :, :, : self.cfgs.kv_hbm_stride]
+        )
         # kv_cache_hbm: (num_pages, num_kv_heads * 2, kv_head_dim // packing,
         #     packing, page_size)
         # kv_cache_hbm_flat: (num_pages * num_kv_heads * 2, kv_head_dim // packing,
@@ -283,12 +294,16 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         grid_indices: tuple[int | jax.Array, ...],
     ):
         kv_out_ref, _, schedule_ref, page_indices_ref = dst_ref
+        assert self.sem_sends is not None
+        assert self.window_ref is not None
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
         block_idx = grid_indices[0]
 
         kv_out_ref_flat = kv_out_ref.reshape(-1, *kv_out_ref.shape[2:])
-        vmem_src = self.window_ref.at[slot, :, :, : self.cfgs.kv_hbm_stride]
+        vmem_src = cast(
+            jax.Ref, self.window_ref.at[slot, :, :, : self.cfgs.kv_hbm_stride]
+        )
 
         for b in range(self.cfgs.batch_size):
             do_writeback = schedule_ref.do_writeback[block_idx, b] == 1
@@ -315,6 +330,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         grid_indices: tuple[int | jax.Array, ...],
     ):
         _, _, schedule_ref, _ = src_ref
+        assert self.sem_recvs is not None
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
         block_idx = grid_indices[0]
@@ -335,6 +351,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         grid_indices: tuple[int | jax.Array, ...],
     ):
         _, _, schedule_ref, _ = dst_ref
+        assert self.sem_sends is not None
         slot = self.current_wait_out_slot
         sem = self.sem_sends.at[slot]
         block_idx = grid_indices[0]
@@ -392,9 +409,11 @@ class BatchingORef(pltpu.BufferedRef):
     ):
         # dst_ref: (o_hbm, schedule_ref)
         o_hbm, schedule_ref = dst_ref
+        assert self.sem_sends is not None
+        assert self.window_ref is not None
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_src = self.window_ref.at[slot]
+        vmem_src = cast(jax.Ref, self.window_ref.at[slot])
         block_idx = grid_indices[0]
 
         # is_last_k stride: batch size
@@ -420,6 +439,7 @@ class BatchingORef(pltpu.BufferedRef):
     ):
         # dst_ref: (o_hbm, schedule_ref)
         o_hbm, schedule_ref = dst_ref
+        assert self.sem_sends is not None
         slot = self.current_wait_out_slot
         sem = self.sem_sends.at[slot]
         block_idx = grid_indices[0]
@@ -474,9 +494,11 @@ class BatchingLSERef(pltpu.BufferedRef):
         grid_indices: tuple[int | jax.Array, ...],
     ):
         lse_hbm, schedule_ref = dst_ref
+        assert self.sem_sends is not None
+        assert self.window_ref is not None
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_src = self.window_ref.at[slot]
+        vmem_src = cast(jax.Ref, self.window_ref.at[slot])
         block_idx = grid_indices[0]
         dma_list = []
         for b in range(self.cfgs.batch_size):
@@ -500,6 +522,7 @@ class BatchingLSERef(pltpu.BufferedRef):
         grid_indices: tuple[int | jax.Array, ...],
     ):
         lse_hbm, schedule_ref = dst_ref
+        assert self.sem_sends is not None
         slot = self.current_wait_out_slot
         sem = self.sem_sends.at[slot]
         block_idx = grid_indices[0]
@@ -556,9 +579,11 @@ class BatchingQRef(pltpu.BufferedRef):
     ):
         # src_ref: (q_hbm, schedule_ref)
         q_hbm, schedule_ref = src_ref
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_dst = self.window_ref.at[slot]
+        vmem_dst = cast(jax.Ref, self.window_ref.at[slot])
         block_idx = grid_indices[0]
 
         dma_list = []
@@ -580,6 +605,7 @@ class BatchingQRef(pltpu.BufferedRef):
         grid_indices: tuple[int | jax.Array, ...],
     ):
         _, schedule_ref = src_ref
+        assert self.sem_recvs is not None
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
         vmem_dst = self.window_ref.at[slot]

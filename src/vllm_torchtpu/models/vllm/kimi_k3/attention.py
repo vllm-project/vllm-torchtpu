@@ -689,6 +689,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         del positions
         group = self.prefill_group if sequence_parallel else get_tp_group()
         assert group is not None
+        output_gate: torch.Tensor | None = None
         # Set and read only on the low-rank gate path.
         gate_input: torch.Tensor | None = None
         if self.packed_prefill_weight is not None:
@@ -728,6 +729,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         if not self.use_full_rank_gate:
             assert self.g_b_proj is not None
             output_gate, _ = self.g_b_proj(gate_input)
+        assert output_gate is not None
 
         metadata = self._metadata()
         if metadata is None or self.kv_cache is None or self.kv_cache[0].numel() == 0:

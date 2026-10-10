@@ -200,6 +200,11 @@ if [ "${DOCKER_EXIT_CODE}" -ne 0 ]; then
   fi
   echo "Last 40 lines of container output:"
   tail -n 40 "${RUN_LOG}"
+
+  python3 "${SCRIPT_DIR}/record_ci_failure.py" \
+    --log-file "${RUN_LOG}" \
+    --exit-code "${DOCKER_EXIT_CODE}" \
+    --step-label "${BUILDKITE_LABEL:-}" || true
 fi
 
 exit "$DOCKER_EXIT_CODE"

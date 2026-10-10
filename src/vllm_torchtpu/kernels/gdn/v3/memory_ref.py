@@ -14,7 +14,7 @@
 
 import dataclasses
 import functools
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -172,7 +172,7 @@ class InBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -189,7 +189,7 @@ class InBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         dma_size = 0
@@ -211,7 +211,7 @@ class OutBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -228,7 +228,7 @@ class OutBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_wait_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         dma_size = 0
@@ -287,7 +287,7 @@ class StateBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -315,7 +315,7 @@ class StateBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         dma_size = 0
@@ -337,7 +337,7 @@ class StateBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -363,7 +363,7 @@ class StateBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_wait_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         dma_size = 0
@@ -430,6 +430,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
         return ckpt_indices[s_idx, ckpt]
 
     def _region_slice(self, src_ref: jax.Ref, state_idx, nblocks):
+        assert self.cfg.state_plan is not None
         base = state_idx * self.stride + self.region.kb0
         if self.cfg.state_plan.whole_block_dma or (
             self.region.row0 == 0 and self.region.nrows == src_ref.shape[1]
@@ -444,7 +445,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
         assert self.window_ref is not None
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -479,9 +480,10 @@ class ExternalStateBufferedRef(StateBufferedRef):
         """
         assert self.sem_sends is not None
         assert self.window_ref is not None
+        assert self.compact_output_ref is not None
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -504,7 +506,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
         assert self.window_ref is not None
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -532,7 +534,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
         assert self.window_ref is not None
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         dma_size = 0
@@ -556,7 +558,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
         assert self.window_ref is not None
         slot = self.current_wait_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         dma_size = 0

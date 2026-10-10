@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
     TPU_DCP_LSE_MERGE_A2A: bool = False
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
+    TPU_MLA_SPARSE_SPLIT_Q: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -391,6 +392,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # faster. Only the backbone uses the all-to-all; the MTP drafter, traced
     # once for every bucket, always takes the reduce-scatter.
     "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS": env_int("TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", 64),
+    # Sparse MLA split q (`sparse_ragged_paged_attention(q_pe=...)`): hand
+    # q_nope and q_pe to the kernel as separate operands. The kernel joins
+    # them in VMEM and its output aliases q_nope (512 wide), instead of the
+    # caller materialising a concat the wrapper pads to [T, H, 640]. Where the
+    # caller also needs the log-sum-exp (DCP), it is exported lane-dense as
+    # f32[T, H] (`lse_lane_dense=True`) instead of f32[T, H, 1], whose
+    # lane-padded tiles cost a broadcast init, a relayout copy and padded
+    # copies through the LSE merge. Bit-identical outputs.
+    "TPU_MLA_SPARSE_SPLIT_Q": env_bool("TPU_MLA_SPARSE_SPLIT_Q", default=False),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per
