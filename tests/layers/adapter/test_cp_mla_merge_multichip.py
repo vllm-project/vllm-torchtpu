@@ -179,6 +179,7 @@ MERGE_VARIANTS = {"a2a_reduce_sum": _merge_reduce_sum, "a2a_unrolled": _merge_un
 def _set_arm(cp_mla, arm):
     cp_mla.envs.TPU_DCP_LSE_MERGE_A2A = ARMS[arm]
     cp_mla.envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS = 1 << 30
+    cp_mla.envs.TPU_DCP_LSE_MERGE_RS_BF16 = False  # "today" stays the f32 reference
 
 
 def _compile(fn):
