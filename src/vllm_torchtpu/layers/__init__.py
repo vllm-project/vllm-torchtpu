@@ -25,6 +25,24 @@ def register_layers() -> None:
     register_tokenizers()
     _maybe_install_frontend_tokcache()
     _maybe_install_frontend_fix()
+    _maybe_install_detok_prompt_tail()
+
+
+def _maybe_install_detok_prompt_tail() -> None:
+    import os
+
+    if os.environ.get("QX_DETOK_PROMPT_TAIL", "8") in ("", "0"):
+        return
+    try:
+        from vllm_torchtpu.frontend_fix import maybe_install_detok_prompt_tail
+
+        maybe_install_detok_prompt_tail()
+    except Exception as e:  # never break startup
+        import logging
+
+        logging.getLogger(__name__).warning(
+            "[QX_DETOK_PROMPT_TAIL] install failed: %r", e
+        )
 
 
 def _maybe_install_frontend_tokcache() -> None:
