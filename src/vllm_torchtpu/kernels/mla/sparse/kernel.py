@@ -466,6 +466,10 @@ def _attention_kernel(
     # Lane-dense lse (`lse_lane_dense`): `lse_hbm_ref` is f32[tokens, heads]
     # and the blse buffer f32[2, bsz, heads]; each token's [heads, 1] column
     # is moved to a row exactly (a masked max) before it is stored.
+
+    # Paths with split_q and lase_lance_dense should be the default but kept
+    # as False to maintain compatibility with existing code paths. Some clean up
+    # work can be done later.
     #
     # Capped mode (`capped_windows` = W set, SparseCore layout only): the
     # gathered buffers hold W windows of `bkv_sz` rows per token, window-major
