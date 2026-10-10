@@ -1,8 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Streaming chat completion delta formatting optimizations for OpenAI API serving.
+"""API-server patches for reasoning-token counting and incremental detokenizer priming.
 
-Reduces per-chunk Python string allocation overhead during high-concurrency
-token streaming with reasoning content extraction.
+* ``QX_LAZY_REASONING_COUNT=1``: skips per-delta ``DelegatingParser.count_reasoning_tokens``
+  recomputation on intermediate streaming chunks when ``continuous_usage_stats`` is
+  disabled, and short-circuits to 0 when the ``StreamingParserEngine`` state machine
+  has no reachable ``REASONING_CHUNK`` transition or state.
+* ``QX_DETOK_PROMPT_TAIL=8``: primes ``FastIncrementalDetokenizer``'s Rust
+  ``DecodeStream`` with a UTF-8 boundary-verified prompt suffix instead of decoding
+  the full prompt twice on the first emitted token.
 """
 
 from __future__ import annotations
@@ -152,4 +157,139 @@ def maybe_install_lazy_reasoning_count() -> bool:
     _INSTALLED = True
     logger.warning("%s installed DelegatingParser.parse_delta/count_reasoning_tokens "
                    "patch (pid %d, %s)", _P, os.getpid(), pname)
+    return True
+
+
+# ---------------------------------------------------------------------------
+# Detokenizer prompt tail (QX_DETOK_PROMPT_TAIL).
+#
+# vLLM's FastIncrementalDetokenizer primes ``tokenizers.decoders.DecodeStream``
+# with the *whole* prompt.  The first ``step()`` then decodes the prompt twice
+# (``prefix`` and ``prefix + new``) on the API-server event loop: ~27 ms at
+# 94k prompt ids, directly in TTFT.  After that first emitted chunk the stream
+# drops every prompt id (``ids.drain(prefix_index..)``), so the prompt only
+# matters as left context for the first chunk.
+#
+# For byte-level decoders the decoded text is ``from_utf8_lossy(concat(bytes))``
+# so the left context only matters through UTF-8 synchronization.  If
+# ``decode(tail)`` is non-empty and does not end with U+FFFD, the tail ends on
+# a character boundary; then ``decode(P + new)[len(decode(P)):]`` equals
+# ``decode(T + new)[len(decode(T)):]`` for every continuation, the stream's
+# emit/hold decisions are identical, and after the first emitted chunk both
+# streams hold exactly ``[new ids]`` (same state).  When the check fails (prompt
+# ends inside a multi-byte character, or the tail decodes to "" because it is
+# all skipped special tokens) we keep the full prompt, i.e. upstream behaviour.
+# ---------------------------------------------------------------------------
+
+_DT = "[QX_DETOK_PROMPT_TAIL]"
+_DETOK_INSTALLED = False
+
+
+class _DetokStats:
+    tail = 0
+    full_fallback = 0
+    short = 0
+    last_log = 0.0
+
+
+def safe_prompt_tail(tokenizer, prompt_ids, skip_special_tokens: bool, tail_n: int):
+    """Shortest prompt suffix that primes a DecodeStream identically to the
+    full prompt, or ``prompt_ids`` itself when no safe tail exists.
+
+    ``tokenizer`` is a ``tokenizers.Tokenizer`` (rust) instance.
+    """
+    if prompt_ids is None or tail_n <= 0 or len(prompt_ids) <= tail_n:
+        return prompt_ids
+    tail = list(prompt_ids[-tail_n:])
+    try:
+        text = tokenizer.decode(tail, skip_special_tokens=skip_special_tokens)
+    except Exception:
+        return prompt_ids
+    if not text or text.endswith("\ufffd"):
+        return prompt_ids
+    return tail
+
+
+class _PromptTailView:
+    """Read-only view of an EngineCoreRequest with a shortened prompt.
+
+    FastIncrementalDetokenizer.__init__ only reads attributes of the request;
+    everything except ``prompt_token_ids`` is delegated to the real request.
+    """
+
+    __slots__ = ("_qx_req", "prompt_token_ids")
+
+    def __init__(self, req, prompt_token_ids):
+        object.__setattr__(self, "_qx_req", req)
+        object.__setattr__(self, "prompt_token_ids", prompt_token_ids)
+
+    def __getattr__(self, name):
+        return getattr(object.__getattribute__(self, "_qx_req"), name)
+
+
+def maybe_install_detok_prompt_tail() -> bool:
+    global _DETOK_INSTALLED
+    if _DETOK_INSTALLED:
+        return False
+    try:
+        tail_n = int(os.environ.get("QX_DETOK_PROMPT_TAIL", "8"))
+    except ValueError:
+        tail_n = 8
+    if tail_n <= 0:
+        return False
+    pname = multiprocessing.current_process().name
+    if not (pname == "MainProcess" or pname.startswith("ApiServer")):
+        return False
+    try:
+        import inspect
+
+        from vllm.v1.engine import detokenizer as detok_mod
+        cls = detok_mod.FastIncrementalDetokenizer
+        src = inspect.getsource(cls.__init__)
+    except Exception as e:
+        logger.warning("%s cannot import FastIncrementalDetokenizer (%r); not enabled",
+                       _DT, e)
+        return False
+    # Only patch the upstream shape we have proven equivalent: a DecodeStream
+    # primed with ``ids=request.prompt_token_ids``.
+    if "DecodeStream(" not in src or "ids=request.prompt_token_ids" not in src:
+        logger.warning("%s FastIncrementalDetokenizer.__init__ changed upstream; "
+                       "not enabled", _DT)
+        return False
+
+    orig_init = cls.__init__
+    log_s = float(os.environ.get("QX_DETOK_PROMPT_TAIL_LOG_S", "300"))
+    _DetokStats.last_log = time.monotonic()
+
+    def __init__(self, tokenizer, request):
+        try:
+            ids = request.prompt_token_ids
+            if ids is not None and len(ids) > tail_n:
+                sp = request.sampling_params
+                tail = safe_prompt_tail(
+                    tokenizer._tokenizer, ids, bool(sp.skip_special_tokens), tail_n
+                )
+                if tail is not ids:
+                    request = _PromptTailView(request, tail)
+                    _DetokStats.tail += 1
+                else:
+                    _DetokStats.full_fallback += 1
+            else:
+                _DetokStats.short += 1
+            now = time.monotonic()
+            if now - _DetokStats.last_log >= log_s:
+                _DetokStats.last_log = now
+                logger.warning("%s stats tail=%d full_fallback=%d short=%d", _DT,
+                               _DetokStats.tail, _DetokStats.full_fallback,
+                               _DetokStats.short)
+        except Exception:
+            pass
+        orig_init(self, tokenizer, request)
+
+    __init__.__qx_detok_tail__ = True
+    __init__.__wrapped__ = orig_init
+    cls.__init__ = __init__
+    _DETOK_INSTALLED = True
+    logger.warning("%s installed FastIncrementalDetokenizer prompt-tail priming "
+                   "(tail=%d, pid %d, %s)", _DT, tail_n, os.getpid(), pname)
     return True
