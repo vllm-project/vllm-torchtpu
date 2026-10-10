@@ -119,3 +119,13 @@ other models' automatic libtpu flags.
 Validation scripts and raw experiment evidence are maintained separately from
 the runtime change. Cache validation alone does not establish full-model
 numerical equivalence, memory usage or serving performance.
+
+DeepSeek V4.1 benchmark configurations and the standalone prefill scripts
+now enable prefix caching by default. Set `ENABLE_PREFIX_CACHING=false` for
+uncached baseline measurements. The shared benchmark runner uses its normal
+prefix-cache switch; no custom scheduler is required. Repeated prompts may
+hit cached prefixes, so these measurements are not interchangeable with the
+previous uncached baselines. Chunk size, concurrency, KV budget, loading and
+Engram offload settings remain specific to each benchmark configuration.
+The DSpark configuration inherits this default; the combination of DSpark
+and prefix caching still requires separate validation.

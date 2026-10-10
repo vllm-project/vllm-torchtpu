@@ -8,6 +8,7 @@ MODEL="${DEEPSEEK_V41_MODEL:-deepseek-ai/DeepSeek-V4.1-Flash}"
 TENSOR_PARALLELISM=8
 DATA_PARALLELISM=1
 ENABLE_EP=true
+ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-true}"
 MAX_MODEL_LEN=5120
 MAX_NUM_BATCHED_TOKENS=2048
 MAX_NUM_SEQS=8
@@ -34,7 +35,7 @@ export VLLM_USE_AOT_COMPILE=0
 export TPU_DEEPSEEK_V41_IMPL="${TPU_DEEPSEEK_V41_IMPL:-v2}"
 # 256 MiB held ~44k tokens in the 4096-len smoke run; 384 MiB leaves margin for
 # 8 x 5120 = 40,960 tokens.
-EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--no-enable-prefix-caching --enable-ep-weight-filter --safetensors-load-strategy=prefetch --safetensors-prefetch-num-threads=8 --block-size=16 --kv-cache-memory-bytes=402653184 --compilation-config={\"compile_sizes\":[8,128,2048]}"
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--enable-ep-weight-filter --safetensors-load-strategy=prefetch --safetensors-prefetch-num-threads=8 --block-size=16 --kv-cache-memory-bytes=402653184 --compilation-config={\"compile_sizes\":[8,128,2048]}"
 
 # Keep the v7x Engram gather on the runtime default path.
 if [[ "${LIBTPU_INIT_ARGS:-}" != *"--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes"* ]]; then

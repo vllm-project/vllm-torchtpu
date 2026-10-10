@@ -26,6 +26,12 @@ export VLLM_DISABLE_COMPILE_CACHE="${VLLM_DISABLE_COMPILE_CACHE:-1}"
 export USE_MOE_SPARSE_CORE="${USE_MOE_SPARSE_CORE:-1}" TORCHINDUCTOR_AUTOGRAD_CACHE=0
 export TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=false
 export LIBTPU_INIT_ARGS="--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0"
+# Set ENABLE_PREFIX_CACHING=false for uncached baseline measurements.
+case "${ENABLE_PREFIX_CACHING:-true}" in
+  true) prefix_caching_flag=--enable-prefix-caching ;;
+  false) prefix_caching_flag=--no-enable-prefix-caching ;;
+  *) echo "ENABLE_PREFIX_CACHING must be true or false" >&2; exit 1 ;;
+esac
 export TPU_DEEPSEEK_V41_IMPL=v2
 export TPU_DEEPSEEK_V41_CED="${TPU_DEEPSEEK_V41_CED:-1}"
 CHUNK=${CHUNK:-2048}; MAX_SEQS=${MAX_SEQS:-4}; OSL=${OSL:-1}
@@ -42,7 +48,7 @@ $py -m vllm.entrypoints.openai.api_server \
   --host 127.0.0.1 --port $port \
   --tensor-parallel-size 8 --data-parallel-size 1 \
   --enable-expert-parallel --enable-ep-weight-filter --language-model-only \
-  --async-scheduling --no-enable-prefix-caching \
+  --async-scheduling "$prefix_caching_flag" \
   --attention-config '{"indexer_kv_dtype":"fp8"}' --kv-cache-dtype fp8 \
   --safetensors-load-strategy prefetch --safetensors-prefetch-num-threads 8 \
   --max-model-len 103424 --max-num-seqs "$MAX_SEQS" --max-num-batched-tokens "$CHUNK" \

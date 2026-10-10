@@ -10,6 +10,7 @@ MODEL="${DEEPSEEK_V41_MODEL:-deepseek-ai/DeepSeek-V4.1-Flash}"
 TENSOR_PARALLELISM=8
 DATA_PARALLELISM=1
 ENABLE_EP=true
+ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-true}"
 MAX_MODEL_LEN=103424
 MAX_NUM_BATCHED_TOKENS=2048
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
@@ -41,7 +42,7 @@ export TPU_DEEPSEEK_V41_CED="${TPU_DEEPSEEK_V41_CED:-1}"
 # On CDK, 16 x 100k requests peaked at 25% of it.
 KV_CACHE_MEMORY_BYTES="${KV_CACHE_MEMORY_BYTES:-21474836480}"
 COMPILE_SIZES="${COMPILE_SIZES:-[4,8,16,2048]}"
-EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--no-enable-prefix-caching --enable-ep-weight-filter --safetensors-load-strategy=prefetch --safetensors-prefetch-num-threads=8 --block-size=16 --kv-cache-memory-bytes=${KV_CACHE_MEMORY_BYTES} --compilation-config={\"compile_sizes\":${COMPILE_SIZES}}"
+EXTRA_SERVE_ARGS="${EXTRA_SERVE_ARGS:+$EXTRA_SERVE_ARGS }--enable-ep-weight-filter --safetensors-load-strategy=prefetch --safetensors-prefetch-num-threads=8 --block-size=16 --kv-cache-memory-bytes=${KV_CACHE_MEMORY_BYTES} --compilation-config={\"compile_sizes\":${COMPILE_SIZES}}"
 
 # Keep the v7x Engram gather on the runtime default path.
 if [[ "${LIBTPU_INIT_ARGS:-}" != *"--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes"* ]]; then
