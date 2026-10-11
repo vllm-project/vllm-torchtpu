@@ -200,6 +200,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_DRAFT_VOCAB_PARALLEL_ARGMAX: bool = False
+    TPU_MTP_EH_PROJ_TP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
@@ -1220,6 +1221,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # unchanged. Not taken with a draft-to-target id table (d2t) or with
     # VLLM_TPU_FUSED_DRAFT_LOOP.
     "TPU_DRAFT_VOCAB_PARALLEL_ARGMAX": env_bool("TPU_DRAFT_VOCAB_PARALLEL_ARGMAX"),
+    # MTP draft (DeepSeek / GLM-5.2): split the replicated eh_proj (2H -> H,
+    # nn.Linear upstream) by output column across TP and all-gather the
+    # result, so each draft pass reads H*2H/tp weight bytes instead of H*2H
+    # (spec_decode/utils.ColumnParallelEhProj). Same per-element dot product.
+    # Not taken with PCP or a replicated (TP=1) draft.
+    "TPU_MTP_EH_PROJ_TP": env_bool("TPU_MTP_EH_PROJ_TP"),
     # Non-greedy sampling filters the vocab to this many 128-logit blocks,
     # ranked by block max, before running top-k (and any subsequent top-p).
     # 0 searches the full vocab. Used only when every active request has
