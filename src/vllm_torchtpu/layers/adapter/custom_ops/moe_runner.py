@@ -14,7 +14,11 @@
 """Out-of-tree (OOT) MoE runner: the TPU side of vLLM's MoE forward path."""
 
 from collections.abc import Callable
+from contextlib import nullcontext
 
+import torch
+import torch.nn.functional as F
+from vllm.distributed import parallel_state
 from vllm.model_executor.layers.fused_moe.runner import moe_runner as _moe_runner
 from vllm.model_executor.layers.fused_moe.runner.moe_runner import MoERunner
 
@@ -30,6 +34,9 @@ from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
 # _fused_output_is_reduced).
 _upstream_fused_output_is_reduced = MoERunner._fused_output_is_reduced.fget
 assert _upstream_fused_output_is_reduced is not None
+_HAS_SYNC_SHARED_EXPERTS_STREAM = hasattr(
+    MoERunner, "_maybe_sync_shared_experts_stream"
+)
 
 
 @MoERunner.register_oot
@@ -75,6 +82,70 @@ class VllmMoERunner(MoERunner):
             if self.shared_experts is None
             else _moe_runner._moe_forward_shared
         )
+
+    @property
+    def do_naive_dispatch_combine(self) -> bool:
+        return (
+            self.moe_config.dp_size > 1 or self.moe_config.is_sequence_parallel
+        ) and not self._quant_method.supports_internal_mk
+
+    def _sequence_parallel_context(self):
+        return nullcontext()
+
+    def _gate_after_gather_applies(self) -> bool:
+        return bool(
+            envs.VLLM_TPU_MOE_SP_GATE_AFTER_GATHER
+            and self.gate is not None
+            and self.moe_config.is_sequence_parallel
+            and self.moe_config.pcp_size == 1
+            and self.do_naive_dispatch_combine
+        )
+
+    def _forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        router_logits: torch.Tensor,
+        shared_experts_input: torch.Tensor | None,
+        input_ids: torch.Tensor | None = None,
+    ):
+        # Mirrors upstream ``MoERunner._forward_impl`` (v0.29) but moves the
+        # runner-owned gate after the EP all-gather. Upstream computes
+        # ``router_logits = gate(hidden[T/TP])`` first and then dispatches both
+        # tensors; on TPU the second gather is a separate latency-bound launch
+        # that a replicated [T, H] x [H, E] GEMM on every rank replaces.
+        if not self._gate_after_gather_applies():
+            return super()._forward_impl(
+                hidden_states, router_logits, shared_experts_input, input_ids
+            )
+
+        self.routed_experts._ensure_moe_quant_config_init()
+        if _HAS_SYNC_SHARED_EXPERTS_STREAM:
+            self._maybe_sync_shared_experts_stream(shared_experts_input)
+        elif self._shared_experts is not None:
+            self._shared_experts.maybe_forward_async(shared_experts_input)
+
+        ep_group = parallel_state.get_ep_group()
+        sp_group = (
+            ep_group if ep_group.world_size > 1 else parallel_state.get_tp_group()
+        )
+        if sp_group.world_size > 1:
+            hidden_states = sp_group.all_gather(hidden_states, dim=0)
+
+        if self._fse_fuse_gate:
+            self._maybe_fuse_gate_weights()
+            assert self._combined_gate_weight is not None
+            router_logits = F.linear(hidden_states, self._combined_gate_weight)
+        else:
+            assert self.gate is not None
+            router_logits, _ = self.gate(hidden_states)
+
+        shared_output, hidden_states = self._apply_quant_method(
+            hidden_states=hidden_states,
+            router_logits=router_logits,
+            shared_experts_input=shared_experts_input,
+            input_ids=input_ids,
+        )
+        return self._maybe_combine(shared_output, hidden_states)
 
     @property
     def _fused_output_is_reduced(self) -> bool:

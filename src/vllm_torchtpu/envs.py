@@ -164,6 +164,10 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
+    VLLM_TPU_MOE_SP_GATE_AFTER_GATHER: bool = True
+    VLLM_TPU_SEQUENCE_PARALLEL_FP8_GATHER: bool = False
+    VLLM_TPU_SP_FP8_GATHER_MIN_TOKENS: int = 0
+    VLLM_TPU_SP_MIN_TOKENS: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
@@ -1003,6 +1007,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_SAMPLER_TOPK_CANDIDATES": env_nonnegative_int(
         "TPU_SAMPLER_TOPK_CANDIDATES", 0
     ),
+    "VLLM_TPU_MOE_SP_GATE_AFTER_GATHER": env_bool(
+        "VLLM_TPU_MOE_SP_GATE_AFTER_GATHER", True
+    ),
+    "VLLM_TPU_SEQUENCE_PARALLEL_FP8_GATHER": lambda: (
+        env_bool("VLLM_TPU_SEQUENCE_PARALLEL_FP8_GATHER")()
+        or env_bool("TPU_SEQUENCE_PARALLEL_FP8_GATHER")()
+    ),
+    "VLLM_TPU_SP_FP8_GATHER_MIN_TOKENS": env_nonnegative_int(
+        "VLLM_TPU_SP_FP8_GATHER_MIN_TOKENS", 0
+    ),
+    "VLLM_TPU_SP_MIN_TOKENS": env_nonnegative_int("VLLM_TPU_SP_MIN_TOKENS", 0),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
     # per-chunk outputs. 0 disables (encode the whole video in one batch).

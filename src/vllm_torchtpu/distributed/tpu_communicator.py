@@ -19,7 +19,7 @@ from vllm.distributed.device_communicators.base_device_communicator import (
     All2AllManagerBase,
     DeviceCommunicatorBase,
 )
-from vllm.distributed.parallel_state import get_dp_group, get_ep_group
+from vllm.distributed.parallel_state import get_dp_group, get_ep_group, get_tp_group
 
 
 class TpuNullAll2AllManager(All2AllManagerBase):
@@ -37,7 +37,11 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
             self.all2all_manager = TpuNullAll2AllManager(self.cpu_group)
 
     def _moe_group(self, is_sequence_parallel: bool):
-        group = get_ep_group() if is_sequence_parallel else get_dp_group()
+        if is_sequence_parallel:
+            ep_group = get_ep_group()
+            group = ep_group if ep_group.world_size > 1 else get_tp_group()
+        else:
+            group = get_dp_group()
         return group if group.world_size > 1 else None
 
     def dispatch_router_logits(

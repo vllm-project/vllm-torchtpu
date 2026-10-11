@@ -335,3 +335,11 @@ def test_token_groups_reject_inconsistent_membership(monkeypatch, group, reports
     monkeypatch.setattr(ep.torch.distributed, "all_gather_object", gather)
     with pytest.raises(RuntimeError, match="replica"):
         ep.ep_token_replica_groups()
+
+
+def test_ep_mesh_order_stays_rank_ordered_under_moe_sp(monkeypatch):
+    device_ids = (0, 1, 4, 5, 6, 7, 2, 3)
+    monkeypatch.setattr(ep.envs, "TPU_MOE_SEQUENCE_PARALLEL", False)
+    assert ep._ep_mesh_order(device_ids) == (0, 1, 6, 7, 2, 3, 4, 5)
+    monkeypatch.setattr(ep.envs, "TPU_MOE_SEQUENCE_PARALLEL", True)
+    assert ep._ep_mesh_order(device_ids) == (0, 1, 2, 3, 4, 5, 6, 7)

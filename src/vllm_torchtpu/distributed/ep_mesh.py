@@ -34,6 +34,7 @@ from typing import Any
 import torch
 from vllm.distributed import parallel_state
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_world_size
 from vllm_torchtpu.distributed.mesh_utils import (
     _collect_rank_to_device_id,
@@ -174,13 +175,25 @@ def _ep_mesh_order(device_ids: tuple[int, ...]) -> tuple[int, ...]:
     conflicting device assignments" -- for DCP whenever a DCP group is not a
     contiguous tile of the sorted EP mesh, e.g. TP4/DCP4 on tpu7x, whose DCP
     groups are devices [0, 1, 4, 5] and [6, 7, 2, 3].
+
+    With sequence-parallel MoE (`TPU_MOE_SEQUENCE_PARALLEL=1`), the mesh also
+    stays in rank order: `ProcessGroupTpu` populates `replica_groups` on TP
+    `all_gather` and `reduce_scatter` collectives with global device IDs in
+    rank order, and `torch_tpu`'s `RewriteReplicaGroupsAttr` indexes
+    `rank_to_partition[val]` whenever a Pallas kernel overrides the module
+    `DeviceAssignment`, which would apply the rank-to-device permutation a
+    second time and scramble token slices across TP ranks.
     """
     if len(set(device_ids)) != len(device_ids):
         raise RuntimeError(
             f"Two EP ranks report the same TPU global device id: {device_ids}"
         )
     ep_ranks = range(len(device_ids))
-    if get_pcp_world_size() > 1 or get_dcp_world_size() > 1:
+    if (
+        get_pcp_world_size() > 1
+        or get_dcp_world_size() > 1
+        or envs.TPU_MOE_SEQUENCE_PARALLEL
+    ):
         return tuple(ep_ranks)
     return tuple(sorted(ep_ranks, key=device_ids.__getitem__))
 

@@ -106,6 +106,16 @@ def test_moe_group_with_sequence_parallel(monkeypatch, communicator):
     assert communicator._moe_group(is_sequence_parallel=True) is ep_group
 
 
+def test_moe_group_with_tp_sequence_parallel(monkeypatch, communicator):
+    ep_group = Mock(world_size=1)
+    tp_group = Mock(world_size=8)
+    dp_group = Mock(world_size=1)
+    monkeypatch.setattr(comm, "get_ep_group", lambda: ep_group)
+    monkeypatch.setattr(comm, "get_tp_group", lambda: tp_group)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: dp_group)
+    assert communicator._moe_group(is_sequence_parallel=True) is tp_group
+
+
 def test_moe_group_without_sequence_parallel(monkeypatch, communicator):
     dp_group_1 = Mock(world_size=1)
     monkeypatch.setattr(comm, "get_dp_group", lambda: dp_group_1)

@@ -13,7 +13,7 @@
 # limitations under the License.
 
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 import pytest
 import torch
@@ -150,3 +150,148 @@ def test_fused_output_is_reduced_under_torch_compile(fused_ep_kernel, armed, exp
         torch._dynamo.reset()
         compiled = torch.compile(reduce_unless_reduced, backend="eager", fullgraph=True)
         torch.testing.assert_close(compiled(x), x if expected else x * 2)
+
+
+def _make_sp_runner(*, gate, is_sp=True, dp_size=1, pcp_size=1, naive=True):
+    """Bare VllmMoERunner instance with the attributes _forward_impl touches."""
+    runner = VllmMoERunner.__new__(VllmMoERunner)
+    torch.nn.Module.__init__(runner)
+    runner.gate = gate
+    runner.moe_config = SimpleNamespace(
+        is_sequence_parallel=is_sp, dp_size=dp_size, pcp_size=pcp_size
+    )
+    runner.routed_experts = Mock()
+    runner.routed_experts.quant_method = SimpleNamespace(supports_internal_mk=not naive)
+    runner._fse_fuse_gate = False
+    runner._apply_quant_method = Mock(
+        side_effect=lambda **kw: (None, kw["hidden_states"])
+    )
+    runner._maybe_combine = Mock(side_effect=lambda shared, hidden: hidden)
+    runner._maybe_sync_shared_experts_stream = Mock()
+    runner._shared_experts = None
+    return runner
+
+
+def _mock_ep_group(monkeypatch, world_size):
+    from vllm.distributed import parallel_state
+
+    ep_group = Mock(world_size=world_size)
+    ep_group.all_gather.side_effect = lambda x, dim: torch.cat(
+        [x + 100 * r for r in range(world_size)], dim=dim
+    )
+    monkeypatch.setattr(parallel_state, "get_ep_group", lambda: ep_group)
+    return ep_group
+
+
+def test_gate_runs_on_gathered_hidden_states(monkeypatch):
+    """SP + runner-owned gate: gather hidden only, gate sees the full [T, H]."""
+    from vllm_torchtpu.layers.adapter.custom_ops.moe_runner import (
+        _HAS_SYNC_SHARED_EXPERTS_STREAM,
+    )
+
+    monkeypatch.setattr(envs, "VLLM_TPU_MOE_SP_GATE_AFTER_GATHER", True)
+    ep_group = _mock_ep_group(monkeypatch, world_size=4)
+    seen = {}
+
+    def gate(x):
+        seen["gate_input"] = x
+        return x.sum(dim=-1, keepdim=True), None
+
+    runner = _make_sp_runner(gate=gate)
+    chunk = torch.arange(2 * 3, dtype=torch.float32).reshape(2, 3)
+    stale_logits = torch.full((2, 1), -1.0)
+
+    out = runner._forward_impl(chunk, stale_logits, None)
+
+    ep_group.all_gather.assert_called_once()
+    assert ep_group.all_gather.call_args.args[0] is chunk
+    gathered = torch.cat([chunk + 100 * r for r in range(4)])
+    torch.testing.assert_close(seen["gate_input"], gathered)
+    kwargs = runner._apply_quant_method.call_args.kwargs
+    torch.testing.assert_close(kwargs["hidden_states"], gathered)
+    torch.testing.assert_close(kwargs["router_logits"], gathered.sum(-1, keepdim=True))
+    torch.testing.assert_close(out, gathered)
+    if _HAS_SYNC_SHARED_EXPERTS_STREAM:
+        runner._maybe_sync_shared_experts_stream.assert_called_once_with(None)
+    runner.routed_experts._ensure_moe_quant_config_init.assert_called_once()
+
+
+def test_fused_shared_expert_gate_uses_combined_weight(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_TPU_MOE_SP_GATE_AFTER_GATHER", True)
+    _mock_ep_group(monkeypatch, world_size=2)
+    runner = _make_sp_runner(gate=Mock())
+    runner._fse_fuse_gate = True
+    runner._maybe_fuse_gate_weights = Mock()
+    runner._combined_gate_weight = torch.eye(3)
+    chunk = torch.ones(2, 3)
+
+    runner._forward_impl(chunk, chunk, None)
+
+    runner._maybe_fuse_gate_weights.assert_called_once()
+    runner.gate.assert_not_called()
+    logits = runner._apply_quant_method.call_args.kwargs["router_logits"]
+    assert logits.shape == (4, 3)
+
+
+def _spy_upstream(monkeypatch):
+    upstream = Mock(name="upstream_forward_impl", return_value="upstream")
+    monkeypatch.setattr(MoERunner, "_forward_impl", upstream)
+    return upstream
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        dict(gate=None),
+        dict(is_sp=False),
+        dict(pcp_size=2),
+        dict(naive=False),
+    ],
+)
+def test_falls_back_to_upstream_forward_impl(monkeypatch, case):
+    monkeypatch.setattr(envs, "VLLM_TPU_MOE_SP_GATE_AFTER_GATHER", True)
+    ep_group = _mock_ep_group(monkeypatch, world_size=4)
+    upstream = _spy_upstream(monkeypatch)
+    kwargs = dict(gate=Mock(return_value=(torch.zeros(2, 1), None)))
+    kwargs.update(case)
+    runner = _make_sp_runner(**kwargs)
+    hidden, logits = torch.ones(2, 3), torch.zeros(2, 1)
+
+    out = runner._forward_impl(hidden, logits, None)
+
+    assert out == "upstream"
+    upstream.assert_called_once_with(hidden, logits, None, None)
+    ep_group.all_gather.assert_not_called()
+    runner._apply_quant_method.assert_not_called()
+
+
+def test_env_flag_disables_gate_after_gather(monkeypatch):
+    monkeypatch.setattr(envs, "VLLM_TPU_MOE_SP_GATE_AFTER_GATHER", False)
+    ep_group = _mock_ep_group(monkeypatch, world_size=4)
+    upstream = _spy_upstream(monkeypatch)
+    runner = _make_sp_runner(gate=Mock(return_value=(torch.zeros(2, 1), None)))
+
+    runner._forward_impl(torch.ones(2, 3), torch.zeros(2, 1), None)
+
+    upstream.assert_called_once()
+    ep_group.all_gather.assert_not_called()
+
+
+def test_gate_runs_on_tp_gathered_hidden_states_when_ep_disabled(monkeypatch):
+    """Under TP+SP (ep_size=1, tp_size>1), _forward_impl gathers over tp_group."""
+    from vllm.distributed import parallel_state
+
+    monkeypatch.setattr(envs, "VLLM_TPU_MOE_SP_GATE_AFTER_GATHER", True)
+    _mock_ep_group(monkeypatch, world_size=1)
+    tp_group = Mock(world_size=4)
+    tp_group.all_gather.side_effect = lambda x, dim: torch.cat(
+        [x + 10 * r for r in range(4)], dim=dim
+    )
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: tp_group)
+
+    runner = _make_sp_runner(gate=lambda x: (x.sum(dim=-1, keepdim=True), None))
+    chunk = torch.ones(2, 3)
+    out = runner._forward_impl(chunk, torch.zeros(2, 1), None)
+
+    tp_group.all_gather.assert_called_once()
+    assert out.shape == (8, 3)

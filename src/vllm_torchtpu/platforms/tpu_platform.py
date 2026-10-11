@@ -1292,6 +1292,8 @@ def _get_token_paddings(
 
 
 def _is_sequence_parallel_bucket(size: int, tp: int) -> bool:
+    if envs.VLLM_TPU_SP_MIN_TOKENS > 0 and size < envs.VLLM_TPU_SP_MIN_TOKENS:
+        return True
     # Each rank receives size // tp rows; require 8-token alignment or
     # validated power-of-two decode sizes (2, 4) with at least 2 rows per rank
     # to avoid single-token shape specialization in Dynamo.

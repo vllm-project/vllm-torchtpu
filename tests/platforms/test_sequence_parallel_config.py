@@ -179,3 +179,26 @@ def test_sequence_parallel_rejects_pipeline_parallel(configure_sp_moe):
         match="does not support pipeline parallelism",
     ):
         configure_sp_moe(vllm_config)
+
+
+def test_sequence_parallel_sp_min_tokens_preserves_small_buckets(
+    configure_sp_moe, monkeypatch
+):
+    import vllm_torchtpu.envs as envs
+
+    monkeypatch.setattr(envs, "VLLM_TPU_SP_MIN_TOKENS", 64)
+    parallel_config = SimpleNamespace(
+        use_sequence_parallel_moe=True,
+        tensor_parallel_size=8,
+        pipeline_parallel_size=1,
+    )
+    model_config = SimpleNamespace(architectures=["Qwen3_5MoeForCausalLM"])
+    compilation_config = SimpleNamespace(compile_sizes=[8, 16, 24, 64, 128])
+    vllm_config = SimpleNamespace(
+        parallel_config=parallel_config,
+        model_config=model_config,
+        compilation_config=compilation_config,
+        speculative_config=None,
+    )
+    configure_sp_moe(vllm_config)
+    assert compilation_config.compile_sizes == [8, 16, 24, 64, 128]

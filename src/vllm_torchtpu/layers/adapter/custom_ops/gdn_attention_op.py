@@ -57,7 +57,10 @@ from vllm_torchtpu.layers.adapter.gdn_linear import (
     GdnColumnParallelLinear,
     GdnInterleavedColumnParallelLinear,
 )
-from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    project_prequant,
+)
 from vllm_torchtpu.layers.core.gdn_attention import (
     run_jax_gdn_attention,
     run_jax_gdn_attention_pcp_tp_prefill,
@@ -1130,11 +1133,15 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def forward(
         self,
         hidden_states: torch.Tensor,
+        prequant: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
         kv_cache = self.kv_cache
         if self._has_active_pooled_pcp_state(kv_cache):
             assert kv_cache is not None
+            if prequant is not None:
+                x_q, x_s = prequant
+                hidden_states = (x_q.to(torch.float32) * x_s).to(torch.bfloat16)
             attn_metadata = cast(
                 "dict[str, _GdnAttentionMetadata]", get_forward_context().attn_metadata
             )[self.prefix]
@@ -1148,16 +1155,16 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # Part 1: Input Projection
         # ============================================================
         if hasattr(self, "in_proj_qkv"):
-            mixed_qkv, _ = self.in_proj_qkv(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
-            z, _ = self.in_proj_z(hidden_states)
+            mixed_qkv = project_prequant(self.in_proj_qkv, hidden_states, prequant)
+            ba = project_prequant(self.in_proj_ba, hidden_states, prequant)
+            z = project_prequant(self.in_proj_z, hidden_states, prequant)
             z = z.reshape(z.size(0), -1, self.head_v_dim)
             b, a = ba.chunk(2, dim=-1)
             b = b.contiguous()
             a = a.contiguous()
         else:
-            mixed_qkvz, _ = self.in_proj_qkvz(hidden_states)
-            ba, _ = self.in_proj_ba(hidden_states)
+            mixed_qkvz = project_prequant(self.in_proj_qkvz, hidden_states, prequant)
+            ba = project_prequant(self.in_proj_ba, hidden_states, prequant)
 
             # Every checkpoint loader produces [q, k, v, z] and [b, a].
             qkv_size = self.tp_head_geometry.local_conv_dim(
