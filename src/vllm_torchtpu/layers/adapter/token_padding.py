@@ -85,13 +85,22 @@ def zero_routing_weights_for_padding(
     else:
         from vllm.distributed.parallel_state import get_dp_group
 
+        from vllm_torchtpu.distributed.pcp import get_pcp_group
+
         dp_group = get_dp_group()
-        dp_size = dp_group.world_size
-        if dp_size > 1:
-            local_padding = _padding_state.get_local_padding_mask(num_tokens // dp_size)
+        pcp_group = get_pcp_group()
+        dp_size = int(dp_group.world_size) if dp_group is not None else 1
+        pcp_size = int(pcp_group.world_size) if pcp_group is not None else 1
+        if dp_size > 1 or pcp_size > 1:
+            local_padding = _padding_state.get_local_padding_mask(
+                num_tokens // (dp_size * pcp_size)
+            ).to(torch.int8)
             # TPU collectives may not support bool, so encode the mask as int8.
-            gathered_padding = dp_group.all_gather(local_padding.to(torch.int8), dim=0)
-            is_padding = gathered_padding.ne(0)
+            if dp_group is not None and dp_size > 1:
+                local_padding = dp_group.all_gather(local_padding, dim=0)
+            if pcp_group is not None and pcp_size > 1:
+                local_padding = pcp_group.all_gather(local_padding, dim=0)
+            is_padding = local_padding.ne(0)
         else:
             is_padding = _padding_state.get_local_padding_mask(num_tokens)
     topk_weights = torch.where(

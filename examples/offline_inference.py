@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import argparse
 import json
 
 from vllm import LLM, EngineArgs
@@ -34,7 +35,14 @@ def create_parser():
 
     # Chat params
     chat_group = parser.add_argument_group("Chat parameters")
-    chat_group.add_argument("--use-chat-template", action="store_true")
+    chat_group.add_argument(
+        "--use-chat-template",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Apply the model's chat template via LLM.chat instead of sending "
+        "raw prompts to LLM.generate. Defaults to True when the tokenizer "
+        "defines a chat template.",
+    )
     # A few models (like Qwen3.5) can use this to disable thinking using,
     # `--chat-template-kwargs='{"enable_thinking": false}'`
     chat_group.add_argument("--chat-template-kwargs", type=json.loads, default={})
@@ -53,11 +61,13 @@ def main(args: dict):
     use_chat_template = args.pop("use_chat_template")
     chat_template_kwargs = args.pop("chat_template_kwargs")
     # Safeguard in case the user doesn't provide use_chat_template
-    if chat_template_kwargs != {}:
+    if use_chat_template is None and chat_template_kwargs != {}:
         use_chat_template = True
 
     # Create an LLM
     llm = LLM(**args)
+    if use_chat_template is None:
+        use_chat_template = bool(getattr(llm.get_tokenizer(), "chat_template", None))
 
     # Create a sampling params object
     sampling_params = llm.get_default_sampling_params()

@@ -588,9 +588,17 @@ def _pipeline_parallel_size(vllm_config: VllmConfig) -> int:
 
 
 def _engine_is_pipeline(vllm_config: VllmConfig) -> bool:
-    """A pipeline-parallel engine: each stage transfers its own layers,
-    every token of them, so the transfer ranks are the pipeline stages."""
+    """A pipeline-parallel engine: each stage transfers its own layers, so
+    the transfer ranks are the pipeline stages (or their PCP ranks)."""
     return _pipeline_parallel_size(vllm_config) > 1
+
+
+def _pipeline_stage_pcp_size(vllm_config: VllmConfig) -> int:
+    """PCP ranks inside each pipeline stage: a PP x PCP stage splits its
+    layers' tokens and GDN heads over them; 1 without PCP or pipeline."""
+    if not _engine_is_pipeline(vllm_config):
+        return 1
+    return int(vllm_config.parallel_config.prefill_context_parallel_size or 1)
 
 
 def _reshard_store_mode() -> bool:
@@ -2419,11 +2427,11 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 )
         elif _engine_is_pipeline(self.vllm_config):
             pp_size = _pipeline_parallel_size(self.vllm_config)
-            if src_parallelism != pp_size:
+            if src_parallelism != pp_size * pcp_size:
                 raise ValueError(
                     "Stage-3 pipeline producer transfer parallelism must "
-                    f"equal PP size: parallelism={src_parallelism}, "
-                    f"pp_size={pp_size}"
+                    f"equal PP * PCP size: parallelism={src_parallelism}, "
+                    f"pp_size={pp_size}, pcp_size={pcp_size}"
                 )
         elif src_parallelism != pcp_size * int(parallel_config.tensor_parallel_size):
             raise ValueError(
@@ -2540,7 +2548,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         if _uses_tp_stage3_source(self.vllm_config):
             return int(parallel_config.tensor_parallel_size or 1)
         if _engine_is_pipeline(self.vllm_config):
-            return _pipeline_parallel_size(self.vllm_config)
+            return _pipeline_parallel_size(self.vllm_config) * (
+                _pipeline_stage_pcp_size(self.vllm_config)
+            )
         return int(parallel_config.prefill_context_parallel_size or 1) * int(
             parallel_config.tensor_parallel_size or 1
         )
@@ -3432,11 +3442,13 @@ class TPURaidenConnectorWorker:
             return
         if _engine_is_pipeline(self.vllm_config):
             pp_size = _pipeline_parallel_size(self.vllm_config)
-            if transfer_parallelism != pp_size:
+            stage_pcp = _pipeline_stage_pcp_size(self.vllm_config)
+            if transfer_parallelism != pp_size * stage_pcp:
                 raise ValueError(
                     "Pipeline producer transfer parallelism must equal the "
-                    "complete PP stage count: "
-                    f"parallelism={transfer_parallelism}, pp_size={pp_size}"
+                    "complete PP stage count times the stage PCP size: "
+                    f"parallelism={transfer_parallelism}, pp_size={pp_size}, "
+                    f"pcp_size={stage_pcp}"
                 )
             if not _use_per_layer_pool_tags():
                 raise ValueError(
@@ -3484,7 +3496,15 @@ class TPURaidenConnectorWorker:
         if _engine_is_pipeline(self.vllm_config):
             from vllm.distributed.parallel_state import get_pp_group
 
-            return int(get_pp_group().rank_in_group)
+            stage = int(get_pp_group().rank_in_group)
+            stage_pcp = _pipeline_stage_pcp_size(self.vllm_config)
+            if not self.is_producer or stage_pcp == 1:
+                return stage
+            # A PP x PCP producer is one unit per stage-local PCP rank, the
+            # index its kernels own tokens and GDN heads by: stage-major.
+            from vllm_torchtpu.distributed.pcp import get_pcp_rank
+
+            return stage * stage_pcp + int(get_pcp_rank())
         if not self.is_producer:
             return int(self.tp_rank)
         if _uses_tp_stage3_source(self.vllm_config):
@@ -3598,11 +3618,14 @@ class TPURaidenConnectorWorker:
             raise ValueError("Raiden transfer_parallelism must be positive")
         # A TP1 destination is logically contiguous even if an unrelated PCP
         # option remains present in its shared ParallelConfig, and so is a
-        # pipeline stage, which holds every token of its own layers.
+        # pipeline stage without PCP, which holds every token of its layers.
         if (
             not self.is_producer
             or transfer_parallelism == 1
-            or _engine_is_pipeline(self.vllm_config)
+            or (
+                _engine_is_pipeline(self.vllm_config)
+                and _pipeline_stage_pcp_size(self.vllm_config) == 1
+            )
         ):
             return page_tokens
         parallel_config = self.vllm_config.parallel_config
@@ -3799,6 +3822,34 @@ class TPURaidenConnectorWorker:
                 return f"pcp{pcp_size}tp{tp_size}_prefill"
             if not self.is_producer and pcp_size == 1 and tp_size > 1:
                 return f"tp{tp_size}dcp{dcp_size}_decode"
+        if self.is_producer and pp_size > 1 and pcp_size > 1:
+            # PP x PCP prefill: every stage-local PCP rank is a source unit
+            # (TPU_RAIDEN_TRANSFER_PARALLELISM = PP * PCP) lowering its own
+            # tokens and GDN heads of its stage's layers.
+            # TODO(yinlin): reachable once pp_validation admits context-parallel
+            # stages, i.e. once the pinned torch_tpu builds a stage group's meshes
+            # (google-pytorch/torch_tpu#4387, for a group made standalone).
+            dcp_size = int(parallel_config.decode_context_parallel_size)
+            if (
+                _raiden_seq_on_lane_layout()
+                and tp_size == 1
+                and dp_size == 1
+                and dcp_size == 1
+                and pp_size in (2, 4, 8)
+            ):
+                return f"pp{pp_size}pcp{pcp_size}_prefill"
+            raise ValueError(
+                "Raiden Qwen3.5 admission topology pp{2,4,8}pcp{N}_prefill "
+                "requires the seq-along-lane FA layout "
+                "(VLLM_KV_CACHE_LAYOUT=HND) and kv_producer with "
+                "tensor_parallel_size=1, data_parallel_size=1, "
+                "decode_context_parallel_size=1, pipeline_parallel_size in "
+                f"(2, 4, 8); got prefill_context_parallel_size={pcp_size}, "
+                f"tensor_parallel_size={tp_size}, "
+                f"data_parallel_size={dp_size}, "
+                f"decode_context_parallel_size={dcp_size}, "
+                f"pipeline_parallel_size={pp_size}"
+            )
         if self.is_producer:
             if tp_size == 1 and pcp_size == 1 and dp_size == 1 and pp_size in (2, 4, 8):
                 return f"pp{pp_size}_prefill"
@@ -3880,9 +3931,22 @@ class TPURaidenConnectorWorker:
         destination = derive_gdn_head_geometry(
             source.num_kq_heads, source.num_v_heads, _raiden_dst_shards()
         )
-        # The current lowerer concatenates source regions for fan-in, or
-        # splits a full-width source for fan-out. Neither operation removes
-        # or creates Q/K replicas, unlike logical head-based resharding.
+        # A sharded pipeline source with a whole number of destination shards
+        # per rank fans its heads out, copying Q/K rows to every destination
+        # replica (seq_on_lane.lower_gdn_state_fanout_spans_sol).
+        # TODO(yinlin): admit the fan-out for other producers once startup
+        # rejects the shapes the [Q|K|V] conv lowering cannot represent; they
+        # keep the refusal below until then.
+        if (
+            _engine_is_pipeline(self.vllm_config)
+            and source.parallel_size > 1
+            and destination.parallel_size > source.parallel_size
+            and destination.parallel_size % source.parallel_size == 0
+        ):
+            return
+        # Otherwise the lowerer concatenates source regions for fan-in, or
+        # splits a full-width source. Neither operation removes or creates
+        # Q/K replicas, unlike logical head-based resharding.
         if source.kq_replication_factor != destination.kq_replication_factor:
             raise ValueError(
                 "GDN state transfer cannot change Q/K replication: "
@@ -3894,9 +3958,9 @@ class TPURaidenConnectorWorker:
             and source.parallel_size % destination.parallel_size
         ):
             raise ValueError(
-                "GDN destination shards must divide producer parallelism "
-                "unless the producer holds the full state: "
-                f"source={source.parallel_size}, "
+                "GDN destination shards must divide producer parallelism (or, "
+                "for a pipeline producer, be a multiple of it), unless the "
+                f"producer holds the full state: source={source.parallel_size}, "
                 f"destination={destination.parallel_size}"
             )
 
@@ -4063,11 +4127,16 @@ class TPURaidenConnectorWorker:
             )
         self._maybe_delay_stage3_registration_for_test(metadata)
         # A pipeline stage holds every token of its own layers: its byte
-        # spans are lowered as a single contiguous owner, and the layer
-        # subset is expressed through per-layer pool tags instead.
+        # spans are lowered over the stage's PCP ranks alone (one contiguous
+        # owner without PCP), and the layer subset is expressed through
+        # per-layer pool tags instead.
         pipeline = _engine_is_pipeline(self.vllm_config)
-        lowering_parallelism = 1 if pipeline else parallelism // self.tp_size
-        lowering_rank = 0 if pipeline else transfer_rank // self.tp_size
+        if pipeline:
+            lowering_parallelism = _pipeline_stage_pcp_size(self.vllm_config)
+            lowering_rank = transfer_rank % lowering_parallelism
+        else:
+            lowering_parallelism = parallelism // self.tp_size
+            lowering_rank = transfer_rank // self.tp_size
 
         now = time.perf_counter()
         expired_terminal_req_ids = [
@@ -4935,7 +5004,9 @@ class TPURaidenConnectorWorker:
         from vllm_torchtpu.distributed.kv_transfer.raiden.seq_on_lane import (
             SOL_LAYOUT_TOKEN,
             lower_gdn_state_shard_spans_sol,
+            registration_source_bytes,
             sol_fa_geometry_from_manifest,
+            sol_gdn_conv_lane_bytes,
         )
 
         aliased_raw = self._raiden_manifest.binding == BINDING_ALIASED_RAW
@@ -4970,11 +5041,13 @@ class TPURaidenConnectorWorker:
                 )
 
         physical_granule = 1024
+        conv_lane_bytes = None
         if _raiden_seq_on_lane_layout() and not self._stage3_kimi:
             if aliased_raw and payload.get("fa_kv_layout") != SOL_LAYOUT_TOKEN:
                 raise RuntimeError("HND GDN spans require an HND layout fingerprint")
             geometry = sol_fa_geometry_from_manifest(self._raiden_manifest)
             physical_granule = geometry.packing * geometry.page_tokens
+            conv_lane_bytes = sol_gdn_conv_lane_bytes(geometry)
 
         registrations = []
         for exact_tag, ordinal in self._stage3_state_registration_tags():
@@ -5017,13 +5090,18 @@ class TPURaidenConnectorWorker:
                     producer_tp_size=self.tp_size,
                     producer_tp_rank=self.tp_rank,
                     physical_granule_bytes=physical_granule,
+                    num_key_heads=self._model_config_int("linear_num_key_heads", 0),
+                    num_value_heads=self._model_config_int("linear_num_value_heads", 0),
+                    conv_lane_bytes=conv_lane_bytes,
                 )
-            if registration.declared_bytes != admitted_live_bytes:
+            # Every admitted source byte is read; fan-out reads some of them
+            # for several destinations.
+            lowered_bytes = registration_source_bytes(registration)
+            if lowered_bytes != admitted_live_bytes:
                 raise RuntimeError(
                     "GDN state byte lowering disagrees with the admitted "
                     f"manifest for {exact_tag}: lowered="
-                    f"{registration.declared_bytes}, admitted="
-                    f"{admitted_live_bytes}"
+                    f"{lowered_bytes}, admitted={admitted_live_bytes}"
                 )
             registrations.append(registration)
         return registrations

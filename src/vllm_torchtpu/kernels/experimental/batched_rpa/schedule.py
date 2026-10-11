@@ -72,11 +72,11 @@ class DmaNew(ABC):
 
     @property
     @abstractmethod
-    def fetch_val(self): ...
+    def fetch_val(self) -> jax.Array: ...
 
     @property
     @abstractmethod
-    def wb_val(self): ...
+    def wb_val(self) -> jax.Array: ...
 
 
 @jax.tree_util.register_dataclass

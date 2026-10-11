@@ -608,11 +608,6 @@ def test_evaluate_runner_chunk_rejects_local_bucket_overflow():
     ("eligibility", "error_type", "message"),
     [
         (_eligibility(dcp_size=2), NotImplementedError, "DCP"),
-        (
-            _eligibility(pipeline_parallel_size=2),
-            NotImplementedError,
-            "pipeline parallelism",
-        ),
         (_eligibility(interleave_size=0), ValueError, "interleave_size > 0"),
     ],
 )

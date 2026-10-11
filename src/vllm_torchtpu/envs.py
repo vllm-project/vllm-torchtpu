@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
     TPU_DCP_LSE_MERGE_A2A: bool = False
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
+    TPU_MLA_SPARSE_SPLIT_Q: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -86,11 +87,14 @@ if TYPE_CHECKING:
     TPU_TOKEN_BUCKET_LINEAR: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
+    TPU_PP_LAZY_PUSH: bool = False
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
+    TPU_DCP_INDEXER_A2A_MERGE: bool = False
+    TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
@@ -153,6 +157,7 @@ if TYPE_CHECKING:
     VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
     VLLM_TPU_DEBUG_PCP_LAYOUT: bool = False
     TPU_LOCAL_RANK_OFFSET: int = 0
+    VLLM_TPU_DEVICE_ORDER: str = ""
     DEBUG_TPU_LOCAL_RANK_OFFSET: int = 0
     TORCH_TPU_BASE_PORT: int = 8070
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
@@ -388,6 +393,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # faster. Only the backbone uses the all-to-all; the MTP drafter, traced
     # once for every bucket, always takes the reduce-scatter.
     "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS": env_int("TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", 64),
+    # Sparse MLA split q (`sparse_ragged_paged_attention(q_pe=...)`): hand
+    # q_nope and q_pe to the kernel as separate operands. The kernel joins
+    # them in VMEM and its output aliases q_nope (512 wide), instead of the
+    # caller materialising a concat the wrapper pads to [T, H, 640]. Where the
+    # caller also needs the log-sum-exp (DCP), it is exported lane-dense as
+    # f32[T, H] (`lse_lane_dense=True`) instead of f32[T, H, 1], whose
+    # lane-padded tiles cost a broadcast init, a relayout copy and padded
+    # copies through the LSE merge. Bit-identical outputs.
+    "TPU_MLA_SPARSE_SPLIT_Q": env_bool("TPU_MLA_SPARSE_SPLIT_Q", default=False),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per
@@ -719,6 +733,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Fraction above the time of a full prefix-free step that a step may
     # take before its chunks are shortened.
     "TPU_PP_CHUNK_SLACK": lambda: float(os.getenv("TPU_PP_CHUNK_SLACK", "0.1")),
+    # Pipeline parallelism over more than two stages: the engine core pushes
+    # the pipeline only when stage 0 would otherwise idle and drops empty
+    # steps, so requests share the pipeline (core/pp_lazy_step.py).
+    "TPU_PP_LAZY_PUSH": env_bool("TPU_PP_LAZY_PUSH", default=False),
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE": env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
     # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
@@ -727,6 +745,15 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Unset means unchunked: one single pass, no pipelining.
     "TPU_STREAMIDX_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_STREAMIDX_CHUNK_TOKENS"
+    ),
+    # Merge the DCP indexer candidates with an all-to-all over the token axis
+    # instead of an all-gather over the candidate axis. Same result.
+    "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=False),
+    # Smallest padded token bucket that takes the all-to-all merge when
+    # TPU_DCP_INDEXER_A2A_MERGE is on. The bucket is static, so each compiled
+    # variant picks one merge with no runtime cost.
+    "TPU_DCP_INDEXER_A2A_MIN_TOKENS": env_nonnegative_int(
+        "TPU_DCP_INDEXER_A2A_MIN_TOKENS", 64
     ),
     # Indexer K-cache writer and layout mode for GLM-5.2 / DSv4 StreamIndex:
     #   "sal" (default): Pallas coalesced_kv_append(_dcp) in SEQ_ALONG_LANE layout
@@ -942,6 +969,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Added to every worker's local rank when it binds to a physical chip.
     # worker/tpu_rank_binding.py reads it from the env mapping it is given.
     "TPU_LOCAL_RANK_OFFSET": env_int("TPU_LOCAL_RANK_OFFSET", 0),
+    # Physical device index per local rank ("0,2,1,3,4,6,5,7"); empty = native.
+    "VLLM_TPU_DEVICE_ORDER": lambda: os.getenv("VLLM_TPU_DEVICE_ORDER", ""),
     # Same offset for the legacy worker init path; debug only.
     "DEBUG_TPU_LOCAL_RANK_OFFSET": env_int("DEBUG_TPU_LOCAL_RANK_OFFSET", 0),
     # First slicebuilder port; each chip on a host takes base + local rank.

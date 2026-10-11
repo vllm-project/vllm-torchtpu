@@ -281,6 +281,62 @@ def test_mesh_rejects_a_pcp_group_smaller_than_the_world(monkeypatch):
     assert pcp._MESH_CACHE == {}
 
 
+def _stage_mesh_environment(monkeypatch, holder, mesh_device_ids):
+    """A slice of four pipeline stages of two devices, seen from stage 1."""
+    _pcp_mesh_environment(monkeypatch, holder, world_size=2)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda *a, **k: 8)
+    monkeypatch.setattr(
+        parallel_state,
+        "get_pp_group",
+        lambda: SimpleNamespace(world_size=4, rank_in_group=1),
+    )
+    group = SimpleNamespace(
+        world_size=2, rank_in_group=0, ranks=[2, 3], device_group=object()
+    )
+    monkeypatch.setattr(parallel_state, "get_pcp_group", lambda: group)
+    from torch_tpu._internal import pallas as pallas_module
+
+    mesh = SimpleNamespace(
+        devices=SimpleNamespace(
+            flat=[SimpleNamespace(id=device_id) for device_id in mesh_device_ids]
+        )
+    )
+    get_pallas_mesh = Mock(return_value=mesh)
+    monkeypatch.setattr(pallas_module, "get_pallas_mesh", get_pallas_mesh)
+    return group, mesh, get_pallas_mesh
+
+
+@pytest.mark.tpu_test
+def test_mesh_covers_the_stage_under_pipeline_parallelism(monkeypatch):
+    holder = [pcp.PcpGroupLayout((2, 3), (4, 5), 0, 2)]
+    group, mesh, get_pallas_mesh = _stage_mesh_environment(monkeypatch, holder, (4, 5))
+
+    assert pcp.get_or_create_pcp_mesh() is mesh
+    get_pallas_mesh.assert_called_once_with(
+        axis_names=("pcp",), mesh_shape=(2,), process_group=group.device_group
+    )
+
+
+@pytest.mark.tpu_test
+def test_stage_mesh_rejects_devices_other_than_the_stage(monkeypatch):
+    holder = [pcp.PcpGroupLayout((2, 3), (4, 5), 0, 2)]
+    _stage_mesh_environment(monkeypatch, holder, (0, 1))
+
+    with pytest.raises(RuntimeError, match="stage's devices"):
+        pcp.get_or_create_pcp_mesh()
+    assert pcp._MESH_CACHE == {}
+
+
+@pytest.mark.tpu_test
+def test_stage_mesh_rejects_ranks_outside_the_stage(monkeypatch):
+    holder = [pcp.PcpGroupLayout((0, 1), (0, 1), 0, 2)]
+    _, _, get_pallas_mesh = _stage_mesh_environment(monkeypatch, holder, (0, 1))
+
+    with pytest.raises(RuntimeError, match=r"ranks 0\.\.N-1"):
+        pcp.get_or_create_pcp_mesh()
+    get_pallas_mesh.assert_not_called()
+
+
 @pytest.mark.tpu_test
 def test_mesh_rejects_a_permuted_pcp_group(monkeypatch):
     monkeypatch.setattr(pcp, "_MESH_CACHE", {})

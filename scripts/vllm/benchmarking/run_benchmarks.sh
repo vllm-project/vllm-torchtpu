@@ -217,9 +217,12 @@ fi
 
 PORT="${PORT:-8000}"
 
-# Verify vllm bench serve is available
-if ! python3 -m vllm.entrypoints.cli.main bench serve --help &>/dev/null; then
-    echo "ERROR: 'vllm bench serve' not available. Is vLLM installed?"
+# Verify vLLM is installed. find_spec locates the package without importing it:
+# the `vllm bench serve --help` this replaces imported all of vLLM, 6-50s per
+# config with the chips idle, and a missing subcommand still fails the first
+# benchmark call with its own error.
+if ! python3 -c 'import importlib.util, sys; sys.exit(importlib.util.find_spec("vllm") is None)'; then
+    echo "ERROR: vLLM is not installed."
     exit 1
 fi
 echo "Using benchmark tool: vllm bench serve"

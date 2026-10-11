@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+from typing import cast
 
 import jax
 import jax.experimental.pallas as pl
@@ -75,15 +76,15 @@ def strided_load_bkv(
 def calculate_and_store_out(
     step_idx: jax.Array,
     schedule_ref: schedule.RpaSchedule,
-    acc_list: list[jax.Array],
-    l_list: list[jax.Array],
-    m_list: list[jax.Array],
+    acc_list: jax.Array,
+    l_list: jax.Array,
+    m_list: jax.Array,
     o_vref: jax.Ref,
     lse_o_vref: jax.Ref | None,
     *,
     cfgs: configs.RpaConfigs,
 ):
-    def _accum(b_idx: jax.Array, batch_acc: jax.Array, batch_l: jax.Array):
+    def _accum(b_idx: int | jax.Array, batch_acc: jax.Array, batch_l: jax.Array):
         batch_l = utils.broadcast_minor(batch_l, batch_acc.shape)
 
         if (
@@ -104,6 +105,7 @@ def calculate_and_store_out(
         utils.strided_store(out_ref, 0, out_ref.shape[0], 1, out)
 
     def _stage_lse(b_idx: int, batch_m: jax.Array, batch_l: jax.Array):
+        assert lse_o_vref is not None
         lse_val = batch_m + jnp.log(jnp.maximum(batch_l, 1e-9))
         # Store through packed words, as for O. Keeping tokens separate in
         # the buffer lets DMA copy complete token records even for small GQA
@@ -174,6 +176,7 @@ def get_scale_factors(
     # second to last dimension, which is the head dimension, which is the same
     # as the scale_channels dimension, so this works out of the box.
     if scale_channels > 1:
+        assert cfgs.serve.per_token_scale_dtype is not None
         k_scale = pltpu.bitcast(k_scale_slice, cfgs.serve.per_token_scale_dtype)
         v_scale = pltpu.bitcast(v_scale_slice, cfgs.serve.per_token_scale_dtype)
 
@@ -514,7 +517,7 @@ def rpa_body(
             o_next = flash_attention.flash_attention_pv(
                 prev_p,
                 v,
-                prev_alpha_list,
+                cast(list[jax.Array], prev_alpha_list),
                 acc_val[:, prev_q_slice],
                 cfgs=cfgs,
                 v_scale=v_scale,
@@ -530,7 +533,7 @@ def rpa_body(
     o_next = flash_attention.flash_attention_pv(
         prev_p,
         v,
-        prev_alpha_list,
+        cast(list[jax.Array], prev_alpha_list),
         acc_val[:, prev_q_slice],
         cfgs=cfgs,
         v_scale=v_scale,
@@ -820,7 +823,12 @@ def rpa_kernel(
                     ),
                     grid=(num_steps + prefix_steps,),
                     in_specs=(q_alloc.spec, kv_cache_alloc.spec),
-                    out_specs=(o_alloc.spec, lse_alloc.spec if return_lse else None),
+                    out_specs=(
+                        o_alloc.spec,
+                        cast(bref_override.BatchingLSERef, lse_alloc).spec
+                        if return_lse
+                        else None,
+                    ),
                 )
                 pipeline_func(
                     (q_hbm_ref, schedule_ref),

@@ -595,6 +595,12 @@ class TPUWorker(WorkerBase):
     def pp_settle(self):
         return self.model_runner.pp_settle()
 
+    def pp_drains_before_handoff(self) -> bool:
+        """Whether this worker's stage drains the slice before each hand-off
+        launch."""
+        wave = self.model_runner._pp_wave
+        return bool(getattr(wave, "drain_before_handoff", False))
+
     def profile_pipeline_chunks(self) -> dict:
         return self.model_runner.profile_pipeline_chunks()
 

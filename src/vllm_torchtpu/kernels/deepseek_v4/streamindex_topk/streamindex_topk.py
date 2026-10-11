@@ -35,6 +35,7 @@ from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     bref_override,
     config,
+    dcp_sc_compact,
     metadata,
 )
 
@@ -1651,6 +1652,7 @@ def streamindex_topk(
         "kv_layout",
         "chunk_tokens",
         "dcp_axis_name",
+        "a2a_merge",
     ),
 )
 def streamindex_topk_dcp(
@@ -1675,6 +1677,7 @@ def streamindex_topk_dcp(
     kv_layout: KVLayout | str = KVLayout.HEAD_ALONG_SUBLANE,
     chunk_tokens: int | None = None,
     dcp_axis_name: str = DCP_AXIS_NAME,
+    a2a_merge: bool = False,
 ) -> jax.Array:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1703,6 +1706,17 @@ def streamindex_topk_dcp(
     collective phase, avoiding the barrier latency of a multi-phase pipeline and
     preserving the token axis `T` unpartitioned.
 
+    `a2a_merge` makes the opposite trade for steps 2-3: an `all_to_all` hands
+    rank `j` every rank's candidate scores for token block `j`, it runs
+    `sparsecore_topk` over only that `T / dcp_size` block, and an
+    `all_gather(axis=0)` of the int32 slots restores the token axis. Each rank
+    then receives `T * k` scores plus `T * k` slots instead of
+    `T * dcp_size * k` scores, and merges `T / dcp_size` rows instead of `T`, at
+    the cost of a second, dependent collective and of the fused merge: the
+    owner filter and compaction run afterwards in
+    `dcp_sc_compact.pack_owned_winners`, since a slot still names its source
+    rank and that rank's own list, so the indices never travel on either path.
+
     Args:
       q: replicated query tokens, in natural request-major order
         `[padded_num_tokens, num_q_heads, head_dim]`.
@@ -1730,6 +1744,8 @@ def streamindex_topk_dcp(
         query-token axis, which is orthogonal to the KV axis DCP shards, so the
         two compose.
       dcp_axis_name: name of the DCP mesh axis.
+      a2a_merge: merge over the token axis with an `all_to_all` instead of over
+        the candidate axis with an `all_gather`; see above. Same result.
 
     Returns:
       i32[padded_num_tokens, k] of this rank's own *local* cache indices for
@@ -1794,6 +1810,29 @@ def streamindex_topk_dcp(
             interleave_size=interleave_size,
             return_scores=True,
         )
+
+        if a2a_merge:
+            # Stage 1. Rank `j` collects every rank's scores for token block
+            # `j`: [T, k] -> [T / dcp, dcp * k], rank-major like the gather.
+            scores = lax.all_to_all(
+                scores, dcp_axis_name, split_axis=0, concat_axis=1, tiled=True
+            )
+            # Stage 2. This block's exact global top-k. Full width as the row
+            # length: -inf entries (unfilled local slots, padding tokens) are
+            # never selected, so they need no masking.
+            slots = sparsecore_topk(
+                scores,
+                k,
+                row_lengths=jnp.full(
+                    (scores.shape[0],), scores.shape[1], dtype=jnp.int32
+                ),
+                write_empty_rows=True,
+            )
+            # Stage 3. Every rank's merged block back, in token order: [T, k]
+            # slots. A slot names its source rank and that rank's own list, so
+            # the owner filter resolves it against this rank's `idxs` as is.
+            slots = lax.all_gather(slots, dcp_axis_name, axis=0, tiled=True)
+            return dcp_sc_compact.pack_owned_winners(slots, idxs, dcp_rank)
 
         # Stage 1. All-gather the scores; the indices stay home.
         scores = lax.all_gather(

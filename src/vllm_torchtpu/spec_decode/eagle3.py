@@ -5,7 +5,7 @@ import contextlib
 import copy
 import dataclasses
 import functools
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import torch
@@ -1222,7 +1222,9 @@ class Eagle3Proposer:
                     )
                 elif nr is not None and np.any(nr):
                     padded_nr = np.zeros(knr, dtype=np.int32)
-                    padded_nr[: c.num_reqs] = nr.astype(np.int32, copy=False)
+                    padded_nr[: c.num_reqs] = cast(np.ndarray, nr).astype(
+                        np.int32, copy=False
+                    )
                     rejected_dev_per_chunk.append(
                         torch.from_numpy(padded_nr).to(runner.device)
                     )

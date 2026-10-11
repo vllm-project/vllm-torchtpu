@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """GDN projections with whole-head TP sharding and Q/K replication."""
 
+from typing import TYPE_CHECKING, cast
+
 import torch
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -15,6 +17,11 @@ from vllm.model_executor.parameter import (
 )
 
 from vllm_torchtpu.kernels.gdn.head_geometry import GdnHeadGeometry
+
+if TYPE_CHECKING:
+    from collections.abc import Sequence
+
+    from vllm.model_executor.parameter import _ColumnvLLMParameter
 
 
 class GdnColumnParallelLinear(MergedColumnParallelLinear):
@@ -81,7 +88,7 @@ class GdnColumnParallelLinear(MergedColumnParallelLinear):
             # channel slices. vLLM already handles scalar-to-fused loading.
             return super().weight_loader_v2(param, loaded_weight, loaded_shard_id)
 
-        output_dim = param.output_dim
+        output_dim = cast("_ColumnvLLMParameter", param).output_dim
         if not isinstance(loaded_shard_id, int):
             shard_ids = (
                 tuple(range(len(self.checkpoint_sizes)))
@@ -171,7 +178,7 @@ class GdnInterleavedColumnParallelLinear(MergedColumnParallelLinear):
         sizes = self.group_sizes
         local_sizes = self.local_group_sizes
         if isinstance(param, BlockQuantScaleParameter):
-            block = self.weight_block_size[0]
+            block = cast("Sequence[int]", self.weight_block_size)[0]
             if any(size % block for size in sizes + local_sizes):
                 raise ValueError(
                     "GDN interleaved scale blocks must align "
@@ -181,7 +188,9 @@ class GdnInterleavedColumnParallelLinear(MergedColumnParallelLinear):
             local_sizes = [size // block for size in local_sizes]
         if isinstance(param, ChannelQuantScaleParameter):
             loaded_weight = loaded_weight.reshape(-1, *param.shape[1:])
-        source = loaded_weight.movedim(param.output_dim, 0)
+        source = loaded_weight.movedim(
+            cast("_ColumnvLLMParameter", param).output_dim, 0
+        )
         groups = source.reshape(geometry.num_kq_heads, sum(sizes), *source.shape[1:])
         first = geometry.kq_shard_index(self.tp_rank) * geometry.local_num_kq_heads
         groups = groups.narrow(0, first, geometry.local_num_kq_heads)
@@ -195,7 +204,7 @@ class GdnInterleavedColumnParallelLinear(MergedColumnParallelLinear):
         # Flatten each segment's head groups before concatenating segments.
         # Scales take exactly the same permutation as their weight rows.
         local = torch.cat([piece.flatten(0, 1) for piece in pieces], dim=0).movedim(
-            0, param.output_dim
+            0, cast("_ColumnvLLMParameter", param).output_dim
         )
         assert local.shape == param.shape
         param.data.copy_(local)
