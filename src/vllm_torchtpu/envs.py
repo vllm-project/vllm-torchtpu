@@ -166,6 +166,8 @@ if TYPE_CHECKING:
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
+    TPU_FP8_LINEAR_PALLAS: bool = False
+    TPU_FP8_LINEAR_PALLAS_SITES: str = "fused_qkv_a_proj,q_b_proj,self_attn.o_proj"
 
 
 def env_with_choices(
@@ -1013,6 +1015,22 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # deterministic cap from the scheduler config, 0 disables the cap (all
     # post-profile HBM goes to KV), N > 0 caps KV at N tokens.
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS": env_int("VLLM_TPU_POOLING_KV_CACHE_TOKENS", -1),
+    # Per-channel FP8 dense linears whose decode weight XLA reads from HBM: route
+    # M <= 16 through the weight-streaming Pallas kernel
+    # (kernels/quantized_matmul/fp8_skinny.py), XLA otherwise. Outputs differ from
+    # the XLA path in the f32 accumulation (exact here; XLA's fp8 x fp8 dot is not).
+    # A selected layer whose width is not a multiple of 128 (q_a + kv_a, 2624) also
+    # keeps a zero-padded copy of its weight for the kernel: +16.5 MB per layer on
+    # GLM-5.2-FP8, i.e. about 1.3 GB per rank over 79 layers.
+    "TPU_FP8_LINEAR_PALLAS": env_bool("TPU_FP8_LINEAR_PALLAS"),
+    # Comma-separated layer-prefix suffixes that take that path, matched on a "."
+    # boundary. The defaults are the GLM-5.2-FP8 MLA attention projections XLA does
+    # not prefetch at decode; a VMEM-prefetched weight (indexer wq_b) is faster under
+    # XLA than any HBM stream. mlp.gate_up_proj is tuned too but opt-in.
+    "TPU_FP8_LINEAR_PALLAS_SITES": env_str(
+        "TPU_FP8_LINEAR_PALLAS_SITES",
+        "fused_qkv_a_proj,q_b_proj,self_attn.o_proj",
+    ),
 }
 
 
