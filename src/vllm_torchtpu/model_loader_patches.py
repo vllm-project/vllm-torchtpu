@@ -161,10 +161,67 @@ def _compute_local_expert_ids() -> set[int] | None:
     return local_ids
 
 
+class _OnlineFp8LayerFinisher:
+    """Quantizes each decoder layer after all its checkpoint tensors are consumed."""
+
+    def __init__(self, model: torch.nn.Module, names: list[str]) -> None:
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+            VllmFp8LinearMethodTPU,
+        )
+
+        # Checkpoint names keyed as the loader reads them, valued as the
+        # module paths they land in.
+        mapper = getattr(model, "hf_to_vllm_mapper", None)
+        targets: dict[str, str] = {}
+        for name in names:
+            mapped = [name] if mapper is None else mapper.apply_list([name])
+            if mapped:
+                targets[name] = mapped[0]
+        self._layers: dict[
+            str, list[tuple[torch.nn.Module, VllmFp8LinearMethodTPU]]
+        ] = {}
+        self._pending: dict[str, set[str]] = {}
+        self._owners: dict[str, str] = {}
+        for prefix, module in model.named_modules():
+            if not prefix.rsplit(".", 1)[-1].isdigit():
+                continue
+            selected = []
+            for child in module.modules():
+                method = getattr(child, "quant_method", None)
+                if isinstance(method, VllmFp8LinearMethodTPU) and method.online_fp8:
+                    selected.append((child, method))
+            if not selected:
+                continue
+            expected = {
+                name
+                for name, target in targets.items()
+                if target.startswith(prefix + ".")
+            }
+            if not expected:
+                continue
+            self._layers[prefix] = selected
+            self._pending[prefix] = expected
+            self._owners.update((name, prefix) for name in expected)
+
+    def consumed(self, name: str) -> None:
+        prefix = self._owners.pop(name, None)
+        if prefix is None:
+            return
+        pending = self._pending[prefix]
+        pending.remove(name)
+        if pending:
+            return
+        for layer, method in self._layers.pop(prefix):
+            method.process_weights_after_loading(layer)
+        del self._pending[prefix]
+        logger.info("[sharded-ep-load] completed online FP8 for %s", prefix)
+
+
 def _sharded_runai_weights_iterator(
     hf_weights_files: list[str],
     local_expert_ids: set[int],
     use_tqdm_on_load: bool,
+    model: torch.nn.Module | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Stream only this rank's tensors from the safetensors files.
 
@@ -172,6 +229,8 @@ def _sharded_runai_weights_iterator(
     ``gs://`` and local paths both work), drops non-local expert tensors
     from the request plan, and streams the surviving byte ranges as
     contiguous runs. The skipped bytes are never requested from storage.
+    With ``model``, each decoder layer's online-FP8 linears are quantized
+    as soon as the layer's tensors have been delivered.
     """
     import runai_model_streamer.safetensors_streamer.safetensors_pytorch as sp
     from runai_model_streamer.file_streamer import FileChunks
@@ -244,6 +303,12 @@ def _sharded_runai_weights_iterator(
             skipped_bytes / 1e9,
         )
 
+        finisher = None
+        if model is not None:
+            names = [t.name for group in tensors_by_request for t in group]
+            names.extend(t.name for t in zero_size_tensors)
+            finisher = _OnlineFp8LayerFinisher(model, names)
+
         fs.stream_files(requests, credentials=None, device="cpu", is_distributed=False)
 
         # Under torch-tpu's deferred eager mode, weight_loader's device
@@ -279,6 +344,8 @@ def _sharded_runai_weights_iterator(
                     tensor_meta.name,
                     sp.create_torch_tensor(memoryview(b""), tensor_meta),
                 )
+                if finisher is not None:
+                    finisher.consumed(tensor_meta.name)
                 progress.update(1)
             for yielded, (request_id, chunk_index, buffer) in enumerate(
                 fs.get_chunks(), start=1
@@ -288,6 +355,8 @@ def _sharded_runai_weights_iterator(
                     tensor_meta.name,
                     sp.create_torch_tensor(buffer, tensor_meta).clone(),
                 )
+                if finisher is not None:
+                    finisher.consumed(tensor_meta.name)
                 progress.update(1)
                 if sync_every and yielded % sync_every == 0:
                     _device_sync()
@@ -310,6 +379,14 @@ def patch_runai_sharded_expert_streaming() -> None:
     if getattr(rsl.RunaiModelStreamerLoader, "_tpu_sharded_ep_patch", False):
         return
     original_get_iterator = rsl.RunaiModelStreamerLoader._get_weights_iterator
+    original_load_weights = rsl.RunaiModelStreamerLoader.load_weights
+
+    def load_weights(self, model, model_config):
+        self._loading_model = model
+        try:
+            return original_load_weights(self, model, model_config)
+        finally:
+            self._loading_model = None
 
     def _get_weights_iterator(self, model_or_path: str, revision: str | None):
         try:
@@ -341,9 +418,14 @@ def patch_runai_sharded_expert_streaming() -> None:
             )
         hf_weights_files = self._prepare_weights(model_or_path, revision)
         return _sharded_runai_weights_iterator(
-            hf_weights_files, local_expert_ids, self.load_config.use_tqdm_on_load
+            hf_weights_files,
+            local_expert_ids,
+            self.load_config.use_tqdm_on_load,
+            self._loading_model,
         )
 
+    rsl.RunaiModelStreamerLoader._loading_model = None
+    rsl.RunaiModelStreamerLoader.load_weights = load_weights
     rsl.RunaiModelStreamerLoader._get_weights_iterator = _get_weights_iterator
     rsl.RunaiModelStreamerLoader._tpu_sharded_ep_patch = True
     logger.info(
