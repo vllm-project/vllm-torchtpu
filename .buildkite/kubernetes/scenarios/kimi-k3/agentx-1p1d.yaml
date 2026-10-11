@@ -1,0 +1,75 @@
+# yaml-language-server: $schema=../../../../tools/scenario/schema/scenario.schema.json
+# InferenceX AgentX trace replay against the Kimi-K3 1P1D pair, one fresh pair per
+# concurrency, and InferenceX's GSM8K eval of the same pair on a pair of its own.
+# The pair is kimi-k3/tp8-dp4-ep-1p1d's; this file overrides only the workload:
+# the checkpoint's own context window, the memory that window needs, decode
+# buckets that bracket the ladder and the tool-call parser. The proxy and the
+# clients run on a chipless host, because the replay is the measurement and on
+# an engine host it would load the machine it times.
+schema: 1
+name: kimi-k3-agentx-1p1d
+extends: kimi-k3/tp8-dp4-ep-1p1d
+server:
+  args:
+    # No context flag: the server serves the checkpoint's own 1M window. aiperf
+    # drops whole traces above the context, so a smaller one would replay a
+    # subset of the corpus.
+    max-model-len: null
+    # The 1M window does not boot at 0.80: one request needs 15.13 GiB of KV per
+    # rank against 7.54 GiB.
+    gpu-memory-utilization: 0.90
+    # Twice the ladder's top concurrency, so the scheduler is never the limit.
+    max-num-seqs: 8
+    # Decode buckets bracket the ladder; the prefill chunk stays the pair's block.
+    compilation-config:
+      compile_sizes: [1, 2, 4, 8, 1296]
+    # Every AgentX turn carries tool calls and tool results.
+    enable-auto-tool-choice: true
+    tool-call-parser: kimi_k3
+tasks:
+  driver: client
+  custom: []
+  eval: null
+  # The identity the AgentX rows and the GSM8K eval share, so InferenceX joins
+  # them.
+  inferencex:
+    model_prefix: kimik3
+    # The experts are MXFP4 with FP8 attention, the label the published B300
+    # vLLM row uses.
+    precision: fp4
+  agentx:
+    # Bring-up: InferenceX's fast mode, which it never publishes. The nightly
+    # cannot afford a canonical 1h window per point on the v7x pair.
+    fast: true
+    duration: 20m
+    # Warmup grace, the 20 minute window and drain, as the client's per-point cap.
+    timeout: 1h45m
+    env:
+      # The checkpoint's window (1048576 tokens), which the server reports in
+      # /v1/models. Written here because the context is a scenario choice and
+      # never derived from max-model-len.
+      AIPERF_MAX_CONTEXT_LENGTH: "1048576"
+      # One ~70k-token turn can take over 30 minutes on a prefill-bound engine.
+      AGENTIC_WARMUP_GRACE_PERIOD: "3600"
+# Named points, since the eval point is not a value of the AgentX ladder.
+sweep:
+  points:
+    - name: c1
+      tasks:
+        agentx:
+          concurrency: 1
+    - name: c4
+      tasks:
+        agentx:
+          concurrency: 4
+    # InferenceX's default eval of an AgentX deployment: GSM8K, alone on a
+    # fresh deployment at its highest concurrency.
+    - name: gsm8k
+      tasks:
+        agentx: null
+        eval:
+          client: inferencex
+          framework: lm-eval
+          concurrency: 4
+          # Full GSM8K (1319 questions) with K3's reasoning; not timed yet.
+          timeout: 8h

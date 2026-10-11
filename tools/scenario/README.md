@@ -176,7 +176,7 @@ A **target** takes a Plan and runs it somewhere:
 |---|---|
 | `local` | this machine, e.g. a TPU VM |
 | `kubectl` | a generic GKE JobSet (M2) |
-| the CI fleet target | the CI fleet through its launcher; it lives under `.buildkite/scenario/` (M2) |
+| the CI fleet target | the CI fleet through its launcher; it lives under `.buildkite/kubernetes/scenario/` (M2) |
 
 A target can add only a few named things: a container name, annotations,
 infrastructure env such as cache paths, and after-task uploads. It cannot
@@ -186,31 +186,39 @@ change what runs. Tests enforce this:
 - imports between modules follow fixed rules;
 - tool-owned and target-owned env names are reserved;
 - fleet-specific strings may not appear under `tools/scenario/` or
-  `scenarios/`.
+  `.buildkite/kubernetes/scenarios/`.
 
 ## Layout
 
 | Path | Contents |
 |---|---|
 | `tools/scenario/` | the CLI, its own Python project (`pyproject.toml`, `uv.lock`) |
-| `scenarios/` | the files people edit, and `scenarios/defaults.yaml` |
-| `.buildkite/scenario/` | CI-only pieces: the golden check, and later the fleet target |
+| `.buildkite/kubernetes/scenarios/` | the CI scenarios, which people edit, and `defaults.yaml` |
+| `.buildkite/kubernetes/scenario/tests/` | checks over the CI scenarios |
+| `.buildkite/kubernetes/scenario/golden/` | the golden check, which is temporary |
+
+The tool's root is the directory that holds `scenarios/defaults.yaml`; for
+the CI scenarios it is `.buildkite/kubernetes`. A reference id such as
+`kimi-k3/tp32-ep` is the path under `scenarios/` without `.yaml`. The CI
+fleet target will live in `.buildkite/kubernetes/scenario/` as well.
 
 ## Usage
 
 From the repository root:
 
 ```
-uv run --project tools/scenario scenario validate
-uv run --project tools/scenario scenario show scenarios/glm-5.2/fp8-dp16-ep.yaml
-uv run --project tools/scenario scenario show --plan scenarios/glm-5.2/fp8-dp16-ep.yaml
-uv run --project tools/scenario scenario show --why server.args.max-model-len scenarios/glm-5.2/fp8-dp16-ep.yaml
-uv run --project tools/scenario scenario run --dry-run --role server --host-index 1 scenarios/glm-5.2/fp8-dp16-ep-mp.yaml
+uv run --project tools/scenario scenario validate --root .buildkite/kubernetes
+uv run --project tools/scenario scenario show .buildkite/kubernetes/scenarios/glm-5.2/fp8-dp16-ep.yaml
+uv run --project tools/scenario scenario show --plan .buildkite/kubernetes/scenarios/glm-5.2/fp8-dp16-ep.yaml
+uv run --project tools/scenario scenario show --why server.args.max-model-len .buildkite/kubernetes/scenarios/glm-5.2/fp8-dp16-ep.yaml
+uv run --project tools/scenario scenario run --dry-run --role server --host-index 1 .buildkite/kubernetes/scenarios/glm-5.2/fp8-dp16-ep-mp.yaml
 ```
 
 What each command does:
 
-- **`validate`:** with no files, checks every scenario under `scenarios/`.
+- **`validate`:** with no files, checks every scenario under the root's
+  `scenarios/`. `--root` names the root; without it, the root is found from
+  the current directory.
 - **`show`:** prints resolved values. With `--plan`, it prints what every host
   runs.
 - **`run --dry-run`:** prints the commands and env of the selected hosts.
@@ -218,7 +226,8 @@ What each command does:
 ## Development
 
 ```
-uv run --project tools/scenario --frozen pytest -c tools/scenario/pyproject.toml tools/scenario/tests .buildkite/scenario
+uv run --project tools/scenario --frozen pytest -c tools/scenario/pyproject.toml tools/scenario/tests .buildkite/kubernetes/scenario/tests
+uv run --project tools/scenario --frozen pytest -c tools/scenario/pyproject.toml .buildkite/kubernetes/scenario/golden
 uv run --project tools/scenario --frozen scenario dev regen        # generated schema and REFERENCE.md
 uv lock --project tools/scenario                                   # after changing dependencies
 ```
@@ -226,6 +235,8 @@ uv lock --project tools/scenario                                   # after chang
 - **Python:** 3.12 and 3.13.
 - **Lock:** `uv.lock` names only pypi.org, whatever a machine's own uv config
   says.
-- **Golden check:** under `.buildkite/scenario/golden`. It runs today's kube
-  scripts with stub programs and compares what they would run with each
-  scenario's Plan. It needs bash 4.4 or newer.
+- **Golden check:** under `.buildkite/kubernetes/scenario/golden`, with its
+  own workflow, `scenario-golden.yml`. It runs today's kube scripts with stub
+  programs and compares what they would run with each scenario's Plan. It
+  needs bash 4.4 or newer. It is temporary: M4 deletes it together with
+  today's kube scripts.

@@ -1,0 +1,96 @@
+# yaml-language-server: $schema=../../../../tools/scenario/schema/scenario.schema.json
+# Kimi-K3 at TP32 with EP over a 4-host v7x slice; single-request latency probe.
+# max-model-len, block-size, kv-cache-dtype and max-num-seqs together select the
+# tuned MLA table entry for K3 at TP32; changing one drops to the untuned fallback
+# without a warning, so treat them as one setting.
+schema: 1
+name: kimi-k3-tp32-ep
+server:
+  model:
+    name: moonshotai/Kimi-K3
+    path: gs://tpu-commons-ci/moonshootai/kimi/k3
+  accelerator: tpu7x
+  topology: 2x2x4
+  hosts: 4
+  chips_per_host: 4
+  # TP32 x DP1 cannot split DP over four hosts, which mp needs.
+  multihost: ray
+  # Covers the stream from object storage plus a cold compile.
+  startup_timeout: 4h
+  args:
+    load-format: runai_streamer
+    tensor-parallel-size: 32
+    enable-expert-parallel: true
+    # pages_per_seq 40 at block size 256, the value the tuned entry is keyed on.
+    max-model-len: 10240
+    max-num-batched-tokens: 8192
+    # The table has no K3 TP32 entry above 8 sequences.
+    max-num-seqs: 8
+    gpu-memory-utilization: 0.82
+    kv-cache-dtype: fp8
+    # The checkpoint ships custom code (TikTokenTokenizer).
+    trust-remote-code: true
+    # Each rank streams only its own experts; the full checkpoint drew Ray OOM kills.
+    enable-ep-weight-filter: true
+    # Serve the language model only; the vision tower has no TPU path here.
+    language-model-only: true
+    limit-mm-per-prompt:
+      image: 0
+      video: 0
+    # Caps the streamer's per-rank host buffer so 32 ranks fit host memory.
+    model-loader-extra-config:
+      memory_limit: 17179869184
+    block-size: 256
+    # A 1 so a single-sequence decode step does not pad to 16 tokens.
+    compilation-config:
+      compile_sizes: [1, 8, 8192]
+tasks:
+  perf:
+    isl_osl: [[8192, 1024]]
+    concurrency: [1]
+    # 64 sequential requests give a stable median; the gate allows 3 to fail.
+    num_prompts: 64
+    random_range_ratio: 0.0
+    temperature: 0
+    baseline:
+      _source:
+        description: >-
+          Baseline adjusted down on purpose after PR #561 (issue #991): Kimi-K3 now
+          runs on the unified KV pool by default, and the pooled KDA path is expected
+          to be slower until it is optimized (with TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=0
+          the pre-#561 numbers come back, but that flag excludes prefix caching).
+          Values from nightly ci build 1003 on main dd9db189 (median TTFT 995 ms ->
+          1573 ms, TPOT 18.95 -> 19.2 ms, 452 -> 434 tok/s); previous_values kept for
+          when the pooled path is optimized.
+        previous_values:
+          median_tpot_ms: 18.9536309547045
+          median_ttft_ms: 995.1696610078216
+          output_token_throughput: 50.22148122390681
+          total_token_throughput: 451.9933310151613
+      isl8192_osl1024_c1:
+        completed: 64
+        median_tpot_ms: 19.2
+        median_ttft_ms: 1573.3
+        num_prompts: 64
+        output_token_throughput: 48.26
+        total_token_throughput: 434.3
+  eval:
+    lm_eval:
+      # MMLU-Pro extracts an answer letter from a complete chat response; K3's
+      # template closes assistant messages, so continuation tasks do not fit.
+      tasks: [mmlu_pro]
+      model_args:
+        num_concurrent: 16
+      fewshot_as_multiturn: false
+      # K3's chat template calls its switch `thinking`, and reasons by default.
+      gen_kwargs:
+        chat_template_kwargs:
+          thinking: false
+    tolerance: 0.025
+    baseline:
+      _source:
+        description: >-
+          Reported TPU calibration: MMLU-Pro, 100 questions per subject, thinking
+          disabled, client concurrency 16 (dev build 33).
+      mmlu_pro:
+        "exact_match,custom-extract": 0.8342857142857143

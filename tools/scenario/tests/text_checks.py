@@ -11,13 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Checks on file text: banned strings.
+"""Checks on file text: banned strings and block-style YAML.
 
 Like plan_fixtures.py it is imported by name, so checks over a repository's
 own scenarios can use it too.
 """
 
 import pathlib
+
+from ruamel.yaml import YAML
+from ruamel.yaml.nodes import MappingNode, SequenceNode
 
 
 def fleet_strings(text: str, banned: tuple[str, ...]) -> list[str]:
@@ -44,3 +47,18 @@ def text_files(root: pathlib.Path) -> list[pathlib.Path]:
                 continue
             files.append(path)
     return sorted(files)
+
+
+def flow_mapping_lines(text: str) -> list[int]:
+    """The lines where a flow mapping ({...}) starts."""
+    found = []
+    nodes = [YAML(typ="rt").compose(text)]
+    while nodes:
+        node = nodes.pop()
+        if isinstance(node, MappingNode):
+            if node.flow_style:
+                found.append(node.start_mark.line + 1)
+            nodes += [value for _, value in node.value]
+        elif isinstance(node, SequenceNode):
+            nodes += node.value
+    return sorted(found)

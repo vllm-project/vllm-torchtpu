@@ -1,0 +1,24 @@
+# yaml-language-server: $schema=../../../../tools/scenario/schema/scenario.schema.json
+# Presubmit guard for Qwen3-0.6B on one v7x chip: TP1, perf and lm_eval. No
+# baseline yet, so neither gate runs.
+schema: 1
+name: qwen3-0.6b-tp1
+server:
+  model:
+    name: Qwen/Qwen3-0.6B
+  accelerator: tpu7x
+  topology: 1x1x1
+  hosts: 1
+  chips_per_host: 1
+  args:
+    gpu-memory-utilization: 0.9
+tasks:
+  perf:
+    isl_osl: [[1024, 1024]]
+    concurrency: [8]
+    random_range_ratio: 0.8
+    warmup_runs: 1
+  eval:
+    lm_eval:
+      tasks: [mmlu_llama, mmlu_pro]
+    tolerance: 0.02
