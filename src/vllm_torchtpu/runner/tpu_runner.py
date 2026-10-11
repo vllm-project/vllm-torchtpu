@@ -10342,28 +10342,36 @@ class TPUModelRunner(GPUModelRunner):
             # sweep one synthetic request per prompt-token bucket at nr=1. Each
             # runs the REAL two-phase propose+verify+sampling dispatch, so
             # torch-tpu emits the same fused programs serving will hit.
-            for i, P in enumerate(self.num_tokens_paddings):
-                # A single request's prompt can't exceed max_model_len; skip
-                # token buckets above it (they only arise as batched totals,
-                # covered by the num_reqs sweep below). Without this, a P >
-                # max_model_len synthetic prompt overflows token_ids_cpu
-                # (shape [.., max_model_len]) when max_num_batched_tokens >
-                # max_model_len, e.g. small max_model_len configs.
-                if int(P) > self.max_model_len:
-                    continue
-                # Greedy and non-greedy (do_sampling=True) verify+sample are
-                # DISTINCT fused programs, so sweep both at every prompt bucket.
-                for greedy in (True, False):
-                    if not self._warmup_one_spec_request(
-                        int(P), idx=i, quiet=True, greedy=greedy
+            with shape_variants.warmup() as buckets:
+                for i, P in enumerate(self.num_tokens_paddings):
+                    # A single request's prompt can't exceed max_model_len; skip
+                    # token buckets above it (they only arise as batched totals,
+                    # covered by the num_reqs sweep below). Without this, a P >
+                    # max_model_len synthetic prompt overflows token_ids_cpu
+                    # (shape [.., max_model_len]) when max_num_batched_tokens >
+                    # max_model_len, e.g. small max_model_len configs.
+                    if int(P) > self.max_model_len:
+                        continue
+                    if (
+                        buckets.needs_retrace(int(P))
+                        and getattr(self.drafter, "draft_model", None) is not None
                     ):
-                        # First attempt cold-compiles the draft forward; a
-                        # SymInt from that cold compile can leak into the
-                        # dynamic=False gather wrapper on the first bucket. Retry
-                        # once now that the forward is compiled and returns
-                        # concrete-shaped tensors (this attempt logs loudly if it
-                        # also fails).
-                        self._warmup_one_spec_request(int(P), idx=i, greedy=greedy)
+                        shape_variants.retrace(
+                            self.drafter.draft_model, self.drafter.draft_vllm_config
+                        )
+                    # Greedy and non-greedy (do_sampling=True) verify+sample are
+                    # DISTINCT fused programs, so sweep both at every prompt bucket.
+                    for greedy in (True, False):
+                        if not self._warmup_one_spec_request(
+                            int(P), idx=i, quiet=True, greedy=greedy
+                        ):
+                            # First attempt cold-compiles the draft forward; a
+                            # SymInt from that cold compile can leak into the
+                            # dynamic=False gather wrapper on the first bucket. Retry
+                            # once now that the forward is compiled and returns
+                            # concrete-shaped tensors (this attempt logs loudly if it
+                            # also fails).
+                            self._warmup_one_spec_request(int(P), idx=i, greedy=greedy)
             # (2) Batched spec steps. A bucketed-draft proposer depends on no
             # exact request count, so one count per program-bucket combination
             # (`_spec_warmup_bucket_grid`), each with a short decode run and a

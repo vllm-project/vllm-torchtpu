@@ -101,6 +101,7 @@ from vllm.model_executor.models import qwen3_next, qwen3_next_mtp
 from vllm.sequence import IntermediateTensors
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.compilation import shape_variants
 from vllm_torchtpu.layers.adapter import (
     linear_common,
     sequence_parallel,
@@ -146,6 +147,26 @@ def step0_post_attn_gather_context(indices: torch.Tensor | None):
         yield
     finally:
         _step0_gather_indices = prev
+
+
+def _step0_effective_gather_indices(
+    positions: torch.Tensor | None,
+) -> torch.Tensor | None:
+    """Slice `_step0_gather_indices` to 4 or 8 rows on small token buckets (`T<=4`
+    and `T<=8`) during `shape_variants.warmup()` so post-attention `o_proj`,
+    `small_all_reduce`, `norm_fp8_gate_and_se`, `moe_lowtok`, and `self.norm`
+    execute on 4 or 8 rows instead of `max_loop_p` (16) rows."""
+    gather_idx = _step0_gather_indices
+    if gather_idx is None:
+        return None
+    if positions is not None and shape_variants.in_warmup():
+        s0 = positions.shape[-1]
+        if gather_idx.shape[0] > 4 and s0 <= 4:
+            return gather_idx[:4]
+        if gather_idx.shape[0] > 8 and s0 <= 8:
+            return gather_idx[:8]
+    return gather_idx
+
 
 
 def is_step0_post_attn_gather_installed(draft_model: Any) -> bool:
@@ -437,7 +458,7 @@ def _forward_qwen3_next_attn_from_qkv(
 ) -> torch.Tensor:
     q, k, v, gate = attn_layer._project_qkv_gate(qkv, positions)
     attn_output = attn_layer.attn(q, k, v)
-    gather_idx = _step0_gather_indices
+    gather_idx = _step0_effective_gather_indices(positions)
     if gather_idx is not None:
         attn_output = torch.index_select(attn_output, 0, gather_idx)
         if gate is not None:
@@ -1445,7 +1466,7 @@ def patched_decoder_layer_forward(
             positions=positions,
             **attn_kwargs,
         )
-        gather_idx = _step0_gather_indices
+        gather_idx = _step0_effective_gather_indices(positions)
         if gather_idx is not None:
             residual = torch.index_select(residual, 0, gather_idx)
     else:
@@ -1606,6 +1627,14 @@ def patched_mtp_forward(
     hidden_states, _ = self.norm(hidden_states, residual)
     if sp:
         hidden_states = tensor_model_parallel_all_gather(hidden_states, 0)
+    if (
+        _step0_gather_indices is not None
+        and hidden_states.shape[0] < _step0_gather_indices.shape[0]
+    ):
+        hidden_states = F.pad(
+            hidden_states,
+            (0, 0, 0, _step0_gather_indices.shape[0] - hidden_states.shape[0]),
+        )
     return hidden_states
 
 

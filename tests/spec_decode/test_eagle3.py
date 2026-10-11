@@ -3195,6 +3195,63 @@ def test_draft_post_step0_fused_matches_unfused_carries_and_step1_inputs(advance
     assert stacked.shape == (4, 3)
     assert torch.equal(stacked[:, 0], tok0_ref)
 
+    # When step0 post-attn gather outputs [max_loop_p, H], _MtpFusedLoop slices
+    # hidden_states[:positions.shape[-1]] internally and produces identical tokens.
+    h_padded = torch.cat([h_f.clone(), torch.full((12, 4), 99.0)], dim=0)
+    stacked_from_padded = loop_mod(None, pos1_f.clone(), h_padded, seq1_f.clone())
+    assert torch.equal(stacked_from_padded, stacked)
+
+    # _draft_async_prepare_inputs with positions and base_seq_lens returns
+    # identical pos_step1 and seq_lens_step1 without needing _draft_post_step0_fused.
+    input_ids = torch.arange(8, dtype=torch.int32)
+    next_tokens = torch.tensor(
+        [[101, 102, 103, -1], [201, 202, 203, 204]], dtype=torch.int32
+    )
+    draft_lengths = torch.tensor([3, 3], dtype=torch.int32)
+    qsl = torch.tensor([0, 4, 5, 5, 5], dtype=torch.int32)
+    pad_req_idx = torch.tensor([0, 1, 1, 1], dtype=torch.int64)
+    _, rej_a, s0_gi_a, pos1_a, seq1_a = (
+        Eagle3Proposer._draft_async_prepare_inputs.__wrapped__.__wrapped__(
+            proposer,
+            input_ids,
+            next_tokens,
+            draft_lengths,
+            qsl,
+            pad_req_idx,
+            None,
+            16,
+            positions,
+            base_seq_lens,
+        )
+    )
+    _, pos1_gi, seq1_gi = (
+        Eagle3Proposer._draft_post_step0_fused.__wrapped__.__wrapped__(
+            proposer,
+            hidden,
+            positions,
+            s0_gi_a[:4],
+            base_seq_lens,
+            rej_a,
+        )
+    )
+    assert torch.equal(rej_a, rejected)
+    assert s0_gi_a.shape == (16,)
+    assert torch.equal(pos1_a, pos1_gi)
+    assert torch.equal(seq1_a, seq1_gi)
+
+    from vllm_torchtpu.compilation import shape_variants
+    from vllm_torchtpu.models.vllm.qwen3_next_patch import (
+        _step0_effective_gather_indices,
+        step0_post_attn_gather_context,
+    )
+
+    with step0_post_attn_gather_context(s0_gi_a):
+        assert _step0_effective_gather_indices(torch.zeros((3, 4))).shape == (16,)
+        with shape_variants.warmup():
+            assert _step0_effective_gather_indices(torch.zeros((3, 4))).shape == (4,)
+            assert _step0_effective_gather_indices(torch.zeros((3, 8))).shape == (8,)
+            assert _step0_effective_gather_indices(torch.zeros((3, 12))).shape == (16,)
+
     # Without propose_step0 (main's form) the program takes step 0's token
     # and returns steps 1..K-1 one tensor each: the same tokens.
     steps_mod = _MtpFusedLoop(
