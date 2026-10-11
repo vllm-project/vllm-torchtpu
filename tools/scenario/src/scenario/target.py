@@ -20,8 +20,18 @@ reserved_env() lists, and a scenario may set neither. With two owners,
 precedence would decide the value, so a clash is an error instead.
 """
 
+import dataclasses
 from dataclasses import dataclass
-from typing import Literal, NamedTuple, Protocol, runtime_checkable
+from typing import (
+    Any,
+    Literal,
+    NamedTuple,
+    Protocol,
+    get_args,
+    get_origin,
+    get_type_hints,
+    runtime_checkable,
+)
 
 from scenario.plan.types import (
     AgentxTaskPlan,
@@ -51,6 +61,7 @@ __all__ = [
     "RoleShape",
     "Shape",
     "Target",
+    "TargetData",
     "TargetInfo",
     "ownership_problems",
     "scenario_env_names",
@@ -131,6 +142,134 @@ class AfterTask:
     fatal: bool = True
     skip_on_experiment: bool = False
     timeout_s: int = 600
+
+    def to_data(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "argv": list(self.argv),
+            "env": [list(pair) for pair in self.env],
+            "when": self.when,
+            "results": self.results,
+            "require": self.require,
+            "fatal": self.fatal,
+            "skip_on_experiment": self.skip_on_experiment,
+            "timeout_s": self.timeout_s,
+        }
+
+    @classmethod
+    def from_data(cls, data: Any) -> "AfterTask":
+        """An AfterTask from to_data()'s form.
+
+        Raises:
+            ValueError: a missing or unknown field, or a value of the wrong kind.
+        """
+        if not isinstance(data, dict):
+            raise ValueError(f"an after-task is a mapping, not {data!r}")
+        fields = {f.name: f for f in dataclasses.fields(cls)}
+        unknown = sorted(set(data) - set(fields))
+        if unknown:
+            raise ValueError(f"after-task field {unknown[0]} is unknown")
+        hints = get_type_hints(cls)
+        values: dict[str, Any] = {}
+        for name, value in data.items():
+            hint = hints[name]
+            if name == "argv":
+                value = tuple(_strings(value, name))
+            elif name == "env":
+                value = tuple(_env_pair(pair) for pair in _items(value, name))
+            elif get_origin(hint) is Literal:
+                if value not in get_args(hint):
+                    choices = ", ".join(get_args(hint))
+                    raise ValueError(
+                        f"after-task {name} {value!r} is not one of {choices}"
+                    )
+            # bool is an int to isinstance; neither may stand for the other.
+            elif type(value) is not hint:
+                raise ValueError(
+                    f"after-task {name} {value!r} is not a {hint.__name__}"
+                )
+            values[name] = value
+        missing = [n for n in ("name", "argv") if n not in values]
+        if missing:
+            raise ValueError(f"after-task without {missing[0]}")
+        return cls(**values)
+
+
+def _items(value: Any, what: str) -> list[Any]:
+    if not isinstance(value, list):
+        raise ValueError(f"after-task {what} is a list, not {value!r}")
+    return value
+
+
+def _strings(value: Any, what: str) -> list[str]:
+    items = _items(value, what)
+    if not all(isinstance(item, str) for item in items):
+        raise ValueError(f"after-task {what} holds a non-string: {value!r}")
+    return items
+
+
+def _env_pair(pair: Any) -> tuple[str, str]:
+    if not (isinstance(pair, list) and len(pair) == 2):
+        raise ValueError(f"after-task env entries are [name, value], not {pair!r}")
+    name, value = _strings(pair, "env")
+    return name, value
+
+
+@dataclass(frozen=True)
+class TargetData:
+    """What a target hands the driver host beside the Plan.
+
+    Pods get it as SCENARIO_TARGET_DATA (gzip and base64 of to_data()),
+    built from info() and after_tasks(); the runtime reads nothing else of
+    the target. `lm_eval_cache_root` is where lm_eval keeps its request
+    cache; None runs it without one.
+    """
+
+    info: TargetInfo
+    after_tasks: tuple[AfterTask, ...] = ()
+    lm_eval_cache_root: str | None = None
+
+    def to_data(self) -> dict[str, Any]:
+        return {
+            "info": {"name": self.info.name, "commit": self.info.commit},
+            "results_root": self.info.results_root,
+            "after_tasks": [task.to_data() for task in self.after_tasks],
+            "lm_eval_cache_root": self.lm_eval_cache_root,
+        }
+
+    @classmethod
+    def from_data(cls, data: Any) -> "TargetData":
+        """TargetData from to_data()'s form.
+
+        Raises:
+            ValueError: the data has another shape.
+        """
+        if not isinstance(data, dict):
+            raise ValueError(f"target data is a mapping, not {data!r}")
+        unknown = sorted(
+            set(data) - {"info", "results_root", "after_tasks", "lm_eval_cache_root"}
+        )
+        if unknown:
+            raise ValueError(f"target data field {unknown[0]} is unknown")
+        info = data.get("info")
+        if not isinstance(info, dict) or not isinstance(info.get("name"), str):
+            raise ValueError(f"target data info needs a name: {info!r}")
+        optional = {
+            "info.commit": info.get("commit"),
+            "results_root": data.get("results_root"),
+            "lm_eval_cache_root": data.get("lm_eval_cache_root"),
+        }
+        for what, value in optional.items():
+            if value is not None and not isinstance(value, str):
+                raise ValueError(f"target data {what} is a string, not {value!r}")
+        return cls(
+            info=TargetInfo(info["name"], info.get("commit"), data.get("results_root")),
+            after_tasks=tuple(
+                AfterTask.from_data(task)
+                for task in _items(data.get("after_tasks", []), "list")
+            ),
+            lm_eval_cache_root=data.get("lm_eval_cache_root"),
+        )
 
 
 def _task_tool_env(task: TaskPlan) -> frozenset[str]:

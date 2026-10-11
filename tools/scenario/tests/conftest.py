@@ -276,3 +276,25 @@ def variants(
 
     base = {"single": single, "pd": pd, "agentx": agentx, "ix_eval": ix_eval}
     return {name: make(base) for name, make in VARIANTS.items()}
+
+
+# Runtime tests -------------------------------------------------------------
+
+
+@pytest.fixture
+def api_port(monkeypatch: pytest.MonkeyPatch) -> int:
+    """A free port as the servers' API port, so runs never collide on 8000."""
+    from runtime_helpers import free_port
+    from scenario.plan import plumbing
+
+    port = free_port()
+    monkeypatch.setattr(plumbing, "API_PORT", port)
+    return port
+
+
+@pytest.fixture
+def fast_polls(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Poll a starting server often, so runtime tests do not wait whole seconds."""
+    from scenario.runtime import bringup
+
+    monkeypatch.setattr(bringup, "POLL_INTERVAL_S", 0.02)
