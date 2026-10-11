@@ -175,14 +175,25 @@ A **target** takes a Plan and runs it somewhere:
 | Target | Where it runs |
 |---|---|
 | `local` | this machine, e.g. a TPU VM |
-| `kubectl` | a generic GKE JobSet (M2) |
-| the CI fleet target | the CI fleet through its launcher; it lives under `.buildkite/kubernetes/scenario/` (M2) |
+| `kubectl` | a JobSet on the cluster `kubectl` points at (GKE with the JobSet controller) |
+| the CI fleet target | the CI fleet through its launcher; it lives under `.buildkite/kubernetes/scenario/` |
 
-A target can add only a few named things: a container name, annotations,
-infrastructure env such as cache paths, and after-task uploads. It cannot
-change what runs. Tests enforce this:
+`--target` names `local`, `kubectl`, or a `.py` file that defines a target;
+`SCENARIO_TARGET` is the default. Kubernetes targets share one render
+(`targets/kubernetes.py`): a point is one JobSet, with a replicatedJob per
+role and Indexed pods, one per host, plus a chipless `client` pod when the
+driver runs off the chips. Every pod runs `scenario run --role ROLE` and
+reads its part from the pod env described under Running.
 
-- a scenario's Plan is identical with and without a target;
+A target can add only a few named things through hooks that return data: a
+container name, annotations, infrastructure env and volumes such as cache
+paths, the chipless pod's node selector, failure policy, and after-task
+uploads. It cannot change what runs. Tests enforce this:
+
+- a scenario's Plan is identical with and without a target, and each pod of
+  a render runs exactly its part of it;
+- after every hook, the render must equal the target-free render apart from
+  what that hook may add, or the error names the hook;
 - imports between modules follow fixed rules;
 - tool-owned and target-owned env names are reserved;
 - fleet-specific strings may not appear under `tools/scenario/` or
@@ -194,13 +205,13 @@ change what runs. Tests enforce this:
 |---|---|
 | `tools/scenario/` | the CLI, its own Python project (`pyproject.toml`, `uv.lock`) |
 | `.buildkite/kubernetes/scenarios/` | the CI scenarios, which people edit, and `defaults.yaml` |
-| `.buildkite/kubernetes/scenario/tests/` | checks over the CI scenarios |
+| `.buildkite/kubernetes/scenario/tests/` | checks over the CI scenarios and the CI fleet target |
+| `.buildkite/kubernetes/scenario/tpu_ci.py` | the CI fleet target, which pipelines name in `SCENARIO_TARGET` |
 | `.buildkite/kubernetes/scenario/golden/` | the golden check, which is temporary |
 
 The tool's root is the directory that holds `scenarios/defaults.yaml`; for
 the CI scenarios it is `.buildkite/kubernetes`. A reference id such as
-`kimi-k3/tp32-ep` is the path under `scenarios/` without `.yaml`. The CI
-fleet target will live in `.buildkite/kubernetes/scenario/` as well.
+`kimi-k3/tp32-ep` is the path under `scenarios/` without `.yaml`.
 
 ## Running
 
@@ -297,13 +308,18 @@ uv run --project tools/scenario scenario run .buildkite/kubernetes/scenarios/qwe
 uv run --project tools/scenario scenario up .buildkite/kubernetes/scenarios/qwen3-0.6b/tp1.yaml
 uv run --project tools/scenario scenario perf .buildkite/kubernetes/scenarios/qwen3-0.6b/tp1.yaml --url http://127.0.0.1:8000
 uv run --project tools/scenario scenario calibrate .buildkite/kubernetes/scenarios/glm-5.2/fp8-dp16-ep.yaml run1/glm-5.2-fp8-dp16-ep run2/glm-5.2-fp8-dp16-ep --write
+uv run --project tools/scenario scenario render .buildkite/kubernetes/scenarios/kimi-k3/agentx-1p1d.yaml --point c1 --target kubectl --set server.image=<image>
+uv run --project tools/scenario scenario submit .buildkite/kubernetes/scenarios/qwen3-0.6b/tp1.yaml --target kubectl --set server.image=<image>
+uv run --project tools/scenario scenario steps .buildkite/kubernetes/scenarios/kimi-k3/agentx-1p1d.yaml
 ```
 
 What each command does:
 
 - **`validate`:** with no files, checks every scenario under the root's
   `scenarios/`. `--root` names the root; without it, the root is found from
-  the current directory.
+  the current directory. With `--target`, no scenario may set an env name
+  the target reserves, and a scenario without `server.image` needs a target
+  that supplies one.
 - **`show`:** prints resolved values. With `--plan`, it prints what every host
   runs.
 - **`run`:** runs the scenario on this host (see Running). `--dry-run` prints
@@ -313,6 +329,15 @@ What each command does:
 - **`up`:** serves the scenario until SIGINT or SIGTERM, running no task.
 - **`perf` / `eval`:** run one task against a server that is already up at
   `--url`.
+- **`render`:** prints the manifest a Kubernetes target applies for one
+  point, byte for byte what `submit` hands it. Without a target, the tool's
+  own render with placeholders.
+- **`submit`:** runs one point on a target and exits with the driver's
+  code. It needs `--target` or `SCENARIO_TARGET`, and a sweep needs
+  `--point`.
+- **`steps`:** prints one CI step per sweep point as JSON (key, label, the
+  `submit` command, the previous point to run after, and the target's
+  concurrency group), for a pipeline to turn into its own steps.
 - **`calibrate`:** computes new baselines from run directories with
   `check_regression.py`'s calibration (medians over the runs) and prints the
   change. `--write` rewrites only those baseline entries in the file; every

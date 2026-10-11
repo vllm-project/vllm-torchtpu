@@ -1,0 +1,71 @@
+# qwen3.5-397b/inferencex-sweep points: tp8-c4, tp8-c8, tp8-c16, dp4tp2-c32, dp4tp2-c64, dp4tp2-c128, dp4tp2-c256
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: '${WORKLOAD_NAME}'
+  annotations:
+    tpu-ci.google.com/defaults: standard
+spec:
+  network:
+    enableDNSHostnames: true
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - server
+  replicatedJobs:
+    - name: server
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          completionMode: Indexed
+          template:
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: '2x2x1'
+              tolerations:
+                - key: google.com/tpu
+                  operator: Equal
+                  value: present
+                  effect: NoSchedule
+              containers:
+                - name: workload
+                  image: '${IMAGE}'
+                  command:
+                    - scenario
+                    - run
+                    - '--role'
+                    - server
+                  ports:
+                    - containerPort: 8000
+                  resources:
+                    limits:
+                      google.com/tpu: '4'
+                    requests:
+                      google.com/tpu: '4'
+                  env:
+                    - name: SCENARIO_PLAN
+                      value: <SCENARIO_PLAN>
+                    - name: SCENARIO_RESOLVED
+                      value: <SCENARIO_RESOLVED>
+                    - name: SCENARIO_HOST_INDEX
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: "metadata.annotations['batch.kubernetes.io/job-completion-index']"
+                    - name: SCENARIO_ADVERTISE_IP
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: status.podIP
+                    - name: SCENARIO_HEAD_ADDRESS
+                      value: '${WORKLOAD_NAME}-server-0-0.${WORKLOAD_NAME}'
+                    - name: SCENARIO_IMAGE
+                      value: '${IMAGE}'
+                    - name: SCENARIO_TARGET_DATA
+                      value: <SCENARIO_TARGET_DATA>
+                    - name: FORCE_COLOR
+                      value: '1'
+                    - name: TQDM_MININTERVAL
+                      value: '30'

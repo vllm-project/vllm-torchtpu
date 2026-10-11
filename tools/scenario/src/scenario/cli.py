@@ -13,15 +13,19 @@
 # limitations under the License.
 """The `scenario` command line.
 
-validate, show and calibrate exit 0 when everything is fine (warnings
-allowed), 1 when a scenario has problems, 2 for usage errors, including a
-Plan that cannot be selected or decoded. run, up, perf and eval exit with
-the runtime's codes (runtime/exits.py), where 1 is a failed task, so a
-scenario with problems is a usage error (2) there.
+validate, show, render, steps and calibrate exit 0 when everything is fine
+(warnings allowed), 1 when a scenario has problems, 2 for usage errors,
+including a Plan that cannot be selected or decoded and a target that
+cannot be loaded. run, up, perf, eval and submit exit with the runtime's
+codes (runtime/exits.py), where 1 is a failed task, so a scenario with
+problems is a usage error (2) there.
 """
 
+import json
 import os
 import pathlib
+import re
+import shlex
 import sys
 import urllib.parse
 from collections.abc import Callable, Sequence
@@ -46,6 +50,9 @@ from scenario.runtime.exits import RunError
 from scenario.runtime.gate import GateError
 from scenario.runtime.placement import ENV_PLAN, PlacementFlags, decode_plan
 from scenario.show import describe, render_plan, render_resolved, render_why
+from scenario.target import EnvNames, Target, ownership_problems
+from scenario.targets import loader
+from scenario.targets.kubernetes import KubernetesTarget, Preview, RenderError
 from scenario.targets.local import LocalTarget
 
 EXIT_PROBLEMS = 1
@@ -57,6 +64,13 @@ RootOption = click.option(
     type=click.Path(path_type=pathlib.Path, file_okay=False, exists=True),
     help="The directory holding scenarios/defaults.yaml; found from the file "
     "or the current directory when not given.",
+)
+TargetOption = click.option(
+    "--target",
+    "target_spec",
+    metavar="TARGET",
+    help=f"{' or '.join(loader.BUILTINS)}, or a .py file that defines a target; "
+    f"default: ${loader.ENV_TARGET}.",
 )
 SetOption = click.option(
     "--set",
@@ -97,7 +111,9 @@ def _resolve(
 ) -> tuple[Resolved, ...]:
     """Resolve FILE, or print every problem and exit with `code`."""
     try:
-        resolver = Resolver(find_root(file, root, cwd=pathlib.Path.cwd()))
+        found = find_root(file, root, cwd=pathlib.Path.cwd())
+        # Absolute, as the file is, so a relative --root still gives refs.
+        resolver = Resolver(found.resolve())
         resolved = resolver.resolve(file.resolve(), tuple(sets), point)
     except DiagnosticError as error:
         click.echo("\n".join(d.render() for d in error.diagnostics), err=True)
@@ -112,6 +128,19 @@ def _plan(points: Sequence[Resolved], point: str | None, only: str | None) -> Pl
         tasks = [name.strip() for name in only.split(",")] if only else None
         return plan(select_point(points, point), only=tasks)
     except PlanError as error:
+        _fail(str(error))
+
+
+def _target(spec: str | None, *, required: bool) -> Target | None:
+    """The target --target or SCENARIO_TARGET names, or None without either."""
+    spec = loader.target_spec(spec, os.environ)
+    if spec is None:
+        if required:
+            _fail(f"no target: pass --target or set {loader.ENV_TARGET}")
+        return None
+    try:
+        return loader.load_target(spec, pathlib.Path.cwd())
+    except loader.TargetLoadError as error:
         _fail(str(error))
 
 
@@ -132,8 +161,14 @@ class _Outcome:
         return [d for d in self.problems if d.severity == "error"]
 
 
-def _check(resolver: Resolver, file: pathlib.Path, sets: tuple[str, ...]) -> _Outcome:
+def _check(
+    resolver: Resolver,
+    file: pathlib.Path,
+    sets: tuple[str, ...],
+    target: Target | None = None,
+) -> _Outcome:
     outcome = _Outcome(file, resolver.ref_of(file))
+    reserved: EnvNames | None = target.reserved_env() if target is not None else None
     try:
         points = resolver.resolve(file, sets)
     except DiagnosticError as error:
@@ -151,6 +186,18 @@ def _check(resolver: Resolver, file: pathlib.Path, sets: tuple[str, ...]) -> _Ou
             outcome.problems.append(Diagnostic(source, None, "", str(error)))
             continue
         summaries.append(describe(planned))
+        if target is not None and reserved is not None:
+            who = target.info().name
+            problems = ownership_problems(planned, reserved)
+            if isinstance(target, KubernetesTarget):
+                try:
+                    target.image(planned)
+                except RenderError as error:
+                    problems.append(str(error))
+            outcome.problems += [
+                Diagnostic(source, None, "", f"target {who}{where}: {problem}")
+                for problem in problems
+            ]
         for what, size in (
             ("SCENARIO_PLAN", len(codec.encode(planned))),
             ("SCENARIO_RESOLVED", len(codec.encode_data(resolved_payload(resolved)))),
@@ -208,15 +255,22 @@ def _duplicate_names(resolver: Resolver, outcomes: Sequence[_Outcome]) -> None:
 @main.command()
 @click.argument("files", nargs=-1, type=FileArg)
 @SetOption
+@TargetOption
 @RootOption
 def validate(
-    files: tuple[pathlib.Path, ...], sets: tuple[str, ...], root: pathlib.Path | None
+    files: tuple[pathlib.Path, ...],
+    sets: tuple[str, ...],
+    target_spec: str | None,
+    root: pathlib.Path | None,
 ) -> None:
     """Check scenario files; with none, every scenario under scenarios/.
 
     Each one is resolved and planned (every sweep point), names must be
     unique across scenarios/, and the encoded Plan must fit its env value.
+    With a target, no scenario may set an env name the target reserves, and
+    one without server.image needs a target that supplies an image.
     """
+    target = _target(target_spec, required=False)
     cwd = pathlib.Path.cwd()
     groups: dict[pathlib.Path, list[pathlib.Path]] = {}
     try:
@@ -234,7 +288,7 @@ def validate(
     outcomes: list[_Outcome] = []
     for found, members in groups.items():
         resolver = Resolver(found)
-        checked = [_check(resolver, file, sets) for file in members]
+        checked = [_check(resolver, file, sets, target) for file in members]
         _duplicate_names(resolver, checked)
         outcomes += checked
     errors = warnings = 0
@@ -619,6 +673,135 @@ def eval_(
 ) -> None:
     """Run a scenario's eval task against a server that is already up."""
     _against("eval", file, url, sets, point, results_dir, root, lm_eval_cache)
+
+
+# render, submit, steps ----------------------------------------------------
+
+
+@main.command()
+@click.argument("file", type=FileArg)
+@SetOption
+@click.option("--point", help="The sweep point to render; a sweep needs one.")
+@TargetOption
+@RootOption
+def render(
+    file: pathlib.Path,
+    sets: tuple[str, ...],
+    point: str | None,
+    target_spec: str | None,
+    root: pathlib.Path | None,
+) -> None:
+    """Print the manifest a Kubernetes target applies for one point.
+
+    It is the exact text `submit` hands the target. Without a target, the
+    tool's own render, with placeholders where a target decides.
+    """
+    target = _target(target_spec, required=False) or Preview()
+    if not isinstance(target, KubernetesTarget):
+        hint = "; use run --dry-run" if isinstance(target, LocalTarget) else ""
+        _fail(f"target {target.info().name} renders no manifest{hint}")
+    points = _resolve(file, sets, root, point)
+    resolved = _select(points, point)
+    planned = _plan(points, point, None)
+    try:
+        text = target.render(planned, resolved_payload(resolved))
+    except RenderError as error:
+        _fail(str(error), EXIT_PROBLEMS)
+    click.echo(text, nl=False)
+
+
+@main.command(epilog=f"\b\nExit codes:\n{EXIT_CODES}")
+@click.argument("file", type=FileArg)
+@SetOption
+@click.option("--point", help="The sweep point to submit; a sweep needs one.")
+@click.option("--only", metavar="TASKS", help="Only these tasks, comma-separated.")
+@TargetOption
+@RootOption
+def submit(
+    file: pathlib.Path,
+    sets: tuple[str, ...],
+    point: str | None,
+    only: str | None,
+    target_spec: str | None,
+    root: pathlib.Path | None,
+) -> None:
+    """Run one point of a scenario on a target, and exit with its driver's code.
+
+    The target comes from --target or SCENARIO_TARGET. There is no default,
+    so a forgotten target never starts vLLM on this machine.
+    """
+    target = _target(target_spec, required=True)
+    assert target is not None
+    points = _resolve(file, sets, root, point, EXIT_USAGE)
+    resolved = _select(points, point)
+    planned = _plan(points, point, only)
+    problems = ownership_problems(planned, target.reserved_env())
+    if problems:
+        _fail("; ".join(problems))
+    try:
+        code = target.submit(planned, resolved=resolved_payload(resolved))
+    except RenderError as error:
+        _fail(str(error))
+    sys.exit(code)
+
+
+def _slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-")
+
+
+@main.command()
+@click.argument("file", type=FileArg)
+@TargetOption
+@RootOption
+def steps(
+    file: pathlib.Path, target_spec: str | None, root: pathlib.Path | None
+) -> None:
+    """Print one CI step per sweep point, as JSON a pipeline turns into its own.
+
+    \b
+    Each step: key, label, point, argv and command (`scenario submit FILE
+    --point P`; no --point without a sweep), after (the previous point's
+    key: run after it, passed or failed, so one point holds the hardware at
+    a time) and group (the target's concurrency group for the point's
+    shape: {name, limit}, or null).
+    """
+    points = _resolve(file, (), root, None)
+    target = _target(target_spec, required=False)
+    group_of = getattr(target, "steps_group", None)
+    command = ["scenario", "submit", str(file)]
+    if root is not None:
+        command += ["--root", str(root)]
+    if target_spec is not None:
+        command += ["--target", target_spec]
+    found: list[dict[str, Any]] = []
+    previous = None
+    for resolved in points:
+        try:
+            planned = plan(resolved)
+        except PlanError as error:
+            _fail(str(error), EXIT_PROBLEMS)
+        argv = list(command)
+        name = planned.scenario_name
+        if resolved.point is not None:
+            argv += ["--point", resolved.point]
+            name += f" {resolved.point}"
+        key = _slug(f"{resolved.ref}-{resolved.point or ''}")
+        group = group_of(planned.shape()) if callable(group_of) else None
+        found.append(
+            {
+                "key": key,
+                "label": name,
+                "point": resolved.point,
+                "argv": argv,
+                "command": shlex.join(argv),
+                "after": previous,
+                "group": (
+                    {"name": group.name, "limit": group.limit} if group else None
+                ),
+            }
+        )
+        previous = key
+    click.echo(json.dumps({"scenario": points[0].ref, "steps": found}, indent=2))
 
 
 # calibrate ----------------------------------------------------------------

@@ -21,7 +21,8 @@ precedence would decide the value, so a clash is an error instead.
 """
 
 import dataclasses
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import (
     Any,
     Literal,
@@ -55,17 +56,46 @@ from scenario.reserved import (
 )
 
 __all__ = [
+    "POD_ENV",
     "TOOL_OWNED_ENV",
     "AfterTask",
+    "CpuPod",
     "EnvNames",
+    "JobPolicy",
     "RoleShape",
     "Shape",
+    "StepGroup",
     "Target",
     "TargetData",
     "TargetInfo",
+    "Volume",
     "ownership_problems",
     "scenario_env_names",
 ]
+
+# The pod contract: the env a target's pods get and the runtime reads, and
+# nothing else passes between them. SCENARIO_RESOLVED and SCENARIO_TARGET_DATA
+# go to the driver's pods only, SCENARIO_HEAD_ADDRESS to server roles, and
+# SCENARIO_ROLE_HOSTS ({role: [host names in index order]}) only when there is
+# more than one role.
+ENV_PLAN = "SCENARIO_PLAN"
+ENV_RESOLVED = "SCENARIO_RESOLVED"
+ENV_HOST_INDEX = "SCENARIO_HOST_INDEX"
+ENV_ADVERTISE_IP = "SCENARIO_ADVERTISE_IP"
+ENV_HEAD_ADDRESS = "SCENARIO_HEAD_ADDRESS"
+ENV_ROLE_HOSTS = "SCENARIO_ROLE_HOSTS"
+ENV_IMAGE = "SCENARIO_IMAGE"
+ENV_TARGET_DATA = "SCENARIO_TARGET_DATA"
+POD_ENV = (
+    ENV_PLAN,
+    ENV_RESOLVED,
+    ENV_HOST_INDEX,
+    ENV_ADVERTISE_IP,
+    ENV_HEAD_ADDRESS,
+    ENV_ROLE_HOSTS,
+    ENV_IMAGE,
+    ENV_TARGET_DATA,
+)
 
 
 class TargetInfo(NamedTuple):
@@ -118,9 +148,55 @@ class Target(Protocol):
         """The env names this target sets; a scenario may not set them."""
         ...
 
-    def submit(self, plan: Plan) -> int:
-        """Run the Plan; the exit code of its driver."""
+    def submit(self, plan: Plan, resolved: Mapping[str, Any] | None = None) -> int:
+        """Run the Plan; the exit code of its driver.
+
+        `resolved` is the point's resolved scenario ({point, scenario}),
+        recorded beside the results; the Plan alone decides what runs.
+        """
         ...
+
+
+@dataclass(frozen=True)
+class Volume:
+    """An emptyDir a target mounts into one role's pods."""
+
+    name: str
+    mount_path: str
+    # "Memory" for tmpfs, "" for the node's disk.
+    medium: Literal["Memory", ""] = "Memory"
+    # A quantity such as 16Gi; a chipless pod's memory volume needs one.
+    size_limit: str | None = None
+
+
+@dataclass(frozen=True)
+class CpuPod:
+    """Where the chipless driver's pod goes, beside what the tool renders."""
+
+    node_selector: Mapping[str, str] = field(default_factory=dict)
+    service_account: str | None = None
+
+
+@dataclass(frozen=True)
+class JobPolicy:
+    """Failure handling of one role's Job; None and False leave a field unset.
+
+    Unset fields let the cluster's own defaults apply.
+    """
+
+    backoff_limit: int | None = None
+    # Fail the Job as soon as the container exits non-zero.
+    fail_on_exit: bool = False
+    # The JobSet's failurePolicy.maxRestarts; roles that set it must agree.
+    max_restarts: int | None = None
+
+
+@dataclass(frozen=True)
+class StepGroup:
+    """A CI concurrency group a scenario step joins: at most `limit` at once."""
+
+    name: str
+    limit: int = 1
 
 
 @dataclass(frozen=True)

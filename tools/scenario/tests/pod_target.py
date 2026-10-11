@@ -21,7 +21,9 @@ variants; like plan_fixtures.py it is imported by name, so checks over a
 repository's own scenarios can run it too.
 """
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
+from typing import Any
 
 from scenario.plan import codec
 from scenario.plan.types import CLIENT_ROLE, Plan
@@ -51,7 +53,7 @@ class PodTarget:
     def reserved_env(self) -> EnvNames:
         return self.reserved
 
-    def submit(self, plan: Plan) -> int:
+    def submit(self, plan: Plan, resolved: Mapping[str, Any] | None = None) -> int:
         problems = ownership_problems(plan, self.reserved)
         if problems:
             raise ValueError("; ".join(problems))

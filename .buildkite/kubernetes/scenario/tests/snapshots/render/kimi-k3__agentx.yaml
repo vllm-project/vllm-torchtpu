@@ -1,0 +1,91 @@
+# kimi-k3/agentx points: c1, c2, c4, c8
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: '${WORKLOAD_NAME}'
+  annotations:
+    tpu-ci.google.com/defaults: standard
+spec:
+  network:
+    enableDNSHostnames: true
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - server
+  replicatedJobs:
+    - name: server
+      replicas: 1
+      template:
+        metadata:
+          annotations:
+            alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+        spec:
+          parallelism: 4
+          completions: 4
+          completionMode: Indexed
+          template:
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+                cloud.google.com/gke-tpu-topology: '2x2x4'
+              tolerations:
+                - key: google.com/tpu
+                  operator: Equal
+                  value: present
+                  effect: NoSchedule
+              containers:
+                - name: workload
+                  image: '${IMAGE}'
+                  command:
+                    - scenario
+                    - run
+                    - '--role'
+                    - server
+                  ports:
+                    - containerPort: 8000
+                    - containerPort: 8090
+                  resources:
+                    limits:
+                      google.com/tpu: '4'
+                    requests:
+                      google.com/tpu: '4'
+                  env:
+                    - name: SCENARIO_PLAN
+                      value: <SCENARIO_PLAN>
+                    - name: SCENARIO_RESOLVED
+                      value: <SCENARIO_RESOLVED>
+                    - name: SCENARIO_HOST_INDEX
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: "metadata.annotations['batch.kubernetes.io/job-completion-index']"
+                    - name: SCENARIO_ADVERTISE_IP
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: status.podIP
+                    - name: SCENARIO_HEAD_ADDRESS
+                      value: '${WORKLOAD_NAME}-server-0-0.${WORKLOAD_NAME}'
+                    - name: SCENARIO_IMAGE
+                      value: '${IMAGE}'
+                    - name: SCENARIO_TARGET_DATA
+                      value: <SCENARIO_TARGET_DATA>
+                    - name: VLLM_CACHE_ROOT
+                      value: /cache/jax/vllm
+                    - name: VLLM_XLA_CACHE_PATH
+                      value: /cache/jax/xla
+                    - name: HF_DATASETS_CACHE
+                      value: /cache/hf/hub/datasets
+                    - name: RAY_LOG_TO_STDERR
+                      value: '1'
+                    - name: FORCE_COLOR
+                      value: '1'
+                    - name: TQDM_MININTERVAL
+                      value: '30'
+                  volumeMounts:
+                    - name: vllm-profile-cache
+                      mountPath: /cache/jax/vllm/profile_cache
+              volumes:
+                - name: vllm-profile-cache
+                  emptyDir:
+                    medium: Memory
+                    sizeLimit: '16Gi'
