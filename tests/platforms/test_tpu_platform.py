@@ -1592,3 +1592,45 @@ def test_a_bad_peer_wait_fails_at_startup(monkeypatch, wait):
     monkeypatch.setenv("TPU_PRECOMPILE_PEER_WAIT_S", wait)
     with pytest.raises(ValueError, match="TPU_PRECOMPILE_PEER_WAIT_S"):
         _validate_peer_replay_config()
+
+
+def test_set_additional_forward_context_caches_dp_num_tokens_tpu_tensor(monkeypatch):
+    """Repeated calls with the same num_tokens_across_dp tuple reuse the cached
+    device tensor instead of calling .to('tpu') on every forward context."""
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    monkeypatch.setattr(TpuPlatform, "_dp_tokens_tpu_cache", {})
+    to_calls = []
+
+    class FakeCpuTensor:
+        def __init__(self, vals):
+            self.device = SimpleNamespace(type="cpu")
+            self.dtype = torch.int32
+            self._vals = list(vals)
+
+        def numel(self):
+            return len(self._vals)
+
+        def item(self):
+            return self._vals[0]
+
+        def tolist(self):
+            return list(self._vals)
+
+        def to(self, device):
+            to_calls.append((tuple(self._vals), device))
+            return SimpleNamespace(dtype=self.dtype, vals=tuple(self._vals))
+
+    dp_metadata_1 = SimpleNamespace(num_tokens_across_dp_cpu=FakeCpuTensor([64]))
+    dp_metadata_2 = SimpleNamespace(num_tokens_across_dp_cpu=FakeCpuTensor([64]))
+    dp_metadata_3 = SimpleNamespace(num_tokens_across_dp_cpu=FakeCpuTensor([16]))
+
+    TpuPlatform.set_additional_forward_context(dp_metadata=dp_metadata_1)
+    TpuPlatform.set_additional_forward_context(dp_metadata=dp_metadata_2)
+    assert dp_metadata_1.num_tokens_across_dp_cpu.vals == (64,)
+    assert dp_metadata_2.num_tokens_across_dp_cpu is dp_metadata_1.num_tokens_across_dp_cpu
+    assert to_calls == [((64,), "tpu")]
+
+    TpuPlatform.set_additional_forward_context(dp_metadata=dp_metadata_3)
+    assert dp_metadata_3.num_tokens_across_dp_cpu.vals == (16,)
+    assert len(to_calls) == 2
