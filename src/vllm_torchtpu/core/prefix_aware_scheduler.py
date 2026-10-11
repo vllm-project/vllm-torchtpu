@@ -118,6 +118,9 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._paw_cold_tokens = 0
         self._paw_prompt_tokens = 0
         self._paw_scoring_broken = False
+        self._is_disagg = (
+            or getattr(self, "connector", None) is not None
+        )
         self._enable_memo_xstep()
 
         logger.info(
