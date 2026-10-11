@@ -297,15 +297,23 @@ class Eagle3Proposer:
         on a sequence-parallel layer: rows at or above
         `sequence_parallel.min_rows()` are sliced, except under the MTP step-0
         post-attention gather, whose rows shrink mid-layer and so always run
-        replicated. The caller records it with `sequence_parallel.set_active`
-        before the compiled forward, so the MoE dispatch / combine agree with
-        the model's own chunking.
+        replicated. Because compiled draft programs (`draft_model`,
+        `_mtp_fused_loop`, `_mtp_loop_model`) are traced once at the first
+        padded token bucket outside `shape_variants.warmup()`, a runner whose
+        smallest padded bucket is below `min_rows()` traces them replicated and
+        must keep `rows_sliced=False` across every bucket of that trace.
         """
-        return (
-            self._draft_sequence_parallel
-            and step0_gather_indices is None
-            and int(num_tokens) >= sequence_parallel.min_rows()
-        )
+        if not self._draft_sequence_parallel or step0_gather_indices is not None:
+            return False
+        min_rows = sequence_parallel.min_rows()
+        paddings = getattr(self.runner, "num_tokens_paddings", None)
+        if (
+            paddings
+            and not getattr(self.runner, "enforce_eager", False)
+            and int(paddings[0]) < min_rows
+        ):
+            return False
+        return int(num_tokens) >= min_rows
 
     def _rank_padding_counts(
         self, num_valid_tokens: int, num_tokens: int, rows_sliced: bool
@@ -424,7 +432,7 @@ class Eagle3Proposer:
             and self.speculative_config.method == "mtp"
             and not self._share_mtp_indices
             and not self._draft_kv_shared
-            and self.speculative_config.num_speculative_tokens > 1
+            and getattr(self.speculative_config, "num_speculative_tokens", 1) > 1
         ):
             # Step 0 traces with the post-attention gather baked in, so the
             # per-step loop's steps 1..K-1 need a program of their own.
@@ -2986,6 +2994,9 @@ class Eagle3Proposer:
                 and not self._share_mtp_indices
                 and not self._draft_kv_shared
                 and not runner._dp_lockstep_enabled()
+                # Runtime never takes this path under PCP (the layout plan is
+                # not ALL), so do not precompile it there either.
+                and not getattr(runner, "_pcp_enabled", False)
                 and is_step0_post_attn_gather_installed(self.draft_model)
             )
             if self._mtp_fused_loop is not None or step0_post_attn_gather:

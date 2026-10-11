@@ -293,6 +293,16 @@ def permute_router_rows(name: str, tensor):
     them)."""
     if not enabled() or not _ROUTER_RE.search(name):
         return tensor
+    # A placement table permutes experts across EP ranks. Without EP (e.g. a
+    # TP or PCP disagg leg that inherits a recipe-wide TPU_EXPERT_PLACEMENT)
+    # the expert weights stay in natural order, so the router must too.
+    try:
+        from vllm.config import get_current_vllm_config
+
+        if not get_current_vllm_config().parallel_config.enable_expert_parallel:
+            return tensor
+    except Exception:  # noqa: BLE001, S110 - no config context: keep prior behavior
+        pass
     layer = layer_index(name)
     if layer is None or str(layer) not in data()["layers"]:
         return tensor

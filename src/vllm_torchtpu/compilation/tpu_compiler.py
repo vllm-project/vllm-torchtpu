@@ -117,6 +117,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     "TPU_KV_WARMUP_ENABLED",
     "TPU_NODE_ID",
     "TPU_P2P_WAIT_PULL_TIMEOUT",
+    "TPU_PREFILL_SKIP_VERIFY_WARMUP",
     "TPU_RAIDEN_INLINE_LOAD",
     "TPU_RAIDEN_POOL_STAGING_LEASES",
     "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT",
@@ -398,6 +399,37 @@ def _single_size(compile_range: Range) -> int | None:
     return compile_range.start if compile_range.is_single_size() else None
 
 
+def _concretize_int_placeholders(
+    graph: fx.GraphModule | None, example_inputs: list[Any]
+) -> None:
+    """Substitute concrete int example_inputs into SymInt placeholders in-place.
+
+    PiecewiseBackend.create_concrete_args converts SymInt placeholders into
+    concrete Python ints for each single-size bucket. However, _run_backend
+    ensures FakeTensorMode has a ShapeEnv so AOTAutogradCache can serialize,
+    which causes aot_autograd.process_inputs to convert Python int arguments
+    back into fresh SymInts. If the FX graph uses those placeholders in shape
+    expressions (e.g. aten.empty.memory_format in all_gather after an SP chunk),
+    the post-AOT graph still carries SymInt args into fx_to_mlir's
+    EagerLikeFxInterpreter under unset_fake_temporarily(), failing in C++
+    KernelFunction_impl.h:123 ("SymIntArrayRef expected to contain only concrete
+    integers"). Replacing all uses of int placeholders with their concrete int
+    values (while keeping the placeholder nodes themselves so input arity and
+    graph_signature are unchanged) keeps all bucket shapes concrete.
+    """
+    if graph is None:
+        return
+    placeholders = [n for n in graph.graph.nodes if n.op == "placeholder"]
+    changed = False
+    for node, val in zip(placeholders, example_inputs):
+        if type(val) is int and node.users:
+            node.replace_all_uses_with(val)
+            changed = True
+    if changed:
+        graph.graph.lint()
+        graph.recompile()
+
+
 class TpuCompilerAdaptor(CompilerInterface):
     """CompilerInterface implementation for TPU.
 
@@ -458,6 +490,8 @@ class TpuCompilerAdaptor(CompilerInterface):
         the backend attached no `serialize`, which it skips for dynamic-symint
         graphs and in debug mode (see TpuBackend.__call__).
         """
+        _concretize_int_placeholders(graph, example_inputs)
+
         # `_tpu_backend` calls detect_fake_mode(), which asserts a single
         # FakeTensorMode. The Dynamo tracing context's mode differs from the
         # example inputs' mode, so run under a context built from the example

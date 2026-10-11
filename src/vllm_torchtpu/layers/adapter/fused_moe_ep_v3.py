@@ -71,7 +71,6 @@ from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, Config, fused_ep_moe
 from vllm_torchtpu.kernels.fused_moe.v3 import layer as _latest_layer
 from vllm_torchtpu.kernels.fused_moe.v3 import layout as _latest_layout
 from vllm_torchtpu.layers.adapter.fused_moe_ep import (
-    _pcp_size,
     _squeeze_channel_scale,
     _squeeze_channel_scale_checked,
     _unsupported_routing_reason,
@@ -558,23 +557,10 @@ def prebuild_fused_moe_ep(layer, topk: int, renormalize: bool, activation: str) 
     # where each rank holds its own slice of the batch; a replicated step
     # stays off the kernel (`_fused_kernel_takes` in the FP8 method), since
     # the op would do ep_size times the expert work for one batch of output.
-    # Prefill context parallelism retains vLLM's outer PCP all-gather and
-    # reduce-scatter when `pcp_size > 1 and not use_all2all_kernels`.
-    # `_patch_moe_explicit_pcp_collectives` enforces that condition for
-    # `use_ep and pcp_size > 1 and dp_size == 1`. The fused kernel already
-    # combines every expert contribution, so the outer reduce-scatter
-    # would multiply its result by pcp_size. Refuse this combination.
-    pcp = _pcp_size(layer)
-    if pcp > 1:
-        logger.warning_once(
-            "Fused EP MoE not engaged: prefill context parallelism "
-            "(pcp_size=%d) keeps vLLM's own all-gather/reduce-scatter around "
-            "the layer, and this kernel already combines over every expert, "
-            "so arming both would multiply the MoE output by %d.",
-            pcp,
-            pcp,
-        )
-        return
+    # Under prefill context parallelism, VllmMoERunner.
+    # _fused_ep_owns_pcp_collectives drops vLLM's outer PCP all-gather and
+    # reduce-scatter for every layer this kernel arms, so the kernel's own
+    # cross-expert combine is the only reduction.
 
     tp = _tensor_parallel_size()
     # Read here, under the loader's config context, and kept for the traced

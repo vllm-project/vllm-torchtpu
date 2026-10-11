@@ -121,6 +121,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_STAGE3_STATUS_PROBE_S: float = 1.0
     TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT: bool = True
     TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S: float = 30.0
+    TPU_PREFILL_SKIP_VERIFY_WARMUP: bool = False
     TPU_RAIDEN_TEST_REGISTRATION_DELAY_S: float = 0.0
     TPU_KV_STAGE_WAIT_TIMEOUT_SECS: float = 30.0
     TPU_KV_SHM_POOL_GB: float = 128.0
@@ -635,7 +636,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_KERNEL_RELOAD_MODULES": lambda: os.getenv("TPU_KERNEL_RELOAD_MODULES", ""),
     # Greedy steps without logprobs or grammar take the vocabulary-parallel
     # argmax (runner/greedy_top_tokens.py) instead of gathering the logits.
-    "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS"),
+    "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS", default=True),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
     # Tile size for MLA transpose pipeline.
@@ -894,6 +895,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S": env_float(
         "TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S", 30.0
     ),
+    # Skip rejection sampler and decode/verify warmup on kv_producer nodes.
+    "TPU_PREFILL_SKIP_VERIFY_WARMUP": env_bool(
+        "TPU_PREFILL_SKIP_VERIFY_WARMUP", default=False
+    ),
     # TEST-ONLY fault injection, in seconds; 0 disables it.
     "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S": env_float(
         "TPU_RAIDEN_TEST_REGISTRATION_DELAY_S", 0.0
@@ -997,7 +1002,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Scheduler: keep the trailing prefix-cache block that EAGLE/MTP normally
     # drops (controls vLLM's disable_eagle_block_drop). Host-only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(
-        "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", default=False
+        "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", default=True
     ),
     # Secret for the KV-transfer IPC socket; "" derives one from the host.
     # Read raw, not through env_str: a secret's bytes must not be trimmed.
@@ -1036,13 +1041,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
         "VLLM_TPU_FAST_TOKEN_SUBSTITUTION", default=True
     ),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
-    # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
+    # (spec_decode/mtp_fused_loop.py).
     # TODO: support the two cases that still take the per-step loop:
     #   - GLM-5.2 / Gemma-4 MTP: IndexShare's per-chunk top-k restore, and a
     #     KV-sharing draft's fixed positions and seq_lens.
     #   - EP-DP lockstep: run_dp_dummy_draft only replays the per-step
     #     collective trace.
-    "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
+    "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP", default=True),
     # Gather last-token rows immediately after self_attn.attn(q, k, v) on MTP
     # draft step 0 so gate, o_proj, post-attention norm, MoE, and final RMSNorm
     # execute on p = pad(num_reqs) rows instead of all T verify rows.
@@ -1054,7 +1059,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 0 searches the full vocab. Used only when every active request has
     # 1 <= top_k <= value // 2 and no grammar mask applies.
     "TPU_SAMPLER_TOPK_CANDIDATES": env_nonnegative_int(
-        "TPU_SAMPLER_TOPK_CANDIDATES", 0
+        "TPU_SAMPLER_TOPK_CANDIDATES", 64
     ),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the

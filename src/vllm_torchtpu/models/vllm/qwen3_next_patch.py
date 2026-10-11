@@ -137,16 +137,17 @@ def _legal_tile(rows: int, cap: int) -> int:
 
 
 def _select_gate_q_tile(rows: int, cols: int) -> int:
-    """Select multiple-of-8 tile cap for [rows, cols] sigmoid-gate + FP8 quant.
+    """Select multiple-of-32 tile cap for [rows, cols] sigmoid-gate + FP8 quant.
 
-    Keeps live fp32 arrays within the 64-VREG hardware file (preventing multi-MiB
-    VMEM spills at N=2048) and ensures grid >= 6 at decode/verify batch sizes
-    (N=96, 128) so double-buffered VMEM DMAs overlap with compute.
+    2D float8_e4m3fn outputs have hardware tiling (32, 128), so any sub-block
+    smaller than `rows` must have `bm % 32 == 0`. Keeps live fp32 arrays within
+    the 64-VREG hardware file (preventing multi-MiB VMEM spills at N=2048 or
+    TP=2 cols=4096) and bounds VMEM DMA windows at decode/verify batch sizes.
     """
     vregs_per_row = max(1, (cols + 1023) // 1024)
-    vreg_cap = max(16, (64 // vregs_per_row // 8) * 8)
+    vreg_cap = max(32, (64 // vregs_per_row // 32) * 32)
     if rows <= 256:
-        dma_cap = max(8, (rows // 6 // 8) * 8)
+        dma_cap = max(32, (rows // 6 // 32) * 32)
         return min(vreg_cap, dma_cap)
     return vreg_cap
 
@@ -806,20 +807,26 @@ def patched_sparse_moe_forward(
         hidden_states=hidden_states,
         router_logits=router_logits,
     )
-    # When Fused EP v3 owns dispatch (`USE_MOE_FUSED_EP_KERNEL=1`),
-    # `_apply_owning_dispatch_v3` already performs `ep.combine` (all-reduce for
-    # SP=0, or in-kernel combine for SP=1). When `USE_MOE_FUSED_EP_KERNEL=0` and
-    # `se_is_replicated=False`, `skip_final_all_reduce=True` leaves
-    # `final_hidden_states` unreduced across EP/TP so it can be all-reduced
-    # together with `shared_output`.
+    # When Fused EP (v3 or v2) owns dispatch (`USE_MOE_FUSED_EP_KERNEL=1`),
+    # `self.experts(...)` already returns `final_hidden_states` reduced across
+    # EP/TP (`_apply_owning_dispatch_v3` or `fused_moe_ep` v2). When
+    # `USE_MOE_FUSED_EP_KERNEL=0` and `se_is_replicated=False`,
+    # `skip_final_all_reduce=True` leaves `final_hidden_states` unreduced across
+    # EP/TP so it can be all-reduced together with `shared_output`.
+    from vllm_torchtpu.layers.adapter.fused_moe_ep import (
+        fused_moe_ep_supported as fused_moe_ep_v2_supported,
+    )
     from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
         fused_moe_ep_supported as fused_moe_ep_v3_supported,
     )
 
     routed_experts = getattr(self.experts, "routed_experts", self.experts)
-    v3_owns_combine = envs.USE_MOE_FUSED_EP_KERNEL and (
+    qm = getattr(routed_experts, "quant_method", None)
+    fused_ep_owns_combine = envs.USE_MOE_FUSED_EP_KERNEL and (
         fused_moe_ep_v3_supported(routed_experts)
-        or fused_moe_ep_v3_supported(getattr(routed_experts, "quant_method", None))
+        or fused_moe_ep_v3_supported(qm)
+        or fused_moe_ep_v2_supported(routed_experts)
+        or fused_moe_ep_v2_supported(qm)
     )
     se_is_replicated = bool(
         getattr(self, "_fused_se_is_replicated", False)
@@ -829,7 +836,7 @@ def patched_sparse_moe_forward(
     if se_is_replicated:
         final_hidden_states = final_hidden_states + shared_output
     else:
-        if tp_size > 1 and v3_owns_combine:
+        if tp_size > 1 and fused_ep_owns_combine:
             shared_output = tensor_model_parallel_all_reduce(shared_output)
             final_hidden_states = final_hidden_states + shared_output
         else:
@@ -987,9 +994,20 @@ def _rows_are_sequence_parallel(num_tokens: int) -> bool:
     A step below `sequence_parallel.min_rows()` keeps its rows replicated, and
     so does the MTP step-0 post-attention gather, whose rows shrink mid-layer.
     The runner records the same decision with `sequence_parallel.set_active`
-    for the MoE dispatch and combine.
+    for the MoE dispatch and combine. Non-backbone modules compiled outside
+    `shape_variants.warmup()` share a single FX trace across all their compile
+    buckets, so while tracing they read the caller's Python boolean from
+    `sequence_parallel.is_active()` instead of guarding on symbolic
+    `num_tokens`.
     """
-    return _step0_gather_indices is None and num_tokens >= sequence_parallel.min_rows()
+    if _step0_gather_indices is not None:
+        return False
+    if torch.compiler.is_compiling():
+        from vllm_torchtpu.compilation import shape_variants
+
+        if not shape_variants.in_warmup():
+            return sequence_parallel.is_active()
+    return num_tokens >= sequence_parallel.min_rows()
 
 
 def _sp_chunk(layer: Any, x: torch.Tensor) -> torch.Tensor:
@@ -1048,7 +1066,12 @@ def patched_decoder_layer_forward(
         hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
     prequant = None
-    if sp and sequence_parallel.fp8_gather():
+    # A PCP-streaming GDN layer takes bf16 rows, so skip the FP8 pre-gather.
+    use_fp8_gather = sequence_parallel.fp8_gather() and not (
+        self.layer_type == "linear_attention"
+        and getattr(self.linear_attn, "_pcp_streaming_configured", False)
+    )
+    if sp and use_fp8_gather:
         x_q, x_s = linear_common.quantize_rows(hidden_states)
         x_q = tensor_model_parallel_all_gather(x_q, 0).narrow(0, 0, full_num_tokens)
         x_s = tensor_model_parallel_all_gather(x_s, 0).narrow(0, 0, full_num_tokens)

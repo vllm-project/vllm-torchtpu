@@ -69,11 +69,27 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._paw_cold_tokens = 0
         self._paw_prompt_tokens = 0
         self._paw_scoring_broken = False
-        self._srpf_running: bool = bool(envs.TPU_SCHED_SRPF_RUNNING)
-        self._cold_chunk_cap: int = int(envs.TPU_SCHED_COLD_CHUNK_CAP)
+        self._is_disagg = (
+            getattr(getattr(self, "vllm_config", None), "kv_transfer_config", None)
+            is not None
+        )
+        self._srpf_running: bool = (
+            bool(envs.TPU_SCHED_SRPF_RUNNING)
+            if (not self._is_disagg or "TPU_SCHED_SRPF_RUNNING" in os.environ)
+            else False
+        )
+        self._cold_chunk_cap: int = (
+            int(envs.TPU_SCHED_COLD_CHUNK_CAP)
+            if (not self._is_disagg or "TPU_SCHED_COLD_CHUNK_CAP" in os.environ)
+            else 0
+        )
         self._cold_threshold: int = int(envs.TPU_SCHED_COLD_THRESHOLD)
         self._cold_min_decoders: int = int(envs.TPU_SCHED_COLD_MIN_DECODERS)
-        self._step_total_cap: int = int(envs.TPU_SCHED_STEP_TOTAL_CAP)
+        self._step_total_cap: int = (
+            int(envs.TPU_SCHED_STEP_TOTAL_CAP)
+            if (not self._is_disagg or "TPU_SCHED_STEP_TOTAL_CAP" in os.environ)
+            else 0
+        )
         self._warm_streak: int = int(envs.TPU_SCHED_WARM_STREAK)
         self._warm_min_decoders: int = int(envs.TPU_SCHED_WARM_MIN_DECODERS)
         self._step_num_decoding: int = 0
@@ -81,7 +97,8 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._step_prefill_tokens_by_req: dict[int, int] | None = None
         self._pure_decode_streak: int = 999999
         self._retention = None
-        if os.environ.get("TPU_HYBRID_STATE_RETENTION", "1") != "0":
+        retention_default = "0" if self._is_disagg else "1"
+        if os.environ.get("TPU_HYBRID_STATE_RETENTION", retention_default) != "0":
             retention = HybridStateRetention(self.kv_cache_manager)
             if retention.enabled:
                 self._retention = retention
@@ -474,7 +491,9 @@ class PrefixAwareScheduler(AsyncScheduler):
         """Return (sort_key, warmth). Lower sort_key is admitted first."""
         warmth = self._prefix_warmth(request)
         cold_tokens = float(max(request.num_tokens - warmth, 0))
-        if (
+        if getattr(self, "_is_disagg", False):
+            tier = _TIER_PREEMPTED if request.num_preemptions > 0 else _TIER_NORMAL
+        elif (
             free_blocks_for_fit is not None
             and warmth > 0
             and math.ceil(cold_tokens / self._get_block_size()) <= free_blocks_for_fit

@@ -1005,6 +1005,18 @@ class TPUModelRunner(GPUModelRunner):
         pcp_config = PcpStaticSupportValidator.from_vllm_config(vllm_config)
         self._pcp_enabled = pcp_config.enabled
         self._mtp_enabled = pcp_config.speculative_method == "mtp"
+        # A kv_producer only emits the first token, so it never verifies
+        # drafts. With TPU_PREFILL_SKIP_VERIFY_WARMUP=1 its verify-path warmup
+        # (rejection sampler, target-logit structured decoding, spec-decode
+        # dispatch) is skipped: those programs are loaded after the KV cache is
+        # sized, and their bottom-HBM reservations OOM'd MTP prefill warmup.
+        _kv_cfg = vllm_config.kv_transfer_config
+        self._skip_verify_warmup = (self._pcp_enabled and self._mtp_enabled) or (
+            envs.TPU_PREFILL_SKIP_VERIFY_WARMUP
+            and vllm_config.speculative_config is not None
+            and _kv_cfg is not None
+            and _kv_cfg.kv_role == "kv_producer"
+        )
         sequence_layout_planner = create_sequence_layout_planner(vllm_config)
         if sequence_layout_planner.requires_backend_preinit:
             # GPUModelRunner probes torch.cuda.mem_get_info during init. The
@@ -7316,9 +7328,7 @@ class TPUModelRunner(GPUModelRunner):
                 logger.info("  -- num_seqs: %d", num_reqs)
             # Prefill-only PCP MTP K1 skips _precompile_rejection_sampler(), so
             # we skip it here as well.
-            if self.speculative_config is None or (
-                self._pcp_enabled and self._mtp_enabled
-            ):
+            if self.speculative_config is None or self._skip_verify_warmup:
                 return
             # For spec decoding, target logits have padded_logits_length rows.
             max_target_rows = (
@@ -8078,6 +8088,15 @@ class TPUModelRunner(GPUModelRunner):
                         "Skipping rejection replay and decode/verify warmup "
                         "for prefill-only PCP MTP K1"
                     )
+                    self._warmup_pcp_mtp_prefill()
+                elif self._skip_verify_warmup:
+                    logger.info(
+                        "Skipping rejection replay and decode/verify warmup "
+                        "for kv_producer (TPU_PREFILL_SKIP_VERIFY_WARMUP=1)"
+                    )
+                    # The draft's first real call can return symbolic sizes
+                    # (see TPUModelRunner._warmup_spec_decode), so still warm
+                    # the real prefill + propose path, as PCP MTP K1 does.
                     self._warmup_pcp_mtp_prefill()
                 else:
                     self._precompile_rejection_sampler()

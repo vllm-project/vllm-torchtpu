@@ -905,10 +905,14 @@ class TpuPlatform(Platform):
                 os.environ.get("TPU_STREAM_INTERVAL", "1")
             )
 
+        # These defaults are calibrated for a single-host server. A disagg leg
+        # (kv_transfer_config set) gets its scheduler, placement and KV budget
+        # from the recipe, and the single-host KV budget would override it.
         if (
             model_config is not None
             and "Qwen3_5MoeForConditionalGeneration"
             in (model_config.architectures or [])
+            and vllm_config.kv_transfer_config is None
             and os.environ.get("TPU_QWEN35_AUTO_DEFAULTS", "1").strip().lower()
             in ("1", "true", "yes", "on")
         ):

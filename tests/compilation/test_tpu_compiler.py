@@ -477,3 +477,33 @@ class TestTpuCompilerCache:
         compiler._run_backend(None, [])
         compiler._run_backend(None, [])
         assert firsts == [1, 1]
+
+    def test_concretize_int_placeholders(self):
+        """Concrete int arguments replace SymInt placeholder uses in-place
+        while preserving placeholder count and graph signature."""
+        import operator
+
+        import torch
+        import torch.fx as fx
+
+        from vllm_torchtpu.compilation import shape_variants
+        from vllm_torchtpu.compilation.tpu_compiler import (
+            _concretize_int_placeholders,
+        )
+
+        g = fx.Graph()
+        s0 = g.placeholder("s0")
+        x = g.placeholder("x")
+        floordiv = g.call_function(operator.floordiv, (s0, 8))
+        mul = g.call_function(operator.mul, (floordiv, 8))
+        empty = g.call_function(torch.empty, ((mul, 4096),))
+        g.output((x, empty))
+        gm = fx.GraphModule(torch.nn.Module(), g)
+
+        sig_before = shape_variants.graph_signature(gm)
+        example_inputs = [8192, torch.zeros(8192, 4096)]
+        _concretize_int_placeholders(gm, example_inputs)
+
+        assert shape_variants.graph_signature(gm) == sig_before
+        assert len(s0.users) == 0
+        assert floordiv.args == (8192, 8)

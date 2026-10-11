@@ -75,7 +75,7 @@ class MtpLoopStepModel(nn.Module):
             hidden_states,
             intermediate_tensors,
             inputs_embeds,
-            spec_step_idx,
+            spec_step_idx=spec_step_idx,
         )
 
 

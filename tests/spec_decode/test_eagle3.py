@@ -2885,3 +2885,36 @@ def test_run_mtp_fused_loop_records_row_form_and_proposes_step0(
     assert input_ids is None
     assert hidden_shape == (8, 4)
     assert seq_lens_arg is seq_lens
+
+
+def test_mtp_loop_step_model_passes_spec_step_idx_by_keyword():
+    """Draft models like Qwen3_5MoeMTP accept 5 positional args + **kwargs
+    without a positional spec_step_idx parameter."""
+    from vllm_torchtpu.spec_decode.mtp_loop_model import MtpLoopStepModel
+
+    recorded = []
+
+    class _KwargsDraft(torch.nn.Module):
+        def forward(
+            self,
+            input_ids,
+            positions,
+            hidden_states,
+            intermediate_tensors=None,
+            inputs_embeds=None,
+            **kwargs,
+        ):
+            recorded.append((input_ids, positions, kwargs))
+            return hidden_states
+
+    loop_model = object.__new__(MtpLoopStepModel)
+    torch.nn.Module.__init__(loop_model)
+    loop_model.mtp = _KwargsDraft()
+
+    ids = torch.zeros(4, dtype=torch.int32)
+    pos = torch.zeros((4, 4), dtype=torch.int32)
+    hid = torch.zeros((4, 8))
+    out = MtpLoopStepModel.forward(loop_model, ids, pos, hid, spec_step_idx=2)
+    assert out is hid
+    assert len(recorded) == 1
+    assert recorded[0][2] == {"spec_step_idx": 2}
