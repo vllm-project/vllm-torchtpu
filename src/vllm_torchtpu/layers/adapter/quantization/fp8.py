@@ -108,7 +108,7 @@ from vllm_torchtpu.layers.adapter.quantization.online_fp8 import (
 from vllm_torchtpu.layers.core.quant_methods import FP8, get_tpu_quant_method
 from vllm_torchtpu.layers.core.quantization import dequantize_tensor, quantize_tensor
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
@@ -397,18 +397,13 @@ def _quantize_and_format_single_moe_weight(
     w = w.transpose(1, 2).contiguous()
 
     # Reshape scales for GMM kernel.
-    # An `unsqueeze(2)` view on a TPU tensor leaves the persistent
-    # nn.Parameter carrying ambiguous strides (stride[1] == stride[2]) that
-    # torch_tpu's per-op JIT re-emits as a per-step `tt_jit_as_strided`
-    # program at the GMM `pallas.jax_op` boundary. Allocate a fresh 4D
-    # contiguous device buffer with `torch.empty + .copy_` to break the
-    # view chain so the persistent storage is a plain 4D buffer that PJRT
-    # ships to the kernel with row-major layout.
+    # The `unsqueeze(2)` view is backed by the 3-D scale buffer, which
+    # torch_tpu would re-materialize as a per-step `tt_jit_as_strided`
+    # program at the GMM `pallas.jax_op` boundary. `fresh_buffer` gives the
+    # persistent parameter a plain 4-D buffer of its own.
     if w_scale is not None:
         s = w_scale.transpose(1, 2).contiguous().to(torch.float32)
-        w_scale = torch.empty(
-            s.shape[0], s.shape[1], 1, s.shape[2], dtype=s.dtype, device=s.device
-        ).copy_(s.unsqueeze(2))
+        w_scale = fresh_buffer(s.unsqueeze(2))
 
     return w, w_scale
 
@@ -1644,17 +1639,12 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         if not keep_vllm_layout:
             weight = weight.transpose(0, 1)
 
-        # The dequant/requant chain may leave views backed by higher-rank PJRT
-        # buffers. Allocate fresh contiguous persistent parameters so the
-        # matmul boundary sees plain row-major buffers.
-        weight = torch.empty(
-            weight.shape[0], weight.shape[1], dtype=weight.dtype, device=weight.device
-        ).copy_(weight)
-        weight_scale = torch.empty(
-            *weight_scale.shape,
-            dtype=weight_scale.dtype,
-            device=weight_scale.device,
-        ).copy_(weight_scale)
+        # The dequant/requant chain may leave views backed by buffers of a
+        # different shape (e.g. a squeezed [n_out, 1] scale). Give the
+        # persistent parameters buffers of their own shape so the matmul
+        # boundary needs no per-step `tt_jit_as_strided` program.
+        weight = fresh_buffer(weight)
+        weight_scale = fresh_buffer(weight_scale)
 
         replace_parameter(
             layer, "weight", torch.nn.Parameter(weight, requires_grad=False)
