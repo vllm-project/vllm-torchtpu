@@ -24,6 +24,7 @@ from scenario import gen
 from scenario.cli import main
 from scenario.model.rules import rule_table
 from scenario.model.scenario import Defaults, Scenario
+from scenario.plan.plumbing import ITEMS
 from scenario.reserved import AGENTX_CLIENT_ENV, TOOL_ENV
 
 
@@ -101,6 +102,7 @@ def test_reference_lists_everything() -> None:
             for name, field in model.model_fields.items():
                 assert f"| `{field.alias or name}` |" in text, (model, name)
     assert all(f"| {rule.id} |" in text for rule in rule_table())
+    assert all(f"| {item} |" in text for item in ITEMS)
     for name in [*TOOL_ENV, *AGENTX_CLIENT_ENV]:
         assert f"| `{name}` |" in text
 

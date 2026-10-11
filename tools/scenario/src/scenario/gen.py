@@ -14,21 +14,24 @@
 """The generated files: JSON schemas for editors and the reference.
 
 The pydantic models are the only definition of the schema; these files are
-derived from them and the rule table, and committed.
+derived from them, the rule table and the plumbing registry, and committed.
 `scenario dev regen` writes them and `--check` fails when one is stale.
 """
 
 import json
 import pathlib
 import types
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Iterator, Sequence
 from typing import Annotated, Any, Literal, Union, get_args, get_origin
 
 from pydantic import BaseModel, JsonValue
 from pydantic.fields import FieldInfo
 
+from scenario import PLAN_FORMAT
 from scenario.model import baseline, common, scenario, tasks
 from scenario.model.rules import rule_table
+from scenario.plan import argv, codec, plumbing
+from scenario.plan import types as plan_types
 from scenario.reserved import (
     AGENTX_CLIENT_ENV,
     CHIPLESS_DRIVER_ENV,
@@ -353,10 +356,28 @@ def reference() -> str:
     for model in models_of(scenario.Defaults):
         if model not in documented:
             lines += _model_section(model)
+    lines += ["## Arg rendering", ""]
+    lines += table(
+        ("Value", "argv"), [(f"`{v}`" if v == "null" else v, r) for v, r in argv.RULES]
+    )
     lines += ["## Validation rules", ""]
     lines += table(
         ("Rule", "Checked at", "Summary"),
         [(rule.id, rule.stage, rule.summary) for rule in rule_table()],
+    )
+    lines += [
+        "## Derived plumbing",
+        "",
+        "The only values the tool derives. It never adds an engine flag or env var",
+        "because of another value; choices belong in `scenarios/defaults.yaml`.",
+        "",
+    ]
+    lines += table(
+        ("Item", "What", "Rule", "Env it sets"),
+        [
+            (item.id, item.title, item.rule, _code(item.env))
+            for item in sorted(plumbing.ITEMS.values(), key=lambda item: item.id)
+        ],
     )
     lines += [
         "## Reserved names",
@@ -377,9 +398,52 @@ def reference() -> str:
             ("`tasks.eval.lm_eval.model_args`", _code(list(LM_EVAL_MODEL_ARGS))),
         ],
     )
+    lines += [
+        "## Plan format",
+        "",
+        f"This is Plan format {PLAN_FORMAT}; a pod refuses a Plan of another format.",
+        "A Plan is one sweep point, as canonical JSON (sorted keys, compact, ASCII).",
+        "Pods get it in `SCENARIO_PLAN` as base64 of gzip, at most",
+        f"{codec.MAX_ENCODED_BYTES} bytes. Values only a host knows at run time are",
+        "Refs:",
+        "",
+    ]
+    lines += table(("Ref", "Filled with"), list(_ref_rows()))
+    lines += table(
+        ("Port", "Use"),
+        [
+            (str(plan_types.API_PORT), "every server's API"),
+            (str(plan_types.ROUTER_PORT), "the router, on the driver host"),
+            (
+                str(plan_types.STATUS_PORT),
+                "the driver's status, when other hosts wait on it",
+            ),
+            (str(plan_types.DP_RPC_PORT), "mp DP coordination"),
+            (str(plan_types.RAY_PORT), "the Ray head"),
+            (str(plan_types.KV_PORT), "the KV connector"),
+            (str(plan_types.KV_TRANSFER_PORT), "KV transfer"),
+            (str(plan_types.SIDE_CHANNEL_PORT), "the KV side channel"),
+        ],
+    )
     while lines[-1] == "":
         lines.pop()
     return "\n".join(lines) + "\n"
+
+
+def _ref_rows() -> Iterator[tuple[str, str]]:
+    meanings = {
+        "self_ip": "this host's advertise address",
+        "head_ip": "the role's first host, as IPv4",
+        "host_index": "this host's index in its role",
+        "role_head": "the first host of a role by name; 127.0.0.1 on that host",
+        "role_ips": "every host of a role as IPv4, joined by commas",
+        "results_dir": "the run directory",
+        "pulled_model_dir": "an object-storage model's pulled directory, or a fallback",
+        "server_log": "the driver host's own server log",
+        "image": "the image the pods run, as the target set it, else the Plan's",
+    }
+    for kind in get_args(plan_types.RefKind):
+        yield f"`{kind}`", meanings[kind]
 
 
 # Files ------------------------------------------------------------------------

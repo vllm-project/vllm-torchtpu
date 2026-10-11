@@ -432,6 +432,16 @@ tasks.eval.lm_eval values, applied only where tasks.eval.lm_eval is declared.
 | `apply_chat_template` | boolean or null | unset | --apply_chat_template. |
 | `fewshot_as_multiturn` | boolean or null | unset | --fewshot_as_multiturn true. |
 
+## Arg rendering
+
+| Value | argv |
+|---|---|
+| true | --k; for a dotted key, --a.b true |
+| false | --no-k; for a dotted key, --a.b false |
+| integer, number, string | --k \<value> |
+| list, mapping | --k \<compact JSON>, key order kept |
+| `null` | removes the key when layers merge; never rendered |
+
 ## Validation rules
 
 | Rule | Checked at | Summary |
@@ -484,6 +494,36 @@ tasks.eval.lm_eval values, applied only where tasks.eval.lm_eval is declared.
 | V-48 | scenario | kv_offloading dram states its backend and DRAM; none states neither |
 | V-49 | scenario | tasks.agentx runs InferenceX's 1h window; a warning |
 | V-50 | scenario | the AgentX corpus fits max-model-len; a client cap below it is a warning unless fast |
+
+## Derived plumbing
+
+The only values the tool derives. It never adds an engine flag or env var
+because of another value; choices belong in `scenarios/defaults.yaml`.
+
+| Item | What | Rule | Env it sets |
+|---|---|---|---|
+| P-01 | hardware | The role's accelerator, topology, hosts and chips_per_host as written (on server for one role); the tool looks nothing up. | none |
+| P-02 | backend | single when the role has one host, else server.multihost (mp or ray). | none |
+| P-03 | serve argv | vllm serve \<model.path> --served-model-name \<model.name>, the role's args in order, then the wiring flags, and --port 8000 on the role's first host, which serves the API. | none |
+| P-04 | mp DP wiring | Every host of an mp role with several hosts: --data-parallel-size-local \<DP / hosts> --data-parallel-address \<head_ip> --data-parallel-rpc-port 29500. | none |
+| P-05 | mp headless hosts | Hosts after the first of an mp role add --headless --data-parallel-start-rank \<index x DP local>, and leave off --port and the frontend-only flags (api-server-count), which vLLM rejects there. | none |
+| P-06 | backend and host env | An mp role over several hosts: the seven slice names GKE injects set empty, and TPU_MULTIHOST_BACKEND=mp. A ray role over several hosts: RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS=1, TPU_MULTIHOST_BACKEND=ray and JAX_PLATFORMS empty. A single-host role of a multi-role plan: the slice names set empty, TPU_HOST_BOUNDS=1,1,1 and TPU_TOPOLOGY=\<topology>. Every host of a role with several hosts: TPU_SKIP_MDS_QUERY=1. Every host, and the driver's tasks: PYTHONUNBUFFERED=1. The driver's tasks also get TPU_MULTIHOST_BACKEND of the driver's role. | `MEGASCALE_COORDINATOR_ADDRESS`, `MEGASCALE_NUM_SLICES`, `MEGASCALE_PORT`, `MEGASCALE_SLICE_ID`, `TPU_PROCESS_ADDRESSES`, `TPU_PROCESS_PORT`, `TPU_WORKER_HOSTNAMES`, `TPU_MULTIHOST_BACKEND`, `RAY_EXPERIMENTAL_NOSET_TPU_VISIBLE_CHIPS`, `JAX_PLATFORMS`, `TPU_HOST_BOUNDS`, `TPU_TOPOLOGY`, `TPU_SKIP_MDS_QUERY`, `PYTHONUNBUFFERED` |
+| P-07 | ray bring-up | The first host of a ray role runs ray start --head --port=6379 before serve; the others run ray start --address=\<head_ip>:6379 and serve nothing. | none |
+| P-08 | advertise address | VLLM_HOST_IP=\<self_ip> on every host of a role with several hosts or with kv. | `VLLM_HOST_IP` |
+| P-09 | startup timeout | VLLM_ENGINE_READY_TIMEOUT_S=\<server.startup_timeout> on every host; the readiness wait, GET /health on port 8000, lasts startup_timeout + 600 s from the server's start. | `VLLM_ENGINE_READY_TIMEOUT_S` |
+| P-10 | accelerator env | TPU_ACCELERATOR_TYPE=\<accelerator> on every TPU host. | `TPU_ACCELERATOR_TYPE` |
+| P-11 | KV wiring | A role with kv: --kv-transfer-config {kv_connector, kv_connector_module_path, kv_role, kv_port: 14579}, TPU_KV_TRANSFER_PORT=9100 and TPU_SIDE_CHANNEL_PORT=9600. | `TPU_KV_TRANSFER_PORT`, `TPU_SIDE_CHANNEL_PORT` |
+| P-12 | Raiden identity | A role with kv at position r among the roles: TPU_KV_TRANSFER_NAMESPACE=\<role>, TPU_RAIDEN_ENGINE_ID=\<role>-engine, TPU_RAIDEN_JOB_NAME=\<role>, TPU_RAIDEN_RESHARD_PORT_BASE=27000+1000r, TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=27100+1000r and TPU_RAIDEN_ADVERTISE_HOST=\<role_ips:role>, every host's IPv4 in DP-rank order (one address on a single host; the store-mode connector requires it). | `TPU_KV_TRANSFER_NAMESPACE`, `TPU_RAIDEN_ENGINE_ID`, `TPU_RAIDEN_JOB_NAME`, `TPU_RAIDEN_RESHARD_PORT_BASE`, `TPU_RAIDEN_STORE_DISPATCH_PORT_BASE`, `TPU_RAIDEN_ADVERTISE_HOST` |
+| P-13 | router | On the driver host: \<router.command> --host 0.0.0.0 --port 8100 --prefiller-hosts \<role_head:producer> --prefiller-ports 8000 --decoder-hosts \<role_head:consumer> --decoder-ports 8000, then router.args; ready on GET /healthcheck. | none |
+| P-14 | driver and endpoint | One role: its first host drives. Several roles: tasks.driver, a role's first host or a chipless client host. Tasks connect to the router (127.0.0.1:8100) when there is one, else to the driver role's own API (127.0.0.1:8000), or from a client host to the first role's head. | none |
+| P-15 | client tokenizer | --tokenizer \<tasks.perf.tokenizer> when set; else, for an object-storage model.path, --tokenizer \<pulled_model_dir>, which falls back to model.name when the pulled directory holds no config.json; else none. | none |
+| P-16 | result paths | Under \<results_dir>: \<cell>.json per perf cell (the label in cells mode), \<cell>.warmup\<i>.json per warmup pass, lm_eval --output_path \<results_dir> (\<results_dir>/\<task>_c\<N> in a concurrency sweep), agentx_c\<N> for AgentX, and \<results_dir>/inferencex_eval for InferenceX's eval client. | none |
+| P-17 | custom-task env | Every custom task gets SCENARIO_SERVED_MODEL, SCENARIO_RESULTS_DIR (\<results_dir>) and SCENARIO_API_PORT=8000; with one producer and one consumer role PREFILL_URL and DECODE_URL (http://\<role_head>:8000); with a router PROXY_URL=http://127.0.0.1:8100 and SCENARIO_ROUTER_PORT=8100; with several roles SCENARIO_HOST_\<ROLE>=\<role_head:role>; on a role's host SCENARIO_SERVER_LOG. Its env values may use them as ${NAME}; $$ is a literal $. | `SCENARIO_SERVED_MODEL`, `SCENARIO_RESULTS_DIR`, `SCENARIO_API_PORT`, `PREFILL_URL`, `DECODE_URL`, `PROXY_URL`, `SCENARIO_ROUTER_PORT`, `SCENARIO_SERVER_LOG` |
+| P-18 | chipless driver env | A chipless client driver's tasks and router get VLLM_PLUGINS empty and TORCH_DEVICE_BACKEND_AUTOLOAD=0, so vLLM's CLI from the TPU image does not start a TPU platform on a host without chips. | `VLLM_PLUGINS`, `TORCH_DEVICE_BACKEND_AUTOLOAD` |
+| P-19 | remote-code warm | Before serve on mp hosts after the first, when trust-remote-code is set and model.path is object storage: python3 -m scenario.runtime.warm \<model.path>, best effort, at most 600 s, so the hosts do not race to write the model's remote code. | none |
+| P-20 | chips | The chips of the server roles, the sum of hosts x chips_per_host (never TensorCores); InferenceX divides AgentX throughput by them (TP, or PREFILL_TP and DECODE_TP per worker for P/D). | none |
+| P-21 | InferenceX client env | The InferenceX perf client gets PYTHONPATH=\<baked checkout>. The AgentX client gets its baked runtime (AIPERF_RUNTIME_DIR, PYTHONPATH, PYTHONSAFEPATH), the endpoint (AIPERF_SERVER_URL), SERVED_MODEL_NAME=\<model.name>, CONC and DURATION, RESULT_DIR and AGENTIC_OUTPUT_DIR (\<results_dir>), RESULT_FILENAME=agentx_c\<N>, AIPERF_EXPERIMENTAL_FAST from tasks.agentx.fast (1 or 0), EVAL_ONLY=false, IS_AGENTIC=1 and the three Dynamo switches off. For several roles it also gets every role head's /metrics in AIPERF_SERVER_METRICS_URLS, since a router re-exports no engine metrics, and power measurement off. InferenceX's eval client gets PYTHONPATH and PYTHONSAFEPATH, MODEL_NAME=\<model.name>, EVAL_SUITE from tasks.eval.suite, EVAL_ONLY=true and OPENAI_API_KEY=EMPTY. Both get the identity of P-22. | `AIPERF_RUNTIME_DIR`, `PYTHONPATH`, `PYTHONSAFEPATH`, `AIPERF_SERVER_URL`, `AIPERF_SERVER_METRICS_URLS`, `SERVED_MODEL_NAME`, `CONC`, `DURATION`, `RESULT_DIR`, `RESULT_FILENAME`, `AGENTIC_OUTPUT_DIR`, `ENABLE_AGENTX_POWER`, `REQUIRE_POWER`, `IS_AGENTIC`, `EVAL_ONLY`, `AIPERF_EXPERIMENTAL_FAST`, `AIPERF_DYNAMO_SESSION_TIMEOUT_SECONDS`, `AIPERF_USE_DYNAMO_CONV_AWARE_ROUTING`, `AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID`, `MODEL_NAME`, `EVAL_SUITE`, `OPENAI_API_KEY` |
+| P-22 | InferenceX identity | What InferenceX files an AgentX row and the evals of the same deployment under, set alike on both clients so they join: MODEL=\<model.name>, tasks.inferencex (MODEL_PREFIX, PRECISION, FRAMEWORK, SPEC_DECODING, KV_OFFLOADING, and when set KV_OFFLOAD_BACKEND with its JSON metadata, TOTAL_CPU_DRAM_GB, ROUTER_METADATA as JSON and KV_P2P_TRANSFER), RUNNER_TYPE=\<accelerator> and IMAGE=\<the image the pods run>. Sizes are chips (P-20). DP attention is data-parallel-size above 1, as InferenceX reads vLLM. One role: IS_MULTINODE=false, TP=\<chips>, EP_SIZE (\<chips> with enable-expert-parallel, else 1), PP_SIZE, DCP_SIZE and PCP_SIZE 1, DP_ATTENTION. P/D: IS_MULTINODE=true, DISAGG=true, and for the producer and the consumer roles PREFILL_ and DECODE_ NUM_WORKERS, TP (one worker's chips), EP (likewise) and DP_ATTN. | `MODEL`, `MODEL_PREFIX`, `PRECISION`, `FRAMEWORK`, `SPEC_DECODING`, `KV_OFFLOADING`, `KV_OFFLOAD_BACKEND`, `KV_OFFLOAD_BACKEND_METADATA`, `TOTAL_CPU_DRAM_GB`, `ROUTER_METADATA`, `KV_P2P_TRANSFER`, `RUNNER_TYPE`, `IMAGE`, `IS_MULTINODE`, `TP`, `EP_SIZE`, `PP_SIZE`, `DCP_SIZE`, `PCP_SIZE`, `DISAGG`, `PREFILL_NUM_WORKERS`, `PREFILL_TP`, `PREFILL_EP`, `DECODE_NUM_WORKERS`, `DECODE_TP`, `DECODE_EP`, `DP_ATTENTION`, `PREFILL_DP_ATTN`, `DECODE_DP_ATTN` |
 
 ## Reserved names
 
@@ -619,3 +659,34 @@ Arg keys a scenario may not set:
 | `server.router.args` | `host`, `port`, `prefiller-hosts`, `prefiller-host`, `prefiller-ports`, `prefiller-port`, `decoder-hosts`, `decoder-host`, `decoder-ports`, `decoder-port` |
 | `tasks.perf.client_args` | `model`, `tokenizer`, `host`, `port`, `base-url`, `dataset-name`, `dataset-path`, `random-input-len`, `random-output-len`, `sharegpt-output-len`, `random-range-ratio`, `num-prompts`, `num-warmups`, `max-concurrency`, `percentile-metrics`, `temperature`, `extra-body`, `label`, `save-result`, `append-result`, `result-dir`, `result-filename` |
 | `tasks.eval.lm_eval.model_args` | `model`, `base_url` |
+
+## Plan format
+
+This is Plan format 1; a pod refuses a Plan of another format.
+A Plan is one sweep point, as canonical JSON (sorted keys, compact, ASCII).
+Pods get it in `SCENARIO_PLAN` as base64 of gzip, at most
+32768 bytes. Values only a host knows at run time are
+Refs:
+
+| Ref | Filled with |
+|---|---|
+| `self_ip` | this host's advertise address |
+| `head_ip` | the role's first host, as IPv4 |
+| `host_index` | this host's index in its role |
+| `role_head` | the first host of a role by name; 127.0.0.1 on that host |
+| `role_ips` | every host of a role as IPv4, joined by commas |
+| `results_dir` | the run directory |
+| `pulled_model_dir` | an object-storage model's pulled directory, or a fallback |
+| `server_log` | the driver host's own server log |
+| `image` | the image the pods run, as the target set it, else the Plan's |
+
+| Port | Use |
+|---|---|
+| 8000 | every server's API |
+| 8100 | the router, on the driver host |
+| 8090 | the driver's status, when other hosts wait on it |
+| 29500 | mp DP coordination |
+| 6379 | the Ray head |
+| 14579 | the KV connector |
+| 9100 | KV transfer |
+| 9600 | the KV side channel |
