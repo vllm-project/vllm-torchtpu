@@ -1,0 +1,55 @@
+schema: 1
+name: glm-5.2-fp8-dp16-ep
+server:
+  model:
+    name: zai-org/GLM-5.2-FP8
+    path: gs://tpu-commons-ci/glm/GLM-5.2-FP8
+  accelerator: tpu7x
+  topology: 2x2x2
+  hosts: 2
+  chips_per_host: 4
+  multihost: ray
+  startup_timeout: 2h
+  args:
+    load-format: runai_streamer
+    tensor-parallel-size: 1
+    data-parallel-size: 16
+    enable-expert-parallel: true
+    max-model-len: 9216
+    max-num-batched-tokens: 1024
+    max-num-seqs: 64
+    gpu-memory-utilization: 0.90
+    kv-cache-dtype: fp8
+    enable-ep-weight-filter: true
+    safetensors-load-strategy: prefetch
+    tool-call-parser: glm47
+    enable-auto-tool-choice: true
+    reasoning-parser: glm45
+tasks:
+  perf:
+    isl_osl: [[8192, 1024]]
+    concurrency: [1024]
+    num_prompts: 2048
+    random_range_ratio: 0.0
+    temperature: 0
+    warmup_runs: 1
+    baseline:
+      isl8192_osl1024_c1024:
+        completed: 2048
+        num_prompts: 2048
+        median_tpot_ms: 276.99
+        output_token_throughput: 2537.45
+        total_token_throughput: 22837.03
+  eval:
+    lm_eval:
+      tasks: [mmlu_pro]
+      model_args:
+        num_concurrent: 32
+        timeout: 7200
+      fewshot_as_multiturn: false
+      gen_kwargs: "until=['<|im_end|>']"
+    tolerance: 0.025
+    baseline:
+      mmlu_pro:
+        "exact_match,custom-extract": 0.7629
+        "exact_match_stderr,custom-extract": 0.0111

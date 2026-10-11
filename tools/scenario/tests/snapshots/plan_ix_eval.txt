@@ -1,0 +1,118 @@
+plan qwen3.5-397b-gsm8k-1p1d (qwen3.5-397b-gsm8k-1p1d), format 1, tool <version>
+image: the target supplies it
+model: Qwen/Qwen3.5-397B-A17B-FP8, loaded from Qwen/Qwen3.5-397B-A17B-FP8
+
+role prefill: tpu7x 2x2x1, 1 host x 4 chips, single
+  ready: GET :8000/health within 2h10m of the server's start  [P-09]
+  kv: TPURaidenConnector kv_producer  [P-11]
+  host 0 (head)
+    serve: vllm serve Qwen/Qwen3.5-397B-A17B-FP8 --served-model-name Qwen/Qwen3.5-397B-A17B-FP8 \
+               --max-model-len 66560 --enable-expert-parallel --max-num-seqs 8 \
+               --prefill-context-parallel-size 8 \
+               --kv-transfer-config '{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_producer","kv_port":14579}' \
+               --port 8000
+    scenario env:
+      JAX_PLATFORMS=tpu,cpu
+      TPU_KV_SHM_POOL_GB=8
+    tool env:
+      MEGASCALE_COORDINATOR_ADDRESS=  [P-06]
+      MEGASCALE_NUM_SLICES=  [P-06]
+      MEGASCALE_PORT=  [P-06]
+      MEGASCALE_SLICE_ID=  [P-06]
+      PYTHONUNBUFFERED=1  [P-06]
+      TPU_ACCELERATOR_TYPE=tpu7x  [P-10]
+      TPU_HOST_BOUNDS=1,1,1  [P-06]
+      TPU_KV_TRANSFER_NAMESPACE=prefill  [P-12]
+      TPU_KV_TRANSFER_PORT=9100  [P-11]
+      TPU_PROCESS_ADDRESSES=  [P-06]
+      TPU_PROCESS_PORT=  [P-06]
+      TPU_RAIDEN_ADVERTISE_HOST=<role_ips:prefill>  [P-12]
+      TPU_RAIDEN_ENGINE_ID=prefill-engine  [P-12]
+      TPU_RAIDEN_JOB_NAME=prefill  [P-12]
+      TPU_RAIDEN_RESHARD_PORT_BASE=27000  [P-12]
+      TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=27100  [P-12]
+      TPU_SIDE_CHANNEL_PORT=9600  [P-11]
+      TPU_TOPOLOGY=2x2x1  [P-06]
+      TPU_WORKER_HOSTNAMES=  [P-06]
+      VLLM_ENGINE_READY_TIMEOUT_S=7200  [P-09]
+      VLLM_HOST_IP=<self_ip>  [P-08]
+
+role decode: tpu7x 2x2x1, 1 host x 4 chips, single
+  ready: GET :8000/health within 2h10m of the server's start  [P-09]
+  kv: TPURaidenConnector kv_consumer  [P-11]
+  host 0 (head)
+    serve: vllm serve Qwen/Qwen3.5-397B-A17B-FP8 --served-model-name Qwen/Qwen3.5-397B-A17B-FP8 \
+               --max-model-len 66560 --enable-expert-parallel --max-num-seqs 32 \
+               --data-parallel-size 8 \
+               --kv-transfer-config '{"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector","kv_role":"kv_consumer","kv_port":14579}' \
+               --port 8000
+    scenario env:
+      JAX_PLATFORMS=tpu,cpu
+      TPU_KV_SHM_POOL_GB=8
+    tool env:
+      MEGASCALE_COORDINATOR_ADDRESS=  [P-06]
+      MEGASCALE_NUM_SLICES=  [P-06]
+      MEGASCALE_PORT=  [P-06]
+      MEGASCALE_SLICE_ID=  [P-06]
+      PYTHONUNBUFFERED=1  [P-06]
+      TPU_ACCELERATOR_TYPE=tpu7x  [P-10]
+      TPU_HOST_BOUNDS=1,1,1  [P-06]
+      TPU_KV_TRANSFER_NAMESPACE=decode  [P-12]
+      TPU_KV_TRANSFER_PORT=9100  [P-11]
+      TPU_PROCESS_ADDRESSES=  [P-06]
+      TPU_PROCESS_PORT=  [P-06]
+      TPU_RAIDEN_ADVERTISE_HOST=<role_ips:decode>  [P-12]
+      TPU_RAIDEN_ENGINE_ID=decode-engine  [P-12]
+      TPU_RAIDEN_JOB_NAME=decode  [P-12]
+      TPU_RAIDEN_RESHARD_PORT_BASE=28000  [P-12]
+      TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=28100  [P-12]
+      TPU_SIDE_CHANNEL_PORT=9600  [P-11]
+      TPU_TOPOLOGY=2x2x1  [P-06]
+      TPU_WORKER_HOSTNAMES=  [P-06]
+      VLLM_ENGINE_READY_TIMEOUT_S=7200  [P-09]
+      VLLM_HOST_IP=<self_ip>  [P-08]
+
+driver: a chipless client host; tasks connect to 127.0.0.1:8100  [P-14]
+  router: python3 examples/disagg/toy_proxy_server.py --host 0.0.0.0 --port 8100 \
+              --prefiller-hosts <role_head:prefill> --prefiller-ports 8000 \
+              --decoder-hosts <role_head:decode> --decoder-ports 8000
+    ready: GET :8100/healthcheck  [P-13]
+  task env:
+    PYTHONUNBUFFERED=1  [P-06]
+    TORCH_DEVICE_BACKEND_AUTOLOAD=0  [P-18]
+    VLLM_PLUGINS=  [P-18]
+  eval (inferencex)
+    lm-eval: inferencex, gate: InferenceX's score floor
+      run: /opt/infx/runtime/venv/bin/python -m infx.bench eval --endpoint http://127.0.0.1:8100 \
+               --concurrency 4 --stage-to <results_dir>/inferencex_eval --framework lm-eval  (timeout 8h)
+        env:
+          DECODE_DP_ATTN=true  [P-22]
+          DECODE_EP=4  [P-22]
+          DECODE_NUM_WORKERS=1  [P-22]
+          DECODE_TP=4  [P-22]
+          DISAGG=true  [P-22]
+          EVAL_LIMIT=20
+          EVAL_ONLY=true  [P-21]
+          FRAMEWORK=vllm  [P-22]
+          IMAGE=<image>  [P-22]
+          IS_MULTINODE=true  [P-22]
+          KV_OFFLOADING=none  [P-22]
+          MODEL=Qwen/Qwen3.5-397B-A17B-FP8  [P-22]
+          MODEL_NAME=Qwen/Qwen3.5-397B-A17B-FP8  [P-21]
+          MODEL_PREFIX=qwen3.5  [P-22]
+          OPENAI_API_KEY=EMPTY  [P-21]
+          PRECISION=fp8  [P-22]
+          PREFILL_DP_ATTN=false  [P-22]
+          PREFILL_EP=4  [P-22]
+          PREFILL_NUM_WORKERS=1  [P-22]
+          PREFILL_TP=4  [P-22]
+          PYTHONPATH=/opt/infx/InferenceX/inferencex-e2e  [P-21]
+          PYTHONSAFEPATH=1  [P-21]
+          RUNNER_TYPE=tpu7x  [P-22]
+          SPEC_DECODING=none  [P-22]
+      floor: /opt/infx/runtime/venv/bin/python -m infx.evals.validate_scores \
+                 --meta-env <results_dir>/inferencex_eval/meta_env.json \
+                 --results-glob '<results_dir>/inferencex_eval/results*.json' --expected-concs 4
+        env:
+          PYTHONPATH=/opt/infx/InferenceX/inferencex-e2e  [P-21]
+          PYTHONSAFEPATH=1  [P-21]

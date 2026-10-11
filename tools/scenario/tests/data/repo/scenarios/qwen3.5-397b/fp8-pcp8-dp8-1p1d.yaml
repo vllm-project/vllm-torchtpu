@@ -1,0 +1,97 @@
+# Qwen3.5-397B as one prefill engine (PCP 8) and one decode engine (DP 8), each on its
+# own 2x2x1 host, KV over Raiden, a proxy in front and the client on a chipless host.
+schema: 1
+name: qwen3.5-397b-fp8-pcp8-dp8-1p1d
+server:
+  model:
+    name: Qwen/Qwen3.5-397B-A17B-FP8
+  startup_timeout: 2h
+  args:
+    # Neither engine runs a single frontend today; decode keeps vLLM's one per DP rank.
+    api-server-count: null
+    trust-remote-code: true
+    seed: 42
+    max-model-len: 66560
+    block-size: 8192
+    enable-expert-parallel: true
+    disable-custom-all-reduce: true
+    gpu-memory-utilization: 0.9
+    language-model-only: true
+    disable-hybrid-kv-cache-manager: false
+    mamba-cache-mode: align
+    enable-prompt-tokens-details: true
+    enable-log-requests: false
+    async-scheduling: false
+    compilation-config:
+      backend: vllm_torchtpu.compilation.tpu_compiler.TpuCompilerAdaptor
+      inductor_compile_config:
+        enable_auto_functionalized_v2: false
+        size_asserts: false
+        alignment_asserts: false
+        scalar_asserts: false
+  env:
+    JAX_PLATFORMS: tpu,cpu
+    PJRT_DEVICE: TPU
+    TPU_KV_RESHARD_TRANSPORT: raiden
+    TPU_KV_SHM_POOL_GB: "8"
+    TPU_RAIDEN_RESHARD_IMPL: store
+    TPU_USE_RAIDEN_KV_CACHE_MANAGER: "1"
+  roles:
+    prefill:
+      accelerator: tpu7x
+      topology: 2x2x1
+      hosts: 1
+      chips_per_host: 4
+      kv:
+        connector: TPURaidenConnector
+        role: producer
+      args:
+        max-num-batched-tokens: 16384
+        long-prefill-token-threshold: 16384
+        max-num-seqs: 8
+        prefill-context-parallel-size: 8
+        cp-kv-cache-interleave-size: 256
+        compilation-config:
+          compile_sizes: [1024, 2048, 4096, 5120]
+    decode:
+      accelerator: tpu7x
+      topology: 2x2x1
+      hosts: 1
+      chips_per_host: 4
+      kv:
+        connector: TPURaidenConnector
+        role: consumer
+      args:
+        max-num-batched-tokens: 4384
+        max-num-seqs: 32
+        prefill-context-parallel-size: 1
+        data-parallel-size: 8
+        compilation-config:
+          compile_sizes: [8, 16, 32, 4352, 4384]
+  router:
+    type: toy-proxy
+    command: [python3, examples/disagg/toy_proxy_server.py]
+tasks:
+  driver: client
+  perf:
+    random_range_ratio: 0
+    temperature: 0
+    percentile_metrics: [ttft, e2el]
+    client_args:
+      backend: openai
+      endpoint: /v1/completions
+      trust-remote-code: null
+      metric-percentiles: "50,90,99"
+    cells:
+      # Warms the prefill, transfer and decode path before any measured cell.
+      - label: pd_disagg_decode_smoke_c8_i8192_o32
+        isl: 8192
+        osl: 32
+        concurrency: 8
+        num_prompts: 8
+        percentile_metrics: [ttft, tpot, itl, e2el]
+      - label: "pd_disagg_prefill_c{concurrency}_i8192_o1"
+        isl: 8192
+        osl: 1
+        concurrency: [8, 16]
+        num_prompts: 512

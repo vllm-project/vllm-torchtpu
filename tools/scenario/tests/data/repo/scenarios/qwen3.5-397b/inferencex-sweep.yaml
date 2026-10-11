@@ -1,0 +1,42 @@
+# InferenceX's benchmark client against one host, one server per sharding preset.
+schema: 1
+name: qwen3.5-397b-inferencex-sweep
+server:
+  model:
+    name: Qwen/Qwen3.5-397B-A17B-FP8
+  accelerator: tpu7x
+  topology: 2x2x1
+  hosts: 1
+  chips_per_host: 4
+  args:
+    max-model-len: 10240
+    enable-expert-parallel: true
+tasks:
+  perf:
+    client: inferencex
+    isl_osl: [[8192, 1024]]
+    concurrency: [64]
+    random_range_ratio: 0.8
+    num_prompts:
+      per_concurrency: 10
+    num_warmups:
+      per_concurrency: 2
+    client_args:
+      backend: vllm
+      request-rate: inf
+      ignore-eos: true
+      use-chat-template: true
+sweep:
+  points:
+    - name: tp8-c64
+      server:
+        args:
+          tensor-parallel-size: 8
+    - name: dp8-c256
+      server:
+        args:
+          data-parallel-size: 8
+          max-num-seqs: 64
+      tasks:
+        perf:
+          concurrency: [256]

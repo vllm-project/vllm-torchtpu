@@ -1,0 +1,8 @@
+ok     glm-5.2/fp8-dp16-ep             glm-5.2-fp8-dp16-ep             server tpu7x 2x2x2 (2 hosts, ray); perf 1 cell, eval mmlu_pro
+ok     glm-5.2/fp8-dp16-ep-mp          glm-5.2-fp8-mp-dp16-ep          server tpu7x 2x2x2 (2 hosts, mp); perf 1 cell
+ok     kimi-k3/agentx                  kimi-k3-agentx                  server tpu7x 2x2x4 (4 hosts, ray); agentx c1; 4 points: c1, c2, c4, c8
+ok     kimi-k3/tp32-ep                 kimi-k3-tp32-ep                 server tpu7x 2x2x4 (4 hosts, ray); perf 1 cell, eval mmlu_pro
+ok     kimi-k3/tp8-dp4-ep-1p1d         kimi-k3-tp8-dp4-ep-1p1d         prefill tpu7x 2x2x4 (4 hosts, mp), decode tpu7x 2x2x4 (4 hosts, mp), router, driver prefill; custom correctness, eval mmlu_pro
+ok     qwen3.5-397b/fp8-pcp8-dp8-1p1d  qwen3.5-397b-fp8-pcp8-dp8-1p1d  prefill tpu7x 2x2x1, decode tpu7x 2x2x1, router, driver client; perf 3 cells
+ok     qwen3.5-397b/inferencex-sweep   qwen3.5-397b-inferencex-sweep   server tpu7x 2x2x1; perf 1 cell; 2 points: tp8-c64, dp8-c256
+7 scenarios, 0 errors

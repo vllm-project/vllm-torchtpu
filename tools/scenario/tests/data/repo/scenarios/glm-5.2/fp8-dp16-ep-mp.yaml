@@ -1,0 +1,12 @@
+# The same serving setup over vLLM's own multi-node DP instead of Ray: what is under
+# test is the mp bootstrap, so it gates on the Ray scenario's perf baseline.
+schema: 1
+name: glm-5.2-fp8-mp-dp16-ep
+extends: glm-5.2/fp8-dp16-ep
+server:
+  multihost: mp
+tasks:
+  perf:
+    baseline:
+      from: glm-5.2/fp8-dp16-ep
+  eval: null

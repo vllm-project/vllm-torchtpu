@@ -1,0 +1,55 @@
+# Kimi-K3 at TP32 with EP over a 4-host v7x slice; single-request latency probe.
+schema: 1
+name: kimi-k3-tp32-ep
+server:
+  model:
+    name: moonshotai/Kimi-K3
+    path: gs://tpu-commons-ci/moonshootai/kimi/k3
+  accelerator: tpu7x
+  topology: 2x2x4
+  hosts: 4
+  chips_per_host: 4
+  multihost: ray
+  startup_timeout: 4h
+  args:
+    load-format: runai_streamer
+    tensor-parallel-size: 32
+    enable-expert-parallel: true
+    max-model-len: 10240
+    max-num-batched-tokens: 8192
+    max-num-seqs: 8
+    gpu-memory-utilization: 0.82
+    trust-remote-code: true
+    limit-mm-per-prompt:
+      image: 0
+      video: 0
+    block-size: 256
+    compilation-config:
+      compile_sizes: [1, 8, 8192]
+tasks:
+  perf:
+    isl_osl: [[8192, 1024]]
+    concurrency: [1]
+    num_prompts: 64
+    random_range_ratio: 0.0
+    temperature: 0
+    baseline:
+      _source:
+        description: Values from a nightly build on main.
+      isl8192_osl1024_c1:
+        completed: 64
+        median_tpot_ms: 19.2
+        median_ttft_ms: 1573.3
+  eval:
+    lm_eval:
+      tasks: [mmlu_pro]
+      model_args:
+        num_concurrent: 16
+      fewshot_as_multiturn: false
+      gen_kwargs:
+        chat_template_kwargs:
+          thinking: false
+    tolerance: 0.025
+    baseline:
+      mmlu_pro:
+        "exact_match,custom-extract": 0.8342857142857143

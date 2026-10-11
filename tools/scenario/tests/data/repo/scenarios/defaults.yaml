@@ -1,0 +1,49 @@
+# Choices every scenario starts from. A scenario overrides any of them; null deletes one.
+schema: 1
+server:
+  startup_timeout: 2h
+  args:
+    tensor-parallel-size: 1
+    data-parallel-size: 1
+    max-model-len: 16384
+    max-num-batched-tokens: 8192
+    max-num-seqs: 512
+    async-scheduling: true
+    enable-prefix-caching: false
+    gpu-memory-utilization: 0.95
+    kv-cache-dtype: fp8
+    attention-backend: CUSTOM
+    # One API frontend, not one per DP rank: per-rank frontends race resolving the model.
+    api-server-count: 1
+tasks:
+  inferencex:
+    framework: vllm
+    spec_decoding: none
+    kv_offloading: none
+  perf:
+    dataset:
+      name: random
+    num_prompts: 320
+    range_ratio_style: symmetric
+    warmup_runs: 0
+    percentile_metrics: [ttft, tpot, itl, e2el]
+    tolerance: 0.05
+    client_args:
+      backend: vllm
+      trust-remote-code: true
+      request-rate: inf
+      ignore-eos: true
+      seed: 42
+  agentx:
+    duration: 1h
+    timeout: 3h
+  eval:
+    lm_eval:
+      model: local-chat-completions
+      model_args:
+        num_concurrent: 128
+      seed: "0,1234,None,1234"
+      limit: 100
+      apply_chat_template: true
+      fewshot_as_multiturn: true
+      gen_kwargs: '{"continue_final_message": true, "add_generation_prompt": false, "chat_template_kwargs": {"enable_thinking": false}}'

@@ -1,0 +1,33 @@
+plan qwen3.5-397b-inferencex-sweep (qwen3.5-397b/inferencex-sweep), format 1, tool <version>
+point: dp8-c256
+image: the target supplies it
+model: Qwen/Qwen3.5-397B-A17B-FP8, loaded from Qwen/Qwen3.5-397B-A17B-FP8
+
+role server: tpu7x 2x2x1, 1 host x 4 chips, single
+  ready: GET :8000/health within 2h10m of the server's start  [P-09]
+  host 0 (head)
+    serve: vllm serve Qwen/Qwen3.5-397B-A17B-FP8 --served-model-name Qwen/Qwen3.5-397B-A17B-FP8 \
+               --tensor-parallel-size 1 --max-num-batched-tokens 8192 --async-scheduling \
+               --no-enable-prefix-caching --gpu-memory-utilization 0.95 --kv-cache-dtype fp8 \
+               --attention-backend CUSTOM --api-server-count 1 --max-model-len 10240 \
+               --enable-expert-parallel --data-parallel-size 8 --max-num-seqs 64 --port 8000
+    scenario env: none
+    tool env:
+      PYTHONUNBUFFERED=1  [P-06]
+      TPU_ACCELERATOR_TYPE=tpu7x  [P-10]
+      VLLM_ENGINE_READY_TIMEOUT_S=7200  [P-09]
+
+driver: server host 0; tasks connect to 127.0.0.1:8000  [P-14]
+  task env:
+    PYTHONUNBUFFERED=1  [P-06]
+  perf (inferencex, product): 1 cell, no gate
+    isl8192_osl1024_c256
+      run: python3 -m infx.bench_serving.benchmark_serving --model Qwen/Qwen3.5-397B-A17B-FP8 \
+               --backend vllm --request-rate inf --ignore-eos --use-chat-template \
+               --base-url http://127.0.0.1:8000 --dataset-name random --random-input-len 8192 \
+               --random-output-len 1024 --random-range-ratio 0.8 --num-prompts 2560 \
+               --max-concurrency 256 --num-warmups 512 --percentile-metrics ttft,tpot,itl,e2el \
+               --save-result --result-dir <results_dir> \
+               --result-filename isl8192_osl1024_c256.json
+        env:
+          PYTHONPATH=/opt/infx/InferenceX/inferencex-e2e  [P-21]
