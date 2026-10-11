@@ -197,3 +197,67 @@ def test_mk_ab_calibrator_and_hooks(monkeypatch):
     mk.record_ab_step(12.5, padded_tokens=16)
     mk.reset_stats()
     assert mk._step_mix == {} and mk.ab_calibrator.counts == {}
+
+
+def test_pallas_allreduce_hier1_uses_cross_core_offsets_357(monkeypatch):
+    class _FakeRef:
+        def __init__(self, tag="ref"):
+            self.tag = tag
+
+        @property
+        def at(self):
+            return self
+
+        def __getitem__(self, item):
+            return _FakeRef(f"{self.tag}[{item}]")
+
+    recorded = []
+
+    def _fake_remote_copy(
+        *, src_ref, dst_ref, send_sem, recv_sem, device_id, device_id_type
+    ):
+        recorded.append((src_ref.tag, dst_ref.tag, device_id[0]))
+        return SimpleNamespace(
+            start=lambda: None, wait_recv=lambda: None, wait_send=lambda: None
+        )
+
+    monkeypatch.setattr(
+        collectives.pltpu, "make_async_remote_copy", _fake_remote_copy
+    )
+    scr = {
+        k: _FakeRef(k)
+        for k in (
+            "send",
+            "recv",
+            "ag_send",
+            "ag_recv",
+            "s2_send",
+            "s2_recv",
+            "ar_ssem",
+            "ar_rsem",
+        )
+    }
+
+    for me in range(8):
+        recorded.clear()
+        ctx_h1 = SimpleNamespace(
+            HIER=1, RSAG=False, R=8, HC2=2048, ARP_H1=False, AR0S=False, scr=scr, me=me
+        )
+        collectives.PallasAllReduce(ctx_h1).ar_copies(slot=0, rnd_i=1)
+        peers_h1 = [dev_id for _, _, dev_id in recorded]
+        assert peers_h1 == [me ^ 3, me ^ 5, me ^ 7]
+        # Every cross-chip peer is on the opposite core (bit 0 flipped) and
+        # covers the other 3 chips in order (chip ^ 1, chip ^ 2, chip ^ 3).
+        assert [(p & 1) for p in peers_h1] == [1 - (me & 1)] * 3
+        assert [p // 2 for p in peers_h1] == [
+            (me // 2) ^ 1,
+            (me // 2) ^ 2,
+            (me // 2) ^ 3,
+        ]
+
+    recorded.clear()
+    ctx_h2 = SimpleNamespace(
+        HIER=2, RSAG=False, R=8, HC2=2048, ARP_H1=False, AR0S=False, scr=scr, me=0
+    )
+    collectives.PallasAllReduce(ctx_h2).ar_copies(slot=0, rnd_i=1)
+    assert [dev_id for _, _, dev_id in recorded] == [2, 4, 6]

@@ -71,7 +71,8 @@ class PallasAllReduce:
                     ]
             elif rnd_i == 1 or (HIER == 1 and rnd_i == 2):
                 src = scr["ag_send"].at[slot]
-                peers = list(enumerate((2, 4, 6)))
+                cross_offs = (3, 5, 7) if (HIER == 1 and R == 8) else (2, 4, 6)
+                peers = list(enumerate(cross_offs))
                 dst = scr["ag_recv"].at[slot, me // 2]
                 if HIER == 1 and ARP_H1 and (slot == 1 or AR0S):
                     hl = pl.ds((rnd_i - 1) * HC2, HC2)
