@@ -141,6 +141,19 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       rm -rf /workspace/vllm-torchtpu/vllm ; \
     fi
 
+# The scenario tool (tools/scenario), whose `scenario run` is a scenario pod's
+# command. Installed against what the image already holds: every installed
+# package is a constraint, and the build fails if the install added anything
+# but the tool and ruamel.yaml or changed any version, so vLLM's resolution
+# still decides every shared package.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip freeze --system --exclude-editable > /tmp/scenario-before.txt \
+ && uv pip install --system -c /tmp/scenario-before.txt ./tools/scenario \
+ && uv pip freeze --system --exclude-editable > /tmp/scenario-after.txt \
+ && python3 tools/scenario/ci/check_freeze_delta.py /tmp/scenario-before.txt /tmp/scenario-after.txt \
+ && rm /tmp/scenario-before.txt /tmp/scenario-after.txt \
+ && scenario --version
+
 ENV PYTHONPATH="/workspace/vllm-torchtpu/src:/workspace/vllm-torchtpu"
 CMD ["/bin/bash"]
 
