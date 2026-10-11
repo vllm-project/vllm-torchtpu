@@ -50,6 +50,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     is_pcp_streaming_attention_metadata,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import fresh_buffer
 
 from .collective_ops import FusedPrefillCollectives
 
@@ -642,10 +643,9 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         # `fused` is the lazy result of a stack of views, and torch_tpu
         # re-materializes that lineage as a per-step `tt_jit_as_strided`
         # program at the dispatched op's boundary (same failure mode and fix as
-        # the w_scale case in quantization/fp8.py). A fresh buffer filled by
-        # copy_ breaks the lazy chain so PJRT ships a plain row-major buffer.
-        out = torch.empty_like(fused)
-        out.copy_(fused)
+        # the w_scale case in quantization/fp8.py). `fresh_buffer` breaks the
+        # lazy chain so PJRT ships a plain row-major buffer.
+        out = fresh_buffer(fused)
         self.conv_weight_fused = out
         self._pack_prefill_projection()
 
