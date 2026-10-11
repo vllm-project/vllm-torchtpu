@@ -1,0 +1,49 @@
+# Temporary: the golden check of the CI scenarios against today's kube scripts
+# (.buildkite/kubernetes/scenario/golden). M4 deletes this workflow with
+# golden/ and today's kube scripts.
+#
+# Path filter: the tool, the CI scenarios, the checks over them and this file,
+# as in scenario.yml, so other pull requests neither run it nor fail on it. An
+# edit to one of today's scripts can still break the check, so a weekday
+# schedule runs it against main and reports that drift.
+name: scenario-golden
+
+on:
+  pull_request:
+    paths:
+      - "tools/scenario/**"
+      - ".buildkite/kubernetes/scenarios/**"
+      - ".buildkite/kubernetes/scenario/**"
+      - ".github/workflows/scenario-golden.yml"
+  push:
+    branches: [main]
+    paths:
+      - "tools/scenario/**"
+      - ".buildkite/kubernetes/scenarios/**"
+      - ".buildkite/kubernetes/scenario/**"
+      - ".github/workflows/scenario-golden.yml"
+  schedule:
+    - cron: "17 13 * * 1-5"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  golden:
+    if: github.repository == 'vllm-project/vllm-torchtpu'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          # The version that wrote tools/scenario/uv.lock, as in scenario.yml.
+          version: "0.12.15"
+      # -c keeps the root project's pytest settings out. The check runs
+      # today's bash with stub programs; ubuntu-24.04's bash is new enough.
+      - name: Golden check (Python 3.12)
+        run: >-
+          uv run --project tools/scenario --frozen --python 3.12
+          pytest -c tools/scenario/pyproject.toml .buildkite/kubernetes/scenario/golden
