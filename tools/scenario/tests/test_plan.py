@@ -345,10 +345,14 @@ def test_p17_custom_task_env(variants: dict[str, Data]) -> None:
 
 
 def test_p18_chipless_driver_env(variants: dict[str, Data]) -> None:
-    assert {"VLLM_PLUGINS": "", "TORCH_DEVICE_BACKEND_AUTOLOAD": "0"}.items() <= env(
-        build(variants["pd"]).driver.task_env
-    ).items()
-    assert "VLLM_PLUGINS" not in env(build(variants["k3_pd"]).driver.task_env)
+    chipless = {
+        "VLLM_PLUGINS": "",
+        "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
+        "PYTHONPATH": Ref("libtpu_block"),
+    }
+    assert chipless.items() <= env(build(variants["pd"]).driver.task_env).items()
+    on_role = env(build(variants["k3_pd"]).driver.task_env)
+    assert not set(chipless) & set(on_role)
 
 
 def test_p19_remote_code_warm(variants: dict[str, Data]) -> None:

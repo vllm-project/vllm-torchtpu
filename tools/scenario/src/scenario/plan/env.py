@@ -14,23 +14,31 @@
 """Env the tool sets: which plumbing item owns a name, and ${NAME} values."""
 
 import re
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 
 from scenario.plan.plumbing import ITEMS
 from scenario.plan.types import Value, concat
 
-_ENV_RULES = {name: item.id for item in ITEMS.values() for name in item.env}
+_ENV_RULES: dict[str, list[str]] = {}
+for _item in ITEMS.values():
+    for _name in _item.env:
+        _ENV_RULES.setdefault(_name, []).append(_item.id)
 _HOST_PREFIX = "SCENARIO_HOST_"
 _REFERENCE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
-def env_rule(name: str) -> str | None:
-    """The plumbing item that sets env `name`, or None for scenario env."""
-    if name in _ENV_RULES:
-        return _ENV_RULES[name]
+def env_rule(name: str, within: Collection[str] | None = None) -> str | None:
+    """The plumbing item that sets env `name`, or None for scenario env.
+
+    A name that several items set (PYTHONPATH: P-18 and P-21) goes to the
+    last of them, unless `within` names the items that apply where it is.
+    """
+    rules = _ENV_RULES.get(name, [])
     if name.startswith(_HOST_PREFIX):
-        return "P-17"
-    return None
+        rules = [*rules, "P-17"]
+    if within is not None:
+        rules = [rule for rule in rules if rule in within]
+    return rules[-1] if rules else None
 
 
 def substitute(text: str, provided: Mapping[str, Value]) -> Value:

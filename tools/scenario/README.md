@@ -218,19 +218,20 @@ fleet target will live in `.buildkite/kubernetes/scenario/` as well.
 4. stops the server's whole process group, and exits with a code that names
    what failed.
 
-A failed task does not stop the next one; a dead server does. The run
-directory is `<results root>/<name>`, plus `/<point>` for a sweep point; the
-root is `--results-dir`, else the target's, else
-`./scenario-results/<name>-<UTC stamp>`.
+A failed task does not stop the next one; a dead server does. Core dumps
+are off for the run and everything it starts: a TPU server's core is about
+the size of its host memory. The run directory is `<results root>/<name>`,
+plus `/<point>` for a sweep point; the root is `--results-dir`, else the
+target's, else `./scenario-results/<name>-<UTC stamp>`.
 
 | Exit | Meaning |
 |---|---|
 | 0 | every task passed (a soft gate may have failed) |
 | 1 | a task failed: a command, a hard gate, a missing result |
 | 2 | usage, scenario, Plan or placement error |
-| 3 | bring-up failed before the server started (a name, a taken port) |
+| 3 | bring-up failed (a name, a taken port, the Ray cluster, a driver that never answered) |
 | 4 | the server was not ready: it died starting, or the wait ran out |
-| 5 | the server died after it was ready |
+| 5 | a server or the router died after it was ready |
 | 6 | a fatal after-task failed while every task passed |
 | 7 | the driver aborted or was lost (hosts that wait on a driver) |
 | 130, 143 | SIGINT, SIGTERM |
@@ -241,8 +242,46 @@ its placement from `SCENARIO_HOST_INDEX`, `SCENARIO_HEAD_ADDRESS`,
 names win. `SCENARIO_TARGET_DATA` carries the target's after-tasks (uploads)
 and its lm_eval request cache root; a local run has neither.
 
-This version runs single-host, single-role scenarios. Hosts that wait on a
-driver (multi-host, multi-role) come next.
+A scenario over several hosts runs `scenario run` on every host, with the
+same Plan:
+
+```
+host-a$ scenario run FILE --host-index 0 --head-address host-a --advertise-ip 10.0.0.1
+host-b$ scenario run FILE --host-index 1 --head-address host-a --advertise-ip 10.0.0.2
+```
+
+The first host of the role drives. It serves its status on port 8090, waits
+for its server (on an mp head, that is every host joining; a Ray head
+starts its server only once every host is a Ray node with TPUs), runs the
+tasks and says how the run ended. Every other host starts its own part at
+once: the remote-code warm when the Plan has it, then its `--headless`
+server, or `ray start` once the Ray head answers. `ray start` gets the
+scenario's env, so every Ray worker inherits it, and `ray stop --force`
+ends every Ray host.
+It asks for the driver's status every 2 s and leaves with 0 when the
+driver is done, 7 when it aborted or has not answered for 20 s, and 4 or 5
+when its own server dies (before or after the driver was serving). It
+writes its `summary.json` and `server.log` under `<run dir>/<role>-<index>`.
+
+A scenario of several roles runs `scenario run --role ROLE` on every host,
+with every role's hosts in `--role-hosts` (or `SCENARIO_ROLE_HOSTS`), the
+chipless `client` included when the scenario has one:
+
+```
+scenario run FILE --role decode --host-index 0 --advertise-ip 10.0.0.2 \
+  --role-hosts 'prefill=p0;decode=d0;client=c0'
+```
+
+The driver is the part `tasks.driver` names: a role's first host, or the
+client, a host without chips that runs no server. After its own server it
+waits for each other role's head (`GET /health` on its API port, for that
+role's readiness wait plus 1800 s from the driver's start, since its host
+may start later), then starts the router and gives it 120 s to answer its
+health check. A router that dies stops the tasks with exit 5. A chipless
+driver's router and tasks get `VLLM_PLUGINS` empty,
+`TORCH_DEVICE_BACKEND_AUTOLOAD=0` and the tool's libtpu blocker first on
+`PYTHONPATH`, so vLLM's CLI from the TPU image finds no TPU on that host.
+The other roles' hosts follow the driver as a multi-host role's do.
 
 ## Usage
 

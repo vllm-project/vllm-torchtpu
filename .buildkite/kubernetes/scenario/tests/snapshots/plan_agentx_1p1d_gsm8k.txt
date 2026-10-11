@@ -465,6 +465,7 @@ driver: a chipless client host; tasks connect to 127.0.0.1:8100  [P-14]
               --decoder-hosts <role_head:decode> --decoder-ports 8000
     ready: GET :8100/healthcheck  [P-13]
   task env:
+    PYTHONPATH=<libtpu_block>  [P-18]
     PYTHONUNBUFFERED=1  [P-06]
     TORCH_DEVICE_BACKEND_AUTOLOAD=0  [P-18]
     VLLM_PLUGINS=  [P-18]

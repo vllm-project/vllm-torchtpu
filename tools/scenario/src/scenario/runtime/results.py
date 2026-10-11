@@ -17,7 +17,9 @@ Root: the --results-dir flag, else the target's results root, else
 ./scenario-results/<name>-<UTC stamp>. The run directory is <root>/<name>,
 plus /<point> for a sweep point. It holds today's result file names and a
 config.json of today's shape, so the existing uploaders read it unchanged,
-plus scenario_run.json (what ran) and summary.json (how it went).
+plus scenario_run.json (what ran) and summary.json (how it went). Hosts
+that follow the driver write their summary.json and server.log under
+<run dir>/<role>-<index>.
 """
 
 import json
@@ -37,6 +39,7 @@ CONFIG = "config.json"
 SCENARIO_RUN = "scenario_run.json"
 SUMMARY = "summary.json"
 SERVER_LOG = "server.log"
+ROUTER_LOG = "router.log"
 
 
 def results_root(
@@ -52,6 +55,15 @@ def results_root(
 def run_dir(root: pathlib.Path, plan: Plan) -> pathlib.Path:
     found = root / plan.scenario_name
     return found / plan.point if plan.point is not None else found
+
+
+def part_dir(run: pathlib.Path, role: str, index: int) -> pathlib.Path:
+    """Where a host that follows the driver keeps its summary and server log.
+
+    The run directory is the driver's; a follower's files go in a directory
+    of their own, so hosts that share a filesystem never write the same file.
+    """
+    return run / f"{role}-{index}"
 
 
 def write_json(path: pathlib.Path, data: Any) -> None:

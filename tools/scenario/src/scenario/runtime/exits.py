@@ -36,8 +36,8 @@ MEANINGS = {
     TASK_FAILED: "a task failed: a command exited non-zero, a hard gate failed, "
     "a result is missing, or a cell had too many failed requests",
     USAGE: "usage, Plan or placement error",
-    BRINGUP: "bring-up failed before the server started: a name did not "
-    "resolve, a port was taken",
+    BRINGUP: "bring-up failed: a name did not resolve, a port was taken, the "
+    "Ray cluster did not form, or the driver never answered",
     NOT_READY: "a server was not ready: it died while starting, or the "
     "readiness wait ran out",
     SERVER_DIED: "a server or router died after it was ready",

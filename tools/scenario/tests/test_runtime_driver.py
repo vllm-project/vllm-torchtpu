@@ -39,6 +39,7 @@ from scenario.plan.types import Command, Plan
 from scenario.runtime import exits
 from scenario.runtime.context import TaskContext, TaskOutcome
 from scenario.runtime.driver import RunOptions, run
+from scenario.runtime.placement import PlacementFlags
 from scenario.runtime.proc import Proc
 
 pytestmark = pytest.mark.usefixtures("api_port", "fast_polls")
@@ -114,6 +115,8 @@ def test_a_run_serves_drives_and_tears_down(tmp_path: pathlib.Path) -> None:
     assert served["env"]["TINY_KNOB"] == "1"
     assert served["env"]["VLLM_ENGINE_READY_TIMEOUT_S"] == "600"
     assert served["env"]["TPU_ACCELERATOR_TYPE"] == "tpu7x"
+    # Core dumps are off for everything the run starts.
+    assert served["core_limit"] == 0
     assert "INFO stub: serving test/tiny" in (out / "server.log").read_text()
     assert no_stray_processes(env)
 
@@ -335,10 +338,12 @@ def _ready(url: str) -> bool:
     return net.http_status(f"{url}/health") == 200
 
 
-def test_several_hosts_wait_for_a_later_version(
-    tmp_path: pathlib.Path, variants: dict[str, Data]
+def test_a_host_of_another_role_needs_the_role_hosts(
+    tmp_path: pathlib.Path, variants: dict[str, Data], capsys: Any
 ) -> None:
     env = stub_env(tmp_path)
-    plan = build(variants["single"])
-    assert run(plan, options(tmp_path, env), {}) == exits.USAGE
+    plan = build(variants["pd"])
+    flags = PlacementFlags(role="prefill")
+    assert run(plan, options(tmp_path, env, flags=flags), {}) == exits.USAGE
+    assert "set SCENARIO_ROLE_HOSTS or pass --role-hosts" in capsys.readouterr().out
     assert not (tmp_path / "results").exists()

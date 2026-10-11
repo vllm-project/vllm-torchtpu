@@ -90,6 +90,12 @@ def port_open(host: str, port: int, timeout_s: float = CONNECT_TIMEOUT_S) -> boo
 
 def http_status(url: str, timeout_s: float = READ_TIMEOUT_S) -> int | None:
     """The status of GET `url`, or None when no answer came."""
+    found = http_get(url, timeout_s)
+    return None if found is None else found[0]
+
+
+def http_get(url: str, timeout_s: float = READ_TIMEOUT_S) -> tuple[int, bytes] | None:
+    """The status and body of GET `url`, or None when no answer came."""
     parts = urllib.parse.urlsplit(url)
     if parts.scheme != "http" or parts.hostname is None:
         raise ValueError(f"not an http URL: {url}")
@@ -105,8 +111,7 @@ def http_status(url: str, timeout_s: float = READ_TIMEOUT_S) -> int | None:
         conn.sock.settimeout(timeout_s)
         conn.request("GET", path)
         response = conn.getresponse()
-        response.read()
-        return response.status
+        return response.status, response.read()
     except (OSError, http.client.HTTPException):
         return None
     finally:

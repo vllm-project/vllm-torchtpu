@@ -18,6 +18,8 @@ as a Scenario on its own.
 """
 
 import copy
+import resource
+from collections.abc import Iterator
 from typing import Any
 
 import pytest
@@ -290,6 +292,14 @@ def api_port(monkeypatch: pytest.MonkeyPatch) -> int:
     port = free_port()
     monkeypatch.setattr(plumbing, "API_PORT", port)
     return port
+
+
+@pytest.fixture(autouse=True)
+def core_limit() -> Iterator[None]:
+    """Put back the core-file limit a run in this process turns off."""
+    limits = resource.getrlimit(resource.RLIMIT_CORE)
+    yield
+    resource.setrlimit(resource.RLIMIT_CORE, limits)
 
 
 @pytest.fixture

@@ -45,7 +45,7 @@ from scenario.reserved import (
     TOOL_ENV,
     TOOL_ENV_PREFIXES,
 )
-from scenario.runtime import bringup, context, exits, net, proc
+from scenario.runtime import bringup, context, control, exits, net, proc
 
 SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
 REFERENCE = "REFERENCE.md"
@@ -455,6 +455,48 @@ def reference() -> str:
                 f"{context.REMOTE_HEALTH_TIMEOUT_S} s",
             ),
             ("a timed-out command's status", str(proc.TIMEOUT_STATUS)),
+            (
+                "hosts that wait on the driver ask for its status every",
+                f"{control.POLL_S:g} s",
+            ),
+            (
+                "such a host leaves (exit 7) once the driver has not answered for",
+                f"{control.GONE_S:g} s",
+            ),
+            (
+                "such a host gives up (exit 3) without a first answer after",
+                f"{control.FIRST_CONTACT_S:g} s",
+            ),
+            (
+                "after its end, the driver waits for every such host to ask, at most",
+                f"{control.LINGER_S:g} s",
+            ),
+            (
+                "after an abort, at most",
+                f"{control.ABORT_LINGER_S:g} s",
+            ),
+            (
+                f"a Ray worker probes the head's port every "
+                f"{bringup.RAY_JOIN_PROBE_S:g} s, gives up after",
+                f"{bringup.RAY_JOIN_TIMEOUT_S:g} s",
+            ),
+            (
+                f"the Ray head counts nodes with TPUs every "
+                f"{bringup.RAY_CLUSTER_POLL_S:g} s, gives up after",
+                f"{bringup.RAY_CLUSTER_TIMEOUT_S:g} s",
+            ),
+            (
+                "the driver asks the other roles' heads for readiness every",
+                f"{bringup.REMOTE_POLL_S:g} s",
+            ),
+            (
+                "and waits their readiness wait from its own start, plus",
+                f"{net.RESOLVE_TIMEOUT_S} s",
+            ),
+            (
+                "the router answers its health check from its start within",
+                f"{bringup.ROUTER_READY_S:g} s",
+            ),
         ],
     )
     while lines[-1] == "":
@@ -465,7 +507,7 @@ def reference() -> str:
 def _ref_rows() -> Iterator[tuple[str, str]]:
     meanings = {
         "self_ip": "this host's advertise address",
-        "head_ip": "the role's first host, as IPv4",
+        "head_ip": "the role's first host as IPv4; its own address on that host",
         "host_index": "this host's index in its role",
         "role_head": "the first host of a role by name; 127.0.0.1 on that host",
         "role_ips": "every host of a role as IPv4, joined by commas",
@@ -473,6 +515,8 @@ def _ref_rows() -> Iterator[tuple[str, str]]:
         "pulled_model_dir": "an object-storage model's pulled directory, or a fallback",
         "server_log": "the driver host's own server log",
         "image": "the image the pods run, as the target set it, else the Plan's",
+        "libtpu_block": "the tool's directory with a libtpu that cannot be "
+        "imported, then the inherited PYTHONPATH",
     }
     for kind in get_args(plan_types.RefKind):
         yield f"`{kind}`", meanings[kind]

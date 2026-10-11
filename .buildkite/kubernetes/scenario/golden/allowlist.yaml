@@ -277,9 +277,22 @@
   today: -y libtpu libtpu-nightly
   plan: null
   reason: >-
-    The chipless driver gets P-18's env (VLLM_PLUGINS empty,
-    TORCH_DEVICE_BACKEND_AUTOLOAD=0), which the manifest also sets, instead of
-    uninstalling libtpu in the pod.
+    The chipless driver hides libtpu with P-18's blocker on PYTHONPATH, below,
+    and gets VLLM_PLUGINS empty and TORCH_DEVICE_BACKEND_AUTOLOAD=0, which the
+    manifest also sets, instead of uninstalling libtpu in the pod.
+
+- scenario: [qwen3.5-397b/fp8-pcp8-dp8-1p1d, kimi-k3/agentx-1p1d]
+  where: "*"
+  kind: env
+  name: PYTHONPATH
+  today: null
+  plan: <libtpu_block>
+  reason: >-
+    P-18 puts the tool's libtpu blocker first on a chipless driver's
+    PYTHONPATH, for its router and tasks: a libtpu that fails to import as an
+    absent one does, so vLLM's platform detection finds no TPU. At run time
+    the pod's own PYTHONPATH follows it. Commands that set their own
+    PYTHONPATH (InferenceX's clients) keep theirs.
 
 - scenario: kimi-k3/agentx-1p1d
   where: router

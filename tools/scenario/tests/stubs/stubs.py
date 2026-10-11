@@ -15,18 +15,25 @@
 
 Run as `python stubs.py <program> <args...>` from a shell shim per program
 name (runtime_helpers.stub_env writes them). Every call is recorded as one
-JSON file under $STUB_RECORDS: the program, argv, env, cwd and pid.
+JSON file under $STUB_RECORDS: the program, argv, env, cwd, pid and soft
+core-file limit.
 
 `vllm serve` is a small OpenAI-compatible HTTP server: /health,
 /v1/models, /v1/completions, /v1/chat/completions and /metrics, plus
 /stub/die, which ends it as a crash would. It forks one child that stands in
-for an engine core. Knobs, all env:
+for an engine core. As the first host of vLLM's multi-node DP (its
+--data-parallel-size-local below --data-parallel-size) it also listens on
+--data-parallel-address:--data-parallel-rpc-port, and /health answers 200
+only once every other host has joined there. With --headless it serves no
+HTTP: it joins that address, and exits 1 when the head goes away, as an
+engine does when it loses its DP group. Knobs, all env:
 
     STUB_SERVE_EXIT=N     exit N at once, before serving
     STUB_READY_AFTER=S    /health answers 503 for S seconds
     STUB_NEVER_READY=1    /health never answers 200
     STUB_DIE_AFTER=S      crash S seconds after start
     STUB_PULL=1           fill $STUB_PULLED_DIR as runai pulls a model
+    STUB_JOIN_TIMEOUT=S   a headless host gives up joining after S seconds
 
 `vllm bench serve` and InferenceX's benchmark_serving (`python3 -m
 infx.bench_serving.benchmark_serving`) ask the server for /v1/models and
@@ -61,15 +68,36 @@ $RESULT_DIR/aiperf_artifacts. Knobs:
     STUB_AGENTX_RESULT=0       write no result
     STUB_AGENTX_VALID=false    aiperf's submission_valid (default true)
 
-`python3` runs the real interpreter for anything but `-m infx...`.
+`ray start --head --port=P` listens on P; `ray start --address=H:P` fails
+unless H:P answers. Either forks a raylet that registers this host's node
+in $STUB_RAY_STATE (as $STUB_HOST, with its env) and lives until stopped;
+`ray start` returns once the node is registered. `ray stop` stops the
+raylets of $STUB_HOST and `ray status` lists the nodes. The stand-in `ray`
+module in the site directory reads the same state. Knobs:
+
+    STUB_RAY_TPU=N             TPUs a node advertises (default 4)
+    STUB_RAY_START_EXIT=N      `ray start` exits N at once
+
+`python3 examples/disagg/toy_proxy_server.py` is the router: /healthcheck,
+and every other request sent to the prefiller (POSTs only) and then the
+decoder, whose answer it returns. Knobs:
+
+    STUB_ROUTER_EXIT=N         exit N at once
+    STUB_ROUTER_DIE_AFTER=S    crash S seconds after start
+
+`python3` runs the real interpreter for anything else but `-m infx...`.
 """
 
+import contextlib
+import fcntl
 import http.client
 import http.server
 import json
 import os
 import pathlib
+import resource
 import signal
+import socket
 import sys
 import threading
 import time
@@ -88,6 +116,7 @@ def record(program: str, argv: list[str], **extra: Any) -> None:
         "env": dict(os.environ),
         "cwd": os.getcwd(),
         "pid": os.getpid(),
+        "core_limit": resource.getrlimit(resource.RLIMIT_CORE)[0],
         **extra,
     }
     path = pathlib.Path(RECORDS) / f"{time.time_ns()}-{os.getpid()}.json"
@@ -114,6 +143,82 @@ def number(name: str, default: float = 0.0) -> float:
 # vllm serve -----------------------------------------------------------------
 
 
+def _crash_later(engine: int) -> None:
+    """Crash STUB_DIE_AFTER seconds from now, when it is set."""
+    die_after = number("STUB_DIE_AFTER")
+    if not die_after:
+        return
+
+    def crash() -> None:
+        time.sleep(die_after)
+        print("ERROR stub: engine core died", flush=True)
+        os.kill(engine, signal.SIGKILL)
+        os._exit(1)
+
+    threading.Thread(target=crash, daemon=True).start()
+
+
+def _dp_address(args: list[str]) -> tuple[str, int] | None:
+    rpc_port = flag(args, "--data-parallel-rpc-port")
+    if rpc_port is None:
+        return None
+    return flag(args, "--data-parallel-address", "127.0.0.1") or "", int(rpc_port)
+
+
+def _dp_head(args: list[str]) -> Callable[[], bool]:
+    """Listen for the other hosts of a multi-node DP; whether all have joined."""
+    size = int(flag(args, "--data-parallel-size", "1") or 1)
+    local = int(flag(args, "--data-parallel-size-local", str(size)) or size)
+    address = _dp_address(args)
+    if address is None or local >= size:
+        return lambda: True
+    expected = size // local - 1
+    joined: list[socket.socket] = []
+    listener = socket.create_server(address)
+
+    def accept() -> None:
+        while True:
+            conn, _ = listener.accept()
+            joined.append(conn)
+            print(f"INFO stub: a host joined ({len(joined)}/{expected})", flush=True)
+
+    threading.Thread(target=accept, daemon=True).start()
+    return lambda: len(joined) >= expected
+
+
+def _headless(args: list[str], engine: int) -> int:
+    """Join the DP head and stay until it goes away."""
+    address = _dp_address(args)
+    assert address is not None, "--headless without --data-parallel-rpc-port"
+
+    def stop(signum: int, frame: Any) -> None:
+        print("INFO stub: shutting down", flush=True)
+        os.kill(engine, signal.SIGTERM)
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, stop)
+    print(f"INFO stub: joining the data-parallel head at {address}", flush=True)
+    deadline = time.monotonic() + number("STUB_JOIN_TIMEOUT", 30)
+    while True:
+        try:
+            conn = socket.create_connection(address, timeout=1)
+            break
+        except OSError:
+            if time.monotonic() >= deadline:
+                print(f"ERROR stub: no data-parallel head at {address}", flush=True)
+                os.kill(engine, signal.SIGKILL)
+                return 1
+            time.sleep(0.05)
+    print(f"INFO stub: joined the data-parallel head at {address}", flush=True)
+    _crash_later(engine)
+    conn.settimeout(None)
+    with contextlib.suppress(OSError):
+        conn.recv(1)
+    print("ERROR stub: lost the data-parallel head", flush=True)
+    os.kill(engine, signal.SIGKILL)
+    return 1
+
+
 def serve(args: list[str]) -> int:
     if "STUB_SERVE_EXIT" in os.environ:
         print("ERROR stub: engine failed to start", flush=True)
@@ -131,6 +236,9 @@ def serve(args: list[str]) -> int:
         while True:
             time.sleep(60)
     record("vllm serve", args, engine_pid=engine)
+    if "--headless" in args:
+        return _headless(args, engine)
+    all_joined = _dp_head(args)
     if os.environ.get("STUB_PULL") == "1":
         pulled = pathlib.Path(os.environ["STUB_PULLED_DIR"])
         pulled.mkdir(parents=True, exist_ok=True)
@@ -147,7 +255,11 @@ def serve(args: list[str]) -> int:
 
         def do_GET(self) -> None:
             if self.path == "/health":
-                ready = not never_ready and time.monotonic() - started >= ready_after
+                ready = (
+                    not never_ready
+                    and time.monotonic() - started >= ready_after
+                    and all_joined()
+                )
                 self.reply(200 if ready else 503, {})
             elif self.path == "/v1/models":
                 card = {"id": served, "object": "model", "max_model_len": max_len}
@@ -178,16 +290,7 @@ def serve(args: list[str]) -> int:
 
     httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
     print(f"INFO stub: serving {served} on port {port}", flush=True)
-    die_after = number("STUB_DIE_AFTER")
-    if die_after:
-
-        def crash() -> None:
-            time.sleep(die_after)
-            print("ERROR stub: engine core died", flush=True)
-            os.kill(engine, signal.SIGKILL)
-            os._exit(1)
-
-        threading.Thread(target=crash, daemon=True).start()
+    _crash_later(engine)
 
     def stop(signum: int, frame: Any) -> None:
         print("INFO stub: shutting down", flush=True)
@@ -281,6 +384,98 @@ def vllm(args: list[str]) -> int:
     return 2
 
 
+# Ray --------------------------------------------------------------------------
+
+
+def _ray_state(change: Callable[[list[dict[str, Any]]], list[dict[str, Any]]]) -> None:
+    """Change the node list in $STUB_RAY_STATE under a lock.
+
+    The file is replaced whole, so readers without the lock never see half.
+    """
+    path = pathlib.Path(os.environ["STUB_RAY_STATE"])
+    with path.with_suffix(".lock").open("w") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        nodes = json.loads(path.read_text()) if path.exists() else []
+        tmp = path.with_suffix(f".{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(change(nodes)))
+        tmp.replace(path)
+
+
+def _ray_nodes() -> list[dict[str, Any]]:
+    path = pathlib.Path(os.environ["STUB_RAY_STATE"])
+    return json.loads(path.read_text()) if path.exists() else []
+
+
+def _raylet(head: socket.socket | None) -> None:
+    """Register this host's node, then live until stopped."""
+    signal.signal(signal.SIGTERM, signal.SIG_DFL)
+    host = os.environ.get("STUB_HOST", "")
+    node = {
+        "host": host,
+        "pid": os.getpid(),
+        "Alive": True,
+        "Resources": {"TPU": float(os.environ.get("STUB_RAY_TPU", "4"))},
+    }
+    _ray_state(lambda nodes: [*nodes, node])
+    record("raylet", [], node=host)
+    print(f"INFO stub raylet: node of {host or 'this host'} registered", flush=True)
+    while True:
+        if head is not None:
+            conn, _ = head.accept()
+            conn.close()
+        else:
+            time.sleep(60)
+
+
+def ray(args: list[str]) -> int:
+    host = os.environ.get("STUB_HOST", "")
+    if args[:1] == ["start"]:
+        if "STUB_RAY_START_EXIT" in os.environ:
+            record("ray start", args)
+            print("ERROR stub: ray start failed", flush=True)
+            return int(os.environ["STUB_RAY_START_EXIT"])
+        head = None
+        address = flag(args, "--address")
+        if address is None:
+            head = socket.create_server(("127.0.0.1", int(flag(args, "--port") or 0)))
+        else:
+            name, _, port = address.rpartition(":")
+            try:
+                socket.create_connection((name, int(port)), timeout=2).close()
+            except OSError:
+                print(f"ConnectionError: no Ray head at {address}", flush=True)
+                record("ray start", args)
+                return 1
+        daemon = os.fork()
+        if daemon == 0:
+            _raylet(head)
+        record("ray start", args, daemon_pid=daemon)
+        deadline = time.monotonic() + 10
+        while not any(n["pid"] == daemon for n in _ray_nodes()):
+            if time.monotonic() >= deadline:
+                return 1
+            time.sleep(0.02)
+        print("Ray runtime started.", flush=True)
+        return 0
+    if args[:1] == ["stop"]:
+        record("ray stop", args)
+        mine = [n for n in _ray_nodes() if n["host"] == host]
+        for node in mine:
+            with contextlib.suppress(ProcessLookupError):
+                os.kill(node["pid"], signal.SIGKILL)
+        _ray_state(lambda nodes: [n for n in nodes if n["host"] != host])
+        print(f"Stopped {len(mine)} Ray processes.", flush=True)
+        return 0
+    if args[:1] == ["status"]:
+        record("ray status", args)
+        nodes = _ray_nodes()
+        tpus = sum(n["Resources"].get("TPU", 0) for n in nodes)
+        print(f"{len(nodes)} nodes, {tpus:g} TPU", flush=True)
+        return 0
+    record("ray", args)
+    return 2
+
+
 # Evals --------------------------------------------------------------------------
 
 METRIC = "exact_match,custom-extract"
@@ -367,9 +562,80 @@ INFX: dict[str, Callable[[list[str]], int]] = {
 }
 
 
+# Router ------------------------------------------------------------------------
+
+
+def router(args: list[str]) -> int:
+    record("router", args)
+    if "STUB_ROUTER_EXIT" in os.environ:
+        print("ERROR stub router: failed to start", flush=True)
+        return int(os.environ["STUB_ROUTER_EXIT"])
+    port = int(flag(args, "--port", "8000") or 8000)
+    prefiller = (flag(args, "--prefiller-hosts"), int(flag(args, "--prefiller-ports")))
+    decoder = (flag(args, "--decoder-hosts"), int(flag(args, "--decoder-ports")))
+
+    class Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self) -> None:
+            if self.path == "/healthcheck":
+                body = b'{"status": "ok"}'
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+            else:
+                self.forward("GET", [decoder])
+
+        def do_POST(self) -> None:
+            self.forward("POST", [prefiller, decoder])
+
+        def forward(self, method: str, targets: list[tuple[Any, int]]) -> None:
+            body = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            status, data = 502, b"{}"
+            for host, target_port in targets:
+                conn = http.client.HTTPConnection(host, target_port, timeout=30)
+                try:
+                    conn.request(method, self.path, body=body or None)
+                    response = conn.getresponse()
+                    status, data = response.status, response.read()
+                except OSError:
+                    status, data = 502, b"{}"
+                finally:
+                    conn.close()
+                if status != 200:
+                    break
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def log_message(self, fmt: str, *values: Any) -> None:
+            print(f"INFO stub router: {fmt % values}", flush=True)
+
+    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    print(
+        f"INFO stub router: on {port}, prefill {prefiller}, decode {decoder}",
+        flush=True,
+    )
+    die_after = number("STUB_ROUTER_DIE_AFTER")
+    if die_after:
+
+        def crash() -> None:
+            time.sleep(die_after)
+            print("ERROR stub router: crashed", flush=True)
+            os._exit(1)
+
+        threading.Thread(target=crash, daemon=True).start()
+    signal.signal(signal.SIGTERM, lambda signum, frame: os._exit(0))
+    httpd.serve_forever()
+    return 0
+
+
 def python3(args: list[str]) -> int:
     if len(args) >= 2 and args[0] == "-m" and args[1] in INFX:
         return INFX[args[1]](args[2:])
+    if args and args[0].endswith("toy_proxy_server.py"):
+        return router(args[1:])
     os.execv(sys.executable, [sys.executable, *args])
     return 1
 
@@ -379,6 +645,7 @@ PROGRAMS: dict[str, Callable[[list[str]], int]] = {
     "python3": python3,
     "lm_eval": lm_eval,
     "evalscope": evalscope,
+    "ray": ray,
 }
 
 

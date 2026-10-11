@@ -20,6 +20,7 @@ runs the same on VMs and under any target that sets those names.
 """
 
 import json
+import os
 import pathlib
 import subprocess
 from collections.abc import Callable, Iterable, Mapping
@@ -42,6 +43,10 @@ ENV_IMAGE = "SCENARIO_IMAGE"
 ENV_TARGET_DATA = "SCENARIO_TARGET_DATA"
 
 LOOPBACK = "127.0.0.1"
+# Its libtpu cannot be imported; first on a chipless driver's PYTHONPATH.
+LIBTPU_BLOCK = pathlib.Path(__file__).resolve().parent / "libtpu_block"
+# Read only to be extended: the libtpu block goes in front of it.
+ENV_PYTHONPATH = "PYTHONPATH"
 
 
 @dataclass(frozen=True)
@@ -264,6 +269,7 @@ class Refs:
         self.server_log = server_log
         self._resolve = resolve
         self._image = env.get(ENV_IMAGE) or plan.image or ""
+        self._pythonpath = env.get(ENV_PYTHONPATH, "")
         self._pulled_dir = pulled_dir or (
             lambda: pulled_model_dir(plan.model_path, env)
         )
@@ -290,13 +296,7 @@ class Refs:
         if ref.kind == "self_ip":
             return self._self_ip()
         if ref.kind == "head_ip":
-            if at.head_address is None:
-                raise RunError(
-                    USAGE,
-                    f"{at.part} needs its role's head address: set "
-                    f"{ENV_HEAD_ADDRESS} or pass --head-address",
-                )
-            return self._ipv4(at.head_address)
+            return self._head_ip()
         if ref.kind == "host_index":
             return str(at.host_index)
         if ref.kind == "role_head":
@@ -327,7 +327,28 @@ class Refs:
             return self._pulled_model_dir(ref)
         if ref.kind == "image":
             return self._image
+        if ref.kind == "libtpu_block":
+            parts = [str(LIBTPU_BLOCK), self._pythonpath]
+            return os.pathsep.join(part for part in parts if part)
         raise RunError(USAGE, f"this runtime cannot fill a {ref.kind} Ref")
+
+    def _head_ip(self) -> str:
+        """The role's first host as IPv4: on that host, its own address.
+
+        Elsewhere the head address, or the role's first listed host, resolved.
+        """
+        at = self.placement
+        if at.host_index == 0 and at.advertise_ip is not None:
+            return at.advertise_ip
+        listed = at.role_hosts.get(at.role)
+        name = at.head_address or (listed[0] if listed else None)
+        if name is None:
+            raise RunError(
+                USAGE,
+                f"{at.part} needs its role's head address: set "
+                f"{ENV_HEAD_ADDRESS} or pass --head-address",
+            )
+        return self._ipv4(name)
 
     def _role_of(self, ref: Ref) -> str:
         if ref.role is None:

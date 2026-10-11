@@ -29,12 +29,13 @@ import io
 import os
 import pathlib
 import re
+import resource
 import signal
 import subprocess
 import sys
 import threading
 import time
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from typing import IO
 
@@ -69,6 +70,17 @@ def capture_output() -> Iterator[io.StringIO]:
     buffer = io.StringIO()
     with _ECHO, contextlib.redirect_stdout(buffer), contextlib.redirect_stderr(buffer):
         yield buffer
+
+
+def disable_core_dumps() -> None:
+    """Make this process's soft core-file limit 0; every child inherits it.
+
+    A TPU server's core is about the size of its host memory. On a pod it
+    fills the node's ephemeral storage, and nothing collects it. The hard
+    limit stays, so a child that wants cores can raise its own soft limit.
+    """
+    _, hard = resource.getrlimit(resource.RLIMIT_CORE)
+    resource.setrlimit(resource.RLIMIT_CORE, (0, hard))
 
 
 def exit_status(returncode: int) -> int:
@@ -310,6 +322,26 @@ class Finished:
 
 # What a timed-out command reports, as timeout(1) does.
 TIMEOUT_STATUS = 124
+# run() calls its `check` this often while the command runs.
+CHECK_EVERY_S = 0.5
+
+
+def _wait(
+    proc: Proc, timeout_s: float | None, check: Callable[[], None] | None
+) -> int | None:
+    if check is None:
+        return proc.wait(timeout_s)
+    deadline = None if timeout_s is None else time.monotonic() + timeout_s
+    while True:
+        step = CHECK_EVERY_S
+        if deadline is not None:
+            step = min(step, max(deadline - time.monotonic(), 0.0))
+        code = proc.wait(step)
+        if code is not None:
+            return code
+        if deadline is not None and time.monotonic() >= deadline:
+            return None
+        check()
 
 
 def run(
@@ -320,14 +352,16 @@ def run(
     log: pathlib.Path | None = None,
     prefix: str = "",
     timeout_s: float | None = None,
+    check: Callable[[], None] | None = None,
 ) -> Finished:
     """Run a command to its end; on a timeout or any exception, stop its group.
 
-    A timeout reports status 124, as timeout(1) does.
+    A timeout reports status 124, as timeout(1) does. `check`, called every
+    CHECK_EVERY_S while the command runs, may raise to stop it.
     """
     proc = Proc(argv, env=env, cwd=cwd, log=log, prefix=prefix).start()
     try:
-        code = proc.wait(timeout_s)
+        code = _wait(proc, timeout_s, check)
     except BaseException:
         proc.stop()
         raise

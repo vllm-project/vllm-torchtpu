@@ -519,7 +519,7 @@ because of another value; choices belong in `scenarios/defaults.yaml`.
 | P-15 | client tokenizer | --tokenizer \<tasks.perf.tokenizer> when set; else, for an object-storage model.path, --tokenizer \<pulled_model_dir>, which falls back to model.name when the pulled directory holds no config.json; else none. | none |
 | P-16 | result paths | Under \<results_dir>: \<cell>.json per perf cell (the label in cells mode), \<cell>.warmup\<i>.json per warmup pass, lm_eval --output_path \<results_dir> (\<results_dir>/\<task>_c\<N> in a concurrency sweep), agentx_c\<N> for AgentX, and \<results_dir>/inferencex_eval for InferenceX's eval client. | none |
 | P-17 | custom-task env | Every custom task gets SCENARIO_SERVED_MODEL, SCENARIO_RESULTS_DIR (\<results_dir>) and SCENARIO_API_PORT=8000; with one producer and one consumer role PREFILL_URL and DECODE_URL (http://\<role_head>:8000); with a router PROXY_URL=http://127.0.0.1:8100 and SCENARIO_ROUTER_PORT=8100; with several roles SCENARIO_HOST_\<ROLE>=\<role_head:role>; on a role's host SCENARIO_SERVER_LOG. Its env values may use them as ${NAME}; $$ is a literal $. | `SCENARIO_SERVED_MODEL`, `SCENARIO_RESULTS_DIR`, `SCENARIO_API_PORT`, `PREFILL_URL`, `DECODE_URL`, `PROXY_URL`, `SCENARIO_ROUTER_PORT`, `SCENARIO_SERVER_LOG` |
-| P-18 | chipless driver env | A chipless client driver's tasks and router get VLLM_PLUGINS empty and TORCH_DEVICE_BACKEND_AUTOLOAD=0, so vLLM's CLI from the TPU image does not start a TPU platform on a host without chips. | `VLLM_PLUGINS`, `TORCH_DEVICE_BACKEND_AUTOLOAD` |
+| P-18 | chipless driver env | A chipless client driver's tasks and router get VLLM_PLUGINS empty, TORCH_DEVICE_BACKEND_AUTOLOAD=0 and PYTHONPATH=\<libtpu_block> (a directory of the tool whose libtpu cannot be imported, ahead of the inherited PYTHONPATH), so vLLM's CLI from the TPU image does not start a TPU platform on a host without chips. | `VLLM_PLUGINS`, `TORCH_DEVICE_BACKEND_AUTOLOAD`, `PYTHONPATH` |
 | P-19 | remote-code warm | Before serve on mp hosts after the first, when trust-remote-code is set and model.path is object storage: python3 -m scenario.runtime.warm \<model.path>, best effort, at most 600 s, so the hosts do not race to write the model's remote code. | none |
 | P-20 | chips | The chips of the server roles, the sum of hosts x chips_per_host (never TensorCores); InferenceX divides AgentX throughput by them (TP, or PREFILL_TP and DECODE_TP per worker for P/D). | none |
 | P-21 | InferenceX client env | The InferenceX perf client gets PYTHONPATH=\<baked checkout>. The AgentX client gets its baked runtime (AIPERF_RUNTIME_DIR, PYTHONPATH, PYTHONSAFEPATH), the endpoint (AIPERF_SERVER_URL), SERVED_MODEL_NAME=\<model.name>, CONC and DURATION, RESULT_DIR and AGENTIC_OUTPUT_DIR (\<results_dir>), RESULT_FILENAME=agentx_c\<N>, AIPERF_EXPERIMENTAL_FAST from tasks.agentx.fast (1 or 0), EVAL_ONLY=false, IS_AGENTIC=1 and the three Dynamo switches off. For several roles it also gets every role head's /metrics in AIPERF_SERVER_METRICS_URLS, since a router re-exports no engine metrics, and power measurement off. InferenceX's eval client gets PYTHONPATH and PYTHONSAFEPATH, MODEL_NAME=\<model.name>, EVAL_SUITE from tasks.eval.suite, EVAL_ONLY=true and OPENAI_API_KEY=EMPTY. Both get the identity of P-22. | `AIPERF_RUNTIME_DIR`, `PYTHONPATH`, `PYTHONSAFEPATH`, `AIPERF_SERVER_URL`, `AIPERF_SERVER_METRICS_URLS`, `SERVED_MODEL_NAME`, `CONC`, `DURATION`, `RESULT_DIR`, `RESULT_FILENAME`, `AGENTIC_OUTPUT_DIR`, `ENABLE_AGENTX_POWER`, `REQUIRE_POWER`, `IS_AGENTIC`, `EVAL_ONLY`, `AIPERF_EXPERIMENTAL_FAST`, `AIPERF_DYNAMO_SESSION_TIMEOUT_SECONDS`, `AIPERF_USE_DYNAMO_CONV_AWARE_ROUTING`, `AIPERF_HTTP_X_DYNAMO_SESSION_ID_FROM_CORRELATION_ID`, `MODEL_NAME`, `EVAL_SUITE`, `OPENAI_API_KEY` |
@@ -671,7 +671,7 @@ Refs:
 | Ref | Filled with |
 |---|---|
 | `self_ip` | this host's advertise address |
-| `head_ip` | the role's first host, as IPv4 |
+| `head_ip` | the role's first host as IPv4; its own address on that host |
 | `host_index` | this host's index in its role |
 | `role_head` | the first host of a role by name; 127.0.0.1 on that host |
 | `role_ips` | every host of a role as IPv4, joined by commas |
@@ -679,6 +679,7 @@ Refs:
 | `pulled_model_dir` | an object-storage model's pulled directory, or a fallback |
 | `server_log` | the driver host's own server log |
 | `image` | the image the pods run, as the target set it, else the Plan's |
+| `libtpu_block` | the tool's directory with a libtpu that cannot be imported, then the inherited PYTHONPATH |
 
 | Port | Use |
 |---|---|
@@ -701,7 +702,7 @@ apply, the first of these wins: a signal, 4 or 5, 3, 7, 1, 6.
 | 0 | every task passed (soft gate failures allowed) |
 | 1 | a task failed: a command exited non-zero, a hard gate failed, a result is missing, or a cell had too many failed requests |
 | 2 | usage, Plan or placement error |
-| 3 | bring-up failed before the server started: a name did not resolve, a port was taken |
+| 3 | bring-up failed: a name did not resolve, a port was taken, the Ray cluster did not form, or the driver never answered |
 | 4 | a server was not ready: it died while starting, or the readiness wait ran out |
 | 5 | a server or router died after it was ready |
 | 6 | a fatal after-task failed while every task passed |
@@ -716,3 +717,13 @@ apply, the first of these wins: a signal, 4 or 5, 3, 7, 1, 6.
 | a name's resolution, retried every 5 s, gives up after | 1800 s |
 | a server at --url is alive while GET /health answers within | 10 s |
 | a timed-out command's status | 124 |
+| hosts that wait on the driver ask for its status every | 2 s |
+| such a host leaves (exit 7) once the driver has not answered for | 20 s |
+| such a host gives up (exit 3) without a first answer after | 1800 s |
+| after its end, the driver waits for every such host to ask, at most | 10 s |
+| after an abort, at most | 3 s |
+| a Ray worker probes the head's port every 10 s, gives up after | 1800 s |
+| the Ray head counts nodes with TPUs every 15 s, gives up after | 1800 s |
+| the driver asks the other roles' heads for readiness every | 5 s |
+| and waits their readiness wait from its own start, plus | 1800 s |
+| the router answers its health check from its start within | 120 s |

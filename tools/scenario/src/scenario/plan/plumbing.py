@@ -481,13 +481,19 @@ def custom_env(
 @plumbing(
     "P-18",
     "chipless driver env",
-    "A chipless client driver's tasks and router get VLLM_PLUGINS empty and "
-    "TORCH_DEVICE_BACKEND_AUTOLOAD=0, so vLLM's CLI from the TPU image does not "
-    "start a TPU platform on a host without chips.",
-    env=("VLLM_PLUGINS", "TORCH_DEVICE_BACKEND_AUTOLOAD"),
+    "A chipless client driver's tasks and router get VLLM_PLUGINS empty, "
+    "TORCH_DEVICE_BACKEND_AUTOLOAD=0 and PYTHONPATH=<libtpu_block> (a "
+    "directory of the tool whose libtpu cannot be imported, ahead of the "
+    "inherited PYTHONPATH), so vLLM's CLI from the TPU image does not start a "
+    "TPU platform on a host without chips.",
+    env=("VLLM_PLUGINS", "TORCH_DEVICE_BACKEND_AUTOLOAD", "PYTHONPATH"),
 )
 def chipless_env() -> dict[str, Value]:
-    return {"VLLM_PLUGINS": "", "TORCH_DEVICE_BACKEND_AUTOLOAD": "0"}
+    return {
+        "VLLM_PLUGINS": "",
+        "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
+        "PYTHONPATH": Ref("libtpu_block"),
+    }
 
 
 WARM_MODULE = "scenario.runtime.warm"

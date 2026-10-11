@@ -20,7 +20,7 @@ render_plan, so what is shown is what a target hands to pods.
 import json
 import re
 import shlex
-from collections.abc import Iterator, Sequence
+from collections.abc import Collection, Iterator, Sequence
 from typing import Any
 
 from scenario.merge import TOOL, Origin, replaces_whole
@@ -50,6 +50,8 @@ from scenario.reserved import (
 from scenario.resolve import Resolved
 
 WIDTH = 100
+# The plumbing items that set the driver's task env.
+TASK_ENV_ITEMS = ("P-06", "P-18")
 _SAFE = re.compile(r"[A-Za-z0-9_@%+=:,./<>|\-]+")
 
 
@@ -105,12 +107,17 @@ def render_argv(argv: Sequence[Value], indent: int) -> str:
     return lines[0] + "".join(f"\n{pad}{rest}" for rest in lines[1:])
 
 
-def _env_lines(items: EnvItems, tagged: set[str] | None, indent: str) -> list[str]:
+def _env_lines(
+    items: EnvItems,
+    tagged: set[str] | None,
+    indent: str,
+    within: Collection[str] | None = None,
+) -> list[str]:
     """One NAME=value line each; names the tool set carry their P-item."""
     lines = []
     for name, value in items:
         text = f"{indent}{name}={_quote(render_value(value)) if value != '' else ''}"
-        rule = env_rule(name)
+        rule = env_rule(name, within)
         if rule is not None and (tagged is None or name in tagged):
             text += f"  [{rule}]"
         lines.append(text)
@@ -239,7 +246,7 @@ def _driver(plan: Plan) -> list[str]:
         lines.append(head + render_argv(router.argv, len(head)))
         lines.append(f"    ready: GET :{router.port}{router.health_path}  [P-13]")
     lines.append("  task env:")
-    lines += _env_lines(driver.task_env, None, "    ")
+    lines += _env_lines(driver.task_env, None, "    ", TASK_ENV_ITEMS)
     if not driver.tasks:
         lines.append("  no tasks: the servers stay up")
     lines += _tasks(plan)

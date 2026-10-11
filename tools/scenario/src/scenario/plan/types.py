@@ -47,6 +47,7 @@ RefKind = Literal[
     "pulled_model_dir",
     "server_log",
     "image",
+    "libtpu_block",
 ]
 Backend = Literal["single", "mp", "ray"]
 
@@ -56,13 +57,16 @@ class Ref:
     """A value only the host knows at run time.
 
     self_ip: this host's advertise address. head_ip: the role's first host,
-    as IPv4. host_index: this host's index. role_head: the first host of
-    `role` by name, or 127.0.0.1 on that host itself. role_ips: every host of
-    `role` as IPv4, joined by `sep`. results_dir: the run directory.
-    pulled_model_dir: where the server pulled an object-storage model, or
-    `fallback` when it holds no config.json. server_log: the driver host's
-    own server log. image: the image the pods run, as the target set it,
-    else the Plan's; empty when neither names one.
+    as IPv4 (its own advertise address on that host). host_index: this
+    host's index. role_head: the first host of `role` by name, or 127.0.0.1
+    on that host itself. role_ips: every host of `role` as IPv4, joined by
+    `sep`. results_dir: the run directory. pulled_model_dir: where the
+    server pulled an object-storage model, or `fallback` when it holds no
+    config.json. server_log: the driver host's own server log.
+    image: the image the pods run, as the target set it, else the Plan's;
+    empty when neither names one.
+    libtpu_block: the tool's directory whose libtpu cannot be imported,
+    ahead of the inherited PYTHONPATH.
     """
 
     kind: RefKind

@@ -15,6 +15,7 @@
 
 import os
 import pathlib
+import resource
 import signal
 import subprocess
 import sys
@@ -190,10 +191,38 @@ def test_an_interrupted_run_stops_its_child(tmp_path: pathlib.Path) -> None:
     assert gone(read_pid(pidfile))
 
 
+def test_a_check_that_raises_stops_the_command(tmp_path: pathlib.Path) -> None:
+    pidfile = tmp_path / "pid"
+    calls: list[int] = []
+
+    def check() -> None:
+        calls.append(1)
+        if pidfile.exists():
+            raise RuntimeError("stop")
+
+    with pytest.raises(RuntimeError):
+        proc.run(
+            ["sh", "-c", f"echo $$ > {pidfile}; exec sleep 60"], env=ENV, check=check
+        )
+    assert calls
+    assert gone(read_pid(pidfile))
+
+
 def test_exit_status_names_signals() -> None:
     assert proc.exit_status(0) == 0
     assert proc.exit_status(3) == 3
     assert proc.exit_status(-signal.SIGTERM) == 143
+
+
+def test_children_get_no_core_dumps() -> None:
+    hard = resource.getrlimit(resource.RLIMIT_CORE)[1]
+    proc.disable_core_dumps()
+    query = "import resource; print(*resource.getrlimit(resource.RLIMIT_CORE))"
+    done = subprocess.run(
+        [sys.executable, "-c", query], capture_output=True, text=True, check=True
+    )
+    # The hard limit stays, so a child may raise its own soft limit.
+    assert done.stdout.split() == ["0", str(hard)]
 
 
 SUPERVISED = textwrap.dedent(

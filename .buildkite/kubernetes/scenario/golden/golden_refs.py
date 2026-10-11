@@ -25,6 +25,7 @@ from scenario.plan.types import Command, Concat, EnvItems, Ref, Value
 
 LOOPBACK = "127.0.0.1"
 IMAGE = "<image>"
+LIBTPU_BLOCK = "<libtpu_block>"
 
 
 @dataclass(frozen=True)
@@ -80,6 +81,10 @@ def _ref(ref: Ref, at: Placement) -> str:
         return at.server_log
     if ref.kind == "image":
         return IMAGE
+    if ref.kind == "libtpu_block":
+        # The tool's own directory, which today's scripts have no counterpart
+        # for; the allowlist names the PYTHONPATH it gives.
+        return LIBTPU_BLOCK
     raise ValueError(f"unknown Ref kind {ref.kind}")
 
 

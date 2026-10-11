@@ -203,10 +203,11 @@ def test_pod_usage(
     assert message in result.stderr
 
 
-def test_several_roles_wait_for_the_next_version(env: dict[str, str]) -> None:
-    result = invoke("run", K3_PD, "--role", "prefill", "--host-index", "0")
+def test_a_host_of_several_roles_needs_the_role_hosts(env: dict[str, str]) -> None:
+    result = invoke("run", K3_PD, "--role", "decode", "--host-index", "1")
     assert result.exit_code == exits.USAGE
-    assert "this version runs single-host, single-role plans" in result.output
+    assert "decode/1 waits on the driver prefill/0" in result.output
+    assert "set SCENARIO_ROLE_HOSTS or pass --role-hosts" in result.output
 
 
 def test_up_serves_until_stopped(tmp_path: pathlib.Path, env: dict[str, str]) -> None:

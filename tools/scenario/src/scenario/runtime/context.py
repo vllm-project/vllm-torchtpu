@@ -38,8 +38,11 @@ REMOTE_HEALTH_TIMEOUT_S = 10
 
 
 class ServerDied(RunError):
-    def __init__(self, message: str) -> None:
+    """A server or the router died; `reason` is what the summary records."""
+
+    def __init__(self, message: str, reason: str = "the server died") -> None:
         super().__init__(exits.SERVER_DIED, message)
+        self.reason = reason
 
 
 class Liveness:
@@ -69,6 +72,33 @@ class LocalServer(Liveness):
                     f"{usage.total >> 30} GiB, {usage.free >> 30} GiB free"
                 )
         raise ServerDied(f"the server died (exit {code})")
+
+
+class LocalRouter(Liveness):
+    """The router on this host: a dead one stops the tasks (exit 5)."""
+
+    def __init__(self, router: Proc, log: Log) -> None:
+        self.router = router
+        self.log = log
+
+    def check(self) -> None:
+        code = self.router.poll()
+        if code is None:
+            return
+        self.log.say("ERROR: the router died; nothing can reach the servers.")
+        bringup.report_tail(self.router, self.log, "router.log")
+        raise ServerDied(f"the router died (exit {code})", "the router died")
+
+
+class Every(Liveness):
+    """Alive while every part is."""
+
+    def __init__(self, *parts: Liveness) -> None:
+        self.parts = parts
+
+    def check(self) -> None:
+        for part in self.parts:
+            part.check()
 
 
 class RemoteServer(Liveness):
