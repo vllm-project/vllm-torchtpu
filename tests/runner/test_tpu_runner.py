@@ -4211,3 +4211,69 @@ class TestLogitsAtDpVocabRows:
             TPUModelRunner._logits_at_dp_vocab_rows(
                 runner, torch.zeros(9, 2), torch.arange(9)
             )
+
+
+def test_stage_timing_disabled_skips_thread_and_events():
+    from vllm_torchtpu.runner.stage_timing import RunnerStageTiming
+
+    timing = RunnerStageTiming(0, enabled=False)
+    assert timing._enabled is False
+    with timing.stage("main_forward"):
+        pass
+    with timing.host_stage("prep"):
+        pass
+    assert not timing._pending
+    assert timing.take_samples() == ([], [])
+
+
+def test_dp_num_tokens_across_dp_caches_cpu_tensors():
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner._dp_lockstep_enabled = lambda: False
+    runner.parallel_config = SimpleNamespace(
+        data_parallel_size=1,
+        use_sequence_parallel_moe=True,
+    )
+    t1 = runner._dp_num_tokens_across_dp(64)
+    t2 = runner._dp_num_tokens_across_dp(64)
+    t3 = runner._dp_num_tokens_across_dp(16)
+    assert t1 is not None
+    assert t1 is t2
+    assert t1.tolist() == [64]
+    assert t3 is not None and t3.tolist() == [16]
+
+    runner.parallel_config.use_sequence_parallel_moe = False
+    assert runner._dp_num_tokens_across_dp(64) is None
+
+
+def test_kv_transfer_uses_stage_timing():
+    cfg_none = SimpleNamespace(kv_transfer_config=None)
+    assert TPUModelRunner._kv_transfer_uses_stage_timing(cfg_none) is False
+
+    cfg_offload = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="TPURaidenOffloadingConnector",
+            kv_connector_extra_config={},
+        )
+    )
+    assert TPUModelRunner._kv_transfer_uses_stage_timing(cfg_offload) is False
+
+    cfg_raiden = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="TPURaidenConnector",
+            kv_connector_extra_config={},
+        )
+    )
+    assert TPUModelRunner._kv_transfer_uses_stage_timing(cfg_raiden) is True
+
+    cfg_multi_with_tpu = SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(
+            kv_connector="TPUMultiConnector",
+            kv_connector_extra_config={
+                "connectors": [
+                    {"kv_connector": "TPURaidenOffloadingConnector"},
+                    {"kv_connector": "TPUConnector"},
+                ]
+            },
+        )
+    )
+    assert TPUModelRunner._kv_transfer_uses_stage_timing(cfg_multi_with_tpu) is True

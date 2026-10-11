@@ -1467,7 +1467,34 @@ class TPUModelRunner(GPUModelRunner):
         self._greedy_head_owner: torch.nn.Module | None = None
 
         self._init_phased_profiling()
-        self._stage_timing = RunnerStageTiming(profiler_rank)
+        self._stage_timing = RunnerStageTiming(
+            profiler_rank,
+            enabled=self._kv_transfer_uses_stage_timing(self.vllm_config),
+        )
+
+    @staticmethod
+    def _kv_transfer_uses_stage_timing(vllm_config: Any) -> bool:
+        """Whether `vllm_config.kv_transfer_config` has a `TpuKVConnectorStats`
+        sink (`TPUConnector` / `TPURaidenConnector`) that consumes
+        `RunnerStageTiming` samples (`tpu_runner.py:get_finished_kv_transfers`).
+        Single-instance CPU offload (`TPURaidenOffloadingConnector` /
+        `OffloadingConnector`) has no TPU timing sink and discards all samples.
+        """
+        kv_cfg = getattr(vllm_config, "kv_transfer_config", None)
+        if kv_cfg is None:
+            return False
+        conn = getattr(kv_cfg, "kv_connector", None)
+        if conn in ("TPUConnector", "TPURaidenConnector"):
+            return True
+        if conn in ("TPUMultiConnector", "MultiConnector"):
+            extra = getattr(kv_cfg, "kv_connector_extra_config", None) or {}
+            for sub in extra.get("connectors", ()):
+                if isinstance(sub, dict) and sub.get("kv_connector") in (
+                    "TPUConnector",
+                    "TPURaidenConnector",
+                ):
+                    return True
+        return False
 
     def _init_phased_profiling(self) -> None:
         """Resolves whether USE_PHASED_PROFILER is set and where its traces go.
@@ -4983,13 +5010,30 @@ class TPUModelRunner(GPUModelRunner):
 
     def _dp_num_tokens_across_dp(self, num_tokens: int) -> torch.Tensor | None:
         if not self._dp_lockstep_enabled():
-            return None
-        return torch.full(
-            (utils.get_dp_size(self.parallel_config),),
-            num_tokens,
-            dtype=torch.int32,
-            device="cpu",
-        )
+            if (
+                getattr(self.parallel_config, "use_sequence_parallel_moe", False)
+                is not True
+            ):
+                return None
+            dp_size = 1
+        else:
+            dp_size = utils.get_dp_size(self.parallel_config)
+        cache = self.__dict__.get("_dp_tokens_cpu_cache")
+        if cache is None:
+            cache = {}
+            self._dp_tokens_cpu_cache = cache
+        key = (dp_size, int(num_tokens))
+        t = cache.get(key)
+        if t is None:
+            t = torch.full(
+                (dp_size,),
+                num_tokens,
+                dtype=torch.int32,
+                device="cpu",
+            )
+            if len(cache) < 512:
+                cache[key] = t
+        return t
 
     @torch.no_grad()
     def execute_model(
@@ -5140,7 +5184,9 @@ class TPUModelRunner(GPUModelRunner):
 
         # NOTE: setup current batch's metadata for kv connector.
         # Verified with TPURaidenConnector, TPUConnector, OffloadingConnector
-        with set_forward_context(None, self.vllm_config):
+        if has_kv_transfer_group() or "maybe_setup_kv_connector" in getattr(
+            self, "__dict__", {}
+        ):
             # Raiden overlap: block the worker main thread on the KV load only
             # in inline mode. In the default async mode the load (network pull
             # + DMA H2D into the cache) runs entirely on the Raiden C++
