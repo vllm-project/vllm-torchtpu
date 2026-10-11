@@ -13,6 +13,7 @@
 # limitations under the License.
 """Diagnostics: rendering, placing in files, and pydantic error rewriting."""
 
+import textwrap
 from typing import Any
 
 import pytest
@@ -26,6 +27,9 @@ from scenario.errors import (
     sort_diagnostics,
     suggest,
 )
+from scenario.keycheck import check_keys
+from scenario.load import load_yaml
+from scenario.model.rules import check_scenario
 from scenario.model.scenario import Scenario
 from scenario.paths import format_path
 
@@ -127,6 +131,55 @@ def test_literal_bound_and_custom_messages(single: dict[str, Any]) -> None:
 def test_extra_key_path(single: dict[str, Any]) -> None:
     single["server"]["model"]["revision"] = "main"
     assert rewrite(single) == [("server.model.revision", "unknown key", None)]
+
+
+def test_one_file_reports_every_problem() -> None:
+    text = textwrap.dedent(
+        """\
+        schema: 1
+        name: demo
+        server:
+          image: us-docker.pkg.dev/test/images/vllm:test
+          model: {name: m}
+          accelerator: tpu7x
+          topology: 2x2x2
+          hosts: 2
+          chips_per_host: 4
+          startup_timout: 2h
+          args:
+            tensor-parallel-size: "8"
+        tasks:
+          custom:
+            - name: probe
+              command: [true]
+              timeout: 10m
+        """
+    )
+    loaded = load_yaml(text, "demo.yaml")
+    issues = check_keys(loaded.data, Scenario)
+    trimmed = {
+        **loaded.data,
+        "server": {
+            k: v for k, v in loaded.data["server"].items() if k != "startup_timout"
+        },
+    }
+    try:
+        model = Scenario.model_validate(trimmed)
+    except ValidationError as error:
+        issues += issues_from_validation_error(error, trimmed)
+    else:
+        issues += check_scenario(model)
+
+    def locate(path: tuple[str | int, ...]) -> tuple[str, int]:
+        return loaded.source, loaded.line(path)
+
+    rendered = [d.render() for d in sort_diagnostics(place(issues, locate))]
+    assert rendered == [
+        "demo.yaml:3: server.startup_timeout: required",
+        "demo.yaml:10: server.startup_timout: unknown key; did you mean "
+        "server.startup_timeout?",
+        "demo.yaml:16: tasks.custom[0].command[0]: expected a string; got True",
+    ]
 
 
 def test_place_keeps_rule_and_severity() -> None:
