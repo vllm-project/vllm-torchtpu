@@ -32,7 +32,8 @@ class CommParams:
     Supported `HIER` modes (`comm_params`):
     - `HIER == 0`: flat ring (`RSAG=False`, 1 round) or 2-round reduce-scatter +
       all-gather (`RSAG=True`), accepted for any power-of-two `R >= 1`.
-    - `HIER == 1`: 2-stage 8-rank pair-reduce + 4-way all-gather (`R == 8`).
+    - `HIER == 1`: 2-stage 8-rank pair-reduce + 4-way all-gather (`R == 8`);
+      the 4-way round pushes to the peers `me ^ off` for `off` in `HIER1_PEERS`.
     - `HIER == 2`: 3-stage 8-rank half-column pair-reduce + 4-way all-gather +
       pair all-gather (`R == 8`, requires `HC2 % 128 == 0`).
     - `HIER == 3`: `N_HIER3 = log2(R)`-round recursive halving/doubling butterfly,
@@ -58,6 +59,22 @@ class CommParams:
     ]  # Active round indices (`(0,)` .. `tuple(range(N_HIER3))`).
     AR_PEERS: int  # Remote peer DMA descriptors per round per slot.
     N_HIER3: int  # Number of butterfly rounds (`max(1, log2(R))`) for `HIER == 3`.
+    # `HIER == 1` cross-chip peer offsets (`tiles.hier1_peers`): one core on each
+    # of the other three chips of the 2x2x1 mesh (core `me ^ off`).
+    HIER1_PEERS: tuple[int, ...] = (2, 4, 6)
+
+
+def _check_hier1_peers(peers: tuple[int, ...]) -> None:
+    """`hier1_peers` must name one core on each other chip (`off >> 1` = 1, 2, 3).
+
+    Both cores of a chip hold the same chip sum after round 0, so any such
+    choice delivers the same three chip sums to the same `ag_recv` rows.
+    """
+    if len(peers) != 3 or sorted(off >> 1 for off in peers) != [1, 2, 3]:
+        raise MegakernelConfigError(
+            f"hier1_peers={peers} must hold one offset per other chip "
+            "(off >> 1 in {1, 2, 3}, e.g. (2, 4, 6) or (3, 5, 7))"
+        )
 
 
 def comm_params(
@@ -110,6 +127,9 @@ def comm_params(
         raise MegakernelConfigError(f"unsupported all-reduce mode: hier={HIER}, R={R}")
     if HIER == 2 and HC2 % 128 != 0:
         raise MegakernelConfigError(f"hier=2 requires HC2={HC2} divisible by 128")
+    HIER1_PEERS = tuple(int(off) for off in tiles.hier1_peers)
+    if HIER == 1:
+        _check_hier1_peers(HIER1_PEERS)
     AR_ROUNDS = (
         tuple(range(N_HIER3))
         if HIER == 3
@@ -134,6 +154,7 @@ def comm_params(
         AR_ROUNDS=AR_ROUNDS,
         AR_PEERS=AR_PEERS,
         N_HIER3=N_HIER3,
+        HIER1_PEERS=HIER1_PEERS,
     )
 
 

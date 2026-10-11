@@ -76,7 +76,7 @@ class AllReduceRing:
                 dst = scr["recv"].at[slot, c_idx]
             elif rnd_i == 1:
                 src = scr["ag_send"].at[slot]
-                peers = list(enumerate((2, 4, 6)))
+                peers = list(enumerate(cp.HIER1_PEERS if HIER == 1 else (2, 4, 6)))
                 dst = scr["ag_recv"].at[slot, me // 2]
             else:
                 src = scr["s2_send"].at[slot]
