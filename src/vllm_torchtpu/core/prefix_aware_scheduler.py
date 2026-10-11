@@ -62,6 +62,7 @@ def _hit_signature(result) -> tuple:
     """Comparable form of a find_longest_cache_hit result (block ids)."""
     blocks = result[0]
     try:
+        ids = tuple(tuple(getattr(b, "block_id", b) for b in group) for group in blocks)
     except TypeError:
         ids = None
     return (result[1], result[2] if len(result) > 2 else None, ids)
@@ -357,6 +358,11 @@ class PrefixAwareScheduler(AsyncScheduler):
     def _get_block_size(self) -> int:
         """Return KV cache block size in tokens (defaults to 16 if unset)."""
         block_size = getattr(self, "block_size", None)
+        if (
+            isinstance(block_size, int)
+            and not isinstance(block_size, bool)
+            and block_size > 0
+        ):
             return block_size
         cache_cfg = getattr(self, "cache_config", None)
         cfg_block_size = getattr(cache_cfg, "block_size", None)
@@ -450,6 +456,7 @@ class PrefixAwareScheduler(AsyncScheduler):
     def _get_local_prefix_cache_hit(
     ) -> tuple[object, int, int, bool]:
         connector = getattr(self, "connector", None)
+        if connector is None or not connector.supports_divergent_local_hybrid_hits:
             kvm = self.kv_cache_manager
             epoch = self._get_prefix_cache_epoch()
             if (
@@ -474,6 +481,7 @@ class PrefixAwareScheduler(AsyncScheduler):
                         # memo itself must never be mutated downstream.
                         computed_blocks = tuple(list(b) for b in computed_blocks)
                     shared_prefix_boundary = (
+                        num_new_computed_tokens + num_uncached if num_uncached else 0
                     )
                     blocks = kvm.create_kv_cache_blocks(computed_blocks)
                     return (
@@ -484,6 +492,7 @@ class PrefixAwareScheduler(AsyncScheduler):
                     )
         blocks, num_local, shared_prefix_boundary, hit_diverged = (
         )
+        if hit_diverged and hasattr(connector, "resolve_divergent_local_hit_tokens"):
             kvm = self.kv_cache_manager
             reconciled_blocks, num_reconciled, reconciled_boundary = (
             )
@@ -532,6 +541,7 @@ class PrefixAwareScheduler(AsyncScheduler):
 
         free_blocks_for_fit: int | None = None
         if free_blocks is not None:
+            head_needed_blocks = math.ceil(head_cold_tokens / self._get_block_size())
             if free_blocks < head_needed_blocks:
                 free_blocks_for_fit = free_blocks
 
