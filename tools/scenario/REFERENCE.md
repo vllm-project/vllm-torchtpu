@@ -690,3 +690,29 @@ Refs:
 | 14579 | the KV connector |
 | 9100 | KV transfer |
 | 9600 | the KV side channel |
+
+## Runtime
+
+`scenario run` exits with a code that names what failed. When several
+apply, the first of these wins: a signal, 4 or 5, 3, 7, 1, 6.
+
+| Exit | Meaning |
+|---|---|
+| 0 | every task passed (soft gate failures allowed) |
+| 1 | a task failed: a command exited non-zero, a hard gate failed, a result is missing, or a cell had too many failed requests |
+| 2 | usage, Plan or placement error |
+| 3 | bring-up failed before the server started: a name did not resolve, a port was taken |
+| 4 | a server was not ready: it died while starting, or the readiness wait ran out |
+| 5 | a server or router died after it was ready |
+| 6 | a fatal after-task failed while every task passed |
+| 7 | the driver aborted, or was lost before it finished |
+| 130 | interrupted (SIGINT) |
+| 143 | terminated (SIGTERM) |
+
+| Constant | Value |
+|---|---|
+| readiness poll of a local server | 1 s |
+| stop: SIGTERM to the group, then SIGKILL after | 20 s |
+| a name's resolution, retried every 5 s, gives up after | 1800 s |
+| a server at --url is alive while GET /health answers within | 10 s |
+| a timed-out command's status | 124 |

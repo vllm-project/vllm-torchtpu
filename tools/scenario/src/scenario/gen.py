@@ -45,6 +45,7 @@ from scenario.reserved import (
     TOOL_ENV,
     TOOL_ENV_PREFIXES,
 )
+from scenario.runtime import bringup, context, exits, net, proc
 
 SCHEMA_DIALECT = "https://json-schema.org/draft/2020-12/schema"
 REFERENCE = "REFERENCE.md"
@@ -423,6 +424,37 @@ def reference() -> str:
             (str(plan_types.KV_PORT), "the KV connector"),
             (str(plan_types.KV_TRANSFER_PORT), "KV transfer"),
             (str(plan_types.SIDE_CHANNEL_PORT), "the KV side channel"),
+        ],
+    )
+    lines += [
+        "## Runtime",
+        "",
+        "`scenario run` exits with a code that names what failed. When several",
+        "apply, the first of these wins: a signal, 4 or 5, 3, 7, 1, 6.",
+        "",
+    ]
+    lines += table(
+        ("Exit", "Meaning"),
+        [(str(code), meaning) for code, meaning in sorted(exits.MEANINGS.items())],
+    )
+    lines += table(
+        ("Constant", "Value"),
+        [
+            ("readiness poll of a local server", f"{bringup.POLL_INTERVAL_S:g} s"),
+            (
+                "stop: SIGTERM to the group, then SIGKILL after",
+                f"{proc.STOP_GRACE_S} s",
+            ),
+            (
+                "a name's resolution, retried every "
+                f"{net.RESOLVE_INTERVAL_S} s, gives up after",
+                f"{net.RESOLVE_TIMEOUT_S} s",
+            ),
+            (
+                "a server at --url is alive while GET /health answers within",
+                f"{context.REMOTE_HEALTH_TIMEOUT_S} s",
+            ),
+            ("a timed-out command's status", str(proc.TIMEOUT_STATUS)),
         ],
     )
     while lines[-1] == "":

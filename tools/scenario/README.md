@@ -128,7 +128,7 @@ error.
 | `custom` | any command, given the server URLs and a results directory |
 
 Perf and lm_eval baselines sit next to the task they gate, and `scenario
-calibrate` (M2) rewrites them from a run. AgentX and InferenceX evals have no
+calibrate` rewrites them from runs. AgentX and InferenceX evals have no
 baseline: InferenceX checks them itself.
 
 AgentX follows InferenceX's own runs. `tasks.inferencex` is the deployment's
@@ -202,9 +202,51 @@ the CI scenarios it is `.buildkite/kubernetes`. A reference id such as
 `kimi-k3/tp32-ep` is the path under `scenarios/` without `.yaml`. The CI
 fleet target will live in `.buildkite/kubernetes/scenario/` as well.
 
+## Running
+
+`scenario run FILE` runs a scenario on this machine. On one host it:
+
+1. writes the run directory: `config.json` in the shape of today's
+   `run_benchmarks.sh`, `scenario_run.json` (the resolved scenario, the Plan,
+   the target) and `summary.json` (state, exit code, per-task status, kept
+   current as the run goes);
+2. starts `vllm serve` with the Plan's argv and env, its output to the log
+   and `server.log`, and waits for `/health` up to `startup_timeout` + 600 s;
+3. runs the tasks in order (perf, AgentX, custom, eval), with today's result
+   file names, and gates each against its baseline with
+   `scripts/vllm/benchmarking/check_regression.py`;
+4. stops the server's whole process group, and exits with a code that names
+   what failed.
+
+A failed task does not stop the next one; a dead server does. The run
+directory is `<results root>/<name>`, plus `/<point>` for a sweep point; the
+root is `--results-dir`, else the target's, else
+`./scenario-results/<name>-<UTC stamp>`.
+
+| Exit | Meaning |
+|---|---|
+| 0 | every task passed (a soft gate may have failed) |
+| 1 | a task failed: a command, a hard gate, a missing result |
+| 2 | usage, scenario, Plan or placement error |
+| 3 | bring-up failed before the server started (a name, a taken port) |
+| 4 | the server was not ready: it died starting, or the wait ran out |
+| 5 | the server died after it was ready |
+| 6 | a fatal after-task failed while every task passed |
+| 7 | the driver aborted or was lost (hosts that wait on a driver) |
+| 130, 143 | SIGINT, SIGTERM |
+
+In a pod, `scenario run --role ROLE` takes the Plan from `SCENARIO_PLAN` and
+its placement from `SCENARIO_HOST_INDEX`, `SCENARIO_HEAD_ADDRESS`,
+`SCENARIO_ADVERTISE_IP` and `SCENARIO_ROLE_HOSTS`; the flags of the same
+names win. `SCENARIO_TARGET_DATA` carries the target's after-tasks (uploads)
+and its lm_eval request cache root; a local run has neither.
+
+This version runs single-host, single-role scenarios. Hosts that wait on a
+driver (multi-host, multi-role) come next.
+
 ## Usage
 
-From the repository root:
+From the repository root (tasks run from the current directory):
 
 ```
 uv run --project tools/scenario scenario validate --root .buildkite/kubernetes
@@ -212,6 +254,10 @@ uv run --project tools/scenario scenario show .buildkite/kubernetes/scenarios/gl
 uv run --project tools/scenario scenario show --plan .buildkite/kubernetes/scenarios/glm-5.2/fp8-dp16-ep.yaml
 uv run --project tools/scenario scenario show --why server.args.max-model-len .buildkite/kubernetes/scenarios/glm-5.2/fp8-dp16-ep.yaml
 uv run --project tools/scenario scenario run --dry-run --role server --host-index 1 .buildkite/kubernetes/scenarios/glm-5.2/fp8-dp16-ep-mp.yaml
+uv run --project tools/scenario scenario run .buildkite/kubernetes/scenarios/qwen3-0.6b/tp1.yaml --results-dir /tmp/runs
+uv run --project tools/scenario scenario up .buildkite/kubernetes/scenarios/qwen3-0.6b/tp1.yaml
+uv run --project tools/scenario scenario perf .buildkite/kubernetes/scenarios/qwen3-0.6b/tp1.yaml --url http://127.0.0.1:8000
+uv run --project tools/scenario scenario calibrate .buildkite/kubernetes/scenarios/glm-5.2/fp8-dp16-ep.yaml run1/glm-5.2-fp8-dp16-ep run2/glm-5.2-fp8-dp16-ep --write
 ```
 
 What each command does:
@@ -221,7 +267,18 @@ What each command does:
   the current directory.
 - **`show`:** prints resolved values. With `--plan`, it prints what every host
   runs.
-- **`run --dry-run`:** prints the commands and env of the selected hosts.
+- **`run`:** runs the scenario on this host (see Running). `--dry-run` prints
+  the commands and env of the selected hosts instead; `--only perf,eval`
+  runs some tasks; `--set` makes the run an experiment, whose gates are
+  skipped.
+- **`up`:** serves the scenario until SIGINT or SIGTERM, running no task.
+- **`perf` / `eval`:** run one task against a server that is already up at
+  `--url`.
+- **`calibrate`:** computes new baselines from run directories with
+  `check_regression.py`'s calibration (medians over the runs) and prints the
+  change. `--write` rewrites only those baseline entries in the file; every
+  other line, comments included, stays. A baseline that is `from:` another
+  scenario is refused.
 
 ## Development
 

@@ -19,7 +19,8 @@ executor fills Refs and runs them. File names are run_benchmarks.sh's:
 .log for each warmup pass; in cells mode the cell key is its label. A
 failed warmup skips its cell's measured run. A failed cell does not stop
 the next while the server lives; a dead server stops the task (exit 5).
-The perf gate runs once the cells are done.
+The perf gate runs once the cells are done. A target's `when: result`
+after-tasks run after each measured run that wrote its result.
 """
 
 import datetime
@@ -187,6 +188,11 @@ class PerfRun:
             return None
         ctx.log.say(f"    OK -> {outcome['result']}")
         outcome["status"] = "ok"
+        publisher = ctx.publisher
+        if publisher is not None:
+            publisher.result(
+                mode=self.task.mode, file=result, label=cell.key, require="always"
+            )
         limit = self.task.max_failed_requests
         if limit is not None and int(found.get("failed") or 0) > limit:
             failed = found.get("failed")
@@ -198,6 +204,10 @@ class PerfRun:
             reason = f"{failed} failed requests, over the {limit} allowed"
             outcome.update(status="failed", reason=reason)
             return f"{cell.key} had {reason}"
+        if publisher is not None:
+            publisher.result(
+                mode=self.task.mode, file=result, label=cell.key, require="result_ok"
+            )
         return None
 
 

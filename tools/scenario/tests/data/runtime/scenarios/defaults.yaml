@@ -1,0 +1,35 @@
+# Choices the runtime tests' scenarios start from, as a repository's defaults.yaml would hold them.
+schema: 1
+server:
+  image: us-docker.pkg.dev/test/images/vllm:test
+  startup_timeout: 10m
+  args:
+    tensor-parallel-size: 1
+    data-parallel-size: 1
+    max-model-len: 4096
+    max-num-batched-tokens: 1024
+    max-num-seqs: 64
+    async-scheduling: true
+    kv-cache-dtype: fp8
+tasks:
+  perf:
+    dataset:
+      name: random
+    num_prompts: 320
+    range_ratio_style: symmetric
+    warmup_runs: 0
+    percentile_metrics: [ttft, tpot, itl, e2el]
+    tolerance: 0.05
+    client_args:
+      backend: vllm
+      ignore-eos: true
+      seed: 42
+  eval:
+    lm_eval:
+      model: local-chat-completions
+      model_args:
+        num_concurrent: 8
+      seed: "0,1234,None,1234"
+      limit: 10
+      apply_chat_template: true
+      fewshot_as_multiturn: true

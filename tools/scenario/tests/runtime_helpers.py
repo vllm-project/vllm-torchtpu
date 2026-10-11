@@ -17,6 +17,7 @@ Imported by name, like plan_fixtures.py. The stubs (stubs/stubs.py) need no
 network, TPU or vLLM.
 """
 
+import dataclasses
 import json
 import os
 import pathlib
@@ -26,8 +27,10 @@ import threading
 import time
 from typing import Any
 
+from scenario.plan.types import Command, Plan
+
 STUBS = pathlib.Path(__file__).resolve().parent / "stubs" / "stubs.py"
-PROGRAMS = ("vllm", "python3")
+PROGRAMS = ("vllm", "python3", "lm_eval", "evalscope")
 # A stand-in vllm package: just runai_utils.ObjectStorageModel.
 SITE = pathlib.Path(__file__).resolve().parent / "stubs" / "site"
 REPO_ROOT = pathlib.Path(__file__).resolve().parents[3]
@@ -45,9 +48,8 @@ def stub_env(tmp_path: pathlib.Path, **knobs: str) -> dict[str, str]:
     bin_dir.mkdir(exist_ok=True)
     for program in PROGRAMS:
         shim = bin_dir / program
-        # -S: the stubs need only the standard library, and start faster.
         shim.write_text(
-            f'#!/bin/sh\nexec "{sys.executable}" -S "{STUBS}" {program} "$@"\n'
+            f'#!/bin/sh\nexec "{sys.executable}" "{STUBS}" {program} "$@"\n'
         )
         shim.chmod(0o755)
     records = tmp_path / "records"
@@ -169,6 +171,27 @@ def tiny() -> dict[str, Any]:
             },
         },
     }
+
+
+def replace_program(plan: Plan, old: str, new: str) -> Plan:
+    """`plan` with every command that starts `old` starting `new` instead.
+
+    For programs at fixed paths, such as InferenceX's baked interpreter.
+    """
+
+    def walk(value: Any) -> Any:
+        if isinstance(value, Command) and value.argv[:1] == (old,):
+            return dataclasses.replace(value, argv=(new, *value.argv[1:]))
+        if isinstance(value, tuple):
+            return tuple(walk(item) for item in value)
+        if dataclasses.is_dataclass(value) and not isinstance(value, type):
+            changes = {
+                f.name: walk(getattr(value, f.name)) for f in dataclasses.fields(value)
+            }
+            return dataclasses.replace(value, **changes)
+        return value
+
+    return walk(plan)
 
 
 def signal_when_serving(summary: pathlib.Path, signum: int) -> threading.Thread:

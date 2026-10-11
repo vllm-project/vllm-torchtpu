@@ -13,20 +13,25 @@
 # limitations under the License.
 """The `scenario` command line.
 
-Exit codes: 0 when everything is fine (warnings allowed), 1 when a scenario
-has problems, 2 for usage errors, including a Plan that cannot be selected
-or decoded.
+validate, show and calibrate exit 0 when everything is fine (warnings
+allowed), 1 when a scenario has problems, 2 for usage errors, including a
+Plan that cannot be selected or decoded. run, up, perf and eval exit with
+the runtime's codes (runtime/exits.py), where 1 is a failed task, so a
+scenario with problems is a usage error (2) there.
 """
 
+import os
 import pathlib
 import sys
-from collections.abc import Sequence
+import urllib.parse
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
-from typing import NoReturn
+from typing import Any, NoReturn
 
 import click
 
 from scenario import PLAN_FORMAT, __version__, gen
+from scenario import calibrate as calibration
 from scenario.errors import Diagnostic, DiagnosticError
 from scenario.keycheck import check_keys
 from scenario.model.scenario import Scenario
@@ -36,7 +41,12 @@ from scenario.plan import codec
 from scenario.plan.build import PlanError, plan, resolved_payload, select_point
 from scenario.plan.types import CLIENT_ROLE, Plan
 from scenario.resolve import DEFAULTS_FILE, Resolved, Resolver, find_root
+from scenario.runtime import driver, exits, init
+from scenario.runtime.exits import RunError
+from scenario.runtime.gate import GateError
+from scenario.runtime.placement import ENV_PLAN, PlacementFlags, decode_plan
 from scenario.show import describe, render_plan, render_resolved, render_why
+from scenario.targets.local import LocalTarget
 
 EXIT_PROBLEMS = 1
 EXIT_USAGE = 2
@@ -83,14 +93,15 @@ def _resolve(
     sets: Sequence[str],
     root: pathlib.Path | None,
     point: str | None = None,
+    code: int = EXIT_PROBLEMS,
 ) -> tuple[Resolved, ...]:
-    """Resolve FILE, or print every problem and exit 1."""
+    """Resolve FILE, or print every problem and exit with `code`."""
     try:
         resolver = Resolver(find_root(file, root, cwd=pathlib.Path.cwd()))
         resolved = resolver.resolve(file.resolve(), tuple(sets), point)
     except DiagnosticError as error:
         click.echo("\n".join(d.render() for d in error.diagnostics), err=True)
-        sys.exit(EXIT_PROBLEMS)
+        sys.exit(code)
     for warning in resolved[0].warnings if resolved else ():
         click.echo(warning.render(), err=True)
     return resolved
@@ -333,39 +344,84 @@ def show(
     click.echo("\n".join(texts), nl=False)
 
 
-# run --------------------------------------------------------------------
+# run, up, perf, eval ---------------------------------------------------
 
-
-@main.command()
-@click.argument("file", type=FileArg)
-@click.option(
-    "--dry-run",
-    is_flag=True,
-    help="Print every host's commands and env instead of running them.",
+EXIT_CODES = "\n".join(
+    f"  {code:>3}  {meaning}" for code, meaning in sorted(exits.MEANINGS.items())
 )
-@SetOption
-@click.option("--point", help="The sweep point to run.")
-@click.option("--role", help="Only this role's hosts (client: the chipless driver).")
-@click.option("--host-index", type=int, help="Only this host of --role.")
-@click.option("--only", metavar="TASKS", help="Only these tasks, comma-separated.")
-@RootOption
-def run(
-    file: pathlib.Path,
-    dry_run: bool,
-    sets: tuple[str, ...],
-    point: str | None,
-    role: str | None,
-    host_index: int | None,
-    only: str | None,
-    root: pathlib.Path | None,
-) -> None:
-    """Run a scenario on this machine; this version prints it (--dry-run)."""
-    if not dry_run:
-        _fail(
-            "this version only prints a run: pass --dry-run. Running scenarios "
-            "comes with the runtime."
-        )
-    planned = _plan(_resolve(file, sets, root, point), point, only)
+
+
+def _placement(command: Callable[..., Any]) -> Callable[..., Any]:
+    """The placement flags; each wins over its SCENARIO_* env var."""
+    options = [
+        click.option(
+            "--role-hosts",
+            metavar="HOSTS",
+            help="Every role's hosts: role=host,host;role=host, or JSON.",
+        ),
+        click.option("--advertise-ip", metavar="IP", help="This host's own address."),
+        click.option(
+            "--head-address",
+            metavar="HOST",
+            help="The first host of this host's role (name or IP).",
+        ),
+        click.option("--host-index", type=int, help="This host's index in its role."),
+        click.option("--role", help="This host's role (client: the chipless driver)."),
+    ]
+    for option in options:
+        command = option(command)
+    return command
+
+
+ResultsOption = click.option(
+    "--results-dir",
+    type=click.Path(path_type=pathlib.Path, file_okay=False),
+    help="Results root; the run directory is <root>/<name>[/<point>]. Default: "
+    "the target's root, else ./scenario-results/<name>-<UTC stamp>.",
+)
+CacheOption = click.option(
+    "--lm-eval-cache",
+    metavar="DIR",
+    help="Where lm_eval keeps its request cache; without it, lm_eval runs uncached.",
+)
+
+
+def _options(
+    mode: driver.Mode,
+    results_dir: pathlib.Path | None,
+    *,
+    flags: PlacementFlags | None = None,
+    resolved: Resolved | None = None,
+    url: str | None = None,
+    lm_eval_cache: str | None = None,
+) -> driver.RunOptions:
+    return driver.RunOptions(
+        env=dict(os.environ),
+        flags=flags or PlacementFlags(),
+        results_root=results_dir,
+        repo_root=pathlib.Path.cwd(),
+        resolved=resolved_payload(resolved) if resolved is not None else None,
+        mode=mode,
+        url=url,
+        lm_eval_cache=lm_eval_cache,
+    )
+
+
+def _supervise() -> None:
+    """As a container's first process, fork and stay behind to reap."""
+    code = init.maybe_supervise()
+    if code is not None:
+        sys.exit(code)
+
+
+def _select(points: Sequence[Resolved], point: str | None) -> Resolved:
+    try:
+        return select_point(points, point)
+    except PlanError as error:
+        _fail(str(error))
+
+
+def _dry_run(planned: Plan, role: str | None, host_index: int | None) -> None:
     roles = [r.name for r in planned.roles]
     if planned.driver.chipless:
         roles.append(CLIENT_ROLE)
@@ -382,6 +438,242 @@ def run(
                 f"role {role} has hosts 0..{hosts - 1}; got --host-index {host_index}"
             )
     click.echo(render_plan(planned, role, host_index), nl=False)
+
+
+@main.command(epilog=f"\b\nExit codes:\n{EXIT_CODES}")
+@click.argument("file", required=False, type=FileArg)
+@click.option(
+    "--dry-run",
+    is_flag=True,
+    help="Print the selected hosts' commands and env instead of running them.",
+)
+@SetOption
+@click.option("--point", help="The sweep point to run.")
+@_placement
+@ResultsOption
+@click.option("--only", metavar="TASKS", help="Only these tasks, comma-separated.")
+@CacheOption
+@RootOption
+def run(
+    file: pathlib.Path | None,
+    dry_run: bool,
+    sets: tuple[str, ...],
+    point: str | None,
+    role: str | None,
+    host_index: int | None,
+    head_address: str | None,
+    advertise_ip: str | None,
+    role_hosts: str | None,
+    results_dir: pathlib.Path | None,
+    only: str | None,
+    lm_eval_cache: str | None,
+    root: pathlib.Path | None,
+) -> None:
+    """Run this host's part of a scenario: serve, run the tasks, keep results.
+
+    With FILE, the local target runs it on this machine. Without FILE, the
+    Plan comes from SCENARIO_PLAN and placement from the SCENARIO_* env, as
+    in a pod. A scenario without tasks serves until SIGINT or SIGTERM.
+    """
+    resolved = None
+    if file is None:
+        text = os.environ.get(ENV_PLAN)
+        if not text:
+            _fail(f"run needs a scenario FILE, or {ENV_PLAN} in the environment")
+        if sets or point or only:
+            _fail(
+                "--set, --point and --only need a scenario FILE; a pod's Plan is fixed"
+            )
+        try:
+            planned = decode_plan(text)
+        except RunError as error:
+            _fail(error.message)
+    else:
+        points = _resolve(file, sets, root, point, EXIT_USAGE)
+        resolved = _select(points, point)
+        planned = _plan(points, point, only)
+    if dry_run:
+        _dry_run(planned, role, host_index)
+        return
+    _supervise()
+    flags = PlacementFlags(role, host_index, head_address, advertise_ip, role_hosts)
+    options = _options(
+        "run", results_dir, flags=flags, resolved=resolved, lm_eval_cache=lm_eval_cache
+    )
+    if file is None:
+        sys.exit(driver.run(planned, options))
+    sys.exit(LocalTarget(options).submit(planned))
+
+
+@main.command(epilog=f"\b\nExit codes:\n{EXIT_CODES}")
+@click.argument("file", type=FileArg)
+@SetOption
+@click.option("--point", help="The sweep point to serve.")
+@_placement
+@ResultsOption
+@RootOption
+def up(
+    file: pathlib.Path,
+    sets: tuple[str, ...],
+    point: str | None,
+    role: str | None,
+    host_index: int | None,
+    head_address: str | None,
+    advertise_ip: str | None,
+    role_hosts: str | None,
+    results_dir: pathlib.Path | None,
+    root: pathlib.Path | None,
+) -> None:
+    """Serve a scenario on this host until SIGINT or SIGTERM, running no task.
+
+    Stopping it that way is its normal end (exit 0); a server that exits
+    on its own is exit 5.
+    """
+    points = _resolve(file, sets, root, point, EXIT_USAGE)
+    resolved = _select(points, point)
+    planned = _plan(points, point, None)
+    _supervise()
+    flags = PlacementFlags(role, host_index, head_address, advertise_ip, role_hosts)
+    options = _options("up", results_dir, flags=flags, resolved=resolved)
+    sys.exit(LocalTarget(options).submit(planned))
+
+
+def _endpoint(url: str) -> tuple[str, int]:
+    parts = urllib.parse.urlsplit(url)
+    if (
+        parts.scheme != "http"
+        or not parts.hostname
+        or parts.path not in ("", "/")
+        or parts.query
+    ):
+        _fail(f"--url is http://HOST:PORT, not {url}")
+    return parts.hostname, parts.port or 80
+
+
+def _against(
+    kind: str,
+    file: pathlib.Path,
+    url: str,
+    sets: Sequence[str],
+    point: str | None,
+    results_dir: pathlib.Path | None,
+    root: pathlib.Path | None,
+    lm_eval_cache: str | None = None,
+) -> NoReturn:
+    points = _resolve(file, sets, root, point, EXIT_USAGE)
+    resolved = _select(points, point)
+    try:
+        planned = plan(resolved, only=[kind], endpoint=_endpoint(url))
+    except PlanError as error:
+        _fail(str(error))
+    options = _options(
+        "url", results_dir, resolved=resolved, url=url, lm_eval_cache=lm_eval_cache
+    )
+    sys.exit(LocalTarget(options).submit(planned))
+
+
+UrlOption = click.option(
+    "--url", required=True, metavar="URL", help="The running server: http://HOST:PORT."
+)
+
+
+@main.command(epilog=f"\b\nExit codes:\n{EXIT_CODES}")
+@click.argument("file", type=FileArg)
+@UrlOption
+@SetOption
+@click.option("--point", help="The sweep point whose perf task to run.")
+@ResultsOption
+@RootOption
+def perf(
+    file: pathlib.Path,
+    url: str,
+    sets: tuple[str, ...],
+    point: str | None,
+    results_dir: pathlib.Path | None,
+    root: pathlib.Path | None,
+) -> None:
+    """Run a scenario's perf task against a server that is already up.
+
+    The client tokenizes with the served name unless the scenario names a
+    tokenizer; results and the gate are as in `run`.
+    """
+    _against("perf", file, url, sets, point, results_dir, root)
+
+
+@main.command(name="eval", epilog=f"\b\nExit codes:\n{EXIT_CODES}")
+@click.argument("file", type=FileArg)
+@UrlOption
+@SetOption
+@click.option("--point", help="The sweep point whose eval task to run.")
+@ResultsOption
+@CacheOption
+@RootOption
+def eval_(
+    file: pathlib.Path,
+    url: str,
+    sets: tuple[str, ...],
+    point: str | None,
+    results_dir: pathlib.Path | None,
+    lm_eval_cache: str | None,
+    root: pathlib.Path | None,
+) -> None:
+    """Run a scenario's eval task against a server that is already up."""
+    _against("eval", file, url, sets, point, results_dir, root, lm_eval_cache)
+
+
+# calibrate ----------------------------------------------------------------
+
+
+@main.command()
+@click.argument("file", type=FileArg)
+@click.argument(
+    "results",
+    nargs=-1,
+    required=True,
+    type=click.Path(path_type=pathlib.Path, file_okay=False, exists=True),
+)
+@click.option("--point", help="The sweep point to calibrate.")
+@click.option("--write", is_flag=True, help="Write the new baselines into FILE.")
+@RootOption
+def calibrate(
+    file: pathlib.Path,
+    results: tuple[pathlib.Path, ...],
+    point: str | None,
+    write: bool,
+    root: pathlib.Path | None,
+) -> None:
+    """New baselines from run directories: print the change, or --write it.
+
+    RESULTS are run directories of FILE's scenario, e.g. downloaded
+    artifacts of several runs. The values are check_regression.py's
+    calibration, the medians over the runs. --write rewrites only the
+    baseline entries it has values for; every other byte of FILE stays,
+    comments included. A baseline that is `from:` another scenario is
+    refused: calibrate that one.
+    """
+    points = _resolve(file, (), root, point)
+    resolved = _select(points, point)
+    try:
+        proposals = calibration.propose(resolved, results, pathlib.Path.cwd())
+    except (calibration.CalibrateError, GateError) as error:
+        _fail(str(error), EXIT_PROBLEMS)
+    click.echo(calibration.render(proposals), nl=False)
+    if not write:
+        return
+    original = file.read_text()
+    try:
+        changed = calibration.write(file, resolved.point, proposals)
+        _resolve(file, (), root, point)
+    except calibration.CalibrateError as error:
+        _fail(str(error), EXIT_PROBLEMS)
+    except SystemExit:
+        file.write_text(original)
+        _fail(
+            f"the rewritten {file} does not resolve; it is left as it was",
+            EXIT_PROBLEMS,
+        )
+    entries = f"{changed} baseline entr{'y' if changed == 1 else 'ies'}"
+    click.echo(f"wrote {entries} to {file}" if changed else "baselines unchanged")
 
 
 # dev --------------------------------------------------------------------

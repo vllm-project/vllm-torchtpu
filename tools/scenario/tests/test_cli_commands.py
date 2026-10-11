@@ -277,7 +277,7 @@ def test_run_dry_run_only(in_repo: pathlib.Path) -> None:
 @pytest.mark.parametrize(
     ("args", "message"),
     [
-        ((K3_PD,), "pass --dry-run"),
+        ((K3_PD, "--set", "server.argz=1"), "server.argz: unknown key"),
         (
             (K3_PD, "--dry-run", "--role", "nope"),
             "no role nope; roles: prefill, decode",

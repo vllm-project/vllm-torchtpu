@@ -1,0 +1,40 @@
+# One chip with the stub server: perf and lm_eval, each gated.
+schema: 1
+name: tiny
+server:
+  model:
+    name: test/tiny
+  accelerator: tpu7x
+  topology: 1x1x1
+  hosts: 1
+  chips_per_host: 1
+  env:
+    TINY_KNOB: "1"
+tasks:
+  perf:
+    isl_osl: [[128, 128]]
+    concurrency: [1, 4]
+    num_prompts:
+      per_concurrency: 2
+    random_range_ratio: 0.5
+    range_ratio_style: min
+    warmup_runs: 1
+    temperature: 0
+    baseline:
+      # Calibrated on the stub server.
+      isl128_osl128_c1:
+        completed: 2
+        median_tpot_ms: 10.0
+        output_token_throughput: 500.0
+      isl128_osl128_c4:
+        completed: 8
+        median_tpot_ms: 10.0
+  eval:
+    lm_eval:
+      tasks: [mmlu_pro, gsm8k]
+    tolerance: 0.02
+    baseline:
+      mmlu_pro:
+        "exact_match,custom-extract": 0.8
+      gsm8k:
+        "exact_match,custom-extract": 0.8

@@ -66,6 +66,7 @@ def test_plan_takes_no_target() -> None:
     assert list(inspect.signature(plan).parameters) == [
         "resolved",
         "only",
+        "endpoint",
         "tool_version",
     ]
 

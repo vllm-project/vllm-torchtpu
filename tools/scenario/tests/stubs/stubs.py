@@ -39,6 +39,28 @@ not, as the real client does. Knobs:
     STUB_BENCH_FAILED=N      report N failed requests
     STUB_BENCH_METRICS=JSON  metric values to report
 
+`lm_eval` writes <output_path>/<model>/results_<n>.json with one score per
+task; with --cache_requests it notes the task under $LM_HARNESS_CACHE_PATH.
+`evalscope eval` writes <work-dir>/reports/<model>/<dataset>.json.
+InferenceX's eval client (`-m infx.bench eval`) stages meta_env.json and a
+results file; its score validation (`-m infx.evals.validate_scores`) only
+exits. Knobs:
+
+    STUB_LM_EVAL_FAIL=TASK     exit 1 without results for TASK
+    STUB_LM_EVAL_SCORES=JSON   task -> score (default 0.8)
+    STUB_EVALSCOPE_REPORT=0    write no report
+    STUB_IX_EVAL_EXIT=N        the eval client's exit code
+    STUB_IX_FLOOR_EXIT=N       the score validation's exit code
+
+InferenceX's AgentX replay (`-m infx.bench agentic`) writes
+$RESULT_DIR/$RESULT_FILENAME.json and aiperf's export under
+$RESULT_DIR/aiperf_artifacts. Knobs:
+
+    STUB_AGENTX_SLEEP=S        take S seconds
+    STUB_AGENTX_EXIT=N         exit N
+    STUB_AGENTX_RESULT=0       write no result
+    STUB_AGENTX_VALID=false    aiperf's submission_valid (default true)
+
 `python3` runs the real interpreter for anything but `-m infx...`.
 """
 
@@ -259,10 +281,89 @@ def vllm(args: list[str]) -> int:
     return 2
 
 
+# Evals --------------------------------------------------------------------------
+
+METRIC = "exact_match,custom-extract"
+
+
+def lm_eval(args: list[str]) -> int:
+    record("lm_eval", args)
+    task = flag(args, "--tasks") or ""
+    if os.environ.get("STUB_LM_EVAL_FAIL") == task:
+        print(f"stub lm_eval: {task} failed", flush=True)
+        return 1
+    model_args = dict(
+        pair.split("=", 1)
+        for pair in (flag(args, "--model_args") or "").split(",")
+        if pair
+    )
+    for percent in (0, 50, 100):
+        sys.stdout.write(f"Requesting API: {percent:3d}%|\r")
+    sys.stdout.write("\n")
+    score = json.loads(os.environ.get("STUB_LM_EVAL_SCORES", "{}")).get(task, 0.8)
+    stderr = METRIC.replace(",", "_stderr,", 1)
+    results = {"results": {task: {METRIC: score, stderr: 0.01}}}
+    model = model_args.get("model", "model").replace("/", "__")
+    out = pathlib.Path(flag(args, "--output_path") or ".") / model
+    out.mkdir(parents=True, exist_ok=True)
+    (out / f"results_{time.time_ns()}.json").write_text(json.dumps(results))
+    cache = os.environ.get("LM_HARNESS_CACHE_PATH")
+    if cache and "--cache_requests" in args:
+        with (pathlib.Path(cache) / "requests.txt").open("a") as notes:
+            notes.write(task + "\n")
+    return 0
+
+
+def evalscope(args: list[str]) -> int:
+    record("evalscope", args)
+    if os.environ.get("STUB_EVALSCOPE_REPORT") == "0":
+        return 0
+    dataset = flag(args, "--datasets") or ""
+    model = (flag(args, "--model") or "model").replace("/", "_")
+    reports = pathlib.Path(flag(args, "--work-dir") or ".") / "reports" / model
+    reports.mkdir(parents=True, exist_ok=True)
+    (reports / f"{dataset}.json").write_text(json.dumps({"score": 0.6, "num": 8}))
+    return 0
+
+
+def infx_bench(args: list[str]) -> int:
+    if args[:1] == ["eval"]:
+        record("infx eval", args[1:])
+        stage = pathlib.Path(flag(args, "--stage-to") or ".")
+        stage.mkdir(parents=True, exist_ok=True)
+        meta = {name: os.environ.get(name) for name in ("MODEL", "TP", "EVAL_ONLY")}
+        (stage / "meta_env.json").write_text(json.dumps(meta))
+        (stage / "results_gsm8k.json").write_text(json.dumps({"score": 0.9}))
+        return int(os.environ.get("STUB_IX_EVAL_EXIT", 0))
+    if args[:1] == ["agentic"]:
+        record("infx agentic", args[1:])
+        time.sleep(number("STUB_AGENTX_SLEEP"))
+        if os.environ.get("STUB_AGENTX_RESULT") != "0":
+            directory = pathlib.Path(os.environ["RESULT_DIR"])
+            row = {"conc": int(os.environ["CONC"]), "output_tput_per_gpu": 12.5}
+            name = os.environ["RESULT_FILENAME"] + ".json"
+            (directory / name).write_text(json.dumps(row))
+            artifacts = directory / "aiperf_artifacts"
+            artifacts.mkdir(exist_ok=True)
+            valid = os.environ.get("STUB_AGENTX_VALID", "true") == "true"
+            export = {"metadata": {"submission_valid": valid}}
+            (artifacts / "profile_export_aiperf.json").write_text(json.dumps(export))
+        return int(os.environ.get("STUB_AGENTX_EXIT", 0))
+    record("infx bench", args)
+    return 2
+
+
+def validate_scores(args: list[str]) -> int:
+    record("infx validate_scores", args)
+    return int(os.environ.get("STUB_IX_FLOOR_EXIT", 0))
+
+
 INFX: dict[str, Callable[[list[str]], int]] = {
     "infx.bench_serving.benchmark_serving": lambda args: bench(
         "infx benchmark_serving", args
     ),
+    "infx.bench": infx_bench,
+    "infx.evals.validate_scores": validate_scores,
 }
 
 
@@ -273,7 +374,12 @@ def python3(args: list[str]) -> int:
     return 1
 
 
-PROGRAMS: dict[str, Callable[[list[str]], int]] = {"vllm": vllm, "python3": python3}
+PROGRAMS: dict[str, Callable[[list[str]], int]] = {
+    "vllm": vllm,
+    "python3": python3,
+    "lm_eval": lm_eval,
+    "evalscope": evalscope,
+}
 
 
 def main() -> int:

@@ -31,6 +31,7 @@ from scenario.runtime.log import Log
 from scenario.runtime.placement import Refs
 from scenario.runtime.proc import Finished, Proc
 from scenario.runtime.proc import run as run_command
+from scenario.runtime.publish import Publisher
 
 # A server at a URL counts as alive while GET /health answers within this.
 REMOTE_HEALTH_TIMEOUT_S = 10
@@ -103,6 +104,7 @@ class TaskContext:
     summary: results.Summary
     liveness: Liveness
     lm_eval_cache: str | None = None
+    publisher: Publisher | None = None
 
     @property
     def experiment(self) -> bool:

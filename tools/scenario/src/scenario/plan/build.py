@@ -90,9 +90,14 @@ def plan(
     resolved: Resolved,
     *,
     only: Sequence[str] | None = None,
+    endpoint: tuple[str, int] | None = None,
     tool_version: str = __version__,
 ) -> Plan:
     """The Plan of one resolved point.
+
+    `endpoint` (host, port) points the tasks at a server that is already
+    running, for `perf --url` and `eval --url`; by default they go to the
+    servers the Plan starts.
 
     Raises:
         PlanError: `only` names a task the point does not have.
@@ -104,6 +109,7 @@ def plan(
         overrides=resolved.overrides,
         ref_baselines=resolved.ref_baselines,
         only=only,
+        endpoint=endpoint,
         tool_version=tool_version,
     )
 
@@ -121,6 +127,7 @@ def build_plan(
     overrides: Sequence[str] = (),
     ref_baselines: Mapping[str, RefBaseline] | None = None,
     only: Sequence[str] | None = None,
+    endpoint: tuple[str, int] | None = None,
     tool_version: str = __version__,
 ) -> Plan:
     """The Plan of a validated scenario point; see plan()."""
@@ -132,7 +139,7 @@ def build_plan(
         for position, view in enumerate(views)
     )
     gates = _Gates(scenario, bool(overrides), ref_baselines or {})
-    driver = _driver(scenario, views, roles, gates, only)
+    driver = _driver(scenario, views, roles, gates, only, endpoint)
     return Plan(
         format=PLAN_FORMAT,
         tool_version=tool_version,
@@ -273,6 +280,7 @@ def _driver(
     roles: Sequence[RolePlan],
     gates: _Gates,
     only: Sequence[str] | None,
+    given: tuple[str, int] | None = None,
 ) -> DriverPlan:
     server, tasks = scenario.server, scenario.tasks
     names = [view.name for view in views]
@@ -287,7 +295,8 @@ def _driver(
         producer = next(name for name, kv in kv_roles.items() if kv == "producer")
         consumer = next(name for name, kv in kv_roles.items() if kv == "consumer")
         router = router_plan(server.router, producer, consumer)
-    host, port = endpoint(names, driver_role, router is not None)
+    host: Value
+    host, port = given or endpoint(names, driver_role, router is not None)
 
     task_env: dict[str, Value] = {"PYTHONUNBUFFERED": "1"}
     if driver_role is not None:
