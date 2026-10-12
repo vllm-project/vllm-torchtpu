@@ -10,6 +10,8 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CED: bool = False
     TPU_DEEPSEEK_V41_IMPL: str = "v1"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
+    TPU_DEEPSEEK_V41_ENGRAM_OVERLAP: bool = False
+    TPU_DEEPSEEK_V41_ENGRAM_BACKEND: str = "torch"
     TPU_DEEPSEEK_V41_SP: bool = False
     TPU_DEEPSEEK_V41_LOCAL_Q: bool = False
     TPU_K3_SP_PREFILL: bool = False
@@ -373,6 +375,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt-in (default False) to trade a small host-staging overhead for HBM.
     "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD": env_bool(
         "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", default=False
+    ),
+    # Experimental v2 graph split to stage later Engram rows during compute.
+    # Opt-in: matched TPU runs have not established a speedup or equivalence.
+    "TPU_DEEPSEEK_V41_ENGRAM_OVERLAP": env_bool(
+        "TPU_DEEPSEEK_V41_ENGRAM_OVERLAP", default=False
+    ),
+    # Migration selector: remove after the fused path covers the existing
+    # offload envelope and passes model correctness and serving comparisons.
+    "TPU_DEEPSEEK_V41_ENGRAM_BACKEND": env_with_choices(
+        "TPU_DEEPSEEK_V41_ENGRAM_BACKEND", "torch", ["torch", "pallas"]
     ),
     # Under V4.1 SP token-parallel FP8 attention, project q only for this
     # rank's token shard with an all-gathered wq_b and run wo_a for every

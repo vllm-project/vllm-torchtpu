@@ -2,7 +2,9 @@
 """Coverage tests for Deepseek V4.1 v2 model SP and mHC pre-sums."""
 
 import unittest.mock
+from contextlib import contextmanager
 from dataclasses import dataclass, field
+from math import prod
 from types import SimpleNamespace
 from typing import Any
 
@@ -311,6 +313,14 @@ def test_prepare_engram_full_path(monkeypatch: pytest.MonkeyPatch):
 
     ids = torch.arange(4, dtype=torch.int32)
     pos = torch.arange(4, dtype=torch.int32)
+
+    deferred = {0: None}
+    v2_model.DeepseekV41Model._prepare_engram(
+        model, ids, pos, None, deferred_embeddings=deferred
+    )
+    assert not prepared_embeddings
+    assert deferred[0][0] is model.layers[0].engram
+    torch.testing.assert_close(deferred[0][1], torch.ones((4, 1), dtype=torch.int32))
 
     # 1. skip_lookup=True
     h, m = v2_model.DeepseekV41Model._prepare_engram(
@@ -986,3 +996,233 @@ def test_deepseek_v41_causal_lm(monkeypatch: pytest.MonkeyPatch):
         NotImplementedError, match="does not support speculative method"
     ):
         v2_model.DeepseekV41ForCausalLM(vllm_config=vllm_cfg)
+
+
+@pytest.mark.parametrize("stage", ["full", "encoder"])
+@pytest.mark.parametrize("sequence_parallel", [False, True])
+@pytest.mark.cpu_test
+def test_engram_pipeline_preserves_mhc_and_defers_later_staging(
+    monkeypatch, stage, sequence_parallel
+):
+    """A split retains mHC/aux state and submits compute before the next upload."""
+    events = []
+    current_context = SimpleNamespace(value=None)
+
+    @dataclass
+    class Context:
+        is_padding: torch.Tensor
+
+    @contextmanager
+    def override(context):
+        previous = current_context.value
+        current_context.value = context
+        try:
+            yield
+        finally:
+            current_context.value = previous
+
+    def shard(value):
+        return value[: -(-value.shape[0] // 2)]
+
+    def post(hidden, residual, post_mix, res_mix):
+        return hidden * post_mix + residual * res_mix
+
+    class Layer(torch.nn.Module):
+        def __init__(self, index):
+            super().__init__()
+            self.index = index
+            self.rows = None
+            self.attn_norm = torch.nn.Identity()
+            self.attn = SimpleNamespace(
+                write_encoder_global_kv=lambda *args, **kwargs: events.append("kv")
+            )
+
+        def prepare_embeddings(self, ids):
+            events.append(f"prepare{self.index}")
+            self.rows = ids.float().view(-1, 1, 1)
+
+        def forward(
+            self,
+            hidden,
+            positions,
+            ids,
+            pre_mix,
+            post_mix,
+            res_mix,
+            residual,
+            hashes,
+            mask,
+            capture_previous_aux=False,
+        ):
+            events.append(f"layer{self.index}")
+            assert current_context.value.is_padding.shape[0] == hidden.shape[0]
+            aux = None
+            if residual is not None:
+                hidden = post(hidden, residual, post_mix, res_mix)
+                hidden = hidden + pre_mix
+                if capture_previous_aux:
+                    aux = hidden.mean(1)
+            if self.index in (0, 2):
+                rows = shard(self.rows) if sequence_parallel else self.rows
+                hidden = hidden + rows
+            ones = torch.ones_like(hidden)
+            return hidden * 2, hidden, ones * 0.25, ones * 0.5, ones * 0.75, aux
+
+    model = v2_model.DeepseekV41Model.__new__(v2_model.DeepseekV41Model)
+    torch.nn.Module.__init__(model)
+    model.start_layer, model.end_layer, model._ced_boundary = 0, 4, 4
+    model._ced_compile_sizes = (4, 5, 6)
+    model.use_sequence_parallel = sequence_parallel
+    model.use_native_mega_moe = False
+    model._mtp_hidden_buffer = None
+    model._engram_prepared_outside_stage = False
+    model.aux_hidden_state_layers = [1, 2, 4]
+    model.norm = torch.nn.Identity()
+    model.layers = torch.nn.ModuleList([Layer(index) for index in range(5)])
+    model.embed_input_ids = lambda ids: ids.float()[:, None, None].expand(-1, 2, 3)
+
+    def prepare(
+        ids,
+        positions,
+        lookback,
+        *,
+        skip_lookup=False,
+        deferred_embeddings=None,
+        stage="full",
+    ):
+        if not skip_lookup:
+            for index in (0, 2):
+                layer = model.layers[index]
+                if deferred_embeddings is not None and index in deferred_embeddings:
+                    deferred_embeddings[index] = layer, ids + index
+                else:
+                    layer.prepare_embeddings(ids + index)
+        return ids[:, None, None].expand(-1, 2, 1), None
+
+    model._prepare_engram = prepare
+    monkeypatch.setattr(v2_model, "post", post)
+    monkeypatch.setattr(
+        v2_model, "collapse", lambda hidden, mix: (hidden + mix).mean(1)
+    )
+    monkeypatch.setattr(v2_model, "override_forward_context", override)
+    monkeypatch.setattr(
+        v2_model.upstream, "get_forward_context", lambda: current_context.value
+    )
+    monkeypatch.setattr(v2_model.upstream, "is_forward_context_available", lambda: True)
+    monkeypatch.setattr(
+        v2_model.upstream,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        v2_model.upstream, "get_tensor_model_parallel_world_size", lambda: 2
+    )
+    monkeypatch.setattr(v2_model.upstream.envs, "VLLM_MOE_SKIP_PADDING", True)
+    monkeypatch.setattr(v2_model.upstream, "sp_shard", shard)
+    monkeypatch.setattr(
+        v2_model.upstream, "sp_padding_mask", lambda mask, hidden: shard(mask)
+    )
+    monkeypatch.setattr(
+        v2_model.upstream, "sp_all_gather", lambda value: torch.cat([value, value])
+    )
+
+    def submit(tensors, wait):
+        assert not wait
+        assert len(tensors) == 6  # Five mHC tensors and the first auxiliary output.
+        events.append("submit")
+
+    monkeypatch.setattr(v2_model, "synchronize_tensors", submit)
+    cfg = SimpleNamespace(compilation_config=SimpleNamespace(mode=CompilationMode.NONE))
+    pipeline = v2_model.DeepseekV41EngramPipeline(
+        owner=model, vllm_config=cfg, boundaries=(0, 2, 4), stage=stage
+    )
+    for count, offset in [(6, 0), (4, 10), (5, 15), (6, 20)]:
+        ids = torch.arange(count) + offset
+        positions = torch.arange(count)
+        with override(Context(torch.zeros(count, dtype=torch.bool))):
+            expected = model._forward_stage(ids, positions, None, stage=stage)
+        events.clear()
+        with override(Context(torch.zeros(count, dtype=torch.bool))) as _:
+            actual = pipeline(ids, positions)
+            assert current_context.value.is_padding.shape[0] == count
+        torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+        assert events == [
+            "prepare0",
+            "layer0",
+            "layer1",
+            "submit",
+            "prepare2",
+            "layer2",
+            "layer3",
+            *(["kv"] if stage == "encoder" else []),
+        ]
+        assert not model._engram_prepared_outside_stage
+
+    def fail(*args):
+        raise RuntimeError("staging failed")
+
+    model.layers[2].prepare_embeddings = fail
+    with (
+        override(Context(torch.zeros(count, dtype=torch.bool))),
+        pytest.raises(RuntimeError, match="staging failed"),
+    ):
+        pipeline(ids, positions)
+    assert not model._engram_prepared_outside_stage
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("tp_size", [1, 2, 8])
+def test_engram_boundary_concretizes_sp_rows_from_full_token_bucket(tp_size):
+    from vllm.compilation.piecewise_backend import create_concrete_args
+
+    # Hardware differs between cases, while production keeps it constant.
+    # Do not let Dynamo generalize the closure's TP size across cases.
+    torch._dynamo.reset()
+    buckets = (16, 17, 32)
+    tail_shapes = {"hidden_states": (16,), "post_mix": (4,), "res_mix": (4, 4)}
+    compiled_buckets = []
+
+    def backend(graph, example_inputs):
+        for bucket in buckets:
+            concrete = create_concrete_args(graph, bucket)
+            outputs = graph(*concrete)
+            expected_rows = -(-bucket // tp_size)
+            assert [value.shape[0] for value in outputs] == [
+                expected_rows,
+                expected_rows,
+                expected_rows,
+            ]
+            compiled_buckets.append(bucket)
+        return graph.forward
+
+    def continuation(positions, packed, shapes):
+        state = v2_model._unpack_engram_boundary(
+            packed, shapes, positions.shape[0], tp_size
+        )
+        return (
+            state["hidden_states"],
+            state["post_mix"],
+            state["res_mix"],
+            state["aux_1"],
+        )
+
+    compiled = torch.compile(continuation, backend=backend, fullgraph=True)
+    for count in buckets:
+        rows = -(-count // tp_size)
+        state = v2_model.upstream.IntermediateTensors(
+            {
+                name: torch.arange(rows * prod(shape)).reshape(rows, *shape)
+                for name, shape in tail_shapes.items()
+            }
+            | {"aux_1": torch.arange(count * 16).reshape(count, 16)}
+        )
+        packed, shapes = v2_model._pack_engram_boundary(state, count, tp_size, buckets)
+        positions = torch.arange(count)
+        torch._dynamo.mark_dynamic(positions, 0)
+        for value in packed.tensors.values():
+            assert value.shape[0] == count
+            torch._dynamo.mark_dynamic(value, 0)
+        actual = compiled(positions, packed, shapes)
+        for result, expected in zip(actual, state.tensors.values(), strict=True):
+            torch.testing.assert_close(result, expected, rtol=0, atol=0)
+    assert set(compiled_buckets) == set(buckets)

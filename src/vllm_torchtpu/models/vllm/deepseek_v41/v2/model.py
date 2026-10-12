@@ -2,8 +2,11 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Upstream V4.1 model assembly with TPU device operations."""
 
+from collections.abc import Sequence
 from dataclasses import replace
 from itertools import islice
+from math import prod
+from typing import TYPE_CHECKING, cast
 
 import torch
 from vllm.compilation.backends import set_model_tag
@@ -34,7 +37,7 @@ from .attention import (
 from .attention_kernels import initialize_indexer, initialize_paged_attention
 from .cache import initialize_cache_ops
 from .ced import plan_decoder_replay, prefix_replay_enabled
-from .engram import Engram, NgramHashState
+from .engram import Engram, NgramHashState, ParallelEngramEmbedding
 from .host_engram import (
     HOST_ENGRAM_KEY,
     gather_host_engram_hashes,
@@ -43,6 +46,9 @@ from .host_engram import (
 from .ops import bind_device_ops, compact_rope_caches, device_hooks
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from vllm.config import VllmConfig
 
 
 def _ced_config(
@@ -127,6 +133,9 @@ def _use_sequence_parallel(vllm_config) -> bool:
 
 
 class _StageBase(torch.nn.Module):
+    owner: "DeepseekV41Model"
+    _compile_prefix: str
+
     def __init__(self, *, owner, vllm_config, prefix="", compile_tag=None):
         super().__init__()
         # Parameters retain their upstream model.layers checkpoint paths. A
@@ -204,7 +213,213 @@ class DeepseekV41DecoderStage(_StageBase):
         )
 
 
+def _pack_engram_boundary(
+    state: upstream.IntermediateTensors,
+    num_tokens: int,
+    tp_size: int,
+    token_buckets: tuple[int, ...],
+) -> tuple[upstream.IntermediateTensors, dict[str, tuple[int, ...]]]:
+    tensors = {}
+    shapes = {}
+    for name, value in state.tensors.items():
+        if name.startswith("aux_"):
+            tensors[name] = value
+            continue
+        shape = tuple(value.shape[1:])
+        columns = prod(shape)
+        # vLLM concretizes every independent symbol to the full token bucket.
+        # Give SP state that same leading dimension, without an all-gather.
+        # Only small mix tensors or non-divisible buckets need padding.
+        widths = []
+        for bucket in token_buckets:
+            rows = -(-bucket // tp_size)
+            widths.append(-(-(rows * columns) // bucket))
+        width = max(widths, default=columns)
+        flat = value.reshape(-1)
+        tensors[name] = torch.nn.functional.pad(
+            flat, (0, num_tokens * width - flat.numel())
+        ).view(num_tokens, width)
+        shapes[name] = shape
+    return upstream.IntermediateTensors(tensors), shapes
+
+
+def _unpack_engram_boundary(
+    state: upstream.IntermediateTensors,
+    shapes: dict[str, tuple[int, ...]],
+    num_tokens: int,
+    tp_size: int,
+) -> upstream.IntermediateTensors:
+    rows = -(-num_tokens // tp_size)
+    return upstream.IntermediateTensors(
+        {
+            name: value.reshape(-1)[: rows * prod(shapes[name])].view(
+                rows, *shapes[name]
+            )
+            if name in shapes
+            else value
+            for name, value in state.tensors.items()
+        }
+    )
+
+
+@support_torch_compile(
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "inputs_embeds": 0,
+        "intermediate_tensors": 0,
+    }
+)
+class DeepseekV41EngramStage(_StageBase):
+    def __init__(
+        self,
+        *,
+        owner: "DeepseekV41Model",
+        vllm_config: "VllmConfig",
+        start_layer: int,
+        end_layer: int,
+        stage: str,
+        compile_tag: str,
+    ) -> None:
+        super().__init__(owner=owner, vllm_config=vllm_config, compile_tag=compile_tag)
+        self.start_layer = start_layer
+        self.end_layer = end_layer
+        self.stage = stage
+        self.tp_size = (
+            upstream.get_tensor_model_parallel_world_size()
+            if owner._stage_uses_sequence_parallel(stage)
+            else 1
+        )
+        self.token_buckets = owner._ced_compile_sizes
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: upstream.IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        lookback_token_ids: torch.Tensor | None = None,
+        intermediate_shapes: dict[str, tuple[int, ...]] | None = None,
+    ) -> (
+        torch.Tensor
+        | upstream.IntermediateTensors
+        | tuple[upstream.IntermediateTensors, dict[str, tuple[int, ...]]]
+    ):
+        if intermediate_shapes is not None:
+            assert intermediate_tensors is not None
+            intermediate_tensors = _unpack_engram_boundary(
+                intermediate_tensors,
+                intermediate_shapes,
+                positions.shape[0],
+                self.tp_size,
+            )
+        output = self.owner._forward_stage(
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            lookback_token_ids,
+            stage=self.stage,
+            layer_range=(self.start_layer, self.end_layer),
+        )
+        end = (
+            self.owner._ced_boundary
+            if self.stage == "encoder"
+            else self.owner.end_layer
+        )
+        if self.end_layer < end:
+            assert isinstance(output, upstream.IntermediateTensors)
+            return _pack_engram_boundary(
+                output, positions.shape[0], self.tp_size, self.token_buckets
+            )
+        return output
+
+
+class DeepseekV41EngramPipeline(_StageBase):
+    """Dispatch earlier layers before staging the next offloaded Engram."""
+
+    def __init__(
+        self,
+        *,
+        owner: "DeepseekV41Model",
+        vllm_config: "VllmConfig",
+        boundaries: tuple[int, ...],
+        stage: str,
+    ) -> None:
+        super().__init__(owner=owner, vllm_config=vllm_config)
+        self.stage = stage
+        self.segments = torch.nn.ModuleList()
+        for start, end in zip(boundaries[:-1], boundaries[1:], strict=True):
+            tag = f"v41_{stage}_engram_{start}_{end}"
+            with set_model_tag(tag):
+                segment = DeepseekV41EngramStage(
+                    owner=owner,
+                    vllm_config=vllm_config,
+                    start_layer=start,
+                    end_layer=end,
+                    stage=stage,
+                    compile_tag=tag,
+                )
+            segment._compile_prefix = tag
+            self.segments.append(segment)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: upstream.IntermediateTensors | None = None,
+        inputs_embeds: torch.Tensor | None = None,
+        lookback_token_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor | upstream.IntermediateTensors:
+        segments = cast(Sequence[DeepseekV41EngramStage], self.segments)
+        deferred: dict[int, tuple[Engram, torch.Tensor] | None] = {
+            segment.start_layer: None for segment in segments[1:]
+        }
+        self.owner._prepare_engram(
+            input_ids,
+            positions,
+            lookback_token_ids,
+            stage=self.stage,
+            deferred_embeddings=deferred,
+        )
+        self.owner._engram_prepared_outside_stage = True
+        context = upstream.get_forward_context()
+        intermediate_shapes = None
+        try:
+            for index, segment in enumerate(segments):
+                pending = deferred.get(segment.start_layer)
+                if pending is not None:
+                    engram, hash_ids = pending
+                    engram.prepare_embeddings(hash_ids)
+                # Each graph receives the full padding mask; SP slices it once.
+                with override_forward_context(replace(context)):
+                    output = segment(
+                        input_ids,
+                        positions,
+                        intermediate_tensors,
+                        inputs_embeds,
+                        lookback_token_ids,
+                        intermediate_shapes=intermediate_shapes,
+                    )
+                if index == len(segments) - 1:
+                    return cast(torch.Tensor | upstream.IntermediateTensors, output)
+                if isinstance(output, (list, tuple)) and len(output) == 1:
+                    output = output[0]
+                assert isinstance(output, tuple)
+                output, intermediate_shapes = output
+                assert isinstance(output, upstream.IntermediateTensors)
+                # DEFER_AND_FUSE must enqueue this graph before the next H2D,
+                # without waiting for its computation to finish.
+                synchronize_tensors(list(output.tensors.values()), wait=False)
+                intermediate_tensors = output
+        finally:
+            self.owner._engram_prepared_outside_stage = False
+        raise AssertionError("Engram overlap requires at least one stage")
+
+
 class DeepseekV41Model(upstream.DeepseekV4Model):
+    _engram_prepared_outside_stage: bool = False
+
     def _has_cpu_offloaded_engram(self) -> bool:
         for layer in islice(self.layers, self.start_layer, self.end_layer):
             engram = getattr(layer, "engram", None)
@@ -250,6 +465,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         *,
         stage: str = "full",
         skip_lookup: bool = False,
+        deferred_embeddings: dict[int, tuple[Engram, torch.Tensor] | None]
+        | None = None,
     ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
         engram_hashes: torch.Tensor | None = None
         engram_mask: torch.Tensor | None = None
@@ -329,12 +546,20 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     if stage == "encoder"
                     else self.end_layer
                 )
-                for layer in islice(self.layers, self.start_layer, end_layer):
+                for index, layer in enumerate(
+                    islice(self.layers, self.start_layer, end_layer),
+                    start=self.start_layer,
+                ):
                     engram = getattr(layer, "engram", None)
                     if engram is not None:
-                        engram.prepare_embeddings(
-                            gathered_hashes[:, engram.layer_hash_index]
-                        )
+                        hash_ids = gathered_hashes[:, engram.layer_hash_index]
+                        if (
+                            deferred_embeddings is not None
+                            and index in deferred_embeddings
+                        ):
+                            deferred_embeddings[index] = engram, hash_ids
+                        else:
+                            engram.prepare_embeddings(hash_ids)
         return engram_hashes, engram_mask
 
     def forward(
@@ -346,7 +571,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         lookback_token_ids=None,
     ):
         offload_engram = self._has_cpu_offloaded_engram()
-        if offload_engram:
+        active_stage = self.encoder_stage if self._ced_enabled else self.full_stage
+        if offload_engram and not isinstance(active_stage, DeepseekV41EngramPipeline):
             input_ids_prep = (
                 input_ids.to(torch.int64)
                 if self.use_native_mega_moe
@@ -547,11 +773,19 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         *,
         encoder_pre_mix: torch.Tensor | None = None,
         stage: str = "full",
+        layer_range: tuple[int, int] | None = None,
     ) -> torch.Tensor | upstream.IntermediateTensors:
         start_layer = self._ced_boundary if stage == "decoder" else self.start_layer
         end_layer = self._ced_boundary if stage == "encoder" else self.end_layer
+        stage_end = end_layer
+        continuation = layer_range is not None and layer_range[0] != start_layer
+        if layer_range is not None:
+            start_layer, end_layer = layer_range
         stage_sp = self._stage_uses_sequence_parallel(stage)
-        if stage == "decoder":
+        if continuation:
+            assert intermediate_tensors is not None
+            hidden_states = intermediate_tensors["hidden_states"]
+        elif stage == "decoder":
             hidden_states = inputs_embeds
         elif upstream.get_pp_group().is_first_rank:
             if inputs_embeds is not None:
@@ -583,7 +817,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             # smallest token bucket at warmup. Guard chunk == 1 explicitly so
             # every bucket specializes consistently.
             tp_size = upstream.get_tensor_model_parallel_world_size()
-            sp_chunk = -(-hidden_states.shape[0] // tp_size)
+            sp_chunk = -(-positions.shape[0] // tp_size)
             _ = bool(sp_chunk == 1)
             if (
                 upstream.envs.VLLM_MOE_SKIP_PADDING
@@ -594,9 +828,10 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 # (new_zeros of a symbolic size) fails torch_tpu lowering.
                 forward_context = upstream.get_forward_context()
                 forward_context.is_padding = upstream.sp_padding_mask(
-                    forward_context.is_padding, hidden_states
+                    forward_context.is_padding, input_ids
                 )
-            hidden_states = upstream.sp_shard(hidden_states)
+            if not continuation:
+                hidden_states = upstream.sp_shard(hidden_states)
             input_ids = upstream.sp_shard(input_ids)
 
         residual, post_mix, res_mix = None, None, None
@@ -610,6 +845,17 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         # Every layer's post runs inside the next layer's fused pre, so aux
         # hidden states are read back from there instead of recomputed.
         aux_hidden_by_layer: dict[int, torch.Tensor] = {}
+        if continuation:
+            assert intermediate_tensors is not None
+            residual = intermediate_tensors["residual"]
+            post_mix = intermediate_tensors["post_mix"]
+            res_mix = intermediate_tensors["res_mix"]
+            pre_mix = intermediate_tensors["pre_mix"]
+            aux_hidden_by_layer = {
+                layer_id: intermediate_tensors[f"aux_{layer_id}"]
+                for layer_id in self.aux_hidden_state_layers
+                if f"aux_{layer_id}" in intermediate_tensors.tensors
+            }
         if stage == "decoder" and start_layer in self.aux_hidden_state_layers:
             assert hidden_states is not None
             aux_hidden = _mean_hc_streams(hidden_states)
@@ -649,6 +895,22 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                             :full_num_tokens
                         ]
                     aux_hidden_by_layer[idx] = previous_aux
+            if end_layer < stage_end:
+                assert residual is not None and pre_mix is not None
+                assert post_mix is not None and res_mix is not None
+                return upstream.IntermediateTensors(
+                    {
+                        "hidden_states": hidden_states,
+                        "residual": residual,
+                        "post_mix": post_mix,
+                        "res_mix": res_mix,
+                        "pre_mix": pre_mix,
+                        **{
+                            f"aux_{layer_id}": value
+                            for layer_id, value in aux_hidden_by_layer.items()
+                        },
+                    }
+                )
             if layer is not None:
                 # The last layer has no successor to fold its post into.
                 hidden_states = post(hidden_states, residual, post_mix, res_mix)
@@ -696,6 +958,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             if stage_sp:
                 hidden_states = upstream.sp_all_gather(hidden_states)[:full_num_tokens]
                 pre_mix = upstream.sp_all_gather(pre_mix)[:full_num_tokens]
+            assert hidden_states is not None
             num_tokens = hidden_states.shape[0]
             self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
@@ -798,7 +1061,9 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             # Separate tags prevent the two backends from sharing a cache
             # namespace. Preserve them when bucket warmup rebuilds wrappers.
             with set_model_tag("v41_encoder"):
-                self.encoder_stage = DeepseekV41EncoderStage(
+                self.encoder_stage: (
+                    DeepseekV41EncoderStage | DeepseekV41EngramPipeline
+                ) = DeepseekV41EncoderStage(
                     owner=self,
                     vllm_config=vllm_config,
                     prefix=f"{prefix}.encoder_stage",
@@ -821,11 +1086,36 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 self._ced_window,
             )
         else:
-            self.full_stage = DeepseekV41FullStage(
+            self.full_stage: DeepseekV41FullStage | DeepseekV41EngramPipeline = (
+                DeepseekV41FullStage(
+                    owner=self,
+                    vllm_config=vllm_config,
+                    prefix=f"{prefix}.full_stage",
+                )
+            )
+        stage = "encoder" if self._ced_enabled else "full"
+        end_layer = self._ced_boundary if self._ced_enabled else self.end_layer
+        offloaded_layers = [
+            index
+            for index in range(self.start_layer, end_layer)
+            if self.layers[index].engram is not None
+            and isinstance(
+                embedding := self.layers[index].engram.embed_tokens,
+                ParallelEngramEmbedding,
+            )
+            and embedding.host_offload
+        ]
+        if len(offloaded_layers) > 1 and envs.TPU_DEEPSEEK_V41_ENGRAM_OVERLAP:
+            pipeline = DeepseekV41EngramPipeline(
                 owner=self,
                 vllm_config=vllm_config,
-                prefix=f"{prefix}.full_stage",
+                boundaries=(self.start_layer, *offloaded_layers[1:], end_layer),
+                stage=stage,
             )
+            if self._ced_enabled:
+                self.encoder_stage = pipeline
+            else:
+                self.full_stage = pipeline
 
 
 class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):

@@ -696,6 +696,8 @@ class TestEngramModule:
         # 2. staged -> unpacks and dequants
         mock_emb = MagicMock()
         mock_emb.host_offload = True
+        mock_emb.cpu_offload = False
+        mock_emb.dp_size = 1
         mock_emb.part_n_hash_cols = cols
         mock_emb.block_size = block_size
         mock_emb.dim = dim
