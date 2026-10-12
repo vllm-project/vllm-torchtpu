@@ -6,7 +6,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from .mock_omni import vllm_omni_mock  # isort: split
+from .mock_omni import _MockRotaryEmbeddingWan, vllm_omni_mock  # isort: split
 
 import vllm_omni
 from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
@@ -19,6 +19,10 @@ from vllm_torchtpu.omni.patches import (
     apply_omni_tpu_patches,
 )
 from vllm_torchtpu.omni.platform import OmniTpuPlatform
+from vllm_torchtpu.omni.rope import (
+    apply_rotary_pair_swap,
+    rotary_embedding_wan_forward,
+)
 
 pytestmark = pytest.mark.omni
 
@@ -53,6 +57,26 @@ def test_platform_attributes():
     with patch("torch.device") as mock_dev:
         platform.get_torch_device()
         mock_dev.assert_called_once_with("tpu")
+
+
+def test_rope_pair_swap_matches_native():
+    rope = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
+    x = torch.randn(1, 24, 3, 16)
+    cos = torch.randn(1, 24, 1, 8)
+    sin = torch.randn(1, 24, 1, 8)
+    torch.testing.assert_close(
+        apply_rotary_pair_swap(x, cos, sin), rope.forward_native(x, cos, sin)
+    )
+
+
+def test_rope_patch_installed():
+    apply_omni_model_specific_patches()
+    assert _MockRotaryEmbeddingWan.forward is rotary_embedding_wan_forward
+    # Non-TPU tensors keep the original CustomOp dispatch.
+    rope = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
+    x = torch.randn(1, 4, 2, 8)
+    cos, sin = torch.randn(1, 4, 1, 4), torch.randn(1, 4, 1, 4)
+    torch.testing.assert_close(rope(x, cos, sin), rope.forward_native(x, cos, sin))
 
 
 def test_device_control_env_var():
