@@ -98,10 +98,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
         Ulysses sequence parallelism moves q, k, v and the attention output
         through dense all-to-alls in every transformer block. By default XLA
-        runs them on the TensorCore, which waits for them. With the SparseCore
-        offload, Wan2.2-I2V-A14B at 480x832x81 on 8 v7x cores (CFG 2 x
-        Ulysses 4) went from 0.927 to 0.906 and from 0.926 to 0.909 s per step
-        in two A/B runs, with bit-identical output.
+        runs them on the TensorCore, which waits for them.
         """
         # TODO: Remove once libtpu enables the SparseCore dense all-to-all offload by
         # default. This sets os.environ after torch_tpu is imported, but it still

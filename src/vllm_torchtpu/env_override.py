@@ -6,6 +6,9 @@ import os
 # envs.py imports nothing from this package, so it is safe to load here,
 # while the package's own __init__ is still running.
 from vllm_torchtpu import envs
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 # Configure TorchTPU compilation cache environment variables directly
 if envs.TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT:
@@ -160,13 +163,31 @@ def _resolve_sc_offload_threshold_bytes() -> int | None:
 _existing_libtpu_args = os.environ.get("LIBTPU_INIT_ARGS", "")
 
 
-def _user_has_flag(flag_name: str) -> bool:
+def _user_has_flag(flag_name: str, args_string: str | None = None) -> bool:
     # Tokenized startswith("<flag>=") check so a hypothetical longer flag
     # that embeds ours as a prefix doesn't false-positive.
+    if args_string is None:
+        args_string = _existing_libtpu_args
     return any(
         token.startswith(flag_name + "=") or token == flag_name
-        for token in _existing_libtpu_args.split()
+        for token in args_string.split()
     )
+
+
+def set_libtpu_flag_default(flag_name: str, value: str) -> None:
+    """Append ``<flag_name>=<value>`` to ``LIBTPU_INIT_ARGS`` unless already set.
+
+    Must be called before the PjRt client is initialized (libtpu parses
+    ``LIBTPU_INIT_ARGS`` at PjRt client creation, not when ``libtpu.so`` is
+    loaded). An explicit user setting in ``LIBTPU_INIT_ARGS`` (either
+    ``<flag_name>=...`` or bare ``<flag_name>``) takes precedence.
+    """
+    current = os.environ.get("LIBTPU_INIT_ARGS", "")
+    if _user_has_flag(flag_name, current):
+        return
+    new_args = f"{current} {flag_name}={value}".strip()
+    os.environ["LIBTPU_INIT_ARGS"] = new_args
+    logger.info("Appended default flag to LIBTPU_INIT_ARGS: %s", new_args)
 
 
 _libtpu_extra_args: list[str] = []
@@ -252,20 +273,3 @@ def _patch_jax_pallas_fori_lowering() -> None:
 from vllm_torchtpu import patch_registry  # noqa: E402
 
 patch_registry.apply("import")
-
-
-def set_libtpu_flag_default(flag_name: str, value: str) -> None:
-    """Append ``<flag_name>=<value>`` to ``LIBTPU_INIT_ARGS`` unless already set.
-
-    Must be called before the PjRt client is initialized (libtpu parses
-    ``LIBTPU_INIT_ARGS`` at PjRt client creation, not when ``libtpu.so`` is
-    loaded). An explicit user setting in ``LIBTPU_INIT_ARGS`` (either
-    ``<flag_name>=...`` or bare ``<flag_name>``) takes precedence.
-    """
-    current = os.environ.get("LIBTPU_INIT_ARGS", "")
-    if any(
-        token.startswith(flag_name + "=") or token == flag_name
-        for token in current.split()
-    ):
-        return
-    os.environ["LIBTPU_INIT_ARGS"] = f"{current} {flag_name}={value}".strip()
