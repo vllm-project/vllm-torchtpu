@@ -116,7 +116,7 @@ def _load_input_image() -> Image.Image:
 
 
 def _compute_ssim(img1: np.ndarray, img2: np.ndarray) -> float:
-    """Mean SSIM across RGB channels."""
+    """Global (single-window) SSIM, mean over RGB channels."""
     c1 = (0.01 * 1.0) ** 2
     c2 = (0.03 * 1.0) ** 2
     ssims = []
@@ -199,8 +199,9 @@ class TestQwenImageEditPrCiOnTpu:
     def test_qwen_image_edit_seed_parity_tpu(self, edit_engine):
         """Test identical seeds produce bitwise identical output on TPU v7x.
 
-        Note: The first and subsequent requests produce bitwise identical results,
-        so no warm-up is required.
+        Note: The test runs after the 2-step smoke test on the shared engine,
+        so it checks repeatability of warm requests,
+        not first-request-after-startup identity.
         """
         input_image = _load_input_image()
         prompt_dict = _build_qwen_prompt_dict(edit_engine, input_image)
