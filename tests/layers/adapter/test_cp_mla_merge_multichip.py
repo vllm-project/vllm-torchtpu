@@ -66,9 +66,7 @@ def _worker_command(result_dir: Path, extra: list[str]) -> list[str]:
 
 def _prepare_worker_env() -> dict[str, str]:
     try:
-        from torch_tpu._internal.distributed.launchers.singlehost_wrapper import (
-            prepare_tpu_environment,
-        )
+        from tests.distributed.tpu_test_utils import prepare_tpu_environment
     except ImportError as exc:
         pytest.skip(f"TorchTPU is unavailable: {exc}")
     keys = (
@@ -181,6 +179,7 @@ MERGE_VARIANTS = {"a2a_reduce_sum": _merge_reduce_sum, "a2a_unrolled": _merge_un
 def _set_arm(cp_mla, arm):
     cp_mla.envs.TPU_DCP_LSE_MERGE_A2A = ARMS[arm]
     cp_mla.envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS = 1 << 30
+    cp_mla.envs.TPU_DCP_RS_OUT_PRECISION = False  # "today" stays the f32 reference
 
 
 def _compile(fn):

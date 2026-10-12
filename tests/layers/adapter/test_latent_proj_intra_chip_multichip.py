@@ -60,9 +60,7 @@ def _worker_command(result_dir: Path) -> list[str]:
 
 def _prepare_worker_env() -> dict[str, str]:
     try:
-        from torch_tpu._internal.distributed.launchers.singlehost_wrapper import (
-            prepare_tpu_environment,
-        )
+        from tests.distributed.tpu_test_utils import prepare_tpu_environment
     except ImportError as exc:
         pytest.skip(f"TorchTPU is unavailable: {exc}")
 

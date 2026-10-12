@@ -136,10 +136,11 @@ def test_plain_dummy_run_keeps_the_decode_shape_and_returns_nothing(monkeypatch)
     assert seen["input_ids"].abs().sum() == 0
 
 
-def _bucket_runner(paddings, block_size, mamba_state, mode, pp=8, cls=None):
+def _bucket_runner(paddings, block_size, mamba_state, mode, pp=8, cls=None, pcp=1):
     from vllm_torchtpu.core.pp_chunk_scheduler import SCHEDULER_CLS
 
     runner = MagicMock(spec=TPUModelRunner)
+    runner._pcp_enabled = pcp > 1
     runner.num_tokens_paddings = list(paddings)
     runner.max_num_tokens = paddings[-1]
     runner.max_model_len = 65536
@@ -191,6 +192,14 @@ def test_chunk_buckets_use_an_eighth_step_without_alignment():
     ]
 
 
+def test_chunk_buckets_hold_whole_query_blocks_under_context_parallelism():
+    # An eighth of a 2048-row step is 256 rows, half a query block.
+    runner = _bucket_runner([512, 1024, 2048], 4096, False, "none", pp=2, pcp=4)
+    runner._add_pipeline_chunk_buckets()
+    assert runner._pp_chunk_granularity == 512
+    assert runner.num_tokens_paddings == [512, 1024, 1536, 2048]
+
+
 def test_chunk_buckets_are_skipped_without_dynamic_chunks():
     runner = _bucket_runner([16, 16384], 4096, False, "none", cls="x.Y")
     runner._add_pipeline_chunk_buckets()
@@ -206,6 +215,8 @@ def test_profile_pipeline_chunks_times_every_point_twice_and_keeps_faster():
     runner.num_reqs_max_model_len = 8
     runner.max_num_blocks_per_req = 16
     runner._pp_chunk_granularity = 2048
+    runner.parallel_config = SimpleNamespace(prefill_context_parallel_size=1)
+    runner.scheduler_config = SimpleNamespace(max_num_batched_tokens=16384)
     calls = []
 
     def dummy_run(tokens, num_reqs, num_blocks, use_max_model_len, profile_prefix):
@@ -237,10 +248,12 @@ def test_profile_pipeline_chunks_times_every_point_twice_and_keeps_faster():
     assert report["schedule"] is None
 
 
-def _profile_runner(paddings, max_tokens, capacity):
+def _profile_runner(paddings, max_tokens, capacity, pcp=1):
     runner = MagicMock(spec=TPUModelRunner)
     runner.num_tokens_paddings = paddings
     runner.max_num_tokens = max_tokens
+    runner.parallel_config = SimpleNamespace(prefill_context_parallel_size=pcp)
+    runner.scheduler_config = SimpleNamespace(max_num_batched_tokens=max_tokens * pcp)
     runner.max_model_len = 262144
     runner.num_reqs_max_model_len = 64
     runner.max_num_blocks_per_req = 64
@@ -267,6 +280,19 @@ def test_profile_skips_points_past_the_schedule_capacity():
         (32768, 0),
     ]
     assert report["schedule"] == (13436, 256, 256)
+
+
+def test_profile_reports_step_tokens_under_context_parallelism():
+    """A bucket counts one rank's rows, the scheduler counts tokens: a bucket
+    of 4096 rows on each of two ranks is a step of 8192 tokens."""
+    runner = _profile_runner([512, 4096, 8192], 8192, None, pcp=2)
+    # The largest bucket is a spare: two ranks of 8192 rows exceed the step.
+    runner.scheduler_config.max_num_batched_tokens = 8192
+    calls = []
+    runner._dummy_run = lambda tokens, *args, **kwargs: calls.append(tokens) or 1.0
+    report = TPUModelRunner.profile_pipeline_chunks(runner)
+    assert sorted(set(calls)) == [512, 4096]
+    assert sorted({t for t, _, _ in report["samples"]}) == [1024, 8192]
 
 
 def test_profile_refuses_a_step_one_request_cannot_run():

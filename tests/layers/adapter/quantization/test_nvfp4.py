@@ -13,7 +13,7 @@
 # limitations under the License.
 """Tests for NVFP4 (ModelOpt FP4) quantization support for TPU.
 
-Verifies helper functions (_fresh, _to_kernel_scale, _requant_moe_w4a8),
+Verifies helper functions (fresh_buffer, _to_kernel_scale, _requant_moe_w4a8),
 VllmNvfp4Config dispatch, VllmNvfp4LinearMethod (create_weights,
 process_weights_after_loading, apply), and VllmNvfp4MoEMethod (create_weights,
 process_weights_after_loading across W4A16 and W4A8 paths, apply_monolithic).
@@ -35,7 +35,6 @@ from vllm_torchtpu.layers.adapter.quantization.nvfp4 import (
     VllmNvfp4Config,
     VllmNvfp4LinearMethod,
     VllmNvfp4MoEMethod,
-    _fresh,
     _NullInputQuantKernel,
     _requant_moe_w4a8,
     _to_kernel_scale,
@@ -44,6 +43,7 @@ from vllm_torchtpu.layers.adapter.quantization.unquantized import (
     VllmUnquantizedFusedMoEMethod,
     VllmUnquantizedLinearMethod,
 )
+from vllm_torchtpu.utils import fresh_buffer
 
 
 class FakeActivation:
@@ -91,7 +91,7 @@ class TestNvfp4Helpers:
 
     def test_fresh(self):
         t = torch.randn(4, 8, dtype=torch.float32)
-        f = _fresh(t)
+        f = fresh_buffer(t)
         assert torch.equal(f, t)
         assert f.data_ptr() != t.data_ptr()
         assert f.dtype == t.dtype

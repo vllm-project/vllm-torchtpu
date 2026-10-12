@@ -551,6 +551,7 @@ def _build_writeback_segment_descriptors(
     )
     discontinuous = compact_slot_ids != previous_slots + 1
     if kv_layout == KVLayout.SEQ_ALONG_LANE:
+        assert page_size is not None
         crossed_page = (compact_slot_ids // page_size) != (previous_slots // page_size)
         discontinuous = jnp.logical_or(discontinuous, crossed_page)
     segment_starts = jnp.logical_and(

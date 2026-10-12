@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -428,7 +429,9 @@ def compress_norm_rope_store(
     )
     out_shapes = (
         jax.ShapeDtypeStruct(cache.shape, cache.dtype),
-        jax.ShapeDtypeStruct(rope_cache.shape, rope_cache.dtype)
+        jax.ShapeDtypeStruct(
+            cast(jax.Array, rope_cache).shape, cast(jax.Array, rope_cache).dtype
+        )
         if cfgs.dims.has_rope_cache
         else None,
     )

@@ -150,7 +150,7 @@ def _mla_sliding_window_ragged_paged_attention_kernel(
     m_ref,  # [bq_sz * num_q_heads],
     acc_ref,  # [bq_sz * num_q_heads, head_dim],
     *,
-    static_q_len: int,
+    static_q_len: int | None,
     sm_scale: float,
     sliding_window: int,
     logical_page_size: int,

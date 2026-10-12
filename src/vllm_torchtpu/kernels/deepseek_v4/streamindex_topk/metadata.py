@@ -11,8 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Calculates batch_tile_idx, bq_idx, and bkv_idx metadata
-for 1D pipeline step schedule."""
+"""Calculates batch_tile_idx, bq_idx, and bkv_idx for the 1D pipeline schedule."""
 
 import dataclasses
 from typing import Any

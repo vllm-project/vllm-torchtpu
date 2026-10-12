@@ -554,6 +554,21 @@ class TPUModelRunner(GPUModelRunner):
             or self.speculative_config.method == "dflash"
         )
 
+    @property
+    def _fence_spec_kv_under_token_copy(self) -> bool:
+        """A KV producer whose Stage-3 registration is published ahead of
+        the finish must have every KV write of a step, the drafter's
+        included, executed before that step's sampled tokens reach the
+        host (the consumer pulls as soon as the first token is out)."""
+        if not self._is_async_drafter:
+            return False
+        transfer_config = self.vllm_config.kv_transfer_config
+        return (
+            transfer_config is not None
+            and bool(transfer_config.is_kv_producer)
+            and dist_utils.get_stage3_register_ahead_enabled()
+        )
+
     def __init__(
         self,
         vllm_config: VllmConfig,
@@ -4679,6 +4694,22 @@ class TPUModelRunner(GPUModelRunner):
                         device_seed=device_seed,
                     )
 
+        if copy_state is not None and self._fence_spec_kv_under_token_copy:
+            # A Raiden producer registers a request's KV blocks ahead of its
+            # finish, so a consumer may pull as soon as the first token is
+            # out, while the drafter's KV writes above are still deferred.
+            # Enqueue the drafter's graph now through its own output (the
+            # draft tokens depend on the draft-layer attention that performs
+            # those writes) and move the sampled-token copy's ready event
+            # behind it, so the host sees this step's tokens only once every
+            # KV write of the step has executed. Rooting the enqueue on the
+            # draft tokens keeps the graph to the drafter itself; rooting it
+            # on the KV cache tensors was measured to enqueue work the size
+            # of the whole forward again.
+            if isinstance(eagle3_drafts, torch.Tensor):
+                synchronize_tensors([eagle3_drafts], wait=False)
+            copy_state.fence_pending_device_work()
+
         # Save, poll and clear the KV connector only after the drafter. Its
         # forward above writes the draft layers' KV into the blocks the target
         # just filled; a save taken before it, or the save fence
@@ -5521,6 +5552,14 @@ class TPUModelRunner(GPUModelRunner):
         granularity = chunk_granularity(
             self.cache_config.block_size, self.max_num_tokens, block_aligned
         )
+        if self._pcp_enabled:
+            # A context-parallel step holds whole query blocks on every rank.
+            from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import (
+                PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE,
+            )
+
+            query_block = PCP_STREAMING_RPA_LOCAL_COMPILE_TOKEN_MULTIPLE
+            granularity = -(-granularity // query_block) * query_block
         self._pp_chunk_granularity = granularity
         extra = sorted(
             set(chunk_buckets(self.max_num_tokens, granularity))
@@ -5561,8 +5600,14 @@ class TPUModelRunner(GPUModelRunner):
                     "core. Use a smaller --max-num-batched-tokens, or "
                     "fewer --max-num-seqs or a shorter --max-model-len."
                 )
+        # A bucket counts this rank's rows; under prefill context parallelism
+        # a step of that many rows per rank is pcp times as long, and the
+        # scheduler sizes steps in tokens.
+        pcp = self.parallel_config.prefill_context_parallel_size
+        step = self.scheduler_config.max_num_batched_tokens
+        buckets = [b for b in self.num_tokens_paddings if b * pcp <= step]
         points = profile_points(
-            self.num_tokens_paddings, self.max_num_tokens, self.max_model_len, schedule
+            buckets, self.max_num_tokens, self.max_model_len, schedule
         )
         samples = []
         started = time.perf_counter()
@@ -5580,7 +5625,7 @@ class TPUModelRunner(GPUModelRunner):
                 assert elapsed_ms is not None
                 timings.append(elapsed_ms)
             ms = min(timings)
-            samples.append((int(tokens), int(prefix), float(ms)))
+            samples.append((int(tokens) * pcp, int(prefix), float(ms)))
         logger.info(
             "Pipeline step profile (%d points, %.1f s): %s",
             len(samples),
@@ -5590,7 +5635,8 @@ class TPUModelRunner(GPUModelRunner):
         granularity = self._pp_chunk_granularity
         assert granularity is not None
         return {
-            "granularity": int(granularity),
+            # The scheduler sizes steps in tokens, like the samples above.
+            "granularity": int(granularity) * pcp,
             "samples": samples,
             "schedule": schedule,
         }

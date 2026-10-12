@@ -211,19 +211,22 @@ def test_shape_derivation_matches_max_model_len():
 
 
 @pytest.mark.tpu_test
-@pytest.mark.parametrize("b,k", [(64, 2048), (128, 2048)])
-def test_exact_topk_when_stage_two_needs_its_own_partition(b, k):
-    """`p * k_p` past one slice must recurse, not overflow SparseCore.
+@pytest.mark.parametrize("b,k", [(16, 2048), (64, 2048), (128, 2048)])
+def test_exact_topk_at_1m_with_single_buffered_slices(b, k):
+    """1M rows must stay on one SparseCore by single-buffering 64K slices.
 
-    At 1M context `p` reaches 32, so stage 2 sees 65536 candidates. Feeding
-    that straight to `_sc_topk_direct` fails to compile with E3000
-    CompileTimeSparseCoreAllocationFailure in tile_spmem. Below `b=32` the
-    single stage-1 wave keeps the same width inside budget, so the batch sizes
-    here are the ones that actually reproduce it.
+    At 1M context the double-buffered budget needs `p=32`, but a cooperative
+    group shares its histogram in one SparseCore's VMEM_SHARED, so it holds at
+    most 16 subcores. Past that the group spans two SparseCores and the core
+    halts at runtime (E0200 RuntimeUnexpectedCoreHalt), poisoning every later
+    test in the process. `_pick_partition` instead returns `p=16` with slices
+    twice `MAX_SLICE_WORDS`, which only fit in tile memory single-buffered;
+    double-buffered they fail to compile with E3000. `b=16` is a single wave,
+    the others pipeline several.
     """
     p = _pick_partition(b, N_1M, k)
-    assert p * min(k, N_1M // p) > MAX_SLICE_WORDS, (
-        f"{b=} {k=} no longer reaches the recursive stage-2 path (p={p})"
+    assert p == 16 and N_1M // p > MAX_SLICE_WORDS, (
+        f"{b=} {k=} no longer reaches the single-buffered path (p={p})"
     )
     rng = np.random.default_rng(SEED)
     scores = _scores("random", b, N_1M, rng)
@@ -398,21 +401,19 @@ def test_return_scores(b: int, n: int, k: int):
 # --------------------------------------------------------------------------- #
 # Scheduling groups.
 # --------------------------------------------------------------------------- #
-# `scheduling_group_id` puts stage 1 in an XLA scheduling group and
-# `stage2_scheduling_group_id` puts stage 2 in a *different* one, so a caller
-# pipelining several chunks can overlap each stage with a different chunk's
-# TensorCore work. Stage 2 only exists on the two-stage path.
+# `scheduling_group_id` puts the SparseCore call in an XLA scheduling group, so a
+# caller pipelining several chunks can overlap it with a different chunk's
+# TensorCore work. Every partition factor is now one cooperative call, so there
+# is no second stage and no stage-2 id.
 #
-# Both ids are scheduling hints, so there are exactly two ways they can be
-# wrong: the annotation lands on the wrong stage (or leaks onto a stage the
-# caller left unannotated, which would pin two stages into one group and
-# serialise the overlap it was added to create), or it perturbs the selection.
-# One test each. Which stage gets which id is decided before any kernel is
-# built, so that half runs on CPU and only the other two need a TPU.
+# The id is a scheduling hint, so there are exactly two ways it can be wrong:
+# the annotation is lost (or appears when not asked for), or it perturbs the
+# selection. One test each. Which call gets the id is decided before any kernel
+# is built, so that half runs on CPU and only the other two need a TPU.
 
-# `b=16, n=N_128K` is the two-stage shape; `b=64, n=N_SHORT` is single-stage.
-TWO_STAGE = (16, N_128K, 2048)
+# `b=64, n=N_SHORT` is P=1; `b=16, n=N_128K` is one cooperative call at P=8.
 SINGLE_STAGE = (64, N_SHORT, 2048)
+COOPERATIVE = (16, N_128K, 2048)
 
 
 def _stage_group_ids(monkeypatch, b, n, k, **kwargs) -> list[int | None]:
@@ -424,7 +425,7 @@ def _stage_group_ids(monkeypatch, b, n, k, **kwargs) -> list[int | None]:
     """
     seen: list[int | None] = []
 
-    def _stub(scores, k_, row_lengths, *, write_empty=True, scheduling_group_id=None):
+    def _stub(scores, k_, row_lengths, *, scheduling_group_id=None, **_):
         seen.append(scheduling_group_id)
         out = jnp.zeros((scores.shape[0], k_), jnp.int32)
         return out, out
@@ -435,35 +436,29 @@ def _stage_group_ids(monkeypatch, b, n, k, **kwargs) -> list[int | None]:
 
 
 @pytest.mark.parametrize(
-    "shape,kwargs,expected",
+    "shape,expected_p,kwargs,expected",
     [
-        # Each stage gets its own group, and stage 2 gets the stage-2 one.
-        (TWO_STAGE, dict(scheduling_group_id=3, stage2_scheduling_group_id=4), [3, 4]),
-        # Stage 2 unannotated: it must NOT inherit stage 1's group.
-        (TWO_STAGE, dict(scheduling_group_id=3), [3, None]),
-        # Stage 1 unannotated, stage 2 annotated: the two are independent.
-        (TWO_STAGE, dict(stage2_scheduling_group_id=4), [None, 4]),
-        (TWO_STAGE, {}, [None, None]),
-        # One stage exists, so the stage-2 id is accepted and unused.
-        (SINGLE_STAGE, dict(scheduling_group_id=3, stage2_scheduling_group_id=4), [3]),
-        (SINGLE_STAGE, dict(stage2_scheduling_group_id=4), [None]),
+        (SINGLE_STAGE, 1, dict(scheduling_group_id=3), [3]),
+        (SINGLE_STAGE, 1, {}, [None]),
+        (COOPERATIVE, 8, dict(scheduling_group_id=3), [3]),
+        (COOPERATIVE, 8, {}, [None]),
     ],
-    ids=["both", "stage1_only", "stage2_only", "neither", "p1_both", "p1_stage2_only"],
+    ids=["p1", "p1_none", "p8", "p8_none"],
 )
 def test_each_stage_gets_the_group_id_it_was_given(
-    monkeypatch, shape, kwargs, expected
+    monkeypatch, shape, expected_p, kwargs, expected
 ):
     b, n, k = shape
-    assert _pick_partition(b, n, k) == (8 if len(expected) == 2 else 1)
+    assert _pick_partition(b, n, k) == expected_p
     assert _stage_group_ids(monkeypatch, b, n, k, **kwargs) == expected
 
 
 @pytest.mark.tpu_test
 def test_scheduling_group_ids_reach_the_lowered_hlo():
     """The stub test above proves the plumbing; this proves the plumbing does
-    something. Both ids have to survive as frontend attributes, or the stages
-    are annotated only in the source."""
-    b, n, k = TWO_STAGE
+    something. The id has to survive as a frontend attribute, or the call is
+    annotated only in the source."""
+    b, n, k = COOPERATIVE
     assert _pick_partition(b, n, k) == 8
     scores = jnp.zeros((b, n), jnp.float32)
     row_lengths = jnp.full((b,), n, jnp.int32)
@@ -471,14 +466,8 @@ def test_scheduling_group_ids_reach_the_lowered_hlo():
     def _text(**kwargs):
         return sparsecore_topk.lower(scores, k, row_lengths, **kwargs).as_text()
 
-    both = _text(scheduling_group_id=3, stage2_scheduling_group_id=4)
-    assert '_scheduling_group_id = "3"' in both
-    assert '_scheduling_group_id = "4"' in both
-
+    assert '_scheduling_group_id = "3"' in _text(scheduling_group_id=3)
     # Nothing is annotated unless it was asked for.
-    stage1_only = _text(scheduling_group_id=3)
-    assert '_scheduling_group_id = "3"' in stage1_only
-    assert '_scheduling_group_id = "4"' not in stage1_only
     assert "_scheduling_group_id" not in _text()
 
 
@@ -486,7 +475,7 @@ def test_scheduling_group_ids_reach_the_lowered_hlo():
 @pytest.mark.parametrize("kind", ["random", "heavy_ties"])
 def test_scheduling_group_ids_do_not_change_the_selection(kind):
     """A scheduling hint that changed the answer would be a correctness bug."""
-    b, n, k = TWO_STAGE
+    b, n, k = COOPERATIVE
     rng = np.random.default_rng(SEED)
     scores = _scores(kind, b, n, rng)
     row_lengths = np.full(b, n, np.int32)
@@ -499,7 +488,6 @@ def test_scheduling_group_ids_do_not_change_the_selection(kind):
                 k,
                 jnp.asarray(row_lengths),
                 scheduling_group_id=3,
-                stage2_scheduling_group_id=4,
             )
         )
     )

@@ -247,10 +247,6 @@ class PcpSequenceLayoutEligibility:
             raise NotImplementedError(
                 "PCP partial sequence layout does not support DCP yet."
             )
-        if self.pipeline_parallel_size > 1:
-            raise NotImplementedError(
-                "PCP partial sequence layout does not support pipeline parallelism yet."
-            )
         if self.interleave_size <= 0:
             raise ValueError(
                 "PCP partial sequence layout requires cp_kv_cache_interleave_size > 0."

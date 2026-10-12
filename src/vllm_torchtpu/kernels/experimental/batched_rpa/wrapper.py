@@ -13,6 +13,8 @@
 # limitations under the License.
 """Wrapper for RPA kernel to match expected interface."""
 
+from typing import cast
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -187,6 +189,7 @@ def get_kv_cache_shape(
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         num_scale_channels = 0
         if use_per_token_scale:
+            assert scale_dtype is not None
             kv_bits = jax.dtypes.itemsize_bits(kv_dtype)
             scale_bits = jax.dtypes.itemsize_bits(scale_dtype)
             num_scale_channels = max(1, scale_bits // kv_bits)
@@ -324,6 +327,7 @@ def calculate_block_sizes(
         # during compute.
         loaded_scale_bytes = 0
         if serve_cfgs.per_token_scale:
+            assert serve_cfgs.per_token_scale_dtype is not None
             scale_bits = jax.dtypes.itemsize_bits(serve_cfgs.per_token_scale_dtype)
             scale_bytes = scale_bits // 8
             # Active k_scale and v_scale each have shape (num_kv_heads, bkv_sz)
@@ -629,10 +633,9 @@ def ragged_paged_attention(
     if out_dtype is None:
         out_dtype = queries.dtype
     if mask_value is None:
-        mask_value = jnp.finfo(out_dtype).min
+        mask_value = cast(float, jnp.finfo(out_dtype).min)
     if vmem_limit_bytes is None:
-        vmem_limit_bytes = pltpu.get_tpu_info().vmem_capacity_bytes
-
+        vmem_limit_bytes = cast(int, pltpu.get_tpu_info().vmem_capacity_bytes)
     max_num_seqs = kv_lens.shape[0]
     if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
         page_size = kv_cache.shape[4]
@@ -844,7 +847,7 @@ def ragged_paged_attention(
     # , num_lanes] to [max_tokens, num_q_heads].
     max_tokens = queries.shape[0]
     # Extract first lane (scalar LSE value per token-head pair).
-    lse = lse_hbm.reshape(
+    lse = cast(jax.Array, lse_hbm).reshape(
         num_kv_heads, max_tokens, aligned_num_q_heads_per_kv_head, num_lanes
     )[:, :max_tokens, :num_q_heads_per_kv_head, 0]
     lse = lse.swapaxes(0, 1).reshape(max_tokens, num_q_heads)

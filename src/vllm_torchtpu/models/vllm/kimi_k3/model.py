@@ -65,7 +65,7 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 from .attention import KimiDeltaAttention, MultiHeadLatentAttention, kda_state_dtype
 from .collective_ops import TokenShardCollectives
@@ -520,7 +520,7 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
 def _tpu_tp_all_gather(input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """Gather a materialized encoder output without leaving the TPU."""
-    materialized = torch.empty_like(input_).copy_(input_)
+    materialized = fresh_buffer(input_)
     synchronize_tensors(materialized)
     gathered = tensor_model_parallel_all_gather(materialized, dim=dim)
     synchronize_tensors(gathered)
@@ -945,7 +945,7 @@ class KimiK3ForConditionalGeneration(
         if merged.device.type != "tpu":
             return merged
 
-        materialized = torch.empty_like(merged).copy_(merged)
+        materialized = fresh_buffer(merged)
         synchronize_tensors(materialized)
         return materialized
 

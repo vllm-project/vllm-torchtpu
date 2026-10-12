@@ -1779,6 +1779,10 @@ _MANAGED_STORAGE_PROPERTIES = {
     "capacity_bytes": f"{_STORAGE_CAPACITY_GB_KEY} / RAIDEN_STORAGE_CAPACITY_GB",
     "tp_size": "the parallel config",
     "tp_rank": "the parallel config",
+    "pcp_size": "the parallel config",
+    "pcp_rank": "the parallel config",
+    "pp_size": "the parallel config",
+    "pp_rank": "the parallel config",
 }
 
 
@@ -1787,10 +1791,10 @@ class RaidenStorageConfig:
     """Resolved settings for the storage tier behind the host DRAM pool.
 
     Each rank writes its shard of a block to
-    `<root_dir>/<model_name>/tp<size>_r<rank>/...`. Raiden calls `<size>`
-    and `<rank>` the TP size and rank; the connector passes the storage size
-    and rank from `StorageRankCoords`, which count PCP ranks too. Raiden
-    replaces characters outside `[A-Za-z0-9._-]` in `model_name` with `_`.
+    `<root_dir>/<model_name>/<topology_dir>/...`, where `<topology_dir>` joins
+    `pp<P>_r<p>`, `pcp<C>_r<c>`, and `tp<T>_r<t>` for the declared axes from
+    `StorageRankCoords` (always `tp`, plus `pcp` and `pp` when greater than 1).
+    Raiden replaces characters outside `[A-Za-z0-9._-]` in `model_name` with `_`.
     """
 
     storage_type: str
@@ -1927,9 +1931,8 @@ def resolve_storage_config(
     engine startup: raiden itself would only log it, and every save would
     fail.
 
-    Pipeline parallelism is refused: storage files are keyed by TP and PCP
-    rank only (see `StorageRankCoords`), so pipeline stages would overwrite
-    each other's files. For testing only,
+    Pipeline parallelism is refused by default until end-to-end validation
+    completes. For testing only,
     `experimental_raiden_storage_skip_parallelism_check` or
     EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK turns that refusal
     into a warning.
@@ -1961,10 +1964,8 @@ def resolve_storage_config(
     )
     if pp_size > 1:
         problem = (
-            "the storage tier does not support pipeline parallelism "
-            f"(pp_size={pp_size}): storage files are keyed by TP and PCP rank "
-            "only, so pipeline stages would write different layers to the "
-            "same file"
+            "the storage tier does not support pipeline parallelism by default "
+            f"(pp_size={pp_size})"
         )
         if not skip_parallelism_check:
             raise ValueError(
@@ -1975,8 +1976,7 @@ def resolve_storage_config(
             )
         logger.warning(
             "TPURaidenOffloadingConnector: %s. Starting anyway, because the "
-            "experimental skip of this check is set: a block read back from "
-            "storage can carry another stage's KV. Use it for testing only.",
+            "experimental skip of this check is set. Use it for testing only.",
             problem,
         )
     if not os.environ.get("PYTHONHASHSEED"):
@@ -2016,29 +2016,24 @@ def resolve_storage_config(
 class StorageRankCoords:
     """Where one rank's shards sit in the storage layout.
 
-    Raiden keys storage files by one rank and size, which it calls the TP
-    rank and size. Every PCP rank holds a different token chunk of each
-    block, so the PCP coordinates are folded in, PCP-major as in the
-    connector's raiden P/D registration: storage rank
-    `pcp_rank * tp_size + tp_rank` of `pcp_size * tp_size`. PCP=8, TP=1 thus
-    writes `tp8_r0` to `tp8_r7` rather than eight ranks sharing `tp1_r0`.
-    A TP=8 engine writes the same directories but never the same files:
-    every block's key starts with the offload namespace, which hashes the
-    world size and the CP layout.
-
-    Pipeline stages are not folded in; `resolve_storage_config` refuses
-    pipeline parallelism.
+    Raiden keys storage directories by the declared parallelism axes in order
+    `pp`, `pcp`, `tp`: `<axis><size>_r<rank>` joined by `_`. `tp` is always
+    declared; `pcp` and `pp` are declared when their size exceeds 1, keeping
+    pure-TP directory names unchanged (`tp<T>_r<t>`).
     """
 
     tp_rank: int
     tp_size: int
     pcp_rank: int = 0
     pcp_size: int = 1
+    pp_rank: int = 0
+    pp_size: int = 1
 
     def __post_init__(self) -> None:
         for name, rank, size in (
             ("TP", self.tp_rank, self.tp_size),
             ("PCP", self.pcp_rank, self.pcp_size),
+            ("PP", self.pp_rank, self.pp_size),
         ):
             if not 0 <= rank < size:
                 raise ValueError(
@@ -2049,29 +2044,36 @@ class StorageRankCoords:
     @property
     def storage_rank(self) -> int:
         """Which of a block's shard files this rank writes."""
-        return self.pcp_rank * self.tp_size + self.tp_rank
+        return (
+            self.pp_rank * (self.pcp_size * self.tp_size)
+            + self.pcp_rank * self.tp_size
+            + self.tp_rank
+        )
 
     @property
     def storage_size(self) -> int:
         """How many shard files a block has."""
-        return self.pcp_size * self.tp_size
+        return self.pp_size * self.pcp_size * self.tp_size
 
 
 def worker_storage_rank_coords() -> StorageRankCoords:
-    """This worker's storage coordinates, read from its TP and PCP groups.
+    """This worker's storage coordinates, read from its TP, PCP, and PP groups.
 
     Not from the world rank: with data parallelism that counts the ranks of
-    every replica, while storage paths are per TP and PCP rank.
+    every replica, while storage paths are per TP, PCP, and PP rank.
     """
     from vllm.distributed import parallel_state
 
     from vllm_torchtpu.distributed.pcp import get_pcp_rank, get_pcp_world_size
 
+    pp_group = parallel_state.get_pp_group()
     return StorageRankCoords(
         tp_rank=parallel_state.get_tensor_model_parallel_rank(),
         tp_size=parallel_state.get_tensor_model_parallel_world_size(),
         pcp_rank=get_pcp_rank(),
         pcp_size=get_pcp_world_size(),
+        pp_rank=pp_group.rank_in_group,
+        pp_size=pp_group.world_size,
     )
 
 
@@ -2100,18 +2102,17 @@ def build_store_storage_backend_config(
     """The scheduler-side store's config for the storage tier.
 
     The store decides whether storage has a block by looking for the block's
-    shard files, and their paths include the shard count, the storage size;
-    left unset, raiden would assume 1. Raiden calls it the TP size, and it
-    goes in `parallelism`, as for the workers. tpu-sync-torch up to
-    0.0.1.dev20261002213151 reads the store's TP size from the `tp_size`
-    property instead, so that carries it too; later builds overwrite the
-    property from `parallelism`.
+    shard files across every declared parallelism axis (`tp`, and `pcp` or `pp`
+    when greater than 1).
     """
     cfg = _new_storage_backend_config(impl, storage)
     parallelism = impl.ParallelismConfig()
-    parallelism.tp_size = coords.storage_size
+    parallelism.tp_size = coords.tp_size
+    if coords.pcp_size > 1:
+        parallelism.pcp_size = coords.pcp_size
+    if coords.pp_size > 1:
+        parallelism.pp_size = coords.pp_size
     cfg.parallelism = parallelism
-    cfg.set_property("tp_size", str(coords.storage_size))
     return cfg
 
 
@@ -2119,15 +2120,19 @@ def build_worker_storage_backend_config(
     impl: Any, storage: RaidenStorageConfig, coords: StorageRankCoords
 ) -> Any:
     """One worker's config for the storage tier: which shard file of each
-    block it writes, passed as raiden's TP rank and size.
-
-    A worker refuses a config without a TP rank and only logs the refusal, so
-    a missing rank would surface later, as every save failing.
+    block it writes, passed as its coordinates on each declared parallelism
+    axis (`tp`, and `pcp` or `pp` when greater than 1).
     """
     cfg = _new_storage_backend_config(impl, storage)
     parallelism = impl.ParallelismConfig()
-    parallelism.tp_rank = coords.storage_rank
-    parallelism.tp_size = coords.storage_size
+    parallelism.tp_rank = coords.tp_rank
+    parallelism.tp_size = coords.tp_size
+    if coords.pcp_size > 1:
+        parallelism.pcp_rank = coords.pcp_rank
+        parallelism.pcp_size = coords.pcp_size
+    if coords.pp_size > 1:
+        parallelism.pp_rank = coords.pp_rank
+        parallelism.pp_size = coords.pp_size
     cfg.parallelism = parallelism
     return cfg
 
@@ -2283,6 +2288,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
         # checks the settings, the directory included, on its own host.
         self.tp_size = parallel.tp_size
         self.pcp_size = parallel.pcp_size
+        self.pp_size = parallel.pp_size
         self.storage_config = resolve_storage_config(
             self.extra_config,
             model_name=vllm_config.model_config.model,
@@ -2318,7 +2324,10 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
 
                 # The store holds no shard; it needs only the shard count.
                 store_coords = StorageRankCoords(
-                    tp_rank=0, tp_size=self.tp_size, pcp_size=self.pcp_size
+                    tp_rank=0,
+                    tp_size=self.tp_size,
+                    pcp_size=self.pcp_size,
+                    pp_size=self.pp_size,
                 )
                 secondary_backend_configs.append(
                     build_store_storage_backend_config(
@@ -2327,7 +2336,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 )
                 logger.info(
                     "TPURaidenOffloadingConnector: storage tier on: %s under %s "
-                    "(model dir %r, %d shards per block (TP %d x PCP %d), "
+                    "(model dir %r, %d shards per block (TP %d x PCP %d x PP %d), "
                     "capacity %s, properties %s)",
                     storage.storage_type,
                     storage.root_dir,
@@ -2335,6 +2344,7 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                     store_coords.storage_size,
                     self.tp_size,
                     self.pcp_size,
+                    self.pp_size,
                     (
                         f"{storage.capacity_bytes / (1 << 30):g} GiB"
                         if storage.capacity_bytes
@@ -2375,13 +2385,15 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 # The store looks for a block's files under the shard count
                 # from the config; a worker that disagreed would write where
                 # the store never looks.
-                assert (coords.tp_size, coords.pcp_size) == (
+                assert (coords.tp_size, coords.pcp_size, coords.pp_size) == (
                     self.tp_size,
                     self.pcp_size,
+                    self.pp_size,
                 ), (
                     "TPURaidenOffloadingConnector: worker group sizes TP="
-                    f"{coords.tp_size}, PCP={coords.pcp_size} != configured "
-                    f"TP={self.tp_size}, PCP={self.pcp_size}"
+                    f"{coords.tp_size}, PCP={coords.pcp_size}, PP={coords.pp_size} != "
+                    f"configured TP={self.tp_size}, PCP={self.pcp_size}, "
+                    f"PP={self.pp_size}"
                 )
                 backend_configs.append(
                     build_worker_storage_backend_config(
@@ -2390,12 +2402,13 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
                 )
                 logger.info(
                     "TPURaidenOffloadingConnector: rank %d writes storage shard "
-                    "%d of %d (TP rank %d, PCP rank %d) under %s",
+                    "%d of %d (TP rank %d, PCP rank %d, PP rank %d) under %s",
                     rank,
                     coords.storage_rank,
                     coords.storage_size,
                     coords.tp_rank,
                     coords.pcp_rank,
+                    coords.pp_rank,
                     self.storage_config.root_dir,
                 )
             self._worker = RaidenStoreOffloadingWorker(

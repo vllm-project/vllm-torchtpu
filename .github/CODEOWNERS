@@ -39,3 +39,8 @@
 
 # Docker Configuration
 /docker/ @QiliangCui @theminghuang
+
+# Omni and Diffusion Support
+/src/vllm_torchtpu/omni/ @mbohlool
+/tests/omni/ @mbohlool
+/tests_omni/ @mbohlool

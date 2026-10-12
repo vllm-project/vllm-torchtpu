@@ -3,7 +3,7 @@
 # agentx_client.sh against it, stop it again.
 #
 #   agentx_sweep.sh --chips 16 [--config kimi-k3-tp32-ep-agentx] [--results-dir DIR]
-#       [--duration 1800] [--fast 1|0] [--ix-ref main]
+#       [--duration 1800] [--fast 1|0] [--ix-ref SHA]
 #       [--gsm8k-limit 100] [--gsm8k-conc 8[,16,...]]
 #       [--gcs-root gs://bucket/prefix] [--port 8000]
 #
@@ -38,7 +38,7 @@ CONFIG_NAME="kimi-k3-tp32-ep-agentx"
 RESULTS_DIR="/perf_eval_results/agentx-sweep"
 DURATION=1800
 FAST=1
-IX_REF="main"
+IX_REF=""            # empty: the pin in sweep_lib.sh
 GSM8K_LIMIT=100        # 0 = skip
 GSM8K_CONC="8"
 # Physical TPU chips serving this benchmark. No default: see the note at the
@@ -88,9 +88,9 @@ AGENTX_REFERENCE_ROW=$(
 _cfg_values=$(
     # shellcheck source=/dev/null
     source "$CONFIG_FILE" >/dev/null || exit 3
-    echo "${MAX_NUM_SEQS:-0} ${AGENTX_SPEC_METHOD:-none} ${AGENTX_MODEL_PREFIX:-} ${AGENTX_PRECISION:-} ${AGENTX_CONC_LIST:-}"
+    echo "${MAX_NUM_SEQS:-0} ${AGENTX_SPEC_METHOD:-none} ${AGENTX_MODEL_PREFIX:-} ${AGENTX_PRECISION:-} ${TENSOR_PARALLELISM:-1} ${DATA_PARALLELISM:-1} ${ENABLE_EP:-false} ${AGENTX_CONC_LIST:-}"
 ) || { log "FATAL: $CONFIG_NAME failed to load; the boot would fail the same way"; exit 2; }
-read -r CONFIG_MAX_NUM_SEQS SPEC_METHOD MODEL_PREFIX PRECISION CONFIG_CONC_LIST <<< "$_cfg_values"
+read -r CONFIG_MAX_NUM_SEQS SPEC_METHOD MODEL_PREFIX PRECISION CONFIG_TP CONFIG_DP CONFIG_ENABLE_EP CONFIG_CONC_LIST <<< "$_cfg_values"
 for _req in MODEL_PREFIX PRECISION; do
     if [ -z "${!_req}" ]; then
         log "FATAL: $CONFIG_NAME declares no AGENTX_${_req}; it is what InferenceX files the row under"
@@ -108,14 +108,14 @@ ix_check_conc_list "$GSM8K_CONC" || exit 1
 # PHYSICAL CHIPS, not ranks: a 2x2x4 v7x slice is 16 chips (4 hosts x
 # google.com/tpu 4, which is what GKE allocates and what Google bills per
 # chip-hour) and vLLM runs 32 ranks on it, two per chip. So TP x DP is twice the
-# divisor and the parallelism cannot give it; the caller states it, with no
-# default, because a wrong divisor silently scales the one number this benchmark
-# exists to report.
+# count and the parallelism cannot give it; the caller states it, with no
+# default, because the chips are what tokens per dollar is divided by and a wrong
+# count silently scales the one number this benchmark exists to report.
 case "${CHIPS:-}" in
     ''|*[!0-9]*|0)
         log "FATAL: --chips N is required: the number of physical TPU chips serving" \
-            "this benchmark (16 for one v7x-32 / 2x2x4 slice). It is what InferenceX" \
-            "divides total throughput by for the per-chip figure."
+            "this benchmark (16 for one v7x-32 / 2x2x4 slice). Times the rate in" \
+            "sweep_summary.py it is the cost tokens per dollar divides by."
         exit 2 ;;
 esac
 IFS=',' read -r -a CONCS <<< "$CONC_LIST"
@@ -177,18 +177,24 @@ if [ -n "$MODEL_URI" ]; then
     TOK_DIR=$(python3 -c "import sys; from vllm.transformers_utils.runai_utils import ObjectStorageModel; print(ObjectStorageModel(url=sys.argv[1]).dir)" "$MODEL_URI" 2>/dev/null | tail -1)
 fi
 
-# The chip count InferenceX divides throughput by, which is PHYSICAL CHIPS and
-# not ranks: a 2x2x4 v7x slice is 16 chips (4 hosts x google.com/tpu 4, which is
-# what GKE allocates and what Google bills per chip-hour), and vLLM runs 32 ranks
-# on it - two per chip. So TP x DP is twice the divisor, and the parallelism
-# cannot give it. The deployment states it, and there is no default, because a
-# wrong divisor silently scales the one number this benchmark exists to report.
+# The chips tokens per dollar is costed over, which is PHYSICAL CHIPS and not
+# ranks: a 2x2x4 v7x slice is 16 chips (4 hosts x google.com/tpu 4, which is what
+# GKE allocates and what Google bills per chip-hour), and vLLM runs 32 ranks on
+# it - two per chip. So TP x DP is twice the count, and the parallelism cannot
+# give it. The deployment states it, and there is no default, because a wrong
+# count silently scales the one number this benchmark exists to report.
 RANKS=$(( $(ix_config_json_get tensor_parallelism) * $(ix_config_json_get data_parallelism) ))
 log "serving on $CHIPS chips with $RANKS ranks (TP x DP, from config.json)"
 if [ "$RANKS" -gt 0 ] && [ "$RANKS" -ne $(( CHIPS * 2 )) ]; then
     log "WARNING: $RANKS ranks on $CHIPS chips is not the two-per-chip v7x shape;" \
         "check K3_AGENTX_CHIPS is the chip count and not the rank count"
 fi
+
+# The shape InferenceX files the row under, from the config the server booted:
+# one aggregate worker set, vLLM's EP spanning TP x DP when the config enables
+# it (run_benchmarks.sh --enable-expert-parallel).
+EP=1; [ "$CONFIG_ENABLE_EP" != true ] || EP=$(( CONFIG_TP * CONFIG_DP ))
+ix_export_topology "$CONFIG_TP" "$CONFIG_DP" "$EP" 0
 
 # The config name is the label: it is the one file that defines this server, so
 # it identifies the row better than a string of knobs reassembled here.
@@ -201,7 +207,7 @@ bash "$SCRIPT_DIR/agentx_client.sh" \
     --results-dir "$RESULTS_DIR" \
     --duration "$DURATION" \
     --fast "$FAST" \
-    --ix-ref "$IX_REF" \
+    ${IX_REF:+--ix-ref "$IX_REF"} \
     --gsm8k-limit "$GSM8K_LIMIT" \
     --gsm8k-conc "$GSM8K_CONC" \
     --model "$(ix_config_json_get model)" \

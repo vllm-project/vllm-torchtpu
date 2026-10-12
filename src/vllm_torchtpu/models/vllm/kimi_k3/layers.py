@@ -23,6 +23,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.utils import fresh_buffer
 
 from .collective_ops import TokenShardCollectives
 
@@ -175,8 +176,7 @@ class AttentionResidual(nn.Module):
         folded = (
             self.norm.weight.float() * cast(torch.Tensor, self.proj.weight)[0].float()
         )
-        out = torch.empty_like(folded)
-        out.copy_(folded)
+        out = fresh_buffer(folded)
         self.folded_weight = out
         self._prefill_op = (
             _build_attention_residual_op(self.eps) if out.device.type == "tpu" else None

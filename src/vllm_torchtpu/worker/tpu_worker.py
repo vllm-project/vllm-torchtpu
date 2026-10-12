@@ -25,6 +25,7 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     init_distributed_environment,
 )
+from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
 from vllm.utils.torch_utils import set_torch_threads_for_runtime
 from vllm.v1 import utils as vllm_utils
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -594,6 +595,12 @@ class TPUWorker(WorkerBase):
     def pp_settle(self):
         return self.model_runner.pp_settle()
 
+    def pp_drains_before_handoff(self) -> bool:
+        """Whether this worker's stage drains the slice before each hand-off
+        launch."""
+        wave = self.model_runner._pp_wave
+        return bool(getattr(wave, "drain_before_handoff", False))
+
     def profile_pipeline_chunks(self) -> dict:
         return self.model_runner.profile_pipeline_chunks()
 
@@ -747,6 +754,11 @@ class TPUWorker(WorkerBase):
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
         set_torch_threads_for_runtime()
+        # The warmed worker holds a large static heap (model, compiled
+        # executables, KV bookkeeping); freezing it keeps a gen-2 collection
+        # from scanning those objects mid-step.
+        freeze_gc_heap()
+        maybe_attach_gc_debug_callback()
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:
