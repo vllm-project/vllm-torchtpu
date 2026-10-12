@@ -119,7 +119,7 @@ steps:
       - label: "DeepSeek-V4.1-Flash: 100k prefill benchmark (TPU v7x-8)"
         key: "dsv41_flash_tp8_ep_100k_prefill"
         # Same weight streaming and startup as the GSM8K step, then a warmup
-        # and 4 measured requests of ~5 s each.
+        # and 4 measured requests of a few seconds each.
         timeout_in_minutes: 180
         agents:
           queue: "tpu_v7x_8_queue"
@@ -134,10 +134,12 @@ steps:
           # isl100000_osl1_c1.json is the prefill tok/s and TTFT the 100k
           # prefill time. The perf baseline holds only the request count, so
           # the step fails when a request fails, not on throughput; the
-          # numbers are published as artifacts and not yet gated. Build 3775
-          # measured 19372 tok/s (TTFT P50 5.18 s); PR #1575 measured 21246
-          # tok/s (TTFT 4.71 s) on its author's host with sync scheduling.
-          # Compare runs from the same environment only.
+          # numbers are published as artifacts and not yet gated. The config
+          # runs the SP, LOCAL_Q and 8192-token chunk settings of #1617/#1673;
+          # #1673 measured 50965 tok/s at C1 with them. With 2048-token chunks
+          # and SP off, builds 4189-4264 measured ~29.4k tok/s (TTFT 3.4 s).
+          # CI hosts run ~4-7% below CDK pods for the same image, so compare
+          # runs from the same environment only.
           - >-
             bash .buildkite/scripts/run_in_docker.sh
             env MODEL_URI=gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
