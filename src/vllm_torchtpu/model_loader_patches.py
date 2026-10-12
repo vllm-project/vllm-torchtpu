@@ -866,6 +866,7 @@ class ExpertParamStager:
     def flush_all(self) -> None:
         for param, _ in list(self._staged.values()):
             self.flush(param)
+        self._pool.clear()
 
     def __len__(self) -> int:
         return len(self._staged)
