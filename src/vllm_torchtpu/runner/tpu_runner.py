@@ -5198,6 +5198,21 @@ class TPUModelRunner(GPUModelRunner):
                 query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
                 position_ids_override=position_ids,
+                # An idle DP participant has no decoder replay rows. Missing
+                # host metadata means startup warmup to CED, which would force
+                # every peer to run the entire bucket through the decoder.
+                # Keep warmup/profiling full-sized; serving idle ranks contribute
+                # zero and still join the decoder bucket required by busy peers.
+                query_start_loc_cpu=(
+                    (0,) * (num_reqs + 1) if dp_lockstep and not profiling else None
+                ),
+                seq_lens_cpu=(0,) * num_reqs if dp_lockstep and not profiling else None,
+                prompt_lens_cpu=(0,) * num_reqs
+                if dp_lockstep and not profiling
+                else None,
+                replay_starts_cpu=(0,) * num_reqs
+                if dp_lockstep and not profiling
+                else None,
                 mamba_state_indices=dummy_mamba_state_indices,
                 mamba_slot_read_offsets=self.mamba_slot_read_offsets,
                 mamba_ckpt_window=self._mamba_ckpt_window,
@@ -5264,10 +5279,11 @@ class TPUModelRunner(GPUModelRunner):
             set_forward_context(
                 per_layer_attn_metadata,
                 self.vllm_config,
-                num_tokens=num_tokens if dp_lockstep else 0,
-                num_tokens_across_dp=self._dp_num_tokens_across_dp(num_tokens)
-                if dp_lockstep
-                else None,
+                # Startup warmup has real padded model rows too. Passing zero
+                # makes DP metadata describe an empty batch, while model-local
+                # collectives (e.g. sharded embeddings) consume this bucket.
+                num_tokens=num_tokens if self._dp_lockstep_enabled() else 0,
+                num_tokens_across_dp=self._dp_num_tokens_across_dp(num_tokens),
             ),
             set_vllm_model_wrapper_context(
                 mesh=self.mesh,

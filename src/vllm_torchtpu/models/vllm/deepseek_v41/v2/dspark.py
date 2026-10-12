@@ -296,6 +296,8 @@ class DSparkDeepseekV41Model(nn.Module):
 class DSparkDeepseekV41ForCausalLM(nn.Module):
     """Registry entry for ``architectures=["DSparkV41DraftModel"]`` on TPU."""
 
+    # Its MoE layers use EP even when the draft itself has TP=1.
+    requires_dp_collective_pairing = True
     has_own_embed_tokens = False
     has_own_lm_head = False
     owns_context_kv = True

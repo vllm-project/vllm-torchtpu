@@ -24,6 +24,28 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 WINDOW = 128
 
 
+@pytest.mark.parametrize("local_rows,peer_rows", [(0, 128), (128, 0), (0, 0)])
+def test_dp_decoder_bucket_preserves_empty_local_plan(
+    monkeypatch, local_rows, peer_rows
+):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import ced
+
+    group = SimpleNamespace(world_size=8, cpu_group=object())
+    monkeypatch.setattr(ced, "get_dp_group", lambda: group)
+
+    def reduce(count, op, group):
+        count.fill_(max(local_rows, peer_rows))
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+    plan = ced.DecoderReplayPlan(
+        tuple(range(local_rows)), (0, local_rows), (65536,), local_rows
+    )
+    coordinated = ced.coordinate_decoder_replay(plan, 8192)
+    assert coordinated.padded_num_tokens == max(local_rows, peer_rows)
+    assert coordinated.indices == plan.indices
+    assert coordinated.query_start_loc == plan.query_start_loc
+
+
 def _plan_metadata(bounds, lengths, prompts, hits=None):
     return SimpleNamespace(
         query_start_loc_cpu=tuple(bounds),

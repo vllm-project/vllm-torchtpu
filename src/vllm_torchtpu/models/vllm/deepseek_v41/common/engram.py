@@ -18,6 +18,8 @@ from vllm_torchtpu.layers.adapter.upstream_bindings import (
 )
 from vllm_torchtpu.model_loader_patches import register_row_slice
 
+from .host_exchange import exchange_rows
+
 
 class NgramHashState(upstream.NgramHashState):
     """Keep upstream tokenizer/layout/cache lifetime; replace Triton hashing."""
@@ -457,7 +459,12 @@ class Engram(upstream.Engram):
         return embedding
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:
-        super()._init_staging(max_tokens, head_dim)
+        if not self.embed_tokens.host_offload:
+            super()._init_staging(max_tokens, head_dim)
+        else:
+            # Packed host staging replaces the upstream BF16 device buffer.
+            self._prefetch_stream = None
+            self._prefetch_done = None
         self._staged_raw: torch.Tensor | None = None
         self._active_raw: torch.Tensor | None = None
         self._staged_by_tokens: dict[int, torch.Tensor] = {}
@@ -472,7 +479,7 @@ class Engram(upstream.Engram):
             # layer (`_unpack_bytes`): a 3-D uint8 `copy_()` takes TorchTPU's
             # slow XlaLinearize path (~9.75 vs ~0.59 ms/layer),
             # and packing raw + scale halves PJRT H2D transfers per step.
-            cols = self.embed_tokens.part_n_hash_cols
+            cols = self.embed_tokens.part_n_hash_cols * self.embed_tokens.dp_size
             blocks = head_dim // self.embed_tokens.block_size
             assert head_dim % 4 == 0, head_dim
             raw_words_per_tok = (cols * head_dim) // 4
@@ -531,14 +538,35 @@ class Engram(upstream.Engram):
         return view
 
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
-        if (
-            self._staged_raw is not None
-            and hash_ids.shape[0] <= self._host_raw.shape[0]
-        ):
-            num_tokens = hash_ids.shape[0]
-            self.embed_tokens.gather_raw(
-                hash_ids, self._host_raw[:num_tokens], self._host_scale[:num_tokens]
-            )
+        if self._staged_raw is not None:
+            dp_size = self.embed_tokens.dp_size
+            num_tokens, remainder = divmod(hash_ids.shape[0], dp_size)
+            if remainder or num_tokens > self._host_raw.shape[0]:
+                raise ValueError("Engram hashes exceed the configured DP staging slots")
+            if dp_size > 1:
+                # Lookup and redistribution stay on CPU. A device all-gather
+                # here would materialize DP copies of every replica's rows.
+                cols = self.embed_tokens.part_n_hash_cols
+                raw = torch.empty(
+                    (hash_ids.shape[0], cols, self._host_raw.shape[-1]),
+                    dtype=torch.uint8,
+                    device="cpu",
+                )
+                scales = torch.empty(
+                    (hash_ids.shape[0], cols, self._host_scale.shape[-1]),
+                    dtype=torch.uint8,
+                    device="cpu",
+                )
+                self.embed_tokens.gather_raw(hash_ids, raw, scales)
+                group = upstream.get_engram_dp_group()
+                assert group is not None and group.world_size == dp_size
+                raw, scales = exchange_rows(raw, scales, group.cpu_group, dp_size)
+                self._host_raw[:num_tokens].copy_(raw)
+                self._host_scale[:num_tokens].copy_(scales)
+            else:
+                self.embed_tokens.gather_raw(
+                    hash_ids, self._host_raw[:num_tokens], self._host_scale[:num_tokens]
+                )
             _, cols, head_dim = self._host_raw.shape
             blocks = self._host_scale.shape[-1]
             raw_words = num_tokens * ((cols * head_dim) // 4)
@@ -569,6 +597,9 @@ class Engram(upstream.Engram):
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
         if self._staged_raw is None:
             return super()._ready_rows(num_tokens)
+        local_num_tokens = num_tokens
+        assert self._active_raw is not None
+        num_tokens = self._active_raw.shape[0]
         _, cols, head_dim = self._host_raw.shape
         blocks = self._host_scale.shape[-1]
         raw_words_per_tok = (cols * head_dim) // 4
@@ -585,7 +616,7 @@ class Engram(upstream.Engram):
             raw.reshape(num_tokens, cols, head_dim),
             scale.reshape(num_tokens, cols, blocks),
             self.embed_tokens.block_size,
-        )
+        )[:local_num_tokens]
 
     def _sp_embed(self, hash_ids):
         """Rows for this rank's SP token chunk with all hash heads.

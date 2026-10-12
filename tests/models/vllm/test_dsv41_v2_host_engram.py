@@ -222,3 +222,28 @@ def test_multi_chunk_execute_model_uses_attn_metadata_builder_ctx():
     assert captured.can_hash_on_host is True
     assert captured.input_ids[:3].tolist() == [54, 55, 56]
     assert captured.lookback_token_ids[0].tolist() == [53, 52, 51, 50]
+
+
+def test_host_dp_slot_uses_snapshot_without_device_scalar_read(monkeypatch):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import host_engram
+
+    # The Engram subgroup covers global ranks 2 and 3, including an idle rank.
+    context = types.SimpleNamespace(
+        additional_kwargs={"tpu_num_tokens_across_dp_cpu": (8192, 8192, 0, 2048)},
+        dp_metadata=object(),
+    )
+    monkeypatch.setattr(host_engram, "get_forward_context", lambda: context)
+    monkeypatch.setattr(
+        host_engram, "get_dp_group", lambda: types.SimpleNamespace(rank_in_group=3)
+    )
+    monkeypatch.setattr(
+        host_engram,
+        "get_engram_dp_group",
+        lambda: types.SimpleNamespace(rank_in_group=1, world_size=2),
+    )
+
+    def device_read():
+        raise AssertionError("Host preparation must not read a device scalar")
+
+    monkeypatch.setattr(host_engram, "upstream_engram_gathered_num_tokens", device_read)
+    assert host_engram.engram_gathered_num_tokens() == 2048

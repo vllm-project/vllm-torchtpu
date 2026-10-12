@@ -106,6 +106,7 @@ def test_ced_forward_skips_sp_all_gather_on_empty_replay_plan(monkeypatch):
     @dataclass
     class _FakeCtx:
         attn_metadata: dict[str, _FakeMeta]
+        dp_metadata: object | None = None
         is_padding: torch.Tensor | None = None
         additional_kwargs: dict[str, object] = field(default_factory=dict)
 
@@ -180,6 +181,30 @@ def test_ced_forward_skips_sp_all_gather_on_empty_replay_plan(monkeypatch):
     assert out_replay.shape == (8, 16)
     assert len(gather_calls) == 2
     assert decoder_inputs == [(torch.Size([4, 4, 16]), torch.Size([4, 4]))]
+
+    # A peer needs the decoder although this replica keeps no rows. It must
+    # participate in EP with padding, then discard every padded result.
+    from vllm.forward_context import DPMetadata
+
+    context = _FakeCtx(
+        attn_metadata={"l0": _FakeMeta(seq_lens=torch.tensor([8]))},
+        dp_metadata=DPMetadata(torch.full((8,), 8, dtype=torch.int32)),
+    )
+    monkeypatch.setattr(v2_model.upstream, "get_forward_context", lambda: context)
+    monkeypatch.setattr(
+        v2_model,
+        "coordinate_decoder_replay",
+        lambda plan, count: SimpleNamespace(
+            indices=(),
+            padded_num_tokens=4,
+            query_start_loc=(0, 0),
+            replay_starts=(0,),
+        ),
+    )
+    padded_output = v2_model.DeepseekV41Model.forward(dummy, input_ids, positions)
+    assert len(decoder_inputs) == 2
+    assert decoder_inputs[-1] == (torch.Size([4, 4, 16]), torch.Size([4, 4]))
+    assert torch.count_nonzero(padded_output) == 0
 
 
 def test_mhc_pre_tpu_default_pre_mix_avoids_new_zeros_symint(monkeypatch):

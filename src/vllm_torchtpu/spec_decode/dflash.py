@@ -828,7 +828,10 @@ class DFlashProposer:
                 return False
             from vllm.model_executor.models.interfaces import is_mixture_of_experts
 
-            self._draft_has_moe_cache = bool(is_mixture_of_experts(self.draft_model))
+            self._draft_has_moe_cache = bool(
+                getattr(self.draft_model, "requires_dp_collective_pairing", False)
+                or is_mixture_of_experts(self.draft_model)
+            )
         return self._draft_has_moe_cache
 
     @torch.no_grad()

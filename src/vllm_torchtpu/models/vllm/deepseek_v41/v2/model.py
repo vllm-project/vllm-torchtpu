@@ -33,7 +33,11 @@ from .attention import (
 )
 from .attention_kernels import initialize_indexer, initialize_paged_attention
 from .cache import initialize_cache_ops
-from .ced import plan_decoder_replay, prefix_replay_enabled
+from .ced import (
+    coordinate_decoder_replay,
+    plan_decoder_replay,
+    prefix_replay_enabled,
+)
 from .engram import Engram, NgramHashState
 from .host_engram import (
     HOST_ENGRAM_KEY,
@@ -317,6 +321,10 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             if engram_hashes is not None and not skip_lookup:
                 # Gather all Engram rows before entering the decoder layers.
                 # One gather feeds every layer sharing the DP-split table.
+                if self._has_cpu_offloaded_engram():
+                    # Idle/decode replicas may hash on device while a prefill
+                    # replica hashes on host. All must use the CPU collective.
+                    engram_hashes = engram_hashes.to("cpu")
                 gathered_hashes = gather_host_engram_hashes(
                     engram_hashes,
                     dp_shared_memory=self.engram_dp_shared_memory,
@@ -345,6 +353,20 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         inputs_embeds=None,
         lookback_token_ids=None,
     ):
+        if (
+            inputs_embeds is None
+            and input_ids is not None
+            and input_ids.device.type == "tpu"
+            and self.parallel_config.data_parallel_size > 1
+        ):
+            # TP1/DP8 full-graph compilation can misinterpret the BF16 tiles
+            # of the unsharded embedding lookup. The same lookup is exact
+            # outside the graph. Materialize it before either compiled stage;
+            # retain input_ids for Engram hashing and token-based MoE routing.
+            inputs_embeds = self.embed_input_ids(input_ids)
+            # Enqueue the lookup without blocking CPU Engram preparation behind
+            # the previous chunk. The compiled stage consumes its device buffer.
+            synchronize_tensors((inputs_embeds,), wait=False)
         offload_engram = self._has_cpu_offloaded_engram()
         if offload_engram:
             input_ids_prep = (
@@ -385,6 +407,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 if first is not None
                 else None
             )
+            if context.dp_metadata is not None:
+                plan = coordinate_decoder_replay(plan, positions.shape[0])
             # SWA bounded replay: the encoder reads no SWA row below a prefix
             # hit's replay start and leaves cached KV of replayed tokens. The
             # input exists in every CED step so the compiled graph does not
@@ -422,7 +446,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         else:
             hidden, pre_mix = encoded
             encoder_aux = []
-        if plan is not None and not plan.indices:
+        if plan is not None and plan.padded_num_tokens == 0:
             # The scheduler ignores logits for incomplete prefills. The
             # encoder has still published every global KV row for this chunk;
             # skip the inter-stage SP all-gather when no decoder replay runs.
@@ -486,6 +510,18 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             ) >= len(plan.indices)
         decoder_context = replace(
             context,
+            dp_metadata=(
+                replace(
+                    context.dp_metadata,
+                    num_tokens_across_dp_cpu=torch.full_like(
+                        context.dp_metadata.num_tokens_across_dp_cpu,
+                        decoder_positions.shape[0],
+                    ),
+                    local_sizes=None,
+                )
+                if context.dp_metadata is not None
+                else None
+            ),
             attn_metadata=decoder_metadata,
             is_padding=decoder_padding,
             additional_kwargs={
@@ -840,12 +876,29 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
         return super().forward(*args, **kwargs)
 
     def __init__(self, *, vllm_config, prefix=""):
-        # Keep capability guards until their device paths are validated.
-        if (
-            vllm_config.parallel_config.pipeline_parallel_size != 1
-            or vllm_config.parallel_config.data_parallel_size != 1
-        ):
-            raise NotImplementedError("V4.1 TPU currently requires PP1 and DP1")
+        # Limit DP to the node-local host-sharded topology implemented here.
+        parallel = vllm_config.parallel_config
+        if parallel.pipeline_parallel_size != 1:
+            raise NotImplementedError("V4.1 TPU currently requires PP1")
+        if parallel.data_parallel_size > 1:
+            if (
+                parallel.tensor_parallel_size != 1
+                or not parallel.enable_expert_parallel
+                or not envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD
+            ):
+                raise NotImplementedError(
+                    "V4.1 TPU DP requires TP1, EP and Engram CPU offload"
+                )
+            if vllm_config.engram_config.dp_shared_memory:
+                raise NotImplementedError(
+                    "V4.1 TPU DP uses head-sharded host Engram tables; "
+                    "set engram_config.dp_shared_memory=False"
+                )
+            if upstream.get_engram_dp_size() != parallel.data_parallel_size:
+                raise NotImplementedError(
+                    "V4.1 TPU DP requires one node-local Engram group covering "
+                    "all DP replicas; refusing to replicate host tables"
+                )
         spec_cfg = getattr(vllm_config, "speculative_config", None)
         if spec_cfg is not None and getattr(spec_cfg, "method", None) not in (
             "dspark",

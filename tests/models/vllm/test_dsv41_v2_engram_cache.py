@@ -417,7 +417,7 @@ def test_engram_init_staging_branches():
     assert torch.all(engram_on._host_scale == v2_engram._INVALID_SCALE)
     assert torch.all(engram_on._staged_raw[:160] == 0)
     assert torch.all(engram_on._staged_raw[160:] == -1)
-    assert engram_on.staged_rows.shape == (10, 4, 16)
+    assert not hasattr(engram_on, "staged_rows")
 
     # Branch 2: cpu_offload = False
     engram_off = object.__new__(Engram)
@@ -444,6 +444,7 @@ def test_engram_prepare_embeddings_branching(monkeypatch: pytest.MonkeyPatch):
         embed = MagicMock()
         embed.host_offload = cpu_offload
         embed.cpu_offload = False
+        embed.dp_size = 1
         embed.part_n_hash_cols = cols
         embed.block_size = block
 
@@ -490,10 +491,11 @@ def test_engram_prepare_embeddings_branching(monkeypatch: pytest.MonkeyPatch):
         "prepare_embeddings",
         lambda self, hash_ids: fallback_calls.append(self),
     )
-    engram.prepare_embeddings(torch.zeros(12, cols, dtype=torch.int32))
+    with pytest.raises(ValueError, match="staging slots"):
+        engram.prepare_embeddings(torch.zeros(12, cols, dtype=torch.int32))
     engram_off = make_engram(cpu_offload=False)
     engram_off.prepare_embeddings(torch.zeros(5, cols, dtype=torch.int32))
-    assert fallback_calls == [engram, engram_off]
+    assert fallback_calls == [engram_off]
 
 
 # ==============================================================================

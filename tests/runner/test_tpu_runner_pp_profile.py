@@ -26,6 +26,7 @@ def _profile_run(monkeypatch, runner, num_tokens, prefix, first_stage=True):
 
     def capture_forward_context(attn_metadata, *_args, **_kwargs):
         seen["metadata"] = attn_metadata
+        seen["forward_kwargs"] = _kwargs
         return contextlib.nullcontext()
 
     monkeypatch.setattr(
@@ -421,4 +422,16 @@ def test_check_passes_a_long_context_step_without_the_batched_kernel(monkeypatch
     runner.seq_lens_np = np.array([262144], dtype=np.int32)
     TPUModelRunner._check_attention_schedule(
         runner, 1, np.array([65536], dtype=np.int32), 0
+    )
+
+
+def test_dp_startup_warmup_reports_its_padded_tokens(monkeypatch):
+    runner = _runner()
+    runner.parallel_config.data_parallel_size = 8
+    runner.parallel_config.enable_expert_parallel = True
+    _, _, seen = _profile_run(monkeypatch, runner, 256, None)
+    assert seen["forward_kwargs"]["num_tokens"] == 256
+    torch.testing.assert_close(
+        seen["forward_kwargs"]["num_tokens_across_dp"],
+        torch.full((8,), 256, dtype=torch.int32),
     )

@@ -1,6 +1,9 @@
 """Host planning for decoder SWA bounded replay across scheduled chunks."""
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+
+import torch
+from vllm.distributed import get_dp_group
 
 from vllm_torchtpu import envs
 
@@ -28,6 +31,24 @@ class DecoderReplayPlan:
     query_start_loc: tuple[int, ...]
     replay_starts: tuple[int, ...]
     padded_num_tokens: int
+
+
+def coordinate_decoder_replay(
+    plan: DecoderReplayPlan | None, num_tokens: int
+) -> DecoderReplayPlan | None:
+    """Make every EP participant enter the decoder with the same row bucket."""
+    group = get_dp_group()
+    if group.world_size == 1:
+        return plan
+    count = torch.tensor(
+        [num_tokens if plan is None else plan.padded_num_tokens],
+        dtype=torch.int64,
+        device="cpu",
+    )
+    torch.distributed.all_reduce(
+        count, op=torch.distributed.ReduceOp.MAX, group=group.cpu_group
+    )
+    return replace(plan, padded_num_tokens=int(count.item())) if plan else None
 
 
 def plan_decoder_replay(metadata, window, num_tokens, compile_sizes):

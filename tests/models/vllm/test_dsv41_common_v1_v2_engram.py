@@ -607,7 +607,7 @@ class TestEngramModule:
 
         # 2. cpu_offload is True
         engram.embed_tokens = SimpleNamespace(
-            host_offload=True, part_n_hash_cols=2, block_size=16
+            host_offload=True, part_n_hash_cols=2, block_size=16, dp_size=1
         )
         common_engram.Engram._init_staging(engram, 16, 32)
         assert engram._staged_raw is not None
@@ -621,6 +621,7 @@ class TestEngramModule:
             engram = object.__new__(common_engram.Engram)
             mock_emb = MagicMock()
             mock_emb.host_offload = cpu_offload
+            mock_emb.dp_size = 1
             mock_emb.part_n_hash_cols = cols
             mock_emb.block_size = block_size
             mock_emb.dim = dim
@@ -669,10 +670,13 @@ class TestEngramModule:
             "prepare_embeddings",
             lambda self, hids: fallback_calls.append(self),
         )
-        engram.prepare_embeddings(torch.zeros(max_tokens + 2, cols, dtype=torch.int32))
+        with pytest.raises(ValueError, match="staging slots"):
+            engram.prepare_embeddings(
+                torch.zeros(max_tokens + 2, cols, dtype=torch.int32)
+            )
         engram_no_offload = make_engram(cpu_offload=False)
         engram_no_offload.prepare_embeddings(hash_ids_partial)
-        assert fallback_calls == [engram, engram_no_offload]
+        assert fallback_calls == [engram_no_offload]
 
     def test_engram_ready_rows_staged_and_unstaged(
         self, monkeypatch: pytest.MonkeyPatch
@@ -696,6 +700,7 @@ class TestEngramModule:
         # 2. staged -> unpacks and dequants
         mock_emb = MagicMock()
         mock_emb.host_offload = True
+        mock_emb.dp_size = 1
         mock_emb.part_n_hash_cols = cols
         mock_emb.block_size = block_size
         mock_emb.dim = dim

@@ -1095,3 +1095,24 @@ class TestQwen3VLModelPatches:
         finally:
             if hasattr(torch, "_orig_cumsum_ref"):
                 delattr(torch, "_orig_cumsum_ref")
+
+
+def test_dp_forward_context_keeps_host_sizes_before_device_upload(monkeypatch):
+    sizes = torch.tensor([0, 2048], dtype=torch.int32)
+    device_sizes = object()
+    metadata = SimpleNamespace(num_tokens_across_dp_cpu=sizes)
+    original_to = torch.Tensor.to
+
+    def upload(tensor, *args, **kwargs):
+        if tensor is sizes:
+            assert args == ("tpu",)
+            return device_sizes
+        return original_to(tensor, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "to", upload)
+    additional = TpuPlatform.set_additional_forward_context(dp_metadata=metadata)
+    assert metadata.num_tokens_across_dp_cpu is device_sizes
+    assert additional["tpu_num_tokens_across_dp_cpu"] == (0, 2048)
+    sizes.fill_(99)
+    assert additional["tpu_num_tokens_across_dp_cpu"] == (0, 2048)
+    assert TpuPlatform.set_additional_forward_context() == {}

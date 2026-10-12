@@ -252,6 +252,7 @@ def test_prepare_engram_full_path(monkeypatch: pytest.MonkeyPatch):
     @dataclass
     class _FakeForwardCtx:
         attn_metadata: Any
+        dp_metadata: Any = None
 
     prepared_embeddings: list[torch.Tensor] = []
 
@@ -404,6 +405,7 @@ def test_model_forward_full_and_ced_paths(monkeypatch: pytest.MonkeyPatch):
     @dataclass
     class _FakeCtx:
         attn_metadata: Any
+        dp_metadata: Any = None
         is_padding: Any = None
         additional_kwargs: dict[str, Any] = field(default_factory=dict)
 
@@ -977,7 +979,7 @@ def test_deepseek_v41_causal_lm(monkeypatch: pytest.MonkeyPatch):
 
     # Capability guard exceptions
     vllm_cfg.parallel_config.pipeline_parallel_size = 2
-    with pytest.raises(NotImplementedError, match="requires PP1 and DP1"):
+    with pytest.raises(NotImplementedError, match="requires PP1"):
         v2_model.DeepseekV41ForCausalLM(vllm_config=vllm_cfg)
 
     vllm_cfg.parallel_config.pipeline_parallel_size = 1

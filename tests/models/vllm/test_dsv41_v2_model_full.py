@@ -56,6 +56,7 @@ from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 @dataclass
 class _FakeForwardCtx:
     attn_metadata: Any
+    dp_metadata: Any = None
     is_padding: Any = None
     additional_kwargs: dict[str, Any] = field(default_factory=dict)
 
@@ -1746,12 +1747,12 @@ class TestDeepseekV41ForCausalLM:
     def test_init_capability_guards(self) -> None:
         # PP > 1
         cfg_pp = _mock_vllm_config(pp_size=2)
-        with pytest.raises(NotImplementedError, match="requires PP1 and DP1"):
+        with pytest.raises(NotImplementedError, match="requires PP1"):
             DeepseekV41ForCausalLM(vllm_config=cfg_pp)
 
         # DP > 1
         cfg_dp = _mock_vllm_config(dp_size=2)
-        with pytest.raises(NotImplementedError, match="requires PP1 and DP1"):
+        with pytest.raises(NotImplementedError, match="DP requires TP1, EP"):
             DeepseekV41ForCausalLM(vllm_config=cfg_dp)
 
         # Speculation not None

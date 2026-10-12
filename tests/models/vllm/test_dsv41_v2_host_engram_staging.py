@@ -527,6 +527,8 @@ class TestEngramModuleStagingAndEmbed:
         engram = object.__new__(Engram)
         embed_tokens = SimpleNamespace(
             cpu_offload=cpu_offload,
+            host_offload=cpu_offload,
+            dp_size=1,
             part_n_hash_cols=2,
             n_hash_cols=2,
             head_dim=32,
@@ -536,6 +538,39 @@ class TestEngramModuleStagingAndEmbed:
         )
         engram.embed_tokens = embed_tokens
         return engram
+
+    def test_dp_staging_uploads_only_local_tokens(self, monkeypatch):
+        from vllm_torchtpu.models.vllm.deepseek_v41.common import engram as common
+
+        engram = self._create_mock_engram(cpu_offload=True)
+        engram.embed_tokens.dp_size = 8
+        engram.embed_tokens.n_hash_cols = 16
+        engram._init_staging(max_tokens=16, head_dim=32)
+        assert engram._host_raw.shape == (16, 16, 32)
+        assert not hasattr(engram, "staged_rows")
+        group = SimpleNamespace(world_size=8, cpu_group=object())
+        monkeypatch.setattr(common.upstream, "get_engram_dp_group", lambda: group)
+
+        def gather(ids, raw, scales):
+            assert raw.shape == (ids.shape[0], 2, 32)
+            raw.fill_(56)  # E4M3 1.0
+            scales.fill_(127)
+
+        def exchange(raw, scales, cpu_group, size):
+            assert cpu_group is group.cpu_group and size == 8
+            # Exchange correctness is covered by the real Gloo regression.
+            tokens = raw.shape[0] // size
+            return raw[:tokens].repeat(1, size, 1), scales[:tokens].repeat(1, size, 1)
+
+        engram.embed_tokens.gather_raw = gather
+        monkeypatch.setattr(common, "exchange_rows", exchange)
+        for tokens in (16, 8, 16):
+            engram.prepare_embeddings(torch.zeros(tokens * 8, 16, dtype=torch.int32))
+            rows = engram._ready_rows(tokens)
+            assert rows.shape == (tokens, 16, 32)
+            assert torch.equal(rows, torch.ones_like(rows))
+            assert engram._active_raw.numel() * 4 == tokens * 16 * (32 + 2)
+        assert len(engram._staged_by_tokens) == 2
 
     def test_init_staging_cpu_offload_false_and_true(self):
         # cpu_offload = False
@@ -553,7 +588,7 @@ class TestEngramModuleStagingAndEmbed:
             v2_engram.upstream.Engram, "_init_staging"
         ) as mock_super_init:
             engram_offload._init_staging(max_tokens=16, head_dim=32)
-            mock_super_init.assert_called_once_with(16, 32)
+            mock_super_init.assert_not_called()
             assert engram_offload._staged_raw is not None
             assert engram_offload._host_raw.shape == (16, 2, 32)
             assert engram_offload._host_scale.shape == (16, 2, 2)
@@ -583,13 +618,10 @@ class TestEngramModuleStagingAndEmbed:
         hash_ids_exact = torch.zeros((16, 2), dtype=torch.int32)
         engram.prepare_embeddings(hash_ids_exact)
 
-        # 2. Fallback path: num_tokens > max_tokens calls super().prepare_embeddings
+        # Oversized host requests must not fall back to a BF16 device lookup.
         hash_ids_large = torch.zeros((32, 2), dtype=torch.int32)
-        with patch.object(
-            v2_engram.upstream.Engram, "prepare_embeddings"
-        ) as mock_super_prep:
+        with pytest.raises(ValueError, match="staging slots"):
             engram.prepare_embeddings(hash_ids_large)
-            mock_super_prep.assert_called_once_with(hash_ids_large)
 
     def test_ready_rows_and_sp_embed(self):
         # 1. _staged_raw is None calls super()._ready_rows

@@ -528,7 +528,11 @@ class TestCommonNgramHashStateFull:
 
         # _init_staging with cpu_offload=True and False
         engram.embed_tokens = SimpleNamespace(
-            part_n_hash_cols=2, block_size=8, cpu_offload=True
+            part_n_hash_cols=2,
+            block_size=8,
+            cpu_offload=True,
+            host_offload=True,
+            dp_size=1,
         )
         with patch.object(common_engram.upstream.Engram, "_init_staging"):
             engram._init_staging(max_tokens=4, head_dim=16)
@@ -544,6 +548,8 @@ class TestCommonNgramHashStateFull:
                 part_n_hash_cols=2,
                 block_size=8,
                 cpu_offload=True,
+                host_offload=True,
+                dp_size=1,
                 n_hash_cols=2,
                 tp_size=1,
             )

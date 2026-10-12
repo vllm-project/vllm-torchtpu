@@ -82,6 +82,8 @@ def _make_runner(
     runner._mtp_enabled = mtp_enabled
     runner.scheduler_config = SimpleNamespace(async_scheduling=False)
     runner.parallel_config = SimpleNamespace(
+        data_parallel_size=1,
+        enable_expert_parallel=False,
         prefill_context_parallel_size=pcp_size,
         cp_kv_cache_interleave_size=block_size,
         decode_context_parallel_size=1,
@@ -126,6 +128,12 @@ def _make_runner(
     runner._cached_logits_indices = None
     runner._cached_request_distribution = None
     runner._dp_target_bucket = None
+    runner._dp_lockstep_enabled = types.MethodType(
+        TPUModelRunner._dp_lockstep_enabled, runner
+    )
+    runner._dp_num_tokens_across_dp = types.MethodType(
+        TPUModelRunner._dp_num_tokens_across_dp, runner
+    )
     runner._has_mamba_state = False
     # One pipeline stage: the runner embeds its own inputs.
     runner._pp_is_first = True
@@ -385,7 +393,7 @@ def test_prepare_inputs_routes_reordered_verify_per_chunk(bucket, chunk_size, hy
         start = end
 
 
-def _run_dummy_run(monkeypatch, runner, *, num_tokens=256):
+def _run_dummy_run(monkeypatch, runner, *, num_tokens=256, dp_lockstep=False):
     def capture_forward_context(attn_metadata, *_args, **_kwargs):
         runner._captured_dummy_attn_metadata = attn_metadata
         return contextlib.nullcontext()
@@ -414,12 +422,14 @@ def _run_dummy_run(monkeypatch, runner, *, num_tokens=256):
         )
     )
 
+    runner.compute_selected_logits = MagicMock()
     TPUModelRunner._dummy_run(
         runner,
         num_tokens,
         runner.num_reqs_max_model_len,
         runner.input_batch.block_table[0].max_num_blocks_per_req,
         use_max_model_len=True,
+        dp_lockstep=dp_lockstep,
     )
     return getattr(runner, "_attn_metadata_builder_ctx", None)
 
@@ -965,3 +975,36 @@ def test_pcp_streaming_does_not_use_batched_smem_capacity(
     # compact streaming schedule for every request distribution.
     assert runner._attention_schedule_capacity() is None
     assert runner._attention_runs_batched_kernel is False
+
+
+@pytest.mark.parametrize("idle", [False, True])
+@pytest.mark.parametrize("peer_rows", [0, 128])
+def test_idle_dummy_ced_replay_uses_only_busy_peer_rows(monkeypatch, idle, peer_rows):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import ced
+
+    runner = _make_runner(
+        num_computed_tokens=[0],
+        prompt_tokens=[64],
+        scheduled_tokens=[1],
+        token_paddings=[256],
+    )
+    ctx = _run_dummy_run(monkeypatch, runner, num_tokens=256, dp_lockstep=idle)
+    plan = ced.plan_decoder_replay(ctx, 128, 256, [128, 256])
+    if not idle:
+        assert plan is None  # Startup still warms the complete decoder graph.
+        return
+    assert plan.indices == ()
+    assert plan.padded_num_tokens == 0
+    monkeypatch.setattr(
+        ced, "get_dp_group", lambda: SimpleNamespace(world_size=8, cpu_group=object())
+    )
+
+    def reduce(count, op, group):
+        assert count.item() == 0
+        count.fill_(peer_rows)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+    coordinated = ced.coordinate_decoder_replay(plan, 256)
+    assert coordinated.padded_num_tokens == peer_rows
+    assert coordinated.indices == ()
+    runner.compute_selected_logits.assert_called_once()
