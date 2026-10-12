@@ -40,6 +40,20 @@ from collections.abc import Sequence
 from typing import Any
 
 import jax
+try:
+    _vcr = os.environ.get("VLLM_CACHE_ROOT", "")
+    if _vcr and _vcr.startswith("/compile-cache"):
+        _jcd = os.path.join(os.path.dirname(_vcr.rstrip("/")), "jax_cache")
+        os.makedirs(_jcd, exist_ok=True)
+        os.environ.setdefault("JAX_COMPILATION_CACHE_DIR", _jcd)
+        os.environ.setdefault("JAX_COMPILER_CACHE_DIR", _jcd)
+        os.environ.setdefault("JAX_PERSISTENT_CACHE_MIN_COMPILE_TIME_SECS", "0")
+        jax.config.update("jax_compilation_cache_dir", _jcd)
+        jax.config.update("jax_persistent_cache_min_compile_time_secs", 0)
+        from jax.experimental.compilation_cache import compilation_cache as _jcc
+        _jcc.set_cache_dir(_jcd)
+except Exception:
+    pass
 import numpy as np
 import jax.numpy as jnp
 import torch
