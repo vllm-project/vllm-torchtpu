@@ -327,8 +327,10 @@ def _mla_ragged_paged_attention_kernel(
     #     align_to(lkv_dim + r_dim, 128)] if not transpose_kv_cache else
     # [total_num_pages, align_to(lkv_dim + r_dim, 128), page_size]
     cache_kv_hbm_ref,
-    # f32[max_num_tokens, num_q_heads, 128] with return_lse, else None. Aliased
-    # with lse_hbm_ref so the kernel's calls thread one buffer; never read.
+    # f32[max_num_tokens, num_q_heads, 128] with return_lse, else None. The
+    # same buffer as lse_hbm_ref: each of the per-case launches writes only its
+    # own sequences' rows, so the buffer is passed through them aliased, as
+    # ql_nope is. Never read.
     lse_in_hbm_ref,
     # Output
     o_hbm_ref,  # [max_num_tokens, num_q_heads, lkv_dim]
@@ -336,8 +338,14 @@ def _mla_ragged_paged_attention_kernel(
     #     align_to(lkv_dim + r_dim, 128)] if not transpose_kv_cache else
     # [total_num_pages, align_to(lkv_dim + r_dim, 128), page_size]
     updated_cache_kv_hbm_ref,
-    # f32[max_num_tokens, num_q_heads, 128] with return_lse, else None. All 128
-    # lanes of a row are equal.
+    # f32[max_num_tokens, num_q_heads, 128] with return_lse, else None. 128
+    # lanes per value because that is m and l's layout: the online softmax keeps
+    # each row's statistics replicated across the lanes of a [rows, 128] tile
+    # so they scale score tiles without cross-lane work. Writing the lse in
+    # that layout makes it a plain copy out of VMEM and a contiguous DMA; the
+    # wrapper slices lane 0. (A lane-dense [tokens, heads] output would need a
+    # lane compaction here, and a 2-D buffer with a dynamic sublane extent did
+    # not compile.)
     lse_hbm_ref,
     # Scratch
     # [2, batch_size, bkv_buf_sz_per_kv_packing, kv_packing, lkv_dim]
@@ -1650,34 +1658,23 @@ def _mla_ragged_paged_attention_kernel(
             debug_print("[RPA debug] sz={}", sz)
 
             @pl.when(sz > 0)
-            def _copy(vmem_ref=vmem_ref, sz=sz, q_len_start=q_len_start, sem=sem):
+            def _copy(b=b, vmem_ref=vmem_ref, sz=sz, q_len_start=q_len_start, sem=sem):
                 _async_copy(
                     vmem_ref.at[pl.ds(0, sz), :num_q_heads],
                     o_hbm_ref.at[pl.ds(q_len_start, sz)],
                     sem,
                     wait,
                 )
-
-    def _send_blse(batch_start_seq_idx, bo_idx, bo_sem_idx, *, wait=False):
-        """Sends the block's log-sum-exp to lse_hbm_ref, as _send_bo sends bo."""
-        assert blse_x2_ref is not None and lse_hbm_ref is not None
-        for b in range(batch_size):
-            sem = sems.at[4, b, bo_sem_idx]
-            vmem_ref = blse_x2_ref.at[bo_sem_idx, b]
-
-            seq_idx = batch_start_seq_idx + b
-            q_len_start = cu_q_lens_ref[seq_idx] + bo_idx * bq_sz
-            q_end = cu_q_lens_ref[seq_idx + 1]
-            sz = jnp.minimum(bq_sz, q_end - q_len_start)
-
-            @pl.when(sz > 0)
-            def _copy(vmem_ref=vmem_ref, sz=sz, q_len_start=q_len_start, sem=sem):
-                _async_copy(
-                    vmem_ref.at[pl.ds(0, sz), :num_q_heads],
-                    lse_hbm_ref.at[pl.ds(q_len_start, sz)],
-                    sem,
-                    wait,
-                )
+                # The block's lse rows go out beside its output rows, on their
+                # own semaphore.
+                if return_lse:
+                    assert blse_x2_ref is not None and lse_hbm_ref is not None
+                    _async_copy(
+                        blse_x2_ref.at[bo_sem_idx, b, pl.ds(0, sz), :num_q_heads],
+                        lse_hbm_ref.at[pl.ds(q_len_start, sz)],
+                        sems.at[4, b, bo_sem_idx],
+                        wait,
+                    )
 
     # TODO: Split out the KV handling functions into separate files.
     _fetch_bkv_fn = _fetch_bkv if not transpose_kv_cache else _fetch_transposed_bkv
@@ -1698,8 +1695,6 @@ def _mla_ragged_paged_attention_kernel(
         bo_ids_ref[bo_sem_idx] = batch_start_seq_idx
         bo_ids_ref[bo_sem_idx + 2] = bo_idx
         _send_bo(batch_start_seq_idx, bo_idx, bo_sem_idx)
-        if return_lse:
-            _send_blse(batch_start_seq_idx, bo_idx, bo_sem_idx)
 
     def wait_send_bo(bo_sem_idx):
         old_batch_start_seq_idx = bo_ids_ref[bo_sem_idx]
@@ -1713,8 +1708,6 @@ def _mla_ragged_paged_attention_kernel(
         )
         def _():
             _send_bo(old_batch_start_seq_idx, old_bo_idx, bo_sem_idx, wait=True)
-            if return_lse:
-                _send_blse(old_batch_start_seq_idx, old_bo_idx, bo_sem_idx, wait=True)
 
     # TODO: Split out the KV handling functions into separate files.
     def start_update_kv_cache(start_seq_idx, bkv_sem_idx, offsets, update_szs):
@@ -2108,19 +2101,15 @@ def _mla_ragged_paged_attention_kernel(
             wait_send_bo(bo_sem_idx)
 
             if return_lse:
-                # m is the row's max scaled score and l the sum of
-                # exp(score - m); adding m back gives the log of the sum of
-                # exp over the scores themselves, so a peer that attended a
-                # disjoint slice of the same query's keys can merge with
-                # o = sum_r softmax(lse_r) * o_r without knowing our max.
-                # A row whose keys are all masked has m = mask_value, finite
-                # by default, and l = the masked count, so its lse sits near
-                # mask_value and weighs 0 in such a merge.
-                # Same (query, head) row split as the bo store below.
+                # log(sum(exp(score))) = m + log(l), in m and l's own layout:
+                # one (query, head) row per sublane, the value across all 128
+                # lanes. Kept that way through HBM so this is a copy, not a
+                # lane compaction; the wrapper reads lane 0.
                 assert blse_x2_ref is not None
-                blse_x2_ref.at[bo_sem_idx][:, :, :num_q_heads] = (
-                    m_ref[...] + jnp.log(l_ref[...])
-                ).reshape(batch_size, bq_sz, num_q_heads, 128)
+                lse = m_ref[...] + jnp.log(l_ref[...])
+                blse_x2_ref.at[bo_sem_idx][:, :, :num_q_heads] = lse.reshape(
+                    batch_size, bq_sz, num_q_heads, 128
+                )
 
             # Store output from acc to bo.
             bo_x2_ref.at[bo_sem_idx].bitcast(jnp.int32).reshape(
@@ -2426,19 +2415,19 @@ def mla_ragged_paged_attention(
         AV attention in two separate steps to make them be more parallelized
         with VALU ops instead of batched matmul in one step.
       p_same_dtype_as_v: if true, cast p to the same dtype as v before p @ v.
-      return_lse: if true, also return each (token, head)'s log-sum-exp of the
-        scaled scores, `m + log(l)`, as f32 `[max_num_tokens,
-        actual_num_q_heads]`. With it a caller can merge this output with the
-        output of the same queries over a disjoint set of keys (context
-        parallelism): `o = sum_r softmax(lse_r) * o_r`. Tokens outside every
-        sequence read 0; a query whose keys are all masked reads about
-        `mask_value`. The output and the cache are unchanged by the flag. As
-        without the flag, every sequence needs `kv_len >= q_len`: a rank that
-        holds no key of a sequence has to be given a masked dummy key, as the
-        sparse MLA kernel's DCP path does, not an empty one. The buffer is
-        f32 with 128 lanes per (token, head), 512 bytes a row, written by the
-        kernel and zeroed by XLA on every call; small on a decode step, but
-        about T * H * 512 bytes on a prefill of T tokens.
+      return_lse: if true, also return each (token, head)'s log-sum-exp of its
+        scaled scores, `log(sum(exp(s)))`, as f32 `[max_num_tokens,
+        actual_num_q_heads]`. It is what lets two attention outputs over
+        different keys of the same query be combined exactly: when the keys
+        are split across ranks (decode context parallelism), each rank's
+        output is a softmax over its own keys only, and
+        `o = sum_r softmax_r(lse) * o_r` reweights them into the softmax over
+        all of them. Rows of tokens outside every sequence read 0 (the buffer
+        starts as zeros and no launch writes them); a query whose keys are all
+        masked reads about `mask_value`. The output and the cache are unchanged
+        by the flag. The cost is an f32 buffer of 128 lanes per (token, head),
+        512 bytes a row: small on a decode step, about T * H * 512 bytes on a
+        prefill of T tokens.
       debug_mode: if true, RPA does not issue any DMAs or run flash attention but
         print debug info. Need to compile with `--xla_tpu_enable_log_recorder`.
 
@@ -2583,7 +2572,6 @@ def mla_ragged_paged_attention(
             pl.BlockSpec(memory_space=pltpu.HBM),  # new_kv_c
             pl.BlockSpec(memory_space=pltpu.HBM),  # new_k_pe
             pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv
-            # The lse slots are None without return_lse; None adds no operand.
             pl.BlockSpec(memory_space=pltpu.HBM) if return_lse else None,  # lse in
         ]
 
@@ -2661,7 +2649,7 @@ def mla_ragged_paged_attention(
             l_scratch,
             m_scratch,
             acc_scratch,
-            # Double buffering for the lse block, bo's layout with 128 lanes.
+            # Double buffering for the lse block, in m and l's 128-lane layout.
             pltpu.VMEM((2, batch_size, bq_sz, padded_num_q_heads, 128), jnp.float32)
             if return_lse
             else None,
@@ -2743,8 +2731,8 @@ def mla_ragged_paged_attention(
         return o, updated_cache_kv, lse
 
     batch_distribution = (distribution[0] // decode_batch_size) * decode_batch_size
-    # One lse buffer, aliased through the calls below as ql_nope is: rows the
-    # calls never write (tokens outside every sequence) stay 0.
+    # One zero-filled lse buffer, aliased through the calls below as ql_nope
+    # is; rows no call writes (tokens outside every sequence) stay 0.
     lse = (
         jnp.zeros((ql_nope.shape[0], num_q_heads, 128), jnp.float32)
         if return_lse
