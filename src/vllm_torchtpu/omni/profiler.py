@@ -12,36 +12,88 @@ Enable it the usual Omni way (``profiler_config={"profiler": "torch",
 ``stop_profile()``.
 """
 
+import dataclasses
+import os
 from typing import Any
 
 import torch
 from torch_tpu._internal.profiler import TpuProfilerConfig
 from vllm_omni.profiler.omni_torch_profiler import OmniTorchProfilerWrapper
 
+from vllm_torchtpu import profiler_trace
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
+
+logger = init_logger(__name__)
 
 
 class TpuOmniTorchProfilerWrapper(OmniTorchProfilerWrapper):
     """Omni torch profiler wrapper that captures TPU device activity."""
 
+    def __init__(
+        self,
+        profiler_config: Any,
+        worker_name: str,
+        local_rank: int,
+        activities: list[Any] | None = None,
+    ):
+        self._tpu_python_tracer = bool(profiler_config.torch_profiler_with_stack)
+        if self._tpu_python_tracer:
+            logger.info(
+                "torch_profiler_with_stack: recording Python stacks with "
+                "the TPU tracer "
+                "(python_tracer_level=1), enforcing torch.profiler with_stack=False."
+            )
+        profiler_config = dataclasses.replace(
+            profiler_config, torch_profiler_with_stack=False
+        )
+        super().__init__(profiler_config, worker_name, local_rank, activities)
+        self._profile_session_index = 0
+        self._capture_state: tuple[str, str, str, int, int, str] | None = None
+
     def _get_default_activities(self) -> list[Any]:
         # TPU activity is added in _start; Omni's activity map has no TPU key.
-        return ["CPU"]
+        return ["CPU", "TPU"]
 
     def _create_profiler(self, profiler_config: Any, activities: list[Any]) -> None:
-        # The torch_tpu profiler binds its output directory at construction,
-        # but Omni names the session directory per capture (see
-        # set_trace_filename), so the profiler is built in _start.
+        logger.info(
+            "TpuOmniTorchProfilerWrapper: Deferring torch.profiler construction "
+            "to _start() because the TPU tracer binds its output directory."
+        )
         return None
 
     def _start(self) -> None:
-        session_dir = self._ensure_session_dir()
-        _, standard_opts, advanced_opts = resolve_profile_dir_and_opts(session_dir)
+        name = self._trace_filename or self._worker_name
+        run_root = (
+            name if os.path.dirname(name) else os.path.join(self._trace_dir, name)
+        )
+        os.makedirs(run_root, exist_ok=True)
+
+        self._ensure_session_dir()
+
+        if torch.distributed.is_initialized():
+            rank = torch.distributed.get_rank()
+            world_size = torch.distributed.get_world_size()
+        else:
+            rank, world_size = 0, 1
+
+        session_key = (
+            f"{profiler_trace.profile_session_id()}_{self._profile_session_index}"
+        )
+        self._profile_session_index += 1
+
+        canonical_ts = profiler_trace.resolve_canonical_dst_ts(
+            run_root, rank, session_key=session_key
+        )
+        capture_dir = profiler_trace.rank_capture_dir(run_root, rank)
+        os.makedirs(capture_dir, exist_ok=True)
+
+        _, standard_opts, advanced_opts = resolve_profile_dir_and_opts(capture_dir)
+
+        if not self._tpu_python_tracer:
+            standard_opts["python_tracer_level"] = 0
+
         cfg = self.profiler_config
-        # Run one Python tracer, the TPU one (Python calls land in the
-        # XSpace). torch's with_stack tracer on top of it deadlocks profiler
-        # start (inside threading.setprofile) in Omni's multi-threaded engine.
-        standard_opts["python_tracer_level"] = int(cfg.torch_profiler_with_stack)
         self.profiler = torch.profiler.profile(
             activities=[
                 torch.profiler.ProfilerActivity.CPU,
@@ -53,10 +105,44 @@ class TpuOmniTorchProfilerWrapper(OmniTorchProfilerWrapper):
             with_flops=cfg.torch_profiler_with_flops,
             on_trace_ready=self._on_trace_ready,
             experimental_config=TpuProfilerConfig(
-                run_dir=session_dir,
-                worker_rank=str(self._rank()),
+                run_dir=capture_dir,
+                host_tracer_level=standard_opts["host_tracer_level"],
+                device_tracer_level=standard_opts["device_tracer_level"],
+                python_tracer_level=standard_opts["python_tracer_level"],
                 experimental_options=advanced_opts,
-                **standard_opts,
             ),
         )
+        self._capture_state = (
+            capture_dir,
+            run_root,
+            canonical_ts,
+            rank,
+            world_size,
+            session_key,
+        )
+
         super()._start()
+
+    def _stop(self) -> None:
+        try:
+            super()._stop()
+        finally:
+            if self._capture_state is not None:
+                (
+                    capture_dir,
+                    run_root,
+                    canonical_ts,
+                    rank,
+                    world_size,
+                    session_key,
+                ) = self._capture_state
+                profiler_trace.merge_rank_capture(
+                    capture_dir,
+                    run_root,
+                    canonical_ts,
+                    rank,
+                    world_size=world_size,
+                )
+                if rank == 0:
+                    profiler_trace.clear_canonical_ts_marker(run_root, session_key)
+                self._capture_state = None

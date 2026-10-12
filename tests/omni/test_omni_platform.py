@@ -538,3 +538,205 @@ def test_wan_self_attention_patch_falls_back_on_f32():
 
     apply_omni_model_specific_patches()
     assert WanSelfAttention()(torch.ones(1, 3, 8)) == "native"
+
+
+def test_tpu_omni_profiler_wrapper(tmp_path, caplog):
+    import logging
+    import os
+    from unittest.mock import MagicMock, patch
+
+    # Use a real vllm.config.ProfilerConfig if available, else a mock that acts like it
+    try:
+        from vllm.config import ProfilerConfig
+    except ImportError:
+
+        class ProfilerConfig:
+            def __init__(self, **kwargs):
+                for k, v in kwargs.items():
+                    setattr(self, k, v)
+
+    from vllm_torchtpu.omni.profiler import TpuOmniTorchProfilerWrapper
+
+    cfg = ProfilerConfig(
+        profiler="torch",
+        torch_profiler_dir=str(tmp_path),
+        torch_profiler_with_stack=True,
+        torch_profiler_record_shapes=True,
+        torch_profiler_with_memory=False,
+        torch_profiler_with_flops=True,
+    )
+    cfg.torch_profiler_trace_filename = None
+    with caplog.at_level(logging.INFO):
+        wrapper = TpuOmniTorchProfilerWrapper(cfg, "worker_0", 0)
+
+    assert wrapper._activities == ["CPU", "TPU"]
+    assert getattr(wrapper, "dump_cpu_time_total", False) is False
+    assert getattr(wrapper, "profiler", None) is None
+    assert "Deferring torch.profiler construction" in caplog.text
+    assert "enforcing torch.profiler with_stack=False" in caplog.text
+    # base config should have with_stack=False
+    assert wrapper.profiler_config.torch_profiler_with_stack is False
+
+    # Mock profiler_trace functions
+    with (
+        patch(
+            "vllm_torchtpu.profiler_trace.resolve_canonical_dst_ts",
+            return_value="2026_01_01_12_00_00",
+        ) as mock_resolve,
+        patch(
+            "vllm_torchtpu.profiler_trace.rank_capture_dir",
+            return_value=str(tmp_path / "rank_2"),
+        ) as mock_capture,
+        patch("vllm_torchtpu.profiler_trace.merge_rank_capture") as mock_merge,
+        patch("vllm_torchtpu.profiler_trace.clear_canonical_ts_marker") as mock_clear,
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_rank", return_value=2),
+        patch("torch.distributed.get_world_size", return_value=4),
+        patch("torch.profiler.profile") as mock_profile,
+        patch("vllm_torchtpu.omni.profiler.TpuProfilerConfig") as mock_tpu_config,
+        caplog.at_level(logging.INFO),
+    ):
+        mock_prof_instance = MagicMock()
+        mock_profile.return_value = mock_prof_instance
+
+        wrapper._start()
+
+        # Test basic _start behavior
+        assert mock_resolve.called
+        assert mock_capture.called
+        mock_profile.assert_called_once()
+
+        # Case 2: check python_tracer_level=1
+        _, tpu_kwargs = mock_tpu_config.call_args
+        assert tpu_kwargs.get("python_tracer_level") == 1
+
+        # Stop
+        wrapper._stop()
+        mock_prof_instance.stop.assert_called_once()
+
+        # Check merge
+        mock_merge.assert_called_once_with(
+            str(tmp_path / "rank_2"),
+            str(tmp_path / "worker_0"),
+            "2026_01_01_12_00_00",
+            2,
+            world_size=4,
+        )
+        # clear is only for rank 0
+        mock_clear.assert_not_called()
+
+    # Case 1: same trace filename, different session dirs resolve the same run_root
+    cfg2 = ProfilerConfig(
+        profiler="torch",
+        torch_profiler_dir=str(tmp_path),
+        torch_profiler_with_stack=False,
+        torch_profiler_record_shapes=True,
+        torch_profiler_with_memory=False,
+        torch_profiler_with_flops=True,
+    )
+    cfg2.torch_profiler_trace_filename = "my_trace"
+    w1 = TpuOmniTorchProfilerWrapper(cfg2, "worker_1", 0)
+    w1.set_trace_filename("my_trace")
+    w2 = TpuOmniTorchProfilerWrapper(cfg2, "worker_2", 0)
+    w2.set_trace_filename("my_trace")
+
+    with (
+        patch("torch.distributed.is_initialized", return_value=False),
+        patch("torch.profiler.profile"),
+        patch("vllm_torchtpu.omni.profiler.TpuProfilerConfig") as mock_tpu_config_2,
+    ):
+        w1._start()
+        w2._start()
+
+        assert w1._capture_state[1] == w2._capture_state[1]
+        assert w1._capture_state[1] == os.path.join(str(tmp_path), "my_trace")
+
+        # Case 2: torch_profiler_with_stack=False means python_tracer_level is 0
+        _, tpu_kwargs = mock_tpu_config_2.call_args
+        assert tpu_kwargs.get("python_tracer_level") == 0
+
+        w1._stop()
+        w2._stop()
+
+    # Case 4: super()._stop() raising still merges and clears
+    cfg3 = ProfilerConfig(
+        profiler="torch",
+        torch_profiler_dir=str(tmp_path),
+        torch_profiler_with_stack=False,
+        torch_profiler_record_shapes=True,
+        torch_profiler_with_memory=False,
+        torch_profiler_with_flops=True,
+    )
+    cfg3.torch_profiler_trace_filename = None
+    w3 = TpuOmniTorchProfilerWrapper(cfg3, "w3", 0)
+    with (
+        patch(
+            "vllm_torchtpu.profiler_trace.resolve_canonical_dst_ts",
+            return_value="2026_01_01",
+        ),
+        patch(
+            "vllm_torchtpu.profiler_trace.rank_capture_dir",
+            return_value=str(tmp_path / "rank_0"),
+        ),
+        patch("vllm_torchtpu.profiler_trace.merge_rank_capture") as mock_merge,
+        patch("vllm_torchtpu.profiler_trace.clear_canonical_ts_marker") as mock_clear,
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_rank", return_value=0),
+        patch("torch.distributed.get_world_size", return_value=1),
+        patch("torch.profiler.profile") as mock_profile_3,
+        patch("vllm_torchtpu.omni.profiler.TpuProfilerConfig"),
+    ):
+        mock_prof_instance_3 = MagicMock()
+        mock_profile_3.return_value = mock_prof_instance_3
+        w3._start()
+
+        # Make the mock profiler stop method raise
+        orig_stop = w3.profiler.stop
+
+        def raising_stop():
+            orig_stop()
+            raise ValueError("Intentional error")
+
+        w3.profiler.stop = raising_stop
+
+        import contextlib
+
+        with contextlib.suppress(ValueError):
+            w3._stop()
+
+        mock_merge.assert_called_once()
+        mock_clear.assert_called_once()
+
+
+def test_tpu_omni_profiler_canonical_ts_sync(tmp_path):
+    from vllm.config import ProfilerConfig
+
+    from vllm_torchtpu.omni.profiler import TpuOmniTorchProfilerWrapper
+
+    cfg = ProfilerConfig(
+        profiler="torch",
+        torch_profiler_dir=str(tmp_path),
+        torch_profiler_with_stack=False,
+        torch_profiler_record_shapes=True,
+        torch_profiler_with_memory=False,
+        torch_profiler_with_flops=True,
+    )
+    cfg.torch_profiler_trace_filename = "my_trace"
+
+    w0 = TpuOmniTorchProfilerWrapper(cfg, "w0", 0)
+    w0.set_trace_filename("my_trace")
+    w1 = TpuOmniTorchProfilerWrapper(cfg, "w1", 0)
+    w1.set_trace_filename("my_trace")
+
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_world_size", return_value=2),
+        patch("torch.profiler.profile"),
+        patch("vllm_torchtpu.omni.profiler.TpuProfilerConfig"),
+    ):
+        with patch("torch.distributed.get_rank", return_value=0):
+            w0._start()
+        with patch("torch.distributed.get_rank", return_value=1):
+            w1._start()
+
+        assert w0._capture_state[2] == w1._capture_state[2]

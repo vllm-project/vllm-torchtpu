@@ -224,3 +224,65 @@ sys.modules["vllm_omni.diffusion.models.wan2_2.wan2_2_transformer"] = (
 sys.modules["vllm_omni.diffusion.layers"] = vllm_omni_mock.diffusion.layers
 sys.modules["vllm_omni.diffusion.layers.rope"] = vllm_omni_mock.diffusion.layers.rope
 sys.modules["vllm_omni.diffusion.layers.norm"] = vllm_omni_mock.diffusion.layers.norm
+
+
+class _MockOmniTorchProfilerWrapper:
+    def __init__(self, profiler_config, worker_name="w", local_rank=0, activities=None):
+        self.profiler_config = profiler_config
+        self.local_rank = local_rank
+        self._worker_name = worker_name
+        self._activities = (
+            activities if activities is not None else self._get_default_activities()
+        )
+        self.dump_cpu_time_total = (
+            "CPU" in self._activities and len(self._activities) == 1
+        )
+        self.profiler = self._create_profiler(profiler_config, self._activities)
+        self._on_trace_ready = MagicMock()
+
+        self._trace_filename = getattr(
+            profiler_config, "torch_profiler_trace_filename", None
+        )
+        self._trace_dir = getattr(profiler_config, "torch_profiler_dir", ".")
+        self.started = False
+        self.stopped = False
+
+    def set_trace_filename(self, filename):
+        self._trace_filename = filename
+
+    def _get_default_activities(self):
+        return ["CPU", "CUDA"]
+
+    def _create_profiler(self, profiler_config, activities):
+        return MagicMock()
+
+    def _ensure_session_dir(self):
+        import os
+        import time
+
+        name = self._trace_filename or self._worker_name
+        if not os.path.dirname(name):
+            name = os.path.join(self._trace_dir, name)
+        return os.path.join(name, str(time.time()))
+
+    def _start(self):
+        self.started = True
+        self.profiler.start()
+
+    def _stop(self):
+        self.stopped = True
+        self.profiler.stop()
+        self._on_stop_hook()
+
+    def _on_stop_hook(self):
+        if self.profiler_config.torch_profiler_with_stack:
+            self.profiler.export_stacks()
+
+
+vllm_omni_mock.profiler.omni_torch_profiler.OmniTorchProfilerWrapper = (
+    _MockOmniTorchProfilerWrapper
+)
+sys.modules["vllm_omni.profiler"] = vllm_omni_mock.profiler
+sys.modules["vllm_omni.profiler.omni_torch_profiler"] = (
+    vllm_omni_mock.profiler.omni_torch_profiler
+)
