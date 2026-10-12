@@ -46,6 +46,11 @@ class AllReduceRing:
         self.sc = sc if sc is not None else (lambda *_: contextlib.nullcontext())
         self.comm = cp.R > 1 and "comm" not in skip
         self._used_slots: set[int] = set()
+        # `cp.ARP`: payload half this core owns first after the deferred
+        # all-reduce (hier=2: its core index; hier=1: half 0 on every core).
+        self.arp_c: Any = None
+        if cp.ARP:
+            self.arp_c = jnp.int32(0) if cp.HIER == 1 else lax.rem(me, 2)
 
     def ar_copies(self, slot, rnd_i: int):
         """Remote copy descriptors for round `rnd_i` on double-buffer `slot`."""
@@ -102,10 +107,16 @@ class AllReduceRing:
                 )
                 peers = [(0, 1)]
                 dst = scr["recv"].at[slot, c_idx]
-            elif rnd_i == 1:
+            elif rnd_i == 1 or (HIER == 1 and rnd_i == 2):
                 src = scr["ag_send"].at[slot]
                 peers = list(enumerate(cp.HIER1_PEERS if HIER == 1 else (2, 4, 6)))
                 dst = scr["ag_recv"].at[slot, me // 2]
+                if HIER == 1 and cp.ARP_H1 and slot == 1:
+                    # deferred hier=1 all-reduce: round 1 pushes payload half
+                    # 0, round 2 half 1
+                    hl = pl.ds((rnd_i - 1) * cp.HC2, cp.HC2)
+                    src = scr["ag_send"].at[slot, :, hl]
+                    dst = scr["ag_recv"].at[slot, me // 2, :, hl]
             else:
                 src = scr["s2_send"].at[slot]
                 peers = [(0, 1)]
@@ -145,6 +156,14 @@ class AllReduceRing:
             for off in range(1, R)
         ]
 
+    def ar_rounds(self, slot) -> tuple[int, ...]:
+        """Rounds whose sends a use of buffer `slot` issues (`AR_ROUNDS`, except
+        the undeferred slot 0 of a split hier=1 schedule: rounds 0 and 1)."""
+        cp = self.cp
+        if cp.ARP_H1 and slot == 0:
+            return (0, 1)
+        return cp.AR_ROUNDS
+
     def ar_round(self, slot, rnd_i: int, fill=None):
         """Start remote copies for round `rnd_i` on `slot` and wait on `wait_recv()`.
 
@@ -158,13 +177,18 @@ class AllReduceRing:
         for d in descs:
             d.wait_recv()
 
-    def allreduce(self, slot, x, first, fill=None):
+    def allreduce(self, slot, x, first, fill=None, defer: bool = False):
         """Reduce-sum `x [MB, H]` f32 partial across all `R` ranks on `slot`.
 
         `fill()` (optional, e.g. a deferred dense-ring refill) is issued once
         inside the all-reduce, while its first cross-chip round is in flight
         (round 0 of the flat one-shot, round 1 otherwise), or before returning
         when there is no communication.
+
+        `defer` (`cp.ARP`, buffer slot 1): add only this core's payload half
+        (`arp_c`) to the residual and return `None`, leaving the last round in
+        flight; `arp_round2_add` (inside the next layer's input projection)
+        waits for it and adds the other half.
         """
         self._used_slots.update((slot,) if isinstance(slot, int) else (0, 1))
         cp, scr, me, sc = self.cp, self.scr, self.me, self.sc
@@ -183,8 +207,15 @@ class AllReduceRing:
 
                 @pl.when(jnp.logical_not(first))
                 def _():
-                    for rnd_i in cp.AR_ROUNDS:
+                    for rnd_i in self.ar_rounds(slot):
                         for d in self.ar_copies(slot, rnd_i):
+                            d.wait_send()
+
+                if defer:  # the primed zero round 2 (`arp_prime`)
+
+                    @pl.when(first)
+                    def _():
+                        for d in self.ar_copies(slot, 2):
                             d.wait_send()
 
             c_idx = lax.rem(me, 2)
@@ -243,6 +274,21 @@ class AllReduceRing:
                     ]
                 else:
                     ag_recv[slot, me // 2] = ag_send[slot]
+            if HIER == 1 and defer:
+                assert cp.ARP and slot == 1, (cp.ARP, slot)
+                with sc("ar_comm"):
+                    h0 = self.ar_copies(slot, 1)
+                    for d in h0 + self.ar_copies(slot, 2):
+                        d.start()
+                    if fill is not None:
+                        fill()
+                    for d in h0:
+                        d.wait_recv()
+                with sc("ar_res"):
+                    self.arp_half_add(
+                        jnp.sum(ag_recv[slot, :, :, 0:HC2].astype(F32), axis=0), 0
+                    )
+                return None
             with sc("ar_comm"):
                 self.ar_round(slot, 1, fill)
             if HIER == 1:
@@ -256,14 +302,24 @@ class AllReduceRing:
                     ).astype(BF16)
                 with sc("ar_comm"):
                     self.ar_round(slot, 3)
-                with sc("ar_sum"):
-                    s2_recv[slot, c_idx] = s2_send[slot]
+                if not defer:
+                    with sc("ar_sum"):
+                        s2_recv[slot, c_idx] = s2_send[slot]
             else:
                 with sc("ar_sum"):
                     s2_send[slot] = jnp.sum(ag_recv[slot].astype(F32), axis=0).astype(
                         BF16
                     )
-                    s2_recv[slot, c_idx] = s2_send[slot]
+                    if not defer:
+                        s2_recv[slot, c_idx] = s2_send[slot]
+            if defer:
+                assert cp.ARP and slot == 1, (cp.ARP, slot)
+                with sc("ar_comm"):
+                    for d in self.ar_copies(slot, 2):
+                        d.start()
+                with sc("ar_res"):
+                    self.arp_half_add(s2_send[slot].astype(F32), self.arp_c)
+                return None
             with sc("ar_comm"):
                 self.ar_round(slot, 2)
             with sc("ar_sum"):
@@ -320,10 +376,97 @@ class AllReduceRing:
         for d in descs:
             d.wait_send()
 
+    # ------------------------------------------------------------------
+    # ARPIPE: the deferred all-reduce (`cp.ARP`)
+    # ------------------------------------------------------------------
+    def arp_lanes(self, j: int, h: Any) -> Any:
+        """First lane of payload half `h` (may be traced) in fold block `j`."""
+        cp = self.cp
+        return pl.multiple_of(j * cp.AR_C + h * cp.HC2, cp.HC2)
+
+    def arp_half_add(self, val: Any, h: Any) -> None:
+        """`add_residual` for payload half `h` only (`val`: f32 `[AR_R, HC2]` in
+        payload layout). `h` may be traced (a run-time lane offset)."""
+        cp, scr = self.cp, self.scr
+        B, HC2 = cp.B, cp.HC2
+        res = scr["res"]
+        with self.sc("ar_res"):
+            for j in range(cp.H // cp.AR_C):
+                l0 = self.arp_lanes(j, h)
+                r0 = 0 if cp.WAR else j * B
+                res[0:B, pl.ds(l0, HC2)] = round_bf16(
+                    res[0:B, pl.ds(l0, HC2)] + val[r0 : r0 + B]
+                )
+
+    def arp_norm_half(
+        self,
+        w_off: int,
+        slot: Any,
+        h: Any,
+        first: bool,
+        *,
+        eps: float,
+        zero_centered: bool,
+    ) -> None:
+        """Input RMSNorm of payload half `h`'s lanes, left unscaled.
+
+        `xb = x * w` (`1 + w` when `zero_centered`; `w` = the norm weights at
+        lane offset `w_off` of `scr['sm'][slot]`). `first`: `scr['arp']` = the
+        half's sum of squares; else `scr['arp']` = the reciprocal RMS over both
+        halves, applied after the input projection (`KernelContext.arp_scale`).
+        """
+        cp, scr = self.cp, self.scr
+        H, HC2 = cp.H, cp.HC2
+        arp = scr["arp"]
+        ss = None
+        for j in range(H // cp.AR_C):
+            l0 = self.arp_lanes(j, h)
+            x = scr["res"][:, pl.ds(l0, HC2)]
+            w_ = scr["sm"][slot, :, pl.ds(w_off + l0, HC2)]
+            scale = (1.0 + w_) if zero_centered else w_
+            scr["xb"][:, pl.ds(l0, HC2)] = (x * scale).astype(BF16)
+            s_ = jnp.sum(x * x, axis=-1, keepdims=True)
+            ss = s_ if ss is None else ss + s_
+        if first:
+            arp[...] = jnp.broadcast_to(ss, arp.shape)
+        else:
+            ms = (arp[:, 0:1] + ss) * (1.0 / H)
+            arp[...] = jnp.broadcast_to(lax.rsqrt(ms + eps), arp.shape)
+
+    def arp_round2_add(self) -> None:
+        """Wait for the deferred all-reduce's last round and add the other
+        payload half to the residual (hier=1: half 1, summed over the 4 chips
+        in chip order like the undeferred all-reduce)."""
+        cp, scr = self.cp, self.scr
+        HC2 = cp.HC2
+        for d in self.ar_copies(1, 2):
+            d.wait_recv()
+        if cp.HIER == 1:
+            self.arp_half_add(
+                jnp.sum(scr["ag_recv"][1, :, :, HC2 : 2 * HC2].astype(F32), axis=0), 1
+            )
+        else:
+            self.arp_half_add(
+                scr["s2_recv"][1, 1 - self.arp_c].astype(F32), 1 - self.arp_c
+            )
+
+    def arp_prime(self) -> None:
+        """Send a zero last round on buffer slot 1 before the first layer, so
+        layer 0's `arp_round2_add` has a (zero) deferred half to add."""
+        cp, scr, me = self.cp, self.scr, self.me
+        self._used_slots.add(1)
+        if cp.HIER == 1:  # zero push of half 1 from every chip, own entry included
+            scr["ag_send"][1] = jnp.zeros(scr["ag_send"].shape[1:], BF16)
+            scr["ag_recv"][1, me // 2] = jnp.zeros(scr["ag_recv"].shape[2:], BF16)
+        else:
+            scr["s2_send"][1] = jnp.zeros(scr["s2_send"].shape[1:], BF16)
+        for d in self.ar_copies(1, 2):
+            d.start()
+
     def drain_sends(self):
         """Wait for the last layer's all-reduce sends before kernel exit."""
         if self.comm:
             for slot in sorted(self._used_slots):
-                for rnd_i in self.cp.AR_ROUNDS:
+                for rnd_i in self.ar_rounds(slot):
                     for d in self.ar_copies(slot, rnd_i):
                         d.wait_send()

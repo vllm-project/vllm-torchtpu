@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Opt-in all-reduce schedule options of `AllReduceRing` (`Tiles.hier1_peers`,
-`Tiles.hx`, `allreduce(fill=)`).
+`Tiles.hx`, `allreduce(fill=)`, the ARPIPE deferred all-reduce).
 
 Each option is checked two ways: the 8-rank interpret-mode all-reduce is
 bit-identical to the default schedule (the option moves data, it does not
@@ -86,6 +86,7 @@ def _ring_outputs(
     seed: int = 0,
     counts: bool = False,
     fills: list[int] | None = None,
+    arp: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, collectives.CommParams]:
     """Run 2 layers x 2 alternating slots of `allreduce` + `add_residual`.
 
@@ -93,13 +94,20 @@ def _ring_outputs(
     of the four reductions `[B, H]`, and the `CommParams` used. With `counts`,
     returns the step's primitive histogram (`prim_counts`) instead of the rows.
     With `fills`, every all-reduce gets a `fill` that appends its slot (at
-    trace time) and zeroes a spare buffer.
+    trace time) and zeroes a spare buffer. With `arp`, slot 1 is the ARPIPE
+    deferred all-reduce: primed, its other half added before the next slot-0
+    all-reduce and after the last step.
     """
     devs = jax.devices("cpu")
     assert len(devs) >= R, f"Expected >= {R} CPU devices, found {len(devs)}"
     ex = ExecSpec(B=B, T=1, R=R, ctx=128, tiles=tiles, interpret=True)
     pc = H // 2 if tiles.war == 0 else None
     cp = collectives.comm_params(ex, tiles, H=H, PC=pc)
+    if arp:
+        cp = collectives.params.with_schedule(
+            cp, tiles, comm=True, dense=True, in_kind=(128, 1), unroll=8
+        )
+        assert cp.ARP
     scratch = {
         "res": pltpu.VMEM((ex.MB, H), F32),
         "spare": pltpu.VMEM((8, 128), F32),
@@ -123,6 +131,8 @@ def _ring_outputs(
                 )
             pl.semaphore_wait(barrier, R - 1)
         scr["res"][...] = jnp.zeros((ex.MB, H), F32)
+        if arp:
+            ar.arp_prime()
         for step_idx in range(4):
             slot = step_idx % 2
             src = x0_ref[...] if slot == 0 else x1_ref[...]
@@ -134,7 +144,14 @@ def _ring_outputs(
                     scr["spare"][...] = jnp.zeros((8, 128), F32)
 
             first = jnp.bool_(step_idx < 2)
+            if arp and slot == 1:
+                assert ar.allreduce(slot, src, first, fill=fill, defer=True) is None
+                continue
+            if arp and step_idx > 0:
+                ar.arp_round2_add()
             ar.add_residual(ar.allreduce(slot, src, first, fill=fill))
+        if arp:
+            ar.arp_round2_add()
         ar.drain_sends()
         out_ref[...] = scr["res"][...]
 
@@ -369,7 +386,63 @@ def test_allreduce_fill_without_comm():
     assert fills == [0, 1, 0, 1]
 
 
+# ---------------------------------------------------------------------------
+# ARPIPE: deferred all-reduce, other half added later
+# ---------------------------------------------------------------------------
+_ARP_MODES = (
+    dict(hier=2, arpipe=True),
+    dict(hier=2, arpipe=True, hx=True),
+    dict(hier=1, arpipe=True, arpipe_h1=True),
+)
+
+
+def _check_arp_bit_identical() -> None:
+    """Each residual lane gets the same sums in the same order whether slot 1
+    is added at once or as two halves around the next layer's start."""
+    for kw in _ARP_MODES:
+        for war, H, B in ((1, 1024, 4), (0, 4096, 3)):
+            tiles = dataclasses.replace(_TINY_TILES, war=war, **kw)
+            plain = dataclasses.replace(tiles, arpipe=False, arpipe_h1=False)
+            base, host, _ = _ring_outputs(plain, H=H, B=B, seed=9)
+            fills: list[int] = []
+            out, _, cp = _ring_outputs(tiles, H=H, B=B, seed=9, arp=True, fills=fills)
+            assert cp.ARP and (kw["hier"] == 1) == cp.ARP_H1, (kw, cp)
+            assert fills == [0, 1, 0, 1], (kw, fills)
+            np.testing.assert_array_equal(out, base)
+            _assert_close_to_host_sum(out, host)
+
+
+def test_with_schedule_gates():
+    def cp_for(in_kind: Any = (128, 1), unroll: int = 8, **kw: Any) -> Any:
+        tiles = dataclasses.replace(_TINY_TILES, **kw)
+        ex = ExecSpec(B=4, T=1, R=8, ctx=128, tiles=tiles, interpret=True)
+        cp = collectives.comm_params(ex, tiles, H=1024)
+        return collectives.params.with_schedule(
+            cp, tiles, comm=True, dense=True, in_kind=in_kind, unroll=unroll
+        )
+
+    on2 = cp_for(hier=2, arpipe=True)
+    assert on2.ARP and not on2.ARP_H1 and on2.AR_ROUNDS == (0, 1, 2)
+    on1 = cp_for(hier=1, arpipe=True, arpipe_h1=True)
+    assert on1.ARP and on1.ARP_H1 and on1.AR_ROUNDS == (0, 1, 2)
+    assert cp_for(hier=2, arpipe=True, hx=True).AR_ROUNDS == (0, 1, 2, 3)
+    assert not cp_for(hier=1, arpipe=True).ARP  # hier=1 needs arpipe_h1
+    assert not cp_for(hier=0, arpipe=True).ARP
+    assert not cp_for(hier=2, arpipe=True, in_kind=None).ARP
+    assert not cp_for(hier=2, arpipe=True, in_kind=(128, 9)).ARP  # not unrolled
+    assert not cp_for(hier=2, arpipe=True, in_kind=(384, 1)).ARP  # HC2 % tk
+    assert cp_for(hier=2) == cp_for(hier=2, in_kind=None)
+
+
+def test_arp_deferred_all_reduce_bit_identical():
+    if len(jax.devices("cpu")) < 8:
+        _spawn_with_cpu_devices(8, "arp")
+        return
+    _check_arp_bit_identical()
+
+
 _CHECKS = {
+    "arp": _check_arp_bit_identical,
     "fill": _check_fill_once_and_bit_identical,
     "hier1_peers": _check_hier1_peers_bit_identical,
     "hx": _check_hx_bit_identical,

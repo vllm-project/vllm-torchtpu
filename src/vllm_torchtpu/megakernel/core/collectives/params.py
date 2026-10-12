@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass
 from typing import Any
 
@@ -68,6 +69,12 @@ class CommParams:
     # `HIER == 2` with the 4-chip RS + AG of the half-sum (`tiles.hx`; needs
     # `R == 8` and `(HC2 // 4) % 128 == 0`, else off).
     HX: bool = False
+    # Layer schedule (`with_schedule`): `ARP` = the layer's last all-reduce
+    # (buffer slot 1) is deferred into the next layer's input projection
+    # (`tiles.arpipe`); `ARP_H1` = the same on `HIER == 1`, whose round 1 is
+    # then split in two half-lane rounds (1 and 2).
+    ARP: bool = False
+    ARP_H1: bool = False
 
 
 def _check_hier1_peers(peers: tuple[int, ...]) -> None:
@@ -166,6 +173,43 @@ def comm_params(
         HIER1_PEERS=HIER1_PEERS,
         HX=HX,
     )
+
+
+def with_schedule(
+    cp: CommParams,
+    tiles: Tiles,
+    *,
+    comm: bool,
+    dense: bool,
+    in_kind: tuple[int, int] | None,
+    unroll: int,
+) -> CommParams:
+    """Engage the layer-schedule options of `tiles` that the layer allows.
+
+    `tiles.arpipe` (`hier=2`, or `hier=1` with `tiles.arpipe_h1`) engages when
+    the all-reduce communicates (`comm`), the dense ring runs (`dense`), the
+    first slot's input projection (`in_kind = (tk, nt)`, shared by its
+    branches; `None` when the layer cannot take the hook) is fully unrolled
+    (`nt <= unroll`) and its `K` tiles split evenly at the payload's half
+    boundary (`HC2 % tk == 0`, `AR_C % tk == 0`, `HC2 % 128 == 0`). Otherwise
+    the option is off and `cp` is returned unchanged.
+    """
+    HIER, HC2, AR_C = cp.HIER, cp.HC2, cp.AR_C
+    arp = False
+    if (
+        tiles.arpipe
+        and comm
+        and dense
+        and in_kind is not None
+        and (HIER == 2 or (HIER == 1 and tiles.arpipe_h1))
+    ):
+        tk, nt = in_kind
+        arp = nt <= unroll and HC2 % 128 == 0 and HC2 % tk == 0 and AR_C % tk == 0
+    if not arp:
+        return cp
+    arp_h1 = HIER == 1
+    rounds = (0, 1, 2) if arp_h1 else cp.AR_ROUNDS
+    return dataclasses.replace(cp, ARP=True, ARP_H1=arp_h1, AR_ROUNDS=rounds)
 
 
 def ring_scratch(cp: CommParams) -> dict[str, Any]:

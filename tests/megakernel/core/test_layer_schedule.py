@@ -96,10 +96,16 @@ class _LinMixer(Module):
         del lyr
         scr = ctx.scr
         with ctx.stream.segment(lazy=True):
-            y = ctx.stream.dmatmul("w_in", scr["xb"], _NI)
-            scr["xb2"][:, :_NI] = round_bf16(y).astype(BF16)
+            y = ctx.stream.dmatmul("w_in", scr["xb"], _NI, hook=ctx.layer_hook)
+            scr["xb2"][:, :_NI] = round_bf16(ctx.arp_scale(y)).astype(BF16)
             yo = ctx.stream.dmatmul("w_out", scr["xb2"], ctx.g.H)
         return yo * ctx.sm(slot, "out_s")
+
+
+class _HookMixer(_LinMixer):
+    """`_LinMixer` that declares the ARPIPE hook (`Module.layer_schedule`)."""
+
+    layer_schedule = frozenset({"layer_hook"})
 
 
 class _LinFFN(Module):
@@ -132,7 +138,9 @@ class _LinFFN(Module):
 
 def _spec(mixer: Module, ffn: Module) -> ModelSpec:
     g = FakeGeometry(L=_L, H=_H)
-    return ModelSpec("layer_schedule", config=g, layer_type=LayerType("lt", (mixer, ffn)))
+    return ModelSpec(
+        "layer_schedule", config=g, layer_type=LayerType("lt", (mixer, ffn))
+    )
 
 
 def _tiles(**kw: Any) -> Tiles:
@@ -152,7 +160,9 @@ def _inputs(info: dict[str, Any], g: FakeGeometry, ex: ExecSpec, seed: int = 3):
     wsh = info["wshape"]
     ks = jax.random.split(jax.random.PRNGKey(seed), 6)
     R = ex.R
-    pos_pad = jnp.pad(jnp.arange(ex.B, dtype=I32), (0, ex.MB - ex.B), constant_values=-1)
+    pos_pad = jnp.pad(
+        jnp.arange(ex.B, dtype=I32), (0, ex.MB - ex.B), constant_values=-1
+    )
     pos = kernel.fold(jnp.broadcast_to(pos_pad[None, None, :], (R, 1, ex.MB)))
     hid0 = jax.random.normal(ks[0], (ex.M, g.H), dtype=BF16)
     hid = kernel.fold(jnp.broadcast_to(hid0[None], (R, ex.M, g.H)))
@@ -185,7 +195,9 @@ def _reference(spec: ModelSpec, info: dict[str, Any], host: Any) -> np.ndarray:
         nx = rmsnorm(res, field(lyr, "in_norm"), g.eps, zero_centered=zc)
         tot = 0.0
         for r in range(_R):
-            h = round_bf16(nx.astype(BF16).astype(F32) @ raw["w_in"][r, lyr].astype(F32))
+            h = round_bf16(
+                nx.astype(BF16).astype(F32) @ raw["w_in"][r, lyr].astype(F32)
+            )
             part = (h @ raw["w_out"][r, lyr].astype(F32)) * field(lyr, "out_s")
             tot = tot + round_bf16(part)
         res = round_bf16(res + tot)
@@ -239,7 +251,68 @@ def test_deferred_fill_issued_inside_the_all_reduce():
     _check_deferred_fill()
 
 
+# ---------------------------------------------------------------------------
+# ARPIPE: the FFN all-reduce's last round deferred into the next input projection
+# ---------------------------------------------------------------------------
+_ARP_CASES = (
+    dict(hier=2, arpipe=True),
+    dict(hier=2, arpipe=True, hx=True),
+    dict(hier=1, arpipe=True, arpipe_h1=True),
+)
+
+
+def _check_arpipe() -> None:
+    for kw in _ARP_CASES:
+        base_t = _tiles(
+            **{k: v for k, v in kw.items() if k not in ("arpipe", "arpipe_h1")}
+        )
+        base, _ = _run(_spec(_HookMixer(), _LinFFN()), base_t)
+        out, info = _run(_spec(_HookMixer(), _LinFFN()), _tiles(**kw))
+        sched = info["schedule"]
+        assert sched.arpipe and sched.hook_kind == "w_in", (kw, sched)
+        assert sched.hook_tiles == (0, 1) and sched.hook_hpt == 2, sched
+        assert (kw["hier"] == 1) == info["core_plan"].comm.ARP_H1
+        assert "arp" in info["vmem_shapes"]
+        # the deferred input norm changes rounding (unscaled input, scaled
+        # after the projection): close to the reference, not bit-identical
+        assert not np.array_equal(out, base), kw
+        # with the FFN's refill also deferred into its (now deferred) all-reduce
+        out2, _ = _run(_spec(_HookMixer(), _LinFFN(defer=True)), _tiles(**kw))
+        np.testing.assert_array_equal(out2, out)
+
+
+def _check_arpipe_needs_module_support() -> None:
+    """A first slot that does not declare the hook keeps the default schedule
+    (bit-identical), as does `arpipe` on `hier=1` without `arpipe_h1`."""
+    base, _ = _run(_spec(_LinMixer(), _LinFFN()), _tiles(hier=2))
+    out, info = _run(_spec(_LinMixer(), _LinFFN()), _tiles(hier=2, arpipe=True))
+    assert not info["schedule"].arpipe and "arp" not in info["vmem_shapes"]
+    np.testing.assert_array_equal(out, base)
+    base1, _ = _run(_spec(_HookMixer(), _LinFFN()), _tiles(hier=1))
+    out1, info1 = _run(_spec(_HookMixer(), _LinFFN()), _tiles(hier=1, arpipe=True))
+    assert not info1["schedule"].arpipe
+    np.testing.assert_array_equal(out1, base1)
+
+
+def test_arpipe_defers_the_last_all_reduce_into_the_input_projection():
+    """ARPIPE on hier=2 (with and without hx) and hier=1: engaged, close to
+    the host reference, and unchanged by also deferring the FFN refill."""
+    if len(jax.devices("cpu")) < _R:
+        _spawn_with_cpu_devices(_R, "arpipe")
+        return
+    _check_arpipe()
+
+
+def test_arpipe_needs_module_support_and_arpipe_h1():
+    if len(jax.devices("cpu")) < _R:
+        _spawn_with_cpu_devices(_R, "arpipe_gate")
+        return
+    _check_arpipe_needs_module_support()
+
+
 _CHECKS = {
+    "arpipe": _check_arpipe,
+    "arpipe_gate": _check_arpipe_needs_module_support,
     "deferred_fill": _check_deferred_fill,
 }
 

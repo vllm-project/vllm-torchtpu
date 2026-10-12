@@ -27,7 +27,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import PartitionSpec as P
 
 from .collectives import AllReduceRing
-from .dma.stream import TwoRing
+from .dma.stream import HalfSplitHook, TwoRing
 from .dma.vmem import CorePlan, build_scratch, fit_default_tiles
 from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
@@ -72,6 +72,22 @@ class KernelContext:
     # refill, `TwoRing.take_deferred_flush()`); the builder issues it inside
     # the all-reduce (`AllReduceRing.allreduce(fill=)`) and clears it.
     deferred_fill: Any = None
+    # ARPIPE (`CorePlan.schedule.arpipe`, mirrored in `arp`): during the first
+    # slot's `emit`, `layer_hook` is the `stream.HalfSplitHook` the module must
+    # pass, exactly once, to its input projection on `scr['xb']` (its first
+    # static weight: `dmatmul(hook=)`, or `dbanks_wait` + `arp_mm`), and it
+    # scales that projection's outputs with `arp_scale`. A module that honours
+    # this declares `"layer_hook"` in `Module.layer_schedule`.
+    layer_hook: Any = None
+    arp: bool = False
+
+    def arp_scale(self, x: Any, rows: Any = None) -> Any:
+        """`x` times the deferred reciprocal input RMS (ARPIPE: `scr['xb']` holds
+        the unscaled normalized input); `x` itself when ARPIPE is off."""
+        if not self.arp:
+            return x
+        r = self.scr["arp"][:, 0:1] if rows is None else self.scr["arp"][rows, 0:1]
+        return x * r
 
     def module_params(self, name: str) -> Any:
         """Return the build-time parameters computed by `Module.plan_params`."""
@@ -130,6 +146,7 @@ def build(
     p = core_plan.plan
     sp = core_plan.stream
     cp = core_plan.comm
+    sched = core_plan.schedule
     s_names = list(scratch.keys())
 
     w_names = p.w_names
@@ -182,13 +199,39 @@ def build(
             skip=skip,
             sc=sc,
             raw_refs=raw_refs,
+            arp=sched.arpipe,
         )
+        zc = bool(g.zero_centered_norm)
+        arp_w_off = sp.lay[sched.in_norm][0] if sched.arpipe else 0
 
         def _emit_mod(mod: Any, lyr: Any, slot: Any) -> Any:
             with mod_sc(mod, "emit"):
                 if scopes_lvl >= 1 and not ex.interpret:
                     pltpu.trace_value("layer", lyr)
                 return mod.emit(ctx, lyr, slot)
+
+        def _emit_hooked(mod: Any, lyr: Any, slot: Any) -> Any:
+            """ARPIPE: emit the first slot with `ctx.layer_hook` set; the hook
+            adds the deferred all-reduce's other half and normalizes it."""
+            calls: list[int] = []
+
+            def fn() -> None:
+                assert not calls, f"{mod.name!r} ran ctx.layer_hook twice"
+                calls.append(1)
+                comm.arp_round2_add()
+                comm.arp_norm_half(
+                    arp_w_off, slot, 1 - comm.arp_c, False, eps=g.eps, zero_centered=zc
+                )
+
+            ctx.layer_hook = HalfSplitHook(
+                sched.hook_tiles, sched.hook_hpt, comm.arp_c, fn
+            )
+            try:
+                part = _emit_mod(mod, lyr, slot)
+            finally:
+                ctx.layer_hook = None
+            assert calls, f"{mod.name!r} did not run ctx.layer_hook (ARPIPE)"
+            return part
 
         # ------------------------------ layer loop ------------------------------
         def layer(l, carry):  # noqa: E741
@@ -219,24 +262,39 @@ def build(
             )
             ar_first = (l < 2) if ar_parity else first
 
-            def _reduce(part: Any, eff_ar: Any) -> None:
+            def _reduce(part: Any, eff_ar: Any, defer: bool = False) -> None:
                 fill, ctx.deferred_fill = ctx.deferred_fill, None
-                if eff_ar is not None:
+                if eff_ar is not None and defer:  # ARPIPE: own half added now
+                    comm.allreduce(eff_ar, part, ar_first, fill, defer=True)
+                elif eff_ar is not None:
                     comm.add_residual(comm.allreduce(eff_ar, part, ar_first, fill))
                 elif fill is not None:
                     fill()
 
-            for slot_entry, ar_slot in zip(
-                model_spec.layer_type.slots, p.slot_ar_index
+            def _input_norm(norm_field: Any, hooked: bool) -> None:
+                if not hooked:
+                    ctx.apply_input_norm(norm_field, slot)
+                    return
+                with sc("norm_in"):  # own half; the hook does the other
+                    comm.arp_norm_half(
+                        arp_w_off, slot, comm.arp_c, True, eps=g.eps, zero_centered=zc
+                    )
+                ctx.norm_x = None
+
+            for si, (slot_entry, ar_slot) in enumerate(
+                zip(model_spec.layer_type.slots, p.slot_ar_index)
             ):
                 eff_ar = slot if (ar_slot is not None and ar_parity) else ar_slot
+                hooked = sched.arpipe and si == 0
+                defer = sched.arpipe and si == 1
+                emit = _emit_hooked if hooked else _emit_mod
                 if isinstance(slot_entry, SwitchSlot):
                     active = slot_entry.active_branches
                     norm_names = {m.input_norm for m in active}
                     assert len(norm_names) == 1, norm_names
-                    ctx.apply_input_norm(active[0].input_norm, slot)
+                    _input_norm(active[0].input_norm, hooked)
                     if len(active) == 1:
-                        _reduce(_emit_mod(active[0], l, slot), eff_ar)
+                        _reduce(emit(active[0], l, slot), eff_ar, defer)
                     elif len(active) == 2:
                         c0 = slot_entry.active_counts[0]
                         is_b1 = (l % slot_entry.period) >= c0
@@ -246,8 +304,8 @@ def build(
                         # the lowered `scf.if` yields `()` instead of returning
                         # a `vector<MBxHxf32>` tensor across the branch boundary
                         # (which would keep 64 VRegs live across `scf.if`).
-                        def _emit_branch(mod, eff_ar=eff_ar):
-                            _reduce(_emit_mod(mod, l, slot), eff_ar)
+                        def _emit_branch(mod, eff_ar=eff_ar, emit=emit, defer=defer):
+                            _reduce(emit(mod, l, slot), eff_ar, defer)
 
                         stream.cond_branches(
                             is_b1,
@@ -262,8 +320,8 @@ def build(
                             "not yet supported"
                         )
                 else:
-                    ctx.apply_input_norm(slot_entry.input_norm, slot)
-                    _reduce(_emit_mod(slot_entry, l, slot), eff_ar)
+                    _input_norm(slot_entry.input_norm, hooked)
+                    _reduce(emit(slot_entry, l, slot), eff_ar, defer)
 
             stream.assert_flushed()
             return carry
@@ -295,10 +353,14 @@ def build(
         for m in modules:
             with mod_sc(m, "init_buffers"):
                 m.init_buffers(ctx)
+        if sched.arpipe:  # a zero deferred round for layer 0's hook
+            comm.arp_prime()
 
         lax.fori_loop(0, g.L, layer, 0)
 
         # ------------------------------ step epilogue ------------------------------
+        if sched.arpipe:  # the last layer's deferred all-reduce half
+            comm.arp_round2_add()
         comm.drain_sends()
         for m in modules:
             with mod_sc(m, "epilogue"):
@@ -431,6 +493,7 @@ def build(
         "exec": ex,
         "plan": p,
         "core_plan": core_plan,
+        "schedule": sched,
         "collective_id": coll_id,
         "T_TOTAL": sp.T_TOTAL,
         "vmem_scratch_bytes": core_plan.vmem_bytes,

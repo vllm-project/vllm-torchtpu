@@ -26,13 +26,19 @@ import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
 from .. import exec_spec
-from ..collectives.params import CommParams, comm_params, ring_scratch, stage_scratch
+from ..collectives.params import (
+    CommParams,
+    comm_params,
+    ring_scratch,
+    stage_scratch,
+    with_schedule,
+)
 from ..errors import MegakernelConfigError
 from ..exec_spec import ExecSpec
 from ..ops import BF16, F32, FP8, round_up
 from ..planner import Plan, extra_inputs, plan
 from ..profiles.default import chip_budget
-from ..spec import ModelSpec, ScratchReq
+from ..spec import ModelSpec, ScratchReq, SwitchSlot
 from . import pool_alias
 
 logger = logging.getLogger(__name__)
@@ -170,6 +176,61 @@ class StreamParams:
 
 
 @dataclass(frozen=True)
+class LayerSchedule:
+    """Layer-schedule options engaged for a build (`collectives.with_schedule`).
+
+    `arpipe`: the layer's last all-reduce is deferred into the first slot's
+    input projection `hook_kind`, whose `K` tiles `hook_tiles` (half 0; half 1
+    = `+ hook_hpt`) are summed around the hook (`stream.HalfSplitHook`).
+    `in_norm`: that slot's input norm field (normalized per half).
+    """
+
+    arpipe: bool = False
+    hook_kind: str | None = None
+    hook_tiles: tuple[int, ...] = ()
+    hook_hpt: int = 0
+    in_norm: str | None = None
+
+
+def _slot_modules(slot: Any) -> tuple[Any, ...]:
+    return slot.active_branches if isinstance(slot, SwitchSlot) else (slot,)
+
+
+def _first_static_kind(m: Any, g: Any, ex: ExecSpec) -> str | None:
+    for w in m.weights(g, ex):
+        if w.stream_ring == "static":
+            return w.name
+    return None
+
+
+def layer_schedule_inputs(
+    model_spec: ModelSpec, ex: ExecSpec, p: Plan
+) -> tuple[tuple[int, int] | None, str | None, str | None]:
+    """`(in_kind, hook_kind, in_norm)` for `collectives.with_schedule`.
+
+    The layer can take the ARPIPE hook when it has two slots, each followed by
+    an all-reduce on buffer slots 0 and 1, and every branch of its first slot
+    declares `"layer_hook"` in `Module.layer_schedule` with a first static
+    weight (its input projection) of one shared `(tk, nt)` and one input
+    norm. Otherwise `(None, None, None)`.
+    """
+    slots = model_spec.layer_type.slots
+    if len(slots) != 2 or tuple(p.slot_ar_index) != (0, 1):
+        return None, None, None
+    mods = _slot_modules(slots[0])
+    if not mods or any("layer_hook" not in m.layer_schedule for m in mods):
+        return None, None, None
+    kinds = [_first_static_kind(m, model_spec.config, ex) for m in mods]
+    norms = {m.input_norm for m in mods}
+    if None in kinds or len(norms) != 1 or None in norms:
+        return None, None, None
+    tk_nt = {(p.tk[k], p.nt[k]) for k in kinds}
+    if len(tk_nt) != 1:
+        return None, None, None
+    return next(iter(tk_nt)), kinds[0], next(iter(norms))
+
+
+@dataclass(frozen=True)
 class CorePlan:
     """Complete build-time plan combining `Plan`, `StreamParams`, and `CommParams`."""
 
@@ -186,6 +247,7 @@ class CorePlan:
     NMIX: int
     smem_bytes: int = 0
     smem_shapes: dict[str, tuple[tuple[int, ...], Any]] | None = None
+    schedule: LayerSchedule = LayerSchedule()
 
     def module(self, name: str) -> Any:
         return self.modules[name]
@@ -283,6 +345,29 @@ def build_scratch(
     typed = bool(ex.interpret)
 
     cp = comm_params(ex, tiles, H)
+    in_kind, hook_kind, in_norm = layer_schedule_inputs(model_spec, ex, p)
+    cp = with_schedule(
+        cp,
+        tiles,
+        comm=cp.R > 1 and "comm" not in ex.skip,
+        dense="dense" not in ex.skip,
+        in_kind=in_kind,
+        unroll=min(tiles.dmm_unroll, NBD),
+    )
+    schedule = LayerSchedule()
+    if cp.ARP:
+        assert in_kind is not None and hook_kind is not None
+        hpt = cp.HC2 // in_kind[0]
+        tiles_per_block = cp.AR_C // in_kind[0]
+        schedule = LayerSchedule(
+            arpipe=True,
+            hook_kind=hook_kind,
+            hook_tiles=tuple(
+                j * tiles_per_block + i for j in range(H // cp.AR_C) for i in range(hpt)
+            ),
+            hook_hpt=hpt,
+            in_norm=in_norm,
+        )
 
     vshape = {k: (tk[k], kinds[k][1]) for k in kinds}
     vdtype = {k: kinds[k][2] for k in kinds}
@@ -310,6 +395,8 @@ def build_scratch(
         scratch["esem"] = pltpu.SemaphoreType.DMA((NBE,))
 
     scratch.update(stage_scratch(cp))
+    if schedule.arpipe:  # per-row sum of squares, then the reciprocal RMS
+        scratch["arp"] = pltpu.VMEM((MB, 128), F32)
 
     phase_map: dict[str, str] = {k: "persistent" for k in scratch}
 
@@ -445,6 +532,7 @@ def build_scratch(
         NMIX=NMIX,
         smem_bytes=smem_bytes,
         smem_shapes=smem_shapes,
+        schedule=schedule,
     )
     return core_plan, scratch
 
