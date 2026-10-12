@@ -19,11 +19,14 @@ out = fused_moe_decode(
     w1_scale, w2_scale,   # [E, 1, 1, 2i] / [E, 1, 1, H] f32 per channel
     shared_w1, shared_w1_scale,  # [H, 2i_s] / [1, 2i_s]
     shared_w2, shared_w2_scale,  # [i_s, H] / [1, H]
-    shared_gate_weight,   # [H, 1], output scaled by sigmoid(hidden @ it)
+    shared_gate_weight,   # [H, 1], output scaled by sigmoid(hidden @ it);
+                          # None for an ungated shared expert
     topk_weights, topk_ids,      # [T, k] from the caller's router
     n_ranks=8,
     expert_start=None,    # global id of the first local expert (EP); None for TP
     scatter_rows=False,   # True for DP attention, see below
+    routed_scale=1.0,     # scales the routed experts only (GLM-5.2: 2.5)
+    i_block=None,         # force blocked mode with this width (tests)
 )  # -> [T, H] bf16, all-reduced, identical on every rank
    #    scatter_rows=True: [T / n_ranks, H], this rank's rows only
 ```
@@ -38,9 +41,12 @@ out = fused_moe_decode(
   are the global batch, all-gathered rank-major by the caller. The all-reduce
   becomes a reduce-scatter over token rows. Rank `r` returns rows
   `[r·T/n, (r+1)·T/n)` and no all-gather runs. Needs `T % n_ranks == 0`.
+- `routed_scale` multiplies the routed sum, never the shared expert, as vLLM's
+  `MoERunner` applies `routed_scaling_factor`.
 - `vmem_bytes(tokens, h, i, i_s, experts, n_ranks, weight_dtype)` returns the
   VMEM one call declares. The adapter uses it to refuse a token cap that cannot
-  compile.
+  compile. `plan_weight_ring` returns the block width (None for whole
+  experts) and ring depth one call uses.
 
 ### Serving
 
@@ -49,6 +55,12 @@ includes the MTP drafter. An armed layer runs this kernel for steps of up to
 `FUSED_MOE_DECODE_KERNEL_MAX_TOKENS` tokens (default 256). Larger steps run the
 regular GMM MoE, the shared expert and one all-reduce, inside the same exported
 program.
+
+Two shared-expert conventions are served: Qwen3.5's gated shared expert, and
+GLM-5.2's ungated `DeepseekV2MLP` with `routed_scaling_factor` 2.5. For the
+latter, arming sets the runner's factor to 1.0 because the op applies it.
+Every EP rank must arm the same layers, so arming compares across ranks and
+raises at load on any mismatch.
 
 ## When to use it
 
@@ -61,16 +73,15 @@ Use it when all of these hold:
 - The MoE is TP-sharded, or EP with `ep_size == mesh size`.
 - Weights are FP8 with per-channel scales, the activation is SiLU, and there
   are no expert biases.
-- The shared expert has a sigmoid gate, `routed_scaling_factor` is 1, and there
-  are no routed input/output transforms.
+- The shared expert has a sigmoid gate (Qwen3.5) or is an ungated
+  `DeepseekV2MLP` (GLM-5.2). The activation dtype is not FP16 when
+  `routed_scaling_factor` is not 1, and there are no routed input/output
+  transforms.
 - `i`, `i_s` and `H / n_ranks` are multiples of 128, and `i_s <= i`.
-- At least 3 slots of one expert's `w1 + w2` fit in half of VMEM. This holds
-  for Qwen3.5-397B TP8 and EP8.
+- Experts of any size. Those whose 3 whole-expert slots do not fit VMEM
+  (GLM-5.2 EP16) stream in blocks; see Design.
 
-Do not use it for:
-
-- Experts too large to hold whole in a VMEM slot. GLM-5.2 EP is one example.
-- Prefill-sized steps.
+Do not use it for prefill-sized steps.
 
 The adapter declines a layer that fails these checks, and that layer keeps the
 GMM path.
@@ -106,11 +117,18 @@ arms only with TP attention (DP 1).
   ring is primed while the shared expert computes. Expert `j+1`'s first matmul
   is issued during expert `j`'s elementwise chain, so the MXU stays busy while
   the VPU quantizes.
+- **Blocked mode.** When 3 whole-expert slots do not fit VMEM, each active
+  expert streams as `i / ib` units: a gate block with its matching up block of
+  `w13`, and the matching rows of `w2`. `ib` is 256 (else 128) and the ring is
+  up to 6 units deep. Each block's down-projection partial adds into the same
+  accumulator. The choice depends on expert size only, so Qwen3.5 and GLM-5.2
+  TP keep whole experts and the unchanged program. The kernel name ends in
+  `-ib_<ib>`.
 - **Numerics.** Hidden states are quantized once per row, and the activated
-  intermediate per row per expert. Both matmuls run in the weight dtype (FP8)
+  intermediate per row per expert (per row per block in blocked mode). Both matmuls run in the weight dtype (FP8)
   with FP32 accumulation into one VMEM accumulator.
 - **Shared expert in-kernel.** Its slice is loaded once at entry and computed
-  first, gated by `sigmoid(x · w_g)`.
+  first, gated by `sigmoid(x · w_g)` or ungated.
 - **In-kernel all-reduce.** It is a remote-DMA reduce-scatter over column
   chunks, then an all-gather, with bf16 on the wire. With `scatter_rows` it is
   a reduce-scatter over token rows only. The cross-rank barrier is
