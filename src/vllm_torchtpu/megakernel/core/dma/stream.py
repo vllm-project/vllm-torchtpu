@@ -430,6 +430,38 @@ class TwoRing:
                 self.dcopy(kind, self.W[kind].at[0, 0], bank).wait()
         return self.dview(kind, bank)
 
+    def dbanks(self, g0, n: int) -> list[Any]:
+        """Ring banks of tiles `g0 .. g0+n-1` (`n <= NBD`, `g0 >= 0`): one `rem`, then
+        a wrap per tile instead of one `rem` per tile."""
+        NBD = self.sp.NBD
+        if isinstance(g0, int):
+            return [(g0 + u) % NBD for u in range(n)]
+        b0 = lax.rem(g0, NBD)
+        out = [b0]
+        for u in range(1, n):
+            b = b0 + u
+            out.append(jnp.where(b >= NBD, b - NBD, b))
+        return out
+
+    def dtake_group(self, kinds_gs: list[tuple[str, Any]]) -> list[Any]:
+        """`dtake` for a group `[(kind, g), ...]` of consecutive tiles `g0, g0+1, ...`.
+
+        With `dwait_hoist` every bank is computed before the first wait and each
+        wait uses a static bank-0 destination view (a DMA wait reads only the
+        semaphore and the byte count); otherwise one `dtake` per tile. Returns
+        the tiles' VMEM views.
+        """
+        if not self.sp.dwait_hoist:
+            return [self.dtake(k, g) for k, g in kinds_gs]
+        banks = self.dbanks(kinds_gs[0][1], len(kinds_gs))
+        if "dense" not in self.skip:
+            with self.sc("dwait", 3):
+                for (k, _), b in zip(kinds_gs, banks):
+                    pltpu.make_async_copy(
+                        self.W[k].at[0, 0], self.dview(k, 0), self.scr["dsem"].at[b]
+                    ).wait()
+        return [self.dview(k, b) for (k, _), b in zip(kinds_gs, banks)]
+
     def dgive(self, g):
         """Release dense bank `g % NBD` by prefetching tile `g + NBD` into it."""
         self.fetch(g + self.sp.NBD)
@@ -449,8 +481,13 @@ class TwoRing:
         *,
         lazy: bool = False,
         dmm_ctx=None,
+        ws_pre=None,
     ):
-        """Paired/unrolled dense matmul: `acc[:, :N] = xsrc[:, :K] @ W(kind)`."""
+        """Paired/unrolled dense matmul: `acc[:, :N] = xsrc[:, :K] @ W(kind)`.
+
+        `ws_pre`: the `n_t` tiles already taken by the caller (`dtake_group`
+        views or ring banks); requires the fully unrolled form (`n_t <= DMU`).
+        """
         sp = self.sp
         n_t, t_k = sp.nt[kind], sp.tk[kind]
         acc = self.scr["acc"]
@@ -460,15 +497,17 @@ class TwoRing:
         U = n_t if n_t <= DMU else (2 if n_t % 2 == 0 and N > DCW else 1)
         chunks = [(c0, min(DCW, N - c0)) for c0 in range(0, N, DCW)]
         n_s = n_t // U
+        assert ws_pre is None or (n_t == U and len(ws_pre) == n_t), (
+            f"dmatmul({kind!r}, ws_pre=...) needs the unrolled form: "
+            f"n_t={n_t}, U={U}, {0 if ws_pre is None else len(ws_pre)} tiles"
+        )
 
         def step(t, first):
-            ws, xs = [], []
-            for u in range(U):
-                ws.append(self.dtake(kind, g0 + t + u))
-                k0 = (t + u) * t_k
-                if not isinstance(k0, int):
-                    k0 = pl.multiple_of(k0, t_k)
-                xs.append(xsrc[:, pl.ds(k0, t_k)])
+            if ws_pre is not None:
+                ws = [self.dview(kind, b) if isinstance(b, int) else b for b in ws_pre]
+                xs = [xsrc[:, u * t_k : (u + 1) * t_k] for u in range(U)]
+            else:
+                ws, xs = self._take_step(kind, g0, t, U, xsrc)
             for c0, cw in chunks:
                 p = self.mm(xs[0], ws[0][:, c0 : c0 + cw])
                 for u in range(1, U):
@@ -495,6 +534,23 @@ class TwoRing:
             lax.fori_loop(1, n_s, body_pair, 0)
         return acc[:, :N]
 
+    def _take_step(self, kind: str, g0, t, U: int, xsrc):
+        """Wait for tiles `g0+t .. g0+t+U-1` (one group with `dwait_hoist`) and
+        slice their `K` lanes of `xsrc`: `(views, x slices)`."""
+        t_k = self.sp.tk[kind]
+        ws: list[Any] = []
+        xs: list[Any] = []
+        if self.sp.dwait_hoist:
+            ws = self.dtake_group([(kind, g0 + t + u) for u in range(U)])
+        for u in range(U):
+            if len(ws) <= u:
+                ws.append(self.dtake(kind, g0 + t + u))
+            k0 = (t + u) * t_k
+            if not isinstance(k0, int):
+                k0 = pl.multiple_of(k0, t_k)
+            xs.append(xsrc[:, pl.ds(k0, t_k)])
+        return ws, xs
+
     def dmatmul(
         self,
         kind: str,
@@ -503,8 +559,12 @@ class TwoRing:
         *,
         g0=None,
         lazy: bool | None = None,
+        ws_pre=None,
     ):
-        """`acc[:, :N] = xsrc[:, :K] @ W(kind)`, advancing `self.cursor`."""
+        """`acc[:, :N] = xsrc[:, :K] @ W(kind)`, advancing `self.cursor`.
+
+        `ws_pre`: the tiles already taken by the caller (see `dmatmul_pair`).
+        """
         sp = self.sp
         n_t, t_k = sp.nt[kind], sp.tk[kind]
         dmm_ctx = None
@@ -579,7 +639,10 @@ class TwoRing:
             )
         DMU = min(sp.dmm_unroll, sp.NBD)
         if n_t <= DMU or sp.dense_acc_pair:
-            return self.dmatmul_pair(kind, g0, xsrc, N, lazy=use_lazy, dmm_ctx=dmm_ctx)
+            return self.dmatmul_pair(
+                kind, g0, xsrc, N, lazy=use_lazy, dmm_ctx=dmm_ctx, ws_pre=ws_pre
+            )
+        assert ws_pre is None, f"dmatmul({kind!r}, ws_pre=...) needs dmatmul_pair"
         acc = self.scr["acc"]
         acc[:, :N] = jnp.zeros((sp.MB, N), F32)
 
