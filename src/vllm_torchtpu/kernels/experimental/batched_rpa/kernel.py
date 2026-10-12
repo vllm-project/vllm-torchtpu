@@ -418,6 +418,9 @@ def generate_mask(
 
 
 def block_fully_visible(
+    stitch_meta: StitchMetadata,
+    step_meta: ComputeMetadata,
+    cfgs: configs.RpaConfigs,
 ) -> jax.Array | None:
     """Scalar: True iff `generate_mask` would be all-True for every batch entry.
 
@@ -425,6 +428,9 @@ def block_fully_visible(
     `q_kv_diff >= causal_offset - bq_start` holds for the whole tile iff it
     holds at the smallest `q_kv_diff` (1 - bkv_sz) of the first q chunk
     (bq_start=0), i.e. the block's last key is at or before the first query row.
+    The block must also hold `bkv_sz` valid keys, since `generate_mask` masks
+    keys past the lane's KV end. This covers ~98% of blocks for a chunk over a
+    long cached context.
     """
     if not flash_attention.vpu_diet_enabled():
         return None
@@ -432,6 +438,13 @@ def block_fully_visible(
         return None
     full = None
     for b_idx in range(cfgs.batch_size):
+        n_valid = (
+            stitch_meta.bkv_sz_frm_cache[b_idx] + stitch_meta.bkv_sz_frm_new[b_idx]
+        )
+        full_b = jnp.logical_and(
+            step_meta.causal_offset[b_idx] <= 1 - cfgs.bkv_sz,
+            n_valid >= cfgs.bkv_sz,
+        )
         if step_meta.local_k_start is not None:
             full_b = jnp.logical_and(full_b, step_meta.local_k_start[b_idx] <= 0)
         if step_meta.local_k_end is not None:
@@ -546,6 +559,7 @@ def rpa_body(
         step_meta=step_meta,
         cfgs=cfgs,
     )
+    full = block_fully_visible(stitch_meta, step_meta, cfgs)
     if full is None:
         run_step(apply_mask=True)
         return
@@ -731,6 +745,7 @@ def _rpa_step(
                     cfgs.bkv_sz,
                 ),
                 bq_start=bq_start,
+                stitch_meta=stitch_meta,
                 step_meta=step_meta,
                 cfgs=cfgs,
             )
