@@ -69,6 +69,9 @@ def _make_runner(
     runner.reorder_batch_threshold = 1
     runner._pcp_enabled = pcp_size > 1
     runner._mtp_enabled = mtp_enabled
+    runner._mtp_prefill_only = mtp_enabled and pcp_size > 1
+    runner._pp_is_first = True
+    runner._pp_is_last = True
     runner.scheduler_config = SimpleNamespace(async_scheduling=False)
     runner.parallel_config = SimpleNamespace(
         prefill_context_parallel_size=pcp_size,

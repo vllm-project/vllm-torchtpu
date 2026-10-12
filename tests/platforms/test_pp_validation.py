@@ -36,7 +36,10 @@ def _config(
     )
 
 
-RAIDEN = SimpleNamespace(kv_connector="TPURaidenConnector")
+RAIDEN = SimpleNamespace(kv_connector="TPURaidenConnector", is_kv_producer=True)
+RAIDEN_CONSUMER = SimpleNamespace(
+    kv_connector="TPURaidenConnector", is_kv_producer=False
+)
 # Qwen3.5-0.8B: 24 layers, full attention on every fourth.
 HYBRID_24 = ["full_attention" if i % 4 == 3 else "linear_attention" for i in range(24)]
 
@@ -58,9 +61,35 @@ def test_rejects_async_scheduling_and_names_the_flag():
         validate_pipeline_parallel_config(_config(pp=2, async_scheduling=True))
 
 
-def test_rejects_speculative_decoding():
-    with pytest.raises(NotImplementedError, match="speculative decoding"):
-        validate_pipeline_parallel_config(_config(pp=2, speculative=object()))
+MTP_K1 = SimpleNamespace(method="mtp", num_speculative_tokens=1)
+
+
+def test_accepts_prefill_only_mtp_k1_on_a_kv_producer():
+    validate_pipeline_parallel_config(
+        _config(pp=2, speculative=MTP_K1, kv_transfer=RAIDEN, layer_types=HYBRID_24)
+    )
+
+
+@pytest.mark.parametrize(
+    "speculative, kv_transfer",
+    [
+        (SimpleNamespace(method="eagle3", num_speculative_tokens=1), RAIDEN),
+        (SimpleNamespace(method="mtp", num_speculative_tokens=2), RAIDEN),
+        # Without a consumer to hand the draft KV to, the drafts serve
+        # nothing and every decode step would be refused at runtime.
+        (MTP_K1, None),
+        (MTP_K1, RAIDEN_CONSUMER),
+    ],
+)
+def test_rejects_speculative_decoding_other_than_mtp_k1_on_a_producer(
+    speculative, kv_transfer
+):
+    with pytest.raises(
+        NotImplementedError, match="prefill-only MTP.*num_speculative_tokens=1"
+    ):
+        validate_pipeline_parallel_config(
+            _config(pp=2, speculative=speculative, kv_transfer=kv_transfer)
+        )
 
 
 def test_rejects_kv_transfer_connectors_other_than_raiden():

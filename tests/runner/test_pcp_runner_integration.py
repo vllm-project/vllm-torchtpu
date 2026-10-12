@@ -76,7 +76,7 @@ def test_execute_model_pcp_mtp_prefill_only_boundary(
 
     runner._reorder_batch_for_rpa = stop_before_forward
     if rejected:
-        with pytest.raises(RuntimeError, match="PCP.*MTP.*req1"):
+        with pytest.raises(RuntimeError, match="Prefill-only MTP.*req1"):
             TPUModelRunner.execute_model(runner, _scheduler_output(scheduled_tokens))
     else:
         with pytest.raises(ForwardBoundaryReached):

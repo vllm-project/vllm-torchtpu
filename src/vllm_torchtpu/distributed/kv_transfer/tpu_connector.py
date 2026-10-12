@@ -1099,12 +1099,15 @@ class TPUConnectorScheduler:
             return
         if request.prompt_token_ids is None:
             return
-        request.prompt_token_ids.pop()
+        next_prompt_token_id = request.prompt_token_ids.pop()
         request._all_token_ids.pop()
         request.num_prompt_tokens -= 1
         if request.kv_transfer_params is None:
             request.kv_transfer_params = {}
         request.kv_transfer_params["_p_side_truncated"] = True
+        request.kv_transfer_params["_p_side_next_prompt_token_id"] = (
+            next_prompt_token_id
+        )
 
     def on_new_request(self, request: "Request") -> None:
         """Validates decoder kv_transfer_params once at admission. The Raiden
@@ -2497,6 +2500,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             num_tokens=num_tokens,
             mamba_state_block_ids=mamba_state_block_ids,
             group_block_ids=normalized_group_block_ids,
+            next_prompt_token_id=(request.kv_transfer_params or {}).get(
+                "_p_side_next_prompt_token_id"
+            ),
             registered_ahead=ahead,
         )
         params: dict[str, Any] = {
@@ -2851,6 +2857,21 @@ class TPURaidenConnectorWorker:
             raw_tensors=raw_tensors,
             mamba_group_ordinal_by_layer=mamba_group_ordinal_by_layer,
         )
+        # The MTP draft's attention layers order and tag after the target's
+        # layers, so `mtp.layers.0` never collides with `model.layers.0`.
+        from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+        layer_index_by_name: dict[str, int] = {}
+        drafter = getattr(runner, "drafter", None)
+        if isinstance(drafter, Eagle3Proposer) and drafter._draft_attn_layer_names:
+            num_hidden_layers = self._model_config_int("num_hidden_layers", 0)
+            for name in drafter._draft_attn_layer_names:
+                index = rpm.layer_index_from_name(name)
+                if index is None:
+                    raise ValueError(
+                        f"draft attention layer has no layer index: {name}"
+                    )
+                layer_index_by_name[name] = num_hidden_layers + index
         if self._stage3_kimi:
             if runner.bm_pool_layout is not None:
                 raise NotImplementedError(
@@ -2884,6 +2905,7 @@ class TPURaidenConnectorWorker:
                     **manifest_args,
                     per_layer_tags=_use_per_layer_pool_tags(),
                     gdn_geometry=gdn_geometry,
+                    layer_index_by_name=layer_index_by_name,
                 )
             else:
                 manifest = rpm.build_qwen35_pool_manifest(
@@ -2891,6 +2913,7 @@ class TPURaidenConnectorWorker:
                     per_layer_tags=_use_per_layer_pool_tags(),
                     gdn_geometry=gdn_geometry,
                     block_major=runner.bm_pool_layout,
+                    layer_index_by_name=layer_index_by_name,
                 )
         # Hard-fail before manager construction if the pools point at storage
         # that the model kernels do not actually use.

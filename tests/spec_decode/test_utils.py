@@ -45,6 +45,29 @@ def test_own_vocab_weights_are_kept_when_tp_layout_matches():
     assert draft.lm_head is draft_head
 
 
+def test_handoff_seed_tokens_replaces_only_rows_with_a_published_send():
+    from types import SimpleNamespace
+
+    seed = torch.tensor([11, 22, 33], dtype=torch.int32)
+    metadata = SimpleNamespace(
+        reqs_to_send={
+            "a": SimpleNamespace(next_prompt_token_id=7),
+            "c": SimpleNamespace(next_prompt_token_id=None),
+        }
+    )
+    out = utils.handoff_seed_tokens(seed, ["a", "b", "c"], metadata)
+    assert out.tolist() == [7, 22, 33]
+    assert seed.tolist() == [11, 22, 33]
+    # No metadata, or no send with a token: the seed is returned as is.
+    assert utils.handoff_seed_tokens(seed, ["a"], None) is seed
+    assert (
+        utils.handoff_seed_tokens(
+            seed, ["b"], SimpleNamespace(reqs_to_send={"a": object()})
+        )
+        is seed
+    )
+
+
 class _SharedHeadLayer(torch.nn.Module):
     def __init__(self, hidden: int, vocab: int):
         super().__init__()

@@ -1082,3 +1082,29 @@ def test_pipelined_moe_four_stage_pipeline():
     assert len(ag_calls) == 12
     # 4 reduce_scatter calls
     assert len(rs_calls) == 4
+
+
+def test_fixed_chunk_count_honors_the_chunk_size_at_the_largest_bucket():
+    from vllm_torchtpu.layers.adapter import pipelined_fused_moe as pfm
+
+    # PCP8, 4096 tokens per rank at the top: 32768 gathered, 4096 per chunk.
+    buckets = [512, 1024, 1536, 2048, 4096]
+    assert pfm.fixed_chunk_count(buckets, 8, 4096) == 8
+    # A count the buckets cannot all split into falls to the next divisor.
+    assert pfm.fixed_chunk_count([512, 768], 8, 1024) == 4
+    assert pfm.fixed_chunk_count(buckets, 1, 4096) == 1
+    assert pfm.fixed_chunk_count(buckets, 8, 0) == 1
+    assert pfm.fixed_chunk_count([], 8, 4096) == 1
+
+
+def test_fixed_chunk_collection_splits_every_bucket_alike(monkeypatch):
+    from vllm_torchtpu.layers.adapter import pipelined_fused_moe as pfm
+
+    monkeypatch.setattr(envs, "TPU_MOE_COLLECTION_CHUNK_SIZE", 4096)
+    assert pfm.collection_chunks(2048, 8) == (4, 512)
+    with pfm.fixed_moe_collection_chunks([512, 1024, 2048, 4096]):
+        assert pfm.collection_chunks(4096, 8) == (8, 512)
+        assert pfm.collection_chunks(512, 8) == (8, 64)
+        # A single rank gathers nothing and keeps one chunk.
+        assert pfm.collection_chunks(512, 1) == (1, 512)
+    assert pfm.collection_chunks(2048, 8) == (4, 512)

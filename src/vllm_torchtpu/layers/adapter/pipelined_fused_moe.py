@@ -18,6 +18,8 @@ This module provides `pipelined_fused_moe_gmm`, which acts as a wrapper around
 collective communications (AllGather and ReduceScatter) with MoE computation.
 """
 
+import contextlib
+from collections.abc import Sequence
 from typing import cast
 
 import torch
@@ -30,6 +32,60 @@ from vllm_torchtpu.layers.core.quantization import dequantize_tensor, quantize_t
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+# A module global rather than a ContextVar: Dynamo guards on the global's
+# value and cannot trace ContextVar.get.
+_fixed_chunk_buckets: tuple[int, ...] | None = None
+
+
+@contextlib.contextmanager
+def fixed_moe_collection_chunks(buckets: Sequence[int]):
+    """Runs every MoE collection under this context in a fixed chunk count.
+
+    The chunk count is otherwise a function of the token count, and a graph
+    traced once over symbolic token counts keeps the branch it was traced
+    with. The MTP draft is traced that way, so its collection runs the count
+    ``fixed_chunk_count`` derives from the token ``buckets`` the draft is
+    padded to: the configured chunk size still bounds the gather at the
+    largest bucket.
+    """
+    global _fixed_chunk_buckets
+    previous = _fixed_chunk_buckets
+    _fixed_chunk_buckets = tuple(int(bucket) for bucket in buckets)
+    try:
+        yield
+    finally:
+        _fixed_chunk_buckets = previous
+
+
+def fixed_chunk_count(
+    buckets: Sequence[int], parallel_size: int, chunk_size: int
+) -> int:
+    """Chunk count that honors ``chunk_size`` at the largest bucket.
+
+    Every bucket must split into equal chunks, so the count is the largest
+    divisor of all buckets at or under the count the largest bucket needs.
+    """
+    if chunk_size <= 0 or parallel_size <= 1 or not buckets:
+        return 1
+    largest = max(buckets)
+    count = -(-largest * parallel_size // chunk_size)
+    while count > 1 and any(bucket % count for bucket in buckets):
+        count -= 1
+    return count
+
+
+def collection_chunks(seq_len: int, parallel_size: int) -> tuple[int, int]:
+    """Chunk count and local chunk size for this rank's ``seq_len`` tokens."""
+    if _fixed_chunk_buckets is not None and parallel_size > 1:
+        num_chunks = fixed_chunk_count(
+            _fixed_chunk_buckets, parallel_size, envs.TPU_MOE_COLLECTION_CHUNK_SIZE
+        )
+        return num_chunks, seq_len // num_chunks
+    return calculate_moe_chunks(
+        seq_len, parallel_size, envs.TPU_MOE_COLLECTION_CHUNK_SIZE
+    )
 
 
 def enable_pipelined_collective_and_compute() -> bool:
@@ -181,16 +237,13 @@ def pipelined_fused_moe_gmm(
     Returns:
         torch.Tensor: Reduced local output activations [S, H].
     """
-    chunk_size = envs.TPU_MOE_COLLECTION_CHUNK_SIZE
     collective_group, _ = _get_moe_collective_group()
 
     seq_len = hidden_states.shape[0]
     parallel_size = (
         int(collective_group.world_size) if collective_group is not None else 1
     )
-    num_chunks, chunk_size_local = calculate_moe_chunks(
-        seq_len, parallel_size, chunk_size
-    )
+    num_chunks, chunk_size_local = collection_chunks(seq_len, parallel_size)
 
     # There is no gather to make cheaper on a single rank, so quantizing there
     # would only round the activations for nothing.
