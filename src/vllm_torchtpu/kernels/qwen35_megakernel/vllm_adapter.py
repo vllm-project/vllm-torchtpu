@@ -2979,7 +2979,7 @@ class Qwen35Megakernel:
             or getattr(runner, "max_num_reqs", 64)
             or 64
         )
-        max_warm_b = min(64, max(16, max_cfg_seqs * 4))
+        max_warm_b = min(self.max_verify_bucket or 64, max(16, max_cfg_seqs * 4))
         all_keys = [
             (1, b) for b in self.buckets if b <= max_warm_b
         ] + [
