@@ -391,6 +391,7 @@ def generate_mask(
     shape: tuple[int, int, int, int],
     *,
     bq_start: int,
+    stitch_meta: StitchMetadata,
     step_meta: ComputeMetadata,
     cfgs: configs.RpaConfigs,
 ) -> jax.Array:
@@ -415,7 +416,10 @@ def generate_mask(
         # Step 2
         #   offset = causal_offset - bq_start
         offset = step_meta.causal_offset[b_idx] - bq_start
-        mask_b = q_kv_diff >= offset
+        n_valid = (
+            stitch_meta.bkv_sz_frm_cache[b_idx] + stitch_meta.bkv_sz_frm_new[b_idx]
+        )
+        mask_b = jnp.logical_and(q_kv_diff >= offset, kv_iota < n_valid)
         if (sliding_window := cfgs.model.sliding_window) is not None:
             mask_b = jnp.logical_and(mask_b, q_kv_diff < sliding_window + offset)
 
@@ -439,9 +443,17 @@ def _mask_unattended_v(
 ) -> tuple[jax.Array, jax.Array | float | None]:
     """Zeroes unattended rows of V and v_scale to prevent FP8 NaNs in PV matmul."""
     seq_along_lane = cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE
-    kv_iota = lax.broadcasted_iota(jnp.int32, (cfgs.bkv_sz,), 0)
+    # Emit the sequence-axis iota directly at the 3D V tile shape so
+    # HEAD_ALONG_SUBLANE (sequence on sublane axis 1) does not lower through an
+    # unsupported 1D->3D vector.shape_cast in Mosaic's infer-vector-layout pass.
+    v_iota = lax.broadcasted_iota(jnp.int32, v.shape[1:], 2 if seq_along_lane else 1)
     has_per_token_v_scale = (
         isinstance(v_scale, jax.Array) and cfgs.serve.per_token_scale
+    )
+    sc_iota = (
+        lax.broadcasted_iota(jnp.int32, v_scale.shape[1:], 1)
+        if has_per_token_v_scale
+        else None
     )
 
     masked_v = []
@@ -449,19 +461,24 @@ def _mask_unattended_v(
 
     for b in range(cfgs.batch_size):
         n_valid = stitch_meta.bkv_sz_frm_cache[b] + stitch_meta.bkv_sz_frm_new[b]
-        keep = kv_iota < n_valid
+        keep_v = v_iota < n_valid
         if step_meta.local_k_start is not None:
-            keep = jnp.logical_and(keep, kv_iota >= step_meta.local_k_start[b])
+            keep_v = jnp.logical_and(keep_v, v_iota >= step_meta.local_k_start[b])
         if step_meta.local_k_end is not None:
-            keep = jnp.logical_and(keep, kv_iota < step_meta.local_k_end[b])
+            keep_v = jnp.logical_and(keep_v, v_iota < step_meta.local_k_end[b])
 
         v_b = v[b]
-        keep_v = keep[None, None, :] if seq_along_lane else keep[None, :, None]
         masked_v.append(jnp.where(keep_v, v_b, jnp.zeros_like(v_b)))
 
         if has_per_token_v_scale:
-            assert isinstance(v_scale, jax.Array)
-            keep_sc = keep[None, :]
+            assert isinstance(v_scale, jax.Array) and sc_iota is not None
+            keep_sc = sc_iota < n_valid
+            if step_meta.local_k_start is not None:
+                keep_sc = jnp.logical_and(
+                    keep_sc, sc_iota >= step_meta.local_k_start[b]
+                )
+            if step_meta.local_k_end is not None:
+                keep_sc = jnp.logical_and(keep_sc, sc_iota < step_meta.local_k_end[b])
             masked_v_scale.append(
                 jnp.where(keep_sc, v_scale[b], jnp.zeros_like(v_scale[b]))
             )
@@ -474,7 +491,9 @@ def _mask_unattended_v(
 
 
 def block_fully_visible(
-    step_meta: ComputeMetadata, cfgs: configs.RpaConfigs
+    stitch_meta: StitchMetadata,
+    step_meta: ComputeMetadata,
+    cfgs: configs.RpaConfigs,
 ) -> jax.Array | None:
     """Scalar: True iff `generate_mask` would be all-True for every batch entry.
 
@@ -482,7 +501,9 @@ def block_fully_visible(
     `q_kv_diff >= causal_offset - bq_start` holds for the whole tile iff it
     holds at the smallest `q_kv_diff` (1 - bkv_sz) of the first q chunk
     (bq_start=0), i.e. the block's last key is at or before the first query row.
-    This covers ~98% of blocks for a chunk over a long cached context.
+    The block must also hold `bkv_sz` valid keys, since `generate_mask` masks
+    keys past the lane's KV end. This covers ~98% of blocks for a chunk over a
+    long cached context.
     """
     if not flash_attention.vpu_diet_enabled():
         return None
@@ -490,7 +511,13 @@ def block_fully_visible(
         return None
     full = None
     for b_idx in range(cfgs.batch_size):
-        full_b = step_meta.causal_offset[b_idx] <= 1 - cfgs.bkv_sz
+        n_valid = (
+            stitch_meta.bkv_sz_frm_cache[b_idx] + stitch_meta.bkv_sz_frm_new[b_idx]
+        )
+        full_b = jnp.logical_and(
+            step_meta.causal_offset[b_idx] <= 1 - cfgs.bkv_sz,
+            n_valid >= cfgs.bkv_sz,
+        )
         if step_meta.local_k_start is not None:
             full_b = jnp.logical_and(full_b, step_meta.local_k_start[b_idx] <= 0)
         if step_meta.local_k_end is not None:
@@ -610,7 +637,7 @@ def rpa_body(
         step_meta=step_meta,
         cfgs=cfgs,
     )
-    full = block_fully_visible(step_meta, cfgs)
+    full = block_fully_visible(stitch_meta, step_meta, cfgs)
     if full is None:
         run_step(apply_mask=True)
         return
@@ -800,6 +827,7 @@ def _rpa_step(
                     cfgs.bkv_sz,
                 ),
                 bq_start=bq_start,
+                stitch_meta=stitch_meta,
                 step_meta=step_meta,
                 cfgs=cfgs,
             )
