@@ -323,6 +323,7 @@ def _plan_effect(field: str, g: Any, ex: mk.ExecSpec) -> Any:
         "gqa.kv_ering": bp["gqa"].KVE,
         "gqa.gqa_qv": bp["gqa"].QV,
         "rel_fetch": sp.rel_fetch,
+        "dwait_hoist": sp.dwait_hoist,
         "moe.moe_group_rows": bp["moe"].group_rel,
         "moe.ep_fast_refill": bp["moe"].ep_fast,
         "moe.route_early": bp["moe"].route_early,

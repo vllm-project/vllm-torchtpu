@@ -155,13 +155,16 @@ TILE_NUMERICS: dict[str, NumericsClass] = {
     "dmm_unroll": "approx",  # unrolled dense matmul accumulation
     "rel_fetch": "exact",  # trace-time-decoded dense refills (scheduling)
     # Collective / dense-ring schedule options: `approx` until a bit-identity
-    # flip (`EXACT_FLIPS`) shows otherwise.
+    # flip (`EXACT_FLIPS`) shows otherwise. `ar0s`, `hx` and `hier1_peers` are
+    # bit-identical in their 8-rank tests (test_collectives_schedule,
+    # test_layer_schedule) but the model flip harness runs at R=2, where the
+    # hier=1 / hier=2 all-reduces do not exist, so they stay `approx` here.
     "arpipe": "approx",  # split input norm + deferred all-reduce round
     "arpipe_h1": "approx",  # `arpipe` on `hier=1`
     "ar0s": "approx",  # early round-0 all-reduce sends
-    "dwait_hoist": "approx",  # dense wait-group bank hoist (scheduling, unproven)
+    "dwait_hoist": "exact",  # dense wait-group bank hoist (scheduling)
     "hx": "approx",  # `hier=2` 4-chip RS + AG
-    "hier1_peers": "approx",  # `hier=1` cross-chip peers (unproven)
+    "hier1_peers": "approx",  # `hier=1` cross-chip peers
 }
 
 
