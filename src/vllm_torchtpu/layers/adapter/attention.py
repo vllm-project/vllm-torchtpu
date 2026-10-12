@@ -790,6 +790,7 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
 
 
 class PallasAttentionBackendImpl(AttentionImpl):
+    layer_idx: int
     _kernel_instance_counter = 0
     # Registry of shared custom ops keyed to avoid registering duplicate Pallas
     # kernels for layers with identical configs.

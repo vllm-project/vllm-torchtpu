@@ -176,6 +176,11 @@
       "concise_description": "`descriptors` may be uninitialized"
     },
     {
+      "path": "src/vllm_torchtpu/executors/ray_distributed_executor_v2.py",
+      "name": "not-iterable",
+      "concise_description": "Type `None` is not iterable"
+    },
+    {
       "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/host.py",
       "name": "unbound-name",
       "concise_description": "`estimate` may be uninitialized"
@@ -392,16 +397,6 @@
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `tuple[Unknown, Unknown, int | None, Unknown] | tuple[Unknown, Unknown, Unknown]` is not assignable to declared return type `tuple[int, ...]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `tuple[Unknown, Unknown, int | None, Unknown] | tuple[Unknown, Unknown, Unknown]` is not assignable to declared return type `tuple[int, ...]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `list[Unknown] | tuple[Unknown, Unknown]` is not assignable to parameter `kv_cache` with type `tuple[Unknown, Unknown]` in function `sparse_mla_impl`"
     },
@@ -444,11 +439,6 @@
       "path": "src/vllm_torchtpu/layers/core/fused_moe_gmm.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `vmem_capacity_bytes`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/sequence_layout.py",
-      "name": "unsupported-delete",
-      "concise_description": "Invalid target for `del`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",

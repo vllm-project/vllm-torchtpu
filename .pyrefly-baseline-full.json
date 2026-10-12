@@ -408,16 +408,6 @@
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector_stats.py",
       "name": "missing-attribute",
-      "concise_description": "Object of type `Counter | Gauge | Histogram` has no attribute `observe`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector_stats.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Histogram` has no attribute `inc`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector_stats.py",
-      "name": "missing-attribute",
       "concise_description": "Object of type `Counter | Gauge | Histogram` has no attribute `set`"
     },
     {
@@ -1437,11 +1427,6 @@
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/custom_ops/mla_attention_op.py",
-      "name": "unsupported-delete",
-      "concise_description": "Invalid target for `del`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/custom_ops/mla_attention_op.py",
       "name": "bad-override",
       "concise_description": "Class member `VllmTPUSparseAttnIndexer.forward_oot` overrides parent class `SparseAttnIndexer` in an inconsistent manner"
     },
@@ -1534,11 +1519,6 @@
       "path": "src/vllm_torchtpu/layers/core/fused_moe_gmm.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `vmem_capacity_bytes`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/sequence_layout.py",
-      "name": "unsupported-delete",
-      "concise_description": "Invalid target for `del`"
     },
     {
       "path": "src/vllm_torchtpu/model_loader_patches.py",

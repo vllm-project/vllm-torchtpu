@@ -306,6 +306,7 @@ class AllSequenceLayoutPlanner:
         target_num_reqs: int,
         padded_num_reqs: int,
     ) -> SequenceLayoutPlan:
+        # pyrefly: ignore[unsupported-delete]
         del (
             scheduler_output,
             start_index,

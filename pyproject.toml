@@ -255,6 +255,7 @@ ignore-missing-imports = [
     "packaging", "packaging.*",
     "pathwaysutils", "pathwaysutils.*",
     "portpicker", "portpicker.*",
+    "prometheus_client", "prometheus_client.*",
     "ray", "ray.*",
     "requests", "requests.*",
     "sympy", "sympy.*",
