@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Startup summaries preserve parallel rank and incomplete-run boundaries."""
 
+import datetime
 import sys
 from pathlib import Path
 
@@ -10,9 +11,19 @@ _SCRIPTS = Path(__file__).resolve().parents[2] / "scripts/dsv41_bench/server_ste
 if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
-from summarize_startup import summarize_startup  # noqa: E402
+from summarize_startup import assert_no_compilation, summarize_startup  # noqa: E402
 
 pytestmark = pytest.mark.cpu_test
+
+
+def test_compilation_audit_excludes_startup_and_handles_new_year():
+    start = datetime.datetime(2026, 12, 31, 23, 59, 58).timestamp() * 1e9
+    intervals = [[int(start), int(start + 5e9)]]
+    assert_no_compilation("12-31 23:58:00 Compiling FX graph", intervals)
+    with pytest.raises(ValueError, match="Compilation in formal"):
+        assert_no_compilation("01-01 00:00:01 Compiling FX graph", intervals)
+    with pytest.raises(ValueError, match="Cannot timestamp"):
+        assert_no_compilation("Compiling FX graph", intervals)
 
 
 def test_parallel_ranks_are_not_summed():

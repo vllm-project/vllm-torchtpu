@@ -59,7 +59,8 @@ python scripts/dsv41_bench/server_steps/run.py \
 `run.py` starts the memory monitor and server, waits for HTTP health readiness,
 runs a separate warmup and five formal rounds, optionally collects a separate
 profile wave, and stops its server process group. The startup timeout defaults
-to 3000 seconds. A cold run rejects a nonempty cache directory. Keep the cache
+to 3000 seconds. Compiler events in formal serving windows fail the run.
+A cold run rejects a nonempty cache directory. Keep the cache
 on persistent storage, and use separate directories for baseline and candidate.
 Both public and internal native Tier-2 shared-memory caches are disabled;
 vLLM, JAX and native Tier-3 paths are recorded in the run manifest.
@@ -132,3 +133,72 @@ responses, metrics, raw worker records, startup logs and memory snapshots.
 five seconds. Sampled peaks can miss transients; cgroup peaks can include earlier
 runs in the same container. Zero cgroup OOM counters do not rule out node-pressure
 eviction. Do not delete live communication buffers to free memory.
+
+## Recorded validation: 2026-10-12
+
+Production commit `7ee60b940`, harness `bd0fe4db6`; all 366 tracked production
+files on the benchmark host matched the submitted source. The later formal-window
+compiler-log guard was also applied offline to these records. Runtime versions,
+source hashes, per-case measurements and limitations are in
+[results_20261012.json](results_20261012.json).
+
+The baseline already includes the host metadata snapshot, packed RoPE selection
+and gather lookahead. The only production difference in this series is the
+static shared-prefill indexer gate. Both cold cases use independent empty
+compilation caches; reuse uses the candidate's unchanged cache directory.
+There is one startup observation per case, so small differences are not a
+statistical speedup claim. Weight-file/system caches are not controlled.
+
+| Case | Launch to healthy (s) | Max engine init (s) | Max logged compilation (s) | FX compile calls | Artifact load attempts |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Before static indexer, cold | 1633.56 | 1043.25 | 929.87 | 80 | 0 |
+| Integrated candidate, cold | 1689.14 | 1032.43 | 921.18 | 80 | 0 |
+| Same candidate, cache reuse | 1663.41 | 949.42 | 911.46 | 64 | 16 |
+
+Cache reuse was partial: 16 artifact load attempts, but 64 new FX compile calls.
+Auto-sized KV token capacities changed across restarts (for example rank 0:
+6,667,507 to 6,666,237 tokens), changing the KV-block-count cache key for serving
+graphs. The initial profiling graphs were reusable. Stable serving-graph reuse
+needs a stable large-KV allocation plan; this run preserves the existing
+shape-sensitive keys.
+
+| Case | Middle tokens/s, node | Whole encoder window, node | Middle / logical device | Middle / physical chip |
+| --- | ---: | ---: | ---: | ---: |
+| Before static indexer, cold | 108,399 | 87,949 | 13,550 | 27,100 |
+| Integrated candidate, cold | 108,659 | 88,410 | 13,582 | 27,165 |
+| Same candidate, cache reuse | 108,397 | 87,845 | 13,550 | 27,099 |
+
+Each case passed five formal rounds and 35 middle-step samples: 524288 cache
+hits per round, zero preemptions and no compiler events in formal windows.
+All 40 one-token candidate responses matched the baseline, for both starts.
+KV remained auto-sized at about 32.4 GiB per rank; this is not a capacity stress
+test. The separate candidate profile contains six complete rank-0 encoder
+graphs with 20 MoE calls each; truncated graphs are excluded. Median device
+time is **160.690 ms**, versus **160.694 ms** in the earlier lookahead run.
+Normalized device-equivalent rate is 101761 new tokens/s at 16352 tokens per
+step; this is not client throughput or an independently qualified node capacity.
+
+The static gate's decoder-2048 compile median across ranks fell from
+145.400 to 131.275 seconds, but total logged compilation fell only 0.9%, and
+cold launch-to-health increased 3.4%. Middle host cadence increased 0.24% and
+whole-window cadence 0.52%; these small differences do not establish a new
+end-to-end speedup. The isolated indexer benefit does not apply uniformly to
+all encoder/decoder compilation work.
+
+Earlier matched large-KV ablations used the same frozen workload:
+
+| Change accumulated | Middle host tokens/s | Whole encoder-window tokens/s |
+| --- | ---: | ---: |
+| Initial large-KV baseline | 58,989 | 55,941 |
+| Host metadata snapshot | 88,529 | 72,658 |
+| Plus packed RoPE selection | 106,563 | 86,641 |
+| Plus gather lookahead | 108,452 | 88,325 |
+
+Those are separate mechanism-isolation runs, not extra multipliers on this
+series. The historical 4-GiB result used different input texts and source and
+is not an exact A/B. No full recovery of that historical device rate is claimed.
+
+Pre-commit checks and focused CPU/TPU regressions pass. Full-dependency type
+checking retains the same 61 diagnostics as the original PR head, with no new
+diagnostics. Full TPU CI still requires a maintainer's `ready` label; long
+accuracy, mixed-load and steady decode qualification remain outside this run.

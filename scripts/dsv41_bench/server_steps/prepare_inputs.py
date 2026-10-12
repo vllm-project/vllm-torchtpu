@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Freeze DSv4.1 token IDs from LongBench code documents, including decode C128.
 
-Design reference: sgl-jax-glm52-dsa/benchmark/glm52/bench_dsa_cache_hit.py.
+Design reference: SGL-JAX DSA's benchmark/glm52/bench_dsa_cache_hit.py.
 Uses this model's tokenizer, independent prefix windows and a content hash;
 never imports GLM token IDs or generates random speculative-decode prompts.
 """

@@ -14,6 +14,7 @@ import time
 from pathlib import Path
 
 import requests
+from summarize_startup import assert_no_compilation
 
 
 def cache_inventory(root: Path) -> dict:
@@ -160,6 +161,13 @@ def main() -> None:
                     stderr=subprocess.STDOUT,
                     check=True,
                 )
+            intervals = [
+                json.loads(
+                    (args.out / "fixed" / f"round-{index}-summary.json").read_text()
+                )["audit_wall_interval_ns"]
+                for index in range(1, args.rounds + 1)
+            ]
+            assert_no_compilation((args.out / "server.log").read_text(), intervals)
             if args.profile:
                 with (args.out / "client-profile.log").open("w") as profile_log:
                     subprocess.run(

@@ -2,9 +2,43 @@
 """Summarize logged startup phases without summing parallel DP rank times."""
 
 import argparse
+import datetime
 import json
 import re
 from pathlib import Path
+
+
+def assert_no_compilation(log: str, intervals: list[list[int]]) -> None:
+    """Reject compilation in formal windows, using the server's local clock."""
+    for line in log.splitlines():
+        if not any(
+            phrase in line
+            for phrase in (
+                "Compiling ",
+                "Starting torch.compile",
+                "Dynamo bytecode",
+                "built program",
+            )
+        ):
+            continue
+        stamp = re.search(r"\b(\d\d-\d\d \d\d:\d\d:\d\d)\b", line)
+        if stamp is None:
+            raise ValueError(f"Cannot timestamp compiler log event: {line}")
+        for low, high in intervals:
+            # Logs omit the year; retain windows crossing New Year's midnight.
+            years = {
+                datetime.datetime.fromtimestamp(low / 1e9 - 1).year,
+                datetime.datetime.fromtimestamp(high / 1e9 + 1).year,
+            }
+            for candidate_year in years:
+                event = (
+                    datetime.datetime.strptime(
+                        f"{candidate_year}-{stamp[1]}", "%Y-%m-%d %H:%M:%S"
+                    ).timestamp()
+                    * 1e9
+                )
+                if low - 1e9 <= event <= high + 1e9:
+                    raise ValueError(f"Compilation in formal serving window: {line}")
 
 
 def summarize_startup(log: str) -> dict:
