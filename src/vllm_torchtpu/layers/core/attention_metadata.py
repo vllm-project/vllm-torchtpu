@@ -501,44 +501,50 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         """
         runner = self.runner
         block_table_obj = runner.input_batch.block_table[self.kv_cache_group_id]
+        max_blocks = block_table_obj.max_num_blocks_per_req
         if ctx.use_max_model_len:
-            target_num_blocks = block_table_obj.max_num_blocks_per_req
-        else:
-            assert runner.most_model_len is not None
-            spec = self.kv_cache_spec
-            first_spec = (
-                spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
+            return block_table_obj, max_blocks
+        most_model_len = runner.most_model_len
+        assert most_model_len is not None
+        geom_key = (most_model_len, max_blocks, ctx.mamba_ckpt_window)
+        if getattr(self, "_cached_geom_key", None) == geom_key:
+            return block_table_obj, self._cached_target_num_blocks
+
+        spec = self.kv_cache_spec
+        first_spec = (
+            spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
+        )
+        if isinstance(first_spec, AttentionSpec):
+            target_num_blocks = attention_block_table_width(
+                block_table_obj,
+                self.kv_cache_spec,
+                self.vllm_config,
+                most_model_len,
             )
-            if isinstance(first_spec, AttentionSpec):
-                target_num_blocks = attention_block_table_width(
-                    block_table_obj,
-                    self.kv_cache_spec,
-                    self.vllm_config,
-                    runner.most_model_len,
-                )
-            else:
-                target_num_blocks = cdiv(runner.most_model_len, self.target_block_size)
-            if self.is_mamba_group and ctx.mamba_ckpt_window > 1:
-                # Speculative decoding: the manager appends
-                # `num_speculative_blocks` (= window - 1) checkpoint blocks
-                # after the request's positional state block, so a mamba row
-                # is that much wider than the positional part alone. This
-                # mirrors `MambaSpec.max_num_blocks_per_req`, which the
-                # use_max_model_len branch above already gets for free.
-                # Without it the row stops short of the checkpoint group and
-                # `in_row` below silently redirects checkpoints to the null
-                # block, costing rollback accuracy with no error.
-                target_num_blocks = min(
-                    target_num_blocks + ctx.mamba_ckpt_window - 1,
-                    block_table_obj.max_num_blocks_per_req,
-                )
+        else:
+            target_num_blocks = cdiv(most_model_len, self.target_block_size)
+        if self.is_mamba_group and ctx.mamba_ckpt_window > 1:
+            # Speculative decoding: the manager appends
+            # `num_speculative_blocks` (= window - 1) checkpoint blocks
+            # after the request's positional state block, so a mamba row
+            # is that much wider than the positional part alone. This
+            # mirrors `MambaSpec.max_num_blocks_per_req`, which the
+            # use_max_model_len branch above already gets for free.
+            # Without it the row stops short of the checkpoint group and
+            # `in_row` below silently redirects checkpoints to the null
+            # block, costing rollback accuracy with no error.
+            target_num_blocks = min(
+                target_num_blocks + ctx.mamba_ckpt_window - 1,
+                max_blocks,
+            )
+        self._cached_geom_key = geom_key
+        self._cached_target_num_blocks = target_num_blocks
         return block_table_obj, target_num_blocks
 
     def build(self, common_prefix_len, common_attn_metadata, fast_build=False):
         runner = self.runner
         ctx = runner._attn_metadata_builder_ctx
         target_num_reqs = common_attn_metadata.num_reqs
-        block_table_obj, target_num_blocks = self._block_table_geometry(ctx)
 
         # `position_ids` is only used for the dummy run in dummy runs, where we
         # want to use fixed position IDs instead of copying from the CPU tensor
@@ -548,6 +554,8 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             if ctx.staged_block_tables is not None
             else None
         )
+        block_table_obj = None
+        target_num_blocks = 0
         if staged is not None:
             # The walk pre-uploaded every group's table in one batched
             # transfer; see `stage_block_table_uploads`.
@@ -558,11 +566,13 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                 else runner.position_ids
             )
         elif ctx.position_ids_override is not None:
+            block_table_obj, target_num_blocks = self._block_table_geometry(ctx)
             block_tables_dev = torch.zeros(
                 (target_num_reqs * target_num_blocks,), dtype=torch.int32
             ).to(runner.device)
             input_positions = ctx.position_ids_override
         else:
+            block_table_obj, target_num_blocks = self._block_table_geometry(ctx)
             # Per-call buffer: a later chunk or draft walk must not overwrite a
             # table whose upload is still in flight (see `stage_h2d_upload`).
             flat = zeros_h2d_source(runner, target_num_reqs * target_num_blocks)
@@ -610,6 +620,8 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                     mamba_prefill_ckpt_indices,
                 ) = staged_products
             else:
+                if target_num_blocks <= 0:
+                    _, target_num_blocks = self._block_table_geometry(ctx)
                 block_tables_2d = block_tables_dev.reshape(
                     target_num_reqs, target_num_blocks
                 )
@@ -764,12 +776,19 @@ def _stage_products_key(
     if not np.all(low >= 0):
         return None
     per_group_q: list[bytes] = []
+    seen_t_bs: dict[tuple[int, int], bytes] = {}
     for _, t, bs, _ in mamba_geom:
+        t_bs = (t, bs)
+        if t_bs in seen_t_bs:
+            per_group_q.append(seen_t_bs[t_bs])
+            continue
         q_low = np.minimum(low // bs, t - 1)
         q_high = np.minimum(high // bs, t - 1)
         if not np.array_equal(q_low, q_high):
             return None
-        per_group_q.append(q_low.tobytes())
+        q_bytes = q_low.tobytes()
+        seen_t_bs[t_bs] = q_bytes
+        per_group_q.append(q_bytes)
     return (
         id(staged_dev),
         num_reqs_padded,

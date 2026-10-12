@@ -29,6 +29,16 @@ class TokenPaddingState:
     local_valid_tokens: torch.Tensor | None = None
     # (valid, padded) counts the mask was last written for.
     _last_counts: tuple[int, int] | None = field(default=None, init=False)
+    _mask_has_true: bool = field(default=True, init=False)
+    _zero_mask_dev: torch.Tensor | None = field(
+        default=None, init=False, repr=False
+    )
+    _mask_cache: dict[tuple[int, int], torch.Tensor] = field(
+        default_factory=dict, init=False, repr=False
+    )
+    _valid_cache: dict[int, torch.Tensor] = field(
+        default_factory=dict, init=False, repr=False
+    )
 
     @classmethod
     def create(cls, max_local_tokens: int, device) -> "TokenPaddingState":
@@ -44,21 +54,45 @@ class TokenPaddingState:
     def update(self, local_valid_tokens: int, local_padded_tokens: int) -> None:
         """Write this rank's token padding mask if its counts changed.
 
-        Consecutive decode steps usually repeat the counts; skipping them
-        saves a synchronous host-to-device copy per step.
+        Caches device-resident mask and valid-count tensors per
+        ``(local_valid_tokens, local_padded_tokens)`` and skips rewriting
+        ``local_padding_mask`` when transitioning between unpadded sizes,
+        eliminating synchronous host-to-device copies on mixed-step transitions.
         """
-        counts = (int(local_valid_tokens), int(local_padded_tokens))
+        valid = int(local_valid_tokens)
+        padded = int(local_padded_tokens)
+        counts = (valid, padded)
         if counts == self._last_counts:
             return
         self._last_counts = counts
-        host = torch.zeros(self.local_padding_mask.shape[0], dtype=torch.bool)
-        host[local_valid_tokens:local_padded_tokens] = True
-        # Synchronous copy since the host tensor is temporary.
-        self.local_padding_mask.copy_(host)
+        dev = self.local_padding_mask.device
+        need_true = valid < padded
+        if need_true:
+            mask_dev = self._mask_cache.get(counts)
+            if mask_dev is None:
+                host = torch.zeros(
+                    self.local_padding_mask.shape[0], dtype=torch.bool
+                )
+                host[valid:padded] = True
+                mask_dev = host.to(device=dev)
+                if len(self._mask_cache) < 128:
+                    self._mask_cache[counts] = mask_dev
+            self.local_padding_mask.copy_(mask_dev)
+            self._mask_has_true = True
+        elif self._mask_has_true:
+            if self._zero_mask_dev is None:
+                self._zero_mask_dev = torch.zeros_like(self.local_padding_mask)
+            self.local_padding_mask.copy_(self._zero_mask_dev)
+            self._mask_has_true = False
         if self.local_valid_tokens is not None:
-            self.local_valid_tokens.copy_(
-                torch.tensor([local_valid_tokens], dtype=torch.int32)
-            )
+            valid_dev = self._valid_cache.get(valid)
+            if valid_dev is None:
+                valid_dev = torch.tensor(
+                    [valid], dtype=torch.int32, device=dev
+                )
+                if len(self._valid_cache) < 256:
+                    self._valid_cache[valid] = valid_dev
+            self.local_valid_tokens.copy_(valid_dev)
 
     def get_local_padding_mask(self, num_tokens: int) -> torch.Tensor:
         return self.local_padding_mask[:num_tokens]
