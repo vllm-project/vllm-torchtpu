@@ -67,7 +67,7 @@ dependencies = [
     # per-config LIBTPU_INIT_ARGS additions under
     # scripts/vllm/benchmarking/configs/ were tuned against an earlier libtpu;
     # re-verify those runs when bumping.
-    "libtpu==0.0.47",
+    "libtpu==0.0.50",
     "ray[default]",
     "ray[data]",
 ]
