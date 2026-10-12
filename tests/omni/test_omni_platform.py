@@ -105,6 +105,16 @@ def test_rope_patch_installed():
         out_fb, rope_fallback.forward_native(x, cos, sin), rtol=0, atol=0
     )
 
+    # f32 calls delegate to _forward_method (precision fallback).
+    spy_f32 = MagicMock(wraps=rope.forward_native)
+    rope._forward_method = spy_f32
+    x_f32, cos_f32, sin_f32 = x.float(), cos.float(), sin.float()
+    out_f32 = rope(x_f32, cos_f32, sin_f32)
+    spy_f32.assert_called_once_with(x_f32, cos_f32, sin_f32)
+    torch.testing.assert_close(
+        out_f32, rope.forward_native(x_f32, cos_f32, sin_f32), rtol=0, atol=0
+    )
+
 
 def test_device_control_env_var():
     assert OmniTpuPlatform.device_control_env_var == "TPU_VISIBLE_CHIPS"

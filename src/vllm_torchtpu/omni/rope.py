@@ -58,7 +58,7 @@ def apply_rotary_pair_swap(
 def rotary_embedding_wan_forward(
     self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
 ) -> torch.Tensor:
-    """Drop-in ``RotaryEmbeddingWan.forward`` for interleaved half-dim tables."""
-    if not (self.interleaved and self.half_head_dim):
+    """Drop-in ``RotaryEmbeddingWan.forward`` for bf16 interleaved half-dim tables."""
+    if not (self.interleaved and self.half_head_dim) or x.dtype != torch.bfloat16:
         return self._forward_method(x, cos, sin)
     return apply_rotary_pair_swap(x, cos, sin)

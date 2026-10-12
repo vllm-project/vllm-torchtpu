@@ -118,6 +118,8 @@ class _MockQwenEmbedRope:
 class _MockQwenEmbedLayer3DRope:
     __init__ = _init_mock_qwen_rope
     forward = _forward_mock_qwen_rope
+
+
 class _MockRotaryEmbeddingWan(torch.nn.Module):
     """vLLM-Omni's CustomOp-style Wan RoPE (native interleaved formula)."""
 
