@@ -631,6 +631,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             FUSED_MOE_EP_OP_ATTR,
             fused_moe_ep_unsupported_reason,
+            register_fused_scale_buffers,
             register_score_bias_buffer,
         )
 
@@ -722,18 +723,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 f"admitted layout: {reason}"
             )
             register_score_bias_buffer(layer)
-            # The kernel takes [E, K/block, N]; do the squeeze once here
-            # rather than per layer per step inside the compiled forward.
-            layer.register_buffer(
-                "_tpu_fused_w13_scale",
-                layer.w13_weight_scale.squeeze(2).contiguous(),
-                persistent=False,
-            )
-            layer.register_buffer(
-                "_tpu_fused_w2_scale",
-                layer.w2_weight_scale.squeeze(2).contiguous(),
-                persistent=False,
-            )
+            register_fused_scale_buffers(layer)
             logger.info_once(
                 "DeepSeek-V4 MXFP4 fused EP W4A8 enabled: block-%d",
                 REQUANTIZED_BLOCK_SIZE,

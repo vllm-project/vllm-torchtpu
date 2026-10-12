@@ -1095,3 +1095,29 @@ def test_pcp_size_reads_the_layer_parallel_config():
     assert bridge._pcp_size(layer) == 1
     layer.moe_config.moe_parallel_config.pcp_size = 4
     assert bridge._pcp_size(layer) == 4
+
+
+def test_fused_scale_buffers_are_fresh_bases_aliased_by_the_parameters():
+    # A view graph input costs a materializing program per step on torch_tpu,
+    # so the kernel's tables must be base tensors, bit-identical to the
+    # squeezed loader tables, and the 4-D parameters must not hold a 2nd copy.
+    layer = torch.nn.Module()
+    w13 = torch.rand(3, 4, 1, 256)
+    w2 = torch.rand(3, 2, 1, 128)
+    layer.w13_weight_scale = torch.nn.Parameter(w13.clone(), requires_grad=False)
+    layer.w2_weight_scale = torch.nn.Parameter(w2.clone(), requires_grad=False)
+    loaded = {
+        p: getattr(layer, p).data_ptr() for p in ("w13_weight_scale", "w2_weight_scale")
+    }
+    bridge.register_fused_scale_buffers(layer)
+    for param, buf, ref in (
+        ("w13_weight_scale", "_tpu_fused_w13_scale", w13),
+        ("w2_weight_scale", "_tpu_fused_w2_scale", w2),
+    ):
+        table, weight = getattr(layer, buf), getattr(layer, param)
+        assert table._base is None and table.is_contiguous()
+        assert table.data_ptr() != loaded[param]
+        assert torch.equal(table.view(torch.int32), ref.squeeze(2).view(torch.int32))
+        assert buf in dict(layer.named_buffers())
+        assert isinstance(weight, torch.nn.Parameter) and not weight.requires_grad
+        assert weight.shape == ref.shape and weight.data_ptr() == table.data_ptr()

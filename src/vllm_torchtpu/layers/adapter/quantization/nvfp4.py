@@ -402,6 +402,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             FUSED_MOE_EP_OP_ATTR,
             fused_moe_ep_unsupported_reason,
+            register_fused_scale_buffers,
             register_score_bias_buffer,
         )
 
@@ -488,17 +489,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             setattr(self, FUSED_MOE_EP_OP_ATTR, op)
         if op is not None:
             register_score_bias_buffer(layer)
-            # Do the scale layout conversion once, outside compiled forward.
-            layer.register_buffer(
-                "_tpu_fused_w13_scale",
-                layer.w13_weight_scale.squeeze(2).contiguous(),
-                persistent=False,
-            )
-            layer.register_buffer(
-                "_tpu_fused_w2_scale",
-                layer.w2_weight_scale.squeeze(2).contiguous(),
-                persistent=False,
-            )
+            register_fused_scale_buffers(layer)
             logger.info_once("NVFP4 fused EP W4A8 enabled: block-%d", requant_block)
         else:
             logger.info_once(
