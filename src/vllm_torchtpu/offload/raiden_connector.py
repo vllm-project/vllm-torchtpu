@@ -49,9 +49,10 @@ Core mechanisms:
 from __future__ import annotations
 
 import os
+import time
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.config import VllmConfig
@@ -217,6 +218,115 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
         assert isinstance(self.manager, RaidenOffloadingManager)
         self._raiden_manager: RaidenOffloadingManager = self.manager
         self._fence_pending: dict[int, _ParkedStore] = {}
+        self._scheduler: Any = None
+        self._pending_failed_jobs: list[Any] = []
+
+    def _complete_jobs_directly(
+        self,
+        scheduler: Any,
+        finished_jobs: Iterable[Any],
+        extra_store_job_ids: Iterable[int] = (),
+    ) -> int:
+        """Complete finished Raiden store/load jobs directly on the scheduler
+        without a 2-step worker echo round-trip."""
+        completed_jobs: dict[int, int] = {}
+        load_req_ids: list[str] = []
+        num_workers = self.config.num_workers
+        for jid in extra_store_job_ids:
+            if jid in self._jobs:
+                completed_jobs[jid] = num_workers
+        for finished_job in finished_jobs:
+            if finished_job.failed_device_block_ids:
+                if not hasattr(self, "_pending_failed_jobs"):
+                    self._pending_failed_jobs = []
+                self._pending_failed_jobs.append(finished_job)
+                continue
+            if finished_job.job_id in self._jobs:
+                completed_jobs[finished_job.job_id] = num_workers
+            if (
+                finished_job.op == AdmissionOp.LOAD
+                and finished_job.req_id is not None
+            ):
+                load_req_ids.append(finished_job.req_id)
+
+        finished_recving: set[str] = set()
+        for req_id in load_req_ids:
+            if req_id not in scheduler.requests:
+                continue
+            req_status = self._req_status.get(req_id)
+            has_other_loads = req_status is not None and any(
+                jid not in completed_jobs
+                and jid in self._jobs
+                and not self._jobs[jid].is_store
+                for jid in req_status.transfer_jobs
+            )
+            if not has_other_loads:
+                finished_recving.add(req_id)
+
+        if completed_jobs or finished_recving:
+            kv_out = KVConnectorOutput(
+                finished_recving=finished_recving,
+                kv_connector_worker_meta=RaidenOffloadingWorkerMetadata(
+                    # pyrefly: ignore[unexpected-keyword]
+                    completed_jobs=completed_jobs,
+                    fenced_jobs={},
+                ),
+            )
+            scheduler._update_from_kv_xfer_finished(kv_out)
+        return len(finished_recving)
+
+    def poll_and_complete_transfers(
+        self, scheduler: Any
+    ) -> tuple[int, int, int, bool]:
+        """Poll Raiden C++ transfer completions at the start of ``schedule()``
+        so completed H2D loads promote ``WAITING_FOR_REMOTE_KVS`` requests in
+        the very next step instead of waiting 2 steps for the worker echo."""
+        self._scheduler = scheduler
+        t0_ns = time.perf_counter_ns()
+        manager = self._raiden_manager
+        initial_finished = manager.poll_finished_jobs()
+        early_reqs = (
+            self._complete_jobs_directly(scheduler, initial_finished)
+            if initial_finished
+            else 0
+        )
+        waited_reqs = 0
+        waited = False
+
+        has_pending_loads = any(not js.is_store for js in self._jobs.values())
+        if has_pending_loads and early_reqs == 0:
+            skipped_waiting = getattr(scheduler, "skipped_waiting", None)
+            has_waiting_remote = bool(skipped_waiting) and any(
+                getattr(r, "status", None) is not None
+                and getattr(r.status, "name", "") == "WAITING_FOR_REMOTE_KVS"
+                and r.request_id not in scheduler.finished_recving_kv_req_ids
+                for r in skipped_waiting
+            )
+            if has_waiting_remote:
+                wait_ms = float(tpu_envs.VLLM_TPU_RAIDEN_LOAD_WAIT_MS)
+                if wait_ms > 0.0:
+                    if not getattr(scheduler, "running", None):
+                        wait_ms = max(wait_ms, 5.0)
+                    deadline_ns = time.perf_counter_ns() + int(
+                        wait_ms * 1_000_000.0
+                    )
+                    waited = True
+                    while time.perf_counter_ns() < deadline_ns:
+                        time.sleep(0.0001)
+                        polled = manager.poll_finished_jobs()
+                        if polled:
+                            waited_reqs += self._complete_jobs_directly(
+                                scheduler, polled
+                            )
+                            if waited_reqs > 0 or not any(
+                                not js.is_store for js in self._jobs.values()
+                            ):
+                                break
+                        elif not manager.has_pending_work():
+                            break
+
+        elapsed_ns = time.perf_counter_ns() - t0_ns
+        return elapsed_ns, early_reqs, waited_reqs, waited
 
     def build_connector_meta(
         self, scheduler_output: SchedulerOutput
@@ -285,16 +395,36 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             elif manager.is_job_launched(job_id):
                 launched_flush_ids.add(job_id)
         drained = manager.drain_jobs(launched_flush_ids) if launched_flush_ids else []
+        polled = manager.poll_finished_jobs()
 
-        # Collect completed/drained jobs for the worker echo channel.
-        for finished_job in list(drained) + manager.poll_finished_jobs():
-            if finished_job.op == AdmissionOp.STORE:
-                finished_store_ids.append(finished_job.job_id)
-            else:
-                assert finished_job.req_id is not None
-                finished_loads[finished_job.job_id] = finished_job.req_id
-                if not finished_job.success:
-                    failed_load_req_ids.add(finished_job.req_id)
+        sched_ref = getattr(self, "_scheduler", None)
+        if sched_ref is not None:
+            self._complete_jobs_directly(
+                sched_ref,
+                list(drained) + polled,
+                extra_store_job_ids=finished_store_ids,
+            )
+            finished_store_ids = []
+            pending_failed = getattr(self, "_pending_failed_jobs", None)
+            if pending_failed:
+                for failed_job in pending_failed:
+                    if failed_job.op == AdmissionOp.STORE:
+                        finished_store_ids.append(failed_job.job_id)
+                    else:
+                        assert failed_job.req_id is not None
+                        finished_loads[failed_job.job_id] = failed_job.req_id
+                        failed_load_req_ids.add(failed_job.req_id)
+                pending_failed.clear()
+        else:
+            # Collect completed/drained jobs for the worker echo channel.
+            for finished_job in list(drained) + polled:
+                if finished_job.op == AdmissionOp.STORE:
+                    finished_store_ids.append(finished_job.job_id)
+                else:
+                    assert finished_job.req_id is not None
+                    finished_loads[finished_job.job_id] = finished_job.req_id
+                    if not finished_job.success:
+                        failed_load_req_ids.add(finished_job.req_id)
 
         # Return empty load_jobs/store_jobs: workers act as passive DMA endpoints.
         return RaidenOffloadingConnectorMetadata(
@@ -551,6 +681,15 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         if self.connector_scheduler is not None:
             return self.connector_scheduler.take_events()
         return []
+
+    def poll_and_complete_transfers(
+        self, scheduler: Any
+    ) -> tuple[int, int, int, bool]:
+        if isinstance(self.connector_scheduler, TPURaidenOffloadingScheduler):
+            return self.connector_scheduler.poll_and_complete_transfers(
+                scheduler
+            )
+        return (0, 0, 0, False)
 
     # -- worker-side hooks -------------------------------------------------
     def register_kv_caches(
