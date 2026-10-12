@@ -183,6 +183,8 @@ class LayerSchedule:
     input projection `hook_kind`, whose `K` tiles `hook_tiles` (half 0; half 1
     = `+ hook_hpt`) are summed around the hook (`stream.HalfSplitHook`).
     `in_norm`: that slot's input norm field (normalized per half).
+    `ar0s`: the first slot's all-reduce sends round 0 from inside its output
+    projection (`KernelContext.ar0`).
     """
 
     arpipe: bool = False
@@ -190,44 +192,53 @@ class LayerSchedule:
     hook_tiles: tuple[int, ...] = ()
     hook_hpt: int = 0
     in_norm: str | None = None
+    ar0s: bool = False
 
 
 def _slot_modules(slot: Any) -> tuple[Any, ...]:
     return slot.active_branches if isinstance(slot, SwitchSlot) else (slot,)
 
 
-def _first_static_kind(m: Any, g: Any, ex: ExecSpec) -> str | None:
-    for w in m.weights(g, ex):
-        if w.stream_ring == "static":
-            return w.name
-    return None
+def _static_kinds(m: Any, g: Any, ex: ExecSpec) -> list[str]:
+    return [w.name for w in m.weights(g, ex) if w.stream_ring == "static"]
 
 
 def layer_schedule_inputs(
     model_spec: ModelSpec, ex: ExecSpec, p: Plan
-) -> tuple[tuple[int, int] | None, str | None, str | None]:
-    """`(in_kind, hook_kind, in_norm)` for `collectives.with_schedule`.
+) -> tuple[tuple[int, int] | None, str | None, str | None, int | None]:
+    """`(in_kind, hook_kind, in_norm, out_nt)` for `collectives.with_schedule`.
 
-    The layer can take the ARPIPE hook when it has two slots, each followed by
-    an all-reduce on buffer slots 0 and 1, and every branch of its first slot
-    declares `"layer_hook"` in `Module.layer_schedule` with a first static
-    weight (its input projection) of one shared `(tk, nt)` and one input
-    norm. Otherwise `(None, None, None)`.
+    Both options need two slots, each followed by an all-reduce on buffer
+    slots 0 and 1. ARPIPE (`in_kind`, `hook_kind`, `in_norm`) further needs
+    every branch of the first slot to declare `"layer_hook"` in
+    `Module.layer_schedule`, with a first static weight (its input
+    projection) of one shared `(tk, nt)` and one input norm. AR0S (`out_nt`:
+    the largest `nt` of the branches' last static weight, their output
+    projection) needs every branch to declare `"ar0"`. Unmet: `None`s.
     """
+    none = (None, None, None, None)
     slots = model_spec.layer_type.slots
     if len(slots) != 2 or tuple(p.slot_ar_index) != (0, 1):
-        return None, None, None
+        return none
     mods = _slot_modules(slots[0])
-    if not mods or any("layer_hook" not in m.layer_schedule for m in mods):
-        return None, None, None
-    kinds = [_first_static_kind(m, model_spec.config, ex) for m in mods]
+    if not mods:
+        return none
+    kinds = [_static_kinds(m, model_spec.config, ex) for m in mods]
+    if any(not k for k in kinds):
+        return none
+    in_kind = hook_kind = in_norm = out_nt = None
+    if all("ar0" in m.layer_schedule for m in mods):
+        out_nt = max(p.nt[k[-1]] for k in kinds)
     norms = {m.input_norm for m in mods}
-    if None in kinds or len(norms) != 1 or None in norms:
-        return None, None, None
-    tk_nt = {(p.tk[k], p.nt[k]) for k in kinds}
-    if len(tk_nt) != 1:
-        return None, None, None
-    return next(iter(tk_nt)), kinds[0], next(iter(norms))
+    tk_nt = {(p.tk[k[0]], p.nt[k[0]]) for k in kinds}
+    if (
+        all("layer_hook" in m.layer_schedule for m in mods)
+        and len(norms) == 1
+        and None not in norms
+        and len(tk_nt) == 1
+    ):
+        in_kind, hook_kind, in_norm = next(iter(tk_nt)), kinds[0][0], next(iter(norms))
+    return in_kind, hook_kind, in_norm, out_nt
 
 
 @dataclass(frozen=True)
@@ -345,7 +356,7 @@ def build_scratch(
     typed = bool(ex.interpret)
 
     cp = comm_params(ex, tiles, H)
-    in_kind, hook_kind, in_norm = layer_schedule_inputs(model_spec, ex, p)
+    in_kind, hook_kind, in_norm, out_nt = layer_schedule_inputs(model_spec, ex, p)
     cp = with_schedule(
         cp,
         tiles,
@@ -353,8 +364,9 @@ def build_scratch(
         dense="dense" not in ex.skip,
         in_kind=in_kind,
         unroll=min(tiles.dmm_unroll, NBD),
+        out_nt=out_nt,
     )
-    schedule = LayerSchedule()
+    schedule = LayerSchedule(ar0s=cp.AR0S)
     if cp.ARP:
         assert in_kind is not None and hook_kind is not None
         hpt = cp.HC2 // in_kind[0]
@@ -367,6 +379,7 @@ def build_scratch(
             ),
             hook_hpt=hpt,
             in_norm=in_norm,
+            ar0s=cp.AR0S,
         )
 
     vshape = {k: (tk[k], kinds[k][1]) for k in kinds}

@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import contextlib
+import functools
 from dataclasses import dataclass
 from typing import Any
 
@@ -80,6 +81,13 @@ class KernelContext:
     # this declares `"layer_hook"` in `Module.layer_schedule`.
     layer_hook: Any = None
     arp: bool = False
+    # AR0S (`CorePlan.schedule.ar0s`): during the first slot's `emit`, `ar0`
+    # is a factory `ar0(scale_field) -> stream.ColumnSplit` (`scale_field`: the
+    # output-scale smalls field, or `None`). The module passes its result as
+    # `split=` to its output projection (its last static weight, `N = H`)
+    # and returns `None`; the builder finishes the all-reduce. A module that
+    # honours this declares `"ar0"` in `Module.layer_schedule`.
+    ar0: Any = None
 
     def arp_scale(self, x: Any, rows: Any = None) -> Any:
         """`x` times the deferred reciprocal input RMS (ARPIPE: `scr['xb']` holds
@@ -210,10 +218,15 @@ def build(
                     pltpu.trace_value("layer", lyr)
                 return mod.emit(ctx, lyr, slot)
 
-        def _emit_hooked(mod: Any, lyr: Any, slot: Any) -> Any:
-            """ARPIPE: emit the first slot with `ctx.layer_hook` set; the hook
-            adds the deferred all-reduce's other half and normalizes it."""
+        def _emit_first(mod: Any, lyr: Any, slot: Any, ar_first: Any) -> Any:
+            """Emit the first slot with the engaged schedule fields set.
+
+            ARPIPE: `ctx.layer_hook`, whose `fn` adds the deferred all-reduce's
+            other half and normalizes it. AR0S: `ctx.ar0`, the output
+            projection's `split=` factory (the module then returns `None`).
+            """
             calls: list[int] = []
+            made: list[int] = []
 
             def fn() -> None:
                 assert not calls, f"{mod.name!r} ran ctx.layer_hook twice"
@@ -223,14 +236,31 @@ def build(
                     arp_w_off, slot, 1 - comm.arp_c, False, eps=g.eps, zero_centered=zc
                 )
 
-            ctx.layer_hook = HalfSplitHook(
-                sched.hook_tiles, sched.hook_hpt, comm.arp_c, fn
-            )
+            def ar0(scale_field: str | None) -> Any:
+                assert not made, f"{mod.name!r} took ctx.ar0 twice"
+                made.append(1)
+                off = None if scale_field is None else sp.lay[scale_field][0]
+                return comm.ar0_spec(slot, ar_first, 0, off)
+
+            if sched.arpipe:
+                ctx.layer_hook = HalfSplitHook(
+                    sched.hook_tiles, sched.hook_hpt, comm.arp_c, fn
+                )
+            if sched.ar0s:
+                ctx.ar0 = ar0
             try:
                 part = _emit_mod(mod, lyr, slot)
             finally:
                 ctx.layer_hook = None
-            assert calls, f"{mod.name!r} did not run ctx.layer_hook (ARPIPE)"
+                ctx.ar0 = None
+            assert calls or not sched.arpipe, (
+                f"{mod.name!r} did not run ctx.layer_hook (ARPIPE)"
+            )
+            if sched.ar0s:
+                assert made and part is None, (
+                    f"{mod.name!r} must pass ctx.ar0(...) to its output "
+                    "projection and return None (AR0S)"
+                )
             return part
 
         # ------------------------------ layer loop ------------------------------
@@ -262,9 +292,15 @@ def build(
             )
             ar_first = (l < 2) if ar_parity else first
 
-            def _reduce(part: Any, eff_ar: Any, defer: bool = False) -> None:
+            def _reduce(
+                part: Any, eff_ar: Any, defer: bool = False, ar0: bool = False
+            ) -> None:
                 fill, ctx.deferred_fill = ctx.deferred_fill, None
-                if eff_ar is not None and defer:  # ARPIPE: own half added now
+                if ar0:  # AR0S: round 0 already sent by the module
+                    comm.ar0_finish(eff_ar, ar_first)
+                    if fill is not None:
+                        fill()
+                elif eff_ar is not None and defer:  # ARPIPE: own half added now
                     comm.allreduce(eff_ar, part, ar_first, fill, defer=True)
                 elif eff_ar is not None:
                     comm.add_residual(comm.allreduce(eff_ar, part, ar_first, fill))
@@ -287,14 +323,20 @@ def build(
                 eff_ar = slot if (ar_slot is not None and ar_parity) else ar_slot
                 hooked = sched.arpipe and si == 0
                 defer = sched.arpipe and si == 1
-                emit = _emit_hooked if hooked else _emit_mod
+                ar0 = sched.ar0s and si == 0
+                emit = (
+                    functools.partial(_emit_first, ar_first=ar_first)
+                    if (hooked or ar0)
+                    else _emit_mod
+                )
+
                 if isinstance(slot_entry, SwitchSlot):
                     active = slot_entry.active_branches
                     norm_names = {m.input_norm for m in active}
                     assert len(norm_names) == 1, norm_names
                     _input_norm(active[0].input_norm, hooked)
                     if len(active) == 1:
-                        _reduce(emit(active[0], l, slot), eff_ar, defer)
+                        _reduce(emit(active[0], l, slot), eff_ar, defer, ar0)
                     elif len(active) == 2:
                         c0 = slot_entry.active_counts[0]
                         is_b1 = (l % slot_entry.period) >= c0
@@ -304,8 +346,10 @@ def build(
                         # the lowered `scf.if` yields `()` instead of returning
                         # a `vector<MBxHxf32>` tensor across the branch boundary
                         # (which would keep 64 VRegs live across `scf.if`).
-                        def _emit_branch(mod, eff_ar=eff_ar, emit=emit, defer=defer):
-                            _reduce(emit(mod, l, slot), eff_ar, defer)
+                        def _emit_branch(
+                            mod, eff_ar=eff_ar, emit=emit, defer=defer, ar0=ar0
+                        ):
+                            _reduce(emit(mod, l, slot), eff_ar, defer, ar0)
 
                         stream.cond_branches(
                             is_b1,
@@ -321,7 +365,7 @@ def build(
                         )
                 else:
                     _input_norm(slot_entry.input_norm, hooked)
-                    _reduce(emit(slot_entry, l, slot), eff_ar, defer)
+                    _reduce(emit(slot_entry, l, slot), eff_ar, defer, ar0)
 
             stream.assert_flushed()
             return carry

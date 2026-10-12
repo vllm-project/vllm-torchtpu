@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Opt-in all-reduce schedule options of `AllReduceRing` (`Tiles.hier1_peers`,
-`Tiles.hx`, `allreduce(fill=)`, the ARPIPE deferred all-reduce).
+`Tiles.hx`, `allreduce(fill=)`, the ARPIPE deferred all-reduce, AR0S).
 
 Each option is checked two ways: the 8-rank interpret-mode all-reduce is
 bit-identical to the default schedule (the option moves data, it does not
@@ -87,6 +87,7 @@ def _ring_outputs(
     counts: bool = False,
     fills: list[int] | None = None,
     arp: bool = False,
+    ar0: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, collectives.CommParams]:
     """Run 2 layers x 2 alternating slots of `allreduce` + `add_residual`.
 
@@ -96,18 +97,21 @@ def _ring_outputs(
     With `fills`, every all-reduce gets a `fill` that appends its slot (at
     trace time) and zeroes a spare buffer. With `arp`, slot 1 is the ARPIPE
     deferred all-reduce: primed, its other half added before the next slot-0
-    all-reduce and after the last step.
+    all-reduce and after the last step. With `ar0`, slot 0 is the AR0S
+    all-reduce: its payload is packed and sent from `ar0_spec`'s column-group
+    hooks (fed the partial's columns, as an output projection would) and
+    finished by `ar0_finish`.
     """
     devs = jax.devices("cpu")
     assert len(devs) >= R, f"Expected >= {R} CPU devices, found {len(devs)}"
     ex = ExecSpec(B=B, T=1, R=R, ctx=128, tiles=tiles, interpret=True)
     pc = H // 2 if tiles.war == 0 else None
     cp = collectives.comm_params(ex, tiles, H=H, PC=pc)
-    if arp:
+    if arp or ar0:
         cp = collectives.params.with_schedule(
-            cp, tiles, comm=True, dense=True, in_kind=(128, 1), unroll=8
+            cp, tiles, comm=True, dense=True, in_kind=(128, 1), unroll=8, out_nt=1
         )
-        assert cp.ARP
+        assert arp == cp.ARP and ar0 == cp.AR0S, cp
     scratch = {
         "res": pltpu.VMEM((ex.MB, H), F32),
         "spare": pltpu.VMEM((8, 128), F32),
@@ -149,6 +153,13 @@ def _ring_outputs(
                 continue
             if arp and step_idx > 0:
                 ar.arp_round2_add()
+            if ar0:  # slot 0
+                spec = ar.ar0_spec(0, first)
+                spec.pre()
+                for cols, hook in zip(spec.cols, spec.hooks):
+                    hook([x0_ref[:, pl.ds(c0, cw)] for c0, cw in cols])
+                ar.ar0_finish(0, first)
+                continue
             ar.add_residual(ar.allreduce(slot, src, first, fill=fill))
         if arp:
             ar.arp_round2_add()
@@ -412,13 +423,53 @@ def _check_arp_bit_identical() -> None:
             _assert_close_to_host_sum(out, host)
 
 
+# ---------------------------------------------------------------------------
+# AR0S: round 0 packed and sent from the producer's column groups
+# ---------------------------------------------------------------------------
+_AR0_MODES = (
+    (dict(hier=2, ar0s=True), False),
+    (dict(hier=2, ar0s=True, hx=True), False),
+    (dict(hier=2, ar0s=True, arpipe=True), True),
+    (dict(hier=1, ar0s=True, arpipe=True, arpipe_h1=True), True),
+)
+
+
+def _check_ar0_bit_identical() -> None:
+    """Same payload values and the same sums: bit-identical to the plain
+    all-reduce of the same partial (alone and with the deferred slot 1)."""
+    for kw, arp in _AR0_MODES:
+        for war, H, B in ((1, 1024, 4), (0, 4096, 3)):
+            tiles = dataclasses.replace(_TINY_TILES, war=war, **kw)
+            plain = dataclasses.replace(tiles, ar0s=False, arpipe=False)
+            base, host, _ = _ring_outputs(plain, H=H, B=B, seed=21)
+            out, _, cp = _ring_outputs(tiles, H=H, B=B, seed=21, arp=arp, ar0=True)
+            assert cp.AR0S and cp.A0_CW == 512, (kw, cp)
+            np.testing.assert_array_equal(out, base)
+            _assert_close_to_host_sum(out, host)
+
+
+def test_ar0s_bit_identical_to_plain_all_reduce():
+    if len(jax.devices("cpu")) < 8:
+        _spawn_with_cpu_devices(8, "ar0")
+        return
+    _check_ar0_bit_identical()
+
+
 def test_with_schedule_gates():
-    def cp_for(in_kind: Any = (128, 1), unroll: int = 8, **kw: Any) -> Any:
+    def cp_for(
+        in_kind: Any = (128, 1), unroll: int = 8, out_nt: Any = None, **kw: Any
+    ) -> Any:
         tiles = dataclasses.replace(_TINY_TILES, **kw)
         ex = ExecSpec(B=4, T=1, R=8, ctx=128, tiles=tiles, interpret=True)
         cp = collectives.comm_params(ex, tiles, H=1024)
         return collectives.params.with_schedule(
-            cp, tiles, comm=True, dense=True, in_kind=in_kind, unroll=unroll
+            cp,
+            tiles,
+            comm=True,
+            dense=True,
+            in_kind=in_kind,
+            unroll=unroll,
+            out_nt=out_nt,
         )
 
     on2 = cp_for(hier=2, arpipe=True)
@@ -432,6 +483,13 @@ def test_with_schedule_gates():
     assert not cp_for(hier=2, arpipe=True, in_kind=(128, 9)).ARP  # not unrolled
     assert not cp_for(hier=2, arpipe=True, in_kind=(384, 1)).ARP  # HC2 % tk
     assert cp_for(hier=2) == cp_for(hier=2, in_kind=None)
+    a2 = cp_for(hier=2, ar0s=True, out_nt=2)
+    assert a2.AR0S and not a2.ARP and a2.A0_CW == 512
+    assert not cp_for(hier=1, ar0s=True, out_nt=2).AR0S  # hier=1 needs ARPIPE
+    a1 = cp_for(hier=1, ar0s=True, arpipe=True, arpipe_h1=True, out_nt=2)
+    assert a1.AR0S and a1.ARP_H1
+    assert not cp_for(hier=2, ar0s=True, out_nt=None).AR0S
+    assert not cp_for(hier=2, ar0s=True, out_nt=9).AR0S  # not unrolled
 
 
 def test_arp_deferred_all_reduce_bit_identical():
@@ -442,6 +500,7 @@ def test_arp_deferred_all_reduce_bit_identical():
 
 
 _CHECKS = {
+    "ar0": _check_ar0_bit_identical,
     "arp": _check_arp_bit_identical,
     "fill": _check_fill_once_and_bit_identical,
     "hier1_peers": _check_hier1_peers_bit_identical,

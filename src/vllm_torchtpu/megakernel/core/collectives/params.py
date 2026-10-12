@@ -75,6 +75,11 @@ class CommParams:
     # then split in two half-lane rounds (1 and 2).
     ARP: bool = False
     ARP_H1: bool = False
+    # `AR0S` (`tiles.ar0s`): the first slot's all-reduce (buffer slot 0) sends
+    # round 0 from inside its producer's output projection, in column chunks
+    # of `A0_CW` lanes (`AllReduceRing.ar0_spec` / `ar0_finish`).
+    AR0S: bool = False
+    A0_CW: int = 0
 
 
 def _check_hier1_peers(peers: tuple[int, ...]) -> None:
@@ -183,6 +188,7 @@ def with_schedule(
     dense: bool,
     in_kind: tuple[int, int] | None,
     unroll: int,
+    out_nt: int | None = None,
 ) -> CommParams:
     """Engage the layer-schedule options of `tiles` that the layer allows.
 
@@ -191,8 +197,15 @@ def with_schedule(
     first slot's input projection (`in_kind = (tk, nt)`, shared by its
     branches; `None` when the layer cannot take the hook) is fully unrolled
     (`nt <= unroll`) and its `K` tiles split evenly at the payload's half
-    boundary (`HC2 % tk == 0`, `AR_C % tk == 0`, `HC2 % 128 == 0`). Otherwise
-    the option is off and `cp` is returned unchanged.
+    boundary (`HC2 % tk == 0`, `AR_C % tk == 0`, `HC2 % 128 == 0`).
+
+    `tiles.ar0s` engages on `hier=2`, or on `hier=1` together with ARPIPE,
+    when the first slot's output projection (`out_nt` tiles; `None` when the
+    layer cannot take it) is fully unrolled and the payload half splits into
+    `A0_CW = min(512, HC2)`-lane chunks of whole 128-lane tiles.
+
+    Options that do not engage stay off; with none engaged `cp` is returned
+    unchanged.
     """
     HIER, HC2, AR_C = cp.HIER, cp.HC2, cp.AR_C
     arp = False
@@ -205,11 +218,28 @@ def with_schedule(
     ):
         tk, nt = in_kind
         arp = nt <= unroll and HC2 % 128 == 0 and HC2 % tk == 0 and AR_C % tk == 0
-    if not arp:
+    arp_h1 = arp and HIER == 1
+    a0_cw = min(512, HC2)
+    ar0s = bool(
+        tiles.ar0s
+        and comm
+        and (HIER == 2 or arp_h1)
+        and out_nt is not None
+        and out_nt <= unroll
+        and HC2 % a0_cw == 0
+        and a0_cw % 128 == 0
+    )
+    if not (arp or ar0s):
         return cp
-    arp_h1 = HIER == 1
     rounds = (0, 1, 2) if arp_h1 else cp.AR_ROUNDS
-    return dataclasses.replace(cp, ARP=True, ARP_H1=arp_h1, AR_ROUNDS=rounds)
+    return dataclasses.replace(
+        cp,
+        ARP=arp,
+        ARP_H1=arp_h1,
+        AR0S=ar0s,
+        A0_CW=a0_cw if ar0s else 0,
+        AR_ROUNDS=rounds,
+    )
 
 
 def ring_scratch(cp: CommParams) -> dict[str, Any]:

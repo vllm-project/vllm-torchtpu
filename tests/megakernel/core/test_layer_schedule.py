@@ -98,6 +98,10 @@ class _LinMixer(Module):
         with ctx.stream.segment(lazy=True):
             y = ctx.stream.dmatmul("w_in", scr["xb"], _NI, hook=ctx.layer_hook)
             scr["xb2"][:, :_NI] = round_bf16(ctx.arp_scale(y)).astype(BF16)
+            if ctx.ar0 is not None:
+                split = ctx.ar0("out_s")
+                ctx.stream.dmatmul("w_out", scr["xb2"], ctx.g.H, split=split)
+                return None
             yo = ctx.stream.dmatmul("w_out", scr["xb2"], ctx.g.H)
         return yo * ctx.sm(slot, "out_s")
 
@@ -106,6 +110,12 @@ class _HookMixer(_LinMixer):
     """`_LinMixer` that declares the ARPIPE hook (`Module.layer_schedule`)."""
 
     layer_schedule = frozenset({"layer_hook"})
+
+
+class _Ar0Mixer(_LinMixer):
+    """`_LinMixer` that declares the ARPIPE hook and AR0S."""
+
+    layer_schedule = frozenset({"layer_hook", "ar0"})
 
 
 class _LinFFN(Module):
@@ -310,7 +320,44 @@ def test_arpipe_needs_module_support_and_arpipe_h1():
     _check_arpipe_needs_module_support()
 
 
+# ---------------------------------------------------------------------------
+# AR0S: the mixer all-reduce's round 0 sent from inside its output projection
+# ---------------------------------------------------------------------------
+_AR0_CASES = (
+    dict(hier=2, ar0s=True),
+    dict(hier=2, ar0s=True, hx=True),
+    dict(hier=2, ar0s=True, arpipe=True),
+    dict(hier=1, ar0s=True, arpipe=True, arpipe_h1=True),
+)
+
+
+def _check_ar0s() -> None:
+    """AR0S moves the payload packing and sends into the output projection:
+    bit-identical to the same schedule without it."""
+    for kw in _AR0_CASES:
+        out, info = _run(_spec(_Ar0Mixer(), _LinFFN()), _tiles(**kw))
+        assert info["schedule"].ar0s and info["core_plan"].comm.AR0S, kw
+        assert info["schedule"].arpipe == bool(kw.get("arpipe")), kw
+        no_ar0 = {k: v for k, v in kw.items() if k != "ar0s"}
+        base, binfo = _run(_spec(_Ar0Mixer(), _LinFFN()), _tiles(**no_ar0))
+        assert not binfo["schedule"].ar0s
+        np.testing.assert_array_equal(out, base)
+    # hier=1 without ARPIPE, or a mixer that does not declare it: off
+    _, info = _run(_spec(_Ar0Mixer(), _LinFFN()), _tiles(hier=1, ar0s=True))
+    assert not info["schedule"].ar0s
+    _, info = _run(_spec(_HookMixer(), _LinFFN()), _tiles(hier=2, ar0s=True))
+    assert not info["schedule"].ar0s
+
+
+def test_ar0s_sends_round0_from_the_output_projection():
+    if len(jax.devices("cpu")) < _R:
+        _spawn_with_cpu_devices(_R, "ar0s")
+        return
+    _check_ar0s()
+
+
 _CHECKS = {
+    "ar0s": _check_ar0s,
     "arpipe": _check_arpipe,
     "arpipe_gate": _check_arpipe_needs_module_support,
     "deferred_fill": _check_deferred_fill,
