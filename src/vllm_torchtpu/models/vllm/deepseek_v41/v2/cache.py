@@ -37,10 +37,16 @@ def uses_fp8_rope_companion(vllm_config) -> bool:
     ) and str(vllm_config.cache_config.cache_dtype).startswith("fp8")
 
 
-def reserve_rope_companion(vllm_config, available: int) -> int:
+def reserve_rope_companion(vllm_config, available: int, *, auto: bool = False) -> int:
     """Leave room for the RoPE companion and cap at SparseCore's 2-bank pool limit."""
     if not uses_fp8_rope_companion(vllm_config):
         return available
+    if auto and available > 0:
+        # Keep five fractional budget bits: rounding loses less than 1/32
+        # while small HBM measurement changes share the same compiled KV shape.
+        # At 32--64 GiB this gives 1-GiB steps, before reserving RoPE bytes.
+        quantum = 1 << max(0, available.bit_length() - 6)
+        available = available // quantum * quantum
     main_budget = available * 4 // 5
     if main_budget < SPARSECORE_MAX_POOL_BYTES + SPARSECORE_MIN_SECOND_BANK_BYTES:
         return min(main_budget, SPARSECORE_MAX_POOL_BYTES)

@@ -297,6 +297,15 @@ def test_reserve_rope_companion_caps_at_sparsecore_16gib_limit():
         ),
         cache_config=SimpleNamespace(cache_dtype="fp8"),
     )
+    # Auto budgets in the same bin must produce identical main/RoPE shapes.
+    auto_budgets = [int(gib * (1 << 30)) for gib in (32.01, 32.42, 32.51, 32.99)]
+    for available in auto_budgets:
+        assert reserve_rope_companion(cfg, available, auto=True) == (32 << 30) * 4 // 5
+        assert reserve_rope_companion(cfg, available) == available * 4 // 5
+    for available in (1, 1000, 1 << 30, (32 << 30) - 1, 32 << 30):
+        rounded = reserve_rope_companion(cfg, available, auto=True)
+        assert 0 <= rounded <= available * 4 // 5
+        assert rounded >= (available * 31 // 32) * 4 // 5
     small_avail = 10 << 30
     assert reserve_rope_companion(cfg, small_avail) == small_avail * 4 // 5
     # Marginal overflow (20 GiB * 4 // 5 = 16 GiB < 1.2 * SPARSECORE_MAX_POOL_BYTES)

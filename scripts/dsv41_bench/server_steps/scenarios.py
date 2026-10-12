@@ -26,10 +26,6 @@ class Scenario:
 
 SCENARIOS = {
     "encoder_extend": Scenario("encoder_extend", 8, extend_tokens=16384),
-    "swa_replay": Scenario("swa_replay", 8),
-    "swa_replay_c16": Scenario("swa_replay_c16", 16),
-    "swa_replay_c64": Scenario("swa_replay_c64", 64, chunk_tokens=4096),
-    "decode": Scenario("decode", 128, output_tokens=512),
 }
 
 

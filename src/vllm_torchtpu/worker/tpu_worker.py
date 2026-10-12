@@ -479,7 +479,11 @@ class TPUWorker(WorkerBase):
             reserve_rope_companion,
         )
 
-        return reserve_rope_companion(self.vllm_config, available)
+        return reserve_rope_companion(
+            self.vllm_config,
+            available,
+            auto=self.cache_config.kv_cache_memory_bytes is None,
+        )
 
     def determine_available_memory(self) -> int:
         # To determine a reasonable kv_cache_memory_bytes for a specific vllm

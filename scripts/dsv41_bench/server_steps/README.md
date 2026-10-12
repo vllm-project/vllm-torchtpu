@@ -8,12 +8,13 @@ The workload uses eight distinct 65536-token cached prefixes, 16384 new input
 tokens per request, and one greedy output token. Each DP engine admits one
 request with a 2048-token budget. The model uses CED, FP8 KV, CPU Engram offload
 and DSpark K5. KV is automatically sized with memory utilization 0.85, rather
-than capped at 4 GiB. Compile buckets are `[16,128,256,2048]`.
+than capped at 4 GiB. Compile buckets are `[128,256,2048]`.
+Automatic FP8 KV budgets round down to binary steps smaller than 1/32 of the
+measured budget (1 GiB at 32–64 GiB), before the RoPE companion reserve.
+This stabilizes shapes within a bin; crossing a bin boundary still recompiles.
 
-SWA replay and decode configurations remain experimental in `scenarios.py` and
-`serve.sh`. Their summaries deliberately raise `NotImplementedError`; they are
-not qualified benchmarks in this harness. One-token output comparison is not a
-long-generation accuracy test or a steady decode benchmark.
+This is a prefill benchmark; one-token output comparison does not qualify
+long-generation accuracy or steady decode performance.
 
 ## Prepare inputs
 
@@ -123,8 +124,7 @@ python scripts/dsv41_bench/server_steps/summarize.py \
 python scripts/dsv41_bench/server_steps/summarize_startup.py \
   /path/to/results/candidate-cold/server.log \
   --out /path/to/startup-phases.json
-python -m pytest tests/scripts/test_dsv41_server_step*.py \
-  tests/scripts/test_dsv41_server_startup.py -q
+python -m pytest tests/scripts/test_dsv41_cached_extend.py -q
 ```
 
 Preserve input provenance, source revisions and diffs, runtime package versions,
@@ -138,9 +138,8 @@ eviction. Do not delete live communication buffers to free memory.
 
 Production commit `7ee60b940`, harness `bd0fe4db6`; all 366 tracked production
 files on the benchmark host matched the submitted source. The later formal-window
-compiler-log guard was also applied offline to these records. Runtime versions,
-source hashes, per-case measurements and limitations are in
-[results_20261012.json](results_20261012.json).
+compiler-log guard was also applied offline to these records. The measurements below used the original four buckets
+`[16,128,256,2048]`, before KV budget rounding.
 
 The baseline already includes the host metadata snapshot, packed RoPE selection
 and gather lookahead. The only production difference in this series is the
