@@ -106,6 +106,16 @@ Example build using the standard helper script:
 ./docker/build_image.sh --target prod -t prod:latest
 ```
 
+## vLLM's Rust frontend
+
+Every target carries vLLM's Rust frontend, `vllm-rs`, at `/usr/local/bin/vllm-rs`, built from the same vLLM commit as the Python package (`VLLM_COMMIT_HASH`). Serving uses the Python API server unless a server opts in:
+
+```bash
+VLLM_USE_RUST_FRONTEND=1 vllm serve <model> ...
+```
+
+`VLLM_RUST_FRONTEND_PATH` is preset to that binary; point it at another build to test one.
+
 ## Useful build arguments
 
 The Dockerfile also supports a few build arguments that may be useful in advanced workflows:
