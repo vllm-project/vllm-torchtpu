@@ -2043,6 +2043,9 @@ class TestUnifiedReadOffsetMigration:
         runner.device = torch.device("cpu")
         runner.mamba_slot_read_offsets = torch.zeros(16, dtype=torch.int32)
         runner._mamba_state_pos = {}
+        runner.scheduler_config = SimpleNamespace(async_scheduling=False)
+        runner.speculative_config = None
+        runner._pre_async_results = None
         runner._pool_block_split = 1
         runner._pending_mamba_state_copies = []
         raw = torch.zeros(16, 2)
