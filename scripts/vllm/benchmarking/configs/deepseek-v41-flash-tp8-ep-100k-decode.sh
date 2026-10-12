@@ -10,7 +10,9 @@ MODEL="${DEEPSEEK_V41_MODEL:-deepseek-ai/DeepSeek-V4.1-Flash}"
 TENSOR_PARALLELISM=8
 DATA_PARALLELISM=1
 ENABLE_EP=true
-ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-true}"
+# Off so a measured prompt never reuses KV from a warmup or earlier run with
+# the same prompt, which would skip the prefill phase this benchmark measures.
+ENABLE_PREFIX_CACHING="${ENABLE_PREFIX_CACHING:-false}"
 MAX_MODEL_LEN=103424
 MAX_NUM_BATCHED_TOKENS=2048
 MAX_NUM_SEQS="${MAX_NUM_SEQS:-16}"
