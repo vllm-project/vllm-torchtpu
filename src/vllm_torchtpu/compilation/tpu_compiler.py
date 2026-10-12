@@ -28,6 +28,7 @@ from vllm.config.utils import Range
 
 from vllm_torchtpu import envs, utils
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.export import stablehlo_export
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -301,6 +302,7 @@ def compute_tpu_compilation_hash(vllm_config: VllmConfig) -> str:
                 exc,
             )
 
+    stablehlo_export.update_hash_with_loaded_hlo(hash_obj)
     return hash_obj.hexdigest()[:10]
 
 
@@ -534,6 +536,19 @@ class TpuCompilerAdaptor(CompilerInterface):
                                                     size)
             if elsewhere is not None:
                 return elsewhere, None
+
+        is_profile = bool(self.cache_dir and "profile_cache" in self.cache_dir)
+
+        if envs.VLLM_TORCHTPU_LOAD_HLO_DIR and not is_profile:
+            return (
+                stablehlo_export.load_and_compile_stablehlo(
+                    self, graph, example_inputs, compile_range, key),
+                None,
+            )
+
+        if envs.VLLM_TORCHTPU_EXPORT_HLO_DIR and not is_profile:
+            stablehlo_export.export_stablehlo(self, graph, example_inputs,
+                                              compile_range, key)
 
         logger.info(
             "[TpuCompilerAdaptor] Compiling FX graph for range %s",

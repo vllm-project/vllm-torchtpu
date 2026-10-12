@@ -126,6 +126,8 @@ if TYPE_CHECKING:
     TPU_RAIDEN_TRANSFER_NUM_SLOTS: int = 0
     TPU_RAIDEN_POOL_STAGING_LEASES: int = 8
     TPU_RAIDEN_INLINE_LOAD: bool = False
+    VLLM_TORCHTPU_EXPORT_HLO_DIR: str = ""
+    VLLM_TORCHTPU_LOAD_HLO_DIR: str = ""
 
 
 def env_with_choices(
@@ -289,6 +291,10 @@ def env_optional_int(env_name: str) -> Callable[[], int | None]:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "VLLM_TORCHTPU_EXPORT_HLO_DIR":
+    env_str("VLLM_TORCHTPU_EXPORT_HLO_DIR", default=""),
+    "VLLM_TORCHTPU_LOAD_HLO_DIR":
+    env_str("VLLM_TORCHTPU_LOAD_HLO_DIR", default=""),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per
