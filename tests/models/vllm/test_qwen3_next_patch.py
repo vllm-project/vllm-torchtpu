@@ -33,8 +33,8 @@ from vllm_torchtpu.models.vllm.qwen3_next_patch import (
     patched_decoder_layer_forward,
 )
 
-# The patched copies track vLLM v0.31.1rc0 (pyproject.toml pin).
-PINNED_VLLM_VERSION = "0.31.1rc0"
+# The patched copies track vLLM v0.31.0 (pyproject.toml pin).
+PINNED_VLLM_VERSION = "0.31.0"
 PINNED_DECODER_LAYER_HASH = (
     "359c047f120f585e0c519a3bc438f037f996f4d48c7b64495dadddc59a709b4a"
 )
