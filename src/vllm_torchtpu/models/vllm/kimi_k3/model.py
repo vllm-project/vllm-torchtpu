@@ -783,6 +783,8 @@ class KimiK3ForConditionalGeneration(
         from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphCaptureInputs
 
         del max_frames_per_batch  # image-only modality
+        if axis_keys:
+            raise ValueError("Kimi K3 does not define encoder capture axes")
 
         merge_h, merge_w = self.vision_tower.merge_kernel_size
         # Ceil so captured capacity is never smaller than token_budget when

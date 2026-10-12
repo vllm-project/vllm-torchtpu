@@ -147,6 +147,20 @@ def test_untouched_configs_keep_their_upstream_hash(patched_compute_hash):
     assert patched_compute_hash(config) == _upstream_compute_hash()(config)
 
 
+@pytest.mark.parametrize("additional_config", [None, {"option": 1}, {KEY: 128}])
+@pytest.mark.parametrize("include_version", [False, True])
+def test_hash_forwards_include_version(
+    patched_compute_hash, additional_config, include_version
+):
+    config = _StubVllmConfig(additional_config)
+    filtered = _StubVllmConfig(
+        {} if additional_config == {KEY: 128} else additional_config
+    )
+    expected = _upstream_compute_hash()(filtered, include_version=include_version)
+    assert patched_compute_hash(config, include_version=include_version) == expected
+    assert patched_compute_hash(config, include_version) == expected
+
+
 def test_additional_config_is_restored_after_hashing(patched_compute_hash):
     additional_config = {KEY: 128}
     config = _StubVllmConfig(additional_config)
@@ -157,7 +171,7 @@ def test_additional_config_is_restored_after_hashing(patched_compute_hash):
 
 
 def test_additional_config_is_restored_when_hashing_raises(apply_patch_over):
-    def exploding_compute_hash(self, *args, **kwargs):
+    def exploding_compute_hash(self, include_version=True):
         raise RuntimeError("boom")
 
     compute_hash = apply_patch_over(exploding_compute_hash)
