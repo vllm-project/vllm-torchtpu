@@ -36,12 +36,23 @@ class MoEBlock:
                 W["es"].at[0, 0], scr["es"].at[s], scr["es_sem"].at[s]
             ).wait()
 
-    def moe(self, l, slot, g0, is_att):
+    def moe(self, l, slot, g0, is_att, defer_flush: bool = False):
         ctx = self.ctx
-        c, scr, sc, sm, rms_zc = ctx.c, ctx.scr, ctx.sc, ctx.sm, ctx.rms_zc
-        dmatmul, flush_rel = self.rings.dmatmul, self.rings.flush_rel
+        c, scr, sc, sm, mm, rms_zc = (
+            ctx.c,
+            ctx.scr,
+            ctx.sc,
+            ctx.sm,
+            ctx.mm,
+            ctx.rms_zc,
+        )
+        dmatmul, dtake, flush_rel = (
+            self.rings.dmatmul,
+            self.rings.dtake,
+            self.rings.flush_rel,
+        )
         E, H, MR, MB = ctx.E, ctx.H, ctx.MR, ctx.MB
-        AE, N_MOE, nt = ctx.AE, ctx.N_MOE, ctx.nt
+        AE, N_MOE, nt, tk, skip = ctx.AE, ctx.N_MOE, ctx.nt, ctx.tk, ctx.skip
         LAZY_MOE, PIPE, PIPE_EP = ctx.LAZY_MOE, ctx.PIPE, ctx.PIPE_EP
 
         seg_r = g0 + jnp.where(
@@ -49,40 +60,8 @@ class MoEBlock:
             nt["att_in"] + nt["att_out"],
             nt["lin_in"] + nt["lin_out"],
         )
-        with sc("moe_router"):
-            x = rms_zc(scr["res"][...], sm(slot, "post_norm"))
-            scr["xb"][...] = x.astype(BF16)
-            logits = dmatmul("router", seg_r, scr["xb"], E, lazy=LAZY_MOE)[0:MR]
-            glog = jnp.sum(x * sm(slot, "sh_gate"), axis=-1, keepdims=True)
-            scr["sg"][...] = jnp.broadcast_to(jax.nn.sigmoid(glog), (MB, 128))
-            mx = jnp.max(logits, axis=-1, keepdims=True)
-            pexp = jnp.exp(logits - mx)
-        with sc("moe_route"):
-            n_hit = self.route(l, pexp)
-        with sc("moe_shared"):
-            # shared expert (TP slice of the intermediate), under the first expert tiles
-            g13 = dmatmul(
-                "sh13", seg_r + nt["router"], scr["xb"], 2 * c.ISR, lazy=LAZY_MOE
-            )
-            g13 = g13 * sm(slot, "sh13_s")
-            mid = rnd(rnd(jax.nn.silu(rnd(g13[:, :c.ISR]))) * rnd(g13[:, c.ISR:]))
-            scr["xb2"][:, :c.ISR] = mid.astype(BF16)
-            ysh = dmatmul(
-                "sh2",
-                seg_r + nt["router"] + nt["sh13"],
-                scr["xb2"],
-                H,
-                lazy=LAZY_MOE,
-            )
-            scr["part"][...] = ysh * sm(slot, "sh2_s") * scr["sg"][:, 0:1]
-        with sc("moe_experts"):
-            if PIPE:
-                self.experts_piped(l, n_hit)
-            elif PIPE_EP:
-                self.experts_piped_ep(l, n_hit)
-            else:
-                lax.fori_loop(0, n_hit, functools.partial(self.expert, l), 0)
-        if LAZY_MOE:
+
+        def moe_flush():
             with sc("refill"):
                 for lt_s in range(AE):
                     # MoE tiles start at in-layer offset base (static per layer type)
@@ -96,6 +75,101 @@ class MoEBlock:
                             g0 + base, l // AE, lt_s, base, N_MOE
                         )
                     )
+
+        SH_PRE = LAZY_MOE and "dense" not in skip and nt["sh13"] + nt["sh2"] <= 4
+        with sc("moe_router"):
+            x = rms_zc(scr["res"][...], sm(slot, "post_norm"))
+            scr["xb"][...] = x.astype(BF16)
+            if SH_PRE and getattr(ctx, "DWAIT_HOIST", False):
+                n_r, n_13, n_2 = nt["router"], nt["sh13"], nt["sh2"]
+                wg = self.rings.dtake_group(
+                    [("router", seg_r + t) for t in range(n_r)]
+                    + [("sh13", seg_r + n_r + t) for t in range(n_13)]
+                    + [("sh2", seg_r + n_r + n_13 + t) for t in range(n_2)]
+                )
+                w13s, w2s = wg[n_r : n_r + n_13], wg[n_r + n_13 :]
+                logits = dmatmul(
+                    "router", seg_r, scr["xb"], E, lazy=LAZY_MOE, ws_pre=wg[:n_r]
+                )[0:MR]
+            else:
+                logits = dmatmul("router", seg_r, scr["xb"], E, lazy=LAZY_MOE)[0:MR]
+                if SH_PRE and not getattr(ctx, "DWAIT_HOIST", False):
+                    g_s = seg_r + nt["router"]
+                    w13s = [dtake("sh13", g_s + t) for t in range(nt["sh13"])]
+                    w2s = [dtake("sh2", g_s + nt["sh13"] + t) for t in range(nt["sh2"])]
+            glog = jnp.sum(x * sm(slot, "sh_gate"), axis=-1, keepdims=True)
+            scr["sg"][...] = jnp.broadcast_to(jax.nn.sigmoid(glog), (MB, 128))
+            mx = jnp.max(logits, axis=-1, keepdims=True)
+            pexp = jnp.exp(logits - mx)
+        if SH_PRE:
+            with sc("moe_shared"):
+                t13 = tk["sh13"]
+                g13 = None
+                for t, w in enumerate(w13s):
+                    p_ = mm(scr["xb"][:, t * t13 : (t + 1) * t13], w[...])
+                    g13 = p_ if g13 is None else g13 + p_
+                g13 = g13 * sm(slot, "sh13_s")
+                mid = rnd(
+                    rnd(jax.nn.silu(rnd(g13[:, : c.ISR]))) * rnd(g13[:, c.ISR :])
+                )
+                scr["xb2"][:, : c.ISR] = mid.astype(BF16)
+                if ctx.SH2_PRE_ROUTE:
+                    t2 = tk["sh2"]
+                    ysh = None
+                    for t, w in enumerate(w2s):
+                        p_ = mm(scr["xb2"][:, t * t2 : (t + 1) * t2], w[...])
+                        ysh = p_ if ysh is None else ysh + p_
+                    scr["part"][...] = ysh * sm(slot, "sh2_s") * scr["sg"][:, 0:1]
+        with sc("moe_route"):
+            n_hit = self.route(l, pexp)
+        if SH_PRE and not ctx.SH2_PRE_ROUTE:
+            with sc("moe_shared"):
+                t2 = tk["sh2"]
+                ysh = None
+                for t, w in enumerate(w2s):
+                    p_ = mm(scr["xb2"][:, t * t2 : (t + 1) * t2], w[...])
+                    ysh = p_ if ysh is None else ysh + p_
+                scr["part"][...] = ysh * sm(slot, "sh2_s") * scr["sg"][:, 0:1]
+        elif not SH_PRE:
+            with sc("moe_shared"):
+                # shared expert (TP slice of the intermediate), under the first expert tiles
+                g13 = dmatmul(
+                    "sh13", seg_r + nt["router"], scr["xb"], 2 * c.ISR, lazy=LAZY_MOE
+                )
+                g13 = g13 * sm(slot, "sh13_s")
+                mid = rnd(rnd(jax.nn.silu(rnd(g13[:, :c.ISR]))) * rnd(g13[:, c.ISR:]))
+                scr["xb2"][:, :c.ISR] = mid.astype(BF16)
+                ysh = dmatmul(
+                    "sh2",
+                    seg_r + nt["router"] + nt["sh13"],
+                    scr["xb2"],
+                    H,
+                    lazy=LAZY_MOE,
+                )
+                scr["part"][...] = ysh * sm(slot, "sh2_s") * scr["sg"][:, 0:1]
+        with sc("moe_experts"):
+            if PIPE:
+                self.experts_piped(l, n_hit)
+            elif PIPE_EP:
+                self.experts_piped_ep(
+                    l,
+                    n_hit,
+                    pre_drain=moe_flush if (LAZY_MOE and defer_flush) else None,
+                )
+            else:
+                lax.fori_loop(0, n_hit, functools.partial(self.expert, l), 0)
+        fill = None
+        if LAZY_MOE:
+            if not defer_flush:
+                moe_flush()
+            elif PIPE_EP and not PIPE:
+                pl.when(n_hit == 0)(moe_flush)
+            elif ctx.FLUSH_IN_AR1:
+                fill = moe_flush
+            else:
+                moe_flush()
+        if defer_flush:
+            return scr["part"][...], fill
         return scr["part"][...]
 
     __call__ = moe
@@ -205,9 +279,10 @@ class MoEBlock:
                 lane_b = lax.broadcasted_iota(I32, (128, E), 1)
                 rr = row_b - NCP
                 in_rank = jnp.logical_and(lane_b >= rr * ER, lane_b < (rr + 1) * ER)
+                cp_code = (row_b % R) * EXTRA + lax.div(row_b, R) + 1
                 bm = jnp.where(
                     row_b < NCP,
-                    jnp.where(cpi == row_b + 1, 1.0, 0.0),
+                    jnp.where(cpi == cp_code, 1.0, 0.0),
                     jnp.where(
                         rr < R,
                         jnp.where(in_rank, 1.0, 0.0),
@@ -221,15 +296,43 @@ class MoEBlock:
                 scr["hitv"][MROW:MROW + 1, :] = meta.astype(I32)
             else:
                 scr["hitv"][...] = ids
+        with sc("route_dma", 2):
+            cp = pltpu.make_async_copy(scr["hitv"], scr["hits"], scr["misc_sem"])
+            cp.start()
             wsel = jnp.where(sel, p8, 0.0)
             scr["wn"][...] = jnp.where(
                 row8 < B, wsel / jnp.sum(wsel, axis=-1, keepdims=True), 0.0
             )
-        with sc("route_dma", 2):
-            cp = pltpu.make_async_copy(scr["hitv"], scr["hits"], scr["misc_sem"])
-            cp.start()
             cp.wait()
         stamp = l + 1
+        n_fill0 = jnp.int32(0)
+        RSHRINK = (
+            getattr(ctx, "ROUTE_SHRINK", False)
+            and VEC
+            and E < (1 << getattr(ctx, "CP_SH", 16))
+        )
+        PRIM_NOW_K = getattr(ctx, "PRIM_NOW_K", False)
+
+        def cp_dec(w):
+            """Packed cplist entry -> (e, r0, s0, r1, s1): primary rank / slot, copy rank /
+            slot (preserving Att15 cp_code mapping)."""
+            CP_SH = getattr(ctx, "CP_SH", 16)
+            e = lax.bitwise_and(w, (1 << CP_SH) - 1)
+            j = lax.shift_right_logical(w, CP_SH)
+            if ER & (ER - 1) == 0:
+                r0 = lax.shift_right_logical(e, ER.bit_length() - 1)
+                s0 = lax.bitwise_and(e, ER - 1)
+            else:
+                r0 = lax.div(e, ER)
+                s0 = e - r0 * ER
+            if R & (R - 1) == 0:
+                r1 = lax.bitwise_and(j, R - 1)
+                s1 = ER + lax.shift_right_logical(j, R.bit_length() - 1)
+            else:
+                r1 = lax.rem(j, R)
+                s1 = ER + lax.div(j, R)
+            return e, r0, s0, r1, s1
+
         if VEC:
             with sc("route_dedup", 2):
                 for r in range(R):
@@ -237,23 +340,49 @@ class MoEBlock:
                 n_tot = scr["hits"][MROW, NCP + R]
                 base = me * ER
 
-                def prim(s, n):
-                    e = base + s
-                    f = scr["hits"][
-                        lax.shift_right_logical(e, 7), lax.bitwise_and(e, 127)
-                    ]
-                    scr["elist"][n] = e
-                    scr["wlist"][n] = s
-                    return n + f
+                if PRIM_NOW_K:
+                    def prim(s, n):
+                        e = base + s
+                        f = scr["hits"][
+                            lax.shift_right_logical(e, 7), lax.bitwise_and(e, 127)
+                        ]
+                        scr["elist"][n] = e
+                        return n + f
+                else:
+                    def prim(s, n):
+                        e = base + s
+                        f = scr["hits"][
+                            lax.shift_right_logical(e, 7), lax.bitwise_and(e, 127)
+                        ]
+                        scr["elist"][n] = e
+                        scr["wlist"][n] = s
+                        return n + f
 
                 n_hit = lax.fori_loop(0, ER, prim, jnp.int32(0), unroll=True)
+                if PRIM_NOW_K:
+                    scr["st"][5] = n_hit
 
-                def cpl(j, n):
-                    v1 = scr["hits"][MROW, j]
-                    scr["cplist"][n] = v1 - 1
-                    return n + jnp.where(v1 > 0, 1, 0).astype(I32)
+                EARLY_FILL = VEC and "experts" not in skip
+                if EARLY_FILL:
+                    n_fill0 = jnp.minimum(NBE, n_hit * TE)
+                    with sc("route_fetch0", 2):
+                        self.rings.fetch_range(jnp.int32(0), n_fill0, l, fixed=PRIM_NOW_K)
 
-                n_cp = lax.fori_loop(0, NCP, cpl, jnp.int32(0), unroll=True)
+                if RSHRINK:
+                    CP_SH = getattr(ctx, "CP_SH", 16)
+                    n_cp = jnp.int32(0)
+                    for c0 in range(0, NCP, 16):
+                        vs = [scr["hits"][MROW, j] for j in range(c0, min(c0 + 16, NCP))]
+                        for k, v1 in enumerate(vs):
+                            scr["cplist"][n_cp] = v1 + (((c0 + k) << CP_SH) - 1)
+                            n_cp = n_cp + lax.shift_right_logical(-v1, 31)
+                else:
+                    def cpl(j, n):
+                        v1 = scr["hits"][MROW, j]
+                        scr["cplist"][n] = v1 - 1
+                        return n + jnp.where(v1 > 0, 1, 0).astype(I32)
+
+                    n_cp = lax.fori_loop(0, NCP, cpl, jnp.int32(0), unroll=True)
         if ECOPY:
             if not VEC:
                 for r in range(R):
@@ -361,11 +490,19 @@ class MoEBlock:
                         n_hit, n_cp, n_tot = carry
 
             with sc("route_dedup", 2):
-                def po2c_pass1(j, _):
+                def cp_fields(j):
+                    if RSHRINK:
+                        return cp_dec(scr["cplist"][j])
                     e = scr["cplist"][j]
                     r0 = lax.div(e, ER)
+                    s0 = e - r0 * ER
                     c0 = scr["ecopy"][slot, 0, e].astype(I32) - 1
                     r1 = lax.div(c0, EXTRA)
+                    s1 = ER + (c0 - r1 * EXTRA)
+                    return e, r0, s0, r1, s1
+
+                def po2c_pass1(j, _):
+                    e, r0, _s0, r1, _s1 = cp_fields(j)
                     l0 = scr["rload"][r0]
                     l1 = scr["rload"][r1]
                     use_c = jnp.logical_or(
@@ -381,12 +518,7 @@ class MoEBlock:
                     return 0
 
                 def po2c_pass2(j, n):
-                    e = scr["cplist"][j]
-                    r0 = lax.div(e, ER)
-                    s0 = e - r0 * ER
-                    c0 = scr["ecopy"][slot, 0, e].astype(I32) - 1
-                    r1 = lax.div(c0, EXTRA)
-                    s1 = ER + (c0 - r1 * EXTRA)
+                    e, r0, s0, r1, s1 = cp_fields(j)
                     use_c = scr["cpchoice"][j] != 0
                     cur = jnp.where(use_c, r1, r0)
                     alt = jnp.where(use_c, r0, r1)
@@ -450,7 +582,9 @@ class MoEBlock:
             n_hit = jnp.int32(0)
         scr["st"][0] = n_hit * TE
         with sc("route_fetch", 2):
-            if c.stack_e:
+            if VEC and EARLY_FILL:
+                self.rings.fetch_range(n_fill0, jnp.minimum(NBE, n_hit * TE), l)
+            elif c.stack_e:
                 for k in range(NBE):
                     @pl.when(k < n_hit * TE)
                     def _(k=k):
@@ -616,7 +750,7 @@ class MoEBlock:
             self.down(last, xb2[:, :IR], etake("e2", u2)[...])
             egive(u2, l, T13)
 
-    def experts_piped_ep(self, l, n_hit):
+    def experts_piped_ep(self, l, n_hit, pre_drain=None):
         """EP multi-tile software pipeline (T13 == 2 * T2, e.g. T13=8, T2=4, TE=12, NBE=12):
         Prologue computes expert 0's gate|up into xb2[:, :IR]. Each steady-state step i overlaps
         expert i's 4 w2 tiles with expert (i+1)'s 8 w13 tiles (1 w2 tile + 2 w13 tiles per
@@ -722,6 +856,8 @@ class MoEBlock:
             lax.fori_loop(0, n_hit - 1, body_ep, 0)
 
             # Epilogue: last expert (n_hit - 1) down projection (T2 tiles)
+            if pre_drain is not None:
+                pre_drain()
             i_last = n_hit - 1
             e_last = scr["elist"][i_last]
             s_last = i_last % NSS

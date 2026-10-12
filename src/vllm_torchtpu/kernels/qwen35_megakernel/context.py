@@ -28,19 +28,40 @@ from jax.experimental.pallas import tpu as pltpu
 from . import pool_alias
 from .config import (
     ABLATIONS,
+    AR0S_ON,
+    ARPIPE_H1_ON,
+    ARPIPE_OFF_B,
+    ARPIPE_ON,
+    ATT_GDEFER,
+    ATT_KVDEFER,
+    ATT_QSWAP,
+    ATT_WGROUP,
     BF16,
     CONV_STAGE_MIN_B,
+    CP_SH,
     DENSE,
     DMM_UNROLL,
+    DMM_UNROLL_OFF_B,
+    DWAIT_HOIST,
     EXPERT,
     F32,
+    FLUSH_IN_AR1,
     FP8,
+    GDN_LCV,
+    GDN_SEQ_ROLL_MIN_B,
+    GDN_ZDEFER,
+    GDN_ZDEFER_ROLL,
+    GDN_ZDEFER_ROLL_BUCKETS,
     GQ_PACK,
     I32,
     MKConfig,
+    MXU_DR_BUCKETS,
     NN,
     O_NAMES,
+    PRIM_NOW,
+    ROUTE_SHRINK,
     S_NAMES,
+    SH2_PRE_ROUTE,
     TOPK_LANES,
     Tiles,
     U8,
@@ -90,6 +111,28 @@ class MKBuildContext:
         self.gq_pack = GQ_PACK if gq_pack is None else gq_pack
         self.topk_lanes = TOPK_LANES if topk_lanes is None else topk_lanes
         self.dmm_unroll = DMM_UNROLL if dmm_unroll is None else dmm_unroll
+        self.DMM_UNROLL_OFF_B = DMM_UNROLL_OFF_B
+        self.GDN_LCV = GDN_LCV
+        self.GDN_ZDEFER = GDN_ZDEFER
+        self.ATT_GDEFER = ATT_GDEFER
+        self.ATT_KVDEFER = ATT_KVDEFER
+        self.ATT_QSWAP = ATT_QSWAP
+        self.FLUSH_IN_AR1 = FLUSH_IN_AR1
+        self.SH2_PRE_ROUTE = SH2_PRE_ROUTE
+        self.ARPIPE_ON = ARPIPE_ON
+        self.ARPIPE_OFF_B = ARPIPE_OFF_B
+        self.ARPIPE_H1_ON = ARPIPE_H1_ON
+        self.AR0S_ON = AR0S_ON
+        self.MXU_DR_BUCKETS = MXU_DR_BUCKETS
+        self.ROUTE_SHRINK = ROUTE_SHRINK
+        self.CP_SH = CP_SH
+        self.PRIM_NOW = PRIM_NOW
+        self.ATT_WGROUP = ATT_WGROUP
+        self.DWAIT_HOIST = DWAIT_HOIST
+        self.GDN_ZDEFER_ROLL = GDN_ZDEFER_ROLL
+        self.GDN_ZDEFER_ROLL_BUCKETS = GDN_ZDEFER_ROLL_BUCKETS
+        self.GDN_SEQ_ROLL_MIN_B = GDN_SEQ_ROLL_MIN_B
+        self.rnd = rnd
         self.conv_stage_min_b = (
             CONV_STAGE_MIN_B if conv_stage_min_b is None else conv_stage_min_b
         )
@@ -211,12 +254,63 @@ class MKBuildContext:
         assert not RSAG or CW % 128 == 0
         assert HIER in (0, 1, 2, 3) and (HIER == 0 or R == 8 or (HIER == 3 and R >= 2))
         assert HIER != 2 or HC2 % 128 == 0
+        ARP_COMMON = bool(
+            B not in self.ARPIPE_OFF_B
+            and FUSED
+            and VER
+            and AE > 1
+            and c.NGDN > 0
+            and tk["att_in"] == tk["lin_in"]
+            and nt["lin_in"] == nt["att_in"]
+            and nt["lin_in"] <= min(self.dmm_unroll, NBD)
+            and B not in self.DMM_UNROLL_OFF_B
+            and HC2 % tk["lin_in"] == 0
+            and AR_C % tk["lin_in"] == 0
+            and HC2 % 128 == 0
+        )
+        ARP_H1 = bool(self.ARPIPE_H1_ON and HIER == 1 and ARP_COMMON)
+        A0_CW = min(512, HC2)
+        AR0S = bool(
+            self.AR0S_ON
+            and R > 1
+            and (HIER == 2 or (HIER == 1 and ARP_H1))
+            and HC2 % A0_CW == 0
+            and A0_CW % 128 == 0
+            and max(nt["lin_out"], nt["att_out"]) <= min(self.dmm_unroll, NBD)
+            and B not in self.DMM_UNROLL_OFF_B
+        )
         AR_ROUNDS = (
             tuple(range(N_HIER3))
             if HIER == 3
-            else ((0, 1, 2) if HIER == 2 else ((0, 1) if (RSAG or HIER == 1) else (0,)))
+            else (
+                (0, 1, 2)
+                if (HIER == 2 or ARP_H1)
+                else ((0, 1) if (RSAG or HIER == 1) else (0,))
+            )
         )
         AR_PEERS = 1 if HIER == 3 else (3 if HIER in (1, 2) else max(R - 1, 1))
+        ARP_TK = tk["lin_in"]
+        ARPIPE = bool(self.ARPIPE_ON and ARP_COMMON and (HIER == 2 or ARP_H1))
+        ARP_HPT = HC2 // ARP_TK if ARPIPE else 0
+        ARP_S = (
+            [j * (AR_C // ARP_TK) + i for j in range(H // AR_C) for i in range(ARP_HPT)]
+            if ARPIPE
+            else []
+        )
+        ARP = bool(ARPIPE and R > 1 and "ar" not in skip and "dense" not in skip)
+        LCV_NH = 3 * qkv_128
+        LCV_NH16 = -(-LCV_NH // 16) * 16
+        LCV = bool(
+            self.GDN_LCV
+            and FUSED
+            and c.NGDN > 0
+            and QKV % 128 == 0
+            and KD == 128
+            and VD == 128
+            and QKV == 2 * kh * KD + vh * VD
+            and LCV_NH16 <= conv8_rows
+        )
+        LCV_ROWS = -(-max((T + 3) * qkv_128, LCV_NH16) // 8) * 8
         # - PACK: the split attention's per-row slabs pack PB rows per 8-row tile
         PACK = (WIDE if tiles.pack < 0 else bool(tiles.pack)) and SPLIT and nh < 8
         PB = 8 // nh if PACK else 1
@@ -325,6 +419,8 @@ class MKBuildContext:
                     "gdn_in_pend": pltpu.SMEM((NGI,), I32),
                     "gdn_out_mode": pltpu.SMEM((NGO,), I32),
                 })
+                if LCV:
+                    scratch["gdn_cq"] = pltpu.VMEM((LCV_ROWS, 128), F32)
             else:
                 del scratch["sbuf"]
             scratch.update({
@@ -377,6 +473,8 @@ class MKBuildContext:
             scratch["ag_recv"] = pltpu.VMEM((2, 4, AR_R, HC2), BF16)
             scratch["s2_send"] = pltpu.VMEM((2, AR_R, HC2), BF16)
             scratch["s2_recv"] = pltpu.VMEM((2, 2, AR_R, HC2), BF16)
+        if ARPIPE:
+            scratch["arp"] = pltpu.VMEM((MB, 128), F32)
         if forced_routing:
             scratch["rb"] = pltpu.VMEM((2, M, E), F32)
             scratch["rb_sem"] = pltpu.SemaphoreType.DMA((2,))
@@ -475,11 +573,32 @@ class MKBuildContext:
         self.HIER, self.N_HIER3, self.RSAG, self.WAR = HIER, N_HIER3, RSAG, WAR
         self.AR_R, self.AR_C, self.CW, self.HC2 = AR_R, AR_C, CW, HC2
         self.AR_ROUNDS, self.AR_PEERS = AR_ROUNDS, AR_PEERS
+        self.ARP_COMMON, self.ARP_H1 = ARP_COMMON, ARP_H1
+        self.A0_CW, self.AR0S = A0_CW, AR0S
+        self.ARP_TK, self.ARPIPE, self.ARP_HPT, self.ARP_S, self.ARP = (
+            ARP_TK,
+            ARPIPE,
+            ARP_HPT,
+            ARP_S,
+            ARP,
+        )
+        self.LCV, self.LCV_NH, self.LCV_NH16, self.LCV_ROWS = LCV, LCV_NH, LCV_NH16, LCV_ROWS
         self.PACK, self.PB, self.NBP = PACK, PB, NBP
         self.NHH, self.SR, self.QV = NHH, SR, QV
         self.QG, self.GQ, self.MLW, self.QVR = QG, GQ, MLW, QVR
         self.KV_ITEM, self.KVE, self.NKVR = KV_ITEM, KVE, NKVR
         self.ECOPY, self.EXTRA = ECOPY, EXTRA
+        self.PRIM_NOW_K = bool(
+            self.PRIM_NOW
+            and self.ROUTE_SHRINK
+            and tiles.route_vec
+            and self.ECOPY
+            and c.E % 128 == 0
+            and c.E // 128 + 1 <= self.MR
+            and c.R * self.EXTRA + c.R + 1 <= 128
+            and c.E < (1 << self.CP_SH)
+            and 128 % self.ER == 0
+        )
         self.vshape, self.vdtype = vshape, vdtype
         self.scratch = scratch
         self.s_names = s_names
@@ -569,6 +688,7 @@ class MKBuildContext:
         self.scr: dict[str, Any] = {}
         self.me: Any = None
         self.gi: Any = None
+        self.arp_c: Any = None
         self.lane_e8: Any = None
         self.lane128: Any = None
         self.row8: Any = None
@@ -576,6 +696,12 @@ class MKBuildContext:
         self.live: Any = None
         self.EM: int = (1 << max(1, (E - 1).bit_length())) - 1
         self.FLT_MIN: float = float(jnp.finfo(F32).tiny)
+
+    def arp_r(self, x, rows=None):
+        """Scale x by scr['arp'][:, 0:1] when ARP is enabled."""
+        if not self.ARP:
+            return x
+        return x * (self.scr["arp"][:, 0:1] if rows is None else self.scr["arp"][rows, 0:1])
 
     def sc(self, name: str, level: int = 1):
         """Return a named device trace scope context manager when scopes >= level."""
@@ -625,6 +751,11 @@ class MKBuildContext:
         self.scr = dict(zip(self.s_names, refs[k_ + len(self.o_names) :]))
         self.me = lax.axis_index("tp").astype(I32)
         self.gi = lax.rem(self.me, self.G) if self.SPLIT else jnp.int32(0)
+        self.arp_c = (
+            (jnp.int32(0) if self.HIER == 1 else lax.rem(self.me, 2))
+            if self.ARP
+            else None
+        )
         self.lane_e8 = lax.broadcasted_iota(I32, (self.MR, self.E), 1)
         self.lane128 = lax.broadcasted_iota(I32, (self.MR, 128), 1)
         self.row8 = lax.broadcasted_iota(I32, (self.MR, 1), 0)

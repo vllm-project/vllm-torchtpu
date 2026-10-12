@@ -119,6 +119,82 @@ class DenseWeightRing:
 
     take = dtake
 
+    def dtake_group(self, kinds_gs):
+        """dtake for a group [(kind, g), ...] of consecutive tiles g0, g0+1, ...: all banks
+        are computed before the first wait (DWAIT_HOIST), and the waits use a static dst view
+        (the wait reads only the semaphore and the byte count)."""
+        ctx = self.ctx
+        if not getattr(ctx, "DWAIT_HOIST", False):
+            return [self.dtake(k, g) for k, g in kinds_gs]
+        banks = self.dbanks(kinds_gs[0][1], len(kinds_gs))
+        if "dense" not in ctx.skip:
+            with ctx.sc("dwait", 2):
+                for (k, _), b in zip(kinds_gs, banks):
+                    pltpu.make_async_copy(
+                        ctx.W[k].at[0, 0],
+                        self.dview(k, 0),
+                        ctx.scr["dsem"].at[b],
+                    ).wait()
+        return [self.dview(k, b) for (k, _), b in zip(kinds_gs, banks)]
+
+    def dbanks(self, g0, n: int):
+        """Ring banks of tiles g0 .. g0+n-1 (n <= NBD, g0 >= 0): one rem, then a wrap."""
+        NBD = self.ctx.NBD
+        if isinstance(g0, int):
+            return [(g0 + u) % NBD for u in range(n)]
+        b0 = lax.rem(g0, NBD)
+        out = [b0]
+        for u in range(1, n):
+            b = b0 + u
+            out.append(jnp.where(b >= NBD, b - NBD, b))
+        return out
+
+    def dbanks_wait(self, kind: str, g0, n: int):
+        """dtake_group([(kind, g0 + u) for u in range(n)]), returning the ring banks."""
+        ctx = self.ctx
+        banks = self.dbanks(g0, n)
+        if "dense" not in ctx.skip:
+            with ctx.sc("dwait", 2):
+                for b in banks:
+                    pltpu.make_async_copy(
+                        ctx.W[kind].at[0, 0], self.dview(kind, 0), ctx.scr["dsem"].at[b]
+                    ).wait()
+        return banks
+
+    def arp_mm(self, kind: str, banks, xsrc, cols, hook):
+        """ARPIPE: acc[:, c0:c0 + cw] = xsrc @ W(kind) over all K tiles for (c0, cw) in cols:
+        the K tiles of this core's all-reduce half first (a register sum per column chunk,
+        stored), then hook() (round-2 wait, other half's residual + norm), then the other
+        half's tiles (added). Tile s + h * ARP_HPT (s in ARP_S) is half h's; its bank and
+        its xsrc lanes are picked at runtime from the core index."""
+        mctx = self.ctx
+        t_k = mctx.tk[kind]
+        acc = mctx.scr["acc"]
+        ARP_S, ARP_HPT, arp_c = mctx.ARP_S, mctx.ARP_HPT, mctx.arp_c
+
+        def half_pass(other):
+            xs, ws = [], []
+            for s in ARP_S:
+                b_lo, b_hi = banks[s], banks[s + ARP_HPT]
+                if other:
+                    b_lo, b_hi = b_hi, b_lo
+                h = (1 - arp_c) if other else arp_c
+                ws.append(self.dview(kind, jnp.where(arp_c == 0, b_lo, b_hi)))
+                k0 = pl.multiple_of((s + h * ARP_HPT) * t_k, t_k)
+                xs.append(xsrc[:, pl.ds(k0, t_k)])
+            for c0, cw in cols:
+                p = mctx.mm(xs[0], ws[0][:, c0 : c0 + cw])
+                for i in range(1, len(xs)):
+                    p = p + mctx.mm(xs[i], ws[i][:, c0 : c0 + cw])
+                if other:
+                    acc[:, c0 : c0 + cw] += p
+                else:
+                    acc[:, c0 : c0 + cw] = p
+
+        half_pass(False)
+        hook()
+        half_pass(True)
+
     def dgive(self, g):
         self.fetch(g + self.ctx.NBD)
 
@@ -206,12 +282,27 @@ class DenseWeightRing:
                 g0 + t + u + NBD, blk, lt, r0 + u + NBD, dt=t, dt_vals=t_vals, lts=lts
             )
 
-    def dmatmul_pair(self, kind: str, g0, xsrc, N: int, lazy: bool = False, ctx=None):
+    def dmatmul_pair(
+        self,
+        kind: str,
+        g0,
+        xsrc,
+        N: int,
+        lazy: bool = False,
+        ctx=None,
+        ws_pre=None,
+        hook=None,
+        split=None,
+    ):
         """Paired/unrolled dense matmul: acc[:, :N] = xsrc[:, :K] @ W(kind)."""
         mctx = self.ctx
         n_t, t_k = mctx.nt[kind], mctx.tk[kind]
         acc = mctx.scr["acc"]
-        DMU = min(mctx.dmm_unroll, mctx.NBD)
+        DMU = (
+            min(mctx.dmm_unroll, mctx.NBD)
+            if mctx.B not in mctx.DMM_UNROLL_OFF_B
+            else 0
+        )
         DCW = 512
         if n_t <= DMU:
             U = n_t
@@ -219,23 +310,51 @@ class DenseWeightRing:
             U = 2 if n_t % 2 == 0 and N > DCW else 1
         chunks = [(c0, min(DCW, N - c0)) for c0 in range(0, N, DCW)]
         n_s = n_t // U
+        if hook is not None:
+            assert U == n_t and ws_pre is None and split is None
+            banks = self.dbanks_wait(kind, g0, n_t)
+            self.arp_mm(kind, banks, xsrc, chunks, hook)
+            if not lazy:
+                for u in range(n_t):
+                    self._give_tile(g0, 0, u, (), ctx)
+            return acc[:, :N]
+        groups = [(chunks, None)]
+        if split is not None:
+            assert U == n_t and n_s == 1 and hook is None and ws_pre is None, kind
+            assert sum(cw for cols_ in split["cols"] for _, cw in cols_) == N, kind
+            groups = list(zip(split["cols"], split["hooks"]))
+            split["pre"]()
 
         def step(t, first):
-            ws, xs = [], []
-            for u in range(U):
-                ws.append(self.dtake(kind, g0 + t + u))
-                k0 = (t + u) * t_k
-                if not isinstance(k0, int):
-                    k0 = pl.multiple_of(k0, t_k)
-                xs.append(xsrc[:, pl.ds(k0, t_k)])
-            for c0, cw in chunks:
-                p = mctx.mm(xs[0], ws[0][:, c0 : c0 + cw])
-                for u in range(1, U):
-                    p = p + mctx.mm(xs[u], ws[u][:, c0 : c0 + cw])
-                if first:
-                    acc[:, c0 : c0 + cw] = p
-                else:
-                    acc[:, c0 : c0 + cw] += p
+            if ws_pre is not None and isinstance(t, int) and t == 0 and U == n_t:
+                ws = [b if not isinstance(b, int) else self.dview(kind, b) for b in ws_pre]
+                xs = [xsrc[:, u * t_k : (u + 1) * t_k] for u in range(U)]
+            else:
+                ws, xs = [], []
+                if getattr(mctx, "DWAIT_HOIST", False):
+                    ws = self.dtake_group([(kind, g0 + t + u) for u in range(U)])
+                for u in range(U):
+                    if len(ws) <= u:
+                        ws.append(self.dtake(kind, g0 + t + u))
+                    k0 = (t + u) * t_k
+                    if not isinstance(k0, int):
+                        k0 = pl.multiple_of(k0, t_k)
+                    xs.append(xsrc[:, pl.ds(k0, t_k)])
+            for cols_, hk in groups:
+                vals = []
+                for c0, cw in cols_:
+                    cs = slice(c0, c0 + cw) if isinstance(c0, int) else pl.ds(c0, cw)
+                    p = mctx.mm(xs[0], ws[0][:, cs])
+                    for u in range(1, U):
+                        p = p + mctx.mm(xs[u], ws[u][:, cs])
+                    if hk is not None:
+                        vals.append(p)
+                    elif first:
+                        acc[:, cs] = p
+                    else:
+                        acc[:, cs] += p
+                if hk is not None:
+                    hk(vals)
             if not lazy:
                 for u in range(U):
                     self._give_tile(g0, t, u, tuple(i * U for i in range(1, n_s)), ctx)
@@ -252,14 +371,39 @@ class DenseWeightRing:
             lax.fori_loop(1, n_s, body_pair, 0)
         return acc[:, :N]
 
-    def dmatmul(self, kind: str, g0, xsrc, N: int, lazy: bool = False, ctx=None):
+    def dmatmul(
+        self,
+        kind: str,
+        g0,
+        xsrc,
+        N: int,
+        lazy: bool = False,
+        ctx=None,
+        ws_pre=None,
+        hook=None,
+        split=None,
+    ):
         """acc[:, :N] = xsrc[:, :K] @ W(kind), tiles g0 .. g0+nt-1 of the dense stream."""
         mctx = self.ctx
         n_t, t_k = mctx.nt[kind], mctx.tk[kind]
         acc = mctx.scr["acc"]
-        DMU = min(mctx.dmm_unroll, mctx.NBD)
+        DMU = (
+            min(mctx.dmm_unroll, mctx.NBD)
+            if mctx.B not in mctx.DMM_UNROLL_OFF_B
+            else 0
+        )
         if n_t <= DMU or mctx.tiles.dense_acc_pair:
-            return self.dmatmul_pair(kind, g0, xsrc, N, lazy=lazy, ctx=ctx)
+            return self.dmatmul_pair(
+                kind,
+                g0,
+                xsrc,
+                N,
+                lazy=lazy,
+                ctx=ctx,
+                ws_pre=ws_pre,
+                hook=hook,
+                split=split,
+            )
 
         acc[:, :N] = jnp.zeros((mctx.MB, N), F32)
 
@@ -298,7 +442,7 @@ class ExpertWeightRing:
     def ecopy(self, kind: str, src, bank):
         return pltpu.make_async_copy(src, self.eview(kind, bank), self.ctx.scr["esem"].at[bank])
 
-    def fetch_e(self, u, l, t=None):
+    def fetch_e(self, u, l, t=None, fixed: bool = False):
         """Issue unit u into bank u % NBE. t: u's tile index when known at trace time."""
         ctx = self.ctx
         c, scr, W = ctx.c, ctx.scr, ctx.W
@@ -308,7 +452,11 @@ class ExpertWeightRing:
             t = u % TE
         i = u // TE if t is None else (u - t) // TE
         if ECOPY:
-            w = scr["wlist"][i]
+            if getattr(ctx, "PRIM_NOW_K", False):
+                w_fix = scr["elist"][i] - me * ER
+                w = w_fix if fixed else jnp.where(i < scr["st"][5], w_fix, scr["wlist"][i])
+            else:
+                w = scr["wlist"][i]
         else:
             e = scr["elist"][i]
             w = e if c.moe_tp else e - me * ER
@@ -393,7 +541,11 @@ class ExpertWeightRing:
         n_l = lst.shape[0]
         ic = i if isinstance(i, int) else jnp.minimum(i, n_l - 1)
         if ECOPY:
-            w = lst[ic]
+            if getattr(ctx, "PRIM_NOW_K", False):
+                w_fix = scr["elist"][ic] - me * ER
+                w = jnp.where(ic < scr["st"][5], w_fix, scr["wlist"][ic])
+            else:
+                w = lst[ic]
         else:
             e = lst[ic]
             w = e if c.moe_tp else e - me * ER
@@ -477,6 +629,22 @@ class ExpertWeightRing:
             lax.fori_loop(0, nf, body, 0)
 
         bswitch(l, [lambda a=a, b=b: arm(a, b) for a, b in zip(W["e13"], W["e2"])])
+
+    def fetch_range(self, k0, k1, l, fixed: bool = False):
+        """Issue units k0 .. k1 - 1 into the ring."""
+        ctx = self.ctx
+        if ctx.c.stack_e:
+            for k in range(ctx.NBE):
+                @pl.when(jnp.logical_and(k >= k0, k < k1))
+                def _(k=k):
+                    self.fetch_e(k, l, fixed=fixed)
+        else:
+            lax.fori_loop(
+                k0,
+                k1,
+                lambda k, _: (self.fetch_e(k, l, fixed=fixed), 0)[1],
+                0,
+            )
 
     def es_wait(self, i):
         ctx = self.ctx

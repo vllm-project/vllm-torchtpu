@@ -106,15 +106,42 @@ class PagedAttentionBlock:
             for b in range(B):
                 pf = jnp.where(rows_ == b, pos_ref[b].astype(F32), pf)
             ang_ = pf * inv_
-            scr["rope"][0, :, :half_] = rnd(jnp.cos(ang_))
-            scr["rope"][1, :, :half_] = rnd(jnp.sin(ang_))
+            cos_t = rnd(jnp.cos(ang_))
+            sin_t = rnd(jnp.sin(ang_))
+            if ctx.ATT_QSWAP and c.ROT <= 128:
+                def dup_(v):
+                    parts = [v, v]
+                    if c.ROT < 128:
+                        parts.append(jnp.zeros((MR, 128 - c.ROT), F32))
+                    return jnp.concatenate(parts, axis=-1)
 
-    def attention(self, l, slot, g0):
+                scr["rope"][0] = dup_(cos_t)
+                scr["rope"][1] = dup_(sin_t)
+            else:
+                scr["rope"][0, :, :half_] = cos_t
+                scr["rope"][1, :, :half_] = sin_t
+
+    def attention(self, l, slot, g0, hook=None, ar0=None):
         ctx = self.ctx
         c, tiles, scr, ST, O = ctx.c, ctx.tiles, ctx.scr, ctx.ST, ctx.O
         pos_ref, raw_refs = ctx.pos_ref, ctx.raw_refs
-        sc, sm, mm, qrow, rms_zc = ctx.sc, ctx.sm, ctx.mm, ctx.qrow, ctx.rms_zc
-        dmatmul, flush_rel = self.rings.dmatmul, self.rings.flush_rel
+        sc, sm, mm, qrow, rms_zc, arp_r = (
+            ctx.sc,
+            ctx.sm,
+            ctx.mm,
+            ctx.qrow,
+            ctx.rms_zc,
+            ctx.arp_r,
+        )
+        dmatmul, dtake, dview, dbanks_wait, arp_mm, flush_rel, fetch_rel = (
+            self.rings.dmatmul,
+            self.rings.dtake,
+            self.rings.dview,
+            self.rings.dbanks_wait,
+            self.rings.arp_mm,
+            self.rings.flush_rel,
+            self.rings.fetch_rel,
+        )
         kv_dma = self.kv_dma
         AE, B, T, NS, G, H = ctx.AE, ctx.B, ctx.T, ctx.NS, ctx.G, ctx.H
         nh, HD, NHH, QR, TQ = ctx.nh, ctx.HD, ctx.NHH, ctx.QR, ctx.TQ
@@ -122,8 +149,8 @@ class PagedAttentionBlock:
         SR, QG, MLW, NBP, PB, PW = ctx.SR, ctx.QG, ctx.MLW, ctx.NBP, ctx.PB, ctx.PW
         BLK, SUB, NKV, NKVR, KVE = ctx.BLK, ctx.SUB, ctx.NKV, ctx.NKVR, ctx.KVE
         KV_ITEM, EBROWS, PAIR_KV = ctx.KV_ITEM, ctx.EBROWS, ctx.PAIR_KV
-        FUSED, LAZY_ATT = ctx.FUSED, ctx.LAZY_ATT
-        nt, skip, interpret, gi = ctx.nt, ctx.skip, ctx.interpret, ctx.gi
+        FUSED, LAZY_ATT, NBD = ctx.FUSED, ctx.LAZY_ATT, ctx.NBD
+        nt, tk, skip, interpret, gi = ctx.nt, ctx.tk, ctx.skip, ctx.interpret, ctx.gi
 
         a = l // AE
         ksem = scr["kv_sem"]
@@ -219,17 +246,83 @@ class PagedAttentionBlock:
             for i in range(NKV):
                 kv_start(jnp.int32(i))
 
+        n_ai, tk_ai = nt["att_in"], tk["att_in"]
+        koff_g = nh * 2 * HD
+        if n_ai <= min(ctx.dmm_unroll, NBD) and B not in ctx.DMM_UNROLL_OFF_B:
+            GA = n_ai
+        elif tiles.dense_acc_pair and n_ai % 2 == 0 and c.NAI > 512:
+            GA = 2
+        else:
+            GA = 0
+        GDEF = bool(
+            ctx.ATT_GDEFER
+            and QV
+            and GA >= 2
+            and HD % 128 == 0
+            and c.NAI == koff_g + 2 * HD
+            and "dense" not in skip
+        )
+        KVDEF = bool(GDEF and ctx.ATT_KVDEFER)
+
+        def a_x(u):
+            return scr["xb"][:, u * tk_ai : (u + 1) * tk_ai]
+
+        def a_sum(ws, c0_, cw_):
+            """att_in columns c0_ .. c0_ + cw_ in dmatmul's summation order."""
+            p_ = None
+            for u0 in range(0, n_ai, GA):
+                st_ = mm(a_x(u0), ws[u0][:, c0_ : c0_ + cw_])
+                for u in range(u0 + 1, u0 + GA):
+                    st_ = st_ + mm(a_x(u), ws[u][:, c0_ : c0_ + cw_])
+                p_ = st_ if p_ is None else p_ + st_
+            return p_
+
         with sc("att_in"):
-            y = dmatmul(
-                "att_in",
-                g0,
-                scr["xb"],
-                c.NAI,
-                lazy=LAZY_ATT,
-                ctx=(a, AE - 1, 0, None),
-            )
             ybuf = scr["ybuf"]
-            ybuf[:, :c.NAI] = rnd(y * sm(slot, "in_s", c.NAI))
+            if GDEF:
+                # q (per head) and k / v columns now; the gate columns after the q exchange
+                in_s_a = sm(slot, "in_s", c.NAI)
+                if hook is not None:
+                    # ARPIPE: q heads (and k / v unless KVDEF) own AR half first
+                    ai_banks = dbanks_wait("att_in", g0, n_ai)
+                    a_ws = [dview("att_in", b_) for b_ in ai_banks]
+                    a_cols = [(h * 2 * HD, HD) for h in range(nh)]
+                    if not KVDEF:
+                        a_cols.append((koff_g, 2 * HD))
+                    arp_mm("att_in", ai_banks, scr["xb"], a_cols, hook)
+                    for c0_, cw_ in a_cols:
+                        ybuf[:, c0_ : c0_ + cw_] = rnd(
+                            arp_r(scr["acc"][:, c0_ : c0_ + cw_])
+                            * in_s_a[:, c0_ : c0_ + cw_]
+                        )
+                else:
+                    if getattr(ctx, "ATT_WGROUP", False) and n_ai <= ctx.NBD:
+                        a_ws = self.rings.dtake_group(
+                            [("att_in", g0 + u) for u in range(n_ai)]
+                        )
+                    else:
+                        a_ws = [dtake("att_in", g0 + u) for u in range(n_ai)]
+                    for h in range(nh):
+                        c0_ = h * 2 * HD
+                        ybuf[:, c0_ : c0_ + HD] = rnd(
+                            a_sum(a_ws, c0_, HD) * in_s_a[:, c0_ : c0_ + HD]
+                        )
+                    if not KVDEF:  # KVDEF: k / v columns after the q exchange starts
+                        ybuf[:, koff_g : koff_g + 2 * HD] = rnd(
+                            a_sum(a_ws, koff_g, 2 * HD)
+                            * in_s_a[:, koff_g : koff_g + 2 * HD]
+                        )
+            else:
+                y = dmatmul(
+                    "att_in",
+                    g0,
+                    scr["xb"],
+                    c.NAI,
+                    lazy=LAZY_ATT,
+                    ctx=(a, AE - 1, 0, None),
+                    hook=hook,
+                )
+                ybuf[:, :c.NAI] = rnd(arp_r(y) * sm(slot, "in_s", c.NAI))
         qn = sm(slot, "qn")
         kn = sm(slot, "kn")
         half = c.ROT // 2
@@ -257,17 +350,54 @@ class PagedAttentionBlock:
                 # math per element is the per-row form's (same rnd points, row-wise rms)
                 cos = scr["rope"][0, :B, :half]
                 sin = scr["rope"][1, :B, :half]
+                QSW = bool(ctx.ATT_QSWAP and c.ROT <= 128 and HD % 128 == 0)
+                if QSW:
+                    # partner lane of lane i < ROT: i + half (x1 lanes) / i - half (x2 lanes).
+                    lane_ = lax.broadcasted_iota(I32, (B, 128), 1)
+                    partner_ = jnp.where(lane_ < half, lane_ + half, lane_ - half)
+                    from_a_ = pltpu.roll(lane_, half, 1) == partner_
+                    in_rot_ = lane_ < c.ROT
+
+                    def swap_(v):
+                        return jnp.where(
+                            from_a_,
+                            pltpu.roll(v, half, 1),
+                            pltpu.roll(v, 128 - half, 1),
+                        )
+
+                    cos_f = scr["rope"][0, :B, :]  # lanes half..ROT duplicate lanes 0..half-1
+                    sin_f = scr["rope"][1, :B, :]
+                    nsin_f = jnp.where(lane_ < half, -sin_f, sin_f)
+                    w1_ = 1.0 + qn
+                    w1s_ = swap_(jnp.broadcast_to(w1_[:, :128], (B, 128)))
                 for h in range(nh):
                     q0_ = h * 2 * HD
-                    qh = rms_zc(ybuf[:B, q0_:q0_ + HD], qn)
-                    qh = rnd(rope(qh, cos, sin) * HD ** -0.5)
+                    if QSW:
+                        # rms_zc / rope / scale of the per-row form, element for element
+                        x_ = ybuf[:B, q0_ : q0_ + HD]
+                        r_ = lax.rsqrt(
+                            jnp.mean(x_ * x_, axis=-1, keepdims=True) + c.eps
+                        )
+                        n_ = rnd(x_ * r_ * w1_)
+                        ns_ = rnd(swap_(x_[:, :128]) * r_ * w1s_)
+                        n0_ = n_[:, :128]
+                        ro_ = rnd(rnd(n0_ * cos_f) + rnd(ns_ * nsin_f))
+                        qparts = [rnd(jnp.where(in_rot_, ro_, n0_) * HD**-0.5)]
+                        for j in range(1, NHH):
+                            qparts.append(
+                                rnd(n_[:, j * 128 : (j + 1) * 128] * HD**-0.5)
+                            )
+                    else:
+                        qh = rms_zc(ybuf[:B, q0_ : q0_ + HD], qn)
+                        qh = rnd(rope(qh, cos, sin) * HD**-0.5)
+                        qparts = [qh[:, j * 128 : (j + 1) * 128] for j in range(NHH)]
                     for j in range(NHH):  # row b, head h -> flattened row b * SR + h (== qrow)
                         scr["qg"][
                             0 if GQ else gi,
                             jnp.int32(j),
                             pl.ds(h, B, stride=SR),
                             :,
-                        ] = qh[:, j * 128:(j + 1) * 128]
+                        ] = qparts[j]
                 if GQ:  # sequence s's (t, h) rows are flattened rows s * QG ..: one bf16 block
                     for sq in range(NS):
                         r0 = sq * QG
@@ -310,13 +440,21 @@ class PagedAttentionBlock:
                 kv_dma.kvrd_issue(a)
         with sc("att_kvnew"):
             if QV:  # k / v / gate pass on [B, HD] blocks
+                if KVDEF:
+                    # deferred att_in k / v columns: MXU work inside the q exchange round trip
+                    in_s_a = sm(slot, "in_s", c.NAI)
+                    ybuf[:, koff_g : koff_g + 2 * HD] = rnd(
+                        arp_r(a_sum(a_ws, koff_g, 2 * HD))
+                        * in_s_a[:, koff_g : koff_g + 2 * HD]
+                    )
                 cos = scr["rope"][0, :B, :half]
                 sin = scr["rope"][1, :B, :half]
-                for h in range(nh):
-                    q0_ = h * 2 * HD
-                    scr["gate"][:B, h * HD:(h + 1) * HD] = ybuf[
-                        :B, q0_ + HD:q0_ + 2 * HD
-                    ]
+                if not GDEF:  # GDEF: the gate columns are computed after this pass
+                    for h in range(nh):
+                        q0_ = h * 2 * HD
+                        scr["gate"][:B, h * HD : (h + 1) * HD] = ybuf[
+                            :B, q0_ + HD : q0_ + 2 * HD
+                        ]
                 k = rms_zc(ybuf[:B, koff:koff + HD], kn)
                 v = ybuf[:B, koff + HD:koff + 2 * HD]
                 k = rope(k, cos, sin)
@@ -361,6 +499,19 @@ class PagedAttentionBlock:
                 )
                 for d in kv_out:
                     d.start()
+        if GDEF:
+            # deferred att_in gate columns: MXU work inside the q exchange round trip
+            with sc("att_gate_mm"):
+                in_s_a = sm(slot, "in_s", c.NAI)
+                for h in range(nh):
+                    c0_ = h * 2 * HD + HD
+                    g_ = rnd(
+                        arp_r(a_sum(a_ws, c0_, HD)) * in_s_a[:, c0_ : c0_ + HD]
+                    )
+                    scr["gate"][:B, h * HD : (h + 1) * HD] = g_[:B]
+                if not LAZY_ATT:  # att_in slots held until here: refill them now
+                    for u in range(n_ai):
+                        fetch_rel(g0 + u + NBD, a, AE - 1, u + NBD)
         if SPLIT or VER:
             with sc("att_qgather"):
                 qgb = scr["qg"]
@@ -763,11 +914,12 @@ class PagedAttentionBlock:
                 H,
                 lazy=LAZY_ATT,
                 ctx=(a, AE - 1, nt["att_in"], None),
+                split=ar0,
             )
         if LAZY_ATT:
             with sc("refill"):
                 # g0 = tile 0 of block a's attention layer (lt = AE - 1): decode at trace time
                 flush_rel(g0, a, AE - 1, 0, nt["att_in"] + nt["att_out"])
-        return yo * sm(slot, "out_s")
+        return None if ar0 is not None else yo * sm(slot, "out_s")
 
     __call__ = attention

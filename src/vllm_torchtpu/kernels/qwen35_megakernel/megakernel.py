@@ -170,29 +170,57 @@ def build(
 
                 is_att = l % AE == AE - 1
                 g0 = (l // AE) * t_block + (l % AE) * t_gdn
-                scr["xb"][...] = rms_zc(scr["res"][...], sm(slot, "in_norm")).astype(
-                    BF16
-                )
+                if ctx.ARP:  # own half now (its residual was added by the previous MoE AR)
+                    allreduce_blk.arp_norm_half(slot, ctx.arp_c, True)
+                else:
+                    scr["xb"][...] = rms_zc(
+                        scr["res"][...], sm(slot, "in_norm")
+                    ).astype(BF16)
 
             first = l == 0
+            hook = None
+            if ctx.ARP:
+                def hook():  # inside the input projection, after the own-half K tiles
+                    allreduce_blk.arp_round2_add()  # layer 0: the primed zero round 2
+                    allreduce_blk.arp_norm_half(slot, 1 - ctx.arp_c, False)
 
             def att_branch():
+                if ctx.AR0S and ctx.comm:
+                    att_blk.attention(
+                        l, slot, g0, hook=hook, ar0=allreduce_blk.ar0_spec(slot, first)
+                    )
+                    allreduce_blk.ar0_finish(0, first)
+                    return
                 allreduce_blk.add_residual(
-                    allreduce_blk.allreduce(0, att_blk.attention(l, slot, g0), first)
+                    allreduce_blk.allreduce(
+                        0, att_blk.attention(l, slot, g0, hook=hook), first
+                    )
                 )
 
             def gdn_branch():
+                if ctx.AR0S and ctx.comm:
+                    gdn_blk.gdn(
+                        l, slot, g0, hook=hook, ar0=allreduce_blk.ar0_spec(slot, first)
+                    )
+                    allreduce_blk.ar0_finish(0, first)
+                    return
                 allreduce_blk.add_residual(
-                    allreduce_blk.allreduce(0, gdn_blk.gdn(l, slot, g0), first)
+                    allreduce_blk.allreduce(
+                        0, gdn_blk.gdn(l, slot, g0, hook=hook), first
+                    )
                 )
 
             if AE == 1:
                 att_branch()
             else:
                 lax.cond(is_att, att_branch, gdn_branch)
-            allreduce_blk.add_residual(
-                allreduce_blk.allreduce(1, moe_blk.moe(l, slot, g0, is_att), first)
-            )
+            y_moe, fill = moe_blk.moe(l, slot, g0, is_att, defer_flush=True)
+            if ctx.ARP:  # own half's residual added; round 2 waited inside the next layer's mixer
+                allreduce_blk.allreduce(1, y_moe, first, fill=fill, defer=True)
+            else:
+                allreduce_blk.add_residual(
+                    allreduce_blk.allreduce(1, y_moe, first, fill=fill)
+                )
             return carry
 
         # ------------------------------ step ------------------------------
@@ -248,8 +276,19 @@ def build(
         if PACK or QV:
             scr["qg"][...] = jnp.zeros(scr["qg"].shape, F32)
         att_blk.init_rope()
+        if ctx.ARP:
+            # ARPIPE prime: a zero round 2 of the MoE all-reduce, so layer 0's input projection
+            if ctx.HIER == 1:  # zero push half 1 from every chip, own entry included
+                scr["ag_send"][1] = jnp.zeros(scr["ag_send"].shape[1:], BF16)
+                scr["ag_recv"][1, me // 2] = jnp.zeros(scr["ag_recv"].shape[2:], BF16)
+            else:
+                scr["s2_send"][1] = jnp.zeros(scr["s2_send"].shape[1:], BF16)
+            for d in allreduce_blk.ar_copies(1, 2):
+                d.start()
         zero_seen.wait()
         lax.fori_loop(0, L, layer, 0)
+        if ctx.ARP:  # the last layer's MoE all-reduce round 2
+            allreduce_blk.arp_round2_add()
         allreduce_blk.wait_sends()
         if FUSED:
             if c.NGDN > 0:

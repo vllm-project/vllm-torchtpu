@@ -27,10 +27,10 @@ class GDNBlock:
         self.rings = rings
         self.gdn_dma = gdn_dma if gdn_dma is not None else GDNPoolDMA(ctx)
 
-    def gdn(self, l, slot, g0):
+    def gdn(self, l, slot, g0, hook=None, ar0=None):
         ctx = self.ctx
         c, scr, ST, O, raw_refs = ctx.c, ctx.scr, ctx.ST, ctx.O, ctx.raw_refs
-        sc, sm = ctx.sc, ctx.sm
+        sc, sm, arp_r = ctx.sc, ctx.sm, ctx.arp_r
         dmatmul, gctx = self.rings.dmatmul, self.rings.gctx
         gdn_dma = self.gdn_dma
         AE, FUSED, GPR, GCH, VER = ctx.AE, ctx.FUSED, ctx.GPR, ctx.GCH, ctx.VER
@@ -43,6 +43,342 @@ class GDNBlock:
         NRB, lay, nt, typed, skip = ctx.NRB, ctx.lay, ctx.nt, ctx.typed, ctx.skip
 
         o = l - (l + 1) // AE
+        if FUSED and ctx.LCV:
+            in_page = scr["gdn_in_page"]
+            out_page = scr["gdn_out_page"]
+            sb = scr["sbuf"]
+            dtake, dview, dbanks_wait, arp_mm, fetch_rel = (
+                self.rings.dtake,
+                self.rings.dview,
+                self.rings.dbanks_wait,
+                self.rings.arp_mm,
+                self.rings.fetch_rel,
+            )
+            mm, NBD = ctx.mm, ctx.NBD
+            LCV_NH, LCV_NH16 = ctx.LCV_NH, ctx.LCV_NH16
+            ZDEF = (
+                ctx.GDN_ZDEFER
+                and nt["lin_in"] <= min(ctx.dmm_unroll, ctx.NBD)
+                and ctx.B not in ctx.DMM_UNROLL_OFF_B
+                and QKV % 512 == 0
+                and Z % 512 == 0
+                and QKV + Z < c.NLI
+            )
+            n_li, tk_li = nt["lin_in"], ctx.tk["lin_in"]
+            z_items, z_part = [], {}
+
+            def z_x(u):
+                return scr["xb"][:, u * tk_li : (u + 1) * tk_li]
+
+            with sc("gdn_in"):
+                for s_ in range(NGI):
+                    gdn_dma.start_gdn_in(o, s_)
+                ybuf = scr["ybuf"]
+                if ZDEF:
+                    if hook is not None:
+                        li_banks = dbanks_wait("lin_in", g0, n_li)
+                        z_ws = [dview("lin_in", b_) for b_ in li_banks]
+                    else:
+                        z_ws = [dtake("lin_in", g0 + u) for u in range(n_li)]
+                    li_cols = []
+                    for c0_ in range(0, c.NLI, 512):
+                        cw_ = min(512, c.NLI - c0_)
+                        if QKV <= c0_ < QKV + Z:
+                            z_items.extend((c0_, u) for u in range(n_li))
+                            continue
+                        if hook is not None:
+                            li_cols.append((c0_, cw_))
+                            continue
+                        p_ = mm(z_x(0), z_ws[0][:, c0_ : c0_ + cw_])
+                        for u in range(1, n_li):
+                            p_ = p_ + mm(z_x(u), z_ws[u][:, c0_ : c0_ + cw_])
+                        scr["acc"][:, c0_ : c0_ + cw_] = p_
+                    if hook is not None:
+                        arp_mm("lin_in", li_banks, scr["xb"], li_cols, hook)
+                    in_s_ = sm(slot, "in_s", c.NLI)
+                    ybuf[:, 0:QKV] = rnd(
+                        arp_r(scr["acc"][:, 0:QKV]) * in_s_[:, 0:QKV]
+                    )
+                    ybuf[:, QKV + Z : c.NLI] = rnd(
+                        arp_r(scr["acc"][:, QKV + Z : c.NLI])
+                        * in_s_[:, QKV + Z : c.NLI]
+                    )
+                else:
+                    y = dmatmul(
+                        "lin_in", g0, scr["xb"], c.NLI, ctx=gctx(l, 0), hook=hook
+                    )
+                    ybuf[:, :c.NLI] = rnd(arp_r(y) * sm(slot, "in_s", c.NLI))
+
+            z_next = [0]
+
+            def z_work(i1):
+                for c0_, u in z_items[z_next[0] : i1]:
+                    pm = mm(z_x(u), z_ws[u][:, c0_ : c0_ + 512])
+                    z_part[c0_] = pm if u == 0 else z_part[c0_] + pm
+                    if u == n_li - 1:
+                        scr["acc"][:, c0_ : c0_ + 512] = z_part.pop(c0_)
+                z_next[0] = max(z_next[0], i1)
+
+            def z_slot(i):
+                if z_items:
+                    z_work((i + 1) * len(z_items) // (NS * T))
+
+            ow, _ = lay["conv"]
+            expand = vh // kh
+            conv_live = -(-(3 * qkv_128) // 16) * 16
+            assert conv_live == LCV_NH16, (conv_live, LCV_NH16)
+            tq = [
+                scr["sm"][slot, :, ow + t * QKV : ow + (t + 1) * QKV].reshape(qkv_128, 128)
+                for t in range(4)
+            ]
+            alog = sm(slot, "alog")[0, :vh]
+            dtb = sm(slot, "dtb")[0, :vh]
+            gnw = sm(slot, "gnorm")[0, :].astype(BF16)
+
+            def colsk(x):
+                return jnp.swapaxes(jnp.broadcast_to(x[:, None, :], (kh, VD, KD)), 1, 2)
+
+            assert 2 * kh <= vh, (kh, vh)
+            NCB = 2 if 4 * kh <= vh else 1
+            hrow = lax.broadcasted_iota(I32, (vh, VD), 0)
+            HR2 = KD // 2
+
+            for s in range(NS):
+                slot_i = s % NGI
+                slot_o = s % NGO
+                with sc("gdn_rec_wait"):
+                    act_in = gdn_dma.wait_gdn_in(slot_i)
+                cq = scr["gdn_cq"]
+                if typed:
+                    u32_in = pltpu.bitcast(
+                        in_page[slot_i, 0:REC_PAGES], U32
+                    ).reshape(SSM_U32_CAP, 128)[:ssm_u32_rows, :]
+                    u32_in = jnp.where(act_in, u32_in, jnp.uint32(0))
+                    s_bf16 = pltpu.bitcast(u32_in, BF16).reshape(vh, KD, VD)
+                    pg16 = pltpu.bitcast(in_page[slot_i, REC_PAGES], BF16).reshape(256, 128)[
+                        0:LCV_NH16, :
+                    ]
+                else:
+                    in_view = (
+                        in_page.at[slot_i, pl.ds(0, REC_PAGES)]
+                        .bitcast(U32)
+                        .reshape(SSM_U32_CAP, 128)
+                    )
+                    pg16 = (
+                        in_page.at[slot_i, REC_PAGES]
+                        .bitcast(BF16)
+                        .reshape(256, 128)[0:LCV_NH16, :]
+                    )
+                cq[0:LCV_NH16, :] = jnp.where(act_in, pg16.astype(F32), 0.0)
+                for j in range(qkv_128):
+                    cq[pl.ds(LCV_NH + j, T, stride=qkv_128), :] = ybuf[
+                        s * T : (s + 1) * T, j * 128 : (j + 1) * 128
+                    ]
+                refill_in = s + NGI < NS
+                if refill_in and typed:
+                    gdn_dma.start_gdn_in(o, s + NGI)
+                gdn_dma.wait_gdn_out(slot_o)
+                if "gdn" not in skip:
+                    with sc("gdn_rec"):
+                        _mxu_dr = c.B in ctx.MXU_DR_BUCKETS
+                        for t in range(T):
+                            b = s * T + t
+                            if ZDEF:
+                                z_slot(b)
+                            w_ = [
+                                cq[(t + i) * qkv_128 : (t + i + 1) * qkv_128, :]
+                                for i in range(4)
+                            ]
+                            u_t = rnd(
+                                jax.nn.silu(
+                                    w_[0] * tq[0]
+                                    + w_[1] * tq[1]
+                                    + w_[2] * tq[2]
+                                    + w_[3] * tq[3]
+                                )
+                            )
+                            q = u_t[0:kh, :]
+                            k = u_t[kh : 2 * kh, :]
+                            v = u_t[2 * kh : 2 * kh + vh, :]
+                            q = q * lax.rsqrt(jnp.sum(q * q, axis=-1, keepdims=True) + 1e-6)
+                            q = q * KD**-0.5
+                            k = k * lax.rsqrt(jnp.sum(k * k, axis=-1, keepdims=True) + 1e-6)
+                            cb = (t % NCB) * 2 * kh
+                            sb[cb : cb + kh] = colsk(k)
+                            if not _mxu_dr:
+                                sb[cb + kh : cb + 2 * kh] = colsk(q)
+                            beta = rnd(jax.nn.sigmoid(ybuf[b, BA : BA + vh]))
+                            a = ybuf[b, BA + 64 : BA + 64 + vh]
+                            g = -jnp.exp(alog) * jax.nn.softplus(a + dtb)
+                            eg = jnp.exp(g)[:, None, None]
+                            beta2 = beta[:, None]
+                            if not typed:
+                                ov = (
+                                    out_page.at[slot_o, pl.ds(t * GDN_PAGES, REC_PAGES)]
+                                    .bitcast(U32)
+                                    .reshape(SSM_U32_CAP, 128)
+                                )
+                                if t > 0:
+                                    pv = (
+                                        out_page.at[
+                                            slot_o,
+                                            pl.ds((t - 1) * GDN_PAGES, REC_PAGES),
+                                        ]
+                                        .bitcast(U32)
+                                        .reshape(SSM_U32_CAP, 128)
+                                    )
+                            if _mxu_dr:
+                                row8k = lax.broadcasted_iota(I32, (8, KD), 0)
+                                lhs_l, qk_l = [], []
+                                for kk in range(kh):
+                                    k_kk, q_kk = k[kk : kk + 1], q[kk : kk + 1]
+                                    qk_l.append(jnp.sum(q_kk * k_kk, axis=-1, keepdims=True))
+                                    x8 = jnp.where(
+                                        row8k == 0,
+                                        jnp.broadcast_to(k_kk, (8, KD)),
+                                        jnp.where(
+                                            row8k == 1,
+                                            jnp.broadcast_to(q_kk, (8, KD)),
+                                            0.0,
+                                        ),
+                                    )
+                                    hi = x8.astype(BF16).astype(F32)
+                                    r1_ = x8 - hi
+                                    mid = r1_.astype(BF16).astype(F32)
+                                    lo = r1_ - mid
+                                    lhs_l.append(
+                                        jnp.concatenate(
+                                            [hi, mid, lo, jnp.zeros((8, KD), F32)], axis=0
+                                        ).astype(BF16)
+                                    )
+                            out_acc = jnp.zeros((vh, VD), F32)
+                            new_heads = []
+                            for h in range(vh):
+                                j = h // expand
+                                if typed:
+                                    st_h = s_bf16[h : h + 1]
+                                elif t == 0:
+                                    u_h = jnp.where(
+                                        act_in,
+                                        in_view[h * HR2 : (h + 1) * HR2, :],
+                                        jnp.uint32(0),
+                                    )
+                                    st_h = pltpu.bitcast(u_h, BF16).reshape(1, KD, VD)
+                                else:
+                                    st_h = pltpu.bitcast(
+                                        pv[h * HR2 : (h + 1) * HR2, :], BF16
+                                    ).reshape(1, KD, VD)
+                                if _mxu_dr:
+                                    Sb = st_h.reshape(KD, VD)
+                                    d_ = eg[h : h + 1].reshape(1, 1)
+                                    r = jnp.dot(lhs_l[j], Sb, preferred_element_type=F32)
+                                    r8 = r[0:8] + r[8:16] + r[16:24]
+                                    pred_h = d_ * r8[0:1]
+                                    delta_h = (v[h : h + 1] - pred_h) * beta2[h : h + 1]
+                                    s_h = Sb.astype(F32) * d_ + sb[cb + j] * delta_h
+                                    out_h = d_ * r8[1:2] + qk_l[j] * delta_h
+                                else:
+                                    kc_h = sb[cb + j : cb + j + 1]
+                                    s_h = st_h.astype(F32) * eg[h : h + 1]
+                                    pred_h = jnp.sum(s_h * kc_h, axis=1)
+                                    delta_h = (v[h : h + 1] - pred_h) * beta2[h : h + 1]
+                                    s_h = s_h + kc_h * delta_h[:, None, :]
+                                    out_h = jnp.sum(
+                                        s_h * sb[cb + kh + j : cb + kh + j + 1], axis=1
+                                    )
+                                out_acc = jnp.where(hrow == h, out_h, out_acc)
+                                nb_h = s_h.reshape(1, KD, VD).astype(BF16)
+                                if typed:
+                                    new_heads.append(nb_h)
+                                else:
+                                    ov[h * HR2 : (h + 1) * HR2, :] = pltpu.bitcast(
+                                        nb_h.reshape(KD, VD), U32
+                                    )
+                            out = rnd(out_acc)
+                            if typed:
+                                s_bf16 = jnp.concatenate(new_heads, axis=0)
+                            val = out * lax.rsqrt(
+                                jnp.mean(out * out, axis=-1, keepdims=True) + c.eps
+                            )
+                            val = (gnw[None, :] * val.astype(BF16)).astype(F32)
+                            if ZDEF:
+                                scr["mix"][b, :Z] = val.reshape(Z)
+                            else:
+                                zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
+                                scr["mix"][b, :Z] = rnd(val * jax.nn.silu(zz)).reshape(Z)
+                            r1_ = (t + 1) * qkv_128
+                            conv_head = jnp.concatenate(
+                                [
+                                    cq[r1_ : r1_ + LCV_NH, :],
+                                    jnp.zeros((conv_live - LCV_NH, 128), F32),
+                                ],
+                                axis=0,
+                            ).astype(BF16)
+                            if typed:
+                                u32_out = pltpu.bitcast(s_bf16.reshape(vh * KD, VD), U32)
+                                u32_p = (
+                                    jnp.pad(
+                                        u32_out,
+                                        ((0, SSM_U32_CAP - ssm_u32_rows), (0, 0)),
+                                    )
+                                    if ssm_u32_rows < SSM_U32_CAP
+                                    else u32_out
+                                )
+                                out_page[
+                                    slot_o,
+                                    t * GDN_PAGES : t * GDN_PAGES + REC_PAGES,
+                                ] = pltpu.bitcast(
+                                    u32_p.reshape(REC_PAGES, 2, 64, 1, 128), FP8
+                                )
+                                conv_p = jnp.concatenate(
+                                    [
+                                        conv_head,
+                                        jnp.zeros((conv8_rows - conv_live, 128), BF16),
+                                    ],
+                                    axis=0,
+                                )
+                                if conv8_rows < 256:
+                                    conv_p = jnp.pad(
+                                        conv_p, ((0, 256 - conv8_rows), (0, 0))
+                                    )
+                                out_page[slot_o, t * GDN_PAGES + REC_PAGES] = pltpu.bitcast(
+                                    conv_p.reshape(2, 64, 2, 128), FP8
+                                )
+                            else:
+                                cv = (
+                                    out_page.at[slot_o, t * GDN_PAGES + REC_PAGES]
+                                    .bitcast(BF16)
+                                    .reshape(256, 128)
+                                )
+                                cv[0:conv_live, :] = conv_head
+                if refill_in and not typed:
+                    gdn_dma.start_gdn_in(o, s + NGI)
+                gdn_dma.start_gdn_out(o, s)
+
+            if ZDEF:
+                z_work(len(z_items))
+                blk_, lt_, _, lts_ = gctx(l, 0)
+                for u in range(n_li):
+                    fetch_rel(g0 + u + NBD, blk_, lt_, u + NBD, lts=lts_)
+                BL = NS * T
+                zz = rnd(
+                    arp_r(scr["acc"][0:BL, QKV : QKV + Z], slice(0, BL))
+                    * sm(slot, "in_s", c.NLI)[:, QKV : QKV + Z]
+                )
+                scr["mix"][0:BL, :Z] = rnd(scr["mix"][0:BL, :Z] * jax.nn.silu(zz))
+
+            with sc("gdn_out"):
+                scr["xb2"][:, :Z] = scr["mix"][:, :Z].astype(BF16)
+                yo = dmatmul(
+                    "lin_out",
+                    g0 + nt["lin_in"],
+                    scr["xb2"],
+                    H,
+                    ctx=gctx(l, nt["lin_in"]),
+                    split=ar0,
+                )
+                return None if ar0 is not None else yo * sm(slot, "out_s")
+
         if FUSED:
             in_page = scr["gdn_in_page"]
             out_page = scr["gdn_out_page"]
@@ -51,9 +387,9 @@ class GDNBlock:
             with sc("gdn_in"):
                 for s_ in range(NGI):
                     gdn_dma.start_gdn_in(o, s_)
-                y = dmatmul("lin_in", g0, scr["xb"], c.NLI, ctx=gctx(l, 0))
+                y = dmatmul("lin_in", g0, scr["xb"], c.NLI, ctx=gctx(l, 0), hook=hook)
                 ybuf = scr["ybuf"]
-                ybuf[:, :c.NLI] = rnd(y * sm(slot, "in_s", c.NLI))
+                ybuf[:, :c.NLI] = rnd(arp_r(y) * sm(slot, "in_s", c.NLI))
 
             ow, _ = lay["conv"]
             taps = [scr["sm"][slot, :, ow + t * QKV:ow + (t + 1) * QKV] for t in range(4)]
@@ -299,8 +635,9 @@ class GDNBlock:
                     scr["xb2"],
                     H,
                     ctx=gctx(l, nt["lin_in"]),
+                    split=ar0,
                 )
-                return yo * sm(slot, "out_s")
+                return None if ar0 is not None else yo * sm(slot, "out_s")
 
         convb, recb, sem = scr["convb"], scr["recb"], scr["st_sem"]
 
@@ -342,9 +679,9 @@ class GDNBlock:
                 else:
                     for d in rec_in():
                         d.start()
-            y = dmatmul("lin_in", g0, scr["xb"], c.NLI, ctx=gctx(l, 0))
+            y = dmatmul("lin_in", g0, scr["xb"], c.NLI, ctx=gctx(l, 0), hook=hook)
             ybuf = scr["ybuf"]
-            ybuf[:, :c.NLI] = rnd(y * sm(slot, "in_s", c.NLI))
+            ybuf[:, :c.NLI] = rnd(arp_r(y) * sm(slot, "in_s", c.NLI))
         with sc("gdn_conv"):
             if GPR:
                 sub_ = lax.rem(o, ctx.G_PER_ATT)
@@ -430,8 +767,9 @@ class GDNBlock:
                 scr["xb2"],
                 H,
                 ctx=gctx(l, nt["lin_in"]),
+                split=ar0,
             )
-            return yo * sm(slot, "out_s")
+            return None if ar0 is not None else yo * sm(slot, "out_s")
 
     __call__ = gdn
 
