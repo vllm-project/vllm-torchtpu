@@ -2,6 +2,38 @@
 # This Dockerfile builds images for running vLLM on Google Cloud TPUs.
 # It pre-installs all dependencies from pyproject.toml (including torch-tpu) in the base variant.
 
+# vLLM's Rust frontend (`vllm-rs`), built from the pinned vLLM commit. The
+# pip install of vLLM skips its Rust build when cargo is absent, so a stage
+# of its own builds the binary and keeps the toolchain out of the images.
+# Opt-in at serve time with VLLM_USE_RUST_FRONTEND=1.
+FROM python:3.12-slim-bookworm AS rust-build
+
+# perl (not slim's perl-base) for the vendored OpenSSL build.
+RUN apt-get update && apt-get install -y curl git build-essential perl && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain none
+
+# Only the Rust sources at VLLM_COMMIT_HASH; the toolchain is the one vLLM pins.
+ARG VLLM_COMMIT_HASH
+WORKDIR /build/vllm
+RUN test -n "${VLLM_COMMIT_HASH}" || { echo "VLLM_COMMIT_HASH is required to build vllm-rs" >&2; exit 1; } && \
+    git clone --quiet --filter=blob:none --no-checkout https://github.com/vllm-project/vllm.git . && \
+    git sparse-checkout set rust && \
+    git checkout --quiet "${VLLM_COMMIT_HASH}" && \
+    rustup toolchain install --profile minimal "$(sed -n 's/^channel *= *"\(.*\)"/\1/p' rust-toolchain.toml)"
+
+# Same cargo invocation as vLLM's setuptools-rust build. The soft open-file
+# limit of a BuildKit RUN step (1024) is too low for one rustc per core.
+RUN --mount=type=cache,target=/opt/cargo/registry \
+    --mount=type=cache,target=/opt/cargo/git \
+    ulimit -n "$(ulimit -Hn)" && \
+    version="$(git describe --tags --exact-match 2>/dev/null || git rev-parse --short HEAD)" && \
+    VLLM_RS_BUILD_VERSION="${version#v}" CARGO_TARGET_DIR=/build/target \
+    cargo build --release --locked --manifest-path rust/src/cmd/Cargo.toml --bin vllm-rs --features native-tls-vendored && \
+    install -m 0755 /build/target/release/vllm-rs /usr/local/bin/vllm-rs && \
+    vllm-rs --version
+
 # Variant 1: The Runtime (Base Image with pre-installed dependencies)
 # This variant provides the core runtime environment with all external dependencies
 # (including torch-tpu) pre-installed.
@@ -58,6 +90,10 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       --extra-index-url https://pypi.org/simple \
       --index-strategy unsafe-best-match \
       -r pyproject.toml
+
+# The Rust frontend; used only when VLLM_USE_RUST_FRONTEND=1.
+COPY --from=rust-build /usr/local/bin/vllm-rs /usr/local/bin/vllm-rs
+ENV VLLM_RUST_FRONTEND_PATH=/usr/local/bin/vllm-rs
 
 
 # Variant 2: The CI Environment (CI/CD Variant)
