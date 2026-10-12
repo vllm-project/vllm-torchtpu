@@ -189,6 +189,48 @@ ix_dump_server_log_context() {
 IX_DEFAULT_REF="8ba71d026e866e7792074a3fd3f896fe6d1ad099"
 IX_URL=https://github.com/SemiAnalysisAI/InferenceX
 
+# ix_export_topology <tp> <dp> <ep> <disagg 0|1>: the deployment's shape in the
+# names InferenceX reads for a multi-node row and its evals
+# (infx/results/agentic/__init__.py _gpu_shape; benchmark_lib.sh
+# bridge_disagg_eval_metadata): per role, TP, EP, DP attention and the worker
+# count. vLLM's DP is InferenceX's workers with dp-attn, as its H200 entry for
+# this shape encodes it (configs/nvidia-master.yaml,
+# kimik3-fp4-h200-vllm-agentic-balanced: tp 8, ep 32, dp-attn true,
+# num-worker 4). A disaggregated pair states both roles with the one shape both
+# serve; an aggregate server is the prefill role with no decode workers, which
+# is how _gpu_shape reads an aggregate multi-node worker. The caller exports
+# this once, before either client, so the row and its evals carry one identity;
+# the clients refuse to run without it (ix_require_topology).
+#
+# InferenceX's num_gpus from these is ranks (workers x TP), not the chips a v7x
+# pod holds; tokens per dollar divides by --chips instead (sweep_summary.py).
+ix_export_topology() {
+    local tp="$1" dp="$2" ep="$3" disagg="$4" dp_attn=false
+    [ "$dp" -le 1 ] || dp_attn=true
+    export IS_MULTINODE=true
+    export PREFILL_TP="$tp" PREFILL_EP="$ep" PREFILL_DP_ATTN="$dp_attn" PREFILL_NUM_WORKERS="$dp"
+    export PREFILL_PP_SIZE=1 PREFILL_DCP_SIZE=1 PREFILL_PCP_SIZE=1
+    export DECODE_PP_SIZE=1 DECODE_DCP_SIZE=1 DECODE_PCP_SIZE=1
+    if [ "$disagg" = 1 ]; then
+        export DISAGG=true
+        export DECODE_TP="$tp" DECODE_EP="$ep" DECODE_DP_ATTN="$dp_attn" DECODE_NUM_WORKERS="$dp"
+    else
+        export DISAGG=false
+        export DECODE_TP=0 DECODE_EP=0 DECODE_DP_ATTN=false DECODE_NUM_WORKERS=0
+    fi
+}
+
+# ix_require_topology: fails unless ix_export_topology ran in this environment.
+ix_require_topology() {
+    local v
+    for v in IS_MULTINODE DISAGG PREFILL_TP PREFILL_EP PREFILL_DP_ATTN PREFILL_NUM_WORKERS              DECODE_TP DECODE_EP DECODE_DP_ATTN DECODE_NUM_WORKERS; do
+        [ -n "${!v:-}" ] || {
+            log "FATAL: $v is unset; the caller states the deployment's shape with"                 "ix_export_topology before running a client (sweep_lib.sh)"
+            return 2
+        }
+    done
+}
+
 # ix_layout_root <dir>: the directory inside the checkout that holds
 # benchmarks/, utils/ and the evals, or nothing when the checkout is unusable.
 # InferenceX moved that tree down into inferencex-e2e/ (the root now also holds

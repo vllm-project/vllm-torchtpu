@@ -364,13 +364,11 @@ export KV_OFFLOADING=none
 unset KV_OFFLOAD_BACKEND
 export DURATION MODEL
 export MODEL_PREFIX="$MODEL_PREFIX_ARG"
-# Not our parallelism: these feed InferenceX's own num_gpus, which it divides
-# total throughput by, so they carry the chip count. They only take effect when
-# IS_MULTINODE=false; we set it true (below), and that branch reads PREFILL_TP
-# and DECODE_TP instead, leaving its num_gpus 0 and its per_gpu empty. Our
-# tokens-per-dollar column does not use any of it: sweep_summary.py divides by
-# what --chips cost.
-export TP="$CHIPS" EP_SIZE="$CHIPS" PP_SIZE=1 DCP_SIZE=1 PCP_SIZE=1
+# The deployment's shape - per role TP, EP, DP attention, workers - is the
+# caller's to state (ix_export_topology), the same way for the row and its
+# evals: InferenceX matches the two by it. --chips is not derived from it and
+# does not feed it; it is what tokens per dollar divides by.
+ix_require_topology || exit 2
 # PRECISION is a label in the aggregate, not something the client measures: it
 # is how InferenceX files the row, so it has to match what the published rows
 # for this model use.
@@ -398,9 +396,8 @@ fi
 # beside IS_MULTINODE (benchmark_lib.sh:3402).
 export ENABLE_AGENTX_POWER=0
 export REQUIRE_POWER="${REQUIRE_POWER:-false}"
-# Recipe-owned, so runtime_settings.sh omits it. True: each role spans four
-# hosts. The string, not 0/1.
-export IS_MULTINODE="${IS_MULTINODE:-true}"
+# Recipe-owned, so runtime_settings.sh omits it; ix_export_topology set it.
+export IS_MULTINODE
 export AIPERF_EXPERIMENTAL_FAST="$FAST"
 # Over their 1800: one ~70k-token turn can take >30 min on a prefill-bound
 # engine. Unconditional, since runtime_settings.sh has just set it, and before

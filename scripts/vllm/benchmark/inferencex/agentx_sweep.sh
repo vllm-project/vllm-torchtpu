@@ -88,9 +88,9 @@ AGENTX_REFERENCE_ROW=$(
 _cfg_values=$(
     # shellcheck source=/dev/null
     source "$CONFIG_FILE" >/dev/null || exit 3
-    echo "${MAX_NUM_SEQS:-0} ${AGENTX_SPEC_METHOD:-none} ${AGENTX_MODEL_PREFIX:-} ${AGENTX_PRECISION:-} ${AGENTX_CONC_LIST:-}"
+    echo "${MAX_NUM_SEQS:-0} ${AGENTX_SPEC_METHOD:-none} ${AGENTX_MODEL_PREFIX:-} ${AGENTX_PRECISION:-} ${TENSOR_PARALLELISM:-1} ${DATA_PARALLELISM:-1} ${ENABLE_EP:-false} ${AGENTX_CONC_LIST:-}"
 ) || { log "FATAL: $CONFIG_NAME failed to load; the boot would fail the same way"; exit 2; }
-read -r CONFIG_MAX_NUM_SEQS SPEC_METHOD MODEL_PREFIX PRECISION CONFIG_CONC_LIST <<< "$_cfg_values"
+read -r CONFIG_MAX_NUM_SEQS SPEC_METHOD MODEL_PREFIX PRECISION CONFIG_TP CONFIG_DP CONFIG_ENABLE_EP CONFIG_CONC_LIST <<< "$_cfg_values"
 for _req in MODEL_PREFIX PRECISION; do
     if [ -z "${!_req}" ]; then
         log "FATAL: $CONFIG_NAME declares no AGENTX_${_req}; it is what InferenceX files the row under"
@@ -189,6 +189,12 @@ if [ "$RANKS" -gt 0 ] && [ "$RANKS" -ne $(( CHIPS * 2 )) ]; then
     log "WARNING: $RANKS ranks on $CHIPS chips is not the two-per-chip v7x shape;" \
         "check K3_AGENTX_CHIPS is the chip count and not the rank count"
 fi
+
+# The shape InferenceX files the row under, from the config the server booted:
+# one aggregate worker set, vLLM's EP spanning TP x DP when the config enables
+# it (run_benchmarks.sh --enable-expert-parallel).
+EP=1; [ "$CONFIG_ENABLE_EP" != true ] || EP=$(( CONFIG_TP * CONFIG_DP ))
+ix_export_topology "$CONFIG_TP" "$CONFIG_DP" "$EP" 0
 
 # The config name is the label: it is the one file that defines this server, so
 # it identifies the row better than a string of knobs reassembled here.

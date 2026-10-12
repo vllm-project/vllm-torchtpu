@@ -177,15 +177,15 @@ export INFMAX_CONTAINER_WORKSPACE="$IX_ROOT"
 source "$IX_ROOT/benchmarks/benchmark_lib.sh"
 
 # What run_eval, _write_lm_eval_meta_json and validate_scores read, with the
-# names multi_node/srt_eval.sh and llm-d/server.sh hand them. The parallelism
-# fields are the ones agentx_client.sh exports for the replay: InferenceX
-# divides by them, and the row and its evals must agree on them.
+# names multi_node/srt_eval.sh and llm-d/server.sh hand them. The deployment's
+# shape (PREFILL_*, DECODE_*) comes from the caller, the same export the replay
+# ran under, so InferenceX matches this eval to its row; meta_env.json's tp and
+# ep are bridged from it (bridge_disagg_eval_metadata).
+ix_require_topology || exit 2
 export MODEL MODEL_NAME="$MODEL"
-export EVAL_ONLY=true IS_AGENTIC=1 IS_MULTINODE=true
+export EVAL_ONLY=true IS_AGENTIC=1 IS_MULTINODE
 export EVAL_CONCURRENT_REQUESTS="$EVAL_CONC" CONC="$EVAL_CONC"
 export EVAL_MAX_MODEL_LEN="$CTX"
-export TP="$CHIPS" EP_SIZE="$CHIPS" PP_SIZE=1 DCP_SIZE=1 PCP_SIZE=1
-export PREFILL_TP="$CHIPS" PREFILL_EP="$CHIPS" PREFILL_DP_ATTN=false DECODE_DP_ATTN=false
 export MODEL_PREFIX="$MODEL_PREFIX_ARG" PRECISION="$PRECISION_ARG" FRAMEWORK=vllm
 export RUNNER_TYPE SPEC_DECODING="$SPEC_METHOD"
 export IMAGE="${BUILDKITE_COMMIT:-local}"

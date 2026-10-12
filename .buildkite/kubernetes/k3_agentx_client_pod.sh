@@ -60,6 +60,9 @@ PROXY_PORT=8100
 PREFILL_HOST="${WORKLOAD_NAME}-prefill-0-0.${WORKLOAD_NAME}"
 DECODE_HOST="${WORKLOAD_NAME}-decode-0-0.${WORKLOAD_NAME}"
 
+# For ix_export_topology; the pod keeps its own log tag.
+# shellcheck source=scripts/vllm/benchmark/inferencex/sweep_lib.sh
+source "$IX_DIR/sweep_lib.sh"
 log() { echo "[k3-agentx-client-pod] $*"; }
 
 cd "$REPO_DIR" || { log "FATAL: no repo at $REPO_DIR"; exit 1; }
@@ -85,9 +88,9 @@ _cfg=$(
     # shellcheck source=/dev/null
     source "$CONFIG_FILE" >/dev/null || exit 3
     _post=$(printf '%s' "${AGENTX_POST_EVAL_SUITES:-}" | tr -s ' ' ',')
-    echo "${MAX_NUM_SEQS:-0} ${TENSOR_PARALLELISM:-0} ${DATA_PARALLELISM:-0} ${AGENTX_MODEL_PREFIX:-} ${AGENTX_PRECISION:-} ${_post:--} ${AGENTX_CONC_LIST:-}"
+    echo "${MAX_NUM_SEQS:-0} ${TENSOR_PARALLELISM:-0} ${DATA_PARALLELISM:-0} ${ENABLE_EP:-false} ${AGENTX_MODEL_PREFIX:-} ${AGENTX_PRECISION:-} ${_post:--} ${AGENTX_CONC_LIST:-}"
 ) || { log "FATAL: $CONFIG failed to load; the engines would have failed the same way"; exit 2; }
-read -r CFG_MAX_NUM_SEQS CFG_TP CFG_DP CFG_MODEL_PREFIX CFG_PRECISION CFG_POST_EVAL_SUITES CFG_CONC_LIST <<< "$_cfg"
+read -r CFG_MAX_NUM_SEQS CFG_TP CFG_DP CFG_ENABLE_EP CFG_MODEL_PREFIX CFG_PRECISION CFG_POST_EVAL_SUITES CFG_CONC_LIST <<< "$_cfg"
 for _req in CFG_MODEL_PREFIX CFG_PRECISION; do
     [ -n "${!_req}" ] || { log "FATAL: $CONFIG declares no AGENTX_${_req#CFG_}"; exit 2; }
 done
@@ -118,6 +121,11 @@ if [ "$RANKS" -ne $(( CHIPS * 2 )) ]; then
     log "WARNING: the pair runs $RANKS ranks on $CHIPS chips, which is not the" \
         "two-per-chip v7x shape; check AGENTX_CHIPS is chips and not ranks"
 fi
+# The shape InferenceX files the row and its evals under, stated once here for
+# both clients: each role TP x DP with EP across both when the config enables
+# it, disaggregated. Not the chip count, which is --chips.
+EP=1; [ "$CFG_ENABLE_EP" != true ] || EP=$(( CFG_TP * CFG_DP ))
+ix_export_topology "$CFG_TP" "$CFG_DP" "$EP" 1
 
 POST_EVAL_SUITES="$CFG_POST_EVAL_SUITES"
 [ "${AGENTX_SKIP_POST_EVAL:-0}" != 1 ] || POST_EVAL_SUITES="-"
