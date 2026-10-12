@@ -173,6 +173,13 @@ class _MockWanSelfAttention(torch.nn.Module):
         return "native"
 
 
+class _MockWanTransformer3DModel(torch.nn.Module):
+    """vLLM-Omni's Wan transformer; echoes the call it receives."""
+
+    def forward(self, *args, **kwargs):
+        return args, kwargs
+
+
 vllm_omni_mock = MagicMock()
 vllm_omni_mock.platforms.interface.OmniPlatform = _MockOmniPlatform
 vllm_omni_mock.platforms.interface.OmniPlatformEnum = _MockOmniPlatformEnum
@@ -191,6 +198,7 @@ vllm_omni_mock.diffusion.layers.norm.RMSNorm = _MockRMSNorm
 _wan2_2 = vllm_omni_mock.diffusion.models.wan2_2
 _wan2_2.wan2_2_transformer.ColumnParallelGELU = _MockColumnParallelGELU
 _wan2_2.wan2_2_transformer.WanSelfAttention = _MockWanSelfAttention
+_wan2_2.wan2_2_transformer.WanTransformer3DModel = _MockWanTransformer3DModel
 
 sys.modules["vllm_omni"] = vllm_omni_mock
 sys.modules["vllm_omni.platforms"] = vllm_omni_mock.platforms

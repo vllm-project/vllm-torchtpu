@@ -238,6 +238,34 @@ def test_wan_ffn_gelu_fence(monkeypatch):
     torch.testing.assert_close(fenced[0], want, rtol=0, atol=0)
 
 
+def test_wan_timestep_fresh_buffer(monkeypatch):
+    # The Wan transformer gets a materialized copy of the timestep instead of
+    # the schedule view, whether passed by keyword or positionally.
+    from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
+        WanTransformer3DModel,
+    )
+
+    apply_omni_model_specific_patches()
+    model = WanTransformer3DModel()
+    synced = []
+    monkeypatch.setattr(
+        "vllm_torchtpu.utils.synchronize_tensors",
+        lambda t, wait=True: synced.append((t, wait)),
+    )
+    view = torch.arange(6.0)[3].expand(2)
+    args, kwargs = model(hidden_states="x", timestep=view, return_dict=False)
+    assert args == () and kwargs["hidden_states"] == "x"
+    assert kwargs["return_dict"] is False
+    fresh = kwargs["timestep"]
+    assert fresh._base is None and fresh.data_ptr() != view.data_ptr()
+    torch.testing.assert_close(fresh, view)
+    args, kwargs = model("x", view, "ctx")
+    assert args[0] == "x" and args[2] == "ctx" and kwargs == {}
+    torch.testing.assert_close(args[1], view)
+    assert [w for _, w in synced] == [False, False]
+    assert synced[0][0] is fresh and synced[1][0] is args[1]
+
+
 def test_device_control_env_var():
     assert OmniTpuPlatform.device_control_env_var == "TPU_VISIBLE_CHIPS"
 
