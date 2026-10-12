@@ -4,27 +4,13 @@
 
 ---
 
-## Nightly CI Model Support Matrix
-
-The tables below are generated directly from the repository's nightly CI support matrices (`support_matrices/nightly/`).
-
-=== "TPU v7x (Ironwood)"
-
-    {{ read_csv('support_matrices/nightly/v7x/model_support_matrix.csv') }}
-
-=== "TPU v6e (Trillium)"
-
-    {{ read_csv('support_matrices/nightly/v6e/model_support_matrix.csv') }}
-
----
-
 ## Validated Model Families & Architectures
 
-In addition to the nightly matrix above, the following model families have first-class kernel, quantization, and parallelism support tested in CI and benchmarking suites. Checkpoints listed in `code` are the ones referenced by the repository's benchmark, integration, test, or recipe configurations (`scripts/vllm/benchmarking/configs/`, `scripts/vllm/integration/`, `tests/`, `tests_omni/`, `docs/deployment/`); other members of a family share the same model code and kernels.
+The following model families have first-class kernel, quantization, and parallelism support tested in CI and benchmarking suites. Checkpoints listed in `code` are the ones referenced by the repository's benchmark, integration, test, or recipe configurations (`scripts/vllm/benchmarking/configs/`, `scripts/vllm/integration/`, `tests/`, `tests_omni/`, `docs/deployment/`); other members of a family share the same model code and kernels.
 
 | Category | Model Family / Checkpoints | Key TPU Optimizations |
 | :--- | :--- | :--- |
-| **Frontier MoE & Hybrid Linear Attention** | **Qwen3.5** (`Qwen/Qwen3.5-397B-A17B`, `Qwen/Qwen3.5-397B-A17B-FP8`, `Qwen/Qwen3.5-35B-A3B-FP8`), **Kimi-Linear-48B** | Gated DeltaNet (GDN) / Kimi Delta Attention (KDA) linear attention + Ragged Paged Attention, unified hybrid KV block pool with prefix caching and host KV offload, SparseCore/GMM Fused MoE, FP8 / W4A8 / MXFP4, TP / DP / EP + PCP / DCP, EAGLE-3 / MTP / DFlash speculative decoding, Raiden P/D disaggregation |
+| **Frontier MoE & Hybrid Linear Attention** | **Qwen3.5** (`Qwen/Qwen3.5-397B-A17B-FP8`, `Qwen/Qwen3.5-35B-A3B-FP8`), **Kimi-Linear-48B** | Gated DeltaNet (GDN) / Kimi Delta Attention (KDA) linear attention + Ragged Paged Attention, unified hybrid KV block pool with prefix caching and host KV offload, SparseCore/GMM Fused MoE, FP8 / W4A8 / MXFP4, TP / DP / EP + PCP / DCP, EAGLE-3 / MTP / DFlash speculative decoding, Raiden P/D disaggregation |
 | **Coding & Dense/MoE LLMs** | **Qwen3 / Qwen3-Coder** (`Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8`, `nvidia/Qwen3-Coder-480B-A35B-Instruct-NVFP4`, `Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8`, `nvidia/Qwen3-30B-A3B-NVFP4`, `Qwen/Qwen3-32B`, `Qwen/Qwen3-8B`, `Qwen/Qwen3-0.6B`) | Fused EP MoE kernels, FP8 static/block and NVFP4 quantization, EAGLE-3 & DFlash speculative decoding, structured outputs (`xgrammar`), prefill context parallelism (PCP) |
 | **Multi-head Latent Attention (MLA)** | **DeepSeek-V2 / V3 / R1 / V4** (`deepseek-ai/DeepSeek-R1`, `deepseek-ai/DeepSeek-V4-Pro-0813`, `deepseek-ai/DeepSeek-V4-Flash`, `deepseek-ai/DeepSeek-V2`), **Kimi-K2.5 / K2.6 / K3** (`moonshotai/Kimi-K3`, `moonshotai/Kimi-K2.6`), **GLM-5 / GLM-5.1 / GLM-5.2** (`zai-org/GLM-5.2-FP8`, `nvidia/GLM-5.2-NVFP4`), **Mistral-Large-3** | Pallas MLA v1/v2 & Sparse MLA kernels with SparseCore top-k selection and `sparsecore` / `tc` KV cache layouts, intra-chip latent projection TP, DCP + EP + TP sharding, `deepseek_v4_fp8` W4A8 MoE / MXFP4 / NVFP4 / W4A16, DSpark & DFlash speculative decoding, host KV offload and P/D disaggregation (DeepSeek-V4 and Kimi-K3 integration tests) |
 | **Open-Weight Dense & MoE** | **Llama 3 / 3.1 / 3.2 / 3.3 / 4** (`meta-llama/Llama-3.1-8B-Instruct`, `meta-llama/Llama-3.2-1B-Instruct`), **GPT-OSS** (`openai/gpt-oss-120b`, `openai/gpt-oss-20b`), **Gemma 2 / 3 / 4** (`google/gemma-4-31B-it`, `RedHatAI/gemma-4-31B-it-FP8-Dynamic`, `RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic`), **Mixtral** | Ragged Paged Attention v3 (incl. sliding-window / hybrid attention masks), MXFP4 / FP8 / `compressed-tensors` W8A8 quantized matmul, Tensor, Data, Expert & Pipeline Parallelism |
