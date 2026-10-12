@@ -16,7 +16,7 @@ Commands (Kimi-K3; see each module's docstring):
     profile decode|prefill ...  the bench's cases with an xprof trace (--trace) and,
                                 with --llo DIR, the compiled LLO of every op (fresh
                                 compile caches, so nothing is skipped)
-    preshard k3|dspark --output DIR   the checkpoints in the kernels' per-rank layout
+    preshard k3|prefill|dspark --output DIR   kernel-layout checkpoints and projections
     preshard verify             a rebuilt sample of one rank against an existing
                                 pre-shard
 

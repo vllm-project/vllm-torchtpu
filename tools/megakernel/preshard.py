@@ -2,6 +2,7 @@
 """Write the checkpoints in the kernels' per-rank layout (``preshard``).
 
     preshard k3 --output DIR [--checkpoint DIR] [--ranks 0,1,..] [--in-flight 4]
+    preshard prefill --output DIR --checkpoint DIR
     preshard dspark --output DIR [--draft DIR] [--max-position 16384]
     preshard verify [--against DIR] [--rank R] [--layers 1,46,92]
 
@@ -16,6 +17,12 @@ program loads (``kernels.rank_loader`` streams them onto the TPU):
     DIR/rank00/expert_gu_{0..3}.bin packed MXFP4 gate/up, by layer range
     DIR/rank00/expert_gus.bin       gate/up E8M0 scales
     DIR/rank00/expert_down_{0,1}.bin, expert_ds.bin
+
+``prefill`` writes ``DIR/prefill-sp-cache/layout.json`` and six BF16 family
+files for layers 1..92. Latent projections are replicated; shared-expert
+channels are grouped by rank parity. It runs on the allocation's first host
+without using a TPU, keeping only one layer in memory, and refuses to
+overwrite an existing cache directory.
 
 From the login node it runs on the allocation as one process per host (each
 converts the eight ranks whose devices it owns; no TPU is used). ``dspark``
@@ -62,6 +69,9 @@ def add_arguments(parser) -> None:
     model.add_argument(
         "--in-flight", type=int, default=4, help="ranks converted concurrently per host"
     )
+    prefill = sub.add_parser("prefill", help="the Kimi-K3 prefill projection cache")
+    prefill.add_argument("--checkpoint", required=True, help="the Kimi-K3 checkpoint")
+    prefill.add_argument("--output", required=True)
     draft = sub.add_parser("dspark", help="the DSpark speculator")
     draft.add_argument(
         "--draft", required=True, help="the DSpark speculator checkpoint"
@@ -88,7 +98,7 @@ def add_arguments(parser) -> None:
 
 
 def runs_on_allocation(args) -> bool:
-    return args.target == "k3"
+    return args.target in ("k3", "prefill")
 
 
 def _modules():
@@ -264,6 +274,89 @@ def write_k3(args, log) -> None:
     log(f"ranks {ranks} converted in {time.perf_counter() - started:.0f} s")
 
 
+def prefill_projection_values(load, checkpoint, layer: int) -> dict[str, np.ndarray]:
+    stem = f"{load.PREFIX}layers.{layer}.block_sparse_moe."
+    values = {
+        "latent_down": np.ascontiguousarray(
+            np.pad(
+                checkpoint.read(stem + "routed_expert_down_proj.weight").T,
+                ((0, 0), (0, 512)),
+            )
+        ),
+        "latent_up": np.ascontiguousarray(
+            checkpoint.read(stem + "routed_expert_up_proj.weight").T
+        ),
+    }
+    shared = {
+        name: checkpoint.read(stem + f"shared_experts.{name}_proj.weight")
+        for name in ("gate", "up", "down")
+    }
+    for parity in (0, 1):
+        channels = np.concatenate(
+            [np.arange(rank * 192, (rank + 1) * 192) for rank in range(parity, 32, 2)]
+        )
+        values[f"shared_gu_{parity}"] = np.ascontiguousarray(
+            np.concatenate(
+                (shared["gate"][channels].T, shared["up"][channels].T), axis=1
+            )
+        )
+        values[f"shared_down_{parity}"] = np.ascontiguousarray(
+            shared["down"][:, channels].T
+        )
+    return values
+
+
+def write_prefill(args, log) -> None:
+    load, _ = _modules()
+    checkpoint = load.Checkpoint(args.checkpoint)
+    output = Path(args.output) / "prefill-sp-cache"
+    output.mkdir(parents=True, exist_ok=False)
+    shapes = {
+        "latent_down": (7168, 4096),
+        "latent_up": (3584, 7168),
+        "shared_gu_0": (7168, 6144),
+        "shared_gu_1": (7168, 6144),
+        "shared_down_0": (3072, 7168),
+        "shared_down_1": (3072, 7168),
+    }
+    layout = {
+        "format": FORMAT,
+        "layers": LAYERS,
+        "checkpoint": str(args.checkpoint),
+        "families": {
+            name: {
+                "file": f"{name}.bin",
+                "shape": [LAYERS - 1, *shape],
+                "dtype": "bfloat16",
+            }
+            for name, shape in shapes.items()
+        },
+    }
+    started = time.perf_counter()
+    with contextlib.ExitStack() as stack:
+        handles = {
+            name: stack.enter_context(open(output / f"{name}.bin", "xb"))
+            for name in shapes
+        }
+        for layer in range(1, LAYERS):
+            values = prefill_projection_values(load, checkpoint, layer)
+            for name, value in values.items():
+                if value.shape != shapes[name] or value.dtype != load.BF16:
+                    raise ValueError((name, layer, value.shape, value.dtype))
+                handles[name].write(value.tobytes())
+            del values
+            if layer % 8 == 0 or layer == LAYERS - 1:
+                log(
+                    f"prefill projections: layer {layer}/{LAYERS - 1} "
+                    f"after {time.perf_counter() - started:.0f} s"
+                )
+    (output / "layout.json").write_text(json.dumps(layout, indent=2) + "\n")
+    log(
+        f"prefill projections written to {output} "
+        f"in {time.perf_counter() - started:.0f} s"
+    )
+
+
 def draft_shards(dspark, draft: str, max_position: int):
     config = dspark.DraftConfig.from_checkpoint(Path(draft))
     weights = dspark.load_checkpoint_weights(Path(draft), config)
@@ -395,6 +488,9 @@ def verify(args, log) -> bool:
 def run(args, log) -> int:
     if args.target == "k3":
         write_k3(args, log)
+    elif args.target == "prefill":
+        if int(os.environ.get("SLURM_NODEID", "0")) == 0:
+            write_prefill(args, log)
     elif args.target == "dspark":
         write_dspark(args, log)
     else:

@@ -355,6 +355,10 @@ speculator checkpoint.
   `preshard verify --against DIR --checkpoint CKPT --draft CKPT` rebuilds a
   sample of one rank and compares it with an existing pre-shard byte for
   byte.
+- `preshard prefill --checkpoint CKPT --output DIR`: generate
+  `DIR/prefill-sp-cache` from the same full Kimi-K3 checkpoint. Run this after
+  `preshard k3`, using the same output root. It runs on the allocation's first
+  host without using a TPU and refuses to overwrite an existing cache.
 
 `--set FIELD=VALUE` overrides a `KernelConfig` field to compare
 configurations, and `--json FILE` appends a record per result (with the
