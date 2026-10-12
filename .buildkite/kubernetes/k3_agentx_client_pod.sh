@@ -24,9 +24,9 @@
 # the proxy, upload the results.
 #
 # Two jobs, the shape InferenceX gives a Kimi K3 agentic row
-# (infx/evals/EVALS.md). K3_AGENTX_EVAL_ONLY=0: the replay ladder, then the
+# (infx/evals/EVALS.md). AGENTX_EVAL_JOB=0: the replay ladder, then the
 # config's AGENTX_POST_EVAL_SUITES (the Kimi tool-call schema suite) on the same
-# pair, InferenceX's post-eval of every K3 point. K3_AGENTX_EVAL_ONLY=1: no
+# pair, InferenceX's post-eval of every K3 point. AGENTX_EVAL_JOB=1: no
 # replay, GSM8K at the top of the ladder, the eval-only job every agentic row
 # gets. Both evals run against the proxy on this pod, the loopback address
 # InferenceX's run_eval expects.
@@ -43,7 +43,9 @@
 #   ARTIFACTS_DIR   where results go, uploaded as the step's artifacts
 #   AGENTX_CHIPS    physical TPU chips serving the pair; no default
 # Optional: AGENTX_DURATION, AGENTX_FAST, AGENTX_GSM8K_LIMIT, AGENTX_GSM8K_CONC,
-#   AGENTX_IX_REF, AGENTX_GCS_ROOT, AGENTX_READY_WAIT_MIN, K3_AGENTX_EVAL_ONLY,
+#   AGENTX_IX_REF, AGENTX_GCS_ROOT, AGENTX_READY_WAIT_MIN, AGENTX_EVAL_JOB=1
+#   (set by the eval step alone, not the build: a build-level value reaches
+#   every step's pods, and the throughput step must not take this branch),
 #   AGENTX_EVAL_SMOKE=1 (the evals as a link check, not a result: 20 GSM8K
 #   questions in place of the split, the verifier's two-case suite in place
 #   of the full one), AGENTX_SKIP_POST_EVAL=1 (throughput: replay only).
@@ -67,8 +69,8 @@ log() { echo "[k3-agentx-client-pod] $*"; }
 
 cd "$REPO_DIR" || { log "FATAL: no repo at $REPO_DIR"; exit 1; }
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-perf_eval_results}"
-EVAL_ONLY="${K3_AGENTX_EVAL_ONLY:-0}"
-case "$EVAL_ONLY" in 0|1) ;; *) log "FATAL: K3_AGENTX_EVAL_ONLY must be 0 or 1, not '$EVAL_ONLY'"; exit 2 ;; esac
+EVAL_ONLY="${AGENTX_EVAL_JOB:-0}"
+case "$EVAL_ONLY" in 0|1) ;; *) log "FATAL: AGENTX_EVAL_JOB must be 0 or 1, not '$EVAL_ONLY'"; exit 2 ;; esac
 if [ "$EVAL_ONLY" = 1 ]; then
     RESULTS_DIR="$ARTIFACTS_DIR/k3-agentx-evals-1p1d"
 else
