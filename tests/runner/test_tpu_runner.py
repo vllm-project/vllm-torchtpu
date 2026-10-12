@@ -15,6 +15,7 @@
 import contextlib
 import copy
 import inspect
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -56,7 +57,10 @@ from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner import utils as runner_utils_module
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
-from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
+from vllm_torchtpu.runner.tpu_runner_async_output import (
+    INVALID_TOKEN_ID,
+    AsyncPreResults,
+)
 
 
 def test_idle_dp_rank_encodes_before_decoder_pairing():
@@ -2788,27 +2792,47 @@ def test_torch_tpu_wrapper_accelerator_aliases(monkeypatch):
         assert torch.cuda.synchronize() == "synchronized"
 
 
-def test_solo_prefill_async_results_skips_wait_for_copy():
-    """An incomplete-prefill step samples 0 tokens; the next step must not block."""
-    copy_mock = MagicMock()
+def test_flush_keeps_zero_token_async_results_until_waited():
+    """A step that committed no tokens still leaves its D2H copy in flight.
+
+    On TP ranks other than the executor's output rank, vLLM may drop the
+    AsyncTPUModelRunnerOutput when the RPC returns, so _pre_async_results is
+    the copy's only owner. execute_model() must neither free it before the
+    copy is waited on (#985) nor block on it ahead of the forward;
+    sample_tokens() waits on it in _modify_prev_results() before replacing it.
+    """
+    events = []
+
+    class FakeCopyState:
+        sampled_token_ids_cpu = torch.tensor([[7]], dtype=torch.int32)
+
+        def wait(self):
+            events.append("wait")
+
+    copy_state = FakeCopyState()
+    weakref.finalize(copy_state, events.append, "freed")
     runner = SimpleNamespace(
         input_batch=SimpleNamespace(num_reqs=1, req_ids=["req-prefill"]),
-        _pre_async_results=SimpleNamespace(
+        _pre_async_results=AsyncPreResults(
             req_ids=["req-prefill"],
+            next_tokens_tpu=torch.tensor([7], dtype=torch.int32),
             request_seq_lens=[],
-            req_id_to_index_copy={},
             discard_sampled_tokens_req_indices=[0],
-            num_draft_per_req=None,
-            wait_for_copy=copy_mock.wait_for_copy,
+            req_id_to_index_copy={},
+            copy_state=copy_state,
         ),
     )
+    # A flush that rolls back calls self._modify_prev_results().
+    runner._modify_prev_results = lambda: TPUModelRunner._modify_prev_results(runner)
+    del copy_state  # The runner now holds the only reference.
 
-    TPUModelRunner._modify_prev_results(runner)
-    copy_mock.wait_for_copy.assert_not_called()
-
+    # execute_model(): neither wait on the copy nor free it.
     TPUModelRunner._flush_disjoint_async_results(runner)
-    copy_mock.wait_for_copy.assert_not_called()
-    assert runner._pre_async_results is None
+    assert events == []
+
+    # sample_tokens(): wait on the copy before the results are replaced.
+    TPUModelRunner._modify_prev_results(runner)
+    assert events == ["wait"]
 
 
 def test_flush_disjoint_async_results_still_flushes_nonempty_prev_batch():

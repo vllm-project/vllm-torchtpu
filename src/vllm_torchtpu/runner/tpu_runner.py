@@ -2398,14 +2398,17 @@ class TPUModelRunner(GPUModelRunner):
             return
         current_req_ids = set(self.input_batch.req_ids[: self.input_batch.num_reqs])
         previous_req_ids = self._pre_async_results.req_id_to_index_copy
-        if not previous_req_ids:
-            # Nothing to roll back (0 sampled tokens, or every previous request
-            # was finished/preempted). Skip wait_for_copy() so the host does not
-            # block on the previous step; the engine's AsyncTPUModelRunnerOutput
-            # still holds copy_state and waits for it in get_output().
-            self._pre_async_results = None
-            return
-        if any(req_id in current_req_ids for req_id in previous_req_ids):
+        # An empty map means nothing to roll back (the previous step committed no
+        # tokens, or all its requests finished or were preempted), but its D2H
+        # copy may still be in flight. Keep the results instead of waiting here,
+        # which would stall the host before this step's forward: sample_tokens()
+        # waits on them in _modify_prev_results() and then replaces them. Never
+        # drop them unsynchronized: on TP ranks other than the executor's output
+        # rank, vLLM may discard the AsyncTPUModelRunnerOutput when the RPC
+        # returns, leaving these results the only owner of the copy (#985).
+        if not previous_req_ids or any(
+            req_id in current_req_ids for req_id in previous_req_ids
+        ):
             return
         self._modify_prev_results()
         self._pre_async_results = None
@@ -2547,8 +2550,9 @@ class TPUModelRunner(GPUModelRunner):
         # below. None/absent -> 0 drafts (non-spec or a non-spec mixed chunk).
         pre_num_draft_per_req = self._pre_async_results.num_draft_per_req
 
-        if not pre_request_seq_lens:
-            return
+        # Wait even when there is nothing to roll back: both callers drop these
+        # results afterwards, and on non-output TP ranks they can be the only
+        # owner of the in-flight D2H copy (#985).
         pre_next_tokens_cpu = self._pre_async_results.wait_for_copy()
         assert pre_next_tokens_cpu is not None
 
