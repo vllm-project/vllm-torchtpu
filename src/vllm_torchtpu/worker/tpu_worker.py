@@ -4,6 +4,7 @@
 # especially torch_tpu which might read them at import time.
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
+import ctypes
 import os
 import time
 from typing import Any, cast
@@ -65,6 +66,15 @@ def _configure_tpu_process_env(
         os.environ["WORLD_SIZE"] = str(world_size)
     else:
         os.environ.pop("WORLD_SIZE", None)
+
+
+def _release_free_host_heap() -> None:
+    """Return free allocator pages from model loading and compilation to the OS."""
+    process = ctypes.CDLL(None)
+    if hasattr(process, "MallocExtension_ReleaseFreeMemory"):  # tcmalloc
+        process.MallocExtension_ReleaseFreeMemory()
+    elif hasattr(process, "malloc_trim"):  # glibc
+        process.malloc_trim(0)
 
 
 class TPUWorker(WorkerBase):
@@ -767,6 +777,7 @@ class TPUWorker(WorkerBase):
         # from scanning those objects mid-step.
         freeze_gc_heap()
         maybe_attach_gc_debug_callback()
+        _release_free_host_heap()
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:
