@@ -2149,13 +2149,12 @@ class TPUModelRunner(GPUModelRunner):
         mla_dispatch.maybe_order_prefills_by_kv_len(
             self, num_decode, num_reqs, scheduler_output, spec_decode_tokens
         )
-        if (
-            swapped
-            and getattr(self.input_batch, "batch_update_builder", None) is not None
-        ):
-            refresh = getattr(self.input_batch, "refresh_metadata", None)
-            if callable(refresh):
-                refresh()
+        if swapped:
+            self._cached_output_req_ids_key = None
+            if getattr(self.input_batch, "batch_update_builder", None) is not None:
+                refresh = getattr(self.input_batch, "refresh_metadata", None)
+                if callable(refresh):
+                    refresh()
         return num_decode, num_windowed
 
     def _build_attention_metadata(
@@ -3436,8 +3435,20 @@ class TPUModelRunner(GPUModelRunner):
         # Disable vLLM's native GPU async spec-decode num_computed_tokens
         # correction. The TPU runner does its own async rejection correction,
         # so letting the base also correct would double-count.
-        for req_state in self.requests.values():
-            req_state.prev_num_draft_len = 0
+        if (
+            self.speculative_config is not None
+            and self.scheduler_config.async_scheduling
+            and scheduler_output.scheduled_spec_decode_tokens
+        ):
+            for req_id in scheduler_output.scheduled_spec_decode_tokens:
+                req_state = self.requests.get(req_id)
+                if req_state is not None:
+                    req_state.prev_num_draft_len = 0
+        if (
+            invalidated_req_ids
+            or scheduler_output.scheduled_new_reqs
+        ):
+            self._cached_output_req_ids_key = None
         self._install_spec_token_room_guard()
         copies = scheduler_output.kv_cache_block_copies
         use_page_local_copy = bool(copies and self.is_unified_pool_used())
@@ -4013,14 +4024,30 @@ class TPUModelRunner(GPUModelRunner):
             num_scheduled_tokens_per_req = num_scheduled_tokens_per_req[:chunk_num_reqs]
             end_index = start_index + chunk_num_reqs
         max_num_scheduled_tokens_all_reqs = max(num_scheduled_tokens_per_req)
+        min_num_scheduled_tokens_all_reqs = min(num_scheduled_tokens_per_req)
         total_num_scheduled_tokens = sum(num_scheduled_tokens_per_req)
         num_scheduled_tokens_per_req_list = num_scheduled_tokens_per_req
-        num_scheduled_tokens_per_req = np.array(
-            num_scheduled_tokens_per_req_list, dtype=np.int32
-        )
-        assert max_num_scheduled_tokens_all_reqs > 0
-
         num_reqs = len(num_scheduled_tokens_per_req_list)
+        is_uniform_scheduled = (
+            min_num_scheduled_tokens_all_reqs == max_num_scheduled_tokens_all_reqs
+        )
+        if is_uniform_scheduled:
+            uni_arr_cache = getattr(self, "_uniform_sched_arr_cache", None)
+            if uni_arr_cache is None:
+                uni_arr_cache = {}
+                self._uniform_sched_arr_cache = uni_arr_cache
+            uni_arr_key = (num_reqs, max_num_scheduled_tokens_all_reqs)
+            num_scheduled_tokens_per_req = uni_arr_cache.get(uni_arr_key)
+            if num_scheduled_tokens_per_req is None:
+                num_scheduled_tokens_per_req = np.full(
+                    num_reqs, max_num_scheduled_tokens_all_reqs, dtype=np.int32
+                )
+                uni_arr_cache[uni_arr_key] = num_scheduled_tokens_per_req
+        else:
+            num_scheduled_tokens_per_req = np.array(
+                num_scheduled_tokens_per_req_list, dtype=np.int32
+            )
+        assert max_num_scheduled_tokens_all_reqs > 0
 
         pcp_planner = self.get_pcp_planner()
         pcp_planner.reserve_host_token_capacity(self, total_num_scheduled_tokens)
@@ -4070,14 +4097,18 @@ class TPUModelRunner(GPUModelRunner):
                 idx_cache = {}
                 self._prepare_inputs_idx_cache = idx_cache
             idx_cache_key = (
-                start_index,
-                num_reqs,
-                token_ids_stride,
-                num_scheduled_tokens_per_req.tobytes(),
+                (start_index, num_reqs, token_ids_stride, max_num_scheduled_tokens_all_reqs)
+                if is_uniform_scheduled
+                else (
+                    start_index,
+                    num_reqs,
+                    token_ids_stride,
+                    num_scheduled_tokens_per_req.tobytes(),
+                )
             )
             cached_idx = idx_cache.get(idx_cache_key)
             if cached_idx is not None:
-                req_indices, arange, req_row_offsets = cached_idx
+                req_indices, arange, req_row_offsets, token_indices = cached_idx
             else:
                 # Get request indices.
                 req_indices = np.repeat(
@@ -4092,12 +4123,16 @@ class TPUModelRunner(GPUModelRunner):
                 req_row_offsets = (req_indices * token_ids_stride).astype(
                     np.int64, copy=False
                 )
+                token_indices = np.empty(
+                    total_num_scheduled_tokens, dtype=np.int64
+                )
                 if len(idx_cache) >= 32:
                     idx_cache.pop(next(iter(idx_cache)))
                 idx_cache[idx_cache_key] = (
                     req_indices,
                     arange,
                     req_row_offsets,
+                    token_indices,
                 )
 
             # Get positions.
@@ -4108,8 +4143,8 @@ class TPUModelRunner(GPUModelRunner):
                 out=positions_np,
             )
 
-            # Get token indices.
-            token_indices = positions_np + req_row_offsets
+            # Get token indices in-place without per-step heap allocation.
+            np.add(positions_np, req_row_offsets, out=token_indices)
             if total_num_scheduled_tokens <= 512:
                 input_ids_np = getattr(self, "input_ids_np", None)
                 if input_ids_np is None:
@@ -5520,6 +5555,7 @@ class TPUModelRunner(GPUModelRunner):
                 assert draft_sequence_layout_plan is not None, (
                     "the PCP manager does not support speculative decoding"
                 )
+                qsl_slice = self.query_start_loc_np[: num_reqs + 1]
                 draft_chunk = DraftChunkInputs(
                     input_ids=(
                         request_major_input_ids
@@ -5527,7 +5563,9 @@ class TPUModelRunner(GPUModelRunner):
                         else draft_input_ids_src
                     ),
                     position_ids=self.position_ids,
-                    query_start_loc_np=self.query_start_loc_np[: num_reqs + 1].copy(),
+                    query_start_loc_np=(
+                        qsl_slice.copy() if target_num_chunks > 1 else qsl_slice
+                    ),
                     attn_ctx=self._attn_metadata_builder_ctx,
                     start_index=start_index,
                     num_reqs=num_reqs,
@@ -6774,10 +6812,20 @@ class TPUModelRunner(GPUModelRunner):
                     pooler_output.extend(out)
 
         with self._stage_timing.host_stage("output_assembly"):
+            req_ids_key = (
+                tuple(req_ids),
+                len(self.input_batch.req_id_to_index),
+            )
+            if getattr(self, "_cached_output_req_ids_key", None) == req_ids_key:
+                req_id_to_index_snap = self._cached_req_id_to_index_snap
+            else:
+                req_id_to_index_snap = dict(self.input_batch.req_id_to_index)
+                self._cached_output_req_ids_key = req_ids_key
+                self._cached_req_id_to_index_snap = req_id_to_index_snap
             model_runner_output = ModelRunnerOutput(
                 req_ids=req_ids,
                 # Snapshot of the req_id_to_index for the VLLM scheduler.
-                req_id_to_index=dict(self.input_batch.req_id_to_index),
+                req_id_to_index=req_id_to_index_snap,
                 sampled_token_ids=[],  # Filled in AsyncTPUModelRunnerOutput get_output
                 logprobs=logprobs,
                 prompt_logprobs_dict=prompt_logprobs.emit(
