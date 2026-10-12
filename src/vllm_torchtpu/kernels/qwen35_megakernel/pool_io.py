@@ -1349,6 +1349,7 @@ def make_flat_pooled_step(
     scopes=False,
     fused_pool_io: bool | None = None,
     coal_rec_override: bool | None = None,
+    out_rows: int = 0,
 ):
     """Build a flat positional `shard_map` pooled step for `sharded_jax_callable` in `vllm_torchtpu`.
 
@@ -1442,8 +1443,12 @@ def make_flat_pooled_step(
             )
             if bool(interpret):
                 hid, raw_out = out
+                if out_rows > 0 and hid.shape[0] > out_rows:
+                    hid = hid[:out_rows]
                 return (hid, *raw_out)
             hid = out[0] if isinstance(out, (tuple, list)) else out
+            if out_rows > 0 and hid.shape[0] > out_rows:
+                hid = hid[:out_rows]
             return (hid, *raw_pools)
 
         if use_gpr:
@@ -1477,6 +1482,8 @@ def make_flat_pooled_step(
             interpret=interpret,
             conv_partial=use_gpr,
         )
+        if out_rows > 0 and hid.shape[0] > out_rows:
+            hid = hid[:out_rows]
         return (hid, *raw_out)
 
     smap = jax.shard_map(
@@ -1588,6 +1595,7 @@ def make_pooled_step(
     scopes=False,
     fused_pool_io: bool | None = None,
     coal_rec_override: bool | None = None,
+    out_rows: int = 0,
 ):
     """Build the `shard_map` decode/verify step over unified block pools `raw[0..14]`.
 

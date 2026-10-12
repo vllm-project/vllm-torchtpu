@@ -69,6 +69,12 @@ _DEFAULT_VERIFY_BUCKETS_48 = (4, 8, 12, 16, 20, 24, 32, 40, 48)
 # sequences stays on the megakernel instead of falling back to stock_t4.
 # `VLLM_TPU_QWEN35_MK_VERIFY_64=0` restores the 48-row list.
 _DEFAULT_VERIFY_BUCKETS_64 = (4, 8, 12, 16, 20, 24, 32, 40, 48, 56, 64)
+# Wide 68..128-row buckets (17..32 sequences at K=3): executed as a 2-microbatch
+# split `(64, b1)` where `b1 = B - 64` reuses the already-compiled single-call
+# `(4, 64)` and `(4, b1)` Pallas kernels without exceeding the 62 MiB VMEM limit
+# or falling back to slow stock_t4_b96 / stock_t4_b128 (256-padded XLA).
+_DEFAULT_WIDE_VERIFY_BUCKETS_128 = (68, 72, 76, 80, 84, 88, 96, 104, 112, 120, 128)
+_MAX_SINGLE_KERNEL_B = 64
 
 
 def _env_off(name: str, default: str = "1") -> bool:
@@ -182,7 +188,7 @@ def parse_mk_buckets(env_val: str | None = None) -> tuple[int, ...]:
         return ()
     buckets = sorted({int(x.strip()) for x in raw.split(",") if x.strip()})
     _need(
-        len(buckets) > 0 and all(1 <= b <= 64 for b in buckets),
+        len(buckets) > 0 and all(1 <= b <= 128 for b in buckets),
         f"invalid VLLM_TPU_QWEN35_MK_BUCKETS={raw!r}",
     )
     return tuple(buckets)
@@ -191,8 +197,10 @@ def parse_mk_buckets(env_val: str | None = None) -> tuple[int, ...]:
 def parse_mk_verify_buckets(env_val: str | None = None) -> tuple[int, ...]:
     """Parse comma-separated T=4 MTP verify row buckets (e.g. '8,16,24' or '0' to disable).
 
-    The default compiles verify buckets up to 64 rows (16 sequences x 4 tokens), so
-    all 1..16 active sequences run on the megakernel with zero stock fallbacks.
+    The default compiles single-call verify buckets up to 64 rows (16 sequences x 4 tokens);
+    when `runner.max_num_reqs > 16` and `VLLM_TPU_QWEN35_MK_SPLIT_WIDE=1` (default),
+    `bind_caches` automatically adds 2-microbatch split buckets up to `min(128, 4 * max_num_reqs)`.
+    Explicit buckets up to 128 (multiples of 4) are also accepted directly.
     """
     raw = (
         env_val
@@ -206,10 +214,17 @@ def parse_mk_verify_buckets(env_val: str | None = None) -> tuple[int, ...]:
         return ()
     buckets = sorted({int(x.strip()) for x in raw.split(",") if x.strip()})
     _need(
-        len(buckets) > 0 and all(4 <= b <= 64 and b % 4 == 0 for b in buckets),
+        len(buckets) > 0 and all(4 <= b <= 128 and b % 4 == 0 for b in buckets),
         f"invalid VLLM_TPU_QWEN35_MK_VERIFY_BUCKETS={raw!r}",
     )
     return tuple(buckets)
+
+
+def parse_mk_split_wide(env_val: str | None = None) -> bool:
+    """`VLLM_TPU_QWEN35_MK_SPLIT_WIDE` (default on): auto-enable 2-microbatch split
+    verify buckets (`68..128` rows = `17..32` sequences x 4 tokens) when the runner's
+    request capacity exceeds 16 sequences (`64` verify rows)."""
+    return _env_flag("VLLM_TPU_QWEN35_MK_SPLIT_WIDE", "1", env_val)
 
 
 def select_bucket(num_tokens: int, buckets: Sequence[int] = _DEFAULT_BUCKETS) -> int:
@@ -241,7 +256,7 @@ def parse_mk_fused_pool_io_max_b(env_val: str | None = None) -> int:
     raw = (
         env_val
         if env_val is not None
-        else os.environ.get("VLLM_TPU_QWEN35_MK_FUSED_POOL_IO_MAX_B", "24")
+        else os.environ.get("VLLM_TPU_QWEN35_MK_FUSED_POOL_IO_MAX_B", "64")
     )
     return int(raw.strip())
 
@@ -1801,11 +1816,14 @@ class Qwen35Megakernel:
         self.num_pages: int = 0
         self.page_size: int = 128
         self.max_pages_per_seq: int = 0
+        self.split_wide: bool = parse_mk_split_wide()
         self._bucket_steps: dict[Any, Any] = {}
         self._bucket_out_rows: dict[tuple[int, int], int] = {}
         self._bucket_ops: dict[Any, Any] = {}
+        self._flat_callables: dict[Any, Any] = {}
         self._bucket_fused: dict[tuple[int, int], bool] = {}
         self._prep_steps: dict[Any, Any] = {}
+        self._merge_steps: dict[Any, Any] = {}
         self._bound = False
         self._zero_roff_1d: torch.Tensor | None = None
         self._ckpt_window: int = 1
@@ -1920,6 +1938,7 @@ class Qwen35Megakernel:
             self._discover_raiden_sync_views(runner)
 
         self._runner_token_paddings = runner_token_paddings
+        self._maybe_expand_wide_verify_buckets(runner)
         self._build_all_buckets()
 
         self._bound = True
@@ -1938,6 +1957,54 @@ class Qwen35Megakernel:
             self.fused_pool_io_min_b_hi,
             self.zero_copy,
         )
+
+    def _maybe_expand_wide_verify_buckets(self, runner: Any) -> None:
+        """Auto-add 2-microbatch split verify buckets (`68..128` rows = `17..32` seqs x 4 tokens)
+        up to `min(128, 4 * runner_max_reqs)` when `split_wide` is enabled and `64` is present."""
+        if not getattr(self, "split_wide", True):
+            return
+        if not self.verify_buckets or _MAX_SINGLE_KERNEL_B not in self.verify_buckets:
+            return
+        if "VLLM_TPU_QWEN35_MK_VERIFY_BUCKETS" in os.environ:
+            return
+        runner_max_reqs = max(
+            (
+                int(x)
+                for x in (
+                    getattr(runner, "max_num_reqs", None),
+                    getattr(runner, "num_reqs_max_model_len", None),
+                    getattr(runner, "num_reqs_most_model_len", None),
+                    getattr(
+                        getattr(runner, "scheduler_config", None),
+                        "max_num_seqs",
+                        None,
+                    ),
+                )
+                if x is not None
+            ),
+            default=0,
+        )
+        if runner_max_reqs <= _MAX_SINGLE_KERNEL_B // 4:
+            return
+        target_rows = min(128, 4 * runner_max_reqs)
+        max_wide = select_bucket(target_rows, _DEFAULT_WIDE_VERIFY_BUCKETS_128)
+        wide_extra = [
+            b
+            for b in _DEFAULT_WIDE_VERIFY_BUCKETS_128
+            if b <= max_wide
+            and (b - _MAX_SINGLE_KERNEL_B) in self.verify_buckets
+            and b not in self.verify_buckets
+        ]
+        if wide_extra:
+            self.verify_buckets = tuple(sorted((*self.verify_buckets, *wide_extra)))
+            self.max_verify_bucket = max(self.verify_buckets)
+            logger.info(
+                "Qwen3.5 megakernel: enabled 2-microbatch split verify buckets %s "
+                "(runner_max_reqs=%d, max_verify_bucket=%d)",
+                wide_extra,
+                runner_max_reqs,
+                self.max_verify_bucket,
+            )
 
     def _runner_out_rows(self, b: int, m_rows: int) -> int:
         # The runner pads a b-row step to its first token bucket >= b and
@@ -1964,10 +2031,25 @@ class Qwen35Megakernel:
             self._bucket_out_rows.clear()
             self._bucket_fused.clear()
             self._prep_steps.clear()
-        for T, b in keys:
+            if hasattr(self, "_flat_callables"):
+                self._flat_callables.clear()
+            if hasattr(self, "_merge_steps"):
+                self._merge_steps.clear()
+        single_keys = [(T, b) for T, b in keys if b <= _MAX_SINGLE_KERNEL_B]
+        split_keys = [(T, b) for T, b in keys if b > _MAX_SINGLE_KERNEL_B]
+        for T, b in single_keys:
             m_rows = max(16, K.rup(b, 16))
             out_rows = self._runner_out_rows(b, m_rows)
             step = self._build_bucket_op(b, tokens_per_seq=T, out_pad_rows=out_rows)
+            self._bucket_steps[(T, b)] = step
+            if T == 1:
+                self._bucket_steps[b] = step
+            self._bucket_out_rows[(T, b)] = out_rows
+        for T, b in split_keys:
+            b1 = b - _MAX_SINGLE_KERNEL_B
+            m_rows = _MAX_SINGLE_KERNEL_B + max(16, K.rup(b1, 16))
+            out_rows = self._runner_out_rows(b, m_rows)
+            step = self._build_split_bucket_op(b, tokens_per_seq=T, out_pad_rows=out_rows)
             self._bucket_steps[(T, b)] = step
             if T == 1:
                 self._bucket_steps[b] = step
@@ -2129,10 +2211,17 @@ class Qwen35Megakernel:
             tiles.dense_acc_pair,
         )
 
+        m_rows = c.M
+        target_out_rows = int(out_pad_rows or m_rows)
+
         if hasattr(pool_io, "make_flat_pooled_step"):
             step_fn, in_specs, out_specs, donate_argnums = (
                 pool_io.make_flat_pooled_step(
-                    self.mesh, c, tiles, fused_pool_io=bucket_fused
+                    self.mesh,
+                    c,
+                    tiles,
+                    fused_pool_io=bucket_fused,
+                    out_rows=target_out_rows,
                 )
             )
             if bucket_fused and not self._hlo_checked:
@@ -2154,7 +2243,11 @@ class Qwen35Megakernel:
                     c = dataclasses.replace(c, fused_pool_io=False)
                     step_fn, in_specs, out_specs, donate_argnums = (
                         pool_io.make_flat_pooled_step(
-                            self.mesh, c, tiles, fused_pool_io=False
+                            self.mesh,
+                            c,
+                            tiles,
+                            fused_pool_io=False,
+                            out_rows=target_out_rows,
                         )
                     )
                 else:
@@ -2236,11 +2329,22 @@ class Qwen35Megakernel:
             weights: list[torch.Tensor],
             pools: list[torch.Tensor],
         ) -> list[torch.Tensor]:
-            return [torch.empty_like(hidden)] + [torch.empty_like(p) for p in pools]
+            return [
+                torch.empty(
+                    (target_out_rows, hidden.shape[1]),
+                    dtype=hidden.dtype,
+                    device=hidden.device,
+                )
+            ] + [torch.empty_like(p) for p in pools]
 
         self._bucket_ops[(tokens_per_seq, bucket_t)] = op
         if tokens_per_seq == 1:
             self._bucket_ops[bucket_t] = op
+        if not hasattr(self, "_flat_callables"):
+            self._flat_callables = {}
+        self._flat_callables[(tokens_per_seq, bucket_t)] = flat_callable
+        if tokens_per_seq == 1:
+            self._flat_callables[bucket_t] = flat_callable
         T = int(tokens_per_seq)
         B = int(bucket_t)
         nseq_bkt = B // T
@@ -2356,6 +2460,8 @@ class Qwen35Megakernel:
             if T == 1:
                 self._prep_steps[B] = compiled_prep
 
+            _static_wp_cache: dict[tuple[int, int], tuple[torch.Tensor, ...]] = {}
+
             def zero_copy_step(
                 input_ids: torch.Tensor,
                 positions: torch.Tensor,
@@ -2374,8 +2480,13 @@ class Qwen35Megakernel:
                 pos_b, h0, pt_b, ckpt_b, roff_b = prep_fn(
                     input_ids, positions, block_tables, s0, c0, s1, c1, s2, c2, roff
                 )
+                cache_key = (id(weights), id(pools))
+                wp_tuple = _static_wp_cache.get(cache_key)
+                if wp_tuple is None:
+                    wp_tuple = (*weights, *pools)
+                    _static_wp_cache[cache_key] = wp_tuple
                 outs = flat_callable(
-                    pos_b, h0, *weights, *pools, pt_b, ckpt_b, roff_b
+                    pos_b, h0, *wp_tuple, pt_b, ckpt_b, roff_b
                 )
                 for dst, src in zip(pools, outs[1 : 1 + n_p]):
                     dst.set_(src)
@@ -2418,6 +2529,266 @@ class Qwen35Megakernel:
         step.__code__ = step.__code__.replace(co_name=f"step_t{tokens_per_seq}_b{bucket_t}")
         return torch.compile(step, backend="tpu", fullgraph=True, dynamic=False)
 
+    def _build_split_bucket_op(
+        self,
+        bucket_t: int,
+        tokens_per_seq: int = 1,
+        out_pad_rows: int | None = None,
+    ) -> Any:
+        """Build a 2-microbatch megakernel step for wide buckets (64 < B <= 128).
+
+        Sequences in verify/decode have disjoint KV pages (`page_table[s]`) and
+        disjoint GDN state checkpoint slots (`ckpt_indices[:, s, :]`), so
+        splitting `B` rows into `b0 = 64` (`16` seqs) + `b1 = B - 64` (`1..16`
+        seqs) is mathematically exact, stays within the 62 MiB v7x VMEM ceiling,
+        and reuses the already-compiled `(T, 64)` and `(T, b1)` Pallas callables
+        with zero extra kernel compilations.
+        """
+        T = int(tokens_per_seq)
+        B = int(bucket_t)
+        if B % T != 0:
+            raise ValueError(f"bucket_t={B} must be a multiple of tokens_per_seq={T}")
+        b0 = _MAX_SINGLE_KERNEL_B
+        b1 = B - b0
+        if b1 <= 0 or b1 > _MAX_SINGLE_KERNEL_B or b1 % T != 0:
+            raise ValueError(
+                f"Split bucket requires {_MAX_SINGLE_KERNEL_B} < B <= {2 * _MAX_SINGLE_KERNEL_B} "
+                f"and B % {T} == 0, got B={B}"
+            )
+        s0_len = b0 // T
+        s1_len = b1 // T
+        S = s0_len + s1_len
+        max_pages = int(self.max_pages_per_seq)
+        n_p = len(self.raw_pools)
+
+        if not hasattr(self, "_flat_callables"):
+            self._flat_callables = {}
+        if not hasattr(self, "_merge_steps"):
+            self._merge_steps = {}
+
+        if (T, b0) not in self._flat_callables:
+            self._build_bucket_op(b0, tokens_per_seq=T)
+        if (T, b1) not in self._flat_callables:
+            self._build_bucket_op(b1, tokens_per_seq=T)
+        flat_callable_0 = self._flat_callables[(T, b0)]
+        flat_callable_1 = self._flat_callables[(T, b1)]
+        op_0 = self._bucket_ops[(T, b0)]
+        op_1 = self._bucket_ops[(T, b1)]
+        self._bucket_fused[(T, B)] = bool(
+            self._bucket_fused.get((T, b0), False)
+            or self._bucket_fused.get((T, b1), False)
+        )
+
+        m_rows_0 = dataclasses.replace(self.base_cfg, B=b0, T=T).M
+        m_rows_1 = dataclasses.replace(self.base_cfg, B=b1, T=T).M
+        m_rows_total = b0 + max(16, K.rup(b1, 16))
+        target_out_rows = int(out_pad_rows or m_rows_total)
+
+        logger.info(
+            "Qwen3.5 megakernel: building 2-microbatch split bucket (T=%d, B=%d -> %d+%d, out_rows=%d)",
+            T,
+            B,
+            b0,
+            b1,
+            target_out_rows,
+        )
+
+        def prep_split(
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            block_tables: torch.Tensor,
+            s0: torch.Tensor,
+            c0: torch.Tensor,
+            s1: torch.Tensor,
+            c1: torch.Tensor,
+            s2: torch.Tensor,
+            c2: torch.Tensor,
+            roff: torch.Tensor,
+        ):
+            bt = block_tables
+            if bt.ndim == 1:
+                if bt.numel() % max_pages == 0:
+                    bt = bt.reshape(-1, max_pages)
+                else:
+                    bt = bt.reshape(int(s0.shape[0]), -1)
+            pt_all = _slice_or_pad_2d(bt, S, max_pages).to(torch.int32)
+            pt0 = pt_all[:s0_len].contiguous()
+            pt1 = pt_all[s0_len:S].contiguous()
+
+            roff_1d = roff.reshape(-1)
+            has_roff = roff_1d.numel() > 1
+            ckpt_rows: list[torch.Tensor] = []
+            roff_rows: list[torch.Tensor] = []
+            for s_raw, c_raw in ((s0, c0), (s1, c1), (s2, c2)):
+                s_1d = s_raw[:, 0] if s_raw.ndim == 2 else s_raw.reshape(-1)
+                s_b = _slice_or_pad_1d(s_1d, S).to(torch.int32)
+                if has_roff:
+                    if roff_1d.numel() > s_1d.shape[0]:
+                        s_idx = s_b.to(torch.long).clamp(
+                            min=0, max=roff_1d.numel() - 1
+                        )
+                        roff_g = roff_1d[s_idx].to(torch.int32)
+                    else:
+                        roff_g = _slice_or_pad_1d(roff_1d, S).to(torch.int32)
+                else:
+                    roff_g = torch.zeros_like(s_b)
+
+                use_ckpt_2d = c_raw.ndim == 2
+                if T > 1:
+                    if use_ckpt_2d and c_raw.shape[1] >= T:
+                        ckpt_g = _slice_or_pad_2d(c_raw, S, T).to(torch.int32)
+                    else:
+                        c_1d = c_raw[:, 0] if use_ckpt_2d else c_raw.reshape(-1)
+                        ckpt_1d = _slice_or_pad_1d(c_1d, S).to(torch.int32)
+                        ckpt_g = ckpt_1d.unsqueeze(1).expand(S, T)
+                        roff_g = torch.zeros_like(roff_g)
+                else:
+                    if use_ckpt_2d and has_roff and c_raw.shape[1] > 1:
+                        c_b = _slice_or_pad_2d(
+                            c_raw, S, int(c_raw.shape[1])
+                        ).to(torch.int32)
+                        r_idx = roff_g.to(torch.long).clamp(
+                            min=0, max=c_raw.shape[1] - 1
+                        )
+                        ckpt_g = c_b.gather(1, r_idx.unsqueeze(1))
+                    else:
+                        ckpt_g = s_b.unsqueeze(1)
+                    roff_g = torch.zeros_like(roff_g)
+
+                active_g = ckpt_g[:, 0] > 0
+                roff_g = torch.where(active_g, roff_g, torch.zeros_like(roff_g))
+                ckpt_rows.append(ckpt_g)
+                roff_rows.append(roff_g)
+
+            ckpt_all = torch.stack(ckpt_rows, dim=0)
+            roff_all = torch.stack(roff_rows, dim=0)
+            ckpt0 = ckpt_all[:, :s0_len, :].contiguous()
+            ckpt1 = ckpt_all[:, s0_len:S, :].contiguous()
+            roff0 = roff_all[:, :s0_len].contiguous()
+            roff1 = roff_all[:, s0_len:S].contiguous()
+
+            active_seq = ckpt_all[0, :, 0] > 0
+            active_tok = active_seq.unsqueeze(1).expand(S, T).reshape(B)
+            zero_b = torch.zeros((B,), dtype=torch.int32, device=input_ids.device)
+            ids_all = torch.where(
+                active_tok, _slice_or_pad_1d(input_ids, B).to(torch.int32), zero_b
+            )
+            pos_1d = positions[0] if positions.ndim == 2 else positions
+            pos_all = torch.where(
+                active_tok, _slice_or_pad_1d(pos_1d, B).to(torch.int32), zero_b
+            )
+            pos0 = pos_all[:b0].contiguous()
+            pos1 = pos_all[b0:B].contiguous()
+
+            h_all = self.embed_tokens(ids_all)
+            h0_0 = h_all[:b0]
+            if h0_0.shape[0] < m_rows_0:
+                h0_0 = F.pad(h0_0, (0, 0, 0, m_rows_0 - h0_0.shape[0]))
+            h0_1 = h_all[b0:B]
+            if h0_1.shape[0] < m_rows_1:
+                h0_1 = F.pad(h0_1, (0, 0, 0, m_rows_1 - h0_1.shape[0]))
+            return pos0, h0_0, pt0, ckpt0, roff0, pos1, h0_1, pt1, ckpt1, roff1
+
+        def merge_split_out(
+            h_out_0: torch.Tensor, h_out_1: torch.Tensor
+        ) -> torch.Tensor:
+            h_out = torch.cat((h_out_0[:b0], h_out_1[:b1]), dim=0)
+            if h_out.shape[0] > target_out_rows:
+                return h_out[:target_out_rows].clone()
+            if h_out.shape[0] < target_out_rows:
+                return F.pad(h_out, (0, 0, 0, target_out_rows - h_out.shape[0]))
+            return h_out
+
+        if self.zero_copy:
+            prep_split.__code__ = prep_split.__code__.replace(
+                co_name=f"prep_split_t{tokens_per_seq}_b{bucket_t}"
+            )
+            compiled_prep = torch.compile(
+                prep_split, backend="tpu", fullgraph=True, dynamic=False
+            )
+            self._prep_steps[(T, B)] = compiled_prep
+            if T == 1:
+                self._prep_steps[B] = compiled_prep
+
+            merge_split_out.__code__ = merge_split_out.__code__.replace(
+                co_name=f"merge_split_t{tokens_per_seq}_b{bucket_t}"
+            )
+            compiled_merge = torch.compile(
+                merge_split_out, backend="tpu", fullgraph=True, dynamic=False
+            )
+            self._merge_steps[(T, B)] = compiled_merge
+
+            _static_wp_cache: dict[tuple[int, int], tuple[torch.Tensor, ...]] = {}
+
+            def zero_copy_split_step(
+                input_ids: torch.Tensor,
+                positions: torch.Tensor,
+                block_tables: torch.Tensor,
+                s0: torch.Tensor,
+                c0: torch.Tensor,
+                s1: torch.Tensor,
+                c1: torch.Tensor,
+                s2: torch.Tensor,
+                c2: torch.Tensor,
+                roff: torch.Tensor,
+                weights: list[torch.Tensor],
+                pools: list[torch.Tensor],
+            ) -> torch.Tensor:
+                prep_fn = self._prep_steps[(T, B)]
+                pos0, h0_0, pt0, ckpt0, roff0, pos1, h0_1, pt1, ckpt1, roff1 = prep_fn(
+                    input_ids, positions, block_tables, s0, c0, s1, c1, s2, c2, roff
+                )
+                cache_key = (id(weights), id(pools))
+                wp_tuple = _static_wp_cache.get(cache_key)
+                if wp_tuple is None:
+                    wp_tuple = (*weights, *pools)
+                    _static_wp_cache[cache_key] = wp_tuple
+                outs0 = flat_callable_0(pos0, h0_0, *wp_tuple, pt0, ckpt0, roff0)
+                for dst, src in zip(pools, outs0[1 : 1 + n_p]):
+                    dst.set_(src)
+                outs1 = flat_callable_1(pos1, h0_1, *wp_tuple, pt1, ckpt1, roff1)
+                for dst, src in zip(pools, outs1[1 : 1 + n_p]):
+                    dst.set_(src)
+                if self._raiden_sync_views:
+                    self._sync_raiden_pool_storages(pools)
+                merge_fn = self._merge_steps[(T, B)]
+                return merge_fn(outs0[0], outs1[0])
+
+            return zero_copy_split_step
+
+        def split_step(
+            input_ids: torch.Tensor,
+            positions: torch.Tensor,
+            block_tables: torch.Tensor,
+            s0: torch.Tensor,
+            c0: torch.Tensor,
+            s1: torch.Tensor,
+            c1: torch.Tensor,
+            s2: torch.Tensor,
+            c2: torch.Tensor,
+            roff: torch.Tensor,
+            weights: list[torch.Tensor],
+            pools: list[torch.Tensor],
+        ) -> torch.Tensor:
+            pos0, h0_0, pt0, ckpt0, roff0, pos1, h0_1, pt1, ckpt1, roff1 = prep_split(
+                input_ids, positions, block_tables, s0, c0, s1, c1, s2, c2, roff
+            )
+            outs0 = op_0(
+                pos0, h0_0, pt0, ckpt0, roff0, list(weights), list(pools)
+            )
+            mid_pools = list(outs0[1 : 1 + n_p])
+            outs1 = op_1(
+                pos1, h0_1, pt1, ckpt1, roff1, list(weights), mid_pools
+            )
+            for dst, src in zip(pools, outs1[1 : 1 + n_p]):
+                dst.copy_(src)
+            return merge_split_out(outs0[0], outs1[0])
+
+        split_step.__code__ = split_step.__code__.replace(
+            co_name=f"split_step_t{tokens_per_seq}_b{bucket_t}"
+        )
+        return torch.compile(split_step, backend="tpu", fullgraph=True, dynamic=False)
+
     def reset_stats(self) -> None:
         """Reset step-mix counters and A/B latency accumulators (e.g. after warmup)."""
         self._step_mix.clear()
@@ -2430,7 +2801,11 @@ class Qwen35Megakernel:
         if os.environ.get("QX_AOT_SKIP_GUARD_CHECK", "1") != "1":
             return 0
         promoted = 0
-        for table in (self._bucket_steps, self._prep_steps):
+        for table in (
+            self._bucket_steps,
+            self._prep_steps,
+            getattr(self, "_merge_steps", {}),
+        ):
             for key, fn in list(table.items()):
                 st = getattr(fn, "_qx_fast_state", None)
                 if isinstance(st, dict):
@@ -2578,7 +2953,17 @@ class Qwen35Megakernel:
             return
         self.nan_page_self_test()
         dev = self.raw_pools[0].device
-        all_keys = [(1, b) for b in self.buckets] + [(4, b) for b in self.verify_buckets]
+        max_cfg_seqs = int(
+            getattr(getattr(runner, "scheduler_config", None), "max_num_seqs", 0)
+            or getattr(runner, "max_num_reqs", 64)
+            or 64
+        )
+        max_warm_b = min(64, max(16, max_cfg_seqs * 4))
+        all_keys = [
+            (1, b) for b in self.buckets if b <= max_warm_b
+        ] + [
+            (4, b) for b in self.verify_buckets if b <= max_warm_b
+        ]
         if not all_keys:
             return
         logger.info("Qwen3.5 megakernel: warming up (T, B) buckets %s ...", all_keys)
