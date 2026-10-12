@@ -1,0 +1,15 @@
+# Version caps for the image installs (`uv pip install -c`), so the packages
+# prod ships have the same versions in the dev image that CI runs.
+#
+# The dev stage installs the test and benchmarking dependencies into the same
+# environment as the runtime ones, and fails if that changes any runtime
+# package. When a dev-only dependency forces a lower version of a runtime
+# package, cap the runtime package here so base installs that version too.
+# Delete a cap once the dependency that forces it lifts its own.
+
+# lm-eval 0.5.0.dev1 and evaluate 0.4.6 predate datasets 5. Stay on 4.x until
+# the perf/eval lane has run them on 5.
+datasets<5
+
+# datasets 4.8.4 requires fsspec<=2026.2.0, and fsspec is a runtime package.
+fsspec<=2026.2.0

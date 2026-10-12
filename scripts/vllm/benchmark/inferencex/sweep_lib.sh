@@ -31,10 +31,10 @@ ix_check_conc_list() {
 ix_set_gcs_root() {
     GCS_ROOT=""
     [ -n "${1:-}" ] || return 0
-    # Said once, here: without gsutil every save_now is a silent no-op, so
+    # Said once, here: without gcloud every save_now is a silent no-op, so
     # --gcs-root would look honoured for the whole run and upload nothing.
-    if ! command -v gsutil >/dev/null 2>&1; then
-        log "WARNING: --gcs-root $1 was given but gsutil is not on PATH; nothing will be uploaded"
+    if ! command -v gcloud >/dev/null 2>&1; then
+        log "WARNING: --gcs-root $1 was given but gcloud is not on PATH; nothing will be uploaded"
         return 0
     fi
     GCS_ROOT="${1%/}/${BUILDKITE_BUILD_NUMBER:-local}"
@@ -42,13 +42,13 @@ ix_set_gcs_root() {
 
 # save_now <path>... : copy each path to $GCS_ROOT/<results dir name>/ right
 # away. A cancelled build never runs the exit trap, so every point is saved as
-# soon as it is written, not only at exit. No-op without GCS_ROOT or gsutil.
+# soon as it is written, not only at exit. No-op without GCS_ROOT or gcloud.
 save_now() {
-    [ -n "${GCS_ROOT:-}" ] && command -v gsutil >/dev/null 2>&1 || return 0
+    [ -n "${GCS_ROOT:-}" ] && command -v gcloud >/dev/null 2>&1 || return 0
     local x
     for x in "$@"; do
         [ -e "$x" ] || continue
-        gsutil -q -m cp -r "$x" "$GCS_ROOT/$(basename "$RESULTS_DIR")/" 2>&1 | tail -2 \
+        gcloud storage cp -r "$x" "$GCS_ROOT/$(basename "$RESULTS_DIR")/" 2>&1 | tail -2 \
             || log "WARNING: upload of $x to $GCS_ROOT failed"
     done
 }

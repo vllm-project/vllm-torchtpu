@@ -1,0 +1,7 @@
+# Packages kept out of every image (`uv pip install --excludes`). Each is a
+# transitive dependency that does nothing on TPU.
+
+# A GPU kernel compiler, ~930 MB installed. xgrammar requires it on Linux
+# x86_64 but imports it only for CUDA tensors, and vLLM disables Triton when
+# no GPU driver is active.
+triton

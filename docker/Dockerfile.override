@@ -9,8 +9,10 @@ ARG OVERRIDE_SOURCE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-dock
 FROM $OVERRIDE_SOURCE AS override-source
 
 # Step 2: The Override Variant (reinstall torch-tpu wheel without dependencies)
+# uv is mounted rather than taken from BASE_IMAGE: the prod image does not ship it.
 FROM $BASE_IMAGE AS override-variant
 RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=from=ghcr.io/astral-sh/uv:0.12,source=/uv,target=/usr/bin/uv \
     --mount=from=override-source,source=/,target=/override-source,ro \
     set -eu; \
     set -- /override-source/opt/wheels/*.whl; \

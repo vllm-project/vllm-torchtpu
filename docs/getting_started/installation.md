@@ -110,7 +110,9 @@ VLLM_TARGET_DEVICE=empty uv pip install -e ../vllm --no-deps
 | :--- | :--- |
 | `--group vllm` | Installs pinned upstream `vllm` (`v0.29.0`) from source. |
 | `--group test` | Installs `pytest`, `pytest-mock`, `pytest-cov`, `parameterized`, and `vllm_test_utils`. |
-| `--extra benchmarking` | Installs `lm-eval`, `evalscope`, `datasets`, and `runai-model-streamer[gcs]`. |
+| `--extra benchmarking` | Installs `lm-eval`, `datasets`, and the other benchmarking dependencies. |
+| `--extra runai` | Installs `runai-model-streamer[gcs]`, needed for `--load-format runai_streamer` (streaming `gs://` checkpoints). |
+| `--group evalscope` | Installs `evalscope` for multimodal evals. Install it in a separate environment: its dependencies downgrade `openai` and `filelock`. |
 | `--extra omni` | Installs `vllm-omni` for multimodal diffusion models (e.g., FLUX, Wan2.2). |
 
 ---

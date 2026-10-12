@@ -78,9 +78,9 @@ cleanup() {
     bash "$IX_BENCHMARKING_DIR/cleanup_server.sh"
     ix_dump_server_log_context
     if [ -f "$SUMMARY" ] && [ "$SUMMARY_PRINTED" = "0" ]; then log "===== summary (partial) ====="; cat "$SUMMARY"; fi
-    if [ -n "$GCS_ROOT" ] && command -v gsutil >/dev/null 2>&1; then
+    if [ -n "$GCS_ROOT" ] && command -v gcloud >/dev/null 2>&1; then
         log "uploading $RESULTS_DIR to $GCS_ROOT"
-        gsutil -q -m cp -r "$RESULTS_DIR" "$GCS_ROOT/" 2>&1 | tail -3 || log "WARNING: GCS upload to $GCS_ROOT failed"
+        gcloud storage cp -r "$RESULTS_DIR" "$GCS_ROOT/" 2>&1 | tail -3 || log "WARNING: GCS upload to $GCS_ROOT failed"
     fi
 }
 trap cleanup EXIT INT TERM

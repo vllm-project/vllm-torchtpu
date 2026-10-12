@@ -66,8 +66,9 @@ CI image target built from `--target ci`.
 
 Use this image for CI and test infrastructure. It includes extra tooling on top of the base runtime, such as:
 
-* `git`
-* `google-cloud-cli`
+* `git` and a C/C++ toolchain (`build-essential`, `cmake`, `ninja-build`)
+* `uv`
+* `google-cloud-cli` (without `gsutil` and `bq`; use `gcloud storage`)
 * `gcsfuse`
 * `lsof`
 * `psmisc` / `fuser`
@@ -84,10 +85,13 @@ Example build using the standard helper script:
 ### `dev:latest`
 Developer image target built from `--target dev`.
 
-This image is based on the `ci` variant, copies the repository into the image, and installs the project in editable mode with the `vllm`/`test` dependency groups and the `benchmarking` extra:
+This image is based on the `ci` variant, copies the repository into the image, and installs the project in editable mode with the `vllm`/`test` dependency groups and the `benchmarking` and `runai` extras:
 
-* dependencies: `--group vllm --group test --extra benchmarking`
+* dependencies: `--group vllm --group test --extra benchmarking --extra runai`
+* `evalscope` in its own environment under `/opt/evalscope`, on `PATH` as `evalscope`
 * intended for local development, debugging, and running tests
+
+Every package the `prod` image ships has the same version here, so tests run against what `prod` ships. The build fails if the test or benchmarking dependencies would change one; `docker/uv-constraints.txt` holds the caps that prevent it.
 
 Example build using the standard helper script:
 
@@ -98,7 +102,13 @@ Example build using the standard helper script:
 ### `prod:latest`
 Production image target built from `--target prod`.
 
-This image is intended for regular runtime usage. It performs a standard install of the project and is the best target for production-style execution.
+This image is intended for regular runtime usage and is the best target for production-style execution. It contains:
+
+* the runtime dependencies, including the `runai` extra for `--load-format runai_streamer`
+* a standard (non-editable) install of the project
+* the repository's `examples/` under `/workspace/vllm-torchtpu/examples`
+
+It does not contain the compiler toolchain, `git`, `uv`, the CI tools, the test and benchmarking dependencies, or the rest of the repository. To install more packages in a derived image, use `pip`.
 
 Example build using the standard helper script:
 
@@ -110,12 +120,13 @@ Example build using the standard helper script:
 
 The Dockerfile also supports a few build arguments that may be useful in advanced workflows:
 
-* `VLLM_SOURCE`: when set, installs `vllm` from the copied local source tree
+* `VLLM_SOURCE`: when set, the `dev` image installs `vllm` in editable mode from the copied local source tree
 
 Example using the helper script with build arguments:
 
 ```bash
 ./docker/build_image.sh \
-  --target prod \
-  -t prod:latest
+  --target dev \
+  -s /path/to/vllm/source \
+  -t dev:latest
 ```

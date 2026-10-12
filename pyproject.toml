@@ -83,9 +83,12 @@ benchmarking = [
     "scikit-learn",
     "pandas",
     "lm-eval[api]==0.5.0.dev1",
-    "evalscope==1.10.0",
-    # Stream gs:// checkpoints via --load-format runai_streamer (multihost
-    # v7x-16 hosts have no disk for an HF download).
+    # evalscope: see the `evalscope` dependency group below.
+]
+
+# Stream gs:// checkpoints via --load-format runai_streamer (multihost
+# v7x-16 hosts have no disk for an HF download). The Docker images install it.
+runai = [
     "runai-model-streamer[gcs]",
 ]
 
@@ -131,6 +134,14 @@ test = [
     "parameterized",
     # Not published on PyPI; lives in vLLM's tests/ directory.
     "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@v0.29.0#subdirectory=tests/vllm_test_utils",
+]
+
+# The multimodal eval CLI used by scripts/vllm/benchmarking/run_eval_flow.sh.
+# Kept out of `benchmarking` because its litellm dependency caps openai<3 and
+# filelock<4, which would downgrade packages vLLM uses. Install it in its own
+# environment; the dev image puts it in /opt/evalscope.
+evalscope = [
+    "evalscope==1.10.0",
 ]
 
 [tool.pytest.ini_options]

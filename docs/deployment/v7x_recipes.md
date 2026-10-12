@@ -99,7 +99,7 @@ vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 \
 
 ## 2. Multi-Host Recipes (`v7x-16` & `v7x-32`)
 
-On multi-host TPU v7x slices without large local disks, stream checkpoints directly from Google Cloud Storage (`gs://`) using `--load-format runai_streamer` and `--enable-ep-weight-filter` so each rank downloads only its own MoE expert shard.
+On multi-host TPU v7x slices without large local disks, stream checkpoints directly from Google Cloud Storage (`gs://`) using `--load-format runai_streamer` and `--enable-ep-weight-filter` so each rank downloads only its own MoE expert shard. The Docker images include the streamer; for a pip install, add it with `pip install "vllm-torchtpu-core[runai]"`.
 
 ### `zai-org/GLM-5.2-FP8` on `v7x-16` (`2 Hosts, TP=1, DP=16 + EP`)
 
