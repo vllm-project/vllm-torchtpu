@@ -238,6 +238,49 @@ def create_cache(rng, total_pages, page_size, head_dim, kv_dtype):
 
 
 class CorrectnessTest(parameterized.TestCase):
+    @parameterized.parameters((16, 16), (128, 125), (256, 204), (272, 257), (256, 0))
+    def test_two_bank_prefetch_preserves_attention(self, tokens, valid):
+        """Lookahead keeps each chunk's KV and tail bounds paired with its query."""
+        from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
+            sparse_ragged_paged_attention_union_gather,
+        )
+
+        rng = np.random.default_rng(51)
+        rows, heads, topk = 1024, 64, 128
+        _, nope, rope = create_cache(rng, 2, rows, 512, jnp.bfloat16)
+        q = gen_random(rng, (tokens, heads, 512), jnp.bfloat16)
+        indices = rng.integers(0, 2 * rows, (tokens, topk), dtype=np.int32)
+        indices[:, -16:] = -1
+        tail = (
+            jnp.asarray(indices),
+            jnp.arange(2, dtype=jnp.int32),
+            jnp.array([0, valid], jnp.int32),
+            jnp.array([0, 0, 1], jnp.int32),
+            jnp.zeros(heads, jnp.float32),
+            jnp.zeros_like(q),
+            jnp.ones((tokens, heads), jnp.float32),
+            jnp.zeros((tokens, heads), jnp.float32),
+        )
+        expected = sparse_mla.sparse_ragged_paged_attention(
+            q,
+            nope,
+            rope,
+            *tail,
+            sm_scale=512**-0.5,
+        )
+        actual = jax.jit(
+            sparse_ragged_paged_attention_union_gather,
+            static_argnames=("sm_scale", "union_gather"),
+        )(
+            q,
+            (nope[:1], nope[1:]),
+            (rope[:1], rope[1:]),
+            *tail,
+            sm_scale=512**-0.5,
+            union_gather=False,
+        )
+        np.testing.assert_array_equal(np.asarray(expected), np.asarray(actual))
+
     def test_correctness(self):
         topk = 1024
         rng = np.random.default_rng()

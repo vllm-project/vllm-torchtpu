@@ -11,6 +11,7 @@ import torch
 from vllm_torchtpu.kernels.deepseek_v41 import index_word_scores
 
 from .cache import (
+    ROPE_WORDS,
     ROW_WORDS,
     _cache_num_rows,
     gather_cache_page_values,
@@ -537,12 +538,18 @@ def _csa_gather_pool(
             nope_hi, rope_hi, idx_hi, num_valid_indices=valid_hi, top_k=top_k
         )
         nope_out = jnp.where(in_hi[:, None], nope_1, nope_0)
-        r0 = unpack_union_rope_words(rope_0, top_k)
-        r1 = unpack_union_rope_words(rope_1, top_k)
-        rope_words = jnp.where(in_hi[:, None], r1, r0)
-        rope_out = repack_chunk_rope_words(
-            rope_words.reshape(num_periods, top_k, -1)
-        ).reshape(out_size // 4, -1)
+        # Select in the packed layout. Unpacking both payloads and repacking
+        # them expands the hot gather path into many tiled layout conversions.
+        # Each selected token owns both BF16 halves of its original words;
+        # packing an all-bits mask gives the exact bit ownership in the output.
+        word_mask = jnp.broadcast_to(
+            jnp.where(in_hi[:, None], jnp.int32(-1), jnp.int32(0)),
+            (out_size, ROPE_WORDS),
+        )
+        packed_mask = repack_chunk_rope_words(
+            word_mask.reshape(num_periods, top_k, -1)
+        ).reshape(rope_0.shape)
+        rope_out = rope_0 ^ ((rope_0 ^ rope_1) & packed_mask)
         return nope_out, rope_out
 
     assert not isinstance(rope_cache, tuple)
@@ -730,7 +737,7 @@ def sparse_ragged_paged_attention_union_gather(
 
     valid_total = cu_q_lens[distribution[2]]
 
-    for i in range(num_chunks):
+    def gather_chunk(i, cache_kv_nope, cache_kv_rope):
         start_pos = i * gather_and_attention_chunk_size
         end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
         chunk_size = end_pos - start_pos
@@ -760,6 +767,36 @@ def sparse_ragged_paged_attention_union_gather(
             )
         )
 
+        return (
+            gathered_nope_buffer,
+            gathered_rope_buffer,
+            start_pos,
+            batch_end,
+            kbs,
+            chunk_size,
+        )
+
+    if num_chunks == 0:
+        return sparse_mla.prepare_outputs(q, actual_num_q_heads, actual_head_dim)
+    current = gather_chunk(0, cache_kv_nope, cache_kv_rope)
+    for i in range(num_chunks):
+        pending = current
+        if i + 1 < num_chunks:
+            # Keep the pending chunk independent of the current attention.
+            # The previous attention's q gates prefetch to one chunk ahead,
+            # bounding gathered HBM buffers without a large while-loop carry.
+            q, cache_kv_nope, cache_kv_rope = jax.lax.optimization_barrier(
+                (q, cache_kv_nope, cache_kv_rope)
+            )
+            pending = gather_chunk(i + 1, cache_kv_nope, cache_kv_rope)
+        (
+            gathered_nope_buffer,
+            gathered_rope_buffer,
+            start_pos,
+            batch_end,
+            kbs,
+            chunk_size,
+        ) = current
         end_seq_idx = jnp.maximum(start_pos, batch_end)
         grid = (sparse_mla.cdiv(end_seq_idx - start_pos, kbs),)
         in_specs = [
@@ -826,6 +863,7 @@ def sparse_ragged_paged_attention_union_gather(
             swa_l,
             swa_m,
         )
+        current = pending
     return sparse_mla.prepare_outputs(q, actual_num_q_heads, actual_head_dim)
 
 
@@ -2142,6 +2180,16 @@ def paged_indexer_jax(
 
     width = records.shape[1]
     if not candidate_filter or candidates.shape[1] * block_size >= width:
+        return full_context(None)
+
+    # Bind shared-query prefill to one scoring pipeline when its static key
+    # volume is no larger than per-token candidate scoring. Both paths apply
+    # the same candidate mask and batch-wide short-context bypass. Keeping
+    # this choice static avoids compiling both pipelines into every layer.
+    if (
+        q.shape[0] > records.shape[0]
+        and records.shape[0] * width <= q.shape[0] * candidates.shape[1] * block_size
+    ):
         return full_context(None)
 
     def candidate_context(_):

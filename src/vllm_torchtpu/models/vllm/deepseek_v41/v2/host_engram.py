@@ -19,11 +19,13 @@ from typing import Any
 
 import numpy as np
 import torch
-from vllm.distributed import get_engram_dp_group
+from vllm.distributed import get_dp_group, get_engram_dp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
 from vllm.models.deepseek_v41.common.engram import (
     DEAD_ID,
-    engram_gathered_num_tokens,
+)
+from vllm.models.deepseek_v41.common.engram import (
+    engram_gathered_num_tokens as upstream_engram_gathered_num_tokens,
 )
 
 HOST_ENGRAM_KEY = "deepseek_v41_host_engram"
@@ -189,6 +191,19 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
         all_prompt=all_prompt,
         host_ready=True,
     )
+
+
+def engram_gathered_num_tokens() -> int:
+    """Read the host snapshot, before any work waiting on the device stream."""
+    context = get_forward_context()
+    sizes = context.additional_kwargs.get("tpu_num_tokens_across_dp_cpu")
+    if sizes is None:
+        return upstream_engram_gathered_num_tokens()
+    group = get_engram_dp_group()
+    assert group is not None
+    start = get_dp_group().rank_in_group - group.rank_in_group
+    # Engram groups are contiguous slices of the global DP group.
+    return max(sizes[start : start + group.world_size])
 
 
 def gather_host_engram_hashes(

@@ -723,6 +723,41 @@ class TestPagedIndexScoresJax:
 class TestPagedIndexerJax:
     """Comprehensive tests for paged_indexer_jax routing and context branches."""
 
+    @pytest.mark.parametrize("active,live_length", [(16, 128), (1, 128), (16, 8)])
+    @pytest.mark.cpu_test
+    def test_shared_prefill_binds_one_pipeline(self, active, live_length):
+        rng = np.random.default_rng(408)
+        pool, records, requests, _, q, weights = _request_inputs(rng, 2, 16, 128)
+        records = jnp.asarray(records)
+        requests = jnp.asarray(requests)
+        lengths = jnp.where(jnp.arange(16) < active, live_length, 0)
+        candidates = jnp.asarray(rng.integers(-1, 8, (16, 2)), jnp.int32)
+
+        def run(q, lengths):
+            return paged_indexer_jax(
+                q,
+                pool,
+                records,
+                weights,
+                lengths,
+                candidates,
+                requests,
+                topk=16,
+                block_size=16,
+                candidate_write=False,
+                candidate_filter=True,
+            )
+
+        scores = paged_index_scores_jax(q, pool, records, weights, lengths, requests)
+        scores = jnp.where(records[requests] >= 0, scores, -jnp.inf)
+        expected = select_indices_jax(scores, lengths, candidates, 16, 16, False, True)
+        actual = jax.jit(run)(q, lengths)
+        for got, want in zip(actual, expected):
+            np.testing.assert_array_equal(got, want)
+        # A value-dependent scoring choice otherwise clones both pipelines.
+        graph = jax.make_jaxpr(run)(q, lengths).jaxpr
+        assert all(eqn.primitive.name != "cond" for eqn in graph.eqns)
+
     def test_routing_to_full_context_via_not_candidate_filter(self):
         rng = np.random.default_rng(404)
         width, topk, block_size = 640, 64, 16
