@@ -14,6 +14,7 @@
 """Tests for Deepseek V4 StreamIndex Top-K kernel."""
 
 import functools
+import re
 from typing import NamedTuple
 
 import jax
@@ -31,6 +32,13 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
     convert_cache_to_seq_along_lane,
 )
+
+
+# The frontend attribute itself (`{_scheduling_group_id = "3"}`), not the bare
+# name: a tokamax operator's `xla_metadata_payload` carries its config's field
+# names, among them `stage2_scheduling_group_id`, which a substring test would
+# match whether or not anything was scheduled.
+_SCHEDULING_GROUP = re.compile(r"(?<!\w)_scheduling_group_id\s*=")
 
 
 # =====================================================================
@@ -1196,7 +1204,7 @@ def test_chunked_topk_matches_the_naive_reference(T_list, chunk_tokens):
     )
 
     hlo = streamindex_topk.lower(**kwargs).as_text()
-    assert "_scheduling_group_id" in hlo, (
+    assert _SCHEDULING_GROUP.search(hlo), (
         f"chunk_tokens={chunk_tokens} did not chunk: no scheduling group id "
         "reached the HLO, so the kernel took the single-pass fallback and "
         "this test would prove nothing"
@@ -1381,7 +1389,7 @@ class TestChunkedPipelining:
         # proof that more than one chunk was emitted. Without it this would be
         # comparing the unchunked kernel against itself.
         hlo = streamindex_topk.lower(**chunked_kwargs).as_text()
-        assert "_scheduling_group_id" in hlo, (
+        assert _SCHEDULING_GROUP.search(hlo), (
             "no scheduling group annotation: the kernel ran a single unchunked"
             " pass and this comparison would pass trivially")
 
@@ -1418,7 +1426,7 @@ class TestChunkedPipelining:
                                             chunk_tokens,
                                             return_scores=True)
         hlo = streamindex_topk.lower(**chunked_kwargs).as_text()
-        assert "_scheduling_group_id" in hlo, (
+        assert _SCHEDULING_GROUP.search(hlo), (
             "no scheduling group annotation: the kernel ran a single unchunked"
             " pass and this comparison would pass trivially")
 
@@ -1462,7 +1470,7 @@ class TestChunkedPipelining:
         hlo = streamindex_topk.lower(
             **_chunk_call_kwargs(inputs, T_list, S_list, 128, 1, 8, 2, _HAS,
                                  chunk_tokens)).as_text()
-        assert "_scheduling_group_id" not in hlo, (
+        assert not _SCHEDULING_GROUP.search(hlo), (
             "an indivisible chunk_tokens emitted more than one chunk; the"
             " fallback that the cases above rely on has changed")
 

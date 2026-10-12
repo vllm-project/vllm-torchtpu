@@ -21,7 +21,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_gather
+from vllm_torchtpu.kernels import tokamax_ops
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 
@@ -885,7 +885,7 @@ def sparse_ragged_paged_attention(
         # based on their lengths. For the sequences-segment below certain length,
         # we use a different kernel (dense attention and mask), for the rest of
         # sequences, we use this gather-and-attention kernel.
-        gathered_nope_buffer, gathered_rope_buffer = csa_gather.csa_gather(
+        gathered_nope_buffer, gathered_rope_buffer = tokamax_ops.csa_gather(
             cache_kv_nope,
             cache_kv_rope,
             indices,

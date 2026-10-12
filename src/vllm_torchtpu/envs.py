@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
+    VLLM_TPU_USE_TOKAMAX: bool = True
     TPU_KERNEL_RELOAD_MODULES: str = ""
     TPU_GREEDY_TOP_TOKENS: bool = False
     DP_SCHED_ENABLED: bool = False
@@ -619,6 +620,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # /reload_kernel endpoint so kernel edits apply to a running server
     # without restarting it. Development aid; off by default.
     "TPU_KERNEL_ITER_MODE": lambda: bool(int(os.getenv("TPU_KERNEL_ITER_MODE") or "0")),
+    # Run tokamax's batched RPA, CSA gather, lightning indexer and SparseCore
+    # top-k in place of the in-tree kernels (see kernels/tokamax_ops.py and
+    # `_tokamax_rpa_unsupported_reason`). 0 keeps every in-tree kernel, e.g.
+    # for an A/B against tokamax.
+    "VLLM_TPU_USE_TOKAMAX": lambda: bool(int(os.getenv("VLLM_TPU_USE_TOKAMAX") or "1")),
     # Comma-separated module names re-imported by /reload_kernel (and, in
     # kernel-iteration mode, excluded from the compile-cache key). Defaults
     # to the in-tree experimental RPA kernel modules; see

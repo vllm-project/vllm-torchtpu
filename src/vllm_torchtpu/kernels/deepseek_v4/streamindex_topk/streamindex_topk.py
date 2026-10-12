@@ -29,9 +29,9 @@ from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
     BITS_NEG_INF,
-    sparsecore_topk,
     sparsecore_topk_dcp_merge,
 )
+from vllm_torchtpu.kernels.tokamax_ops import sparsecore_topk
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     bref_override,
     config,

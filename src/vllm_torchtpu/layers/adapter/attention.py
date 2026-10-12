@@ -542,6 +542,82 @@ def _pallas_rpa_kernel_batched(
     )
 
 
+def _fake_tokamax_rpa(queries, keys, values, kv_cache, *args, out_dtype=None, **kwargs):
+    """Meta shapes for tokamax's batched RPA operator under vLLM's compile.
+
+    jax_op's default fake re-exports the JAX function and refuses a
+    `torch.SymInt` dimension, and vLLM compiles with a symbolic token count,
+    so -- as for the in-tree RPA op -- vLLM supplies its own. The output is
+    query-shaped and the cache keeps its shape.
+    """
+    del keys, values, args, kwargs
+    dtype = queries.dtype if out_dtype is None else getattr(torch, out_dtype)
+    return torch.empty_like(queries, dtype=dtype), torch.empty_like(kv_cache)
+
+
+_donating_tokamax_rpa_op = None
+
+
+def _donating_tokamax_rpa(tokamax_rpa: Any) -> Any:
+    """tokamax's batched RPA torch operator, registered to donate the KV pool.
+
+    tokamax's `PallasMosaicTpuBatchedRpa` registers itself without donation,
+    so each call returns a new pool and the `copy_` writeback lands at the end
+    of vLLM's compiled graph: the whole pool exists twice, and Qwen3-0.6B at
+    gpu_memory_utilization=0.6 needs 112 GiB of HLO temporaries on a 95 GiB
+    v7x chip. `TorchOp` takes `donate_argnums` and `fake_impl` from the
+    constructor, so a subclass that sets only those -- plus its own op name --
+    gets a second registration with donation and vLLM's fake, through
+    tokamax's own `TorchOp` machinery. `__call__` and `op_impl_call` are
+    tokamax's, inherited unchanged.
+    """
+    global _donating_tokamax_rpa_op
+    if _donating_tokamax_rpa_op is None:
+        base = type(tokamax_rpa.PallasMosaicTpuBatchedRpa)
+
+        class _DonatingBatchedRpa(base):
+            def __init__(self):
+                super().__init__()
+                self.jax_op_name = "vllm_tpu_donating_batched_rpa"
+                self.donate_argnums = (3,)  # kv_cache
+                self.fake_impl = _fake_tokamax_rpa
+
+        _donating_tokamax_rpa_op = _DonatingBatchedRpa()
+    return _donating_tokamax_rpa_op
+
+
+def _tokamax_rpa_unsupported_reason(
+    impl: "PallasAttentionBackendImpl",
+    mesh: jax.sharding.Mesh,
+    *,
+    block_major: bool,
+) -> str | None:
+    """Why this layer cannot use tokamax's batched RPA operator, or None.
+
+    Batched RPA goes to tokamax's `PallasMosaicTpuBatchedRpa` unless one of
+    these holds, in which case the layer keeps the in-tree batched kernel. PCP
+    streaming and DCP never reach this check: they have kernels of their own.
+    """
+    if not envs.VLLM_TPU_USE_TOKAMAX:
+        return "VLLM_TPU_USE_TOKAMAX=0"
+    if mesh.shape.get("model", 1) > 1:
+        # The operator registers itself once, with no mesh and no partition
+        # specs, so there is nothing to shard heads over in one process.
+        # Multi-process TP, where each worker sees `model=1`, is unaffected.
+        return f"{mesh.shape['model']} model-axis devices in one process"
+    if block_major:
+        return "the block-major unified pool (the operator takes one layer's pool)"
+    if impl.head_size == 64:
+        return "head_dim 64 (the hd64 kernel and its pool layout)"
+    if impl.sinks is not None:
+        return "attention sinks (not in the operator's signature)"
+    if impl.kv_layout is not batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE:
+        return "VLLM_KV_CACHE_LAYOUT=HND"
+    if not impl.use_causal_mask:
+        return "use_causal_mask=False (the operator is causal only)"
+    return None
+
+
 # ======================================================================================
 # VLLM Attention Backend
 # ======================================================================================
@@ -793,6 +869,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
     # kernels for layers with identical configs.
     # Mapping of (sliding_window, mesh, q_scale, k_scale, v_scale) -> custom op
     _kernel_registry: dict = {}
+    # Same, for closures over tokamax's batched RPA operator.
+    _tokamax_kernel_registry: ClassVar[dict] = {}
 
     # Each Impl subclass points at its own RPA kernel entry function. Wrapped
     # with `staticmethod` so attribute access through `self` doesn't bind it
@@ -914,6 +992,163 @@ class PallasAttentionBackendImpl(AttentionImpl):
         return kernel_instance_id
 
     def _build_rpa_kernel(
+        self,
+        q_scale: float | None,
+        k_scale: float | None,
+        v_scale: float | None,
+        skip_kv_update: bool = False,
+        use_pcp_streaming: bool = False,
+        cp_kv_cache_interleave_size: int = 0,
+        block_major: bool = False,
+    ):
+        """Returns this layer's RPA kernel.
+
+        The batched backend's non-PCP path goes to tokamax's batched RPA
+        operator unless `_tokamax_rpa_unsupported_reason` names a reason not
+        to; everything else is the in-tree kernel.
+        """
+        in_tree_kwargs = dict(
+            skip_kv_update=skip_kv_update,
+            use_pcp_streaming=use_pcp_streaming,
+            cp_kv_cache_interleave_size=cp_kv_cache_interleave_size,
+            block_major=block_major,
+        )
+        if self._kernel_entry is not _pallas_rpa_kernel_batched or use_pcp_streaming:
+            return self._build_in_tree_rpa_kernel(
+                q_scale, k_scale, v_scale, **in_tree_kwargs
+            )
+
+        config_key = ("tokamax", q_scale, k_scale, v_scale, skip_kv_update, block_major)
+        existing = self._kernel_config_cache.get(config_key)
+        if existing is not None:
+            return existing
+
+        # Built either way: it is the fallback for a pool tokamax cannot take,
+        # which is only known from the pool's shape at call time.
+        in_tree = self._build_in_tree_rpa_kernel(
+            q_scale, k_scale, v_scale, **in_tree_kwargs
+        )
+        reason = _tokamax_rpa_unsupported_reason(
+            self, get_vllm_model_wrapper_context().mesh, block_major=block_major
+        )
+        kernel = None
+        if reason is None:
+            try:
+                kernel = self._build_tokamax_rpa_kernel(
+                    q_scale, k_scale, v_scale, skip_kv_update, in_tree
+                )
+            except ImportError as e:
+                reason = f"tokamax not being importable ({e})"
+        if kernel is None:
+            logger.warning_once(
+                "Batched RPA: falling back to the in-tree kernel because of %s.",
+                reason,
+            )
+            kernel = in_tree
+        self._kernel_config_cache[config_key] = kernel
+        return kernel
+
+    def _build_tokamax_rpa_kernel(
+        self,
+        q_scale: float | None,
+        k_scale: float | None,
+        v_scale: float | None,
+        skip_kv_update: bool,
+        in_tree: Callable[..., torch.Tensor],
+    ) -> Callable[..., torch.Tensor]:
+        """Closes over tokamax's batched RPA torch operator for this layer.
+
+        Calls go through `PallasMosaicTpuBatchedRpa.__call__`, which resolves
+        the kernel config inside the op, on the donating registration from
+        `_donating_tokamax_rpa`; what is left here is the writeback. The pool
+        crosses in the packed 5-D shape the runner allocated, which tokamax's
+        wrapper takes natively, so donation targets the runner's own buffer.
+        """
+        # Imported lazily so a missing or moved tokamax surfaces against a
+        # concrete layer rather than at module import.
+        from tokamax.experimental.torch_tpu.ops.batched_rpa import (
+            torch_pallas_mosaic_tpu as tokamax_rpa,
+        )
+
+        # By value: these are the operator's static arguments, and with the
+        # pool shape they key its compilations. `kv_layout` stays at the
+        # operator's HEAD_ALONG_SUBLANE default, the only layout allowed here.
+        config = dict(
+            use_causal_mask=self.use_causal_mask,
+            sm_scale=self.scale,
+            sliding_window=self.sliding_window,
+            soft_cap=self.logits_soft_cap,
+            q_scale=q_scale,
+            k_scale=k_scale,
+            v_scale=v_scale,
+            skip_kv_update=skip_kv_update,
+            decode_query_size=self.decode_query_size,
+        )
+        registry_key = (*sorted(config.items()), id(in_tree))
+        existing = self._tokamax_kernel_registry.get(registry_key)
+        if existing is not None:
+            return existing
+        if envs.TPU_KERNEL_ITER_MODE:
+            # As for the in-tree op, kernel-iteration mode runs the op eagerly,
+            # where donating the pool would kill the buffer `copy_` writes
+            # into, so it takes tokamax's own, non-donating registration --
+            # with vLLM's fake, as Dynamo still traces through it.
+            tokamax_batched_rpa = tokamax_rpa.PallasMosaicTpuBatchedRpa
+            tokamax_batched_rpa._torch_tokamax_op.register_fake(_fake_tokamax_rpa)
+        else:
+            tokamax_batched_rpa = _donating_tokamax_rpa(tokamax_rpa)
+
+        def tokamax_rpa_kernel_impl(
+            kv_cache,
+            query,
+            key,
+            value,
+            seq_lens,
+            block_tables,
+            query_start_loc,
+            request_distribution,
+            sinks=None,
+        ):
+            assert sinks is None, "sinks are routed to the in-tree kernel"
+            if kv_cache.ndim != 5:
+                # A shared pool, `[N, bs, packing, words]`: only the in-tree
+                # kernel knows how to view it as this layer's pages.
+                return in_tree(
+                    kv_cache,
+                    query,
+                    key,
+                    value,
+                    seq_lens,
+                    block_tables,
+                    query_start_loc,
+                    request_distribution,
+                    sinks,
+                )
+            outputs, new_kv_cache = tokamax_batched_rpa(
+                query,
+                key,
+                value,
+                kv_cache,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                **config,
+            )
+            if new_kv_cache.shape != kv_cache.shape:
+                raise RuntimeError(
+                    "tokamax returned an incompatible KV cache: expected "
+                    f"{tuple(kv_cache.shape)}, got {tuple(new_kv_cache.shape)}."
+                )
+            # Donation + copy_ writeback, as for the in-tree op: XLA aliases
+            # the output onto the donated pool, so this is an in-place update.
+            kv_cache.copy_(new_kv_cache)
+            return outputs
+
+        self._tokamax_kernel_registry[registry_key] = tokamax_rpa_kernel_impl
+        return tokamax_rpa_kernel_impl
+
+    def _build_in_tree_rpa_kernel(
         self,
         q_scale: float | None,
         k_scale: float | None,

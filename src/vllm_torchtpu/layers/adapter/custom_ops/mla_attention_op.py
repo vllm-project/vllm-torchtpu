@@ -44,6 +44,7 @@ from vllm.v1.attention.backends.mla.prefill import selector
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group, get_or_create_dcp_mesh
+from vllm_torchtpu.kernels.tokamax_ops import streamindex_topk
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME,
     KVLayout,
@@ -53,7 +54,6 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     get_kv_cache_shape,
     indexer_kv_layout,
     kv_cache_append,
-    streamindex_topk,
     streamindex_topk_dcp,
 )
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (

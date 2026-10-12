@@ -31,6 +31,13 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     streamindex_topk_dcp,
 )
 
+# The frontend attribute itself (`{_scheduling_group_id = "3"}`), not the bare
+# name: a tokamax operator's `xla_metadata_payload` carries its config's field
+# names, among them `stage2_scheduling_group_id`, which a substring test would
+# match whether or not anything was scheduled.
+_SCHEDULING_GROUP = re.compile(r"(?<!\w)_scheduling_group_id\s*=")
+
+
 pytestmark = pytest.mark.tpu_test
 
 P = jax.sharding.PartitionSpec
@@ -431,7 +438,7 @@ def test_dcp_chunking_does_not_change_the_result(chunk_tokens, dcp_size):
     hlo = streamindex_topk_dcp.lower(
         *args, **kwargs, chunk_tokens=chunk_tokens
     ).as_text()
-    assert "_scheduling_group_id" in hlo, (
+    assert _SCHEDULING_GROUP.search(hlo), (
         "no scheduling group annotation: the DCP path ran a single unchunked"
         " pass, so this comparison would pass trivially"
     )
