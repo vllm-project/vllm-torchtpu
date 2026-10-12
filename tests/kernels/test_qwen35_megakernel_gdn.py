@@ -304,3 +304,88 @@ def test_gpr_three_stage_matches_fused_at_tp16_checkpoint_geometry():
         )
         conv = p0 + c.rec_pages
         assert np.array_equal(p_3[conv, 0, :cp_rows], p_f[conv, 0, :cp_rows]), int(slot)
+
+
+def test_gdn_checkpoint_slot_stride_matches_packed_layout():
+    """GDN checkpoint slots `gdn_stride_pages` apart (vLLM / Raiden place manager block b at page
+    b * (block_size // page_size), e.g. 10 pages at block 1280 vs 5 GDN pages at TP8) must give
+    the same hidden rows and slot contents as the packed layout, for fused and 3-stage pool I/O,
+    and must leave the pages between slots untouched."""
+    base = dataclasses.replace(
+        K.TINY_EP,
+        R=1,
+        B=20,
+        T=4,
+        L=2,
+        att_every=2,
+        H=2048,
+        NH=1,
+        NKV=1,
+        KH=1,
+        VH=4,
+        I=128,
+        IS=128,
+        E=128,
+        TOPK=2,
+        e_slots=128,
+        paged_kv=True,
+        page_size=128,
+        max_pages_per_seq=8,
+        ctx=1024,
+    )
+    gp = base.gdn_pages
+    st_shapes = K.state_shapes(dataclasses.replace(base, paged_kv=False))
+    St = {
+        k: (
+            jax.random.normal(jax.random.PRNGKey(40 + i), (base.R, *s), jnp.float32)
+            * (0.1 if k in ("conv", "rec") else 0.5)
+        ).astype(dt)
+        for i, (k, (s, dt)) in enumerate(st_shapes.items())
+    }
+    pos = jnp.asarray(
+        [10 + 37 * s + t for s in range(base.NS) for t in range(base.T)], jnp.int32
+    )
+    hid = jax.random.normal(jax.random.PRNGKey(9), (base.M, base.H), jnp.float32)
+    hid = jnp.where(jnp.arange(base.M)[:, None] < base.B, hid, 0.0).astype(jnp.bfloat16)
+    mesh = Mesh(np.array(setup_8_cpu_devices()[:1]), ("tp",))
+    kv_pages = base.NS * (base.ctx // base.page_size)
+
+    def run(stride):
+        c = dataclasses.replace(base, gdn_stride_pages=stride)
+        pt, ckpt, roff, min_pages = pool_io.default_pool_layout(c)
+        c = dataclasses.replace(c, num_pages=min_pages)
+        tiles = dataclasses.replace(K.default_tiles(c), kv_blk=512, kv_sub=256)
+        torch.manual_seed(0)
+        w = jnp_leaves(pack_weights(make_tiny_backbone(c, e_slots=c.EW), c, 0, tiles))
+        raw = [np.array(r) for r in pool_io.states_to_pool(c, St, pt, ckpt, roff)]
+        gap = np.zeros(min_pages, dtype=bool)
+        if stride > gp:
+            for slot in np.unique(np.asarray(ckpt)):
+                gap[int(slot) * stride + gp : (int(slot) + 1) * stride] = True
+            for r in raw:
+                r.view(np.uint8)[gap] = 0x5A
+        res = {}
+        for fused in (True, False):
+            fn, _, _, _ = pool_io.make_flat_pooled_step(
+                mesh, c, tiles, fused_pool_io=fused, interpret=True, skip=frozenset({"experts"})
+            )
+            out = fn(pos, hid, *w, *[jnp.array(r, copy=True) for r in raw], pt, ckpt, roff)
+            pages = np.asarray(jax.lax.bitcast_convert_type(out[1], jnp.uint8))
+            slots = {
+                int(s): pages[int(s) * stride : int(s) * stride + gp]
+                for s in np.unique(np.asarray(ckpt))
+            }
+            res[fused] = (np.asarray(out[0][: c.B], np.float32), pages[:kv_pages], slots, pages[gap])
+        return res
+
+    packed, strided = run(gp), run(2 * gp + 1)
+    for fused in (True, False):
+        h_p, kv_p, slots_p, _ = packed[fused]
+        h_s, kv_s, slots_s, gap_s = strided[fused]
+        assert np.isfinite(h_s).all()
+        np.testing.assert_array_equal(h_s, h_p, err_msg=f"hidden rows differ (fused={fused})")
+        assert np.array_equal(kv_s, kv_p), f"KV pages differ (fused={fused})"
+        assert len(slots_s) == len(slots_p)
+        for (sp, a), (ss, b) in zip(sorted(slots_p.items()), sorted(slots_s.items())):
+            assert np.array_equal(a, b), f"GDN slot {sp}/{ss} differs (fused={fused})"
+        assert gap_s.size and np.all(gap_s == 0x5A), f"pages between slots written (fused={fused})"

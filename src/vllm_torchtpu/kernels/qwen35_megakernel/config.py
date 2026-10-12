@@ -202,6 +202,10 @@ class MKConfig:
     num_pages: int = 37705
     page_size: int = 128
     max_pages_per_seq: int = 2050
+    # Kernel pages between consecutive GDN checkpoint slots in the pool (0 -> gdn_pages). vLLM and
+    # Raiden place manager block b's GDN state at page b * (block_size // page_size), so a vLLM
+    # block larger than gdn_pages * page_size tokens (e.g. 1280 at TP8) leaves a gap per slot.
+    gdn_stride_pages: int = 0
     fused_pool_io: bool = False  # P1+P2: gather/scatter GDN & KV states directly in raw[0..14]
     act_mode: str = "from_ckpt"  # "from_ckpt", "all", or "ref" when fused_pool_io=True
     ckpt_2d: bool = False        # True when ckpt_indices is 2D [NS, K] instead of 3D [G_PER_ATT, NS, K]
@@ -307,6 +311,12 @@ class MKConfig:
     @property
     def gdn_pages(self) -> int:  # total kernel pages per GDN state checkpoint (recurrent + 1 conv)
         return self.rec_pages + 1
+
+    @property
+    def gdn_stride(self) -> int:  # kernel pages from one GDN checkpoint slot to the next
+        stride = self.gdn_stride_pages or self.gdn_pages
+        assert stride >= self.gdn_pages, (stride, self.gdn_pages)
+        return stride
 
     @property
     def CR(self):  # conv state rows: three taps x B rows

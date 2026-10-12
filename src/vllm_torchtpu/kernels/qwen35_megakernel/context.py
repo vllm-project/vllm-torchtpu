@@ -234,6 +234,7 @@ class MKBuildContext:
         ssm_u32_rows = (vh * KD) // 2
         REC_PAGES = c.rec_pages
         GDN_PAGES = c.gdn_pages
+        GDN_STRIDE = c.gdn_stride
         SSM_U32_CAP = REC_PAGES * 128
         ckpt_is_3d = not c.ckpt_2d
         roff_is_2d = not c.roff_1d
@@ -568,6 +569,7 @@ class MKBuildContext:
             ssm_u32_rows,
         )
         self.REC_PAGES, self.GDN_PAGES, self.SSM_U32_CAP = REC_PAGES, GDN_PAGES, SSM_U32_CAP
+        self.GDN_STRIDE = GDN_STRIDE
         self.ckpt_is_3d, self.roff_is_2d = ckpt_is_3d, roff_is_2d
         self.K_ckpt, self.ckpt_t_off = K_ckpt, ckpt_t_off
         self.HIER, self.N_HIER3, self.RSAG, self.WAR = HIER, N_HIER3, RSAG, WAR

@@ -1921,6 +1921,22 @@ class Qwen35Megakernel:
         ]
         self.attn_layer_name = self.backbone.layers[3].self_attn.attn.layer_name
 
+        # The stock GDN op and the KV connectors place manager block b's GDN state at kernel page
+        # b * (block_size // page_size), so checkpoint slots sit that many pages apart.
+        block_size = int(
+            getattr(runner, "block_size", 0) or runner.vllm_config.cache_config.block_size
+        )
+        _need(
+            block_size % self.page_size == 0,
+            f"vLLM block_size {block_size} is not a multiple of the kernel page size {self.page_size}",
+        )
+        gdn_stride = block_size // self.page_size
+        _need(
+            gdn_stride >= self.base_cfg.gdn_pages,
+            f"vLLM block_size {block_size} holds {gdn_stride} kernel pages, fewer than the "
+            f"{self.base_cfg.gdn_pages} of one GDN state checkpoint",
+        )
+
         self.base_cfg = dataclasses.replace(
             self.base_cfg,
             ctx=max(self.base_cfg.ctx, self.max_pages_per_seq * self.page_size),
@@ -1928,6 +1944,7 @@ class Qwen35Megakernel:
             page_size=self.page_size,
             max_pages_per_seq=self.max_pages_per_seq,
             paged_kv=True,
+            gdn_stride_pages=gdn_stride,
         )
 
         runner_token_paddings = tuple(
@@ -1944,11 +1961,12 @@ class Qwen35Megakernel:
         self._bound = True
         logger.info(
             "Qwen3.5 megakernel bound to %d unified pools (num_pages=%d, "
-            "page_size=%d, max_pages_per_seq=%d, decode_buckets=%s, verify_buckets=%s, "
-            "fused_pool_io=%s (B<=%d or B>=%d), zero_copy=%s)",
+            "page_size=%d, gdn_stride_pages=%d, max_pages_per_seq=%d, decode_buckets=%s, "
+            "verify_buckets=%s, fused_pool_io=%s (B<=%d or B>=%d), zero_copy=%s)",
             len(self.raw_pools),
             self.num_pages,
             self.page_size,
+            self.base_cfg.gdn_stride,
             self.max_pages_per_seq,
             self.buckets,
             self.verify_buckets,
@@ -2849,7 +2867,9 @@ class Qwen35Megakernel:
             return False
         t0 = time.monotonic()
         try:
-            T, B, NP, MPS = 4, 4, 32, 32
+            T, B, MPS = 4, 4, 32
+            # Checkpoint slots 1..T at the bound GDN stride, then 3 KV pages.
+            NP = max(32, (1 + T) * self.base_cfg.gdn_stride + 3)
             bucket_fused = bool(self.fused_pool_io and self._bucket_is_fused(B))
             c = dataclasses.replace(
                 self.base_cfg,
@@ -2883,12 +2903,13 @@ class Qwen35Megakernel:
                 donate_argnums=donate_argnums,
             )
 
-            # One sequence with plen = 10 cached tokens on page 25; pages 26..27
-            # complete its first 2048-token KV block together with the padded
-            # page 0. Checkpoint slots 1..4 (pages 5..24 at R=8) hold zero GDN
-            # states.
-            kv_page, ckpt0 = 25, 1
-            gp = c.gdn_pages
+            # One sequence with plen = 10 cached tokens on page kv_page (25 when
+            # GDN slots are packed); the next 2 pages complete its first 2048-token
+            # KV block together with the padded page 0. Checkpoint slots 1..4
+            # (pages 5..24 at R=8 with packed slots) hold zero GDN states.
+            ckpt0 = 1
+            gp = c.gdn_stride
+            kv_page = max(25, (ckpt0 + T) * gp)
             u8 = np.full((NP, 2, 64, 4, self.page_size), 0xFF, dtype=np.uint8)
             u8[ckpt0 * gp:(ckpt0 + T) * gp] = 0
             u8[kv_page] = 0
@@ -2970,7 +2991,7 @@ class Qwen35Megakernel:
         max_t = max(T for T, _ in all_keys)
         # Fused pool I/O sentinel pages: KV page 0 and the rec pages of GDN
         # checkpoint slot 1 (pages 5..8 at R=8).
-        gp = self.base_cfg.gdn_pages
+        gp = self.base_cfg.gdn_stride
         gdn_sent = slice(gp, gp + self.base_cfg.rec_pages)
         n_save = min(self.num_pages, max(gp, gp * (max_t + 1)))
         # Never slice-clone or slice-write raw_pools on TPU (PyTorch/XLA lowers
