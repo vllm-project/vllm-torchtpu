@@ -411,6 +411,7 @@ class TpuPlatform(Platform):
         "TPU_USE_RAIDEN_KV_CACHE_MANAGER",
         "TPU_RAIDEN_GLM_ADMISSION",
         "TPU_KV_RESHARD_TRANSPORT",
+        "VLLM_TPU_DP_DECODE_AWARE_PREFILL_CHUNK_CAP",
     ]
 
     # The "Platform" base class has import_kernels() that tries to import
@@ -784,6 +785,11 @@ class TpuPlatform(Platform):
                     vllm_config.model_config.max_model_len
                     + scheduler_config.max_num_seqs,
                 )
+            decode_aware_cap = envs.VLLM_TPU_DP_DECODE_AWARE_PREFILL_CHUNK_CAP
+            if decode_aware_cap is not None and decode_aware_cap > 0:
+                aligned_cap = max(128, ((int(decode_aware_cap) + 127) // 128) * 128)
+                if aligned_cap not in extra_bucket_sizes:
+                    extra_bucket_sizes.append(aligned_cap)
             compilation_config.compile_sizes = cast(
                 list[int | str],
                 _get_token_paddings(
@@ -1014,17 +1020,39 @@ class TpuPlatform(Platform):
             )
             parallel_config.distributed_executor_backend = "uni"
 
-        if envs.DP_SCHED_ENABLED and parallel_config.data_parallel_size > 1:
+        decode_aware_cap = envs.VLLM_TPU_DP_DECODE_AWARE_PREFILL_CHUNK_CAP
+        enable_dp_sched = bool(
+            envs.DP_SCHED_ENABLED
+            or (decode_aware_cap is not None and decode_aware_cap > 0)
+        )
+        if enable_dp_sched and parallel_config.data_parallel_size > 1:
             dp_sched_cls = "vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"
-            if scheduler_config.scheduler_cls != dp_sched_cls:
-                assert scheduler_config.scheduler_cls is None, (
-                    "Cannot have DP_SCHED_ENABLED enabled and also a custom "
-                    "scheduler being provided."
-                )
+            paw_sched_cls = (
+                "vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler"
+            )
+            if scheduler_config.scheduler_cls is None:
                 scheduler_config.scheduler_cls = dp_sched_cls
                 logger.info(
-                    "Enabled TpuDpScheduler (DP_SCHED_ENABLED=1) for DP=%d.",
+                    "Enabled TpuDpScheduler (DP_SCHED_ENABLED=%s, "
+                    "VLLM_TPU_DP_DECODE_AWARE_PREFILL_CHUNK_CAP=%s) for DP=%d.",
+                    envs.DP_SCHED_ENABLED,
+                    decode_aware_cap,
                     parallel_config.data_parallel_size,
+                )
+            elif scheduler_config.scheduler_cls in (dp_sched_cls, paw_sched_cls):
+                logger.info(
+                    "Using %s with TpuDpScheduler decode-aware clamping "
+                    "(DP_SCHED_ENABLED=%s, "
+                    "VLLM_TPU_DP_DECODE_AWARE_PREFILL_CHUNK_CAP=%s) for DP=%d.",
+                    scheduler_config.scheduler_cls,
+                    envs.DP_SCHED_ENABLED,
+                    decode_aware_cap,
+                    parallel_config.data_parallel_size,
+                )
+            elif envs.DP_SCHED_ENABLED:
+                raise AssertionError(
+                    "Cannot have DP_SCHED_ENABLED enabled and also a custom "
+                    "scheduler being provided."
                 )
 
         kv_transfer_config = vllm_config.kv_transfer_config

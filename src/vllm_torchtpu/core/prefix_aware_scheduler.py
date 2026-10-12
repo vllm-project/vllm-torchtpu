@@ -32,13 +32,14 @@ from itertools import islice
 from typing import cast
 
 from vllm.logger import init_logger
-from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.request_queue import (
     FCFSRequestQueue,
     RequestQueue,
     SchedulingPolicy,
 )
 from vllm.v1.request import Request
+
+from vllm_torchtpu.core.tpu_scheduler import TpuDpScheduler
 
 logger = init_logger("vllm." + __name__)
 
@@ -49,7 +50,7 @@ _TIER_PREEMPTED = 1
 _TIER_NORMAL = 2
 
 
-class PrefixAwareScheduler(AsyncScheduler):
+class PrefixAwareScheduler(TpuDpScheduler):
     """Admit ready requests prioritizing fewest uncached prompt tokens."""
 
     #: Lookahead window of ready requests to evaluate for cached prefix length.
@@ -61,6 +62,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._paw_cold_tokens = 0
         self._paw_prompt_tokens = 0
         self._paw_scoring_broken = False
+        self._paw_ext_scoring_broken = False
 
         logger.info("PrefixAwareScheduler ACTIVE (window=%d)", self.WINDOW)
 
@@ -72,10 +74,30 @@ class PrefixAwareScheduler(AsyncScheduler):
         if request.num_computed_tokens > 0:
             return request.num_computed_tokens
         try:
+            max_hit_len = max(request.num_tokens - 1, 0)
             result = kvm.coordinator.find_longest_cache_hit(
-                request.block_hashes, max(request.num_tokens - 1, 0)
+                request.block_hashes, max_hit_len
             )
-            return int(result[1])
+            local_warmth = int(result[1])
+            connector = getattr(self, "connector", None)
+            if connector is not None and local_warmth < max_hit_len:
+                estimate_ext = getattr(
+                    connector, "estimate_external_prefix_warmth", None
+                )
+                if callable(estimate_ext):
+                    try:
+                        ext_warmth = int(estimate_ext(request, local_warmth))
+                    except Exception:
+                        if not getattr(self, "_paw_ext_scoring_broken", False):
+                            self._paw_ext_scoring_broken = True
+                            logger.exception(
+                                "PrefixAwareScheduler: external connector warmth "
+                                "scoring failed; using local HBM warmth only."
+                            )
+                        ext_warmth = 0
+                    if ext_warmth > 0:
+                        local_warmth = min(max_hit_len, local_warmth + ext_warmth)
+            return local_warmth
         except Exception:
             if not self._paw_scoring_broken:
                 self._paw_scoring_broken = True

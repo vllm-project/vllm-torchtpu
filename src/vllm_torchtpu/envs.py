@@ -65,6 +65,11 @@ if TYPE_CHECKING:
     TPU_KERNEL_RELOAD_MODULES: str = ""
     TPU_GREEDY_TOP_TOKENS: bool = False
     DP_SCHED_ENABLED: bool = False
+    VLLM_TPU_DP_DECODE_AWARE_PREFILL_CHUNK_CAP: int | None = None
+    ENABLE_PREFIX_ROUTING: bool = True
+    PREFIX_ROUTING_TOKENS: int = 512
+    PREFIX_ROUTING_MAX_QUEUE: int = 2
+    PREFIX_ROUTING_MAX_KV: float = 0.95
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
@@ -629,6 +634,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS"),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
+    # Optional per-step prefill micro-chunk token cap (aligned to 128-token
+    # systolic buckets) applied when active decode requests are present locally
+    # or across the DP group, decoupling decode TPOT from 1024-token prefill
+    # lockstep stalls while keeping pure-prefill steps unclamped.
+    "VLLM_TPU_DP_DECODE_AWARE_PREFILL_CHUNK_CAP": env_optional_int(
+        "VLLM_TPU_DP_DECODE_AWARE_PREFILL_CHUNK_CAP"
+    ),
+    # Prefix-affine data-parallel request routing (core/prefix_aware_dp_router.py).
+    "ENABLE_PREFIX_ROUTING": env_bool("ENABLE_PREFIX_ROUTING", default=True),
+    "PREFIX_ROUTING_TOKENS": lambda: int(os.getenv("PREFIX_ROUTING_TOKENS", "512")),
+    "PREFIX_ROUTING_MAX_QUEUE": lambda: int(os.getenv("PREFIX_ROUTING_MAX_QUEUE", "2")),
+    "PREFIX_ROUTING_MAX_KV": lambda: float(os.getenv("PREFIX_ROUTING_MAX_KV", "0.95")),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE": lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
     "MIXED_Q_SPLIT": env_optional_int("MIXED_Q_SPLIT"),

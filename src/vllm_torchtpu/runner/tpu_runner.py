@@ -750,6 +750,8 @@ class TPUModelRunner(GPUModelRunner):
         self._dp_step_num_chunks: int = 0
         self._dp_step_max_reqs: int = 0
         self._dp_step_has_encoder_inputs = False
+        self._dp_step_has_active_decode: bool = False
+        self._dp_step_executed_in_empty_execute_model: bool = False
         self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
 
@@ -3362,9 +3364,16 @@ class TPUModelRunner(GPUModelRunner):
         local_num_chunks: int,
         local_num_reqs: int = 0,
         has_encoder_inputs: bool = False,
+        local_has_decode: bool = False,
     ) -> "tuple[int | None, int]":
         """Return the DP-wide padded token bucket and forward chunk count."""
+        from vllm_torchtpu.core.tpu_scheduler import (
+            set_process_cross_dp_active_decode,
+        )
+
         if not self._dp_lockstep_enabled():
+            self._dp_step_has_active_decode = bool(local_has_decode)
+            set_process_cross_dp_active_decode(self._dp_step_has_active_decode)
             return None, local_num_chunks
         from vllm.distributed.parallel_state import get_dp_group
 
@@ -3378,6 +3387,7 @@ class TPUModelRunner(GPUModelRunner):
                 int(local_num_chunks),
                 int(local_num_reqs),
                 int(has_encoder_inputs),
+                int(local_has_decode),
             ],
             dtype=torch.int64,
             device="cpu",
@@ -3392,6 +3402,8 @@ class TPUModelRunner(GPUModelRunner):
         # second collective.
         self._dp_step_max_reqs = int(t[2].item())
         self._dp_step_has_encoder_inputs = bool(t[3].item())
+        self._dp_step_has_active_decode = bool(t[4].item())
+        set_process_cross_dp_active_decode(self._dp_step_has_active_decode)
         return bucket, int(t[1].item())
 
     def _execute_dp_mm_encoder(
@@ -3477,6 +3489,17 @@ class TPUModelRunner(GPUModelRunner):
             device="cpu",
         )
 
+    def _attach_dp_step_active_decode(
+        self, output: ModelRunnerOutput
+    ) -> ModelRunnerOutput:
+        active = getattr(self, "_dp_step_has_active_decode", None)
+        if active is None:
+            return output
+        if output is EMPTY_MODEL_RUNNER_OUTPUT:
+            output = copy.copy(EMPTY_MODEL_RUNNER_OUTPUT)
+        output.dp_step_has_active_decode = bool(active)
+        return output
+
     @torch.no_grad()
     def execute_model(
         self,
@@ -3489,18 +3512,44 @@ class TPUModelRunner(GPUModelRunner):
                 "after execute_model() returns None."
             )
         # Update cached state
+        self._dp_step_executed_in_empty_execute_model = False
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:
             self._flush_disjoint_async_results()
         if scheduler_output.total_num_scheduled_tokens == 0:
+            if not self._dp_lockstep_enabled():
+                if not has_kv_transfer_group():
+                    return self._attach_dp_step_active_decode(EMPTY_MODEL_RUNNER_OUTPUT)
+                return self._attach_dp_step_active_decode(
+                    self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                )
+            self._dp_step_executed_in_empty_execute_model = True
+            self._dp_target_bucket, target_num_chunks = self._dp_coordinated_step(
+                0,
+                0,
+                local_num_reqs=0,
+                has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
+                local_has_decode=False,
+            )
+            self._dp_step_num_chunks = target_num_chunks
+            if target_num_chunks == 0:
+                if not has_kv_transfer_group():
+                    return self._attach_dp_step_active_decode(EMPTY_MODEL_RUNNER_OUTPUT)
+                return self._attach_dp_step_active_decode(
+                    self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                )
+            if self._dp_target_bucket is None:
+                self._dp_target_bucket = (
+                    self.num_tokens_paddings[0]
+                    if getattr(self, "num_tokens_paddings", None)
+                    else 16
+                )
+            self._run_dp_idle_pairing(self._dp_target_bucket, target_num_chunks)
             if not has_kv_transfer_group():
-                return EMPTY_MODEL_RUNNER_OUTPUT
-            # Even for a zero-token step and if DP lockstep is enabled, we must
-            # still execute the KV coordination logic so the background ZMQ/SHM
-            # threads can start KV transfer in disaggregated serving. This is
-            # safe to do for a zero-token step since no collectives are
-            # triggered.
-            return self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+                return self._attach_dp_step_active_decode(EMPTY_MODEL_RUNNER_OUTPUT)
+            return self._attach_dp_step_active_decode(
+                self.kv_connector_no_forward(scheduler_output, self.vllm_config)
+            )
         if self._pcp_enabled and self._mtp_enabled:
             # Validate the actual scheduled span before any forward/collective.
             # Ending exactly at the prompt boundary produces the first output;
@@ -3530,6 +3579,7 @@ class TPUModelRunner(GPUModelRunner):
             local_num_chunks,
             local_num_reqs=local_max_chunk_reqs,
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
+            local_has_decode=bool(num_decode_reqs > 0 or num_windowed_reqs > 0),
         )
         self._dp_step_num_chunks = target_num_chunks
 
@@ -3914,7 +3964,7 @@ class TPUModelRunner(GPUModelRunner):
         )
 
         if self.is_pooling_model:
-            return self.sample_tokens(None)
+            return self._attach_dp_step_active_decode(self.sample_tokens(None))
         return None
 
     def _pool_chunk(
@@ -4907,9 +4957,9 @@ class TPUModelRunner(GPUModelRunner):
                     scheduler_output=scheduler_output,
                 )
 
-            return final_output
+            return self._attach_dp_step_active_decode(final_output)
 
-        return async_output
+        return self._attach_dp_step_active_decode(async_output)
 
     def load_model(self) -> None:
         self.device_config.device = torch.device("tpu")
