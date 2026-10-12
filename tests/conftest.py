@@ -13,6 +13,7 @@
 # limitations under the License.
 """Shared pytest configuration for all tests."""
 
+import gc
 import os
 import sys
 
@@ -94,6 +95,24 @@ def vllm_config_context():
     resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
     with set_current_vllm_config(config):
         yield
+
+
+@pytest.fixture
+def release_jax_backend():
+    """Release TPU devices after a test's local JAX arrays are gone.
+
+    Here rather than in the pcp_streaming_rpa package's conftest, which is
+    where its tests live: pytest 9.1.1 did not resolve that conftest's
+    fixtures for its tests when tests/kernels/fused_moe/test_fused_ep_moe_v2.py
+    came first on the command line, and a sharded run passes files in the
+    planner's order, not path order. A fixture in this file applies to every
+    test regardless.
+    """
+    yield
+    from jax._src.api import clear_backends
+
+    clear_backends()
+    gc.collect()
 
 
 @pytest.fixture

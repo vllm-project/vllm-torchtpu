@@ -85,8 +85,9 @@ FORWARD=(
   NIGHTLY CREATED_BY
   # The P/D benchmark loads its results into BigQuery when this is set.
   BQ_UPLOAD
-  # Carries the -m filter into bktec's collection step; see the sharded steps
-  # in pipeline_tests_kube.yml.
+  # Each unit test step's marker filter and timeout, for its test command and
+  # bktec's collection alike; see x-tests-plugin-defaults in
+  # pipeline_tests_kube.yml.
   PYTEST_ADDOPTS
   # Unset on purpose: naming an unset variable is how the launcher is asked to
   # supply it from its env_secrets registry. HF_TOKEN is not here - every pod

@@ -22,7 +22,7 @@ x-cpu-unit-test-defaults: &cpu_unit_test_defaults
     - bash .buildkite/scripts/run_in_docker.sh bktec run
   agents:
     queue: "cpu_64_core"
-  env:
+  env: &cpu_env
     CPU_ONLY: "1"
 
 x-tests-plugin-defaults: &tests_plugin_defaults
@@ -32,6 +32,10 @@ x-tests-plugin-defaults: &tests_plugin_defaults
   test-file-pattern: "tests/**/{test_*,*_test}.py"
   install-client: false
   oidc-lifetime: 7200
+  # Each step's marker filter and per-test timeout are in its PYTEST_ADDOPTS,
+  # which pytest reads on every invocation, bktec's `pytest --collect-only`
+  # included, so splitting by example plans over the tests the step runs.
+  test-cmd: "pytest -sv --junit-xml={{resultPath}} {{testExamples}}"
 
 steps:
   - label: "Type Check - Full Environment"
@@ -52,23 +56,27 @@ steps:
     key: "unit_tests_cpu_pr"
     <<: *cpu_unit_test_defaults
     if: 'build.env("NIGHTLY") != "1"'
+    env:
+      <<: *cpu_env
+      PYTEST_ADDOPTS: "--timeout=600 -m 'not tpu_test and not multichip and not nightly'"
     plugins:
       - tests#v1.0.0:
           <<: *tests_plugin_defaults
           test-file-pattern: "tests/**/{test_*,*_test}.py"
           fail-on-no-tests: true
-          test-cmd: "pytest -sv --timeout=600 -m 'not tpu_test and not multichip and not nightly' --junit-xml={{resultPath}} {{testExamples}}"
 
   - label: "Unit Tests - CPU (Nightly)"
     key: "unit_tests_cpu_nightly"
     <<: *cpu_unit_test_defaults
     if: 'build.env("NIGHTLY") == "1"'
+    env:
+      <<: *cpu_env
+      PYTEST_ADDOPTS: "--timeout=600 -m 'not tpu_test and not multichip'"
     plugins:
       - tests#v1.0.0:
           <<: *tests_plugin_defaults
           test-file-pattern: "tests/**/{test_*,*_test}.py"
           fail-on-no-tests: true
-          test-cmd: "pytest -sv --timeout=600 -m 'not tpu_test and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
   - group: "Unit Tests on TPU"
     depends_on: "build_docker"
@@ -79,33 +87,38 @@ steps:
       # its own agents instead of serializing behind everything else. The
       # general steps exclude the file to avoid running it twice.
       #
-      # bktec splits General by file, not by example, so a file that shares
-      # one engine across its tests (module-scoped fixtures, the Qwen2.5-VL
-      # engines in test_multi_modal_inference.py) starts it in one shard only.
+      # bktec splits General and Multichip by file, so a file that shares one
+      # engine across its tests (module-scoped fixtures, the Qwen2.5-VL engines
+      # in test_multi_modal_inference.py) starts it in one shard only. Its
+      # split-by-example would not change that here: it only divides files it
+      # considers slow.
       - label: "Unit Tests - General (PR)"
         key: "unit_tests_general_pr"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") != "1"'
-        parallelism: 3
+        parallelism: 4
+        env:
+          PYTEST_ADDOPTS: "--timeout=600 -m 'tpu_test and not nightly and not multichip'"
         agents:
           queue: "tpu_v7x_2_queue"
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
-              test-cmd: "pytest -sv --timeout=600 -m 'tpu_test and not nightly and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: "Unit Tests - Multichip (PR)"
         key: "unit_tests_multichip_pr"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") != "1"'
+        parallelism: 2
+        env:
+          PYTEST_ADDOPTS: "--timeout=600 -m 'not nightly and multichip'"
         agents:
           queue: "tpu_v7x_8_queue"
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
-              test-cmd: "pytest -sv --timeout=600 -m 'not nightly and multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       # Representative correctness cases run on PRs; the full parameter
       # matrix and acceptance-rate tests run nightly. Split by example because
@@ -116,15 +129,11 @@ steps:
         if: 'build.env("NIGHTLY") != "1"'
         parallelism: 3
         env:
-          # bktec enumerates the examples to split with a plain
-          # `pytest --collect-only`, which does not see the `-m` filter in
-          # test-cmd. Without this the nightly-only cases would be handed
-          # to the splitter carrying their (long) nightly timings and then
-          # deselected at run time, so a shard could be planned full and
-          # actually run almost nothing. PYTEST_ADDOPTS applies to collection
-          # as well as to the run, which keeps the split over what PR
-          # actually executes. run_in_docker.sh forwards it into the container.
-          PYTEST_ADDOPTS: "-m 'not nightly and not multichip'"
+          # Without the filter here (see x-tests-plugin-defaults), the
+          # nightly-only cases would be handed to the splitter with their
+          # (long) nightly timings and then deselected at run time, so a shard
+          # could be planned full and run almost nothing.
+          PYTEST_ADDOPTS: "--timeout=1800 -m 'not nightly and not multichip'"
         agents:
           queue: "tpu_v7x_2_queue"
         plugins:
@@ -132,12 +141,13 @@ steps:
               <<: *tests_plugin_defaults
               split-by-example: true
               test-file-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
-              test-cmd: "pytest -sv --timeout=1800 -m 'not nightly and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: "Unit Tests - Speculative Decoding Multichip (PR)"
         key: "unit_tests_spec_decode_multichip_pr"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") != "1"'
+        env:
+          PYTEST_ADDOPTS: "--timeout=3600 -m 'not nightly and multichip'"
         agents:
           queue: "tpu_v7x_8_queue"
         artifact_paths:
@@ -146,7 +156,6 @@ steps:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
               test-file-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
-              test-cmd: "pytest -sv --timeout=3600 -m 'not nightly and multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       # Omni multimodal and diffusion models on TPU.
       - label: "Unit Tests - Omni (PR)"
@@ -159,6 +168,7 @@ steps:
           - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/golden/ /mnt/disks/persist/models"
           - "bash .buildkite/scripts/run_in_docker.sh bktec run"
         env:
+          PYTEST_ADDOPTS: "--timeout=1200 -m 'not nightly and omni'"
           DOCKER_IMAGE_SUFFIX: "-omni"
         agents:
           queue: "tpu_v7x_2_queue"
@@ -167,15 +177,14 @@ steps:
               <<: *tests_plugin_defaults
               test-file-pattern: "tests_omni/**/{test_*,*_test}.py"
               fail-on-no-tests: true
-              test-cmd: "pytest -sv --timeout=1200 -m 'not nightly and omni' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: "Unit Tests - Speculative Decoding (Nightly)"
         key: "unit_tests_spec_decode_nightly"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") == "1"'
-        parallelism: 3
+        parallelism: 4
         env:
-          PYTEST_ADDOPTS: "-m 'not multichip'"
+          PYTEST_ADDOPTS: "--timeout=600 -m 'not multichip'"
         agents:
           queue: "tpu_v7x_2_queue"
         plugins:
@@ -183,7 +192,6 @@ steps:
               <<: *tests_plugin_defaults
               split-by-example: true
               test-file-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
-              test-cmd: "pytest -sv --timeout=600 -m 'not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       # The data-parallel MTP tests in the same file need DP*TP chips, which
       # the 2-chip spec-decode queue above cannot provide (they self-skip
@@ -192,6 +200,9 @@ steps:
         key: "unit_tests_spec_decode_multichip_nightly"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") == "1"'
+        parallelism: 2
+        env:
+          PYTEST_ADDOPTS: "--timeout=3600 -m 'multichip'"
         agents:
           queue: "tpu_v7x_8_queue"
         artifact_paths:
@@ -199,32 +210,36 @@ steps:
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
+              split-by-example: true
               test-file-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
-              test-cmd: "pytest -sv --timeout=3600 -m 'multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: "Unit Tests - General (Nightly)"
         key: "unit_tests_general_nightly"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") == "1"'
+        parallelism: 4
+        env:
+          PYTEST_ADDOPTS: "--timeout=600 -m 'tpu_test and not multichip'"
         agents:
           queue: "tpu_v7x_2_queue"
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
-              test-cmd: "pytest -sv --timeout=600 -m 'tpu_test and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: "Unit Tests - Multichip (Nightly)"
         key: "unit_tests_multichip_nightly"
         <<: *unit_test_defaults
         if: 'build.env("NIGHTLY") == "1"'
+        parallelism: 2
+        env:
+          PYTEST_ADDOPTS: "--timeout=600 -m 'multichip'"
         agents:
           queue: "tpu_v7x_8_queue"
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
-              test-cmd: "pytest -sv --timeout=600 -m 'multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       # Omni multimodal and diffusion models on TPU.
       - label: "Unit Tests - Omni (Nightly)"
@@ -237,6 +252,7 @@ steps:
           - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/golden/ /mnt/disks/persist/models"
           - "bash .buildkite/scripts/run_in_docker.sh bktec run"
         env:
+          PYTEST_ADDOPTS: "--timeout=1800 -m 'nightly and omni'"
           DOCKER_IMAGE_SUFFIX: "-omni"
         agents:
           queue: "tpu_v7x_2_queue"
@@ -245,4 +261,3 @@ steps:
               <<: *tests_plugin_defaults
               test-file-pattern: "tests_omni/**/{test_*,*_test}.py"
               fail-on-no-tests: true
-              test-cmd: "pytest -sv --timeout=1800 -m 'nightly and omni' --junit-xml={{resultPath}} {{testExamples}}"
