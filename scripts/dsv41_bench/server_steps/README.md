@@ -134,70 +134,54 @@ five seconds. Sampled peaks can miss transients; cgroup peaks can include earlie
 runs in the same container. Zero cgroup OOM counters do not rule out node-pressure
 eviction. Do not delete live communication buffers to free memory.
 
-## Recorded validation: 2026-10-12
+## Recorded validation: 2026-10-13
 
-Production commit `7ee60b940`, harness `bd0fe4db6`; all 366 tracked production
-files on the benchmark host matched the submitted source. The later formal-window
-compiler-log guard was also applied offline to these records. The measurements below used the original four buckets
-`[16,128,256,2048]`, before KV budget rounding.
+Production source `ce69313ec`; all 366 tracked production files on the benchmark
+host matched the submitted source. The four-bucket baseline uses the same
+rounded-KV source with only `serve.sh` restored to `[16,128,256,2048]`. Both cold
+runs use independent empty caches; restart reuses the three-bucket cache.
 
-The baseline already includes the host metadata snapshot, packed RoPE selection
-and gather lookahead. The only production difference in this series is the
-static shared-prefill indexer gate. Both cold cases use independent empty
-compilation caches; reuse uses the candidate's unchanged cache directory.
-There is one startup observation per case, so small differences are not a
-statistical speedup claim. Weight-file/system caches are not controlled.
-
-| Case | Launch to healthy (s) | Max engine init (s) | Max logged compilation (s) | FX compile calls | Artifact load attempts |
+| Case | Ready (s) | Engine init (s) | Logged compilation (s) | FX compiles | Artifact loads |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Before static indexer, cold | 1633.56 | 1043.25 | 929.87 | 80 | 0 |
-| Integrated candidate, cold | 1689.14 | 1032.43 | 921.18 | 80 | 0 |
-| Same candidate, cache reuse | 1663.41 | 949.42 | 911.46 | 64 | 16 |
+| Rounded KV, four buckets, cold | 1683.17 | 1023.10 | 910.47 | 80 | 0 |
+| Rounded KV, three buckets, cold | 1479.24 | 825.46 | 713.98 | 64 | 0 |
+| Same three-bucket cache, restart | 1045.10 | 194.60 | 156.70 | 0 | 64 |
 
-Cache reuse was partial: 16 artifact load attempts, but 64 new FX compile calls.
-Auto-sized KV token capacities changed across restarts (for example rank 0:
-6,667,507 to 6,666,237 tokens), changing the KV-block-count cache key for serving
-graphs. The initial profiling graphs were reusable. Stable serving-graph reuse
-needs a stable large-KV allocation plan; this run preserves the existing
-shape-sensitive keys.
+Removing the 16-token bucket reduced serving main graphs from 64 to 48
+(80 to 64 FX compiles including initial profiling), logged compilation by 21.6%,
+and launch-to-ready by 12.1%. Restart loaded all 64 artifacts with zero new FX
+compiles; cache inventory stayed at 162 files / 20,687,965,159 bytes. Logged
+compilation includes cache replay/backend warmup and is not pure XLA time.
+Engine initialization fell from 825.46 to 194.60 seconds on restart. Model
+loading varies between runs, so the ready-time gain is smaller.
 
-| Case | Middle tokens/s, node | Whole encoder window, node | Middle / logical device | Middle / physical chip |
-| --- | ---: | ---: | ---: | ---: |
-| Before static indexer, cold | 108,399 | 87,949 | 13,550 | 27,100 |
-| Integrated candidate, cold | 108,659 | 88,410 | 13,582 | 27,165 |
-| Same candidate, cache reuse | 108,397 | 87,845 | 13,550 | 27,099 |
+All 24 rank-start observations had the same capacity: 6,575,165 tokens per rank,
+from a 32-GiB budget including RoPE. This retains the two-bank path. Bin crossings
+still change shapes and trigger recompilation; cache-key checks remain intact.
 
-Each case passed five formal rounds and 35 middle-step samples: 524288 cache
-hits per round, zero preemptions and no compiler events in formal windows.
-All 40 one-token candidate responses matched the baseline, for both starts.
-KV remained auto-sized at about 32.4 GiB per rank; this is not a capacity stress
-test. The separate candidate profile contains six complete rank-0 encoder
-graphs with 20 MoE calls each; truncated graphs are excluded. Median device
-time is **160.690 ms**, versus **160.694 ms** in the earlier lookahead run.
-Normalized device-equivalent rate is 101761 new tokens/s at 16352 tokens per
-step; this is not client throughput or an independently qualified node capacity.
-
-The static gate's decoder-2048 compile median across ranks fell from
-145.400 to 131.275 seconds, but total logged compilation fell only 0.9%, and
-cold launch-to-health increased 3.4%. Middle host cadence increased 0.24% and
-whole-window cadence 0.52%; these small differences do not establish a new
-end-to-end speedup. The isolated indexer benefit does not apply uniformly to
-all encoder/decoder compilation work.
-
-Earlier matched large-KV ablations used the same frozen workload:
-
-| Change accumulated | Middle host tokens/s | Whole encoder-window tokens/s |
+| Case | Middle host tokens/s | Whole encoder-window tokens/s |
 | --- | ---: | ---: |
-| Initial large-KV baseline | 58,989 | 55,941 |
-| Host metadata snapshot | 88,529 | 72,658 |
-| Plus packed RoPE selection | 106,563 | 86,641 |
-| Plus gather lookahead | 108,452 | 88,325 |
+| Rounded KV, four buckets, cold | 108,588 | 88,346 |
+| Rounded KV, three buckets, cold | 107,272 | 87,447 |
+| Same three-bucket cache, restart | 107,377 | 87,114 |
 
-Those are separate mechanism-isolation runs, not extra multipliers on this
-series. The historical 4-GiB result used different input texts and source and
-is not an exact A/B. No full recovery of that historical device rate is claimed.
+Each case passed five formal rounds / 35 middle samples, with 524288 prefix hits
+per round, zero preemptions and no compiler events after readiness, including
+prime/warmup. All 40 outputs from each three-bucket start matched the four-bucket
+baseline; the baseline also matched the preceding unrounded-KV candidate.
+These are single-token consistency checks, not long-generation accuracy tests.
+Cgroup OOM counters stayed at zero.
 
-Pre-commit checks and focused CPU/TPU regressions pass. Full-dependency type
-checking retains the same 61 diagnostics as the original PR head, with no new
-diagnostics. Full TPU CI still requires a maintainer's `ready` label; long
-accuracy, mixed-load and steady decode qualification remain outside this run.
+A separate restart profile contains 6 complete rank-0 encoder graphs with
+20 MoE calls each. Median device time is **160.851 ms**, versus the previous
+160.690 ms (about 0.1% difference). At 16352 useful tokens per step, its normalized
+device-equivalent rate is **101,659 tokens/s**. Profiled rounds are
+excluded from host throughput. The roughly 1% lower host cadence does not prove
+a device-speed change; there is only one startup/profile observation per case.
+Neither metric independently qualifies serving capacity or steady decode.
+
+Falcon experiment: `exp-hyxe77erhh`, results subtree `pr1848-startup`;
+device analysis: `an-1fughtzu5e` (`topk-census.json`).
+The new budget test and seven consolidated harness tests pass, as do pre-commit
+checks. Full-dependency type checking retains the previous 61 diagnostics,
+with no added or removed diagnostics; this is not a clean full type-check pass.
