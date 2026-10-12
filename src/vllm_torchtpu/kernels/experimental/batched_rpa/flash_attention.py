@@ -115,6 +115,7 @@ def flash_attention_qk_softmax(
     cfgs: configs.RpaConfigs,
     bq_start: int,
     k_scale: jax.Array | float | None = None,  # [B, KV, S]
+    dma_q: jax.Ref | None = None,
 ):
     """Flash attention kernel.
 
@@ -217,7 +218,10 @@ def flash_attention_qk_softmax(
         alpha_b = jnp.exp(m_prev - m_next_b)
         alpha_list.append(alpha_b)
         m_next_list.append(m_next_b)
-        m_prev = jnp.where(is_last_k[step, b_idx], -jnp.inf, m_next_b)
+        reset_m = is_last_k[step, b_idx] != 0
+        if dma_q is not None:
+            reset_m = jnp.logical_or(reset_m, bq_start >= dma_q[step, b_idx, 1])
+        m_prev = jnp.where(reset_m, -jnp.inf, m_next_b)
 
     m_next = jnp.stack(m_next_list, axis=0)
     p = jnp.exp(qk - utils.broadcast_minor(m_next, qk.shape))

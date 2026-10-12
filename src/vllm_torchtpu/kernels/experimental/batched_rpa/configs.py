@@ -30,6 +30,13 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.experimental.batched_rpa import utils
 
 
+def _get_tpu_info() -> pltpu.TpuInfo:
+    try:
+        return pltpu.get_tpu_info()
+    except ValueError:
+        return pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+
+
 @dataclasses.dataclass(frozen=True)
 class BlockSizes:
     """Tuning parameters for the RPA kernel.
@@ -304,8 +311,9 @@ class RpaConfigs:
         word_size_bytes = 4
         fixed_bytes *= word_size_bytes
 
+        tpu_info = _get_tpu_info()
         smem_limit_bytes = (
-            pltpu.get_tpu_info().smem_capacity_bytes - 32 * 1024
+            tpu_info.smem_capacity_bytes - 32 * 1024
         ) * self.serve.smem_fraction_limit_for_schedule_generation
         available_bytes = smem_limit_bytes - fixed_bytes
 
@@ -325,7 +333,7 @@ class RpaConfigs:
 
         max_steps_ub = available_bytes // bytes_per_step
 
-        num_lanes = pltpu.get_tpu_info().num_lanes
+        num_lanes = tpu_info.num_lanes
         max_steps_ub = max(1, max_steps_ub // num_lanes) * num_lanes
         return int(max_steps_ub)
 
@@ -380,14 +388,15 @@ class RpaConfigs:
 
     @property
     def aligned_q_head_dim(self) -> int:
-        num_lanes = pltpu.get_tpu_info().num_lanes
+        num_lanes = _get_tpu_info().num_lanes
         return utils.align_to(self.model.head_dim, num_lanes)
 
     # Actual head dimension used for compute, does not include scale factors.
     @property
     def compute_kv_head_dim(self) -> int:
-        num_lanes = pltpu.get_tpu_info().num_lanes
-        num_sublanes = pltpu.get_tpu_info().num_sublanes
+        tpu_info = _get_tpu_info()
+        num_lanes = tpu_info.num_lanes
+        num_sublanes = tpu_info.num_sublanes
         kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
             return utils.align_to(self.model.head_dim, num_sublanes * kv_packing)
@@ -397,8 +406,9 @@ class RpaConfigs:
     # per_token_scale is enabled.
     @property
     def aligned_kv_head_dim(self) -> int:
-        num_lanes = pltpu.get_tpu_info().num_lanes
-        num_sublanes = pltpu.get_tpu_info().num_sublanes
+        tpu_info = _get_tpu_info()
+        num_lanes = tpu_info.num_lanes
+        num_sublanes = tpu_info.num_sublanes
         kv_packing = utils.get_dtype_packing(self.serve.dtype_kv)
 
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
@@ -539,7 +549,7 @@ class RpaConfigs:
 
     @property
     def lm_scratch_shape(self):
-        num_lanes = pltpu.get_tpu_info().num_lanes
+        num_lanes = _get_tpu_info().num_lanes
         return (
             self.model.num_kv_heads,
             self.block.bq_sz * self.aligned_num_q_heads_per_kv_head,
@@ -548,7 +558,7 @@ class RpaConfigs:
 
     @property
     def lse_vmem_shape(self):
-        num_lanes = pltpu.get_tpu_info().num_lanes
+        num_lanes = _get_tpu_info().num_lanes
         q_per_kv_packing = self.aligned_num_q_heads_per_kv_head // self.serve.packing_q
         return (
             self.block.batch_size,

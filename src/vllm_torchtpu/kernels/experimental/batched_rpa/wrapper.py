@@ -253,7 +253,7 @@ def calculate_block_sizes(
     models keep their tiles.
     """
 
-    tpu_info = pltpu.get_tpu_info()
+    tpu_info = configs._get_tpu_info()
     num_lanes = tpu_info.num_lanes
     mxu_column_size = tpu_info.mxu_column_size
 
