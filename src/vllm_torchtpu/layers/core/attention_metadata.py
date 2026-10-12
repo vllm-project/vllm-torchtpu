@@ -487,7 +487,7 @@ def stage_block_table_uploads(
 ) -> None:
     """One batched H2D transfer for every block table a walk will build.
 
-    Packs all participating groups' rows into one flat CPU scratch, transfers
+    Packs all participating groups' rows into one owned CPU buffer, transfers
     once, and hands each group's build() a flat view of its region via
     `ctx.staged_block_tables` (instead of one small per-group H2D per build).
     `gids` limits staging to a subset of groups; None stages every group.
@@ -517,14 +517,10 @@ def stage_block_table_uploads(
         return
 
     total = sum(num_reqs_padded * tnb for _, _, tnb in entries)
-    scratch = runner._block_table_stage_cpu
-    if scratch is None or scratch.numel() < total:
-        scratch = torch.zeros(
-            (total,), dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY
-        )
-        runner._block_table_stage_cpu = scratch
-    flat = scratch[:total]
-    flat.zero_()
+    # TorchTPU borrows the CPU source until async H2D completes. Each walk
+    # owns its upload buffer: a later chunk/MTP step must not clear or refill
+    # an earlier transfer's source. TorchTPU retains this tensor until done.
+    flat = torch.zeros((total,), dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY)
 
     if ctx.position_ids_override is None:
         offset = 0
