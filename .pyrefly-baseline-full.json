@@ -903,11 +903,6 @@
     {
       "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
       "name": "bad-argument-type",
-      "concise_description": "Argument `SmemWrapper` is not assignable to parameter `is_last_k` with type `Ref` in function `vllm_torchtpu.kernels.experimental.batched_rpa.flash_attention.flash_attention_qk_softmax`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
-      "name": "bad-argument-type",
       "concise_description": "Argument `Array | int | None` is not assignable to parameter `v_scale` with type `Array | None` in function `vllm_torchtpu.kernels.experimental.batched_rpa.flash_attention.flash_attention_pv`"
     },
     {
