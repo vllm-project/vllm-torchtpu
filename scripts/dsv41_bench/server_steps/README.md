@@ -1,0 +1,134 @@
+# DP8 cached-extend and startup benchmark
+
+This harness qualifies `encoder_extend` on one v7x host: four physical chips,
+eight logical devices, TP1/DP8/EP8/PP1. It observes normal serving completion;
+it adds no device synchronization and never calls `get_output()` early.
+
+The workload uses eight distinct 65536-token cached prefixes, 16384 new input
+tokens per request, and one greedy output token. Each DP engine admits one
+request with a 2048-token budget. The model uses CED, FP8 KV, CPU Engram offload
+and DSpark K5. KV is automatically sized with memory utilization 0.85, rather
+than capped at 4 GiB. Compile buckets are `[16,128,256,2048]`.
+
+SWA replay and decode configurations remain experimental in `scenarios.py` and
+`serve.sh`. Their summaries deliberately raise `NotImplementedError`; they are
+not qualified benchmarks in this harness. One-token output comparison is not a
+long-generation accuracy test or a steady decode benchmark.
+
+## Prepare inputs
+
+Install the repository-pinned TPU runtime, `requests`, `prometheus-client` and
+`transformers`. Supply a local DeepSeek-V4.1-Flash checkpoint and the pinned
+LongBench-v2 dataset:
+
+```bash
+python scripts/dsv41_bench/server_steps/prepare_inputs.py \
+  --dataset /path/to/longbench-v2.json \
+  --tokenizer /models/DeepSeek-V4.1-Flash \
+  --out /path/to/dsv41-code-c128.json
+```
+
+The client verifies the frozen input SHA256:
+`865b183381ae43367214d9dd0870f94c578b3d581e613ddc7872d1e48f391a11`.
+The first eight deterministic code windows are used for this scenario. They
+have distinct prefixes, but come from adjacent windows of the same document;
+they are not eight unrelated documents. Prime requests branch immediately
+after the prefix. Prime, warmup and generated tokens are excluded from the
+new-input token count.
+
+The corpus methodology follows SGL-JAX DSA's `bench_dsa_cache_hit.py`:
+freeze natural-code inputs and verify actual cache behavior. This implementation
+uses vLLM worker-extension RPCs and DeepSeek tokenizer IDs.
+
+## Run cold startup and serving
+
+Run on an isolated benchmark server; the harness uses development endpoints
+for pause/resume, prefix reset and worker RPC. No other traffic may run on the
+server. Reserve port 8000 and use fresh output directories.
+
+```bash
+export MODEL_PATH=/models/DeepSeek-V4.1-Flash
+export ARTIFACT_LOCAL_DIR=/path/to/artifacts
+python scripts/dsv41_bench/server_steps/run.py \
+  --input /path/to/dsv41-code-c128.json \
+  --out /path/to/results/candidate-cold \
+  --cache-dir /path/to/persistent-cache/candidate \
+  --cache-mode cold --rounds 5 --profile
+```
+
+`run.py` starts the memory monitor and server, waits for HTTP health readiness,
+runs a separate warmup and five formal rounds, optionally collects a separate
+profile wave, and stops its server process group. The startup timeout defaults
+to 3000 seconds. A cold run rejects a nonempty cache directory. Keep the cache
+on persistent storage, and use separate directories for baseline and candidate.
+Both public and internal native Tier-2 shared-memory caches are disabled;
+vLLM, JAX and native Tier-3 paths are recorded in the run manifest.
+
+A cache-reuse restart uses the same code, model, hardware, runtime, compile
+buckets and cache directory, with a new result directory:
+
+```bash
+python scripts/dsv41_bench/server_steps/run.py \
+  --input /path/to/dsv41-code-c128.json \
+  --out /path/to/results/candidate-reuse \
+  --cache-dir /path/to/persistent-cache/candidate \
+  --cache-mode reuse --rounds 5
+```
+
+A populated cache does not prove a cache hit. Check load attempts, recompiles,
+artifact warnings and timings. Do not drop cache-key fields to force reuse.
+Keep `ARTIFACT_LOCAL_DIR` consistent across an A/B/restart series; the profile
+is stored under its `encoder_extend/profile` directory. Do not enable compiler
+dumps during timed startup, and never pool profiled and unprofiled rounds.
+
+For a manually managed server, use `serve.sh encoder_extend`, then invoke
+`client.py --scenario encoder_extend --input INPUT --out OUTPUT --rounds 5`.
+
+## Timing and audit contract
+
+- `startup.json` measures launch through HTTP health readiness. This includes
+  model loading, engine initialization, compilation, cache work and warmup.
+- `summarize_startup.py` extracts per-rank engine-init and reported-compilation
+  times from the server log. Parallel rank times are never summed. These logged
+  durations are not pure XLA compilation time; serialization and cache I/O can
+  be included. Repeated stage-warmup records retain their separate scopes.
+- `encoder_middle` requires consecutive full-DP actual2044/padded2048 chunks,
+  matching contexts, no SWA replay and no decoder stage. Its numerator is
+  16352 new input tokens per global step. It covers encoder layers 0–19 plus
+  downstream global KV projection/write. First and tail steps remain separate.
+- Natural throughput divides useful work by consecutive maximum-rank output
+  observation intervals. A fully discarded asynchronous output can return
+  without waiting for device completion. Therefore host cadence alone is not
+  device capacity: summaries retain `capacity_qualified=false` and
+  `device_seconds=null`. Use a separate device profile for completed-graph
+  time, and report the exact captured graph count and coverage.
+- Also report aggregate encoder throughput including first and tail steps;
+  an asynchronous boundary can shift work from middle to tail. Do not label
+  middle cadence as client request throughput or isolated decode capacity.
+- Each formal round must complete all eight requests, hit 524288 cached
+  tokens, have zero preemptions, and contain no compilation. Invalid shapes,
+  missing ranks, interrupted windows and inconsistent counters fail closed.
+
+Report node totals, values divided by eight logical devices, and values divided
+by four physical chips explicitly. DSpark K5 is not a token-count multiplier.
+CPU stage-call timestamps describe dispatch, not device execution duration.
+
+## Reprocess and validate
+
+```bash
+python scripts/dsv41_bench/server_steps/summarize.py \
+  /path/to/results/candidate-cold/fixed/round-1-steps.json \
+  --scenario encoder_extend --out /path/to/recomputed-summary.json
+python scripts/dsv41_bench/server_steps/summarize_startup.py \
+  /path/to/results/candidate-cold/server.log \
+  --out /path/to/startup-phases.json
+python -m pytest tests/scripts/test_dsv41_server_step*.py \
+  tests/scripts/test_dsv41_server_startup.py -q
+```
+
+Preserve input provenance, source revisions and diffs, runtime package versions,
+responses, metrics, raw worker records, startup logs and memory snapshots.
+`monitor_memory.py` records host/cgroup/shared-memory and process RSS/HWM every
+five seconds. Sampled peaks can miss transients; cgroup peaks can include earlier
+runs in the same container. Zero cgroup OOM counters do not rule out node-pressure
+eviction. Do not delete live communication buffers to free memory.

@@ -17,6 +17,10 @@ export VLLM_ENGINE_READY_TIMEOUT_S=7200 TORCHINDUCTOR_AUTOGRAD_CACHE=0 TORCH_TPU
 export LIBTPU_INIT_ARGS='--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0'
 export VLLM_SERVER_DEV_MODE=1
 # Cache roots, when supplied, must be keyed by source/runtime/topology/buckets.
+kv_args=(--gpu-memory-utilization 0.85)
+if [[ "${KV_BYTES:-auto}" != auto ]]; then
+  kv_args+=(--kv-cache-memory-bytes "${KV_BYTES:-auto}")
+fi
 exec vllm serve "$model" \
   --load-format runai_streamer --served-model-name deepseek-v41 \
   --host "${HOST:-127.0.0.1}" --port "${PORT:-8000}" \
@@ -27,8 +31,7 @@ exec vllm serve "$model" \
   --engram-config '{"dp_shared_memory":false}' \
   --block-size 16 --max-model-len 82944 \
   --max-num-batched-tokens "$chunk" --max-num-seqs "$max_seqs" \
-  --gpu-memory-utilization 0.85 \
-  --kv-cache-memory-bytes "${KV_BYTES:-4294967296}" \
+  "${kv_args[@]}" \
   --compilation-config "{\"compile_sizes\":[128,256,$chunk]}" \
   --speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"model\":\"$model\"}" \
   "$@"

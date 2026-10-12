@@ -23,9 +23,15 @@ Prime, warmup and profile times are excluded from extension measurements.
 
 The server enables EP, CED, Engram CPU offload, FP8 KV and DSpark with five
 draft tokens. The 2048-token budget and one-sequence limit are per DP engine.
+KV capacity defaults to automatic sizing with memory utilization 0.85; it is
+not capped at 4 GiB. Set `KV_BYTES` only for an explicit capacity experiment.
 It uses ordinary scheduler admission; this PR does not add an admission
 window. Keep development/cache-reset endpoints on an isolated network.
 One-token timing is not accuracy validation or a multi-step decode benchmark.
 
 Supported DP requires PP1/TP1, EP, CPU Engram offload and one node-local
 Engram group covering all DP ranks, with `dp_shared_memory=false`.
+
+For audited natural server-step timing, cold startup and cache-reuse runs, see
+[the server-step harness](server_steps/README.md). It keeps host cadence,
+completed-device graph time and startup compilation scopes separate.
