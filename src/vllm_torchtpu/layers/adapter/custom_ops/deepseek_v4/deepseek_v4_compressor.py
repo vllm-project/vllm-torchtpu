@@ -380,8 +380,8 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         weight = torch.empty(w_t.shape, dtype=w_t.dtype, device=w_t.device).copy_(w_t)
         self.fused_wkv_wgate.weight = torch.nn.Parameter(weight, requires_grad=False)
         self._wkv_wgate_transposed = True
-        if self.fused_wkv_wgate.weight.device.type == "tpu":
-            synchronize_tensors([self.fused_wkv_wgate.weight])
+        if weight.device.type == "tpu":
+            synchronize_tensors([weight])
 
     # head_dim == 512 with overlap: CSA, which splits NoPE and RoPE.
     # head_dim == 512 without:      HCA, whose state lives on a CSA array.
