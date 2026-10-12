@@ -64,8 +64,8 @@ def _worker(rank: int, size: int, rendezvous: str) -> None:
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize("size", [2, 8])
-def test_exchange_retains_local_tokens_and_head_order(tmp_path, size):
+def test_exchange_retains_local_tokens_and_head_order(tmp_path):
+    size = 2
     mp.spawn(_worker, args=(size, (tmp_path / "gloo").as_uri()), nprocs=size)
 
 

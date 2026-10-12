@@ -7,13 +7,6 @@ tp=${TP:-1}
 dp=${DP:-8}
 chunk=${CHUNK:-2048}
 max_seqs=${MAX_SEQS:-1}
-# C8 cached-prefill baseline: bounded admission across cache owners.
-# Set PREFILL_ADMISSION_MS=off for the control or latency-sensitive C1.
-admission_ms=${PREFILL_ADMISSION_MS:-100}
-admission_args=()
-if [[ "$admission_ms" != off ]]; then
-  admission_args=(--additional-config "{\"dp_prefill_admission_ms\":$admission_ms}")
-fi
 export TPU_RECLAIM_COMPILE_MEMORY=1
 export OMP_NUM_THREADS=1 NEW_MODEL_DESIGN=1 MODEL_IMPL_TYPE=vllm VLLM_TARGET_DEVICE=tpu
 export VLLM_USE_BREAKABLE_CUDAGRAPH=0 VLLM_USE_AOT_COMPILE=0 VLLM_DISABLE_COMPILE_CACHE=0
@@ -38,4 +31,4 @@ exec vllm serve "$model" \
   --kv-cache-memory-bytes "${KV_BYTES:-4294967296}" \
   --compilation-config "{\"compile_sizes\":[128,256,$chunk]}" \
   --speculative-config "{\"method\":\"dspark\",\"num_speculative_tokens\":5,\"model\":\"$model\"}" \
-  "${admission_args[@]}" "$@"
+  "$@"

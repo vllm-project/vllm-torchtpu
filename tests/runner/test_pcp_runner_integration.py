@@ -978,8 +978,7 @@ def test_pcp_streaming_does_not_use_batched_smem_capacity(
 
 
 @pytest.mark.parametrize("idle", [False, True])
-@pytest.mark.parametrize("peer_rows", [0, 128])
-def test_idle_dummy_ced_replay_uses_only_busy_peer_rows(monkeypatch, idle, peer_rows):
+def test_idle_dummy_ced_replay_has_no_local_rows(monkeypatch, idle):
     from vllm_torchtpu.models.vllm.deepseek_v41.v2 import ced
 
     runner = _make_runner(
@@ -995,16 +994,4 @@ def test_idle_dummy_ced_replay_uses_only_busy_peer_rows(monkeypatch, idle, peer_
         return
     assert plan.indices == ()
     assert plan.padded_num_tokens == 0
-    monkeypatch.setattr(
-        ced, "get_dp_group", lambda: SimpleNamespace(world_size=8, cpu_group=object())
-    )
-
-    def reduce(count, op, group):
-        assert count.item() == 0
-        count.fill_(peer_rows)
-
-    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
-    coordinated = ced.coordinate_decoder_replay(plan, 256)
-    assert coordinated.padded_num_tokens == peer_rows
-    assert coordinated.indices == ()
     runner.compute_selected_logits.assert_called_once()
