@@ -7434,8 +7434,16 @@ def _get_padded_num_reqs_with_upper_limit(x: int, upper_limit: int) -> int:
 
 def _get_padded_token_len(paddings: list[int], x: int) -> int:
     """Return the first element in paddings list greater or equal to x."""
+    if not paddings:
+        raise ValueError(
+            f"Cannot determine padded token length for {x}: paddings list is empty"
+        )
     index = bisect.bisect_left(paddings, x)
-    assert index < len(paddings)
+    if index >= len(paddings):
+        raise ValueError(
+            f"Requested token length {x} exceeds the maximum compiled padding "
+            f"bucket {paddings[-1]} (available paddings: {paddings})"
+        )
     return paddings[index]
 
 
