@@ -30,6 +30,10 @@ class SendMeta:
     # order. Only DSv4 sets it, because its groups page at different sizes;
     # single-group models leave it None and use local_block_ids.
     group_block_ids: list[list[int]] | None = None
+    # Published in the step that completes the prompt, ahead of the finish:
+    # the worker registration starts finish_pending (no TTL, no status
+    # probe) until finished_req_ids names the request.
+    registered_ahead: bool = False
 
 
 @dataclass
