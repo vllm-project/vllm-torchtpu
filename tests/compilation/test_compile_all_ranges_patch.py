@@ -90,3 +90,15 @@ def test_every_rank_compiles_every_range(compile_all_ranges, monkeypatch):
     for rank in range(8):
         order = _compile_order(compile_all_ranges, monkeypatch, rank)
         assert sorted(order) == SIZES
+
+
+def test_biggest_first_off_keeps_vllm_order(compile_all_ranges, monkeypatch):
+    monkeypatch.setenv("TPU_PRECOMPILE_BIGGEST_FIRST", "0")
+    firsts = [
+        _compile_order(compile_all_ranges, monkeypatch, rank)[0] for rank in range(8)
+    ]
+    # vLLM's order: local rank 0 starts on the smallest range.
+    assert firsts == SIZES[:8]
+    for rank in range(8):
+        order = _compile_order(compile_all_ranges, monkeypatch, rank)
+        assert sorted(order) == SIZES

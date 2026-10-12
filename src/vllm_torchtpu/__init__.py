@@ -383,14 +383,12 @@ def _patch_vllm_compile_all_ranges() -> None:
         )
 
         local_rank = int(os.environ["LOCAL_RANK"])
-        # Biggest first: local rank 0 starts on the biggest range, which takes
-        # far longer than the others and so bounds startup, instead of
-        # reaching it only after the smallest one.
-        range_entry_list = sorted(
-            self.range_entries.values(),
-            key=lambda e: e.compile_range.end,
-            reverse=True,
-        )
+        range_entry_list = list(self.range_entries.values())
+        if envs.TPU_PRECOMPILE_BIGGEST_FIRST:
+            # Biggest first: local rank 0 starts on the biggest range, which
+            # takes far longer than the others and so bounds startup, instead
+            # of reaching it only after the smallest one.
+            range_entry_list.sort(key=lambda e: e.compile_range.end, reverse=True)
 
         range_entry_len = len(range_entry_list)
 
