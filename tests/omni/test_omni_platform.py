@@ -1,28 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
-import os
 import sys
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 import pytest
-import torch
-
-from .mock_omni import _MockRotaryEmbeddingWan, vllm_omni_mock  # isort: split
-
-import vllm_omni
-from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
-from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
 
 from vllm_torchtpu.omni import register_omni_tpu_platform
-from vllm_torchtpu.omni.attention import TpuSDPABackend, TpuSDPAImpl
-from vllm_torchtpu.omni.patches import (
-    apply_omni_model_specific_patches,
-    apply_omni_tpu_patches,
-)
 from vllm_torchtpu.omni.platform import OmniTpuPlatform
-from vllm_torchtpu.omni.rope import (
-    apply_rotary_pair_swap,
-    rotary_embedding_wan_forward,
-)
 
 pytestmark = pytest.mark.omni
 
@@ -57,5 +40,3 @@ def test_platform_attributes():
     with patch("torch.device") as mock_dev:
         platform.get_torch_device()
         mock_dev.assert_called_once_with("tpu")
-
-

@@ -118,6 +118,8 @@ class _MockQwenEmbedRope:
 class _MockQwenEmbedLayer3DRope:
     __init__ = _init_mock_qwen_rope
     forward = _forward_mock_qwen_rope
+
+
 class _MockColumnParallelGELU(torch.nn.Module):
     """vLLM-Omni's Wan FFN up-projection + tanh GELU."""
 
@@ -194,6 +196,7 @@ sys.modules["vllm_omni.diffusion.models.qwen_image"] = (
 )
 sys.modules["vllm_omni.diffusion.models.qwen_image.qwen_image_transformer"] = (
     vllm_omni_mock.diffusion.models.qwen_image.qwen_image_transformer
+)
 sys.modules["vllm_omni.diffusion.models.wan2_2"] = _wan2_2
 sys.modules["vllm_omni.diffusion.models.wan2_2.wan2_2_transformer"] = (
     _wan2_2.wan2_2_transformer

@@ -6,12 +6,18 @@ from typing import Any
 
 import torch
 
-from vllm_torchtpu.layers.adapter.custom_ops.optimization_barrier_op import (
-    optimization_barrier_op as _optimization_barrier_op,
-)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+@run_once
+def _optimization_barrier_op() -> Any:
+    from vllm_torchtpu.layers.adapter.custom_ops.optimization_barrier_op import (
+        optimization_barrier_op,
+    )
+
+    return optimization_barrier_op()
 
 
 @run_once
@@ -226,12 +232,13 @@ def _patch_wan_ffn_gelu_fence() -> None:
         ColumnParallelGELU,
     )
 
-    orig_forward = getattr(ColumnParallelGELU, "_tpu_orig_forward", ColumnParallelGELU.forward)
+    orig_forward = getattr(
+        ColumnParallelGELU, "_tpu_orig_forward", ColumnParallelGELU.forward
+    )
     ColumnParallelGELU._tpu_orig_forward = orig_forward
 
     def _fenced_gelu_forward(self: Any, x: torch.Tensor) -> torch.Tensor:
-        x = torch.nn.functional.gelu(self.proj(x), approximate=self.approximate)
-        return _optimization_barrier_op()(x)
+        return _optimization_barrier_op()(orig_forward(self, x))
 
     ColumnParallelGELU.forward = _fenced_gelu_forward
     logger.info("Applied TPU patch: fusion fence after Wan FFN GELU.")

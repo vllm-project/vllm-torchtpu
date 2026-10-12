@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Torch custom op wrapping ``jax.lax.optimization_barrier`` (XLA fusion fence)."""
+"""Torch custom op wrapping ``jax.lax.optimization_barrier`` (XLA fusion fence).
+
+It lives under layers/adapter/custom_ops so the compile-cache key hashes it,
+and it is a generic XLA fence, not Omni-specific.
+"""
 
 from functools import cache as run_once
 from typing import Any
