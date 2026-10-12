@@ -16,6 +16,8 @@
 from __future__ import annotations
 
 import contextlib
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass
 from typing import Any
 
 import jax.numpy as jnp
@@ -29,6 +31,39 @@ from .vmem import StreamParams
 
 # lax.dot_general dimension_numbers for a standard [M, K] @ [K, N] -> [M, N] matmul.
 NN = (((1,), (0,)), ((), ()))
+
+
+@dataclass(frozen=True)
+class HalfSplitHook:
+    """`hook=` of `TwoRing.dmatmul` / `TwoRing.arp_mm`: `fn()` runs between the
+    two lane halves of a dense matmul's `K` tiles.
+
+    `K` tile `s` (for `s` in `tiles`) belongs to half 0 and tile `s + hpt` to
+    half 1. `first` (0 or 1, may be traced) is the half whose tiles are summed
+    before `fn()`; the other half's tiles are summed after it, so `fn()` may
+    still write that half's lanes of the matmul input.
+    """
+
+    tiles: tuple[int, ...]
+    hpt: int
+    first: Any
+    fn: Callable[[], None]
+
+
+@dataclass(frozen=True)
+class ColumnSplit:
+    """`split=` of `TwoRing.dmatmul`: the output columns in groups whose sums go
+    to hooks instead of `acc`.
+
+    `pre()` runs before the matmul. Group `i` covers the `(c0, width)` column
+    chunks `cols[i]` (`c0` may be traced); once its chunks are summed,
+    `hooks[i](vals)` receives their f32 sums in `cols[i]` order. The groups
+    must cover all `N` columns.
+    """
+
+    pre: Callable[[], None]
+    cols: tuple[Sequence[tuple[Any, int]], ...]
+    hooks: tuple[Callable[[list[Any]], None], ...]
 
 
 class TwoRing:
@@ -462,6 +497,63 @@ class TwoRing:
                     ).wait()
         return [self.dview(k, b) for (k, _), b in zip(kinds_gs, banks)]
 
+    def dbanks_wait(self, kind: str, g0, n: int) -> list[Any]:
+        """Wait for tiles `g0 .. g0+n-1` of `kind` as one hoisted group (one `rem`,
+        static destination views) and return their ring banks."""
+        banks = self.dbanks(g0, n)
+        if "dense" not in self.skip:
+            with self.sc("dwait", 3):
+                for b in banks:
+                    pltpu.make_async_copy(
+                        self.W[kind].at[0, 0],
+                        self.dview(kind, 0),
+                        self.scr["dsem"].at[b],
+                    ).wait()
+        return banks
+
+    def arp_mm(
+        self,
+        kind: str,
+        banks: Sequence[Any],
+        xsrc,
+        cols: Sequence[tuple[int, int]],
+        hook: HalfSplitHook,
+    ) -> None:
+        """`acc[:, c0:c0+cw] = xsrc @ W(kind)` over all `K` tiles, for each `(c0, cw)`
+        in `cols`, in two passes around `hook.fn()`.
+
+        First the tiles of half `hook.first` (one register sum per column chunk,
+        stored), then `hook.fn()`, then the other half's tiles (added). `banks[u]`
+        is tile `u`'s ring bank (`dbanks_wait`); each half's banks and `xsrc`
+        lanes are picked at run time from `hook.first`.
+        """
+        t_k = self.sp.tk[kind]
+        acc = self.scr["acc"]
+        S, HPT, c = hook.tiles, hook.hpt, hook.first
+
+        def half_pass(other: bool) -> None:
+            xs, ws = [], []
+            for s in S:
+                b_lo, b_hi = banks[s], banks[s + HPT]
+                if other:
+                    b_lo, b_hi = b_hi, b_lo
+                h = (1 - c) if other else c
+                ws.append(self.dview(kind, jnp.where(c == 0, b_lo, b_hi)))
+                k0 = pl.multiple_of((s + h * HPT) * t_k, t_k)
+                xs.append(xsrc[:, pl.ds(k0, t_k)])
+            for c0, cw in cols:
+                p = self.mm(xs[0], ws[0][:, c0 : c0 + cw])
+                for i in range(1, len(xs)):
+                    p = p + self.mm(xs[i], ws[i][:, c0 : c0 + cw])
+                if other:
+                    acc[:, c0 : c0 + cw] += p
+                else:
+                    acc[:, c0 : c0 + cw] = p
+
+        half_pass(False)
+        hook.fn()
+        half_pass(True)
+
     def dgive(self, g):
         """Release dense bank `g % NBD` by prefetching tile `g + NBD` into it."""
         self.fetch(g + self.sp.NBD)
@@ -482,11 +574,17 @@ class TwoRing:
         lazy: bool = False,
         dmm_ctx=None,
         ws_pre=None,
+        hook: HalfSplitHook | None = None,
+        split: ColumnSplit | None = None,
     ):
         """Paired/unrolled dense matmul: `acc[:, :N] = xsrc[:, :K] @ W(kind)`.
 
         `ws_pre`: the `n_t` tiles already taken by the caller (`dtake_group`
         views or ring banks); requires the fully unrolled form (`n_t <= DMU`).
+        `hook`: run `hook.fn()` between the two lane halves of the `K` tiles
+        (`arp_mm`). `split`: hand column groups to hooks (`ColumnSplit`).
+        Each of the three requires the fully unrolled form, and at most one of
+        them may be given.
         """
         sp = self.sp
         n_t, t_k = sp.nt[kind], sp.tk[kind]
@@ -501,6 +599,28 @@ class TwoRing:
             f"dmatmul({kind!r}, ws_pre=...) needs the unrolled form: "
             f"n_t={n_t}, U={U}, {0 if ws_pre is None else len(ws_pre)} tiles"
         )
+        if hook is not None:
+            assert n_t == U and ws_pre is None and split is None, (
+                f"dmatmul({kind!r}, hook=...) needs the unrolled form, alone: "
+                f"n_t={n_t}, U={U}"
+            )
+            banks = self.dbanks_wait(kind, g0, n_t)
+            self.arp_mm(kind, banks, xsrc, chunks, hook)
+            if not lazy:
+                for u in range(n_t):
+                    self._give_tile(g0, 0, u, (), dmm_ctx)
+            return acc[:, :N]
+        groups: list[tuple[Sequence[tuple[Any, int]], Any]] = [(chunks, None)]
+        if split is not None:
+            assert n_t == U and ws_pre is None, (
+                f"dmatmul({kind!r}, split=...) needs the unrolled form, alone: "
+                f"n_t={n_t}, U={U}"
+            )
+            assert sum(cw for cols_ in split.cols for _, cw in cols_) == N, (
+                f"dmatmul({kind!r}, split=...) column groups must cover N={N}"
+            )
+            groups = list(zip(split.cols, split.hooks))
+            split.pre()
 
         def step(t, first):
             if ws_pre is not None:
@@ -508,14 +628,21 @@ class TwoRing:
                 xs = [xsrc[:, u * t_k : (u + 1) * t_k] for u in range(U)]
             else:
                 ws, xs = self._take_step(kind, g0, t, U, xsrc)
-            for c0, cw in chunks:
-                p = self.mm(xs[0], ws[0][:, c0 : c0 + cw])
-                for u in range(1, U):
-                    p = p + self.mm(xs[u], ws[u][:, c0 : c0 + cw])
-                if first:
-                    acc[:, c0 : c0 + cw] = p
-                else:
-                    acc[:, c0 : c0 + cw] += p
+            for cols_, hk in groups:
+                vals = []
+                for c0, cw in cols_:
+                    cs = slice(c0, c0 + cw) if isinstance(c0, int) else pl.ds(c0, cw)
+                    p = self.mm(xs[0], ws[0][:, cs])
+                    for u in range(1, U):
+                        p = p + self.mm(xs[u], ws[u][:, cs])
+                    if hk is not None:
+                        vals.append(p)
+                    elif first:
+                        acc[:, cs] = p
+                    else:
+                        acc[:, cs] += p
+                if hk is not None:
+                    hk(vals)
             if not lazy:
                 for u in range(U):
                     self._give_tile(
@@ -560,10 +687,12 @@ class TwoRing:
         g0=None,
         lazy: bool | None = None,
         ws_pre=None,
+        hook: HalfSplitHook | None = None,
+        split: ColumnSplit | None = None,
     ):
         """`acc[:, :N] = xsrc[:, :K] @ W(kind)`, advancing `self.cursor`.
 
-        `ws_pre`: the tiles already taken by the caller (see `dmatmul_pair`).
+        `ws_pre`, `hook`, `split`: see `dmatmul_pair` (each needs that path).
         """
         sp = self.sp
         n_t, t_k = sp.nt[kind], sp.tk[kind]
@@ -640,9 +769,19 @@ class TwoRing:
         DMU = min(sp.dmm_unroll, sp.NBD)
         if n_t <= DMU or sp.dense_acc_pair:
             return self.dmatmul_pair(
-                kind, g0, xsrc, N, lazy=use_lazy, dmm_ctx=dmm_ctx, ws_pre=ws_pre
+                kind,
+                g0,
+                xsrc,
+                N,
+                lazy=use_lazy,
+                dmm_ctx=dmm_ctx,
+                ws_pre=ws_pre,
+                hook=hook,
+                split=split,
             )
-        assert ws_pre is None, f"dmatmul({kind!r}, ws_pre=...) needs dmatmul_pair"
+        assert ws_pre is None and hook is None and split is None, (
+            f"dmatmul({kind!r}): ws_pre / hook / split need dmatmul_pair"
+        )
         acc = self.scr["acc"]
         acc[:, :N] = jnp.zeros((sp.MB, N), F32)
 
