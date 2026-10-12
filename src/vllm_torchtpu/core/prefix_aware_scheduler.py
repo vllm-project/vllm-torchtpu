@@ -287,6 +287,16 @@ class PrefixAwareScheduler(AsyncScheduler):
         return cached
 
     def schedule(self, *args, **kwargs):
+        connector = getattr(self, "connector", None)
+        if connector is not None:
+            poll_fn = getattr(connector, "poll_and_complete_transfers", None)
+            if callable(poll_fn):
+                try:
+                except Exception:
+                    logger.exception(
+                        "PrefixAwareScheduler: poll_and_complete_transfers failed."
+                    )
+
         # Decoders first: vLLM schedules ``running`` in list order and a
         # partial prefill takes min(remaining, budget), so a prefill ahead of
         # a decoder can leave it no tokens. Stably move every decoding request
