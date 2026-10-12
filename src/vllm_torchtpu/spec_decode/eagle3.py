@@ -5,7 +5,8 @@ import contextlib
 import copy
 import dataclasses
 import functools
-from typing import TYPE_CHECKING, cast
+from collections.abc import Callable, Iterable
+from typing import TYPE_CHECKING, Any, cast
 
 import numpy as np
 import torch
@@ -135,6 +136,22 @@ def _collect_topk_indices_buffers(mtp_model) -> list[torch.Tensor]:
             seen.add(id(buf))
             buffers.append(buf)
     return buffers
+
+
+def _draft_head_modules(model: torch.nn.Module) -> dict[str, object]:
+    """The draft's embedding and head modules, keyed by checkpoint-name fragment."""
+    inner = getattr(model, "model", None)
+    modules: dict[str, object] = {
+        "embed_tokens": getattr(inner, "embed_tokens", None),
+        "lm_head": getattr(model, "lm_head", None)
+        if hasattr(model, "lm_head")
+        else getattr(inner, "lm_head", None),
+    }
+    # Sharing rebinds every per-layer head together, so the first stands for all.
+    for shared_head in iter_mtp_shared_heads(model):
+        modules["shared_head.head"] = shared_head.head
+        break
+    return {key: module for key, module in modules.items() if module is not None}
 
 
 class Eagle3Proposer:
@@ -869,14 +886,17 @@ class Eagle3Proposer:
         load_device = vllm_config.load_config.device
         if load_device is None:
             load_device = vllm_config.device_config.device
+        assert load_device is not None
         target_device = torch.device(load_device)
         with set_default_torch_dtype(draft_model_config.dtype):
             with target_device:
-                model = initialize_model(
-                    vllm_config=vllm_config, model_config=draft_model_config
+                model = cast(
+                    torch.nn.Module,
+                    initialize_model(
+                        vllm_config=vllm_config, model_config=draft_model_config
+                    ),
                 )
-            own_embed_tokens = getattr(model.model, "embed_tokens", None)
-            own_lm_head = getattr(model, "lm_head", None)
+            before = _draft_head_modules(model)
             maybe_share_embeddings(model, target_model, True)
             maybe_share_lm_head(
                 model,
@@ -887,32 +907,26 @@ class Eagle3Proposer:
             )
             # A borrowed module already carries the target's weights; a
             # module the draft kept (`has_own_lm_head`) still loads its own.
+            # Keys are the checkpoint-name fragments of each module sharing
+            # can replace, including DeepSeek-style per-layer heads.
+            after = _draft_head_modules(model)
             shared_keys = tuple(
-                key
-                for key, before, after in (
-                    (
-                        "embed_tokens",
-                        own_embed_tokens,
-                        getattr(model.model, "embed_tokens", None),
-                    ),
-                    ("lm_head", own_lm_head, getattr(model, "lm_head", None)),
-                )
-                if after is not before
+                key for key in before if after.get(key) is not before[key]
             )
-            model_load_weights = model.load_weights
+            model_load_weights = cast(Callable[..., Any], model.load_weights)
 
-            def load_weights(weights):
+            def load_weights(weights: Iterable[tuple[str, torch.Tensor]]) -> Any:
                 return model_load_weights(
                     (name, weight)
                     for name, weight in weights
                     if not any(key in name for key in shared_keys)
                 )
 
-            model.load_weights = load_weights
+            cast(Any, model).load_weights = load_weights
             try:
                 model_loader.load_weights(model, draft_model_config)
             finally:
-                del model.load_weights
+                del cast(Any, model).load_weights
             if base_loader._has_online_quant(model):
                 base_loader.finalize_layerwise_processing(model, draft_model_config)
             base_loader.process_weights_after_loading(

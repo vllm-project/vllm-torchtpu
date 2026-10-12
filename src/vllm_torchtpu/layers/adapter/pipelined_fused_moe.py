@@ -19,6 +19,7 @@ collective communications (AllGather and ReduceScatter) with MoE computation.
 """
 
 import contextlib
+import math
 from collections.abc import Sequence
 from typing import cast
 
@@ -62,18 +63,21 @@ def fixed_moe_collection_chunks(buckets: Sequence[int]):
 def fixed_chunk_count(
     buckets: Sequence[int], parallel_size: int, chunk_size: int
 ) -> int:
-    """Chunk count that honors ``chunk_size`` at the largest bucket.
+    """Chunk count that keeps every gather at or under ``chunk_size``.
 
-    Every bucket must split into equal chunks, so the count is the largest
-    divisor of all buckets at or under the count the largest bucket needs.
+    Every bucket must split into equal chunks, so the count is the smallest
+    common divisor of the buckets that is at least what the largest bucket
+    needs. When no common divisor is that large, the greatest one is used
+    and the largest bucket's gather exceeds ``chunk_size``.
     """
     if chunk_size <= 0 or parallel_size <= 1 or not buckets:
         return 1
-    largest = max(buckets)
-    count = -(-largest * parallel_size // chunk_size)
-    while count > 1 and any(bucket % count for bucket in buckets):
-        count -= 1
-    return count
+    needed = -(-max(buckets) * parallel_size // chunk_size)
+    common = math.gcd(*buckets)
+    count = needed
+    while count < common and common % count:
+        count += 1
+    return min(count, common)
 
 
 def collection_chunks(seq_len: int, parallel_size: int) -> tuple[int, int]:

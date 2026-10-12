@@ -2564,10 +2564,15 @@ def test_static_shape_args_passes_non_tensors_through():
 
 
 @pytest.mark.parametrize("own_lm_head", [False, True])
-def test_mtp_draft_borrows_target_head_before_loading_weights(monkeypatch, own_lm_head):
+@pytest.mark.parametrize("head_style", ["lm_head", "shared_head"])
+def test_mtp_draft_borrows_target_head_before_loading_weights(
+    monkeypatch, own_lm_head, head_style
+):
     """The target's embed_tokens and lm_head are bound before the draft's
     weights stream in, and only the checkpoint copies of borrowed modules are
-    skipped: a draft that keeps its own lm_head still loads it."""
+    skipped: a draft that keeps its own lm_head still loads it. A
+    DeepSeek-style draft keeps its head at ``model.layers.<N>.shared_head.head``
+    and must not load that checkpoint copy over the borrowed target head."""
     import vllm.model_executor.model_loader.utils as loader_utils
     from vllm.model_executor.model_loader import base_loader
 
@@ -2601,20 +2606,37 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(monkeypatch, own_l
             super().__init__()
             self.model = torch.nn.Module()
             self.model.embed_tokens = torch.nn.Embedding(4, 2)
-            self.lm_head = torch.nn.Linear(2, 4)
+            if head_style == "lm_head":
+                self.lm_head = torch.nn.Linear(2, 4)
+            else:
+                layer = torch.nn.Module()
+                layer.shared_head = torch.nn.Module()
+                layer.shared_head.head = torch.nn.Linear(2, 4)
+                self.model.layers = torch.nn.ModuleDict({"92": layer})
+
+        def _head(self):
+            if head_style == "lm_head":
+                return self.lm_head
+            return self.model.layers["92"].shared_head.head
 
         def load_weights(self, weights):
             seen["names"] = [name for name, _ in weights]
             seen["embed_is_target"] = self.model.embed_tokens is target_embed
-            seen["head_is_target"] = self.lm_head is target_head
+            seen["head_is_target"] = self._head() is target_head
             return set(seen["names"])
+
+    head_name = (
+        "lm_head.weight"
+        if head_style == "lm_head"
+        else "model.layers.92.shared_head.head.weight"
+    )
 
     class _Loader:
         def load_weights(self, model, model_config):
             model.load_weights(
                 [
                     ("model.embed_tokens.weight", 1),
-                    ("lm_head.weight", 2),
+                    (head_name, 2),
                     ("model.layers.92.mlp.gate.weight", 3),
                 ]
             )
@@ -2645,7 +2667,7 @@ def test_mtp_draft_borrows_target_head_before_loading_weights(monkeypatch, own_l
     assert seen["head_is_target"] is not own_lm_head
     expected = ["model.layers.92.mlp.gate.weight"]
     if own_lm_head:
-        expected = ["lm_head.weight"] + expected
+        expected = [head_name] + expected
     assert seen["names"] == expected
     assert processed == [proposer.draft_model]
     assert "load_weights" not in proposer.draft_model.__dict__
