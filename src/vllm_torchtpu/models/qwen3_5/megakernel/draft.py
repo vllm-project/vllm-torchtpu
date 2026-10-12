@@ -25,6 +25,10 @@ programs:
   `MoEDebug.row_mask`);
 - the draft loop (steps `1..K-1`): one row per request.
 
+A draft step 0 of more rows than the widest verify bucket (up to twice its
+rows) runs as two steps: the widest bucket, then the rest, the second over the
+pool the first wrote.
+
 The new K/V rows land in the draft layer's pool at the slots ragged paged
 attention writes, so steps on either path read each other's cache. Steps that
 don't fit the buckets, mixed prefill steps and position overrides keep the
@@ -76,8 +80,8 @@ logger = init_logger(__name__)
 
 # Rows per draft step: one per request in the loop, K + 1 = 4 per request at
 # step 0. Larger steps keep the XLA draft layer.
-DEFAULT_LOOP_BUCKETS: tuple[int, ...] = (4, 8, 16)
-DEFAULT_VERIFY_BUCKETS: tuple[int, ...] = (4, 8, 16, 32)
+DEFAULT_LOOP_BUCKETS: tuple[int, ...] = (4, 8, 12, 16, 20, 24, 28, 32)
+DEFAULT_VERIFY_BUCKETS: tuple[int, ...] = (4, 8, 16, 24, 32, 48, 64)
 NUM_SPEC_TOKENS = 3
 _MOE = "moe"
 
@@ -471,13 +475,78 @@ class Qwen35DraftProgram:
         operands `(hidden, block_tables, seq_lens, query_start_loc,
         [gather_indices], *w_flat, pool)` (each rank's copy stacked on dim 0);
         returns `(rows, new_pool)`. It picks the bucket and the block-table
-        width from the shapes it is traced with."""
+        width from the shapes it is traced with. A step-0 step of more rows
+        than the widest bucket whose requests don't fit it runs as two
+        microbatches; padded rows past the widest bucket are dropped."""
         R = self.R
         A = P(self.mesh.axis_names[0])
         buckets = self.loop_buckets if T == 1 else self.verify_buckets
         gather = T > 1
         n_meta = 5 if gather else 4
         n_w = len(self.w_flat)
+        meta_specs = (P(), A, P(), P(), P())
+
+        def two_steps(
+            meta: Sequence[jax.Array],
+            weights: dict[str, Any],
+            pool: jax.Array,
+            rows: int,
+            knr: int,
+            width: int,
+        ) -> tuple[jax.Array, jax.Array]:
+            """Step 0 as two microbatches: the widest bucket's requests, then
+            the rest over the pool the first one wrote."""
+            b0 = buckets[-1]
+            ns0 = b0 // T
+            rows1 = rows - b0
+            ex0, step0 = self.step(T, b0, width)
+            ex1, step1 = self.step(T, select_bucket(rows1, buckets), width)
+            _need(rows1 <= ex1.M, f"{rows1} rows exceed the {ex1.M}-row step")
+
+            def prep_two(*xs: jax.Array) -> tuple[jax.Array, ...]:
+                h_in, bt_in, sl_in, qsl_in, g_in = xs
+                pages = bt_in.reshape(knr, width)
+                ops0 = step_operands(
+                    ex0, h_in[:b0], pages[:ns0], sl_in[:ns0], qsl_in[: ns0 + 1], g_in
+                )
+                ops1 = step_operands(
+                    ex1,
+                    h_in[b0:],
+                    pages[ns0:],
+                    sl_in[ns0:],
+                    qsl_in[ns0:] - qsl_in[ns0],
+                    g_in[ns0:] - b0,
+                )
+                return (*ops0, *ops1)
+
+            ops = jax.shard_map(
+                prep_two,
+                mesh=self.mesh,
+                in_specs=(A,) * n_meta,
+                out_specs=meta_specs * 2,
+                check_vma=False,
+            )(*meta)
+            pos0, hid0, pt0, live0, moe0 = ops[:5]
+            pos1, hid1, pt1, live1, moe1 = ops[5:]
+            out0, pools1 = step0(pos0, hid0, weights, (pool,), pt0, moe0, live0)
+            out1, pools2 = step1(pos1, hid1, weights, pools1, pt1, moe1, live1)
+
+            def post_two(o0: jax.Array, o1: jax.Array, g: jax.Array) -> jax.Array:
+                o_cat = jnp.concatenate([o0[:b0], o1], axis=0)
+                return jnp.take(
+                    o_cat,
+                    jnp.clip(g.astype(jnp.int32), 0, o_cat.shape[0] - 1),
+                    axis=0,
+                )
+
+            out = jax.shard_map(
+                post_two,
+                mesh=self.mesh,
+                in_specs=(A, A, A),
+                out_specs=A,
+                check_vma=False,
+            )(out0, out1, meta[4])
+            return out, pools2[0]
 
         def impl(*args: jax.Array) -> tuple[jax.Array, jax.Array]:
             hidden, block_tables, seq_lens = args[:3]
@@ -488,8 +557,12 @@ class Qwen35DraftProgram:
             knr = seq_lens.shape[0] // R
             width = block_tables.size // R // knr
             _need(width * knr * R == block_tables.size, "ragged block tables")
-            ex, step = self.step(T, select_bucket(rows, buckets), width)
-            _need(rows <= ex.M, f"{rows} rows exceed the {ex.M}-row step")
+            b_max = buckets[-1]
+            weights = self._weights(leaves)
+            if gather and rows > b_max and knr > b_max // T:
+                return two_steps(args[:n_meta], weights, pool, rows, knr, width)
+            ex, step = self.step(T, select_bucket(min(rows, b_max), buckets), width)
+            _need(min(rows, b_max) <= ex.M, f"{rows} rows exceed the {ex.M}-row step")
 
             def prep(*xs: jax.Array) -> tuple[jax.Array, ...]:
                 return step_operands(ex, *xs[:4], xs[4] if gather else None)
@@ -498,11 +571,11 @@ class Qwen35DraftProgram:
                 prep,
                 mesh=self.mesh,
                 in_specs=(A,) * n_meta,
-                out_specs=(P(), A, P(), P(), P()),
+                out_specs=meta_specs,
                 check_vma=False,
             )(*args[:n_meta])
             out, new_pools = step(
-                pos, hid, self._weights(leaves), (pool,), page_table, moe_rows, live
+                pos, hid, weights, (pool,), page_table, moe_rows, live
             )
 
             def post(o: jax.Array, *g: jax.Array) -> jax.Array:
@@ -543,8 +616,8 @@ class Qwen35DraftProgram:
         """The rows a draft step of `rows` rows arrives at after the runner pads it.
 
         `use_for_step` admits step-0 steps up to `padded_rows((K + 1) *
-        num_reqs)` rows, so the drafter's step-0 program compiles every token
-        bucket up to the padded count of its widest step.
+        num_reqs)` rows (at most twice the widest verify bucket), so the
+        drafter's step-0 program compiles every token bucket up to that.
         """
         return padded(rows, self._paddings)
 
@@ -562,11 +635,12 @@ class Qwen35DraftProgram:
         )
         # A step-0 step arrives padded to the runner's token bucket: its rows
         # past the requests' K + 1 tokens each are inert (no live sequence, no
-        # gather index).
+        # gather index). Up to twice the widest verify bucket runs as two
+        # microbatches.
         b_max = buckets[-1] if buckets else 0
         max_rows = (
             min(
-                b_max,
+                2 * b_max,
                 self.padded_rows(int(md.seq_lens.shape[0]) * (NUM_SPEC_TOKENS + 1)),
             )
             if (step0 and md is not None)

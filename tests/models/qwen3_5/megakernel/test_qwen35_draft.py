@@ -282,6 +282,20 @@ def test_use_for_step_takes_padded_steps() -> None:
     }
 
 
+def test_use_for_step_takes_two_microbatches_at_cap_28() -> None:
+    """28 requests: a 32-row loop step, and a 112-row step 0 padded to 128 rows,
+    twice the widest verify bucket (64)."""
+    prog = _bare(28)
+    assert prog.loop_buckets == LOOP and prog.verify_buckets == VERIFY
+    md = _md(prog, 28)
+    assert prog.use_for_step(md, 32, step0=False)
+    assert not prog.use_for_step(md, 48, step0=False)
+    assert prog.use_for_step(md, 128, step0=True)
+    assert not prog.use_for_step(md, 129, step0=True)
+    # 16 requests verify 64 rows, padded to 64: no 80-row step
+    assert not prog.use_for_step(_md(prog, 16), 80, step0=True)
+
+
 def test_note_step_logs_the_mix_each_period(caplog: pytest.LogCaptureFixture) -> None:
     prog = _bare(4)
     prog.step_mix_tracker = draft.mk_stats.StepMixTracker(period_s=0.0)
@@ -423,6 +437,35 @@ def test_step0_row_mask_routes_only_the_gathered_rows() -> None:
     assert np.isfinite(o_mask[:8]).all() and np.isfinite(o_all[:8]).all()
     np.testing.assert_allclose(o_mask[[3, 7]], o_all[[3, 7]], rtol=2e-2, atol=2e-2)
     assert float(np.abs(o_mask[0] - o_all[0]).max()) > 1e-2
+
+
+def _three_requests(verify: tuple[int, ...]) -> tuple[np.ndarray, np.ndarray]:
+    """Step 0 of 3 requests (12 live rows) arriving padded to 16 rows."""
+    prog = _program(verify=verify, skip=frozenset({"experts"}))
+    rng = np.random.default_rng(5)
+    pool0 = _rand_pool_u8(rng, (NUM_PAGES, 2, 64, 4, PS))
+    bt = np.asarray([list(range(8 * s, 8 * s + 8)) for s in (1, 2, 3)], np.int32)
+    lens = np.asarray([304, 704, 515], np.int32)
+    qsl = np.asarray([0, 4, 8, 12], np.int32)
+    hid = jax.random.normal(jax.random.PRNGKey(6), (16, 256), jnp.float32).astype(
+        jnp.bfloat16
+    )
+    out, pool = _run(prog, 4, hid, bt, lens, qsl, pool0, gather=np.asarray([3, 6, 9]))
+    assert not np.array_equal(pool, pool0)
+    return out, pool
+
+
+def test_step0_past_the_widest_bucket_runs_as_two_microbatches() -> None:
+    """Widest bucket 8 (two requests): steps of 8 + 8 rows, the second over the
+    pool the first wrote, give the rows and pool of one 16-row step; widest
+    bucket 12 (three requests fit): the padded rows past it are dropped."""
+    o16, p16 = _three_requests((16,))
+    o8, p8 = _three_requests((8,))
+    o12, p12 = _three_requests((12,))
+    assert np.isfinite(o16).all()
+    np.testing.assert_allclose(o8, o16, rtol=2e-2, atol=2e-2)
+    np.testing.assert_allclose(o12, o16, rtol=2e-2, atol=2e-2)
+    assert np.array_equal(p8, p16) and np.array_equal(p12, p16)
 
 
 def test_forward_layer_runs_the_jax_step_through_the_torch_op(
