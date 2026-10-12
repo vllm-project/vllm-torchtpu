@@ -106,6 +106,10 @@ Example build using the standard helper script:
 ./docker/build_image.sh --target prod -t prod:latest
 ```
 
+## vllm-router
+
+Every target carries [vllm-router](https://github.com/vllm-project/router) at `/usr/local/bin/vllm-router`, built from the commit in the `VLLM_ROUTER_COMMIT` build arg. The disaggregated benchmark clients start it in prefill/decode mode when a serve config sets `AGENTX_PROXY=router`; the default stays the toy proxy in `examples/disagg`.
+
 ## Useful build arguments
 
 The Dockerfile also supports a few build arguments that may be useful in advanced workflows:
