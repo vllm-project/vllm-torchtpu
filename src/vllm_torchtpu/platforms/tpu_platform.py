@@ -795,6 +795,8 @@ class TpuPlatform(Platform):
         else:
             compilation_config.compile_sizes = sorted(compilation_config.compile_sizes)
 
+        if envs.TPU_MOE_SEQUENCE_PARALLEL_FP8_GATHER:
+            _check_sequence_parallel_fp8_gather(vllm_config)
         if envs.TPU_MOE_SEQUENCE_PARALLEL:
             _configure_sequence_parallel_moe(vllm_config)
 
@@ -1297,6 +1299,21 @@ def _is_sequence_parallel_bucket(size: int, tp: int) -> bool:
     # to avoid single-token shape specialization in Dynamo.
     rows, rem = divmod(size, tp)
     return rem == 0 and (rows % 8 == 0 or rows in (2, 4))
+
+
+def _check_sequence_parallel_fp8_gather(vllm_config: VllmConfig) -> None:
+    """The fp8 gather rides on the sequence-parallel decoder's all-gather."""
+    if not envs.TPU_MOE_SEQUENCE_PARALLEL:
+        raise ValueError(
+            "TPU_MOE_SEQUENCE_PARALLEL_FP8_GATHER=1 needs TPU_MOE_SEQUENCE_PARALLEL=1."
+        )
+    # The pooled PCP GDN path projects inside its own op, from bf16 rows.
+    pcp = vllm_config.parallel_config.prefill_context_parallel_size
+    if pcp > 1:
+        raise ValueError(
+            "TPU_MOE_SEQUENCE_PARALLEL_FP8_GATHER=1 does not support prefill "
+            f"context parallelism (prefill_context_parallel_size={pcp})."
+        )
 
 
 def _configure_sequence_parallel_moe(vllm_config: VllmConfig) -> None:

@@ -23,7 +23,10 @@ from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
-from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
+from vllm_torchtpu.kernels.quantized_matmul.util import (
+    quantize_tensor,
+    xla_quantized_matmul,
+)
 
 # Some layers have their `.weight` read raw -- bypassing the linear method's
 # `apply` -- by code that assumes vLLM's `[n_out, n_in]` layout. Flipping those
@@ -156,6 +159,145 @@ def quantized_matmul(
     x_2d = x.reshape(-1, x.shape[-1])
     out_2d = _get_quantized_matmul_op()(x_2d, w_q, w_s)
     return out_2d.reshape(orig_out_shape)
+
+
+def _prequant_matmul_jax(
+    x_q: jax.Array, x_s: jax.Array, w_q: jax.Array, w_s: jax.Array
+) -> jax.Array:
+    """`xla_quantized_matmul`'s per-channel path on pre-quantized rows.
+
+    `x_q` [m, k] fp8 with its per-row scales `x_s` [m, 1]; `w_q` the (k, n)
+    weight with its per-channel scale `w_s` [n]. bf16 out.
+    """
+    out = jax.lax.dot_general(
+        x_q,
+        w_q,
+        dimension_numbers=(((1,), (0,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )
+    out = out * x_s * jnp.expand_dims(w_s, 0)
+    return out.astype(jnp.bfloat16)
+
+
+_prequant_matmul_op: Callable | None = None
+_prequant_matmul_op_lock = Lock()
+
+
+def _get_prequant_matmul_op() -> Callable:
+    global _prequant_matmul_op
+    if _prequant_matmul_op is not None:
+        return _prequant_matmul_op
+
+    with _prequant_matmul_op_lock:
+        if _prequant_matmul_op is not None:
+            return _prequant_matmul_op
+
+        op = pallas.jax_op("pallas::prequant_matmul", _prequant_matmul_jax)
+
+        def _fake_prequant_matmul(
+            x_q: torch.Tensor, x_s: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor
+        ):
+            del x_s, w_s
+            return torch.empty(
+                x_q.shape[0], w_q.shape[-1], dtype=torch.bfloat16, device=x_q.device
+            )
+
+        op.register_fake(_fake_prequant_matmul)
+        _prequant_matmul_op = op
+        return op
+
+
+def quantized_matmul_prequant(
+    x_q: torch.Tensor, x_s: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor
+) -> torch.Tensor:
+    """`quantized_matmul` for rows already quantized per row to fp8.
+
+    Per-channel weight scales only.
+    """
+    if w_s.shape != (w_q.shape[-1],):
+        raise ValueError(
+            f"The pre-quantized matmul takes per-channel weight scales [n], got "
+            f"{tuple(w_s.shape)} for a weight of {tuple(w_q.shape)}."
+        )
+    if x_q.shape[-1] != w_q.shape[0]:
+        raise ValueError(
+            f"Input hidden dim {x_q.shape[-1]} must match weight hidden dim "
+            f"{w_q.shape[0]}."
+        )
+    return _get_prequant_matmul_op()(x_q, x_s, w_q, w_s)
+
+
+def _quantize_rows_jax(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Per-row fp8 quantization: the rows and scales `xla_quantized_matmul`
+    computes for itself, so `_prequant_matmul_jax` on them matches it."""
+    x_q, x_s = quantize_tensor(x, jnp.float8_e4m3fn)
+    return x_q, x_s.astype(jnp.float32)
+
+
+_quantize_rows_op: Callable | None = None
+_quantize_rows_op_lock = Lock()
+
+
+def _get_quantize_rows_op() -> Callable:
+    global _quantize_rows_op
+    if _quantize_rows_op is not None:
+        return _quantize_rows_op
+
+    with _quantize_rows_op_lock:
+        if _quantize_rows_op is not None:
+            return _quantize_rows_op
+
+        op = pallas.jax_op("pallas::quantize_rows_fp8", _quantize_rows_jax)
+
+        def _fake_quantize_rows(x: torch.Tensor):
+            return (
+                torch.empty(x.shape, dtype=torch.float8_e4m3fn, device=x.device),
+                torch.empty((x.shape[0], 1), dtype=torch.float32, device=x.device),
+            )
+
+        op.register_fake(_fake_quantize_rows)
+        _quantize_rows_op = op
+        return op
+
+
+def quantize_rows(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    """`x` [m, k] as fp8 rows with their float32 scales [m, 1]."""
+    return _get_quantize_rows_op()(x)
+
+
+def project_rows(
+    layer: torch.nn.Module,
+    x: torch.Tensor,
+    prequant: tuple[torch.Tensor, torch.Tensor] | None,
+) -> torch.Tensor:
+    """A column-parallel projection of `x`, or of `prequant`'s rows.
+
+    `prequant` is the rows gathered as fp8 with their per-row scales
+    (TPU_MOE_SEQUENCE_PARALLEL_FP8_GATHER), or None to project `x`. A
+    per-channel fp8 projection takes them as they are; any other is given the
+    rows dequantized.
+    """
+    if prequant is None:
+        out, _ = layer(x)
+        return out
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
+
+    x_q, x_s = prequant
+    scale = getattr(layer, "weight_scale", None)
+    if (
+        isinstance(layer.quant_method, VllmFp8LinearMethodTPU)
+        and layer.weight.dtype == torch.float8_e4m3fn
+        and scale is not None
+        and scale.dim() == 1
+    ):
+        weight = layer.weight
+        if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
+            weight = weight.transpose(0, 1)
+        out = quantized_matmul_prequant(x_q, x_s, weight, scale)
+        bias = None if layer.skip_bias_add else layer.bias
+        return out if bias is None else out + bias
+    out, _ = layer((x_q.to(torch.float32) * x_s).to(torch.bfloat16))
+    return out
 
 
 def _quantized_matmul_fp4_jax(

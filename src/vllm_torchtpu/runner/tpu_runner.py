@@ -5009,6 +5009,8 @@ class TPUModelRunner(GPUModelRunner):
 
     def _initialize_quantization_kernels(self):
         from vllm_torchtpu.layers.adapter.linear_common import (
+            _get_prequant_matmul_op,
+            _get_quantize_rows_op,
             _get_quantized_matmul_fp4_op,
             _get_quantized_matmul_op,
         )
@@ -5018,6 +5020,10 @@ class TPUModelRunner(GPUModelRunner):
             _get_quantized_matmul_op()
             # Same for the NVFP4 W4A16 matmul op.
             _get_quantized_matmul_fp4_op()
+            # Same for the sequence-parallel fp8 gather's two ops.
+            if envs.TPU_MOE_SEQUENCE_PARALLEL_FP8_GATHER:
+                _get_quantize_rows_op()
+                _get_prequant_matmul_op()
 
     def _initialize_attention_kernels(self, force: bool = False) -> None:
         """Pre-build Pallas RPA and custom attention kernels before torch.compile."""
