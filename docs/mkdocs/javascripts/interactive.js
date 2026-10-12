@@ -18,22 +18,22 @@
 
 const COMMAND_DATA = {
     "uv_pip": {
-        cmd: `# 1. Authenticate with GCP Artifact Registry (for torch_tpu wheels):\ngcloud auth application-default login\n\n# 2. Clone the repository and install with uv:\ngit clone https://github.com/vllm-project/vllm-torchtpu.git\ncd vllm-torchtpu\nuv sync --group vllm\nsource .venv/bin/activate`,
-        inst: "Install <code>vllm-torchtpu</code> and its pinned <code>vllm</code> and <code>torch_tpu</code> dependencies into a managed virtual environment using <code>uv</code>."
+        cmd: `# 1. Log in with an account that can read the private Torch TPU registry:\ngcloud auth login\ngcloud auth application-default login\n\n# 2. Clone the repository and create a virtual environment:\ngit clone https://github.com/vllm-project/vllm-torchtpu.git\ncd vllm-torchtpu\nuv venv --python 3.12\nsource .venv/bin/activate\n\n# 3. Registry auth, and CPU torch instead of the CUDA build:\nexport UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=\"oauth2accesstoken\"\nuv tool install keyring --with keyrings.google-artifactregistry-auth\nexport UV_TORCH_BACKEND=cpu\n\n# 4. Install (--group vllm builds vLLM from source):\nVLLM_TARGET_DEVICE=\"empty\" uv pip install --pre -e . --group vllm`,
+        inst: "Install <code>vllm-torchtpu</code> and its pinned <code>vllm</code> and <code>torch-tpu</code> dependencies into a virtual environment using <code>uv</code>."
     },
     "docker": {
         "latest": {
-            cmd: `export DOCKER_URI=us-central1-docker.pkg.dev/tpu-pytorch-releases/docker/development:tpu7x_20260405\ngcloud auth configure-docker us-central1-docker.pkg.dev --quiet\nsudo docker run -it --rm --name $USER-vllm --privileged --net=host \\\n  -v /dev/shm:/dev/shm \\\n  --shm-size 150gb \\\n  -p 8000:8000 \\\n  --entrypoint /bin/bash \${DOCKER_URI}`,
-            inst: "Run the pre-built <strong>TPU development</strong> container with <code>torch_tpu</code>, <code>libtpu</code>, and <code>jax</code> pre-installed. Include <code>--privileged</code>, <code>--net=host</code>, and <code>--shm-size=150gb</code> to enable TPU access and shared memory."
+            cmd: `gcloud auth configure-docker us-central1-docker.pkg.dev --quiet\nsudo docker run -it --rm --name $USER-vllm --privileged --device /dev/fuse --net=host \\\n  --shm-size=64g \\\n  us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/vllm-torchtpu-dev:latest bash`,
+            inst: "Run the nightly <strong>dev</strong> image, which has <code>vllm-torchtpu</code> installed in editable mode with its test and benchmarking dependencies. <code>--privileged</code> and <code>--net=host</code> give the container TPU and network access."
         },
         "nightly": {
-            cmd: `git clone https://github.com/vllm-project/vllm-torchtpu.git\ncd vllm-torchtpu\ndocker build -f docker/Dockerfile -t vllm-torchtpu:dev .\nsudo docker run -it --rm --name $USER-vllm --privileged --net=host \\\n  -v /dev/shm:/dev/shm \\\n  --shm-size 150gb \\\n  -p 8000:8000 \\\n  --entrypoint /bin/bash vllm-torchtpu:dev`,
-            inst: "Build and run the <strong>vllm-torchtpu</strong> image from <code>docker/Dockerfile</code> containing the latest repository source."
+            cmd: `git clone https://github.com/vllm-project/vllm-torchtpu.git\ncd vllm-torchtpu\n# Needs gcloud credentials (or ACCESS_TOKEN) for the private Torch TPU registry\n./docker/build_image.sh --target dev -t vllm-torchtpu:dev\nsudo docker run -it --rm --name $USER-vllm --privileged --device /dev/fuse --net=host \\\n  --shm-size=64g \\\n  vllm-torchtpu:dev bash`,
+            inst: "Build the <strong>dev</strong> image from <code>docker/Dockerfile</code> with <code>docker/build_image.sh</code>, then run it."
         }
     },
     "source": {
-        cmd: `# 1. Authenticate with GCP Artifact Registry:\ngcloud auth application-default login\n\n# 2. Clone vllm-torchtpu and create a virtual environment:\ngit clone https://github.com/vllm-project/vllm-torchtpu.git\ncd vllm-torchtpu\nuv venv --python 3.12 --seed\nsource .venv/bin/activate\n\n# 3. Install in editable mode with vllm and dev dependencies:\nuv pip install --prerelease=allow -e . --group vllm --group dev\n\n# 4. (Optional) Editable vllm checkout for cross-repo development:\ngit clone --branch v0.29.0 --depth 1 https://github.com/vllm-project/vllm.git ../vllm\nVLLM_TARGET_DEVICE=empty uv pip install -e ../vllm --no-deps`,
-        inst: "For development or debugging, install <code>vllm-torchtpu</code> in editable mode with <code>--group vllm --group dev</code>. Optionally mount an editable <code>vllm</code> checkout."
+        cmd: `# 1. Log in with an account that can read the private Torch TPU registry:\ngcloud auth login\ngcloud auth application-default login\n\n# 2. Clone the repository and create a virtual environment:\ngit clone https://github.com/vllm-project/vllm-torchtpu.git\ncd vllm-torchtpu\nuv venv --python 3.12\nsource .venv/bin/activate\n\n# 3. Registry auth, and CPU torch instead of the CUDA build:\nexport UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=\"oauth2accesstoken\"\nuv tool install keyring --with keyrings.google-artifactregistry-auth\nexport UV_TORCH_BACKEND=cpu\n\n# 4. Install in editable mode with the vllm and test groups:\nVLLM_TARGET_DEVICE=\"empty\" uv pip install --pre -e . --group vllm --group test\n\n# 5. (Optional) Editable vllm checkout for cross-repo development:\ngit clone --branch v0.29.0 --depth 1 https://github.com/vllm-project/vllm.git ../vllm\nVLLM_TARGET_DEVICE=empty uv pip install -e ../vllm --no-deps`,
+        inst: "For development or debugging, install <code>vllm-torchtpu</code> in editable mode with <code>--group vllm --group test</code>. Optionally install an editable <code>vllm</code> checkout."
     }
 };
 

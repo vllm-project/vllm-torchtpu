@@ -23,6 +23,7 @@ Before provisioning a TPU VM, ensure you have:
    ```
 
 4. **TPU Quota**: Verify that your project has sufficient TPU quota in your target zone under **IAM & Admin -> Quotas & System Limits** in the Google Cloud Console.
+5. **Torch TPU registry access**: `torch-tpu` is installed from a private registry. Request read access from the Torch TPU team (see [Installation](installation.md#prerequisites)).
 
 ---
 
@@ -100,10 +101,10 @@ gcloud compute ssh my-tpu-vm \
 
 ## 4. Verify TPU Devices
 
-Inside the TPU VM, verify that the accelerator devices are visible before installing `vllm-torchtpu`:
+Inside the TPU VM, verify that the accelerator devices are visible before installing `vllm-torchtpu`. Depending on the TPU generation, they appear under `/dev/vfio/` or as `/dev/accel*`:
 
 ```bash
-ls /dev/vfio/
+ls /dev/vfio/ /dev/accel* 2>/dev/null
 ```
 
 Once `vllm-torchtpu` is installed (which includes `tpu-info`), you can inspect chip utilization and HBM memory usage at any time with:

@@ -84,7 +84,7 @@ curl http://localhost:8000/v1/chat/completions \
 ```
 
 > [!TIP]
-> The first startup compiles TPU graphs for the configured shapes and can take several minutes. Set `VLLM_XLA_CACHE_PATH` to persist compiled artifacts across restarts — see [Compilation & Warmup Cache](docs/user_guide/compilation_cache.md).
+> The first startup compiles TPU graphs for the configured shapes and can take several minutes. Set `TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT` to persist compiled artifacts across restarts. See [TorchTPU Compilation Cache](docs/user_guide/compilation_cache.md).
 
 The [Quickstart](docs/getting_started/quickstart.md) covers offline batch inference with `vllm.LLM`, multi-device serving with TP/EP, and multimodal examples.
 

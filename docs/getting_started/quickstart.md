@@ -17,7 +17,7 @@ vllm serve meta-llama/Llama-3.2-1B-Instruct \
   --port 8000
 ```
 
-### 8-Device TPU Host (`TP=8` + Expert Parallelism)
+### 8-Device TPU Host, e.g. `tpu7x-8` (`TP=8` + Expert Parallelism)
 
 ```bash
 vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 \
@@ -46,7 +46,7 @@ curl http://localhost:8000/v1/chat/completions \
 ```
 
 > [!TIP]
-> **Persisting Compilation Caches Across Restarts**: The first startup compiles XLA/Pallas graphs for the configured token shapes. Set `VLLM_XLA_CACHE_PATH` to persist compiled artifacts across runs—see [Compilation & Warmup Cache](../user_guide/compilation_cache.md).
+> **Persisting Compilation Caches Across Restarts**: The first startup compiles XLA/Pallas graphs for the configured token shapes. Set `TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT` to a persistent directory to reuse compiled artifacts across runs (vLLM's own cache lives under `VLLM_CACHE_ROOT`, default `~/.cache/vllm`). See [Compilation Cache](../user_guide/compilation_cache.md).
 
 ---
 
@@ -98,7 +98,7 @@ python examples/offline_inference.py \
 
 ## 3. Multimodal Vision-Language Inference
 
-`vllm-torchtpu` supports vision-language models such as `Qwen/Qwen2.5-VL-3B-Instruct` and `Qwen/Qwen3.5-397B-A17B`:
+`vllm-torchtpu` supports vision-language models such as `Qwen/Qwen2.5-VL-3B-Instruct`. The example script below builds Qwen2.5-VL prompts, so use it with a Qwen2.5-VL checkpoint:
 
 ```bash
 python examples/multi_modal_inference.py \

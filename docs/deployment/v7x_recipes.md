@@ -2,7 +2,7 @@
 
 **TPU v7x (Ironwood)** is Google Cloud's 7th-generation TPU architecture. Each physical TPU v7x chip exposes **2 logical TensorCore devices** to PyTorch and JAX (`192 GB` HBM per chip / `96 GB` per logical device), so a single 4-chip TPU v7x host (`tpu7x-8`) provides **8 logical TPU devices** and `768 GB` of total HBM.
 
-The recipes below are extracted directly from the repository's active PR and nightly CI performance benchmark configurations in [`scripts/vllm/benchmarking/configs/`](https://github.com/vllm-project/vllm-torchtpu/tree/main/scripts/vllm/benchmarking/configs) (scheduled via [`.buildkite/pipeline_perf.yml`](https://github.com/vllm-project/vllm-torchtpu/blob/main/.buildkite/pipeline_perf.yml)).
+The recipes below are extracted directly from the repository's scheduled and nightly CI performance benchmark configurations in [`scripts/vllm/benchmarking/configs/`](https://github.com/vllm-project/vllm-torchtpu/tree/main/scripts/vllm/benchmarking/configs) (scheduled via [`.buildkite/pipeline_perf.yml`](https://github.com/vllm-project/vllm-torchtpu/blob/main/.buildkite/pipeline_perf.yml)).
 
 ---
 
@@ -34,6 +34,7 @@ export ONEHOT_MOE_PERMUTE_THRESHOLD=32768
 vllm serve Qwen/Qwen3.5-397B-A17B-FP8 \
   --tensor-parallel-size 1 \
   --data-parallel-size 8 \
+  --api-server-count=1 \
   --enable-expert-parallel \
   --quantization fp8 \
   --kv-cache-dtype fp8 \
@@ -66,7 +67,7 @@ vllm serve Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
   --quantization fp8 \
   --kv-cache-dtype fp8 \
   --attention-backend CUSTOM \
-  --max-model-len 16384 \
+  --max-model-len 10240 \
   --max-num-batched-tokens 8192 \
   --max-num-seqs 512 \
   --gpu-memory-utilization 0.95 \
@@ -77,9 +78,11 @@ vllm serve Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8 \
 
 ### `Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8` (`TP=8 + EP`)
 
-Used as the PR-time performance guard gate ([`scripts/vllm/benchmarking/configs/qwen3-coder-30b-fp8-tp8-ep.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/qwen3-coder-30b-fp8-tp8-ep.sh)):
+Guard config in the scheduled perf lane's general suite; PRs run it only with the `run-perf-eval` label ([`scripts/vllm/benchmarking/configs/qwen3-coder-30b-fp8-tp8-ep.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/qwen3-coder-30b-fp8-tp8-ep.sh)):
 
 ```bash
+export LIBTPU_INIT_ARGS="--xla_tpu_alternate_memory_benefit_scaling_factor_for_large_buffers=0"
+
 vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 \
   --tensor-parallel-size 8 \
   --enable-expert-parallel \
@@ -88,7 +91,7 @@ vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 \
   --attention-backend CUSTOM \
   --max-model-len 16384 \
   --max-num-batched-tokens 8192 \
-  --max-num-seqs 512 \
+  --max-num-seqs 128 \
   --gpu-memory-utilization 0.95 \
   --async-scheduling \
   --no-enable-prefix-caching \
@@ -99,16 +102,19 @@ vllm serve Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8 \
 
 ## 2. Multi-Host Recipes (`v7x-16` & `v7x-32`)
 
-On multi-host TPU v7x slices without large local disks, stream checkpoints directly from Google Cloud Storage (`gs://`) using `--load-format runai_streamer` and `--enable-ep-weight-filter` so each rank downloads only its own MoE expert shard.
+On multi-host TPU v7x slices without large local disks, stream checkpoints directly from Google Cloud Storage (`gs://`) using `--load-format runai_streamer` and `--enable-ep-weight-filter` so each rank downloads only its own MoE expert shard. Replace `gs://<bucket>/...` with your own checkpoint copy. The commands below run on the head host of a running multi-host cluster; see [Multi-Host Serving](../user_guide/multihost.md) for bringing the hosts up (CI uses `.buildkite/scripts/run_multihost.sh`, Ray backend by default).
 
 ### `zai-org/GLM-5.2-FP8` on `v7x-16` (`2 Hosts, TP=1, DP=16 + EP`)
 
 Validated nightly in [`scripts/vllm/benchmarking/configs/glm-5.2-fp8-dp16-ep.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/glm-5.2-fp8-dp16-ep.sh):
 
 ```bash
-vllm serve zai-org/GLM-5.2-FP8 \
+vllm serve gs://<bucket>/GLM-5.2-FP8 \
+  --load-format runai_streamer \
+  --served-model-name zai-org/GLM-5.2-FP8 \
   --tensor-parallel-size 1 \
   --data-parallel-size 16 \
+  --api-server-count=1 \
   --enable-expert-parallel \
   --enable-ep-weight-filter \
   --safetensors-load-strategy prefetch \
@@ -120,15 +126,19 @@ vllm serve zai-org/GLM-5.2-FP8 \
   --tool-call-parser glm47 \
   --enable-auto-tool-choice \
   --reasoning-parser glm45 \
+  --async-scheduling \
+  --no-enable-prefix-caching \
   --port 8000
 ```
 
 ### `moonshotai/Kimi-K3` on `v7x-32` (`4 Hosts, TP=32 + EP`)
 
-Validated nightly in [`scripts/vllm/benchmarking/configs/kimi-k3-tp32-ep.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/kimi-k3-tp32-ep.sh):
+From [`scripts/vllm/benchmarking/configs/kimi-k3-tp32-ep.sh`](https://github.com/vllm-project/vllm-torchtpu/blob/main/scripts/vllm/benchmarking/configs/kimi-k3-tp32-ep.sh). This config is not a standalone nightly lane; the nightly Kimi-K3 1P1D Kubernetes run uses it as its baseline config.
 
 ```bash
-vllm serve moonshotai/Kimi-K3 \
+vllm serve gs://<bucket>/kimi-k3 \
+  --load-format runai_streamer \
+  --served-model-name moonshotai/Kimi-K3 \
   --tensor-parallel-size 32 \
   --enable-expert-parallel \
   --enable-ep-weight-filter \
@@ -144,5 +154,6 @@ vllm serve moonshotai/Kimi-K3 \
   --gpu-memory-utilization 0.82 \
   --compilation-config '{"compile_sizes":[1,8,8192]}' \
   --async-scheduling \
+  --no-enable-prefix-caching \
   --port 8000
 ```

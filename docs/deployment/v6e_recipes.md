@@ -3,7 +3,7 @@
 **TPU v6e (Trillium)** provides 1 TensorCore per physical chip with `32 GB` of high-bandwidth memory (HBM) per chip. Single-host TPU v6e VMs are available in `1-chip` (`v6e-1`, `32 GB` HBM), `4-chip` (`v6e-4`, `128 GB` HBM), and `8-chip` (`v6e-8`, `256 GB` HBM) topologies, with multi-host pod slices scaling to `v6e-16` (`512 GB` HBM) and beyond.
 
 > [!NOTE]
-> **Reference Configuration Examples**: Unlike the [TPU v7x Serving Recipes](v7x_recipes.md) (which mirror dedicated CI benchmark scripts in `scripts/vllm/benchmarking/configs/`), the `v6e` commands below are **reference configuration examples** sized for `v6e` HBM capacity (`32 GB` per chip). Check [Supported Models](../user_guide/supported_models.md) (`support_matrices/nightly/v6e/model_support_matrix.csv`) for the latest nightly `v6e` CI validation status of each checkpoint.
+> **Reference Configuration Examples**: Unlike the [TPU v7x Serving Recipes](v7x_recipes.md) (which mirror dedicated CI benchmark scripts in `scripts/vllm/benchmarking/configs/`), the `v6e` commands below are **reference configuration examples** sized for `v6e` HBM capacity (`32 GB` per chip). They are **not covered by CI**: no unit, integration or perf lane runs on `v6e`, and `support_matrices/nightly/v6e/model_support_matrix.csv` lists only `Qwen/Qwen3.5-397B-A17B`, as untested.
 
 ---
 
@@ -15,7 +15,6 @@
 | `Qwen/Qwen2.5-VL-7B-Instruct`, `google/gemma-3-12b-it` | `bf16` or `fp8` | `v6e-1` or `v6e-4` | `TP=1` or `TP=4` |
 | `Qwen/Qwen3-32B`, `Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8`, `Qwen/Qwen3.5-35B-A3B-FP8` | `fp8` (`bf16` on `v6e-4`/`v6e-8`) | `v6e-4` (4 chips, 128 GB) | `TP=4` (+ `--enable-expert-parallel` for MoE) |
 | `meta-llama/Llama-3.3-70B-Instruct`, `openai/gpt-oss-120b` | `fp8` / `mxfp4` (`bf16` on `v6e-8`) | `v6e-8` (8 chips, 256 GB) | `TP=8` (+ `--enable-expert-parallel` for MoE) |
-| `Qwen/Qwen3.5-397B-A17B-FP8` | `fp8` | `v6e-16` (2 hosts, 512 GB) | `TP=16` or `DP=2, TP=8` + EP |
 
 ---
 
@@ -88,4 +87,4 @@ vllm serve openai/gpt-oss-120b \
 ```
 
 > [!TIP]
-> **Maximizing KV Cache Capacity on `v6e` (`32 GB` HBM/chip)**: Always pass `--kv-cache-dtype fp8` on TPU v6e to double available KV cache blocks and prevent preemption under long-context or high-concurrency workloads.
+> **Maximizing KV Cache Capacity on `v6e` (`32 GB` HBM/chip)**: Always pass `--kv-cache-dtype fp8` on TPU v6e (it maps to `fp8_e5m2` there) to double available KV cache blocks and prevent preemption under long-context or high-concurrency workloads.

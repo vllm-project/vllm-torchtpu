@@ -155,13 +155,13 @@ The project source is organized under `src/vllm_torchtpu/`:
   * `core/`: JAX-side numerical, attention metadata, and layout logic.
   * `adapter/`: Torch/vLLM-facing adapter layer (quantization methods, custom op bridges, attention backends).
 * `kernels/`: JAX and Pallas custom hardware kernels for TPU.
-* `models/`: Model implementations and architectures supported on TPU (e.g., Llama, Qwen, DeepSeek).
-* `spec_decode/`: Speculative decoding engines (Draft models, Jump decoding, GaaD).
+* `models/`: TPU-specific model implementations and patches (DeepSeek-V4, Kimi-K3, Qwen2.5-VL, Qwen3-VL, Qwen3-Next).
+* `spec_decode/`: Speculative decoding proposers (EAGLE-3, MTP, DFlash, DSpark).
 * `offload/`: KV cache offload subsystems (Raiden store connector, block-major memory layouts).
 * `compilation/`: TorchTPU / XLA compilation pipeline, graph optimizations, and persistent compilation caches.
 * `distributed/`: Tensor Parallel (TP) and Pipeline Parallel (PP) communication primitives for TPU.
-* `platforms/`: Hardware platform detection, device initialization, and platform patch registry.
-* `tests/`: Component unit tests and integration tests.
+* `platforms/`: TPU platform (`TpuPlatform`) and parallelism config validation. TPU patches are registered in `patch_registry.py` at the package root.
+* Tests live outside the package, in `tests/` and `tests_omni/` at the repository root.
 
 ---
 

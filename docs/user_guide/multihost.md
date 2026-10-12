@@ -77,10 +77,12 @@ When `data_parallel_size` is wider than `data_parallel_size_local` (for example,
 
 During `VllmConfig` initialization, `vllm-torchtpu` automatically runs a `TCPStore` rendezvous across all hosts to populate `TORCH_TPU_SLICEBUILDER_ADDRESSES` and `TORCH_TPU_TOPOLOGY` for the full multi-host ICI mesh.
 
+To run each host's command inside a TPU-privileged Docker container, use `scripts/multihost/run_cluster_mp.sh <docker_image> <path_to_hf_home> "<vllm serve ...>"` on every host.
+
 ---
 
 ## Option 2: Ray (`ray`) Multi-Host Backend on GCE
 
-Set `TPU_MULTIHOST_BACKEND=ray` to use the Ray distributed executor across multiple TPU VMs. The instructions below are included from `examples/multihost/README.md`:
+Set `TPU_MULTIHOST_BACKEND=ray` to use the Ray distributed executor across multiple TPU VMs (`scripts/multihost/deploy_cluster.sh` already sets it in each container). The instructions below are included from `examples/multihost/README.md`:
 
 ---8<--- "examples/multihost/README.md:5"

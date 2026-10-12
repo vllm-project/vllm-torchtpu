@@ -34,9 +34,9 @@ TTL, the memory request for whichever host the pod lands on, and the retry rules
 that let a run survive its node being repaired. It is defined once in ci-infra,
 in `kueue/launcher/pod_defaults.yaml`.
 
-The merge is additive, so a role can still declare a volume of its own — both
-manifests here add a per-pod profile cache that shadows a subtree of the shared
-one — or override anything it needs to differ on.
+The merge is additive, so a role can still declare a volume of its own (the
+multi-host and 1P1D manifests here add a per-pod profile cache that shadows a
+subtree of the shared one) or override anything it needs to differ on.
 
 Roles that hold no chips inherit only the eviction policy: the caches are sized
 from a TPU host's memory and a chipless role does not run on one, so it states

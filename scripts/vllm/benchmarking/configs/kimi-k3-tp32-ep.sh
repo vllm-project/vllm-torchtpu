@@ -1,7 +1,8 @@
 #!/bin/bash
 # shellcheck disable=SC2034  # Variables are sourced by run_benchmarks.sh
-# Nightly perf benchmark for Kimi-K3 on the multihost TPU v7x-32 pod
-# (4 hosts x 8 chips): TP=32 with EP. Single-request latency probe at
+# Kimi-K3 baseline config for the multihost TPU v7x-32 pod, used as
+# --baseline-config by the nightly 1P1D run (.buildkite/kubernetes/k3_1p1d.sh)
+# (4 hosts x 4 chips x 2 cores = 32 devices): TP=32 with EP. Single-request latency probe at
 # 8k in / 1k out. Run-to-run spread on this case is <= 0.3% on every gated
 # metric; the default 5% perf tolerance applies. The baseline was adjusted
 # down after PR #561 put K3 on the unified KV pool, whose pooled KDA path is

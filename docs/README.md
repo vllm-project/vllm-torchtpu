@@ -30,7 +30,7 @@ vLLM TorchTPU is the integration of **TorchTPU** and **vLLM**. It is a vLLM plat
 
 - :material-speedometer:{ .lg .middle } __I Want to Serve & Scale__
 
-    Explore supported models, 6D parallelism, P/D disaggregation, and TPU recipes.
+    Explore supported models, parallelism (DP / TP / PP / EP / PCP / DCP), P/D disaggregation, and TPU recipes.
 
     [:octicons-arrow-right-24: Supported Models & Features](user_guide/supported_models.md)
 

@@ -5,7 +5,8 @@
 To install the required benchmarking and evaluation dependencies (`lm-eval`, `evalscope`, `datasets`, `runai-model-streamer`), run:
 
 ```bash
-uv pip install --prerelease=allow -e ".[benchmarking]" --group vllm
+export UV_TORCH_BACKEND=cpu
+VLLM_TARGET_DEVICE=empty uv pip install --pre -e ".[benchmarking]" --group vllm
 ```
 
 ---

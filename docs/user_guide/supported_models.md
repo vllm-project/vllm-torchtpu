@@ -20,16 +20,16 @@ The tables below are generated directly from the repository's nightly CI support
 
 ## Validated Model Families & Architectures
 
-In addition to the nightly matrix above, the following model families have first-class kernel, quantization, and parallelism support tested in CI and benchmarking suites:
+In addition to the nightly matrix above, the following checkpoints are exercised by the repository's tests, CI pipelines, or benchmark configs (`scripts/vllm/benchmarking/configs/`):
 
 | Category | Model Family / Checkpoints | Key TPU Optimizations |
 | :--- | :--- | :--- |
 | **Frontier MoE & Hybrid Attention** | **Qwen3.5** (`Qwen/Qwen3.5-397B-A17B`, `Qwen/Qwen3.5-35B-A3B-FP8`) | Gated DeltaNet (GDN) linear attention + Ragged Paged Attention, SparseCore/GMM Fused MoE, FP8 / W4A8 / MXFP4, PCP, Raiden P/D disaggregation |
-| **Coding & Dense/MoE LLMs** | **Qwen3 / Qwen3-Coder** (`Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8`, `Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8`, `Qwen/Qwen3-32B`, `Qwen/Qwen3-8B`) | Fused EP MoE kernels, FP8 static/block quantization, EAGLE-3 & DFlash speculative decoding |
-| **Multi-head Latent Attention (MLA)** | **DeepSeek-V3 / R1 / V4** (`deepseek-ai/DeepSeek-R1`), **Kimi-K2.5 / K3**, **GLM-5 / GLM-5.1**, **Mistral-Large-3** | Pallas MLA v1/v2 & Sparse MLA kernels, intra-chip latent projection TP, DCP + EP + TP sharding, MXFP4 / W4A8 MoE |
-| **Open-Weight Dense & MoE** | **Llama 3 / 3.1 / 3.2 / 3.3 / 4**, **GPT-OSS** (`openai/gpt-oss-120b`, `openai/gpt-oss-20b`), **Gemma 2 / 3 / 4**, **Mixtral** | Ragged Paged Attention v3, MXFP4 / FP8 quantized matmul, Tensor & Pipeline Parallelism |
-| **Vision-Language & Multimodal** | **Qwen2.5-VL**, **Qwen3-VL** (including embedding), **Kimi-K2.5 VL**, **Gemma-3 / Gemma-4 VL** | 3D M-RoPE, vision encoder FlashAttention, multimodal token chunking |
-| **Diffusion & Omni (`vllm-omni`)** | **FLUX.1** (`FLUX.1-dev`, `FLUX.1-schnell`, `FLUX.1-Kontext-dev`), **Wan2.2** | `vllm_omni` TPU platform plugin (`tests_omni/`) |
+| **Coding & Dense/MoE LLMs** | **Qwen3 / Qwen3-Coder** (`Qwen/Qwen3-Coder-480B-A35B-Instruct-FP8`, `Qwen/Qwen3-Coder-30B-A3B-Instruct-FP8`, `nvidia/Qwen3-30B-A3B-NVFP4`, `Qwen/Qwen3-0.6B`) | Fused EP MoE kernels, FP8 static/block quantization, EAGLE-3 & DFlash speculative decoding |
+| **Multi-head Latent Attention (MLA)** | **DeepSeek-V2 / V4** (`deepseek-ai/DeepSeek-V2`, `deepseek-ai/DeepSeek-V4-Flash`, `deepseek-ai/DeepSeek-V4-Pro`), **Kimi-K2.6 / K3** (`moonshotai/Kimi-K3`), **GLM-5.2** (`zai-org/GLM-5.2-FP8`) | Pallas MLA v1/v2 & Sparse MLA kernels, Kimi-K3 intra-chip latent-MoE projection TP, DCP + EP + TP sharding, MXFP4 / W4A8 MoE |
+| **Open-Weight Dense & MoE** | **Llama 3.1** (`NousResearch/Meta-Llama-3.1-8B-Instruct`, EAGLE-3 tests), **Gemma 4** (`RedHatAI/gemma-4-26B-A4B-it-FP8-Dynamic`, `RedHatAI/gemma-4-31B-it-FP8-Dynamic`) | Ragged Paged Attention v3, FP8, Tensor & Data Parallelism |
+| **Vision-Language & Multimodal** | **Qwen2.5-VL** (`Qwen/Qwen2.5-VL-3B-Instruct`), **Qwen3-VL** (including `Qwen/Qwen3-VL-Embedding-8B`), **Kimi-K3** (vision), **Gemma 4** (multimodal) | 3D M-RoPE, vision encoder FlashAttention, multimodal token chunking |
+| **Diffusion & Omni (`vllm-omni`)** | **FLUX.1** (`FLUX.1-dev`, `FLUX.1-schnell`), **FLUX.2** (`FLUX.2-klein-4B`) | `vllm_omni` TPU platform plugin (`tests_omni/`) |
 
 ---
 
@@ -40,9 +40,9 @@ In addition to the nightly matrix above, the following model families have first
 | **Ragged Paged Attention (RPA v3)** | Supported | Custom Pallas paged attention for MHA/GQA with block-major and HND KV cache layouts (`bf16` and `fp8`). |
 | **Multi-head Latent Attention (MLA)** | Supported | Dense MLA v1/v2 and Sparse MLA kernels with SparseCore gather and KV compression. |
 | **Gated DeltaNet (GDN) Hybrid Attention** | Supported | Pallas chunked prefill and recurrent decode kernels for hybrid linear + full attention models (e.g., Qwen3.5). |
-| **Parallelism (TP, DP, PP, EP, PCP, DCP)** | Supported | Up to 6D composable parallelism across single-host and multi-host TPU slices. |
-| **Quantization** | Supported | Unquantized `bf16`, `fp8` (`e4m3fn`), `compressed-tensors` (`W8A8`, `W4A8`, `W4A16`), `awq`, `gptq`, `mxfp4`, and `fp8` KV cache. |
-| **Disaggregated Serving (P/D)** | Supported | High-bandwidth KV cache transfer via `TpuRaidenConnector` (`tpu_sync`) with dynamic P/D resharding. |
-| **Speculative Decoding** | Supported | `ngram`, `suffix`, `mtp` (Multi-Token Prediction), `eagle3`, and `dflash`. |
+| **Parallelism (TP, DP, PP, EP, PCP, DCP)** | Supported | Across single-host and multi-host TPU slices. Not every combination is allowed (for example, PP requires TP=1); see [Parallelism & Scaling](parallelism.md). |
+| **Quantization** | Supported | Unquantized `bf16`, `fp8`, `mxfp4`, `modelopt_fp4` (NVFP4), `compressed-tensors`, DeepSeek-V4 FP8, and `fp8` KV cache. See [Quantization](quantization.md). |
+| **Disaggregated Serving (P/D)** | Supported | High-bandwidth KV cache transfer via `TPURaidenConnector` (`tpu_sync`) with dynamic P/D resharding. |
+| **Speculative Decoding** | Supported | `ngram`, `mtp` (Multi-Token Prediction), `eagle3`, `dflash`, and `dspark`. |
 | **Multi-LoRA** | Supported | Dynamic LoRA adapter routing (`--enable-lora`). |
-| **Compilation & Warmup Cache** | Supported | Persistent on-disk XLA (`VLLM_XLA_CACHE_PATH`) and `torch_tpu` warmup caches. |
+| **Compilation Cache** | Supported | Persistent on-disk TorchTPU compilation cache (`TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT`). |

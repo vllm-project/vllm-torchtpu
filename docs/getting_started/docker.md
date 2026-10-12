@@ -1,6 +1,6 @@
 # Docker images
 
-This folder contains the Dockerfile used to build the main image variants for vllm-torchtpu.
+`docker/Dockerfile` defines the image variants for vllm-torchtpu, and `docker/build_image.sh` builds them.
 
 ## Pre-built Nightly Images
 
@@ -106,16 +106,33 @@ Example build using the standard helper script:
 ./docker/build_image.sh --target prod -t prod:latest
 ```
 
-## Useful build arguments
-
-The Dockerfile also supports a few build arguments that may be useful in advanced workflows:
-
-* `VLLM_SOURCE`: when set, installs `vllm` from the copied local source tree
-
-Example using the helper script with build arguments:
+### `omni`
+Built from `--target omni`. Extends `dev` with the `omni` extra (`vllm-omni`). Not published as a nightly image.
 
 ```bash
-./docker/build_image.sh \
-  --target prod \
-  -t prod:latest
+./docker/build_image.sh --target omni -t omni:latest
+```
+
+## `build_image.sh` options
+
+* `-t, --image-tag TAG`: image tag (default: `vllm-torchtpu-local`).
+* `--target TARGET`: `prod`, `dev`, `ci`, or `omni` (default: `prod`).
+* `-s, --vllm-source DIR`: install `vllm` in editable mode from a local source tree. Only the `dev` and `omni` targets use it.
+* `-c, --vllm-commit-hash REF`: build against a different vLLM ref (default: the `vllm` pin in `pyproject.toml`).
+
+The build pulls `torch-tpu` from the private Torch TPU registry. The script reads a token from `ACCESS_TOKEN`, or else from `gcloud auth print-access-token` (or the GCE metadata server), and passes it to BuildKit as the `gcloud_token` secret.
+
+Example with a local vLLM checkout:
+
+```bash
+./docker/build_image.sh --target dev -s /path/to/vllm -t dev:latest
+```
+
+## Running a container
+
+Start a container with the same device, network, and shared-memory flags that CI uses:
+
+```bash
+docker run --rm -it --privileged --device /dev/fuse --net=host --shm-size=64g \
+  us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/vllm-torchtpu-dev:latest bash
 ```

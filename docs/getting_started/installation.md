@@ -12,7 +12,7 @@ Choose your preferred installation method below:
   <div class="cg-row">
     <div class="cg-label">1. Installation Method</div>
     <div class="cg-options">
-      <button type="button" class="cg-btn active" data-group="method" data-val="uv_pip" aria-pressed="true">uv sync (Recommended)</button>
+      <button type="button" class="cg-btn active" data-group="method" data-val="uv_pip" aria-pressed="true">uv (Recommended)</button>
       <button type="button" class="cg-btn" data-group="method" data-val="source" aria-pressed="false">Editable Source Install</button>
       <button type="button" class="cg-btn" data-group="method" data-val="docker" aria-pressed="false">Docker Container</button>
     </div>
@@ -20,7 +20,7 @@ Choose your preferred installation method below:
   <div class="cg-row" id="docker-image-group" style="display: none;">
     <div class="cg-label">2. Container Type</div>
     <div class="cg-options">
-      <button type="button" class="cg-btn active" data-group="docker_img" data-val="latest" aria-pressed="true">Base TPU Dev Image</button>
+      <button type="button" class="cg-btn active" data-group="docker_img" data-val="latest" aria-pressed="true">Nightly Dev Image</button>
       <button type="button" class="cg-btn" data-group="docker_img" data-val="nightly" aria-pressed="false">Build from Dockerfile</button>
     </div>
   </div>
@@ -34,49 +34,56 @@ Choose your preferred installation method below:
 
 ## Prerequisites
 
-- **Python 3.12** (`>=3.12,<3.13`). Pre-built `tpu-sync-torch` and `torch_tpu` wheels target CPython 3.12.
-- **GCP Artifact Registry Authentication**: `torch_tpu` wheels are pulled from Google Cloud Artifact Registry (`us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/`). Authenticate your host before installing:
+- **Python 3.12** (`requires-python = ">=3.12,<3.13"` in `pyproject.toml`).
+- **Access to the private Torch TPU registry**: `torch-tpu` is pulled from Google Cloud Artifact Registry (`us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/`). Log in to `gcloud` with an account that can read it (to request access, contact the Torch TPU team):
 
 ```bash
+gcloud auth login
 gcloud auth application-default login
 ```
+
+!!! tip "Stale `~/.netrc` credentials"
+    A `~/.netrc` entry for `us-python.pkg.dev` with an expired token is a common cause of authentication errors with `keyring`. Delete that block from `~/.netrc`.
+
+!!! note "Migrating from the old `vllm_torchtpu` distribution"
+    This repo is now distributed as `vllm-torchtpu-core` (the import package is still `vllm_torchtpu`). If your environment has the pre-rename `vllm_torchtpu` installed, run `pip uninstall -y vllm_torchtpu` (or `uv pip uninstall vllm_torchtpu`) first.
 
 ---
 
 ## Option 1: Install with `uv` (Recommended)
 
-`pyproject.toml` configures the `torch-tpu-registry` index and pins compatible `torch`, `torch-tpu`, `jax`, `libtpu`, and `vllm` versions automatically.
+`pyproject.toml` pins `torch`, `torch-tpu`, `jax`, `libtpu`, and `vllm`, and uses the `torch-tpu-registry` index only for `torch-tpu`. Set `UV_TORCH_BACKEND=cpu` so `torch` resolves to the CPU build rather than the CUDA one.
 
 ```bash
 # 1. Install uv (if not already installed)
 curl -LsSf https://astral.sh/uv/install.sh | sh
 source $HOME/.local/bin/env
 
-# 2. Clone vllm-torchtpu and sync the environment (including the vllm group)
+# 2. Clone vllm-torchtpu and create a virtual environment
 git clone https://github.com/vllm-project/vllm-torchtpu.git
 cd vllm-torchtpu
-uv sync --group vllm
-
-# 3. Activate the virtual environment
+uv venv --python 3.12
 source .venv/bin/activate
+
+# 3. Registry auth: username for the index, plus keyring for the token
+export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken"
+uv tool install keyring --with keyrings.google-artifactregistry-auth
+
+# 4. Install (--group vllm builds vLLM from source)
+export UV_TORCH_BACKEND=cpu
+VLLM_TARGET_DEVICE="empty" uv pip install --pre -e . --group vllm
 ```
 
-To install in editable mode with test and development dependencies:
-
-```bash
-uv venv --python 3.12 --seed
-source .venv/bin/activate
-uv pip install --prerelease=allow -e . --group vllm --group test
-```
+To also install the test dependencies, add `--group test` to the last command.
 
 ---
 
 ## Option 2: Install with `pip`
 
-If using standard `pip` (`pip >= 25.1` for `--group` support), install `keyring` and `keyrings.google-artifactregistry-auth` first so `pip` can authenticate with the `torch_tpu` Artifact Registry index:
+If using standard `pip` (`pip >= 25.1` for `--group` support), install `keyring` and `keyrings.google-artifactregistry-auth` first so `pip` can authenticate with the Torch TPU registry:
 
 ```bash
-python3.12 -m venv .venv
+python3.12 -m venv .venv --symlinks
 source .venv/bin/activate
 
 pip install --upgrade pip keyring keyrings.google-artifactregistry-auth
@@ -84,8 +91,8 @@ pip install --upgrade pip keyring keyrings.google-artifactregistry-auth
 git clone https://github.com/vllm-project/vllm-torchtpu.git
 cd vllm-torchtpu
 
-pip install -e . --group vllm \
-  --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/
+export PIP_INDEX_URL="https://oauth2accesstoken@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
+VLLM_TARGET_DEVICE="empty" pip install --pre -e . --group vllm
 ```
 
 ---
@@ -109,9 +116,9 @@ VLLM_TARGET_DEVICE=empty uv pip install -e ../vllm --no-deps
 | Flag | Purpose |
 | :--- | :--- |
 | `--group vllm` | Installs pinned upstream `vllm` (`v0.29.0`) from source. |
-| `--group test` | Installs `pytest`, `pytest-mock`, `pytest-cov`, `parameterized`, and `vllm_test_utils`. |
-| `--extra benchmarking` | Installs `lm-eval`, `evalscope`, `datasets`, and `runai-model-streamer[gcs]`. |
-| `--extra omni` | Installs `vllm-omni` for multimodal diffusion models (e.g., FLUX, Wan2.2). |
+| `--group test` | Installs `pytest` (with `pytest-mock`, `pytest-timeout`, `pytest-cov`), `absl-py`, `parameterized`, and `vllm_test_utils`. |
+| `--extra benchmarking` | Installs benchmarking and eval tools, including `lm-eval`, `evalscope`, `datasets`, and `runai-model-streamer[gcs]`. |
+| `--extra omni` | Installs `vllm-omni` for multimodal diffusion models (e.g., FLUX). |
 
 ---
 

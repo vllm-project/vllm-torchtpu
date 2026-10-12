@@ -1,20 +1,20 @@
 # Benchmarking vllm-torchtpu
 
-All configs target TPU v7x-8 (TP=8). KV cache is forced to fp8 in `run_benchmarks.sh`.
+Most configs target TPU v7x-8; some use v7x-2, v7x-16 or v7x-32 (see `.buildkite/pipeline_perf.yml`, and `.buildkite/pipeline_k3_sweep.yml` for v7x-32). KV cache defaults to fp8 in `run_benchmarks.sh`; a config can override it with `KV_CACHE_DTYPE`.
 
 ## Quick Start
 
 ```bash
 # Guard configs (scheduled perf builds)
 ./scripts/vllm/benchmarking/run_benchmarks.sh --config qwen3-coder-30b-fp8-tp8-ep
+./scripts/vllm/benchmarking/run_benchmarks.sh --config qwen3.5-35b-fp8-tp4-ep
 
 # Nightly sweeps
 ./scripts/vllm/benchmarking/run_benchmarks.sh --config qwen3-coder-30b-tp8-ep
-./scripts/vllm/benchmarking/run_benchmarks.sh --config qwen3.5-35b-fp8-tp4-ep
 ./scripts/vllm/benchmarking/run_benchmarks.sh --config qwen3.5-35b-fp8-dp4-tp2-ep
 ./scripts/vllm/benchmarking/run_benchmarks.sh --config qwen3-coder-480b-fp8-tp8-ep
 
-# Manual full 480B sweep, not run in CI
+# Full 480B sweep (nightly)
 ./scripts/vllm/benchmarking/run_benchmarks.sh --config qwen3-coder-480b-fp8-tp8-ep-full
 
 # Pin a deterministic results dir (used by CI)
@@ -30,12 +30,12 @@ All configs target TPU v7x-8 (TP=8). KV cache is forced to fp8 in `run_benchmark
 |--------|-------|-----|----|----|----|
 | `qwen3-coder-30b-fp8-tp8-ep` | Qwen3-Coder-30B-A3B-Instruct-FP8 | yes | on | fp8 | guard (scheduled) |
 | `qwen3-coder-30b-tp8-ep` | Qwen3-Coder-30B-A3B-Instruct | yes | on | none | nightly |
-| `qwen3.5-35b-fp8-tp4-ep` | Qwen3.5-35B-A3B-FP8 | yes | on | fp8 | nightly |
+| `qwen3.5-35b-fp8-tp4-ep` | Qwen3.5-35B-A3B-FP8 | yes | on | fp8 | guard (scheduled) |
 | `qwen3.5-35b-fp8-dp4-tp2-ep` | Qwen3.5-35B-A3B-FP8 | yes | on | fp8 | nightly |
 | `qwen3-coder-480b-fp8-tp8-ep` | Qwen3-Coder-480B-A35B-Instruct-FP8 | yes | on | fp8 | nightly short sweep |
-| `qwen3-coder-480b-fp8-tp8-ep-full` | Qwen3-Coder-480B-A35B-Instruct-FP8 | yes | on | fp8 | manual only |
+| `qwen3-coder-480b-fp8-tp8-ep-full` | Qwen3-Coder-480B-A35B-Instruct-FP8 | yes | on | fp8 | nightly full sweep |
 
-Configs are shell files in `configs/`. Add your own by copying an existing one.
+This table lists a subset; every config is a shell file in `configs/`. Add your own by copying an existing one.
 
 CI (`.buildkite/pipeline_perf.yml`) runs `check_regression.py` three times against
 the same live server:
@@ -94,7 +94,7 @@ the default lands.
 1. Loads a config (model, TP, ISL/OSL sweep, concurrency levels)
 2. Starts a `vllm serve` instance with the right flags
 3. Optionally runs discarded full-traffic warmup passes
-4. Runs `benchmark_serving.py` (from your vLLM install) for each ISL/OSL x concurrency combo
+4. Runs `vllm bench serve` for each ISL/OSL x concurrency combo
 5. Saves JSON results to `benchmark_runs/<model>_tp<N>_<timestamp>/`
 
 ## Regression Checks
@@ -114,7 +114,7 @@ python3 scripts/vllm/benchmarking/check_regression.py \
 
 ## Prerequisites
 
-- vLLM installed (provides `benchmark_serving.py`)
+- vLLM installed (provides `vllm bench serve`)
 - `vllm_torchtpu` installed (this repo)
 - TPU device available
 - Model weights downloaded (or use `--load-format dummy` via config)
@@ -123,7 +123,7 @@ python3 scripts/vllm/benchmarking/check_regression.py \
 
 Results are saved to `benchmark_runs/` (gitignored). Each run creates a directory containing:
 - `config.json` — benchmark parameters
-- `isl<N>_osl<N>_c<N>.json` — per-combo results from benchmark_serving.py
+- `isl<N>_osl<N>_c<N>.json`: per-combo results from `vllm bench serve`
 - `server.log` — vLLM server output
 - `benchmark.log` — run metadata
 

@@ -1,15 +1,16 @@
 # Testing & CI Guide
 
-`vllm-torchtpu` runs continuous integration on Buildkite (`.buildkite/pipeline_tests.yml`) across CPU agents (`cpu_64_core`), 2-chip TPU agents (`tpu_v7x_2_queue`), and 8-chip TPU agents (`tpu_v7x_8_queue`).
+`vllm-torchtpu` runs continuous integration on Buildkite (`.buildkite/pipeline_tests.yml`) across CPU agents (`cpu` for the full-environment type check, `cpu_64_core` for unit tests), TPU v7x-2 agents (`tpu_v7x_2_queue`, 1 chip / 2 devices), and TPU v7x-8 agents (`tpu_v7x_8_queue`, 4 chips / 8 devices).
 
 ---
 
 ## Running Tests Locally
 
-Install the `test` dependency group before running `pytest`:
+Install the `test` dependency group before running `pytest` (set up the `torch-tpu` registry auth first, see [Installation](../getting_started/installation.md)):
 
 ```bash
-uv pip install --prerelease=allow -e . --group vllm --group test
+export UV_TORCH_BACKEND=cpu
+VLLM_TARGET_DEVICE=empty uv pip install --pre -e . --group vllm --group test
 ```
 
 The commands below match the exact marker expressions and file filters executed in `.buildkite/pipeline_tests.yml`:
@@ -23,7 +24,7 @@ JAX_PLATFORMS=cpu pytest tests/ -sv --timeout=600 \
   -m "not tpu_test and not multichip and not nightly"
 ```
 
-### 2. General Single-Host TPU Tests (2-Chip Queue)
+### 2. General Single-Host TPU Tests (v7x-2 Queue)
 
 On a TPU VM, run the general `tpu_test` suite (excluding `test_speculative_decoding.py`, which runs in its own dedicated CI step):
 
@@ -33,9 +34,9 @@ pytest tests/ -sv --timeout=600 \
   -m "tpu_test and not nightly and not multichip"
 ```
 
-### 3. Multi-Chip TPU Tests (8-Chip Queue)
+### 3. Multi-Chip TPU Tests (v7x-8 Queue)
 
-On an 8-chip (or 8-device TPU v7x) host, run multi-chip distributed and kernel tests:
+On a TPU v7x-8 host (4 chips / 8 devices), run multi-chip distributed and kernel tests:
 
 ```bash
 pytest tests/ -sv --timeout=600 \
@@ -45,14 +46,14 @@ pytest tests/ -sv --timeout=600 \
 
 ### 4. Speculative Decoding TPU Tests
 
-Speculative decoding e2e tests (`tests/entrypoints/llm/test_speculative_decoding.py`) carry a module-level `pytestmark = pytest.mark.tpu_test` and are split across 2-chip and 8-chip steps:
+Speculative decoding e2e tests (`tests/entrypoints/llm/test_speculative_decoding.py`) carry a module-level `pytestmark = pytest.mark.tpu_test` and are split across v7x-2 and v7x-8 steps:
 
 ```bash
-# 2-chip speculative decoding PR suite
+# v7x-2 speculative decoding PR suite
 pytest tests/entrypoints/llm/test_speculative_decoding.py -sv --timeout=1800 \
   -m "not nightly and not multichip"
 
-# 8-chip speculative decoding multichip PR suite (e.g. DP + MTP)
+# v7x-8 speculative decoding multichip PR suite (e.g. DP + MTP)
 pytest tests/entrypoints/llm/test_speculative_decoding.py -sv --timeout=3600 \
   -m "not nightly and multichip"
 ```
@@ -102,6 +103,9 @@ Key repository hooks:
 
 - **`ruff-check` & `ruff-format`**: Enforces PEP 8 formatting (88-column line width) and import sorting.
 - **`pyrefly`**: Runs static type checking (`[tool.pyrefly]` in `pyproject.toml`)—see [Type Checking](type_checking.md).
-- **`pymarkdown`**: Automatically formats Markdown files.
-- **`check-env-reads`**: Verifies that all environment variable reads go through `src/vllm_torchtpu/envs.py`.
-- **`check-b023-baseline`**: Verifies that Pallas kernel files under `src/vllm_torchtpu/kernels/` do not introduce unintended loop-variable closures.
+- **`pymarkdown`**: Lints Markdown files and auto-fixes what it can.
+- **`check-env-reads`**: Fails on new direct environment variable reads outside `src/vllm_torchtpu/envs.py`. It is a ratchet against `tools/env_reads_baseline.txt`, so existing direct reads remain until migrated.
+- **`check-b023-baseline`**: Fails when a file under `src/vllm_torchtpu/kernels/` gains a loop-variable closure (ruff B023), ratcheted against `tools/b023_baseline.txt`.
+- **`signoff-commit`** (`commit-msg` stage): Appends a `Signed-off-by:` line to the commit message if it is missing.
+
+The config also runs `check-yaml`, `end-of-file-fixer`, `trailing-whitespace`, `clang-format`, `actionlint`, `pip-compile`, `shellcheck`, `detect-missing-init`, `keep-sorted`, `check-license-header`, `check-filenames`, `no-internal-refs` and `suggestion`.
