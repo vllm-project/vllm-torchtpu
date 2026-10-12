@@ -145,16 +145,27 @@ class AllReduceRing:
             for off in range(1, R)
         ]
 
-    def ar_round(self, slot, rnd_i: int):
-        """Start remote copies for round `rnd_i` on `slot` and wait on `wait_recv()`."""
+    def ar_round(self, slot, rnd_i: int, fill=None):
+        """Start remote copies for round `rnd_i` on `slot` and wait on `wait_recv()`.
+
+        `fill()` (optional) runs between the starts and the waits.
+        """
         descs = self.ar_copies(slot, rnd_i)
         for d in descs:
             d.start()
+        if fill is not None:
+            fill()
         for d in descs:
             d.wait_recv()
 
-    def allreduce(self, slot, x, first):
-        """Reduce-sum `x [MB, H]` f32 partial across all `R` ranks on `slot`."""
+    def allreduce(self, slot, x, first, fill=None):
+        """Reduce-sum `x [MB, H]` f32 partial across all `R` ranks on `slot`.
+
+        `fill()` (optional, e.g. a deferred dense-ring refill) is issued once
+        inside the all-reduce, while its first cross-chip round is in flight
+        (round 0 of the flat one-shot, round 1 otherwise), or before returning
+        when there is no communication.
+        """
         self._used_slots.update((slot,) if isinstance(slot, int) else (0, 1))
         cp, scr, me, sc = self.cp, self.scr, self.me, self.sc
         WAR, MR, B, HPC, PR, PC = cp.WAR, cp.MR, cp.B, cp.HPC, cp.PR, cp.PC
@@ -195,9 +206,13 @@ class AllReduceRing:
                 send[slot] = val.astype(BF16)
                 recv[slot, me] = send[slot]
         if not self.comm:
+            if fill is not None:
+                fill()
             return round_bf16(val)
         with sc("ar_comm"):
-            self.ar_round(slot, 0)
+            # one-round modes take `fill` here; the others in their round 1
+            one_round = (HIER == 0 and not RSAG) or (HIER == 3 and cp.N_HIER3 == 1)
+            self.ar_round(slot, 0, fill if one_round else None)
         if HIER == 3:
             for rnd_i in range(1, cp.N_HIER3):
                 with sc("ar_sum"):
@@ -208,7 +223,7 @@ class AllReduceRing:
                     ).astype(BF16)
                     recv[rnd_i, slot, bi] = send[rnd_i, slot]
                 with sc("ar_comm"):
-                    self.ar_round(slot, rnd_i)
+                    self.ar_round(slot, rnd_i, fill if rnd_i == 1 else None)
             with sc("ar_sum"):
                 last = cp.N_HIER3 - 1
                 return recv[last, slot, 0].astype(F32) + recv[last, slot, 1].astype(F32)
@@ -229,7 +244,7 @@ class AllReduceRing:
                 else:
                     ag_recv[slot, me // 2] = ag_send[slot]
             with sc("ar_comm"):
-                self.ar_round(slot, 1)
+                self.ar_round(slot, 1, fill)
             if HIER == 1:
                 with sc("ar_sum"):
                     return jnp.sum(ag_recv[slot].astype(F32), axis=0)
@@ -263,7 +278,7 @@ class AllReduceRing:
             ag_send[slot] = jnp.sum(recv[slot].astype(F32), axis=0).astype(BF16)
             ag_recv[slot, me] = ag_send[slot]
         with sc("ar_comm"):
-            self.ar_round(slot, 1)
+            self.ar_round(slot, 1, fill)
         with sc("ar_sum"):
             return jnp.concatenate(
                 [ag_recv[slot, j] for j in range(R)], axis=-1

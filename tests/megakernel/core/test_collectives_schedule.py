@@ -12,7 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Opt-in all-reduce schedule options of `AllReduceRing` (`Tiles.hier1_peers`,
-`Tiles.hx`).
+`Tiles.hx`, `allreduce(fill=)`).
 
 Each option is checked two ways: the 8-rank interpret-mode all-reduce is
 bit-identical to the default schedule (the option moves data, it does not
@@ -85,12 +85,15 @@ def _ring_outputs(
     B: int = 4,
     seed: int = 0,
     counts: bool = False,
+    fills: list[int] | None = None,
 ) -> tuple[np.ndarray, np.ndarray, collectives.CommParams]:
     """Run 2 layers x 2 alternating slots of `allreduce` + `add_residual`.
 
     Returns the per-rank residual rows `[R, B, H]` (f32), the float64 host sum
     of the four reductions `[B, H]`, and the `CommParams` used. With `counts`,
     returns the step's primitive histogram (`prim_counts`) instead of the rows.
+    With `fills`, every all-reduce gets a `fill` that appends its slot (at
+    trace time) and zeroes a spare buffer.
     """
     devs = jax.devices("cpu")
     assert len(devs) >= R, f"Expected >= {R} CPU devices, found {len(devs)}"
@@ -99,6 +102,7 @@ def _ring_outputs(
     cp = collectives.comm_params(ex, tiles, H=H, PC=pc)
     scratch = {
         "res": pltpu.VMEM((ex.MB, H), F32),
+        "spare": pltpu.VMEM((8, 128), F32),
         **collectives.ring_scratch(cp),
         **collectives.stage_scratch(cp),
     }
@@ -108,17 +112,29 @@ def _ring_outputs(
         scr = dict(zip(s_names, scr_refs))
         me = lax.axis_index("tp").astype(I32)
         ar = AllReduceRing(cp, scr, me)
-        barrier = pltpu.get_barrier_semaphore()
-        for off in range(1, R):
-            pl.semaphore_signal(
-                barrier, 1, device_id=(me ^ off,), device_id_type=pl.DeviceIdType.MESH
-            )
-        pl.semaphore_wait(barrier, R - 1)
+        if ar.comm:
+            barrier = pltpu.get_barrier_semaphore()
+            for off in range(1, R):
+                pl.semaphore_signal(
+                    barrier,
+                    1,
+                    device_id=(me ^ off,),
+                    device_id_type=pl.DeviceIdType.MESH,
+                )
+            pl.semaphore_wait(barrier, R - 1)
         scr["res"][...] = jnp.zeros((ex.MB, H), F32)
         for step_idx in range(4):
             slot = step_idx % 2
             src = x0_ref[...] if slot == 0 else x1_ref[...]
-            ar.add_residual(ar.allreduce(slot, src, jnp.bool_(step_idx < 2)))
+            fill = None
+            if fills is not None:
+
+                def fill(slot=slot):
+                    fills.append(slot)
+                    scr["spare"][...] = jnp.zeros((8, 128), F32)
+
+            first = jnp.bool_(step_idx < 2)
+            ar.add_residual(ar.allreduce(slot, src, first, fill=fill))
         ar.drain_sends()
         out_ref[...] = scr["res"][...]
 
@@ -314,7 +330,47 @@ def test_hx_adds_the_all_gather_round():
     _check_hx_structure()
 
 
+# ---------------------------------------------------------------------------
+# allreduce(fill=)
+# ---------------------------------------------------------------------------
+_FILL_MODES = (
+    dict(hier=0),
+    dict(hier=0, rsag=True),
+    dict(hier=1),
+    dict(hier=2),
+    dict(hier=2, hx=True),
+    dict(hier=3),
+)
+
+
+def _check_fill_once_and_bit_identical() -> None:
+    for kw in _FILL_MODES:
+        tiles = dataclasses.replace(_TINY_TILES, **kw)
+        base, _, _ = _ring_outputs(tiles)
+        fills: list[int] = []
+        out, _, _ = _ring_outputs(tiles, fills=fills)
+        assert fills == [0, 1, 0, 1], (kw, fills)
+        np.testing.assert_array_equal(out, base)
+
+
+def test_allreduce_fill_runs_once_per_all_reduce():
+    """`fill` is issued exactly once inside every all-reduce mode, and the
+    reduced rows do not change."""
+    if len(jax.devices("cpu")) < 8:
+        _spawn_with_cpu_devices(8, "fill")
+        return
+    _check_fill_once_and_bit_identical()
+
+
+def test_allreduce_fill_without_comm():
+    """`R=1`: no rounds, `fill` still runs once."""
+    fills: list[int] = []
+    _ring_outputs(dataclasses.replace(_TINY_TILES, hier=0), R=1, fills=fills)
+    assert fills == [0, 1, 0, 1]
+
+
 _CHECKS = {
+    "fill": _check_fill_once_and_bit_identical,
     "hier1_peers": _check_hier1_peers_bit_identical,
     "hx": _check_hx_bit_identical,
     "hx_structure": _check_hx_structure,

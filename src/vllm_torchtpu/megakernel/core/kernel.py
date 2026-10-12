@@ -67,6 +67,11 @@ class KernelContext:
     sc: Any
     norm_x: Any = None
     raw_refs: Any = None
+    # Optional layer-schedule fields (off unless set). `deferred_fill`: work a
+    # module leaves for its slot's all-reduce (e.g. a deferred lazy-segment
+    # refill, `TwoRing.take_deferred_flush()`); the builder issues it inside
+    # the all-reduce (`AllReduceRing.allreduce(fill=)`) and clears it.
+    deferred_fill: Any = None
 
     def module_params(self, name: str) -> Any:
         """Return the build-time parameters computed by `Module.plan_params`."""
@@ -214,6 +219,13 @@ def build(
             )
             ar_first = (l < 2) if ar_parity else first
 
+            def _reduce(part: Any, eff_ar: Any) -> None:
+                fill, ctx.deferred_fill = ctx.deferred_fill, None
+                if eff_ar is not None:
+                    comm.add_residual(comm.allreduce(eff_ar, part, ar_first, fill))
+                elif fill is not None:
+                    fill()
+
             for slot_entry, ar_slot in zip(
                 model_spec.layer_type.slots, p.slot_ar_index
             ):
@@ -224,9 +236,7 @@ def build(
                     assert len(norm_names) == 1, norm_names
                     ctx.apply_input_norm(active[0].input_norm, slot)
                     if len(active) == 1:
-                        part = _emit_mod(active[0], l, slot)
-                        if eff_ar is not None:
-                            comm.add_residual(comm.allreduce(eff_ar, part, ar_first))
+                        _reduce(_emit_mod(active[0], l, slot), eff_ar)
                     elif len(active) == 2:
                         c0 = slot_entry.active_counts[0]
                         is_b1 = (l % slot_entry.period) >= c0
@@ -237,11 +247,7 @@ def build(
                         # a `vector<MBxHxf32>` tensor across the branch boundary
                         # (which would keep 64 VRegs live across `scf.if`).
                         def _emit_branch(mod, eff_ar=eff_ar):
-                            part = _emit_mod(mod, l, slot)
-                            if eff_ar is not None:
-                                comm.add_residual(
-                                    comm.allreduce(eff_ar, part, ar_first)
-                                )
+                            _reduce(_emit_mod(mod, l, slot), eff_ar)
 
                         stream.cond_branches(
                             is_b1,
@@ -257,9 +263,7 @@ def build(
                         )
                 else:
                     ctx.apply_input_norm(slot_entry.input_norm, slot)
-                    part = _emit_mod(slot_entry, l, slot)
-                    if eff_ar is not None:
-                        comm.add_residual(comm.allreduce(eff_ar, part, ar_first))
+                    _reduce(_emit_mod(slot_entry, l, slot), eff_ar)
 
             stream.assert_flushed()
             return carry
