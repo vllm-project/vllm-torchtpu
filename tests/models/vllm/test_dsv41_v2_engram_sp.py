@@ -9,6 +9,68 @@ import torch
 from vllm_torchtpu.models.vllm.deepseek_v41.common import engram as v2_engram
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("tp", [1, 2, 8])
+def test_fused_offload_preserves_packed_shards_and_sp_mask(monkeypatch, tp):
+    from vllm_torchtpu.kernels.engram import vllm_adapter
+
+    local_tokens, cols, head_dim = 4, 3, 256
+    tokens = local_tokens * tp
+    raw = torch.randint(0, 256, (tp, tokens, cols, head_dim), dtype=torch.uint8)
+    scale = torch.randint(
+        120, 128, (tp, tokens, cols, head_dim // 32), dtype=torch.uint8
+    )
+    packed = torch.stack(
+        [
+            torch.cat([r.flatten(), s.flatten()]).view(torch.int32).view(tokens, -1)
+            for r, s in zip(raw, scale)
+        ]
+    )
+    rank = tp - 1
+    monkeypatch.setattr(
+        v2_engram.upstream, "get_tensor_model_parallel_rank", lambda: rank
+    )
+
+    def gather(value, dim):
+        assert dim == 0
+        torch.testing.assert_close(value, packed[rank])
+        return packed.flatten(0, 1)
+
+    monkeypatch.setattr(v2_engram.upstream, "tensor_model_parallel_all_gather", gather)
+    module = object.__new__(v2_engram.Engram)
+    torch.nn.Module.__init__(module)
+    module._fused_offload = True
+    module.use_sequence_parallel = True
+    module.embed_tokens = SimpleNamespace(tp_size=tp)
+    module._active_raw = packed[rank]
+    module._host_raw = raw[rank]
+    module._host_scale = scale[rank]
+    module.wkv = SimpleNamespace(weight=torch.empty(1), weight_scale=torch.empty(1))
+    module.q_weight = torch.empty(1)
+    module.k_weight = torch.empty(1)
+    module.eps, module.clamp_value = 1e-20, 1e-6
+    hidden = torch.randn(local_tokens, 4, 8).bfloat16()
+    mask = torch.arange(tokens) % 3 != 0
+    calls = []
+
+    def fused(raw_words, scale_words, h, w, ws, q, k, local_mask, size, r, eps, clamp):
+        torch.testing.assert_close(
+            raw_words, raw.view(torch.int32).reshape(tp * tokens, -1)
+        )
+        torch.testing.assert_close(
+            scale_words, scale.view(torch.int32).reshape(tp * tokens, -1)
+        )
+        torch.testing.assert_close(local_mask, mask[rank * local_tokens :])
+        assert size == tp and r == rank
+        calls.append(True)
+        return h + 1
+
+    monkeypatch.setattr(vllm_adapter, "fused_engram_torch", fused)
+    actual = module(hidden, torch.zeros(tokens, cols * tp, dtype=torch.int32), mask)
+    torch.testing.assert_close(actual, hidden + 1)
+    assert calls == [True]
+
+
 @pytest.mark.parametrize("num_tokens", [16, 13, 3])
 @pytest.mark.parametrize("tp", [1, 2, 8])
 def test_sp_embed_matches_head_gather(monkeypatch, num_tokens, tp):

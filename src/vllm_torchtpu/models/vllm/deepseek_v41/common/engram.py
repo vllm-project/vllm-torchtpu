@@ -438,6 +438,7 @@ class Engram(upstream.Engram):
     embed = bind_device_ops(
         upstream.Engram.embed, tensor_model_parallel_all_gather=_gather_engram_rows
     )
+    _fused_offload: bool = False
 
     def _create_embedding(self, layout, layer_hash_index):
         embedding = ParallelEngramEmbedding(
@@ -458,6 +459,9 @@ class Engram(upstream.Engram):
 
     def _init_staging(self, max_tokens: int, head_dim: int) -> None:
         super()._init_staging(max_tokens, head_dim)
+        self._fused_offload = envs.TPU_DEEPSEEK_V41_ENGRAM_BACKEND == "pallas"
+        if self._fused_offload:
+            self._init_fused_offload(head_dim)
         self._staged_raw: torch.Tensor | None = None
         self._active_raw: torch.Tensor | None = None
         self._staged_by_tokens: dict[int, torch.Tensor] = {}
@@ -501,6 +505,90 @@ class Engram(upstream.Engram):
             self._staged_raw[max_tokens * raw_words_per_tok :].fill_(-1)
             self._staged_by_tokens[max_tokens] = self._staged_raw
             self._active_raw = self._staged_views(max_tokens)
+
+    def _init_fused_offload(self, head_dim: int) -> None:
+        """Validate fusion support; head_dim is embedding width per hash head."""
+        from vllm_torchtpu.kernels.engram.vllm_adapter import initialize_fused_engram
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
+
+        embedding = self.embed_tokens
+        assert isinstance(embedding, ParallelEngramEmbedding)
+        assert embedding.host_offload, "Pallas Engram requires CPU offload"
+        assert embedding.dp_size == 1, "Pallas Engram currently requires DP1"
+        assert self.use_sequence_parallel or embedding.tp_size == 1, (
+            "Pallas Engram requires sequence parallelism with TP>1"
+        )
+        assert (
+            embedding.part_n_hash_cols * embedding.tp_size == embedding.n_hash_cols
+        ), "Pallas Engram requires equal head shards without padded heads"
+        assert (
+            embedding.part_n_hash_cols * head_dim // embedding.block_size
+        ) % 4 == 0, "Pallas Engram requires four-byte-aligned scale rows"
+        method = self.wkv.quant_method
+        assert isinstance(method, VllmFp8LinearMethodTPU), (
+            "Pallas Engram requires the TPU FP8 linear method"
+        )
+        _, dtype, block_size, _ = method._linear_quant_config
+        assert block_size is None and dtype in (
+            torch.float8_e4m3fn,
+            torch.float8_e5m2,
+        ), "Pallas Engram requires per-channel FP8 WKV weights"
+        initialize_fused_engram()
+
+    def _fused_forward(
+        self,
+        hidden_states: torch.Tensor,
+        hash_ids: torch.Tensor,
+        token_mask: torch.Tensor | None,
+    ) -> torch.Tensor:
+        """Gather packed rows, then compute only this rank's SP token shard.
+
+        Args:
+            hidden_states: BF16 [T/P, S, D], with P TP ranks, T padded tokens,
+                S streams and hidden width D.
+            hash_ids: int32 [T, H], full-token hash IDs for H total hash heads;
+                rows have already been staged, so only the token count is used.
+            token_mask: [T/P], local boolean/numeric 0/1 mask, or None.
+
+        Returns:
+            BF16 [T/P, S, D], matching hidden_states.
+        """
+        from vllm_torchtpu.kernels.engram.vllm_adapter import fused_engram_torch
+
+        assert self._active_raw is not None
+        tp = self.embed_tokens.tp_size
+        tokens = hash_ids.shape[0]
+        assert tokens == hidden_states.shape[0] * tp, (
+            "Pallas Engram requires runner-padded SP token counts",
+            tokens,
+            tp,
+        )
+        _, cols, head_dim = self._host_raw.shape
+        raw_words = cols * head_dim // 4
+        scale_words = cols * self._host_scale.shape[-1] // 4
+        packed = self._active_raw
+        if tp > 1:
+            packed = upstream.tensor_model_parallel_all_gather(packed, dim=0)
+        by_word = packed.view(tp, raw_words + scale_words, tokens)
+        # TorchTPU specializes bucketed custom-op inputs along dim 0.
+        raw = by_word[:, :raw_words].reshape(tp * tokens, raw_words)
+        scale = by_word[:, raw_words:].reshape(tp * tokens, scale_words)
+        if token_mask is None:
+            token_mask = hidden_states.new_ones(hidden_states.shape[0])
+        return fused_engram_torch(
+            raw,
+            scale,
+            hidden_states,
+            self.wkv.weight,
+            self.wkv.weight_scale,
+            self.q_weight,
+            self.k_weight,
+            token_mask,
+            tp,
+            upstream.get_tensor_model_parallel_rank(),
+            self.eps,
+            self.clamp_value,
+        )
 
     def _staged_tensors(self, num_tokens: int) -> torch.Tensor:
         assert self._staged_raw is not None
@@ -620,8 +708,12 @@ class Engram(upstream.Engram):
                 token_mask = torch.cat([token_mask, token_mask.new_zeros(pad)])
                 rank = upstream.get_tensor_model_parallel_rank()
                 token_mask = token_mask[rank * chunk : (rank + 1) * chunk]
+            if self._fused_offload:
+                return self._fused_forward(hidden_states, hash_ids, token_mask)
             embedded = self._sp_embed(hash_ids)
         else:
+            if self._fused_offload:
+                return self._fused_forward(hidden_states, hash_ids, token_mask)
             embedded = self.embed(hash_ids)
         kv = self.wkv(embedded.flatten(-2))
         keys = (
