@@ -38,7 +38,9 @@
 # "New Build" button, or an API token with write_builds). Such a build runs the
 # steps it passes on whatever queues they name, with nothing in the repository
 # to show for it: the record is the build's env and its job commands on
-# Buildkite, and this step prints the decoded YAML in its log.
+# Buildkite, and this step prints the decoded YAML in its log. So the passed
+# YAML must carry no secret: the agent's log redaction covers only values of
+# agent environment variables, not text written into the YAML.
 #
 # Example:
 #   STEPS=$(base64 <<'EOT' | tr -d '\n'
@@ -65,7 +67,7 @@ steps:
       queue: cpu
     commands:
       - |
-        set -o pipefail
+        set -eo pipefail
         yaml=$$(printf '%s' "$${DYNAMIC_PIPELINE_B64:-}" | tr -d ' \t\r\n' | base64 -d) || {
           echo "ERROR: DYNAMIC_PIPELINE_B64 is not valid base64; it must hold the steps as base64 pipeline YAML." >&2
           exit 1
