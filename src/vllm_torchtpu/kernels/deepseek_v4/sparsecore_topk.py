@@ -690,9 +690,26 @@ def _topk_body(
         row_len, busy, part, lo, words = wave_info(wave)
         has_next = wave + 1 < num_waves
         next_words = wave_info(jnp.minimum(wave + 1, num_waves - 1))[4]
-        # When this part and the next both fit half the buffer, the next one
-        # lands in the other half while this one is selected. A longer part
-        # fills the buffer, so its neighbour is fetched after it, at 0.
+        # Double-buffering is decided per wave from the parts' real lengths,
+        # not once from the width n. The buffer is two halves of `half` words
+        # (MAX_SLICE_WORDS once n is wide), and `off` says which half holds
+        # this wave's part:
+        #
+        #   both parts <= half:  fetch the next part into the other half,
+        #                        `half - off`, now, so its DMA overlaps this
+        #                        wave's selection.
+        #   either part > half:  a part that long needs the whole buffer, so
+        #                        the next part is fetched into 0 only after
+        #                        this wave is done, and its DMA is exposed.
+        #
+        # A static double buffer would need two full-width slices, which do
+        # not fit tile memory once n > MAX_SLICE_WORDS; that is what used to
+        # force p = 2 on 32K-64K-wide rows. Real rows are far shorter than n
+        # (GLM-5.2 at 1M over DCP16: 3-7K of 64K words), so nearly every wave
+        # takes the first branch. Only parts longer than MAX_SLICE_WORDS
+        # (contexts past 512K at DCP16) run single-buffered. Each half has its
+        # own DMA semaphore (see `slice_copy`), so overlapping fetches never
+        # wait on each other's bytes.
         early = has_next & (words <= half) & (next_words <= half)
         next_off = jnp.where(early, half - off, 0)
         pl.when(early)(functools.partial(start_fetch, wave + 1, next_off))
