@@ -14,7 +14,7 @@ import time
 from pathlib import Path
 
 import requests
-from summarize_startup import assert_no_compilation
+from bench_cached_extend import assert_no_compilation, summarize_startup
 
 
 def cache_inventory(root: Path) -> dict:
@@ -82,6 +82,28 @@ def main() -> None:
     env["TORCH_TPU_TIER2_COMPILATION_CACHE"] = "disabled"
     env["TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE"] = "disabled"
     env["KV_BYTES"] = "auto"
+    env.update(TP="1", DP="8", CHUNK="2048", MAX_SEQS="1")
+    env["PYTHONPATH"] = str(here) + os.pathsep + env.get("PYTHONPATH", "")
+    server_command = [
+        "bash",
+        str(here.parent / "serve_cached_prefill.sh"),
+        "--worker-extension-cls",
+        "server_step_worker.ServerStepWorker",
+        "--compilation-config",
+        '{"compile_sizes":[128,256,2048]}',
+    ]
+    if env.get("ARTIFACT_LOCAL_DIR"):
+        server_command += [
+            "--profiler-config",
+            json.dumps(
+                {
+                    "profiler": "torch",
+                    "torch_profiler_dir": str(
+                        Path(env["ARTIFACT_LOCAL_DIR"]) / "encoder_extend/profile"
+                    ),
+                }
+            ),
+        ]
     manifest = {
         "cache_mode": args.cache_mode,
         "cache_before": before,
@@ -95,21 +117,13 @@ def main() -> None:
         "cache_hit_claim": "Inspect server logs; populated cache is not proof of hits",
     }
     (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
-    server = monitor = None
+    server = None
     started = time.monotonic()
     timing = {"launch_wall_ns": time.time_ns(), "completed": False}
     try:
-        monitor = subprocess.Popen(
-            [
-                sys.executable,
-                str(here / "monitor_memory.py"),
-                str(args.out / "memory.jsonl"),
-            ],
-            start_new_session=True,
-        )
         with (args.out / "server.log").open("w") as log:
             server = subprocess.Popen(
-                ["bash", str(here / "serve.sh"), "encoder_extend"],
+                server_command,
                 env=env,
                 stdout=log,
                 stderr=subprocess.STDOUT,
@@ -141,9 +155,8 @@ def main() -> None:
             (args.out / "startup.json").write_text(json.dumps(timing, indent=2) + "\n")
             base = [
                 sys.executable,
-                str(here / "client.py"),
-                "--scenario",
-                "encoder_extend",
+                str(here / "bench_cached_extend.py"),
+                "client",
                 "--input",
                 str(args.input),
             ]
@@ -187,7 +200,16 @@ def main() -> None:
             timing["completed"] = True
     finally:
         stop(server)
-        stop(monitor)
+        if (args.out / "server.log").exists():
+            (args.out / "startup-phases.json").write_text(
+                json.dumps(
+                    summarize_startup(
+                        (args.out / "server.log").read_text(errors="replace")
+                    ),
+                    indent=2,
+                )
+                + "\n"
+            )
         timing["finished_wall_ns"] = time.time_ns()
         (args.out / "startup.json").write_text(json.dumps(timing, indent=2) + "\n")
 

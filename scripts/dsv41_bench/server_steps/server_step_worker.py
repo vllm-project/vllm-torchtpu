@@ -11,10 +11,55 @@ import json
 import logging
 import socket
 import time
+from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
 
-from scenarios import SCENARIOS, classify_rows, token_counts
+
+@dataclass(frozen=True)
+class Scenario:
+    name: str
+    concurrency: int
+    prefix_tokens: int = 65536
+    extend_tokens: int = 0
+    output_tokens: int = 1
+    dp_size: int = 8
+    chunk_tokens: int = 2048
+    dspark_tokens: int = 5
+    physical_chips: int = 4
+
+    @property
+    def local_concurrency(self) -> int:
+        return self.concurrency // self.dp_size
+
+    def to_dict(self) -> dict:
+        return asdict(self)
+
+
+SCENARIO = Scenario("encoder_extend", 8, extend_tokens=16384)
+
+
+def classify_rows(starts: list[int], ends: list[int], prompts: list[int]) -> str:
+    if not starts:
+        return "idle"
+    if all(start >= prompt for start, prompt in zip(starts, prompts, strict=True)):
+        return "decode"
+    if all(end <= prompt for end, prompt in zip(ends, prompts, strict=True)):
+        return "prefill"
+    return "mixed"
+
+
+def token_counts(starts: list[int], ends: list[int], prefix: int) -> dict:
+    return {
+        "computed_tokens": sum(b - a for a, b in zip(starts, ends, strict=True)),
+        "new_tokens": sum(
+            max(0, b - max(a, prefix)) for a, b in zip(starts, ends, strict=True)
+        ),
+        "replay_tokens": sum(
+            max(0, min(b, prefix) - a) for a, b in zip(starts, ends, strict=True)
+        ),
+    }
+
 
 _ACTIVE = None
 _INSTALLED = False
@@ -220,7 +265,9 @@ class ServerStepWorker:
         hf = self.vllm_config.model_config.hf_config
         if hf.num_hidden_layers != 40 or hf.sliding_window != 128:
             raise ValueError("Expected the 40-layer DSv4.1 model with SWA=128")
-        selected = SCENARIOS[scenario]
+        if scenario != SCENARIO.name:
+            raise ValueError(f"Unknown scenario: {scenario}")
+        selected = SCENARIO
         if self.vllm_config.scheduler_config.max_num_seqs != selected.local_concurrency:
             raise ValueError(
                 "max_num_seqs must equal the scenario's per-DP concurrency"

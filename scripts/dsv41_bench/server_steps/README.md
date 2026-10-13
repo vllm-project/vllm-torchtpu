@@ -16,6 +16,14 @@ This stabilizes shapes within a bin; crossing a bin boundary still recompiles.
 This is a prefill benchmark; one-token output comparison does not qualify
 long-generation accuracy or steady decode performance.
 
+The harness has three scripts:
+
+- `run.py`: launch configuration, cold/reuse cache lifecycle and cleanup.
+- `bench_cached_extend.py`: input preparation, client, throughput and startup audit.
+- `server_step_worker.py`: opt-in worker observations and shared workload definition.
+
+Normal serving does not load this worker extension unless explicitly configured.
+
 ## Prepare inputs
 
 Install the repository-pinned TPU runtime, `requests`, `prometheus-client` and
@@ -23,7 +31,7 @@ Install the repository-pinned TPU runtime, `requests`, `prometheus-client` and
 LongBench-v2 dataset:
 
 ```bash
-python scripts/dsv41_bench/server_steps/prepare_inputs.py \
+python scripts/dsv41_bench/server_steps/bench_cached_extend.py prepare \
   --dataset /path/to/longbench-v2.json \
   --tokenizer /models/DeepSeek-V4.1-Flash \
   --out /path/to/dsv41-code-c128.json
@@ -57,7 +65,7 @@ python scripts/dsv41_bench/server_steps/run.py \
   --cache-mode cold --rounds 5 --profile
 ```
 
-`run.py` starts the memory monitor and server, waits for HTTP health readiness,
+`run.py` starts the server, waits for HTTP health readiness,
 runs a separate warmup and five formal rounds, optionally collects a separate
 profile wave, and stops its server process group. The startup timeout defaults
 to 3000 seconds. Compiler events in formal serving windows fail the run.
@@ -83,14 +91,15 @@ Keep `ARTIFACT_LOCAL_DIR` consistent across an A/B/restart series; the profile
 is stored under its `encoder_extend/profile` directory. Do not enable compiler
 dumps during timed startup, and never pool profiled and unprofiled rounds.
 
-For a manually managed server, use `serve.sh encoder_extend`, then invoke
-`client.py --scenario encoder_extend --input INPUT --out OUTPUT --rounds 5`.
+For an already running server with `server_step_worker.ServerStepWorker` loaded,
+use `bench_cached_extend.py client --input INPUT --out OUTPUT --rounds 5`.
+The server must use the same DP8 configuration as `run.py`.
 
 ## Timing and audit contract
 
 - `startup.json` measures launch through HTTP health readiness. This includes
   model loading, engine initialization, compilation, cache work and warmup.
-- `summarize_startup.py` extracts per-rank engine-init and reported-compilation
+- `bench_cached_extend.py startup` extracts per-rank engine-init and reported-compilation
   times from the server log. Parallel rank times are never summed. These logged
   durations are not pure XLA compilation time; serialization and cache I/O can
   be included. Repeated stage-warmup records retain their separate scopes.
@@ -118,27 +127,25 @@ CPU stage-call timestamps describe dispatch, not device execution duration.
 ## Reprocess and validate
 
 ```bash
-python scripts/dsv41_bench/server_steps/summarize.py \
+python scripts/dsv41_bench/server_steps/bench_cached_extend.py summarize \
   /path/to/results/candidate-cold/fixed/round-1-steps.json \
-  --scenario encoder_extend --out /path/to/recomputed-summary.json
-python scripts/dsv41_bench/server_steps/summarize_startup.py \
+  --out /path/to/recomputed-summary.json
+python scripts/dsv41_bench/server_steps/bench_cached_extend.py startup \
   /path/to/results/candidate-cold/server.log \
   --out /path/to/startup-phases.json
 python -m pytest tests/scripts/test_dsv41_cached_extend.py -q
 ```
 
 Preserve input provenance, source revisions and diffs, runtime package versions,
-responses, metrics, raw worker records, startup logs and memory snapshots.
-`monitor_memory.py` records host/cgroup/shared-memory and process RSS/HWM every
-five seconds. Sampled peaks can miss transients; cgroup peaks can include earlier
-runs in the same container. Zero cgroup OOM counters do not rule out node-pressure
-eviction. Do not delete live communication buffers to free memory.
+responses, metrics, raw worker records and startup logs. `run.py` also writes
+`startup-phases.json` automatically. Memory monitoring used during the original
+investigation is not part of this benchmark entry point.
 
 ## Recorded validation: 2026-10-13
 
 Production source `ce69313ec`; all 366 tracked production files on the benchmark
 host matched the submitted source. The four-bucket baseline uses the same
-rounded-KV source with only `serve.sh` restored to `[16,128,256,2048]`. Both cold
+rounded-KV source with only the launch buckets restored to `[16,128,256,2048]`. Both cold
 runs use independent empty caches; restart reuses the three-bucket cache.
 
 | Case | Ready (s) | Engine init (s) | Logged compilation (s) | FX compiles | Artifact loads |

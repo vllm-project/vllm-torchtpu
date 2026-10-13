@@ -16,9 +16,12 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 
 import server_step_worker as worker  # noqa: E402
-from scenarios import SCENARIOS, token_counts  # noqa: E402
-from summarize_extend import summarize_extend  # noqa: E402
-from summarize_startup import assert_no_compilation, summarize_startup  # noqa: E402
+from bench_cached_extend import (  # noqa: E402
+    assert_no_compilation,
+    summarize_extend,
+    summarize_startup,
+)
+from server_step_worker import SCENARIO, token_counts  # noqa: E402
 
 pytestmark = pytest.mark.cpu_test
 
@@ -90,7 +93,7 @@ def fixture():
             dict(
                 rank=rank,
                 hostname="one",
-                scenario=SCENARIOS["encoder_extend"].to_dict(),
+                scenario=SCENARIO.to_dict(),
                 steps=steps,
             )
         )
@@ -134,7 +137,7 @@ class CaptureTest(unittest.TestCase):
         recorder = SimpleNamespace(
             forward_id=0,
             decoder_snapshot=None,
-            scenario=SCENARIOS["encoder_extend"],
+            scenario=SCENARIO,
             stages=[],
             pending={"stages": []},
         )
@@ -197,7 +200,7 @@ class DeferredObservationTest(unittest.TestCase):
         runner = SimpleNamespace(
             execute_model=lambda *a: output, sample_tokens=lambda *a: None
         )
-        recorder = worker.Recorder(runner, SCENARIOS["encoder_extend"], 0)
+        recorder = worker.Recorder(runner, SCENARIO, 0)
         recorder.enabled = True
         with patch.dict(
             sys.modules,
