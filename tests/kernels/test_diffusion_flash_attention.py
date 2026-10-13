@@ -82,17 +82,17 @@ def test_outlier_heads_fall_back_to_online():
     q = q.at[:, :, 0].multiply(12.0)
     k = k.at[:, :, 1].add(3.0)
     scale = 1.0 / math.sqrt(128)
-    q_scaled = (q.astype(jnp.float32) * (scale * LOG2_E)).astype(jnp.bfloat16)
-    k32 = k.astype(jnp.float32)
-    k_smoothed = (k32 - k32.mean(axis=1, keepdims=True)).astype(jnp.bfloat16)
     flags = np.asarray(
-        fixed_m_operands(q_scaled, k_smoothed, gate=FIXED_M_SAFE_BOUND, seq_axis=1)
+        fixed_m_operands(
+            q.astype(jnp.float32) * (scale * LOG2_E),
+            k,
+            gate=FIXED_M_SAFE_BOUND,
+            seq_axis=1,
+        )
     )[1]
     assert flags[0] == 0.0 and flags[1:].min() == 1.0
     out = jax.jit(lambda q, k, v: flash_attention_bshd(q, k, v, scale=scale))(q, k, v)
-    # Reference on the bf16 pre-scaled query the kernel consumes: with logits
-    # this large, rounding q * scale * log2(e) to bf16 is itself a few percent.
-    _check(out, _reference(q_scaled, k, v, 1.0 / LOG2_E))
+    _check(out, _reference(q, k, v, scale))
 
 
 def test_fixed_m_gate_boundary_accuracy(monkeypatch):
@@ -109,9 +109,9 @@ def test_fixed_m_gate_boundary_accuracy(monkeypatch):
     k_raw = rng.normal(size=(1, seq_len, num_heads, head_dim)).astype(np.float32)
     k_centered = k_raw - k_raw.mean(axis=1, keepdims=True)
     k = jnp.asarray(k_centered, dtype=jnp.bfloat16)
-    k_smoothed = (
-        k.astype(jnp.float32) - k.astype(jnp.float32).mean(axis=1, keepdims=True)
-    ).astype(jnp.bfloat16)
+    # The kernel's fixed-m bound uses f32 scaled queries and f32 centred keys.
+    k32 = k.astype(jnp.float32)
+    k_smoothed = k32 - k32.mean(axis=1, keepdims=True)
 
     q_dir = rng.normal(size=(1, seq_len, num_heads, head_dim)).astype(np.float32)
     q_dir /= np.linalg.norm(q_dir, axis=-1, keepdims=True)
@@ -131,7 +131,7 @@ def test_fixed_m_gate_boundary_accuracy(monkeypatch):
         rng.normal(size=(1, seq_len, num_heads, head_dim)), dtype=jnp.bfloat16
     )
 
-    q_scaled = (q.astype(jnp.float32) * (scale * LOG2_E)).astype(jnp.bfloat16)
+    q_scaled = q.astype(jnp.float32) * (scale * LOG2_E)
     bounds = np.asarray(
         kernel_mod.max_row_norm_per_head(q_scaled, seq_axis=1)
         * kernel_mod.max_row_norm_per_head(k_smoothed, seq_axis=1)
@@ -141,9 +141,7 @@ def test_fixed_m_gate_boundary_accuracy(monkeypatch):
     mk = fixed_m_operands(q_scaled, k_smoothed, gate=FIXED_M_SAFE_BOUND, seq_axis=1)
     assert list(np.asarray(mk[1])) == [1.0, 0.0]
 
-    ref = np.asarray(
-        _reference(q_scaled, k_smoothed, v, 1.0 / LOG2_E), dtype=np.float64
-    )
+    ref = np.asarray(_reference(q, k, v, scale), dtype=np.float64)
     ref_row_max = np.abs(ref).max(axis=-1)
 
     out = np.asarray(
@@ -165,6 +163,45 @@ def test_fixed_m_gate_boundary_accuracy(monkeypatch):
         / ref_row_max[0, :, 1]
     )
     assert head1_row_rel_err.max() > 0.05
+
+
+def _bf16(x):
+    return np.asarray(jnp.asarray(x, jnp.float32).astype(jnp.bfloat16), np.float64)
+
+
+@pytest.mark.parametrize("fixed_m", [True, False])
+def test_error_at_bf16_floor(fixed_m):
+    """Per-row error vs float64 stays at the floor of a bf16-output kernel.
+
+    Large logits and keys with a common offset, as in Wan's attention, make
+    any extra bf16 rounding of the kernel's inputs (pre-scaled q, centred k)
+    show up several times above the floor: the error of rounding the
+    normalized probabilities and the output to bf16.
+    """
+    q, k, v = _inputs(1, 4133, 4133, 2, 2, 128, seed=2)
+    q = (q.astype(jnp.float32) * 8.0).astype(jnp.bfloat16)
+    k = (k.astype(jnp.float32) + 1.0).astype(jnp.bfloat16)
+    scale = 1.0 / math.sqrt(128)
+    rows = np.random.default_rng(0).choice(4133, size=128, replace=False)
+    qn, kn, vn = (np.asarray(x, np.float64) for x in (q, k, v))
+    ref, floor = [], []
+    for h in range(2):
+        s = qn[0, rows, h] @ kn[0, :, h].T * scale
+        p = np.exp(s - s.max(axis=-1, keepdims=True))
+        p /= p.sum(axis=-1, keepdims=True)
+        ref.append(p @ vn[0, :, h])
+        floor.append(_bf16(_bf16(p) @ vn[0, :, h]))
+    ref, floor = np.stack(ref, axis=1), np.stack(floor, axis=1)
+
+    def max_row_rel(out):
+        err = np.abs(out - ref).max(axis=-1)
+        return (err / np.abs(ref).max(axis=-1)).max()
+
+    out = jax.jit(
+        lambda q, k, v: flash_attention_bshd(q, k, v, scale=scale, use_fixed_m=fixed_m)
+    )(q, k, v)
+    out = np.asarray(out.astype(jnp.float32), np.float64)[0, rows]
+    assert max_row_rel(out) < 1.5 * max_row_rel(floor)
 
 
 def test_block_sizes():

@@ -8,10 +8,15 @@
 # - Removed the ring-attention residual path (residual_attention,
 #   emit_residuals) and the E4M3 QK path (qk_fp8), which are not used here.
 # - flash_attention_bshd() replaces attention(): (B, S, H, D) inputs and
-#   outputs, block sizes from autotune_block_sizes(), q scaled in f32 before
-#   its bf16 cast, keys mean-centred per head for fixed-m, and fixed-m only
+#   outputs, block sizes from autotune_block_sizes(), and fixed-m only
 #   when K/V spans more than one block. Lane-aligned heads are DMA'd as
-#   column blocks of the (B, S, H * D) activations (column_heads).
+#   column blocks of the (B, S, H * D) activations (column_heads) when the
+#   head count is large or K/V fits one block, and transposed to (B, H, S, D)
+#   for smaller multi-block head counts (such as Ulysses-sharded attention).
+# - q and k reach the kernel unscaled and uncentred: the kernel multiplies
+#   its f32 scores by scale * log2(e) (score_scale), and fixed_m_operands()
+#   bounds raw-key scores via the centred key norm and key-mean norm so
+#   neither q nor k is rounded to bf16 a second time.
 # - fixed_m_operands() repeats the key norms over GQA query heads.
 # - end() broadcasts 1 / l by slicing: pltpu.repeat is not in JAX 0.11.
 # - Lowered FIXED_M_SAFE_BOUND from 213.0 to 200.0 so low-norm query rows
@@ -96,6 +101,13 @@ def fixed_m_operands(
 ) -> jax.Array:
     """Builds the ``(2, heads)`` fixed-m scalar-prefetch operand.
 
+    Splitting ``k = (k - mean(k)) + mean(k)`` bounds raw-key scores without
+    rounding ``k - mean(k)`` to bf16 or subtracting a per-row offset:
+    ``max_j(q_i . k_j) <= |q_i| (max_j |k_j - mean(k)| + |mean(k)|)`` gives
+    the upper bound ``m``, and since ``max_j(q_i . (k_j - mean(k))) >= 0``,
+    ``m - max_j(q_i . k_j) <= |q_i| (max_j |k_j - mean(k)| + 2 |mean(k)|)``
+    bounds the shift against ``gate``.
+
     Args:
         query_scaled: query already scaled by ``scale * log2(e)``.
         key: keys, same layout as ``query_scaled``.
@@ -106,14 +118,20 @@ def fixed_m_operands(
     Returns:
         Row 0 = integral CS bound (the kernel's m), row 1 = flag.
     """
+    k32 = key.astype(jnp.float32)
+    k_mean = k32.mean(axis=seq_axis, keepdims=True)
     qn_max = max_row_norm_per_head(query_scaled, seq_axis=seq_axis)
-    mk_h = max_row_norm_per_head(key, seq_axis=seq_axis)
-    # GQA: each query head takes the norm of the kv head it attends to.
-    mk_h = jnp.repeat(mk_h, qn_max.shape[0] // mk_h.shape[0])
-    bound = qn_max * mk_h
+    kn_cent_max = max_row_norm_per_head(k32 - k_mean, seq_axis=seq_axis)
+    kn_mean_norm = jnp.sqrt((k_mean**2).sum(axis=-1)).max(axis=(0, seq_axis))
+    # GQA: each query head takes the norms of the kv head it attends to.
+    rep = qn_max.shape[0] // kn_cent_max.shape[0]
+    kn_cent_max = jnp.repeat(kn_cent_max, rep)
+    kn_mean_norm = jnp.repeat(kn_mean_norm, rep)
+    m_bound = qn_max * (kn_cent_max + kn_mean_norm)
+    gate_bound = qn_max * (kn_cent_max + 2.0 * kn_mean_norm)
     # Row 0 is the integral bound the kernel uses as m directly; integral
     # so exp2(m) is exact.
-    return jnp.stack([jnp.ceil(bound), (bound <= gate).astype(jnp.float32)])
+    return jnp.stack([jnp.ceil(m_bound), (gate_bound <= gate).astype(jnp.float32)])
 
 
 @functools.cache
@@ -170,7 +188,7 @@ def _flash_attention_kernel(
     q_ref: Any,  # (bq, head_dim_qk) bf16
     k_ref: Any,  # (bkv, head_dim_qk) bf16
     v_ref: Any,  # (bkv, head_dim_v) bf16
-    *refs: Any,  # (m, l, o) cross-j scratch then the real outputs
+    *refs: Any,  # (m, l, o) cross-j scratch, real outputs
     mask_value: float,
     grid_width: int,
     bkv: int,
@@ -178,13 +196,14 @@ def _flash_attention_kernel(
     head_dim_v: int,
     kv_seq_len: int,
     use_fixed_m: bool,
+    score_scale: float,
 ) -> None:
     """Hybrid fixed-m / online-softmax flash attention over one (h, i) tile.
 
     With ``use_fixed_m``, per-head flag ``mk_ref[1]`` routes in-window heads
     onto the fixed-m fast path (``m`` = integral CS bound, no reduce_max /
     alpha-rescale); outliers keep online softmax. Matmuls: bf16 x bf16, f32
-    accumulate.
+    accumulate. Scores are ``score_scale * (q . k)`` in f32.
     """
     float32 = jnp.float32
     # Pallas passes inputs then outputs positionally. The first three
@@ -247,7 +266,7 @@ def _flash_attention_kernel(
             # rescale — plain accumulate at scale 2^-m. Read it from scalar
             # prefetch, not m_scratch: the scratch tile is (NUM_SUBLANES, bq)
             # f32 and only row 0 carries information.
-            s_curr = _exp2(qk - (mk_ref[0, h] - FIXED_M_RECENTER))
+            s_curr = _exp2(qk * score_scale - (mk_ref[0, h] - FIXED_M_RECENTER))
             s_cast = s_curr.astype(jnp.bfloat16)
             # l comes from an f32 VPU reduce, not the textbook "append a ones
             # row to V and read l out of the PV matmul": s never leaves VREGs,
@@ -265,6 +284,7 @@ def _flash_attention_kernel(
             return
 
         # Online softmax update (all f32).
+        qk = qk * score_scale
         m_prev, l_prev = m_scratch_ref[...], l_scratch_ref[...]
         m_curr = qk.max(axis=0)[None, :]
         m_next = jnp.maximum(m_prev, m_curr)
@@ -356,6 +376,7 @@ def _splash_attention_forward(
     mk: jax.Array,
     block_sizes: BlockSizes,
     *,
+    score_scale: float,
     q_seq_len: int | None = None,
     kv_seq_len: int | None = None,
     use_fixed_m: bool = False,
@@ -364,13 +385,14 @@ def _splash_attention_forward(
     """Runs the fused splash kernel over ``(heads, seq, dim)`` q/k/v.
 
     Args:
-        q: ``(num_heads, seq_q, head_dim)`` — already scaled by
-            ``scale * log2(e)`` and cast to bf16.
+        q: ``(num_heads, seq_q, head_dim)`` bf16.
         k, v: ``(num_kv_heads, seq_kv, head_dim)`` bf16.
         mk: ``(2, num_heads)`` f32 fixed-m prefetch operand (row 0 =
             integral CS bound used as m, row 1 = eligibility flag); a
             ``(2, 1)`` zeros placeholder when ``use_fixed_m`` is off.
         block_sizes: kernel block sizes (clamped to seq by the caller).
+        score_scale: multiplies the f32 ``q . k`` scores (``scale *
+            log2(e)``).
         q_seq_len, kv_seq_len: unpadded lengths (default to the padded
             shapes).
         use_fixed_m: hybrid fixed-m softmax (see the kernel docstring).
@@ -428,7 +450,6 @@ def _splash_attention_forward(
             pl.BlockSpec((bkv, head_dim_qk), kv_column_map),
             pl.BlockSpec((bkv, head_dim_v), kv_column_map),
         ]
-    operands = [mk, q, k, v]
     # First three outputs are cross-j scratch (a single block reused per
     # head); the rest are the real per-head outputs. Normalized o keeps
     # q.dtype.
@@ -463,6 +484,7 @@ def _splash_attention_forward(
             head_dim_v=head_dim_v,
             kv_seq_len=actual_kv_seq_len,
             use_fixed_m=use_fixed_m,
+            score_scale=score_scale,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=1,
@@ -476,7 +498,7 @@ def _splash_attention_forward(
             vmem_limit_bytes=_splash_vmem_limit_bytes(),
         ),
         out_shape=out_shapes,
-    )(*operands)
+    )(mk, q, k, v)
     return all_out[first_out]
 
 
@@ -553,20 +575,30 @@ def flash_attention_bshd(
     )
     use_fixed_m = use_fixed_m and kv_orig_len > bsizes.block_kv
     scale_factor = 1.0 / math.sqrt(query.shape[-1]) if scale is None else scale
-    # Fuse scale + log2(e) for exp2-based softmax, in f32 with one rounding
-    # to bf16 for the 2x MXU path (the kernel accumulates f32).
-    q = (query.astype(jnp.float32) * (scale_factor * LOG2_E)).astype(jnp.bfloat16)
+    # scale and log2(e) (for the exp2-based softmax) multiply the f32 scores
+    # in-kernel: pre-scaling q would round it to bf16 a second time.
+    score_scale = scale_factor * LOG2_E
+    q = query.astype(jnp.bfloat16)
+    k = key.astype(jnp.bfloat16)
     v = value.astype(jnp.bfloat16)
     if use_fixed_m:
-        # k-smoothing: mean-centring a head's keys shifts each score row by
-        # a constant (softmax-invariant) and makes every row max >= 0.
-        k32 = key.astype(jnp.float32)
-        k = (k32 - k32.mean(axis=1, keepdims=True)).astype(jnp.bfloat16)
-        mk_arr = fixed_m_operands(q, k, gate=FIXED_M_SAFE_BOUND, seq_axis=1)
+        mk_arr = fixed_m_operands(
+            q.astype(jnp.float32) * score_scale,
+            k,
+            gate=FIXED_M_SAFE_BOUND,
+            seq_axis=1,
+        )
     else:
-        k = key.astype(jnp.bfloat16)
         mk_arr = jnp.zeros((2, 1), jnp.float32)  # unused placeholder
-    if head_dim % spec.num_lanes == 0 and head_dim_v % spec.num_lanes == 0:
+    # When K/V spans multiple blocks and head count is small (e.g. Ulysses
+    # sharded heads), transposing to (B, H, S, D) makes every repeated Q/K/V
+    # tile DMA contiguous; for large head counts or single-block K/V, column
+    # blocks on (B, S, H * D) avoid the transpose.
+    if (
+        head_dim % spec.num_lanes == 0
+        and head_dim_v % spec.num_lanes == 0
+        and (not use_fixed_m or num_heads > 16)
+    ):
         column_heads = (num_heads, num_kv_heads)
         q, k, v = (x.reshape(*x.shape[:2], -1) for x in (q, k, v))
     else:
@@ -582,6 +614,7 @@ def flash_attention_bshd(
             v_3d,
             mk_arr,
             bsizes,
+            score_scale=score_scale,
             q_seq_len=q_orig_len,
             kv_seq_len=kv_orig_len,
             use_fixed_m=use_fixed_m,
