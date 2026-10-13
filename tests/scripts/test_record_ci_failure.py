@@ -95,10 +95,31 @@ class TestRecordCiFailure(unittest.TestCase):
         record_ci_failure.set_buildkite_metadata("infra_disk_full")
         mock_which.assert_called_with("buildkite-agent")
 
-    def test_upload_to_bigquery_unconfigured_skips(self) -> None:
-        # With table unset and no env var, returns cleanly without error
-        with mock.patch.dict("os.environ", {}, clear=True):
-            record_ci_failure.upload_to_bigquery("infra_disk_full", 1, "Test")
+    def test_upload_to_bigquery_disabled(self) -> None:
+        # With table explicitly empty or 'none', skips without running insert
+        self.assertFalse(
+            record_ci_failure.upload_to_bigquery("infra_disk_full", 1, "Test", table="")
+        )
+        self.assertFalse(
+            record_ci_failure.upload_to_bigquery(
+                "infra_disk_full", 1, "Test", table="none"
+            )
+        )
+
+    def test_upload_to_bigquery_success(self) -> None:
+        if record_ci_failure.bq_utils is None:
+            self.skipTest("bq_utils not available")
+        with mock.patch.object(
+            record_ci_failure.bq_utils, "run_insert", return_value=True
+        ) as mock_insert:
+            res = record_ci_failure.upload_to_bigquery(
+                "infra_disk_full", 1, "Test Step"
+            )
+            self.assertTrue(res)
+            mock_insert.assert_called_once()
+            sql_arg = mock_insert.call_args[0][0]
+            self.assertIn("ci_failures", sql_arg)
+            self.assertIn("infra_disk_full", sql_arg)
 
 
 if __name__ == "__main__":

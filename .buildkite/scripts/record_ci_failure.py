@@ -50,6 +50,10 @@ try:
 except ImportError:
     bq_utils = None
 
+DEFAULT_BQ_FAILURE_TABLE = (
+    "cloud-ullm-inference-ci-cd.llm_benchmark_analytics.ci_failures"
+)
+
 CATEGORY_LABELS = {
     "infra_disk_full": "Infra: Disk Space Full",
     "infra_oom": "Infra: OOM (Exit 137)",
@@ -146,8 +150,14 @@ def upload_to_bigquery(
     table: str | None = None,
 ) -> bool:
     """Best-effort insert of failure record into BigQuery."""
-    target_table = table or os.getenv("BQ_FAILURE_TABLE") or os.getenv("BQ_TABLE")
-    if not target_table or bq_utils is None:
+    target_table = (
+        table
+        if table is not None
+        else os.getenv("BQ_FAILURE_TABLE", DEFAULT_BQ_FAILURE_TABLE)
+    )
+    if not target_table or target_table.lower() in ("none", "skip", "disabled", "0"):
+        return False
+    if bq_utils is None:
         return False
 
     target_project = (
@@ -206,7 +216,7 @@ def main() -> None:
     )
     parser.add_argument(
         "--bq-table",
-        default=os.getenv("BQ_FAILURE_TABLE"),
+        default=os.getenv("BQ_FAILURE_TABLE", DEFAULT_BQ_FAILURE_TABLE),
         help="BigQuery failure table",
     )
     args = parser.parse_args()
