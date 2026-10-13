@@ -179,11 +179,6 @@ def _wait(tensors: tuple[torch.Tensor, ...]) -> None:
     sync.synchronize(list(tensors), wait=True)
 
 
-# Seconds a worker thread waits for the helper thread's launch before
-# giving up; a hand-off pairs within one forward.
-_ASYNC_LAUNCH_TIMEOUT_S = 900.0
-
-
 class PPWave:
     def __init__(
         self,
@@ -293,13 +288,7 @@ class PPWave:
             )
             self._async_thread.start()
         with self._async_cv:
-            if not self._async_cv.wait_for(
-                self._async_idle, timeout=_ASYNC_LAUNCH_TIMEOUT_S
-            ):
-                raise RuntimeError(
-                    f"PP wave rank {self.rank}: a hand-off is still queued "
-                    f"after {_ASYNC_LAUNCH_TIMEOUT_S:.0f} s"
-                )
+            self._async_cv.wait_for(self._async_idle)
             self._async_carried = carried
             self._async_cv.notify_all()
 
@@ -335,13 +324,10 @@ class PPWave:
         if not self.async_handoff:
             return None
         with self._async_cv:
-            if not self._async_cv.wait_for(
-                self._async_idle, timeout=_ASYNC_LAUNCH_TIMEOUT_S
-            ):
-                raise RuntimeError(
-                    f"PP wave rank {self.rank}: the hand-off thread issued no "
-                    f"launch in {_ASYNC_LAUNCH_TIMEOUT_S:.0f} s"
-                )
+            # No timeout, as on the drain the helper runs: the barrier
+            # raises after the process group's timeout and is reported
+            # here; a device that never returns is left to the engine.
+            self._async_cv.wait_for(self._async_idle)
             if self._async_error is not None:
                 error, self._async_error = self._async_error, None
                 raise RuntimeError(
