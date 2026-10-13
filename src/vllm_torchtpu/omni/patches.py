@@ -11,7 +11,17 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU runtime patches for vLLM-Omni diffusion models."""
+"""TPU runtime patches for vLLM-Omni diffusion models.
+
+vLLM-Omni diffusion workers run in separate worker processes spawned by
+vLLM-Omni's DiffusionEngine rather than through TPUWorker's worker_init /
+model_load lifecycle stages, so Omni patches are applied from
+OmniTpuPlatform at platform registration and attention backend import
+(tracked in #1862 for unification with patch_registry.py). Because
+importing vllm_torchtpu sets TORCH_TPU_DEFER_AND_FUSE=1 in
+vllm_torchtpu/__init__.py, deferred graph execution is active in diffusion
+workers when helpers such as synchronize_tensors() run.
+"""
 
 from functools import cache as run_once
 from typing import Any
@@ -294,24 +304,25 @@ def _patch_wan_fresh_timestep() -> None:
         WanTransformer3DModel,
     )
 
-    if not hasattr(WanTransformer3DModel, "_fresh_patched"):
-        orig_wan_forward = WanTransformer3DModel.forward
+    orig_wan_forward = getattr(
+        WanTransformer3DModel, "_tpu_orig_forward", WanTransformer3DModel.forward
+    )
+    WanTransformer3DModel._tpu_orig_forward = orig_wan_forward
 
-        def _fresh_timestep(timestep: Any) -> Any:
-            if isinstance(timestep, torch.Tensor):
-                from vllm_torchtpu.utils import synchronize_tensors
+    def _fresh_timestep(timestep: Any) -> Any:
+        if isinstance(timestep, torch.Tensor):
+            from vllm_torchtpu.utils import synchronize_tensors
 
-                timestep = timestep.clone()
-                synchronize_tensors(timestep, wait=False)
-            return timestep
+            timestep = timestep.clone()
+            synchronize_tensors(timestep, wait=False)
+        return timestep
 
-        def _fresh_timestep_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
-            if "timestep" in kwargs:
-                kwargs["timestep"] = _fresh_timestep(kwargs["timestep"])
-            elif len(args) > 1:  # forward(hidden_states, timestep, ...)
-                args = (args[0], _fresh_timestep(args[1]), *args[2:])
-            return orig_wan_forward(self, *args, **kwargs)
+    def _fresh_timestep_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
+        if "timestep" in kwargs:
+            kwargs["timestep"] = _fresh_timestep(kwargs["timestep"])
+        elif len(args) > 1:  # forward(hidden_states, timestep, ...)
+            args = (args[0], _fresh_timestep(args[1]), *args[2:])
+        return orig_wan_forward(self, *args, **kwargs)
 
-        WanTransformer3DModel.forward = _fresh_timestep_forward
-        WanTransformer3DModel._fresh_patched = True
-        logger.info("Applied TPU patch: fresh timestep buffer for Wan transformers.")
+    WanTransformer3DModel.forward = _fresh_timestep_forward
+    logger.info("Applied TPU patch: fresh timestep buffer for Wan transformers.")
