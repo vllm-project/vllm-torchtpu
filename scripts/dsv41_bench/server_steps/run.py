@@ -8,7 +8,9 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import shutil
 import signal
+import socket
 import subprocess
 import sys
 import time
@@ -16,6 +18,7 @@ from pathlib import Path
 
 import requests
 from bench_cached_extend import assert_no_compilation, summarize_startup
+from server_step_worker import DECODE_SCENARIO
 
 
 def cache_inventory(root: Path) -> dict:
@@ -41,6 +44,33 @@ def stop(process: subprocess.Popen | None) -> None:
         process.wait(timeout=10)
 
 
+def bootstrap_ports(env: dict[str, str], out: Path) -> None:
+    """Use checked non-ephemeral ports for the eight co-located TPU workers."""
+    for base in range(19000, 20000, 10):
+        sockets = []
+        try:
+            for port in range(base, base + 10):
+                sock = socket.socket(socket.AF_INET6, socket.SOCK_STREAM)
+                sockets.append(sock)
+                sock.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_V6ONLY, 0)
+                sock.bind(("::", port))
+            ports = list(range(base, base + 10))
+            env["TORCH_TPU_SLICEBUILDER_ADDRESSES"] = ",".join(
+                f"localhost:{port}" for port in ports[:8]
+            )
+            env["MASTER_ADDR"] = env["TORCH_TPU_DP_MASTER_ADDR"] = "127.0.0.1"
+            env["MASTER_PORT"] = str(ports[8])
+            env["TORCH_TPU_DP_MASTER_PORT"] = str(ports[9])
+            (out / "bootstrap-ports.json").write_text(json.dumps(ports))
+            return
+        except OSError:
+            continue
+        finally:
+            for sock in sockets:
+                sock.close()
+    raise RuntimeError("No available ten-port bootstrap block")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
@@ -58,8 +88,6 @@ def main() -> None:
         args.rounds = 1 if args.scenario == "decode" else 5
     if args.rounds < 1:
         parser.error("The integrated launcher requires at least one formal window")
-    if args.profile and args.scenario == "decode":
-        parser.error("Decode profiling must be captured separately from timing")
 
     def terminate(signum, frame):
         raise SystemExit(128 + signum)
@@ -93,15 +121,18 @@ def main() -> None:
     env["TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE"] = "disabled"
     env["KV_BYTES"] = "auto"
     decode = args.scenario == "decode"
-    buckets = [128, 512] if decode else [128, 256, 2048]
+    buckets = [384, DECODE_SCENARIO.chunk_tokens] if decode else [128, 256, 2048]
     env.update(
         TP="1",
         DP="8",
-        CHUNK="512" if decode else "2048",
-        MAX_SEQS="16" if decode else "1",
+        CHUNK=str(DECODE_SCENARIO.chunk_tokens) if decode else "2048",
+        MAX_SEQS=str(DECODE_SCENARIO.local_concurrency) if decode else "1",
     )
     if decode:
-        env["MAX_MODEL_LEN"] = "66048"
+        env["MAX_MODEL_LEN"] = str(
+            DECODE_SCENARIO.prefix_tokens + DECODE_SCENARIO.output_tokens
+        )
+        env["USE_PHASED_PROFILER"] = "0"
     env["PYTHONPATH"] = str(here) + os.pathsep + env.get("PYTHONPATH", "")
     server_command = [
         "bash",
@@ -118,7 +149,7 @@ def main() -> None:
                 {
                     "profiler": "torch",
                     "torch_profiler_dir": str(
-                        Path(env["ARTIFACT_LOCAL_DIR"]) / f"{args.scenario}/profile"
+                        Path(env.get("TMPDIR", "/tmp")) / "dsv41-profile"
                     ),
                 }
             ),
@@ -175,6 +206,7 @@ def main() -> None:
         identity_path.write_text(json.dumps(identity, indent=2) + "\n")
     manifest["identity"] = identity
     (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
+    bootstrap_ports(env, args.out)
     server = None
     started = time.monotonic()
     timing = {"launch_wall_ns": time.time_ns(), "completed": False}
@@ -193,6 +225,15 @@ def main() -> None:
                     raise RuntimeError(
                         f"Server exited during startup: {server.returncode}"
                     )
+                startup_log = (args.out / "server.log").read_text(errors="replace")
+                if any(
+                    error in startup_log
+                    for error in [
+                        "WorkerProc failed to start",
+                        "Engine core initialization failed",
+                    ]
+                ):
+                    raise RuntimeError("Worker startup failed; see server.log")
                 if time.monotonic() >= deadline:
                     raise TimeoutError(
                         "Server did not become healthy before the deadline"
@@ -248,9 +289,11 @@ def main() -> None:
                             *base,
                             "--out",
                             str(args.out / "fixed-profile"),
-                            "--rounds",
-                            "1",
-                            "--profile",
+                            *(
+                                ["--profile-only", "--reuse-prefix"]
+                                if decode
+                                else ["--rounds", "1", "--profile"]
+                            ),
                         ],
                         env=env,
                         stdout=profile_log,
@@ -270,6 +313,13 @@ def main() -> None:
                 )
                 + "\n"
             )
+        if args.profile and env.get("ARTIFACT_LOCAL_DIR"):
+            profile_root = Path(env.get("TMPDIR", "/tmp")) / "dsv41-profile"
+            destination = Path(env["ARTIFACT_LOCAL_DIR"]) / "profile"
+            for path in profile_root.rglob("*.xplane.pb"):
+                target = destination / path.relative_to(profile_root)
+                target.parent.mkdir(parents=True, exist_ok=True)
+                shutil.copy2(path, target)
         timing["finished_wall_ns"] = time.time_ns()
         (args.out / "startup.json").write_text(json.dumps(timing, indent=2) + "\n")
 

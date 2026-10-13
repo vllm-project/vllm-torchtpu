@@ -15,7 +15,7 @@ from pathlib import Path
 
 import requests
 from prometheus_client.parser import text_string_to_metric_families
-from server_step_worker import SCENARIO, token_counts
+from server_step_worker import SCENARIO, SCENARIOS, token_counts
 
 DATA_SHA256 = "15d61c22d92c96900b3c4948b6aeea218d3214b676a65df48e7b8555604c7fe2"
 
@@ -25,7 +25,12 @@ def prepare_main(argv: list[str]) -> None:
     parser.add_argument("--dataset", type=Path, required=True)
     parser.add_argument("--tokenizer", required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--scenario", choices=list(SCENARIOS), default="encoder_extend")
     args = parser.parse_args(argv)
+    scenario = SCENARIOS[args.scenario]
+    count = scenario.concurrency if args.scenario == "decode" else 128
+    prefix = scenario.prefix_tokens
+    row_tokens = max(prefix + scenario.extend_tokens, prefix + 1)
     from transformers import AutoTokenizer
 
     digest = hashlib.sha256(args.dataset.read_bytes()).hexdigest()
@@ -45,9 +50,11 @@ def prepare_main(argv: list[str]) -> None:
             continue
         ids = tokenizer.encode(doc["context"][:1000000], add_special_tokens=False)
         # Bounded, deterministic windows retain real code continuation statistics.
-        for offset in range(0, min(max(0, len(ids) - 81920 + 1), 16 * 256), 256):
-            row = ids[offset : offset + 81920]
-            key = hashlib.sha256(json.dumps(row[:65536]).encode()).hexdigest()
+        for offset in range(
+            0, min(max(0, len(ids) - row_tokens + 1), count * 256), 256
+        ):
+            row = ids[offset : offset + row_tokens]
+            key = hashlib.sha256(json.dumps(row[:prefix]).encode()).hexdigest()
             if key in hashes:
                 continue
             hashes.add(key)
@@ -55,14 +62,16 @@ def prepare_main(argv: list[str]) -> None:
             sources.append(
                 {"document": doc["_id"], "offset": offset, "prefix_sha256": key}
             )
-            branch = next(t for t in branches if t != row[65536])
+            branch = next(t for t in branches if t != row[prefix])
             suffixes.append([branch, branch])
-            if len(rows) == 128:
+            if len(rows) == count:
                 break
-        if len(rows) == 128:
+        if len(rows) == count:
             break
-    if len(rows) != 128:
-        raise ValueError(f"Need 128 distinct long-context windows; found {len(rows)}")
+    if len(rows) != count:
+        raise ValueError(
+            f"Need {count} distinct long-context windows; found {len(rows)}"
+        )
     args.out.parent.mkdir(parents=True, exist_ok=True)
     with args.out.open("x") as stream:
         json.dump(

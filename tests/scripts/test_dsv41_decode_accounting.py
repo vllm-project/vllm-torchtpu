@@ -26,12 +26,12 @@ def records(count: int = 20) -> list:
                 "forward_id": i + 1,
                 "stage": "encoder",
                 "phase": "prefill" if i == 0 else "decode",
-                "requests": 16,
-                "rows": 96,
-                "padded_rows": 128,
-                "starts": [65536 + i * 3] * 16,
-                "ends": [65542 + i * 3] * 16,
-                "prompts": [65536] * 16,
+                "requests": 48,
+                "rows": 288,
+                "padded_rows": 384,
+                "starts": [98304 + i * 3] * 48,
+                "ends": [98310 + i * 3] * 48,
+                "prompts": [98304] * 48,
             }
             steps.append(
                 {
@@ -43,16 +43,16 @@ def records(count: int = 20) -> list:
                         {**stage, "stage": "decoder"},
                         {
                             "stage": "draft_inputs",
-                            "requests": 16,
-                            "rows": 80,
-                            "padded_rows": 128,
+                            "requests": 48,
+                            "rows": 240,
+                            "padded_rows": 384,
                         },
                     ],
-                    "scheduled_draft_lengths": {f"r{rank}-{j}": 5 for j in range(16)},
-                    "accepted_output_tokens": 16 * (1 + i % 3),
-                    "output_requests": 16,
-                    "output_request_ids": [f"r{rank}-{j}" for j in range(16)],
-                    "accepted_output_counts": [1 + i % 3] * 16,
+                    "scheduled_draft_lengths": {f"r{rank}-{j}": 5 for j in range(48)},
+                    "accepted_output_tokens": 48 * (1 + i % 3),
+                    "output_requests": 48,
+                    "output_request_ids": [f"r{rank}-{j}" for j in range(48)],
+                    "accepted_output_counts": [1 + i % 3] * 48,
                 }
             )
         ranks.append(
@@ -69,7 +69,7 @@ def records(count: int = 20) -> list:
 class AccountingTest(unittest.TestCase):
     def test_counts_align_with_observation_intervals(self):
         result = summarize(records(), "decode")["categories"]["decode"]
-        expected = sum(128 * (1 + i % 3) for i in range(2, 18)) + 16
+        expected = sum(384 * (1 + i % 3) for i in range(2, 18)) + 48
         self.assertEqual(result["steps"], 17)
         self.assertEqual(result["effective_tokens"], expected)
         self.assertAlmostEqual(result["global_tokens_s"], expected / (17 * 0.2 - 0.007))
@@ -81,8 +81,8 @@ class AccountingTest(unittest.TestCase):
         data = records()
         for rank in data:
             for step in rank["steps"]:
-                step["accepted_output_counts"] = [6] * 16
-                step["accepted_output_tokens"] = 96
+                step["accepted_output_counts"] = [6] * 48
+                step["accepted_output_tokens"] = 288
         result = summarize(data, "decode")["categories"]["decode"]
         self.assertEqual(result["mean_tokens_per_request_step"], 6)
 
@@ -102,12 +102,12 @@ class AccountingTest(unittest.TestCase):
         data = records(100)
         for rank in data:
             for step in rank["steps"]:
-                step["accepted_output_counts"] = [6] * 16
-                step["accepted_output_tokens"] = 96
+                step["accepted_output_counts"] = [6] * 48
+                step["accepted_output_tokens"] = 288
         result = summarize(data, "decode")["categories"]["decode"]
         self.assertTrue(
             all(
-                max(s["contexts_from_accepted_outputs"][0]) + 6 < 65536 + 512
+                max(s["contexts_from_accepted_outputs"][0]) + 6 < 98304 + 512
                 for s in result["samples"]
             )
         )
@@ -189,7 +189,7 @@ class AccountingTest(unittest.TestCase):
             summarize(data, "decode")
 
     def test_phase_and_replay_accounting(self):
-        self.assertEqual(classify_rows([65535], [65540], [65536]), "mixed")
+        self.assertEqual(classify_rows([98303], [98308], [98304]), "mixed")
         self.assertEqual(token_counts([65408], [67452], 65536)["new_tokens"], 1916)
 
 

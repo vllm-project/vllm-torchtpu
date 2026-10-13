@@ -35,6 +35,7 @@ def client_main(argv: list[str]) -> None:
     parser.add_argument("--admission-settle-seconds", type=float, default=5.0)
     parser.add_argument("--single-window", action="store_true")
     parser.add_argument("--reuse-prefix", action="store_true")
+    parser.add_argument("--profile-only", action="store_true")
     args = parser.parse_args(argv)
     if args.single_window:
         args.rounds = 0
@@ -153,13 +154,25 @@ def client_main(argv: list[str]) -> None:
                 post("/resume", {})
             return [future.result() for future in futures]
 
+    if args.profile_only:
+        post("/pause?mode=keep&clear_cache=false", {})
+        rpc("synchronized_profile_arm")
+        try:
+            wave(prompts, scenario.output_tokens)
+            post("/pause?mode=keep&clear_cache=false", {})
+            capture = rpc("synchronized_profile_check")
+            (args.out / "synchronized-capture.json").write_text(json.dumps(capture))
+        finally:
+            post("/resume", {})
+        return
+
     for round_id in range(args.rounds + 1):
         label = (
             "steady"
             if args.single_window
             else ("warmup" if round_id == 0 else f"round-{round_id}")
         )
-        if args.reuse_prefix:
+        if args.reuse_prefix or round_id > 0:
             before = metrics()
         else:
             post("/reset_prefix_cache", {})
