@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     TPU_DCP_MLA_SPLIT_Q_LSE: bool = True
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 4
+    TPU_DCP_MLA_UV_BEFORE_MERGE: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -433,6 +434,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # grids `cdiv(real tokens, step)` steps, so up to N-1 padding rows are
     # attended (outputs don't-care). 1 = one token per step.
     "TPU_DCP_MLA_SMALL_CHUNK_BATCH": env_int("TPU_DCP_MLA_SMALL_CHUNK_BATCH", 4),
+    # Under qrep, apply W_UV before the DCP merge, so the reduce-scatter carries
+    # v_head_dim (256) instead of kv_lora_rank (512). Replicates W_UV per rank.
+    "TPU_DCP_MLA_UV_BEFORE_MERGE": env_bool(
+        "TPU_DCP_MLA_UV_BEFORE_MERGE", default=False
+    ),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per

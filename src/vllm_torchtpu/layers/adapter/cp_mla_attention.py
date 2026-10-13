@@ -78,6 +78,21 @@ def all_gather_q_nope_pe_heads(
     )
 
 
+def project_uv_heads(
+    partial: torch.Tensor, w_uv: torch.Tensor, w_uv_scale: torch.Tensor | None
+) -> torch.Tensor:
+    """`[T, N, kv_lora_rank]` partial -> f32 `[T, N, v_head_dim]`, head n by W_UV[n].
+
+    W_UV is linear and the merge weights are per (token, head), so projecting
+    each partial before the merge gives the same result as projecting after.
+    """
+    # f32 operands: bf16/fp8 values are exact, so the dot accumulates in f32.
+    out = torch.bmm(partial.transpose(0, 1).to(torch.float32), w_uv.to(torch.float32))
+    if w_uv_scale is not None:
+        out = out * w_uv_scale.to(torch.float32)
+    return out.transpose(0, 1)
+
+
 def merge_lse_partials_scatter_heads(
     output: torch.Tensor, lse: torch.Tensor, is_backbone: bool = True
 ) -> torch.Tensor:

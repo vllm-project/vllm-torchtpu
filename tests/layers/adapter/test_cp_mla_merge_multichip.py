@@ -38,6 +38,7 @@ pytestmark = [pytest.mark.multichip, pytest.mark.spawns_tpu_workers]
 WORLD_SIZE = 8
 HEADS = 64
 VDIM = 512
+DV = 256  # GLM-5.2 v_head_dim
 CHECK_TOKENS = 64
 LAUNCH_TIMEOUT_SECONDS = 900
 
@@ -109,6 +110,32 @@ def _global_partials(world, tokens, seed=20261002):
     lses[world - 1] = float("-inf")  # the last rank owns nothing
     lses[0, 4, : HEADS // world] = float("-inf")
     return outputs, lses
+
+
+def _global_w_uv(seed=20261009):
+    """A bf16 W_UV `[HEADS, VDIM, DV]` for the whole group, identical on all ranks."""
+    import torch
+
+    g = torch.Generator().manual_seed(seed)
+    return (torch.randn(HEADS, VDIM, DV, generator=g) / VDIM**0.5).to(torch.bfloat16)
+
+
+def _uv_paths(cp_mla, merge, w_dev, rank, world):
+    """W_UV after the merge (main: bf16 latent, bf16 bmm) and before it."""
+    import torch
+
+    local = HEADS // world
+    w_local = w_dev[rank * local : (rank + 1) * local].contiguous().clone()
+
+    def after(o, lse):
+        merged = merge(o, lse).transpose(0, 1)
+        return torch.bmm(merged, w_local).transpose(0, 1)
+
+    def first(o, lse):
+        return merge(cp_mla.project_uv_heads(o, w_dev, None), lse)
+
+    # The path under test first, so a later device fault cannot hide it.
+    return {"uv_first": first, "uv_after": after}
 
 
 def _reference(outputs, lses):
@@ -192,6 +219,7 @@ def _compile(fn):
 
 
 def _check(rank, world, group, cp_mla):
+    import numpy as np
     import torch
 
     outputs, lses = _global_partials(world, CHECK_TOKENS)
@@ -215,6 +243,30 @@ def _check(rank, world, group, cp_mla):
             except Exception as exc:  # noqa: BLE001 - reported to the parent
                 traceback.print_exc()
                 report[f"{arm}/{how}"] = {"error": repr(exc)[:400]}
+
+    # W_UV before vs after the merge, against the f64 reference projected.
+    w_uv = _global_w_uv()
+    ref_uv = np.einsum(
+        "thv,hvd->thd",
+        _reference(outputs, lses),
+        w_uv.float().numpy().astype(np.float64),
+    )[:, rank * local : (rank + 1) * local]
+    w_dev = w_uv.to("tpu")
+    for arm in ARMS:
+        _set_arm(cp_mla, arm)
+        for path, fn in _uv_paths(cp_mla, merge, w_dev, rank, world).items():
+            for how in ("eager", "compiled"):
+                try:
+                    run = fn if how == "eager" else _compile(fn)
+                    got = run(o_dev, l_dev).cpu()
+                    report[f"{path}/{arm}/{how}"] = {
+                        "shape": list(got.shape),
+                        "dtype": str(got.dtype),
+                        **_error_stats(got, ref_uv),
+                    }
+                except Exception as exc:  # noqa: BLE001 - reported to the parent
+                    traceback.print_exc()
+                    report[f"{path}/{arm}/{how}"] = {"error": repr(exc)[:400]}
 
     # Diagnostics, reported but not asserted: the compiled local merge with an
     # explicit per-rank f32 accumulation, and under HIGHEST op precision. They
@@ -280,6 +332,8 @@ def _bench(rank, cp_mla, tokens_list, reps=10):
         return run
 
     out = {}
+    world = int(os.environ["WORLD_SIZE"])
+    w_dev = _global_w_uv().to("tpu")
     for tokens in tokens_list:
         torch.manual_seed(rank)
         o = torch.randn(tokens, HEADS, VDIM).to(torch.bfloat16).to("tpu")
@@ -312,7 +366,52 @@ def _bench(rank, cp_mla, tokens_list, reps=10):
                 cp_mla._merge_received = real_merge
             if rank == 0:
                 print(f"BENCH T={tokens} {arm}: {out[f'{arm}@{tokens}']}", flush=True)
+        for arm in ARMS:
+            _set_arm(cp_mla, arm)
+            paths = _uv_paths(
+                cp_mla, cp_mla.merge_lse_partials_scatter_heads, w_dev, rank, world
+            )
+            for path, fn in paths.items():
+                key = f"{path}/{arm}@{tokens}"
+                try:
+                    out[key] = _time_chain(fn, o, lse, reps)
+                except Exception as exc:  # noqa: BLE001 - reported to the parent
+                    out[key] = {"error": repr(exc)[:400]}
+                if rank == 0:
+                    print(f"BENCH T={tokens} {path}/{arm}: {out[key]}", flush=True)
     return out
+
+
+def _time_chain(fn, o, lse, reps):
+    """Per-call device time of `fn(o, lse)`, chained like `_bench`'s merges."""
+
+    def chain(k):
+        def run(o, lse):
+            for _ in range(k):
+                y = fn(o, lse)
+                s = y.reshape(-1)[:1].float() * 0.0
+                o = o.slice_scatter(o[:1] + s.to(o.dtype), dim=0, start=0, end=1)
+                lse = lse.slice_scatter(lse[:1] + s, dim=0, start=0, end=1)
+            return lse[:1, :1]
+
+        return run
+
+    times = {}
+    for k in (1, 1 + reps):
+        run = _compile(chain(k))
+        run(o, lse).cpu()
+        run(o, lse).cpu()
+        samples = []
+        for _ in range(5):
+            t0 = time.perf_counter()
+            run(o, lse).cpu()
+            samples.append(time.perf_counter() - t0)
+        samples.sort()
+        times[k] = samples[len(samples) // 2]
+    return {
+        "per_merge_us": (times[1 + reps] - times[1]) / reps * 1e6,
+        "single_call_us": times[1] * 1e6,
+    }
 
 
 def _run_worker(result_dir: Path, bench_tokens: list[int]) -> None:
@@ -413,6 +512,10 @@ def assert_merge_results(results: list[dict]) -> None:
     errors = [r for r in results if "error" in r]
     assert not errors, f"worker failures: {errors}"
     for r in results:
+        for key, c in sorted(r["check"].items()):
+            if key.startswith("uv_") and key.endswith("/compiled"):
+                print(f"UV rank={r['rank']} {key}: {c}", flush=True)
+    for r in results:
         check = r["check"]
         for arm in ("today", "a2a"):
             for how in ("eager", "compiled"):
@@ -428,6 +531,23 @@ def assert_merge_results(results: list[dict]) -> None:
                 a2a["frac_over_1ulp"] <= today["frac_over_1ulp"]
                 and a2a["max_abs_err"] <= today["max_abs_err"]
             ), (r["rank"], how, today, a2a)
+        for arm in ARMS:
+            for how in ("eager", "compiled"):
+                first = check[f"uv_first/{arm}/{how}"]
+                after = check[f"uv_after/{arm}/{how}"]
+                assert "error" not in first, (r["rank"], arm, how, first)
+                assert "error" not in after, (r["rank"], arm, how, after)
+                assert first["shape"] == after["shape"], (r["rank"], arm, how)
+                # One rounding at the end: exact to one bf16 ulp, and never
+                # less exact than projecting the rounded merge.
+                assert first["within_1ulp"], (r["rank"], arm, how, first)
+                assert first["max_abs_err"] <= after["max_abs_err"], (
+                    r["rank"],
+                    arm,
+                    how,
+                    first,
+                    after,
+                )
         for arm in ("a2a",):
             for how in ("eager", "compiled"):
                 c = check[f"control_rotated/{arm}/{how}"]

@@ -1250,6 +1250,8 @@ class VllmTPUMLAAttention(MLAAttention):
         # gathering q every step -- that trade is the point of qrep.
         self.W_UK_T_dcp_qrep = None
         self.W_UK_T_dcp_qrep_scale = None
+        self.W_UV_dcp_qrep = None
+        self.W_UV_dcp_qrep_scale = None
         if self.dcp_q_replicate:
             dcp_group = get_dcp_group()
             if dcp_group is None or int(dcp_group.world_size) <= 1:
@@ -1264,6 +1266,15 @@ class VllmTPUMLAAttention(MLAAttention):
                 self.W_UK_T_dcp_qrep_scale = _fresh(
                     dcp_group.all_gather(self.W_UK_T_scale.contiguous(), dim=0)
                 )
+            # The group's W_UV too, so W_UV can run before the merge.
+            if envs.TPU_DCP_MLA_UV_BEFORE_MERGE:
+                self.W_UV_dcp_qrep = _fresh(
+                    dcp_group.all_gather(self.W_UV.contiguous(), dim=0)
+                )
+                if hasattr(self, "W_UV_scale"):
+                    self.W_UV_dcp_qrep_scale = _fresh(
+                        dcp_group.all_gather(self.W_UV_scale.contiguous(), dim=0)
+                    )
 
         # Safely detach and clear kv_b_proj parameter buffers without breaking
         # PyTorch attribute integrity
@@ -1280,7 +1291,12 @@ class VllmTPUMLAAttention(MLAAttention):
                 tensors.extend([self.W_UK_T_scale, self.W_UV_scale])
             tensors.extend(
                 t
-                for t in (self.W_UK_T_dcp_qrep, self.W_UK_T_dcp_qrep_scale)
+                for t in (
+                    self.W_UK_T_dcp_qrep,
+                    self.W_UK_T_dcp_qrep_scale,
+                    self.W_UV_dcp_qrep,
+                    self.W_UV_dcp_qrep_scale,
+                )
                 if t is not None
             )
             synchronize_tensors(tensors)

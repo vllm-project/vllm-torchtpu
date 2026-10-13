@@ -126,6 +126,41 @@ def test_torch_merge_matches_the_reference(dcp_size, monkeypatch):
     )
 
 
+@pytest.mark.parametrize("dcp_size", [2, 4, 8, 16])
+def test_projecting_before_the_merge_matches_projecting_after(dcp_size, monkeypatch):
+    """W_UV is linear per head and the merge weights are per (token, head), so
+    merging the projected partials is the projected merge."""
+    rng = np.random.default_rng(20261009)
+    outputs, lses = _partials(rng, dcp_size, empty=((0, 1), (dcp_size - 1, 5)))
+    heads, vdim = outputs.shape[2], outputs.shape[3]
+    w_uv = torch.from_numpy(rng.standard_normal((heads, vdim, 8)).astype(np.float32))
+    projected = torch.stack(
+        [cp_mla.project_uv_heads(outputs[r], w_uv, None) for r in range(dcp_size)]
+    )
+    assert projected.dtype == torch.float32
+
+    got = _merge_whole(projected, lses, monkeypatch).numpy()
+    want = np.einsum(
+        "thv,hvd->thd",
+        _reference_merge(outputs, lses),
+        w_uv.numpy().astype(np.float64),
+    )
+    np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)
+
+
+def test_projection_applies_the_per_head_output_scale():
+    rng = np.random.default_rng(11)
+    partial = torch.from_numpy(rng.standard_normal((3, 4, 16)).astype(np.float32))
+    w_uv = torch.from_numpy(rng.standard_normal((4, 16, 8)).astype(np.float32))
+    scale = torch.from_numpy(rng.uniform(0.5, 2.0, (4, 1, 8)).astype(np.float32))
+    np.testing.assert_allclose(
+        cp_mla.project_uv_heads(partial, w_uv, scale).numpy(),
+        cp_mla.project_uv_heads(partial, w_uv * scale, None).numpy(),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
 @pytest.mark.parametrize("rank", [0, 1, 2, 3])
 def test_each_rank_gets_its_own_block_of_one_answer(rank, monkeypatch):
     """The rank index must only select which head block comes back -- never

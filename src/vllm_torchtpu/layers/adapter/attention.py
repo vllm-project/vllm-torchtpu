@@ -78,6 +78,7 @@ from vllm_torchtpu.layers.adapter.cp_mla_attention import (
     all_gather_heads,
     all_gather_q_nope_pe_heads,
     merge_lse_partials_scatter_heads,
+    project_uv_heads,
 )
 from vllm_torchtpu.layers.core.attention_interface import (
     attention,
@@ -2390,6 +2391,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             w_uk_t_src = layer.W_UK_T
             w_uk_t_scale = getattr(layer, "W_UK_T_scale", None)
         attn_heads = layer.num_heads * (self.dcp_size if use_qrep else 1)
+        # W_UV runs before the DCP merge, so the merge carries v_head_dim.
+        uv_first = use_qrep and getattr(layer, "W_UV_dcp_qrep", None) is not None
 
         # Evaluate projection matrices directly across input precision
         # (`bfloat16`/`float16`/`fp8`) without dynamic `.to(torch.float32)` casting
@@ -2476,6 +2479,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 # comparison would pin its graph to the first size, and the
                 # large buckets fail with ShapeSpecializationError. So the
                 # drafter keeps the reduce-scatter, as with the flag off.
+                if uv_first:
+                    partial = project_uv_heads(
+                        partial, layer.W_UV_dcp_qrep, layer.W_UV_dcp_qrep_scale
+                    )
                 outputs = merge_lse_partials_scatter_heads(
                     partial,
                     lse,
@@ -2517,22 +2524,27 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 attn_metadata.request_distribution,
             )
 
-        outputs_t = outputs.reshape(-1, layer.num_heads, layer.kv_lora_rank).transpose(
-            0, 1
-        )
-        w_uv = (
-            layer.W_UV.to(outputs_t.dtype)
-            if layer.W_UV.dtype != outputs_t.dtype
-            else layer.W_UV
-        )
-        out_proj = torch.bmm(outputs_t, w_uv)
-        if hasattr(layer, "W_UV_scale"):
-            out_proj = out_proj * layer.W_UV_scale
-        outputs = (
-            out_proj.transpose(0, 1)
-            .to(input_dtype)
-            .reshape(-1, layer.num_heads * layer.v_head_dim)
-        )
+        if uv_first:
+            outputs = outputs.to(input_dtype).reshape(
+                -1, layer.num_heads * layer.v_head_dim
+            )
+        else:
+            outputs_t = outputs.reshape(
+                -1, layer.num_heads, layer.kv_lora_rank
+            ).transpose(0, 1)
+            w_uv = (
+                layer.W_UV.to(outputs_t.dtype)
+                if layer.W_UV.dtype != outputs_t.dtype
+                else layer.W_UV
+            )
+            out_proj = torch.bmm(outputs_t, w_uv)
+            if hasattr(layer, "W_UV_scale"):
+                out_proj = out_proj * layer.W_UV_scale
+            outputs = (
+                out_proj.transpose(0, 1)
+                .to(input_dtype)
+                .reshape(-1, layer.num_heads * layer.v_head_dim)
+            )
 
         if output is not None and outputs is not output:
             output.copy_(outputs)
