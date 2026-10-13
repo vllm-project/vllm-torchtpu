@@ -1713,6 +1713,9 @@ def sparse_fp8_attention(
 # 32K+ is slower.
 _INDEX_KEYS_PER_ITER = 262144
 _INDEX_MAX_TILE = 16384
+# The packed scorer unrolls its query loop. Keep shared decode groups small;
+# large prefill groups use the existing shared matmul.
+_INDEX_MAX_SHARED_QUERIES = 8
 
 
 def paged_index_scores_jax(
@@ -1816,7 +1819,64 @@ def paged_index_scores_jax(
             )
             return jax.lax.fori_loop(0, trips, step, result)
 
-        return jax.lax.fori_loop(0, records.shape[0], row_step, scores)[:, :width]
+        def shared_rows(_):
+            return jax.lax.fori_loop(0, records.shape[0], row_step, scores)[:, :width]
+
+        if (
+            pages
+            and dim == index_word_scores.DIM
+            and q.dtype == jnp.bfloat16
+            and records.shape[0] > 1
+            and tokens <= _INDEX_MAX_SHARED_QUERIES * records.shape[0]
+        ):
+            # Balanced batches can score only each request's own queries. The
+            # old row loop contracts every query against every request, then
+            # discards the cross-request scores. Ignore zero-length padding
+            # when checking capacity; uneven batches retain the general path.
+            assert page_records is not None  # implied by `pages`
+            groups = records.shape[0]
+            group_tokens = -(-tokens // groups)
+            belongs = (jnp.arange(groups)[:, None] == requests) & (lengths > 0)
+            fits = jnp.all(belongs.sum(axis=1) <= group_tokens)
+
+            def grouped_rows(_):
+                token_ids = jax.vmap(
+                    lambda mask: jnp.nonzero(
+                        mask, size=group_tokens, fill_value=tokens
+                    )[0]
+                )(belongs).reshape(-1)
+                grouped_q = jnp.pad(q, ((0, 1), (0, 0), (0, 0)))[token_ids]
+                grouped_weights = jnp.pad(weights, ((0, 1), (0, 0), (0, 0)))[token_ids]
+
+                def grouped_step(index, result):
+                    addresses = jax.lax.dynamic_slice_in_dim(
+                        records, index * tile, tile, axis=1
+                    )
+                    words = gather_cache_page_words(
+                        pool, addresses[:, ::page_records], page_records, dim
+                    )
+                    values = _score_word_rows(
+                        grouped_q,
+                        grouped_weights,
+                        words.reshape(
+                            groups, tile // index_word_scores.SLOTS, ROW_WORDS
+                        ),
+                    )
+                    # Sentinel token IDs are dropped, including duplicate
+                    # padding slots. Every active token is written once.
+                    ordered = jnp.full((tokens, tile), -jnp.inf, jnp.float32)
+                    ordered = ordered.at[token_ids].set(values, mode="drop")
+                    return jax.lax.dynamic_update_slice_in_dim(
+                        result, ordered, index * tile, axis=1
+                    )
+
+                trips = jnp.minimum(
+                    (row_lengths.max() + tile - 1) // tile, padded_width // tile
+                )
+                return jax.lax.fori_loop(0, trips, grouped_step, scores)[:, :width]
+
+            return jax.lax.cond(fits, grouped_rows, shared_rows, None)
+        return shared_rows(None)
 
     trips = jnp.minimum(
         (jnp.maximum(lengths.max(), 0) + tile - 1) // tile, padded_width // tile

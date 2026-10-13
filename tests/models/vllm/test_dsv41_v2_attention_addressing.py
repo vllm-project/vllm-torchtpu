@@ -302,6 +302,78 @@ def test_paged_index_scores_shared_rows_page_gather_bitwise(width, page):
     np.testing.assert_array_equal(got[valid], expected[valid])
 
 
+@pytest.mark.parametrize("layout", ["balanced", "shuffled", "uneven", "empty"])
+def test_shared_index_scores_grouped_queries_match_dense(layout):
+    # Decode verification has 16 * 6 real queries in a padded 128-row batch.
+    # Padding belongs to request zero but must not consume grouping capacity.
+    rng = np.random.default_rng(219)
+    tokens, rows, width, page = 128, 16, 257, 16
+    pool = jnp.asarray(
+        rng.integers(-(2**31), 2**31, (256, 128)), jnp.int32
+    ) & jnp.int32(0x3FFF3FFF)
+    records = _paged_records(rng, rows, width, page, 512)
+    records[3, -page:] = -1
+    requests = np.pad(np.repeat(np.arange(rows), 6), (0, 32)).astype(np.int32)
+    lengths = np.pad(rng.integers(129, width + 1, 96), (0, 32)).astype(np.int32)
+    if layout == "shuffled":
+        order = rng.permutation(tokens)
+        requests, lengths = requests[order], lengths[order]
+    elif layout == "uneven":
+        requests[:24] = 0  # exceeds static capacity and requires the fallback
+    elif layout == "empty":
+        lengths[:] = 0
+    q = jnp.asarray(rng.standard_normal((tokens, 4, 128)), jnp.bfloat16)
+    weights = jnp.asarray(rng.standard_normal((tokens, 4)), jnp.float32)
+    keys = gather_cache_values(
+        pool, jnp.asarray(records[requests].reshape(-1)), 128, split=True
+    ).reshape(tokens, width, 128)
+    logits = jnp.einsum(
+        "thd,tcd->thc",
+        split_halves(q),
+        keys,
+        preferred_element_type=jnp.float32,
+    )
+    expected = (jnp.maximum(logits, 0) * weights[:, :, None]).sum(1)
+    got = paged_index_scores_jax(
+        q,
+        pool,
+        jnp.asarray(records),
+        weights,
+        jnp.asarray(lengths),
+        jnp.asarray(requests),
+        page_records=page,
+    )
+    valid = (records[requests] >= 0) & (np.arange(width) < lengths[:, None])
+    np.testing.assert_allclose(
+        np.asarray(got)[valid], np.asarray(expected)[valid], rtol=1e-5, atol=1e-5
+    )
+    # Verify the actual selected indices, not only approximate score equality.
+    expected_top = jax.lax.top_k(jnp.where(valid, expected, -jnp.inf), 32)[1]
+    got_top = jax.lax.top_k(jnp.where(valid, got, -jnp.inf), 32)[1]
+    np.testing.assert_array_equal(np.asarray(got_top), np.asarray(expected_top))
+
+
+@pytest.mark.parametrize("rows,tokens", [(1, 16), (2, 32)])
+def test_shared_index_scores_large_query_groups_keep_matmul(monkeypatch, rows, tokens):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels
+
+    def unexpected_word_score(*args, **kwargs):
+        raise AssertionError("large prefill groups must not unroll the packed scorer")
+
+    monkeypatch.setattr(attention_kernels, "_score_word_rows", unexpected_word_score)
+    rng = np.random.default_rng(29)
+    width, page = 257, 16
+    pool, _, _, lengths, q, weights = _request_inputs(rng, rows, tokens, width)
+    records = _paged_records(rng, rows, width, page, 512)
+    requests = jnp.asarray(np.repeat(np.arange(rows), tokens // rows), jnp.int32)
+    expected = paged_index_scores_jax(q, pool, records, weights, lengths, requests)
+    got = paged_index_scores_jax(
+        q, pool, records, weights, lengths, requests, page_records=page
+    )
+    valid = np.arange(width) < lengths[:, None]
+    np.testing.assert_array_equal(np.asarray(got)[valid], np.asarray(expected)[valid])
+
+
 def test_candidate_filter_sparsecore_selection_matches_top_k(monkeypatch):
     """Unordered candidate scoring on SparseCore selects the top_k set."""
     from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels
