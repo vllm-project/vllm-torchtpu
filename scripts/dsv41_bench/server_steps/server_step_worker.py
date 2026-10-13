@@ -37,6 +37,8 @@ class Scenario:
 
 
 SCENARIO = Scenario("encoder_extend", 8, extend_tokens=16384)
+DECODE_SCENARIO = Scenario("decode", 128, output_tokens=512, chunk_tokens=512)
+SCENARIOS = {s.name: s for s in (SCENARIO, DECODE_SCENARIO)}
 
 
 def classify_rows(starts: list[int], ends: list[int], prompts: list[int]) -> str:
@@ -152,6 +154,30 @@ class Recorder:
         self.sample = runner.sample_tokens
         runner.execute_model = self.execute_model
         runner.sample_tokens = self.sample_tokens
+        if scenario.name == "decode":
+            drafter = runner.drafter
+            prepare = drafter._prepare_dflash_inputs
+
+            def prepare_draft(chunk: Any, *args: Any, **kwargs: Any) -> Any:
+                started = time.perf_counter_ns()
+                result = prepare(chunk, *args, **kwargs)
+                if self.enabled and self.pending is not None:
+                    row = {
+                        "stage": "draft_inputs",
+                        "forward_id": self.forward_id,
+                        "requests": chunk.num_reqs,
+                        "rows": chunk.num_reqs * drafter.block_size,
+                        "padded_rows": result[0].shape[0],
+                        "input_shape": list(result[0].shape),
+                        "positions_shape": list(result[1].shape),
+                        "dispatch_ns": started,
+                        "host_return_ns": time.perf_counter_ns(),
+                    }
+                    self.pending["stages"].append(row)
+                    self.stages.append(row)
+                return result
+
+            drafter._prepare_dflash_inputs = prepare_draft
 
     def execute_model(self, scheduler_output: Any, *args: Any, **kwargs: Any) -> Any:
         if not self.enabled:
@@ -159,6 +185,11 @@ class Recorder:
         if self.pending is not None:
             raise RuntimeError("Previous benchmark step did not complete sampling")
         self.pending = {"start_ns": time.perf_counter_ns(), "stages": []}
+        if self.scenario.name == "decode":
+            self.pending["scheduled_draft_lengths"] = {
+                req: len(tokens)
+                for req, tokens in scheduler_output.scheduled_spec_decode_tokens.items()
+            }
         result = self.execute(scheduler_output, *args, **kwargs)
         if result is not None:
             self.finish(result)
@@ -265,9 +296,9 @@ class ServerStepWorker:
         hf = self.vllm_config.model_config.hf_config
         if hf.num_hidden_layers != 40 or hf.sliding_window != 128:
             raise ValueError("Expected the 40-layer DSv4.1 model with SWA=128")
-        if scenario != SCENARIO.name:
+        if scenario not in SCENARIOS:
             raise ValueError(f"Unknown scenario: {scenario}")
-        selected = SCENARIO
+        selected = SCENARIOS[scenario]
         if self.vllm_config.scheduler_config.max_num_seqs != selected.local_concurrency:
             raise ValueError(
                 "max_num_seqs must equal the scenario's per-DP concurrency"

@@ -192,3 +192,60 @@ device analysis: `an-1fughtzu5e` (`topk-census.json`).
 The new budget test and seven consolidated harness tests pass, as do pre-commit
 checks. Full-dependency type checking retains the previous 61 diagnostics,
 with no added or removed diagnostics; this is not a clean full type-check pass.
+
+## Steady decode (C128)
+
+`bench_decode.py` measures steady decode on the same single-host TP1/DP8/EP8
+configuration, with DSpark K5, 40 layers and SWA128. It reuses the input file
+produced by `bench_cached_extend.py prepare` above and records its SHA256.
+The workload uses 128 distinct 65,536-token prompts and 512 output tokens each.
+
+Start a dedicated server (terminal 1):
+
+```bash
+export MODEL_PATH=/models/DeepSeek-V4.1-Flash
+export PYTHONPATH="$PWD/scripts/dsv41_bench/server_steps${PYTHONPATH:+:$PYTHONPATH}"
+TP=1 DP=8 CHUNK=512 MAX_SEQS=16 MAX_MODEL_LEN=66048 KV_BYTES=auto \
+  bash scripts/dsv41_bench/serve_cached_prefill.sh \
+  --worker-extension-cls server_step_worker.ServerStepWorker \
+  --compilation-config '{"compile_sizes":[16,128,512]}' \
+  2>&1 | tee /results/decode-server.log
+```
+
+After readiness, run the client in terminal 2 with a fresh output directory:
+
+```bash
+python scripts/dsv41_bench/server_steps/bench_decode.py client \
+  --input /data/dsv41-inputs.json --out /results/decode \
+  --server-log /results/decode-server.log
+```
+
+The default is one warmup followed by **one** formal window. `--rounds 0` runs
+warmup only; `--single-window` measures an already warmed server without another
+warmup. `--reuse-prefix` additionally skips priming and requires the same inputs
+to be cached. The client rejects incomplete responses, missing ranks, unexpected
+prefix hits, preemption and logged compilation in formal windows. Compilation
+log checks cannot detect silent runtime compilation; device attribution requires
+a separate profile. Run on an otherwise idle server.
+
+The recorder observes native output consumption without additional device waits.
+The summary retains only consecutive full-C decode observations: 16 requests,
+96 target rows and 80 draft rows per rank, with five scheduled drafts/request.
+Mixed phases, membership changes, gaps and drain observations split/exclude
+windows. At least eight intervals in a segment of ten observations are required.
+Node cadence uses the latest rank observation, never the sum of rank times.
+Throughput counts accepted output events, **including bonus tokens**, within a
+common host-clock window; do not multiply it by K. Host cadence is distinct from
+isolated target/draft device duration. Contexts derived from accepted outputs
+are reported separately from asynchronous scheduler metadata.
+
+Reprocess saved observations without running the model:
+
+```bash
+python scripts/dsv41_bench/server_steps/bench_decode.py summarize \
+  /results/decode/round-1-steps.json --scenario decode \
+  --out /results/decode/reprocessed.json
+```
+
+CPU regression tests cover rank alignment, window boundaries, output accounting
+and native output capture in `tests/scripts/test_dsv41_decode_*.py`.

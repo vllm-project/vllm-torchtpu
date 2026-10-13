@@ -29,7 +29,7 @@ exec vllm serve "$model" \
   --async-scheduling --enable-prefix-caching --kv-cache-dtype fp8 \
   --attention-config '{"indexer_kv_dtype":"fp8"}' \
   --engram-config '{"dp_shared_memory":false}' \
-  --block-size 16 --max-model-len 82944 \
+  --block-size 16 --max-model-len "${MAX_MODEL_LEN:-82944}" \
   --max-num-batched-tokens "$chunk" --max-num-seqs "$max_seqs" \
   "${kv_args[@]}" \
   --compilation-config "{\"compile_sizes\":[128,256,$chunk]}" \
