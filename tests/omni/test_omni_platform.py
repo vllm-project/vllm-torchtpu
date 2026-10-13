@@ -15,6 +15,7 @@ from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
 from vllm_torchtpu.omni import register_omni_tpu_platform
 from vllm_torchtpu.omni.attention import TpuSDPABackend, TpuSDPAImpl
 from vllm_torchtpu.omni.patches import (
+    _patch_diffusion_startup_warmup_sync,
     apply_omni_model_specific_patches,
     apply_omni_tpu_patches,
 )
@@ -384,7 +385,6 @@ def test_omni_tpu_patches_configuration(monkeypatch):
 def test_startup_warmup_device_sync(monkeypatch):
     # The startup warmup must be followed by a device sync so that its pending
     # deferred TPU ops are not fused into the first request.
-    from vllm_omni.diffusion import ipc
     from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 
     calls = []
@@ -395,15 +395,7 @@ def test_startup_warmup_device_sync(monkeypatch):
     monkeypatch.setattr(
         DiffusionEngine, "run_startup_warmup", lambda self: calls.append("warmup")
     )
-    # Call the undecorated body so the run-once cache is left alone, and
-    # restore the other attributes it patches.
-    monkeypatch.setattr(ipc, "_pack_tensor_if_large", ipc._pack_tensor_if_large)
-    monkeypatch.setattr(
-        ltx2_runtime.LTXRuntime,
-        "_decode_output",
-        ltx2_runtime.LTXRuntime._decode_output,
-    )
-    apply_omni_model_specific_patches.__wrapped__()
+    _patch_diffusion_startup_warmup_sync()
 
     DiffusionEngine.run_startup_warmup(object())
     assert calls == ["warmup", "sync"]

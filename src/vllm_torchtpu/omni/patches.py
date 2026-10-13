@@ -258,7 +258,12 @@ def _patch_diffusion_startup_warmup_sync() -> None:
     into different fused programs than later identical requests (those start
     from an empty queue because the previous output's ``.cpu()`` flushed it).
     The first request after startup therefore differs numerically from later
-    same-seed requests
+    same-seed requests.
+
+    Scope: this only takes effect when the engine runs its worker in-process
+    (the uniproc executor, the single-device default). With the mp executor,
+    only the worker processes install this patch, and they never call
+    run_startup_warmup.
     """
     from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 
@@ -266,7 +271,10 @@ def _patch_diffusion_startup_warmup_sync() -> None:
 
     def _synced_run_startup_warmup(self: Any) -> None:
         orig_run_startup_warmup(self)
-        torch.accelerator.synchronize()  # flushes pending deferred ops + waits
+        # TODO: Once the vllm-omni pin is >= 0.30, sync every worker with
+        # self.executor.collective_rpc("synchronize_device") and install this
+        # patch at platform init, so that mp engines are covered too.
+        torch.accelerator.synchronize()
 
     DiffusionEngine.run_startup_warmup = _synced_run_startup_warmup
     logger.info("Applied TPU patch: device sync after diffusion startup warmup.")
