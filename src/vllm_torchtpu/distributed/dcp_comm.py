@@ -89,11 +89,23 @@ def lse_merge_weights(
 
 
 def reduce_scatter_weighted(
-    output: torch.Tensor, weight: torch.Tensor, group: Any
+    output: torch.Tensor, weight: torch.Tensor, group: Any, skip_rs: bool = False
 ) -> torch.Tensor:
     """The reduce-scatter half of `cp_lse_ag_out_rs`: weight this rank's
-    `[T, H * group, D]` partial and reduce-scatter the heads to `[T, H, D]`."""
+    `[T, H * group, D]` partial and reduce-scatter the heads to `[T, H, D]`.
+
+    `skip_rs` (WHAT-IF ONLY, WRONG OUTPUT) replaces the reduce-scatter with a
+    local sum of this rank's `group` head blocks: same `[T, H, D]` shape and
+    dtype, no collective, and every weighted element still feeds the result,
+    so the compiler cannot drop the lse gather, the weights or any part of
+    the attention output that produced them.
+    """
     weighted = output.to(torch.float32) * weight
     # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
     weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
+    if skip_rs:
+        tokens, heads, dim = weighted.shape
+        world = int(group.world_size)
+        folded = weighted.view(tokens, world, heads // world, dim).sum(dim=1)
+        return folded.to(output.dtype)
     return group.reduce_scatter(weighted.contiguous(), dim=1).to(output.dtype)

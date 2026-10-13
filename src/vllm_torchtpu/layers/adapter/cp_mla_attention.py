@@ -141,6 +141,12 @@ def merge_lse_partials_scatter_heads(
         return merge_lse_partials_all_to_all(output, lse, group)
 
     chunks = _merge_chunks(output.shape[0]) if is_backbone else 1
+    # WHAT-IF ONLY, WRONG OUTPUT: every backbone step that reaches here (the
+    # prefill and mixed steps) keeps its lse gather, weights and chunking but
+    # drops the reduce-scatter. The drafter keeps its reduce-scatter: it has
+    # one graph for decode and prefill alike.
+    if envs.TPU_DCP_MERGE_WHATIF_SKIP_RS and is_backbone:
+        return _merge_chunked(output, lse, group, chunks, skip_rs=True)
     if chunks > 1:
         return _merge_chunked(output, lse, group, chunks)
     return cp_lse_ag_out_rs(output, lse, group)
@@ -162,7 +168,11 @@ def _merge_chunks(num_tokens: int) -> int:
 
 
 def _merge_chunked(
-    output: torch.Tensor, lse: torch.Tensor, group: Any, chunks: int
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    group: Any,
+    chunks: int,
+    skip_rs: bool = False,
 ) -> torch.Tensor:
     """`cp_lse_ag_out_rs` over `chunks` independent token chunks.
 
@@ -187,8 +197,10 @@ def _merge_chunked(
         weight = (
             whole[rows] if whole is not None else lse_merge_weights(lse[rows], group)[0]
         )
-        pieces.append(reduce_scatter_weighted(output[rows], weight, group))
-    return torch.cat(pieces, dim=0)
+        pieces.append(
+            reduce_scatter_weighted(output[rows], weight, group, skip_rs=skip_rs)
+        )
+    return pieces[0] if chunks == 1 else torch.cat(pieces, dim=0)
 
 
 def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:

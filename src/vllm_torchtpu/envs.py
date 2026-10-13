@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     TPU_DCP_MERGE_CHUNKED: int = 0
     TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
     TPU_DCP_MERGE_CHUNKED_LSE_ONCE: bool = False
+    TPU_DCP_MERGE_WHATIF_SKIP_RS: bool = False
     TPU_DCP_MLA_SPLIT_Q_LSE: bool = True
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 4
     JAX_PLATFORMS: str = ""
@@ -433,6 +434,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "TPU_DCP_MERGE_CHUNKED_LSE_ONCE": env_bool(
         "TPU_DCP_MERGE_CHUNKED_LSE_ONCE", default=False
+    ),
+    # WHAT-IF ONLY, WRONG OUTPUT: the backbone's reduce-scatter merge (every
+    # step above TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS, i.e. prefill and mixed
+    # steps) folds its heads with a local sum instead of the reduce-scatter,
+    # to measure what the step would cost without that collective.
+    "TPU_DCP_MERGE_WHATIF_SKIP_RS": env_bool(
+        "TPU_DCP_MERGE_WHATIF_SKIP_RS", default=False
     ),
     # DCP sparse MLA kernel I/O (`sparse_ragged_paged_attention(q_pe=...,
     # lse_lane_dense=True)`): hand q_nope and q_pe to the kernel as separate
