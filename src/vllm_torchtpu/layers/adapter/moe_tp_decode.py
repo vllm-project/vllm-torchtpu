@@ -395,7 +395,7 @@ def _get_op(mesh, statics: _OpStatics):
 
     name = "pallas::moe_tp_decode" + (f"_{len(_OPS)}" if _OPS else "")
     # torch_tpu annotates the partition specs as tuples of axis-name tuples, but
-    # jax_op takes PartitionSpecs at runtime, as main's other call sites pass them.
+    # jax_op takes PartitionSpecs at runtime, as other jax_op call sites pass them.
     # pyrefly: ignore[no-matching-overload]
     op = pallas.jax_op(
         name, fn, mesh=mesh, input_partition_specs=specs, output_partition_specs=P(axis)
@@ -592,7 +592,7 @@ def moe_tp_decode_forward(
     padding = token_padding._padding_state
     assert padding is not None, "moe_tp_decode needs the token-padding mask"
     sw13, ss13, sw2, ss2, bias, rank = (getattr(layer, n) for n in _BUFFERS)
-    # Production's scoring op; everything after it is the op.
+    # The usual path's scoring function; everything after it is the op.
     scores = moe_routing._apply_scoring_fn(layer.scoring_func, router_logits)
     return getattr(quant_method, _OP_ATTR)(
         x,

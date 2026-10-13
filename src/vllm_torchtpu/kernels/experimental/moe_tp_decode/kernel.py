@@ -1,13 +1,5 @@
 # Copyright 2026 Google LLC
 # SPDX-License-Identifier: Apache-2.0
-# Provenance: the routed-expert loop (transfers, the gate_up matmul issued one
-# expert ahead, finish, refill) and the per-row FP8 quantization of x are
-# copied from vllm-project/vllm-torchtpu PR #1512 (Haowen Ning,
-# @helloworld1), head e4a379c5, src/vllm_torchtpu/kernels/experimental/
-# moe_fused_tp.py (_kernel). Starting the shared expert's weight copies at
-# kernel entry follows _ar_kernel in the same file. Changes to copied code are
-# marked "# UPDATE:". The all-reduce epilogue follows PR #1559; see
-# all_reduce.py.
 """Decode MoE layer of one TP rank, all-reduce included, in one pallas_call.
 
 For DeepSeek-V3-style MoE layers served with MoE tensor parallelism (every
@@ -24,12 +16,15 @@ inside the kernel, so no XLA all-reduce follows:
   4. the experts any row picked go VMEM -> SMEM and are compacted; the first
      _NUM_BUFFERS of them start their weight DMAs as they are recorded;
   5. x quantized to FP8 per row; this rank's slice of the shared expert
-     (xla_quantized_matmul's arithmetic and production's bf16 roundings);
-  6. PR #1512's routed loop over a ring of _NUM_BUFFERS weight slots;
-  7. bf16(bf16(shared) + bf16(bf16(routed) * routed_scale)), production's
-     combine, all-reduced by all_reduce.epilogue in place of the store.
+     (xla_quantized_matmul's arithmetic and the usual TP path's bf16
+     roundings);
+  6. the routed experts, streamed through a ring of _NUM_BUFFERS weight slots
+     with each gate_up matmul issued one expert ahead;
+  7. bf16(bf16(shared) + bf16(bf16(routed) * routed_scale)), the usual TP
+     path's combine, all-reduced by all_reduce.epilogue in place of the store.
 
-Rows >= n_valid come out exactly +0 and only rows < n_valid travel.
+Rows >= n_valid come out exactly +0; n_valid also picks the all-reduce path,
+which sets how many rows travel (all_reduce: zero, fold, trim, full).
 """
 
 import functools
@@ -54,8 +49,7 @@ SUM_FLOOR = 1e-20
 QUANT_BLOCK = 512
 PAIR = 128
 # VMEM limit = need x headroom (Mosaic temporaries), refused above a fraction
-# of the capacity so neighbouring XLA ops keep room. The rule and both values
-# follow _vmem_budget in PR #1382 (Ann Yan, @annyan09023).
+# of the capacity so neighbouring XLA ops keep room.
 VMEM_HEADROOM = 1.25
 VMEM_FRACTION = 0.75
 # Output columns per second-matmul chunk; bounds the live f32 result.
@@ -87,7 +81,7 @@ def _vmem_plan(m, h, i, num_experts, shared_inter, info, spec):
         + t((1, h), f32)
         + 2 * t((m, h), FP8)  # sxq, xq
         + t((m, 2 * i), f32)  # xs
-        + 2 * t((m, h), f32)  # owner, shared_acc
+        + 2 * t((m, h), f32)  # owner, shared
         + t((m, e_pad), f32)  # wtab
         + t((1, e_pad), jnp.int32)  # hits_v
     )
@@ -205,8 +199,8 @@ def _to_fp8(v):
 def _shared_expert(x_ref, sxq_ref, sw13_ref, ss13_ref, sw2_ref, ss2_ref, out_ref):
     """This rank's slice of the shared expert into out_ref (f32), as
     xla_quantized_matmul twice: x quantized per row over its full K (true
-    division, clip), f32 dot, x scale then weight scale; production's bf16
-    roundings between the projections; the down projection stays f32."""
+    division, clip), f32 dot, x scale then weight scale; the usual TP path's
+    bf16 roundings between the projections; the down projection stays f32."""
     m, h = x_ref.shape
     shared_inter = sw2_ref.shape[0]
     amax = jnp.zeros((m, 1), jnp.float32)
@@ -229,8 +223,9 @@ def _shared_expert(x_ref, sxq_ref, sw13_ref, ss13_ref, sw2_ref, ss2_ref, out_ref
 
 
 def _combine(routed_sum, shared_sum, routed_scale):
-    """Production's combine: bf16(bf16(shared) + bf16(bf16(routed) * scale)),
-    f32 arithmetic between the roundings (routed_scale is exact in bf16)."""
+    """The usual TP path's combine, roundings included:
+    bf16(bf16(shared) + bf16(bf16(routed) * scale)), f32 arithmetic between the
+    roundings (routed_scale is exact in bf16)."""
     routed = routed_sum.astype(jnp.bfloat16).astype(jnp.float32)
     scaled = (routed * routed_scale).astype(jnp.bfloat16).astype(jnp.float32)
     shared = shared_sum.astype(jnp.bfloat16).astype(jnp.float32)
@@ -302,7 +297,7 @@ def _kernel(
     hit_copy.wait()
 
     def transfers(step):
-        # UPDATE: active_ids_ref / ring_sem names; otherwise #1512's transfers.
+        # Active expert `step`'s weights and scales into ring slot step % nb.
         e, slot = active_ids_ref[step], step % nb
         return [
             pltpu.make_async_copy(w1_hbm.at[e], w1_ref.at[slot], ring_sem.at[slot, 0]),
@@ -316,16 +311,17 @@ def _kernel(
         ]
 
     def compact(e, count):
-        # UPDATE: the in-kernel hit table (hits_s_ref), not the caller's
-        # active_ref.
+        # Appends expert e to active_ids_ref if any row picked it.
         hit_e = hits_s_ref[0, e]
 
         @pl.when(hit_e != 0)
         def record():
             active_ids_ref[count] = e
 
-            # UPDATE: #1512 primes the ring after the compaction; here active
-            # expert `count` starts its copies as soon as it is recorded.
+            # The first nb active experts start their copies as soon as they
+            # are recorded: the weight stream then starts at the first hit
+            # rather than after the scan, which outweighs the branch this
+            # adds to the loop (measured on v7x).
             @pl.when(count < nb)
             def prime():
                 for copy in transfers(count):
@@ -333,14 +329,12 @@ def _kernel(
 
         return count + (hit_e != 0).astype(jnp.int32)
 
-    # UPDATE: local_experts is #1512's `experts`.
     count = lax.fori_loop(0, local_experts, compact, jnp.int32(0))
 
-    # UPDATE: zeroing and x quantization run after the compaction (#1512 does
-    # them before it), so the first weight copies start earlier.
+    # Zeroing and x quantization follow the compaction, so the first weight
+    # copies are already in flight while they run.
     owner_ref[...] = jnp.zeros((m, h), jnp.float32)
     x = x_ref[...].astype(jnp.float32)
-    # UPDATE: FP8 / FP8_MAX names (FP8_MAX == #1512's _F8_MAX == 448.0).
     xsc = jnp.max(jnp.abs(x), axis=1, keepdims=True) / FP8_MAX
     xq_ref[...] = (x * jnp.where(xsc == 0, 0.0, 1.0 / xsc)).astype(FP8)
     xs_ref[...] = jnp.broadcast_to(xsc, (m, 2 * i))
@@ -355,8 +349,8 @@ def _kernel(
 
     def finish(step, slot, acc1):
         e = active_ids_ref[step]
-        # UPDATE: column e of the in-kernel routing table over all E experts,
-        # not the caller's coefficient table.
+        # Each row's routing weight for expert e (column e of the routing
+        # table, 0 for rows that did not pick it).
         coeff = jnp.sum(
             jnp.where(expert_columns == e, wtab_ref[...], 0.0),
             axis=1,
@@ -380,7 +374,7 @@ def _kernel(
 
     @pl.when(count > 0)
     def run_experts():
-        # UPDATE: no prime here (it runs in the compaction loop above).
+        # compact() started the copies of the first nb experts.
         for copy in transfers(jnp.int32(0)):
             copy.wait()
 
@@ -408,9 +402,9 @@ def _kernel(
 
         lax.fori_loop(0, count, expert_body, gate_up(0))
 
-    # UPDATE: production's combine and the in-kernel all-reduce instead of
-    # out_ref[...] = owner_ref[...].astype(out_ref.dtype); outside
-    # pl.when(count > 0), so every rank runs it on every path.
+    # Outside pl.when(count > 0): every rank must take part in the exchange
+    # (its peers wait for its chunks), consume the barrier signals sent at
+    # entry and write out_ref.
     all_reduce.epilogue(
         ar_spec,
         rank,

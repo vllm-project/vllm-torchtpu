@@ -1,11 +1,5 @@
 # Copyright 2026 Google LLC
 # SPDX-License-Identifier: Apache-2.0
-# Provenance: `prologue` and the reduce-scatter / f32 sum / all-gather
-# protocol of `epilogue` come from the all-reduce section of _ar_kernel in
-# vllm-project/vllm-torchtpu PR #1559 (Haowen Ning, @helloworld1), head
-# 08c288cdb, src/vllm_torchtpu/kernels/experimental/moe_fused_tp.py. Changes
-# to copied code are marked "# UPDATE:"; the per-sender semaphores, the
-# rotated issue order and the valid-rows paths are new.
 """In-kernel all-reduce of a bf16 [m, h] partial over the n ranks of a 1-D mesh.
 
 A fused kernel calls `prologue` at entry and `epilogue` in place of its final
@@ -14,18 +8,21 @@ store, and adds `scratch_shapes` / `vmem_bytes` to its pallas_call;
 
 A rank is a device's index in the mesh. Protocol: reduce-scatter of n column
 chunks [m, h / n] (rank r owns chunk r), an f32 sum of the n bf16 slots in
-rank (mesh) order rounded to bf16 (PR #1559's sum), then an all-gather into
-out_ref. Each receive slot has its own semaphore,
-indexed by sender; the own chunk moves by a local copy; out_ref is both the
-reduce-scatter source and the all-gather target; rank r's k-th copy goes to
-rank (r + k) % n. Only rows < n_valid travel, and rows >= n_valid come out +0:
+rank (mesh) order rounded to bf16, then an all-gather into out_ref. Each
+receive slot has its own semaphore, indexed by sender; the own chunk moves by
+a local copy; out_ref is both the reduce-scatter source and the all-gather
+target, except on the fold path, which exchanges its folded matrix; rank r's
+i-th copy goes to rank (r + i) % n, so no two ranks' i-th copies share a
+target. Rows >= n_valid come out +0, and n_valid picks the path, which sets
+how many rows travel (fold exists only when spec.fold, trim only when
+tile_rows < m):
 
   zero  n_valid == 0: barrier wait, zeros.
   fold  1 <= n_valid <= fold_rows: the valid rows are folded into one
         [tile_rows, h / k] matrix, q[j * fold_rows + r, x] = p[r, j * h / k + x]
         (k = lane groups per chunk), and that is all-reduced instead.
-  trim  fold_rows < n_valid <= tile_rows < m: rows [0, tile_rows) only.
-  full  otherwise.
+  trim  above the fold range, n_valid <= tile_rows: rows [0, tile_rows) only.
+  full  otherwise: all m rows.
 
 n_valid must be the same on every rank (one replicated value). The barrier
 semaphore gets one signal from every rank at entry and is waited for n
@@ -185,7 +182,7 @@ def _recv_all(spec, me, dst_of, recv_sem):
 
 
 def _sum_slots(load, count):
-    """f32 sum of count bf16 slots in slot (rank) order, as PR #1559."""
+    """f32 sum of count bf16 slots in slot (rank) order."""
     acc = load(0).astype(F32)
     for s in range(1, count):
         acc = acc + load(s).astype(F32)
@@ -298,7 +295,6 @@ def prologue(spec: AllReduceSpec) -> None:
     barrier = pltpu.get_barrier_semaphore()
     for d in range(spec.n):
         pl.semaphore_signal(
-            # UPDATE: device ids as Python ints, (d,) instead of (jnp.int32(d),).
             barrier,
             inc=1,
             device_id=(d,),
