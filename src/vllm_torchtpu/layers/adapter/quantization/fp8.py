@@ -103,6 +103,7 @@ from vllm_torchtpu.layers.adapter.quantization.online_fp8 import (
     map_online_fp8,
     quantize_online_fp8,
 )
+from vllm_torchtpu.layers.core.fused_moe_gmm import moe_intermediate_alignment
 from vllm_torchtpu.layers.core.quant_methods import FP8, get_tpu_quant_method
 from vllm_torchtpu.layers.core.quantization import dequantize_tensor, quantize_tensor
 from vllm_torchtpu.logger import init_logger
@@ -366,9 +367,11 @@ def _quantize_and_format_single_moe_weight(
         w3 = w[:, 1::2, :]
         w = torch.cat([w1, w3], dim=1)
 
+    # routing_moe may ask for 256; it takes no block scales, so those keep 128.
+    align = 128 if block_size is not None else moe_intermediate_alignment()
     if name == "w13":
         half = w.shape[1] // 2
-        aligned_half = (half + 127) // 128 * 128
+        aligned_half = -(-half // align) * align
         if aligned_half != half:
             pad_w = w.new_zeros(w.shape[0], aligned_half - half, w.shape[2])
             w = torch.cat(
@@ -376,7 +379,7 @@ def _quantize_and_format_single_moe_weight(
             ).contiguous()
     elif name == "w2":
         inter = w.shape[2]
-        aligned_inter = (inter + 127) // 128 * 128
+        aligned_inter = -(-inter // align) * align
         if aligned_inter != inter:
             pad_w = w.new_zeros(w.shape[0], w.shape[1], aligned_inter - inter)
             w = torch.cat([w, pad_w], dim=2).contiguous()

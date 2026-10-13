@@ -13,10 +13,12 @@
 # limitations under the License.
 
 import functools
+import importlib.metadata
 
 import jax
 from jax import numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
+from packaging.version import Version
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.kernels.experimental.moe_dense_expert import (
@@ -28,6 +30,8 @@ from vllm_torchtpu.kernels.megablox.moe_onehot_unpermute import (
     blockwise_onehot_unpermute,
     can_use_blockwise_onehot_unpermute,
 )
+from vllm_torchtpu.kernels.routing_moe.common import layout_util as routing_layout
+from vllm_torchtpu.kernels.routing_moe.gmm.kernel import routing_gmm
 from vllm_torchtpu.kernels.sparse_core.ragged_gather_reduce import (
     ragged_gather_reduce as ragged_gather_reduce_v1,
 )
@@ -68,6 +72,45 @@ _SINGLE_SORT = envs.TPU_MOE_SINGLE_SORT
 # Above 2,048 routed rows, the inverse-permutation scatter costs more than
 # the two sorts it replaces when `ragged_permute` is off (e.g. non-EP prefill).
 _SINGLE_SORT_MAX_ROWS = 2048
+# routing_gmm needs more than two output buffers per pipeline (jax) and the
+# tpu.annotate op (libtpu).
+_ROUTING_GMM_MIN_JAX = Version("0.12.0.dev20261007")
+_ROUTING_GMM_MIN_LIBTPU = Version("0.0.50")
+
+
+def routing_gmm_runtime_supported() -> bool:
+    """Whether the installed jax and libtpu can compile routing_gmm."""
+    try:
+        libtpu_version = Version(importlib.metadata.version("libtpu"))
+    except importlib.metadata.PackageNotFoundError:
+        return False
+    return (
+        Version(jax.__version__) >= _ROUTING_GMM_MIN_JAX
+        and libtpu_version >= _ROUTING_GMM_MIN_LIBTPU
+    )
+
+
+def _resolve_routing_gmm() -> bool:
+    if not envs.TPU_MOE_ROUTING_GMM:
+        return False
+    if not routing_gmm_runtime_supported():
+        logger.info(
+            "routing_moe MoE needs jax >= %s and libtpu >= %s; using gmm_v2.",
+            _ROUTING_GMM_MIN_JAX,
+            _ROUTING_GMM_MIN_LIBTPU,
+        )
+        return False
+    return True
+
+
+# Fixed at import: run admitted layers through the routing_moe kernel.
+_ROUTING_GMM = _resolve_routing_gmm()
+# Activations routing_gmm can fuse; it has no situ.
+_ROUTING_GMM_ACTIVATIONS = frozenset(
+    {"silu", "gelu", "gelu_tanh", "swigluoai", "silu_and_mul_with_clamp"}
+)
+# Share of VMEM the untiled routing_gmm buffers may claim.
+_ROUTING_GMM_VMEM_FRACTION = 0.75
 
 
 def resolve_onehot_permute_threshold() -> int:
@@ -577,6 +620,151 @@ def moe_gmm(
     return token_topk_hidden.sum(axis=1).astype(x.dtype)
 
 
+def moe_intermediate_alignment() -> int:
+    """Multiple the MoE loaders pad each shard's intermediate (each w13 half,
+    and w2's rows) to.
+
+    gmm_v2 needs 128. routing_gmm reads the gate/up output in its compact
+    layout, two bf16 per 32-bit lane over 128 lanes, so narrower shards need
+    256. TPU_MOE_ROUTING_GMM_PAD_INTERMEDIATE=0 keeps 128 to save the memory.
+    """
+    if _ROUTING_GMM and envs.TPU_MOE_ROUTING_GMM_PAD_INTERMEDIATE:
+        return 256
+    return 128
+
+
+def _routing_gmm_vmem_bytes(
+    size_k: int, size_n: int, size_out_n: int, w_dtype, rows: int
+) -> int:
+    """Upper bound on one routing_gmm call's VMEM. With no N/K tiling yet the
+    whole K x N expert slab stays resident, double-buffered, next to
+    triple-buffered row tiles of x and out (see routing_moe TileConfig)."""
+    tile_m = min(256, rows)
+    w_bytes = 2 * size_k * size_n * jnp.dtype(w_dtype).itemsize
+    xo_bytes = 3 * tile_m * (size_k + size_out_n) * jnp.dtype(jnp.bfloat16).itemsize
+    acc_bytes = tile_m * size_n * jnp.dtype(jnp.float32).itemsize
+    return w_bytes + xo_bytes + acc_bytes
+
+
+def can_use_routing_gmm(
+    hidden_states: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array | None,
+    w2_scale: jax.Array | None,
+    w1_bias: jax.Array | None,
+    w2_bias: jax.Array | None,
+    *,
+    activation: str,
+    topk: int,
+    rhs_quant_dtype: jnp.dtype | None,
+) -> bool:
+    """Whether routing_moe's routing_gmm can serve this layer.
+
+    routing_gmm takes bf16 weights, or fp8 weights with one scale per output
+    channel, and quantizes activations to the weight dtype. It has no bias,
+    no packed or block-scaled weights, and no N/K tiling, so everything else
+    stays on gmm_v2.
+    """
+    if rhs_quant_dtype is not None or w1_bias is not None or w2_bias is not None:
+        return False
+    if activation not in _ROUTING_GMM_ACTIVATIONS:
+        return False
+    if hidden_states.dtype != jnp.bfloat16 or w1.dtype != w2.dtype:
+        return False
+    if w1.dtype == jnp.bfloat16:
+        if w1_scale is not None or w2_scale is not None:
+            return False
+    elif w1.dtype == jnp.float8_e4m3fn:
+        # Per-channel scales only: [experts, 1, 1, N].
+        if w1_scale is None or w2_scale is None:
+            return False
+        if w1_scale.shape[1] != 1 or w2_scale.shape[1] != 1:
+            return False
+    else:
+        return False
+
+    _, size_k, size_n = w1.shape
+    size_inter = size_n // 2
+    # The compact layout packs two bf16 per 32-bit lane over 128 lanes, and
+    # the gate/up output feeds w2 as is: no padded intermediate to trim.
+    if size_k % 256 or size_inter % 256 or w2.shape[1:] != (size_inter, size_k):
+        return False
+
+    try:
+        tpu_info = pltpu.get_tpu_info()
+    except ValueError:
+        # get_tpu_info raises for unsupported device kinds (e.g. CPU hosts).
+        return False
+    rows = hidden_states.shape[0] * topk
+    # routing_gmm keeps per-row routing metadata in SMEM.
+    if not 0 < rows <= int(0.45 * tpu_info.smem_capacity_bytes) // 4:
+        return False
+    vmem_budget = _ROUTING_GMM_VMEM_FRACTION * tpu_info.vmem_capacity_bytes
+    return (
+        _routing_gmm_vmem_bytes(size_k, size_n, size_inter, w1.dtype, rows) <= vmem_budget
+        and _routing_gmm_vmem_bytes(size_inter, size_k, size_k, w2.dtype, rows)
+        <= vmem_budget
+    )
+
+
+def routing_moe_gmm(
+    hidden_states: jax.Array,
+    w1: jax.Array,
+    w2: jax.Array,
+    w1_scale: jax.Array | None,
+    w2_scale: jax.Array | None,
+    topk_weights: jax.Array,
+    topk_ids: jax.Array,
+    *,
+    activation: str,
+    topk: int,
+    skip_padded_tokens: bool,
+) -> jax.Array:
+    """MoE through routing_gmm: the token gather is fused into the gate/up GMM
+    and the scatter back to (token, k) order into the down GMM, so no separate
+    permute or combine kernel runs.
+
+    ``topk_ids`` are local expert ids, negative for routes this shard does not
+    own. Those rows sort into a sentinel group past the local experts, which
+    routing_gmm never processes.
+    """
+    num_tokens, hidden_size = hidden_states.shape
+    local_num_experts, padded_hidden_size, _ = w1.shape
+    topk_ids_flat = topk_ids.reshape(-1)
+    if skip_padded_tokens:
+        # Padded tokens carry zero routing weights; drop them from GMM work.
+        valid = (topk_ids_flat >= 0) & (topk_weights.reshape(-1) != 0)
+    else:
+        valid = topk_ids_flat >= 0
+    sort_keys = jnp.where(valid, topk_ids_flat, local_num_experts)
+    sorted_rows = jnp.argsort(sort_keys)
+    group_sizes = jnp.bincount(sort_keys, length=local_num_experts + 1)
+
+    x = jnp.pad(hidden_states, ((0, 0), (0, padded_hidden_size - hidden_size)))
+    x = x.reshape(routing_layout.to_compact_shape(x.shape, x.dtype))
+    gmm1_res = routing_gmm(
+        x,
+        w1,
+        w1_scale,
+        group_sizes,
+        gather_indices=sorted_rows // topk,
+        fuse_act=activation,
+    )
+    gmm2_res = routing_gmm(
+        gmm1_res, w2, w2_scale, group_sizes, scatter_indices=sorted_rows
+    )
+
+    rows = gmm2_res.reshape(routing_layout.to_large_shape(gmm2_res.shape))
+    rows = rows.reshape(num_tokens, topk, padded_hidden_size)
+    # Rows of skipped routes are never written; select them away rather than
+    # weighting them, since 0 * NaN == NaN.
+    rows = jnp.where(valid.reshape(num_tokens, topk, 1), rows, 0)
+    weights = topk_weights.astype(jnp.float32).reshape(num_tokens, topk, 1)
+    out = (rows.astype(jnp.float32) * weights).sum(axis=1)
+    return out[:, :hidden_size].astype(hidden_states.dtype)
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -683,6 +871,32 @@ def fused_moe_func(
         logger.info_once("Selected experimental dense-expert decode MoE")
         return dense_expert_moe(
             hidden_states, w1, w2, w1_scale, w2_scale, topk_weights, topk_ids
+        )
+
+    if _ROUTING_GMM and can_use_routing_gmm(
+        hidden_states,
+        w1,
+        w2,
+        w1_scale,
+        w2_scale,
+        w1_bias,
+        w2_bias,
+        activation=activation,
+        topk=topk,
+        rhs_quant_dtype=rhs_quant_dtype,
+    ):
+        logger.info_once("Selected routing_moe routing_gmm MoE")
+        return routing_moe_gmm(
+            hidden_states,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            topk_weights,
+            topk_ids,
+            activation=activation,
+            topk=topk,
+            skip_padded_tokens=skip_padded_tokens,
         )
 
     (

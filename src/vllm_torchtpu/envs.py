@@ -59,6 +59,8 @@ if TYPE_CHECKING:
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     TPU_MOE_SINGLE_SORT: bool = True
+    TPU_MOE_ROUTING_GMM: bool = True
+    TPU_MOE_ROUTING_GMM_PAD_INTERMEDIATE: bool = True
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -604,6 +606,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three. The ragged (counting sort) path ignores it.
     "TPU_MOE_SINGLE_SORT": env_bool("TPU_MOE_SINGLE_SORT", True),
+    # Run MoE through the routing_moe kernel, which fuses the token gather into
+    # the gate/up GMM and the scatter into the down GMM. Layers it cannot serve
+    # (packed or block-scaled weights, bias, situ) keep the gmm_v2 path, and so
+    # does everything when jax < 0.12.0.dev20261007 or libtpu < 0.0.50 (newer
+    # than the pins). Set to 0 to force gmm_v2.
+    "TPU_MOE_ROUTING_GMM": env_bool("TPU_MOE_ROUTING_GMM", True),
+    # Pad each shard's MoE intermediate to a multiple of 256 instead of 128 at
+    # load, so routing_moe can serve shards narrower than 256 (e.g. 1024-wide
+    # experts at TP=8). The padding is zeros, so outputs are unchanged, but a
+    # shard that is not already a multiple of 256 grows (128 -> 256 doubles its
+    # MoE weights). Only applies when routing_moe is on; set to 0 to keep 128.
+    "TPU_MOE_ROUTING_GMM_PAD_INTERMEDIATE": env_bool(
+        "TPU_MOE_ROUTING_GMM_PAD_INTERMEDIATE", True
+    ),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.

@@ -72,6 +72,7 @@ from vllm_torchtpu.layers.adapter.quantization.configs import (
     VllmQuantConfig,
     should_quantize_on_load,
 )
+from vllm_torchtpu.layers.core.fused_moe_gmm import moe_intermediate_alignment
 from vllm_torchtpu.layers.core.quant_methods import UNQUANTIZED, get_tpu_quant_method
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
@@ -280,9 +281,11 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
         w2_weight = w2_weight.transpose(1, 2).contiguous()
 
         # Pad each w13 half (gate, up) to a multiple of 128 so the fused GMM
-        # kernel's sub-view of the up half lands on a tile boundary.
+        # kernel's sub-view of the up half lands on a tile boundary; routing_moe
+        # may ask for 256. It takes no bias, so biased layers keep 128.
+        align = 128 if self.moe.has_bias else moe_intermediate_alignment()
         half = w13_weight.shape[-1] // 2
-        aligned_half = (half + 127) // 128 * 128
+        aligned_half = -(-half // align) * align
         if aligned_half != half:
             pad = w13_weight.new_zeros((*w13_weight.shape[:-1], aligned_half - half))
             w13_weight = torch.cat(
