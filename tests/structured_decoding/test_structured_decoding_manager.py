@@ -177,6 +177,7 @@ class TestPrepareStructuredDecodingInput:
             logits, grammar_output, 0, 2
         )
 
+        assert require.data_ptr() == manager.device_all_true_require.data_ptr()
         assert require[:, 0].tolist() == [True, True]
         assert bitmask[0].tolist() == [ALLOW_ALL, BLOCK_ALL]
         assert bitmask[1].tolist() == [BLOCK_ALL, ALLOW_ALL]
