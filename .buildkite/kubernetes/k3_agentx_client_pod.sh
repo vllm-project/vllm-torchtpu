@@ -90,9 +90,9 @@ _cfg=$(
     # shellcheck source=/dev/null
     source "$CONFIG_FILE" >/dev/null || exit 3
     _post=$(printf '%s' "${AGENTX_POST_EVAL_SUITES:-}" | tr -s ' ' ',')
-    echo "${MAX_NUM_SEQS:-0} ${TENSOR_PARALLELISM:-0} ${DATA_PARALLELISM:-0} ${ENABLE_EP:-false} ${AGENTX_MODEL_PREFIX:-} ${AGENTX_PRECISION:-} ${_post:--} ${AGENTX_PROXY:-toy} ${AGENTX_CONC_LIST:-}"
+    echo "${MAX_NUM_SEQS:-0} ${TENSOR_PARALLELISM:-0} ${DATA_PARALLELISM:-0} ${ENABLE_EP:-false} ${AGENTX_MODEL_PREFIX:-} ${AGENTX_PRECISION:-} ${_post:--} ${AGENTX_PROXY:-toy} ${AGENTX_ALLOW_SEQS_BELOW_CONC:-0} ${AGENTX_CONC_LIST:-}"
 ) || { log "FATAL: $CONFIG failed to load; the engines would have failed the same way"; exit 2; }
-read -r CFG_MAX_NUM_SEQS CFG_TP CFG_DP CFG_ENABLE_EP CFG_MODEL_PREFIX CFG_PRECISION CFG_POST_EVAL_SUITES CFG_PROXY CFG_CONC_LIST <<< "$_cfg"
+read -r CFG_MAX_NUM_SEQS CFG_TP CFG_DP CFG_ENABLE_EP CFG_MODEL_PREFIX CFG_PRECISION CFG_POST_EVAL_SUITES CFG_PROXY CFG_ALLOW_SEQS_BELOW_CONC CFG_CONC_LIST <<< "$_cfg"
 # What fronts the pair: the toy proxy (examples/disagg) or vllm-router in
 # its prefill/decode mode (AGENTX_PROXY=router in the config; the image
 # carries the binary). Same two-hop protocol either way.
@@ -111,9 +111,16 @@ for c in "${CONCS[@]}"; do
 done
 NEED_SEQS=$((2 * MAX_CONC)); [ "$NEED_SEQS" -lt 4 ] && NEED_SEQS=4
 if [ "${CFG_MAX_NUM_SEQS:-0}" -lt "$NEED_SEQS" ]; then
-    log "FATAL: $CONFIG sets MAX_NUM_SEQS=$CFG_MAX_NUM_SEQS, but concurrencies ${CONCS[*]}" \
-        "need at least $NEED_SEQS (2 x $MAX_CONC). Raise it in the config."
-    exit 2
+    # A config may cap the engine below the replay's concurrency on purpose (an
+    # agentic session idles between turns), and say so.
+    if [ "${CFG_ALLOW_SEQS_BELOW_CONC:-0}" = 1 ]; then
+        log "WARNING: $CONFIG sets MAX_NUM_SEQS=$CFG_MAX_NUM_SEQS under the $NEED_SEQS that" \
+            "concurrencies ${CONCS[*]} would need; it allows that (AGENTX_ALLOW_SEQS_BELOW_CONC=1)"
+    else
+        log "FATAL: $CONFIG sets MAX_NUM_SEQS=$CFG_MAX_NUM_SEQS, but concurrencies ${CONCS[*]}" \
+            "need at least $NEED_SEQS (2 x $MAX_CONC). Raise it in the config."
+        exit 2
+    fi
 fi
 
 # What tokens per dollar is costed over: PHYSICAL chips, both engines, stated by

@@ -1,0 +1,91 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Kimi-K3 AgentX on the megakernel backend. The AgentX lane's client
+# (k3_agentx_client_pod.sh: the toy proxy and the InferenceX trace replay)
+# against a prefill/decode pair served as the "Kimi-K3 on TPU7x: 1P1D
+# prefill/decode recipes" doc serves it: TP32 per role on two tpu7x 2x2x4
+# slices, the TP32 pre-shard in the model bucket, DSpark decode, Raiden
+# prefill-to-decode transfer and vLLM's Rust frontend
+# (kimi-k3-mk-agentx-1p1d.yaml, kimi-k3-mk-tp32-1p1d-agentx.sh). The engines
+# run an image built from another branch; the client and this lane's scripts
+# come from the build's commit.
+#
+# HOW TO TRIGGER
+# ──────────────
+# Manual builds only. Own Buildkite pipeline, trigger mode "none" and no
+# schedule, whose "Steps" setting is
+#   DEV_PIPELINE_FILE=.buildkite/pipeline_k3_megakernel_agentx.yml bash .buildkite/scripts/bootstrap_dev.sh
+# then "New Build" with any of these in the build's environment. Or select
+# this file on vllm-torchtpu-dev with DEV_PIPELINE_FILE.
+#
+#   K3_MK_POINT      the doc's point, 1-5 (6-7 experimental); default 1
+#   K3_ENGINE_REF    branch, tag or commit the engine image is built from;
+#                    default inferact/megakernel-integration
+#   K3_ENGINE_IMAGE  an engine image to use as it is, instead of building one
+#
+# One point per build, since each needs its own decode server. Point 1 took
+# ~45 min from admission: node scale-up, ~5 min for the engines to come up, the
+# replay's warmup and its 20 min window (the client's fast mode).
+#
+# The step passes even when every request fails, because the client exits 0
+# after writing what it has: read "requests ok" in summary.md.
+
+env:
+  # The kube launcher uploads whatever the workload leaves here as the step's
+  # artifacts, as pipeline_perf_kube.yml declares it.
+  ARTIFACTS_DIR: "perf_eval_results"
+
+steps:
+  # The client image: docker/Dockerfile --target dev at this commit, the same
+  # build pipeline_build.yml runs.
+  - label: ":docker: Build and Push Dev Image"
+    key: build_docker
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/setup_docker_env.sh
+
+  - label: ":docker: Build Kimi-K3 megakernel engine image"
+    key: k3_engine_image
+    agents:
+      queue: cpu_64_core
+    commands:
+      - bash .buildkite/scripts/build_k3_engine_image.sh
+
+  - label: ":kubernetes: :tpu: Perf: Kimi-K3 megakernel AgentX 1P1D point ${K3_MK_POINT:-1} (TPU v7x 2x2x4 x2)"
+    key: k3_mk_agentx_1p1d
+    depends_on:
+      - build_docker
+      - k3_engine_image
+    # The group the nightly Kimi-K3 pairs in pipeline_perf_kube.yml join, so a
+    # build waits for a running pair instead of competing for its slices.
+    concurrency_group: "tpu/v7x-2x2x4"
+    concurrency: 1
+    timeout_in_minutes: 1440
+    env:
+      # bootstrap_dev.sh leaves its builds unclassed: Kueue priority 0, ahead of
+      # the nightlies and behind every other kind of build. post-merge queues
+      # this one with main, and it preempts: the 2x2x4 ClusterQueue reclaims
+      # within its cohort from LowerPriority workloads, so the quota it lends to
+      # other tpu7x shapes is taken back by evicting their jobs (Kueue requeues
+      # them).
+      WORKLOAD_PRIORITY: "post-merge"
+    agents:
+      queue: "kube"
+    plugins:
+      - kubernetes:
+          podTemplate: tpu-launcher
+    commands:
+      - .buildkite/kubernetes/k3_mk_submit.sh

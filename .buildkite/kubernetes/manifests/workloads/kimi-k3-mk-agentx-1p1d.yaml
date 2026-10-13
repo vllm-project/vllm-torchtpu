@@ -1,0 +1,239 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# kimi-k3-agentx-1p1d.yaml with megakernel engines: prefill and decode each TP32
+# on a 2x2x4 slice as the TPU7x recipe doc serves them (k3_mk_engine.sh,
+# kimi-k3-mk-tp32-1p1d-agentx.sh), replayed by the same chipless AgentX client
+# (k3_agentx_client_pod.sh). Submitted by k3_mk_submit.sh.
+#
+# The engines run ${K3_ENGINE_IMAGE}, built from the megakernel branch, and start
+# from K3_MK_BUNDLE_B64 rather than that image's scripts; the client runs this
+# build's ${IMAGE}. The pre-shard and the speculator come from the model bucket
+# the fleet mounts at /cache/hf/hub. Names like ${K3_MK_POINT} are substituted
+# from the step's environment before submission, so a literal dollar is $$.
+
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  annotations:
+    tpu-ci.google.com/defaults: standard
+    alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
+spec:
+  network:
+    enableDNSHostnames: true
+  # The engines serve until told to stop; the client finishing ends the run.
+  successPolicy:
+    operator: All
+    targetReplicatedJobs:
+      - client
+  replicatedJobs:
+    # A group per role: GKE's TPU webhook derives MEGASCALE_NUM_SLICES from it.
+    - name: prefill
+      groupName: prefill
+      replicas: 1
+      template:
+        spec:
+          parallelism: 4
+          completions: 4
+          completionMode: Indexed
+          activeDeadlineSeconds: 28800
+          backoffLimit: 0
+          template:
+            spec:
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: 2x2x4
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              containers:
+                - name: workload
+                  image: ${K3_ENGINE_IMAGE}
+                  command:
+                    - /bin/bash
+                    - -c
+                    - >-
+                      mkdir -p /tmp/k3mk-bundle &&
+                      printf '%s' "$$K3_MK_BUNDLE_B64" | base64 -d | tar -xz -C /tmp/k3mk-bundle &&
+                      exec bash /tmp/k3mk-bundle/k3_mk_engine.sh prefill
+                  env:
+                    # Host i of this role is <prefix>i.<domain>; host 0 is the head.
+                    - name: ROLE_HOST_PREFIX
+                      value: ${WORKLOAD_NAME}-prefill-0-
+                    - name: ROLE_HOST_DOMAIN
+                      value: ${WORKLOAD_NAME}
+                    - name: K3_MK_POINT
+                      value: "${K3_MK_POINT}"
+                    # Keys the compilation cache to the toolchain that fills it.
+                    - name: K3_ENGINE_IMAGE
+                      value: "${K3_ENGINE_IMAGE}"
+                    - name: K3_MK_BUNDLE_B64
+                      value: "${K3_MK_BUNDLE_B64}"
+                    - name: POD_IP
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: status.podIP
+                    - name: TPU_ACCELERATOR_TYPE
+                      value: tpu7x
+                    - name: TMPDIR
+                      value: /dev/shm
+                  ports:
+                    - containerPort: 8000
+                  resources:
+                    limits:
+                      google.com/tpu: "4"
+                    requests:
+                      google.com/tpu: "4"
+                  volumeMounts:
+                    - name: k3-checkpoint
+                      mountPath: /ckpt/k3
+                      readOnly: true
+              volumes:
+                # The checkpoint's config and tokenizer, at the path the
+                # pre-shard was written from (its layout.json names /ckpt/k3).
+                - name: k3-checkpoint
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    readOnly: true
+                    volumeAttributes:
+                      bucketName: tpu-commons-ci
+                      mountOptions: "implicit-dirs,only-dir=moonshootai/kimi/k3"
+                      skipCSIBucketAccessCheck: "true"
+
+    - name: decode
+      groupName: decode
+      replicas: 1
+      template:
+        spec:
+          parallelism: 4
+          completions: 4
+          completionMode: Indexed
+          activeDeadlineSeconds: 28800
+          backoffLimit: 0
+          template:
+            spec:
+              nodeSelector:
+                cloud.google.com/gke-tpu-topology: 2x2x4
+                cloud.google.com/gke-tpu-accelerator: tpu7x
+              containers:
+                - name: workload
+                  image: ${K3_ENGINE_IMAGE}
+                  command:
+                    - /bin/bash
+                    - -c
+                    - >-
+                      mkdir -p /tmp/k3mk-bundle &&
+                      printf '%s' "$$K3_MK_BUNDLE_B64" | base64 -d | tar -xz -C /tmp/k3mk-bundle &&
+                      exec bash /tmp/k3mk-bundle/k3_mk_engine.sh decode
+                  env:
+                    - name: ROLE_HOST_PREFIX
+                      value: ${WORKLOAD_NAME}-decode-0-
+                    - name: ROLE_HOST_DOMAIN
+                      value: ${WORKLOAD_NAME}
+                    - name: K3_MK_POINT
+                      value: "${K3_MK_POINT}"
+                    - name: K3_ENGINE_IMAGE
+                      value: "${K3_ENGINE_IMAGE}"
+                    - name: K3_MK_BUNDLE_B64
+                      value: "${K3_MK_BUNDLE_B64}"
+                    - name: POD_IP
+                      valueFrom:
+                        fieldRef:
+                          fieldPath: status.podIP
+                    - name: TPU_ACCELERATOR_TYPE
+                      value: tpu7x
+                    - name: TMPDIR
+                      value: /dev/shm
+                  ports:
+                    - containerPort: 8000
+                  resources:
+                    limits:
+                      google.com/tpu: "4"
+                    requests:
+                      google.com/tpu: "4"
+                  volumeMounts:
+                    - name: k3-checkpoint
+                      mountPath: /ckpt/k3
+                      readOnly: true
+              volumes:
+                - name: k3-checkpoint
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    readOnly: true
+                    volumeAttributes:
+                      bucketName: tpu-commons-ci
+                      mountOptions: "implicit-dirs,only-dir=moonshootai/kimi/k3"
+                      skipCSIBucketAccessCheck: "true"
+
+    # The AgentX lane's client, unchanged: chipless, on a worker-cpu node.
+    - name: client
+      dependsOn:
+        - name: prefill
+          status: Ready
+        - name: decode
+          status: Ready
+      replicas: 1
+      template:
+        spec:
+          parallelism: 1
+          completions: 1
+          activeDeadlineSeconds: 32400
+          completionMode: Indexed
+          backoffLimit: 0
+          template:
+            spec:
+              restartPolicy: Never
+              nodeSelector:
+                cloud.google.com/compute-class: worker-cpu
+              serviceAccountName: tpu-workload
+              containers:
+                - name: workload
+                  image: ${IMAGE}
+                  command: ["/bin/bash", "/workspace/vllm-torchtpu/.buildkite/kubernetes/k3_agentx_client_pod.sh"]
+                  env:
+                    - name: WORKLOAD_NAME
+                      value: ${WORKLOAD_NAME}
+                    # The config the engines serve; read here for the shape,
+                    # the point's concurrency and the row labels.
+                    - name: K3_PD_CONFIG
+                      value: kimi-k3-mk-tp32-1p1d-agentx
+                    - name: K3_MK_POINT
+                      value: "${K3_MK_POINT}"
+                    # Physical chips the pair holds: 4 hosts x 4 per slice, twice.
+                    - name: AGENTX_CHIPS
+                      value: "32"
+                    # No GSM8K quick check: the DSpark points accept drafts
+                    # without verifying them (synthetic acceptance), so their
+                    # answers are not the model's.
+                    - name: AGENTX_GSM8K_LIMIT
+                      value: "0"
+                    - name: ARTIFACTS_DIR
+                      value: perf_eval_results
+                    # On a chipless pod the torchtpu plugin makes vLLM's CLI
+                    # call torch.device("tpu"), and `import torch` auto-imports
+                    # torch_tpu, whose native init aborts without libtpu.
+                    - name: VLLM_PLUGINS
+                      value: ""
+                    - name: TORCH_DEVICE_BACKEND_AUTOLOAD
+                      value: "0"
+                    - name: PYTHONUNBUFFERED
+                      value: "1"
+                    - name: TMPDIR
+                      value: /tmp
+                  resources:
+                    requests:
+                      cpu: "12"
+                      memory: "32Gi"
+                      ephemeral-storage: "30Gi"
+                    limits:
+                      cpu: "12"
+                      memory: "32Gi"
+                      ephemeral-storage: "30Gi"
