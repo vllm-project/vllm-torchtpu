@@ -200,7 +200,25 @@ configuration, with DSpark K5, 40 layers and SWA128. It reuses the input file
 produced by `bench_cached_extend.py prepare` above and records its SHA256.
 The workload uses 128 distinct 65,536-token prompts and 512 output tokens each.
 
-Start a dedicated server (terminal 1):
+For an audited run, use the shared launcher after preparing inputs above:
+
+```bash
+export MODEL_PATH=/models/DeepSeek-V4.1-Flash
+python scripts/dsv41_bench/server_steps/run.py --scenario decode \
+  --input /data/dsv41-inputs.json --out /results/decode \
+  --cache-dir /cache/dsv41-decode --cache-mode cold
+```
+
+This compiles only buckets `[128,512]`: target verification (96 rows), draft
+inputs (80 rows) and bounded replay fit 128; chunked prefill uses 512. It keeps
+automatic KV sizing, disables both Tier2 caches and persists the JAX/vLLM/Tier3
+caches. Startup readiness, phase timings, compile/load counts and package/source
+identities are saved. Future runs may use `--cache-mode reuse` with that directory;
+the launcher rejects mismatched source/runtime/model/scenario identities. A
+populated cache is not proof of a hit; inspect `startup-phases.json` and logs.
+Do not reuse earlier cache directories without an identity file.
+
+For manual operation, start a dedicated server (terminal 1):
 
 ```bash
 export MODEL_PATH=/models/DeepSeek-V4.1-Flash
@@ -208,7 +226,7 @@ export PYTHONPATH="$PWD/scripts/dsv41_bench/server_steps${PYTHONPATH:+:$PYTHONPA
 TP=1 DP=8 CHUNK=512 MAX_SEQS=16 MAX_MODEL_LEN=66048 KV_BYTES=auto \
   bash scripts/dsv41_bench/serve_cached_prefill.sh \
   --worker-extension-cls server_step_worker.ServerStepWorker \
-  --compilation-config '{"compile_sizes":[16,128,512]}' \
+  --compilation-config '{"compile_sizes":[128,512]}' \
   2>&1 | tee /results/decode-server.log
 ```
 

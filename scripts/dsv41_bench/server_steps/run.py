@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import importlib.metadata
 import json
 import os
@@ -47,9 +48,18 @@ def main() -> None:
     parser.add_argument("--cache-dir", type=Path, required=True)
     parser.add_argument("--cache-mode", choices=["cold", "reuse"], required=True)
     parser.add_argument("--startup-timeout", type=float, default=3000)
-    parser.add_argument("--rounds", type=int, default=5)
+    parser.add_argument(
+        "--scenario", choices=["encoder_extend", "decode"], default="encoder_extend"
+    )
+    parser.add_argument("--rounds", type=int)
     parser.add_argument("--profile", action="store_true")
     args = parser.parse_args()
+    if args.rounds is None:
+        args.rounds = 1 if args.scenario == "decode" else 5
+    if args.rounds < 1:
+        parser.error("The integrated launcher requires at least one formal window")
+    if args.profile and args.scenario == "decode":
+        parser.error("Decode profiling must be captured separately from timing")
 
     def terminate(signum, frame):
         raise SystemExit(128 + signum)
@@ -82,7 +92,16 @@ def main() -> None:
     env["TORCH_TPU_TIER2_COMPILATION_CACHE"] = "disabled"
     env["TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE"] = "disabled"
     env["KV_BYTES"] = "auto"
-    env.update(TP="1", DP="8", CHUNK="2048", MAX_SEQS="1")
+    decode = args.scenario == "decode"
+    buckets = [128, 512] if decode else [128, 256, 2048]
+    env.update(
+        TP="1",
+        DP="8",
+        CHUNK="512" if decode else "2048",
+        MAX_SEQS="16" if decode else "1",
+    )
+    if decode:
+        env["MAX_MODEL_LEN"] = "66048"
     env["PYTHONPATH"] = str(here) + os.pathsep + env.get("PYTHONPATH", "")
     server_command = [
         "bash",
@@ -90,7 +109,7 @@ def main() -> None:
         "--worker-extension-cls",
         "server_step_worker.ServerStepWorker",
         "--compilation-config",
-        '{"compile_sizes":[128,256,2048]}',
+        json.dumps({"compile_sizes": buckets}),
     ]
     if env.get("ARTIFACT_LOCAL_DIR"):
         server_command += [
@@ -99,12 +118,14 @@ def main() -> None:
                 {
                     "profiler": "torch",
                     "torch_profiler_dir": str(
-                        Path(env["ARTIFACT_LOCAL_DIR"]) / "encoder_extend/profile"
+                        Path(env["ARTIFACT_LOCAL_DIR"]) / f"{args.scenario}/profile"
                     ),
                 }
             ),
         ]
     manifest = {
+        "scenario": args.scenario,
+        "compile_sizes": buckets,
         "cache_mode": args.cache_mode,
         "cache_before": before,
         "cache_dir": str(args.cache_dir),
@@ -116,6 +137,43 @@ def main() -> None:
         "startup_scope": "server launch through HTTP health readiness",
         "cache_hit_claim": "Inspect server logs; populated cache is not proof of hits",
     }
+    import vllm
+
+    def source_identity(root: Path) -> dict:
+        return {
+            "commit": subprocess.check_output(
+                ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
+            ).strip(),
+            "diff_sha256": hashlib.sha256(
+                subprocess.check_output(
+                    ["git", "-C", str(root), "diff", "HEAD", "--", "."]
+                )
+            ).hexdigest(),
+        }
+
+    model = Path(env["MODEL_PATH"])
+    identity = {
+        "scenario": args.scenario,
+        "compile_sizes": buckets,
+        "packages": manifest["packages"],
+        "torchtpu": source_identity(here.parents[2]),
+        "vllm": source_identity(Path(vllm.__file__).resolve().parent),
+        "model": str(model.resolve()),
+        "model_config_sha256": hashlib.sha256(
+            (model / "config.json").read_bytes()
+        ).hexdigest(),
+        "parallelism": "TP1/DP8/EP8/PP1 on one v7x-8 host",
+    }
+    identity_path = args.cache_dir / "benchmark-identity.json"
+    if args.cache_mode == "reuse":
+        if (
+            not identity_path.is_file()
+            or json.loads(identity_path.read_text()) != identity
+        ):
+            parser.error("Cache identity differs; use a new cold cache directory")
+    else:
+        identity_path.write_text(json.dumps(identity, indent=2) + "\n")
+    manifest["identity"] = identity
     (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     server = None
     started = time.monotonic()
@@ -155,11 +213,13 @@ def main() -> None:
             (args.out / "startup.json").write_text(json.dumps(timing, indent=2) + "\n")
             base = [
                 sys.executable,
-                str(here / "bench_cached_extend.py"),
+                str(here / ("bench_decode.py" if decode else "bench_cached_extend.py")),
                 "client",
                 "--input",
                 str(args.input),
             ]
+            if decode:
+                base += ["--server-log", str(args.out / "server.log")]
             with (args.out / "client-fixed.log").open("w") as client_log:
                 subprocess.run(
                     [

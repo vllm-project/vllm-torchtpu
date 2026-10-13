@@ -174,6 +174,7 @@ def client_main(argv: list[str]) -> None:
         ):
             raise ValueError("RPC did not configure all eight DP workers")
         log_offset = args.server_log.stat().st_size
+        audit_start = time.time_ns()
         try:
             responses = wave(prompts, scenario.output_tokens)
         finally:
@@ -181,6 +182,7 @@ def client_main(argv: list[str]) -> None:
             records = rpc("benchmark_end")
             (args.out / f"{label}-steps.json").write_text(json.dumps(records))
             post("/resume", {})
+        audit_end = time.time_ns()
         after = wait_metrics(before)
         (args.out / f"{label}-responses.json").write_text(json.dumps(responses))
         delta = {k: after[k] - before.get(k, 0) for k in after if k.endswith("_total")}
@@ -217,6 +219,7 @@ def client_main(argv: list[str]) -> None:
                 f"Compilation contaminated formal round: {compile_lines[:3]}"
             )
         report = summarize(records["results"], args.scenario)
+        report["audit_wall_interval_ns"] = [audit_start, audit_end]
         report["compilation_log_matches"] = compile_lines
         report["warmup"] = round_id == 0 and not args.single_window
         (args.out / f"{label}-summary.json").write_text(json.dumps(report, indent=2))
