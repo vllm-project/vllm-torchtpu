@@ -9,6 +9,7 @@
 # - Typed spec_from_tpu_info(info: Any) instead of suppressing pyrefly,
 #   populated TpuSpec.num_lanes from get_tpu_info(), and cached detect_spec().
 # - v7 fixed-m VMEM fraction 0.6, which caps block_q at 4096 for head_dim 128.
+# - Only v7 counts as calibrated in _KNOWN_GENERATIONS (was v6 and v7).
 # - block_kv is the whole K/V extent when that is shorter than
 #   safe_kv_block, and sequences up to one MXU tile use one
 #   full-extent block instead of raising.
@@ -74,11 +75,13 @@ _DEFAULT_USABLE_VMEM_FRACTION = 0.93
 # Per-generation, sweep-pinned like safe_kv_block; no entry = normal fraction.
 _FIXED_M_KERNEL_MODES = frozenset({"fixedm"})
 # v7x: fixed-m measured fastest at block_q 3072-4096 at 32K and 75K tokens
-# (40 heads x 128); 0.6 caps block_q at 4096 for head_dim 128.
+# (40 heads x 128); 0.6 caps block_q at 4096 for head_dim 128. The v6 entry
+# is inherited from the original implementation and not measured here.
 _FIXED_M_VMEM_FRACTION: dict[int, float] = {6: 0.5, 7: 0.6}
 
-# Sweep-verified generations (no "uncalibrated" warning).
-_KNOWN_GENERATIONS = frozenset({6, 7})
+# Generations whose block sizes were measured on hardware (no "uncalibrated"
+# warning). Only v7x has been.
+_KNOWN_GENERATIONS = frozenset({7})
 
 
 @dataclasses.dataclass(frozen=True)
