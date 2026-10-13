@@ -57,6 +57,9 @@ def _check(out, ref, max_rel=3e-2, mean_rel=1e-2):
         (2, 2600, 2600, 4, 2, 128, True),
         # Cross-attention: K/V fits one block (online path only).
         (1, 3000, 512, 4, 4, 128, True),
+        # Wan 720p single-device cross-attention: the largest query block,
+        # sized by the VMEM cap.
+        (1, 75600, 512, 1, 1, 128, True),
         # Narrow heads use the transposing layout.
         (1, 2304, 2304, 2, 2, 64, True),
     ],

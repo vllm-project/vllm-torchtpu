@@ -10,6 +10,8 @@
 #   populated TpuSpec.num_lanes from get_tpu_info(), and cached detect_spec().
 # - v7 fixed-m VMEM fraction 0.6, which caps block_q at 4096 for head_dim 128.
 # - Only v7 counts as calibrated in _KNOWN_GENERATIONS (was v6 and v7).
+# - Added vmem_footprint_bytes(), a VMEM upper bound fitted on v7x, and cap
+#   block_q so it fits physical VMEM.
 # - block_kv is the whole K/V extent when that is shorter than
 #   safe_kv_block, and sequences up to one MXU tile use one
 #   full-extent block instead of raising.
@@ -45,7 +47,9 @@ Derivation of the other knobs
 * ``block_q`` (above): cost-model search over the VMEM-feasible range, choosing
   the minimum padded-q tile; ties broken toward the larger block_q (fewer grid
   rows). The VMEM ceiling is the f32 QK^T score tile,
-  ``block_kv_compute * block_q * 4 + operands <= usable_fraction * VMEM``.
+  ``block_kv_compute * block_q * 4 + operands <= usable_fraction * VMEM``,
+  and the whole kernel's footprint (``vmem_footprint_bytes``) must fit
+  physical VMEM.
 
 Asymmetric Q / K/V extents
 --------------------------
@@ -69,6 +73,9 @@ _logger = logging.getLogger(__name__)
 # safe_kv_block 2048). Re-verify per generation via a sweep.
 _SAFE_KV_BLOCK_MULTIPLE = 8
 _DEFAULT_USABLE_VMEM_FRACTION = 0.93
+# VMEM kept free under vmem_footprint_bytes(): Mosaic reserves some for
+# itself (64 MiB on v7x reports 63.94 MiB usable).
+_VMEM_RESERVE_BYTES = 2**20
 
 # Fixed-m drops the VPU softmax rescale that hid DMA behind compute, so its
 # score tile must double-buffer to hide DMA -> fits <= VMEM/2 (fraction ~0.5).
@@ -208,6 +215,36 @@ def score_tile_bytes(
     return score_f32 + qkv_2x + output_f32 + max_sum_scratch
 
 
+def vmem_footprint_bytes(
+    block_q: int,
+    block_kv_compute: int,
+    head_dim: int,
+    block_kv: int,
+) -> int:
+    """Upper bound on the VMEM one kernel instance allocates, in bytes.
+
+    Unlike ``score_tile_bytes`` (the performance budget), this has to cover
+    every buffer Mosaic allocates. Fitted to the VMEM Mosaic reports on v7x
+    (head_dim 64 and 128, block_kv 512 to 2048, block_q 2048 to 18944). Per
+    query row: the f32 score tile (``4 * block_kv_compute``, held in
+    register spill slots) plus the double-buffered bf16 q and output blocks
+    and the f32 o, m and l scratch (at most ``13 * head_dim``). Plus the
+    double-buffered bf16 K and V blocks. It is 0.2 to 2.7 MiB above every
+    allocation Mosaic reported.
+
+    Args:
+      block_q: Query block size.
+      block_kv_compute: MXU compute block size (score tile rows).
+      head_dim: Per-head feature dimension.
+      block_kv: Key/value memory block size.
+
+    Returns:
+      The VMEM upper bound in bytes.
+    """
+    per_query_row = 4 * block_kv_compute + 13 * head_dim
+    return block_q * per_query_row + 8 * block_kv * head_dim
+
+
 def _vmem_max_block_q(
     seq_len: int,
     block_kv_compute: int,
@@ -216,8 +253,14 @@ def _vmem_max_block_q(
     bytes_per_element: int,
     spec: TpuSpec,
 ) -> int:
-    """Largest block_q (multiple of mxu_dim, <= seq) whose score tile fits."""
+    """Largest block_q (multiple of mxu_dim, <= seq) that fits VMEM.
+
+    The score tile has to fit the performance budget (``score_tile_bytes``
+    within ``usable_vmem_fraction``) and the whole kernel has to fit physical
+    VMEM (``vmem_footprint_bytes``, less ``_VMEM_RESERVE_BYTES``).
+    """
     budget = int(spec.vmem_bytes * spec.usable_vmem_fraction)
+    hard_limit = spec.vmem_bytes - _VMEM_RESERVE_BYTES
     best = spec.mxu_dim
     block_q = spec.mxu_dim
     while block_q <= seq_len:
@@ -226,6 +269,8 @@ def _vmem_max_block_q(
                 block_q, block_kv_compute, head_dim, block_kv, bytes_per_element
             )
             <= budget
+            and vmem_footprint_bytes(block_q, block_kv_compute, head_dim, block_kv)
+            <= hard_limit
         )
         if not fits:
             break

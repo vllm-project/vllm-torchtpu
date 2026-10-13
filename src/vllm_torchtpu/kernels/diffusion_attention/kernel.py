@@ -120,9 +120,10 @@ def fixed_m_operands(
 def _splash_vmem_limit_bytes() -> int:
     """Mosaic scoped-VMEM ceiling per pallas_call, adapted to the device.
 
-    Set to physical core VMEM (720p cross-attention tiles need ~57 MiB, above
+    Set to physical core VMEM: the block sizes autotune_block_sizes() picks
+    may need up to physical VMEM less 1 MiB (see vmem_footprint_bytes), above
     the 32 MiB Mosaic default on libtpu >= 0.0.41; the XLA vmem flag does not
-    govern Pallas). Scales across generations.
+    govern Pallas. Scales across generations.
 
     Returns:
       The scoped-VMEM limit in bytes.
