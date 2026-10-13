@@ -584,6 +584,7 @@ class RaggedScheduleBoundTest(parameterized.TestCase):
         max_num_tokens=None,
         start_seq_idx=0,
         end_seq_idx=None,
+        static_q_len=None,
     ):
         num_seqs = len(cu_q_lens) - 1
         return metadata.compute_metadata(
@@ -598,7 +599,7 @@ class RaggedScheduleBoundTest(parameterized.TestCase):
             pages_per_seq=self.PAGES_PER_SEQ,
             page_size=self.PAGE_SIZE,
             max_num_tokens=max_num_tokens or int(cu_q_lens[-1]),
-            static_q_len=None,
+            static_q_len=static_q_len,
             seq_batch_size=seq_batch_size,
             chunk_token_start=tuple(starts),
             chunk_tokens=chunk_tokens,
@@ -760,6 +761,93 @@ class RaggedScheduleBoundTest(parameterized.TestCase):
             self._meta(*args, max_num_tokens=cu_q_lens[-1]),
             self._expected_num_steps(*args),
         )
+
+    @parameterized.product(chunk_tokens=(2, 6, 12), seq_batch_size=(1, 4))
+    def test_decode_pass_with_seams_inside_tiles(self, chunk_tokens, seq_batch_size):
+        """static_q_len=1 is bounded by total_max_bq + num_chunks - 1.
+
+        64 one-token sequences under chunks narrower than a tile, so seams land
+        inside tiles; every seam must cost at most one extra bq block.
+        """
+        cu_q_lens = list(range(65))
+        starts = range(0, 96, chunk_tokens)
+        args = (cu_q_lens, starts, chunk_tokens, 1, seq_batch_size)
+        self._assert_fits(
+            self._meta(*args, max_num_tokens=96, static_q_len=1),
+            self._expected_num_steps(*args),
+        )
+
+
+class ServingShapeSmemTest(parameterized.TestCase):
+    """GLM-5.2 AgentX at concurrency 32, --max-num-seqs=64, against v7x smem.
+
+    1M context over 256-token pages at DCP=16 is 256 pages per sequence. The
+    three passes are the ones `streamindex_topk` runs with the indexer's
+    `num_queries_per_block=(1, 128, 128)`, `num_kv_pages_per_block=(2, 2, 2)`
+    and `decode_req_batch_size=4`, chunked by TPU_STREAMIDX_CHUNK_TOKENS=256.
+    `get_tpu_info` is pinned to v7x so the real smem check runs on CPU too.
+    """
+
+    NUM_SEQS = 64
+    PAGES_PER_SEQ = 256
+    PAGE_SIZE = 256
+    CHUNK_TOKENS = 256
+    SMEM_BYTES = 1024 * 1024
+
+    def setUp(self):
+        super().setUp()
+        v7x = mock.Mock(smem_capacity_bytes=self.SMEM_BYTES, num_lanes=128)
+        patcher = mock.patch.object(metadata.pltpu, "get_tpu_info", return_value=v7x)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _passes(self, num_decode, num_total):
+        decode_end = num_decode // 4 * 4
+        return (
+            ("decode", 0, decode_end, dict(bq_sz=1, static_q_len=1, seq_batch_size=4)),
+            ("decode_rem", decode_end, num_decode, dict(bq_sz=1, static_q_len=1)),
+            ("mixed", num_decode, num_total, dict(bq_sz=128, static_q_len=None)),
+        )
+
+    @parameterized.named_parameters(
+        ("all_decode", 32, 0),
+        ("decode_tail", 31, 0),
+        ("decode_and_prefill", 31, 1),
+    )
+    def test_every_token_bucket_compiles_within_smem(self, num_decode, num_prefill):
+        num_total = num_decode + num_prefill
+        for max_num_tokens in [2**i for i in range(5, 13)]:
+            q_lens = [1] * num_decode
+            q_lens += [max_num_tokens - num_decode] * num_prefill
+            q_lens += [0] * (self.NUM_SEQS - num_total)
+            cu_q_lens = np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int32)
+            if max_num_tokens % self.CHUNK_TOKENS:
+                starts, chunk_tokens = (None,), max_num_tokens
+            else:
+                starts = tuple(range(0, max_num_tokens, self.CHUNK_TOKENS))
+                chunk_tokens = self.CHUNK_TOKENS
+            for name, start, end, block in self._passes(num_decode, num_total):
+                with self.subTest(tokens=max_num_tokens, pass_=name):
+                    meta_ = metadata.compute_metadata(
+                        seq_lens=jnp.full((self.NUM_SEQS,), 500_000, jnp.int32),
+                        cu_q_lens=jnp.array(cu_q_lens),
+                        start_seq_idx=start,
+                        end_seq_idx=end,
+                        bkv_sz=2 * self.PAGE_SIZE,
+                        pages_per_seq=self.PAGES_PER_SEQ,
+                        page_size=self.PAGE_SIZE,
+                        max_num_tokens=max_num_tokens,
+                        chunk_token_start=starts,
+                        chunk_tokens=chunk_tokens,
+                        cp_size=16,
+                        interleave_c=4,
+                        **block,
+                    )
+                    max_steps = meta_.bq_idx.shape[0]
+                    used = int(np.array(meta_.num_steps).sum())
+                    self.assertLessEqual(used, max_steps)
+                    page_table = self.NUM_SEQS * self.PAGES_PER_SEQ * 4
+                    self.assertLess(3 * max_steps * 4 + page_table, self.SMEM_BYTES)
 
 
 class SmemBudgetCheckTest(absltest.TestCase):
