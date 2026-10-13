@@ -77,9 +77,12 @@ class TpuFlashAttentionImpl(TpuSDPAImpl):
         attn_metadata: Any | None,
     ) -> bool:
         attn_mask = getattr(attn_metadata, "attn_mask", None)
+        # TODO: Revisit this fallback once torch_tpu SDPA lets callers select its
+        # flash kernel and supports masks; until then masked, causal, non-bf16 and
+        # uneven-GQA calls take its math path.
+        #
         # torch_tpu's SDPA picks its Mosaic flash kernel opaquely and has no
-        # mask support, so masked, causal, non-bf16 and uneven-GQA calls stay
-        # on the SDPA path.
+        # mask support.
         return (
             self.causal
             or attn_mask is not None
