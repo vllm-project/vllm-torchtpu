@@ -276,3 +276,10 @@ steps:
           queue: "tpu_v7x_2_queue"
         commands:
           - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_compilation_cache_e2e.sh"
+
+      - label: "Integration: startup-e2e"
+        key: "integration_startup_e2e"
+        agents:
+          queue: "tpu_v7x_2_queue"
+        commands:
+          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_startup_e2e.sh"
