@@ -83,16 +83,8 @@ class Qwen3_5MTP(upstream.Qwen3_5MTP):
 
     supports_pp: ClassVar[Literal[True]] = True
 
-    @property
-    def make_empty_intermediate_tensors(self):
-        return self.model.make_empty_intermediate_tensors
-
 
 class Qwen3_5MoeMTP(upstream.Qwen3_5MoeMTP):
     """The MoE draft, admitted under pipeline parallelism; see `Qwen3_5MTP`."""
 
     supports_pp: ClassVar[Literal[True]] = True
-
-    @property
-    def make_empty_intermediate_tensors(self):
-        return self.model.make_empty_intermediate_tensors
