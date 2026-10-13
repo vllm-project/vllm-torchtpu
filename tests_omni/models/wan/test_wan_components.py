@@ -78,6 +78,8 @@ class TestWanFusedQKNormRoPEOnTpu:
                 device="tpu", dtype=torch.bfloat16
             )
         with torch.no_grad():
+            for p in attn.parameters():
+                torch.nn.init.normal_(p, std=0.02)
             attn.norm_q.weight.copy_(
                 torch.linspace(0.5, 1.5, 256, device="tpu", dtype=torch.bfloat16)
             )
@@ -85,16 +87,17 @@ class TestWanFusedQKNormRoPEOnTpu:
                 torch.linspace(1.5, 0.5, 256, device="tpu", dtype=torch.bfloat16)
             )
 
-        hidden = torch.randn(2, 128, 256, device="tpu", dtype=torch.bfloat16)
-        cos = torch.randn(1, 128, 1, 64, device="tpu", dtype=torch.bfloat16)
-        sin = torch.randn(1, 128, 1, 64, device="tpu", dtype=torch.bfloat16)
-        rotary_emb = (cos, sin)
+            hidden = torch.randn(2, 128, 256, device="tpu", dtype=torch.bfloat16)
+            cos = torch.randn(1, 128, 1, 64, device="tpu", dtype=torch.bfloat16)
+            sin = torch.randn(1, 128, 1, 64, device="tpu", dtype=torch.bfloat16)
+            rotary_emb = (cos, sin)
 
-        assert can_fuse_qk_norm_rope(attn, hidden, rotary_emb)
-        fused_out = attn(hidden, rotary_emb)
-        unpatched_out = WanSelfAttention._tpu_orig_forward(attn, hidden, rotary_emb)
+            assert can_fuse_qk_norm_rope(attn, hidden, rotary_emb)
+            fused_out = attn(hidden, rotary_emb)
+            unpatched_out = WanSelfAttention._tpu_orig_forward(attn, hidden, rotary_emb)
 
         assert fused_out.device.type == "tpu"
+        assert torch.isfinite(fused_out).all()
         torch.testing.assert_close(
             fused_out.cpu().float(),
             unpatched_out.cpu().float(),
