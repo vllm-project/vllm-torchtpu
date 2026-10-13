@@ -30,11 +30,15 @@ Because none of these tests dispatch a kernel, they run the same way on any
 TPU generation and on CPU.
 """
 
+import os
+from unittest import mock
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 from absl.testing import parameterized
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     KVCacheLayout,
     KVCacheType,
@@ -277,3 +281,32 @@ class SparseMlaAttentionLayoutValidationTest(parameterized.TestCase):
                 NOPE_SPEC,
                 ROPE_SC_SPEC,
             )
+
+
+class DcpMlaTopkCapTest(parameterized.TestCase):
+    """The capped sparse-MLA defaults #1510 shipped for GLM-5.2 AgentX: a
+    512 cap from DCP16 and a 256-token gather chunk. The port first kept
+    main's 0 (off), which left the DCP16 path slower than #1510."""
+
+    def _env(self, **values):
+        """Patch the real environment: `envs` reads it lazily, so setting the
+        module attribute would outlive the test."""
+        env = {k: v for k, v in os.environ.items() if k not in values}
+        env.update({k: v for k, v in values.items() if v is not None})
+        return mock.patch.dict(os.environ, env, clear=True)
+
+    @parameterized.parameters((1, 0), (2, 0), (8, 0), (16, 512), (32, 512))
+    def test_default_is_512_from_dcp16(self, dcp_size, cap):
+        with self._env(TPU_DCP_MLA_TOPK_CAP=None):
+            self.assertEqual(attention_interface.dcp_mla_topk_cap(dcp_size), cap)
+
+    @parameterized.parameters(2, 16)
+    def test_explicit_value_applies_at_any_dcp_size(self, dcp_size):
+        with self._env(TPU_DCP_MLA_TOPK_CAP="512"):
+            self.assertEqual(attention_interface.dcp_mla_topk_cap(dcp_size), 512)
+        with self._env(TPU_DCP_MLA_TOPK_CAP="0"):
+            self.assertEqual(attention_interface.dcp_mla_topk_cap(dcp_size), 0)
+
+    def test_default_chunk_is_256(self):
+        with self._env(TPU_DCP_MLA_TOPK_CAP_CHUNK=None):
+            self.assertEqual(envs.TPU_DCP_MLA_TOPK_CAP_CHUNK, 256)

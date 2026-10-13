@@ -1008,6 +1008,20 @@ def sparse_mla_attention(
     return new_kv_cache_nope, new_kv_cache_rope, output
 
 
+def dcp_mla_topk_cap(dcp_size: int) -> int:
+    """`TPU_DCP_MLA_TOPK_CAP` as it applies at `dcp_size`; 0 is uncapped.
+
+    The default (-1) is auto: 512 from DCP16, as #1510 shipped it for GLM-5.2
+    AgentX, and off below. A rank owns ~topk/dcp_size slots, so a cap of 512
+    rarely binds at DCP16 and overflows every row at DCP2 (~30% slower
+    prefill there). An explicit value applies at any DCP size.
+    """
+    topk_cap = envs.TPU_DCP_MLA_TOPK_CAP
+    if topk_cap < 0:
+        return 512 if dcp_size >= 16 else 0
+    return topk_cap
+
+
 def sparse_mla_attention_dcp(
     ql_nope: jax.Array,
     q_pe: jax.Array,
@@ -1163,11 +1177,7 @@ def sparse_mla_attention_dcp(
             q, split_kwargs = jnp.concatenate([ql_nope, q_pe], axis=-1), {}
         # The capped path (and its chunk) applies only where the kernel takes
         # it: SparseCore caches and a top-k wider than the cap.
-        topk_cap = envs.TPU_DCP_MLA_TOPK_CAP
-        if topk_cap < 0:
-            # Auto: a rank owns ~topk/dcp_size slots, so a cap of 512 rarely
-            # binds at DCP16 and overflows every row at DCP2.
-            topk_cap = 512 if dcp_size >= 16 else 0
+        topk_cap = dcp_mla_topk_cap(dcp_size)
         if not (
             topk_cap
             and cache_layout == sparse_mla_kernel.SPARSECORE_CACHE_LAYOUT
