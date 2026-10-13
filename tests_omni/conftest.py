@@ -132,12 +132,14 @@ class OmniRunner:
         return self
 
     def close(self, *_: Any) -> None:
-        if self.omni is not None:
-            self.omni.close()
-            self.omni = None
-
-        self._cleanup_process()
-        cleanup_test_environment()
+        omni = self.omni
+        self.omni = None
+        try:
+            if omni is not None:
+                omni.close()
+        finally:
+            self._cleanup_process()
+            cleanup_test_environment()
 
     shutdown = __exit__ = close
 
