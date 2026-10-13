@@ -406,6 +406,20 @@ def kernel(
         """[n_tok*H, D] head-minor rows -> [H*n_tok, D] head-major rows."""
         return bq_rows.transpose(1, 0, 2).reshape(num_q_heads * n_tok, head_dim)
 
+    # Tokens per head in the cached head-major q block of the per-step path.
+    # Whole 8-row sublane groups keep each head's [tokens, bkv] slice of q @ k
+    # vreg-aligned: at the 7-token verify window a head straddles two groups,
+    # and realigning every slice costs more VPU work than the reduction itself.
+    # The zero pad rows are scored and dropped.
+    hm_tok = align_to(bq_sz, 8)
+
+    def pad_tokens(bq_rows, n_tok):
+        """[n_tok, H, D] -> [hm_tok, H, D], zero rows appended."""
+        if n_tok == hm_tok:
+            return bq_rows
+        pad = jnp.zeros((hm_tok - n_tok, *bq_rows.shape[1:]), bq_rows.dtype)
+        return jnp.concatenate([bq_rows, pad], axis=0)
+
     def reduce_heads(bq_rows, bkv, bq_weights, head_major=False):
         """relu(q @ k) weighted-summed over heads.
 
@@ -439,14 +453,19 @@ def kernel(
             return st.sum(axis=1)
 
         # Prefill. Transpose to head-major if needed.
-        rows_hm = bq_rows if head_major else transpose_to_head_major(bq_rows, n_tok)
-        st = qk(rows_hm).reshape(num_q_heads, n_tok, -1)
+        if head_major:
+            # The cached block carries `hm_tok` tokens per head.
+            rows_hm, rows_tok = bq_rows, hm_tok
+            w = jnp.pad(w, ((0, rows_tok - n_tok), (0, 0)))
+        else:
+            rows_hm, rows_tok = transpose_to_head_major(bq_rows, n_tok), n_tok
+        st = qk(rows_hm).reshape(num_q_heads, rows_tok, -1)
         acc = jnp.maximum(st[0], 0.0) * w[:, 0:1]
         # Loop over heads 1..H-1, accumulating the sum of relu(st[h] * w[:, h]).
         for h in range(1, num_q_heads):
             relu_st = jnp.maximum(st[h], 0.0)  # relu
             acc = acc + relu_st * w[:, h : h + 1]  # fused multiply-add.
-        return acc
+        return acc[:n_tok]
 
     def compute_scores(
         bq_vec,
@@ -504,7 +523,9 @@ def kernel(
             # == 0` marks exactly the first step of each new q block.
             @pl.when(bkv_idx == 0)
             def _():
-                q_hm_ref[...] = transpose_to_head_major(q_vmem[...], bq_sz)
+                q_hm_ref[...] = transpose_to_head_major(
+                    pad_tokens(q_vmem[...], bq_sz), hm_tok
+                )
 
             bq_vec = [q_hm_ref[...]]
         else:
@@ -790,7 +811,7 @@ def kernel(
     elif seq_batch_size == 1 and bq_sz > 1:
         pl.run_scoped(
             _run_all,
-            pltpu.VMEM((num_q_heads * bq_sz, head_dim), q_hbm_ref.dtype),
+            pltpu.VMEM((num_q_heads * hm_tok, head_dim), q_hbm_ref.dtype),
         )
     else:
         _run_all()
