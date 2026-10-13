@@ -45,10 +45,13 @@ class _Ring:
             return tuple(x.clone() for x in self.slots[((rank - 1) % self.size, pos)])
 
 
-def _build_stages(monkeypatch, template, size=8):
+def _build_stages(monkeypatch, template, size=8, async_handoff=False):
     """``size`` PPWave instances on CPU sharing one fake ring."""
     ring = _Ring(size)
     current = {}
+    monkeypatch.setenv("TPU_PP_ASYNC_HANDOFF", "1" if async_handoff else "0")
+    monkeypatch.setattr(pp_wave, "_flush", lambda tensors: None)
+    monkeypatch.setattr(pp_wave, "_wait", lambda tensors: None)
     monkeypatch.setattr(pp_wave, "get_or_create_pp_mesh", lambda: None)
     monkeypatch.setattr(
         pp_wave,
@@ -86,6 +89,14 @@ def _template(side: bool):
 def stages(request, monkeypatch):
     """Eight stages, with and without a side tensor on each hand-off."""
     ring, waves = _build_stages(monkeypatch, _template(request.param))
+    return ring, waves
+
+
+@pytest.fixture
+def async_stages(monkeypatch):
+    """Eight stages whose first stage launches from its helper thread."""
+    ring, waves = _build_stages(monkeypatch, _template(True), async_handoff=True)
+    assert waves[0].async_handoff and not any(w.async_handoff for w in waves[1:])
     return ring, waves
 
 
@@ -198,6 +209,42 @@ def test_random_forwards_and_pushes_deliver_every_forward(stages):
     assert len({w.launches for w in waves}) == 1
     assert waves[0].launches == 1 + moves + events.count(SETTLE) * last
     assert all(w.bursts == events.count(SETTLE) for w in waves)
+
+
+def test_async_first_stage_delivers_every_forward(async_stages):
+    ring, waves = async_stages
+    rng = random.Random(11)
+    events = _events(rng, 12, len(waves))
+    results = _run(waves, events)
+    forwards = [e for e in events if e is not None and e != SETTLE]
+    assert len(results) == len(forwards)
+    last = waves[-1].rank
+    for g, rows, h, r, extra in results:
+        assert rows == forwards[g]
+        assert torch.equal(h, torch.full((rows, HIDDEN), g + last + 0.5))
+        assert torch.equal(extra, torch.full((rows, SIDE_WIDTH), g, dtype=torch.int32))
+    moves = len(events) - events.count(SETTLE)
+    assert len({w.launches for w in waves}) == 1
+    assert waves[0].launches == 1 + moves + events.count(SETTLE) * last
+    # Every queued launch was issued and consumed.
+    assert waves[0]._async_pending == 0 and waves[0]._async_out is None
+
+
+def test_async_first_stage_reports_a_failed_launch(async_stages):
+    _, waves = async_stages
+    w = waves[0]
+
+    def boom(carried):
+        raise ValueError("ring down")
+
+    w._launch_blocking = boom
+    w.burst_open = True
+    w.burst_launches = 1
+    w._launch_async(w.zeros)
+    with pytest.raises(RuntimeError, match="hand-off thread failed") as info:
+        w._async_wait()
+    assert isinstance(info.value.__cause__, ValueError)
+    assert w._async_wait() is None
 
 
 def test_pushes_alone_carry_a_lone_forward_to_the_last_stage(stages):
