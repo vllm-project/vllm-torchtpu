@@ -64,7 +64,7 @@
 #     K3_DURATION          default 1800      (measurement window per point, seconds)
 #     K3_GSM8K_LIMIT       default 100       (0 = skip the probe)
 #     K3_GSM8K_CONC        default 8         (comma list = one GSM8K run per value)
-#     K3_IX_REF            default empty     (the pin in agentx_client.sh, which is a full
+#     K3_IX_REF            default empty     (the pin in sweep_lib.sh, which is a full
 #                                              40-character SHA: an abbreviated one cannot be
 #                                              fetched. Set it to override that pin.)
 #     K3_GCS_ROOT          default empty     (no GCS copy; artifacts only)

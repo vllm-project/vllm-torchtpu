@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -32,18 +33,18 @@ from vllm_torchtpu.kernels.gdn.v3 import (
 
 def inner_kernel(
     # Inputs.
-    qkv_slot_ref: jax.Array,  # [seq, chunk, 1, dim_size]
-    b_slot_ref: jax.Array,  # [seq, chunk, 1, num_v_heads]
-    a_slot_ref: jax.Array,  # [seq, chunk, 1, num_v_heads]
-    conv_state_slot_ref: jax.Array,  # [seq, prev_kernel_size, 1, dim_size]
-    recurrent_slot_ref: jax.Array,  # [seq, num_v_heads, kq_head, v_head]
+    qkv_slot_ref: jax.Ref,  # [seq, chunk, 1, dim_size]
+    b_slot_ref: jax.Ref,  # [seq, chunk, 1, num_v_heads]
+    a_slot_ref: jax.Ref,  # [seq, chunk, 1, num_v_heads]
+    conv_state_slot_ref: jax.Ref,  # [seq, prev_kernel_size, 1, dim_size]
+    recurrent_slot_ref: jax.Ref,  # [seq, num_v_heads, kq_head, v_head]
     # Outputs.
-    out_slot_ref: jax.Array,  # [seq * chunk, num_v_heads, v_head]
+    out_slot_ref: jax.Ref,  # [seq * chunk, num_v_heads, v_head]
     # Scratches.
     metadata_ref: memory_ref.MetadataRef,
     weights_ref: memory_ref.WeightRefs,
-    carry_conv_scratch_ref: jax.Array | None,
-    carry_recurrent_scratch_ref: jax.Array | None,
+    carry_conv_scratch_ref: jax.Ref | None,
+    carry_recurrent_scratch_ref: jax.Ref | None,
     *,
     cfg: config.GDNConfig,
     p_id: jax.Array | None = None,
@@ -142,13 +143,6 @@ def inner_kernel(
 
     # Apply activation function.
     qkv_out_compact = jax.nn.silu(qkv_out_compact)
-    if cfg.is_kda and cfg.window_size > 1:
-        # The one-token K3 decode kernel stores the post-SiLU activation in
-        # the model activation dtype before promoting it for the recurrent
-        # math. Preserve that numerical contract for a fused verify window;
-        # otherwise its target logits can drift solely because the KDA window
-        # keeps this intermediate in fp32.
-        qkv_out_compact = qkv_out_compact.astype(cfg.dtypes.act_out).astype(jnp.float32)
 
     # Step 2: GDN.
 
@@ -477,6 +471,7 @@ def fused_conv1d_gdn(
         )
     else:
         assert state_source is None
+        assert conv_state is not None and recurrent_state is not None
         conv_out_dtype = conv_state.dtype
         recurrent_out_dtype = recurrent_state.dtype
         conv_state = conv_state.astype(jnp.float32)
@@ -599,8 +594,8 @@ def fused_conv1d_gdn(
     # TODO(kyuyeunk): To eliminate runtime cost, move this logic into model
     # loading stage.
     if not pooled:
-        conv_state_shape = conv_state.shape
-        conv_state = conv_state.reshape(-1, kernel_size - 1, 1, dim)
+        conv_state_shape = cast(jax.Array, conv_state).shape
+        conv_state = cast(jax.Array, conv_state).reshape(-1, kernel_size - 1, 1, dim)
     conv_weight = conv_weight.swapaxes(0, 2).astype(jnp.float32)
     conv_bias = conv_bias.astype(jnp.float32) if conv_bias is not None else None
 
@@ -649,7 +644,9 @@ def fused_conv1d_gdn(
                 act_out=act_out_dtype,
                 compute=compute_precision,
                 recurrent_state=(
-                    jnp.float32.dtype if pooled else in_recurrent_state.dtype
+                    jnp.float32.dtype
+                    if pooled
+                    else cast(jax.Array, in_recurrent_state).dtype
                 ),
                 conv_state=(jnp.float32.dtype if pooled else in_conv_state.dtype),
             ),

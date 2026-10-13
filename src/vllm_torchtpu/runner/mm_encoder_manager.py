@@ -1,3 +1,17 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from collections.abc import Hashable
 from typing import Any, cast
 
 import torch
@@ -166,7 +180,12 @@ class MMEncoderManager(EncoderCudaGraphManager):
         return padded
 
     @torch.no_grad()
-    def _capture_budget_graph(self, token_budget: int, path: str = "default") -> None:
+    def _capture_budget_graph(
+        self,
+        token_budget: int,
+        path: str = "default",
+        axis_keys: tuple[Hashable, ...] = (),
+    ) -> None:
         """Primes the XLA cache for a specific budget bucket."""
         template = self.budget_templates[path][token_budget]
 
@@ -175,6 +194,7 @@ class MMEncoderManager(EncoderCudaGraphManager):
         try:
             out = self._compiled_budget_forward(dict(template), path=path)
             synchronize_tensors(out, wait=True)
+            # pyrefly: ignore[unsupported-operation]
             self._get_graph_set(path)[token_budget] = template
         except Exception as e:
             logger.warning(
@@ -191,6 +211,7 @@ class MMEncoderManager(EncoderCudaGraphManager):
         mm_kwargs: dict[str, Any],
         token_budget: int,
         path: str = "default",
+        axis_keys: tuple[Hashable, ...] = (),
         *,
         allow_eager_fallback: bool = True,
     ) -> torch.Tensor | None:
@@ -308,9 +329,12 @@ class MMEncoderManager(EncoderCudaGraphManager):
             if step < len(batches):
                 assert mm_kwargs is not None
                 indices, _ = batches[step]
-                kwargs = self._select_items(mm_kwargs, indices)
+                kwargs, axis_keys = self._select_items(mm_kwargs, indices)
                 output = self._run_budget_graph(
-                    kwargs, budget, allow_eager_fallback=False
+                    kwargs,
+                    budget,
+                    axis_keys=axis_keys,
+                    allow_eager_fallback=False,
                 )
                 assert output is not None
                 self.model.postprocess_encoder_output(

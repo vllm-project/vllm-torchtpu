@@ -330,12 +330,19 @@ def test_rejection_sampler_refuses_argmax_for_sampling():
 def test_log_step_path_logs_each_path_once():
     # Captured on the "vllm" logger at its configured level: a record that
     # does not reach it never reaches the server log either.
-    vllm_logger._print_info_once.cache_clear()
+    if hasattr(vllm_logger, "_print_info_once"):
+        vllm_logger._print_info_once.cache_clear()
     records = []
     handler = logging.Handler()
     handler.emit = records.append
     logger = logging.getLogger("vllm")
+    # Another test may have raised the level or called logging.disable();
+    # either drops the record before any handler runs.
+    old_level = logger.level
+    old_disable = logging.root.manager.disable
     logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+    logging.disable(logging.NOTSET)
     try:
         # The runner's warmup steps hold only synthetic "__..__" requests.
         greedy_top_tokens.log_step_path(True, ["__spec_warmup_0__", None])
@@ -345,6 +352,8 @@ def test_log_step_path_logs_each_path_once():
             greedy_top_tokens.log_step_path(is_spec_step, ["__spec_warmup_1__", "r0"])
     finally:
         logger.removeHandler(handler)
+        logger.setLevel(old_level)
+        logging.disable(old_disable)
     assert [r.getMessage() for r in records] == [
         "TPU_GREEDY_TOP_TOKENS: a speculative verify step took the top tokens",
         "TPU_GREEDY_TOP_TOKENS: a non-speculative step took the top tokens",

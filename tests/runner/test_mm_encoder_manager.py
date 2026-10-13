@@ -22,6 +22,7 @@ def manager(compile_mock):
     model = Mock()
     model.get_encoder_cudagraph_config.return_value = SimpleNamespace(
         padding_logics={},
+        capture_axes=(),
         paths={
             "global": SimpleNamespace(min_token_budget=None, allow_zero_tokens=False),
             "local": SimpleNamespace(min_token_budget=8, allow_zero_tokens=True),
@@ -284,8 +285,18 @@ def test_coordinated_encoder_matches_peer_buckets_and_restores_item_order(
         assert (output == count).all()
     assert manager._run_budget_graph.call_args_list == (
         [
-            call({"tokens": [1, 3]}, 8, allow_eager_fallback=False),
-            call({"tokens": [4]}, 8, allow_eager_fallback=False),
+            call(
+                {"tokens": [1, 3]},
+                8,
+                axis_keys=(),
+                allow_eager_fallback=False,
+            ),
+            call(
+                {"tokens": [4]},
+                8,
+                axis_keys=(),
+                allow_eager_fallback=False,
+            ),
         ]
         if active
         else []
@@ -388,6 +399,7 @@ def test_execute_local_chunks_oversized_video_into_compiled_budgets(compile_mock
     model = Mock()
     model.get_encoder_cudagraph_config.return_value = SimpleNamespace(
         padding_logics={},
+        capture_axes=(),
         paths={
             "default": SimpleNamespace(min_token_budget=None, allow_zero_tokens=False),
         },

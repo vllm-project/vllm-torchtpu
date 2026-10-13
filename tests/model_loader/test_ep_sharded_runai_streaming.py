@@ -319,6 +319,7 @@ def test_patch_falls_back_when_filter_inactive():
 
     class FakeLoader:
         _get_weights_iterator = original
+        load_weights = MagicMock(name="original_load_weights")
 
     with patch.object(rsl, "RunaiModelStreamerLoader", FakeLoader):
         mlp.patch_runai_sharded_expert_streaming()
@@ -330,3 +331,85 @@ def test_patch_falls_back_when_filter_inactive():
             loader = FakeLoader()
             FakeLoader._get_weights_iterator(loader, "gs://b/m", None)
         original.assert_called_once_with(loader, "gs://b/m", None)
+
+
+def test_layer_finisher_runs_after_consumer_receives_tensor():
+    pytest.importorskip("runai_model_streamer")
+    import runai_model_streamer.safetensors_streamer.safetensors_pytorch as sp
+    import torch
+    from runai_model_streamer.safetensors_streamer import safetensors_streamer
+
+    from vllm_torchtpu import model_loader_patches as mlp
+
+    names = ["model.layers.0.q.weight", "model.layers.0.v.weight"]
+    metadata = _fake_file_meta(100, [(name, 4) for name in names])
+    received, finalized = [], []
+    model = torch.nn.Module()
+
+    class FakeFinisher:
+        def __init__(self, actual_model, actual_names):
+            assert actual_model is model
+            assert actual_names == names
+
+        def consumed(self, name):
+            assert received[-1] == name
+            finalized.append(name)
+
+    class FakeStreamer:
+        def __init__(self):
+            self.file_streamer = self
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            return None
+
+        def stream_files(self, *args, **kwargs):
+            pass
+
+        def get_chunks(self):
+            return iter([(0, 0, b"1234"), (0, 1, b"5678")])
+
+    with (
+        patch.object(safetensors_streamer, "SafetensorsStreamer", FakeStreamer),
+        patch.object(sp.SafetensorsMetadata, "from_files", return_value=[metadata]),
+        patch.object(sp, "create_torch_tensor", return_value=torch.ones(1)),
+        patch.object(mlp, "_OnlineFp8LayerFinisher", FakeFinisher),
+        patch.object(mlp.envs, "TPU_SHARDED_LOAD_SYNC_EVERY", 0),
+    ):
+        for name, _ in _sharded_runai_weights_iterator(
+            ["gs://b/m"], {0}, False, model=model
+        ):
+            assert name not in finalized
+            received.append(name)
+    assert finalized == names
+
+
+@pytest.mark.parametrize("fail", [False, True])
+def test_loading_model_is_scoped_to_load_weights(fail):
+    import torch
+    from vllm.model_executor.model_loader import runai_streamer_loader as rsl
+
+    from vllm_torchtpu import model_loader_patches as mlp
+
+    model = torch.nn.Module()
+
+    class FakeLoader:
+        _get_weights_iterator = MagicMock()
+
+        def load_weights(self, actual_model, model_config):
+            assert self._loading_model is actual_model
+            if fail:
+                raise RuntimeError("load failed")
+
+    with patch.object(rsl, "RunaiModelStreamerLoader", FakeLoader):
+        mlp.patch_runai_sharded_expert_streaming()
+        loader = FakeLoader()
+        assert loader._loading_model is None
+        if fail:
+            with pytest.raises(RuntimeError, match="load failed"):
+                loader.load_weights(model, None)
+        else:
+            loader.load_weights(model, None)
+    assert loader._loading_model is None

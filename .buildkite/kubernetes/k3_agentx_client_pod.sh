@@ -23,11 +23,19 @@
 # the proxy, read the cases out of the serve config, run agentx_client.sh against
 # the proxy, upload the results.
 #
+# Two jobs, the shape InferenceX gives a Kimi K3 agentic row
+# (infx/evals/EVALS.md). AGENTX_EVAL_JOB=0: the replay ladder, then the
+# config's AGENTX_POST_EVAL_SUITES (the Kimi tool-call schema suite) on the same
+# pair, InferenceX's post-eval of every K3 point. AGENTX_EVAL_JOB=1: no
+# replay, GSM8K at the top of the ladder, the eval-only job every agentic row
+# gets. Both evals run against the proxy on this pod, the loopback address
+# InferenceX's run_eval expects.
+#
 # The AGENTX_* knobs are passed only when set, so agentx_client.sh keeps one
 # default per value. A second default here is how build 245 ran against
 # InferenceX main while the client had pinned a ref. Only --gsm8k-conc carries a
-# value, because 4 is a departure from the client's 8: the pair's ladder tops
-# out at 4.
+# value, the top of the ladder, where the client's own default is wider than
+# this pair admits.
 #
 # Env (the manifest sets all of these):
 #   WORKLOAD_NAME   the JobSet's name; each head is <name>-<role>-0-0.<name>
@@ -35,7 +43,12 @@
 #   ARTIFACTS_DIR   where results go, uploaded as the step's artifacts
 #   AGENTX_CHIPS    physical TPU chips serving the pair; no default
 # Optional: AGENTX_DURATION, AGENTX_FAST, AGENTX_GSM8K_LIMIT, AGENTX_GSM8K_CONC,
-#   AGENTX_IX_REF, AGENTX_GCS_ROOT, AGENTX_READY_WAIT_MIN.
+#   AGENTX_IX_REF, AGENTX_GCS_ROOT, AGENTX_READY_WAIT_MIN, AGENTX_EVAL_JOB=1
+#   (set by the eval step alone, not the build: a build-level value reaches
+#   every step's pods, and the throughput step must not take this branch),
+#   AGENTX_EVAL_SMOKE=1 (the evals as a link check, not a result: 20 GSM8K
+#   questions in place of the split, the verifier's two-case suite in place
+#   of the full one), AGENTX_SKIP_POST_EVAL=1 (throughput: replay only).
 set -uo pipefail
 
 REPO_DIR="${REPO_DIR:-/workspace/vllm-torchtpu}"
@@ -49,26 +62,37 @@ PROXY_PORT=8100
 PREFILL_HOST="${WORKLOAD_NAME}-prefill-0-0.${WORKLOAD_NAME}"
 DECODE_HOST="${WORKLOAD_NAME}-decode-0-0.${WORKLOAD_NAME}"
 
+# For ix_export_topology; the pod keeps its own log tag.
+# shellcheck source=scripts/vllm/benchmark/inferencex/sweep_lib.sh
+source "$IX_DIR/sweep_lib.sh"
 log() { echo "[k3-agentx-client-pod] $*"; }
 
 cd "$REPO_DIR" || { log "FATAL: no repo at $REPO_DIR"; exit 1; }
 ARTIFACTS_DIR="${ARTIFACTS_DIR:-perf_eval_results}"
-RESULTS_DIR="$ARTIFACTS_DIR/k3-agentx-1p1d"
+EVAL_ONLY="${AGENTX_EVAL_JOB:-0}"
+case "$EVAL_ONLY" in 0|1) ;; *) log "FATAL: AGENTX_EVAL_JOB must be 0 or 1, not '$EVAL_ONLY'"; exit 2 ;; esac
+if [ "$EVAL_ONLY" = 1 ]; then
+    RESULTS_DIR="$ARTIFACTS_DIR/k3-agentx-evals-1p1d"
+else
+    RESULTS_DIR="$ARTIFACTS_DIR/k3-agentx-1p1d"
+fi
 mkdir -p "$RESULTS_DIR"
 
 CONFIG_FILE="$CONFIG_DIR/${CONFIG}.sh"
 [ -f "$CONFIG_FILE" ] || { log "FATAL: no such config: $CONFIG_FILE"; exit 2; }
 
 # The cases and the server size the engines booted with, read in a subshell with
-# the role set because the config branches on it. The list is read last: read's
-# final variable takes the rest of the line.
+# the role set because the config branches on it. The suite list travels comma
+# joined, or as "-" when there is none, so it stays one field. The ladder is
+# read last: read's final variable takes the rest of the line.
 _cfg=$(
     export K3_1P1D_ROLE=decode
     # shellcheck source=/dev/null
     source "$CONFIG_FILE" >/dev/null || exit 3
-    echo "${MAX_NUM_SEQS:-0} ${TENSOR_PARALLELISM:-0} ${DATA_PARALLELISM:-0} ${AGENTX_MODEL_PREFIX:-} ${AGENTX_PRECISION:-} ${AGENTX_CONC_LIST:-}"
+    _post=$(printf '%s' "${AGENTX_POST_EVAL_SUITES:-}" | tr -s ' ' ',')
+    echo "${MAX_NUM_SEQS:-0} ${TENSOR_PARALLELISM:-0} ${DATA_PARALLELISM:-0} ${ENABLE_EP:-false} ${AGENTX_MODEL_PREFIX:-} ${AGENTX_PRECISION:-} ${_post:--} ${AGENTX_CONC_LIST:-}"
 ) || { log "FATAL: $CONFIG failed to load; the engines would have failed the same way"; exit 2; }
-read -r CFG_MAX_NUM_SEQS CFG_TP CFG_DP CFG_MODEL_PREFIX CFG_PRECISION CFG_CONC_LIST <<< "$_cfg"
+read -r CFG_MAX_NUM_SEQS CFG_TP CFG_DP CFG_ENABLE_EP CFG_MODEL_PREFIX CFG_PRECISION CFG_POST_EVAL_SUITES CFG_CONC_LIST <<< "$_cfg"
 for _req in CFG_MODEL_PREFIX CFG_PRECISION; do
     [ -n "${!_req}" ] || { log "FATAL: $CONFIG declares no AGENTX_${_req#CFG_}"; exit 2; }
 done
@@ -99,9 +123,29 @@ if [ "$RANKS" -ne $(( CHIPS * 2 )) ]; then
     log "WARNING: the pair runs $RANKS ranks on $CHIPS chips, which is not the" \
         "two-per-chip v7x shape; check AGENTX_CHIPS is chips and not ranks"
 fi
+# The shape InferenceX files the row and its evals under, stated once here for
+# both clients: each role TP x DP with EP across both when the config enables
+# it, disaggregated. Not the chip count, which is --chips.
+EP=1; [ "$CFG_ENABLE_EP" != true ] || EP=$(( CFG_TP * CFG_DP ))
+ix_export_topology "$CFG_TP" "$CFG_DP" "$EP" 1
+
+POST_EVAL_SUITES="$CFG_POST_EVAL_SUITES"
+[ "${AGENTX_SKIP_POST_EVAL:-0}" != 1 ] || POST_EVAL_SUITES="-"
+# A smoke proves the path - lm-eval installs, the proxy streams tool calls,
+# validate_scores reads the staging - in minutes, with results that are
+# marked as not the gate: a GSM8K slice (InferenceX's EVAL_LIMIT) and the
+# verifier's two-case suite.
+SMOKE="${AGENTX_EVAL_SMOKE:-0}"
+case "$SMOKE" in 0|1) ;; *) log "FATAL: AGENTX_EVAL_SMOKE must be 0 or 1, not '$SMOKE'"; exit 2 ;; esac
+GSM8K_LIMIT_ARG=""
+if [ "$SMOKE" = 1 ]; then
+    GSM8K_LIMIT_ARG=20
+    POST_EVAL_SUITES="${POST_EVAL_SUITES//kimi_tool_call_schema_full/kimi_tool_call_schema}"
+fi
 
 log "config=$CONFIG concs=${CONCS[*]} max_num_seqs=$CFG_MAX_NUM_SEQS chips=$CHIPS ranks=$RANKS" \
-    "prefill=$PREFILL_HOST decode=$DECODE_HOST"
+    "prefill=$PREFILL_HOST decode=$DECODE_HOST eval_only=$EVAL_ONLY smoke=$SMOKE" \
+    "post_eval_suites=$POST_EVAL_SUITES"
 
 proxy_pid=""
 # shellcheck disable=SC2317  # run by the trap
@@ -166,6 +210,28 @@ fi
 # and the model card comes from its /v1/models. --engine-url is where /metrics is
 # read instead: the proxy has none, and the queue depth and preemption counters
 # are one engine's.
+if [ "$EVAL_ONLY" = 1 ]; then
+    # At the top of the ladder: InferenceX evaluates a multi-node deployment at
+    # its highest concurrency of 16 or more, else its highest.
+    log "running the AgentX GSM8K eval against the proxy"
+    bash "$IX_DIR/agentx_eval_client.sh" \
+        --server-url "http://127.0.0.1:$PROXY_PORT" \
+        --engine-url "http://${DECODE_HOST}:${PORT}" \
+        --suites gsm8k \
+        --eval-conc "$MAX_CONC" \
+        --chips "$CHIPS" \
+        --results-dir "$RESULTS_DIR" \
+        --spec-method none \
+        --model-prefix "$CFG_MODEL_PREFIX" \
+        --precision "$CFG_PRECISION" \
+        ${AGENTX_IX_REF:+--ix-ref "$AGENTX_IX_REF"} \
+        ${GSM8K_LIMIT_ARG:+--gsm8k-limit "$GSM8K_LIMIT_ARG"} \
+        ${AGENTX_GCS_ROOT:+--gcs-root "$AGENTX_GCS_ROOT"}
+    rc=$?
+    log "the AgentX eval client finished with rc=$rc"
+    exit "$rc"
+fi
+
 log "running the AgentX client against the proxy"
 bash "$IX_DIR/agentx_client.sh" \
     --server-url "http://127.0.0.1:$PROXY_PORT" \
@@ -177,7 +243,7 @@ bash "$IX_DIR/agentx_client.sh" \
     --spec-method none \
     --model-prefix "$CFG_MODEL_PREFIX" \
     --precision "$CFG_PRECISION" \
-    --gsm8k-conc "${AGENTX_GSM8K_CONC:-4}" \
+    --gsm8k-conc "${AGENTX_GSM8K_CONC:-$MAX_CONC}" \
     ${AGENTX_DURATION:+--duration "$AGENTX_DURATION"} \
     ${AGENTX_FAST:+--fast "$AGENTX_FAST"} \
     ${AGENTX_IX_REF:+--ix-ref "$AGENTX_IX_REF"} \
@@ -185,4 +251,28 @@ bash "$IX_DIR/agentx_client.sh" \
     ${AGENTX_GCS_ROOT:+--gcs-root "$AGENTX_GCS_ROOT"}
 rc=$?
 log "the AgentX client finished with rc=$rc"
+if [ "$POST_EVAL_SUITES" = "-" ]; then
+    exit "$rc"
+fi
+
+# InferenceX's post-eval for a Kimi K3 point: the tool-call schema suite on the
+# pair the ladder just ran on, after the replay so it never shares the window.
+# A dead pair fails here on its own; a failed point does not skip the suite,
+# since the schema verdict is still worth having.
+log "running the post-replay evals ($POST_EVAL_SUITES) against the proxy"
+bash "$IX_DIR/agentx_eval_client.sh" \
+    --server-url "http://127.0.0.1:$PROXY_PORT" \
+    --engine-url "http://${DECODE_HOST}:${PORT}" \
+    --suites "$POST_EVAL_SUITES" \
+    --eval-conc "$MAX_CONC" \
+    --chips "$CHIPS" \
+    --results-dir "$RESULTS_DIR/post-eval" \
+    --spec-method none \
+    --model-prefix "$CFG_MODEL_PREFIX" \
+    --precision "$CFG_PRECISION" \
+    ${AGENTX_IX_REF:+--ix-ref "$AGENTX_IX_REF"} \
+    ${AGENTX_GCS_ROOT:+--gcs-root "$AGENTX_GCS_ROOT"}
+erc=$?
+log "the post-replay evals finished with rc=$erc"
+[ "$rc" -ne 0 ] || rc=$erc
 exit "$rc"

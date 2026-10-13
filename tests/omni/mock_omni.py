@@ -120,6 +120,24 @@ class _MockQwenEmbedLayer3DRope:
     forward = _forward_mock_qwen_rope
 
 
+class _MockRotaryEmbeddingWan(torch.nn.Module):
+    """vLLM-Omni's CustomOp-style Wan RoPE (native interleaved formula)."""
+
+    def __init__(self, is_neox_style=False, half_head_dim=False):
+        super().__init__()
+        self.interleaved = not is_neox_style
+        self.half_head_dim = half_head_dim
+        self._forward_method = self.forward_native
+
+    def forward(self, *args, **kwargs):
+        return self._forward_method(*args, **kwargs)
+
+    def forward_native(self, x, cos, sin):
+        x1, x2 = x.unflatten(-1, (-1, 2)).unbind(-1)
+        rotated = torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
+        return rotated.flatten(-2, -1).to(x.dtype)
+
+
 vllm_omni_mock = MagicMock()
 vllm_omni_mock.platforms.interface.OmniPlatform = _MockOmniPlatform
 vllm_omni_mock.platforms.interface.OmniPlatformEnum = _MockOmniPlatformEnum
@@ -134,6 +152,7 @@ qwen_transformer_mock = (
 )
 qwen_transformer_mock.QwenEmbedRope = _MockQwenEmbedRope
 qwen_transformer_mock.QwenEmbedLayer3DRope = _MockQwenEmbedLayer3DRope
+vllm_omni_mock.diffusion.layers.rope.RotaryEmbeddingWan = _MockRotaryEmbeddingWan
 
 sys.modules["vllm_omni"] = vllm_omni_mock
 sys.modules["vllm_omni.platforms"] = vllm_omni_mock.platforms
@@ -164,3 +183,5 @@ sys.modules["vllm_omni.diffusion.models.qwen_image"] = (
 sys.modules["vllm_omni.diffusion.models.qwen_image.qwen_image_transformer"] = (
     vllm_omni_mock.diffusion.models.qwen_image.qwen_image_transformer
 )
+sys.modules["vllm_omni.diffusion.layers"] = vllm_omni_mock.diffusion.layers
+sys.modules["vllm_omni.diffusion.layers.rope"] = vllm_omni_mock.diffusion.layers.rope

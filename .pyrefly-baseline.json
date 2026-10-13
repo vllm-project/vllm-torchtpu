@@ -276,16 +276,6 @@
       "concise_description": "Object of class `int` has no attribute `astype`"
     },
     {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `whole_block_dma`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `shape`"
@@ -299,11 +289,6 @@
       "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `dtype`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `shape`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
@@ -339,11 +324,6 @@
       "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
       "name": "unbound-name",
       "concise_description": "`recurrent_out_dtype` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/kimi_k3/decode_kda.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `float | None` is not assignable to parameter `x` with type `Buffer | SupportsFloat | SupportsIndex | str` in function `float.__new__`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/kimi_k3/mega_kda/kernel.py",
@@ -386,41 +366,6 @@
       "concise_description": "`A_inv` may be uninitialized"
     },
     {
-      "path": "src/vllm_torchtpu/kernels/kimi_k3/mega_kda/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `shape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | None` is not assignable to parameter `step` with type `SupportsIndex` in function `range.__new__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+` is not supported between `int` and `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "unsupported-operation",
-      "concise_description": "`//` is not supported between `int` and `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | None` is not assignable to parameter `step` with type `SupportsIndex` in function `range.__new__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+` is not supported between `int` and `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "unsupported-operation",
-      "concise_description": "`//` is not supported between `int` and `None`"
-    },
-    {
       "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
       "name": "bad-assignment",
       "concise_description": "`FusedWeightsRef` is not assignable to variable `rhs_ref` with type `WeightsRef`"
@@ -431,31 +376,11 @@
       "concise_description": "`zero_size` may be uninitialized"
     },
     {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "unsupported-operation",
-      "concise_description": "`%` is not supported between `int` and `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "unsupported-operation",
-      "concise_description": "`%` is not supported between `None` and `int`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | None` is not assignable to parameter with type `int`"
-    },
-    {
       "path": "src/vllm_torchtpu/kernels/mla/dispatch.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `tuple[int, ...]` is not assignable to parameter `limits` with type `tuple[int, int]` in function `_masked_dense_prefill_cost_tier`"
     },
     {
-      "path": "src/vllm_torchtpu/kernels/mla/masked_dense/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`<` is not supported between `Literal[0]` and `None`"
-    },
-    {
       "path": "src/vllm_torchtpu/kernels/mla/sparse/kernel.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `at`"
@@ -469,46 +394,11 @@
       "path": "src/vllm_torchtpu/kernels/mla/sparse/kernel.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/mla/sparse/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/mla/v2/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `list[int] | tuple[int, int, int]` is not assignable to parameter `num_kv_pages_per_blocks` with type `tuple[int, int, int] | None` in function `static_validate_inputs`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/mla/v2/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `list[int] | tuple[int, int, int]` is not assignable to parameter `num_queries_per_blocks` with type `tuple[int, int, int] | None` in function `static_validate_inputs`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/mla/v2/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `float | None` is not assignable to parameter `mask_value` with type `float` in function `_mla_ragged_paged_attention_kernel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/mla/v2/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | None` is not assignable to parameter `static_q_len` with type `int` in function `_mla_ragged_paged_attention_kernel`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/quantized_matmul/kernel.py",
       "name": "unbound-name",
       "concise_description": "`x_scale_tmp` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/ragged_paged_attention/v3/kernel_hd64.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `float | None` is not assignable to parameter `mask_value` with type `float` in function `_ragged_paged_attention_kernel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `object` has no attribute `model_config`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/attention.py",
@@ -524,16 +414,6 @@
       "path": "src/vllm_torchtpu/layers/adapter/attention.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `tuple[Unknown, Unknown, Unknown, Unknown, Unknown, Unknown, Unknown, Unknown] | tuple[Unknown, *tuple[Unknown, ...]] | None` is not assignable to parameter `input_partition_specs` with type `Sequence[Unknown]` in function `vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter.pcp_streaming_jax_op`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `object` has no attribute `parallel_config`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `object` has no attribute `parallel_config`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/attention.py",
@@ -594,16 +474,6 @@
       "path": "src/vllm_torchtpu/layers/core/sequence_layout.py",
       "name": "unsupported-delete",
       "concise_description": "Invalid target for `del`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "unbound-name",
-      "concise_description": "`output_gate` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "unbound-name",
-      "concise_description": "`output_gate` may be uninitialized"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",

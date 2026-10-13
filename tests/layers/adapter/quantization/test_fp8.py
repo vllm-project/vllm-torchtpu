@@ -122,6 +122,10 @@ def test_fp8_routed_experts_checkpoint_allocation(
         "get_tensor_model_parallel_world_size",
         lambda: 2,
     )
+    monkeypatch.setattr(
+        "vllm.distributed.get_tensor_model_parallel_world_size",
+        lambda: 2,
+    )
     quant_cls = VllmFp8Config
     if deepseek_v4:
         from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import (
@@ -196,6 +200,21 @@ def test_fp8_routed_experts_tp_shard_loading(monkeypatch, tp_size, full_inter):
     shard = full_inter // tp_size
     padded = (shard + 127) // 128 * 128
     n_blocks = (full_inter + 127) // 128
+    from vllm.distributed import parallel_state
+
+    monkeypatch.setattr(
+        parallel_state,
+        "_TP",
+        SimpleNamespace(world_size=tp_size, rank_in_group=0),
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.get_tensor_model_parallel_world_size",
+        lambda: tp_size,
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_tensor_model_parallel_world_size",
+        lambda: tp_size,
+    )
     monkeypatch.setattr(
         "vllm.model_executor.layers.quantization.fp8."
         "get_tensor_model_parallel_world_size",
@@ -338,6 +357,7 @@ def test_fp8_routed_experts_block_refine(
     from types import SimpleNamespace
 
     from vllm.config import set_current_vllm_config
+    from vllm.distributed import parallel_state
     from vllm.model_executor.layers.fused_moe import RoutedExperts
     from vllm.model_executor.layers.fused_moe.config import (
         FusedMoEConfig,
@@ -347,6 +367,19 @@ def test_fp8_routed_experts_block_refine(
     )
     from vllm.model_executor.layers.fused_moe.expert_map_manager import ExpertMapManager
 
+    monkeypatch.setattr(
+        parallel_state,
+        "_TP",
+        SimpleNamespace(world_size=tp_size, rank_in_group=0),
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.get_tensor_model_parallel_world_size",
+        lambda: tp_size,
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_tensor_model_parallel_world_size",
+        lambda: tp_size,
+    )
     monkeypatch.setattr(
         "vllm.model_executor.layers.quantization.fp8."
         "get_tensor_model_parallel_world_size",

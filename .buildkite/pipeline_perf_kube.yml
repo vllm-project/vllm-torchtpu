@@ -329,3 +329,30 @@ steps:
           - *kube_plugin
         commands:
           - .buildkite/kubernetes/run_multihost.sh --manifest kimi-k3-agentx-1p1d.yaml
+
+      # The eval-only job InferenceX schedules beside that row: GSM8K against
+      # its threshold, at the top of the ladder (infx/matrix/generate.py). The
+      # same pair and manifest; AGENTX_EVAL_JOB=1, this step's own env, makes
+      # the client pod run agentx_eval_client.sh instead of the replay. The
+      # build-level K3_AGENTX_EVAL_ONLY only triggers the step: a build value
+      # reaches every step's pods, and the throughput step must keep replaying. The row's other eval, the
+      # Kimi tool-call schema suite, is the step above's own post-eval, after
+      # its replay, as InferenceX attaches it to every kimik3 point. Nightly, or
+      # on its own for a build that sets K3_AGENTX_EVAL_ONLY=1 (with
+      # AGENTX_EVAL_SMOKE=1 for a link check). The same concurrency group, so it
+      # follows the pairs above rather than holding slices beside them.
+      - label: ":kubernetes: :tpu: Eval: Kimi-K3 AgentX GSM8K 1P1D (TPU v7x 2x2x4 x2)"
+        depends_on:
+          - "build_docker"
+        concurrency_group: "tpu/v7x-2x2x4"
+        concurrency: 1
+        if: 'build.env("NIGHTLY") == "1" || build.env("K3_AGENTX_EVAL_ONLY") == "1"'
+        timeout_in_minutes: 1440
+        agents:
+          queue: "kube"
+        plugins:
+          - *kube_plugin
+        env:
+          AGENTX_EVAL_JOB: "1"
+        commands:
+          - .buildkite/kubernetes/run_multihost.sh --manifest kimi-k3-agentx-1p1d.yaml

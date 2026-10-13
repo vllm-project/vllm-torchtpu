@@ -264,6 +264,7 @@ def load_and_select_states(
                 0,
             )
             if carry_conv_scratch_ref is not None:
+                assert carry_recurrent_scratch_ref is not None
                 prev_conv_state = jnp.where(
                     is_first_tile, prev_conv_state, carry_conv_scratch_ref[idx]
                 )
@@ -276,6 +277,8 @@ def load_and_select_states(
             # Later tiles resume from the carry, so decode both sources once
             # instead of on every tile. One guard, not one per state.
             # pl.when traces the body here, so `idx` is this iteration's.
+            assert carry_recurrent_scratch_ref is not None
+
             @pl.when(is_first_tile)
             def _():
                 carry_conv_scratch_ref[idx] = jnp.where(

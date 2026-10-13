@@ -65,6 +65,10 @@ from vllm.model_executor.layers.quantization.fp8 import (
     Fp8MoEMethod,
 )
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    ParallelLMHead,
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.parameter import (
     BlockQuantScaleParameter,
     ChannelQuantScaleParameter,
@@ -102,7 +106,7 @@ from vllm_torchtpu.layers.adapter.quantization.online_fp8 import (
 from vllm_torchtpu.layers.core.quant_methods import FP8, get_tpu_quant_method
 from vllm_torchtpu.layers.core.quantization import dequantize_tensor, quantize_tensor
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm.model_executor.models.utils import WeightsMapper
@@ -391,18 +395,13 @@ def _quantize_and_format_single_moe_weight(
     w = w.transpose(1, 2).contiguous()
 
     # Reshape scales for GMM kernel.
-    # An `unsqueeze(2)` view on a TPU tensor leaves the persistent
-    # nn.Parameter carrying ambiguous strides (stride[1] == stride[2]) that
-    # torch_tpu's per-op JIT re-emits as a per-step `tt_jit_as_strided`
-    # program at the GMM `pallas.jax_op` boundary. Allocate a fresh 4D
-    # contiguous device buffer with `torch.empty + .copy_` to break the
-    # view chain so the persistent storage is a plain 4D buffer that PJRT
-    # ships to the kernel with row-major layout.
+    # The `unsqueeze(2)` view is backed by the 3-D scale buffer, which
+    # torch_tpu would re-materialize as a per-step `tt_jit_as_strided`
+    # program at the GMM `pallas.jax_op` boundary. `fresh_buffer` gives the
+    # persistent parameter a plain 4-D buffer of its own.
     if w_scale is not None:
         s = w_scale.transpose(1, 2).contiguous().to(torch.float32)
-        w_scale = torch.empty(
-            s.shape[0], s.shape[1], 1, s.shape[2], dtype=s.dtype, device=s.device
-        ).copy_(s.unsqueeze(2))
+        w_scale = fresh_buffer(s.unsqueeze(2))
 
     return w, w_scale
 
@@ -678,12 +677,13 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
                 "FP8 store_dtype is not supported by the TPU quantization path"
             )
         super().__init__(
-            is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
+            is_checkpoint_fp8_serialized=True,
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
             store_dtype=store_dtype,
         )
+        self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:
@@ -1578,21 +1578,20 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         # [n_out, n_in] keep that layout; `apply` below contracts accordingly.
         if getattr(layer, WEIGHT_FLIPPED_ATTR, False):
             return  # already flipped; reload paths re-enter this hook
-        keep_vllm_layout = getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False)
+        # Prevent transposing for embedding lookup, keep [vocab_size, hidden_size].
+        is_embedding = isinstance(layer, VocabParallelEmbedding) and not isinstance(
+            layer, ParallelLMHead
+        )
+        keep_vllm_layout = getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False) or is_embedding
         if not keep_vllm_layout:
             weight = weight.transpose(0, 1)
 
-        # The dequant/requant chain may leave views backed by higher-rank PJRT
-        # buffers. Allocate fresh contiguous persistent parameters so the
-        # matmul boundary sees plain row-major buffers.
-        weight = torch.empty(
-            weight.shape[0], weight.shape[1], dtype=weight.dtype, device=weight.device
-        ).copy_(weight)
-        weight_scale = torch.empty(
-            *weight_scale.shape,
-            dtype=weight_scale.dtype,
-            device=weight_scale.device,
-        ).copy_(weight_scale)
+        # The dequant/requant chain may leave views backed by buffers of a
+        # different shape (e.g. a squeezed [n_out, 1] scale). Give the
+        # persistent parameters buffers of their own shape so the matmul
+        # boundary needs no per-step `tt_jit_as_strided` program.
+        weight = fresh_buffer(weight)
+        weight_scale = fresh_buffer(weight_scale)
 
         replace_parameter(
             layer, "weight", torch.nn.Parameter(weight, requires_grad=False)
@@ -1647,10 +1646,28 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             # Stored [n_out, n_in] for a raw consumer; `quantized_matmul`
             # takes the canonical (k, n), so flip the view for the contraction.
             weight = weight.transpose(0, 1)
-        out = quantized_matmul(x, weight, layer.weight_scale)
+        if isinstance(layer, VocabParallelEmbedding):
+            # Prevent the quantization of activations to FP8 (W8A16).
+            out = torch.matmul(x, weight.to(x.dtype)) * layer.weight_scale.to(x.dtype)
+        else:
+            out = quantized_matmul(x, weight, layer.weight_scale)
         if bias is not None:
             out = out + bias
         return out
+
+    def embedding(self, layer: torch.nn.Module, input_: torch.Tensor) -> torch.Tensor:
+        layer = cast("TpuLinear", layer)
+        flat = input_.reshape(-1)
+        out_dtype = getattr(layer, "params_dtype", None) or torch.get_default_dtype()
+        w = torch.index_select(layer.weight, 0, flat).to(out_dtype)
+        s = torch.index_select(layer.weight_scale, 0, flat).to(out_dtype).unsqueeze(-1)
+        return (w * s).reshape(*input_.shape, -1)
+
+    def tie_weights(self, layer: torch.nn.Module, embed_tokens: torch.nn.Module):
+        layer.weight = embed_tokens.weight
+        layer.weight_scale = embed_tokens.weight_scale
+        setattr(layer, KEEP_VLLM_LAYOUT_ATTR, True)
+        return layer
 
 
 def resolve_online_fp8(

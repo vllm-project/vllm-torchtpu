@@ -11,7 +11,8 @@
 #   GPU_MEMORY_UTILIZATION  0.80  -> 0.90, which that window needs to boot
 #   compile_sizes           adds 1,2,4 so the buckets bracket the ladder
 #   serve flags             adds the tool-call parser the traces need
-#   AGENTX_*                the cases and the row labels, which the base has no use for
+#   AGENTX_*                the cases, the row labels and the quality evals, which
+#                           the base has no use for
 #
 # Nothing else differs. k3_agentx_client_pod.sh reads AGENTX_CONC_LIST from
 # here, as agentx_sweep.sh does for the aggregate lane, so the cases live in one
@@ -37,6 +38,12 @@ AGENTX_CONC_LIST="1 4"
 # The row labels, which the model-agnostic client takes as arguments.
 AGENTX_MODEL_PREFIX=kimik3
 AGENTX_PRECISION=fp4
+
+# The model's own quality eval, which InferenceX attaches to every kimik3
+# throughput point after its replay (infx/matrix/generate.py);
+# k3_agentx_client_pod.sh appends it after the ladder. GSM8K, which every
+# agentic row gets as a separate eval-only job, is not the config's to name.
+AGENTX_POST_EVAL_SUITES="kimi_tool_call_schema_full"
 
 # An assertion, not an override: the base is 8 too, but as a single-request
 # probe's value, and it only happens to equal twice this ladder's top
