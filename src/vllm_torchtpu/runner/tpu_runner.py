@@ -4344,7 +4344,9 @@ class TPUModelRunner(GPUModelRunner):
                 topk_candidates = self._sampler_topk_candidates(
                     cur_start_idx, cur_end_idx, grammar_output
                 )
-                bonus_u = torch.rand_like(bonus_logits, generator=sampling_generator)
+                bonus_u = torch.rand_like(
+                    bonus_logits, dtype=torch.float32, generator=sampling_generator
+                )
                 bonus_token_ids = self.sample_from_logits_func(
                     bonus_logits,
                     req_temperatures,
@@ -4533,7 +4535,11 @@ class TPUModelRunner(GPUModelRunner):
                                     cur_start_idx, cur_end_idx, logits
                                 )
                             )
-                            u = torch.rand_like(logits, generator=sampling_generator)
+                            u = torch.rand_like(
+                                logits,
+                                dtype=torch.float32,
+                                generator=sampling_generator,
+                            )
                             selected = self.sample_from_logits_func(
                                 logits,
                                 temperatures_tpu,
@@ -4599,7 +4605,9 @@ class TPUModelRunner(GPUModelRunner):
                                 cur_start_idx, cur_end_idx, logits
                             )
                         )
-                        u = torch.rand_like(logits, generator=sampling_generator)
+                        u = torch.rand_like(
+                            logits, dtype=torch.float32, generator=sampling_generator
+                        )
                         selected_token_ids = self.sample_from_logits_func(
                             logits,
                             temperatures_tpu,
@@ -5860,7 +5868,7 @@ class TPUModelRunner(GPUModelRunner):
                 dummy_temperatures = torch.ones(
                     (num_reqs, 1), dtype=self._hidden_states_dtype
                 ).to(self.device)
-                dummy_u = torch.rand_like(dummy_logits)
+                dummy_u = torch.rand_like(dummy_logits, dtype=torch.float32)
                 dummy_top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(
                     self.device
                 )
@@ -7528,6 +7536,10 @@ class TPUModelRunner(GPUModelRunner):
         is_greedy = temperatures <= SAMPLING_EPS
         scaled_logits = self._apply_temperature(logits, temperatures)
         masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p, topk_candidates)
+        # Callers draw u in fp32 whatever the logits dtype. Clamped to
+        # 1 - eps of a bf16 u, the Gumbel noise tops out at 4.85 (15.94 in
+        # fp32), so tokens more than a few nats below the top logit would be
+        # under-sampled, and beyond about 9 nats never sampled.
         u_clamped = torch.clamp(
             u, min=torch.finfo(u.dtype).tiny, max=1.0 - torch.finfo(u.dtype).eps
         )

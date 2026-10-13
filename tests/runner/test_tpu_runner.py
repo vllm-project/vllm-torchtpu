@@ -12,9 +12,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import ast
 import contextlib
 import copy
 import inspect
+import math
+import textwrap
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -2786,3 +2789,77 @@ def test_torch_tpu_wrapper_accelerator_aliases(monkeypatch):
         assert torch.cuda.current_stream() is fake_stream
         assert torch.cuda.set_stream(fake_stream) == "set_stream_" + str(fake_stream)
         assert torch.cuda.synchronize() == "synchronized"
+
+
+def test_gumbel_u_is_drawn_in_fp32_at_every_call_site():
+    """Each uniform drawn for the Gumbel-max sampler is fp32, not the logits
+    dtype: clamped to 1 - eps of a bf16 u, the noise tops out at 4.85 and
+    tokens more than about 9 nats below the top logit are never sampled."""
+    tree = ast.parse(textwrap.dedent(inspect.getsource(TPUModelRunner)))
+    draws = [
+        node
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Call)
+        and ast.unparse(node.func) == "torch.rand_like"
+        and "logits" in ast.unparse(node.args[0])
+    ]
+    assert draws
+    for node in draws:
+        dtypes = [ast.unparse(kw.value) for kw in node.keywords if kw.arg == "dtype"]
+        assert dtypes == ["torch.float32"], ast.unparse(node)
+
+
+def test_precompile_sample_from_logits_uses_fp32_u(monkeypatch):
+    """The sampler graphs are precompiled for the fp32 u that serving draws,
+    so the first sampled step does not recompile them."""
+    seen = []
+
+    def record(logits, temperatures, u, top_k, top_p, *, all_greedy, topk_candidates):
+        seen.append((all_greedy, topk_candidates, u.dtype))
+        return torch.argmax(logits, dim=-1, keepdim=True)
+
+    runner = SimpleNamespace(
+        num_reqs_paddings=[8, 16],
+        vocab_size=256,
+        _hidden_states_dtype=torch.bfloat16,
+        device="cpu",
+        _precompile_timed=lambda name: contextlib.nullcontext(),
+        _topk_candidate_blocks=lambda: 2,
+        sample_from_logits_func=record,
+    )
+    runner._dummy_logits = lambda n: TPUModelRunner._dummy_logits(runner, n)
+    monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **k: None)
+
+    TPUModelRunner._precompile_sample_from_logits(runner)
+
+    sampled = [(k, dtype) for greedy, k, dtype in seen if not greedy]
+    assert sampled == [(0, torch.float32), (2, torch.float32)] * 2
+
+
+def test_sample_from_logits_reaches_tokens_far_below_the_top_logit():
+    """bf16 logits with an fp32 u: a token 8 nats below the top logit is
+    sampled at its softmax probability (a bf16 u samples it about 6x too
+    rarely, and never beyond about 9 nats)."""
+    n, gap = 1_000_000, 8.0
+    logits = torch.zeros(n, 2, dtype=torch.bfloat16)
+    logits[:, 1] = -gap
+    u = torch.rand_like(
+        logits, dtype=torch.float32, generator=torch.Generator().manual_seed(0)
+    )
+    runner = SimpleNamespace()
+    runner._apply_temperature = lambda x, t: TPUModelRunner._apply_temperature(
+        runner, x, t
+    )
+
+    # The eager body: the "tpu" compile backend needs a TPU.
+    tokens = TPUModelRunner.sample_from_logits.__wrapped__(
+        runner,
+        logits,
+        torch.ones(n, 1, dtype=torch.bfloat16),
+        u,
+        torch.zeros(n, 1, dtype=torch.int32),
+        torch.ones(n, 1, dtype=torch.float32),
+    )
+
+    p = 1.0 / (1.0 + math.exp(gap))
+    assert abs(int(tokens.sum()) - n * p) < 5 * math.sqrt(n * p * (1 - p))
