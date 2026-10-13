@@ -9,6 +9,9 @@ from vllm.model_executor.models import qwen3_5_mtp as upstream
 from vllm.model_executor.models.utils import sequence_parallel_chunk
 from vllm.sequence import IntermediateTensors
 
+# Upstream's forward, kept for the drift pin in test_qwen3_next_patch.py.
+UPSTREAM_PREDICTOR_FORWARD = upstream.Qwen3_5MultiTokenPredictor.forward
+
 
 def _predictor_forward(
     self: upstream.Qwen3_5MultiTokenPredictor,

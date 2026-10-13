@@ -1642,6 +1642,7 @@ def test_forward_draft_uses_saved_draft_config_in_both_contexts(monkeypatch, dev
     proposer.runner = SimpleNamespace(
         mesh=object(),
         _dp_num_tokens_across_dp=lambda n: n,
+        num_tokens_paddings=[16],
     )
     proposer._build_draft_attn_metadata = lambda **_kwargs: {"draft": "md"}
 

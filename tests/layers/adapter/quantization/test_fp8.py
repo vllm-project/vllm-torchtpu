@@ -1361,6 +1361,10 @@ class TestMoERequantizationChunks:
         layer, chunk_bytes = self._layer(device, torch.float8_e4m3fn)
         kwargs = dict(weight_block_size=(128, 128), activation="silu")
         whole = fp8_mod._process_fp8_moe_weights(layer, **kwargs)
+        # On TPU the pass rebinds the layer's checkpoint w13 and scale to
+        # the requantized pair, so the chunked pass takes a fresh layer.
+        torch.manual_seed(0)
+        layer, _ = self._layer(device, torch.float8_e4m3fn)
         monkeypatch.setattr(fp8_mod, "_REQUANT_CHUNK_BYTES", chunk_bytes)
         chunked = fp8_mod._process_fp8_moe_weights(layer, **kwargs)
         self._same(whole, chunked)

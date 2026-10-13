@@ -1330,8 +1330,11 @@ class Eagle3Proposer:
                 )
                 assert knr is not None
                 if is_async:
+                    # nr is at the sampler's request-padding width, which can
+                    # sit above a chunk's kernel_num_reqs; the rows past the
+                    # chunk's requests are zeros either way.
                     rejected_dev_per_chunk.append(
-                        _maybe_pad_dim0(nr, knr) if nr is not None else None
+                        _maybe_pad_dim0(nr[:knr], knr) if nr is not None else None
                     )
                 elif nr is not None and np.any(nr):
                     padded_nr = np.zeros(knr, dtype=np.int32)
@@ -1563,8 +1566,14 @@ class Eagle3Proposer:
             num_rejected_out = (num_draft_dev - accepted_drafts).to(torch.int32)
             # qsl_end already lives on-device in the chunk's attn context (the
             # same tensor _build_draft_attn_metadata reads at step_idx=0); slice
-            # it instead of a fresh H2D of query_start_loc_np.
+            # it instead of a fresh H2D of query_start_loc_np. The upload is
+            # sized by the chunk's request cap, which can sit below the
+            # request-padding bucket; the rows past it take the last end.
             qsl_end = chunk.attn_ctx.query_start_loc[1 : width + 1].to(torch.int64)
+            if qsl_end.shape[0] < width:
+                qsl_end = torch.cat(
+                    [qsl_end, qsl_end[-1:].expand(width - qsl_end.shape[0])]
+                )
             last_token_indices = qsl_end - 1 - num_rejected_out.to(torch.int64)
             # Partial-prefill (discard) requests have no sampled token; seed
             # them from the host request state (same value as the sync path).

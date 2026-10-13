@@ -95,6 +95,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
         ),
         scheduler_config=SimpleNamespace(async_scheduling=is_async),
         _is_async_drafter=method == "mtp",
+        _mtp_prefill_only=False,
         _fence_spec_kv_under_token_copy=fence,
         is_pooling_model=False,
         drafter=SimpleNamespace(),
