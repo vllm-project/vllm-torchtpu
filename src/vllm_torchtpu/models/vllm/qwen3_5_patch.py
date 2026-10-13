@@ -37,6 +37,7 @@ from vllm.model_executor.models.qwen3_5 import Qwen3_5DecoderLayer
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.compilation import shape_variants
+from vllm_torchtpu.distributed.fp8_all_gather import fp8_all_gather
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
@@ -47,6 +48,9 @@ logger = init_logger(__name__)
 _orig_init = Qwen3_5DecoderLayer.__init__
 
 _MIN_PER_CHIP_SIZE_MB = 8
+# gmm_v2 quantizes its lhs with one scale per 512 channels. Matching that
+# granularity keeps an outlier from clipping a whole 4096-wide row.
+_FP8_SUBCHANNEL_SIZE = 512
 
 
 def _overlap_min_tokens(hidden_size: int, tp_size: int, element_size: int) -> int:
@@ -127,7 +131,14 @@ def _overlap_forward(
         logits = tensor_model_parallel_all_gather(logits_loc, 0).narrow(
             0, 0, num_tokens
         )
-        h = tensor_model_parallel_all_gather(h_loc, 0).narrow(0, 0, num_tokens)
+        if envs.TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER:
+            h = fp8_all_gather(
+                h_loc,
+                lambda t: tensor_model_parallel_all_gather(t, 0),
+                block_size=_FP8_SUBCHANNEL_SIZE,
+            ).narrow(0, 0, num_tokens)
+        else:
+            h = tensor_model_parallel_all_gather(h_loc, 0).narrow(0, 0, num_tokens)
     else:
         h, residual = self.post_attention_layernorm(
             tensor_model_parallel_all_reduce(attn), residual

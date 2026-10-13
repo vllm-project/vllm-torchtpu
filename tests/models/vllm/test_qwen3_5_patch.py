@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import threading
+from collections.abc import Callable
 from types import SimpleNamespace
 
 import pytest
@@ -547,3 +548,230 @@ def test_overlap_forward_narrows_padded_all_gather(
     out, _ = qwen3_5_patch._overlap_forward(layer, x, None, torch.arange(6))
     assert seen_shapes == [(torch.Size([6, d]), torch.Size([6, 4]))]
     assert out.shape == (6, d)
+
+
+def _run_on_tp_threads[T](tp_size: int, fn: Callable[[int], T]) -> list[T]:
+    """Runs fn(rank) on tp_size threads tagged with .rank; re-raises the first error."""
+    outs: list[T | None] = [None] * tp_size
+    errors: list[Exception | None] = [None] * tp_size
+
+    def worker(rank: int) -> None:
+        try:
+            outs[rank] = fn(rank)
+        except Exception as e:  # noqa: BLE001
+            errors[rank] = e
+
+    threads = []
+    for r in range(tp_size):
+        t = threading.Thread(target=worker, args=(r,))
+        t.rank = r  # type: ignore[attr-defined]
+        threads.append(t)
+        t.start()
+    for t in threads:
+        t.join(timeout=10.0)
+        assert not t.is_alive()
+    for err in errors:
+        if err is not None:
+            raise err
+    return [o for o in outs if o is not None]
+
+
+def _run_single_layer_with_wire_capture(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    overlap: bool,
+    fp8_all_gather: bool,
+    tp_size: int = 2,
+    d: int = 64,
+    with_residual: bool = False,
+    layer_type: str = "linear_attention",
+    layer_scale: bool = False,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    list[tuple[str, torch.Size, torch.dtype]],
+    list[torch.dtype],
+]:
+    """Runs _overlap_forward across TP threads and records rank-0 wire shapes/dtypes."""
+    monkeypatch.setattr(qwen3_5_patch, "_MIN_PER_CHIP_SIZE_MB", 0 if overlap else 1024)
+    monkeypatch.setattr(envs, "TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER", fp8_all_gather)
+    torch.manual_seed(11)
+    n = 16
+    x = torch.randn(n, d, dtype=torch.bfloat16)
+    res_in = torch.randn(n, d, dtype=torch.bfloat16) if with_residual else None
+    pos = torch.arange(n)
+
+    input_norm = _CpuRMSNorm(d).to(torch.bfloat16)
+    post_norm = _CpuRMSNorm(d).to(torch.bfloat16)
+    gate_linear = nn.Linear(d, 8, bias=False).to(torch.bfloat16)
+
+    def gate(h: torch.Tensor) -> tuple[torch.Tensor, None]:
+        return gate_linear(h), None
+
+    attn_projs = [
+        nn.Linear(d, d, bias=False).to(torch.bfloat16) for _ in range(tp_size)
+    ]
+    expert_projs = [
+        nn.Linear(d, d, bias=False).to(torch.bfloat16) for _ in range(tp_size)
+    ]
+    attn_ls = torch.tensor([0.1], dtype=torch.bfloat16)
+    ffn_ls = torch.tensor([0.2], dtype=torch.bfloat16)
+
+    mock = _TPCollectiveMock(tp_size)
+    wire_log: list[tuple[str, torch.Size, torch.dtype]] = []
+    experts_dtypes: list[torch.dtype] = []
+
+    def logged_rs(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
+        if getattr(threading.current_thread(), "rank", 0) == 0:
+            wire_log.append(("reduce_scatter", tensor.shape, tensor.dtype))
+        return mock.reduce_scatter(tensor, dim=dim)
+
+    def logged_ag(tensor: torch.Tensor, dim: int = 0) -> torch.Tensor:
+        if getattr(threading.current_thread(), "rank", 0) == 0:
+            wire_log.append(("all_gather", tensor.shape, tensor.dtype))
+        return mock.all_gather(tensor, dim=dim)
+
+    def logged_ar(tensor: torch.Tensor) -> torch.Tensor:
+        if getattr(threading.current_thread(), "rank", 0) == 0:
+            wire_log.append(("all_reduce", tensor.shape, tensor.dtype))
+        return mock.all_reduce(tensor)
+
+    monkeypatch.setattr(
+        qwen3_5_patch, "tensor_model_parallel_reduce_scatter", logged_rs
+    )
+    monkeypatch.setattr(qwen3_5_patch, "tensor_model_parallel_all_gather", logged_ag)
+    monkeypatch.setattr(qwen3_5_patch, "tensor_model_parallel_all_reduce", logged_ar)
+
+    def run_rank(rank: int) -> tuple[torch.Tensor, torch.Tensor]:
+        def experts(
+            hidden_states: torch.Tensor, router_logits: torch.Tensor
+        ) -> torch.Tensor:
+            if rank == 0:
+                experts_dtypes.append(hidden_states.dtype)
+            return expert_projs[rank](hidden_states) * (
+                router_logits.sum(-1, keepdim=True) * 0.01 + 1.0
+            )
+
+        rank_layer = SimpleNamespace(
+            input_layernorm=input_norm,
+            post_attention_layernorm=post_norm,
+            layer_type=layer_type,
+            layer_scale=layer_scale,
+            attn_layer_scale=attn_ls,
+            ffn_layer_scale=ffn_ls,
+            linear_attn=(
+                (lambda hidden_states: attn_projs[rank](hidden_states))
+                if layer_type == "linear_attention"
+                else None
+            ),
+            self_attn=(
+                (lambda hidden_states, positions: attn_projs[rank](hidden_states))
+                if layer_type != "linear_attention"
+                else None
+            ),
+            mlp=SimpleNamespace(tp_size=tp_size, gate=gate, experts=experts),
+        )
+        out, ret_res = qwen3_5_patch._overlap_forward(
+            rank_layer,
+            x.clone(),
+            res_in.clone() if res_in is not None else None,
+            pos,
+        )
+        assert ret_res is not None
+        return out, ret_res
+
+    pairs = _run_on_tp_threads(tp_size, run_rank)
+    out0, res0 = pairs[0]
+    return out0, res0, wire_log, experts_dtypes
+
+
+def test_overlap_forward_fp8_flag_changes_only_the_h_gather(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With TPU_ATTN_MOE_OVERLAP_FP8_ALL_GATHER=True the h gather ships int8 rows
+    + fp32 scales.
+    """
+    out_fp8, _, wire_fp8, exp_dtypes_fp8 = _run_single_layer_with_wire_capture(
+        monkeypatch, overlap=True, fp8_all_gather=True, tp_size=2
+    )
+    out_bf16, _, wire_bf16, exp_dtypes_bf16 = _run_single_layer_with_wire_capture(
+        monkeypatch, overlap=True, fp8_all_gather=False, tp_size=2
+    )
+
+    assert wire_bf16 == [
+        ("reduce_scatter", torch.Size([16, 64]), torch.bfloat16),
+        ("all_gather", torch.Size([8, 8]), torch.bfloat16),
+        ("all_gather", torch.Size([8, 64]), torch.bfloat16),
+        ("all_reduce", torch.Size([16, 64]), torch.bfloat16),
+    ]
+    assert wire_fp8 == [
+        ("reduce_scatter", torch.Size([16, 64]), torch.bfloat16),
+        ("all_gather", torch.Size([8, 8]), torch.bfloat16),
+        ("all_gather", torch.Size([8, 64]), torch.int8),
+        ("all_gather", torch.Size([8, 1]), torch.float32),
+        ("all_reduce", torch.Size([16, 64]), torch.bfloat16),
+    ]
+    assert exp_dtypes_fp8 == [torch.bfloat16]
+    assert exp_dtypes_bf16 == [torch.bfloat16]
+    torch.testing.assert_close(
+        out_fp8,
+        out_bf16,
+        rtol=1.0 / 16,
+        atol=float(out_bf16.detach().abs().max()) / 16,
+    )
+
+
+def test_overlap_forward_fp8_mid_stack_full_attention_with_layer_scale(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Mid-stack full_attention layer with residual and layer_scale at d=1024."""
+    out_fp8, res_fp8, wire_fp8, exp_dtypes_fp8 = _run_single_layer_with_wire_capture(
+        monkeypatch,
+        overlap=True,
+        fp8_all_gather=True,
+        tp_size=2,
+        d=1024,
+        with_residual=True,
+        layer_type="full_attention",
+        layer_scale=True,
+    )
+    out_bf16, res_bf16, _, _ = _run_single_layer_with_wire_capture(
+        monkeypatch,
+        overlap=True,
+        fp8_all_gather=False,
+        tp_size=2,
+        d=1024,
+        with_residual=True,
+        layer_type="full_attention",
+        layer_scale=True,
+    )
+    assert wire_fp8 == [
+        ("reduce_scatter", torch.Size([16, 1024]), torch.bfloat16),
+        ("all_gather", torch.Size([8, 8]), torch.bfloat16),
+        ("all_gather", torch.Size([8, 1024]), torch.int8),
+        ("all_gather", torch.Size([8, 2]), torch.float32),
+        ("all_reduce", torch.Size([16, 1024]), torch.bfloat16),
+    ]
+    assert exp_dtypes_fp8 == [torch.bfloat16]
+    assert torch.equal(res_fp8, res_bf16)
+    torch.testing.assert_close(
+        out_fp8,
+        out_bf16,
+        rtol=1.0 / 16,
+        atol=float(out_bf16.detach().abs().max()) / 16,
+    )
+
+
+def test_non_overlap_branch_ignores_fp8_flag(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Below min_tokens the all-reduce path runs; the flag adds no all-gathers."""
+    out_fp8, _, wire_fp8, _ = _run_single_layer_with_wire_capture(
+        monkeypatch, overlap=False, fp8_all_gather=True, tp_size=2
+    )
+    out_bf16, _, wire_bf16, _ = _run_single_layer_with_wire_capture(
+        monkeypatch, overlap=False, fp8_all_gather=False, tp_size=2
+    )
+    assert [op for op, _, _ in wire_fp8] == ["all_reduce", "all_reduce"]
+    assert wire_fp8 == wire_bf16
+    assert torch.equal(out_fp8, out_bf16)

@@ -24,9 +24,9 @@ import torch
 from vllm.distributed.parallel_state import get_dp_group
 
 import vllm_torchtpu.envs as envs
+from vllm_torchtpu.distributed.fp8_all_gather import fp8_all_gather
 from vllm_torchtpu.distributed.pcp import get_pcp_group
 from vllm_torchtpu.layers.adapter.fused_moe import fused_moe_gmm
-from vllm_torchtpu.layers.core.quantization import dequantize_tensor, quantize_tensor
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -50,16 +50,9 @@ def _quantized_all_gather(
     collective_group, hidden_states: torch.Tensor
 ) -> torch.Tensor:
     """All-gather activations in fp8, restored on arrival."""
-    out_dtype = hidden_states.dtype
-    quantized, scale = quantize_tensor(
-        hidden_states, quant_dtype=torch.float8_e4m3fn, axis=-1
+    return fp8_all_gather(
+        hidden_states, lambda t: collective_group.all_gather(t, dim=0)
     )
-    ag_rows = collective_group.all_gather(quantized.view(torch.int8), dim=0)
-    ag_scale = collective_group.all_gather(scale, dim=0)
-    ag_hidden_states = dequantize_tensor(
-        ag_rows.view(torch.float8_e4m3fn), ag_scale, axis=-1, out_dtype=out_dtype
-    )
-    return ag_hidden_states
 
 
 def calculate_moe_chunks(
