@@ -90,10 +90,13 @@ forward at once; the worker thread prepares the next step while the forward
 runs. Its next ``start_forward`` waits for that launch and for the hand-off
 to complete, so no stage collective is dispatched while the hand-off runs.
 Pushes and settles keep the launch order: they wait for the queued launch
-first.
+first, and a settle on the first stage waits for it even when it issues no
+launch of its own, so a launch that failed on the helper thread is raised
+at the engine's next wait; on a two-stage pipeline the engine sends that
+settle only with the knob on (``pp_push``), since its launches otherwise
+pair by themselves.
 """
 
-import queue
 import threading
 from typing import Any
 
@@ -223,9 +226,11 @@ class PPWave:
         self.async_handoff = (
             bool(envs.TPU_PP_ASYNC_HANDOFF) and self.rank == 0 and self.size > 1
         )
+        # At most one launch is ever queued: the next start_forward, push
+        # or settle waits for it before anything else is launched.
         self._async_cv = threading.Condition()
-        self._async_queue: queue.Queue = queue.Queue()
-        self._async_pending = 0
+        self._async_carried: tuple[torch.Tensor, ...] | None = None
+        self._async_busy = False
         self._async_out: tuple[torch.Tensor, ...] | None = None
         self._async_error: BaseException | None = None
         self._async_thread: threading.Thread | None = None
@@ -272,6 +277,9 @@ class PPWave:
         self.burst_launches += 1
         return out
 
+    def _async_idle(self) -> bool:
+        return self._async_carried is None and not self._async_busy
+
     def _launch_async(self, carried: tuple[torch.Tensor, ...]) -> None:
         """Counts the launch now and has the helper thread issue it once the
         device is idle. The producers of ``carried`` are submitted here so
@@ -285,33 +293,50 @@ class PPWave:
             )
             self._async_thread.start()
         with self._async_cv:
-            self._async_pending += 1
-        self._async_queue.put(carried)
+            if not self._async_cv.wait_for(
+                self._async_idle, timeout=_ASYNC_LAUNCH_TIMEOUT_S
+            ):
+                raise RuntimeError(
+                    f"PP wave rank {self.rank}: a hand-off is still queued "
+                    f"after {_ASYNC_LAUNCH_TIMEOUT_S:.0f} s"
+                )
+            self._async_carried = carried
+            self._async_cv.notify_all()
 
     def _async_loop(self) -> None:
         while True:
-            carried = self._async_queue.get()
+            with self._async_cv:
+                self._async_cv.wait_for(lambda: self._async_carried is not None)
+                carried = self._async_carried
+                assert carried is not None
+                self._async_carried = None
+                self._async_busy = True
             out: tuple[torch.Tensor, ...] | None = None
             error: BaseException | None = None
             try:
                 out = self._launch_blocking(carried)
-            except BaseException as exc:  # reported on the worker thread
+            except BaseException as exc:  # raised again on the worker thread
+                logger.exception(
+                    "PP wave rank %d: the hand-off thread failed to launch",
+                    self.rank,
+                )
                 error = exc
             with self._async_cv:
-                self._async_pending -= 1
+                self._async_busy = False
                 self._async_out = out
                 if error is not None:
                     self._async_error = error
                 self._async_cv.notify_all()
 
     def _async_wait(self) -> tuple[torch.Tensor, ...] | None:
-        """Blocks until every queued launch is issued; returns the last one's
-        received buffers, once, or None when nothing was queued."""
+        """Blocks until the queued launch, if any, has been issued; raises
+        what the helper thread raised; returns the received buffers once, or
+        None when nothing was queued."""
         if not self.async_handoff:
             return None
         with self._async_cv:
             if not self._async_cv.wait_for(
-                lambda: self._async_pending == 0, timeout=_ASYNC_LAUNCH_TIMEOUT_S
+                self._async_idle, timeout=_ASYNC_LAUNCH_TIMEOUT_S
             ):
                 raise RuntimeError(
                     f"PP wave rank {self.rank}: the hand-off thread issued no "
@@ -443,6 +468,10 @@ class PPWave:
         if not self.burst_open:
             return
         with TraceAnnotation("PP:Settle"):
+            if self.rank == 0:
+                # Issues no launch of its own when the pipeline has two
+                # stages; the queued one still has to be out and good.
+                self._async_wait()
             if 0 < self.rank < self.last:
                 assert self.pending is not None
                 self._launch(self.pending)

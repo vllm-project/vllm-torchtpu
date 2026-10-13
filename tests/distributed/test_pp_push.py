@@ -97,6 +97,20 @@ def test_settles_when_the_awaited_step_is_the_newest():
     assert [c[0] for c in executor.calls] == ["pp_push", "pp_settle", "pp_settle"]
 
 
+def test_two_stages_settle_only_with_the_async_handoff(monkeypatch):
+    # Two stages pair their launches by themselves; the settle is sent only
+    # so a first stage launching from a helper thread raises what failed.
+    monkeypatch.delenv("TPU_PP_ASYNC_HANDOFF", raising=False)
+    executor = _Executor()
+    wave = pp_push._WaveState(stages=2)
+    assert _futures(executor, wave, 1)[0].result() == 1
+    assert executor.calls == []
+    monkeypatch.setenv("TPU_PP_ASYNC_HANDOFF", "1")
+    assert _futures(executor, wave, 1)[0].result() == 2
+    assert [c[0] for c in executor.calls] == ["pp_settle"]
+    assert not wave.open
+
+
 def test_the_future_forwards_to_the_executors_future():
     executor = _Executor()
     wave = pp_push._WaveState(stages=2)
