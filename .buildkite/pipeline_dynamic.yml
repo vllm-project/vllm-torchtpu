@@ -1,0 +1,60 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Dynamic pipeline for vllm-torchtpu-dev: the steps come from the build, not
+# from a file on a branch.
+#
+# A build created over the API with
+#   env.DEV_PIPELINE_FILE = .buildkite/pipeline_dynamic.yml
+#   env.DYNAMIC_PIPELINE_B64 = <the steps, as base64-encoded pipeline YAML>
+# runs those steps at the commit it names. The commit only has to exist in this
+# repository (main, say); nothing is pushed for the build. A tool that builds its
+# own image names it in the build's meta-data as CI_IMAGE_TAG, which
+# scripts/run_in_docker.sh and kubernetes/common.sh read, so the uploaded steps
+# need no build step.
+#
+# The uploaded steps run at the build's dev priority (JOB_PRIORITY, set by
+# bootstrap_dev.sh) unless they set their own.
+#
+# Example:
+#   STEPS=$(base64 -w0 <<'EOT'
+#   steps:
+#     - label: "my step"
+#       agents: { queue: tpu_v7x_2_queue }
+#       commands:
+#         - .buildkite/scripts/run_in_docker.sh python3 -c "import vllm_torchtpu"
+#   EOT
+#   )
+#   curl -X POST -H "Authorization: Bearer $BUILDKITE_API_TOKEN" \
+#     https://api.buildkite.com/v2/organizations/vllm/pipelines/vllm-torchtpu-dev/builds \
+#     -d "{\"commit\": \"$(git rev-parse origin/main)\", \"branch\": \"main\",
+#          \"message\": \"my test\",
+#          \"env\": {\"DEV_PIPELINE_FILE\": \".buildkite/pipeline_dynamic.yml\",
+#                    \"DYNAMIC_PIPELINE_B64\": \"$STEPS\"},
+#          \"meta_data\": {\"CI_IMAGE_TAG\": \"<registry>/vllm-torchtpu:<tag>\"}}"
+
+steps:
+  - label: ":pipeline: Upload dynamic steps"
+    key: upload_dynamic
+    agents:
+      queue: cpu
+    command: |
+      if [ -z "${DYNAMIC_PIPELINE_B64:-}" ]; then
+        echo "ERROR: DYNAMIC_PIPELINE_B64 is empty: this pipeline runs the steps the build passes in that variable (base64 YAML)." >&2
+        exit 1
+      fi
+      {
+        echo "priority: ${JOB_PRIORITY:-1}"
+        echo "$DYNAMIC_PIPELINE_B64" | base64 -d
+      } | buildkite-agent pipeline upload
