@@ -22,6 +22,8 @@ from vllm_torchtpu.kernels.experimental.fused_moe_decode import (
 )
 from vllm_torchtpu.layers.adapter import fused_moe_decode as adapter
 
+pytestmark = pytest.mark.multichip
+
 N, H, INTER, INTER_S, E, TOPK = 8, 1024, 256, 128, 64, 10
 F8 = jnp.float8_e4m3fn
 GLM_SCALE = 2.5  # GLM-5.2's routed_scaling_factor
