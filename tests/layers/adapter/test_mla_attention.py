@@ -1096,17 +1096,17 @@ def test_dcp_indexer_a2a_is_chosen_per_bucket(
 
 
 def test_dcp_indexer_a2a_env_defaults_and_forwarding(monkeypatch):
-    """Off by default, threshold 64, and both reach the workers on multi-host."""
+    """On by default, threshold 512, and both reach the workers on multi-host."""
     from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
     monkeypatch.delenv("TPU_DCP_INDEXER_A2A_MERGE", raising=False)
     monkeypatch.delenv("TPU_DCP_INDEXER_A2A_MIN_TOKENS", raising=False)
-    assert envs.environment_variables["TPU_DCP_INDEXER_A2A_MERGE"]() is False
-    assert envs.environment_variables["TPU_DCP_INDEXER_A2A_MIN_TOKENS"]() == 64
-
-    monkeypatch.setenv("TPU_DCP_INDEXER_A2A_MERGE", "1")
-    monkeypatch.setenv("TPU_DCP_INDEXER_A2A_MIN_TOKENS", "256")
     assert envs.environment_variables["TPU_DCP_INDEXER_A2A_MERGE"]() is True
+    assert envs.environment_variables["TPU_DCP_INDEXER_A2A_MIN_TOKENS"]() == 512
+
+    monkeypatch.setenv("TPU_DCP_INDEXER_A2A_MERGE", "0")
+    monkeypatch.setenv("TPU_DCP_INDEXER_A2A_MIN_TOKENS", "256")
+    assert envs.environment_variables["TPU_DCP_INDEXER_A2A_MERGE"]() is False
     assert envs.environment_variables["TPU_DCP_INDEXER_A2A_MIN_TOKENS"]() == 256
 
     monkeypatch.setenv("TPU_DCP_INDEXER_A2A_MIN_TOKENS", "-1")

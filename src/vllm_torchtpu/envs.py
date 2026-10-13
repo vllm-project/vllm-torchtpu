@@ -94,8 +94,8 @@ if TYPE_CHECKING:
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
-    TPU_DCP_INDEXER_A2A_MERGE: bool = False
-    TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
+    TPU_DCP_INDEXER_A2A_MERGE: bool = True
+    TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 512
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
@@ -752,12 +752,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Merge the DCP indexer candidates with an all-to-all over the token axis
     # instead of an all-gather over the candidate axis. Same result.
-    "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=False),
+    "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=True),
     # Smallest padded token bucket that takes the all-to-all merge when
     # TPU_DCP_INDEXER_A2A_MERGE is on. The bucket is static, so each compiled
     # variant picks one merge with no runtime cost.
     "TPU_DCP_INDEXER_A2A_MIN_TOKENS": env_nonnegative_int(
-        "TPU_DCP_INDEXER_A2A_MIN_TOKENS", 64
+        "TPU_DCP_INDEXER_A2A_MIN_TOKENS", 512
     ),
     # Indexer K-cache writer and layout mode for GLM-5.2 / DSv4 StreamIndex:
     #   "sal" (default): Pallas coalesced_kv_append(_dcp) in SEQ_ALONG_LANE layout
