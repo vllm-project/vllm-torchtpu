@@ -15,9 +15,9 @@ inside the kernel, so no XLA all-reduce follows:
      to 1e-20, rounded to bf16; rows >= n_valid get weight 0;
   4. the experts any row picked go VMEM -> SMEM and are compacted; the first
      _NUM_BUFFERS of them start their weight DMAs as they are recorded;
-  5. x quantized to FP8 per row; this rank's slice of the shared expert
-     (xla_quantized_matmul's arithmetic and the usual TP path's bf16
-     roundings);
+  5. x quantized to FP8 once per row with quantize_block, as
+     xla_quantized_matmul does, for the shared and the routed experts; this
+     rank's slice of the shared expert (the usual TP path's bf16 roundings);
   6. the routed experts, streamed through a ring of _NUM_BUFFERS weight slots
      with each gate_up matmul issued one expert ahead;
   7. bf16(bf16(shared) + bf16(bf16(routed) * routed_scale)), the usual TP
@@ -37,6 +37,7 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
+from vllm_torchtpu.kernels.quantized_matmul.util import quantize_block
 
 FP8 = jnp.float8_e4m3fn
 FP8_MAX = float(jnp.finfo(FP8).max)
@@ -45,8 +46,6 @@ ROW_BUCKETS = (16, 32)
 ROUTER_NEG = -3.0e38
 # moe_routing: weights / clamp(sum, min=1e-20).
 SUM_FLOOR = 1e-20
-# The shared expert quantizes x in QUANT_BLOCK-column chunks.
-QUANT_BLOCK = 512
 PAIR = 128
 # VMEM limit = need x headroom (Mosaic temporaries), refused above a fraction
 # of the capacity so neighbouring XLA ops keep room.
@@ -79,7 +78,7 @@ def _vmem_plan(m, h, i, num_experts, shared_inter, info, spec):
         + t((1, 2 * shared_inter), f32)
         + t((shared_inter, h), FP8)  # shared down
         + t((1, h), f32)
-        + 2 * t((m, h), FP8)  # sxq, xq
+        + t((m, h), FP8)  # xq
         + t((m, 2 * i), f32)  # xs
         + 2 * t((m, h), f32)  # owner, shared
         + t((m, e_pad), f32)  # wtab
@@ -139,7 +138,7 @@ def can_use_moe_tp_decode(
         return False
     if not 0 < topk <= num_experts or i <= 0 or i % info.num_lanes:
         return False
-    if h % QUANT_BLOCK or h % _N_CHUNK or shared_inter <= 0 or shared_inter % PAIR:
+    if h % _N_CHUNK or shared_inter <= 0 or shared_inter % PAIR:
         return False
     if out != h or w13.shape != (experts, h, 2 * i):
         return False
@@ -186,38 +185,20 @@ def _route(scores, bias, n_valid, *, topk):
     return jnp.where(jnp.logical_and(chosen, valid), w.astype(jnp.float32), 0.0)
 
 
-def _row_scale(amax):
-    """quantize_tensor's per-row scale: amax / FP8 max, 0 replaced by 1."""
-    scale = amax / FP8_MAX
-    return jnp.where(scale == 0, 1.0, scale)
-
-
-def _to_fp8(v):
-    return jnp.clip(v, -FP8_MAX, FP8_MAX).astype(FP8)
-
-
-def _shared_expert(x_ref, sxq_ref, sw13_ref, ss13_ref, sw2_ref, ss2_ref, out_ref):
+def _shared_expert(xq_ref, xs, sw13_ref, ss13_ref, sw2_ref, ss2_ref, out_ref):
     """This rank's slice of the shared expert into out_ref (f32), as
-    xla_quantized_matmul twice: x quantized per row over its full K (true
-    division, clip), f32 dot, x scale then weight scale; the usual TP path's
-    bf16 roundings between the projections; the down projection stays f32."""
-    m, h = x_ref.shape
+    xla_quantized_matmul twice on x already quantized by quantize_block
+    (xq_ref, row scales xs): f32 dot, x scale then weight scale; the usual TP
+    path's bf16 roundings between the projections; the down projection stays
+    f32."""
     shared_inter = sw2_ref.shape[0]
-    amax = jnp.zeros((m, 1), jnp.float32)
-    for k in range(0, h, QUANT_BLOCK):
-        block = x_ref[:, k : k + QUANT_BLOCK].astype(jnp.float32)
-        amax = jnp.maximum(amax, jnp.max(jnp.abs(block), axis=1, keepdims=True))
-    xs = _row_scale(amax)
-    for k in range(0, h, QUANT_BLOCK):
-        block = x_ref[:, k : k + QUANT_BLOCK].astype(jnp.float32)
-        sxq_ref[:, k : k + QUANT_BLOCK] = _to_fp8(block / xs)
-    gu = jnp.dot(sxq_ref[...], sw13_ref[...], preferred_element_type=jnp.float32)
+    gu = jnp.dot(xq_ref[...], sw13_ref[...], preferred_element_type=jnp.float32)
     gu = (gu * xs * ss13_ref[...]).astype(jnp.bfloat16).astype(jnp.float32)
     gate, up = gu[:, :shared_inter], gu[:, shared_inter:]
     act = jax.nn.silu(gate).astype(jnp.bfloat16).astype(jnp.float32) * up
-    act = act.astype(jnp.bfloat16).astype(jnp.float32)
-    act_scale = _row_scale(jnp.max(jnp.abs(act), axis=1, keepdims=True))
-    act_q = _to_fp8(act / act_scale)
+    act_q, act_scale = quantize_block(
+        act.astype(jnp.bfloat16), axis=1, target_dtype=FP8
+    )
     y = jnp.dot(act_q, sw2_ref[...], preferred_element_type=jnp.float32)
     out_ref[...] = y * act_scale * ss2_ref[...]
 
@@ -254,7 +235,6 @@ def _kernel(
     ss13_ref,
     sw2_ref,
     ss2_ref,
-    sxq_ref,
     xq_ref,
     xs_ref,
     owner_ref,
@@ -332,15 +312,16 @@ def _kernel(
     count = lax.fori_loop(0, local_experts, compact, jnp.int32(0))
 
     # Zeroing and x quantization follow the compaction, so the first weight
-    # copies are already in flight while they run.
+    # copies are already in flight while they run. x is quantized once, as
+    # xla_quantized_matmul does; the shared and the routed experts both read
+    # xq_ref.
     owner_ref[...] = jnp.zeros((m, h), jnp.float32)
-    x = x_ref[...].astype(jnp.float32)
-    xsc = jnp.max(jnp.abs(x), axis=1, keepdims=True) / FP8_MAX
-    xq_ref[...] = (x * jnp.where(xsc == 0, 0.0, 1.0 / xsc)).astype(FP8)
-    xs_ref[...] = jnp.broadcast_to(xsc, (m, 2 * i))
+    xq, xs = quantize_block(x_ref[...], axis=1, target_dtype=FP8)
+    xq_ref[...] = xq
+    xs_ref[...] = jnp.broadcast_to(xs, (m, 2 * i))
     for copy in shared_copies:
         copy.wait()
-    _shared_expert(x_ref, sxq_ref, sw13_ref, ss13_ref, sw2_ref, ss2_ref, shared_ref)
+    _shared_expert(xq_ref, xs, sw13_ref, ss13_ref, sw2_ref, ss2_ref, shared_ref)
 
     expert_columns = lax.broadcasted_iota(jnp.int32, wtab_ref.shape, 1)
 
@@ -512,7 +493,6 @@ def moe_tp_decode(
                 pltpu.VMEM((1, 2 * shared_inter), jnp.float32),
                 pltpu.VMEM((shared_inter, h), FP8),
                 pltpu.VMEM((1, h), jnp.float32),
-                pltpu.VMEM((m, h), FP8),
                 pltpu.VMEM((m, h), FP8),
                 pltpu.VMEM((m, 2 * i), jnp.float32),
                 pltpu.VMEM((m, h), jnp.float32),
