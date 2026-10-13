@@ -14,15 +14,17 @@
 # limitations under the License.
 
 # The engine image of the Kimi-K3 megakernel lane, published as the build's
-# K3_ENGINE_IMAGE metadata for k3_mk_submit.sh. The engines serve code from
-# another branch than the one this build runs (the megakernel integration
-# branch does not merge into main cleanly), while the client and the lane's
-# scripts stay on this build's commit.
+# K3_ENGINE_IMAGE metadata, which common.sh hands the AgentX manifest. The
+# engines serve code from another branch than the one this build runs (the
+# megakernel integration branch does not merge into main cleanly), while the
+# client and the pair's scripts stay on this build's commit.
 #
 #   K3_ENGINE_IMAGE=<image>  use that image as it is
-#   K3_ENGINE_REF=<ref>      build the image from that branch, tag or commit of
-#                            this repo (default inferact/megakernel-integration),
-#                            or reuse it if the registry already has it
+#   K3_ENGINE_REF=<ref>      build the image from that ref of this repo - a
+#                            branch, a tag, a full 40-character commit SHA (git
+#                            cannot fetch a short one) or refs/pull/<N>/head;
+#                            default inferact/megakernel-integration - or reuse
+#                            it if the registry already has it
 set -euo pipefail
 
 if [ -n "${K3_ENGINE_IMAGE:-}" ]; then

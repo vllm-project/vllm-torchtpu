@@ -12,26 +12,25 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# Kimi-K3 AgentX on the megakernel backend. The AgentX lane's client
-# (k3_agentx_client_pod.sh: the toy proxy and the InferenceX trace replay)
-# against a prefill/decode pair served as the "Kimi-K3 on TPU7x: 1P1D
-# prefill/decode recipes" doc serves it: TP32 per role on two tpu7x 2x2x4
-# slices, the TP32 pre-shard in the model bucket, DSpark decode, Raiden
-# prefill-to-decode transfer and vLLM's Rust frontend
-# (kimi-k3-mk-agentx-1p1d.yaml, kimi-k3-mk-tp32-1p1d-agentx.sh). The engines
-# run an image built from another branch; the client and this lane's scripts
-# come from the build's commit.
+
+# Kimi-K3 AgentX on the megakernel backend: one recipe point of the "Kimi-K3
+# on TPU7x: 1P1D prefill/decode recipes" doc (configs/kimi-k3-megakernel/) on
+# the AgentX 1P1D pair (kimi-k3-agentx-1p1d.yaml) - TP32 per role on two tpu7x
+# 2x2x4 slices, served with --nnodes by k3_1p1d.sh - and replayed by the pair's
+# client through vllm-router. The engines run an image built from another
+# branch; the client and the pair's scripts come from the build's commit.
 #
 # HOW TO TRIGGER
 # ──────────────
-# Manual builds only. Own Buildkite pipeline, trigger mode "none" and no
-# schedule, whose "Steps" setting is
-#   DEV_PIPELINE_FILE=.buildkite/pipeline_k3_megakernel_agentx.yml bash .buildkite/scripts/bootstrap_dev.sh
-# then "New Build" with any of these in the build's environment. Or select
-# this file on vllm-torchtpu-dev with DEV_PIPELINE_FILE.
+# Manual builds on vllm-torchtpu-dev, with this file selected:
+#   DEV_PIPELINE_FILE=.buildkite/pipeline_k3_megakernel_agentx.yml
+# and any of these in the build's environment:
 #
-#   K3_MK_POINT      the doc's point, 1-5 (6-7 experimental); default 1
-#   K3_ENGINE_REF    branch, tag or commit the engine image is built from;
+#   K3_PD_CONFIG     the point: kimi-k3-megakernel/p1-c1 (default) ...
+#                    kimi-k3-megakernel/p7-c16 (p6, p7 experimental)
+#   K3_ENGINE_REF    the ref of this repository the engine image is built from:
+#                    a branch name, a tag, a full 40-character commit SHA (not a
+#                    short one, which cannot be fetched) or refs/pull/<N>/head;
 #                    default inferact/megakernel-integration
 #   K3_ENGINE_IMAGE  an engine image to use as it is, instead of building one
 #
@@ -48,8 +47,8 @@ env:
   ARTIFACTS_DIR: "perf_eval_results"
 
 steps:
-  # The client image: docker/Dockerfile --target dev at this commit, the same
-  # build pipeline_build.yml runs.
+  # The client image, and the source of the pair's scripts: docker/Dockerfile
+  # --target dev at this commit, the same build pipeline_build.yml runs.
   - label: ":docker: Build and Push Dev Image"
     key: build_docker
     agents:
@@ -57,6 +56,7 @@ steps:
     commands:
       - bash .buildkite/scripts/setup_docker_env.sh
 
+  # Publishes K3_ENGINE_IMAGE, which common.sh hands the manifest.
   - label: ":docker: Build Kimi-K3 megakernel engine image"
     key: k3_engine_image
     agents:
@@ -64,7 +64,7 @@ steps:
     commands:
       - bash .buildkite/scripts/build_k3_engine_image.sh
 
-  - label: ":kubernetes: :tpu: Perf: Kimi-K3 megakernel AgentX 1P1D point ${K3_MK_POINT:-1} (TPU v7x 2x2x4 x2)"
+  - label: ":kubernetes: :tpu: Perf: Kimi-K3 AgentX 1P1D ${K3_PD_CONFIG:-kimi-k3-megakernel/p1-c1} (TPU v7x 2x2x4 x2)"
     key: k3_mk_agentx_1p1d
     depends_on:
       - build_docker
@@ -75,6 +75,7 @@ steps:
     concurrency: 1
     timeout_in_minutes: 1440
     env:
+      K3_PD_CONFIG: "${K3_PD_CONFIG:-kimi-k3-megakernel/p1-c1}"
       # bootstrap_dev.sh leaves its builds unclassed: Kueue priority 0, ahead of
       # the nightlies and behind every other kind of build. post-merge queues
       # this one with main, and it preempts: the 2x2x4 ClusterQueue reclaims
@@ -88,4 +89,8 @@ steps:
       - kubernetes:
           podTemplate: tpu-launcher
     commands:
-      - .buildkite/kubernetes/k3_mk_submit.sh
+      # A misspelt point fails here rather than in eight pods after admission.
+      - |
+        test -f "scripts/vllm/benchmarking/configs/$${K3_PD_CONFIG}.sh" \
+          || { echo "no such config: $${K3_PD_CONFIG}" >&2; exit 2; }
+      - .buildkite/kubernetes/run_multihost.sh --manifest kimi-k3-agentx-1p1d.yaml
