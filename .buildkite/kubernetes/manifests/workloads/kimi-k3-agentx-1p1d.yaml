@@ -13,13 +13,23 @@
 # limitations under the License.
 
 # Kimi-K3 1P1D serving the InferenceX AgentX trace replay: prefill and decode
-# each TP8 x DP4 x EP32 on a 2x2x4 slice (k3_1p1d.sh), driven by a chipless
-# client pod that owns the proxy and the benchmark (k3_agentx_client_pod.sh).
-# The client runs off the slices because aiperf's replay is the measurement.
+# each on a 2x2x4 slice (k3_1p1d.sh), driven by a chipless client pod that
+# owns the proxy and the benchmark (k3_agentx_client_pod.sh). The client runs
+# off the slices because aiperf's replay is the measurement. Which pair is
+# K3_PD_CONFIG: the nightly's TP8 x DP4 x EP32 by default, or a step's own,
+# such as a recipe point under configs/kimi-k3-megakernel/.
+#
+# Two images. The engines run ${K3_ENGINE_IMAGE}, the vLLM build under
+# measurement, which need not carry this repository's scripts: an init
+# container lays this commit's .buildkite/kubernetes and benchmark configs
+# over the engine image's, out of ${IMAGE}. The client runs ${IMAGE}.
+# common.sh defaults K3_ENGINE_IMAGE to the build's own image, so the nightly
+# is a one-image run of the commit.
 #
 # Exclusive-topology gives each engine role a slice of its own rather than
-# splitting both across the two. ${WORKLOAD_NAME} and ${IMAGE} are substituted
-# before submission, so a literal dollar is $$; every container is `workload`.
+# splitting both across the two. ${WORKLOAD_NAME}, ${IMAGE} and
+# ${K3_ENGINE_IMAGE} are substituted before submission, so a literal dollar is
+# $$; every main container is `workload`.
 
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
@@ -60,9 +70,16 @@ spec:
               nodeSelector:
                 cloud.google.com/gke-tpu-topology: 2x2x4
                 cloud.google.com/gke-tpu-accelerator: tpu7x
+              initContainers:
+                - name: scripts
+                  image: ${IMAGE}
+                  command: ["/bin/bash", "-c", "cd /workspace/vllm-torchtpu && cp -a --parents .buildkite/kubernetes scripts/vllm/benchmarking/configs /scripts/"]
+                  volumeMounts:
+                    - name: scripts
+                      mountPath: /scripts
               containers:
                 - name: workload
-                  image: ${IMAGE}
+                  image: ${K3_ENGINE_IMAGE}
                   command: ["/bin/bash", "/workspace/vllm-torchtpu/.buildkite/kubernetes/k3_1p1d.sh", "prefill"]
                   env:
                     # Host i of this role is <prefix>i.<domain>.
@@ -74,7 +91,8 @@ spec:
                       value: ${WORKLOAD_NAME}-decode-0-0.${WORKLOAD_NAME}
                     - name: NUM_HOSTS
                       value: "4"
-                    # Both roles and the client read this one config.
+                    # Both roles and the client read this one config; a step
+                    # that forwards K3_PD_CONFIG overrides it.
                     - name: K3_PD_CONFIG
                       value: kimi-k3-tp8-dp4-ep-agentx
                     # Serve only; the client pod drives the run.
@@ -105,15 +123,41 @@ spec:
                     requests:
                       google.com/tpu: "4"
                   volumeMounts:
+                    # This commit's scripts and configs, over the engine
+                    # image's own.
+                    - name: scripts
+                      mountPath: /workspace/vllm-torchtpu/.buildkite/kubernetes
+                      subPath: .buildkite/kubernetes
+                      readOnly: true
+                    - name: scripts
+                      mountPath: /workspace/vllm-torchtpu/scripts/vllm/benchmarking/configs
+                      subPath: scripts/vllm/benchmarking/configs
+                      readOnly: true
                     # profile_cache must not persist, or a later run loads the
                     # kv=0 graph instead of compiling it.
                     - name: vllm-profile-cache
                       mountPath: /cache/jax/vllm/profile_cache
+                    # The K3 checkpoint (config, tokenizer, remote code; the
+                    # recipe's weights are a pre-shard under /cache/hf/hub),
+                    # in a bucket the fleet does not mount.
+                    - name: k3-checkpoint
+                      mountPath: /ckpt/k3
+                      readOnly: true
               volumes:
+                - name: scripts
+                  emptyDir: {}
                 - name: vllm-profile-cache
                   emptyDir:
                     medium: Memory
                     sizeLimit: 16Gi
+                - name: k3-checkpoint
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    readOnly: true
+                    volumeAttributes:
+                      bucketName: tpu-commons-ci
+                      mountOptions: "implicit-dirs,only-dir=moonshootai/kimi/k3,metadata-cache:ttl-secs:-1,metadata-cache:stat-cache-max-size-mb:-1,metadata-cache:type-cache-max-size-mb:-1"
+                      skipCSIBucketAccessCheck: "true"
 
     - name: decode
       groupName: decode
@@ -130,9 +174,16 @@ spec:
               nodeSelector:
                 cloud.google.com/gke-tpu-topology: 2x2x4
                 cloud.google.com/gke-tpu-accelerator: tpu7x
+              initContainers:
+                - name: scripts
+                  image: ${IMAGE}
+                  command: ["/bin/bash", "-c", "cd /workspace/vllm-torchtpu && cp -a --parents .buildkite/kubernetes scripts/vllm/benchmarking/configs /scripts/"]
+                  volumeMounts:
+                    - name: scripts
+                      mountPath: /scripts
               containers:
                 - name: workload
-                  image: ${IMAGE}
+                  image: ${K3_ENGINE_IMAGE}
                   command: ["/bin/bash", "/workspace/vllm-torchtpu/.buildkite/kubernetes/k3_1p1d.sh", "decode"]
                   env:
                     # Host i of this role is <prefix>i.<domain>.
@@ -144,7 +195,8 @@ spec:
                       value: ${WORKLOAD_NAME}-decode-0-0.${WORKLOAD_NAME}
                     - name: NUM_HOSTS
                       value: "4"
-                    # Both roles and the client read this one config.
+                    # Both roles and the client read this one config; a step
+                    # that forwards K3_PD_CONFIG overrides it.
                     - name: K3_PD_CONFIG
                       value: kimi-k3-tp8-dp4-ep-agentx
                     # Serve only; the client pod drives the run.
@@ -170,13 +222,34 @@ spec:
                     requests:
                       google.com/tpu: "4"
                   volumeMounts:
+                    - name: scripts
+                      mountPath: /workspace/vllm-torchtpu/.buildkite/kubernetes
+                      subPath: .buildkite/kubernetes
+                      readOnly: true
+                    - name: scripts
+                      mountPath: /workspace/vllm-torchtpu/scripts/vllm/benchmarking/configs
+                      subPath: scripts/vllm/benchmarking/configs
+                      readOnly: true
                     - name: vllm-profile-cache
                       mountPath: /cache/jax/vllm/profile_cache
+                    - name: k3-checkpoint
+                      mountPath: /ckpt/k3
+                      readOnly: true
               volumes:
+                - name: scripts
+                  emptyDir: {}
                 - name: vllm-profile-cache
                   emptyDir:
                     medium: Memory
                     sizeLimit: 16Gi
+                - name: k3-checkpoint
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    readOnly: true
+                    volumeAttributes:
+                      bucketName: tpu-commons-ci
+                      mountOptions: "implicit-dirs,only-dir=moonshootai/kimi/k3,metadata-cache:ttl-secs:-1,metadata-cache:stat-cache-max-size-mb:-1,metadata-cache:type-cache-max-size-mb:-1"
+                      skipCSIBucketAccessCheck: "true"
 
     # Chipless, so it is scheduled by its requests onto a worker-cpu node rather
     # than onto a slice, as qwen3.5-397b-1p1d.yaml's benchmark role is.

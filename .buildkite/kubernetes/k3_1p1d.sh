@@ -13,24 +13,34 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# One pod of the Kimi-K3 1P1D test. Prefill and decode each get a 2x2x4 slice,
-# four hosts, and serve TP8 x DP4 x EP32 over vLLM's own multi-node DP, one DP
-# replica per host.
+# One pod of a Kimi-K3 1P1D pair. Prefill and decode each get a 2x2x4 slice,
+# four hosts, and serve the config K3_PD_CONFIG names over the slice.
 #
 #   k3_1p1d.sh prefill|decode          every pod of the role's slice
 #
-# The launch is mp_multihost_entry.sh's, which serves a config under
-# run_eval_flow.sh and so cannot front a pair: index 0 serves the API at the
-# role's --data-parallel-address, the other hosts join it --headless at their
-# start rank. Both engines serve the kimi-k3-tp8-dp4-ep-1p1d config, which
-# holds the serve flags and the Raiden environment of each. The prefill head
-# then fronts the pair with the toy proxy, checks a few greedy completions
-# through it, runs the correctness stages and the MMLU-Pro eval through it, and
-# exits; the JobSet's success policy tears decode down.
+# Two launches, chosen by the config's K3_1P1D_LAUNCH:
+#   dp (the default): TP8 x DP4 x EP32 over vLLM's own multi-node DP, one DP
+#     replica per host, as mp_multihost_entry.sh launches it: index 0 serves
+#     the API at the role's --data-parallel-address, the other hosts join it
+#     --headless at their start rank. The config holds the serve flags and the
+#     Raiden environment in run_benchmarks.sh's vocabulary (kimi-k3-tp8-dp4-ep-
+#     1p1d.sh and what builds on it).
+#   nnodes: one TP32 rank group over the four hosts via `--nnodes`, the same
+#     `vllm serve` on every host, index 0 as --master-addr. The config states
+#     the complete SERVE_ARGS itself (configs/kimi-k3-megakernel/); only an external
+#     client drives this launch.
 #
-# Environment, from manifests/workloads/kimi-k3-1p1d-4dp8tp.yaml: POD_IP,
-# ROLE_HOST_PREFIX and ROLE_HOST_DOMAIN (host i of this role is
-# <prefix>i.<domain>), DECODE_HOST (decode's index 0), NUM_HOSTS.
+# Unless K3_PD_EXTERNAL_CLIENT=1, the prefill head then fronts the pair with the
+# toy proxy, checks a few greedy completions through it, runs the correctness
+# stages and the MMLU-Pro eval through it, and exits; the JobSet's success
+# policy tears decode down. With it, the engines only serve and a client pod
+# (k3_agentx_client_pod.sh) drives the pair.
+#
+# Environment, from the manifest (kimi-k3-1p1d-4dp8tp.yaml or
+# kimi-k3-agentx-1p1d.yaml): POD_IP, ROLE_HOST_PREFIX and ROLE_HOST_DOMAIN
+# (host i of this role is <prefix>i.<domain>), DECODE_HOST (decode's index 0),
+# NUM_HOSTS. K3_1P1D_DRY_RUN=1 prints the serve command and the environment,
+# checks the config's inputs and stops.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -76,10 +86,48 @@ DP_ADDRESS="${hosts[0]}"
 echo "--- ${role} host ${INDEX}/${NUM_HOSTS}: data-parallel address ${DP_ADDRESS}," \
   "advertise hosts ${TPU_RAIDEN_ADVERTISE_HOST}"
 
-# Best effort, as k3_1p1d.sh: index 0's API server imports the model's remote
-# code before any worker exists; elsewhere the workers would race to write it.
-# The subshell keeps that config's variables out of this script.
-if [[ "$INDEX" != "0" ]]; then
+# The serve flags and the Raiden environment of this role, over the defaults
+# run_benchmarks.sh applies before sourcing a config. The addresses, for a
+# config that builds its own command: host 0 of the role, this host, its rank.
+export K3_1P1D_ROLE="$role"
+export HEAD_IP="$DP_ADDRESS" NODE_IP="$POD_IP" NODE_RANK="$INDEX"
+MODEL_URI="${MODEL_URI:-}"
+ENABLE_EP=false
+QUANTIZATION=""
+ATTENTION_BACKEND="CUSTOM"
+ASYNC_SCHEDULING=true
+EXTRA_SERVE_ARGS=""
+K3_1P1D_LAUNCH=dp
+K3_1P1D_INPUTS=()
+SERVE_ARGS=()
+# shellcheck source=/dev/null
+source "scripts/vllm/benchmarking/configs/${CONFIG}.sh" || exit 2
+case "$K3_1P1D_LAUNCH" in
+  dp)
+    mp_serve_args || exit 2
+    ;;
+  nnodes)
+    if [[ "${#SERVE_ARGS[@]}" -eq 0 ]]; then
+      echo "ERROR: ${CONFIG} launches with --nnodes but sets no SERVE_ARGS" >&2
+      exit 2
+    fi
+    if [[ "${K3_PD_EXTERNAL_CLIENT:-0}" != "1" ]]; then
+      echo "ERROR: the --nnodes launch has no driver of its own; set K3_PD_EXTERNAL_CLIENT=1" >&2
+      exit 2
+    fi
+    SERVE_ARGS+=(--nnodes "$NUM_HOSTS" --node-rank "$INDEX" --master-addr "$DP_ADDRESS")
+    ;;
+  *)
+    echo "ERROR: ${CONFIG} sets K3_1P1D_LAUNCH='${K3_1P1D_LAUNCH}'; expected dp or nnodes" >&2
+    exit 2
+    ;;
+esac
+export PYTHONUNBUFFERED=1
+
+# Best effort: under DP, index 0's API server imports the model's remote code
+# before any worker exists; elsewhere the workers would race to write it. The
+# subshell keeps that config's variables out of this script.
+if [[ "$K3_1P1D_LAUNCH" == "dp" && "$INDEX" != "0" ]]; then
   # shellcheck source=/dev/null
   uri=$(source scripts/vllm/benchmarking/configs/kimi-k3-tp32-ep.sh >/dev/null \
     && echo "$MODEL_URI") \
@@ -87,25 +135,34 @@ if [[ "$INDEX" != "0" ]]; then
     || echo "WARNING: could not warm the model's remote code"
 fi
 
-# The serve flags and the Raiden environment of this role, over the defaults
-# run_benchmarks.sh applies before sourcing a config.
-export K3_1P1D_ROLE="$role"
-MODEL_URI="${MODEL_URI:-}"
-ENABLE_EP=false
-QUANTIZATION=""
-ATTENTION_BACKEND="CUSTOM"
-ASYNC_SCHEDULING=true
-EXTRA_SERVE_ARGS=""
-# shellcheck source=/dev/null
-source "scripts/vllm/benchmarking/configs/${CONFIG}.sh" || exit 2
-mp_serve_args || exit 2
-export PYTHONUNBUFFERED=1
+# The files the config's loader needs, named by the config; a path that is not
+# there is reported before the boot would spend an hour finding out.
+missing=0
+for f in "${K3_1P1D_INPUTS[@]}"; do
+  if [[ -e "$f" ]]; then echo "found   $f"; else echo "MISSING $f"; missing=1; fi
+done
 
-# K3_1P1D_DRY_RUN=1: print the serve command and environment and stop.
+# K3_1P1D_DRY_RUN=1: print the serve command and environment and stop. Under an
+# external client the pod idles instead, Ready for the client's own dry run,
+# whose finish ends the JobSet.
 if [[ "${K3_1P1D_DRY_RUN:-0}" == "1" ]]; then
   printf '[cmd] vllm serve'; printf ' %q' "${SERVE_ARGS[@]}"; echo
-  env | grep -E '^(TPU_|VLLM_|K3_)' | sort
+  env | grep -E '^(TPU_|VLLM_|K3_|HF_|TORCH_TPU_|LIBTPU_|RAIDEN_|XLA_|ONEHOT_|NPROC=)' | sort
+  if [[ "${K3_PD_EXTERNAL_CLIENT:-0}" == "1" ]]; then
+    echo "--- dry run: idling for the client"
+    sleep 1200
+  fi
   exit 0
+fi
+if [[ "$missing" == "1" ]]; then
+  echo "ERROR: inputs missing; not booting" >&2
+  exit 2
+fi
+
+if [[ "$K3_1P1D_LAUNCH" == "nnodes" ]]; then
+  echo "--- Starting ${role} host ${INDEX} (node rank ${INDEX} of ${NUM_HOSTS}, master ${DP_ADDRESS})"
+  vllm serve "${SERVE_ARGS[@]}" --host 0.0.0.0 --port "$PORT"
+  exit $?
 fi
 
 if [[ "$INDEX" != "0" ]]; then

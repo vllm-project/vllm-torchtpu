@@ -42,6 +42,9 @@ if [[ -z "${WORKLOAD_IMAGE:-}" ]]; then
   exit 2
 fi
 export WORKLOAD_IMAGE
+# The image the Kimi-K3 pair's engines run (kimi-k3-agentx-1p1d.yaml): the
+# step's, else this build's. Read by the launcher's manifest rendering.
+export K3_ENGINE_IMAGE="${K3_ENGINE_IMAGE:-$WORKLOAD_IMAGE}"
 
 # Anything exported here must also be named in FORWARD below: the launcher
 # forwards only what --env names.
@@ -101,6 +104,9 @@ FORWARD=(
   # K3_AGENTX_EVAL_ONLY build trigger), the eval smoke, and skipping the
   # post-replay eval.
   AGENTX_EVAL_JOB AGENTX_EVAL_SMOKE AGENTX_SKIP_POST_EVAL
+  # The pair's config (kimi-k3-agentx-1p1d.yaml); a shorter window and warmup
+  # for a check, the boot wait, and the dry run (k3_1p1d.sh).
+  K3_PD_CONFIG AGENTX_DURATION AGENTX_FAST AGENTX_READY_WAIT_MIN K3_1P1D_DRY_RUN
 )
 
 # The `tests` plugin mints these on the agent and their two-hour life starts

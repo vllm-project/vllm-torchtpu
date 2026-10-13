@@ -43,7 +43,8 @@
 #   ARTIFACTS_DIR   where results go, uploaded as the step's artifacts
 #   AGENTX_CHIPS    physical TPU chips serving the pair; no default
 # Optional: AGENTX_DURATION, AGENTX_FAST, AGENTX_GSM8K_LIMIT, AGENTX_GSM8K_CONC,
-#   AGENTX_IX_REF, AGENTX_GCS_ROOT, AGENTX_READY_WAIT_MIN, AGENTX_EVAL_JOB=1
+#   AGENTX_IX_REF, AGENTX_GCS_ROOT, AGENTX_READY_WAIT_MIN, K3_1P1D_DRY_RUN=1
+#   (the engines did not boot: check the config and stop), AGENTX_EVAL_JOB=1
 #   (set by the eval step alone, not the build: a build-level value reaches
 #   every step's pods, and the throughput step must not take this branch),
 #   AGENTX_EVAL_SMOKE=1 (the evals as a link check, not a result: 20 GSM8K
@@ -82,17 +83,38 @@ CONFIG_FILE="$CONFIG_DIR/${CONFIG}.sh"
 [ -f "$CONFIG_FILE" ] || { log "FATAL: no such config: $CONFIG_FILE"; exit 2; }
 
 # The cases and the server size the engines booted with, read in a subshell with
-# the role set because the config branches on it. The suite list travels comma
-# joined, or as "-" when there is none, so it stays one field. The ladder is
-# read last: read's final variable takes the rest of the line.
+# the role set because the config branches on it. One shell-quoted NAME=value
+# line per variable, so an empty or spaced value stays its own field; here
+# they become CFG_<NAME>. What the config may state, with its default:
+#   MAX_NUM_SEQS TENSOR_PARALLELISM DATA_PARALLELISM ENABLE_EP   the geometry
+#   AGENTX_CONC_LIST AGENTX_MODEL_PREFIX AGENTX_PRECISION          required
+#   AGENTX_POST_EVAL_SUITES  the suites after the replay ("" = none)
+#   AGENTX_PROXY             toy | router
+#   AGENTX_SPEC_METHOD       the row's speculation label (none)
+#   AGENTX_LABEL             the run label (agentx_<config>)
+#   AGENTX_MAX_MODEL_LEN     told to aiperf when the server does not report it
+#   AGENTX_GSM8K_LIMIT       the default for the env's AGENTX_GSM8K_LIMIT
+#   AGENTX_ALLOW_QUEUEING    1: the ladder may exceed what MAX_NUM_SEQS admits
+#   AGENTX_DECODE_DCP_SIZE AGENTX_DECODE_ATTN_DP  decode's DCP (1) and attention
+#                            groups (1), for the row's topology
+_cfg_names="MAX_NUM_SEQS TENSOR_PARALLELISM DATA_PARALLELISM ENABLE_EP AGENTX_CONC_LIST
+    AGENTX_MODEL_PREFIX AGENTX_PRECISION AGENTX_POST_EVAL_SUITES AGENTX_PROXY AGENTX_SPEC_METHOD
+    AGENTX_LABEL AGENTX_MAX_MODEL_LEN AGENTX_GSM8K_LIMIT AGENTX_ALLOW_QUEUEING
+    AGENTX_DECODE_DCP_SIZE AGENTX_DECODE_ATTN_DP"
 _cfg=$(
     export K3_1P1D_ROLE=decode
     # shellcheck source=/dev/null
     source "$CONFIG_FILE" >/dev/null || exit 3
-    _post=$(printf '%s' "${AGENTX_POST_EVAL_SUITES:-}" | tr -s ' ' ',')
-    echo "${MAX_NUM_SEQS:-0} ${TENSOR_PARALLELISM:-0} ${DATA_PARALLELISM:-0} ${ENABLE_EP:-false} ${AGENTX_MODEL_PREFIX:-} ${AGENTX_PRECISION:-} ${_post:--} ${AGENTX_PROXY:-toy} ${AGENTX_CONC_LIST:-}"
+    for _n in $_cfg_names; do printf '%s=%q\n' "$_n" "${!_n:-}"; done
 ) || { log "FATAL: $CONFIG failed to load; the engines would have failed the same way"; exit 2; }
-read -r CFG_MAX_NUM_SEQS CFG_TP CFG_DP CFG_ENABLE_EP CFG_MODEL_PREFIX CFG_PRECISION CFG_POST_EVAL_SUITES CFG_PROXY CFG_CONC_LIST <<< "$_cfg"
+while IFS= read -r _line; do eval "CFG_$_line"; done <<< "$_cfg"
+CFG_MAX_NUM_SEQS="${CFG_MAX_NUM_SEQS:-0}"; CFG_TP="${CFG_TENSOR_PARALLELISM:-0}"; CFG_DP="${CFG_DATA_PARALLELISM:-0}"
+CFG_ENABLE_EP="${CFG_ENABLE_EP:-false}"; CFG_PROXY="${CFG_AGENTX_PROXY:-toy}"
+CFG_MODEL_PREFIX="$CFG_AGENTX_MODEL_PREFIX"; CFG_PRECISION="$CFG_AGENTX_PRECISION"; CFG_CONC_LIST="$CFG_AGENTX_CONC_LIST"
+CFG_POST_EVAL_SUITES=$(printf '%s' "$CFG_AGENTX_POST_EVAL_SUITES" | tr -s ' ' ','); CFG_POST_EVAL_SUITES="${CFG_POST_EVAL_SUITES:--}"
+CFG_SPEC_METHOD="${CFG_AGENTX_SPEC_METHOD:-none}"; CFG_LABEL="${CFG_AGENTX_LABEL:-agentx_${CONFIG}}"
+CFG_DECODE_DCP_SIZE="${CFG_AGENTX_DECODE_DCP_SIZE:-1}"; CFG_DECODE_ATTN_DP="${CFG_AGENTX_DECODE_ATTN_DP:-1}"
+AGENTX_GSM8K_LIMIT="${AGENTX_GSM8K_LIMIT:-$CFG_AGENTX_GSM8K_LIMIT}"
 # What fronts the pair: the toy proxy (examples/disagg) or vllm-router in
 # its prefill/decode mode (AGENTX_PROXY=router in the config; the image
 # carries the binary). Same two-hop protocol either way.
@@ -109,11 +131,18 @@ for c in "${CONCS[@]}"; do
     [[ "$c" =~ ^[1-9][0-9]*$ ]] || { log "FATAL: bad concurrency '$c' in '$CONC_LIST'"; exit 1; }
     [ "$c" -gt "$MAX_CONC" ] && MAX_CONC=$c
 done
+# Twice the top concurrency, so the scheduler is not the limit; unless the
+# config says queueing is the point, as a recipe whose decode admits fewer
+# sequences than it is offered.
 NEED_SEQS=$((2 * MAX_CONC)); [ "$NEED_SEQS" -lt 4 ] && NEED_SEQS=4
 if [ "${CFG_MAX_NUM_SEQS:-0}" -lt "$NEED_SEQS" ]; then
-    log "FATAL: $CONFIG sets MAX_NUM_SEQS=$CFG_MAX_NUM_SEQS, but concurrencies ${CONCS[*]}" \
-        "need at least $NEED_SEQS (2 x $MAX_CONC). Raise it in the config."
-    exit 2
+    if [ "${CFG_AGENTX_ALLOW_QUEUEING:-0}" = 1 ]; then
+        log "note: $CONFIG sets MAX_NUM_SEQS=$CFG_MAX_NUM_SEQS, under 2 x the top concurrency (${CONCS[*]}); queueing is allowed by the config"
+    else
+        log "FATAL: $CONFIG sets MAX_NUM_SEQS=$CFG_MAX_NUM_SEQS, but concurrencies ${CONCS[*]}" \
+            "need at least $NEED_SEQS (2 x $MAX_CONC). Raise it in the config."
+        exit 2
+    fi
 fi
 
 # What tokens per dollar is costed over: PHYSICAL chips, both engines, stated by
@@ -132,6 +161,12 @@ fi
 # it, disaggregated. Not the chip count, which is --chips.
 EP=1; [ "$CFG_ENABLE_EP" != true ] || EP=$(( CFG_TP * CFG_DP ))
 ix_export_topology "$CFG_TP" "$CFG_DP" "$EP" 1
+# Decode's context parallelism and attention groups, when the config has them:
+# the helper only knows TP x DP.
+export DECODE_DCP_SIZE="$CFG_DECODE_DCP_SIZE"
+if [ "$CFG_DECODE_ATTN_DP" -gt 1 ]; then
+    export DECODE_DP_ATTN=true DECODE_NUM_WORKERS="$CFG_DECODE_ATTN_DP"
+fi
 
 POST_EVAL_SUITES="$CFG_POST_EVAL_SUITES"
 [ "${AGENTX_SKIP_POST_EVAL:-0}" != 1 ] || POST_EVAL_SUITES="-"
@@ -149,7 +184,16 @@ fi
 
 log "config=$CONFIG concs=${CONCS[*]} max_num_seqs=$CFG_MAX_NUM_SEQS chips=$CHIPS ranks=$RANKS" \
     "prefill=$PREFILL_HOST decode=$DECODE_HOST proxy=$CFG_PROXY eval_only=$EVAL_ONLY smoke=$SMOKE" \
-    "post_eval_suites=$POST_EVAL_SUITES"
+    "post_eval_suites=$POST_EVAL_SUITES label=$CFG_LABEL spec=$CFG_SPEC_METHOD" \
+    "dcp=$DECODE_DCP_SIZE attn_dp=$CFG_DECODE_ATTN_DP gsm8k_limit=${AGENTX_GSM8K_LIMIT:-default}"
+
+# The engines are idling, not serving: the config loaded and the knobs above
+# are what the run would use. That is the check; the JobSet ends with this pod.
+if [ "${K3_1P1D_DRY_RUN:-0}" = 1 ]; then
+    log "dry run: not waiting for the engines"
+    if command -v vllm-router >/dev/null; then log "vllm-router found"; else log "vllm-router MISSING"; fi
+    exit 0
+fi
 
 proxy_pid=""
 # shellcheck disable=SC2317  # run by the trap
@@ -260,11 +304,12 @@ bash "$IX_DIR/agentx_client.sh" \
     --conc-list "$CONC_LIST" \
     --chips "$CHIPS" \
     --results-dir "$RESULTS_DIR" \
-    --label "agentx_${CONFIG}" \
-    --spec-method none \
+    --label "$CFG_LABEL" \
+    --spec-method "$CFG_SPEC_METHOD" \
     --model-prefix "$CFG_MODEL_PREFIX" \
     --precision "$CFG_PRECISION" \
     --gsm8k-conc "${AGENTX_GSM8K_CONC:-$MAX_CONC}" \
+    ${CFG_AGENTX_MAX_MODEL_LEN:+--max-model-len "$CFG_AGENTX_MAX_MODEL_LEN"} \
     ${AGENTX_DURATION:+--duration "$AGENTX_DURATION"} \
     ${AGENTX_FAST:+--fast "$AGENTX_FAST"} \
     ${AGENTX_IX_REF:+--ix-ref "$AGENTX_IX_REF"} \

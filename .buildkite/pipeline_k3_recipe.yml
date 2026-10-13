@@ -1,0 +1,55 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# One Kimi-K3 recipe point on the managed kube fleet: build the image, then
+# serve the point's prefill/decode pair on the AgentX manifest
+# (kimi-k3-agentx-1p1d.yaml) and run its one-hour AgentX replay. One point per
+# build, named by the build's K3_PD_CONFIG, e.g. kimi-k3-megakernel/p3-c12;
+# see scripts/vllm/benchmarking/configs/kimi-k3-megakernel/. Trigger through
+# vllm-torchtpu-dev with DEV_PIPELINE_FILE=.buildkite/pipeline_k3_recipe.yml
+# and K3_PD_CONFIG in the build environment. AGENTX_DURATION and AGENTX_FAST
+# shorten a run that is a check rather than a measurement; K3_1P1D_DRY_RUN=1
+# checks the config and the inputs without booting.
+#
+# The engines run K3_ENGINE_IMAGE, the vLLM build being measured; the client
+# and the engines' scripts come from the image this build makes. Unset, the
+# engines run that image too. Set it in the build environment to measure
+# another build of vLLM, such as a branch's, on this commit's lane.
+
+# Named by build number so the tag is immutable: submission can be hours after
+# the push, and a second build sharing a tag would decide what the first
+# measures.
+env:
+  WORKLOAD_IMAGE: "us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-dev:k3-recipe-${BUILDKITE_BUILD_NUMBER}"
+
+steps:
+  - label: ":docker: Build the image"
+    key: "build_k3_recipe_image"
+    agents:
+      queue: cpu_64_core
+    commands:
+      - ./docker/build_image.sh --target dev -t "$$WORKLOAD_IMAGE"
+      - docker push "$$WORKLOAD_IMAGE"
+
+  - label: ":kubernetes: :tpu: Kimi-K3 recipe ${K3_PD_CONFIG:-(K3_PD_CONFIG unset)} (1P1D, TPU v7x 2x2x4 x2)"
+    depends_on: "build_k3_recipe_image"
+    timeout_in_minutes: 480
+    agents:
+      queue: "kube"
+    plugins:
+      - kubernetes:
+          podTemplate: tpu-launcher
+    commands:
+      - 'test -n "$${K3_PD_CONFIG:-}" || { echo "set K3_PD_CONFIG to the point, e.g. kimi-k3-megakernel/p1-c1"; exit 1; }'
+      - .buildkite/kubernetes/run_multihost.sh --manifest kimi-k3-agentx-1p1d.yaml
