@@ -327,10 +327,8 @@ def _mla_ragged_paged_attention_kernel(
     #     align_to(lkv_dim + r_dim, 128)] if not transpose_kv_cache else
     # [total_num_pages, align_to(lkv_dim + r_dim, 128), page_size]
     cache_kv_hbm_ref,
-    # f32[max_num_tokens, num_q_heads, 128] with return_lse, else None. The
-    # same buffer as lse_hbm_ref: each of the per-case launches writes only its
-    # own sequences' rows, so the buffer is passed through them aliased, as
-    # ql_nope is. Never read.
+    # f32[max_num_tokens, num_q_heads, 128] with return_lse, else None.
+    # Aliased with lse_hbm_ref.
     lse_in_hbm_ref,
     # Output
     o_hbm_ref,  # [max_num_tokens, num_q_heads, lkv_dim]
@@ -338,14 +336,8 @@ def _mla_ragged_paged_attention_kernel(
     #     align_to(lkv_dim + r_dim, 128)] if not transpose_kv_cache else
     # [total_num_pages, align_to(lkv_dim + r_dim, 128), page_size]
     updated_cache_kv_hbm_ref,
-    # f32[max_num_tokens, num_q_heads, 128] with return_lse, else None. 128
-    # lanes per value because that is m and l's layout: the online softmax keeps
-    # each row's statistics replicated across the lanes of a [rows, 128] tile
-    # so they scale score tiles without cross-lane work. Writing the lse in
-    # that layout makes it a plain copy out of VMEM and a contiguous DMA; the
-    # wrapper slices lane 0. (A lane-dense [tokens, heads] output would need a
-    # lane compaction here, and a 2-D buffer with a dynamic sublane extent did
-    # not compile.)
+    # f32[max_num_tokens, num_q_heads, 128] with return_lse, else None.
+    # Same lane-replicated layout as m_ref and l_ref; the wrapper reads lane 0.
     lse_hbm_ref,
     # Scratch
     # [2, batch_size, bkv_buf_sz_per_kv_packing, kv_packing, lkv_dim]
@@ -1665,8 +1657,6 @@ def _mla_ragged_paged_attention_kernel(
                     sem,
                     wait,
                 )
-                # The block's lse rows go out beside its output rows, on their
-                # own semaphore.
                 if return_lse:
                     assert blse_x2_ref is not None and lse_hbm_ref is not None
                     _async_copy(
@@ -2101,10 +2091,6 @@ def _mla_ragged_paged_attention_kernel(
             wait_send_bo(bo_sem_idx)
 
             if return_lse:
-                # log(sum(exp(score))) = m + log(l), in m and l's own layout:
-                # one (query, head) row per sublane, the value across all 128
-                # lanes. Kept that way through HBM so this is a copy, not a
-                # lane compaction; the wrapper reads lane 0.
                 assert blse_x2_ref is not None
                 lse = m_ref[...] + jnp.log(l_ref[...])
                 blse_x2_ref.at[bo_sem_idx][:, :, :num_q_heads] = lse.reshape(
@@ -2415,19 +2401,10 @@ def mla_ragged_paged_attention(
         AV attention in two separate steps to make them be more parallelized
         with VALU ops instead of batched matmul in one step.
       p_same_dtype_as_v: if true, cast p to the same dtype as v before p @ v.
-      return_lse: if true, also return each (token, head)'s log-sum-exp of its
-        scaled scores, `log(sum(exp(s)))`, as f32 `[max_num_tokens,
-        actual_num_q_heads]`. It is what lets two attention outputs over
-        different keys of the same query be combined exactly: when the keys
-        are split across ranks (decode context parallelism), each rank's
-        output is a softmax over its own keys only, and
-        `o = sum_r softmax_r(lse) * o_r` reweights them into the softmax over
-        all of them. Rows of tokens outside every sequence read 0 (the buffer
-        starts as zeros and no launch writes them); a query whose keys are all
-        masked reads about `mask_value`. The output and the cache are unchanged
-        by the flag. The cost is an f32 buffer of 128 lanes per (token, head),
-        512 bytes a row: small on a decode step, about T * H * 512 bytes on a
-        prefill of T tokens.
+      return_lse: if true, also return the log-sum-exp of the scaled scores per
+        (token, head) as f32 `[max_num_tokens, actual_num_q_heads]`, for
+        merging partial attention outputs across ranks. Rows of tokens outside
+        every sequence are 0.
       debug_mode: if true, RPA does not issue any DMAs or run flash attention but
         print debug info. Need to compile with `--xla_tpu_enable_log_recorder`.
 
@@ -2642,14 +2619,13 @@ def mla_ragged_paged_attention(
             bq_nope_double_buf,
             bq_rope_double_buf,
             bo_double_buf,  # Double buffering for output block.
-            # Semaphores for double buffering of bkv, bq, bo, bkv_update and,
-            # with return_lse, the lse block.
+            # Semaphores for double buffering of bkv, bq, bo, bkv_update, lse.
             pltpu.SemaphoreType.DMA((5 if return_lse else 4, batch_size, 2)),
             # Intermediate buffers per kv head for flash attention.
             l_scratch,
             m_scratch,
             acc_scratch,
-            # Double buffering for the lse block, in m and l's 128-lane layout.
+            # Double buffering for the lse block.
             pltpu.VMEM((2, batch_size, bq_sz, padded_num_q_heads, 128), jnp.float32)
             if return_lse
             else None,
@@ -2731,8 +2707,7 @@ def mla_ragged_paged_attention(
         return o, updated_cache_kv, lse
 
     batch_distribution = (distribution[0] // decode_batch_size) * decode_batch_size
-    # One zero-filled lse buffer, aliased through the calls below as ql_nope
-    # is; rows no call writes (tokens outside every sequence) stay 0.
+    # Aliased through the calls below; unwritten rows stay 0.
     lse = (
         jnp.zeros((ql_nope.shape[0], num_q_heads, 128), jnp.float32)
         if return_lse
@@ -2837,7 +2812,5 @@ def mla_ragged_paged_attention(
     if not return_lse:
         return output, updated_kv
     assert lse is not None
-    # All 128 lanes of a row are equal; the leading rows are the real tokens
-    # and heads, the rest padding from prepare_q_nope_inputs.
     lse = lse[:actual_max_num_tokens, :actual_num_q_heads, 0]
     return output, updated_kv, lse
