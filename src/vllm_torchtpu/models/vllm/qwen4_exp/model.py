@@ -177,7 +177,7 @@ class Qwen4ExpModel(nn.Module):
 
 
 class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
-    """Text-only Qwen4Exp on TPU."""
+    """Text-only Qwen4Exp on TPU, also used for the vision-language arch."""
 
     packed_modules_mapping = {
         "qkv_proj": ["q_proj", "k_proj", "v_proj"],
@@ -188,10 +188,18 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
     # Qwen3.5's mapping fuses the split GDN, attention and shared-expert
     # projections that Qwen4Exp checkpoints use as well.
     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | WeightsMapper(
-        # TODO(QSA): load the indexer weights once the QSA indexer lands;
-        # dense attention does not use them.
-        orig_to_new_substr={".self_attn.indexer.": None},
-        orig_to_new_prefix={"model.language_model.": "model.", "mtp.": None},
+        orig_to_new_substr={
+            # TODO(QSA): load the indexer weights once the QSA indexer lands;
+            # dense attention does not use them.
+            ".self_attn.indexer.": None,
+            # TODO(PLE): load once the n-gram PLE layer lands.
+            ".ple.": None,
+        },
+        orig_to_new_prefix={
+            "model.language_model.": "model.",
+            "model.visual.": None,
+            "mtp.": None,
+        },
     )
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:

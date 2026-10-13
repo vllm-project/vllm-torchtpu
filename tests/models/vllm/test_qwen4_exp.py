@@ -22,6 +22,10 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from vllm.config import CompilationMode
+from vllm.model_executor.layers.quantization.utils.quant_utils import (
+    is_layer_skipped,
+)
+from vllm.model_executor.model_loader.utils import configure_quant_config
 from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
@@ -29,6 +33,7 @@ from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
 import vllm_torchtpu.models.vllm.qwen4_exp.model as qwen4_model
 from vllm_torchtpu.gdn_pool_layout import QWEN_GDN_ARCHITECTURES
 from vllm_torchtpu.layers import register_layers
+from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8Config
 from vllm_torchtpu.models.vllm.qwen4_exp.config import TPUQwen4ExpConfig
 from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpForCausalLM
 
@@ -81,8 +86,10 @@ def _text_config(**overrides) -> Qwen4ExpTextConfig:
 # ---------------------------------------------------------------------------
 # Registration and config checks
 # ---------------------------------------------------------------------------
-def test_qwen4_exp_is_registered() -> None:
-    arch = "Qwen4ExpForCausalLM"
+@pytest.mark.parametrize(
+    "arch", ["Qwen4ExpForCausalLM", "Qwen4ExpForConditionalGeneration"]
+)
+def test_qwen4_exp_is_registered(arch: str) -> None:
     previous_model = ModelRegistry.models.get(arch)
     previous_config = MODELS_CONFIG_MAP.get(arch)
     try:
@@ -384,3 +391,112 @@ def test_load_weights_maps_hyper_connection_names_and_skips_mtp_and_indexer(
         param = params[vllm_name]
         torch.testing.assert_close(param, tensor.to(param.dtype))
     assert not any("mtp." in name or ".indexer." in name for name in loaded)
+
+
+_LM = "model.language_model"
+
+
+@pytest.mark.parametrize(
+    "checkpoint_name,expected",
+    [
+        (f"{_LM}.embed_tokens.weight", ("model.embed_tokens.weight", None)),
+        ("lm_head.weight", ("lm_head.weight", None)),
+        (
+            f"{_LM}.hyper_connection_mixer.hc_norm.weight",
+            ("model.hyper_connection_mixer.hc_norm.weight", None),
+        ),
+        (
+            f"{_LM}.layers.0.linear_attn.in_proj_qkv.weight",
+            ("model.layers.0.linear_attn.in_proj_qkvz.weight", (0, 1, 2)),
+        ),
+        (
+            f"{_LM}.layers.0.linear_attn.in_proj_z.weight",
+            ("model.layers.0.linear_attn.in_proj_qkvz.weight", 3),
+        ),
+        (
+            f"{_LM}.layers.0.linear_attn.in_proj_b.weight",
+            ("model.layers.0.linear_attn.in_proj_ba.weight", 0),
+        ),
+        (
+            f"{_LM}.layers.0.linear_attn.in_proj_a.weight",
+            ("model.layers.0.linear_attn.in_proj_ba.weight", 1),
+        ),
+        (
+            f"{_LM}.layers.3.self_attn.q_proj.weight",
+            ("model.layers.3.self_attn.qkv_proj.weight", "q"),
+        ),
+        (
+            f"{_LM}.layers.0.mlp.shared_expert.up_proj.weight",
+            ("model.layers.0.mlp.shared_expert.gate_up_proj.weight", 1),
+        ),
+        (
+            f"{_LM}.layers.0.mlp.experts.7.down_proj.weight_scale_inv",
+            ("model.layers.0.mlp.experts.7.down_proj.weight_scale_inv", None),
+        ),
+        (f"{_LM}.layers.3.self_attn.indexer.index_qk_proj.weight", None),
+        (f"{_LM}.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight", None),
+        (f"{_LM}.layers.1.ple.key_proj.weight", None),
+        ("model.visual.blocks.0.attn.qkv.weight", None),
+        ("mtp.layers.0.mlp.experts.0.gate_proj.weight", None),
+    ],
+)
+def test_checkpoint_names_map_to_params_or_are_dropped(
+    checkpoint_name: str, expected: tuple[str, object] | None
+) -> None:
+    mapped = list(
+        Qwen4ExpForCausalLM.hf_to_vllm_mapper.apply([(checkpoint_name, torch.empty(0))])
+    )
+    if expected is None:
+        assert mapped == []
+        return
+    ((name, tensor),) = mapped
+    assert (name, getattr(tensor, "shard_id", None)) == expected
+
+
+def test_fp8_checkpoint_quantizes_only_routed_experts() -> None:
+    not_converted = [
+        "lm_head",
+        f"{_LM}.embed_tokens",
+        *(
+            f"{_LM}.layers.0.linear_attn.{name}"
+            for name in ("in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b")
+        ),
+        f"{_LM}.layers.0.linear_attn.out_proj",
+        *(
+            f"{_LM}.layers.1.self_attn.{name}"
+            for name in ("q_proj", "k_proj", "v_proj", "o_proj")
+        ),
+        *(
+            f"{_LM}.layers.{idx}.mlp.shared_expert.{name}"
+            for idx in (0, 1)
+            for name in ("gate_proj", "up_proj", "down_proj")
+        ),
+    ]
+    quant_config = VllmFp8Config.from_config(
+        {
+            "quant_method": "fp8",
+            "activation_scheme": "dynamic",
+            "weight_block_size": [128, 128],
+            "modules_to_not_convert": not_converted,
+        }
+    )
+    configure_quant_config(quant_config, Qwen4ExpForCausalLM)
+
+    def skipped(prefix: str) -> bool:
+        return is_layer_skipped(
+            prefix,
+            quant_config.ignored_layers,
+            fused_mapping=quant_config.packed_modules_mapping,
+        )
+
+    for prefix in (
+        "model.layers.0.linear_attn.in_proj_qkvz",
+        "model.layers.0.linear_attn.in_proj_ba",
+        "model.layers.0.linear_attn.out_proj",
+        "model.layers.1.self_attn.qkv_proj",
+        "model.layers.1.self_attn.o_proj",
+        "model.layers.0.mlp.shared_expert.gate_up_proj",
+        "model.layers.1.mlp.shared_expert.down_proj",
+    ):
+        assert skipped(prefix), prefix
+    assert not skipped("model.layers.0.mlp.experts")

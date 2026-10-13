@@ -20,6 +20,7 @@ QWEN_GDN_ARCHITECTURES = frozenset(
         "Qwen3_5MoeForCausalLM",
         "Qwen3_5MoeForConditionalGeneration",
         "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
     }
 )
 POOLED_GDN_ARCHITECTURES = QWEN_GDN_ARCHITECTURES | frozenset(

@@ -44,5 +44,9 @@ def register_models() -> None:
     ModelRegistry.register_model("Qwen3_5MTP", _QWEN35_MTP_MODEL)
     ModelRegistry.register_model("Qwen3_5MoeMTP", _QWEN35_MOE_MTP_MODEL)
     ModelRegistry.register_model("Qwen4ExpForCausalLM", _QWEN4_EXP_MODEL)
+    # The released checkpoint declares the vision-language arch; serve it with
+    # the text-only model.
+    ModelRegistry.register_model("Qwen4ExpForConditionalGeneration", _QWEN4_EXP_MODEL)
     MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = _TPUKimiK3Config
     MODELS_CONFIG_MAP["Qwen4ExpForCausalLM"] = TPUQwen4ExpConfig
+    MODELS_CONFIG_MAP["Qwen4ExpForConditionalGeneration"] = TPUQwen4ExpConfig
