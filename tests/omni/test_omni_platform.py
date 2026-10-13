@@ -180,22 +180,17 @@ def test_tpu_flash_attention_backend(monkeypatch):
         "query.dtype=torch.float32 (requires torch.bfloat16)",
     )
 
-    # 4. uneven GQA falls back
+    # 4. uneven GQA raises, like vLLM-Omni's SDPA
     mock_warn.reset_mock()
-    mock_sdpa = MagicMock(return_value=q.clone())
-    monkeypatch.setattr(TpuSDPAImpl, "forward", mock_sdpa)
     impl_uneven = TpuFlashAttentionImpl(
         num_heads=6, head_size=16, softmax_scale=0.25, num_kv_heads=4
     )
     k4 = torch.randn(1, 16, 4, 16, dtype=torch.bfloat16)
     v4 = torch.randn(1, 16, 4, 16, dtype=torch.bfloat16)
-    impl_uneven.forward(q, k4, v4)
+    with pytest.raises(ValueError, match=r"num_heads \(6\) must be a multiple"):
+        impl_uneven.forward(q, k4, v4)
     mock_op.assert_not_called()
-    mock_sdpa.assert_called_once_with(q, k4, v4, None)
-    mock_warn.assert_called_once_with(
-        "TpuFlashAttentionImpl falling back to PyTorch SDPA (%s).",
-        "num_heads (6) not divisible by num_kv_heads (4)",
-    )
+    mock_warn.assert_not_called()
 
 
 def test_wan_ffn_gelu_fence(monkeypatch):

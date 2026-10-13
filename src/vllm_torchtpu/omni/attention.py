@@ -3,8 +3,8 @@
 
 ``TpuFlashAttentionBackend`` (the default) runs unmasked, non-causal
 bf16 attention through a Pallas flash kernel tuned for diffusion
-sequence lengths. Masked, causal, non-bf16, or uneven-GQA calls fall
-back with a one-time warning to ``TpuSDPAImpl`` (PyTorch SDPA).
+sequence lengths. Masked, causal, or non-bf16 calls fall back with a
+one-time warning to ``TpuSDPAImpl`` (PyTorch SDPA).
 """
 
 from functools import cache as run_once
@@ -78,19 +78,14 @@ class TpuFlashAttentionImpl(TpuSDPAImpl):
     ) -> bool:
         attn_mask = getattr(attn_metadata, "attn_mask", None)
         # TODO: Revisit this fallback once torch_tpu SDPA lets callers select its
-        # flash kernel and supports masks; until then masked, causal, non-bf16 and
-        # uneven-GQA calls take PyTorch SDPA.
+        # flash kernel and supports masks; until then masked, causal and non-bf16
+        # calls take PyTorch SDPA.
         if self.causal:
             reason = "causal=True"
         elif attn_mask is not None:
             reason = "attn_mask is not None"
         elif query.dtype != torch.bfloat16:
             reason = f"query.dtype={query.dtype} (requires torch.bfloat16)"
-        elif query.shape[2] % key.shape[2] != 0:
-            reason = (
-                f"num_heads ({query.shape[2]}) not divisible by "
-                f"num_kv_heads ({key.shape[2]})"
-            )
         else:
             return False
         logger.warning_once(
@@ -106,6 +101,12 @@ class TpuFlashAttentionImpl(TpuSDPAImpl):
         value: torch.Tensor,
         attn_metadata: Any | None = None,
     ) -> torch.Tensor:
+        if query.shape[2] % key.shape[2] != 0:
+            # Neither path supports it: vLLM-Omni's SDPA raises the same way.
+            raise ValueError(
+                f"num_heads ({query.shape[2]}) must be a multiple of "
+                f"num_kv_heads ({key.shape[2]})"
+            )
         if self._needs_sdpa_fallback(query, key, attn_metadata):
             return super().forward(query, key, value, attn_metadata)
         return self._op(query, key, value, self.softmax_scale)
