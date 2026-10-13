@@ -85,8 +85,8 @@ The first stage launches after its forward, so that drain holds its worker
 thread until the forward has finished, and the host work of the next step
 (scheduler output, KV-connector registrations, input staging) starts only
 then, while the device idles. With ``TPU_PP_ASYNC_HANDOFF`` the first stage
-hands the drain and the launch to a helper thread and returns from the
-forward at once; the worker thread prepares the next step while the forward
+hands the drain and the launch to a helper thread and ``end_forward``
+returns at once; the worker thread prepares the next step while the forward
 runs. Its next ``start_forward`` waits for that launch and for the hand-off
 to complete, so no stage collective is dispatched while the hand-off runs.
 Pushes and settles keep the launch order: they wait for the queued launch
@@ -276,8 +276,8 @@ class PPWave:
         return self._async_carried is None and not self._async_busy
 
     def _launch_async(self, carried: tuple[torch.Tensor, ...]) -> None:
-        """Counts the launch now and has the helper thread issue it once the
-        device is idle. The producers of ``carried`` are submitted here so
+        """Counts the launch and has the helper thread issue it once the
+        device is idle. The producers of ``carried`` are submitted here, so
         the helper only waits and launches."""
         _flush(carried)
         self.launches += 1
@@ -324,9 +324,10 @@ class PPWave:
         if not self.async_handoff:
             return None
         with self._async_cv:
-            # No timeout, as on the drain the helper runs: the barrier
-            # raises after the process group's timeout and is reported
-            # here; a device that never returns is left to the engine.
+            # Unbounded, like the drain the helper runs: a barrier that
+            # never pairs raises after the process group's timeout and is
+            # reported here; a device that never returns is left to the
+            # engine.
             self._async_cv.wait_for(self._async_idle)
             if self._async_error is not None:
                 error, self._async_error = self._async_error, None
@@ -455,8 +456,9 @@ class PPWave:
             return
         with TraceAnnotation("PP:Settle"):
             if self.rank == 0:
-                # Issues no launch of its own when the pipeline has two
-                # stages; the queued one still has to be out and good.
+                # With two stages this stage issues no launch of its own;
+                # the queued launch has to be issued all the same, and its
+                # failure raised here.
                 self._async_wait()
             if 0 < self.rank < self.last:
                 assert self.pending is not None
