@@ -42,6 +42,13 @@
 #   K3_PD_CONFIG    the serve config both engines booted, read here for the cases
 #   ARTIFACTS_DIR   where results go, uploaded as the step's artifacts
 #   AGENTX_CHIPS    physical TPU chips serving the pair; no default
+# The config states the cases and labels: AGENTX_CONC_LIST, AGENTX_MODEL_PREFIX,
+#   AGENTX_PRECISION, and optionally AGENTX_POST_EVAL_SUITES, AGENTX_PROXY,
+#   AGENTX_SPEC_METHOD (the row's speculation; default none),
+#   AGENTX_GSM8K_LIMIT (the probe's size when the env does not set it; 0
+#   skips it), AGENTX_ALLOW_SEQS_BELOW_CONC=1, and the decode topology when
+#   the roles are not plain TP x DP: AGENTX_PREFILL_DCP_SIZE,
+#   AGENTX_DECODE_DCP_SIZE, AGENTX_DECODE_DP_ATTN, AGENTX_DECODE_NUM_WORKERS.
 # Optional: AGENTX_DURATION, AGENTX_FAST, AGENTX_GSM8K_LIMIT, AGENTX_GSM8K_CONC,
 #   AGENTX_IX_REF, AGENTX_GCS_ROOT, AGENTX_READY_WAIT_MIN, AGENTX_EVAL_JOB=1
 #   (set by the eval step alone, not the build: a build-level value reaches
@@ -82,17 +89,36 @@ CONFIG_FILE="$CONFIG_DIR/${CONFIG}.sh"
 [ -f "$CONFIG_FILE" ] || { log "FATAL: no such config: $CONFIG_FILE"; exit 2; }
 
 # The cases and the server size the engines booted with, read in a subshell with
-# the role set because the config branches on it. The suite list travels comma
-# joined, or as "-" when there is none, so it stays one field. The ladder is
-# read last: read's final variable takes the rest of the line.
+# the role set because the config branches on it, as NAME=value lines that land
+# in CFG_<NAME>. The suite list travels comma joined, or as "-" when there is
+# none.
 _cfg=$(
     export K3_1P1D_ROLE=decode
     # shellcheck source=/dev/null
     source "$CONFIG_FILE" >/dev/null || exit 3
     _post=$(printf '%s' "${AGENTX_POST_EVAL_SUITES:-}" | tr -s ' ' ',')
-    echo "${MAX_NUM_SEQS:-0} ${TENSOR_PARALLELISM:-0} ${DATA_PARALLELISM:-0} ${ENABLE_EP:-false} ${AGENTX_MODEL_PREFIX:-} ${AGENTX_PRECISION:-} ${_post:--} ${AGENTX_PROXY:-toy} ${AGENTX_CONC_LIST:-}"
+    printf '%s\n' \
+        "MAX_NUM_SEQS=${MAX_NUM_SEQS:-0}" \
+        "TP=${TENSOR_PARALLELISM:-0}" \
+        "DP=${DATA_PARALLELISM:-0}" \
+        "ENABLE_EP=${ENABLE_EP:-false}" \
+        "MODEL_PREFIX=${AGENTX_MODEL_PREFIX:-}" \
+        "PRECISION=${AGENTX_PRECISION:-}" \
+        "POST_EVAL_SUITES=${_post:--}" \
+        "PROXY=${AGENTX_PROXY:-toy}" \
+        "CONC_LIST=${AGENTX_CONC_LIST:-}" \
+        "SPEC_METHOD=${AGENTX_SPEC_METHOD:-none}" \
+        "GSM8K_LIMIT=${AGENTX_GSM8K_LIMIT:-}" \
+        "ALLOW_SEQS_BELOW_CONC=${AGENTX_ALLOW_SEQS_BELOW_CONC:-0}" \
+        "PREFILL_DCP_SIZE=${AGENTX_PREFILL_DCP_SIZE:-}" \
+        "DECODE_DCP_SIZE=${AGENTX_DECODE_DCP_SIZE:-}" \
+        "DECODE_DP_ATTN=${AGENTX_DECODE_DP_ATTN:-}" \
+        "DECODE_NUM_WORKERS=${AGENTX_DECODE_NUM_WORKERS:-}"
 ) || { log "FATAL: $CONFIG failed to load; the engines would have failed the same way"; exit 2; }
-read -r CFG_MAX_NUM_SEQS CFG_TP CFG_DP CFG_ENABLE_EP CFG_MODEL_PREFIX CFG_PRECISION CFG_POST_EVAL_SUITES CFG_PROXY CFG_CONC_LIST <<< "$_cfg"
+while IFS='=' read -r _k _v; do
+    printf -v "CFG_${_k}" '%s' "$_v"
+done <<< "$_cfg"
+unset _k _v
 # What fronts the pair: the toy proxy (examples/disagg) or vllm-router in
 # its prefill/decode mode (AGENTX_PROXY=router in the config; the image
 # carries the binary). Same two-hop protocol either way.
@@ -111,9 +137,16 @@ for c in "${CONCS[@]}"; do
 done
 NEED_SEQS=$((2 * MAX_CONC)); [ "$NEED_SEQS" -lt 4 ] && NEED_SEQS=4
 if [ "${CFG_MAX_NUM_SEQS:-0}" -lt "$NEED_SEQS" ]; then
-    log "FATAL: $CONFIG sets MAX_NUM_SEQS=$CFG_MAX_NUM_SEQS, but concurrencies ${CONCS[*]}" \
-        "need at least $NEED_SEQS (2 x $MAX_CONC). Raise it in the config."
-    exit 2
+    # A config may cap the engine below the replay's concurrency on purpose (an
+    # agentic session idles between turns), and say so.
+    if [ "${CFG_ALLOW_SEQS_BELOW_CONC:-0}" = 1 ]; then
+        log "WARNING: $CONFIG sets MAX_NUM_SEQS=$CFG_MAX_NUM_SEQS under the $NEED_SEQS that" \
+            "concurrencies ${CONCS[*]} would need; it allows that (AGENTX_ALLOW_SEQS_BELOW_CONC=1)"
+    else
+        log "FATAL: $CONFIG sets MAX_NUM_SEQS=$CFG_MAX_NUM_SEQS, but concurrencies ${CONCS[*]}" \
+            "need at least $NEED_SEQS (2 x $MAX_CONC). Raise it in the config."
+        exit 2
+    fi
 fi
 
 # What tokens per dollar is costed over: PHYSICAL chips, both engines, stated by
@@ -132,6 +165,14 @@ fi
 # it, disaggregated. Not the chip count, which is --chips.
 EP=1; [ "$CFG_ENABLE_EP" != true ] || EP=$(( CFG_TP * CFG_DP ))
 ix_export_topology "$CFG_TP" "$CFG_DP" "$EP" 1
+# What plain TP x DP does not say, from a config that states it - DCP, and
+# decode's attention DP - so the row tells such points apart.
+[ -z "$CFG_PREFILL_DCP_SIZE" ] || export PREFILL_DCP_SIZE="$CFG_PREFILL_DCP_SIZE"
+[ -z "$CFG_DECODE_DCP_SIZE" ] || export DECODE_DCP_SIZE="$CFG_DECODE_DCP_SIZE"
+[ -z "$CFG_DECODE_DP_ATTN" ] || export DECODE_DP_ATTN="$CFG_DECODE_DP_ATTN"
+[ -z "$CFG_DECODE_NUM_WORKERS" ] || export DECODE_NUM_WORKERS="$CFG_DECODE_NUM_WORKERS"
+# The probe's size: the step's, else the config's, else agentx_client.sh's.
+GSM8K_LIMIT="${AGENTX_GSM8K_LIMIT:-$CFG_GSM8K_LIMIT}"
 
 POST_EVAL_SUITES="$CFG_POST_EVAL_SUITES"
 [ "${AGENTX_SKIP_POST_EVAL:-0}" != 1 ] || POST_EVAL_SUITES="-"
@@ -147,7 +188,7 @@ if [ "$SMOKE" = 1 ]; then
     POST_EVAL_SUITES="${POST_EVAL_SUITES//kimi_tool_call_schema_full/kimi_tool_call_schema}"
 fi
 
-log "config=$CONFIG concs=${CONCS[*]} max_num_seqs=$CFG_MAX_NUM_SEQS chips=$CHIPS ranks=$RANKS" \
+log "config=$CONFIG concs=${CONCS[*]} max_num_seqs=$CFG_MAX_NUM_SEQS chips=$CHIPS ranks=$RANKS spec=$CFG_SPEC_METHOD" \
     "prefill=$PREFILL_HOST decode=$DECODE_HOST proxy=$CFG_PROXY eval_only=$EVAL_ONLY smoke=$SMOKE" \
     "post_eval_suites=$POST_EVAL_SUITES"
 
@@ -242,7 +283,7 @@ if [ "$EVAL_ONLY" = 1 ]; then
         --eval-conc "$MAX_CONC" \
         --chips "$CHIPS" \
         --results-dir "$RESULTS_DIR" \
-        --spec-method none \
+        --spec-method "$CFG_SPEC_METHOD" \
         --model-prefix "$CFG_MODEL_PREFIX" \
         --precision "$CFG_PRECISION" \
         ${AGENTX_IX_REF:+--ix-ref "$AGENTX_IX_REF"} \
@@ -260,15 +301,15 @@ bash "$IX_DIR/agentx_client.sh" \
     --conc-list "$CONC_LIST" \
     --chips "$CHIPS" \
     --results-dir "$RESULTS_DIR" \
-    --label "agentx_${CONFIG}" \
-    --spec-method none \
+    --label "agentx_${CONFIG//\//_}" \
+    --spec-method "$CFG_SPEC_METHOD" \
     --model-prefix "$CFG_MODEL_PREFIX" \
     --precision "$CFG_PRECISION" \
     --gsm8k-conc "${AGENTX_GSM8K_CONC:-$MAX_CONC}" \
     ${AGENTX_DURATION:+--duration "$AGENTX_DURATION"} \
     ${AGENTX_FAST:+--fast "$AGENTX_FAST"} \
     ${AGENTX_IX_REF:+--ix-ref "$AGENTX_IX_REF"} \
-    ${AGENTX_GSM8K_LIMIT:+--gsm8k-limit "$AGENTX_GSM8K_LIMIT"} \
+    ${GSM8K_LIMIT:+--gsm8k-limit "$GSM8K_LIMIT"} \
     ${AGENTX_GCS_ROOT:+--gcs-root "$AGENTX_GCS_ROOT"}
 rc=$?
 log "the AgentX client finished with rc=$rc"
@@ -288,7 +329,7 @@ bash "$IX_DIR/agentx_eval_client.sh" \
     --eval-conc "$MAX_CONC" \
     --chips "$CHIPS" \
     --results-dir "$RESULTS_DIR/post-eval" \
-    --spec-method none \
+    --spec-method "$CFG_SPEC_METHOD" \
     --model-prefix "$CFG_MODEL_PREFIX" \
     --precision "$CFG_PRECISION" \
     ${AGENTX_IX_REF:+--ix-ref "$AGENTX_IX_REF"} \

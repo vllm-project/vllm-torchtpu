@@ -104,7 +104,7 @@ def _indexer_jax(
             k=k,
             compression_ratio=compression_ratio,
             # The following parameters are tuned based on microbenchmark results.
-            num_kv_pages_per_block=(64, 32, 16),
+            num_kv_pages_per_block=(32, 32, 16),
             num_queries_per_block=(1, 128, 128),
             decode_req_batch_size=4,
             chunk_tokens=envs.TPU_STREAMIDX_CHUNK_TOKENS,
