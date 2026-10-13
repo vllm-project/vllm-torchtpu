@@ -127,11 +127,14 @@ class StructuredDecodingManager:
             )
 
         num_local = len(local_indices)
+        all_rows_structured = num_local == padded_num_reqs
 
         # Standard path: handles all structured batches (all-structured,
         # mixed, or permuted).
-        self.grammar_bitmask_cpu[:padded_num_reqs].zero_()
-        self.require_structured_out_cpu[:padded_num_reqs].zero_()
+        if not all_rows_structured:
+            self.grammar_bitmask_cpu[:padded_num_reqs].zero_()
+            self.require_structured_out_cpu[:padded_num_reqs].zero_()
+            self.require_structured_out_cpu[local_indices] = True
 
         if num_local == 1:
             self.grammar_bitmask_cpu[local_indices[0]].copy_(
@@ -141,10 +144,14 @@ class StructuredDecodingManager:
             self.grammar_bitmask_cpu[local_indices] = torch.from_numpy(
                 bitmask[mask_rows]
             )
-        self.require_structured_out_cpu[local_indices] = True
 
+        require_sd = (
+            self.device_all_true_require[:padded_num_reqs]
+            if all_rows_structured
+            else self.require_structured_out_cpu[:padded_num_reqs].to(logits.device)
+        )
         return (
-            self.require_structured_out_cpu[:padded_num_reqs].to(logits.device),
+            require_sd,
             self.grammar_bitmask_cpu[:padded_num_reqs].to(logits.device),
             self.structured_decode_arange,
         )
