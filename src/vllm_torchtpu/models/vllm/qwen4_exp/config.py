@@ -33,7 +33,8 @@ class TPUQwen4ExpConfig(Qwen4ExpForCausalLMConfig):
         text_config = model_config.hf_text_config
         parallel_config = vllm_config.parallel_config
         if text_config.ple_layer_ids:
-            # TODO(PLE): add the n-gram PLE layer and its per-request state.
+            # TODO(PLE): pass the PLE inputs and per-request conv state from
+            # the TPU runner.
             # Vision-language checkpoints nest the field under text_config.
             if model_config.hf_config is text_config:
                 override = '{"ple_layer_ids": []}'
