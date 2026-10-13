@@ -103,7 +103,12 @@ def _glm_runner(mlp, *, n=2, h=256, i=128, e=4, dtype=torch.bfloat16):
     )
 
 
-def test_glm_admission():
+def test_glm_admission(monkeypatch):
+    import vllm.distributed
+
+    monkeypatch.setattr(
+        vllm.distributed, "get_tensor_model_parallel_world_size", lambda: 2
+    )
     shared, expert_parallel, routed_scale = bridge._admit(
         _glm_runner(DeepseekV2MLP(256, 128)), 2
     )
@@ -115,6 +120,17 @@ def test_glm_admission():
     other = DeepseekV2MLP(256, 128)
     other.act_fn = torch.nn.GELU()
     assert bridge._admit(_glm_runner(other), 2) is None
+
+
+def test_admission_declines_attention_narrower_than_mesh(monkeypatch):
+    """PCP2 (or DP2) at TP1: the EP group spans the mesh, attention does not, so
+    MoERunner still runs a collective after the op."""
+    import vllm.distributed
+
+    monkeypatch.setattr(
+        vllm.distributed, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    assert bridge._admit(_glm_runner(DeepseekV2MLP(256, 128)), 2) is None
 
 
 def test_glm_fallback_scales_routed_only(monkeypatch):

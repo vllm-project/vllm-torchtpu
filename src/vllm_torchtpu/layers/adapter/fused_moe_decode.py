@@ -399,6 +399,8 @@ def _shared_slice(runner) -> tuple | None:
 def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
     """(shared-expert tensors, expert_parallel, routed scale) for an eligible
     layer, else None."""
+    from vllm.distributed import get_tensor_model_parallel_world_size
+
     from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
 
     cfg = runner.moe_config
