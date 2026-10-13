@@ -110,7 +110,7 @@ def _cases(window: int) -> list[Case]:
     """One engine step's batch per case; `window` is 1 + the draft tokens."""
     cases = []
     for context in (32 * _K, 128 * _K, 456 * _K, _M):
-        for num_seqs in (1, 2):
+        for num_seqs in (1, 2, 4, 8, 16, 32):
             cases.append(
                 Case(
                     f"decode c={num_seqs} @{_label(context)}",
