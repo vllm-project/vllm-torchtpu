@@ -191,7 +191,7 @@ def _omni_runner_manager() -> Generator[_OmniRunnerManager, None, None]:
 def omni_runner(
     request: pytest.FixtureRequest, _omni_runner_manager: _OmniRunnerManager
 ) -> Generator[OmniRunner, None, None]:
-    """Function-scoped :class:`OmniRunner` that spins up each model only once."""
+    """Function-scoped :class:`OmniRunner` that spins up each model as needed."""
     yield _omni_runner_manager.get_or_create(request.param)
 
 
