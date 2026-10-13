@@ -92,10 +92,76 @@ def test_outlier_heads_fall_back_to_online():
     _check(out, _reference(q_scaled, k, v, 1.0 / LOG2_E))
 
 
-def test_gate_constant_is_inside_flush_window():
-    # Row max >= 0 after k-smoothing, so the gap m - rowmax <= ceil(bound)
-    # must stay below 88 + 126 for the row-max term to remain normal f32.
-    assert math.ceil(FIXED_M_SAFE_BOUND) < 88 + 126
+def test_fixed_m_gate_boundary_accuracy(monkeypatch):
+    # Verify per-row accuracy on inputs with a 1e3x dynamic range of query row
+    # norms (geomspace 1e-3..1.0): Head 0 sits just below FIXED_M_SAFE_BOUND
+    # (fixed-m fast path) and Head 1 sits in (210, 213) where the old 213 gate
+    # flushed low-norm rows to zero.
+    import vllm_torchtpu.kernels.diffusion_attention.kernel as kernel_mod
+
+    rng = np.random.default_rng(0)
+    seq_len, num_heads, head_dim = 4133, 2, 128
+    scale = 1.0 / math.sqrt(head_dim)
+
+    k_raw = rng.normal(size=(1, seq_len, num_heads, head_dim)).astype(np.float32)
+    k_centered = k_raw - k_raw.mean(axis=1, keepdims=True)
+    k = jnp.asarray(k_centered, dtype=jnp.bfloat16)
+    k_smoothed = (
+        k.astype(jnp.float32) - k.astype(jnp.float32).mean(axis=1, keepdims=True)
+    ).astype(jnp.bfloat16)
+
+    q_dir = rng.normal(size=(1, seq_len, num_heads, head_dim)).astype(np.float32)
+    q_dir /= np.linalg.norm(q_dir, axis=-1, keepdims=True)
+    row_profile = np.geomspace(1e-3, 1.0, seq_len, dtype=np.float32).reshape(
+        1, seq_len, 1, 1
+    )
+    k_max_norm = np.asarray(
+        kernel_mod.max_row_norm_per_head(k_smoothed, seq_axis=1), dtype=np.float32
+    )
+    target_bounds = np.array([195.0, 211.5], dtype=np.float32)
+    q_peak_norm = target_bounds / (k_max_norm * scale * LOG2_E)
+    q = jnp.asarray(
+        q_dir * row_profile * q_peak_norm.reshape(1, 1, num_heads, 1),
+        dtype=jnp.bfloat16,
+    )
+    v = jnp.asarray(
+        rng.normal(size=(1, seq_len, num_heads, head_dim)), dtype=jnp.bfloat16
+    )
+
+    q_scaled = (q.astype(jnp.float32) * (scale * LOG2_E)).astype(jnp.bfloat16)
+    bounds = np.asarray(
+        kernel_mod.max_row_norm_per_head(q_scaled, seq_axis=1)
+        * kernel_mod.max_row_norm_per_head(k_smoothed, seq_axis=1)
+    )
+    assert 190.0 < bounds[0] <= FIXED_M_SAFE_BOUND < 210.0 < bounds[1] < 213.0
+
+    mk = fixed_m_operands(q_scaled, k_smoothed, gate=FIXED_M_SAFE_BOUND, seq_axis=1)
+    assert list(np.asarray(mk[1])) == [1.0, 0.0]
+
+    ref = np.asarray(
+        _reference(q_scaled, k_smoothed, v, 1.0 / LOG2_E), dtype=np.float64
+    )
+    ref_row_max = np.abs(ref).max(axis=-1)
+
+    out = np.asarray(
+        flash_attention_bshd(q, k, v, scale=scale).astype(jnp.float32),
+        dtype=np.float64,
+    )
+    row_rel_err = np.abs(out - ref).max(axis=-1) / ref_row_max
+    assert row_rel_err.max() < 3e-2
+
+    # Must-fail calibration check: raising the gate back to 213.0 routes Head 1
+    # through fixed-m, flushing its low-norm query rows on TPU.
+    monkeypatch.setattr(kernel_mod, "FIXED_M_SAFE_BOUND", 213.0)
+    out_213 = np.asarray(
+        flash_attention_bshd(q, k, v, scale=scale).astype(jnp.float32),
+        dtype=np.float64,
+    )
+    head1_row_rel_err = (
+        np.abs(out_213[0, :, 1, :] - ref[0, :, 1, :]).max(axis=-1)
+        / ref_row_max[0, :, 1]
+    )
+    assert head1_row_rel_err.max() > 0.05
 
 
 def test_block_sizes():

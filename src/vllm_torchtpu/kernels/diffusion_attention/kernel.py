@@ -14,6 +14,8 @@
 #   column blocks of the (B, S, H * D) activations (column_heads).
 # - fixed_m_operands() repeats the key norms over GQA query heads.
 # - end() broadcasts 1 / l by slicing: pltpu.repeat is not in JAX 0.11.
+# - Lowered FIXED_M_SAFE_BOUND from 213.0 to 200.0 so low-norm query rows
+#   stay at least 14 log2 units above the f32 flush threshold.
 # ruff: noqa: E741
 
 """Custom Pallas flash attention kernel for TPU.
@@ -61,10 +63,13 @@ LOG2_E = 1.44269504
 # m - rowmax > C + 126.
 FIXED_M_RECENTER = 88.0
 
-# Flat gate: fixed-m only if the head's Cauchy-Schwarz bound <= 213.
-# k-smoothing forces rowmax >= 0, so the flush gap ceil(bound) <= 213 <
-# C + 126 = 214. Outlier heads exceed it and keep online softmax.
-FIXED_M_SAFE_BOUND = 213.0
+# Flat gate: fixed-m only if the head's Cauchy-Schwarz bound <= 200.
+# k-smoothing forces rowmax >= 0, and keeping ceil(bound) <= 200 leaves at
+# least 14 log2 units above the f32 flush threshold (m - (C + 126) <= -14),
+# so keys flushed to zero in exp2(qk - (m - C)) sit below 2^-14 of a
+# unit-norm row max (avoiding accuracy loss on low-norm query rows near the
+# flush ceiling 214). Outlier heads exceed it and keep online softmax.
+FIXED_M_SAFE_BOUND = 200.0
 
 
 def max_row_norm_per_head(x: jax.Array, *, seq_axis: int = 2) -> jax.Array:
