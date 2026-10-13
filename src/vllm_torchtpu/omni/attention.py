@@ -2,10 +2,9 @@
 """Diffusion attention backends for TPU execution.
 
 ``TpuFlashAttentionBackend`` (the default) runs unmasked, non-causal
-attention through a Pallas flash kernel that never materializes the
-``(Sq, Skv)`` score matrix. Masked, causal or non-bf16 calls fall back to
-PyTorch SDPA, which torch_tpu lowers to a math path that materializes the
-scores and does not scale to video sequence lengths.
+bf16 attention through a Pallas flash kernel tuned for diffusion
+sequence lengths. Masked, causal, non-bf16, or uneven-GQA calls fall
+back with a one-time warning to ``TpuSDPAImpl`` (PyTorch SDPA).
 """
 
 from functools import cache as run_once
@@ -17,6 +16,9 @@ from torch_tpu._internal import pallas
 from vllm_omni.diffusion.attention.backends.sdpa import SDPABackend, SDPAImpl
 
 from vllm_torchtpu.kernels.diffusion_attention.kernel import flash_attention_bshd
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
 
 
 class TpuSDPAImpl(SDPAImpl):
@@ -55,9 +57,7 @@ def _flash_attention_op():
     ) -> jax.Array:
         return flash_attention_bshd(q, k, v, scale=scale)
 
-    op = pallas.jax_op(
-        "vllm_torchtpu::diffusion_flash_attention", diffusion_flash_attention
-    )
+    op = pallas.jax_op("pallas::diffusion_flash_attention", diffusion_flash_attention)
     op.register_fake(lambda q, k, v, scale: q.new_empty((*q.shape[:3], v.shape[-1])))
     return op
 
@@ -79,16 +79,25 @@ class TpuFlashAttentionImpl(TpuSDPAImpl):
         attn_mask = getattr(attn_metadata, "attn_mask", None)
         # TODO: Revisit this fallback once torch_tpu SDPA lets callers select its
         # flash kernel and supports masks; until then masked, causal, non-bf16 and
-        # uneven-GQA calls take its math path.
-        #
-        # torch_tpu's SDPA picks its Mosaic flash kernel opaquely and has no
-        # mask support.
-        return (
-            self.causal
-            or attn_mask is not None
-            or query.dtype != torch.bfloat16
-            or query.shape[2] % key.shape[2] != 0
+        # uneven-GQA calls take PyTorch SDPA.
+        if self.causal:
+            reason = "causal=True"
+        elif attn_mask is not None:
+            reason = "attn_mask is not None"
+        elif query.dtype != torch.bfloat16:
+            reason = f"query.dtype={query.dtype} (requires torch.bfloat16)"
+        elif query.shape[2] % key.shape[2] != 0:
+            reason = (
+                f"num_heads ({query.shape[2]}) not divisible by "
+                f"num_kv_heads ({key.shape[2]})"
+            )
+        else:
+            return False
+        logger.warning_once(
+            "TpuFlashAttentionImpl falling back to PyTorch SDPA (%s).",
+            reason,
         )
+        return True
 
     def forward(
         self,

@@ -64,6 +64,8 @@ class _MockSDPAImpl:
         self.head_size = head_size
         self.scale = scale
         self.num_kv_heads = num_kv_heads or num_heads
+        self.softmax_scale = kwargs.get("softmax_scale", scale)
+        self.causal = kwargs.get("causal", False)
 
     def _forward_impl(
         self, query, key, value, attn_metadata=None, mask_mode="broadcast_k"
