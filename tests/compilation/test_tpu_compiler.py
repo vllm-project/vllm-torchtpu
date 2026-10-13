@@ -14,6 +14,7 @@
 
 import importlib
 import os
+import re
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -158,13 +159,43 @@ class TestTpuCompilerCache:
             for path in (source_root / "vllm_torchtpu").rglob("*.py")
             if "pallas.jax_op" in path.read_text()
         }
-        assert custom_op_boundaries <= hashed
+        excluded = tuple(
+            f"{rel_path}/"
+            for rel_path in tpu_compiler._RUNTIME_CACHE_KEY_EXCLUDED_PATHS
+        )
+        omni_only = {path for path in custom_op_boundaries if path.startswith(excluded)}
+        assert custom_op_boundaries - omni_only <= hashed
+        assert not {path for path in hashed if path.startswith(excluded)}
         assert {
             "vllm_torchtpu/kernels/quantized_matmul/blockwise_kernel.py",
             "vllm_torchtpu/kernels/pool_adapters.py",
             "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
             "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
         } <= hashed
+
+    def test_runtime_hash_excluded_kernels_stay_omni_only(self):
+        """Excluded diffusion kernels must have no caller in hashed code.
+
+        An LLM path importing one would compile it into a cached executable
+        whose key no longer covers the kernel's source.
+        """
+        from vllm_torchtpu.compilation import tpu_compiler
+
+        source_root = Path(tpu_compiler.__file__).resolve().parents[2]
+        excluded = tuple(
+            f"{rel_path}/"
+            for rel_path in tpu_compiler._RUNTIME_CACHE_KEY_EXCLUDED_PATHS
+        )
+        importers = {
+            path.relative_to(source_root).as_posix()
+            for path in (source_root / "vllm_torchtpu").rglob("*.py")
+            if not path.relative_to(source_root).as_posix().startswith(excluded)
+            and re.search(
+                r"kernels\.diffusion_attention|kernels import diffusion_attention",
+                path.read_text(),
+            )
+        }
+        assert not importers
 
     def test_serving_only_kv_knobs_stay_out_of_the_compile_cache_key(self):
         """Serving-time knobs must stay out of the compile-cache key.

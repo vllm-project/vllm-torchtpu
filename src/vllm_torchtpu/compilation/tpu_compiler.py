@@ -213,6 +213,16 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
 )
 
+# vLLM-Omni diffusion code, dropped from the hashed set above. Diffusion
+# workers never compile through TpuCompilerAdaptor (OmniTpuPlatform does not
+# support torch inductor and vLLM-Omni skips torch.compile), and nothing
+# outside these paths imports their kernels, so they cannot change a cached
+# executable; hashing them would only invalidate LLM compile caches.
+_RUNTIME_CACHE_KEY_EXCLUDED_PATHS = (
+    "vllm_torchtpu/kernels/diffusion_attention",
+    "vllm_torchtpu/omni",
+)
+
 
 def _iter_runtime_cache_key_files(repo_root: Path) -> list[Path]:
     """Return runtime source files that affect TPU custom-op lowering."""
@@ -229,6 +239,10 @@ def _iter_runtime_cache_key_files(repo_root: Path) -> list[Path]:
                 files_by_relpath[child_relpath] = child
             continue
         logger.warning("[TpuCompilerAdaptor] Cache key source path missing: %s", path)
+
+    excluded = tuple(f"{rel_path}/" for rel_path in _RUNTIME_CACHE_KEY_EXCLUDED_PATHS)
+    for relpath in [key for key in files_by_relpath if key.startswith(excluded)]:
+        del files_by_relpath[relpath]
 
     if envs.TPU_KERNEL_ITER_MODE:
         for relpath in _reloadable_kernel_relpaths(repo_root):
