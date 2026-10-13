@@ -68,6 +68,20 @@ def attention_block_table_width(
         "mamba_slot_read_offsets",
         "mamba_ckpt_indices",
         "mamba_request_distribution",
+        "pcp_split_block_tables",
+        "pcp_split_seq_lens",
+        "pcp_split_query_start_loc",
+        "pcp_hidden_restore_idx",
+        "pcp_rep_row_idx",
+        "pcp_rep_block_tables",
+        "pcp_rep_seq_lens",
+        "pcp_rep_query_start_loc",
+        "pcp_rep_request_distribution",
+        "pcp_ws_req",
+        "pcp_ws_vpage",
+        "pcp_ws_page_offset",
+        "pcp_num_split_reqs",
+        "pcp_ws_used_pages",
     ],
     meta_fields=[
         "sequence_layout_kind",
@@ -119,6 +133,29 @@ class AttentionMetadata:
     # the first two groups. None unless the model has mamba layers and spec
     # decoding is enabled.
     mamba_request_distribution: jax.Array | torch.Tensor | None = None
+    # PCP manager only (see `runner/pcp_manager.py`); None elsewhere. The
+    # fields above are the rank-local request view.
+    # The split prefills, request-major: block tables, seq_lens,
+    # query_start_loc, and each split token's PCP-gathered row.
+    pcp_split_block_tables: jax.Array | None = None
+    pcp_split_seq_lens: jax.Array | None = None
+    pcp_split_query_start_loc: jax.Array | None = None
+    pcp_hidden_restore_idx: jax.Array | None = None
+    # The replicated decodes as their own request window: local rows, block
+    # tables, seq_lens, query_start_loc, request_distribution.
+    pcp_rep_row_idx: jax.Array | None = None
+    pcp_rep_block_tables: jax.Array | None = None
+    pcp_rep_seq_lens: jax.Array | None = None
+    pcp_rep_query_start_loc: jax.Array | None = None
+    pcp_rep_request_distribution: jax.Array | None = None
+    # KV workspace: request and virtual page of each workspace page, first
+    # workspace page of each local split segment, split request count (1,),
+    # pages in use (1,).
+    pcp_ws_req: jax.Array | None = None
+    pcp_ws_vpage: jax.Array | None = None
+    pcp_ws_page_offset: jax.Array | None = None
+    pcp_num_split_reqs: jax.Array | None = None
+    pcp_ws_used_pages: jax.Array | None = None
     sequence_layout_kind: str = SequenceLayoutKind.ALL.value
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
     sequence_layout_version: int = 1
@@ -184,6 +221,11 @@ class AttentionMetadataBuilderContext:
     # (state_indices, ckpt_indices | None) from the single
     # `_staged_walk_products_compiled` program; None -> per-group fallback.
     staged_mamba_products: dict | None = None
+    # Persistent-batch row of each request (None: rows [start_index,
+    # start_index + num_reqs)). Set by the PCP manager.
+    block_table_rows: Any = None
+    # PCP manager device fields (`PcpKvGatherFields`).
+    pcp_kv_gather: Any = None
 
 
 def _staged_walk_products(
@@ -472,9 +514,12 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             flat = zeros_h2d_source(runner, target_num_reqs * target_num_blocks)
             block_tables = flat.view(target_num_reqs, target_num_blocks)
             source_block_tables = block_table_obj.get_cpu_tensor()
-            block_tables[: ctx.num_reqs, :target_num_blocks] = source_block_tables[
-                ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
-            ]
+            _copy_block_table_rows(
+                block_tables[:, :target_num_blocks],
+                source_block_tables,
+                ctx,
+                target_num_blocks,
+            )
             # Flatten on CPU before H2D to avoid device-side
             # as_strided/reshape materialization on every decode step.
             block_tables_dev = stage_h2d_upload(runner, flat)
@@ -543,6 +588,21 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_slot_read_offsets = None
             mamba_request_distribution = None
 
+        pcp_fields = ctx.pcp_kv_gather
+        pcp_kwargs = {}
+        if pcp_fields is not None:
+            pcp_kwargs = pcp_metadata_kwargs(
+                pcp_fields,
+                split_block_tables=_pcp_block_tables_for_rows(
+                    runner, ctx, block_table_obj, pcp_fields.split_block_rows,
+                    target_num_reqs, target_num_blocks,
+                ),
+                rep_block_tables=_pcp_block_tables_for_rows(
+                    runner, ctx, block_table_obj, pcp_fields.rep_block_rows,
+                    pcp_fields.rep_window, target_num_blocks,
+                ),
+            )
+
         return AttentionMetadata(
             input_positions=input_positions,
             block_tables=block_tables_dev,
@@ -553,10 +613,69 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_slot_read_offsets=mamba_slot_read_offsets,
             mamba_ckpt_indices=mamba_ckpt_indices,
             mamba_request_distribution=mamba_request_distribution,
+            **pcp_kwargs,
             sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
             sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
             sequence_layout_version=ctx.sequence_layout_descriptor.version,
         )
+
+
+def pcp_metadata_kwargs(
+    fields: Any, *, split_block_tables: Any, rep_block_tables: Any
+) -> dict[str, Any]:
+    """`AttentionMetadata` kwargs for the PCP manager's `PcpKvGatherFields`."""
+    return {
+        "pcp_split_block_tables": split_block_tables,
+        "pcp_split_seq_lens": fields.split_seq_lens,
+        "pcp_split_query_start_loc": fields.split_query_start_loc,
+        "pcp_hidden_restore_idx": fields.hidden_restore_idx,
+        "pcp_rep_row_idx": fields.rep_row_idx,
+        "pcp_rep_block_tables": rep_block_tables,
+        "pcp_rep_seq_lens": fields.rep_seq_lens,
+        "pcp_rep_query_start_loc": fields.rep_query_start_loc,
+        "pcp_rep_request_distribution": fields.rep_request_distribution,
+        "pcp_ws_req": fields.ws_req,
+        "pcp_ws_vpage": fields.ws_vpage,
+        "pcp_ws_page_offset": fields.ws_page_offset,
+        "pcp_num_split_reqs": fields.num_split_reqs,
+        "pcp_ws_used_pages": fields.ws_used_pages,
+    }
+
+
+def _copy_block_table_rows(
+    dst: torch.Tensor,
+    source: torch.Tensor,
+    ctx: AttentionMetadataBuilderContext,
+    target_num_blocks: int,
+) -> None:
+    """Fill `dst[:ctx.num_reqs]` with this metadata's requests' block tables."""
+    if ctx.block_table_rows is None:
+        dst[: ctx.num_reqs] = source[
+            ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
+        ]
+    else:
+        rows = torch.as_tensor(ctx.block_table_rows, dtype=torch.long)
+        dst[: ctx.num_reqs] = source[:, :target_num_blocks].index_select(0, rows)
+
+
+def _pcp_block_tables_for_rows(
+    runner: Any,
+    ctx: AttentionMetadataBuilderContext,
+    block_table_obj: Any,
+    rows: Any,
+    target_num_reqs: int,
+    target_num_blocks: int,
+) -> torch.Tensor:
+    """Block tables of the given persistent-batch rows, zero-padded."""
+    fields = ctx.pcp_kv_gather
+    table = torch.zeros((target_num_reqs, target_num_blocks), dtype=torch.int32)
+    if rows is not None and len(rows):
+        source = block_table_obj.get_cpu_tensor()
+        table[: len(rows)] = source[:, :target_num_blocks].index_select(
+            0, torch.as_tensor(rows, dtype=torch.long)
+        )
+    fields.keepalive.append(table)  # outlive the non-blocking upload
+    return table.reshape(-1).to(runner.device, non_blocking=True)
 
 
 def stage_block_table_uploads(
@@ -609,9 +728,7 @@ def stage_block_table_uploads(
                 num_reqs_padded, target_num_blocks
             )
             source = block_table_obj.get_cpu_tensor()
-            rows[: ctx.num_reqs] = source[
-                ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
-            ]
+            _copy_block_table_rows(rows, source, ctx, target_num_blocks)
             offset += num_reqs_padded * target_num_blocks
     # Dummy runs keep the zeroed buffer: same staged layout, null blocks.
 

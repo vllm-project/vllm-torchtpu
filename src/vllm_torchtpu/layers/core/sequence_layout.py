@@ -381,7 +381,13 @@ class AllSequenceLayoutPlanner:
 
 
 def create_sequence_layout_planner(vllm_config: Any) -> SequenceLayoutPlanner:
+    from vllm_torchtpu import envs
     from vllm_torchtpu.layers.core.pcp_sequence_layout import PcpSequenceLayoutPlanner
+
+    if vllm_config is not None and envs.USE_TPU_PCP_MANAGER:
+        from vllm_torchtpu.runner.pcp_manager import PcpManager
+
+        return PcpManager.from_vllm_config(vllm_config)
 
     pcp_planner = PcpSequenceLayoutPlanner.from_vllm_config(vllm_config)
     if pcp_planner.enabled:

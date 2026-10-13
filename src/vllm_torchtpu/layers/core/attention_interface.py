@@ -1267,3 +1267,253 @@ def sparse_mla_attention_dcp(
         query_start_loc,
         request_distribution,
     )
+
+
+
+def sparse_mla_pcp_write_split(
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    restore_idx: jax.Array,
+    split_seq_lens: jax.Array,
+    split_block_tables: jax.Array,
+    split_query_start_loc: jax.Array,
+    mesh: Mesh,
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+    *,
+    dcp_size: int,
+    pcp_size: int,
+    interleave_size: int,
+    dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME,
+) -> tuple[jax.Array, jax.Array]:
+    """PCP manager: write the step's split prefill rows into the DCP shards.
+
+    PCP-gathers the split rows' latents and writes the positions this rank
+    owns. Runs before every cache reader of the layer, so XLA never copies
+    the cache. No `lax.cond`: with no split prefill every row is dropped as
+    padding, and a cond result would force a rope cache relayout every step.
+
+    Returns the updated `(kv_cache_nope, kv_cache_rope)`.
+    """
+    from vllm_torchtpu.kernels.mla import pcp_workspace as ws
+
+    sharded = P(dcp_axis_name)
+    replicated = P()
+    in_specs = (
+        sharded,  # kv_cache_nope
+        sharded,  # kv_cache_rope
+        sharded,  # kv_c_normed
+        sharded,  # k_pe
+        replicated,  # restore_idx
+        replicated,  # split_seq_lens
+        replicated,  # split_block_tables
+        replicated,  # split_query_start_loc
+    )
+    out_specs = (sharded, sharded)
+
+    def _local(
+        kv_cache_nope, kv_cache_rope, kv_c_normed, k_pe, restore_idx_,
+        split_seq_lens_, split_block_tables_, split_qsl_,
+    ):
+        gather = functools.partial(
+            ws.pcp_gather_rows, axis_name=dcp_axis_name, pcp_size=pcp_size
+        )
+        return update_sparse_mla_kv_cache_dcp(
+            kv_cache_nope,
+            kv_cache_rope,
+            gather(kv_c_normed, restore_idx_),
+            gather(k_pe, restore_idx_),
+            split_seq_lens_,
+            split_block_tables_,
+            split_qsl_,
+            streamindex_topk.cp_rank_as_data(dcp_axis_name, dcp_size),
+            nope_spec=nope_spec,
+            rope_spec=rope_spec,
+            dcp_size=dcp_size,
+            interleave_size=interleave_size,
+        )
+
+    return jax.jit(
+        shard_map.shard_map(
+            _local, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False
+        )
+    )(
+        kv_cache_nope,
+        kv_cache_rope,
+        kv_c_normed,
+        k_pe,
+        restore_idx,
+        split_seq_lens,
+        split_block_tables,
+        split_query_start_loc,
+    )
+
+
+def sparse_mla_attention_pcp_prefill(
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    ql_nope: jax.Array,
+    q_pe: jax.Array,
+    topk_indices: jax.Array,
+    split_block_tables: jax.Array,
+    ws_req: jax.Array,
+    ws_vpage: jax.Array,
+    ws_page_offset: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    num_split_reqs: jax.Array,
+    ws_used_pages: jax.Array,
+    mesh: Mesh,
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+    sm_scale: float | None = None,
+    k_scale: float | None = None,
+    *,
+    dcp_size: int,
+    interleave_size: int,
+    chunk_pages: int,
+    dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME,
+) -> jax.Array:
+    """PCP manager sparse MLA for the split prefill rows (read-only).
+
+    Under `lax.cond(num_split_reqs > 0)`, gathers the split requests' KV into
+    a fixed-size workspace, `chunk_pages` pages per DCP all-gather and only as
+    many chunks as in use, then attends the local queries' top-k (global
+    positions) over it in one call.
+
+    Returns `[local_tokens, local_heads, lkv_dim]`; zeros when nothing is split.
+    """
+    from vllm_torchtpu.kernels.mla import pcp_workspace as ws
+
+    if nope_spec.layout is not rope_spec.layout:
+        raise ValueError(
+            "sparse MLA attention requires matching NoPE and RoPE layouts; "
+            f"got {nope_spec.layout.value} and {rope_spec.layout.value}"
+        )
+    cache_layout = nope_spec.layout.value
+    dequant_scale = float(k_scale) if k_scale is not None else 1.0
+    sharded = P(dcp_axis_name)
+    replicated = P()
+    in_specs = (
+        sharded,  # kv_cache_nope
+        sharded,  # kv_cache_rope
+        sharded,  # ql_nope
+        sharded,  # q_pe
+        sharded,  # topk_indices
+        replicated,  # split_block_tables: [num_split_seqs, pages]
+        replicated,  # ws_req
+        replicated,  # ws_vpage
+        sharded,  # ws_page_offset
+        sharded,  # query_start_loc
+        sharded,  # request_distribution
+        replicated,  # num_split_reqs
+        replicated,  # ws_used_pages
+    )
+    out_specs = sharded
+
+    def _local(
+        kv_cache_nope, kv_cache_rope, ql_nope, q_pe, topk_idx,
+        split_block_tables_, ws_req_,
+        ws_vpage_, ws_page_offset_, qsl_, rd_, num_split_, ws_used_pages_,
+    ):
+        num_tokens, num_heads, lkv_dim = ql_nope.shape
+
+        def run(caches):
+            nope, rope = caches
+            pages = ws.workspace_pages(
+                split_block_tables_,
+                split_block_tables_.shape[0],
+                ws_req_,
+                ws_vpage_,
+                nope_spec.num_pages,
+            )
+            coords = ws.topk_workspace_coords(
+                topk_idx,
+                qsl_,
+                ws_page_offset_,
+                page_size=nope_spec.page_size,
+                dcp_size=dcp_size,
+                interleave=interleave_size,
+            )
+            ws_idx = ws.remap_topk_chunked(
+                coords,
+                chunk_pages=chunk_pages,
+                page_size=nope_spec.page_size,
+                dcp_size=dcp_size,
+            )
+
+            # Gather only the chunks in use, then attend once (no merge).
+            num_ws_chunks = ws_req_.shape[0] // chunk_pages
+            rows_per_chunk = dcp_size * chunk_pages
+            ws_rows = num_ws_chunks * rows_per_chunk
+
+            def gather_body(c, bufs):
+                buf_nope, buf_rope = bufs
+                # `ws_req` is padded to a multiple of `chunk_pages`, so this
+                # slice never runs off the end (dynamic_slice would shift it).
+                chunk_ids = jax.lax.dynamic_slice_in_dim(
+                    pages, c * chunk_pages, chunk_pages
+                )
+                g_nope = ws.gather_workspace(nope, chunk_ids, axis_name=dcp_axis_name)
+                g_rope = ws.gather_workspace(rope, chunk_ids, axis_name=dcp_axis_name)
+                at = c * rows_per_chunk
+                buf_nope = jax.lax.dynamic_update_slice_in_dim(
+                    buf_nope, g_nope.reshape(-1, *g_nope.shape[2:]), at, axis=0
+                )
+                buf_rope = jax.lax.dynamic_update_slice_in_dim(
+                    buf_rope, g_rope.reshape(-1, *g_rope.shape[2:]), at, axis=0
+                )
+                return buf_nope, buf_rope
+
+            num_chunks = (ws_used_pages_[0] + chunk_pages - 1) // chunk_pages
+            init = (
+                jnp.zeros((ws_rows, *nope.shape[1:]), nope.dtype),
+                jnp.zeros((ws_rows, *rope.shape[1:]), rope.dtype),
+            )
+            ws_nope, ws_rope = jax.lax.fori_loop(0, num_chunks, gather_body, init)
+
+            q = jnp.concatenate([ql_nope, q_pe], axis=-1)
+            output = sparse_mla_kernel.sparse_ragged_paged_attention(
+                q,
+                ws_nope,
+                ws_rope,
+                ws_idx,
+                None,
+                qsl_,
+                rd_,
+                sm_scale=sm_scale or 1.0,
+                k_scale=dequant_scale,
+                cache_layout=cache_layout,
+            )
+            # Drop the rope tail: only the nope part is the MLA value.
+            return output[..., :lkv_dim].astype(ql_nope.dtype)
+
+        def skip(caches):
+            del caches
+            return jnp.zeros((num_tokens, num_heads, lkv_dim), ql_nope.dtype)
+
+        return jax.lax.cond(
+            num_split_[0] > 0, run, skip, (kv_cache_nope, kv_cache_rope)
+        )
+
+    return jax.jit(
+        shard_map.shard_map(
+            _local, mesh=mesh, in_specs=in_specs, out_specs=out_specs, check_rep=False
+        )
+    )(
+        kv_cache_nope,
+        kv_cache_rope,
+        ql_nope,
+        q_pe,
+        topk_indices,
+        split_block_tables,
+        ws_req,
+        ws_vpage,
+        ws_page_offset,
+        query_start_loc,
+        request_distribution,
+        num_split_reqs,
+        ws_used_pages,
+    )
