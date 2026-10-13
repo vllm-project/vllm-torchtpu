@@ -34,6 +34,10 @@ Requests only all decode at once if each decode outlasts the prefill of the
 other requests: with chunked prefill, decode tokens must exceed about
 (concurrency - 1) * ceil(prefill tokens / max_num_batched_tokens). Pass the
 server's --max-num-batched-tokens to check this before sending anything.
+At high concurrency with long prompts that overlap can shrink to a few
+seconds. --prime-prefix-cache avoids it on a server with prefix caching:
+each round first sends its prompts with max_tokens=1, so the measured
+requests hit the cache and start decoding together.
 
 During each round the server's /metrics is polled for peak running/waiting
 requests, KV cache usage and preemptions: waiting requests or preemptions
@@ -1041,6 +1045,7 @@ def write_markdown(path: Path, summary: dict[str, Any]) -> None:
         f"  --step-seconds {benchmark['step_s']} \\",
         f"  --min-full-overlap-seconds {benchmark['min_full_overlap_s']} \\",
         f"  --min-full-overlap-tokens {benchmark['min_full_overlap_tokens']} \\",
+        *(["  --prime-prefix-cache \\"] if benchmark.get("prime_prefix_cache") else []),
         (f"  --min-peak-active-fraction {benchmark['min_peak_active_fraction']}"),
         "```",
         "",
@@ -1140,6 +1145,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--rounds", type=positive_int, default=1)
     parser.add_argument("--cache-salt-prefix", default="")
+    parser.add_argument(
+        "--prime-prefix-cache",
+        action="store_true",
+        help=(
+            "Before each round, send the round's prompts with max_tokens=1 so "
+            "the measured requests hit the prefix cache and decode together. "
+            "Needs a server with prefix caching enabled."
+        ),
+    )
     parser.add_argument("--window-seconds", type=positive_float, default=10.0)
     parser.add_argument("--step-seconds", type=positive_float, default=1.0)
     parser.add_argument(
@@ -1173,7 +1187,7 @@ def parse_args() -> argparse.Namespace:
         parser.error("--decode-tokens must be at least 2 for decode interval timing")
     if args.tokenizer is None:
         args.tokenizer = args.model
-    if args.max_num_batched_tokens is not None:
+    if args.max_num_batched_tokens is not None and not args.prime_prefix_cache:
         possible, tokens_before_last_prefill = check_full_overlap_possible(
             concurrency=args.concurrency,
             prefill_tokens=args.prefill_tokens,
@@ -1248,6 +1262,31 @@ def main() -> None:
             }
             for request_id, prompt in enumerate(prompts)
         ]
+        prime_summary: dict[str, Any] = {}
+        if args.prime_prefix_cache:
+            prime_start_s = time.perf_counter()
+            prime_results = run_round(
+                endpoint=endpoint,
+                request_payloads=[
+                    {**payload, "max_tokens": 1} for payload in request_payloads
+                ],
+                concurrency=args.concurrency,
+                data_parallel_size=args.data_parallel_size,
+                timeout_s=args.request_timeout_seconds,
+            )
+            prime_summary = {
+                "prime_duration_s": time.perf_counter() - prime_start_s,
+                "prime_failures": [
+                    {"request_id": result.request_id, "error": result.error}
+                    for result in prime_results
+                    if result.error is not None
+                ],
+            }
+            print(
+                f"[prime] duration_s={prime_summary['prime_duration_s']:.1f} "
+                f"failures={len(prime_summary['prime_failures'])}",
+                flush=True,
+            )
         with ServerMetricsSampler(
             f"{base_url}/metrics", args.metrics_interval_seconds
         ) as sampler:
@@ -1271,6 +1310,11 @@ def main() -> None:
             min_peak_active_fraction=args.min_peak_active_fraction,
         )
         analysis.summary.update(server_metrics)
+        analysis.summary.update(prime_summary)
+        if prime_summary.get("prime_failures"):
+            # Unprimed requests prefill cold, so the window would not be steady decode.
+            analysis.summary["valid"] = False
+            analysis.summary["invalid_reason"] = "prime_failed"
         round_summaries.append(analysis.summary)
         all_windows.extend(analysis.windows)
         all_request_tpots.extend(analysis.request_tpots)
@@ -1334,6 +1378,7 @@ def main() -> None:
             "min_full_overlap_s": args.min_full_overlap_seconds,
             "min_full_overlap_tokens": args.min_full_overlap_tokens,
             "min_peak_active_fraction": args.min_peak_active_fraction,
+            "prime_prefix_cache": args.prime_prefix_cache,
             "boundary": "peak_sustained_concurrency_sliding_windows",
             "token_accounting": "continuous_usage_completion_tokens",
         },

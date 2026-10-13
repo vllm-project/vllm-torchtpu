@@ -105,7 +105,10 @@ steps:
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
         commands:
           # C64, 98k input / 5k output, DSpark K=5, Engram CPU offload.
-          # Use the same benchmark runner and artifacts as C4/C8/C16.
+          # Use the same benchmark runner and artifacts as C4/C8/C16. Prompts
+          # are primed into the prefix cache first, so full-overlap tok/s is
+          # steady 64-request decode; DSpark acceptance on this repeated-text
+          # prompt is higher than on real text.
           - >-
             bash .buildkite/scripts/run_in_docker.sh
             env MODEL_URI=gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash

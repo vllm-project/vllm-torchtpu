@@ -78,11 +78,21 @@ eval "$(
     bash -c '
         source "$1" > /dev/null
         : "${DATA_PARALLELISM:=1}" "${SERVER_READY_WAIT_MIN:=90}"
+        : "${DECODE_PRIME_PREFIX_CACHE:=false}" "${DECODE_MIN_FULL_OVERLAP_SECONDS:=0}"
         declare -p MODEL TENSOR_PARALLELISM DATA_PARALLELISM \
             MAX_NUM_BATCHED_TOKENS ISL_OSL_CONFIGS CONCURRENCY_OPTIONS \
-            SERVER_READY_WAIT_MIN
+            SERVER_READY_WAIT_MIN DECODE_PRIME_PREFIX_CACHE \
+            DECODE_MIN_FULL_OVERLAP_SECONDS
     ' _ "$CONFIG_FILE"
 )"
+# Optional config knobs for the measured runs: DECODE_PRIME_PREFIX_CACHE=true
+# primes each round's prompts into the prefix cache first (the config must
+# enable prefix caching), and DECODE_MIN_FULL_OVERLAP_SECONDS rejects a round
+# whose all-requests-decoding interval is shorter.
+measure_args=(--min-full-overlap-seconds "$DECODE_MIN_FULL_OVERLAP_SECONDS")
+if [ "$DECODE_PRIME_PREFIX_CACHE" = "true" ]; then
+    measure_args+=(--prime-prefix-cache)
+fi
 ISL_OSL_CONFIGS="${ISL_OSL_OVERRIDE:-$ISL_OSL_CONFIGS}"
 CONCURRENCY_OPTIONS="${CONCURRENCIES_OVERRIDE:-$CONCURRENCY_OPTIONS}"
 
@@ -176,7 +186,7 @@ for isl_osl in $ISL_OSL_CONFIGS; do
             --concurrency "$concurrency" \
             --prefill-tokens "$prefill_tokens" --decode-tokens "$decode_tokens" \
             --max-num-batched-tokens "$MAX_NUM_BATCHED_TOKENS" \
-            --rounds "$ROUNDS" 2>&1 | tee "$DECODE_DIR/$name.log"; then
+            --rounds "$ROUNDS" "${measure_args[@]}" 2>&1 | tee "$DECODE_DIR/$name.log"; then
             echo "ERROR: $name failed"
             exit_code=1
         fi

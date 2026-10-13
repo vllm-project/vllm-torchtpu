@@ -23,3 +23,12 @@ MAX_NUM_BATCHED_TOKENS=8192
 KV_CACHE_DTYPE=fp8
 # Match the measured C64 DSpark/offload workload.
 ISL_OSL_CONFIGS="98000:5000"
+# Unprimed, the 64 x 98k prefills spread first tokens over ~400 s and all 64
+# requests decode together for only a few seconds, so the full-overlap number
+# swung 2.7k-7.6k tok/s on unchanged code. Prime the prompts into the prefix
+# cache first, so the measured requests start decoding together, and reject a
+# round with less than 10 s of full overlap. Each round has its own cache salt,
+# so only its own prime pass can hit.
+ENABLE_PREFIX_CACHING=true
+DECODE_PRIME_PREFIX_CACHE=true
+DECODE_MIN_FULL_OVERLAP_SECONDS=10
