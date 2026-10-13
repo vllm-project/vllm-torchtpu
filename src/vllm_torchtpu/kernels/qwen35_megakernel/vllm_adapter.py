@@ -87,8 +87,9 @@ _DEFAULT_VERIFY_BUCKETS_64 = (4, 8, 12, 16, 20, 24, 32, 40, 48, 56, 64)
 # split `(64, b1)` where `b1 = B - 64` reuses the already-compiled single-call
 # `(4, 64)` and `(4, b1)` Pallas kernels without exceeding the 62 MiB VMEM limit
 # or falling back to slow stock_t4_b96 / stock_t4_b128 (256-padded XLA).
-_DEFAULT_WIDE_VERIFY_BUCKETS_128 = (68, 72, 76, 80, 84, 88, 96, 104, 112, 120, 128)
-_MAX_SINGLE_KERNEL_B = 64
+_DEFAULT_WIDE_VERIFY_BUCKETS_128 = (80, 84, 88, 96, 104, 112, 120, 128)
+_MAX_SINGLE_KERNEL_B = 80
+_SPLIT_BASE_B = 80
 
 
 def _env_off(name: str, default: str = "1") -> bool:
@@ -270,7 +271,7 @@ def parse_mk_fused_pool_io_max_b(env_val: str | None = None) -> int:
     raw = (
         env_val
         if env_val is not None
-        else os.environ.get("VLLM_TPU_QWEN35_MK_FUSED_POOL_IO_MAX_B", "64")
+        else os.environ.get("VLLM_TPU_QWEN35_MK_FUSED_POOL_IO_MAX_B", "128")
     )
     return int(raw.strip())
 
@@ -1995,7 +1996,7 @@ class Qwen35Megakernel:
         up to `min(128, 4 * runner_max_reqs)` when `split_wide` is enabled and `64` is present."""
         if not getattr(self, "split_wide", True):
             return
-        if not self.verify_buckets or _MAX_SINGLE_KERNEL_B not in self.verify_buckets:
+        if not self.verify_buckets or 64 not in self.verify_buckets:
             return
         if "VLLM_TPU_QWEN35_MK_VERIFY_BUCKETS" in os.environ:
             return
@@ -2016,7 +2017,7 @@ class Qwen35Megakernel:
             ),
             default=0,
         )
-        if runner_max_reqs <= _MAX_SINGLE_KERNEL_B // 4:
+        if runner_max_reqs <= 16:
             return
         target_rows = min(128, 4 * runner_max_reqs)
         max_wide = select_bucket(target_rows, _DEFAULT_WIDE_VERIFY_BUCKETS_128)
@@ -2024,7 +2025,7 @@ class Qwen35Megakernel:
             b
             for b in _DEFAULT_WIDE_VERIFY_BUCKETS_128
             if b <= max_wide
-            and (b - _MAX_SINGLE_KERNEL_B) in self.verify_buckets
+            and (b <= _MAX_SINGLE_KERNEL_B or (b - _SPLIT_BASE_B) in self.verify_buckets)
             and b not in self.verify_buckets
         ]
         if wide_extra:
@@ -2078,8 +2079,8 @@ class Qwen35Megakernel:
                 self._bucket_steps[b] = step
             self._bucket_out_rows[(T, b)] = out_rows
         for T, b in split_keys:
-            b1 = b - _MAX_SINGLE_KERNEL_B
-            m_rows = _MAX_SINGLE_KERNEL_B + max(16, K.rup(b1, 16))
+            b1 = b - _SPLIT_BASE_B
+            m_rows = _SPLIT_BASE_B + max(16, K.rup(b1, 16))
             out_rows = self._runner_out_rows(b, m_rows)
             step = self._build_split_bucket_op(b, tokens_per_seq=T, out_pad_rows=out_rows)
             self._bucket_steps[(T, b)] = step
@@ -2580,11 +2581,11 @@ class Qwen35Megakernel:
         B = int(bucket_t)
         if B % T != 0:
             raise ValueError(f"bucket_t={B} must be a multiple of tokens_per_seq={T}")
-        b0 = _MAX_SINGLE_KERNEL_B
+        b0 = _SPLIT_BASE_B
         b1 = B - b0
-        if b1 <= 0 or b1 > _MAX_SINGLE_KERNEL_B or b1 % T != 0:
+        if b1 <= 0 or b1 > _SPLIT_BASE_B or b1 % T != 0:
             raise ValueError(
-                f"Split bucket requires {_MAX_SINGLE_KERNEL_B} < B <= {2 * _MAX_SINGLE_KERNEL_B} "
+                f"Split bucket requires {_SPLIT_BASE_B} < B <= {2 * _SPLIT_BASE_B} "
                 f"and B % {T} == 0, got B={B}"
             )
         s0_len = b0 // T
@@ -2993,7 +2994,7 @@ class Qwen35Megakernel:
             or getattr(runner, "max_num_reqs", 64)
             or 64
         )
-        max_warm_b = min(self.max_verify_bucket or 64, max(16, max_cfg_seqs * 4))
+        max_warm_b = min(128, max(16, max_cfg_seqs * 4))
         all_keys = [
             (1, b) for b in self.buckets if b <= max_warm_b
         ] + [

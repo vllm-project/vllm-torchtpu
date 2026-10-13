@@ -334,7 +334,7 @@ class MKConfig:
         assert self.L % self.att_every == 0 and self.NH % self.R == 0 and self.R % self.NKV == 0
         assert self.KH % self.R == 0 and self.VH % self.R == 0 and self.E % self.R == 0
         assert self.IS % self.R == 0 and (not self.moe_tp or self.I % self.R == 0)
-        assert self.vh <= 64 and self.B * self.TOPK <= 640 and 1 <= self.B <= self.M <= 64
+        assert self.vh <= 64 and self.B * self.TOPK <= 1280 and 1 <= self.B <= self.M <= 128
         assert self.E % 128 == 0 and self.E <= 1024 and self.H % self.PC == 0 and self.nh <= 8
         assert self.ROT % 2 == 0 and self.R & (self.R - 1) == 0 and self.VH % self.KH == 0
         assert self.T >= 1 and self.B % self.T == 0, (self.B, self.T)
@@ -462,7 +462,7 @@ CONV_STAGE_MIN_B = 8
 # all refills), so each chunk's MXU drain overlaps the next chunk's weight pushes.
 DMM_UNROLL = 8
 DMM_UNROLL_OFF_B = ()
-MXU_DR_BUCKETS = (4, 8, 12, 16, 20, 24, 32, 40, 48, 56, 64)
+MXU_DR_BUCKETS = (4, 8, 12, 16, 20, 24, 32, 40, 48, 56, 64, 80, 96, 112, 128)
 GDN_LCV = True
 GDN_ZDEFER = True
 ATT_GDEFER = True
@@ -474,7 +474,7 @@ ARPIPE_ON = True
 ARPIPE_OFF_B = (20, 24, 32)
 ARPIPE_H1_ON = True
 AR0S_ON = True
-FUSED_WIDE_NBD = {32: 12, 40: 12, 48: 12, 56: 11, 64: 9}
+FUSED_WIDE_NBD = {32: 12, 40: 12, 48: 12, 56: 11, 64: 9, 80: 8, 96: 5, 112: 2}
 
 # ROUTE_SHRINK (VEC route): shorter serial scalar chain from the EARLY_FILL issue to the first
 # expert compute. The copy-candidate scan packs each candidate's copy slot (its meta lane) above

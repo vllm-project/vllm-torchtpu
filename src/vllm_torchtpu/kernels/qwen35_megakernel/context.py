@@ -225,8 +225,8 @@ class MKBuildContext:
         GCONV_ROWS = (c.HR * QKV * 2) // (4 * 128)  # fp8 (4,128)-rows holding HR bf16 conv rows
         assert not GPR or (c.HR * QKV * 2) % (4 * 128) == 0, (c.HR, QKV)
         assert not GPR or GCONV_ROWS <= 64, GCONV_ROWS
-        NGI = min(NS, 8)
-        NGO = min(NS, 2)
+        NGI = min(NS, 1 if B > 96 else (2 if B > 80 else (4 if B > 64 else 8)))
+        NGO = min(NS, 1 if B > 64 else 2)
         G_PER_ATT = max(1, AE - 1)
         qkv_128 = QKV // 128
         A_conv = 16
