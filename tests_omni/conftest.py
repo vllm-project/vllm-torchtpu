@@ -195,19 +195,6 @@ def omni_runner(
     yield _omni_runner_manager.get_or_create(request.param)
 
 
-@pytest.fixture(scope="function")
-def omni_runner_function(
-    request: pytest.FixtureRequest,
-) -> Generator[OmniRunner, None, None]:
-    """Function-scoped :class:`OmniRunner` torn down after each test."""
-    model, stage_cfg, extra = _parse_omni_runner_param(request.param)
-    with (
-        omni_fixture_lock,
-        OmniRunner(model, deploy_config=stage_cfg, **extra) as runner,
-    ):
-        yield runner
-
-
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
     """Group ``omni_runner`` tests by model within each module to spin up once."""
     first_seen: dict[tuple[str, tuple[str, str | None, str]], int] = {}
