@@ -48,6 +48,7 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.pcp_partition import (
     build_pcp_batch_plan,
     build_workspace_plan,
+    pcp_max_local_tokens,
     pcp_rank_token_counts,
 )
 
@@ -275,6 +276,8 @@ class PcpManager:
         dcp_size: int,
         page_size: int,
         workspace_tokens: int,
+        max_num_batched_tokens: int,
+        max_num_seqs: int,
     ) -> None:
         self.pcp_size = int(pcp_size)
         self.pcp_rank = int(pcp_rank)
@@ -285,6 +288,9 @@ class PcpManager:
         chunk_pages = pcp_chunk_pages(page_size, self.dcp_size)
         num_pages = max(1, int(workspace_tokens) // self.virtual_page_size)
         self.num_ws_pages = -(-num_pages // chunk_pages) * chunk_pages
+        self._max_local_num_tokens = pcp_max_local_tokens(
+            max_num_batched_tokens, max_num_seqs, self.pcp_size
+        )
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> PcpManager:
@@ -298,6 +304,8 @@ class PcpManager:
             dcp_size=parallel_config.decode_context_parallel_size,
             page_size=vllm_config.cache_config.block_size,
             workspace_tokens=envs.TPU_PCP_KV_WORKSPACE_TOKENS,
+            max_num_batched_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
+            max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
         )
 
     # --- SequenceLayoutPlanner ---------------------------------------------
@@ -312,6 +320,10 @@ class PcpManager:
     @property
     def uses_selected_logits_hidden_states(self) -> bool:
         return True
+
+    @property
+    def max_local_num_tokens(self) -> int:
+        return self._max_local_num_tokens
 
     def reserve_host_token_capacity(
         self, runner: Any, required_num_tokens: int
@@ -344,6 +356,11 @@ class PcpManager:
 
         # Every rank pads its local batch to the same compile bucket.
         rank_counts = pcp_rank_token_counts(q_lens, is_prefilling, self.pcp_size)
+        if max(rank_counts) > self._max_local_num_tokens:
+            raise RuntimeError(
+                f"PCP rank has {max(rank_counts)} local tokens, above the "
+                f"warmed-up cap {self._max_local_num_tokens}."
+            )
         local_padded = _first_ge(runner.num_tokens_paddings, max(1, max(rank_counts)))
         dp_target_bucket = getattr(runner, "_dp_target_bucket", None)
         if dp_target_bucket is not None and dp_target_bucket > local_padded:

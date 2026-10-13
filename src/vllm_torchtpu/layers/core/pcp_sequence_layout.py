@@ -373,6 +373,10 @@ class PcpSequenceLayoutPlanner:
     def uses_selected_logits_hidden_states(self) -> bool:
         return self.enabled
 
+    @property
+    def max_local_num_tokens(self) -> int | None:
+        return None
+
     def reserve_host_token_capacity(
         self, runner: Any, required_num_tokens: int
     ) -> None:

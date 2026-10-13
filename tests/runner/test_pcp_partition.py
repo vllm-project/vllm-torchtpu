@@ -14,12 +14,14 @@
 """Host-side PCP batch partitioning (`runner/pcp_partition.py`)."""
 
 import itertools
+import random
 
 import pytest
 
 from vllm_torchtpu.runner.pcp_partition import (
     build_pcp_batch_plan,
     build_workspace_plan,
+    pcp_max_local_tokens,
     pcp_rank_token_counts,
 )
 
@@ -141,6 +143,28 @@ def test_random_batches_keep_invariants(pcp_size):
             pcp_rank_token_counts(q_lens, prefilling, pcp_size)
             == plan.per_rank_num_tokens
         )
+
+
+@pytest.mark.parametrize("pcp_size", [2, 4, 8])
+def test_max_local_tokens_bounds_every_schedulable_step(pcp_size):
+    budget, max_seqs = 4096, 8
+    cap = pcp_max_local_tokens(budget, max_seqs, pcp_size)
+    rng = random.Random(pcp_size)
+    cases = [
+        # Rounding worst case: every request a short prefill.
+        ([2 * pcp_size + 1] * max_seqs, [True] * max_seqs),
+        ([budget - max_seqs + 1] + [1] * (max_seqs - 1), [True] + [False] * 7),
+        ([budget], [True]),
+    ]
+    for _ in range(2000):
+        n = rng.randint(1, max_seqs)
+        cuts = sorted(rng.sample(range(1, budget), n - 1))
+        q_lens = [b - a for a, b in zip([0] + cuts, cuts + [budget])]
+        prefilling = [rng.random() < 0.5 for _ in q_lens]
+        q_lens = [q if p else 1 for q, p in zip(q_lens, prefilling)]
+        cases.append((q_lens, prefilling))
+    for q_lens, prefilling in cases:
+        assert max(pcp_rank_token_counts(q_lens, prefilling, pcp_size)) <= cap
 
 
 def test_workspace_plan_lays_requests_back_to_back():

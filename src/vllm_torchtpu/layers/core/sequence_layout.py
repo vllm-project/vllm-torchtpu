@@ -236,6 +236,11 @@ class SequenceLayoutPlanner(Protocol):
     @property
     def uses_selected_logits_hidden_states(self) -> bool: ...
 
+    @property
+    def max_local_num_tokens(self) -> int | None:
+        """Most tokens one rank runs per step, or None for the global count."""
+        ...
+
     def reserve_host_token_capacity(
         self, runner: Any, required_num_tokens: int
     ) -> None: ...
@@ -299,6 +304,10 @@ class AllSequenceLayoutPlanner:
     @property
     def uses_selected_logits_hidden_states(self) -> bool:
         return False
+
+    @property
+    def max_local_num_tokens(self) -> int | None:
+        return None
 
     def reserve_host_token_capacity(
         self, runner: Any, required_num_tokens: int

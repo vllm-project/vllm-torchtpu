@@ -909,6 +909,11 @@ class TPUModelRunner(GPUModelRunner):
         # Override parent's max_num_tokens with the last (largest) padding
         # bucket so all CPU staging buffers cover it.
         self.max_num_tokens = self.num_tokens_paddings[-1]
+        # vLLM compiles the backbone for every compile size, but it runs on a
+        # rank's local tokens, which PCP caps well below the global step.
+        backbone_paddings = self._backbone_token_paddings()
+        if len(backbone_paddings) < len(self.num_tokens_paddings):
+            vllm_config.compilation_config.compile_sizes = list(backbone_paddings)
         self.num_attn_layers = self.model_config.get_num_layers_by_block_type(
             self.parallel_config, "attention"
         )
@@ -6852,6 +6857,14 @@ class TPUModelRunner(GPUModelRunner):
             )
         return attempt_succeeded
 
+    def _backbone_token_paddings(self) -> list[int]:
+        """Token buckets the backbone can run at on this rank."""
+        cap = self.sequence_layout_planner.max_local_num_tokens
+        if cap is None or cap >= self.num_tokens_paddings[-1]:
+            return self.num_tokens_paddings
+        top = _get_padded_token_len(self.num_tokens_paddings, cap)
+        return [n for n in self.num_tokens_paddings if n <= top]
+
     def _precompile_backbone(self) -> None:
         """Compile the backbone for every token bucket.
 
@@ -6862,7 +6875,7 @@ class TPUModelRunner(GPUModelRunner):
         vllm_torchtpu.compilation.shape_variants).
         """
         with shape_variants.warmup() as buckets:
-            for num_tokens in self.num_tokens_paddings:
+            for num_tokens in self._backbone_token_paddings():
                 logger.info("  -- num_tokens: %d", num_tokens)
                 if buckets.needs_retrace(num_tokens):
                     shape_variants.retrace(self.model, self.vllm_config)
@@ -7610,6 +7623,7 @@ class TPUModelRunner(GPUModelRunner):
             # program-region reservation, and the kv=0-specialized graphs are
             # dead after the dynamo reset below — one throwaway program keeps
             # the region within budget for capture_model's full bucket ladder.
+            num_tokens = min(num_tokens, self._backbone_token_paddings()[-1])
             with self._profile_isolated_cache():
                 cc.compile_sizes = [num_tokens]
                 self._dummy_run(

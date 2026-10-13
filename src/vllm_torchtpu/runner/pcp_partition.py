@@ -146,6 +146,17 @@ def pcp_rank_token_counts(
     ]
 
 
+def pcp_max_local_tokens(
+    max_num_batched_tokens: int, max_num_seqs: int, pcp_size: int
+) -> int:
+    """Upper bound on `pcp_rank_token_counts` for any schedulable step.
+
+    A rank holds 1/pcp of the prefill tokens, plus up to 2 per prefill from
+    rounding its two chunks up, plus every (replicated) decode.
+    """
+    return -(-int(max_num_batched_tokens) // int(pcp_size)) + 3 * int(max_num_seqs)
+
+
 def build_pcp_batch_plan(
     num_scheduled_tokens: list[int],
     is_prefilling: list[bool],
