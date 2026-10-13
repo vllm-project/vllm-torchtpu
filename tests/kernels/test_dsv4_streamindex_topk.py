@@ -1226,6 +1226,113 @@ def test_chunked_topk_matches_the_naive_reference(T_list, chunk_tokens):
     )
 
 
+@pytest.mark.parametrize("kv_layout", [_HAS, _SAL])
+@pytest.mark.parametrize(
+    "T_list, S_list, distribution",
+    [
+        # Decodes, then verify windows that take the prefill pass, then a long
+        # prefill and a short one after it that both take the mixed pass.
+        (
+            (1, 1, 4, 4, 3, 40, 4),
+            (300, 512, 260, 500, 333, 480, 390),
+            (2, 7, 7),
+        ),
+        # The 12-token sequence is longer than the prefill q block, so it ends the
+        # prefill pass early and everything from it on goes to the mixed pass.
+        ((1, 4, 12, 4), (420, 512, 300, 250), (1, 4, 4)),
+        # Today's `(i, i, k)` leaves the prefill pass empty.
+        ((1, 4, 4), (420, 512, 300), (1, 1, 3)),
+        # A speculative-decoding step: only verify windows, so the kernel takes
+        # its branch that runs the prefill pass alone.
+        ((4, 4, 3), (420, 512, 300), (0, 3, 3)),
+    ],
+    ids=[
+        "verify_windows_then_mixed",
+        "long_sequence_ends_the_pass",
+        "empty",
+        "verify_windows_only",
+    ],
+)
+def test_short_prefill_pass_matches_the_naive_reference(
+    T_list, S_list, distribution, kv_layout
+):
+    """Short prefill-only sequences get their own small-q-block pass.
+
+    Every token must be scored exactly once whichever pass it lands in. `k` is
+    below the visible length, so a row that no pass scored would select garbage
+    instead of silently selecting every visible column. That makes ties matter,
+    so the inputs avoid them: q is exact in bf16, which is what the MXU sees,
+    and positive weights keep the k-th score above the many exact zeros that
+    four relu'd heads produce.
+    """
+    page_size, H_I, D = 128, 4, 128
+    k, comp_ratio = 128, 1
+
+    inputs = _chunk_inputs(T_list, _fragmented_pages(len(T_list)), page_size, H_I, D)
+    inputs = inputs._replace(
+        q=np.asarray(jnp.asarray(inputs.q, jnp.bfloat16), np.float32),
+        weights=np.abs(inputs.weights),
+    )
+    kwargs = _chunk_call_kwargs(
+        inputs, T_list, S_list, k, comp_ratio, 8, 2, kv_layout, None
+    )
+    kwargs.update(
+        distribution=distribution,
+        num_queries_per_block=(1, 8, 32),
+        num_kv_pages_per_block=(2, 4, 2),
+    )
+
+    actual = np.array(streamindex_topk(**kwargs))
+    expected = streamindex_topk_ref(
+        q=inputs.q,
+        weights=inputs.weights,
+        kv=inputs.dequantized_kv,
+        block_table=inputs.block_table,
+        T_list=list(T_list),
+        S_list=list(S_list),
+        cu_q_lens=np.concatenate([[0], np.cumsum(T_list)]).astype(np.int32),
+        k=k,
+        comp_ratio=comp_ratio,
+        H_I=H_I,
+        H_KV=1,
+    )
+
+    np.testing.assert_array_equal(
+        np.sort(actual, axis=-1),
+        np.sort(expected, axis=-1),
+        err_msg=f"distribution={distribution} did not match the naive reference",
+    )
+
+
+@pytest.mark.parametrize("kv_layout", [_HAS, _SAL])
+def test_chunked_short_prefill_pass_matches_unchunked(kv_layout):
+    """Chunks past the decodes and verify windows do not launch those passes.
+
+    The verify windows fill tokens 4-67, nine 8-token chunks, and the prefill
+    the rest. The short pass may only skip the chunks from 13 sequences * 8
+    tokens = 104 on, and the decode passes those from 13 on; skipping any
+    earlier would drop rows, and chunking must not change the selection.
+    """
+    T_list = (1,) * 4 + (8,) * 8 + (60,)
+    S_list = (300, 512, 260, 500, 333, 480, 390, 420, 512, 300, 250, 400, 512)
+    page_size, H_I, D = 128, 4, 128
+
+    inputs = _chunk_inputs(T_list, _fragmented_pages(len(T_list)), page_size, H_I, D)
+
+    def topk(chunk_tokens):
+        kwargs = _chunk_call_kwargs(
+            inputs, T_list, S_list, 128, 1, 8, 2, kv_layout, chunk_tokens
+        )
+        kwargs.update(
+            distribution=(4, len(T_list), len(T_list)),
+            num_queries_per_block=(1, 8, 32),
+            num_kv_pages_per_block=(2, 4, 2),
+        )
+        return np.array(streamindex_topk(**kwargs))
+
+    np.testing.assert_array_equal(topk(8), topk(None))
+
+
 class TestChunkedPipelining:
     """Chunking the token axis must not change which candidates are selected.
 

@@ -592,3 +592,110 @@ def test_dcp_append_and_topk_match_across_xla_has_and_sal(dcp_size):
 
     np.testing.assert_array_equal(topk_has, topk_xla)
     np.testing.assert_array_equal(topk_sal, topk_xla)
+
+
+def _pages(rec, num_pages):
+    """`rec` from the first slot of `num_pages` HEAD_ALONG_SUBLANE pages."""
+    rec = jnp.pad(rec, ((0, num_pages * PAGE_SIZE - rec.shape[0]), (0, 0)))
+    return rec.reshape(num_pages, PAGE_SIZE // 4, 4, WIDTH)
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 4, 8])
+def test_dcp_short_pass_matches_the_unsharded_topk(dcp_size):
+    """Verify windows take the prefill pass, and each rank's share of every
+    sequence ends partway through a KV block and a page. Each rank fetches and
+    scores only the pages it holds, which must not change the global top-k.
+    """
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+        KVLayout,
+        convert_cache_to_seq_along_lane,
+    )
+
+    _need_devices(dcp_size)
+    q_lens = (4, 4, 3, 4)
+    seq_lens = (9001, 20000, 4099, 13337)
+    num_seqs, num_tokens = len(q_lens), sum(q_lens)
+    # The runner pads tokens to a bucket, which DCP needs divisible by dcp_size.
+    padded_tokens = 16
+    recs = [_global_records(s, seed=i) for i, s in enumerate(seq_lens)]
+    kq, kw = jax.random.split(jax.random.key(5))
+    q = (
+        jax.random.normal(kq, (padded_tokens, H_IDX, D_IDX), jnp.float32) * 0.5
+    ).astype(jnp.float8_e4m3fn)
+    # Positive weights keep the k-th score clear of exact-zero ties.
+    weights = (jnp.abs(jax.random.normal(kw, (padded_tokens, H_IDX))) + 0.1).astype(
+        jnp.bfloat16
+    )
+    seq_lens_a = jnp.array(seq_lens, jnp.int32)
+    cu_q_lens = jnp.array(np.concatenate([[0], np.cumsum(q_lens)]), jnp.int32)
+    distribution = jnp.array([0, num_seqs, num_seqs], jnp.int32)
+    kwargs = dict(
+        k=K,
+        compression_ratio=1,
+        kv_layout=KVLayout.SEQ_ALONG_LANE,
+        num_kv_pages_per_block=(2, 8, 2),
+        num_queries_per_block=(1, 4, 128),
+    )
+
+    pages_per_seq = -(-max(seq_lens) // PAGE_SIZE)
+    cache = jnp.concatenate([_pages(rec, pages_per_seq) for rec in recs])
+    reference = np.asarray(
+        streamindex_topk(
+            q,
+            weights,
+            convert_cache_to_seq_along_lane(np.asarray(cache), D_IDX),
+            seq_lens_a,
+            jnp.arange(num_seqs * pages_per_seq, dtype=jnp.int32),
+            cu_q_lens,
+            distribution,
+            **kwargs,
+        )
+    )
+
+    # interleave_size=1: rank r holds rec[r::dcp_size] of every sequence.
+    max_local_len = -(-max(seq_lens) // dcp_size)
+    local_pages_per_seq = -(-max_local_len // PAGE_SIZE)
+    shards = jnp.concatenate(
+        [
+            convert_cache_to_seq_along_lane(
+                np.asarray(
+                    jnp.concatenate(
+                        [_pages(rec[r::dcp_size], local_pages_per_seq) for rec in recs]
+                    )
+                ),
+                D_IDX,
+            )
+            for r in range(dcp_size)
+        ]
+    )
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:dcp_size]), (DCP_AXIS_NAME,))
+    shards = jax.device_put(shards, jax.sharding.NamedSharding(mesh, P(DCP_AXIS_NAME)))
+    local_topk = np.asarray(
+        streamindex_topk_dcp(
+            q,
+            weights,
+            shards,
+            seq_lens_a,
+            jnp.arange(num_seqs * local_pages_per_seq, dtype=jnp.int32),
+            cu_q_lens,
+            distribution,
+            mesh=mesh,
+            dcp_size=dcp_size,
+            interleave_size=1,
+            **kwargs,
+        )
+    ).reshape(dcp_size, padded_tokens, K)
+
+    for t in range(num_tokens):
+        got = set()
+        for r in range(dcp_size):
+            row = local_topk[r, t]
+            got.update(
+                int(cp_local_to_global(local, r, dcp_size, 1))
+                for local in row[row >= 0].tolist()
+            )
+        want = set(reference[t][reference[t] >= 0].tolist())
+        assert got == want, (
+            f"token {t}: {len(want - got)} missing, {len(got - want)} spurious"
+        )

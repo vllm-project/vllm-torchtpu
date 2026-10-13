@@ -289,12 +289,20 @@ def compute_batched_seq_metadata(
         seg_num_bkv = jnp.tile(s_num_bkv, num_chunks)
         seg_seq_tiles = jnp.tile(all_seq_tiles, num_chunks)
         seg_num_steps = num_bq.reshape(-1) * seg_num_bkv
-        seg_start_step_id = jnp.cumulative_sum(seg_num_steps, include_initial=True)
+        # Inclusive prefix sum as one masked reduction over the few segments.
+        # `cumulative_sum` lowers to a chain of several small kernels, a fixed
+        # cost that dominates a decode-sized call.
+        seg_ids = jnp.arange(seg_num_steps.shape[0])
+        seg_end_step_id = jnp.sum(
+            jnp.where(seg_ids[None, :] <= seg_ids[:, None], seg_num_steps[None, :], 0),
+            axis=1,
+        )
+        seg_start_step_id = seg_end_step_id - seg_num_steps
 
         # 2D boolean ownership mask [num_chunks * max_seq_tiles, max_steps] where
         # entry (j, t) is True if flat pipeline step t belongs to segment j.
-        is_step_in_seg = (all_steps[None, :] >= seg_start_step_id[:-1, None]) & (
-            all_steps[None, :] < seg_start_step_id[1:, None]
+        is_step_in_seg = (all_steps[None, :] >= seg_start_step_id[:, None]) & (
+            all_steps[None, :] < seg_end_step_id[:, None]
         )
 
         # Map each flat pipeline step t to its sequence tile index (0, 1, ...) and
@@ -303,7 +311,7 @@ def compute_batched_seq_metadata(
         batch_tile_idx = repeat_seq_tiles * seq_batch_size
         # Holds the starting sequence index per flat pipeline step.
         start_step_id_repeat = jnp.sum(
-            seg_start_step_id[:-1, None] * is_step_in_seg, axis=0
+            seg_start_step_id[:, None] * is_step_in_seg, axis=0
         )
         # Holds the local step index within the sequence tile.
         tile_step_id = all_steps - start_step_id_repeat

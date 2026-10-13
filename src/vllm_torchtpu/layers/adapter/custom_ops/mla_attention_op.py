@@ -47,6 +47,7 @@ from vllm_torchtpu.distributed.dcp import get_dcp_group, get_or_create_dcp_mesh
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME,
     KVLayout,
+    cache_page_size,
     coalesced_kv_append,
     coalesced_kv_append_dcp,
     cp_rank_as_data,
@@ -80,6 +81,30 @@ logger = init_logger(__name__)
 # traffic and not at all once any request in the batch is past `index_topk`
 # tokens.
 STREAMIDX_ENABLE_EARLY_EXIT = True
+
+
+def _verify_window() -> int | None:
+    """Tokens per speculative-decoding verify window, or None without drafts."""
+    spec_config = getattr(get_current_vllm_config_or_none(), "speculative_config", None)
+    if spec_config is None:
+        return None
+    return (spec_config.num_speculative_tokens or 0) + 1
+
+
+def _streamidx_block_sizes(
+    page_size: int, verify_window: int | None
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    """`(num_kv_pages_per_block, num_queries_per_block)` for `streamindex_topk`.
+
+    Tuned on GLM-5.2 indexer shapes. Verify windows take the kernel's prefill
+    pass (see `distribution` in `forward_oot`) with one q block per window and
+    ~16K-token KV blocks, which keeps a decode step's latency down. Without
+    drafts the prefill entry equals the mixed one, so the kernel skips that pass.
+    """
+    if verify_window is None:
+        return (2, 2, 2), (1, 128, 128)
+    return (2, max(1, 16384 // page_size), 2), (1, verify_window, 128)
+
 
 _INDEXER_KV_CACHE_FALLBACK_LOGGED: set[tuple[str, str]] = set()
 _INDEXER_KV_CACHE_INFO_LOGGED: set[tuple[str, str, str, tuple[int, ...]]] = set()
@@ -414,6 +439,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
     def _build_streamidx_op(self):
         topk = self.topk_tokens
+        verify_window = _verify_window()
         # None means unchunked. The kernel falls back to a single unpipelined
         # pass when `max_num_tokens` is not a multiple of the chunk.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
@@ -437,6 +463,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         ) -> tuple[jax.Array, jax.Array]:
             writer, kv_layout = _resolve_indexer_kv_cache_mode(
                 cache_kv, k_packed, mode=kv_cache_mode
+            )
+            num_kv_pages_per_block, num_queries_per_block = _streamidx_block_sizes(
+                cache_page_size(cache_kv, kv_layout), verify_window
             )
             if writer == "xla":
                 _, block_size_per_kv_packing, kv_packing, lkv_dim = cache_kv.shape
@@ -486,10 +515,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 distribution,
                 k=topk,
                 compression_ratio=1,
-                # The following parameters are tuned based on microbenchmark
-                # results.
-                num_kv_pages_per_block=(2, 2, 2),
-                num_queries_per_block=(1, 128, 128),
+                num_kv_pages_per_block=num_kv_pages_per_block,
+                num_queries_per_block=num_queries_per_block,
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
                 kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
@@ -523,6 +550,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         replicated across the op boundary. Only the cache is split.
         """
         topk = self.topk_tokens
+        verify_window = _verify_window()
         mesh = get_or_create_dcp_mesh(axis_name=DCP_AXIS_NAME)
         # Chunking cuts the replicated query-token axis, which is orthogonal to
         # the KV axis DCP shards, so the same knob applies here unchanged.
@@ -547,6 +575,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         ) -> tuple[jax.Array, jax.Array]:
             writer, kv_layout = _resolve_indexer_kv_cache_mode(
                 cache_kv, k_packed, mode=kv_cache_mode
+            )
+            num_kv_pages_per_block, num_queries_per_block = _streamidx_block_sizes(
+                cache_page_size(cache_kv, kv_layout), verify_window
             )
             # `_cp_scatter_indexer_k` pads the packed fp8+scale rows out to
             # the cache's record width itself.
@@ -578,8 +609,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 compression_ratio=1,
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
-                num_kv_pages_per_block=(2, 2, 2),
-                num_queries_per_block=(1, 128, 128),
+                num_kv_pages_per_block=num_kv_pages_per_block,
+                num_queries_per_block=num_queries_per_block,
                 kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
                 a2a_merge=_dcp_indexer_a2a_for_bucket(
@@ -691,7 +722,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         page_indices = metadata.block_tables
         cu_q_lens = metadata.query_start_loc
         rd = metadata.request_distribution
-        distribution = torch.stack([rd[0], rd[0], rd[2]])
+        # Everything after the 1-token decodes is offered to the kernel's prefill
+        # pass. It takes the leading sequences that fit one prefill q block --
+        # the speculative-decoding verify windows, which the runner places right
+        # after the decodes -- and sends the rest to the mixed pass.
+        distribution = torch.stack([rd[0], rd[2], rd[2]])
 
         if self.topk_op_dcp is not None:
             # DCP replicates the queries, so the token

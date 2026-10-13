@@ -1554,3 +1554,33 @@ def test_indexer_kv_layout_and_op_resolution_raiden_glm_admission(monkeypatch, c
     )
     with pytest.raises(ValueError, match="Raiden GLM admission"):
         mla_attention_op._resolve_indexer_kv_cache_mode(cache_has, k_packed, mode="sal")
+
+
+@pytest.mark.parametrize(
+    "num_speculative_tokens, page_size, expected",
+    [
+        # No speculative decoding: the prefill entry equals the mixed one, so the
+        # kernel skips its prefill pass.
+        (None, 256, ((2, 2, 2), (1, 128, 128))),
+        # MTP verify windows of 4 tokens, one q block each, 16K-token KV blocks.
+        (3, 256, ((2, 64, 2), (1, 4, 128))),
+        (3, 1024, ((2, 16, 2), (1, 4, 128))),
+    ],
+)
+def test_streamidx_block_sizes_follow_speculative_config(
+    monkeypatch, num_speculative_tokens, page_size, expected
+):
+    from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op
+
+    spec = (
+        None
+        if num_speculative_tokens is None
+        else SimpleNamespace(num_speculative_tokens=num_speculative_tokens)
+    )
+    monkeypatch.setattr(
+        mla_attention_op,
+        "get_current_vllm_config_or_none",
+        lambda: SimpleNamespace(speculative_config=spec),
+    )
+    window = mla_attention_op._verify_window()
+    assert mla_attention_op._streamidx_block_sizes(page_size, window) == expected

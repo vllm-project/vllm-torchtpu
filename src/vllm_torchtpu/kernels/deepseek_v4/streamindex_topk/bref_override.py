@@ -21,6 +21,10 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.metadata import (
+    cp_local_length,
+)
+
 
 def _step_offset(meta_ref: Any, chunk_idx: int):
     """Flat schedule row where chunk `chunk_idx`'s pipeline steps begin."""
@@ -137,10 +141,10 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
 
     def copy_in(  # pytype: disable=attribute-error
         self,
-        src_ref: tuple[jax.Ref, jax.Ref, Any],
+        src_ref: tuple[Any, ...],
         grid_indices: tuple[int | jax.Array, ...],
     ):
-        cache_kv_hbm, page_indices_ref, meta_ref = src_ref
+        cache_kv_hbm, page_indices_ref, meta_ref, *_ = src_ref
         p_id = grid_indices[0] + _step_offset(meta_ref, self.chunk_idx)
         batch_tile_idx = meta_ref.batch_tile_idx[p_id]
         bkv_idx = meta_ref.bkv_idx[p_id]
@@ -190,7 +194,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
 
     def wait_in(
         self,
-        src_ref: tuple[jax.Ref, jax.Ref, Any],
+        src_ref: tuple[Any, ...],
         grid_indices: tuple[int | jax.Array, ...],
     ):
         assert self.is_input
@@ -215,9 +219,14 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
 
     The HBM cache is `[total_pages, kv_sublane_groups, kv_packing, page_size]`,
     i.e. one page is a single contiguous block whose minor-most dimension is the
-    token (lane) dimension. Gathering `bkv_p` pages into one block therefore
-    means writing each page into a *lane* window of the VMEM buffer, instead of
-    the sublane window used by the HEAD_ALONG_SUBLANE layout.
+    token (lane) dimension. The VMEM block keeps one such slab per page,
+    `[seq_batch, bkv_p, kv_sublane_groups, kv_packing, page_size]`, so each page
+    moves as one contiguous copy. Placing pages side by side along lanes instead
+    would split every page into `kv_sublane_groups * kv_packing` short rows.
+
+    Only the pages that hold the sequence's keys on this rank are fetched. A KV
+    block can be far longer than a short sequence or one rank's share of a long
+    one, and the top-k never reads the scores of the slabs left stale.
     """
 
     bkv_p: int = dataclasses.field(default=1, metadata=dict(static=True))
@@ -225,6 +234,9 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
     pages_per_seq: int = dataclasses.field(default=1, metadata=dict(static=True))
     seq_batch_size: int = dataclasses.field(default=1, metadata=dict(static=True))
     chunk_idx: int = dataclasses.field(default=0, metadata=dict(static=True))
+    compression_ratio: int = dataclasses.field(default=1, metadata=dict(static=True))
+    cp_size: int = dataclasses.field(default=1, metadata=dict(static=True))
+    interleave_c: int = dataclasses.field(default=1, metadata=dict(static=True))
 
     @classmethod
     def create(  # pytype: disable=signature-mismatch
@@ -240,6 +252,9 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
         seq_batch_size: int,
         grid_rank: int = 1,
         chunk_idx: int = 0,
+        compression_ratio: int = 1,
+        cp_size: int = 1,
+        interleave_c: int = 1,
     ):
         assert buffer_type == pltpu.BufferType.INPUT
         standard_ref = pltpu.BufferedRef.create(
@@ -256,6 +271,9 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
             pages_per_seq=pages_per_seq,
             seq_batch_size=seq_batch_size,
             chunk_idx=chunk_idx,
+            compression_ratio=compression_ratio,
+            cp_size=cp_size,
+            interleave_c=interleave_c,
             **{
                 f.name: getattr(standard_ref, f.name)
                 for f in dataclasses.fields(pltpu.BufferedRef)
@@ -275,6 +293,9 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
         seq_batch_size: int,
         grid_rank: int = 1,
         chunk_idx: int = 0,
+        compression_ratio: int = 1,
+        cp_size: int = 1,
+        interleave_c: int = 1,
         **kwargs: Any,
     ):
         return cls.create(
@@ -289,14 +310,33 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
             seq_batch_size=seq_batch_size,
             grid_rank=grid_rank,
             chunk_idx=chunk_idx,
+            compression_ratio=compression_ratio,
+            cp_size=cp_size,
+            interleave_c=interleave_c,
         )
+
+    def num_pages(self, src_ref: tuple[Any, ...], p_id, batch_idx: int):
+        """Pages of step `p_id`'s KV block holding sequence `batch_idx`'s keys."""
+        _, _, meta_ref, seq_lens_ref, cp_rank_ref = src_ref
+        seq_idx = jnp.minimum(
+            meta_ref.batch_tile_idx[p_id] + batch_idx, seq_lens_ref.shape[0] - 1
+        )
+        # This rank's share of the sequence's compressed keys.
+        kv_len = cp_local_length(
+            seq_lens_ref[seq_idx] // self.compression_ratio,
+            cp_rank_ref[0],
+            self.cp_size,
+            self.interleave_c,
+        )
+        first_page = meta_ref.bkv_idx[p_id] * self.bkv_p
+        return jnp.clip(pl.cdiv(kv_len, self.page_size) - first_page, 0, self.bkv_p)
 
     def copy_in(  # pytype: disable=attribute-error
         self,
-        src_ref: tuple[jax.Ref, jax.Ref, Any],
+        src_ref: tuple[Any, ...],
         grid_indices: tuple[int | jax.Array, ...],
     ):
-        cache_kv_hbm, page_indices_ref, meta_ref = src_ref
+        cache_kv_hbm, page_indices_ref, meta_ref, *_ = src_ref
         p_id = grid_indices[0] + _step_offset(meta_ref, self.chunk_idx)
         batch_tile_idx = meta_ref.batch_tile_idx[p_id]
         bkv_idx = meta_ref.bkv_idx[p_id]
@@ -317,28 +357,27 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
             page_indices_offset = (
                 effective_seq_idx + batch_idx
             ) * self.pages_per_seq + kv_p_start
+            num_pages = self.num_pages(src_ref, p_id, batch_idx)
             for i in range(self.bkv_p):
-                page_idx = jnp.minimum(page_indices_offset + i, num_page_indices - 1)
-                safe_page = jnp.minimum(page_indices_ref[page_idx], max_hbm_pages - 1)
-                # One page is contiguous in HBM; it lands in lanes
-                # [i * page_size, (i + 1) * page_size) of the block. The offset is a
-                # compile-time constant and page_size is a multiple of the lane count,
-                # so the destination slice is always tile aligned.
-                dst_lane_start = i * self.page_size
-                pltpu.make_async_copy(
-                    cache_kv_hbm.at[safe_page],
-                    vmem_dst.at[  # pytype: disable=attribute-error
-                        batch_idx,
-                        :,
-                        :,
-                        pl.ds(dst_lane_start, self.page_size),
-                    ],
-                    sem,
-                ).start()
+
+                @pl.when(i < num_pages)
+                def _(*, i=i, batch_idx=batch_idx, offset=page_indices_offset):
+                    page_idx = jnp.minimum(offset + i, num_page_indices - 1)
+                    safe_page = jnp.minimum(
+                        page_indices_ref[page_idx], max_hbm_pages - 1
+                    )
+                    # One page is contiguous in HBM and keeps that layout in its
+                    # own slab of the block, so it moves as a single contiguous
+                    # copy.
+                    pltpu.make_async_copy(
+                        cache_kv_hbm.at[safe_page],
+                        vmem_dst.at[batch_idx, i],  # pytype: disable=attribute-error
+                        sem,
+                    ).start()
 
     def wait_in(
         self,
-        src_ref: tuple[jax.Ref, jax.Ref, Any],
+        src_ref: tuple[Any, ...],
         grid_indices: tuple[int | jax.Array, ...],
     ):
         assert self.is_input
@@ -349,11 +388,17 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
         vmem_dst: Any = self.window_ref.at[slot]  # pytype: disable=attribute-error
-        pltpu.make_async_copy(
-            vmem_dst,
-            vmem_dst,
-            sem,
-        ).wait()
+        meta_ref = src_ref[2]
+        p_id = grid_indices[0] + _step_offset(meta_ref, self.chunk_idx)
+        # Must cover exactly the pages copy_in started or the semaphore never
+        # clears.
+        for batch_idx in range(self.seq_batch_size):
+            num_pages = self.num_pages(src_ref, p_id, batch_idx)
+
+            @pl.when(num_pages > 0)
+            def _(*, batch_idx=batch_idx, num_pages=num_pages):
+                pages = vmem_dst.at[batch_idx, pl.ds(0, num_pages)]
+                pltpu.make_async_copy(pages, pages, sem).wait()
 
 
 @jax.tree_util.register_dataclass
