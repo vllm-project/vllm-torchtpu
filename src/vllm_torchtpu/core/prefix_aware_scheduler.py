@@ -118,9 +118,16 @@ class PrefixAwareScheduler(AsyncScheduler):
         self._paw_cold_tokens = 0
         self._paw_prompt_tokens = 0
         self._paw_scoring_broken = False
+        kv_transfer_cfg = getattr(
+            getattr(self, "vllm_config", None), "kv_transfer_config", None
+        )
+        kv_role = getattr(kv_transfer_cfg, "kv_role", None)
         self._is_disagg = (
+            kv_transfer_cfg is not None
             or getattr(self, "connector", None) is not None
         )
+        self._is_kv_producer = self._is_disagg and kv_role == "kv_producer"
+        self._is_kv_consumer = self._is_disagg and not self._is_kv_producer
         self._enable_memo_xstep()
 
         logger.info(
@@ -522,6 +529,7 @@ class PrefixAwareScheduler(AsyncScheduler):
                 num_local = target_local
         return blocks, num_local, shared_prefix_boundary, hit_diverged
 
+
     def _rank_and_warmth(
         self,
         request: Request,
@@ -542,6 +550,11 @@ class PrefixAwareScheduler(AsyncScheduler):
         window = list(islice(queue, self.WINDOW))
         head = window[0]
 
+        free_blocks = (
+            None
+            if getattr(self, "_is_kv_consumer", False)
+            else self._get_num_free_blocks()
+        )
         free_blocks_for_fit: int | None = None
         if free_blocks is not None:
             head_needed_blocks = math.ceil(head_cold_tokens / self._get_block_size())
