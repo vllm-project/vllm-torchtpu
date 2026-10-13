@@ -549,8 +549,14 @@ def _build_fused_ep_moe_kernel(
     act_fn="silu",
     has_w1_bias=False,
     has_w2_bias=False,
+    scales_block_major=False,
 ):
-    """Build the pallas_call and the function that invokes it."""
+    """Build the pallas_call and the function that invokes it.
+
+    `scales_block_major` takes the per-contraction-block scale tables as
+    [blocks, G, N] rather than [G, blocks, N]; an expert's table is then a
+    strided slice, which the DMA reads as cheaply.
+    """
     if act_fn not in ACT_FNS:
         raise NotImplementedError(
             f"the fused EP MoE kernel fuses {ACT_FNS}; got {act_fn!r}"
@@ -919,13 +925,16 @@ def _build_fused_ep_moe_kernel(
             """The down weight slab of `expert`, into weight slot `slot`."""
             return _slot_copy(w2_hbm.at[expert], w2_vm, w2_sems, slot)
 
+        def scale_table(hbm, expert):
+            return hbm.at[:, expert] if scales_block_major else hbm.at[expert]
+
         def w1s_copy(expert, slot):
             assert w1s_hbm is not None
-            return _slot_copy(w1s_hbm.at[expert], w1s_vm, w1s_sems, slot)
+            return _slot_copy(scale_table(w1s_hbm, expert), w1s_vm, w1s_sems, slot)
 
         def w2s_copy(expert, slot):
             assert w2s_hbm is not None
-            return _slot_copy(w2s_hbm.at[expert], w2s_vm, w2s_sems, slot)
+            return _slot_copy(scale_table(w2s_hbm, expert), w2s_vm, w2s_sems, slot)
 
         def weight_starts(expert, slot):
             """Start every buffer slot `slot` holds for `expert`.

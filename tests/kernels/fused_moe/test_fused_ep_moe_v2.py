@@ -972,6 +972,29 @@ def test_fp4_block512_tracks_dense_reference_and_routing_plan():
     assert _relative_l2(out, wrong) > ROTATED_CONTROL_FACTOR * error
 
 
+def test_fp4_block_major_scale_reads_are_bit_exact():
+    """Reading the scale tables block-major changes only their addressing."""
+    mesh = _mesh()
+    weights, scales, _ = _make_fp4_weights(
+        mesh, 44, hidden=2048, inter=1024, e_total=32, rhs_qb=512
+    )
+    x, gating = _make_inputs(mesh, 45, tokens=256, hidden=2048, e_total=32)
+    common = dict(
+        topk=4,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=512,
+        sharded_plan=True,
+    )
+    expert_major = fused_ep_moe_v2(x, *weights, *scales, gating, **common)
+    block_major = fused_ep_moe_v2(
+        x, *weights, *scales, gating, scales_expert_second_minor=True, **common
+    )
+    np.testing.assert_array_equal(np.asarray(block_major), np.asarray(expert_major))
+
+
 # --------------------------------------------------------------------------- #
 # The weight-DMA schedule.
 #
