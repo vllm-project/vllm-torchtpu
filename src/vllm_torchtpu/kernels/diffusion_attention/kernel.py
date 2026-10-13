@@ -16,6 +16,8 @@
 # - end() broadcasts 1 / l by slicing: pltpu.repeat is not in JAX 0.11.
 # - Lowered FIXED_M_SAFE_BOUND from 213.0 to 200.0 so low-norm query rows
 #   stay at least 14 log2 units above the f32 flush threshold.
+# - Set _splash_vmem_limit_bytes() to 1x physical VMEM and check
+#   head_dim % spec.num_lanes.
 # ruff: noqa: E741
 
 """Custom Pallas flash attention kernel for TPU.
@@ -118,9 +120,9 @@ def fixed_m_operands(
 def _splash_vmem_limit_bytes() -> int:
     """Mosaic scoped-VMEM ceiling per pallas_call, adapted to the device.
 
-    Set to 2x physical core VMEM (720p tiles need ~57 MiB, above the 32 MiB
-    Mosaic default on libtpu >= 0.0.41; the XLA vmem flag does not govern
-    Pallas). Scales across generations.
+    Set to physical core VMEM (720p cross-attention tiles need ~57 MiB, above
+    the 32 MiB Mosaic default on libtpu >= 0.0.41; the XLA vmem flag does not
+    govern Pallas). Scales across generations.
 
     Returns:
       The scoped-VMEM limit in bytes.
@@ -130,7 +132,7 @@ def _splash_vmem_limit_bytes() -> int:
         vmem_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes)
     else:
         vmem_bytes = 64 * 2**20  # v7-sized fallback for CPU-only tracing.
-    return 2 * vmem_bytes
+    return vmem_bytes
 
 
 def _exp2(x: jax.Array) -> jax.Array:
@@ -563,7 +565,7 @@ def flash_attention_bshd(
     else:
         k = key.astype(jnp.bfloat16)
         mk_arr = jnp.zeros((2, 1), jnp.float32)  # unused placeholder
-    if head_dim % 128 == 0 and head_dim_v % 128 == 0:
+    if head_dim % spec.num_lanes == 0 and head_dim_v % spec.num_lanes == 0:
         column_heads = (num_heads, num_kv_heads)
         q, k, v = (x.reshape(*x.shape[:2], -1) for x in (q, k, v))
     else:

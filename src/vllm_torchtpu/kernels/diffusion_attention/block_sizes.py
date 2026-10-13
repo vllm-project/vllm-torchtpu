@@ -6,7 +6,8 @@
 # - Removed pareto_block_q(), rank_block_candidates(), _MEASURED_OVERRIDES,
 #   the residual* kernel modes, and unused TpuSpec.peak_bf16_flops /
 #   hbm_bw_bytes.
-# - Typed spec_from_tpu_info(info: Any) instead of suppressing pyrefly.
+# - Typed spec_from_tpu_info(info: Any) instead of suppressing pyrefly,
+#   populated TpuSpec.num_lanes from get_tpu_info(), and cached detect_spec().
 # - v7 fixed-m VMEM fraction 0.6, which caps block_q at 4096 for head_dim 128.
 # - block_kv is the whole K/V extent when that is shorter than
 #   safe_kv_block, and sequences up to one MXU tile use one
@@ -54,6 +55,7 @@ extents.
 """
 
 import dataclasses
+import functools
 import logging
 import math
 from typing import Any
@@ -95,6 +97,7 @@ class TpuSpec:
         not trip the Mosaic cliff.
       usable_vmem_fraction: Fraction of vmem_bytes the score tile + operands may
         occupy, leaving headroom for Mosaic scratch and double buffering.
+      num_lanes: Vector lane count (128 on v7+), determining activation layouts.
     """
 
     name: str
@@ -103,6 +106,7 @@ class TpuSpec:
     mxu_dim: int
     safe_kv_block: int
     usable_vmem_fraction: float = _DEFAULT_USABLE_VMEM_FRACTION
+    num_lanes: int = 128
 
 
 # Known-good v7 spec, used for tests and as the fallback off a TPU host.
@@ -121,7 +125,7 @@ def spec_from_tpu_info(info: Any) -> TpuSpec:
     Args:
       info: The object returned by
         ``jax.experimental.pallas.tpu.get_tpu_info``; must expose generation,
-        mxu_column_size, and vmem_capacity_bytes.
+        mxu_column_size, vmem_capacity_bytes, and num_lanes.
 
     Returns:
       A TpuSpec with device-queried fields plus the calibrated K/V block.
@@ -134,9 +138,11 @@ def spec_from_tpu_info(info: Any) -> TpuSpec:
         vmem_bytes=int(info.vmem_capacity_bytes),
         mxu_dim=mxu_dim,
         safe_kv_block=_SAFE_KV_BLOCK_MULTIPLE * mxu_dim,
+        num_lanes=int(info.num_lanes),
     )
 
 
+@functools.cache
 def detect_spec() -> TpuSpec:
     """Returns the TpuSpec for the attached accelerator.
 
