@@ -87,10 +87,6 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       -r pyproject.toml \
       --group vllm
 
-# The P/D router; the disaggregated benchmark clients start it when the
-# serve config asks for it (AGENTX_PROXY=router).
-COPY --from=router-build /usr/local/bin/vllm-router /usr/local/bin/vllm-router
-
 
 # Variant 2: The CI Environment (CI/CD Variant)
 # This variant builds on top of the runtime base, installing additional packages
@@ -110,6 +106,11 @@ RUN apt-get update && apt-get install -y apt-transport-https ca-certificates gnu
     echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt gcsfuse-$(lsb_release -c -s) main" | tee -a /etc/apt/sources.list.d/gcsfuse.list && \
     apt-get update && apt-get install -y google-cloud-cli gcsfuse && \
     rm -rf /var/lib/apt/lists/*
+
+# The P/D router the disaggregated benchmark clients start when the serve
+# config asks for it (AGENTX_PROXY=router). A client-side tool, so ci and
+# dev only; prod serves and does not route.
+COPY --from=router-build /usr/local/bin/vllm-router /usr/local/bin/vllm-router
 
 # Start from an empty PYTHONPATH; the dev and prod stages set their own.
 ENV PYTHONPATH=""
