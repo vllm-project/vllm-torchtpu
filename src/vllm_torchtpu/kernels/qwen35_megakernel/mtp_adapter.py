@@ -259,7 +259,7 @@ class Qwen35MtpMegakernel:
         )
         raw_verify = _parse_buckets(
             "VLLM_TPU_QWEN35_MTP_MK_VERIFY_BUCKETS",
-            (16, 32, 48, 64, 96, 128),
+            _DEFAULT_VERIFY_BUCKETS,
         )
         if max_reqs > 0:
             self.loop_buckets = tuple(b for b in raw_loop if b <= max_reqs) or (
