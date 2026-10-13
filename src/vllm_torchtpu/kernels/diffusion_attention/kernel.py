@@ -1,11 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Google LLC
 #
-# Copied from a code-reviewed TPU diffusion kernel implementation
-# (Apache-2.0).
-# LOG2_E, FIXED_M_RECENTER, FIXED_M_SAFE_BOUND, max_row_norm_per_head() and
-# fixed_m_operands() are copied verbatim from fixed_m_bound.py in the same
-# directory. Changes from the original:
+# Adapted from a code-reviewed TPU diffusion kernel implementation.
+# Changes from the original:
+# - Inlined LOG2_E, FIXED_M_RECENTER, FIXED_M_SAFE_BOUND,
+#   max_row_norm_per_head(), and fixed_m_operands().
 # - Removed the ring-attention residual path (residual_attention,
 #   emit_residuals) and the E4M3 QK path (qk_fp8), which are not used here.
 # - flash_attention_bshd() replaces attention(): (B, S, H, D) inputs and
@@ -49,7 +48,7 @@ NT_DIM_NUMBERS = (((1,), (1,)), ((), ()))
 
 
 # ---------------------------------------------------------------------------
-# Copied verbatim from fixed_m_bound.py.
+# Fixed-m softmax bound helpers.
 # ---------------------------------------------------------------------------
 
 # log2(e): the kernels exponentiate with exp2, so natural-log logits are
@@ -134,23 +133,6 @@ def _exp2(x: jax.Array) -> jax.Array:
 
 
 # ---------------------------------------------------------------------------
-# CLOSED — do not re-attempt: folding RoPE into this kernel. It was fully
-# implemented (tables + in-kernel rotate-half on the q/k tile loads) and
-# measured on v7x-8 at the production ring shard (B=2, H=10, S=37800, D=128,
-# bkv=2048, qk_fp8 + fixed_m on). It LOSES: 23.20 ms folded vs 22.04 ms
-# rotating outside, i.e. +1.2 ms per attention call, ~+50 ms/step over 40
-# blocks. Cause is WORK, not bytes: K crosses the grid once per q-block, so
-# the fold runs the rotation grid_height + 1 times at 0.30 ms a sweep,
-# against 0.90 ms for the entire outside pass. Break-even needs
-# grid_height <= 2, i.e. bq >= 18900, whose f32 score tile is 155 MiB =
-# 2.4x all of VMEM — unreachable; the residual/ring kernel already overflows
-# by 7.6 MiB at bq=6400. Measured NOT to be the cause: table DMA (an f32
-# table times identically) and E4M3 ordering (delta +2.61 with qk_fp8 off vs
-# +2.71 on). Note also that Mosaic rejects ``pltpu.roll`` on bf16 ("Rotate
-# with non-32-bit data"), so the rotation has no cheaper one-op form.
-# ---------------------------------------------------------------------------
-
-
 # pylint: disable=too-few-public-methods
 class BlockSizes:
     """Pallas grid tiling for one splash-attention call.

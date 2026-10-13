@@ -1,23 +1,23 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Google LLC
 #
-# Copied from a code-reviewed TPU diffusion kernel implementation
-# (Apache-2.0).
+# Adapted from a code-reviewed TPU diffusion kernel implementation.
 # Changes from the original:
-# - Removed pareto_block_q() and rank_block_candidates(), which are not used
-#   here.
+# - Removed pareto_block_q(), rank_block_candidates(), _MEASURED_OVERRIDES,
+#   the residual* kernel modes, and unused TpuSpec.peak_bf16_flops /
+#   hbm_bw_bytes.
+# - Typed spec_from_tpu_info(info: Any) instead of suppressing pyrefly.
 # - v7 fixed-m VMEM fraction 0.6, which caps block_q at 4096 for head_dim 128.
 # - block_kv is the whole K/V extent when that is shorter than
 #   safe_kv_block, and sequences up to one MXU tile use one
 #   full-extent block instead of raising.
-# pyrefly: ignore-errors
 
 """Dynamic, generation-portable block-size autotuner for splash attention.
 
 Given a sequence length and the TPU hardware spec, this derives the
 ``(block_q, block_kv, block_kv_compute)`` for the custom splash kernel
 (``custom_splash_attention``) with no on-device sweep. The spec is read at
-runtime from ``pltpu.get_tpu_info`` (VMEM, MXU edge, peak FLOPs, generation),
+runtime from ``pltpu.get_tpu_info`` (VMEM, MXU edge, generation),
 so v8/v9 are handled automatically; the few compiler-calibrated constants are
 multiples of the MXU edge.
 
@@ -29,11 +29,7 @@ runs. A v7 sweep across resolutions (per chiplet, fixed-m) showed the winning
 ``block_q`` is the one that minimizes the *padded* query rows
 ``ceil(seq / block_q) * block_q`` (a near-empty final q-block wastes a whole
 tile of compute), among block_q large enough to fill the MXU N dimension and
-small enough to fit VMEM. Measured optima, all reproduced by this model:
-
-  384x640 121f seq 29760 -> block_q 6144 (621 TF/s, 90% of the K=128 ceiling)
-  480p     121f seq 48360 -> block_q 4864 (662 TF/s, 95%)
-  720p     121f seq 111600 -> block_q 5888 (matches the hand-tuned config)
+small enough to fit VMEM.
 
 So block_q is chosen by a tiny closed-form search (no device), not a constant:
 the resolution, frame count, and generation all flow through.
@@ -49,20 +45,18 @@ Derivation of the other knobs
   rows). The VMEM ceiling is the f32 QK^T score tile,
   ``block_kv_compute * block_q * 4 + operands <= usable_fraction * VMEM``.
 
-Asymmetric Q / K/V extents (2D ring-ulysses CP)
------------------------------------------------
-Under 2D CP the per-device query shard (S / ring) differs from the K/V
-extent (full S on the allgather path, S / ring per ring step). Every entry
-point takes an optional ``kv_seq_len`` for this; the K/V block clamps to the
-K/V extent and the grid cost uses both extents.
-
-Re-calibrate a new generation with a block-size sweep; a shape where the model's pick
-measurably loses gets a ``_MEASURED_OVERRIDES`` entry.
+Asymmetric Q / K/V extents
+--------------------------
+In cross-attention the query sequence length differs from the K/V
+sequence length. Every entry point takes an optional ``kv_seq_len`` for
+this; the K/V block clamps to the K/V extent and the grid cost uses both
+extents.
 """
 
 import dataclasses
 import logging
 import math
+from typing import Any
 
 _logger = logging.getLogger(__name__)
 
@@ -76,69 +70,13 @@ _DEFAULT_USABLE_VMEM_FRACTION = 0.93
 # Fixed-m drops the VPU softmax rescale that hid DMA behind compute, so its
 # score tile must double-buffer to hide DMA -> fits <= VMEM/2 (fraction ~0.5).
 # Per-generation, sweep-pinned like safe_kv_block; no entry = normal fraction.
-_FIXED_M_KERNEL_MODES = frozenset({"fixedm", "residual-fixedm"})
+_FIXED_M_KERNEL_MODES = frozenset({"fixedm"})
 # v7x: fixed-m measured fastest at block_q 3072-4096 at 32K and 75K tokens
 # (40 heads x 128); 0.6 caps block_q at 4096 for head_dim 128.
 _FIXED_M_VMEM_FRACTION: dict[int, float] = {6: 0.5, 7: 0.6}
 
-# Sweep-verified generations (no "uncalibrated" warning). v6e residual picks
-# match the model to <=0.4%; its only extra effect, the fixed-m DMA cliff, is
-# handled by _FIXED_M_VMEM_FRACTION, so v6e needs no _MEASURED_OVERRIDES.
+# Sweep-verified generations (no "uncalibrated" warning).
 _KNOWN_GENERATIONS = frozenset({6, 7})
-
-# Measured block-size calibrations, keyed by (generation, q_seq,
-# kv_seq, kernel_mode). The kernel mode is part of the key because the
-# optimum moves with the softmax variant (measured at shard 55800:
-# residual-online -> 6400/2048, residual-fixedm -> 5632/2048). Entries
-# take precedence over the analytic model and are produced by the
-# on-device harness (``examples/kernels/sweep_block_sizes.py``); regenerate
-# after kernel changes or on a new generation. Only shapes where the
-# model's pick measurably loses belong here — at every validated flat
-# Ulysses shape the model pick IS the measured optimum, so flat shapes
-# stay model-driven.
-_MEASURED_OVERRIDES: dict[tuple[int, int, int, str], dict[str, int]] = {
-    # v7, WAN 2.2 720p/121f 2D ring step (S/ring = 27900, residual
-    # kernel, 20 heads/core; 33-candidate sweep 2026-07-02): 9472/1024
-    # measures 28.1 ms vs the model pick's 32.8 ms (+16.8%). The ring
-    # regime's shallow per-head grid (5x14 cells vs flat's 19x55)
-    # exposes VMEM/DMA effects the grid-cost model cannot rank — the
-    # measured landscape is non-monotonic in block_q (4864 +0.4%,
-    # 4096 +21%), so this is calibrated, not modelled.
-    (7, 27900, 27900, "residual"): {
-        "block_q": 9472,
-        "block_kv": 1024,
-        "block_kv_compute": 1024,
-    },
-    # v7 ring-step shards, residual-kernel sweeps 2026-07-02 (b1 = CFG
-    # split; b2 = pure 2D). Model-fallback regret at these shapes was
-    # +19.7% (55800), so ring shards are calibrated, not modelled.
-    # 55800 = 720p/121f cfg-split ring2; 6400/2048 = 52.2 ms, 611 TF/s.
-    (7, 55800, 55800, "residual"): {
-        "block_q": 6400,
-        "block_kv": 2048,
-        "block_kv_compute": 2048,
-    },
-    # 55800 fixedm variant (53-candidate sweep 2026-07-02): fixed-m
-    # shifts the optimum to 5632/2048 = 48.2 ms, 662 TF/s (6400/2048
-    # measures +2.2% under fixed-m).
-    (7, 55800, 55800, "residual-fixedm"): {
-        "block_q": 5632,
-        "block_kv": 2048,
-        "block_kv_compute": 2048,
-    },
-    # 37800 = 720p/81f cfg-split ring2; 6400/2048 = 24.1 ms, 607 TF/s.
-    (7, 37800, 37800, "residual"): {
-        "block_q": 6400,
-        "block_kv": 2048,
-        "block_kv_compute": 2048,
-    },
-    # 18900 = 720p/81f pure-2D ring4; 9472/1024 = 13.1 ms, 559 TF/s.
-    (7, 18900, 18900, "residual"): {
-        "block_q": 9472,
-        "block_kv": 1024,
-        "block_kv_compute": 1024,
-    },
-}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -153,8 +91,6 @@ class TpuSpec:
       generation: TPU generation integer (7, 8, ...).
       vmem_bytes: Vector memory per core (the Pallas/Mosaic kernel budget).
       mxu_dim: MXU systolic array edge length (the multiple-of rule).
-      peak_bf16_flops: Nominal bf16 MXU peak (full-K contraction) per core.
-      hbm_bw_bytes: HBM bandwidth per core, bytes/s.
       safe_kv_block: K/V block size (DMA + MXU compute tile); largest that does
         not trip the Mosaic cliff.
       usable_vmem_fraction: Fraction of vmem_bytes the score tile + operands may
@@ -165,8 +101,6 @@ class TpuSpec:
     generation: int
     vmem_bytes: int
     mxu_dim: int
-    peak_bf16_flops: float
-    hbm_bw_bytes: float
     safe_kv_block: int
     usable_vmem_fraction: float = _DEFAULT_USABLE_VMEM_FRACTION
 
@@ -177,20 +111,17 @@ V7_SPEC = TpuSpec(
     generation=7,
     vmem_bytes=64 * 2**20,
     mxu_dim=256,
-    peak_bf16_flops=1155e12,
-    hbm_bw_bytes=3.7e12,
     safe_kv_block=2048,
 )
 
 
-def spec_from_tpu_info(info: object) -> TpuSpec:
+def spec_from_tpu_info(info: Any) -> TpuSpec:
     """Builds a TpuSpec from a ``get_tpu_info()`` result.
 
     Args:
       info: The object returned by
         ``jax.experimental.pallas.tpu.get_tpu_info``; must expose generation,
-        mxu_column_size, vmem_capacity_bytes, bf16_ops_per_second and
-        mem_bw_bytes_per_second.
+        mxu_column_size, and vmem_capacity_bytes.
 
     Returns:
       A TpuSpec with device-queried fields plus the calibrated K/V block.
@@ -202,8 +133,6 @@ def spec_from_tpu_info(info: object) -> TpuSpec:
         generation=generation,
         vmem_bytes=int(info.vmem_capacity_bytes),
         mxu_dim=mxu_dim,
-        peak_bf16_flops=float(info.bf16_ops_per_second),
-        hbm_bw_bytes=float(info.mem_bw_bytes_per_second),
         safe_kv_block=_SAFE_KV_BLOCK_MULTIPLE * mxu_dim,
     )
 
@@ -401,19 +330,15 @@ def autotune_block_sizes(
     parallel grid dimension), not the per-tile economics this tunes.
 
     Args:
-      seq_len: Unpadded query sequence length (full sequence under 1D
-        Ulysses; the per-device query shard under 2D ring-ulysses).
+      seq_len: Unpadded query sequence length.
       head_dim: Per-head feature dimension (the fixed QK^T contraction).
       bytes_per_element: Activation element size in bytes (bf16 = 2).
       spec: Target hardware spec. Auto-detected from the live TPU when omitted.
       kv_seq_len: Unpadded key/value sequence length when it differs from
-        ``seq_len`` (2D CP: the full sequence on the allgather path, the
-        per-step ring shard on the ppermute path). ``None`` means
-        self-attention with ``kv_seq_len == seq_len``.
-      kernel_mode: which kernel variant consumes the blocks (``online``,
-        ``fixedm``, ``residual``, ``residual-fixedm``) — selects the
-        matching measured calibration; the analytic model is
-        mode-independent.
+        ``seq_len`` (e.g. cross-attention). ``None`` means self-attention with
+        ``kv_seq_len == seq_len``.
+      kernel_mode: Which kernel variant consumes the blocks (``online`` or
+        ``fixedm``).
 
     Returns:
       A mapping with block_q, block_kv and block_kv_compute.
@@ -421,19 +346,6 @@ def autotune_block_sizes(
     if spec is None:
         spec = detect_spec()
     kv_seq = kv_seq_len if kv_seq_len is not None else seq_len
-
-    # Measured calibration wins over the model (see _MEASURED_OVERRIDES).
-    # Fallback chain: exact kernel mode, then the base residual-online
-    # calibration for fixed-m callers (a same-shape measurement beats the
-    # raw model even across softmax variants), then the model.
-    for mode in (
-        (kernel_mode, "residual")
-        if kernel_mode in ("residual-fixedm", "residual-qkfp8")
-        else (kernel_mode,)
-    ):
-        measured = _MEASURED_OVERRIDES.get((spec.generation, seq_len, kv_seq, mode))
-        if measured is not None:
-            return dict(measured)
 
     # Fixed-m tightens the block_q VMEM budget to the double-buffer ceiling
     # (~VMEM/2; see _FIXED_M_VMEM_FRACTION), keeping it out of the DMA cliff.
