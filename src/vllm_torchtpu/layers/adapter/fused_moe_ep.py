@@ -402,12 +402,9 @@ def _simulated_routing_operands(
     at random, so expert load is balanced in expectation -- the kernel is
     handed operands whose top-k IS that draw:
 
-    - gating: f32 uniform noise plus the real logits' mean, the same anchor
-      `moe_routing._uniform_random_routing` uses. A uniform shift does not
-      change top-k; it keeps a data edge to this layer's activations so XLA
-      cannot hoist every layer's routing into one blob. The noise stays f32:
-      in bf16, a few hundred experts' noise values in [m, m + 1) collide and
-      top-k breaks the ties toward low expert ids, which is not uniform.
+    - gating: `moe_routing.uniform_random_logits`, the f32 noise anchored to
+      the real logits' mean that `moe_routing._uniform_random_routing` draws
+      from.
     - score bias: zeros, so the correction bias cannot shift the draw.
     - hash ids (hash-routed layers): top-k of the same noise.
 
@@ -420,13 +417,9 @@ def _simulated_routing_operands(
     """
     from vllm_torchtpu.layers.adapter import moe_routing
 
-    if (
-        moe_routing._SIMULATION_STRATEGY is None
-        or moe_routing._strategy_name != moe_routing._UNIFORM_RANDOM
-    ):
+    if not moe_routing.is_uniform_random_simulation():
         return router_logits, score_bias, hash_ids
-    noise = torch.rand_like(router_logits, dtype=torch.float32)
-    noise = noise + router_logits.float().mean()
+    noise = moe_routing.uniform_random_logits(router_logits)
     if hash_ids is not None:
         hash_ids = torch.topk(noise, k=hash_ids.shape[-1], dim=-1).indices.to(
             torch.int32
@@ -929,7 +922,7 @@ def _unsupported_routing_reason(layer, *, supplies_hash_ids=False) -> str | None
     # the others are refused.
     if (
         moe_routing._SIMULATION_STRATEGY is not None
-        and moe_routing._strategy_name != moe_routing._UNIFORM_RANDOM
+        and not moe_routing.is_uniform_random_simulation()
     ):
         return (
             "VLLM_MOE_ROUTING_SIMULATION_STRATEGY is set to a strategy other "
