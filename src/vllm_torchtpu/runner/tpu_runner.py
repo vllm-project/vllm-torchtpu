@@ -5072,6 +5072,19 @@ class TPUModelRunner(GPUModelRunner):
             )
             token_padding.set_padding_state(self._token_padding_state)
 
+        # Last: arming needs the drafter's MTP layer and the padding mask.
+        if envs.MOE_FUSED_EP_KERNEL_IMPL == "v3":
+            from vllm_torchtpu.layers.adapter.fused_moe_ep_v3_tp import (
+                arm,
+                tp_attention_over_ep,
+            )
+
+            if tp_attention_over_ep():
+                draft = (
+                    self._async_drafter.draft_model if self._is_async_drafter else None
+                )
+                arm(self.model, draft)
+
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
         self._initialize_quantization_kernels()

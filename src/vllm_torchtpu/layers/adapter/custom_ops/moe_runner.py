@@ -101,6 +101,17 @@ class VllmMoERunner(MoERunner):
         # Not super()._fused_output_is_reduced: under torch.compile dynamo
         # reads that as truthy, and the routed output then skips its TP
         # all-reduce.
+        # A layer armed by fused_moe_ep_v3_tp reduces shared + routed in its op.
+        # Imported only under v3, so other runs do not load the v3 package.
+        if envs.MOE_FUSED_EP_KERNEL_IMPL == "v3":
+            from vllm_torchtpu.layers.adapter.fused_moe_ep_v3_tp import (
+                fused_moe_ep_v3_tp_supported,
+            )
+
+            if fused_moe_ep_v3_tp_supported(self._quant_method) and not getattr(
+                self.moe_config, "skip_final_all_reduce", False
+            ):
+                return True
         if not envs.USE_MOE_FUSED_EP_KERNEL or getattr(
             self.moe_config, "skip_final_all_reduce", False
         ):

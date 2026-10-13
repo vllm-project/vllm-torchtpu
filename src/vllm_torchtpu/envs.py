@@ -81,6 +81,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
+    MOE_FUSED_EP_V3_MIN_TOKENS: int = 1024
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
@@ -685,8 +686,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Explicit implementation selection also enables fused EP. When unset,
     # preserve the legacy enable flag and v2 behavior. Adaptive owns its
     # admission, automatically supports FP4 and never falls back to GMM.
+    # v3 (kernels/fused_moe/v3) serves FP8 layers under DP+EP, TP=1.
     "MOE_FUSED_EP_KERNEL_IMPL": env_with_choices(
-        "MOE_FUSED_EP_KERNEL_IMPL", None, ["v2", "adaptive"]
+        "MOE_FUSED_EP_KERNEL_IMPL", None, ["v2", "adaptive", "v3"]
     ),
     # Opt in to NVFP4 W4A8 in fused EP MoE v2. Requires the fused EP switch
     # above; defaults off so enabling fused EP alone preserves NVFP4 W4A16.
@@ -698,6 +700,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # arming everything. Below the threshold the grouped-matmul path serves.
     "MOE_FUSED_EP_KERNEL_MIN_TOKENS": lambda: int(
         os.getenv("MOE_FUSED_EP_KERNEL_MIN_TOKENS", "1024")
+    ),
+    # MOE_FUSED_EP_KERNEL_IMPL=v3 under tensor-parallel attention over the EP
+    # group (fused_moe_ep_v3_tp): steps of at least this many tokens take v3,
+    # smaller ones production's EP path in the same op. The token count is
+    # static per exported program, so this is a per-step choice.
+    "MOE_FUSED_EP_V3_MIN_TOKENS": lambda: int(
+        os.getenv("MOE_FUSED_EP_V3_MIN_TOKENS", "1024")
     ),
     # Build each rank's two consumed routing-plan slices instead of
     # replicating the full T * topk * experts plan arithmetic on every rank.
