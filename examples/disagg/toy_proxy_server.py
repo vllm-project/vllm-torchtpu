@@ -171,8 +171,8 @@ async def _post_with_retries(
 
 
 def _render_endpoint_for_api(api: str) -> str | None:
-    if api == "/v1/completions":
-        return "/v1/completions/render"
+    # Upstream vLLM does not expose a /render endpoint; tokenization occurs
+    # directly within the prefill engine.
     return None
 
 

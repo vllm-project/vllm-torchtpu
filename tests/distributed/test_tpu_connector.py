@@ -1080,6 +1080,8 @@ class TestTPURaidenConnectorScheduler:
             assert len(req.prompt_token_ids) == 32
             assert req.num_prompt_tokens == 32
             assert req.kv_transfer_params["_p_side_truncated"] is True
+            # The dropped token seeds a prefill-only draft's boundary row.
+            assert req.kv_transfer_params["_p_side_next_prompt_token_id"] == 32
 
             # Re-admission after preemption must not truncate again.
             producer.on_new_request(req)
@@ -7353,6 +7355,14 @@ class TestContextParallelRegisterAhead:
         assert producer._stage3_early_sends == {}
         assert producer._stage3_early_requests == {}
         assert producer._stage3_block_tables == {}
+
+    def test_stage3_send_carries_the_dropped_prompt_token(self):
+        producer = self._producer()
+        req = _stage3_request("seed", self.PROMPT)
+        req.kv_transfer_params = {"_p_side_next_prompt_token_id": 4242}
+        with _stage3_producer_env(777):
+            meta = self._register_ahead(producer, req)
+        assert meta.reqs_to_send["seed"].next_prompt_token_id == 4242
 
     def test_stage3_finish_time_send_is_not_marked_ahead(self):
         producer = self._producer()

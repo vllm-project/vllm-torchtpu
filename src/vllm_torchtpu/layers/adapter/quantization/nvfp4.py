@@ -41,22 +41,33 @@ Requires torch_tpu's native `torch.float4_e2m1fn_x2` dtype
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
+import vllm.model_executor.kernels.linear as linear_kernels
+import vllm.model_executor.layers.quantization.modelopt as modelopt_module
+from vllm.config.quantization import QuantSpec
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
-from vllm.model_executor.layers.linear import LinearBase
+from vllm.model_executor.layers.linear import (
+    LinearBase,
+    register_weight_loader_v2_supported_method,
+)
 from vllm.model_executor.layers.quantization import (
     QuantizationMethods,
     register_quantization_config,
 )
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.modelopt import (
+    CkptCtx,
+    FormatScheme,
+    KNvfp4Static,
+    ModelOptLinearMethod,
     ModelOptNvFp4Config,
     ModelOptNvFp4FusedMoE,
-    ModelOptNvFp4LinearMethod,
 )
+from vllm.model_executor.layers.quantization.utils.quant_utils import kNvfp4Static
+from vllm.model_executor.parameter import PerTensorScaleParameter
 from vllm.model_executor.utils import replace_parameter
 
 import vllm_torchtpu.envs as envs
@@ -402,6 +413,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             FUSED_MOE_EP_OP_ATTR,
             fused_moe_ep_unsupported_reason,
+            register_fused_scale_buffers,
             register_score_bias_buffer,
         )
 
@@ -488,17 +500,7 @@ class VllmNvfp4MoEMethod(TpuMoEActivationMixin, FusedMoEMethodBase):
             setattr(self, FUSED_MOE_EP_OP_ATTR, op)
         if op is not None:
             register_score_bias_buffer(layer)
-            # Do the scale layout conversion once, outside compiled forward.
-            layer.register_buffer(
-                "_tpu_fused_w13_scale",
-                layer.w13_weight_scale.squeeze(2).contiguous(),
-                persistent=False,
-            )
-            layer.register_buffer(
-                "_tpu_fused_w2_scale",
-                layer.w2_weight_scale.squeeze(2).contiguous(),
-                persistent=False,
-            )
+            register_fused_scale_buffers(layer)
             logger.info_once("NVFP4 fused EP W4A8 enabled: block-%d", requant_block)
         else:
             logger.info_once(
@@ -583,11 +585,25 @@ class _NullInputQuantKernel:
     layer advertises no input_quant_key."""
 
     @staticmethod
-    def input_quant_key():
+    def input_quant_key() -> str | None:
+        return None
+
+    @classmethod
+    def is_supported(
+        cls, compute_capability: int | None = None
+    ) -> tuple[bool, str | None]:
+        return True, None
+
+    @classmethod
+    def can_implement(cls, *args: Any, **kwargs: Any) -> bool:
+        return True
+
+    def __getattr__(self, name: str) -> Any:
         return None
 
 
-class VllmNvfp4LinearMethod(ModelOptNvFp4LinearMethod):
+@register_weight_loader_v2_supported_method
+class VllmNvfp4LinearMethod(ModelOptLinearMethod):
     """NVFP4 dense-linear for TPU (W4A16).
 
     Reuses upstream create_weights for parameter registration; fuses the block
@@ -599,7 +615,7 @@ class VllmNvfp4LinearMethod(ModelOptNvFp4LinearMethod):
     def __init__(
         self, quant_config: VllmNvfp4Config, linear_config: VllmQuantLinearConfig
     ):
-        # Skip ModelOptNvFp4LinearMethod.__init__ (it builds a GPU NVFP4 kernel
+        # Skip ModelOptLinearMethod.__init__ (it builds a GPU NVFP4 kernel
         # unavailable on TPU). create_weights only needs kernel.input_quant_key.
         self.quant_config = quant_config
         self.linear_config = linear_config
@@ -607,6 +623,20 @@ class VllmNvfp4LinearMethod(ModelOptNvFp4LinearMethod):
         # vLLM types this as an NvFp4LinearKernel; TPU installs a stand-in.
         # pyrefly: ignore[bad-assignment]
         self.kernel = _NullInputQuantKernel()
+        self.wkey = KNvfp4Static()
+        self.ctx = CkptCtx(group_size=self.group_size)
+        self.akey = None
+        self.fmt = getattr(modelopt_module, "_DROP_INPUT_SCALE", FormatScheme())
+        self.input_dtype = torch.get_default_dtype()
+        self.out_dtype = torch.get_default_dtype()
+        self.marlin_input_dtype = None
+        self.spec = QuantSpec(weight=kNvfp4Static, activation=None)
+
+    def select_kernel(self, *args: Any, **kwargs: Any) -> Any:
+        return _NullInputQuantKernel()
+
+    def init_kernel(self, *args: Any, **kwargs: Any) -> Any:
+        return _NullInputQuantKernel()
 
     def create_weights(
         self,
@@ -618,16 +648,42 @@ class VllmNvfp4LinearMethod(ModelOptNvFp4LinearMethod):
         params_dtype,
         **extra_weight_attrs,
     ):
-        ModelOptNvFp4LinearMethod.create_weights(
-            self,
-            layer,
-            input_size_per_partition,
-            output_partition_sizes,
-            input_size,
-            output_size,
-            params_dtype,
-            **extra_weight_attrs,
+        orig_init_nvfp4_modelopt = getattr(
+            modelopt_module, "init_nvfp4_linear_kernel", None
         )
+        orig_init_nvfp4_linear = getattr(
+            linear_kernels, "init_nvfp4_linear_kernel", None
+        )
+
+        def null_factory(*args: Any, **kwargs: Any) -> Any:
+            return _NullInputQuantKernel()
+
+        try:
+            if orig_init_nvfp4_modelopt is not None:
+                # pyrefly: ignore[bad-assignment]
+                modelopt_module.init_nvfp4_linear_kernel = null_factory
+            if orig_init_nvfp4_linear is not None:
+                # pyrefly: ignore[bad-assignment]
+                linear_kernels.init_nvfp4_linear_kernel = null_factory
+            ModelOptLinearMethod.create_weights(
+                self,
+                layer,
+                input_size_per_partition,
+                output_partition_sizes,
+                input_size,
+                output_size,
+                params_dtype,
+                **extra_weight_attrs,
+            )
+        finally:
+            if orig_init_nvfp4_modelopt is not None:
+                # pyrefly: ignore[bad-assignment]
+                modelopt_module.init_nvfp4_linear_kernel = orig_init_nvfp4_modelopt
+            if orig_init_nvfp4_linear is not None:
+                # pyrefly: ignore[bad-assignment]
+                linear_kernels.init_nvfp4_linear_kernel = orig_init_nvfp4_linear
+
+        self.kernel = _NullInputQuantKernel()
 
         # input_scale / weight_scale_2 are per-tensor (no output_dim); vLLM's
         # fused QKV/MergedColumn stacked loader cannot place the per-projection
@@ -636,6 +692,15 @@ class VllmNvfp4LinearMethod(ModelOptNvFp4LinearMethod):
         def scalar_weight_loader(param, loaded_weight, *args, **kwargs):
             assert loaded_weight.numel() == 1
             param.data.fill_(loaded_weight.item())
+
+        if not hasattr(layer, "input_scale"):
+            layer.register_parameter(
+                "input_scale",
+                PerTensorScaleParameter(
+                    data=torch.full((len(output_partition_sizes),), torch.nan),
+                    weight_loader=scalar_weight_loader,
+                ),
+            )
 
         for name in ("input_scale", "weight_scale_2"):
             if hasattr(layer, name):

@@ -366,6 +366,43 @@ def _sharded_runai_weights_iterator(
             _device_sync()
 
 
+def _patch_runai_local_rank_discovery() -> None:
+    """Reuse the exported host-rank count instead of rediscovering it.
+
+    Every ``SafetensorsStreamer`` instance runs
+    ``_distributedStreamerParams.find_local_ranks``, which opens a process
+    group over the whole world and all-gathers hostnames, so a load that
+    only some ranks perform (the last pipeline stage loading its MTP draft)
+    waits on the absent ranks until the store timeout. The first load in a
+    process exports RUNAI_STREAMER_PROCESS_GROUP_SIZE from its discovery;
+    later streamers read it back and skip the collective.
+    """
+    try:
+        from runai_model_streamer.distributed_streamer import (
+            distributed_streamer as rds,
+        )
+
+        params_cls = rds._distributedStreamerParams
+    except (ImportError, AttributeError):
+        logger.info_once(
+            "[sharded-ep-load] runai streamer without host-rank discovery; "
+            "nothing to patch."
+        )
+        return
+    if getattr(params_cls, "_tpu_discovery_patch", False):
+        return
+    original_find_local_ranks = params_cls.find_local_ranks
+
+    def find_local_ranks(self):
+        size = os.environ.get("RUNAI_STREAMER_PROCESS_GROUP_SIZE")
+        if size is None or not torch.distributed.is_initialized():
+            return original_find_local_ranks(self)
+        return int(size), torch.distributed.get_rank(), []
+
+    params_cls.find_local_ranks = find_local_ranks
+    params_cls._tpu_discovery_patch = True
+
+
 def patch_runai_sharded_expert_streaming() -> None:
     """Make ``RunaiModelStreamerLoader`` fetch only this rank's tensors.
 
@@ -378,6 +415,7 @@ def patch_runai_sharded_expert_streaming() -> None:
 
     if getattr(rsl.RunaiModelStreamerLoader, "_tpu_sharded_ep_patch", False):
         return
+    _patch_runai_local_rank_discovery()
     original_get_iterator = rsl.RunaiModelStreamerLoader._get_weights_iterator
     original_load_weights = rsl.RunaiModelStreamerLoader.load_weights
 

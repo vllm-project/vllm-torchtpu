@@ -27,6 +27,7 @@ from vllm.models.deepseek_v4 import attention as dsv4_attention
 from vllm.models.deepseek_v4.attention import DeepseekV4Indexer, DeepseekV4IndexerCache
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.rope import rope_quant
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
@@ -103,10 +104,10 @@ def _indexer_jax(
             k=k,
             compression_ratio=compression_ratio,
             # The following parameters are tuned based on microbenchmark results.
-            num_kv_pages_per_block=(16, 8, 8),
+            num_kv_pages_per_block=(64, 32, 16),
             num_queries_per_block=(1, 128, 128),
             decode_req_batch_size=4,
-            chunk_tokens=128,
+            chunk_tokens=envs.TPU_STREAMIDX_CHUNK_TOKENS,
         )
 
     return _indexer_local(

@@ -94,10 +94,20 @@ class PrefixAwareScheduler(AsyncScheduler):
         return (tier, cold_tokens, request.arrival_time), warmth
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
-        queue = super()._select_waiting_queue_for_scheduling()
+        queue = getattr(self, "kv_holding_waiting", None) or getattr(
+            self, "waiting", None
+        )
         if queue is not None:
             self._promote_warmest(queue)
         return queue
+
+    def schedule(self, throttle_prefills: bool = False):
+        queue = getattr(self, "kv_holding_waiting", None) or getattr(
+            self, "waiting", None
+        )
+        if queue is not None:
+            self._promote_warmest(queue)
+        return super().schedule(throttle_prefills)
 
     def _promote_warmest(self, queue: RequestQueue) -> None:
         """Promote the request with the fewest uncached tokens within WINDOW."""

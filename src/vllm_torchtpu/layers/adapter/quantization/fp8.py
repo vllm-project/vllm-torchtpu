@@ -594,6 +594,13 @@ def _process_fp8_moe_weights(
         block_size=requant_block_size,
         activation=activation,
     )
+    if layer.w13_weight.device.type == "tpu":
+        # The checkpoint w13 and its scale are dead once the requantized pair
+        # is materialized; rebinding them here returns their HBM before w2's
+        # float32 chunks and output are allocated.
+        synchronize_tensors([w13] if w13_scale is None else [w13, w13_scale])
+        layer.w13_weight.data = w13
+        w13_scale_param.data = w13_scale
     w2, w2_scale = _requantize_expert_chunks(
         layer.w2_weight.data,
         w2_scale_param.data,
@@ -677,12 +684,13 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
                 "FP8 store_dtype is not supported by the TPU quantization path"
             )
         super().__init__(
-            is_checkpoint_fp8_serialized=is_checkpoint_fp8_serialized,
+            is_checkpoint_fp8_serialized=True,
             activation_scheme=activation_scheme,
             ignored_layers=ignored_layers,
             weight_block_size=weight_block_size,
             store_dtype=store_dtype,
         )
+        self.is_checkpoint_fp8_serialized = is_checkpoint_fp8_serialized
 
     @classmethod
     def get_name(cls) -> QuantizationMethods:

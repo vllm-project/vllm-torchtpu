@@ -413,3 +413,26 @@ def test_loading_model_is_scoped_to_load_weights(fail):
         else:
             loader.load_weights(model, None)
     assert loader._loading_model is None
+
+
+def test_local_rank_discovery_reuses_exported_group_size(monkeypatch):
+    pytest.importorskip("runai_model_streamer")
+    from runai_model_streamer.distributed_streamer import (
+        distributed_streamer as rds,
+    )
+
+    from vllm_torchtpu import model_loader_patches as mlp
+
+    mlp._patch_runai_local_rank_discovery()
+    mlp._patch_runai_local_rank_discovery()  # idempotent
+    params = rds._distributedStreamerParams()
+    monkeypatch.setenv("RUNAI_STREAMER_PROCESS_GROUP_SIZE", "8")
+    with (
+        patch("torch.distributed.is_initialized", return_value=True),
+        patch("torch.distributed.get_rank", return_value=5),
+        patch("torch.distributed.new_group", side_effect=AssertionError("collective")),
+    ):
+        assert params.find_local_ranks() == (8, 5, [])
+    monkeypatch.delenv("RUNAI_STREAMER_PROCESS_GROUP_SIZE")
+    with patch("torch.distributed.is_initialized", return_value=False):
+        assert params.find_local_ranks() == (1, 0, [[0]])

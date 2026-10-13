@@ -147,6 +147,7 @@ def _bucket_runner(paddings, block_size, mamba_state, mode, pp=8, cls=None, pcp=
     runner.num_reqs_max_model_len = 8
     runner.max_num_blocks_per_req = 16
     runner._pp_chunk_granularity = None
+    runner.drafter = None
     runner._has_mamba_state = mamba_state
     runner.cache_config = SimpleNamespace(block_size=block_size, mamba_cache_mode=mode)
     runner.vllm_config = SimpleNamespace(
@@ -198,6 +199,86 @@ def test_chunk_buckets_hold_whole_query_blocks_under_context_parallelism():
     runner._add_pipeline_chunk_buckets()
     assert runner._pp_chunk_granularity == 512
     assert runner.num_tokens_paddings == [512, 1024, 1536, 2048]
+
+
+def test_chunk_buckets_reach_the_draft_compilation_config():
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+    runner = _bucket_runner([512, 1024, 2048, 4096], 4096, False, "none", pp=4, pcp=8)
+    drafter = MagicMock(spec=Eagle3Proposer)
+    drafter.draft_vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(compile_sizes=[512, 1024, 2048, 4096])
+    )
+    runner.drafter = drafter
+    runner._add_pipeline_chunk_buckets()
+    assert runner.num_tokens_paddings == [
+        512,
+        1024,
+        1536,
+        2048,
+        2560,
+        3072,
+        3584,
+        4096,
+    ]
+    assert drafter.draft_vllm_config.compilation_config.compile_sizes == (
+        runner.num_tokens_paddings
+    )
+    assert runner.vllm_config.compilation_config.compile_sizes == (
+        runner.num_tokens_paddings
+    )
+
+
+def _draft_bucket_runner(draft_sizes):
+    from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
+
+    runner = _bucket_runner([512, 1024, 2048, 4096], 4096, False, "none", pp=4, pcp=8)
+    drafter = MagicMock(spec=Eagle3Proposer)
+    drafter.draft_vllm_config = SimpleNamespace(
+        compilation_config=SimpleNamespace(compile_sizes=list(draft_sizes))
+    )
+    runner.drafter = drafter
+    runner._check_draft_buckets = TPUModelRunner._check_draft_buckets.__get__(runner)
+    return runner
+
+
+def test_draft_bucket_check_passes_once_chunk_buckets_reach_the_draft():
+    runner = _draft_bucket_runner([512, 1024, 2048, 4096])
+    runner._add_pipeline_chunk_buckets()
+    runner._check_draft_buckets()
+
+
+def test_draft_bucket_check_refuses_a_bucket_the_draft_never_compiles():
+    runner = _draft_bucket_runner([512, 1024, 2048, 4096])
+    runner.num_tokens_paddings = [512, 1024, 1536, 2048, 2560, 3072, 3584, 4096]
+    with pytest.raises(RuntimeError, match=r"\[1536, 2560, 3072, 3584\]"):
+        runner._check_draft_buckets()
+
+
+def test_draft_bucket_check_skips_a_stage_without_a_drafter():
+    runner = _draft_bucket_runner([512])
+    runner.drafter = None
+    runner._check_draft_buckets()
+
+
+def test_capture_model_checks_draft_buckets_after_the_mtp_warmup(monkeypatch):
+    from vllm_torchtpu.runner import tpu_runner
+
+    monkeypatch.setattr(
+        tpu_runner, "maybe_create_mm_encoder_manager", lambda *_args: None
+    )
+    runner = MagicMock(spec=TPUModelRunner)
+    runner.parallel_config = SimpleNamespace(pipeline_parallel_size=1)
+    runner.enforce_eager = False
+    runner.lora_config = None
+    runner.vllm_config = runner.device = runner.model = None
+    runner._mtp_prefill_only = True
+    runner._is_async_drafter = False
+    calls = []
+    runner._warmup_mtp_prefill.side_effect = lambda: calls.append("warmup")
+    runner._check_draft_buckets.side_effect = lambda: calls.append("check")
+    TPUModelRunner.capture_model(runner)
+    assert calls == ["warmup", "check"]
 
 
 def test_chunk_buckets_are_skipped_without_dynamic_chunks():

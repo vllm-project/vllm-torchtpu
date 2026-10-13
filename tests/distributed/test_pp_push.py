@@ -290,3 +290,9 @@ def test_each_executor_pushes_for_its_own_pipeline_size(monkeypatch, queue):
     assert four.execute_model(_step(16, 1)) == ("forward", 1)
     assert [c[0] for c in four.calls] == ["pp_settle"]
     assert queue(1, 1).kwargs["max_chunks"] == 24
+
+
+def test_pipeline_executor_never_asks_the_workers_for_draft_tokens(monkeypatch, queue):
+    executor = _install_on_fake_executor(monkeypatch, stages=4)
+    assert executor.take_draft_token_ids() is None
+    assert executor.calls == []

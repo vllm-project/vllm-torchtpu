@@ -95,15 +95,19 @@ def patch_disable_eagle_block_drop() -> None:
 
     @wraps(original_split)
     def split(self, *args, **kwargs):
-        if not self.use_eagle:
+        old_use_eagle = getattr(self, "use_eagle", False)
+        old_use_eagle_block_drop = getattr(self, "use_eagle_block_drop", False)
+        if not old_use_eagle and not old_use_eagle_block_drop:
             return original_split(self, *args, **kwargs)
-        # The upstream split reads use_eagle only for the one-block back-off.
-        # schedule() calls it synchronously on the EngineCore thread.
+        # The upstream split reads use_eagle or use_eagle_block_drop for the
+        # one-block back-off. schedule() calls it synchronously on EngineCore.
         self.use_eagle = False
+        self.use_eagle_block_drop = False
         try:
             return original_split(self, *args, **kwargs)
         finally:
-            self.use_eagle = True
+            self.use_eagle = old_use_eagle
+            self.use_eagle_block_drop = old_use_eagle_block_drop
 
     setattr(__init__, "_tpu_disable_eagle_block_drop_patch", True)  # noqa: B010
     setattr(split, "_tpu_disable_eagle_block_drop_patch", True)  # noqa: B010

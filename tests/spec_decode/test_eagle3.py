@@ -43,12 +43,16 @@ def _make_proposer(
     speculative_config = SimpleNamespace(
         draft_tensor_parallel_size=draft_tp, method=method, draft_model_config=None
     )
-    parallel_config = SimpleNamespace(tensor_parallel_size=target_tp)
+    parallel_config = SimpleNamespace(
+        tensor_parallel_size=target_tp, pipeline_parallel_size=1
+    )
     vllm_config = SimpleNamespace(
         speculative_config=speculative_config, parallel_config=parallel_config
     )
     return Eagle3Proposer(
-        runner=mock.MagicMock(_pcp_enabled=False, _mtp_enabled=method == "mtp"),
+        runner=mock.MagicMock(
+            _pcp_enabled=False, _mtp_enabled=method == "mtp", _mtp_prefill_only=False
+        ),
         vllm_config=vllm_config,
     )
 
@@ -142,7 +146,7 @@ def test_load_model_vocab_weights_follow_tp_layout(draft_tp, target_tp, monkeypa
     draft_head = draft.lm_head
     original_gather_logits = draft.logits_processor._gather_logits
 
-    def load_draft_model():
+    def load_draft_model(_target):
         proposer.draft_model = draft
 
     proposer._load_draft_model = load_draft_model
@@ -657,6 +661,75 @@ def test_prepare_draft_inputs_async_device(device):
     # and is sliced off by propose(), so compare only [:num_reqs].
     assert torch.equal(dev_last.cpu()[:2], host_last.cpu()[:2])
     assert dev_rej.cpu().tolist() == host_rej.tolist() == [1, 3]
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("discard", [[], [1]])
+def test_prepare_draft_inputs_async_device_keeps_padded_width(device, discard):
+    """The async path works at the sampler's padded request width: rows past
+    num_reqs repeat the last real request's seed position and token, so the
+    scatter result equals the host path's, and they report no rejections.
+    A last request still in partial prefill seeds from its known next prompt
+    token, and the padding rows repeat that token, not its sampled one."""
+    proposer = _make_proposer(draft_tp=1)
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
+        device=device,
+        requests={
+            "r1": SimpleNamespace(num_computed_tokens=0, get_token_id=lambda _i: 777)
+        },
+        num_tokens_paddings=[16, 32, 64, 128],
+        _dp_lockstep_enabled=lambda: False,
+    )
+    scheduler_output = SimpleNamespace(num_scheduled_tokens={"r1": 4})
+
+    def make_chunk():
+        # Two real requests (qsl [0, 4, 8]) inside a request padding of 4:
+        # the padded qsl and draft_lengths rows repeat the last real value.
+        return _make_chunk(
+            input_ids=torch.arange(8, dtype=torch.int32, device=device),
+            position_ids=torch.arange(8, dtype=torch.int32, device=device),
+            query_start_loc_np=np.array([0, 4, 8], dtype=np.int32),
+            start_index=0,
+            num_reqs=2,
+            device=device,
+            draft_lengths=torch.tensor([3, 3, 3, 3], dtype=torch.int32, device=device),
+            attn_ctx=SimpleNamespace(
+                query_start_loc=torch.tensor(
+                    [0, 4, 8, 8, 8], dtype=torch.int32, device=device
+                )
+            ),
+        )
+
+    # Padding rows carry no valid token at all; without the mask their
+    # clamp(min=1) seed would land on a real request's slot.
+    next_tokens = torch.tensor(
+        [[91, 92, 201, -1], [202, -1, -1, -1], [-1, -1, -1, -1], [-1, -1, -1, -1]],
+        dtype=torch.int32,
+        device=device,
+    )
+    dev_ids, _, dev_last, dev_rej = proposer._prepare_draft_inputs(
+        make_chunk(),
+        sampled_token_ids=None,
+        discard_sampled_tokens_req_indices=discard,
+        num_rejected_tokens_np=None,
+        scheduler_output=scheduler_output,
+        next_tokens_device=next_tokens,
+    )
+    host_ids, _, host_last, host_rej = proposer._prepare_draft_inputs(
+        make_chunk(),
+        sampled_token_ids=[[201], [202]],
+        discard_sampled_tokens_req_indices=discard,
+        num_rejected_tokens_np=np.array([1, 3], dtype=np.int32),
+        scheduler_output=scheduler_output,
+    )
+
+    assert torch.equal(dev_ids, host_ids)
+    assert torch.equal(dev_last.cpu()[:2], host_last.cpu()[:2])
+    assert dev_last.shape[0] == 16
+    assert dev_rej.shape[0] == 4
+    assert dev_rej.cpu().tolist() == [1, 3, 0, 0]
+    assert host_rej.tolist() == [1, 3]
 
 
 @pytest.mark.tpu_test
@@ -1569,6 +1642,7 @@ def test_forward_draft_uses_saved_draft_config_in_both_contexts(monkeypatch, dev
     proposer.runner = SimpleNamespace(
         mesh=object(),
         _dp_num_tokens_across_dp=lambda n: n,
+        num_tokens_paddings=[16],
     )
     proposer._build_draft_attn_metadata = lambda **_kwargs: {"draft": "md"}
 
@@ -1610,8 +1684,9 @@ def test_forward_draft_uses_saved_draft_config_in_both_contexts(monkeypatch, dev
     assert torch.equal(carry, hidden)
 
 
-def test_pcp_mtp_draft_cache_specs_require_full_attention():
-    """PCP K=1 rejects draft cache specs that need unsupported routing."""
+def test_prefill_only_mtp_draft_cache_specs_require_full_attention():
+    """A prefill-only producer rejects draft cache specs that need
+    unsupported routing."""
     proposer = _make_proposer(draft_tp=1, method="mtp")
     draft_attn_layer_names = {"draft.attn"}
     full_spec = FullAttentionSpec(
@@ -1621,14 +1696,14 @@ def test_pcp_mtp_draft_cache_specs_require_full_attention():
         get_kv_cache_spec=lambda: {"draft.attn": full_spec}
     )
 
-    proposer._validate_pcp_draft_model(draft_attn_layer_names)
+    proposer._validate_prefill_only_draft_model(draft_attn_layer_names)
 
     mamba_spec = MambaSpec(block_size=1, shapes=((1, 4, 8),), dtypes=(torch.bfloat16,))
     proposer.runner = SimpleNamespace(
         get_kv_cache_spec=lambda: {"draft.attn": mamba_spec}
     )
     with pytest.raises(NotImplementedError, match="FullAttentionSpec.*draft.attn"):
-        proposer._validate_pcp_draft_model(draft_attn_layer_names)
+        proposer._validate_prefill_only_draft_model(draft_attn_layer_names)
 
 
 @pytest.mark.tpu_test
@@ -2060,7 +2135,7 @@ def _forward_draft_harness(monkeypatch):
     proposer = _make_proposer(draft_tp=1, method="mtp")
     proposer.draft_vllm_config = object()
     proposer.runner = SimpleNamespace(
-        mesh=object(), _dp_num_tokens_across_dp=lambda n: n
+        mesh=object(), _dp_num_tokens_across_dp=lambda n: n, num_tokens_paddings=[2]
     )
     proposer._build_draft_attn_metadata = lambda **_kwargs: {}
 
@@ -2487,3 +2562,113 @@ def test_static_shape_args_passes_non_tensors_through():
 
     t, step_idx, flag = region(torch.zeros(2), 3, flag=None)
     assert step_idx == 3 and flag is None and t.shape == (2,)
+
+
+@pytest.mark.parametrize("own_lm_head", [False, True])
+@pytest.mark.parametrize("head_style", ["lm_head", "shared_head"])
+def test_mtp_draft_borrows_target_head_before_loading_weights(
+    monkeypatch, own_lm_head, head_style
+):
+    """The target's embed_tokens and lm_head are bound before the draft's
+    weights stream in, and only the checkpoint copies of borrowed modules are
+    skipped: a draft that keeps its own lm_head still loads it. A
+    DeepSeek-style draft keeps its head at ``model.layers.<N>.shared_head.head``
+    and must not load that checkpoint copy over the borrowed target head."""
+    import vllm.model_executor.model_loader.utils as loader_utils
+    from vllm.model_executor.model_loader import base_loader
+
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.runner = SimpleNamespace(mesh=object())
+    proposer.vllm_config.load_config = SimpleNamespace(device=None)
+    proposer.vllm_config.device_config = SimpleNamespace(device="cpu")
+    proposer.vllm_config.compilation_config = SimpleNamespace(
+        inductor_compile_config={}
+    )
+    proposer.speculative_config.draft_model_config = SimpleNamespace(
+        runner_type=None, dtype=torch.bfloat16
+    )
+    proposer._draft_tp_matches_target = True
+    proposer._draft_replicated = False
+
+    target_embed = torch.nn.Embedding(4, 2)
+    target_head = torch.nn.Linear(2, 4)
+    target = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=target_embed), lm_head=target_head
+    )
+    seen = {}
+
+    class Draft(torch.nn.Module):
+        has_own_embed_tokens = False
+        has_own_lm_head = own_lm_head
+
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.embed_tokens = torch.nn.Embedding(4, 2)
+            if head_style == "lm_head":
+                self.lm_head = torch.nn.Linear(2, 4)
+            else:
+                layer = torch.nn.Module()
+                layer.shared_head = torch.nn.Module()
+                layer.shared_head.head = torch.nn.Linear(2, 4)
+                self.model.layers = torch.nn.ModuleDict({"92": layer})
+
+        def _head(self):
+            if head_style == "lm_head":
+                return self.lm_head
+            return self.model.layers["92"].shared_head.head
+
+        def load_weights(self, weights):
+            seen["names"] = [name for name, _ in weights]
+            seen["embed_is_target"] = self.model.embed_tokens is target_embed
+            seen["head_is_target"] = self._head() is target_head
+            return set(seen["names"])
+
+    head_name = (
+        "lm_head.weight"
+        if head_style == "lm_head"
+        else "model.layers.92.shared_head.head.weight"
+    )
+
+    class _Loader:
+        def load_weights(self, model, model_config):
+            model.load_weights(
+                [
+                    ("model.embed_tokens.weight", 1),
+                    (head_name, 2),
+                    ("model.layers.92.mlp.gate.weight", 3),
+                ]
+            )
+
+    processed = []
+    monkeypatch.setattr(loader_utils, "initialize_model", lambda **kw: Draft())
+    monkeypatch.setattr(base_loader, "_has_online_quant", lambda model: False)
+    monkeypatch.setattr(
+        base_loader,
+        "process_weights_after_loading",
+        lambda model, config, device: processed.append(model),
+    )
+    monkeypatch.setattr(e3, "get_model_loader", lambda _cfg: _Loader())
+    monkeypatch.setattr(e3, "set_model_tag", lambda _tag: contextlib.nullcontext())
+    monkeypatch.setattr(
+        e3, "set_current_vllm_config", lambda _cfg: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        e3,
+        "set_vllm_model_wrapper_context",
+        lambda **kw: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(e3, "_force_draft_tp1", lambda: contextlib.nullcontext())
+
+    proposer._load_draft_model(target)
+
+    assert seen["embed_is_target"]
+    assert seen["head_is_target"] is not own_lm_head
+    expected = ["model.layers.92.mlp.gate.weight"]
+    if own_lm_head:
+        expected = [head_name] + expected
+    assert seen["names"] == expected
+    assert processed == [proposer.draft_model]
+    assert "load_weights" not in proposer.draft_model.__dict__

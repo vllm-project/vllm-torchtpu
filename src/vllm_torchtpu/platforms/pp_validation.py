@@ -102,8 +102,24 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
         # placeholder substitution reads from the device.
         unsupported = "async scheduling"
         remedy = " Pass --no-async-scheduling."
-    elif vllm_config.speculative_config is not None:
-        unsupported = "speculative decoding"
+    elif (spec := vllm_config.speculative_config) is not None and (
+        spec.method != "mtp"
+        or spec.num_speculative_tokens != 1
+        or vllm_config.kv_transfer_config is None
+        or not vllm_config.kv_transfer_config.is_kv_producer
+    ):
+        # The last stage hosts the draft and runs it over each prefill chunk
+        # so the draft layer's KV reaches a decode peer; it never verifies,
+        # and the runner refuses any decode step. That is the PCP producer's
+        # support boundary too.
+        unsupported = (
+            "speculative decoding other than prefill-only MTP with "
+            "num_speculative_tokens=1 on a KV producer"
+        )
+        remedy = (
+            " Use method=mtp with num_speculative_tokens=1 on an engine whose "
+            "kv_transfer_config has kv_role kv_producer."
+        )
     elif (
         vllm_config.kv_transfer_config is not None
         and vllm_config.kv_transfer_config.kv_connector != "TPURaidenConnector"

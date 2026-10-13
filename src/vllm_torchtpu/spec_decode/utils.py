@@ -110,6 +110,38 @@ def _force_draft_tp1():
         tp.rank_in_group = saved_rank
 
 
+def handoff_seed_tokens(
+    device_seed: torch.Tensor, req_ids: list[str], metadata: Any
+) -> torch.Tensor:
+    """Seeds a prefill-only draft's boundary row with the consumer's token.
+
+    A Stage-3 producer drops the last prompt token for the decode peer to
+    compute and samples a throwaway token in its place. The draft layer's KV
+    row at the prompt boundary has to be built from the real continuation,
+    which the send published in this step carries as
+    ``SendMeta.next_prompt_token_id``. Requests without such a send keep the
+    sampled seed.
+    """
+    reqs_to_send = getattr(metadata, "reqs_to_send", None)
+    if not reqs_to_send:
+        return device_seed
+    indices: list[int] = []
+    tokens: list[int] = []
+    for index, req_id in enumerate(req_ids):
+        send = reqs_to_send.get(req_id)
+        token = None if send is None else getattr(send, "next_prompt_token_id", None)
+        if token is not None:
+            indices.append(index)
+            tokens.append(int(token))
+    if not indices:
+        return device_seed
+    seed = device_seed.clone()
+    seed[torch.tensor(indices, dtype=torch.long, device=seed.device)] = torch.tensor(
+        tokens, dtype=seed.dtype, device=seed.device
+    )
+    return seed
+
+
 def gather_sharded_weight(
     sharded_module: VocabParallelEmbedding,
 ) -> tuple[torch.Tensor, int, int, torch.device]:

@@ -78,6 +78,7 @@ def _runner(*, producer: bool, method: str | None) -> TPUModelRunner:
     runner.vllm_config = SimpleNamespace(
         kv_transfer_config=SimpleNamespace(is_kv_producer=producer)
     )
+    runner._pp_is_last = True
     return runner
 
 
@@ -90,6 +91,10 @@ def test_fence_applies_to_producers_with_a_device_drafter_only():
     assert not _runner(producer=False, method="mtp")._fence_spec_kv_under_token_copy
     runner = _runner(producer=True, method="mtp")
     runner.vllm_config = SimpleNamespace(kv_transfer_config=None)
+    assert not runner._fence_spec_kv_under_token_copy
+    # Stages before the last hand their hidden states on and never draft.
+    runner = _runner(producer=True, method="mtp")
+    runner._pp_is_last = False
     assert not runner._fence_spec_kv_under_token_copy
 
 

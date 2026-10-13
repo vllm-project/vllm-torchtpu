@@ -53,6 +53,8 @@ def test_async_results_do_not_overwrite_recomputed_request(transition, num_draft
     runner._install_spec_token_room_guard = lambda: None
     runner._mamba_state_pos = {"resumed": 9, "continuing": 12}
     runner._mamba_offset_seeded = {"resumed", "continuing"}
+    runner._mamba_slot_by_req_id = {"resumed": 1, "continuing": 1 + stride}
+    runner._free_mamba_slots = []
     output = SchedulerOutput.make_empty()
     output.finished_req_ids = {"resumed"} if transition == "finish" else set()
     output.preempted_req_ids = {"resumed"} if transition == "preempt" else None
@@ -90,6 +92,12 @@ def test_async_results_do_not_overwrite_recomputed_request(transition, num_draft
     assert runner._mamba_offset_seeded == (
         {"continuing"} if invalid else {"resumed", "continuing"}
     )
+    assert runner._mamba_slot_by_req_id == (
+        {"continuing": 1 + stride}
+        if invalid
+        else {"resumed": 1, "continuing": 1 + stride}
+    )
+    assert runner._free_mamba_slots == ([1] if invalid else [])
     # Preserve source row indices and rejection correction for the other request.
     assert previous.req_id_to_index_copy["continuing"] == 1
     assert previous.spec_decode_num_rejected_tokens is (

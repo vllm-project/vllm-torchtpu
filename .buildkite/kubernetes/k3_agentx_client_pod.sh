@@ -90,9 +90,13 @@ _cfg=$(
     # shellcheck source=/dev/null
     source "$CONFIG_FILE" >/dev/null || exit 3
     _post=$(printf '%s' "${AGENTX_POST_EVAL_SUITES:-}" | tr -s ' ' ',')
-    echo "${MAX_NUM_SEQS:-0} ${TENSOR_PARALLELISM:-0} ${DATA_PARALLELISM:-0} ${ENABLE_EP:-false} ${AGENTX_MODEL_PREFIX:-} ${AGENTX_PRECISION:-} ${_post:--} ${AGENTX_CONC_LIST:-}"
+    echo "${MAX_NUM_SEQS:-0} ${TENSOR_PARALLELISM:-0} ${DATA_PARALLELISM:-0} ${ENABLE_EP:-false} ${AGENTX_MODEL_PREFIX:-} ${AGENTX_PRECISION:-} ${_post:--} ${AGENTX_PROXY:-toy} ${AGENTX_CONC_LIST:-}"
 ) || { log "FATAL: $CONFIG failed to load; the engines would have failed the same way"; exit 2; }
-read -r CFG_MAX_NUM_SEQS CFG_TP CFG_DP CFG_ENABLE_EP CFG_MODEL_PREFIX CFG_PRECISION CFG_POST_EVAL_SUITES CFG_CONC_LIST <<< "$_cfg"
+read -r CFG_MAX_NUM_SEQS CFG_TP CFG_DP CFG_ENABLE_EP CFG_MODEL_PREFIX CFG_PRECISION CFG_POST_EVAL_SUITES CFG_PROXY CFG_CONC_LIST <<< "$_cfg"
+# What fronts the pair: the toy proxy (examples/disagg) or vllm-router in
+# its prefill/decode mode (AGENTX_PROXY=router in the config; the image
+# carries the binary). Same two-hop protocol either way.
+case "$CFG_PROXY" in toy|router) ;; *) log "FATAL: $CONFIG sets AGENTX_PROXY='$CFG_PROXY'; expected toy or router"; exit 2 ;; esac
 for _req in CFG_MODEL_PREFIX CFG_PRECISION; do
     [ -n "${!_req}" ] || { log "FATAL: $CONFIG declares no AGENTX_${_req#CFG_}"; exit 2; }
 done
@@ -144,7 +148,7 @@ if [ "$SMOKE" = 1 ]; then
 fi
 
 log "config=$CONFIG concs=${CONCS[*]} max_num_seqs=$CFG_MAX_NUM_SEQS chips=$CHIPS ranks=$RANKS" \
-    "prefill=$PREFILL_HOST decode=$DECODE_HOST eval_only=$EVAL_ONLY smoke=$SMOKE" \
+    "prefill=$PREFILL_HOST decode=$DECODE_HOST proxy=$CFG_PROXY eval_only=$EVAL_ONLY smoke=$SMOKE" \
     "post_eval_suites=$POST_EVAL_SUITES"
 
 proxy_pid=""
@@ -193,14 +197,31 @@ done
 # the pair has no /metrics of its own, so aiperf reads each engine's.
 export AIPERF_SERVER_METRICS_URLS="http://${PREFILL_HOST}:${PORT}/metrics,http://${DECODE_HOST}:${PORT}/metrics"
 
-log "starting the proxy on port $PROXY_PORT"
-python3 examples/disagg/toy_proxy_server.py \
-    --host 0.0.0.0 --port "$PROXY_PORT" \
-    --prefiller-hosts "$PREFILL_HOST" --prefiller-ports "$PORT" \
-    --decoder-hosts "$DECODE_HOST" --decoder-ports "$PORT" \
-    >"$RESULTS_DIR/proxy.log" 2>&1 &
-proxy_pid=$!
-if ! timeout 120 bash -c "until curl -sf -o /dev/null http://127.0.0.1:${PROXY_PORT}/healthcheck; do sleep 2; done"; then
+log "starting the $CFG_PROXY proxy on port $PROXY_PORT"
+if [ "$CFG_PROXY" = router ]; then
+    # The request timeout covers a full decode; retries off so a failed hop
+    # fails the request instead of prefilling it twice.
+    vllm-router --host 0.0.0.0 --port "$PROXY_PORT" \
+        --vllm-pd-disaggregation \
+        --prefill "http://${PREFILL_HOST}:${PORT}" \
+        --decode "http://${DECODE_HOST}:${PORT}" \
+        --policy consistent_hash \
+        --request-timeout-secs 5000 --worker-startup-timeout-secs 300 \
+        --health-check-interval-secs 30 --disable-retries \
+        --prometheus-host 0.0.0.0 --prometheus-port $((PROXY_PORT + 1)) \
+        >"$RESULTS_DIR/proxy.log" 2>&1 &
+    proxy_pid=$!
+    proxy_health="health"
+else
+    python3 examples/disagg/toy_proxy_server.py \
+        --host 0.0.0.0 --port "$PROXY_PORT" \
+        --prefiller-hosts "$PREFILL_HOST" --prefiller-ports "$PORT" \
+        --decoder-hosts "$DECODE_HOST" --decoder-ports "$PORT" \
+        >"$RESULTS_DIR/proxy.log" 2>&1 &
+    proxy_pid=$!
+    proxy_health="healthcheck"
+fi
+if ! timeout 120 bash -c "until curl -sf -o /dev/null http://127.0.0.1:${PROXY_PORT}/${proxy_health}; do sleep 2; done"; then
     log "FATAL: the proxy did not come up"
     tail -50 "$RESULTS_DIR/proxy.log" || true
     exit 1

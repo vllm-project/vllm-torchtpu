@@ -65,6 +65,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
 )
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -380,6 +381,31 @@ def fused_moe_ep(
         router_logits = token_padding.mask_router_logits_for_padding(router_logits)
     extra = tuple(t for t in (score_bias, hash_ids) if t is not None)
     return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
+
+
+def register_fused_scale_buffers(layer) -> None:
+    """Stage the fp4 weight scales as the `[E, K/block, N]` tables the op takes.
+
+    The loader's tables are `[E, K/block, 1, N]`. A squeeze of one is a view,
+    and torch_tpu materializes a view graph input with a program of its own
+    before every step, in a layout the kernel then copies out of again inside
+    the step. So each table is copied once into a base tensor of its own, and
+    the 4-D parameter becomes a view of that copy rather than a second one.
+    The tables are synced here because the loaders' own sync has already run.
+    """
+    tables = []
+    for param, buf in (
+        ("w13_weight_scale", "_tpu_fused_w13_scale"),
+        ("w2_weight_scale", "_tpu_fused_w2_scale"),
+    ):
+        table = fresh_buffer(getattr(layer, param).squeeze(2))
+        layer.register_buffer(buf, table, persistent=False)
+        setattr(
+            layer, param, torch.nn.Parameter(table.unsqueeze(2), requires_grad=False)
+        )
+        tables.append(table)
+    if tables[0].device.type == "tpu":
+        synchronize_tensors(tables)
 
 
 # The buffer `register_score_bias_buffer` stages the bias operand under, and

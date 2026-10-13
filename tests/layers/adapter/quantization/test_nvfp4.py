@@ -226,6 +226,9 @@ class TestNvfp4LinearMethod:
         quant_config = MagicMock(group_size=16)
         linear_config = MagicMock()
         method = VllmNvfp4LinearMethod(quant_config, linear_config)
+        assert method.ctx.group_size == 16
+        assert method.akey is None
+        assert method.spec is not None
         layer = make_linear_layer(64, 32)
 
         def mock_base_create_weights(self, lyr, *args, **kwargs):
@@ -233,7 +236,7 @@ class TestNvfp4LinearMethod:
             lyr.weight_scale_2 = torch.nn.Parameter(torch.zeros(1), requires_grad=False)
 
         with patch(
-            "vllm.model_executor.layers.quantization.modelopt.ModelOptNvFp4LinearMethod.create_weights",
+            "vllm.model_executor.layers.quantization.modelopt.ModelOptLinearMethod.create_weights",
             mock_base_create_weights,
         ):
             method.create_weights(layer, 64, [32], 64, 32, torch.bfloat16)
