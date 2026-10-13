@@ -70,7 +70,6 @@ def test_platform_attributes():
         mock_dev.assert_called_once_with("tpu")
 
 
-<<<<<<< HEAD
 def test_rope_pair_swap_matches_native():
     torch.manual_seed(0)
     rope = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
@@ -126,9 +125,12 @@ def test_rope_patch_installed():
     torch.testing.assert_close(
         out_f32, rope.forward_native(x_f32, cos_f32, sin_f32), rtol=0, atol=0
     )
+
+
 def test_tpu_flash_attention_backend(monkeypatch):
     from types import SimpleNamespace
     from unittest.mock import MagicMock
+
     assert TpuFlashAttentionBackend.get_name() == "TPU_FLASH_ATTN"
     assert TpuFlashAttentionBackend.get_impl_cls() is TpuFlashAttentionImpl
 

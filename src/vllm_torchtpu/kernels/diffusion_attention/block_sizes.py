@@ -20,7 +20,7 @@
 
 Given a sequence length and the TPU hardware spec, this derives the
 ``(block_q, block_kv, block_kv_compute)`` for the custom splash kernel
-(``custom_splash_attention``) with no on-device sweep. The spec is read at
+(``kernel.flash_attention_bshd``) with no on-device sweep. The spec is read at
 runtime from ``pltpu.get_tpu_info`` (VMEM, MXU edge, generation),
 so v8/v9 are handled automatically; the few compiler-calibrated constants are
 multiples of the MXU edge.

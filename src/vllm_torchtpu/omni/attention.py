@@ -76,7 +76,7 @@ class TpuFlashAttentionImpl(TpuSDPAImpl):
         key: torch.Tensor,
         attn_metadata: Any | None,
     ) -> bool:
-        attn_mask = getattr(attn_metadata, "attn_mask", None)
+        attn_mask = attn_metadata.attn_mask if attn_metadata is not None else None
         # TODO: Revisit this fallback once torch_tpu SDPA lets callers select its
         # flash kernel and supports masks; until then masked, causal and non-bf16
         # calls take PyTorch SDPA.

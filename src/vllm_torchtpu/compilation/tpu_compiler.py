@@ -220,7 +220,7 @@ _RUNTIME_CACHE_KEY_PATHS = (
 # executable; hashing them would only invalidate LLM compile caches.
 _RUNTIME_CACHE_KEY_EXCLUDED_PATHS = (
     "vllm_torchtpu/kernels/diffusion_attention",
-    "vllm_torchtpu/omni",
+    "vllm_torchtpu/omni/attention.py",
 )
 
 
@@ -240,8 +240,15 @@ def _iter_runtime_cache_key_files(repo_root: Path) -> list[Path]:
             continue
         logger.warning("[TpuCompilerAdaptor] Cache key source path missing: %s", path)
 
-    excluded = tuple(f"{rel_path}/" for rel_path in _RUNTIME_CACHE_KEY_EXCLUDED_PATHS)
-    for relpath in [key for key in files_by_relpath if key.startswith(excluded)]:
+    excluded_files = set(_RUNTIME_CACHE_KEY_EXCLUDED_PATHS)
+    excluded_dirs = tuple(
+        f"{rel_path}/" for rel_path in _RUNTIME_CACHE_KEY_EXCLUDED_PATHS
+    )
+    for relpath in [
+        key
+        for key in files_by_relpath
+        if key in excluded_files or key.startswith(excluded_dirs)
+    ]:
         del files_by_relpath[relpath]
 
     if envs.TPU_KERNEL_ITER_MODE:

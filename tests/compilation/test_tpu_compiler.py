@@ -159,13 +159,22 @@ class TestTpuCompilerCache:
             for path in (source_root / "vllm_torchtpu").rglob("*.py")
             if "pallas.jax_op" in path.read_text()
         }
-        excluded = tuple(
+        excluded_files = set(tpu_compiler._RUNTIME_CACHE_KEY_EXCLUDED_PATHS)
+        excluded_dirs = tuple(
             f"{rel_path}/"
             for rel_path in tpu_compiler._RUNTIME_CACHE_KEY_EXCLUDED_PATHS
         )
-        omni_only = {path for path in custom_op_boundaries if path.startswith(excluded)}
+        omni_only = {
+            path
+            for path in custom_op_boundaries
+            if path in excluded_files or path.startswith(excluded_dirs)
+        }
         assert custom_op_boundaries - omni_only <= hashed
-        assert not {path for path in hashed if path.startswith(excluded)}
+        assert not {
+            path
+            for path in hashed
+            if path in excluded_files or path.startswith(excluded_dirs)
+        }
         assert {
             "vllm_torchtpu/kernels/quantized_matmul/blockwise_kernel.py",
             "vllm_torchtpu/kernels/pool_adapters.py",
@@ -182,14 +191,18 @@ class TestTpuCompilerCache:
         from vllm_torchtpu.compilation import tpu_compiler
 
         source_root = Path(tpu_compiler.__file__).resolve().parents[2]
-        excluded = tuple(
+        excluded_files = set(tpu_compiler._RUNTIME_CACHE_KEY_EXCLUDED_PATHS)
+        excluded_dirs = tuple(
             f"{rel_path}/"
             for rel_path in tpu_compiler._RUNTIME_CACHE_KEY_EXCLUDED_PATHS
         )
         importers = {
             path.relative_to(source_root).as_posix()
             for path in (source_root / "vllm_torchtpu").rglob("*.py")
-            if not path.relative_to(source_root).as_posix().startswith(excluded)
+            if not (
+                path.relative_to(source_root).as_posix() in excluded_files
+                or path.relative_to(source_root).as_posix().startswith(excluded_dirs)
+            )
             and re.search(
                 r"kernels\.diffusion_attention|kernels import diffusion_attention",
                 path.read_text(),

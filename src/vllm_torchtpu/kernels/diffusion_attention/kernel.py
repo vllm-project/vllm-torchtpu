@@ -20,7 +20,7 @@
 # - fixed_m_operands() repeats the key norms over GQA query heads.
 # - end() broadcasts 1 / l by slicing: pltpu.repeat is not in JAX 0.11.
 # - Lowered FIXED_M_SAFE_BOUND from 213.0 to 200.0 so low-norm query rows
-#   stay at least 14 log2 units above the f32 flush threshold.
+#   stay at least 13 log2 units above the f32 flush threshold.
 # - Set _splash_vmem_limit_bytes() to 1x physical VMEM and check
 #   head_dim % spec.num_lanes.
 # ruff: noqa: E741
@@ -71,8 +71,8 @@ LOG2_E = 1.44269504
 FIXED_M_RECENTER = 88.0
 
 # Flat gate: fixed-m only if the head's Cauchy-Schwarz bound <= 200.
-# k-smoothing forces rowmax >= 0, and keeping ceil(bound) <= 200 leaves at
-# least 14 log2 units above the f32 flush threshold (m - (C + 126) <= -14),
+# k-smoothing forces rowmax >= 0, and keeping m = ceil(bound) <= 200 leaves at
+# least 13 log2 units above the f32 flush threshold (m - (C + 126) <= -13),
 # so keys flushed to zero in exp2(qk - (m - C)) sit below 2^-14 of a
 # unit-norm row max (avoiding accuracy loss on low-norm query rows near the
 # flush ceiling 214). Outlier heads exceed it and keep online softmax.
@@ -146,12 +146,7 @@ def _splash_vmem_limit_bytes() -> int:
     Returns:
       The scoped-VMEM limit in bytes.
     """
-    devices = jax.devices()
-    if devices and devices[0].platform == "tpu":
-        vmem_bytes = int(pltpu.get_tpu_info().vmem_capacity_bytes)
-    else:
-        vmem_bytes = 64 * 2**20  # v7-sized fallback for CPU-only tracing.
-    return vmem_bytes
+    return detect_spec().vmem_bytes
 
 
 def _exp2(x: jax.Array) -> jax.Array:
@@ -550,9 +545,9 @@ def flash_attention_bshd(
       value: ``(B, seq_kv, kv_heads, dim)`` device-local.
       scale: Softmax scale; ``None`` means ``1/sqrt(dim)``.
       use_fixed_m: Hybrid fixed-m softmax, used when K/V spans more than one
-        block. The per-head eligibility gate is ``FIXED_M_SAFE_BOUND`` over
-        this call's Q and K, whose no-flush guarantee presumes k-smoothed
-        keys, so ``key`` is mean-centred per head first (softmax-invariant).
+        block. ``key`` is passed uncentred; ``fixed_m_operands`` splits
+        ``k = (k - mean(k)) + mean(k)`` in f32 to bound raw-key scores
+        against ``FIXED_M_SAFE_BOUND`` without a second bf16 rounding.
 
     Returns:
       ``(B, seq_q, heads, dim)`` in ``query``'s dtype.

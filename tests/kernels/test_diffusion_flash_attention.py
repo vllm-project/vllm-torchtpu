@@ -62,6 +62,8 @@ def _check(out, ref, max_rel=3e-2, mean_rel=1e-2):
         (1, 75600, 512, 1, 1, 128, True),
         # Narrow heads use the transposing layout.
         (1, 2304, 2304, 2, 2, 64, True),
+        (1, 4133, 4133, 24, 24, 128, True),
+        (1, 69632, 512, 1, 1, 128, False),
     ],
 )
 def test_matches_reference(batch, q_len, kv_len, heads, kv_heads, head_dim, fixed_m):
@@ -179,8 +181,8 @@ def test_error_at_bf16_floor(fixed_m):
     normalized probabilities and the output to bf16.
     """
     q, k, v = _inputs(1, 4133, 4133, 2, 2, 128, seed=2)
-    q = (q.astype(jnp.float32) * 8.0).astype(jnp.bfloat16)
-    k = (k.astype(jnp.float32) + 1.0).astype(jnp.bfloat16)
+    q = (q.astype(jnp.float32) * 4.0).astype(jnp.bfloat16)
+    k = (k.astype(jnp.float32) + 0.6).astype(jnp.bfloat16)
     scale = 1.0 / math.sqrt(128)
     rows = np.random.default_rng(0).choice(4133, size=128, replace=False)
     qn, kn, vn = (np.asarray(x, np.float64) for x in (q, k, v))
@@ -196,6 +198,15 @@ def test_error_at_bf16_floor(fixed_m):
     def max_row_rel(out):
         err = np.abs(out - ref).max(axis=-1)
         return (err / np.abs(ref).max(axis=-1)).max()
+
+    if fixed_m:
+        mk = fixed_m_operands(
+            q.astype(jnp.float32) * (scale * LOG2_E),
+            k,
+            gate=FIXED_M_SAFE_BOUND,
+            seq_axis=1,
+        )
+        assert np.array_equal(np.asarray(mk[1]), [1.0, 1.0])
 
     out = jax.jit(
         lambda q, k, v: flash_attention_bshd(q, k, v, scale=scale, use_fixed_m=fixed_m)
