@@ -96,8 +96,15 @@ class Qwen3_5MTP(upstream.Qwen3_5MTP):
 
     supports_pp: ClassVar[Literal[True]] = True
 
+    def make_empty_intermediate_tensors(self, batch_size: int, dtype: torch.dtype, device: torch.device):
+        return self.model.make_empty_intermediate_tensors(batch_size=batch_size, dtype=dtype, device=device)
+
 
 class Qwen3_5MoeMTP(upstream.Qwen3_5MoeMTP):
     """The MoE draft, admitted under pipeline parallelism; see `Qwen3_5MTP`."""
 
     supports_pp: ClassVar[Literal[True]] = True
+
+    def make_empty_intermediate_tensors(self, batch_size: int, dtype: torch.dtype, device: torch.device):
+        return self.model.make_empty_intermediate_tensors(batch_size=batch_size, dtype=dtype, device=device)
+
