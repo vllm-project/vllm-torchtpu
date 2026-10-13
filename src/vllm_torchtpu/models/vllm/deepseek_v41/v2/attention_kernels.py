@@ -658,7 +658,9 @@ def gather_sparse_kv_chunk(
             seq_page_ids,
             chunk_seq_ids,
             max_num_seqs,
-            block_tokens=sparse_mla._largest_divisor(chunk_size, 8),
+            # The page gather pads tail rows internally. Keep TPU blocks aligned
+            # even when the whole stage has, for example, twelve token rows.
+            block_tokens=8,
         )
     else:
         page_table = page_indices.reshape(max_num_seqs, -1)
