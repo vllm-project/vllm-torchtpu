@@ -102,10 +102,11 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
-    VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
-    TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = 4
     TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
+    TPU_STREAMIDX_SMALL_BUCKET_TOKENS: int = 64
+    VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
+    TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_STREAMIDX_SKIP_EMPTY_DECODE: bool = True
     TPU_INDEXER_TOPK_SHARED_READ: bool = True
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
@@ -829,6 +830,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_INDEXER_A2A_MIN_TOKENS": env_nonnegative_int(
         "TPU_DCP_INDEXER_A2A_MIN_TOKENS", 64
     ),
+    # MIXED-pass query block for StreamIndex top-k token buckets of at most
+    # TPU_STREAMIDX_SMALL_BUCKET_TOKENS. Under MTP every decode request has
+    # q_len = gamma + 1 and runs in the MIXED pass, whose default 128-row block
+    # scores ~124 padding rows per request. 4 (the default on glm-agentx) is
+    # the recommended value; TPU_STREAMIDX_SMALL_BUCKET_TOKENS=0 keeps 128
+    # everywhere.
+    "TPU_STREAMIDX_SMALL_BUCKET_BQ": env_positive_int_or_none(
+        "TPU_STREAMIDX_SMALL_BUCKET_BQ", default=4
+    ),
+    # MIXED-pass KV pages per block for those buckets; unset takes 8. Read only
+    # when TPU_STREAMIDX_SMALL_BUCKET_BQ is set.
+    "TPU_STREAMIDX_SMALL_BUCKET_BKVP": env_positive_int_or_none(
+        "TPU_STREAMIDX_SMALL_BUCKET_BKVP"
+    ),
+    # Largest padded token bucket that takes the small-bucket block sizes. A
+    # small query block re-reads a sequence's keys once per block, so one long
+    # q_len row in the bucket erodes the win: at 64 a lone 60-token tail is at
+    # parity with the 128-row block.
+    "TPU_STREAMIDX_SMALL_BUCKET_TOKENS": env_int(
+        "TPU_STREAMIDX_SMALL_BUCKET_TOKENS", 64
+    ),
     # Indexer K-cache writer and layout mode for GLM-5.2 / DSv4 StreamIndex:
     #   "sal" (default): Pallas coalesced_kv_append(_dcp) in SEQ_ALONG_LANE layout
     #     (falls back to "has" when block_size < 128 or when Raiden GLM admission
@@ -847,21 +869,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ).lower(),
     "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER": env_bool(
         "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", True
-    ),
-    # Query block size for the StreamIndex top-k MIXED pass when the padded
-    # token bucket is small (<= 16 tokens). Under MTP every decode request has
-    # q_len = gamma + 1 > 1, so decode runs in the MIXED pass, whose default
-    # 128-row query block computes ~124 padding rows per real row. 4 (one MTP
-    # request per block, the default) measured fastest.
-    "TPU_STREAMIDX_SMALL_BUCKET_BQ": env_positive_int_or_none(
-        "TPU_STREAMIDX_SMALL_BUCKET_BQ", default=4
-    ),
-    # KV pages per block for that same small-bucket MIXED pass. Read only when
-    # `TPU_STREAMIDX_SMALL_BUCKET_BQ` is set; unset then takes
-    # `STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP` (mla_attention_op.py), the value
-    # the decode-shape sweep picked.
-    "TPU_STREAMIDX_SMALL_BUCKET_BKVP": env_positive_int_or_none(
-        "TPU_STREAMIDX_SMALL_BUCKET_BKVP"
     ),
     # Branch at runtime around StreamIndex top-k's two DECODE (q_len 1)
     # passes when the batch has no q_len-1 sequence -- every step under MTP,
