@@ -66,6 +66,7 @@ pytestmark = pytest.mark.filterwarnings("ignore::DeprecationWarning")
 # `align_to(pages_per_seq, bkv_p) * page_size // 128 * 128` with page_size=1024
 # and bkv_p=2 on the GLM path.
 N_SHORT = 10240  # --max-model-len 9216
+N_64K = 65536  # --max-model-len 1048576 over DCP 16, one rank's share
 N_128K = 133120  # --max-model-len 132096
 N_1M = 1048576  # --max-model-len 1048576, the GLM-5.2 DCP=16 shape
 
@@ -189,6 +190,9 @@ def _run(scores: np.ndarray, k: int, row_lengths: np.ndarray) -> np.ndarray:
 # `MAX_SLICE_WORDS`, which a subcore holds single-buffered.
 SHAPES = [
     pytest.param(64, N_SHORT, 2048, 1, id="p1-b64-n10240"),
+    # GLM-5.2 at --max-model-len 1M over DCP 16: one subcore per row, whose
+    # parts past MAX_SLICE_WORDS fill the whole slice buffer.
+    pytest.param(64, N_64K, 2048, 1, id="p1-b64-n65536"),
     pytest.param(16, N_SHORT, 2048, 2, id="p2-b16-n10240"),
     pytest.param(16, N_128K, 2048, 4, id="p4-b16-n133120"),
     pytest.param(64, N_128K, 2048, 4, id="p4-b64-n133120"),
@@ -288,6 +292,40 @@ def test_exact_topk_ragged_rows_straddle_partition_boundaries(b, n, k, expected_
     )
     row_lengths = np.array([edges[i % len(edges)] for i in range(b)], np.int32)
     assert _mismatch(scores, _run(scores, k, row_lengths), k, row_lengths) is None
+
+
+@pytest.mark.tpu_test
+def test_every_slice_buffer_handoff_between_waves():
+    """Each subcore's parts move through its slice buffer by length.
+
+    A subcore fetches only its row's first `row_length` words. While a wave
+    is selected, the next wave's part lands in the other half of the buffer
+    if both fit a half (MAX_SLICE_WORDS); otherwise the next part waits and
+    starts at 0. Row `f + 32 * w` is subcore f's wave w, so the pattern below
+    walks every handoff: short then exactly half (flip halves), half then
+    long (wait), long then short, short then empty (flip with no fetch),
+    empty then long (wait). A part read from the wrong half, or fetched over
+    one still being selected, selects the wrong scores.
+    """
+    n, k = N_64K, 2048
+    pattern = [
+        lambda f: 5000 + 16 * f,
+        lambda f: MAX_SLICE_WORDS,
+        lambda f: 40000 + 16 * f,
+        lambda f: 7 + f,
+        lambda f: 0,
+        lambda f: n - f,
+    ]
+    b = 32 * len(pattern)
+    assert _pick_partition(b, n, k) == 1
+    row_lengths = np.array(
+        [pattern[w](f) for w in range(len(pattern)) for f in range(32)], np.int32
+    )
+    rng = np.random.default_rng(SEED)
+    for kind in ("random", "heavy_ties"):
+        scores = _scores(kind, b, n, rng)
+        idx = _run(scores, k, row_lengths)
+        assert _mismatch(scores, idx, k, row_lengths) is None, kind
 
 
 @pytest.mark.tpu_test
