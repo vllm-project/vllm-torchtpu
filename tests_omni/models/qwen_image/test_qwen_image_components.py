@@ -20,37 +20,14 @@ from vllm_omni.diffusion.models.qwen_image.qwen_image_transformer import (
     QwenEmbedRope,
 )
 
+from tests_omni.omni_test_utils import (
+    NUMERIC_MISMATCH_PATTERN,
+    assert_numerical_parity,
+)
 from vllm_torchtpu.omni.attention import TpuSDPAImpl
 from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
 
 pytestmark = [pytest.mark.omni]
-
-
-def _assert_numerical_parity(
-    actual: torch.Tensor,
-    reference: torch.Tensor,
-    atol: float = 1e-2,
-    rtol: float = 1e-2,
-    min_cos_sim: float = 0.999,
-):
-    a_flat = actual.flatten().float()
-    r_flat = reference.flatten().float()
-
-    norm_a = torch.linalg.norm(a_flat)
-    norm_r = torch.linalg.norm(r_flat)
-    if norm_a > 0 and norm_r > 0:
-        cos_sim = float(torch.dot(a_flat, r_flat) / (norm_a * norm_r))
-        assert cos_sim >= min_cos_sim, (
-            f"Cosine similarity {cos_sim:.5f} fell below minimum required {min_cos_sim}"
-        )
-
-    torch.testing.assert_close(
-        actual.float(),
-        reference.float(),
-        atol=atol,
-        rtol=rtol,
-        msg="TPU kernel output diverged from CPU baseline",
-    )
 
 
 class TestQwenEmbedRopeOnTpu:
@@ -141,6 +118,14 @@ class TestQwenRotaryKernelApplication:
     """Test QwenImageCrossAttention q/k rotation on TPU vs float64 CPU reference."""
 
     def test_apply_qwen_rope_numeric_parity_on_tpu(self):
+        """Check the rotation kernel on TPU against the float64 CPU reference.
+
+        Both frequency tables are computed on CPU and copied to TPU: the embedder
+        is built on CPU, and _compute_video_freqs is lru_cached without the
+        device in its key, so the second call returns the cached CPU tensor. The
+        test runs outside torch.inference_mode(); TestQwenEmbedRopeOnTpu covers
+        the TPU-built frequencies and the inference-mode path.
+        """
         torch.manual_seed(42)
         batch_size = 1
         num_heads = 24
@@ -185,20 +170,18 @@ class TestQwenRotaryKernelApplication:
         tpu_q_vid = rope(q_vid_tpu, vid_cos, vid_sin)
         tpu_q_txt = rope(q_txt_tpu, txt_cos, txt_sin)
 
-        _assert_numerical_parity(
+        assert_numerical_parity(
             tpu_q_vid.cpu(), ref_q_vid, atol=5e-2, rtol=0.0
         )  # Measured max abs error: 0.030761
-        _assert_numerical_parity(
+        assert_numerical_parity(
             tpu_q_txt.cpu(), ref_q_txt, atol=5e-2, rtol=0.0
         )  # Measured max abs error: 0.025155
 
         # Must-fail control: Neox rotation (chunked halves) instead of interleaved pairs
         bad_rope = RotaryEmbedding(is_neox_style=True)
         bad_tpu_q_vid = bad_rope(q_vid_tpu, vid_cos, vid_sin)
-        with pytest.raises(AssertionError):
-            _assert_numerical_parity(
-                bad_tpu_q_vid.cpu(), ref_q_vid, atol=5e-2, rtol=0.0
-            )
+        with pytest.raises(AssertionError, match=NUMERIC_MISMATCH_PATTERN):
+            assert_numerical_parity(bad_tpu_q_vid.cpu(), ref_q_vid, atol=5e-2, rtol=0.0)
 
 
 def _unmasked_sdpa_reference(q, k, v, scale):
@@ -265,7 +248,7 @@ class TestQwenJointAttention:
         assert tpu_out.shape == (batch_size, seq_len, num_heads, head_size)
         assert torch.all(torch.isfinite(tpu_out_cpu))
 
-        _assert_numerical_parity(
+        assert_numerical_parity(
             tpu_out_cpu, ref_out, atol=1e-3, rtol=1e-2
         )  # Measured max abs error: 0.000482
 
@@ -279,5 +262,5 @@ class TestQwenJointAttention:
             num_heads=num_heads, head_size=head_size, softmax_scale=scale * 2.0
         )
         tpu_out_bad = impl_bad.forward(q_tpu, k_tpu, v_tpu, attn_metadata=attn_metadata)
-        with pytest.raises(AssertionError):
-            _assert_numerical_parity(tpu_out_bad.cpu(), ref_out, atol=1e-3, rtol=1e-2)
+        with pytest.raises(AssertionError, match=NUMERIC_MISMATCH_PATTERN):
+            assert_numerical_parity(tpu_out_bad.cpu(), ref_out, atol=1e-3, rtol=1e-2)

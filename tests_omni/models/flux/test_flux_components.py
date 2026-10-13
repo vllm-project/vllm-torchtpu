@@ -20,37 +20,10 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 from vllm_omni.diffusion.models.flux.flux_transformer import FluxPosEmbed
 from vllm_omni.diffusion.models.flux2.flux2_transformer import Flux2PosEmbed
 
+from tests_omni.omni_test_utils import assert_numerical_parity
 from vllm_torchtpu.omni.attention import TpuFlashAttentionImpl, TpuSDPAImpl
 
 pytestmark = [pytest.mark.omni]
-
-
-def _assert_numerical_parity(
-    actual: torch.Tensor,
-    reference: torch.Tensor,
-    atol: float = 1e-2,
-    rtol: float = 1e-2,
-    min_cos_sim: float = 0.999,
-):
-    """Assert cosine similarity and floating-point tolerance bounds."""
-    a_flat = actual.flatten().float()
-    r_flat = reference.flatten().float()
-
-    norm_a = torch.linalg.norm(a_flat)
-    norm_r = torch.linalg.norm(r_flat)
-    if norm_a > 0 and norm_r > 0:
-        cos_sim = float(torch.dot(a_flat, r_flat) / (norm_a * norm_r))
-        assert cos_sim >= min_cos_sim, (
-            f"Cosine similarity {cos_sim:.5f} fell below minimum required {min_cos_sim}"
-        )
-
-    torch.testing.assert_close(
-        actual.float(),
-        reference.float(),
-        atol=atol,
-        rtol=rtol,
-        msg="TPU kernel output diverged from CPU baseline",
-    )
 
 
 def _sdpa_reference(
@@ -140,7 +113,7 @@ class TestFluxTpuSDPAAttention:
         )
 
         # Numerical parity against CPU baseline (CosSim >= 0.999, bfloat16 tolerance)
-        _assert_numerical_parity(tpu_out.cpu(), ref_out, atol=1e-2, rtol=1e-2)
+        assert_numerical_parity(tpu_out.cpu(), ref_out, atol=1e-2, rtol=1e-2)
 
     @pytest.mark.parametrize("impl_cls", [TpuSDPAImpl, TpuFlashAttentionImpl])
     def test_flux_joint_attention_asymmetry_numeric_parity_on_tpu(self, impl_cls):
@@ -180,7 +153,7 @@ class TestFluxTpuSDPAAttention:
         assert tpu_out.shape == (batch_size, q_len, num_heads, head_size)
         assert torch.all(torch.isfinite(tpu_out.cpu()))
 
-        _assert_numerical_parity(tpu_out.cpu(), ref_out, atol=1e-2, rtol=1e-2)
+        assert_numerical_parity(tpu_out.cpu(), ref_out, atol=1e-2, rtol=1e-2)
 
     @pytest.mark.parametrize("impl_cls", [TpuSDPAImpl, TpuFlashAttentionImpl])
     def test_flux_gqa_repeat_interleave_numeric_parity_on_tpu(self, impl_cls):
@@ -221,7 +194,7 @@ class TestFluxTpuSDPAAttention:
         assert tpu_out.shape == (batch_size, seq_len, num_heads, head_size)
         assert torch.all(torch.isfinite(tpu_out.cpu()))
 
-        _assert_numerical_parity(tpu_out.cpu(), ref_out, atol=1e-2, rtol=1e-2)
+        assert_numerical_parity(tpu_out.cpu(), ref_out, atol=1e-2, rtol=1e-2)
 
     @pytest.mark.parametrize("impl_cls", [TpuSDPAImpl, TpuFlashAttentionImpl])
     def test_flux_long_sequence_fixed_m_numeric_parity_on_tpu(self, impl_cls):
@@ -256,7 +229,7 @@ class TestFluxTpuSDPAAttention:
         v_tpu = value_cpu.to(device="tpu")
 
         tpu_out = impl.forward(q_tpu, k_tpu, v_tpu)
-        _assert_numerical_parity(
+        assert_numerical_parity(
             tpu_out.cpu(), ref_out, atol=2e-2, rtol=2e-2, min_cos_sim=0.999
         )
 
@@ -342,7 +315,7 @@ class TestFluxTpuSDPAAttention:
         sdpa_f32 = sdpa_impl.forward(q_f32, k_f32, v_f32).cpu()
         torch.testing.assert_close(flash_f32, sdpa_f32, atol=0.0, rtol=0.0)
         ref_out = _sdpa_reference(query_cpu, key_cpu, value_cpu, scale)
-        _assert_numerical_parity(flash_f32, ref_out, atol=1e-2, rtol=1e-2)
+        assert_numerical_parity(flash_f32, ref_out, atol=1e-2, rtol=1e-2)
 
 
 class TestFluxRoPEPositionEmbeddingOnTpu:
@@ -437,5 +410,5 @@ class TestFluxRoPEKernelApplication:
         torch.testing.assert_close(tpu_k.cpu(), tpu_k_replay.cpu(), atol=0.0, rtol=0.0)
 
         # Numerical parity against CPU ground truth
-        _assert_numerical_parity(tpu_q.cpu(), ref_q, atol=1e-4, rtol=1e-4)
-        _assert_numerical_parity(tpu_k.cpu(), ref_k, atol=1e-4, rtol=1e-4)
+        assert_numerical_parity(tpu_q.cpu(), ref_q, atol=1e-4, rtol=1e-4)
+        assert_numerical_parity(tpu_k.cpu(), ref_k, atol=1e-4, rtol=1e-4)

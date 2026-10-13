@@ -14,6 +14,8 @@ from PIL import Image
 from vllm_omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
+from tests_omni.omni_test_utils import compute_ssim, high_freq_energy
+
 pytestmark = [
     pytest.mark.omni,
     pytest.mark.spawns_tpu_workers,
@@ -80,37 +82,9 @@ def _load_golden_reference_image() -> np.ndarray:
     return np.load(path).astype(np.float32)
 
 
-def _compute_ssim(img1: np.ndarray, img2: np.ndarray) -> float:
-    """Mean SSIM across RGB channels."""
-    c1 = (0.01 * 1.0) ** 2
-    c2 = (0.03 * 1.0) ** 2
-    ssims = []
-    for c in range(3):
-        x, y = img1[..., c], img2[..., c]
-        mu_x, mu_y = x.mean(), y.mean()
-        var_x, var_y = x.var(), y.var()
-        cov_xy = np.mean((x - mu_x) * (y - mu_y))
-        num = (2 * mu_x * mu_y + c1) * (2 * cov_xy + c2)
-        den = (mu_x**2 + mu_y**2 + c1) * (var_x + var_y + c2)
-        ssims.append(float(num / den))
-    return float(np.mean(ssims))
-
-
 def _extract_image(output) -> Image.Image:
     """Extract PIL Image from Omni generate output."""
     return output.images[0]
-
-
-def _high_freq_energy(img: np.ndarray) -> float:
-    """Mean absolute Laplacian: drops with blur, rises with noise or blocking."""
-    laplacian = (
-        4 * img[1:-1, 1:-1]
-        - img[:-2, 1:-1]
-        - img[2:, 1:-1]
-        - img[1:-1, :-2]
-        - img[1:-1, 2:]
-    )
-    return float(np.abs(laplacian).mean())
 
 
 class TestFluxPrCiOnTpu:
@@ -249,14 +223,14 @@ class TestFluxPrCiOnTpu:
         )
 
         mae = float(np.mean(np.abs(arr - ref_img)))
-        ssim_val = _compute_ssim(arr, ref_img)
+        ssim_val = compute_ssim(arr, ref_img)
         pearsons = [
             float(np.corrcoef(arr[..., c].ravel(), ref_img[..., c].ravel())[0, 1])
             for c in range(3)
         ]
         min_pearson = min(pearsons)
-        ref_hf = _high_freq_energy(ref_img)
-        hf_ratio = _high_freq_energy(arr) / ref_hf
+        ref_hf = high_freq_energy(ref_img)
+        hf_ratio = high_freq_energy(arr) / ref_hf
         lo, hi = HF_ENERGY_RATIO_RANGE
 
         summary = (

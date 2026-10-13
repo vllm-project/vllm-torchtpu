@@ -16,6 +16,8 @@ from vllm_omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.model_extras import build_image_to_image_prompt, get_model_class_name
 
+from tests_omni.omni_test_utils import high_freq_energy
+
 pytestmark = [
     pytest.mark.nightly,
     pytest.mark.omni,
@@ -65,18 +67,6 @@ def _load_input_image() -> Image.Image:
     return Image.open(path).convert("RGB")
 
 
-def _high_freq_energy(img: np.ndarray) -> float:
-    """Mean absolute Laplacian: drops with blur, rises with noise or blocking."""
-    laplacian = (
-        4 * img[1:-1, 1:-1]
-        - img[:-2, 1:-1]
-        - img[2:, 1:-1]
-        - img[1:-1, :-2]
-        - img[1:-1, 2:]
-    )
-    return float(np.abs(laplacian).mean())
-
-
 def compute_distribution_metrics(
     img: Image.Image, input_img: Image.Image | None = None
 ) -> dict[str, float]:
@@ -85,7 +75,7 @@ def compute_distribution_metrics(
     metrics = {
         "mean": float(np.mean(arr)),
         "var": float(np.var(arr)),
-        "hf": _high_freq_energy(arr),
+        "hf": high_freq_energy(arr),
     }
     if input_img is not None:
         r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
