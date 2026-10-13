@@ -1,7 +1,7 @@
 # Copyright 2026 Google LLC
 # SPDX-License-Identifier: Apache-2.0
 """8-device parity for the fused MoE decode kernel (routed + shared expert +
-in-kernel all-reduce, or its reduce-scatter-only DP mode), with the experts
+in-kernel all-reduce, or its all-to-all + local sum DP mode), with the experts
 TP-sliced (every rank holds all E) or EP-sharded (rank r holds global experts
 [r*E, (r+1)*E)), whole or streamed in intermediate blocks; the shared expert is
 always a TP slice, gated (Qwen3.5) or ungated with a routed scale (GLM-5.2)."""
@@ -326,7 +326,7 @@ def test_vmem_bound_matches_build_limits():
 @pytest.mark.parametrize("ep", [False, True])
 @pytest.mark.parametrize("i_block", [None, 128])
 def test_scatter_rows_is_own_slice_of_all_reduce(setup, m, ep, i_block):
-    """scatter_rows=True (DP attention: reduce-scatter only, no all-gather)
+    """scatter_rows=True (DP attention: all-to-all + local sum, no all-gather)
     returns on rank r exactly rows [r*m/N, (r+1)*m/N) of the all-reduce mode's
     output. The BF16 wire (m/N % 16 == 0) is bit-identical; the FP32 wire used
     for small row counts differs only by the all-reduce's BF16 rounding.

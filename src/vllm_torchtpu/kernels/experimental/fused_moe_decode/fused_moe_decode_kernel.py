@@ -61,9 +61,10 @@ _NUM_BUFFERS = 6
 # The expert loop, plus the layer's shared expert (its TP slice, gated by
 # sigmoid(x . w_g) or ungated) and the TP all-reduce, in one call per rank under
 # shard_map. The all-reduce is latency bound at decode sizes, so it runs once
-# at the end; the barrier it needs is signalled at entry and waited only
-# before the reduce-scatter, so the expert loop hides it. bf16 on the wire,
-# FP32 sum of the slots.
+# at the end, as a direct all-to-all with a local sum (reduce-scatter
+# semantics, see all_to_all_sum) followed by an all-gather; the barrier it
+# needs is signalled at entry and waited only before the all-to-all, so the
+# expert loop hides it. bf16 on the wire, FP32 sum of the slots.
 
 
 def _kernel(
@@ -98,8 +99,8 @@ def _kernel(
     ids_ref,
     sem_ref,
     shared_sem,
-    rs_send,
-    rs_recv,
+    a2a_send,
+    a2a_recv,
     ag_send,
     ag_recv,
     *,
@@ -146,7 +147,7 @@ def _kernel(
         ([m, 2 max(ib, i_s)] in blocked mode).
       acc_ref [m, h] f32: this rank's partial sum.
       acc_bf16 [m, h] bf16: the same, as the all-reduce source.
-      recv [n, m, c] bf16: reduce-scatter slots, one per sending rank.
+      recv [n, m, c] bf16: all-to-all receive slots, one per sending rank.
       red [m, c] bf16: this rank's reduced column chunk.
       With `rows` set, acc_bf16 and recv are [n, r_pad, h] (row slab d is
       peer d's tokens) and red is unused.
@@ -161,7 +162,7 @@ def _kernel(
     exact because SiLU(gate) * up is elementwise in the intermediate and the
     down projection sums over it.
       shared_sem DMA [4]: shared expert transfers.
-      rs_send DMA [n], rs_recv DMA: reduce-scatter.
+      a2a_send DMA [n], a2a_recv DMA: all-to-all.
       ag_send DMA [n], ag_recv DMA: all-gather.
     """
     nblk = 1 if ib is None else i // ib
@@ -341,62 +342,54 @@ def _kernel(
             jnp.matmul(xq_ref[...], w1_ring[0], preferred_element_type=jnp.float32),
         )
 
-    if rows is not None:
-        # DP attention: reduce-scatter over token rows, no all-gather. Rank d
-        # receives every rank's partial of tokens [d * rows, (d + 1) * rows),
-        # sums them and keeps that slice. Each peer's slab is a whole leading
-        # index of acc_bf16 / recv, so it is tile aligned for any rows.
-        for d in range(n_ranks):
-            acc_bf16[d, :rows, :] = acc_ref[d * rows : (d + 1) * rows, :].astype(
-                acc_bf16.dtype
-            )
+    def all_to_all_sum(slab, dst):
+        """Reduce-scatter semantics by a direct all-to-all and a local sum,
+        which both output modes end with. slab(d) is this rank's partial of
+        the slice rank d keeps; one remote copy per peer sends it straight to
+        rank d's recv[me]. Each rank then sums the n slots it received in FP32
+        into dst. There is no ring and no per-hop reduction: a single hop of n
+        concurrent copies, where a ring needs n - 1 dependent steps for the
+        same bytes, which suits the latency-bound sizes of decode."""
+        # Every peer has entered this call, so its receive buffer is live.
         pl.semaphore_wait(barrier, n_ranks)
-        scatter = [
+        copies = [
             pltpu.make_async_remote_copy(
-                acc_bf16.at[d],
+                slab(d),
                 recv.at[me],
-                rs_send.at[d],
-                rs_recv,
+                a2a_send.at[d],
+                a2a_recv,
                 device_id=(jnp.int32(d),),
                 device_id_type=pl.DeviceIdType.MESH,
             )
             for d in range(n_ranks)
         ]
-        for copy in scatter:
+        for copy in copies:
             copy.start()
-        pltpu.make_async_copy(recv, recv, rs_recv).wait()
+        pltpu.make_async_copy(recv, recv, a2a_recv).wait()
         acc = recv[0].astype(jnp.float32)
         for s in range(1, n_ranks):
             acc = acc + recv[s].astype(jnp.float32)
-        out_ref[...] = acc.astype(out_ref.dtype)
-        for copy in scatter:
+        dst[...] = acc.astype(dst.dtype)
+        for copy in copies:
             copy.wait_send()
+
+    if rows is not None:
+        # DP attention: all-to-all + local sum over token rows, no all-gather.
+        # Slab d is this rank's partial of tokens [d * rows, (d + 1) * rows),
+        # the rows rank d keeps. Each slab is a whole leading index of
+        # acc_bf16 / recv, so it is tile aligned for any rows.
+        for d in range(n_ranks):
+            acc_bf16[d, :rows, :] = acc_ref[d * rows : (d + 1) * rows, :].astype(
+                acc_bf16.dtype
+            )
+        all_to_all_sum(lambda d: acc_bf16.at[d], out_ref)
         return
 
-    # All-reduce: reduce-scatter column chunks, sum, all-gather.
+    # TP attention, all-reduce: all-to-all + local sum over column chunks (rank
+    # d keeps columns [d * chunk, (d + 1) * chunk) of every token), then an
+    # all-gather of the reduced chunks.
     acc_bf16[...] = acc_ref[...].astype(acc_bf16.dtype)
-    # Every peer has entered this call, so its receive buffer is live.
-    pl.semaphore_wait(barrier, n_ranks)
-    scatter = [
-        pltpu.make_async_remote_copy(
-            acc_bf16.at[:, pl.ds(d * chunk, chunk)],
-            recv.at[me],
-            rs_send.at[d],
-            rs_recv,
-            device_id=(jnp.int32(d),),
-            device_id_type=pl.DeviceIdType.MESH,
-        )
-        for d in range(n_ranks)
-    ]
-    for copy in scatter:
-        copy.start()
-    pltpu.make_async_copy(recv, recv, rs_recv).wait()
-    acc = recv[0].astype(jnp.float32)
-    for s in range(1, n_ranks):
-        acc = acc + recv[s].astype(jnp.float32)
-    red[...] = acc.astype(red.dtype)
-    for copy in scatter:
-        copy.wait_send()
+    all_to_all_sum(lambda d: acc_bf16.at[:, pl.ds(d * chunk, chunk)], red)
     col = pl.multiple_of(me * chunk, chunk)
     gather = [
         pltpu.make_async_remote_copy(
@@ -451,7 +444,7 @@ def _token_side_bytes(m, h, i_s, xs_width, experts, n_ranks, wt):
         + xs_width * f32  # row scales, broadcast
         + h * f32  # accumulator
         + h * bf16  # accumulator in bf16, the all-reduce source
-        + n_ranks * (h // n_ranks) * bf16  # reduce-scatter slots
+        + n_ranks * (h // n_ranks) * bf16  # all-to-all receive slots
         + (h // n_ranks) * bf16  # reduced chunk
     )
     return shared + rows
@@ -559,9 +552,10 @@ def fused_moe_decode(
         nothing here and are summed in by the all-reduce. None for TP experts.
       scatter_rows: for DP attention. The caller all-gathered every rank's
         tokens and routing rank-major, so `hidden` holds the global batch.
-        The all-reduce becomes a reduce-scatter over token rows: rank r
-        returns only its own rows [r * tokens / n_ranks, (r + 1) * tokens /
-        n_ranks), [tokens / n_ranks, H], and no all-gather runs. Needs tokens
+        The all-reduce becomes an all-to-all + local sum over token rows
+        (reduce-scatter semantics): rank r returns only its own rows
+        [r * tokens / n_ranks, (r + 1) * tokens / n_ranks), [tokens / n_ranks,
+        H], and no all-gather runs. Needs tokens
         % n_ranks == 0. The wire is BF16 when tokens / n_ranks is a multiple
         of 16, else FP32.
       routed_scale: multiplies the routed experts' sum only, never the shared

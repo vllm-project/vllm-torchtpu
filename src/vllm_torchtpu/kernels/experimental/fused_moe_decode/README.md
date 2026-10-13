@@ -39,7 +39,8 @@ out = fused_moe_decode(
   by the all-reduce.
 - `scatter_rows=True` (DP attention): `hidden`, `topk_weights` and `topk_ids`
   are the global batch, all-gathered rank-major by the caller. The all-reduce
-  becomes a reduce-scatter over token rows. Rank `r` returns rows
+  becomes an all-to-all + local sum over token rows (reduce-scatter
+  semantics). Rank `r` returns rows
   `[r·T/n, (r+1)·T/n)` and no all-gather runs. Needs `T % n_ranks == 0`.
 - `routed_scale` multiplies the routed sum, never the shared expert, as vLLM's
   `MoERunner` applies `routed_scaling_factor`.
@@ -91,8 +92,8 @@ GMM path.
 With DP attention each rank owns T/n tokens. The caller all-gathers every
 rank's tokens and routing, rank-major, and calls the kernel with
 `scatter_rows=True`. The kernel computes the experts over the global batch and
-ends with a reduce-scatter over token rows, so each rank gets back exactly its
-own T/n rows. The kernel runs no all-gather. Things to know:
+ends with an all-to-all + local sum over token rows, so each rank gets back
+exactly its own T/n rows. The kernel runs no all-gather. Things to know:
 
 - The token cap counts global tokens: a cap of 256 at DP8 is 32 tokens per
   rank. Larger DP decode batches are better served by fused EP MoE, which
@@ -129,11 +130,15 @@ arms only with TP attention (DP 1).
   with FP32 accumulation into one VMEM accumulator.
 - **Shared expert in-kernel.** Its slice is loaded once at entry and computed
   first, gated by `sigmoid(x · w_g)` or ungated.
-- **In-kernel all-reduce.** It is a remote-DMA reduce-scatter over column
-  chunks, then an all-gather, with bf16 on the wire. With `scatter_rows` it is
-  a reduce-scatter over token rows only. The cross-rank barrier is
-  signalled at entry and waited only before the reduce-scatter, so the expert
+- **In-kernel all-reduce.** A direct all-to-all with a local sum over column
+  chunks, then an all-gather, with bf16 on the wire: each rank sends every
+  peer the chunk that peer keeps in one remote copy, and sums the n chunks it
+  receives. That gives reduce-scatter semantics without a ring or per-hop
+  reduction, one hop of n concurrent copies instead of n - 1 dependent steps,
+  which suits latency-bound decode sizes. With `scatter_rows` it is the
+  all-to-all + local sum over token rows only. The cross-rank barrier is
+  signalled at entry and waited only before the all-to-all, so the expert
   loop hides it.
-- **Limits.** All tokens, the accumulator and the reduce-scatter buffers stay
+- **Limits.** All tokens, the accumulator and the all-to-all buffers stay
   resident in VMEM. That caps the token count, and `vmem_bytes` computes the
   cap.
