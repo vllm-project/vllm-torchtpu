@@ -410,6 +410,9 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
         sharded_ok = par.ep_size == n_ranks and par.dp_size == 1
     else:
         sharded_ok = par.tp_size == n_ranks
+    # TP attention over the whole mesh: every rank holds every token and one
+    # shared-expert slice, and MoERunner runs no DP/PCP collective after the op.
+    sharded_ok = sharded_ok and get_tensor_model_parallel_world_size() == n_ranks
     if not isinstance(qm, VllmFp8MoEMethodTPU) or not sharded_ok:
         return None
     if qm._tpu_activation_str != "silu":
