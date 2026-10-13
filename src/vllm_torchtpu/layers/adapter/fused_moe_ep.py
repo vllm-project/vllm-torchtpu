@@ -56,9 +56,11 @@ from vllm_torchtpu.distributed.ep_mesh import (
     build_ep_mesh,
     ep_mesh_index,
     ep_rank_order,
+    ep_sorted_gather_group,
     ep_token_replica_groups,
 )
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
+    HIDDEN_LANE_BLOCK,
     PACK4,
     U32_SUBLANE_TILE,
     token_gather_smem_bytes,
@@ -178,8 +180,13 @@ def _build_op(
     has_hash_ids=False,
     *,
     token_replica_groups=None,
+    sorted_gather=None,
 ):
-    """The op for this closure, built once per distinct closure and reused."""
+    """The op for this closure, built once per distinct closure and reused.
+
+    `sorted_gather` is `ep_sorted_gather_group()`'s (group, positions), or
+    None for the single fused program. With it the op is a `_SortedGatherOp`.
+    """
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
 
     key = (
@@ -195,6 +202,7 @@ def _build_op(
         routed_scaling_factor,
         has_hash_ids,
         token_replica_groups,
+        None if sorted_gather is None else sorted_gather[1],
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -209,7 +217,9 @@ def _build_op(
         scoring_fn=scoring_fn, routed_scaling_factor=routed_scaling_factor
     )
 
-    def call(x, w1, w2, w1_scale, w2_scale, gating, rank, **bias_kw):
+    # Any: the layer, route or compute result depending on bias_kw's stage;
+    # each wrapper below declares the one it returns.
+    def call(x, w1, w2, w1_scale, w2_scale, gating, rank, **bias_kw) -> Any:
         # The router's top-k selector writes into an f32 accumulator ref, so a
         # bf16 gate output -- which is what the model's gate matmul produces --
         # fails inside the kernel on a dtype mismatch. Widen at the boundary;
@@ -337,8 +347,208 @@ def _build_op(
         return torch.empty_like(x)
 
     op.register_fake(_fake)
+    if sorted_gather is not None:
+        op = _build_split_ops(
+            name,
+            call,
+            mesh,
+            input_specs,
+            spec,
+            topk,
+            weight_format,
+            has_score_bias,
+            has_hash_ids,
+            token_replica_groups,
+            sorted_gather,
+        )
     _OPS[key] = op
     return op
+
+
+class _SortedGatherOp:
+    """The fused layer as route, a torch all-gather, compute.
+
+    Called exactly like the single op. The gather runs over
+    `ep_sorted_gather_group`'s device-id ordered group while both programs
+    keep the rank-ordered mesh; compute is told where each rank's rows
+    landed. Holds no mesh, so it is safe to reach from a traced forward.
+    """
+
+    def __init__(self, route, compute, group):
+        self.route = route
+        self.compute = compute
+        self.group = group
+
+    def __call__(self, x, w1, w2, w1_scale, w2_scale, gating, rank, *extra):
+        from torch.distributed import _functional_collectives as funcol
+
+        operands = (x, w1, w2, w1_scale, w2_scale, gating, rank, *extra)
+        q, router_weights, payload = self.route(*operands)
+        q_g = funcol.wait_tensor(funcol.all_gather_tensor(q, 0, self.group))
+        return self.compute(*operands, q_g, router_weights, payload)
+
+
+def _build_split_ops(
+    name,
+    call,
+    mesh,
+    input_specs,
+    spec,
+    topk,
+    weight_format,
+    has_score_bias,
+    has_hash_ids,
+    token_replica_groups,
+    sorted_gather,
+):
+    """`_SortedGatherOp` for the closure `call` was built for."""
+    from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat
+    from vllm_torchtpu.kernels.fused_moe.v2.host import weight_form
+    from vllm_torchtpu.kernels.fused_moe.v2.layer import _exchange_layout
+    from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import replica_wire_rows
+
+    group, positions = sorted_gather
+    ep = mesh.shape[EP_AXIS_NAME]
+    quantized = weight_form(WeightFormat(weight_format)).quantized_activations
+
+    def extra_kw(extra):
+        if has_score_bias:
+            return dict(score_bias=extra.astype(jnp.float32))
+        if has_hash_ids:
+            return dict(hash_topk_ids=extra.astype(jnp.int32))
+        return {}
+
+    def route(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        return call(x, w1, w2, w1_scale, w2_scale, gating, rank, stage="route")
+
+    def route_extra(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        extra: jax.Array,
+    ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            stage="route",
+            **extra_kw(extra),
+        )
+
+    def compute(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        q_g: jax.Array,
+        router_weights: jax.Array,
+        payload: jax.Array,
+    ) -> jax.Array:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            stage="compute",
+            routed=(q_g, router_weights, payload),
+            gather_positions=positions,
+        )
+
+    def compute_extra(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        extra: jax.Array,
+        q_g: jax.Array,
+        router_weights: jax.Array,
+        payload: jax.Array,
+    ) -> jax.Array:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            stage="compute",
+            routed=(q_g, router_weights, payload),
+            gather_positions=positions,
+            **extra_kw(extra),
+        )
+
+    has_extra = has_score_bias or has_hash_ids
+    route_op = jax_op(
+        f"{name}_route",
+        route_extra if has_extra else route,
+        mesh=mesh,
+        input_partition_specs=input_specs,
+        output_partition_specs=(spec,) * 3,
+    )
+    # q_g is the whole gather on every rank: one block of mesh-wide rows per
+    # shard, so it is sharded on axis 0 like the rest.
+    compute_op = jax_op(
+        f"{name}_compute",
+        compute_extra if has_extra else compute,
+        mesh=mesh,
+        input_partition_specs=input_specs + (spec,) * 3,
+        output_partition_specs=spec,
+    )
+
+    replica_width = len(token_replica_groups[0]) if token_replica_groups else 1
+
+    # x.shape[0] is symbolic here, and must stay unguarded: see
+    # replica_wire_rows, the padded row count route returns for that reason.
+    def _route_fake(x, w1, *_args, **_kwargs):
+        t_wire = replica_wire_rows(x.shape[0], replica_width, U32_SUBLANE_TILE)
+        width = _exchange_layout(t_wire, topk, w1.shape[0] * ep, quantized)[-1]
+        q_dtype = torch.float8_e4m3fn if quantized else torch.bfloat16
+        return (
+            x.new_empty(
+                (t_wire, x.shape[1] // HIDDEN_LANE_BLOCK, HIDDEN_LANE_BLOCK),
+                dtype=q_dtype,
+            ),
+            x.new_empty((t_wire, topk), dtype=torch.float32),
+            x.new_empty((1, width), dtype=torch.int32),
+        )
+
+    def _compute_fake(x, *_args, **_kwargs):
+        return torch.empty_like(x)
+
+    route_op.register_fake(_route_fake)
+    compute_op.register_fake(_compute_fake)
+    logger.info_once(
+        "Fused EP MoE: activation all-gather runs over the device-id ordered "
+        "group | gather_positions=%s",
+        positions,
+    )
+    return _SortedGatherOp(route_op, compute_op, group)
 
 
 def fused_moe_ep(
@@ -571,6 +781,11 @@ def prebuild_fused_moe_ep(
         )
         return None
     ep = mesh.shape[EP_AXIS_NAME]
+    # Collective over the world, so before any refusal that could differ by
+    # rank; cached after the first layer.
+    sorted_gather = (
+        ep_sorted_gather_group() if envs.MOE_FUSED_EP_SORTED_GATHER else None
+    )
 
     gather_bytes = token_gather_smem_bytes(_TILE_M)
     needed_smem = _SMEM_OVERHEAD_BYTES + gather_bytes
@@ -684,6 +899,7 @@ def prebuild_fused_moe_ep(
         routed_scale,
         has_hash_ids,
         token_replica_groups=token_replica_groups,
+        sorted_gather=sorted_gather,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
