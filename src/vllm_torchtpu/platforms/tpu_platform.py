@@ -6,7 +6,7 @@ import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import os
 import time
-from typing import TYPE_CHECKING, Any, Protocol, Union, cast
+from typing import TYPE_CHECKING, Protocol, Union, cast
 
 import portpicker
 import torch
