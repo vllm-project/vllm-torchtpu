@@ -8,13 +8,20 @@
 # directory. Changes from the original:
 # - Removed the ring-attention residual path (residual_attention,
 #   emit_residuals) and the E4M3 QK path (qk_fp8), which are not used here.
+# - flash_attention_bshd() replaces attention(): (B, S, H, D) inputs and
+#   outputs, block sizes from autotune_block_sizes(), q scaled in f32 before
+#   its bf16 cast, keys mean-centred per head for fixed-m, and fixed-m only
+#   when K/V spans more than one block. Lane-aligned heads are DMA'd as
+#   column blocks of the (B, S, H * D) activations (column_heads).
+# - fixed_m_operands() repeats the key norms over GQA query heads.
+# - end() broadcasts 1 / l by slicing: pltpu.repeat is not in JAX 0.11.
 # ruff: noqa: E741
 
 """Custom Pallas flash attention kernel for TPU.
 
 A hand-written Pallas kernel using ``exp2`` fused softmax, ``fori_loop`` KV
 tiling, and a hybrid per-head fixed-m / online softmax. The device-local
-entry point ``attention`` wraps the kernel body
+entry point ``flash_attention_bshd`` wraps the kernel body
 (``_flash_attention_kernel``) and returns the normalized output. It knows
 nothing about a mesh or a runtime: callers own the ``shard_map`` and the
 collectives around it.
@@ -30,6 +37,11 @@ import numpy as np
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+from vllm_torchtpu.kernels.diffusion_attention.block_sizes import (
+    autotune_block_sizes,
+    detect_spec,
+)
 
 DEFAULT_MASK_VALUE = -0.7 * float(np.finfo(np.dtype("float32")).max)
 NUM_SUBLANES = 8
@@ -90,6 +102,8 @@ def fixed_m_operands(
     """
     qn_max = max_row_norm_per_head(query_scaled, seq_axis=seq_axis)
     mk_h = max_row_norm_per_head(key, seq_axis=seq_axis)
+    # GQA: each query head takes the norm of the kv head it attends to.
+    mk_h = jnp.repeat(mk_h, qn_max.shape[0] // mk_h.shape[0])
     bound = qn_max * mk_h
     # Row 0 is the integral bound the kernel uses as m directly; integral
     # so exp2(m) is exact.
@@ -188,7 +202,7 @@ def _flash_attention_kernel(
     # constant index maps so they persist across the j sweep; the rest are
     # the real outputs.
     m_scratch_ref, l_scratch_ref, o_scratch_ref, *out_refs = refs
-    head_dim_v_repeats, rem = divmod(head_dim_v, NUM_SUBLANES)
+    _, rem = divmod(head_dim_v, NUM_SUBLANES)
     if rem != 0:
         raise NotImplementedError(
             f"{head_dim_v=} should be a multiple of {NUM_SUBLANES}"
@@ -337,10 +351,11 @@ def _flash_attention_kernel(
 
     @pl.when(j == grid_width - 1)
     def end():
-        # Normalize by l; repeat broadcasts the (1, bq) inverse up sublanes.
+        # Normalize by l; the (1, bq) inverse broadcasts up sublanes (every
+        # row of l holds the same sums).
         (o_ref,) = out_refs
         l = l_scratch_ref[...]
-        l_inv = pltpu.repeat(1.0 / l, head_dim_v_repeats, axis=0)
+        l_inv = 1.0 / l[0:1]
         o_ref[...] = (o_scratch_ref[...] * l_inv).astype(o_ref.dtype)
 
 
@@ -354,6 +369,7 @@ def _splash_attention_forward(
     q_seq_len: int | None = None,
     kv_seq_len: int | None = None,
     use_fixed_m: bool = False,
+    column_heads: tuple[int, int] | None = None,
 ):
     """Runs the fused splash kernel over ``(heads, seq, dim)`` q/k/v.
 
@@ -368,17 +384,26 @@ def _splash_attention_forward(
         q_seq_len, kv_seq_len: unpadded lengths (default to the padded
             shapes).
         use_fixed_m: hybrid fixed-m softmax (see the kernel docstring).
+        column_heads: ``(num_heads, num_kv_heads)`` when q/k/v are
+            ``(seq, heads * dim)`` instead: each head is a lane-aligned
+            column block, DMA'd in place with no transposes.
 
     Returns:
         The normalized output ``(num_heads, head_dim_v, seq_q)`` in
         ``q.dtype``.
     """
-    num_q_heads, padded_q_seq_len, head_dim_qk = q.shape
-    head_dim_v = v.shape[-1]
+    if column_heads is None:
+        num_q_heads, padded_q_seq_len, head_dim_qk = q.shape
+        head_dim_v = v.shape[-1]
+        num_kv_heads = k.shape[0]
+        padded_kv_seq_len = k.shape[1]
+    else:
+        num_q_heads, num_kv_heads = column_heads
+        padded_q_seq_len, padded_kv_seq_len = q.shape[0], k.shape[0]
+        head_dim_qk = q.shape[1] // num_q_heads
+        head_dim_v = v.shape[1] // num_kv_heads
     bq, bkv = block_sizes.block_q, block_sizes.block_kv
     bkv_compute = block_sizes.block_kv_compute
-    num_kv_heads = k.shape[0]
-    padded_kv_seq_len = k.shape[1]
     # Use original (unpadded) lengths for padding handling inside the kernel.
     actual_q_seq_len = q_seq_len if q_seq_len is not None else padded_q_seq_len
     actual_kv_seq_len = kv_seq_len if kv_seq_len is not None else padded_kv_seq_len
@@ -400,6 +425,19 @@ def _splash_attention_forward(
         pl.BlockSpec((None, bkv, head_dim_qk), kv_index_map),
         pl.BlockSpec((None, bkv, head_dim_v), kv_index_map),
     ]
+    if column_heads is not None:
+        # Head h is column block h of the (seq, heads * dim) operands.
+        def q_column_map(h, i, j, *_):
+            return (i, h)
+
+        def kv_column_map(h, i, j, *_):
+            return (j, h // q_heads_per_kv_head)
+
+        in_specs = [
+            pl.BlockSpec((bq, head_dim_qk), q_column_map),
+            pl.BlockSpec((bkv, head_dim_qk), kv_column_map),
+            pl.BlockSpec((bkv, head_dim_v), kv_column_map),
+        ]
     operands = [mk, q, k, v]
     # First three outputs are cross-j scratch (a single block reused per
     # head); the rest are the real per-head outputs. Normalized o keeps
@@ -483,54 +521,73 @@ def _local_blocks(
     )
 
 
-def attention(
+def flash_attention_bshd(
     query: jax.Array,
     key: jax.Array,
     value: jax.Array,
     *,
     scale: float | None,
-    block_q: int,
-    block_kv: int,
-    block_kv_compute: int,
-    use_fixed_m: bool = False,
+    use_fixed_m: bool = True,
 ) -> jax.Array:
     """Device-local custom splash attention, normalized.
 
     Args:
-      query: ``(B, heads, seq_q, dim)`` device-local.
-      key: ``(B, heads, seq_kv, dim)`` device-local.
-      value: ``(B, heads, seq_kv, dim)`` device-local.
+      query: ``(B, seq_q, heads, dim)`` device-local.
+      key: ``(B, seq_kv, kv_heads, dim)`` device-local; ``heads`` is a
+        multiple of ``kv_heads``.
+      value: ``(B, seq_kv, kv_heads, dim)`` device-local.
       scale: Softmax scale; ``None`` means ``1/sqrt(dim)``.
-      block_q: Query block rows (clamped to ``seq_q``).
-      block_kv: Key/value block rows (clamped to ``seq_kv``).
-      block_kv_compute: MXU compute sub-block over K/V (clamped).
-      use_fixed_m: Hybrid fixed-m softmax. The per-head eligibility gate is
-        ``FIXED_M_SAFE_BOUND`` over this call's Q and K, whose
-        no-flush guarantee presumes the caller k-smoothed ``key``.
+      use_fixed_m: Hybrid fixed-m softmax, used when K/V spans more than one
+        block. The per-head eligibility gate is ``FIXED_M_SAFE_BOUND`` over
+        this call's Q and K, whose no-flush guarantee presumes k-smoothed
+        keys, so ``key`` is mean-centred per head first (softmax-invariant).
 
     Returns:
-      ``(B, heads, seq_q, dim)`` in ``query``'s dtype.
+      ``(B, seq_q, heads, dim)`` in ``query``'s dtype.
     """
+    q_orig_len, num_heads, head_dim = query.shape[1:]
+    kv_orig_len, num_kv_heads, head_dim_v = value.shape[1:]
+    spec = detect_spec()
+    fixed_tiles = use_fixed_m and kv_orig_len > spec.safe_kv_block
+    bsizes = _local_blocks(
+        q_orig_len,
+        kv_orig_len,
+        **autotune_block_sizes(
+            q_orig_len,
+            head_dim,
+            2,
+            spec,
+            kv_orig_len,
+            "fixedm" if fixed_tiles else "online",
+        ),
+    )
+    use_fixed_m = use_fixed_m and kv_orig_len > bsizes.block_kv
     scale_factor = 1.0 / math.sqrt(query.shape[-1]) if scale is None else scale
-    # Fuse scale + log2(e) for exp2-based softmax
-    query = query * scale_factor * LOG2_E
-
-    # Per-head fixed-m operands over the local shard. Computed
-    # unconditionally; XLA drops it when unused.
-    mk_arr = fixed_m_operands(query, key, gate=FIXED_M_SAFE_BOUND)
+    # Fuse scale + log2(e) for exp2-based softmax, in f32 with one rounding
+    # to bf16 for the 2x MXU path (the kernel accumulates f32).
+    q = (query.astype(jnp.float32) * (scale_factor * LOG2_E)).astype(jnp.bfloat16)
+    v = value.astype(jnp.bfloat16)
+    if use_fixed_m:
+        # k-smoothing: mean-centring a head's keys shifts each score row by
+        # a constant (softmax-invariant) and makes every row max >= 0.
+        k32 = key.astype(jnp.float32)
+        k = (k32 - k32.mean(axis=1, keepdims=True)).astype(jnp.bfloat16)
+        mk_arr = fixed_m_operands(q, k, gate=FIXED_M_SAFE_BOUND, seq_axis=1)
+    else:
+        k = key.astype(jnp.bfloat16)
+        mk_arr = jnp.zeros((2, 1), jnp.float32)  # unused placeholder
+    if head_dim % 128 == 0 and head_dim_v % 128 == 0:
+        column_heads = (num_heads, num_kv_heads)
+        q, k, v = (x.reshape(*x.shape[:2], -1) for x in (q, k, v))
+    else:
+        column_heads = None
+        q, k, v = (jnp.swapaxes(x, 1, 2) for x in (q, k, v))
 
     def _kernel_3d(q_3d, k_3d, v_3d):
-        # vmap strips the batch axis: q_3d is (heads, seq, dim), shape[1]=seq.
-        q_orig_len = q_3d.shape[1]
-        kv_orig_len = k_3d.shape[1]
-        bsizes = _local_blocks(
-            q_orig_len, kv_orig_len, block_q, block_kv, block_kv_compute
-        )
-        # Q cast back to bf16 for the 2x MXU path (K/V already bf16; kernel
-        # accumulates f32). mk_arr is closed over, so it stays unmapped
-        # under the vmap — matching the kernel's (2, heads) prefetch operand.
-        out = _splash_attention_forward(
-            q_3d.astype(jnp.bfloat16),
+        # mk_arr is closed over, so it stays unmapped under the vmap —
+        # matching the kernel's (2, heads) prefetch operand.
+        return _splash_attention_forward(
+            q_3d,
             k_3d,
             v_3d,
             mk_arr,
@@ -538,9 +595,9 @@ def attention(
             q_seq_len=q_orig_len,
             kv_seq_len=kv_orig_len,
             use_fixed_m=use_fixed_m,
+            column_heads=column_heads,
         )
-        # Output is (heads, dim, seq) — transpose back to (heads, seq, dim)
-        out = jnp.swapaxes(out, 1, 2)
-        return out[:, :q_orig_len, ...]
 
-    return jax.vmap(_kernel_3d, in_axes=(0, 0, 0), out_axes=0)(query, key, value)
+    out = jax.vmap(_kernel_3d, in_axes=(0, 0, 0), out_axes=0)(q, k, v)
+    # Output is (B, heads, dim, seq) — transpose back to (B, seq, heads, dim).
+    return out.transpose(0, 3, 1, 2).astype(query.dtype)

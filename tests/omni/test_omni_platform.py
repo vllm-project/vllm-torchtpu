@@ -13,7 +13,12 @@ from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
 from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
 
 from vllm_torchtpu.omni import register_omni_tpu_platform
-from vllm_torchtpu.omni.attention import TpuSDPABackend, TpuSDPAImpl
+from vllm_torchtpu.omni.attention import (
+    TpuFlashAttentionBackend,
+    TpuFlashAttentionImpl,
+    TpuSDPABackend,
+    TpuSDPAImpl,
+)
 from vllm_torchtpu.omni.patches import (
     _patch_diffusion_startup_warmup_sync,
     apply_omni_model_specific_patches,
@@ -53,8 +58,13 @@ def test_platform_attributes():
     assert platform.supports_diffusion_dense_flash_attention() is False
     assert (
         platform.get_diffusion_attn_backend_cls(None, 64)
-        == "vllm_torchtpu.omni.attention.TpuSDPABackend"
+        == "vllm_torchtpu.omni.attention.TpuFlashAttentionBackend"
     )
+    for name in ("SDPA", "TPU_SDPA", "torch_sdpa"):
+        assert (
+            platform.get_diffusion_attn_backend_cls(name, 64)
+            == "vllm_torchtpu.omni.attention.TpuSDPABackend"
+        )
     with patch("torch.device") as mock_dev:
         platform.get_torch_device()
         mock_dev.assert_called_once_with("tpu")
@@ -115,6 +125,9 @@ def test_rope_patch_installed():
     torch.testing.assert_close(
         out_f32, rope.forward_native(x_f32, cos_f32, sin_f32), rtol=0, atol=0
     )
+def test_tpu_flash_attention_backend():
+    assert TpuFlashAttentionBackend.get_name() == "TPU_FLASH_ATTN"
+    assert TpuFlashAttentionBackend.get_impl_cls() is TpuFlashAttentionImpl
 
 
 def test_wan_ffn_gelu_fence(monkeypatch):

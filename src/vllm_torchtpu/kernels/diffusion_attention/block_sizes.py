@@ -6,6 +6,10 @@
 # Changes from the original:
 # - Removed pareto_block_q() and rank_block_candidates(), which are not used
 #   here.
+# - v7 fixed-m VMEM fraction 0.6, which caps block_q at 4096 for head_dim 128.
+# - block_kv is the whole K/V extent when that is shorter than
+#   safe_kv_block, and sequences up to one MXU tile use one
+#   full-extent block instead of raising.
 # pyrefly: ignore-errors
 
 """Dynamic, generation-portable block-size autotuner for splash attention.
@@ -73,7 +77,9 @@ _DEFAULT_USABLE_VMEM_FRACTION = 0.93
 # score tile must double-buffer to hide DMA -> fits <= VMEM/2 (fraction ~0.5).
 # Per-generation, sweep-pinned like safe_kv_block; no entry = normal fraction.
 _FIXED_M_KERNEL_MODES = frozenset({"fixedm", "residual-fixedm"})
-_FIXED_M_VMEM_FRACTION: dict[int, float] = {6: 0.5}
+# v7x: fixed-m measured fastest at block_q 3072-4096 at 32K and 75K tokens
+# (40 heads x 128); 0.6 caps block_q at 4096 for head_dim 128.
+_FIXED_M_VMEM_FRACTION: dict[int, float] = {6: 0.5, 7: 0.6}
 
 # Sweep-verified generations (no "uncalibrated" warning). v6e residual picks
 # match the model to <=0.4%; its only extra effect, the fixed-m DMA cliff, is
@@ -235,11 +241,6 @@ def detect_spec() -> TpuSpec:
     return spec
 
 
-def _round_down(value: int, multiple: int) -> int:
-    """Rounds value down to a non-zero multiple (never below ``multiple``)."""
-    return max((value // multiple) * multiple, multiple)
-
-
 def score_tile_bytes(
     block_q: int,
     block_kv_compute: int,
@@ -370,8 +371,8 @@ def _search_block_q(
         for bq in range(spec.mxu_dim, vmem_max + 1, spec.mxu_dim)
         if math.ceil(seq_len / bq) >= 2
     ]
-    if not candidates:  # seq < 2 * mxu_dim: single small block.
-        candidates = [min(vmem_max, _round_down(seq_len, spec.mxu_dim))]
+    if not candidates:  # seq <= mxu_dim: single full-extent block.
+        candidates = [seq_len]
     # Tie-break at equal model cost: prefer the LARGER block_q — the cost
     # already accounts for padding and per-cell overhead, and at equal
     # cost fewer, larger tiles mean fewer DMA issues (measured at the
@@ -416,17 +417,10 @@ def autotune_block_sizes(
 
     Returns:
       A mapping with block_q, block_kv and block_kv_compute.
-
-    Raises:
-      ValueError: If seq_len or kv_seq_len is smaller than the MXU dimension.
     """
     if spec is None:
         spec = detect_spec()
     kv_seq = kv_seq_len if kv_seq_len is not None else seq_len
-    if seq_len < spec.mxu_dim:
-        raise ValueError(f"seq_len {seq_len} must be >= MXU dim {spec.mxu_dim}.")
-    if kv_seq < spec.mxu_dim:
-        raise ValueError(f"kv_seq_len {kv_seq} must be >= MXU dim {spec.mxu_dim}.")
 
     # Measured calibration wins over the model (see _MEASURED_OVERRIDES).
     # Fallback chain: exact kernel mode, then the base residual-online
@@ -453,8 +447,9 @@ def autotune_block_sizes(
             )
 
     # K/V block and MXU compute tile: the whole cliff-safe block, clamped to
-    # the K/V extent (not the query extent — they differ under 2D CP).
-    block_kv = _round_down(min(spec.safe_kv_block, kv_seq), spec.mxu_dim)
+    # the K/V extent (not the query extent — they differ under 2D CP). A
+    # shorter K/V is one full-extent block, which is legal at any length.
+    block_kv = min(spec.safe_kv_block, kv_seq)
     block_kv_compute = block_kv
 
     # block_q: cost-model search over the VMEM-feasible range.
