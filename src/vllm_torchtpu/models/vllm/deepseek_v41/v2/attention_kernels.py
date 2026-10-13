@@ -1180,11 +1180,12 @@ def initialize_paged_attention():
         get_vllm_model_wrapper_context,
     )
 
+    # jax_op's type stub omits PartitionSpec and None for static arguments.
     _attention_op = pallas.jax_op(
         "pallas::dsv41v2_paged_bf16_attention",
         paged_attention_jax,
         mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(),) * 6 + (None, P()),
+        input_partition_specs=cast(Any, (P(),) * 6 + (None, P())),
     )
     _attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
@@ -1215,7 +1216,7 @@ def initialize_paged_attention():
         "pallas::dsv41v2_paged_bf16_attention_2bank",
         paged_attention_2bank,
         mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(),) * 8 + (None, P()),
+        input_partition_specs=cast(Any, (P(),) * 8 + (None, P())),
     )
     _attention_2bank_op.register_fake(lambda q, *args: q.new_empty(q.shape))
     mesh = get_vllm_model_wrapper_context().mesh
@@ -1234,7 +1235,7 @@ def initialize_paged_attention():
         "pallas::dsv41v2_gather_bf16_kv",
         gather_bf16_kv_jax,
         mesh=mesh,
-        input_partition_specs=(P(),) * 3 + (None,),
+        input_partition_specs=cast(Any, (P(),) * 3 + (None,)),
     )
     _gather_bf16_op.register_fake(
         lambda pool, pool_hi, records, dim: pool.new_empty(
@@ -1277,7 +1278,7 @@ def initialize_paged_attention():
         "pallas::dsv41v2_gather_fp8_kv",
         gather_fp8_bridge,
         mesh=tp_mesh,
-        input_partition_specs=(P(),) * 8 + (None,) * 3,
+        input_partition_specs=cast(Any, (P(),) * 8 + (None,) * 3),
     )
 
     def fake_gather_fp8(
@@ -1460,7 +1461,7 @@ def initialize_paged_attention():
         "pallas::dsv41v2_sparse_fp8_attention",
         fp8_attention,
         mesh=tp_mesh,
-        input_partition_specs=(P(),) * 11 + (None,) * 7 + (P(),) * 2,
+        input_partition_specs=cast(Any, (P(),) * 11 + (None,) * 7 + (P(),) * 2),
     )
     _fp8_attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
@@ -1516,7 +1517,7 @@ def initialize_paged_attention():
         "pallas::dsv41v2_sparse_fp8_attention_2bank",
         fp8_attention_2bank,
         mesh=tp_mesh,
-        input_partition_specs=(P(),) * 14 + (None,) * 7 + (P(),) * 2,
+        input_partition_specs=cast(Any, (P(),) * 14 + (None,) * 7 + (P(),) * 2),
     )
     _fp8_attention_2bank_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
@@ -1738,7 +1739,7 @@ def initialize_paged_attention():
         "pallas::dsv41v2_sparse_fp8_attention_qo",
         fp8_attention_qo,
         mesh=tp_mesh,
-        input_partition_specs=(P(),) * 23 + (None,) * 5 + (P(),) * 2,
+        input_partition_specs=cast(Any, (P(),) * 23 + (None,) * 5 + (P(),) * 2),
     )
     # [T, o_lora_rank]: positions is args[5], wo_a is args[17].
     _fp8_attention_qo_op.register_fake(
@@ -1817,7 +1818,7 @@ def initialize_paged_attention():
         "pallas::dsv41v2_sparse_fp8_attention_qo_2bank",
         fp8_attention_qo_2bank,
         mesh=tp_mesh,
-        input_partition_specs=(P(),) * 26 + (None,) * 5 + (P(),) * 2,
+        input_partition_specs=cast(Any, (P(),) * 26 + (None,) * 5 + (P(),) * 2),
     )
     # [T, o_lora_rank]: positions is args[5], wo_a is args[20].
     _fp8_attention_qo_2bank_op.register_fake(
