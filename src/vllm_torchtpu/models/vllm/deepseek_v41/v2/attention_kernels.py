@@ -1,7 +1,10 @@
 """Paged attention, exact index selection and index-cache publication."""
 
+import contextlib
+import dataclasses
 import functools
 import math
+from collections.abc import Iterator
 from typing import Any, cast
 
 import jax
@@ -34,6 +37,56 @@ _fp8_attention_op = None
 _fp8_attention_2bank_op = None
 _fp8_attention_qo_op = None
 _fp8_attention_qo_2bank_op = None
+_gather_bf16_op = None
+_gather_fp8_op = None
+_attention_tp_size = 1
+
+
+@dataclasses.dataclass
+class _GatheredKVCache:
+    """One live gather group; records are immutable within a forward stage."""
+
+    source: Any = None
+    records: torch.Tensor | None = None
+    layout: tuple = ()
+    values: tuple[torch.Tensor, torch.Tensor | None] | None = None
+
+    def get(
+        self, source: Any, records: torch.Tensor, layout: tuple
+    ) -> tuple[torch.Tensor, torch.Tensor | None] | None:
+        if self.source is source and self.records is records and self.layout == layout:
+            return self.values
+        return None
+
+    def put(
+        self,
+        source: Any,
+        records: torch.Tensor,
+        layout: tuple,
+        values: tuple[torch.Tensor, torch.Tensor | None],
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
+        self.source, self.records, self.layout, self.values = (
+            source,
+            records,
+            layout,
+            values,
+        )
+        return values
+
+
+_active_gathered_kv: _GatheredKVCache | None = None
+
+
+@contextlib.contextmanager
+def gathered_kv_cache_scope() -> Iterator[None]:
+    """Reuse KV payloads across layers, never across scheduler steps/stages."""
+    global _active_gathered_kv
+    previous = _active_gathered_kv
+    _active_gathered_kv = _GatheredKVCache()
+    try:
+        yield
+    finally:
+        _active_gathered_kv = previous
 
 
 def _attention_state(q):
@@ -45,7 +98,7 @@ def _attention_state(q):
     )
 
 
-def _attend(q, pool, records, state, scale, tile=64):
+def _attend(q, pool, records, state, scale, tile=64, gathered=None):
     """Online-softmax accumulate one record set into (max, denominator, numerator)."""
     tokens, _, dim = q.shape
     width = records.shape[1]
@@ -58,7 +111,8 @@ def _attend(q, pool, records, state, scale, tile=64):
     # pieces contracted in one dot; attention is invariant to a shared
     # permutation of the head dimension. Keep `pieces` on axis 0 (`pthd`) so
     # `(heads, 128)` stays on the minor tiled axes without sublane padding.
-    gathered = gather_cache_pieces(pool, records.reshape(-1), dim)
+    if gathered is None:
+        gathered = gather_cache_pieces(pool, records.reshape(-1), dim)
     count = gathered.shape[0]
     gathered = gathered.reshape(count, tokens, records.shape[1], -1)
 
@@ -272,6 +326,7 @@ def paged_attention_jax(
     main_records: jax.Array,
     sink: jax.Array,
     scale: float,
+    gathered: jax.Array | None = None,
 ) -> jax.Array:
     # SWA widths in the released model are multiples of 64, preserving the
     # reference's accumulation boundaries when compressed rows follow.
@@ -281,6 +336,7 @@ def paged_attention_jax(
         main_records,
         _attend_window(q, swa_pool, swa_records, _attention_state(q), scale),
         scale,
+        gathered=gathered,
     )
     denominator += jnp.exp(sink.astype(jnp.float32)[None] - maximum)
     return (numerator / denominator[..., None]).astype(q.dtype)
@@ -578,6 +634,58 @@ def _csa_gather_pool(
     return u_nope, u_rope
 
 
+def gather_sparse_kv_chunk(
+    cache_kv_nope: jax.Array | tuple[jax.Array, jax.Array],
+    cache_kv_rope: jax.Array | tuple[jax.Array, jax.Array],
+    chunk_records: jax.Array,
+    chunk_seq_ids: jax.Array,
+    page_indices: jax.Array,
+    *,
+    max_num_seqs: int,
+    start_pos: int,
+    batch_end: jax.Array,
+) -> tuple[jax.Array, jax.Array]:
+    """Gather packed selected KV, preserving SparseMLA's per-token RoPE layout."""
+    total_num_pages, page_size, _ = _paged_pool_shape(cache_kv_nope)
+    chunk_size, topk = chunk_records.shape
+    seq_page_ids = chunk_records // page_size
+    token_offset = chunk_records % page_size
+    if jax.default_backend() == "tpu":
+        from vllm_torchtpu.kernels.deepseek_v4.core_attention import sparse_mla
+
+        page_ids = sparse_mla.gather_page_ids(
+            page_indices,
+            seq_page_ids,
+            chunk_seq_ids,
+            max_num_seqs,
+            block_tokens=sparse_mla._largest_divisor(chunk_size, 8),
+        )
+    else:
+        page_table = page_indices.reshape(max_num_seqs, -1)
+        page_ids = page_table[chunk_seq_ids[:, None], jnp.clip(seq_page_ids, 0)]
+
+    is_padding = chunk_records == -1
+    flat_idx = start_pos * topk + jnp.arange(
+        chunk_size * topk, dtype=jnp.int32
+    ).reshape(chunk_size, topk)
+    scattered_page_ids = (flat_idx * 104729) % total_num_pages
+    scattered_token_offset = (flat_idx * 15485863) % page_size
+    page_ids = jnp.where(is_padding, scattered_page_ids, page_ids)
+    token_offset = jnp.where(is_padding, scattered_token_offset, token_offset)
+    direct_indices = (page_ids * page_size + token_offset).reshape(-1)
+    g_nope, g_rope = _csa_gather_pool(
+        cache_kv_nope,
+        cache_kv_rope,
+        direct_indices,
+        num_valid_indices=jnp.maximum(0, batch_end - start_pos) * topk,
+        top_k=topk,
+    )
+    return (
+        g_nope.reshape(chunk_size, topk, -1),
+        g_rope.reshape(chunk_size, topk // 4, -1),
+    )
+
+
 def gather_sparse_kv_chunk_with_union_fallback(
     cache_kv_nope: jax.Array | tuple[jax.Array, jax.Array],
     cache_kv_rope: jax.Array | tuple[jax.Array, jax.Array],
@@ -601,8 +709,6 @@ def gather_sparse_kv_chunk_with_union_fallback(
     union_cap``, ``jax.lax.cond`` falls back to direct ``[chunk_size, topk]``
     gather so that ``num_unique > union_cap`` never truncates KV rows.
     """
-    total_num_pages, page_size, _ = _paged_pool_shape(cache_kv_nope)
-    chunk_size = chunk_records.shape[0]
     union_cap = union_phys_chunk.shape[0]
     has_valid = batch_end > start_pos
 
@@ -624,41 +730,15 @@ def gather_sparse_kv_chunk_with_union_fallback(
         return remap_union_kv_to_chunk(u_nope, u_rope, inv_idx_chunk, topk)
 
     def _direct_branch(_: None) -> tuple[jax.Array, jax.Array]:
-        seq_page_ids = chunk_records // page_size
-        token_offset = chunk_records % page_size
-        if jax.default_backend() == "tpu":
-            from vllm_torchtpu.kernels.deepseek_v4.core_attention import sparse_mla
-
-            page_ids = sparse_mla.gather_page_ids(
-                page_indices,
-                seq_page_ids,
-                chunk_seq_ids,
-                max_num_seqs,
-                block_tokens=sparse_mla._largest_divisor(chunk_size, 8),
-            )
-        else:
-            page_table = page_indices.reshape(max_num_seqs, -1)
-            page_ids = page_table[chunk_seq_ids[:, None], jnp.clip(seq_page_ids, 0)]
-
-        is_padding = chunk_records == -1
-        flat_idx = start_pos * topk + jnp.arange(
-            chunk_size * topk, dtype=jnp.int32
-        ).reshape(chunk_size, topk)
-        scattered_page_ids = (flat_idx * 104729) % total_num_pages
-        scattered_token_offset = (flat_idx * 15485863) % page_size
-        page_ids = jnp.where(is_padding, scattered_page_ids, page_ids)
-        token_offset = jnp.where(is_padding, scattered_token_offset, token_offset)
-        direct_indices = (page_ids * page_size + token_offset).reshape(-1)
-        g_nope, g_rope = _csa_gather_pool(
+        return gather_sparse_kv_chunk(
             cache_kv_nope,
             cache_kv_rope,
-            direct_indices,
-            num_valid_indices=jnp.maximum(0, batch_end - start_pos) * topk,
-            top_k=topk,
-        )
-        return (
-            g_nope.reshape(chunk_size, topk, -1),
-            g_rope.reshape(chunk_size, topk // 4, -1),
+            chunk_records,
+            chunk_seq_ids,
+            page_indices,
+            max_num_seqs=max_num_seqs,
+            start_pos=start_pos,
+            batch_end=batch_end,
         )
 
     if not use_union:
@@ -689,6 +769,8 @@ def sparse_ragged_paged_attention_union_gather(
     attention_kernel_batch_size: int = 16,
     union_cap: int = 4096,
     union_gather: bool = True,
+    gathered_nope: jax.Array | None = None,
+    gathered_rope: jax.Array | None = None,
 ) -> jax.Array:
     """``sparse_ragged_paged_attention`` with per-chunk SparseCore Union Gather."""
     from jax.experimental import pallas as pl
@@ -711,6 +793,10 @@ def sparse_ragged_paged_attention_union_gather(
     total_num_pages, page_size, _ = _paged_pool_shape(cache_kv_nope)
     _, num_q_heads, _ = q.shape
     topk = topk_indices.shape[-1]
+    if gathered_nope is not None:
+        assert gathered_rope is not None
+        assert gathered_nope.shape == (q.shape[0], topk, ROW_WORDS)
+        assert gathered_rope.shape == (q.shape[0], topk // 4, ROW_WORDS)
     kv_lens = jnp.sum(topk_indices != -1, axis=-1)
     union_cap_aligned = max(topk, sparse_mla.align_to(union_cap, topk))
     max_num_seqs = cu_q_lens.shape[0] - 1
@@ -722,7 +808,7 @@ def sparse_ragged_paged_attention_union_gather(
     )
 
     num_chunks = sparse_mla.cdiv(q.shape[0], gather_and_attention_chunk_size)
-    if union_gather:
+    if union_gather and gathered_nope is None:
         union_phys, inv_idx_all, num_unique_all = compute_chunk_union_gather_indices(
             topk_indices,
             page_indices,
@@ -753,6 +839,16 @@ def sparse_ragged_paged_attention_union_gather(
             )
             * kbs
         )
+        if gathered_nope is not None:
+            assert gathered_rope is not None
+            return (
+                gathered_nope[start_pos:end_pos],
+                gathered_rope[start_pos:end_pos],
+                start_pos,
+                batch_end,
+                kbs,
+                chunk_size,
+            )
         gathered_nope_buffer, gathered_rope_buffer = (
             gather_sparse_kv_chunk_with_union_fallback(
                 cache_kv_nope,
@@ -887,6 +983,8 @@ def sparse_fp8_attention_jax(
     precompacted: bool = False,
     union_gather: bool = False,
     union_cap: int = 4096,
+    gathered_nope: jax.Array | None = None,
+    gathered_rope: jax.Array | None = None,
 ) -> jax.Array:
     """BF16 SWA partial merged into V4's sparse MLA over FP8 NoPE + RoPE rows.
 
@@ -929,7 +1027,7 @@ def sparse_fp8_attention_jax(
     )
     nope_3d = _reshape_paged_pool(main_pool, page_size)
     rope_3d = _reshape_paged_pool(rope_pool, page_size // 4)
-    if union_gather or isinstance(main_pool, tuple):
+    if gathered_nope is not None or union_gather or isinstance(main_pool, tuple):
         return sparse_ragged_paged_attention_union_gather(
             q,
             nope_3d,
@@ -945,6 +1043,8 @@ def sparse_fp8_attention_jax(
             sm_scale=scale,
             union_cap=union_cap,
             union_gather=union_gather,
+            gathered_nope=gathered_nope,
+            gathered_rope=gathered_rope,
         )
     assert not isinstance(nope_3d, tuple) and not isinstance(rope_3d, tuple)
     return sparse_ragged_paged_attention(
@@ -981,10 +1081,93 @@ def slice_token_parallel_attention_inputs(
     return swa_local, main_local, q_loc_local
 
 
+def gather_bf16_kv_jax(
+    pool: jax.Array,
+    pool_hi: jax.Array | None,
+    records: jax.Array,
+    dim: int,
+) -> jax.Array:
+    """Materialize the split BF16 pieces consumed by `_attend`."""
+    records = jnp.pad(
+        records, ((0, 0), (0, -records.shape[1] % 64)), constant_values=-1
+    )
+    return gather_cache_pieces(
+        pool if pool_hi is None else (pool, pool_hi), records.reshape(-1), dim
+    )
+
+
+def gather_fp8_kv_jax(
+    pool: jax.Array,
+    pool_hi: jax.Array | None,
+    rope: jax.Array,
+    rope_hi: jax.Array | None,
+    records: jax.Array,
+    pages: jax.Array,
+    starts: jax.Array,
+    rank: jax.Array,
+    page_size: int,
+    shards: int,
+    precompacted: bool,
+) -> tuple[jax.Array, jax.Array]:
+    """Gather once per source/index group, retaining packed FP8 and BF16 RoPE."""
+    if shards > 1:
+        tokens = records.shape[0] // shards
+        start = rank.reshape(()) * tokens
+        records = jax.lax.dynamic_slice_in_dim(records, start, tokens, axis=0)
+        starts = jnp.clip(starts - start, 0, tokens)
+        records = jnp.pad(records, ((0, -tokens % 8), (0, 0)), constant_values=-1)
+    compacted = (
+        _pad_compacted_records(records) if precompacted else compact_records(records)
+    )
+    nope_pool = _reshape_paged_pool(
+        pool if pool_hi is None else (pool, pool_hi), page_size
+    )
+    rope_pool = _reshape_paged_pool(
+        rope if rope_hi is None else (rope, rope_hi), page_size // 4
+    )
+    seq_ids = jnp.repeat(
+        jnp.arange(pages.shape[0], dtype=jnp.int32),
+        starts[1:] - starts[:-1],
+        total_repeat_length=compacted.shape[0],
+    )
+    return gather_sparse_kv_chunk(
+        nope_pool,
+        rope_pool,
+        compacted,
+        seq_ids,
+        pages.reshape(-1),
+        max_num_seqs=pages.shape[0],
+        start_pos=0,
+        batch_end=starts[-1],
+    )
+
+
+def _fp8_query_shards(
+    tokens: int, tp_size: int, token_parallel: bool, local_tokens: int | None = None
+) -> int:
+    """Use the same query partition for the gather and attention bridges."""
+    if local_tokens is not None:
+        use_shards = (
+            tp_size > 1
+            and tokens >= 128 * tp_size
+            and tokens % (128 * tp_size) == 0
+            and local_tokens * tp_size == tokens
+        )
+    else:
+        use_shards = (
+            token_parallel
+            and tp_size > 1
+            and tokens >= 6 * tp_size
+            and tokens % tp_size == 0
+        )
+    return tp_size if use_shards else 1
+
+
 def initialize_paged_attention():
     global _attention_op, _attention_2bank_op
     global _fp8_attention_op, _fp8_attention_2bank_op
     global _fp8_attention_qo_op, _fp8_attention_qo_2bank_op
+    global _gather_bf16_op, _gather_fp8_op, _attention_tp_size
     if _attention_op is not None:
         return
     from jax.sharding import PartitionSpec as P
@@ -999,7 +1182,7 @@ def initialize_paged_attention():
         "pallas::dsv41v2_paged_bf16_attention",
         paged_attention_jax,
         mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(), P(), P(), P(), P(), P(), None),
+        input_partition_specs=(P(),) * 6 + (None, P()),
     )
     _attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
@@ -1013,6 +1196,7 @@ def initialize_paged_attention():
         main_records: jax.Array,
         sink: jax.Array,
         scale: float,
+        gathered: jax.Array | None = None,
     ) -> jax.Array:
         return paged_attention_jax(
             q,
@@ -1022,13 +1206,14 @@ def initialize_paged_attention():
             main_records,
             sink,
             scale,
+            gathered,
         )
 
     _attention_2bank_op = pallas.jax_op(
         "pallas::dsv41v2_paged_bf16_attention_2bank",
         paged_attention_2bank,
         mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(),) * 8 + (None,),
+        input_partition_specs=(P(),) * 8 + (None, P()),
     )
     _attention_2bank_op.register_fake(lambda q, *args: q.new_empty(q.shape))
     mesh = get_vllm_model_wrapper_context().mesh
@@ -1042,7 +1227,82 @@ def initialize_paged_attention():
         tp_mesh = pallas.get_pallas_mesh(axis_names=("tp",), process_group=tp_group)
     else:
         tp_mesh = mesh
-    in_specs = (P(),) * 11
+    _attention_tp_size = tp_size
+    _gather_bf16_op = pallas.jax_op(
+        "pallas::dsv41v2_gather_bf16_kv",
+        gather_bf16_kv_jax,
+        mesh=mesh,
+        input_partition_specs=(P(),) * 3 + (None,),
+    )
+    _gather_bf16_op.register_fake(
+        lambda pool, pool_hi, records, dim: pool.new_empty(
+            (
+                max(2, dim // 128),
+                records.shape[0] * (-(-records.shape[1] // 64) * 64),
+                min(128, dim // 2),
+            ),
+            dtype=torch.bfloat16,
+        )
+    )
+
+    def gather_fp8_bridge(
+        pool: jax.Array,
+        pool_hi: jax.Array | None,
+        rope: jax.Array,
+        rope_hi: jax.Array | None,
+        records: jax.Array,
+        pages: jax.Array,
+        starts: jax.Array,
+        rank: jax.Array,
+        page_size: int,
+        shards: int,
+        precompacted: bool,
+    ) -> tuple[jax.Array, jax.Array]:
+        return jax.shard_map(
+            functools.partial(
+                gather_fp8_kv_jax,
+                page_size=page_size,
+                shards=shards,
+                precompacted=precompacted,
+            ),
+            mesh=tp_mesh,
+            in_specs=(P(),) * 8,
+            out_specs=(P(), P()),
+            check_vma=False,
+        )(pool, pool_hi, rope, rope_hi, records, pages, starts, rank)
+
+    _gather_fp8_op = pallas.jax_op(
+        "pallas::dsv41v2_gather_fp8_kv",
+        gather_fp8_bridge,
+        mesh=tp_mesh,
+        input_partition_specs=(P(),) * 8 + (None,) * 3,
+    )
+
+    def fake_gather_fp8(
+        pool,
+        pool_hi,
+        rope,
+        rope_hi,
+        records,
+        pages,
+        starts,
+        rank,
+        page_size,
+        shards,
+        precompacted,
+    ):
+        tokens = (
+            records.shape[0]
+            if shards == 1
+            else -(-(records.shape[0] // shards) // 8) * 8
+        )
+        topk = max(128, -(-records.shape[1] // 128) * 128)
+        return pool.new_empty((tokens, topk, ROW_WORDS)), rope.new_empty(
+            (tokens, topk // 4, ROW_WORDS)
+        )
+
+    _gather_fp8_op.register_fake(fake_gather_fp8)
+    in_specs = (P(),) * 13
     out_spec = P()
 
     def fp8_attention(
@@ -1064,21 +1324,18 @@ def initialize_paged_attention():
         token_parallel: bool,
         union_gather: bool,
         union_cap: int,
+        gathered_nope: jax.Array | None = None,
+        gathered_rope: jax.Array | None = None,
     ) -> jax.Array:
         tokens = q.shape[0]
-        use_token_parallel = (
-            token_parallel
-            and tp_size > 1
-            and tokens >= 6 * tp_size
-            and tokens % tp_size == 0
-        )
+        use_token_parallel = _fp8_query_shards(tokens, tp_size, token_parallel) > 1
         if use_token_parallel:
             tokens_local = tokens // tp_size
             padded_local = -(-tokens_local // 8) * 8
             pad_rows = padded_local - tokens_local
 
             def _token_parallel_body(
-                q_l, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, _snk, f_snk, r_id
+                q_l, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, _snk, f_snk, r_id, g_n, g_r
             ):
                 q_tok = jax.lax.all_to_all(
                     q_l, axis_name="tp", split_axis=0, concat_axis=1, tiled=True
@@ -1110,6 +1367,8 @@ def initialize_paged_attention():
                     precompacted=precompacted,
                     union_gather=union_gather,
                     union_cap=union_cap,
+                    gathered_nope=g_n,
+                    gathered_rope=g_r,
                 )
                 if pad_rows:
                     out_tok = out_tok[:-pad_rows]
@@ -1135,12 +1394,26 @@ def initialize_paged_attention():
                 sink,
                 full_sink,
                 tp_rank,
+                gathered_nope,
+                gathered_rope,
             )
 
         # Mosaic calls require explicit manual partitioning on a multi-device
         # mesh; each device attends over its own replicated cache.
         return jax.shard_map(
-            lambda q_l, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, snk, _f_snk, _r_id: (
+            lambda q_l,
+            s_p,
+            m_p,
+            r_p,
+            s_r,
+            m_r,
+            pgs,
+            q_loc,
+            snk,
+            _f_snk,
+            _r_id,
+            g_n,
+            g_r: (
                 sparse_fp8_attention_jax(
                     q_l,
                     s_p,
@@ -1157,6 +1430,8 @@ def initialize_paged_attention():
                     precompacted=precompacted,
                     union_gather=union_gather,
                     union_cap=union_cap,
+                    gathered_nope=g_n,
+                    gathered_rope=g_r,
                 )
             ),
             mesh=tp_mesh,
@@ -1175,13 +1450,15 @@ def initialize_paged_attention():
             sink,
             full_sink,
             tp_rank,
+            gathered_nope,
+            gathered_rope,
         )
 
     _fp8_attention_op = pallas.jax_op(
         "pallas::dsv41v2_sparse_fp8_attention",
         fp8_attention,
         mesh=tp_mesh,
-        input_partition_specs=in_specs + (None,) * 7,
+        input_partition_specs=(P(),) * 11 + (None,) * 7 + (P(),) * 2,
     )
     _fp8_attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
@@ -1207,6 +1484,8 @@ def initialize_paged_attention():
         token_parallel: bool,
         union_gather: bool,
         union_cap: int,
+        gathered_nope: jax.Array | None = None,
+        gathered_rope: jax.Array | None = None,
     ) -> jax.Array:
         return fp8_attention(
             q,
@@ -1227,13 +1506,15 @@ def initialize_paged_attention():
             token_parallel,
             union_gather,
             union_cap,
+            gathered_nope,
+            gathered_rope,
         )
 
     _fp8_attention_2bank_op = pallas.jax_op(
         "pallas::dsv41v2_sparse_fp8_attention_2bank",
         fp8_attention_2bank,
         mesh=tp_mesh,
-        input_partition_specs=(P(),) * 14 + (None,) * 7,
+        input_partition_specs=(P(),) * 14 + (None,) * 7 + (P(),) * 2,
     )
     _fp8_attention_2bank_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
@@ -1266,6 +1547,8 @@ def initialize_paged_attention():
         max_requests: int | None,
         precompacted: bool,
         head_dim: int,
+        gathered_nope: jax.Array | None = None,
+        gathered_rope: jax.Array | None = None,
     ) -> jax.Array:
         """q projection + RoPE, sparse FP8 attention and inverse-RoPE ``wo_a``.
 
@@ -1294,12 +1577,7 @@ def initialize_paged_attention():
             max_requests=max_requests,
             precompacted=precompacted,
         )
-        if (
-            tp_size > 1
-            and tokens >= 128 * tp_size
-            and tokens % (128 * tp_size) == 0
-            and tokens_local * tp_size == tokens
-        ):
+        if _fp8_query_shards(tokens, tp_size, True, tokens_local) > 1:
 
             def _local_body(
                 q_in,
@@ -1319,6 +1597,8 @@ def initialize_paged_attention():
                 w,
                 ws,
                 ok,
+                g_n,
+                g_r,
             ):
                 s_r_tok, m_r_tok, q_loc_tok = slice_token_parallel_attention_inputs(
                     s_r, m_r, q_loc, r_id, tp_size, tokens
@@ -1341,6 +1621,8 @@ def initialize_paged_attention():
                     q_loc_tok,
                     f_snk,
                     **attn_kwargs,
+                    gathered_nope=g_n,
+                    gathered_rope=g_r,
                 )
                 out_tok = jnp.where(
                     ok_tok[:, None, None] != 0, out_tok, jnp.zeros((), out_tok.dtype)
@@ -1355,7 +1637,7 @@ def initialize_paged_attention():
             return jax.shard_map(
                 _local_body,
                 mesh=tp_mesh,
-                in_specs=(P(),) * 17,
+                in_specs=(P(),) * 19,
                 out_specs=out_spec,
                 check_vma=False,
             )(
@@ -1376,10 +1658,29 @@ def initialize_paged_attention():
                 wo_a_full,
                 wo_a_full_scale,
                 valid,
+                gathered_nope,
+                gathered_rope,
             )
 
         def _sharded_body(
-            q_in, wq, wqs, pos, cs, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, snk, w, ws, ok
+            q_in,
+            wq,
+            wqs,
+            pos,
+            cs,
+            s_p,
+            m_p,
+            r_p,
+            s_r,
+            m_r,
+            pgs,
+            q_loc,
+            snk,
+            w,
+            ws,
+            ok,
+            g_n,
+            g_r,
         ):
             if tp_size > 1 and q_in.shape[0] < tokens:
                 q_in = jax.lax.all_gather(q_in, axis_name="tp", axis=0, tiled=True)[
@@ -1388,7 +1689,18 @@ def initialize_paged_attention():
             q = _quantized_matmul_jax(q_in, wq, wqs)
             q = _rope_jax(q.reshape(tokens, -1, head_dim), pos, cs)
             out = sparse_fp8_attention_jax(
-                q, s_p, m_p, r_p, s_r, m_r, pgs, q_loc, snk, **attn_kwargs
+                q,
+                s_p,
+                m_p,
+                r_p,
+                s_r,
+                m_r,
+                pgs,
+                q_loc,
+                snk,
+                **attn_kwargs,
+                gathered_nope=g_n,
+                gathered_rope=g_r,
             )
             out = jnp.where(ok[:, None, None] != 0, out, jnp.zeros((), out.dtype))
             return _o_proj_jax(out, pos, cs, w, ws, head_dim=head_dim)
@@ -1396,7 +1708,7 @@ def initialize_paged_attention():
         return jax.shard_map(
             _sharded_body,
             mesh=tp_mesh,
-            in_specs=(P(),) * 16,
+            in_specs=(P(),) * 18,
             out_specs=out_spec,
             check_vma=False,
         )(
@@ -1416,13 +1728,15 @@ def initialize_paged_attention():
             wo_a,
             wo_a_scale,
             valid,
+            gathered_nope,
+            gathered_rope,
         )
 
     _fp8_attention_qo_op = pallas.jax_op(
         "pallas::dsv41v2_sparse_fp8_attention_qo",
         fp8_attention_qo,
         mesh=tp_mesh,
-        input_partition_specs=(P(),) * 23 + (None,) * 5,
+        input_partition_specs=(P(),) * 23 + (None,) * 5 + (P(),) * 2,
     )
     # [T, o_lora_rank]: positions is args[5], wo_a is args[17].
     _fp8_attention_qo_op.register_fake(
@@ -1461,6 +1775,8 @@ def initialize_paged_attention():
         max_requests: int | None,
         precompacted: bool,
         head_dim: int,
+        gathered_nope: jax.Array | None = None,
+        gathered_rope: jax.Array | None = None,
     ) -> jax.Array:
         return fp8_attention_qo(
             qr,
@@ -1491,13 +1807,15 @@ def initialize_paged_attention():
             max_requests,
             precompacted,
             head_dim,
+            gathered_nope,
+            gathered_rope,
         )
 
     _fp8_attention_qo_2bank_op = pallas.jax_op(
         "pallas::dsv41v2_sparse_fp8_attention_qo_2bank",
         fp8_attention_qo_2bank,
         mesh=tp_mesh,
-        input_partition_specs=(P(),) * 26 + (None,) * 5,
+        input_partition_specs=(P(),) * 26 + (None,) * 5 + (P(),) * 2,
     )
     # [T, o_lora_rank]: positions is args[5], wo_a is args[20].
     _fp8_attention_qo_2bank_op.register_fake(
@@ -1522,6 +1840,33 @@ def _resolve_fp8_pages(main, main_records, tokens):
         ).unsqueeze(0)
     starts = main_records.new_tensor([0, tokens])
     return page_size, pages, starts
+
+
+def _gather_fp8_for_stage(
+    main, records, pages, starts, rank, page_size, shards, precompacted
+):
+    cache = _active_gathered_kv
+    if cache is None:
+        return None, None
+    layout = ("fp8", page_size, shards, precompacted)
+    values = cache.get(main, records, layout)
+    if values is not None:
+        return values
+    assert _gather_fp8_op is not None
+    values = _gather_fp8_op(
+        main.raw,
+        main.raw_hi,
+        main.rope,
+        main.rope_hi,
+        records.int(),
+        pages.int(),
+        starts.int(),
+        rank.reshape(1).int(),
+        page_size,
+        shards,
+        precompacted,
+    )
+    return cache.put(main, records, layout, values)
 
 
 def sparse_fp8_attention_qo(
@@ -1559,6 +1904,11 @@ def sparse_fp8_attention_qo(
         page_size, pages, starts = _resolve_fp8_pages(
             main, main_records, positions.shape[0]
         )
+    tokens = positions.shape[0]
+    shards = _fp8_query_shards(tokens, _attention_tp_size, True, qr_local.shape[0])
+    gathered = _gather_fp8_for_stage(
+        main, main_records, pages, starts, tp_rank, page_size, shards, precompacted
+    )
     tail_args = (
         swa_records.int(),
         main_records.int(),
@@ -1577,6 +1927,7 @@ def sparse_fp8_attention_qo(
         max_requests,
         precompacted,
         head_dim,
+        *gathered,
     )
     if _has_hi_bank(main):
         assert (
@@ -1618,6 +1969,25 @@ def sparse_fp8_attention_qo(
 
 
 def paged_attention(q, swa, main, swa_records, main_records, sink, scale):
+    gathered = None
+    cache = _active_gathered_kv
+    if cache is not None and main_records.shape[1]:
+        layout = ("bf16", q.shape[-1])
+        values = cache.get(main, main_records, layout)
+        if values is None:
+            assert _gather_bf16_op is not None
+            values = cache.put(
+                main,
+                main_records,
+                layout,
+                (
+                    _gather_bf16_op(
+                        main.raw, main.raw_hi, main_records.int(), q.shape[-1]
+                    ),
+                    None,
+                ),
+            )
+        gathered = values[0]
     if _has_hi_bank(main):
         assert _attention_2bank_op is not None and swa.raw_hi is not None
         return _attention_2bank_op(
@@ -1630,10 +2000,18 @@ def paged_attention(q, swa, main, swa_records, main_records, sink, scale):
             main_records.int(),
             sink,
             scale,
+            gathered,
         )
     assert _attention_op is not None
     return _attention_op(
-        q, swa.raw, main.raw, swa_records.int(), main_records.int(), sink, scale
+        q,
+        swa.raw,
+        main.raw,
+        swa_records.int(),
+        main_records.int(),
+        sink,
+        scale,
+        gathered,
     )
 
 
@@ -1666,6 +2044,11 @@ def sparse_fp8_attention(
         tp_rank = main_records.new_zeros((1,), dtype=torch.int32)
     else:
         tp_rank = tp_rank.reshape(1).int()
+    tokens = q.shape[0]
+    shards = _fp8_query_shards(tokens, _attention_tp_size, token_parallel)
+    gathered = _gather_fp8_for_stage(
+        main, main_records, pages, starts, tp_rank, page_size, shards, precompacted
+    )
     tail_args = (
         swa_records.int(),
         main_records.int(),
@@ -1681,6 +2064,7 @@ def sparse_fp8_attention(
         token_parallel,
         union_gather,
         union_cap,
+        *gathered,
     )
     if _has_hi_bank(main):
         assert (

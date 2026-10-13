@@ -23,6 +23,7 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
 
 from .attention_kernels import (
+    gathered_kv_cache_scope,
     paged_attention,
     paged_indexer,
     sparse_fp8_attention,
@@ -37,12 +38,13 @@ _active_stage_attn_cache: dict[Any, Any] | None = None
 
 @contextlib.contextmanager
 def stage_attention_cache_scope():
-    """Share stage-invariant SWA and compressed-KV addressing across layers."""
+    """Share addressing and selected global KV payloads across stage layers."""
     global _active_stage_attn_cache
     prev = _active_stage_attn_cache
     _active_stage_attn_cache = {}
     try:
-        yield
+        with gathered_kv_cache_scope():
+            yield
     finally:
         _active_stage_attn_cache = prev
 
