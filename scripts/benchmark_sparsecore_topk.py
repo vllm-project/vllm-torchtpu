@@ -28,10 +28,10 @@ width a kernel reads is what separates versions. A case is one engine step's
 batch, tokens padded to the next power of two from 16. Scores are standard
 normal, which the selection cost depends on only weakly.
 
-`--kernel NAME=PATH` loads a standalone copy of `sparsecore_topk.py` (see
-Usage), so versions run side by side on the same inputs; without it
-the checkout's kernel runs alone. Every version's indices must equal the first
-version's as sets per row (`check`).
+`--kernel NAME=SRC` loads `sparsecore_topk.py` from SRC, a file or a git ref
+such as `origin/main`, so versions run side by side on the same inputs; without
+it the checkout's kernel runs alone. Every version's indices must equal the
+first version's as sets per row (`check`).
 
 `local us` and `merge us` are per-call slopes `(t(1 + n) - t(1)) / n` of calls
 chained in one `fori_loop` through the row lengths, so host dispatch cancels.
@@ -46,10 +46,8 @@ which they do unless `max_model_len / dcp_size` equals `dcp_size * k`.
 Usage:
   python scripts/benchmark_sparsecore_topk.py
   python scripts/benchmark_sparsecore_topk.py --list
-  git show origin/main:src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py \\
-      > /tmp/main.py
   python scripts/benchmark_sparsecore_topk.py --cases prefill,mixed \\
-      --kernel main=/tmp/main.py \\
+      --kernel main=origin/main \\
       --kernel branch=src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py \\
       --device-time --json results.jsonl
 """
@@ -64,6 +62,7 @@ import json
 import os
 import re
 import shutil
+import subprocess
 import sys
 import tempfile
 import time
@@ -86,6 +85,7 @@ _MIN_NUM_SEQS = 8
 _NEVER = -12345
 _TARGET_SECONDS, _MIN_EXTRA_CALLS, _MAX_EXTRA_CALLS, _REPEATS = 0.2, 4, 200, 5
 _XPROF_CALLS = 10
+_KERNEL_PATH = "src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py"
 
 
 @dataclasses.dataclass(frozen=True)
@@ -215,16 +215,41 @@ def _step(case: Case, args: argparse.Namespace) -> Step:
     return Step(bucket, chunk_len, np.asarray(row_lengths), width)
 
 
+def _kernel_source(name: str, src: str) -> str:
+    """`sparsecore_topk.py`'s source from a file, or else from a git ref."""
+    if os.path.isfile(src):
+        with open(src) as f:
+            return f.read()
+    repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    result = subprocess.run(
+        ["git", "show", f"{src}:{_KERNEL_PATH}"],
+        cwd=repo,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        sys.exit(
+            f"--kernel {name}={src}: not a file, and git show {src}:{_KERNEL_PATH}"
+            f" failed: {result.stderr.strip()}"
+        )
+    return result.stdout
+
+
 def _load_kernels(specs: list[str]) -> dict:
     if not specs:
         return {"checkout": checkout_kernel}
     kernels = {}
     for spec in specs:
-        name, _, path = spec.partition("=")
-        module_spec = importlib.util.spec_from_file_location(f"_sc_topk_{name}", path)
-        module = importlib.util.module_from_spec(module_spec)
-        sys.modules[module_spec.name] = module
-        module_spec.loader.exec_module(module)
+        name, _, src = spec.partition("=")
+        with tempfile.NamedTemporaryFile("w", suffix=".py") as f:
+            f.write(_kernel_source(name, src))
+            f.flush()
+            module_spec = importlib.util.spec_from_file_location(
+                f"_sc_topk_{name}", f.name
+            )
+            module = importlib.util.module_from_spec(module_spec)
+            sys.modules[module_spec.name] = module
+            module_spec.loader.exec_module(module)
         kernels[name] = module
     return kernels
 
@@ -376,7 +401,10 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--cases", default="", help="comma-separated name substrings")
     parser.add_argument("--list", action="store_true", help="list the cases and exit")
     parser.add_argument(
-        "--kernel", action="append", default=[], help="NAME=PATH, repeatable"
+        "--kernel",
+        action="append",
+        default=[],
+        help="NAME=PATH or NAME=GIT_REF, repeatable",
     )
     parser.add_argument("--page-size", type=int, default=256)
     parser.add_argument("--dcp-size", type=int, default=16)
