@@ -83,17 +83,6 @@ DP_ADDRESS="${hosts[0]}"
 echo "--- ${role} host ${INDEX}/${NUM_HOSTS}: data-parallel address ${DP_ADDRESS}," \
   "advertise hosts ${TPU_RAIDEN_ADVERTISE_HOST}"
 
-# Best effort, as k3_1p1d.sh: index 0's API server imports the model's remote
-# code before any worker exists; elsewhere the workers would race to write it.
-# The subshell keeps that config's variables out of this script.
-if [[ "$INDEX" != "0" ]]; then
-  # shellcheck source=/dev/null
-  uri=$(source scripts/vllm/benchmarking/configs/kimi-k3-tp32-ep.sh >/dev/null \
-    && echo "$MODEL_URI") \
-    && timeout 600 python3 "$HERE/warm_remote_code.py" "$uri" \
-    || echo "WARNING: could not warm the model's remote code"
-fi
-
 # The serve flags and the Raiden environment of this role, over the defaults
 # run_benchmarks.sh applies before sourcing a config.
 # K3_1P1D_ENGINE tells a config that also serves the AgentX client that this
@@ -175,6 +164,20 @@ if [[ "${K3_1P1D_DRY_RUN:-0}" == "1" ]]; then
     env | grep -E '^(TPU_|VLLM_|K3_)' | sort
   fi
   exit 0
+fi
+
+# Best effort, as k3_1p1d.sh: index 0's API server imports the model's remote
+# code before any worker exists; elsewhere the workers would race to write it.
+# The subshell keeps that config's variables out of this script. Not for an
+# --nnodes config: it serves the checkpoint from local files with the Hub
+# offline and its own HF modules cache, so this would fill a cache it never
+# reads.
+if [[ "$INDEX" != "0" && "$K3_1P1D_LAUNCH" == "dp" ]]; then
+  # shellcheck source=/dev/null
+  uri=$(source scripts/vllm/benchmarking/configs/kimi-k3-tp32-ep.sh >/dev/null \
+    && echo "$MODEL_URI") \
+    && timeout 600 python3 "$HERE/warm_remote_code.py" "$uri" \
+    || echo "WARNING: could not warm the model's remote code"
 fi
 
 if [[ "$K3_1P1D_LAUNCH" == "nnodes" ]]; then
