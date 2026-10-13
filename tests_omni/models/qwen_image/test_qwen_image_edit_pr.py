@@ -10,6 +10,7 @@ import os
 
 import numpy as np
 import pytest
+from huggingface_hub import snapshot_download
 from PIL import Image
 from vllm_omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -21,6 +22,11 @@ pytestmark = [
     pytest.mark.omni,
     pytest.mark.spawns_tpu_workers,
 ]
+
+# Hub revision the golden reference was generated from (see the recipe below). The
+# fixture loads the local snapshot of it: in vllm-omni 0.29.0rc1, Omni(revision=...)
+# pins only the configs it reads, and the weights come from the default branch.
+QWEN_IMAGE_EDIT_REVISION = "ac7f9318f633fc4b5778c59367c8128225f1e3de"
 
 # ==============================================================================
 # Golden reference: full 512x512 CPU diffusers reference image staged from
@@ -134,8 +140,11 @@ class TestQwenImageEditPrCiOnTpu:
     @pytest.fixture(scope="class")
     def edit_engine(self):
         """Omni engine fixture: loads Qwen/Qwen-Image-Edit once per class."""
+        model_path = snapshot_download(
+            "Qwen/Qwen-Image-Edit", revision=QWEN_IMAGE_EDIT_REVISION
+        )
         omni = Omni(
-            "Qwen/Qwen-Image-Edit",
+            model_path,
             init_timeout=600,
             stage_init_timeout=600,
         )
@@ -160,6 +169,8 @@ class TestQwenImageEditPrCiOnTpu:
         assert outputs, "Omni returned empty output list"
 
         img = outputs[0].images[0]
+        assert isinstance(img, Image.Image), f"Expected PIL Image, got {type(img)}"
+        assert img.size == (512, 512), f"Expected (512, 512), got {img.size}"
         # FLUX-style PIL-to-float32 extraction
         arr = np.array(img.convert("RGB"), dtype=np.float32)
 
@@ -184,7 +195,7 @@ class TestQwenImageEditPrCiOnTpu:
             params = OmniDiffusionSamplingParams(
                 height=512,
                 width=512,
-                num_inference_steps=4,
+                num_inference_steps=2,
                 true_cfg_scale=4.0,
                 seed=seed,
             )

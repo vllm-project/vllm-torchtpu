@@ -11,6 +11,7 @@ import os
 
 import numpy as np
 import pytest
+from huggingface_hub import snapshot_download
 from PIL import Image
 from vllm_omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
@@ -23,6 +24,15 @@ pytestmark = [
     pytest.mark.omni,
     pytest.mark.spawns_tpu_workers,
 ]
+
+# Hub revisions of the models under test. Omni gets the local snapshot of each:
+# in vllm-omni 0.29.0rc1, Omni(revision=...) pins only the configs it reads, and
+# the weights come from the default branch.
+MODEL_REVISIONS = {
+    "Qwen/Qwen-Image-Edit": "ac7f9318f633fc4b5778c59367c8128225f1e3de",
+    "Qwen/Qwen-Image-Edit-2511": "6f3ccc0b56e431dc6a0c2b2039706d7d26f22cb9",
+    "Qwen/Qwen-Image": "75e0b4be04f60ec59a75f475837eced720f823b6",
+}
 
 # ==============================================================================
 # Pixel statistics on TPU v7x, torch_tpu ...release.2026.9.22 (CI pin),
@@ -110,7 +120,8 @@ class TestQwenImageNightlyOnTpu:
         """Validate common path execution across the three Qwen variants on TPU v7x."""
         input_image = _load_input_image()
 
-        omni = Omni(model_id, init_timeout=600, stage_init_timeout=600)
+        model_path = snapshot_download(model_id, revision=MODEL_REVISIONS[model_id])
+        omni = Omni(model_path, init_timeout=600, stage_init_timeout=600)
         try:
             if mode == "edit":
                 prompt = "Change the latte art into a red heart"
