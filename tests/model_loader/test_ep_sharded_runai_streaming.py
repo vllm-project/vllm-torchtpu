@@ -202,11 +202,11 @@ def test_request_plan_groups_contiguous_kept_runs():
         )
 
     requests = captured["requests"]
-    assert [(r.offset, r.chunks) for r in requests] == [
-        (1000, [10, 2]),  # expert 0's contiguous run
-        (1024, [7]),  # dense weight after the skipped gap
+    assert [(r.offsets, r.sizes) for r in requests] == [
+        ([1000, 1010], [10, 2]),  # expert 0's contiguous run
+        ([1024], [7]),  # dense weight after the skipped gap
     ]
-    total_requested = sum(sum(r.chunks) for r in requests)
+    total_requested = sum(sum(r.sizes) for r in requests)
     assert total_requested == 19  # 31 bytes in file, 12 skipped
 
 
@@ -273,7 +273,7 @@ def test_zero_size_kept_tensor_bypasses_fetch_plan():
 
     requests = captured["requests"]
     # One contiguous run through the zero-byte tensor; no 0-length chunk.
-    assert [(r.offset, r.chunks) for r in requests] == [(100, [8, 4])]
+    assert [(r.offsets, r.sizes) for r in requests] == [([100, 108], [8, 4])]
     # The zero-size tensor is still yielded (as an empty tensor).
     assert "m.layers.0.empty.weight" in yielded
 
@@ -281,8 +281,8 @@ def test_zero_size_kept_tensor_bypasses_fetch_plan():
 def test_streamer_split_preserves_chunk_index_mapping():
     """Pin the library contract this loader depends on: when
     RUNAI_STREAMER_MEMORY_LIMIT forces FilesRequestsIterator to split one
-    FileChunks across several sub-requests, get_global_file_and_chunk must
-    keep reporting (our request id, index within OUR chunk list)."""
+    FileChunks across several sub-requests, get_global_file_and_range must
+    keep reporting (our request id, index within OUR range list)."""
     # The Run:AI streamer ships with PR #331; skip until it is in the image.
     pytest.importorskip("runai_model_streamer")
     from runai_model_streamer.file_streamer.requests_iterator import (
@@ -292,7 +292,7 @@ def test_streamer_split_preserves_chunk_index_mapping():
 
     # One request of 5 chunks, memory limit 6 -> split into [3,3],[3,3],[3]
     chunks = [3, 3, 3, 3, 3]
-    it = FilesRequestsIterator(6, [FileChunks(7, "/f", 100, list(chunks))])
+    it = FilesRequestsIterator(6, [FileChunks.contiguous(7, "/f", 100, list(chunks))])
 
     seen = []
     while True:
@@ -300,9 +300,9 @@ def test_streamer_split_preserves_chunk_index_mapping():
         if req is None:
             break
         for local_file_idx, fc in enumerate(req.files):
-            for local_chunk_idx in range(len(fc.chunks)):
-                file_id, global_idx = it.get_global_file_and_chunk(
-                    local_file_idx, local_chunk_idx
+            for local_range_idx in range(len(fc.sizes)):
+                file_id, global_idx = it.get_global_file_and_range(
+                    req, local_file_idx, local_range_idx
                 )
                 seen.append((file_id, global_idx))
     assert seen == [(7, i) for i in range(len(chunks))]
