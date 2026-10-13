@@ -19,6 +19,8 @@ XLA reference's own error on the cell: XLA's fp8 x fp8 dot accumulates below f32
 this kernel does not, so the kernel must land inside 2x the reference's error.
 """
 
+import re
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -173,3 +175,99 @@ def test_supports():
     assert not fp8_skinny.supports(16, wq[:, :2624], ws[:2624])  # pad N at load first
     assert not fp8_skinny.supports(16, wq, ws.reshape(1, 1, 1, -1))  # blockwise scale
     assert not fp8_skinny.supports(16, wq.astype(jnp.bfloat16), ws)
+
+
+# --------------------------------------------------------------------------------
+# scale_dma (TPU_FP8_SKINNY_SCALE_DMA): the scale passed in HBM, DMA'd in-kernel.
+# --------------------------------------------------------------------------------
+
+SCALE_DMA_SITES = [
+    (2048, 16384, None),
+    (2048, 8192, None),
+    (1024, 6144, None),
+    (6144, 1536, None),
+    (6144, 2688, None),
+    (1024, 6144, ("n", 512, 2)),
+    (6144, 1536, ("k", 768, 4)),
+    (512, 640, ("n", 640, 1)),
+]
+
+
+@pytest.mark.parametrize("k,n,config", SCALE_DMA_SITES)
+@pytest.mark.parametrize("m,real", [(16, 4), (16, 16), (8, 8)])
+def test_scale_dma_is_bit_identical(k, n, config, m, real):
+    x = _x(m, k, real)
+    wq, ws = _w(k, n)
+
+    def f(sd):
+        return jax.jit(
+            lambda a, b, c: fp8_skinny.fp8_skinny_matmul(
+                a, b, c, config=config, scale_dma=sd
+            )
+        )(x, wq, ws)
+
+    y0, y1 = f(False), f(True)
+    np.testing.assert_array_equal(
+        np.asarray(y1, np.float32), np.asarray(y0, np.float32)
+    )
+    # Positive control: the result depends on every scale column, so a scale the
+    # kernel never received (or read before its DMA landed) cannot pass the above.
+    ws2 = ws.at[n // 2].multiply(2.0)
+    y2 = jax.jit(
+        lambda a, b, c: fp8_skinny.fp8_skinny_matmul(
+            a, b, c, config=config, scale_dma=True
+        )
+    )(x, wq, ws2)
+    assert not np.array_equal(np.asarray(y2, np.float32), np.asarray(y1, np.float32))
+
+
+def test_scale_dma_stacked_eager_bit_identical():
+    """The constraint cannot run eagerly; the scale_dma path jits itself."""
+    k, n = 1024, 3072
+    x = _x(16, k, 16)
+    ws_list = [_w(k, n, seed=s) for s in (3, 4)]
+    stack = jnp.stack([w for w, _ in ws_list])
+    for i, (_, ws) in enumerate(ws_list):
+        idx = jnp.array([i], jnp.int32)
+        y0 = fp8_skinny.fp8_skinny_matmul_stacked(x, stack, idx, ws)
+        y1 = fp8_skinny.fp8_skinny_matmul_stacked(x, stack, idx, ws, scale_dma=True)
+        np.testing.assert_array_equal(
+            np.asarray(y0, np.float32), np.asarray(y1, np.float32)
+        )
+
+
+def _scale_copy_lines(hlo: str, n: int) -> list[str]:
+    """Compiled-HLO instructions that copy or slice an f32[n] / f32[1,n] buffer (the
+    scale): the defining op is a copy/slice start and its result is that shape."""
+    pat = re.compile(rf"=\s*\(f32\[(?:1,)?{n}\][^=]*\)\s+(?:copy|slice)-start\(")
+    return [ln.strip()[:200] for ln in hlo.splitlines() if pat.search(ln)]
+
+
+@pytest.mark.parametrize("k,n", [(1024, 6144), (2048, 16384), (6144, 1536)])
+def test_scale_dma_lowers_scale_to_hbm(k, n):
+    """scale_dma: the custom call carries `input_memory_space_colors` and the compiled
+    module has no copy on the scale buffer. Positive control: the default lowering
+    carries no colors."""
+    x = _x(16, k, 4)
+    wq, ws = _w(k, n)
+
+    def lowered(sd):
+        return jax.jit(
+            lambda a, b, c: fp8_skinny.fp8_skinny_matmul(a, b, c, scale_dma=sd)
+        ).lower(x, wq, ws)
+
+    on, off = lowered(True), lowered(False)
+    assert "input_memory_space_colors" in on.as_text()
+    assert "input_memory_space_colors" not in off.as_text()
+    off_lines = _scale_copy_lines(off.compile().as_text(), n)
+    print(f"default scale copies ({k},{n}): {off_lines}")
+    assert _scale_copy_lines(on.compile().as_text(), n) == []
+
+
+def test_scale_dma_applies():
+    assert fp8_skinny.scale_dma_applies(1024, 6144)  # o_proj
+    assert not fp8_skinny.scale_dma_applies(2048, 16384)  # q_b: copy hidden
+    assert not fp8_skinny.scale_dma_applies(6144, 1536)  # gate_up: not a bitcast
+    assert not fp8_skinny.scale_dma_applies(6144, 2688)  # q_a + kv_a
+    for k, n in fp8_skinny.SCALE_DMA_SITES:
+        assert (k, n) in fp8_skinny.TUNED and n % 1024 == 0

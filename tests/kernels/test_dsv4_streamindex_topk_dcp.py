@@ -592,3 +592,156 @@ def test_dcp_append_and_topk_match_across_xla_has_and_sal(dcp_size):
 
     np.testing.assert_array_equal(topk_has, topk_xla)
     np.testing.assert_array_equal(topk_sal, topk_xla)
+
+
+# ===================================================================== #
+# overlap_fn (TPU_INDEXER_QB_OVERLAP): independent TC work pinned under the
+# SparseCore top-k calls, exact.
+# ===================================================================== #
+
+
+def _qb_overlap_operands(seed=3, m=16, k=2048, n=16384):
+    """The MLA q_b projection's operands at GLM-5.2's served shape."""
+    from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
+
+    kx, kw, ks = jax.random.split(jax.random.key(seed), 3)
+    x = (jax.random.normal(kx, (m, k), jnp.float32) * 0.5).astype(jnp.bfloat16)
+    w = (jax.random.normal(kw, (k, n), jnp.float32) * 0.05).astype(jnp.float8_e4m3fn)
+    s = jax.random.uniform(ks, (n,), jnp.float32, 0.5, 1.5)
+    # Decode rows take the skinny Pallas kernel, wider ones the XLA matmul.
+    assert fp8_skinny.supports(m, w, s) == (m <= 16)
+    return x, w, s
+
+
+def _entry_order(compiled_text, names):
+    """Positions of the first scheduled instruction whose name starts with
+    each of `names`, in the compiled ENTRY computation."""
+    entry = compiled_text[compiled_text.rfind("ENTRY") :]
+    order = {}
+    for i, line in enumerate(entry.splitlines()):
+        m = re.match(r"\s*(?:ROOT )?%?([\w.-]+) = ", line)
+        if not m:
+            continue
+        for n in names:
+            if n not in order and m.group(1).startswith(n):
+                order[n] = i
+    return order
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 8])
+@pytest.mark.parametrize("q_len", [16, 256], ids=["decode16", "mixed256"])
+def test_overlap_fn_is_exact(dcp_size, q_len):
+    """The overlapped q_b and the top-k both match running them apart, byte
+    for byte, and the positive control (one weight byte changed) is caught."""
+    from vllm_torchtpu.layers.adapter.linear_common import _fp8_linear_pallas_jax
+
+    _need_devices(dcp_size)
+    _require_sparsecore()
+    _, args, kwargs = _dcp_case(dcp_size, 31, q_len=q_len)
+    x, w, s = _qb_overlap_operands(m=q_len)
+
+    want_topk = np.asarray(streamindex_topk_dcp(*args, **kwargs))
+    want_q = np.asarray(jax.jit(_fp8_linear_pallas_jax)(x, w, s))
+
+    ov = dict(overlap_fn=_fp8_linear_pallas_jax, overlap_args=(x, w, s))
+    got_topk, got_q = streamindex_topk_dcp(*args, **kwargs, **ov)
+    np.testing.assert_array_equal(np.asarray(got_topk), want_topk)
+    np.testing.assert_array_equal(
+        np.asarray(got_q).view(np.uint16), want_q.view(np.uint16)
+    )
+
+    # The model's setting: pin decode buckets only (mixed256 runs unpinned).
+    got_topk, got_q = streamindex_topk_dcp(
+        *args, **kwargs, **ov, overlap_pin_max_tokens=16
+    )
+    np.testing.assert_array_equal(np.asarray(got_topk), want_topk)
+    np.testing.assert_array_equal(
+        np.asarray(got_q).view(np.uint16), want_q.view(np.uint16)
+    )
+
+    w_bad = w.at[0, 0].set(jnp.float8_e4m3fn(3.0))
+    _, bad_q = streamindex_topk_dcp(
+        *args, **kwargs, **{**ov, "overlap_args": (x, w_bad, s)}
+    )
+    assert (np.asarray(bad_q).view(np.uint16) != want_q.view(np.uint16)).any(), (
+        "a changed q_b weight byte left q bit-identical: the comparison is blind"
+    )
+
+
+@pytest.mark.multichip
+def test_overlap_fn_is_scheduled_under_the_sparsecore_calls():
+    """Decode bucket: q_b lands between the local top-k's call-update and its
+    call-done, and the merge stage's work between the merge's update and done
+    -- the windows the TensorCore otherwise idles in."""
+    from vllm_torchtpu.layers.adapter.linear_common import _fp8_linear_pallas_jax
+
+    _need_devices(2)
+    _require_sparsecore()
+    _, args, kwargs = _dcp_case(2, 41, q_len=16)
+    x, w, s = _qb_overlap_operands(m=16)
+    w_uk = jax.random.normal(jax.random.key(9), (64, 192, 512), jnp.bfloat16)
+
+    def absorb(q):
+        return jnp.einsum("thd,hdl->thl", q.reshape(16, 64, 256)[..., :192], w_uk)
+
+    text = (
+        streamindex_topk_dcp.lower(
+            *args,
+            **kwargs,
+            overlap_fn=_fp8_linear_pallas_jax,
+            overlap_args=(x, w, s),
+            merge_overlap_fn=absorb,
+        )
+        .compile()
+        .as_text()
+    )
+    local = "sc_topk_direct_b16_n"
+    pos = _entry_order(
+        text,
+        [
+            "fp8_skinny",
+            "all_gather",
+            "all-gather",
+        ],
+    )
+    entry = text[text.rfind("ENTRY") :].splitlines()
+    sc = [
+        (i, ln.split("=")[0].strip().lstrip("%"))
+        for i, ln in enumerate(entry)
+        if local in ln.split("=")[0]
+    ]
+    updates = [i for i, n in sc if "update" in n]
+    dones = [i for i, n in sc if n.endswith("call-done") or ".call-done" in n]
+    assert len(updates) >= 2 and len(dones) >= 2, sc
+    assert updates[0] < pos["fp8_skinny"] < dones[0], (sc, pos)
+    convs = [
+        i
+        for i, ln in enumerate(entry)
+        if re.search(r"= bf16\[(16,64|64,16),512\]", ln) and "fusion" in ln
+    ]
+    assert any(updates[1] < i < dones[1] for i in convs), (sc, convs)
+
+
+@pytest.mark.multichip
+def test_merge_overlap_fn_is_exact():
+    """`merge_overlap_fn` sees `overlap_fn`'s output; both stages exact."""
+    _need_devices(2)
+    _require_sparsecore()
+    _, args, kwargs = _dcp_case(2, 37, q_len=16)
+    x = jax.random.normal(jax.random.key(5), (16, 512), jnp.float32)
+
+    def first(v):
+        return v * 2.0
+
+    def second(v):
+        return jnp.tanh(v) + 1.0
+
+    want = np.asarray(jax.jit(lambda v: second(first(v)))(x))
+    topk, got = streamindex_topk_dcp(
+        *args, **kwargs, overlap_fn=first, overlap_args=(x,), merge_overlap_fn=second
+    )
+    np.testing.assert_array_equal(np.asarray(got), want)
+    np.testing.assert_array_equal(
+        np.asarray(topk), np.asarray(streamindex_topk_dcp(*args, **kwargs))
+    )

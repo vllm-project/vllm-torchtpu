@@ -775,3 +775,145 @@ def test_dcp_kernel_output_flag_on_matches_flag_off(layout):
             f"dcp{dcp_size} {layout.value} {phase}: max|on-off| = "
             f"{np.abs(b - a).max():.3e}, exact={np.array_equal(a, b)}"
         )
+
+
+# --- TPU_MLA_DECODE_PROLOGUE: the served wiring ------------------------------
+
+
+def _kernel_rope_emulated(q_raw, tab):
+    """The kernel's `rope_q_block` on the raw head, in torch: x*C + rot(x)*S
+    over q_pe = q_raw[..., 192:] with each product rounded to bf16 first."""
+    x = q_raw[..., NOPE:].float()  # [T, H, 64]
+    c = tab[:, None, 0, 64:]  # [T, 1, 64] = [cos, cos]
+    s = tab[:, None, 1, 64:]  # [-sin, sin]
+    rot = torch.cat([x[..., 32:], x[..., :32]], dim=-1)
+    a = (x * c).bfloat16().float()
+    b = (rot * s).bfloat16().float()
+    return (a + b).bfloat16()
+
+
+@pytest.mark.parametrize("num_tokens", [DECODE_TOKENS, PREFILL_TOKENS])
+@pytest.mark.parametrize("group_size,heads", [(4, 4), (2, 8)])
+def test_decode_prologue_wrapper_hands_raw_q_and_table(num_tokens, group_size, heads):
+    """Flag on: the qrep sparse path gets (q_nope, raw q head, rope table);
+    k_pe / kv_c / q_nope are bit-identical to flag off, and the kernel's rope
+    of (raw q, table) is bit-identical to flag off's q_pe."""
+    hidden, positions = _inputs(num_tokens, seed=5)
+    outs = {}
+    # One thread: a multi-threaded CPU GEMM may reduce in a different order
+    # call to call, and this compares two forwards bit for bit.
+    threads = torch.get_num_threads()
+    torch.set_num_threads(1)
+    try:
+        for flag in (False, True, False):
+            w = _wrapper(heads=heads, group_size=group_size, rank_in_group=1)
+            w.permute_rope_to_half_split()
+            w.decode_prologue = flag
+            outs.setdefault(flag, []).append(_run(w, hidden, positions))
+    finally:
+        torch.set_num_threads(threads)
+    off, on = outs[False][0], outs[True][0]
+    # The harness itself is deterministic (flag off twice).
+    assert torch.equal(outs[False][1]["k_pe"], off["k_pe"])
+    assert torch.equal(on["k_pe"], off["k_pe"])
+    assert torch.equal(on["kv_c"], off["kv_c"])
+    assert len(off["rep"]) == 2 and len(on["rep"]) == 3
+    q_nope_on, q_raw, tab = on["rep"]
+    assert torch.equal(q_nope_on, off["rep"][0])
+    assert q_raw.shape == (num_tokens, heads * group_size, QK)
+    assert tab.shape == (num_tokens, 2, 128) and tab.dtype == torch.float32
+    # The raw head's nope part is q_nope itself.
+    assert torch.equal(q_raw[..., :NOPE], off["rep"][0])
+    got = _kernel_rope_emulated(q_raw, tab)
+    assert torch.equal(got, off["rep"][1].contiguous())
+    # Positive control: a table built from other positions moves it.
+    w = _wrapper(heads=heads, group_size=group_size, rank_in_group=1)
+    bad = mla_op.mla_q_rope_table(w.rotary_emb, (positions + 1) % MAX_POS, q_raw)
+    assert not torch.equal(_kernel_rope_emulated(q_raw, bad), got)
+
+
+def test_decode_prologue_needs_permuted_rope():
+    """Without the NeoX half-split layout the wrapper keeps the torch rope."""
+    hidden, positions = _inputs(DECODE_TOKENS, seed=6)
+    w = _wrapper(heads=4, group_size=4, rank_in_group=0)
+    w.decode_prologue = True  # but _rope_neox_permuted is False
+    out = _run(w, hidden, positions)
+    assert len(out["rep"]) == 2
+
+
+def test_decode_prologue_impl_routes_to_rope_op(monkeypatch):
+    """`PallasMLAttentionBackendImpl.forward` with a 3-tuple q_dcp_replicated
+    calls the rope op with the flag-off op's operands, the raw q head in place
+    of q_pe and the table appended."""
+    try:
+        from vllm_torchtpu.layers.adapter import attention as attn_mod
+    except Exception as e:  # noqa: BLE001 - needs torch_tpu
+        pytest.skip(f"attention backend unavailable: {e}")
+    t, h, g = 16, 4, 4
+    gen = torch.Generator().manual_seed(3)
+    layer = MagicMock()
+    layer.num_heads = h
+    layer.kv_lora_rank = KV_LORA
+    layer.qk_rope_head_dim = ROPE
+    layer.v_head_dim = V_DIM
+    layer.kv_cache_quantized_dtype = None
+    layer.W_UK_T_dcp_qrep = torch.randn(h * g, NOPE, KV_LORA, generator=gen).bfloat16()
+    layer.W_UK_T_dcp_qrep_scale = None
+    layer.W_UV = torch.randn(h, KV_LORA, V_DIM, generator=gen).bfloat16()
+    del layer.W_UV_scale
+    for name in ("sparse_mla_dcp_op", "sparse_mla_dcp_rope_op"):
+        setattr(
+            layer,
+            name,
+            MagicMock(
+                return_value=(
+                    torch.zeros(g * t, h * g, KV_LORA, dtype=torch.bfloat16),
+                    torch.zeros(g * t, h * g),
+                )
+            ),
+        )
+    impl = attn_mod.PallasMLAttentionBackendImpl.__new__(
+        attn_mod.PallasMLAttentionBackendImpl
+    )
+    impl.dcp_size = g
+    monkeypatch.setattr(
+        attn_mod,
+        "merge_lse_partials_scatter_heads",
+        lambda partial, lse, **kw: partial[:t, :h],
+    )
+    monkeypatch.setattr(
+        impl, "_get_kv_scales", lambda layer: (None, None, None), raising=False
+    )
+    q = torch.randn(t, h * g, QK, generator=gen).bfloat16()
+    q_nope, q_pe = q[..., :NOPE], q[..., NOPE:]
+    tab = torch.randn(t, 2, 128, generator=gen)
+    kv_c = torch.randn(t, KV_LORA, generator=gen).bfloat16()
+    k_pe = torch.randn(t, 1, ROPE, generator=gen).bfloat16()
+    kv_cache = (torch.zeros(4, 4), torch.zeros(4, 4))
+    md = MagicMock()
+    topk = torch.zeros(g * t, 8, dtype=torch.int32)
+    common = dict(
+        layer=layer,
+        kv_c_normed=kv_c,
+        k_pe=k_pe,
+        kv_cache=kv_cache,
+        attn_metadata=md,
+        topk_indices=topk,
+    )
+    impl.forward(
+        q=(q_nope[:, :h], q_pe[:, :h]), q_dcp_replicated=(q_nope, q_pe), **common
+    )
+    impl.forward(
+        q=(q_nope[:, :h], q_pe[:, :h]), q_dcp_replicated=(q_nope, q, tab), **common
+    )
+    base = layer.sparse_mla_dcp_op.call_args.args
+    rope = layer.sparse_mla_dcp_rope_op.call_args.args
+    assert len(rope) == len(base) + 1 and rope[-1] is tab
+    for i, (a, b) in enumerate(zip(base, rope)):
+        if i == 2:  # q_pe slot: the raw head view
+            assert b.shape == (t, h * g, QK) and torch.equal(b, q)
+            assert torch.equal(a, q_pe)
+        elif isinstance(a, torch.Tensor):
+            assert torch.equal(a, b), i
+        else:
+            assert a is b, i

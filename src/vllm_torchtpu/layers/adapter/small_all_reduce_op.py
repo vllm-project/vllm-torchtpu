@@ -31,7 +31,18 @@ TPU_SMALL_ALL_REDUCE_DRAFT those traces call a second op that takes the choice
 inside JAX instead, where each bucket is exported at its concrete shape: the
 kernel up to the row cap, XLA's all-reduce (``psum``) above it. Without the
 flag, and in eager mode, they keep vLLM's collective.
+
+With TPU_SMALL_ALL_REDUCE_VALID_ROWS a backbone block that has the two-shot
+kernel's fold path (``all_reduce.fold_geometry``) is handed the step's
+valid-row count from the token-padding mask: up to ``fold_rows`` valid rows
+are folded into one row tile and only that moves, padding rows coming out +0;
+more valid rows run the plain two-shot. Valid rows are bitwise the plain
+kernel's either way. The count is the same on every TP rank (the ranks share
+the step's tokens). The drafter traces keep the sized op: the mask describes
+the target step's rows.
 """
+
+from typing import Any
 
 import jax
 import torch
@@ -51,6 +62,7 @@ from vllm_torchtpu.kernels.experimental.small_collectives import (
     reduce_scatter,
 )
 from vllm_torchtpu.kernels.experimental.small_collectives.common import LANES
+from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -68,11 +80,17 @@ def max_rows() -> int:
     return envs.TPU_SMALL_ALL_REDUCE_MAX_ROWS or MAX_ROWS
 
 
-_AR_OP = None
+# Built ops are torch custom ops; `Any` so the checker does not read the
+# None placeholder as their type.
+_AR_OP: Any = None
 # The all-reduce for traces outside the backbone warmup: the row choice is
 # made per exported bucket inside JAX (TPU_SMALL_ALL_REDUCE_DRAFT).
 _AR_SIZED_OP = None
 _RS_OP = None
+# The valid-rows all-reduce (TPU_SMALL_ALL_REDUCE_VALID_ROWS) and the bf16 row
+# tile its fold path folds into.
+_AR_VALID_OP: Any = None
+_VALID_TILE_ROWS = 0
 # This core's mesh index as an int32 [1] device tensor: the kernels take it as
 # data (see small_collectives/common.py).
 _RANK = None
@@ -117,6 +135,39 @@ def _build_all_reduce(mesh, psum_above: int | None = None):
     )
 
 
+def _build_valid_rows_all_reduce(mesh, tile_rows: int):
+    """The all-reduce op over ``mesh`` that moves only a block's valid rows:
+    fn(x [rows, hidden], n_valid int32 [1], rank int32 [1]) per core."""
+    n = mesh.shape[EP_AXIS_NAME]
+    spec = PartitionSpec(EP_AXIS_NAME)
+
+    def body(block, n_valid, rank):
+        return all_reduce.small_all_reduce_valid_rows(
+            block, n_valid, rank, num_cores=n, axis=EP_AXIS_NAME, tile_rows=tile_rows
+        )
+
+    def fn(x: jax.Array, n_valid: jax.Array, rank: jax.Array) -> jax.Array:
+        return jax.shard_map(
+            body,
+            mesh=mesh,
+            in_specs=(spec, spec, spec),
+            out_specs=spec,
+            check_vma=False,
+        )(x, n_valid, rank)
+
+    def fake(x, n_valid, rank):
+        return torch.empty_like(x)
+
+    return sharded_jax_op(
+        "pallas::small_all_reduce_valid_rows",
+        fn,
+        mesh=mesh,
+        input_partition_specs=(spec, spec, spec),
+        output_partition_specs=spec,
+        fake=fake,
+    )
+
+
 def _build_reduce_scatter(mesh):
     n = mesh.shape[EP_AXIS_NAME]
     spec = PartitionSpec(EP_AXIS_NAME)
@@ -148,6 +199,7 @@ def prebuild() -> None:
     """Build the ops and this core's rank tensor, outside any traced region:
     the mesh comes from a collective. A no-op unless TPU_SMALL_ALL_REDUCE."""
     global _AR_OP, _AR_SIZED_OP, _RS_OP, _RANK, _CORES, _MESH_RANKS, _DP_COMBINE
+    global _AR_VALID_OP, _VALID_TILE_ROWS
     if not envs.TPU_SMALL_ALL_REDUCE or _AR_OP is not None:
         return
     mesh = build_ep_mesh()
@@ -172,6 +224,12 @@ def prebuild() -> None:
     if envs.TPU_SMALL_ALL_REDUCE_DRAFT:
         _AR_SIZED_OP = _build_all_reduce(mesh, psum_above=max_rows())
     _RS_OP = _build_reduce_scatter(mesh)
+    if envs.TPU_SMALL_ALL_REDUCE_VALID_ROWS:
+        from jax.experimental.pallas import tpu as pltpu
+
+        info = pltpu.get_tpu_info()
+        _VALID_TILE_ROWS = int(info.get_sublane_tiling(jax.numpy.bfloat16))
+        _AR_VALID_OP = _build_valid_rows_all_reduce(mesh, _VALID_TILE_ROWS)
     # The mesh is rank-ordered (ep_mesh.build_ep_mesh), so when the DP group
     # is the mesh, DP rank r's rows go to mesh core r.
     _DP_COMBINE = tuple(int(r) for r in get_dp_group().ranks) == _MESH_RANKS
@@ -179,7 +237,7 @@ def prebuild() -> None:
     logger.info(
         "Small collectives armed | cores=%d | max_rows=%d | "
         "combine_max_rows=%d | one_shot_max_bytes=%d | tp_all_reduce=%s | "
-        "dp_combine=%s | outside_warmup=%s",
+        "dp_combine=%s | outside_warmup=%s | valid_rows=%s",
         _CORES,
         max_rows(),
         COMBINE_MAX_ROWS,
@@ -189,6 +247,9 @@ def prebuild() -> None:
         "kernel to max_rows, psum above (MTP drafter)"
         if _AR_SIZED_OP is not None
         else "vLLM's collectives (MTP drafter, eager)",
+        f"fold into {_VALID_TILE_ROWS}-row tiles (needs the token-padding mask)"
+        if _AR_VALID_OP is not None
+        else "off",
     )
 
 
@@ -203,15 +264,47 @@ def _fits(x: torch.Tensor, width_multiple: int, in_warmup: bool = True) -> bool:
     )
 
 
+def _padding_mask() -> torch.Tensor | None:
+    """The token-padding mask the valid-rows all-reduce reads, or None."""
+    if _AR_VALID_OP is None or token_padding._padding_state is None:
+        return None
+    return token_padding._padding_state.local_padding_mask
+
+
 def retain(out: torch.Tensor) -> torch.Tensor:
-    """``out`` plus a zero read from the rank buffer, for a token-count branch
-    that skips the kernel while its other side calls it: the warmup hands a
-    bucket over only between traces that lift the same buffers. A read whose
-    result is dead would be eliminated, so the zero rides on ``out``."""
+    """``out`` plus a zero read from the rank buffer (and, with the valid-rows
+    all-reduce, the padding mask), for a token-count branch that skips the
+    kernel while its other side calls it: the warmup hands a bucket over only
+    between traces that lift the same buffers. A read whose result is dead
+    would be eliminated, so the zero rides on ``out``."""
     if _RANK is None or not shape_variants.in_warmup():
         return out
     value = _RANK[0].to(out.dtype)
+    mask = _padding_mask()
+    if mask is not None:
+        value = value + mask[0].to(out.dtype)
     return out + (value - value)
+
+
+def _valid_rows(rows: int, mask: torch.Tensor) -> torch.Tensor:
+    """int32 [1], the valid rows of this block: the mask marks rows
+    [n_valid, padded) as padding, the same on every TP rank."""
+    padding = mask[:rows].to(torch.int32).sum()
+    return (rows - padding).reshape(1).to(torch.int32)
+
+
+def _small_all_reduce(x: torch.Tensor) -> torch.Tensor:
+    """A block of at most max_rows rows inside the warmup: the valid-rows
+    all-reduce when armed and the block has a fold path, else the
+    two-shot/one-shot kernel (with the mask read, so every bucket lifts the
+    same buffers)."""
+    mask = _padding_mask()
+    if mask is None:
+        return _AR_OP(x, _RANK)
+    rows, hidden = x.shape
+    if all_reduce.fold_geometry(rows, hidden, _CORES, _VALID_TILE_ROWS) is not None:
+        return _AR_VALID_OP(x, _valid_rows(rows, mask), _RANK)
+    return _AR_OP(retain(x), _RANK)
 
 
 def all_reduce_or(x: torch.Tensor, ranks, fallback) -> torch.Tensor:
@@ -225,7 +318,13 @@ def all_reduce_or(x: torch.Tensor, ranks, fallback) -> torch.Tensor:
     if not _fits(x, _CORES * LANES):
         return fallback(x)
     if x.shape[0] <= max_rows():
-        return _AR_OP(x, _RANK)
+        return _small_all_reduce(x)
+    if envs.TPU_FUSED_ADD_RMSNORM:
+        # The zero rides on the all-reduce INPUT, where XLA fuses it into the
+        # producer's epilogue (sum of zeros is zero). On the output it cannot
+        # fuse into the Pallas RMSNorm that reads it, and costs a full pass
+        # (plus a relayout to the kernel's operand tiling).
+        return fallback(retain(x))
     return retain(fallback(x))
 
 

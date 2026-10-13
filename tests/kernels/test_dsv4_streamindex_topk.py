@@ -1472,6 +1472,69 @@ class TestChunkedPipelining:
             " fallback that the cases above rely on has changed")
 
 
+# fmt: off
+@pytest.mark.tpu_test
+@pytest.mark.parametrize(
+    "T_list, chunk_tokens, drops_statically",
+    [
+        # Eight decodes then a prefill: chunk 0 keeps its DECODE passes (the
+        # runtime branch is taken), chunks 1-3 start past max_num_seqs=9 and
+        # drop theirs statically.
+        pytest.param((1,) * 8 + (120,), 32, True, id="decodes_in_chunk0"),
+        # Ten decodes: the batched pass covers [0, 8), the ragged remainder
+        # pass [8, 10) -- both live in chunk 0 only.
+        pytest.param((1,) * 10 + (118,), 32, True, id="ragged_remainder"),
+        # Chunks narrower than max_num_seqs: chunk 1 starts at token 4 < 8, so
+        # it must keep its DECODE passes (it holds decode rows 4-7), so the
+        # census must not shrink.
+        pytest.param((1,) * 8, 4, False, id="decode_rows_past_chunk0"),
+        # No q_len-1 sequence (the MTP case): chunk 0 takes the MIXED-only
+        # branch at runtime, the rest drop the passes statically.
+        pytest.param((4,) * 8 + (96,), 32, True, id="no_decode_mtp_like"),
+        pytest.param((40, 88), 32, True, id="prefill_only"),
+    ],
+)
+# fmt: on
+def test_skip_empty_decode_chunked_is_exact(T_list, chunk_tokens, drops_statically):
+    """Dropping DECODE passes from chunks that hold no decode row is exact.
+
+    Bitwise against the same chunked call without the flag (same kernels on
+    the rows that matter, so the same order), and as a set against the
+    unchunked call. The HLO kernel census is the positive control: the flag
+    must actually remove DECODE launches where it should, or the comparison
+    is vacuous -- and must keep them in a chunk that holds decode rows.
+    """
+    B = len(T_list)
+    S_list = (512,) * B
+    inputs = _chunk_inputs(T_list, _fragmented_pages(B), 128, 4, 128)
+    common = (inputs, T_list, S_list, 128, 1, 8, 2, _HAS)
+    base_kwargs = _chunk_call_kwargs(*common, chunk_tokens)
+    skip_kwargs = dict(base_kwargs, skip_empty_decode_chunked=True)
+
+    base_hlo = streamindex_topk.lower(**base_kwargs).as_text()
+    skip_hlo = streamindex_topk.lower(**skip_kwargs).as_text()
+    assert "_scheduling_group_id" in skip_hlo, "did not chunk"
+    n_base = base_hlo.count("StreamIdxTC-d-")
+    n_skip = skip_hlo.count("StreamIdxTC-d-")
+    if drops_statically:
+        assert n_skip < n_base, (
+            f"the flag removed no DECODE launch ({n_skip} vs {n_base})")
+    else:
+        assert n_skip == n_base, (
+            f"the flag dropped DECODE passes from a chunk holding decode rows"
+            f" ({n_skip} vs {n_base})")
+
+    base = np.array(streamindex_topk(**base_kwargs))
+    skip = np.array(streamindex_topk(**skip_kwargs))
+    unchunked = np.array(streamindex_topk(**_chunk_call_kwargs(*common, None)))
+    np.testing.assert_array_equal(
+        skip, base,
+        err_msg="skip_empty_decode_chunked changed the chunked output")
+    np.testing.assert_array_equal(
+        np.sort(skip, axis=-1), np.sort(unchunked, axis=-1),
+        err_msg="skip_empty_decode_chunked disagrees with the unchunked call")
+
+
 def main(argv):
     del argv
 

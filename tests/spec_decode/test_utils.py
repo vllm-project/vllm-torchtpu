@@ -206,3 +206,57 @@ def test_vocab_parallel_argmax_matches_full_argmax(monkeypatch, tp, width, pad):
     for r in range(tp):
         out = utils.vocab_parallel_argmax(shards[r], infos[r])
         assert torch.equal(out, expected), (r, out, expected)
+
+
+@pytest.mark.parametrize(
+    "tp,rows,lead3", [(16, 16, False), (8, 5, False), (4, 6, True)]
+)
+def test_column_parallel_eh_proj_matches_replicated(monkeypatch, tp, rows, lead3):
+    """TPU_MTP_EH_PROJ_TP: every rank's gathered output equals the replicated
+    nn.Linear, for 2-D and 3-D inputs. Small-integer f32 values make every dot
+    product exact under any summation order, so equality tests the column
+    split and the gather layout, not BLAS blocking."""
+    import vllm.distributed as vd
+
+    hidden = 8 * tp
+    g = torch.Generator().manual_seed(tp * 7 + rows)
+    full = torch.nn.Linear(2 * hidden, hidden, bias=False)
+    with torch.no_grad():
+        full.weight.copy_(
+            torch.randint(-4, 5, (hidden, 2 * hidden), generator=g).float()
+        )
+    shape = (2, rows, 2 * hidden) if lead3 else (rows, 2 * hidden)
+    x = torch.randint(-4, 5, shape, generator=g).float()
+    expected = full(x).detach()
+    mods = [utils.ColumnParallelEhProj(full.weight, r, tp) for r in range(tp)]
+    for r, m in enumerate(mods):
+        n = hidden // tp
+        assert m.weight.shape == (n, 2 * hidden)
+        assert torch.equal(m.weight, full.weight[r * n : (r + 1) * n])
+    # all-gather(dim=0) = concatenation of every rank's local [rows, n] block
+    flat = x.reshape(-1, 2 * hidden)
+    locals_ = [torch.nn.functional.linear(flat, m.weight) for m in mods]
+    monkeypatch.setattr(
+        vd, "tensor_model_parallel_all_gather", lambda t, dim=0: torch.cat(locals_, 0)
+    )
+    for r, m in enumerate(mods):
+        out = m(x)
+        assert out.shape == expected.shape
+        assert torch.equal(out, expected), r
+
+
+def test_shard_draft_eh_proj_swaps_only_plain_linear():
+    draft = _make_mtp_draft(num_layers=2)
+    layers = list(draft.model.layers.values())
+    layers[0].eh_proj = torch.nn.Linear(32, 16, bias=False)
+    layers[1].eh_proj = torch.nn.Linear(32, 16, bias=True)  # has bias: kept
+    w0 = layers[0].eh_proj.weight.detach().clone()
+    assert utils.shard_draft_eh_proj(draft, tp_rank=2, tp_size=4) == 1
+    assert isinstance(layers[0].eh_proj, utils.ColumnParallelEhProj)
+    assert torch.equal(layers[0].eh_proj.weight, w0[8:12])
+    assert type(layers[1].eh_proj) is torch.nn.Linear
+    # tp 1, or a width tp does not divide: untouched
+    d2 = _make_mtp_draft(num_layers=1)
+    next(iter(d2.model.layers.values())).eh_proj = torch.nn.Linear(10, 6, bias=False)
+    assert utils.shard_draft_eh_proj(d2, 0, 1) == 0
+    assert utils.shard_draft_eh_proj(d2, 0, 4) == 0

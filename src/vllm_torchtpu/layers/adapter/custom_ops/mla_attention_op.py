@@ -45,7 +45,11 @@ from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.mla.prefill import selector
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.distributed.dcp import get_dcp_group, get_or_create_dcp_mesh
+from vllm_torchtpu.distributed.dcp import (
+    dcp_rank_operand,
+    get_dcp_group,
+    get_or_create_dcp_mesh,
+)
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     DCP_AXIS_NAME,
     KVLayout,
@@ -58,19 +62,26 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     streamindex_topk,
     streamindex_topk_dcp,
 )
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.config import (
+    register_indexer_layer,
+)
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
 from vllm_torchtpu.kernels.mla.kv_cache_utils import OOB_PAGE, _row_positions
+from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
 from vllm_torchtpu.layers.adapter.attention import (
     TPU_STR_DTYPE_TO_TORCH_DTYPE,
     PallasMLAttentionBackendImpl,
     VllmTPUDeepseekV32IndexerBackend,
 )
 from vllm_torchtpu.layers.adapter.linear_common import (
+    FP8_PALLAS_N_ATTR,
     FP8_PALLAS_SCALE,
     FP8_PALLAS_WEIGHT,
+    KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
+    _fp8_linear_pallas_jax,
 )
 from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on_load
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
@@ -86,9 +97,6 @@ logger = init_logger(__name__)
 # traffic and not at all once any request in the batch is past `index_topk`
 # tokens.
 STREAMIDX_ENABLE_EARLY_EXIT = True
-# Token buckets at or below this size take `TPU_STREAMIDX_SMALL_BUCKET_BQ`
-# (and `TPU_STREAMIDX_SMALL_BUCKET_BKVP`) as the MIXED-pass block sizes.
-STREAMIDX_SMALL_BUCKET_TOKENS = 16
 # MIXED-pass KV pages per block for small buckets when only the bq knob is set.
 # Picked by a DCP16 per-rank sweep (GLM-5.2, 32 indexer heads, 4/8 real rows in
 # a 16-token bucket, 5k/18k KV per rank): bq 4 with bkvp 8 was fastest at every
@@ -102,7 +110,11 @@ STREAMIDX_QUERIES_PER_BLOCK = (1, 128, 128)
 
 
 def _streamidx_block_sizes(
-    num_tokens: int, small_bucket_bq: int | None, small_bucket_bkvp: int | None
+    num_tokens: int,
+    small_bucket_bq: int | None,
+    small_bucket_bkvp: int | None,
+    small_bucket_tokens: int,
+    mixed_bkvp: int | None = None,
 ) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
     """(num_kv_pages_per_block, num_queries_per_block) for a token bucket.
 
@@ -110,9 +122,17 @@ def _streamidx_block_sizes(
     variant per compiled shape. Under MTP every decode request has
     q_len = gamma + 1 and runs in the MIXED pass; for small buckets that pass
     takes the knob's query block instead of 128 rows of mostly padding.
+    Buckets up to `small_bucket_tokens` (TPU_STREAMIDX_SMALL_BUCKET_TOKENS)
+    take the small-bucket sizes; larger buckets take `mixed_bkvp`
+    (TPU_STREAMIDX_MIXED_KV_PAGES) kv pages per MIXED block when it is set.
     """
-    if small_bucket_bq is None or num_tokens > STREAMIDX_SMALL_BUCKET_TOKENS:
-        return STREAMIDX_KV_PAGES_PER_BLOCK, STREAMIDX_QUERIES_PER_BLOCK
+    if small_bucket_bq is None or num_tokens > small_bucket_tokens:
+        if mixed_bkvp is None:
+            return STREAMIDX_KV_PAGES_PER_BLOCK, STREAMIDX_QUERIES_PER_BLOCK
+        return (
+            STREAMIDX_KV_PAGES_PER_BLOCK[:2] + (mixed_bkvp,),
+            STREAMIDX_QUERIES_PER_BLOCK,
+        )
     bkvp = small_bucket_bkvp or STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP
     return (
         STREAMIDX_KV_PAGES_PER_BLOCK[:2] + (bkvp,),
@@ -263,6 +283,28 @@ def _dcp_indexer_a2a_for_bucket(
     return enabled and num_tokens >= min_tokens
 
 
+def _qb_overlap_operands(layer: Any) -> tuple[torch.Tensor, torch.Tensor] | None:
+    """`(w_q, w_s)` the q_b-overlap indexer op needs to run `layer` itself, or
+    None when `layer` would not run `_fp8_linear_pallas_jax` on its plain
+    weight: the op must compute exactly what `layer(x)` would."""
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
+
+    if not isinstance(getattr(layer, "quant_method", None), VllmFp8LinearMethodTPU):
+        return None
+    if getattr(layer, FP8_PALLAS_N_ATTR, None) is None:
+        return None
+    if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
+        return None
+    if getattr(layer, "bias", None) is not None:
+        return None
+    # A padded kernel copy (n_out not a lane multiple) takes a 5-operand path.
+    if hasattr(layer, FP8_PALLAS_WEIGHT):
+        return None
+    if getattr(layer, "gather_output", False):
+        return None
+    return layer.weight, layer.weight_scale
+
+
 def _topk_rows_update_jax(buf: jax.Array, rows: jax.Array) -> jax.Array:
     """`buf[:rows.shape[0]] = rows` as one row update of a donated buffer."""
     return jax.lax.dynamic_update_slice(buf, rows.astype(buf.dtype), (0, 0))
@@ -327,6 +369,7 @@ def _cp_scatter_indexer_k(
     axis_name: str = DCP_AXIS_NAME,
     writer: str = "xla",
     kv_layout: KVLayout = KVLayout.HEAD_ALONG_SUBLANE,
+    rank_ids: jax.Array | None = None,
 ) -> jax.Array:
     """Scatter this step's indexer K rows into the DCP-sharded K cache.
 
@@ -342,6 +385,10 @@ def _cp_scatter_indexer_k(
     come from `cu_q_lens`/`seq_lens`.
 
     `axis_name`/`cp_size` name the axis the cache is split over.
+
+    `rank_ids` (`TPU_DCP_RANK_OPERAND`), when given, is i32[cp_size] sharded
+    over `axis_name` with entry r = r: each shard reads its rank from it
+    instead of from an `all_to_all` of an iota. Same result.
     """
     if writer not in ("xla", "pallas"):
         raise ValueError(f"Expected writer in ('xla', 'pallas'), got {writer!r}.")
@@ -350,8 +397,8 @@ def _cp_scatter_indexer_k(
             f"writer='xla' only supports HEAD_ALONG_SUBLANE, got {kv_layout}."
         )
 
-    def _local(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens):
-        rank = cp_rank_as_data(axis_name, cp_size)
+    def _local(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens, *rank_arg):
+        rank = rank_arg[0][0] if rank_arg else cp_rank_as_data(axis_name, cp_size)
         if writer == "pallas":
             return coalesced_kv_append_dcp(
                 cache_kv,
@@ -412,13 +459,15 @@ def _cp_scatter_indexer_k(
 
     replicated = jax.sharding.PartitionSpec()
     sharded = jax.sharding.PartitionSpec(axis_name)
+    rank_args = () if rank_ids is None else (rank_ids,)
     return jax.shard_map(
         _local,
         mesh=mesh,
-        in_specs=(sharded, replicated, replicated, replicated, replicated),
+        in_specs=(sharded, replicated, replicated, replicated, replicated)
+        + (sharded,) * len(rank_args),
         out_specs=sharded,
         check_vma=False,
-    )(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens)
+    )(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens, *rank_args)
 
 
 @SparseAttnIndexer.register_oot
@@ -450,6 +499,15 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             self.topk_op_dcp = self._build_streamidx_dcp_op(
                 dcp_size, parallel_config.cp_kv_cache_interleave_size
             )
+            # TPU_INDEXER_QB_OVERLAP: the same op, also running the MLA q_b
+            # projection under the SparseCore top-k (see `forward_oot`).
+            self.topk_op_dcp_qb = None
+            if envs.TPU_INDEXER_QB_OVERLAP:
+                self.topk_op_dcp_qb = self._build_streamidx_dcp_op(
+                    dcp_size,
+                    parallel_config.cp_kv_cache_interleave_size,
+                    qb_overlap=True,
+                )
 
     def _build_streamidx_op(self):
         topk = self.topk_tokens
@@ -463,7 +521,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         )
         small_bucket_bq = envs.TPU_STREAMIDX_SMALL_BUCKET_BQ
         small_bucket_bkvp = envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP
+        small_bucket_tokens = envs.TPU_STREAMIDX_SMALL_BUCKET_TOKENS
         skip_empty_decode = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE
+        skip_empty_decode_chunked = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED
+        mixed_bkvp = envs.TPU_STREAMIDX_MIXED_KV_PAGES
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -519,7 +580,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
             kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
-                q.shape[0], small_bucket_bq, small_bucket_bkvp
+                q.shape[0],
+                small_bucket_bq,
+                small_bucket_bkvp,
+                small_bucket_tokens,
+                mixed_bkvp,
             )
             topk_indices = streamindex_topk(
                 q,
@@ -534,6 +599,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 num_kv_pages_per_block=kv_pages_per_block,
                 num_queries_per_block=queries_per_block,
                 skip_empty_decode=skip_empty_decode,
+                skip_empty_decode_chunked=skip_empty_decode_chunked,
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
                 kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
@@ -558,13 +624,24 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         self._streamidx_op = op
         return op
 
-    def _build_streamidx_dcp_op(self, dcp_size: int, interleave_size: int):
+    def _build_streamidx_dcp_op(
+        self, dcp_size: int, interleave_size: int, qb_overlap: bool = False
+    ):
         """The DCP twin of `_build_streamidx_op`.
 
         DCP shards the KV cache and leaves the *queries*
         replicated, so there is no rank-major token packing to undo. Every
         token-major input arrives already in request-major order and stays
         replicated across the op boundary. Only the cache is split.
+
+        `qb_overlap` (TPU_INDEXER_QB_OVERLAP) builds the variant that also takes
+        the MLA q_b projection's input and fp8 weights `(x, w_q, w_s)`, all
+        replicated, and returns its output `q` as a third, replicated result.
+        It is `_fp8_linear_pallas_jax`, the function the q_b layer's own op
+        runs, so `q` is bit-identical; what changes is only where it lands in
+        the schedule: `streamindex_topk_dcp(overlap_fn=...)` pins it under the
+        local SparseCore top-k, so on decode the TensorCore runs it while the
+        top-k it would otherwise idle on is in flight.
         """
         topk = self.topk_tokens
         mesh = get_or_create_dcp_mesh(axis_name=DCP_AXIS_NAME)
@@ -580,9 +657,19 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         )
         small_bucket_bq = envs.TPU_STREAMIDX_SMALL_BUCKET_BQ
         small_bucket_bkvp = envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP
+        small_bucket_tokens = envs.TPU_STREAMIDX_SMALL_BUCKET_TOKENS
         skip_empty_decode = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE
+        skip_empty_decode_chunked = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED
+        mixed_bkvp = envs.TPU_STREAMIDX_MIXED_KV_PAGES
+        global_group = None
+        if envs.TPU_IDX_TOPK_SCHED_GROUPS:
+            global_group = register_indexer_layer(self.k_cache.prefix)
+        # TPU_DCP_RANK_OPERAND: this rank's DCP index arrives as a sharded
+        # i32 operand (one element per rank) instead of the iota all_to_all.
+        rank_operand = envs.TPU_DCP_RANK_OPERAND
+        rank_tensor = dcp_rank_operand() if rank_operand else None
 
-        def _streamidx_topk_dcp_jax(
+        def _streamidx_topk_dcp_impl(
             q_bytes: jax.Array,  # replicated, uint8 view of fp8 q
             weights: jax.Array,  # replicated
             cache_kv: jax.Array,  # this rank's position shard
@@ -591,7 +678,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             page_indices: jax.Array,  # virtual page ordinals
             cu_q_lens: jax.Array,
             distribution: jax.Array,
-        ) -> tuple[jax.Array, jax.Array]:
+            qb_args: tuple[jax.Array, ...],  # (x, w_q, w_s), replicated, or ()
+            rank_ids_arg: jax.Array | None,  # TPU_DCP_RANK_OPERAND: i32[dcp]
+        ) -> tuple[jax.Array, ...]:
             writer, kv_layout = _resolve_indexer_kv_cache_mode(
                 cache_kv, k_packed, mode=kv_cache_mode
             )
@@ -609,13 +698,26 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 axis_name=DCP_AXIS_NAME,
                 writer=writer,
                 kv_layout=kv_layout,
+                rank_ids=rank_ids_arg,
             )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
             kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
-                q.shape[0], small_bucket_bq, small_bucket_bkvp
+                q.shape[0],
+                small_bucket_bq,
+                small_bucket_bkvp,
+                small_bucket_tokens,
+                mixed_bkvp,
             )
-            local_topk = streamindex_topk_dcp(
+            overlap = {}
+            if qb_overlap:
+                overlap = dict(
+                    overlap_fn=_fp8_linear_pallas_jax,
+                    overlap_args=tuple(qb_args),
+                    # Decode buckets only: the skinny kernel's M range.
+                    overlap_pin_max_tokens=fp8_skinny.MAX_M,
+                )
+            out = streamindex_topk_dcp(
                 q,
                 weights,
                 cache_kv,
@@ -632,23 +734,142 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 num_queries_per_block=queries_per_block,
                 kv_layout=kv_layout,
                 skip_empty_decode=skip_empty_decode,
+                skip_empty_decode_chunked=skip_empty_decode_chunked,
                 chunk_tokens=chunk_tokens,
                 a2a_merge=_dcp_indexer_a2a_for_bucket(
                     q.shape[0], a2a_merge, a2a_min_tokens
                 ),
+                global_scheduling_group_id=global_group,
+                dcp_rank_ids=rank_ids_arg,
+                **overlap,
             )
-            return cache_kv, local_topk
+            if qb_overlap:
+                local_topk, q_out = out
+                return cache_kv, local_topk, q_out
+            return cache_kv, out
+
+        # Fixed arity: torch custom-op schemas take no varargs. One signature
+        # per (q_b overlap, rank operand) variant; trailing operands in that
+        # order. Both flags off = exactly the eight operands it always had.
+        def _streamidx_topk_dcp_jax(
+            q_bytes: jax.Array,
+            weights: jax.Array,
+            cache_kv: jax.Array,
+            k_packed: jax.Array,
+            seq_lens: jax.Array,
+            page_indices: jax.Array,
+            cu_q_lens: jax.Array,
+            distribution: jax.Array,
+        ) -> tuple[jax.Array, jax.Array]:
+            return _streamidx_topk_dcp_impl(  # pyrefly: ignore[bad-return]
+                q_bytes,
+                weights,
+                cache_kv,
+                k_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                (),
+                None,
+            )
+
+        def _streamidx_topk_dcp_rank_jax(
+            q_bytes: jax.Array,
+            weights: jax.Array,
+            cache_kv: jax.Array,
+            k_packed: jax.Array,
+            seq_lens: jax.Array,
+            page_indices: jax.Array,
+            cu_q_lens: jax.Array,
+            distribution: jax.Array,
+            rank_ids: jax.Array,  # i32[dcp], sharded: shard r holds r
+        ) -> tuple[jax.Array, jax.Array]:
+            return _streamidx_topk_dcp_impl(  # pyrefly: ignore[bad-return]
+                q_bytes,
+                weights,
+                cache_kv,
+                k_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                (),
+                rank_ids,
+            )
+
+        def _streamidx_topk_dcp_qb_jax(
+            q_bytes: jax.Array,
+            weights: jax.Array,
+            cache_kv: jax.Array,
+            k_packed: jax.Array,
+            seq_lens: jax.Array,
+            page_indices: jax.Array,
+            cu_q_lens: jax.Array,
+            distribution: jax.Array,
+            qb_x: jax.Array,  # q_b input, [num_tokens, q_lora_rank]
+            qb_w: jax.Array,  # fp8 [q_lora_rank, n] (flipped runtime layout)
+            qb_s: jax.Array,  # f32 [n] per-output-channel scale
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            return _streamidx_topk_dcp_impl(  # pyrefly: ignore[bad-return]
+                q_bytes,
+                weights,
+                cache_kv,
+                k_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                (qb_x, qb_w, qb_s),
+                None,
+            )
+
+        def _streamidx_topk_dcp_qb_rank_jax(
+            q_bytes: jax.Array,
+            weights: jax.Array,
+            cache_kv: jax.Array,
+            k_packed: jax.Array,
+            seq_lens: jax.Array,
+            page_indices: jax.Array,
+            cu_q_lens: jax.Array,
+            distribution: jax.Array,
+            qb_x: jax.Array,  # q_b input, [num_tokens, q_lora_rank]
+            qb_w: jax.Array,  # fp8 [q_lora_rank, n] (flipped runtime layout)
+            qb_s: jax.Array,  # f32 [n] per-output-channel scale
+            rank_ids: jax.Array,  # i32[dcp], sharded: shard r holds r
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            return _streamidx_topk_dcp_impl(  # pyrefly: ignore[bad-return]
+                q_bytes,
+                weights,
+                cache_kv,
+                k_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                (qb_x, qb_w, qb_s),
+                rank_ids,
+            )
+
+        jax_fn = {
+            (False, False): _streamidx_topk_dcp_jax,
+            (False, True): _streamidx_topk_dcp_rank_jax,
+            (True, False): _streamidx_topk_dcp_qb_jax,
+            (True, True): _streamidx_topk_dcp_qb_rank_jax,
+        }[(bool(qb_overlap), bool(rank_operand))]
 
         replicated = jax.sharding.PartitionSpec()
         sharded = jax.sharding.PartitionSpec(DCP_AXIS_NAME)
         op_name = f"pallas::streamidx_topk_dcp_{self.k_cache.prefix.replace('.', '_')}"
+        if qb_overlap:
+            op_name += "_qb"
         # Reuses the PCP export wrapper verbatim: nothing in it is PCP-specific
         # once the mesh and the specs are arguments, and the reason it exists --
         # `jax_placeholders` specializing the dynamic token dim while scaling
         # sharded dims to global size -- applies identically here.
         jax_op = pcp_streaming_jax_op(
             op_name,
-            _streamidx_topk_dcp_jax,
+            jax_fn,
             donate_argnums=(2,),
             mesh=mesh,
             input_partition_specs=(
@@ -660,10 +881,13 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 replicated,  # page_indices
                 replicated,  # cu_q_lens
                 replicated,  # distribution
+                *((replicated,) * 3 if qb_overlap else ()),  # x, w_q, w_s
+                *((sharded,) if rank_operand else ()),  # rank ids
             ),
             output_partition_specs=(
                 sharded,  # new cache_kv
                 sharded,  # local_topk: [num_tokens, topk] per rank
+                *((replicated,) if qb_overlap else ()),  # q
             ),
         )
 
@@ -678,27 +902,29 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             page_indices,
             cu_q_lens,
             distribution,
+            *rest,  # (qb_x, qb_w, qb_s) with qb_overlap, then rank ids
             **kwargs,
         ):
-            del (
-                weights,
-                k_packed,
-                seq_lens,
-                page_indices,
-                cu_q_lens,
-                distribution,
-                kwargs,
-            )
-            return (
+            del weights, k_packed, seq_lens, page_indices, cu_q_lens, distribution
+            del kwargs
+            outs = (
                 torch.empty_like(cache_kv),
                 q_bytes.new_empty((q_bytes.shape[0], topk), dtype=torch.int32),
             )
+            if qb_overlap:
+                qb_x, qb_w = rest[0], rest[1]
+                outs += (qb_x.new_empty((qb_x.shape[0], qb_w.shape[1])),)
+            return outs
 
         jax_op.register_fake(_fake_streamidx_topk_dcp)
 
         def op(*args):
-            new_cache, local_topk = jax_op(*args)
+            if rank_tensor is not None:
+                args = (*args, rank_tensor)
+            new_cache, local_topk, *rest = jax_op(*args)
             args[2].copy_(new_cache)
+            if qb_overlap:
+                return local_topk, rest[0]
             return local_topk
 
         return op
@@ -709,7 +935,23 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         q_values: torch.Tensor,
         k: torch.Tensor,
         weights: torch.Tensor,
-    ) -> torch.Tensor:
+        qb_overlap: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+        """`qb_overlap=(x, w_q, w_s)` (TPU_INDEXER_QB_OVERLAP) also returns the
+        MLA q_b projection of `x`, computed under the SparseCore top-k: a pair
+        `(topk, q)`, `q` None where the op did not run (the caller then runs
+        the projection itself)."""
+        rows, q = self._forward_impl(hidden_states, q_values, k, weights, qb_overlap)
+        return rows if qb_overlap is None else (rows, q)
+
+    def _forward_impl(
+        self,
+        hidden_states: torch.Tensor,
+        q_values: torch.Tensor,
+        k: torch.Tensor,
+        weights: torch.Tensor,
+        qb_overlap: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None,
+    ) -> tuple[torch.Tensor, torch.Tensor | None]:
         assert q_values.dtype == torch.float8_e4m3fn, (
             f"streamindex_topk expects fp8 q, got {q_values.dtype}"
         )
@@ -730,13 +972,13 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         if isinstance(attn_metadata, dict):
             metadata = attn_metadata.get(self.k_cache.prefix)
         if not isinstance(metadata, AttentionMetadata):
-            return self.topk_indices_buffer
+            return self.topk_indices_buffer, None
 
         # uint8 [num_blocks, block_size_per_kv_packing, kv_packing, lkv_dim],
         # lkv_dim = head_dim + 1 padded to a 128 multiple
         kv_cache = self.k_cache.kv_cache
         if kv_cache.numel() == 0:
-            return self.topk_indices_buffer
+            return self.topk_indices_buffer, None
 
         seq_lens = metadata.seq_lens
         page_indices = metadata.block_tables
@@ -744,7 +986,22 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         rd = metadata.request_distribution
         distribution = torch.stack([rd[0], rd[0], rd[2]])
 
-        if self.topk_op_dcp is not None:
+        q_b_out = None
+        topk_op_dcp_qb = getattr(self, "topk_op_dcp_qb", None)
+        if qb_overlap is not None and topk_op_dcp_qb is not None:
+            # Same op plus the MLA q_b projection, run under the top-k.
+            topk_indices, q_b_out = topk_op_dcp_qb(
+                q_values.view(torch.uint8),
+                weights,
+                kv_cache,
+                k_quant_packed,
+                seq_lens,
+                page_indices,
+                cu_q_lens,
+                distribution,
+                *qb_overlap,
+            )
+        elif self.topk_op_dcp is not None:
             # DCP replicates the queries, so the token
             # inputs are already the whole batch in request-major order. What
             # comes back is not global positions but this rank's own local
@@ -776,8 +1033,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         if envs.TPU_INDEXER_TOPK_SHARED_READ:
             # Read back what the skip_topk layers will read, so the attention
             # index prep is one CSE class across them.
-            return self.topk_indices_buffer
-        return rows
+            return self.topk_indices_buffer, q_b_out
+        return rows, q_b_out
 
     def _write_topk_rows(
         self, num_tokens: int, topk_indices: torch.Tensor
@@ -878,8 +1135,16 @@ class VllmTPUIndexer(Indexer):
         self._rope_neox_permuted = True
 
     def forward(
-        self, hidden_states: torch.Tensor, qr: torch.Tensor, positions, rotary_emb
-    ) -> torch.Tensor:
+        self,
+        hidden_states: torch.Tensor,
+        qr: torch.Tensor,
+        positions,
+        rotary_emb,
+        q_b_layer: torch.nn.Module | None = None,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor | None]:
+        """`q_b_layer` (TPU_INDEXER_QB_OVERLAP): also return `q_b_layer(qr)`,
+        run inside the top-k op, as `(topk, q)`; `q` None where the op could
+        not take it (the caller runs `q_b_layer` itself)."""
         q, _ = self.wq_b(qr)
         q = q.view(-1, self.n_head, self.head_dim)
         # Fused wk + weights_proj: one GEMM, then split
@@ -935,7 +1200,15 @@ class VllmTPUIndexer(Indexer):
         )
         weights = weights.squeeze(-1).to(weights_dtype)
 
-        return self.indexer_op(hidden_states, q_fp8, k, weights)
+        if q_b_layer is None:
+            return self.indexer_op(hidden_states, q_fp8, k, weights)
+        operands = _qb_overlap_operands(q_b_layer)
+        if operands is None:
+            return self.indexer_op(hidden_states, q_fp8, k, weights), None
+        qb_x = qr.reshape(-1, qr.shape[-1])
+        return self.indexer_op(
+            hidden_states, q_fp8, k, weights, qb_overlap=(qb_x, *operands)
+        )
 
 
 def _fresh(t: torch.Tensor) -> torch.Tensor:
@@ -1050,6 +1323,24 @@ def rope_half_split(rotary_emb, positions, query, key):
         rotary_emb._match_cos_sin_cache_dtype(query),
         True,
     )
+
+
+def mla_q_rope_table(rotary_emb, positions: torch.Tensor, query: torch.Tensor):
+    """Per-token f32 `[T, 2, 128]` table for the in-kernel q rope
+    (TPU_MLA_DECODE_PROLOGUE): row 0 C = [cos, cos, cos, cos], row 1
+    S = [-sin, sin, -sin, sin], from the same cos/sin rows `rope_half_split`
+    reads (so the gather is shared with the k_pe rope). Lanes 64:128 line up
+    with q_pe in lanes 128:256 of the raw 192 + 64 q head; the kernel forms
+    x*C + rot(x)*S there. Negation and the f32 widening are exact."""
+    if isinstance(rotary_emb, DeepseekScalingRotaryEmbedding):
+        cache = rotary_emb.cos_sin_cache
+    else:
+        cache = rotary_emb._match_cos_sin_cache_dtype(query)
+    cos, sin = cache.index_select(0, positions.flatten()).chunk(2, dim=-1)
+    assert cos.shape[-1] == 32, f"rope half {cos.shape[-1]} != 32"
+    c = torch.cat([cos, cos, cos, cos], dim=-1).float()
+    s_ = torch.cat([-sin, sin, -sin, sin], dim=-1).float()
+    return torch.stack([c, s_], dim=1)
 
 
 def rope_half_split_leading(
@@ -1294,10 +1585,17 @@ class VllmTPUMLAAttention(MLAAttention):
 
         dcp_size = getattr(impl, "dcp_size", 1)
         self.sparse_mla_dcp_op = None
+        self.sparse_mla_dcp_rope_op = None
         if dcp_size > 1:
             self.sparse_mla_dcp_op = impl._build_sparse_mla_dcp_op(
                 self, dcp_size, impl.dcp_interleave_size
             )
+            # TPU_MLA_DECODE_PROLOGUE: the variant that takes the raw q head
+            # and ropes q_pe in the attention kernel (query replication only).
+            if envs.TPU_MLA_DECODE_PROLOGUE and self.dcp_q_replicate:
+                self.sparse_mla_dcp_rope_op = impl._build_sparse_mla_dcp_op(
+                    self, dcp_size, impl.dcp_interleave_size, q_rope=True
+                )
 
         # Post-load work the owning wrapper registered: it holds the q / kv_a
         # projections, but is not itself visited by the loader's attention
@@ -1428,6 +1726,37 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
 
         self.prefix = prefix
 
+        # TPU_MLA_DECODE_PROLOGUE: rope q_pe inside the DCP sparse attention
+        # kernel from the raw q head (see `mla_q_rope_table`). Only the qrep
+        # sparse DCP path consumes q that way; it also needs the NeoX
+        # half-split q layout (checked per call: set by a post-load hook).
+        self.decode_prologue = bool(
+            envs.TPU_MLA_DECODE_PROLOGUE
+            and self.is_sparse
+            and self.dcp_q_replicate
+            and self.rotary_emb is not None
+        )
+        if self.decode_prologue:
+            if not envs.TPU_DCP_MLA_SPLIT_Q_LSE:
+                raise NotImplementedError(
+                    "TPU_MLA_DECODE_PROLOGUE needs TPU_DCP_MLA_SPLIT_Q_LSE"
+                )
+            if (self.qk_nope_head_dim, self.qk_rope_head_dim) != (192, 64):
+                raise NotImplementedError(
+                    "TPU_MLA_DECODE_PROLOGUE assumes a 192 + 64 q head, got "
+                    f"{self.qk_nope_head_dim} + {self.qk_rope_head_dim}"
+                )
+
+        # TPU_INDEXER_QB_OVERLAP: hand q_b to the indexer, which runs it under
+        # its SparseCore top-k (`VllmTPUSparseAttnIndexer.forward_oot`).
+        self.qb_overlap = bool(
+            envs.TPU_INDEXER_QB_OVERLAP
+            and self.is_sparse
+            and self.indexer is not None
+            and not self.skip_topk
+            and self.q_lora_rank is not None
+        )
+
         # TPU_MLA_ROPE_NEOX_PERMUTE: set once the q / k_pe projection columns
         # are in half-split order, which is what switches `forward` to NeoX
         # rope -- the two can never disagree.
@@ -1518,6 +1847,7 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         q_c = None
         kv_lora = None
         output_gate = None
+        early_topk = None
 
         if self.kimi_preprocess is not None:
             assert self.fused_qkv_a_proj is not None
@@ -1560,7 +1890,20 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
                         dim=-1,
                     )
                 q_c = self.q_a_layernorm(q_c)
-                q = self.q_b_proj(q_c)[0]
+                if getattr(self, "qb_overlap", False) and self.kimi_preprocess is None:
+                    # The indexer runs on q_c anyway; it returns q too.
+                    assert self.indexer is not None
+                    early_topk, q = self.indexer(
+                        hidden_states,
+                        q_c,
+                        positions,
+                        self.indexer_rope_emb,
+                        q_b_layer=self.q_b_proj,
+                    )
+                    if q is None:
+                        q = self.q_b_proj(q_c)[0]
+                else:
+                    q = self.q_b_proj(q_c)[0]
             else:
                 assert self.kv_a_proj_with_mqa is not None, (
                     "kv_a_proj_with_mqa is required when q_lora_rank is None"
@@ -1585,7 +1928,20 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # Add head dim of 1 to k_pe
         k_pe = k_pe.unsqueeze(1)
 
-        if self.rotary_emb is not None:
+        q_rope_table = None
+        fold_q_rope = (
+            getattr(self, "decode_prologue", False)
+            and getattr(self, "_rope_neox_permuted", False)
+            and llama_4_scaling is None
+        )
+        if fold_q_rope:
+            # k_pe exactly as below (the unused q half is dead code to XLA);
+            # q_pe is roped in the attention kernel from the raw q head.
+            k_pe_dtype = k_pe.dtype
+            _, k_pe = rope_half_split(self.rotary_emb, positions, q_pe, k_pe)
+            k_pe = k_pe.to(dtype=k_pe_dtype)
+            q_rope_table = mla_q_rope_table(self.rotary_emb, positions, q)
+        elif self.rotary_emb is not None:
             q_pe_dtype = q_pe.dtype
             k_pe_dtype = k_pe.dtype
             if getattr(self, "_rope_neox_permuted", False):
@@ -1600,7 +1956,9 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
 
         topk_indices = None
         if self.is_sparse:
-            if self.indexer is not None and not self.skip_topk:
+            if early_topk is not None:
+                topk_index = early_topk
+            elif self.indexer is not None and not self.skip_topk:
                 topk_index = self.indexer(
                     hidden_states, q_c, positions, self.indexer_rope_emb
                 )
@@ -1620,7 +1978,10 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         # all-gather the heads itself; everything else takes this rank's shard.
         q_dcp_replicated = None
         if self.dcp_q_replicate:
-            if self.is_sparse:
+            if q_rope_table is not None:
+                # The raw q head view (q_pe un-roped) + the rope table.
+                q_dcp_replicated = (q_nope, q, q_rope_table)
+            elif self.is_sparse:
                 q_dcp_replicated = (q_nope, q_pe)
             local_view = cast(
                 DCPGroupColumnParallelLinear, self._q_proj_layer()

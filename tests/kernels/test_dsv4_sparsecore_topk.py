@@ -57,6 +57,8 @@ from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
     MAX_SLICE_WORDS,
     _align_to,
     _pick_partition,
+    _row_cap_dma_chunk,
+    _use_row_cap,
     sparsecore_topk,
 )
 
@@ -498,3 +500,158 @@ def test_scheduling_group_ids_do_not_change_the_selection(kind):
         np.sort(np.take_along_axis(scores, np.maximum(plain, 0), axis=1), axis=1),
         np.sort(np.take_along_axis(scores, np.maximum(grouped, 0), axis=1), axis=1),
     )
+
+
+# --- TPU_SC_TOPK_ROW_CAP: P=1 with length-bounded reads ----------------------
+
+# Lengths that straddle every boundary the capped path has: 16-lane vregs,
+# the 4096-word DMA chunk, k, the P=2 half-row edge at 32768, and the three
+# GLM-5.2 mixed-c8k per-rank prefixes (1,792 / 6,912 / 30,720).
+ROW_CAP_EDGES = (
+    0,
+    1,
+    15,
+    16,
+    17,
+    1792,
+    2047,
+    2048,
+    2049,
+    4095,
+    4096,
+    4097,
+    6912,
+    8191,
+    8193,
+    30720,
+    32767,
+    32768,
+    32769,
+    40000,
+    65535,
+    65536,
+)
+
+ROW_CAP_SHAPES = [
+    # The indexer's mixed chunk call: b=256 rows of the 64K bucket, 8 waves.
+    pytest.param(256, 65536, 2048, id="b256-n65536"),
+    # A ragged last wave (40 = 32 + 8) and a single exact wave.
+    pytest.param(40, 65536, 2048, id="b40-n65536"),
+    pytest.param(32, 65536, 2048, id="b32-n65536"),
+    # n not a multiple of 4096: the DMA chunk shrinks to divide n.
+    pytest.param(64, 40960, 2048, id="b64-n40960"),
+    pytest.param(64, 33024, 512, id="b64-n33024-k512"),
+]
+
+
+def _row_cap_lengths(b, n, rng):
+    edges = [min(e, n) for e in ROW_CAP_EDGES]
+    lengths = [edges[i % len(edges)] for i in range(b)]
+    # Past the edge list, random lengths.
+    for i in range(len(edges), b):
+        lengths[i] = int(rng.integers(0, n + 1))
+    return np.array(lengths, np.int32)
+
+
+def _row_cap_scores(kind, b, n, lengths, rng):
+    if kind == "huge_past_length":
+        # Everything at or past a row's length outranks every real score, so a
+        # read past the cap -- stale tile memory from the previous wave's row,
+        # or the HBM tail -- would be selected.
+        scores = rng.standard_normal((b, n), dtype=np.float32)
+        cols = np.arange(n)[None, :]
+        scores[cols >= lengths[:, None]] = 1e30
+        return scores
+    if kind == "neg_inf_mix":
+        scores = rng.standard_normal((b, n), dtype=np.float32)
+        scores[rng.random((b, n)) < 0.5] = -np.inf
+        return scores
+    return _scores(kind, b, n, rng)
+
+
+def _run_cap(scores, k, lengths, row_cap, return_scores):
+    out = sparsecore_topk(
+        jnp.asarray(scores),
+        k,
+        jnp.asarray(lengths),
+        row_cap=row_cap,
+        return_scores=return_scores,
+    )
+    out = jax.block_until_ready(out)
+    if return_scores:
+        return np.asarray(out[0]), np.asarray(out[1])
+    return np.asarray(out), None
+
+
+@pytest.mark.parametrize("b,n,k", ROW_CAP_SHAPES)
+def test_row_cap_retargets_exactly_these_shapes(b, n, k):
+    """Every row-cap shape is one the default path splits at P >= 2."""
+    assert _use_row_cap(b, n, True)
+    assert not _use_row_cap(b, n, False)
+    assert _pick_partition(b, n, k) >= 2
+    assert n % _row_cap_dma_chunk(n) == 0
+    # Out of scope: fewer rows than subcores, one-slice rows, 1M rows.
+    assert not _use_row_cap(16, 65536, True)
+    assert not _use_row_cap(256, 32768, True)
+    assert not _use_row_cap(256, 131072, True)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("b,n,k", ROW_CAP_SHAPES)
+@pytest.mark.parametrize(
+    "kind", ["random", "heavy_ties", "strict_desc", "neg_inf_mix", "huge_past_length"]
+)
+@pytest.mark.parametrize("return_scores", [False, True])
+def test_row_cap_is_bitwise_identical(b, n, k, kind, return_scores):
+    """Same indices in the same order, same keys, as the default P>=2 path.
+
+    And independently exact against the numpy reference, so a fault shared by
+    both paths cannot hide behind the bitwise comparison.
+    """
+    rng = np.random.default_rng(SEED)
+    lengths = _row_cap_lengths(b, n, rng)
+    scores = _row_cap_scores(kind, b, n, lengths, rng)
+
+    cap_hlo = sparsecore_topk.lower(
+        jnp.asarray(scores),
+        k,
+        jnp.asarray(lengths),
+        row_cap=True,
+        return_scores=return_scores,
+    ).as_text()
+    assert "_p1_cap" in cap_hlo, "row_cap=True did not take the capped path"
+
+    base_idx, base_keys = _run_cap(scores, k, lengths, False, return_scores)
+    cap_idx, cap_keys = _run_cap(scores, k, lengths, True, return_scores)
+    np.testing.assert_array_equal(cap_idx, base_idx)
+    if return_scores:
+        np.testing.assert_array_equal(cap_keys, base_keys)
+    assert _mismatch(scores, cap_idx, k, lengths) is None
+
+
+@pytest.mark.tpu_test
+def test_row_cap_comparison_detects_a_difference():
+    """Positive control for the bitwise comparison above.
+
+    (1) Two winners swapped in one row: the same set, a different order, which
+    the bitwise assertion must reject. (2) One row's length shortened by 4096
+    words: the default path's output differs from the capped one on that row
+    only, so the capped kernel really reads the lengths it is given.
+    """
+    b, n, k = 256, 65536, 2048
+    rng = np.random.default_rng(SEED)
+    lengths = _row_cap_lengths(b, n, rng)
+    scores = _row_cap_scores("random", b, n, lengths, rng)
+    cap_idx, _ = _run_cap(scores, k, lengths, True, False)
+
+    swapped = cap_idx.copy()
+    row = int(np.flatnonzero(lengths >= 30720)[0])
+    swapped[row, [0, 1]] = swapped[row, [1, 0]]
+    with pytest.raises(AssertionError):
+        np.testing.assert_array_equal(swapped, cap_idx)
+
+    short = lengths.copy()
+    short[row] -= 4096
+    base_short, _ = _run_cap(scores, k, short, False, False)
+    differs = np.flatnonzero((base_short != cap_idx).any(axis=1))
+    assert differs.tolist() == [row], differs[:8]

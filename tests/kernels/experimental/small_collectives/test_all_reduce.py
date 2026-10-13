@@ -97,6 +97,73 @@ def test_a_wrong_rank_order_fails_the_oracle(mesh):
         assert not within(got[core], want, tolerance).all()
 
 
+# --- valid rows (fold path) ---------------------------------------------------
+
+TILE_ROWS = 16
+
+
+def _valid_rows(mesh, per_core, n_valid):
+    meta = np.stack([np.full(N, n_valid), np.arange(N)], 1).astype(np.int32)
+
+    def body(x, m):
+        return ar.small_all_reduce_valid_rows(
+            x,
+            m.reshape(2)[:1],
+            m.reshape(2)[1:],
+            num_cores=N,
+            axis=AXIS,
+            tile_rows=TILE_ROWS,
+        )
+
+    return run_sharded(mesh, body, per_core, meta)
+
+
+def _plain(mesh, per_core):
+    return _all_reduce(mesh, per_core, range(N), form="twoshot")
+
+
+@pytest.mark.parametrize("hidden", [4096, 6144])
+@pytest.mark.parametrize("rows", [16, 32])
+def test_valid_rows_are_bitwise_the_plain_two_shot(mesh, rows, hidden):
+    """Every n_valid on both sides of fold_rows: rows < n_valid bitwise equal
+    to the plain two-shot (and within the oracle), rows >= n_valid +0 on the
+    fold path and the plain sum on the full path."""
+    _, fold_rows = ar.fold_geometry(rows, hidden, N, TILE_ROWS)
+    per_core = blocks((N, rows, hidden), seed=rows + hidden)
+    plain = _plain(mesh, per_core)
+    want, tolerance = exact_sum(per_core), sum_tolerance(per_core)
+    for n_valid in sorted({0, 1, fold_rows, fold_rows + 1, rows}):
+        got = _valid_rows(mesh, per_core, n_valid)
+        for core in range(N):
+            g, p = got[core], plain[core]
+            assert np.array_equal(
+                g[:n_valid].view(np.uint16), p[:n_valid].view(np.uint16)
+            ), f"n_valid={n_valid} core {core}: valid rows differ from the two-shot"
+            assert within(g[:n_valid], want[:n_valid], tolerance[:n_valid]).all()
+            if n_valid <= fold_rows:
+                assert not g[n_valid:].view(np.uint16).any(), "padding is not +0"
+            else:
+                assert np.array_equal(g.view(np.uint16), p.view(np.uint16))
+
+
+def test_an_understated_valid_count_fails_the_oracle(mesh):
+    """Positive control: one valid row reported as padding comes out +0 and
+    the oracle has to see it."""
+    rows, hidden = 16, 4096
+    _, fold_rows = ar.fold_geometry(rows, hidden, N, TILE_ROWS)
+    per_core = blocks((N, rows, hidden), seed=5)
+    want, tolerance = exact_sum(per_core), sum_tolerance(per_core)
+    got = _valid_rows(mesh, per_core, fold_rows - 1)
+    assert not within(got[0][:fold_rows], want[:fold_rows], tolerance[:fold_rows]).all()
+
+
+def test_fold_geometry():
+    assert ar.fold_geometry(16, 6144, 16, 16) == (3, 5)  # GLM-5.2 on 16 cores
+    assert ar.fold_geometry(16, 6144, 8, 16) == (6, 2)
+    assert ar.fold_geometry(8, 6144, 16, 16) is None  # fewer rows than a tile
+    assert ar.fold_geometry(16, 2048, 16, 16) is None  # one lane group per chunk
+
+
 def test_refuses_a_width_that_does_not_split():
     with pytest.raises(ValueError, match="lanes"):
         ar.small_all_reduce(jnp.zeros((16, 4000), jnp.bfloat16), num_cores=N, axis=AXIS)

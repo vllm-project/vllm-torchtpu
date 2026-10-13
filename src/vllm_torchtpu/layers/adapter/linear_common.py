@@ -4,11 +4,13 @@ from threading import Lock
 import jax
 import jax.numpy as jnp
 import torch
+from jax.experimental import xla_metadata
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul import fp8_skinny
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
@@ -45,6 +47,9 @@ WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
 FP8_PALLAS_N_ATTR = "_tpu_fp8_pallas_n_out"
 FP8_PALLAS_WEIGHT = "weight_pallas"
 FP8_PALLAS_SCALE = "weight_scale_pallas"
+# TPU_IDX_TOPK_SCHED_GROUPS: the kernel's XLA scheduling group, on a DCP indexer
+# layer's q_b_proj (G2: it runs under the cross-rank SparseCore top-k).
+FP8_PALLAS_SCHED_GROUP_ATTR = "_tpu_fp8_pallas_sched_group"
 
 
 def _get_x_q_dtype(w_q_dtype: jnp.dtype) -> jnp.dtype:
@@ -168,6 +173,17 @@ def _fp8_linear_pallas_jax(
     `(w_k, s_k)`, when given, is the kernel's zero-padded `[n_in, n_pad]` copy of a
     weight whose width is not a lane multiple; the kernel output is cut back to it.
     """
+    return _fp8_linear_pallas(x, w_q, w_s, w_k, s_k)
+
+
+def _fp8_linear_pallas(
+    x: jax.Array,
+    w_q: jax.Array,
+    w_s: jax.Array,
+    w_k: jax.Array | None,
+    s_k: jax.Array | None,
+    scheduling_group_id: int | None = None,
+) -> jax.Array:
     n_out = w_q.shape[1]
     if w_k is None:
         kw, ks = w_q, w_s
@@ -175,31 +191,73 @@ def _fp8_linear_pallas_jax(
         assert s_k is not None, "the padded weight w_k comes with its scale s_k"
         kw, ks = w_k, s_k
     if fp8_skinny.supports(x.shape[0], kw, ks):
-        return fp8_skinny.fp8_skinny_matmul(x, kw, ks, n_logical=n_out)
+        out = fp8_skinny.fp8_skinny_matmul(
+            x,
+            kw,
+            ks,
+            n_logical=n_out,
+            scale_dma=envs.TPU_FP8_SKINNY_SCALE_DMA
+            and fp8_skinny.scale_dma_applies(*kw.shape),
+        )
+        if scheduling_group_id is not None:
+            # Tags the op that produced `out`: the kernel itself only when no
+            # cut back to `n_out` follows it, i.e. without a padded copy.
+            if w_k is not None:
+                raise ValueError("a scheduling group needs an unpadded weight")
+            out = xla_metadata.set_xla_metadata(
+                out, _scheduling_group_id=scheduling_group_id
+            )
+        return out
     return xla_quantized_matmul(x, w_q, w_s)
 
 
-_fp8_linear_pallas_ops: dict[bool, Callable] = {}
+def _fp8_linear_pallas_grouped_jax(scheduling_group_id: int) -> Callable:
+    """`_fp8_linear_pallas_jax` with the kernel in XLA scheduling group
+    `scheduling_group_id` (`TPU_IDX_TOPK_SCHED_GROUPS`). The id is baked into
+    the body rather than passed, so each id is its own op and lowering."""
+
+    def _fp8_linear_pallas_grouped(
+        x: jax.Array,
+        w_q: jax.Array,
+        w_s: jax.Array,
+        w_k: jax.Array | None = None,
+        s_k: jax.Array | None = None,
+    ) -> jax.Array:
+        return _fp8_linear_pallas(x, w_q, w_s, w_k, s_k, scheduling_group_id)
+
+    return _fp8_linear_pallas_grouped
 
 
-def get_fp8_linear_pallas_op(padded_copy: bool) -> Callable:
-    """The cached torch op; build it outside Dynamo (load time), it takes a Lock."""
-    op = _fp8_linear_pallas_ops.get(padded_copy)
+_fp8_linear_pallas_ops: dict[tuple[bool, int | None], Callable] = {}
+
+
+def get_fp8_linear_pallas_op(
+    padded_copy: bool, scheduling_group_id: int | None = None
+) -> Callable:
+    """The cached torch op; build it outside Dynamo (load time), it takes a Lock.
+
+    A `scheduling_group_id` gets its own op (`TPU_IDX_TOPK_SCHED_GROUPS`)."""
+    key = (padded_copy, scheduling_group_id)
+    op = _fp8_linear_pallas_ops.get(key)
     if op is not None:
         return op
     with _quantized_matmul_kernel_op_lock:
-        op = _fp8_linear_pallas_ops.get(padded_copy)
+        op = _fp8_linear_pallas_ops.get(key)
         if op is not None:
             return op
         name = "pallas::fp8_linear_pallas" + ("_padded" if padded_copy else "")
-        op = pallas.jax_op(name, _fp8_linear_pallas_jax)
+        fn = _fp8_linear_pallas_jax
+        if scheduling_group_id is not None:
+            name += f"_g{scheduling_group_id}"
+            fn = _fp8_linear_pallas_grouped_jax(scheduling_group_id)
+        op = pallas.jax_op(name, fn)
 
         def _fake(x: torch.Tensor, w_q: torch.Tensor, w_s: torch.Tensor, *rest):
             del w_s, rest
             return torch.empty(x.shape[0], w_q.shape[1], dtype=x.dtype, device=x.device)
 
         op.register_fake(_fake)
-        _fp8_linear_pallas_ops[padded_copy] = op
+        _fp8_linear_pallas_ops[key] = op
         return op
 
 
@@ -209,10 +267,11 @@ def quantized_matmul_pallas(
     w_s: torch.Tensor,
     w_kernel: torch.Tensor | None = None,
     s_kernel: torch.Tensor | None = None,
+    scheduling_group_id: int | None = None,
 ) -> torch.Tensor:
     """Torch entry point for `TPU_FP8_LINEAR_PALLAS` (per-channel FP8, (k, n) weight).
     Same contract as `quantized_matmul`; `(w_kernel, s_kernel)` is the optional padded
-    kernel copy."""
+    kernel copy, `scheduling_group_id` the kernel's XLA scheduling group."""
     if x.shape[-1] != w_q.shape[0]:
         raise ValueError(
             f"Input hidden dim {x.shape[-1]} must match weight hidden dim "
@@ -220,9 +279,11 @@ def quantized_matmul_pallas(
         )
     x_2d = x.reshape(-1, x.shape[-1])
     if w_kernel is None:
-        out_2d = get_fp8_linear_pallas_op(False)(x_2d, w_q, w_s)
+        out_2d = get_fp8_linear_pallas_op(False, scheduling_group_id)(x_2d, w_q, w_s)
     else:
-        out_2d = get_fp8_linear_pallas_op(True)(x_2d, w_q, w_s, w_kernel, s_kernel)
+        out_2d = get_fp8_linear_pallas_op(True, scheduling_group_id)(
+            x_2d, w_q, w_s, w_kernel, s_kernel
+        )
     return out_2d.reshape(*x.shape[:-1], w_q.shape[1])
 
 

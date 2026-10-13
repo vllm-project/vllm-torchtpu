@@ -11,6 +11,7 @@ import numpy as np
 import torch
 from vllm.compilation.backends import set_model_tag
 from vllm.config import VllmConfig, get_layers_from_vllm_config, set_current_vllm_config
+from vllm.distributed.parallel_state import get_tp_group
 from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
@@ -33,6 +34,7 @@ from vllm_torchtpu.spec_decode.utils import (
     iter_mtp_shared_heads,
     maybe_share_embeddings,
     maybe_share_lm_head,
+    shard_draft_eh_proj,
     vocab_parallel_argmax,
 )
 from vllm_torchtpu.utils import synchronize_tensors
@@ -253,6 +255,12 @@ class Eagle3Proposer:
             get_layers_from_vllm_config(self.vllm_config, AttentionLayerBase).keys()
         )
         self._load_draft_model()
+        if envs.TPU_FUSED_ADD_RMSNORM:
+            # The draft model is traced once for every token bucket, so its
+            # norms cannot branch on the token count: keep them upstream.
+            from vllm_torchtpu.layers.adapter import rmsnorm as _tpu_rmsnorm
+
+            _tpu_rmsnorm.keep_upstream_path(self.draft_model)
         all_attn_layers = get_layers_from_vllm_config(
             self.vllm_config, AttentionLayerBase
         )
@@ -274,6 +282,24 @@ class Eagle3Proposer:
             self._draft_tp_matches_target,
             materialize_if_mismatched=False,
         )
+        # TPU_MTP_EH_PROJ_TP: split the replicated MTP eh_proj by output column
+        # across TP (+ one all-gather) so a draft pass streams H*2H/tp weight
+        # bytes, not H*2H. Needs TP-identical input rows: no PCP.
+        if (
+            envs.TPU_MTP_EH_PROJ_TP
+            and not self._draft_replicated
+            and self._draft_tp_matches_target
+            and not self.runner._pcp_enabled
+        ):
+            tp_group = get_tp_group()
+            n_eh = shard_draft_eh_proj(
+                self.draft_model, tp_group.rank_in_group, tp_group.world_size
+            )
+            logger.info(
+                "Draft eh_proj column-parallel over tp=%d: %d layer(s).",
+                tp_group.world_size,
+                n_eh,
+            )
         # TPU_SAMPLER_VOCAB_PARALLEL: the greedy draft argmax reduces per logit
         # shard and all-gathers (max, id) per row, not [rows, vocab] logits.
         # The fused draft loop also argmaxes compute_logits; it keeps the

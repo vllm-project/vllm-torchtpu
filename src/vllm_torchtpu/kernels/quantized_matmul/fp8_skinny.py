@@ -45,6 +45,11 @@ LANE = 128
 TUNED = {  # (k, n) -> (split, tile, nbuf)
     (6144, 2688): ("k", 1024, 3),  # q_a + kv_a (padded copy of 2624)
     (2048, 16384): ("n", 1024, 4),  # q_b
+    (2048, 8192): (
+        "n",
+        1024,
+        4,
+    ),  # q_b at half the heads (scaled microbenchmark twin), not tuned
     (1024, 6144): ("n", 2048, 3),  # o_proj
     (6144, 1536): ("k", 1536, 3),  # dense gate_up
 }
@@ -89,9 +94,20 @@ def _kernel(
     n_tiles,
     nbuf,
     q_dtype,
+    scale_dma,
 ):
     # Weight slice: 0 in production (a [1, ...] view); a stack index in the benchmark.
     s = idx_ref[0]
+
+    ws_copy = None
+    if scale_dma:
+        # The per-channel scale arrives as an HBM ref; copy it to VMEM here, issued
+        # ahead of the weight ring so its latency hides under the first tile's.
+        ws_vmem, ws_sem = acc[-2], acc[-1]
+        acc = acc[:-2]
+        ws_copy = pltpu.make_async_copy(ws_ref, ws_vmem, ws_sem)
+        ws_copy.start()
+        ws_ref = ws_vmem
 
     def copy(j):
         if split == "n":
@@ -124,6 +140,9 @@ def _kernel(
             y = jax.lax.dot_general(
                 xq_ref[...], w, dn, preferred_element_type=jnp.float32
             )
+            if scale_dma and j == 0:
+                assert ws_copy is not None
+                ws_copy.wait()
             o_ref[:, cols] = (y * xs_ref[...] * ws_ref[:, cols]).astype(o_ref.dtype)
         else:
             y = jax.lax.dot_general(
@@ -139,11 +158,14 @@ def _kernel(
         if j + nbuf < n_tiles:
             copy(j + nbuf).start()
     if split == "k":
+        if scale_dma:
+            assert ws_copy is not None
+            ws_copy.wait()
         o_ref[...] = (acc[0][...] * xs_ref[...] * ws_ref[...]).astype(o_ref.dtype)
 
 
 @functools.cache
-def _build(m, k, n, n_stack, w_dtype, out_dtype, split, t, nbuf):
+def _build(m, k, n, n_stack, w_dtype, out_dtype, split, t, nbuf, scale_dma=False):
     full = k if split == "k" else n
     if full % t or t % LANE:
         raise ValueError(
@@ -160,27 +182,40 @@ def _build(m, k, n, n_stack, w_dtype, out_dtype, split, t, nbuf):
     ]
     if split == "k":
         scratch.append(pltpu.VMEM((m, n), jnp.float32))
+    if scale_dma:
+        scratch += [pltpu.VMEM((1, n), jnp.float32), pltpu.SemaphoreType.DMA]
     kern = functools.partial(
-        _kernel, split=split, t=t, n_tiles=n_tiles, nbuf=nbuf, q_dtype=w_dtype
+        _kernel,
+        split=split,
+        t=t,
+        n_tiles=n_tiles,
+        nbuf=nbuf,
+        q_dtype=w_dtype,
+        scale_dma=scale_dma,
     )
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=1,
         grid=(1,),
         in_specs=[
             pl.BlockSpec((m, k), lambda g, idx: (0, 0)),
-            pl.BlockSpec((1, n), lambda g, idx: (0, 0)),
+            # Scale [1, n]: a VMEM block, or with `scale_dma` an HBM ref the kernel
+            # copies itself (see `fp8_skinny_matmul_stacked`).
+            pl.BlockSpec(memory_space=pltpu.HBM)
+            if scale_dma
+            else pl.BlockSpec((1, n), lambda g, idx: (0, 0)),
             # W [s, k, n], pinned to HBM (MSA cannot move it into VMEM).
             pl.BlockSpec(memory_space=pltpu.HBM),
         ],
         out_specs=pl.BlockSpec((m, n), lambda g, idx: (0, 0)),
         scratch_shapes=scratch,
     )
+    sd = "_sd" if scale_dma else ""
     return pl.pallas_call(
         kern,
         out_shape=jax.ShapeDtypeStruct((m, n), out_dtype),
         grid_spec=grid_spec,
         compiler_params=pltpu.CompilerParams(dimension_semantics=("arbitrary",)),
-        name=f"fp8_skinny_{split}{t}_b{nbuf}_m{m}_k{k}_n{n}",
+        name=f"fp8_skinny_{split}{t}_b{nbuf}{sd}_m{m}_k{k}_n{n}",
     )
 
 
@@ -191,9 +226,10 @@ def fp8_skinny_matmul(
     *,
     n_logical: int | None = None,
     config: tuple[str, int, int] | None = None,
+    scale_dma: bool = False,
 ) -> jax.Array:
     """x [m<=16, k] bf16, w_q fp8 [k, n] with n % 128 == 0, w_s f32 [n]
-    -> [m, n_logical or n] in x.dtype."""
+    -> [m, n_logical or n] in x.dtype. `scale_dma`: see `fp8_skinny_matmul_stacked`."""
     return fp8_skinny_matmul_stacked(
         x,
         w_q[None],
@@ -201,19 +237,57 @@ def fp8_skinny_matmul(
         w_s,
         n_logical=n_logical,
         config=config,
+        scale_dma=scale_dma,
     )
 
 
-def fp8_skinny_matmul_stacked(x, w_stack, idx, w_s, *, n_logical=None, config=None):
-    """As `fp8_skinny_matmul`; the kernel reads the weight from `w_stack[idx[0]]`."""
+@functools.partial(jax.jit, static_argnums=0)
+def _call_scale_in_hbm(call, idx, x, w_s, w_stack):
+    # The constraint sets the scale operand's aval memory space, which pallas_call
+    # lowers to the custom call's `input_memory_space_colors` (HBM = 0). It only
+    # binds a pallas_call input and cannot run eagerly, hence the jit around both.
+    return call(idx, x, pltpu.with_memory_space_constraint(w_s, pltpu.HBM), w_stack)
+
+
+def fp8_skinny_matmul_stacked(
+    x, w_stack, idx, w_s, *, n_logical=None, config=None, scale_dma=False
+):
+    """As `fp8_skinny_matmul`; the kernel reads the weight from `w_stack[idx[0]]`.
+
+    `scale_dma` (TPU_FP8_SKINNY_SCALE_DMA): pass the per-channel scale as an HBM
+    operand and DMA it to VMEM inside the kernel, issued with the weight ring.
+    Otherwise XLA stages the scale (o_proj's f32[6144], 24 KB) into VMEM with a copy
+    its memory-space assignment places one instruction before the call, exposing the
+    DMA issue latency (~0.8 us) every layer. Same values, same arithmetic:
+    bit-identical outputs.
+    """
     m, k = x.shape
     n_stack, _, n = w_stack.shape
     split, t, nbuf = config or pick_config(k, n)
-    call = _build(m, k, n, n_stack, w_stack.dtype, x.dtype, split, t, nbuf)
-    out = call(idx, x, w_s.reshape(1, n).astype(jnp.float32), w_stack)
+    call = _build(m, k, n, n_stack, w_stack.dtype, x.dtype, split, t, nbuf, scale_dma)
+    w_s2 = w_s.reshape(1, n).astype(jnp.float32)
+    if scale_dma:
+        out = _call_scale_in_hbm(call, idx, x, w_s2, w_stack)
+    else:
+        out = call(idx, x, w_s2, w_stack)
     if n_logical is not None and n_logical != n:
         out = out[:, :n_logical]
     return out
+
+
+# Sites where TPU_FP8_SKINNY_SCALE_DMA is used in the model: those whose XLA scale
+# copy was measured exposed on GLM-5.2-FP8 decode (twin j-69560162 / j-dae7fb62:
+# o_proj's f32[6144] copy sits one instruction before the call, ~0.8 us per layer).
+# q_b's scale copy is hidden there, and standalone the in-kernel copy measured
+# +0.3-0.5 us per call at (2048, 16384), so it stays as today. A site's N must be a
+# multiple of 1024: the scale's [n] -> [1, n] reshape is then a bitcast of the f32
+# T(1024) layout and the HBM operand is the parameter itself (at gate_up's 1536 the
+# reshape is a real op whose output XLA would write to HBM).
+SCALE_DMA_SITES = {(1024, 6144)}  # o_proj
+
+
+def scale_dma_applies(k: int, n: int) -> bool:
+    return (k, n) in SCALE_DMA_SITES
 
 
 def padded_n(n: int, multiple: int = LANE) -> int:

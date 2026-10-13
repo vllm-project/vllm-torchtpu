@@ -1064,6 +1064,7 @@ def _effective_row_lengths(
         "interleave_size",
         "return_scores",
         "skip_empty_decode",
+        "skip_empty_decode_chunked",
     ),
 )
 def streamindex_topk(
@@ -1093,7 +1094,9 @@ def streamindex_topk(
     interleave_size: int = 1,
     return_scores: bool = False,
     skip_empty_decode: bool = False,
-) -> jax.Array | tuple[jax.Array, jax.Array]:
+    skip_empty_decode_chunked: bool = False,
+    final_sc_tie: tuple = (),
+) -> jax.Array | tuple[jax.Array, ...]:
     """StreamIndex Top-K retrieval.
 
     Args:
@@ -1158,6 +1161,19 @@ def streamindex_topk(
         DECODE passes, which would launch over an empty range. Unchunked calls
         only. The MIXED pass writes the same rows either way, so the result is
         identical.
+      skip_empty_decode_chunked: the chunked counterpart. The DECODE passes
+        cover sequences `[0, distribution[1])`, one token each, so their rows
+        are the first `distribution[1] <= max_num_seqs` tokens: every chunk
+        starting at or past `max_num_seqs` drops them statically, and chunk 0
+        branches around them at runtime as `skip_empty_decode` does. Exact
+        for the same reason.
+      final_sc_tie: arrays to tie, with an `optimization_barrier`, to the
+        scores the last chunk's SparseCore top-k reads; returned last (as a
+        tuple) so work on them cannot be scheduled before those scores exist.
+        The barrier takes a one-row slice of the scores, not the scores, so
+        the SparseCore operand keeps its layout (a barrier on the whole
+        buffer costs two relayout copies of it). Values are untouched. Needs
+        `enable_early_exit=False`.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions
@@ -1550,6 +1566,7 @@ def streamindex_topk(
         )
         topk_idxs = []
         topk_scores_list = []
+        tied = ()
         for m in range(num_chunks):
             # Group g holds chunk g's SparseCore top-k and chunk g+1's TensorCore
             # scoring, so the scheduler emits `sc(g).start, tc(g+1), sc(g).done`.
@@ -1566,11 +1583,21 @@ def streamindex_topk(
                 out_dtype=out_dtype,
                 scheduling_group_id=tc_group,
             )
-            if skip_empty_decode and num_chunks == 1:
+            mixed_only = tuple(p for p in passes if p[0]["case"] == MlaCase.MIXED)
+            if (
+                skip_empty_decode_chunked
+                and num_chunks > 1
+                and m * chunk_len >= max_num_seqs
+            ):
+                # No DECODE row can sit in this chunk: they are the first
+                # distribution[1] <= max_num_seqs tokens.
+                scores = scores_for(mixed_only)
+            elif (skip_empty_decode and num_chunks == 1) or (
+                skip_empty_decode_chunked and num_chunks > 1 and m == 0
+            ):
                 # The DECODE passes cover [0, distribution[1]); with it empty,
                 # the MIXED pass alone allocates the buffer and writes every row
                 # it would have written behind them.
-                mixed_only = tuple(p for p in passes if p[0]["case"] == MlaCase.MIXED)
                 scores = jax.lax.cond(
                     distribution[1] > 0,
                     lambda f=scores_for: f(passes),
@@ -1584,6 +1611,10 @@ def streamindex_topk(
                     scores,
                     ((0, 0), (0, k - scores.shape[1])),
                     constant_values=BITS_NEG_INF,
+                )
+            if final_sc_tie and m == num_chunks - 1:
+                _, tied = lax.optimization_barrier(
+                    (scores[:1, :128], tuple(final_sc_tie))
                 )
 
             if return_scores:
@@ -1610,15 +1641,16 @@ def streamindex_topk(
         out = topk_idxs[0] if len(topk_idxs) == 1 else jnp.concatenate(topk_idxs)
         out = out[:max_num_tokens, :k]
 
+        extra = (tied,) if final_sc_tie else ()
         if cp_size == 1 and not return_scores:
-            return out
+            return (out, *extra) if extra else out
 
         # Columns in `out` are rank-local compressed positions. Even when
         # `cp_size > 1`, `streamindex_topk` only returns rank-local indices (callers
         # like `streamindex_topk_dcp` resolve winners directly against their local
         # candidate list without converting to global coordinates).
         if not return_scores:
-            return out
+            return (out, *extra) if extra else out
 
         scores_out = (
             topk_scores_list[0]
@@ -1626,7 +1658,7 @@ def streamindex_topk(
             else jnp.concatenate(topk_scores_list)
         )
         scores_out = scores_out[:max_num_tokens, :k]
-        return out, scores_out
+        return (out, scores_out, *extra)
 
     def _fast_path(_):
         token_idx = jnp.arange(q.shape[0])
@@ -1648,6 +1680,8 @@ def streamindex_topk(
 
     if not enable_early_exit:
         return _common_path(None)
+    if final_sc_tie:
+        raise ValueError("final_sc_tie needs enable_early_exit=False")
     return jax.lax.cond(
         jnp.max(seq_lens) // compression_ratio <= k,
         _fast_path,
@@ -1674,6 +1708,11 @@ def streamindex_topk(
         "dcp_axis_name",
         "a2a_merge",
         "skip_empty_decode",
+        "skip_empty_decode_chunked",
+        "global_scheduling_group_id",
+        "overlap_fn",
+        "merge_overlap_fn",
+        "overlap_pin_max_tokens",
     ),
 )
 def streamindex_topk_dcp(
@@ -1700,7 +1739,14 @@ def streamindex_topk_dcp(
     dcp_axis_name: str = DCP_AXIS_NAME,
     a2a_merge: bool = False,
     skip_empty_decode: bool = False,
-) -> jax.Array:
+    skip_empty_decode_chunked: bool = False,
+    global_scheduling_group_id: int | None = None,
+    dcp_rank_ids: jax.Array | None = None,
+    overlap_fn=None,
+    overlap_args: tuple = (),
+    merge_overlap_fn=None,
+    overlap_pin_max_tokens: int | None = None,
+) -> jax.Array | tuple[jax.Array, Any]:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
     Architecture:
@@ -1769,8 +1815,38 @@ def streamindex_topk_dcp(
       a2a_merge: merge over the token axis with an `all_to_all` instead of over
         the candidate axis with an `all_gather`; see above. Same result.
       skip_empty_decode: forwarded to `streamindex_topk`; see there.
+      skip_empty_decode_chunked: forwarded to `streamindex_topk`; see there.
+      global_scheduling_group_id: XLA scheduling group of the cross-rank
+        SparseCore merge (stage 2), which the layer's independent TensorCore
+        work joins from outside this op (`TPU_IDX_TOPK_SCHED_GROUPS`). None =
+        no group. Same result.
+      dcp_rank_ids: optional i32[dcp_size] sharded over `dcp_axis_name`, entry
+        r = r (`TPU_DCP_RANK_OPERAND`): each shard reads its own rank from its
+        one element instead of an `all_to_all` of an iota. Same result.
+      overlap_fn: optional TensorCore work, independent of the top-k, to run
+        while the TensorCore would otherwise idle on the SparseCore calls.
+        `overlap_fn(*overlap_args)` (replicated args; result replicated) is
+        pinned between the local top-k's input scores and the candidate
+        all-gather by `optimization_barrier`s -- the only window it can then
+        land in is the local SparseCore call's. Only `overlap_args[0]` (the
+        activation) goes through the first barrier; the rest (weights) are
+        passed as they are, since a barrier on a parameter makes XLA copy it.
+        `merge_overlap_fn(result)`,
+        if given, is pinned the same way between the all-gather and the
+        merge's consumers, i.e. under the merge call. The barriers only add
+        ordering edges: the top-k and the work compute the same values as
+        apart. XLA scheduling groups (`_scheduling_group_id`) cannot do this:
+        `legalize-scheduling-annotations` strips groups that hold a
+        SparseCore kernel (it is not yet an async op there). With chunking
+        or the a2a merge the work runs unpinned.
+      overlap_args: tuple of replicated arrays `overlap_fn` takes.
+      merge_overlap_fn: see `overlap_fn`.
+      overlap_pin_max_tokens: pin only buckets of at most this many tokens
+        (the decode buckets, whose TensorCore idles on the SparseCore calls);
+        larger ones run the work unpinned. None pins every bucket.
 
     Returns:
+      With `overlap_fn`, a pair `(local_topk, overlap_out)`. Otherwise:
       i32[padded_num_tokens, k] of this rank's own *local* cache indices for
       every token, packed into a prefix and `-1` padded, sharded over
       `dcp_axis_name` (global leading dim `dcp_size * padded_num_tokens`).
@@ -1793,10 +1869,28 @@ def streamindex_topk_dcp(
             f"dcp_size={dcp_size} does not match mesh axis"
             f" {dcp_axis_name!r}={mesh.shape[dcp_axis_name]}."
         )
-    if q.shape[0] % dcp_size != 0:
+    # Only the all-to-all merge splits the token axis over the DCP ranks; the
+    # all-gather merge gathers the candidate axis and takes any token count, so
+    # a decode bucket smaller than dcp_size (TPU_TOKEN_BUCKET_EXTRA=8 at DCP16)
+    # stays legal on it.
+    if a2a_merge and q.shape[0] % dcp_size != 0:
         raise ValueError(
             f"padded_num_tokens={q.shape[0]} must be divisible by dcp_size={dcp_size}."
         )
+
+    if overlap_fn is None and merge_overlap_fn is not None:
+        raise ValueError("merge_overlap_fn needs overlap_fn")
+    # Pin only where each stage is one SparseCore call: an unchunked local
+    # top-k (as `streamindex_topk` decides it) and the all-gather merge.
+    pin = (
+        overlap_fn is not None
+        and (overlap_pin_max_tokens is None or q.shape[0] <= overlap_pin_max_tokens)
+        and (
+            chunk_tokens is None
+            or q.shape[0] % chunk_tokens != 0
+            or q.shape[0] == chunk_tokens
+        )
+    )
 
     def _local(
         q,
@@ -1806,11 +1900,19 @@ def streamindex_topk_dcp(
         page_indices,
         cu_q_lens,
         distribution,
+        *extra,
     ):
-        dcp_rank = cp_rank_as_data(dcp_axis_name, dcp_size)
+        # Trailing operands: this shard's rank (TPU_DCP_RANK_OPERAND), then the
+        # overlap work's arguments (TPU_INDEXER_QB_OVERLAP).
+        n_rank = 0 if dcp_rank_ids is None else 1
+        rank_ids, ov_args = extra[:n_rank], extra[n_rank:]
+        if rank_ids:
+            dcp_rank = rank_ids[0][0]
+        else:
+            dcp_rank = cp_rank_as_data(dcp_axis_name, dcp_size)
         local_page_indices = jnp.mod(page_indices, jnp.int32(cache_kv.shape[0]))
 
-        idxs, scores = streamindex_topk(
+        local = streamindex_topk(
             q,
             indexer_weights,
             cache_kv,
@@ -1833,7 +1935,31 @@ def streamindex_topk_dcp(
             interleave_size=interleave_size,
             return_scores=True,
             skip_empty_decode=skip_empty_decode,
+            skip_empty_decode_chunked=skip_empty_decode_chunked,
+            final_sc_tie=tuple(ov_args[:1]) if pin else (),
         )
+        if pin:
+            idxs, scores, tied = local
+            ov_in = (*tied, *ov_args[1:])
+        else:
+            (idxs, scores), ov_in = local, tuple(ov_args)
+
+        ov = None
+        if overlap_fn is not None:
+            ov = overlap_fn(*ov_in)
+            if pin:
+                # The candidate exchange, and so the merge, waits for the work.
+                scores, ov = lax.optimization_barrier((scores, ov))
+
+        def _ret(topk, merge_pinned=False):
+            if overlap_fn is None:
+                return topk
+            if merge_overlap_fn is None:
+                return topk, ov
+            out = merge_overlap_fn(ov)
+            if merge_pinned:
+                topk, out = lax.optimization_barrier((topk, out))
+            return topk, out
 
         if a2a_merge:
             # Stage 1. Rank `j` collects every rank's scores for token block
@@ -1856,7 +1982,7 @@ def streamindex_topk_dcp(
             # slots. A slot names its source rank and that rank's own list, so
             # the owner filter resolves it against this rank's `idxs` as is.
             slots = lax.all_gather(slots, dcp_axis_name, axis=0, tiled=True)
-            return dcp_sc_compact.pack_owned_winners(slots, idxs, dcp_rank)
+            return _ret(dcp_sc_compact.pack_owned_winners(slots, idxs, dcp_rank))
 
         # Stage 1. All-gather the scores; the indices stay home.
         scores = lax.all_gather(
@@ -1866,17 +1992,28 @@ def streamindex_topk_dcp(
             tiled=True,
         )
 
+        merge_pinned = pin and merge_overlap_fn is not None
+        if merge_pinned:
+            # The merge stage's work starts once the candidates have landed
+            # (a slice, so the merge's operand keeps its layout).
+            _, ov = lax.optimization_barrier((scores[:1, :128], ov))
+
         # Stage 2. Fused SparseCore global top-k threshold selection, owner
         # filtering, local index resolution, and prefix compaction.
-        return sparsecore_topk_dcp_merge(
-            scores,
-            idxs,
-            k,
-            dcp_rank=dcp_rank,
-            dcp_size=dcp_size,
+        return _ret(
+            sparsecore_topk_dcp_merge(
+                scores,
+                idxs,
+                k,
+                dcp_rank=dcp_rank,
+                dcp_size=dcp_size,
+                scheduling_group_id=global_scheduling_group_id,
+            ),
+            merge_pinned,
         )
 
     replicated = P()
+    ov_leaves = tuple(overlap_args) if overlap_fn is not None else ()
     return jax.shard_map(
         _local,
         mesh=mesh,
@@ -1888,8 +2025,12 @@ def streamindex_topk_dcp(
             replicated,  # page_indices
             replicated,  # cu_q_lens
             replicated,  # distribution
+            *((P(dcp_axis_name),) if dcp_rank_ids is not None else ()),  # rank ids
+            *(replicated for _ in ov_leaves),  # overlap_args
         ),
-        out_specs=P(dcp_axis_name),
+        out_specs=(
+            P(dcp_axis_name) if overlap_fn is None else (P(dcp_axis_name), replicated)
+        ),
         check_vma=False,
     )(
         q,
@@ -1899,4 +2040,6 @@ def streamindex_topk_dcp(
         page_indices,
         cu_q_lens,
         distribution,
+        *((dcp_rank_ids,) if dcp_rank_ids is not None else ()),
+        *ov_leaves,
     )

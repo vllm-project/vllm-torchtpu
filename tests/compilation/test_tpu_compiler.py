@@ -211,6 +211,7 @@ class TestTpuCompilerCache:
             "RAIDEN_STORAGE_PROPERTIES",
             "RAIDEN_STORAGE_TYPE",
             "SPEC_WARMUP",
+            "TPU_PRECOMPILE_SPEC_MIXED",
             "TORCH_TPU_BASE_PORT",
             "TORCH_TPU_MP_RENDEZVOUS_PORT",
             "TPU_LOCAL_RANK_OFFSET",

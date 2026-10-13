@@ -126,7 +126,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
-from vllm_torchtpu.runner import greedy_top_tokens
+from vllm_torchtpu.runner import greedy_top_tokens, spec_precompile_shapes
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.mm_encoder_manager import (
@@ -240,6 +240,11 @@ _tpu_compile = torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 # the multi-candidate passes cost more than the passes they save (top-p-only
 # verify + bonus: 204 us at 1 bit, 257 at 2, 288 at 3, 464 at 4).
 _SAMPLER_LIGHT_DEFAULT_RADIX_BITS = 1
+# TPU_SAMPLER_VERIFY_TRIM: target rows the fused verify chain keeps when a
+# chunk's drafts fit (one f32 sublane tile), and the largest padded logits
+# length it trims (the variants _precompile_spec_sample_verify_fused warms).
+_VERIFY_TRIM_ROWS = 8
+_VERIFY_TRIM_MAX_LEN = 32
 _reset_read_offsets_compiled = _tpu_compile(_reset_read_offsets_impl)
 _rollback_offsets_seed_compiled = _tpu_compile(_rollback_offsets_seed_impl)
 _rollback_offsets_migrate_compiled = _tpu_compile(_rollback_offsets_migrate_impl)
@@ -969,6 +974,9 @@ class TPUModelRunner(GPUModelRunner):
         self._sampler_fast_top_p = bool(envs.TPU_SAMPLER_FAST_TOP_P)
         # TPU_SAMPLER_FUSED_CHAIN: one compiled non-greedy verify program.
         self._sampler_fused_chain = bool(envs.TPU_SAMPLER_FUSED_CHAIN)
+        # TPU_SAMPLER_VERIFY_TRIM: the fused chain's target work on 8 rows
+        # when the chunk's drafts fit (see _verify_trim_rows).
+        self._sampler_verify_trim = bool(envs.TPU_SAMPLER_VERIFY_TRIM)
 
         # TPU async-scheduling state (passed between execute_model and
         # sample_tokens, mirroring vLLM's async path).
@@ -4355,6 +4363,11 @@ class TPUModelRunner(GPUModelRunner):
                 device=logits.device,
                 generator=sampling_generator,
             )
+            trim_kwargs = {}
+            if rows := self._verify_trim_rows(
+                md.target_logits_indices.shape[0], md.draft_lengths_cpu
+            ):
+                trim_kwargs["verify_rows"] = rows
             return self.spec_sample_verify_fused(
                 logits,
                 md.bonus_logits_indices,
@@ -4371,6 +4384,7 @@ class TPUModelRunner(GPUModelRunner):
                 recover_u,
                 self.speculative_config.num_speculative_tokens,
                 **self._sampler_kwargs(),
+                **trim_kwargs,
             )
         if all_greedy and grammar_output is None:
             bonus_token_ids, target_logits = self.spec_bonus_and_target_logits(
@@ -5113,6 +5127,13 @@ class TPUModelRunner(GPUModelRunner):
             )
             token_padding.set_padding_state(self._token_padding_state)
 
+        # Last: arming needs the drafter's MTP layer and the padding mask.
+        if envs.USE_MOE_TP_DECODE_KERNEL:
+            from vllm_torchtpu.layers.adapter.moe_tp_decode import arm
+
+            draft = self._async_drafter.draft_model if self._is_async_drafter else None
+            arm(self.model, draft)
+
     def _initialize_pallas_kernels(self):
         self._initialize_attention_kernels()
         self._initialize_quantization_kernels()
@@ -5806,6 +5827,47 @@ class TPUModelRunner(GPUModelRunner):
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
 
+    def _precompile_spec_selected_logits(self) -> None:
+        """Warm compute_selected_logits at spec-verify index lengths.
+
+        A spec step gathers ``final_logits_indices`` (``padded_logits_length``
+        rows, a num-tokens bucket) rather than ``padded_num_reqs`` rows, so the
+        sweep above misses it, and the spec real warmup only reaches it on
+        decode-only batches. A mixed step (prefill chunk + drafted decodes)
+        then compiles ``(chunk bucket, padded_logits_length)`` on the serving
+        path. See spec_precompile_shapes. Opt-in: TPU_PRECOMPILE_SPEC_MIXED.
+        """
+        if not envs.TPU_PRECOMPILE_SPEC_MIXED or self.speculative_config is None:
+            return
+        pairs = spec_precompile_shapes.spec_selected_logits_pairs(
+            self.num_tokens_paddings,
+            self.num_reqs_paddings,
+            self.max_num_reqs,
+            self.speculative_config.num_speculative_tokens,
+        )
+        if not pairs:
+            return
+        hsize = self.model_config.get_hidden_size()
+        top_tokens = self._greedy_head_owner is not None
+        with self._precompile_timed("spec compute_selected_logits"):
+            for num_tokens, logits_len in pairs:
+                dummy_hidden = torch.zeros(
+                    (num_tokens, hsize),
+                    dtype=self._hidden_states_dtype,
+                ).to(self.device)
+                # final_logits_indices is int32 (get_spec_decode_metadata).
+                indices = torch.zeros(logits_len, dtype=torch.int32).to(self.device)
+                out = self.compute_selected_logits(dummy_hidden, indices)
+                synchronize_tensors(out)
+                if top_tokens:
+                    out = self.compute_selected_top_tokens(dummy_hidden, indices)
+                    synchronize_tensors(out)
+                logger.info(
+                    "  -- num_tokens: %d, padded_logits_length: %d",
+                    num_tokens,
+                    logits_len,
+                )
+
     def _precompile_compute_logits_from_hidden_states(self) -> None:
         hsize = self.model_config.get_hidden_size()
         with self._precompile_timed("compute_logits_from_hidden_states"):
@@ -6003,12 +6065,21 @@ class TPUModelRunner(GPUModelRunner):
         # buckets (non-spec / pure-async), plus the bounded stride-(1+K) span
         # async eagle3 parks (max_num_reqs*(1+K); see sample_tokens) so the spec
         # substitute doesn't recompile per real num_reqs.
-        next_lens = list(self.num_reqs_paddings)
+        next_variants = [(n, torch.int64) for n in self.num_reqs_paddings]
         if self._is_async_drafter:
             assert self.speculative_config is not None
-            next_lens.append(
-                self.max_num_reqs * (1 + self.speculative_config.num_speculative_tokens)
+            spec_span = self.max_num_reqs * (
+                1 + self.speculative_config.num_speculative_tokens
             )
+            next_variants.append((spec_span, torch.int64))
+            if envs.TPU_PRECOMPILE_SPEC_MIXED:
+                # The async spec source is assembled in the drafts' dtype
+                # (assemble_spec_next_tokens / _assemble_async_prefill_bootstrap:
+                # torch.cat([bonus.to(drafts.dtype), drafts])), and eagle3
+                # proposes int32 -- so the int64 span above never matches a
+                # real call, and every mixed step's token bucket compiled
+                # on the serving path instead.
+                next_variants.append((spec_span, torch.int32))
         with self._precompile_timed("substitute_placeholder_token"):
             for num_tokens in self.num_tokens_paddings:
                 input_ids = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
@@ -6020,8 +6091,8 @@ class TPUModelRunner(GPUModelRunner):
                 pre_next_tokens_indices = torch.full(
                     (num_tokens,), -1, dtype=torch.int32
                 ).to(self.device)
-                for nlen in next_lens:
-                    next_tokens = torch.zeros(nlen, dtype=torch.int64).to(self.device)
+                for nlen, next_dtype in next_variants:
+                    next_tokens = torch.zeros(nlen, dtype=next_dtype).to(self.device)
                     out = _substitute_placeholder_token(
                         input_ids,
                         cur_input_indices,
@@ -6061,25 +6132,32 @@ class TPUModelRunner(GPUModelRunner):
         recover_u = torch.zeros((num_tokens, vocab), dtype=torch.float32).to(
             self.device
         )
-        for light_kwargs in self._sampler_light_variants() or [{}]:
-            out = self.spec_sample_verify_fused(
-                dummy_logits,
-                bonus_logits_indices,
-                target_logits_indices,
-                temps,
-                top_k,
-                top_p,
-                draft_token_ids,
-                draft_lengths,
-                segment_ids,
-                group_indices,
-                bonus_u,
-                accept_u,
-                recover_u,
-                k,
-                **light_kwargs,
-            )
-            synchronize_tensors(out)
+        trim_variants: list[dict[str, Any]] = [{}]
+        if self._sampler_verify_trim and (
+            _VERIFY_TRIM_ROWS < num_tokens <= _VERIFY_TRIM_MAX_LEN
+        ):
+            trim_variants.append({"verify_rows": _VERIFY_TRIM_ROWS})
+        for trim_kwargs in trim_variants:
+            for light_kwargs in self._sampler_light_variants() or [{}]:
+                out = self.spec_sample_verify_fused(
+                    dummy_logits,
+                    bonus_logits_indices,
+                    target_logits_indices,
+                    temps,
+                    top_k,
+                    top_p,
+                    draft_token_ids,
+                    draft_lengths,
+                    segment_ids,
+                    group_indices,
+                    bonus_u,
+                    accept_u,
+                    recover_u,
+                    k,
+                    **light_kwargs,
+                    **trim_kwargs,
+                )
+                synchronize_tensors(out)
 
     def _precompile_rejection_sampler(self) -> None:
         """Warm the spec-decode verify path so it doesn't recompile at runtime.
@@ -6299,6 +6377,7 @@ class TPUModelRunner(GPUModelRunner):
             # Only the last stage holds the lm_head and samples.
             return
         self._precompile_compute_selected_logits()
+        self._precompile_spec_selected_logits()
         if _get_sequence_layout_planner_for_runner(
             self
         ).uses_selected_logits_hidden_states:
@@ -7544,6 +7623,25 @@ class TPUModelRunner(GPUModelRunner):
         target_logits = torch.index_select(logits, 0, target_logits_indices)
         return bonus_logits, target_logits
 
+    def _verify_trim_rows(
+        self, padded_logits_length: int, draft_lengths_cpu: np.ndarray
+    ) -> int:
+        """TPU_SAMPLER_VERIFY_TRIM: the target rows the fused verify chain
+        keeps for this chunk, or 0 to keep all ``padded_logits_length``.
+
+        get_spec_decode_metadata lays the chunk's real draft slots out first
+        (request-major) and pads after them; a padding slot is never a valid
+        slot of any request, so its target row reaches no output. Trimming to
+        _VERIFY_TRIM_ROWS is exact when every real slot fits.
+        """
+        if not self._sampler_verify_trim:
+            return 0
+        if not (_VERIFY_TRIM_ROWS < padded_logits_length <= _VERIFY_TRIM_MAX_LEN):
+            return 0
+        if int(np.sum(draft_lengths_cpu)) > _VERIFY_TRIM_ROWS:
+            return 0
+        return _VERIFY_TRIM_ROWS
+
     def _sampler_kwargs(self) -> dict[str, Any]:
         """Static kwargs of the non-greedy sampler / verify graphs for the
         sampling params last staged by _build_padded_sampling_params."""
@@ -7621,13 +7719,26 @@ class TPUModelRunner(GPUModelRunner):
         need_top_p: bool = True,
         radix_bits: int = 1,
         fast_top_p: bool = False,
+        verify_rows: int = 0,
     ) -> torch.Tensor:
         """TPU_SAMPLER_FUSED_CHAIN: the non-greedy, grammar-free branch of
         _sample_spec_verify_chunk as one program -- the logits gathers, bonus
         sampling, the per-token param gathers and the rejection sampler. The
         uniforms come in drawn by the caller (Dynamo cannot take a
-        torch.Generator into the graph), same shapes and order as unfused."""
+        torch.Generator into the graph), same shapes and order as unfused.
+
+        ``verify_rows`` (static, TPU_SAMPLER_VERIFY_TRIM): keep only the first
+        that many draft slots -- the caller guarantees every real slot is
+        among them (_verify_trim_rows). The uniforms are drawn at the full
+        shape and sliced here, so the generator stream is unchanged."""
         assert self.rejection_sampler is not None
+        if verify_rows:
+            target_logits_indices = target_logits_indices[:verify_rows]
+            draft_token_ids = draft_token_ids[:verify_rows]
+            segment_ids = segment_ids[:verify_rows]
+            group_indices = group_indices[:verify_rows]
+            accept_u = accept_u[:verify_rows]
+            recover_u = recover_u[:verify_rows]
         bonus_logits = torch.index_select(logits, 0, bonus_logits_indices)
         target_logits = torch.index_select(logits, 0, target_logits_indices)
         bonus_token_ids = _sample_from_logits_impl(

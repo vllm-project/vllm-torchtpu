@@ -28,6 +28,7 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 | `TPU_PCP_TOPOLOGY_AWARE_MESH` | `True` | Orders Prefill Context Parallel (`PCP`) ranks along adjacent ICI torus neighbors to minimize ring hop count. |
 | `TPU_DCP_MLA_TOPK_CAP` | `0` | Caps top-k selection per Decode Context Parallel (`DCP`) rank in Sparse MLA (`0` disables cap). |
 | `TPU_DCP_LSE_MERGE_A2A` | `False` | Uses all-to-all LSE merge for Decode Context Parallelism when token count is below `TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS` (`64`). |
+| `TPU_DCP_MERGE_CHUNKED` | `0` | Splits the Decode Context Parallelism reduce-scatter LSE merge of backbone buckets of at least `TPU_DCP_MERGE_CHUNKED_MIN_TOKENS` (`1024`) tokens into this many token chunks, so each chunk's reduce-scatter overlaps the next chunk's compute (`0`/`1` disables). |
 | `TPU_TOKEN_BUCKET_EXTRA` | `[]` | Comma-separated list of additional token padding bucket sizes to precompile. |
 | `TPU_TOKEN_BUCKET_LINEAR` | `False` | Uses linearly spaced token compilation buckets instead of exponential buckets. |
 

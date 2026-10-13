@@ -57,6 +57,33 @@ def get_dcp_rank() -> int:
     return 0 if group is None else int(group.rank_in_group)
 
 
+_RANK_OPERANDS: dict[str, Any] = {}
+
+
+def dcp_rank_operand(device: Any = None) -> Any:
+    """``TPU_DCP_RANK_OPERAND``: this rank's DCP index as an int32 ``[1]`` tensor.
+
+    Passed to a DCP Pallas op under ``PartitionSpec(DCP_AXIS_NAME)``, the
+    per-rank tensors form the global ``i32[dcp_size]`` with entry r = r, so
+    each shard reads its own rank as data. That replaces
+    ``cp_rank_as_data``'s ``all_to_all`` of an iota (a collective once per
+    program, ~8 us on 2x2x2 TP16xDCP16) without ``lax.axis_index``, whose
+    ``partition-id`` the torch_tpu export path refuses. Every rank compiles
+    the same program; only the operand's value differs. Built once per device
+    (call it at op-build time, outside Dynamo).
+    """
+    import torch
+
+    if device is None:
+        device = torch.device("tpu")
+    key = str(device)
+    t = _RANK_OPERANDS.get(key)
+    if t is None:
+        t = torch.tensor([get_dcp_rank()], dtype=torch.int32, device=device)
+        _RANK_OPERANDS[key] = t
+    return t
+
+
 def get_dcp_world_size() -> int:
     group = get_dcp_group()
     return 1 if group is None else int(group.world_size)
