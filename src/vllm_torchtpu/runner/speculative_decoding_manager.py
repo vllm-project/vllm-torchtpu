@@ -64,10 +64,10 @@ class SpeculativeDecodingManager:
         # Cached draft tokens.
         self._draft_token_ids: list[list[int]] | None = None
         # For async-scheduling: in-flight D2H copy of drafts on device,
-        # as (cpu_tensor, ready_event, req_ids snapshot). See
-        # stage_draft_token_ids_for_host.
+        # as (per-chunk cpu tensors, per-chunk real row counts, ready_event,
+        # req_ids snapshot). See stage_draft_token_ids_for_host.
         self._staged_draft_copy: (
-            tuple[torch.Tensor, torch.Event | None, list[str]] | None
+            tuple[list[torch.Tensor], list[int], torch.Event | None, list[str]] | None
         ) = None
         self.spec_token_ids: dict[str, list[int]] = {}
         # Content-keyed cache for get_spec_decode_metadata: 7 of its 8 device
@@ -85,11 +85,14 @@ class SpeculativeDecodingManager:
             # For async scheduling: the engine only asks when a step carries
             # structured-output requests, to swap real drafts into the
             # deferred grammar-bitmask computation.
-            drafts_cpu, ready_event, req_ids = self._staged_draft_copy
+            drafts_cpu, real_lens, ready_event, req_ids = self._staged_draft_copy
             self._staged_draft_copy = None
             if ready_event is not None:
                 ready_event.synchronize()
-            return DraftTokenIds(req_ids, drafts_cpu.tolist())
+            # Trim each bucketed chunk to its real rows on the host.
+            rows = [t[:n] for t, n in zip(drafts_cpu, real_lens)]
+            merged = rows[0] if len(rows) == 1 else torch.cat(rows, dim=0)
+            return DraftTokenIds(req_ids, merged.tolist())
         if self._draft_token_ids is None:
             return None
         num_reqs = self.runner.input_batch.num_reqs
@@ -98,7 +101,11 @@ class SpeculativeDecodingManager:
         self._draft_token_ids = None
         return DraftTokenIds(req_ids, draft_token_ids)
 
-    def stage_draft_token_ids_for_host(self, drafts: torch.Tensor) -> None:
+    def stage_draft_token_ids_for_host(
+        self,
+        drafts: torch.Tensor | list[torch.Tensor],
+        real_lens: list[int] | None = None,
+    ) -> None:
         """Starts a non-blocking D2H copy of drafts on device.
 
         Async scheduling keeps drafts on device (return_device=True), but the
@@ -107,18 +114,30 @@ class SpeculativeDecodingManager:
         the next step's forward, so take only waits for the copy itself.
         Note that req_ids must be snapshotted now because take_draft_token_ids()
         is called after the next step's execute_model mutates input_batch.
+
+        `drafts` is either one exact `[num_reqs, K]` tensor (eagle3) or one
+        bucketed `[rows, K]` tensor per chunk with `real_lens` giving each
+        chunk's real request count (bucketed-draft proposer, dflash/dspark).
+        Padded chunks are copied whole and trimmed on the host, so the copy's
+        shapes stay bucketed.
         """
         num_reqs = self.runner.input_batch.num_reqs
-        assert drafts.shape[0] == num_reqs, (
-            f"drafts rows {drafts.shape[0]} != num_reqs {num_reqs}"
-        )
+        if isinstance(drafts, torch.Tensor):
+            assert drafts.shape[0] == num_reqs, (
+                f"drafts rows {drafts.shape[0]} != num_reqs {num_reqs}"
+            )
+            chunks = [drafts]
+            lens = [num_reqs]
+        else:
+            chunks = list(drafts)
+            lens = [int(n) for n in real_lens or ()]
         req_ids = list(self.runner.input_batch.req_ids[:num_reqs])
-        drafts_cpu = drafts.to("cpu", non_blocking=True)
+        drafts_cpu = [t.to("cpu", non_blocking=True) for t in chunks]
         ready_event = None
-        if drafts.device.type != "cpu":
+        if chunks[0].device.type != "cpu":
             ready_event = torch.tpu.Event()
             ready_event.record()
-        self._staged_draft_copy = (drafts_cpu, ready_event, req_ids)
+        self._staged_draft_copy = (drafts_cpu, lens, ready_event, req_ids)
 
     def propose_draft_token_ids(
         self,
@@ -128,8 +147,8 @@ class SpeculativeDecodingManager:
         scheduler_output=None,
         return_device: bool = False,
         next_tokens_per_chunk: list[torch.Tensor] | None = None,
-        device_seed: torch.Tensor | None = None,
-    ) -> torch.Tensor | None:
+        device_seed: torch.Tensor | list[torch.Tensor] | None = None,
+    ) -> torch.Tensor | list[torch.Tensor] | None:
         """Proposes draft token IDs based on the speculative decoding method.
 
         The single dispatch point for all draft proposing. eagle3 is called
@@ -155,15 +174,16 @@ class SpeculativeDecodingManager:
           scheduler_output: vLLM SchedulerOutput; carries the per-step spec
             token budget for ngram and the partial-prefill next-token lookup
             for eagle3.
-          return_device: return the raw ``[num_reqs, K]`` device tensor
-            instead of caching a host list for take_draft_token_ids.
+          return_device: return the device drafts instead of caching a host
+            list: one exact ``[num_reqs, K]`` tensor (eagle3) or one bucketed
+            tensor per chunk (bucketed-draft proposers).
           next_tokens_per_chunk: on-device rejection-sampler output (spec
             verify step).
           device_seed: on-device just-sampled tokens (prefill / non-spec
-            step).
+            step): a flat batch tensor, or one bucketed tensor per chunk.
 
         Returns:
-          The raw device tensor when return_device=True; otherwise None (the
+          The raw device drafts when return_device=True; otherwise None (the
           host list is cached in self._draft_token_ids).
         """
         num_reqs = self.runner.input_batch.num_reqs
@@ -204,7 +224,7 @@ class SpeculativeDecodingManager:
                 device_seed=device_seed,
             )
             if return_device:
-                assert isinstance(result, torch.Tensor)
+                assert isinstance(result, torch.Tensor | list)
                 return result
             assert isinstance(result, list)
             self._draft_token_ids = result

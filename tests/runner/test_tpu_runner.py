@@ -433,6 +433,81 @@ def test_spec_decode_warmup_sweeps_batches_at_the_shortest_and_longest_prompt(
     ]
 
 
+def _runner(K: int, block: int, max_reqs: int, budget: int, paddings: list[int]):
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=K),
+        drafter=SimpleNamespace(block_size=block),
+        max_num_reqs=max_reqs,
+        max_num_tokens=budget,
+        num_tokens_paddings=paddings,
+    )
+
+
+def _step_keys(runner, R: int, mixed: bool) -> set[tuple]:
+    """The program buckets of a verify step with R decoders (and, with
+    ``mixed``, one more request prefilling a token), as the runner keys them."""
+    K = runner.speculative_config.num_speculative_tokens
+    block = runner.drafter.block_size
+    pads = runner.num_tokens_paddings
+    max_reqs = runner.max_num_reqs
+
+    def tok_bucket(n: int) -> int:
+        return tpu_runner._get_padded_token_len(pads, n) if n <= pads[-1] else pads[-1]
+
+    keys = set()
+    if runner.max_num_tokens >= R * (1 + K):
+        keys.add(
+            (
+                "decode",
+                tpu_runner._get_padded_num_reqs_with_upper_limit(R, max_reqs),
+                tok_bucket(R * (1 + K)),
+                tok_bucket(R * block),
+            )
+        )
+    if mixed and max_reqs >= R + 1 and runner.max_num_tokens >= R * (1 + K) + 1:
+        keys.add(
+            (
+                "mixed",
+                tpu_runner._get_padded_num_reqs_with_upper_limit(R + 1, max_reqs),
+                tok_bucket(R * (1 + K) + 1),
+                tok_bucket((R + 1) * block),
+            )
+        )
+    return keys
+
+
+FLASH = dict(
+    K=5, block=5, max_reqs=64, budget=1024, paddings=[16, 32, 64, 128, 256, 512, 1024]
+)
+AGENTX = dict(K=5, block=5, max_reqs=8, budget=256, paddings=[16, 32, 64, 128, 256])
+# 8 decoders x 6 rows = 48 > a 32-token budget: counts above 5 have no step.
+TIGHT = dict(K=5, block=5, max_reqs=8, budget=32, paddings=[16, 32])
+
+
+@pytest.mark.parametrize(
+    "cfg", [FLASH, AGENTX, TIGHT], ids=["flash", "agentx", "tight"]
+)
+@pytest.mark.parametrize("mixed", [False, True])
+def test_grid_covers_every_bucket_combination_once(cfg, mixed):
+    runner = _runner(**cfg)
+    grid = TPUModelRunner._spec_warmup_bucket_grid(runner, mixed=mixed)
+
+    assert grid == sorted(set(grid))
+    assert all(1 <= R <= cfg["max_reqs"] for R in grid)
+    # Every bucket combination a serving step can take is warmed ...
+    covered = set().union(*(_step_keys(runner, R, mixed) for R in grid))
+    needed = set().union(
+        *(_step_keys(runner, R, mixed) for R in range(1, cfg["max_reqs"] + 1))
+    )
+    assert covered == needed
+    # ... by one count each: every grid entry brings a bucket no earlier one had.
+    seen: set[tuple] = set()
+    for R in grid:
+        keys = _step_keys(runner, R, mixed)
+        assert keys - seen, f"count {R} adds no new bucket"
+        seen |= keys
+
+
 def test_mtp_prefill_warmup_retries_each_bucket_without_a_pipeline():
     attempts = MagicMock(side_effect=[False, True, True])
     runner = SimpleNamespace(

@@ -219,7 +219,7 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
 
 
 def assemble_spec_next_tokens(
-    next_tokens: torch.Tensor, drafts: torch.Tensor, num_reqs: int
+    next_tokens: torch.Tensor, drafts: torch.Tensor, num_reqs: int | None = None
 ) -> torch.Tensor:
     """Async substitution source for speculative decoding.
 
@@ -234,10 +234,14 @@ def assemble_spec_next_tokens(
             prefix + bonus, padded with INVALID_TOKEN_ID); the bonus is the last
             non-padding column of each row.
         drafts: device proposer output ``[>=num_reqs, K]``.
-        num_reqs: real request count (both inputs may be bucket-padded in dim 0).
+        num_reqs: slice both inputs to this many rows, or None to keep the
+            bucketed rows (the runner's choice: the padded tail is never
+            addressed, and an exact slice would compile a program per count).
     """
-    nt = next_tokens[:num_reqs]
-    drafts = drafts[:num_reqs]
+    if num_reqs is not None:
+        next_tokens = next_tokens[:num_reqs]
+        drafts = drafts[:num_reqs]
+    nt = next_tokens
     # Last non-padding column per row is the bonus.
     last_valid_col = (nt != INVALID_TOKEN_ID).sum(dim=1).clamp(min=1) - 1
     bonus = nt.gather(1, last_valid_col.unsqueeze(1))  # [num_reqs, 1]
