@@ -160,6 +160,15 @@ def test_config_accepts_qsa_within_indexer_budget() -> None:
     TPUQwen4ExpConfig.verify_and_update_config(vllm_config)
 
 
+def test_config_rejects_qsa_layer_type() -> None:
+    text_config = _text_config(**_QSA)
+    # Set after construction: the pinned transformers does not know this
+    # layer type, but newer versions accept it.
+    text_config.layer_types = ["linear_attention", "qwen_sparse_attention"]
+    with pytest.raises(NotImplementedError, match="qwen_sparse_attention"):
+        TPUQwen4ExpConfig.verify_and_update_config(_vllm_config_for_checks(text_config))
+
+
 @pytest.mark.parametrize(
     "text_overrides,config_overrides,match",
     [
@@ -335,11 +344,17 @@ def test_unknown_layer_type_is_rejected(fake_sublayers) -> None:
 # ---------------------------------------------------------------------------
 # Weight loading
 # ---------------------------------------------------------------------------
-def test_load_weights_maps_hyper_connection_names_and_skips_mtp(
+def test_load_weights_maps_hyper_connection_names_and_skips_mtp_and_indexer(
     fake_sublayers,
 ) -> None:
     model = Qwen4ExpForCausalLM(vllm_config=_model_vllm_config(_text_config()))
     prefix = "model.language_model"
+    skipped = (
+        # MTP weights belong to the draft model.
+        "mtp.fc_hidden.weight",
+        # Dense attention does not use the QSA indexer.
+        f"{prefix}.layers.1.self_attn.indexer.index_qk_proj.weight",
+    )
     weights = {
         f"{prefix}.layers.0.attn_hyper_connection.hc_norm.weight": torch.randn(
             HC * HIDDEN
@@ -355,18 +370,17 @@ def test_load_weights_maps_hyper_connection_names_and_skips_mtp(
         ),
         f"{prefix}.embed_tokens.weight": torch.randn(VOCAB, HIDDEN),
         "lm_head.weight": torch.randn(VOCAB, HIDDEN),
-        # MTP weights belong to the draft model.
-        "mtp.fc_hidden.weight": torch.randn(HIDDEN, HIDDEN),
+        **{name: torch.randn(HIDDEN, HIDDEN) for name in skipped},
     }
 
     loaded = model.load_weights(iter(weights.items()))
 
     params = dict(model.named_parameters())
     for name, tensor in weights.items():
-        if name.startswith("mtp."):
+        if name in skipped:
             continue
         vllm_name = name.replace(f"{prefix}.", "model.")
         assert vllm_name in loaded
         param = params[vllm_name]
         torch.testing.assert_close(param, tensor.to(param.dtype))
-    assert not any(name.startswith("mtp.") for name in loaded)
+    assert not any("mtp." in name or ".indexer." in name for name in loaded)

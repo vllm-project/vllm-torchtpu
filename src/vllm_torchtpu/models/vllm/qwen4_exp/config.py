@@ -38,8 +38,22 @@ class TPUQwen4ExpConfig(Qwen4ExpForCausalLMConfig):
                 "Qwen4Exp n-gram PLE (ple_layer_ids="
                 f"{text_config.ple_layer_ids}) is not supported on TPU yet."
             )
-        # The QSA fields are optional; configs without them use dense
-        # attention by design.
+        # Released checkpoints label their QSA layers full_attention; the
+        # qwen_sparse_attention layer type needs the QSA indexer.
+        unsupported_layer_types = sorted(
+            set(text_config.layer_types or ()) - {"linear_attention", "full_attention"}
+        )
+        if unsupported_layer_types:
+            # TODO(QSA): accept qwen_sparse_attention once the indexer lands.
+            raise NotImplementedError(
+                f"Qwen4Exp layer types {unsupported_layer_types} are not "
+                "supported on TPU yet."
+            )
+        # Configs without the QSA fields run dense attention by design. With
+        # them, QSA attends over the indexer_budget / indexer_compress_ratio
+        # highest-scoring complete blocks plus the open tail block. A sequence
+        # of at most indexer_budget tokens has no more complete blocks than
+        # that, so every block is selected and QSA equals dense attention.
         indexer_budget = getattr(text_config, "indexer_budget", None)
         if indexer_budget is not None and model_config.max_model_len > indexer_budget:
             # TODO(QSA): lift once the QSA indexer and sparse attention land.

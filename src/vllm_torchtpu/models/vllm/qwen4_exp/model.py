@@ -188,6 +188,9 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
     # Qwen3.5's mapping fuses the split GDN, attention and shared-expert
     # projections that Qwen4Exp checkpoints use as well.
     hf_to_vllm_mapper = Qwen3_5Model.hf_to_vllm_mapper | WeightsMapper(
+        # TODO(QSA): load the indexer weights once the QSA indexer lands;
+        # dense attention does not use them.
+        orig_to_new_substr={".self_attn.indexer.": None},
         orig_to_new_prefix={"model.language_model.": "model.", "mtp.": None},
     )
 
