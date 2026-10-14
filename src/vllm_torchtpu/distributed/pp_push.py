@@ -117,9 +117,8 @@ class _WaveState:
         wait settles."""
         if not self.open:
             return
-        # Two stages need no pushes because stage 0's post-forward launch
-        # pairs directly with stage 1's pre-forward launch, but they still
-        # settle so stage 0 issues its queued hand-off and surfaces errors.
+        # With two stages the launches pair without pushes; the settle still
+        # goes out and issues stage 0's queued hand-off.
         if self.lazy or real_step == self.real_steps:
             self.settle(executor)
             return

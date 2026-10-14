@@ -371,7 +371,7 @@ def _pp_step[**P, R](
     method: Callable[Concatenate[Any, P], R],
 ) -> Callable[Concatenate[Any, P], R]:
     """Brackets a runner call that traces device ops with the pipeline wave's
-    step context so the hand-off thread does not launch concurrently."""
+    step."""
 
     @functools.wraps(method)
     def wrapper(self: Any, *args: P.args, **kwargs: P.kwargs) -> R:
@@ -563,8 +563,7 @@ class TPUModelRunner(GPUModelRunner):
     # pyrefly: ignore[bad-override-mutable-attribute]
     input_ids: torch.Tensor
     empty_slot_mappings: dict[int, torch.Tensor]
-    # Set in __init__; the class default covers runners the tests build
-    # without it, which _pp_step reads.
+    # Default for a runner built without __init__.
     _pp_wave: PPWave | None = None
 
     @property

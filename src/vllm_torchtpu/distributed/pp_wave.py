@@ -81,30 +81,22 @@ running at the same time, a core of the stage stops inside a stage collective
 and the runtime halts the device. A one-chip stage never showed this and
 launches the hand-off without waiting.
 
-Stage 0 launches its hand-off in end_forward, after its forward. On a
-multi-chip stage that must drain before each hand-off, draining on the worker
-thread would block host preparation for the next step (scheduling,
-KV-connector setup, input staging) until the forward pass finishes on the
-device. Stage 0 therefore offloads the drain to a background helper thread:
-- end_forward flushes the outgoing tensors, records a device fence, and queues
-  the hand-off so the worker thread can immediately prepare the next step.
-- The helper thread only waits on the fence and the slice barrier; it never
-  traces ops while the worker thread is inside a runner step, because flushing
-  from another thread could split the lazy graph at different points across
-  ranks.
-- Once drained, the helper launches the hand-off immediately if the worker
-  thread is between runner calls. If the worker thread is inside a step, the
-  worker issues the queued launch itself at the next start_forward, push, or
-  settle. Either way the launch goes out without a further engine action,
-  which pp_push's accounting relies on: it counts stage 0's launch as issued
-  once execute_model returns and may wait without sending a push.
+Stage 0 launches its hand-off in end_forward, after its forward. A first
+stage that must drain before each hand-off drains on a helper thread:
+- end_forward flushes the outgoing tensors, records a device fence, queues the
+  hand-off and returns; the worker thread goes on to the next step.
+- The helper thread waits on the fence and then at the slice barrier. It
+  traces and submits no op while the worker thread is inside a runner step
+  (``step``).
+- Once drained, the helper issues the launch if the worker thread is between
+  runner calls; otherwise the worker thread issues it at its next
+  start_forward, push or settle. Either way the launch goes out without a
+  further engine action.
 - Stage 0 does not read the received buffers and does not wait for the
-  hand-off to finish: the device runs programs in submission order, so its
-  next forward queues behind the hand-off, as on the synchronous path.
-- Pushes and settles always issue any queued hand-off first. Even on a
-  two-stage pipeline where stage 0 issues no settle launches of its own, settle
-  waits on the helper thread so any drain or launch failure is raised at the
-  engine's next wait.
+  hand-off to finish; its next forward queues behind it on the device.
+- Pushes and settles issue any queued hand-off first. A settle on stage 0
+  issues it even when it launches nothing of its own, and raises a drain or
+  launch failure from the helper thread.
 """
 
 import threading
@@ -153,7 +145,7 @@ def stage_chips() -> int:
 
 def _drain_slice(fence: "TpuEvent | None" = None) -> None:
     """Waits for local device work (or the given fence) to complete, then joins
-    the slice barrier so no stage forward is running when the hand-off starts."""
+    the slice barrier."""
     import torch.distributed as dist
     from torch_tpu._internal.sync import sync
     from vllm.distributed.parallel_state import get_world_group
@@ -305,8 +297,8 @@ class PPWave:
 
     @contextmanager
     def step(self) -> Iterator[None]:
-        """Marks a worker-thread region that traces device ops so the helper
-        thread does not launch a hand-off concurrently."""
+        """Marks a worker-thread region that traces device ops; the helper
+        thread issues no launch inside it."""
         with self._async_cv:
             self._async_cv.wait_for(lambda: not self._async_issuing)
             self._in_step += 1
@@ -392,8 +384,6 @@ class PPWave:
         if not self.async_handoff:
             return
         with self._async_cv:
-            # Wait without a separate timeout: process-group barrier timeouts
-            # surface via _async_error, and device hangs are handled by the engine.
             self._async_cv.wait_for(
                 lambda: self._async_queued is None
                 and not self._async_busy
@@ -524,8 +514,8 @@ class PPWave:
             return
         with TraceAnnotation("PP:Settle"):
             if self.rank == 0:
-                # Issue any queued hand-off and surface helper errors even on
-                # a two-stage pipeline where stage 0 issues no settle launches.
+                # Issues the queued hand-off and raises a helper failure; with
+                # two stages this stage launches nothing else.
                 self._issue_queued()
             if 0 < self.rank < self.last:
                 assert self.pending is not None
