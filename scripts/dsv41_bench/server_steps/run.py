@@ -8,6 +8,7 @@ import hashlib
 import importlib.metadata
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -26,6 +27,45 @@ def cache_inventory(root: Path) -> dict:
     return {
         "files": len(files),
         "bytes": sum(p.stat().st_size for p in files),
+    }
+
+
+def source_identity(
+    root: Path, package: str, *, build_commit: str | None = None
+) -> dict:
+    if any((parent / ".git").exists() for parent in (root, *root.parents)):
+        return {
+            "commit": subprocess.check_output(
+                ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
+            ).strip(),
+            "diff_sha256": hashlib.sha256(
+                subprocess.check_output(
+                    ["git", "-C", str(root), "diff", "HEAD", "--", "."]
+                )
+            ).hexdigest(),
+        }
+
+    # CI excludes .git; its image records the build SHA. The installed vLLM
+    # Git dependency instead records its upstream SHA in direct_url.json.
+    distribution = importlib.metadata.distribution(package)
+    if build_commit is not None:
+        if re.fullmatch(r"[0-9a-f]{40}", build_commit) is None:
+            raise ValueError("Buildkite image source requires a full Git commit SHA")
+        return {
+            "commit": build_commit,
+            "package_version": distribution.version,
+            "provenance": "Buildkite CI image",
+        }
+    direct_url_text = distribution.read_text("direct_url.json")
+    if direct_url_text is None:
+        raise ValueError(f"{package} requires Git source provenance for cache identity")
+    direct_url = json.loads(direct_url_text)
+    if "vcs_info" not in direct_url or not direct_url["vcs_info"].get("commit_id"):
+        raise ValueError(f"{package} direct_url.json has no VCS commit identity")
+    return {
+        "commit": direct_url["vcs_info"]["commit_id"],
+        "package_version": distribution.version,
+        "direct_url": direct_url,
     }
 
 
@@ -179,25 +219,19 @@ def main() -> None:
     }
     import vllm
 
-    def source_identity(root: Path) -> dict:
-        return {
-            "commit": subprocess.check_output(
-                ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
-            ).strip(),
-            "diff_sha256": hashlib.sha256(
-                subprocess.check_output(
-                    ["git", "-C", str(root), "diff", "HEAD", "--", "."]
-                )
-            ).hexdigest(),
-        }
-
     model = Path(env["MODEL_PATH"])
     identity = {
         "scenario": args.scenario,
         "compile_sizes": buckets,
         "packages": manifest["packages"],
-        "torchtpu": source_identity(here.parents[2]),
-        "vllm": source_identity(Path(vllm.__file__).resolve().parent),
+        "torchtpu": source_identity(
+            here.parents[2],
+            "vllm-torchtpu",
+            build_commit=(
+                env.get("BUILDKITE_COMMIT") if env.get("BUILDKITE") == "true" else None
+            ),
+        ),
+        "vllm": source_identity(Path(vllm.__file__).resolve().parent, "vllm"),
         "model": str(model.resolve()),
         "model_config_sha256": hashlib.sha256(
             (model / "config.json").read_bytes()

@@ -3,6 +3,9 @@
 
 import copy
 import datetime
+import hashlib
+import json
+import subprocess
 import sys
 import unittest
 from pathlib import Path
@@ -21,6 +24,7 @@ from bench_cached_extend import (  # noqa: E402
     summarize_extend,
     summarize_startup,
 )
+from run import source_identity  # noqa: E402
 from server_step_worker import SCENARIO, token_counts  # noqa: E402
 
 pytestmark = pytest.mark.cpu_test
@@ -216,3 +220,67 @@ class DeferredObservationTest(unittest.TestCase):
             result.get_output()
             self.assertEqual(recorder.steps[0]["observed_ns"], timestamp)
             self.assertEqual(recorder.in_flight, 0)
+
+
+def test_source_identity_records_checkout_changes(tmp_path):
+    subprocess.run(["git", "init", str(tmp_path)], check=True, capture_output=True)
+    source = tmp_path / "module.py"
+    source.write_text("value = 1\n")
+    subprocess.run(["git", "-C", str(tmp_path), "add", "."], check=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(tmp_path),
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "-c",
+            "core.hooksPath=/dev/null",
+            "commit",
+            "-m",
+            "fixture",
+        ],
+        check=True,
+        capture_output=True,
+    )
+    original = source_identity(tmp_path, "vllm")
+    assert original["diff_sha256"] == hashlib.sha256(b"").hexdigest()
+    source.write_text("value = 2\n")
+    changed = source_identity(tmp_path, "vllm")
+    assert changed["commit"] == original["commit"]
+    assert changed["diff_sha256"] != original["diff_sha256"]
+
+
+def test_source_identity_accepts_installed_git_dependency(tmp_path, monkeypatch):
+    url = {
+        "url": "https://github.com/vllm-project/vllm.git",
+        "vcs_info": {"vcs": "git", "commit_id": "a" * 40},
+    }
+    metadata = SimpleNamespace(version="0.31.1rc0", read_text=lambda _: json.dumps(url))
+    monkeypatch.setattr("importlib.metadata.distribution", lambda _: metadata)
+    identity = source_identity(tmp_path, "vllm")
+    assert identity["commit"] == "a" * 40
+    assert identity["package_version"] == "0.31.1rc0"
+    assert identity["direct_url"] == url
+
+
+@pytest.mark.parametrize("direct_url", [None, "{}", '{"dir_info": {}}'])
+def test_source_identity_rejects_unidentified_install(
+    tmp_path, monkeypatch, direct_url
+):
+    metadata = SimpleNamespace(version="0.31.1rc0", read_text=lambda _: direct_url)
+    monkeypatch.setattr("importlib.metadata.distribution", lambda _: metadata)
+    with pytest.raises(ValueError, match="provenance|commit identity"):
+        source_identity(tmp_path, "vllm")
+
+
+def test_source_identity_accepts_buildkite_image(tmp_path, monkeypatch):
+    metadata = SimpleNamespace(version="0.0.0", read_text=lambda _: None)
+    monkeypatch.setattr("importlib.metadata.distribution", lambda _: metadata)
+    identity = source_identity(tmp_path, "vllm-torchtpu", build_commit="b" * 40)
+    assert identity["commit"] == "b" * 40
+    assert identity["provenance"] == "Buildkite CI image"
+    with pytest.raises(ValueError, match="full Git commit SHA"):
+        source_identity(tmp_path, "vllm-torchtpu", build_commit="HEAD")
