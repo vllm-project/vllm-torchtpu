@@ -37,6 +37,7 @@ def main_kernel(
     subcore_axis_name: str,
     num_row_subchunks: int,
     num_streams: int,
+    is_dcp_mode: bool = False,
 ):
     tpu_info = pltpu.get_tpu_info()
     sc_info = tpu_info.sparse_core
@@ -164,18 +165,35 @@ def main_kernel(
         )
         core_start_idx = out_row_base * row_subchunk_size
 
-        @pl.when(core_start_idx < valid_indices)
-        def _run_gather():
-            pltpu.emit_pipeline(
-                functools.partial(_body, nope_sem, nope_out_i32),
-                grid=(num_row_subchunks // num_streams,),
-                in_specs=nope_in_specs + rope_in_specs,
-                out_specs=(rope_out_spec,),
-            )(
-                *([nope_in_i32] * num_streams),
-                *([rope_in_i32] * num_streams),
-                rope_out_i32,
-            )
+        if is_dcp_mode:
+            first = idx_ref[pl.ds(0, row_subchunk_size)][0]
+
+            @pl.when((core_start_idx < valid_indices) & (first >= 0))
+            def _run_gather():
+                pltpu.emit_pipeline(
+                    functools.partial(_body, nope_sem, nope_out_i32),
+                    grid=(num_row_subchunks // num_streams,),
+                    in_specs=nope_in_specs + rope_in_specs,
+                    out_specs=(rope_out_spec,),
+                )(
+                    *([nope_in_i32] * num_streams),
+                    *([rope_in_i32] * num_streams),
+                    rope_out_i32,
+                )
+        else:
+
+            @pl.when(core_start_idx < valid_indices)
+            def _run_gather():
+                pltpu.emit_pipeline(
+                    functools.partial(_body, nope_sem, nope_out_i32),
+                    grid=(num_row_subchunks // num_streams,),
+                    in_specs=nope_in_specs + rope_in_specs,
+                    out_specs=(rope_out_spec,),
+                )(
+                    *([nope_in_i32] * num_streams),
+                    *([rope_in_i32] * num_streams),
+                    rope_out_i32,
+                )
 
     pltpu.emit_pipeline(
         outer_pipeline,
@@ -193,12 +211,20 @@ def main_kernel(
     )(indices_hbm_ref, valid_indices_ref)
 
 
-@functools.partial(jax.jit)
+# An index of `SKIP_INDEX` in a 64-token inner gather step tells the kernel
+# that the step is padding and may be skipped without issuing HBM gathers.
+SKIP_INDEX = -1
+
+
+@functools.partial(jax.jit, static_argnames=("num_row_subchunks", "is_dcp_mode"))
 def dsa_gather(
     nope_cache: jax.Array,
     rope_cache: jax.Array,
     indices: jax.Array,
     num_valid_indices: jax.Array | None = None,
+    *,
+    num_row_subchunks: int = 32,
+    is_dcp_mode: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Fused SparseCore gather of the nope and rope caches.
 
@@ -213,6 +239,10 @@ def dsa_gather(
       indices: (N,) int32. Token indices into the caches.
       num_valid_indices: Optional (1,) or scalar int32. Number of valid indices
         to gather. Subcores assigned to indices beyond this count skip gathering.
+      num_row_subchunks: Number of 16-lane subchunks per outer window (must be a
+        multiple of `num_streams = 4`).
+      is_dcp_mode: Whether to enable DCP mode (e.g. skip gathering for padding
+        chunks marked with negative indices).
 
     Returns:
       nope_out: (N, WORD_BYTES, TILE_LANE_BYTES) uint8. Each token's nope tile
@@ -256,14 +286,24 @@ def dsa_gather(
     # pipeline step to keep multiple gather DMAs in flight.
     # See `outer_pipeline` for details.
     num_streams = 4
-    num_row_subchunks = 32
     assert num_row_subchunks % num_streams == 0, (
         f"{num_streams=} must divide {num_row_subchunks=}."
     )
     row_chunk_size = row_subchunk_size * num_row_subchunks
     block_size = row_chunk_size * num_cores
     out_pad_size = ((out_size + block_size - 1) // block_size) * block_size - out_size
-    indices = jnp.pad(indices, ((0, out_pad_size)))
+    if out_pad_size:
+        if is_dcp_mode:
+            pad_pos = out_size + jnp.arange(out_pad_size, dtype=jnp.int32)
+            window_start = (pad_pos // row_chunk_size) * row_chunk_size
+            indices = jnp.concatenate(
+                [
+                    indices,
+                    jnp.where(window_start >= out_size, SKIP_INDEX, 0),
+                ]
+            )
+        else:
+            indices = jnp.pad(indices, ((0, out_pad_size)))
     vector_mesh = plsc.VectorSubcoreMesh(
         num_cores=sc_info.num_cores,
         num_subcores=sc_info.num_subcores,
@@ -279,6 +319,7 @@ def dsa_gather(
                 subcore_axis_name=vector_mesh.subcore_axis_name,
                 num_row_subchunks=num_row_subchunks,
                 num_streams=num_streams,
+                is_dcp_mode=is_dcp_mode,
             ),
             out_type=(
                 jax.ShapeDtypeStruct(

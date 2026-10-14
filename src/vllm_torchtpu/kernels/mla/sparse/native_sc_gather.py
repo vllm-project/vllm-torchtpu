@@ -68,6 +68,7 @@ def _kernel(
     serve_pipelined: bool,
     live_hbm_ref: Any = None,
     guard_tail: bool = False,
+    is_dcp_mode: bool = False,
 ):
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
     live_batches = None
@@ -172,12 +173,19 @@ def _kernel(
                 rope_out_hbm_ref,
             )
 
+        pred = None
+        if is_dcp_mode:
+            # Skip a batch whose first index is the -1 pad.
+            pred = indices_ref[0, 0, 0, :][0] >= 0
         if live_batches is not None and guard_tail:
             # Owners share a uniform traced grid of cdiv(live, num_owners);
             # the ragged last round is skipped per owner.
-            pl.when(logical_batch < live_batches)(run_inner)
-        else:
+            tail_ok = logical_batch < live_batches
+            pred = tail_ok if pred is None else (pred & tail_ok)
+        if pred is None:
             run_inner()
+        else:
+            pl.when(pred)(run_inner)
 
     indices_spec = pl.BlockSpec(
         (1, atoms_per_batch, ROPE_PACKING, NUM_LANES),
@@ -217,6 +225,7 @@ def _kernel(
         "wait_mode",
         "serve_pipelined",
         "live_multiple",
+        "is_dcp_mode",
     ),
 )
 def dsa_gather_native_sc(
@@ -230,6 +239,7 @@ def dsa_gather_native_sc(
     serve_pipelined: bool = True,
     num_live_indices: jax.Array | None = None,
     live_multiple: int = 1,
+    is_dcp_mode: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
 
@@ -243,6 +253,15 @@ def dsa_gather_native_sc(
     unwritten. ``live_multiple`` is a static promise that ``num_live_indices``
     is a multiple of it; when that multiple covers whole owner rounds the
     per-owner tail guard is dropped.
+    Args:
+      nope_cache: explicit native-SC uint32[..., 128] cache.
+      rope_cache: quarter-major uint32[..., 128] cache.
+      indices: int32[query, topk] token indices.
+      out_size: total number of gathered tokens (indices.size).
+      atoms_per_batch: number of atoms per batch.
+      wait_mode: "overlap_rope" or "before_rope".
+      serve_pipelined: whether to pipeline the gather serving loop.
+      is_dcp_mode: whether to enable DCP mode (skips gather for padding atoms).
     """
     if wait_mode not in ("overlap_rope", "before_rope"):
         raise ValueError(f"unknown {wait_mode=}")
@@ -328,6 +347,7 @@ def dsa_gather_native_sc(
         wait_mode=wait_mode,
         serve_pipelined=serve_pipelined,
         guard_tail=guard_tail,
+        is_dcp_mode=is_dcp_mode,
     )
     if live:
         inner = body
