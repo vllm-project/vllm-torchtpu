@@ -143,16 +143,19 @@ class TpuEvalRunner(BaseVllmRunner):
             )
 
             if eval_proc.stdout is not None:
-                try:
-                    for line in iter(eval_proc.stdout.readline, ""):
-                        if not isinstance(line, str):
-                            break
+                for line in iter(eval_proc.stdout.readline, ""):
+                    if not isinstance(line, str):
+                        break
+                    captured_output_chunks.append(line)
+                    try:
                         sys.stdout.write(line)
                         sys.stdout.flush()
-                        captured_output_chunks.append(line)
-                    eval_proc.stdout.close()
-                except Exception:
-                    pass
+                    except (OSError, ValueError):
+                        # Keep draining the pipe even if echoing fails: a
+                        # reader that stops would let the child block on a
+                        # full pipe and deadlock eval_proc.wait().
+                        pass
+                eval_proc.stdout.close()
 
             eval_retcode = eval_proc.wait()
             # In unit tests with MagicMock, wait() may return a Mock object. Treat non-int or 0 as success.
