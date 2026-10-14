@@ -53,7 +53,6 @@ def _build_stages(monkeypatch, template, size=8, async_handoff=False):
     monkeypatch.setattr(pp_wave, "_drain_slice", lambda fence=None: None)
     monkeypatch.setattr(pp_wave, "_fence", lambda: object())
     monkeypatch.setattr(pp_wave, "_flush", lambda tensors: None)
-    monkeypatch.setattr(pp_wave, "_wait", lambda tensors: None)
     monkeypatch.setattr(pp_wave, "get_or_create_pp_mesh", lambda: None)
     monkeypatch.setattr(
         pp_wave,
@@ -249,12 +248,12 @@ def test_async_first_stage_reports_a_failed_drain(async_stages, monkeypatch):
 
 
 def _first_stage_alone(monkeypatch, size=2):
-    """A two-chip stage 0 PPWave whose drain waits on ``drain_gate`` and whose
-    hand-off completion waits on ``done``; ``drains`` records what each drain
-    waited on, ``launched`` what each launch carried, ``issuers`` its thread."""
+    """A two-chip stage 0 PPWave whose drain waits on ``drain_gate``;
+    ``drains`` records what each drain waited on, ``launched`` what each
+    launch carried, ``issuers`` its thread."""
     from vllm.distributed import parallel_state
 
-    drain_gate, done = threading.Event(), threading.Event()
+    drain_gate = threading.Event()
     launched, drains, issuers = [], [], []
 
     def drain(fence=None):
@@ -273,7 +272,6 @@ def _first_stage_alone(monkeypatch, size=2):
     monkeypatch.setattr(pp_wave, "pp_permute_op", lambda mesh, num_tensors=1: None)
     monkeypatch.setattr(pp_wave, "_launch_now", launch_now)
     monkeypatch.setattr(pp_wave, "_flush", lambda tensors: None)
-    monkeypatch.setattr(pp_wave, "_wait", lambda tensors: done.wait(10))
     monkeypatch.setattr(
         parallel_state,
         "get_pp_group",
@@ -281,7 +279,7 @@ def _first_stage_alone(monkeypatch, size=2):
     )
     wave = pp_wave.PPWave(torch.device("cpu"), MAX_ROWS, _template(False))
     assert wave.async_handoff
-    return wave, drain_gate, done, launched, drains, issuers
+    return wave, drain_gate, launched, drains, issuers
 
 
 def _queue_one_forward(wave, launched):
@@ -305,7 +303,7 @@ def _until(predicate, seconds=2.0):
 def test_async_helper_issues_the_launch_while_the_worker_thread_is_idle(
     monkeypatch,
 ):
-    wave, drain_gate, done, launched, drains, issuers = _first_stage_alone(monkeypatch)
+    wave, drain_gate, launched, drains, issuers = _first_stage_alone(monkeypatch)
     drain_gate.set()
     assert wave.start_forward(8) is None
     assert len(launched) == 1 and drains == [None]
@@ -316,18 +314,13 @@ def test_async_helper_issues_the_launch_while_the_worker_thread_is_idle(
     assert _until(lambda: len(launched) == 2)
     assert drains[1] == "fence" and issuers[1] == "pp-wave-handoff"
     assert torch.equal(launched[1][0][:8], torch.full((8, HIDDEN), 2.5))
-    nxt = threading.Thread(target=wave.start_forward, args=(8,), daemon=True)
-    nxt.start()
-    nxt.join(0.3)
-    assert nxt.is_alive(), "start_forward ran before the hand-off completed"
-    done.set()
-    nxt.join(5)
-    assert not nxt.is_alive()
-    assert wave._async_idle()
+    # The next forward neither issues nor waits for anything.
+    assert wave.start_forward(8) is None
+    assert len(launched) == 2 and wave._async_idle()
 
 
 def test_async_worker_thread_issues_the_launch_inside_a_step(monkeypatch):
-    wave, drain_gate, done, launched, drains, issuers = _first_stage_alone(monkeypatch)
+    wave, drain_gate, launched, drains, issuers = _first_stage_alone(monkeypatch)
     drain_gate.set()
     wave.start_forward(8)
     drain_gate.clear()
@@ -345,16 +338,13 @@ def test_async_worker_thread_issues_the_launch_inside_a_step(monkeypatch):
     # The worker thread is tracing, so the helper leaves the launch to it.
     assert _until(lambda: len(launched) == 2)
     assert drains[1] == "fence" and issuers == [threading.main_thread().name, "worker"]
-    nxt.join(0.3)
-    assert nxt.is_alive(), "start_forward ran before the hand-off completed"
-    done.set()
     nxt.join(5)
     assert not nxt.is_alive()
     assert wave._async_idle()
 
 
 def test_async_step_waits_for_a_launch_the_helper_is_issuing(monkeypatch):
-    wave, drain_gate, done, launched, drains, issuers = _first_stage_alone(monkeypatch)
+    wave, drain_gate, launched, drains, issuers = _first_stage_alone(monkeypatch)
     drain_gate.set()
     wave.start_forward(8)
     drain_gate.clear()
@@ -384,7 +374,7 @@ def test_async_step_waits_for_a_launch_the_helper_is_issuing(monkeypatch):
 
 
 def test_async_settle_on_two_stages_reports_a_failed_drain(monkeypatch):
-    wave, drain_gate, done, launched, drains, issuers = _first_stage_alone(monkeypatch)
+    wave, drain_gate, launched, drains, issuers = _first_stage_alone(monkeypatch)
     drain_gate.set()
     wave.start_forward(8)
 
