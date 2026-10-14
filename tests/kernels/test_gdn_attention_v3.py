@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 from absl.testing import parameterized
 
+from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import wrapper
 
 pytestmark = pytest.mark.tpu_test
@@ -271,6 +272,136 @@ def gdn_attention_spec_ref(
         output = output.at[start:end].set(out_seq.reshape(query_len, n_v * d_v))
 
     return (new_conv_state, new_recurrent_state), output
+
+
+# Unified-pool geometry for the windowed race check: a 1-byte pool (like the
+# FP8 KV cache) of 256-token kernel blocks with 256 lanes. With 8 V heads the
+# recurrent state takes two whole kernel blocks and the conv state 16 token
+# rows at the start of the third.
+_POOL_KBS, _POOL_LANES, _POOL_PAYLOAD, _POOL_SPLIT = 256, 256, (1, 4), 3
+_POOL_TOK_BYTES = int(np.prod(_POOL_PAYLOAD)) * _POOL_LANES
+_POOL_CONV_NTOK = 16
+
+
+def _windowed_race_case(layout, num_seqs, num_spec_tokens, seed):
+    """One verify step at Qwen3.5-397B TP8 per-chip shapes where every
+    sequence runs a full window and resumes from a random checkpoint.
+
+    Returns (states, kwargs, read_states). Request i owns the `window` states
+    from `1 + i * window` (state 0 is the null block). Every state is
+    distinct, so a checkpoint written from the wrong source shows up as a
+    mismatch. `read_states(states)` returns all (conv, recurrent) states as
+    float32 numpy arrays.
+    """
+    n_kq, n_v, d_k, d_v, kernel_size = 2, 8, 128, 128, 4
+    dim = n_kq * d_k * 2 + n_v * d_v
+    window = num_spec_tokens + 1
+    num_tokens = num_seqs * window
+    num_states = 1 + num_seqs * window
+    keys = iter(jax.random.split(jax.random.key(seed), 10))
+
+    def normal(shape, dtype, scale=1.0):
+        return (jax.random.normal(next(keys), shape) * scale).astype(dtype)
+
+    base = 1 + window * jnp.arange(num_seqs, dtype=jnp.int32)
+    kwargs = dict(
+        qkv=normal((num_tokens, dim), jnp.bfloat16),
+        b=normal((num_tokens, n_v), jnp.bfloat16),
+        a=normal((num_tokens, n_v), jnp.bfloat16),
+        conv_weight=normal((dim, 1, kernel_size), jnp.float32),
+        conv_bias=normal((dim,), jnp.float32),
+        a_log=normal((n_v,), jnp.float32),
+        dt_bias=normal((n_v,), jnp.float32),
+        query_start_loc=jnp.arange(0, num_tokens + 1, window, dtype=jnp.int32),
+        state_indices=base,
+        distribution=jnp.full((3,), num_seqs, dtype=jnp.int32),
+        # Longer than the window, so every sequence reads its initial state.
+        seq_lens=jnp.full((num_seqs,), 64 + window, dtype=jnp.int32),
+        read_offsets=jax.random.randint(
+            next(keys), (num_seqs,), 0, window, dtype=jnp.int32
+        ),
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+        num_spec_tokens=num_spec_tokens,
+        batched_only=True,
+    )
+    recurrent = normal((num_states, n_v, d_k, d_v), jnp.float32, 0.1)
+    conv = normal((num_states, kernel_size - 1, dim), jnp.bfloat16, 0.1)
+
+    if layout == "dense":
+
+        def read_dense(states):
+            return tuple(np.asarray(s, dtype=np.float32) for s in states)
+
+        return (conv, recurrent), kwargs, read_dense
+
+    ssm_ntok = n_v * d_k * d_v * 4 // _POOL_TOK_BYTES
+    conv_rows = (kernel_size - 1) * dim // _POOL_LANES
+    conv_slot_rows = _POOL_CONV_NTOK * _POOL_TOK_BYTES // (2 * _POOL_LANES)
+    region = dict(split=_POOL_SPLIT)
+    ssm_region = dict(tok0=0, ntok=ssm_ntok, **region)
+    conv_region = dict(tok0=ssm_ntok, ntok=_POOL_CONV_NTOK, **region)
+    idx = jnp.arange(num_states, dtype=jnp.int32)
+
+    pool = jnp.zeros(
+        (num_states * _POOL_SPLIT, _POOL_KBS) + _POOL_PAYLOAD + (_POOL_LANES,),
+        dtype=jnp.int8,
+    )
+    pool = pool_adapters.scatter_region(
+        pool, recurrent.reshape(num_states, n_v * d_k, d_v), idx, **ssm_region
+    )
+    conv_rows_arr = conv.reshape(num_states, conv_rows, _POOL_LANES)
+    conv_rows_arr = jnp.pad(
+        conv_rows_arr, ((0, 0), (0, conv_slot_rows - conv_rows), (0, 0))
+    )
+    pool = pool_adapters.scatter_region(pool, conv_rows_arr, idx, **conv_region)
+
+    kwargs.update(
+        state_plan=pool_adapters.v3_state_source(
+            pool,
+            split=_POOL_SPLIT,
+            ssm_ntok=ssm_ntok,
+            conv_tok0=ssm_ntok,
+            conv_ntok=_POOL_CONV_NTOK,
+            conv_dim=dim,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        ),
+        ckpt_indices=base[:, None] + jnp.arange(window, dtype=jnp.int32),
+    )
+
+    def read_pooled(states):
+        rec = pool_adapters.gather_region(
+            states, idx, out_dtype=jnp.float32, out_lanes=d_v, **ssm_region
+        )
+        cnv = pool_adapters.gather_region(
+            states, idx, out_dtype=jnp.bfloat16, **conv_region
+        )
+        cnv = cnv[:, :conv_rows].reshape(num_states, kernel_size - 1, dim)
+        return np.asarray(cnv, dtype=np.float32), np.asarray(rec)
+
+    return pool, kwargs, read_pooled
+
+
+def _run_windowed(layout, states, kwargs, **tile_kwargs):
+    """One kernel call on copies of `states`; returns (new_states, output)."""
+    states = jax.tree.map(jnp.copy, states)
+    if layout == "dense":
+        return wrapper.fused_conv1d_gdn(
+            conv_state=states[0], recurrent_state=states[1], **kwargs, **tile_kwargs
+        )
+    return wrapper.fused_conv1d_gdn(
+        conv_state=None,
+        recurrent_state=None,
+        state_source=states,
+        **kwargs,
+        **tile_kwargs,
+    )
 
 
 class GDNAttentionTest(parameterized.TestCase):
@@ -631,6 +762,48 @@ class GDNAttentionTest(parameterized.TestCase):
                 atol=2e-2,
                 err_msg=f"recurrent checkpoint mismatch at slot {slot}",
             )
+
+    @parameterized.named_parameters(("dense", "dense"), ("pooled", "pooled"))
+    def test_spec_checkpoints_match_one_seq_per_tile(self, layout):
+        """Verify windows packed several to a decode tile must write the same
+        checkpoints as one window per tile.
+
+        The state tiles are double-buffered, so tile i+1's state refill can
+        target the VMEM slot whose checkpoint write-back for tile i-1 is still
+        in flight. Rows 1+ of a tile then write another request's state as
+        their checkpoint 0. One window per tile cannot race between rows, so it
+        is the reference. 16 windows give 4 tiles of 4; the race is timing
+        dependent, so a few independent steps run.
+        """
+        num_seqs = 16
+        num_spec_tokens = 3
+        window = num_spec_tokens + 1
+        for trial in range(3):
+            states, kwargs, read_states = _windowed_race_case(
+                layout, num_seqs, num_spec_tokens, seed=trial
+            )
+            ref_states, ref_out = _run_windowed(
+                layout, states, kwargs, decode_tile_size=1
+            )
+            got_states, got_out = _run_windowed(layout, states, kwargs)
+            np.testing.assert_allclose(
+                np.asarray(got_out, dtype=np.float32),
+                np.asarray(ref_out, dtype=np.float32),
+                rtol=2e-2,
+                atol=2e-2,
+            )
+            for name, got, ref in zip(
+                ("conv", "recurrent"), read_states(got_states), read_states(ref_states)
+            ):
+                close = np.isclose(got, ref, rtol=2e-2, atol=2e-2)
+                bad = np.flatnonzero(~close.reshape(close.shape[0], -1).all(axis=1))
+                self.assertEqual(
+                    bad.size,
+                    0,
+                    f"trial {trial}: {name} state differs from one window per "
+                    f"tile at states {bad.tolist()} (window positions "
+                    f"{sorted({int(s - 1) % window for s in bad if s > 0})})",
+                )
 
     def test_has_initial_state_zeros_stale_slot(self):
         """Ensure stale states are ignore by new request.
