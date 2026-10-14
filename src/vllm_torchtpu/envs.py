@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_SP: bool = False
     TPU_DEEPSEEK_V41_LOCAL_Q: bool = False
+    TPU_DEEPSEEK_V41_PREFILL_INDEXER: str = "radix"
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
@@ -367,6 +368,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (models/vllm/deepseek_v41/v2: FP8 main KV + RoPE companion pool).
     "TPU_DEEPSEEK_V41_IMPL": env_with_choices(
         "TPU_DEEPSEEK_V41_IMPL", "v1", ["v1", "v2"]
+    ),
+    # Prefill defaults to resident-Q scoring + radix TopK (8K/8K).
+    # Keep baseline as an A/B escape hatch while qualifying the new route.
+    # It affects only paged prefill, never decode or candidate publication.
+    "TPU_DEEPSEEK_V41_PREFILL_INDEXER": env_with_choices(
+        "TPU_DEEPSEEK_V41_PREFILL_INDEXER",
+        "radix",
+        ["baseline", "radix"],
     ),
     # Offload V4.1 Engram embedding tables (23.60 GiB/rank at TP8, 188.83 GiB
     # total) to Host DRAM so TPU HBM remains available for KV cache and decode.

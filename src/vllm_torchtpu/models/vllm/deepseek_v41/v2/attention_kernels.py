@@ -11,9 +11,12 @@ import jax
 import jax.numpy as jnp
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v41 import (
     index_word_scores,
     indexer,
+    prefill_index_scores,
+    prefill_radix_topk,
     tuned_block_sizes,
 )
 
@@ -2380,6 +2383,51 @@ _indexer_op = None
 _indexer_2bank_op = None
 
 
+def _prefill_score(q, weights, pool, pages, limit, *, page_records):
+    """Resident-query scorer, manually replicated across the wrapper mesh."""
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        get_vllm_model_wrapper_context,
+    )
+
+    score = functools.partial(
+        prefill_index_scores.prefill_index_scores,
+        page_records=page_records,
+        query_tile=tuned_block_sizes.PREFILL_QUERY_TILE,
+        key_tile=tuned_block_sizes.PREFILL_KEY_TILE,
+    )
+    try:
+        mesh = get_vllm_model_wrapper_context().mesh
+    except AssertionError:
+        return score(q, weights, pool, pages, limit)
+    return jax.shard_map(
+        score, mesh=mesh, in_specs=(P(),) * 5, out_specs=P(), check_vma=False
+    )(q, weights, pool, pages, limit)
+
+
+def _prefill_top_k(scores, lengths):
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        get_vllm_model_wrapper_context,
+    )
+
+    def select(s, n):
+        ids = prefill_radix_topk.prefill_radix_topk(s, valid_lengths=n, k=512)
+        values = jnp.take_along_axis(s, jnp.maximum(ids, 0), axis=1)
+        ids = jnp.where((ids >= 0) & (values > -jnp.inf), ids, -1)
+        return _compact_selected(ids)
+
+    try:
+        mesh = get_vllm_model_wrapper_context().mesh
+    except AssertionError:
+        return select(scores, lengths)
+    return jax.shard_map(
+        select, mesh=mesh, in_specs=(P(), P()), out_specs=P(), check_vma=False
+    )(scores, lengths)
+
+
 def _score_word_rows(q: jax.Array, weights: jax.Array, words: jax.Array) -> jax.Array:
     """`index_word_scores.score_word_rows` on every device (replicated)."""
     from jax.sharding import PartitionSpec as P
@@ -2636,6 +2684,7 @@ def paged_indexer_jax(
     unordered: bool = False,
     batch_max: jax.Array | None = None,
     page_records: int | None = None,
+    prefill_mode: str = "radix",
 ) -> tuple[jax.Array, jax.Array]:
     """``records`` is ``[requests, width]``; ``requests`` maps tokens to rows.
 
@@ -2644,7 +2693,7 @@ def paged_indexer_jax(
     ``gcd(block_size, page_records)`` records (a block lies in one page).
     """
 
-    def score_context(records, query_tile):
+    def score_context(records, query_tile, mode="baseline"):
         # Finish selection before reusing a query tile's score buffer. Key
         # tiling alone still materializes [all queries, max context]: at
         # 2048 x 1M a single FP32 score matrix is 8 GiB, before top-k copies.
@@ -2652,6 +2701,7 @@ def paged_indexer_jax(
         rows = q.shape[0]
         longest = lengths.max() if batch_max is None else batch_max
         group_tokens = -(-rows // records.shape[0])
+        use_prefill = mode != "baseline"
 
         def run(grouped):
             tile = min(rows, query_tile)
@@ -2704,21 +2754,38 @@ def paged_indexer_jax(
 
             def score(args):
                 queries, row_weights, row_lengths, _, row_requests, row_records = args
-                scores = paged_index_scores_jax(
-                    queries,
-                    pool,
-                    row_records,
-                    row_weights,
-                    row_lengths,
-                    row_requests,
-                    page_records,
-                )
+                if use_prefill:
+                    # The outer route proves every live query shares a request.
+                    # Entries are first-record addresses, not page numbers.
+                    request = requests[jnp.argmax(lengths)]
+                    pages = jax.lax.dynamic_slice_in_dim(row_records, request, 1)
+                    scores = _prefill_score(
+                        split_halves(queries),
+                        row_weights.astype(jnp.float32)[:, :, None],
+                        pool,
+                        pages[:, ::page_records],
+                        jnp.max(row_lengths, keepdims=True),
+                        page_records=page_records,
+                    )
+                else:
+                    scores = paged_index_scores_jax(
+                        queries,
+                        pool,
+                        row_records,
+                        row_weights,
+                        row_lengths,
+                        row_requests,
+                        page_records,
+                    )
                 return jnp.where(
                     jnp.take(row_records >= 0, row_requests, axis=0), scores, -jnp.inf
                 )
 
             def select(i, scores):
                 _, _, row_lengths, row_candidates, _, _ = prepare(i)
+                if use_prefill:
+                    selected = _prefill_top_k(scores, row_lengths)
+                    return selected, row_candidates
                 return select_indices_jax(
                     scores,
                     row_lengths,
@@ -2774,7 +2841,8 @@ def paged_indexer_jax(
             return selected[:rows], published[:rows]
 
         if (
-            page_records is not None
+            not use_prefill
+            and page_records is not None
             and q.dtype == jnp.bfloat16
             and q.shape[-1] == index_word_scores.DIM
             and records.shape[0] > 1
@@ -2786,6 +2854,39 @@ def paged_indexer_jax(
             fits = jnp.all(belongs.sum(axis=1) <= group_tokens)
             return jax.lax.cond(fits, lambda _: run(True), lambda _: run(False), None)
         return run(False)
+
+    def prefill_context():
+        widths = prefill_index_scores.context_buckets(records.shape[1])
+
+        def run(columns):
+            bounded_records = records[:, :columns]
+            bounded_records = jnp.pad(
+                bounded_records,
+                ((0, 0), (0, columns - bounded_records.shape[1])),
+                constant_values=-1,
+            )
+            return score_context(
+                bounded_records, tuned_block_sizes.PREFILL_QUERY_TILE, prefill_mode
+            )
+
+        def all_indices(_):
+            # No ranking is necessary when every visible key fits in TopK.
+            ids = jnp.broadcast_to(
+                jnp.arange(min(topk, records.shape[1]), dtype=jnp.int32),
+                (q.shape[0], min(topk, records.shape[1])),
+            )
+            valid = (ids < lengths[:, None]) & (
+                jnp.take(records[:, : ids.shape[1]], requests, axis=0) >= 0
+            )
+            return _compact_selected(jnp.where(valid, ids, -1)), candidates
+
+        def ranked(_):
+            branch = jnp.searchsorted(
+                jnp.asarray(widths[:-1]), lengths.max(), side="left"
+            )
+            return jax.lax.switch(branch, [functools.partial(run, b) for b in widths])
+
+        return jax.lax.cond(lengths.max() <= topk, all_indices, ranked, None)
 
     def full_context(_):
         rows = q.shape[0]
@@ -2810,13 +2911,36 @@ def paged_indexer_jax(
         ):
             # Select a smaller working shape without limiting request length.
             # Publication/filtering retain their full-width candidate contract.
+            def bounded(_):
+                return score_context(records[:, :columns], query_tile)
+
             return jax.lax.cond(
                 lengths.max() <= columns,
-                lambda _: score_context(records[:, :columns], query_tile),
+                bounded,
                 lambda _: score_context(records, indexer.QUERY_TILE),
                 None,
             )
         return score_context(records, indexer.QUERY_TILE)
+
+    if (
+        prefill_mode != "baseline"
+        and jax.default_backend() == "tpu"
+        and unordered
+        and not candidate_write
+        and not candidate_filter
+        and topk == 512
+        and records.shape[1] >= topk
+        and prefill_index_scores.supports_chunked_prefill(q, pool, page_records)
+    ):
+        live = lengths > 0
+        request = requests[jnp.argmax(lengths)]
+        # Preserve decode/DSpark and mixed-request graphs. Short contexts
+        # are handled without scoring; padding does not select a request.
+        prefill = (live.sum() >= tuned_block_sizes.PREFILL_QUERY_TILE) | (
+            lengths.max() <= topk
+        )
+        prefill &= jnp.all((requests == request) | ~live)
+        return jax.lax.cond(prefill, prefill_context, lambda: full_context(None))
 
     width = records.shape[1]
     if not candidate_filter or candidates.shape[1] * block_size >= width:
@@ -2972,6 +3096,7 @@ def update_and_select_jax(
     candidate_filter: bool,
     unordered: bool,
     page_records: int = 0,
+    prefill_mode: str = "radix",
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """``page_records`` 0 disables page gathers (see `paged_indexer_jax`)."""
     updated = write_index_keys(pool, write_records, keys)
@@ -2990,6 +3115,7 @@ def update_and_select_jax(
         unordered,
         batch_max,
         page_records or None,
+        prefill_mode,
     )
     return updated, selected, published
 
@@ -3012,6 +3138,7 @@ def update_and_select_2bank_jax(
     candidate_filter: bool,
     unordered: bool,
     page_records: int = 0,
+    prefill_mode: str = "radix",
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     (updated_lo, updated_hi), selected, published = cast(
         Any,
@@ -3032,6 +3159,7 @@ def update_and_select_2bank_jax(
             candidate_filter,
             unordered,
             page_records,
+            prefill_mode,
         ),
     )
     return updated_lo, updated_hi, selected, published
@@ -3053,7 +3181,7 @@ def initialize_indexer():
         update_and_select_jax,
         donate_argnums=(1,),
         mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(),) * 10 + (None,) * 6,
+        input_partition_specs=(P(),) * 10 + (None,) * 7,
     )
 
     def fake(
@@ -3073,6 +3201,7 @@ def initialize_indexer():
         candidate_filter,
         unordered,
         page_records=0,
+        prefill_mode="radix",
     ):
         return (
             torch.empty_like(pool),
@@ -3088,7 +3217,7 @@ def initialize_indexer():
         update_and_select_2bank_jax,
         donate_argnums=(1, 2),
         mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(),) * 11 + (None,) * 6,
+        input_partition_specs=(P(),) * 11 + (None,) * 7,
     )
 
     def fake_2bank(
@@ -3109,6 +3238,7 @@ def initialize_indexer():
         candidate_filter,
         unordered,
         page_records=0,
+        prefill_mode="radix",
     ):
         return (
             torch.empty_like(pool_lo),
@@ -3140,6 +3270,7 @@ def paged_indexer(
     unordered=False,
     batch_max=None,
     page_records=None,
+    prefill_mode=None,
 ):
     """``records`` is ``[requests, width]``; ``requests`` maps tokens to rows.
 
@@ -3147,6 +3278,10 @@ def paged_indexer(
     whole batch when the queries are only part of it. ``page_records``: see
     `paged_index_scores_jax`.
     """
+    # Resolve the comparison selector in the torch-to-JAX wrapper and pass it
+    # explicitly: compiled JAX functions must not read environment state.
+    if prefill_mode is None:
+        prefill_mode = envs.TPU_DEEPSEEK_V41_PREFILL_INDEXER
     assert _indexer_op is not None
     if batch_max is None:
         batch_max = lengths.max()
@@ -3165,6 +3300,7 @@ def paged_indexer(
         candidate_filter,
         unordered,
         page_records or 0,
+        prefill_mode,
     )
     if _has_hi_bank(cache):
         assert _indexer_2bank_op is not None

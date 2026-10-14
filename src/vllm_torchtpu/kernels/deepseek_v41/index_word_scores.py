@@ -31,8 +31,8 @@ def _bf16(bits: jax.Array) -> jax.Array:
     return jax.lax.bitcast_convert_type(bits, jnp.float32).astype(jnp.bfloat16)
 
 
-def _kernel(q_ref, w_ref, words_ref, out_ref, keys_ref):
-    words = words_ref[0]
+def unpack_word_rows(words, keys_ref):
+    """Unpack BF16 keys into split element order, preserving record order."""
     rows, half = words.shape[0], ROW_WORDS // 2
     # Record SLOTS * r + s (slot s of row r) on sublane SLOTS * r + s, its
     # words rolled to lanes [0, 64): scores then leave in record order, with
@@ -44,7 +44,11 @@ def _kernel(q_ref, w_ref, words_ref, out_ref, keys_ref):
     first = jax.lax.broadcasted_iota(jnp.int32, words.shape, 1) < half
     # Lanes [0, 64) of lo (even elements), then the same lanes of hi (odd
     # elements), i.e. q's split element order.
-    key = jnp.where(first, lo, pltpu.roll(hi, half, 1))
+    return jnp.where(first, lo, pltpu.roll(hi, half, 1))
+
+
+def _kernel(q_ref, w_ref, words_ref, out_ref, keys_ref):
+    key = unpack_word_rows(words_ref[0], keys_ref)
     for t in range(q_ref.shape[0]):
         logits = jax.lax.dot_general(
             q_ref[t], key, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32

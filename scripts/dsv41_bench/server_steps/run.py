@@ -180,6 +180,29 @@ def main() -> None:
     import vllm
 
     def source_identity(root: Path) -> dict:
+        root = Path(
+            subprocess.check_output(
+                ["git", "-C", str(root), "rev-parse", "--show-toplevel"], text=True
+            ).strip()
+        )
+        # Experimental kernels may not be committed yet. git diff alone omits
+        # them and could incorrectly admit a cache made from different code.
+        untracked = subprocess.check_output(
+            [
+                "git",
+                "-C",
+                str(root),
+                "ls-files",
+                "--others",
+                "--exclude-standard",
+                "-z",
+                "--",
+                "*.py",
+                "*.toml",
+                "*.sh",
+            ],
+            text=True,
+        ).split("\0")
         return {
             "commit": subprocess.check_output(
                 ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
@@ -189,6 +212,11 @@ def main() -> None:
                     ["git", "-C", str(root), "diff", "HEAD", "--", "."]
                 )
             ).hexdigest(),
+            "untracked_source_sha256": {
+                name: hashlib.sha256((root / name).read_bytes()).hexdigest()
+                for name in sorted(untracked)
+                if name
+            },
         }
 
     model = Path(env["MODEL_PATH"])
@@ -203,6 +231,7 @@ def main() -> None:
             (model / "config.json").read_bytes()
         ).hexdigest(),
         "parallelism": "TP1/DP8/EP8/PP1 on one v7x-8 host",
+        "prefill_indexer": env.get("TPU_DEEPSEEK_V41_PREFILL_INDEXER", "radix"),
     }
     identity_path = args.cache_dir / "benchmark-identity.json"
     if args.cache_mode == "reuse":
