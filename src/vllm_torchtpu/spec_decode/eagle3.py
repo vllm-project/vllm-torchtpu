@@ -154,6 +154,29 @@ def _draft_head_modules(model: torch.nn.Module) -> dict[str, object]:
     return {key: module for key, module in modules.items() if module is not None}
 
 
+@dataclasses.dataclass
+class _DpDummyDraft:
+    """Inputs an EP-DP padding chunk replays the draft trace with."""
+
+    chunk: DraftChunkInputs
+    # First-pass token bucket, coordinated across the DP group.
+    bucket: int
+    loop_bucket: int
+    input_ids: torch.Tensor
+    positions: torch.Tensor
+    target_hidden_states: torch.Tensor
+    first_pass_carry: torch.Tensor
+    loop_input_ids: torch.Tensor
+    loop_positions: torch.Tensor
+    loop_hidden: torch.Tensor
+    loop_query_start_loc: torch.Tensor
+    loop_request_distribution: torch.Tensor
+    # Aux-hidden-state eagle3 drafts combine three aux tensors, other eagle3
+    # drafts one plain tensor; MTP drafts combine nothing.
+    combine_aux: list[torch.Tensor]
+    combine_plain: torch.Tensor | None
+
+
 class Eagle3Proposer:
     """Eagle3/MTP draft proposer for TPU.
 
@@ -1301,6 +1324,22 @@ class Eagle3Proposer:
                     [self._draft_propose_token(last_hidden_carry)]
                 )
 
+        # EP-DP lockstep: a rank with fewer chunks than the step's coordinated
+        # bound pads with dummy chunks. Collectives pair across ranks in
+        # emission order, so each draft step's padding runs right after this
+        # rank's real chunks for that step, never all at the end.
+        num_dp_pad_chunks = 0
+        if self._dp_lockstep_sharded():
+            num_dp_pad_chunks = max(0, runner._dp_step_num_chunks - len(chunks))
+        dp_dummy = self._build_dp_dummy_draft() if num_dp_pad_chunks else None
+
+        def pad_dp_draft_step(step: int) -> None:
+            if dp_dummy is not None:
+                for _ in range(num_dp_pad_chunks):
+                    self._dp_dummy_draft_step(dp_dummy, step)
+
+        pad_dp_draft_step(0)
+
         if K > 1:
             # Loop steps: uniform decode shape, one query per request. The
             # carries are already padded to the chunk's bucket p, so the loop
@@ -1422,20 +1461,14 @@ class Eagle3Proposer:
                         if self._share_mtp_indices:
                             # The loop is step-major, so chunks interleave and
                             # each one finds the buffer holding its
-                            # predecessor's rows. Restore unconditionally: one
+                            # predecessor's rows, or an EP-DP padding chunk's
+                            # first-pass rows. Restore unconditionally: one
                             # rule, no dependence on the chunk count. With a
                             # single chunk this is a self-copy of a few
                             # hundred KiB.
                             self._mtp_restore_topk(saved_topk_per_chunk[ci])
                         run_draft_step(ci, step)
-
-        # EP-DP lockstep: pad this rank's draft-forward count up to the
-        # step's coordinated chunk bound so ranks with fewer chunks still
-        # run the same number of draft forwards as their peers.
-        if runner._dp_lockstep_enabled():
-            extra_chunks = runner._dp_step_num_chunks - len(chunks)
-            if extra_chunks > 0:
-                self.run_dp_dummy_draft(extra_chunks)
+                    pad_dp_draft_step(step)
 
         # Assemble [total_num_reqs, K]. Each chunk's tokens are padded to p; slice
         # to the real num_reqs at the end. Sync slices on the host (the [p, K] D2H
@@ -2275,20 +2308,32 @@ class Eagle3Proposer:
         for `num_chunks` padding chunks (EP-DP lockstep).
 
         SHARDED draft (draft_tp == target tp): the draft's collectives are matched
-        across ranks by graph-structure channel IDs, so each padding chunk must
-        replay the REAL propose trace, channel IDs attach to collectives only.
+        across ranks by graph-structure channel IDs, in emission order, so the
+        padding chunks must replay the REAL propose trace in propose()'s order:
+        every chunk's first pass, then each loop step across all chunks.
 
         REPLICATED draft (draft_tp=1): entirely local — it emits no
         collectives, so there is nothing for an idle rank to pair with and the
         forwards would be pure wasted device time.
         """
-        if not self._dp_lockstep_sharded():
+        K = self.speculative_config.num_speculative_tokens
+        if not self._dp_lockstep_sharded() or num_chunks * K == 0:
             return
         self._draft_md_cache.clear()
+        dummy = self._build_dp_dummy_draft()
+        toks = [
+            self._dp_dummy_draft_step(dummy, step)
+            for step in range(K)
+            for _ in range(num_chunks)
+        ]
+        # Nothing consumes the drafts; wait so this idle rank's draft
+        # collectives have fired before it moves on.
+        synchronize_tensors(toks)
+
+    def _build_dp_dummy_draft(self) -> _DpDummyDraft:
+        """Inputs for EP-DP padding chunks at the step's coordinated shapes,
+        shared by every padding chunk and draft step."""
         runner = self.runner
-        K = self.speculative_config.num_speculative_tokens
-        if num_chunks * K == 0:
-            return
         bucket = runner._dp_target_bucket
         assert bucket is not None, "_dp_target_bucket unset in lockstep step"
         num_reqs = runner.num_reqs_max_model_len
@@ -2340,95 +2385,107 @@ class Eagle3Proposer:
             num_reqs=num_reqs,
             aux_hidden_states=[],
         )
-        # Replay the real propose trace per padding chunk.
         p = self._loop_bucket(num_reqs)
         draft_hidden = self._draft_hidden_size()
         dtype = runner._hidden_states_dtype
-        # First-pass lm-head input mirrors the gathered carry [p, hidden].
-        first_pass_carry = torch.zeros(
-            (p, draft_hidden), dtype=dtype, device=runner.device
-        )
-        loop_input_ids = torch.zeros(p, dtype=torch.int32, device=runner.device)
-        # Mirrors the real loop carry, which stays mrope-shaped across steps
-        # (propose() pads it with _maybe_pad_dim1 when pos.ndim == 2).
-        loop_positions = torch.zeros(
-            (3, p) if runner.uses_mrope else (p,),
-            dtype=torch.int32,
-            device=runner.device,
-        )
-        loop_hidden = torch.zeros((p, draft_hidden), dtype=dtype, device=runner.device)
-        # Loop-step metadata mirrors propose()'s per-chunk loop tensors.
-        loop_qsl = torch.from_numpy(
-            np.minimum(np.arange(num_reqs + 1, dtype=np.int32), actual_num_reqs)
-        ).to(runner.device)
-        loop_reqdist = torch.tensor(
-            [actual_num_reqs] * 3, dtype=torch.int32, device=runner.device
-        )
-        uses_aux = self._draft_uses_aux_hidden_state()
         # Mirror propose()'s branch exactly: only eagle3 runs the plain
         # hidden state through combine_hidden_states. An MTP draft feeds the
         # target hidden state straight to the forward and has no
         # combine_hidden_states at all, so replaying one here would both
         # crash and add a step the real trace does not have.
-        combines_plain = not uses_aux and (self.speculative_config.method == "eagle3")
         combine_aux: list[torch.Tensor] = []
         combine_plain: torch.Tensor | None = None
-        if uses_aux:
+        if self._draft_uses_aux_hidden_state():
             aux_width = self._draft_combine_input_size() // 3
             combine_aux = [
                 torch.zeros((bucket, aux_width), dtype=dtype, device=runner.device)
                 for _ in range(3)
             ]
-        elif combines_plain:
+        elif self.speculative_config.method == "eagle3":
             combine_plain = torch.zeros(
                 (bucket, self._draft_combine_input_size()),
                 dtype=dtype,
                 device=runner.device,
             )
-        for _ in range(num_chunks):
-            # Mirror the real first pass: combine -> forward @bucket -> lm head.
-            if uses_aux or combines_plain:
-                with set_model_tag("eagle_head"):
-                    if uses_aux:
-                        self._draft_combine_hidden_states(*combine_aux)
-                    else:
-                        assert self.draft_model is not None
-                        self.draft_model.combine_hidden_states(combine_plain)
-            last_hidden, _ = self._forward_draft(
-                chunk=chunk,
-                input_ids=input_ids,
-                positions=positions,
-                target_hidden_states=target_hidden_states,
+        return _DpDummyDraft(
+            chunk=chunk,
+            bucket=bucket,
+            loop_bucket=p,
+            input_ids=input_ids,
+            positions=positions,
+            target_hidden_states=target_hidden_states,
+            # First-pass lm-head input mirrors the gathered carry [p, hidden].
+            first_pass_carry=torch.zeros(
+                (p, draft_hidden), dtype=dtype, device=runner.device
+            ),
+            loop_input_ids=torch.zeros(p, dtype=torch.int32, device=runner.device),
+            # Mirrors the real loop carry, which stays mrope-shaped across steps
+            # (propose() pads it with _maybe_pad_dim1 when pos.ndim == 2).
+            loop_positions=torch.zeros(
+                (3, p) if runner.uses_mrope else (p,),
+                dtype=torch.int32,
+                device=runner.device,
+            ),
+            loop_hidden=torch.zeros(
+                (p, draft_hidden), dtype=dtype, device=runner.device
+            ),
+            # Loop-step metadata mirrors propose()'s per-chunk loop tensors.
+            loop_query_start_loc=torch.from_numpy(
+                np.minimum(np.arange(num_reqs + 1, dtype=np.int32), actual_num_reqs)
+            ).to(runner.device),
+            loop_request_distribution=torch.tensor(
+                [actual_num_reqs] * 3, dtype=torch.int32, device=runner.device
+            ),
+            combine_aux=combine_aux,
+            combine_plain=combine_plain,
+        )
+
+    def _dp_dummy_draft_step(self, dummy: _DpDummyDraft, step: int) -> torch.Tensor:
+        """Draft step `step` of one EP-DP padding chunk: the programs and
+        shapes a real chunk's step `step` runs in propose()."""
+        if step == 0:
+            # The real first pass: combine -> forward @bucket -> lm head.
+            with set_model_tag("eagle_head"):
+                if dummy.combine_aux:
+                    self._draft_combine_hidden_states(*dummy.combine_aux)
+                elif dummy.combine_plain is not None:
+                    assert self.draft_model is not None
+                    self.draft_model.combine_hidden_states(dummy.combine_plain)
+            self._forward_draft(
+                chunk=dummy.chunk,
+                input_ids=dummy.input_ids,
+                positions=dummy.positions,
+                target_hidden_states=dummy.target_hidden_states,
                 step_idx=0,
                 seq_lens_delta=0,
                 num_rejected_np=None,
-                num_tokens_padded=bucket,
+                num_tokens_padded=dummy.bucket,
             )
-            with set_model_tag("eagle_head"):
-                tok = self._draft_propose_token(first_pass_carry)
-            # Mirror the K-1 loop steps: forward @p -> lm head @p. Under
-            # IndexShare, _forward_draft routes these to the loop-step program
-            # exactly as a real propose does, so this rank runs the same
-            # programs, and the same collectives, as its peers. They read the
-            # top-k table without having written it this step; load_model
-            # seeds it with -1 so that read stays in range.
-            for step in range(1, K):
-                last_hidden, _ = self._forward_draft(
-                    chunk=chunk,
-                    input_ids=loop_input_ids,
-                    positions=loop_positions,
-                    target_hidden_states=loop_hidden,
-                    step_idx=step,
-                    # Mirror the real loop so the dummy traces the same
-                    # metadata program the peer ranks' propose emits.
-                    seq_lens_delta=(step if self.advance_draft_positions else 0),
-                    num_rejected_np=None,
-                    num_tokens_padded=p,
-                    loop_query_start_loc=loop_qsl,
-                    loop_request_distribution=loop_reqdist,
-                )
-                with set_model_tag("eagle_head"):
-                    tok = self._draft_propose_token(last_hidden)
-            # Force the chunk to execute so its collectives fire in lockstep
-            # with the peer ranks' real propose (nothing consumes the result).
-            synchronize_tensors(tok)
+            lm_head_input = dummy.first_pass_carry
+        else:
+            # A real loop step: forward @p -> lm head @p. Under IndexShare,
+            # _forward_draft routes it to the loop-step program exactly as a
+            # real propose does, so this rank runs the same programs, and the
+            # same collectives, as its peers. It reads the top-k table
+            # without having written it this step; load_model seeds it with
+            # -1 so that read stays in range.
+            lm_head_input, _ = self._forward_draft(
+                chunk=dummy.chunk,
+                input_ids=dummy.loop_input_ids,
+                positions=dummy.loop_positions,
+                target_hidden_states=dummy.loop_hidden,
+                step_idx=step,
+                # Mirror the real loop so the dummy traces the same
+                # metadata program the peer ranks' propose emits.
+                seq_lens_delta=(step if self.advance_draft_positions else 0),
+                num_rejected_np=None,
+                num_tokens_padded=dummy.loop_bucket,
+                loop_query_start_loc=dummy.loop_query_start_loc,
+                loop_request_distribution=dummy.loop_request_distribution,
+            )
+        with set_model_tag("eagle_head"):
+            tok = self._draft_propose_token(lm_head_input)
+        # Nothing consumes the result, so enqueue it here, at this step's
+        # place in the collective order, without blocking the host.
+        synchronize_tensors(tok, wait=False)
+        return tok
