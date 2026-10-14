@@ -49,6 +49,16 @@ spec:
           parallelism: ${MULTIHOST_HOSTS}
           completions: ${MULTIHOST_HOSTS}
           completionMode: Indexed
+          # The Job, and so the JobSet, succeeds as soon as index 0 (the head)
+          # does, and Kubernetes then terminates the workers. Without it a
+          # worker leaves only by noticing the head is gone
+          # (multihost_lib.sh wait_for_head_to_go), which held its chips for
+          # tens of seconds after the head had exited. Job successPolicy is GA
+          # since Kubernetes 1.33; the fleet runs 1.35 with JobSet 0.12, whose
+          # CRD keeps the field.
+          successPolicy:
+            rules:
+              - succeededIndexes: "0"
           # Eight hours, over the fleet's three-hour default, because these
           # models compile for the better part of an hour before the sweep
           # starts. Raising it shrinks the admission window: a workload gets

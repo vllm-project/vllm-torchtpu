@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -355,3 +368,24 @@ def test_engine_core_patch_is_skipped_without_dynamic_chunks(monkeypatch):
     monkeypatch.setattr(engine_core, "EngineCore", FakeCore)
     patch_engine_core_for_pp_chunks(_config(cls=None))
     assert not hasattr(FakeCore, "_tpu_pp_chunks_patch")
+
+
+def test_the_step_estimate_prices_the_step_the_cost_model_sees():
+    cost = _model()
+    scheduler = _scheduler(cost=cost)
+    # schedule() has already counted the step's tokens as computed
+    scheduler.requests = {
+        "a": _request(12288, 32768, "a"),
+        "d": _request(8193, 8192, "d", num_tokens=8193),
+    }
+    step = SimpleNamespace(
+        num_scheduled_tokens={"a": 4096, "d": 1, "gone": 7},
+        total_num_scheduled_tokens=4104,
+    )
+    pairs = 4096 * 8192 + 1 * 8192
+    squares = 4096**2 + 1 + 49
+    assert scheduler.step_estimate_ms(step) == cost.step_ms(8192, pairs, squares)
+    # past the largest bucket the step is priced at that bucket
+    step.total_num_scheduled_tokens = 20000
+    assert scheduler.step_estimate_ms(step) == cost.step_ms(16384, pairs, squares)
+    assert _scheduler().step_estimate_ms(step) is None

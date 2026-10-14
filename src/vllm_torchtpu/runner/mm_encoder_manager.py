@@ -1,3 +1,17 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+from collections.abc import Hashable
 from typing import Any, cast
 
 import torch
@@ -9,6 +23,10 @@ from vllm.model_executor.models.interfaces import (
 from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner.mm_video_chunking import (
+    embed_multimodal_chunked,
+    get_video_chunk_patch_size,
+)
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
@@ -162,7 +180,12 @@ class MMEncoderManager(EncoderCudaGraphManager):
         return padded
 
     @torch.no_grad()
-    def _capture_budget_graph(self, token_budget: int, path: str = "default") -> None:
+    def _capture_budget_graph(
+        self,
+        token_budget: int,
+        path: str = "default",
+        axis_keys: tuple[Hashable, ...] = (),
+    ) -> None:
         """Primes the XLA cache for a specific budget bucket."""
         template = self.budget_templates[path][token_budget]
 
@@ -171,6 +194,7 @@ class MMEncoderManager(EncoderCudaGraphManager):
         try:
             out = self._compiled_budget_forward(dict(template), path=path)
             synchronize_tensors(out, wait=True)
+            # pyrefly: ignore[unsupported-operation]
             self._get_graph_set(path)[token_budget] = template
         except Exception as e:
             logger.warning(
@@ -187,6 +211,7 @@ class MMEncoderManager(EncoderCudaGraphManager):
         mm_kwargs: dict[str, Any],
         token_budget: int,
         path: str = "default",
+        axis_keys: tuple[Hashable, ...] = (),
         *,
         allow_eager_fallback: bool = True,
     ) -> torch.Tensor | None:
@@ -226,6 +251,35 @@ class MMEncoderManager(EncoderCudaGraphManager):
             self.graph_misses += num_items
             with torch.inference_mode():
                 return self.model.encoder_eager_forward(mm_kwargs, path=path)
+
+    def _execute_local(
+        self,
+        mm_kwargs: dict[str, Any],
+    ) -> list[torch.Tensor]:
+        """Execute locally, temporally chunking videos that exceed max budget."""
+        item_specs = self._get_item_specs(mm_kwargs)
+        total_tokens = sum(spec.output_tokens for spec in item_specs)
+        max_budget = max(self.token_budgets, default=0)
+        # When total batch tokens exceed the largest compiled bucket
+        # (max_budget), embed_multimodal_chunked temporally splits oversized
+        # videos so each call to upstream _execute_local fits in a compiled
+        # bucket, avoiding unbucketed eager fallback, XLA recompilation, and
+        # VMEM OOM on long videos.
+        if total_tokens > max_budget > 0:
+            total_patches = sum(spec.input_size for spec in item_specs)
+            max_patches = get_video_chunk_patch_size(
+                self.vllm_config.model_config,
+                default_max_patches=max_budget * total_patches // total_tokens,
+            )
+            if max_patches > 0:
+                return list(
+                    embed_multimodal_chunked(
+                        lambda **kw: super(MMEncoderManager, self)._execute_local(kw),
+                        mm_kwargs,
+                        max_patches,
+                    )
+                )
+        return super()._execute_local(mm_kwargs)
 
     @torch.no_grad()
     def execute_dp_coordinated(
@@ -275,9 +329,12 @@ class MMEncoderManager(EncoderCudaGraphManager):
             if step < len(batches):
                 assert mm_kwargs is not None
                 indices, _ = batches[step]
-                kwargs = self._select_items(mm_kwargs, indices)
+                kwargs, axis_keys = self._select_items(mm_kwargs, indices)
                 output = self._run_budget_graph(
-                    kwargs, budget, allow_eager_fallback=False
+                    kwargs,
+                    budget,
+                    axis_keys=axis_keys,
+                    allow_eager_fallback=False,
                 )
                 assert output is not None
                 self.model.postprocess_encoder_output(

@@ -54,7 +54,7 @@ def _recording_connector(events: list[str]) -> MagicMock:
     return connector
 
 
-def _fake_runner(method, is_async, verify, propose):
+def _fake_runner(method, is_async, verify, propose, fence=False):
     """The runner state sample_tokens reads for one request sampling token 7
     (drafting token 8 when async)."""
     scheduler_output = SimpleNamespace(
@@ -95,6 +95,8 @@ def _fake_runner(method, is_async, verify, propose):
         ),
         scheduler_config=SimpleNamespace(async_scheduling=is_async),
         _is_async_drafter=method == "mtp",
+        _mtp_prefill_only=False,
+        _fence_spec_kv_under_token_copy=fence,
         is_pooling_model=False,
         drafter=SimpleNamespace(),
         spec_decode_manager=SimpleNamespace(propose_draft_token_ids=propose),
@@ -188,3 +190,50 @@ def test_device_drafter_runs_before_kv_connector_save(
     )
     assert output.kv_connector_output.finished_sending == {"sent"}
     assert output.kv_connector_output.finished_recving == {"loaded"}
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+def test_spec_kv_fence_runs_after_drafter_before_connector_save(is_async):
+    """A Stage-3 producer that registers KV blocks ahead of the finish
+    enqueues the drafter's graph through its draft-token output and re-arms
+    the sampled-token copy's ready event behind it, after the drafter and
+    before the connector save, so the first token leaving the device proves
+    the step's KV is written."""
+    events: list[str] = []
+
+    def propose(**kwargs):
+        events.append("draft")
+        return torch.tensor([[8]]) if is_async else None
+
+    def fence(tensors, *, wait):
+        # The drafter's device output (the draft tokens) roots the enqueue.
+        assert len(tensors) == 1 and tensors[0].tolist() == [[8]]
+        assert wait is False
+        events.append("fence")
+
+    def host_copy(chunks, lengths, spec_logprobs=None):
+        state = _host_copy(chunks, lengths, spec_logprobs)
+        state.fence_pending_device_work = lambda: events.append("rearm")
+        return state
+
+    runner = _fake_runner("mtp", is_async, False, propose, fence=True)
+    connector = _recording_connector(events)
+    with (
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group",
+            return_value=True,
+        ),
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group",
+            return_value=connector,
+        ),
+        patch("vllm_torchtpu.runner.tpu_runner.synchronize_tensors", side_effect=fence),
+        patch.object(AsyncTPUCopyState, "from_device_chunks", side_effect=host_copy),
+    ):
+        output = TPUModelRunner.sample_tokens(runner, None)
+
+    if is_async:
+        output = output.get_output()
+    assert output.sampled_token_ids == [[7]]
+    expected = ["draft", "fence", "rearm"] if is_async else ["draft", "rearm"]
+    assert events == expected + ["save", "poll", "clear"]

@@ -177,9 +177,17 @@ class SparseMLAScatterTest(parameterized.TestCase):
             spec.num_pages, spec.page_size, spec.token_bytes
         )
         written = rows[inp["page"], inp["slot"]]
-        np.testing.assert_array_equal(
+        # TPU hardware canonicalizes FP8 negative NaN (0xFF) to positive NaN (0x7F).
+        # Treat both representations as equivalent for float8_e4m3fn latents.
+        expected = np.asarray(raw_u8)
+        written_canonical = np.where(
+            (written[:, : raw_u8.shape[1]] == 0x7F) & (expected == 0xFF),
+            0xFF,
             written[:, : raw_u8.shape[1]],
-            np.asarray(raw_u8),
+        )
+        np.testing.assert_array_equal(
+            written_canonical,
+            expected,
             err_msg=f"Pallas {key} decoded bytes mismatch vs input",
         )
         # A short token's padded tail must be zero-filled, never stale: stale

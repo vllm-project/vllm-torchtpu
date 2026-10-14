@@ -84,10 +84,6 @@ class PcpStaticSupportValidator:
 
         if config.dcp_size > 1:
             raise NotImplementedError("PCP runner path does not support DCP yet.")
-        if config.pipeline_parallel_size != 1:
-            raise NotImplementedError(
-                "PCP runner path does not support pipeline parallelism yet."
-            )
         if config.is_moe and not config.expert_parallel:
             raise NotImplementedError(
                 "PCP on an MoE model requires --enable-expert-parallel: "

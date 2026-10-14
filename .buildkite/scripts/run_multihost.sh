@@ -268,6 +268,11 @@ if [ "${EXIT_CODE}" -ne 0 ] && [ -n "${MULTIHOST_RUN_LOG:-}" ] && [ -s "${MULTIH
   fi
   echo "Last 40 lines of head-container output:"
   tail -n 40 "${MULTIHOST_RUN_LOG}"
+
+  python3 "${SCRIPT_DIR}/record_ci_failure.py" \
+    --log-file "${MULTIHOST_RUN_LOG}" \
+    --exit-code "${EXIT_CODE}" \
+    --step-label "${BUILDKITE_LABEL:-}" || true
 fi
 if [[ "${MULTIHOST_RUN_LOG:-}" == /tmp/* ]]; then
   rm -f "${MULTIHOST_RUN_LOG}"

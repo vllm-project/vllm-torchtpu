@@ -14,9 +14,11 @@
 """TPU-Friendly MLA Ragged Paged Attention kernel - GLM5.2 DeepSeek Sparse Attention."""
 
 import functools
+from typing import cast
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
@@ -125,6 +127,288 @@ def gather_page_ids(
     return out[:num_tokens]
 
 
+def _floor_divmod_const(x: jax.Array, d: int) -> tuple[jax.Array, jax.Array]:
+    """Computes exact integer `(x // d, x % d)` without hardware integer division.
+
+    TPU vector units lack a native vector `idiv` instruction. This function
+    emulates floor div/mod with maximum efficiency:
+    - Powers of 2: Uses bitwise shift (`>>`) and bitmask (`&`).
+    - Arbitrary integers: Uses a reciprocal float32 multiplication followed by
+      a remainder refinement and a ±1 clamp to guarantee bit-exact results.
+
+    Args:
+        x: Input int32 tensor of arbitrary shape.
+        d: Static positive integer divisor (must be > 0).
+
+    Returns:
+        A tuple `(quotient, remainder)` where `quotient = x // d` and
+        `remainder = x % d`, both int32 arrays with exact floor semantics.
+    """
+    # Fast path: powers of 2 (e.g., page_size = 256) use bitwise operations.
+    if d & (d - 1) == 0:
+        shift = d.bit_length() - 1
+        return lax.shift_right_arithmetic(x, jnp.int32(shift)), x & jnp.int32(d - 1)
+
+    # General path: reciprocal float32 multiplication.
+    inv = np.float32(1.0 / d)
+    q = jnp.floor(x.astype(jnp.float32) * inv).astype(jnp.int32)
+    r = x - q * jnp.int32(d)
+    q2 = jnp.floor(r.astype(jnp.float32) * inv).astype(jnp.int32)
+    q = q + q2
+    r = r - q2 * jnp.int32(d)
+    lo = r < 0
+    q = jnp.where(lo, q - 1, q)
+    r = jnp.where(lo, r + jnp.int32(d), r)
+    hi = r >= d
+    q = jnp.where(hi, q + 1, q)
+    r = jnp.where(hi, r - jnp.int32(d), r)
+    return q, r
+
+
+def _capped_window_indices_kernel(
+    live_windows_ref,  # i32[1] (scalar prefetch; sizes the grid)
+    windows_ref,  # i32[block_tokens, padded_pps] page-table row per token
+    topk_ref,  # i32[block_tokens, topk_cap] one window of the logical top-k
+    out_ref,  # i32[block_tokens, topk_cap] its physical rows
+    *,
+    block_tokens: int,
+    chunk_size: int,
+    topk: int,
+    topk_cap: int,
+    page_size: int,
+    pages_per_seq: int,
+    total_num_pages: int,
+):
+    """Translates logical top-k slots to physical memory rows for one tile.
+
+    Executes on TPU vector cores for a single (window `w`, chunk `c`, tile `tb`).
+    - Valid slots: looks up their physical page in the page table.
+    - Empty slots (-1): hashes them to pseudo-random physical rows using primes
+      to prevent memory bank conflicts on SparseCore during gathering."""
+    del live_windows_ref
+    w = pl.program_id(0)
+    c = pl.program_id(1)
+    tb = pl.program_id(2)
+    idx = topk_ref[...]
+    is_padding = idx == -1
+
+    # 1. Translate logical index -> (logical sequence page, token offset within page).
+    seq_page, token_offset = _floor_divmod_const(idx, page_size)
+    logical = jnp.clip(seq_page, 0, pages_per_seq - 1)
+
+    # 2. Look up the physical page from the sequence's page table.
+    # Processed in chunks of _GATHER_PAGE_CHUNK to stay within vector register limits.
+    page = jnp.zeros_like(logical)
+    for pc in range(windows_ref.shape[1] // _GATHER_PAGE_CHUNK):
+        window_chunk = windows_ref[
+            :, pc * _GATHER_PAGE_CHUNK : (pc + 1) * _GATHER_PAGE_CHUNK
+        ]
+        local = logical - pc * _GATHER_PAGE_CHUNK
+        gathered = jnp.take_along_axis(
+            window_chunk, jnp.clip(local, 0, _GATHER_PAGE_CHUNK - 1), axis=1
+        )
+        page = jnp.where((local >= 0) & (local < _GATHER_PAGE_CHUNK), gathered, page)
+
+    # 3. Handle empty padding slots (-1) with pseudo-random scattering.
+    # If all -1s read row 0, SparseCore would bottleneck on memory bank 0.
+    # Multiplying unique slot coordinates by large primes hashes -1s uniformly.
+    row = (
+        c * chunk_size
+        + tb * block_tokens
+        + lax.broadcasted_iota(jnp.int32, idx.shape, 0)
+    )
+    col = w * topk_cap + lax.broadcasted_iota(jnp.int32, idx.shape, 1)
+    flat_element_index = row * topk + col
+
+    _, scattered_page = _floor_divmod_const(
+        flat_element_index * 104729, total_num_pages
+    )
+    _, scattered_offset = _floor_divmod_const(flat_element_index * 15485863, page_size)
+
+    # Use the real page/offset for valid slots; use scattered values for -1 padding.
+    page = jnp.where(is_padding, scattered_page, page)
+    token_offset = jnp.where(is_padding, scattered_offset, token_offset)
+
+    # 4. Write physical row (page * page_size + offset) straight into output layout.
+    out_ref[...] = page * page_size + token_offset
+
+
+def prepare_capped_window_indices(
+    topk_indices: jax.Array,  # i32[num_tokens, topk]
+    page_indices: jax.Array,  # i32[max_num_seqs * pages_per_seq]
+    cu_q_lens: jax.Array,  # i32[max_num_seqs + 1]
+    live_windows: jax.Array,  # i32[] in [1, topk // topk_cap]
+    *,
+    chunk_size: int,
+    topk_cap: int,
+    page_size: int,
+    total_num_pages: int,
+    block_tokens: int | None = None,
+) -> jax.Array:
+    """Launches the TPU kernel to translate logical slots to physical rows.
+
+    This function configures and launches the `_capped_window_indices_kernel`.
+    By sizing the Pallas grid dimension to `live_windows` (typically 1), it only
+    translates slots for windows that will actually be read by the gather,
+    leaving unneeded windows unwritten.
+
+    Args:
+        topk_indices: Shape [num_tokens, topk]. Logical token positions to gather.
+        page_indices: Flattened page table mapping logical pages to physical pages.
+        cu_q_lens: Cumulative query token count per sequence (ragged boundaries).
+        live_windows: Scalar from `capped_live_windows` determining how many
+          512-slot windows to translate (1 to 4).
+        chunk_size: Attention chunk size (e.g. 256).
+        topk_cap: Window capacity (e.g. 512).
+        page_size: Tokens per physical page (e.g. 256).
+        total_num_pages: Total physical cache pages allocated.
+        block_tokens: Token sub-tile size inside each chunk (e.g. 16 or 32).
+
+    Returns:
+        Array of shape [num_chunks * num_windows * chunk_size, topk_cap]
+        containing physical cache rows formatted directly in the layout
+        expected by the downstream SparseCore gather.
+    """
+    num_tokens, topk = topk_indices.shape
+    if num_tokens % chunk_size or topk % topk_cap:
+        raise ValueError(
+            f"num_tokens ({num_tokens}) and topk ({topk}) must be multiples of "
+            f"chunk_size ({chunk_size}) and topk_cap ({topk_cap})"
+        )
+    if block_tokens is None:
+        block_tokens = next((b for b in (32, 16, 8) if chunk_size % b == 0), chunk_size)
+    if chunk_size % block_tokens:
+        raise ValueError(
+            f"block_tokens ({block_tokens}) must divide chunk_size ({chunk_size})"
+        )
+    num_windows = topk // topk_cap
+    num_chunks = num_tokens // chunk_size
+    blocks_per_chunk = chunk_size // block_tokens
+    max_num_seqs = cu_q_lens.shape[0] - 1
+    pages_per_seq = page_indices.shape[0] // max_num_seqs
+
+    # Align page table width to vector register boundaries (_GATHER_PAGE_CHUNK).
+    padded_pps = align_to(pages_per_seq, _GATHER_PAGE_CHUNK)
+    page_table = page_indices.reshape(max_num_seqs, pages_per_seq)
+    if padded_pps != pages_per_seq:
+        page_table = jnp.pad(page_table, ((0, 0), (0, padded_pps - pages_per_seq)))
+
+    # Associate each token with its sequence ID to look up its page table row.
+    tokens_per_seq = cu_q_lens[1:] - cu_q_lens[:-1]
+    seq_ids_segment = jnp.repeat(
+        jnp.arange(max_num_seqs), tokens_per_seq, total_repeat_length=num_tokens
+    )
+    windows = page_table[seq_ids_segment]  # i32[num_tokens, padded_pps]
+
+    def token_block(w, c, tb, lw):
+        del w, lw
+        return c * blocks_per_chunk + tb
+
+    kernel = functools.partial(
+        _capped_window_indices_kernel,
+        block_tokens=block_tokens,
+        chunk_size=chunk_size,
+        topk=topk,
+        topk_cap=topk_cap,
+        page_size=page_size,
+        pages_per_seq=pages_per_seq,
+        total_num_pages=total_num_pages,
+    )
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=1,
+            in_specs=[
+                # Spec 0: Page table for this token block
+                pl.BlockSpec(
+                    (block_tokens, padded_pps),
+                    lambda w, c, tb, lw: (token_block(w, c, tb, lw), 0),
+                ),
+                # Spec 1: Top-k indices for this token block
+                pl.BlockSpec(
+                    (block_tokens, topk_cap),
+                    lambda w, c, tb, lw: (token_block(w, c, tb, lw), w),
+                ),
+            ],
+            # Direct-in-place write: places output straight into windowed chunk layout.
+            out_specs=pl.BlockSpec(
+                (block_tokens, topk_cap),
+                lambda w, c, tb, lw: ((c * num_windows + w) * blocks_per_chunk + tb, 0),
+            ),
+            grid=(live_windows, num_chunks, blocks_per_chunk),
+        ),
+        out_shape=jax.ShapeDtypeStruct(
+            (num_chunks * num_windows * chunk_size, topk_cap), jnp.int32
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("arbitrary", "arbitrary", "arbitrary"),
+            disable_bounds_checks=True,
+        ),
+        name="capped_window_indices",
+    )(jnp.reshape(live_windows, (1,)).astype(jnp.int32), windows, topk_indices)
+
+
+def capped_live_windows(
+    kv_lens: jax.Array,  # i32[num_tokens]
+    token_end: jax.Array,  # i32[]
+    *,
+    chunk_size: int,
+    kernel_batch_size: int,
+    topk_cap: int,
+    num_windows: int,
+) -> jax.Array:
+    """Calculates how many `topk_cap` (512-slot) windows the capped path must process.
+
+    Instead of blindly gathering all possible windows (e.g., 4 windows = 2,048 slots),
+    this function inspects all active query tokens in the batch and finds the
+    maximum number of windows required by any single token.
+
+    Args:
+        kv_lens: Array of shape [num_tokens] containing the number of valid KV
+            cache entries each query token owns on this DCP rank.
+        token_end: Scalar integer marking the end of real tokens in the buffer.
+            Tokens at or beyond this index are padding.
+        chunk_size: Token chunk size processed per attention loop step (e.g., 256).
+        kernel_batch_size: Hardware execution tile size (e.g., 8 or 16 rows)
+            processed together by the TPU vector units.
+        topk_cap: Capacity of a single window (e.g., 512 slots).
+        num_windows: Maximum number of windows possible (e.g., 4 for 2,048 slots).
+
+    Returns:
+        A scalar i32 in the range [1, num_windows].
+        - 1 if all active tokens fit within the first window (<= topk_cap keys).
+        - >1 only if at least one active token overflows into later windows.
+        The window prep translates this many windows per chunk, and no chunk's
+        gather reaches past them.
+    """
+    num_tokens = kv_lens.shape[0]
+
+    # Map each token to its offset and start position within its chunk.
+    local = np.arange(num_tokens, dtype=np.int32) % chunk_size
+    start = np.arange(num_tokens, dtype=np.int32) - local
+
+    # Count how many real tokens fall within each chunk before hitting token_end.
+    valid_rows = jnp.clip(token_end - start, 0, chunk_size)
+
+    # Round up valid rows to the hardware tile size (kernel_batch_size)
+    # because TPU vector units execute complete tiles, not individual rows.
+    grid_rows = (valid_rows + kernel_batch_size - 1) // kernel_batch_size
+    grid_rows = grid_rows * kernel_batch_size
+
+    # Compute windows needed per token:
+    # - If inside the active hardware grid: ceil(kv_len / topk_cap).
+    # - Outside it (padding, rows the grid never reaches): 1, so they never raise
+    #   the bound.
+    token_windows = jnp.where(
+        local < grid_rows,
+        (jnp.maximum(kv_lens, 1) + topk_cap - 1) // topk_cap,
+        1,
+    )
+
+    # The worst case over all active tokens, clamped to [1, num_windows].
+    return jnp.clip(jnp.max(token_windows), 1, num_windows).astype(jnp.int32)
+
+
 def _attention_kernel(
     # Prefetch
     kv_lens_ref,  # [max_num_tokens] valid top-k count per query token
@@ -145,13 +429,35 @@ def _attention_kernel(
     return_lse: bool = False,
     sparsecore_layout: bool = False,
     capped_windows: int | None = None,
+    split_q: bool = False,
+    lse_lane_dense: bool = False,
 ):
+    # Split-q mode (`split_q`): `q_hbm_ref` holds q_nope only and the rope
+    # part arrives as a separate input `q_pe_hbm_ref` (first of `refs`), with
+    # its own VMEM double buffer (last scratch ref). The two are joined and
+    # zero-padded in VMEM, so the scores see exactly the operand the caller's
+    # concat used to build. The output is q_nope's width and aliases it.
+    #
+    # Lane-dense lse (`lse_lane_dense`): `lse_hbm_ref` is f32[tokens, heads]
+    # and the blse buffer f32[2, bsz, heads]; each token's [heads, 1] column
+    # is moved to a row exactly (a masked max) before it is stored.
+
+    # Paths with split_q and lase_lance_dense should be the default but kept
+    # as False to maintain compatibility with existing code paths. Some clean up
+    # work can be done later.
+    #
     # Capped mode (`capped_windows` = W set, SparseCore layout only): the
     # gathered buffers hold W windows of `bkv_sz` rows per token, window-major
     # (`[W * chunk, bkv_sz, ...]`), and the pipelined body attends window 0
     # exactly like the uncapped path. Tokens with more than `bkv_sz` live rows
     # are recomputed over all their windows by an online-softmax fix-up with
     # double-buffered window DMAs (two-slot scratch trails the usual scratch).
+    q_pe_hbm_ref = None
+    bq_pe_x2_ref = None
+    if split_q:
+        q_pe_hbm_ref = refs[0]  # [max_num_tokens, num_q_heads, rope_dim]
+        bq_pe_x2_ref = refs[-1]  # [2, bsz, num_q_heads, rope_dim]
+        refs = refs[1:-1]
     fix_refs = None
     if capped_windows is not None:
         assert sparsecore_layout
@@ -184,7 +490,11 @@ def _attention_kernel(
     assert q_hbm_ref.shape == o_hbm_ref.shape
 
     num_tokens, num_q_heads, head_dim = q_hbm_ref.shape
+    # Width of the stored output (q_nope's in split-q mode, else head_dim).
     o_dim = head_dim
+    if split_q:
+        assert q_pe_hbm_ref is not None
+        head_dim = align_to(head_dim + q_pe_hbm_ref.shape[-1], 128)
     nope_dim = kv_cache_utils.WORD_BYTES * kv_cache_utils.TILE_LANE_BYTES
     assert kv_lens_ref.shape[0] == num_tokens
     bkv_sz = (
@@ -311,8 +621,19 @@ def _attention_kernel(
                 sem,
                 wait,
             )
+            if split_q:
+                # Same semaphore; the waits below mirror both starts.
+                _async_copy(
+                    q_pe_hbm_ref.at[pl.ds(seq_idx_start, batch_size)],
+                    bq_pe_x2_ref.at[bq_sem_idx, :],
+                    sem,
+                    wait,
+                )
         else:
             _async_copy(src=bq_vmem_ref, dst=bq_vmem_ref, sem=sem, wait=True)
+            if split_q:
+                bq_pe_vmem_ref = bq_pe_x2_ref.at[bq_sem_idx, :]
+                _async_copy(src=bq_pe_vmem_ref, dst=bq_pe_vmem_ref, sem=sem, wait=True)
 
     def _send_bo_batch(seq_idx_start, bo_sem_idx, *, wait=False):
         sem = sems.at[2, bo_sem_idx]
@@ -341,6 +662,7 @@ def _attention_kernel(
             _async_copy(src=vmem_ref, dst=vmem_ref, sem=sem, wait=True)
 
     def _send_blse_batch(seq_idx_start, bo_sem_idx, *, wait=False):
+        assert blse_x2_ref is not None and lse_hbm_ref is not None
         sem = sems.at[4, bo_sem_idx]
         vmem_ref = blse_x2_ref.at[bo_sem_idx, :]
 
@@ -373,11 +695,37 @@ def _attention_kernel(
         return _send_bo_batch(seq_idx_start, bo_sem_idx, wait=True)
 
     def load_bq(bq_sem_idx, batch_idx):
-        return bq_x2_ref.at[bq_sem_idx, batch_idx][...]
+        q = bq_x2_ref.at[bq_sem_idx, batch_idx][...]
+        if split_q:
+            # The caller's concat + zero pad, rebuilt in VMEM.
+            q = jnp.concatenate([q, bq_pe_x2_ref.at[bq_sem_idx, batch_idx][...]], -1)
+            if q.shape[-1] < head_dim:
+                q = jnp.pad(q, ((0, 0), (0, head_dim - q.shape[-1])))
+        return q
 
     def store_blse(bo_sem_idx, batch_idx, lse_col):
         """Stores one token's f32[num_q_heads, 1] log-sum-exp column."""
-        blse_x2_ref.at[bo_sem_idx, batch_idx][...] = lse_col
+        assert blse_x2_ref is not None
+        if not lse_lane_dense:
+            blse_x2_ref.at[bo_sem_idx, batch_idx][...] = lse_col
+            return
+        # Heads from sublanes to lanes, exactly: each column of the masked
+        # [heads, heads] tile holds one live entry, the rest -inf.
+        eye_shape = (num_q_heads, num_q_heads)
+        eye = lax.broadcasted_iota(jnp.int32, eye_shape, 0) == (
+            lax.broadcasted_iota(jnp.int32, eye_shape, 1)
+        )
+        row = jnp.max(
+            jnp.where(eye, jnp.broadcast_to(lse_col, eye_shape), -jnp.inf),
+            axis=0,
+            keepdims=True,
+        )
+        tile_ref = blse_x2_ref.at[bo_sem_idx]  # [bsz, num_q_heads]
+        if isinstance(batch_idx, int):
+            tile_ref[pl.ds(batch_idx, 1), :] = row
+        else:
+            pick = lax.broadcasted_iota(jnp.int32, tile_ref.shape, 0) == batch_idx
+            tile_ref[...] = jnp.where(pick, row, tile_ref[...])
 
     def load_bkv(bkv_sem_idx, batch_idx):
         return unpack_bkv(
@@ -711,6 +1059,7 @@ def prepare_outputs(
         "small_chunk_gather_atoms",
         "live_gather_all_chunks",
         "topk_cap",
+        "lse_lane_dense",
     ),
 )
 def sparse_ragged_paged_attention(
@@ -743,6 +1092,8 @@ def sparse_ragged_paged_attention(
     small_chunk_gather_atoms: int = 1,
     live_gather_all_chunks: bool = True,
     topk_cap: int | None = None,
+    q_pe: jax.Array | None = None,
+    lse_lane_dense: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -797,6 +1148,16 @@ def sparse_ragged_paged_attention(
         a chunk with no such token gathers `topk_cap` slots per row only. Must
         be a multiple of 64 dividing `topk`. Pays off when rows hold far fewer
         than `topk` live entries (DCP).
+      q_pe: Split-q mode. `q` is then q_nope only, `[max_num_tokens,
+        num_q_heads, nope]` with `nope` a multiple of 128 and `num_q_heads` a
+        multiple of the dtype packing, and `q_pe` `[max_num_tokens,
+        num_q_heads, rope]` its rope part. The kernel joins them in VMEM
+        instead of the caller materialising a padded concat; the output
+        aliases q_nope and is `nope` wide (the value part only). Same scores
+        and output values.
+      lse_lane_dense: With `return_lse`, carry the log-sum-exp as f32[tokens,
+        heads] through the kernel instead of f32[tokens, heads, 1] (lane-padded
+        tiles). Same values.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -857,7 +1218,18 @@ def sparse_ragged_paged_attention(
 
     _, actual_num_q_heads, actual_head_dim = q.shape
 
-    q = prepare_q_inputs(q)  # [max_num_tokens, num_q_heads, head_dim]
+    if q_pe is not None:
+        if q_pe.shape[:2] != q.shape[:2] or q_pe.dtype != q.dtype:
+            raise ValueError(
+                f"q_pe {q_pe.shape}/{q_pe.dtype} must match q_nope "
+                f"{q.shape}/{q.dtype} in tokens, heads and dtype"
+            )
+        if actual_head_dim % 128 or actual_num_q_heads % get_dtype_packing(q.dtype):
+            raise ValueError(
+                f"split q needs a 128-multiple nope dim and packed heads, got {q.shape}"
+            )
+    else:
+        q = prepare_q_inputs(q)  # [max_num_tokens, num_q_heads, head_dim]
 
     page_size = cache_kv_nope.shape[1]
 
@@ -885,20 +1257,64 @@ def sparse_ragged_paged_attention(
         )
 
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
-    kv_lens, physical_indices = prepare_gather_indices(
-        topk_indices,
-        page_indices,
-        cu_q_lens,
-        page_size=page_size,
-        total_num_pages=cache_kv_nope.shape[0],
+    # With the cap, translate the top-k once per call straight into the capped
+    # window-major layout, live windows only (`prepare_capped_window_indices`),
+    # whenever every chunk has one static size; otherwise the full-width
+    # `prepare_gather_indices` plus a per-chunk transpose. Same gathered rows.
+    uniform_chunk = min(gather_and_attention_chunk_size, q.shape[0])
+    window_prep = (
+        topk_cap is not None
+        and page_indices is not None
+        and q.shape[0] % uniform_chunk == 0
     )
+    window_indices_all = None
+    chunk_window_rows = 0  # rows of `window_indices_all` per chunk
+    if window_prep:
+        assert topk_cap is not None
+        chunk_window_rows = topk // topk_cap * uniform_chunk
+        kv_lens = jnp.sum(topk_indices != -1, axis=-1)
+        physical_indices = None
+        _, prep_batch = _chunk_kernel_batch_size(
+            uniform_chunk,
+            attention_kernel_batch_size,
+            small_chunk_tokens,
+            small_chunk_batch_size,
+        )
+        live_windows = capped_live_windows(
+            kv_lens,
+            cu_q_lens[distribution[2]],
+            chunk_size=uniform_chunk,
+            kernel_batch_size=prep_batch,
+            topk_cap=topk_cap,
+            num_windows=topk // topk_cap,
+        )
+        window_indices_all = prepare_capped_window_indices(
+            topk_indices,
+            page_indices,
+            cu_q_lens,
+            live_windows,
+            chunk_size=uniform_chunk,
+            topk_cap=topk_cap,
+            page_size=page_size,
+            total_num_pages=cache_kv_nope.shape[0],
+        )
+    else:
+        kv_lens, physical_indices = prepare_gather_indices(
+            topk_indices,
+            page_indices,
+            cu_q_lens,
+            page_size=page_size,
+            total_num_pages=cache_kv_nope.shape[0],
+        )
 
     # Rows the grid never reaches (padding past `batch_end`) keep this
     # sentinel, so a downstream merge weights them at exp(min - max) == 0
     # instead of tripping on uninitialised memory.
     lse = (
         jnp.full(
-            (q.shape[0], num_q_heads, 1),
+            (q.shape[0], num_q_heads)
+            if lse_lane_dense
+            else (q.shape[0], num_q_heads, 1),
             jnp.finfo(jnp.float32).min,
             dtype=jnp.float32,
         )
@@ -934,6 +1350,15 @@ def sparse_ragged_paged_attention(
             live_gather_all_chunks=live_gather_all_chunks,
             topk_cap=topk_cap,
             topk_override=topk,
+            window_indices=(
+                None
+                if window_indices_all is None
+                else window_indices_all[
+                    i * chunk_window_rows : (i + 1) * chunk_window_rows
+                ]
+            ),
+            q_pe=q_pe,
+            lse_lane_dense=lse_lane_dense,
         )
         if return_lse:
             q, lse = result
@@ -943,7 +1368,9 @@ def sparse_ragged_paged_attention(
     # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     out = prepare_outputs(q, actual_num_q_heads, actual_head_dim)
     if return_lse:
-        return out, lse[:, :actual_num_q_heads, 0]
+        if lse_lane_dense:
+            return out, cast(jax.Array, lse)[:, :actual_num_q_heads]
+        return out, cast(jax.Array, lse)[:, :actual_num_q_heads, 0]
     return out
 
 
@@ -1030,6 +1457,9 @@ def sparse_attention_chunk(
     live_gather_all_chunks: bool = False,
     topk_cap: int | None = None,
     topk_override: int | None = None,
+    window_indices: jax.Array | None = None,
+    q_pe: jax.Array | None = None,
+    lse_lane_dense: bool = False,
 ):
     """Gathers and attends query rows `[start_pos, min(end_pos, token_end))`.
 
@@ -1043,6 +1473,13 @@ def sparse_attention_chunk(
     the chunk's top-k window-major in `topk_cap`-slot windows, bounded to the
     windows its live rows reach, and attends window 0 per token with an
     in-kernel fix-up over all windows for tokens holding more live entries.
+    `window_indices` (with `topk_cap`; from `prepare_capped_window_indices`)
+    is that window-major index array prebuilt for this chunk, in which case
+    `physical_indices` may be None and `topk_override` must be given.
+    `q_pe` (split-q): `q` is q_nope `[max_num_tokens, num_q_heads, nope]`
+    (unpadded, nope a multiple of 128) and `q_pe` its rope part; the kernel
+    joins them in VMEM and the output (aliasing `q`) is `nope` wide.
+    `lse_lane_dense`: `lse` is f32[max_num_tokens, num_q_heads].
     """
     return_lse = lse is not None
     if topk_override is not None:
@@ -1050,6 +1487,8 @@ def sparse_attention_chunk(
     else:
         assert physical_indices is not None
         topk = physical_indices.shape[-1]
+    if window_indices is not None and topk_cap is None:
+        raise ValueError("window_indices requires topk_cap")
     sparsecore_layout = cache_layout == SPARSECORE_CACHE_LAYOUT
     if topk_cap is not None and not sparsecore_layout:
         raise ValueError("topk_cap requires the sparsecore cache layout")
@@ -1061,6 +1500,9 @@ def sparse_attention_chunk(
     if preserve_suffix and (return_lse or sparsecore_layout):
         raise ValueError("Prefix stores require TensorCore caches without LSE")
     _, num_q_heads, head_dim = q.shape
+    split_q = q_pe is not None
+    if split_q:
+        head_dim = align_to(head_dim + q_pe.shape[-1], 128)
     chunk_size = end_pos - start_pos
     capped_windows = None if topk_cap is None else topk // topk_cap
 
@@ -1070,7 +1512,7 @@ def sparse_attention_chunk(
         cache_kv_nope: jax.Array,
         cache_kv_rope: jax.Array,  # [num_tokens, topk, rope_dim] (gathered)
         kv_lens: jax.Array,  # i32[max_num_tokens]
-        start_seq_idx: jax.Array,  # i32
+        start_seq_idx: int,
         end_seq_idx: jax.Array,  # i32
         kernel_batch_size: int,
         lse: jax.Array | None = None,  # f32[max_num_tokens, num_q_heads, 1]
@@ -1083,6 +1525,8 @@ def sparse_attention_chunk(
             pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv_nope
             pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv_rope
         ]
+        if split_q:
+            in_specs.append(pl.BlockSpec(memory_space=pltpu.HBM))  # q_pe
 
         out_specs = pl.BlockSpec(memory_space=pltpu.HBM)  # o
         # Each chunk writes only its own token rows, so -- exactly like `q` --
@@ -1119,7 +1563,12 @@ def sparse_attention_chunk(
         ]
         if return_lse:
             scratch_shapes.append(
-                pltpu.VMEM((2, batch_size, num_q_heads, 1), jnp.float32)
+                pltpu.VMEM(
+                    (2, batch_size, num_q_heads)
+                    if lse_lane_dense
+                    else (2, batch_size, num_q_heads, 1),
+                    jnp.float32,
+                )
             )
         # Semaphores for double buffering of bkv_nope, bq, bo, bkv_rope
         # (+ blse when the log-sum-exp is exported).
@@ -1135,6 +1584,11 @@ def sparse_attention_chunk(
                 pltpu.VMEM((num_q_heads, head_dim), jnp.float32),
                 pltpu.SemaphoreType.DMA((2, 2)),
             ]
+        if split_q:
+            # q_pe double buffer; always the last scratch ref.
+            scratch_shapes.append(
+                pltpu.VMEM((2, batch_size, num_q_heads, q_pe.shape[-1]), q_pe.dtype)
+            )
 
         bounds = [start_seq_idx, end_seq_idx]
         if preserve_suffix:
@@ -1154,6 +1608,8 @@ def sparse_attention_chunk(
             return_lse=return_lse,
             sparsecore_layout=sparsecore_layout,
             capped_windows=capped_windows,
+            split_q=split_q,
+            lse_lane_dense=lse_lane_dense,
         )
 
         scope_name = (
@@ -1181,7 +1637,10 @@ def sparse_attention_chunk(
                 out_shape=(
                     [
                         jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype),
-                        jax.ShapeDtypeStruct(shape=lse.shape, dtype=lse.dtype),
+                        jax.ShapeDtypeStruct(
+                            shape=cast(jax.Array, lse).shape,
+                            dtype=cast(jax.Array, lse).dtype,
+                        ),
                     ]
                     if return_lse
                     else jax.ShapeDtypeStruct(shape=q.shape, dtype=q.dtype)
@@ -1189,7 +1648,7 @@ def sparse_attention_chunk(
                 input_output_aliases=(
                     {
                         num_prefetch: 0,
-                        num_prefetch + 3: 1,
+                        num_prefetch + 3 + int(split_q): 1,
                     }
                     if return_lse
                     else {
@@ -1202,8 +1661,10 @@ def sparse_attention_chunk(
             )
         )
         operands = [q, cache_kv_nope, cache_kv_rope]
+        if split_q:
+            operands.append(q_pe)
         if return_lse:
-            operands.append(lse)
+            operands.append(cast(jax.Array, lse))
         return kernel(*scalar_prefetches, *operands)
 
     indices = None if physical_indices is None else physical_indices[start_pos:end_pos]
@@ -1238,7 +1699,7 @@ def sparse_attention_chunk(
         # slice. The live bound reaches the last window any gridded row needs
         # (always window 0's live rows, so a chunk without overflow gathers
         # exactly `(batch_end - start) * topk_cap` rows).
-        assert capped_windows is not None and indices is not None
+        assert capped_windows is not None
         gather_atoms = sparsecore_atoms_per_batch
         if small_chunk and small_chunk_live_gather:
             gather_atoms = small_chunk_gather_atoms
@@ -1252,11 +1713,13 @@ def sparse_attention_chunk(
         num_live_capped = (live_windows - 1) * chunk_size * topk_cap + jnp.maximum(
             0, live_tokens
         ) * topk_cap
-        window_indices = (
-            indices.reshape(chunk_size, capped_windows, topk_cap)
-            .transpose(1, 0, 2)
-            .reshape(capped_windows * chunk_size, topk_cap)
-        )
+        if window_indices is None:
+            assert indices is not None
+            window_indices = (
+                indices.reshape(chunk_size, capped_windows, topk_cap)
+                .transpose(1, 0, 2)
+                .reshape(capped_windows * chunk_size, topk_cap)
+            )
         gathered_nope_buffer, gathered_rope_buffer = (
             native_sc_gather.dsa_gather_native_sc(
                 cache_kv_nope,

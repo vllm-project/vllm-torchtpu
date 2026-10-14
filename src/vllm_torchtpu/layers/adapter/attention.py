@@ -29,7 +29,7 @@ from vllm.v1.attention.backend import (
 )
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout as VllmKVCacheLayout
 
 import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched_wrapper
@@ -776,7 +776,9 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
         )
 
     @staticmethod
-    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+    def get_supported_kernel_block_sizes(
+        kv_cache_spec: KVCacheSpec | None = None,
+    ) -> list[int | MultipleOf]:
         if (
             get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
             is VllmKVCacheLayout.LBHNC
@@ -924,7 +926,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         block_major: bool = False,
     ):
         ctx = get_vllm_model_wrapper_context()
-        vllm_config = ctx.vllm_config
+        vllm_config = cast("VllmConfig | None", ctx.vllm_config)
         max_model_len = (
             vllm_config.model_config.max_model_len
             if use_pcp_streaming and vllm_config is not None
@@ -1329,7 +1331,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # cache aliasing for how the shared cache tensor is set up.
         skip_kv_update = self.kv_sharing_target_layer_name is not None
         ctx = get_vllm_model_wrapper_context()
-        vllm_config = ctx.vllm_config
+        vllm_config = cast("VllmConfig | None", ctx.vllm_config)
         parallel_config = None if vllm_config is None else vllm_config.parallel_config
         pcp_configured = (
             parallel_config is not None
@@ -1510,7 +1512,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
         sink = self.sinks
         ctx = get_vllm_model_wrapper_context()
-        vllm_config = ctx.vllm_config
+        vllm_config = cast("VllmConfig | None", ctx.vllm_config)
         parallel_config = None if vllm_config is None else vllm_config.parallel_config
 
         if self.dcp_world_size > 1:
@@ -2053,7 +2055,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
             )
-            return mla_attention(
+            results = mla_attention(
                 q_nope,
                 q_pe,
                 kv_c_normed,
@@ -2069,6 +2071,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 v_scale=v_scale,
                 use_causal_mask=not self.non_causal_multi_token_decode,
             )
+            # mla_attention returns (kv_cache, out), and more with return_lse.
+            return results[0], results[1]
 
         op_name = f"pallas::mla_attention_{layer.layer_name.replace('.', '_')}"
         mla_jax_op = pallas.jax_op(op_name, mla_attention_core_tpu, donate_argnums=(0,))

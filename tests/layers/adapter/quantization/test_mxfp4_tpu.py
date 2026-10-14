@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from types import SimpleNamespace
 
 import pytest
@@ -51,19 +64,38 @@ def _build_layer_and_method(device):
         has_bias=True,
     )
 
-    dummy_vllm_config = SimpleNamespace(
+    class _OpenNamespace(SimpleNamespace):
+        def __getattr__(self, name):
+            if name.startswith("__") and name.endswith("__"):
+                raise AttributeError(name)
+            return None
+
+    dummy_parallel_config = _OpenNamespace(
+        tp_size=1,
+        dp_size=1,
+        ep_size=1,
+        sp_size=1,
+        pcp_size=1,
+        tensor_parallel_size=1,
+        data_parallel_size=1,
+        pipeline_parallel_size=1,
+        prefill_context_parallel_size=1,
+        decode_context_parallel_size=1,
+        cp_kv_cache_interleave_size=1,
+        enable_dbo=False,
+        enable_expert_parallel=False,
+        all2all_backend="allgather_reducescatter",
+        enable_eplb=False,
+        expert_placement_strategy="linear",
+        use_ubatching=False,
+    )
+    dummy_vllm_config = _OpenNamespace(
         model_config=None,
-        kernel_config=SimpleNamespace(moe_backend="auto"),
+        kernel_config=_OpenNamespace(moe_backend="auto"),
         lora_config=None,
-        device_config=SimpleNamespace(device=device),
-        parallel_config=SimpleNamespace(
-            enable_dbo=False,
-            enable_expert_parallel=False,
-            all2all_backend="allgather_reducescatter",
-            enable_eplb=False,
-            expert_placement_strategy="linear",
-        ),
-        compilation_config=SimpleNamespace(
+        device_config=_OpenNamespace(device=device),
+        parallel_config=dummy_parallel_config,
+        compilation_config=_OpenNamespace(
             static_forward_context={},
             static_all_moe_layers=[],
             custom_ops=["all"],
@@ -71,9 +103,12 @@ def _build_layer_and_method(device):
             disabled_custom_ops=set(),
             max_cudagraph_capture_size=0,
         ),
-        scheduler_config=SimpleNamespace(
+        scheduler_config=_OpenNamespace(
             max_num_batched_tokens=2048,
         ),
+        attention_config=_OpenNamespace(hisparse_config=None),
+        speculative_config=None,
+        kv_transfer_config=None,
     )
 
     from vllm.config.vllm import set_current_vllm_config

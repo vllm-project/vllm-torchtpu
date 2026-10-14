@@ -14,6 +14,7 @@ from vllm.forward_context import set_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model_loader
 
+from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
@@ -549,6 +550,9 @@ class DFlashProposer:
             draft_attn_metadata = self._build_draft_attn_metadata(
                 chunk, padded_len, seq_lens
             )
+            # The padding mask still describes the target's last chunk; a
+            # MoE draft layer would skip real draft rows past its valid count.
+            token_padding.mark_padding(chunk.num_reqs * block_size, padded_len)
 
             with (
                 # Precomputed so set_forward_context does not run its
@@ -777,6 +781,9 @@ class DFlashProposer:
             position_ids_override=positions,
             padded_num_reqs=actual_num_reqs,
         )
+        # Every row of a dummy draft forward is padding, as in the runner's
+        # warmup steps.
+        token_padding.mark_padding(0, num_tokens)
 
         with (
             # Same contract as propose(): precomputed DP metadata, no

@@ -26,6 +26,7 @@ def cp_lse_ag_out_rs(
     lse: torch.Tensor,
     group: Any | None,
     return_lse: Literal[False] = False,
+    rs_dtype: torch.dtype | None = None,
 ) -> torch.Tensor: ...
 
 
@@ -35,6 +36,7 @@ def cp_lse_ag_out_rs(
     lse: torch.Tensor,
     group: Any | None,
     return_lse: Literal[True],
+    rs_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]: ...
 
 
@@ -43,6 +45,7 @@ def cp_lse_ag_out_rs(
     lse: torch.Tensor,
     group: Any | None,
     return_lse: bool = False,
+    rs_dtype: torch.dtype | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """Mirror vllm.v1.attention.ops.dcp.cp_lse_ag_out_rs.
 
@@ -50,6 +53,8 @@ def cp_lse_ag_out_rs(
       output: [T, H * group, D]
       lse: [T, H * group]
       return_lse: also return the merged LSE.
+      rs_dtype: dtype the weighted terms cross the reduce-scatter in; None
+        keeps f32.
 
     Returns:
       merged_output [T, H, D] in output.dtype, plus merged_lse [T, H] in f32
@@ -72,6 +77,8 @@ def cp_lse_ag_out_rs(
     weighted = output.to(torch.float32) * weight
     weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
 
+    if rs_dtype is not None:
+        weighted = weighted.to(rs_dtype)
     merged = group.reduce_scatter(weighted.contiguous(), dim=1).to(output.dtype)
     if not return_lse:
         return merged

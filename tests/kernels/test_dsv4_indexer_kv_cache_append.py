@@ -126,21 +126,50 @@ def _in_layout(cache_has: jax.Array, layout: str) -> jax.Array:
     return st_lib.convert_cache_to_seq_along_lane(cache_has, actual_head_dim=128)
 
 
+def _as_quantized_records(records: np.ndarray, rng: np.random.Generator) -> np.ndarray:
+    """Turns random `[..., >= 129]` record bytes into ones the quantizer can emit.
+
+    Bytes `[0, 128)` become finite FP8 keys and byte 128 a UE8M0 scale in
+    `2^[-7, 7]`. Uniform bytes would make 63% of keys hold an e4m3fn NaN and
+    put the scale's 0 and 0xFF codes in ~1% of tokens. The scores of those tokens
+    depend on how a reader decodes values the quantizer never writes, which is
+    not what a writer-placement test should compare.
+    """
+    records = records.copy()
+    keys = records[..., :128]
+    keys[(keys & 0x7F) == 0x7F] &= 0xFE  # e4m3fn NaN is S.1111.111.
+    records[..., 128] = rng.integers(120, 135, size=records.shape[:-1], dtype=np.uint8)
+    return records
+
+
 def _random_cache(
-    rng: np.random.Generator, num_pages: int, page_size: int, lkv_dim=256
+    rng: np.random.Generator,
+    num_pages: int,
+    page_size: int,
+    lkv_dim=256,
+    *,
+    quantized: bool = False,
 ) -> jax.Array:
-    """Random `HEAD_ALONG_SUBLANE` cache `[num_pages, page_size // 4, 4, W]`."""
-    return jnp.asarray(
-        rng.integers(
-            0, 256, size=(num_pages, page_size // 4, 4, lkv_dim), dtype=np.uint8
-        )
+    """Random `HEAD_ALONG_SUBLANE` cache `[num_pages, page_size // 4, 4, W]`.
+
+    With `quantized`, every record is a valid FP8 key and scale; see
+    `_as_quantized_records`.
+    """
+    cache = rng.integers(
+        0, 256, size=(num_pages, page_size // 4, 4, lkv_dim), dtype=np.uint8
     )
+    return jnp.asarray(_as_quantized_records(cache, rng) if quantized else cache)
 
 
 def _random_rows(
-    rng: np.random.Generator, num_tokens: int, width: int = 129
+    rng: np.random.Generator,
+    num_tokens: int,
+    width: int = 129,
+    *,
+    quantized: bool = False,
 ) -> jax.Array:
-    return jnp.asarray(rng.integers(0, 256, size=(num_tokens, width), dtype=np.uint8))
+    rows = rng.integers(0, 256, size=(num_tokens, width), dtype=np.uint8)
+    return jnp.asarray(_as_quantized_records(rows, rng) if quantized else rows)
 
 
 def _cu_q_lens(q_lens) -> jax.Array:
@@ -1439,9 +1468,9 @@ class CoalescedKvAppendTest(parameterized.TestCase):
         )
         page_indices = jnp.arange(num_pages, dtype=jnp.int32)
 
-        cache_has = _random_cache(rng, num_pages, page_size)
+        cache_has = _random_cache(rng, num_pages, page_size, quantized=True)
         cache_sal = _in_layout(cache_has, _SAL)
-        k_rows = _random_rows(rng, num_tokens)
+        k_rows = _random_rows(rng, num_tokens, quantized=True)
         q = jnp.asarray(rng.standard_normal((num_tokens, 64, 128)), jnp.bfloat16)
         w = jnp.asarray(rng.standard_normal((num_tokens, 64)), jnp.bfloat16)
 
@@ -1524,14 +1553,18 @@ class CoalescedKvAppendTest(parameterized.TestCase):
         replicated = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
 
         shards_has = [
-            _random_cache(np.random.default_rng(100 + r), local_pages, page_size)
+            _random_cache(
+                np.random.default_rng(100 + r), local_pages, page_size, quantized=True
+            )
             for r in range(dcp_size)
         ]
         shards_sal = [_in_layout(s, _SAL) for s in shards_has]
         global_has = jax.device_put(jnp.concatenate(shards_has, axis=0), sharded)
         global_sal = jax.device_put(jnp.concatenate(shards_sal, axis=0), sharded)
 
-        k_rows = jax.device_put(_random_rows(rng, num_tokens), replicated)
+        k_rows = jax.device_put(
+            _random_rows(rng, num_tokens, quantized=True), replicated
+        )
         q = jax.device_put(
             jnp.asarray(rng.standard_normal((num_tokens, 64, 128)), jnp.bfloat16),
             replicated,

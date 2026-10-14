@@ -125,3 +125,32 @@ def test_compressor_op_is_built_lazily_and_cached():
         assert compressor.compressor_op is sentinel
         assert compressor.compressor_op is sentinel
     build.assert_called_once()
+
+
+def test_transpose_wkv_wgate_allocates_fresh_buffer():
+    """The transposed weight gets its own buffer even if `.contiguous()` is a no-op.
+
+    On CPU `.contiguous()` already copies, so it is patched to return `self`,
+    mimicking the torch_tpu view chain that the fresh buffer + `copy_` breaks.
+    """
+    compressor = VllmDeepseekCompressor.__new__(VllmDeepseekCompressor)
+    torch.nn.Module.__init__(compressor)
+    orig = torch.arange(12, dtype=torch.float32).reshape(3, 4)
+    orig_ptr = orig.untyped_storage().data_ptr()
+    compressor.fused_wkv_wgate = SimpleNamespace(
+        weight=torch.nn.Parameter(orig, requires_grad=False)
+    )
+    compressor._wkv_wgate_transposed = False
+
+    with patch.object(torch.Tensor, "contiguous", lambda self, *a, **k: self):
+        compressor.transpose_wkv_wgate()
+
+    w = compressor.fused_wkv_wgate.weight
+    assert compressor._wkv_wgate_transposed is True
+    assert w.shape == (4, 3)
+    assert w.is_contiguous()
+    assert w.untyped_storage().data_ptr() != orig_ptr
+    assert torch.equal(w, orig.t())
+
+    compressor.transpose_wkv_wgate()  # A second call must not flip it back.
+    assert compressor.fused_wkv_wgate.weight is w

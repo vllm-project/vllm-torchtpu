@@ -13,6 +13,7 @@ BLOCK = 1152
 def _split_scheduler(use_eagle: bool):
     return SimpleNamespace(
         use_eagle=use_eagle,
+        use_eagle_block_drop=use_eagle,
         block_size=BLOCK,
         cache_config=SimpleNamespace(block_size=BLOCK),
         max_num_scheduled_tokens=16384,
@@ -20,6 +21,7 @@ def _split_scheduler(use_eagle: bool):
         hash_block_size=BLOCK,
         mamba_has_prefill_checkpoint_blocks=False,
         mamba_partial_cache_hit=False,
+        mamba_shared_prefix_checkpoint=False,
     )
 
 

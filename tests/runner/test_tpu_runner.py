@@ -15,6 +15,7 @@
 import contextlib
 import copy
 import inspect
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -56,7 +57,10 @@ from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner import utils as runner_utils_module
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
-from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
+from vllm_torchtpu.runner.tpu_runner_async_output import (
+    INVALID_TOKEN_ID,
+    AsyncPreResults,
+)
 
 
 def test_idle_dp_rank_encodes_before_decoder_pairing():
@@ -65,6 +69,7 @@ def test_idle_dp_rank_encodes_before_decoder_pairing():
         _execute_dp_mm_encoder=lambda: order.append("encoder"),
         _run_dp_dummy_chunk=lambda bucket: order.append(("decoder", bucket)),
         speculative_config=SimpleNamespace(use_eagle=lambda: True),
+        _is_async_drafter=True,
         _async_drafter=SimpleNamespace(
             run_dp_dummy_draft=lambda chunks: order.append(("draft", chunks))
         ),
@@ -83,6 +88,40 @@ def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
         "request-0": [0] * 8,
         "request-1": [0] * 13,
     }
+
+
+@pytest.mark.parametrize("dcp_size,expected_blocks", [(1, 65), (8, 9)])
+def test_spec_warmup_request_counts_blocks_in_block_table_units(
+    dcp_size, expected_blocks
+):
+    spec = FullAttentionSpec(
+        block_size=128, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    config = SimpleNamespace(
+        parallel_config=SimpleNamespace(decode_context_parallel_size=dcp_size)
+    )
+    captured = []
+    runner = SimpleNamespace(
+        max_model_len=40960,
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=4096, kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+        ),
+        vllm_config=config,
+        execute_model=lambda so: captured.append(so),
+        sample_tokens=lambda _: None,
+        take_draft_token_ids=lambda: None,
+        _warmup_spec_decode_cleanup=lambda rids: True,
+    )
+
+    assert TPUModelRunner._warmup_one_spec_request(runner, 8192, idx=0)
+
+    (block_ids,) = captured[0].scheduled_new_reqs[0].block_ids
+    # Five decode steps of 1 + K tokens follow the 8192-token prefill, so the
+    # request reaches position 8200; a row of the DCP8 block table covers
+    # 40960 tokens in 40 entries of 1024, and the ids must fit that row.
+    assert block_ids == list(range(1, 1 + expected_blocks))
+    assert len(block_ids) <= spec.max_num_blocks_per_req(config, 40960)
 
 
 def _smem_runner(dcp_size=8, kernel_page_size=384, most_model_len=65536):
@@ -237,21 +276,27 @@ def test_suspend_kv_transfer_group_restores_agent_after_failure():
         ([False, False], True),
     ],
 )
-def test_pcp_mtp_prefill_warmup_retries_once(outcomes, raises_after_retry):
+def test_mtp_prefill_warmup_retries_once(outcomes, raises_after_retry):
     attempts = MagicMock(side_effect=outcomes)
     runner = SimpleNamespace(
         enforce_eager=False,
-        _is_async_drafter=True,
+        speculative_config=object(),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1, prefill_context_parallel_size=1
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=4096),
         input_batch=SimpleNamespace(num_reqs=0),
         num_tokens_paddings=[4096],
         max_model_len=262144,
         num_xla_graphs=7,
         _precompile_timed=lambda _label: contextlib.nullcontext(),
-        _warmup_one_pcp_mtp_prefill=attempts,
+        _warmup_one_mtp_prefill=attempts,
     )
 
     expectation = (
-        pytest.raises(RuntimeError, match="PCP MTP prefill warmup failed after retry")
+        pytest.raises(
+            RuntimeError, match="MTP prefill warmup failed at P=4096 after retry"
+        )
         if raises_after_retry
         else contextlib.nullcontext()
     )
@@ -263,7 +308,7 @@ def test_pcp_mtp_prefill_warmup_retries_once(outcomes, raises_after_retry):
         ),
         expectation,
     ):
-        TPUModelRunner._warmup_pcp_mtp_prefill(runner)
+        TPUModelRunner._warmup_mtp_prefill(runner)
 
     assert attempts.call_args_list == [
         ((4096,), {"quiet": True}),
@@ -271,7 +316,207 @@ def test_pcp_mtp_prefill_warmup_retries_once(outcomes, raises_after_retry):
     ]
 
 
-def test_one_pcp_mtp_warmup_builds_prefill_without_decode():
+@pytest.mark.parametrize("succeeds", [True, False])
+def test_mtp_prefill_warmup_on_a_pipeline_runs_once_on_every_stage(succeeds):
+    # Every stage runs the synthetic prefill through the hand-off in step,
+    # so a stage never retries on its own, and settles the burst after its
+    # forward so the launches that carry the prefill on are issued.
+    attempts = MagicMock(return_value=succeeds)
+    wave = MagicMock()
+    runner = SimpleNamespace(
+        enforce_eager=False,
+        speculative_config=object(),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=4, prefill_context_parallel_size=1
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=4096),
+        _pp_wave=wave,
+        input_batch=SimpleNamespace(num_reqs=0),
+        num_tokens_paddings=[4096],
+        max_model_len=262144,
+        num_xla_graphs=7,
+        _precompile_timed=lambda _label: contextlib.nullcontext(),
+        _warmup_one_mtp_prefill=attempts,
+    )
+    expectation = (
+        contextlib.nullcontext()
+        if succeeds
+        else pytest.raises(RuntimeError, match="MTP prefill warmup failed")
+    )
+    with (
+        patch.object(
+            tpu_runner,
+            "_suspend_kv_transfer_group",
+            return_value=contextlib.nullcontext(),
+        ),
+        expectation,
+    ):
+        TPUModelRunner._warmup_mtp_prefill(runner)
+
+    assert attempts.call_args_list == [((4096,), {})]
+    assert wave.settle.call_count == 1
+
+
+def test_mtp_prefill_warmup_fills_every_bucket():
+    # Buckets are per rank: a PCP8 prompt of 8 x 512 tokens pads to 512 per
+    # rank. Prompts above one scheduler step collapse onto its size.
+    attempts = MagicMock(return_value=True)
+    wave = MagicMock()
+    runner = SimpleNamespace(
+        enforce_eager=False,
+        speculative_config=object(),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=4, prefill_context_parallel_size=8
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=32768),
+        _pp_wave=wave,
+        input_batch=SimpleNamespace(num_reqs=0),
+        num_tokens_paddings=[512, 1024, 1536, 2048, 4096, 8192],
+        max_model_len=262144,
+        num_xla_graphs=7,
+        _precompile_timed=lambda _label: contextlib.nullcontext(),
+        _warmup_one_mtp_prefill=attempts,
+    )
+    with patch.object(
+        tpu_runner, "_suspend_kv_transfer_group", return_value=contextlib.nullcontext()
+    ):
+        TPUModelRunner._warmup_mtp_prefill(runner)
+
+    assert attempts.call_args_list == [
+        ((4096,), {}),
+        ((8192,), {}),
+        ((12288,), {}),
+        ((16384,), {}),
+        ((32768,), {}),
+    ]
+    assert wave.settle.call_count == 5
+
+
+@pytest.mark.parametrize("async_scheduling", [True, False])
+def test_spec_decode_warmup_sweeps_batches_at_the_shortest_and_longest_prompt(
+    async_scheduling,
+):
+    one = MagicMock(return_value=True)
+    batch = MagicMock()
+    runner = SimpleNamespace(
+        enforce_eager=False,
+        _is_async_drafter=True,
+        input_batch=SimpleNamespace(num_reqs=0),
+        num_tokens_paddings=[16, 32, 64, 128, 4096, 8192, 16384],
+        num_reqs_paddings=[1, 8, 16, 32],
+        max_model_len=8192,
+        scheduler_config=SimpleNamespace(
+            max_num_seqs=32, async_scheduling=async_scheduling
+        ),
+        num_xla_graphs=3,
+        _precompile_timed=lambda _label: contextlib.nullcontext(),
+        _warmup_one_spec_request=one,
+        _warmup_spec_batch=batch,
+    )
+    with (
+        patch.object(tpu_runner.envs, "SPEC_WARMUP", True),
+        patch.object(
+            tpu_runner,
+            "_suspend_kv_transfer_group",
+            return_value=contextlib.nullcontext(),
+        ),
+    ):
+        TPUModelRunner._warmup_spec_decode(runner)
+
+    # One request per prompt bucket within max_model_len, greedy and not.
+    assert [c.args[0] for c in one.call_args_list] == [
+        P for P in (16, 32, 64, 128, 4096, 8192) for _ in range(2)
+    ]
+    # Every request count (async) or the request paddings (sync) at the
+    # shortest prompt bucket, then the paddings at the longest one, nr > 1.
+    counts = range(2, 33) if async_scheduling else (8, 16, 32)
+    assert batch.call_args_list == [
+        ((R, 16), {"greedy": greedy}) for R in counts for greedy in (True, False)
+    ] + [
+        ((R, 8192), {"greedy": greedy}) for R in (8, 16, 32) for greedy in (True, False)
+    ]
+
+
+def test_mtp_prefill_warmup_retries_each_bucket_without_a_pipeline():
+    attempts = MagicMock(side_effect=[False, True, True])
+    runner = SimpleNamespace(
+        enforce_eager=False,
+        speculative_config=object(),
+        parallel_config=SimpleNamespace(
+            pipeline_parallel_size=1, prefill_context_parallel_size=16
+        ),
+        scheduler_config=SimpleNamespace(max_num_batched_tokens=65536),
+        input_batch=SimpleNamespace(num_reqs=0),
+        num_tokens_paddings=[512, 4096],
+        max_model_len=139264,
+        num_xla_graphs=7,
+        _precompile_timed=lambda _label: contextlib.nullcontext(),
+        _warmup_one_mtp_prefill=attempts,
+    )
+    with patch.object(
+        tpu_runner, "_suspend_kv_transfer_group", return_value=contextlib.nullcontext()
+    ):
+        TPUModelRunner._warmup_mtp_prefill(runner)
+
+    assert attempts.call_args_list == [
+        ((8192,), {"quiet": True}),
+        ((8192,), {}),
+        ((65536,), {"quiet": True}),
+    ]
+
+
+def _spec(method="mtp", eagle=True):
+    return SimpleNamespace(method=method, use_eagle=lambda: eagle)
+
+
+@pytest.mark.parametrize(
+    "pp, pcp, mtp, expected",
+    [
+        (1, False, True, False),
+        (1, True, True, True),
+        (4, False, True, True),
+        (4, False, False, False),
+    ],
+)
+def test_prefill_only_mtp_follows_context_or_pipeline_parallelism(
+    pp, pcp, mtp, expected
+):
+    parallel_config = SimpleNamespace(pipeline_parallel_size=pp)
+    assert TPUModelRunner._prefill_only_mtp(parallel_config, pcp, mtp) is expected
+
+
+def test_only_the_last_pipeline_stage_hosts_a_drafter():
+    last = SimpleNamespace(speculative_config=_spec(), _pp_is_last=True)
+    middle = SimpleNamespace(speculative_config=_spec(), _pp_is_last=False)
+    assert TPUModelRunner._is_async_drafter.fget(last) is True
+    assert TPUModelRunner._is_async_drafter.fget(middle) is False
+
+    TPUModelRunner._init_speculative_decoding(middle)
+    assert middle.drafter is None and middle.rejection_sampler is None
+
+
+def test_dp_idle_pairing_replays_the_draft_only_where_a_drafter_lives():
+    def runner(is_drafter):
+        return SimpleNamespace(
+            _execute_dp_mm_encoder=MagicMock(),
+            _run_dp_dummy_chunk=MagicMock(),
+            _is_async_drafter=is_drafter,
+            _async_drafter=MagicMock(),
+            speculative_config=_spec(),
+            drafter=None,
+        )
+
+    middle = runner(False)
+    TPUModelRunner._run_dp_idle_pairing(middle, 1024, 3)
+    assert middle._run_dp_dummy_chunk.call_count == 3
+    middle._async_drafter.run_dp_dummy_draft.assert_not_called()
+
+    last = runner(True)
+    TPUModelRunner._run_dp_idle_pairing(last, 1024, 3)
+    last._async_drafter.run_dp_dummy_draft.assert_called_once_with(3)
+
+
+def test_one_mtp_prefill_warmup_builds_prefill_without_decode():
     executed = []
     runner = SimpleNamespace(
         max_model_len=64,
@@ -288,21 +533,21 @@ def test_one_pcp_mtp_warmup_builds_prefill_without_decode():
         _warmup_spec_decode_cleanup=MagicMock(return_value=True),
     )
 
-    assert TPUModelRunner._warmup_one_pcp_mtp_prefill(runner, 31) is True
+    assert TPUModelRunner._warmup_one_mtp_prefill(runner, 31) is True
 
     assert len(executed) == 1
     scheduler_output = executed[0]
     assert scheduler_output.total_num_scheduled_tokens == 31
-    assert scheduler_output.num_scheduled_tokens == {"__pcp_mtp_warmup__": 31}
+    assert scheduler_output.num_scheduled_tokens == {"__mtp_prefill_warmup__": 31}
     assert len(scheduler_output.scheduled_new_reqs) == 1
     request = scheduler_output.scheduled_new_reqs[0]
-    assert request.req_id == "__pcp_mtp_warmup__"
+    assert request.req_id == "__mtp_prefill_warmup__"
     assert len(request.prompt_token_ids) == 31
     assert request.block_ids == ([98, 99], [96, 97, 98, 99])
     assert scheduler_output.scheduled_cached_reqs.req_ids == []
     runner.sample_tokens.assert_called_once_with(None)
     runner.take_draft_token_ids.assert_called_once_with()
-    runner._warmup_spec_decode_cleanup.assert_called_once_with("__pcp_mtp_warmup__")
+    runner._warmup_spec_decode_cleanup.assert_called_once_with("__mtp_prefill_warmup__")
 
 
 def _sub_indices(req_id_to_index_copy, req_ids, num_scheduled, spec_k=None):
@@ -1165,6 +1410,7 @@ class TestCompactMambaSlotPool:
 
     def _set_batch(self, runner, req_ids):
         """Set the persistent batch to the given ordered req_ids."""
+        runner.requests = {rid: object() for rid in req_ids}
         runner.input_batch.req_ids = list(req_ids)
         runner.input_batch.req_id_to_index = {r: i for i, r in enumerate(req_ids)}
 
@@ -1243,6 +1489,22 @@ class TestCompactMambaSlotPool:
         self._set_batch(runner, ["e"])
         idx1 = runner._build_mamba_state_indices(0, 1, 4).cpu()
         assert 1 <= int(idx1[0]) <= 4
+
+    @pytest.mark.parametrize("stride", [1, 4])
+    def test_unscheduled_request_keeps_state_at_full_capacity(self, stride):
+        runner = self._make_runner(max_num_reqs=2, slot_stride=stride)
+        runner._init_mamba_slot_pool(1 + 2 * stride)
+        owners = {rid: object() for rid in ("a", "b")}
+        state = torch.zeros(1 + 2 * stride)
+        for step, (rid, value) in enumerate([("a", 11), ("b", 22), ("a", 11)]):
+            self._set_batch(runner, [rid])
+            runner.requests = owners
+            slot = int(runner._build_mamba_state_indices(0, 1, 2)[0])
+            if step == 2:
+                assert state[slot] == value
+            state[slot] = value
+        assert len(runner._mamba_slot_by_req_id) == 2
+        assert runner._free_mamba_slots == []
 
     def test_chunked_build_allocates_all(self):
         """Two chunks in one step: each chunk allocates its own requests; all
@@ -1802,12 +2064,16 @@ class TestUnifiedReadOffsetMigration:
         runner.device = torch.device("cpu")
         runner.mamba_slot_read_offsets = torch.zeros(16, dtype=torch.int32)
         runner._mamba_state_pos = {}
+        runner.scheduler_config = SimpleNamespace(async_scheduling=False)
+        runner.speculative_config = None
+        runner._pre_async_results = None
         runner._pool_block_split = 1
         runner._pending_mamba_state_copies = []
         raw = torch.zeros(16, 2)
         runner._mamba_copy_plan = [(0, [raw])]
         runner.input_batch = MagicMock()
         req_ids = [f"r{i}" for i in range(len(computed))]
+        runner.requests = {rid: object() for rid in req_ids}
         runner._mamba_offset_seeded = set(req_ids)
         runner.input_batch.req_ids = req_ids
         runner.input_batch.req_id_to_index = {rid: i for i, rid in enumerate(req_ids)}
@@ -2524,3 +2790,59 @@ def test_torch_tpu_wrapper_accelerator_aliases(monkeypatch):
         assert torch.cuda.current_stream() is fake_stream
         assert torch.cuda.set_stream(fake_stream) == "set_stream_" + str(fake_stream)
         assert torch.cuda.synchronize() == "synchronized"
+
+
+def test_flush_keeps_zero_token_async_results_until_waited():
+    """A step that committed no tokens still leaves its D2H copy in flight.
+
+    On TP ranks other than the executor's output rank, vLLM may drop the
+    AsyncTPUModelRunnerOutput when the RPC returns, so _pre_async_results is
+    the copy's only owner. execute_model() must neither free it before the
+    copy is waited on (#985) nor block on it ahead of the forward;
+    sample_tokens() waits on it in _modify_prev_results() before replacing it.
+    """
+    events = []
+
+    class FakeCopyState:
+        sampled_token_ids_cpu = torch.tensor([[7]], dtype=torch.int32)
+
+        def wait(self):
+            events.append("wait")
+
+    copy_state = FakeCopyState()
+    weakref.finalize(copy_state, events.append, "freed")
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=1, req_ids=["req-prefill"]),
+        _pre_async_results=AsyncPreResults(
+            req_ids=["req-prefill"],
+            next_tokens_tpu=torch.tensor([7], dtype=torch.int32),
+            request_seq_lens=[],
+            discard_sampled_tokens_req_indices=[0],
+            req_id_to_index_copy={},
+            copy_state=copy_state,
+        ),
+    )
+    # A flush that rolls back calls self._modify_prev_results().
+    runner._modify_prev_results = lambda: TPUModelRunner._modify_prev_results(runner)
+    del copy_state  # The runner now holds the only reference.
+
+    # execute_model(): neither wait on the copy nor free it.
+    TPUModelRunner._flush_disjoint_async_results(runner)
+    assert events == []
+
+    # sample_tokens(): wait on the copy before the results are replaced.
+    TPUModelRunner._modify_prev_results(runner)
+    assert events == ["wait"]
+
+
+def test_flush_disjoint_async_results_still_flushes_nonempty_prev_batch():
+    """A disjoint previous batch that sampled tokens must still be rolled back."""
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=1, req_ids=["req-new"]),
+        _pre_async_results=SimpleNamespace(req_id_to_index_copy={"req-old": 0}),
+        _modify_prev_results=MagicMock(),
+    )
+
+    TPUModelRunner._flush_disjoint_async_results(runner)
+    runner._modify_prev_results.assert_called_once()
+    assert runner._pre_async_results is None

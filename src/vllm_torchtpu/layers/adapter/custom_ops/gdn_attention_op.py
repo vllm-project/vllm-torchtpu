@@ -70,6 +70,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
+from vllm_torchtpu.utils import fresh_buffer
 
 _GDN_PCP_AXIS_NAME = "pcp"
 _GDN_TP_AXIS_NAME = "tp"
@@ -531,13 +532,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         2-D. torch_tpu hands a compiled executable the buffer behind each
         argument and re-materializes a shape-mismatched argument as a
         standalone `tt_jit_as_strided` program before every forward. One
-        contiguous copy at load time removes that per-step program.
+        `fresh_buffer` copy at load time removes that per-step program.
         """
         del act_dtype
         w = self.conv1d.weight
-        self.conv1d.weight.data = torch.empty(
-            w.shape, dtype=w.dtype, device=w.device
-        ).copy_(w)
+        self.conv1d.weight.data = fresh_buffer(w)
 
     def get_state_shape(
         self,

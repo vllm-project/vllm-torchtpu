@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # The environment variables override should be imported before any other
 # modules to ensure that the environment variables are set before any
 # other modules are imported.
@@ -6,6 +19,44 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def _patch_vllm_compact_mamba_streaming_input() -> None:
+    """Reject input sessions whose retained state can exceed the compact pool."""
+    import inspect
+    from functools import wraps
+
+    from vllm.v1.engine.input_processor import InputProcessor
+
+    from vllm_torchtpu.platforms.tpu_block_size_utils import unified_kv_layout_enabled
+
+    original = InputProcessor.process_inputs
+    marker = "_tpu_compact_mamba_input_patch"
+    if original.__dict__.get(marker, False):
+        return
+    signature = inspect.signature(original)
+
+    @wraps(original)
+    def process_inputs(self, *args, **kwargs):
+        config = self.vllm_config
+        transfer = config.kv_transfer_config
+        uses_slots = transfer is None or transfer.kv_connector == "DecodeBenchConnector"
+        if (
+            uses_slots
+            and config.model_config.is_hybrid
+            and not unified_kv_layout_enabled(config)
+            and signature.bind(self, *args, **kwargs).arguments.get("resumable", False)
+        ):
+            raise ValueError(
+                "resumable input is unsupported with the compact Mamba state pool: "
+                "waiting sessions retain state beyond the running-request limit. "
+                "Use the unified KV pool on a supported architecture, or submit "
+                "complete inputs. Streaming output remains supported."
+            )
+        return original(self, *args, **kwargs)
+
+    process_inputs.__dict__[marker] = True
+    InputProcessor.process_inputs = process_inputs
 
 
 def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
@@ -174,17 +225,17 @@ def _patch_vllm_config_hash_ignore_diagnostics() -> None:
 
     original = VllmConfig.compute_hash
 
-    def compute_hash(self) -> str:
+    def compute_hash(self, *args, **kwargs) -> str:
         additional_config = self.additional_config
         if not isinstance(additional_config, dict):
-            return original(self)
+            return original(self, *args, **kwargs)
         filtered = {
             key: value
             for key, value in additional_config.items()
             if key not in HASH_IGNORED_ADDITIONAL_CONFIG_KEYS
         }
         if filtered == additional_config:
-            return original(self)
+            return original(self, *args, **kwargs)
         # Hash a shallow copy with the filtered dict rather than mutating the
         # live config: compute_hash() may run while other code holds the same
         # VllmConfig, and a shallow copy shares every sub-config by reference
@@ -192,7 +243,7 @@ def _patch_vllm_config_hash_ignore_diagnostics() -> None:
         # compute_hash its own additional_config to read.
         proxy = copy.copy(self)
         proxy.additional_config = filtered
-        return original(proxy)
+        return original(proxy, *args, **kwargs)
 
     VllmConfig._tpu_upstream_compute_hash = original
     VllmConfig.compute_hash = compute_hash
@@ -479,6 +530,21 @@ def _patch_multiproc_worker_global_rank_env() -> None:
         pc = vllm_config.parallel_config
         binding = get_tpu_worker_binding(pc, rank, local_rank, env=_os.environ)
         _os.environ.update(binding.as_env())
+        # VLLM_TPU_DEVICE_ORDER lists a physical device per local rank, so
+        # consecutive ranks (a two-device pipeline stage) can sit on different
+        # chips; TorchTPU reads TPU_VISIBLE_DEVICES at import, hence set here.
+        order = envs.VLLM_TPU_DEVICE_ORDER
+        if order:
+            device = [int(x) for x in order.split(",")][binding.local_rank]
+            _os.environ["TPU_VISIBLE_CHIPS"] = str(device)
+            _os.environ["TPU_VISIBLE_DEVICES"] = str(device)
+            logger.info(
+                "Applied TPU patch: worker spawn env local rank %d -> device %d "
+                "(VLLM_TPU_DEVICE_ORDER=%s)",
+                binding.local_rank,
+                device,
+                order,
+            )
         logger.info(
             "Applied TPU patch: worker spawn env RANK=%d LOCAL_RANK=%d "
             "WORLD_SIZE=%d LOCAL_WORLD_SIZE=%d "
@@ -507,10 +573,12 @@ def _run_engine_core_with_tpu_patches(*args, **kwargs):
 
     patch_registry.apply("engine_core")
     from vllm_torchtpu.core.pp_chunk_scheduler import patch_engine_core_for_pp_chunks
+    from vllm_torchtpu.core.pp_lazy_step import patch_engine_core_for_lazy_push
     from vllm_torchtpu.distributed.pp_push import patch_executor_for_pp_wave
 
     patch_executor_for_pp_wave(kwargs.get("vllm_config"))
     patch_engine_core_for_pp_chunks(kwargs.get("vllm_config"))
+    patch_engine_core_for_lazy_push(kwargs.get("vllm_config"))
 
     from vllm.v1.engine.core import EngineCoreProc
 
@@ -813,6 +881,8 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
             hash_block_size,
             metrics_collector=None,
             num_prefill_lookahead=0,
+            allow_partial_hash_hits: bool = True,
+            **kwargs,
         ):
             groups = kv_cache_config.kv_cache_groups
             logical_pcp_world_size = pcp_world_size
@@ -884,6 +954,8 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
                 hash_block_size,
                 metrics_collector,
                 num_prefill_lookahead=num_prefill_lookahead,
+                allow_partial_hash_hits=allow_partial_hash_hits,
+                **kwargs,
             )
 
         _get_coordinator_with_logical_pcp_blocks._tpu_hybrid_pcp_coordinator_patch = (
@@ -1046,6 +1118,12 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
                         "than block_size*dcp); prefix hits stay block-aligned.",
                         vllm_config.cache_config.prefix_match_unit,
                     )
+                    orig_unit = vllm_config.cache_config.prefix_match_unit
+                    try:
+                        vllm_config.cache_config.prefix_match_unit = None
+                        return previous_resolve(kv_cache_config, vllm_config)
+                    finally:
+                        vllm_config.cache_config.prefix_match_unit = orig_unit
                 return previous_resolve(kv_cache_config, vllm_config)
             dcp = vllm_config.parallel_config.decode_context_parallel_size
             scheduler_block_size = vllm_config.cache_config.block_size * dcp

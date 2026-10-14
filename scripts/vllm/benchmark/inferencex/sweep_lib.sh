@@ -3,7 +3,9 @@
 #   agentx_sweep.sh          boots a server, then calls agentx_client.sh (boot,
 #                            config.json, cleanup, log dump, GCS)
 #   agentx_client.sh         benchmarks a server it did not boot (server URL,
-#                            liveness, drain, engine counters, GCS)
+#                            liveness, drain, engine counters, GCS, checkout)
+#   agentx_eval_client.sh    InferenceX's quality evals against a server it did
+#                            not boot (server URL, liveness, GCS, checkout)
 #   kimi-k3/eval_conc_sweep.sh  boots a server, then runs lm_eval (all of it)
 # Source it after setting:
 #   IX_SWEEP_TAG   log tag, e.g. "k3-eval-sweep"
@@ -60,6 +62,12 @@ save_now() {
 # sourced.
 ix_server_url() { echo "${IX_SERVER_URL:-http://127.0.0.1:$PORT}"; }
 
+# ix_engine_url: where /metrics lives. Usually the same server, but a P/D pair is
+# driven through a proxy that has no /metrics of its own - the queue depth and the
+# preemption counters belong to one engine, not to a pair - so a caller in that
+# shape points this at the engine whose queue it wants to watch, the decode one.
+ix_engine_url() { echo "${IX_ENGINE_URL:-$(ix_server_url)}"; }
+
 # --max-time on every poll: an engine that is wedged but still listening would
 # otherwise block the caller forever, and wait_server_idle only checks its
 # deadline between polls, so its timeout would never fire.
@@ -71,7 +79,7 @@ server_alive() { curl -sf --max-time 10 "$(ix_server_url)/v1/models" >/dev/null;
 # "unreachable" from "drained" instead of reading both as 0.
 ix_engine_queue_depth() {
     local body
-    body=$(curl -s --max-time 30 "$(ix_server_url)/metrics") || return 1
+    body=$(curl -s --max-time 30 "$(ix_engine_url)/metrics") || return 1
     [ -n "$body" ] || return 1
     printf '%s' "$body" \
         | awk '/^vllm:num_requests_(running|waiting)( |\{)/{s+=$NF} END{print s+0}'
@@ -81,7 +89,7 @@ ix_engine_queue_depth() {
 # preemptions (a preempted request is re-prefilled from its KV state) and
 # finished requests. Printed as "preemptions=N finished=M".
 ix_engine_counters() {
-    curl -s --max-time 30 "$(ix_server_url)/metrics" | awk '
+    curl -s --max-time 30 "$(ix_engine_url)/metrics" | awk '
         /^vllm:num_preemptions_total( |\{)/ {p+=$NF}
         /^vllm:request_success_total( |\{)/ {f+=$NF}
         END {printf "preemptions=%d finished=%d\n", p, f}'
@@ -166,6 +174,112 @@ ix_dump_server_log_context() {
         | grep -n -E -B3 -A25 'Traceback|Error|Exception|NotImplemented|Killed|OOM|halt' | tail -150 | cut -c1-400
     log "===== server.log: last 40 non-blank lines ====="
     tr '\r' '\n' < "$RESULTS_DIR/server.log" | grep -v '^\s*$' | tail -40 | cut -c1-300
+}
+
+# Pinned, not main, and shared by both clients so a perf row and its quality
+# evals come from one InferenceX. InferenceX refactors its benchmark harness
+# under us: in one week it moved its tree into inferencex-e2e/, added ten env
+# vars that build_replay_cmd validates, and then replaced benchmark_lib.sh -
+# which agentx_client.sh sources - with the infx.bench package (#3610). A
+# nightly that tracks main races those. This is the last ref the lane ran clean
+# on (build 65: both ladder points, ok=19 err=0, isl p50 337k). Bump it
+# deliberately, with a run to show the new ref works; --ix-ref overrides for a
+# one-off.
+# shellcheck disable=SC2034  # read by the scripts that source this
+IX_DEFAULT_REF="8ba71d026e866e7792074a3fd3f896fe6d1ad099"
+IX_URL=https://github.com/SemiAnalysisAI/InferenceX
+
+# ix_export_topology <tp> <dp> <ep> <disagg 0|1>: the deployment's shape in the
+# names InferenceX reads for a multi-node row and its evals
+# (infx/results/agentic/__init__.py _gpu_shape; benchmark_lib.sh
+# bridge_disagg_eval_metadata): per role, TP, EP, DP attention and the worker
+# count. vLLM's DP is InferenceX's workers with dp-attn, as its H200 entry for
+# this shape encodes it (configs/nvidia-master.yaml,
+# kimik3-fp4-h200-vllm-agentic-balanced: tp 8, ep 32, dp-attn true,
+# num-worker 4). A disaggregated pair states both roles with the one shape both
+# serve; an aggregate server is the prefill role with no decode workers, which
+# is how _gpu_shape reads an aggregate multi-node worker. The caller exports
+# this once, before either client, so the row and its evals carry one identity;
+# the clients refuse to run without it (ix_require_topology).
+#
+# InferenceX's num_gpus from these is ranks (workers x TP), not the chips a v7x
+# pod holds; tokens per dollar divides by --chips instead (sweep_summary.py).
+ix_export_topology() {
+    local tp="$1" dp="$2" ep="$3" disagg="$4" dp_attn=false
+    [ "$dp" -le 1 ] || dp_attn=true
+    export IS_MULTINODE=true
+    export PREFILL_TP="$tp" PREFILL_EP="$ep" PREFILL_DP_ATTN="$dp_attn" PREFILL_NUM_WORKERS="$dp"
+    export PREFILL_PP_SIZE=1 PREFILL_DCP_SIZE=1 PREFILL_PCP_SIZE=1
+    export DECODE_PP_SIZE=1 DECODE_DCP_SIZE=1 DECODE_PCP_SIZE=1
+    if [ "$disagg" = 1 ]; then
+        export DISAGG=true
+        export DECODE_TP="$tp" DECODE_EP="$ep" DECODE_DP_ATTN="$dp_attn" DECODE_NUM_WORKERS="$dp"
+    else
+        export DISAGG=false
+        export DECODE_TP=0 DECODE_EP=0 DECODE_DP_ATTN=false DECODE_NUM_WORKERS=0
+    fi
+}
+
+# ix_require_topology: fails unless ix_export_topology ran in this environment.
+ix_require_topology() {
+    local v
+    for v in IS_MULTINODE DISAGG PREFILL_TP PREFILL_EP PREFILL_DP_ATTN PREFILL_NUM_WORKERS              DECODE_TP DECODE_EP DECODE_DP_ATTN DECODE_NUM_WORKERS; do
+        [ -n "${!v:-}" ] || {
+            log "FATAL: $v is unset; the caller states the deployment's shape with"                 "ix_export_topology before running a client (sweep_lib.sh)"
+            return 2
+        }
+    done
+}
+
+# ix_layout_root <dir>: the directory inside the checkout that holds
+# benchmarks/, utils/ and the evals, or nothing when the checkout is unusable.
+# InferenceX moved that tree down into inferencex-e2e/ (the root now also holds
+# collectivex/, operatorx/ and power_model/), and --ix-ref can still pin a
+# commit from before the move, so this is probed rather than hardcoded.
+ix_layout_root() {
+    local d
+    for d in "$1/inferencex-e2e" "$1"; do
+        [ -d "$d/utils/aiperf/src" ] && { echo "$d"; return 0; }
+    done
+    return 1
+}
+
+# ix_checkout <dir> <ref> : InferenceX at <ref> in <dir>, reused when already
+# there, then IX_ROOT (the tree) and IX_EVALS (its evals directory, empty when
+# it has none). Returns non-zero with a FATAL line when it cannot be had.
+# shellcheck disable=SC2034  # IX_ROOT and IX_EVALS are for the caller
+ix_checkout() {
+    local dir="$1" ref="$2" d
+    if ! ix_layout_root "$dir" >/dev/null; then
+        rm -rf "$dir"
+        if [[ "$ref" =~ ^[0-9a-f]{7,39}$ ]]; then
+            log "FATAL: --ix-ref '$ref' looks like an abbreviated commit, which cannot" \
+                "be fetched - git answers \"couldn't find remote ref\". Use the full 40" \
+                "characters."
+            return 2
+        fi
+        if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+            # A commit cannot be cloned with --branch: fetch just that commit.
+            if ! { git init -q "$dir" \
+                    && git -C "$dir" fetch -q --depth 1 "$IX_URL" "$ref" \
+                    && git -C "$dir" checkout -q FETCH_HEAD \
+                    && git -C "$dir" submodule update -q --init --depth 1 --recursive; }; then
+                log "FATAL: cannot fetch InferenceX commit $ref from $IX_URL"; return 1
+            fi
+        else
+            git clone -q --depth 1 --branch "$ref" --recurse-submodules --shallow-submodules "$IX_URL" "$dir" \
+                || { log "FATAL: cannot clone InferenceX branch/tag $ref from $IX_URL"; return 1; }
+        fi
+    fi
+    IX_ROOT=$(ix_layout_root "$dir") || {
+        log "FATAL: $dir has no utils/aiperf/src under its root or inferencex-e2e/"; return 1
+    }
+    # The eval task files and their lm-eval patch moved from utils/evals to
+    # infx/evals in the same reorganisation.
+    IX_EVALS=""
+    for d in "$IX_ROOT/infx/evals" "$IX_ROOT/utils/evals"; do
+        [ -d "$d" ] && { IX_EVALS="$d"; break; }
+    done
 }
 
 # run_benchmarks.sh, cleanup_server.sh and configs/ are shared with every other

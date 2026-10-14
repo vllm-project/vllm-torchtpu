@@ -277,6 +277,7 @@ class TestCompressedTensorsConfig:
         )
         input_quant = QuantizationArgs(
             num_bits=8,
+            type=QuantizationType.FLOAT,
             strategy=QuantizationStrategy.TOKEN,
             symmetric=True,
             dynamic=True,

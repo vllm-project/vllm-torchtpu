@@ -6,10 +6,11 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from .mock_omni import vllm_omni_mock  # isort: split
+from .mock_omni import _MockRotaryEmbeddingWan, vllm_omni_mock  # isort: split
 
 import vllm_omni
 from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
+from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
 
 from vllm_torchtpu.omni import register_omni_tpu_platform
 from vllm_torchtpu.omni.attention import TpuSDPABackend, TpuSDPAImpl
@@ -18,6 +19,10 @@ from vllm_torchtpu.omni.patches import (
     apply_omni_tpu_patches,
 )
 from vllm_torchtpu.omni.platform import OmniTpuPlatform
+from vllm_torchtpu.omni.rope import (
+    apply_rotary_pair_swap,
+    rotary_embedding_wan_forward,
+)
 
 pytestmark = pytest.mark.omni
 
@@ -52,6 +57,63 @@ def test_platform_attributes():
     with patch("torch.device") as mock_dev:
         platform.get_torch_device()
         mock_dev.assert_called_once_with("tpu")
+
+
+def test_rope_pair_swap_matches_native():
+    torch.manual_seed(0)
+    rope = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
+    x = torch.randn(1, 24, 3, 16)
+    cos = torch.randn(1, 24, 1, 8)
+    sin = torch.randn(1, 24, 1, 8)
+    torch.testing.assert_close(
+        apply_rotary_pair_swap(x, cos, sin), rope.forward_native(x, cos, sin)
+    )
+    x_bf16, cos_bf16, sin_bf16 = (
+        x.bfloat16(),
+        cos.bfloat16(),
+        sin.bfloat16(),
+    )
+    torch.testing.assert_close(
+        apply_rotary_pair_swap(x_bf16, cos_bf16, sin_bf16),
+        rope.forward_native(x_bf16, cos_bf16, sin_bf16),
+        rtol=0,
+        atol=0,
+    )
+
+
+def test_rope_patch_installed():
+    from unittest.mock import MagicMock
+
+    apply_omni_model_specific_patches()
+    assert _MockRotaryEmbeddingWan.forward is rotary_embedding_wan_forward
+    # Interleaved half-dim calls use apply_rotary_pair_swap (bit-exact in bf16).
+    rope = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=True)
+    x = torch.randn(1, 4, 2, 8, dtype=torch.bfloat16)
+    cos = torch.randn(1, 4, 1, 4, dtype=torch.bfloat16)
+    sin = torch.randn(1, 4, 1, 4, dtype=torch.bfloat16)
+    torch.testing.assert_close(
+        rope(x, cos, sin), rope.forward_native(x, cos, sin), rtol=0, atol=0
+    )
+
+    # Non-half-dim or Neox calls delegate to _forward_method.
+    rope_fallback = _MockRotaryEmbeddingWan(is_neox_style=False, half_head_dim=False)
+    spy = MagicMock(wraps=rope_fallback.forward_native)
+    rope_fallback._forward_method = spy
+    out_fb = rope_fallback(x, cos, sin)
+    spy.assert_called_once_with(x, cos, sin)
+    torch.testing.assert_close(
+        out_fb, rope_fallback.forward_native(x, cos, sin), rtol=0, atol=0
+    )
+
+    # f32 calls delegate to _forward_method (precision fallback).
+    spy_f32 = MagicMock(wraps=rope.forward_native)
+    rope._forward_method = spy_f32
+    x_f32, cos_f32, sin_f32 = x.float(), cos.float(), sin.float()
+    out_f32 = rope(x_f32, cos_f32, sin_f32)
+    spy_f32.assert_called_once_with(x_f32, cos_f32, sin_f32)
+    torch.testing.assert_close(
+        out_f32, rope.forward_native(x_f32, cos_f32, sin_f32), rtol=0, atol=0
+    )
 
 
 def test_device_control_env_var():
@@ -223,6 +285,28 @@ def test_ltx2_safe_decode_output():
     runtime.output = (None, None)
     res = runtime._decode_output(**decode_kwargs)
     assert res.output == (None, None)
+
+
+@pytest.mark.parametrize(
+    "rope_cls_name",
+    ["QwenEmbedRope", "QwenEmbedLayer3DRope"],
+)
+def test_qwen_image_rope_txt_freqs_clone(rope_cls_name):
+    apply_omni_model_specific_patches()
+
+    rope_cls = getattr(qwen_image_transformer, rope_cls_name)
+    rope = rope_cls()
+
+    vid_freqs, txt_freqs = rope.forward([(1, 2, 2)], [3], torch.device("cpu"))
+
+    assert not txt_freqs._is_view()
+    assert (
+        txt_freqs.untyped_storage().data_ptr()
+        != rope.pos_freqs.untyped_storage().data_ptr()
+    )
+    assert torch.equal(txt_freqs, rope.pos_freqs[2:5])
+    assert txt_freqs.dtype == torch.complex64
+    assert torch.equal(vid_freqs, rope.pos_freqs[:2])
 
 
 def test_safe_pack_tensor_if_large():

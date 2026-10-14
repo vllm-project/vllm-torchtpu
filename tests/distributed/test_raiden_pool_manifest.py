@@ -267,6 +267,53 @@ def test_layer_tag_helpers_round_trip():
         tags.layer_tag("fa", -1)
 
 
+def _with_mtp_draft_layer(named):
+    """The stage's caches plus a Qwen3.5 MTP draft layer (``mtp.layers.0``)."""
+    fa_name = next(name for name in named if "self_attn" in name)
+    named = dict(named)
+    named["mtp.layers.0.self_attn.attn"] = named[fa_name]
+    return named
+
+
+def test_mtp_draft_layer_tags_and_orders_after_the_targets_layers():
+    named_all = _qwen35_materialization(
+        fa_shape=(256, 256, 1, 4, 256),
+        fa_esz=1,
+        fa_dtype="torch.float8_e4m3fn",
+        conv_shape=(16, 3, 1, 12288),
+        conv_esz=2,
+        ssm_shape=(16, 64, 128, 128),
+        ssm_esz=4,
+    )
+    stage_layers = {f"model.layers.{i}." for i in range(5)}
+    named = _with_mtp_draft_layer(
+        {
+            name: tensor
+            for name, tensor in named_all.items()
+            if any(name.startswith(prefix) for prefix in stage_layers)
+        }
+    )
+    groups = _qwen35_groups(named, block_size=4096, num_kv_heads=2, head_size=256)
+    manifest = rpm.build_qwen35_pool_manifest(
+        named_kv_caches=named,
+        kv_cache_groups=groups,
+        raw_tensors=(),
+        gdn_geometry=PCP8_GEOMETRY,
+        mamba_group_ordinal_by_layer={
+            name: 0 for name in named if "linear_attn" in name
+        },
+        per_layer_tags=True,
+        layer_index_by_name={"mtp.layers.0.self_attn.attn": 48},
+    )
+
+    assert [pool.tag for pool in manifest.pools][-3:] == [
+        "gdn.conv.g0.l4",
+        "gdn.ssm.g0.l4",
+        "fa.l48",
+    ]
+    assert manifest.pools[-1].layer_name == "mtp.layers.0.self_attn.attn"
+
+
 def test_canonical_pool_order_is_layer_major_conv_before_ssm():
     _, manifest = _build_pcp8()
     # Layer 0..2 are GDN (conv, ssm), layer 3 is FA.

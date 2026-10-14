@@ -13,6 +13,8 @@
 # limitations under the License.
 """Tests for DCP (decode context parallel) StreamIndex Top-K"""
 
+import re
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -309,10 +311,13 @@ def _dcp_case(dcp_size, seed):
 
 @pytest.mark.multichip
 @pytest.mark.parametrize("dcp_size", [2, 4, 8])
-def test_dcp_reassembles_the_unsharded_global_topk(dcp_size):
-    """Union the per-rank lists back together; it must be the global top-k"""
+@pytest.mark.parametrize("a2a_merge", [False, True])
+def test_dcp_reassembles_the_unsharded_global_topk(dcp_size, a2a_merge):
+    """Union the per-rank lists back together; it must be the global top-k.
+    Both merge paths; the unsharded reference is all they must agree on."""
     _need_devices(dcp_size)
     rec, args, kwargs = _dcp_case(dcp_size, 0)
+    kwargs["a2a_merge"] = a2a_merge
     q, weights = args[0], args[1]
 
     pages = KV_LEN // PAGE_SIZE
@@ -347,6 +352,72 @@ def test_dcp_reassembles_the_unsharded_global_topk(dcp_size):
         want = set(reference[t][reference[t] >= 0].tolist())
         assert got == want, (
             f"token {t}: {len(want - got)} missing, {len(got - want)} spurious"
+        )
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 4, 8])
+@pytest.mark.parametrize("chunk_tokens", [None, 64])
+def test_a2a_merge_matches_the_all_gather_merge(dcp_size, chunk_tokens):
+    """Slot for slot, not just as a set: the packed order is the contract."""
+    _need_devices(dcp_size)
+    _, args, kwargs = _dcp_case(dcp_size, 5)
+    kwargs["chunk_tokens"] = chunk_tokens
+
+    # Both paths carry cp_rank_as_data's all-to-all; the a2a merge adds exactly
+    # one. The default is what a bucket below TPU_DCP_INDEXER_A2A_MIN_TOKENS runs.
+    def num_a2a(**kw):
+        hlo = streamindex_topk_dcp.lower(*args, **kwargs, **kw).as_text()
+        return len(re.findall(r"all[_-]to[_-]all", hlo))
+
+    n_default, n_a2a = num_a2a(), num_a2a(a2a_merge=True)
+    assert n_a2a == n_default + 1, (
+        f"all-to-alls: default {n_default}, a2a {n_a2a}; the default merge paid"
+        " the all-to-all, or the a2a path ran the all-gather merge"
+    )
+
+    gather = np.asarray(streamindex_topk_dcp(*args, **kwargs))
+    a2a = np.asarray(streamindex_topk_dcp(*args, **kwargs, a2a_merge=True))
+    np.testing.assert_array_equal(a2a, gather)
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 4, 8])
+def test_all_to_all_round_trip_preserves_token_order(dcp_size):
+    """The a2a scatter and the all-gather restore must agree on block order;
+    if they do not, every rank merges a full, plausible, wrong token."""
+    _need_devices(dcp_size)
+    rows, width = 4 * dcp_size, 8
+    mesh = jax.sharding.Mesh(np.array(jax.devices()[:dcp_size]), (DCP_AXIS_NAME,))
+
+    def _local(token_ids):
+        # Every rank starts with the same [rows, width] of token ids.
+        scattered = jax.lax.all_to_all(
+            token_ids, DCP_AXIS_NAME, split_axis=0, concat_axis=1, tiled=True
+        )
+        # [rows/dcp, dcp * width]: every peer sent this rank the same block.
+        blocks = scattered.reshape(-1, dcp_size, width)
+        return jax.lax.all_gather(blocks[:, 0, :], DCP_AXIS_NAME, axis=0, tiled=True)
+
+    token_ids = jnp.broadcast_to(
+        jnp.arange(rows, dtype=jnp.int32)[:, None], (rows, width)
+    )
+    out = jax.jit(
+        jax.shard_map(
+            _local,
+            mesh=mesh,
+            in_specs=(P(),),
+            out_specs=P(DCP_AXIS_NAME),
+            check_vma=False,
+        )
+    )(token_ids)
+
+    got = np.asarray(out).reshape(dcp_size, rows, width)
+    for r in range(dcp_size):
+        np.testing.assert_array_equal(
+            got[r],
+            np.asarray(token_ids),
+            err_msg=f"rank {r} came back with the token axis permuted",
         )
 
 

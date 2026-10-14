@@ -6,7 +6,7 @@ import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import os
 import time
-from typing import TYPE_CHECKING, Protocol, Union, cast
+from typing import TYPE_CHECKING, Any, Protocol, Union, cast
 
 import portpicker
 import torch
@@ -406,6 +406,8 @@ class TpuPlatform(Platform):
         "MOE_FUSED_EP_ENABLE_W4A8",
         "MOE_FUSED_EP_KERNEL_IMPL",
         "VLLM_TPU_INDEXER_KV_CACHE_MODE",
+        "TPU_DCP_INDEXER_A2A_MERGE",
+        "TPU_DCP_INDEXER_A2A_MIN_TOKENS",
         "TPU_USE_RAIDEN_KV_CACHE_MANAGER",
         "TPU_RAIDEN_GLM_ADMISSION",
         "TPU_KV_RESHARD_TRANSPORT",
@@ -733,6 +735,9 @@ class TpuPlatform(Platform):
 
             patch_executor_for_pp_wave(vllm_config)
             _configure_pipeline_chunks(vllm_config)
+            from vllm_torchtpu.core.pp_lazy_step import patch_engine_core_for_lazy_push
+
+            patch_engine_core_for_lazy_push(vllm_config)
 
         from vllm.config import CompilationMode
 
@@ -1048,6 +1053,16 @@ class TpuPlatform(Platform):
                     "on hybrid attention+Mamba models requires the unified "
                     "block pool; set TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1"
                 )
+
+    @classmethod
+    def _find_non_ssm_backend(cls, vllm_config: VllmConfig) -> Any:
+        """Returns the primary non-SSM attention backend for the config."""
+        backends = cls._find_non_ssm_backends(vllm_config)
+        if not backends:
+            return None
+        if isinstance(backends, (list, tuple)):
+            return backends[0]
+        return next(iter(backends), None)
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:

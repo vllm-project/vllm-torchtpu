@@ -435,9 +435,7 @@ def _extended_cases(out, rank, partition, mesh, rows):
 
 @pytest.mark.nightly
 def test_hnd_partial_prefill_and_decode_preserve_attention_and_cache(tmp_path):
-    from torch_tpu._internal.distributed.launchers.singlehost_wrapper import (
-        prepare_tpu_environment,
-    )
+    from tests.distributed.tpu_test_utils import prepare_tpu_environment
 
     keys = (
         "TORCH_TPU_XPROF_SESSION_ID",

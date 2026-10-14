@@ -1,0 +1,86 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
+# Dynamic pipeline for vllm-torchtpu-dev: the steps come from the build, not
+# from a file on a branch.
+#
+# A build created over the API with
+#   env.DEV_PIPELINE_FILE = .buildkite/pipeline_dynamic.yml
+#   env.DYNAMIC_PIPELINE_B64 = <the steps, as base64-encoded pipeline YAML>
+# runs those steps at the commit it names. The commit must be on the build's
+# branch (a commit on main with branch main, say): the checkout fetches the
+# branch and refuses a commit that is not on it. Nothing is pushed for the
+# build. A tool that builds its own image names it in the build's meta-data as
+# CI_IMAGE_TAG, which scripts/run_in_docker.sh and kubernetes/common.sh read,
+# so the uploaded steps need no build step.
+#
+# What the passed YAML must be: one YAML document whose top-level key is
+# `steps:` (no leading `---`, no top-level `priority:`, not a bare list, not
+# JSON), because the step below writes `priority: <the build's dev priority>`
+# in front of it. The dev priority is JOB_PRIORITY from the build's meta-data,
+# set by bootstrap_dev.sh; a step that sets its own `priority` keeps it. The
+# agent interpolates `$VAR` in uploaded YAML from the upload job's environment,
+# so a variable a step must read at run time is written `$$VAR`, as in the
+# other files here.
+#
+# Who can use this: anyone who can create a build on vllm-torchtpu-dev (the
+# "New Build" button, or an API token with write_builds). Such a build runs the
+# steps it passes on whatever queues they name, with nothing in the repository
+# to show for it: the record is the build's env and its job commands on
+# Buildkite, and this step prints the decoded YAML in its log. So the passed
+# YAML must carry no secret: the agent's log redaction covers only values of
+# agent environment variables, not text written into the YAML.
+#
+# Example:
+#   STEPS=$(base64 <<'EOT' | tr -d '\n'
+#   steps:
+#     - label: "my step"
+#       agents: { queue: tpu_v7x_2_queue }
+#       commands:
+#         - .buildkite/scripts/run_in_docker.sh python3 -c "import vllm_torchtpu"
+#   EOT
+#   )
+#   curl -X POST -H "Authorization: Bearer $BUILDKITE_API_TOKEN" \
+#     -H "Content-Type: application/json" \
+#     https://api.buildkite.com/v2/organizations/vllm/pipelines/vllm-torchtpu-dev/builds \
+#     -d "{\"commit\": \"$(git rev-parse origin/main)\", \"branch\": \"main\",
+#          \"message\": \"my test\",
+#          \"env\": {\"DEV_PIPELINE_FILE\": \".buildkite/pipeline_dynamic.yml\",
+#                    \"DYNAMIC_PIPELINE_B64\": \"$STEPS\"},
+#          \"meta_data\": {\"CI_IMAGE_TAG\": \"<registry>/vllm-torchtpu:<tag>\"}}"
+
+steps:
+  - label: ":pipeline: Upload dynamic steps"
+    key: upload_dynamic
+    agents:
+      queue: cpu
+    commands:
+      - |
+        set -eo pipefail
+        yaml=$$(printf '%s' "$${DYNAMIC_PIPELINE_B64:-}" | tr -d ' \t\r\n' | base64 -d) || {
+          echo "ERROR: DYNAMIC_PIPELINE_B64 is not valid base64; it must hold the steps as base64 pipeline YAML." >&2
+          exit 1
+        }
+        if [ -z "$$yaml" ]; then
+          echo "ERROR: DYNAMIC_PIPELINE_B64 is empty: this pipeline runs the steps the build passes in that variable (base64 pipeline YAML)." >&2
+          exit 1
+        fi
+        prio=$$(buildkite-agent meta-data get JOB_PRIORITY --default "")
+        if [ -z "$$prio" ]; then
+          echo "ERROR: no JOB_PRIORITY in the build's meta-data; bootstrap_dev.sh sets it before this file is uploaded." >&2
+          exit 1
+        fi
+        echo "--- :pipeline: Uploading the build's dynamic steps with priority $$prio"
+        printf '%s\n' "$$yaml"
+        { printf 'priority: %s\n' "$$prio"; printf '%s\n' "$$yaml"; } | buildkite-agent pipeline upload

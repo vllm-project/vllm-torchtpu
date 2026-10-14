@@ -28,13 +28,22 @@
 # through it, runs the correctness stages and the MMLU-Pro eval through it, and
 # exits; the JobSet's success policy tears decode down.
 #
+# A config that sets K3_1P1D_LAUNCH=nnodes is launched the other way vLLM serves
+# one model across hosts: the config's own SERVE_ARGS, one TP group spanning the
+# role's hosts, every host running `vllm serve --nnodes N --node-rank I
+# --master-addr <host 0>` and every host but 0 --headless. That launch only
+# serves, so it needs an external client (the Kimi-K3 megakernel recipe points
+# in configs/kimi-k3-megakernel/ on kimi-k3-agentx-1p1d.yaml).
+#
 # Environment, from manifests/workloads/kimi-k3-1p1d-4dp8tp.yaml: POD_IP,
 # ROLE_HOST_PREFIX and ROLE_HOST_DOMAIN (host i of this role is
 # <prefix>i.<domain>), DECODE_HOST (decode's index 0), NUM_HOSTS.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-CONFIG=kimi-k3-tp8-dp4-ep-1p1d
+# The pair's serve flags and Raiden environment. The AgentX lane serves the
+# same pair with a longer context and its own ladder, so it passes its own.
+CONFIG="${K3_PD_CONFIG:-kimi-k3-tp8-dp4-ep-1p1d}"
 PORT=8000
 PROXY_PORT=8100
 DP_RPC_PORT=29500
@@ -74,20 +83,15 @@ DP_ADDRESS="${hosts[0]}"
 echo "--- ${role} host ${INDEX}/${NUM_HOSTS}: data-parallel address ${DP_ADDRESS}," \
   "advertise hosts ${TPU_RAIDEN_ADVERTISE_HOST}"
 
-# Best effort, as k3_1p1d.sh: index 0's API server imports the model's remote
-# code before any worker exists; elsewhere the workers would race to write it.
-# The subshell keeps that config's variables out of this script.
-if [[ "$INDEX" != "0" ]]; then
-  # shellcheck source=/dev/null
-  uri=$(source scripts/vllm/benchmarking/configs/kimi-k3-tp32-ep.sh >/dev/null \
-    && echo "$MODEL_URI") \
-    && timeout 600 python3 "$HERE/warm_remote_code.py" "$uri" \
-    || echo "WARNING: could not warm the model's remote code"
-fi
-
 # The serve flags and the Raiden environment of this role, over the defaults
 # run_benchmarks.sh applies before sourcing a config.
+# K3_1P1D_ENGINE tells a config that also serves the AgentX client that this
+# is an engine.
 export K3_1P1D_ROLE="$role"
+# shellcheck disable=SC2034  # read by the config sourced below
+K3_1P1D_ENGINE=1
+# What a config launched with --nnodes fills in; empty, they stay set under -u.
+SERVE_ARGS=() K3_1P1D_INPUTS=() K3_1P1D_IMPORTS=()
 MODEL_URI="${MODEL_URI:-}"
 ENABLE_EP=false
 QUANTIZATION=""
@@ -96,14 +100,92 @@ ASYNC_SCHEDULING=true
 EXTRA_SERVE_ARGS=""
 # shellcheck source=/dev/null
 source "scripts/vllm/benchmarking/configs/${CONFIG}.sh" || exit 2
-mp_serve_args || exit 2
+K3_1P1D_LAUNCH="${K3_1P1D_LAUNCH:-dp}"
+case "$K3_1P1D_LAUNCH" in
+  dp)
+    mp_serve_args || exit 2
+    ;;
+  nnodes)
+    if [[ "${#SERVE_ARGS[@]}" -eq 0 ]]; then
+      echo "ERROR: ${CONFIG} launches with --nnodes but sets no SERVE_ARGS" >&2
+      exit 2
+    fi
+    if [[ "${K3_PD_EXTERNAL_CLIENT:-0}" != "1" ]]; then
+      echo "ERROR: the --nnodes launch only serves; it needs K3_PD_EXTERNAL_CLIENT=1" >&2
+      exit 2
+    fi
+    SERVE_ARGS+=(--nnodes "$NUM_HOSTS" --node-rank "$INDEX" --master-addr "$DP_ADDRESS")
+    # vLLM does not infer --headless from --node-rank: without it every host
+    # would start an API server and an engine core of its own.
+    if [[ "$INDEX" == "0" ]]; then
+      SERVE_ARGS+=(--host 0.0.0.0 --port "$PORT")
+    else
+      SERVE_ARGS+=(--headless)
+    fi
+    ;;
+  *)
+    echo "ERROR: ${CONFIG} sets K3_1P1D_LAUNCH='${K3_1P1D_LAUNCH}'; expected dp or nnodes" >&2
+    exit 2
+    ;;
+esac
 export PYTHONUNBUFFERED=1
+
+# check_inputs: whether the files and modules an --nnodes config names, and the
+# Rust frontend it asks for, are there - what a boot takes minutes to fail on.
+check_inputs() {
+  local p m ok=0
+  for p in "${K3_1P1D_INPUTS[@]}"; do
+    if [[ -e "$p" ]]; then echo "[input] ok $p"; else echo "[input] MISSING $p"; ok=1; fi
+  done
+  for m in "${K3_1P1D_IMPORTS[@]}"; do
+    if python3 -c "import $m" >/dev/null 2>&1; then
+      echo "[import] ok $m"
+    else
+      echo "[import] FAILED $m"; ok=1
+    fi
+  done
+  if [[ "$INDEX" == "0" && "${VLLM_USE_RUST_FRONTEND:-0}" == "1" ]]; then
+    if [[ -x "${VLLM_RUST_FRONTEND_PATH:-}" ]]; then
+      echo "[input] ok ${VLLM_RUST_FRONTEND_PATH}"
+    else
+      echo "[input] MISSING the Rust frontend at '${VLLM_RUST_FRONTEND_PATH:-}'"; ok=1
+    fi
+  fi
+  return "$ok"
+}
 
 # K3_1P1D_DRY_RUN=1: print the serve command and environment and stop.
 if [[ "${K3_1P1D_DRY_RUN:-0}" == "1" ]]; then
   printf '[cmd] vllm serve'; printf ' %q' "${SERVE_ARGS[@]}"; echo
-  env | grep -E '^(TPU_|VLLM_|K3_)' | sort
+  if [[ "$K3_1P1D_LAUNCH" == "nnodes" ]]; then
+    env | grep -E '^(TPU_|VLLM_|K3_|HF_|TORCH_TPU_|RAIDEN_|LIBTPU_|NPROC=|ONEHOT_|XLA_|PYTHON|TRANSFORMERS_|TMPDIR=)' | sort
+    check_inputs || true
+  else
+    env | grep -E '^(TPU_|VLLM_|K3_)' | sort
+  fi
   exit 0
+fi
+
+# Best effort, as k3_1p1d.sh: index 0's API server imports the model's remote
+# code before any worker exists; elsewhere the workers would race to write it.
+# The subshell keeps that config's variables out of this script. Not for an
+# --nnodes config: it serves the checkpoint from local files with the Hub
+# offline and its own HF modules cache, so this would fill a cache it never
+# reads.
+if [[ "$INDEX" != "0" && "$K3_1P1D_LAUNCH" == "dp" ]]; then
+  # shellcheck source=/dev/null
+  uri=$(source scripts/vllm/benchmarking/configs/kimi-k3-tp32-ep.sh >/dev/null \
+    && echo "$MODEL_URI") \
+    && timeout 600 python3 "$HERE/warm_remote_code.py" "$uri" \
+    || echo "WARNING: could not warm the model's remote code"
+fi
+
+if [[ "$K3_1P1D_LAUNCH" == "nnodes" ]]; then
+  check_inputs || { echo "ERROR: ${CONFIG}'s inputs are not all there; not booting" >&2; exit 2; }
+  echo "--- Starting ${role} host ${INDEX} of ${NUM_HOSTS} (--nnodes, master ${DP_ADDRESS})"
+  # Every host serves until the JobSet ends: the client finishing is what ends
+  # the run, and a host that fails fails its role's Job and so the JobSet.
+  exec vllm serve "${SERVE_ARGS[@]}"
 fi
 
 if [[ "$INDEX" != "0" ]]; then
@@ -120,6 +202,15 @@ vllm serve "${SERVE_ARGS[@]}" --api-server-count=1 --host 0.0.0.0 --port "$PORT"
 serve_pid=$!
 
 if [[ "$role" == "decode" ]]; then
+  wait "$serve_pid"
+  exit $?
+fi
+
+# K3_PD_EXTERNAL_CLIENT=1: something outside this role drives the pair, so this
+# head only serves. Unset, this head IS the driver and its finishing ends the
+# run, so falling through here would tear its own engine down mid-benchmark.
+if [[ "${K3_PD_EXTERNAL_CLIENT:-0}" == "1" ]]; then
+  echo "--- K3_PD_EXTERNAL_CLIENT: serving until the external client finishes"
   wait "$serve_pid"
   exit $?
 fi

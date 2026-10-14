@@ -712,7 +712,7 @@ def masked_dense_ragged_paged_attention(
     num_page_indices = page_indices.shape[0]
     assert num_page_indices % max_num_seqs == 0
     pages_per_seq = num_page_indices // max_num_seqs
-    page_table_span = pages_per_seq * page_size
+    page_table_span: int = pages_per_seq * page_size
     if max_kv_len is None:
         max_kv_len = page_table_span
     assert 0 < max_kv_len <= page_table_span, (

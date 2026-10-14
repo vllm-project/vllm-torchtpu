@@ -15,6 +15,7 @@ def _config(device="tpu", method=None, pcp=1):
     config = object.__new__(VllmConfig)
     config.device_config = SimpleNamespace(device_type=device)
     config.model_config = None
+    config.attention_config = SimpleNamespace(hisparse_config=None)
     config.parallel_config = SimpleNamespace(
         prefill_context_parallel_size=pcp,
         tensor_parallel_size=1,
@@ -23,6 +24,7 @@ def _config(device="tpu", method=None, pcp=1):
         enable_batch_sharded_sampling=False,
         enable_dbo=False,
         enable_elastic_ep=False,
+        use_ubatching=False,
     )
     config.cache_config = CacheConfig()
     config.compilation_config = CompilationConfig(mode=CompilationMode.NONE)
@@ -72,7 +74,7 @@ def test_native_v1_validation_uses_tpu_capabilities(device, method, pcp, reason)
     "feature,reason",
     [
         ("adaptive", "adaptive draft verification"),
-        ("dflash2", "dflash2 drafts"),
+        ("dflash2", r"(?:DFlash candidate-head drafts|dflash2 drafts)"),
         ("diffusion", "diffusion models"),
         ("batch_sharded", "batch-sharded sampling"),
     ],
