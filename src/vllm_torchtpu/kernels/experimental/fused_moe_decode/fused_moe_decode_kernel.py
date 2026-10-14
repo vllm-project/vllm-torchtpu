@@ -149,8 +149,8 @@ def _kernel(
       acc_bf16 [m, h] bf16: the same, as the all-reduce source.
       recv [n, m, c] bf16: all-to-all receive slots, one per sending rank.
       red [m, c] bf16: this rank's reduced column chunk.
-      With `rows` set, acc_bf16 and recv are [n, r_pad, h] (row slab d is
-      peer d's tokens) and red is unused.
+      With `rows` set, acc_bf16 and recv are [n, r_pad, h] (index d holds
+      peer d's tokens, the send slice for peer d) and red is unused.
       ids_ref [E] int32 (SMEM): active expert ids, compacted.
       sem_ref DMA [nb, 4]: ring slot transfers (w1, w2, w1 scale, w2 scale);
         [nb, 6] in blocked mode (gate and up blocks of w1 and w1 scale apart).
@@ -289,7 +289,7 @@ def _kernel(
                 for copy in transfers(jnp.int32(initial)):
                     copy.start()
 
-    # Shared expert first; its slabs were issued at entry with the routed primes.
+    # Shared expert first; its weights were issued at entry with the routed primes.
     for copy in shared_copies:
         copy.wait()
     shared_coeff = jnp.max(shared_gate_ref[...], axis=1, keepdims=True)
@@ -342,11 +342,11 @@ def _kernel(
             jnp.matmul(xq_ref[...], w1_ring[0], preferred_element_type=jnp.float32),
         )
 
-    def all_to_all_sum(slab, dst):
+    def all_to_all_sum(send_slice, dst):
         """Reduce-scatter semantics by a direct all-to-all and a local sum,
-        which both output modes end with. slab(d) is this rank's partial of
-        the slice rank d keeps; one remote copy per peer sends it straight to
-        rank d's recv[me]. Each rank then sums the n slots it received in FP32
+        which both output modes end with. send_slice(d) is this rank's partial
+        of the slice rank d keeps; one remote copy per peer sends it straight
+        to rank d's recv[me]. Each rank then sums the n slots it received in FP32
         into dst. There is no ring and no per-hop reduction: a single hop of n
         concurrent copies, where a ring needs n - 1 dependent steps for the
         same bytes, which suits the latency-bound sizes of decode."""
@@ -354,7 +354,7 @@ def _kernel(
         pl.semaphore_wait(barrier, n_ranks)
         copies = [
             pltpu.make_async_remote_copy(
-                slab(d),
+                send_slice(d),
                 recv.at[me],
                 a2a_send.at[d],
                 a2a_recv,
@@ -375,9 +375,9 @@ def _kernel(
 
     if rows is not None:
         # DP attention: all-to-all + local sum over token rows, no all-gather.
-        # Slab d is this rank's partial of tokens [d * rows, (d + 1) * rows),
-        # the rows rank d keeps. Each slab is a whole leading index of
-        # acc_bf16 / recv, so it is tile aligned for any rows.
+        # Send slice d is this rank's partial of tokens [d * rows, (d + 1) *
+        # rows), the rows rank d keeps. Each send slice is a whole leading
+        # index of acc_bf16 / recv, so it is tile aligned for any rows.
         for d in range(n_ranks):
             acc_bf16[d, :rows, :] = acc_ref[d * rows : (d + 1) * rows, :].astype(
                 acc_bf16.dtype
@@ -613,7 +613,8 @@ def fused_moe_decode(
         out_rows, wire = m, hidden.dtype
         acc_bf16_shape, recv_shape, red_shape = (m, h), (n_ranks, m, chunk), (m, chunk)
     else:
-        # BF16 packs 16 rows per tile; smaller slabs go over the wire in FP32.
+        # BF16 packs 16 rows per tile; smaller send slices go over the wire in
+        # FP32.
         wire = hidden.dtype if rows % 16 == 0 else jnp.float32
         out_rows = rows if rows % 16 == 0 else -(-rows // 8) * 8
         acc_bf16_shape = recv_shape = (n_ranks, out_rows, h)
