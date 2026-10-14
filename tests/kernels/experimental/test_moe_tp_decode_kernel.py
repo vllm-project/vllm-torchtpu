@@ -3,11 +3,12 @@
 """moe_tp_decode: admission, and the fused kernel and the adapter's op body on
 16 CPU devices.
 
-The 16-device checks run this file as a script in a subprocess, because the
-host device count (XLA_FLAGS) must be set before JAX starts. They use TPU
+The 16-device checks run this file as a script in two subprocesses, because
+the host device count (XLA_FLAGS) must be set before JAX starts. They use TPU
 interpret mode with the race detector, so they check routing, the DMA and
-semaphore protocols and the arithmetic, not Mosaic lowering, VMEM limits or
-TPU timing.
+semaphore protocols and the arithmetic (against an f32 reference and against
+_expected, the kernel's roundings in plain JAX ops), not Mosaic lowering,
+VMEM limits or TPU timing.
 """
 
 import contextlib
@@ -27,7 +28,13 @@ from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.experimental import moe_tp_decode as kernel
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
+from vllm_torchtpu.kernels.experimental.moe_tp_decode.kernel import _quantize_blocks
+from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
+F8, BF16, F32 = jnp.float8_e4m3fn, jnp.bfloat16, jnp.float32
+FP8_MAX = float(jnp.finfo(F8).max)
+# gmm_v2's activation quantization block (its quant_block_size).
+Q_BLOCK = 512
 N_RANKS = 16
 # One rank's slice of GLM-5.2 at TP16.
 GLM52_TP16 = dict(h=6144, e=256, i=128, fs=128, topk=8)
@@ -56,10 +63,20 @@ CASES = (
 BODY_CASE = (16, 7)
 # A token count the kernel does not admit: the op body's psum path.
 CHAIN_ROWS = 128
+# Row 0 of OUTLIER_CASE gets OUTLIER at OUTLIER_COLUMN (inside the second
+# 512-column block), and every weight on that column is zeroed, so it moves
+# nothing but quantization scales.
+OUTLIER_CASE = (16, 16)
+OUTLIER_COLUMN = Q_BLOCK + 7
+OUTLIER = 2.0**20
 # Kernel vs an f32 reference with dequantized weights and unquantized
 # activations, i.e. the kernel's FP8 activations and bf16 roundings: measured
 # rel-L2 0.044 to 0.046 and cos >= 0.9989 on these inputs.
 TOLERANCE = dict(rel_l2=0.06, cos=0.998)
+# Kernel vs _expected, the same arithmetic in plain JAX ops: measured rel-L2
+# 0 to 5e-5 (a few elements one bf16 ulp apart); one scale per row of the
+# routed x instead of per 512 columns gives 0.19 on the outlier case.
+EXPECTED_REL_L2 = 1e-3
 
 
 def _tpu7x():
@@ -155,16 +172,48 @@ def test_selftest_inputs_have_exact_sums_that_expose_a_wrong_chunk(monkeypatch):
     assert not all_reduce.selftest_ok(spec, x, padded, 3)
 
 
-@pytest.fixture(scope="module")
-def on_16_devices():
+def test_routed_x_scales_per_512_column_block_as_gmm_v2():
+    rows, h, lanes = 16, 4 * Q_BLOCK, 128
+
+    def quantize(x):
+        q = np.zeros((rows, h), F8)
+        scales = np.zeros((h // Q_BLOCK, rows, lanes), BF16)
+        _quantize_blocks(jnp.asarray(x), q, scales)
+        return q.view(np.uint8), scales
+
+    x = np.asarray(jax.random.normal(jax.random.key(1), (rows, h)), BF16)
+    x[1, 2 * Q_BLOCK : 3 * Q_BLOCK] = 0  # row 1, block 2
+    q, scales = quantize(x)
+    for b, (want_q, want_s) in enumerate(_gmm_v2_quantize(jnp.asarray(x))):
+        block = slice(b * Q_BLOCK, (b + 1) * Q_BLOCK)
+        assert np.array_equal(q[:, block], np.asarray(want_q).view(np.uint8))
+        assert np.array_equal(scales[b], np.broadcast_to(want_s, (rows, lanes)))
+    # An all-zero block keeps scale 0 and quantizes to 0, where quantize_block
+    # would use scale 1.
+    assert not scales[2, 1].any() and not q[1, 2 * Q_BLOCK : 3 * Q_BLOCK].any()
+    # One outlier changes its own block's scale and FP8 values, nothing else;
+    # one scale per row would carry it to row 0's other blocks.
+    x[0, OUTLIER_COLUMN] = OUTLIER
+    q_out, scales_out = quantize(x)
+    changed = np.zeros((rows, h // Q_BLOCK), bool)
+    changed[0, OUTLIER_COLUMN // Q_BLOCK] = True
+    assert np.array_equal(scales_out[:, :, 0].T != scales[:, :, 0].T, changed)
+    q_changed = (q_out != q).reshape(rows, h // Q_BLOCK, Q_BLOCK).any(axis=2)
+    assert np.array_equal(q_changed, changed)
+
+
+def _run_worker(part):
     flags = os.environ.get("XLA_FLAGS", "")
     env = dict(
         os.environ,
         JAX_PLATFORMS="cpu",
-        XLA_FLAGS=f"{flags} --xla_force_host_platform_device_count={N_RANKS}",
+        # bf16 rounded after every op in the interpreted kernel too, as on the
+        # TPU and in _expected; XLA:CPU may otherwise keep f32 in between.
+        XLA_FLAGS=f"{flags} --xla_force_host_platform_device_count={N_RANKS}"
+        " --xla_allow_excess_precision=false",
     )
     proc = subprocess.run(
-        [sys.executable, __file__],
+        [sys.executable, __file__, part],
         env=env,
         capture_output=True,
         text=True,
@@ -175,13 +224,28 @@ def on_16_devices():
     return json.loads(lines[-1][len("RESULT ") :])
 
 
+# Two worker processes, so that each stays well inside the timeouts: "a" runs
+# the race-detector control, the 16- and 32-row cases and the op body's kernel
+# case; "b" the 64-row cases, the outlier case, the op body's psum path and
+# the all-reduce self-test.
+@pytest.fixture(scope="module")
+def on_16_devices():
+    return _run_worker("a")
+
+
+@pytest.fixture(scope="module")
+def on_16_devices_b():
+    return _run_worker("b")
+
+
 def test_race_detector_is_live(on_16_devices):
     assert on_16_devices["race_control"] == {"racy": True, "clean": False}
 
 
 @pytest.mark.parametrize("rows, n_valid", CASES)
-def test_kernel_on_16_devices(on_16_devices, rows, n_valid):
-    case = on_16_devices["cases"][f"{rows}:{n_valid}"]
+def test_kernel_on_16_devices(request, rows, n_valid):
+    worker = "on_16_devices_b" if rows == 64 else "on_16_devices"
+    case = request.getfixturevalue(worker)["cases"][f"{rows}:{n_valid}"]
     assert case["ranks_identical"], case
     assert case["padding_rows_positive_zero"], case
     assert not case["races_found"], case
@@ -189,6 +253,17 @@ def test_kernel_on_16_devices(on_16_devices, rows, n_valid):
         assert case["nan"] == 0, case
         assert case["rel_l2"] <= TOLERANCE["rel_l2"], case
         assert case["cos"] >= TOLERANCE["cos"], case
+        assert case["expected_rel_l2"] <= EXPECTED_REL_L2, case
+
+
+def test_routed_x_outlier_on_16_devices(on_16_devices_b):
+    case = on_16_devices_b["outlier"]
+    assert case["ranks_identical"], case
+    assert not case["races_found"], case
+    assert case["nan"] == 0, case
+    assert case["expected_rel_l2"] <= EXPECTED_REL_L2, case
+    # With one scale per row of x, row 0's other blocks flush to zero.
+    assert case["per_row_rel_l2"] >= 100 * EXPECTED_REL_L2, case
 
 
 def test_op_body_runs_the_kernel_with_n_valid_from_the_padding_mask(on_16_devices):
@@ -200,17 +275,18 @@ def test_op_body_runs_the_kernel_with_n_valid_from_the_padding_mask(on_16_device
     assert case["nan"] == 0, case
     assert case["rel_l2"] <= TOLERANCE["rel_l2"], case
     assert case["cos"] >= TOLERANCE["cos"], case
+    assert case["expected_rel_l2"] <= EXPECTED_REL_L2, case
 
 
-def test_op_body_psums_the_usual_path_at_other_token_counts(on_16_devices):
+def test_op_body_psums_the_usual_path_at_other_token_counts(on_16_devices_b):
     # The usual path is stubbed with ones on real rows: the psum over 16 ranks
     # gives exactly 16 there and 0 on padded rows.
-    assert on_16_devices["body_chain_exact"]
+    assert on_16_devices_b["body_chain_exact"]
 
 
-def test_all_reduce_selftest_on_16_devices(on_16_devices):
+def test_all_reduce_selftest_on_16_devices(on_16_devices_b):
     # 32 rows: one call per row path (full, fold, trim, zero).
-    assert on_16_devices["selftest_ok"]
+    assert on_16_devices_b["selftest_ok"]
 
 
 # ---------------------------------------------------------------------------
@@ -264,6 +340,67 @@ def _reference(x, scores, bias, n_valid, ranks, c):
     return np.asarray(out[:n_valid])
 
 
+def _gmm_v2_quantize(x, width=Q_BLOCK):
+    """gmm_v2's LHS quantization (its quantized matmul path): per row per
+    `width` columns a bf16 scale, amax / FP8 max, and its inverse (0 for an
+    all-zero block); x * inverse in bf16, no clip. [(FP8 block, scales)]."""
+    blocks = []
+    for k in range(0, x.shape[1], width):
+        block = x[:, k : k + width]
+        scale = jnp.max(jnp.abs(block), axis=1, keepdims=True) / FP8_MAX
+        inv = jnp.where(scale == 0, 0, 1 / scale)
+        blocks.append(((block * inv).astype(F8), scale))
+    return blocks
+
+
+def _expected(x, scores, bias, n_valid, ranks, c, *, x_block=Q_BLOCK):
+    """The kernel's arithmetic in plain JAX ops run one at a time (so bf16 is
+    rounded after every op), each part as the path it replaces computes it:
+    routing as select_experts (top-k of scores + bias; the picked unbiased
+    scores over their pick-order sum, in bf16); the routed gate_up as gmm_v2
+    (x quantized per row per x_block columns; per block a partial product
+    rounded to bf16, times the block's scales, then the weight scales in
+    bf16, summed in bf16; SiLU(gate) * up in bf16); the second matmul with
+    the intermediate times the route weight quantized to FP8 per row; the
+    shared expert as xla_quantized_matmul twice around SiluAndMul; shared +
+    scale * routed in bf16; the f32 sum of the ranks' bf16 partials in rank
+    order, in bf16, as all_reduce. x_block=h is the per-row control."""
+    i, fs = c["i"], c["fs"]
+    _, ids = jax.lax.top_k(scores + bias, c["topk"])
+    picked = jnp.take_along_axis(scores, ids, axis=-1)
+    wsum = picked[:, :1]
+    for j in range(1, c["topk"]):
+        wsum = wsum + picked[:, j : j + 1]
+    # select_experts' clamp(sum, min=1e-20).
+    w = (picked / jnp.maximum(wsum, 1e-20)).astype(BF16).astype(F32)
+    coef = jnp.sum(jax.nn.one_hot(ids, c["e"], dtype=F32) * w[..., None], axis=1)
+    blocks = _gmm_v2_quantize(x, x_block)
+    total = None
+    for w13, w2, s13, s2, sw13, ss13, sw2, ss2 in ranks:
+        routed = jnp.zeros(x.shape, F32)
+        for e in range(c["e"]):
+            acc = jnp.zeros((x.shape[0], 2 * i), BF16)
+            for b, (q, scale) in enumerate(blocks):
+                rows = slice(b * x_block, (b + 1) * x_block)
+                part = jnp.matmul(q, w13[e, rows], preferred_element_type=F32)
+                acc = acc + part.astype(BF16) * scale * s13[e, 0].astype(BF16)
+            act = jax.nn.silu(acc[:, :i]) * acc[:, i:]
+            coeff = coef[:, e : e + 1]
+            mid = jnp.where(coeff != 0, act.astype(F32) * coeff, 0.0)
+            ms = jnp.max(jnp.abs(mid), axis=1, keepdims=True) / FP8_MAX
+            mq = (mid * jnp.where(ms == 0, 0.0, 1.0 / ms)).astype(F8)
+            for n in range(0, x.shape[1], 512):
+                cols = slice(n, n + 512)
+                y = jnp.matmul(mq, w2[e][:, cols], preferred_element_type=F32)
+                routed = routed.at[:, cols].add(y * s2[e, 0, :, cols] * ms)
+        gate_up = xla_quantized_matmul(x, sw13, ss13)
+        act = jax.nn.silu(gate_up[:, :fs].astype(F32)).astype(BF16)
+        shared = xla_quantized_matmul(act * gate_up[:, fs:], sw2, ss2)
+        partial = (shared + routed.astype(BF16) * ROUTED_SCALE).astype(F32)
+        total = partial if total is None else total + partial
+    return np.asarray(total.astype(BF16)[:n_valid]).astype(np.float32)
+
+
 def _interpret(fn, *args):
     """fn(*args) with fresh interpreter state; (out, whether races were found)."""
     from jax._src.pallas.mosaic.interpret import interpret_pallas_call
@@ -306,7 +443,7 @@ def _race_control():
     }
 
 
-def _worker():
+def _worker(part):
     from jax._src.pallas.mosaic import tpu_info
     from jax.sharding import Mesh, NamedSharding
     from jax.sharding import PartitionSpec as P
@@ -348,7 +485,23 @@ def _worker():
         x = jax.random.normal(keys[-3], (rows, c["h"])).astype(jnp.bfloat16)
         return x, jax.nn.sigmoid(x.astype(jnp.float32) @ gate.T)
 
-    def checks(out, x, scores, rows, n_valid, races, start):
+    def rel_l2(got, want):
+        got, want = got.astype(np.float64), want.astype(np.float64)
+        return float(np.linalg.norm(got - want) / np.linalg.norm(want))
+
+    cache = {}
+
+    def references(key, x, scores, rows, weights):
+        # Every row of these inputs: a valid row's result is independent of
+        # n_valid, so cases with the same inputs share them.
+        if key not in cache:
+            cache[key] = (
+                _reference(x, scores, bias, rows, weights, c),
+                _expected(x, scores, bias, rows, weights, c),
+            )
+        return cache[key]
+
+    def checks(out, x, scores, rows, n_valid, races, start, key, weights=ranks):
         out = out.reshape(N_RANKS, rows, c["h"]).astype(np.float32)
         bits = out.view(np.uint32)
         pad = out[:, n_valid:]
@@ -360,14 +513,18 @@ def _worker():
             nan=int(np.isnan(out).sum()),
         )
         if n_valid:
-            got = out[0, :n_valid].astype(np.float64)
-            want = _reference(x, scores, bias, n_valid, ranks, c).astype(np.float64)
+            got = out[0, :n_valid]
+            want, exp = references(key, x, scores, rows, weights)
+            want, exp = want[:n_valid].astype(np.float64), exp[:n_valid]
             case.update(
-                rel_l2=float(np.linalg.norm(got - want) / np.linalg.norm(want)),
+                rel_l2=rel_l2(got, want),
                 cos=float(
                     np.vdot(got, want) / (np.linalg.norm(got) * np.linalg.norm(want))
                 ),
                 max_abs=float(np.max(np.abs(got - want))),
+                expected_rel_l2=rel_l2(got, exp),
+                expected_max_abs=float(np.max(np.abs(got - exp))),
+                expected_equal=float(np.mean(got == exp)),
             )
         return case
 
@@ -376,23 +533,6 @@ def _worker():
             jax.device_put(a, NamedSharding(mesh, s))
             for a, s in zip(operands, in_specs, strict=True)
         ]
-
-    result = {"race_control": _race_control(), "cases": {}}
-    for rows, n_valid in CASES:
-        x, scores = inputs(rows)
-        operands = (
-            jnp.tile(x, (N_RANKS, 1)),
-            jnp.tile(scores, (N_RANKS, 1)),
-            bias,
-            jnp.asarray([n_valid], jnp.int32),
-            rank_ids,
-            *stacked,
-        )
-        start = time.monotonic()
-        out, races = _interpret(run, *put(operands, specs))
-        result["cases"][f"{rows}:{n_valid}"] = checks(
-            out, x, scores, rows, n_valid, races, start
-        )
 
     # The adapter's op body: the operands moe_tp_decode_forward passes, with a
     # padding mask longer than the token count, as the runner's is.
@@ -430,11 +570,63 @@ def _worker():
             body_specs,
         )
 
-    rows, n_valid = BODY_CASE
+    result = {"cases": {}}
+    if part == "a":
+        result["race_control"] = _race_control()
+    for rows, n_valid in CASES:
+        if (rows == 64) != (part == "b"):
+            continue
+        x, scores = inputs(rows)
+        operands = (
+            jnp.tile(x, (N_RANKS, 1)),
+            jnp.tile(scores, (N_RANKS, 1)),
+            bias,
+            jnp.asarray([n_valid], jnp.int32),
+            rank_ids,
+            *stacked,
+        )
+        start = time.monotonic()
+        out, races = _interpret(run, *put(operands, specs))
+        result["cases"][f"{rows}:{n_valid}"] = checks(
+            out, x, scores, rows, n_valid, races, start, rows
+        )
+
+    if part == "a":
+        rows, n_valid = BODY_CASE
+        x, scores = inputs(rows)
+        start = time.monotonic()
+        out, races = _interpret(run_body, *body_operands(x, scores, n_valid))
+        result["body_kernel"] = checks(
+            out, x, scores, rows, n_valid, races, start, rows
+        )
+        print("RESULT " + json.dumps(result))
+        return
+
+    # The routed x per 512-column block: an outlier in row 0, on a column no
+    # weight reads, so it moves nothing but quantization scales.
+    rows, n_valid = OUTLIER_CASE
     x, scores = inputs(rows)
+    x = x.at[0, OUTLIER_COLUMN].set(OUTLIER)
+    zeroed = [
+        (w13.at[:, OUTLIER_COLUMN].set(0), w2, s13, s2)
+        + (sw13.at[OUTLIER_COLUMN].set(0), ss13, sw2, ss2)
+        for w13, w2, s13, s2, sw13, ss13, sw2, ss2 in ranks
+    ]
+    operands = (
+        jnp.tile(x, (N_RANKS, 1)),
+        jnp.tile(scores, (N_RANKS, 1)),
+        bias,
+        jnp.asarray([n_valid], jnp.int32),
+        rank_ids,
+        *[jnp.concatenate(ws, axis=0) for ws in zip(*zeroed, strict=True)],
+    )
     start = time.monotonic()
-    out, races = _interpret(run_body, *body_operands(x, scores, n_valid))
-    result["body_kernel"] = checks(out, x, scores, rows, n_valid, races, start)
+    out, races = _interpret(run, *put(operands, specs))
+    case = checks(out, x, scores, rows, n_valid, races, start, "outlier", zeroed)
+    per_row = _expected(x, scores, bias, n_valid, zeroed, c, x_block=c["h"])
+    got = out.reshape(N_RANKS, rows, c["h"])[0, :n_valid].astype(np.float32)
+    case["per_row_rel_l2"] = rel_l2(got, per_row)
+    result["outlier"] = case
 
     def ones_on_real_rows(x, scores, bias, is_pad, *weights_and_statics):
         return jnp.where(is_pad[:, None], 0.0, 1.0).astype(x.dtype) * jnp.ones_like(x)
@@ -488,4 +680,4 @@ def _worker():
 if __name__ == "__main__":
     # Around everything: pallas_call reads the mode when it is built.
     with pltpu.force_tpu_interpret_mode(pltpu.InterpretParams(detect_races=True)):
-        _worker()
+        _worker(sys.argv[1])

@@ -16,11 +16,15 @@ inside the kernel, so no XLA all-reduce follows:
   4. the experts any row picked go VMEM -> SMEM and are compacted by a
      branch-free scan; the first _NUM_BUFFERS of them then start their weight
      DMAs, and the shared expert's weights are waited for;
-  5. x quantized to FP8 once per row with quantize_block, as
-     xla_quantized_matmul does, for the shared and the routed experts; this
-     rank's slice of the shared expert (the usual TP path's bf16 roundings);
+  5. x quantized to FP8 twice, each copy by the rule its matmuls follow with
+     this kernel off: per row with quantize_block for the shared expert (its
+     linears run xla_quantized_matmul), per 512-column block with bf16
+     scales for the routed experts (they run gmm_v2); this rank's slice of
+     the shared expert (the usual TP path's bf16 roundings);
   6. the routed experts, streamed through a ring of _NUM_BUFFERS weight slots
-     with each gate_up matmul issued one expert ahead;
+     with each gate_up matmul issued one expert ahead; gate_up and its SiLU
+     as gmm_v2 computes them: one partial product per 512-column block,
+     scaled and summed in bf16;
   7. bf16(bf16(shared) + bf16(bf16(routed) * routed_scale)), the usual TP
      path's combine, all-reduced by all_reduce.epilogue in place of the store.
 
@@ -54,6 +58,9 @@ VMEM_HEADROOM = 1.25
 VMEM_FRACTION = 0.75
 # Output columns per second-matmul chunk; bounds the live f32 result.
 _N_CHUNK = 512
+# gmm_v2's activation quantization block: one scale per row per this many
+# columns of x (its quant_block_size).
+_Q_BLOCK = 512
 # Weight ring depth. One slot holds the expert whose first matmul is in
 # flight, so num_buffers - 2 transfers run ahead of compute.
 _NUM_BUFFERS = 6
@@ -79,8 +86,8 @@ def _vmem_plan(m, h, i, num_experts, shared_inter, info, spec):
         + t((1, 2 * shared_inter), f32)
         + t((shared_inter, h), FP8)  # shared down
         + t((1, h), f32)
-        + t((m, h), FP8)  # xq
-        + t((m, 2 * i), f32)  # xs
+        + 2 * t((m, h), FP8)  # sxq (per row), xq (per block)
+        + t((h // _Q_BLOCK, m, info.num_lanes), bf16)  # xs
         + 2 * t((m, h), f32)  # owner, shared
         + t((m, e_pad), f32)  # wtab
         + t((1, e_pad), jnp.int32)  # hits_v
@@ -139,7 +146,7 @@ def can_use_moe_tp_decode(
         return False
     if not 0 < topk <= num_experts or i <= 0 or i % info.num_lanes:
         return False
-    if h % _N_CHUNK or shared_inter <= 0 or shared_inter % PAIR:
+    if h % _N_CHUNK or h % _Q_BLOCK or shared_inter <= 0 or shared_inter % PAIR:
         return False
     if out != h or w13.shape != (experts, h, 2 * i):
         return False
@@ -184,6 +191,22 @@ def _route(scores, bias, n_valid, *, topk):
     w = (jnp.where(chosen, scores, 0.0) / denom).astype(jnp.bfloat16)
     valid = lax.broadcasted_iota(jnp.int32, (rows, n), 0) < n_valid
     return jnp.where(jnp.logical_and(chosen, valid), w.astype(jnp.float32), 0.0)
+
+
+def _quantize_blocks(x, q_ref, scale_ref):
+    """x [m, h] bf16 to FP8 in q_ref as gmm_v2 quantizes its LHS: per row per
+    _Q_BLOCK columns, scale = block amax / FP8 max and its inverse (0 for an
+    all-zero block) in bf16, x * inverse in bf16, no clip (as
+    moe_dense_expert._quantize). Block k's scales go to scale_ref[k] as an
+    [m, lanes] plane, so each read is one contiguous tile."""
+    m, h = x.shape
+    lanes = scale_ref.shape[-1]
+    for k in range(0, h, _Q_BLOCK):
+        block = x[:, k : k + _Q_BLOCK]
+        scale = jnp.max(jnp.abs(block), axis=1, keepdims=True) / FP8_MAX
+        inv = jnp.where(scale == 0, 0, 1 / scale)
+        q_ref[:, k : k + _Q_BLOCK] = (block * inv).astype(FP8)
+        scale_ref[k // _Q_BLOCK] = jnp.broadcast_to(scale, (m, lanes))
 
 
 def _shared_expert(xq_ref, xs, sw13_ref, ss13_ref, sw2_ref, ss2_ref, out_ref):
@@ -236,6 +259,7 @@ def _kernel(
     ss13_ref,
     sw2_ref,
     ss2_ref,
+    sxq_ref,
     xq_ref,
     xs_ref,
     owner_ref,
@@ -318,19 +342,35 @@ def _kernel(
         copy.wait()
 
     # Zeroing and x quantization follow the compaction, so the first weight
-    # copies are already in flight while they run. x is quantized once, as
-    # xla_quantized_matmul does; the shared and the routed experts both read
-    # xq_ref.
+    # copies are already in flight while they run. x is quantized twice on
+    # purpose, each copy as its matmuls quantize it with this kernel off: per
+    # row for the shared expert (xla_quantized_matmul), per _Q_BLOCK columns
+    # for the routed experts (gmm_v2).
     owner_ref[...] = jnp.zeros((m, h), jnp.float32)
-    xq, xs = quantize_block(x_ref[...], axis=1, target_dtype=FP8)
-    xq_ref[...] = xq
-    xs_ref[...] = jnp.broadcast_to(xs, (m, 2 * i))
-    _shared_expert(xq_ref, xs, sw13_ref, ss13_ref, sw2_ref, ss2_ref, shared_ref)
+    sxq, sxs = quantize_block(x_ref[...], axis=1, target_dtype=FP8)
+    sxq_ref[...] = sxq
+    _shared_expert(sxq_ref, sxs, sw13_ref, ss13_ref, sw2_ref, ss2_ref, shared_ref)
+    _quantize_blocks(x_ref[...], xq_ref, xs_ref)
 
     expert_columns = lax.broadcasted_iota(jnp.int32, wtab_ref.shape, 1)
+    lanes = xs_ref.shape[-1]
 
     def gate_up(slot):
-        return jnp.matmul(xq_ref[...], w1_ref[slot], preferred_element_type=jnp.float32)
+        # gmm_v2's quantized matmul: one partial product per _Q_BLOCK rows of
+        # w1, rounded to bf16, times its x block's scales and then the weight
+        # scales in bf16, summed in bf16 (moe_dense_expert's pattern).
+        w_scale = s1_ref[slot].astype(jnp.bfloat16)
+        acc = jnp.zeros((m, 2 * i), jnp.bfloat16)
+        for k in range(0, h, _Q_BLOCK):
+            part = jnp.matmul(
+                xq_ref[:, k : k + _Q_BLOCK],
+                w1_ref[slot, k : k + _Q_BLOCK, :],
+                preferred_element_type=jnp.float32,
+            ).astype(jnp.bfloat16)
+            part *= jnp.concatenate([xs_ref[k // _Q_BLOCK]] * (2 * i // lanes), axis=1)
+            part *= w_scale
+            acc += part
+        return acc
 
     def finish(step, slot, acc1):
         e = active_ids_ref[step]
@@ -341,10 +381,11 @@ def _kernel(
             axis=1,
             keepdims=True,
         )
-        acc1 = acc1 * xs_ref[...] * s1_ref[slot]
+        # gmm_v2's fused SiLU, on the bf16 gate_up result.
+        act = jax.nn.silu(acc1[:, :i]) * acc1[:, i:]
         # Mask, not multiply: a padded row with non-finite hidden would give
         # NaN * 0 = NaN. Rows this expert does not own contribute exactly 0.
-        mid = jnp.where(coeff != 0, jax.nn.silu(acc1[:, :i]) * acc1[:, i:] * coeff, 0.0)
+        mid = jnp.where(coeff != 0, act.astype(jnp.float32) * coeff, 0.0)
         ms = jnp.max(jnp.abs(mid), axis=1, keepdims=True) / FP8_MAX
         mq = (mid * jnp.where(ms == 0, 0.0, 1.0 / ms)).astype(FP8)
         for n in range(0, h, _N_CHUNK):
@@ -499,7 +540,8 @@ def moe_tp_decode(
                 pltpu.VMEM((shared_inter, h), FP8),
                 pltpu.VMEM((1, h), jnp.float32),
                 pltpu.VMEM((m, h), FP8),
-                pltpu.VMEM((m, 2 * i), jnp.float32),
+                pltpu.VMEM((m, h), FP8),
+                pltpu.VMEM((h // _Q_BLOCK, m, info.num_lanes), jnp.bfloat16),
                 pltpu.VMEM((m, h), jnp.float32),
                 pltpu.VMEM((m, h), jnp.float32),
                 pltpu.VMEM((m, e_pad), jnp.float32),
