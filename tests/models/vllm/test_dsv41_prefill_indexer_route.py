@@ -21,12 +21,12 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels as ak
         (2048, 2044, False, None, 2, 131200, 131199),
         (2048, 2044, False, None, 2, 524288, 524288),
         (2048, 2044, False, None, 2, 1048576, 1048576),
-        (2048, 2044, False, "radix", 2, 131072, 50176),
+        (2048, 2044, False, "streaming", 2, 131072, 50176),
         (2048, 2044, False, "baseline", 1, 131072, 50176),
         (384, 288, True, None, 1, 131072, 50176),
-        (384, 288, True, "radix", 1, 131072, 50176),
-        (2048, 6, False, "radix", 1, 131072, 50176),
-        (2048, 2044, True, "radix", 1, 131072, 50176),
+        (384, 288, True, "streaming", 1, 131072, 50176),
+        (2048, 6, False, "streaming", 1, 131072, 50176),
+        (2048, 2044, True, "streaming", 1, 131072, 50176),
     ],
 )
 def test_prefill_route_excludes_decode_and_mixed(

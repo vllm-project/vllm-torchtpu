@@ -17,13 +17,13 @@ from vllm_torchtpu.kernels.deepseek_v41 import (
     indexer,
     tuned_block_sizes,
 )
-from vllm_torchtpu.kernels.deepseek_v41.prefill_indexer import (
-    radix_topk as prefill_radix_topk,
-)
-from vllm_torchtpu.kernels.deepseek_v41.prefill_indexer import (
+from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
     scores as prefill_index_scores,
 )
-from vllm_torchtpu.kernels.deepseek_v41.prefill_indexer import (
+from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
+    streaming_topk,
+)
+from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
     tuned_block_sizes as prefill_tuning,
 )
 
@@ -2421,7 +2421,7 @@ def _prefill_top_k(scores, lengths):
     )
 
     def select(s, n):
-        ids = prefill_radix_topk.prefill_radix_topk(s, valid_lengths=n, k=512)
+        ids = streaming_topk.streaming_topk(s, valid_lengths=n, k=512)
         values = jnp.take_along_axis(s, jnp.maximum(ids, 0), axis=1)
         ids = jnp.where((ids >= 0) & (values > -jnp.inf), ids, -1)
         return _compact_selected(ids)
@@ -2691,7 +2691,7 @@ def paged_indexer_jax(
     unordered: bool = False,
     batch_max: jax.Array | None = None,
     page_records: int | None = None,
-    prefill_mode: str = "radix",
+    prefill_mode: str = "streaming",
 ) -> tuple[jax.Array, jax.Array]:
     """``records`` is ``[requests, width]``; ``requests`` maps tokens to rows.
 
@@ -3101,7 +3101,7 @@ def update_and_select_jax(
     candidate_filter: bool,
     unordered: bool,
     page_records: int = 0,
-    prefill_mode: str = "radix",
+    prefill_mode: str = "streaming",
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """``page_records`` 0 disables page gathers (see `paged_indexer_jax`)."""
     updated = write_index_keys(pool, write_records, keys)
@@ -3143,7 +3143,7 @@ def update_and_select_2bank_jax(
     candidate_filter: bool,
     unordered: bool,
     page_records: int = 0,
-    prefill_mode: str = "radix",
+    prefill_mode: str = "streaming",
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     (updated_lo, updated_hi), selected, published = cast(
         Any,
@@ -3206,7 +3206,7 @@ def initialize_indexer():
         candidate_filter,
         unordered,
         page_records=0,
-        prefill_mode="radix",
+        prefill_mode="streaming",
     ):
         return (
             torch.empty_like(pool),
@@ -3243,7 +3243,7 @@ def initialize_indexer():
         candidate_filter,
         unordered,
         page_records=0,
-        prefill_mode="radix",
+        prefill_mode="streaming",
     ):
         return (
             torch.empty_like(pool_lo),

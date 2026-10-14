@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.deepseek_v41.prefill_indexer.scores import (
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.scores import (
     prefill_index_scores,
 )
 

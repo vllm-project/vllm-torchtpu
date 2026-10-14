@@ -2,9 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Single-request prefill scoring, with resident Q and pipelined packed K.
 
-The windowed VMEM output and contiguous-page DMA strategy are inspired by
-sgl-jax's srt/kernels/dsa/paged_score.py (15081a487). This implementation uses
-our two-bank packed word cache and preserves FP32 multiply/reduce semantics.
+Uses a two-bank packed word cache and preserves FP32 multiply/reduce semantics.
 """
 
 import contextlib

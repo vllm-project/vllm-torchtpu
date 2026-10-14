@@ -1,14 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Full-row prefill radix selection: stable ties and finite padding contract."""
+"""Full-row prefill streaming top-k: stable ties and finite padding contract."""
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.deepseek_v41.prefill_indexer.radix_topk import (
-    prefill_radix_topk,
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.streaming_topk import (
+    streaming_topk,
 )
 
 
@@ -26,7 +26,7 @@ from vllm_torchtpu.kernels.deepseek_v41.prefill_indexer.radix_topk import (
         "masked",
     ],
 )
-def test_prefill_radix_contract(block, threshold, width, distribution):
+def test_streaming_topk_contract(block, threshold, width, distribution):
     if jax.default_backend() != "tpu":
         pytest.skip("SparseCore selection requires TPU")
     rng = np.random.default_rng(17)
@@ -51,7 +51,7 @@ def test_prefill_radix_contract(block, threshold, width, distribution):
         np.array([0, 1, 511, 512, 513, 8191, 8193, 16383, 50176, width], np.int32), 32
     )
     actual = np.asarray(
-        prefill_radix_topk(
+        streaming_topk(
             jnp.asarray(scores),
             valid_lengths=jnp.asarray(lengths),
             k=512,

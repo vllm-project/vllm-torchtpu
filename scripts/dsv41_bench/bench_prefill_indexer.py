@@ -17,7 +17,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.kernels.deepseek_v41.prefill_indexer.scores import (
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.scores import (
     supports_chunked_prefill,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
@@ -37,8 +37,8 @@ def main():
     parser.add_argument(
         "--modes",
         nargs="+",
-        choices=["baseline", "radix"],
-        default=["baseline", "radix"],
+        choices=["baseline", "streaming"],
+        default=["baseline", "streaming"],
     )
     parser.add_argument(
         "--distribution", choices=["random", "ties", "ascending"], default="random"

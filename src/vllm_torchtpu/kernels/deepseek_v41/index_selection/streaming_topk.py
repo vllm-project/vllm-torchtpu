@@ -1,12 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright 2024-2025 SGLang Team
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Prefill full-row SparseCore radix selection.
+"""Full-row SparseCore streaming top-k over logical key indices.
 
-Adapted from sgl-jax radix_topk/v2/kernel.py, revision
-15081a48747885a12c99d63b70935b529fc41219 (Apache-2.0).
-Changes: logical indices only, forward scanning only, prefill defaults and
-repository interface. No page remapping or decode routing.
+Scan scores in forward order and compact candidates with exact radix selection.
 """
 
 from __future__ import annotations
@@ -21,7 +18,7 @@ from jax.experimental.pallas import tpu_sc as plsc
 
 
 def _ordered_bits(keys: jax.Array) -> jax.Array:
-    """Match v1's FP32 radix ordering, including signed zero."""
+    """Preserve FP32 radix ordering, including signed zero."""
     bits = keys.view(jnp.uint32)
     sign = (bits.view(jnp.int32) >> 31).view(jnp.uint32)
     return bits ^ (sign | jnp.uint32(1 << 31))
@@ -35,7 +32,7 @@ def _ordered_bits(keys: jax.Array) -> jax.Array:
         "reconstruct_threshold",
     ),
 )
-def prefill_radix_topk(
+def streaming_topk(
     scores: jax.Array,
     *,
     valid_lengths: jax.Array | None = None,
@@ -95,7 +92,7 @@ def prefill_radix_topk(
     scratch_bytes = 8 * (capacity + k) + 4 * (block_size + histogram_size + lanes)
     if scratch_bytes > info.vmem_capacity_bytes:
         raise ValueError(
-            f"RadixTopKV2 scratch needs {scratch_bytes} bytes per subcore, "
+            f"Streaming TopK scratch needs {scratch_bytes} bytes per subcore, "
             f"but only {info.vmem_capacity_bytes} bytes are available"
         )
     mesh = plsc.VectorSubcoreMesh(
@@ -121,7 +118,7 @@ def prefill_radix_topk(
             pltpu.SemaphoreType.DMA,
         ),
         compiler_params=pltpu.CompilerParams(needs_layout_passes=False),
-        name="prefill_radix_topk",
+        name="streaming_topk",
     )
     def kernel(scores_ref, lengths_ref, out_indices_ref, *scratch):
         (
@@ -348,4 +345,4 @@ def prefill_radix_topk(
     return result
 
 
-__all__ = ["prefill_radix_topk"]
+__all__ = ["streaming_topk"]

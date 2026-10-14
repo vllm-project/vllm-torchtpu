@@ -1,7 +1,7 @@
 # Chunked prefill indexer
 
 DeepSeek V4.1 v2 defaults to resident-query scoring and full-row SparseCore
-radix selection (`TPU_DEEPSEEK_V41_PREFILL_INDEXER=radix`). Set the selector
+streaming top-k (`TPU_DEEPSEEK_V41_PREFILL_INDEXER=streaming`). Set the selector
 to `baseline` before server startup to compare with the epic implementation.
 The baseline escape hatch is retained during rollout and can be removed after
 default-path qualification.
@@ -20,15 +20,15 @@ a complete score row in HBM until top-k finishes. Radix scan and compaction
 parameters are both 8192. Returned logical indices remain ascending with
 invalid entries padded by -1.
 
-The implementation lives in `kernels/deepseek_v41/prefill_indexer/`:
-`scores.py`, `radix_topk.py` and their local `tuned_block_sizes.py`.
+The implementation lives in `kernels/deepseek_v41/index_selection/`:
+`scores.py`, `streaming_topk.py` and their local `tuned_block_sizes.py`.
 
 Routing uses shapes and live-request metadata, not an explicit phase flag.
 Ordinary decode/DSpark workloads retain existing score/top-k kernels. A single
 request padded to 2048 queries with at most 512 effective keys can take the
 all-indices shortcut even in decode; it does not execute the new scorer or
-radix kernel. This is not a replacement for all prefill shapes or a claim that
-every decode compilation graph is identical.
+streaming top-k kernel. This is not a replacement for all prefill shapes or a
+claim that every decode compilation graph is identical.
 
 The benchmark launcher does not enable this route. It is enabled by the
 runtime default. For A/B runs, use distinct output/cache directories per mode;
