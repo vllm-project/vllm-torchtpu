@@ -201,6 +201,29 @@ class TestPrepareStructuredDecodingInput:
         assert bitmask[1].tolist() == [0, 0]
         assert arange.tolist() == list(range(32))
 
+    def test_contiguous_subslice_with_nonzero_offsets(self):
+        # req0 is in chunk 0; chunk 1 has req1 (unstructured),
+        # req2 & req3 (contiguous structured).
+        manager = make_manager(
+            req_id_to_index={"req0": 0, "req1": 1, "req2": 2, "req3": 3}
+        )
+        grammar_output = make_grammar_output(
+            ["req0", "req2", "req3"],
+            [row(10), row(20), row(30)],
+        )
+        logits = torch.zeros(4, VOCAB_SIZE)
+
+        require, bitmask, _ = manager.prepare_structured_decoding_input(
+            logits, grammar_output, cur_start_idx=1, cur_end_idx=4
+        )
+
+        # local_indices=[1, 2], mask_rows=[1, 2] -> contiguous with l0=1, m0=1
+        assert require[:, 0].tolist() == [False, True, True, False]
+        assert bitmask[0].tolist() == [0, 0]
+        assert bitmask[1].tolist() == row(20)
+        assert bitmask[2].tolist() == row(30)
+        assert bitmask[3].tolist() == [0, 0]
+
     def test_scheduler_order_permutes_batch_order(self):
         # Bitmask rows follow `structured_output_request_ids`, i.e. the
         # scheduler's order. That order is not the runner's batch order:
