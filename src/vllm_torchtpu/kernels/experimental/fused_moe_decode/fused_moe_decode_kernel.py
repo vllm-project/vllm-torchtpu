@@ -25,9 +25,10 @@ TP attention a rank holds whole experts instead of slices and the call is the
 same, restricted to the rank's expert range.
 
 Numerics: hidden states are quantized to FP8 once per call with one scale per
-row; the activated intermediate is quantized per row per expert (per row per
-block in blocked mode); both
-matmuls are FP8 x FP8 with FP32 accumulation into an FP32 VMEM accumulator.
+row per 512 columns, as gmm_v2 quantizes them with the kernel off; the
+activated intermediate likewise per row per 512 columns of the expert (per row
+per block in blocked mode). Both matmuls are FP8 x FP8; each 512-column block's
+partial is scaled and summed in FP32, into an FP32 VMEM accumulator.
 Router top-k stays with the caller.
 
 Derived from moe_dense_expert.py, which targets i % 512 == 0 (EP layouts).
@@ -56,6 +57,11 @@ _N_CHUNK = 512
 # hides more DMA latency when experts are small, but the VMEM it takes lowers
 # the token cap vmem_bytes allows.
 _NUM_BUFFERS = 6
+# Columns per FP8 activation scale: each row of the hidden states (and of the
+# activated intermediate) gets one scale per block of this many columns, the
+# block gmm_v2 uses on the GMM path, so one outlier channel coarsens only its
+# own block. Each block's partial product is scaled before it is summed.
+_Q_BLOCK = 512
 
 
 # The expert loop, plus the layer's shared expert (its TP slice, gated by
@@ -142,9 +148,10 @@ def _kernel(
         blocked mode one unit per slot, with ib in place of i.
       shared_w1_vmem, shared_w1_scale_vmem, shared_w2_vmem,
         shared_w2_scale_vmem: the shared expert, loaded once.
-      xq_ref [m, h] weight_dtype: hidden states quantized per row.
-      xs_ref [m, 2 i] f32: their row scales, repeated over columns
-        ([m, 2 max(ib, i_s)] in blocked mode).
+      xq_ref [m, h] weight_dtype: hidden states quantized per row per
+        _Q_BLOCK columns.
+      xs_ref [h / _Q_BLOCK, m, 128] f32: their scales, one [m, 128] plane per
+        column block, repeated over lanes.
       acc_ref [m, h] f32: this rank's partial sum.
       acc_bf16 [m, h] bf16: the same, as the all-reduce source.
       recv [n, m, c] bf16: all-to-all receive slots, one per sending rank.
@@ -192,10 +199,15 @@ def _kernel(
         copy.start()
 
     acc_ref[...] = jnp.zeros((m, h), jnp.float32)
-    x = x_ref[...].astype(jnp.float32)
-    xsc = jnp.max(jnp.abs(x), axis=1, keepdims=True) / qmax
-    xq_ref[...] = (x * jnp.where(xsc == 0, 0.0, 1.0 / xsc)).astype(weight_dtype)
-    xs_ref[...] = jnp.broadcast_to(xsc, xs_ref.shape)
+    # K blocks lead xs_ref so each block's scales are one contiguous [m, 128]
+    # plane (as in moe_dense_expert.py); K between tokens and lanes relayouts.
+    for k in range(0, h, _Q_BLOCK):
+        x = x_ref[:, k : k + _Q_BLOCK].astype(jnp.float32)
+        xsc = jnp.max(jnp.abs(x), axis=1, keepdims=True) / qmax
+        xq_ref[:, k : k + _Q_BLOCK] = (x * jnp.where(xsc == 0, 0.0, 1.0 / xsc)).astype(
+            weight_dtype
+        )
+        xs_ref[k // _Q_BLOCK] = jnp.broadcast_to(xsc, (m, 128))
     cols = lax.broadcasted_iota(jnp.int32, coeff_ref.shape, 1)
 
     def compact(e, count):
@@ -258,22 +270,51 @@ def _kernel(
         )
         return copies
 
+    def first_matmul(w1):
+        """xq @ w1 ([h, 2 width] ref) in f32, each _Q_BLOCK-row slab of w1
+        against its column block of the hidden states, scaled by that block's
+        row scales before the sum."""
+        acc = None
+        for k in range(0, h, _Q_BLOCK):
+            part = jnp.matmul(
+                xq_ref[:, k : k + _Q_BLOCK],
+                w1[k : k + _Q_BLOCK, :],
+                preferred_element_type=jnp.float32,
+            )
+            xs = xs_ref[k // _Q_BLOCK]
+            part = part * jnp.concatenate([xs] * (part.shape[1] // 128), axis=1)
+            acc = part if acc is None else acc + part
+        return acc
+
     def accumulate(acc1, coeff, w1_scale, w2, w2_scale):
-        """Finish one expert from its first-matmul result acc1 [m, 2 width]:
-        dequantize, SiLU(gate) * up weighted by coeff [m, 1], quantize per row,
-        and add the second matmul with w2 [width, h] into acc_ref."""
+        """Finish one expert from its first-matmul result acc1 [m, 2 width]
+        (x scales applied): dequantize, SiLU(gate) * up weighted by coeff
+        [m, 1], quantize per row per _Q_BLOCK columns, and add the second
+        matmul with w2 [width, h] into acc_ref."""
         width = acc1.shape[1] // 2  # the routed or the shared intermediate size
-        acc1 = acc1 * xs_ref[:, : 2 * width] * w1_scale
+        acc1 = acc1 * w1_scale
         mid = jnp.where(
             coeff != 0, jax.nn.silu(acc1[:, :width]) * acc1[:, width:] * coeff, 0.0
         )
-        ms = jnp.max(jnp.abs(mid), axis=1, keepdims=True) / qmax
-        mq = (mid * jnp.where(ms == 0, 0.0, 1.0 / ms)).astype(weight_dtype)
-        for n in range(0, h, _N_CHUNK):
-            acc2 = jnp.matmul(
-                mq, w2[:, n : n + _N_CHUNK], preferred_element_type=jnp.float32
+        qa = min(_Q_BLOCK, width)
+        blocks = []
+        for k in range(0, width, qa):
+            blk = mid[:, k : k + qa]
+            ms = jnp.max(jnp.abs(blk), axis=1, keepdims=True) / qmax
+            blocks.append(
+                ((blk * jnp.where(ms == 0, 0.0, 1.0 / ms)).astype(weight_dtype), ms)
             )
-            acc_ref[:, n : n + _N_CHUNK] += acc2 * w2_scale[:, n : n + _N_CHUNK] * ms
+        for n in range(0, h, _N_CHUNK):
+            acc2 = None
+            for b, (mq, ms) in enumerate(blocks):
+                part = jnp.matmul(
+                    mq,
+                    w2[b * qa : (b + 1) * qa, n : n + _N_CHUNK],
+                    preferred_element_type=jnp.float32,
+                )
+                part = part * ms
+                acc2 = part if acc2 is None else acc2 + part
+            acc_ref[:, n : n + _N_CHUNK] += acc2 * w2_scale[:, n : n + _N_CHUNK]
 
     # Prime the weight ring: start the weight transfers of the first
     # min(units, nb) ring units (active experts, or their blocks) into slots
@@ -294,9 +335,7 @@ def _kernel(
         copy.wait()
     shared_coeff = jnp.max(shared_gate_ref[...], axis=1, keepdims=True)
     accumulate(
-        jnp.matmul(
-            xq_ref[...], shared_w1_vmem[...], preferred_element_type=jnp.float32
-        ),
+        first_matmul(shared_w1_vmem),
         shared_coeff,
         shared_w1_scale_vmem[...],
         shared_w2_vmem,
@@ -316,9 +355,7 @@ def _kernel(
                 for copy in transfers(nxt):
                     copy.wait()
 
-            acc1_next = jnp.matmul(
-                xq_ref[...], w1_ring[nxt % nb], preferred_element_type=jnp.float32
-            )
+            acc1_next = first_matmul(w1_ring.at[nxt % nb])
             slot = step % nb
             e = ids_ref[step] if ib is None else ids_ref[step // nblk]
             coeff = jnp.sum(
@@ -339,7 +376,7 @@ def _kernel(
             0,
             units,
             expert_body,
-            jnp.matmul(xq_ref[...], w1_ring[0], preferred_element_type=jnp.float32),
+            first_matmul(w1_ring.at[0]),
         )
 
     def all_to_all_sum(send_slice, dst):
@@ -430,7 +467,7 @@ def _unit_bytes(h, width, wt):
     return 3 * h * width * wt + (2 * width + h) * 4
 
 
-def _token_side_bytes(m, h, i_s, xs_width, experts, n_ranks, wt):
+def _token_side_bytes(m, h, i_s, experts, n_ranks, wt):
     """Everything the call declares but the routed weight ring: the shared
     expert and the token-proportional buffers."""
     f32, bf16 = 4, 2
@@ -441,7 +478,7 @@ def _token_side_bytes(m, h, i_s, xs_width, experts, n_ranks, wt):
         + 128 * f32  # shared gate
         + h * bf16  # output
         + h * wt  # quantized hidden
-        + xs_width * f32  # row scales, broadcast
+        + (h // _Q_BLOCK) * 128 * f32  # per-block row scales, over lanes
         + h * f32  # accumulator
         + h * bf16  # accumulator in bf16, the all-reduce source
         + n_ranks * (h // n_ranks) * bf16  # all-to-all receive slots
@@ -479,7 +516,7 @@ def plan_weight_ring(m, h, i, i_s, experts, n_ranks, weight_dtype, i_block=None)
             capacity
             - _VMEM_RESERVE
             - live
-            - _token_side_bytes(m, h, i_s, 2 * max(w, i_s), experts, n_ranks, wt)
+            - _token_side_bytes(m, h, i_s, experts, n_ranks, wt)
         )
         return free // _unit_bytes(h, w, wt)
 
@@ -494,9 +531,8 @@ def vmem_bytes(tokens, h, i, i_s, experts, n_ranks, weight_dtype):
     m = tokens + (-tokens) % 16
     wt = jnp.dtype(weight_dtype).itemsize
     ib, nb = plan_weight_ring(m, h, i, i_s, experts, n_ranks, weight_dtype)
-    xs_width = 2 * i if ib is None else 2 * max(ib, i_s)
     return nb * _unit_bytes(h, i if ib is None else ib, wt) + _token_side_bytes(
-        m, h, i_s, xs_width, experts, n_ranks, wt
+        m, h, i_s, experts, n_ranks, wt
     )
 
 
@@ -567,10 +603,13 @@ def fused_moe_decode(
         plan_weight_ring picks it for experts too large to stream whole.
 
     The weights' dtype (FP8 in production) is also the dtype the kernel
-    quantizes the hidden states and the activated intermediate to, so both
-    matmuls run in it with FP32 accumulation.
+    quantizes the hidden states and the activated intermediate to (one scale
+    per row per 512 columns), so both matmuls run in it with FP32
+    accumulation. The hidden size must be a multiple of 512.
     """
     tokens, h = hidden.shape
+    if h % _Q_BLOCK:
+        raise ValueError(f"hidden size {h} must be a multiple of {_Q_BLOCK}")
     if scatter_rows and tokens % n_ranks:
         raise ValueError(f"scatter_rows needs tokens % n_ranks == 0; got {tokens}")
     rows = tokens // n_ranks if scatter_rows else None
@@ -648,7 +687,7 @@ def fused_moe_decode(
                 pltpu.VMEM((i_s, h), weight_dtype),
                 pltpu.VMEM((1, h), jnp.float32),
                 pltpu.VMEM((m, h), weight_dtype),
-                pltpu.VMEM((m, 2 * (i if ib is None else max(ib, i_s))), jnp.float32),
+                pltpu.VMEM((h // _Q_BLOCK, m, 128), jnp.float32),
                 pltpu.VMEM((m, h), jnp.float32),
                 pltpu.VMEM(acc_bf16_shape, wire),
                 pltpu.VMEM(recv_shape, wire),

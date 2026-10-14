@@ -125,9 +125,11 @@ arms only with TP attention (DP 1).
   accumulator. The choice depends on expert size only, so Qwen3.5 and GLM-5.2
   TP keep whole experts and the unchanged program. The kernel name ends in
   `-ib_<ib>`.
-- **Numerics.** Hidden states are quantized once per row, and the activated
-  intermediate per row per expert (per row per block in blocked mode). Both matmuls run in the weight dtype (FP8)
-  with FP32 accumulation into one VMEM accumulator.
+- **Numerics.** Hidden states and the activated intermediate are quantized to
+  FP8 with one scale per row per 512 columns, the block `gmm_v2` uses with the
+  kernel off (in blocked mode the intermediate per row per block). Each block's
+  partial product is scaled and summed in FP32, into one VMEM accumulator.
+  The hidden size must be a multiple of 512.
 - **Shared expert in-kernel.** Its slice is loaded once at entry and computed
   first, gated by `sigmoid(x · w_g)` or ungated.
 - **In-kernel all-reduce.** A direct all-to-all with a local sum over column
