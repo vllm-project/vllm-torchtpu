@@ -227,9 +227,7 @@ def main() -> None:
         "torchtpu": source_identity(
             here.parents[2],
             "vllm-torchtpu",
-            build_commit=(
-                env.get("BUILDKITE_COMMIT") if env.get("BUILDKITE") == "true" else None
-            ),
+            build_commit=env.get("BUILDKITE_COMMIT"),
         ),
         "vllm": source_identity(Path(vllm.__file__).resolve().parent, "vllm"),
         "model": str(model.resolve()),
