@@ -606,7 +606,7 @@ def _run_engine_core_with_tpu_patches(*args, **kwargs):
 
 
 def _patch_vllm_offloading_config_build() -> None:
-    """Adapt vLLM's OffloadingConfig construction to TPU PCP.
+    """Adapt vLLM's OffloadingConfig construction to TPU PCP and DCP.
 
     ``build_offloading_config`` scales each group's ``tokens_per_block`` by
     DCP only (it records ``pcp_size`` in the parallel config but never
@@ -618,21 +618,99 @@ def _patch_vllm_offloading_config_build() -> None:
     hybrid configs ``build_offloading_config`` trips its own
     ``tokens_per_block % tokens_per_hash`` assert (the PCP-patched resolve
     returns logical hash sizes while the group sizes stay rank-local).
+
+    Under DCP, older vLLM scales a group's ``tokens_per_block`` only when its
+    spec is an ``AttentionSpec``. A model whose layers mix cache shapes in one
+    group (GLM-5.2: MLA latent + sparse indexer K, a
+    ``UniformTypeKVCacheSpecs``) keeps the rank-local block size while
+    ``tokens_per_hash`` is ``block_size * dcp``, so the build asserts at engine
+    init. Every attention leaf is DCP-sharded on TPU, so such groups span
+    ``block_size * dcp`` tokens as well.
     """
+    import math
     import sys
     from dataclasses import replace
 
     from vllm.distributed.kv_transfer.kv_connector.v1.offloading import (
         config as offloading_config_module,
     )
+    from vllm.v1.kv_cache_interface import AttentionSpec, UniformTypeKVCacheSpecs
 
     if getattr(offloading_config_module, "_tpu_offloading_config_patch", False):
         return
 
     original_build = offloading_config_module.build_offloading_config
 
+    def _dcp_sharded(spec) -> bool:
+        if isinstance(spec, UniformTypeKVCacheSpecs):
+            return all(
+                isinstance(leaf, AttentionSpec) for leaf in spec.kv_cache_specs.values()
+            )
+        return isinstance(spec, AttentionSpec)
+
+    def build_offloading_config_dcp(vllm_config, kv_cache_config, dcp):
+        # Let the original build pass its block/hash assert with a hash unit
+        # that divides every rank-local group size, then restate each
+        # DCP-sharded group at its logical span and restore the real
+        # tokens_per_hash.
+        from vllm.v1.core import kv_cache_utils
+
+        _, tokens_per_hash = kv_cache_utils.resolve_kv_cache_block_sizes(
+            kv_cache_config, vllm_config
+        )
+        local_unit = math.gcd(
+            tokens_per_hash,
+            *(g.kv_cache_spec.block_size for g in kv_cache_config.kv_cache_groups),
+        )
+        saved_resolve = offloading_config_module.resolve_kv_cache_block_sizes
+
+        def resolve_local(kv_cache_config, vllm_config):
+            scheduler_block_size, _ = saved_resolve(kv_cache_config, vllm_config)
+            return scheduler_block_size, local_unit
+
+        offloading_config_module.resolve_kv_cache_block_sizes = resolve_local
+        try:
+            config = original_build(vllm_config, kv_cache_config)
+        finally:
+            offloading_config_module.resolve_kv_cache_block_sizes = saved_resolve
+
+        specs_by_layers = {
+            tuple(g.layer_names): g.kv_cache_spec
+            for g in kv_cache_config.kv_cache_groups
+        }
+        groups = []
+        for group in config.groups:
+            spec = specs_by_layers[tuple(group.layer_names)]
+            tokens_per_block = spec.block_size * (dcp if _dcp_sharded(spec) else 1)
+            groups.append(replace(group, tokens_per_block=tokens_per_block))
+        for group in groups:
+            assert group.tokens_per_block % tokens_per_hash == 0, (
+                f"tokens_per_block={group.tokens_per_block} not "
+                f"divisible by tokens_per_hash={tokens_per_hash} after "
+                f"DCP scaling (dcp={dcp})"
+            )
+        blocks_per_chunk = config.cache.blocks_per_chunk
+        tokens_per_chunk = config.extra_config.get("block_size")
+        if tokens_per_chunk is not None:
+            # The original sized chunks against the rank-local block.
+            assert len({g.tokens_per_block for g in groups}) == 1
+            assert int(tokens_per_chunk) % groups[0].tokens_per_block == 0
+            blocks_per_chunk = int(tokens_per_chunk) // groups[0].tokens_per_block
+        return replace(
+            config,
+            groups=tuple(groups),
+            cache=replace(
+                config.cache,
+                tokens_per_hash=tokens_per_hash,
+                blocks_per_chunk=blocks_per_chunk,
+            ),
+        )
+
     def build_offloading_config_tpu(vllm_config, kv_cache_config):
         pcp = vllm_config.parallel_config.prefill_context_parallel_size
+        dcp = vllm_config.parallel_config.decode_context_parallel_size
+        if pcp <= 1 and dcp > 1:
+            return build_offloading_config_dcp(vllm_config, kv_cache_config, dcp)
         if pcp <= 1:
             return original_build(vllm_config, kv_cache_config)
 
@@ -687,7 +765,7 @@ def _patch_vllm_offloading_config_build() -> None:
     if connector_module is not None:
         connector_module.build_offloading_config = build_offloading_config_tpu
 
-    logger.info("Applied TPU patch: PCP-aware OffloadingConfig build.")
+    logger.info("Applied TPU patch: CP-aware OffloadingConfig build.")
 
 
 def _patch_vllm_kimi_kda_layer_counts() -> None:
