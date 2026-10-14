@@ -56,7 +56,7 @@ esac
 
 # Docker Hub gets a release only from a build someone approved. A scheduled
 # nightly of a release branch skips the approval step, so it stops at GAR.
-if [[ "${BRANCH}" == releases/* ]] && ! buildkite-agent meta-data exists dockerhub_move_latest; then
+if [[ "${BRANCH}" == releases/v* ]] && ! buildkite-agent meta-data exists dockerhub_move_latest; then
   PUBLISH_DOCKERHUB=0
 fi
 if [[ "${PUBLISH_DOCKERHUB}" == "1" ]]; then
@@ -64,7 +64,7 @@ if [[ "${PUBLISH_DOCKERHUB}" == "1" ]]; then
   DOCKERHUB_USERNAME="${DOCKERHUB_USERNAME:?DOCKERHUB_USERNAME must be set when PUBLISH_DOCKERHUB=1}"
   MOVE_LATEST="yes"
   OVERWRITE="no"
-  if [[ "${BRANCH}" == releases/* ]]; then
+  if [[ "${BRANCH}" == releases/v* ]]; then
     DOCKERHUB_TARGET="prod"
     # RELEASE_VERSION (e.g. v0.29.0rc1, set on New Build) publishes a
     # pre-release under its own tag instead of vX.Y.Z. GAR keeps the branch
@@ -121,7 +121,7 @@ if [[ "${PUBLISH_DOCKERHUB}" == "1" ]]; then
 
   # Released tags are immutable unless the approver chose to overwrite.
   # Checked before the build, so a refused release builds nothing.
-  if [[ "${BRANCH}" == releases/* && "${OVERWRITE}" != "yes" ]] \
+  if [[ "${BRANCH}" == releases/v* && "${OVERWRITE}" != "yes" ]] \
     && DOCKER_CONFIG="${DOCKERHUB_CONFIG}" docker manifest inspect "${DOCKERHUB_REPO}:${DOCKERHUB_TAG}" >/dev/null 2>&1; then
     echo "ERROR: ${DOCKERHUB_REPO}:${DOCKERHUB_TAG} already exists; choose Overwrite in the approval step to replace it." >&2
     exit 1
