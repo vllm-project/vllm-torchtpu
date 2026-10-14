@@ -247,8 +247,21 @@ class SweepOrchestrator:
                 )
                 continue
 
-            # 1. Resolve target model checkpoint dynamically
-            target_model, consumed_keys = self._resolve_model(current_config)
+            # 1. Resolve target model checkpoint dynamically. A resolver
+            # failure (bad config, failed splice or calibration) is recorded
+            # like a runner failure so sweep.json never stays RUNNING.
+            try:
+                target_model, consumed_keys = self._resolve_model(
+                    current_config)
+            except Exception as e:
+                error_message = f"{type(e).__name__}: {e}"
+                self.recorder.record_failure(
+                    dict(current_config), error_message,
+                    f"python3 run_sweep_orchestrator.py --config "
+                    f"{self.config_path}")
+                self.recorder.finalize(status="FAILED",
+                                       error_message=error_message)
+                raise
 
             # 2. Build normalized ExecutionContext
             combined_metadata = {**current_config}
