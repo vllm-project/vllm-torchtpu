@@ -15,10 +15,8 @@
 
 # Kimi-K3 megakernel recipe pruned point h of the Oct 13 set: concurrency 48;
 # decode admits 64 sequences, no speculation, DCP32; decode-host store servers.
-# The doc lists this point without a serve command: recipe-base.sh serves it as
-# the DP2 points' decode without attention DP, on DCP32 with the DSpark decode's
-# 18 GiB of KV cache, and the DP2 points' prefill without the reshard. See
-# ../kimi-k3-megakernel/recipe-base.sh.
+# The DP2 points' prefill and decode, with the transfer keeping DCP32 and the
+# decode without attention DP. See ../kimi-k3-megakernel/recipe-base.sh.
 
 # shellcheck disable=SC2034  # read by recipe-base.sh
 RECIPE_SET=oct13

@@ -83,8 +83,8 @@ case "$RECIPE_DECODE" in
      return 2 ;;
 esac
 # The decodes without speculation: attention DP2 x DCP16, or plain DCP32 (the
-# Oct 13 set's pruned point h, which the doc lists without a serve command;
-# it is the DP2 decode's arguments on the DSpark decode's DCP32 layout).
+# doc's pruned point h: the DP2 points' prefill and decode, with the transfer
+# keeping DCP32 and the decode without attention DP).
 _no_spec=0
 case "$RECIPE_DECODE" in dp2_dcp16|dcp32) _no_spec=1 ;; esac
 case "${RECIPE_SET:-}" in
@@ -251,15 +251,15 @@ fi
 
 # ---- per-role environment (all points) -----------------------------------------
 # The doc's ${USER} cache names; a pod has no USER.
-_cache_user="${USER:-k3mk}"
+_cache_user="${USER:-k3}"
 export HF_MODULES_CACHE="$HF_HOME_DIR/modules-$_role"
 export TPU_RAIDEN_JOB_NAME="k3-mk-0-$_role"
 export TPU_RAIDEN_ENGINE_ID="k3-mk-0-$_role-engine"
 export VLLM_XLA_CACHE_PATH="$CACHE_ROOT/$_role"
 export VLLM_CACHE_ROOT="$CACHE_ROOT/$_role/vllm-runtime"
 export VLLM_CONFIG_ROOT="$CACHE_ROOT/$_role/vllm-config"
-export TORCH_TPU_TIER2_COMPILATION_CACHE="${_cache_user}_k3_$_role"
-export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE="${_cache_user}_k3_$_role"
+export TORCH_TPU_TIER2_COMPILATION_CACHE="${_cache_user}_k3mk_$_role"
+export TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE="${_cache_user}_k3mk_$_role"
 export TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT="$CACHE_ROOT/$_role/torch_tpu_tier3"
 if [ "$_role" = prefill ]; then
   export TPU_K3_MOE_REDUCE_DTYPE=bfloat16
@@ -337,11 +337,11 @@ if [ "$_role" = prefill ]; then
       "$(_offload_connector 27800)")
     _kv_cache_bytes=23622320128
   elif [ "$RECIPE_DECODE" = dcp32 ]; then
-    # Point h: no draft, and the transfer keeps DCP32.
+    # Point h: the DP2 points' prefill, except that the transfer keeps DCP32.
     _loader=$(printf '{"presharded":"%s"}' "$PRESHARDED_DIR")
     _kv=$(_multi_connector kv_producer \
       "{${_raiden},\"kv_role\":\"kv_producer\"}" "$(_offload_connector 27800)")
-    _kv_cache_bytes=19327352832
+    _kv_cache_bytes=23622320128
   else
     # Every DSpark point: the same prefill.
     _loader=$(printf '{"presharded":"%s","draft":"%s"}' "$PRESHARDED_DIR" "$DSPARK_DIR")
@@ -372,12 +372,13 @@ elif [ "$RECIPE_DECODE" = dp2_dcp16 ]; then
     --kv-transfer-config "{${_raiden},\"kv_role\":\"kv_consumer\"}"
   )
 elif [ "$RECIPE_DECODE" = dcp32 ]; then
+  # Point h: the DP2 points' decode on DCP32, without attention DP.
   _loader=$(printf '{"presharded":"%s"}' "$PRESHARDED_DIR")
   ROLE_ARGS=(
     --decode-context-parallel-size 32
     --load-format megakernel --model-loader-extra-config "$_loader"
     --max-num-seqs "$RECIPE_DECODE_MAX_NUM_SEQS" --max-num-batched-tokens 512
-    --kv-cache-memory-bytes 19327352832
+    --kv-cache-memory-bytes 30064771072
     --kv-transfer-config "{${_raiden},\"kv_role\":\"kv_consumer\"}"
   )
 else
