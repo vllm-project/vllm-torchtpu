@@ -188,6 +188,15 @@ DSPARK_DIR="$HF_HUB_CACHE_DIR/models--RedHatAI--Kimi-K3-speculator.dspark/snapsh
 export PYTHONPATH="$PLUGIN_SRC"
 export PYTHONNOUSERSITE=1
 export PYTHONUNBUFFERED=1
+# The engine image preloads gperftools tcmalloc, which keeps freed pages in its
+# heap rather than returning them to the OS. Without this the weight load's
+# buffers stay resident once the weights are in HBM: ~52-54 GiB of private
+# memory per worker, ~410-450 GiB a host before any KV store. Returning pages
+# as they are freed halves that, ~200 GiB a host back, at no measurable serving
+# cost: point d-c24 served 890 against 891 out tok/s with TPOT p50 11.07
+# against 11.09 ms (vllm-torchtpu-dev builds 601 and 599). Engine init runs
+# ~5% longer.
+export TCMALLOC_AGGRESSIVE_DECOMMIT=true
 # vLLM's Rust frontend, which the engine image carries from #1884 on.
 export VLLM_USE_RUST_FRONTEND=1
 export VLLM_RUST_FRONTEND_PATH=/usr/local/bin/vllm-rs
