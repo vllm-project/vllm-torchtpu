@@ -164,6 +164,34 @@ def _floor_divmod_const(x: jax.Array, d: int) -> tuple[jax.Array, jax.Array]:
     return q, r
 
 
+# murmur3 fmix32 multipliers as wrapping int32.
+_FMIX32_C1 = np.uint32(0x85EBCA6B).view(np.int32).item()
+_FMIX32_C2 = np.uint32(0xC2B2AE35).view(np.int32).item()
+
+
+def scatter_padding_slots(
+    flat_element_index: jax.Array, total_num_pages: int, page_size: int
+) -> tuple[jax.Array, jax.Array]:
+    """Hashes flat slot indices to spread-out (page, offset) for -1 padding.
+
+    murmur3 fmix32 on int32; shared by the Pallas kernel and XLA so both match."""
+    h = flat_element_index.astype(jnp.int32)
+    h = h ^ lax.shift_right_logical(h, jnp.int32(16))
+    h = h * jnp.int32(_FMIX32_C1)
+    h = h ^ lax.shift_right_logical(h, jnp.int32(13))
+    h = h * jnp.int32(_FMIX32_C2)
+    h = h ^ lax.shift_right_logical(h, jnp.int32(16))
+    # Top 23 bits feed the page: non-negative and exact for the f32 divmod.
+    _, page = _floor_divmod_const(
+        lax.shift_right_logical(h, jnp.int32(9)), total_num_pages
+    )
+    if page_size & (page_size - 1) == 0:
+        offset = h & jnp.int32(page_size - 1)
+    else:
+        _, offset = _floor_divmod_const(h & jnp.int32((1 << 23) - 1), page_size)
+    return page, offset
+
+
 def _capped_window_indices_kernel(
     live_windows_ref,  # i32[1] (scalar prefetch; sizes the grid)
     windows_ref,  # i32[block_tokens, padded_pps] page-table row per token
@@ -182,7 +210,7 @@ def _capped_window_indices_kernel(
 
     Executes on TPU vector cores for a single (window `w`, chunk `c`, tile `tb`).
     - Valid slots: looks up their physical page in the page table.
-    - Empty slots (-1): hashes them to pseudo-random physical rows using primes
+    - Empty slots (-1): hashes them to pseudo-random physical rows
       to prevent memory bank conflicts on SparseCore during gathering."""
     del live_windows_ref
     w = pl.program_id(0)
@@ -210,7 +238,6 @@ def _capped_window_indices_kernel(
 
     # 3. Handle empty padding slots (-1) with pseudo-random scattering.
     # If all -1s read row 0, SparseCore would bottleneck on memory bank 0.
-    # Multiplying unique slot coordinates by large primes hashes -1s uniformly.
     row = (
         c * chunk_size
         + tb * block_tokens
@@ -219,10 +246,9 @@ def _capped_window_indices_kernel(
     col = w * topk_cap + lax.broadcasted_iota(jnp.int32, idx.shape, 1)
     flat_element_index = row * topk + col
 
-    _, scattered_page = _floor_divmod_const(
-        flat_element_index * 104729, total_num_pages
+    scattered_page, scattered_offset = scatter_padding_slots(
+        flat_element_index, total_num_pages, page_size
     )
-    _, scattered_offset = _floor_divmod_const(flat_element_index * 15485863, page_size)
 
     # Use the real page/offset for valid slots; use scattered values for -1 padding.
     page = jnp.where(is_padding, scattered_page, page)
@@ -1405,14 +1431,17 @@ def prepare_gather_indices(
         )
 
         # Scatter "-1" padding across the cache to avoid read hot spots.
-        scattered_page_ids = (flat_element_index * 104729) % total_num_pages
-        scattered_token_offset = (flat_element_index * 15485863) % page_size
+        scattered_page_ids, scattered_token_offset = scatter_padding_slots(
+            flat_element_index, total_num_pages, page_size
+        )
         page_ids = jnp.where(is_padding, scattered_page_ids, page_ids)
         token_offset = jnp.where(is_padding, scattered_token_offset, token_offset)
         physical_indices = page_ids * page_size + token_offset
     else:
-        total_tokens = total_num_pages * page_size
-        scattered_physical = (flat_element_index * 15485863) % total_tokens
+        scattered_page_ids, scattered_token_offset = scatter_padding_slots(
+            flat_element_index, total_num_pages, page_size
+        )
+        scattered_physical = scattered_page_ids * page_size + scattered_token_offset
         physical_indices = jnp.where(is_padding, scattered_physical, topk_indices)
 
     physical_indices = physical_indices.astype(jnp.int32)
