@@ -50,8 +50,6 @@ from typing import Any, cast
 
 from vllm.logger import init_logger
 
-from vllm_torchtpu import envs
-
 logger = init_logger(__name__)
 
 
@@ -117,12 +115,11 @@ class _WaveState:
         lacks, counting the pushes as later steps for the waits that
         follow. With lazy pushes the engine core sends the pushes, and a
         wait settles."""
-        # With one or two stages every launch pairs on its own: stage 1's
-        # launch before forward m is stage 0's launch after it. The settle
-        # still goes out when stage 0 launches from a helper thread: it is
-        # where a launch that failed there is raised (pp_wave.settle).
-        if not self.open or (self.stages <= 2 and not envs.TPU_PP_ASYNC_HANDOFF):
+        if not self.open:
             return
+        # Two stages need no pushes because stage 0's post-forward launch
+        # pairs directly with stage 1's pre-forward launch, but they still
+        # settle so stage 0 issues its queued hand-off and surfaces errors.
         if self.lazy or real_step == self.real_steps:
             self.settle(executor)
             return

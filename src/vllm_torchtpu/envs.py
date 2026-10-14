@@ -94,7 +94,6 @@ if TYPE_CHECKING:
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
     TPU_PP_LAZY_PUSH: bool = False
-    TPU_PP_ASYNC_HANDOFF: bool = False
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
@@ -784,10 +783,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # the pipeline only when stage 0 would otherwise idle and drops empty
     # steps, so requests share the pipeline (core/pp_lazy_step.py).
     "TPU_PP_LAZY_PUSH": env_bool("TPU_PP_LAZY_PUSH", default=False),
-    # The first pipeline stage drains the slice and launches its hand-off
-    # on a helper thread, so the worker thread prepares the next step while
-    # the forward runs (distributed/pp_wave.py).
-    "TPU_PP_ASYNC_HANDOFF": env_bool("TPU_PP_ASYNC_HANDOFF", default=False),
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE": env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
     # Under TPU_PARALLEL_PRECOMPILE, take a subgraph's ranges biggest first,

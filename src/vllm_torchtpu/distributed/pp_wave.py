@@ -81,32 +81,46 @@ running at the same time, a core of the stage stops inside a stage collective
 and the runtime halts the device. A one-chip stage never showed this and
 launches the hand-off without waiting.
 
-The first stage launches after its forward, so that drain holds its worker
-thread until the forward has finished, and the host work of the next step
-(scheduler output, KV-connector registrations, input staging) starts only
-then, while the device idles. With ``TPU_PP_ASYNC_HANDOFF`` the first stage
-hands the drain and the launch to a helper thread and ``end_forward``
-returns at once; the worker thread prepares the next step while the forward
-runs. Its next ``start_forward`` waits for that launch and for the hand-off
-to complete, so no stage collective is dispatched while the hand-off runs.
-Pushes and settles keep the launch order: they wait for the queued launch
-first, and a settle on the first stage waits for it even when it issues no
-launch of its own, so a launch that failed on the helper thread is raised
-at the engine's next wait; on a two-stage pipeline the engine sends that
-settle only with the knob on (``pp_push``), since its launches otherwise
-pair by themselves.
+Stage 0 launches its hand-off in end_forward, after its forward. On a
+multi-chip stage that must drain before each hand-off, draining on the worker
+thread would block host preparation for the next step (scheduling,
+KV-connector setup, input staging) until the forward pass finishes on the
+device. Stage 0 therefore offloads the drain to a background helper thread:
+- end_forward flushes the outgoing tensors, records a device fence, and queues
+  the hand-off so the worker thread can immediately prepare the next step.
+- The helper thread only waits on the fence and the slice barrier; it never
+  traces ops while the worker thread is inside a runner step, because flushing
+  from another thread could split the lazy graph at different points across
+  ranks.
+- Once drained, the helper launches the hand-off immediately if the worker
+  thread is between runner calls. If the worker thread is inside a step, the
+  worker issues the queued launch itself at the next start_forward, push, or
+  settle. Either way the launch goes out without a further engine action,
+  which pp_push's accounting relies on: it counts stage 0's launch as issued
+  once execute_model returns and may wait without sending a push.
+- Before starting its next forward, stage 0 explicitly waits for the previous
+  hand-off to finish on the device, since stage 0 does not read the received
+  buffers and has no data dependency to order the forward behind the hand-off.
+- Pushes and settles always issue any queued hand-off first. Even on a
+  two-stage pipeline where stage 0 issues no settle launches of its own, settle
+  waits on the helper thread so any drain or launch failure is raised at the
+  engine's next wait.
 """
 
 import threading
-from typing import Any
+from collections.abc import Iterator
+from contextlib import contextmanager
+from typing import TYPE_CHECKING, Any
 
 import torch
 from vllm.sequence import IntermediateTensors
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.pp_shift import get_or_create_pp_mesh, pp_permute_op
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
+
+if TYPE_CHECKING:
+    from torch_tpu._internal.stream.streams import TpuEvent
 
 logger = init_logger(__name__)
 
@@ -137,15 +151,17 @@ def stage_chips() -> int:
     return sum(1 for chip in topology.chips if device_ids & set(chip))
 
 
-def _drain_slice() -> None:
-    """Waits for this device to go idle, then for every worker of the slice
-    to reach the same point, so no stage program is running anywhere when
-    the hand-off is launched."""
+def _drain_slice(fence: "TpuEvent | None" = None) -> None:
+    """Waits for local device work (or the given fence) to complete, then joins
+    the slice barrier so no stage forward is running when the hand-off starts."""
     import torch.distributed as dist
     from torch_tpu._internal.sync import sync
     from vllm.distributed.parallel_state import get_world_group
 
-    sync.synchronize(None, wait=True)
+    if fence is None:
+        sync.synchronize(None, wait=True)
+    else:
+        fence.synchronize()
     dist.barrier(group=get_world_group().cpu_group)
 
 
@@ -154,7 +170,7 @@ def _launch_now(op, carried: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ..
 
     vLLM runs torch_tpu in fused-eager mode, where ops are deferred, fused
     with their neighbours and submitted only when a result is read. Pending
-    producers are flushed first, then the launch alone; neither flush waits.
+    ops are flushed first, then the launch alone; neither flush waits.
     """
     from torch_tpu._internal.sync import sync
 
@@ -166,17 +182,26 @@ def _launch_now(op, carried: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ..
 
 
 def _flush(tensors: tuple[torch.Tensor, ...]) -> None:
-    """Submits the pending producers of ``tensors`` without waiting."""
+    """Submits the pending ops producing ``tensors`` without blocking."""
     from torch_tpu._internal.sync import sync
 
     sync.synchronize(list(tensors), wait=False)
 
 
 def _wait(tensors: tuple[torch.Tensor, ...]) -> None:
-    """Waits until ``tensors`` are materialized on the device."""
+    """Blocks until ``tensors`` are materialized on the device."""
     from torch_tpu._internal.sync import sync
 
     sync.synchronize(list(tensors), wait=True)
+
+
+def _fence() -> "TpuEvent":
+    """Records a device event for all work submitted so far."""
+    from torch_tpu._internal.stream.streams import TpuEvent
+
+    event = TpuEvent()
+    event.record()
+    return event
 
 
 class PPWave:
@@ -219,15 +244,21 @@ class PPWave:
         # See the module docstring.
         self.drain_before_handoff = stage_chips() > 1
         self.async_handoff = (
-            bool(envs.TPU_PP_ASYNC_HANDOFF) and self.rank == 0 and self.size > 1
+            self.rank == 0 and self.size > 1 and self.drain_before_handoff
         )
-        # At most one launch is ever queued: the next start_forward, push
-        # or settle waits for it before anything else is launched.
+        # State for at most one in-flight async hand-off on stage 0, moving from
+        # queued (_async_queued) to draining (_async_busy), drained
+        # (_async_drained), issuing (_async_issuing), and completed (_async_out).
         self._async_cv = threading.Condition()
-        self._async_carried: tuple[torch.Tensor, ...] | None = None
+        self._async_queued: tuple[tuple[torch.Tensor, ...], TpuEvent | None] | None = (
+            None
+        )
         self._async_busy = False
+        self._async_drained: tuple[torch.Tensor, ...] | None = None
+        self._async_issuing = False
         self._async_out: tuple[torch.Tensor, ...] | None = None
         self._async_error: BaseException | None = None
+        self._in_step = 0
         self._async_thread: threading.Thread | None = None
         self.zeros = tuple(
             torch.zeros(
@@ -266,20 +297,40 @@ class PPWave:
             return _launch_now(self.op, carried)
 
     def _launch(self, carried: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
-        self._async_wait()
+        self._issue_queued()
         out = self._launch_blocking(carried)
         self.launches += 1
         self.burst_launches += 1
         return out
 
     def _async_idle(self) -> bool:
-        return self._async_carried is None and not self._async_busy
+        return (
+            self._async_queued is None
+            and not self._async_busy
+            and self._async_drained is None
+            and not self._async_issuing
+            and self._async_out is None
+        )
+
+    @contextmanager
+    def step(self) -> Iterator[None]:
+        """Marks a worker-thread region that traces device ops so the helper
+        thread does not launch a hand-off concurrently."""
+        with self._async_cv:
+            self._async_cv.wait_for(lambda: not self._async_issuing)
+            self._in_step += 1
+        try:
+            yield
+        finally:
+            with self._async_cv:
+                self._in_step -= 1
+                self._async_cv.notify_all()
 
     def _launch_async(self, carried: tuple[torch.Tensor, ...]) -> None:
-        """Counts the launch and has the helper thread issue it once the
-        device is idle. The producers of ``carried`` are submitted here, so
-        the helper only waits and launches."""
+        """Flushes the outgoing tensors and queues the drain on the helper
+        thread; the hand-off is issued by whichever thread is free first."""
         _flush(carried)
+        fence = _fence() if self.drain_before_handoff else None
         self.launches += 1
         self.burst_launches += 1
         if self._async_thread is None:
@@ -289,53 +340,87 @@ class PPWave:
             self._async_thread.start()
         with self._async_cv:
             self._async_cv.wait_for(self._async_idle)
-            self._async_carried = carried
+            self._async_queued = (carried, fence)
             self._async_cv.notify_all()
 
     def _async_loop(self) -> None:
         while True:
             with self._async_cv:
-                self._async_cv.wait_for(lambda: self._async_carried is not None)
-                carried = self._async_carried
-                assert carried is not None
-                self._async_carried = None
+                self._async_cv.wait_for(lambda: self._async_queued is not None)
+                queued = self._async_queued
+                assert queued is not None
+                carried, fence = queued
+                self._async_queued = None
                 self._async_busy = True
-            out: tuple[torch.Tensor, ...] | None = None
             error: BaseException | None = None
             try:
-                out = self._launch_blocking(carried)
-            except BaseException as exc:  # raised again on the worker thread
+                if self.drain_before_handoff:
+                    with TraceAnnotation("PP:Drain"):
+                        _drain_slice(fence)
+            except BaseException as exc:  # re-raised on the worker thread
+                logger.exception(
+                    "PP wave rank %d: the hand-off thread failed to drain",
+                    self.rank,
+                )
+                error = exc
+            with self._async_cv:
+                self._async_busy = False
+                if error is not None:
+                    self._async_error = error
+                    self._async_cv.notify_all()
+                    continue
+                self._async_drained = carried
+                self._async_cv.notify_all()
+                # Launch immediately if the worker thread is outside a step;
+                # otherwise leave it for the worker's next launch point.
+                self._async_cv.wait_for(
+                    lambda: self._async_drained is None or self._in_step == 0
+                )
+                if self._async_drained is None:
+                    continue
+                self._async_drained = None
+                self._async_issuing = True
+            out: tuple[torch.Tensor, ...] | None = None
+            try:
+                with TraceAnnotation("PP:Handoff"):
+                    out = _launch_now(self.op, carried)
+            except BaseException as exc:  # re-raised on the worker thread
                 logger.exception(
                     "PP wave rank %d: the hand-off thread failed to launch",
                     self.rank,
                 )
                 error = exc
             with self._async_cv:
-                self._async_busy = False
+                self._async_issuing = False
                 self._async_out = out
                 if error is not None:
                     self._async_error = error
                 self._async_cv.notify_all()
 
-    def _async_wait(self) -> tuple[torch.Tensor, ...] | None:
-        """Blocks until the queued launch, if any, has been issued; raises
-        what the helper thread raised; returns the received buffers once, or
-        None when nothing was queued."""
+    def _issue_queued(self) -> tuple[torch.Tensor, ...] | None:
+        """Waits for any queued drain, issues the hand-off if the helper has not,
+        propagates helper errors, and returns the received buffers."""
         if not self.async_handoff:
             return None
         with self._async_cv:
-            # Unbounded, like the drain the helper runs: a barrier that
-            # never pairs raises after the process group's timeout and is
-            # reported here; a device that never returns is left to the
-            # engine.
-            self._async_cv.wait_for(self._async_idle)
+            # Wait without a separate timeout: process-group barrier timeouts
+            # surface via _async_error, and device hangs are handled by the engine.
+            self._async_cv.wait_for(
+                lambda: self._async_queued is None
+                and not self._async_busy
+                and not self._async_issuing
+            )
             if self._async_error is not None:
                 error, self._async_error = self._async_error, None
                 raise RuntimeError(
                     f"PP wave rank {self.rank}: the hand-off thread failed"
                 ) from error
+            carried, self._async_drained = self._async_drained, None
             out, self._async_out = self._async_out, None
-            return out
+        if carried is not None:
+            with TraceAnnotation("PP:Handoff"):
+                out = _launch_now(self.op, carried)
+        return out
 
     def _pad(
         self, carried: tuple[torch.Tensor, ...], rows: int
@@ -391,10 +476,10 @@ class PPWave:
         count. Returns the incoming activations (None on the first stage)."""
         self._open_burst()
         if self.rank == 0:
-            out = self._async_wait()
+            out = self._issue_queued()
             if out is not None:
-                # The hand-off has to complete before this forward's
-                # collectives are dispatched (see the module docstring).
+                # Stage 0 does not consume the received buffers, so explicitly
+                # wait to keep the next forward from overlapping the hand-off.
                 _wait(out)
             return None
         send = self.pending if self.pending is not None else self.zeros
@@ -456,10 +541,9 @@ class PPWave:
             return
         with TraceAnnotation("PP:Settle"):
             if self.rank == 0:
-                # With two stages this stage issues no launch of its own;
-                # the queued launch has to be issued all the same, and its
-                # failure raised here.
-                self._async_wait()
+                # Issue any queued hand-off and surface helper errors even on
+                # a two-stage pipeline where stage 0 issues no settle launches.
+                self._issue_queued()
             if 0 < self.rank < self.last:
                 assert self.pending is not None
                 self._launch(self.pending)
