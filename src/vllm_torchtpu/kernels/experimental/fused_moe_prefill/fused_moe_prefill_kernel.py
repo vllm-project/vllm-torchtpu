@@ -496,7 +496,11 @@ def _build_expert_kernel(
                 out_wait(p, n_prev)
 
             def compute(rows, w1, w2, w1_scale, w2_scale):
-                act = act_vmem[aslot, pl.ds(0, rows)].reshape(rows, h)
+                # Retile the gathered rows ([rows, L, 128] blocks) into the
+                # matmul layout [rows, h] as bf16, then cast back: cheaper than
+                # retiling the packed fp8 value, and both casts are exact.
+                act = act_vmem[aslot, pl.ds(0, rows)].astype(jnp.bfloat16)
+                act = act.reshape(rows, h).astype(weight_dtype)
                 act_scales = _unpack_scales(
                     [
                         _tile_row_scales(act_scale_vmem[aslot, k], start, rows)
