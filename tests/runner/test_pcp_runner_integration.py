@@ -26,6 +26,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 )
 from vllm_torchtpu.runner.speculative_decoding_manager import SpeculativeDecodingManager
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
+from vllm_torchtpu.runner.tpu_runner_async_output import AsyncPreResults
 
 _PCP_LAYOUT_RANK = "vllm_torchtpu.layers.core.pcp_sequence_layout._get_native_pcp_rank"
 _PCP_LAYOUT_WORLD_SIZE = (
@@ -737,3 +738,50 @@ def test_pcp_streaming_does_not_use_batched_smem_capacity(
     # compact streaming schedule for every request distribution.
     assert runner._attention_schedule_capacity() is None
     assert runner._attention_runs_batched_kernel is False
+
+
+@pytest.mark.parametrize("uses_mrope", [False, True])
+def test_prepare_inputs_pcp_ignores_unmapped_async_spec_results(
+    monkeypatch, uses_mrope
+):
+    """Zero-token async spec results kept for their copy must not be applied.
+
+    _flush_disjoint_async_results() keeps results whose req_id_to_index_copy is
+    empty until sample_tokens() waits on their D2H copy. A PCP prefill step that
+    follows must skip the rejected-token subtraction: no request maps, and its
+    index arrays are sized by the global padded token count while position_ids
+    holds only this rank's shard (qwen35-pcp4-dp4-disagg-correctness crashed
+    with a 4096 vs 16384 shape mismatch).
+    """
+    scheduled = [32]
+    runner = _make_runner(
+        num_computed_tokens=[0],
+        prompt_tokens=scheduled,
+        scheduled_tokens=scheduled,
+        token_paddings=[256],
+        uses_mrope=uses_mrope,
+        mtp_enabled=True,
+    )
+    runner.scheduler_config.async_scheduling = True
+    runner.speculative_config = SimpleNamespace(num_speculative_tokens=1)
+    runner.spec_decode_manager = SpeculativeDecodingManager(runner)
+    runner._pre_async_results = AsyncPreResults(
+        req_ids=["req-finished"],
+        next_tokens_tpu=torch.tensor([[7, 8]], dtype=torch.int32),
+        request_seq_lens=[],
+        discard_sampled_tokens_req_indices=[0],
+        req_id_to_index_copy={},
+        spec_decode_num_rejected_tokens=torch.tensor([1], dtype=torch.int32),
+    )
+
+    monkeypatch.setattr(_PCP_LAYOUT_RANK, lambda: 1)
+    monkeypatch.setattr(_PCP_LAYOUT_WORLD_SIZE, lambda: 2)
+
+    TPUModelRunner._prepare_inputs(runner, _scheduler_output(scheduled), 0, 0)
+
+    # Positions are this rank's shard, unchanged by any subtraction.
+    assert runner.position_ids.shape[-1] == 256
+    if not uses_mrope:
+        torch.testing.assert_close(
+            runner.position_ids[:16].cpu(), torch.arange(16, 32, dtype=torch.int32)
+        )
