@@ -20,10 +20,12 @@ from core.interfaces import IResultRecorder
 
 def _json_serializer(obj: Any) -> Any:
     """Custom JSON serializer fallback for non-serializable objects."""
-    if hasattr(obj, "item") and callable(obj.item):
-        return obj.item()
+    # tolist() first: item() raises ValueError on multi-element tensors
+    # and arrays, while tolist() also unwraps 0-d ones to Python scalars.
     if hasattr(obj, "tolist") and callable(obj.tolist):
         return obj.tolist()
+    if hasattr(obj, "item") and callable(obj.item):
+        return obj.item()
     if isinstance(obj, (set, tuple)):
         return list(obj)
     if isinstance(obj, os.PathLike):
