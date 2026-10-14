@@ -60,7 +60,7 @@ from vllm.models.qwen4_exp.common.hyperconnection import (
 )
 from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
 
-from vllm_torchtpu.models.vllm.qwen4_exp.ple import PLEInputs, Qwen4ExpPLELayer
+from vllm_torchtpu.models.vllm.qwen4_exp.ple import Qwen4ExpPLELayer
 
 
 def _hc_config(vllm_config: VllmConfig) -> HyperConnectionConfig:
@@ -92,11 +92,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
         layer_index = extract_layer_index(prefix)
         self.layer_type = layer_types[layer_index]
 
-        # ple_layer_ids is one-indexed.
+        # ple_layer_ids is one-indexed; each PLE layer's hash layout follows
+        # its rank among them.
         self.ple = (
             Qwen4ExpPLELayer(
                 config,
-                config.ple_layer_ids.index(layer_index + 1),
+                sorted(set(config.ple_layer_ids)).index(layer_index + 1),
                 vllm_config.quant_config,
                 prefix=f"{prefix}.ple",
             )
@@ -129,20 +130,16 @@ class Qwen4ExpDecoderLayer(nn.Module):
         self.mlp_hyper_connection = GatedResidual(hc_config)
 
     def forward(
-        self,
-        positions: torch.Tensor,
-        hidden_states: torch.Tensor,
-        ple_inputs: PLEInputs | None = None,
+        self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
         if self.ple is not None:
-            if ple_inputs is None:
-                # TODO(PLE): pass the PLE inputs and per-request conv state
-                # from the TPU runner.
-                raise NotImplementedError(
-                    "Qwen4Exp n-gram PLE needs inputs from the TPU runner, "
-                    "which does not provide them yet."
-                )
-            hidden_states = hidden_states + self.ple(hidden_states, ple_inputs)
+            # TODO(PLE): read and write the conv windows in the unified pool,
+            # take the PLE inputs from the TPU runner, and add the PLE term to
+            # hidden_states here, before the attention mix.
+            raise NotImplementedError(
+                "Qwen4Exp n-gram PLE needs its inputs and conv state from the "
+                "TPU runner, which does not provide them yet."
+            )
         block_input, residuals = self.attn_hyper_connection.mix(hidden_states)
         if self.layer_type == "linear_attention":
             block_output = self.linear_attn(hidden_states=block_input)
@@ -178,7 +175,6 @@ class Qwen4ExpModel(nn.Module):
             Qwen4ExpDecoderLayer(vllm_config, prefix=f"{prefix}.layers.{idx}")
             for idx in range(config.num_hidden_layers)
         )
-        self.has_ple = bool(config.ple_layer_ids)
         # Reduces the hc_count streams to the single stream fed to lm_head.
         # It only mixes, so it has no block_inject_weight.
         self.hyper_connection_mixer = GatedResidual(
@@ -220,6 +216,9 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             # TODO(QSA): load the indexer weights once the QSA indexer lands;
             # dense attention does not use them.
             ".self_attn.indexer.": None,
+            # PLE hash statistics, which upstream skips as well.
+            "hashstats_": None,
+            "token_lookup": None,
         },
         orig_to_new_prefix={
             "model.language_model.": "model.",
@@ -290,7 +289,7 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         mapper = self.hf_to_vllm_mapper
-        if not self.model.has_ple:
+        if not any(isinstance(module, Qwen4ExpPLELayer) for module in self.modules()):
             # The checkpoint keeps its PLE weights when ple_layer_ids is
             # overridden to [].
             mapper = mapper | WeightsMapper(orig_to_new_substr={".ple.": None})

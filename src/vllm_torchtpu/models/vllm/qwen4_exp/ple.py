@@ -13,11 +13,14 @@
 # limitations under the License.
 """N-gram PLE: the hashed n-gram embedding Qwen4Exp adds at one decoder layer.
 
-Follows the HF reference (``Qwen4ExpTextNGramEmbedding`` and
-``Qwen4ExpTextPLELayer``) and upstream vllm/models/qwen4_exp. The n-gram ids
-are computed on the device from this step's input ids plus the tokens that
-precede each request's chunk, so async scheduling does not need the newest
-sampled token on the host.
+Ported from upstream vllm/models/qwen4_exp (nvidia/ngram_embedding.py,
+nvidia/ple_layer.py and the Triton kernels in nvidia/ops/ple.py) and checked
+against the HF reference (``Qwen4ExpTextNGramEmbedding``,
+``Qwen4ExpTextPLELayer``). The kernels become torch ops, and each function
+names what it follows. The n-gram ids are computed on the device from this
+step's input ids plus the tokens that precede each request's chunk, so async
+scheduling does not need the newest sampled token on the host. The conv
+state is passed in and returned, so the caller decides where it is stored.
 """
 
 from __future__ import annotations
@@ -59,7 +62,10 @@ def _splitmix64(value: int) -> int:
 def layer_multipliers(
     vocab_size: int, ngram_size: int, ple_layer_index: int, seed: int
 ) -> list[int]:
-    """Odd hash multipliers small enough that token * multiplier fits int64."""
+    """Odd hash multipliers small enough that token * multiplier fits int64.
+
+    Same values as upstream's ``Qwen4ExpNGramEmbedding._make_layer_multipliers``.
+    """
     half_bound = max(1, _MAX_INT64 // max(vocab_size, 1) // 2)
     base_seed = seed + _PLE_LAYER_PRIME * ple_layer_index
     multipliers = []
@@ -80,7 +86,12 @@ def _is_prime(value: int) -> bool:
 def head_vocab_sizes(
     ngram_vocab_size_base: int, ngram_heads: int, ple_layer_index: int
 ) -> list[int]:
-    """Each head hashes into its own prime-sized slice of the table."""
+    """Each head hashes into its own prime-sized slice of the table.
+
+    Same values as upstream's ``Qwen4ExpNGramEmbedding._make_vocab_layout``,
+    with trial division in place of its Miller-Rabin test: the primes sit just
+    above ngram_vocab_size_base (2e7 in the released checkpoint).
+    """
     sizes = []
     prime = ngram_vocab_size_base - 1
     for _ in range((ple_layer_index + 1) * ngram_heads):
@@ -91,24 +102,35 @@ def head_vocab_sizes(
     return sizes[ple_layer_index * ngram_heads :]
 
 
-def _token_requests(
+def token_requests(
     query_start_loc: torch.Tensor, num_tokens: int
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Each token's position, request and offset within that request's chunk.
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Each token's request and its offset within that request's chunk.
 
-    Batch padding past the last request maps to the last request.
+    Marks the interior request starts and takes a cumsum, the form
+    kda_attention_op._token_sequence_ids measured as cheaper on TPU than a
+    [num_tokens, num_reqs] comparison. Starts at or past ``num_tokens`` land
+    in a dropped overflow slot, and batch padding maps to the last request.
     """
-    starts = query_start_loc.long()
-    positions = torch.arange(num_tokens, device=starts.device)
-    request = (positions.unsqueeze(1) >= starts[1:].unsqueeze(0)).sum(dim=1)
-    request = request.clamp(max=starts.numel() - 2)
-    return positions, request, positions - starts[request]
+    num_reqs = query_start_loc.numel() - 1
+    query_start_loc = query_start_loc.to(torch.int32)
+    starts = query_start_loc[1:num_reqs].clamp(max=num_tokens)
+    marks = torch.zeros(
+        num_tokens + 1, dtype=torch.int32, device=query_start_loc.device
+    )
+    marks.index_add_(0, starts, torch.ones_like(starts))
+    request = marks[:num_tokens].cumsum(0, dtype=torch.int32).clamp(max=num_reqs - 1)
+    positions = torch.arange(
+        num_tokens, dtype=torch.int32, device=query_start_loc.device
+    )
+    return request, positions - query_start_loc[request]
 
 
 def ngram_ids(
     input_ids: torch.Tensor,
-    query_start_loc: torch.Tensor,
     ngram_context: torch.Tensor,
+    request: torch.Tensor,
+    chunk_pos: torch.Tensor,
     multipliers: torch.Tensor,
     vocab_sizes: torch.Tensor,
     offsets: torch.Tensor,
@@ -119,12 +141,14 @@ def ngram_ids(
     """Table rows for every head of every token, shape [num_tokens, heads].
 
     ``ngram_context[r]`` holds the tokens just before request ``r``'s chunk,
-    oldest first, with EOS where the request has none.
+    oldest first, with EOS where the request has none; ``request`` and
+    ``chunk_pos`` come from token_requests. Follows upstream's
+    ``_ple_ngram_ids_kernel``, reading in-step predecessors as static shifts.
     """
     tokens = input_ids.long()
     context = ngram_context.long()
+    num_tokens = tokens.shape[0]
     context_len = context.shape[-1]
-    positions, request, chunk_pos = _token_requests(query_start_loc, tokens.shape[0])
 
     # Walk predecessors from newest to oldest. Everything behind an EOS reads
     # as EOS, which is how the reference resets the n-gram history.
@@ -133,7 +157,7 @@ def ngram_ids(
     mixed = tokens * multipliers[0]
     blocks = []
     for shift in range(1, context_len + 1):
-        from_step = tokens[(positions - shift).clamp(min=0)]
+        from_step = F.pad(tokens, (shift, 0))[:num_tokens]
         from_context = context[
             request, (context_len - shift + chunk_pos).clamp(0, context_len - 1)
         ]
@@ -154,73 +178,70 @@ def dilated_short_conv(
     x: torch.Tensor,
     weight: torch.Tensor,
     dilation: int,
-    conv_state: torch.Tensor,
-    state_indices: torch.Tensor,
-    has_initial_state: torch.Tensor,
+    windows: torch.Tensor,
     query_start_loc: torch.Tensor,
-) -> torch.Tensor:
-    """Depthwise causal conv over a ragged batch; updates ``conv_state``.
+    request: torch.Tensor,
+    chunk_pos: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Depthwise causal conv over a ragged batch that carries each request's
+    window between steps.
 
-    ``weight`` is [channels, kernel]; ``conv_state[slot]`` holds a request's
-    last (kernel - 1) * dilation inputs, oldest first. Taps that reach back
-    past the chunk start read that window instead of ``x``. Every request,
-    including padding requests, writes its window back to its slot. Returns
-    the conv output before its activation.
+    ``weight`` is [channels, kernel]. ``windows[r]`` holds request ``r``'s last
+    (kernel - 1) * dilation inputs, oldest first, and must be zero when the
+    request has no history. Taps that reach back past the chunk start read the
+    window instead of ``x``. Returns the conv output before its activation and
+    each request's new window. Follows the taps and window shift of upstream's
+    ``ple_conv`` prefill kernel and write-back, without touching storage.
     """
-    num_tokens = x.shape[0]
+    num_tokens, channels = x.shape
     kernel = weight.shape[-1]
     history = (kernel - 1) * dilation
-    starts = query_start_loc.long()
-    num_reqs = starts.numel() - 1
-    positions, request, chunk_pos = _token_requests(query_start_loc, num_tokens)
+    num_reqs = query_start_loc.numel() - 1
+    if windows.shape != (num_reqs, history, channels):
+        raise ValueError(
+            f"PLE conv windows have shape {tuple(windows.shape)}; expected "
+            f"(num_reqs, (kernel - 1) * dilation, channels) = "
+            f"({num_reqs}, {history}, {channels})."
+        )
+    query_start_loc = query_start_loc.to(torch.int32)
 
-    slots = state_indices.long()
-    windows = conv_state[slots].to(x.dtype)
-    windows = torch.where(
-        has_initial_state.view(-1, 1, 1), windows, torch.zeros_like(windows)
-    )
     out = torch.zeros(x.shape, dtype=torch.float32, device=x.device)
     for tap in range(kernel):
         back = history - tap * dilation
         source = chunk_pos - back
-        from_step = x[(positions - back).clamp(min=0)]
+        from_step = F.pad(x, (0, 0, back, 0))[:num_tokens]
         from_window = windows[request, (history + source).clamp(0, history - 1)]
         rows = torch.where((source >= 0).unsqueeze(-1), from_step, from_window)
         out = out + rows.float() * weight[:, tap].float()
 
     # The new window is each request's last `history` inputs.
-    query_lens = starts[1:] - starts[:-1]
-    source = query_lens.unsqueeze(1) - history + torch.arange(history, device=x.device)
-    from_step = x[(starts[:-1].unsqueeze(1) + source).clamp(0, num_tokens - 1)]
+    starts = query_start_loc[:-1]
+    query_lens = query_start_loc[1:] - starts
+    steps = torch.arange(history, dtype=torch.int32, device=x.device)
+    source = query_lens.unsqueeze(1) - history + steps
+    from_step = x[(starts.unsqueeze(1) + source).clamp(0, num_tokens - 1)]
     from_window = windows[
-        torch.arange(num_reqs, device=x.device).unsqueeze(1),
+        torch.arange(num_reqs, dtype=torch.int32, device=x.device).unsqueeze(1),
         (history + source).clamp(0, history - 1),
     ]
     new_windows = torch.where((source >= 0).unsqueeze(-1), from_step, from_window)
-    conv_state.index_copy_(0, slots, new_windows.to(conv_state.dtype))
-    return out.to(x.dtype)
+    return out.to(x.dtype), new_windows
 
 
 @dataclass(frozen=True)
 class PLEInputs:
-    """Per-step PLE inputs for one batch.
+    """Per-step token inputs for one batch.
 
     Attributes:
         input_ids: [num_tokens] token ids of this step.
         query_start_loc: [num_reqs + 1] chunk boundaries in ``input_ids``.
-        ngram_context: [num_reqs, ngram_size - 1] tokens before each chunk.
-        conv_state: [num_slots, (kernel - 1) * dilation, hc_count * hidden].
-        state_indices: [num_reqs] each request's ``conv_state`` slot.
-        has_initial_state: [num_reqs] False for requests starting from
-            scratch, whose slot content is ignored.
+        ngram_context: [num_reqs, ngram_size - 1] tokens before each chunk,
+            oldest first, with EOS where the request has none.
     """
 
     input_ids: torch.Tensor
     query_start_loc: torch.Tensor
     ngram_context: torch.Tensor
-    conv_state: torch.Tensor
-    state_indices: torch.Tensor
-    has_initial_state: torch.Tensor
 
 
 class Qwen4ExpPLETable(PLEVocabParallelEmbedding):
@@ -262,7 +283,8 @@ class Qwen4ExpPLETable(PLEVocabParallelEmbedding):
         if self.tp_size > 1:
             # The table has no added or padding rows, so each rank owns one
             # row range. vllm-torchtpu registers its bounds as buffers so that
-            # every TP rank compiles the same graph; fall back to the ints.
+            # every TP rank compiles the same graph; without that patch (CPU
+            # tests) the ints are used.
             start = getattr(
                 self, "org_vocab_start_index", self.shard_indices.org_vocab_start_index
             )
@@ -306,12 +328,18 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 f"ple_embed_dim ({embedding_dim}) must be divisible by the "
                 f"{ngram_heads} n-gram heads."
             )
-        self.heads_per_ngram = config.heads_per_ngram
         eos_token_id = config.eos_token_id
-        if isinstance(eos_token_id, list | tuple):
-            eos_token_id = eos_token_id[0]
-        self.eos_token_id = int(eos_token_id)
+        if not isinstance(eos_token_id, int):
+            raise ValueError(
+                "Qwen4Exp PLE resets its n-gram history at a single EOS token, "
+                f"but the text config has eos_token_id={eos_token_id!r}."
+            )
+        self.eos_token_id = eos_token_id
+        self.ngram_size = config.ngram_size
+        self.heads_per_ngram = config.heads_per_ngram
         self.vocab_size = config.vocab_size
+        # Optional checkpoint fields, with upstream's defaults. The released
+        # checkpoint sets split_ngram_parts only.
         self.split_ngram_parts = int(getattr(config, "split_ngram_parts", 512))
         seed = getattr(config, "seed", None)
         multipliers = layer_multipliers(
@@ -344,13 +372,21 @@ class Qwen4ExpNGramEmbedding(nn.Module):
     def forward(
         self,
         input_ids: torch.Tensor,
-        query_start_loc: torch.Tensor,
         ngram_context: torch.Tensor,
+        request: torch.Tensor,
+        chunk_pos: torch.Tensor,
     ) -> torch.Tensor:
+        if ngram_context.shape[-1] != self.ngram_size - 1:
+            raise ValueError(
+                f"ngram_context has {ngram_context.shape[-1]} tokens per "
+                f"request; ngram_size={self.ngram_size} needs "
+                f"{self.ngram_size - 1}."
+            )
         ids = ngram_ids(
             input_ids,
-            query_start_loc,
             ngram_context,
+            request,
+            chunk_pos,
             self.layer_multipliers,
             self.ngram_heads_vocab_sizes,
             self.ngram_heads_offsets,
@@ -386,13 +422,21 @@ class Qwen4ExpNGramEmbedding(nn.Module):
                 scale = table.get_parameter("weight_scale")
                 scale.data.copy_(tensor.reshape(scale.shape))
             elif name.startswith(shard_prefix) and name.endswith(".weight"):
-                index = int(name[len(shard_prefix) : -len(".weight")])
+                index_text = name[len(shard_prefix) : -len(".weight")]
+                if not index_text.isdigit():
+                    raise ValueError(
+                        f"Unexpected PLE table weight {name!r}; table shards are "
+                        "named ngram_embedding.shard_<index>.weight."
+                    )
+                index = int(index_text)
+                if index >= self.split_ngram_parts:
+                    raise ValueError(
+                        f"PLE table shard {index} is out of range for the "
+                        f"config's split_ngram_parts={self.split_ngram_parts}."
+                    )
                 start = index * shard_rows
                 rows = min(shard_rows, table.org_vocab_size - start)
-                if index >= self.split_ngram_parts or tensor.shape != (
-                    rows,
-                    table.embedding_dim,
-                ):
+                if tensor.shape != (rows, table.embedding_dim):
                     raise ValueError(
                         f"PLE table shard {index} has shape {tuple(tensor.shape)}; "
                         f"split_ngram_parts={self.split_ngram_parts} implies "
@@ -425,6 +469,11 @@ class Qwen4ExpPLELayer(nn.Module):
         prefix: str,
     ) -> None:
         super().__init__()
+        if config.ple_conv_kernel_size < 2:
+            raise NotImplementedError(
+                "Qwen4Exp PLE on TPU needs ple_conv_kernel_size >= 2, got "
+                f"{config.ple_conv_kernel_size}."
+            )
         self.hidden_size = config.hidden_size
         self.hc_count = config.hc_count
         hc_hidden_size = config.hidden_size * config.hc_count
@@ -471,26 +520,42 @@ class Qwen4ExpPLELayer(nn.Module):
             dtype=dtype,
         )
 
-    def forward(self, hidden_states: torch.Tensor, inputs: PLEInputs) -> torch.Tensor:
-        """Returns the term to add to the hc_count * hidden_size residual."""
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        inputs: PLEInputs,
+        conv_windows: torch.Tensor,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns the term to add to the hc_count * hidden_size residual, and
+        each request's new conv window (see dilated_short_conv)."""
+        num_tokens = hidden_states.shape[0]
+        if inputs.input_ids.shape[0] != num_tokens:
+            raise ValueError(
+                f"PLE got {inputs.input_ids.shape[0]} input ids for "
+                f"{num_tokens} hidden states."
+            )
+        request, chunk_pos = token_requests(inputs.query_start_loc, num_tokens)
         embeddings = self.ple_embedding(
-            inputs.input_ids, inputs.query_start_loc, inputs.ngram_context
+            inputs.input_ids, inputs.ngram_context, request, chunk_pos
         )
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
         streams = (self.hc_count, self.hidden_size)
         key = self.norm_key(key).unflatten(-1, streams)
         query = self.norm_query(hidden_states).unflatten(-1, streams)
-        gate = (key * query).sum(dim=-1, keepdim=True) / math.sqrt(self.hidden_size)
+        # As in upstream's gate kernel, the products are rounded to the
+        # activation dtype and then summed in fp32.
+        dot = (key * query).float().sum(dim=-1, keepdim=True).to(key.dtype)
+        gate = dot / math.sqrt(self.hidden_size)
         gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
         gated_value = (torch.sigmoid(gate) * value.unsqueeze(-2)).flatten(-2)
-        conv_output = dilated_short_conv(
+        conv_output, new_windows = dilated_short_conv(
             self.norm_conv(gated_value),
             self.conv1d.weight[:, 0, :],
             self.conv_dilation,
-            inputs.conv_state,
-            inputs.state_indices,
-            inputs.has_initial_state,
+            conv_windows,
             inputs.query_start_loc,
+            request,
+            chunk_pos,
         )
-        return gated_value + F.silu(conv_output)
+        return gated_value + F.silu(conv_output), new_windows

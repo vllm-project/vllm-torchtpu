@@ -51,6 +51,7 @@ from vllm_torchtpu.models.vllm.qwen4_exp.ple import (
     head_vocab_sizes,
     layer_multipliers,
     ngram_ids,
+    token_requests,
 )
 
 HIDDEN = 16
@@ -480,6 +481,8 @@ _LM = "model.language_model"
             f"{_LM}.layers.1.ple.conv1d.weight",
             ("model.layers.1.ple.conv1d.weight", None),
         ),
+        (f"{_LM}.layers.1.ple.ple_embedding.hashstats_ngram_counts", None),
+        (f"{_LM}.layers.1.ple.ple_embedding.token_lookup", None),
         ("model.visual.blocks.0.attn.qkv.weight", None),
         ("mtp.layers.0.mlp.experts.0.gate_proj.weight", None),
     ],
@@ -714,19 +717,61 @@ def _randomize_ple(ple: nn.Module) -> None:
             param.normal_(0.0, 0.5)
 
 
-def test_hash_buffers_match_released_checkpoint() -> None:
-    """The config-derived multipliers and head sizes equal the buffers in the
-    Qwen3.8-Flash-Next checkpoint (vocab 248320, ngram_vocab_size_base 20M)."""
-    assert layer_multipliers(248320, 3, 0, 1234) == [
-        23703573157769,
-        20109073645365,
-        8052911324071,
-    ]
-    assert head_vocab_sizes(20_000_000, 16, 0) == [
-        *(20000003, 20000023, 20000033, 20000047, 20000059, 20000063),
-        *(20000069, 20000077, 20000081, 20000093, 20000107, 20000147),
-        *(20000153, 20000159, 20000161, 20000171),
-    ]
+@pytest.mark.parametrize(
+    "ple_layer_index,multipliers,sizes",
+    [
+        # The buffers stored in the released Qwen3.8-Flash-Next checkpoint.
+        (
+            0,
+            [23703573157769, 20109073645365, 8052911324071],
+            [
+                *(20000003, 20000023, 20000033, 20000047, 20000059, 20000063),
+                *(20000069, 20000077, 20000081, 20000093, 20000107, 20000147),
+                *(20000153, 20000159, 20000161, 20000171),
+            ],
+        ),
+        # Upstream's _make_layer_multipliers and _make_vocab_layout for a
+        # second PLE layer.
+        (
+            1,
+            [3352040966061, 19752442147475, 10742103100073],
+            [
+                *(20000213, 20000221, 20000243, 20000269, 20000287, 20000297),
+                *(20000303, 20000311, 20000327, 20000329, 20000339, 20000353),
+                *(20000359, 20000377, 20000389, 20000429),
+            ],
+        ),
+    ],
+    ids=["released_checkpoint", "second_ple_layer"],
+)
+def test_hash_buffers_match_checkpoint_and_upstream(
+    ple_layer_index: int, multipliers: list[int], sizes: list[int]
+) -> None:
+    """Config-derived multipliers and head sizes at the released checkpoint's
+    vocab (248320) and ngram_vocab_size_base (20M)."""
+    assert layer_multipliers(248320, 3, ple_layer_index, 1234) == multipliers
+    assert head_vocab_sizes(20_000_000, 16, ple_layer_index) == sizes
+
+
+@pytest.mark.parametrize(
+    "query_start_loc,num_tokens,expected_request,expected_chunk_pos",
+    [
+        # Requests 1 and 3 are empty; the two padding tokens go to request 3.
+        ([0, 2, 2, 5, 5], 7, [0, 0, 2, 2, 2, 3, 3], [0, 1, 0, 1, 2, 0, 1]),
+        # A request start past the token bucket is dropped.
+        ([0, 2, 6, 8], 4, [0, 0, 1, 1], [0, 1, 0, 1]),
+    ],
+    ids=["empty_requests_and_padding", "start_past_bucket"],
+)
+def test_token_requests(
+    query_start_loc: list[int],
+    num_tokens: int,
+    expected_request: list[int],
+    expected_chunk_pos: list[int],
+) -> None:
+    request, chunk_pos = token_requests(torch.tensor(query_start_loc), num_tokens)
+    assert request.tolist() == expected_request
+    assert chunk_pos.tolist() == expected_chunk_pos
 
 
 @pytest.mark.parametrize("chunks", list(_CHUNKS.values()), ids=list(_CHUNKS))
@@ -741,10 +786,12 @@ def test_ngram_ids_match_reference_for_any_chunking(chunks) -> None:
     got: list[list[torch.Tensor]] = [[] for _ in sequences]
     for step in _steps(chunks):
         input_ids, query_start_loc, context = _batch(sequences, step, eos)
+        request, chunk_pos = token_requests(query_start_loc, input_ids.numel())
         ids = ngram_ids(
             input_ids,
-            query_start_loc,
             context,
+            request,
+            chunk_pos,
             multipliers,
             sizes,
             offsets,
@@ -763,8 +810,8 @@ def test_ngram_ids_match_reference_for_any_chunking(chunks) -> None:
 
 @pytest.mark.parametrize("chunks", list(_CHUNKS.values()), ids=list(_CHUNKS))
 def test_ple_layer_matches_reference_for_any_chunking(monkeypatch, chunks) -> None:
-    """Padded, chunked batches that carry the conv state between steps match
-    the reference run over each whole sequence."""
+    """Padded, chunked batches that carry each request's conv window between
+    steps match the reference run over each whole sequence."""
     _set_tp(monkeypatch, 0, 1)
     torch.manual_seed(0)
     ple = Qwen4ExpPLELayer(_text_config(**_PLE), 0, None, prefix="model.layers.1.ple")
@@ -772,8 +819,9 @@ def test_ple_layer_matches_reference_for_any_chunking(monkeypatch, chunks) -> No
     eos = _PLE["eos_token_id"]
     sequences = _sequences(VOCAB, eos)
     hidden_states = [torch.randn(len(tokens), HC * HIDDEN) for tokens in sequences]
-    # Slot 0 serves the padding request. Requests without an initial state
-    # must ignore the stale slot contents.
+    # The caller owns the conv state. As in the TPU runner, slot 0 serves the
+    # padding request, and a request without history gets a zero window
+    # instead of its stale slot.
     conv_state = torch.randn(len(sequences) + 1, ple.conv_state_len, HC * HIDDEN)
     got: list[list[torch.Tensor]] = [[] for _ in sequences]
     with torch.no_grad():
@@ -781,15 +829,13 @@ def test_ple_layer_matches_reference_for_any_chunking(monkeypatch, chunks) -> No
             input_ids, query_start_loc, context = _batch(sequences, step, eos)
             hidden = torch.cat([hidden_states[r][start:end] for r, start, end in step])
             hidden = F.pad(hidden, (0, 0, 0, input_ids.numel() - hidden.shape[0]))
-            inputs = PLEInputs(
-                input_ids=input_ids,
-                query_start_loc=query_start_loc,
-                ngram_context=context,
-                conv_state=conv_state,
-                state_indices=torch.tensor([r + 1 for r, _, _ in step] + [0]),
-                has_initial_state=torch.tensor([s > 0 for _, s, _ in step] + [False]),
+            slots = torch.tensor([r + 1 for r, _, _ in step] + [0])
+            has_history = torch.tensor([s > 0 for _, s, _ in step] + [False])
+            windows = torch.where(has_history.view(-1, 1, 1), conv_state[slots], 0)
+            output, new_windows = ple(
+                hidden, PLEInputs(input_ids, query_start_loc, context), windows
             )
-            output = ple(hidden, inputs)
+            conv_state[slots] = new_windows
             for index, (request, _, _) in enumerate(step):
                 start, end = query_start_loc[index], query_start_loc[index + 1]
                 got[request].append(output[start:end])
@@ -863,7 +909,9 @@ def test_load_weights_loads_ple_or_drops_it_when_disabled(
     prefix = f"{_LM}.layers.1.ple"
     weights = {
         f"{prefix}.key_proj.weight": torch.randn(HC * HIDDEN, _PLE["ple_embed_dim"]),
-        f"{prefix}.conv1d.weight": torch.randn(HC * HIDDEN, 1, 4),
+        f"{prefix}.conv1d.weight": torch.randn(
+            HC * HIDDEN, 1, _PLE["ple_conv_kernel_size"]
+        ),
         f"{prefix}.norm_conv.weight": torch.randn(HC * HIDDEN),
         f"{prefix}.ple_embedding.layer_multipliers": torch.tensor([3, 5, 7]),
         f"{prefix}.ple_embedding.ngram_embedding.shard_2.weight": torch.randn(
@@ -885,40 +933,8 @@ def test_load_weights_loads_ple_or_drops_it_when_disabled(
     state = model.state_dict()
     for name, tensor in expected.items():
         torch.testing.assert_close(state[name], tensor)
-    torch.testing.assert_close(state[f"{table}.weight"][44:], last_shard)
-
-
-def _ple_inputs(num_tokens: int) -> PLEInputs:
-    return PLEInputs(
-        input_ids=torch.arange(num_tokens) + 5,
-        query_start_loc=torch.tensor([0, num_tokens]),
-        ngram_context=torch.full((1, 2), _PLE["eos_token_id"]),
-        conv_state=torch.zeros(1, 9, HC * HIDDEN),
-        state_indices=torch.tensor([0]),
-        has_initial_state=torch.tensor([False]),
-    )
-
-
-def test_decoder_adds_ple_before_attention_mix(fake_sublayers, monkeypatch) -> None:
-    _set_tp(monkeypatch, 0, 1)
-    torch.manual_seed(0)
-    model = qwen4_model.Qwen4ExpModel(
-        vllm_config=_model_vllm_config(_text_config(**_PLE)), prefix="model"
-    )
-    _randomize_hc_norms(model)
-    layer = model.layers[1]
-    ple = layer.ple
-    _randomize_ple(ple)
-    hidden_states = torch.randn(3, HC * HIDDEN)
-    positions = torch.arange(3)
-
-    with torch.no_grad():
-        output = layer(positions, hidden_states, _ple_inputs(3))
-        ple_term = ple(hidden_states, _ple_inputs(3))
-        layer.ple = None
-        expected = layer(positions, hidden_states + ple_term)
-
-    torch.testing.assert_close(output, expected)
+    last_shard_start = 2 * math.ceil(_TABLE_ROWS / _PLE["split_ngram_parts"])
+    torch.testing.assert_close(state[f"{table}.weight"][last_shard_start:], last_shard)
 
 
 def test_model_rejects_ple_without_runner_inputs(fake_sublayers, monkeypatch) -> None:
@@ -928,3 +944,71 @@ def test_model_rejects_ple_without_runner_inputs(fake_sublayers, monkeypatch) ->
     )
     with pytest.raises(NotImplementedError, match="PLE"):
         model(torch.tensor([1, 2, 3]), torch.arange(3))
+
+
+@pytest.mark.parametrize(
+    "weights,match",
+    [
+        (
+            {"ngram_embedding.shard_0.weight": torch.zeros(21, _HEAD_DIM)},
+            "shard 0 has shape",
+        ),
+        (
+            {"ngram_embedding.shard_3.weight": torch.zeros(22, _HEAD_DIM)},
+            "out of range",
+        ),
+        (
+            {"ngram_embedding.shard_x.weight": torch.zeros(22, _HEAD_DIM)},
+            "shard_<index>",
+        ),
+        ({"ngram_embedding.weight_scale": torch.ones(1)}, "Unexpected PLE"),
+        ({"layer_multipliers": torch.tensor([1 << 62, 3, 5])}, "overflows int64"),
+    ],
+    ids=["shard_shape", "shard_index", "shard_name", "scale_without_fp8", "overflow"],
+)
+def test_ngram_embedding_rejects_malformed_checkpoint_tensors(
+    monkeypatch, weights: dict[str, torch.Tensor], match: str
+) -> None:
+    _set_tp(monkeypatch, 0, 1)
+    embedding = Qwen4ExpNGramEmbedding(
+        _text_config(**_PLE),
+        _PLE["ple_embed_dim"],
+        0,
+        None,
+        prefix="model.layers.1.ple.ple_embedding",
+    )
+    with pytest.raises(ValueError, match=match):
+        embedding.load_weights(iter(weights.items()))
+
+
+@pytest.mark.parametrize(
+    "num_ids,context_delta,window_delta,match",
+    [
+        (2, 0, 0, "input ids"),
+        (3, -1, 0, "ngram_context"),
+        (3, 0, -1, "conv windows"),
+    ],
+    ids=["input_ids", "ngram_context", "conv_windows"],
+)
+def test_ple_layer_rejects_inconsistent_inputs(
+    monkeypatch, num_ids: int, context_delta: int, window_delta: int, match: str
+) -> None:
+    _set_tp(monkeypatch, 0, 1)
+    ple = Qwen4ExpPLELayer(_text_config(**_PLE), 0, None, prefix="model.layers.1.ple")
+    inputs = PLEInputs(
+        input_ids=torch.arange(num_ids) + 5,
+        query_start_loc=torch.tensor([0, 3]),
+        ngram_context=torch.full(
+            (1, _PLE["ngram_size"] - 1 + context_delta), _PLE["eos_token_id"]
+        ),
+    )
+    windows = torch.zeros(1, ple.conv_state_len + window_delta, HC * HIDDEN)
+    with torch.no_grad(), pytest.raises(ValueError, match=match):
+        ple(torch.zeros(3, HC * HIDDEN), inputs, windows)
+
+
+def test_ple_layer_rejects_kernel_size_one(monkeypatch) -> None:
+    _set_tp(monkeypatch, 0, 1)
+    config = _text_config(**{**_PLE, "ple_conv_kernel_size": 1})
+    with pytest.raises(NotImplementedError, match="ple_conv_kernel_size"):
+        Qwen4ExpPLELayer(config, 0, None, prefix="model.layers.1.ple")
