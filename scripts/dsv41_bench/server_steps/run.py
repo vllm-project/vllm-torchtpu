@@ -121,7 +121,14 @@ def main() -> None:
     env["TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE"] = "disabled"
     env["KV_BYTES"] = "auto"
     decode = args.scenario == "decode"
-    buckets = [384, DECODE_SCENARIO.chunk_tokens] if decode else [128, 256, 2048]
+    # Steady target verification is exactly local_concurrency * (K + 1) rows;
+    # padding it to 384 runs every layer on 25% padding rows.
+    verify_rows = DECODE_SCENARIO.local_concurrency * (
+        DECODE_SCENARIO.dspark_tokens + 1
+    )
+    buckets = (
+        [verify_rows, 384, DECODE_SCENARIO.chunk_tokens] if decode else [128, 256, 2048]
+    )
     env.update(
         TP="1",
         DP="8",
