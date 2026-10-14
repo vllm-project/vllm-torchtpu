@@ -222,7 +222,8 @@ def compute_batched_seq_metadata(
         # num_chunks * per_chunk_bq does, overcounts it by up to num_chunks.
         # Each of the num_chunks - 1 seams splits at most one unchunked bq block,
         # so total_max_bq + num_chunks - 1 also holds; it is the tight one for
-        # static_q_len passes, whose block count does not grow with tokens.
+        # static_q_len passes, whose block count does not grow with tokens. It
+        # trusts static_q_len, which streamindex_topk enforces for MTP batches.
         # Overlapping chunks share tokens and break the partition, so they keep
         # the per-chunk bound alone.
         total_bq_ub = num_chunks * per_chunk_bq

@@ -1226,6 +1226,17 @@ def streamindex_topk(
 
     max_num_seqs = seq_lens.shape[0]
 
+    # distribution[0] is sized for attention's decode stage, which takes
+    # (gamma+1)-token verify requests once reorder_batch_threshold > 1. These
+    # decode passes are static_q_len=1, so keep only the leading one-token
+    # requests here; the mixed pass takes the rest.
+    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+    one_token = (q_lens == 1) & (jnp.arange(max_num_seqs) < distribution[1])
+    num_one_token = jnp.sum(jnp.cumprod(one_token.astype(jnp.int32)))
+    distribution = jnp.stack(
+        [jnp.minimum(distribution[0], num_one_token), num_one_token, distribution[2]]
+    ).astype(jnp.int32)
+
     original_dtype = q.dtype
     actual_head_dim = q.shape[-1]
 

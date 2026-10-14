@@ -715,6 +715,39 @@ def _ee_assert_full_rows(actual, q_lens, seq_lens, k):
         )
 
 
+def test_streamindex_topk_verify_requests_counted_as_decode():
+    """MTP verify requests counted in distribution[0] select like mixed ones.
+
+    With reorder_batch_threshold > 1 the runner counts (gamma+1)-token verify
+    requests as decode. The decode passes are static_q_len=1, so the kernel
+    must keep those requests out of them; the result has to match the batch
+    declared with only its one-token requests as decode.
+    """
+    q_lens = (1, 1, 1) + (4,) * 9
+    seq_lens = tuple(512 + 384 * i for i in range(len(q_lens)))
+    k = 128
+    inputs = _ee_inputs(q_lens, seq_lens, seed=5)
+    np.testing.assert_array_equal(inputs["distribution"], [3, 3, 12])
+
+    def run(distribution):
+        args = {name: jnp.asarray(value) for name, value in inputs.items()}
+        args["distribution"] = jnp.asarray(distribution, jnp.int32)
+        return np.asarray(
+            streamindex_topk(
+                **args,
+                k=k,
+                compression_ratio=1,
+                num_kv_pages_per_block=_EE_BKV_P,
+                num_queries_per_block=(1, _EE_BQ_SZ, _EE_BQ_SZ),
+            )
+        )
+
+    as_decode = run([12, 12, 12])
+    as_mixed = run([3, 3, 12])
+    _ee_assert_full_rows(as_mixed, q_lens, seq_lens, k)
+    _ee_assert_same_selection(as_decode, as_mixed)
+
+
 def test_streamindex_topk_early_exit_all_short():
     """Whole batch under k: the global fast path answers on its own."""
     q_lens, seq_lens, k = (1, 1, 1), (64, 96, 128), 512
