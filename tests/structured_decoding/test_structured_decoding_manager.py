@@ -659,6 +659,95 @@ class TestPrepareSpecStructuredDecodingInput:
         assert bonus_bitmask[0].tolist() == [0, 0]
         assert bonus_bitmask[1].tolist() == row(31)
 
+    def test_spec_fast_path_no_structured_requests(self):
+        manager = make_manager(
+            num_spec_tokens=2, req_id_to_index={"req0": 0, "req1": 1}
+        )
+        grammar_output = make_grammar_output([], [])
+        draft_lengths = np.array([2, 2], dtype=np.int32)
+        target_logits = torch.zeros(4, VOCAB_SIZE)
+        bonus_logits = torch.zeros(2, VOCAB_SIZE)
+
+        (require_target, target_bitmask, require_bonus, bonus_bitmask, arange) = (
+            manager.prepare_spec_structured_decoding_input(
+                target_logits, bonus_logits, grammar_output, {}, draft_lengths, 0, 2
+            )
+        )
+
+        assert require_target.data_ptr() == manager.device_all_false_require.data_ptr()
+        assert require_target[:, 0].tolist() == [False, False, False, False]
+        assert target_bitmask.data_ptr() == manager.device_dummy_bitmask.data_ptr()
+        assert require_bonus.data_ptr() == manager.device_all_false_require.data_ptr()
+        assert require_bonus[:, 0].tolist() == [False, False]
+        assert bonus_bitmask.data_ptr() == manager.device_dummy_bitmask.data_ptr()
+        assert arange.tolist() == list(range(32))
+
+    def test_spec_fast_path_all_structured_uniform_drafts(self):
+        manager = make_manager(
+            num_spec_tokens=2, req_id_to_index={"req0": 0, "req1": 1}
+        )
+        grammar_output = make_grammar_output(
+            ["req0", "req1"],
+            [row(10), row(11), row(12), row(20), row(21), row(22)],
+        )
+        scheduled = {"req0": [1, 2], "req1": [3, 4]}
+        draft_lengths = np.array([2, 2], dtype=np.int32)
+        target_logits = torch.zeros(4, VOCAB_SIZE)
+        bonus_logits = torch.zeros(2, VOCAB_SIZE)
+
+        (require_target, target_bitmask, require_bonus, bonus_bitmask, _) = (
+            manager.prepare_spec_structured_decoding_input(
+                target_logits,
+                bonus_logits,
+                grammar_output,
+                scheduled,
+                draft_lengths,
+                0,
+                2,
+            )
+        )
+
+        assert require_target.data_ptr() == manager.device_all_true_require.data_ptr()
+        assert require_target[:, 0].tolist() == [True, True, True, True]
+        assert target_bitmask[0].tolist() == row(10)
+        assert target_bitmask[1].tolist() == row(11)
+        assert target_bitmask[2].tolist() == row(20)
+        assert target_bitmask[3].tolist() == row(21)
+        assert require_bonus.data_ptr() == manager.device_all_true_require.data_ptr()
+        assert require_bonus[:, 0].tolist() == [True, True]
+        assert bonus_bitmask[0].tolist() == row(12)
+        assert bonus_bitmask[1].tolist() == row(22)
+
+    def test_spec_fast_path_zero_structured_drafts_with_target_logits(self):
+        # req0 is unstructured with 2 drafts; req1 is structured with 0 drafts.
+        manager = make_manager(
+            num_spec_tokens=2, req_id_to_index={"req0": 0, "req1": 1}
+        )
+        grammar_output = make_grammar_output(["req1"], [row(20)])
+        scheduled = {"req0": [1, 2]}
+        draft_lengths = np.array([2, 0], dtype=np.int32)
+        target_logits = torch.zeros(2, VOCAB_SIZE)
+        bonus_logits = torch.zeros(2, VOCAB_SIZE)
+
+        (require_target, target_bitmask, require_bonus, bonus_bitmask, _) = (
+            manager.prepare_spec_structured_decoding_input(
+                target_logits,
+                bonus_logits,
+                grammar_output,
+                scheduled,
+                draft_lengths,
+                0,
+                2,
+            )
+        )
+
+        assert require_target.data_ptr() == manager.device_all_false_require.data_ptr()
+        assert require_target[:, 0].tolist() == [False, False]
+        assert target_bitmask.data_ptr() == manager.device_dummy_bitmask.data_ptr()
+        assert require_bonus[:, 0].tolist() == [False, True]
+        assert bonus_bitmask[0].tolist() == [0, 0]
+        assert bonus_bitmask[1].tolist() == row(20)
+
 
 @contextlib.contextmanager
 def capture_trace():
