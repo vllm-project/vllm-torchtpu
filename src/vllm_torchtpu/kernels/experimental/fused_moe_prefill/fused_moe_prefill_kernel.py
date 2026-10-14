@@ -31,8 +31,11 @@ blocks, and a combine that reads only the live slots of each token
 (plan_blocks).
 
 Numerics: hidden states are quantized to FP8 once per call with one scale per
-row; the activated intermediate is quantized per row (per row per block in
-blocked mode); both matmuls are FP8 x FP8 with FP32 accumulation. Each route's
+row per 512 columns, as gmm_v2 quantizes them with the kernel off; the
+activated intermediate likewise per row per 512 columns of the expert (per
+row per block in blocked mode, in 512-column pieces of wider blocks). Both
+matmuls are FP8 x FP8; each 512-column block's partial is scaled and summed in
+FP32. Each route's
 rows are BF16 in the slab (the down projection's output is a partial sum over
 an intermediate shard; the grouped GEMM path writes BF16 there too). Router
 top-k stays with the caller.
@@ -49,14 +52,21 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.fused_moe.v2 import host as v2_host
 from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     DN,
+    _absmax_rows,
     _intermediate_rows,
+    _quant_apply,
+    _row_scale,
     _tile_row_scales,
     build_combine_kernel,
     combine_step_tokens,
-    expert_ffn_fp8,
 )
 
 _LANES = 128
+# Columns per FP8 activation scale: each row of the hidden states (and of the
+# activated intermediate) gets one scale per block of this many columns, the
+# block gmm_v2 uses on the GMM path, so one outlier channel coarsens only its
+# own block. Each block's partial product is scaled before it is summed.
+_Q_BLOCK = 512
 # Weight DMAs run at this priority so the activation-row gathers, which the
 # next tile waits on first, are not queued behind a whole expert's weights.
 _WEIGHT_DMA_PRIORITY = 1
@@ -106,6 +116,64 @@ _SC_PARITIES = 4
 _SC_LEAD = 2
 
 
+def _unpack_scales(packed, n_q):
+    """The n_q activation scales of a tile as [m, 1] f32 columns, from the
+    [m, 1] int32 columns that carry them two per word (_pack_scales): the
+    first scale in the high 16 bits, the second in the low, each a bf16."""
+    out = []
+    for v in packed:
+        out.append(lax.bitcast_convert_type(v & jnp.int32(-65536), jnp.float32))
+        out.append(lax.bitcast_convert_type(lax.shift_left(v, 16), jnp.float32))
+    return out[:n_q]
+
+
+def _gate_up(act, act_scales, w1):
+    """act [m, h] fp8 @ w1 [h, 2 width] in f32, each _Q_BLOCK-row slab of w1
+    against its column block of act, scaled by that block's row scales
+    (act_scales: one [m, 1] column per block) before the sum."""
+    acc = None
+    for k, scale in enumerate(act_scales):
+        cols = slice(k * _Q_BLOCK, (k + 1) * _Q_BLOCK)
+        part = lax.dot_general(
+            act[:, cols], w1[cols, :], DN, preferred_element_type=jnp.float32
+        )
+        part = part * scale
+        acc = part if acc is None else acc + part
+    return acc
+
+
+def _quantize_mid(acc1, width, w1_scale):
+    """acc1's gate and up halves (x scales applied) through SiLU and the
+    weight scale, quantized per row per min(_Q_BLOCK, width) columns.
+    Returns [(fp8 block, its [m, 1] row scale)] in column order."""
+    mid, _ = _intermediate_rows(
+        acc1, None, width, w1s=w1_scale, act_fn="silu", w1b=None, requantize=False
+    )
+    qa = min(_Q_BLOCK, width)
+    blocks = []
+    for k in range(0, width, qa):
+        blk = mid[:, k : k + qa]
+        scale, sinv, usable = _row_scale(_absmax_rows(blk))
+        blocks.append((_quant_apply(blk, sinv.astype(blk.dtype), usable), scale))
+    return blocks
+
+
+def _down(blocks, w2, cols):
+    """The down projection of _quantize_mid's blocks onto w2's columns `cols`,
+    each block's partial scaled by its row scales, summed in f32 (the weight
+    scale still owed)."""
+    acc, k = None, 0
+    for mq, scale in blocks:
+        n = mq.shape[1]
+        part = lax.dot_general(
+            mq, w2[k : k + n, cols], DN, preferred_element_type=jnp.float32
+        )
+        part = part * scale
+        acc = part if acc is None else acc + part
+        k += n
+    return acc
+
+
 def _cdiv(a, b):
     return (a + b - 1) // b
 
@@ -130,6 +198,8 @@ def _build_expert_kernel(
     n_act = _LOOKAHEAD + 1  # activation tile slots
     window = tile_rows + _LANES  # a tile's rows start anywhere in an aligned window
     scale_window = tile_rows // _LANES + 1
+    n_q = h // _Q_BLOCK
+    n_p = _cdiv(n_q, 2)
     rungs = [tile_rows * (r + 1) // _TILE_RUNGS for r in range(_TILE_RUNGS)]
     lane_blocks = h // _LANES
     shared = experts  # visit-table id of the shared expert
@@ -185,8 +255,11 @@ def _build_expert_kernel(
           visit_rows [V] int32: rows of each visit.
           num_visits [1] int32: visits, the shared one included.
         Inputs in HBM:
-          x_hbm [T, L, 128] fp8: row-quantized hidden states.
-          row_scale_hbm [scale_rows, 128] f32: activation scale of each slab row.
+          x_hbm [T, L, 128] fp8: hidden states quantized per row per
+            _Q_BLOCK columns.
+          row_scale_hbm [P, scale_rows, 128] int32: the activation scales of
+            each slab row, two bf16 per word (_pack_scales), one plane per
+            pair of column blocks (P = ceil(h / (2 * _Q_BLOCK))).
           row_token_hbm [token_rows] int32: token of each routed slab row.
           w1_hbm [E, h, 2i], w2_hbm [E, i, h]: routed expert weights.
           w1_scale_hbm [E, 1, 2i], w2_scale_hbm [E, 1, h] f32: their scales.
@@ -196,7 +269,7 @@ def _build_expert_kernel(
           slab_hbm [slab_rows, L, 128] bf16: unweighted rows, slab order.
         Scratch:
           act_vmem [n_act, tile_rows, L, 128] fp8: gathered activation rows.
-          act_scale_vmem [n_act, scale_window, 128] f32: their scales.
+          act_scale_vmem [n_act, P, scale_window, 128] int32: their scales.
           out_vmem [2, tile_rows, L, 128] bf16: double-buffered tile output.
           w1_ring, w2_ring, w1_scale_ring, w2_scale_ring: [nb, ...] expert
             weight ring.
@@ -292,7 +365,7 @@ def _build_expert_kernel(
         # ---- activation rows ----
         def scale_copy(start, slot):
             return pltpu.make_async_copy(
-                row_scale_hbm.at[pl.ds(start // _LANES, scale_window)],
+                row_scale_hbm.at[:, pl.ds(start // _LANES, scale_window)],
                 act_scale_vmem.at[slot],
                 act_sems.at[slot],
             )
@@ -424,13 +497,20 @@ def _build_expert_kernel(
 
             def compute(rows, w1, w2, w1_scale, w2_scale):
                 act = act_vmem[aslot, pl.ds(0, rows)].reshape(rows, h)
-                act_scale = _tile_row_scales(act_scale_vmem[aslot], start, rows)
-                acc2, mid_scale = expert_ffn_fp8(act, act_scale, w1, w2, w1_scale)
-                assert mid_scale is not None  # requantized rows carry a scale
+                act_scales = _unpack_scales(
+                    [
+                        _tile_row_scales(act_scale_vmem[aslot, k], start, rows)
+                        for k in range(n_p)
+                    ],
+                    n_q,
+                )
+                acc1 = _gate_up(act, act_scales, w1)
+                blocks = _quantize_mid(acc1, w1.shape[-1] // 2, w1_scale)
+                acc2 = _down(blocks, w2, slice(None))
                 # Retile into the per-row slab layout while still f32 (8x8
                 # sublane blocks), then pack to bf16: cheaper than retiling the
                 # packed bf16 value.
-                out = (acc2 * mid_scale * w2_scale).reshape(rows, lane_blocks, _LANES)
+                out = (acc2 * w2_scale).reshape(rows, lane_blocks, _LANES)
                 out = out.astype(jnp.bfloat16)
                 for par in range(2):
 
@@ -490,7 +570,7 @@ def _build_expert_kernel(
             out_specs=hbm,
             scratch_shapes=(
                 pltpu.VMEM((n_act, tile_rows, lane_blocks, _LANES), weight_dtype),
-                pltpu.VMEM((n_act, scale_window, _LANES), jnp.float32),
+                pltpu.VMEM((n_act, n_p, scale_window, _LANES), jnp.int32),
                 pltpu.VMEM((2, tile_rows, lane_blocks, _LANES), jnp.bfloat16),
                 pltpu.VMEM((nb, h, 2 * i), weight_dtype),
                 pltpu.VMEM((nb, i, h), weight_dtype),
@@ -573,6 +653,8 @@ def _build_blocked_expert_kernel(
     tiles = chunk_rows // tile_rows
     window = chunk_rows + _LANES  # a chunk's rows start anywhere in an aligned window
     scale_window = tile_rows // _LANES + 1
+    n_q = h // _Q_BLOCK
+    n_p = _cdiv(n_q, 2)
     lane_blocks = h // _LANES
     shared = experts
     slab_rows = routes + tokens + tile_rows
@@ -623,7 +705,7 @@ def _build_blocked_expert_kernel(
     ):
         """One rank's chunk loop. num_visits counts routed visits. Scratch
         beyond the whole-expert kernel's: act_vmem [2, chunk_rows, L, 128]
-        and act_scale_vmem [2, tiles, scale_window, 128] (a chunk's rows,
+        and act_scale_vmem [2, tiles, P, scale_window, 128] (a chunk's rows,
         double-buffered), acc_vmem [chunk_rows, h] f32 (the running sum),
         out_vmem [chunk_rows, L, 128] bf16, a ring of nb (expert, block)
         units, and the chunk table chunk_expert / chunk_start / chunk_live
@@ -743,7 +825,7 @@ def _build_blocked_expert_kernel(
         def scale_copy(c, buf, t):
             row = (chunk_start[c] + t * tile_rows) // _LANES
             return pltpu.make_async_copy(
-                row_scale_hbm.at[pl.ds(row, scale_window)],
+                row_scale_hbm.at[:, pl.ds(row, scale_window)],
                 act_scale_vmem.at[buf, t],
                 act_sems.at[buf],
             )
@@ -809,30 +891,30 @@ def _build_blocked_expert_kernel(
 
         def tile_ffn(c, buf, t, w1, w2, w1_scale, w2_scale, mode):
             """Tile t of chunk c through one unit: gate/up, the activation and
-            its per-row requantization, then the down projection in column
+            its requantization per row per 512 columns, then the down
+            projection in column
             chunks of _DOWN_CHUNK straight into the running sum (mode "first"
             stores, "mid" adds) or, finished with the down scale, into the
             bf16 output rows ("last" adds the running sum first, "only" has
             none)."""
             lo = pl.multiple_of(t * tile_rows, tile_rows)
             act = act_vmem[buf, pl.ds(lo, tile_rows)].reshape(tile_rows, h)
-            act_scale = _tile_row_scales(
-                act_scale_vmem[buf, t], chunk_start[c] + lo, tile_rows
+            act_scales = _unpack_scales(
+                [
+                    _tile_row_scales(
+                        act_scale_vmem[buf, t, k], chunk_start[c] + lo, tile_rows
+                    )
+                    for k in range(n_p)
+                ],
+                n_q,
             )
-            width = w1.shape[-1] // 2
-            acc1 = lax.dot_general(act, w1[...], DN, preferred_element_type=jnp.float32)
-            mid_q, mid_scale = _intermediate_rows(
-                acc1, act_scale, width, w1s=w1_scale, act_fn="silu", w1b=None
-            )
-            assert mid_scale is not None  # requantized rows carry a scale
+            acc1 = _gate_up(act, act_scales, w1)
+            blocks = _quantize_mid(acc1, w1.shape[-1] // 2, w1_scale)
             rows = pl.ds(lo, tile_rows)
             nc = min(_DOWN_CHUNK, h)
             for n in range(0, h, nc):
                 cols = slice(n, n + nc)
-                part = lax.dot_general(
-                    mid_q, w2[:, cols], DN, preferred_element_type=jnp.float32
-                )
-                part = part * mid_scale
+                part = _down(blocks, w2, cols)
                 if mode == "first":
                     acc_vmem[rows, cols] = part
                 elif mode == "mid":
@@ -960,7 +1042,7 @@ def _build_blocked_expert_kernel(
             out_specs=hbm,
             scratch_shapes=(
                 pltpu.VMEM((2, chunk_rows, lane_blocks, _LANES), weight_dtype),
-                pltpu.VMEM((2, tiles, scale_window, _LANES), jnp.float32),
+                pltpu.VMEM((2, tiles, n_p, scale_window, _LANES), jnp.int32),
                 pltpu.VMEM((chunk_rows, h), jnp.float32),
                 pltpu.VMEM((chunk_rows, lane_blocks, _LANES), jnp.bfloat16),
                 pltpu.VMEM((nb, h, 2 * ib), weight_dtype),
@@ -1001,7 +1083,14 @@ def _blocked_bytes(h, ib, i_s, nb, tile_rows, chunk_rows, wt):
     """VMEM of the blocked kernel: the unit ring, a chunk's double-buffered
     rows, running sum and output, its scale windows and the shared expert."""
     rows = chunk_rows * h * (2 * wt + 4 + 2)
-    scales = 2 * (chunk_rows // tile_rows) * (tile_rows // _LANES + 1) * _LANES * 4
+    scales = (
+        2
+        * (chunk_rows // tile_rows)
+        * _cdiv(h // _Q_BLOCK, 2)
+        * (tile_rows // _LANES + 1)
+        * _LANES
+        * 4
+    )
     return nb * _unit_bytes(h, ib, wt) + rows + scales + _unit_bytes(h, i_s, wt)
 
 
@@ -1049,13 +1138,17 @@ def _routing_plan(topk_ids, route_valid, experts, row_scale):
     over the routes.
 
     One key/value sort orders the routes by expert, carrying each route's id
-    and its token's activation scale; a second sort of that permutation gives
+    and its token's packed activation scales (row_scale [T, P] int32, one
+    payload per word; a gather instead would be a slow TensorCore index
+    gather);
+    a second sort of that permutation gives
     its inverse (each route's slab row). Routes where route_valid [T, K] is
     False get the sentinel expert E, sort last and are never visited.
 
     Returns the token of each slab row [R], the slab row of each route [T, K],
-    the activation scale of each slab row [R], the visit tables (expert, first
-    row, rows; E + _VISIT_SLACK entries each) and the routed visit count.
+    the packed activation scales of each slab row [P, R], the visit tables
+    (expert, first row, rows; E + _VISIT_SLACK entries each) and the routed
+    visit count.
     """
     tokens, topk = topk_ids.shape
     routes = tokens * topk
@@ -1063,9 +1156,12 @@ def _routing_plan(topk_ids, route_valid, experts, row_scale):
         route_valid.reshape(-1), topk_ids.reshape(-1).astype(jnp.int32), experts
     )
     iota = jnp.arange(routes, dtype=jnp.int32)
-    route_scale = jnp.broadcast_to(row_scale[:, None], (tokens, topk)).reshape(-1)
-    _, order, sorted_scale = lax.sort(
-        (route_expert, iota, route_scale), num_keys=1, is_stable=True
+    route_scales = [
+        jnp.broadcast_to(row_scale[:, k, None], (tokens, topk)).reshape(-1)
+        for k in range(row_scale.shape[1])
+    ]
+    _, order, *sorted_scales = lax.sort(
+        (route_expert, iota, *route_scales), num_keys=1, is_stable=True
     )
     _, slab_row = lax.sort((order, iota), num_keys=1, is_stable=False)
     counts = jnp.sum(
@@ -1084,7 +1180,7 @@ def _routing_plan(topk_ids, route_valid, experts, row_scale):
     return (
         order // topk,
         slab_row.reshape(tokens, topk),
-        sorted_scale,
+        jnp.stack(sorted_scales),
         visit_expert,
         first[visit_expert],
         counts[visit_expert],
@@ -1093,18 +1189,34 @@ def _routing_plan(topk_ids, route_valid, experts, row_scale):
 
 
 def _quantize_rows(x, dtype):
-    """Per-row quantization straight into the [T, h / 128, 128] layout the
-    expert kernel gathers rows from (one XLA fusion, no separate retile).
-    Returns (q, scale [T]); an all-zero row gets scale 0."""
+    """Quantization per row per _Q_BLOCK columns straight into the
+    [T, h / 128, 128] layout the expert kernel gathers rows from. The block
+    maxima reduce over lanes first, in that layout (no relayout of x), then
+    over each block's lane blocks. Each scale is rounded up to bf16, so it
+    travels in 16 bits exactly and x / scale stays within the fp8 range.
+    Returns (q, scales [T, ceil(h / (2 * _Q_BLOCK))] int32 packed by
+    _pack_scales); an all-zero block gets scale 0."""
     tokens, h = x.shape
+    per_block = _Q_BLOCK // _LANES
     x3 = x.reshape(tokens, h // _LANES, _LANES)
-    amax = jnp.max(jnp.abs(x3), axis=(1, 2), keepdims=True)
+    amax = jnp.max(jnp.abs(x3), axis=2).reshape(tokens, -1, per_block).max(-1)
     scale = amax.astype(jnp.float32) / float(jnp.finfo(dtype).max)
     usable = jnp.isfinite(scale) & (scale > 0)
-    scale = jnp.where(usable, scale, 0.0)
+    bits = lax.bitcast_convert_type(jnp.where(usable, scale, 0.0), jnp.uint32)
+    bits = (bits + jnp.uint32(0xFFFF)) & jnp.uint32(0xFFFF0000)  # round up to bf16
+    scale = lax.bitcast_convert_type(bits, jnp.float32)
     inv = jnp.where(usable, 1.0 / jnp.where(usable, scale, 1.0), 0.0)
-    q = jnp.where(usable, x3 * inv.astype(x.dtype), jnp.zeros_like(x3)).astype(dtype)
-    return q, scale.reshape(-1)
+    inv = jnp.repeat(inv.astype(x.dtype), per_block, axis=1)[:, :, None]
+    q = jnp.where(inv != 0, x3 * inv, jnp.zeros_like(x3)).astype(dtype)
+    return q, _pack_scales(bits)
+
+
+def _pack_scales(bits):
+    """[T, Q] uint32 bf16-valued scale bits -> [T, ceil(Q / 2)] int32, two
+    per word: block 2j in the high 16 bits, block 2j + 1 in the low."""
+    if bits.shape[1] % 2:
+        bits = jnp.pad(bits, ((0, 0), (0, 1)))
+    return lax.bitcast_convert_type(bits[:, 0::2] | (bits[:, 1::2] >> 16), jnp.int32)
 
 
 def _chunked_psum(tokens, combine_chunk, axis_name):
@@ -1400,9 +1512,12 @@ def fused_moe_prefill(
         plan_blocks picks it for experts too large to stream whole.
 
     The weights' dtype (FP8 in production) is also the dtype the kernel
-    quantizes the hidden states and the activated intermediate to.
+    quantizes the hidden states and the activated intermediate to, one scale
+    per row per 512 columns. The hidden size must be a multiple of 512.
     """
     tokens, h = hidden.shape
+    if h % _Q_BLOCK:
+        raise ValueError(f"hidden size {h} must be a multiple of {_Q_BLOCK}")
     experts, _, two_i = w1.shape
     i = two_i // 2
     i_s = shared_w2.shape[0]
@@ -1459,15 +1574,19 @@ def fused_moe_prefill(
         visit_expert = visit_expert.at[routed_visits].set(experts)
         visit_start = visit_start.at[routed_visits].set(routes)
         visit_rows = visit_rows.at[routed_visits].set(tokens)
-    row_scale = jnp.concatenate([sorted_scale, x_scale])
-    row_scale = jnp.pad(row_scale, (0, scale_rows * _LANES - row_scale.shape[0]))
+    # [P, slab rows]: per packed scale word, the routed rows' then the shared
+    # rows' (every token), each plane in the flat lane-dense layout.
+    row_scale = jnp.concatenate([sorted_scale, x_scale.T], 1)
+    row_scale = jnp.pad(
+        row_scale, ((0, 0), (0, scale_rows * _LANES - row_scale.shape[1]))
+    )
     slab = call(
         visit_expert,
         visit_start,
         visit_rows,
         (routed_visits + 1 if blocks is None else routed_visits).reshape(1),
         x_q,
-        row_scale.reshape(-1, _LANES),
+        row_scale.reshape(row_scale.shape[0], -1, _LANES),
         jnp.pad(row_token, (0, token_rows - routes)),
         w1,
         w2,

@@ -26,6 +26,8 @@ from vllm_torchtpu.kernels.experimental.fused_moe_prefill import (
     plan_blocks,
 )
 
+pytestmark = pytest.mark.multichip
+
 F8 = jnp.float8_e4m3fn
 
 
