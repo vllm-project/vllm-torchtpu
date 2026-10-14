@@ -1318,13 +1318,24 @@ def build_glm_mla_pool_manifest(
     for tag, layer_name, dtype_tag, tensor in flat:
         nbytes = _nbytes(tensor)
         shape = tuple(int(dim) for dim in getattr(tensor, "shape", ()))
-        if len(shape) != 4:
+        itemsize = _element_size(tensor)
+        if len(shape) == 4:
+            num_blocks, rows, packing, width = shape
+            tokens_per_row = packing
+        elif (
+            len(shape) == 3
+            and itemsize == 4
+            and class_tag(tag) in (TAG_MLA_NOPE, TAG_MLA_ROPE)
+        ):
+            num_blocks, rows, width = shape
+            packing = 1
+            tokens_per_row = block_size_tokens // rows if rows > 0 else 0
+        else:
             raise ManifestError(
-                f"cache {layer_name} must be [blocks, rows, packing, width]: "
+                f"cache {layer_name} must be [blocks, rows, packing, width] "
+                "(or a SparseCore uint32 [blocks, rows, words] MLA cache): "
                 f"got shape {shape}"
             )
-        num_blocks, rows, packing, width = shape
-        itemsize = _element_size(tensor)
         if num_blocks <= 0 or nbytes % num_blocks != 0:
             raise ManifestError(
                 f"cache {layer_name} nbytes {nbytes} is not divisible by "
@@ -1338,9 +1349,9 @@ def build_glm_mla_pool_manifest(
                     f"cache {layer_name} nope rows {rows} do not match the "
                     f"KV block size {block_size_tokens}"
                 )
-        elif rows * packing != block_size_tokens:
+        elif rows * tokens_per_row != block_size_tokens:
             raise ManifestError(
-                f"cache {layer_name} rows*packing {rows}*{packing} does not "
+                f"cache {layer_name} rows*packing {rows}*{tokens_per_row} does not "
                 f"match the KV block size {block_size_tokens}"
             )
         # The packing axis must fill one 32-bit word (see the layout
