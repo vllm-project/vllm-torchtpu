@@ -37,14 +37,14 @@ dependencies = [
     # torch==2.13.0 above; a mismatched pair fails at operator-registration time,
     # not at install time.
     "torchvision==0.28.0",
-    "torch-tpu==0.1.1.dev20260924085621",
+    "torch-tpu==0.1.1+release.2026.9.22.20261003154636",
     # High-bandwidth PJRT raw-transfer / KV-cache DMA engine backing the
     # raiden KV connector (disaggregated serving) and host KV offload; the
     # import name is `tpu_sync`. The wheel bundles one extension per
     # supported torch ABI and dispatches to the variant matching the
     # installed torch at import time. Published to PyPI as nightly .dev
     # pre-releases, so it needs no registry source below.
-    "tpu-sync-torch==0.0.1.dev20260923040928",
+    "tpu-sync-torch==0.0.1.dev20261013083150",
     # Imported directly by src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py, so
     # declared here rather than leaned on as a vLLM transitive.
     #
