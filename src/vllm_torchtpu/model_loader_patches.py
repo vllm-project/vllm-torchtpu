@@ -239,7 +239,9 @@ def _sharded_runai_weights_iterator(
             if run_sizes:
                 # run_start is set whenever a size is appended to run_sizes.
                 assert run_start is not None
-                requests.append(FileChunks(len(requests), path, run_start, run_sizes))
+                requests.append(
+                    FileChunks.contiguous(len(requests), path, run_start, run_sizes)
+                )
                 tensors_by_request.append(run_tensors)
             run_start, run_sizes, run_tensors = None, [], []
 
@@ -270,7 +272,7 @@ def _sharded_runai_weights_iterator(
                     # so it is a request of its own.
                     _flush(path)
                     requests.append(
-                        FileChunks(
+                        FileChunks.contiguous(
                             len(requests),
                             path,
                             pos + start * row_bytes,
