@@ -18,6 +18,9 @@ from vllm_torchtpu.kernels.deepseek_v41 import (
     tuned_block_sizes,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
+    decode as decode_index_selection,
+)
+from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
     scores as prefill_index_scores,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
@@ -2390,6 +2393,40 @@ _indexer_op = None
 _indexer_2bank_op = None
 
 
+def _decode_select(
+    q,
+    weights,
+    pool,
+    pages,
+    lengths,
+    *,
+    page_records,
+    candidate_count=0,
+    candidate_block_size=1,
+):
+    """Run the complete TC/SC decode pipeline inside the manual wrapper mesh."""
+    from jax.sharding import PartitionSpec as P
+
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        get_vllm_model_wrapper_context,
+    )
+
+    select = functools.partial(
+        decode_index_selection.decode_indexer,
+        page_records=page_records,
+        key_tile=4096,
+        candidate_count=candidate_count,
+        candidate_block_size=candidate_block_size,
+    )
+    try:
+        mesh = get_vllm_model_wrapper_context().mesh
+    except AssertionError:
+        return select(q, weights, pool, pages, lengths)
+    return jax.shard_map(
+        select, mesh=mesh, in_specs=(P(),) * 5, out_specs=P(), check_vma=False
+    )(q, weights, pool, pages, lengths)
+
+
 def _prefill_score(q, weights, pool, pages, limit, *, page_records):
     """Resident-query scorer, manually replicated across the wrapper mesh."""
     from jax.sharding import PartitionSpec as P
@@ -2895,7 +2932,59 @@ def paged_indexer_jax(
 
         return jax.lax.cond(lengths.max() <= topk, all_indices, ranked, None)
 
+    def decode_context():
+        count = records.shape[0]
+        queries = q.shape[0] // count
+        # Pad the compact page table, not the full per-token record matrix.
+        width = max(4096, 1 << (records.shape[1] - 1).bit_length())
+        pages = jnp.pad(
+            records[:, ::page_records],
+            ((0, 0), (0, (width - records.shape[1]) // page_records)),
+            constant_values=-1,
+        )
+        publish = (
+            candidate_write and candidates.shape[1] * block_size < records.shape[1]
+        )
+        result = _decode_select(
+            split_halves(q).reshape(count, queries, *q.shape[1:]),
+            weights.astype(jnp.float32).reshape(count, queries, q.shape[1], 1),
+            pool,
+            pages,
+            lengths.reshape(count, queries),
+            page_records=page_records,
+            candidate_count=candidates.shape[1] if publish else 0,
+            candidate_block_size=block_size,
+        )
+        return result if publish else (result, candidates)
+
     def full_context(_):
+        if (
+            jax.default_backend() == "tpu"
+            and unordered
+            and not candidate_filter
+            and (
+                not candidate_write
+                or (
+                    block_size > 0
+                    and 4096 % block_size == 0
+                    and candidates.shape[1] > 0
+                    and candidates.shape[1] % 16 == 0
+                )
+            )
+            and topk == 512
+            and decode_index_selection.supports_decode(q, pool, records, page_records)
+        ):
+            expected = jnp.repeat(
+                jnp.arange(records.shape[0], dtype=jnp.int32),
+                q.shape[0] // records.shape[0],
+            )
+            # Draft/mixed batches can share the padded shape but have different
+            # request boundaries. Never reinterpret those rows as uniform groups.
+            regular = jnp.all((requests == expected) | (lengths == 0))
+            return jax.lax.cond(regular, decode_context, existing_context)
+        return existing_context()
+
+    def existing_context():
         rows = q.shape[0]
         if (
             records.shape[0] > 1

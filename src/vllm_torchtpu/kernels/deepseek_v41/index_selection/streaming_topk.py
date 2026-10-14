@@ -30,6 +30,7 @@ def _ordered_bits(keys: jax.Array) -> jax.Array:
         "k",
         "block_size",
         "reconstruct_threshold",
+        "exclude_neg_inf",
     ),
 )
 def streaming_topk(
@@ -39,6 +40,7 @@ def streaming_topk(
     k: int = 512,
     block_size: int = 8192,
     reconstruct_threshold: int = 8192,
+    exclude_neg_inf: bool = False,
 ) -> jax.Array:
     """Return unordered logical TopK indices, padded with -1.
 
@@ -49,8 +51,9 @@ def streaming_topk(
     scores strictly above the retained threshold. Signed zeros use FP32 radix
     order (+0 above -0), as in the existing SparseCore selector.
 
-    Callers exclude selected -inf values and sort logical indices. Keeping this
-    adapter outside the kernel matches the existing benchmark's full cost.
+    exclude_neg_inf masks selected -inf entries using resident candidate keys,
+    avoiding a separate score gather. Callers still sort logical indices; when
+    the flag is false they also exclude selected -inf values themselves.
     Inputs must contain ordinary FP32 scores or -inf masking, not NaNs.
     """
     if scores.ndim != 2 or scores.dtype != jnp.float32:
@@ -335,6 +338,14 @@ def streaming_topk(
                 scan_block,
                 (jnp.int32(0), jnp.uint32(0), jnp.bool_(False)),
             )
+            if exclude_neg_inf:
+
+                @plsc.parallel_loop(0, output_width, lanes)
+                def invalidate_masked(i):
+                    ids = candidate_ids[pl.ds(i, lanes)]
+                    keys = candidates[pl.ds(i, lanes)]
+                    candidate_ids[pl.ds(i, lanes)] = jnp.where(keys > -jnp.inf, ids, -1)
+
             pltpu.async_copy(
                 candidate_ids.at[:output_width], out_indices_ref.at[row], sem
             ).wait()

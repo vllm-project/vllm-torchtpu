@@ -70,6 +70,8 @@ def _kernel(
     coalesce,
     prefetch,
     profile_stages,
+    row_lengths=None,
+    row_offset=0,
 ):
     scope = jax.named_scope if profile_stages else contextlib.nullcontext
     with scope("prefill_kernel_body"):
@@ -179,6 +181,31 @@ def _kernel(
                     preferred_element_type=jnp.float32,
                 ).reshape(rows, heads, tile)
                 values = (jnp.maximum(logits, 0) * weights).sum(1)
+                if row_lengths is not None:
+                    position = window_start + block * tile + jnp.arange(tile)
+                    causal = (
+                        position[None, :]
+                        < jnp.stack([row_lengths[row_offset + i] for i in range(rows)])[
+                            :, None
+                        ]
+                    )
+                    page_valid = jnp.concatenate(
+                        [
+                            jnp.broadcast_to(
+                                (
+                                    pages[
+                                        (window_start // tile + block) * tile_pages + p
+                                    ]
+                                    >= 0
+                                ).astype(jnp.int32),
+                                (1, page_records),
+                            )
+                            for p in range(tile_pages)
+                        ],
+                        axis=1,
+                    )
+                    valid = causal & (page_valid != 0)
+                    values = jnp.where(valid, values, -jnp.inf)
                 out[:, pl.ds(block * tile, tile)] = values
 
         jax.lax.fori_loop(0, steps, body, None)

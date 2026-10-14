@@ -1,0 +1,141 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Decode routing preserves request ownership and candidate semantics."""
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+
+from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels as ak
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("width", [6144, 49408, 98816])
+@pytest.mark.parametrize("mode", ["regular", "padded", "draft", "ordered", "publish"])
+def test_decode_route(monkeypatch, width, mode):
+    monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
+    count, queries, heads = 4, 6, 32
+    rows = count * queries
+    q = jnp.arange(rows * heads * 128, dtype=jnp.float32).reshape(rows, heads, 128)
+    q = q.astype(jnp.bfloat16)
+    weights = jnp.arange(rows * heads, dtype=jnp.float32).reshape(rows, heads)
+    records = jnp.arange(count * width, dtype=jnp.int32).reshape(count, width)
+    lengths = jnp.full(rows, width - 1, jnp.int32)
+    requests = jnp.repeat(jnp.arange(count, dtype=jnp.int32), queries)
+    if mode == "padded":
+        lengths = lengths.at[-3:].set(0)
+        requests = requests.at[-3:].set(0)
+    elif mode == "draft":
+        requests = jnp.arange(rows, dtype=jnp.int32) % count
+    candidates = jnp.zeros((rows, 128 if mode == "publish" else 0), jnp.int32)
+    pool = jnp.zeros((128, 128), jnp.int32)
+    calls = []
+
+    def new_select(
+        grouped_q,
+        grouped_weights,
+        pool,
+        pages,
+        limits,
+        *,
+        page_records,
+        candidate_count,
+        candidate_block_size,
+    ):
+        calls.append(True)
+        assert page_records == 128
+        assert pages.shape == (count, (1 << (width - 1).bit_length()) // 128)
+        np.testing.assert_array_equal(pages[:, : width // 128], records[:, ::128])
+        np.testing.assert_array_equal(pages[:, width // 128 :], -1)
+        np.testing.assert_array_equal(grouped_q.reshape(q.shape), ak.split_halves(q))
+        np.testing.assert_array_equal(grouped_weights.reshape(weights.shape), weights)
+        np.testing.assert_array_equal(limits.reshape(-1), lengths)
+        result = jnp.where(lengths[:, None] > 0, jnp.full((rows, 512), 2), -1)
+        assert candidate_block_size == 8
+        if mode == "publish":
+            assert candidate_count == 128
+            return result, jnp.full(candidates.shape, 3, jnp.int32)
+        assert candidate_count == 0
+        return result
+
+    def old_score(q, pool, records, weights, lengths, requests, page_records):
+        return jnp.ones((q.shape[0], records.shape[1]), jnp.float32)
+
+    def old_select(scores, lengths, candidates, *args):
+        result = jnp.where(lengths[:, None] > 0, scores[:, :512].astype(jnp.int32), -1)
+        return result, candidates
+
+    monkeypatch.setattr(ak, "_decode_select", new_select)
+    monkeypatch.setattr(ak, "paged_index_scores_jax", old_score)
+    monkeypatch.setattr(ak, "select_indices_jax", old_select)
+    with jax.disable_jit():
+        selected, published = ak.paged_indexer_jax(
+            q,
+            pool,
+            records,
+            weights,
+            lengths,
+            candidates,
+            requests,
+            512,
+            8,
+            mode == "publish",
+            False,
+            mode != "ordered",
+            page_records=128,
+        )
+    optimized = mode in ("regular", "padded", "publish")
+    assert bool(calls) == optimized
+    expected = np.where(np.asarray(lengths)[:, None] > 0, 2 if optimized else 1, -1)
+    np.testing.assert_array_equal(selected, np.broadcast_to(expected, (rows, 512)))
+    np.testing.assert_array_equal(published, 3 if mode == "publish" else candidates)
+
+
+@pytest.mark.skipif(jax.default_backend() != "tpu", reason="TPU decode pipeline")
+@pytest.mark.parametrize("width", [49408, 98816])
+@pytest.mark.parametrize("candidate_count", [0, 2048])
+def test_decode_route_tpu_matches_existing(monkeypatch, width, candidate_count):
+    rng = np.random.default_rng(721)
+    count, queries, page = 4, 6, 128
+    keys = jnp.asarray(rng.normal(size=(count * width, 128)), jnp.bfloat16)
+    words = jax.lax.bitcast_convert_type(keys.reshape(-1, 64, 2), jnp.int32)
+    words = words.reshape(-1, 128)
+    bank_rows = words.shape[0] // 2
+    pool = (words[:bank_rows], words[bank_rows:])
+    page_order = rng.permutation(count * width // page).reshape(count, -1)
+    records = jnp.asarray(
+        (page_order[:, :, None] * page + np.arange(page)).reshape(count, width),
+        jnp.int32,
+    )
+    records = records.at[0, page : 2 * page].set(-1)
+    q = jnp.asarray(rng.normal(size=(count * queries, 32, 128)), jnp.bfloat16)
+    weights = jnp.asarray(rng.uniform(0.1, 1, size=(count * queries, 32)), jnp.float32)
+    lengths = jnp.full(count * queries, width - 200, jnp.int32)
+    lengths = lengths.at[-queries:].set(jnp.array([0, 1, 127, 511, 512, 513]))
+    requests = jnp.repeat(jnp.arange(count, dtype=jnp.int32), queries)
+    candidates = jnp.zeros((count * queries, candidate_count), jnp.int32)
+
+    def run(q, pool, records, weights, lengths, candidates, requests):
+        return ak.paged_indexer_jax(
+            q,
+            pool,
+            records,
+            weights,
+            lengths,
+            candidates,
+            requests,
+            512,
+            8,
+            candidate_count > 0,
+            False,
+            True,
+            page_records=page,
+        )
+
+    args = (q, pool, records, weights, lengths, candidates, requests)
+    candidate = jax.tree.map(np.asarray, jax.jit(run)(*args))
+    monkeypatch.setattr(ak.decode_index_selection, "supports_decode", lambda *a: False)
+    baseline = jax.tree.map(np.asarray, jax.jit(lambda *a: run(*a))(*args))
+    np.testing.assert_array_equal(candidate[0], baseline[0])
+    np.testing.assert_array_equal(np.sort(candidate[1]), np.sort(baseline[1]))
