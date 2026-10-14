@@ -57,9 +57,9 @@
 # the decode's default deferred Stage-3 submit. RECIPE_STORE_SERVERS=1 (c-h)
 # adds the global registry on the prefill head and a host-store server on each
 # decode host, which k3_1p1d.sh starts; the prefill's host store joins their
-# pool and the decode drops its own. Departures for GKE: the DP2 points' prefill
-# keeps the 1.5 TiB host store (the doc: 2 TiB, 512 GiB per host), and has no
-# --numa-bind, which runs the ranks under numactl and the engine image has none.
+# pool and the decode drops its own. Departure for GKE: the prefill of e-h has
+# no --numa-bind, which runs the ranks under numactl and the engine image has
+# none.
 
 for _v in RECIPE_CONCURRENCY RECIPE_DECODE RECIPE_DECODE_MAX_NUM_SEQS; do
   [ -n "${!_v:-}" ] || { echo "ERROR: kimi-k3-megakernel: the point sets no $_v" >&2; return 2; }
@@ -313,8 +313,14 @@ COMMON_ARGS=(
 # (build 601). The size matters: at 384 GiB the first set's point 4 prefill
 # recomputed 3.2x the trace's minimum prompt tokens with P90 TTFT 19.2 s
 # (build 588), at 768 GiB 2.6x and 7.5 s (589), at 1.5 TiB 6.2 s with 5% more
-# throughput than 768 GiB (597). A point may set RECIPE_OFFLOAD_BYTES.
-_offload_bytes="${RECIPE_OFFLOAD_BYTES:-1649267441664}"
+# throughput than 768 GiB (597). The doc's points without speculation (e-h)
+# give the prefill 2 TiB (2199023255552, 64 GiB per rank, 512 GiB per host). A
+# point may set RECIPE_OFFLOAD_BYTES.
+if [ "$_no_spec" = 1 ]; then
+  _offload_bytes="${RECIPE_OFFLOAD_BYTES:-2199023255552}"
+else
+  _offload_bytes="${RECIPE_OFFLOAD_BYTES:-1649267441664}"
+fi
 # The Oct 13 store servers' pool: the prefill's host store registers with the
 # global registry and joins the pool group the decode-host store servers serve.
 _registry_port=27900
