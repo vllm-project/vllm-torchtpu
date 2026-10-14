@@ -46,6 +46,8 @@ class StructuredDecodingManager:
             device="cpu",
             pin_memory=PIN_MEMORY,
         )
+        self.grammar_bitmask_np = self.grammar_bitmask_cpu.numpy()
+        self.require_structured_out_np = self.require_structured_out_cpu.numpy()
         self.device = runner.device
         # Pre-allocate directly on device to avoid repeated host-to-device transfers
         # every step
@@ -88,6 +90,10 @@ class StructuredDecodingManager:
                 device="cpu",
                 pin_memory=PIN_MEMORY,
             )
+            self.target_grammar_bitmask_np = self.target_grammar_bitmask_cpu.numpy()
+            self.require_structured_out_target_np = (
+                self.require_structured_out_target_cpu.numpy()
+            )
 
     def prepare_structured_decoding_input(
         self,
@@ -108,12 +114,18 @@ class StructuredDecodingManager:
         req_id_to_index = self.runner.input_batch.req_id_to_index
 
         bitmask = grammar_output.grammar_bitmask
-        local_indices = []
-        mask_rows = []
+        local_indices: list[int] = []
+        mask_rows: list[int] = []
+        is_contiguous = True
         for mask_row, req_id in enumerate(grammar_output.structured_output_request_ids):
             batch_index = req_id_to_index.get(req_id)
             if batch_index is not None and cur_start_idx <= batch_index < cur_end_idx:
-                local_indices.append(batch_index - cur_start_idx)
+                local_idx = batch_index - cur_start_idx
+                if local_indices and (
+                    local_idx != local_indices[-1] + 1 or mask_row != mask_rows[-1] + 1
+                ):
+                    is_contiguous = False
+                local_indices.append(local_idx)
                 mask_rows.append(mask_row)
 
         # Fast path 1: No structured requests in this chunk.
@@ -132,18 +144,20 @@ class StructuredDecodingManager:
         # Standard path: handles all structured batches (all-structured,
         # mixed, or permuted).
         if not all_rows_structured:
-            self.grammar_bitmask_cpu[:padded_num_reqs].zero_()
-            self.require_structured_out_cpu[:padded_num_reqs].zero_()
-            self.require_structured_out_cpu[local_indices] = True
+            self.grammar_bitmask_np[:padded_num_reqs].fill(0)
+            self.require_structured_out_np[:padded_num_reqs].fill(False)
+            if is_contiguous:
+                l0 = local_indices[0]
+                self.require_structured_out_np[l0 : l0 + num_local] = True
+            else:
+                self.require_structured_out_np[local_indices] = True
 
-        if num_local == 1:
-            self.grammar_bitmask_cpu[local_indices[0]].copy_(
-                torch.from_numpy(bitmask[mask_rows[0]])
-            )
+        if is_contiguous:
+            l0 = local_indices[0]
+            m0 = mask_rows[0]
+            self.grammar_bitmask_np[l0 : l0 + num_local] = bitmask[m0 : m0 + num_local]
         else:
-            self.grammar_bitmask_cpu[local_indices] = torch.from_numpy(
-                bitmask[mask_rows]
-            )
+            self.grammar_bitmask_np[local_indices] = bitmask[mask_rows]
 
         require_sd = (
             self.device_all_true_require[:padded_num_reqs]
@@ -183,16 +197,16 @@ class StructuredDecodingManager:
         is None.
         """
         padded_bonus_rows = bonus_logits.shape[0]
-        self.grammar_bitmask_cpu[:padded_bonus_rows].zero_()
-        self.require_structured_out_cpu[:padded_bonus_rows].zero_()
+        self.grammar_bitmask_np[:padded_bonus_rows].fill(0)
+        self.require_structured_out_np[:padded_bonus_rows].fill(False)
 
         padded_target_rows = 0
         target_row_starts = None
         if target_logits is not None:
             assert draft_lengths_cpu is not None
             padded_target_rows = target_logits.shape[0]
-            self.target_grammar_bitmask_cpu[:padded_target_rows].zero_()
-            self.require_structured_out_target_cpu[:padded_target_rows].zero_()
+            self.target_grammar_bitmask_np[:padded_target_rows].fill(0)
+            self.require_structured_out_target_np[:padded_target_rows].fill(False)
             # Chunk-local start row of each request's drafts in target_logits.
             target_row_starts = np.zeros(len(draft_lengths_cpu) + 1, dtype=np.int64)
             np.cumsum(draft_lengths_cpu, out=target_row_starts[1:])
@@ -219,15 +233,13 @@ class StructuredDecodingManager:
                         f"{draft_lengths_cpu[local_index]} drafts."
                     )
                 row = int(target_row_starts[local_index])
-                self.target_grammar_bitmask_cpu[row : row + num_drafts] = (
-                    torch.from_numpy(bitmask[mask_row : mask_row + num_drafts])
-                )
-                self.require_structured_out_target_cpu[row : row + num_drafts] = True
+                self.target_grammar_bitmask_np[row : row + num_drafts] = bitmask[
+                    mask_row : mask_row + num_drafts
+                ]
+                self.require_structured_out_target_np[row : row + num_drafts] = True
             # Bonus row.
-            self.grammar_bitmask_cpu[local_index] = torch.from_numpy(
-                bitmask[mask_row + num_drafts]
-            )
-            self.require_structured_out_cpu[local_index] = True
+            self.grammar_bitmask_np[local_index] = bitmask[mask_row + num_drafts]
+            self.require_structured_out_np[local_index] = True
             mask_row += 1 + num_drafts
 
         if target_logits is not None:
