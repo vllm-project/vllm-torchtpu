@@ -1247,6 +1247,7 @@ def prepare_outputs(
         "live_gather_all_chunks",
         "topk_cap",
         "is_dcp_mode",
+        "capped_live_rows",
         "lse_lane_dense",
     ),
 )
@@ -1281,6 +1282,7 @@ def sparse_ragged_paged_attention(
     live_gather_all_chunks: bool = True,
     topk_cap: int | None = None,
     is_dcp_mode: bool = False,
+    capped_live_rows: bool = False,
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
@@ -1339,6 +1341,9 @@ def sparse_ragged_paged_attention(
         than `topk` live entries (DCP).
       is_dcp_mode: whether to enable DCP mode (skips gather and attention compute
         for padding and uses dynamic KV cache slice sizing).
+      capped_live_rows: With `topk_cap`, the native gather also skips each
+        (window, token) row's 64-slot atoms past its live count; the kernel
+        never reads those slots (`kv_len` masks), so outputs are unchanged.
       q_pe: Split-q mode. `q` is then q_nope only, `[max_num_tokens,
         num_q_heads, nope]` with `nope` a multiple of 128 and `num_q_heads` a
         multiple of the dtype packing, and `q_pe` `[max_num_tokens,
@@ -1551,6 +1556,7 @@ def sparse_ragged_paged_attention(
             small_chunk_gather_atoms=small_chunk_gather_atoms,
             live_gather_all_chunks=live_gather_all_chunks,
             topk_cap=topk_cap,
+            capped_live_rows=capped_live_rows,
             topk_override=topk,
             window_indices=(
                 None
@@ -1668,6 +1674,7 @@ def sparse_attention_chunk(
     small_chunk_gather_atoms: int = 1,
     live_gather_all_chunks: bool = False,
     topk_cap: int | None = None,
+    capped_live_rows: bool = False,
     topk_override: int | None = None,
     is_dcp_mode: bool = False,
     window_indices: jax.Array | None = None,
@@ -1965,6 +1972,17 @@ def sparse_attention_chunk(
                 .transpose(1, 0, 2)
                 .reshape(capped_windows * chunk_size, topk_cap)
             )
+        row_live_atoms = None
+        if capped_live_rows:
+            # Window w of a gridded token holds prefix-packed slots [w*cap, (w+1)*cap).
+            window_start = topk_cap * jnp.arange(capped_windows, dtype=jnp.int32)
+            live_slots = jnp.clip(
+                kv_lens[start_pos:end_pos][None, :] - window_start[:, None], 0, topk_cap
+            )
+            live_slots = jnp.where(jnp.arange(chunk_size) < live_tokens, live_slots, 0)
+            row_live_atoms = (
+                (live_slots + GATHER_ATOM_ROWS - 1) // GATHER_ATOM_ROWS
+            ).reshape(-1)
         gathered_nope_buffer, gathered_rope_buffer = (
             native_sc_gather.dsa_gather_native_sc(
                 cache_kv_nope,
@@ -1977,6 +1995,7 @@ def sparse_attention_chunk(
                 # No is_dcp_mode: capped liveness is `num_live_capped`, not -1.
                 num_live_indices=num_live_capped,
                 live_multiple=kernel_batch_size * topk_cap,
+                row_live_atoms=row_live_atoms,
             )
         )
         gathered_nope_buffer = gathered_nope_buffer.reshape(

@@ -1185,7 +1185,10 @@ def sparse_mla_attention_dcp(
         ):
             topk_cap = None
         chunk_kwargs = (
-            {"gather_and_attention_chunk_size": envs.TPU_DCP_MLA_TOPK_CAP_CHUNK}
+            {
+                "gather_and_attention_chunk_size": envs.TPU_DCP_MLA_TOPK_CAP_CHUNK,
+                "capped_live_rows": envs.TPU_SPARSE_MLA_LIVE_GATHER,
+            }
             if topk_cap
             else {}
         )
