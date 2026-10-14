@@ -241,6 +241,12 @@ class SequenceLayoutPlanner(Protocol):
         """Most tokens one rank runs per step, or None for the global count."""
         ...
 
+    @property
+    def local_reqs_per_req(self) -> int:
+        """Most rank-local requests one scheduled request becomes; the
+        attention metadata's request bucket is this times `max_num_reqs`."""
+        ...
+
     def reserve_host_token_capacity(
         self, runner: Any, required_num_tokens: int
     ) -> None: ...
@@ -308,6 +314,10 @@ class AllSequenceLayoutPlanner:
     @property
     def max_local_num_tokens(self) -> int | None:
         return None
+
+    @property
+    def local_reqs_per_req(self) -> int:
+        return 1
 
     def reserve_host_token_capacity(
         self, runner: Any, required_num_tokens: int

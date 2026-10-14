@@ -157,7 +157,9 @@ from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
 from vllm_torchtpu.runner.pcp_manager import (
     PcpKvGatherPlan,
+    PcpManager,
     dummy_pcp_kv_gather_fields,
+    mla_kv_page_size,
     pcp_kv_gather_fields,
 )
 from vllm_torchtpu.runner.mm_encoder_manager import (
@@ -901,6 +903,12 @@ class TPUModelRunner(GPUModelRunner):
         # InputBatch needs to work with sampling tensors greater than padding
         # to avoid dynamic shapes. Also, avoid suboptimal alignment.
         self.max_num_reqs = max(self.max_num_reqs, MIN_NUM_SEQS)
+        # Requests the attention metadata holds per step: a sequence layout
+        # can run one scheduled request as several rank-local ones (PCP
+        # manager), so its request bucket outgrows `max_num_reqs`.
+        self.max_num_local_reqs = (
+            self.max_num_reqs * self.sequence_layout_planner.local_reqs_per_req
+        )
         # TPUPlatform sets compile_sizes to the token padding buckets, so they
         # are ints here; the config field's own type also admits str and None.
         compile_sizes = vllm_config.compilation_config.compile_sizes
@@ -1757,6 +1765,18 @@ class TPUModelRunner(GPUModelRunner):
     def initialize_kv_cache(self, kv_cache_config: KVCacheConfig) -> None:
         with set_current_vllm_config(self.vllm_config):
             self.kv_cache_manager.initialize_kv_cache(kv_cache_config)
+        planner = getattr(self, "sequence_layout_planner", None)
+        if isinstance(planner, PcpManager):
+            # The KV-gather workspace is in units of the MLA cache's page,
+            # which vLLM may have unified away from `cache_config.block_size`.
+            planner.set_page_size(mla_kv_page_size(kv_cache_config))
+            logger.info(
+                "PCP manager KV workspace: page_size=%d, %d workspace pages "
+                "(%d tokens)",
+                planner.page_size,
+                planner.num_ws_pages,
+                planner.num_ws_pages * planner.virtual_page_size,
+            )
 
     def get_kv_prewarm_shapes(self) -> list[int]:
         return self.kv_cache_manager.get_kv_prewarm_shapes()
@@ -7716,9 +7736,10 @@ class TPUModelRunner(GPUModelRunner):
                 return self.max_num_blocks_per_req
             return cdiv(model_len, self.block_size)
 
+        max_num_local_reqs = getattr(self, "max_num_local_reqs", self.max_num_reqs)
         self.num_reqs_max_model_len = min(
             PallasAttentionBackend.get_max_num_seqs_for_pages(widest_table(None)),
-            self.max_num_reqs,
+            max_num_local_reqs,
             self.max_num_tokens,
         )
         self.num_reqs_most_model_len = None
@@ -7726,7 +7747,7 @@ class TPUModelRunner(GPUModelRunner):
             pages = widest_table(self.most_model_len)
             self.num_reqs_most_model_len = min(
                 PallasAttentionBackend.get_max_num_seqs_for_pages(pages),
-                self.max_num_reqs,
+                max_num_local_reqs,
                 self.max_num_tokens,
             )
             self.num_blocks_per_most_len_req = pages

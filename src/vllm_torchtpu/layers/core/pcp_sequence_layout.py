@@ -377,6 +377,10 @@ class PcpSequenceLayoutPlanner:
     def max_local_num_tokens(self) -> int | None:
         return None
 
+    @property
+    def local_reqs_per_req(self) -> int:
+        return 1
+
     def reserve_host_token_capacity(
         self, runner: Any, required_num_tokens: int
     ) -> None:

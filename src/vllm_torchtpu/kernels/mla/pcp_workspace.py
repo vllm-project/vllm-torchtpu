@@ -69,14 +69,15 @@ def gather_workspace(
 
 
 def position_ordered(workspace: jax.Array, interleave: int) -> jax.Array:
-    """`[dcp, Pw, P/4, 4, W]` rank-major -> `[Pw, dcp * P/4, 4, W]`, one
-    position-ordered page per virtual page (a transpose at `interleave`
-    granularity)."""
+    """`[dcp, Pw, P/4, 4, W]` rank-major -> `[Pw * dcp, P/4, 4, W]` in
+    position order (a transpose at `interleave` granularity). Virtual page
+    `v` becomes the `dcp` cache-sized pages `v * dcp .. v * dcp + dcp - 1`,
+    so the top-k kernel's `num_kv_pages_per_block` keeps its VMEM size."""
     dcp, num_ws_pages, rows, packing, width = workspace.shape
     page_size = rows * packing
     x = workspace.reshape(dcp, num_ws_pages, page_size // interleave, interleave, width)
     x = jnp.transpose(x, (1, 2, 0, 3, 4))
-    return x.reshape(num_ws_pages, dcp * rows, packing, width)
+    return x.reshape(num_ws_pages * dcp, rows, packing, width)
 
 
 def segment_of_rows(num_rows: int, query_start_loc: jax.Array) -> jax.Array:
@@ -87,12 +88,24 @@ def segment_of_rows(num_rows: int, query_start_loc: jax.Array) -> jax.Array:
 
 
 def workspace_index_page_table(
-    ws_page_offset: jax.Array, num_ws_pages: int
+    ws_page_offset: jax.Array,
+    num_ws_pages: int,
+    dcp_size: int,
+    max_pages_per_seq: int | None = None,
 ) -> jax.Array:
-    """Flat `[max_num_seqs * Pw]` page table into the position-ordered
-    indexer workspace, one row per local segment."""
-    pages = jnp.arange(num_ws_pages, dtype=jnp.int32)
-    table = jnp.minimum(ws_page_offset[:, None] + pages[None, :], num_ws_pages - 1)
+    """Flat `[max_num_seqs * W]` page table into the position-ordered indexer
+    workspace (cache-sized pages), one row per local segment, where
+    `W = min(Pw * dcp, max_pages_per_seq)`. A request's pages are contiguous
+    from its offset, so `max_pages_per_seq` covers any request up to that
+    many pages. `ws_page_offset` is in virtual pages."""
+    num_pages = num_ws_pages * dcp_size
+    width = num_pages if max_pages_per_seq is None else min(
+        num_pages, int(max_pages_per_seq)
+    )
+    pages = jnp.arange(width, dtype=jnp.int32)
+    table = jnp.minimum(
+        ws_page_offset[:, None] * dcp_size + pages[None, :], num_pages - 1
+    )
     return table.reshape(-1)
 
 

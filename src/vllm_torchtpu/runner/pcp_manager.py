@@ -266,6 +266,29 @@ def _grow_host_token_buffers(runner: Any, required: int) -> None:
     runner.positions_np = runner.positions_cpu.numpy()
 
 
+def mla_kv_page_size(kv_cache_config: Any) -> int:
+    """The single block size of the MLA KV cache groups (the sparse-MLA
+    cache's page size), looking inside `UniformTypeKVCacheSpecs`."""
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec, UniformTypeKVCacheSpecs
+
+    sizes: set[int] = set()
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        specs = (
+            spec.kv_cache_specs.values()
+            if isinstance(spec, UniformTypeKVCacheSpecs)
+            else (spec,)
+        )
+        sizes.update(
+            int(s.block_size) for s in specs if isinstance(s, MLAAttentionSpec)
+        )
+    if len(sizes) != 1:
+        raise ValueError(
+            f"PCP manager expects one MLA KV cache block size, got {sorted(sizes)}"
+        )
+    return sizes.pop()
+
+
 class PcpManager:
     """`SequenceLayoutPlanner` for PCP x DCP with KV-gather attention."""
 
@@ -282,15 +305,27 @@ class PcpManager:
         self.pcp_size = int(pcp_size)
         self.pcp_rank = int(pcp_rank)
         self.dcp_size = int(dcp_size)
-        # A DCP virtual page is one physical page on each DCP rank.
-        self.virtual_page_size = int(page_size) * self.dcp_size
-        # A multiple of `chunk_pages`, so the chunk loop never slices past it.
-        chunk_pages = pcp_chunk_pages(page_size, self.dcp_size)
-        num_pages = max(1, int(workspace_tokens) // self.virtual_page_size)
-        self.num_ws_pages = -(-num_pages // chunk_pages) * chunk_pages
+        self._workspace_tokens = int(workspace_tokens)
+        self.set_page_size(page_size)
         self._max_local_num_tokens = pcp_max_local_tokens(
             max_num_batched_tokens, max_num_seqs, self.pcp_size
         )
+
+    def set_page_size(self, page_size: int) -> None:
+        """Size the KV-gather workspace for `page_size`-token KV pages.
+
+        Must match the sparse-MLA cache's page size, which can differ from
+        `cache_config.block_size` once vLLM unifies the KV cache groups'
+        page sizes; the runner calls this again with the real size after
+        `initialize_kv_cache` (see `mla_kv_page_size`).
+        """
+        self.page_size = int(page_size)
+        # A DCP virtual page is one physical page on each DCP rank.
+        self.virtual_page_size = self.page_size * self.dcp_size
+        # A multiple of `chunk_pages`, so the chunk loop never slices past it.
+        chunk_pages = pcp_chunk_pages(self.page_size, self.dcp_size)
+        num_pages = max(1, self._workspace_tokens // self.virtual_page_size)
+        self.num_ws_pages = -(-num_pages // chunk_pages) * chunk_pages
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> PcpManager:
@@ -324,6 +359,12 @@ class PcpManager:
     @property
     def max_local_num_tokens(self) -> int:
         return self._max_local_num_tokens
+
+    @property
+    def local_reqs_per_req(self) -> int:
+        # A split prefill is two DualChunkSwap chunks on every rank, each its
+        # own local request; a decode is one.
+        return 2
 
     def reserve_host_token_capacity(
         self, runner: Any, required_num_tokens: int

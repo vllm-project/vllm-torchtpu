@@ -437,6 +437,173 @@ def _cp_scatter_indexer_k(
     )(cache_kv, k_packed, seq_lens, page_indices, cu_q_lens)
 
 
+def pcp_prefill_topk_partition_specs():
+    """`(in_specs, out_specs)` of `pcp_prefill_topk` over the DCP mesh."""
+    sharded = jax.sharding.PartitionSpec(DCP_AXIS_NAME)
+    replicated = jax.sharding.PartitionSpec()
+    in_specs = (
+        sharded,  # cache_kv
+        sharded,  # q_bytes: local rows
+        sharded,  # weights: local rows
+        sharded,  # k_packed: local rows
+        replicated,  # restore_idx
+        replicated,  # split_seq_lens
+        replicated,  # split_page_indices
+        replicated,  # split_cu_q_lens
+        replicated,  # ws_req
+        replicated,  # ws_vpage
+        sharded,  # ws_page_offset: per local segment
+        sharded,  # seq_lens: local
+        sharded,  # cu_q_lens: local
+        sharded,  # distribution: local
+        replicated,  # num_split_reqs
+        replicated,  # ws_used_pages
+    )
+    return in_specs, (sharded, sharded)
+
+
+def pcp_prefill_topk(
+    cache_kv: jax.Array,
+    q_bytes: jax.Array,
+    weights: jax.Array,
+    k_packed: jax.Array,
+    restore_idx: jax.Array,
+    split_seq_lens: jax.Array,
+    split_page_indices: jax.Array,
+    split_cu_q_lens: jax.Array,
+    ws_req: jax.Array,
+    ws_vpage: jax.Array,
+    ws_page_offset: jax.Array,
+    seq_lens: jax.Array,
+    cu_q_lens: jax.Array,
+    distribution: jax.Array,
+    num_split_reqs: jax.Array,
+    ws_used_pages: jax.Array,
+    *,
+    mesh: Any,
+    topk: int,
+    dcp_size: int,
+    pcp_size: int,
+    interleave_size: int,
+    max_model_len: int | None = None,
+    chunk_tokens: int | None = None,
+) -> tuple[jax.Array, jax.Array]:
+    """PCP manager split-prefill top-k: write the split rows' K, gather the K
+    workspace, top-k the local queries over it (global positions).
+
+    Each segment's page table row spans at most `max_model_len` tokens of the
+    workspace, not all of it: the kernel's score buffer is
+    `[num_tokens, row width]`, so a full-workspace row costs
+    `num_tokens * workspace_tokens * 4` bytes of HBM.
+
+    Returns the updated cache and `[local_tokens, topk]` global positions.
+    """
+    from vllm_torchtpu.kernels.mla import pcp_workspace as ws
+
+    def _local(
+        cache_kv, q_bytes, weights, k_packed, restore_idx, split_seq_lens,
+        split_page_indices, split_cu_q_lens, ws_req, ws_vpage,
+        ws_page_offset, seq_lens, cu_q_lens, distribution, num_split_reqs,
+        ws_used_pages,
+    ):
+        num_tokens = q_bytes.shape[0]
+        num_ws_pages = ws_req.shape[0]
+        _, rows_per_page, kv_packing, _ = cache_kv.shape
+        page_size = rows_per_page * kv_packing
+        virtual_page = page_size * dcp_size
+        max_seq_pages = (
+            None if max_model_len is None
+            else -(-int(max_model_len) // page_size)
+        )
+        # Workspace page buckets; the smallest that fits is picked at run time.
+        buckets = sorted(
+            {
+                min(num_ws_pages, max(1, t // virtual_page))
+                for t in PCP_INDEXER_BUCKET_TOKENS
+            }
+            | {num_ws_pages}
+        )
+
+        def run(cache_kv):
+            rank = cp_rank_as_data(DCP_AXIS_NAME, dcp_size)
+            k_split = ws.pcp_gather_rows(
+                k_packed, restore_idx, axis_name=DCP_AXIS_NAME,
+                pcp_size=pcp_size,
+            )
+            cache_kv = _scatter_indexer_k_rows(
+                cache_kv,
+                k_split,
+                split_seq_lens,
+                split_page_indices,
+                split_cu_q_lens,
+                rank,
+                cp_size=dcp_size,
+                interleave_size=interleave_size,
+            )
+            pages = ws.workspace_pages(
+                split_page_indices,
+                split_seq_lens.shape[0],
+                ws_req,
+                ws_vpage,
+                cache_kv.shape[0],
+            )
+            q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
+
+            def at_size(size):
+                def branch(cache_kv):
+                    ws_kv = ws.position_ordered(
+                        ws.gather_workspace(
+                            cache_kv, pages[:size], axis_name=DCP_AXIS_NAME
+                        ),
+                        interleave_size,
+                    )
+                    return streamindex_topk(
+                        q,
+                        weights,
+                        ws_kv,
+                        seq_lens,
+                        ws.workspace_index_page_table(
+                            ws_page_offset, size, dcp_size, max_seq_pages
+                        ),
+                        cu_q_lens,
+                        distribution,
+                        k=topk,
+                        compression_ratio=1,
+                        num_kv_pages_per_block=(2, 2, 2),
+                        num_queries_per_block=(1, 128, 128),
+                        enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
+                        chunk_tokens=chunk_tokens,
+                    ).astype(jnp.int32)
+
+                return branch
+
+            used = ws_used_pages[0]
+            which = sum((used > b).astype(jnp.int32) for b in buckets[:-1])
+            topk_indices = jax.lax.switch(
+                which, [at_size(b) for b in buckets], cache_kv
+            )
+            return cache_kv, topk_indices.astype(jnp.int32)
+
+        def skip(cache_kv):
+            return cache_kv, jnp.full((num_tokens, topk), -1, jnp.int32)
+
+        return jax.lax.cond(num_split_reqs[0] > 0, run, skip, cache_kv)
+
+    in_specs, out_specs = pcp_prefill_topk_partition_specs()
+    return jax.shard_map(
+        _local,
+        mesh=mesh,
+        in_specs=in_specs,
+        out_specs=out_specs,
+        check_vma=False,
+    )(
+        cache_kv, q_bytes, weights, k_packed, restore_idx, split_seq_lens,
+        split_page_indices, split_cu_q_lens, ws_req, ws_vpage,
+        ws_page_offset, seq_lens, cu_q_lens, distribution, num_split_reqs,
+        ws_used_pages,
+    )
+
+
 @SparseAttnIndexer.register_oot
 class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
     def __init__(self, *args, **kwargs):
@@ -445,8 +612,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # cannot trace if the op is first built inside a compiled forward.
         self.topk_op = self._build_streamidx_op()
 
-        parallel_config = getattr(
-            get_current_vllm_config_or_none(), "parallel_config", None
+        vllm_config = get_current_vllm_config_or_none()
+        parallel_config = getattr(vllm_config, "parallel_config", None)
+        max_model_len = getattr(
+            getattr(vllm_config, "model_config", None), "max_model_len", None
         )
         pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
         pcp_size = pcp_size if isinstance(pcp_size, int) else 1
@@ -464,7 +633,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             )
         if self.pcp_kv_gather:
             self.topk_op_pcp_prefill = self._build_pcp_prefill_topk_op(
-                dcp_size, pcp_size, self.interleave_size
+                dcp_size, pcp_size, self.interleave_size, max_model_len
             )
 
     def _build_streamidx_op(self):
@@ -723,118 +892,19 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         return op
 
     def _build_pcp_prefill_topk_op(self, dcp_size: int, pcp_size: int,
-                                   interleave_size: int):
+                                   interleave_size: int,
+                                   max_model_len: int | None = None):
         """Split-prefill top-k: write the split rows' K, gather the K
-        workspace, top-k the local queries over it (global positions)."""
-        from vllm_torchtpu.kernels.mla import pcp_workspace as ws
+        workspace, top-k the local queries over it (global positions).
 
+        Each segment's page table row spans at most `max_model_len` tokens of
+        the workspace, not all of it: the kernel's score buffer is
+        `[num_tokens, row width]`, so a full-workspace row costs
+        `num_tokens * workspace_tokens * 4` bytes of HBM."""
         topk = self.topk_tokens
-        chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
         mesh = get_or_create_dcp_mesh(axis_name=DCP_AXIS_NAME)
-
-        def _local(
-            cache_kv, q_bytes, weights, k_packed, restore_idx, split_seq_lens,
-            split_page_indices, split_cu_q_lens, ws_req, ws_vpage,
-            ws_page_offset, seq_lens, cu_q_lens, distribution, num_split_reqs,
-            ws_used_pages,
-        ):
-            num_tokens = q_bytes.shape[0]
-            num_ws_pages = ws_req.shape[0]
-            _, rows_per_page, kv_packing, _ = cache_kv.shape
-            virtual_page = rows_per_page * kv_packing * dcp_size
-            # Workspace page buckets; the smallest that fits is picked at run time.
-            buckets = sorted(
-                {
-                    min(num_ws_pages, max(1, t // virtual_page))
-                    for t in PCP_INDEXER_BUCKET_TOKENS
-                }
-                | {num_ws_pages}
-            )
-
-            def run(cache_kv):
-                rank = cp_rank_as_data(DCP_AXIS_NAME, dcp_size)
-                k_split = ws.pcp_gather_rows(
-                    k_packed, restore_idx, axis_name=DCP_AXIS_NAME,
-                    pcp_size=pcp_size,
-                )
-                cache_kv = _scatter_indexer_k_rows(
-                    cache_kv,
-                    k_split,
-                    split_seq_lens,
-                    split_page_indices,
-                    split_cu_q_lens,
-                    rank,
-                    cp_size=dcp_size,
-                    interleave_size=interleave_size,
-                )
-                pages = ws.workspace_pages(
-                    split_page_indices,
-                    split_seq_lens.shape[0],
-                    ws_req,
-                    ws_vpage,
-                    cache_kv.shape[0],
-                )
-                q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
-
-                def at_size(size):
-                    def branch(cache_kv):
-                        ws_kv = ws.position_ordered(
-                            ws.gather_workspace(
-                                cache_kv, pages[:size], axis_name=DCP_AXIS_NAME
-                            ),
-                            interleave_size,
-                        )
-                        return streamindex_topk(
-                            q,
-                            weights,
-                            ws_kv,
-                            seq_lens,
-                            ws.workspace_index_page_table(ws_page_offset, size),
-                            cu_q_lens,
-                            distribution,
-                            k=topk,
-                            compression_ratio=1,
-                            num_kv_pages_per_block=(2, 2, 2),
-                            num_queries_per_block=(1, 128, 128),
-                            enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
-                            chunk_tokens=chunk_tokens,
-                        ).astype(jnp.int32)
-
-                    return branch
-
-                used = ws_used_pages[0]
-                which = sum((used > b).astype(jnp.int32) for b in buckets[:-1])
-                topk_indices = jax.lax.switch(
-                    which, [at_size(b) for b in buckets], cache_kv
-                )
-                return cache_kv, topk_indices.astype(jnp.int32)
-
-            def skip(cache_kv):
-                return cache_kv, jnp.full((num_tokens, topk), -1, jnp.int32)
-
-            return jax.lax.cond(num_split_reqs[0] > 0, run, skip, cache_kv)
-
-        sharded = jax.sharding.PartitionSpec(DCP_AXIS_NAME)
-        replicated = jax.sharding.PartitionSpec()
-        in_specs = (
-            sharded,  # cache_kv
-            sharded,  # q_bytes: local rows
-            sharded,  # weights: local rows
-            sharded,  # k_packed: local rows
-            replicated,  # restore_idx
-            replicated,  # split_seq_lens
-            replicated,  # split_page_indices
-            replicated,  # split_cu_q_lens
-            replicated,  # ws_req
-            replicated,  # ws_vpage
-            sharded,  # ws_page_offset: per local segment
-            sharded,  # seq_lens: local
-            sharded,  # cu_q_lens: local
-            sharded,  # distribution: local
-            replicated,  # num_split_reqs
-            replicated,  # ws_used_pages
-        )
-        out_specs = (sharded, sharded)
+        in_specs, out_specs = pcp_prefill_topk_partition_specs()
+        chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
 
         def _pcp_prefill_topk_jax(
             cache_kv: jax.Array,
@@ -854,17 +924,18 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             num_split_reqs: jax.Array,
             ws_used_pages: jax.Array,
         ) -> tuple[jax.Array, jax.Array]:
-            return jax.shard_map(
-                _local,
-                mesh=mesh,
-                in_specs=in_specs,
-                out_specs=out_specs,
-                check_vma=False,
-            )(
+            return pcp_prefill_topk(
                 cache_kv, q_bytes, weights, k_packed, restore_idx, split_seq_lens,
                 split_page_indices, split_cu_q_lens, ws_req, ws_vpage,
                 ws_page_offset, seq_lens, cu_q_lens, distribution, num_split_reqs,
                 ws_used_pages,
+                mesh=mesh,
+                topk=topk,
+                dcp_size=dcp_size,
+                pcp_size=pcp_size,
+                interleave_size=interleave_size,
+                max_model_len=max_model_len,
+                chunk_tokens=chunk_tokens,
             )
 
         op_name = f"pallas::pcp_prefill_topk_{self.k_cache.prefix.replace('.', '_')}"
