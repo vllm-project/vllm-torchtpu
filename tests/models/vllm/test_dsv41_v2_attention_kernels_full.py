@@ -2365,6 +2365,9 @@ def test_fp8_consumers_skip_global_gather(monkeypatch, tokens):
         np.testing.assert_array_equal(
             jnp.concatenate([x[1] for x in actual]), rope_values
         )
+
+
+@pytest.mark.parametrize("banks", [1, 2])
 def test_paged_indexer_decode_rows_skip_query_tiles(monkeypatch, banks):
     """Decode-shaped batches (few rows per request) score in one query tile.
 
