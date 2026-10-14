@@ -62,20 +62,38 @@ def cp_lse_ag_out_rs(
     if group is None or int(group.world_size) == 1:
         return (output, lse) if return_lse else output
 
-    # TODO(weiyulin): Evaluate if we need LSE and reduce to be fp32.
-    lse = lse.to(torch.float32)
-    lses = group.all_gather(lse.unsqueeze(0).contiguous(), dim=0)
-    merged_lse = torch.logsumexp(lses, dim=0)
-
-    # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
-    weight = torch.exp(lse - merged_lse).unsqueeze(-1)
-    weighted = output.to(torch.float32) * weight
-    weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
-
-    merged = group.reduce_scatter(weighted.contiguous(), dim=1).to(output.dtype)
+    weight, merged_lse = lse_merge_weights(lse, group)
+    merged = reduce_scatter_weighted(output, weight, group)
     if not return_lse:
         return merged
 
     heads = merged.shape[1]
     start = int(group.rank_in_group) * heads
     return merged, merged_lse[:, start : start + heads]
+
+
+def lse_merge_weights(
+    lse: torch.Tensor, group: Any
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The all-gather half of `cp_lse_ag_out_rs`: this rank's `[T, H, 1]` f32
+    merge weights `exp(lse_r - logsumexp_r(lse))` and the merged `[T, H]` lse.
+
+    Each token's weights depend on its own row only, so the weights of a
+    slice of the token axis equal that slice of the whole step's weights.
+    """
+    # TODO(weiyulin): Evaluate if we need LSE and reduce to be fp32.
+    lse = lse.to(torch.float32)
+    lses = group.all_gather(lse.unsqueeze(0).contiguous(), dim=0)
+    merged_lse = torch.logsumexp(lses, dim=0)
+    return torch.exp(lse - merged_lse).unsqueeze(-1), merged_lse
+
+
+def reduce_scatter_weighted(
+    output: torch.Tensor, weight: torch.Tensor, group: Any
+) -> torch.Tensor:
+    """The reduce-scatter half of `cp_lse_ag_out_rs`: weight this rank's
+    `[T, H * group, D]` partial and reduce-scatter the heads to `[T, H, D]`."""
+    weighted = output.to(torch.float32) * weight
+    # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
+    weighted = torch.where(weight > 0, weighted, torch.zeros_like(weighted))
+    return group.reduce_scatter(weighted.contiguous(), dim=1).to(output.dtype)

@@ -13,6 +13,9 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
     TPU_DCP_LSE_MERGE_A2A: bool = True
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
+    TPU_DCP_MERGE_CHUNKED: int = 0
+    TPU_DCP_MERGE_CHUNKED_MIN_TOKENS: int = 1024
+    TPU_DCP_MERGE_CHUNKED_LSE_ONCE: bool = False
     TPU_DCP_MLA_SPLIT_Q_LSE: bool = True
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 4
     JAX_PLATFORMS: str = ""
@@ -417,6 +420,20 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # faster. Only the backbone uses the all-to-all; the MTP drafter, traced
     # once for every bucket, always takes the reduce-scatter.
     "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS": env_int("TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", 64),
+    # The reduce-scatter merge of a backbone bucket of at least
+    # TPU_DCP_MERGE_CHUNKED_MIN_TOKENS tokens, split into this many equal token
+    # chunks (0/1 = unsplit; a bucket that does not split into multiples of 8
+    # rows stays unsplit). Per-row arithmetic is unchanged; chunk k's
+    # SparseCore reduce-scatter can overlap chunk k+1's TensorCore lse gather
+    # and weight multiply. TPU_DCP_MERGE_CHUNKED_LSE_ONCE gathers the whole
+    # step's lse once and chunks only the multiply and the reduce-scatter.
+    "TPU_DCP_MERGE_CHUNKED": env_int("TPU_DCP_MERGE_CHUNKED", 0),
+    "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS": env_int(
+        "TPU_DCP_MERGE_CHUNKED_MIN_TOKENS", 1024
+    ),
+    "TPU_DCP_MERGE_CHUNKED_LSE_ONCE": env_bool(
+        "TPU_DCP_MERGE_CHUNKED_LSE_ONCE", default=False
+    ),
     # DCP sparse MLA kernel I/O (`sparse_ragged_paged_attention(q_pe=...,
     # lse_lane_dense=True)`): hand q_nope and q_pe to the kernel as separate
     # operands (it joins them in VMEM; the output aliases q_nope, 512 wide)

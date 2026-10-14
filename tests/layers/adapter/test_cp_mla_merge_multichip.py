@@ -5,7 +5,8 @@
 # You may obtain a copy of the License at
 #
 #     http://www.apache.org/licenses/LICENSE-2.0
-"""The DCP MLA lse merge over real collectives (`TPU_DCP_LSE_MERGE_A2A`).
+"""The DCP MLA lse merge over real collectives (`TPU_DCP_LSE_MERGE_A2A`,
+`TPU_DCP_MERGE_CHUNKED`).
 
 The unit tests in `test_cp_mla_attention.py` pin the arithmetic against a
 threaded stand-in for the exchange; this pins what only hardware can answer:
@@ -16,6 +17,8 @@ threaded stand-in for the exchange; this pins what only hardware can answer:
      merge to within one bf16 ulp, including `-inf` rows and a rank that owns
      nothing -- and the same check fails when the send blocks are rotated by
      one rank (the positive control).
+  3. The chunked reduce-scatter merge, which changes only the schedule, is as
+     exact as the unchunked one on the real collectives.
 
 Run on one host (4 chips x 2 cores = 8 ranks). `--bench` adds a per-merge
 timing of every path at decode and mixed-step token counts.
@@ -41,11 +44,24 @@ VDIM = 512
 CHECK_TOKENS = 64
 LAUNCH_TIMEOUT_SECONDS = 900
 
-# name -> TPU_DCP_LSE_MERGE_A2A
-ARMS = {
-    "today": False,
-    "a2a": True,
+_ARM_DEFAULTS = {
+    "TPU_DCP_LSE_MERGE_A2A": False,
+    "TPU_DCP_MERGE_CHUNKED": 0,
+    "TPU_DCP_MERGE_CHUNKED_LSE_ONCE": False,
 }
+# name -> the env overrides of `_ARM_DEFAULTS` that make the arm.
+ARMS = {
+    "today": {},
+    "a2a": {"TPU_DCP_LSE_MERGE_A2A": True},
+    "chunk2": {"TPU_DCP_MERGE_CHUNKED": 2},
+    "chunk4": {"TPU_DCP_MERGE_CHUNKED": 4},
+    "chunk4_lse_once": {
+        "TPU_DCP_MERGE_CHUNKED": 4,
+        "TPU_DCP_MERGE_CHUNKED_LSE_ONCE": True,
+    },
+}
+# Arms that change only the schedule of today's merge.
+CHUNK_ARMS = ("chunk2", "chunk4", "chunk4_lse_once")
 
 
 def _worker_command(result_dir: Path, extra: list[str]) -> list[str]:
@@ -177,8 +193,10 @@ MERGE_VARIANTS = {"a2a_reduce_sum": _merge_reduce_sum, "a2a_unrolled": _merge_un
 
 
 def _set_arm(cp_mla, arm):
-    cp_mla.envs.TPU_DCP_LSE_MERGE_A2A = ARMS[arm]
+    for name, value in {**_ARM_DEFAULTS, **ARMS[arm]}.items():
+        setattr(cp_mla.envs, name, value)
     cp_mla.envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS = 1 << 30
+    cp_mla.envs.TPU_DCP_MERGE_CHUNKED_MIN_TOKENS = 0
 
 
 def _compile(fn):
@@ -414,20 +432,21 @@ def assert_merge_results(results: list[dict]) -> None:
     assert not errors, f"worker failures: {errors}"
     for r in results:
         check = r["check"]
-        for arm in ("today", "a2a"):
+        for arm in ARMS:
             for how in ("eager", "compiled"):
                 c = check[f"{arm}/{how}"]
                 assert "error" not in c, (r["rank"], arm, how, c)
                 assert c["dtype"] == "torch.bfloat16", (r["rank"], arm, how, c)
                 assert c["finite"], (r["rank"], arm, how, c)
-        for how in ("eager", "compiled"):
-            today, a2a = check[f"today/{how}"], check[f"a2a/{how}"]
-            # The all-to-all merge must be exact to one bf16 ulp, or at worst
-            # no less exact than today's path compiled the same way.
-            assert a2a["within_1ulp"] or (
-                a2a["frac_over_1ulp"] <= today["frac_over_1ulp"]
-                and a2a["max_abs_err"] <= today["max_abs_err"]
-            ), (r["rank"], how, today, a2a)
+        for arm in ("a2a", *CHUNK_ARMS):
+            for how in ("eager", "compiled"):
+                today, got = check[f"today/{how}"], check[f"{arm}/{how}"]
+                # Exact to one bf16 ulp, or at worst no less exact than
+                # today's path compiled the same way.
+                assert got["within_1ulp"] or (
+                    got["frac_over_1ulp"] <= today["frac_over_1ulp"]
+                    and got["max_abs_err"] <= today["max_abs_err"]
+                ), (r["rank"], arm, how, today, got)
         for arm in ("a2a",):
             for how in ("eager", "compiled"):
                 c = check[f"control_rotated/{arm}/{how}"]
