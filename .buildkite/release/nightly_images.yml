@@ -12,13 +12,13 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# RELEASE_MODE=nightly. Uploaded by bootstrap.py, which sets RELEASE_QUEUE;
+# `?` makes the upload fail if it is unset. The agent doesn't substitute
+# variables in `secrets`, so any secret a step here reads must have the same
+# name in every cluster that can run this pipeline.
 steps:
-  - group: "Publish Nightly Docker Images"
-    key: "publish_nightly_images_group"
-    steps:
-      - label: ":docker: Build and Publish Nightly Images (ci, dev, prod)"
-        key: "publish_nightly_images"
-        agents:
-          queue: cpu_64_core
-        commands:
-          - bash .buildkite/scripts/publish_nightly_images.sh
+  - label: ":docker: Build and Publish Nightly Images (ci, dev, prod)"
+    key: publish_nightly_images
+    agents:
+      queue: "${RELEASE_QUEUE?}"
+    command: python3 .buildkite/release/publish_images.py nightly

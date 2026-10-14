@@ -11,6 +11,8 @@
 
 # CI/CD and Build Configuration
 /.buildkite/ @QiliangCui @theminghuang
+# Runs in the TPU Release Buildkite cluster and publishes the images.
+/.buildkite/release/ @QiliangCui @CienetStingLin @theminghuang @charlesli640
 /.github/ @QiliangCui @theminghuang
 
 # Documentation
