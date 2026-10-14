@@ -127,7 +127,7 @@ def main() -> None:
         DECODE_SCENARIO.dspark_tokens + 1
     )
     buckets = (
-        [verify_rows, 384, DECODE_SCENARIO.chunk_tokens] if decode else [128, 256, 2048]
+        [verify_rows, DECODE_SCENARIO.chunk_tokens] if decode else [128, 256, 2048]
     )
     env.update(
         TP="1",

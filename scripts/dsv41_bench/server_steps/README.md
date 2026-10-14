@@ -246,10 +246,13 @@ python scripts/dsv41_bench/server_steps/run.py --scenario decode \
   --cache-dir /cache/dsv41-decode --cache-mode cold
 ```
 
-This compiles buckets `[288,384,2048]`: steady target verification is exactly
-48 requests x (K + 1) = 288 rows, so it no longer pads to 384 (padding ran every
-layer, and the grouped indexer, on 25% padding rows). Draft inputs (240 rows)
-use 288; bounded replay still fits 384; chunked prefill uses 2048.
+This compiles buckets `[288,2048]`, omitting 384 to reduce precompile work.
+Steady target verification remains exactly 48 requests x (K + 1) = 288 rows.
+Draft inputs (240 rows) still pad to 288; chunked prefill uses 2048.
+Replay/mixed target batches above 288 rows now use 2048. These transitional
+batches are excluded from the steady decode metric, but can affect preparation
+time and window availability. Startup savings have not yet been measured;
+the historical results below retain their original bucket configurations.
 The larger prefill budget admits the 48 requests per rank before early requests
 finish: exact-prefix cache hits leave 256 tokens per request to compute.
 With a 512-token budget, admission overlapped request draining and produced no
@@ -269,7 +272,7 @@ export PYTHONPATH="$PWD/scripts/dsv41_bench/server_steps${PYTHONPATH:+:$PYTHONPA
 TP=1 DP=8 CHUNK=2048 MAX_SEQS=48 MAX_MODEL_LEN=98816 KV_BYTES=auto \
   bash scripts/dsv41_bench/serve_cached_prefill.sh \
   --worker-extension-cls server_step_worker.ServerStepWorker \
-  --compilation-config '{"compile_sizes":[288,384,2048]}' \
+  --compilation-config '{"compile_sizes":[288,2048]}' \
   2>&1 | tee /results/decode-server.log
 ```
 
