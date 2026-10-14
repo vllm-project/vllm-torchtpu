@@ -135,7 +135,6 @@ python scripts/dsv41_bench/server_steps/bench_cached_extend.py summarize \
 python scripts/dsv41_bench/server_steps/bench_cached_extend.py startup \
   /path/to/results/candidate-cold/server.log \
   --out /path/to/startup-phases.json
-python -m pytest tests/scripts/test_dsv41_cached_extend.py -q
 ```
 
 Preserve input provenance, source revisions and diffs, runtime package versions,

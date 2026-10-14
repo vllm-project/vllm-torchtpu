@@ -1596,10 +1596,9 @@ class TestBenchSparseMlaSwa:
 # 4. Tests for 93e011ff9 benchmarking config scripts
 # ==============================================================================
 class TestBenchmarkingConfigs:
-    """Unit tests verifying 100k prefill/decode benchmarking config scripts."""
+    """Validate the retained C4/C8/C16 decode benchmarking config."""
 
     _CONFIG_DIR = _REPO_ROOT / "scripts" / "vllm" / "benchmarking" / "configs"
-    _PREFILL_SCRIPT = "deepseek-v41-flash-tp8-ep-100k-prefill.sh"
     _DECODE_SCRIPT = "deepseek-v41-flash-tp8-ep-100k-decode.sh"
 
     @classmethod
@@ -1612,7 +1611,7 @@ class TestBenchmarkingConfigs:
         bash_code = f"""
         source "{config_path}"
         vars=(
-            MODEL TENSOR_PARALLELISM DATA_PARALLELISM ENABLE_EP
+            MODEL TENSOR_PARALLELISM DATA_PARALLELISM ENABLE_EP ENABLE_PREFIX_CACHING
             MAX_MODEL_LEN MAX_NUM_BATCHED_TOKENS MAX_NUM_SEQS
             ASYNC_SCHEDULING GPU_MEMORY_UTILIZATION KV_CACHE_DTYPE
             NUM_PROMPTS ISL_OSL_CONFIGS CONCURRENCY_OPTIONS
@@ -1630,6 +1629,7 @@ class TestBenchmarkingConfigs:
         env = os.environ.copy()
         for k in (
             "DEEPSEEK_V41_MODEL",
+            "ENABLE_PREFIX_CACHING",
             "KV_CACHE_DTYPE",
             "OMP_NUM_THREADS",
             "TPU_DEEPSEEK_V41_IMPL",
@@ -1655,7 +1655,7 @@ class TestBenchmarkingConfigs:
         return result
 
     def test_config_scripts_exist_and_pass_syntax_check(self):
-        for script_name in (self._PREFILL_SCRIPT, self._DECODE_SCRIPT):
+        for script_name in (self._DECODE_SCRIPT,):
             script_path = self._CONFIG_DIR / script_name
             assert script_path.is_file(), f"{script_name} must exist"
             assert script_path.stat().st_size > 0, f"{script_name} must not be empty"
@@ -1667,87 +1667,6 @@ class TestBenchmarkingConfigs:
                 check=True,
             )
             assert res.returncode == 0
-
-    def test_deepseek_v41_flash_100k_prefill_default_config(self):
-        cfg = self._source_config(self._PREFILL_SCRIPT)
-
-        assert cfg["MODEL"] == "deepseek-ai/DeepSeek-V4.1-Flash"
-        assert cfg["TENSOR_PARALLELISM"] == "8"
-        assert cfg["DATA_PARALLELISM"] == "1"
-        assert cfg["ENABLE_EP"] == "true"
-        assert cfg["MAX_MODEL_LEN"] == "103424"
-        assert cfg["MAX_NUM_BATCHED_TOKENS"] == "2048"
-        assert cfg["MAX_NUM_SEQS"] == "1"
-        assert cfg["ASYNC_SCHEDULING"] == "true"
-        assert cfg["GPU_MEMORY_UTILIZATION"] == "0.85"
-
-        assert cfg["KV_CACHE_DTYPE"] == "fp8"
-
-        assert cfg["NUM_PROMPTS"] == "4"
-        assert cfg["ISL_OSL_CONFIGS"] == "100000:1"
-        assert cfg["CONCURRENCY_OPTIONS"] == "1"
-        assert cfg["RANDOM_RANGE_RATIO"] == "0.0"
-        assert cfg["BENCHMARK_TEMPERATURE"] == "0"
-        assert cfg["BENCHMARK_WARMUP_RUNS"] == "1"
-        assert cfg["EVAL_TOLERANCE"] == "0.03"
-        assert cfg["SERVER_READY_WAIT_MIN"] == "120"
-
-        assert cfg["OMP_NUM_THREADS"] == "1"
-        assert cfg["NEW_MODEL_DESIGN"] == "1"
-        assert cfg["MODEL_IMPL_TYPE"] == "vllm"
-        assert cfg["VLLM_USE_BREAKABLE_CUDAGRAPH"] == "0"
-        assert cfg["VLLM_USE_AOT_COMPILE"] == "0"
-        assert cfg["TPU_DEEPSEEK_V41_IMPL"] == "v2"
-        assert cfg["TPU_DEEPSEEK_V41_CED"] == "1"
-
-        extra_args = cfg["EXTRA_SERVE_ARGS"]
-        assert "--no-enable-prefix-caching" in extra_args
-        assert "--enable-ep-weight-filter" in extra_args
-        assert "--safetensors-load-strategy=prefetch" in extra_args
-        assert "--safetensors-prefetch-num-threads=8" in extra_args
-        assert "--block-size=16" in extra_args
-        assert "--kv-cache-memory-bytes=1342177280" in extra_args
-        assert '--compilation-config={"compile_sizes":[2,2048]}' in extra_args
-
-        assert (
-            "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0"
-            in cfg["LIBTPU_INIT_ARGS"]
-        )
-
-    def test_deepseek_v41_flash_100k_prefill_env_overrides(self):
-        overrides = {
-            "DEEPSEEK_V41_MODEL": "custom-org/Custom-V41",
-            "KV_CACHE_DTYPE": "auto",
-            "OMP_NUM_THREADS": "4",
-            "TPU_DEEPSEEK_V41_IMPL": "v1",
-            "TPU_DEEPSEEK_V41_CED": "0",
-            "EXTRA_SERVE_ARGS": "--test-flag",
-            "LIBTPU_INIT_ARGS": (
-                "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=1024"
-            ),
-        }
-        cfg = self._source_config(self._PREFILL_SCRIPT, env_overrides=overrides)
-
-        assert cfg["MODEL"] == "custom-org/Custom-V41"
-        assert cfg["KV_CACHE_DTYPE"] == "auto"
-        assert cfg["OMP_NUM_THREADS"] == "4"
-        assert cfg["TPU_DEEPSEEK_V41_IMPL"] == "v1"
-        assert cfg["TPU_DEEPSEEK_V41_CED"] == "0"
-        assert cfg["EXTRA_SERVE_ARGS"].startswith("--test-flag ")
-        assert (
-            cfg["LIBTPU_INIT_ARGS"]
-            == "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=1024"
-        )
-
-        cfg_append = self._source_config(
-            self._PREFILL_SCRIPT,
-            env_overrides={"LIBTPU_INIT_ARGS": "--xla_tpu_enable_llo_profiling=true"},
-        )
-        assert (
-            cfg_append["LIBTPU_INIT_ARGS"].strip()
-            == "--xla_tpu_enable_llo_profiling=true"
-            " --xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0"
-        )
 
     def test_deepseek_v41_flash_100k_decode_default_config(self):
         cfg = self._source_config(self._DECODE_SCRIPT)
@@ -1780,7 +1699,7 @@ class TestBenchmarkingConfigs:
         assert cfg["TPU_DEEPSEEK_V41_CED"] == "1"
 
         extra_args = cfg["EXTRA_SERVE_ARGS"]
-        assert "--no-enable-prefix-caching" in extra_args
+        assert cfg["ENABLE_PREFIX_CACHING"] == "false"
         assert "--enable-ep-weight-filter" in extra_args
         assert "--safetensors-load-strategy=prefetch" in extra_args
         assert "--safetensors-prefetch-num-threads=8" in extra_args
@@ -1813,7 +1732,7 @@ class TestBenchmarkingConfigs:
         )
 
     def test_config_script_static_invariants(self):
-        for script_name in (self._PREFILL_SCRIPT, self._DECODE_SCRIPT):
+        for script_name in (self._DECODE_SCRIPT,):
             content = (self._CONFIG_DIR / script_name).read_text(encoding="utf-8")
             assert content.startswith("#!/bin/bash\n")
             assert "# shellcheck disable=SC2034" in content

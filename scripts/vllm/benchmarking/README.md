@@ -153,7 +153,9 @@ FP8 KV, CED, Engram CPU offload and DSpark K5:
   tokens, 2,048-token chunks, one warmup and one formal window. The serving
   context limit is 98,816; compile buckets are `[384,2048]`.
 
-These replace the TP8/DP1 C64 DSpark and C1 cold-prefill CI steps. The ordinary
+These replace the TP8/DP1 C64 DSpark and C1 cold-prefill CI steps. Their old
+config scripts, the unused DSpark config helper and prefill perf baseline are
+removed. The ordinary
 C4/C8/C16 decode and smoke/GSM8K steps remain separate. Related: #1794, #1890
 and #1912; #1891 improves priming for the superseded TP8/DP1 C64 recipe.
 
