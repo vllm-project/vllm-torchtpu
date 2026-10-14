@@ -203,6 +203,24 @@ def test_config_rejects_unsupported_features(
         TPUQwen4ExpConfig.verify_and_update_config(vllm_config)
 
 
+@pytest.mark.parametrize(
+    "nested,override",
+    [
+        (False, '{"ple_layer_ids": []}'),
+        (True, '{"text_config": {"ple_layer_ids": []}}'),
+    ],
+    ids=["text_only", "vision_language"],
+)
+def test_config_ple_error_names_override(nested, override) -> None:
+    text_config = _text_config(ple_layer_ids=[2])
+    vllm_config = _vllm_config_for_checks(text_config)
+    if nested:
+        vllm_config.model_config.hf_config = SimpleNamespace(text_config=text_config)
+    with pytest.raises(NotImplementedError) as excinfo:
+        TPUQwen4ExpConfig.verify_and_update_config(vllm_config)
+    assert f"--hf-overrides '{override}'" in str(excinfo.value)
+
+
 # ---------------------------------------------------------------------------
 # Decoder wiring with stand-in sublayers
 # ---------------------------------------------------------------------------

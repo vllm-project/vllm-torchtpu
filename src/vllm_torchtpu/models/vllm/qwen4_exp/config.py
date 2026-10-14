@@ -34,9 +34,16 @@ class TPUQwen4ExpConfig(Qwen4ExpForCausalLMConfig):
         parallel_config = vllm_config.parallel_config
         if text_config.ple_layer_ids:
             # TODO(PLE): add the n-gram PLE layer and its per-request state.
+            # Vision-language checkpoints nest the field under text_config.
+            if model_config.hf_config is text_config:
+                override = '{"ple_layer_ids": []}'
+            else:
+                override = '{"text_config": {"ple_layer_ids": []}}'
             raise NotImplementedError(
                 "Qwen4Exp n-gram PLE (ple_layer_ids="
-                f"{text_config.ple_layer_ids}) is not supported on TPU yet."
+                f"{text_config.ple_layer_ids}) is not supported on TPU yet. "
+                f"To run without PLE for bring-up, pass --hf-overrides "
+                f"'{override}'; outputs then differ from the released model."
             )
         # Released checkpoints label their QSA layers full_attention; the
         # qwen_sparse_attention layer type needs the QSA indexer.
