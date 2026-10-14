@@ -185,6 +185,8 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
         return f"activation {qm._tpu_activation_str!r} is not silu"
     if qm._use_adaptive_fused_moe or fused_moe_ep_supported(qm):
         return "a fused EP MoE kernel serves this layer"
+    if envs.FUSED_MOE_DECODE_KERNEL:
+        return "FUSED_MOE_DECODE_KERNEL is set; moe_tp_decode stands down"
     # Same test as apply_monolithic's owns_collectives: those paths run their own
     # collectives, so the layer keeps them.
     if enable_pipelined_collective_and_compute() or envs.TPU_MOE_FP8_ALL_GATHER:

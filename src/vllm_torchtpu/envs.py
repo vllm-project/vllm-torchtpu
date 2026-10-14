@@ -626,8 +626,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # counts the usual path plus a psum (layers/adapter/moe_tp_decode.py).
     # Armed once after load; needs TPU_MOE_SKIP_PADDED_TOKENS=1 (the op reads
     # the real token count from its padding mask), otherwise every layer keeps
-    # the usual path. Remove once the path is the default for these layers or
-    # is replaced by another fused TP MoE path.
+    # the usual path. Arms nothing while FUSED_MOE_DECODE_KERNEL is set. Remove
+    # once the path is the default for these layers or is replaced by another
+    # fused TP MoE path.
     "USE_MOE_TP_DECODE_KERNEL": env_bool("USE_MOE_TP_DECODE_KERNEL"),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and

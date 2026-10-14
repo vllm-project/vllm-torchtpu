@@ -382,6 +382,14 @@ def test_refuses_when_the_moe_path_owns_its_collectives(harness, monkeypatch):
     assert "owns its collectives" in harness.logs[-1]
 
 
+def test_stands_down_when_fused_moe_decode_is_on(harness, monkeypatch):
+    monkeypatch.setattr(envs, "FUSED_MOE_DECODE_KERNEL", True)
+    model = harness.model({})
+    assert moe_tp_decode.arm(model) == 0
+    assert not _armed(model.layers[0]) and harness.selftest_calls == 0
+    assert "FUSED_MOE_DECODE_KERNEL is set" in harness.logs[-1]
+
+
 def test_refuses_a_topology_it_cannot_serve(harness, monkeypatch):
     monkeypatch.setattr(moe_tp_decode, "_topology", lambda: "no EP group")
     model = harness.model({})
