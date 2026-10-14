@@ -227,7 +227,10 @@ def compute_batched_seq_metadata(
         # Overlapping chunks share tokens and break the partition, so they keep
         # the per-chunk bound alone.
         total_bq_ub = num_chunks * per_chunk_bq
-        if all(b - a >= chunk_tokens for a, b in zip(chunk_starts, chunk_starts[1:])):
+        starts = [s for s in chunk_starts if s is not None]
+        if len(starts) == num_chunks and all(
+            b - a >= chunk_tokens for a, b in zip(starts, starts[1:])
+        ):
             total_bq_ub = min(
                 total_bq_ub,
                 total_max_bq + num_chunks - 1,
