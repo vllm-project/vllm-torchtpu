@@ -273,7 +273,8 @@ def _build_expert_kernel(
           out_vmem [2, tile_rows, L, 128] bf16: double-buffered tile output.
           w1_ring, w2_ring, w1_scale_ring, w2_scale_ring: [nb, ...] expert
             weight ring.
-          token_window [2, window] int32 (SMEM): token numbers of a tile's rows.
+          token_window [2 * window] int32 (SMEM): token numbers of a tile's rows,
+            window slot s at [s * window, (s + 1) * window).
           act_sems [n_act], window_sems [2], out_sems [2], ring_sems [nb]: DMA.
           shared_w1_vmem, shared_w2_vmem, shared_w1_scale_vmem,
             shared_w2_scale_vmem, shared_sem: the shared expert, loaded once.
@@ -346,9 +347,12 @@ def _build_expert_kernel(
         # ---- token-number windows (routed tiles only) ----
         def window_copy(start, slot):
             aligned = pl.multiple_of(start - lax.rem(start, _LANES), _LANES)
+            lo = slot * window  # the slot's first entry in the flat ring
+            if not isinstance(lo, int):
+                lo = pl.multiple_of(lo, _LANES)
             return pltpu.make_async_copy(
                 row_token_hbm.at[pl.ds(aligned, window)],
-                token_window.at[slot],
+                token_window.at[pl.ds(lo, window)],
                 window_sems.at[slot],
             )
 
@@ -393,8 +397,7 @@ def _build_expert_kernel(
                     act_vmem.at[slot],
                     act_sems.at[slot],
                     token_window,
-                    wslot,
-                    lax.rem(start, _LANES),
+                    wslot * window + lax.rem(start, _LANES),
                     tile_live(v, t),
                 )
 
@@ -587,7 +590,7 @@ def _build_expert_kernel(
                 pltpu.VMEM((nb, i, h), weight_dtype),
                 pltpu.VMEM((nb, 1, 2 * i), jnp.float32),
                 pltpu.VMEM((nb, 1, h), jnp.float32),
-                pltpu.SMEM((2, window), jnp.int32),
+                pltpu.SMEM((2 * window,), jnp.int32),
                 pltpu.SemaphoreType.DMA((n_act,)),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((2,)),
@@ -622,19 +625,23 @@ def _shared_scratch(h, i_s, weight_dtype):
     )
 
 
-def _gather_rows(x_hbm, dst, sem, token_window, wslot, offset, live):
+def _gather_rows(x_hbm, dst, sem, token_window, ptr0, live):
     """Start one DMA per activation row: row r of `dst` gets token
-    token_window[wslot, offset + r], for whole blocks of _GATHER_UNROLL rows
-    covering `live` (dead rows read in-bounds table entries)."""
+    token_window[ptr0 + r] (the flat token ring), for whole blocks of
+    _GATHER_UNROLL rows covering `live` (dead rows read in-bounds table
+    entries)."""
 
-    def block(b, carry):
+    # The carry is the flat-ring index of the block's first row, so each row
+    # costs one SMEM load at a constant offset plus its DMA (no 2-D index
+    # arithmetic per row).
+    def block(b, ptr):
+        r0 = b * _GATHER_UNROLL
         for u in range(_GATHER_UNROLL):
-            r = b * _GATHER_UNROLL + u
-            token = token_window[wslot, offset + r]
-            pltpu.make_async_copy(x_hbm.at[token], dst.at[r], sem).start()
-        return carry
+            token = token_window[ptr + u]
+            pltpu.make_async_copy(x_hbm.at[token], dst.at[r0 + u], sem).start()
+        return ptr + _GATHER_UNROLL
 
-    lax.fori_loop(0, _cdiv(live, _GATHER_UNROLL), block, 0)
+    lax.fori_loop(0, _cdiv(live, _GATHER_UNROLL), block, ptr0)
 
 
 # ---- Blocked mode: experts streamed in intermediate blocks ----------------
@@ -819,9 +826,12 @@ def _build_blocked_expert_kernel(
         def window_copy(c, slot):
             start = chunk_start[c]
             aligned = pl.multiple_of(start - lax.rem(start, _LANES), _LANES)
+            lo = slot * window  # the slot's first entry in the flat ring
+            if not isinstance(lo, int):
+                lo = pl.multiple_of(lo, _LANES)
             return pltpu.make_async_copy(
                 row_token_hbm.at[pl.ds(aligned, window)],
-                token_window.at[slot],
+                token_window.at[pl.ds(lo, window)],
                 window_sems.at[slot],
             )
 
@@ -862,8 +872,7 @@ def _build_blocked_expert_kernel(
                     act_vmem.at[buf],
                     act_sems.at[buf],
                     token_window,
-                    buf,
-                    lax.rem(start, _LANES),
+                    buf * window + lax.rem(start, _LANES),
                     live,
                 )
 
@@ -1060,7 +1069,7 @@ def _build_blocked_expert_kernel(
                 pltpu.VMEM((nb, ib, h), weight_dtype),
                 pltpu.VMEM((nb, 1, 2 * ib), jnp.float32),
                 pltpu.VMEM((nb, 1, h), jnp.float32),
-                pltpu.SMEM((2, window), jnp.int32),
+                pltpu.SMEM((2 * window,), jnp.int32),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA(()),
