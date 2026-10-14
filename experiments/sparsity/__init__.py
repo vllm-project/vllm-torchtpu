@@ -6,6 +6,7 @@ and TPU-accelerated SparseGPT kernel integrations for LLMs (Gemma 4, LLaMA).
 """
 
 import os
+import shutil
 import time
 
 import torch
@@ -80,7 +81,6 @@ def prune_gemma4(model_path: str,
         print(
             f">>> [SPARSITY ENGINE] Saving pruned checkpoint to {save_path}..."
         )
-        import shutil
         model.save_pretrained(save_path)
         # Ensure multimodal processor and tokenizer configs are saved alongside sparse weights.
         # Gemma 4 uses AutoProcessor (multimodal) which serializes processor_config.json,
@@ -89,7 +89,11 @@ def prune_gemma4(model_path: str,
             from transformers import AutoProcessor
             AutoProcessor.from_pretrained(model_path).save_pretrained(
                 save_path)
-        except Exception:
+        except (OSError, ValueError):
+            # transformers raises OSError/ValueError when no processor
+            # config exists; text-only checkpoints only ship a tokenizer.
+            print(">>> [SPARSITY ENGINE] No AutoProcessor found, "
+                  "falling back to AutoTokenizer")
             AutoTokenizer.from_pretrained(model_path).save_pretrained(
                 save_path)
         # Preserve original base model config.json and processor_config.json to retain
