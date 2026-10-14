@@ -32,7 +32,6 @@ Validation levels used in both tables:
 | **Llama 3.x** (dense) | `meta-llama/Llama-3.1-8B-Instruct` ✅ (EAGLE-3 tests), `meta-llama/Llama-3.2-1B-Instruct` 📝 | Reference dense path; EAGLE-3 drafting with `yuhuili/EAGLE3-LLaMA3.1-Instruct-8B` |
 | **Qwen2.5-VL / Qwen3-VL** (vision-language) | `Qwen/Qwen2.5-VL-3B-Instruct` ✅, `Qwen/Qwen2.5-VL-7B-Instruct` 📝, `Qwen/Qwen3-VL-4B` 🧪 | 3D M-RoPE, vision-encoder attention patches, multimodal encoder manager with video frame chunking |
 | **Embedding & safety classifiers** | `Qwen/Qwen3-VL-Embedding-8B` 📝, `meta-llama/Llama-Guard-4-12B` 📝 | TPU-native on-device pooling with request bucketing and static compilation; safety classification on the AILuminate prompt set |
-| **Diffusion (`vllm-omni`)** | `black-forest-labs/FLUX.1-dev` ✅ 🌙, `black-forest-labs/FLUX.1-schnell` ✅ 🌙, `black-forest-labs/FLUX.2-klein-4B` ✅ 🌙, Qwen-Image / Qwen-Image-Edit 🧪 | `OmniTpuPlatform` plugin with a TPU SDPA diffusion attention backend; pixel-statistics regression tests |
 
 See the [TPU v7x](../deployment/v7x_recipes.md) and [TPU v6e](../deployment/v6e_recipes.md) serving recipes for the exact slice topologies, parallelism layouts, and `vllm serve` flags used for the CI checkpoints.
 
@@ -64,6 +63,5 @@ All features below are merged in `main`. "Validated with" lists the models and v
 | **Weight streaming & loading** | `--load-format runai_streamer` (from `gs://`), `--enable-ep-weight-filter`, `--safetensors-load-strategy prefetch`, `--model-loader-extra-config '{"memory_limit": ...}'` | GLM-5.2 🌙, DeepSeek-V4-Pro 🌙, Kimi-K3 (multi-host recipes) | [Multi-Host Serving](multihost.md) |
 | **SparseCore offload** | `USE_MOE_SPARSE_CORE=1` (default), `ONEHOT_MOE_PERMUTE_THRESHOLD` | Every MoE recipe; Sparse MLA top-k on DeepSeek-V4 🌙 | [Parallelism](parallelism.md) |
 | **Profiling & observability** | `--profiler-config.profiler torch` with `--profile-result-dir`; `USE_PHASED_PROFILER=1`; Python / host / device tracer levels; vLLM Prometheus metrics (local and external prefix-cache hit counters) | `examples/tpu_profiling.py`, `examples/run_profiling_suite.sh` 📝 | [Profiling](../developers_guide/profiling.md) |
-| **Diffusion (`vllm-omni`)** | Install `vllm-omni`; `vllm-torchtpu` registers `OmniTpuPlatform` automatically | FLUX.1 / FLUX.2 ✅ 🌙, Qwen-Image 🧪 | — |
 
 See the [Environment Variables Reference](../reference/env_vars.md) for the full list of tuning knobs behind these features.
