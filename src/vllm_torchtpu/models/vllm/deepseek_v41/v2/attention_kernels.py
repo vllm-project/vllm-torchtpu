@@ -2107,6 +2107,17 @@ _INDEX_MAX_TILE = 16384
 # The packed scorer unrolls its query loop. Keep shared decode groups small;
 # large prefill groups use the existing shared matmul.
 _INDEX_MAX_SHARED_QUERIES = 8
+# Packed word-row scoring (`index_word_scores`) streams pool rows straight into
+# the kernel, so a loop iteration costs one paged gather + one kernel launch +
+# one score write regardless of size. At TP1/DP8 C384 decode (288 rows, ~96K
+# context) the `_INDEX_KEYS_PER_ITER` budget gives 512-key tiles: ~200 tiny
+# iterations per layer, dominated by per-iteration overhead. Word-row paths
+# use a 4.5x larger key budget; grouped rows size the tile by request rows.
+_INDEX_WORD_KEYS_PER_ITER = 4608 * 256  # 4096-key tiles at 288 rows; prefill keeps 512
+# Decode-shaped batches (few queries per request row) skip query tiling in
+# `paged_indexer_jax` while their full [queries, context] FP32 score buffer
+# stays within this many elements (512 MiB), keeping grouped scoring intact.
+_INDEX_UNTILED_SCORE_ELEMENTS = 1 << 27
 
 
 def paged_index_scores_jax(
@@ -2144,11 +2155,32 @@ def paged_index_scores_jax(
         )
         else tokens
     )
+    word_rows = (
+        page_records is not None
+        and dim == index_word_scores.DIM
+        and q.dtype == jnp.bfloat16
+    )
+    keys_per_iter = _INDEX_WORD_KEYS_PER_ITER if word_rows else _INDEX_KEYS_PER_ITER
     budget = min(
-        max(512, min(_INDEX_MAX_TILE, _INDEX_KEYS_PER_ITER // max(eff_tokens, 1))),
+        max(512, min(_INDEX_MAX_TILE, keys_per_iter // max(eff_tokens, 1))),
         -(-width // 128) * 128,
     )
     tile = 1 << (budget.bit_length() - 1)
+    if (
+        word_rows
+        and requests is not None
+        and records.shape[0] > 1
+        and records.shape[0] < tokens <= _INDEX_MAX_SHARED_QUERIES * records.shape[0]
+    ):
+        # Grouped decode scoring reads `requests * tile` keys per iteration,
+        # not `tokens * tile`: size the tile by request rows.
+        grouped = min(
+            _INDEX_MAX_TILE,
+            _INDEX_KEYS_PER_ITER // records.shape[0],
+            -(-width // 128) * 128,
+        )
+        if grouped > tile:
+            tile = 1 << (grouped.bit_length() - 1)
     padded_width = width + (-width % tile)
     scores = jnp.full((tokens, padded_width), -jnp.inf, jnp.float32)
     q = split_halves(q)  # keys are read in the split element order
@@ -2756,6 +2788,18 @@ def paged_indexer_jax(
         return run(False)
 
     def full_context(_):
+        rows = q.shape[0]
+        if (
+            records.shape[0] > 1
+            and records.shape[0] < rows <= _INDEX_MAX_SHARED_QUERIES * records.shape[0]
+            and rows * records.shape[1] <= _INDEX_UNTILED_SCORE_ELEMENTS
+        ):
+            # Decode-shaped batch (e.g. DSpark verify: 48 requests x 6 rows).
+            # Query tiles of 32/128 rows hold fewer rows than request rows, so
+            # `paged_index_scores_jax` could not share each request's key tile
+            # across its queries and would gather every row's context again.
+            # The untiled score buffer is small here; keep one query tile.
+            return score_context(records, rows)
         columns, query_tile = tuned_block_sizes.PAGED_INDEXER_PREFILL_BUCKET
         if (
             not candidate_write

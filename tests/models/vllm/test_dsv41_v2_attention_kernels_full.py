@@ -2365,3 +2365,58 @@ def test_fp8_consumers_skip_global_gather(monkeypatch, tokens):
         np.testing.assert_array_equal(
             jnp.concatenate([x[1] for x in actual]), rope_values
         )
+def test_paged_indexer_decode_rows_skip_query_tiles(monkeypatch, banks):
+    """Decode-shaped batches (few rows per request) score in one query tile.
+
+    DSpark verification has K + 1 rows per request. Query tiles smaller than
+    the request-row count would defeat grouped per-request key sharing.
+    """
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import _pack_bf16_words
+
+    rng = np.random.default_rng(31)
+    requests_count, group, width, topk = 16, 6, 256, 16
+    rows = requests_count * group
+    keys = jnp.asarray(rng.standard_normal((requests_count * width, 128)), jnp.bfloat16)
+    pool = _pack_bf16_words(keys).reshape(-1, 128)
+    if banks == 2:
+        pool = tuple(jnp.split(pool, 2))
+    q = jnp.asarray(rng.standard_normal((rows, 2, 128)), jnp.bfloat16)
+    weights = jnp.asarray(rng.random((rows, 2)), jnp.float32)
+    records = jnp.arange(requests_count * width, dtype=jnp.int32).reshape(
+        requests_count, width
+    )
+    requests = jnp.repeat(jnp.arange(requests_count, dtype=jnp.int32), group)
+    lengths = jnp.asarray(rng.integers(1, width + 1, rows), jnp.int32)
+    candidates = jnp.zeros((rows, 4), jnp.int32)
+    scores = paged_index_scores_jax(q, pool, records, weights, lengths, requests)
+    expected = select_indices_jax(
+        scores, lengths, candidates, topk, 16, False, False, True
+    )
+    score_rows = []
+    original = attention_kernels.paged_index_scores_jax
+
+    def record_shape(queries, *args, **kwargs):
+        score_rows.append(queries.shape[0])
+        return original(queries, *args, **kwargs)
+
+    monkeypatch.setattr(attention_kernels, "paged_index_scores_jax", record_shape)
+    actual = jax.jit(
+        lambda: paged_indexer_jax(
+            q,
+            pool,
+            records,
+            weights,
+            lengths,
+            candidates,
+            requests,
+            topk,
+            16,
+            False,
+            False,
+            True,
+        )
+    )()
+    for result, reference in zip(actual, expected, strict=True):
+        np.testing.assert_array_equal(result, reference)
+    assert rows > attention_kernels.indexer.QUERY_TILE
+    assert score_rows == [rows]

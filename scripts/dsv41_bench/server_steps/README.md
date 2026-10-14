@@ -246,8 +246,10 @@ python scripts/dsv41_bench/server_steps/run.py --scenario decode \
   --cache-dir /cache/dsv41-decode --cache-mode cold
 ```
 
-This compiles only buckets `[384,2048]`: target verification (288 rows), draft
-inputs (240 rows) and bounded replay fit 384; chunked prefill uses 2048.
+This compiles buckets `[288,384,2048]`: steady target verification is exactly
+48 requests x (K + 1) = 288 rows, so it no longer pads to 384 (padding ran every
+layer, and the grouped indexer, on 25% padding rows). Draft inputs (240 rows)
+use 288; bounded replay still fits 384; chunked prefill uses 2048.
 The larger prefill budget admits the 48 requests per rank before early requests
 finish: exact-prefix cache hits leave 256 tokens per request to compute.
 With a 512-token budget, admission overlapped request draining and produced no
@@ -267,7 +269,7 @@ export PYTHONPATH="$PWD/scripts/dsv41_bench/server_steps${PYTHONPATH:+:$PYTHONPA
 TP=1 DP=8 CHUNK=2048 MAX_SEQS=48 MAX_MODEL_LEN=98816 KV_BYTES=auto \
   bash scripts/dsv41_bench/serve_cached_prefill.sh \
   --worker-extension-cls server_step_worker.ServerStepWorker \
-  --compilation-config '{"compile_sizes":[384,2048]}' \
+  --compilation-config '{"compile_sizes":[288,384,2048]}' \
   2>&1 | tee /results/decode-server.log
 ```
 
@@ -316,7 +318,21 @@ server. Profile output is written locally and XPlane files are copied after
 shutdown. Timing summaries exclude profiling. All eight ranks capture at the
 same DP boundaries; validate XPlane coverage instead of the optional Chrome JSON.
 
-### Validated 96k/C384 result
+### Validated 96k/C384 result (indexer tiles + 288 bucket)
+
+Same host and recipe, epic/dsv41 `c7f2aea` plus the request-row indexer tiles,
+the decode-shaped query-tile bypass and the `[288,384,2048]` buckets; one formal
+window after warmup:
+
+| Metric | `c7f2aea` | This change |
+| --- | ---: | ---: |
+| Steady host-observation step median | 309.19 ms | 139.93 ms |
+| Steady step P90 (linear interpolation) | 309.92 ms | 141.49 ms |
+| Accepted + bonus output throughput | 4,954.18 tok/s | 10,885.18 tok/s |
+| Valid full-DP step intervals | 79 | 83 |
+| Accepted outputs / request / step | 4.034 | 4.030 |
+
+### Earlier validated 96k/C384 result (#1890, buckets `[384,2048]`)
 
 On four physical v7x chips (eight logical devices), TP1/DP8/EP8, DSpark K5,
 40 layers and SWA128, one formal window after warmup produced:

@@ -374,6 +374,39 @@ def test_shared_index_scores_large_query_groups_keep_matmul(monkeypatch, rows, t
     np.testing.assert_array_equal(np.asarray(got)[valid], np.asarray(expected)[valid])
 
 
+@pytest.mark.parametrize("per_token", [False, True])
+def test_index_score_tiles_by_request_rows_are_bitwise(monkeypatch, per_token):
+    # Wide decode contexts span several key tiles. Request-row (grouped) and
+    # per-token word-row tiles only change loop blocking: every key score must
+    # be bitwise identical to the historical 512-key tiling.
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels
+
+    rng = np.random.default_rng(1913)
+    rows, width, page = 16, 5000, 16
+    tokens = 128
+    pool = jnp.asarray(
+        rng.integers(-(2**31), 2**31, (256, 128)), jnp.int32
+    ) & jnp.int32(0x3FFF3FFF)
+    records = _paged_records(rng, rows, width, page, 512)
+    records[5, -3 * page :] = -1
+    requests = np.pad(np.repeat(np.arange(rows), 6), (0, 32)).astype(np.int32)
+    lengths = np.pad(rng.integers(1, width + 1, 96), (0, 32)).astype(np.int32)
+    q = jnp.asarray(rng.standard_normal((tokens, 4, 128)), jnp.bfloat16)
+    weights = jnp.asarray(rng.standard_normal((tokens, 4)), jnp.float32)
+    if per_token:
+        args = (q, pool, jnp.asarray(records[requests]), weights, jnp.asarray(lengths))
+        kwargs = {"page_records": page}
+    else:
+        args = (q, pool, jnp.asarray(records), weights, jnp.asarray(lengths))
+        kwargs = {"requests": jnp.asarray(requests), "page_records": page}
+    got = paged_index_scores_jax(*args, **kwargs)
+    monkeypatch.setattr(attention_kernels, "_INDEX_KEYS_PER_ITER", 512 * rows)
+    monkeypatch.setattr(attention_kernels, "_INDEX_WORD_KEYS_PER_ITER", 512)
+    expected = paged_index_scores_jax(*args, **kwargs)
+    valid = (records[requests] >= 0) & (np.arange(width) < lengths[:, None])
+    np.testing.assert_array_equal(np.asarray(got)[valid], np.asarray(expected)[valid])
+
+
 def test_candidate_filter_sparsecore_selection_matches_top_k(monkeypatch):
     """Unordered candidate scoring on SparseCore selects the top_k set."""
     from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels
