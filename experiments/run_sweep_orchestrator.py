@@ -259,7 +259,9 @@ class SweepOrchestrator:
 
             # Resolve trace configuration and advanced JAX profiler options
             trace_configs = self.config.get("trace_configs", [])
-            trace = bool(trace_configs)
+            # A root-level `trace: true` enables tracing even without
+            # per-coordinate trace_configs.
+            trace = bool(self.config.get("trace", bool(trace_configs)))
             matching_jax_config = {}
             for tc in trace_configs:
                 matches = True
@@ -302,6 +304,11 @@ class SweepOrchestrator:
             runner_names = ["profile", "eval"] if mode == "both" else [mode]
             cmd_repro = (f"python3 run_sweep_orchestrator.py --config "
                          f"{self.config_path}")
+            # Metrics of every runner for this coordinate are merged and
+            # persisted once, so `mode: both` yields a single trial and a
+            # resumed sweep cannot mistake a profile-only trial for a
+            # completed coordinate.
+            combined_metrics: Dict[str, Any] = {}
             for r_name in runner_names:
                 runner = RunnerRegistry.get(r_name)
                 try:
@@ -315,17 +322,18 @@ class SweepOrchestrator:
                     self.recorder.finalize(status="FAILED",
                                            error_message=error_message)
                     raise
+                combined_metrics.update(result.metrics)
 
-                # 4. Persist trial metrics to CSV and JSON
-                # Persist whether this coordinate was traced so the JSON
-                # recorder can attach trace artifacts to the right trial.
-                self.recorder.record(
-                    metadata={
-                        **combined_metadata, "trace": trace
-                    },
-                    metrics=result.metrics,
-                    reproduction_cmd=cmd_repro,
-                )
+            # 4. Persist trial metrics to CSV and JSON
+            # Persist whether this coordinate was traced so the JSON
+            # recorder can attach trace artifacts to the right trial.
+            self.recorder.record(
+                metadata={
+                    **combined_metadata, "trace": trace
+                },
+                metrics=combined_metrics,
+                reproduction_cmd=cmd_repro,
+            )
 
         # Finalize recorders (e.g. stamp completed_at in sweep.json)
         self.recorder.finalize(status="COMPLETED")

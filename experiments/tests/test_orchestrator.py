@@ -377,6 +377,50 @@ class TestSweepOrchestrator(unittest.TestCase):
             "batch_size": 1
         })
 
+    def test_both_mode_records_one_trial_per_coordinate(self):
+        """`mode: both` merges profile+eval metrics into a single trial.
+
+        Two trials per coordinate would make resumption skip the eval phase
+        after a crash between the two runners.
+        """
+        config_data = {
+            "mode": "both",
+            "sweep_matrix": {
+                "model": ["model_A"],
+                "batch_size": [1, 2]
+            }
+        }
+        self._write_yaml(config_data)
+
+        runners = {
+            "profile":
+            MagicMock(execute=MagicMock(return_value=BenchmarkResult(
+                duration_s=1.0, metrics={"TTFT_ms": "12.5"}, log_path=""))),
+            "eval":
+            MagicMock(execute=MagicMock(return_value=BenchmarkResult(
+                duration_s=2.0, metrics={"Eval_Acc": "0.9"}, log_path=""))),
+        }
+
+        with patch("runners.registry.RunnerRegistry.get",
+                   side_effect=lambda name: runners[name]):
+            orchestrator = run_sweep.SweepOrchestrator(
+                config_path=self.config_path,
+                result_dir=self.results_dir,
+                upload_gcs=False,
+            )
+            orchestrator.run()
+
+        self.assertEqual(runners["profile"].execute.call_count, 2)
+        self.assertEqual(runners["eval"].execute.call_count, 2)
+        with open(orchestrator.json_file, "r") as f:
+            data = json.load(f)
+        self.assertEqual(len(data["experiments"]), 2)
+        for trial in data["experiments"]:
+            self.assertEqual(trial["metrics"]["TTFT_ms"], "12.5")
+            self.assertEqual(trial["metrics"]["Eval_Acc"], "0.9")
+        with open(orchestrator.csv_file, "r") as f:
+            self.assertEqual(len(list(csv.DictReader(f))), 2)
+
     def test_fresh_run_with_custom_experiment_id(self):
         """Verifies that passing an experiment_id without resume=True starts a fresh run with that ID."""
         config_data = {
