@@ -2413,25 +2413,6 @@ class TPUModelRunner(GPUModelRunner):
         self._modify_prev_results()
         self._pre_async_results = None
 
-    def _needs_rejected_token_subtraction(self) -> bool:
-        """Whether _prepare_inputs must undo the previous step's rejected drafts.
-
-        Only when the previous async spec-decode step left results that map to
-        requests (req_id_to_index_copy). _flush_disjoint_async_results() keeps
-        zero-token results alive until sample_tokens() waits on their copy; with
-        an empty map there is nothing to subtract, and building the full-size
-        index arrays anyway breaks under PCP, where position_ids holds only this
-        rank's shard of the tokens.
-        """
-        pre = self._pre_async_results
-        return bool(
-            self.scheduler_config.async_scheduling
-            and self.speculative_config
-            and pre is not None
-            and pre.spec_decode_num_rejected_tokens is not None
-            and pre.req_id_to_index_copy
-        )
-
     def _install_spec_token_room_guard(self) -> None:
         """Wrap InputBatch.update_req_spec_token_ids to clamp its *write*.
 
@@ -3048,7 +3029,17 @@ class TPUModelRunner(GPUModelRunner):
         # Async spec: seq_lens/positions were advanced optimistically (every
         # draft from the previous step assumed accepted). Subtract the real
         # per-request rejected count on-device, keyed by req position.
-        if self._needs_rejected_token_subtraction():
+        # req_id_to_index_copy is empty for zero-token results that
+        # _flush_disjoint_async_results() keeps until sample_tokens() waits on
+        # their copy. Nothing maps then, and under PCP the full-size index arrays
+        # below would not match this rank's shard of position_ids.
+        if (
+            self.scheduler_config.async_scheduling
+            and self.speculative_config
+            and self._pre_async_results is not None
+            and self._pre_async_results.spec_decode_num_rejected_tokens is not None
+            and self._pre_async_results.req_id_to_index_copy
+        ):
             from vllm_torchtpu.runner.tpu_runner_async_output import (
                 subtract_num_rejected_tokens,
             )
