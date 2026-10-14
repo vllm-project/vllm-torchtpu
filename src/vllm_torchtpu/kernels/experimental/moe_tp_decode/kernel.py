@@ -13,8 +13,9 @@ inside the kernel, so no XLA all-reduce follows:
   3. routing: top-k of scores + bias (router_topk's clamp and lowest-column
      tie rule), weights = the picked unbiased scores over their sum clamped
      to 1e-20, rounded to bf16; rows >= n_valid get weight 0;
-  4. the experts any row picked go VMEM -> SMEM and are compacted; the first
-     _NUM_BUFFERS of them start their weight DMAs as they are recorded;
+  4. the experts any row picked go VMEM -> SMEM and are compacted by a
+     branch-free scan; the first _NUM_BUFFERS of them then start their weight
+     DMAs, and the shared expert's weights are waited for;
   5. x quantized to FP8 once per row with quantize_block, as
      xla_quantized_matmul does, for the shared and the routed experts; this
      rank's slice of the shared expert (the usual TP path's bf16 roundings);
@@ -291,25 +292,30 @@ def _kernel(
         ]
 
     def compact(e, count):
-        # Appends expert e to active_ids_ref if any row picked it.
-        hit_e = hits_s_ref[0, e]
-
-        @pl.when(hit_e != 0)
-        def record():
-            active_ids_ref[count] = e
-
-            # The first nb active experts start their copies as soon as they
-            # are recorded: the weight stream then starts at the first hit
-            # rather than after the scan, which outweighs the branch this
-            # adds to the loop (measured on v7x).
-            @pl.when(count < nb)
-            def prime():
-                for copy in transfers(count):
-                    copy.start()
-
-        return count + (hit_e != 0).astype(jnp.int32)
+        # Appends expert e to active_ids_ref if any row picked it. The store
+        # is unconditional, so the loop body has no branch: count <= e, a
+        # later hit overwrites the entry, and no read touches one >= count.
+        hit = hits_s_ref[0, e] != 0
+        active_ids_ref[count] = e
+        return count + hit.astype(jnp.int32)
 
     count = lax.fori_loop(0, local_experts, compact, jnp.int32(0))
+
+    def prime(step):
+        @pl.when(step < count)
+        def start():
+            for copy in transfers(step):
+                copy.start()
+
+    # The first nb active experts start their weight copies.
+    for s in range(nb):
+        prime(jnp.int32(s))
+
+    # The shared expert's copies started at entry. Waiting for them here,
+    # before the zeroing and the x quantization, leaves no DMA wait between
+    # those steps and the shared expert's matmuls.
+    for copy in shared_copies:
+        copy.wait()
 
     # Zeroing and x quantization follow the compaction, so the first weight
     # copies are already in flight while they run. x is quantized once, as
@@ -319,8 +325,6 @@ def _kernel(
     xq, xs = quantize_block(x_ref[...], axis=1, target_dtype=FP8)
     xq_ref[...] = xq
     xs_ref[...] = jnp.broadcast_to(xs, (m, 2 * i))
-    for copy in shared_copies:
-        copy.wait()
     _shared_expert(xq_ref, xs, sw13_ref, ss13_ref, sw2_ref, ss2_ref, shared_ref)
 
     expert_columns = lax.broadcasted_iota(jnp.int32, wtab_ref.shape, 1)
@@ -355,7 +359,8 @@ def _kernel(
 
     @pl.when(count > 0)
     def run_experts():
-        # compact() started the copies of the first nb experts.
+        # The prime loop after the compaction started the first nb experts'
+        # copies.
         for copy in transfers(jnp.int32(0)):
             copy.wait()
 
