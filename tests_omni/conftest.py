@@ -87,6 +87,9 @@ class OmniRunner:
         cleanup_test_environment()
         self.model_name = model_name
         self.omni: Omni | None = None
+        self._baseline_children: set[psutil.Process] = set()
+        with contextlib.suppress(Exception):
+            self._baseline_children = set(psutil.Process().children(recursive=True))
         kwargs.setdefault("stage_init_timeout", 600)
         kwargs.setdefault("init_timeout", 1800)
         kwargs.setdefault("log_stats", False)
@@ -113,7 +116,13 @@ class OmniRunner:
 
     def _cleanup_process(self) -> None:
         with contextlib.suppress(Exception):
-            children = psutil.Process().children(recursive=True)
+            children = []
+            for p in psutil.Process().children(recursive=True):
+                if p in self._baseline_children:
+                    continue
+                with contextlib.suppress(psutil.Error):
+                    if not any("resource_tracker" in arg for arg in p.cmdline()):
+                        children.append(p)
             for p in children:
                 with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
                     p.terminate()
