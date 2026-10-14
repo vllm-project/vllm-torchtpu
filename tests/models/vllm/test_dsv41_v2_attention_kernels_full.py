@@ -2357,14 +2357,10 @@ def test_fp8_consumers_skip_global_gather(monkeypatch, tokens):
             gathered_nope=nope,
             gathered_rope=rope_values,
         )
-    per_layer = (tokens + 127) // 128
-    assert len(chunks) == 6 * per_layer
-    for layer in range(6):
-        actual = chunks[layer * per_layer : (layer + 1) * per_layer]
-        np.testing.assert_array_equal(jnp.concatenate([x[0] for x in actual]), nope)
-        np.testing.assert_array_equal(
-            jnp.concatenate([x[1] for x in actual]), rope_values
-        )
+    assert len(chunks) == 6
+    for actual_nope, actual_rope in chunks:
+        np.testing.assert_array_equal(actual_nope, nope)
+        np.testing.assert_array_equal(actual_rope, rope_values)
 
 
 @pytest.mark.parametrize("banks", [1, 2])

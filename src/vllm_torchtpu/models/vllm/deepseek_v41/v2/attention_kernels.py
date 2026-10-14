@@ -568,6 +568,16 @@ def _csa_gather_pool(
     top_k: int,
 ) -> tuple[jax.Array, jax.Array]:
     """Gather NoPE and RoPE rows from a 1-bank or 2-bank paged pool."""
+    if isinstance(nope_cache, tuple) and jax.default_backend() == "tpu":
+        from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_gather
+
+        return csa_gather.csa_gather(
+            nope_cache,
+            rope_cache,
+            indices,
+            num_valid_indices=num_valid_indices,
+            top_k=top_k,
+        )
     if isinstance(nope_cache, tuple):
         assert isinstance(rope_cache, tuple)
         nope_lo, nope_hi = nope_cache
@@ -778,7 +788,7 @@ def sparse_ragged_paged_attention_union_gather(
     *,
     sm_scale: float = 1.0,
     gather_and_attention_chunk_size: int = 128,
-    attention_kernel_batch_size: int = 16,
+    attention_kernel_batch_size: int | None = None,
     union_cap: int = 4096,
     union_gather: bool = True,
     gathered_nope: jax.Array | None = None,
@@ -809,6 +819,23 @@ def sparse_ragged_paged_attention_union_gather(
         assert gathered_rope is not None
         assert gathered_nope.shape == (q.shape[0], topk, ROW_WORDS)
         assert gathered_rope.shape == (q.shape[0], topk // 4, ROW_WORDS)
+        # These buffers already cover the stage. Keep them resident in one
+        # attention pipeline instead of materializing per-chunk HBM slices.
+        gather_and_attention_chunk_size = q.shape[0]
+    if attention_kernel_batch_size is None:
+        attention_kernel_batch_size = 16
+        if (
+            gathered_nope is not None
+            and q.shape[0] >= 128
+            and jax.default_backend() == "tpu"
+        ):
+            from vllm_torchtpu.kernels.deepseek_v4.core_attention import (
+                tuned_block_sizes as sparse_tuning,
+            )
+
+            attention_kernel_batch_size = sparse_tuning.prefill_batch_size(
+                str(pltpu.get_tpu_info().chip_version), q.shape[1], head_dim, topk
+            )
     kv_lens = jnp.sum(topk_indices != -1, axis=-1)
     union_cap_aligned = max(topk, sparse_mla.align_to(union_cap, topk))
     max_num_seqs = cu_q_lens.shape[0] - 1
@@ -1013,15 +1040,38 @@ def sparse_fp8_attention_jax(
     from vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla import (
         sparse_ragged_paged_attention,
     )
+    from vllm_torchtpu.kernels.mla import tuned_window_attention, window_attention
 
-    state = _attend_window(
-        q,
-        swa_pool,
-        swa_records,
-        _attention_state(q),
-        scale,
-        max_requests=max_requests,
-    )
+    if (
+        max_requests == 1
+        and jax.default_backend() == "tpu"
+        and window_attention.supports_window_attention(q, swa_records)
+    ):
+        union, mask, uncovered = _window_union(swa_records, 64)
+        kv = gather_cache_pieces(swa_pool, union.reshape(-1), q.shape[-1])
+        kv = kv.reshape(kv.shape[0], *union.shape, kv.shape[-1])
+        key = (q.shape[1], q.shape[2], swa_records.shape[1])
+        state = window_attention.attend_windows(
+            q,
+            kv,
+            mask,
+            scale,
+            query_block=tuned_window_attention.QUERY_BLOCKS[key],
+        )
+        # Match the branch-free window path's failure for noncontiguous records.
+        state = tuple(
+            jnp.where(uncovered.reshape(-1, *([1] * (value.ndim - 1))), jnp.nan, value)
+            for value in state
+        )
+    else:
+        state = _attend_window(
+            q,
+            swa_pool,
+            swa_records,
+            _attention_state(q),
+            scale,
+            max_requests=max_requests,
+        )
     # The SWA conditional holds SparseCore gathers, and XLA completes every
     # in-flight `sc_csa_gather` before such a conditional: the TensorCore then
     # idles through the whole gather chain (sc_gather_diag.md). Launch the CSA

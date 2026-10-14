@@ -96,6 +96,34 @@ class GatherTest(parameterized.TestCase):
         np.testing.assert_array_equal(nope_ref, nope_sc)
         np.testing.assert_array_equal(rope_ref, rope_sc)
 
+    @parameterized.product(
+        top_k=(256, 512, 1024),
+        placement=("low", "high", "mixed"),
+    )
+    def test_banked_gather(self, top_k, placement):
+        pages, page_size, split_pages = 64, 16, 23
+        key, rope_key, index_key = jax.random.split(jax.random.key(7), 3)
+        nope = _random_words(key, (pages, page_size, 128))
+        rope = _random_words(rope_key, (pages, page_size // 4, 128))
+        boundary = split_pages * page_size
+        low = boundary if placement == "high" else 0
+        high = boundary if placement == "low" else pages * page_size
+        indices = jax.random.randint(index_key, (5 * top_k,), low, high)
+        if placement == "mixed":
+            indices = indices.at[:4].set(
+                jnp.array([0, boundary - 1, boundary, high - 1])
+            )
+        actual = csa_gather(
+            (nope[:split_pages], nope[split_pages:]),
+            (rope[:split_pages], rope[split_pages:]),
+            indices,
+            num_valid_indices=3 * top_k,
+            top_k=top_k,
+        )
+        expected = gather_ref_impl(nope, rope, indices[: 3 * top_k], top_k=top_k)
+        for got, ref in zip(actual, expected, strict=True):
+            np.testing.assert_array_equal(got[: ref.shape[0]], ref)
+
     @parameterized.parameters(
         (4096, 1024),
         (128 * 1024, 16 * 1024),
