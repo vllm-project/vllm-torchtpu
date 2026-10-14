@@ -43,6 +43,17 @@ class IResultRecorder(ABC):
         """Records a completed benchmark coordinate with its metrics and reproduction command."""
         pass
 
+    def record_failure(self,
+                       metadata: Dict[str, Any],
+                       error_message: str,
+                       reproduction_cmd: str = "") -> None:
+        """Records a benchmark coordinate whose runner raised.
+
+        Optional hook; recorders that only log successful trials (such as
+        flat CSV logs) keep the default no-op.
+        """
+        return None
+
     def finalize(self,
                  status: str = "COMPLETED",
                  error_message: Optional[str] = None) -> None:

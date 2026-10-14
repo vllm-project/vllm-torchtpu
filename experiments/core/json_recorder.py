@@ -189,6 +189,13 @@ class CompositeResultRecorder(IResultRecorder):
         for recorder in self.recorders:
             recorder.record(metadata, metrics, reproduction_cmd)
 
+    def record_failure(self,
+                       metadata: Dict[str, Any],
+                       error_message: str,
+                       reproduction_cmd: str = "") -> None:
+        for recorder in self.recorders:
+            recorder.record_failure(metadata, error_message, reproduction_cmd)
+
     def finalize(self,
                  status: str = "COMPLETED",
                  error_message: Optional[str] = None) -> None:

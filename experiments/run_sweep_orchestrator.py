@@ -307,8 +307,8 @@ class SweepOrchestrator:
                     # Persist the failure so sweep.json never stays RUNNING
                     # after a crash, then propagate to the caller.
                     error_message = f"{type(e).__name__}: {e}"
-                    self.json_recorder.record_failure(combined_metadata,
-                                                      error_message, cmd_repro)
+                    self.recorder.record_failure(combined_metadata,
+                                                 error_message, cmd_repro)
                     self.recorder.finalize(status="FAILED",
                                            error_message=error_message)
                     raise
