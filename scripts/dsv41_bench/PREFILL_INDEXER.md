@@ -20,6 +20,20 @@ a complete score row in HBM until top-k finishes. Radix scan and compaction
 parameters are both 8192. Returned logical indices remain ascending with
 invalid entries padded by -1.
 
+The implementation lives in `kernels/deepseek_v41/prefill_indexer/`:
+`scores.py`, `radix_topk.py` and their local `tuned_block_sizes.py`.
+
+Routing uses shapes and live-request metadata, not an explicit phase flag.
+Ordinary decode/DSpark workloads retain existing score/top-k kernels. A single
+request padded to 2048 queries with at most 512 effective keys can take the
+all-indices shortcut even in decode; it does not execute the new scorer or
+radix kernel. This is not a replacement for all prefill shapes or a claim that
+every decode compilation graph is identical.
+
+The benchmark launcher does not enable this route. It is enabled by the
+runtime default. For A/B runs, use distinct output/cache directories per mode;
+set the selector before startup and compile each mode separately.
+
 ## Kernel A/B
 
 Use the installed serving dependencies on a TPU host. The runner includes

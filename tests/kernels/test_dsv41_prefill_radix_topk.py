@@ -7,7 +7,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.deepseek_v41.prefill_radix_topk import prefill_radix_topk
+from vllm_torchtpu.kernels.deepseek_v41.prefill_indexer.radix_topk import (
+    prefill_radix_topk,
+)
 
 
 @pytest.mark.parametrize("block,threshold", [(8192, 8192), (16384, 32768)])

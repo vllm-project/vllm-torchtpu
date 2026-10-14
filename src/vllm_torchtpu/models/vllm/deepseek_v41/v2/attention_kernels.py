@@ -15,9 +15,16 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v41 import (
     index_word_scores,
     indexer,
-    prefill_index_scores,
-    prefill_radix_topk,
     tuned_block_sizes,
+)
+from vllm_torchtpu.kernels.deepseek_v41.prefill_indexer import (
+    radix_topk as prefill_radix_topk,
+)
+from vllm_torchtpu.kernels.deepseek_v41.prefill_indexer import (
+    scores as prefill_index_scores,
+)
+from vllm_torchtpu.kernels.deepseek_v41.prefill_indexer import (
+    tuned_block_sizes as prefill_tuning,
 )
 
 from .cache import (
@@ -2394,8 +2401,8 @@ def _prefill_score(q, weights, pool, pages, limit, *, page_records):
     score = functools.partial(
         prefill_index_scores.prefill_index_scores,
         page_records=page_records,
-        query_tile=tuned_block_sizes.PREFILL_QUERY_TILE,
-        key_tile=tuned_block_sizes.PREFILL_KEY_TILE,
+        query_tile=prefill_tuning.QUERY_TILE,
+        key_tile=prefill_tuning.KEY_TILE,
     )
     try:
         mesh = get_vllm_model_wrapper_context().mesh
@@ -2866,7 +2873,7 @@ def paged_indexer_jax(
                 constant_values=-1,
             )
             return score_context(
-                bounded_records, tuned_block_sizes.PREFILL_QUERY_TILE, prefill_mode
+                bounded_records, prefill_tuning.QUERY_TILE, prefill_mode
             )
 
         def all_indices(_):
@@ -2934,11 +2941,9 @@ def paged_indexer_jax(
     ):
         live = lengths > 0
         request = requests[jnp.argmax(lengths)]
-        # Preserve decode/DSpark and mixed-request graphs. Short contexts
-        # are handled without scoring; padding does not select a request.
-        prefill = (live.sum() >= tuned_block_sizes.PREFILL_QUERY_TILE) | (
-            lengths.max() <= topk
-        )
+        # Infer eligibility from live rows, not a prefill/decode phase flag.
+        # Short contexts need no ranking; padding does not select a request.
+        prefill = (live.sum() >= prefill_tuning.QUERY_TILE) | (lengths.max() <= topk)
         prefill &= jnp.all((requests == request) | ~live)
         return jax.lax.cond(prefill, prefill_context, lambda: full_context(None))
 

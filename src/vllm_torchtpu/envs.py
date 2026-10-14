@@ -371,7 +371,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Prefill defaults to resident-Q scoring + radix TopK (8K/8K).
     # Keep baseline as an A/B escape hatch while qualifying the new route.
-    # It affects only paged prefill, never decode or candidate publication.
+    # Eligibility is limited to single-request 2K chunks without candidate modes.
     "TPU_DEEPSEEK_V41_PREFILL_INDEXER": env_with_choices(
         "TPU_DEEPSEEK_V41_PREFILL_INDEXER",
         "radix",

@@ -17,7 +17,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.kernels.deepseek_v41.prefill_index_scores import (
+from vllm_torchtpu.kernels.deepseek_v41.prefill_indexer.scores import (
     supports_chunked_prefill,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (

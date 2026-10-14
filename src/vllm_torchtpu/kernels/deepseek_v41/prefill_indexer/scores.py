@@ -16,8 +16,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from ..index_word_scores import DIM, ROW_WORDS, SLOTS, unpack_word_rows
 from . import tuned_block_sizes
-from .index_word_scores import DIM, ROW_WORDS, SLOTS, unpack_word_rows
 
 
 def supports_chunked_prefill(
@@ -31,9 +31,9 @@ def supports_chunked_prefill(
         q.shape == (2048, 32, DIM)
         and q.dtype == jnp.bfloat16
         and page_records is not None
-        and 0 < page_records <= tuned_block_sizes.PREFILL_KEY_TILE
+        and 0 < page_records <= tuned_block_sizes.KEY_TILE
         and page_records % 16 == 0
-        and tuned_block_sizes.PREFILL_KEY_TILE % page_records == 0
+        and tuned_block_sizes.KEY_TILE % page_records == 0
         and all(
             b.dtype == jnp.int32
             and b.ndim == 2
@@ -46,7 +46,7 @@ def supports_chunked_prefill(
 
 def context_buckets(capacity: int) -> tuple[int, ...]:
     """Power-of-two score widths, capped at the page-aligned capacity."""
-    tile = tuned_block_sizes.PREFILL_KEY_TILE
+    tile = tuned_block_sizes.KEY_TILE
     capacity = pl.cdiv(capacity, tile) * tile
     widths = []
     width = tile
@@ -253,8 +253,8 @@ def prefill_index_scores(
     # logical HBM columns before the full-row SparseCore selector runs.
     window = (
         width
-        if width <= tuned_block_sizes.PAGED_INDEXER_PREFILL_BUCKET[0]
-        else math.gcd(width, max(key_tile, tuned_block_sizes.PREFILL_SCORE_WINDOW))
+        if width <= 2 * tuned_block_sizes.SCORE_WINDOW
+        else math.gcd(width, max(key_tile, tuned_block_sizes.SCORE_WINDOW))
     )
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
     return pl.pallas_call(
