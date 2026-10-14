@@ -69,7 +69,9 @@ run blocked mode.
   1024 wide, 2 slots from 8192. The combine then reads only each token's live
   slots, since under EP most routes belong to other ranks. The kernel name
   ends in `-ib_<ib>-nb_<nb>-r_<rows>`.
-- **Numerics.** Hidden states are quantized to FP8 once per row, and the
-  activated intermediate per row (per row per block in blocked mode). Both
-  matmuls are FP8 x FP8 with FP32 accumulation; slab rows and the all-reduce
-  are BF16.
+- **Numerics.** Hidden states and the activated intermediate are quantized to
+  FP8 with one scale per row per 512 columns, the block `gmm_v2` uses with the
+  kernel off (in blocked mode the intermediate per row per block, in
+  512-column pieces of wider blocks). Each block's partial product is scaled
+  and summed in FP32; slab rows and the all-reduce are BF16. The hidden size
+  must be a multiple of 512.
