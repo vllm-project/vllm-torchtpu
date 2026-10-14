@@ -80,5 +80,40 @@ def test_calculate_block_sizes_generation(
         decode_blocks, prefill_blocks = wrapper.calculate_block_sizes(
             model_cfg, serve_cfg, vmem_limit
         )
-        assert decode_blocks.bq_sz >= decode_blocks.bq_c_sz >= expected_bq_c_min
+        assert decode_blocks.bq_sz == decode_blocks.bq_c_sz
+        assert decode_blocks.bq_c_sz >= expected_bq_c_min
         assert prefill_blocks.bq_sz >= prefill_blocks.bq_c_sz >= expected_bq_c_min
+
+
+@pytest.mark.parametrize("decode_query_size", [1, 2, 4, 8])
+def test_decode_bqc_always_equals_bq(decode_query_size):
+    """Verifies that in decode mode, bq_c_sz is never downsized below bq_sz."""
+    dtype = jnp.float8_e4m3fn
+    # Multi-head config where compute buffer time would exceed threshold if downsized
+    # (e.g. Qwen3.5 on TP=2 with 16 query heads per core).
+    model_cfg = configs.ModelConfigs(
+        num_q_heads=16,
+        num_kv_heads=2,
+        head_dim=256,
+        mask_value=-1e9,
+    )
+    serve_cfg = configs.ServingConfigs(
+        num_seqs=4,
+        page_size=256,
+        total_q_tokens=decode_query_size * 4,
+        num_page_indices=128,
+        dtype_q=dtype,
+        dtype_kv=dtype,
+        dtype_out=jnp.bfloat16,
+        decode_query_size=decode_query_size,
+    )
+    vmem_limit = 64 * 1024 * 1024
+    with patch(
+        "jax.experimental.pallas.tpu.get_tpu_info",
+        return_value=_create_mock_tpu_info(7, chip_version="v7x"),
+    ):
+        decode_blocks, _ = wrapper.calculate_block_sizes(
+            model_cfg, serve_cfg, vmem_limit, decode_query_size=decode_query_size
+        )
+        assert decode_blocks.bq_sz == decode_query_size
+        assert decode_blocks.bq_c_sz == decode_query_size
