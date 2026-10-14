@@ -21,6 +21,8 @@ from .cache import (
     ROPE_WORDS,
     ROW_WORDS,
     _cache_num_rows,
+    _gather_raw_rows,
+    _valid_records,
     gather_cache_page_values,
     gather_cache_page_words,
     gather_cache_pieces,
@@ -244,44 +246,74 @@ def _attend_window(
         fallback = min(tokens, -(-(tile - 1) * (max_requests - 1) // 8) * 8)
 
     def fast(_):
-        gathered = gather_cache_pieces(pool, union.reshape(-1), dim)
-        pieces = gathered.shape[0]
-        kv = gathered.reshape(pieces, count, union.shape[1], -1)
-        kv = jnp.where((union >= 0)[None, ..., None], kv, 0)
+        if (
+            jax.default_backend() == "tpu"
+            and q.dtype == jnp.bfloat16
+            and dim % 256 == 0
+            and heads % min(heads, 8) == 0
+        ):
+            from vllm_torchtpu.kernels.mla.window_attention import attend_windows
 
-        def split(x):
-            return split_pieces(x.reshape(count, tile, heads, dim), pieces)
+            pad = -union.shape[1] % 128
+            padded_union = jnp.pad(union, ((0, 0), (0, pad)), constant_values=-1)
+            padded_mask = jnp.pad(mask, ((0, 0), (0, 0), (0, pad)))
+            chunks = dim // (2 * ROW_WORDS)
+            rows = _valid_records(pool, padded_union.reshape(-1), dim // 2) * chunks
+            rows = rows[None] + jnp.arange(chunks, dtype=rows.dtype)[:, None]
+            words = _gather_raw_rows(pool, rows.reshape(-1)).reshape(
+                chunks, count, padded_union.shape[1], ROW_WORDS
+            )
+            maximum, denominator, numerator = attend_windows(
+                q, words, padded_mask, scale=scale
+            )
+            old_max, old_den, old_num = state
+            new_max = jnp.maximum(old_max, maximum)
+            old_correction = jnp.exp(old_max - new_max)
+            correction = jnp.exp(maximum - new_max)
+            result = (
+                new_max,
+                old_den * old_correction + denominator * correction,
+                old_num * old_correction[..., None] + numerator * correction[..., None],
+            )
+        else:
+            gathered = gather_cache_pieces(pool, union.reshape(-1), dim)
+            pieces = gathered.shape[0]
+            kv = gathered.reshape(pieces, count, union.shape[1], -1)
+            kv = jnp.where((union >= 0)[None, ..., None], kv, 0)
 
-        maximum, denominator, numerator = state
-        shape = (count, tile, heads)
-        maximum = maximum.reshape(shape)
-        denominator = denominator.reshape(shape)
-        numerator = split(numerator)
-        scores = (
-            jnp.einsum(
-                "pnthd,pnkd->nthk",
-                split(q).astype(jnp.float32),
-                kv.astype(jnp.float32),
+            def split(x):
+                return split_pieces(x.reshape(count, tile, heads, dim), pieces)
+
+            maximum, denominator, numerator = state
+            shape = (count, tile, heads)
+            maximum = maximum.reshape(shape)
+            denominator = denominator.reshape(shape)
+            numerator = split(numerator)
+            scores = (
+                jnp.einsum(
+                    "pnthd,pnkd->nthk",
+                    split(q).astype(jnp.float32),
+                    kv.astype(jnp.float32),
+                    preferred_element_type=jnp.float32,
+                )
+                * scale
+            )
+            scores = jnp.where(mask[:, :, None], scores, -jnp.inf)
+            new_max = jnp.maximum(maximum, scores.max(-1))
+            correction = jnp.exp(maximum - new_max)
+            exponentials = jnp.exp(scores - new_max[..., None])
+            denominator = denominator * correction + exponentials.sum(-1)
+            numerator = numerator * correction[None, ..., None] + jnp.einsum(
+                "nthk,pnkd->pnthd",
+                exponentials.astype(jnp.bfloat16),
+                kv,
                 preferred_element_type=jnp.float32,
             )
-            * scale
-        )
-        scores = jnp.where(mask[:, :, None], scores, -jnp.inf)
-        new_max = jnp.maximum(maximum, scores.max(-1))
-        correction = jnp.exp(maximum - new_max)
-        exponentials = jnp.exp(scores - new_max[..., None])
-        denominator = denominator * correction + exponentials.sum(-1)
-        numerator = numerator * correction[None, ..., None] + jnp.einsum(
-            "nthk,pnkd->pnthd",
-            exponentials.astype(jnp.bfloat16),
-            kv,
-            preferred_element_type=jnp.float32,
-        )
-        result = (
-            new_max.reshape(tokens, heads),
-            denominator.reshape(tokens, heads),
-            merge_pieces(numerator).reshape(tokens, heads, dim),
-        )
+            result = (
+                new_max.reshape(tokens, heads),
+                denominator.reshape(tokens, heads),
+                merge_pieces(numerator).reshape(tokens, heads, dim),
+            )
 
         # Recompute uncovered tokens from their own records.
         def patch(result):
@@ -531,10 +563,10 @@ def _paged_pool_shape(
         cache_lo, cache_hi = cache
         return (
             cache_lo.shape[0] + cache_hi.shape[0],
-            cache_lo.shape[1],
+            cache_lo.shape[1] // 2,
             cache_lo.shape[2],
         )
-    return cache.shape
+    return cache.shape[0], cache.shape[1] // 2, cache.shape[2]
 
 
 def _reshape_paged_pool(
@@ -562,8 +594,8 @@ def _csa_gather_pool(
         assert isinstance(rope_cache, tuple)
         nope_lo, nope_hi = nope_cache
         rope_lo, rope_hi = rope_cache
-        lo_tokens = nope_lo.shape[0] * nope_lo.shape[1]
-        hi_tokens = nope_hi.shape[0] * nope_hi.shape[1]
+        lo_tokens = nope_lo.shape[0] * nope_lo.shape[1] // 2
+        hi_tokens = nope_hi.shape[0] * nope_hi.shape[1] // 2
         out_size = indices.size
         num_periods = out_size // top_k
         in_hi = indices >= lo_tokens
@@ -622,15 +654,16 @@ def _csa_gather_pool(
             indices,
             num_valid_indices=num_valid_indices,
             top_k=top_k,
+            combined=True,
         )
-    total_num_pages, page_size, nope_lanes = nope_cache.shape
-    _, _, rope_lanes = rope_cache.shape
-    flat_nope = nope_cache.reshape(total_num_pages * page_size, nope_lanes)
-    flat_rope_words = rope_cache.reshape(total_num_pages * page_size, rope_lanes // 4)
-    u_nope = flat_nope[indices]
+    flat = nope_cache.reshape(-1, ROW_WORDS)
+    u_nope = flat[2 * indices]
+    rope = flat[2 * indices + 1]
+    # SparseMLA's gathered buffer keeps its established compact 64-BF16 ABI.
+    rope_words = (rope[:, :32] & 0xFFFF) | (rope[:, 32:64] << 16)
     u_rope = repack_chunk_rope_words(
-        flat_rope_words[indices].reshape(indices.size // top_k, top_k, rope_lanes // 4)
-    ).reshape(indices.size // 4, rope_lanes)
+        rope_words.reshape(indices.size // top_k, top_k, ROPE_WORDS)
+    ).reshape(indices.size // 4, ROW_WORDS)
     return u_nope, u_rope
 
 
@@ -937,6 +970,7 @@ def sparse_ragged_paged_attention_union_gather(
                     sparse_mla._attention_kernel,
                     sm_scale=sm_scale,
                     batch_size=kbs,
+                    nope_row_scale=True,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=len(scalar_prefetches),
@@ -992,18 +1026,14 @@ def sparse_fp8_attention_jax(
 
     ``main_records`` index rows through ``pages`` ``[requests, pages_per_seq]``:
     row ``r`` of request ``s`` is raw row ``pages[s, r // page_size] *
-    page_size + r % page_size``; the RoPE companion holds raw row i's 32 words
-    at i. With one request, one page of every row and ``query_start_loc``
+    page_size + r % page_size``. Each record owns rows ``2*r`` (NoPE/scales)
+    and ``2*r+1`` (padded RoPE). With one request and ``query_start_loc``
     ``[0, tokens]``, records are raw rows.
 
     ``max_requests`` bounds requests per batch (see `_attend_window`).
     ``precompacted`` skips ``compact_records`` when ``main_records`` already has
     valid indices sorted ascending at the prefix and ``-1`` at the tail.
     """
-    from vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla import (
-        sparse_ragged_paged_attention,
-    )
-
     state = _attend_window(
         q,
         swa_pool,
@@ -1027,29 +1057,9 @@ def sparse_fp8_attention_jax(
         if precompacted
         else compact_records(main_records)
     )
-    nope_3d = _reshape_paged_pool(main_pool, page_size)
-    rope_3d = _reshape_paged_pool(rope_pool, page_size // 4)
-    if gathered_nope is not None or union_gather or isinstance(main_pool, tuple):
-        return sparse_ragged_paged_attention_union_gather(
-            q,
-            nope_3d,
-            rope_3d,
-            compacted,
-            pages.reshape(-1),
-            query_start_loc,
-            jnp.array([0, 0, pages.shape[0]], jnp.int32),
-            sink.astype(jnp.float32),
-            numerator.astype(q.dtype),
-            denominator,
-            maximum,
-            sm_scale=scale,
-            union_cap=union_cap,
-            union_gather=union_gather,
-            gathered_nope=gathered_nope,
-            gathered_rope=gathered_rope,
-        )
-    assert not isinstance(nope_3d, tuple) and not isinstance(rope_3d, tuple)
-    return sparse_ragged_paged_attention(
+    nope_3d = _reshape_paged_pool(main_pool, 2 * page_size)
+    rope_3d = _reshape_paged_pool(rope_pool, 2 * page_size)
+    return sparse_ragged_paged_attention_union_gather(
         q,
         nope_3d,
         rope_3d,
@@ -1062,6 +1072,10 @@ def sparse_fp8_attention_jax(
         denominator,
         maximum,
         sm_scale=scale,
+        union_cap=union_cap,
+        union_gather=union_gather,
+        gathered_nope=gathered_nope,
+        gathered_rope=gathered_rope,
     )
 
 
@@ -1122,10 +1136,10 @@ def gather_fp8_kv_jax(
         _pad_compacted_records(records) if precompacted else compact_records(records)
     )
     nope_pool = _reshape_paged_pool(
-        pool if pool_hi is None else (pool, pool_hi), page_size
+        pool if pool_hi is None else (pool, pool_hi), 2 * page_size
     )
     rope_pool = _reshape_paged_pool(
-        rope if rope_hi is None else (rope, rope_hi), page_size // 4
+        rope if rope_hi is None else (rope, rope_hi), 2 * page_size
     )
     seq_ids = jnp.repeat(
         jnp.arange(pages.shape[0], dtype=jnp.int32),
@@ -1833,11 +1847,11 @@ def _has_hi_bank(cache) -> bool:
 def _resolve_fp8_pages(main, main_records, tokens):
     page_size = main.shape[1]
     if not _has_hi_bank(main):
-        page_size = main.raw.shape[0]
+        page_size = main.raw.shape[0] // 2
         pages = main_records.new_zeros((1, 1))
     else:
-        page_size = math.gcd(main.raw.shape[0], main.raw_hi.shape[0])
-        total_pages = main.total_rows // page_size
+        page_size = math.gcd(main.raw.shape[0], main.raw_hi.shape[0]) // 2
+        total_pages = main.total_rows // (2 * page_size)
         pages = torch.arange(
             total_pages, device=main_records.device, dtype=torch.int32
         ).unsqueeze(0)
@@ -2183,7 +2197,7 @@ def paged_index_scores_jax(
             tile = 1 << (grouped.bit_length() - 1)
     padded_width = width + (-width % tile)
     scores = jnp.full((tokens, padded_width), -jnp.inf, jnp.float32)
-    q = split_halves(q)  # keys are read in the split element order
+    q = split_halves(q)  # cache keys retain the original feature order
     weights = weights.astype(jnp.float32)[:, :, None]
 
     def head_sum(logits):

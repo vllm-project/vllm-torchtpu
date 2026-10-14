@@ -91,7 +91,10 @@ def _scatter_kernel(
     else:
         src_words = src_ref
         cache_words = cache_ref
-    num_rows = cache_words.shape[0]
+    record_words = src_words.shape[-1]
+    row_words = cache_words.shape[-1]
+    per_row = row_words // record_words
+    num_rows = cache_words.size // record_words
 
     block_slot = core_index // plan.cores_per_block
     lane_group = lax.rem(core_index, plan.cores_per_block)
@@ -110,7 +113,10 @@ def _scatter_kernel(
             row = jnp.clip(dst, 0, num_rows - 1)
             copy = pltpu.make_async_copy(
                 src_buf.at[pl.ds(i, 1)],
-                cache_words.at[pl.ds(row, 1)],
+                cache_words.at[
+                    pl.ds(row // per_row, 1),
+                    pl.ds(row % per_row * record_words, record_words),
+                ],
                 sem.at[i],
             )
             copies.append((write, copy))
@@ -150,15 +156,16 @@ def scatter_rows(
 ) -> jax.Array:
     """Writes one row of `src` per token into `cache`.
 
-    `cache.dtype` selects the layout: uint32 is the native SparseCore cache, one
-    word row per token; uint8 is the TensorCore-tiled cache, where the kernel
-    folds WORD_BYTES uint8 rows into one word row.
+    `cache.dtype` selects the layout: uint32 uses native SparseCore tiling;
+    int32 and uint8 retain TensorCore tiling. The uint8 path folds WORD_BYTES
+    rows into one word row. Word records may divide a physical cache row or
+    span several whole rows.
 
     Args:
-      cache: KV cache in HBM, any leading dims; flattened to one row per token.
+      cache: KV cache in HBM, any leading dims; its last dimension is preserved.
       src: [num_tokens, row_width] tokens, same dtype as `cache`.
-      dst_rows: [num_tokens] destination row; negative or out of range drops the
-        token.
+      dst_rows: [num_tokens] destination record in units of `src.shape[-1]`
+        elements; negative or out of range drops the token.
       name: Pallas kernel name, as it appears in a profile.
 
     Returns:
@@ -168,14 +175,30 @@ def scatter_rows(
         f"src {src.dtype} does not match cache {cache.dtype}"
     )
     tc_tiled = cache.dtype == jnp.uint8
-    assert tc_tiled or cache.dtype == jnp.uint32, (
-        f"cache must be uint8 (TensorCore) or uint32 (SparseCore), got {cache.dtype}"
+    assert tc_tiled or cache.dtype in (jnp.uint32, jnp.int32), (
+        "cache must be uint8 (TensorCore) or 32-bit words (SparseCore), "
+        f"got {cache.dtype}"
     )
     tc_row_bytes = kv_cache_utils.WORD_BYTES * kv_cache_utils.TILE_LANE_BYTES
     assert not tc_tiled or src.shape[-1] == tc_row_bytes, (
         f"TensorCore tiling folds exactly {kv_cache_utils.WORD_BYTES} rows, so a"
         f" token must be {tc_row_bytes}B (got {src.shape[-1]}B)"
     )
+
+    row_width = kv_cache_utils.TILE_LANE_BYTES if tc_tiled else cache.shape[-1]
+    record_words = row_width if tc_tiled else src.shape[-1]
+    assert not (row_width % record_words and record_words % row_width), (
+        "Records must divide a cache row or span whole rows"
+    )
+    if record_words > row_width:
+        chunks = record_words // row_width
+        valid = (dst_rows >= 0) & (dst_rows < cache.size // record_words)
+        dst_rows = jnp.where(
+            valid[:, None],
+            dst_rows[:, None] * chunks + jnp.arange(chunks, dtype=dst_rows.dtype),
+            kv_cache_utils.SKIP_ROW,
+        ).reshape(-1)
+        src = src.reshape(-1, row_width)
 
     sc_info = pltpu.get_tpu_info().sparse_core
     assert sc_info is not None, "SparseCore info is missing."
@@ -189,8 +212,9 @@ def scatter_rows(
         )
         src = jnp.pad(src, ((0, pad_tokens), (0, 0)))
 
-    # A TC-tiled token is WORD_BYTES uint8 rows the kernel folds back into one.
-    row_width = kv_cache_utils.TILE_LANE_BYTES if tc_tiled else src.shape[-1]
+    # Keep the owner's shape across the kernel boundary. Reshaping the whole
+    # array to a narrow record width can pad every row to a TensorCore lane
+    # width; the kernel instead addresses each record within the original rows.
     cache_ref = jax.new_ref(cache.reshape(-1, row_width))
 
     vector_mesh = plsc.VectorSubcoreMesh(
@@ -210,12 +234,13 @@ def scatter_rows(
         out_type=(),
         scratch_types=(pltpu.SemaphoreType.DMA((plan.lanes_per_block,)),),
         compiler_params=pltpu.CompilerParams(
-            use_tc_tiling_on_sc=tc_tiled,
+            # Signed word pools retain the TensorCore layout of their owner.
+            use_tc_tiling_on_sc=tc_tiled or cache.dtype == jnp.int32,
             needs_layout_passes=True,
             disable_bounds_checks=True,
         ),
         mesh=vector_mesh,
         name=name,
-    )(dst_rows, src.reshape(-1, row_width), cache_ref)
+    )(dst_rows, src.reshape(-1, row_width) if tc_tiled else src, cache_ref)
 
     return jax.freeze(cache_ref).reshape(cache.shape)

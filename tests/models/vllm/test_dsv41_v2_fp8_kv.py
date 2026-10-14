@@ -1,15 +1,12 @@
-"""CPU checks for the DeepSeek V4.1 FP8 main-KV record and RoPE companion."""
+"""CPU checks for the DeepSeek V4.1 FP8 combined main-KV record."""
 
 import jax.numpy as jnp
-import ml_dtypes
 import numpy as np
 import pytest
 import torch
 
-from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import compact_records
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
-    NOPE_DIM,
     PagedCacheRows,
     encode_fp8_kv,
     scatter_cache_values,
@@ -20,54 +17,6 @@ def _latent(n, seed=0):
     rng = np.random.default_rng(seed)
     values = rng.standard_normal((n, 512)) * rng.uniform(0.01, 30, (n, 1))
     return jnp.asarray(values, jnp.bfloat16)
-
-
-def _decode(words, rope):
-    """Dequantize records back to float32 ``[n, 512]``."""
-    record = np.asarray(csa_cache_layout.words_to_slabs(words)).reshape(-1, 512)
-    values = record[:, :NOPE_DIM].view(jnp.float8_e4m3fn).astype(np.float32)
-    scales = record[:, NOPE_DIM:].view(jnp.float8_e8m0fnu).astype(np.float32)
-    nope = values * np.tile(scales, NOPE_DIM // 64)
-    bits = np.asarray(rope).view(np.uint32)
-    halves = np.concatenate((bits & 0xFFFF, bits >> 16), axis=-1).astype(np.uint16)
-    return np.concatenate((nope, halves.view(jnp.bfloat16).astype(np.float32)), -1)
-
-
-def test_encode_matches_exact_lane_periodic_quantizer():
-    """V4's lane-periodic UE8M0 quantizer, with exact power-of-two scales."""
-    latent = _latent(37)
-    # Exact e4m3 ties (bf16 inputs make them common) and zero lanes.
-    latent = latent.at[0, :NOPE_DIM].set(0).at[1, :NOPE_DIM].set(76 * 2.0**-19)
-    words, rope = encode_fp8_kv(latent)
-    assert words.shape == (37, 128) and words.dtype == jnp.int32
-    assert rope.shape == (37, 32) and rope.dtype == jnp.int32
-    nope = np.asarray(latent, np.float64)[:, :NOPE_DIM]
-    amax = np.maximum(np.abs(nope).reshape(37, -1, 64).max(axis=1), 1e-4)
-    exponent = np.ceil(np.log2(amax / 448)).astype(np.int64)
-    q = (nope / np.tile(2.0**exponent, NOPE_DIM // 64)).astype(np.float32)
-    expected = np.concatenate(
-        (
-            q.astype(ml_dtypes.float8_e4m3fn).view(np.uint8),
-            (exponent + 127).astype(np.uint8),
-        ),
-        axis=-1,
-    )
-    got = np.asarray(csa_cache_layout.words_to_slabs(words)).reshape(37, 512)
-    np.testing.assert_array_equal(got, expected)
-    np.testing.assert_array_equal(
-        np.asarray(rope), np.asarray(csa_cache_layout.rope_words(latent[:, NOPE_DIM:]))
-    )
-
-
-def test_encode_round_trip_error():
-    latent = _latent(64, seed=1)
-    decoded = _decode(*encode_fp8_kv(latent))
-    reference = np.asarray(latent, np.float32)
-    np.testing.assert_array_equal(decoded[:, NOPE_DIM:], reference[:, NOPE_DIM:])
-    # e4m3 keeps 3 mantissa bits; power-of-two scales add at most one more.
-    nope = reference[:, :NOPE_DIM]
-    lane_max = np.tile(np.abs(nope).reshape(64, -1, 64).max(axis=1), NOPE_DIM // 64)
-    assert np.all(np.abs(decoded[:, :NOPE_DIM] - nope) <= lane_max / 8 + 1e-6)
 
 
 def test_companion_scatter_places_slot_by_row():
@@ -85,10 +34,10 @@ def test_companion_scatter_places_slot_by_row():
 
 def test_paged_cache_rows_fp8_cpu_write():
     pages, block = 3, 4
-    raw = torch.zeros((pages * block * 2, 128), dtype=torch.int32)
-    rope = torch.zeros((raw.shape[0] // 4, 128), dtype=torch.int32)
+    raw = torch.zeros((pages * block * 4, 128), dtype=torch.int32)
+    rope = raw
     # Second half of each 2-row page stride belongs to this layer.
-    layout = ((pages, block, 512), torch.uint8, 2 * block * 512, block * 512)
+    layout = ((pages, block, 512), torch.uint8, 2 * block * 1024, block * 1024)
     cache = PagedCacheRows(raw, layout, rope)
     latent = _latent(3, seed=2)
     slots = torch.tensor([0, -1, 9])
@@ -99,21 +48,20 @@ def test_paged_cache_rows_fp8_cpu_write():
         if slot < 0:
             continue
         row = int(cache.row_indices(torch.tensor(slot)))
-        np.testing.assert_array_equal(raw[row].numpy(), np.asarray(words[index]))
+        np.testing.assert_array_equal(raw[2 * row].numpy(), np.asarray(words[index]))
         np.testing.assert_array_equal(
-            rope.view(-1, 32)[row].numpy(), np.asarray(rope_words[index])
+            raw[2 * row + 1].numpy(), np.asarray(rope_words[index])
         )
     written = {int(cache.row_indices(torch.tensor(s))) for s in (0, 9)}
-    untouched = [r for r in range(raw.shape[0]) if r not in written]
-    assert not raw[untouched].any()
-    assert not rope.view(-1, 32)[untouched].any()
+    untouched = [r for r in range(raw.shape[0] // 2) if r not in written]
+    assert not raw.view(-1, 256)[untouched].any()
 
 
 def test_paged_cache_rows_pages_match_row_indices():
     pages, block = 3, 4
-    raw = torch.zeros((pages * block * 2, 128), dtype=torch.int32)
-    rope = torch.zeros((raw.shape[0] // 4, 128), dtype=torch.int32)
-    layout = ((pages, block, 512), torch.uint8, 2 * block * 512, block * 512)
+    raw = torch.zeros((pages * block * 4, 128), dtype=torch.int32)
+    rope = raw
+    layout = ((pages, block, 512), torch.uint8, 2 * block * 1024, block * 1024)
     cache = PagedCacheRows(raw, layout, rope)
     table = torch.tensor([[2, 0], [1, 2]])
     physical = cache.pages(table)
@@ -124,7 +72,7 @@ def test_paged_cache_rows_pages_match_row_indices():
             got = physical[request, logical // block] * block + logical % block
             assert int(got) == int(expected)
     # A layer offset that is not a whole page cannot be expressed as pages.
-    odd = ((pages, block, 512), torch.uint8, 2 * block * 512, 2 * 512)
+    odd = ((pages, block, 512), torch.uint8, 2 * block * 1024, 2 * 1024)
     assert PagedCacheRows(raw, odd, rope).pages(table) is None
 
 
@@ -282,13 +230,13 @@ def test_unpack_bytes_round_trips_host_int32_view():
     assert torch.equal(_unpack_bytes(words[:10], 37), data[:37])
 
 
-def test_reserve_rope_companion_caps_at_sparsecore_16gib_limit():
+def test_cap_native_cache_budget_caps_at_sparsecore_16gib_limit():
     from types import SimpleNamespace
 
     from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
         SPARSECORE_MAX_POOL_BANKS,
         SPARSECORE_MAX_POOL_BYTES,
-        reserve_rope_companion,
+        cap_native_cache_budget,
     )
 
     cfg = SimpleNamespace(
@@ -300,24 +248,29 @@ def test_reserve_rope_companion_caps_at_sparsecore_16gib_limit():
     # Auto budgets in the same bin must produce identical main/RoPE shapes.
     auto_budgets = [int(gib * (1 << 30)) for gib in (32.01, 32.42, 32.51, 32.99)]
     for available in auto_budgets:
-        assert reserve_rope_companion(cfg, available, auto=True) == (32 << 30) * 4 // 5
-        assert reserve_rope_companion(cfg, available) == available * 4 // 5
+        assert (
+            cap_native_cache_budget(cfg, available, auto=True)
+            == 2 * SPARSECORE_MAX_POOL_BYTES
+        )
+        assert cap_native_cache_budget(cfg, available) == min(
+            available, 2 * SPARSECORE_MAX_POOL_BYTES
+        )
     for available in (1, 1000, 1 << 30, (32 << 30) - 1, 32 << 30):
-        rounded = reserve_rope_companion(cfg, available, auto=True)
-        assert 0 <= rounded <= available * 4 // 5
-        assert rounded >= (available * 31 // 32) * 4 // 5
+        rounded = cap_native_cache_budget(cfg, available, auto=True)
+        assert 0 <= rounded <= min(available, 2 * SPARSECORE_MAX_POOL_BYTES)
+        assert rounded >= min(available * 31 // 32, 2 * SPARSECORE_MAX_POOL_BYTES)
     small_avail = 10 << 30
-    assert reserve_rope_companion(cfg, small_avail) == small_avail * 4 // 5
-    # Marginal overflow (20 GiB * 4 // 5 = 16 GiB < 1.2 * SPARSECORE_MAX_POOL_BYTES)
+    assert cap_native_cache_budget(cfg, small_avail) == small_avail
+    # Keep small overflow in one bank instead of creating a tiny second bank.
     # stays clamped to 1 bank (SPARSECORE_MAX_POOL_BYTES).
-    assert reserve_rope_companion(cfg, 20 << 30) == SPARSECORE_MAX_POOL_BYTES
+    assert cap_native_cache_budget(cfg, 19 << 30) == SPARSECORE_MAX_POOL_BYTES
     # With 2-bank SparseCore pool splitting, up to 2 * SPARSECORE_MAX_POOL_BYTES
-    # (~31.875 GiB main pool, ~39.84375 GiB with RoPE companion) is supported,
+    # (~31.875 GiB including RoPE) is supported,
     # keeping each bank below 16 GiB (1 << 34) for SparseCore.
-    mid_avail = 35 << 30
-    assert reserve_rope_companion(cfg, mid_avail) == mid_avail * 4 // 5
+    mid_avail = 30 << 30
+    assert cap_native_cache_budget(cfg, mid_avail) == mid_avail
     offload_avail = 42 << 30
-    capped = reserve_rope_companion(cfg, offload_avail)
+    capped = cap_native_cache_budget(cfg, offload_avail)
     assert capped == SPARSECORE_MAX_POOL_BANKS * SPARSECORE_MAX_POOL_BYTES
     assert capped // SPARSECORE_MAX_POOL_BANKS < (16 << 30)
 
@@ -494,14 +447,23 @@ def test_chunk_union_gather_overflow_fallback_bitwise_exact():
         )
         + 19
     )
+    flat_nope = cache_kv_nope.reshape(-1, 128)
+    flat_rope_words = cache_kv_rope.reshape(-1, 32)
+    low = flat_rope_words.astype(jnp.uint32) & 0xFFFF
+    high = flat_rope_words.astype(jnp.uint32) >> 16
+    padded_rope = jnp.pad(jnp.concatenate((low, high), -1), ((0, 0), (0, 64)))
+    cache_kv_nope = (
+        jnp.concatenate((flat_nope, padded_rope), -1)
+        .astype(jnp.int32)
+        .reshape(total_num_pages, 2 * page_size, 128)
+    )
+    cache_kv_rope = cache_kv_nope
     tokens_per_seq = q_loc[1:] - q_loc[:-1]
     seq_seg = jnp.repeat(
         jnp.arange(max_num_seqs, dtype=jnp.int32),
         tokens_per_seq,
         total_repeat_length=num_tokens,
     )
-    flat_nope = cache_kv_nope.reshape(total_num_pages * page_size, 128)
-    flat_rope_words = cache_kv_rope.reshape(total_num_pages * page_size, 32)
     page_table = pages.reshape(max_num_seqs, pages_per_seq)
 
     for c in range(2):
@@ -577,9 +539,15 @@ def test_two_bank_gather_selects_packed_rope_without_unpack(
         raise AssertionError("Two-bank selection must preserve the packed payload")
 
     monkeypatch.setattr(kernels, "unpack_union_rope_words", forbidden_unpack)
+    rope_bits = rope.view(np.uint32)
+    native_rope = np.pad(
+        np.concatenate((rope_bits & 0xFFFF, rope_bits >> 16), -1), ((0, 0), (0, 64))
+    )
+    combined = np.concatenate((nope, native_rope), -1).astype(np.int32)
+    banks = tuple(jnp.asarray(x.reshape(1, -1, 128)) for x in np.split(combined, 2))
     got_nope, got_rope = kernels._csa_gather_pool(
-        tuple(jnp.asarray(x.reshape(1, -1, 128)) for x in np.split(nope, 2)),
-        tuple(jnp.asarray(x.reshape(1, -1, 128)) for x in np.split(rope, 2)),
+        banks,
+        banks,
         jnp.asarray(indices),
         top_k=topk,
     )

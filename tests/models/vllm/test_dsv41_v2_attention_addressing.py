@@ -124,9 +124,10 @@ def test_pack_bf16_words_and_split_pieces_roundtrip(elements):
     raw = rng.standard_normal((16, elements)).astype(np.float32)
     values = jnp.asarray(raw, dtype=jnp.bfloat16)
     got_words = _pack_bf16_words(values)
-    ref_words = jax.lax.bitcast_convert_type(
-        values.reshape(values.shape[0], -1, 2), jnp.int32
-    )
+    bits = np.asarray(values).view(np.uint16).astype(np.uint32)
+    width = ((elements + 255) // 256) * 128
+    bits = np.pad(bits, ((0, 0), (0, 2 * width - elements)))
+    ref_words = (bits[:, :width] | (bits[:, width:] << 16)).view(np.int32)
     np.testing.assert_array_equal(np.asarray(got_words), np.asarray(ref_words))
 
     pieces = elements // 128
@@ -172,7 +173,7 @@ def test_paged_index_scores_matches_dense(tokens, width):
     pool = jnp.asarray(rng.integers(-(2**31), 2**31, (256, 128)), dtype=jnp.int32)
     # Keep BF16 keys finite: clear exponent-overflow patterns.
     pool = pool & jnp.int32(0x3FFF3FFF)
-    records = rng.integers(0, 256 * 2, (tokens, width)).astype(np.int32)
+    records = rng.integers(0, 256, (tokens, width)).astype(np.int32)
     records[:, width - 5 :] = -1
     lengths = rng.integers(1, width + 1, tokens).astype(np.int32)
     q = jnp.asarray(rng.standard_normal((tokens, heads, dim)), jnp.bfloat16)
@@ -203,7 +204,7 @@ def test_gather_cache_page_values_matches_records(page):
     pool = jnp.asarray(
         rng.integers(-(2**31), 2**31, (256, 128)), jnp.int32
     ) & jnp.int32(0x3FFF3FFF)
-    records = _paged_records(rng, 1, 6 * page, page, 512)[0]
+    records = _paged_records(rng, 1, 6 * page, page, 256)[0]
     records[-page:] = -1  # an invalid page reads arbitrary rows
     expected = gather_cache_values(pool, jnp.asarray(records), 128, split=True)
     got = gather_cache_page_values(pool, jnp.asarray(records[::page]), page, 128)
@@ -212,8 +213,9 @@ def test_gather_cache_page_values_matches_records(page):
     np.testing.assert_array_equal(
         np.asarray(got, np.float32)[valid], np.asarray(expected, np.float32)[valid]
     )
-    with pytest.raises(ValueError, match="whole pool word rows"):
-        gather_cache_page_values(pool, jnp.asarray(records[::page]), 3, 128)
+    assert gather_cache_page_values(
+        pool, jnp.asarray(records[::page]), 3, 128
+    ).shape == (18, 128)
 
 
 @pytest.mark.parametrize(
@@ -225,7 +227,7 @@ def test_paged_index_scores_page_gather_bitwise(tokens, width, page):
     pool = jnp.asarray(
         rng.integers(-(2**31), 2**31, (256, 128)), jnp.int32
     ) & jnp.int32(0x3FFF3FFF)
-    records = _paged_records(rng, tokens, width, page, 512)
+    records = _paged_records(rng, tokens, width, page, 256)
     records[0, -(width % page or page) :] = -1  # a trailing invalid page
     lengths = rng.integers(0, width + 1, tokens).astype(np.int32)
     q = jnp.asarray(rng.standard_normal((tokens, heads, dim)), jnp.bfloat16)
@@ -252,7 +254,7 @@ def test_paged_indexer_page_gather_matches_records(
     pool = jnp.asarray(
         rng.integers(-(2**31), 2**31, (256, 128)), jnp.int32
     ) & jnp.int32(0x3FFF3FFF)
-    records = _paged_records(rng, tokens, width, page, 512)
+    records = _paged_records(rng, tokens, width, page, 256)
     records[1, -page:] = -1
     lengths = rng.integers(topk + 1, width + 1, tokens).astype(np.int32)
     lengths[-1] = 0  # a padding row
@@ -288,7 +290,7 @@ def test_paged_index_scores_shared_rows_page_gather_bitwise(width, page):
     pool = jnp.asarray(
         rng.integers(-(2**31), 2**31, (256, 128)), jnp.int32
     ) & jnp.int32(0x3FFF3FFF)
-    records = _paged_records(rng, 3, width, page, 512)
+    records = _paged_records(rng, 3, width, page, 256)
     records[1, -(width % page or page) :] = -1
     requests = np.sort(rng.integers(0, 2, 40)).astype(np.int32)  # row 2 unused
     lengths = rng.integers(0, width + 1, 40).astype(np.int32)
@@ -311,7 +313,7 @@ def test_shared_index_scores_grouped_queries_match_dense(layout):
     pool = jnp.asarray(
         rng.integers(-(2**31), 2**31, (256, 128)), jnp.int32
     ) & jnp.int32(0x3FFF3FFF)
-    records = _paged_records(rng, rows, width, page, 512)
+    records = _paged_records(rng, rows, width, page, 256)
     records[3, -page:] = -1
     requests = np.pad(np.repeat(np.arange(rows), 6), (0, 32)).astype(np.int32)
     lengths = np.pad(rng.integers(129, width + 1, 96), (0, 32)).astype(np.int32)
@@ -364,7 +366,7 @@ def test_shared_index_scores_large_query_groups_keep_matmul(monkeypatch, rows, t
     rng = np.random.default_rng(29)
     width, page = 257, 16
     pool, _, _, lengths, q, weights = _request_inputs(rng, rows, tokens, width)
-    records = _paged_records(rng, rows, width, page, 512)
+    records = _paged_records(rng, rows, width, page, 256)
     requests = jnp.asarray(np.repeat(np.arange(rows), tokens // rows), jnp.int32)
     expected = paged_index_scores_jax(q, pool, records, weights, lengths, requests)
     got = paged_index_scores_jax(
@@ -387,7 +389,7 @@ def test_index_score_tiles_by_request_rows_are_bitwise(monkeypatch, per_token):
     pool = jnp.asarray(
         rng.integers(-(2**31), 2**31, (256, 128)), jnp.int32
     ) & jnp.int32(0x3FFF3FFF)
-    records = _paged_records(rng, rows, width, page, 512)
+    records = _paged_records(rng, rows, width, page, 256)
     records[5, -3 * page :] = -1
     requests = np.pad(np.repeat(np.arange(rows), 6), (0, 32)).astype(np.int32)
     lengths = np.pad(rng.integers(1, width + 1, 96), (0, 32)).astype(np.int32)
@@ -452,14 +454,14 @@ def test_index_page_records_requires_row_aligned_pages():
     raw = torch.zeros((64, 128), dtype=torch.int32)
 
     def cache(block, stride, offset, dtype=torch.bfloat16, dim=128):
-        record = dim * dtype.itemsize
+        record = ((dim * dtype.itemsize + 511) // 512) * 512
         layout = ((4, block, dim), dtype, stride * record, offset * record)
         return PagedCacheRows(raw, layout)
 
     assert _index_page_records(cache(16, 32, 16)) == 16
-    assert _index_page_records(cache(16, 32, 1)) == 0  # offset splits a row
-    assert _index_page_records(cache(16, 33, 0)) == 0  # stride splits a row
-    assert _index_page_records(cache(3, 4, 0)) == 0  # page ends mid-row
+    assert _index_page_records(cache(16, 32, 1)) == 16  # each key occupies a whole row
+    assert _index_page_records(cache(16, 33, 0)) == 16
+    assert _index_page_records(cache(3, 4, 0)) == 3
     assert _index_page_records(cache(8, 8, 0, torch.float32, 64)) == 0
     assert _index_page_records(raw) == 0
 
@@ -467,7 +469,7 @@ def test_index_page_records_requires_row_aligned_pages():
 def _request_inputs(rng, requests_count, tokens, width, heads=4, dim=128):
     pool = jnp.asarray(rng.integers(-(2**31), 2**31, (256, 128)), dtype=jnp.int32)
     pool = pool & jnp.int32(0x3FFF3FFF)  # finite BF16 keys
-    records = rng.integers(0, 256 * 2, (requests_count, width)).astype(np.int32)
+    records = rng.integers(0, 256, (requests_count, width)).astype(np.int32)
     records[:, width - 5 :] = -1
     requests = np.sort(rng.integers(0, requests_count, tokens)).astype(np.int32)
     lengths = rng.integers(1, width + 1, tokens).astype(np.int32)

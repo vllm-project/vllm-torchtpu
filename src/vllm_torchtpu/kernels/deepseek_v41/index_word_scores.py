@@ -1,18 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Index scores straight from gathered BF16 index-cache word rows.
-
-A native pool word row (``int32[128]``) holds ``128 // (dim // 2)`` BF16
-index keys in the split element order (`cache.split_halves`): the low halves
-of a key's words are its even elements, the high halves its odd ones. XLA
-scores such rows by splitting the words into two BF16 arrays and relaying
-them out as ``[keys, dim]`` (two HBM copies per tile). This kernel instead
-lays the keys out in VMEM, one per sublane in record order (two stride-2
-stores of the word rows), rebuilds each key with a half-lane roll and a
-select, then runs the same ``K = dim`` dot and FP32 ReLU-weighted head sum,
-so the scores are bitwise those of ``einsum("thd,tcd->thc")`` +
-``(max(., 0) * w).sum(heads)`` and come out in record order.
-"""
+"""Index scores from one padded BF16 key per native 128-word record."""
 
 import functools
 
@@ -22,8 +10,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 ROW_WORDS = 128
-DIM = 128  # BF16 elements per key: two keys per word row
-SLOTS = ROW_WORDS // (DIM // 2)
+DIM = 128
+SLOTS = 1
 MAX_BLOCK_ROWS = 4096
 
 
@@ -31,20 +19,10 @@ def _bf16(bits: jax.Array) -> jax.Array:
     return jax.lax.bitcast_convert_type(bits, jnp.float32).astype(jnp.bfloat16)
 
 
-def _kernel(q_ref, w_ref, words_ref, out_ref, keys_ref):
-    words = words_ref[0]
-    rows, half = words.shape[0], ROW_WORDS // 2
-    # Record SLOTS * r + s (slot s of row r) on sublane SLOTS * r + s, its
-    # words rolled to lanes [0, 64): scores then leave in record order, with
-    # no [slots, rows] -> [rows, slots] relayout in XLA (0.27 ms/step).
-    keys_ref[pl.ds(0, rows, stride=SLOTS), :] = words
-    keys_ref[pl.ds(1, rows, stride=SLOTS), :] = pltpu.roll(words, half, 1)
-    words = keys_ref[...]
-    lo, hi = _bf16(words << 16), _bf16(words & jnp.int32(-65536))
-    first = jax.lax.broadcasted_iota(jnp.int32, words.shape, 1) < half
-    # Lanes [0, 64) of lo (even elements), then the same lanes of hi (odd
-    # elements), i.e. q's split element order.
-    key = jnp.where(first, lo, pltpu.roll(hi, half, 1))
+def _kernel(q_ref, w_ref, words_ref, out_ref):
+    # The original 128 features occupy the low halves; the high halves are
+    # padding. No lane roll, even/odd permutation or sublane scatter is needed.
+    key = _bf16(words_ref[0] << 16)
     for t in range(q_ref.shape[0]):
         logits = jax.lax.dot_general(
             q_ref[t], key, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
@@ -59,7 +37,7 @@ def score_word_rows(
 ) -> jax.Array:
     """Scores ``[tokens, SLOTS * rows]`` of the keys in ``words``.
 
-    ``q``: BF16 ``[tokens, heads, DIM]`` in the split element order.
+    ``q``: BF16 ``[tokens, heads, DIM]`` in the original feature order.
     ``weights``: FP32 ``[tokens, heads, 1]``. ``words``: int32
     ``[groups, rows, ROW_WORDS]`` where ``tokens % groups == 0``; each group of
     ``tokens // groups`` consecutive queries shares one ``[rows, ROW_WORDS]``
@@ -84,7 +62,8 @@ def score_word_rows(
     # a serialized copy before the call: 3.55 us per 8 MB tile in the 40L
     # decode profile. Pipelined HBM reads overlap the scoring instead: 106K
     # keys at 2 rows 0.264 -> 0.254 ms.
-    words = pltpu.with_memory_space_constraint(words, pltpu.MemorySpace.HBM)
+    if not interpret:
+        words = pltpu.with_memory_space_constraint(words, pltpu.MemorySpace.HBM)
     keys = SLOTS * block
     return pl.pallas_call(
         _kernel,
@@ -97,7 +76,6 @@ def score_word_rows(
         # A unit middle axis keeps the block's last two dims TPU-legal.
         out_specs=pl.BlockSpec((group_tokens, 1, keys), lambda i, j: (i, 0, j)),
         out_shape=jax.ShapeDtypeStruct((tokens, 1, SLOTS * rows), jnp.float32),
-        scratch_shapes=[pltpu.VMEM((keys, ROW_WORDS), jnp.int32)],
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel")
         ),

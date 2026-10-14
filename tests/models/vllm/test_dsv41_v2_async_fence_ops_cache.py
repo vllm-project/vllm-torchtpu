@@ -288,7 +288,7 @@ class TestOps:
 
 
 class TestCacheSizingAndConfig:
-    def test_uses_fp8_rope_companion(self):
+    def test_uses_native_fp8_cache(self):
         # True case
         vllm_cfg = SimpleNamespace(
             model_config=SimpleNamespace(
@@ -296,22 +296,22 @@ class TestCacheSizingAndConfig:
             ),
             cache_config=SimpleNamespace(cache_dtype="fp8"),
         )
-        assert v2_cache.uses_fp8_rope_companion(vllm_cfg) is True
+        assert v2_cache.uses_native_fp8_cache(vllm_cfg) is True
 
         # False cases: architecture mismatch
         vllm_cfg.model_config.hf_config.architectures = ["LlamaForCausalLM"]
-        assert v2_cache.uses_fp8_rope_companion(vllm_cfg) is False
+        assert v2_cache.uses_native_fp8_cache(vllm_cfg) is False
 
         # False cases: architectures is None
         vllm_cfg.model_config.hf_config.architectures = None
-        assert v2_cache.uses_fp8_rope_companion(vllm_cfg) is False
+        assert v2_cache.uses_native_fp8_cache(vllm_cfg) is False
 
         # False cases: cache_dtype is bfloat16
         vllm_cfg.model_config.hf_config.architectures = ["DeepseekV41ForCausalLM"]
         vllm_cfg.cache_config.cache_dtype = "bfloat16"
-        assert v2_cache.uses_fp8_rope_companion(vllm_cfg) is False
+        assert v2_cache.uses_native_fp8_cache(vllm_cfg) is False
 
-    def test_reserve_rope_companion(self):
+    def test_cap_native_cache_budget(self):
         # Non-FP8 case
         vllm_cfg = SimpleNamespace(
             model_config=SimpleNamespace(
@@ -319,23 +319,23 @@ class TestCacheSizingAndConfig:
             ),
             cache_config=SimpleNamespace(cache_dtype="bfloat16"),
         )
-        assert v2_cache.reserve_rope_companion(vllm_cfg, 1000) == 1000
+        assert v2_cache.cap_native_cache_budget(vllm_cfg, 1000) == 1000
 
         # FP8 case below cap
         vllm_cfg.cache_config.cache_dtype = "fp8_e4m3"
-        assert v2_cache.reserve_rope_companion(vllm_cfg, 1000) == 800
+        assert v2_cache.cap_native_cache_budget(vllm_cfg, 1000) == 1000
 
         # FP8 marginal overflow (e.g. 20 GiB -> 16 GiB main pool < 1.2x bank cap)
         # stays clamped to 1 bank (SPARSECORE_MAX_POOL_BYTES).
         assert (
-            v2_cache.reserve_rope_companion(vllm_cfg, 20 << 30)
+            v2_cache.cap_native_cache_budget(vllm_cfg, 19 << 30)
             == v2_cache.SPARSECORE_MAX_POOL_BYTES
         )
 
         # FP8 case above 2-bank cap
         huge_bytes = 100 << 30
         assert (
-            v2_cache.reserve_rope_companion(vllm_cfg, huge_bytes)
+            v2_cache.cap_native_cache_budget(vllm_cfg, huge_bytes)
             == v2_cache.SPARSECORE_MAX_POOL_BANKS * v2_cache.SPARSECORE_MAX_POOL_BYTES
         )
 
@@ -371,6 +371,11 @@ class TestCacheSizingAndConfig:
         cfg = SimpleNamespace(
             kv_cache_tensors=[SimpleNamespace(size=16 * 512)],
             num_blocks=16,
+            kv_cache_groups=[
+                SimpleNamespace(
+                    layer_names=["layer0"], kv_cache_spec=SimpleNamespace(head_size=8)
+                )
+            ],
         )
         layout = SimpleNamespace(is_layer_compact=False)
 
@@ -382,7 +387,7 @@ class TestCacheSizingAndConfig:
         assert res.raw_tensors[0].shape == (16 * 512,)
 
         # Case 3: layer_compact = True, word_rows = True, with FP8 views
-        fp8_view = torch.zeros(16, 1, 4, 128, dtype=torch.uint8)
+        fp8_view = torch.zeros(16, 1, 4, 1024, dtype=torch.uint8)
         fp8_views = {"fp8_layer": fp8_view}
         monkeypatch.setattr(
             v2_cache, "allocate_upstream_kv_cache", lambda *a: fp8_views
@@ -395,10 +400,13 @@ class TestCacheSizingAndConfig:
         )
 
         cfg_fp8 = SimpleNamespace(
-            kv_cache_tensors=[SimpleNamespace(size=16 * 512)],
+            kv_cache_tensors=[SimpleNamespace(size=16 * 4096)],
             num_blocks=16,
             kv_cache_groups=[
-                SimpleNamespace(kv_cache_spec=SimpleNamespace(page_size_bytes=512))
+                SimpleNamespace(
+                    layer_names=["fp8_layer"],
+                    kv_cache_spec=SimpleNamespace(page_size_bytes=4096, head_size=512),
+                )
             ],
         )
         layout_fp8 = SimpleNamespace(is_layer_compact=True)
@@ -407,23 +415,24 @@ class TestCacheSizingAndConfig:
             cfg_fp8, torch.device("cpu"), layout_fp8, word_rows=True
         )
         assert "fp8_layer" in res_fp8.rope_pools
-        # Companion raw_tensor appended
-        assert len(res_fp8.raw_tensors) == 2
+        # RoPE shares the main owner.
+        assert len(res_fp8.raw_tensors) == 1
+        assert res_fp8.rope_pools["fp8_layer"] is res_fp8.native_raw_cache["fp8_layer"]
 
         # Case 4: split_banks = True when pool_bytes > SPARSECORE_MAX_POOL_BYTES
         # Bank 0 fills to SPARSECORE_MAX_POOL_BYTES (12 blocks), Bank 1 gets 4 blocks.
-        monkeypatch.setattr(v2_cache, "SPARSECORE_MAX_POOL_BYTES", 12 * 512)
+        monkeypatch.setattr(v2_cache, "SPARSECORE_MAX_POOL_BYTES", 12 * 4096)
         res_split = v2_cache.materialize_upstream_kv_cache(
             cfg_fp8, torch.device("cpu"), layout_fp8, word_rows=True
         )
         assert isinstance(res_split.native_raw_cache["fp8_layer"], tuple)
         assert len(res_split.native_raw_cache["fp8_layer"]) == 2
-        assert res_split.native_raw_cache["fp8_layer"][0].shape == (12, ROW_WORDS)
-        assert res_split.native_raw_cache["fp8_layer"][1].shape == (4, ROW_WORDS)
+        assert res_split.native_raw_cache["fp8_layer"][0].shape == (96, ROW_WORDS)
+        assert res_split.native_raw_cache["fp8_layer"][1].shape == (32, ROW_WORDS)
         assert isinstance(res_split.rope_pools["fp8_layer"], tuple)
         assert len(res_split.rope_pools["fp8_layer"]) == 2
-        assert len(res_split.raw_tensors) == 4
-        assert res_split.kv_caches["fp8_layer"].shape == (16, 1, 4, 128)
+        assert len(res_split.raw_tensors) == 2
+        assert res_split.kv_caches["fp8_layer"].shape == (16, 1, 4, 1024)
 
 
 # ==============================================================================
@@ -460,14 +469,14 @@ class TestPagedCacheRows:
 
         # 4. FP8 uint8 without companion or wrong shape
         with pytest.raises(
-            ValueError, match="FP8 records are one pool row plus a RoPE companion"
+            ValueError, match="FP8 records contain NoPE and RoPE in the same pool"
         ):
             v2_cache.PagedCacheRows(
                 valid_raw, ((16, 1, 512), torch.uint8, 512, 0), rope=None
             )
 
         with pytest.raises(
-            ValueError, match="FP8 records are one pool row plus a RoPE companion"
+            ValueError, match="FP8 records contain NoPE and RoPE in the same pool"
         ):
             v2_cache.PagedCacheRows(
                 valid_raw,
@@ -476,9 +485,7 @@ class TestPagedCacheRows:
             )
 
         # 5. Record bytes must divide or be multiple of 512
-        with pytest.raises(
-            ValueError, match="Cache records must divide or be a multiple of 512 bytes"
-        ):
+        with pytest.raises(ValueError, match="Cache pages must be record-aligned"):
             v2_cache.PagedCacheRows(valid_raw, ((16, 1, 100), torch.bfloat16, 200, 0))
 
         # 6. Record alignment for pages
@@ -513,7 +520,7 @@ class TestPagedCacheRows:
                 rope=(torch.zeros((4, ROW_WORDS), dtype=torch.int32),),
             )
         with pytest.raises(
-            ValueError, match="FP8 records are one pool row plus a RoPE companion"
+            ValueError, match="FP8 records contain NoPE and RoPE in the same pool"
         ):
             v2_cache.PagedCacheRows(
                 (valid_raw, valid_raw),
@@ -527,12 +534,12 @@ class TestPagedCacheRows:
     def test_numel_row_indices_pages(self):
         raw = torch.zeros((64, ROW_WORDS), dtype=torch.int32)
         # 16 pages, 4 records per page, 128 words per record
-        layout = ((16, 4, 128), torch.bfloat16, 1024, 512)
+        layout = ((16, 4, 128), torch.bfloat16, 2048, 1024)
         paged = v2_cache.PagedCacheRows(raw, layout)
 
         assert paged.numel() == 16 * 4 * 128
         slots = torch.tensor([0, 1, 4, 7])
-        # row_offset = 512 // 256 = 2, page_stride = 1024 // 256 = 4
+        # row_offset = 1024 // 512 = 2, page_stride = 2048 // 512 = 4
         # slots // 4 * 4 + slots % 4 + 2 -> slot + 2
         assert torch.equal(paged.row_indices(slots), slots + 2)
 
@@ -541,7 +548,7 @@ class TestPagedCacheRows:
         assert paged.pages(torch.tensor([0, 1])) is None
 
         # Fully aligned layout
-        layout_aligned = ((16, 4, 128), torch.bfloat16, 1024, 0)
+        layout_aligned = ((16, 4, 128), torch.bfloat16, 2048, 0)
         paged_aligned = v2_cache.PagedCacheRows(raw, layout_aligned)
         assert torch.equal(
             paged_aligned.pages(torch.tensor([1, 2])), torch.tensor([1, 2])
@@ -668,9 +675,9 @@ class TestPagedCacheRows:
         paged_2b.raw_hi.copy_.assert_called_once()
 
     def test_write_fp8_cpu_and_custom_op(self, monkeypatch: pytest.MonkeyPatch):
-        raw = torch.zeros((16, ROW_WORDS), dtype=torch.int32)
-        rope = torch.zeros((4, ROW_WORDS), dtype=torch.int32)
-        layout = ((16, 1, 512), torch.uint8, 512, 0)
+        raw = torch.zeros((32, ROW_WORDS), dtype=torch.int32)
+        rope = raw
+        layout = ((16, 1, 512), torch.uint8, 1024, 0)
         paged = v2_cache.PagedCacheRows(raw, layout, rope=rope)
 
         # 1. CPU FP8 write
@@ -691,7 +698,7 @@ class TestPagedCacheRows:
         mock_encode = MagicMock(
             return_value=(
                 torch.zeros(2, ROW_WORDS, dtype=torch.int32),
-                torch.zeros(2, v2_cache.ROPE_WORDS, dtype=torch.int32),
+                torch.zeros(2, ROW_WORDS, dtype=torch.int32),
             )
         )
         mock_write_val = MagicMock(side_effect=[torch.zeros(1), torch.zeros(1)])
@@ -700,15 +707,15 @@ class TestPagedCacheRows:
 
         paged.write(slots, latents)
         mock_encode.assert_called_once()
-        assert mock_write_val.call_count == 2
+        assert mock_write_val.call_count == 1
         paged.raw.copy_.assert_called_once()
-        paged.rope.copy_.assert_called_once()
+        paged.rope.copy_.assert_not_called()
 
         # 3. 2-bank CPU FP8 write and Non-CPU FP8 write
-        raw_lo = torch.zeros((8, ROW_WORDS), dtype=torch.int32)
-        raw_hi = torch.zeros((8, ROW_WORDS), dtype=torch.int32)
-        rope_lo = torch.zeros((2, ROW_WORDS), dtype=torch.int32)
-        rope_hi = torch.zeros((2, ROW_WORDS), dtype=torch.int32)
+        raw_lo = torch.zeros((16, ROW_WORDS), dtype=torch.int32)
+        raw_hi = torch.zeros((16, ROW_WORDS), dtype=torch.int32)
+        rope_lo = raw_lo
+        rope_hi = raw_hi
         paged_2b = v2_cache.PagedCacheRows(
             (raw_lo, raw_hi), layout, rope=(rope_lo, rope_hi)
         )
@@ -737,11 +744,11 @@ class TestPagedCacheRows:
         monkeypatch.setattr(v2_cache, "_write_values_op", mock_write_val_2b)
         paged_2b.write(slots_2b, latents)
         mock_encode.assert_called_once()
-        assert mock_write_val_2b.call_count == 4
+        assert mock_write_val_2b.call_count == 2
         paged_2b.raw.copy_.assert_called_once()
         paged_2b.raw_hi.copy_.assert_called_once()
-        paged_2b.rope.copy_.assert_called_once()
-        paged_2b.rope_hi.copy_.assert_called_once()
+        paged_2b.rope.copy_.assert_not_called()
+        paged_2b.rope_hi.copy_.assert_not_called()
 
 
 # ==============================================================================
@@ -779,7 +786,8 @@ class TestNativeCacheView:
         new_tensor = torch.zeros(8, 4, 128)
         adapter.kv_cache = new_tensor
         monkeypatch.setattr(torch.compiler, "is_compiling", lambda: False)
-        assert adapter.kv_cache is new_tensor
+        assert adapter._bound_cache is new_tensor
+        assert isinstance(adapter.kv_cache, v2_cache.PagedCacheRows)
 
         # 4. Error when raw_cache is on TPU without explicit layout
         tpu_raw = SimpleNamespace(device=SimpleNamespace(type="tpu"))
@@ -896,7 +904,7 @@ class TestCacheJaxHelpers:
         # Error on unaligned record_words
         with pytest.raises(ValueError, match="Pages must cover whole pool word rows"):
             v2_cache.gather_cache_page_values(
-                cache, jnp.array([0]), page_records=3, elements=100
+                cache, jnp.array([0]), page_records=3, elements=512
             )
 
         # Valid call
@@ -924,7 +932,7 @@ class TestCacheJaxHelpers:
         words, rope = v2_cache.encode_fp8_kv(latent)
         assert words.shape == (4, ROW_WORDS)
         assert words.dtype == jnp.int32
-        assert rope.shape == (4, v2_cache.ROPE_WORDS)
+        assert rope.shape == (4, ROW_WORDS)
         assert rope.dtype == jnp.int32
 
 
@@ -1022,7 +1030,7 @@ class TestCacheMutationOps:
             lat_fake = torch.empty(4, 512, dtype=torch.bfloat16)
             w_fake, rp_fake = v2_cache._encode_fp8_op(lat_fake)
             assert w_fake.shape == (4, ROW_WORDS)
-            assert rp_fake.shape == (4, v2_cache.ROPE_WORDS)
+            assert rp_fake.shape == (4, ROW_WORDS)
 
     def test_write_cache_dispatch(self, monkeypatch: pytest.MonkeyPatch):
         # 1. PagedCacheRows branch
@@ -1108,61 +1116,11 @@ class TestCacheMutationOps:
         out_full = v2_cache.scatter_cache_values(cache, records, full_vals)
         assert out_full.shape == cache.shape
 
-        # Mock pl.pallas_call before entering TPU backend branches
-        from jax.experimental import pallas as pl
-        from jax.experimental.pallas import tpu as pltpu
+        from vllm_torchtpu.kernels.mla import word_cache
 
-        pallas_called = False
-
-        def mock_pallas(kernel, *args, **kwargs):
-            nonlocal pallas_called
-            pallas_called = True
-
-            def invoke(rec, w_flat, c):
-                rec_ref = [0, 1, -1] + [0] * 64
-                val_ref = MagicMock()
-                out_ref = MagicMock()
-                sem = MagicMock()
-                orig_pid = getattr(pl, "program_id", None)
-                orig_ds = getattr(pl, "ds", None)
-                orig_copy = getattr(pltpu, "make_async_copy", None)
-                orig_when = getattr(pl, "when", None)
-                orig_fori = getattr(jax.lax, "fori_loop", None)
-                try:
-                    pl.program_id = lambda _: 0
-                    pl.ds = lambda s, sz: slice(s, s + sz)
-                    copy_mock = SimpleNamespace(start=MagicMock(), wait=MagicMock())
-                    pltpu.make_async_copy = lambda s, d, sm: copy_mock
-                    pl.when = lambda c: lambda fn: fn()
-                    jax.lax.fori_loop = lambda lower, upper, body, init: [
-                        body(i, init) for i in range(lower, min(upper, 2))
-                    ]
-                    kernel(rec_ref, val_ref, None, out_ref, sem)
-                finally:
-                    if orig_pid:
-                        pl.program_id = orig_pid
-                    if orig_ds:
-                        pl.ds = orig_ds
-                    if orig_copy:
-                        pltpu.make_async_copy = orig_copy
-                    if orig_when:
-                        pl.when = orig_when
-                    if orig_fori:
-                        jax.lax.fori_loop = orig_fori
-                return c
-
-            return invoke
-
-        monkeypatch.setattr(pl, "pallas_call", mock_pallas)
-
-        # 4. TPU backend with width < ROW_WORDS (merge_sub_rows branch)
+        write = MagicMock(return_value=cache)
+        monkeypatch.setattr(word_cache, "scatter_word_records", write)
         monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
-        out_tpu_sub = v2_cache.scatter_cache_values(cache, records, int32_vals)
-        assert out_tpu_sub.shape == cache.shape
-        assert pallas_called is True
-
-        # 5. TPU backend with width >= ROW_WORDS (Pallas DMA branch)
-        pallas_called = False
-        out_tpu_pallas = v2_cache.scatter_cache_values(cache, records, full_vals)
-        assert pallas_called is True
-        assert out_tpu_pallas.shape == cache.shape
+        for values in (int32_vals, full_vals):
+            v2_cache.scatter_cache_values(cache, records, values)
+        assert write.call_count == 2

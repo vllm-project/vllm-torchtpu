@@ -39,6 +39,7 @@ def main_kernel(
     num_row_subchunks: int,
     num_streams: int,
     top_k: int,
+    combined: bool,
 ):
     tpu_info = pltpu.get_tpu_info()
     sc_info = tpu_info.sparse_core
@@ -70,6 +71,10 @@ def main_kernel(
             even = gather_ref[pl.ds(2 * t, 1), :]
             odd = gather_ref[pl.ds(2 * t + 1, 1), :]
             row = pl.ds(out_row_base + t, 1)
+            if combined:
+                # Native BF16 [2, 128]: all 64 RoPE values are in low halves.
+                out_ref[row, :] = (even[:, :64] & 0xFFFF) | (odd[:, :64] << 16)
+                continue
             out_ref[row, pl.ds(0, rope_in_cols)] = jnp.bitwise_or(
                 jnp.bitwise_and(even, 0xFFFF), jnp.left_shift(odd, 16)
             )
@@ -141,7 +146,7 @@ def main_kernel(
         nope_in_specs = tuple(
             pl.BlockSpec(
                 (pl.Indirect(row_subchunk_size), nope_in_cols),
-                lambda r, s=s: (idx_window(r, s), 0),
+                lambda r, s=s: (idx_window(r, s) * (2 if combined else 1), 0),
             )
             for s in range(num_streams)
         )
@@ -149,7 +154,10 @@ def main_kernel(
         rope_in_specs = tuple(
             pl.BlockSpec(
                 (pl.Indirect(row_subchunk_size), rope_in_cols),
-                lambda r, s=s: (idx_window(r, s), 0),
+                lambda r, s=s: (
+                    idx_window(r, s) * (2 if combined else 1) + int(combined),
+                    0,
+                ),
             )
             for s in range(num_streams)
         )
@@ -198,7 +206,7 @@ def main_kernel(
     )(indices_hbm_ref, valid_indices_ref)
 
 
-@functools.partial(jax.jit, static_argnames=("top_k",))
+@functools.partial(jax.jit, static_argnames=("top_k", "combined"))
 def csa_gather(
     nope_cache: jax.Array,
     rope_cache: jax.Array,
@@ -206,6 +214,7 @@ def csa_gather(
     num_valid_indices: jax.Array | None = None,
     *,
     top_k: int = 1024,
+    combined: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """Fused SparseCore gather of the nope and rope caches.
 
@@ -222,6 +231,8 @@ def csa_gather(
       top_k: the consumer's row block (the attention kernel's top-k), a
         multiple of 128. `rope_out` pairs entry i of a period with entry
         i + top_k // 2.
+      combined: NoPE and padded BF16 RoPE are consecutive 128-word rows
+        in one pool; both cache arguments alias that pool.
 
     Returns:
       Both outputs are int32 with 128 lanes, which XLA lays out byte-for-byte
@@ -247,7 +258,9 @@ def csa_gather(
     # (`use_tc_tiling_on_sc=False`), so token t's rope is words
     # [32 t, 32 t + 32).
     nope_cache = nope_cache.reshape(-1, csa_cache_layout.ROW_WORDS)
-    rope_cache = rope_cache.reshape(-1, csa_cache_layout.ROPE_WORDS)
+    rope_cache = rope_cache.reshape(
+        -1, csa_cache_layout.ROW_WORDS if combined else csa_cache_layout.ROPE_WORDS
+    )
     sc_info = pltpu.get_tpu_info().sparse_core
     assert sc_info is not None, "SparseCore info is missing."
     out_size = indices.size
@@ -281,7 +294,7 @@ def csa_gather(
     out_pad_size = ((out_size + block_size - 1) // block_size) * block_size - out_size
     if out_pad_size:
         # spread the padding to avoid hotspots
-        num_tokens = nope_cache.shape[0]
+        num_tokens = nope_cache.shape[0] // (2 if combined else 1)
         pad = (jnp.arange(out_pad_size, dtype=indices.dtype) * 104729) % num_tokens
         indices = jnp.concatenate([indices, pad])
     vector_mesh = plsc.VectorSubcoreMesh(
@@ -298,6 +311,7 @@ def csa_gather(
             num_row_subchunks=num_row_subchunks,
             num_streams=num_streams,
             top_k=top_k,
+            combined=combined,
         ),
         out_type=(
             jax.ShapeDtypeStruct(

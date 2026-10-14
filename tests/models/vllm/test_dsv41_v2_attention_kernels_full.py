@@ -428,8 +428,8 @@ class TestCompactionAndGatherHelpers:
 
 class TestGatherSparseKVAndUnionGather:
     def test_gather_sparse_kv_chunk_union_and_direct_branches(self):
-        cache_nope = jnp.ones((4, 16, 64), dtype=jnp.uint8)
-        cache_rope = jnp.ones((4, 4, 128), dtype=jnp.int32)
+        cache_nope = jnp.ones((4, 32, 128), dtype=jnp.int32)
+        cache_rope = cache_nope
         union_phys = jnp.zeros((32,), dtype=jnp.int32)
         inv_idx = jnp.zeros((8, 16), dtype=jnp.int32)
         chunk_rec = jnp.zeros((8, 16), dtype=jnp.int32)
@@ -451,12 +451,12 @@ class TestGatherSparseKVAndUnionGather:
             batch_end=jnp.array(8, dtype=jnp.int32),
             topk=16,
         )
-        assert g_nope_u.shape == (8, 16, 64)
+        assert g_nope_u.shape == (8, 16, 128)
 
-        def _mock_csa(c_nope, c_rope, indices, num_valid_indices, top_k):
+        def _mock_csa(c_nope, c_rope, indices, num_valid_indices, top_k, combined):
             n = indices.shape[0]
             return (
-                jnp.ones((n, 64), dtype=jnp.uint8),
+                jnp.ones((n, 128), dtype=jnp.int32),
                 jnp.ones((n // 4, 128), dtype=jnp.int32),
             )
 
@@ -503,7 +503,7 @@ class TestGatherSparseKVAndUnionGather:
             batch_end=jnp.array(8, dtype=jnp.int32),
             topk=16,
         )
-        assert g_nope_d.shape == (8, 16, 64)
+        assert g_nope_d.shape == (8, 16, 128)
 
         # 4. Direct branch on TPU mock
         with (
@@ -535,8 +535,8 @@ class TestGatherSparseKVAndUnionGather:
 
     def test_sparse_ragged_paged_attention_union_gather(self):
         q = jnp.ones((128, 4, 64), dtype=jnp.bfloat16)
-        cache_nope = jnp.ones((4, 16, 64), dtype=jnp.uint8)
-        cache_rope = jnp.ones((4, 4, 128), dtype=jnp.int32)
+        cache_nope = jnp.ones((4, 32, 128), dtype=jnp.int32)
+        cache_rope = cache_nope
         topk_indices = jnp.full((128, 16), 0, dtype=jnp.int32)
         page_indices = jnp.zeros((4,), dtype=jnp.int32)
         cu_q_lens = jnp.array([0, 128], dtype=jnp.int32)
@@ -606,7 +606,7 @@ class TestGatherSparseKVAndUnionGather:
         q = jnp.ones((128, 4, 64), dtype=jnp.bfloat16)
         swa_pool = jnp.zeros((256, 128), dtype=jnp.int32)
         main_pool = jnp.ones((256, 128), dtype=jnp.int32)
-        rope_pool = jnp.ones((64, 128), dtype=jnp.int32)
+        rope_pool = main_pool
         swa_records = jnp.zeros((128, 64), dtype=jnp.int32)
         main_records = jnp.zeros((128, 128), dtype=jnp.int32)
         pages = jnp.zeros((1, 1), dtype=jnp.int32)
@@ -615,7 +615,7 @@ class TestGatherSparseKVAndUnionGather:
 
         # 1. Non-union gather, precompacted=False
         with mock.patch(
-            "vllm_torchtpu.kernels.deepseek_v4.core_attention.sparse_mla.sparse_ragged_paged_attention",
+            "vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels.sparse_ragged_paged_attention_union_gather",
             return_value=q,
         ) as mock_std_attn:
             res1 = sparse_fp8_attention_jax(
@@ -664,7 +664,7 @@ class TestGatherSparseKVAndUnionGather:
                 q,
                 (swa_pool[:128], swa_pool[128:]),
                 (main_pool[:128], main_pool[128:]),
-                (rope_pool[:32], rope_pool[32:]),
+                (rope_pool[:128], rope_pool[128:]),
                 swa_records,
                 main_records,
                 pages,
@@ -2173,9 +2173,15 @@ def test_fp8_gather_payload_matches_paged_rows(banks, shards, rank, precompacted
     rope_words = jnp.asarray(
         rng.integers(-(2**30), 2**30, size=(32, 32), dtype=np.int32)
     )
-    rope = rope_words.reshape(-1, 128)
-    lo, hi = (pool, None) if banks == 1 else tuple(jnp.split(pool, 2))
-    rlo, rhi = (rope, None) if banks == 1 else tuple(jnp.split(rope, 2))
+    padded_rope = jnp.pad(
+        jnp.concatenate(
+            (rope_words & 0xFFFF, jax.lax.shift_right_logical(rope_words, 16)), -1
+        ),
+        ((0, 0), (0, 64)),
+    )
+    combined = jnp.concatenate((pool, padded_rope), -1).reshape(-1, 128)
+    lo, hi = (combined, None) if banks == 1 else tuple(jnp.split(combined, 2))
+    rlo, rhi = lo, hi
     pages = jnp.array([[3, 0], [1, 2]], jnp.int32)
     starts = jnp.array([0, 5, 11], jnp.int32)
     records = jnp.tile(jnp.array([9, -1, 2, 5, 0], jnp.int32), (12, 1))
@@ -2318,8 +2324,8 @@ def test_fp8_consumers_skip_global_gather(monkeypatch, tokens):
     from jax.experimental import pallas as pl
 
     ak = attention_kernels
-    pool = jnp.zeros((16, 128), jnp.int32)
-    rope = jnp.zeros((4, 128), jnp.int32)
+    pool = jnp.zeros((32, 128), jnp.int32)
+    rope = pool
     records = jnp.tile(jnp.array([0, 7, -1], jnp.int32), (tokens, 1))
     pages, starts = jnp.array([[0]], jnp.int32), jnp.array([0, tokens], jnp.int32)
     nope, rope_values = ak.gather_fp8_kv_jax(
@@ -2365,6 +2371,9 @@ def test_fp8_consumers_skip_global_gather(monkeypatch, tokens):
         np.testing.assert_array_equal(
             jnp.concatenate([x[1] for x in actual]), rope_values
         )
+
+
+@pytest.mark.parametrize("banks", [1, 2])
 def test_paged_indexer_decode_rows_skip_query_tiles(monkeypatch, banks):
     """Decode-shaped batches (few rows per request) score in one query tile.
 

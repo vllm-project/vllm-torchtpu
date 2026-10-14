@@ -27,8 +27,8 @@ from vllm_torchtpu.models.vllm.deepseek_v41.common.engram import (
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
     SPARSECORE_MAX_POOL_BANKS,
     SPARSECORE_MAX_POOL_BYTES,
-    reserve_rope_companion,
-    uses_fp8_rope_companion,
+    cap_native_cache_budget,
+    uses_native_fp8_cache,
 )
 
 
@@ -583,8 +583,8 @@ def test_engram_sp_embed_and_forward(
 # ==============================================================================
 
 
-def test_uses_fp8_rope_companion_architectures():
-    """Verify uses_fp8_rope_companion covers all architecture and dtype branches."""
+def test_uses_native_fp8_cache_architectures():
+    """Verify uses_native_fp8_cache covers all architecture and dtype branches."""
     # Architecture matches with fp8 cache
     cfg_match = SimpleNamespace(
         model_config=SimpleNamespace(
@@ -592,7 +592,7 @@ def test_uses_fp8_rope_companion_architectures():
         ),
         cache_config=SimpleNamespace(cache_dtype="fp8"),
     )
-    assert uses_fp8_rope_companion(cfg_match) is True
+    assert uses_native_fp8_cache(cfg_match) is True
 
     # Architecture matches but cache_dtype is not fp8
     cfg_non_fp8 = SimpleNamespace(
@@ -601,7 +601,7 @@ def test_uses_fp8_rope_companion_architectures():
         ),
         cache_config=SimpleNamespace(cache_dtype="bfloat16"),
     )
-    assert uses_fp8_rope_companion(cfg_non_fp8) is False
+    assert uses_native_fp8_cache(cfg_non_fp8) is False
 
     # Architecture does not match
     cfg_diff = SimpleNamespace(
@@ -610,32 +610,32 @@ def test_uses_fp8_rope_companion_architectures():
         ),
         cache_config=SimpleNamespace(cache_dtype="fp8"),
     )
-    assert uses_fp8_rope_companion(cfg_diff) is False
+    assert uses_native_fp8_cache(cfg_diff) is False
 
     # Architectures is empty
     cfg_empty = SimpleNamespace(
         model_config=SimpleNamespace(hf_config=SimpleNamespace(architectures=[])),
         cache_config=SimpleNamespace(cache_dtype="fp8"),
     )
-    assert uses_fp8_rope_companion(cfg_empty) is False
+    assert uses_native_fp8_cache(cfg_empty) is False
 
     # Architectures is None (exercises `or []` branch)
     cfg_none = SimpleNamespace(
         model_config=SimpleNamespace(hf_config=SimpleNamespace(architectures=None)),
         cache_config=SimpleNamespace(cache_dtype="fp8"),
     )
-    assert uses_fp8_rope_companion(cfg_none) is False
+    assert uses_native_fp8_cache(cfg_none) is False
 
 
-def test_reserve_rope_companion_capping():
-    """Verify reserve_rope_companion non-V41 bypass and 16 GiB cap."""
+def test_cap_native_cache_budget_capping():
+    """Verify cap_native_cache_budget non-V41 bypass and 16 GiB cap."""
     cfg_non_v41 = SimpleNamespace(
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
         ),
         cache_config=SimpleNamespace(cache_dtype="fp8"),
     )
-    assert reserve_rope_companion(cfg_non_v41, 20 << 30) == 20 << 30
+    assert cap_native_cache_budget(cfg_non_v41, 20 << 30) == 20 << 30
 
     cfg_v41 = SimpleNamespace(
         model_config=SimpleNamespace(
@@ -643,22 +643,22 @@ def test_reserve_rope_companion_capping():
         ),
         cache_config=SimpleNamespace(cache_dtype="fp8"),
     )
-    # Under limit: 10 GiB * 4 // 5 = 8 GiB < SPARSECORE_MAX_POOL_BYTES
+    # Under the single-bank limit.
     avail_small = 10 << 30
-    assert reserve_rope_companion(cfg_v41, avail_small) == avail_small * 4 // 5
+    assert cap_native_cache_budget(cfg_v41, avail_small) == avail_small
 
-    # Marginal overflow (20 GiB * 4 // 5 = 16 GiB < 1.2 * SPARSECORE_MAX_POOL_BYTES)
+    # Keep small overflow in one bank instead of creating a tiny second bank.
     # stays clamped to 1 bank so OFFLOAD=0 does not split into 2 banks.
-    avail_offload0 = 20 << 30
-    assert reserve_rope_companion(cfg_v41, avail_offload0) == SPARSECORE_MAX_POOL_BYTES
+    avail_offload0 = 19 << 30
+    assert cap_native_cache_budget(cfg_v41, avail_offload0) == SPARSECORE_MAX_POOL_BYTES
 
-    # 2-bank range: 30 GiB * 4 // 5 = 24 GiB <= 2 * SPARSECORE_MAX_POOL_BYTES
+    # Fits in two banks.
     avail_mid = 30 << 30
-    assert reserve_rope_companion(cfg_v41, avail_mid) == avail_mid * 4 // 5
+    assert cap_native_cache_budget(cfg_v41, avail_mid) == avail_mid
 
-    # Over 2-bank limit: 50 GiB * 4 // 5 = 40 GiB > 2 * SPARSECORE_MAX_POOL_BYTES
+    # Above the total two-bank limit.
     avail_large = 50 << 30
-    capped = reserve_rope_companion(cfg_v41, avail_large)
+    capped = cap_native_cache_budget(cfg_v41, avail_large)
     assert capped == SPARSECORE_MAX_POOL_BANKS * SPARSECORE_MAX_POOL_BYTES
     assert capped == 2 * ((16 << 30) - (64 << 20))
 

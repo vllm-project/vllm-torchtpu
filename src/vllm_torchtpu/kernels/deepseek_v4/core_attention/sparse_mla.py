@@ -184,6 +184,7 @@ def _attention_kernel(
     *,
     sm_scale: float,
     batch_size: int = 1,
+    nope_row_scale: bool = False,
 ):
     assert q_hbm_ref.shape == o_hbm_ref.shape
 
@@ -404,7 +405,12 @@ def _attention_kernel(
         bkv_nope = bkv_nope_x2_ref.at[bkv_sem_idx, batch_idx][...]
         # The gather nope is (4, 128) u8, reshape it to (1, 512) u8.
         bkv_nope = bkv_nope.reshape(bkv_sz, -1)
-        bkv_nope = _dequant_dsv4_fp8(bkv_nope)
+        if nope_row_scale:
+            from vllm_torchtpu.kernels.deepseek_v41.fp8_cache import dequant_fp8_nope
+
+            bkv_nope = dequant_fp8_nope(bkv_nope)
+        else:
+            bkv_nope = _dequant_dsv4_fp8(bkv_nope)
 
         # The gathered rope block is [bkv_sz // 2, 2 * rope_dim]: entry i in
         # lanes 0:rope_dim, entry i + bkv_sz // 2 in the upper half (see

@@ -20,6 +20,7 @@ from vllm.models.deepseek_v41 import compressor as compressor_upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.mla.cache_layout import packed_record_shape
 from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
 
 from .attention_kernels import (
@@ -170,6 +171,9 @@ class CompressorStateCache(NativeCacheView, compressor_upstream.CompressorStateC
 
     def get_attn_backend(self):
         return AttentionBackend
+
+    def get_kv_cache_spec(self, vllm_config):
+        return _native_cache_spec(super().get_kv_cache_spec(vllm_config))
 
 
 def save_compress_norm(
@@ -353,6 +357,9 @@ class SWACache(NativeCacheView, DeepseekV4SWACache):
         kwargs["backend_cls"] = AttentionBackend
         super().__init__(*args, **kwargs)
 
+    def get_kv_cache_spec(self, vllm_config):
+        return _native_cache_spec(super().get_kv_cache_spec(vllm_config))
+
 
 class IndexerCache(NativeCacheView, upstream.DeepseekV4IndexerCache):
     def __init__(self, *args, **kwargs):
@@ -367,6 +374,17 @@ class IndexerCache(NativeCacheView, upstream.DeepseekV4IndexerCache):
 
     def get_attn_backend(self):
         return AttentionBackend
+
+    def get_kv_cache_spec(self, vllm_config):
+        return _native_cache_spec(super().get_kv_cache_spec(vllm_config))
+
+
+def _native_cache_spec(spec):
+    """Budget tail padding in the scheduler, preserving semantic head size."""
+    _, width = packed_record_shape(spec.head_size, spec.dtype.itemsize)
+    return dataclasses.replace(
+        spec, state_content_bytes=4 * width, page_size_padded=None
+    )
 
 
 def _value(output):
@@ -512,7 +530,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                 "TPU V4.1 supports --kv-cache-dtype auto, bfloat16 or fp8"
             )
         # FP8 main KV uses DSV4's packed record (448 e4m3 + 64 e8m0 bytes)
-        # plus a BF16 RoPE companion; see cache.encode_fp8_kv.
+        # followed by padded BF16 RoPE in the same owned record.
         self._fp8_kv = self.kv_cache_torch_dtype == torch.float8_e4m3fn
         self.register_buffer(
             "_tpu_rope_cache", self.rotary_emb.cos_sin_cache, persistent=False
@@ -554,9 +572,14 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
 
     def get_kv_cache_spec(self, vllm_config):
         spec = super().get_kv_cache_spec(vllm_config)
-        if spec is None or not self._fp8_kv:
+        if spec is None:
             return spec
-        return dataclasses.replace(spec, dtype=torch.uint8, page_size_padded=None)
+        if not self._fp8_kv:
+            return _native_cache_spec(spec)
+        # 512 B NoPE/scales + 512 B padded BF16 RoPE, in one owned record.
+        return dataclasses.replace(
+            spec, dtype=torch.uint8, state_content_bytes=1024, page_size_padded=None
+        )
 
     # Mirrors upstream vllm/models/deepseek_v41/attention.py:561-596
     # (DeepseekV41Attention.forward) with SP-sharded input projection support

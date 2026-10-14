@@ -6,18 +6,21 @@ from typing import Any, Protocol, cast
 
 import jax
 import torch
+from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
 from vllm.v1.worker.utils import allocate_kv_cache as allocate_upstream_kv_cache
 
 from vllm_torchtpu.kernels.deepseek_v4.csa_cache_layout import ROW_WORDS
+from vllm_torchtpu.kernels.deepseek_v41.fp8_cache import encode_fp8_kv
+from vllm_torchtpu.kernels.mla.cache_layout import (
+    pack_cache_values,
+    packed_record_shape,
+    unpack_cache_values,
+)
 
 ROW_BYTES = ROW_WORDS * 4
-# DSV4 FP8 NoPE record: 448 e4m3 values, then one e8m0 scale per lane of a
-# 64-lane period (groups {j, j + 64, ...}); 448 + 64 = 512 bytes = one pool row.
-NOPE_DIM = 448
-NOPE_SCALE_PERIOD = 64
-# Each 512-byte pool row owns 128 RoPE bytes (32 words) in a companion array,
-# addressed by the same row index, as `csa_gather` expects.
+# SparseMLA's gathered RoPE ABI still uses 32 compact words per token.
 ROPE_WORDS = 32
+FP8_RECORD_WORDS = 2 * ROW_WORDS
 
 
 # TPU7x SparseCore hardware addressing limit: a single HBM tensor passed to
@@ -31,23 +34,23 @@ SPARSECORE_MIN_SECOND_BANK_BYTES = SPARSECORE_MAX_POOL_BYTES // 4
 RawCachePool = torch.Tensor | tuple[torch.Tensor, torch.Tensor]
 
 
-def uses_fp8_rope_companion(vllm_config) -> bool:
+def uses_native_fp8_cache(vllm_config) -> bool:
     return "DeepseekV41ForCausalLM" in (
         vllm_config.model_config.hf_config.architectures or []
     ) and str(vllm_config.cache_config.cache_dtype).startswith("fp8")
 
 
-def reserve_rope_companion(vllm_config, available: int, *, auto: bool = False) -> int:
-    """Leave room for the RoPE companion and cap at SparseCore's 2-bank pool limit."""
-    if not uses_fp8_rope_companion(vllm_config):
+def cap_native_cache_budget(vllm_config, available: int, *, auto: bool = False) -> int:
+    """Cap the pool; RoPE is now budgeted in each FP8 record's cache spec."""
+    if not uses_native_fp8_cache(vllm_config):
         return available
     if auto and available > 0:
         # Keep five fractional budget bits: rounding loses less than 1/32
         # while small HBM measurement changes share the same compiled KV shape.
-        # At 32--64 GiB this gives 1-GiB steps, before reserving RoPE bytes.
+        # At 32--64 GiB this gives 1-GiB steps.
         quantum = 1 << max(0, available.bit_length() - 6)
         available = available // quantum * quantum
-    main_budget = available * 4 // 5
+    main_budget = available
     if main_budget < SPARSECORE_MAX_POOL_BYTES + SPARSECORE_MIN_SECOND_BANK_BYTES:
         return min(main_budget, SPARSECORE_MAX_POOL_BYTES)
     return min(
@@ -145,6 +148,15 @@ def materialize_upstream_kv_cache(
     caches = {}
     native_raw_cache: dict[str, RawCachePool] = {}
     native_cache_layouts = {}
+    specs = {}
+    for group in kv_cache_config.kv_cache_groups:
+        spec = group.kv_cache_spec
+        for name in group.layer_names:
+            specs[name] = (
+                spec.kv_cache_specs[name]
+                if isinstance(spec, UniformTypeKVCacheSpecs)
+                else spec
+            )
     for name, view in views.items():
         assert view.ndim == 4 and view.shape[1] == 1
         assert view.stride(-1) == 1 and view.stride(-2) == view.shape[-1]
@@ -155,7 +167,7 @@ def materialize_upstream_kv_cache(
         owner = pool_owners[pool_index]
         native_raw_cache[name] = owner
         native_cache_layouts[name] = (
-            (view.shape[0], *view.shape[2:]),
+            (view.shape[0], view.shape[2], specs[name].head_size),
             view.dtype,
             stride_bytes,
             offset_bytes,
@@ -177,45 +189,10 @@ def materialize_upstream_kv_cache(
                 stride_bytes,
                 offset_bytes,
             )
-    # FP8 NoPE layers (uint8 records) keep RoPE in a companion with one
-    # 32-word slot per pool row, budgeted by `reserve_rope_companion`.
+    # NoPE/scales and padded RoPE occupy consecutive rows in the same record.
+    # Keep the binding alias, but never allocate a model-wide companion pool.
     fp8_layers = [name for name, view in views.items() if view.dtype == torch.uint8]
-    rope_pools: dict[str, RawCachePool] = {}
-    if fp8_layers:
-        assert word_rows
-        if split_banks:
-            rope_owners: list[RawCachePool] = [
-                (
-                    torch.zeros(
-                        (pair[0].shape[0] * ROPE_WORDS // ROW_WORDS, ROW_WORDS),
-                        dtype=torch.int32,
-                        device=device,
-                    ),
-                    torch.zeros(
-                        (pair[1].shape[0] * ROPE_WORDS // ROW_WORDS, ROW_WORDS),
-                        dtype=torch.int32,
-                        device=device,
-                    ),
-                )
-                for pair in cast(list[tuple[torch.Tensor, torch.Tensor]], pool_owners)
-            ]
-            companions = [
-                bank
-                for pair in cast(list[tuple[torch.Tensor, torch.Tensor]], rope_owners)
-                for bank in pair
-            ]
-        else:
-            companions = [
-                torch.zeros(
-                    (raw.shape[0] * ROPE_WORDS // ROW_WORDS, ROW_WORDS),
-                    dtype=torch.int32,
-                    device=device,
-                )
-                for raw in raw_tensors
-            ]
-            rope_owners = list(companions)
-        rope_pools = {name: rope_owners[pool_indices[name]] for name in fp8_layers}
-        raw_tensors = raw_tensors + companions
+    rope_pools = {name: native_raw_cache[name] for name in fp8_layers}
     return MaterializedNativeKVCache(
         kv_caches=caches,
         raw_tensors=raw_tensors,
@@ -259,29 +236,30 @@ class PagedCacheRows:
         else:
             self.rope, self.rope_hi = rope, None
         self.shape, self.dtype, stride_bytes, offset_bytes = layout
-        self.row_bytes = math.prod(self.shape[2:]) * self.dtype.itemsize
+        if self.dtype not in (torch.bfloat16, torch.float32, torch.uint8):
+            raise ValueError("Native cache records must be BF16, FP32 or FP8 bytes")
+        _, width = packed_record_shape(math.prod(self.shape[2:]), self.dtype.itemsize)
+        self.row_bytes = (
+            FP8_RECORD_WORDS * 4 if self.dtype == torch.uint8 else width * 4
+        )
         banks = (self.raw,) if self.raw_hi is None else (self.raw, self.raw_hi)
         if any(
             bank.dtype != torch.int32 or bank.ndim != 2 or bank.shape[1] != ROW_WORDS
             for bank in banks
         ):
             raise ValueError("Native cache requires DSV4 int32[..., 128] word rows")
-        if self.dtype not in (torch.bfloat16, torch.float32, torch.uint8):
-            raise ValueError("Native cache records must be BF16, FP32 or FP8 bytes")
         if self.dtype == torch.uint8 and (
-            self.row_bytes != ROW_BYTES
+            self.shape[-1] != 512
             or self.rope is None
             or (self.rope_hi is not None) != (self.raw_hi is not None)
-            or self.rope.shape
-            != (self.raw.shape[0] * ROPE_WORDS // ROW_WORDS, ROW_WORDS)
+            or self.rope.shape != self.raw.shape
             or (
                 self.raw_hi is not None
                 and self.rope_hi is not None
-                and self.rope_hi.shape
-                != (self.raw_hi.shape[0] * ROPE_WORDS // ROW_WORDS, ROW_WORDS)
+                and self.rope_hi.shape != self.raw_hi.shape
             )
         ):
-            raise ValueError("FP8 records are one pool row plus a RoPE companion")
+            raise ValueError("FP8 records contain NoPE and RoPE in the same pool")
         if self.row_bytes % 4 or (
             self.row_bytes % ROW_BYTES and ROW_BYTES % self.row_bytes
         ):
@@ -310,6 +288,10 @@ class PagedCacheRows:
     def numel(self):
         return math.prod(self.shape)
 
+    @property
+    def device(self):
+        return self.raw.device
+
     def row_indices(self, slots):
         return (
             self.row_offset
@@ -321,15 +303,15 @@ class PagedCacheRows:
         """``block_table`` as pages of ``shape[1]`` raw rows, or None if unaligned.
 
         Page ``p`` is raw rows ``[p * shape[1], (p + 1) * shape[1])``, and its
-        RoPE companion rows ``[p * shape[1] / 4, ...)``.
+        FP8 records occupy two consecutive physical rows each.
         """
         rows = self.shape[1]
         if (
             rows % 4
             or self.row_offset % rows
             or self.page_stride % rows
-            or self.raw.shape[0] % rows
-            or (self.raw_hi is not None and self.raw_hi.shape[0] % rows)
+            or self.bank_records % rows
+            or (self.raw_hi is not None and self.raw_hi.nbytes // self.row_bytes % rows)
         ):
             return None
         return block_table * (self.page_stride // rows) + self.row_offset // rows
@@ -358,12 +340,17 @@ class PagedCacheRows:
                 selected = torch.where(
                     in_hi.unsqueeze(-1), pool_hi[hi_idx], pool[lo_idx]
                 )
-            return (
-                selected.contiguous()
-                .view(self.dtype)
-                .reshape(*records.shape, *self.shape[2:])
+            words = selected.contiguous().view(torch.int32)
+            if self.dtype == torch.bfloat16:
+                low = (words & 0xFFFF).to(torch.uint16).view(torch.bfloat16)
+                high = ((words >> 16) & 0xFFFF).to(torch.uint16).view(torch.bfloat16)
+                values = torch.cat((low, high), -1)
+            else:
+                values = words.view(self.dtype)
+            return values[..., : self.shape[-1]].reshape(
+                *records.shape, *self.shape[2:]
             )
-        elem_count = self.row_bytes // self.dtype.itemsize
+        elem_count = math.prod(self.shape[2:])
         is_fp32 = self.dtype == torch.float32
         if self.raw_hi is None:
             assert _read_values_op is not None
@@ -390,10 +377,16 @@ class PagedCacheRows:
         if self.dtype == torch.uint8:
             self._write_fp8(records, values)
             return
-        values = values.to(self.dtype).reshape(
-            slots.shape[0], self.row_bytes // self.dtype.itemsize
-        )
+        values = values.to(self.dtype).reshape(slots.shape[0], -1)
         if self.raw.device.type == "cpu":
+            width = self.row_bytes // 4
+            if self.dtype == torch.bfloat16:
+                bits = values.contiguous().view(torch.int16).to(torch.int32) & 0xFFFF
+                bits = torch.nn.functional.pad(bits, (0, 2 * width - bits.shape[-1]))
+                values = bits[:, :width] | (bits[:, width:] << 16)
+            else:
+                values = torch.nn.functional.pad(values, (0, width - values.shape[-1]))
+                values = values.contiguous().view(torch.int32)
             pool = self.raw.view(torch.int8).reshape(-1, self.row_bytes)
             valid = (slots >= 0) & (
                 True if self.raw_hi is None else (records < self.bank_records)
@@ -431,7 +424,7 @@ class PagedCacheRows:
                 self.raw_hi.copy_(_write_values_op(self.raw_hi, rec_hi, values))
 
     def _write_fp8(self, records, values):
-        """Quantize BF16 latents into NoPE rows and their RoPE companion slots."""
+        """Write combined NoPE/scales and padded BF16 RoPE records."""
         assert self.rope is not None
         if self.raw.device.type == "cpu":
             import numpy as np
@@ -441,33 +434,33 @@ class PagedCacheRows:
                 torch.from_numpy(np.array(array))
                 for array in encode_fp8_kv(jax.numpy.asarray(latent))
             )
+            packed = torch.cat((words, rope), dim=1)
             valid_lo = (records >= 0) & (
                 True if self.raw_hi is None else (records < self.bank_records)
             )
             rows_lo = records[valid_lo].long()
-            self.raw.index_copy_(0, rows_lo, words[valid_lo])
-            companion = self.rope.view(-1, ROPE_WORDS)
-            companion.index_copy_(0, rows_lo, rope[valid_lo])
+            self.raw.view(-1, FP8_RECORD_WORDS).index_copy_(
+                0, rows_lo, packed[valid_lo]
+            )
             if self.raw_hi is not None:
                 assert self.rope_hi is not None
                 valid_hi = records >= self.bank_records
                 rows_hi = (records[valid_hi] - self.bank_records).long()
-                self.raw_hi.index_copy_(0, rows_hi, words[valid_hi])
-                companion_hi = self.rope_hi.view(-1, ROPE_WORDS)
-                companion_hi.index_copy_(0, rows_hi, rope[valid_hi])
+                self.raw_hi.view(-1, FP8_RECORD_WORDS).index_copy_(
+                    0, rows_hi, packed[valid_hi]
+                )
             return
         assert _encode_fp8_op is not None and _write_values_op is not None
         words, rope = _encode_fp8_op(values.to(torch.bfloat16))
+        packed = torch.cat((words, rope), dim=1)
         rec_lo = records.int()
-        self.raw.copy_(_write_values_op(self.raw, rec_lo, words))
-        self.rope.copy_(_write_values_op(self.rope, rec_lo, rope))
+        self.raw.copy_(_write_values_op(self.raw, rec_lo, packed))
         if self.raw_hi is not None:
             assert self.rope_hi is not None
             rec_hi = torch.where(
                 rec_lo >= self.bank_records, rec_lo - self.bank_records, -1
             )
-            self.raw_hi.copy_(_write_values_op(self.raw_hi, rec_hi, words))
-            self.rope_hi.copy_(_write_values_op(self.rope_hi, rec_hi, rope))
+            self.raw_hi.copy_(_write_values_op(self.raw_hi, rec_hi, packed))
 
 
 class NativeCacheView:
@@ -478,10 +471,9 @@ class NativeCacheView:
     @property
     def kv_cache(self):
         raw = getattr(self, "_tpu_raw_cache", None)
-        if torch.compiler.is_compiling() and raw is not None:
-            return PagedCacheRows(
-                raw, self._tpu_cache_layout, getattr(self, "_tpu_rope_pool", None)
-            )
+        if raw is not None:
+            assert self._tpu_paged_cache is not None
+            return self._tpu_paged_cache
         return self._bound_cache
 
     @kv_cache.setter
@@ -494,16 +486,22 @@ class NativeCacheView:
         self._tpu_rope_pool = rope_pool
         if layout is not None:
             self._tpu_cache_layout = layout
-            return
-        raw_tensor = raw_cache[0] if isinstance(raw_cache, tuple) else raw_cache
-        if raw_tensor is not None and raw_tensor.device.type != "cpu":
-            raise ValueError("TPU native caches require explicit allocator layout")
-        view = self._bound_cache
-        self._tpu_cache_layout = (
-            tuple(view.shape),
-            view.dtype,
-            view.stride(0) * view.element_size(),
-            view.storage_offset() * view.element_size(),
+        else:
+            raw_tensor = raw_cache[0] if isinstance(raw_cache, tuple) else raw_cache
+            if raw_tensor is not None and raw_tensor.device.type != "cpu":
+                raise ValueError("TPU native caches require explicit allocator layout")
+            view = self._bound_cache
+            self._tpu_cache_layout = (
+                tuple(view.shape),
+                view.dtype,
+                view.stride(0) * view.element_size(),
+                view.storage_offset() * view.element_size(),
+            )
+        # Engram uses the cache object's identity to retain token history.
+        self._tpu_paged_cache = (
+            PagedCacheRows(raw_cache, self._tpu_cache_layout, rope_pool)
+            if raw_cache is not None
+            else None
         )
 
 
@@ -567,86 +565,24 @@ def _gather_words(cache, records, record_words):
     return selected
 
 
-def _permute(x: jax.Array, source: jax.Array) -> jax.Array:
-    """``x[..., source]`` as an exact 0/1 matmul (finite ``x``; subnormals flush).
-
-    Lane-stride slices and lane gathers are slow on TPU; the MXU is not.
-    """
-    import jax.numpy as jnp
-
-    permutation = (jnp.arange(x.shape[-1])[:, None] == source[None]).astype(x.dtype)
-    return jnp.einsum(
-        "...d,de->...e",
-        x,
-        permutation,
-        precision=jax.lax.Precision.HIGHEST,
-        preferred_element_type=jnp.float32,
-    ).astype(x.dtype)
-
-
-def piece_order(elements: int) -> jax.Array:
-    """Element order of `gather_cache_pieces`: per word row, even then odd."""
-    import jax.numpy as jnp
-
-    width = min(elements // 2, ROW_WORDS)
-    return jnp.concatenate(
-        [
-            start + 2 * jnp.arange(width) + parity
-            for start in range(0, elements, 2 * width)
-            for parity in (0, 1)
-        ]
-    )
-
-
 def split_halves(x: jax.Array) -> jax.Array:
-    """Reorder the last axis as `piece_order` (``split`` reads)."""
-    return _permute(x, piece_order(x.shape[-1]))
+    """The native feature layout needs no even/odd permutation."""
+    return x
 
 
 def merge_halves(x: jax.Array) -> jax.Array:
-    """Inverse of `split_halves`."""
-    import jax.numpy as jnp
-
-    return _permute(x, jnp.argsort(piece_order(x.shape[-1])))
+    return x
 
 
 def split_pieces(x: jax.Array, pieces: int) -> jax.Array:
-    """Reorder the last axis into ``[pieces, *x.shape[:-1], d // pieces]``.
-
-    Placing ``pieces`` on the leading axis instead of the second-to-last axis
-    preserves ``(heads, 128)`` as the minor dimensions on TPU, avoiding 5D
-    sublane-padded ``(..., pieces=4, 128)`` reshapes (~5.95 ms/chunk).
-    """
-    import jax.numpy as jnp
-
-    dim = x.shape[-1]
-    order = piece_order(dim)
-    perm = (jnp.arange(dim)[:, None] == order[None]).reshape(dim, pieces, dim // pieces)
-    return jnp.einsum(
-        "...d,dpe->p...e",
-        x,
-        perm.astype(x.dtype),
-        precision=jax.lax.Precision.HIGHEST,
-        preferred_element_type=jnp.float32,
-    ).astype(x.dtype)
+    """Put contiguous 128-feature chunks on a leading axis for attention."""
+    split = x.reshape(*x.shape[:-1], pieces, x.shape[-1] // pieces)
+    return jax.numpy.moveaxis(split, -2, 0)
 
 
 def merge_pieces(x: jax.Array) -> jax.Array:
-    """Inverse of `split_pieces`, contracting leading ``pieces`` into the last axis."""
-    import jax.numpy as jnp
-
-    pieces = x.shape[0]
-    piece_dim = x.shape[-1]
-    dim = pieces * piece_dim
-    order = piece_order(dim)
-    perm = (jnp.arange(dim)[:, None] == order[None]).reshape(dim, pieces, piece_dim)
-    return jnp.einsum(
-        "p...e,dpe->...d",
-        x,
-        perm.astype(x.dtype),
-        precision=jax.lax.Precision.HIGHEST,
-        preferred_element_type=jnp.float32,
-    ).astype(x.dtype)
+    merged = jax.numpy.moveaxis(x, 0, -2)
+    return merged.reshape(*x.shape[1:-1], x.shape[0] * x.shape[-1])
 
 
 def _valid_records(cache, records, record_words):
@@ -668,9 +604,9 @@ def _split_words(words: jax.Array) -> tuple[jax.Array, jax.Array]:
     import jax.numpy as jnp
 
     def bf16(bits):
-        return jax.lax.bitcast_convert_type(bits, jnp.float32).astype(jnp.bfloat16)
+        return jax.lax.bitcast_convert_type(bits.astype(jnp.uint16), jnp.bfloat16)
 
-    return bf16(words << 16), bf16(words & jnp.int32(-65536))
+    return bf16(words), bf16(jax.lax.shift_right_logical(words, 16))
 
 
 def gather_cache_pieces(
@@ -678,26 +614,24 @@ def gather_cache_pieces(
     records: jax.Array,
     elements: int,
 ) -> jax.Array:
-    """BF16 records as stacked ``[pieces, n, width]`` in `piece_order`.
-
-    See `gather_cache_values`. Records spanning several word rows are read
-    word-row-major in one gather (``[rows, n, 128]`` needs no relayout, unlike
-    an interleaved ``[2n, 128] -> [n, 256]``; one gather stays on SparseCore).
-    """
+    """Gather contiguous feature chunks as ``[pieces, records, 128]``."""
     import jax.numpy as jnp
 
-    record_words = elements // 2
-    if record_words <= ROW_WORDS:
-        return jnp.stack(_split_words(_gather_records(cache, records, record_words)))
+    if elements % ROW_WORDS:
+        return gather_cache_values(cache, records, elements)[None]
+    _, record_words = packed_record_shape(elements, 2)
     chunks = record_words // ROW_WORDS
     records = _valid_records(cache, records, record_words) * chunks
     rows = (records[None] + jnp.arange(chunks, dtype=records.dtype)[:, None]).reshape(
         -1
     )
-    even, odd = _split_words(
+    low, high = _split_words(
         _gather_raw_rows(cache, rows).reshape(chunks, records.size, ROW_WORDS)
     )
-    return jnp.stack([even, odd], axis=1).reshape(2 * chunks, records.size, ROW_WORDS)
+    pieces = jnp.concatenate((low, high), axis=0)
+    if elements < ROW_WORDS:
+        return pieces[:1, :, :elements]
+    return pieces[: elements // ROW_WORDS]
 
 
 def gather_cache_values(
@@ -707,32 +641,16 @@ def gather_cache_values(
     fp32: bool = False,
     split: bool = False,
 ) -> jax.Array:
-    """Read physical records without flattening or converting the whole pool.
+    """Gather padded physical records and return their original feature order.
 
-    Negative records are invalid and return arbitrary rows; callers mask them.
-    They read distinct rows: clamping them all to row 0 serializes the
-    SparseCore gather on the repeated index (padded decode, short top-k).
-    ``split`` returns BF16 elements reordered as `piece_order` (see
-    `split_halves`), which needs no lane gather.
+    Negative records read arbitrary distributed rows; consumers mask them.
+    `split` is retained for callers whose inputs used the old split ordering.
     """
     import jax.numpy as jnp
 
-    if split:
-        if elements // 2 <= ROW_WORDS:
-            words = _gather_records(cache, records, elements // 2)
-            return jnp.concatenate(_split_words(words), axis=1)
-        return jnp.concatenate(
-            list(gather_cache_pieces(cache, records, elements)), axis=1
-        )
-    record_words = elements if fp32 else elements // 2
-    words = _gather_records(cache, records, record_words)
-    if fp32:
-        return jax.lax.bitcast_convert_type(words, jnp.float32)
-    # Keep the consumer's final shape; rank-increasing bitcasts add TPU padding.
-    columns = jnp.arange(elements)[None]
-    selected = jnp.take_along_axis(words, columns // 2, axis=1)
-    bits = (selected >> ((columns % 2) * 16)) << 16
-    return jax.lax.bitcast_convert_type(bits, jnp.float32).astype(jnp.bfloat16)
+    _, width = packed_record_shape(elements, 4 if fp32 else 2)
+    words = _gather_records(cache, records, width)
+    return unpack_cache_values(words, elements, jnp.float32 if fp32 else jnp.bfloat16)
 
 
 def gather_cache_page_words(
@@ -743,12 +661,12 @@ def gather_cache_page_words(
 ) -> jax.Array:
     """Raw int32 word rows ``[pages * rows, ROW_WORDS]`` of whole pages.
 
-    Each row holds ``ROW_WORDS // (elements // 2)`` consecutive records of
-    its page, in the split element order; see `gather_cache_page_values`.
+    Each padded index record occupies one complete 128-word row;
+    see `gather_cache_page_values` for the natural feature-order view.
     """
     import jax.numpy as jnp
 
-    record_words = elements // 2
+    _, record_words = packed_record_shape(elements, 2)
     if ROW_WORDS % record_words or (page_records * record_words) % ROW_WORDS:
         raise ValueError("Pages must cover whole pool word rows")
     total_rows = _cache_num_rows(cache)
@@ -785,41 +703,9 @@ def gather_cache_page_values(
     import jax.numpy as jnp
 
     words = gather_cache_page_words(cache, first_records, page_records, elements)
-    words = words.reshape(first_records.size * page_records, elements // 2)
-    return jnp.concatenate(_split_words(words), axis=1)
-
-
-def encode_fp8_kv(latent: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """BF16 ``[n, 512]`` latents -> DSV4 FP8 NoPE rows and RoPE words.
-
-    Returns int32 ``[n, 128]`` rows (the ``(4, 128)`` uint8 slab of
-    `csa_cache_layout`: 448 e4m3 values, then 64 lane-periodic e8m0 scales)
-    and int32 ``[n, 32]`` RoPE words for the companion. Matches the V4
-    compressor's quantizer, so `sparse_ragged_paged_attention` reads it.
-    """
-    import jax.numpy as jnp
-
-    from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
-
-    nope = latent[:, :NOPE_DIM].astype(jnp.float32)
-    groups = NOPE_DIM // NOPE_SCALE_PERIOD
-    amax = jnp.abs(nope).reshape(-1, groups, NOPE_SCALE_PERIOD).max(axis=1)
-    fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
-    exponent = jnp.ceil(jnp.log2(jnp.maximum(amax, 1e-4) / fp8_max)).astype(jnp.int32)
-    # Build the power of two from its bits: exp2 is approximate on some
-    # backends, and a scale off by one ulp flips e4m3 rounding at ties.
-    biased = exponent + 127
-    scales = jax.lax.bitcast_convert_type(biased << 23, jnp.float32)
-    values = (nope / jnp.tile(scales, groups)).astype(jnp.float8_e4m3fn)
-    record = jnp.concatenate(
-        (jax.lax.bitcast_convert_type(values, jnp.uint8), biased.astype(jnp.uint8)),
-        axis=-1,
-    )
-    words = csa_cache_layout.slabs_to_words(
-        record.reshape(-1, csa_cache_layout.SLAB_ROWS, ROW_WORDS)
-    )
-    rope = csa_cache_layout.rope_words(latent[:, NOPE_DIM:].astype(jnp.bfloat16))
-    return words, rope
+    _, width = packed_record_shape(elements, 2)
+    words = words.reshape(first_records.size * page_records, width)
+    return unpack_cache_values(words, elements, jnp.bfloat16)
 
 
 def initialize_cache_ops():
@@ -877,10 +763,16 @@ def initialize_cache_ops():
     )
     _write_op.register_fake(lambda cache, slots, values: torch.empty_like(cache))
     mesh = get_vllm_model_wrapper_context().mesh
+
+    def write_values(
+        cache: jax.Array, records: jax.Array, values: jax.Array
+    ) -> jax.Array:
+        return scatter_cache_values(cache, records, values)
+
     # Pallas DMA runs independently on each device's replicated cache.
     # Mosaic calls require explicit manual partitioning on a multi-device mesh.
     write_values = jax.shard_map(
-        scatter_cache_values,
+        write_values,
         mesh=mesh,
         in_specs=(P(), P(), P()),
         out_specs=P(),
@@ -900,10 +792,15 @@ def initialize_cache_ops():
     def write_values_after(
         cache: jax.Array, records: jax.Array, values: jax.Array, after: jax.Array
     ) -> jax.Array:
-        # An in-place write that may overlap an async gather of the old pool
-        # makes XLA copy the whole pool first; finish the gather instead.
-        cache, _ = jax.lax.optimization_barrier((cache, after))
-        return write_values(cache, records, values)
+        return scatter_cache_values(cache, records, values, after=after)
+
+    write_values_after = jax.shard_map(
+        write_values_after,
+        mesh=mesh,
+        in_specs=(P(), P(), P(), P()),
+        out_specs=P(),
+        check_vma=False,
+    )
 
     _write_values_after_op = pallas.jax_op(
         "pallas::dsv41v2_cache_write_values_after",
@@ -924,7 +821,7 @@ def initialize_cache_ops():
     _encode_fp8_op.register_fake(
         lambda latent: (
             latent.new_empty((latent.shape[0], ROW_WORDS), dtype=torch.int32),
-            latent.new_empty((latent.shape[0], ROPE_WORDS), dtype=torch.int32),
+            latent.new_empty((latent.shape[0], ROW_WORDS), dtype=torch.int32),
         )
     )
 
@@ -989,30 +886,15 @@ def merge_sub_rows(
 
 
 def _pack_bf16_words(values: jax.Array) -> jax.Array:
-    """Pack BF16 ``[n, 2 * width]`` into int32 ``[n, width]`` via `split_halves`.
-
-    A direct ``bitcast_convert_type(values.reshape(n, -1, 2), int32)`` lowers on
-    TPU to stride-2 lane slices ``[0:511:2]`` and ``[1:512:2]`` (~6.0 ms/chunk
-    across 21 SWA/compressor writes). Reordering via `split_halves` (MXU 0/1
-    matmul) places even and odd elements into contiguous 128-lane halves first.
-    """
-    import jax.numpy as jnp
-
-    half_width = min(values.shape[1] // 2, ROW_WORDS)
-    split = split_halves(values).reshape(values.shape[0], -1, 2, half_width)
-    even = jax.lax.bitcast_convert_type(
-        split[:, :, 0, :].astype(jnp.float32), jnp.int32
-    )
-    odd = jax.lax.bitcast_convert_type(split[:, :, 1, :].astype(jnp.float32), jnp.int32)
-    return (jax.lax.shift_right_logical(even, 16) | (odd & jnp.int32(-65536))).reshape(
-        values.shape[0], values.shape[1] // 2
-    )
+    return pack_cache_values(values)
 
 
 def scatter_cache_values(
     cache: jax.Array,
     records: jax.Array,
     values: jax.Array,
+    *,
+    after: jax.Array | None = None,
 ) -> jax.Array:
     """Write unique physical records, preserving the shared owner and padding.
 
@@ -1026,7 +908,9 @@ def scatter_cache_values(
     if isinstance(cache, tuple):
         cache_lo, cache_hi = cache
         record_words = (
-            values.shape[1] // 2 if values.dtype == jnp.bfloat16 else values.shape[1]
+            values.shape[1]
+            if values.dtype == jnp.int32
+            else packed_record_shape(values.shape[1], values.dtype.itemsize)[1]
         )
         bank_records = cache_lo.shape[0] * ROW_WORDS // record_words
         records_lo = jnp.where(records < bank_records, records, -1)
@@ -1034,102 +918,26 @@ def scatter_cache_values(
         return cast(
             Any,
             (
-                scatter_cache_values(cache_lo, records_lo, values),
-                scatter_cache_values(cache_hi, records_hi, values),
+                scatter_cache_values(cache_lo, records_lo, values, after=after),
+                scatter_cache_values(cache_hi, records_hi, values, after=after),
             ),
         )
     assert cache.dtype == jnp.int32 and cache.ndim == 2 and cache.shape[1] == ROW_WORDS
     if not values.shape[0]:
         return cache
-    words = (
-        values
-        if values.dtype == jnp.int32
-        else (
-            _pack_bf16_words(values)
-            if (
-                values.dtype == jnp.bfloat16
-                and jax.default_backend() == "tpu"
-                and values.shape[1] >= 2 * ROW_WORDS
-                and values.shape[1] % (2 * ROW_WORDS) == 0
-            )
-            else jax.lax.bitcast_convert_type(
-                values.reshape(values.shape[0], -1, 2)
-                if values.dtype == jnp.bfloat16
-                else values,
-                jnp.int32,
-            )
-        )
-    )
+    words = values if values.dtype == jnp.int32 else pack_cache_values(values)
     width = words.shape[1]
-    if width < ROW_WORDS and jax.default_backend() == "tpu":
-        # An elementwise (row, lane) scatter is slow on TPU. Rebuild whole word
-        # rows instead and reuse the full-row DMA below.
-        records, words = merge_sub_rows(cache, records, words)
-        width = ROW_WORDS
-    if width < ROW_WORDS or jax.default_backend() != "tpu":
-        columns = jnp.arange(width)[None]
-        if width < ROW_WORDS:
-            per_row = ROW_WORDS // width
-            rows = records[:, None] // per_row
-            lanes = (records[:, None] % per_row) * width + columns
-        else:
-            rows = records[:, None] * (width // ROW_WORDS) + columns // ROW_WORDS
-            lanes = jnp.broadcast_to(columns % ROW_WORDS, rows.shape)
-        rows = jnp.where(records[:, None] >= 0, rows, cache.shape[0])
-        return cache.at[rows, lanes].set(words, mode="drop")
+    if jax.default_backend() == "tpu":
+        from vllm_torchtpu.kernels.mla.word_cache import scatter_word_records
 
-    from jax.experimental import pallas as pl
-    from jax.experimental.pallas import tpu as pltpu
-
-    chunks = width // ROW_WORDS
-    # Records per grid step whose row DMAs are in flight together. A serial
-    # start/wait per 512 B row is DMA-latency bound.
-    block = 64
-    count = records.shape[0]
-    records = jnp.pad(records, (0, -count % block), constant_values=-1)
-
-    def kernel(record_ref, values_ref, _input_ref, output_ref, sem):
-        def copies(index):
-            token = pl.program_id(0) * block + index
-            record = record_ref[token]
-            return (record >= 0) & (record < cache.shape[0] // chunks), [
-                pltpu.make_async_copy(
-                    values_ref.at[
-                        pl.ds((token * chunks + chunk) * ROW_WORDS, ROW_WORDS)
-                    ],
-                    output_ref.at[record * chunks + chunk, :],
-                    sem,
-                )
-                for chunk in range(chunks)
-            ]
-
-        def run(method):
-            def body(index, carry):
-                valid, row_copies = copies(index)
-
-                @pl.when(valid)
-                def _():
-                    for copy in row_copies:
-                        getattr(copy, method)()
-
-                return carry
-
-            jax.lax.fori_loop(0, block, body, 0)
-
-        run("start")
-        run("wait")
-
-    return pl.pallas_call(
-        kernel,
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
-            grid=(records.shape[0] // block,),
-            in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)] * 2,
-            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
-            scratch_shapes=[pltpu.SemaphoreType.DMA],
-        ),
-        out_shape=jax.ShapeDtypeStruct(cache.shape, cache.dtype),
-        input_output_aliases={2: 0},
-        # Flatten only the small update batch. A partial DMA from a tiled 2D
-        # source can straddle its padded minor dimension; the cache stays 2D.
-    )(records, words.reshape(-1), cache)
+        return scatter_word_records(cache, records, words, after=after)
+    columns = jnp.arange(width)[None]
+    if width < ROW_WORDS:
+        per_row = ROW_WORDS // width
+        rows = records[:, None] // per_row
+        lanes = (records[:, None] % per_row) * width + columns
+    else:
+        rows = records[:, None] * (width // ROW_WORDS) + columns // ROW_WORDS
+        lanes = jnp.broadcast_to(columns % ROW_WORDS, rows.shape)
+    rows = jnp.where(records[:, None] >= 0, rows, cache.shape[0])
+    return cache.at[rows, lanes].set(words, mode="drop")

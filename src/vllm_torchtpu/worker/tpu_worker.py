@@ -472,14 +472,14 @@ class TPUWorker(WorkerBase):
         # f"hbm={utils.hbm_usage_gb(self.devices)}GiB")
         vllm_utils.report_usage_stats(self.vllm_config)
 
-    def _reserve_deepseek_v41_rope_companion(self, available: int) -> int:
+    def _cap_deepseek_v41_native_cache(self, available: int) -> int:
         if envs.TPU_DEEPSEEK_V41_IMPL != "v2":
             return available
         from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
-            reserve_rope_companion,
+            cap_native_cache_budget,
         )
 
-        return reserve_rope_companion(
+        return cap_native_cache_budget(
             self.vllm_config,
             available,
             auto=self.cache_config.kv_cache_memory_bytes is None,
@@ -501,7 +501,7 @@ class TPUWorker(WorkerBase):
                 "correspondingly."
             )
             logger.info(msg)
-            return self._reserve_deepseek_v41_rope_companion(kv_cache_memory_bytes)
+            return self._cap_deepseek_v41_native_cache(kv_cache_memory_bytes)
 
         # VLLM directive of the percentage of HBM memory the model executor can use
         self.model_runner.profile_run(self.model_runner.max_num_tokens)
@@ -547,7 +547,7 @@ class TPUWorker(WorkerBase):
                 f"increasing --gpu-memory-utilization from "
                 f"{gpu_memory_utilization} to a larger value."
             )
-        return self._reserve_deepseek_v41_rope_companion(available)
+        return self._cap_deepseek_v41_native_cache(available)
 
     def execute_model(self, scheduler_output):
         return self.model_runner.execute_model(scheduler_output)

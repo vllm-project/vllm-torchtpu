@@ -20,7 +20,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
 
-PAGE = 16  # records per page: 8 word rows of two 128-element BF16 keys
+PAGE = 16  # one 128-word row per padded BF16 key
 
 
 def _words(rng, shape):
@@ -30,14 +30,14 @@ def _words(rng, shape):
 
 
 def _reference(q, weights, words):
-    """XLA path: split words into keys [tokens, 2 * rows, 128], einsum."""
+    """XLA reference using the first 128-feature plane of each record."""
     groups, rows, _ = words.shape
     tokens = q.shape[0]
-    keys = jnp.concatenate(_split_words(words.reshape(-1, ROW_WORDS // 2)), axis=1)
-    keys = jnp.repeat(keys.reshape(groups, 2 * rows, -1), tokens // groups, axis=0)
+    keys = _split_words(words)[0]
+    keys = jnp.repeat(keys.reshape(groups, rows, -1), tokens // groups, axis=0)
     logits = jnp.einsum("thd,tcd->thc", q, keys, preferred_element_type=jnp.float32)
     scores = (jnp.maximum(logits, 0) * weights).sum(1)
-    return np.asarray(scores)  # record order: key 2r + s is slot s of row r
+    return np.asarray(scores)
 
 
 @pytest.mark.parametrize(
@@ -87,21 +87,23 @@ def test_gather_cache_page_words_is_raw_page_rows():
     pool = _words(rng, (64, ROW_WORDS))
     first = jnp.asarray([32, -1, 0], jnp.int32)
     words = gather_cache_page_words(pool, first, PAGE, 128)
-    assert words.shape == (3 * 8, ROW_WORDS)
-    np.testing.assert_array_equal(np.asarray(words[:8]), np.asarray(pool[16:24]))
-    np.testing.assert_array_equal(np.asarray(words[16:]), np.asarray(pool[:8]))
+    assert words.shape == (3 * PAGE, ROW_WORDS)
+    np.testing.assert_array_equal(np.asarray(words[:PAGE]), np.asarray(pool[32:48]))
+    np.testing.assert_array_equal(
+        np.asarray(words[2 * PAGE :]), np.asarray(pool[:PAGE])
+    )
     values = gather_cache_page_values(pool, first, PAGE, 128)
-    split = jnp.concatenate(_split_words(words.reshape(-1, 64)), axis=1)
+    split = _split_words(words)[0]
     np.testing.assert_array_equal(np.asarray(values), np.asarray(split))
     with pytest.raises(ValueError):
-        gather_cache_page_words(pool, first, 3, 128)
+        gather_cache_page_words(pool, first, 3, 512)
 
 
 def _paged_inputs(rng, tokens, width, lengths, q_dtype=jnp.bfloat16):
     rows = 4096
     pool = _words(rng, (rows, ROW_WORDS))
     pages = -(-width // PAGE)
-    table = np.stack([rng.permutation(rows * 2 // PAGE)[:pages] for _ in range(tokens)])
+    table = np.stack([rng.permutation(rows // PAGE)[:pages] for _ in range(tokens)])
     records = (table[:, :, None] * PAGE + np.arange(PAGE)).reshape(tokens, -1)
     records = records[:, :width].astype(np.int32)
     records[0, -5:] = -1
