@@ -2114,8 +2114,16 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         return mla_impl
 
-    def _build_sparse_mla_op(self, layer: Any):
+    def _build_sparse_mla_op(self, layer: Any, plain: bool = False):
+        """`plain`: never the token-sharded variant, and named apart from the
+        layer's main op (GLM's all-heads path, `build_full_heads`)."""
         from vllm_torchtpu.layers.core.attention_interface import sparse_mla_attention
+
+        if not plain and envs.TPU_SPARSE_MLA_TOKEN_SHARD_MIN_TOKENS > 0:
+            from vllm.distributed import get_tensor_model_parallel_world_size
+
+            if get_tensor_model_parallel_world_size() > 1:
+                return self._build_sparse_mla_token_shard_op(layer)
 
         vllm_context = get_vllm_model_wrapper_context()
 
@@ -2159,9 +2167,12 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 sm_scale=layer.scale,
                 k_scale=k_scale,
                 allow_masked_dense=allow_masked_dense,
+                write_rope=not getattr(layer, "zero_rope", False),
             )
 
         op_name = f"pallas::sparse_mla_attention_{layer.layer_name.replace('.', '_')}"
+        if plain:
+            op_name += "_full"
         sparse_mla_jax_op = pallas.jax_op(
             op_name, sparse_mla_attention_core_tpu, donate_argnums=(0, 1)
         )
@@ -2178,7 +2189,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             **kwargs,
         ):
             num_tokens = ql_nope.size(0)
-            out_shape = (num_tokens, layer.num_heads, layer.kv_lora_rank)
+            out_shape = (num_tokens, ql_nope.size(1), layer.kv_lora_rank)
             return (
                 torch.empty_like(kv_cache_nope),
                 torch.empty_like(kv_cache_rope),
@@ -2218,6 +2229,242 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             return outputs
 
         return sparse_mla_impl
+
+    def _build_sparse_mla_local_op(self, layer: Any):
+        """Sparse MLA for a sequence-parallel step; see
+        `sparse_mla_attention_local_tokens`. Torch signature as
+        `_build_sparse_mla_op`, with `[T / tp]`-row q, topk and output."""
+        from torch_tpu._internal.pallas import get_pallas_mesh
+
+        from vllm_torchtpu.layers.core.attention_interface import (
+            sparse_mla_attention_local_tokens,
+        )
+
+        axis_name = "mla_tokens"
+        mesh = get_pallas_mesh(axis_names=(axis_name,))
+        k_scale = None
+        if layer.kv_cache_quantized_dtype is not None:
+            _, k_scale, _ = self._get_kv_scales(layer)
+
+        def core(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            ql_nope: jax.Array,
+            q_pe: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            topk_indices: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            nope_spec, rope_spec = layer.mla_kv_spec
+            return sparse_mla_attention_local_tokens(
+                ql_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                kv_cache_nope,
+                kv_cache_rope,
+                topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                mesh,
+                nope_spec,
+                rope_spec,
+                sm_scale=layer.scale,
+                k_scale=k_scale,
+                axis_name=axis_name,
+                write_rope=not getattr(layer, "zero_rope", False),
+            )
+
+        jax_op = pallas.jax_op(
+            f"pallas::sparse_mla_attention_sp_{layer.layer_name.replace('.', '_')}",
+            core,
+            donate_argnums=(0, 1),
+            mesh=mesh,
+            input_partition_specs=(P(),) * 11,
+            output_partition_specs=(P(), P(), P()),
+        )
+
+        def _fake(kv_cache_nope, kv_cache_rope, ql_nope, *args, **kwargs):
+            return (
+                torch.empty_like(kv_cache_nope),
+                torch.empty_like(kv_cache_rope),
+                torch.empty_like(ql_nope),
+            )
+
+        jax_op.register_fake(_fake)
+
+        def impl(kv_cache, ql_nope, q_pe, *args):
+            nope_cache, rope_cache = kv_cache
+            new_nope, new_rope, outputs = jax_op(
+                nope_cache, rope_cache, ql_nope, q_pe, *args
+            )
+            nope_cache.copy_(new_nope)
+            rope_cache.copy_(new_rope)
+            return outputs
+
+        return impl
+
+    def forward_sparse_all_heads(
+        self,
+        layer: Any,
+        q_nope: torch.Tensor,
+        kv_c_normed: torch.Tensor,
+        k_pe: torch.Tensor,
+        kv_cache: tuple[torch.Tensor, torch.Tensor],
+        attn_metadata: Any,
+        topk_indices: torch.Tensor,
+        sequence_parallel: bool,
+    ) -> torch.Tensor:
+        """`forward` attending with every head (`build_full_heads`).
+
+        `q_nope` is `[T_q, H, nope]` with all `H` heads, projected with the
+        `W_UK_T_full`/`W_UV_full` the layer gathered at load; `kv_c_normed` /
+        `k_pe` cover the whole step. In a sequence-parallel step `T_q` is this
+        rank's `T / tp` tokens; otherwise it is every token, replicated on
+        every rank. Returns `[T_q, H * v_head_dim]`.
+        """
+        input_dtype = q_nope.dtype
+        ql_nope = (
+            torch.bmm(q_nope.transpose(0, 1), layer.W_UK_T_full.to(input_dtype))
+            .transpose(0, 1)
+            .contiguous()
+        )
+        q_pe = torch.zeros_like(ql_nope[..., : layer.qk_rope_head_dim])
+        _, k_scale, _ = self._get_kv_scales(layer)
+        if layer.kv_cache_quantized_dtype is not None:
+            assert k_scale is not None
+            kv_c_normed, _ = quantize_kv(
+                layer.kv_cache_quantized_dtype, kv_c_normed, value=None, k_scale=k_scale
+            )
+            k_pe, _ = quantize_kv(
+                layer.kv_cache_quantized_dtype, k_pe, value=None, k_scale=k_scale
+            )
+        op = (
+            layer.sparse_mla_local_op if sequence_parallel else layer.sparse_mla_full_op
+        )
+        outputs = op(
+            kv_cache,
+            ql_nope,
+            q_pe,
+            kv_c_normed,
+            k_pe,
+            topk_indices,
+            attn_metadata.seq_lens,
+            attn_metadata.block_tables,
+            attn_metadata.query_start_loc,
+            attn_metadata.request_distribution,
+        )
+        out_proj = torch.bmm(outputs.transpose(0, 1), layer.W_UV_full.to(outputs.dtype))
+        # `-1` rather than `flatten`: torch-tpu's exporter rejects a view whose
+        # shape spells out the symbolic token count.
+        return (
+            out_proj.transpose(0, 1)
+            .to(input_dtype)
+            .reshape(-1, out_proj.shape[0] * out_proj.shape[2])
+        )
+
+    def _build_sparse_mla_token_shard_op(self, layer: Any):
+        """`_build_sparse_mla_op` that attends large batches token-sharded.
+
+        See `sparse_mla_attention_token_sharded`. Same torch signature; the op
+        runs on a mesh over the whole TP world (TP is the whole world here:
+        `get_pallas_mesh` cannot build a sub-world mesh).
+        """
+        import torch.distributed as dist
+        from torch_tpu._internal.pallas import get_pallas_mesh
+        from vllm.distributed import get_tensor_model_parallel_world_size
+
+        from vllm_torchtpu.layers.core.attention_interface import (
+            sparse_mla_attention_token_sharded,
+        )
+
+        if get_tensor_model_parallel_world_size() != dist.get_world_size():
+            raise NotImplementedError(
+                "token-sharded sparse MLA needs TP to span the whole world"
+            )
+        axis_name = "mla_tokens"
+        mesh = get_pallas_mesh(axis_names=(axis_name,))
+        min_tokens = envs.TPU_SPARSE_MLA_TOKEN_SHARD_MIN_TOKENS
+
+        k_scale = None
+        if layer.kv_cache_quantized_dtype is not None:
+            _, k_scale, _ = self._get_kv_scales(layer)
+
+        def core(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            ql_nope: jax.Array,
+            q_pe: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            topk_indices: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            nope_spec, rope_spec = layer.mla_kv_spec
+            return sparse_mla_attention_token_sharded(
+                ql_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                kv_cache_nope,
+                kv_cache_rope,
+                topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                mesh,
+                nope_spec,
+                rope_spec,
+                sm_scale=layer.scale,
+                k_scale=k_scale,
+                axis_name=axis_name,
+                min_tokens=min_tokens,
+                write_rope=not getattr(layer, "zero_rope", False),
+            )
+
+        heads = P(None, axis_name, None)
+        op_name = (
+            f"pallas::sparse_mla_attention_tok_{layer.layer_name.replace('.', '_')}"
+        )
+        jax_op = pallas.jax_op(
+            op_name,
+            core,
+            donate_argnums=(0, 1),
+            mesh=mesh,
+            input_partition_specs=(P(), P(), heads, heads) + (P(),) * 7,
+            output_partition_specs=(P(), P(), heads),
+        )
+
+        def _fake(kv_cache_nope, kv_cache_rope, ql_nope, *args, **kwargs):
+            out_shape = (ql_nope.size(0), layer.num_heads, layer.kv_lora_rank)
+            return (
+                torch.empty_like(kv_cache_nope),
+                torch.empty_like(kv_cache_rope),
+                torch.empty(out_shape, dtype=ql_nope.dtype, device=ql_nope.device),
+            )
+
+        jax_op.register_fake(_fake)
+
+        def impl(kv_cache, ql_nope, q_pe, *args):
+            nope_cache, rope_cache = kv_cache
+            new_nope, new_rope, outputs = jax_op(
+                nope_cache, rope_cache, ql_nope, q_pe, *args
+            )
+            nope_cache.copy_(new_nope)
+            rope_cache.copy_(new_rope)
+            return outputs
+
+        return impl
 
     def _build_sparse_mla_dcp_op(self, layer: Any, dcp_size: int, interleave_size: int):
         """DCP variant of `_build_sparse_mla_op`: shard the KV cache only.

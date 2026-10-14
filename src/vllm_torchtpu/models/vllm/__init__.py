@@ -23,6 +23,10 @@ _DSV4_DSPARK_MODEL = (
 _QWEN35_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MTP"
 _QWEN35_MOE_MTP_MODEL = "vllm_torchtpu.models.vllm.qwen3_5_mtp:Qwen3_5MoeMTP"
 _QWEN4_EXP_MODEL = "vllm_torchtpu.models.vllm.qwen4_exp.model:Qwen4ExpForCausalLM"
+_GLM5_NEXT_MODEL = (
+    "vllm_torchtpu.models.vllm.glm5_next:Glm5NextForConditionalGeneration"
+)
+_GLM5_NEXT_TEXT_MODEL = "vllm_torchtpu.models.vllm.glm5_next:Glm5NextForCausalLM"
 
 
 class _TPUKimiK3Config(VerifyAndUpdateConfig):
@@ -44,5 +48,11 @@ def register_models() -> None:
     ModelRegistry.register_model("Qwen3_5MTP", _QWEN35_MTP_MODEL)
     ModelRegistry.register_model("Qwen3_5MoeMTP", _QWEN35_MOE_MTP_MODEL)
     ModelRegistry.register_model("Qwen4ExpForCausalLM", _QWEN4_EXP_MODEL)
+    # GLM-5.3-Flash. Registering this matters even before the port is
+    # finished: without it vLLM does not fail, it silently resolves the
+    # architecture to the generic Transformers fallback with `use_mla=False`
+    # and `is_hybrid=False`, which runs and produces garbage.
+    ModelRegistry.register_model("Glm5NextForConditionalGeneration", _GLM5_NEXT_MODEL)
+    ModelRegistry.register_model("Glm5NextForCausalLM", _GLM5_NEXT_TEXT_MODEL)
     MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = _TPUKimiK3Config
     MODELS_CONFIG_MAP["Qwen4ExpForCausalLM"] = TPUQwen4ExpConfig

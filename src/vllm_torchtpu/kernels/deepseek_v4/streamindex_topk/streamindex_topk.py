@@ -1023,11 +1023,16 @@ def _effective_row_lengths(
     cp_rank: jax.Array | int = 0,
     cp_size: int = 1,
     interleave_c: int = 1,
+    complete_rows_only: bool = False,
 ) -> jax.Array:  # i32[num_tokens]
     """Visible compressed KV positions per token row of the score matrix.
 
     Under context parallelism the score matrix is rank-local, so the row length
     is the number of globally-visible positions that *this* rank owns.
+
+    By default a token sees the compressed row its own position falls in.
+    `complete_rows_only` hides that row until its last token is visible
+    (GLM-5.3-Flash's k-pool indexer, which scores only complete pools).
     """
     max_num_seqs = seq_lens.shape[0]
     num_seqs = distribution[2]
@@ -1041,7 +1046,10 @@ def _effective_row_lengths(
     seq_len = seq_lens[seq_ids]
     token_pos = seq_len - q_len + (token_ids - q_start)
     kv_len = seq_len // compression_ratio
-    visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
+    if complete_rows_only:
+        visible = jnp.minimum(kv_len, (token_pos + 1) // compression_ratio)
+    else:
+        visible = jnp.minimum(kv_len, token_pos // compression_ratio + 1)
     visible = cp_local_length(visible, cp_rank, cp_size, interleave_c)
     valid = token_ids < cu_q_lens[num_seqs]
     return jnp.where(valid, jnp.minimum(visible, num_positions), 0)
@@ -1063,6 +1071,7 @@ def _effective_row_lengths(
         "cp_size",
         "interleave_size",
         "return_scores",
+        "complete_rows_only",
     ),
 )
 def streamindex_topk(
@@ -1091,6 +1100,7 @@ def streamindex_topk(
     cp_rank: jax.Array | int = 0,
     interleave_size: int = 1,
     return_scores: bool = False,
+    complete_rows_only: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1150,6 +1160,10 @@ def streamindex_topk(
         what makes a cross-rank merge possible. A local top-k over a sharded KV
         axis is not the global top-k, so the merge needs the scores the same way
         the DCP attention kernels need an LSE output.
+      complete_rows_only: a token sees a compressed row only once the row's
+        last token is visible, instead of from the row's first token on.
+        Decode rows are unaffected (the incomplete row is not in the cache);
+        prefill rows lose the row they are still filling. Defaults to False.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions
@@ -1518,6 +1532,7 @@ def streamindex_topk(
             cp_rank=cp_rank,
             cp_size=cp_size,
             interleave_c=interleave_c,
+            complete_rows_only=complete_rows_only,
         )
 
         if chunk_tokens is None or max_num_tokens % chunk_tokens:
@@ -1620,7 +1635,9 @@ def streamindex_topk(
         q_abs_pos = (seq_len - q_len) + (token_idx - q_start)
         max_valid_idx = jnp.minimum(
             seq_len // compression_ratio - 1,
-            q_abs_pos // compression_ratio,
+            (q_abs_pos + 1) // compression_ratio - 1
+            if complete_rows_only
+            else q_abs_pos // compression_ratio,
         )
         max_valid_idx = jnp.where(token_idx < cu_q_lens[-1], max_valid_idx, -1)
         s_idx = jnp.arange(k, dtype=jnp.int32)[None, :]

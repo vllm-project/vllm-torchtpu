@@ -22,6 +22,7 @@ import torch
 from torch.nn import Parameter
 from torch_tpu._internal import pallas
 from vllm.config import CacheConfig, get_current_vllm_config_or_none
+from vllm.distributed import get_tp_group
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention import mla_attention
 from vllm.model_executor.layers.attention.attention import get_attention_context
@@ -1061,6 +1062,25 @@ class VllmTPUMLAAttention(MLAAttention):
             self, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
         )
         self.sparse_mla_op = impl._build_sparse_mla_op(self)
+
+        # Sequence-parallel prefill (GLM, `build_full_heads`): each rank
+        # attends its own tokens with every head, so it needs the absorbed
+        # projections of all heads, gathered once here.
+        self.sparse_mla_local_op = None
+        if getattr(self, "build_full_heads", False):
+            assert not hasattr(self, "W_UK_T_scale"), (
+                "build_full_heads does not handle quantized W_UK_T/W_UV"
+            )
+            tp_group = get_tp_group()
+            self.W_UK_T_full = fresh_buffer(
+                tp_group.all_gather(self.W_UK_T.contiguous(), dim=0)
+            )
+            self.W_UV_full = fresh_buffer(
+                tp_group.all_gather(self.W_UV.contiguous(), dim=0)
+            )
+            synchronize_tensors([self.W_UK_T_full, self.W_UV_full])
+            self.sparse_mla_local_op = impl._build_sparse_mla_local_op(self)
+            self.sparse_mla_full_op = impl._build_sparse_mla_op(self, plain=True)
 
         dcp_size = getattr(impl, "dcp_size", 1)
         self.sparse_mla_dcp_op = None

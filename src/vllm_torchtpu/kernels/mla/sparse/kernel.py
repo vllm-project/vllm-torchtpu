@@ -1094,6 +1094,8 @@ def sparse_ragged_paged_attention(
     topk_cap: int | None = None,
     q_pe: jax.Array | None = None,
     lse_lane_dense: bool = False,
+    prepared_kv_lens: jax.Array | None = None,
+    prepared_token_end: jax.Array | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
@@ -1158,6 +1160,13 @@ def sparse_ragged_paged_attention(
       lse_lane_dense: With `return_lse`, carry the log-sum-exp as f32[tokens,
         heads] through the kernel instead of f32[tokens, heads, 1] (lane-padded
         tiles). Same values.
+      prepared_kv_lens: if set, `topk_indices` already holds flat physical
+        cache rows (`prepare_gather_indices` output) and this is the matching
+        per-token valid count; `page_indices`, `cu_q_lens` and `distribution`
+        are then ignored. Lets a caller attend an arbitrary slice of a batch's
+        tokens (token-sharded prefill).
+      prepared_token_end: with `prepared_kv_lens`, the number of leading rows
+        to attend; rows past it are padding and are skipped.
 
     Returns:
       The output of attention, or `(output, lse)` when `return_lse` is set.
@@ -1257,6 +1266,7 @@ def sparse_ragged_paged_attention(
         )
 
     num_chunks = cdiv(q.shape[0], gather_and_attention_chunk_size)
+    token_end = cu_q_lens[distribution[2]]
     # With the cap, translate the top-k once per call straight into the capped
     # window-major layout, live windows only (`prepare_capped_window_indices`),
     # whenever every chunk has one static size; otherwise the full-width
@@ -1269,7 +1279,11 @@ def sparse_ragged_paged_attention(
     )
     window_indices_all = None
     chunk_window_rows = 0  # rows of `window_indices_all` per chunk
-    if window_prep:
+    if prepared_kv_lens is not None:
+        assert prepared_token_end is not None
+        kv_lens, physical_indices = prepared_kv_lens, topk_indices
+        token_end = prepared_token_end
+    elif window_prep:
         assert topk_cap is not None
         chunk_window_rows = topk // topk_cap * uniform_chunk
         kv_lens = jnp.sum(topk_indices != -1, axis=-1)
@@ -1334,7 +1348,7 @@ def sparse_ragged_paged_attention(
             lse,
             start_pos=start_pos,
             end_pos=end_pos,
-            token_end=cu_q_lens[distribution[2]],
+            token_end=token_end,
             sm_scale=sm_scale,
             k_scale=k_scale,
             attention_kernel_batch_size=attention_kernel_batch_size,

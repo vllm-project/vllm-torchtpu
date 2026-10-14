@@ -863,6 +863,7 @@ def sparse_mla_attention(
     k_scale: float | None = None,
     *,
     allow_masked_dense: bool = False,
+    write_rope: bool = True,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Sharded wrapper for the GLM-5.2 sparse (DSA) MLA Pallas kernel.
 
@@ -889,6 +890,7 @@ def sparse_mla_attention(
       allow_masked_dense: Whether masked-dense routing admitted this layer
         (`kernels.mla.dispatch.admit_layer`). A static Python bool; when false
         the layer compiles only the original sparse call.
+      write_rope: see `update_sparse_mla_kv_cache`.
 
     Returns:
       A tuple containing:
@@ -970,6 +972,7 @@ def sparse_mla_attention(
             query_start_loc_,
             nope_spec=nope_spec,
             rope_spec=rope_spec,
+            write_rope=write_rope,
         )
 
         # Opt-in masked-dense routing builds Q inside each device branch.
@@ -1017,6 +1020,298 @@ def sparse_mla_attention(
             mesh=mesh,
             in_specs=in_specs,
             out_specs=out_specs,
+            check_rep=False,
+        )
+    )(
+        ql_nope,
+        q_pe,
+        kv_c_normed,
+        k_pe,
+        kv_cache_nope,
+        kv_cache_rope,
+        topk_indices,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+    )
+    return new_kv_cache_nope, new_kv_cache_rope, output
+
+
+def token_shard_start(axis_name: str, num_shards: int, local_tokens: int) -> jax.Array:
+    """First token of this rank's slice in a token-sharded step.
+
+    The mesh index comes from an all-to-all rather than `axis_index` (see
+    `_select_replicated_shard_for_pcp_rank`): element i goes to index i, so
+    it is also the slice `all_to_all(..., split_axis=tokens)` delivers here.
+    """
+    shard = jax.lax.all_to_all(
+        jnp.arange(num_shards, dtype=jnp.int32), axis_name, 0, 0, tiled=True
+    )[0]
+    return shard * local_tokens
+
+
+def sparse_mla_attention_token_sharded(
+    ql_nope: jax.Array,
+    q_pe: jax.Array,
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    topk_indices: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    mesh: Mesh,
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+    sm_scale: float | None = None,
+    k_scale: float | None = None,
+    *,
+    axis_name: str,
+    min_tokens: int,
+    write_rope: bool = True,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """`sparse_mla_attention` with the attention sharded by token, not head.
+
+    Under TP the latent cache is replicated and the heads are sharded, so
+    every rank gathers the same `topk` rows for every token -- the gather and
+    the gathered buffer the kernel re-reads are the whole cost, and they are
+    paid `tp` times over. For a batch of at least `min_tokens` (and a multiple
+    of the TP size) this exchanges q from head shards to token shards with one
+    all-to-all, so each rank gathers for `1/tp` of the tokens and attends them
+    with all heads, then exchanges the output back. Smaller batches (decode)
+    take the plain head-sharded path. The decision is per concrete shape, so it
+    lives here rather than in the traced torch graph.
+
+    On the sharded path only this rank's rows of `topk_indices` are read, so
+    an indexer applying the same rule may leave the other rows unfilled.
+
+    `ql_nope`, `q_pe` and the output are head-sharded over `axis_name`;
+    everything else is replicated. Same return contract as
+    `sparse_mla_attention`.
+    """
+    lkv_dim, rope_dim = kv_c_normed.shape[-1], k_pe.shape[-1]
+    word_bytes = kv_cache_utils.WORD_BYTES
+    lane_bytes = kv_cache_utils.TILE_LANE_BYTES
+    assert lkv_dim == word_bytes * lane_bytes and rope_dim * 2 == lane_bytes
+    if nope_spec.layout is not rope_spec.layout:
+        raise ValueError(
+            "sparse MLA attention requires matching NoPE and RoPE layouts; "
+            f"got {nope_spec.layout.value} and {rope_spec.layout.value}"
+        )
+    cache_layout = nope_spec.layout.value
+    dequant_scale = float(k_scale) if k_scale is not None else 1.0
+    num_shards = mesh.shape[axis_name]
+
+    heads = P(None, axis_name, None)
+    in_specs = (heads, heads) + (P(),) * 9
+    out_specs = (heads, P(), P())
+
+    def _local(
+        ql_nope,
+        q_pe,
+        kv_c_normed,
+        k_pe,
+        kv_cache_nope,
+        kv_cache_rope,
+        topk_idx,
+        seq_lens_,
+        block_tables_,
+        query_start_loc_,
+        request_distribution_,
+    ):
+        kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache(
+            kv_cache_nope,
+            kv_cache_rope,
+            kv_c_normed,
+            k_pe,
+            seq_lens_,
+            block_tables_,
+            query_start_loc_,
+            nope_spec=nope_spec,
+            rope_spec=rope_spec,
+            write_rope=write_rope,
+        )
+        q = jnp.concatenate([ql_nope, q_pe], axis=-1)
+        num_tokens = q.shape[0]
+        kernel_kwargs = dict(
+            sm_scale=sm_scale or 1.0,
+            k_scale=dequant_scale,
+            cache_layout=cache_layout,
+        )
+        if num_tokens < min_tokens or num_tokens % num_shards:
+            output = sparse_mla_ragged_paged_attention(
+                q,
+                kv_cache_nope,
+                kv_cache_rope,
+                topk_idx,
+                block_tables_,
+                query_start_loc_,
+                request_distribution_,
+                **kernel_kwargs,
+            )
+            return output[..., :lkv_dim], kv_cache_nope, kv_cache_rope
+
+        local_tokens = num_tokens // num_shards
+        start = token_shard_start(axis_name, num_shards, local_tokens)
+        # Only this rank's rows of `topk_idx` are read: a token-sharded
+        # indexer (`min_tokens` is shared with it) fills nothing else.
+        # Clipping the request boundaries to the slice gives every local
+        # token its request, so the page lookup runs on the slice alone.
+        local_cu = jnp.clip(query_start_loc_ - start, 0, local_tokens)
+        kv_lens, physical = sparse_mla_kernel.prepare_gather_indices(
+            jax.lax.dynamic_slice_in_dim(topk_idx, start, local_tokens),
+            block_tables_,
+            local_cu,
+            page_size=kv_cache_nope.shape[1],
+            total_num_pages=kv_cache_nope.shape[0],
+        )
+        token_end = local_cu[request_distribution_[2]]
+        # [T, H/n, D] head shard -> [T/n, H, D] token shard. Heads arrive in
+        # mesh order and the inverse exchange below sends each block back.
+        q = jax.lax.all_to_all(q, axis_name, 0, 1, tiled=True)
+        output = sparse_mla_ragged_paged_attention(
+            q,
+            kv_cache_nope,
+            kv_cache_rope,
+            physical,
+            None,
+            query_start_loc_,
+            request_distribution_,
+            prepared_kv_lens=kv_lens,
+            prepared_token_end=token_end,
+            **kernel_kwargs,
+        )
+        output = jax.lax.all_to_all(output[..., :lkv_dim], axis_name, 1, 0, tiled=True)
+        return output, kv_cache_nope, kv_cache_rope
+
+    output, new_kv_cache_nope, new_kv_cache_rope = jax.jit(
+        shard_map.shard_map(
+            _local,
+            mesh=mesh,
+            in_specs=in_specs,
+            out_specs=out_specs,
+            check_rep=False,
+        )
+    )(
+        ql_nope,
+        q_pe,
+        kv_c_normed,
+        k_pe,
+        kv_cache_nope,
+        kv_cache_rope,
+        topk_indices,
+        seq_lens,
+        block_tables,
+        query_start_loc,
+        request_distribution,
+    )
+    return new_kv_cache_nope, new_kv_cache_rope, output
+
+
+def sparse_mla_attention_local_tokens(
+    ql_nope: jax.Array,
+    q_pe: jax.Array,
+    kv_c_normed: jax.Array,
+    k_pe: jax.Array,
+    kv_cache_nope: jax.Array,
+    kv_cache_rope: jax.Array,
+    topk_indices: jax.Array,
+    seq_lens: jax.Array,
+    block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    request_distribution: jax.Array,
+    mesh: Mesh,
+    nope_spec: SparseMLAKVCacheSpec,
+    rope_spec: SparseMLAKVCacheSpec,
+    sm_scale: float | None = None,
+    k_scale: float | None = None,
+    *,
+    axis_name: str,
+    write_rope: bool = True,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Sparse MLA for a sequence-parallel step: queries are this rank's tokens.
+
+    The caller already holds this rank's `T / tp` tokens with every head (it
+    projected q from its own token shard with replicated weights), so unlike
+    `sparse_mla_attention_token_sharded` there is no all-to-all at either end.
+    `kv_c_normed` / `k_pe` cover the whole step and are written to the
+    (replicated) cache; `topk_indices` holds this rank's rows only.
+
+    `ql_nope`, `q_pe`, `topk_indices` and the output are `[T / tp, ...]`;
+    everything else is replicated. Same return contract as
+    `sparse_mla_attention`.
+    """
+    lkv_dim, rope_dim = kv_c_normed.shape[-1], k_pe.shape[-1]
+    word_bytes = kv_cache_utils.WORD_BYTES
+    lane_bytes = kv_cache_utils.TILE_LANE_BYTES
+    assert lkv_dim == word_bytes * lane_bytes and rope_dim * 2 == lane_bytes
+    cache_layout = nope_spec.layout.value
+    dequant_scale = float(k_scale) if k_scale is not None else 1.0
+    num_shards = mesh.shape[axis_name]
+
+    def _local(
+        ql_nope,
+        q_pe,
+        kv_c_normed,
+        k_pe,
+        kv_cache_nope,
+        kv_cache_rope,
+        topk_idx,
+        seq_lens_,
+        block_tables_,
+        query_start_loc_,
+        request_distribution_,
+    ):
+        kv_cache_nope, kv_cache_rope = update_sparse_mla_kv_cache(
+            kv_cache_nope,
+            kv_cache_rope,
+            kv_c_normed,
+            k_pe,
+            seq_lens_,
+            block_tables_,
+            query_start_loc_,
+            nope_spec=nope_spec,
+            rope_spec=rope_spec,
+            write_rope=write_rope,
+        )
+        local_tokens = ql_nope.shape[0]
+        assert kv_c_normed.shape[0] == local_tokens * num_shards
+        start = token_shard_start(axis_name, num_shards, local_tokens)
+        local_cu = jnp.clip(query_start_loc_ - start, 0, local_tokens)
+        kv_lens, physical = sparse_mla_kernel.prepare_gather_indices(
+            topk_idx,
+            block_tables_,
+            local_cu,
+            page_size=kv_cache_nope.shape[1],
+            total_num_pages=kv_cache_nope.shape[0],
+        )
+        output = sparse_mla_ragged_paged_attention(
+            jnp.concatenate([ql_nope, q_pe], axis=-1),
+            kv_cache_nope,
+            kv_cache_rope,
+            physical,
+            None,
+            local_cu,
+            request_distribution_,
+            sm_scale=sm_scale or 1.0,
+            k_scale=dequant_scale,
+            cache_layout=cache_layout,
+            prepared_kv_lens=kv_lens,
+            prepared_token_end=local_cu[request_distribution_[2]],
+        )
+        return output[..., :lkv_dim], kv_cache_nope, kv_cache_rope
+
+    # Every spec is P(): the token-sharded inputs and output are this rank's
+    # arrays as they are, which keeps the torch tensors sized for the rank.
+    output, new_kv_cache_nope, new_kv_cache_rope = jax.jit(
+        shard_map.shard_map(
+            _local,
+            mesh=mesh,
+            in_specs=(P(),) * 11,
+            out_specs=(P(), P(), P()),
             check_rep=False,
         )
     )(
