@@ -2618,68 +2618,142 @@ def paged_indexer_jax(
         # 2048 x 1M a single FP32 score matrix is 8 GiB, before top-k copies.
         # Reuse the native indexer's query tile and score/selection pipeline.
         rows = q.shape[0]
-        tile = min(rows, query_tile)
-        padding = -rows % tile
         longest = lengths.max() if batch_max is None else batch_max
-        inputs = jax.tree.map(
-            lambda x: jnp.pad(x, ((0, padding),) + ((0, 0),) * (x.ndim - 1)),
-            (q, weights, lengths, candidates, requests),
-        )
+        group_tokens = -(-rows // records.shape[0])
 
-        def prepare(i):
-            return jax.tree.map(
-                lambda x: jax.lax.dynamic_slice_in_dim(x, i * tile, tile), inputs
-            )
+        def run(grouped):
+            tile = min(rows, query_tile)
+            inputs = (q, weights, lengths, candidates, requests)
+            if grouped:
+                # Keep a request's queries together and slice its records too:
+                # flat query tiles otherwise gather the same keys per query.
+                group_rows = min(records.shape[0], tile // group_tokens)
+                tile = group_rows * group_tokens
+                token_ids = jax.vmap(
+                    lambda mask: jnp.nonzero(mask, size=group_tokens, fill_value=rows)[
+                        0
+                    ]
+                )(belongs).reshape(-1)
+                token_ids = jnp.pad(
+                    token_ids, (0, -token_ids.size % tile), constant_values=rows
+                )
+                inputs = jax.tree.map(
+                    lambda x: jnp.pad(x, ((0, 1),) + ((0, 0),) * (x.ndim - 1))[
+                        token_ids
+                    ],
+                    inputs,
+                )
+                local_requests = jnp.repeat(jnp.arange(group_rows), group_tokens)
+                record_tiles = jnp.pad(
+                    records,
+                    ((0, -records.shape[0] % group_rows), (0, 0)),
+                    constant_values=-1,
+                )
+                count = token_ids.size
+            else:
+                count = rows + (-rows % tile)
+                inputs = jax.tree.map(
+                    lambda x: jnp.pad(
+                        x, ((0, count - rows),) + ((0, 0),) * (x.ndim - 1)
+                    ),
+                    inputs,
+                )
 
-        def score(args):
-            queries, row_weights, row_lengths, _, row_requests = args
-            scores = paged_index_scores_jax(
-                queries,
-                pool,
-                records,
-                row_weights,
-                row_lengths,
-                row_requests,
-                page_records,
-            )
-            return jnp.where(
-                jnp.take(records >= 0, row_requests, axis=0), scores, -jnp.inf
-            )
+            def prepare(i):
+                values = jax.tree.map(
+                    lambda x: jax.lax.dynamic_slice_in_dim(x, i * tile, tile), inputs
+                )
+                if grouped:
+                    row_records = jax.lax.dynamic_slice_in_dim(
+                        record_tiles, i * group_rows, group_rows
+                    )
+                    return (*values[:-1], local_requests, row_records)
+                return (*values, records)
 
-        def select(i, scores):
-            _, _, row_lengths, row_candidates, _ = prepare(i)
-            return select_indices_jax(
-                scores,
-                row_lengths,
-                row_candidates,
-                topk,
-                block_size,
-                candidate_write,
-                candidate_filter,
-                unordered,
-                longest,
-            )
+            def score(args):
+                queries, row_weights, row_lengths, _, row_requests, row_records = args
+                scores = paged_index_scores_jax(
+                    queries,
+                    pool,
+                    row_records,
+                    row_weights,
+                    row_lengths,
+                    row_requests,
+                    page_records,
+                )
+                return jnp.where(
+                    jnp.take(row_records >= 0, row_requests, axis=0), scores, -jnp.inf
+                )
 
-        if rows <= tile:
-            return select(jnp.int32(0), score(inputs))
+            def select(i, scores):
+                _, _, row_lengths, row_candidates, _, _ = prepare(i)
+                return select_indices_jax(
+                    scores,
+                    row_lengths,
+                    row_candidates,
+                    topk,
+                    block_size,
+                    candidate_write,
+                    candidate_filter,
+                    unordered,
+                    longest,
+                )
 
-        def write(i, selected, output):
-            return jax.tree.map(
-                lambda dst, src: jax.lax.dynamic_update_slice_in_dim(
-                    dst, src, i * tile, axis=0
+            if not grouped and rows <= tile:
+                return select(jnp.int32(0), score(prepare(jnp.int32(0))))
+
+            def write(i, selected, output):
+                if grouped:
+                    ids = jax.lax.dynamic_slice_in_dim(token_ids, i * tile, tile)
+                    return jax.tree.map(
+                        lambda dst, src: dst.at[ids].set(src, mode="drop"),
+                        output,
+                        selected,
+                    )
+                return jax.tree.map(
+                    lambda dst, src: jax.lax.dynamic_update_slice_in_dim(
+                        dst, src, i * tile, axis=0
+                    ),
+                    output,
+                    selected,
+                )
+
+            if grouped:
+                # Zero-length queries were omitted from the request groups.
+                published = (
+                    jnp.full_like(candidates, -1)
+                    if candidate_write
+                    and candidates.shape[1] * block_size < records.shape[1]
+                    else candidates
+                )
+            else:
+                published = jnp.zeros((count, candidates.shape[1]), candidates.dtype)
+            output = (
+                jnp.full(
+                    (rows if grouped else count, min(topk, records.shape[1])),
+                    -1,
+                    jnp.int32,
                 ),
-                output,
-                selected,
+                published,
             )
+            selected, published = indexer.pipeline_score_topk(
+                count // tile, prepare, score, select, write, output
+            )
+            return selected[:rows], published[:rows]
 
-        output = (
-            jnp.full((rows + padding, min(topk, records.shape[1])), -1, jnp.int32),
-            jnp.zeros((rows + padding, candidates.shape[1]), candidates.dtype),
-        )
-        selected, published = indexer.pipeline_score_topk(
-            (rows + padding) // tile, prepare, score, select, write, output
-        )
-        return selected[:rows], published[:rows]
+        if (
+            page_records is not None
+            and q.dtype == jnp.bfloat16
+            and q.shape[-1] == index_word_scores.DIM
+            and records.shape[0] > 1
+            and 1 < group_tokens <= min(query_tile, _INDEX_MAX_SHARED_QUERIES)
+        ):
+            belongs = (jnp.arange(records.shape[0])[:, None] == requests) & (
+                lengths > 0
+            )
+            fits = jnp.all(belongs.sum(axis=1) <= group_tokens)
+            return jax.lax.cond(fits, lambda _: run(True), lambda _: run(False), None)
+        return run(False)
 
     def full_context(_):
         columns, query_tile = tuned_block_sizes.PAGED_INDEXER_PREFILL_BUCKET

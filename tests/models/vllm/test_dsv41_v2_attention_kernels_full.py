@@ -1962,6 +1962,112 @@ def test_paged_indexer_query_tiles_preserve_selection(
     assert score_rows and max(score_rows) <= attention_kernels.indexer.QUERY_TILE
 
 
+@pytest.mark.parametrize(
+    "mode,banks,layout,request_count,candidate_width",
+    [
+        ("plain", 1, "balanced", 48, 4),
+        ("publish", 2, "balanced", 48, 4),
+        ("filter", 2, "shuffled", 49, 4),
+        ("plain", 2, "uneven", 48, 4),
+        ("publish", 2, "empty", 48, 4),
+        ("publish", 1, "empty", 48, 8),
+    ],
+)
+def test_paged_indexer_query_tiles_share_request_keys(
+    monkeypatch, mode, banks, layout, request_count, candidate_width
+):
+    """Six-query requests share keys across tile boundaries and restore row order."""
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
+        _pack_bf16_words,
+        gather_cache_values,
+        split_halves,
+    )
+
+    rng = np.random.default_rng(31)
+    rows, width, page, topk = 8 * request_count, 128, 16, 16
+    keys = jnp.asarray(rng.standard_normal((request_count * width, 128)), jnp.bfloat16)
+    pool = _pack_bf16_words(keys).reshape(-1, 128)
+    if banks == 2:
+        pool = tuple(jnp.split(pool, 2))
+    records = jnp.arange(request_count * width, dtype=jnp.int32).reshape(
+        request_count, width
+    )
+    records = records.at[3, -page:].set(-1)
+    requests = np.pad(np.repeat(np.arange(request_count), 6), (0, 2 * request_count))
+    lengths = np.pad(
+        rng.integers(32, width + 1, 6 * request_count), (0, 2 * request_count)
+    )
+    if layout == "shuffled":
+        order = rng.permutation(rows)
+        requests, lengths = requests[order], lengths[order]
+    elif layout == "uneven":
+        requests[:24] = 0
+    elif layout == "empty":
+        lengths[:] = 0
+    requests, lengths = (
+        jnp.asarray(requests, jnp.int32),
+        jnp.asarray(lengths, jnp.int32),
+    )
+    q = jnp.asarray(rng.standard_normal((rows, 2, 128)), jnp.bfloat16)
+    weights = jnp.asarray(rng.random((rows, 2)), jnp.float32)
+    candidates = jnp.tile(jnp.arange(candidate_width, dtype=jnp.int32), (rows, 1))
+    token_records = records[requests]
+    dense_keys = gather_cache_values(
+        pool, token_records.reshape(-1), 128, split=True
+    ).reshape(rows, width, 128)
+    logits = jnp.einsum(
+        "thd,tcd->thc", split_halves(q), dense_keys, preferred_element_type=jnp.float32
+    )
+    scores = (jnp.maximum(logits, 0) * weights[:, :, None]).sum(1)
+    scores = jnp.where(token_records >= 0, scores, -jnp.inf)
+    expected = select_indices_jax(
+        scores, lengths, candidates, topk, page, mode == "publish", mode == "filter"
+    )
+    gathered_keys, score_rows = [], []
+    original_gather = attention_kernels.gather_cache_page_words
+    original_score = attention_kernels.paged_index_scores_jax
+
+    def record_gather(pool, first_records, page_records, dim):
+        jax.debug.callback(
+            lambda count: gathered_keys.append(int(count)),
+            first_records.size * page_records,
+            ordered=True,
+        )
+        return original_gather(pool, first_records, page_records, dim)
+
+    def record_score(queries, *args, **kwargs):
+        score_rows.append(queries.shape[0])
+        return original_score(queries, *args, **kwargs)
+
+    monkeypatch.setattr(attention_kernels, "gather_cache_page_words", record_gather)
+    monkeypatch.setattr(attention_kernels, "paged_index_scores_jax", record_score)
+    actual = jax.jit(
+        lambda: paged_indexer_jax(
+            q,
+            pool,
+            records,
+            weights,
+            lengths,
+            candidates,
+            requests,
+            topk,
+            page,
+            mode == "publish",
+            mode == "filter",
+            page_records=page,
+        )
+    )()
+    for result, reference in zip(actual, expected, strict=True):
+        np.testing.assert_array_equal(result, reference)
+    jax.effects_barrier()
+    assert score_rows and max(score_rows) <= attention_kernels.indexer.QUERY_TILE
+    if layout != "uneven":
+        # One key stream per request, including the final padded request tile.
+        request_tile = attention_kernels.indexer.QUERY_TILE // 8
+        padded_requests = -(-request_count // request_tile) * request_tile
+        assert sum(gathered_keys) <= padded_requests * width
+
+
 @pytest.mark.parametrize("length", [0, 127, 128, 129, 255])
 @pytest.mark.parametrize("banks", [1, 2])
 def test_paged_indexer_context_bucket_preserves_boundary_and_fallback(
