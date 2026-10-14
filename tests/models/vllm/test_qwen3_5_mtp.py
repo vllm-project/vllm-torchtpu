@@ -12,6 +12,19 @@ def test_qwen35_mtp_drafts_declare_pipeline_support():
     assert supports_pp(Qwen3_5MoeMTP)
 
 
+def test_qwen35_mtp_drafts_accept_the_upstream_constructor_assignment():
+    """Upstream's `__init__` sets `make_empty_intermediate_tensors` on the
+    instance; a read-only property on the subclass would make every Qwen3.5
+    MTP draft fail to construct ("property ... has no setter")."""
+    import torch
+
+    for cls in (Qwen3_5MTP, Qwen3_5MoeMTP):
+        draft = cls.__new__(cls)
+        torch.nn.Module.__init__(draft)
+        draft.make_empty_intermediate_tensors = lambda *args: None
+        assert callable(draft.make_empty_intermediate_tensors)
+
+
 def test_qwen35_mtp_drafts_are_registered_over_upstream():
     register_models()
     for arch, cls in (("Qwen3_5MTP", Qwen3_5MTP), ("Qwen3_5MoeMTP", Qwen3_5MoeMTP)):

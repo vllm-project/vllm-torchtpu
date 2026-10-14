@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import torch
 from vllm.v1.outputs import DraftTokenIds
 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+
+from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 
 if TYPE_CHECKING:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
@@ -212,22 +214,39 @@ class SpeculativeDecodingManager:
             )
             return None
         elif self.runner._is_async_drafter:
-            result = self.runner._async_drafter.propose(
-                sampled_token_ids[:num_reqs]
-                if sampled_token_ids
-                else sampled_token_ids,
-                discard_sampled_tokens_req_indices or [],
-                num_rejected_tokens_np,
-                scheduler_output,
-                return_device=return_device,
-                next_tokens_per_chunk=next_tokens_per_chunk,
-                device_seed=device_seed,
+            drafter = self.runner._async_drafter
+            sampled = (
+                sampled_token_ids[:num_reqs] if sampled_token_ids else sampled_token_ids
             )
+            discard = discard_sampled_tokens_req_indices or []
+            if isinstance(drafter, DFlashProposer):
+                # Bucketed drafters take one seed tensor per chunk.
+                assert device_seed is None or isinstance(device_seed, list)
+                result = drafter.propose(
+                    sampled,
+                    discard,
+                    num_rejected_tokens_np,
+                    scheduler_output,
+                    return_device=return_device,
+                    next_tokens_per_chunk=next_tokens_per_chunk,
+                    device_seed=device_seed,
+                )
+            else:
+                assert device_seed is None or isinstance(device_seed, torch.Tensor)
+                result = drafter.propose(
+                    sampled,
+                    discard,
+                    num_rejected_tokens_np,
+                    scheduler_output,
+                    return_device=return_device,
+                    next_tokens_per_chunk=next_tokens_per_chunk,
+                    device_seed=device_seed,
+                )
             if return_device:
                 assert isinstance(result, torch.Tensor | list)
                 return result
             assert isinstance(result, list)
-            self._draft_token_ids = result
+            self._draft_token_ids = cast("list[list[int]]", result)
             return None
         else:
             raise NotImplementedError(

@@ -2639,19 +2639,24 @@ class TPUModelRunner(GPUModelRunner):
         return placeholder_req_id_to_index
 
     def _sync_replicated_drafts_across_tp(
-        self, drafts: torch.Tensor | None
-    ) -> torch.Tensor | None:
+        self, drafts: torch.Tensor | list[torch.Tensor] | None
+    ) -> torch.Tensor | list[torch.Tensor] | None:
         """Pin a replicated drafter's device proposal to rank 0's on every rank.
 
         Broadcast emulated as mask + all_reduce (tpu_dist has no broadcast);
         tiny (num_reqs x K int32), fully on device. No-ops for a sharded
-        drafter, TP=1, the sync host-list form, and empty steps.
+        drafter, TP=1, the sync host-list form, and empty steps. Bucketed
+        drafters hand over one tensor per chunk; each is pinned.
         """
+        if drafts is None:
+            return None
         if isinstance(drafts, list):
-            # Bucketed per-chunk drafts: pin each chunk.
-            return [self._sync_replicated_drafts_across_tp(d) for d in drafts]
-        if drafts is None or not isinstance(drafts, torch.Tensor):
+            return [self._sync_one_replicated_draft(d) for d in drafts]
+        if not isinstance(drafts, torch.Tensor):
             return drafts
+        return self._sync_one_replicated_draft(drafts)
+
+    def _sync_one_replicated_draft(self, drafts: torch.Tensor) -> torch.Tensor:
         if (
             self.speculative_config is None
             or self.speculative_config.draft_tensor_parallel_size != 1
@@ -4795,7 +4800,7 @@ class TPUModelRunner(GPUModelRunner):
                     # padded tail on device (no exact-count slice here).
                     device_seed = [sel.view(-1) for sel in combined_selected_tokens]
                 else:
-                    device_seed = torch.cat(
+                    flat_seed = torch.cat(
                         [
                             sel.view(-1)[:n]
                             for sel, n in zip(
@@ -4804,13 +4809,15 @@ class TPUModelRunner(GPUModelRunner):
                             )
                         ]
                     )
-                if self._mtp_prefill_only:
-                    # The producer's sample at the prompt boundary is thrown
-                    # away; the draft row there takes the token the consumer
-                    # computes, carried by this step's published send.
-                    device_seed = handoff_seed_tokens(
-                        device_seed, req_ids, scheduler_output.kv_connector_metadata
-                    )
+                    if self._mtp_prefill_only:
+                        # The producer's sample at the prompt boundary is
+                        # thrown away; the draft row there takes the token the
+                        # consumer computes, carried by this step's published
+                        # send.
+                        flat_seed = handoff_seed_tokens(
+                            flat_seed, req_ids, scheduler_output.kv_connector_metadata
+                        )
+                    device_seed = flat_seed
                 with self._stage_timing.stage("draft_propose"):
                     eagle3_drafts = self.spec_decode_manager.propose_draft_token_ids(
                         sampled_token_ids=[],
