@@ -61,6 +61,7 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
     pcp_streaming_jax_op,
 )
 from vllm_torchtpu.kernels.mla import kv_cache_utils
+from vllm_torchtpu.kernels.mla.absorb_q import absorb_q
 from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     KVCacheLayout,
     KVCacheType,
@@ -100,6 +101,15 @@ from vllm_torchtpu.tpu_info import get_chip_version
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
+
+
+def _fake_absorb_q(q_nope: torch.Tensor, w_uk_t: torch.Tensor) -> torch.Tensor:
+    return q_nope.new_empty((*q_nope.shape[:2], w_uk_t.shape[2]))
+
+
+# Registered at import: Dynamo cannot trace a lock-guarded registration.
+_absorb_q = pallas.jax_op("pallas::mla_absorb_q", absorb_q)
+_absorb_q.register_fake(_fake_absorb_q)
 
 # TPU requires the head size to be a multiple of 128.
 TPU_HEAD_SIZE_ALIGNMENT = 128
@@ -2397,16 +2407,14 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         # Evaluate projection matrices directly across input precision
         # (`bfloat16`/`float16`/`fp8`) without dynamic `.to(torch.float32)` casting
         # right before `torch.bmm`.
-        q_nope_t = q_nope.transpose(0, 1)
-        w_uk_t = (
-            w_uk_t_src.to(q_nope_t.dtype)
-            if w_uk_t_src.dtype != q_nope_t.dtype
-            else w_uk_t_src
-        )
-        ql_nope = torch.bmm(q_nope_t, w_uk_t)
-        if w_uk_t_scale is not None:
-            ql_nope = ql_nope * w_uk_t_scale
-        ql_nope = ql_nope.transpose(0, 1).to(input_dtype)
+        if q_nope.device.type == "tpu" and w_uk_t_scale is None:
+            ql_nope = _absorb_q(q_nope, w_uk_t_src.to(q_nope.dtype)).to(input_dtype)
+        else:
+            q_nope_t = q_nope.transpose(0, 1)
+            ql_nope = torch.bmm(q_nope_t, w_uk_t_src.to(q_nope_t.dtype))
+            if w_uk_t_scale is not None:
+                ql_nope = ql_nope * w_uk_t_scale
+            ql_nope = ql_nope.transpose(0, 1).to(input_dtype)
 
         q_scale, k_scale, v_scale = self._get_kv_scales(layer)
 
