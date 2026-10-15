@@ -18,6 +18,8 @@ fi
 export TMPDIR=/tmp/tpu_logs/tmp
 export PIP_CACHE_DIR=/tmp/tpu_logs/pip-cache UV_CACHE_DIR=/tmp/tpu_logs/uv-cache
 export PYTHONUNBUFFERED=1 PYTHONNOUSERSITE=1
+# The shared CI image preloads tcmalloc; heap trimming requires glibc malloc.
+export TPU_RECLAIM_COMPILE_MEMORY=0
 mkdir -p "$TMPDIR" "$results" /local_hf_cache/dsv41-ci
 exec > >(tee "$results/task.log") 2>&1
 scratch=$(mktemp -d "$TMPDIR/dsv41-dp8.XXXXXX")
