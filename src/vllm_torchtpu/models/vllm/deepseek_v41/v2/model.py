@@ -319,11 +319,10 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 # hash still has to reach them.
                 engram_hashes, engram_mask = self.engram_hash.dummy_hashes(input_ids)
             if engram_hashes is not None and not skip_lookup:
-                # Gather all Engram rows before entering the decoder layers.
-                # One gather feeds every layer sharing the DP-split table.
+                # Shared CPU tables need only this rank's hashes. Device tables
+                # retain the upstream gather for DP-sharded lookup.
                 if self._has_cpu_offloaded_engram():
-                    # Idle/decode replicas may hash on device while a prefill
-                    # replica hashes on host. All must use the CPU collective.
+                    # DSpark can produce device hashes; CPU lookup needs D2H.
                     engram_hashes = engram_hashes.to("cpu")
                 gathered_hashes = gather_host_engram_hashes(
                     engram_hashes,
@@ -775,6 +774,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             device_hooks(torch.cuda, Stream=lambda: None),
         ):
             super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self.engram_dp_shared_memory |= self._has_cpu_offloaded_engram()
         spec_cfg = getattr(vllm_config, "speculative_config", None)
         if spec_cfg is None or getattr(spec_cfg, "method", None) != "mtp":
             # Upstream allocates _mtp_hidden_buffer whenever use_eagle() is
@@ -876,7 +876,7 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
         return super().forward(*args, **kwargs)
 
     def __init__(self, *, vllm_config, prefix=""):
-        # Limit DP to the node-local host-sharded topology implemented here.
+        # Limit DP to the node-local shared host-table topology implemented here.
         parallel = vllm_config.parallel_config
         if parallel.pipeline_parallel_size != 1:
             raise NotImplementedError("V4.1 TPU currently requires PP1")
@@ -891,7 +891,7 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
                 )
             if vllm_config.engram_config.dp_shared_memory:
                 raise NotImplementedError(
-                    "V4.1 TPU DP uses head-sharded host Engram tables; "
+                    "V4.1 TPU shares CPU Engram tables without CUDA UVA; "
                     "set engram_config.dp_shared_memory=False"
                 )
             if upstream.get_engram_dp_size() != parallel.data_parallel_size:

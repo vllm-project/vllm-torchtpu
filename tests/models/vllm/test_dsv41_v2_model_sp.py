@@ -827,6 +827,7 @@ def test_finalize_mhc_broadcast_weights(monkeypatch: pytest.MonkeyPatch):
 def test_model_init_validation_and_ced_setup(monkeypatch: pytest.MonkeyPatch):
     def fake_super_init(self: Any, *, vllm_config: Any, prefix: str = "") -> None:
         torch.nn.Module.__init__(self)
+        self.engram_dp_shared_memory = False
         self.use_sequence_parallel = bool(v2_model._use_sequence_parallel(vllm_config))
         self.config = SimpleNamespace(num_hidden_layers=4, hidden_size=16)
         self.start_layer = 0
@@ -840,6 +841,10 @@ def test_model_init_validation_and_ced_setup(monkeypatch: pytest.MonkeyPatch):
             )
             for i in range(4)
         ]
+        if getattr(vllm_config, "_test_host_offload", False):
+            self.layers[0].engram = SimpleNamespace(
+                embed_tokens=SimpleNamespace(host_offload=True)
+            )
 
     monkeypatch.setattr(v2_model.upstream.DeepseekV4Model, "__init__", fake_super_init)
     monkeypatch.setattr(v2_model, "initialize_cache_ops", lambda: None)
@@ -870,6 +875,11 @@ def test_model_init_validation_and_ced_setup(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(v2_model.envs, "TPU_DEEPSEEK_V41_CED", True)
     m = v2_model.DeepseekV41Model(vllm_config=vllm_cfg)
     assert m._ced_enabled is False
+    assert m.engram_dp_shared_memory is False
+    vllm_cfg._test_host_offload = True
+    shared = v2_model.DeepseekV41Model(vllm_config=vllm_cfg)
+    assert shared.engram_dp_shared_memory is True
+    vllm_cfg._test_host_offload = False
 
     # 3. CED with prefill_context_parallel_size != 1 -> NotImplementedError
     vllm_cfg.cache_config.enable_prefix_caching = False
@@ -895,7 +905,9 @@ def test_model_init_validation_and_ced_setup(monkeypatch: pytest.MonkeyPatch):
     # 5. CED with decoder engram layers -> NotImplementedError
     def fake_super_dec_engram(self: Any, *, vllm_config: Any, prefix: str = "") -> None:
         fake_super_init(self, vllm_config=vllm_config, prefix=prefix)
-        self.layers[3].engram = SimpleNamespace()
+        self.layers[3].engram = SimpleNamespace(
+            embed_tokens=SimpleNamespace(host_offload=False)
+        )
 
     monkeypatch.setattr(
         v2_model.upstream.DeepseekV4Model, "__init__", fake_super_dec_engram

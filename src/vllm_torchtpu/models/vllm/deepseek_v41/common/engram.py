@@ -16,9 +16,12 @@ from vllm_torchtpu.layers.adapter.upstream_bindings import (
     bind_device_ops,
     device_hooks,
 )
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.model_loader_patches import register_row_slice
 
-from .host_exchange import exchange_rows
+from .host_storage import HostSharedEngramStorage
+
+logger = init_logger(__name__)
 
 
 class NgramHashState(upstream.NgramHashState):
@@ -253,7 +256,11 @@ def _load_local_rows(param: torch.Tensor, loaded_weight: torch.Tensor) -> None:
 
 
 class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
-    """Reuse upstream head sharding and checkpoint loaders; support Host DRAM."""
+    """TP-sharded heads, with one CPU table shared across node-local DP ranks.
+
+    Each DP rank loads disjoint rows into the shared table, then reads every
+    TP-local head for its own tokens without DP hash/embedding collectives.
+    """
 
     @staticmethod
     def _weight_loader(param, loaded_weight):
@@ -295,10 +302,59 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
             upstream.set_weight_attrs(
                 self.weight_scale_inv, {"dummy_weight_value": 127}
             )
+        self.load_row_slice = (self.vocab_start_idx, self.part_num_embeddings)
+        if isinstance(self._shared_memory, HostSharedEngramStorage):
+            group = self._shared_memory.group
+            start = self.part_num_embeddings * group.rank_in_group // group.world_size
+            end = (
+                self.part_num_embeddings * (group.rank_in_group + 1) // group.world_size
+            )
+            assert end > start, "Engram table has fewer rows than loading ranks"
+            self.load_row_slice = (self.vocab_start_idx + start, end - start)
+            logger.info(
+                "Engram shared CPU table: %d rows x %d, %.2f GiB across %d DP "
+                "ranks; rank %d loads rows [%d, %d), lookup heads=%d",
+                self.part_num_embeddings,
+                self.dim,
+                self.part_num_embeddings
+                * (self.dim + self.dim // self.block_size)
+                / 1024**3,
+                group.world_size,
+                group.rank_in_group,
+                self.load_row_slice[0],
+                self.load_row_slice[0] + self.load_row_slice[1],
+                self.part_n_hash_cols,
+            )
+
+    def _get_shard_info(self) -> tuple[int, int]:
+        if self.host_offload:
+            self.dp_size = 1
+            return self.tp_size, upstream.get_tensor_model_parallel_rank()
+        return super()._get_shard_info()
+
+    def _load_shared_weight(
+        self, param: torch.Tensor, loaded_weight: torch.Tensor
+    ) -> None:
+        start, rows = self.load_row_slice
+        if loaded_weight.shape[0] != rows:
+            loaded_weight = loaded_weight.narrow(0, start, rows)
+        destination = param.narrow(0, start - self.vocab_start_idx, rows)
+        _load_local_rows(destination, loaded_weight)
+        assert isinstance(self._shared_memory, HostSharedEngramStorage)
+        # Loading order can differ; the final call fences all table publications.
+        torch.distributed.barrier(group=self._shared_memory.group.cpu_group)
 
     def _allocate_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
         if not self.host_offload:
             return super()._allocate_weights()
+        group = upstream.get_engram_dp_group()
+        if group is not None and group.world_size > 1:
+            storage = HostSharedEngramStorage(
+                self.part_num_embeddings, self.dim, self.block_size, group
+            )
+            self._shared_memory = storage
+            self._weight_loader = self._load_shared_weight
+            return storage.weight, storage.weight_scale_inv
         return (
             torch.empty(
                 self.part_num_embeddings,
@@ -447,14 +503,13 @@ class Engram(upstream.Engram):
             layout.head_dim,
             tuple(size for order in layout.primes[layer_hash_index] for size in order),
         )
-        # Each table is ~98 GB in one tensor, over the Run:AI streamer's
-        # per-tensor memory limit, and a rank keeps only its heads' rows.
+        # Parallel loading stays row-sharded even when lookup sees the full table:
+        # a complete checkpoint tensor can exceed the streamer's memory limit.
         layer_id = layout.layer_ids[layer_hash_index]
         for leaf in ("weight", "scale"):
             register_row_slice(
                 f"layers.{layer_id}.engram.embed.{leaf}",
-                embedding.vocab_start_idx,
-                embedding.part_num_embeddings,
+                *embedding.load_row_slice,
             )
         return embedding
 
@@ -479,7 +534,7 @@ class Engram(upstream.Engram):
             # layer (`_unpack_bytes`): a 3-D uint8 `copy_()` takes TorchTPU's
             # slow XlaLinearize path (~9.75 vs ~0.59 ms/layer),
             # and packing raw + scale halves PJRT H2D transfers per step.
-            cols = self.embed_tokens.part_n_hash_cols * self.embed_tokens.dp_size
+            cols = self.embed_tokens.part_n_hash_cols
             blocks = head_dim // self.embed_tokens.block_size
             assert head_dim % 4 == 0, head_dim
             raw_words_per_tok = (cols * head_dim) // 4
@@ -539,34 +594,14 @@ class Engram(upstream.Engram):
 
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
         if self._staged_raw is not None:
-            dp_size = self.embed_tokens.dp_size
-            num_tokens, remainder = divmod(hash_ids.shape[0], dp_size)
-            if remainder or num_tokens > self._host_raw.shape[0]:
-                raise ValueError("Engram hashes exceed the configured DP staging slots")
-            if dp_size > 1:
-                # Lookup and redistribution stay on CPU. A device all-gather
-                # here would materialize DP copies of every replica's rows.
-                cols = self.embed_tokens.part_n_hash_cols
-                raw = torch.empty(
-                    (hash_ids.shape[0], cols, self._host_raw.shape[-1]),
-                    dtype=torch.uint8,
-                    device="cpu",
+            num_tokens = hash_ids.shape[0]
+            if num_tokens > self._host_raw.shape[0]:
+                raise ValueError(
+                    "Engram hashes exceed the configured host staging slots"
                 )
-                scales = torch.empty(
-                    (hash_ids.shape[0], cols, self._host_scale.shape[-1]),
-                    dtype=torch.uint8,
-                    device="cpu",
-                )
-                self.embed_tokens.gather_raw(hash_ids, raw, scales)
-                group = upstream.get_engram_dp_group()
-                assert group is not None and group.world_size == dp_size
-                raw, scales = exchange_rows(raw, scales, group.cpu_group, dp_size)
-                self._host_raw[:num_tokens].copy_(raw)
-                self._host_scale[:num_tokens].copy_(scales)
-            else:
-                self.embed_tokens.gather_raw(
-                    hash_ids, self._host_raw[:num_tokens], self._host_scale[:num_tokens]
-                )
+            self.embed_tokens.gather_raw(
+                hash_ids, self._host_raw[:num_tokens], self._host_scale[:num_tokens]
+            )
             _, cols, head_dim = self._host_raw.shape
             blocks = self._host_scale.shape[-1]
             raw_words = num_tokens * ((cols * head_dim) // 4)

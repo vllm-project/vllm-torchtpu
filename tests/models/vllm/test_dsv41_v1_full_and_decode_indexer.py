@@ -1847,6 +1847,8 @@ class TestV1Model:
 
         def make_base_model():
             m = object.__new__(v1_model.DeepseekV41Model)
+            m.engram_dp_shared_memory = False
+            m.start_layer = 0
             m.config = SimpleNamespace(num_hidden_layers=4)
             m.layers = [mock.MagicMock() for _ in range(4)]
             for lyr in m.layers:
@@ -1896,7 +1898,9 @@ class TestV1Model:
 
             # 3. CED enabled: engram in decoder -> raises NotImplementedError
             m3 = make_base_model()
-            m3.layers[2].engram = "engram"
+            m3.layers[2].engram = SimpleNamespace(
+                embed_tokens=SimpleNamespace(host_offload=False)
+            )
             with pytest.raises(
                 NotImplementedError, match="Engram layers in the encoder"
             ):

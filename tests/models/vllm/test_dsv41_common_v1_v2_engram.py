@@ -421,6 +421,8 @@ class TestParallelEngramEmbedding:
             nn.Module.__init__(self)
             self.weight = nn.Parameter(torch.empty(1))
             self.weight_scale_inv = None
+            self.vocab_start_idx = 0
+            self.part_num_embeddings = 1
 
         monkeypatch.setattr(
             common_engram.upstream.ParallelEngramEmbedding,

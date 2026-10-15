@@ -1459,6 +1459,7 @@ class TestModelInitAndWeights:
     def test_model_init_validation_and_ced_setup(self) -> None:
         def fake_super_init(self: Any, *, vllm_config: Any, prefix: str = "") -> None:
             torch.nn.Module.__init__(self)
+            self.engram_dp_shared_memory = False
             self.use_sequence_parallel = getattr(
                 vllm_config, "_test_use_sequence_parallel", False
             )
@@ -1631,7 +1632,9 @@ class TestModelInitAndWeights:
             self: Any, *, vllm_config: Any, prefix: str = ""
         ) -> None:
             fake_super_init(self, vllm_config=vllm_config, prefix=prefix)
-            self.layers[3].engram = SimpleNamespace()
+            self.layers[3].engram = SimpleNamespace(
+                embed_tokens=SimpleNamespace(host_offload=False)
+            )
 
         with (
             patch("vllm_torchtpu.envs.TPU_DEEPSEEK_V41_CED", True),

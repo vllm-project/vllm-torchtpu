@@ -539,11 +539,11 @@ class TestEngramModuleStagingAndEmbed:
         engram.embed_tokens = embed_tokens
         return engram
 
-    def test_dp_staging_uploads_only_local_tokens(self, monkeypatch):
+    def test_shared_table_stages_local_tokens_without_collectives(self, monkeypatch):
         from vllm_torchtpu.models.vllm.deepseek_v41.common import engram as common
 
         engram = self._create_mock_engram(cpu_offload=True)
-        engram.embed_tokens.dp_size = 8
+        engram.embed_tokens.part_n_hash_cols = 16
         engram.embed_tokens.n_hash_cols = 16
         engram._init_staging(max_tokens=16, head_dim=32)
         assert engram._host_raw.shape == (16, 16, 32)
@@ -552,20 +552,16 @@ class TestEngramModuleStagingAndEmbed:
         monkeypatch.setattr(common.upstream, "get_engram_dp_group", lambda: group)
 
         def gather(ids, raw, scales):
-            assert raw.shape == (ids.shape[0], 2, 32)
+            assert raw.shape == (ids.shape[0], 16, 32)
             raw.fill_(56)  # E4M3 1.0
             scales.fill_(127)
 
-        def exchange(raw, scales, cpu_group, size):
-            assert cpu_group is group.cpu_group and size == 8
-            # Exchange correctness is covered by the real Gloo regression.
-            tokens = raw.shape[0] // size
-            return raw[:tokens].repeat(1, size, 1), scales[:tokens].repeat(1, size, 1)
-
         engram.embed_tokens.gather_raw = gather
-        monkeypatch.setattr(common, "exchange_rows", exchange)
+        collective = MagicMock(side_effect=AssertionError("unexpected collective"))
+        monkeypatch.setattr(torch.distributed, "all_to_all_single", collective)
+        monkeypatch.setattr(torch.distributed, "all_gather_into_tensor", collective)
         for tokens in (16, 8, 16):
-            engram.prepare_embeddings(torch.zeros(tokens * 8, 16, dtype=torch.int32))
+            engram.prepare_embeddings(torch.zeros(tokens, 16, dtype=torch.int32))
             rows = engram._ready_rows(tokens)
             assert rows.shape == (tokens, 16, 32)
             assert torch.equal(rows, torch.ones_like(rows))

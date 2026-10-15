@@ -453,6 +453,10 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             device_hooks(torch.cuda, Stream=lambda: None),
         ):
             super().__init__(vllm_config=vllm_config, prefix=prefix)
+        self.engram_dp_shared_memory |= any(
+            layer.engram is not None and layer.engram.embed_tokens.host_offload
+            for layer in islice(self.layers, self.start_layer, self.end_layer)
+        )
         compact_rope_caches(
             (layer.attn for layer in self.layers),
             vllm_config.model_config.max_model_len,
