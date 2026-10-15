@@ -7632,13 +7632,20 @@ class TPUModelRunner(GPUModelRunner):
         token_ids = sampled_tokens.to(torch.int64)
         token_logits = logits.gather(-1, token_ids)
         token_ranks = (logits >= token_logits).sum(dim=-1, dtype=torch.int32)
-        log_probs = logits.log_softmax(dim=-1, dtype=torch.float32)
-        token_logprobs = log_probs.gather(-1, token_ids)
+        # Normalize in FP32: a BF16 logsumexp/subtraction can round the selected
+        # token's logprob to 0.0 and make the top-k probabilities sum to > 1.
+        # Only the [N, 1] normalizer is materialized in FP32; the upcast feeds
+        # straight into the reduction and the FP32 subtraction is done on the
+        # gathered [N, k] values rather than on a full-vocab log_softmax.
+        log_normalizers = torch.logsumexp(
+            logits.to(torch.float32), dim=-1, keepdim=True
+        )
+        token_logprobs = token_logits.to(torch.float32) - log_normalizers
 
         max_logprobs = self.model_config.max_logprobs
         if max_logprobs > 0:
-            topk_indices = torch.topk(logits, max_logprobs, dim=-1).indices
-            topk_logprobs = log_probs.gather(-1, topk_indices)
+            topk_logits, topk_indices = torch.topk(logits, max_logprobs, dim=-1)
+            topk_logprobs = topk_logits.to(torch.float32) - log_normalizers
             logprob_token_ids = torch.cat((token_ids, topk_indices), dim=1)
             logprobs = torch.cat((token_logprobs, topk_logprobs), dim=1)
         else:
