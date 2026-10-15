@@ -43,10 +43,11 @@ RUN --mount=type=cache,target=/opt/cargo/registry \
 FROM python:3.12-slim-bookworm AS base
 
 # curl for health checks, git so uv can clone the vllm source dependency, the
-# toolchain for packages that build from source, and libgoogle-perftools4 for
-# the tcmalloc allocator enabled below. build-essential already pulls in gcc,
+# toolchain for packages that build from source, libgoogle-perftools4 for
+# the tcmalloc allocator enabled below, and numactl for vLLM's --numa-bind, which
+# launches each worker under it. build-essential already pulls in gcc,
 # g++, make and libc6-dev.
-RUN apt-get update && apt-get install -y curl git build-essential cmake ninja-build libgoogle-perftools4 && rm -rf /var/lib/apt/lists/*
+RUN apt-get update && apt-get install -y curl git build-essential cmake ninja-build libgoogle-perftools4 numactl && rm -rf /var/lib/apt/lists/*
 
 # tcmalloc for every derived image. Set after the install above, so that
 # intermediate steps do not fail preloading a library that is not there yet.
