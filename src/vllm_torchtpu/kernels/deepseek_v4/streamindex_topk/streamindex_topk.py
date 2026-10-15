@@ -247,18 +247,33 @@ def kernel(
 
     # The schedule holds every chunk's steps back to back, so this chunk starts
     # where the chunks before it end and runs `num_steps[chunk_idx]` steps.
-    step_offset = sum(metadata_ref.num_steps[m] for m in range(chunk_idx))
+    if metadata_ref is None:
+        assert q_hbm_ref.shape[0] == seq_batch_size == static_q_len == cp_size == 1
+        assert chunk_idx == 0
+        step_offset = 0
+        num_steps = jnp.maximum(
+            1, pl.cdiv(seq_lens_ref[0] // compression_ratio, bkv_sz)
+        )
+    else:
+        step_offset = sum(metadata_ref.num_steps[m] for m in range(chunk_idx))
+        num_steps = metadata_ref.num_steps[chunk_idx]
 
     def seq_tile(p_id):
         """Sequence tile scheduled at pipeline step `p_id`."""
+        if metadata_ref is None:
+            return 0
         return metadata_ref.batch_tile_idx[step_offset + p_id]
 
     def bq_block(p_id):
         """Query block scheduled at pipeline step `p_id`."""
+        if metadata_ref is None:
+            return 0
         return metadata_ref.bq_idx[step_offset + p_id]
 
     def bkv_block(p_id):
         """KV block scheduled at pipeline step `p_id`."""
+        if metadata_ref is None:
+            return p_id
         return metadata_ref.bkv_idx[step_offset + p_id]
 
     prefill_cfg = _BlockedPrefillConfig.create(
@@ -756,7 +771,7 @@ def kernel(
             q_buf, weights_buf, kv_buf, o_buf = final_allocs
             pipeline_fn = pltpu.emit_pipeline(
                 body,
-                grid=(metadata_ref.num_steps[chunk_idx],),
+                grid=(num_steps,),
                 in_specs=(q_buf.spec, weights_buf.spec, kv_buf.spec),
                 out_specs=o_buf.spec,
             )
@@ -1063,6 +1078,7 @@ def _effective_row_lengths(
         "cp_size",
         "interleave_size",
         "return_scores",
+        "dense_decode",
     ),
 )
 def streamindex_topk(
@@ -1091,6 +1107,7 @@ def streamindex_topk(
     cp_rank: jax.Array | int = 0,
     interleave_size: int = 1,
     return_scores: bool = False,
+    dense_decode: bool = False,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1159,6 +1176,18 @@ def streamindex_topk(
     # Scale factors for the FP8 index cache format are packed directly inside
     # `cache_kv`, keeping HBM transactions fused.
 
+    # A dense prefix of B real, single-token decode sequences, without
+    # padded queries or mixed requests. The dispatch wrapper checks on device.
+    # Base implementation and all scoring/top-k arithmetic remain unchanged.
+    if dense_decode and (
+        cp_size != 1
+        or chunk_tokens is not None
+        or not 0 < q.shape[0] <= seq_lens.shape[0]
+    ):
+        raise ValueError(
+            "dense_decode requires CP1, no chunks, 0 < B <= sequence capacity"
+        )
+
     kv_layout = KVLayout.parse(kv_layout)
 
     if cp_size < 1:
@@ -1217,6 +1246,12 @@ def streamindex_topk(
         )
 
     max_num_seqs = seq_lens.shape[0]
+    # Each decode request owns a query, independently of padded sequence slots.
+    max_decode_seqs = min(max_num_seqs, q.shape[0])
+
+    # Metadata capacity can exceed the token bucket. Each decode sequence needs
+    # one query, so a smaller bucket cannot fill a batched decode pass.
+    use_batched_decode = max_decode_seqs >= decode_req_batch_size
 
     original_dtype = q.dtype
     actual_head_dim = q.shape[-1]
@@ -1365,7 +1400,26 @@ def streamindex_topk(
                 ),
                 compiler_params=pltpu.CompilerParams(
                     dimension_semantics=("arbitrary",),
-                    vmem_limit_bytes=vmem_limit_bytes,
+                    # Measured scoped use is 3.7 MiB for B1 decode and
+                    # 7.5 MiB for its padded mixed fallback. Bound both
+                    # branches so the dispatch does not reserve all VMEM.
+                    vmem_limit_bytes=(
+                        min(vmem_limit_bytes, 16 * 1024 * 1024)
+                        if (
+                            max_num_tokens == 1
+                            and num_q_heads == 64
+                            and head_dim == 128
+                            and seq_batch_size == 1
+                            and (bkv_p, buffer_count, bq_sz)
+                            in ((24, 4, 1), (2, 3, 128))
+                            and page_size == 256
+                            and compression_ratio == 4
+                            and cp_size == 1
+                            and kv_layout == KVLayout.SEQ_ALONG_LANE
+                            and original_dtype == jnp.float8_e4m3fn
+                        )
+                        else vmem_limit_bytes
+                    ),
                     disable_bounds_checks=True,
                 ),
                 out_shape=jax.ShapeDtypeStruct(
@@ -1398,9 +1452,32 @@ def streamindex_topk(
             static_q_len=1,
             case=MlaCase.DECODE,
         )
+        if dense_decode:
+            count = q.shape[0]
+            batch_end = count // decode_req_batch_size * decode_req_batch_size
+            result = []
+            if batch_end:
+                result.append(
+                    dict(
+                        start_seq_idx=jnp.array(0),
+                        end_seq_idx=jnp.array(batch_end),
+                        seq_batch_size=decode_req_batch_size,
+                        **decode_cfg,
+                    )
+                )
+            if batch_end < count:
+                result.append(
+                    dict(
+                        start_seq_idx=jnp.array(batch_end),
+                        end_seq_idx=jnp.array(count),
+                        seq_batch_size=1,
+                        **decode_cfg,
+                    )
+                )
+            return tuple(result)
         batched_decode = (
             ()
-            if max_num_seqs < decode_req_batch_size
+            if not use_batched_decode
             else (
                 dict(
                     start_seq_idx=jnp.array(0),
@@ -1438,9 +1515,14 @@ def streamindex_topk(
             spec["num_kv_pages_per_block"],
             spec["static_q_len"],
         )
+        # A single unchunked decode visits KV blocks in order. The scoring
+        # kernel derives its trip count directly from scalar-prefetched lengths.
+        if dense_decode and q.shape[0] == 1 and chunk_starts == (None,):
+            return None
+        metadata_seqs = max_decode_seqs if spec["static_q_len"] == 1 else max_num_seqs
         return metadata.compute_metadata(
-            seq_lens=seq_lens,
-            cu_q_lens=cu_q_lens,
+            seq_lens=seq_lens[:metadata_seqs],
+            cu_q_lens=cu_q_lens[: metadata_seqs + 1],
             start_seq_idx=spec["start_seq_idx"],
             end_seq_idx=spec["end_seq_idx"],
             bq_sz=bq_sz,
@@ -1503,22 +1585,31 @@ def streamindex_topk(
         # blocks to run computation for.
         decode_batch_end = (
             jnp.array(0)
-            if max_num_seqs < decode_req_batch_size
+            if not use_batched_decode
             else distribution[0] // decode_req_batch_size * decode_req_batch_size
         )
 
         num_positions = max(num_sublanes_total * 128, k)
-        eff_row_lengths = _effective_row_lengths(
-            seq_lens=seq_lens,
-            cu_q_lens=cu_q_lens,
-            distribution=distribution,
-            num_tokens=max_num_tokens,
-            num_positions=num_positions,
-            compression_ratio=compression_ratio,
-            cp_rank=cp_rank,
-            cp_size=cp_size,
-            interleave_c=interleave_c,
-        )
+        raw_single_length = dense_decode and max_num_tokens == 1
+        if raw_single_length:
+            eff_row_lengths = seq_lens
+        elif dense_decode:
+            # q_len=1 and token_pos=seq_len-1: visible compressed rows = L//R.
+            eff_row_lengths = jnp.minimum(
+                seq_lens[:max_num_tokens] // compression_ratio, num_positions
+            )
+        else:
+            eff_row_lengths = _effective_row_lengths(
+                seq_lens=seq_lens,
+                cu_q_lens=cu_q_lens,
+                distribution=distribution,
+                num_tokens=max_num_tokens,
+                num_positions=num_positions,
+                compression_ratio=compression_ratio,
+                cp_rank=cp_rank,
+                cp_size=cp_size,
+                interleave_c=interleave_c,
+            )
 
         if chunk_tokens is None or max_num_tokens % chunk_tokens:
             num_chunks, chunk_len = 1, max_num_tokens
@@ -1570,7 +1661,12 @@ def streamindex_topk(
                 chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
                     scores,
                     k,
-                    row_lengths=eff_row_lengths[start : start + chunk_len],
+                    row_lengths=(
+                        eff_row_lengths
+                        if raw_single_length
+                        else eff_row_lengths[start : start + chunk_len]
+                    ),
+                    row_length_divisor=compression_ratio if raw_single_length else 1,
                     write_empty_rows=True,
                     scheduling_group_id=sc_group,
                     return_scores=True,
@@ -1580,7 +1676,12 @@ def streamindex_topk(
                 chunk_topk_idxs = sparsecore_topk(
                     scores,
                     k,
-                    row_lengths=eff_row_lengths[start : start + chunk_len],
+                    row_lengths=(
+                        eff_row_lengths
+                        if raw_single_length
+                        else eff_row_lengths[start : start + chunk_len]
+                    ),
+                    row_length_divisor=compression_ratio if raw_single_length else 1,
                     write_empty_rows=True,
                     scheduling_group_id=sc_group,
                     return_scores=False,
@@ -1875,4 +1976,45 @@ def streamindex_topk_dcp(
         page_indices,
         cu_q_lens,
         distribution,
+    )
+
+
+# Decode dispatch keeps conditions on device, avoiding a host
+# synchronization or inference based solely on the padded compile bucket.
+def is_dense_decode_batch(q, seq_lens, cu_q_lens, distribution):
+    batch = q.shape[0]
+    if not 0 < batch <= seq_lens.shape[0]:
+        return jnp.array(False)
+    expected_cu = jnp.minimum(jnp.arange(cu_q_lens.shape[0]), batch)
+    return (
+        jnp.all(distribution == batch)
+        & jnp.all(cu_q_lens == expected_cu)
+        & jnp.all(seq_lens[:batch] > 0)
+    )
+
+
+def streamindex_topk_decode_dispatch(
+    q,
+    weights,
+    cache,
+    seq_lens,
+    pages,
+    cu_q_lens,
+    distribution,
+    *,
+    decode_group_size=4,
+    **kwargs,
+):
+    args = (q, weights, cache, seq_lens, pages, cu_q_lens, distribution)
+    if kwargs.get("cp_size", 1) != 1 or kwargs.get("chunk_tokens") is not None:
+        return streamindex_topk(*args, **kwargs)
+    if not 0 < q.shape[0] <= seq_lens.shape[0]:
+        return streamindex_topk(*args, **kwargs)
+    return jax.lax.cond(
+        is_dense_decode_batch(q, seq_lens, cu_q_lens, distribution),
+        lambda _: streamindex_topk(
+            *args, **kwargs, dense_decode=True, decode_req_batch_size=decode_group_size
+        ),
+        lambda _: streamindex_topk(*args, **kwargs, dense_decode=False),
+        None,
     )

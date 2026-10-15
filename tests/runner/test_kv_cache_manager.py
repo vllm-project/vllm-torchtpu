@@ -2166,3 +2166,63 @@ class TestUpdateAttentionPageSizePadded:
                 256, 2, 256, torch.bfloat16
             )
         )
+
+
+@pytest.mark.parametrize("block_size", [512, 1024])
+def test_dsv4_sal_allocates_independent_state_with_budget(block_size):
+    """SAL and FP32 state use distinct arrays, covered by the declared budget."""
+    from vllm.v1.kv_cache_interface import SlidingWindowMLASpec
+
+    from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (  # noqa: E501
+        VllmDeepseekV4IndexerCache,
+    )
+
+    config = SimpleNamespace(cache_config=SimpleNamespace(block_size=block_size))
+    indexer = VllmDeepseekV4IndexerCache.__new__(VllmDeepseekV4IndexerCache)
+    indexer.compress_ratio = 4
+    spec = indexer.get_kv_cache_spec(config)
+    assert spec.head_size == 260
+    state_tokens = block_size // 64
+    state_spec = SlidingWindowMLASpec(
+        block_size=state_tokens,
+        num_kv_heads=1,
+        head_size=2048,
+        dtype=torch.uint8,
+        sliding_window=8,
+        alignment=None,
+    )
+    csa_spec = MLAAttentionSpec(
+        block_size=block_size,
+        num_kv_heads=1,
+        head_size=640,
+        dtype=torch.uint8,
+        tokens_per_state=4,
+        alignment=None,
+    )
+    specs = {
+        "m.layers.0.attn": csa_spec,
+        "m.layers.0.attn.indexer.k_cache": spec,
+        "m.layers.0.attn.indexer.compressor.state_cache": state_spec,
+    }
+    groups = [
+        SimpleNamespace(layer_names=[name], kv_cache_spec=value)
+        for name, value in specs.items()
+    ]
+    runner = MagicMock()
+    runner.shared_kv_cache_layers = {}
+    runner.device = "cpu"
+    allocator = DsV4KVCacheAllocator(runner)
+    caches = {}
+    with patch.object(allocator, "_refresh_ds_v4_request_caps"):
+        allocator._initialize_ds_v4_kv_cache(
+            SimpleNamespace(kv_cache_groups=groups),
+            specs.__getitem__,
+            caches,
+            3,
+        )
+    records = caches["m.layers.0.attn.indexer.k_cache"]
+    state = caches["m.layers.0.attn.indexer.compressor.state_cache"]
+    assert tuple(records.shape) == (3, 33, 4, block_size // 4)
+    assert tuple(state.shape) == (3, state_tokens * 2, 4, 256)
+    assert records.data_ptr() != state.data_ptr()
+    assert records.numel() + state.numel() == 3 * spec.page_size_bytes

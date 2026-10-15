@@ -200,6 +200,56 @@ def _compressor_jax_hca(
     return new_cache, new_state_cache
 
 
+def _compressor_jax_indexer_sal(
+    hidden_states: jax.Array,
+    wkv_wgate: jax.Array,
+    ape: jax.Array,
+    norm_weight: jax.Array,
+    cos_sin_cache: jax.Array,
+    positions: jax.Array,
+    state_block_tables: jax.Array,
+    query_start_loc: jax.Array,
+    k_block_tables: jax.Array,
+    request_distribution: jax.Array,
+    cache: jax.Array,
+    state_cache: jax.Array,
+    *,
+    state_block_size: int,
+    head_dim: int,
+    compress_ratio: int,
+    overlap: bool,
+    rms_eps: float,
+    quant_block: int,
+) -> tuple[jax.Array, jax.Array]:
+    """SAL Indexer: compressed records and FP32 state use separate arrays."""
+    if cache.shape[0] == 0 or state_cache.shape[0] == 0:
+        return cache, state_cache
+    new_cache, _, new_state_cache = _run_compressor(
+        hidden_states=hidden_states,
+        wkv_wgate=wkv_wgate,
+        ape=ape,
+        norm_weight=norm_weight,
+        cos_sin_cache=cos_sin_cache,
+        positions=positions,
+        state_block_tables=state_block_tables,
+        query_start_loc=query_start_loc,
+        k_block_tables=k_block_tables,
+        request_distribution=request_distribution,
+        cache=cache,
+        rope_cache=None,
+        state_cache=state_cache,
+        state_block_size=state_block_size,
+        head_dim=head_dim,
+        compress_ratio=compress_ratio,
+        overlap=overlap,
+        rms_eps=rms_eps,
+        quant_block=quant_block,
+    )
+    # Independent FP32 state is returned after compression finishes.
+    assert new_state_cache is not None
+    return new_cache, new_state_cache
+
+
 def _compressor_jax_indexer(
     hidden_states: jax.Array,
     wkv_wgate: jax.Array,
@@ -385,14 +435,16 @@ class VllmDeepseekCompressor(DeepseekCompressor):
 
     # head_dim == 512 with overlap: CSA, which splits NoPE and RoPE.
     # head_dim == 512 without:      HCA, whose state lives on a CSA array.
-    # head_dim == 128:              lightning indexer, one array for both.
+    # head_dim == 128:              lightning indexer, SAL + separate state.
     @property
     def _has_rope_cache(self) -> bool:
         return self.head_dim == 512 and self.overlap
 
     @property
     def _separate_state(self) -> bool:
-        return not self.overlap
+        return not self.overlap or (
+            self.head_dim == 128 and self.state_cache.block_size % 8 == 0
+        )
 
     @property
     def compressor_op(self):
@@ -414,6 +466,8 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         assert self.head_dim in (512, 128), self.head_dim
         if self._has_rope_cache:
             variant, jax_fn = "csa", _compressor_jax_csa
+        elif self.head_dim == 128 and self._separate_state:
+            variant, jax_fn = "indexer_sal", _compressor_jax_indexer_sal
         elif self._separate_state:
             variant, jax_fn = "hca", _compressor_jax_hca
         else:
@@ -589,11 +643,11 @@ class VllmDeepseekCompressor(DeepseekCompressor):
                 # profiling pass: skipping the compressor would silently
                 # leave every later token's state unwritten.
                 raise RuntimeError(
-                    f"DeepSeek-V4 HCA compressor {state_prefix!r} has a live "
+                    f"DeepSeek-V4 compressor {state_prefix!r} has a live "
                     "compressed-KV array but no state array; the kernel needs "
-                    "a separate buffer for the f32 state, an HCA page being "
-                    "far too small to host it. Expected the runner to have "
-                    "overlaid this state cache onto a CSA NoPE array."
+                    "a separate buffer for the f32 state. Expected the runner "
+                    "to bind the HCA state overlay or the independent SAL "
+                    "Indexer state allocation."
                 )
 
         assert self._wkv_wgate_transposed, (

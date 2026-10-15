@@ -94,10 +94,12 @@ def _topk_body(
     write_empty: bool,
     return_scores: bool,
     local_idxs_hbm: Any = None,
+    compact_single_row: bool = False,
+    row_length_divisor: int = 1,
 ):
     dcp_merge = local_idxs_hbm is not None
     num_subcores = 16
-    num_sc_cores = 2
+    num_sc_cores = 1 if compact_single_row else 2
     core = lax.axis_index("core")
     sub = lax.axis_index("subcore")
     flat = core * num_subcores + sub
@@ -218,7 +220,9 @@ def _topk_body(
         )
         active = row < b
         row_eff_len = (
-            jnp.int32(n) if dcp_merge else jnp.minimum(vec_at(len_slice_vmem, 0), n)
+            jnp.int32(n)
+            if dcp_merge
+            else jnp.minimum(vec_at(len_slice_vmem, 0) // row_length_divisor, n)
         )
         row_eff_len = jnp.where(active, row_eff_len, 0)
 
@@ -629,12 +633,12 @@ def _topk_body(
         in_specs = (
             pl.BlockSpec(
                 (slice_len,),
-                lambda w: (w * cores_per_chip + flat,),
+                lambda w: (s if compact_single_row else w * cores_per_chip + flat,),
                 pipeline_mode=pl.Buffered(buf_count),
             ),
             pl.BlockSpec(
                 (LANES,),
-                lambda w: (w * cores_per_chip + flat,),
+                lambda w: (0 if compact_single_row else w * cores_per_chip + flat,),
                 pipeline_mode=pl.Buffered(buf_count),
             ),
         )
@@ -651,6 +655,7 @@ def _sc_topk_direct(
     k: int,
     row_lengths: jax.Array,  # i32[b]
     *,
+    row_length_divisor: int = 1,
     local_idxs: jax.Array | None = None,  # i32[b, k]
     p: int = 1,
     write_empty: bool = True,
@@ -681,15 +686,27 @@ def _sc_topk_direct(
     slice_len = _align_to(n // p, LANES)
     num_waves = _cdiv(b, groups_per_chip)
     padded_b = num_waves * groups_per_chip
-    pad_b = padded_b - b
+    # The measured decode row uses one cooperative group on one SparseCore.
+    # Keep other shapes and DCP on their existing buffer/mesh contract.
+    compact_single_row = (b, n, k, p) == (1, 18432, 512, 4)
+    pad_b = 0 if compact_single_row else padded_b - b
     pad_n = slice_len * p - n
     if pad_b > 0 or pad_n > 0:
         words = jnp.pad(words, ((0, pad_b), (0, pad_n)))
 
-    lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, padded_b - b))
-    if p > 1:
-        lengths = jnp.repeat(lengths, p)
-    lengths_2d = jnp.pad(lengths[:, None], ((0, 0), (0, LANES - 1)))
+    if compact_single_row:
+        # A padded source already has a full DMA window. Only element zero is
+        # consumed, so neither a prefix slice nor a broadcast is needed.
+        lengths_2d = (
+            row_lengths
+            if row_lengths.shape[0] >= LANES
+            else jnp.broadcast_to(row_lengths[:1], (LANES,))
+        )
+    else:
+        lengths = jnp.pad(row_lengths[:b].astype(jnp.int32), (0, padded_b - b))
+        if p > 1:
+            lengths = jnp.repeat(lengths, p)
+        lengths_2d = jnp.pad(lengths[:, None], ((0, 0), (0, LANES - 1)))
 
     extra_inputs = ()
     if local_idxs is not None:
@@ -699,12 +716,13 @@ def _sc_topk_direct(
         extra_inputs = (local_words.reshape(-1),)
 
     mesh = plsc.VectorSubcoreMesh(
-        num_cores=sc.num_cores,
+        num_cores=1 if compact_single_row else sc.num_cores,
         num_subcores=sc.num_subcores,
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
-    slot_type = jax.ShapeDtypeStruct((padded_b * k,), jnp.int32)
+    output_rows = b if compact_single_row else padded_b
+    slot_type = jax.ShapeDtypeStruct((output_rows * k,), jnp.int32)
     out_type = (slot_type, slot_type if return_scores else None)
 
     scratch_types = (
@@ -740,6 +758,8 @@ def _sc_topk_direct(
         p=p,
         slice_len=slice_len,
         num_waves=num_waves,
+        compact_single_row=compact_single_row,
+        row_length_divisor=row_length_divisor,
         write_empty=write_empty,
         return_scores=return_scores,
     )
@@ -766,10 +786,10 @@ def _sc_topk_direct(
     # pl.kernel and set_xla_metadata are untyped upstream; both return the
     # out_type pytree here.
     slots, keys = cast(tuple[jax.Array, jax.Array | None], out)
-    slots_2d = slots.reshape(padded_b, k)[:b]
+    slots_2d = slots.reshape(output_rows, k)[:b]
     if return_scores:
         assert keys is not None
-        keys_2d = keys.reshape(padded_b, k)[:b]
+        keys_2d = keys.reshape(output_rows, k)[:b]
         return slots_2d, keys_2d
     return slots_2d
 
@@ -803,6 +823,7 @@ def _pick_partition(b: int, n: int, k: int) -> int:
         "write_empty_rows",
         "scheduling_group_id",
         "return_scores",
+        "row_length_divisor",
     ),
 )
 def sparsecore_topk(
@@ -810,6 +831,7 @@ def sparsecore_topk(
     k: int,
     row_lengths: jax.Array | None = None,  # i32[b], defaults to n
     *,
+    row_length_divisor: int = 1,
     write_empty_rows: bool = True,
     scheduling_group_id: int | None = None,
     return_scores: bool = False,
@@ -822,7 +844,9 @@ def sparsecore_topk(
     candidates back to HBM.
 
     ``scores`` may be f32 or i32 holding those f32 bits; the comparison is on
-    raw bits either way.
+    raw bits either way. ``row_lengths`` may have unused trailing capacity.
+    Each effective length is floor-divided by ``row_length_divisor`` inside
+    SparseCore, then bounded by the score width.
     """
     if scores.ndim != 2:
         raise ValueError(f"scores must be 2D, got {scores.shape}")
@@ -834,17 +858,26 @@ def sparsecore_topk(
     if k % LANES != 0 or not 0 < k <= 4096:
         raise ValueError(f"{k=} must be a positive multiple of {LANES}, at most 4096")
 
+    if row_length_divisor <= 0:
+        raise ValueError("row_length_divisor must be positive")
+    if row_lengths is None and row_length_divisor != 1:
+        raise ValueError("row_length_divisor requires explicit row_lengths")
+    if row_lengths is not None and (row_lengths.ndim != 1 or row_lengths.shape[0] < b):
+        raise ValueError(f"row_lengths must be a vector with at least {b} entries")
     if row_lengths is None:
         row_lengths = jnp.full((b,), n, jnp.int32)
     else:
         row_lengths = row_lengths.astype(jnp.int32)
 
-    p = _pick_partition(b, n, k)
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import tuned_block_sizes
+
+    p = tuned_block_sizes.get_topk_partition(b, n, k, default=_pick_partition(b, n, k))
     return _sc_topk_direct(
         scores,
         k,
         row_lengths,
         p=p,
+        row_length_divisor=row_length_divisor,
         write_empty=write_empty_rows,
         return_scores=return_scores,
         scheduling_group_id=scheduling_group_id,

@@ -24,6 +24,9 @@ from jax.experimental.pallas import tpu as pltpu
 
 def _step_offset(meta_ref: Any, chunk_idx: int):
     """Flat schedule row where chunk `chunk_idx`'s pipeline steps begin."""
+    if meta_ref is None:
+        assert chunk_idx == 0
+        return 0
     return sum(meta_ref.num_steps[m] for m in range(chunk_idx))
 
 
@@ -40,12 +43,12 @@ def _token_window(
     _, cu_q_lens_ref, meta_ref, start_end_seq_idx_ref = refs
     chunk_start = start_end_seq_idx_ref[2]
     p_id = p_id + _step_offset(meta_ref, chunk_idx)
-    seq_idx = meta_ref.batch_tile_idx[p_id]
+    seq_idx = 0 if meta_ref is None else meta_ref.batch_tile_idx[p_id]
     lo = jnp.maximum(cu_q_lens_ref[seq_idx], chunk_start)
 
     if seq_batch_size > 1:
         return lo, seq_batch_size
-    token_start = lo + meta_ref.bq_idx[p_id] * bq_sz
+    token_start = lo + (0 if meta_ref is None else meta_ref.bq_idx[p_id]) * bq_sz
     if bq_sz == 1:
         return token_start, 1
     hi = jnp.minimum(cu_q_lens_ref[seq_idx + 1], chunk_start + chunk_tokens)
@@ -142,8 +145,8 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
     ):
         cache_kv_hbm, page_indices_ref, meta_ref = src_ref
         p_id = grid_indices[0] + _step_offset(meta_ref, self.chunk_idx)
-        batch_tile_idx = meta_ref.batch_tile_idx[p_id]
-        bkv_idx = meta_ref.bkv_idx[p_id]
+        batch_tile_idx = 0 if meta_ref is None else meta_ref.batch_tile_idx[p_id]
+        bkv_idx = p_id if meta_ref is None else meta_ref.bkv_idx[p_id]
 
         assert self.sem_recvs is not None
         assert self.window_ref is not None
@@ -298,8 +301,8 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
     ):
         cache_kv_hbm, page_indices_ref, meta_ref = src_ref
         p_id = grid_indices[0] + _step_offset(meta_ref, self.chunk_idx)
-        batch_tile_idx = meta_ref.batch_tile_idx[p_id]
-        bkv_idx = meta_ref.bkv_idx[p_id]
+        batch_tile_idx = 0 if meta_ref is None else meta_ref.batch_tile_idx[p_id]
+        bkv_idx = p_id if meta_ref is None else meta_ref.bkv_idx[p_id]
 
         assert self.sem_recvs is not None
         assert self.window_ref is not None
@@ -561,9 +564,8 @@ class StreamIndexOBufferedRef(pltpu.BufferedRef):
         grid_indices: tuple[int | jax.Array, ...],
     ):
         scores_hbm, _, meta_ref, start_end_seq_idx_ref = dst_ref
-        bkv_idx = meta_ref.bkv_idx[
-            grid_indices[0] + _step_offset(meta_ref, self.chunk_idx)
-        ]
+        p_id = grid_indices[0] + _step_offset(meta_ref, self.chunk_idx)
+        bkv_idx = p_id if meta_ref is None else meta_ref.bkv_idx[p_id]
 
         assert self.sem_sends is not None
         assert self.window_ref is not None

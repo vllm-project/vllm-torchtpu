@@ -29,7 +29,16 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.rope import rope_quant
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    KVLayout,
+    tuned_block_sizes,
+)
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.query_epilogue import (
+    rope_quant_fold_weights,
+)
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
+    streamindex_topk_decode_dispatch,
+)
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     VllmDeepseekCompressor,
 )
@@ -37,7 +46,6 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_pallas_op_mesh,
 )
-from vllm_torchtpu.utils import align_to
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
@@ -86,27 +94,58 @@ def _indexer_jax(
         # Note: vLLM's implementation rounds the scale factors up to the next
         # power of 2, but the plain `abs_max / dtype_max` the kernel returns is
         # sufficient here.
-        q_quant, q_scales = rope_quant(
-            q, positions, cos_sin_cache, quant_dtype=jnp.float8_e4m3fn
+        if (
+            q.shape[0] in (1, 4, 8, 64)
+            and q.shape[1:] == (64, 128)
+            and q.dtype == jnp.bfloat16
+            and indexer_weights.dtype in (jnp.float32, jnp.bfloat16)
+            and cos_sin_cache.dtype == jnp.float32
+            and cos_sin_cache.shape[1] == 64
+            and n_head == 64
+        ):
+            q_quant, weights = rope_quant_fold_weights(
+                q,
+                positions,
+                cos_sin_cache,
+                indexer_weights,
+                softmax_scale=softmax_scale,
+            )
+        else:
+            q_quant, q_scales = rope_quant(
+                q, positions, cos_sin_cache, quant_dtype=jnp.float8_e4m3fn
+            )
+            weights = indexer_weights * softmax_scale * (n_head**-0.5) * q_scales
+
+        sal = cache_kv.shape[1] == 33
+        decode_kv_pages = tuned_block_sizes.get_decode_kv_pages_per_block(
+            q_quant,
+            cache_kv,
+            page_indices.reshape(seq_lens.shape[0], -1),
+            k=k,
+            compression_ratio=compression_ratio,
         )
 
-        # Fold the query quantization scales into the weights.
-        weights = indexer_weights * softmax_scale * (n_head**-0.5) * q_scales
-
-        return streamindex_topk(
-            q=q_quant,
-            indexer_weights=weights,
-            cache_kv=cache_kv,
-            seq_lens=seq_lens,
-            page_indices=page_indices.flatten(),
-            cu_q_lens=cu_q_lens,
-            distribution=distribution,
+        return streamindex_topk_decode_dispatch(
+            q_quant,
+            weights,
+            cache_kv,
+            seq_lens,
+            page_indices.flatten(),
+            cu_q_lens,
+            distribution,
+            decode_group_size=tuned_block_sizes.get_decode_group_size(
+                q_quant,
+                cache_kv,
+                page_indices.reshape(seq_lens.shape[0], -1),
+                k=k,
+                compression_ratio=compression_ratio,
+            ),
+            kv_layout=KVLayout.SEQ_ALONG_LANE if sal else KVLayout.HEAD_ALONG_SUBLANE,
             k=k,
             compression_ratio=compression_ratio,
             # The following parameters are tuned based on microbenchmark results.
-            num_kv_pages_per_block=(32, 32, 16),
+            num_kv_pages_per_block=(decode_kv_pages, 32, 16),
             num_queries_per_block=(1, 128, 128),
-            decode_req_batch_size=4,
             chunk_tokens=envs.TPU_STREAMIDX_CHUNK_TOKENS,
         )
 
@@ -127,11 +166,27 @@ class VllmDeepseekV4IndexerCache(DeepseekV4IndexerCache):
     """Indexer K cache as a packed uint8 record on TPU."""
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
-        block_size = self.cache_config.block_size
+        from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import config
+
+        block_size = vllm_config.cache_config.block_size
+        states = block_size // self.compress_ratio
+        state_tokens = config.state_block_size(
+            config.Mode.CSA_INDEXER,
+            block_size,
+            compress_ratio=self.compress_ratio,
+            head_dim=128,
+        )
+        # Budget both arrays. For the standard block this is 260 B/record,
+        # versus 256 B for the old state-overlaid HAS cache (+1.5625%).
+        bytes_per_record = (
+            (132 + (state_tokens * 2048 + states - 1) // states)
+            if states % 128 == 0
+            else 256
+        )
         return MLAAttentionSpec(
             block_size=block_size,
             num_kv_heads=1,
-            head_size=align_to(128 + 1, 128),
+            head_size=bytes_per_record,
             dtype=torch.uint8,
             tokens_per_state=min(self.compress_ratio, block_size),
             alignment=None,

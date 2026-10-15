@@ -1609,7 +1609,16 @@ def _dsv4_check_role_rows(
     if kv_tag == TAG_DSV4_CSA_NOPE:
         expected = {"nope": tokens, "rope": tokens // DSV4_CSA_COMPRESS_RATIO}
     elif kv_tag == TAG_DSV4_IDX:
-        expected = {"k_cache": tokens // DSV4_CSA_COMPRESS_RATIO}
+        shape = tuple(int(dim) for dim in getattr(arrays[0], "shape", ()))
+        if len(shape) == 4 and shape[1:3] == (33, 4):
+            if shape[-1] != tokens or tokens % 128:
+                raise ManifestError(
+                    f"DSv4 SAL Indexer page shape {shape} "
+                    f"does not match {tokens} tokens"
+                )
+            expected = {"k_cache": 33}
+        else:
+            expected = {"k_cache": tokens // DSV4_CSA_COMPRESS_RATIO}
     else:
         expected = {"latents": tokens * 2}
     for (role, rows), array in zip(expected.items(), arrays):

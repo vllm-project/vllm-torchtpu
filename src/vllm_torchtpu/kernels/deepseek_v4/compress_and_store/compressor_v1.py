@@ -252,7 +252,7 @@ def prepare_boundary_batch(
     )
 
 
-def compressor_forward(
+def compressor_forward_generic(
     hidden_states: jax.Array,  # [num_tokens, hidden_size] fp32
     wkv_wgate: jax.Array,  # [2*coff*head_dim, hidden_size] fp32
     ape: jax.Array,  # [compress_ratio, coff*head_dim] fp32
@@ -355,3 +355,33 @@ def compressor_forward(
     # the read supplies the missing ordering edge.
     state_cache, cache = jax.lax.optimization_barrier((state_cache, cache))
     return cache, rope_cache, state_cache
+
+
+def compressor_forward(
+    hidden_states: jax.Array,  # [num_tokens, hidden_size] fp32
+    wkv_wgate: jax.Array,  # [2*coff*head_dim, hidden_size] fp32
+    ape: jax.Array,  # [compress_ratio, coff*head_dim] fp32
+    norm_weight: jax.Array,  # [head_dim] fp32
+    cos_sin_cache: jax.Array,  # [max_pos, rope_head_dim] fp32
+    positions: jax.Array,  # [num_tokens] int
+    block_table: jax.Array,  # [num_reqs * max_blocks] int
+    query_start_loc: jax.Array,  # [num_reqs + 1] int
+    kv_block_table: jax.Array,  # [num_reqs * max_kv_blocks] int
+    cache: jax.Array,  # [num_pages, page_size, 4, 128] u8 / CSA [..., 128] i32
+    rope_cache: jax.Array,  # CSA [num_pages, page_size // 4, 128] int32
+    distribution: jax.Array,  # i32[3]
+    state_block_size: int,
+    head_dim: int,
+    compress_ratio: int,
+    overlap: bool,
+    rms_eps: float,
+    quant_block: int,
+    state_cache: jax.Array | None = None,  # [num_pages, state_page_size, 4, 128] uint8
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Select the persistent SAL writer or the generic compressor."""
+    args = dict(locals())
+    if head_dim == 128 and state_cache is not None and cache.shape[1] == 33:
+        from . import indexer_sal
+
+        return indexer_sal.compressor_forward(**args)
+    return compressor_forward_generic(**args)

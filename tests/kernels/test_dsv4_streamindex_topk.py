@@ -1226,6 +1226,161 @@ def test_chunked_topk_matches_the_naive_reference(T_list, chunk_tokens):
     )
 
 
+@pytest.mark.parametrize(
+    "T_list", [(1,), (1, 1), (1, 1, 1), (1,) * 4, (1,) * 5, (2,), (1, 2)]
+)
+@pytest.mark.parametrize("kv_layout", [_HAS, _SAL])
+def test_small_token_bucket_with_padded_sequence_metadata(
+    T_list, kv_layout, monkeypatch
+):
+    """Unused sequence slots must not cause an impossible batched decode pass."""
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import metadata
+
+    inputs = _chunk_inputs(T_list, _fragmented_pages(len(T_list)), 128, 4, 128)
+    kwargs = _chunk_call_kwargs(
+        inputs,
+        T_list,
+        (512,) * len(T_list),
+        64,
+        1,
+        (1, 128, 128),
+        (3, 2, 2),
+        kv_layout,
+        None,
+    )
+    expected = np.asarray(streamindex_topk(**kwargs))
+    capacity = 256
+    padded = dict(kwargs)
+    padded["seq_lens"] = jnp.pad(kwargs["seq_lens"], (0, capacity - len(T_list)))
+    padded["cu_q_lens"] = jnp.pad(
+        kwargs["cu_q_lens"],
+        (0, capacity - len(T_list)),
+        constant_values=sum(T_list),
+    )
+    padded["page_indices"] = jnp.pad(
+        kwargs["page_indices"].reshape(len(T_list), -1),
+        ((0, capacity - len(T_list)), (0, 0)),
+    ).flatten()
+    batches = []
+    original = metadata.compute_metadata
+
+    def record_metadata(**call_kwargs):
+        batches.append(call_kwargs["seq_batch_size"])
+        return original(**call_kwargs)
+
+    streamindex_topk.clear_cache()
+    with monkeypatch.context() as patch:
+        patch.setattr(metadata, "compute_metadata", record_metadata)
+        compiled = streamindex_topk.lower(**padded).compile()
+    assert batches == ([1, 1] if sum(T_list) < 4 else [4, 1, 1])
+    # Run through the same jitted callable so static keyword arguments are
+    # stripped consistently, while reusing the executable compiled above.
+    del compiled
+    actual = np.asarray(streamindex_topk(**padded))
+    _verify_padding_at_end(actual)
+    np.testing.assert_array_equal(np.sort(actual, axis=-1), np.sort(expected, axis=-1))
+
+
+@pytest.mark.parametrize(
+    "valid_positions", [127, 128, 129, 255, 256, 257, 383, 384, 385]
+)
+@pytest.mark.parametrize("batch", [1, 4])
+@pytest.mark.parametrize("kv_layout", [_HAS, _SAL])
+@pytest.mark.parametrize("decode_pages", [3, 24])
+def test_decode_topk_excludes_poisoned_cache_tail(
+    valid_positions, batch, kv_layout, decode_pages
+):
+    """High-scoring cache padding must never enter the selected top-k."""
+    tokens = (1,) * batch
+    inputs = _chunk_inputs(tokens, _fragmented_pages(batch), 128, 4, 128)
+    cache = np.zeros_like(inputs.cache_kv).reshape(-1, 128, 256)
+    dequantized = np.zeros_like(inputs.dequantized_kv)
+    # Binary keys and power-of-two queries give distinct, exactly representable
+    # scores 0..511. Random ReLU scores can tie at zero at the selection boundary.
+    keys = np.zeros((512, 128), np.float32)
+    keys[:, :9] = (np.arange(512)[:, None] >> np.arange(9)) & 1
+    key_bytes = np.asarray(_to_byte_lane(jnp.array(keys, jnp.float8_e4m3fn)))
+    for seq in range(batch):
+        for pos in range(512):
+            page = inputs.block_table[seq, pos // 128]
+            offset = pos % 128
+            cache[page, offset, :128] = key_bytes[pos]
+            cache[page, offset, 128] = 127
+            dequantized[page, offset, 0] = keys[pos]
+    poison = np.asarray(_to_byte_lane(jnp.array(64, jnp.float8_e4m3fn)))
+    for seq in range(batch):
+        for pos in range(valid_positions, 512):
+            page = inputs.block_table[seq, pos // 128]
+            offset = pos % 128
+            cache[page, offset, :128] = poison
+            cache[page, offset, 128] = 127  # UE8M0 scale = 1.
+            dequantized[page, offset, 0] = 64
+    cache = jnp.array(cache.reshape(inputs.cache_kv.shape))
+    q = np.zeros_like(inputs.q)
+    q[:, 0, :9] = 2.0 ** np.arange(9)
+    weights = np.ones_like(inputs.weights)
+    lengths = (valid_positions * 4 + 3,) * batch
+    kwargs = _chunk_call_kwargs(
+        inputs,
+        tokens,
+        lengths,
+        64,
+        4,
+        (1, 128, 128),
+        (decode_pages, 2, 2),
+        kv_layout,
+        None,
+    )
+    kwargs.update(q=jnp.array(q, jnp.float8_e4m3fn), indexer_weights=jnp.array(weights))
+    kwargs["cache_kv"] = (
+        convert_cache_to_seq_along_lane(cache, 128) if kv_layout == _SAL else cache
+    )
+    actual = np.asarray(streamindex_topk(**kwargs))
+    expected = streamindex_topk_ref(
+        q,
+        weights,
+        dequantized,
+        inputs.block_table,
+        list(tokens),
+        list(lengths),
+        np.arange(batch + 1, dtype=np.int32),
+        64,
+        4,
+        4,
+        1,
+    )
+    assert np.all((actual >= 0) & (actual < valid_positions))
+    np.testing.assert_array_equal(np.sort(actual, axis=-1), np.sort(expected, axis=-1))
+
+
+@pytest.mark.parametrize("context", [2048, 8192, 65536, 65568, 66048, 66560])
+def test_tuned_single_query_decode_preserves_topk(context):
+    """Exercise the tuned dispatch and real kernel through partial tail pages."""
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import tuned_block_sizes
+
+    if tuned_block_sizes.get_device_name() != "TPU v7":
+        pytest.skip("This measured tile targets TPU v7")
+    inputs = _chunk_inputs((1,), _fragmented_pages(1, 65), 256, 64, 128)
+    kwargs = _chunk_call_kwargs(
+        inputs, (1,), (context,), 512, 4, (1, 128, 128), (3, 2, 2), _HAS, None
+    )
+    kwargs["q"] = kwargs["q"].astype(jnp.float8_e4m3fn)
+    kwargs["seq_lens"] = jnp.pad(kwargs["seq_lens"], (0, 255))
+    kwargs["cu_q_lens"] = jnp.pad(kwargs["cu_q_lens"], (0, 255), constant_values=1)
+    pages = jnp.pad(jnp.array(inputs.block_table), ((0, 255), (0, 0)))
+    kwargs["page_indices"] = pages.flatten()
+    expected = np.asarray(streamindex_topk(**kwargs))
+    selected = tuned_block_sizes.get_decode_kv_pages_per_block(
+        kwargs["q"], kwargs["cache_kv"], pages, k=512, compression_ratio=4
+    )
+    assert selected == 24
+    kwargs["num_kv_pages_per_block"] = (selected, 2, 2)
+    assert "StreamIdxTC-d-bq_1-bkvp_24" in streamindex_topk.lower(**kwargs).as_text()
+    actual = np.asarray(streamindex_topk(**kwargs))
+    assert np.all((actual >= 0) & (actual < context // 4))
+    np.testing.assert_array_equal(np.sort(actual, axis=-1), np.sort(expected, axis=-1))
+
+
 class TestChunkedPipelining:
     """Chunking the token axis must not change which candidates are selected.
 
@@ -1477,3 +1632,130 @@ if __name__ == "__main__":
     from absl import app
 
     app.run(main)
+
+
+@pytest.mark.parametrize(
+    "q_lens,seq_lens,distribution",
+    [
+        ([1], [2048], [1, 1, 1]),
+        ([1, 1], [2048, 1024], [2, 2, 2]),
+        ([1, 1, 1], [2048, 1024, 1536], [3, 3, 3]),
+        ([1, 1, 1, 1], [2048, 1024, 1536, 768], [4, 4, 4]),
+        ([1], [2048], [0, 0, 1]),
+        ([1], [2048], [0, 1, 1]),
+        ([0, 1], [0, 2048], [0, 0, 2]),
+        ([1], [0], [0, 0, 0]),
+    ],
+)
+def test_decode_token_bound_skips_impossible_group(q_lens, seq_lens, distribution):
+    inputs = _ee_inputs(q_lens, seq_lens, seed=17)
+    inputs = {name: jnp.asarray(value) for name, value in inputs.items()}
+    inputs["q"] = inputs["q"].astype(jnp.float8_e4m3fn)
+    inputs["distribution"] = jnp.asarray(distribution, dtype=jnp.int32)
+    slots = 256
+    num_seqs = inputs["seq_lens"].size
+    pages_per_seq = inputs["page_indices"].size // num_seqs
+    inputs["seq_lens"] = jnp.pad(inputs["seq_lens"], (0, slots - num_seqs))
+    inputs["cu_q_lens"] = jnp.pad(
+        inputs["cu_q_lens"], (0, slots - num_seqs), mode="edge"
+    )
+    inputs["page_indices"] = jnp.pad(
+        inputs["page_indices"], (0, (slots - num_seqs) * pages_per_seq)
+    )
+
+    kwargs = dict(
+        k=512,
+        compression_ratio=1,
+        num_kv_pages_per_block=(1, 1, 1),
+        num_queries_per_block=(1, 4, 4),
+    )
+    # Enabling early exit retains the generic schedule for seq_len > k.
+    generic = streamindex_topk(**inputs, **kwargs, enable_early_exit=True)
+    compiled = (
+        jax.jit(
+            lambda **args: streamindex_topk(**args, **kwargs, enable_early_exit=False)
+        )
+        .lower(**inputs)
+        .compile()
+    )
+    actual = compiled(**inputs)
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(generic))
+    calls = [
+        line
+        for line in compiled.as_text().splitlines()
+        if "StreamIdxTC" in line and "custom-call" in line
+    ]
+    assert len(calls) == (2 if sum(q_lens) < 4 else 3)
+
+
+@pytest.mark.parametrize("kv_layout", [_HAS, _SAL])
+@pytest.mark.parametrize("mode", ["dense", "leading_empty", "mixed", "chunked"])
+def test_single_decode_schedule_matches_general_with_changing_lengths(kv_layout, mode):
+    """Do not reuse stale trip counts or assume the live request is slot zero."""
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk import (
+        streamindex_topk_decode_dispatch,
+    )
+
+    tokens = (0, 1) if mode == "leading_empty" else (1,)
+    inputs = _chunk_inputs(tokens, _fragmented_pages(len(tokens), 65), 256, 64, 128)
+    kwargs = _chunk_call_kwargs(
+        inputs,
+        tokens,
+        (65568,) * len(tokens),
+        512,
+        4,
+        (1, 128, 128),
+        (24, 2, 2),
+        kv_layout,
+        CHUNK_DECODE_REQ_BATCH_SIZE if mode == "chunked" else None,
+        return_scores=True,
+    )
+    kwargs["q"] = kwargs["q"].astype(jnp.float8_e4m3fn)
+    kwargs["cu_q_lens"] = jnp.pad(
+        kwargs["cu_q_lens"], (0, 256 - len(tokens)), mode="edge"
+    )
+    kwargs["page_indices"] = jnp.pad(
+        jnp.asarray(inputs.block_table), ((0, 256 - len(tokens)), (0, 0))
+    ).ravel()
+    kwargs["distribution"] = jnp.asarray(
+        (0, 0, len(tokens)) if mode == "mixed" else kwargs["distribution"],
+        jnp.int32,
+    )
+    names = (
+        "q",
+        "indexer_weights",
+        "cache_kv",
+        "seq_lens",
+        "page_indices",
+        "cu_q_lens",
+        "distribution",
+    )
+    static = {key: value for key, value in kwargs.items() if key not in names}
+    dispatch = jax.jit(lambda *args: streamindex_topk_decode_dispatch(*args, **static))
+    for context in [
+        0,
+        1,
+        3,
+        4,
+        2047,
+        2048,
+        2049,
+        2052,
+        24575,
+        24576,
+        24577,
+        49152,
+        49155,
+        65535,
+        65536,
+        65568,
+        66559,
+        66560,
+    ]:
+        lengths = np.zeros(256, np.int32)
+        lengths[len(tokens) - 1] = context
+        kwargs["seq_lens"] = jnp.asarray(lengths)
+        expected = streamindex_topk(**kwargs)
+        actual = dispatch(*(kwargs[name] for name in names))
+        for a, b in zip(actual, expected):
+            np.testing.assert_array_equal(np.asarray(a), np.asarray(b))

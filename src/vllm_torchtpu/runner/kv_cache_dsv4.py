@@ -140,7 +140,7 @@ class DsV4KVCacheAllocator:
             CSA `*.attn`      NoPE int32 `(N, T, 128)`   512B/token
                               RoPE int32 `(N, T/4, 128)` 128B/token, in a
                                                          companion array
-            indexer k_cache   uint8 `(N, T/4, 4, 256)`   256B/token
+            indexer k_cache   uint8 `(N, 33, 4, T)`      132B/token + separate state
             HCA `*.attn`      uint8 `(N, T*2, 4, 128)`  1024B/token (raw bf16)
 
         The CSA arrays are int32 so the SparseCore gather can fetch a token's
@@ -152,7 +152,7 @@ class DsV4KVCacheAllocator:
 
         - Every SWA cache maps onto a CSA NoPE array by its position in its
           cache group.
-        - Every CSA / indexer compressor state cache maps onto the array of
+        - Every CSA compressor state cache maps onto the array of
           its own compressed-KV layer: the compressor kernel writes the f32
           state rows and the compressed KV through that one buffer. State and
           full-attention groups never own the same block ID, so the rows
@@ -189,9 +189,14 @@ class DsV4KVCacheAllocator:
             spec = per_layer_spec(layer_name)
             page_size = spec.num_states
             if layer_name.endswith(self._DS_V4_INDEXER_CACHE_SUFFIX):
-                # Lightning indexer: 128 fp8 values + 1 e8m0 scale per token,
-                # padded to a 256B record; 4 tokens per row.
-                shape = (num_blocks, page_size // packing, packing, 256)
+                # Persistent SAL: 128 payload bytes + 4 scale/padding bytes.
+                # Its separate state allocation is included in the cache
+                # spec budget; no per-step HAS/SAL migration.
+                shape = (
+                    (num_blocks, 33, packing, page_size)
+                    if page_size % 128 == 0
+                    else (num_blocks, page_size // packing, packing, 256)
+                )
                 kv_caches[layer_name] = _create_cache(shape, layer_name)
             elif spec.tokens_per_state == self._DS_V4_CSA_COMPRESS_RATIO:
                 # CSA is split across two arrays, for NoPE and RoPE.
@@ -261,6 +266,24 @@ class DsV4KVCacheAllocator:
                 )
             if kv_layer_name in hca_layer_names:
                 hca_state_layers.append(layer_name)
+            elif (
+                kv_layer_name.endswith(self._DS_V4_INDEXER_CACHE_SUFFIX)
+                and per_layer_spec(kv_layer_name).num_states % 128 == 0
+            ):
+                state_spec = per_layer_spec(layer_name)
+                state_rows = (
+                    state_spec.block_size * state_spec.head_size // (packing * 256)
+                )
+                kv_spec = per_layer_spec(kv_layer_name)
+                records_bytes = kv_spec.num_states * 132
+                state_bytes = state_rows * packing * 256
+                if records_bytes + state_bytes > kv_spec.num_states * kv_spec.head_size:
+                    raise ValueError(
+                        "SAL records and FP32 state exceed the Indexer page budget"
+                    )
+                kv_caches[layer_name] = _create_cache(
+                    (num_blocks, state_rows, packing, 256), layer_name
+                )
             else:
                 kv_caches[layer_name] = kv_caches[kv_layer_name]
 
