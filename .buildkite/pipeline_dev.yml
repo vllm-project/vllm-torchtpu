@@ -171,10 +171,13 @@ steps:
     depends_on:
       - build_docker
       - k3_engine_image
-    # The group the nightly Kimi-K3 pairs in pipeline_perf_kube.yml join, so a
-    # build waits for a running pair instead of competing for its slices.
-    concurrency_group: "tpu/v7x-2x2x4"
-    concurrency: 1
+    # No concurrency group, so two pairs can run at once on the four 2x2x4
+    # slice pools. Kueue admits a pair's 32 chips together and JobSet gives
+    # each role a slice of its own, so two pairs cannot split slices. A second
+    # pair borrows 32 chips from the tpu7x cohort when they are idle (the
+    # lending queues never reclaim) and otherwise waits in Kueue, for up to the
+    # launcher's queue_max_seconds. The nightly pairs in pipeline_perf_kube.yml
+    # keep their group, so they still run one at a time among themselves.
     timeout_in_minutes: 1440
     env:
       # The kube launcher uploads whatever the workload leaves here as the
