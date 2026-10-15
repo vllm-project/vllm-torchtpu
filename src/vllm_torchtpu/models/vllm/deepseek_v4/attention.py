@@ -34,6 +34,10 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.hca_compress_attention import (
+    attention_compressor,
+    attention_compressor_shared,
+)
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention_layer_base import AttentionBackend
@@ -95,10 +99,6 @@ def _fake_qkv_rms_norm(x, q_weight, kv_weight, *args, **kwargs):
     )
 
 
-def _fake_qkv_preprocess(q, kv, *args, **kwargs):
-    return torch.empty_like(q), torch.empty_like(kv)
-
-
 def _qnorm_rope_jax(
     x: jax.Array,
     positions: jax.Array,
@@ -139,6 +139,10 @@ def _o_proj_jax(
         inverse=True,
         quantize_activations=True,
     )
+
+
+def _fake_qkv_preprocess(q, kv, *args, **kwargs):
+    return torch.empty_like(q), torch.empty_like(kv)
 
 
 def _fake_rope(x, positions, cos_sin_cache, *args, **kwargs):
@@ -325,9 +329,67 @@ class VllmDeepseekV4MLAAttention(
             "_attn_op_instance" if built_from_real_caches else "_attn_op_prof_instance",
             op,
         )
+        if self.compress_ratio == 128:
+            # The runner prebuilds attn_op before Dynamo tracing. Build the
+            # paired decode entry here too, including after cache rebinding.
+            preprocess_op, real = self._build_attn_op(preprocess=True)
+            object.__setattr__(
+                self,
+                "_hca_preprocess_attn_op_instance"
+                if real
+                else "_hca_preprocess_attn_op_prof_instance",
+                preprocess_op,
+            )
+        if self.compress_ratio == 128:
+            comp_op, real = self._build_attn_op(preprocess=True, compress=True)
+            object.__setattr__(
+                self,
+                "_hca_compressor_attn_op_instance"
+                if real
+                else "_hca_compressor_attn_op_prof_instance",
+                comp_op,
+            )
         return op
 
-    def _build_attn_op(self):
+    @property
+    def hca_compressor_attn_op(self):
+        op = self.__dict__.get("_hca_compressor_attn_op_instance")
+        if op is not None:
+            return op
+        if _live_cache(self.mla_attn.swa_cache_layer.kv_cache) is None:
+            prof = self.__dict__.get("_hca_compressor_attn_op_prof_instance")
+            if prof is not None:
+                return prof
+        op, real = self._build_attn_op(preprocess=True, compress=True)
+        object.__setattr__(
+            self,
+            "_hca_compressor_attn_op_instance"
+            if real
+            else "_hca_compressor_attn_op_prof_instance",
+            op,
+        )
+        return op
+
+    @property
+    def hca_preprocess_attn_op(self):
+        op = self.__dict__.get("_hca_preprocess_attn_op_instance")
+        if op is not None:
+            return op
+        if _live_cache(self.mla_attn.swa_cache_layer.kv_cache) is None:
+            prof = self.__dict__.get("_hca_preprocess_attn_op_prof_instance")
+            if prof is not None:
+                return prof
+        op, real = self._build_attn_op(preprocess=True)
+        object.__setattr__(
+            self,
+            "_hca_preprocess_attn_op_instance"
+            if real
+            else "_hca_preprocess_attn_op_prof_instance",
+            op,
+        )
+        return op
+
+    def _build_attn_op(self, *, preprocess=False, compress=False):
         vllm_context = get_vllm_model_wrapper_context()
         mesh = get_pallas_op_mesh()
 
@@ -403,10 +465,28 @@ class VllmDeepseekV4MLAAttention(
         if not isinstance(fp8_compute, bool):
             raise ValueError("tpu_csa_fp8_compute must be a boolean")
         csa_fp8_compute = is_csa and fp8_compute
-        wrapped_fn = functools.partial(
+        shared_state = False
+        if compress:
+            state_tensor = _live_cache(self.mla_attn.compressor.state_cache.kv_cache)
+            shared_state = bool(
+                state_tensor is not None
+                and swa_tensor is not None
+                and state_tensor.data_ptr() == swa_tensor.data_ptr()
+                and state_tensor.shape == swa_tensor.shape
+                and state_tensor.dtype == swa_tensor.dtype
+            )
+            object.__setattr__(self, "_hca_state_swa_shared", shared_state)
+        attention_fn = (
             functools.partial(_attention_csa, use_fp8_compute=csa_fp8_compute)
             if is_csa
-            else _attention_hca,
+            else attention_compressor_shared
+            if compress and shared_state
+            else attention_compressor
+            if compress
+            else _attention_hca
+        )
+        wrapped_fn = functools.partial(
+            attention_fn,
             sm_scale=sm_scale,
             sliding_window=self.window_size,
             logical_page_size=logical_page_size,
@@ -414,6 +494,20 @@ class VllmDeepseekV4MLAAttention(
             two_caches_same_buffer=two_caches_same_buffer,
             non_causal_block=non_causal,
         )
+
+        if preprocess:
+            assert self.compress_ratio == 128 and not is_csa and not swa_only
+            wrapped_fn = functools.partial(wrapped_fn, eps=float(self.mla_attn.eps))
+
+        if compress:
+            assert preprocess
+            c = self.mla_attn.compressor
+            wrapped_fn = functools.partial(
+                wrapped_fn,
+                state_block_size=c.state_cache.block_size,
+                compress_eps=float(c.rms_norm_eps),
+                quant_block=c._quant_block,
+            )
 
         op_type = "swa" if swa_only else ("csa" if is_csa else "hca")
         # Build unique cache key encoding geometry, overlay status, block
@@ -427,6 +521,15 @@ class VllmDeepseekV4MLAAttention(
             f"{'' if built_from_real_caches else '_prof'}"
         )
 
+        if preprocess:
+            op_name += f"_qkv_e{_name_float(float(self.mla_attn.eps))}"
+        if compress:
+            c = self.mla_attn.compressor
+            op_name += (
+                f"_compress_s{c.state_cache.block_size}"
+                f"_e{_name_float(float(c.rms_norm_eps))}_q{c._quant_block}"
+                f"_shared{int(shared_state)}"
+            )
         if op_name in _pallas_op_cache:
             return _pallas_op_cache[op_name], built_from_real_caches
 
@@ -465,13 +568,35 @@ class VllmDeepseekV4MLAAttention(
         if is_csa:
             input_partition_specs += (P(),)  # main_cache_rope
 
+        if preprocess:
+            input_partition_specs += (P(), P())  # positions, cos_sin_cache
+
+        if compress:
+            input_partition_specs += (
+                P(),
+                P(),
+                P(),
+                P(),
+                P(),
+                P(batch_axis),
+                P(),
+                P(batch_axis),
+                P(),
+            )
+        if compress and shared_state:
+            input_partition_specs = (
+                input_partition_specs[:20] + input_partition_specs[21:]
+            )
+
         # Donate sw_cache to permit in-place updates by the Pallas
         # sliding-window kernel.
         attn_jax_op = pallas.jax_op(
             op_name,
             wrapped_fn,
             mesh=mesh,
-            donate_argnums=(2,),
+            donate_argnums=((2, 7) if shared_state else (2, 7, 20))
+            if compress
+            else (2,),
             input_partition_specs=input_partition_specs,
         )
 
@@ -483,6 +608,16 @@ class VllmDeepseekV4MLAAttention(
                 dtype=q.dtype,
                 device=q.device,
             )
+            if compress and shared_state:
+                return out_tensor, torch.empty_like(args[4]), torch.empty_like(sw_cache)
+            if compress:
+                # *args starts at operand3; main7 and state20 are cache outputs.
+                return (
+                    out_tensor,
+                    torch.empty_like(args[17]),
+                    torch.empty_like(args[4]),
+                    torch.empty_like(sw_cache),
+                )
             return out_tensor, torch.empty_like(sw_cache)
 
         attn_jax_op.register_fake(_fake_attn)
@@ -648,12 +783,31 @@ class VllmDeepseekV4MLAAttention(
         q = self.wq_b(qr).view(
             qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim
         )
-        q, kv = self.qkv_preprocess_op(
-            q, kv, positions, self.mla_attn.rotary_emb.cos_sin_cache
-        )
+        preprocess_hca = self.compress_ratio == 128
+        if not preprocess_hca:
+            q, kv = self.qkv_preprocess_op(
+                q,
+                kv,
+                positions,
+                self.mla_attn.rotary_emb.cos_sin_cache,
+            )
 
         topk_indices = None
         compressor = getattr(self.mla_attn, "compressor", None)
+        # Keep operand discovery stable across prefill/decode FX traces.
+        # The JAX adapter selects the dense single-token fast path.
+        compress_hca = (
+            preprocess_hca
+            and compressor is not None
+            and hidden_states.shape[-1:] == (4096,)
+            and q.shape[1:] == (64, 512)
+            and hidden_states.dtype == torch.bfloat16
+            and compressor.head_dim == 512
+            and compressor.state_cache.block_size == 32
+            and not compressor.overlap
+            and compressor.fused_wkv_wgate.weight.shape == (4096, 1024)
+            and compressor.fused_wkv_wgate.weight.dtype == torch.bfloat16
+        )
         if self.indexer is not None:
             indexer_emb = getattr(
                 self.mla_attn,
@@ -663,7 +817,7 @@ class VllmDeepseekV4MLAAttention(
             topk_indices = self.indexer(
                 hidden_states, qr, indexer_weights, positions, indexer_emb
             )
-        if compressor is not None:
+        if compressor is not None and not compress_hca:
             compressor(hidden_states, positions, self.mla_attn.rotary_emb)
 
         res = self.forward_mqa(
@@ -672,6 +826,8 @@ class VllmDeepseekV4MLAAttention(
             positions,
             None,
             topk_indices=topk_indices,
+            preprocess_hca=preprocess_hca,
+            composite_hidden=hidden_states if compress_hca else None,
         )
         return res
 
@@ -701,6 +857,8 @@ class VllmDeepseekV4MLAAttention(
         output: torch.Tensor | None,
         *,
         topk_indices: torch.Tensor | None,
+        preprocess_hca: bool = False,
+        composite_hidden: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Prepare metadata operands and dispatch the Pallas attention op."""
         attn_ctx = get_forward_context().attn_metadata
@@ -830,7 +988,53 @@ class VllmDeepseekV4MLAAttention(
                 main_cache_rope = main_cache_kv.clone()
             operands += (main_cache_rope,)
 
-        output, new_sw_cache = self.attn_op(*operands)
+        if preprocess_hca:
+            operands += (positions, self.mla_attn.rotary_emb.cos_sin_cache)
+            c = self.mla_attn.compressor
+            sm = (
+                attn_ctx.get(c.state_cache.prefix)
+                if isinstance(attn_ctx, dict)
+                else None
+            )
+            kp = getattr(
+                c.k_cache, "prefix", getattr(c.k_cache, "custom_prefix", None)
+            ) or getattr(c, "k_cache_prefix", None)
+            km = attn_ctx.get(kp) if isinstance(attn_ctx, dict) else None
+            history = c._as_kernel_cache_view(c.state_cache.kv_cache)
+            if (
+                sm is not None
+                and km is not None
+                and history is not None
+                and composite_hidden is not None
+            ):
+                extra_operands = (
+                    composite_hidden,
+                    c.fused_wkv_wgate.weight,
+                    c.ape.clone(),
+                    c.norm.weight.clone(),
+                    history,
+                    sm.block_tables,
+                    sm.query_start_loc,
+                    km.block_tables,
+                    sm.request_distribution,
+                )
+                if self.__dict__.get("_hca_state_swa_shared", False):
+                    output, new_main, new_sw_cache = self.hca_compressor_attn_op(
+                        *operands, *extra_operands[:4], *extra_operands[5:]
+                    )
+                else:
+                    output, new_history, new_main, new_sw_cache = (
+                        self.hca_compressor_attn_op(*operands, *extra_operands)
+                    )
+                    history.copy_(new_history)
+                main_cache_kv.copy_(new_main)
+            else:
+                # Profiling and incomplete metadata retain the original guarded calls.
+                if composite_hidden is not None:
+                    c(composite_hidden, positions, self.mla_attn.rotary_emb)
+                output, new_sw_cache = self.hca_preprocess_attn_op(*operands)
+        else:
+            output, new_sw_cache = self.attn_op(*operands)
 
         if (
             orig_sw_cache is not None

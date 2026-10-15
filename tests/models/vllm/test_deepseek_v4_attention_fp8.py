@@ -59,3 +59,36 @@ def test_csa_fp8_option_does_not_change_other_attention(compress_ratio):
 def test_csa_fp8_rejects_ambiguous_configuration():
     with pytest.raises(ValueError, match="must be a boolean"):
         build_op("false")
+
+
+@pytest.mark.parametrize("name", ["hca_preprocess_attn_op", "hca_compressor_attn_op"])
+@pytest.mark.parametrize("real_cache", [False, True])
+def test_hca_op_getter_reuses_profile_and_real_registration(name, real_cache):
+    import torch
+
+    calls = []
+    registered = object()
+    layer = SimpleNamespace(
+        mla_attn=SimpleNamespace(
+            swa_cache_layer=SimpleNamespace(
+                kv_cache=torch.empty(1) if real_cache else None
+            )
+        )
+    )
+
+    def build(**kwargs):
+        calls.append(kwargs)
+        return registered, real_cache
+
+    layer._build_attn_op = build
+    if real_cache:
+        # A profiling op must not be reused after binding real caches.
+        setattr(layer, "_" + name + "_prof_instance", object())
+    getter = getattr(VllmDeepseekV4MLAAttention, name).fget
+    assert getter(layer) is registered
+    assert getter(layer) is registered
+    assert len(calls) == 1
+    expected = {"preprocess": True}
+    if name == "hca_compressor_attn_op":
+        expected["compress"] = True
+    assert calls[0] == expected

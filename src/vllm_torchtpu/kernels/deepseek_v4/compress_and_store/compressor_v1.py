@@ -383,6 +383,42 @@ def compressor_forward(
 
     args = dict(locals())
     args.pop("decode_compressor")
+    from . import hca_decode_compressor
+
+    if rope_cache is None and hca_decode_compressor.is_supported(
+        hidden_states,
+        wkv_wgate,
+        cache,
+        state_cache,
+        query_start_loc,
+        block_table,
+        kv_block_table,
+        head_dim=head_dim,
+        compress_ratio=compress_ratio,
+        overlap=overlap,
+        state_block_size=state_block_size,
+    ):
+        dense = (
+            jnp.all(distribution == 1)
+            & jnp.all(
+                query_start_loc == jnp.minimum(jnp.arange(query_start_loc.size), 1)
+            )
+            & (positions[0] >= 0)
+            & (
+                positions[0] // state_block_size
+                < block_table.size // (query_start_loc.size - 1)
+            )
+            & (
+                positions[0] // (compress_ratio * (cache.shape[1] // 2))
+                < kv_block_table.size // (query_start_loc.size - 1)
+            )
+        )
+        return jax.lax.cond(
+            dense,
+            lambda _: hca_decode_compressor.compressor_forward(**args),
+            lambda _: compressor_forward_generic(**args),
+            None,
+        )
     n = hidden_states.shape[0]
     reqs = query_start_loc.size - 1
     eligible = (

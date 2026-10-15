@@ -20,3 +20,9 @@
 FUSED_CSA_METADATA_BUCKETS = {
     ("TPU v7", 512, 256, 65, 256): (1, 2, 4),
 }
+
+# (device, query heads, head dimension, SWA page size, HCA page size) ->
+# HCA pages per tile. Preserve the generic HCA kernel's 32-page reduction order.
+FUSED_HCA_DECODE_KV_PAGES = {
+    ("TPU v7", 64, 512, 128, 8): 32,
+}

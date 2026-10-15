@@ -189,6 +189,54 @@ def create_cache(rng, total_pages, page_size, head_dim, kv_dtype):
 
 
 class CorrectnessTest(parameterized.TestCase):
+    @parameterized.named_parameters(
+        ("decode", (1, 1, 1), None, 64),
+        ("decode_32_heads", (1, 1, 1), None, 32),
+        ("decode_63_heads", (1, 1, 1), None, 63),
+        ("mixed", (0, 0, 1), None, 64),
+        ("mixed_32_heads", (0, 0, 1), None, 32),
+        ("mixed_63_heads", (0, 0, 1), None, 63),
+        ("one_token_prefill", (0, 1, 1), 1, 64),
+        ("one_token_prefill_32_heads", (0, 1, 1), 1, 32),
+        ("one_token_prefill_63_heads", (0, 1, 1), 1, 63),
+    )
+    def test_single_query_hca(self, distribution, chunk_prefill_size, heads):
+        """One query must merge paged KV and SWA correctly for every group."""
+        rng = np.random.default_rng(577)
+        q = gen_random(rng, (1, heads, 512), jnp.bfloat16) * 0.1
+        reference_cache, cache = create_cache(rng, 65, 8, 512, jnp.bfloat16)
+        kv_lens = jnp.array([512], dtype=jnp.int32)
+        kv_lens_to_attend = jnp.array([507], dtype=jnp.int32)
+        pages = jnp.asarray(rng.permutation(65), dtype=jnp.int32)
+        cu_q_lens = jnp.array([0, 1], dtype=jnp.int32)
+        distribution = jnp.array(distribution, dtype=jnp.int32)
+        sinks = generate_attention_sinks(rng, heads)
+        swa_acc = gen_random(rng, q.shape, jnp.bfloat16)
+        swa_l = gen_random(rng, (1, heads), jnp.float32) + 1
+        swa_m = gen_random(rng, (1, heads), jnp.float32)
+        args = (
+            kv_lens,
+            kv_lens_to_attend,
+            pages,
+            cu_q_lens,
+            distribution,
+            sinks,
+            swa_acc,
+            swa_l,
+            swa_m,
+        )
+        expected = ref_implementation(q, reference_cache, *args, sm_scale=512**-0.5)
+        actual = mla.mla_ragged_paged_attention(
+            q,
+            cache,
+            *args,
+            sm_scale=512**-0.5,
+            num_kv_pages_per_block=(32, 32, 32),
+            num_queries_per_block=(1, 32, 32),
+            chunk_prefill_size=chunk_prefill_size,
+        )
+        np.testing.assert_allclose(actual, expected, rtol=0.01, atol=0.002)
+
     def test_correctness(self):
         rng = np.random.default_rng(1234)
 

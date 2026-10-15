@@ -19,6 +19,14 @@ PROJECTION_OUTPUT_TILES: dict[tuple[int, int, int, int], int] = {
     (1, 4096, 512, 4): 512,
 }
 
+# Single-query HCA metadata rows validated with max_model_len=66560. Keep
+# longer tables on the general path; the state row alone occupies 8320 B SMEM.
+HCA_DECODE_METADATA_PAGES: dict[
+    tuple[str, int, int, int, int, int], tuple[int, int]
+] = {
+    ("TPU v7", 4096, 1024, 128, 32, 256): (2080, 65),
+}
+
 # (token count, request capacity, compression ratio). The compact metadata
 # removes long prefix scans at 256 slots; 1/4-slot consumers regress.
 COMPACT_BOUNDARY_BATCHES: frozenset[tuple[int, int, int]] = frozenset({(1, 256, 4)})

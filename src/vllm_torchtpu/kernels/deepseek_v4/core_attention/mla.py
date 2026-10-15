@@ -936,6 +936,37 @@ def mla_ragged_paged_attention(
             swa_m,
         )
 
+    if (
+        q.shape == (1, 64, 512)
+        and (actual_num_q_heads, actual_head_dim) == (64, 512)
+        and q.dtype == jnp.bfloat16
+        and cache_kv.shape[1:] == (16, 4, 128)
+        and len(set(num_kv_pages_per_blocks)) == 1
+    ):
+        # A single query has at most one token per sequence, including a
+        # one-token prefill. With identical KV tiles, all distribution groups
+        # use the same arithmetic. Keep the total sequence count dynamic so
+        # padded steps perform no work, without launching empty group kernels.
+        return run_mla_kernel(
+            q,
+            cache_kv,
+            kv_lens,
+            kv_lens_to_attend,
+            page_indices,
+            cu_q_lens,
+            attention_sinks,
+            swa_accumution,
+            swa_l,
+            swa_m,
+            num_kv_pages_per_block=num_kv_pages_per_blocks[0],
+            num_queries_per_block=1,
+            start_seq_idx=jnp.int32(0),
+            end_seq_idx=distribution[2],
+            static_q_len=1,
+            batch_size=1,
+            case=MlaCase.MIXED,
+        )
+
     batch_distribution = (distribution[0] // decode_batch_size) * decode_batch_size
     # Batched decode
     q = run_mla_kernel(
