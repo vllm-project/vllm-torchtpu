@@ -95,7 +95,10 @@ def project_uv_heads(
 
 
 def merge_lse_partials_scatter_heads(
-    output: torch.Tensor, lse: torch.Tensor, is_backbone: bool = True
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    is_backbone: bool = True,
+    wire_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Combine this rank's partial attention output with its peers'.
 
@@ -149,7 +152,12 @@ def merge_lse_partials_scatter_heads(
     ):
         return merge_lse_partials_all_to_all(output, lse, group)
 
-    rs_dtype = output.dtype if envs.TPU_DCP_RS_OUT_PRECISION and is_backbone else None
+    # A W_UV-projected f32 partial still crosses in the attention dtype.
+    rs_dtype = (
+        (wire_dtype or output.dtype)
+        if envs.TPU_DCP_RS_OUT_PRECISION and is_backbone
+        else None
+    )
     return cp_lse_ag_out_rs(output, lse, group, rs_dtype=rs_dtype)
 
 

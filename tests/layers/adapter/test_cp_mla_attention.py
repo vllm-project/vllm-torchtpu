@@ -148,6 +148,39 @@ def test_projecting_before_the_merge_matches_projecting_after(dcp_size, monkeypa
     np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)
 
 
+@pytest.mark.parametrize(
+    "rs_bf16, is_backbone, want",
+    [
+        (True, True, torch.bfloat16),
+        (True, False, torch.float32),
+        (False, True, torch.float32),
+    ],
+)
+def test_a_projected_partial_crosses_in_the_wire_dtype(
+    rs_bf16, is_backbone, want, monkeypatch
+):
+    """A W_UV-projected partial is f32, but the backbone's bf16 reduce-scatter
+    must stay bf16: the caller names the wire dtype. The drafter stays f32."""
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_RS_OUT_PRECISION", rs_bf16)
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A", False)
+    outputs, lses = _partials(np.random.default_rng(12), 4)
+    group = _FakeGroup(outputs, lses, 0)
+    seen = []
+    inner = group.reduce_scatter
+
+    def spy(tensor, dim=-1):
+        seen.append(tensor.dtype)
+        return inner(tensor, dim)
+
+    group.reduce_scatter = spy
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
+    got = cp_mla.merge_lse_partials_scatter_heads(
+        outputs[0], lses[0], is_backbone=is_backbone, wire_dtype=torch.bfloat16
+    )
+    assert seen == [want]
+    assert got.dtype == torch.float32
+
+
 def test_projection_applies_the_per_head_output_scale():
     rng = np.random.default_rng(11)
     partial = torch.from_numpy(rng.standard_normal((3, 4, 16)).astype(np.float32))

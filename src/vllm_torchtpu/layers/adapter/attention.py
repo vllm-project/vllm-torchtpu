@@ -2479,6 +2479,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 # comparison would pin its graph to the first size, and the
                 # large buckets fail with ShapeSpecializationError. So the
                 # drafter keeps the reduce-scatter, as with the flag off.
+                wire_dtype = partial.dtype
                 if uv_first:
                     partial = project_uv_heads(
                         partial, layer.W_UV_dcp_qrep, layer.W_UV_dcp_qrep_scale
@@ -2487,6 +2488,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     partial,
                     lse,
                     is_backbone=vllm_compilation_backends.model_tag == "backbone",
+                    wire_dtype=wire_dtype,
                 )
             else:
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:

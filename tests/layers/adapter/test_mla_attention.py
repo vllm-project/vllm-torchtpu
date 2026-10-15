@@ -985,6 +985,8 @@ def test_mla_forward_qrep_applies_w_uv_before_the_merge(monkeypatch):
 
     (seen,) = merged_inputs
     assert seen.dtype == torch.float32
+    # The merge is told the attention dtype, so a bf16 wire stays bf16.
+    assert merge_kwargs[0]["wire_dtype"] == partial.dtype
     projected = torch.bmm(partial.transpose(0, 1), layer.W_UV_dcp_qrep).transpose(0, 1)
     torch.testing.assert_close(seen, projected)
     torch.testing.assert_close(
