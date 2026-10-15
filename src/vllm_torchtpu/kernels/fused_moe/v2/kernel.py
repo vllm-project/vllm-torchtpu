@@ -1234,7 +1234,30 @@ def _build_fused_ep_moe_kernel(
             def _():
                 _rows_wait(send_scl_sems.at[parity], cscl_hbm, subs)
 
-        def prime_expert(e, lhs_slot, wslot, window_started):
+        def n_groups_of(e):
+            """Index-window groups expert ``e``'s routed rows span."""
+            tiles = -(-expert_rows_sm[e] // tile_m)
+            return -(-tiles // gather_tiles)
+
+        def issue_rows_ahead(e, visit_j, wslot):
+            """After expert ``e`` (visit ``visit_j``) has its first tile's rows
+            in flight: start the window its rows no longer need -- its second
+            group's, or, for a single-group expert, the next visit's first.
+
+            Either way it lands in the other scalar slot, which the previous
+            expert's last group held and whose rows have all been issued.
+            """
+            other = jnp.int32(1) - wslot
+
+            @pl.when(expert_rows_sm[e] > gather_payload_rows)
+            def _():
+                issue_gather_window(expert_base_sm[e] + gather_payload_rows, other)
+
+            @pl.when(jnp.logical_and(n_groups_of(e) == 1, visit_j + 1 < n_visit))
+            def _():
+                issue_gather_window(expert_base_sm[visit_sm[visit_j + 1]], other)
+
+        def prime_expert(e, visit_j, lhs_slot, wslot, window_started):
             """Prime expert ``e``'s metadata and first activation tile.
 
             ``wslot`` is the scalar-memory slot this expert's group-zero index
@@ -1256,15 +1279,11 @@ def _build_fused_ep_moe_kernel(
             lhs_issue_tile(
                 slab_base, jnp.minimum(rows, tile_m) // ROWBLK, lhs_slot, wslot, shift
             )
-
-            # Keep group one in flight while tile zero computes. Later group
-            # boundaries refill the just-retired alternate slot in the same
-            # way, so at most two fixed windows are ever resident.
-            @pl.when(rows > gather_payload_rows)
-            def _():
-                issue_gather_window(
-                    slab_base + gather_payload_rows, jnp.int32(1) - wslot
-                )
+            # Keep group one (or the next visit's window) in flight while tile
+            # zero computes. Later group boundaries refill the just-retired
+            # alternate slot in the same way, so at most two fixed windows are
+            # ever resident.
+            issue_rows_ahead(e, visit_j, wslot)
 
         def expert_tiles(e, visit_i, carry):
             """One expert step: a fori_loop over its [tile_m, H] tiles."""
@@ -1318,6 +1337,7 @@ def _build_fused_ep_moe_kernel(
             # second-to-last group retired -- free from this expert's last
             # tile on, whatever its group count.
             n_groups = -(-n_tiles // gather_tiles)
+            single_group = n_groups == 1
             next_wslot = lax.rem(wslot + n_groups, jnp.int32(2))
 
             def commit_tile(parity, t, tile_block_base, live_blocks):
@@ -1526,10 +1546,32 @@ def _build_fused_ep_moe_kernel(
                         next_shift + next_within * tile_m,
                     )
 
-                # The next expert's index window, a tile early. This is the
-                # only arrival the kernel waits for with nothing issued
-                # behind it, so a tile of compute is what it costs to hide.
-                @pl.when(jnp.logical_and(t + 1 == n_tiles, visit_i + 1 < n_visit))
+                last_with_next = jnp.logical_and(
+                    t + 1 == n_tiles, visit_i + 1 < n_visit
+                )
+
+                # A single-group expert started the next visit's index window
+                # when its own rows went out, so the next visit's first tile
+                # is issued here, under this tile's compute, rather than at
+                # the visit boundary with nothing to hide it behind.
+                @pl.when(jnp.logical_and(last_with_next, single_group))
+                def _():
+                    nxt = visit_sm[visit_i + 1]
+                    nbase = expert_base_sm[nxt]
+                    wait_gather_window(nbase, next_wslot)
+                    _, nshift = gather_dma_coords(nbase)
+                    lhs_issue_tile(
+                        nbase,
+                        jnp.minimum(expert_rows_sm[nxt], tile_m) // ROWBLK,
+                        other_parity,
+                        next_wslot,
+                        nshift,
+                    )
+                    issue_rows_ahead(nxt, visit_i + 1, next_wslot)
+
+                # Otherwise the next expert's index window, a tile early: the
+                # visit boundary waits for it and issues the rows.
+                @pl.when(jnp.logical_and(last_with_next, jnp.logical_not(single_group)))
                 def _():
                     issue_gather_window(
                         expert_base_sm[visit_sm[visit_i + 1]], next_wslot
@@ -1728,11 +1770,14 @@ def _build_fused_ep_moe_kernel(
             # not the round trip. Empty experts are absent from the visit list.
             tiles_done = carry[0]
 
-            @pl.when(visit_i + 1 < n_visit)
+            @pl.when(
+                jnp.logical_and(visit_i + 1 < n_visit, jnp.logical_not(single_group))
+            )
             def _():
                 nxt = visit_sm[visit_i + 1]
                 prime_expert(
                     nxt,
+                    visit_i + 1,
                     lax.rem(tiles_done, jnp.int32(OUT_PARITIES)),
                     next_wslot,
                     jnp.bool_(True),
@@ -1767,7 +1812,9 @@ def _build_fused_ep_moe_kernel(
 
         @pl.when(n_visit > 0)
         def _():
-            prime_expert(visit_sm[0], jnp.int32(0), jnp.int32(0), jnp.bool_(False))
+            prime_expert(
+                visit_sm[0], jnp.int32(0), jnp.int32(0), jnp.int32(0), jnp.bool_(False)
+            )
 
         def push_expert(e):
             """Push expert e's remote regions and hop its own-dest region."""
