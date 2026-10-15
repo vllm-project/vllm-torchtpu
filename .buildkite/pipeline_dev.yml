@@ -157,7 +157,8 @@ steps:
   #   K3_ENGINE_REF    the ref of this repository the engine image is built
   #                    from: a branch name, a tag, a full 40-character commit
   #                    SHA (not a short one, which cannot be fetched) or
-  #                    refs/pull/<N>/head; default inferact/megakernel-integration
+  #                    refs/pull/<N>/head; default
+  #                    inferact/megakernel-integration-1015
   #   K3_ENGINE_IMAGE  an engine image to use as it is, instead of building one
   # One point per build, since each needs its own decode server. Point 1 took
   # ~45 min from admission. The step passes even when every request fails,

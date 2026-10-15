@@ -34,6 +34,7 @@ from typing import Any
 import torch
 from vllm.distributed import parallel_state
 
+import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.dcp import get_dcp_world_size
 from vllm_torchtpu.distributed.mesh_utils import (
     _collect_rank_to_device_id,
@@ -56,6 +57,7 @@ EP_AXIS_NAME = "d"
 
 _MESH_CACHE: dict[tuple[str, tuple[int, ...]], Any] = {}
 _TOKEN_GROUP_CACHE: dict[tuple, tuple[tuple[int, ...], ...]] = {}
+_SORTED_GATHER_CACHE: dict[tuple, tuple[Any, tuple[int, ...]]] = {}
 
 
 def ep_token_replica_groups(
@@ -174,13 +176,21 @@ def _ep_mesh_order(device_ids: tuple[int, ...]) -> tuple[int, ...]:
     conflicting device assignments" -- for DCP whenever a DCP group is not a
     contiguous tile of the sorted EP mesh, e.g. TP4/DCP4 on tpu7x, whose DCP
     groups are devices [0, 1, 4, 5] and [6, 7, 2, 3].
+
+    With MOE_FUSED_EP_SORTED_GATHER the mesh stays in rank order too, and the
+    activation all-gather gets the device-id order on its own instead; see
+    `ep_sorted_gather_group`.
     """
     if len(set(device_ids)) != len(device_ids):
         raise RuntimeError(
             f"Two EP ranks report the same TPU global device id: {device_ids}"
         )
     ep_ranks = range(len(device_ids))
-    if get_pcp_world_size() > 1 or get_dcp_world_size() > 1:
+    if (
+        get_pcp_world_size() > 1
+        or get_dcp_world_size() > 1
+        or envs.MOE_FUSED_EP_SORTED_GATHER
+    ):
         return tuple(ep_ranks)
     return tuple(sorted(ep_ranks, key=device_ids.__getitem__))
 
@@ -212,6 +222,45 @@ def ep_mesh_index() -> int | None:
         return None
     ranks = tuple(int(r) for r in group.ranks)
     return _ep_mesh_order(device_ids).index(ranks.index(_get_current_global_rank()))
+
+
+def ep_sorted_gather_group() -> tuple[Any, tuple[int, ...]] | None:
+    """A process group over the EP ranks in ascending device-id order.
+
+    Returns (group, positions), where positions[i] is the group rank of EP
+    rank i, or None when EP is off. An all-gather over this group is the
+    SparseCore gather the device-id ordered EP mesh got its N-dimensional
+    algorithm from, while the Pallas kernels around it keep a rank-ordered
+    DeviceAssignment: torch_tpu lets a torch collective's group order differ
+    from the kernels' and rewrites its replica groups into the module's
+    partitions, but requires every JAX op in a module to share one order.
+    The gather's blocks come out in group order, which
+    `fused_ep_moe_v2(gather_positions=...)` reads.
+
+    `torch.distributed.new_group` is collective over the whole world, so this
+    must be called by every rank in the same order, at weight load.
+    """
+    group = get_ep_group()
+    device_ids = ep_device_ids()
+    if group is None or device_ids is None:
+        return None
+    ranks = tuple(int(r) for r in group.ranks)
+    key = (ranks, device_ids)
+    cached = _SORTED_GATHER_CACHE.get(key)
+    if cached is not None:
+        return cached
+    order = tuple(sorted(range(len(ranks)), key=device_ids.__getitem__))
+    # sort_ranks=False, or new_group sorts the list back into global-rank
+    # order and the gather comes out in rank order again.
+    pg = torch.distributed.new_group([ranks[e] for e in order], sort_ranks=False)
+    positions = tuple(order.index(e) for e in range(len(ranks)))
+    logger.info(
+        "Built EP sorted-gather group | device_ids=%s | ep_rank_order=%s",
+        [device_ids[e] for e in order],
+        order,
+    )
+    _SORTED_GATHER_CACHE[key] = (pg, positions)
+    return pg, positions
 
 
 def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
