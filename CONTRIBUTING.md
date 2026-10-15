@@ -43,7 +43,7 @@ git push origin HEAD --force-with-lease
 
 ### 2. Google Cloud Authentication
 <!-- TODO: Once torch_tpu and vllm-torchtpu are open-sourced, torch_tpu will be installable directly from PyPI without GCP authentication. -->
-We authenticate with Google Cloud to access the Torch TPU Virtual Registry (`https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/`), which contains `torch-tpu`, `torch`, and other TPU dependencies.
+We authenticate with Google Cloud to access the Torch TPU Virtual Registry (`https://us-python.pkg.dev/ml-oss-artifacts-published/torch-tpu-release-virtual-registry/simple/`), which contains `torch-tpu`, `torch`, and other TPU dependencies.
 
 Check your active account:
 
@@ -96,7 +96,7 @@ pip install --upgrade pip
 # Install keyring plugin for persistent auth
 pip install keyring keyrings.google-artifactregistry-auth
 # TODO: Replace with the public index once torch_tpu is open-sourced
-export PIP_INDEX_URL="https://oauth2accesstoken@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
+export PIP_INDEX_URL="https://oauth2accesstoken@us-python.pkg.dev/ml-oss-artifacts-published/torch-tpu-release-virtual-registry/simple/"
 
 # Install vllm-torchtpu and dependencies in editable mode (--group vllm pulls vLLM from source;
 # needs pip >= 25.1)

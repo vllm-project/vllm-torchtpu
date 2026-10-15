@@ -498,6 +498,18 @@ class TestTpuCompilerCache:
         compiler.initialize_cache(cache_dir="/tmp/test_cache_dir")
         assert compiler.cache_dir == "/tmp/test_cache_dir"
 
+    def test_runtime_hash_excludes_omni_rope(self):
+        """Verify that diffusion/Omni specific paths are excluded from the hash."""
+        from vllm_torchtpu.compilation.tpu_compiler import (
+            _RUNTIME_CACHE_KEY_EXCLUDED_PATHS,
+        )
+
+        assert (
+            "vllm_torchtpu/kernels/diffusion_attention"
+            in _RUNTIME_CACHE_KEY_EXCLUDED_PATHS
+        )
+        assert "vllm_torchtpu/omni/rope.py" in _RUNTIME_CACHE_KEY_EXCLUDED_PATHS
+
     def test_run_backend_restarts_scheduling_group_ids(self, monkeypatch):
         """A bucket's HLO, and so its cache key, must not depend on what the
         rank compiled before it."""

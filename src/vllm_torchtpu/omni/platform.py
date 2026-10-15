@@ -8,6 +8,7 @@ from torch_tpu._internal.utils import hardware
 from vllm.logger import init_logger
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
+from vllm_torchtpu.env_override import set_libtpu_flag_default
 from vllm_torchtpu.omni.patches import apply_omni_tpu_patches
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
@@ -94,10 +95,28 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
                     world_size - 1,
                 )
             cls._set_shared_slicebuilder_addresses(world_size)
+            cls._offload_dense_all_to_all()
         cls._prepare_singlehost_tpu_env(world_size)
         torch.accelerator.set_device_index(0)
         _ = torch.empty(1, device=torch.device("tpu"))
         torch.accelerator.synchronize()
+
+    @staticmethod
+    def _offload_dense_all_to_all() -> None:
+        """Run dense all-to-alls on SparseCore in multi-rank diffusion workers.
+
+        Ulysses sequence parallelism moves q, k, v and the attention output
+        through dense all-to-alls in every transformer block. By default XLA
+        runs them on the TensorCore, which waits for them.
+        """
+        # TODO: Remove once libtpu enables the SparseCore dense all-to-all offload by
+        # default. This sets os.environ after torch_tpu is imported, but it still
+        # takes effect because libtpu reads LIBTPU_INIT_ARGS when the PjRt client
+        # is created on the first device allocation, the same pre-PjRt window
+        # that _set_shared_slicebuilder_addresses relies on.
+        set_libtpu_flag_default(
+            "--xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all", "true"
+        )
 
     @staticmethod
     def _set_shared_slicebuilder_addresses(world_size: int) -> None:

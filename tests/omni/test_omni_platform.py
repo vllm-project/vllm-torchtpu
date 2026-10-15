@@ -6,13 +6,18 @@ from unittest.mock import MagicMock, patch
 import pytest
 import torch
 
-from .mock_omni import _MockRotaryEmbeddingWan, vllm_omni_mock  # isort: split
+from .mock_omni import (  # isort: split
+    _MockRMSNorm,
+    _MockRotaryEmbeddingWan,
+    vllm_omni_mock,
+)
 
 import vllm_omni
 from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
 from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
 
 from vllm_torchtpu.omni import register_omni_tpu_platform
+from vllm_torchtpu.omni import rope as omni_rope
 from vllm_torchtpu.omni.attention import (
     TpuFlashAttentionBackend,
     TpuFlashAttentionImpl,
@@ -26,8 +31,11 @@ from vllm_torchtpu.omni.patches import (
 )
 from vllm_torchtpu.omni.platform import OmniTpuPlatform
 from vllm_torchtpu.omni.rope import (
+    _pair_swap_matrix,
     apply_rotary_pair_swap,
+    can_fuse_qk_norm_rope,
     rotary_embedding_wan_forward,
+    wan_self_attention_fused,
 )
 
 pytestmark = pytest.mark.omni
@@ -239,6 +247,21 @@ def test_shared_slicebuilder_addresses(monkeypatch):
         os.environ["TORCH_TPU_SLICEBUILDER_ADDRESSES"]
         == "localhost:29501,localhost:29502"
     )
+
+
+def test_offload_dense_all_to_all(monkeypatch):
+    flag = "--xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all"
+    monkeypatch.setenv("LIBTPU_INIT_ARGS", "--xla_foo=1")
+    OmniTpuPlatform._offload_dense_all_to_all()
+    OmniTpuPlatform._offload_dense_all_to_all()
+    assert os.environ["LIBTPU_INIT_ARGS"] == f"--xla_foo=1 {flag}=true"
+    # An explicit user setting wins.
+    monkeypatch.setenv("LIBTPU_INIT_ARGS", f"{flag}=false")
+    OmniTpuPlatform._offload_dense_all_to_all()
+    assert os.environ["LIBTPU_INIT_ARGS"] == f"{flag}=false"
+    monkeypatch.delenv("LIBTPU_INIT_ARGS")
+    OmniTpuPlatform._offload_dense_all_to_all()
+    assert os.environ["LIBTPU_INIT_ARGS"] == f"{flag}=true"
 
 
 def test_dist_backend_after_world_size_pop(monkeypatch):
@@ -477,3 +500,86 @@ def test_startup_warmup_device_sync(monkeypatch):
 
     DiffusionEngine.run_startup_warmup(object())
     assert calls == ["warmup", "sync"]
+
+
+def _rms_norm(x, w, eps):
+    x32 = x.float()
+    out = x32 * torch.rsqrt(x32.pow(2).mean(-1, keepdim=True) + eps)
+    return (w.float() * out).to(x.dtype)
+
+
+def _reference_qk_norm_rope(qkv, wq, wk, cos, sin, eps, head_dim):
+    # Semantics of the fused kernel: (T, 3C) in, repeated-pair tables.
+    dim = qkv.shape[1] // 3
+    swap = _pair_swap_matrix(head_dim, qkv.dtype, qkv.device)
+    outs = []
+    for j, w in ((0, wq), (1, wk)):
+        y = _rms_norm(qkv[:, j * dim : (j + 1) * dim], w, eps)
+        y = y.unflatten(1, (-1, head_dim))
+        out = y * cos[:, None] + (y @ swap) * sin[:, None]
+        outs.append(out.flatten(1))
+    return tuple(outs)
+
+
+class _FakeWanSelfAttention(torch.nn.Module):
+    def __init__(self, dim=64, heads=2, head_dim=128):
+        super().__init__()
+        self.num_heads = self.num_kv_heads = heads
+        self.head_dim = head_dim
+        self.qkv = torch.nn.Linear(dim, 3 * heads * head_dim)
+        self.norm_q = _MockRMSNorm(heads * head_dim)
+        self.norm_k = _MockRMSNorm(heads * head_dim)
+        with torch.no_grad():
+            self.norm_q.weight.uniform_(0.5, 1.5)
+            self.norm_k.weight.uniform_(0.5, 1.5)
+        self.to_gate_compress = None
+        self.to_out = torch.nn.Identity()
+        self.dropout = torch.nn.Identity()
+
+    def to_qkv(self, x):
+        return self.qkv(x), None
+
+    def attn(self, q, k, v, attn_metadata=None):
+        return q * 3 + k * 2 + v
+
+
+def test_wan_self_attention_fused_matches_native(monkeypatch):
+    # The fused forward's glue (flattening, tables, value slice) around the
+    # kernel reproduces vLLM-Omni's norm -> unflatten -> RoPE -> attention.
+    torch.manual_seed(0)
+    attn = _FakeWanSelfAttention()
+    batch, seq, half = 2, 5, attn.head_dim // 2
+    x = torch.randn(batch, seq, 64)
+    cos, sin = torch.randn(1, seq, 1, half), torch.randn(1, seq, 1, half)
+    monkeypatch.setattr(omni_rope, "_qk_norm_rope_op", lambda: _reference_qk_norm_rope)
+    out = wan_self_attention_fused(attn, x, (cos, sin))
+
+    qkv, _ = attn.to_qkv(x)
+    q, k, v = qkv.split(attn.num_heads * attn.head_dim, dim=-1)
+    shape = (attn.num_heads, attn.head_dim)
+    q = _rms_norm(q, attn.norm_q.weight, 1e-6).unflatten(2, shape)
+    k = _rms_norm(k, attn.norm_k.weight, 1e-6).unflatten(2, shape)
+    q = apply_rotary_pair_swap(q, cos, sin)
+    k = apply_rotary_pair_swap(k, cos, sin)
+    want = attn.attn(q, k, v.unflatten(2, shape)).flatten(2, 3)
+    torch.testing.assert_close(out, want)
+
+
+def test_can_fuse_qk_norm_rope():
+    attn = _FakeWanSelfAttention()
+    rot = (torch.ones(1, 3, 1, 64), torch.ones(1, 3, 1, 64))
+    bf16_x = torch.ones(1, 3, 64, dtype=torch.bfloat16)
+    assert can_fuse_qk_norm_rope(attn, bf16_x, rot)
+    assert not can_fuse_qk_norm_rope(attn, torch.ones(1, 3, 64), rot)
+    assert not can_fuse_qk_norm_rope(attn, bf16_x, None)
+    attn.norm_q = torch.nn.LayerNorm(8)  # e.g. DistributedRMSNorm under TP
+    assert not can_fuse_qk_norm_rope(attn, bf16_x, rot)
+
+
+def test_wan_self_attention_patch_falls_back_on_f32():
+    from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
+        WanSelfAttention,
+    )
+
+    apply_omni_model_specific_patches()
+    assert WanSelfAttention()(torch.ones(1, 3, 8)) == "native"
