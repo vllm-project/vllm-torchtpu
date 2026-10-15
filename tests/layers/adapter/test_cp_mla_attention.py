@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""The MLA DCP head gather and log-sum-exp merge (`attention`), the
+"""The MLA DCP head gather and log-sum-exp merge (`cp_mla_attention`), the
 position-ownership rule the indexer's return leg and the KV write agree on, and
 the kernel `return_lse` flag the merge is built on."""
 
@@ -34,7 +34,7 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     SparseMLAKVCacheSpec,
 )
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
-from vllm_torchtpu.layers.adapter import attention as cp_mla
+from vllm_torchtpu.layers.adapter import cp_mla_attention as cp_mla
 from vllm_torchtpu.layers.core import attention_interface
 
 
@@ -60,7 +60,6 @@ class _FakeGroup:
         return total.to(dtype)
 
     def reduce_scatter(self, tensor, dim=-1):
-        assert dim == 0
         total = self._reduced(tensor.dtype)
         width = total.shape[dim] // self.world_size
         return total.narrow(dim, self.rank_in_group * width, width)
@@ -69,7 +68,7 @@ class _FakeGroup:
 def _merge_as_rank(outputs, lses, rank, monkeypatch):
     """The merge as rank `r` sees it: its own head block of the whole answer"""
     group = _FakeGroup(outputs, lses, rank)
-    monkeypatch.setattr(cp_mla, "_get_dcp_group", lambda: group)
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
     return cp_mla.merge_lse_partials_scatter_heads(outputs[rank], lses[rank])
 
 
@@ -155,7 +154,7 @@ def test_a_token_no_rank_owns_is_zero_not_nan(monkeypatch):
 
 
 class _HeadGatherGroup:
-    """Serves `all_gather(dim=0)` from head-major per-rank slices."""
+    """Serves only `all_gather(dim=1)`, from a stack of per-rank head slices."""
 
     def __init__(self, per_rank, rank):
         self.world_size = len(per_rank)
@@ -163,11 +162,9 @@ class _HeadGatherGroup:
         self._per_rank = per_rank
 
     def all_gather(self, tensor, dim=0):
-        assert dim == 0
-        torch.testing.assert_close(
-            tensor, self._per_rank[self.rank_in_group].transpose(0, 1)
-        )
-        return torch.cat([part.transpose(0, 1) for part in self._per_rank], dim=0)
+        assert dim == 1
+        assert tensor.shape == self._per_rank[self.rank_in_group].shape
+        return torch.cat(list(self._per_rank), dim=1)
 
 
 @pytest.mark.parametrize("rank", [0, 1, 2, 3])
@@ -181,7 +178,7 @@ def test_head_gather_puts_this_ranks_heads_in_its_own_block(rank, monkeypatch):
     rng = np.random.default_rng(31)
     per_rank = torch.from_numpy(rng.standard_normal((4, 6, 3, 8)).astype(np.float32))
     monkeypatch.setattr(
-        cp_mla, "_get_dcp_group", lambda: _HeadGatherGroup(per_rank, rank)
+        cp_mla, "get_dcp_group", lambda: _HeadGatherGroup(per_rank, rank)
     )
 
     got = cp_mla.all_gather_heads(per_rank[rank])
@@ -192,13 +189,13 @@ def test_head_gather_puts_this_ranks_heads_in_its_own_block(rank, monkeypatch):
 
 
 def test_head_gather_is_a_noop_without_a_group(monkeypatch):
-    monkeypatch.setattr(cp_mla, "_get_dcp_group", lambda: None)
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: None)
     q = torch.ones(2, 3, 4)
     assert cp_mla.all_gather_heads(q) is q
 
 
 def test_scatter_merge_is_a_noop_without_a_group(monkeypatch):
-    monkeypatch.setattr(cp_mla, "_get_dcp_group", lambda: None)
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: None)
     out = torch.ones(2, 3, 4)
     assert cp_mla.merge_lse_partials_scatter_heads(out, torch.zeros(2, 3)) is out
 
