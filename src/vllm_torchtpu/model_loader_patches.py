@@ -196,6 +196,8 @@ def _sharded_runai_weights_iterator(
     hf_weights_files: list[str],
     local_expert_ids: set[int],
     use_tqdm_on_load: bool,
+    *,
+    weight_prefix: str | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Stream only this rank's tensors from the safetensors files.
 
@@ -203,7 +205,9 @@ def _sharded_runai_weights_iterator(
     ``gs://`` and local paths both work), drops non-local expert tensors
     from the request plan, and streams the surviving byte ranges as
     contiguous runs. Tensors with a registered row slice are fetched as
-    just those rows. The skipped bytes are never requested from storage.
+    just those rows. When weight_prefix is set, tensors outside that model's
+    checkpoint namespace are also excluded before fetch. The skipped bytes
+    are never requested from storage.
     """
     import runai_model_streamer.safetensors_streamer.safetensors_pytorch as sp
     from runai_model_streamer.file_streamer import FileChunks
@@ -229,6 +233,7 @@ def _sharded_runai_weights_iterator(
         zero_size_tensors: list = []
         kept = skipped = sliced = 0
         kept_bytes = skipped_bytes = sliced_bytes = 0
+        skipped_model = skipped_model_bytes = 0
 
         run_start: int | None = None
         run_sizes: list[int] = []
@@ -248,7 +253,14 @@ def _sharded_runai_weights_iterator(
         for path, meta in zip(hf_weights_files, metas):
             pos = meta.offset
             for tensor_meta, size in zip(meta.tensors_metadata, meta.read_sizes):
-                if _should_skip(tensor_meta.name, local_expert_ids):
+                if weight_prefix is not None and not tensor_meta.name.startswith(
+                    weight_prefix
+                ):
+                    skipped_model += 1
+                    skipped_model_bytes += size
+                    if size:
+                        _flush(path)
+                elif _should_skip(tensor_meta.name, local_expert_ids):
                     skipped += 1
                     skipped_bytes += size
                     # A zero-byte skip leaves the byte stream contiguous, so
@@ -306,6 +318,14 @@ def _sharded_runai_weights_iterator(
             sliced,
             sliced_bytes / 1e9,
         )
+        if weight_prefix is not None:
+            logger.info(
+                "[sharded-ep-load] namespace %s: skipping %d tensors (%.1f GB) "
+                "owned by the target model before fetch",
+                weight_prefix,
+                skipped_model,
+                skipped_model_bytes / 1e9,
+            )
 
         fs.stream_files(requests, credentials=None, device="cpu", is_distributed=False)
 
@@ -360,6 +380,15 @@ def _sharded_runai_weights_iterator(
             _device_sync()
 
 
+def _runai_weight_prefix(model_config) -> str | None:
+    """V4.1 DSpark consumes only mtp.* from its target checkpoint."""
+    if model_config.runner_type == "draft" and "DSparkV41DraftModel" in (
+        model_config.hf_config.architectures or []
+    ):
+        return "mtp."
+    return None
+
+
 def patch_runai_sharded_expert_streaming() -> None:
     """Make ``RunaiModelStreamerLoader`` fetch only this rank's tensors.
 
@@ -403,8 +432,13 @@ def patch_runai_sharded_expert_streaming() -> None:
                 "plans; streaming per rank instead."
             )
         hf_weights_files = self._prepare_weights(model_or_path, revision)
+        from vllm.config import get_current_vllm_config
+
         return _sharded_runai_weights_iterator(
-            hf_weights_files, local_expert_ids, self.load_config.use_tqdm_on_load
+            hf_weights_files,
+            local_expert_ids,
+            self.load_config.use_tqdm_on_load,
+            weight_prefix=_runai_weight_prefix(get_current_vllm_config().model_config),
         )
 
     rsl.RunaiModelStreamerLoader._get_weights_iterator = _get_weights_iterator

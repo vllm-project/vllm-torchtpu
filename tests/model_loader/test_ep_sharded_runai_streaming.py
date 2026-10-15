@@ -26,6 +26,7 @@ import pytest
 
 from vllm_torchtpu.model_loader_patches import (
     _compute_local_expert_ids,
+    _runai_weight_prefix,
     _sharded_runai_weights_iterator,
     _should_skip,
 )
@@ -35,6 +36,26 @@ from vllm_torchtpu.model_loader_patches import (
 # ---------------------------------------------------------------------------
 
 _LOCAL = {0, 1, 27}
+
+
+@pytest.mark.parametrize(
+    "runner_type,architectures,expected",
+    [
+        ("draft", ["DSparkV41DraftModel"], "mtp."),
+        ("generate", ["DeepseekV41ForCausalLM"], None),
+        ("generate", ["DSparkV41DraftModel"], None),
+        ("draft", ["OtherDraftModel"], None),
+        ("draft", None, None),
+    ],
+)
+def test_only_v41_dspark_filters_the_checkpoint_namespace(
+    runner_type, architectures, expected
+):
+    config = SimpleNamespace(
+        runner_type=runner_type,
+        hf_config=SimpleNamespace(architectures=architectures),
+    )
+    assert _runai_weight_prefix(config) == expected
 
 
 @pytest.mark.parametrize(
@@ -149,7 +170,8 @@ def _fake_file_meta(offset, names_and_sizes):
     )
 
 
-def test_request_plan_groups_contiguous_kept_runs():
+@pytest.mark.parametrize("weight_prefix", [None, "mtp."])
+def test_request_plan_groups_contiguous_kept_runs(weight_prefix):
     """Kept tensors separated by a skipped one become separate byte-range
     requests, offsets account for the skipped bytes, and skipped tensors are
     never part of any request."""
@@ -164,6 +186,9 @@ def test_request_plan_groups_contiguous_kept_runs():
             (f"{e}.5.w1.weight_packed", 10),  # skip   @1012
             (f"{e}.5.w1.weight_scale", 2),  # skip   @1022
             ("m.layers.0.dense.weight", 7),  # kept   @1024
+            ("mtp.0.ffn.experts.0.w1.weight", 10),  # kept @1031
+            ("mtp.0.ffn.experts.5.w1.weight", 10),  # skip @1041
+            ("mtp.0.main_proj.weight", 4),  # kept @1051
         ],
     )
 
@@ -203,16 +228,22 @@ def test_request_plan_groups_contiguous_kept_runs():
                 ["gs://bucket/file0.safetensors"],
                 local_expert_ids={0},
                 use_tqdm_on_load=False,
+                weight_prefix=weight_prefix,
             )
         )
 
     requests = captured["requests"]
-    assert [(r.offsets, r.sizes) for r in requests] == [
-        ([1000, 1010], [10, 2]),  # expert 0's contiguous run
-        ([1024], [7]),  # dense weight after the skipped gap
-    ]
+    if weight_prefix is None:
+        expected = [
+            ([1000, 1010], [10, 2]),
+            ([1024, 1031], [7, 10]),
+            ([1051], [4]),
+        ]
+    else:
+        expected = [([1031], [10]), ([1051], [4])]
+    assert [(r.offsets, r.sizes) for r in requests] == expected
     total_requested = sum(sum(r.sizes) for r in requests)
-    assert total_requested == 19  # 31 bytes in file, 12 skipped
+    assert total_requested == (33 if weight_prefix is None else 14)
 
 
 def test_zero_size_kept_tensor_bypasses_fetch_plan():
