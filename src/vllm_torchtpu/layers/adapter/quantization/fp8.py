@@ -819,11 +819,15 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         a weight or routing layout the kernel cannot serve.
         """
         from vllm_torchtpu.layers.adapter.fused_moe_ep import fused_moe_ep_supported
+        from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+            fused_moe_ep_v3_supported,
+        )
 
         return (
             enable_pipelined_collective_and_compute()
             or fused_moe_ep_supported(self)
             or adaptive_moe.adaptive_fused_moe_supported(self)
+            or fused_moe_ep_v3_supported(self)
             or envs.TPU_MOE_FP8_ALL_GATHER
         )
 
@@ -1077,6 +1081,18 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
         )
+        if envs.MOE_FUSED_EP_KERNEL_IMPL == "v3":
+            from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+                FUSED_MOE_EP_V3_OP_ATTR,
+                prebuild_fused_moe_ep_v3,
+            )
+
+            setattr(
+                self,
+                FUSED_MOE_EP_V3_OP_ATTR,
+                prebuild_fused_moe_ep_v3(layer, activation_str),
+            )
+            return
         # Resolve the EP mesh here, not on the first forward: it maps ranks to
         # TPU device ids with an all_gather_object, and Dynamo cannot trace a
         # collective inside the compiled graph. The result is recorded on this
@@ -1135,6 +1151,13 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 layer.w2_weight_scale_inv,
                 router_logits,
             )
+        from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import (
+            fused_moe_ep_v3,
+            fused_moe_ep_v3_supported,
+        )
+
+        if fused_moe_ep_v3_supported(self):
+            return fused_moe_ep_v3(self, layer, x, router_logits)
 
         # `score_bias_operand` is not optional, and omitting it is silent on
         # every model that does not have one. `prebuild_fused_moe_ep` builds
