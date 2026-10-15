@@ -30,6 +30,7 @@ from vllm_torchtpu.kernels.gdn.v3 import (
     tiling,
     vmem_ldst,
 )
+from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -332,7 +333,7 @@ def outer_kernel(
     ),
 )
 def fused_conv1d_gdn(
-    qkv: jax.Array,  # [batch_size, n_kq * d_k * 2 + n_v * d_v = dim_size]
+    qkv: jax.Array | Conv1DInput,  # [batch_size, n_kq * d_k * 2 + n_v * d_v = dim_size]
     b: jax.Array,  # [batch_size, n_v]
     a: jax.Array,  # [batch_size, n_v]; [batch_size, n_v * d_k] for KDA
     states: jax.Array | tuple[jax.Array, jax.Array],
@@ -373,7 +374,8 @@ def fused_conv1d_gdn(
 
     Args:
         qkv: Mixed query, key, value input tensor of shape [batch_size, dim_size],
-            where `dim_size = n_kq * d_k * 2 + n_v * d_v`.
+            where `dim_size = n_kq * d_k * 2 + n_v * d_v`, or a prepared
+            Conv1DInput with FP32 values and the original output dtype.
         b: b tensor (for beta) of shape [batch_size, n_v].
         a: a tensor (for g) of shape [batch_size, n_v].
         conv_state: Convolution state cache tensor of shape [num_seqs + 1,
@@ -456,7 +458,15 @@ def fused_conv1d_gdn(
             f"kernel_act_dtype must be float32; got {jnp.dtype(kernel_act_dtype).name}."
         )
 
-    act_out_dtype = qkv.dtype
+    # Conv1D consumes FP32 while outputs retain the projection activation dtype.
+    prepared_qkv = isinstance(qkv, Conv1DInput)
+    if isinstance(qkv, Conv1DInput):
+        act_out_dtype = qkv.output_dtype
+        qkv = qkv.values
+        if qkv.ndim != 3 or qkv.shape[1] != 1 or qkv.dtype != jnp.float32:
+            raise ValueError("Conv1DInput requires FP32 [tokens, 1, features]")
+    else:
+        act_out_dtype = qkv.dtype
 
     is_shared = isinstance(states, jax.Array)
     if is_shared:
@@ -480,7 +490,8 @@ def fused_conv1d_gdn(
             f"state; got conv={conv_dtype} recurrent={recurrent_dtype}."
         )
 
-    qkv = qkv.astype(kernel_act_dtype)
+    if not prepared_qkv:
+        qkv = qkv.astype(kernel_act_dtype)
     b = b.astype(kernel_act_dtype)
     a = a.astype(kernel_act_dtype)
 
@@ -504,7 +515,7 @@ def fused_conv1d_gdn(
             )
 
     num_seqs = state_indices.size
-    batch_size, dim = qkv.shape
+    batch_size, dim = qkv.shape[0], qkv.shape[-1]
     assert conv_weight.shape == (dim, 1, kernel_size)
     if conv_bias is not None:
         assert conv_bias.shape == (dim,)
@@ -611,7 +622,8 @@ def fused_conv1d_gdn(
     # lane multiple of n_v * d_k rather than of n_v.
     gate_dim = n_v * d_k if is_kda else n_v
     gate_padding_size = (pl.cdiv(gate_dim, num_lanes) * num_lanes) - gate_dim
-    qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
+    qkv_padding = ((0, batch_padding_size),) + ((0, 0),) * (qkv.ndim - 1)
+    qkv = jnp.pad(qkv, qkv_padding)
     b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
     a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
 

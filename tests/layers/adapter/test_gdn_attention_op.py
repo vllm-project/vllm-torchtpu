@@ -1938,3 +1938,43 @@ def test_flipped_qkvz_fp8_block_weight_is_the_kept_one_transposed(
     assert kept_weight.shape == weight.shape
     torch.testing.assert_close(flipped_weight, kept_weight.T, rtol=0, atol=0)
     torch.testing.assert_close(flipped_scale, kept_scale, rtol=0, atol=0)
+
+def test_pooled_input_preparation_separates_cached_ops(cpu_vllm_config_context):
+    from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
+        VllmGatedDeltaNetAttention,
+    )
+
+    class PreparedAttention(VllmGatedDeltaNetAttention):
+        def _prepare_pooled_gdn_input(self, mixed_qkv, seq_lens, mesh):
+            return mixed_qkv + 1
+
+    captured = []
+
+    def build(name, function, **kwargs):
+        captured.append((name, function))
+        return MagicMock()
+
+    with (
+        patch.dict(gdn_attention_op._shared_gdn_ops, {}, clear=True),
+        set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+        patch.object(gdn_attention_op.pallas, "jax_op", side_effect=build),
+    ):
+        for index, cls in enumerate(
+            (VllmGatedDeltaNetAttention, PreparedAttention, PreparedAttention)
+        ):
+            attn = _qwen35_397b_gdn_attn(f"model.layers.{index}.linear_attn")
+            attn.__class__ = cls
+            attn._build_pooled_gdn_op()
+
+    assert len(captured) == 2
+    assert captured[0][0] != captured[1][0]
+    operands = [torch.zeros((1, 1)) for _ in range(12)]
+    operands[5] = None
+    for index, (_, function) in enumerate(captured):
+        with patch.object(
+            gdn_attention_op,
+            "run_jax_gdn_attention_pooled",
+            return_value=(operands[3], operands[0]),
+        ) as dispatch:
+            function(*operands)
+        torch.testing.assert_close(dispatch.call_args.args[0], operands[0] + index)
