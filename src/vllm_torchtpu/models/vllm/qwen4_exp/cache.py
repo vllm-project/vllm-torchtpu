@@ -48,8 +48,8 @@ class Qwen4ExpCache:
             if layer.ple is not None:
                 self.specs[base + ".ple"] = MambaSpec(
                     block_size=runner.max_model_len,
-                    shapes=layer.ple.get_state_shape(),
-                    dtypes=layer.ple.get_state_dtype(),
+                    shapes=(layer.ple.state_shape,),
+                    dtypes=(torch.bfloat16,),
                     tp_replicated=True,
                     mamba_type=MambaAttentionBackendEnum.SHORT_CONV,
                 )
@@ -106,12 +106,12 @@ class Qwen4ExpCache:
                     alloc(base_q + role, shape, dtype, fill)
                     for role, shape, dtype, fill in layouts
                 )
-                layer.self_attn.bind_kv_cache(owners)
+                layer.self_attn.bind_cache_owners(owners)
             if layer.ple is not None:
                 layer.ple.bind_history(
                     alloc(
                         base + ".ple.history",
-                        (self.slots, *layer.ple.get_state_shape()[0]),
+                        (self.slots, *(layer.ple.state_shape,)[0]),
                         torch.bfloat16,
                     )
                 )
@@ -177,9 +177,7 @@ class Qwen4ExpCache:
                     * self.specs[base + ".self_attn.raw_ring"].page_size_bytes
                 )
             if layer.ple is not None:
-                for shape, dtype in zip(
-                    layer.ple.get_state_shape(), layer.ple.get_state_dtype()
-                ):
+                for shape, dtype in zip((layer.ple.state_shape,), (torch.bfloat16,)):
                     total += (
                         math.ceil(self.slots / 8)
                         * 8

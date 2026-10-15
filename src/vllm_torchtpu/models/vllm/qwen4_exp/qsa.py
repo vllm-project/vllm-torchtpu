@@ -27,8 +27,8 @@ from vllm.v1.kv_cache_interface import (
     get_kv_quant_mode,
 )
 
-from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import build_qsa_op
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import build_qsa_op
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 

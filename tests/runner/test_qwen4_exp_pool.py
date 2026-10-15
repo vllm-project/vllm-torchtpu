@@ -229,10 +229,10 @@ def test_pooled_ops_register_and_dispatch_without_allocating_a_device(symbolic):
     from torch._subclasses.fake_tensor import FakeTensorMode
     from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
-    from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import (
-        build_pooled_qsa_op,
+    from vllm_torchtpu.layers.adapter.custom_ops.ple_op import (
         build_pooled_short_conv_op,
     )
+    from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import build_pooled_qsa_op
 
     qgate_cpu = torch.empty((8, 12288), dtype=torch.bfloat16, device="cpu")
     with FakeTensorMode(shape_env=ShapeEnv()) as mode:

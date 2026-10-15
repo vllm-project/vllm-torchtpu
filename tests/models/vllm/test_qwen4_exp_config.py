@@ -54,6 +54,37 @@ def test_admission_accepts_cuda_qsa_kv_modes(dtype):
 
 
 @pytest.mark.parametrize(
+    "requested,resolved",
+    [("auto", "float32"), ("float32", "float32"), ("bfloat16", "bfloat16")],
+)
+def test_ssm_dtype_uses_checkpoint_default_and_preserves_explicit_override(
+    monkeypatch, requested, resolved
+):
+    import torch
+    from vllm.config import CacheConfig
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import config as model_config
+
+    cfg = config()
+    cfg.model_config.hf_text_config.mamba_ssm_dtype = "float32"
+    cfg.model_config.multimodal_config = None
+    cfg.parallel_config.ubatch_size = 1
+    cfg.cache_config = CacheConfig(
+        block_size=128,
+        enable_prefix_caching=False,
+        mamba_ssm_cache_dtype=requested,
+    )
+    # Exercise the real upstream normalization and model hook. Capacity
+    # planning has separate native-cache tests and does not choose a dtype.
+    monkeypatch.setattr(model_config, "use_unified_pool", lambda: False)
+    monkeypatch.setattr(model_config, "native_cache_capacity", lambda cfg: 32)
+    model_config.TPUQwen4ExpConfig.verify_and_update_config(cfg)
+    assert cfg.cache_config.mamba_ssm_cache_dtype == resolved
+    expected = torch.float32 if resolved == "float32" else torch.bfloat16
+    assert model_config.gdn_cache_spec(cfg).dtypes == (torch.float32, expected)
+
+
+@pytest.mark.parametrize(
     "override,expected", [(None, True), (True, True), (False, False)]
 )
 def test_unified_pool_defaults_on_and_respects_global_override(
@@ -117,3 +148,37 @@ def test_prefix_reuse_requires_scheduler_owned_aligned_state(
     else:
         with pytest.raises(ValueError, match=error):
             validate_config(cfg)
+
+
+@pytest.mark.parametrize("prefix", [False, True])
+def test_pool_page_override_respects_upstream_prefix_validation(monkeypatch, prefix):
+    from vllm.config import CacheConfig, VllmConfig
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.config import (
+        Qwen4ExpForCausalLMConfig,
+        TPUQwen4ExpConfig,
+    )
+    from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import pooled_cache_specs
+
+    monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
+    # The fixture already contains normalized text-only HF fields. Exercise
+    # our page override and the actual upstream validator, without a loader.
+    monkeypatch.setattr(
+        Qwen4ExpForCausalLMConfig,
+        "verify_and_update_config",
+        staticmethod(lambda cfg: None),
+    )
+    cfg = config()
+    cfg.cache_config = CacheConfig(
+        block_size=128,
+        cache_dtype="fp8_e4m3",
+        enable_prefix_caching=prefix,
+        mamba_cache_mode="align",
+        mamba_ssm_cache_dtype="bfloat16",
+    )
+    TPUQwen4ExpConfig.verify_and_update_config(cfg)
+    VllmConfig.validate_mamba_block_size(cfg)
+    layout, specs = pooled_cache_specs(cfg)
+    assert cfg.cache_config.block_size == layout.block_size
+    assert cfg.cache_config.mamba_block_size == (layout.block_size if prefix else None)
+    assert {spec.page_size_bytes for spec in specs.values()} == {layout.page_bytes}

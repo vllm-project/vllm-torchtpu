@@ -87,9 +87,10 @@ def test_reordered_history_slots_and_group_tables_are_independent(
     )
     if offload:
         args = lookup.call_args.args
-        assert args[0] is device_ids
-        assert args[2].tolist() == [[91, 92], [248044, 20], [248044, 248044]]
-        assert args[3] is actual["valid_tokens"]
+        assert args[0].input_ids is device_ids
+        assert args[0].query_start_loc is ctx.query_start_loc
+        assert args[0].ngram_context is actual["ngram_context"]
+        assert args[1].tolist() == [4]
         assert layer.call_args.args[-1] is raw
     else:
         lookup.assert_not_called()

@@ -94,9 +94,7 @@ def test_native_groups_last_blocks_and_real_capacity(
         get_state_shape=lambda: ((3, 1, 10240 // tp), (48 // tp, 128, 128)),
         get_state_dtype=lambda: (torch.float32, torch.float32),
     )
-    ple = NS(
-        get_state_shape=lambda: ((9, 10240),), get_state_dtype=lambda: (torch.bfloat16,)
-    )
+    ple = NS(state_shape=(9, 10240))
     layers = [
         NS(
             layer_type="full_attention" if i % 4 == 3 else "linear_attention",
@@ -235,7 +233,7 @@ def test_native_groups_last_blocks_and_real_capacity(
         assert [x.shape for x in owners] == shapes
         assert [x.dtype for x in owners] == dtypes
 
-    qsa.bind_kv_cache = bind_qsa
+    qsa.bind_cache_owners = bind_qsa
     ple.bind_history = lambda owner: None
     runner.device = "cpu"
     with monkeypatch.context() as allocation_patch:

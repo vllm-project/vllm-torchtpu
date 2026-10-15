@@ -10,7 +10,7 @@ import os
 import tempfile
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, TypedDict
 
 
 def host_available_memory():
@@ -20,7 +20,16 @@ def host_available_memory():
     raise RuntimeError("PLE host capacity requires Linux MemAvailable")
 
 
-def shared_ple_options(model_config, prefix, tp_rank, tp_size):
+class SharedPLEDescriptor(TypedDict):
+    directory: str
+    key: str
+    identity: dict[str, object]
+    participants: int
+
+
+def shared_ple_options(
+    model_config, prefix: str, tp_rank: int, tp_size: int
+) -> SharedPLEDescriptor:
     """Use the pre-worker descriptor, never the worker's collapsed DP size."""
     launch = model_config._qwen4_exp_ple_host_launch
     return dict(

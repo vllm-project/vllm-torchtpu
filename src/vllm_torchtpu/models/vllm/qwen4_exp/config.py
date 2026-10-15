@@ -16,10 +16,11 @@
 import math
 
 import torch
-from vllm.config import VllmConfig
 from vllm.model_executor.models.config import (
     Qwen4ExpForCausalLMConfig,
+    VerifyAndUpdateConfig,
 )
+from vllm.v1.kv_cache_interface import KVCacheSpec
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.gdn_pool_layout import unified_kv_layout_enabled_for_architecture
@@ -66,19 +67,19 @@ def gdn_cache_spec(cfg):
     )
 
 
-def native_cache_specs(cfg):
+def native_cache_specs(cfg) -> dict[str, KVCacheSpec]:
     """Describe model-owned caches before allocating any model weights."""
     from vllm.v1.attention.backends.registry import MambaAttentionBackendEnum
     from vllm.v1.kv_cache_interface import MambaSpec
 
-    from .ple import ple_state_shape
+    from .ple_geometry import ple_state_shape
     from .qsa import get_qsa_cache_specs
 
     t = cfg.model_config.hf_text_config
     main, auxiliary = get_qsa_cache_specs(
         t, cfg.parallel_config.tensor_parallel_size, cfg.cache_config.cache_dtype
     )
-    specs = {}
+    specs: dict[str, KVCacheSpec] = {}
     for index, layer_type in enumerate(t.layer_types):
         prefix = f"model.layers.{index}"
         if layer_type == "linear_attention":
@@ -117,75 +118,72 @@ def native_cache_capacity(cfg, specs=None):
     return 1 + cfg.scheduler_config.max_num_seqs * blocks_per_request
 
 
-class TPUQwen4ExpConfig(Qwen4ExpForCausalLMConfig):
-    """Upstream Qwen4Exp checks, plus the features the TPU model lacks yet."""
+def normalize_text_config(t) -> None:
+    """Restore the checkpoint's spelling of the text config fields.
 
+    transformers (>=5.18, see pyproject.toml) relabels the checkpoint's
+    full_attention (QSA) layers indexed_attention, and leaves ple_layer_ids
+    None when a config has no PLE. This implementation keys its QSA layers on
+    the checkpoint's full_attention label and iterates ple_layer_ids, so map
+    both back once, before anything reads them.
+    """
+    if t.layer_types is not None:
+        t.layer_types = [
+            "full_attention" if kind == "indexed_attention" else kind
+            for kind in t.layer_types
+        ]
+    if getattr(t, "ple_layer_ids", None) is None:
+        t.ple_layer_ids = []
+
+
+class TPUQwen4ExpConfig(VerifyAndUpdateConfig):
     @staticmethod
-    def verify_and_update_config(vllm_config: VllmConfig) -> None:
+    def verify_and_update_config(vllm_config):
+        # Reuse upstream's text/config normalization, including removal of
+        # mrope even though this class truthfully does not support vision.
         Qwen4ExpForCausalLMConfig.verify_and_update_config(vllm_config)
-        model_config = vllm_config.model_config
-        text_config = model_config.hf_text_config
-        parallel_config = vllm_config.parallel_config
-        if text_config.ple_layer_ids:
-            # TODO(PLE): pass the PLE inputs and per-request conv state from
-            # the TPU runner.
-            # Vision-language checkpoints nest the field under text_config.
-            if model_config.hf_config is text_config:
-                override = '{"ple_layer_ids": []}'
-            else:
-                override = '{"text_config": {"ple_layer_ids": []}}'
-            raise NotImplementedError(
-                "Qwen4Exp n-gram PLE (ple_layer_ids="
-                f"{text_config.ple_layer_ids}) is not supported on TPU yet. "
-                f"To run without PLE for bring-up, pass --hf-overrides "
-                f"'{override}'; outputs then differ from the released model."
+        normalize_text_config(vllm_config.model_config.hf_text_config)
+        validate_config(vllm_config)
+        qwen = vllm_config.additional_config.get("qwen4_exp", {})
+        if qwen.get("engram_config", {}).get("cpu_offload", False):
+            # Host PLE lookup stays eager; its device producer and decoder
+            # consumers use the existing piecewise compilation backend.
+            compilation = vllm_config.compilation_config
+            if compilation.splitting_ops is None:
+                compilation.splitting_ops = []
+            if "qwen4_exp::host_lookup" not in compilation.splitting_ops:
+                compilation.splitting_ops.append("qwen4_exp::host_lookup")
+        if qwen.get("engram_config", {}).get("dp_shared_memory", False):
+            # This hook runs before engine copies / TPU worker DP collapse.
+            # Runtime-only ModelConfig attributes survive deepcopy/pickling
+            # but are outside its dataclass hash factors. A launch identity
+            # in additional_config would invalidate compilation caches.
+            vllm_config.model_config._qwen4_exp_ple_host_launch = dict(
+                instance=vllm_config.instance_id,
+                participants=vllm_config.parallel_config.data_parallel_size,
+                checkpoint=vllm_config.model_config.model,
+                revision=vllm_config.model_config.revision,
             )
-        # transformers (>=5.18, see pyproject.toml) labels the checkpoint's
-        # full_attention (QSA) layers indexed_attention. TPU runs them as
-        # dense attention, which matches QSA within the max_model_len bound
-        # below.
-        unsupported_layer_types = sorted(
-            set(text_config.layer_types or ())
-            - {"linear_attention", "indexed_attention"}
-        )
-        if unsupported_layer_types:
-            raise NotImplementedError(
-                f"Qwen4Exp layer types {unsupported_layer_types} are not "
-                "supported on TPU yet."
+        vllm_config.cache_config.kv_cache_layout = "BLHNC"
+        if use_unified_pool():
+            from .pool_layout import pooled_cache_specs
+
+            layout, specs = pooled_cache_specs(vllm_config)
+            vllm_config.cache_config.block_size = layout.block_size
+            # Upstream reserves this override for prefix caching. The model's
+            # native pool specs carry the physical state-page span themselves.
+            vllm_config.cache_config.mamba_block_size = (
+                layout.block_size
+                if vllm_config.cache_config.enable_prefix_caching
+                else None
             )
-        # Configs without the QSA fields run dense attention by design. With
-        # them, QSA attends over the indexer_budget / indexer_compress_ratio
-        # highest-scoring complete blocks plus the open tail block. A sequence
-        # of at most indexer_budget tokens has no more complete blocks than
-        # that, so every block is selected and QSA equals dense attention.
-        indexer_budget = getattr(text_config, "indexer_budget", None)
-        if indexer_budget is not None and model_config.max_model_len > indexer_budget:
-            # TODO(QSA): lift once the QSA indexer and sparse attention land.
-            raise NotImplementedError(
-                "Qwen4Exp full attention runs dense on TPU, which matches QSA "
-                f"only up to indexer_budget={indexer_budget} tokens. Pass "
-                f"--max-model-len {indexer_budget} or less."
-            )
-        if vllm_config.speculative_config is not None:
-            raise NotImplementedError(
-                "Qwen4Exp on TPU does not support speculative decoding yet."
-            )
-        if parallel_config.pipeline_parallel_size > 1:
-            raise NotImplementedError(
-                "Qwen4Exp on TPU requires pipeline_parallel_size=1."
-            )
-        if parallel_config.use_sequence_parallel_moe:
-            raise NotImplementedError(
-                "Qwen4Exp hyper-connections do not support sequence-parallel "
-                "MoE; unset TPU_MOE_SEQUENCE_PARALLEL."
-            )
-        if (
-            parallel_config.prefill_context_parallel_size > 1
-            or parallel_config.decode_context_parallel_size > 1
-        ):
-            raise NotImplementedError(
-                "Qwen4Exp on TPU does not support context parallelism yet."
-            )
+            vllm_config.cache_config.mamba_page_size_padded = layout.page_bytes
+            pages = native_cache_capacity(vllm_config, specs)
+        else:
+            pages = native_cache_capacity(vllm_config)
+        if vllm_config.cache_config.num_gpu_blocks_override not in (None, pages):
+            raise ValueError(f"Qwen4Exp S1 fixes native capacity to {pages} blocks")
+        vllm_config.cache_config.num_gpu_blocks_override = pages
 
 
 def validate_config(cfg):
@@ -270,8 +268,10 @@ def validate_config(cfg):
     if tp <= 0 or p.data_parallel_size <= 0:
         raise ValueError("Qwen4Exp parallel sizes must be positive")
     expert_shards = tp * p.data_parallel_size if p.enable_expert_parallel else 1
-    if t.num_experts % expert_shards or (
-        not p.enable_expert_parallel and t.moe_intermediate_size % tp
+    if (
+        t.num_experts % expert_shards
+        or (not p.enable_expert_parallel and t.moe_intermediate_size % tp)
+        or t.shared_expert_intermediate_size % tp
     ):
         raise ValueError(
             "Qwen4Exp experts and intermediate must divide their parallel groups"
@@ -349,10 +349,7 @@ def validate_config(cfg):
     # hook. TPU's existing platform_activation patch disables it afterward;
     # rejecting that intermediate property would block every mixed TP/DP.
     if (
-        (p.tensor_parallel_size, p.data_parallel_size)
-        not in ((8, 1), (4, 2), (2, 4), (1, 8))
-        or (not p.enable_expert_parallel and p.tensor_parallel_size == 1)
-        or p.pipeline_parallel_size != 1
+        p.pipeline_parallel_size != 1
         or p.prefill_context_parallel_size != 1
         or p.decode_context_parallel_size != 1
         or p.enable_dbo
@@ -361,8 +358,7 @@ def validate_config(cfg):
         or p.enable_elastic_ep
     ):
         raise ValueError(
-            "Qwen4Exp TPU requires TP8/DP1, TP4/DP2, TP2/DP4 or TP1/DP8 with "
-            "EP8 or EP off at TP>=2, PP/CP1, "
+            "Qwen4Exp TPU requires PP/CP1, "
             "linear expert placement and no DBO/EPLB/elastic EP"
         )
     # SparseCore top-k writes 16-lane vectors; this is a kernel boundary,
@@ -430,21 +426,17 @@ def validate_config(cfg):
             "Qwen4Exp shared PLE requires local DP>1, one host, and "
             "embedding_across_dp=false"
         )
-    from .ple import ple_checkpoint_shards, ple_vocab_rows
+    from .ple_geometry import ple_vocab_rows
 
     etp = tp * p.data_parallel_size if across else tp
     ple_width = t.ple_embed_dim // ((t.ngram_size - 1) * t.heads_per_ngram)
     ple_rows = [ple_vocab_rows(t, layer - 1) for layer in sorted(set(t.ple_layer_ids))]
-    checkpoint_shards = ple_checkpoint_shards(t)
-    if checkpoint_shards <= 0:
-        raise ValueError("Qwen4Exp PLE checkpoint shard count must be positive")
     for rows in ple_rows:
         if (
             rows % etp
             or (rows // etp * ple_width) % 128
             or rows >= 2**31
             or rows // etp * ple_width // 128 >= 2**31
-            or checkpoint_shards > rows
         ):
             raise ValueError(
                 "Qwen4Exp PLE table must fit aligned embedding shards and INT32 indices"
