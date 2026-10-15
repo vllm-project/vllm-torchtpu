@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
+from vllm_torchtpu.kernels.qwen4_exp.hc_full import _full_mix
 from vllm_torchtpu.kernels.qwen4_exp.hc_norm import _normalize
 from vllm_torchtpu.kernels.qwen4_exp.hc_up import _up_epilogue
 
@@ -33,7 +34,7 @@ def reference(x, weight, down, up):
     return mixed, norm, mid
 
 
-@pytest.mark.parametrize("kernel", ["norm", "up"])
+@pytest.mark.parametrize("kernel", ["norm", "up", "full"])
 def test_hc_rejects_partial_token_tiles(kernel):
     shape = jax.ShapeDtypeStruct
     x, weight, down, up = [shape(a.shape, jnp.bfloat16) for a in inputs(127)]
@@ -45,13 +46,18 @@ def test_hc_rejects_partial_token_tiles(kernel):
     elif kernel == "up":
         fn = functools.partial(_up_epilogue, branches=4, hidden=128, token_tile=128)
         args = (shape((127, 128), jnp.bfloat16), x, up)
+    else:
+        fn = functools.partial(
+            _full_mix, branches=4, hidden=128, eps=1e-6, token_tile=128
+        )
+        args = (x, weight, down, up)
     with pytest.raises(ValueError, match="token tiles"):
         jax.eval_shape(fn, *args)
 
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("tokens", [256, 512])
-def test_hc_staged_mix_matches_cpu_reference(tokens):
+def test_hc_staged_and_full_mix_match_cpu_reference(tokens):
     cpu = jax.devices("cpu")[0]
     tpu = jax.devices("tpu")[0]
     with jax.default_device(cpu):
@@ -62,10 +68,15 @@ def test_hc_staged_mix_matches_cpu_reference(tokens):
     mixed = _up_epilogue(
         jax.device_put(mid, tpu), norm, up, branches=4, hidden=128, token_tile=128
     )
+    full_mix, full_norm = _full_mix(
+        x, weight, down, up, branches=4, hidden=128, eps=1e-6, token_tile=128
+    )
     # Use the existing HC layer's NRMSE/cosine numerical acceptance contract.
     for actual, expected in [
         (norm, expected_norm),
         (mixed, expected_mix),
+        (full_norm, expected_norm),
+        (full_mix, expected_mix),
     ]:
         a, e = (np.asarray(v, np.float32) for v in (actual, expected))
         assert np.isfinite(a).all()

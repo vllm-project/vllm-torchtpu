@@ -9,6 +9,7 @@ import torch
 from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.qwen4_exp.gated_residual import gated_residual_fn
+from vllm_torchtpu.kernels.qwen4_exp.hc_full import _full_mix
 from vllm_torchtpu.kernels.qwen4_exp.hc_norm import _normalize
 from vllm_torchtpu.kernels.qwen4_exp.hc_up import _up_epilogue
 
@@ -23,6 +24,39 @@ def build_gated_residual_op(branches: int, hidden: int, token_tile: int):
     @op.register_fake
     def fake(residual, block, gates):
         return residual.new_empty(residual.shape)
+
+    return op
+
+
+@functools.cache
+def build_full_mix_op(branches: int, hidden: int, eps: float, token_tile: int):
+    eps_tag = hashlib.sha1(repr(eps).encode()).hexdigest()[:8]
+
+    def core(
+        x: jax.Array, weight: jax.Array, down: jax.Array, up: jax.Array
+    ) -> tuple[jax.Array, jax.Array]:
+        return _full_mix(
+            x,
+            weight,
+            down,
+            up,
+            branches=branches,
+            hidden=hidden,
+            eps=eps,
+            token_tile=token_tile,
+        )
+
+    op = pallas.jax_op(
+        f"qwen4_exp::hc_full_c{branches}_h{hidden}_m{token_tile}_e{eps_tag}_v1",
+        core,
+    )
+
+    @op.register_fake
+    def fake(x, weight, down, up):
+        return (
+            x.new_empty((x.shape[0], hidden), dtype=torch.bfloat16),
+            x.new_empty(x.shape, dtype=torch.bfloat16),
+        )
 
     return op
 
