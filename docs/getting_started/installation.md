@@ -35,7 +35,7 @@ Choose your preferred installation method below:
 ## Prerequisites
 
 - **Python 3.12** (`>=3.12,<3.13`). Pre-built `tpu-sync-torch` and `torch_tpu` wheels target CPython 3.12.
-- **GCP Artifact Registry Authentication**: `torch_tpu` wheels are pulled from Google Cloud Artifact Registry (`us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/`). Authenticate your host before installing:
+- **GCP Artifact Registry Authentication**: `torch_tpu` wheels are pulled from Google Cloud Artifact Registry (`us-python.pkg.dev/ml-oss-artifacts-published/torch-tpu-release-virtual-registry/simple/`). Authenticate your host before installing:
 
 ```bash
 gcloud auth application-default login
@@ -85,7 +85,7 @@ git clone https://github.com/vllm-project/vllm-torchtpu.git
 cd vllm-torchtpu
 
 pip install -e . --group vllm \
-  --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/
+  --extra-index-url https://us-python.pkg.dev/ml-oss-artifacts-published/torch-tpu-release-virtual-registry/simple/
 ```
 
 ---
