@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, cast
 import torch
 from vllm.forward_context import set_forward_context
 
+from vllm_torchtpu.kv_cache_materializer import LayerKVCache
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
@@ -62,9 +63,9 @@ class Qwen4ExpAdapter:
         assert self.cache is not None
         return self.cache.get_specs()
 
-    def initialize_kv_cache(self, config):
+    def initialize_kv_cache(self, config) -> dict[str, LayerKVCache] | None:
         assert self.cache is not None
-        self.cache.initialize(config)
+        return self.cache.initialize(config)
 
     def begin_step(self):
         # Exactly one immutable H2D snapshot after runner request reordering.
