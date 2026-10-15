@@ -14,6 +14,7 @@ if TYPE_CHECKING:
     TPU_SPARSE_MLA_LIVE_GATHER: bool = True
     TPU_DCP_LSE_MERGE_A2A: bool = True
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
+    TPU_DCP_RS_OUT_PRECISION: bool = True
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 4
     TPU_DCP_MLA_UV_BEFORE_MERGE: bool = False
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
@@ -426,6 +427,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # faster. Only the backbone uses the all-to-all; the MTP drafter, traced
     # once for every bucket, always takes the reduce-scatter.
     "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS": env_int("TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", 64),
+    # Backbone MLA merge: reduce-scatter the weighted outputs in the output's
+    # precision (bf16), half f32's bytes. MTP drafter stays f32; 0 = f32.
+    "TPU_DCP_RS_OUT_PRECISION": env_bool("TPU_DCP_RS_OUT_PRECISION", default=True),
     # DCP sparse MLA attention grid step for decode-sized chunks
     # (`sparse_ragged_paged_attention(small_chunk_batch_size=...)`): attend
     # this many query tokens per kernel grid step instead of one, so the
