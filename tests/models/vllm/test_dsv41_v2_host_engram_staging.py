@@ -560,10 +560,15 @@ class TestEngramModuleStagingAndEmbed:
             assert cpu_group is group.cpu_group and size == 8
             # Exchange correctness is covered by the real Gloo regression.
             tokens = raw.shape[0] // size
-            return raw[:tokens].repeat(1, size, 1), scales[:tokens].repeat(1, size, 1)
+            return SimpleNamespace(
+                wait=lambda: (
+                    raw[:tokens].repeat(1, size, 1),
+                    scales[:tokens].repeat(1, size, 1),
+                )
+            )
 
         engram.embed_tokens.gather_raw = gather
-        monkeypatch.setattr(common, "exchange_rows", exchange)
+        monkeypatch.setattr(common, "start_exchange_rows", exchange)
         for tokens in (16, 8, 16):
             engram.prepare_embeddings(torch.zeros(tokens * 8, 16, dtype=torch.int32))
             rows = engram._ready_rows(tokens)
@@ -703,6 +708,68 @@ class TestEngramModuleStagingAndEmbed:
 
 
 class TestModelEngramPreparation:
+    def test_prepare_all_host_tables_before_waiting_and_uploading(self, monkeypatch):
+        from vllm_torchtpu.models.vllm.deepseek_v41.common import engram as common
+        from vllm_torchtpu.models.vllm.deepseek_v41.v2 import model as model_module
+
+        model = self._create_mock_model(use_slot_cache=False)
+        model.end_layer = 2
+        model.engram_dp_shared_memory = False
+        model.engram_hash.ensure_cache = lambda: False
+        issued = []
+        group = SimpleNamespace(world_size=2, cpu_group=object())
+        monkeypatch.setattr(common.upstream, "get_engram_dp_group", lambda: group)
+        monkeypatch.setattr(model_module.upstream, "get_engram_dp_size", lambda: 2)
+        monkeypatch.setattr(
+            model_module, "gather_host_engram_hashes", lambda hashes, **kw: hashes
+        )
+        monkeypatch.setattr(
+            model_module.upstream, "is_forward_context_available", lambda: True
+        )
+        monkeypatch.setattr(
+            model_module.upstream,
+            "get_forward_context",
+            lambda: SimpleNamespace(attn_metadata={}),
+        )
+
+        def gather(ids, raw, scales):
+            raw.fill_(56 + 8 * int(ids[0, 0]))  # FP8 1.0 or 2.0.
+            scales.fill_(127)
+
+        def exchange(raw, scales, cpu_group, size):
+            issued.append(int(raw[0, 0, 0]))
+
+            def wait():
+                assert issued == [56, 64]
+                tokens = raw.shape[0] // size
+                return (
+                    raw[:tokens].repeat(1, size, 1),
+                    scales[:tokens].repeat(1, size, 1),
+                )
+
+            return SimpleNamespace(wait=wait)
+
+        monkeypatch.setattr(common, "start_exchange_rows", exchange)
+        stagers = []
+        for index in range(2):
+            engram = TestEngramModuleStagingAndEmbed()._create_mock_engram(True)
+            engram.layer_hash_index = index
+            engram.embed_tokens.dp_size = 2
+            engram.embed_tokens.gather_raw = gather
+            engram._init_staging(7, 32)
+            stagers.append(engram)
+        model.layers = [SimpleNamespace(engram=e) for e in stagers]
+
+        for tokens in (7, 2, 7):
+            issued.clear()
+            hashes = torch.tensor([0, 1]).view(1, 2, 1).expand(tokens * 2, 2, 4)
+            model.engram_hash.dummy_hashes = lambda ids, hashes=hashes: (hashes, None)
+            model._prepare_engram(torch.arange(tokens), torch.arange(tokens), None)
+            for index, engram in enumerate(stagers):
+                rows = engram._ready_rows(tokens)
+                assert rows.shape == (tokens, 4, 32)
+                assert torch.equal(rows, torch.full_like(rows, index + 1))
+
     def _create_mock_model(
         self,
         cpu_offload: bool = True,

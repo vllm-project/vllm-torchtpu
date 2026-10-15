@@ -395,6 +395,65 @@ def test_prepare_engram_full_path(monkeypatch: pytest.MonkeyPatch):
 # ---------------------------------------------------------------------------
 
 
+def test_ced_dispatches_encoder_before_host_bucket_coordination(monkeypatch):
+    from vllm.forward_context import DPMetadata
+
+    @dataclass
+    class Context:
+        attn_metadata: Any = None
+        dp_metadata: Any = field(
+            default_factory=lambda: DPMetadata(torch.tensor([4, 4]))
+        )
+        is_padding: Any = None
+        additional_kwargs: dict[str, Any] = field(default_factory=dict)
+
+    class TpuTensor(torch.Tensor):
+        @property
+        def device(self):
+            return SimpleNamespace(type="tpu")
+
+    order = []
+    hidden = torch.ones(4, 16).as_subclass(TpuTensor)
+    mix = torch.ones(4, 4).as_subclass(TpuTensor)
+    auxiliary = torch.ones(4, 16).as_subclass(TpuTensor)
+
+    def encoder(*args):
+        order.append("encoder")
+        return hidden, mix, [auxiliary]
+
+    def dispatch(tensors, wait):
+        assert wait is False
+        assert all(a is b for a, b in zip(tensors, (hidden, mix, auxiliary)))
+        order.append("dispatch")
+
+    def coordinate(plan, count):
+        assert plan is None and count == 4
+        order.append("coordinate")
+        return plan
+
+    def decoder(ids, positions, inputs_embeds, encoder_pre_mix):
+        order.append("decoder")
+        assert inputs_embeds is hidden and encoder_pre_mix is mix
+        return torch.ones(4, 16)
+
+    monkeypatch.setattr(v2_model.upstream, "get_forward_context", Context)
+    monkeypatch.setattr(v2_model, "synchronize_tensors", dispatch)
+    monkeypatch.setattr(v2_model, "coordinate_decoder_replay", coordinate)
+    model = SimpleNamespace(
+        _ced_enabled=True,
+        _has_cpu_offloaded_engram=lambda: False,
+        _stage_uses_sequence_parallel=lambda stage: False,
+        encoder_stage=encoder,
+        decoder_stage=decoder,
+    )
+    output, aux = v2_model.DeepseekV41Model.forward(
+        model, torch.arange(4), torch.arange(4)
+    )
+    assert torch.equal(output, torch.ones(4, 16))
+    assert aux[0] is auxiliary
+    assert order == ["encoder", "dispatch", "coordinate", "decoder"]
+
+
 def test_model_forward_full_and_ced_paths(monkeypatch: pytest.MonkeyPatch):
     @dataclass
     class _FakeMeta:

@@ -5,6 +5,7 @@ subclasses ``NgramHashState`` to bind its own slot-cache write op and, when
 its SWA cache module differs, the cache lifetime in ``ensure_cache``.
 """
 
+from dataclasses import dataclass
 from types import SimpleNamespace
 
 import numpy as np
@@ -18,7 +19,13 @@ from vllm_torchtpu.layers.adapter.upstream_bindings import (
 )
 from vllm_torchtpu.model_loader_patches import register_row_slice
 
-from .host_exchange import exchange_rows
+from .host_exchange import PendingRowExchange, start_exchange_rows
+
+
+@dataclass
+class HostEngramStaging:
+    num_tokens: int
+    exchange: PendingRowExchange | None = None
 
 
 class NgramHashState(upstream.NgramHashState):
@@ -538,61 +545,72 @@ class Engram(upstream.Engram):
         return view
 
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
-        if self._staged_raw is not None:
-            dp_size = self.embed_tokens.dp_size
-            num_tokens, remainder = divmod(hash_ids.shape[0], dp_size)
-            if remainder or num_tokens > self._host_raw.shape[0]:
-                raise ValueError("Engram hashes exceed the configured DP staging slots")
-            if dp_size > 1:
-                # Lookup and redistribution stay on CPU. A device all-gather
-                # here would materialize DP copies of every replica's rows.
-                cols = self.embed_tokens.part_n_hash_cols
-                raw = torch.empty(
-                    (hash_ids.shape[0], cols, self._host_raw.shape[-1]),
-                    dtype=torch.uint8,
-                    device="cpu",
-                )
-                scales = torch.empty(
-                    (hash_ids.shape[0], cols, self._host_scale.shape[-1]),
-                    dtype=torch.uint8,
-                    device="cpu",
-                )
-                self.embed_tokens.gather_raw(hash_ids, raw, scales)
-                group = upstream.get_engram_dp_group()
-                assert group is not None and group.world_size == dp_size
-                raw, scales = exchange_rows(raw, scales, group.cpu_group, dp_size)
-                self._host_raw[:num_tokens].copy_(raw)
-                self._host_scale[:num_tokens].copy_(scales)
-            else:
-                self.embed_tokens.gather_raw(
-                    hash_ids, self._host_raw[:num_tokens], self._host_scale[:num_tokens]
-                )
-            _, cols, head_dim = self._host_raw.shape
-            blocks = self._host_scale.shape[-1]
-            raw_words = num_tokens * ((cols * head_dim) // 4)
-            scale_bytes = num_tokens * cols * blocks
-            scale_words = num_tokens * (-(-(cols * blocks) // 4))
-            if scale_words * 4 > scale_bytes:
-                self._host_scale_buf[scale_bytes : scale_words * 4].fill_(
-                    _INVALID_SCALE
-                )
-            # On TorchTPU, `copy_()` into a slice/view of a materialized device
-            # tensor allocates a fresh buffer per call instead of overwriting in
-            # place, whereas a whole-tensor `copy_()` overwrites in place (see
-            # `deepseek_v4/model.py:_HostStagedParams`). Allocate and reuse one
-            # exact-size whole 1-D packed device tensor per `num_tokens` bucket
-            # so each Engram layer issues a single fast 1-D H2D transfer, while
-            # exposing a 2-D `[num_tokens, words_per_tok]` dynamic-dim0 view to
-            # `torch.compile` (`create_concrete_args`).
-            host_words = self._host_packed_buf.view(torch.int32)
-            host_words[raw_words : raw_words + scale_words].copy_(
-                self._host_scale_buf[: scale_words * 4].view(torch.int32)
-            )
-            staged = self._staged_tensors(num_tokens)
-            staged.copy_(host_words[: raw_words + scale_words])
-            self._active_raw = self._staged_views(num_tokens)
+        if self._staged_raw is None:
+            super().prepare_embeddings(hash_ids)
             return
-        super().prepare_embeddings(hash_ids)
+        self.finish_prepare_embeddings(self.start_prepare_embeddings(hash_ids))
+
+    def start_prepare_embeddings(self, hash_ids: torch.Tensor) -> HostEngramStaging:
+        """Look up host rows and enqueue redistribution without waiting."""
+        assert self._staged_raw is not None
+        dp_size = self.embed_tokens.dp_size
+        num_tokens, remainder = divmod(hash_ids.shape[0], dp_size)
+        if remainder or num_tokens > self._host_raw.shape[0]:
+            raise ValueError("Engram hashes exceed the configured DP staging slots")
+        if dp_size > 1:
+            # Lookup and redistribution stay on CPU. A device all-gather
+            # here would materialize DP copies of every replica's rows.
+            cols = self.embed_tokens.part_n_hash_cols
+            raw = torch.empty(
+                (hash_ids.shape[0], cols, self._host_raw.shape[-1]),
+                dtype=torch.uint8,
+                device="cpu",
+            )
+            scales = torch.empty(
+                (hash_ids.shape[0], cols, self._host_scale.shape[-1]),
+                dtype=torch.uint8,
+                device="cpu",
+            )
+            self.embed_tokens.gather_raw(hash_ids, raw, scales)
+            group = upstream.get_engram_dp_group()
+            assert group is not None and group.world_size == dp_size
+            exchange = start_exchange_rows(raw, scales, group.cpu_group, dp_size)
+            return HostEngramStaging(num_tokens, exchange)
+        else:
+            self.embed_tokens.gather_raw(
+                hash_ids, self._host_raw[:num_tokens], self._host_scale[:num_tokens]
+            )
+        return HostEngramStaging(num_tokens)
+
+    def finish_prepare_embeddings(self, staging: HostEngramStaging) -> None:
+        """Wait for local token rows and upload them before their consumer graph."""
+        num_tokens = staging.num_tokens
+        if staging.exchange is not None:
+            raw, scales = staging.exchange.wait()
+            self._host_raw[:num_tokens].copy_(raw)
+            self._host_scale[:num_tokens].copy_(scales)
+        _, cols, head_dim = self._host_raw.shape
+        blocks = self._host_scale.shape[-1]
+        raw_words = num_tokens * ((cols * head_dim) // 4)
+        scale_bytes = num_tokens * cols * blocks
+        scale_words = num_tokens * (-(-(cols * blocks) // 4))
+        if scale_words * 4 > scale_bytes:
+            self._host_scale_buf[scale_bytes : scale_words * 4].fill_(_INVALID_SCALE)
+        # On TorchTPU, `copy_()` into a slice/view of a materialized device
+        # tensor allocates a fresh buffer per call instead of overwriting in
+        # place, whereas a whole-tensor `copy_()` overwrites in place (see
+        # `deepseek_v4/model.py:_HostStagedParams`). Allocate and reuse one
+        # exact-size whole 1-D packed device tensor per `num_tokens` bucket
+        # so each Engram layer issues a single fast 1-D H2D transfer, while
+        # exposing a 2-D `[num_tokens, words_per_tok]` dynamic-dim0 view to
+        # `torch.compile` (`create_concrete_args`).
+        host_words = self._host_packed_buf.view(torch.int32)
+        host_words[raw_words : raw_words + scale_words].copy_(
+            self._host_scale_buf[: scale_words * 4].view(torch.int32)
+        )
+        staged = self._staged_tensors(num_tokens)
+        staged.copy_(host_words[: raw_words + scale_words])
+        self._active_raw = self._staged_views(num_tokens)
 
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
         if self._staged_raw is None:

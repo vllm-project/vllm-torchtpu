@@ -337,12 +337,27 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     if stage == "encoder"
                     else self.end_layer
                 )
+                pending = []
                 for layer in islice(self.layers, self.start_layer, end_layer):
                     engram = getattr(layer, "engram", None)
-                    if engram is not None:
+                    if isinstance(engram, Engram) and engram.embed_tokens.host_offload:
+                        pending.append(
+                            (
+                                engram,
+                                engram.start_prepare_embeddings(
+                                    gathered_hashes[:, engram.layer_hash_index]
+                                ),
+                            )
+                        )
+                    elif engram is not None:
                         engram.prepare_embeddings(
                             gathered_hashes[:, engram.layer_hash_index]
                         )
+                # Issue collectives in layer order on every rank. Later tables'
+                # lookups overlap earlier exchanges, and their exchanges overlap
+                # earlier uploads. All buffers are ready before graph dispatch.
+                for engram, staging in pending:
+                    engram.finish_prepare_embeddings(staging)
         return engram_hashes, engram_mask
 
     def forward(
@@ -397,18 +412,6 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             first = (
                 next(iter(metadata.values())) if isinstance(metadata, dict) else None
             )
-            plan = (
-                plan_decoder_replay(
-                    first,
-                    self._ced_window,
-                    positions.shape[0],
-                    self._ced_compile_sizes,
-                )
-                if first is not None
-                else None
-            )
-            if context.dp_metadata is not None:
-                plan = coordinate_decoder_replay(plan, positions.shape[0])
             # SWA bounded replay: the encoder reads no SWA row below a prefix
             # hit's replay start and leaves cached KV of replayed tokens. The
             # input exists in every CED step so the compiled graph does not
@@ -446,6 +449,22 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         else:
             hidden, pre_mix = encoded
             encoder_aux = []
+        if context.dp_metadata is not None and hidden.device.type == "tpu":
+            # Host bucket coordination depends only on scheduling metadata.
+            # Enqueue the encoder before Gloo waits for other DP replicas.
+            synchronize_tensors((hidden, pre_mix, *encoder_aux), wait=False)
+        plan = (
+            plan_decoder_replay(
+                first,
+                self._ced_window,
+                positions.shape[0],
+                self._ced_compile_sizes,
+            )
+            if first is not None
+            else None
+        )
+        if context.dp_metadata is not None:
+            plan = coordinate_decoder_replay(plan, positions.shape[0])
         if plan is not None and plan.padded_num_tokens == 0:
             # The scheduler ignores logits for incomplete prefills. The
             # encoder has still published every global KV row for this chunk;

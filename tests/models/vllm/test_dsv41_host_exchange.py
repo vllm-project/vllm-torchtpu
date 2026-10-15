@@ -21,6 +21,7 @@ assert _SPEC is not None and _SPEC.loader is not None
 _MODULE = importlib.util.module_from_spec(_SPEC)
 _SPEC.loader.exec_module(_MODULE)
 exchange_rows = _MODULE.exchange_rows
+start_exchange_rows = _MODULE.start_exchange_rows
 
 
 def _worker(rank: int, size: int, rendezvous: str) -> None:
@@ -60,6 +61,21 @@ def _worker(rank: int, size: int, rendezvous: str) -> None:
                         assert scale_out[token, source * 2 + head, 0] == (
                             255 if token == slot - 1 else 127 + source + head
                         )
+            # Both layers are in flight before either wait. Distinct payloads
+            # and alternating buckets expose stale/reused communication buffers.
+            pending = [
+                start_exchange_rows(
+                    (raw + offset).flatten(0, 1),
+                    scales.flatten(0, 1),
+                    dist.group.WORLD,
+                    size,
+                )
+                for offset in (0, 64)
+            ]
+            for offset, transfer in zip((0, 64), pending):
+                actual, actual_scales = transfer.wait()
+                assert torch.equal(actual, out + offset)
+                assert torch.equal(actual_scales, scale_out)
     finally:
         dist.destroy_process_group()
 
