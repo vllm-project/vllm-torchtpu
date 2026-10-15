@@ -143,7 +143,12 @@ def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:
     from torch.distributed import _functional_collectives as funcol
 
     out = funcol.all_to_all_single(x.contiguous(), None, None, group.device_group)
-    return funcol.wait_tensor(out)
+    # Under `torch.compile`, `funcol.all_to_all_single` already wraps its output
+    # in `wait_tensor` via `_maybe_wrap_tensor`; calling `wait_tensor` a second
+    # time emits `wait_tensor(wait_tensor(...))` and breaks `SplitCompiler`.
+    if isinstance(out, funcol.AsyncCollectiveTensor):
+        return out.wait()
+    return out
 
 
 def merge_lse_partials_all_to_all(

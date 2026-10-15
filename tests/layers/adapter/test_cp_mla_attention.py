@@ -432,6 +432,39 @@ def test_all_to_all_merge_agrees_with_the_reduce_scatter_merge(monkeypatch):
     assert _bf16_close(ag_rs_result, reference)
 
 
+def test_all_to_all_unwraps_async_tensor_once_and_skips_plain_tensor(monkeypatch):
+    """Under `torch.compile`, `funcol.all_to_all_single` already returns a
+    waited Tensor; `_all_to_all` must not wrap it in a second `wait_tensor`."""
+    from torch.distributed import _functional_collectives as funcol
+
+    class _DummyGroup:
+        device_group = "dummy_pg"
+
+    wait_calls = []
+    monkeypatch.setattr(
+        funcol,
+        "wait_tensor",
+        lambda t: wait_calls.append(t) or t,
+    )
+
+    # 1. Plain Tensor (as returned when `_is_compiling()` is True):
+    # `wait_tensor` must NOT be called a second time.
+    plain = torch.ones(2, 3)
+    monkeypatch.setattr(funcol, "all_to_all_single", lambda x, out_sp, in_sp, pg: plain)
+    out_plain = cp_mla._all_to_all(plain, _DummyGroup())
+    assert out_plain is plain
+    assert wait_calls == []
+
+    # 2. AsyncCollectiveTensor (eager mode): `.wait()` unwraps it once.
+    async_wrapped = funcol.AsyncCollectiveTensor(plain)
+    monkeypatch.setattr(
+        funcol, "all_to_all_single", lambda x, out_sp, in_sp, pg: async_wrapped
+    )
+    out_async = cp_mla._all_to_all(plain, _DummyGroup())
+    assert out_async is plain
+    assert len(wait_calls) == 1
+
+
 def test_positive_control_wrong_head_slice_is_caught(monkeypatch):
     """The reference check must fail when a rank merges another rank's heads."""
     outputs, lses = _hard_partials(np.random.default_rng(13), 4)
