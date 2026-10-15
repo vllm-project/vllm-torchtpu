@@ -86,7 +86,8 @@ def project_uv_heads(
     W_UV is linear and the merge weights are per (token, head), so projecting
     each partial before the merge gives the same result as projecting after.
     """
-    # f32 operands: bf16/fp8 values are exact, so the dot accumulates in f32.
+    # f32 operands make bmm return f32 (out_dtype is ignored on TPU). bf16/fp8
+    # convert exactly, so XLA still runs one bf16 MXU pass.
     out = torch.bmm(partial.transpose(0, 1).to(torch.float32), w_uv.to(torch.float32))
     if w_uv_scale is not None:
         out = out * w_uv_scale.to(torch.float32)
