@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """BF16 decode selection: page ownership, completed groups and exact ties."""
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -173,6 +174,129 @@ def test_streamindex_bf16_pool_view_matches_native_cache(carrier, ties):
 
     expected = select(native)
     actual = select(packed)
+    for wanted, got in zip(expected, actual):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(wanted))
+    np.testing.assert_array_equal(np.asarray(packed).view(np.uint8), before)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("batch", [8, 9, 128])
+@pytest.mark.parametrize("ties", [False, True])
+def test_pooled_decode_uses_logical_width_without_changing_selection(batch, ties):
+    """Real owner geometry and mixed decode contexts retain padded-path winners."""
+    import jax
+
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
+    from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import select_blocks
+
+    rng = np.random.default_rng(53)
+    pages = batch * 2 + 1
+    query = jnp.asarray(rng.normal(size=(batch, 4, 128)), jnp.bfloat16)
+    if ties:
+        query = jnp.zeros_like(query)
+    keys = np.asarray(
+        jnp.asarray(rng.normal(size=(pages, 208, 2, 128)), jnp.bfloat16)
+    ).view(np.uint16)
+    raw = np.zeros((pages, 1664, 1, 4, 256), np.uint8)
+    raw[:, :208, 0, 0::2, :128] = keys & 255
+    raw[:, :208, 0, 1::2, :128] = keys >> 8
+    pool = jax.device_put(raw.view(np.dtype(jnp.float8_e4m3fn)))
+    owner_pages = rng.permutation(np.arange(1, pages)).reshape(batch, 2)
+    table = jnp.asarray(np.tile(owner_pages, (1, 3)), jnp.int32)
+    req = jnp.asarray(rng.permutation(batch), jnp.int32)
+    lengths = np.resize([0, 1, 3, 4, 2047, 2048, 2049, 8192, 9216], batch)
+    if batch == 128:
+        lengths = 8286 + np.arange(batch) % 51
+    lengths = jnp.asarray(lengths, jnp.int32)
+    expected = streamindex_topk(
+        jnp.pad(query, ((0, 0), (0, 0), (0, 128))),
+        jnp.full(query.shape[:2], 128**-0.5, jnp.float32),
+        pool.reshape(-1, 16, 4, 256),
+        lengths,
+        (table[req, :, None] * 104 + jnp.arange(13)).reshape(-1),
+        jnp.arange(batch + 1, dtype=jnp.int32),
+        jnp.full((3,), batch, jnp.int32),
+        k=512,
+        compression_ratio=4,
+        num_kv_pages_per_block=8,
+        num_queries_per_block=1,
+        decode_req_batch_size=8,
+        enable_early_exit=True,
+        components=qsa_indexing(),
+    )
+    actual = jax.jit(select_blocks, static_argnames=("ratio", "block_topk"))(
+        query,
+        pool,
+        lengths,
+        table,
+        req,
+        jnp.arange(batch + 1, dtype=jnp.int32),
+        lengths - 1,
+        ratio=4,
+        block_topk=512,
+    )
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+    np.testing.assert_array_equal(np.asarray(pool).view(np.uint8), raw)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("carrier", [jnp.uint8, jnp.float8_e4m3fn])
+@pytest.mark.parametrize("ties", [False, True])
+@pytest.mark.parametrize("prefill", [False, True])
+def test_bf16_view_wider_storage_preserves_score_bits_and_owner(carrier, ties, prefill):
+    """Unused finite features must not affect retrieval or mutate the carrier."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
+
+    rng = np.random.default_rng(53)
+    batch, pages, width = (3 if prefill else 9), 24, 256
+    query_length = 128 if prefill else 1
+    query = jnp.asarray(rng.normal(size=(batch * query_length, 4, 128)), jnp.bfloat16)
+    if ties:
+        query = jnp.zeros_like(query)
+    keys = jnp.asarray(rng.normal(size=(batch * pages, 16, 2, width)), jnp.bfloat16)
+    keys = keys.at[..., 128:].set(jnp.finfo(jnp.bfloat16).max)
+
+    def encode(src, dst):
+        dst.bitcast(jnp.bfloat16)[...] = src[...]
+
+    packed = pl.pallas_call(
+        encode,
+        grid=(len(keys),),
+        in_specs=[pl.BlockSpec((1, 16, 2, width), lambda p: (p, 0, 0, 0))],
+        out_specs=pl.BlockSpec((1, 16, 4, width), lambda p: (p, 0, 0, 0)),
+        out_shape=jax.ShapeDtypeStruct((len(keys), 16, 4, width), carrier),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+    )(keys)
+    before = np.asarray(packed).view(np.uint8).copy()
+    table = jnp.asarray(rng.permutation(batch * pages), jnp.int32)
+    lengths = jnp.array(
+        [3072, 3071, 0] if prefill else [0, 1, 3, 4, 2047, 2048, 2049, 3071, 3072],
+        jnp.int32,
+    )
+
+    def select(q):
+        return streamindex_topk(
+            q,
+            jnp.full(q.shape[:2], 128**-0.5, jnp.float32),
+            packed,
+            lengths,
+            table,
+            jnp.arange(batch + 1, dtype=jnp.int32) * query_length,
+            jnp.array([0, 0, batch] if prefill else [batch] * 3, jnp.int32),
+            k=512,
+            compression_ratio=4,
+            num_kv_pages_per_block=8,
+            num_queries_per_block=query_length,
+            decode_req_batch_size=8,
+            components=qsa_indexing(),
+            return_scores=True,
+        )
+
+    expected = select(jnp.pad(query, ((0, 0), (0, 0), (0, 128))))
+    actual = select(query)
     for wanted, got in zip(expected, actual):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(wanted))
     np.testing.assert_array_equal(np.asarray(packed).view(np.uint8), before)

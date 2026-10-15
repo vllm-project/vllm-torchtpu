@@ -32,7 +32,7 @@ class BF16KeyReader:
                     "native BF16 index keys require [pages, rows, 2, width]"
                 )
         elif cache.dtype in (jnp.uint8, jnp.float8_e4m3fn):
-            if cache.shape[2] != 4 or cache.shape[-1] != width or cache.shape[-1] % 128:
+            if cache.shape[2] != 4 or cache.shape[-1] < width or cache.shape[-1] % 128:
                 raise ValueError(
                     "BF16 carrier requires packing 4 and aligned storage width"
                 )
@@ -43,7 +43,7 @@ class BF16KeyReader:
         values = (
             ref[...] if ref.dtype == jnp.bfloat16 else ref.bitcast(jnp.bfloat16)[...]
         )
-        keys = values.reshape(rows, width)
+        keys = values.reshape(rows, ref.shape[-1])[:, :width]
         return keys, jnp.ones((1, rows), jnp.float32)
 
 

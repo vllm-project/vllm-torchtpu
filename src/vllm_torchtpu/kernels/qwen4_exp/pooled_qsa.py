@@ -503,8 +503,13 @@ def select_blocks(
     def select_chunk(q, lens, pages):
         batch = len(q)
         expanded = expand_pages(pages).reshape(batch, -1)
+        index_query = (
+            jnp.pad(q, ((0, 0), (0, 0), (0, width - q.shape[-1])))
+            if pool.dtype == jnp.bfloat16
+            else q
+        )
         return streamindex_topk(
-            jnp.pad(q, ((0, 0), (0, 0), (0, width - q.shape[-1]))),
+            index_query,
             jnp.full(q.shape[:2], q.shape[-1] ** -0.5, jnp.float32),
             cache,
             lens,
