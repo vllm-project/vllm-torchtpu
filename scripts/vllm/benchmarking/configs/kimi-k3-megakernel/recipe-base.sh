@@ -52,14 +52,13 @@
 #
 # RECIPE_SET=oct13 serves the doc's Oct 13 set as its "Changes from" list reads:
 # TPU P-state 7 and RAIDEN_NUMA_POLICY=bind on both roles, the prefill without
-# --prefix-cache-retention-interval, the one-hour benchmark, and for the DP2
-# points (e-g) and point h the prefill's --long-prefill-token-threshold 4096 and
-# the decode's default deferred Stage-3 submit. RECIPE_STORE_SERVERS=1 (c-h)
-# adds the global registry on the prefill head and a host-store server on each
-# decode host, which k3_1p1d.sh starts; the prefill's host store joins their
-# pool and the decode drops its own. Departure for GKE: the prefill of e-h has
-# no --numa-bind, which runs the ranks under numactl and the engine image has
-# none.
+# --prefix-cache-retention-interval, the one-hour benchmark, and for the points
+# without speculation (e-h) the prefill's --long-prefill-token-threshold 4096
+# and --numa-bind (which needs numactl in the engine image) and the decode's
+# default deferred Stage-3 submit. RECIPE_STORE_SERVERS=1 (c-h) adds the global
+# registry on the prefill head and a host-store server on each decode host,
+# which k3_1p1d.sh starts; the prefill's host store joins their pool and the
+# decode drops its own.
 
 for _v in RECIPE_CONCURRENCY RECIPE_DECODE RECIPE_DECODE_MAX_NUM_SEQS; do
   [ -n "${!_v:-}" ] || { echo "ERROR: kimi-k3-megakernel: the point sets no $_v" >&2; return 2; }
@@ -371,9 +370,13 @@ if [ "$_role" = prefill ]; then
     --kv-transfer-config "$_kv"
   )
   # The Oct 13 points without speculation: a long prompt takes at most 4,096
-  # tokens of the 8,192-token step, so short requests share it.
+  # tokens of the 8,192-token step, so short requests share it. --numa-bind
+  # pins ranks 0-3 to NUMA node 0 and 4-7 to node 1, CPUs and memory, so each
+  # rank's host store lands on its own node; vLLM launches the workers under
+  # numactl, which k3_1p1d.sh checks the engine image for.
   if [ "${RECIPE_SET:-}" = oct13 ] && [ "$_no_spec" = 1 ]; then
     ROLE_ARGS+=(--long-prefill-token-threshold 4096)
+    ROLE_ARGS+=(--numa-bind --numa-bind-nodes 0 0 0 0 1 1 1 1)
   fi
 elif [ "$RECIPE_DECODE" = dp2_dcp16 ]; then
   _loader=$(printf '{"presharded":"%s","attention_dp":2}' "$PRESHARDED_DIR")
