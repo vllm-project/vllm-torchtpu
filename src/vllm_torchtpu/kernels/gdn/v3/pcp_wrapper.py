@@ -128,9 +128,11 @@ def _all_rank_barrier(
 def _compute_gdn_tile(
     b_slot_ref: jax.Ref,
     a_slot_ref: jax.Ref,
-    conv_state_slot_ref: jax.Ref,
-    recurrent_slot_ref: jax.Ref,
+    conv_state_in_slot_ref: jax.Ref,
+    recurrent_in_slot_ref: jax.Ref,
     out_slot_ref: jax.Ref,
+    conv_state_out_slot_ref: jax.Ref,
+    recurrent_out_slot_ref: jax.Ref,
     metadata_ref: memory_ref.MetadataRef,
     stage_metadata_ref: pcp_metadata.PcpStageMetadata,
     weights_ref: memory_ref.WeightRefs,
@@ -196,9 +198,11 @@ def _compute_gdn_tile(
         compute_qkv_ref,
         b_slot_ref,
         a_slot_ref,
-        conv_state_slot_ref,
-        recurrent_slot_ref,
+        conv_state_in_slot_ref,
+        recurrent_in_slot_ref,
         out_slot_ref,
+        conv_state_out_slot_ref,
+        recurrent_out_slot_ref,
         metadata_ref,
         weights_ref,
         carry_conv_scratch_ref,
@@ -791,19 +795,26 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
             unroll=False,
         )
 
-    _, b_alloc, a_alloc, conv_alloc, recurrent_alloc, out_alloc = (
-        memory_ref.create_allocs(
-            metadata_ref=metadata_ref,
-            qkv_ref=compute_qkv_ref,
-            b_ref=b_ref,
-            a_ref=a_ref,
-            out_ref=gdn_out_ref,
-            conv_state_ref=state_source_ref,
-            recurrent_state_ref=state_source_ref,
-            cfg=cfg,
-            conv_state_output_ref=conv_state_updates_ref,
-            recurrent_state_output_ref=recurrent_state_updates_ref,
-        )
+    (
+        _,
+        b_alloc,
+        a_alloc,
+        conv_in_alloc,
+        recurrent_in_alloc,
+        out_alloc,
+        conv_out_alloc,
+        recurrent_out_alloc,
+    ) = memory_ref.create_allocs(
+        metadata_ref=metadata_ref,
+        qkv_ref=compute_qkv_ref,
+        b_ref=b_ref,
+        a_ref=a_ref,
+        out_ref=gdn_out_ref,
+        conv_state_ref=state_source_ref,
+        recurrent_state_ref=state_source_ref,
+        cfg=cfg,
+        conv_state_output_ref=conv_state_updates_ref,
+        recurrent_state_output_ref=recurrent_state_updates_ref,
     )
 
     num_tiles = metadata_ref.num_tiles[...]
@@ -883,9 +894,11 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
     def _compute_gdn_tile_and_exchange_output(
         b_slot_ref,
         a_slot_ref,
-        conv_state_slot_ref,
-        recurrent_slot_ref,
+        conv_state_in_slot_ref,
+        recurrent_in_slot_ref,
         out_slot_ref,
+        conv_state_out_slot_ref,
+        recurrent_out_slot_ref,
         metadata_ref,
         stage_metadata_ref,
         weights_ref,
@@ -945,9 +958,11 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         _compute_gdn_tile(
             b_slot_ref,
             a_slot_ref,
-            conv_state_slot_ref,
-            recurrent_slot_ref,
+            conv_state_in_slot_ref,
+            recurrent_in_slot_ref,
             out_slot_ref,
+            conv_state_out_slot_ref,
+            recurrent_out_slot_ref,
             metadata_ref,
             stage_metadata_ref,
             weights_ref,
@@ -1008,10 +1023,14 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         in_specs=(
             b_alloc.spec,
             a_alloc.spec,
-            conv_alloc.spec,
-            recurrent_alloc.spec,
+            conv_in_alloc.spec,
+            recurrent_in_alloc.spec,
         ),
-        out_specs=(out_alloc.spec,),
+        out_specs=(
+            out_alloc.spec,
+            conv_out_alloc.spec,
+            recurrent_out_alloc.spec,
+        ),
     )
 
     def _stage_prologue() -> None:
@@ -1050,9 +1069,11 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
         allocations=(
             b_alloc,
             a_alloc,
-            conv_alloc,
-            recurrent_alloc,
+            conv_in_alloc,
+            recurrent_in_alloc,
             out_alloc,
+            conv_out_alloc,
+            recurrent_out_alloc,
         ),
     )
     def _run(
@@ -1081,6 +1102,8 @@ def _pcp_qkvz_projection_gdn_outer_kernel(
             state_source_ref,
             state_source_ref,
             gdn_out_ref,
+            state_source_ref,
+            state_source_ref,
             scratches=(
                 metadata_ref,
                 stage_metadata_ref,
@@ -1236,7 +1259,8 @@ def _compact_state_updates_shape(
 
     NHD can address a token-row subregion directly. HND stores tokens on the
     minormost lane, so the V3 state seam copies complete source pages and keeps
-    all of their inner dimensions, matching ``ExternalStateBufferedRef``.
+    all of their inner dimensions, matching ``ExternalStateInBufferedRef`` and
+    ``ExternalStateOutBufferedRef``.
     """
     if whole_block_dma:
         region_shape = (region.nblocks, *state_source.shape[1:])

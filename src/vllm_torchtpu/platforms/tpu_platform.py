@@ -6,7 +6,7 @@ import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import os
 import time
-from typing import TYPE_CHECKING, Any, Protocol, Union, cast
+from typing import TYPE_CHECKING, Protocol, Union, cast
 
 import portpicker
 import torch
@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from vllm.inputs import EngineInput
     from vllm.pooling_params import PoolingParams
     from vllm.sampling_params import SamplingParams
+    from vllm.v1.attention.backend import AttentionBackend
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
     from vllm.v1.attention.selector import AttentionSelectorConfig
 
@@ -1055,14 +1056,16 @@ class TpuPlatform(Platform):
                 )
 
     @classmethod
-    def _find_non_ssm_backend(cls, vllm_config: VllmConfig) -> Any:
-        """Returns the primary non-SSM attention backend for the config."""
+    def _find_non_ssm_backend(
+        cls, vllm_config: VllmConfig
+    ) -> "type[AttentionBackend] | None":
+        """First non-SSM attention backend in layer order, or None.
+
+        vLLM v0.31 replaced this helper with `_find_non_ssm_backends`, which
+        lists every distinct backend; the TPU callers need the first one.
+        """
         backends = cls._find_non_ssm_backends(vllm_config)
-        if not backends:
-            return None
-        if isinstance(backends, (list, tuple)):
-            return backends[0]
-        return next(iter(backends), None)
+        return backends[0] if backends else None
 
     @classmethod
     def update_block_size_for_backend(cls, vllm_config: VllmConfig) -> None:

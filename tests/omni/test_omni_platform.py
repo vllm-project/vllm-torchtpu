@@ -13,7 +13,12 @@ from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
 from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
 
 from vllm_torchtpu.omni import register_omni_tpu_platform
-from vllm_torchtpu.omni.attention import TpuSDPABackend, TpuSDPAImpl
+from vllm_torchtpu.omni.attention import (
+    TpuFlashAttentionBackend,
+    TpuFlashAttentionImpl,
+    TpuSDPABackend,
+    TpuSDPAImpl,
+)
 from vllm_torchtpu.omni.patches import (
     _patch_diffusion_startup_warmup_sync,
     apply_omni_model_specific_patches,
@@ -53,8 +58,13 @@ def test_platform_attributes():
     assert platform.supports_diffusion_dense_flash_attention() is False
     assert (
         platform.get_diffusion_attn_backend_cls(None, 64)
-        == "vllm_torchtpu.omni.attention.TpuSDPABackend"
+        == "vllm_torchtpu.omni.attention.TpuFlashAttentionBackend"
     )
+    for name in ("SDPA", "TPU_SDPA", "torch_sdpa"):
+        assert (
+            platform.get_diffusion_attn_backend_cls(name, 64)
+            == "vllm_torchtpu.omni.attention.TpuSDPABackend"
+        )
     with patch("torch.device") as mock_dev:
         platform.get_torch_device()
         mock_dev.assert_called_once_with("tpu")
@@ -115,6 +125,74 @@ def test_rope_patch_installed():
     torch.testing.assert_close(
         out_f32, rope.forward_native(x_f32, cos_f32, sin_f32), rtol=0, atol=0
     )
+
+
+def test_tpu_flash_attention_backend(monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import MagicMock
+
+    assert TpuFlashAttentionBackend.get_name() == "TPU_FLASH_ATTN"
+    assert TpuFlashAttentionBackend.get_impl_cls() is TpuFlashAttentionImpl
+
+    mock_op = MagicMock(side_effect=lambda q, k, v, scale: q.clone())
+    monkeypatch.setattr(
+        "vllm_torchtpu.omni.attention._flash_attention_op", lambda: mock_op
+    )
+    mock_warn = MagicMock()
+    monkeypatch.setattr("vllm_torchtpu.omni.attention.logger.warning_once", mock_warn)
+
+    q = torch.randn(1, 16, 6, 16, dtype=torch.bfloat16)
+    k = torch.randn(1, 16, 6, 16, dtype=torch.bfloat16)
+    v = torch.randn(1, 16, 6, 16, dtype=torch.bfloat16)
+
+    impl = TpuFlashAttentionImpl(num_heads=6, head_size=16, softmax_scale=0.25)
+    out = impl.forward(q, k, v)
+    assert out.shape == (1, 16, 6, 16)
+    mock_op.assert_called_once()
+    mock_warn.assert_not_called()
+
+    # 1. causal=True falls back to PyTorch SDPA with warning_once
+    mock_op.reset_mock()
+    impl_causal = TpuFlashAttentionImpl(
+        num_heads=6, head_size=16, softmax_scale=0.25, causal=True
+    )
+    out_causal = impl_causal.forward(q, k, v)
+    assert out_causal.shape == (1, 16, 6, 16)
+    mock_op.assert_not_called()
+    mock_warn.assert_called_once_with(
+        "TpuFlashAttentionImpl falling back to PyTorch SDPA (%s).", "causal=True"
+    )
+
+    # 2. attn_mask is not None falls back
+    mock_warn.reset_mock()
+    meta = SimpleNamespace(attn_mask=torch.ones(1, 16, dtype=torch.bool))
+    impl.forward(q, k, v, attn_metadata=meta)
+    mock_op.assert_not_called()
+    mock_warn.assert_called_once_with(
+        "TpuFlashAttentionImpl falling back to PyTorch SDPA (%s).",
+        "attn_mask is not None",
+    )
+
+    # 3. non-bfloat16 falls back
+    mock_warn.reset_mock()
+    impl.forward(q.float(), k.float(), v.float())
+    mock_op.assert_not_called()
+    mock_warn.assert_called_once_with(
+        "TpuFlashAttentionImpl falling back to PyTorch SDPA (%s).",
+        "query.dtype=torch.float32 (requires torch.bfloat16)",
+    )
+
+    # 4. uneven GQA raises, like vLLM-Omni's SDPA
+    mock_warn.reset_mock()
+    impl_uneven = TpuFlashAttentionImpl(
+        num_heads=6, head_size=16, softmax_scale=0.25, num_kv_heads=4
+    )
+    k4 = torch.randn(1, 16, 4, 16, dtype=torch.bfloat16)
+    v4 = torch.randn(1, 16, 4, 16, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match=r"num_heads \(6\) must be a multiple"):
+        impl_uneven.forward(q, k4, v4)
+    mock_op.assert_not_called()
+    mock_warn.assert_not_called()
 
 
 def test_wan_ffn_gelu_fence(monkeypatch):

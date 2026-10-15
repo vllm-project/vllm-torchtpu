@@ -107,8 +107,8 @@ VLLM_TARGET_DEVICE="empty" pip install --pre -e . --group vllm
 If you are developing or debugging vLLM core in tandem with `vllm-torchtpu`:
 
 ```bash
-# Clone matching vLLM version (e.g. v0.29.0)
-git clone --depth 1 --branch v0.29.0 https://github.com/vllm-project/vllm.git ../vllm
+# Clone matching vLLM version (e.g. v0.31.0)
+git clone --depth 1 --branch v0.31.0 https://github.com/vllm-project/vllm.git ../vllm
 
 # Install in editable mode without overwriting dependencies
 VLLM_TARGET_DEVICE="empty" uv pip install --no-deps -e ../vllm

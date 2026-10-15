@@ -94,7 +94,10 @@ def test_hybrid_full_attention_mamba_pcp_resolves_effective_block_size():
     ) == (32768, 4096)
 
 
-def test_hybrid_full_attention_mamba_pcp_builds_prefix_cache_coordinator():
+@pytest.mark.parametrize("allow_partial_hash_hits", [False, True])
+def test_hybrid_full_attention_mamba_pcp_builds_prefix_cache_coordinator(
+    allow_partial_hash_hits,
+):
     _patch_vllm_hybrid_pcp_block_sizes()
     from vllm.v1.core.kv_cache_coordinator import (
         HybridKVCacheCoordinator,
@@ -126,10 +129,12 @@ def test_hybrid_full_attention_mamba_pcp_builds_prefix_cache_coordinator():
         dcp_world_size=1,
         pcp_world_size=8,
         scheduler_block_size=scheduler_block_size,
-        hash_block_size=hash_block_size,
+        hash_block_size=hash_block_size // 2,
+        allow_partial_hash_hits=allow_partial_hash_hits,
     )
 
     assert isinstance(coordinator, HybridKVCacheCoordinator)
+    assert coordinator.enable_partial_hash_hits is allow_partial_hash_hits
     assert [
         group.kv_cache_spec.block_size
         for group in coordinator.kv_cache_config.kv_cache_groups

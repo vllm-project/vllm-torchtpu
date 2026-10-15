@@ -46,11 +46,10 @@ dependencies = [
     # Imported directly by src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py, so
     # declared here rather than leaned on as a vLLM transitive.
     #
-    # Capped below 5.15. vLLM 0.29.0 sets a floor (>=5.10.4), and vllm-omni 0.29.0rc1
-    # requires transformers>=5.13.0,<5.15. The previous <5.11 ceiling was added
-    # defensively after floating to 5.17.0 produced an argmax tie-break divergence in
-    # test_structured_output_spec_decode_correctness_greedy. Widening to <5.15 allows
-    # vllm-torchtpu[omni] to resolve (to 5.14.x) while remaining bounded below 5.15+.
+    # vLLM 0.31.0 allows >=5.10.4,<5.18; vllm-omni 0.29.0rc1 needs
+    # >=5.13,<5.15. Keep the shared upper bound for Omni compatibility.
+    # A previous upgrade to 5.17.0 changed greedy structured-output results;
+    # rerun that regression before widening the upper bound.
     "transformers>=5.10.4,<5.15",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
@@ -118,7 +117,8 @@ torchtpu_layers = "vllm_torchtpu.layers:register_layers"
 # on top would overwrite it. Opt in with `pip install -e . --group vllm`.
 vllm = [
     # Note: we **intentionally** build vllm from source, see README.
-    "vllm @ git+https://github.com/vllm-project/vllm.git@8039d3cbfd55be2aa172d544042c53b4e966369d"
+    # Keep vllm_test_utils on the same upstream tag below.
+    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.31.0",
 ]
 
 # Required for running tests
@@ -131,7 +131,7 @@ test = [
     "pytest-cov",
     "parameterized",
     # Not published on PyPI; lives in vLLM's tests/ directory.
-    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@8039d3cbfd55be2aa172d544042c53b4e966369d#subdirectory=tests/vllm_test_utils",
+    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@v0.31.0#subdirectory=tests/vllm_test_utils",
 ]
 
 [tool.pytest.ini_options]

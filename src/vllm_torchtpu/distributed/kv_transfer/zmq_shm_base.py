@@ -753,9 +753,9 @@ class ZmqShmKvConnectorBase:
     def _coord_attach_shm_with_retry(self, spec: Any, name: str) -> Any:
         """Non-rank-0 ranks may race ahead of rank 0. Poll the shm name a
         few seconds before giving up."""
-        deadline = time.perf_counter() + 30.0
+        deadline = time.time() + 30.0
         last_err: Exception | None = None
-        while time.perf_counter() < deadline:
+        while time.time() < deadline:
             try:
                 return self._pool_attach(spec, name)
             except FileNotFoundError as e:
@@ -1022,7 +1022,7 @@ class ZmqShmKvConnectorBase:
                 send_holders = [
                     f"uuid={u} req={e.req_id} "
                     f"acked={e.pull_acked} "
-                    f"exp_in={max(0.0, e.expiration_time - time.perf_counter()):.1f}s"
+                    f"exp_in={max(0.0, e.expiration_time - time.time()):.1f}s"
                     for u, e in self._coord_send.items()
                 ]
                 recv_holders = [
@@ -1097,11 +1097,11 @@ class ZmqShmKvConnectorBase:
             req_id,
             uuid,
         )
-        deadline = time.perf_counter() + timeout
+        deadline = time.time() + timeout
         info: tuple[int, int, list[int]] | None = None
         with self._worker_pending_stage_cv:
             while uuid not in self._worker_pending_stage:
-                rem = deadline - time.perf_counter()
+                rem = deadline - time.time()
                 if rem <= 0:
                     logger.warning(
                         "TPUConnectorWorker(%d) rank%d --> stage_inline timeout "
@@ -1232,9 +1232,9 @@ class ZmqShmKvConnectorBase:
                 py_fut = self._coord_stage_waiter_pool.submit(
                     self._coord_stage_wait_worker, entry
                 )
-                in_flight.append((time.monotonic() + timeout_s, entry, py_fut))
+                in_flight.append((time.time() + timeout_s, entry, py_fut))
             if in_flight:
-                now = time.monotonic()
+                now = time.time()
                 kept: list[tuple[float, _StageInFlight, Any]] = []
                 for deadline, ent, fut in in_flight:
                     if fut.done():
@@ -1566,10 +1566,10 @@ class ZmqShmKvConnectorBase:
                     time.time(),
                 )
                 sock.send_multipart([_MSG_PULL, uuid_bytes, req_blocks_pickle])
-                deadline = t0 + timeout_s
+                deadline = time.time() + timeout_s
                 frames = None
-                while time.perf_counter() < deadline:
-                    remaining_ms = max(1, int((deadline - time.perf_counter()) * 1000))
+                while time.time() < deadline:
+                    remaining_ms = max(1, int((deadline - time.time()) * 1000))
                     if sock.poll(timeout=min(remaining_ms, 1000)) != 0:
                         # copy=False returns zmq.Frame objects whose
                         # .buffer is a readonly memoryview into the ZMQ
@@ -2019,10 +2019,10 @@ class ZmqShmKvConnectorBase:
         or None for skip/timeout. The dict stores None as a sentinel set
         by LOAD_SKIP, so we can tell "skip" apart from "not there yet" by
         presence."""
-        deadline = time.perf_counter() + timeout
+        deadline = time.time() + timeout
         with self._worker_pending_load_cv:
             while uuid not in self._worker_pending_load:
-                rem = deadline - time.perf_counter()
+                rem = deadline - time.time()
                 if rem <= 0:
                     return None
                 self._worker_pending_load_cv.wait(timeout=rem)
@@ -2444,9 +2444,9 @@ class ZmqShmKvConnectorBase:
         # n_channels parallel PULLs the race window is n_channels-fold more
         # likely to fire, so this backoff is required for correctness.
         timeout = dist_utils.get_p2p_wait_pull_timeout()
-        deadline = time.perf_counter() + timeout
+        deadline = time.time() + timeout
         entry = None
-        while time.perf_counter() < deadline:
+        while time.time() < deadline:
             with self._coord_lock:
                 entry = self._coord_send.get(uuid)
                 if entry is not None:
@@ -2454,7 +2454,7 @@ class ZmqShmKvConnectorBase:
                     # Do not let the expiration sweeper release it while this
                     # channel is waiting for staging or queued to send.
                     entry.expiration_time = max(
-                        entry.expiration_time, time.perf_counter() + timeout
+                        entry.expiration_time, time.time() + timeout
                     )
             if entry is not None:
                 break
@@ -2475,7 +2475,7 @@ class ZmqShmKvConnectorBase:
         # n_channels=tp_size (the default) this means each channel waits
         # for exactly one rank.
         for r in ranks_on_channel:
-            rem = max(0.0, deadline - time.perf_counter())
+            rem = max(0.0, deadline - time.time())
             if r >= len(entry.staged_events):
                 # Defensive: should never happen because tp_size sizes the
                 # vector at construction. Fall back to global wait.
@@ -2504,9 +2504,7 @@ class ZmqShmKvConnectorBase:
                 )
                 return None
         with self._coord_lock:
-            entry.expiration_time = max(
-                entry.expiration_time, time.perf_counter() + timeout
-            )
+            entry.expiration_time = max(entry.expiration_time, time.time() + timeout)
             stage_failed = entry.stage_failed
         if stage_failed:
             # Some rank's stage waiter aborted (timeout or wait() raised).
@@ -2615,7 +2613,7 @@ class ZmqShmKvConnectorBase:
         while not self._stop_event.is_set():
             if self._stop_event.wait(timeout=1.0):
                 return
-            now = time.perf_counter()
+            now = time.time()
             expired: list[int] = []
             with self._coord_lock:
                 for uuid, entry in list(self._coord_send.items()):

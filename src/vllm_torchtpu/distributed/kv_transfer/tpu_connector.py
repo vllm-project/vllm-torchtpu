@@ -463,7 +463,7 @@ class _Stage3SubmitOutcome:
     task: _Stage3SubmitTask
     error: BaseException | None
     submit_ms: float
-    # perf_counter() when the RPC was issued; paces re-attempts.
+    # Unix timestamp when the RPC was issued; paces re-attempts.
     attempted_at: float
 
 
@@ -1310,9 +1310,7 @@ class TPUConnectorScheduler:
         delay_free_blocks = len(computed_block_ids) > 0
         if delay_free_blocks:
             uuid = get_uuid()
-            expiration_time = (
-                time.perf_counter() + dist_utils.get_p2p_wait_pull_timeout()
-            )
+            expiration_time = time.time() + dist_utils.get_p2p_wait_pull_timeout()
             self.reqs_to_send[request.request_id] = SendMeta(
                 uuid=uuid,
                 local_block_ids=computed_block_ids,
@@ -2491,7 +2489,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 mamba_block_ids, self._stage3_mamba_num_speculative_blocks
             )
         uuid = get_uuid()
-        now = time.perf_counter()
+        now = time.time()
         expiration_time = now + dist_utils.get_p2p_wait_pull_timeout()
         self.reqs_to_send[request.request_id] = SendMeta(
             uuid=uuid,
@@ -2631,7 +2629,7 @@ class TPURaidenConnectorWorker:
         # native terminal (or was cancelled unclaimed) and is drained into
         # the scheduler report exactly once.
         self._stage3_send_outcomes: dict[str, str] = {}
-        # req_id -> next registry status probe time (perf_counter seconds).
+        # req_id -> next registry status probe time (Unix seconds).
         self._stage3_status_probe_next: dict[str, float] = {}
         # vLLM independently randomizes the internal request ID on the
         # prefill and decode engines. D5 and the controller/native transfer
@@ -3730,9 +3728,7 @@ class TPURaidenConnectorWorker:
         # Store mode: the store is brought up by this engine's rank-0
         # worker in parallel with the peer ranks' init — bounded retry
         # instead of the sidecar era's launcher-ordered readiness.
-        registration_deadline = time.perf_counter() + (
-            120.0 if _reshard_store_mode() else 0.0
-        )
+        registration_deadline = time.time() + (120.0 if _reshard_store_mode() else 0.0)
         while True:
             try:
                 facade.register_work_unit(
@@ -3747,7 +3743,7 @@ class TPURaidenConnectorWorker:
                 )
                 break
             except Exception as exc:  # noqa: BLE001 — retry-or-reraise
-                if time.perf_counter() >= registration_deadline:
+                if time.time() >= registration_deadline:
                     raise
                 logger.info(
                     "Raiden work-unit registration to %s not accepted yet "
@@ -4161,7 +4157,7 @@ class TPURaidenConnectorWorker:
             lowering_parallelism = parallelism // self.tp_size
             lowering_rank = transfer_rank // self.tp_size
 
-        now = time.perf_counter()
+        now = time.time()
         expired_terminal_req_ids = [
             req_id
             for req_id, registration in self._stage3_terminal_sends.items()
@@ -4354,7 +4350,7 @@ class TPURaidenConnectorWorker:
                 # is no local registration to complete or release. Retain a
                 # fresh local tombstone so metadata replay is idempotent, and
                 # contribute this rank's terminal vote to PCP aggregation.
-                tombstone_deadline = time.perf_counter() + float(
+                tombstone_deadline = time.time() + float(
                     dist_utils.get_p2p_wait_pull_timeout()
                 )
                 self._stage3_terminal_sends[req_id] = _Stage3RegisteredSend(
@@ -4469,7 +4465,7 @@ class TPURaidenConnectorWorker:
         transfer_rank = self._local_raiden_transfer_rank()
         self._maybe_delay_stage3_registration_for_test(metadata)
 
-        now = time.perf_counter()
+        now = time.time()
         expired_terminal_req_ids = [
             req_id
             for req_id, registration in self._stage3_terminal_sends.items()
@@ -4601,7 +4597,7 @@ class TPURaidenConnectorWorker:
             except (RuntimeError, ValueError) as exc:
                 if _STAGE3_REGISTRATION_CANCELLED_ERROR not in str(exc):
                     raise
-                tombstone_deadline = time.perf_counter() + float(
+                tombstone_deadline = time.time() + float(
                     dist_utils.get_p2p_wait_pull_timeout()
                 )
                 self._stage3_terminal_sends[req_id] = _Stage3RegisteredSend(
@@ -4706,7 +4702,7 @@ class TPURaidenConnectorWorker:
         parallelism = self._raiden_transfer_parallelism()
         transfer_rank = self._local_raiden_transfer_rank()
 
-        now = time.perf_counter()
+        now = time.time()
         for req_id in [
             req_id
             for req_id, registration in self._stage3_terminal_sends.items()
@@ -4784,7 +4780,7 @@ class TPURaidenConnectorWorker:
             except (RuntimeError, ValueError) as exc:
                 if _STAGE3_REGISTRATION_CANCELLED_ERROR not in str(exc):
                     raise
-                tombstone_deadline = time.perf_counter() + float(
+                tombstone_deadline = time.time() + float(
                     dist_utils.get_p2p_wait_pull_timeout()
                 )
                 self._stage3_terminal_sends[req_id] = _Stage3RegisteredSend(
@@ -5255,7 +5251,7 @@ class TPURaidenConnectorWorker:
         precise, side-effect-free error for a short bounded interval.
         """
         configured_timeout = float(dist_utils.get_p2p_wait_pull_timeout())
-        deadline = time.perf_counter() + min(
+        deadline = time.time() + min(
             max(configured_timeout, 0.0), _STAGE3_D5_REGISTRATION_WAIT_S
         )
         attempts = 0
@@ -5266,7 +5262,7 @@ class TPURaidenConnectorWorker:
             except RuntimeError as exc:
                 if (
                     "Missing producer block registration" not in str(exc)
-                    or time.perf_counter() >= deadline
+                    or time.time() >= deadline
                 ):
                     raise
                 if attempts == 1:
@@ -5517,7 +5513,7 @@ class TPURaidenConnectorWorker:
                     # records; only surface recompute after manager failure or
                     # a full post-RPC manager timeout.
                     self._stage3_controller_accepted.add(destination_req_id)
-                    deadline = time.perf_counter() + float(
+                    deadline = time.time() + float(
                         dist_utils.get_p2p_wait_pull_timeout()
                     )
                     self._stage3_pending_controller_failures[destination_req_id] = (
@@ -5576,7 +5572,7 @@ class TPURaidenConnectorWorker:
                 )
 
                 continue
-            now = time.perf_counter()
+            now = time.time()
             defer_wait_s = (
                 dist_utils.get_stage3_registration_wait_s()
                 if not synchronous and dist_utils.get_stage3_deferred_submit_enabled()
@@ -5836,7 +5832,7 @@ class TPURaidenConnectorWorker:
     def _stage3_source_unreachable(self, address: str) -> bool:
         with self._stage3_submit_lock:
             until = self._stage3_unreachable_sources.get(address, 0)
-        return time.perf_counter() < until
+        return time.time() < until
 
     @staticmethod
     def _stage3_source_down(address: str, exc: BaseException) -> bool:
@@ -5856,7 +5852,7 @@ class TPURaidenConnectorWorker:
         )
         with self._stage3_submit_lock:
             self._stage3_unreachable_sources[address] = (
-                time.perf_counter() + _STAGE3_UNREACHABLE_SOURCE_BACKOFF_S
+                time.time() + _STAGE3_UNREACHABLE_SOURCE_BACKOFF_S
             )
 
     def _execute_stage3_submit(self, task: _Stage3SubmitTask) -> _Stage3SubmitOutcome:
@@ -5867,6 +5863,7 @@ class TPURaidenConnectorWorker:
         completion is deliberately *not* inferred from that acknowledgement;
         get_finished polls the local manager.
         """
+        attempted_at = time.time()
         start_submit = time.perf_counter()
         if (
             task.pending.destination_req_id
@@ -5878,7 +5875,7 @@ class TPURaidenConnectorWorker:
                     "Missing producer block registration (aborted before submit)"
                 ),
                 submit_ms=0.0,
-                attempted_at=start_submit,
+                attempted_at=attempted_at,
             )
         address = str(task.call_kwargs["src_controller_address"])
         not_sent = f"Control RPC connection failed before sending request to {address}"
@@ -5887,7 +5884,7 @@ class TPURaidenConnectorWorker:
                 task=task,
                 error=RuntimeError(not_sent),
                 submit_ms=0.0,
-                attempted_at=start_submit,
+                attempted_at=attempted_at,
             )
         error: BaseException | None = None
         try:
@@ -5910,7 +5907,7 @@ class TPURaidenConnectorWorker:
             task=task,
             error=error,
             submit_ms=(time.perf_counter() - start_submit) * 1000,
-            attempted_at=start_submit,
+            attempted_at=attempted_at,
         )
 
     def _apply_stage3_submit_outcome(self, outcome: _Stage3SubmitOutcome) -> None:
@@ -5947,7 +5944,7 @@ class TPURaidenConnectorWorker:
                 missing_registration
                 and pending.defer_deadline is not None
                 and not aborted
-                and time.perf_counter() < pending.defer_deadline
+                and time.time() < pending.defer_deadline
             ):
                 # The precise pre-arm missing-registration result is
                 # side-effect free (registrations ride a later producer
@@ -6007,9 +6004,7 @@ class TPURaidenConnectorWorker:
             # records; only surface recompute after manager failure or
             # a full post-RPC manager timeout.
             self._stage3_controller_accepted.add(destination_req_id)
-            deadline = time.perf_counter() + float(
-                dist_utils.get_p2p_wait_pull_timeout()
-            )
+            deadline = time.time() + float(dist_utils.get_p2p_wait_pull_timeout())
             self._stage3_pending_controller_failures[destination_req_id] = deadline
             if self._stage3_fail_uncertain_loads_early:
                 self._failed_block_ids.update(pending.local_blocks)
@@ -6047,7 +6042,7 @@ class TPURaidenConnectorWorker:
             logger.info(
                 "Stage-3 deferred load submitted after %.2fs wait "
                 "req_id=%s destination_req_id=%s uuid=%d",
-                time.perf_counter() - pending.first_attempt_s,
+                time.time() - pending.first_attempt_s,
                 source_req_id,
                 destination_req_id,
                 uuid,
@@ -6108,8 +6103,7 @@ class TPURaidenConnectorWorker:
                 self._stage3_controller_accepted.add(req_id)
                 if state == "uncertain":
                     self._stage3_pending_controller_failures[req_id] = (
-                        time.perf_counter()
-                        + float(dist_utils.get_p2p_wait_pull_timeout())
+                        time.time() + float(dist_utils.get_p2p_wait_pull_timeout())
                     )
 
     def _drain_stage3_pending_submits(self, finished_req_ids: set[str] | None) -> None:
@@ -6141,7 +6135,7 @@ class TPURaidenConnectorWorker:
                     req_id,
                     pending.uuid,
                 )
-        now = time.perf_counter()
+        now = time.time()
         for destination_req_id in list(self._stage3_pending_submits):
             pending = self._stage3_pending_submits[destination_req_id]
             if (
@@ -6341,7 +6335,7 @@ class TPURaidenConnectorWorker:
             # The scheduler finished these requests: their registrations
             # made ahead of the finish start the TTL clock and the status
             # probe.
-            now = time.perf_counter()
+            now = time.time()
             for req_id in finished_req_ids or ():
                 registration = self._stage3_registered_sends.get(req_id)
                 if registration is not None and registration.finish_pending:
@@ -6516,7 +6510,7 @@ class TPURaidenConnectorWorker:
             terminal_recvs = set(done_recving) | set(failed_recving)
             for req_id in terminal_recvs:
                 self._stage3_pending_controller_failures.pop(req_id, None)
-            now = time.perf_counter()
+            now = time.time()
             expired_uncertain = {
                 req_id
                 for req_id, deadline in self._stage3_pending_controller_failures.items()
@@ -6530,7 +6524,7 @@ class TPURaidenConnectorWorker:
             self._stage3_terminal_loads.update(failed_recving)
         if self.is_producer and self._raiden_stage3_enabled():
             facade, _ = self._require_stage3_controller()
-            now = time.perf_counter()
+            now = time.time()
             self._probe_stage3_registrations(facade, now)
             expired_candidates = {
                 req_id
@@ -6698,7 +6692,7 @@ class TPURaidenConnectorWorker:
                             uuid=registration.uuid,
                             unit=self._raiden_work_unit,
                         )
-                tombstone_deadline = time.perf_counter() + float(
+                tombstone_deadline = time.time() + float(
                     dist_utils.get_p2p_wait_pull_timeout()
                 )
                 self._stage3_terminal_sends[req_id] = _Stage3RegisteredSend(
@@ -6721,7 +6715,7 @@ class TPURaidenConnectorWorker:
         if not req_ids:
             return
         engine = self._ensure_raiden_transfer_engine()
-        deadline = time.perf_counter() + float(dist_utils.get_p2p_wait_pull_timeout())
+        deadline = time.time() + float(dist_utils.get_p2p_wait_pull_timeout())
         while True:
             finished = self._done_recving | self._failed_recving
             if req_ids <= finished:
@@ -6730,7 +6724,7 @@ class TPURaidenConnectorWorker:
             finished = self._done_recving | self._failed_recving
             if req_ids <= finished:
                 return
-            if time.perf_counter() >= deadline:
+            if time.time() >= deadline:
                 pending = sorted(req_ids - finished)
                 logger.warning(
                     "TPURaidenConnectorWorker rank%d --> timed out waiting "
@@ -6827,13 +6821,13 @@ class TPURaidenConnectorWorker:
 
         host, port_str = address.rsplit(":", 1)
         port = int(port_str)
-        deadline = time.perf_counter() + timeout_s
+        deadline = time.time() + timeout_s
         while True:
             try:
                 with socket.create_connection((host, port), timeout=0.5):
                     return
             except OSError as err:
-                if time.perf_counter() >= deadline:
+                if time.time() >= deadline:
                     raise TimeoutError(
                         f"Timed out waiting for address {address} to be ready"
                     ) from err

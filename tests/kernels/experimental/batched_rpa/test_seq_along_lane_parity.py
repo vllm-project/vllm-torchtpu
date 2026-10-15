@@ -25,12 +25,8 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 
 pytestmark = pytest.mark.tpu_test
 
-_DECODE_BLOCKS = configs.BlockSizes(
-    bq_sz=1, bq_c_sz=1, bkv_sz=256, batch_size=8, n_buffer=3
-)
-_PREFILL_BLOCKS = configs.BlockSizes(
-    bq_sz=1792, bq_c_sz=28, bkv_sz=256, batch_size=2, n_buffer=3
-)
+_DECODE_BLOCKS = configs.BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=256, batch_size=8)
+_PREFILL_BLOCKS = configs.BlockSizes(bq_sz=1792, bq_c_sz=28, bkv_sz=256, batch_size=2)
 
 
 def _build_cache(
