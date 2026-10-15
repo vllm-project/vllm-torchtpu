@@ -139,3 +139,131 @@ def test_decode_route_tpu_matches_existing(monkeypatch, width, candidate_count):
     baseline = jax.tree.map(np.asarray, jax.jit(lambda *a: run(*a))(*args))
     np.testing.assert_array_equal(candidate[0], baseline[0])
     np.testing.assert_array_equal(np.sort(candidate[1]), np.sort(baseline[1]))
+
+
+@pytest.mark.skipif(jax.default_backend() != "tpu", reason="TPU candidate pipeline")
+@pytest.mark.parametrize(
+    "mode",
+    [
+        "regular",
+        "overflow",
+        "reordered",
+        "short",
+        "ties",
+        "invalid",
+        "ragged_rows",
+        "shifted_pages",
+    ],
+)
+@pytest.mark.parametrize("packed", [False, True])
+def test_candidate_cache_matches_existing_with_fallback(mode, packed):
+    _check_candidate_cache(mode, packed, groups=2, width=8192, capacity=4096)
+
+
+@pytest.mark.skipif(jax.default_backend() != "tpu", reason="TPU candidate pipeline")
+@pytest.mark.parametrize(
+    "groups,mode",
+    [
+        (1, "regular"),
+        (1, "overflow"),
+        (1, "invalid"),
+        (1, "short"),
+        (4, "regular"),
+        (4, "reordered"),
+    ],
+)
+def test_long_candidate_cache_matches_existing(groups, mode):
+    _check_candidate_cache(mode, False, groups=groups, width=1048576, capacity=49152)
+
+
+def _check_candidate_cache(mode, packed, *, groups, width, capacity):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.candidate_cache import (
+        prepare_candidate_cache_jax,
+        select_candidate_cache_jax,
+    )
+
+    rng = np.random.default_rng(104)
+    queries = 6
+    rows = groups * queries
+    if mode == "ragged_rows":
+        rows += 1
+    keys = jnp.asarray(rng.normal(size=(groups * width, 128)), jnp.bfloat16)
+    words = jax.lax.bitcast_convert_type(keys.reshape(-1, 64, 2), jnp.int32)
+    words = words.reshape(-1, 128)
+    pool = (words[:4096], words[4096:])
+    pages = rng.permutation(groups * width // 128).reshape(groups, -1) * 128
+    records = jnp.asarray(
+        (pages[..., None] + np.arange(128)).reshape(groups, width), jnp.int32
+    )
+    if mode == "shifted_pages":
+        # Native pages may start on any pool word row, not only block8.
+        records += 2
+        pool = (jnp.pad(words[:4096], ((1, 0), (0, 0))), words[4096:])
+    records = records.at[-1, 128:256].set(-1)
+    q = jnp.asarray(rng.normal(size=(rows, 32, 128)), jnp.bfloat16)
+    weights = jnp.asarray(rng.normal(size=(rows, 32)), jnp.float32)
+    candidate_count = 2048 if width > 131072 else 128
+    offset = width // 8 - 16384 if width > 131072 else 0
+    candidates = jnp.broadcast_to(
+        jnp.arange(candidate_count, dtype=jnp.int32) + offset,
+        (rows, candidate_count),
+    )
+    lengths = jnp.full((rows,), width - 3, jnp.int32).at[-1].set(0)
+    requests = jnp.repeat(jnp.arange(groups, dtype=jnp.int32), queries)
+    if mode == "ragged_rows":
+        requests = jnp.concatenate((requests, jnp.array([1], jnp.int32)))
+    if mode == "overflow":
+        candidates += jnp.tile(jnp.arange(queries) * candidate_count, groups)[:, None]
+    elif mode == "reordered":
+        requests = requests[::-1]
+    elif mode == "short":
+        lengths = jnp.arange(rows, dtype=jnp.int32) * 7
+    elif mode == "ties":
+        q = jnp.zeros_like(q)
+    elif mode == "invalid":
+        candidates = candidates.at[:, :4].set(jnp.array([-1, width // 8, 8, 8]))
+        candidates = candidates.at[0].set(-1)
+        lengths = lengths.at[1].set(519)
+    batch_max = lengths.max().reshape(1)
+    prepare = jax.jit(prepare_candidate_cache_jax, static_argnums=(5, 6, 7))
+    dense, ids, bits, actual, usable = prepare(
+        pool, records, candidates, requests, lengths, 8, capacity, packed
+    )
+    assert bool(usable[0]) == (mode not in ("overflow", "reordered", "ragged_rows"))
+    if mode == "overflow":
+        assert np.all(np.asarray(actual) * 8 > capacity)
+    select = jax.jit(select_candidate_cache_jax, static_argnums=(12, 13, 14))
+    result = select(
+        q,
+        pool,
+        records,
+        weights,
+        lengths,
+        candidates,
+        requests,
+        batch_max,
+        dense,
+        ids,
+        bits,
+        usable,
+        8,
+        128,
+        min(groups, 2),
+    )
+    expected, _ = ak.paged_indexer_jax(
+        q,
+        pool,
+        records,
+        weights,
+        lengths,
+        candidates,
+        requests,
+        512,
+        8,
+        False,
+        True,
+        True,
+        batch_max,
+        128,
+    )
+    np.testing.assert_array_equal(np.asarray(result), np.asarray(expected))

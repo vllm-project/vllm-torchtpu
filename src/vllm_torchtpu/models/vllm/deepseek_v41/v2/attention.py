@@ -20,6 +20,7 @@ from vllm.models.deepseek_v41 import compressor as compressor_upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import cache_capacity
 from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
 
 from .attention_kernels import (
@@ -30,6 +31,7 @@ from .attention_kernels import (
     sparse_fp8_attention_qo,
 )
 from .cache import ROW_BYTES, NativeCacheView, PagedCacheRows, write_cache
+from .candidate_cache import prepare_candidate_cache, select_candidate_cache
 from .ced import prefix_replay_enabled
 from .ops import device_hooks, rms_norm, rotary, round_fp8_activation
 
@@ -827,6 +829,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             self._rotate(latent, group_positions),
             valid,
         )
+        if stage_cache is not None:
+            version_key = ("candidate_index_version", indexer.k_cache.prefix)
+            stage_cache[version_key] = stage_cache.get(version_key, 0) + 1
         keys = indexer.k_norm(_value(indexer.wk(latent)))
         keys = self._quantize_indexer(self._rotate(keys, group_positions))
         if (
@@ -1569,6 +1574,65 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         else:
             qr_part, weights_part, candidates_part = qr, weights, candidates
         q_part = self._project_index_q(qr_part, positions_part)
+        capacity = (
+            cache_capacity(
+                tuple(q_part.shape),
+                tuple(records.shape),
+                candidates_part.shape[1],
+                self.candidate_block_size,
+                _index_page_records(index_cache),
+            )
+            if has_candidates
+            and not candidate_write
+            and not split
+            and self._fp8_kv
+            and q_part.dtype == torch.bfloat16
+            and pending_index_write is None
+            and self._config["index_topk"] == 512
+            and stage_cache is not None
+            else None
+        )
+        if capacity is not None:
+            assert stage_cache is not None
+            # A stage has immutable request membership. Re-entering the stage
+            # rebuilds this graph-local cache, including reordered scheduler rows.
+            # Publication and index-K writes explicitly version their sources.
+            cache_key = (
+                "candidate_index_keys",
+                indexer.k_cache.prefix,
+                stage_cache.get(("candidate_index_version", indexer.k_cache.prefix), 0),
+                self.candidate_source_layer,
+                stage_cache.get(
+                    ("candidate_publication", self.candidate_source_layer), 0
+                ),
+                capacity,
+            )
+            prepared = stage_cache.get(cache_key)
+            if prepared is None:
+                prepared = prepare_candidate_cache(
+                    index_cache,
+                    records,
+                    candidates_part,
+                    requests_part,
+                    lengths_part,
+                    block_size=self.candidate_block_size,
+                    capacity=capacity,
+                )
+                stage_cache[cache_key] = prepared
+            return select_candidate_cache(
+                q_part,
+                index_cache,
+                records,
+                weights_part,
+                lengths_part,
+                candidates_part,
+                requests_part,
+                batch_max,
+                prepared,
+                block_size=self.candidate_block_size,
+                page_records=_index_page_records(index_cache),
+                request_tile=None,
+            )
         updated_cache, selected, published = paged_indexer(
             q_part,
             index_cache,
@@ -1599,6 +1663,9 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         else:
             index_cache.raw.copy_(updated_cache)
         if candidate_write:
+            if stage_cache is not None:
+                version_key = ("candidate_publication", self.candidate_source_layer)
+                stage_cache[version_key] = stage_cache.get(version_key, 0) + 1
             self.candidate_block_buffer.copy_(
                 torch.nn.functional.pad(
                     published,

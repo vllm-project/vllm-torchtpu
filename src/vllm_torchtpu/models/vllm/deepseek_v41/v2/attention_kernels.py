@@ -3260,6 +3260,9 @@ def update_and_select_2bank_jax(
 
 
 def initialize_indexer():
+    from .candidate_cache import initialize_candidate_cache
+
+    initialize_candidate_cache()
     global _indexer_op, _indexer_2bank_op
     if _indexer_op is not None:
         return

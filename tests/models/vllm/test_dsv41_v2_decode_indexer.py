@@ -956,3 +956,99 @@ class TestAttentionSelectPagedIndicesDecode:
             assert sel3.shape == (count, 4)
             assert torch.all(index_cache_2b.raw == 1)
             assert torch.all(index_cache_2b.raw_hi == 2)
+
+
+@pytest.mark.cpu_test
+def test_candidate_envelope_keeps_token_rows_dynamic():
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
+        cache_capacity,
+    )
+
+    def route(q):
+        capacity = cache_capacity(tuple(q.shape), (2, 98304), 2048, 8, 128)
+        return q + (1 if capacity is not None else 0)
+
+    compiled = torch.compile(route, backend="eager", fullgraph=True)
+    for rows in (12, 13, 2048):
+        q = torch.zeros((rows, 32, 128), dtype=torch.bfloat16)
+        torch._dynamo.mark_dynamic(q, 0, min=2, max=4096)
+        torch.testing.assert_close(compiled(q), q + 1)
+
+
+@pytest.mark.cpu_test
+def test_candidate_cache_reuses_only_within_stage_and_source_version(monkeypatch):
+    """Four reindexes share keys; publication, source and new stage invalidate."""
+    attn = TestAttentionSelectPagedIndicesDecode()._setup_mock_attn(
+        monkeypatch, ranks=1
+    )
+    attn._config = {"index_topk": 512}
+    attn.compress_ratio = 1
+    attn.candidate_block_size = 8
+    attn.candidate_source_layer = 20
+    attn.candidate_block_buffer = torch.zeros((12, 2048), dtype=torch.int32)
+    attn.indexer.k_cache = SimpleNamespace(prefix="source-a")
+    cache = SimpleNamespace(raw=torch.zeros((128, 128), dtype=torch.int32))
+    q = torch.zeros((12, 32, 128), dtype=torch.bfloat16)
+    positions = torch.arange(12, dtype=torch.int32)
+    records = torch.arange(2 * 98304, dtype=torch.int32).reshape(2, -1)
+    requests = torch.arange(2, dtype=torch.int32).repeat_interleave(6)
+    weights = torch.ones((12, 32))
+    lengths = torch.full((12, 1), 98304, dtype=torch.int32)
+    slots = torch.arange(12, dtype=torch.int32)
+    prepared = []
+    used = []
+
+    def prepare(cache, records, candidates, requests, lengths, **kwargs):
+        result = object()
+        prepared.append((result, requests.clone()))
+        return result
+
+    def select(
+        q,
+        cache,
+        records,
+        weights,
+        lengths,
+        candidates,
+        requests,
+        batch_max,
+        prepared,
+        **kwargs,
+    ):
+        used.append(prepared)
+        return torch.zeros((12, 512), dtype=torch.int32)
+
+    def old(q, cache, records, weights, lengths, candidates, *args, **kwargs):
+        return cache.raw, torch.zeros((12, 512), dtype=torch.int32), candidates + 1
+
+    monkeypatch.setattr(v2_attn, "_index_page_records", lambda cache: 128)
+    monkeypatch.setattr(v2_attn, "prepare_candidate_cache", prepare)
+    monkeypatch.setattr(v2_attn, "select_candidate_cache", select)
+    monkeypatch.setattr(v2_attn, "paged_indexer", old)
+
+    def run(mapping):
+        return attn._select_paged_indices(
+            q, positions, cache, records, mapping, weights, lengths, slots, None
+        )
+
+    with v2_attn.stage_attention_cache_scope():
+        for _ in range(4):
+            run(requests)
+        assert len(prepared) == 1
+        assert all(x is prepared[0][0] for x in used)
+        attn.indexer.indexer_op.candidate_write = True
+        run(requests)
+        attn.indexer.indexer_op.candidate_write = False
+        run(requests)
+        assert len(prepared) == 2
+        attn.indexer.k_cache.prefix = "source-b"
+        run(requests)
+        assert len(prepared) == 3
+        v2_attn._active_stage_attn_cache[("candidate_index_version", "source-b")] = 1
+        run(requests)
+        assert len(prepared) == 4
+    with v2_attn.stage_attention_cache_scope():
+        reordered = requests.flip(0)
+        run(reordered)
+        assert len(prepared) == 5
+        torch.testing.assert_close(prepared[-1][1], reordered)
