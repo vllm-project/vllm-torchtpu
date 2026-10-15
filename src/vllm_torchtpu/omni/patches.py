@@ -92,36 +92,6 @@ def apply_omni_model_specific_patches() -> None:
     ipc._pack_tensor_if_large = _safe_pack_tensor_if_large
     logger.info("Applied TPU patch: safe CPU serialization for diffusion IPC tensors.")
 
-    # -------------------------------------------------------------------------
-    # Upstream torch_tpu Root Cause Tracking:
-    # In LTX-2, LTXRuntime._decode_output produces a (video, audio) tuple. Audio
-    # tensors are sub-threshold (<1MB) and returned directly in the output object,
-    # bypassing SHM packing. If audio remains on TPU, unpickling in the orchestrator
-    # triggers PJRT re-initialization and /tmp/libtpu_lockfile collision, while
-    # pickling in the worker risks tensor_to_buffer.cc ABSL_CHECK aborts.
-    # Moving video and audio to CPU prevents device tensors entering the IPC stream.
-    #
-    # REMOVAL / FIX CONDITION:
-    # Can be removed once torch_tpu provides safe cross-process device tensor
-    # serialization, or once vllm_omni universally ensures all diffusion output
-    # payloads are moved to host CPU before IPC serialization.
-    # -------------------------------------------------------------------------
-    from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
-
-    orig_decode_output = ltx2_runtime.LTXRuntime._decode_output
-
-    def _safe_decode_output(self: Any, *args: Any, **kwargs: Any):
-        res = orig_decode_output(self, *args, **kwargs)
-        video, audio = res.output
-        res.output = (
-            video.cpu() if isinstance(video, torch.Tensor) else video,
-            audio.cpu() if isinstance(audio, torch.Tensor) else audio,
-        )
-        return res
-
-    ltx2_runtime.LTXRuntime._decode_output = _safe_decode_output
-    logger.info("Applied TPU patch: safe LTX-2 CPU decode output.")
-
     _patch_qwen_image_rope_txt_freqs_clone()
     _patch_wan_pair_swap_rope()
     _patch_wan_ffn_gelu_fence()
