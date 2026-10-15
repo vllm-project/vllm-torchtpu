@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import math
 from typing import cast
 
 import jax
@@ -28,6 +29,25 @@ from vllm_torchtpu.utils import largest_divisor
 LANE = 128
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
+
+
+def _dynamic_vmem_limit_bytes(
+    x_block_shape: tuple[int, ...],
+    x_dtype: jnp.dtype,
+    cos_sin_cache: jax.Array,
+) -> int:
+    """Budget for pipeline tiles, independent of the HBM cache length."""
+    # CosSinRef gathers only tile_n rows, and RoPE stages only the last lane
+    # block. QNorm stages a full head with two input and two output buffers.
+    # Keep the validated sixfold allowance for buffers and FP32 temporaries.
+    x_bytes = math.prod(x_block_shape) * x_dtype.itemsize
+    cache_tile_bytes = (
+        x_block_shape[0] * cos_sin_cache.shape[1] * cos_sin_cache.dtype.itemsize
+    )
+    return min(
+        DEFAULT_VMEM_LIMIT_BYTES,
+        max(16 * 1024 * 1024, 6 * (x_bytes + cache_tile_bytes)),
+    )
 
 
 @jax.tree_util.register_dataclass
@@ -468,7 +488,14 @@ def _rope_call(
         grid_spec=grid_spec,
         input_output_aliases=input_output_aliases,
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            # The quantized path emits an FP8 inner DMA slice that must stay
+            # 512-byte divisible; a reduced budget makes Mosaic pick a sub-tile
+            # that violates this, so keep the full budget when quantizing.
+            vmem_limit_bytes=(
+                DEFAULT_VMEM_LIMIT_BYTES
+                if quant_dtype is not None
+                else _dynamic_vmem_limit_bytes(x_block_shape, x.dtype, cos_sin_cache)
+            ),
             disable_bounds_checks=True,
         ),
         name=name,
@@ -571,7 +598,9 @@ def qnorm_rope(
         grid_spec=grid_spec,
         input_output_aliases={1: 0},  # x (after the scalar prefetch) -> out
         compiler_params=pltpu.CompilerParams(
-            vmem_limit_bytes=DEFAULT_VMEM_LIMIT_BYTES,
+            vmem_limit_bytes=_dynamic_vmem_limit_bytes(
+                x_block_shape, x.dtype, cos_sin_cache
+            ),
             disable_bounds_checks=True,
         ),
         name=name,

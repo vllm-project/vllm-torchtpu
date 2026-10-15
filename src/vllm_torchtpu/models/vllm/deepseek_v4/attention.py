@@ -42,6 +42,8 @@ from vllm_torchtpu.kernels.deepseek_v4 import rope as rope_kernel
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
     fused_reverse_rope_wo_a_projection,
 )
+from vllm_torchtpu.kernels.deepseek_v4.qkv_preprocess import qkv_preprocess
+from vllm_torchtpu.kernels.deepseek_v4.qkv_rms_norm import qkv_rms_norm
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_op import (  # noqa: E501
     BATCH_AXIS,
     VllmDeepseekSparseSWABackend,
@@ -75,6 +77,28 @@ class DeepseekV4TPUAttentionBackend(PallasAttentionBackend):
 
 
 # Module-level so `pallas.jax_op` can trace and register them as torch ops.
+def _qkv_rms_norm_jax(
+    x: jax.Array,
+    q_weight: jax.Array,
+    kv_weight: jax.Array,
+    *,
+    q_eps: float,
+    kv_eps: float,
+) -> tuple[jax.Array, jax.Array]:
+    return qkv_rms_norm(x, q_weight, kv_weight, q_eps=q_eps, kv_eps=kv_eps)
+
+
+def _fake_qkv_rms_norm(x, q_weight, kv_weight, *args, **kwargs):
+    return (
+        x.new_empty((x.shape[0], q_weight.numel())),
+        x.new_empty((x.shape[0], kv_weight.numel())),
+    )
+
+
+def _fake_qkv_preprocess(q, kv, *args, **kwargs):
+    return torch.empty_like(q), torch.empty_like(kv)
+
+
 def _qnorm_rope_jax(
     x: jax.Array,
     positions: jax.Array,
@@ -241,6 +265,9 @@ class VllmDeepseekV4MLAAttention(
                 compilation_config.static_forward_context[
                     self.mla_attn.compressor.state_cache.prefix
                 ] = self.mla_attn.compressor.state_cache
+
+        # Build the JAX op before torch.compile traces the forward method.
+        _ = self.qkv_norm_op
 
     @classmethod
     def get_padded_num_q_heads(cls, num_heads: int) -> int:
@@ -466,6 +493,52 @@ class VllmDeepseekV4MLAAttention(
         return qr_kv, indexer_weights
 
     @property
+    def qkv_norm_op(self):
+        """One launch for the independent low-rank Q and KV norms."""
+        op = self.__dict__.get("_qkv_norm_op_instance")
+        if op is not None:
+            return op
+        q_eps = float(self.q_norm.variance_epsilon)
+        kv_eps = float(self.kv_norm.variance_epsilon)
+        op_name = (
+            f"pallas::deepseek_v4_qkv_norm_q{_name_float(q_eps)}"
+            f"_kv{_name_float(kv_eps)}"
+        )
+        op = _pallas_op_cache.get(op_name)
+        if op is None:
+            mesh = get_pallas_op_mesh()
+            op = pallas.jax_op(
+                op_name,
+                functools.partial(_qkv_rms_norm_jax, q_eps=q_eps, kv_eps=kv_eps),
+                mesh=mesh,
+                input_partition_specs=(P(), P(), P()),
+            )
+            op.register_fake(_fake_qkv_rms_norm)
+            _pallas_op_cache[op_name] = op
+        object.__setattr__(self, "_qkv_norm_op_instance", op)
+        return op
+
+    def normalize_qkv(self, qr_kv: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Normalize packed projection outputs, preserving both RMS statistics."""
+        q_width = self.q_norm.weight.numel()
+        kv_width = self.kv_norm.weight.numel()
+        if (
+            qr_kv.shape == (1, q_width + kv_width)
+            and q_width % 128 == 0
+            and kv_width % 128 == 0
+            and qr_kv.dtype in (torch.bfloat16, torch.float32)
+            and self.q_norm.weight.dtype in (torch.bfloat16, torch.float32)
+            and self.kv_norm.weight.dtype in (torch.bfloat16, torch.float32)
+            and self.q_norm.variance_size_override is None
+            and self.kv_norm.variance_size_override is None
+            and self.q_norm.pass_weight
+            and self.kv_norm.pass_weight
+        ):
+            return self.qkv_norm_op(qr_kv, self.q_norm.weight, self.kv_norm.weight)
+        qr, kv = qr_kv.split([q_width, kv_width], dim=-1)
+        return self.q_norm(qr), self.kv_norm(kv)
+
+    @property
     def qnorm_rope_op(self):
         """The fused q-RMSNorm + RoPE op, built lazily on first forward."""
         op = self.__dict__.get("_qnorm_rope_op_instance")
@@ -532,6 +605,27 @@ class VllmDeepseekV4MLAAttention(
         """Apply scaling RoPE to decoupled key states."""
         return self.kv_rope_op(kv, positions, self.mla_attn.rotary_emb.cos_sin_cache)
 
+    @property
+    def qkv_preprocess_op(self) -> Any:
+        """Joint query normalization/rotation and key rotation."""
+        op = self.__dict__.get("_qkv_preprocess_op_instance")
+        if op is not None:
+            return op
+        eps = float(self.mla_attn.eps)
+        op_name = f"pallas::deepseek_v4_qkv_preprocess_e{_name_float(eps)}"
+        op = _pallas_op_cache.get(op_name)
+        if op is None:
+            op = pallas.jax_op(
+                op_name,
+                functools.partial(qkv_preprocess, eps=eps),
+                mesh=get_pallas_op_mesh(),
+                input_partition_specs=(P(None, "model", None), P(), P(), P()),
+            )
+            op.register_fake(_fake_qkv_preprocess)
+            _pallas_op_cache[op_name] = op
+        object.__setattr__(self, "_qkv_preprocess_op_instance", op)
+        return op
+
     def attention_impl(
         self,
         hidden_states: torch.Tensor,
@@ -545,8 +639,9 @@ class VllmDeepseekV4MLAAttention(
         q = self.wq_b(qr).view(
             qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim
         )
-        q = self.qnorm_rope(q, positions)
-        kv = self.kv_rope(kv, positions)
+        q, kv = self.qkv_preprocess_op(
+            q, kv, positions, self.mla_attn.rotary_emb.cos_sin_cache
+        )
 
         topk_indices = None
         compressor = getattr(self.mla_attn, "compressor", None)
@@ -876,11 +971,7 @@ class VllmDeepseekV4MLAAttention(
 
         qr_kv, indexer_weights = self.attn_gemm(hidden_states)
 
-        qr, kv = qr_kv.split(
-            [self.mla_attn.q_lora_rank, self.mla_attn.head_dim], dim=-1
-        )
-        qr = self.q_norm(qr)
-        kv = self.kv_norm(kv)
+        qr, kv = self.normalize_qkv(qr_kv)
 
         attn_output = self.attention_impl(
             hidden_states,
