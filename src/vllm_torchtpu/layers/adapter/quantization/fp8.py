@@ -1163,6 +1163,15 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 router_logits,
                 score_bias_operand(layer),
             )
+        from vllm_torchtpu.layers.adapter.moe_tp_decode import (
+            moe_tp_decode_forward,
+            moe_tp_decode_supported,
+        )
+
+        if moe_tp_decode_supported(self):
+            # Armed layer: the runner no longer runs the shared expert or the
+            # all-reduce, so this returns the reduced shared + routed sum.
+            return moe_tp_decode_forward(self, layer, x, router_logits)
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE

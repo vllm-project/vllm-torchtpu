@@ -62,6 +62,7 @@ if TYPE_CHECKING:
     FUSED_MOE_DECODE_KERNEL: bool = False
     FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
+    USE_MOE_TP_DECODE_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -651,6 +652,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three. The ragged (counting sort) path ignores it.
     "TPU_MOE_SINGLE_SORT": env_bool("TPU_MOE_SINGLE_SORT", True),
+    # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
+    # top-k with renormalization, one shared expert, FP8 per-channel weights)
+    # with one op that also covers the shared expert and the TP all-reduce:
+    # at 16, 32 and 64 tokens a single Pallas kernel per rank, at other token
+    # counts the usual path plus a psum (layers/adapter/moe_tp_decode.py).
+    # Armed once after load; needs TPU_MOE_SKIP_PADDED_TOKENS=1 (the op reads
+    # the real token count from its padding mask), otherwise every layer keeps
+    # the usual path. Arms nothing while FUSED_MOE_DECODE_KERNEL is set. Remove
+    # once the path is the default for these layers or is replaced by another
+    # fused TP MoE path.
+    "USE_MOE_TP_DECODE_KERNEL": env_bool("USE_MOE_TP_DECODE_KERNEL"),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
