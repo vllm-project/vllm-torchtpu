@@ -84,6 +84,10 @@ PATCHES = (
     # KV cache, scheduling, and offloading.
     Patch("vllm_torchtpu:_patch_vllm_compact_mamba_streaming_input", _ACTIVE),
     Patch(
+        "vllm_torchtpu.platforms.tpu_platform:_register_tpu_kv_connectors",
+        _ENGINE,
+    ),
+    Patch(
         "vllm_torchtpu:_patch_vllm_hybrid_pcp_block_sizes",
         _ENGINE,
         refresh="vllm_torchtpu:_patch_vllm_hybrid_pcp_block_sizes",

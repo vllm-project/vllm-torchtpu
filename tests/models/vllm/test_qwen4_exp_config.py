@@ -182,3 +182,35 @@ def test_pool_page_override_respects_upstream_prefix_validation(monkeypatch, pre
     assert cfg.cache_config.block_size == layout.block_size
     assert cfg.cache_config.mamba_block_size == (layout.block_size if prefix else None)
     assert {spec.page_size_bytes for spec in specs.values()} == {layout.page_bytes}
+
+
+@pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])
+def test_pd_admits_only_model_owned_fp8_dp8(monkeypatch, role):
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
+    cfg = config()
+    cfg.cache_config.cache_dtype = "fp8"
+    cfg.cache_config.mamba_ssm_cache_dtype = "bfloat16"
+    cfg.kv_transfer_config = SimpleNamespace(
+        kv_connector="Qwen4ExpRaidenConnector",
+        kv_connector_module_path=None,
+        kv_role=role,
+    )
+    validate_config(cfg)
+    for section, field, value in [
+        ("parallel_config", "tensor_parallel_size", 2),
+        ("parallel_config", "enable_expert_parallel", False),
+        ("cache_config", "cache_dtype", "auto"),
+        ("cache_config", "mamba_ssm_cache_dtype", "float32"),
+        ("cache_config", "enable_prefix_caching", True),
+        ("kv_transfer_config", "kv_role", "kv_both"),
+        ("kv_transfer_config", "kv_connector", "TPURaidenConnector"),
+        ("kv_transfer_config", "kv_connector_module_path", "other.module"),
+    ]:
+        target = getattr(cfg, section)
+        original = getattr(target, field)
+        setattr(target, field, value)
+        with pytest.raises(ValueError):
+            validate_config(cfg)
+        setattr(target, field, original)

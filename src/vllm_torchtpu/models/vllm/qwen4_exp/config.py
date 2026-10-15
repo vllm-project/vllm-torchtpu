@@ -395,14 +395,40 @@ def validate_config(cfg):
         (c.enable_prefix_caching and not pooled)
         or s.disable_hybrid_kv_cache_manager
         or cfg.speculative_config is not None
-        or cfg.kv_transfer_config is not None
         or cfg.lora_config is not None
         or c.kv_cache_memory_bytes is not None
     ):
         raise ValueError(
             "Qwen4Exp TPU requires profiled hybrid caches, APC only with unified pool, "
-            "and no MTP/transfer/LoRA"
+            "and no MTP/LoRA"
         )
+    transfer = cfg.kv_transfer_config
+    if transfer is not None:
+        connector_module = "vllm_torchtpu.models.vllm.qwen4_exp.pd_connector"
+        if (
+            (p.tensor_parallel_size, p.data_parallel_size) != (1, 8)
+            or not p.enable_expert_parallel
+            or transfer.kv_connector != "Qwen4ExpRaidenConnector"
+            or transfer.kv_connector_module_path not in (None, connector_module)
+            or transfer.kv_role not in ("kv_producer", "kv_consumer")
+            or not pooled
+            or c.cache_dtype not in ("fp8", "fp8_e4m3")
+            or c.enable_prefix_caching
+            or c.mamba_ssm_cache_dtype != "bfloat16"
+            or envs.TPU_KV_RESHARD_TRANSPORT != "raiden"
+            or any(
+                (
+                    envs.TPU_RAIDEN_QWEN35_ADMISSION,
+                    envs.TPU_RAIDEN_KIMIK3_ADMISSION,
+                    envs.TPU_RAIDEN_GLM_ADMISSION,
+                    envs.TPU_RAIDEN_DSV4_ADMISSION,
+                )
+            )
+        ):
+            raise ValueError(
+                "Qwen4Exp PD requires its model-owned Raiden connector, a producer "
+                "or consumer role, DP8/TP1/EP8, unified FP8 pages, BF16 SSM and APC off"
+            )
     if envs.VLLM_TPU_BLOCK_MAJOR_KV:
         raise ValueError("Qwen4Exp requires its native HEAD_ALONG_SUBLANE cache layout")
     if pooled and c.enable_prefix_caching and c.mamba_cache_mode != "align":
