@@ -282,47 +282,35 @@ def _patch_wan_fused_qk_norm_rope() -> None:
 
 
 def _patch_wan_fresh_timestep() -> None:
-    # -------------------------------------------------------------------------
-    # TODO: Remove this patch once torch_tpu passes view offsets to graphs as
-    # runtime inputs, or vLLM-Omni stops handing device views of the schedule to
-    # the model.
+    # Wan: give the transformer its own copy of the timestep.
     #
-    # Wan pipelines loop `for t in scheduler.timesteps` over a device tensor
-    # and pass `t.expand(batch)` to the transformer. Each `t` is an unbind
-    # view, and torch_tpu bakes a view's base shape and offset into every
-    # deferred graph that reads it, so the transformer graphs that consume it
-    # recompile once per (step count, step index) pair. On v7x the first
-    # 12-step request at 480x832x81 on 8 cores took 53.0 s against 15.5 s
-    # warm (40 steps: 158 s against 42 s). Copying the timestep into its own
-    # buffer at transformer entry, before other work is queued, confines
-    # that baking to a tiny copy program: 26.9 s for the first 12-step
-    # request, bit-identical output. (Doing the copy inside the condition
-    # embedder instead only reaches 38.3 s, as the copy then shares a graph
-    # with the patch embedding.)
-    # -------------------------------------------------------------------------
+    # Problem: Wan pipelines pass `t.expand(batch)`, a view into
+    #   scheduler.timesteps. torch_tpu bakes a view's offset into every graph
+    #   that reads it, so the transformer recompiles at every denoising step.
+    # Fix: clone the timestep on entry and flush the clone right away, so only
+    #   a tiny copy graph sees the view.
+    # Effect (v7x, 480x832x81, 8 cores): first 12-step request 53.0 s -> 26.9 s
+    #   (warm: 15.5 s); output is bit-identical.
+    # TODO: remove once torch_tpu passes view offsets as runtime inputs.
     from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
         WanTransformer3DModel,
     )
 
+    from vllm_torchtpu.utils import synchronize_tensors
+
+    # On a re-run after cache_clear(), wrap the original forward, not ours.
     orig_wan_forward = getattr(
         WanTransformer3DModel, "_tpu_orig_forward", WanTransformer3DModel.forward
     )
     WanTransformer3DModel._tpu_orig_forward = orig_wan_forward
 
-    def _fresh_timestep(timestep: Any) -> Any:
+    def _fresh_timestep_forward(
+        self: Any, hidden_states: Any, timestep: Any, *args: Any, **kwargs: Any
+    ) -> Any:
         if isinstance(timestep, torch.Tensor):
-            from vllm_torchtpu.utils import synchronize_tensors
-
             timestep = timestep.clone()
             synchronize_tensors(timestep, wait=False)
-        return timestep
-
-    def _fresh_timestep_forward(self: Any, *args: Any, **kwargs: Any) -> Any:
-        if "timestep" in kwargs:
-            kwargs["timestep"] = _fresh_timestep(kwargs["timestep"])
-        elif len(args) > 1:  # forward(hidden_states, timestep, ...)
-            args = (args[0], _fresh_timestep(args[1]), *args[2:])
-        return orig_wan_forward(self, *args, **kwargs)
+        return orig_wan_forward(self, hidden_states, timestep, *args, **kwargs)
 
     WanTransformer3DModel.forward = _fresh_timestep_forward
     logger.info("Applied TPU patch: fresh timestep buffer for Wan transformers.")
