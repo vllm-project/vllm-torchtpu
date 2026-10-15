@@ -83,9 +83,9 @@ def test_token_cap_dispatch(monkeypatch, tokens, expert_parallel):
 def test_prefill_kernel_serves_buckets_above_the_cap(
     monkeypatch, tokens, prefill_kernel
 ):
-    """FUSED_MOE_PREFILL_KERNEL=1 (off by default): buckets above the cap run
-    the prefill kernel, with the layer's expert range, ungated shared expert
-    and routed scale; off, the GMM fallback as before."""
+    """prefill_kernel=True: buckets above the cap run the prefill kernel, with
+    the layer's expert range, ungated shared expert and routed scale; False,
+    the GMM fallback as before. FUSED_MOE_PREFILL_KERNEL is off by default."""
     monkeypatch.delenv("FUSED_MOE_PREFILL_KERNEL", raising=False)
     assert envs.FUSED_MOE_PREFILL_KERNEL is False
     calls = []
@@ -128,6 +128,17 @@ def test_prefill_kernel_serves_buckets_above_the_cap(
         assert calls == [("prefill", None, 192, 2.5)]
     else:
         assert calls == [("gmm",)]
+
+
+def test_prefill_kernel_serves_tp_experts_only(monkeypatch):
+    """FUSED_MOE_PREFILL_KERNEL arms the prefill kernel for TP-expert layers
+    only; EP layers keep the GMM path above the cap."""
+    monkeypatch.delenv("FUSED_MOE_PREFILL_KERNEL", raising=False)
+    assert not bridge._serves_prefill_kernel(expert_parallel=False)
+    assert not bridge._serves_prefill_kernel(expert_parallel=True)
+    monkeypatch.setenv("FUSED_MOE_PREFILL_KERNEL", "1")
+    assert bridge._serves_prefill_kernel(expert_parallel=False)
+    assert not bridge._serves_prefill_kernel(expert_parallel=True)
 
 
 class DeepseekV2MLP(torch.nn.Module):

@@ -33,8 +33,9 @@ all-reduce of their sum. The token count is static there, so the branch costs
 nothing at run time; branching in torch instead gives the two sides different
 graph inputs, which vLLM's per-bucket specialization of one traced graph
 refuses (``compilation.shape_variants``). With ``FUSED_MOE_PREFILL_KERNEL=1``
-the steps above the cap run ``fused_moe_prefill`` instead of the GMM path, in
-the same program and with the same conventions.
+the steps above the cap of a TP-expert layer run ``fused_moe_prefill`` instead
+of the GMM path, in the same program and with the same conventions; EP layers
+keep the GMM path for now.
 
 Two shared-expert conventions are served, each as vLLM's MoERunner computes it
 with the kernel off: a shared expert gated by sigmoid(x . w_g) (Qwen3.5,
@@ -188,8 +189,9 @@ def _prefill_layer(
     shared_gated,
     routed_scale,
 ):
-    """Above the cap with FUSED_MOE_PREFILL_KERNEL=1: the fused MoE prefill
-    kernel, all-reduced. Per rank, inside shard_map."""
+    """Above the cap of a layer armed with the prefill kernel (TP experts with
+    FUSED_MOE_PREFILL_KERNEL=1): the fused MoE prefill kernel, all-reduced.
+    Per rank, inside shard_map."""
     # Trace-time, once per token bucket: the evidence that the prefill kernel
     # serves this shape, and in which mode (the kernel's name carries it too).
     blocks = plan_blocks(
@@ -578,6 +580,13 @@ def _check_same_arming_on_every_rank(signature: tuple, what: str) -> None:
         )
 
 
+def _serves_prefill_kernel(expert_parallel: bool) -> bool:
+    """FUSED_MOE_PREFILL_KERNEL applies to TP-expert layers only for now: an EP
+    layer keeps the GMM path above the cap, which at GLM-5.2 shapes was faster
+    than the prefill kernel's blocked mode at 4,096 tokens."""
+    return envs.FUSED_MOE_PREFILL_KERNEL and not expert_parallel
+
+
 def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
     """Arm every eligible MoE layer of `model`; returns how many were armed.
 
@@ -658,7 +667,7 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
                 max_tokens,
                 shared_gated,
                 routed_scale,
-                envs.FUSED_MOE_PREFILL_KERNEL,
+                _serves_prefill_kernel(expert_parallel),
             ),
         )
         for name, tensor in zip(_SHARED_BUFFERS, shared):
@@ -684,8 +693,16 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
         sorted({s[2] for s in signature[1]}),
         sorted({s[3] for s in signature[1]}),
         max_tokens,
-        "the fused MoE prefill kernel" if envs.FUSED_MOE_PREFILL_KERNEL else "GMM MoE",
+        "the fused MoE prefill kernel"
+        if any(_serves_prefill_kernel(s[1]) for s in signature[1])
+        else "GMM MoE",
     )
+    if envs.FUSED_MOE_PREFILL_KERNEL and any(s[1] for s in signature[1]):
+        logger.info(
+            "FUSED_MOE_PREFILL_KERNEL applies to TP-expert layers only: the EP "
+            "layers keep the GMM MoE path above %d tokens",
+            max_tokens,
+        )
     return armed
 
 
