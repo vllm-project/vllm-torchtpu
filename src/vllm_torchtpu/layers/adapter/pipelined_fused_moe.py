@@ -18,15 +18,78 @@ This module provides `pipelined_fused_moe_gmm`, which acts as a wrapper around
 collective communications (AllGather and ReduceScatter) with MoE computation.
 """
 
+import contextlib
+import math
+from collections.abc import Sequence
+from typing import cast
+
 import torch
 from vllm.distributed.parallel_state import get_dp_group
 
 import vllm_torchtpu.envs as envs
 from vllm_torchtpu.distributed.pcp import get_pcp_group
 from vllm_torchtpu.layers.adapter.fused_moe import fused_moe_gmm
+from vllm_torchtpu.layers.core.quantization import dequantize_tensor, quantize_tensor
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+# A module global rather than a ContextVar: Dynamo guards on the global's
+# value and cannot trace ContextVar.get.
+_fixed_chunk_buckets: tuple[int, ...] | None = None
+
+
+@contextlib.contextmanager
+def fixed_moe_collection_chunks(buckets: Sequence[int]):
+    """Runs every MoE collection under this context in a fixed chunk count.
+
+    The chunk count is otherwise a function of the token count, and a graph
+    traced once over symbolic token counts keeps the branch it was traced
+    with. The MTP draft is traced that way, so its collection runs the count
+    ``fixed_chunk_count`` derives from the token ``buckets`` the draft is
+    padded to: the configured chunk size still bounds the gather at the
+    largest bucket.
+    """
+    global _fixed_chunk_buckets
+    previous = _fixed_chunk_buckets
+    _fixed_chunk_buckets = tuple(int(bucket) for bucket in buckets)
+    try:
+        yield
+    finally:
+        _fixed_chunk_buckets = previous
+
+
+def fixed_chunk_count(
+    buckets: Sequence[int], parallel_size: int, chunk_size: int
+) -> int:
+    """Chunk count that keeps every gather at or under ``chunk_size``.
+
+    Every bucket must split into equal chunks, so the count is the smallest
+    common divisor of the buckets that is at least what the largest bucket
+    needs. When no common divisor is that large, the greatest one is used
+    and the largest bucket's gather exceeds ``chunk_size``.
+    """
+    if chunk_size <= 0 or parallel_size <= 1 or not buckets:
+        return 1
+    needed = -(-max(buckets) * parallel_size // chunk_size)
+    common = math.gcd(*buckets)
+    count = needed
+    while count < common and common % count:
+        count += 1
+    return min(count, common)
+
+
+def collection_chunks(seq_len: int, parallel_size: int) -> tuple[int, int]:
+    """Chunk count and local chunk size for this rank's ``seq_len`` tokens."""
+    if _fixed_chunk_buckets is not None and parallel_size > 1:
+        num_chunks = fixed_chunk_count(
+            _fixed_chunk_buckets, parallel_size, envs.TPU_MOE_COLLECTION_CHUNK_SIZE
+        )
+        return num_chunks, seq_len // num_chunks
+    return calculate_moe_chunks(
+        seq_len, parallel_size, envs.TPU_MOE_COLLECTION_CHUNK_SIZE
+    )
 
 
 def enable_pipelined_collective_and_compute() -> bool:
@@ -41,6 +104,22 @@ def enable_pipelined_collective_and_compute() -> bool:
 
 # Alias for alternative naming convention
 enable_pipeline_collective_and_compute = enable_pipelined_collective_and_compute
+
+
+def _quantized_all_gather(
+    collective_group, hidden_states: torch.Tensor
+) -> torch.Tensor:
+    """All-gather activations in fp8, restored on arrival."""
+    out_dtype = hidden_states.dtype
+    quantized, scale = quantize_tensor(
+        hidden_states, quant_dtype=torch.float8_e4m3fn, axis=-1
+    )
+    ag_rows = collective_group.all_gather(quantized.view(torch.int8), dim=0)
+    ag_scale = collective_group.all_gather(scale, dim=0)
+    ag_hidden_states = dequantize_tensor(
+        ag_rows.view(torch.float8_e4m3fn), ag_scale, axis=-1, out_dtype=out_dtype
+    )
+    return ag_hidden_states
 
 
 def calculate_moe_chunks(
@@ -162,22 +241,28 @@ def pipelined_fused_moe_gmm(
     Returns:
         torch.Tensor: Reduced local output activations [S, H].
     """
-    chunk_size = envs.TPU_MOE_COLLECTION_CHUNK_SIZE
     collective_group, _ = _get_moe_collective_group()
 
     seq_len = hidden_states.shape[0]
     parallel_size = (
         int(collective_group.world_size) if collective_group is not None else 1
     )
-    num_chunks, chunk_size_local = calculate_moe_chunks(
-        seq_len, parallel_size, chunk_size
-    )
+    num_chunks, chunk_size_local = collection_chunks(seq_len, parallel_size)
+
+    # There is no gather to make cheaper on a single rank, so quantizing there
+    # would only round the activations for nothing.
+    quantize_ag = parallel_size > 1 and envs.TPU_MOE_FP8_ALL_GATHER
 
     if num_chunks == 1 or parallel_size == 1:
         if parallel_size > 1:
             # parallel_size > 1 only when collective_group is set.
             assert collective_group is not None
-            ag_hidden_states = collective_group.all_gather(hidden_states, dim=0)
+            if quantize_ag:
+                ag_hidden_states = _quantized_all_gather(
+                    collective_group, hidden_states
+                )
+            else:
+                ag_hidden_states = collective_group.all_gather(hidden_states, dim=0)
             ag_topk_weights = (
                 collective_group.all_gather(topk_weights, dim=0)
                 if topk_weights is not None
@@ -201,8 +286,9 @@ def pipelined_fused_moe_gmm(
             w2_scale=w2_scale,
             w1_bias=w1_bias,
             w2_bias=w2_bias,
-            topk_weights=ag_topk_weights,
-            topk_ids=ag_topk_ids,
+            # Declared Tensor like the parameters; a None input stays None.
+            topk_weights=cast(torch.Tensor, ag_topk_weights),
+            topk_ids=cast(torch.Tensor, ag_topk_ids),
             experts_start=experts_start,
             topk=topk,
             activation=activation,
@@ -240,8 +326,13 @@ def pipelined_fused_moe_gmm(
         else [None] * num_chunks
     )
 
+    def _all_gather_hs(hs_slice):
+        if quantize_ag:
+            return _quantized_all_gather(collective_group, hs_slice)
+        return collective_group.all_gather(hs_slice, dim=0)
+
     # Prime pipeline with initial all-gather for chunk 0
-    ag_hs_curr = collective_group.all_gather(hs_slices[0], dim=0)
+    ag_hs_curr = _all_gather_hs(hs_slices[0])
     ag_tw_curr = (
         collective_group.all_gather(weights_slices[0], dim=0)
         if weights_slices[0] is not None
@@ -259,7 +350,7 @@ def pipelined_fused_moe_gmm(
         ag_hs_next = ag_tw_next = ag_ti_next = None
         # Issue asynchronous all-gather for next chunk if available
         if i + 1 < num_chunks:
-            ag_hs_next = collective_group.all_gather(hs_slices[i + 1], dim=0)
+            ag_hs_next = _all_gather_hs(hs_slices[i + 1])
             # Locals let the None checks below narrow; subscripts do not.
             weights_next = weights_slices[i + 1]
             ag_tw_next = (
@@ -283,8 +374,8 @@ def pipelined_fused_moe_gmm(
             w2_scale=w2_scale,
             w1_bias=w1_bias,
             w2_bias=w2_bias,
-            topk_weights=ag_tw_curr,
-            topk_ids=ag_ti_curr,
+            topk_weights=cast(torch.Tensor, ag_tw_curr),
+            topk_ids=cast(torch.Tensor, ag_ti_curr),
             experts_start=experts_start,
             topk=topk,
             activation=activation,

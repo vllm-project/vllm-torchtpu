@@ -70,6 +70,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
+from vllm_torchtpu.utils import fresh_buffer
 
 _GDN_PCP_AXIS_NAME = "pcp"
 _GDN_TP_AXIS_NAME = "tp"
@@ -384,7 +385,10 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # vLLM's MambaBase types kv_cache as tuple[Tensor, ...].
         # pyrefly: ignore[bad-assignment]
         self.kv_cache = None
-        vllm_config = get_vllm_model_wrapper_context().vllm_config
+        # The wrapper context types vllm_config as object.
+        vllm_config = cast(
+            VllmConfig | None, get_vllm_model_wrapper_context().vllm_config
+        )
         self._bm_kernel = vllm_config is not None and unified_block_major_enabled(
             vllm_config
         )
@@ -528,13 +532,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         2-D. torch_tpu hands a compiled executable the buffer behind each
         argument and re-materializes a shape-mismatched argument as a
         standalone `tt_jit_as_strided` program before every forward. One
-        contiguous copy at load time removes that per-step program.
+        `fresh_buffer` copy at load time removes that per-step program.
         """
         del act_dtype
         w = self.conv1d.weight
-        self.conv1d.weight.data = torch.empty(
-            w.shape, dtype=w.dtype, device=w.device
-        ).copy_(w)
+        self.conv1d.weight.data = fresh_buffer(w)
 
     def get_state_shape(
         self,
@@ -554,7 +556,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         vllm_context = get_vllm_model_wrapper_context()
         if vllm_context.vllm_config is None:
             return False
-        parallel_config = vllm_context.vllm_config.parallel_config
+        parallel_config = cast(VllmConfig, vllm_context.vllm_config).parallel_config
         return parallel_config.prefill_context_parallel_size > 1
 
     def _build_gdn_op(self, *, pcp_streaming: bool = False):
@@ -577,7 +579,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             )
 
         if pcp_streaming:
-            parallel_config = vllm_context.vllm_config.parallel_config
+            parallel_config = cast(VllmConfig, vllm_context.vllm_config).parallel_config
             interleave_size = parallel_config.cp_kv_cache_interleave_size
             if not isinstance(interleave_size, int) or interleave_size <= 0:
                 raise ValueError(
@@ -709,7 +711,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     def _build_pooled_gdn_op(self, *, block_major: bool = False):
         vllm_context = get_vllm_model_wrapper_context()
         local_num_v_heads = self.num_v_heads // self.tp_size
-        vllm_config = vllm_context.vllm_config
+        vllm_config = cast(VllmConfig, vllm_context.vllm_config)
         mesh = vllm_context.mesh
         n_kq = self.tp_head_geometry.local_num_kq_heads
         d_k = self.head_k_dim
@@ -858,7 +860,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         local_num_v_heads = self.num_v_heads // self.tp_size
         local_num_kq_heads = self.tp_head_geometry.local_num_kq_heads
         has_conv_bias = self.conv1d.bias is not None
-        parallel_config = vllm_context.vllm_config.parallel_config
+        parallel_config = cast(VllmConfig, vllm_context.vllm_config).parallel_config
         interleave_size = parallel_config.cp_kv_cache_interleave_size
         if not isinstance(interleave_size, int) or interleave_size <= 0:
             raise ValueError(
@@ -881,7 +883,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             )
         derive_gdn_head_geometry(local_num_kq_heads, local_num_v_heads, pcp_size)
 
-        vllm_config = vllm_context.vllm_config
+        vllm_config = cast(VllmConfig, vllm_context.vllm_config)
         d_k = self.head_k_dim
         d_v = self.head_v_dim
         kernel_size = self.conv_kernel_size

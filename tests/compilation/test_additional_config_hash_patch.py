@@ -66,6 +66,7 @@ class _StubVllmConfig:
         self.observability_config = SimpleNamespace(
             compute_hash=lambda: "observability"
         )
+        self.aux_output_config = SimpleNamespace(compute_hash=lambda: "aux_output")
 
     def __getattr__(self, name):
         # Let dunders (``__setstate__``/``__deepcopy__``/...) miss normally so
@@ -156,7 +157,7 @@ def test_additional_config_is_restored_after_hashing(patched_compute_hash):
 
 
 def test_additional_config_is_restored_when_hashing_raises(apply_patch_over):
-    def exploding_compute_hash(self):
+    def exploding_compute_hash(self, *args, **kwargs):
         raise RuntimeError("boom")
 
     compute_hash = apply_patch_over(exploding_compute_hash)

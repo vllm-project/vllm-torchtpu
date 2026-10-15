@@ -1,8 +1,21 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import functools
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, cast
 
 import jax
 import torch
@@ -12,7 +25,12 @@ from vllm.utils.torch_utils import PIN_MEMORY
 from vllm.v1.attention.backend import (
     AttentionMetadataBuilder as BaseAttentionMetadataBuilder,
 )
-from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVCacheSpec,
+    MambaSpec,
+    UniformTypeKVCacheSpecs,
+)
 
 from vllm_torchtpu.layers.core.sequence_layout import (
     DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
@@ -20,6 +38,22 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutDescriptor,
     SequenceLayoutKind,
 )
+
+
+def attention_block_table_width(
+    block_table: Any,
+    spec: KVCacheSpec,
+    vllm_config: Any,
+    model_len: int | None = None,
+) -> int:
+    """Match allocated, rank-local kernel page ordinals, including block splits."""
+    if model_len is None:
+        return block_table.max_num_blocks_per_req
+    pages = spec.max_num_blocks_per_req(vllm_config, model_len)
+    return min(
+        pages * getattr(block_table, "blocks_per_kv_block", 1),
+        block_table.max_num_blocks_per_req,
+    )
 
 
 @functools.partial(
@@ -45,22 +79,22 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 @dataclass
 class AttentionMetadata:
     # (padded_total_num_scheduled_tokens,)
-    input_positions: jax.Array
+    input_positions: jax.Array | torch.Tensor | None
     # (max_num_seqs * max_num_blocks_per_req,)
-    block_tables: jax.Array = None
+    block_tables: jax.Array | torch.Tensor | None = None
     # (max_num_seqs,)
-    seq_lens: jax.Array = None
+    seq_lens: jax.Array | torch.Tensor | None = None
     # (max_num_seqs + 1,)
-    query_start_loc: jax.Array = None
+    query_start_loc: jax.Array | torch.Tensor | None = None
     # (3,)
-    request_distribution: jax.Array = None
+    request_distribution: jax.Array | torch.Tensor | None = None
     # (max_num_seqs,) int32 - physical slot id in the mamba kv-cache for the
     # request currently in each persistent-batch position. Compact-mamba uses
     # an explicit slot from its independent pool; unified align mode derives
     # the slot from the current entry in the device block table. None for
     # attention groups, non-mamba models, and Mamba modes whose native fallback
     # addresses block_tables[:, 0].
-    mamba_state_indices: jax.Array | None = None
+    mamba_state_indices: jax.Array | torch.Tensor | None = None
     # (mamba_num_blocks,) int32 — per-*slot* read offset for speculative
     # decoding with mamba layers. `mamba_slot_read_offsets[base_slot]` is
     # `num_accepted - 1` from the request's most recent verify step: the GDN
@@ -70,11 +104,11 @@ class AttentionMetadata:
     # batch position) so the value survives requests being rescheduled or
     # condensed. Updated on device after each sampling step; None unless the
     # model has mamba layers *and* speculative decoding is enabled.
-    mamba_slot_read_offsets: jax.Array | None = None
+    mamba_slot_read_offsets: jax.Array | torch.Tensor | None = None
     # `(num_reqs, num_spec + 1)` source block per checkpoint. Unified pool
     # with speculative decoding only; None elsewhere, where the sole
     # checkpoint is the request's own state block.
-    mamba_ckpt_indices: jax.Array | None = None
+    mamba_ckpt_indices: jax.Array | torch.Tensor | None = None
     # (3,) int32 — GDN-specific request distribution, same format as
     # `request_distribution` but with the first segment covering all
     # *windowed* sequences (plain decodes and speculative verify windows of
@@ -84,7 +118,7 @@ class AttentionMetadata:
     # decode front segment while the GDN kernel runs its windowed mode over
     # the first two groups. None unless the model has mamba layers and spec
     # decoding is enabled.
-    mamba_request_distribution: jax.Array | None = None
+    mamba_request_distribution: jax.Array | torch.Tensor | None = None
     sequence_layout_kind: str = SequenceLayoutKind.ALL.value
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
     sequence_layout_version: int = 1
@@ -295,7 +329,19 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             target_num_blocks = block_table_obj.max_num_blocks_per_req
         else:
             assert runner.most_model_len is not None
-            target_num_blocks = cdiv(runner.most_model_len, self.target_block_size)
+            spec = self.kv_cache_spec
+            first_spec = (
+                spec.first_spec if isinstance(spec, UniformTypeKVCacheSpecs) else spec
+            )
+            if isinstance(first_spec, AttentionSpec):
+                target_num_blocks = attention_block_table_width(
+                    block_table_obj,
+                    self.kv_cache_spec,
+                    self.vllm_config,
+                    runner.most_model_len,
+                )
+            else:
+                target_num_blocks = cdiv(runner.most_model_len, self.target_block_size)
             if self.is_mamba_group and ctx.mamba_ckpt_window > 1:
                 # Speculative decoding: the manager appends
                 # `num_speculative_blocks` (= window - 1) checkpoint blocks
@@ -398,14 +444,11 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                     torch.zeros_like(gathered_state_indices),
                 )
                 if ckpt_index is not None:
-                    mamba_ckpt_indices = (
-                        torch.gather(
-                            block_tables_2d,
-                            dim=1,
-                            index=ckpt_index,
-                        )
-                        * ckpt_in_row
-                    )
+                    mamba_ckpt_indices = torch.gather(
+                        block_tables_2d,
+                        dim=1,
+                        index=ckpt_index,
+                    ) * cast(torch.Tensor, ckpt_in_row)
             if ctx.unified_mamba_state_indices is not None:
                 # Spec decode: expose this group's state blocks for the
                 # post-sampling read-offset scatter.

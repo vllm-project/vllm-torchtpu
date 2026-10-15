@@ -28,7 +28,8 @@
     font-family: var(--md-text-font), sans-serif;
 }
 
-.cg-options-group {
+.cg-options-group,
+.cg-row {
     display: flex;
     align-items: stretch;
     border-bottom: 1px solid var(--md-default-fg-color--lightest);
@@ -36,14 +37,21 @@
     gap: 0.5rem;
 }
 
+.cg-options {
+    display: flex;
+    flex: 1;
+    flex-wrap: wrap;
+    gap: 0.5rem;
+}
+
 .cg-label {
     font-weight: 600;
-    width: 110px;
+    width: 160px;
     flex-shrink: 0;
     color: var(--md-default-fg-color);
     display: flex;
     align-items: center;
-    font-size: 16px;
+    font-size: 15px;
 }
 
 .cg-btn {

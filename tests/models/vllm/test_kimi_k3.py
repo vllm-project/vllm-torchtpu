@@ -45,18 +45,22 @@ def _cpu_model_tests(monkeypatch):
     # queries registered devices; keep it from opening a distributed TPU
     # client merely to inspect the current device while tracing CPU code.
     #
-    # torch.tpu is registered by importing torch_tpu, which the cpu_test job
+    # torch.tpu is registered by importing torch_tpu, which the CPU test job
     # never does: tests/conftest.py imports it only under --use-tpu, and
     # importing it here would claim the accelerator in the pytest parent and
     # lock out every spawned child. With no device module registered there is
     # nothing for Dynamo to query, so there is nothing to stub either.
     tpu = getattr(torch, "tpu", None)
-    if tpu is None:
-        return
-    monkeypatch.setattr(tpu, "is_available", lambda: False)
-    monkeypatch.setattr(tpu, "current_device", lambda: 0)
-    monkeypatch.setattr(tpu, "device_count", lambda: 0)
-    monkeypatch.setattr(tpu, "manual_seed_all", lambda seed: None)
+    if tpu is not None:
+        monkeypatch.setattr(tpu, "is_available", lambda: False)
+        monkeypatch.setattr(tpu, "current_device", lambda: 0)
+        monkeypatch.setattr(tpu, "device_count", lambda: 0)
+        monkeypatch.setattr(tpu, "manual_seed_all", lambda seed: None)
+
+    if hasattr(torch, "accelerator"):
+        monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
+        monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+        monkeypatch.setattr(torch.accelerator, "device_count", lambda: 0)
 
 
 def test_kimi_architectures_are_registered() -> None:
@@ -212,7 +216,6 @@ def test_checkpoint_name_mapping_is_conditional_for_mla() -> None:
     assert weight.shard_id == 0
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize("tied", [False, True], ids=["untied", "tied"])
 def test_weight_loader_preserves_lm_head_skip_and_streaming(tied) -> None:
     model = KimiLinearForCausalLM.__new__(KimiLinearForCausalLM)
@@ -513,6 +516,7 @@ def test_model_is_registered_for_torch_compile() -> None:
     assert TorchCompileWithNoGuardsWrapper in KimiModel.__bases__
 
 
+@pytest.mark.tpu_test
 def test_kimi_linear_mla_keeps_its_checkpoint_layout(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -586,6 +590,7 @@ def test_kimi_linear_mla_keeps_its_checkpoint_layout(
     )
 
 
+@pytest.mark.tpu_test
 def test_mla_fuses_output_gate_with_lora_a_projections(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -696,6 +701,7 @@ def _mla_config(**overrides) -> KimiLinearConfig:
     return KimiLinearConfig(**kwargs)
 
 
+@pytest.mark.tpu_test
 def test_mla_requires_nope(monkeypatch: pytest.MonkeyPatch) -> None:
     """The TPU MLA layer only implements the NoPE variant. A config that
     asks for the RoPE-inside-MLA variant is rejected up front."""
@@ -705,6 +711,7 @@ def test_mla_requires_nope(monkeypatch: pytest.MonkeyPatch) -> None:
         MultiHeadLatentAttention(config, VllmConfig(), prefix="a")
 
 
+@pytest.mark.tpu_test
 def test_mla_rejects_incomplete_config(monkeypatch: pytest.MonkeyPatch) -> None:
     """All four MLA head dimensions must be set. Leaving one as `None`
     produces an error that lists every field, so the user can see which
@@ -715,6 +722,7 @@ def test_mla_rejects_incomplete_config(monkeypatch: pytest.MonkeyPatch) -> None:
         MultiHeadLatentAttention(config, VllmConfig(), prefix="b")
 
 
+@pytest.mark.tpu_test
 def test_mla_rejects_heads_not_divisible_by_tp(monkeypatch: pytest.MonkeyPatch) -> None:
     """Attention heads are split evenly across tensor-parallel ranks, so
     4 heads cannot be spread over 3 ranks."""
@@ -873,7 +881,10 @@ def test_kda_forward_dispatches_to_both_custom_ops(monkeypatch) -> None:
     )
 
 
-def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache(monkeypatch) -> None:
+@pytest.mark.parametrize("speculative", [False, True])
+def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache(
+    monkeypatch, speculative
+) -> None:
     """A one-tensor kv_cache means the unified pool: the layer must take the
     pooled op and never the dense dispatched op."""
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
@@ -905,7 +916,13 @@ def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache(monkeypatch) -> 
         seq_lens=torch.tensor([2], dtype=torch.int32),
         request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
         mamba_slot_read_offsets=None,
+        mamba_request_distribution=None,
+        mamba_ckpt_indices=None,
     )
+    if speculative:
+        metadata.mamba_slot_read_offsets = torch.tensor([0, 1], dtype=torch.int32)
+        metadata.mamba_request_distribution = torch.tensor([1, 1, 1], dtype=torch.int32)
+        metadata.mamba_ckpt_indices = torch.tensor([[1, 3]], dtype=torch.int32)
     layer._metadata = lambda: metadata
 
     calls: list[str] = []
@@ -913,6 +930,9 @@ def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache(monkeypatch) -> 
     def pooled_kda_op(mixed_qkv, *args):
         calls.append("pooled")
         assert args[3] is pool
+        assert args[-3] is metadata.mamba_request_distribution
+        assert args[-2] is metadata.mamba_slot_read_offsets
+        assert args[-1] is metadata.mamba_ckpt_indices
         return mixed_qkv[:, :4].view(-1, 2, 2)
 
     def unexpected(name):
@@ -996,15 +1016,16 @@ def _patch_kda_construction_deps(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(
         kimi_attention,
         "build_kimi_dispatched_kda_op",
-        lambda *a, **k: (lambda *args, **kwargs: None),
+        lambda *a, **k: lambda *args, **kwargs: None,
     )
     monkeypatch.setattr(
         kimi_attention,
         "build_kimi_pooled_kda_op",
-        lambda *a, **k: (lambda *args, **kwargs: None),
+        lambda *a, **k: lambda *args, **kwargs: None,
     )
 
 
+@pytest.mark.tpu_test
 def test_kda_construction_wires_projections_and_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1037,6 +1058,7 @@ def test_kda_construction_wires_projections_and_state(
     )
 
 
+@pytest.mark.tpu_test
 def test_kda_construction_full_rank_gate_builds_separate_projections(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1058,6 +1080,7 @@ def test_kda_construction_full_rank_gate_builds_separate_projections(
     assert layer.g_b_proj is None
 
 
+@pytest.mark.tpu_test
 def test_kda_construction_rejects_duplicate_prefix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1078,6 +1101,7 @@ def test_kda_construction_rejects_duplicate_prefix(
             )
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("num_spec_tokens", [0, 5, 7])
 def test_kda_construction_passes_speculative_window_to_op(
     monkeypatch: pytest.MonkeyPatch, num_spec_tokens: int
@@ -1351,20 +1375,62 @@ def test_core_attention_pooled_rejects_pcp_streaming(
         layer._core_attention_pooled(None, None, None, None, None, metadata)
 
 
-def test_core_attention_pooled_rejects_speculative_verify(
+def test_core_attention_pooled_forwards_speculative_verify_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`mamba_slot_read_offsets` is only set for speculative-decode verify
-    steps, which the pooled path cannot handle (it keeps one state per block,
-    not the per-window checkpoints verify needs)."""
+    """Pooled verify forwards accepted-state offsets and noncontiguous checkpoints."""
     layer = _make_bare_kda_layer()
     monkeypatch.setattr(
         kimi_attention, "is_pcp_streaming_attention_metadata", lambda md: False
     )
-    metadata = SimpleNamespace(mamba_slot_read_offsets=torch.zeros(1))
+    metadata = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 6], dtype=torch.int32),
+        mamba_state_indices=torch.tensor([1], dtype=torch.int32),
+        seq_lens=torch.tensor([12], dtype=torch.int32),
+        request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+        mamba_request_distribution=torch.tensor([1, 1, 1], dtype=torch.int32),
+        mamba_slot_read_offsets=torch.tensor([0, 2], dtype=torch.int32),
+        mamba_ckpt_indices=torch.tensor([[1, 3, 5, 7, 9, 11]], dtype=torch.int32),
+    )
+    mixed_qkv = torch.zeros(6, 12)
+    raw_gate = torch.zeros(6, 4)
+    beta = torch.zeros(6, 2)
+    output_gate = torch.zeros(6, 4)
+    pool = torch.empty(12, 1, 1, 1)
+    expected_output = torch.ones(6, 2, 2)
+    calls = []
 
-    with pytest.raises(NotImplementedError, match="Speculative decoding"):
-        layer._core_attention_pooled(None, None, None, None, None, metadata)
+    def pooled_kda_op(*args):
+        calls.append(args)
+        return expected_output
+
+    layer.pooled_kda_op = pooled_kda_op
+    output = layer._core_attention_pooled(
+        mixed_qkv, raw_gate, beta, output_gate, pool, metadata
+    )
+
+    assert output is expected_output
+    assert len(calls) == 1
+    expected_args = (
+        mixed_qkv,
+        raw_gate,
+        beta,
+        output_gate,
+        pool,
+        layer.conv_weight_fused,
+        layer.A_log,
+        layer.dt_bias,
+        layer.o_norm.weight,
+        metadata.query_start_loc,
+        metadata.mamba_state_indices,
+        metadata.seq_lens,
+        metadata.request_distribution,
+        metadata.mamba_request_distribution,
+        metadata.mamba_slot_read_offsets,
+        metadata.mamba_ckpt_indices,
+    )
+    assert len(calls[0]) == len(expected_args)
+    assert all(actual is expected for actual, expected in zip(calls[0], expected_args))
 
 
 def test_core_attention_pooled_requires_state_indices(
@@ -2422,7 +2488,6 @@ def _encoder_cudagraph_stub(merge=(2, 2)) -> SimpleNamespace:
     )
 
 
-@pytest.mark.cpu_test
 def test_kimi_k3_opts_into_encoder_cudagraph() -> None:
     # This is the switch MMEncoderManager keys on: without it,
     # cudagraph_mm_encoder is silently inert for Kimi and MoonViT stays eager,
@@ -2432,7 +2497,6 @@ def test_kimi_k3_opts_into_encoder_cudagraph() -> None:
     assert supports_encoder_cudagraph(KimiK3ForConditionalGeneration)
 
 
-@pytest.mark.cpu_test
 def test_kimi_k3_encoder_cudagraph_item_specs() -> None:
     stub = _encoder_cudagraph_stub()
     grid = torch.tensor([[1, 4, 6], [1, 2, 2], [2, 8, 4]])
@@ -2446,7 +2510,6 @@ def test_kimi_k3_encoder_cudagraph_item_specs() -> None:
     assert [s.output_tokens for s in specs] == [6, 1, 16]
 
 
-@pytest.mark.cpu_test
 def test_kimi_k3_select_encoder_cudagraph_items_gathers_each_items_patches() -> None:
     stub = _encoder_cudagraph_stub()
     grid = torch.tensor([[1, 2, 2], [1, 4, 2], [1, 2, 6]])
@@ -2473,7 +2536,6 @@ def test_kimi_k3_select_encoder_cudagraph_items_gathers_each_items_patches() -> 
     assert empty["grid_thws"].shape == (0, 3)
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     ("batched", "model_len", "expected_max"), [(8192, 24576, 8192), (8192, 4096, 4096)]
 )
@@ -2492,7 +2554,6 @@ def test_kimi_k3_encoder_cudagraph_budget_range(
     assert budget_range == (64, expected_max)
 
 
-@pytest.mark.cpu_test
 def test_kimi_vision_qkv_materialization_is_skipped_while_compiling(
     monkeypatch,
 ) -> None:
@@ -2511,7 +2572,6 @@ def test_kimi_vision_qkv_materialization_is_skipped_while_compiling(
     assert kimi_vit._materialize_vision_qkv(None, (), (qkv, None)) is None
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     ("budget", "items", "grid"),
     [
@@ -2552,7 +2612,6 @@ def test_kimi_k3_encoder_cudagraph_capture_grid_fits_rope_table(
     assert inputs.values["pixel_values"].shape[0] == items * t * h * w
 
 
-@pytest.mark.cpu_test
 def test_kimi_k3_encoder_cudagraph_capture_rejects_budget_past_rope_table() -> None:
     stub = _encoder_cudagraph_stub()
     stub.vision_tower.encoder = SimpleNamespace(

@@ -97,15 +97,21 @@ def _raw(pool):
 
 
 def _pack_pool(
-    conv_init, ssm_init, block_ids, conv_shard_heads=None, pool_dtype=jnp.bfloat16
+    conv_init,
+    ssm_init,
+    block_ids,
+    conv_shard_heads=None,
+    pool_dtype=jnp.bfloat16,
+    num_blocks=NUM_BLOCKS,
 ):
     """Write the given states into the pool's state regions; the rest of the
     pool (including block 0 and the attention rows of every block) keeps its
     sentinel bytes."""
     rng = np.random.default_rng(99)
+    # Keep the byte capacity fixed; typed scatter packs BF16/FP32 state.
     pool = jnp.asarray(
         rng.standard_normal(
-            (NUM_BLOCKS, BLOCK_SIZE, _pool_pack(pool_dtype), LANES)
+            (num_blocks, BLOCK_SIZE, _pool_pack(pool_dtype), LANES)
         ).astype(np.float32),
         dtype=pool_dtype,
     )
@@ -230,6 +236,7 @@ def _run_pooled(
     )
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     ("query_lens", "seq_lens", "decode_end", "conv_shard_heads"),
     [
@@ -252,6 +259,7 @@ def test_pooled_kda_matches_dense_bitwise(
     )
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     "conv_shard_heads", [None, 1], ids=["one-shard", "rank-blocked"]
 )
@@ -328,6 +336,82 @@ def _check_pooled_matches_dense(
         )
 
 
+@pytest.mark.parametrize(
+    ("has_offsets", "checkpoint_shape", "message"),
+    [
+        pytest.param(
+            False,
+            (2, 6),
+            "requires read offsets and checkpoint indices",
+            id="missing-offsets",
+        ),
+        pytest.param(
+            True,
+            None,
+            "requires read offsets and checkpoint indices",
+            id="missing-checkpoints",
+        ),
+        pytest.param(
+            False,
+            None,
+            "requires read offsets and checkpoint indices",
+            id="missing-both",
+        ),
+        pytest.param(
+            True,
+            (1, 6),
+            "checkpoint indices must match the verify window",
+            id="wrong-request-count",
+        ),
+        pytest.param(
+            True,
+            (2, 5),
+            "checkpoint indices must match the verify window",
+            id="short-window",
+        ),
+        pytest.param(
+            True,
+            (2, 7),
+            "checkpoint indices must match the verify window",
+            id="long-window",
+        ),
+        pytest.param(
+            True,
+            (12,),
+            "checkpoint indices must match the verify window",
+            id="wrong-rank",
+        ),
+    ],
+)
+def test_pooled_kda_rejects_invalid_speculative_metadata(
+    has_offsets, checkpoint_shape, message
+):
+    """Reject invalid verify metadata before pool access or TPU kernel dispatch."""
+    inputs = _inputs(np.random.default_rng(0), [6, 6], [6, 6])
+    pool = jnp.zeros((13, BLOCK_SIZE, PACK, LANES), dtype=jnp.bfloat16)
+    offsets = jnp.zeros(13, dtype=jnp.int32) if has_offsets else None
+    checkpoints = (
+        jnp.ones(checkpoint_shape, dtype=jnp.int32)
+        if checkpoint_shape is not None
+        else None
+    )
+    distribution = jnp.asarray([2, 2, 2], dtype=jnp.int32)
+    with pytest.raises(ValueError, match=message):
+        _pooled_kda_core(
+            **inputs,
+            pool=pool,
+            state_indices=jnp.asarray([1, 7], dtype=jnp.int32),
+            distribution=distribution,
+            window_distribution=distribution,
+            slot_read_offsets=offsets,
+            ckpt_indices=checkpoints,
+            lower_bound=LOWER_BOUND,
+            eps=EPS,
+            pool_block_tokens=BLOCK_SIZE * PACK,
+            num_spec_tokens=5,
+        )
+
+
 def test_pooled_kda_rejects_oversized_state():
     inputs = _inputs(np.random.default_rng(0), [2], [2])
     layout = derive_pooled_gdn_state_layout(
@@ -346,6 +430,7 @@ def test_pooled_kda_rejects_oversized_state():
         )
 
 
+@pytest.mark.tpu_test
 def test_pooled_kda_manager_block_split():
     """Manager ids on a pool born at kernel-block granularity (split > 1).
 
@@ -411,6 +496,7 @@ def test_pooled_kda_manager_block_split():
             np.testing.assert_array_equal(after[block], seed[block])
 
 
+@pytest.mark.tpu_test
 def test_pooled_kda_multistep_state_evolution():
     """State must round-trip the pool across a chunked prefill and decodes.
 
@@ -466,3 +552,132 @@ def test_pooled_kda_multistep_state_evolution():
         rtol=1e-2,
         atol=5e-4,
     )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("split", [1, BLOCK_SIZE])
+@pytest.mark.parametrize("seed", [0, 17])
+@pytest.mark.parametrize(
+    "pool_dtype", [jnp.bfloat16, jnp.float8_e4m3fn], ids=["bf16", "fp8"]
+)
+def test_pooled_kda_speculative_checkpoints(split, seed, pool_dtype):
+    """Noncontiguous blocks, ragged windows, rollback and padded requests.
+
+    The dense window is the oracle; compare every checkpoint, not just the
+    final output, while repeatedly selecting a different accepted prefix.
+    """
+    rng = np.random.default_rng(seed)
+    window, num_reqs = 6, 3
+    live_states = 2 * window
+    num_blocks = live_states + 2
+    physical = rng.permutation(np.arange(1, live_states + 1)).reshape(2, window)
+    ckpts = jnp.asarray(np.vstack([physical, np.zeros(window, np.int32)]), jnp.int32)
+    state_ids = ckpts[:, 0]
+    conv, ssm = _initial_states(rng, live_states + 1)
+    conv = conv.at[-1].set(0)
+    ssm = ssm.at[-1].set(0)
+    pool = _pack_pool(
+        conv,
+        ssm,
+        [*physical.reshape(-1), 0],
+        num_blocks=num_blocks,
+        pool_dtype=pool_dtype,
+    )
+    pack = pool.shape[2]
+    sentinel = np.asarray(pool[-1].view(jnp.uint8)).copy()
+    pool = pool.reshape(num_blocks * split, BLOCK_SIZE // split, pack, LANES)
+    conv_buf = jnp.concatenate(
+        [conv[-1:], conv[:-1], jnp.repeat(conv[-1:], window, axis=0)]
+    )
+    ssm_buf = jnp.concatenate(
+        [ssm[-1:], ssm[:-1], jnp.repeat(ssm[-1:], window, axis=0)]
+    )
+    identity = 1 + jnp.arange(num_reqs, dtype=jnp.int32) * window
+    steps = [
+        # Pure prefill must only seed checkpoint zero.
+        ([8, 7, 0], [8, 7, 0], 0, [0, 0, 0]),
+        ([6, 3, 0], [14, 10, 0], 2, [0, 0, 0]),
+        # Resume independently from last and intermediate checkpoints.
+        ([6, 1, 0], [20, 9, 0], 2, [5, 1, 0]),
+        ([1, 6, 0], [16, 14, 0], 2, [0, 0, 0]),
+        # Mixed verify + continuation prefill.
+        ([6, 9, 0], [22, 23, 0], 1, [0, 4, 0]),
+    ]
+    for lengths, seq_lens, window_end, offsets in steps:
+        inputs = _inputs(rng, lengths, seq_lens)
+        distribution = jnp.asarray([window_end, 2, 2], jnp.int32)
+        pool_offsets = (
+            jnp.zeros(num_blocks, jnp.int32).at[state_ids].set(jnp.asarray(offsets))
+        )
+        dense_offsets = (
+            jnp.zeros(num_reqs * window + 1, jnp.int32)
+            .at[identity]
+            .set(jnp.asarray(offsets))
+        )
+        out_ref, conv_buf, ssm_buf = _build_fused_core(-5.0, EPS, window - 1)(
+            inputs["mixed_qkv"],
+            inputs["raw_gate"],
+            inputs["beta"],
+            inputs["output_gate"],
+            conv_buf.reshape(num_reqs * window + 1, KERNEL_SIZE - 1, -1),
+            ssm_buf,
+            inputs["conv_weight"],
+            inputs["a_log"],
+            inputs["dt_bias"],
+            inputs["norm_weight"],
+            inputs["query_start_loc"],
+            identity,
+            inputs["seq_lens"],
+            distribution,
+            distribution,
+            dense_offsets,
+        )
+        out, pool = _pooled_kda_core(
+            inputs["mixed_qkv"],
+            inputs["raw_gate"],
+            inputs["beta"],
+            inputs["output_gate"],
+            pool,
+            inputs["conv_weight"],
+            inputs["a_log"],
+            inputs["dt_bias"],
+            inputs["norm_weight"],
+            inputs["query_start_loc"],
+            state_ids,
+            inputs["seq_lens"],
+            distribution,
+            distribution,
+            pool_offsets,
+            ckpts,
+            lower_bound=-5.0,
+            eps=EPS,
+            pool_block_tokens=BLOCK_SIZE * pack,
+            num_spec_tokens=window - 1,
+        )
+        np.testing.assert_allclose(
+            np.asarray(out, np.float32),
+            np.asarray(out_ref, np.float32),
+            rtol=5e-2,
+            atol=4e-3,
+        )
+        actual_conv, actual_ssm = _unpack_pool(
+            pool, list(physical.reshape(-1)), split=split
+        )
+        np.testing.assert_array_equal(
+            np.asarray(actual_conv.view(jnp.uint16)),
+            np.asarray(
+                conv_buf[1 : live_states + 1]
+                .reshape(actual_conv.shape)
+                .view(jnp.uint16)
+            ),
+        )
+        np.testing.assert_allclose(
+            np.asarray(actual_ssm),
+            np.asarray(ssm_buf[1 : live_states + 1]),
+            rtol=1e-2,
+            atol=5e-4,
+        )
+        restored = pool.reshape(num_blocks, BLOCK_SIZE, pack, LANES)
+        np.testing.assert_array_equal(
+            np.asarray(restored[-1].view(jnp.uint8)), sentinel
+        )

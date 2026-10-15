@@ -3,7 +3,7 @@
 import bisect
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 import numpy as np
 import torch
@@ -120,8 +120,12 @@ class SequenceLayoutPlan:
             value=-1,
         )
 
-        packed_to_request = self._packed_to_request_major_token_indices
-        request_to_packed = self._request_major_to_packed_token_indices
+        packed_to_request = cast(
+            np.ndarray, self._packed_to_request_major_token_indices
+        )
+        request_to_packed = cast(
+            np.ndarray, self._request_major_to_packed_token_indices
+        )
         num_tokens = request_to_packed.size
         assert num_tokens <= self.global_padded_num_tokens, (
             "Request-major mapping exceeds the PCP global token capacity: "

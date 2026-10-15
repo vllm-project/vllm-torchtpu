@@ -1,0 +1,65 @@
+name: PR Text
+
+# The repo is public, so internal links and IDs stay out of PR titles and
+# descriptions, not only out of the code (R-7.12 in
+# docs/developers_guide/coding_guidance.md). A squash merge copies the title
+# into the history of main. pre-commit cannot see PR text, so this check reads
+# the event payload. Like ready-label.yml it needs no checkout and no token, so
+# it also works on fork PRs.
+#
+# The pattern is wider than the `no-internal-refs` pre-commit hook: PR text
+# also tends to carry internal hosts and "CL 123456". The log names where a
+# match is, never the match itself, so a failing run does not repeat it.
+
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions: {}
+
+concurrency:
+  group: pr-text-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr-text:
+    name: No Internal Links in PR Text
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - name: Check the PR title and description
+        # The title and body are untrusted input: pass them through env, never
+        # through ${{ }} inside the script, where they would run as code.
+        env:
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_BODY: ${{ github.event.pull_request.body }}
+        run: |
+          python3 - <<'EOF'
+          import os
+          import re
+          import sys
+
+          pattern = re.compile(
+              r"""(^|[\s(\[{"'`<,]|https?://)(go/[A-Za-z]|b/[0-9]{6,}|cl/[0-9]{6,})"""
+              r"""|\bgoogle3\b|\bcl\s+[0-9]{6,}|\bbuganizer\b|\bcorp\.google\.com\b"""
+              r"""|\bgoogleplex\b|\bgoto\.google\.com\b""",
+              re.IGNORECASE,
+          )
+          places = []
+          if pattern.search(os.environ["PR_TITLE"]):
+              places.append("the title")
+          for i, line in enumerate(os.environ.get("PR_BODY", "").splitlines(), 1):
+              if pattern.search(line):
+                  places.append(f"line {i} of the description")
+          if not places:
+              print("No internal links in the PR title or description.")
+              sys.exit(0)
+          for place in places:
+              print(f"::error::Internal link or ID in {place}.")
+          print(
+              "This repo is public. Remove go/ links, b/ and cl/ numbers, internal "
+              "code paths and internal hosts from the PR title and description "
+              "(R-7.12 in docs/developers_guide/coding_guidance.md). Editing the PR "
+              "runs this check again."
+          )
+          sys.exit(1)
+          EOF

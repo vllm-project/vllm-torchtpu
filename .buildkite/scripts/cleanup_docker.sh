@@ -24,7 +24,8 @@ set -euo pipefail
 # fails with "removal ... is already in progress". Under `set -e` that aborts
 # the caller before any test runs, turning housekeeping into a red build.
 # A resource that is already being removed is the outcome we wanted.
-TARGET_IMAGES=("vllm-torchtpu" "torchtpu-vllm-local")
+# TODO: after 11/31/2026, remove torchtpu-vllm and torchtpu-vllm-local
+TARGET_IMAGES=("vllm-torchtpu" "torchtpu-vllm" "vllm-torchtpu-local" "torchtpu-vllm-local")
 
 echo "=== Starting Docker resource cleanup ==="
 echo "Target images: ${TARGET_IMAGES[*]}"

@@ -177,9 +177,9 @@ def _load_conv_state(slot_ref: jax.Ref, cfg: config.GDNConfig, idx: int) -> jax.
     """One slot's conv state, decoded through the plan when there is one."""
     # NOTE: Conv1D mandates fp32 due to its usage of compact layout.
     if cfg.state_plan is None:
-        return slot_ref[idx, 0].astype(jnp.float32)
+        return slot_ref[idx, cfg.state_in_pos].astype(jnp.float32)
     return load_state_region(
-        slot_ref.at[idx, 0],
+        slot_ref.at[idx, cfg.state_in_pos],
         cfg.state_plan.conv,
         (cfg.prev_kernel_size, 1, cfg.dim_size),
     ).astype(jnp.float32)
@@ -190,9 +190,9 @@ def _load_recurrent_state(
 ) -> jax.Array:
     """One slot's recurrent state, converted to FP32 for compute."""
     if cfg.state_plan is None:
-        return slot_ref[idx, 0].astype(jnp.float32)
+        return slot_ref[idx, cfg.state_in_pos].astype(jnp.float32)
     return load_state_region(
-        slot_ref.at[idx, 0],
+        slot_ref.at[idx, cfg.state_in_pos],
         cfg.state_plan.recurrent,
         (cfg.num_v_heads, cfg.kq_head_dim, cfg.v_head_dim),
     ).astype(jnp.float32)
@@ -264,6 +264,7 @@ def load_and_select_states(
                 0,
             )
             if carry_conv_scratch_ref is not None:
+                assert carry_recurrent_scratch_ref is not None
                 prev_conv_state = jnp.where(
                     is_first_tile, prev_conv_state, carry_conv_scratch_ref[idx]
                 )
@@ -276,6 +277,8 @@ def load_and_select_states(
             # Later tiles resume from the carry, so decode both sources once
             # instead of on every tile. One guard, not one per state.
             # pl.when traces the body here, so `idx` is this iteration's.
+            assert carry_recurrent_scratch_ref is not None
+
             @pl.when(is_first_tile)
             def _():
                 carry_conv_scratch_ref[idx] = jnp.where(

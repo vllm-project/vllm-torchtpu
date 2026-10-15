@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import inspect
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -142,6 +155,7 @@ def _capture_kernel(monkeypatch):
     return captured
 
 
+@pytest.mark.tpu_test
 def test_forward_routes_partial_layout_to_streaming_kernel(
     monkeypatch, vllm_config_context
 ):
@@ -161,6 +175,7 @@ def test_forward_routes_partial_layout_to_streaming_kernel(
     assert torch.all(outputs == 7)
 
 
+@pytest.mark.tpu_test
 def test_forward_routes_fp8_partial_layout_with_kv_scales(
     monkeypatch, vllm_config_context
 ):
@@ -184,6 +199,7 @@ def test_forward_routes_fp8_partial_layout_with_kv_scales(
     assert torch.all(outputs == 7)
 
 
+@pytest.mark.tpu_test
 def test_forward_routes_pcp_decode_metadata_to_streaming_kernel(
     monkeypatch, vllm_config_context
 ):
@@ -201,6 +217,7 @@ def test_forward_routes_pcp_decode_metadata_to_streaming_kernel(
     assert captured["args"][8] is None
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     ("impl_kwargs", "expected_message"),
     [
@@ -222,6 +239,7 @@ def test_forward_rejects_unsupported_pcp_streaming_features(
         _impl(**impl_kwargs).forward(_layer(), query, key, value, kv_cache, metadata)
 
 
+@pytest.mark.tpu_test
 def test_initialize_kernel_rejects_unsupported_pcp_streaming_features(
     vllm_config_context,
 ):
@@ -232,6 +250,7 @@ def test_initialize_kernel_rejects_unsupported_pcp_streaming_features(
         _impl(logits_soft_cap=30.0).initialize_kernel(_layer())
 
 
+@pytest.mark.tpu_test
 def test_forward_keeps_non_pcp_batch_on_disabled_mode(monkeypatch, vllm_config_context):
     captured = _capture_kernel(monkeypatch)
     query, key, value, kv_cache = _tensors()
@@ -246,6 +265,7 @@ def test_forward_keeps_non_pcp_batch_on_disabled_mode(monkeypatch, vllm_config_c
     assert captured["build"]["cp_kv_cache_interleave_size"] == 0
 
 
+@pytest.mark.tpu_test
 def test_initialize_kernel_prebuilds_streaming_variant_for_native_pcp(
     monkeypatch, vllm_config_context
 ):
@@ -272,6 +292,7 @@ def test_initialize_kernel_prebuilds_streaming_variant_for_native_pcp(
     assert calls == [(True, 4)]
 
 
+@pytest.mark.tpu_test
 def test_initialize_kernel_marks_the_batched_layer_as_streaming_under_pcp(
     monkeypatch, vllm_config_context
 ):
@@ -288,6 +309,7 @@ def test_initialize_kernel_marks_the_batched_layer_as_streaming_under_pcp(
     assert not impl.runs_batched_rpa_schedule()
 
 
+@pytest.mark.tpu_test
 def test_no_kernel_reports_a_schedule_bound(vllm_config_context):
     """The batched kernel streams its schedule from an HBM table and exposes
     no capacity, so no layer asks the runner to bound its schedule."""
@@ -326,6 +348,7 @@ def test_streaming_rpa_mesh_requests_full_pcp_tp_grid(monkeypatch):
     assert captured["axis_names"] == ("pcp", "tp")
 
 
+@pytest.mark.tpu_test
 def test_build_rpa_kernel_reuses_prebuilt_config_before_mesh_lookup(
     monkeypatch, vllm_config_context
 ):
@@ -384,6 +407,7 @@ def test_build_rpa_kernel_reuses_prebuilt_config_before_mesh_lookup(
     assert cached is prebuilt
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("block_major", [False, True])
 def test_build_streaming_kernel_registers_eight_tensor_custom_op(
     monkeypatch, vllm_config_context, block_major
@@ -484,6 +508,7 @@ def hnd_vllm_config_context(monkeypatch):
         yield config
 
 
+@pytest.mark.tpu_test
 def test_pcp_hnd_layout_is_forwarded_to_streaming_kernel(
     monkeypatch, hnd_vllm_config_context
 ):
@@ -527,6 +552,7 @@ def test_pcp_hnd_layout_is_forwarded_to_streaming_kernel(
     assert captured["kv_layout"] == KVLayout.SEQ_ALONG_LANE
 
 
+@pytest.mark.tpu_test
 def test_pcp_hnd_layout_selects_sequence_cache_shape_and_page_sizes(
     hnd_vllm_config_context,
 ):
@@ -548,6 +574,7 @@ def test_pcp_hnd_layout_selects_sequence_cache_shape_and_page_sizes(
     ]
 
 
+@pytest.mark.tpu_test
 def test_pcp_hnd_layout_requires_custom_backend_and_fp8(hnd_vllm_config_context):
     with pytest.raises(NotImplementedError, match="non-CUSTOM"):
         _impl(kv_cache_dtype="fp8_e4m3")._validate_pcp_streaming_support(False)
@@ -633,13 +660,14 @@ def test_adapter_make_streaming_kernel_rejects_unsupported_features(
         )
 
 
+@pytest.mark.tpu_test
 def test_build_pcp_streaming_callable_returns_stock_jax_callable(monkeypatch):
     """The callable must be stock, not a subclass that overrides __call__.
 
     It used to be a local subclass so it could size shard_map outputs from
     ``lowered._out_named_shardings``; stock derived them from
-    ``lowered.out_avals``, which jax.export records as replicated. Since
-    cl/975923205 stock takes ``output_partition_specs`` directly, so the
+    ``lowered.out_avals``, which jax.export records as replicated. Now
+    stock takes ``output_partition_specs`` directly, so the
     subclass is unnecessary -- and while it existed it silently dropped every
     argument stock's __call__ gained, ``mesh_device_ids`` included. Asserting
     the exact type is what keeps a subclass from creeping back in.
@@ -692,6 +720,7 @@ def test_build_pcp_streaming_callable_returns_stock_jax_callable(monkeypatch):
     assert "out_shardings" not in captured["jit_kwargs"]
 
 
+@pytest.mark.tpu_test
 def test_build_pcp_streaming_callable_defaults_output_specs(monkeypatch):
     monkeypatch.setattr(
         pcp_adapter.pallas_impl, "_verify_signature", lambda _signature: None
@@ -833,6 +862,7 @@ def test_adapter_invoke_streaming_op_rejects_kwargs_and_wrong_arg_count():
         pcp_adapter.invoke_pcp_streaming_op(lambda *_args: None, object(), (), {})
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     "rebind_local, expects_kv_layout",
     [(False, True), (True, False)],

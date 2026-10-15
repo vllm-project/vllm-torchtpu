@@ -14,7 +14,7 @@
 
 import dataclasses
 import functools
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -172,7 +172,7 @@ class InBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -189,7 +189,7 @@ class InBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         dma_size = 0
@@ -211,7 +211,7 @@ class OutBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -228,7 +228,7 @@ class OutBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_wait_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         dma_size = 0
@@ -287,7 +287,7 @@ class StateBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -301,9 +301,12 @@ class StateBufferedRef(BaseBufferedRef):
             # Resume from the checkpoint of the last accepted token.
             state_idx += self._read_offset(s_idx)
 
+            # Into the dedicated incoming-state position (see
+            # `GDNConfig.state_in_pos`), never a checkpoint position that an
+            # in-flight copy_out of this slot may still be reading.
             pltpu.make_async_copy(
                 self._src_slice(src_ref, state_idx, dma_size),
-                vmem_ref.at[idx, pl.ds(0, dma_size)],
+                vmem_ref.at[idx, pl.ds(self.cfg.state_in_pos, dma_size)],
                 sem,
             ).start()
 
@@ -312,7 +315,7 @@ class StateBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         dma_size = 0
@@ -334,7 +337,7 @@ class StateBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -360,7 +363,7 @@ class StateBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_wait_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         dma_size = 0
@@ -427,6 +430,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
         return ckpt_indices[s_idx, ckpt]
 
     def _region_slice(self, src_ref: jax.Ref, state_idx, nblocks):
+        assert self.cfg.state_plan is not None
         base = state_idx * self.stride + self.region.kb0
         if self.cfg.state_plan.whole_block_dma or (
             self.region.row0 == 0 and self.region.nrows == src_ref.shape[1]
@@ -441,7 +445,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
         assert self.window_ref is not None
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -457,7 +461,9 @@ class ExternalStateBufferedRef(StateBufferedRef):
 
             pltpu.make_async_copy(
                 self._region_slice(src_ref, state_idx, nblocks),
-                vmem_ref.at[idx, 0, pl.ds(0, nblocks)],
+                # Dedicated incoming-state position; see
+                # `GDNConfig.state_in_pos`.
+                vmem_ref.at[idx, self.cfg.state_in_pos, pl.ds(0, nblocks)],
                 sem,
             ).start()
 
@@ -474,9 +480,10 @@ class ExternalStateBufferedRef(StateBufferedRef):
         """
         assert self.sem_sends is not None
         assert self.window_ref is not None
+        assert self.compact_output_ref is not None
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -499,7 +506,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
         assert self.window_ref is not None
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -527,7 +534,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
         assert self.window_ref is not None
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         dma_size = 0
@@ -551,7 +558,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
         assert self.window_ref is not None
         slot = self.current_wait_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         dma_size = 0
@@ -650,14 +657,14 @@ def create_allocs(
         # without speculative decoding, where window_size is 1).
         conv_shape = (
             cfg.seq_tile_size,
-            cfg.window_size,
+            cfg.state_window_alloc,
             cfg.prev_kernel_size,
             1,
             cfg.dim_size,
         )
         recurrent_shape = (
             cfg.seq_tile_size,
-            cfg.window_size,
+            cfg.state_window_alloc,
             cfg.num_v_heads,
             cfg.kq_head_dim,
             cfg.v_head_dim,
@@ -688,13 +695,13 @@ def create_allocs(
             # Whole-block DMA transfers complete pages, retaining all inner dims.
             conv_shape = (
                 cfg.seq_tile_size,
-                cfg.window_size,
+                cfg.state_window_alloc,
                 plan.conv.nblocks,
                 *conv_state_ref.shape[1:],
             )
             recurrent_shape = (
                 cfg.seq_tile_size,
-                cfg.window_size,
+                cfg.state_window_alloc,
                 plan.recurrent.nblocks,
                 *recurrent_state_ref.shape[1:],
             )
@@ -702,14 +709,14 @@ def create_allocs(
             payload = conv_state_ref.shape[2:]
             conv_shape = (
                 cfg.seq_tile_size,
-                cfg.window_size,
+                cfg.state_window_alloc,
                 plan.conv.nblocks,
                 plan.conv.nrows,
                 *payload,
             )
             recurrent_shape = (
                 cfg.seq_tile_size,
-                cfg.window_size,
+                cfg.state_window_alloc,
                 plan.recurrent.nblocks,
                 plan.recurrent.nrows,
                 *payload,

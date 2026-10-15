@@ -24,6 +24,8 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUCopyState,
 )
 
+pytestmark = pytest.mark.tpu_test
+
 
 @pytest.fixture
 def device():
@@ -136,6 +138,8 @@ def cached_step(runner, req_ids, *, num_scheduled=4):
         ("unified", "new_owner", 2, 0),
         ("unified", "reuse_id", 2, 0),
         ("compact", "continue", 2, 2),
+        ("compact", "pause", 0, 0),
+        ("compact", "pause", 2, 2),
         ("compact", "new_owner", 2, 0),
         ("compact", "reuse_id", 2, 0),
     ],
@@ -143,7 +147,7 @@ def cached_step(runner, req_ids, *, num_scheduled=4):
 def test_mamba_read_offset_follows_storage_owner(
     device, monkeypatch, transition, offset, expected, layout
 ):
-    """Check offset ownership; compact pause needs separate state restoration."""
+    """A scheduling gap retains state ownership until KV is invalidated."""
     runner = make_runner(device, monkeypatch, 3)
     a = request_state("A", 5, [100, 101, 102])
     b = request_state("B", 9, [200])

@@ -44,6 +44,7 @@ from vllm_torchtpu.kernels.deepseek_v4.o_projection import (
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_op import (  # noqa: E501
     BATCH_AXIS,
+    VllmDeepseekSparseSWABackend,
     VllmDeepseekV4SWACache,
     _attention_csa,
     _attention_hca,
@@ -57,8 +58,10 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer imp
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    get_pallas_op_mesh,
     get_vllm_model_wrapper_context,
 )
+from vllm_torchtpu.utils import fresh_buffer
 
 logger = init_logger(__name__)
 
@@ -144,6 +147,8 @@ class VllmDeepseekV4MLAAttention(
 ):
     """Sparse MLA attention on TPU, over the SWA and compressed-KV caches."""
 
+    backend_cls = DeepseekV4TPUAttentionBackend
+    swa_backend_cls = VllmDeepseekSparseSWABackend
     # Set with object.__setattr__ in __init__ to avoid registering a submodule.
     mla_attn: VllmDeepseekV4MLAAttention
     # Set to True on DSpark draft layers; read with getattr(..., False).
@@ -297,7 +302,7 @@ class VllmDeepseekV4MLAAttention(
 
     def _build_attn_op(self):
         vllm_context = get_vllm_model_wrapper_context()
-        mesh = vllm_context.mesh
+        mesh = get_pallas_op_mesh()
 
         swa_only = self.compress_ratio <= 1
         is_csa = self.compress_ratio == 4
@@ -335,13 +340,15 @@ class VllmDeepseekV4MLAAttention(
 
         built_from_real_caches = swa_tensor is not None
 
+        # The wrapper context types vllm_config as object.
+        vllm_config = cast(VllmConfig, vllm_context.vllm_config)
         cfg_lps = VllmDeepseekV4SWACache._swa_block_size(
-            vllm_context.vllm_config.cache_config.block_size, self.window_size
+            vllm_config.cache_config.block_size, self.window_size
         )
         if cfg_lps != logical_page_size:
             logical_page_size = cfg_lps
 
-        hf_config = vllm_context.vllm_config.model_config.hf_config
+        hf_config = vllm_config.model_config.hf_config
         sm_scale = (
             getattr(self.mla_attn, "scale", None)
             or getattr(self.mla_attn, "softmax_scale", None)
@@ -472,7 +479,7 @@ class VllmDeepseekV4MLAAttention(
             op = pallas.jax_op(
                 op_name,
                 functools.partial(_qnorm_rope_jax, eps=eps),
-                mesh=get_vllm_model_wrapper_context().mesh,
+                mesh=get_pallas_op_mesh(),
                 input_partition_specs=(
                     P(None, "model", None),  # q
                     P(),  # positions
@@ -497,7 +504,7 @@ class VllmDeepseekV4MLAAttention(
             op = pallas.jax_op(
                 op_name,
                 _rope_jax,
-                mesh=get_vllm_model_wrapper_context().mesh,
+                mesh=get_pallas_op_mesh(),
                 input_partition_specs=(
                     P(),  # kv
                     P(),  # positions
@@ -745,7 +752,7 @@ class VllmDeepseekV4MLAAttention(
             op = pallas.jax_op(
                 op_name,
                 functools.partial(_o_proj_jax, head_dim=head_dim),
-                mesh=get_vllm_model_wrapper_context().mesh,
+                mesh=get_pallas_op_mesh(),
                 input_partition_specs=(
                     P(None, "model", None),  # o
                     P(),  # positions
@@ -778,8 +785,7 @@ class VllmDeepseekV4MLAAttention(
             f"{list(transposed[::-1])}, got {list(weight.shape)}."
         )
 
-        out = torch.empty(transposed, dtype=weight.dtype, device=weight.device)
-        out.copy_(weight.data.t())
+        out = fresh_buffer(weight.data.t())
         self.wo_a.weight = torch.nn.Parameter(out, requires_grad=False)
 
     def _assert_o_proj_supported(self) -> None:
@@ -833,7 +839,7 @@ class VllmDeepseekV4MLAAttention(
             f"{self.prefix}.wo_a: rotary_dim {rotary_dim} must be even and at most 128."
         )
 
-    def _o_proj(self, o: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def _o_proj(self, o: torch.Tensor | Any, positions: torch.Tensor) -> torch.Tensor:
         """Apply inverse RoPE and low-rank output projections wo_a and wo_b."""
         # The kernel folds the inverse RoPE, the activation quantization and
         # the per-group `wo_a` matmul into one pass.

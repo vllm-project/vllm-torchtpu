@@ -3,7 +3,7 @@ requires = ["setuptools>=61.0.0", "wheel", "setuptools_scm[toml]>=8.0"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "vllm_torchtpu"
+name = "vllm-torchtpu-core"
 dynamic = ["version"]
 description = ""
 readme = "README.md"
@@ -12,7 +12,7 @@ readme = "README.md"
 # unsatisfiable-requirements failure partway through a Docker build.
 requires-python = ">=3.12,<3.13"
 authors = [
-    { name = "vllm_torchtpu Contributors" }
+    { name = "vLLM TorchTPU Contributors" }
 ]
 classifiers = [
     "Development Status :: 3 - Alpha",
@@ -27,9 +27,7 @@ dependencies = [
     "tpu-info",
     "portpicker",
     "pathwaysutils",
-    # Note: we **intentionally** build vllm from source, see README.
-    # Keep the native KV cache placement API aligned with vLLM 0.29.0.
-    "vllm @ git+https://github.com/vllm-project/vllm.git@v0.29.0",
+    # vllm: see the `vllm` dependency group below.
     "torch==2.13.0",
     # Some multimodal checkpoints dynamically invoke torchvision at class-definition
     # time in their HF processors. torchvision's pre-compiled ops (nms and friends)
@@ -37,14 +35,14 @@ dependencies = [
     # torch==2.13.0 above; a mismatched pair fails at operator-registration time,
     # not at install time.
     "torchvision==0.28.0",
-    "torch-tpu==0.1.1.dev20260924085621",
+    "torch-tpu==0.1.1+release.2026.9.22.20261003154636",
     # High-bandwidth PJRT raw-transfer / KV-cache DMA engine backing the
     # raiden KV connector (disaggregated serving) and host KV offload; the
     # import name is `tpu_sync`. The wheel bundles one extension per
     # supported torch ABI and dispatches to the variant matching the
     # installed torch at import time. Published to PyPI as nightly .dev
     # pre-releases, so it needs no registry source below.
-    "tpu-sync-torch==0.0.1.dev20260923040928",
+    "tpu-sync-torch==0.0.1.dev20261012084241",
     # Imported directly by src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py, so
     # declared here rather than leaned on as a vLLM transitive.
     #
@@ -59,34 +57,24 @@ dependencies = [
     # cpu.txt, ...) except tpu.txt, so it's missing
     # when installing vllm as a plain PyPI dependency for our TPU platform.
     "numba==0.65.0",
+    # sentencepiece 0.2.2 wheel is not available in the transient torch-tpu registry
+    "sentencepiece<0.2.2",
     # See the JAX fori-loop lowering monkey-patch in
     # src/vllm_torchtpu/env_override.py; it works around a Pallas remainder-loop
     # bloat this JAX pin regresses on (validated on Qwen3.5-397B DP=8 EP).
-    "jax==0.10.2",
-    "jaxlib==0.10.2",
+    "jax==0.11.2",
+    "jaxlib==0.11.2",
     # tpu-sync-torch requires libtpu>=0.0.47. The workarounds in
     # src/vllm_torchtpu/env_override.py (SC-offload threshold gate) and the
     # per-config LIBTPU_INIT_ARGS additions under
     # scripts/vllm/benchmarking/configs/ were tuned against an earlier libtpu;
     # re-verify those runs when bumping.
-    "libtpu==0.0.47",
+    "libtpu==0.0.50",
     "ray[default]",
     "ray[data]",
 ]
 
 [project.optional-dependencies]
-# Required for running tests
-test = [
-    # tests/kernels/ and tests/layers/ use absl.testing.
-    "absl-py",
-    "pytest",
-    "pytest-mock",
-    "pytest-timeout",
-    "pytest-cov",
-    "parameterized",
-    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@v0.29.0#subdirectory=tests/vllm_test_utils",
-]
-
 # These are required for running any benchmarking
 # See more information at scripts/vllm/benchmarking/README.md
 benchmarking = [
@@ -120,10 +108,37 @@ torchtpu = "vllm_torchtpu.omni:register_omni_tpu_platform"
 [project.entry-points."vllm.general_plugins"]
 torchtpu_layers = "vllm_torchtpu.layers:register_layers"
 
+# Dev / CI / Docker only. These are PEP 735 dependency groups, not extras:
+# groups are never written into the built wheel's metadata, so their git URLs
+# do not block a PyPI upload (PyPI rejects direct-URL requirements, even in
+# extras). Install with `--group <name>` (uv, or pip >= 25.1).
+[dependency-groups]
+# vLLM built from source. Deliberately NOT in `dependencies`: the combined
+# `vllm-torchtpu` wheel already provides vLLM, and installing the real `vllm`
+# on top would overwrite it. Opt in with `pip install -e . --group vllm`.
+vllm = [
+    # Note: we **intentionally** build vllm from source, see README.
+    "vllm @ git+https://github.com/vllm-project/vllm.git@8039d3cbfd55be2aa172d544042c53b4e966369d"
+]
+
+# Required for running tests
+test = [
+    # tests/kernels/ and tests/layers/ use absl.testing.
+    "absl-py",
+    "pytest",
+    "pytest-mock",
+    "pytest-timeout",
+    "pytest-cov",
+    "parameterized",
+    # Not published on PyPI; lives in vLLM's tests/ directory.
+    "vllm_test_utils @ git+https://github.com/vllm-project/vllm.git@8039d3cbfd55be2aa172d544042c53b4e966369d#subdirectory=tests/vllm_test_utils",
+]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+pythonpath = ["."]
 markers = [
-    "cpu_test: tests that run without accelerator hardware",
+    "tpu_test: tests that require TPU hardware; CI runs them on a single-host TPU agent",
     "nightly: tests that only run in the nightly CI workflow",
     "multichip: tests that need more than 2 TPU chips; CI runs them on an 8-chip agent",
     "spawns_tpu_workers: tests that spawn a torch.distributed.run worker group spanning the TPU slice; must run before any in-process TPU test in the same pytest session",
@@ -142,11 +157,12 @@ exclude = ["src/vllm_torchtpu/tools/xplane_pb2.py"]
 
 [tool.ruff.lint]
 # E pycodestyle, F pyflakes, I import sorting, UP outdated syntax, B likely
-# bugs, SIM needless complexity, G logging calls, ISC string concatenation.
+# bugs, SIM needless complexity, G logging calls, ISC string concatenation,
+# T20 print calls, S110 `except: pass`, TID251 banned imports.
 # E501 fails a line longer than 88 characters, the width `ruff format` wraps
 # code at. The formatter does not split comments or strings, so wrap those by
 # hand.
-select = ["E", "F", "I", "UP", "B", "SIM", "G", "ISC"]
+select = ["E", "F", "I", "UP", "B", "SIM", "G", "ISC", "T20", "S110", "TID251"]
 
 ignore = [
     # Off on purpose, matching upstream vllm.
@@ -155,7 +171,22 @@ ignore = [
     "UP032",  # .format() that could be an f-string
 ]
 
+# Banned in src/vllm_torchtpu/kernels/ only; see per-file-ignores below.
+[tool.ruff.lint.flake8-tidy-imports.banned-api]
+"torch".msg = "kernels/ is JAX and Pallas only. Put torch code in a vllm_adapter.py."
+"torch_tpu".msg = "kernels/ is JAX and Pallas only. Use it in a vllm_adapter.py."
+"vllm".msg = "kernels/ does not import vLLM. Pass the values in as arguments."
+
 [tool.ruff.lint.per-file-ignores]
+# Kernels must not import torch, torch_tpu or vLLM directly. Adapter files
+# bridge a kernel to torch. The three files listed after them already import
+# torch or vLLM and have not been split yet.
+"!src/vllm_torchtpu/kernels/**" = ["TID251"]
+"src/vllm_torchtpu/kernels/**/vllm_adapter.py" = ["TID251"]
+"src/vllm_torchtpu/kernels/mla/kv_cache_utils.py" = ["TID251"]
+"src/vllm_torchtpu/kernels/partial_kv_update.py" = ["TID251"]
+"src/vllm_torchtpu/kernels/pool_adapters.py" = ["TID251"]
+
 # Pallas runs a kernel closure the moment it is defined: `pl.when` and
 # `pl.loop` trace the body during the decorator call, inside the iteration
 # that built it. B023 warns that a closure outliving its loop sees the last
@@ -166,6 +197,11 @@ ignore = [
 # tools/check_b023_baseline.py counts the findings per file and fails when a
 # file gains one. Both move together.
 "src/vllm_torchtpu/kernels/**" = ["B023"]
+
+# Library code logs through vllm_torchtpu.logger. Tests, scripts and
+# command-line tools print to the terminal on purpose.
+"!src/**" = ["T20"]
+"src/vllm_torchtpu/tools/merge_xplane.py" = ["T20"]
 
 [tool.ruff.format]
 docstring-code-format = true

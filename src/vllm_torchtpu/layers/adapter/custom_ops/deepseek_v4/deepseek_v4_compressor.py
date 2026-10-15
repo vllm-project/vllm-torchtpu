@@ -35,9 +35,9 @@ from vllm_torchtpu.kernels.deepseek_v4.compress_and_store.compressor_v1 import (
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-    get_vllm_model_wrapper_context,
+    get_pallas_op_mesh,
 )
-from vllm_torchtpu.utils import align_to
+from vllm_torchtpu.utils import align_to, synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
@@ -372,9 +372,16 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         """
         if self._wkv_wgate_transposed:
             return
-        weight = cast(torch.Tensor, self.fused_wkv_wgate.weight).data.t().contiguous()
+        w_t = cast(torch.Tensor, self.fused_wkv_wgate.weight).data.t().contiguous()
+        # torch_tpu can keep `w_t` as a view chain on the old parameter and
+        # re-materialize it at the `pallas.jax_op` boundary every step
+        # (`tt_jit_as_strided`). A fresh buffer + copy_ breaks the chain; same
+        # pattern as `_fresh()` in mla_attention_op.py and the flip in fp8.py.
+        weight = torch.empty(w_t.shape, dtype=w_t.dtype, device=w_t.device).copy_(w_t)
         self.fused_wkv_wgate.weight = torch.nn.Parameter(weight, requires_grad=False)
         self._wkv_wgate_transposed = True
+        if weight.device.type == "tpu":
+            synchronize_tensors([weight])
 
     # head_dim == 512 with overlap: CSA, which splits NoPE and RoPE.
     # head_dim == 512 without:      HCA, whose state lives on a CSA array.
@@ -402,8 +409,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         return op
 
     def _build_compressor_op(self):
-        vllm_context = get_vllm_model_wrapper_context()
-        mesh = vllm_context.mesh
+        mesh = get_pallas_op_mesh()
 
         assert self.head_dim in (512, 128), self.head_dim
         if self._has_rope_cache:
@@ -599,8 +605,8 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         operands = (
             hidden_states,
             self.fused_wkv_wgate.weight,
-            self.ape.clone(),
-            self.norm.weight.clone(),
+            self.ape,
+            self.norm.weight,
             rotary_emb.cos_sin_cache,
             positions,
             state_block_tables,

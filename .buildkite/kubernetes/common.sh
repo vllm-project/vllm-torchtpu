@@ -43,11 +43,33 @@ if [[ -z "${WORKLOAD_IMAGE:-}" ]]; then
 fi
 export WORKLOAD_IMAGE
 
+# The image the Kimi-K3 AgentX pair's engines run (kimi-k3-agentx-1p1d.yaml
+# substitutes it; no pod reads it from here): the step's, else the one the build
+# published from build_k3_engine_image.sh, else the build's own.
+if [[ -z "${K3_ENGINE_IMAGE:-}" ]]; then
+  K3_ENGINE_IMAGE=$(buildkite-agent meta-data get K3_ENGINE_IMAGE --default "" 2>/dev/null || true)
+fi
+export K3_ENGINE_IMAGE="${K3_ENGINE_IMAGE:-$WORKLOAD_IMAGE}"
+
+# Whether that pair's pods get the fleet's caches (kimi-k3-agentx-1p1d.yaml
+# substitutes it; no pod reads it from here): the step's, else `none` for a
+# megakernel point and empty, which keeps them, for anything else. A megakernel
+# boot needs the host memory the gcsfuse file cache would hold; see the
+# manifest. Tested for set rather than empty, so a step can keep the caches by
+# setting it empty.
+if [[ -z "${K3_FLEET_CACHES+set}" ]]; then
+  case "${K3_PD_CONFIG:-}" in
+    kimi-k3-megakernel*/*) K3_FLEET_CACHES=none ;;
+    *) K3_FLEET_CACHES="" ;;
+  esac
+fi
+export K3_FLEET_CACHES
+
 # Anything exported here must also be named in FORWARD below: the launcher
 # forwards only what --env names.
 export FORCE_COLOR="1"
 export TQDM_MININTERVAL="30"
-export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU="0.0.0"
+export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU_CORE="0.0.0"
 export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken"
 export UV_NO_CACHE="1"
 
@@ -63,7 +85,7 @@ export SKIP_SPANNER_UPLOAD="1"
 FORWARD=(
   # cpu on the cpu queue; unset on a TPU host, where JAX finds the chips.
   JAX_PLATFORMS
-  FORCE_COLOR TQDM_MININTERVAL SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU
+  FORCE_COLOR TQDM_MININTERVAL SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU_CORE
   UV_INDEX_TORCH_TPU_REGISTRY_USERNAME UV_NO_CACHE
   CI_RUNNER SKIP_SPANNER_UPLOAD
   BENCHMARK_WARMUP_RUNS RUN_CODE_EVAL RUN_LM_EVAL RUN_TYPE MODEL_PATH MODEL_URI
@@ -83,6 +105,8 @@ FORWARD=(
   USE_MOE_SPARSE_CORE P4D2_BIND_HOST PROXY_PORT
   # Set by bootstrap.sh; benchmark configs branch on it.
   NIGHTLY CREATED_BY
+  # The P/D benchmark loads its results into BigQuery when this is set.
+  BQ_UPLOAD
   # Carries the -m filter into bktec's collection step; see the sharded steps
   # in pipeline_tests_kube.yml.
   PYTEST_ADDOPTS
@@ -94,6 +118,14 @@ FORWARD=(
   MULTIHOST_ARGS_B64
   # Names the directory whose contents the pod uploads as artifacts.
   ARTIFACTS_DIR
+  # The Kimi-K3 AgentX pair's job switches, read by k3_agentx_client_pod.sh:
+  # the eval-only job (the eval step's own env, distinct from the
+  # K3_AGENTX_EVAL_ONLY build trigger), the eval smoke, and skipping the
+  # post-replay eval.
+  AGENTX_EVAL_JOB AGENTX_EVAL_SMOKE AGENTX_SKIP_POST_EVAL
+  # The config both engines of the pair and its client read, when a step serves
+  # another than the manifest's default (a Kimi-K3 megakernel recipe point).
+  K3_PD_CONFIG
 )
 
 # The `tests` plugin mints these on the agent and their two-hour life starts

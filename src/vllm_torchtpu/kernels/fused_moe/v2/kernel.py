@@ -18,6 +18,7 @@ combine reduce-scatter."""
 
 import functools
 import threading
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -54,6 +55,8 @@ AXIS = "d"
 # Columns of the intermediate the requantization does at a time. Chunking
 # it keeps the live bf16 intermediate down; the width is a tuned choice.
 QCHUNK = 512
+# Output columns the four-bit FFN contracts at a time.
+FP4_OUTPUT_CHUNK = 256
 # How many tile heights the FFN body is emitted at, where it is emitted at
 # more than one. A tile runs the smallest rung that covers its live rows, so
 # an expert's short tail tile stops computing a full tile_m of rows nothing
@@ -353,7 +356,8 @@ def expert_ffn_blockscale(
     their own scales, w1s_blocks [nb1, 2*inter] and w2s_blocks [nb2, hidden].
 
     Each contraction block carries its own scale, on blocks already widened
-    to fp8: w1_block(b) and w2_block(b) return weight k-block b in fp8, and
+    to fp8: w1_block(b, n_start, n_end) and w2_block(b, n_start, n_end) return columns
+    [n_start, n_end) of weight k-block b in fp8, and
     the widening is the CALLER's. It has to be, because it is a Mosaic
     bitcast on a VMEM reference, which has no host form and so cannot be
     shared with the eight-bit body the way the rest of this function is.
@@ -363,31 +367,33 @@ def expert_ffn_blockscale(
     """
     n_blocks1, n_blocks2 = w1s_blocks.shape[0], w2s_blocks.shape[0]
     inter = w1s_blocks.shape[-1] // 2
-    acc1 = None
-    for b in range(n_blocks1):
-        part = lax.dot_general(
-            act_q[:, b * qb : (b + 1) * qb],
-            w1_block(b),
-            DN,
-            preferred_element_type=jnp.float32,
-        )
-        part = part * w1s_blocks[b][None, :]
-        acc1 = part if acc1 is None else acc1 + part
+    hidden = w2s_blocks.shape[-1]
+
+    def contract(lhs, rhs_block, scales, n_blocks, n_out):
+        chunks = []
+        for n_start in range(0, n_out, FP4_OUTPUT_CHUNK):
+            n_end = min(n_start + FP4_OUTPUT_CHUNK, n_out)
+            acc = None
+            for b in range(n_blocks):
+                part = lax.dot_general(
+                    lhs[:, b * qb : (b + 1) * qb],
+                    rhs_block(b, n_start, n_end),
+                    DN,
+                    preferred_element_type=jnp.float32,
+                )
+                part = part * scales[b : (b + 1), n_start:n_end]
+                acc = part if acc is None else acc + part
+            assert acc is not None
+            chunks.append(acc)
+        return jnp.concatenate(chunks, axis=-1)
+
+    acc1 = contract(act_q, w1_block, w1s_blocks, n_blocks1, 2 * inter)
     # The block scales are already inside acc1, so the halves this builds
     # are the true activation values and owe no further weight scale.
     mid_q, mid_scale = _intermediate_rows(
         acc1, act_scale, inter, w1s=None, act_fn=act_fn, w1b=w1b
     )
-    acc2 = None
-    for b in range(n_blocks2):
-        part = lax.dot_general(
-            mid_q[:, b * qb : (b + 1) * qb],
-            w2_block(b),
-            DN,
-            preferred_element_type=jnp.float32,
-        )
-        part = part * w2s_blocks[b][None, :]
-        acc2 = part if acc2 is None else acc2 + part
+    acc2 = contract(mid_q, w2_block, w2s_blocks, n_blocks2, hidden)
     return acc2, mid_scale
 
 
@@ -899,9 +905,11 @@ def _build_fused_ep_moe_kernel(
             return _slot_copy(w2_hbm.at[expert], w2_vm, w2_sems, slot)
 
         def w1s_copy(expert, slot):
+            assert w1s_hbm is not None
             return _slot_copy(w1s_hbm.at[expert], w1s_vm, w1s_sems, slot)
 
         def w2s_copy(expert, slot):
+            assert w2s_hbm is not None
             return _slot_copy(w2s_hbm.at[expert], w2s_vm, w2s_sems, slot)
 
         def weight_starts(expert, slot):
@@ -1012,21 +1020,39 @@ def _build_fused_ep_moe_kernel(
             # Each widens one k-block: u32 [qb/8, N] -> fp4 [qb, N] -> fp8.
             packed_rows = rhs_qb // PACK4
 
-            def w1_block(b):
-                if wait_slab is not None:
+            def w1_block(b, n_start, n_end):
+                # N.B. b is the contraction-block index.
+                if wait_slab is not None and n_start == 0:
                     wait_slab(w1_copy, b)
                 block = pltpu.bitcast(
-                    w1_vm[slot, pl.ds(b * packed_rows, packed_rows), :], FP4
+                    w1_vm[
+                        slot,
+                        pl.ds(b * packed_rows, packed_rows),
+                        pl.ds(n_start, n_end - n_start),
+                    ],
+                    FP4,
                 ).astype(FP8)
-                if slab_retired is not None and b == hidden // rhs_qb - 1:
+                # slab_retired starts the next expert's gate/up DMA into the
+                # same VMEM slot. That is only safe after the last read of
+                # the current slab.
+                if (
+                    slab_retired is not None
+                    and b == hidden // rhs_qb - 1
+                    and n_end == 2 * inter
+                ):
                     slab_retired()
                 return block
 
-            def w2_block(b):
-                if wait_slab is not None:
+            def w2_block(b, n_start, n_end):
+                if wait_slab is not None and n_start == 0:
                     wait_slab(w2_copy, b)
                 return pltpu.bitcast(
-                    w2_vm[slot, pl.ds(b * packed_rows, packed_rows), :], FP4
+                    w2_vm[
+                        slot,
+                        pl.ds(b * packed_rows, packed_rows),
+                        pl.ds(n_start, n_end - n_start),
+                    ],
+                    FP4,
                 ).astype(FP8)
 
             return w1_block, w2_block
@@ -1133,6 +1159,7 @@ def _build_fused_ep_moe_kernel(
                 # ls rides along on the same sem. The slab is the dense
                 # lane-block view of one f32 per row, so a tile's window is
                 # the sublanes its rows fall in, not a row range.
+                assert ls_hbm is not None and ls_vm is not None
                 pltpu.make_async_copy(
                     ls_hbm.at[pl.ds(row_base // HIDDEN_LANE_BLOCK, ls_window_rows)],
                     ls_vm.at[slot],
@@ -1149,6 +1176,7 @@ def _build_fused_ep_moe_kernel(
                 lhs_sems.at[slot],
             ).wait()
             if has_act_scale:
+                assert ls_vm is not None
                 pltpu.make_async_copy(
                     ls_vm.at[slot], ls_vm.at[slot], lhs_sems.at[slot]
                 ).wait()
@@ -1182,6 +1210,7 @@ def _build_fused_ep_moe_kernel(
 
         def wait_commits(parity, live_blocks):
             """Wait one tile's commits on `parity`: data rows, then scales."""
+            assert commit_sems is not None and commit_scl_sems is not None
             _rows_wait(commit_sems.at[parity], contrib_hbm, live_blocks * ROWBLK)
             # One tile committed one mirror sublane, whatever its row count.
             _rows_wait(commit_scl_sems.at[parity], cscl_hbm, 1)
@@ -1293,6 +1322,7 @@ def _build_fused_ep_moe_kernel(
 
             def commit_tile(parity, t, tile_block_base, live_blocks):
                 """Commit the tile's intersection with each (expert, dest) run."""
+                assert commit_sems is not None and commit_scl_sems is not None
                 # The runs tile the expert slab contiguously, so the
                 # per-dest lengths sum to exactly live_blocks. Rows go per
                 # run; the scales go once, below, because a tile's are one
@@ -1517,15 +1547,18 @@ def _build_fused_ep_moe_kernel(
                         lhs_vm[parity] if full else lhs_vm[parity, pl.ds(0, height)]
                     ).reshape(height, hidden)
                     act_scales = (
-                        _tile_row_scales(ls_vm[parity], row_base, height)
+                        _tile_row_scales(cast(jax.Ref, ls_vm)[parity], row_base, height)
                         if has_act_scale
                         else None
                     )
-                    w1b_row = w1b_vm[pl.ds(e, 1), :] if has_w1_bias else None
+                    w1b_row = (
+                        cast(jax.Ref, w1b_vm)[pl.ds(e, 1), :] if has_w1_bias else None
+                    )
                     if rhs_packed4:
                         # The block scales apply inside
                         # expert_ffn_blockscale, so the epilogues below must
                         # not apply w2s again.
+                        assert w1s_vm is not None and w2s_vm is not None
                         w1s_blocks = w1s_vm[slot]  # [nb1, 2*inter] f32
                         w2s_blocks = w2s_vm[slot]  # [nb2, hidden] f32
                         first_tile, last_tile = t == 0, t == n_tiles - 1
@@ -1554,6 +1587,7 @@ def _build_fused_ep_moe_kernel(
                             w1b=w1b_row,
                         )
                     elif weight_format == host.WeightFormat.INT8:
+                        assert w1s_vm is not None
                         w1_chunk, w2_chunk = _int8_chunk_readers(slot)
                         acc2, mid_scale = expert_ffn_int8(
                             act_rows,
@@ -1574,6 +1608,7 @@ def _build_fused_ep_moe_kernel(
                             w1b=w1b_row,
                         )
                     else:
+                        assert w1s_vm is not None
                         acc2, mid_scale = expert_ffn_fp8(
                             act_rows,
                             act_scales,
@@ -1596,11 +1631,15 @@ def _build_fused_ep_moe_kernel(
                         acc2,
                         mid_scale,
                         w2s=(
-                            w2s_vm[pl.ds(slot, 1), :]
+                            cast(jax.Ref, w2s_vm)[pl.ds(slot, 1), :]
                             if (has_scales and not rhs_packed4)
                             else None
                         ),
-                        w2b=w2b_vm[pl.ds(e, 1), :] if has_w2_bias else None,
+                        w2b=(
+                            cast(jax.Ref, w2b_vm)[pl.ds(e, 1), :]
+                            if has_w2_bias
+                            else None
+                        ),
                         wire_dtype=form.wire_dtype,
                         tile_m=height,
                     )
@@ -2224,7 +2263,7 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
                     * coef_sm[(base + i) * topk + k]
                 )
                 acc = term if acc is None else acc + term
-            tile_vm[i] = acc.astype(out_dtype)
+            tile_vm[i] = cast(jax.Array, acc).astype(out_dtype)
 
         def one_step(step, parity):
             # The step's rows were started a step ago; the next step's are

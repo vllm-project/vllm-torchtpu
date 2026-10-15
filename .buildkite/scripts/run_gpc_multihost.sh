@@ -195,7 +195,7 @@ ssh_retry "${SSH_USER}@${WORKER_IP}" \
      -e GPC_ROLE=worker \
      -e GPC_HEAD_IP='${HEAD_INTERNAL_IP}' \
      -e GPC_MY_IP='${WORKER_IP}' \
-     -w /root/torchtpu-vllm \
+     -w /workspace/vllm-torchtpu \
      '${IMAGE_TAG}' \
      bash scripts/vllm/integration/run_qwen35_gpc_correctness.sh"
 
@@ -210,7 +210,7 @@ docker run -d --name gpc-head --privileged --net=host --shm-size=64g \
   -e GPC_HEAD_IP="${HEAD_INTERNAL_IP}" \
   -e GPC_MY_IP="${HEAD_INTERNAL_IP}" \
   -e GPC_PEER_IP="${WORKER_IP}" \
-  -w /root/torchtpu-vllm \
+  -w /workspace/vllm-torchtpu \
   "${IMAGE_TAG}" \
   bash -c 'umask 000; bash scripts/vllm/integration/run_qwen35_gpc_correctness.sh'
 docker logs -f gpc-head &

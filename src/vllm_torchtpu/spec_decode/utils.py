@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import contextlib
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
@@ -95,6 +108,38 @@ def _force_draft_tp1():
     finally:
         tp.world_size = saved_ws
         tp.rank_in_group = saved_rank
+
+
+def handoff_seed_tokens(
+    device_seed: torch.Tensor, req_ids: list[str], metadata: Any
+) -> torch.Tensor:
+    """Seeds a prefill-only draft's boundary row with the consumer's token.
+
+    A Stage-3 producer drops the last prompt token for the decode peer to
+    compute and samples a throwaway token in its place. The draft layer's KV
+    row at the prompt boundary has to be built from the real continuation,
+    which the send published in this step carries as
+    ``SendMeta.next_prompt_token_id``. Requests without such a send keep the
+    sampled seed.
+    """
+    reqs_to_send = getattr(metadata, "reqs_to_send", None)
+    if not reqs_to_send:
+        return device_seed
+    indices: list[int] = []
+    tokens: list[int] = []
+    for index, req_id in enumerate(req_ids):
+        send = reqs_to_send.get(req_id)
+        token = None if send is None else getattr(send, "next_prompt_token_id", None)
+        if token is not None:
+            indices.append(index)
+            tokens.append(int(token))
+    if not indices:
+        return device_seed
+    seed = device_seed.clone()
+    seed[torch.tensor(indices, dtype=torch.long, device=seed.device)] = torch.tensor(
+        tokens, dtype=seed.dtype, device=seed.device
+    )
+    return seed
 
 
 def gather_sharded_weight(

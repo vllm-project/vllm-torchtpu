@@ -255,7 +255,7 @@ def validate_inputs(
     x: jax.Array,
     w_q: jax.Array,
     w_scale: jax.Array,
-    x_abs_max: jax.Array,
+    x_abs_max: jax.Array | None,
     batch_block_size: int,
     out_block_size: int,
     in_block_size: int,

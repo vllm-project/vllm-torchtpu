@@ -1,0 +1,288 @@
+#!/usr/bin/env bash
+# Shared helpers for the InferenceX benchmark scripts:
+#   agentx_sweep.sh          boots a server, then calls agentx_client.sh (boot,
+#                            config.json, cleanup, log dump, GCS)
+#   agentx_client.sh         benchmarks a server it did not boot (server URL,
+#                            liveness, drain, engine counters, GCS, checkout)
+#   agentx_eval_client.sh    InferenceX's quality evals against a server it did
+#                            not boot (server URL, liveness, GCS, checkout)
+#   kimi-k3/eval_conc_sweep.sh  boots a server, then runs lm_eval (all of it)
+# Source it after setting:
+#   IX_SWEEP_TAG   log tag, e.g. "k3-eval-sweep"
+#   RESULTS_DIR    where the harness and these scripts write results
+#   PORT           the vLLM server port - only needed when IX_SERVER_URL is
+#                  unset, since that is the fallback ix_server_url resolves to
+# Everything here talks to the server named by ix_server_url: the one the
+# caller booted with run_benchmarks.sh --keep-alive, or one on another host.
+
+log() { echo "[${IX_SWEEP_TAG:-k3-sweep}] $*"; }
+
+# ix_check_conc_list "1,2,4" -> fails with a clear message on a non-integer.
+ix_check_conc_list() {
+    local c
+    IFS=',' read -r -a _concs <<< "$1"
+    for c in "${_concs[@]}"; do
+        [[ "$c" =~ ^[1-9][0-9]*$ ]] || { log "ERROR: bad concurrency '$c' in '$1' (positive integers, comma separated)"; return 1; }
+    done
+}
+
+# ix_set_gcs_root gs://bucket/prefix -> GCS_ROOT=gs://bucket/prefix/<build number>,
+# or GCS_ROOT="" (no upload) when the argument is empty.
+ix_set_gcs_root() {
+    GCS_ROOT=""
+    [ -n "${1:-}" ] || return 0
+    # Said once, here: without gsutil every save_now is a silent no-op, so
+    # --gcs-root would look honoured for the whole run and upload nothing.
+    if ! command -v gsutil >/dev/null 2>&1; then
+        log "WARNING: --gcs-root $1 was given but gsutil is not on PATH; nothing will be uploaded"
+        return 0
+    fi
+    GCS_ROOT="${1%/}/${BUILDKITE_BUILD_NUMBER:-local}"
+}
+
+# save_now <path>... : copy each path to $GCS_ROOT/<results dir name>/ right
+# away. A cancelled build never runs the exit trap, so every point is saved as
+# soon as it is written, not only at exit. No-op without GCS_ROOT or gsutil.
+save_now() {
+    [ -n "${GCS_ROOT:-}" ] && command -v gsutil >/dev/null 2>&1 || return 0
+    local x
+    for x in "$@"; do
+        [ -e "$x" ] || continue
+        gsutil -q -m cp -r "$x" "$GCS_ROOT/$(basename "$RESULTS_DIR")/" 2>&1 | tail -2 \
+            || log "WARNING: upload of $x to $GCS_ROOT failed"
+    done
+}
+
+# ix_server_url: the base URL of the vLLM server to send requests to. Empty or
+# unset IX_SERVER_URL means agentx_sweep.sh or eval_conc_sweep.sh started that
+# server in this same container, so it is at 127.0.0.1:$PORT. A caller whose
+# server runs on another host - a kube P/D JobSet, where the engines are on TPU
+# pods and the client is on a CPU pod - sets IX_SERVER_URL to its URL. Resolved
+# per call, so neither PORT nor IX_SERVER_URL has to be set before this file is
+# sourced.
+ix_server_url() { echo "${IX_SERVER_URL:-http://127.0.0.1:$PORT}"; }
+
+# ix_engine_url: where /metrics lives. Usually the same server, but a P/D pair is
+# driven through a proxy that has no /metrics of its own - the queue depth and the
+# preemption counters belong to one engine, not to a pair - so a caller in that
+# shape points this at the engine whose queue it wants to watch, the decode one.
+ix_engine_url() { echo "${IX_ENGINE_URL:-$(ix_server_url)}"; }
+
+# --max-time on every poll: an engine that is wedged but still listening would
+# otherwise block the caller forever, and wait_server_idle only checks its
+# deadline between polls, so its timeout would never fire.
+server_alive() { curl -sf --max-time 10 "$(ix_server_url)/v1/models" >/dev/null; }
+
+# Number of requests the engine holds (running + waiting), from /metrics.
+# The anchor stops vllm:num_requests_waiting_by_reason{...} from matching too.
+# Returns non-zero when /metrics could not be read, so a caller can tell
+# "unreachable" from "drained" instead of reading both as 0.
+ix_engine_queue_depth() {
+    local body
+    body=$(curl -s --max-time 30 "$(ix_engine_url)/metrics") || return 1
+    [ -n "$body" ] || return 1
+    printf '%s' "$body" \
+        | awk '/^vllm:num_requests_(running|waiting)( |\{)/{s+=$NF} END{print s+0}'
+}
+
+# Cumulative engine counters from /metrics that explain a bad point:
+# preemptions (a preempted request is re-prefilled from its KV state) and
+# finished requests. Printed as "preemptions=N finished=M".
+ix_engine_counters() {
+    curl -s --max-time 30 "$(ix_engine_url)/metrics" | awk '
+        /^vllm:num_preemptions_total( |\{)/ {p+=$NF}
+        /^vllm:request_success_total( |\{)/ {f+=$NF}
+        END {printf "preemptions=%d finished=%d\n", p, f}'
+}
+
+# wait_server_idle [timeout_s]: return when running+waiting has been 0 on 3
+# polls 10 s apart, so the next point starts on a drained engine.
+# shellcheck disable=SC2120  # the timeout argument is optional
+wait_server_idle() {
+    local timeout="${1:-1800}" t0 idle=0 n
+    t0=$(date +%s)
+    while [ $(( $(date +%s) - t0 )) -lt "$timeout" ]; do
+        if ! n=$(ix_engine_queue_depth); then
+            log "WARNING: /metrics unreachable while draining"
+            idle=0; sleep 10; continue
+        fi
+        if [ "${n%.*}" = "0" ]; then
+            idle=$((idle + 1)); [ "$idle" -ge 3 ] && return 0
+        else
+            idle=0; log "drain: running+waiting=$n"
+        fi
+        sleep 10
+    done
+    log "WARNING: engine did not drain within ${timeout}s (running+waiting=$n)"
+    return 1
+}
+
+# ix_check_disk [min_free_gb] : fail before the 30-min boot when the results
+# mount or the container root has less than min_free_gb free. The boot itself
+# writes tens of GB (compile caches, Ray logs), so the floor is 50 GB: a pod
+# that passed a 10 GB check still died with "No space left on device" mid-boot.
+ix_check_disk() {
+    local min_gb="${1:-50}" d free ok=0
+    for d in "$RESULTS_DIR" /tmp /; do
+        [ -d "$d" ] || continue
+        free=$(df -BG --output=avail "$d" 2>/dev/null | tail -1 | tr -dc '0-9')
+        [ -n "$free" ] || continue
+        log "disk: ${free} GB free on $d"
+        if [ "$free" -lt "$min_gb" ]; then
+            log "FATAL: only ${free} GB free on $d (need ${min_gb} GB); the pod's disk needs cleaning (docker image prune, old results) before this sweep can run"
+            df -h "$d" 2>/dev/null || true
+            ok=1
+        fi
+    done
+    return $ok
+}
+
+# ix_boot_server <config> : cleanup, then run_benchmarks.sh --keep-alive
+# (boots the server, runs the config's bench as a smoke test, leaves the server
+# up). Returns 1 with a FATAL line when the boot or the smoke bench fails.
+ix_boot_server() {
+    local config="$1" t0 rc
+    ix_check_disk 50 || return 1
+    bash "$IX_BENCHMARKING_DIR/cleanup_server.sh"
+    t0=$(date +%s)
+    "$IX_BENCHMARKING_DIR/run_benchmarks.sh" --config "$config" --results-dir "$RESULTS_DIR" --keep-alive --port "$PORT"
+    rc=$?
+    if [ "$rc" -ne 0 ]; then
+        log "FATAL: run_benchmarks.sh --config $config failed (rc=$rc): server boot or smoke bench failed; see server.log context below"
+        return 1
+    fi
+    if ! server_alive; then
+        log "FATAL: server not answering on port $PORT after run_benchmarks.sh returned 0"
+        return 1
+    fi
+    log "server up after $(( $(date +%s) - t0 )) s (incl. the config's smoke bench)"
+}
+
+# ix_config_json_get <key> : a value from the harness's $RESULTS_DIR/config.json.
+ix_config_json_get() {
+    python3 -c 'import json, sys; v = json.load(open(sys.argv[1])).get(sys.argv[2]); print("" if v is None else v)' \
+        "$RESULTS_DIR/config.json" "$1"
+}
+
+# ix_dump_server_log_context : error context + tail of server.log, for the
+# exit trap, so a failed boot can be diagnosed from the job log alone.
+ix_dump_server_log_context() {
+    [ -f "$RESULTS_DIR/server.log" ] || return 0
+    log "===== server.log: error context ====="
+    tr '\r' '\n' < "$RESULTS_DIR/server.log" | grep -v '^\s*$' \
+        | grep -v -E 'ActorHandle|ray_executor_v2.py|Failed to kill|client_mode_hook|auto_init_hook|_raylet|ray/_private' \
+        | grep -n -E -B3 -A25 'Traceback|Error|Exception|NotImplemented|Killed|OOM|halt' | tail -150 | cut -c1-400
+    log "===== server.log: last 40 non-blank lines ====="
+    tr '\r' '\n' < "$RESULTS_DIR/server.log" | grep -v '^\s*$' | tail -40 | cut -c1-300
+}
+
+# Pinned, not main, and shared by both clients so a perf row and its quality
+# evals come from one InferenceX. InferenceX refactors its benchmark harness
+# under us: in one week it moved its tree into inferencex-e2e/, added ten env
+# vars that build_replay_cmd validates, and then replaced benchmark_lib.sh -
+# which agentx_client.sh sources - with the infx.bench package (#3610). A
+# nightly that tracks main races those. This is the last ref the lane ran clean
+# on (build 65: both ladder points, ok=19 err=0, isl p50 337k). Bump it
+# deliberately, with a run to show the new ref works; --ix-ref overrides for a
+# one-off.
+# shellcheck disable=SC2034  # read by the scripts that source this
+IX_DEFAULT_REF="8ba71d026e866e7792074a3fd3f896fe6d1ad099"
+IX_URL=https://github.com/SemiAnalysisAI/InferenceX
+
+# ix_export_topology <tp> <dp> <ep> <disagg 0|1>: the deployment's shape in the
+# names InferenceX reads for a multi-node row and its evals
+# (infx/results/agentic/__init__.py _gpu_shape; benchmark_lib.sh
+# bridge_disagg_eval_metadata): per role, TP, EP, DP attention and the worker
+# count. vLLM's DP is InferenceX's workers with dp-attn, as its H200 entry for
+# this shape encodes it (configs/nvidia-master.yaml,
+# kimik3-fp4-h200-vllm-agentic-balanced: tp 8, ep 32, dp-attn true,
+# num-worker 4). A disaggregated pair states both roles with the one shape both
+# serve; an aggregate server is the prefill role with no decode workers, which
+# is how _gpu_shape reads an aggregate multi-node worker. The caller exports
+# this once, before either client, so the row and its evals carry one identity;
+# the clients refuse to run without it (ix_require_topology).
+#
+# InferenceX's num_gpus from these is ranks (workers x TP), not the chips a v7x
+# pod holds; tokens per dollar divides by --chips instead (sweep_summary.py).
+ix_export_topology() {
+    local tp="$1" dp="$2" ep="$3" disagg="$4" dp_attn=false
+    [ "$dp" -le 1 ] || dp_attn=true
+    export IS_MULTINODE=true
+    export PREFILL_TP="$tp" PREFILL_EP="$ep" PREFILL_DP_ATTN="$dp_attn" PREFILL_NUM_WORKERS="$dp"
+    export PREFILL_PP_SIZE=1 PREFILL_DCP_SIZE=1 PREFILL_PCP_SIZE=1
+    export DECODE_PP_SIZE=1 DECODE_DCP_SIZE=1 DECODE_PCP_SIZE=1
+    if [ "$disagg" = 1 ]; then
+        export DISAGG=true
+        export DECODE_TP="$tp" DECODE_EP="$ep" DECODE_DP_ATTN="$dp_attn" DECODE_NUM_WORKERS="$dp"
+    else
+        export DISAGG=false
+        export DECODE_TP=0 DECODE_EP=0 DECODE_DP_ATTN=false DECODE_NUM_WORKERS=0
+    fi
+}
+
+# ix_require_topology: fails unless ix_export_topology ran in this environment.
+ix_require_topology() {
+    local v
+    for v in IS_MULTINODE DISAGG PREFILL_TP PREFILL_EP PREFILL_DP_ATTN PREFILL_NUM_WORKERS              DECODE_TP DECODE_EP DECODE_DP_ATTN DECODE_NUM_WORKERS; do
+        [ -n "${!v:-}" ] || {
+            log "FATAL: $v is unset; the caller states the deployment's shape with"                 "ix_export_topology before running a client (sweep_lib.sh)"
+            return 2
+        }
+    done
+}
+
+# ix_layout_root <dir>: the directory inside the checkout that holds
+# benchmarks/, utils/ and the evals, or nothing when the checkout is unusable.
+# InferenceX moved that tree down into inferencex-e2e/ (the root now also holds
+# collectivex/, operatorx/ and power_model/), and --ix-ref can still pin a
+# commit from before the move, so this is probed rather than hardcoded.
+ix_layout_root() {
+    local d
+    for d in "$1/inferencex-e2e" "$1"; do
+        [ -d "$d/utils/aiperf/src" ] && { echo "$d"; return 0; }
+    done
+    return 1
+}
+
+# ix_checkout <dir> <ref> : InferenceX at <ref> in <dir>, reused when already
+# there, then IX_ROOT (the tree) and IX_EVALS (its evals directory, empty when
+# it has none). Returns non-zero with a FATAL line when it cannot be had.
+# shellcheck disable=SC2034  # IX_ROOT and IX_EVALS are for the caller
+ix_checkout() {
+    local dir="$1" ref="$2" d
+    if ! ix_layout_root "$dir" >/dev/null; then
+        rm -rf "$dir"
+        if [[ "$ref" =~ ^[0-9a-f]{7,39}$ ]]; then
+            log "FATAL: --ix-ref '$ref' looks like an abbreviated commit, which cannot" \
+                "be fetched - git answers \"couldn't find remote ref\". Use the full 40" \
+                "characters."
+            return 2
+        fi
+        if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+            # A commit cannot be cloned with --branch: fetch just that commit.
+            if ! { git init -q "$dir" \
+                    && git -C "$dir" fetch -q --depth 1 "$IX_URL" "$ref" \
+                    && git -C "$dir" checkout -q FETCH_HEAD \
+                    && git -C "$dir" submodule update -q --init --depth 1 --recursive; }; then
+                log "FATAL: cannot fetch InferenceX commit $ref from $IX_URL"; return 1
+            fi
+        else
+            git clone -q --depth 1 --branch "$ref" --recurse-submodules --shallow-submodules "$IX_URL" "$dir" \
+                || { log "FATAL: cannot clone InferenceX branch/tag $ref from $IX_URL"; return 1; }
+        fi
+    fi
+    IX_ROOT=$(ix_layout_root "$dir") || {
+        log "FATAL: $dir has no utils/aiperf/src under its root or inferencex-e2e/"; return 1
+    }
+    # The eval task files and their lm-eval patch moved from utils/evals to
+    # infx/evals in the same reorganisation.
+    IX_EVALS=""
+    for d in "$IX_ROOT/infx/evals" "$IX_ROOT/utils/evals"; do
+        [ -d "$d" ] && { IX_EVALS="$d"; break; }
+    done
+}
+
+# run_benchmarks.sh, cleanup_server.sh and configs/ are shared with every other
+# model's benchmarks and stay in scripts/vllm/benchmarking/; these scripts live
+# one directory deeper, under benchmark/inferencex/.
+IX_BENCHMARKING_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../benchmarking" && pwd)"

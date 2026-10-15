@@ -15,7 +15,7 @@ from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
@@ -171,8 +171,8 @@ async def _post_with_retries(
 
 
 def _render_endpoint_for_api(api: str) -> str | None:
-    if api == "/v1/completions":
-        return "/v1/completions/render"
+    # Upstream vLLM does not expose a /render endpoint; tokenization occurs
+    # directly within the prefill engine.
     return None
 
 
@@ -583,7 +583,16 @@ async def _handle_completions(api: str, request: Request):
                     first = False
                 yield chunk
 
-        return StreamingResponse(generate_stream(), media_type="application/json")
+        # text/event-stream when the caller asked for a stream, which is what
+        # the decode instance is actually sending back. Declared as
+        # application/json, a client parses each SSE frame - "data: {...}" prefix
+        # and all - as one JSON document, and every request fails; aiperf's
+        # agentic replay does exactly that, while the non-streaming callers this
+        # proxy had until now (check_completions.py, lm_eval) never noticed.
+        media_type = (
+            "text/event-stream" if req_data.get("stream") else "application/json"
+        )
+        return StreamingResponse(generate_stream(), media_type=media_type)
 
     except Exception as e:
         import sys
@@ -604,6 +613,20 @@ async def handle_completions(request: Request):
 @app.post("/v1/chat/completions")
 async def handle_chat_completions(request: Request):
     return await _handle_completions("/v1/chat/completions", request)
+
+
+@app.get("/v1/models")
+async def models():
+    """The decode instance's model list, which is the pair's.
+
+    Part of the OpenAI surface this proxy presents: a client resolves the served
+    model name here, and the ModelCard's max_model_len is how a benchmark client
+    learns the window it is replaying against. Both instances serve the same
+    model; decode is the one that finishes a request.
+    """
+    client = app.state.decode_clients[0]["client"]
+    response = await client.get("/v1/models")
+    return JSONResponse(status_code=response.status_code, content=response.json())
 
 
 @app.get("/healthcheck")

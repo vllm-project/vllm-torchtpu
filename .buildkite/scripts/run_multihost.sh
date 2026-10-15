@@ -203,7 +203,7 @@ CONTAINER_ENV_COMMON=(
   -e BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-}"
   -e FORCE_COLOR="1"
   -e TQDM_MININTERVAL="30"
-  -e SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU="0.0.0"
+  -e SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU_CORE="0.0.0"
   ${USE_MOE_SPARSE_CORE:+-e USE_MOE_SPARSE_CORE="${USE_MOE_SPARSE_CORE}"}
   ${CAPTURE_PROFILE:+-e CAPTURE_PROFILE="${CAPTURE_PROFILE}"}
   # RAY_TMPDIR keeps Ray on /tmp; following TMPDIR breaks log collection.
@@ -268,6 +268,11 @@ if [ "${EXIT_CODE}" -ne 0 ] && [ -n "${MULTIHOST_RUN_LOG:-}" ] && [ -s "${MULTIH
   fi
   echo "Last 40 lines of head-container output:"
   tail -n 40 "${MULTIHOST_RUN_LOG}"
+
+  python3 "${SCRIPT_DIR}/record_ci_failure.py" \
+    --log-file "${MULTIHOST_RUN_LOG}" \
+    --exit-code "${EXIT_CODE}" \
+    --step-label "${BUILDKITE_LABEL:-}" || true
 fi
 if [[ "${MULTIHOST_RUN_LOG:-}" == /tmp/* ]]; then
   rm -f "${MULTIHOST_RUN_LOG}"

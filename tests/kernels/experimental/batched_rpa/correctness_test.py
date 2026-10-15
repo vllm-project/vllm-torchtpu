@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Correctness tests for batched ragged paged attention."""
 
 from typing import Any
@@ -5,6 +18,7 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import absltest, parameterized
 from jax._src import dtypes
 from jax._src import test_util as jtu
@@ -15,6 +29,8 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import (
     utils,
     wrapper,
 )
+
+pytestmark = pytest.mark.tpu_test
 
 jax.config.parse_flags_with_absl()
 
@@ -206,6 +222,7 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         distribution: jax.Array | None = None,
     ):
         if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
+            # Tokens live on the lane dim, so page_size must be a multiple of 128.
             page_size = utils.align_to(page_size, 128)
         bkv_sz = utils.align_to(bkv_sz, page_size)
 
@@ -359,10 +376,8 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         )
 
         rpa_bkv_sz = bkv_sz
-        rpa_n_buffer = 3
         rpa_batch_size = 2
         if kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-            rpa_n_buffer = 2
             rpa_batch_size = 1
 
         decode_block_sizes = configs.BlockSizes(
@@ -370,14 +385,12 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             bq_c_sz=bq_csz,
             bkv_sz=rpa_bkv_sz,
             batch_size=rpa_batch_size,
-            n_buffer=rpa_n_buffer,
         )
         prefill_block_sizes = configs.BlockSizes(
             bq_sz=bq_sz,
             bq_c_sz=bq_csz,
             bkv_sz=rpa_bkv_sz,
             batch_size=rpa_batch_size,
-            n_buffer=rpa_n_buffer,
         )
 
         output, updated_kv_cache = wrapper.ragged_paged_attention(
@@ -456,6 +469,29 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             bkv_sz=bkv_sz,
             bq_csz=bq_csz,
             kv_layout=kv_layout,
+        )
+
+    @parameterized.product(
+        page_size=[128, 256, 512],
+        bq_sz=[1, 64],
+    )
+    def test_ragged_paged_attention_seq_along_lane_page_size(self, page_size, bq_sz):
+        # page_size > 128 only matters for SEQ_ALONG_LANE, where tokens are packed
+        # along the lane dim. bq_sz=1 takes the decode stitch path, bq_sz=64 the
+        # prefill roll path. kv_lens are deliberately not multiples of 128.
+        q_len = 1 if bq_sz == 1 else 5
+        seq_lens = [(q_len, n) for n in (18, 129, 597, 1107, 31, 1328)]
+        self._test_ragged_paged_attention(
+            seq_lens,
+            (32, 8),
+            128,
+            page_size,
+            jnp.bfloat16,
+            jnp.bfloat16,
+            1000,
+            bq_sz=bq_sz,
+            bq_csz=bq_sz,
+            kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
         )
 
     @parameterized.product(

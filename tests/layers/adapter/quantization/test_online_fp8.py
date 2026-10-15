@@ -43,6 +43,15 @@ def tensor_parallel_group(monkeypatch):
 
     group = SimpleNamespace(rank_in_group=0, world_size=1)
     monkeypatch.setattr(parallel_state, "_TP", group)
+    monkeypatch.setattr(parallel_state, "get_tp_group", lambda: group)
+    monkeypatch.setattr(
+        parallel_state, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(parallel_state, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        "vllm.distributed.get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr("vllm.distributed.get_tensor_model_parallel_rank", lambda: 0)
     return group
 
 
@@ -431,6 +440,7 @@ def test_block_must_divide_local_shard():
         layer.quant_method.process_weights_after_loading(layer)
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("block", [[1, 128], [128, 128], [128, 512]])
 def test_online_block_matmul_tpu(block):
     import jax

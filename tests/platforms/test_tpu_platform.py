@@ -33,6 +33,7 @@ from vllm.config.compilation import DynamicShapesType
 from vllm.model_executor.layers.attention import Attention
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine.core import EngineCoreProc
+from vllm.v1.engine.input_processor import InputProcessor
 
 import vllm_torchtpu as plugin
 import vllm_torchtpu.platforms.tpu_platform as tpu_platform
@@ -46,6 +47,53 @@ from vllm_torchtpu.platforms.tpu_platform import (
     _validate_phased_profiling_config,
     get_tpu_multihost_topology,
 )
+
+
+@pytest.mark.parametrize(
+    "hybrid,unified,resumable,blocked",
+    [
+        (True, False, True, True),
+        (True, False, False, False),
+        (True, True, True, False),
+        (False, False, True, False),
+    ],
+)
+@pytest.mark.parametrize("positional", [False, True])
+@pytest.mark.parametrize("connector", [None, "DecodeBenchConnector", "RaidenConnector"])
+def test_compact_mamba_rejects_resumable_input_before_admission(
+    monkeypatch, hybrid, unified, resumable, blocked, positional, connector
+):
+    calls = []
+
+    def process_inputs(self, request_id, resumable=False):
+        calls.append(request_id)
+        return request_id
+
+    monkeypatch.setattr(InputProcessor, "process_inputs", process_inputs)
+    monkeypatch.setattr(
+        "vllm_torchtpu.platforms.tpu_block_size_utils.unified_kv_layout_enabled",
+        lambda config: unified,
+    )
+    plugin._patch_vllm_compact_mamba_streaming_input()
+    wrapped = InputProcessor.process_inputs
+    plugin._patch_vllm_compact_mamba_streaming_input()
+    assert InputProcessor.process_inputs is wrapped
+    processor = object.__new__(InputProcessor)
+    processor.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(is_hybrid=hybrid),
+        kv_transfer_config=(
+            SimpleNamespace(kv_connector=connector) if connector is not None else None
+        ),
+    )
+    args = ("request", resumable) if positional else ("request",)
+    kwargs = {} if positional else {"resumable": resumable}
+    if blocked and connector != "RaidenConnector":
+        with pytest.raises(ValueError, match="resumable.*compact Mamba"):
+            processor.process_inputs(*args, **kwargs)
+        assert calls == []
+    else:
+        assert processor.process_inputs(*args, **kwargs) == "request"
+        assert calls == ["request"]
 
 
 def test_grouped_topk_dynamic_compile_wrapper_is_unwrapped(monkeypatch):
@@ -80,8 +128,12 @@ def test_scheduler_mamba_split_accepts_external_kv_tokens():
         cache_config=SimpleNamespace(block_size=16),
         block_size=16,
         use_eagle=False,
+        use_eagle_block_drop=False,
         mamba_partial_cache_hit=False,
         mamba_has_prefill_checkpoint_blocks=False,
+        mamba_shared_prefix_checkpoint=False,
+        max_num_scheduled_tokens=16384,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         hash_block_size=16,
     )
     request = SimpleNamespace(
@@ -535,6 +587,64 @@ class TestTpuPlatform:
         )
 
     @pytest.mark.parametrize(
+        ("linear", "max_model_len", "added"),
+        [
+            (False, 32768, []),
+            # budget/32 = 64 rows would be 23 buckets above budget/4; the
+            # step widens to 4 * 64 to stay within seven.
+            (True, 32768, [768, 1280, 1536, 1792]),
+            # Up to the longest prompt pass, 1000 + 8 rounded up to 1024:
+            # eight 64-row buckets, so 128 rows.
+            (True, 1000, [640, 768, 896]),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_linear_token_buckets(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        monkeypatch,
+        linear,
+        max_model_len,
+        added,
+    ):
+        monkeypatch.setenv("TPU_TOKEN_BUCKET_LINEAR", "1" if linear else "0")
+        vllm_config.compilation_config.compile_sizes = None
+        vllm_config.model_config.max_model_len = max_model_len
+        vllm_config.scheduler_config.max_num_seqs = 8
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        ladder = [16, 32, 64, 128, 256, 512, 1024, 2048]
+        assert vllm_config.compilation_config.compile_sizes == sorted(ladder + added)
+
+    def test_linear_token_step_at_the_served_budget(self):
+        paddings = tpu_platform._get_linear_token_paddings(16384, 262144 + 8)
+
+        assert paddings == list(range(6144, 16385, 2048))
+
+    def test_linear_token_buckets_for_tp8_qwen35_mtp(self):
+        # The TP8 Qwen3.5 recipe: 16384-token budget, max_model_len 10240,
+        # 64 seqs. 512-row buckets were 13 (4608..10752) and OOMed the
+        # 512 GiB pod precompiling under MTP; 1024 rows keep it to seven,
+        # six of them new beside the power-of-two 8192.
+        paddings = tpu_platform._get_linear_token_paddings(16384, 10240 + 64)
+
+        assert paddings == list(range(5120, 11265, 1024))
+
+    @pytest.mark.parametrize("budget", [256, 2048, 8192, 16384, 65536])
+    def test_linear_token_buckets_are_capped(self, budget):
+        for longest_pass in range(16, 4 * budget, max(1, budget // 61)):
+            paddings = tpu_platform._get_linear_token_paddings(budget, longest_pass)
+
+            assert len(paddings) <= tpu_platform._MAX_LINEAR_BUCKETS
+            assert all(budget // 4 < p <= budget for p in paddings)
+
+    @pytest.mark.parametrize(
         ("is_hybrid", "pool_env", "expect_error"),
         [
             # Hybrid CPU offloading transfers whole pool rows; without the
@@ -917,6 +1027,7 @@ def test_qwen_import_failure_leaves_targets_unchanged(monkeypatch):
     assert torch.cumsum is original_cumsum
 
 
+@pytest.mark.tpu_test
 class TestQwen3VLModelPatches:
     """Tests for Qwen3-VL platform and model-level patches."""
 
@@ -1095,3 +1206,50 @@ class TestQwen3VLModelPatches:
         finally:
             if hasattr(torch, "_orig_cumsum_ref"):
                 delattr(torch, "_orig_cumsum_ref")
+
+
+def test_tpu_platform_accelerator_methods(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(torch.accelerator, "is_available", lambda: True)
+    monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
+    monkeypatch.setattr(
+        torch.accelerator,
+        "set_device_index",
+        lambda dev: calls.append(("set_device_index", dev)),
+    )
+    monkeypatch.setattr(
+        torch.accelerator,
+        "synchronize",
+        lambda dev=None: calls.append(("synchronize", dev)),
+    )
+    fake_stream = object()
+    monkeypatch.setattr(
+        torch.accelerator, "current_stream", lambda dev=None: fake_stream
+    )
+    monkeypatch.setattr(
+        torch.accelerator,
+        "set_stream",
+        lambda s: calls.append(("set_stream", s)),
+    )
+
+    assert TpuPlatform.is_available() is True
+    assert TpuPlatform.current_device() == 0
+    assert TpuPlatform.current_device_index() == 0
+
+    TpuPlatform.set_device(0)
+    assert calls[-1] == ("set_device_index", 0)
+
+    TpuPlatform.set_device_index(1)
+    assert calls[-1] == ("set_device_index", 1)
+
+    TpuPlatform.synchronize()
+    assert calls[-1] == ("synchronize", None)
+
+    TpuPlatform.synchronize(0)
+    assert calls[-1] == ("synchronize", 0)
+
+    assert TpuPlatform.current_stream() is fake_stream
+
+    TpuPlatform.set_stream(fake_stream)
+    assert calls[-1] == ("set_stream", fake_stream)
