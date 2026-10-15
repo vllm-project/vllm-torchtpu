@@ -543,19 +543,24 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             2e-2,
         )
 
-    def _capped_live_problem(self, query_tokens, real_tokens, seed):
+    def _capped_live_problem(self, query_tokens, real_tokens, seed, counts=None):
         topk = 2048
         rng = np.random.default_rng(seed)
         problem = _build_problem(
             rng, k_scale=0.75, query_tokens=query_tokens, topk=topk
         )
-        # 0 / 1 live, atom boundaries (64, 128), the cap and one past it
-        # (window 2), every window (2048).
-        counts = np.resize(
-            np.array([0, 1, 63, 64, 65, 128, 255, 256, 257, 511, 512, 513, 1025, 2048]),
-            query_tokens,
-        )
-        rng.shuffle(counts)
+        if counts is None:
+            # 0 / 1 live, atom boundaries (64, 128), the cap and one past it
+            # (window 2), every window (2048).
+            counts = np.resize(
+                np.array(
+                    [0, 1, 63, 64, 65, 128, 255, 256, 257, 511, 512, 513, 1025, 2048]
+                ),
+                query_tokens,
+            )
+            rng.shuffle(counts)
+        counts = np.asarray(counts)
+        assert counts.shape == (query_tokens,)
         live = np.arange(topk)[None, :] < counts[:, None]
         topk_idx = jnp.where(jnp.asarray(live), problem["topk"], -1)
 
@@ -665,6 +670,72 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
         np.testing.assert_array_equal(np.asarray(lse), np.asarray(ref_lse))
         self.assertTrue(np.isnan(np.asarray(ctl, np.float32)[token]).any())
         self.assertFalse(np.isnan(np.asarray(out, np.float32)).any())
+
+    def test_capped_live_rows_with_dcp_mode_slice_rungs(self):
+        """`capped_live_rows` under `is_dcp_mode`: the slice rungs read rows the
+        live gather left unwritten (rung >= the batch max, > shorter rows' live
+        atoms). Those rows NaN-poisoned must not reach the output; one batch per
+        rung, an all-empty batch and two overflow batches. Positive control as above.
+        """
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        query_tokens = real_tokens = 128
+        cap, atom, bsz = 512, sparse_mla.GATHER_ATOM_ROWS, 16
+        batches = [
+            [1, 5, 17, 33, 40, 50, 63, 64, 2, 9, 30, 44, 60, 61, 62, 0],  # rung 64
+            [65, 70, 1, 0, 100, 127, 128, 3, 90, 66, 64, 2, 110, 120, 80, 5],  # 128
+            [129, 1, 200, 30, 150, 64, 65, 0, 199, 2, 170, 128, 7, 140, 9, 180],  # 256
+            [256, 0, 1, 255, 63, 64, 65, 127, 128, 129, 191, 192, 193, 2, 3, 4],  # 256
+            [0] * bsz,  # all-empty batch: zero-batch bypass
+            [513, 1, 64, 100, 0, 130, 257, 300, 2, 65, 400, 511, 512, 10, 20, 30],
+            [2048, 1025, 0, 1, 64, 600, 700, 129, 2, 3, 511, 512, 513, 256, 5, 6],
+            [65, 66, 127, 128, 129, 64, 63, 65, 66, 67, 70, 80, 90, 100, 110, 129],
+        ]
+        counts = np.concatenate([np.asarray(b) for b in batches])
+        run, base, _ = self._capped_live_problem(
+            query_tokens, real_tokens, 11, counts=counts
+        )
+        kw = dict(
+            base,
+            gather_and_attention_chunk_size=64,
+            topk_cap=cap,
+            is_dcp_mode=True,
+            attention_kernel_batch_size=bsz,
+        )
+        gather = sparse_mla.native_sc_gather.dsa_gather_native_sc
+        poison_live_row = []
+
+        def poisoned(nope_c, rope_c, idx, *, row_live_atoms=None, **k):
+            nope, rope = gather(nope_c, rope_c, idx, row_live_atoms=row_live_atoms, **k)
+            assert row_live_atoms is not None
+            slot = jnp.arange(idx.shape[1])[None, :]
+            dead = (slot >= row_live_atoms[:, None] * atom).reshape(-1)
+            if poison_live_row:
+                dead = dead.at[poison_live_row[0]].set(True)
+            nan = jnp.uint32(0xFFFFFFFF)
+            nope = jnp.where(dead[:, None], nan, nope)
+            rope = jnp.where(dead[::4, None], nan, rope)
+            return nope, rope
+
+        ref, ref_lse = jax.block_until_ready(run(**kw))
+        with mock.patch.object(
+            sparse_mla.native_sc_gather, "dsa_gather_native_sc", poisoned
+        ):
+            out, lse = jax.block_until_ready(
+                run(jit=False, capped_live_rows=True, **kw)
+            )
+            # Control: slot 0 of token 1 (batch 0, rung 64, 5 live rows).
+            token = 1
+            poison_live_row.append(token * cap)
+            ctl, _ = jax.block_until_ready(run(jit=False, capped_live_rows=True, **kw))
+        np.testing.assert_array_equal(np.asarray(out), np.asarray(ref))
+        np.testing.assert_array_equal(np.asarray(lse), np.asarray(ref_lse))
+        self.assertFalse(np.isnan(np.asarray(out, np.float32)).any())
+        self.assertTrue(np.isnan(np.asarray(ctl, np.float32)[token]).any())
+        # The all-empty batch is the bypass: zeros and a -inf lse.
+        empty = slice(4 * bsz, 5 * bsz)
+        np.testing.assert_array_equal(np.asarray(out, np.float32)[empty], 0)
+        self.assertTrue(np.all(np.isneginf(np.asarray(lse)[empty])))
 
     @parameterized.product(
         (
