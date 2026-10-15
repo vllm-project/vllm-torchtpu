@@ -364,12 +364,20 @@ def client_main(argv: list[str]) -> None:
     parser.add_argument("--model", default="deepseek-v41")
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument(
+        "--profile-only",
+        action="store_true",
+        help="One diagnostic wave on an already warmed server",
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="Separate diagnostic run; do not pool with formal rounds",
     )
     parser.add_argument("--admission-settle-seconds", type=float, default=5.0)
     args = parser.parse_args(argv)
+    if args.profile_only:
+        args.profile = True
+        args.rounds = 1
     if args.admission_settle_seconds <= 0:
         parser.error("admission settle time must be positive")
     if args.rounds < 1:
@@ -483,7 +491,7 @@ def client_main(argv: list[str]) -> None:
                 post("/resume", {})
             return [future.result() for future in futures]
 
-    for round_id in range(args.rounds + 1):
+    for round_id in range(1 if args.profile_only else 0, args.rounds + 1):
         label = "warmup" if round_id == 0 else f"round-{round_id}"
         post("/reset_prefix_cache", {})
         prime_before = metrics()

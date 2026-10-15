@@ -9,7 +9,6 @@ import importlib.metadata
 import json
 import os
 import re
-import shutil
 import signal
 import socket
 import subprocess
@@ -139,6 +138,7 @@ def main() -> None:
         raise SystemExit(128 + signum)
 
     signal.signal(signal.SIGTERM, terminate)
+    args.out = args.out.resolve()
     args.out.mkdir(parents=True, exist_ok=False)
     before = cache_inventory(args.cache_dir)
     if args.cache_mode == "cold" and before["files"]:
@@ -185,9 +185,9 @@ def main() -> None:
         env["MAX_MODEL_LEN"] = str(
             DECODE_SCENARIO.prefix_tokens + DECODE_SCENARIO.output_tokens
         )
-        env["USE_PHASED_PROFILER"] = "0"
     else:
         env.pop("MAX_MODEL_LEN", None)
+    env["USE_PHASED_PROFILER"] = "0"
     env["PYTHONPATH"] = str(here) + os.pathsep + env.get("PYTHONPATH", "")
     server_command = [
         "bash",
@@ -197,15 +197,13 @@ def main() -> None:
         "--compilation-config",
         json.dumps({"compile_sizes": buckets}),
     ]
-    if env.get("ARTIFACT_LOCAL_DIR"):
+    if args.profile:
         server_command += [
             "--profiler-config",
             json.dumps(
                 {
                     "profiler": "torch",
-                    "torch_profiler_dir": str(
-                        Path(env.get("TMPDIR", "/tmp")) / "dsv41-profile"
-                    ),
+                    "torch_profiler_dir": str(args.out / "profile"),
                 }
             ),
         ]
@@ -256,7 +254,12 @@ def main() -> None:
     bootstrap_ports(env, args.out)
     server = None
     started = time.monotonic()
-    timing = {"launch_wall_ns": time.time_ns(), "completed": False}
+    timing = {
+        "launch_wall_ns": time.time_ns(),
+        "completed": False,
+        "formal_status": "pending",
+        "profile_status": "pending" if args.profile else "disabled",
+    }
     try:
         with (args.out / "server.log").open("w") as log:
             server = subprocess.Popen(
@@ -308,6 +311,7 @@ def main() -> None:
             ]
             if decode:
                 base += ["--server-log", str(args.out / "server.log")]
+            timing["formal_status"] = "failed"
             with (args.out / "client-fixed.log").open("w") as client_log:
                 subprocess.run(
                     [
@@ -329,7 +333,9 @@ def main() -> None:
                 for index in range(1, args.rounds + 1)
             ]
             assert_no_compilation((args.out / "server.log").read_text(), intervals)
+            timing["formal_status"] = "passed"
             if args.profile:
+                timing["profile_status"] = "failed"
                 with (args.out / "client-profile.log").open("w") as profile_log:
                     subprocess.run(
                         [
@@ -339,7 +345,7 @@ def main() -> None:
                             *(
                                 ["--profile-only", "--reuse-prefix"]
                                 if decode
-                                else ["--rounds", "1", "--profile"]
+                                else ["--profile-only"]
                             ),
                         ],
                         env=env,
@@ -347,6 +353,7 @@ def main() -> None:
                         stderr=subprocess.STDOUT,
                         check=True,
                     )
+                timing["profile_status"] = "passed"
             timing["completed"] = True
     finally:
         stop(server)
@@ -360,13 +367,6 @@ def main() -> None:
                 )
                 + "\n"
             )
-        if args.profile and env.get("ARTIFACT_LOCAL_DIR"):
-            profile_root = Path(env.get("TMPDIR", "/tmp")) / "dsv41-profile"
-            destination = Path(env["ARTIFACT_LOCAL_DIR"]) / "profile"
-            for path in profile_root.rglob("*.xplane.pb"):
-                target = destination / path.relative_to(profile_root)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(path, target)
         timing["finished_wall_ns"] = time.time_ns()
         (args.out / "startup.json").write_text(json.dumps(timing, indent=2) + "\n")
 

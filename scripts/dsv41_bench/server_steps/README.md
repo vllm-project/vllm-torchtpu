@@ -65,7 +65,6 @@ server. Reserve port 8000 and use fresh output directories.
 
 ```bash
 export MODEL_PATH=/models/DeepSeek-V4.1-Flash
-export ARTIFACT_LOCAL_DIR=/path/to/artifacts
 python scripts/dsv41_bench/server_steps/run.py \
   --input /path/to/dsv41-code-96k-c128.json \
   --out /path/to/results/candidate-cold \
@@ -77,6 +76,11 @@ python scripts/dsv41_bench/server_steps/run.py \
 runs a separate warmup and five formal rounds, optionally collects a separate
 profile wave, and stops its server process group. The startup timeout defaults
 to 3000 seconds. Compiler events in formal serving windows fail the run.
+The profile-only prefill client skips a second warmup but still resets and primes
+the prefix before measuring the extension. Five formal rounds plus a profile
+therefore need seven priming waves instead of eight. Formal warmup, workload
+lengths, compile buckets and round counts are unchanged. `startup.json` reports
+formal and profile status separately; a profile failure still fails the run.
 A cold run rejects a nonempty cache directory. Keep the cache
 on persistent storage, and use separate directories for baseline and candidate.
 Both public and internal native Tier-2 shared-memory caches are disabled;
@@ -95,13 +99,33 @@ python scripts/dsv41_bench/server_steps/run.py \
 
 A populated cache does not prove a cache hit. Check load attempts, recompiles,
 artifact warnings and timings. Do not drop cache-key fields to force reuse.
-Keep `ARTIFACT_LOCAL_DIR` consistent across an A/B/restart series; the profile
-is stored under its `encoder_extend/profile` directory. Do not enable compiler
+Profiles are enabled only by `--profile` and written directly under `--out/profile`.
+No `ARTIFACT_LOCAL_DIR` or shared scratch directory is required. Do not enable compiler
 dumps during timed startup, and never pool profiled and unprofiled rounds.
 
 For an already running server with `server_step_worker.ServerStepWorker` loaded,
 use `bench_cached_extend.py client --input INPUT --out OUTPUT --rounds 5`.
 The server must use the same DP8 configuration as `run.py`.
+After a completed warmup/formal run, use `--profile-only` for one diagnostic
+prefill wave; the server must have been started with a profiler configuration.
+
+### CI coverage
+
+The DP8 cases in `.buildkite/pipeline_dsv41.yml` each start one server with a cold
+cache and no profile: prefill runs one warmup plus five formal rounds; decode
+runs one warmup plus one formal round. They already avoid a second server start,
+so skipping the diagnostic prefill warmup does not speed up these CI cases.
+The TP8 GSM8K and 100K decode cases use other scripts and are unaffected.
+
+The same lane runs these CPU regressions on PRs as well as branch builds; the
+expensive DP8 benchmarks remain branch-only:
+
+```bash
+python -m pytest --confcutdir=tests/scripts \
+  tests/scripts/test_dsv41_server_session.py \
+  tests/scripts/test_dsv41_decode_worker_capture.py \
+  tests/scripts/test_dsv41_decode_accounting.py -q
+```
 
 ## Timing and audit contract
 
@@ -322,8 +346,9 @@ and native output capture in `tests/scripts/test_dsv41_decode_*.py`.
 
 Use `run.py --scenario decode --profile` to run one warmup and one formal
 benchmark window, then a separate synchronized six-step profile on the same
-server. Profile output is written locally and XPlane files are copied after
-shutdown. Timing summaries exclude profiling. All eight ranks capture at the
+server. Traces are written directly to `--out/profile` and per-rank capture
+records to `--out/fixed-profile/synchronized-profile`. Timing summaries exclude
+profiling. All eight ranks capture at the
 same DP boundaries; validate XPlane coverage instead of the optional Chrome JSON.
 
 ### Validated 96k/C384 result (indexer tiles + 288 bucket)

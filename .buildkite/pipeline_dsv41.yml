@@ -17,6 +17,25 @@
 # not run here.
 
 steps:
+  - label: "DeepSeek-V4.1 benchmark scripts: CPU regression tests"
+    key: "dsv41_benchmark_scripts_cpu"
+    depends_on: "build_docker"
+    timeout_in_minutes: 10
+    agents:
+      queue: "cpu_64_core"
+    env:
+      CPU_ONLY: "1"
+    commands:
+      - >-
+        bash .buildkite/scripts/run_in_docker.sh
+        python -m pytest --confcutdir=tests/scripts
+        tests/scripts/test_dsv41_server_session.py
+        tests/scripts/test_dsv41_decode_worker_capture.py
+        tests/scripts/test_dsv41_decode_accounting.py
+        -q --junitxml=/perf_eval_results/dsv41-benchmark-cpu.xml
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
   - group: "DeepSeek-V4.1-Flash on TPU"
     depends_on: "build_docker"
     steps:

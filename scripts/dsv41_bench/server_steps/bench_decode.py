@@ -156,7 +156,7 @@ def client_main(argv: list[str]) -> None:
 
     if args.profile_only:
         post("/pause?mode=keep&clear_cache=false", {})
-        rpc("synchronized_profile_arm")
+        rpc("synchronized_profile_arm", output_dir=str(args.out.resolve()))
         try:
             wave(prompts, scenario.output_tokens)
             post("/pause?mode=keep&clear_cache=false", {})
