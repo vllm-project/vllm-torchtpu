@@ -58,11 +58,13 @@
 # the decode's default deferred Stage-3 submit. RECIPE_STORE_SERVERS=1 (c-h)
 # adds the global registry on the prefill head and a host-store server on each
 # decode host, which k3_1p1d.sh starts; the prefill's host store joins their
-# pool and the decode drops its own. Departures for GKE: the prefill's host
-# store stays at this file's 768 GiB (the doc: 1.5 TiB, 2 TiB for the DP2
-# points), each store server lends 256 GiB (the doc: 512 GiB), and the DP2
-# prefill has no --numa-bind, which runs the ranks under numactl and the engine
-# image has none.
+# pool and the decode drops its own. The DP2 points' prefill runs its ranks
+# under numactl (--numa-bind), which needs an engine image with numactl: one
+# built from a ref that has this repo's docker/Dockerfile with it. On an older
+# image the prefill serves without the binding and says so. Departures for GKE:
+# the prefill's host store stays at this file's 768 GiB (the doc: 1.5 TiB, 2
+# TiB for the DP2 points), and each store server lends 256 GiB (the doc: 512
+# GiB).
 
 for _v in RECIPE_CONCURRENCY RECIPE_DECODE RECIPE_DECODE_MAX_NUM_SEQS; do
   [ -n "${!_v:-}" ] || { echo "ERROR: kimi-k3-megakernel: the point sets no $_v" >&2; return 2; }
@@ -370,6 +372,18 @@ if [ "$_role" = prefill ]; then
   # tokens of the 8,192-token step, so short requests share it.
   if [ "${RECIPE_SET:-}" = oct13 ] && [ "$_no_spec" = 1 ]; then
     ROLE_ARGS+=(--long-prefill-token-threshold 4096)
+  fi
+  # The DP2 points' prefill binds each rank's CPUs and memory to its TPU's NUMA
+  # node, as the doc does. A tpu7x-standard-4t host has two nodes, and vLLM's
+  # local ranks take the TPU devices in PCI order: ranks 0-3 on node 0
+  # (00:03.0-00:04.1), 4-7 on node 1 (c0:00.0-c0:02.1). vLLM detects that
+  # only on CUDA, so the nodes are given.
+  if [ "${RECIPE_SET:-}" = oct13 ] && [ "$RECIPE_DECODE" = dp2_dcp16 ]; then
+    if command -v numactl >/dev/null 2>&1; then
+      ROLE_ARGS+=(--numa-bind --numa-bind-nodes 0 0 0 0 1 1 1 1)
+    else
+      echo "WARNING: kimi-k3-megakernel: the engine image has no numactl; serving the prefill without the doc's --numa-bind" >&2
+    fi
   fi
 elif [ "$RECIPE_DECODE" = dp2_dcp16 ]; then
   _loader=$(printf '{"presharded":"%s","attention_dp":2}' "$PRESHARDED_DIR")
