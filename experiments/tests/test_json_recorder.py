@@ -11,7 +11,8 @@ import unittest.mock
 import jsonschema
 import pytest
 from core.csv_recorder import CsvResultRecorder
-from core.json_recorder import CompositeResultRecorder, JsonResultRecorder
+from core.json_recorder import (CompositeResultRecorder, JsonResultRecorder,
+                                _default_user, _strip_os_login)
 
 
 @pytest.fixture
@@ -343,3 +344,41 @@ def test_assign_trace_paths_untraced_trial_never_gets_uris(
     exps = recorder.data["experiments"]
     assert exps[0]["artifacts"]["trace_paths"] == uris
     assert exps[1]["artifacts"]["trace_paths"] == []
+
+
+@pytest.mark.parametrize("login,expected", [
+    ("shenrunz_google_com", "shenrunz"),
+    ("shenrunz", "shenrunz"),
+    ("shenrunz-test", "shenrunz-test"),
+    ("_google_com", "_google_com"),
+])
+def test_strip_os_login_suffix(login, expected):
+    assert _strip_os_login(login) == expected
+
+
+def test_default_user_prefers_exported_user_then_strips_os_login(monkeypatch):
+    # An orchestrator that exports USER decides the incoming/<user>/ prefix.
+    monkeypatch.setenv("USER", "shenrunz-test")
+    assert _default_user() == "shenrunz-test"
+    # The OS Login account name is reduced to the LDAP.
+    monkeypatch.setenv("USER", "shenrunz_google_com")
+    assert _default_user() == "shenrunz"
+    # No USER: fall back to the login name, stripped the same way.
+    monkeypatch.delenv("USER", raising=False)
+    monkeypatch.setattr("core.json_recorder.getpass.getuser",
+                        lambda: "alice_google_com")
+    assert _default_user() == "alice"
+    # A resolver that blows up never breaks a sweep.
+    monkeypatch.setattr("core.json_recorder.getpass.getuser",
+                        unittest.mock.Mock(side_effect=OSError("no passwd")))
+    assert _default_user() == "unknown"
+
+
+def test_recorder_gcs_dir_uses_exported_user(tmp_path, monkeypatch):
+    monkeypatch.setenv("USER", "shenrunz-test")
+    monkeypatch.setenv("EXPERIMENTS_NO_UPLOAD_GCS", "1")
+    rec = JsonResultRecorder(str(tmp_path / "sweep.json"),
+                             sweep_id="20260101_000000")
+    assert rec.user == "shenrunz-test"
+    assert rec.gcs_sweep_dir.endswith(
+        "/incoming/shenrunz-test/20260101_000000")

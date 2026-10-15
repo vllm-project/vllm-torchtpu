@@ -42,12 +42,32 @@ def _env_flag(name: str) -> bool:
     return value not in ("", "0", "false")
 
 
+# OS Login names a Googler's VM account ``<ldap>_google_com``; the GCS
+# ``incoming/<user>/`` convention and every downstream reader key on the bare
+# LDAP, so the suffix is stripped from whatever name we resolve.
+_OS_LOGIN_SUFFIX = "_google_com"
+
+
+def _strip_os_login(name: str) -> str:
+    """``shenrunz_google_com`` -> ``shenrunz``; other names pass through."""
+    if name.endswith(_OS_LOGIN_SUFFIX) and len(name) > len(_OS_LOGIN_SUFFIX):
+        return name[:-len(_OS_LOGIN_SUFFIX)]
+    return name
+
+
 def _default_user() -> str:
-    """Best-effort owner name, resolved lazily; never raises."""
+    """Owner name for the sweep; never raises.
+
+    An exported ``USER`` wins, so an orchestrator that wants results under a
+    particular ``incoming/<user>/`` prefix (an operator's data root, a shared
+    team name) exports ``USER=<owner>`` before launching the sweep. Otherwise
+    the login name is used, with the OS Login suffix removed.
+    """
     try:
-        return os.environ.get("USER") or getpass.getuser() or "unknown"
+        name = os.environ.get("USER") or getpass.getuser() or "unknown"
     except Exception:
         return "unknown"
+    return _strip_os_login(name) or "unknown"
 
 
 class JsonResultRecorder(IResultRecorder):
