@@ -305,6 +305,26 @@ def test_non_spec_async_uses_the_same_admitted_topologies(tp, dp):
     validate_config(cfg)
 
 
+@pytest.mark.parametrize("architecture", ["Qwen4ExpForCausalLM", "Qwen3ForCausalLM"])
+@pytest.mark.parametrize("ep", [False, True])
+@pytest.mark.parametrize("across", [False, True])
+def test_dp_collectives_follow_model_communication_not_only_ep(
+    architecture, ep, across
+):
+    from vllm_torchtpu.models.parallel_requirements import requires_dp_collectives
+
+    cfg = NS(
+        parallel_config=NS(enable_expert_parallel=ep),
+        model_config=NS(architecture=architecture),
+        additional_config={
+            "qwen4_exp": {"engram_config": {"embedding_across_dp": across}}
+        },
+    )
+    assert requires_dp_collectives(cfg) is (
+        ep or (architecture == "Qwen4ExpForCausalLM" and across)
+    )
+
+
 @pytest.mark.parametrize("tp", [2, 4])
 def test_dp_shared_ple_keeps_one_world_with_ep_off(tp):
     from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
