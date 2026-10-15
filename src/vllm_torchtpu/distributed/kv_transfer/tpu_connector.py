@@ -6787,7 +6787,7 @@ class TPURaidenConnectorWorker:
                 # controller: the reshard coordinator submits transfer
                 # programs over the persistent channel this creates.
                 dispatch_address = _reshard_dispatch_address(self.dp_rank)
-                self._wait_for_address_ready(dispatch_address, timeout_s=30.0)
+                self._wait_for_address_ready(dispatch_address, timeout_s=300.0)
                 manager_kwargs.update(
                     raiden_worker_port=0,
                     raiden_controller_address=dispatch_address,

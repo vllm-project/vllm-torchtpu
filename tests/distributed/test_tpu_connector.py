@@ -6694,6 +6694,88 @@ def test_maybe_host_reshard_store_passes_registry_ttl_from_lease():
     }
 
 
+def test_store_mode_peer_rank_waits_past_30s_for_dispatch_controller_ready():
+    """Peer ranks constructing the Raiden transfer engine in store mode must
+    tolerate >30s initialization skew while rank-0 brings up ReshardStore."""
+    worker = _make_raiden_worker(
+        tp_rank=0, tp_size=1, is_producer=True, dp_size=1, pcp_size=8
+    )
+    worker._local_raiden_transfer_rank = MagicMock(return_value=3)
+    engine = _FakeAdmissionRaidenEngine()
+    worker._new_raiden_manager = MagicMock(return_value=engine)
+    storage = object()
+
+    now = [1_700_000_000.0]
+    ready_at = now[0] + 45.0
+    dialed_addresses: list[tuple[str, int]] = []
+
+    def fake_create_connection(address: tuple[str, int], timeout: float = 0.5):
+        dialed_addresses.append(address)
+        if now[0] < ready_at:
+            raise ConnectionRefusedError("rank-0 dispatch controller not ready")
+        return MagicMock()
+
+    with (
+        patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 8, create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_RESHARD_IMPL", "store", create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_ADVERTISE_HOST", "10.0.0.1", create=True),
+        patch(
+            f"{_MOD}.tpu_envs.TPU_RAIDEN_STORE_DISPATCH_PORT_BASE", 27100, create=True
+        ),
+        patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=12.0),
+        patch(f"{_MOD}.time.time", side_effect=lambda: now[0]),
+        patch(
+            f"{_MOD}.time.sleep",
+            side_effect=lambda _dt: now.__setitem__(0, now[0] + 15.0),
+        ),
+        patch("socket.create_connection", side_effect=fake_create_connection),
+    ):
+        result = worker._construct_raiden_transfer_engine([storage], num_slots=1)
+
+    assert result is engine
+    assert len(dialed_addresses) == 4
+    assert set(dialed_addresses) == {("10.0.0.1", 27100)}
+    worker._new_raiden_manager.assert_called_once_with(
+        kv_caches=[storage],
+        node_id=3,
+        local_control_port=9106,
+        max_blocks=4,
+        num_slots=1,
+        timeout_s=12.0,
+        listener_port=0,
+        parallelism=8,
+        raiden_worker_port=0,
+        raiden_controller_address="10.0.0.1:27100",
+        worker_id="worker_3",
+    )
+
+    # Exceeding the 300s deadline still raises TimeoutError.
+    now[0] = 1_700_000_000.0
+    ready_at = now[0] + 305.0
+    with (
+        patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 8, create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_RESHARD_IMPL", "store", create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_ADVERTISE_HOST", "10.0.0.1", create=True),
+        patch(
+            f"{_MOD}.tpu_envs.TPU_RAIDEN_STORE_DISPATCH_PORT_BASE", 27100, create=True
+        ),
+        patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=12.0),
+        patch(f"{_MOD}.time.time", side_effect=lambda: now[0]),
+        patch(
+            f"{_MOD}.time.sleep",
+            side_effect=lambda _dt: now.__setitem__(0, now[0] + 60.0),
+        ),
+        patch("socket.create_connection", side_effect=fake_create_connection),
+        pytest.raises(
+            TimeoutError,
+            match="Timed out waiting for address 10.0.0.1:27100 to be ready",
+        ),
+    ):
+        worker._construct_raiden_transfer_engine([storage], num_slots=1)
+
+
 # ---------------------------------------------------------------------------
 # Block-major unified pool
 # ---------------------------------------------------------------------------
