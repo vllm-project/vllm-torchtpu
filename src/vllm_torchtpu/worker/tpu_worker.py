@@ -33,6 +33,7 @@ from vllm.v1.worker.worker_base import CompilationTimes, WorkerBase
 
 import vllm_torchtpu.distributed.utils as dist_utils
 from vllm_torchtpu import envs, profiler_trace, utils
+from vllm_torchtpu.distributed.mesh_utils import make_stage_groups_standalone
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
@@ -443,6 +444,7 @@ class TPUWorker(WorkerBase):
                 prefill_context_model_parallel_size=pcp_size,
                 decode_context_model_parallel_size=self.parallel_config.decode_context_parallel_size,
             )
+        make_stage_groups_standalone()
 
         pp_group = get_pp_group()
         is_first_rank = pp_group.is_first_rank

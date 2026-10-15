@@ -451,6 +451,11 @@
       "concise_description": "Object of type `Counter | Gauge | Histogram` has no attribute `set`"
     },
     {
+      "path": "src/vllm_torchtpu/distributed/mesh_utils.py",
+      "name": "missing-attribute",
+      "concise_description": "No attribute `make_standalone` in module `torch_tpu._internal.distributed.spmd_util`"
+    },
+    {
       "path": "src/vllm_torchtpu/distributed/pcp_rank_order.py",
       "name": "missing-attribute",
       "concise_description": "No attribute `tpu` in module `torch`"

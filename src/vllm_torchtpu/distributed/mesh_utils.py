@@ -26,8 +26,8 @@ named for the job rather than for an axis.
 Under pipeline parallelism a group is one pipeline stage, a part of the slice.
 Its mesh then holds the stage's devices alone (`get_stage_mesh`): torch_tpu
 compiles a program whose kernels and collectives all name the devices of one
-process group for those devices, so a stage launches its programs while the
-other stages launch theirs.
+standalone process group (`make_stage_groups_standalone`) for those devices,
+so a stage launches its programs while the other stages launch theirs.
 """
 
 from __future__ import annotations
@@ -166,6 +166,48 @@ def get_pipeline_stage() -> tuple[int, int]:
     return int(group.rank_in_group), int(group.world_size)
 
 
+def make_stage_groups_standalone() -> None:
+    """Make the process groups of pipeline stages of several devices standalone.
+
+    torch_tpu compiles the collectives and kernels of a standalone group for the
+    group's devices alone, so each stage launches them while the other stages
+    launch theirs. Under pipeline parallelism every group but the world lies
+    inside one stage, except the pipeline group, which holds one device of each
+    stage and carries the hand-off. Every rank makes its groups standalone in
+    the same order before their first collective; each call returns once all
+    members of the group have made it.
+    """
+    _, stages = get_pipeline_stage()
+    if stages == 1:
+        return
+    from vllm.distributed import parallel_state
+
+    world_size = int(torch.distributed.get_world_size())
+    device_groups = []
+    for get_group in (
+        parallel_state.get_tp_group,
+        parallel_state.get_dcp_group,
+        parallel_state.get_pcp_group,
+        parallel_state.get_dp_group,
+        parallel_state.get_ep_group,
+        parallel_state.get_eplb_group,
+        parallel_state.get_pp_group,
+    ):
+        try:
+            group = get_group()
+        except AssertionError:
+            # Only MoE models have an EP group, and only EPLB an EPLB group.
+            continue
+        if 1 < int(group.world_size) < world_size:
+            device_groups.append(group.device_group)
+    if not device_groups:
+        return
+    from torch_tpu._internal.distributed import spmd_util
+
+    for device_group in device_groups:
+        spmd_util.make_standalone(device_group)
+
+
 def get_stage_mesh(
     axis_names: tuple[str, ...],
     mesh_shape: tuple[int, ...],
@@ -182,9 +224,8 @@ def get_stage_mesh(
     """
     from torch_tpu._internal.pallas import get_pallas_mesh
 
-    # TODO(yinlin): torch_tpu releases refuse a mesh smaller than the world
-    # here, and pp_validation turns such stages away; make the stage group
-    # standalone once the pinned torch_tpu has google-pytorch/torch_tpu#4387.
+    # torch_tpu takes a mesh smaller than the world for a standalone group (see
+    # `make_stage_groups_standalone`), and lists its devices in rank order.
     mesh = get_pallas_mesh(
         axis_names=axis_names,
         mesh_shape=mesh_shape,

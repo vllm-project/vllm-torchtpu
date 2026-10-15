@@ -137,6 +137,17 @@ def test_rejects_tensor_parallel_stages():
         validate_pipeline_parallel_config(_config(pp=2, tp=4))
 
 
+@pytest.mark.parametrize("standalone", [True, False])
+def test_stage_meshes_need_standalone_groups(monkeypatch, standalone):
+    from torch_tpu._internal.distributed import spmd_util
+
+    if standalone:
+        monkeypatch.setattr(spmd_util, "make_standalone", object(), raising=False)
+    else:
+        monkeypatch.delattr(spmd_util, "make_standalone", raising=False)
+    assert pp_validation._torch_tpu_builds_stage_meshes() is standalone
+
+
 @pytest.fixture
 def stage_meshes(monkeypatch):
     """A torch_tpu that builds meshes over a stage's process group."""

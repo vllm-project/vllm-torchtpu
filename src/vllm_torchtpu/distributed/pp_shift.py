@@ -12,6 +12,7 @@ import inspect
 
 import jax
 import numpy as np
+import torch
 from jax.experimental.shard_map import shard_map
 from jax.sharding import Mesh, PartitionSpec
 from torch_tpu._internal.pallas import jax_op
@@ -35,7 +36,9 @@ def get_or_create_pp_mesh() -> Mesh:
     """A JAX mesh over the pipeline group's devices in device-id order.
 
     The runtime addresses collective peers by device order, so mesh positions
-    follow device ids; ``pp_positions()`` maps pipeline ranks onto them.
+    follow device ids; ``pp_positions()`` maps pipeline ranks onto them. With
+    stages of several devices the pipeline group is a standalone subgroup,
+    whose mesh torch_tpu takes in the group's rank order instead.
     """
     global _MESH, _POS_OF_RANK
     if _MESH is not None:
@@ -48,11 +51,14 @@ def get_or_create_pp_mesh() -> Mesh:
         group, _get_current_global_rank(), _get_tpu_global_device_id()
     )
     devices_by_id = {int(device.id): device for device in jax.devices()}
-    device_ids = sorted(rank_to_device[rank] for rank in ranks)
+    if len(ranks) < torch.distributed.get_world_size():
+        device_ids = [rank_to_device[rank] for rank in ranks]
+    else:
+        device_ids = sorted(rank_to_device[rank] for rank in ranks)
     _MESH = Mesh(np.asarray([devices_by_id[d] for d in device_ids]), axis_names=(AXIS,))
     _POS_OF_RANK = tuple(device_ids.index(rank_to_device[rank]) for rank in ranks)
     logger.info(
-        "PP hand-off mesh (device order): %s",
+        "PP hand-off mesh: %s",
         ", ".join(
             f"rank{r}->pos{_POS_OF_RANK[i]}/dev{rank_to_device[r]}"
             for i, r in enumerate(ranks)

@@ -65,10 +65,11 @@ Then send a request:
 
 A stage may instead span a prefill context-parallel group
 (`--prefill-context-parallel-size`), which splits each chunk's attention over
-the stage's cores; MoE models then need `--enable-expert-parallel`. This needs
-a torch_tpu that compiles a stage's kernels and collectives for the stage's
-devices only (the 2026-09-28 build of google-pytorch/torch_tpu#4387); on a
-torch_tpu that builds world-size meshes only, the platform refuses such stages.
+the stage's cores; MoE models then need `--enable-expert-parallel`. The worker
+makes the stage's process groups standalone, so torch_tpu compiles a stage's
+kernels and collectives for the stage's devices only. This needs a torch_tpu
+with `spmd_util.make_standalone` (google-pytorch/torch_tpu#5092) and libtpu
+0.0.47 or newer; on other torch_tpu builds the platform refuses such stages.
 A two-core stage must not be the two cores of one chip: set
 `VLLM_TPU_DEVICE_ORDER` to the device each local rank binds, e.g.
 `0,2,1,3,4,6,5,7` for four stages of two cores on one host.

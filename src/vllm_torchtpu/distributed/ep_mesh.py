@@ -174,13 +174,21 @@ def _ep_mesh_order(device_ids: tuple[int, ...]) -> tuple[int, ...]:
     conflicting device assignments" -- for DCP whenever a DCP group is not a
     contiguous tile of the sorted EP mesh, e.g. TP4/DCP4 on tpu7x, whose DCP
     groups are devices [0, 1, 4, 5] and [6, 7, 2, 3].
+
+    Under pipeline parallelism the mesh stays in rank order too: the EP group is
+    one stage, made standalone, and torch_tpu takes the mesh of a standalone
+    group in the group's rank order.
     """
     if len(set(device_ids)) != len(device_ids):
         raise RuntimeError(
             f"Two EP ranks report the same TPU global device id: {device_ids}"
         )
     ep_ranks = range(len(device_ids))
-    if get_pcp_world_size() > 1 or get_dcp_world_size() > 1:
+    if (
+        get_pcp_world_size() > 1
+        or get_dcp_world_size() > 1
+        or get_pipeline_stage()[1] > 1
+    ):
         return tuple(ep_ranks)
     return tuple(sorted(ep_ranks, key=device_ids.__getitem__))
 
@@ -188,15 +196,15 @@ def _ep_mesh_order(device_ids: tuple[int, ...]) -> tuple[int, ...]:
 def ep_rank_order() -> tuple[int, ...] | None:
     """EP rank at each mesh index, or None when EP is off.
 
-    With the mesh in ascending device-id order (PCP and DCP off; see
-    `_ep_mesh_order`)
+    With the mesh in ascending device-id order (PCP, DCP and pipeline
+    parallelism off; see `_ep_mesh_order`)
     mesh index i is not EP rank i on a host whose PCI enumeration differs from
     its device ids -- every tpu7x host, where local ranks 0..7 land on devices
     `[0, 1, 4, 5, 6, 7, 2, 3]` -- so the shard at mesh index i owns the experts
     of EP rank `ep_rank_order()[i]`. The caller has to say so -- see
     `fused_moe_ep._mesh_expert_order` -- because the kernel reads a token's
-    expert id as `mesh_index * experts_per_shard + j`. With PCP or DCP on it is
-    the identity.
+    expert id as `mesh_index * experts_per_shard + j`. With PCP, DCP or pipeline
+    parallelism on it is the identity.
     """
     device_ids = ep_device_ids()
     if device_ids is None:
@@ -218,8 +226,8 @@ def build_ep_mesh(axis_name: str = EP_AXIS_NAME) -> Any | None:
     """A one-axis JAX mesh over the EP group, or None when EP is off.
 
     The devices are Torchtpu's ``get_pallas_mesh`` ones, put in the order
-    `_ep_mesh_order` picks: ascending device id, or rank order when PCP or DCP
-    is on.
+    `_ep_mesh_order` picks: ascending device id, or rank order when PCP, DCP
+    or pipeline parallelism is on.
     `ep_rank_order` has the permutation this introduces and the consequence
     for the caller.
 

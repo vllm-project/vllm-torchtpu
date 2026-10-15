@@ -101,6 +101,15 @@ def test_cp_keeps_rank_order(monkeypatch, group, cp_size_fn, cp_size):
     assert ep.ep_mesh_index() == 2
 
 
+def test_pipeline_keeps_rank_order(monkeypatch, group):
+    """Under pipeline parallelism the EP group is one standalone stage, whose
+    mesh torch_tpu takes in rank order only."""
+    monkeypatch.setattr(ep, "get_pipeline_stage", lambda: (1, 4))
+    monkeypatch.setattr(ep, "ep_device_ids", lambda: (40, 20, 10, 30))
+    assert ep.ep_rank_order() == (0, 1, 2, 3)
+    assert ep.ep_mesh_index() == 2
+
+
 def test_missing_rank_mapping(monkeypatch, group):
     monkeypatch.setattr(
         ep, "_collect_rank_to_device_id", lambda *args: {2: 40, 4: 20, 8: 30}

@@ -17,10 +17,11 @@ def _legacy_ray_executor() -> bool:
 
 def _torch_tpu_builds_stage_meshes() -> bool:
     """Whether the installed torch_tpu builds a Pallas mesh over a pipeline
-    stage's process group; its releases accept world-size meshes only."""
-    from torch_tpu._internal.pallas import pallas
+    stage's process group, which it does for a group made standalone; its
+    releases accept world-size meshes only."""
+    from torch_tpu._internal.distributed import spmd_util
 
-    return not hasattr(pallas, "_validate_pallas_mesh_world_size")
+    return hasattr(spmd_util, "make_standalone")
 
 
 _FULL_ATTENTION_LAYER_TYPES = ["full_attention", "deepseek_sparse_attention"]
@@ -75,17 +76,17 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
         )
     ) and not _torch_tpu_builds_stage_meshes():
         # A stage of several devices builds its meshes, and the hand-off its
-        # per-column mesh, over a group smaller than the world.
-        # TODO(yinlin): google-pytorch/torch_tpu#4387 builds those for a group
-        # made standalone; make each stage group standalone and drop this
-        # guard once the pinned torch_tpu has it.
+        # per-column mesh, over a group smaller than the world, which the
+        # worker makes standalone (mesh_utils.make_stage_groups_standalone).
+        # TODO(yinlin): drop this guard once the pinned torch_tpu has
+        # spmd_util.make_standalone (google-pytorch/torch_tpu#5092).
         unsupported = (
             "pipeline stages of several devices (context parallelism, or expert "
             "parallelism across data-parallel ranks) with this torch_tpu"
         )
         remedy = (
-            " They need a torch_tpu that builds Pallas meshes over a stage's"
-            " process group."
+            " They need a torch_tpu that can make a process group standalone"
+            " (spmd_util.make_standalone)."
         )
     elif (
         parallel_config.prefill_context_parallel_size > 1
