@@ -41,6 +41,10 @@ from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
     components as indexing,
 )
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
+    SparseCoreTopK,
+    TopKBackend,
+)
 
 try:
     from vllm_torchtpu.logger import init_logger
@@ -54,6 +58,7 @@ KVLayout = config.KVLayout
 DEFAULT_BUFFER_COUNT = config.DEFAULT_BUFFER_COUNT
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
 DCP_AXIS_NAME = "dcp"
+_DEFAULT_TOPK_BACKEND = SparseCoreTopK()
 
 cp_local_to_global = metadata.cp_local_to_global
 cp_local_length = metadata.cp_local_length
@@ -1074,6 +1079,7 @@ def _effective_row_lengths(
         "return_scores",
         "uniform_q_len",
         "components",
+        "topk_backend",
     ),
 )
 def streamindex_topk(
@@ -1104,6 +1110,7 @@ def streamindex_topk(
     return_scores: bool = False,
     uniform_q_len: int | None = None,
     components: indexing.StreamIndexComponents | None = None,
+    topk_backend: TopKBackend = _DEFAULT_TOPK_BACKEND,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """StreamIndex Top-K retrieval.
 
@@ -1172,6 +1179,9 @@ def streamindex_topk(
 
       components: Optional static key reader and schedule. None retains the
         original packed-key reader and metadata traversal.
+      topk_backend: Static selector for the score-bit buffers. The default keeps
+        SparseCore selection and chunk overlap. A backend without overlap uses
+        the same scoring chunks without cross-engine scheduling annotations.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions
@@ -1572,7 +1582,7 @@ def streamindex_topk(
         # Ids count from 1, so the 0 is never a real group: a single chunk has no
         # pair to annotate and takes the `None` branch below both times.
         group_base = 0
-        if num_chunks > 1:
+        if num_chunks > 1 and topk_backend.overlaps_scoring:
             group_base = config.reserve_scheduling_group_ids(num_chunks - 1)
 
         chunk_starts = (
@@ -1590,8 +1600,14 @@ def streamindex_topk(
             # Group g holds chunk g's SparseCore top-k and chunk g+1's TensorCore
             # scoring, so the scheduler emits `sc(g).start, tc(g+1), sc(g).done`.
             # Chunk 0's scoring and the last top-k have no partner.
-            tc_group = None if m == 0 else group_base + m - 1
-            sc_group = None if m == num_chunks - 1 else group_base + m
+            tc_group = (
+                group_base + m - 1 if m > 0 and topk_backend.overlaps_scoring else None
+            )
+            sc_group = (
+                group_base + m
+                if m < num_chunks - 1 and topk_backend.overlaps_scoring
+                else None
+            )
 
             start = m * chunk_len
             scores = _scores_for_chunk(
@@ -1610,25 +1626,20 @@ def streamindex_topk(
                     constant_values=BITS_NEG_INF,
                 )
 
+            selected = topk_backend.select(
+                scores,
+                k,
+                row_lengths=eff_row_lengths[start : start + chunk_len],
+                scheduling_group_id=sc_group,
+                return_scores=return_scores,
+            )
             if return_scores:
-                chunk_topk_idxs, chunk_topk_scores = sparsecore_topk(
-                    scores,
-                    k,
-                    row_lengths=eff_row_lengths[start : start + chunk_len],
-                    write_empty_rows=True,
-                    scheduling_group_id=sc_group,
-                    return_scores=True,
-                )
+                assert isinstance(selected, tuple)
+                chunk_topk_idxs, chunk_topk_scores = selected
                 topk_scores_list.append(chunk_topk_scores)
             else:
-                chunk_topk_idxs = sparsecore_topk(
-                    scores,
-                    k,
-                    row_lengths=eff_row_lengths[start : start + chunk_len],
-                    write_empty_rows=True,
-                    scheduling_group_id=sc_group,
-                    return_scores=False,
-                )
+                assert isinstance(selected, jax.Array)
+                chunk_topk_idxs = selected
             topk_idxs.append(chunk_topk_idxs)
 
         out = topk_idxs[0] if len(topk_idxs) == 1 else jnp.concatenate(topk_idxs)
