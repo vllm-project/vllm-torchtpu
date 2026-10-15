@@ -938,8 +938,15 @@ def _mla_batched_decode_kernel(
     unnormalized_output: bool,
     bkv_p: int,
     seq_batch_sz: int,
+    fetch_extra=None,
+    finalize=None,
+    resident_inputs=False,
+    page_indices_count=None,
 ):
     del in_output_hbm_ref, in_l_hbm_ref, in_m_hbm_ref  # Aliased with out, l, m.
+    if resident_inputs:
+        # Only the validated single-request composition supplies VMEM refs.
+        assert q_hbm_ref.shape[0] == seq_batch_sz == 1
 
     def async_copy(src, dst, sem, wait=False):
         cp = pltpu.make_async_copy(src, dst, sem)
@@ -962,7 +969,9 @@ def _mla_batched_decode_kernel(
     phys_tokens_per_page = physical_page_size_per_kv_packing // slots_per_token
 
     max_num_seqs = kv_lens_ref.shape[0]
-    num_page_indices = page_indices_ref.shape[0]
+    num_page_indices = (
+        page_indices_ref.shape[0] if page_indices_count is None else page_indices_count
+    )
     pages_per_seq = num_page_indices // max_num_seqs
 
     bkv_sz = bkv_p * logical_page_size
@@ -991,6 +1000,8 @@ def _mla_batched_decode_kernel(
         return start_offset, jnp.minimum(kv_left_frm_cache, bkv_sz)
 
     def _fetch_bq(batch_idx, sem_idx, wait=False):
+        if fetch_extra is not None:
+            fetch_extra(batch_idx, sem_idx, wait)
         s_start = start_seq_idx + batch_idx * seq_batch_sz
         q_start_seq = jnp.minimum(s_start, max_num_seqs - 1)
         q_token_idx = jnp.where(
@@ -999,6 +1010,10 @@ def _mla_batched_decode_kernel(
             0,
         )
         batch_sz = jnp.clip(end_seq_idx - s_start, 0, seq_batch_sz)
+        if resident_inputs:
+            if not wait:
+                q_batch_x2_vmem[sem_idx] = q_hbm_ref[...]
+            return
         async_copy(
             q_hbm_ref.at[pl.ds(q_token_idx, batch_sz)],
             q_batch_x2_vmem.at[sem_idx, pl.ds(0, batch_sz)],
@@ -1066,12 +1081,16 @@ def _mla_batched_decode_kernel(
                 cu_q_lens_ref[seq_idx_clamped],
                 0,
             )
-            async_copy(
-                new_kv_hbm_ref.at[pl.ds(q_token_idx, sz)],
-                new_kv_vmem_ref.at[pl.ds(bkv_sz_frm_cache, sz)],
-                sem_kv,
-                wait=wait,
-            )
+            if resident_inputs:
+                if not wait:
+                    new_kv_vmem_ref[pl.ds(bkv_sz_frm_cache, 1)] = new_kv_hbm_ref[...]
+            else:
+                async_copy(
+                    new_kv_hbm_ref.at[pl.ds(q_token_idx, sz)],
+                    new_kv_vmem_ref.at[pl.ds(bkv_sz_frm_cache, sz)],
+                    sem_kv,
+                    wait=wait,
+                )
 
     def compute_batch(batch_idx, sem_idx):
         s_start = start_seq_idx + batch_idx * seq_batch_sz
@@ -1139,18 +1158,29 @@ def _mla_batched_decode_kernel(
                 else (pv_batch * pl.reciprocal(l_tile, approx=True)).astype(q_dtype)
             )
 
-        o_batch_x2_vmem[sem_idx, ...] = out
-        num_l_heads = l_batch_x2_vmem.shape[2]
-        if num_l_heads == num_q_heads:
-            l_batch_x2_vmem[sem_idx, ...] = l_val
-            m_batch_x2_vmem[sem_idx, ...] = m_val
+        if finalize is not None:
+            finalize(
+                batch_idx,
+                sem_idx,
+                q_batch,
+                out,
+                l_val,
+                m_val,
+                o_batch_x2_vmem.at[sem_idx],
+            )
         else:
-            l_batch_x2_vmem[sem_idx, ...] = jnp.pad(
-                l_val, ((0, 0), (0, num_l_heads - num_q_heads))
-            )
-            m_batch_x2_vmem[sem_idx, ...] = jnp.pad(
-                m_val, ((0, 0), (0, num_l_heads - num_q_heads))
-            )
+            o_batch_x2_vmem[sem_idx, ...] = out
+            num_l_heads = l_batch_x2_vmem.shape[2]
+            if num_l_heads == num_q_heads:
+                l_batch_x2_vmem[sem_idx, ...] = l_val
+                m_batch_x2_vmem[sem_idx, ...] = m_val
+            else:
+                l_batch_x2_vmem[sem_idx, ...] = jnp.pad(
+                    l_val, ((0, 0), (0, num_l_heads - num_q_heads))
+                )
+                m_batch_x2_vmem[sem_idx, ...] = jnp.pad(
+                    m_val, ((0, 0), (0, num_l_heads - num_q_heads))
+                )
 
     def _send_bo(batch_idx, sem_idx, wait=False):
         s_start = start_seq_idx + batch_idx * seq_batch_sz
@@ -1167,18 +1197,19 @@ def _mla_batched_decode_kernel(
             sems.at[sem_idx, 1],
             wait=wait,
         )
-        async_copy(
-            l_batch_x2_vmem.at[sem_idx, pl.ds(0, batch_sz)],
-            l_hbm_ref.at[pl.ds(q_token_idx, batch_sz)],
-            sems.at[sem_idx, 2],
-            wait=wait,
-        )
-        async_copy(
-            m_batch_x2_vmem.at[sem_idx, pl.ds(0, batch_sz)],
-            m_hbm_ref.at[pl.ds(q_token_idx, batch_sz)],
-            sems.at[sem_idx, 3],
-            wait=wait,
-        )
+        if finalize is None:
+            async_copy(
+                l_batch_x2_vmem.at[sem_idx, pl.ds(0, batch_sz)],
+                l_hbm_ref.at[pl.ds(q_token_idx, batch_sz)],
+                sems.at[sem_idx, 2],
+                wait=wait,
+            )
+            async_copy(
+                m_batch_x2_vmem.at[sem_idx, pl.ds(0, batch_sz)],
+                m_hbm_ref.at[pl.ds(q_token_idx, batch_sz)],
+                sems.at[sem_idx, 3],
+                wait=wait,
+            )
 
     def _update_kv_cache(batch_idx, sem_idx, wait=False):
         s_start = start_seq_idx + batch_idx * seq_batch_sz
@@ -1783,7 +1814,8 @@ def mla_sliding_window_ragged_paged_attention(
             logical_page_size=logical_page_size,
             vmem_limit_bytes=vmem_limit_bytes,
             unnormalized_output=unnormalized_output,
-            seq_batch_sz=decode_seq_batch_size,
+            # Decode has at most one token per active sequence. Avoid padded work.
+            seq_batch_sz=min(decode_seq_batch_size, max(1, q.shape[0])),
         )
     else:
         output, updated_kv, out_l, out_m = run_mla_kernel(

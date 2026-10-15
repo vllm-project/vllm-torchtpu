@@ -397,8 +397,16 @@ class VllmDeepseekV4MLAAttention(
         # attribute a layer stays causal, so target layers are unaffected.
         non_causal = bool(getattr(self, "non_causal_multi_token_decode", False))
 
+        fp8_compute = cast(dict[str, Any], vllm_config.additional_config).get(
+            "tpu_csa_fp8_compute", False
+        )
+        if not isinstance(fp8_compute, bool):
+            raise ValueError("tpu_csa_fp8_compute must be a boolean")
+        csa_fp8_compute = is_csa and fp8_compute
         wrapped_fn = functools.partial(
-            _attention_csa if is_csa else _attention_hca,
+            functools.partial(_attention_csa, use_fp8_compute=csa_fp8_compute)
+            if is_csa
+            else _attention_hca,
             sm_scale=sm_scale,
             sliding_window=self.window_size,
             logical_page_size=logical_page_size,
@@ -413,6 +421,7 @@ class VllmDeepseekV4MLAAttention(
         op_name = (
             f"pallas::deepseek_v4_attention_{op_type}"
             f"_p{logical_page_size}"
+            f"{'_fp8_qk_pv' if csa_fp8_compute else ''}"
             f"{'_aliased' if two_caches_same_buffer else ''}"
             f"{'_ncb' if non_causal else ''}"
             f"{'' if built_from_real_caches else '_prof'}"

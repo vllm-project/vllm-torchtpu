@@ -21,7 +21,7 @@ from absl.testing import absltest, parameterized
 
 # Import the kernels
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
-from vllm_torchtpu.kernels.deepseek_v4.core_attention import sparse_mla
+from vllm_torchtpu.kernels.deepseek_v4.core_attention import csa_metadata, sparse_mla
 
 pytestmark = pytest.mark.tpu_test
 
@@ -75,6 +75,7 @@ def ref_implementation(
     *,
     sm_scale: float = 1.0,
     mask_value: float | None = DEFAULT_MASK_VALUE,
+    use_fp8_compute: bool = False,
 ):
     if mask_value is None:
         mask_value = DEFAULT_MASK_VALUE
@@ -136,6 +137,14 @@ def ref_implementation(
         k_i = flat_kv_c[:kv_len]  # [kv_len, lkv_dim]
         v_i = flat_kv_c[:kv_len]  # [kv_len, lkv_dim]
 
+        if use_fp8_compute:
+            # Independent dense reference: quantize operands, then use FP32 dots.
+            fp8_max = float(jnp.finfo(jnp.float8_e4m3fn).max)
+            q_i = jnp.clip(q_i, -fp8_max, fp8_max).astype(jnp.float8_e4m3fn)
+            k_i = jnp.clip(k_i, -fp8_max, fp8_max).astype(jnp.float8_e4m3fn)
+            v_i = k_i.astype(jnp.float32)
+            q_i, k_i = q_i.astype(jnp.float32), k_i.astype(jnp.float32)
+
         # MQA attention:
         # q:[q_len, actual_num_q_heads, lkv_dim+r_dim]
         # k:[kv_len, lkv_dim+r_dim]
@@ -164,12 +173,16 @@ def ref_implementation(
         l = l_1_scaled + l_2 + l_sinks  # noqa: E741
 
         p_2 = jnp.exp(attn - m)
+        if use_fp8_compute:
+            p_2 = (p_2 * fp8_max).astype(jnp.float8_e4m3fn).astype(jnp.float32)
         acc_2 = jnp.einsum("nqk,kl->qnl", p_2, v_i)
+        if use_fp8_compute:
+            acc_2 *= 1.0 / fp8_max
         exp_m1_diff = jnp.transpose(jnp.exp(m_1 - m), (1, 0, 2))
         acc_1_scaled = swa_accumution_i * exp_m1_diff
         acc = acc_1_scaled + acc_2
 
-        out_i = (acc / jnp.transpose(l, (1, 0, 2))).astype(q_i.dtype)
+        out_i = (acc / jnp.transpose(l, (1, 0, 2))).astype(q.dtype)
         outputs.append(out_i)
 
     return jnp.concatenate(outputs, axis=0)
@@ -354,6 +367,130 @@ class CorrectnessTest(parameterized.TestCase):
         diff_out = np.abs(out_base - out_agent)
         print(f"Max Diff Out: {np.max(diff_out)}")
         np.testing.assert_allclose(out_base, out_agent, rtol=0.1, atol=0.1)
+
+
+@pytest.mark.parametrize(
+    "tokens,seqs,pps,page_size",
+    [
+        (1, 256, 65, 256),
+        (2, 256, 65, 256),
+        (4, 256, 65, 256),
+        (3, 17, 129, 16),
+        (8, 17, 65, 256),
+        (64, 256, 65, 256),
+        (1, 1, 1, 4),
+        (1, 17, 513, 128),
+    ],
+)
+@pytest.mark.parametrize("valid_k", [0, 127, 512])
+def test_fused_csa_metadata_exact_addresses(tokens, seqs, pps, page_size, valid_k):
+    """Preserve mixed/empty sequence mapping, padded rows and int32 scatter."""
+    rng = np.random.default_rng(999)
+    sizes = rng.multinomial(tokens, np.ones(seqs) / seqs).astype(np.int32)
+    if tokens > 1:
+        sizes[np.argmax(sizes)] -= 1  # One padded query after all real tokens.
+    cu = np.r_[0, np.cumsum(sizes)].astype(np.int32)
+    seq_ids = np.repeat(np.arange(seqs), sizes)
+    seq_ids = np.pad(seq_ids, (0, tokens - len(seq_ids)), constant_values=seqs - 1)
+    pages = rng.integers(0, 997, size=(seqs, pps), dtype=np.int32)
+    top = rng.integers(0, pps * page_size, size=(tokens, 512), dtype=np.int32)
+    top[:, valid_k:] = -1
+    logical = np.clip(top // page_size, 0, pps - 1)
+    physical = pages[seq_ids[:, None], logical]
+    flat = np.arange(top.size, dtype=np.int32).reshape(top.shape)
+    physical = np.where(top == -1, (flat * np.int32(104729)) % 997, physical)
+    offset = np.where(
+        top == -1, (flat * np.int32(15485863)) % page_size, top % page_size
+    )
+    reference = (physical * page_size + offset).ravel()
+    actual = jax.jit(
+        lambda t, p, c: csa_metadata.fused_metadata(
+            t, p, c, page_size=page_size, num_pages=997
+        )
+    )(jnp.asarray(top), jnp.asarray(pages.ravel()), jnp.asarray(cu))
+    np.testing.assert_array_equal(np.asarray(actual[0]), reference)
+    np.testing.assert_array_equal(np.asarray(actual[1]), np.sum(top != -1, axis=1))
+
+
+@pytest.mark.parametrize("tokens", [1, 2, 4, 8])
+@pytest.mark.parametrize("use_fp8_compute", [False, True])
+@pytest.mark.parametrize("valid_topk", [0, 127, 512])
+def test_fused_csa_dispatch_and_attention(tokens, use_fp8_compute, valid_topk):
+    """Exercise the actual SparseMLA entry, including masked NaN cache bytes."""
+    if csa_metadata.get_device_name() != "TPU v7":
+        pytest.skip("Dispatch tuning is for TPU v7")
+    rng = np.random.default_rng(42)
+    base, nope, rope = create_cache(rng, 65, 256, 512, jnp.bfloat16)
+    # The final page is outside every valid top-k, but padding scatter can read it.
+    nope = nope.at[-1].set(jnp.int32(-1))
+    rope = rope.at[-1].set(jnp.int32(-1))
+    lengths = np.zeros(256, np.int32)
+    lengths[:tokens] = 512
+    cu = jnp.asarray(np.minimum(np.arange(257), tokens), jnp.int32)
+    distribution = jnp.asarray([tokens, tokens, tokens], jnp.int32)
+    pages = jnp.tile(jnp.arange(65, dtype=jnp.int32), 256)
+    top = np.full((tokens, 512), -1, np.int32)
+    for i in range(tokens):
+        top[i, :valid_topk] = rng.permutation(512)[:valid_topk]
+    q = gen_random(rng, (tokens, 64, 512), jnp.bfloat16)
+    sink = generate_attention_sinks(rng, 64)
+    acc = gen_random(rng, q.shape, jnp.bfloat16)
+    ls = gen_random(rng, (tokens, 64), jnp.float32)
+    ms = gen_random(rng, (tokens, 64), jnp.float32)
+    top = jnp.asarray(top)
+    args = (q, nope, rope, top, pages, cu, distribution, sink, acc, ls, ms)
+    exe = sparse_mla.sparse_ragged_paged_attention.lower(
+        *args, sm_scale=512**-0.5, use_fp8_compute=use_fp8_compute
+    ).compile()
+    assert ("CSA_fused_metadata" in exe.as_text()) == (tokens in (1, 2, 4))
+    assert ("FP8_QK_PV" in exe.as_text()) == use_fp8_compute
+    actual = exe(*args)
+    expected = ref_implementation(
+        q,
+        base,
+        jnp.asarray(lengths),
+        top,
+        pages,
+        cu,
+        distribution,
+        sink,
+        acc,
+        ls,
+        ms,
+        sm_scale=512**-0.5,
+        use_fp8_compute=use_fp8_compute,
+    )
+    assert np.isfinite(np.asarray(actual, dtype=np.float32)).all()
+    # Keep the existing independent reference tolerance. FP8 reference checks
+    # implementation correctness, not model quality against BF16.
+    np.testing.assert_allclose(actual, expected, rtol=0.1, atol=0.1)
+
+
+@pytest.mark.parametrize(
+    "heads,dim,dtype,topk",
+    [
+        (32, 512, jnp.bfloat16, 512),
+        (64, 512, jnp.float32, 512),
+        (64, 512, jnp.bfloat16, 256),
+    ],
+)
+def test_fp8_csa_rejects_unsupported_inputs(heads, dim, dtype, topk):
+    shape = jax.ShapeDtypeStruct
+    with pytest.raises(NotImplementedError, match="FP8 CSA compute requires"):
+        sparse_mla.sparse_ragged_paged_attention.lower(
+            shape((1, heads, dim), dtype),
+            shape((2, 256, 128), jnp.int32),
+            shape((2, 64, 128), jnp.int32),
+            shape((1, topk), jnp.int32),
+            shape((2,), jnp.int32),
+            shape((2,), jnp.int32),
+            shape((3,), jnp.int32),
+            shape((heads,), jnp.float32),
+            shape((1, heads, dim), dtype),
+            shape((1, heads), jnp.float32),
+            shape((1, heads), jnp.float32),
+            use_fp8_compute=True,
+        )
 
 
 if __name__ == "__main__":

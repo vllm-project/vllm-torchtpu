@@ -417,6 +417,26 @@ class CorrectnessTest(parameterized.TestCase):
             subkey, shape=shape, minval=low, maxval=high, dtype=jnp.int32
         )
 
+    @parameterized.parameters((1, 128), (4, 128), (8, 128), (1, 32))
+    def test_small_decode_batch(self, active_sequences, heads):
+        """Exercise decode capacity below 32 with inactive metadata slots."""
+        self.num_heads = heads
+        self.attention_sinks = self.attention_sinks[:heads]
+        self.kv_lens = self.kv_lens.at[:active_sequences].set(1)
+        cu_q_lens = jnp.minimum(
+            jnp.arange(self.batch_size + 1, dtype=jnp.int32), active_sequences
+        )
+        distribution = jnp.full((3,), active_sequences, dtype=jnp.int32)
+        for _ in range(4):
+            q = self.gen_random(
+                (active_sequences, self.num_heads, self.head_dim), self.q_dtype
+            )
+            new_kv = self.gen_random((active_sequences, self.head_dim), self.kv_dtype)
+            self.run_and_compare_outputs(
+                q, new_kv, self.kv_lens, cu_q_lens, distribution
+            )
+            self.kv_lens = self.kv_lens.at[:active_sequences].add(1)
+
     def test_correctness_rng(self):
         print(f"JAX Backend: {jax.default_backend()}")
 

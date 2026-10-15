@@ -252,7 +252,7 @@ def prepare_boundary_batch(
     )
 
 
-def compressor_forward(
+def compressor_forward_generic(
     hidden_states: jax.Array,  # [num_tokens, hidden_size] fp32
     wkv_wgate: jax.Array,  # [2*coff*head_dim, hidden_size] fp32
     ape: jax.Array,  # [compress_ratio, coff*head_dim] fp32
@@ -355,3 +355,108 @@ def compressor_forward(
     # the read supplies the missing ordering edge.
     state_cache, cache = jax.lax.optimization_barrier((state_cache, cache))
     return cache, rope_cache, state_cache
+
+
+def compressor_forward(
+    hidden_states: jax.Array,  # [num_tokens, hidden_size] fp32
+    wkv_wgate: jax.Array,  # [2*coff*head_dim, hidden_size] fp32
+    ape: jax.Array,  # [compress_ratio, coff*head_dim] fp32
+    norm_weight: jax.Array,  # [head_dim] fp32
+    cos_sin_cache: jax.Array,  # [max_pos, rope_head_dim] fp32
+    positions: jax.Array,  # [num_tokens] int
+    block_table: jax.Array,  # [num_reqs * max_blocks] int
+    query_start_loc: jax.Array,  # [num_reqs + 1] int
+    kv_block_table: jax.Array,  # [num_reqs * max_kv_blocks] int
+    cache: jax.Array,  # [num_pages, page_size, 4, 128] u8 / CSA [..., 128] i32
+    rope_cache: jax.Array,  # CSA [num_pages, page_size // 4, 128] int32
+    distribution: jax.Array,  # i32[3]
+    state_block_size: int,
+    head_dim: int,
+    compress_ratio: int,
+    overlap: bool,
+    rms_eps: float,
+    quant_block: int,
+    state_cache: jax.Array | None = None,  # [num_pages, state_page_size, 4, 128] uint8
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Select launch fusion for a supported, device-validated decode batch."""
+    from . import decode_compressor
+
+    args = dict(locals())
+    args.pop("decode_compressor")
+    n = hidden_states.shape[0]
+    reqs = query_start_loc.size - 1
+    eligible = (
+        head_dim == 512
+        and compress_ratio == 4
+        and overlap
+        and quant_block == 64
+        and state_cache is None
+        and rope_cache is not None
+        and cache.dtype == jnp.int32
+        and cache.shape[1:] == (128, 128)
+        and state_block_size == 8
+        and n in (4, 16, 64, 128)
+        and n <= reqs
+        and hidden_states.shape[1] == 4096
+        and wkv_wgate.shape == (4096, 2048)
+    )
+    if not eligible:
+        return compressor_forward_generic(**args)
+    active = distribution[0]
+    req = jnp.arange(n)
+    real = req < active
+    pos = positions
+    st = block_table.reshape(reqs, -1)
+    kt = kv_block_table.reshape(reqs, -1)
+    previous = jnp.maximum(pos - 7, 0) // 8
+    current = pos // 8
+    output = pos // 512
+    a = st[req, previous]
+    b = st[req, current]
+    c = kt[req, output]
+    pair = real[:, None] & real[None, :]
+    distinct = req[:, None] != req[None, :]
+    exclusive = ~jnp.any(
+        pair
+        & distinct
+        & (
+            (a[:, None] == a[None, :])
+            | (a[:, None] == b[None, :])
+            | (b[:, None] == a[None, :])
+            | (b[:, None] == b[None, :])
+            | (c[:, None] == c[None, :])
+        )
+    )
+    disjoint = ~jnp.any(
+        pair & ((c[:, None] == a[None, :]) | (c[:, None] == b[None, :]))
+    )
+    valid = (
+        jnp.all(distribution == active)
+        & (active >= 0)
+        & (active <= n)
+        & jnp.all(
+            query_start_loc == jnp.minimum(jnp.arange(query_start_loc.size), active)
+        )
+        & jnp.all(
+            ~real
+            | (
+                (pos >= 0)
+                & (current < st.shape[1])
+                & (output < kt.shape[1])
+                & (a >= 0)
+                & (a < cache.shape[0])
+                & (b >= 0)
+                & (b < cache.shape[0])
+                & (c >= 0)
+                & (c < min(cache.shape[0], rope_cache.shape[0]))
+            )
+        )
+        & exclusive
+        & disjoint
+    )
+    return jax.lax.cond(
+        valid,
+        lambda _: decode_compressor.compressor_forward(**args),
+        lambda _: compressor_forward_generic(**args),
+        None,
+    )

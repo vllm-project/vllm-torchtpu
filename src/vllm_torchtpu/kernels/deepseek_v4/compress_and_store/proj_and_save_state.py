@@ -385,6 +385,18 @@ def proj_and_save_state(
     Returns:
       The updated KV cache tensor.
     """
+    pin_decode_weight = (
+        hidden_states.shape == (1, 4096)
+        and wkv_wgate.shape == (4096, 2048)
+        and hidden_states.dtype == jnp.bfloat16
+        and wkv_wgate.dtype == jnp.bfloat16
+        and compress_ratio == 4
+    )
+    if pin_decode_weight:
+        # BlockSpec alone permits XLA to stage the full weight in VMEM.
+        # Keep the source in HBM and use the kernel's tiled DMA pipeline.
+        wkv_wgate = pltpu.with_memory_space_constraint(wkv_wgate, pltpu.HBM)
+
     num_tokens, hidden_size = hidden_states.shape
     _, state_dim = wkv_wgate.shape
 

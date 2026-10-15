@@ -169,7 +169,7 @@ def _attention_hca(
     return output, updated_sw_cache
 
 
-def _attention_csa(
+def _attention_csa_generic(
     q: jax.Array,
     new_kv: jax.Array,
     sw_cache: jax.Array,
@@ -192,6 +192,7 @@ def _attention_csa(
     swa_only: bool,
     two_caches_same_buffer: bool,
     non_causal_block: bool = False,
+    use_fp8_compute: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """CSA: sparse gather over top-k rows, NoPE and RoPE in two arrays."""
     if main_cache_kv.shape[0] == 0 or main_cache_rope.shape[0] == 0:
@@ -241,8 +242,101 @@ def _attention_csa(
         sm_scale=sm_scale,
         gather_and_attention_chunk_size=gather_and_attention_chunk_size,
         attention_kernel_batch_size=attention_kernel_batch_size,
+        use_fp8_compute=use_fp8_compute,
     )
     return output, updated_sw_cache
+
+
+def _attention_csa(
+    q: jax.Array,
+    new_kv: jax.Array,
+    sw_cache: jax.Array,
+    swa_kv_lens: jax.Array,
+    swa_page_indices: jax.Array,
+    swa_cu_q_lens: jax.Array,
+    swa_distribution: jax.Array,
+    main_cache_kv: jax.Array,
+    main_kv_lens: jax.Array,
+    extra: jax.Array,  # pass topk_indices for CSA
+    main_page_indices: jax.Array,
+    main_cu_q_lens: jax.Array,
+    main_distribution: jax.Array,
+    attention_sinks: jax.Array,
+    main_cache_rope: jax.Array,
+    *,
+    sm_scale: float,
+    sliding_window: int,
+    logical_page_size: int,
+    swa_only: bool,
+    two_caches_same_buffer: bool,
+    non_causal_block: bool = False,
+    use_fp8_compute: bool = False,
+) -> tuple[jax.Array, jax.Array]:
+    """Dispatch measured pure-decode cases; retain ragged/aliased-cache handling."""
+    from vllm_torchtpu.kernels.deepseek_v4.core_attention import swa_csa_decode
+    from vllm_torchtpu.utils import get_device_name
+
+    operands = dict(locals())
+    for name in ("swa_csa_decode", "get_device_name"):
+        operands.pop(name)
+    b = q.shape[0]
+    eligible = (
+        get_device_name() == "TPU v7"
+        and b in (1, 4, 8, 16)
+        and q.shape[1:] == (64, 512)
+        and q.dtype == jnp.bfloat16
+        and extra.shape == (b, 512)
+        and extra.dtype == jnp.int32
+        and main_cache_kv.dtype == jnp.int32
+        and main_cache_rope.dtype == jnp.int32
+        and main_cache_kv.shape[0] > 0
+        and main_cache_rope.shape[0] > 0
+        and sw_cache.shape[0] > 0
+        # Word-backed pools must use the generic kernel's in-kernel bitcast.
+        # Converting the whole pool to byte slabs materializes every page.
+        and sw_cache.dtype == jnp.uint8
+        and logical_page_size == 128
+        and sliding_window == 128
+        and not two_caches_same_buffer
+        and not non_causal_block
+        and not use_fp8_compute
+        and b < swa_cu_q_lens.size
+        and b < main_cu_q_lens.size
+    )
+    if not eligible:
+        return _attention_csa_generic(**operands)
+    dense = (
+        jnp.all(swa_distribution == b)
+        & jnp.all(main_distribution == b)
+        & jnp.all(swa_cu_q_lens == jnp.minimum(jnp.arange(swa_cu_q_lens.size), b))
+        & jnp.all(main_cu_q_lens == jnp.minimum(jnp.arange(main_cu_q_lens.size), b))
+        & jnp.all(swa_kv_lens[:b] > 0)
+    )
+
+    def decode(_):
+        out, updated = swa_csa_decode.fused_decode(
+            q,
+            new_kv,
+            sw_cache,
+            swa_kv_lens,
+            swa_page_indices.flatten(),
+            swa_cu_q_lens,
+            swa_distribution,
+            main_cache_kv,
+            main_cache_rope,
+            extra,
+            main_page_indices.flatten(),
+            attention_sinks,
+            sm_scale=sm_scale,
+            logical_page_size=logical_page_size,
+            sliding_window=sliding_window,
+            use_decode_metadata=True,
+        )
+        return out, updated
+
+    return jax.lax.cond(
+        dense, decode, lambda _: _attention_csa_generic(**operands), None
+    )
 
 
 def get_packed_mla_head_size(hf_config) -> int:
