@@ -8,6 +8,8 @@ import pytest
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 
+pytestmark = pytest.mark.tpu_test
+
 
 @pytest.mark.parametrize(
     ("bucket", "q_lens", "kv_lengths"),
@@ -129,7 +131,7 @@ def test_ragged_verify_matches_reference_and_preserves_cache(
 
 
 def _lse_combine(out_a, lse_a, out_b, lse_b):
-    """numpy twin of cp_attention.lse_weighted_combine (handles -inf lse)."""
+    """numpy twin of cp_attention.merge_attn_results (handles -inf lse)."""
     m = np.maximum(lse_a, lse_b)
     m_finite = np.isfinite(m)
     m_safe = np.where(m_finite, m, 0.0)

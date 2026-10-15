@@ -18,7 +18,11 @@ from torch_tpu._internal import pallas
 from vllm.config import VllmConfig
 
 from vllm_torchtpu import envs as tpu_envs
-from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
+from vllm_torchtpu.gdn_pool_layout import (
+    DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
+    derive_pooled_gdn_state_layout,
+    pooled_gdn_state_itemsize,
+)
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.gdn.v3 import config as gdn_config
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_wrapper
@@ -363,9 +367,11 @@ def _build_fused_core(lower_bound: float | None, eps: float, num_spec_tokens: in
         # The kernel wants the weight transposed to [dim, 1, kernel_size].
         conv_weight_flat = conv_weight.reshape(kernel_size, -1)
         conv_weight_flat = jnp.transpose(conv_weight_flat, (1, 0))[:, None]
-        if num_spec_tokens > 0 and slot_read_offsets is None:
-            raise ValueError("slot_read_offsets are required for KDA verify")
-        read_offsets = slot_read_offsets[state_indices] if num_spec_tokens > 0 else None
+        read_offsets = None
+        if num_spec_tokens > 0:
+            if slot_read_offsets is None:
+                raise ValueError("slot_read_offsets are required for KDA verify")
+            read_offsets = slot_read_offsets[state_indices]
 
         def run_kernel(conv_in, rec_in, *, batched_only=False, prefill_only=False):
             return gdn_wrapper.fused_conv1d_gdn(
@@ -526,21 +532,50 @@ def _pooled_kda_core(
     state_indices: jax.Array,
     seq_lens: jax.Array,
     distribution: jax.Array,
+    window_distribution: jax.Array | None = None,
+    slot_read_offsets: jax.Array | None = None,
+    ckpt_indices: jax.Array | None = None,
     *,
     lower_bound: float | None,
     eps: float,
     pool_block_tokens: int,
     conv_shard_heads: int | None = None,
+    num_spec_tokens: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     num_reqs = state_indices.shape[0]
+    window = num_spec_tokens + 1
+    dense_offsets = None
+    identity = 1 + jnp.arange(num_reqs, dtype=jnp.int32) * window
+    if num_spec_tokens:
+        if slot_read_offsets is None or ckpt_indices is None:
+            raise ValueError(
+                "Pooled KDA verify requires read offsets and checkpoint indices"
+            )
+        if ckpt_indices.shape != (num_reqs, window):
+            raise ValueError(
+                "Pooled KDA checkpoint indices must match the verify window"
+            )
+        # Manager blocks need not be contiguous. Keep every checkpoint in a
+        # contiguous scratch window, including untouched ragged/prefill tails.
+        # TODO: follow #889's is_shared=True path and access the unified pool
+        # directly via ckpt_indices[s, offset], avoiding per-step gather/scatter
+        # and dense checkpoint temporaries.
+        num_reqs *= window
+        dense_offsets = jnp.zeros(num_reqs + 1, dtype=jnp.int32)
+        dense_offsets = dense_offsets.at[identity].set(slot_read_offsets[state_indices])
+        state_indices = ckpt_indices.reshape(-1)
     num_heads = a_log.shape[0]
     head_dim = norm_weight.shape[0]
     kernel_size = conv_weight.shape[0]
-    elem_bytes = jnp.dtype(pool.dtype).itemsize
-    tok_bytes = math.prod(pool.shape[2:]) * elem_bytes
+    # The pool dtype is the attention KV dtype. The state regions keep the
+    # dtypes gdn_pool_layout fixes for every reader of pool bytes (block
+    # sizing, the Raiden manifest), so an fp8 pool still holds bf16 conv rows.
+    conv_dtype = jnp.dtype(DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.removeprefix("torch."))
+    conv_elem_bytes = pooled_gdn_state_itemsize(DEFAULT_POOLED_GDN_CONV_STATE_DTYPE)
+    tok_bytes = math.prod(pool.shape[2:]) * jnp.dtype(pool.dtype).itemsize
     layout = derive_pooled_gdn_state_layout(
         ssm_bytes=num_heads * head_dim * head_dim * 4,
-        conv_bytes=(kernel_size - 1) * 3 * num_heads * head_dim * elem_bytes,
+        conv_bytes=(kernel_size - 1) * 3 * num_heads * head_dim * conv_elem_bytes,
         token_bytes=tok_bytes,
     )
     # state_indices are MANAGER block ids, and the region offsets are
@@ -599,7 +634,9 @@ def _pooled_kda_core(
     if layout.conv_tokens % conv_shards:
         raise ValueError("KDA conv shards must occupy whole packed pool rows")
     shard_elems = (kernel_size - 1) * 3 * shard_heads * head_dim
-    padded_shard_elems = layout.conv_tokens // conv_shards * tok_bytes // elem_bytes
+    padded_shard_elems = (
+        layout.conv_tokens // conv_shards * tok_bytes // conv_elem_bytes
+    )
     if shard_elems > padded_shard_elems:
         raise ValueError("KDA conv shard exceeds its padded pool region")
     conv_gathered = pool_adapters.gather_region(
@@ -607,7 +644,7 @@ def _pooled_kda_core(
         state_indices,
         tok0=layout.ssm_tokens,
         ntok=layout.conv_tokens,
-        out_dtype=pool.dtype,
+        out_dtype=conv_dtype,
         split=split,
     )
     conv_local = conv_gathered.reshape(num_reqs, conv_shards, padded_shard_elems)[
@@ -623,7 +660,6 @@ def _pooled_kda_core(
     # Dense slot 0 is scratch for the kernel's idempotent null-block writes.
     conv_buf = jnp.concatenate([jnp.zeros_like(conv_local[:1]), conv_local], axis=0)
     ssm_buf = jnp.concatenate([jnp.zeros_like(ssm_local[:1]), ssm_local], axis=0)
-    identity = jnp.arange(1, num_reqs + 1, dtype=jnp.int32)
 
     # The fused conv1d + GDN v3 kernel takes the conv state flat
     # [slots, K - 1, 3*H*D]; the buffers here lay their channels out as
@@ -631,7 +667,7 @@ def _pooled_kda_core(
     # and zero-length sequences are safe under identity indices because the
     # kernel gates their state DMAs to zero size rather than redirecting them
     # to the null slot.
-    fused_core = _build_fused_core(lower_bound, eps)
+    fused_core = _build_fused_core(lower_bound, eps, num_spec_tokens)
     output, new_conv_buf, new_ssm_buf = fused_core(
         mixed_qkv,
         raw_gate,
@@ -647,6 +683,8 @@ def _pooled_kda_core(
         identity,
         seq_lens,
         distribution,
+        window_distribution,
+        dense_offsets,
     )
     new_conv_buf = new_conv_buf.reshape(
         num_reqs + 1, kernel_size - 1, 3, num_heads, head_dim
@@ -689,6 +727,7 @@ def build_kimi_pooled_kda_op(
     lower_bound: float | None,
     eps: float,
     vllm_config: VllmConfig,
+    num_spec_tokens: int = 0,
 ):
     """Build the KDA op that reads and writes its state through the pool.
 
@@ -735,6 +774,9 @@ def build_kimi_pooled_kda_op(
         state_indices: jax.Array,
         seq_lens: jax.Array,
         distribution: jax.Array,
+        window_distribution: jax.Array | None = None,
+        slot_read_offsets: jax.Array | None = None,
+        ckpt_indices: jax.Array | None = None,
     ) -> tuple[jax.Array, jax.Array]:
         # Explicit annotated signature: pallas.jax_op's _verify_signature
         # rejects unannotated *args.
@@ -752,10 +794,14 @@ def build_kimi_pooled_kda_op(
             state_indices,
             seq_lens,
             distribution,
+            window_distribution,
+            slot_read_offsets,
+            ckpt_indices,
             lower_bound=lower_bound,
             eps=eps,
             pool_block_tokens=vllm_config.cache_config.block_size,
             conv_shard_heads=conv_shard_heads,
+            num_spec_tokens=num_spec_tokens,
         )
 
     # vLLM's compile cache is keyed on the model config and not on the op
@@ -763,6 +809,9 @@ def build_kimi_pooled_kda_op(
     # build_kimi_dispatched_kda_op). A pooled program cached from the unfused
     # era would otherwise be served stale.
     op_name = f"pallas::kimi_pooled_kda_fused_{prefix.replace('.', '_')}"
+    op_name += f"_conv_{DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.removeprefix('torch.')}"
+    if num_spec_tokens:
+        op_name += f"_window{num_spec_tokens + 1}"
     if conv_shard_heads is not None:
         # Stored state order is part of the compiled program, including for
         # decode-local requests and prefix-cache seeds, not just PD loads.
@@ -805,6 +854,9 @@ def build_kimi_pooled_kda_op(
         state_indices: torch.Tensor,
         seq_lens: torch.Tensor,
         distribution: torch.Tensor,
+        window_distribution: torch.Tensor | None = None,
+        slot_read_offsets: torch.Tensor | None = None,
+        ckpt_indices: torch.Tensor | None = None,
     ) -> torch.Tensor:
         output, new_pool = pooled_op(
             mixed_qkv,
@@ -820,6 +872,9 @@ def build_kimi_pooled_kda_op(
             state_indices,
             seq_lens,
             distribution,
+            window_distribution,
+            slot_read_offsets,
+            ckpt_indices,
         )
         pool.copy_(new_pool)
         return output

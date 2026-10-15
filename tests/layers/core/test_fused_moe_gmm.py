@@ -278,6 +278,7 @@ def _require_tpu() -> None:
         pytest.fail(f"Expected JAX TPU backend, got {backend}.")
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("masked", [False, True])
 @pytest.mark.parametrize(
     "num_tokens,topk,hidden,uses_v3",
@@ -541,6 +542,7 @@ def test_output_onehot_owner_kernel_respects_mode(mode, owner_called):
     assert call.kwargs == {"num_tokens": 2}
 
 
+@pytest.mark.tpu_test
 def test_fused_moe_local_routing_matches_reference():
     _require_tpu()
 
@@ -697,6 +699,7 @@ def _make_ep_inputs(num_local_experts, seed=0):
     return (hidden_states, w1, w2, w1_bias, w2_bias, topk_weights, local_ids, topk)
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     "num_local_experts,experts_start",
     [
@@ -746,6 +749,7 @@ def test_fused_moe_global_id_remap_matches_local(num_local_experts, experts_star
     )
 
 
+@pytest.mark.tpu_test
 def test_fused_moe_global_id_remap_masks_out_of_range():
     """Non-local global ids must contribute zero (range check + jnp.where)."""
     _require_tpu()
@@ -793,6 +797,50 @@ def test_fused_moe_global_id_remap_masks_out_of_range():
     )
 
 
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("owner_output_mode", ["off", "on"])
+def test_fused_moe_onehot_path_keeps_nan_token_local(owner_output_mode):
+    """A NaN token must not reach other tokens through the one-hot permute and
+    unpermute matmuls (0 * NaN == NaN)."""
+    _require_tpu()
+    (hidden_states, w1, w2, w1_bias, w2_bias, topk_weights, local_ids, topk) = (
+        _make_ep_inputs(16)
+    )
+    kwargs = dict(
+        w1=w1,
+        w2=w2,
+        w1_scale=None,
+        w2_scale=None,
+        w1_bias=w1_bias,
+        w2_bias=w2_bias,
+        topk_ids=local_ids,
+        topk=topk,
+        activation="silu",
+        use_ep=True,
+        use_sparse_core=True,
+        # 4 tokens x top-8 routes stay under this, so both matmuls are one-hot.
+        onehot_moe_permute_threshold=1024,
+    )
+    # The mode is read at trace time; drop traces cached under the other mode.
+    jax.clear_caches()
+    with patch.object(envs, "TPU_MOE_OWNER_OUTPUT_MODE", owner_output_mode):
+        expected = fused_moe_func(
+            hidden_states=hidden_states, topk_weights=topk_weights, **kwargs
+        )
+        # A NaN hidden state also makes that token's router weights NaN.
+        actual = fused_moe_func(
+            hidden_states=hidden_states.at[1].set(jnp.nan),
+            topk_weights=topk_weights.at[1].set(jnp.nan),
+            **kwargs,
+        )
+
+    others = np.array([0, 2, 3])
+    np.testing.assert_allclose(
+        np.asarray(actual)[others], np.asarray(expected)[others], atol=1e-1, rtol=1e-1
+    )
+
+
+@pytest.mark.tpu_test
 def test_fused_moe_func_int4_packed_matches_reference():
     _require_tpu()
 

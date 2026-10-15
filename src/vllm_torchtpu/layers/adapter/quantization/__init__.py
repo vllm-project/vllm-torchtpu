@@ -97,4 +97,5 @@ def get_tpu_quantization_config(
         quant_config_cls.get_name()
     )
     config = VllmConfig.get_quantization_config(model_config, vllm_config.load_config)
+    assert config is not None
     return attach_online_fp8(config, vllm_config)

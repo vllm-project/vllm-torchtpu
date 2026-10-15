@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from contextlib import ExitStack
 from functools import cache
+from typing import cast
 from unittest.mock import patch
 
 import jax
@@ -22,6 +23,7 @@ from vllm.model_executor.layers.linear import (
 from vllm.model_executor.layers.quantization import QuantizationConfig
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.utils import fresh_buffer
 
 from .collective_ops import TokenShardCollectives
 
@@ -132,7 +134,6 @@ class KimiMLP(nn.Module):
         group = self.tp_group
         if sequence_parallel:
             group = self.sp_group or group or get_tp_group()
-        if sequence_parallel:
             hidden_states = group.all_gather(hidden_states, dim=0)
         hidden_states, _ = self.gate_up_proj(hidden_states)
         hidden_states = self.act_fn(hidden_states)
@@ -141,11 +142,11 @@ class KimiMLP(nn.Module):
             hidden_states = self.down_proj.quant_method.apply(
                 self.down_proj, hidden_states, None
             )
-            return (
-                group.reduce_scatter(hidden_states, dim=0)
-                if sequence_parallel
-                else group.all_reduce(hidden_states)
-            )
+            if sequence_parallel:
+                assert group is not None
+                return group.reduce_scatter(hidden_states, dim=0)
+            assert self.tp_group is not None
+            return self.tp_group.all_reduce(hidden_states)
         hidden_states, _ = self.down_proj(hidden_states)
         return hidden_states
 
@@ -172,9 +173,10 @@ class AttentionResidual(nn.Module):
 
     def process_weights_after_loading(self) -> None:
         """Fold the norm and projection weights into one [hidden] vector."""
-        folded = self.norm.weight.float() * self.proj.weight[0].float()
-        out = torch.empty_like(folded)
-        out.copy_(folded)
+        folded = (
+            self.norm.weight.float() * cast(torch.Tensor, self.proj.weight)[0].float()
+        )
+        out = fresh_buffer(folded)
         self.folded_weight = out
         self._prefill_op = (
             _build_attention_residual_op(self.eps) if out.device.type == "tpu" else None

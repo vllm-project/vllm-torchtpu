@@ -41,12 +41,12 @@ def _create_vllm_model(
                         return chat_utils.load_chat_template(
                             tokenizer, chat_template=chat_template
                         )
-                    except Exception:
+                    except Exception:  # noqa: S110
                         pass
                 return getattr(tokenizer, "chat_template", chat_template)
 
             chat_utils.resolve_hf_chat_template = resolve_hf_chat_template
-    except Exception:
+    except Exception:  # noqa: S110
         pass
 
     try:
@@ -67,7 +67,7 @@ def _create_vllm_model(
 
             EngineArgs.__init__ = patched_init
             EngineArgs._swap_space_patched = True
-    except Exception:
+    except Exception:  # noqa: S110
         pass
 
     from lm_eval.models.vllm_causallms import VLLM

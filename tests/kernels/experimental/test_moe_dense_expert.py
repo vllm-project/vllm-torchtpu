@@ -10,6 +10,8 @@ import pytest
 from vllm_torchtpu.kernels.experimental import moe_dense_expert as kernel
 from vllm_torchtpu.layers.core import fused_moe_gmm as wrapper
 
+pytestmark = pytest.mark.tpu_test
+
 
 @pytest.fixture(scope="module")
 def tensors():

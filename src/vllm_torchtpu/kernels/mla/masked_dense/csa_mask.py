@@ -25,7 +25,7 @@ leaves the TensorCore free.
 """
 
 import functools
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -152,4 +152,4 @@ def generate_mask_sc(
         name="sc_mask_generate",
     )(padded_topk_indices)
 
-    return out[:chunk_size, :]
+    return cast(Any, out)[:chunk_size, :]  # pyrefly: ignore[unsupported-operation]

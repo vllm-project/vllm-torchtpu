@@ -30,8 +30,18 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
 os.environ.setdefault("VLLM_DO_NOT_TRACK", "1")
 
+from typing import NamedTuple
+
 import pytest
 import torch
+import vllm.v1.outputs
+
+if not hasattr(vllm.v1.outputs, "RoutedExpertsLists"):
+
+    class RoutedExpertsLists(NamedTuple):
+        pass
+
+    vllm.v1.outputs.RoutedExpertsLists = RoutedExpertsLists  # type: ignore[attr-defined]
 
 
 def pytest_collection_modifyitems(items):
@@ -42,11 +52,20 @@ def pytest_collection_modifyitems(items):
     ``torch.distributed.run`` worker group can no longer bootstrap the slice:
     the workers fail with "PjRtClient is not initialized" and libtpu may tear
     down the whole session with SLICE_FAILURE_SW_INJECT_ERROR. libtpu exposes
-    no release API, so the only safe ordering is spawn-first. The sort is
-    stable, so relative order within each group is unchanged.
+    no release API, so the only safe ordering is spawn-first.
+
+    Within each group, files run in path order, whatever order they were
+    passed in. Tests that start an engine in a subprocess (tests/entrypoints)
+    need the TPU free, so they must run before the in-process tests under
+    tests/kernels and tests/layers, and a sharded run receives its files in
+    the planner's order. The sort is stable, so tests within a file keep
+    their order.
     """
     items.sort(
-        key=lambda item: 0 if item.get_closest_marker("spawns_tpu_workers") else 1
+        key=lambda item: (
+            0 if item.get_closest_marker("spawns_tpu_workers") else 1,
+            item.nodeid.split("::")[0],
+        )
     )
 
 

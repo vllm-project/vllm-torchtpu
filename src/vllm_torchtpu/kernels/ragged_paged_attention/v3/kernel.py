@@ -21,7 +21,7 @@ during inference.
 
 import functools
 from enum import Enum
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -99,7 +99,7 @@ def ref_ragged_paged_attention(
 
     if mask_value is None:
         # We do not set to -inf directly because (-inf) - (-inf) is nan.
-        mask_value = jnp.finfo(out_dtype).min
+        mask_value = cast(float, jnp.finfo(out_dtype).min)
     dynamic_validate_inputs(
         queries,
         keys,
@@ -522,7 +522,7 @@ def _ragged_paged_attention_kernel_loop(
             mask = mask_and(mask, q_span < k_span + sliding_window)
 
         if mask is not None:
-            s = jnp.where(mask, s, mask_value)
+            s = jnp.where(mask, s, cast(float, mask_value))
 
         s_rowmax = jnp.max(s, axis=1, keepdims=True)
         m_prev = m_ref[...]
@@ -1717,7 +1717,7 @@ def ragged_paged_attention(
 
     if mask_value is None:
         # We do not set to -inf directly because (-inf) - (-inf) is nan.
-        mask_value = jnp.finfo(out_dtype).min
+        mask_value = cast(float, jnp.finfo(out_dtype).min)
 
     if vmem_limit_bytes is None:
         # TODO(jevinjiang, jacobplatin): change this to use
@@ -1920,7 +1920,7 @@ def ragged_paged_attention(
                     pltpu.with_memory_space_constraint(kv_cache, pltpu.HBM),
                 )
         else:
-            # TODO(b/494285697): v6 has issues with pinning aliased memory.
+            # TODO: v6 has issues with pinning aliased memory.
             def run(scalar_prefetches, q, kv, kv_cache):
                 return kernel(*scalar_prefetches, q, kv, kv_cache)
 

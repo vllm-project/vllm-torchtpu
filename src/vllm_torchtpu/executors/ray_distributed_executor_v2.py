@@ -230,6 +230,8 @@ class RayDistributedExecutorV2(RayExecutorV2):
 
         self._initialize_ray_cluster()
         placement_group = self.parallel_config.placement_group
+        # _initialize_ray_cluster sets the placement group or raises.
+        assert placement_group is not None
 
         # Step 2: Build bundle assignments for worker rank placement while
         # respecting VLLM_RAY_BUNDLE_INDICES. If it specifies a complete 1:1

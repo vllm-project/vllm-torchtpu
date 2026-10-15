@@ -26,6 +26,8 @@ from vllm_torchtpu.kernels.ragged_paged_attention.v3.kernel import (
     ragged_paged_attention_bundled,
 )
 
+pytestmark = pytest.mark.tpu_test
+
 
 def _require_tpu() -> None:
     try:

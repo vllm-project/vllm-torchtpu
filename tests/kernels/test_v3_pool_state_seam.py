@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """GDN V3 pooled state seam: plan math, byte compatibility, equivalence.
 
 `TestV3StateSourcePlan` and the source-hygiene test are pure Python/CPU.
@@ -197,6 +210,7 @@ def _run_seam(pool, idx, kwargs):
     )
 
 
+@pytest.mark.tpu_test
 class TestSeamMatchesRoundTrip:
     def _compare(self, pool, idx, kwargs):
         pool_rt, out_rt = _run_roundtrip(jnp.copy(pool), idx, kwargs)
@@ -398,6 +412,7 @@ class TestSeamMatchesRoundTrip:
         self._compare(pool, idx, kwargs)
 
 
+@pytest.mark.tpu_test
 class TestSeamSkipsInvalidSlots:
     def test_padded_slots_and_null_block_untouched(self):
         # 2 active decodes on manager blocks 2 and 4; rows 2..3 padded to
@@ -456,6 +471,7 @@ def _write_states_split(pool, ssm, conv, idx, split):
     )
 
 
+@pytest.mark.tpu_test
 class TestPooledSpecWindows:
     """Speculative verify windows on the pooled path.
 
@@ -580,6 +596,7 @@ class TestPooledSpecWindows:
             )
 
 
+@pytest.mark.tpu_test
 class TestPooledCallerV3:
     def test_bf16_ssm_round_trips_through_fp8_pool(self):
         gdn_attention = pytest.importorskip("vllm_torchtpu.layers.core.gdn_attention")

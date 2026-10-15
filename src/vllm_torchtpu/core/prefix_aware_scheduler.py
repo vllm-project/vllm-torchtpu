@@ -29,10 +29,15 @@ Enable with:
 """
 
 from itertools import islice
+from typing import cast
 
 from vllm.logger import init_logger
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
-from vllm.v1.core.sched.request_queue import RequestQueue, SchedulingPolicy
+from vllm.v1.core.sched.request_queue import (
+    FCFSRequestQueue,
+    RequestQueue,
+    SchedulingPolicy,
+)
 from vllm.v1.request import Request
 
 logger = init_logger("vllm." + __name__)
@@ -89,10 +94,20 @@ class PrefixAwareScheduler(AsyncScheduler):
         return (tier, cold_tokens, request.arrival_time), warmth
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
-        queue = super()._select_waiting_queue_for_scheduling()
+        queue = getattr(self, "kv_holding_waiting", None) or getattr(
+            self, "waiting", None
+        )
         if queue is not None:
             self._promote_warmest(queue)
         return queue
+
+    def schedule(self, throttle_prefills: bool = False):
+        queue = getattr(self, "kv_holding_waiting", None) or getattr(
+            self, "waiting", None
+        )
+        if queue is not None:
+            self._promote_warmest(queue)
+        return super().schedule(throttle_prefills)
 
     def _promote_warmest(self, queue: RequestQueue) -> None:
         """Promote the request with the fewest uncached tokens within WINDOW."""
@@ -105,7 +120,8 @@ class PrefixAwareScheduler(AsyncScheduler):
         (best_rank, best_warmth), best = min(scored, key=lambda t: t[0][0])
 
         if best is not head and best_rank < scored[0][0][0]:
-            queue.remove(best)
+            # Only FCFS reaches here (see the early return above).
+            cast(FCFSRequestQueue, queue).remove(best)
             queue.prepend_request(best)
 
         self._paw_n += 1

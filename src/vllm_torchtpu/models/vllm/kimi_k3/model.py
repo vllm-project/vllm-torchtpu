@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Hashable, Iterable
 from typing import cast
 from unittest.mock import patch
 
@@ -65,7 +65,7 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 from .attention import KimiDeltaAttention, MultiHeadLatentAttention, kda_state_dtype
 from .collective_ops import TokenShardCollectives
@@ -198,7 +198,7 @@ class KimiDecoderLayer(nn.Module):
 class KimiModel(nn.Module):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
-        config: KimiLinearConfig = vllm_config.model_config.hf_text_config
+        config = cast(KimiLinearConfig, vllm_config.model_config.hf_text_config)
         logger.info(
             "Kimi optional features: mla_use_output_gate=%s, hidden_act=%s, "
             "activation_situ_beta=%s, activation_situ_linear_beta=%s, "
@@ -256,11 +256,11 @@ class KimiModel(nn.Module):
         positions: torch.Tensor,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, list[torch.Tensor]]:
-        hidden_states = (
-            inputs_embeds
-            if inputs_embeds is not None
-            else self.embed_input_ids(input_ids)
-        )
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
+        else:
+            assert input_ids is not None
+            hidden_states = self.embed_input_ids(input_ids)
         num_tokens = hidden_states.shape[0]
         sequence_parallel = (
             self.sp_prefill
@@ -346,7 +346,7 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
-        self.config: KimiLinearConfig = vllm_config.model_config.hf_text_config
+        self.config = cast(KimiLinearConfig, vllm_config.model_config.hf_text_config)
         self.model = KimiModel(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),
@@ -414,7 +414,7 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
         cls,
         vllm_config: VllmConfig,
     ) -> tuple[tuple[int, ...], tuple[int, int, int]]:
-        config: KimiLinearConfig = vllm_config.model_config.hf_text_config
+        config = cast(KimiLinearConfig, vllm_config.model_config.hf_text_config)
         kda_config = config.linear_attn_config
         assert kda_config is not None
         local_heads = (
@@ -520,7 +520,7 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
 def _tpu_tp_all_gather(input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """Gather a materialized encoder output without leaving the TPU."""
-    materialized = torch.empty_like(input_).copy_(input_)
+    materialized = fresh_buffer(input_)
     synchronize_tensors(materialized)
     gathered = tensor_model_parallel_all_gather(materialized, dim=dim)
     synchronize_tensors(gathered)
@@ -562,7 +562,7 @@ class KimiK3ForConditionalGeneration(
     def __init__(self, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
         model_config = vllm_config.model_config
-        config: KimiK3Config = model_config.hf_config
+        config = cast(KimiK3Config, model_config.hf_config)
         if model_config.multimodal_config is None:
             raise ValueError(
                 "KimiK3ForConditionalGeneration requires multimodal config"
@@ -584,7 +584,7 @@ class KimiK3ForConditionalGeneration(
             )
             if vision_quant_config is None:
                 self.vision_tower = self.vision_tower.to(
-                    device=self.device, dtype=model_config.dtype
+                    device=self.device, dtype=cast(torch.dtype, model_config.dtype)
                 )
             else:
                 self.vision_tower = self.vision_tower.to(device=self.device)
@@ -596,16 +596,19 @@ class KimiK3ForConditionalGeneration(
                 prefix=maybe_prefix(prefix, "mm_projector"),
             )
             self.mm_projector = self.mm_projector.to(
-                device=self.device, dtype=model_config.dtype
+                device=self.device, dtype=cast(torch.dtype, model_config.dtype)
             )
 
         self.quant_config = vllm_config.quant_config
         with self._mark_language_model(vllm_config):
-            self.language_model = init_vllm_registered_model(
-                vllm_config=vllm_config,
-                hf_config=config.text_config,
-                prefix=maybe_prefix(prefix, "language_model"),
-                architectures=["KimiLinearForCausalLM"],
+            self.language_model = cast(
+                KimiLinearForCausalLM,
+                init_vllm_registered_model(
+                    vllm_config=vllm_config,
+                    hf_config=config.text_config,
+                    prefix=maybe_prefix(prefix, "language_model"),
+                    architectures=["KimiLinearForCausalLM"],
+                ),
             )
         self.media_placeholder = config.media_placeholder_token_id
 
@@ -724,7 +727,9 @@ class KimiK3ForConditionalGeneration(
 
     @staticmethod
     def _grid_thw_list(grid_thws: object) -> list[list[int]]:
-        return grid_thws.tolist() if isinstance(grid_thws, torch.Tensor) else grid_thws
+        if isinstance(grid_thws, torch.Tensor):
+            grid_thws = cast(torch.Tensor, grid_thws).tolist()
+        return cast(list[list[int]], grid_thws)
 
     def get_encoder_cudagraph_item_specs(self, mm_kwargs: dict[str, object]):
         from vllm.v1.worker.encoder_cudagraph_defs import EncoderItemSpec
@@ -772,10 +777,13 @@ class KimiK3ForConditionalGeneration(
         device: torch.device,
         dtype: torch.dtype,
         path: str = "default",
+        axis_keys: tuple[Hashable, ...] | None = None,
     ):
         from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphCaptureInputs
 
         del max_frames_per_batch  # image-only modality
+        if axis_keys:
+            raise ValueError("Kimi K3 does not define encoder capture axes")
 
         merge_h, merge_w = self.vision_tower.merge_kernel_size
         # Ceil so captured capacity is never smaller than token_budget when
@@ -826,7 +834,7 @@ class KimiK3ForConditionalGeneration(
             ),
             device=device,
         )
-        values = dict(metadata)
+        values = {key: value for key, value in metadata.items() if value is not None}
         values["pixel_values"] = dummy_pixel_values
         return EncoderCudaGraphCaptureInputs(values=values)
 
@@ -940,7 +948,7 @@ class KimiK3ForConditionalGeneration(
         if merged.device.type != "tpu":
             return merged
 
-        materialized = torch.empty_like(merged).copy_(merged)
+        materialized = fresh_buffer(merged)
         synchronize_tensors(materialized)
         return materialized
 

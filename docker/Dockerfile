@@ -2,6 +2,32 @@
 # This Dockerfile builds images for running vLLM on Google Cloud TPUs.
 # It pre-installs all dependencies from pyproject.toml (including torch-tpu) in the base variant.
 
+# vllm-router (vllm-project/router), the prefill/decode router the
+# disaggregated benchmarks put in front of an engine pair. Built from source
+# in a stage of its own; the pin is a build arg so a run can try another
+# commit without touching this file.
+FROM python:3.12-slim-bookworm AS router-build
+
+# pkg-config and libssl-dev: hf-hub links the system OpenSSL.
+RUN apt-get update && apt-get install -y curl git build-essential pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.95
+
+ARG VLLM_ROUTER_COMMIT=5d3c3af9a41dec2d5ecff412024b7a743763472d
+WORKDIR /build/router
+RUN git clone --quiet --filter=blob:none https://github.com/vllm-project/router.git . && \
+    git checkout --quiet "${VLLM_ROUTER_COMMIT}"
+
+# The soft open-file limit of a BuildKit RUN step (1024) is too low for one
+# rustc per core.
+RUN --mount=type=cache,target=/opt/cargo/registry \
+    --mount=type=cache,target=/opt/cargo/git \
+    ulimit -n "$(ulimit -Hn)" && \
+    cargo build --release --locked --bin vllm-router && \
+    install -m 0755 target/release/vllm-router /usr/local/bin/vllm-router && \
+    vllm-router --version
+
 # Variant 1: The Runtime (Base Image with pre-installed dependencies)
 # This variant provides the core runtime environment with all external dependencies
 # (including torch-tpu) pre-installed.
@@ -45,6 +71,7 @@ ENV VLLM_TARGET_DEVICE=empty
 
 # Install all dependencies from pyproject.toml. We mount the gcloud token secret
 # to authenticate with the private torch-tpu registry, falling back to PyPI for other packages.
+# vLLM comes from the `vllm` dependency group (see pyproject.toml).
 RUN --mount=type=cache,target=/root/.cache/uv \
     --mount=type=secret,id=gcloud_token \
     set -eu; \
@@ -57,7 +84,8 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       --index https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/ \
       --extra-index-url https://pypi.org/simple \
       --index-strategy unsafe-best-match \
-      -r pyproject.toml
+      -r pyproject.toml \
+      --group vllm
 
 
 # Variant 2: The CI Environment (CI/CD Variant)
@@ -79,6 +107,11 @@ RUN apt-get update && apt-get install -y apt-transport-https ca-certificates gnu
     apt-get update && apt-get install -y google-cloud-cli gcsfuse && \
     rm -rf /var/lib/apt/lists/*
 
+# The P/D router the disaggregated benchmark clients start when the serve
+# config asks for it (AGENTX_PROXY=router). A client-side tool, so ci and
+# dev only; prod serves and does not route.
+COPY --from=router-build /usr/local/bin/vllm-router /usr/local/bin/vllm-router
+
 # Start from an empty PYTHONPATH; the dev and prod stages set their own.
 ENV PYTHONPATH=""
 
@@ -99,10 +132,13 @@ FROM ci AS dev
 # Pre-install test and benchmarking dependencies before copying full source tree
 # so that changes to folders like src/ or tests/ do not invalidate the
 # dependency installation layer cache.
+# --group vllm keeps vLLM (already installed in base) in this resolution, so
+# the test/benchmarking deps cannot move shared packages outside vLLM's pins.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system \
       -r pyproject.toml \
-      --extra test \
+      --group vllm \
+      --group test \
       --extra benchmarking
 
 COPY . .
@@ -115,10 +151,10 @@ RUN if [ -n "$VLLM_COMMIT_HASH" ]; then \
       sed -i -E "s|(git\+https://github\.com/vllm-project/vllm\.git@)[a-zA-Z0-9.-]+|\1${VLLM_COMMIT_HASH}|g" pyproject.toml; \
     fi
 
-# Scoped to the vllm_torchtpu dist: the unscoped SETUPTOOLS_SCM_PRETEND_VERSION
+# Scoped to the vllm-torchtpu-core dist: the unscoped SETUPTOOLS_SCM_PRETEND_VERSION
 # also applies to any other scm-versioned package built in this step.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU=0.0.0 \
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU_CORE=0.0.0 \
     uv pip install --system --no-deps -e .
 
 # Install vLLM from source if requested.
@@ -143,9 +179,12 @@ CMD ["/bin/bash"]
 # Variant 4: Omni Image (Omni Variant with dev + omni dependencies)
 FROM dev AS omni
 
+# --group vllm keeps vLLM's source pin in this resolution, so vllm-omni cannot
+# replace it with a PyPI vllm.
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system \
       -r pyproject.toml \
+      --group vllm \
       --extra omni
 
 
@@ -166,7 +205,7 @@ RUN if [ -n "$VLLM_COMMIT_HASH" ]; then \
 
 # Use --no-deps to preserve layer caching since dependencies were already resolved and installed in base.
 RUN --mount=type=cache,target=/root/.cache/uv \
-    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU=0.0.0 \
+    SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU_CORE=0.0.0 \
     uv pip install --system --no-deps .
 
 RUN if [ -z "$VLLM_SOURCE" ] && [ -d /workspace/vllm-torchtpu/vllm ]; then \

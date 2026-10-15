@@ -2,8 +2,10 @@
 
 ## Repository standards
 
-- `docs/coding_guidance.md` (R-1.x through R-8.x coding style and hygiene)
-- `docs/optimization_best_practices.md` (TPU performance and memory invariants)
+- `docs/developers_guide/coding_guidance.md` (R-1.x through R-8.x coding style
+  and hygiene)
+- `docs/developers_guide/optimization_best_practices.md` (TPU performance and
+  memory invariants)
 - `docs/developers_guide/type_checking.md` (pyrefly and ruff checks: running
   them locally before a PR, fixing new errors, baseline rules)
 

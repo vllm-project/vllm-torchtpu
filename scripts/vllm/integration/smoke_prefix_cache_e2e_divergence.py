@@ -1,4 +1,17 @@
 #!/usr/bin/env python3
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import argparse
 import json
 import math
@@ -25,11 +38,16 @@ def env_float(name: str, default: float) -> float:
         raise SystemExit(f"{name} must be a float: {raw}") from exc
 
 
+# Sent with every request. main() adds vLLM's X-data-parallel-rank from
+# --data-parallel-rank.
+EXTRA_HEADERS: dict = {}
+
+
 def post_json(url: str, payload: dict, timeout: int) -> tuple[int, dict, float]:
     request = urllib.request.Request(
         url,
         data=json.dumps(payload).encode(),
-        headers={"Content-Type": "application/json"},
+        headers={"Content-Type": "application/json", **EXTRA_HEADERS},
         method="POST",
     )
     start = time.time()
@@ -270,6 +288,13 @@ def parse_args() -> argparse.Namespace:
         "--run-id",
         help="Fixed prompt run ID for fresh-server regression tests; defaults to time.",
     )
+    parser.add_argument(
+        "--data-parallel-rank",
+        type=int,
+        help="Hold every request to this DP rank of the engine, with vLLM's "
+        "X-data-parallel-rank header; through a P/D proxy, of both engines. "
+        "Replicas differ slightly in greedy output, and this compares tokens.",
+    )
     return parser.parse_args()
 
 
@@ -285,6 +310,8 @@ def main() -> int:
     if args.chat_template_kwargs is not None:
         CHAT_TEMPLATE_KWARGS.clear()
         CHAT_TEMPLATE_KWARGS.update(args.chat_template_kwargs)
+    if args.data_parallel_rank is not None:
+        EXTRA_HEADERS["X-data-parallel-rank"] = str(args.data_parallel_rank)
     url = f"http://{args.host}:{args.port}/v1/chat/completions"
     run_id = args.run_id if args.run_id is not None else str(int(time.time() * 1000))
     hit_attempts = 0

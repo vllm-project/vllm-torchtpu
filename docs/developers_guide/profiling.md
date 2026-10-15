@@ -405,9 +405,9 @@ Complete reference GKE `Deployment` and `Service` manifests for both clusters
 are available in `docs/developers_guide/examples/`:
 
 * **Prefill Pod Manifest (`TPU v6e 2x2, PCP=4, TP=1`)**:
-  [`docs/developers_guide/examples/raiden_pd_prefill.yaml`](examples/raiden_pd_prefill.yaml)
+  [`docs/developers_guide/examples/raiden_pd_prefill.yaml`](https://github.com/vllm-project/vllm-torchtpu/blob/main/docs/developers_guide/examples/raiden_pd_prefill.yaml)
 * **Decode Pod Manifest (`TPU v6e 2x2, DP=4, TP=1`)**:
-  [`docs/developers_guide/examples/raiden_pd_decode.yaml`](examples/raiden_pd_decode.yaml)
+  [`docs/developers_guide/examples/raiden_pd_decode.yaml`](https://github.com/vllm-project/vllm-torchtpu/blob/main/docs/developers_guide/examples/raiden_pd_decode.yaml)
 
 Deploy both manifests into your target namespace (e.g., `disagg-1-1`):
 

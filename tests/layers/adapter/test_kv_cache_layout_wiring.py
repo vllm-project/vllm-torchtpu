@@ -1,10 +1,23 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Wiring of `VLLM_KV_CACHE_LAYOUT` onto the batched-RPA KV cache layout.
 
     unset / NHD -> HEAD_ALONG_SUBLANE, byte-identical to the inherited layout
     HND         -> SEQ_ALONG_LANE, tokens on lanes and head_dim in the words
 
 Only the second makes an fp8 page smaller than a bf16 page when a rank holds a
-single KV head (b/510425663).
+single KV head.
 """
 
 import contextlib
@@ -31,8 +44,9 @@ KVLayout = batched_rpa_configs.KVLayout
 BASE = PallasAttentionBackend
 BATCHED = PallasBatchedRPAAttentionBackend
 
-# (num_kv_heads, head_size); 1 KV head is the b/510425663 case (a TP=4 rank of
-# a 4-KV-head model), 128 and 256 are the head widths in use on this backend.
+# (num_kv_heads, head_size); 1 KV head (a TP=4 rank of a 4-KV-head model) is the
+# case where only SEQ_ALONG_LANE halves the fp8 page. 128 and 256 are the head
+# widths in use on this backend.
 HEAD_CASES = [(1, 128), (1, 256), (2, 128), (4, 128), (8, 128), (8, 256)]
 # Subset for properties that only carry a value through rather than recompute it.
 HEAD_CASES_CORE = [(1, 128), (2, 128), (8, 256)]
@@ -137,7 +151,6 @@ def test_default_shape_matches_inherited(
 KERNEL_BLOCK_SIZES = [128, 256]
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize("layout", ["NHD", "HND"])
 @pytest.mark.parametrize("dtype", [BF16, FP8])
 @pytest.mark.parametrize("head_dim", [64, 256, 512])
@@ -231,6 +244,7 @@ def test_bf16_pages_are_identical_across_layouts(hnd, num_kv_heads, head_size):
 # Shape contracts the rest of the stack depends on
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("num_kv_heads,head_size", HEAD_CASES)
 @pytest.mark.parametrize("dtype", [BF16, FP8])
 def test_shape_matches_the_kernel_wrapper(hnd, num_kv_heads, head_size, dtype):
@@ -383,6 +397,7 @@ def test_layout_blind_backend_would_lose_the_halving(hnd):
 # Head width read off the cache
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("head_size", [80, 128, 256])
 @pytest.mark.parametrize("layout", ["HND", None])
 def test_page_carries_head_width_where_forward_reads_it(monkeypatch, layout, head_size):

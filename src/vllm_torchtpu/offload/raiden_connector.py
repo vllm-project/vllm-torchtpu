@@ -46,7 +46,7 @@ Core mechanisms:
 from __future__ import annotations
 
 import os
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -170,8 +170,11 @@ class RaidenOffloadingWorkerMetadata(OffloadingWorkerMetadata):
         merged_fenced = dict(self.fenced_jobs)
         for job_id, v in other.fenced_jobs.items():
             merged_fenced[job_id] = merged_fenced.get(job_id, 0) + v
+        # completed_jobs and transfer_stats are inherited from vLLM base dataclass.
         return RaidenOffloadingWorkerMetadata(
+            # pyrefly: ignore[unexpected-keyword]
             completed_jobs=merged_completed,
+            # pyrefly: ignore[unexpected-keyword]
             transfer_stats=self.transfer_stats.aggregate(other.transfer_stats),
             fenced_jobs=merged_fenced,
         )
@@ -404,7 +407,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
 
     # -- worker-side hooks -------------------------------------------------
     def register_kv_caches(
-        self, kv_caches: dict[str, torch.Tensor | list[torch.Tensor]]
+        self, kv_caches: Mapping[str, torch.Tensor | list[torch.Tensor]]
     ):
         """Register the TPU UBP as zero-copy canonical offload tensors.
 
@@ -505,6 +508,16 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         block_ids = self._load_error_block_ids
         self._load_error_block_ids = set()
         return block_ids
+
+    def get_block_ids_with_load_errors_group_index(self) -> int | None:
+        """Returns None: offload load errors are not scoped to one KV group.
+
+        The runner reads this whenever ``get_block_ids_with_load_errors``
+        returns a non-empty set. Failed device block ids come from the
+        scheduler-side block table and resolve against every cache group,
+        so there is no single group index to report.
+        """
+        return None
 
     def build_connector_worker_meta(self) -> OffloadingWorkerMetadata | None:
         if not (self._fenced_jobs or self._completed_jobs):

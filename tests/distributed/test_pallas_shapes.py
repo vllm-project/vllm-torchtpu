@@ -10,6 +10,7 @@ from torch_tpu._internal.pallas import pallas
 from vllm_torchtpu.distributed import pallas_shapes
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     "spec,expected",
     [

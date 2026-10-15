@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+from typing import cast
+
 import torch
 from torch import nn
 from vllm.config import VllmConfig
@@ -48,6 +50,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     is_pcp_streaming_attention_metadata,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import fresh_buffer
 
 from .collective_ops import FusedPrefillCollectives
 
@@ -380,9 +383,12 @@ class MultiHeadLatentAttention(nn.Module):
             and getattr(projection, WEIGHT_FLIPPED_ATTR, False)
         ):
             return
+        assert self.q_a_layernorm is not None
         eps = self.q_a_layernorm.variance_epsilon
         if eps != self.kv_a_layernorm.variance_epsilon:
             raise ValueError("K3 MLA preprocessing requires matching norm epsilons")
+        # torch's Module.__setattr__ stub rejects a function as the value.
+        # pyrefly: ignore[bad-argument-type]
         pack, wrapper.kimi_preprocess = group.mla_ops(eps)
         with torch.no_grad():
             wrapper.kimi_gate_weight = pack(weight)
@@ -394,6 +400,7 @@ class MultiHeadLatentAttention(nn.Module):
         sequence_parallel: bool = False,
     ) -> torch.Tensor:
         group = self.prefill_group if sequence_parallel else get_tp_group()
+        assert group is not None
         if (
             sequence_parallel
             and getattr(self.mla_attn, "kimi_preprocess", None) is None
@@ -581,6 +588,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             lower_bound=self.gate_lower_bound,
             eps=config.rms_norm_eps,
             vllm_config=vllm_config,
+            num_spec_tokens=self.num_spec_tokens,
         )
 
         context = vllm_config.compilation_config.static_forward_context
@@ -636,10 +644,9 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         # `fused` is the lazy result of a stack of views, and torch_tpu
         # re-materializes that lineage as a per-step `tt_jit_as_strided`
         # program at the dispatched op's boundary (same failure mode and fix as
-        # the w_scale case in quantization/fp8.py). A fresh buffer filled by
-        # copy_ breaks the lazy chain so PJRT ships a plain row-major buffer.
-        out = torch.empty_like(fused)
-        out.copy_(fused)
+        # the w_scale case in quantization/fp8.py). `fresh_buffer` breaks the
+        # lazy chain so PJRT ships a plain row-major buffer.
+        out = fresh_buffer(fused)
         self.conv_weight_fused = out
         self._pack_prefill_projection()
 
@@ -655,6 +662,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             return
         projections = (self.fused_qkvb_proj, self.g_proj, self.f_a_proj)
         expected = ((7168, 1155), (7168, 384), (7168, 128))
+        weights = []
         for projection, shape in zip(projections, expected):
             weight = getattr(projection, "weight", None)
             if (
@@ -664,8 +672,9 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 or not getattr(projection, WEIGHT_FLIPPED_ATTR, False)
             ):
                 return
+            weights.append(weight)
         # q/k/v occupy 1152 columns; pad the 3 beta columns to an MXU tile.
-        qkvb, gate, fa = (p.weight for p in projections)
+        qkvb, gate, fa = weights
         with torch.no_grad():
             packed = torch.cat((qkvb, qkvb.new_zeros((7168, 125)), gate, fa), dim=-1)
             # Materialize the layout once, avoiding a lazy cat at every call.
@@ -680,6 +689,10 @@ class KimiDeltaAttention(nn.Module, MambaBase):
     ) -> torch.Tensor:
         del positions
         group = self.prefill_group if sequence_parallel else get_tp_group()
+        assert group is not None
+        output_gate: torch.Tensor | None = None
+        # Set and read only on the low-rank gate path.
+        gate_input: torch.Tensor | None = None
         if self.packed_prefill_weight is not None:
             # Every token bucket must capture the same parameter list: the
             # serving compiler hands executables between traces by input ABI.
@@ -717,6 +730,7 @@ class KimiDeltaAttention(nn.Module, MambaBase):
         if not self.use_full_rank_gate:
             assert self.g_b_proj is not None
             output_gate, _ = self.g_b_proj(gate_input)
+        assert output_gate is not None
 
         metadata = self._metadata()
         if metadata is None or self.kv_cache is None or self.kv_cache[0].numel() == 0:
@@ -756,12 +770,12 @@ class KimiDeltaAttention(nn.Module, MambaBase):
                 self.A_log,
                 self.dt_bias,
                 self.o_norm.weight,
-                metadata.query_start_loc,
-                metadata.mamba_state_indices,
-                metadata.seq_lens,
-                metadata.request_distribution,
-                window_distribution,
-                slot_read_offsets,
+                cast(torch.Tensor, metadata.query_start_loc),
+                cast(torch.Tensor, metadata.mamba_state_indices),
+                cast(torch.Tensor, metadata.seq_lens),
+                cast(torch.Tensor, metadata.request_distribution),
+                cast(torch.Tensor, window_distribution),
+                cast(torch.Tensor, slot_read_offsets),
             ).flatten(1)
 
         if sequence_parallel and isinstance(group, FusedPrefillCollectives):
@@ -788,17 +802,18 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             raise NotImplementedError(
                 "KDA does not support PCP streaming prefill with the unified KV pool"
             )
-        if metadata.mamba_slot_read_offsets is not None:
-            # Speculative verify needs per-window state checkpoints; the
-            # pooled gather/scatter path keeps a single state per block.
-            raise NotImplementedError(
-                "Speculative decoding is not supported with pooled KDA"
-            )
         state_indices = metadata.mamba_state_indices
         if state_indices is None:
             raise RuntimeError(
                 "Pooled KDA requires mamba_state_indices in the attention metadata"
             )
+        # AttentionMetadata also describes the JAX-side representation. The
+        # builder supplies Torch tensors here, before the Torch-to-JAX bridge.
+        window_distribution = cast(
+            torch.Tensor | None, metadata.mamba_request_distribution
+        )
+        slot_read_offsets = cast(torch.Tensor | None, metadata.mamba_slot_read_offsets)
+        ckpt_indices = cast(torch.Tensor | None, metadata.mamba_ckpt_indices)
         return self.pooled_kda_op(
             mixed_qkv,
             raw_gate,
@@ -809,8 +824,11 @@ class KimiDeltaAttention(nn.Module, MambaBase):
             self.A_log,
             self.dt_bias,
             self.o_norm.weight,
-            metadata.query_start_loc,
-            state_indices,
-            metadata.seq_lens,
-            metadata.request_distribution,
+            cast(torch.Tensor, metadata.query_start_loc),
+            cast(torch.Tensor, state_indices),
+            cast(torch.Tensor, metadata.seq_lens),
+            cast(torch.Tensor, metadata.request_distribution),
+            window_distribution,
+            slot_read_offsets,
+            ckpt_indices,
         )

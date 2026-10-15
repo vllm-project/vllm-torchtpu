@@ -45,7 +45,7 @@ scaling.
    - Returns output tensor
 """
 
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
 import jax.numpy as jnp
 import torch
@@ -56,7 +56,10 @@ from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
     Mxfp4MoeBackend as Mxfp4Backend,
 )
 from vllm.model_executor.layers.linear import LinearBase
-from vllm.model_executor.layers.quantization import register_quantization_config
+from vllm.model_executor.layers.quantization import (
+    QuantizationMethods,
+    register_quantization_config,
+)
 from vllm.model_executor.layers.quantization.base_config import QuantizeMethodBase
 from vllm.model_executor.layers.quantization.mxfp4 import Mxfp4Config, Mxfp4MoEMethod
 from vllm.model_executor.layers.quantization.utils.quant_utils import is_layer_skipped
@@ -75,9 +78,16 @@ from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
 )
 from vllm_torchtpu.layers.adapter.quantization.configs import VllmQuantConfig
 from vllm_torchtpu.layers.core.quant_methods import MXFP4, get_tpu_quant_method
-from vllm_torchtpu.layers.core.quantization import dequantize_mxfp4_packed
+from vllm_torchtpu.layers.core.quantization import (
+    dequantize_mxfp4_packed,
+    dequantize_tensor,
+    e8m0_to_fp32,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
+
+if TYPE_CHECKING:
+    from vllm_torchtpu.layers.adapter.quantization.configs import TpuRoutedExperts
 
 logger = init_logger(__name__)
 
@@ -93,7 +103,7 @@ class VllmMxfp4Config(Mxfp4Config, VllmQuantConfig):
     """
 
     @classmethod
-    def get_name(cls) -> str:
+    def get_name(cls) -> QuantizationMethods:
         """Return the base quantization method name."""
         return MXFP4
 
@@ -153,6 +163,42 @@ class VllmMxfp4Config(Mxfp4Config, VllmQuantConfig):
         return None
 
 
+def _dequantize_mxfp4_packed_on_device(
+    weight_packed: torch.Tensor,
+    scale_u8: torch.Tensor,
+    axis: int,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """`dequantize_mxfp4_packed`, bit for bit, without leaving the device.
+
+    The e8m0 scales are decoded on CPU, since `torch.ldexp` overflows on TPU
+    (see `e8m0_to_fp32`); they are 1/16 of the packed bytes. The fp4 nibbles
+    are decoded with selects rather than a LUT gather. Every product is an
+    fp4 value times a power of two, so it is exact in fp32 and in bf16.
+    """
+    scale = e8m0_to_fp32(scale_u8.to("cpu")).to(weight_packed.device)
+
+    def decode(nibble: torch.Tensor) -> torch.Tensor:
+        exponent = (nibble >> 1) & 3
+        mantissa = (nibble & 1).to(torch.float32)
+        # e2m1: 0, 0.5 | 1, 1.5 | 2, 3 | 4, 6
+        magnitude = torch.where(
+            exponent == 0,
+            mantissa * 0.5,
+            torch.where(
+                exponent == 1,
+                1.0 + mantissa * 0.5,
+                torch.where(exponent == 2, 2.0 + mantissa, 4.0 + mantissa * 2.0),
+            ),
+        )
+        return torch.where((nibble & 8) != 0, -magnitude, magnitude)
+
+    packed = weight_packed.to(torch.int32)
+    unpacked = torch.stack([decode(packed & 0x0F), decode(packed >> 4)], dim=-1)
+    unpacked = unpacked.reshape(*weight_packed.shape[:-1], -1)
+    return dequantize_tensor(unpacked, scale, axis, out_dtype)
+
+
 def _get_activation_str(activation) -> str:
     """Convert MoEActivation enum or string to plain string."""
     return activation.value if hasattr(activation, "value") else str(activation)
@@ -200,6 +246,7 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
 
     def process_weights_after_loading(self, layer: torch.nn.Module):
         assert isinstance(layer, RoutedExperts)
+        layer = cast("TpuRoutedExperts", layer)
         assert layer.moe_config.has_bias, "MXFP4 quantization requires bias."
 
         activation_str = self._set_tpu_activation(layer)
@@ -229,8 +276,9 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
         layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
 
-        layer.w13_weight_scale = None
-        layer.w2_weight_scale = None
+        # Same as `= None`, which torch's stubs reject.
+        layer.register_parameter("w13_weight_scale", None)
+        layer.register_parameter("w2_weight_scale", None)
 
         if layer.w13_bias is not None:
             w13_bias = layer.w13_bias.data
@@ -279,6 +327,7 @@ class VllmMxfp4MoEMethod(TpuMoEActivationMixin, Mxfp4MoEMethod):
         input_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass using GMM kernel."""
+        layer = cast("TpuRoutedExperts", layer)
         activation_str = self._tpu_activation_str
         assert activation_str is not None, (
             "[moe] process_weights_after_loading did not run for this layer"
@@ -438,36 +487,45 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
 
     def _dequantize_and_pad(
         self,
-        layer: RoutedExperts,
+        layer: "TpuRoutedExperts",
     ) -> tuple[
         torch.Tensor, torch.Tensor, torch.Tensor | None, torch.Tensor | None, int
     ]:
-        """Dequantize staged shards on CPU, concatenate w13, and pad to
-        strided block boundaries."""
-        w1_scale = layer.w13_weight_scale.data.to("cpu")[:, : self.intermediate_size, :]
-        w3_scale = layer.w13_weight_scale.data.to("cpu")[:, self.intermediate_size :, :]
-        w2_scale = layer.w2_weight_scale.data.to("cpu")
+        """Dequantize staged shards, concatenate w13, and pad to strided block
+        boundaries: on the device the shards sit on when
+        VLLM_TPU_MXFP4_DEVICE_DEQUANT is set, else on CPU."""
+        assert isinstance(layer.w13_weight, torch.Tensor)
+        assert isinstance(layer.w13_weight_scale, torch.Tensor)
+        assert isinstance(layer.w2_weight, torch.Tensor)
+        assert isinstance(layer.w2_weight_scale, torch.Tensor)
+        if envs.VLLM_TPU_MXFP4_DEVICE_DEQUANT:
+            work_device = layer.w13_weight.device
+            dequantize = _dequantize_mxfp4_packed_on_device
+        else:
+            work_device = torch.device("cpu")
+            dequantize = dequantize_mxfp4_packed
+        w1_scale = layer.w13_weight_scale.data.to(work_device)[
+            :, : self.intermediate_size, :
+        ]
+        w3_scale = layer.w13_weight_scale.data.to(work_device)[
+            :, self.intermediate_size :, :
+        ]
+        w2_scale = layer.w2_weight_scale.data.to(work_device)
 
         # w13 packs w1|w3 as contiguous halves along dim 1, matching how the
         # scales are sliced above.
-        w13_packed = layer.w13_weight.data.to("cpu")
-        w2_packed = layer.w2_weight.data.to("cpu")
+        w13_packed = layer.w13_weight.data.to(work_device)
+        w2_packed = layer.w2_weight.data.to(work_device)
         w1_packed = w13_packed[:, : self.intermediate_size, :]
         w3_packed = w13_packed[:, self.intermediate_size :, :]
 
-        w1_dequant = dequantize_mxfp4_packed(
-            w1_packed, w1_scale, axis=2, out_dtype=torch.bfloat16
-        )
-        w3_dequant = dequantize_mxfp4_packed(
-            w3_packed, w3_scale, axis=2, out_dtype=torch.bfloat16
-        )
-        w2_dequant = dequantize_mxfp4_packed(
-            w2_packed, w2_scale, axis=2, out_dtype=torch.bfloat16
-        )
+        w1_dequant = dequantize(w1_packed, w1_scale, axis=2, out_dtype=torch.bfloat16)
+        w3_dequant = dequantize(w3_packed, w3_scale, axis=2, out_dtype=torch.bfloat16)
+        w2_dequant = dequantize(w2_packed, w2_scale, axis=2, out_dtype=torch.bfloat16)
         _w13_bias = getattr(layer, "w13_bias", None)
         _w2_bias = getattr(layer, "w2_bias", None)
-        w13_bias = _w13_bias.data.to("cpu") if _w13_bias is not None else None
-        w2_bias = _w2_bias.data.to("cpu") if _w2_bias is not None else None
+        w13_bias = _w13_bias.data.to(work_device) if _w13_bias is not None else None
+        w2_bias = _w2_bias.data.to(work_device) if _w2_bias is not None else None
 
         w13_weight = (
             torch.cat([w1_dequant, w3_dequant], dim=1).transpose(1, 2).contiguous()
@@ -565,6 +623,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         # TODO(upstream): Extract generic on-disk quantization cache to a
         # standalone utility PR.
         assert isinstance(layer, RoutedExperts)
+        layer = cast("TpuRoutedExperts", layer)
         device = layer.w13_weight.device
 
         activation_str = self._set_tpu_activation(layer)
@@ -572,6 +631,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             FUSED_MOE_EP_OP_ATTR,
             fused_moe_ep_unsupported_reason,
+            register_fused_scale_buffers,
             register_score_bias_buffer,
         )
 
@@ -663,18 +723,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 f"admitted layout: {reason}"
             )
             register_score_bias_buffer(layer)
-            # The kernel takes [E, K/block, N]; do the squeeze once here
-            # rather than per layer per step inside the compiled forward.
-            layer.register_buffer(
-                "_tpu_fused_w13_scale",
-                layer.w13_weight_scale.squeeze(2).contiguous(),
-                persistent=False,
-            )
-            layer.register_buffer(
-                "_tpu_fused_w2_scale",
-                layer.w2_weight_scale.squeeze(2).contiguous(),
-                persistent=False,
-            )
+            register_fused_scale_buffers(layer)
             logger.info_once(
                 "DeepSeek-V4 MXFP4 fused EP W4A8 enabled: block-%d",
                 REQUANTIZED_BLOCK_SIZE,
@@ -694,6 +743,7 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             score_bias_operand,
         )
 
+        layer = cast("TpuRoutedExperts", layer)
         if fused_moe_ep_supported(self):
             # This rank's own tokens in and out: the kernel scores, selects,
             # dispatches, runs both matmuls and combines inside one program,

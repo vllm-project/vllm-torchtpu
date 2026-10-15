@@ -311,3 +311,55 @@ def test_summing_before_the_hand_off_keeps_the_residual_and_rounds_the_norm_inpu
 
     assert torch.equal(received_residual, new_residual)
     assert torch.allclose(received_norm_input, norm_input, rtol=2**-8, atol=0)
+
+
+def _column_wave(monkeypatch, stage, column, received, chips=1):
+    """The wave of one device of a slice of three stages of two devices,
+    whose hand-off returns ``received`` in every tensor."""
+    from vllm.distributed import parallel_state
+
+    from vllm_torchtpu.distributed import pcp
+
+    drains = []
+    monkeypatch.setattr(pp_wave, "get_or_create_pp_mesh", lambda: None)
+    monkeypatch.setattr(pp_wave, "pp_permute_op", lambda mesh, num_tensors=1: None)
+    monkeypatch.setattr(
+        pp_wave,
+        "_launch_now",
+        lambda op, carried: tuple(torch.full_like(x, received) for x in carried),
+    )
+    monkeypatch.setattr(pp_wave, "stage_chips", lambda: chips)
+    monkeypatch.setattr(pp_wave, "_drain_slice", lambda: drains.append(1))
+    monkeypatch.setattr(
+        parallel_state,
+        "get_pp_group",
+        lambda: SimpleNamespace(rank_in_group=stage, world_size=3),
+    )
+    monkeypatch.setattr(
+        pcp,
+        "get_pcp_group",
+        lambda: SimpleNamespace(rank_in_group=column, world_size=2),
+    )
+    return pp_wave.PPWave(torch.device("cpu"), MAX_ROWS, _template(False)), drains
+
+
+def test_the_self_test_expects_the_same_column_of_the_previous_stage(monkeypatch):
+    # Stage 1 column 1 sends 4 and receives what stage 0 column 1 sent: 2.
+    wave, _ = _column_wave(monkeypatch, stage=1, column=1, received=2)
+    wave.warmup()
+    # 1 is what the other column of the previous stage sent.
+    wave, _ = _column_wave(monkeypatch, stage=1, column=1, received=1)
+    with pytest.raises(RuntimeError, match="expected 2.0"):
+        wave.warmup()
+
+
+def test_a_stage_of_several_chips_drains_before_every_hand_off(monkeypatch):
+    wave, drains = _column_wave(monkeypatch, stage=1, column=0, received=1, chips=2)
+    wave.warmup()
+    wave.start_forward(16)
+    assert len(drains) == wave.launches == 3
+
+    wave, drains = _column_wave(monkeypatch, stage=1, column=0, received=1)
+    wave.warmup()
+    wave.start_forward(16)
+    assert drains == [] and wave.launches == 3

@@ -3,6 +3,7 @@
 """Torch bridges for K3's sequence-parallel prefill collectives."""
 
 from functools import lru_cache
+from typing import Any
 
 import jax
 import torch
@@ -24,7 +25,7 @@ from vllm_torchtpu.kernels.kimi_k3.collectives import (  # isort: skip
     ring_tables,
 )
 
-_OPS = {}
+_OPS: dict[tuple, Any] = {}
 
 
 def _build_mla_ops(mesh, owners, layer, eps):
@@ -238,6 +239,7 @@ def _mesh_and_tables():
     if ep is None or list(ep.ranks) != list(base.ranks):
         raise ValueError("K3 rings require identical TP32 and EP32 rank order")
     mesh = build_ep_mesh(axis_name="k3_sp")
+    assert mesh is not None
     owners = ep_rank_order()
     return mesh, ring_tables(list(mesh.devices.flat), owners)
 

@@ -1,9 +1,23 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Unit tests for DeepSeek V3 layer enhancements (Attention kwargs/reshape,
 Grouped Top-K MoE, Unaligned FP8).
 """
 
 from unittest.mock import MagicMock, patch
 
+import pytest
 import torch
 
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
@@ -15,6 +29,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 )
 
 
+@pytest.mark.tpu_test
 def test_pallas_attention_init_kwargs(vllm_config_context):
     """Test that PallasAttentionBackendImpl accepts arbitrary kwargs like q_lora_rank
     without raising TypeError.
@@ -35,6 +50,7 @@ def test_pallas_attention_init_kwargs(vllm_config_context):
     assert backend.head_size == 256
 
 
+@pytest.mark.tpu_test
 def test_pallas_attention_forward_2d_reshape(vllm_config_context):
     """Test that PallasAttentionBackendImpl correctly reshapes 2D query/key tensors
     to 3D and restores 2D output.

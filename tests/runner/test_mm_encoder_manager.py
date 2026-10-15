@@ -21,6 +21,7 @@ def compile_mock(monkeypatch):
 def manager(compile_mock):
     model = Mock()
     model.get_encoder_cudagraph_config.return_value = SimpleNamespace(
+        capture_axes=(),
         padding_logics={},
         paths={
             "global": SimpleNamespace(min_token_budget=None, allow_zero_tokens=False),
@@ -136,12 +137,12 @@ def test_capture_preserves_template_mapping_and_registers_after_sync(
     def synchronize(values, *, wait):
         assert values is output
         assert wait
-        assert 4 not in manager._get_graph_set("global")
+        assert 4 not in manager.compiled_budgets["global"]
 
     manager._compiled_budget_forward.side_effect = forward
     monkeypatch.setattr(mm, "synchronize_tensors", synchronize)
     manager._capture_budget_graph(4, "global")
-    assert manager._get_graph_set("global")[4] is template
+    assert 4 in manager.compiled_budgets["global"]
     assert "pixels" in template
 
 
@@ -152,7 +153,7 @@ def test_capture_failure_leaves_budget_unregistered(manager, monkeypatch, failur
     target.side_effect = RuntimeError("capture failed")
     monkeypatch.setattr(mm, "synchronize_tensors", synchronize)
     manager._capture_budget_graph(4, "global")
-    assert 4 not in manager._get_graph_set("global")
+    assert 4 not in manager.compiled_budgets["global"]
     assert manager.graph_hits == manager.graph_misses == 0
 
 
@@ -167,8 +168,8 @@ def test_precompile_continues_after_one_budget_fails(manager, monkeypatch):
     manager.precompile_vision_encoder()
     assert manager._compiled_budget_forward.call_count == 3
     assert synchronize.call_count == 2
-    assert set(manager._get_graph_set("global")) == {8}
-    assert set(manager._get_graph_set("local")) == {8}
+    assert manager.compiled_budgets["global"] == {8}
+    assert manager.compiled_budgets["local"] == {8}
 
 
 @pytest.mark.parametrize("path, budget", [("missing", 4), ("global", 16), ("local", 0)])
@@ -197,7 +198,7 @@ def test_replay_counts_items_and_passes_padded_values(manager):
 
     manager._compiled_budget_forward.side_effect = forward
     for _ in range(2):
-        assert manager._run_budget_graph(mm_kwargs, 4, "global") is output
+        assert manager._run_budget_graph(mm_kwargs, 4, "global", axis_keys=()) is output
     assert manager.graph_hits == 4
     assert manager.graph_misses == 0
     assert "pixels" in manager.budget_templates["global"][4]
@@ -284,8 +285,8 @@ def test_coordinated_encoder_matches_peer_buckets_and_restores_item_order(
         assert (output == count).all()
     assert manager._run_budget_graph.call_args_list == (
         [
-            call({"tokens": [1, 3]}, 8, allow_eager_fallback=False),
-            call({"tokens": [4]}, 8, allow_eager_fallback=False),
+            call({"tokens": [1, 3]}, 8, axis_keys=(), allow_eager_fallback=False),
+            call({"tokens": [4]}, 8, axis_keys=(), allow_eager_fallback=False),
         ]
         if active
         else []
@@ -359,21 +360,25 @@ def test_coordinated_encoder_dp_shards_and_gathers_empty_and_uneven_ranks(
     tp.all_gather.assert_called_once()
 
 
+@pytest.mark.parametrize("capture_axes", [(), ((1, 2),)])
 @pytest.mark.parametrize(
     "enabled, supported", [(False, True), (True, False), (True, True)]
 )
-def test_factory_requires_enabled_and_supported(monkeypatch, enabled, supported):
+def test_factory_requires_enabled_and_supported(
+    monkeypatch, enabled, supported, capture_axes
+):
     config = SimpleNamespace(
         compilation_config=SimpleNamespace(cudagraph_mm_encoder=enabled)
     )
     model = Mock()
+    model.get_encoder_cudagraph_config.return_value.capture_axes = capture_axes
     device = torch.device("cpu")
     supports = Mock(return_value=supported)
     constructor = Mock()
     monkeypatch.setattr(mm, "supports_encoder_cudagraph", supports)
     monkeypatch.setattr(mm, "MMEncoderManager", constructor)
     result = mm.maybe_create_mm_encoder_manager(config, device, model)
-    if enabled and supported:
+    if enabled and supported and not capture_axes:
         assert result is constructor.return_value
         constructor.assert_called_once_with(config, device, model)
     else:
@@ -381,3 +386,106 @@ def test_factory_requires_enabled_and_supported(monkeypatch, enabled, supported)
         constructor.assert_not_called()
     if not enabled:
         supports.assert_not_called()
+
+
+def test_execute_local_chunks_oversized_video_into_compiled_budgets(compile_mock):
+    """Chunk an oversized video so each chunk hits a compiled budget graph."""
+    model = Mock()
+    model.get_encoder_cudagraph_config.return_value = SimpleNamespace(
+        capture_axes=(),
+        padding_logics={},
+        paths={
+            "default": SimpleNamespace(min_token_budget=None, allow_zero_tokens=False),
+        },
+    )
+    # 4 patches per output token (e.g. spatial_merge_size = 2)
+    model.prepare_encoder_cudagraph_capture_inputs.side_effect = (
+        lambda budget, *args, path: SimpleNamespace(
+            values={"pixel_values": torch.zeros(budget * 4, 2)}
+        )
+    )
+
+    def get_item_specs(mm_kwargs):
+        grid = mm_kwargs["video_grid_thw"]
+        grid_list = grid.tolist() if hasattr(grid, "tolist") else list(grid)
+        return [
+            SimpleNamespace(
+                input_size=int(t) * int(h) * int(w),
+                output_tokens=int(t) * (int(h) // 2) * (int(w) // 2),
+                get_path_output_tokens=lambda path, t=t, h=h, w=w: (
+                    int(t) * (int(h) // 2) * (int(w) // 2)
+                ),
+            )
+            for t, h, w in grid_list
+        ]
+
+    def select_items(mm_kwargs, indices):
+        grid = mm_kwargs["video_grid_thw"]
+        grid_list = grid.tolist() if hasattr(grid, "tolist") else list(grid)
+        pixels = mm_kwargs["pixel_values_videos"]
+        selected_grid = [grid_list[i] for i in indices]
+        return {
+            "pixel_values_videos": pixels,
+            "video_grid_thw": torch.tensor(selected_grid, dtype=torch.int64),
+        }
+
+    def prepare_replay(mm_kwargs, *args, path):
+        return SimpleNamespace(
+            values={"pixel_values": mm_kwargs["pixel_values_videos"]}
+        )
+
+    def postprocess(
+        outputs, indices, per_item_out_tokens, dest, clone, batch_mm_kwargs
+    ):
+        out = outputs["default"]
+        offset = 0
+        for idx in indices:
+            n = per_item_out_tokens[idx]
+            dest[idx] = out[offset : offset + n].clone()
+            offset += n
+
+    model.get_encoder_cudagraph_item_specs.side_effect = get_item_specs
+    model.select_encoder_cudagraph_items.side_effect = select_items
+    model.prepare_encoder_cudagraph_replay_buffers.side_effect = prepare_replay
+    model.postprocess_encoder_output.side_effect = postprocess
+
+    config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            dtype=torch.float32,
+            multimodal_config=SimpleNamespace(
+                get_limit_per_prompt=lambda _: 0,
+                mm_encoder_tp_mode="weights",
+                video_pruning_rate=None,
+            ),
+        ),
+        compilation_config=SimpleNamespace(
+            cudagraph_mm_encoder=True,
+            encoder_cudagraph_token_budgets=[4, 8],
+            encoder_cudagraph_max_vision_items_per_batch=2,
+            encoder_cudagraph_max_frames_per_batch=0,
+        ),
+    )
+    mgr = mm.MMEncoderManager(config, torch.device("cpu"), model)
+
+    # Forward projects every group of 4 patch rows to 1 output token by summing
+    def compiled_forward(values, *, path):
+        pv = values["pixel_values"]
+        return pv.reshape(-1, 4, 2).sum(dim=1)
+
+    mgr._compiled_budget_forward.side_effect = compiled_forward
+
+    # Video with t=5, h=4, w=4 -> 80 patches -> 20 output tokens (> max budget 8).
+    # Max budget 8 tokens = 32 patches = 2 frames of 4x4, so chunks into:
+    # t=2 (8 tokens, budget 8), t=2 (8 tokens, budget 8), t=1 (4 tokens, budget 4).
+    pixels = torch.arange(160, dtype=torch.float32).reshape(80, 2)
+    mm_kwargs = {
+        "pixel_values_videos": pixels,
+        "video_grid_thw": torch.tensor([[5, 4, 4]], dtype=torch.int64),
+    }
+    outputs = mgr._execute_local(mm_kwargs)
+    assert len(outputs) == 1
+    expected = pixels.reshape(20, 4, 2).sum(dim=1)
+    torch.testing.assert_close(outputs[0], expected)
+    assert mgr.graph_hits == 3
+    assert mgr.graph_misses == 0
+    model.encoder_eager_forward.assert_not_called()

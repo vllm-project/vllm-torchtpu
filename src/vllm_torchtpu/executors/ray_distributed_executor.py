@@ -17,7 +17,7 @@ import copy
 import os
 from collections import defaultdict
 from concurrent.futures import Future
-from typing import Union
+from typing import TYPE_CHECKING, Union, cast
 
 import ray
 import vllm.envs as envs
@@ -41,6 +41,9 @@ from vllm_torchtpu.distributed.utils import set_node_kv_ip_port
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.platforms.tpu_platform import get_tpu_multihost_topology
 from vllm_torchtpu.runner.tpu_runner import AsyncTPUModelRunnerOutput
+
+if TYPE_CHECKING:
+    from ray.dag.compiled_dag_node import CompiledDAG
 
 logger = init_logger(__name__)
 
@@ -92,7 +95,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         return True
 
     def _init_executor(self) -> None:
-        self.forward_dag: ray.dag.CompiledDAG | None = None
+        self.forward_dag: CompiledDAG | None = None
 
         os.environ["VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE"] = "shm"
 
@@ -106,7 +109,8 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
 
         assert self.uses_ray
         self._initialize_ray_cluster()
-        placement_group = self.parallel_config.placement_group
+        # _initialize_ray_cluster() sets the placement group.
+        placement_group = cast(PlacementGroup, self.parallel_config.placement_group)
 
         # Disable Ray usage stats collection. Ray accepts exactly "0" or "1"
         # here and raises on anything else (ray/_common/usage/usage_lib.py),
@@ -124,7 +128,7 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
         # KV connector setup
         self.has_connector = self.vllm_config.kv_transfer_config is not None
         if self.has_connector:
-            ip_port = self.collective_rpc("get_node_kv_ip_port")
+            ip_port = cast(list, self.collective_rpc("get_node_kv_ip_port"))
             for item in ip_port:
                 set_node_kv_ip_port(item)
         self.uses_sampler = self.vllm_config.model_config.runner_type != "pooling" and (

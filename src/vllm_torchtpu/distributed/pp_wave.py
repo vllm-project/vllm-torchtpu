@@ -5,7 +5,10 @@ One hand-off is a single collective-permute that all stages run together:
 each stage sends one buffer to the next stage and receives one from the
 previous stage (the last stage's buffer goes to stage 0, which ignores it).
 Because every stage takes part in every hand-off, launch number p on one
-stage pairs with launch number p on every other stage.
+stage pairs with launch number p on every other stage. A stage of several
+devices (a context-parallel group) hands off once per device: each device
+holds its own rows of the chunk and permutes them with the devices holding
+the same rows in the other stages, its column.
 
 What travels is the sum of hidden states and residual, one tensor in the
 model dtype. The receiving stage's first norm adds hidden states and
@@ -71,6 +74,12 @@ Two rules keep the launches pairing across stages: every launch runs the
 same compiled program (one buffer padded to the largest token bucket), and
 every launch is submitted to the device right away, even on a stage that
 never reads the result.
+
+A stage that spans more than one chip drains its device and waits for every
+worker of the slice before each hand-off: with a stage program and a hand-off
+running at the same time, a core of the stage stops inside a stage collective
+and the runtime halts the device. A one-chip stage never showed this and
+launches the hand-off without waiting.
 """
 
 from typing import Any
@@ -99,6 +108,30 @@ def pp_rank_flags(parallel_config: Any) -> tuple[bool, bool]:
     return bool(group.is_first_rank), bool(group.is_last_rank)
 
 
+def stage_chips() -> int:
+    """How many chips this worker's pipeline stage spans."""
+    from vllm_torchtpu.distributed.chip_topology import get_chip_topology
+    from vllm_torchtpu.distributed.pcp import get_pcp_group_layout
+
+    topology = get_chip_topology()
+    if topology is None:
+        return 1
+    device_ids = set(get_pcp_group_layout().device_ids)
+    return sum(1 for chip in topology.chips if device_ids & set(chip))
+
+
+def _drain_slice() -> None:
+    """Waits for this device to go idle, then for every worker of the slice
+    to reach the same point, so no stage program is running anywhere when
+    the hand-off is launched."""
+    import torch.distributed as dist
+    from torch_tpu._internal.sync import sync
+    from vllm.distributed.parallel_state import get_world_group
+
+    sync.synchronize(None, wait=True)
+    dist.barrier(group=get_world_group().cpu_group)
+
+
 def _launch_now(op, carried: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
     """Run one hand-off as its own device program, submitted immediately.
 
@@ -124,10 +157,16 @@ class PPWave:
     ):
         from vllm.distributed.parallel_state import get_pp_group
 
+        from vllm_torchtpu.distributed.pcp import get_pcp_rank, get_pcp_world_size
+
         group = get_pp_group()
         self.rank = int(group.rank_in_group)
         self.size = int(group.world_size)
         self.last = self.size - 1
+        # This device's column in its stage: the same column of every stage
+        # holds the same token rows.
+        self.column = get_pcp_rank()
+        self.columns = get_pcp_world_size()
         extras = [key for key in template if key not in (HIDDEN_STATES, RESIDUAL)]
         if (
             set(template) != {HIDDEN_STATES, RESIDUAL, *extras}
@@ -146,6 +185,8 @@ class PPWave:
         self.carried = (HIDDEN_STATES, *extras)
         self.max_rows = int(max_rows)
         self.op = pp_permute_op(get_or_create_pp_mesh(), num_tensors=len(self.carried))
+        # See the module docstring.
+        self.drain_before_handoff = stage_chips() > 1
         self.zeros = tuple(
             torch.zeros(
                 (self.max_rows, *template[key][0]),
@@ -162,9 +203,11 @@ class PPWave:
         self.forwards = 0
         self.pending: tuple[torch.Tensor, ...] | None = None
         logger.info(
-            "PP wave: rank %d/%d, hand-off carries %s",
+            "PP wave: rank %d/%d column %d/%d, hand-off carries %s",
             self.rank,
             self.size,
+            self.column,
+            self.columns,
             ", ".join(
                 f"{key}[{self.max_rows}, {template[key][0][0]}] {template[key][1]}"
                 for key in self.carried
@@ -173,6 +216,8 @@ class PPWave:
 
     def _launch(self, carried: tuple[torch.Tensor, ...]) -> tuple[torch.Tensor, ...]:
         with TraceAnnotation("PP:Handoff"):
+            if self.drain_before_handoff:
+                _drain_slice()
             out = _launch_now(self.op, carried)
         self.launches += 1
         self.burst_launches += 1
@@ -186,12 +231,14 @@ class PPWave:
         return tuple(torch.cat([t, z[rows:]]) for t, z in zip(carried, self.zeros))
 
     def warmup(self) -> None:
-        """One launch outside any burst on every stage, carrying a known
-        value; checks that it arrived on the next stage."""
+        """One launch outside any burst on every device, carrying a value
+        known by its stage and column; checks that it arrived on the same
+        column of the next stage."""
         assert not self.burst_open and self.launches == 0
-        out = self._launch(tuple(torch.full_like(z, self.rank + 1) for z in self.zeros))
+        sent = self.rank * self.columns + self.column + 1
+        out = self._launch(tuple(torch.full_like(z, sent) for z in self.zeros))
         if self.rank > 0:
-            want = float(self.rank)
+            want = float(sent - self.columns)
             for key, x in zip(self.carried, out):
                 got = (float(x[0, 0].item()), float(x[-1, -1].item()))
                 if any(g != want for g in got):

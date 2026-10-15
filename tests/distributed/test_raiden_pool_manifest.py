@@ -13,9 +13,12 @@ import pytest
 
 from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
 
-from .raiden_test_utils import FakeTensor, dsv4_materialization, glm_named_kv_caches
-
-pytestmark = pytest.mark.cpu_test
+from .raiden_test_utils import (
+    FakeTensor,
+    dsv4_materialization,
+    glm_named_kv_caches,
+    kimi_pool_manifest,
+)
 
 
 def _fa_group(layer_names, *, block_size, num_kv_heads, head_size):
@@ -262,6 +265,53 @@ def test_layer_tag_helpers_round_trip():
     assert tags.class_tag("fa") == "fa"
     with pytest.raises(ValueError):
         tags.layer_tag("fa", -1)
+
+
+def _with_mtp_draft_layer(named):
+    """The stage's caches plus a Qwen3.5 MTP draft layer (``mtp.layers.0``)."""
+    fa_name = next(name for name in named if "self_attn" in name)
+    named = dict(named)
+    named["mtp.layers.0.self_attn.attn"] = named[fa_name]
+    return named
+
+
+def test_mtp_draft_layer_tags_and_orders_after_the_targets_layers():
+    named_all = _qwen35_materialization(
+        fa_shape=(256, 256, 1, 4, 256),
+        fa_esz=1,
+        fa_dtype="torch.float8_e4m3fn",
+        conv_shape=(16, 3, 1, 12288),
+        conv_esz=2,
+        ssm_shape=(16, 64, 128, 128),
+        ssm_esz=4,
+    )
+    stage_layers = {f"model.layers.{i}." for i in range(5)}
+    named = _with_mtp_draft_layer(
+        {
+            name: tensor
+            for name, tensor in named_all.items()
+            if any(name.startswith(prefix) for prefix in stage_layers)
+        }
+    )
+    groups = _qwen35_groups(named, block_size=4096, num_kv_heads=2, head_size=256)
+    manifest = rpm.build_qwen35_pool_manifest(
+        named_kv_caches=named,
+        kv_cache_groups=groups,
+        raw_tensors=(),
+        gdn_geometry=PCP8_GEOMETRY,
+        mamba_group_ordinal_by_layer={
+            name: 0 for name in named if "linear_attn" in name
+        },
+        per_layer_tags=True,
+        layer_index_by_name={"mtp.layers.0.self_attn.attn": 48},
+    )
+
+    assert [pool.tag for pool in manifest.pools][-3:] == [
+        "gdn.conv.g0.l4",
+        "gdn.ssm.g0.l4",
+        "fa.l48",
+    ]
+    assert manifest.pools[-1].layer_name == "mtp.layers.0.self_attn.attn"
 
 
 def test_canonical_pool_order_is_layer_major_conv_before_ssm():
@@ -1043,6 +1093,71 @@ def test_glm_manifest_rejects_bad_geometry(overrides, message):
         )
 
 
+def _glm_sparsecore_caches(
+    nope_shape=(16, _GLM_BLOCK_SIZE, 128), rope_shape=(16, _GLM_BLOCK_SIZE // 4, 128)
+):
+    """GLM caches under TPU_SPARSE_MLA_{NOPE,ROPE}_LAYOUT=sparsecore."""
+    named = glm_named_kv_caches()
+    for idx in range(2):
+        named[f"model.layers.{idx}.self_attn.mla_attn"] = (
+            FakeTensor(nope_shape, 4, dtype="torch.uint32"),
+            FakeTensor(rope_shape, 4, dtype="torch.uint32"),
+        )
+    return named
+
+
+def test_glm_manifest_sparsecore_layout_keeps_tensorcore_geometry():
+    # Both layouts hold a page as the same whole 512-byte rows, so the
+    # transfer lowering must not see a difference.
+    def build(named):
+        return rpm.build_glm_mla_pool_manifest(
+            named_kv_caches=named,
+            raw_tensors=(),
+            block_size_tokens=_GLM_BLOCK_SIZE,
+            per_layer_tags=True,
+        )
+
+    tensorcore = build(glm_named_kv_caches())
+    sparsecore = build(_glm_sparsecore_caches())
+    assert sparsecore.geometry_by_tag() == tensorcore.geometry_by_tag()
+    twins = {pool.tag: pool for pool in tensorcore.pools}
+    for pool in sparsecore.pools:
+        assert pool.regions == twins[pool.tag].regions
+        assert pool.block_stride_bytes == twins[pool.tag].block_stride_bytes
+    assert {
+        pool.dtype_tag for pool in sparsecore.pools if pool.tag.startswith("mla.")
+    } == {"uint32"}
+
+
+@pytest.mark.parametrize(
+    ("overrides", "message"),
+    [
+        (dict(nope_shape=(16, 512, 128)), "nope rows 512 do not match"),
+        (dict(rope_shape=(16, 300, 128)), "KV block size"),
+        (dict(rope_shape=(16, 256, 120)), "lane-aligned"),
+    ],
+)
+def test_glm_manifest_rejects_bad_sparsecore_geometry(overrides, message):
+    with pytest.raises(rpm.ManifestError, match=message):
+        rpm.build_glm_mla_pool_manifest(
+            named_kv_caches=_glm_sparsecore_caches(**overrides),
+            raw_tensors=(),
+            block_size_tokens=_GLM_BLOCK_SIZE,
+        )
+
+
+def test_glm_manifest_rejects_rank3_indexer_cache():
+    # Only the MLA caches have a SparseCore layout.
+    named = glm_named_kv_caches()
+    named["model.layers.0.self_attn.indexer"] = FakeTensor(
+        (16, 256, 256), 4, dtype="torch.uint32"
+    )
+    with pytest.raises(rpm.ManifestError, match="SparseCore uint32"):
+        rpm.build_glm_mla_pool_manifest(
+            named_kv_caches=named, raw_tensors=(), block_size_tokens=_GLM_BLOCK_SIZE
+        )
+
+
 # ---------------------------------------------------------------------------
 # DeepSeek-V4.
 # ---------------------------------------------------------------------------
@@ -1174,3 +1289,45 @@ def test_glm_manifest_per_layer_tags():
         "mla_nope_rows"
     }
     assert set(manifest.geometry_by_tag()) == {"mla.nope", "mla.rope", "dsa.idx"}
+
+
+def test_kimi_fp8_pool_keeps_the_bf16_pool_byte_geometry():
+    """An fp8 K3 pool packs four tokens per row instead of two, in the same
+    2,560 bytes, and its KDA state regions do not move."""
+    bf16 = kimi_pool_manifest(3, kv_dtype="bfloat16")
+    fp8 = kimi_pool_manifest(3, kv_dtype="float8_e4m3fn")
+
+    assert bf16.storages[0].shape[1:] == (81, 2, 640)
+    assert fp8.storages[0].shape[1:] == (81, 4, 640)
+    assert [pool.tag for pool in fp8.pools] == [pool.tag for pool in bf16.pools]
+    for bf16_pool, fp8_pool in zip(bf16.pools, fp8.pools):
+        assert fp8_pool.base_offset_bytes == bf16_pool.base_offset_bytes
+        assert fp8_pool.block_stride_bytes == bf16_pool.block_stride_bytes == 207360
+        assert fp8_pool.regions == bf16_pool.regions
+        assert (bf16_pool.dtype_tag, fp8_pool.dtype_tag) == (
+            "bfloat16",
+            "float8_e4m3fn",
+        )
+    conv, ssm, fa = fp8.pools
+    # SSM is f32 and conv is bf16 whatever the pool dtype: 77 + 4 rows.
+    assert ssm.live_bytes_per_block == 3 * 128 * 128 * 4
+    assert conv.base_offset_bytes == 77 * 2560
+    assert conv.live_bytes_per_block == 4 * 2560
+    assert fa.regions[0].unit_bytes == 2560
+
+
+@pytest.mark.parametrize(
+    ("shape", "itemsize", "dtype", "match"),
+    [
+        ((4, 81, 4, 640), 1, "torch.float8_e5m2", "must be bf16 or fp8"),
+        ((4, 81, 4, 640), 1, "torch.uint8", "must be bf16 or fp8"),
+        # A packing axis that does not fill the 32-bit word.
+        ((4, 162, 2, 640), 1, "torch.float8_e4m3fn", "invalid packed-row geometry"),
+        ((4, 81, 4, 320), 2, "torch.bfloat16", "invalid packed-row geometry"),
+    ],
+    ids=["fp8-e5m2", "uint8", "fp8-packing-2", "bf16-packing-4"],
+)
+def test_kimi_manifest_rejects_a_pool_it_cannot_describe(shape, itemsize, dtype, match):
+    pool = FakeTensor(shape, itemsize, dtype=dtype)
+    with pytest.raises(rpm.ManifestError, match=match):
+        kimi_pool_manifest(3, pool=pool)

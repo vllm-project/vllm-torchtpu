@@ -57,8 +57,8 @@ class _StubVllmConfig:
 
     A real VllmConfig needs a fully materialized ModelConfig to construct.
     ``compute_hash()`` guards every sub-config with ``if self.x:``, so ``None``
-    sends them all down the "absent" branch -- except ``observability_config``,
-    which is dereferenced unconditionally.
+    sends them all down the "absent" branch -- except ``observability_config``
+    and ``aux_output_config``, which are dereferenced unconditionally.
     """
 
     def __init__(self, additional_config=None):
@@ -66,6 +66,7 @@ class _StubVllmConfig:
         self.observability_config = SimpleNamespace(
             compute_hash=lambda: "observability"
         )
+        self.aux_output_config = SimpleNamespace(compute_hash=lambda: "aux_output")
 
     def __getattr__(self, name):
         # Let dunders (``__setstate__``/``__deepcopy__``/...) miss normally so
@@ -146,6 +147,20 @@ def test_untouched_configs_keep_their_upstream_hash(patched_compute_hash):
     assert patched_compute_hash(config) == _upstream_compute_hash()(config)
 
 
+@pytest.mark.parametrize("additional_config", [None, {"option": 1}, {KEY: 128}])
+@pytest.mark.parametrize("include_version", [False, True])
+def test_hash_forwards_include_version(
+    patched_compute_hash, additional_config, include_version
+):
+    config = _StubVllmConfig(additional_config)
+    filtered = _StubVllmConfig(
+        {} if additional_config == {KEY: 128} else additional_config
+    )
+    expected = _upstream_compute_hash()(filtered, include_version=include_version)
+    assert patched_compute_hash(config, include_version=include_version) == expected
+    assert patched_compute_hash(config, include_version) == expected
+
+
 def test_additional_config_is_restored_after_hashing(patched_compute_hash):
     additional_config = {KEY: 128}
     config = _StubVllmConfig(additional_config)
@@ -156,7 +171,7 @@ def test_additional_config_is_restored_after_hashing(patched_compute_hash):
 
 
 def test_additional_config_is_restored_when_hashing_raises(apply_patch_over):
-    def exploding_compute_hash(self):
+    def exploding_compute_hash(self, include_version=True):
         raise RuntimeError("boom")
 
     compute_hash = apply_patch_over(exploding_compute_hash)

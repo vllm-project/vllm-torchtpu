@@ -132,7 +132,7 @@ fi
 
 echo "--- Running command in Docker container"
 docker run --rm --name "${CONTAINER_NAME}" "${DEVICE_ARGS[@]}" --net=host --shm-size=64g \
-  -w /root/torchtpu-vllm \
+  -w /workspace/vllm-torchtpu \
   -v "${HOST_CACHE_ROOT}/models:/local_hf_cache" \
   -v "${HOST_CACHE_ROOT}/perf_eval_results:/perf_eval_results" \
   -e BENCHMARK_WARMUP_RUNS="${BENCHMARK_WARMUP_RUNS:-}" \
@@ -141,7 +141,7 @@ docker run --rm --name "${CONTAINER_NAME}" "${DEVICE_ARGS[@]}" --net=host --shm-
   -e HF_TOKEN="${HF_TOKEN:-}" \
   -e RUN_CODE_EVAL="${RUN_CODE_EVAL:-}" \
   -e RUN_LM_EVAL="${RUN_LM_EVAL:-}" \
-  -e SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU="0.0.0" \
+  -e SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU_CORE="0.0.0" \
   -e TQDM_MININTERVAL="30" \
   -e UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken \
   -e UV_NO_CACHE="1" \
@@ -157,6 +157,16 @@ docker run --rm --name "${CONTAINER_NAME}" "${DEVICE_ARGS[@]}" --net=host --shm-
   ${TPU_MULTIHOST_BACKEND:+-e TPU_MULTIHOST_BACKEND="${TPU_MULTIHOST_BACKEND}"} \
   ${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL:+-e TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL="${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL}"} \
   ${VLLM_ENGINE_READY_TIMEOUT_S:+-e VLLM_ENGINE_READY_TIMEOUT_S="${VLLM_ENGINE_READY_TIMEOUT_S}"} \
+  ${PREFILL_PCP:+-e PREFILL_PCP="${PREFILL_PCP}"} \
+  ${PREFILL_TP:+-e PREFILL_TP="${PREFILL_TP}"} \
+  ${DECODE_TP:+-e DECODE_TP="${DECODE_TP}"} \
+  ${DECODE_DCP:+-e DECODE_DCP="${DECODE_DCP}"} \
+  ${ROLE:+-e ROLE="${ROLE}"} \
+  ${PREFILL_BLOCK_SIZE:+-e PREFILL_BLOCK_SIZE="${PREFILL_BLOCK_SIZE}"} \
+  ${DECODE_BLOCK_SIZE:+-e DECODE_BLOCK_SIZE="${DECODE_BLOCK_SIZE}"} \
+  ${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE:+-e PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE="${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE}"} \
+  ${TPU_RAIDEN_DST_SHARDS:+-e TPU_RAIDEN_DST_SHARDS="${TPU_RAIDEN_DST_SHARDS}"} \
+  ${VLLM_KV_CACHE_LAYOUT:+-e VLLM_KV_CACHE_LAYOUT="${VLLM_KV_CACHE_LAYOUT}"} \
   "${TEST_SUITE_VARS[@]}" \
   "${BQ_EVAL_VARS[@]}" \
   "${IMAGE_TAG}" \
@@ -190,6 +200,11 @@ if [ "${DOCKER_EXIT_CODE}" -ne 0 ]; then
   fi
   echo "Last 40 lines of container output:"
   tail -n 40 "${RUN_LOG}"
+
+  python3 "${SCRIPT_DIR}/record_ci_failure.py" \
+    --log-file "${RUN_LOG}" \
+    --exit-code "${DOCKER_EXIT_CODE}" \
+    --step-label "${BUILDKITE_LABEL:-}" || true
 fi
 
 exit "$DOCKER_EXIT_CODE"

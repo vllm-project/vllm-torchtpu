@@ -275,6 +275,7 @@ class TestW4MoEWeightPreprocessing:
             assert layer.w13_weight_packed[1, 0, 0].item() == expected_carrier
 
 
+@pytest.mark.tpu_test
 class TestW4MoECorrectness:
     """Verify computation correctness of W4 MoE."""
 

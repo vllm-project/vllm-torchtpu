@@ -14,8 +14,9 @@
 
 import time
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
 
 from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
@@ -52,7 +53,7 @@ def _make_scheduler(
     for r in requests:
         q.add_request(r)
     s.waiting = q
-    s.skipped_waiting = FCFSRequestQueue()
+    s.kv_holding_waiting = FCFSRequestQueue()
     s.policy = SchedulingPolicy.FCFS
     s.WINDOW = window
     s._paw_n = 0
@@ -89,10 +90,15 @@ def test_promotes_warmest_within_window():
     r_warm = _make_request("warm", num_tokens=1000, arrival_time=now - 5)
     s = _make_scheduler([r_cold, r_warm], {"cold": 0, "warm": 800})
 
-    q = s._select_waiting_queue_for_scheduling()
-    assert q is not None
-    order = [r.request_id for r in q]
-    assert order == ["warm", "cold"]
+    expected = object()
+
+    def schedule(throttle_prefills):
+        assert throttle_prefills is True
+        assert [r.request_id for r in s.waiting] == ["warm", "cold"]
+        return expected
+
+    with patch.object(AsyncScheduler, "schedule", side_effect=schedule):
+        assert s.schedule(throttle_prefills=True) is expected
 
 
 def test_ranks_by_uncached_tokens_not_hit_ratio():

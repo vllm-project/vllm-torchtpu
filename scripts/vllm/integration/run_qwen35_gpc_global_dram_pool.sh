@@ -302,8 +302,11 @@ KV_TRANSFER_CONFIG='{"kv_connector":"TPURaidenOffloadingConnector","kv_connector
   export RAGGED_GATED_DELTA_RULE_IMPL=chunked_kernel_v3_pd
   export TPU_GDN_CONV_STATE_TILE_PAD=1
   export LIBTPU_INIT_ARGS="--xla_tpu_scoped_vmem_limit_kib=65536 --xla_tpu_enable_latency_hiding_scheduler=false"
-  export VLLM_CACHE_ROOT="${RUN_DIR}/cache"
-  export TORCHINDUCTOR_CACHE_DIR="${RUN_DIR}/cache/inductor"
+  # Outside RUN_DIR: CI points RUN_ROOT into the artifacts directory, and a
+  # compile cache there (~13 GiB) was uploaded with the logs on every run.
+  compile_cache="${COMPILE_CACHE_DIR:-${TMPDIR:-/tmp}/qwen35_gpc_dram_pool_compile_cache}"
+  export VLLM_CACHE_ROOT="${compile_cache}"
+  export TORCHINDUCTOR_CACHE_DIR="${compile_cache}/inductor"
   export VLLM_ENGINE_READY_TIMEOUT_S="${STARTUP_TIMEOUT_S}"
   export TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=1
   export TPU_USE_RAIDEN_KV_CACHE_MANAGER=1

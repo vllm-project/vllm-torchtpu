@@ -355,7 +355,6 @@ def test_pcp_token_orders_are_inverses_and_each_request_has_one_owner(
     torch.testing.assert_close(owner_counts, torch.ones_like(owner_counts))
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize(
     "num_tokens,expected_gathers",
     [
@@ -609,11 +608,6 @@ def test_evaluate_runner_chunk_rejects_local_bucket_overflow():
     ("eligibility", "error_type", "message"),
     [
         (_eligibility(dcp_size=2), NotImplementedError, "DCP"),
-        (
-            _eligibility(pipeline_parallel_size=2),
-            NotImplementedError,
-            "pipeline parallelism",
-        ),
         (_eligibility(interleave_size=0), ValueError, "interleave_size > 0"),
     ],
 )

@@ -1,6 +1,6 @@
 # Cloud TPU Setup
 
-This guide provides information on setting up and provisioning Google Cloud TPUs for use with `vllm-torchtpu`.
+Running `vllm-torchtpu` requires access to Google Cloud TPUs (such as **TPU v7x / Ironwood** or **TPU v6e / Trillium**). This guide walks through choosing a TPU generation, setting up a Google Cloud project, and provisioning a TPU VM.
 
 ## TPU Versions and Topologies
 
@@ -63,10 +63,25 @@ The following TPU versions are compatible with `vllm-torchtpu`. Selecting a topo
 
 </div>
 
-## Quota and Pricing
+## Prerequisites
 
-In order for you to use Cloud TPUs you need to have TPU quota granted to your
-Google Cloud project. For more information, see [TPU quota](https://cloud.google.com/tpu/docs/quota#tpu_quota).
+Before provisioning a TPU VM, ensure you have:
+
+1. **A Google Cloud project** with billing enabled.
+2. **The Google Cloud CLI (`gcloud`)** installed and authenticated on your workstation:
+
+    ```bash
+    gcloud auth login
+    gcloud config set project PROJECT_ID
+    ```
+
+3. **The Cloud TPU and Compute Engine APIs enabled**:
+
+    ```bash
+    gcloud services enable tpu.googleapis.com compute.googleapis.com
+    ```
+
+4. **TPU quota** in your target zone. You can check it under **IAM & Admin -> Quotas & System Limits** in the Google Cloud Console. For more information, see [TPU quota](https://cloud.google.com/tpu/docs/quota#tpu_quota).
 
 For TPU pricing information, see [Cloud TPU pricing](https://cloud.google.com/tpu/pricing).
 
@@ -74,86 +89,136 @@ For TPU pricing information, see [Cloud TPU pricing](https://cloud.google.com/tp
 
 Google Cloud supports two primary APIs for provisioning TPUs:
 
-- **[Compute Engine API](https://cloud.google.com/tpu/docs/tpus-in-compute-engine) (`gcloud compute instances create`)**: Recommended for modern TPU generations starting with **TPU v6e (Trillium)** and **TPU v5p**.
-- **[Cloud TPU API](https://cloud.google.com/tpu/docs/queued-resources) (`gcloud alpha compute tpus queued-resources create`)**: Legacy API used for earlier generations like **TPU v5e**. Note that the Cloud TPU API is no longer under active development.
-
-!!! note "TPU v7x (Ironwood)"
-    TPU v7x (Ironwood) is in preview status and is provisioned via **Google Kubernetes Engine (GKE)** rather than standalone on-demand VM commands. Note that TPU v7x does not support Flex-start (DWS). For v7x provisioning and cluster orchestration, see [About TPUs in GKE](https://cloud.google.com/tpu/docs/tpus-in-gke) and the official [TPU v7x documentation](https://cloud.google.com/tpu/docs/tpu7x).
+- **[Compute Engine API](https://cloud.google.com/tpu/docs/tpus-in-compute-engine) (`gcloud compute instances create`)**: Used for **TPU v6e (Trillium)** and **TPU v5p**.
+- **[Cloud TPU API](https://cloud.google.com/tpu/docs/queued-resources) (`gcloud alpha compute tpus queued-resources create`)**: Used for **TPU v7x (Ironwood)**, **TPU v5e**, and **TPU v4**.
 
 You can also choose between two capacity models:
 
 - **Standard (On-Demand)**: Immediate allocation at standard pay-as-you-go rates.
-- **Flex-start (DWS)**: Discounted capacity via Dynamic Workload Scheduler (DWS) that runs uninterrupted for up to 7 days. Note that Flex-start is supported on **TPU v5e**, **TPU v5p**, and **TPU v6e** (**TPU v7x** and older generations like **v4** do not support Flex-start). For more details, see [About Flex-start VMs](https://cloud.google.com/compute/docs/instances/about-flex-start-vms) and [DWS Pricing](https://cloud.google.com/products/dws/pricing#flex-start-tpu-vm-pricing).
+- **Flex-start (DWS)**: Discounted capacity via Dynamic Workload Scheduler (DWS) that runs uninterrupted for up to 7 days. Flex-start is supported on **TPU v7x**, **TPU v6e**, **TPU v5p**, and **TPU v5e** (not on **TPU v4**). For more details, see [About Flex-start VMs](https://cloud.google.com/compute/docs/instances/about-flex-start-vms) and [DWS Pricing](https://cloud.google.com/products/dws/pricing#flex-start-tpu-vm-pricing).
 
-Select your desired TPU hardware, number of chips, and capacity model to generate the exact provisioning command. Be sure to replace placeholder variables (like `PROJECT_ID` and `SERVICE_ACCOUNT`) with your own values before running.
+Select your target TPU generation, chip count, and provisioning model below to generate the `gcloud` provisioning command. Be sure to replace placeholder variables (like `PROJECT_ID` and `SERVICE_ACCOUNT`) with your own values before running.
 
 <div class="command-generator-container" id="prov-generator">
-  <div class="cg-options-group">
-    <span class="cg-label">Hardware</span>
-    <button class="cg-btn active" role="button" aria-pressed="true" data-group="prov_hw" data-val="v6e">TPU v6e</button>
-    <button class="cg-btn" role="button" aria-pressed="false" data-group="prov_hw" data-val="v5e">TPU v5e</button>
-    <button class="cg-btn" role="button" aria-pressed="false" data-group="prov_hw" data-val="v5p">TPU v5p</button>
-    <button class="cg-btn" role="button" aria-pressed="false" data-group="prov_hw" data-val="v4">TPU v4</button>
+  <div class="cg-row">
+    <div class="cg-label">1. Hardware Generation</div>
+    <div class="cg-options">
+      <button type="button" class="cg-btn active" data-group="prov_hw" data-val="v7x" aria-pressed="true">TPU v7x (Ironwood)</button>
+      <button type="button" class="cg-btn" data-group="prov_hw" data-val="v6e" aria-pressed="false">TPU v6e (Trillium)</button>
+      <button type="button" class="cg-btn" data-group="prov_hw" data-val="v5p" aria-pressed="false">TPU v5p</button>
+      <button type="button" class="cg-btn" data-group="prov_hw" data-val="v5e" aria-pressed="false">TPU v5e</button>
+      <button type="button" class="cg-btn" data-group="prov_hw" data-val="v4" aria-pressed="false">TPU v4</button>
+    </div>
   </div>
-  <div class="cg-options-group">
-    <span class="cg-label">Chips</span>
-    <button class="cg-btn" role="button" aria-pressed="false" data-group="prov_chips" data-val="1">1</button>
-    <button class="cg-btn active" role="button" aria-pressed="true" data-group="prov_chips" data-val="4">4</button>
-    <button class="cg-btn" role="button" aria-pressed="false" data-group="prov_chips" data-val="8">8</button>
-    <button class="cg-btn" role="button" aria-pressed="false" data-group="prov_chips" data-val="16">16</button>
-    <button class="cg-btn" role="button" aria-pressed="false" data-group="prov_chips" data-val="32">32</button>
-    <button class="cg-btn" role="button" aria-pressed="false" data-group="prov_chips" data-val="64">64</button>
+  <div class="cg-row">
+    <div class="cg-label">2. Chip Count</div>
+    <div class="cg-options">
+      <button type="button" class="cg-btn" data-group="prov_chips" data-val="1" aria-pressed="false">1 Chip</button>
+      <button type="button" class="cg-btn active" data-group="prov_chips" data-val="4" aria-pressed="true">4 Chips</button>
+      <button type="button" class="cg-btn" data-group="prov_chips" data-val="8" aria-pressed="false">8 Chips</button>
+      <button type="button" class="cg-btn" data-group="prov_chips" data-val="16" aria-pressed="false">16 Chips</button>
+      <button type="button" class="cg-btn" data-group="prov_chips" data-val="32" aria-pressed="false">32 Chips</button>
+      <button type="button" class="cg-btn" data-group="prov_chips" data-val="64" aria-pressed="false">64 Chips</button>
+    </div>
   </div>
-  <div class="cg-options-group">
-    <span class="cg-label">Model</span>
-    <button class="cg-btn active" role="button" aria-pressed="true" data-group="prov_model" data-val="standard">Standard</button>
-    <button class="cg-btn" role="button" aria-pressed="false" data-group="prov_model" data-val="flex_start">Flex-start (DWS)</button>
+  <div class="cg-row">
+    <div class="cg-label">3. Provisioning Model</div>
+    <div class="cg-options">
+      <button type="button" class="cg-btn active" data-group="prov_model" data-val="standard" aria-pressed="true">Standard / Reserved</button>
+      <button type="button" class="cg-btn" data-group="prov_model" data-val="flex_start" aria-pressed="false">Flex-start (DWS)</button>
+    </div>
   </div>
-
-  <div id="prov-output-instructions" class="cg-instructions"></div>
   <div class="cg-output-container">
-    <pre><code id="prov-output-command" class="language-shell"></code></pre>
+    <div class="cg-instructions" id="prov-output-instructions"></div>
+    <div class="highlight"><pre><code id="prov-output-command"></code></pre></div>
   </div>
 </div>
 
 | Parameter | Description |
 |-----------|-------------|
 | `PROJECT_ID` | Your Google Cloud project ID. |
-| `ZONE` | The Google Cloud zone where you have TPU quota (e.g., `us-east5-a`, `europe-west4-a`, `us-central2-b`). See [TPU regions and zones](https://cloud.google.com/tpu/docs/regions-zones) for availability. |
-| `SERVICE_ACCOUNT` | The email address for your service account, found in the Cloud Console under IAM Service Accounts (e.g., `tpu-service-account@<your_project_ID>.iam.gserviceaccount.com`). Required for legacy Cloud TPU API calls. |
+| `ZONE` | The Google Cloud zone where you have TPU quota (e.g., `us-central1-c`, `us-east5-a`, `europe-west4-a`, `us-central2-b`). See [TPU regions and zones](https://cloud.google.com/tpu/docs/regions-zones) for availability. |
+| `SERVICE_ACCOUNT` | The email address for your service account, found in the Cloud Console under IAM Service Accounts (e.g., `tpu-service-account@<your_project_ID>.iam.gserviceaccount.com`). Required for Cloud TPU API (queued resources) commands. |
 | `RUNTIME_VERSION` | Automatically populated by the generator above based on your selected TPU hardware generation. |
 
-### Connecting and Checking Status
+!!! note "TPU v7x dual-core architecture"
+    Each physical **TPU v7x (Ironwood)** chip exposes **2 logical TensorCore devices** to PyTorch and JAX. A single 4-chip TPU v7x host (`tpu7x-8`) provides **8 logical TPU devices** (`--tensor-parallel-size=8`) and 768 GB of total HBM.
 
-**Connect to your TPU VM using SSH**:
+## Connecting and Checking Status
 
-- **For GCE VM Instances (TPU v6e, v5p)**:
+Once your queued resource or GCE instance reaches the `ACTIVE` / `RUNNING` state, SSH into the host.
 
-    ```bash
-    gcloud compute ssh my-tpu-vm --zone ZONE
-    ```
+### Compute Engine (TPU v6e, v5p)
 
-- **For Legacy TPU VMs (TPU v5e, v4)**:
+Check the status of your instance:
 
-    ```bash
-    gcloud compute tpus tpu-vm ssh my-tpu-name --project PROJECT_ID --zone ZONE
-    ```
+```bash
+gcloud compute instances describe my-tpu-vm \
+  --project=PROJECT_ID \
+  --zone=ZONE
+```
 
-**Check Provisioning Status**:
+Connect using SSH:
 
-To check whether your TPU VM or Flex-start request has been allocated and is running:
+```bash
+gcloud compute ssh my-tpu-vm \
+  --project=PROJECT_ID \
+  --zone=ZONE
+```
 
-- **For GCE VM Instances (TPU v6e, v5p)**:
+### Queued Resources (TPU v7x, v5e, v4)
 
-    ```bash
-    gcloud compute instances describe my-tpu-vm --zone ZONE
-    ```
+Check the status of your queued resource:
 
-- **For Queued Resources (TPU v5e, v4)**:
+```bash
+gcloud alpha compute tpus queued-resources describe my-queued-resource \
+  --project=PROJECT_ID \
+  --zone=ZONE
+```
 
-    ```bash
-    gcloud alpha compute tpus queued-resources describe my-queued-resource --zone ZONE
-    ```
+Connect to worker 0 using SSH:
+
+```bash
+gcloud compute tpus tpu-vm ssh my-tpu-name \
+  --project=PROJECT_ID \
+  --zone=ZONE \
+  --worker=0
+```
+
+## Verify TPU Devices
+
+Inside the TPU VM, verify that the accelerator devices are visible before installing `vllm-torchtpu`:
+
+```bash
+ls /dev/vfio/
+```
+
+Once `vllm-torchtpu` is installed (which includes `tpu-info`), you can inspect chip utilization and HBM memory usage at any time with:
+
+```bash
+tpu-info
+```
+
+## Clean Up Resources
+
+To avoid incurring unnecessary charges when you are finished, delete your TPU resources:
+
+### Compute Engine (TPU v6e, v5p)
+
+```bash
+gcloud compute instances delete my-tpu-vm \
+  --project=PROJECT_ID \
+  --zone=ZONE
+```
+
+### Queued Resources (TPU v7x, v5e, v4)
+
+```bash
+gcloud alpha compute tpus queued-resources delete my-queued-resource \
+  --project=PROJECT_ID \
+  --zone=ZONE \
+  --force
+```
 
 ## Next Steps
 

@@ -28,6 +28,30 @@ steps:
         artifact_paths:
           - "perf_eval_results/**/*"
 
+      - label: "Integration: qwen35-pcp4tp1-tp4dcp2-disagg-correctness"
+        key: "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness"
+        agents:
+          queue: "tpu_v7x_8_queue"
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
+          RUN_ROOT: "/perf_eval_results/qwen35_pcp4tp1_tp4dcp2_disagg_ci"
+          ROLE: "all"
+          PREFILL_PCP: "4"
+          PREFILL_TP: "1"
+          DECODE_TP: "4"
+          DECODE_DCP: "2"
+          DECODE_DP: "1"
+          PREFILL_BLOCK_SIZE: "256"
+          DECODE_BLOCK_SIZE: "256"
+          PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE: "128"
+          TPU_RAIDEN_DST_SHARDS: "4"
+          VLLM_KV_CACHE_LAYOUT: "HND"
+        commands:
+          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_qwen35_pcp_tp_dcp_disagg_correctness.sh"
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
       - label: "Integration: qwen35-pcp8-dp8-disagg-correctness"
         key: "integration_qwen35_pcp8_dp8_disagg_correctness"
         agents:

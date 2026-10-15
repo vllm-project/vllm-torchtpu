@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from vllm.utils.network_utils import get_ip
 
 from vllm_torchtpu import envs
@@ -102,6 +115,16 @@ def get_stage3_status_probe_s() -> float:
     (and vLLM's delayed block free waiting on it) sits until
     p2p_wait_pull_timeout. 0 disables the probe."""
     return max(envs.TPU_RAIDEN_STAGE3_STATUS_PROBE_S, 0.0)
+
+
+def get_stage3_register_ahead_enabled() -> bool:
+    """Whether a PCP, TP or DP Stage-3 producer publishes a request's send
+    in the scheduler step that completes its prompt, so its workers
+    register the KV blocks while that step runs instead of in the step
+    after the finish response, where the registration first waits for the
+    next batch's forward (default on). Pipeline producers always register
+    ahead."""
+    return bool(envs.TPU_RAIDEN_STAGE3_REGISTER_AHEAD)
 
 
 def get_stage3_deferred_submit_enabled() -> bool:

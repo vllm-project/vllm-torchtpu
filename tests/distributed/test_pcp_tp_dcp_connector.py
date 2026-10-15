@@ -3,7 +3,7 @@
 
 import math
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 from vllm.v1.request import RequestStatus
@@ -221,7 +221,11 @@ def test_consumer_rejects_invalid_geometry_before_transfer(monkeypatch, field, v
 
 
 @pytest.mark.parametrize("tp,dcp", [(8, 8), (8, 2), (2, 1)])
-def test_consumer_prefix_clip_uses_local_heads_and_dcp_tokens(monkeypatch, tp, dcp):
+@pytest.mark.parametrize("queued", [False, True])
+@pytest.mark.parametrize("misaligned", [False, True])
+def test_consumer_prefix_clip_uses_local_heads_and_dcp_tokens(
+    monkeypatch, tp, dcp, queued, misaligned
+):
     _environment(monkeypatch, dtp=tp)
     worker = _make_raiden_worker(
         is_producer=False, tp_rank=0, tp_size=tp, block_size=384
@@ -239,9 +243,11 @@ def test_consumer_prefix_clip_uses_local_heads_and_dcp_tokens(monkeypatch, tp, d
     )
     monkeypatch.setattr(worker, "_raiden_hbm_memory_type", lambda: 3)
     req = SimpleNamespace(
-        src_controller_address="localhost:27000", skip_tokens=384 * dcp
+        src_controller_address="localhost:27000",
+        skip_tokens=384 * dcp - int(misaligned),
+        mamba_state_block_ids=None,
     )
-    outcome = worker._submit_stage3_load_as_leader(
+    args = dict(
         req_meta=req,
         source_req_id="p",
         destination_req_id="d",
@@ -251,7 +257,22 @@ def test_consumer_prefix_clip_uses_local_heads_and_dcp_tokens(monkeypatch, tp, d
         dst_controller_address="localhost:27001",
         dst_units=[worker._raiden_work_unit],
     )
-    assert outcome[0] == "accepted", outcome
+    if queued:
+        pending = tc._Stage3PendingSubmit(
+            **args, defer_deadline=None, first_attempt_s=0
+        )
+        task = worker._stage_stage3_submit_task(pending, synchronous=False)
+        if misaligned:
+            assert task is None
+        else:
+            assert task is not None
+            assert worker._execute_stage3_submit(task).error is None
+    else:
+        outcome = worker._submit_stage3_load_as_leader(**args)
+        assert outcome[0] == ("failed" if misaligned else "accepted"), outcome
+    if misaligned:
+        facade.start_transfer.assert_not_called()
+        return
     assert facade.start_transfer.call_args.kwargs["dst_skip_bytes"] == [384 * 512]
 
 
@@ -298,7 +319,9 @@ def test_pd_topology_rejects_invalid_layout_or_dcp(monkeypatch, layout, dcp):
     [
         (4, 2, 4, 4, 32, "Q/K replication"),
         (1, 1, 8, 4, 32, "Q/K replication"),
-        (2, 2, 8, 16, 32, "producer parallelism"),
+        (2, 2, 8, 16, 32, "producer parallelism"),  # Fan-out outside a pipeline.
+        (8, 1, 32, 16, 128, "Q/K replication"),  # Fan-out outside a pipeline.
+        (4, 1, 6, 12, 24, "producer parallelism"),
     ],
 )
 def test_gdn_unsupported_resharding_fails_before_store_or_pool_registration(
@@ -330,6 +353,7 @@ def test_gdn_unsupported_resharding_fails_before_store_or_pool_registration(
         (8, 1, 2, 16, 32),  # Existing PCP -> TP2.
         (1, 1, 8, 16, 32),  # Existing full-state producer fan-out.
         (1, 1, 1, 16, 32),
+        (8, 2, 16, 8, 64),  # Half-width PCP8 x TP2 -> TP16: 1:1.
     ],
 )
 def test_gdn_supported_transfer_geometry(monkeypatch, pcp, tp, dtp, k, v):
@@ -339,3 +363,185 @@ def test_gdn_supported_transfer_geometry(monkeypatch, pcp, tp, dtp, k, v):
     config.linear_num_key_heads = k
     config.linear_num_value_heads = v
     worker._validate_gdn_transfer_geometry(worker._gdn_head_geometry())
+
+
+def _pp_pcp_worker(monkeypatch, pp=4, pcp=8, tp=1, producer=True, dtp=32):
+    _environment(monkeypatch, pcp=pp * pcp, tp=tp, dtp=dtp)
+    worker = _make_raiden_worker(
+        is_producer=producer,
+        pcp_size=pcp,
+        tp_size=tp,
+        tp_rank=0,
+        pp_size=pp,
+        block_size=384,
+        interleave_size=128,
+    )
+    worker.vllm_config.kv_transfer_config.kv_connector_extra_config = {
+        "destination_decode_context_parallel_size": 8
+    }
+    return worker
+
+
+def _pp_pcp_coordinates(stage, pcp_rank):
+    return (
+        patch(
+            "vllm.distributed.parallel_state.get_pp_group",
+            return_value=SimpleNamespace(rank_in_group=stage),
+        ),
+        patch("vllm_torchtpu.distributed.pcp.get_pcp_rank", return_value=pcp_rank),
+    )
+
+
+@pytest.mark.parametrize("pp,pcp", [(4, 8), (2, 8), (2, 2), (8, 4)])
+def test_pp_pcp_producer_topology_and_unit_identity(monkeypatch, pp, pcp):
+    worker = _pp_pcp_worker(monkeypatch, pp=pp, pcp=pcp)
+    assert worker._raiden_qwen35_admission_topology() == f"pp{pp}pcp{pcp}_prefill"
+    monkeypatch.setattr(worker, "_raiden_stage3_enabled", lambda: True)
+    ranks, ports = [], set()
+    for stage in range(pp):
+        for p in range(pcp):
+            pp_group, pcp_rank = _pp_pcp_coordinates(stage, p)
+            with pp_group, pcp_rank:
+                rank = worker._local_raiden_transfer_rank()
+                endpoint, node = worker._raiden_endpoint_identity()
+            assert endpoint == node == rank
+            ranks.append(rank)
+            ports.add(worker._rank_control_port(9100, rank=endpoint))
+            fields = worker._raiden_work_unit_fields(rank)
+            assert fields["job_replica_id"] == f"producer-rank{rank}"
+    # Stage-major, then the stage-local PCP rank: contiguous from zero.
+    assert ranks == list(range(pp * pcp))
+    assert len(ports) == pp * pcp
+    # FA lowering follows the stage's PCP interleave, not whole stages.
+    assert worker._raiden_interleave_tokens(384, pcp) == 128
+    assert worker._raiden_interleave_tokens(384, pp * pcp) == 128
+
+
+def test_pp_pcp_decode_stage_keeps_the_stage_rank(monkeypatch):
+    worker = _pp_pcp_worker(monkeypatch, producer=False)
+    pp_group, pcp_rank = _pp_pcp_coordinates(3, 5)
+    with pp_group, pcp_rank:
+        assert worker._local_raiden_transfer_rank() == 3
+
+
+@pytest.mark.parametrize(
+    "pp,pcp,tp,hnd", [(4, 8, 2, True), (4, 8, 1, False), (3, 8, 1, True)]
+)
+def test_pp_pcp_producer_topology_rejects_unsupported_shapes(
+    monkeypatch, pp, pcp, tp, hnd
+):
+    worker = _pp_pcp_worker(monkeypatch, pp=pp, pcp=pcp, tp=tp)
+    monkeypatch.setattr(tc, "_raiden_seq_on_lane_layout", lambda: hnd)
+    with pytest.raises(ValueError, match=r"pp\{2,4,8\}pcp\{N\}_prefill"):
+        worker._raiden_qwen35_admission_topology()
+
+
+def test_pp_pcp_parallelism_requires_every_unit_and_per_layer_tags(monkeypatch):
+    worker = _pp_pcp_worker(monkeypatch)
+    with patch.object(tc.tpu_envs, "TPU_RAIDEN_POOL_TAGS_PER_LAYER", True):
+        worker._validate_stage3_transfer_parallelism(32)
+        for wrong in (4, 8):
+            with pytest.raises(ValueError, match="PP stage count"):
+                worker._validate_stage3_transfer_parallelism(wrong)
+    with (
+        patch.object(tc.tpu_envs, "TPU_RAIDEN_POOL_TAGS_PER_LAYER", False),
+        pytest.raises(ValueError, match="TPU_RAIDEN_POOL_TAGS_PER_LAYER"),
+    ):
+        worker._validate_stage3_transfer_parallelism(32)
+
+
+def test_pp_pcp_gdn_geometry_fans_out_to_tp32(monkeypatch):
+    worker = _pp_pcp_worker(monkeypatch)
+    config = worker.vllm_config.model_config.hf_config
+    config.linear_num_key_heads = 16
+    config.linear_num_value_heads = 128
+    geometry = worker._gdn_head_geometry()
+    assert (
+        geometry.parallel_size,
+        geometry.local_num_kq_heads,
+        geometry.local_num_v_heads,
+        geometry.kq_replication_factor,
+    ) == (8, 2, 16, 1)
+    worker._validate_gdn_transfer_geometry(geometry)
+
+
+@pytest.mark.parametrize(
+    "pp,pcp,dtp,k,v",
+    [
+        (4, 8, 32, 16, 128),  # PP4 x PCP8 -> TP32: fan-out grows Q/K replicas.
+        (2, 8, 16, 8, 64),  # Half-width PP2 x PCP8 -> TP16.
+    ],
+)
+def test_pp_pcp_gdn_fan_out_is_admitted(monkeypatch, pp, pcp, dtp, k, v):
+    worker = _pp_pcp_worker(monkeypatch, pp=pp, pcp=pcp, dtp=dtp)
+    config = worker.vllm_config.model_config.hf_config
+    config.linear_num_key_heads = k
+    config.linear_num_value_heads = v
+    worker._validate_gdn_transfer_geometry(worker._gdn_head_geometry())
+
+
+def _pp_pcp_scheduler(monkeypatch, parallelism):
+    _environment(monkeypatch, pcp=parallelism, tp=1, dtp=32)
+    scheduler = _make_raiden_scheduler(is_producer=True, pcp_size=8, block_size=384)
+    config = scheduler.vllm_config
+    config.parallel_config.pipeline_parallel_size = 4
+    config.parallel_config.cp_kv_cache_interleave_size = 128
+    config.kv_transfer_config.kv_connector_extra_config = {
+        "destination_decode_context_parallel_size": 8
+    }
+    scheduler._stage3_mamba_group_indices = [1]
+    return scheduler
+
+
+def _finished_request(tokens):
+    return MagicMock(
+        request_id="request",
+        num_computed_tokens=tokens + 1,
+        num_prompt_tokens=tokens + 1,
+        status=RequestStatus.FINISHED_LENGTH_CAPPED,
+        kv_transfer_params={},
+    )
+
+
+@pytest.mark.parametrize("tokens", [1, 3072, 8191])
+def test_pp_pcp_scheduler_metadata_and_finished_count(monkeypatch, tokens):
+    scheduler = _pp_pcp_scheduler(monkeypatch, 32)
+    assert scheduler.get_finished_count() == 32
+    ids = list(range(math.ceil(tokens / (384 * 8))))
+    delay, params = scheduler.request_finished(
+        _finished_request(tokens), ids + [99], mamba_block_ids=[[4, 5]]
+    )
+    assert delay
+    assert params["src_parallelism"] == 32
+    assert params["dst_tp_size"] == 32 and params["dst_dcp_size"] == 8
+    assert scheduler.reqs_to_send["request"].local_block_ids == ids
+    assert scheduler.reqs_to_send["request"].mamba_state_block_ids == [5]
+
+
+def test_pp_pcp_scheduler_rejects_stage_count_parallelism(monkeypatch):
+    scheduler = _pp_pcp_scheduler(monkeypatch, 4)
+    with pytest.raises(ValueError, match=r"PP \* PCP"):
+        scheduler.request_finished(
+            _finished_request(1000), [0], mamba_block_ids=[[4, 5]]
+        )
+
+
+def test_tp32_dcp8_consumer_pulls_every_pp_pcp_unit(monkeypatch):
+    _environment(monkeypatch, pcp=32, tp=1, dtp=32)
+    scheduler = _make_raiden_scheduler(is_producer=False, tp_size=32, block_size=384)
+    assert scheduler.get_finished_count() == 32
+    worker = _make_raiden_worker(
+        is_producer=False, tp_rank=0, tp_size=32, block_size=384
+    )
+    monkeypatch.setattr(worker, "_new_raiden_id", lambda fields: fields)
+    meta = SimpleNamespace(
+        src_parallelism=32,
+        src_job_name="prefill",
+        src_engine_id="p",
+        src_data_replica_idx=0,
+    )
+    units = worker._stage3_source_work_units(meta)
+    assert [unit["job_replica_id"] for unit in units] == [
+        f"p-rank{rank}" for rank in range(32)
+    ]
+    assert len(worker._raiden_destination_work_units()) == 32

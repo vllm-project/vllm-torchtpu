@@ -210,7 +210,7 @@ def _exchange_pcp_token_shards_for_head_shards(
 ) -> jnp.ndarray:
     """Exchange PCP token shards for PCP head shards.
 
-    Native torchtpu-vLLM PCP feeds rank-local token shards into this op. The
+    Native vllm-torchtpu PCP feeds rank-local token shards into this op. The
     op-local PCP mesh then treats PCP as extra head parallelism for the GDN
     recurrent scan: each PCP rank receives all tokens for only its local head
     slice.

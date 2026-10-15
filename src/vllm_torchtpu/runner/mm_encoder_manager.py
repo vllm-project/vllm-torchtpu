@@ -1,11 +1,34 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from typing import Any, cast
 
 import torch
 from vllm.config import VllmConfig
-from vllm.model_executor.models.interfaces import supports_encoder_cudagraph
-from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
+from vllm.model_executor.models.interfaces import (
+    SupportsEncoderCudaGraph,
+    supports_encoder_cudagraph,
+)
+from vllm.v1.worker.encoder_cudagraph import (
+    CaptureAxisKeys,
+    EncoderCudaGraphManager,
+)
 
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner.mm_video_chunking import (
+    embed_multimodal_chunked,
+    get_video_chunk_patch_size,
+)
 from vllm_torchtpu.utils import synchronize_tensors
 
 logger = init_logger(__name__)
@@ -78,8 +101,18 @@ class MMEncoderManager(EncoderCudaGraphManager):
             vllm_config=vllm_config,
             device=device,
             dtype=cast(torch.dtype, vllm_config.model_config.dtype),
-            model=vllm_model,
+            # maybe_create_mm_encoder_manager checks supports_encoder_cudagraph.
+            model=cast(SupportsEncoderCudaGraph, vllm_model),
         )
+        if self._capture_axes:
+            raise ValueError("TPU encoder budget templates do not support capture axes")
+
+        encoder_use_dp = getattr(vllm_model, "use_data_parallel", None)
+        if isinstance(encoder_use_dp, bool):
+            tp_size = vllm_config.parallel_config.tensor_parallel_size
+            self.use_dp = encoder_use_dp and tp_size > 1
+        elif encoder_use_dp is not None:
+            logger.warning("Ignoring non-boolean use_data_parallel=%r", encoder_use_dp)
 
         # Create dummy input templates for every budget size and path directly
         # from self.path_token_budgets prepared by EncoderCudaGraphManager.
@@ -97,6 +130,11 @@ class MMEncoderManager(EncoderCudaGraphManager):
                 if budget > 0
             }
             for path, budgets in self.path_token_budgets.items()
+        }
+        # CUDA graph metadata owns CUDA replay buffers. Track XLA warmup
+        # separately rather than storing template dicts in that upstream map.
+        self.compiled_budgets: dict[str, set[int]] = {
+            path: set() for path in self.path_token_budgets
         }
 
         # We compile the forward pass function using the TPU backend.
@@ -151,8 +189,15 @@ class MMEncoderManager(EncoderCudaGraphManager):
         return padded
 
     @torch.no_grad()
-    def _capture_budget_graph(self, token_budget: int, path: str = "default") -> None:
+    def _capture_budget_graph(
+        self,
+        token_budget: int,
+        path: str = "default",
+        axis_keys: CaptureAxisKeys = (),
+    ) -> None:
         """Primes the XLA cache for a specific budget bucket."""
+        if axis_keys:
+            raise ValueError("TPU encoder budget templates do not support capture axes")
         template = self.budget_templates[path][token_budget]
 
         # Pass a copy of template so models calling values.pop() don't mutate
@@ -160,7 +205,7 @@ class MMEncoderManager(EncoderCudaGraphManager):
         try:
             out = self._compiled_budget_forward(dict(template), path=path)
             synchronize_tensors(out, wait=True)
-            self._get_graph_set(path)[token_budget] = template
+            self.compiled_budgets[path].add(token_budget)
         except Exception as e:
             logger.warning(
                 "[mm_encoder_manager] Failed to precompile vision encoder "
@@ -176,10 +221,13 @@ class MMEncoderManager(EncoderCudaGraphManager):
         mm_kwargs: dict[str, Any],
         token_budget: int,
         path: str = "default",
+        axis_keys: CaptureAxisKeys = (),
         *,
         allow_eager_fallback: bool = True,
     ) -> torch.Tensor | None:
         """Pads actual inputs and runs the compiled XLA graph."""
+        if axis_keys:
+            raise ValueError("TPU encoder budget templates do not support capture axes")
         num_items = len(self._get_item_specs(mm_kwargs))
         if (
             path not in self.budget_templates
@@ -215,6 +263,35 @@ class MMEncoderManager(EncoderCudaGraphManager):
             self.graph_misses += num_items
             with torch.inference_mode():
                 return self.model.encoder_eager_forward(mm_kwargs, path=path)
+
+    def _execute_local(
+        self,
+        mm_kwargs: dict[str, Any],
+    ) -> list[torch.Tensor]:
+        """Execute locally, temporally chunking videos that exceed max budget."""
+        item_specs = self._get_item_specs(mm_kwargs)
+        total_tokens = sum(spec.output_tokens for spec in item_specs)
+        max_budget = max(self.token_budgets, default=0)
+        # When total batch tokens exceed the largest compiled bucket
+        # (max_budget), embed_multimodal_chunked temporally splits oversized
+        # videos so each call to upstream _execute_local fits in a compiled
+        # bucket, avoiding unbucketed eager fallback, XLA recompilation, and
+        # VMEM OOM on long videos.
+        if total_tokens > max_budget > 0:
+            total_patches = sum(spec.input_size for spec in item_specs)
+            max_patches = get_video_chunk_patch_size(
+                self.vllm_config.model_config,
+                default_max_patches=max_budget * total_patches // total_tokens,
+            )
+            if max_patches > 0:
+                return list(
+                    embed_multimodal_chunked(
+                        lambda **kw: super(MMEncoderManager, self)._execute_local(kw),
+                        mm_kwargs,
+                        max_patches,
+                    )
+                )
+        return super()._execute_local(mm_kwargs)
 
     @torch.no_grad()
     def execute_dp_coordinated(
@@ -264,9 +341,9 @@ class MMEncoderManager(EncoderCudaGraphManager):
             if step < len(batches):
                 assert mm_kwargs is not None
                 indices, _ = batches[step]
-                kwargs = self._select_items(mm_kwargs, indices)
+                kwargs, axis_keys = self._select_items(mm_kwargs, indices)
                 output = self._run_budget_graph(
-                    kwargs, budget, allow_eager_fallback=False
+                    kwargs, budget, axis_keys=axis_keys, allow_eager_fallback=False
                 )
                 assert output is not None
                 self.model.postprocess_encoder_output(
@@ -355,5 +432,8 @@ def maybe_create_mm_encoder_manager(
     if not vllm_config.compilation_config.cudagraph_mm_encoder:
         return None
     if not supports_encoder_cudagraph(vllm_model):
+        return None
+    if vllm_model.get_encoder_cudagraph_config().capture_axes:
+        logger.info("Using eager encoding for a model with encoder capture axes.")
         return None
     return MMEncoderManager(vllm_config, device, vllm_model)

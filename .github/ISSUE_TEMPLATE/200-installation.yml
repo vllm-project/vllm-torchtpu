@@ -33,7 +33,7 @@ body:
       Paste the full command you are trying to execute.
     value: |
       ```sh
-      pip install -e .
+      VLLM_TARGET_DEVICE="empty" pip install --pre -e . --group vllm
       ```
 - type: markdown
   attributes:
