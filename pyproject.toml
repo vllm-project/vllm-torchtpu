@@ -87,10 +87,7 @@ benchmarking = [
     "evalscope==1.10.0",
     # Stream gs:// checkpoints via --load-format runai_streamer (multihost
     # v7x-16 hosts have no disk for an HF download).
-    # 0.17.0 (2026-10-13) changed FileChunks to parallel offset/size lists and
-    # reworked the request iterator; model_loader_patches.py and
-    # tests/model_loader/test_ep_sharded_runai_streaming.py target the 0.16 API.
-    "runai-model-streamer[gcs]<0.17",
+    "runai-model-streamer[gcs]",
 ]
 
 # vLLM-Omni optional dependency
