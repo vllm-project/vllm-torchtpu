@@ -46,23 +46,19 @@
 #                            launches with --nnodes
 #
 # Where this departs from the doc, each needed on GKE: distinct Raiden ids per
-# role, a host KV store half the size, and --headless on hosts 1-3 (which
-# k3_1p1d.sh adds). Not here, as in the doc: --enable-auto-tool-choice,
+# role and --headless on hosts 1-3 (which k3_1p1d.sh adds). Not here, as in the doc: --enable-auto-tool-choice,
 # --tool-call-parser and --reasoning-parser, and so not the Kimi tool-call
 # post-eval either.
 #
 # RECIPE_SET=oct13 serves the doc's Oct 13 set as its "Changes from" list reads:
 # TPU P-state 7 and RAIDEN_NUMA_POLICY=bind on both roles, the prefill without
-# --prefix-cache-retention-interval, the one-hour benchmark, and for the DP2
-# points (e-g) and point h the prefill's --long-prefill-token-threshold 4096 and
-# the decode's default deferred Stage-3 submit. RECIPE_STORE_SERVERS=1 (c-h)
-# adds the global registry on the prefill head and a host-store server on each
-# decode host, which k3_1p1d.sh starts; the prefill's host store joins their
-# pool and the decode drops its own. Departures for GKE: the prefill's host
-# store stays at this file's 768 GiB (the doc: 1.5 TiB, 2 TiB for the DP2
-# points), each store server lends 256 GiB (the doc: 512 GiB), and the DP2
-# prefill has no --numa-bind, which runs the ranks under numactl and the engine
-# image has none.
+# --prefix-cache-retention-interval, the one-hour benchmark, and for the points
+# without speculation (e-h) the prefill's --long-prefill-token-threshold 4096
+# and --numa-bind (which needs numactl in the engine image) and the decode's
+# default deferred Stage-3 submit. RECIPE_STORE_SERVERS=1 (c-h) adds the global
+# registry on the prefill head and a host-store server on each decode host,
+# which k3_1p1d.sh starts; the prefill's host store joins their pool and the
+# decode drops its own.
 
 for _v in RECIPE_CONCURRENCY RECIPE_DECODE RECIPE_DECODE_MAX_NUM_SEQS; do
   [ -n "${!_v:-}" ] || { echo "ERROR: kimi-k3-megakernel: the point sets no $_v" >&2; return 2; }
@@ -306,17 +302,24 @@ COMMON_ARGS=(
 )
 
 # ---- per role and point ---------------------------------------------------------
-# The host-memory KV store the DSpark points' roles add beside Raiden. Its size
-# is split across the 32 ranks, so a quarter of it lands on each host, all of it
-# allocated when the ranks register. The doc's 1.5 TiB (1649267441664) put
-# ~384 GiB on each GKE tpu7x host; on top of the weight loads' page cache and
-# the gcsfuse sidecar's ~63 GiB, every host's working set reached 790-850 GiB of
-# 960 and the kubelet evicted the prefill head (vllm-torchtpu-dev build 562).
-# 768 GiB in all is ~192 GiB per host, which peaked at 604-677 GiB (build 589).
-# Half that left point 4's prefill recomputing 3.2x the trace's minimum prompt
-# tokens against 2.6x, with P90 TTFT 19.2 s against 7.5 s and 13% less
-# throughput (build 588). A point may set RECIPE_OFFLOAD_BYTES.
-_offload_bytes="${RECIPE_OFFLOAD_BYTES:-824633720832}"
+# The host-memory KV store the roles add beside Raiden: the doc's 1.5 TiB
+# (1649267441664), split across the 32 ranks, so ~384 GiB on each host, all of
+# it allocated when the ranks register. With the fleet's gcsfuse file cache and
+# tcmalloc keeping freed pages, that reached 790-850 GiB of 960 and the kubelet
+# evicted the prefill head (vllm-torchtpu-dev build 562); without the caches
+# (#1950) the prefill hosts peaked at 800-862 GiB (build 599), and with
+# TCMALLOC_AGGRESSIVE_DECOMMIT (#1981) at 645-647 GiB of the 917.9 allocatable
+# (build 601). The size matters: at 384 GiB the first set's point 4 prefill
+# recomputed 3.2x the trace's minimum prompt tokens with P90 TTFT 19.2 s
+# (build 588), at 768 GiB 2.6x and 7.5 s (589), at 1.5 TiB 6.2 s with 5% more
+# throughput than 768 GiB (597). The doc's points without speculation (e-h)
+# give the prefill 2 TiB (2199023255552, 64 GiB per rank, 512 GiB per host). A
+# point may set RECIPE_OFFLOAD_BYTES.
+if [ "$_no_spec" = 1 ]; then
+  _offload_bytes="${RECIPE_OFFLOAD_BYTES:-2199023255552}"
+else
+  _offload_bytes="${RECIPE_OFFLOAD_BYTES:-1649267441664}"
+fi
 # The Oct 13 store servers' pool: the prefill's host store registers with the
 # global registry and joins the pool group the decode-host store servers serve.
 _registry_port=27900
@@ -367,9 +370,13 @@ if [ "$_role" = prefill ]; then
     --kv-transfer-config "$_kv"
   )
   # The Oct 13 points without speculation: a long prompt takes at most 4,096
-  # tokens of the 8,192-token step, so short requests share it.
+  # tokens of the 8,192-token step, so short requests share it. --numa-bind
+  # pins ranks 0-3 to NUMA node 0 and 4-7 to node 1, CPUs and memory, so each
+  # rank's host store lands on its own node; vLLM launches the workers under
+  # numactl, which k3_1p1d.sh checks the engine image for.
   if [ "${RECIPE_SET:-}" = oct13 ] && [ "$_no_spec" = 1 ]; then
     ROLE_ARGS+=(--long-prefill-token-threshold 4096)
+    ROLE_ARGS+=(--numa-bind --numa-bind-nodes 0 0 0 0 1 1 1 1)
   fi
 elif [ "$RECIPE_DECODE" = dp2_dcp16 ]; then
   _loader=$(printf '{"presharded":"%s","attention_dp":2}' "$PRESHARDED_DIR")
@@ -420,18 +427,20 @@ SERVE_ARGS=("$MODEL_DIR" "${COMMON_ARGS[@]}" "${ROLE_ARGS[@]}")
 # The Oct 13 store servers, which k3_1p1d.sh starts: the global registry on the
 # prefill head before its serve, and a host-store server on each decode host
 # once the decode head serves, as the doc starts them after the engines are up.
-# Each server lends 256 GiB, half the doc's 512 GiB: without its own host store
-# a decode host holds ~410-440 GiB (build 589's 604-634 GiB less its 192 GiB
-# store), so with 256 GiB it comes to ~670-700 GiB before the gcsfuse sidecar,
-# about what build 589's prefill hosts held. A point may set
-# RECIPE_STORE_NODE_BYTES.
+# Each server lends the doc's 512 GiB (549755813888). Before
+# TCMALLOC_AGGRESSIVE_DECOMMIT (#1981) a decode host without its own host store
+# held ~410-450 GiB of workers, and 512 GiB servers put the hosts at 868-917
+# GiB of the 917.9 allocatable and the kubelet evicted two of them (build 598);
+# with it the workers hold ~210 GiB and a 384 GiB server left the hosts at
+# 599-601 GiB (build 601), so 512 GiB comes to roughly 730 GiB. A point may
+# set RECIPE_STORE_NODE_BYTES.
 if [ -n "${RECIPE_STORE_SERVERS:-}" ]; then
   K3_1P1D_REGISTRY_ADDRESS="$PREFILL_HEAD_IP:$_registry_port"
   if [ "$_role" = prefill ]; then
     K3_1P1D_REGISTRY_ARGS=(--port="$_registry_port")
   else
     K3_1P1D_STORE_NODE_ARGS=(
-      --dram_budget_bytes="${RECIPE_STORE_NODE_BYTES:-274877906944}"
+      --dram_budget_bytes="${RECIPE_STORE_NODE_BYTES:-549755813888}"
       --global_registry_address="$K3_1P1D_REGISTRY_ADDRESS"
       --kv_pool_group="$_pool_group"
       --store_server_ip="$NODE_IP"

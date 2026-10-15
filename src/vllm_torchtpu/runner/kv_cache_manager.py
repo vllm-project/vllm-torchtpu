@@ -406,7 +406,7 @@ class KVCacheManager:
             self.runner.kv_cache_dtype,
             enable_unified_kv_layout=self.runner._unified_kv_layout,
             exempt_layers=ds_v4_layers,
-            attention_backend=backend_cls,
+            attention_backend=cast("type[PallasAttentionBackend] | None", backend_cls),
         )
         if (
             hma_enabled

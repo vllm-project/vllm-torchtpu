@@ -1891,11 +1891,6 @@
       "concise_description": "Class `AttentionBackend` has no class attribute `get_kv_cache_shape`"
     },
     {
-      "path": "src/vllm_torchtpu/runner/mm_encoder_manager.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[int, BudgetGraphMetadata]`"
-    },
-    {
       "path": "src/vllm_torchtpu/runner/mm_video_chunking.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `(**mm_kwargs: Any) -> MultiModalEmbeddings` is not assignable to parameter `value` with type `Module | Tensor` in function `torch.nn.modules.module.Module.__setattr__`"

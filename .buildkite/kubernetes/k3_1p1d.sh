@@ -158,6 +158,8 @@ check_inputs() {
   local cmd cmds=()
   if [[ "${#K3_1P1D_REGISTRY_ARGS[@]}" -gt 0 && "$INDEX" == "0" ]]; then cmds+=(global_registry_server); fi
   if [[ "${#K3_1P1D_STORE_NODE_ARGS[@]}" -gt 0 ]]; then cmds+=(kv_cache_host_store_node_main); fi
+  # vLLM launches every worker under numactl when a config passes --numa-bind.
+  if printf '%s\n' "${SERVE_ARGS[@]}" | grep -qx -- '--numa-bind'; then cmds+=(numactl); fi
   for cmd in "${cmds[@]}"; do
     if command -v "$cmd" >/dev/null; then echo "[input] ok $cmd"; else echo "[input] MISSING $cmd"; ok=1; fi
   done

@@ -23,7 +23,7 @@ from vllm_torchtpu.core.tpu_scheduler import TpuDpScheduler
 def _make_scheduler(waiting=(), drain_prefill=False):
     scheduler = TpuDpScheduler.__new__(TpuDpScheduler)
     scheduler.waiting = list(waiting)
-    scheduler.skipped_waiting = []
+    scheduler.kv_holding_waiting = []
     scheduler._pause_state = PauseState.UNPAUSED
     scheduler._drain_prefill = drain_prefill
     scheduler.prefill_capacity_bound = False

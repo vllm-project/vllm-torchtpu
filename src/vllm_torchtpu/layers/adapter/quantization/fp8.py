@@ -683,6 +683,10 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
             raise NotImplementedError(
                 "FP8 store_dtype is not supported by the TPU quantization path"
             )
+        # vLLM v0.31 rejects online quantization in `Fp8Config` and moved it to
+        # the `fp8_per_tensor` shorthand. The TPU path still quantizes BF16
+        # checkpoints online through its own linear/MoE methods, so construct
+        # the parent as serialized and restore the requested mode.
         super().__init__(
             is_checkpoint_fp8_serialized=True,
             activation_scheme=activation_scheme,

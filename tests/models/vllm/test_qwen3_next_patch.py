@@ -33,8 +33,8 @@ from vllm_torchtpu.models.vllm.qwen3_next_patch import (
     patched_decoder_layer_forward,
 )
 
-# The patched copies track vLLM v0.29.0 (pyproject.toml pin).
-PINNED_VLLM_VERSION = "0.29.0"
+# The patched copies track vLLM v0.31.0 (pyproject.toml pin).
+PINNED_VLLM_VERSION = "0.31.0"
 PINNED_DECODER_LAYER_HASH = (
     "359c047f120f585e0c519a3bc438f037f996f4d48c7b64495dadddc59a709b4a"
 )
@@ -45,7 +45,7 @@ PINNED_MODEL_FORWARD_HASH = (
 # keeps its SP chunk before the MTP layer and all-gather after the final
 # norm, which is what lets tpu_platform admit MTP under SP.
 PINNED_QWEN3_5_MTP_FORWARD_HASH = (
-    "54034d76e48fccf2cd98bcf05b831207580ad9e8886e6e387193e1bd70e9e472"
+    "af988ccd1ba49bf2953bb9858d7a2082c405d260d2ebb64413c6707c34a80d22"
 )
 requires_pinned_vllm = pytest.mark.skipif(
     vllm.__version__ != PINNED_VLLM_VERSION,

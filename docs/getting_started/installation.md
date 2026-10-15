@@ -92,10 +92,10 @@ pip install -e . --group vllm \
 
 ## Option 3: Editable `vllm` Checkout (Cross-Repo Development)
 
-By default, `--group vllm` builds and installs the pinned upstream `vllm` tag (`v0.29.0`) from GitHub. If you are developing changes across both `vllm` and `vllm-torchtpu`, replace the installed `vllm` package with a local editable checkout:
+By default, `--group vllm` builds and installs the pinned upstream `vllm` tag (`v0.31.0`) from GitHub. If you are developing changes across both `vllm` and `vllm-torchtpu`, replace the installed `vllm` package with a local editable checkout:
 
 ```bash
-git clone --branch v0.29.0 --depth 1 https://github.com/vllm-project/vllm.git ../vllm
+git clone --branch v0.31.0 --depth 1 https://github.com/vllm-project/vllm.git ../vllm
 VLLM_TARGET_DEVICE=empty uv pip install -e ../vllm --no-deps
 ```
 
@@ -108,7 +108,7 @@ VLLM_TARGET_DEVICE=empty uv pip install -e ../vllm --no-deps
 
 | Flag | Purpose |
 | :--- | :--- |
-| `--group vllm` | Installs pinned upstream `vllm` (`v0.29.0`) from source. |
+| `--group vllm` | Installs pinned upstream `vllm` (`v0.31.0`) from source. |
 | `--group test` | Installs `pytest`, `pytest-mock`, `pytest-cov`, `parameterized`, and `vllm_test_utils`. |
 | `--extra benchmarking` | Installs `lm-eval`, `evalscope`, `datasets`, and `runai-model-streamer[gcs]`. |
 | `--extra omni` | Installs `vllm-omni` for multimodal diffusion models (e.g., FLUX, Wan2.2). |

@@ -11,7 +11,6 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from collections.abc import Hashable
 from typing import Any, cast
 
 import torch
@@ -20,7 +19,10 @@ from vllm.model_executor.models.interfaces import (
     SupportsEncoderCudaGraph,
     supports_encoder_cudagraph,
 )
-from vllm.v1.worker.encoder_cudagraph import EncoderCudaGraphManager
+from vllm.v1.worker.encoder_cudagraph import (
+    CaptureAxisKeys,
+    EncoderCudaGraphManager,
+)
 
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.runner.mm_video_chunking import (
@@ -102,6 +104,8 @@ class MMEncoderManager(EncoderCudaGraphManager):
             # maybe_create_mm_encoder_manager checks supports_encoder_cudagraph.
             model=cast(SupportsEncoderCudaGraph, vllm_model),
         )
+        if self._capture_axes:
+            raise ValueError("TPU encoder budget templates do not support capture axes")
 
         encoder_use_dp = getattr(vllm_model, "use_data_parallel", None)
         if isinstance(encoder_use_dp, bool):
@@ -126,6 +130,11 @@ class MMEncoderManager(EncoderCudaGraphManager):
                 if budget > 0
             }
             for path, budgets in self.path_token_budgets.items()
+        }
+        # CUDA graph metadata owns CUDA replay buffers. Track XLA warmup
+        # separately rather than storing template dicts in that upstream map.
+        self.compiled_budgets: dict[str, set[int]] = {
+            path: set() for path in self.path_token_budgets
         }
 
         # We compile the forward pass function using the TPU backend.
@@ -184,9 +193,11 @@ class MMEncoderManager(EncoderCudaGraphManager):
         self,
         token_budget: int,
         path: str = "default",
-        axis_keys: tuple[Hashable, ...] = (),
+        axis_keys: CaptureAxisKeys = (),
     ) -> None:
         """Primes the XLA cache for a specific budget bucket."""
+        if axis_keys:
+            raise ValueError("TPU encoder budget templates do not support capture axes")
         template = self.budget_templates[path][token_budget]
 
         # Pass a copy of template so models calling values.pop() don't mutate
@@ -194,8 +205,7 @@ class MMEncoderManager(EncoderCudaGraphManager):
         try:
             out = self._compiled_budget_forward(dict(template), path=path)
             synchronize_tensors(out, wait=True)
-            # pyrefly: ignore[unsupported-operation]
-            self._get_graph_set(path)[token_budget] = template
+            self.compiled_budgets[path].add(token_budget)
         except Exception as e:
             logger.warning(
                 "[mm_encoder_manager] Failed to precompile vision encoder "
@@ -211,11 +221,13 @@ class MMEncoderManager(EncoderCudaGraphManager):
         mm_kwargs: dict[str, Any],
         token_budget: int,
         path: str = "default",
-        axis_keys: tuple[Hashable, ...] = (),
+        axis_keys: CaptureAxisKeys = (),
         *,
         allow_eager_fallback: bool = True,
     ) -> torch.Tensor | None:
         """Pads actual inputs and runs the compiled XLA graph."""
+        if axis_keys:
+            raise ValueError("TPU encoder budget templates do not support capture axes")
         num_items = len(self._get_item_specs(mm_kwargs))
         if (
             path not in self.budget_templates
@@ -331,10 +343,7 @@ class MMEncoderManager(EncoderCudaGraphManager):
                 indices, _ = batches[step]
                 kwargs, axis_keys = self._select_items(mm_kwargs, indices)
                 output = self._run_budget_graph(
-                    kwargs,
-                    budget,
-                    axis_keys=axis_keys,
-                    allow_eager_fallback=False,
+                    kwargs, budget, axis_keys=axis_keys, allow_eager_fallback=False
                 )
                 assert output is not None
                 self.model.postprocess_encoder_output(
@@ -423,5 +432,8 @@ def maybe_create_mm_encoder_manager(
     if not vllm_config.compilation_config.cudagraph_mm_encoder:
         return None
     if not supports_encoder_cudagraph(vllm_model):
+        return None
+    if vllm_model.get_encoder_cudagraph_config().capture_axes:
+        logger.info("Using eager encoding for a model with encoder capture axes.")
         return None
     return MMEncoderManager(vllm_config, device, vllm_model)
