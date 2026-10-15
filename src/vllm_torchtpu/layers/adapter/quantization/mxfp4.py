@@ -733,14 +733,19 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             register_score_bias_buffer(layer)
             # The kernel takes [E, K/block, N]; do the squeeze once here
             # rather than per layer per step inside the compiled forward.
+            # `squeeze(2)` of the [E, K/block, 1, N] parameter is already
+            # contiguous, so `.contiguous()` keeps the 4-D device buffer and
+            # its (1, 128)-tiled layout: the compiled step then relayouts both
+            # scale tables (two copies each) in every MoE layer. `clone()`
+            # materializes a real 3-D buffer in the kernel's layout.
             layer.register_buffer(
                 "_tpu_fused_w13_scale",
-                layer.w13_weight_scale.squeeze(2).contiguous(),
+                layer.w13_weight_scale.squeeze(2).clone(),
                 persistent=False,
             )
             layer.register_buffer(
                 "_tpu_fused_w2_scale",
-                layer.w2_weight_scale.squeeze(2).contiguous(),
+                layer.w2_weight_scale.squeeze(2).clone(),
                 persistent=False,
             )
             logger.info_once(
