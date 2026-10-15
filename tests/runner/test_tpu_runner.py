@@ -3109,6 +3109,8 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             ),
             scheduler_config=SimpleNamespace(async_scheduling=False),
             _is_async_drafter=False,
+            _is_dspark_pd_producer=False,
+            _fence_spec_kv_under_token_copy=False,
             is_pooling_model=False,
             drafter=SimpleNamespace(),
             spec_decode_manager=SimpleNamespace(
