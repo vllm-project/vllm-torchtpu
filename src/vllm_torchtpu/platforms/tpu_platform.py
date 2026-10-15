@@ -34,6 +34,7 @@ from vllm.platforms.interface import Platform, PlatformEnum
 from vllm_torchtpu import envs, patch_registry
 from vllm_torchtpu.core.eagle_block_drop import apply_eagle_block_drop_override
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.parallel_requirements import requires_dp_collectives
 from vllm_torchtpu.platforms.pcp_validation import PcpStaticSupportValidator
 from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
 from vllm_torchtpu.platforms.tpu_block_size_utils import (
@@ -947,8 +948,10 @@ class TpuPlatform(Platform):
         else:
             compilation_config.mode = CompilationMode.VLLM_COMPILE
 
-        # No graph splitting — TPU handles the full graph including
-        compilation_config.splitting_ops = []
+        # Compile whole graphs by default, retaining explicit boundaries
+        # declared by model configuration hooks or the caller.
+        if compilation_config.splitting_ops is None:
+            compilation_config.splitting_ops = []
 
         # Kernel-iteration mode splits the compiled graph at the Pallas RPA
         # custom ops so they execute eagerly outside the compiled pieces.
@@ -958,16 +961,19 @@ class TpuPlatform(Platform):
         # are allocated at model build, so list every id the registry could
         # plausibly allocate (should_split does exact name matching).
         if envs.TPU_KERNEL_ITER_MODE:
-            compilation_config.splitting_ops = [
-                f"pallas::{prefix}_{i}"
+            compilation_config.splitting_ops.extend(
+                op
                 for prefix in ("rpa_kernel", "rpa_kernel_batched")
                 for i in range(64)
-            ]
+                if (op := f"pallas::{prefix}_{i}")
+                not in compilation_config.splitting_ops
+            )
 
         # Disable inductor-specific fusion passes (only available on CUDA).
         compilation_config.pass_config.fuse_norm_quant = False
         compilation_config.pass_config.fuse_act_quant = False
         compilation_config.pass_config.fuse_attn_quant = False
+        compilation_config.pass_config.fuse_rope_kvcache_cat_mla = False
         compilation_config.pass_config.eliminate_noops = False
 
         # Set compile_sizes to match the token padding buckets used by
@@ -1164,9 +1170,9 @@ class TpuPlatform(Platform):
                 os.environ.setdefault(
                     "TORCH_TPU_DP_MASTER_PORT", str(portpicker.pick_unused_port())
                 )
-                if parallel_config.enable_expert_parallel:
-                    # EP's expert-combine collective genuinely spans every
-                    # DP*TP worker, so torch_tpu needs one shared slice
+                if requires_dp_collectives(vllm_config):
+                    # EP or a DP-sharded model embedding spans all
+                    # DP*TP workers, so torch_tpu needs one shared slice
                     # across all of them; the worker spawn shim exposes a
                     # DP-adjusted chip ordinal to TorchTPU for physical
                     # binding.

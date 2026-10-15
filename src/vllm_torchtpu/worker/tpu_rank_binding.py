@@ -216,6 +216,7 @@ def get_tpu_worker_binding(
     *,
     env: Mapping[str, str],
     use_spawned_pcp_local_rank: bool = False,
+    dp_collectives: bool = False,
 ) -> TpuWorkerBinding:
     world_size = parallel_config.world_size
     pcp_size = parallel_config.prefill_context_parallel_size
@@ -226,7 +227,7 @@ def get_tpu_worker_binding(
 
     rank = int(rank)
     local_rank = int(local_rank)
-    if dp_size > 1 and parallel_config.enable_expert_parallel:
+    if dp_size > 1 and (parallel_config.enable_expert_parallel or dp_collectives):
         dp_rank = parallel_config.data_parallel_index
         assert dp_rank is not None, (
             "ParallelConfig.data_parallel_index must be resolved when "

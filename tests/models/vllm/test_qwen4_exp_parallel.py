@@ -305,6 +305,35 @@ def test_non_spec_async_uses_the_same_admitted_topologies(tp, dp):
     validate_config(cfg)
 
 
+@pytest.mark.parametrize("tp", [2, 4])
+def test_dp_shared_ple_keeps_one_world_with_ep_off(tp):
+    from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
+
+    assignments = []
+    for rank in range(8):
+        cfg = NS(
+            world_size=tp,
+            local_world_size=tp,
+            prefill_context_parallel_size=1,
+            data_parallel_size=8 // tp,
+            data_parallel_size_local=8 // tp,
+            data_parallel_index=rank // tp,
+            data_parallel_rank_local=rank // tp,
+            enable_expert_parallel=False,
+        )
+        binding = get_tpu_worker_binding(
+            cfg, rank % tp, rank % tp, env={}, dp_collectives=True
+        )
+        assignments.append(binding.native_local_rank)
+        assert binding.rank == rank and binding.local_rank == rank
+        assert binding.world_size == binding.local_world_size == 8
+        assert binding.init_rank == rank % tp and binding.init_world_size == tp
+        independent = get_tpu_worker_binding(cfg, rank % tp, rank % tp, env={})
+        assert independent.world_size == tp and independent.rank == rank % tp
+        assert independent.native_local_rank == rank
+    assert assignments == list(range(8))
+
+
 def test_admission_uses_model_relations_instead_of_checkpoint_literals():
     cfg = config()
     cfg.model_config.hf_text_config = q4exp_text_config(
