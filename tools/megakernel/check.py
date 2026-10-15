@@ -436,6 +436,35 @@ def run_spec(args, records: harness.Records) -> None:
     batched.forget(tuple("f" + n for n in four))
     four_agree = report(f"4 x {verify_rows(4)} rows", four, four_streams, four_rates)
 
+    def arriving(name, joining):
+        """``name``'s first token arriving as a transferred request does: all
+        but its last prompt token computed (its pages hold them from the
+        groups above). Joining another request's speculation, it arrives with
+        that step's draft slots already scheduled (vLLM pads a request
+        starting to decode to the speculative width)."""
+        n, req = len(prompts[name]), "t" + name
+        if not joining:
+            arrival = k3.request(req, prompts[name][-1:], tables[name], computed=n - 1)
+            out = decode(batched, [arrival])[:1]
+            batched.forget((req,))
+            return tokens_of([out])
+        decode(batched, [row("tA", prompts["A"], tables["A"])])
+        for _ in range(4):
+            decode(batched, [row("tA", np.zeros(rows), tables["A"])])
+        k = verify_rows(2)
+        tokens = np.concatenate((prompts[name][-1:], np.full(k - 1, -1)))
+        arrival = k3.request(req, tokens, tables[name], computed=n - 1)
+        arrival = dataclasses.replace(arrival, num_tokens=n)
+        out = decode(batched, [row("tA", np.zeros(k), tables["A"]), arrival])[1:2]
+        batched.forget(("tA", req))
+        return tokens_of([out])
+
+    arrivals = {n: (arriving(n, False), arriving(n, True)) for n in ("B", "D")}
+    harness.log(
+        "transferred arrival, first token alone vs joining a speculation with "
+        "draft slots: " + "; ".join(f"{n} {a} vs {j}" for n, (a, j) in arrivals.items())
+    )
+
     def plain_group(names, streams, n=112):
         """The group in plain steps: how far batch composition alone moves
         each greedy stream from its single-request reference, and how far
@@ -552,10 +581,12 @@ def run_spec(args, records: harness.Records) -> None:
         batched_seed_varies=b_varies,
         batched_ms={str(b): t for b, t in timing.items()},
         churn_worst_ms=[round(churn_join), round(churn_steady)],
+        transferred_arrival_first_tokens=arrivals,
     )
     ok = reproducible and varies and same > 0
     ok = ok and b_reproducible and b_varies and same_pa > 0 and same_pb > 0
     ok = ok and all(a > 0 for a in four_agree + three_agree + eight_agree + five_agree)
+    ok = ok and all(a[:1] == j[:1] for a, j in arrivals.values())
     if churn_steady > 1000 or churn_join > 1000:
         harness.log("a step after warmup compiled (churn above)")
         ok = False

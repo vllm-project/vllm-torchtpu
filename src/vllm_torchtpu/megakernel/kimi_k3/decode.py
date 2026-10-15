@@ -619,8 +619,11 @@ class KimiDecoder:
             if request.req_id in self.tracked:
                 entries.append((slot, False, 0, 0, sampling))
             else:
-                tokens = request.token_ids[request.computed : request.end]
-                replay = request.scheduled - (0 if request.partial else 1)
+                # Scheduled slots past the known tokens are draft slots (vLLM
+                # pads a request starting to decode to the speculative width).
+                known = min(request.end, request.num_tokens)
+                tokens = request.token_ids[request.computed : known]
+                replay = len(tokens) - (0 if request.partial else 1)
                 if replay:
                     self._replay(
                         slot,
@@ -631,15 +634,7 @@ class KimiDecoder:
                     )
                 if request.partial:
                     continue
-                entries.append(
-                    (
-                        slot,
-                        True,
-                        int(tokens[request.scheduled - 1]),
-                        request.end - 1,
-                        sampling,
-                    )
-                )
+                entries.append((slot, True, int(tokens[-1]), known - 1, sampling))
                 self.tracked.add(request.req_id)
             tables.append(table)
             decoding.append((i, request))
