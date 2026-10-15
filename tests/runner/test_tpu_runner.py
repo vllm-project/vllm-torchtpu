@@ -2644,3 +2644,210 @@ def test_gather_logprobs_computes_in_fp32(max_logprobs):
     assert torch.equal(
         out.selected_token_ranks, torch.tensor([1, 2], dtype=torch.int32)
     )
+
+
+def test_sample_from_logits_float32_noise_preserves_gumbel_tail():
+    """Uniform noise `u` in float32 preserves the upper Gumbel tail above the
+    bfloat16 ceiling (-log(-log(1 - 2^-7)) ~= 4.85) when logits are bfloat16."""
+    runner = SimpleNamespace()
+    runner._apply_temperature = TPUModelRunner._apply_temperature.__get__(runner)
+    sample_fn = TPUModelRunner.sample_from_logits.__wrapped__
+
+    logits = torch.tensor([[6.0, 0.0]], dtype=torch.bfloat16)
+    temperatures = torch.tensor([[1.0]], dtype=torch.bfloat16)
+    top_k = torch.tensor([[0]], dtype=torch.int32)
+    top_p = torch.tensor([[1.0]], dtype=torch.float32)
+
+    # With float32 u = 0.9995, -log(-log(0.9995)) ~= 7.60 > 6.0 + 0.37, so
+    # token 1 is sampled. In bfloat16, 1 - eps = 0.9921875 clamps Gumbel noise
+    # to <= 4.85, making token 1 impossible to sample.
+    u_fp32 = torch.tensor([[0.5, 0.9995]], dtype=torch.float32)
+    out_fp32 = sample_fn(runner, logits, temperatures, u_fp32, top_k, top_p)
+    assert int(out_fp32.item()) == 1
+
+    u_bf16 = u_fp32.to(torch.bfloat16)
+    out_bf16 = sample_fn(runner, logits, temperatures, u_bf16, top_k, top_p)
+    assert int(out_bf16.item()) == 0
+
+
+def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
+    """All TPUModelRunner call sites into sample_from_logits_func must draw
+    uniform random noise `u` in float32 even when logits are bfloat16."""
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+    )
+    monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **k: None)
+    monkeypatch.setattr(
+        tpu_runner, "has_kv_transfer_group", lambda: False, raising=False
+    )
+
+    seen_u_dtypes: list[torch.dtype] = []
+
+    def fake_sample_from_logits(
+        logits,
+        temperatures,
+        u,
+        top_k,
+        top_p,
+        all_greedy=False,
+        topk_candidates=0,
+    ):
+        seen_u_dtypes.append(u.dtype)
+        return torch.zeros((logits.shape[0], 1), dtype=torch.int32)
+
+    bf16_logits = torch.zeros((2, 16), dtype=torch.bfloat16)
+    sampling_params = (
+        torch.ones((2, 1), dtype=torch.bfloat16),
+        torch.zeros((2, 1), dtype=torch.int32),
+        torch.ones((2, 1), dtype=torch.float32),
+    )
+
+    # 1. _precompile_sample_from_logits
+    precompile_runner = SimpleNamespace(
+        num_reqs_paddings=[2],
+        _hidden_states_dtype=torch.bfloat16,
+        device=torch.device("cpu"),
+        _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
+        _topk_candidate_blocks=lambda: 0,
+        _precompile_timed=lambda _name: contextlib.nullcontext(),
+        _sampler_light_variants=lambda: [],
+        sample_from_logits_func=fake_sample_from_logits,
+    )
+    TPUModelRunner._precompile_sample_from_logits(precompile_runner)
+    assert seen_u_dtypes == [torch.float32, torch.float32]
+    seen_u_dtypes.clear()
+
+    # 2. _sample_spec_verify_chunk (bonus_u and recover_u)
+    seen_recover_dtypes: list[torch.dtype] = []
+
+    def fake_rejection_sampler(**kwargs):
+        seen_recover_dtypes.append(kwargs["recover_u"].dtype)
+        return torch.zeros((2, 2), dtype=torch.int32)
+
+    spec_runner = SimpleNamespace(
+        spec_gather_bonus_and_target_logits=lambda logits, b_idx, t_idx: (
+            bf16_logits,
+            bf16_logits,
+        ),
+        _build_padded_sampling_params=lambda start, end, logits: sampling_params,
+        _sampler_topk_candidates=lambda start, end, grammar: 0,
+        _sampler_fused_chain=False,
+        _sampler_kwargs=lambda: {},
+        sample_from_logits_func=fake_sample_from_logits,
+        speculative_config=SimpleNamespace(num_speculative_tokens=1),
+    )
+    spec_runner.rejection_sampler = MagicMock(side_effect=fake_rejection_sampler)
+    spec_runner.rejection_sampler.synthetic_mode = False
+    md = SimpleNamespace(
+        bonus_logits_indices=torch.tensor([0, 1], dtype=torch.int32),
+        target_logits_indices=torch.tensor([0, 1], dtype=torch.int32),
+        draft_token_ids=torch.zeros((2,), dtype=torch.int32),
+        draft_lengths=torch.ones((2,), dtype=torch.int32),
+        segment_ids=torch.tensor([0, 1], dtype=torch.int32),
+        group_indices=torch.tensor([[0], [1]], dtype=torch.int32),
+    )
+    TPUModelRunner._sample_spec_verify_chunk(
+        spec_runner,
+        bf16_logits,
+        md,
+        cur_start_idx=0,
+        cur_end_idx=2,
+        all_greedy=False,
+        grammar_output=None,
+        scheduler_output=SimpleNamespace(),
+        sampling_generator=None,
+    )
+    assert seen_u_dtypes == [torch.float32]
+    assert seen_recover_dtypes == [torch.float32]
+    seen_u_dtypes.clear()
+
+    # 2b. _sample_spec_verify_chunk under TPU_SAMPLER_FUSED_CHAIN
+    seen_fused_dtypes: list[tuple[torch.dtype, ...]] = []
+
+    def fake_spec_sample_verify_fused(*args, **kwargs):
+        bonus_u, accept_u, recover_u = args[10:13]
+        seen_fused_dtypes.append((bonus_u.dtype, accept_u.dtype, recover_u.dtype))
+        return torch.zeros((2, 2), dtype=torch.int32)
+
+    spec_runner._sampler_fused_chain = True
+    spec_runner._build_padded_sampling_params = (
+        lambda start, end, logits, **kw: sampling_params
+    )
+    spec_runner.spec_sample_verify_fused = fake_spec_sample_verify_fused
+    TPUModelRunner._sample_spec_verify_chunk(
+        spec_runner,
+        bf16_logits,
+        md,
+        cur_start_idx=0,
+        cur_end_idx=2,
+        all_greedy=False,
+        grammar_output=None,
+        scheduler_output=SimpleNamespace(),
+        sampling_generator=None,
+    )
+    assert seen_fused_dtypes == [(torch.float32,) * 3]
+    assert seen_u_dtypes == []
+
+    # 3 & 4. sample_tokens (both non-speculative and speculative non-verify chunk)
+    for spec_method in (None, "ngram"):
+        scheduler_output = SimpleNamespace(
+            num_scheduled_tokens={"r0": 1, "r1": 1},
+            finished_req_ids=set(),
+            has_structured_output_requests=False,
+        )
+        runner = SimpleNamespace(
+            execute_model_state=SimpleNamespace(
+                scheduler_output=scheduler_output,
+                draft_chunks=[],
+                logits_list=[bf16_logits],
+                num_reqs_list=[2],
+                spec_decode_metadata_list=[None],
+                mamba_state_indices_list=None,
+                pooler_output_list=[],
+                top_tokens=False,
+            ),
+            input_batch=SimpleNamespace(
+                max_num_logprobs=None,
+                num_reqs=2,
+                req_ids=["r0", "r1"],
+                req_id_to_index={"r0": 0, "r1": 1},
+                all_greedy=False,
+                num_tokens_no_spec=[1, 1],
+                token_ids_cpu=np.zeros((2, 8), dtype=np.int32),
+            ),
+            requests={
+                "r0": SimpleNamespace(
+                    num_computed_tokens=0, num_tokens=1, output_token_ids=[]
+                ),
+                "r1": SimpleNamespace(
+                    num_computed_tokens=0, num_tokens=1, output_token_ids=[]
+                ),
+            },
+            speculative_config=(
+                None
+                if spec_method is None
+                else SimpleNamespace(method=spec_method, num_speculative_tokens=1)
+            ),
+            scheduler_config=SimpleNamespace(async_scheduling=False),
+            _is_async_drafter=False,
+            is_pooling_model=False,
+            drafter=SimpleNamespace(),
+            spec_decode_manager=SimpleNamespace(
+                propose_draft_token_ids=lambda **kw: None
+            ),
+            _get_sampling_generator=lambda: None,
+            _build_padded_sampling_params=lambda start, end, logits: sampling_params,
+            _sampler_topk_candidates=lambda start, end, grammar: 0,
+            _sampler_kwargs=lambda: {},
+            sample_from_logits_func=fake_sample_from_logits,
+            _update_mamba_slot_read_offsets=lambda *_args: None,
+            _update_num_xla_graphs=lambda *_args: None,
+            _stage_timing=MagicMock(),
+        )
+        runner._stage_timing.take_samples.return_value = ([], [])
+        for name in ("maybe_wait_for_kv_save", "get_finished_kv_transfers"):
+            setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+
+        TPUModelRunner.sample_tokens(runner, None)
+
+    assert seen_u_dtypes == [torch.float32, torch.float32]

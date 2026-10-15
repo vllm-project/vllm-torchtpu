@@ -4353,11 +4353,12 @@ class TPUModelRunner(GPUModelRunner):
                 padded_num_reqs=md.bonus_logits_indices.shape[0],
             )
             assert self.speculative_config is not None
-            # The unfused path's draws: rand_like(bonus_logits), then accept_u,
-            # then rand_like(target_logits, f32) -- same shapes, dtypes, order.
+            # The unfused path's draws: rand_like(bonus_logits, f32), then
+            # accept_u, then rand_like(target_logits, f32) -- same shapes,
+            # dtypes, order.
             bonus_u = torch.rand(
                 (md.bonus_logits_indices.shape[0], logits.shape[-1]),
-                dtype=logits.dtype,
+                dtype=torch.float32,
                 device=logits.device,
                 generator=sampling_generator,
             )
@@ -4422,7 +4423,9 @@ class TPUModelRunner(GPUModelRunner):
                 topk_candidates = self._sampler_topk_candidates(
                     cur_start_idx, cur_end_idx, grammar_output
                 )
-                bonus_u = torch.rand_like(bonus_logits, generator=sampling_generator)
+                bonus_u = torch.rand_like(
+                    bonus_logits, dtype=torch.float32, generator=sampling_generator
+                )
                 bonus_token_ids = self.sample_from_logits_func(
                     bonus_logits,
                     req_temperatures,
@@ -4613,7 +4616,11 @@ class TPUModelRunner(GPUModelRunner):
                                     cur_start_idx, cur_end_idx, logits
                                 )
                             )
-                            u = torch.rand_like(logits, generator=sampling_generator)
+                            u = torch.rand_like(
+                                logits,
+                                dtype=torch.float32,
+                                generator=sampling_generator,
+                            )
                             selected = self.sample_from_logits_func(
                                 logits,
                                 temperatures_tpu,
@@ -4680,7 +4687,9 @@ class TPUModelRunner(GPUModelRunner):
                                 cur_start_idx, cur_end_idx, logits
                             )
                         )
-                        u = torch.rand_like(logits, generator=sampling_generator)
+                        u = torch.rand_like(
+                            logits, dtype=torch.float32, generator=sampling_generator
+                        )
                         selected_token_ids = self.sample_from_logits_func(
                             logits,
                             temperatures_tpu,
@@ -5927,7 +5936,7 @@ class TPUModelRunner(GPUModelRunner):
                 dummy_temperatures = torch.ones(
                     (num_reqs, 1), dtype=self._hidden_states_dtype
                 ).to(self.device)
-                dummy_u = torch.rand_like(dummy_logits)
+                dummy_u = torch.rand_like(dummy_logits, dtype=torch.float32)
                 dummy_top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(
                     self.device
                 )
@@ -6083,9 +6092,7 @@ class TPUModelRunner(GPUModelRunner):
         top_k = torch.zeros((num_reqs, 1), dtype=torch.int32).to(self.device)
         top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(self.device)
         vocab = dummy_logits.shape[-1]
-        bonus_u = torch.zeros((num_reqs, vocab), dtype=dummy_logits.dtype).to(
-            self.device
-        )
+        bonus_u = torch.zeros((num_reqs, vocab), dtype=torch.float32).to(self.device)
         accept_u = torch.zeros(draft_token_ids.shape, dtype=torch.float32).to(
             self.device
         )
