@@ -37,17 +37,19 @@ out = fused_moe_prefill(
 
 ### Serving
 
-With both env vars set, a layer armed for the decode kernel runs this kernel
-for steps above `FUSED_MOE_DECODE_KERNEL_MAX_TOKENS` instead of the GMM MoE,
-inside the same exported program and with the same admission rules and
+With both env vars set, a TP-expert layer armed for the decode kernel runs this
+kernel for steps above `FUSED_MOE_DECODE_KERNEL_MAX_TOKENS` instead of the GMM
+MoE, inside the same exported program and with the same admission rules and
 shared-expert conventions (`layers/adapter/fused_moe_decode.py`). With
-`FUSED_MOE_PREFILL_KERNEL` unset those steps keep the GMM path.
+`FUSED_MOE_PREFILL_KERNEL` unset those steps keep the GMM path. EP layers keep
+the GMM path in either case for now: at GLM-5.2 shapes it was faster than
+blocked mode at 4,096 tokens.
 
 ## When to use it
 
-For the layers the decode kernel serves, at steps too large for it. Experts
-of any size: those whose 3 whole-expert slots do not fit VMEM (GLM-5.2 EP16)
-run blocked mode.
+For the TP-expert layers the decode kernel serves, at steps too large for it.
+Called directly, the kernel takes experts of any size: those whose 3
+whole-expert slots do not fit VMEM (GLM-5.2 EP16) run blocked mode.
 
 ## Design
 

@@ -698,10 +698,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS": env_int(
         "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS", 256
     ),
-    # With FUSED_MOE_DECODE_KERNEL=1, serve the armed layers' steps above
-    # FUSED_MOE_DECODE_KERNEL_MAX_TOKENS tokens with the fused MoE prefill
+    # With FUSED_MOE_DECODE_KERNEL=1, serve the armed TP-expert layers' steps
+    # above FUSED_MOE_DECODE_KERNEL_MAX_TOKENS tokens with the fused MoE prefill
     # kernel (routed and shared experts, combine and all-reduce) instead of
-    # the GMM MoE path, in the same exported program.
+    # the GMM MoE path, in the same exported program. EP layers keep the GMM
+    # path for now.
     "FUSED_MOE_PREFILL_KERNEL": env_bool("FUSED_MOE_PREFILL_KERNEL"),
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three (up to 2,048 routed rows on non-ragged
