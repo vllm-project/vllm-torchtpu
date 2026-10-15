@@ -145,19 +145,18 @@ def merge_lse_partials_scatter_heads(
     # bucket; comparing its token count would pin that graph to the first
     # size traced. `is_backbone` is checked before the token count, so the
     # drafter never compares it.
+    # A W_UV-projected f32 partial still crosses in the attention dtype.
+    narrow = envs.TPU_DCP_RS_OUT_PRECISION and is_backbone
     if (
         envs.TPU_DCP_LSE_MERGE_A2A
         and is_backbone
         and output.shape[0] <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
     ):
-        return merge_lse_partials_all_to_all(output, lse, group)
+        return merge_lse_partials_all_to_all(
+            output, lse, group, send_dtype=wire_dtype if narrow else None
+        )
 
-    # A W_UV-projected f32 partial still crosses in the attention dtype.
-    rs_dtype = (
-        (wire_dtype or output.dtype)
-        if envs.TPU_DCP_RS_OUT_PRECISION and is_backbone
-        else None
-    )
+    rs_dtype = (wire_dtype or output.dtype) if narrow else None
     return cp_lse_ag_out_rs(output, lse, group, rs_dtype=rs_dtype)
 
 
@@ -171,18 +170,24 @@ def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:
 
 
 def merge_lse_partials_all_to_all(
-    output: torch.Tensor, lse: torch.Tensor, group: Any
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    group: Any,
+    send_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Same result as the reduce-scatter merge, via all-to-all.
 
     Each rank sends head block `d` of its partial and lse to rank `d`, then
     merges its own heads locally in f32. Faster for small token counts.
+    `send_dtype` is the dtype the partial crosses in; None keeps its own.
     """
     world = int(group.world_size)
     num_tokens, num_heads, vdim = output.shape
     local = num_heads // world
     # Destination-major: [world, T, local, V] and [world, T, local].
     o_send = output.reshape(num_tokens, world, local, vdim).transpose(0, 1)
+    if send_dtype is not None:
+        o_send = o_send.to(send_dtype)
     l_send = lse.to(torch.float32).reshape(num_tokens, world, local).transpose(0, 1)
     o_recv = _all_to_all(o_send, group)
     l_recv = _all_to_all(l_send, group)
