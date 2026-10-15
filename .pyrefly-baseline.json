@@ -256,6 +256,11 @@
       "concise_description": "Argument `float | None` is not assignable to parameter `sm_scale` with type `float` in function `vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper.sharded_pcp_ragged_paged_attention`"
     },
     {
+      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/layer.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `int` has no attribute `astype`"
+    },
+    {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `shape`"
@@ -379,26 +384,6 @@
       "path": "src/vllm_torchtpu/kernels/quantized_matmul/kernel.py",
       "name": "unbound-name",
       "concise_description": "`x_scale_tmp` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `tuple[Unknown, Unknown, Unknown, Unknown, Unknown, Unknown, Unknown, Unknown] | tuple[Unknown, *tuple[Unknown, ...]] | None` is not assignable to parameter `input_partition_specs` with type `Sequence[Unknown]` in function `vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter.pcp_streaming_jax_op`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `list[Unknown] | tuple[Unknown, Unknown]` is not assignable to parameter `kv_cache` with type `tuple[Unknown, Unknown]` in function `sparse_mla_impl`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/attention.py",
@@ -539,21 +524,6 @@
       "path": "src/vllm_torchtpu/runner/utils.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `ndim`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/utils.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `shape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/utils.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `ndim`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/utils.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `shape`"
     },
     {
       "path": "src/vllm_torchtpu/spec_decode/eagle3.py",

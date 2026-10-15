@@ -178,6 +178,7 @@ from vllm_torchtpu.tracing.utils import (
 from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
 
 if TYPE_CHECKING:
+    from vllm.model_executor.models.interfaces import SupportsPP
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
 
@@ -7548,8 +7549,10 @@ class TPUModelRunner(GPUModelRunner):
         """Buffers shaped like this stage's input from the previous stage:
         zeros, uninitialized, or random values."""
         if self._pp_intermediate_template is None:
-            probe = self.model.make_empty_intermediate_tensors(
-                batch_size=1, dtype=self.model_config.dtype, device=self.device
+            probe = cast("SupportsPP", self.model).make_empty_intermediate_tensors(
+                batch_size=1,
+                dtype=cast(torch.dtype, self.model_config.dtype),
+                device=self.device,
             )
             template = {
                 key: (tuple(tensor.shape[1:]), tensor.dtype)

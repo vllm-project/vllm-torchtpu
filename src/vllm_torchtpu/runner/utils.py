@@ -432,7 +432,7 @@ def relayout_rope_caches(model: torch.nn.Module):
         if not isinstance(module, RotaryEmbeddingBase):
             continue
         # The buffers on a rotary module that are indexed by position.
-        caches = [
+        caches: list[tuple[str, Any]] = [
             (buf_name, getattr(module, buf_name, None))
             for buf_name in ("cos_sin_cache", "cos_sin_cache_bf16")
         ]

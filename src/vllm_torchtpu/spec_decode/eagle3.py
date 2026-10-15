@@ -636,6 +636,7 @@ class Eagle3Proposer:
         if len(seq_lens_set) != 1:
             return None
         (seq_lens,) = seq_lens_set.values()
+        assert self._mtp_fused_loop is not None
         self._draft_md_cache.pop(id(chunk), None)
 
         num_tokens = input_ids.shape[0]
@@ -1373,7 +1374,9 @@ class Eagle3Proposer:
                     # sit above a chunk's kernel_num_reqs; the rows past the
                     # chunk's requests are zeros either way.
                     rejected_dev_per_chunk.append(
-                        _maybe_pad_dim0(nr[:knr], knr) if nr is not None else None
+                        _maybe_pad_dim0(cast(torch.Tensor, nr)[:knr], knr)
+                        if nr is not None
+                        else None
                     )
                 elif nr is not None and np.any(nr):
                     padded_nr = np.zeros(knr, dtype=np.int32)

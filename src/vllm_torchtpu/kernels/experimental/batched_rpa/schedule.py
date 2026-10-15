@@ -16,7 +16,7 @@ import dataclasses
 import functools
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -363,7 +363,7 @@ def _write_schedule_to_hbm(
     """Writes `num_steps` of metadata from `schedule_smem` to
     `schedule_hbm` at `hbm_offset`."""
     hbm_offset_aligned = pl.multiple_of(
-        hbm_offset, 128
+        cast(jax.Array, hbm_offset), 128
     )  # pytype: disable=bad-argument-type
     flat_hbm = jax.tree_util.tree_leaves(schedule_hbm)
     flat_smem = jax.tree_util.tree_leaves(schedule_smem)

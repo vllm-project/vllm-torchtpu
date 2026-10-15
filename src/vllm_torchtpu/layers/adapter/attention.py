@@ -968,9 +968,12 @@ class PallasAttentionBackendImpl(AttentionImpl):
         if use_pcp_streaming and block_major:
             # The merged pool inserts rows_per_block before the page axes.
             # Keep TP on the head axis when sizing native Pallas placeholders.
-            cache_spec = input_partition_specs[0]
+            cache_spec = cast(tuple[P, ...], input_partition_specs)[0]
             cache_spec = P(cache_spec[0], None, *cache_spec[1:])
-            input_partition_specs = (cache_spec, *input_partition_specs[1:])
+            input_partition_specs = (
+                cache_spec,
+                *cast(tuple[P, ...], input_partition_specs)[1:],
+            )
             output_partition_specs = (cache_spec, output_partition_specs[1])
         registry_key = (
             self._kernel_op_prefix,
@@ -1066,8 +1069,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 op_name,
                 wrapped_fn,
                 donate_argnums=rpa_donate_argnums,
-                mesh=op_mesh,
-                input_partition_specs=input_partition_specs,
+                mesh=cast(jax.sharding.Mesh, op_mesh),
+                input_partition_specs=cast(tuple[P, ...], input_partition_specs),
                 output_partition_specs=output_partition_specs,
             )
             if envs.TPU_KERNEL_ITER_MODE:
@@ -2189,7 +2192,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         sparse_mla_jax_op.register_fake(_fake_sparse_mla)
 
         def sparse_mla_impl(
-            kv_cache: tuple[torch.Tensor, torch.Tensor],
+            kv_cache: tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor],
             ql_nope: torch.Tensor,
             q_pe: torch.Tensor,
             kv_c_normed: torch.Tensor,
@@ -2309,7 +2312,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         sparse_mla_jax_op.register_fake(_fake_sparse_mla_dcp)
 
         def sparse_mla_dcp_impl(
-            kv_cache: tuple[torch.Tensor, torch.Tensor],
+            kv_cache: tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor],
             ql_nope: torch.Tensor,
             q_pe: torch.Tensor,
             kv_c_normed: torch.Tensor,
