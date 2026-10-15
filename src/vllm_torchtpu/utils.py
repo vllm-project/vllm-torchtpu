@@ -23,6 +23,28 @@ _megacore = False
 logger = init_logger(__name__)
 
 
+class CachedUpload:
+    """Device copy of a host tensor, re-uploaded only when its contents change.
+
+    A changed upload replaces the device tensor rather than writing into it,
+    so an execution still reading the previous one is unaffected.
+    """
+
+    def __init__(self) -> None:
+        self._host: torch.Tensor | None = None
+        self._device: torch.Tensor | None = None
+
+    def __call__(self, host: torch.Tensor, device: Any) -> torch.Tensor:
+        if (
+            self._device is None
+            or self._host.shape != host.shape
+            or not torch.equal(self._host, host)
+        ):
+            self._device = host.to(device, non_blocking=True)
+            self._host = host.clone()
+        return self._device
+
+
 def align_to(unpadded_dim, pad_multiple):
     return (unpadded_dim + pad_multiple - 1) // pad_multiple * pad_multiple
 

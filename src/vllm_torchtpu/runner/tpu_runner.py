@@ -170,7 +170,11 @@ from vllm_torchtpu.tracing.utils import (
     extract_kv_lens_for_tracing,
     extract_request_ids_for_tracing,
 )
-from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
+from vllm_torchtpu.utils import (
+    CachedUpload,
+    synchronize_device,
+    synchronize_tensors,
+)
 
 if TYPE_CHECKING:
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
@@ -321,35 +325,31 @@ def _spec_logprob_row_tokens(
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
 def _substitute_placeholder_token(
     input_ids: torch.Tensor,
-    token_in_tpu_cur_input_indices: torch.Tensor,
-    token_in_tpu_pre_next_tokens_indices: torch.Tensor,
+    substitution_indices: torch.Tensor,
     next_tokens: torch.Tensor,
 ):
     """Substitute placeholder tokens from TPU for async scheduler.
 
-    Padding scheme (set up by `_apply_async_token_substitution`):
-      - `token_in_tpu_cur_input_indices`: real-slot indices followed by all
+    Padding scheme (built by `_padded_substitution_indices`), the two index
+    rows uploaded as one [2, N] tensor in a single host-to-device copy:
+      - row 0, the destination slots: real-slot indices followed by all
         other indices in ascending order; the tail entries re-target slots
         that should keep their current values.
-      - `token_in_tpu_pre_next_tokens_indices`: real `next_tokens` indices
-        followed by `-1` sentinels at the padded positions.
+      - row 1, the source slots in `next_tokens`: real indices followed by
+        `-1` sentinels at the padded positions.
     The `-1` sentinel is the mask source; the program is shape-only so it
     does not recompile when the active count changes.
 
     Args:
         input_ids: device tensor [N] where N is the bucketed input size.
-        token_in_tpu_cur_input_indices: int tensor [N], destination slots.
-        token_in_tpu_pre_next_tokens_indices: int tensor [N], source slots
-            in `next_tokens`; -1 marks a padding slot to leave unchanged.
+        substitution_indices: int tensor [2, N], the two rows above.
         next_tokens: int tensor of tokens from the previous async step.
     Return:
         input_ids with real placeholders replaced; padding slots untouched.
     """
-    assert (
-        input_ids.shape[0]
-        == token_in_tpu_cur_input_indices.shape[0]
-        == token_in_tpu_pre_next_tokens_indices.shape[0]
-    )
+    assert substitution_indices.shape == (2, input_ids.shape[0])
+    token_in_tpu_cur_input_indices = substitution_indices[0]
+    token_in_tpu_pre_next_tokens_indices = substitution_indices[1]
     mask = token_in_tpu_pre_next_tokens_indices > -1
     # clamp_min(0) gives a safe in-range gather index for the -1 sentinel
     # slots; their gathered values are discarded by `mask` in `where`.
@@ -359,6 +359,24 @@ def _substitute_placeholder_token(
     update_values = torch.where(mask, new_token_values, original_values)
     input_ids.scatter_(0, token_in_tpu_cur_input_indices, update_values)
     return input_ids
+
+
+def _padded_substitution_indices(
+    num_tokens: int,
+    token_in_tpu_cur_input_indices: np.ndarray,
+    token_in_tpu_pre_next_tokens_indices: np.ndarray,
+) -> np.ndarray:
+    """The [2, num_tokens] int32 index rows `_substitute_placeholder_token`
+    takes: destinations padded with the complement of the real slots (an O(n)
+    mask; flatnonzero keeps ascending order), sources padded with -1."""
+    missing_mask = np.ones(num_tokens, dtype=bool)
+    missing_mask[token_in_tpu_cur_input_indices] = False
+    indices = np.full((2, num_tokens), -1, dtype=np.int32)
+    n = len(token_in_tpu_cur_input_indices)
+    indices[0, :n] = token_in_tpu_cur_input_indices
+    indices[0, n:] = np.flatnonzero(missing_mask)
+    indices[1, :n] = token_in_tpu_pre_next_tokens_indices
+    return indices
 
 
 logger = init_logger(__name__)
@@ -909,6 +927,7 @@ class TPUModelRunner(GPUModelRunner):
         )
         self.seq_lens_np = self.seq_lens_cpu.numpy()
         self._block_table_stage_cpu: torch.Tensor | None = None
+        self._block_table_upload = CachedUpload()
         if self.supports_mm_inputs:
             self.is_mm_embed_cpu = torch.zeros(
                 self.max_num_tokens,
@@ -2347,65 +2366,33 @@ class TPUModelRunner(GPUModelRunner):
                 tuple(token_in_tpu_cur_input_indices),
                 tuple(token_in_tpu_pre_next_tokens_indices),
             )
-            if (
-                getattr(self, "_cached_subst_key", None) == subst_key
-                and hasattr(self, "_cached_cur_input_indices")
-                and hasattr(self, "_cached_pre_next_tokens_indices")
+            if getattr(self, "_cached_subst_key", None) == subst_key and hasattr(
+                self, "_cached_substitution_indices"
             ):
-                cur_input_indices = self._cached_cur_input_indices
-                pre_next_tokens_indices = self._cached_pre_next_tokens_indices
+                substitution_indices = self._cached_substitution_indices
             else:
-                idx_pad_len = len(input_ids) - len(token_in_tpu_cur_input_indices)
-                _missing_mask = np.ones(len(input_ids), dtype=bool)
-                _missing_mask[token_in_tpu_cur_input_indices] = False
-                missing_values = np.flatnonzero(_missing_mask).astype(np.int32)
-                padded_token_in_tpu_cur_input_indices = np.concatenate(
-                    (token_in_tpu_cur_input_indices, missing_values)
-                )
-
-                padded_token_in_tpu_pre_next_tokens_indices = np.pad(
-                    token_in_tpu_pre_next_tokens_indices,
-                    (0, idx_pad_len),
-                    mode="constant",
-                    constant_values=-1,
-                )
-
-                cur_input_indices = torch.from_numpy(
-                    padded_token_in_tpu_cur_input_indices
-                ).to(self.device, non_blocking=True)
-                pre_next_tokens_indices = torch.from_numpy(
-                    padded_token_in_tpu_pre_next_tokens_indices
+                substitution_indices = torch.from_numpy(
+                    _padded_substitution_indices(
+                        len(input_ids),
+                        token_in_tpu_cur_input_indices,
+                        token_in_tpu_pre_next_tokens_indices,
+                    )
                 ).to(self.device, non_blocking=True)
                 self._cached_subst_key = subst_key
-                self._cached_cur_input_indices = cur_input_indices
-                self._cached_pre_next_tokens_indices = pre_next_tokens_indices
+                self._cached_substitution_indices = substitution_indices
         else:
-            idx_pad_len = len(input_ids) - len(token_in_tpu_cur_input_indices)
-            _missing_mask = np.ones(len(input_ids), dtype=bool)
-            _missing_mask[token_in_tpu_cur_input_indices] = False
-            missing_values = np.flatnonzero(_missing_mask).astype(np.int32)
-            padded_token_in_tpu_cur_input_indices = np.concatenate(
-                (token_in_tpu_cur_input_indices, missing_values)
-            )
-
-            padded_token_in_tpu_pre_next_tokens_indices = np.pad(
-                token_in_tpu_pre_next_tokens_indices,
-                (0, idx_pad_len),
-                mode="constant",
-                constant_values=-1,
-            )
-
-            cur_input_indices = torch.from_numpy(
-                padded_token_in_tpu_cur_input_indices
-            ).to(self.device, non_blocking=True)
-            pre_next_tokens_indices = torch.from_numpy(
-                padded_token_in_tpu_pre_next_tokens_indices
+            # Both index rows in one host-to-device copy.
+            substitution_indices = torch.from_numpy(
+                _padded_substitution_indices(
+                    len(input_ids),
+                    token_in_tpu_cur_input_indices,
+                    token_in_tpu_pre_next_tokens_indices,
+                )
             ).to(self.device, non_blocking=True)
 
         return _substitute_placeholder_token(
             input_ids,
-            cur_input_indices,
-            pre_next_tokens_indices,
+            substitution_indices,
             self._pre_async_results.next_tokens_tpu,
         )
 
@@ -6020,21 +6007,21 @@ class TPUModelRunner(GPUModelRunner):
         with self._precompile_timed("substitute_placeholder_token"):
             for num_tokens in self.num_tokens_paddings:
                 input_ids = torch.zeros(num_tokens, dtype=torch.int32).to(self.device)
-                cur_input_indices = torch.zeros(num_tokens, dtype=torch.int32).to(
-                    self.device
-                )
-                # -1 sentinel marks every slot as padding so the precompiled
-                # program is byte-identical to the runtime JIT call.
-                pre_next_tokens_indices = torch.full(
-                    (num_tokens,), -1, dtype=torch.int32
+                # Row 0 destinations, row 1 sources; the -1 sentinel marks
+                # every slot as padding so the precompiled program is
+                # byte-identical to the runtime JIT call.
+                substitution_indices = torch.from_numpy(
+                    np.stack(
+                        (
+                            np.zeros(num_tokens, dtype=np.int32),
+                            np.full(num_tokens, -1, dtype=np.int32),
+                        )
+                    )
                 ).to(self.device)
                 for nlen in next_lens:
                     next_tokens = torch.zeros(nlen, dtype=torch.int64).to(self.device)
                     out = _substitute_placeholder_token(
-                        input_ids,
-                        cur_input_indices,
-                        pre_next_tokens_indices,
-                        next_tokens,
+                        input_ids, substitution_indices, next_tokens
                     )
                     synchronize_tensors(out)
                     logger.info("  -- num_tokens: %d, next_len: %d", num_tokens, nlen)

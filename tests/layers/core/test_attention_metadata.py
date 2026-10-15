@@ -27,6 +27,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutDescriptor,
     SequenceLayoutKind,
 )
+from vllm_torchtpu.utils import CachedUpload
 
 
 class TestAttentionMetadataBuilderPlumbing:
@@ -44,6 +45,7 @@ class TestAttentionMetadataBuilderPlumbing:
         runner.most_model_len = most_model_len
         runner.position_ids = torch.full((8,), 42, dtype=torch.int32)
         runner._block_table_stage_cpu = None
+        runner._block_table_upload = CachedUpload()
         runner.attn_groups = []
         runner._unified_kv_layout = False
 
@@ -589,3 +591,112 @@ class TestAttentionMetadataBuilderPlumbing:
         )
         stage_block_table_uploads(runner, ctx_preinit, 4)
         assert ctx_preinit.staged_block_tables is None
+
+
+class TestBlockTableUploadSkip:
+    """The staged upload is reused only while its contents are unchanged."""
+
+    def _setup(self, num_groups=1, num_reqs=3):
+        plumbing = TestAttentionMetadataBuilderPlumbing()
+        runner = plumbing._make_runner_mock(num_groups=num_groups)
+        builders = [
+            plumbing._make_builder(runner, kv_cache_group_id=gid)
+            for gid in range(num_groups)
+        ]
+        plumbing._make_attn_groups(runner, builders)
+        tables = [
+            bt.get_cpu_tensor.return_value for bt in runner.input_batch.block_table
+        ]
+        return runner, tables
+
+    def _stage(self, runner, num_reqs, num_reqs_padded=4):
+        """Stage one step; returns its tables and whether it re-uploaded."""
+        before = runner._block_table_upload._device
+        ctx = AttentionMetadataBuilderContext(
+            num_reqs=num_reqs,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.ones((num_reqs_padded,), dtype=torch.int32),
+            query_start_loc=torch.arange(num_reqs_padded + 1, dtype=torch.int32),
+            request_distribution=torch.tensor([num_reqs] * 3, dtype=torch.int32),
+        )
+        stage_block_table_uploads(runner, ctx, num_reqs_padded)
+        return ctx.staged_block_tables, runner._block_table_upload._device is not before
+
+    @staticmethod
+    def _expected(table, num_reqs, num_reqs_padded=4):
+        rows = torch.zeros((num_reqs_padded, table.shape[1]), dtype=torch.int32)
+        rows[:num_reqs] = table[:num_reqs]
+        return rows.reshape(-1)
+
+    def test_unchanged_contents_reuse_the_upload(self):
+        runner, (table,) = self._setup()
+        _, uploaded = self._stage(runner, 3)
+        assert uploaded
+        staged, uploaded = self._stage(runner, 3)
+        assert not uploaded
+        assert torch.equal(staged[0], self._expected(table, 3))
+
+    def test_in_place_block_table_change_reuploads(self):
+        # A page boundary appends a block to the same CPU tensor in place.
+        runner, (table,) = self._setup()
+        self._stage(runner, 3)
+        table[1, 3] = 999
+        staged, uploaded = self._stage(runner, 3)
+        assert uploaded
+        assert torch.equal(staged[0], self._expected(table, 3))
+
+    def test_reordered_batch_with_equal_counts_reuploads(self):
+        # Same request count and padding, different composition.
+        runner, (table,) = self._setup()
+        self._stage(runner, 3)
+        table[[0, 2]] = table[[2, 0]].clone()
+        staged, uploaded = self._stage(runner, 3)
+        assert uploaded
+        assert torch.equal(staged[0], self._expected(table, 3))
+
+    def test_mtp_rejection_reuploads_then_reuses(self):
+        # Drafts crossing a page boundary take a block; rejecting them frees
+        # it and a finished request leaves the batch. Each step must see its
+        # own table, and an unchanged step after the rejection reuses it.
+        runner, (table,) = self._setup()
+        table[0, 3] = 0
+        self._stage(runner, 3)
+        table[0, 3] = 77  # verify step: drafts reach a new block
+        verify, uploaded = self._stage(runner, 3)
+        assert uploaded
+        assert torch.equal(verify[0], self._expected(table, 3))
+        table[0, 3] = 0  # drafts rejected: the block is released
+        rejected, uploaded = self._stage(runner, 2)  # request 2 finished
+        assert uploaded
+        assert torch.equal(rejected[0], self._expected(table, 2))
+        again, uploaded = self._stage(runner, 2)
+        assert not uploaded
+        assert torch.equal(again[0], self._expected(table, 2))
+
+    def test_multi_group_products_follow_a_changed_table(self):
+        runner, tables = self._setup(num_groups=2)
+        self._stage(runner, 3)
+        tables[1][2, 0] = 555
+        staged, uploaded = self._stage(runner, 3)
+        assert uploaded
+        for gid, table in enumerate(tables):
+            assert torch.equal(staged[gid], self._expected(table, 3))
+
+    def test_dummy_run_between_steps_does_not_leak(self):
+        runner, (table,) = self._setup()
+        self._stage(runner, 3)
+        ctx_dummy = AttentionMetadataBuilderContext(
+            num_reqs=3,
+            start_index=0,
+            use_max_model_len=True,
+            seq_lens=torch.ones((4,), dtype=torch.int32),
+            query_start_loc=torch.arange(5, dtype=torch.int32),
+            request_distribution=torch.tensor([3, 3, 3], dtype=torch.int32),
+            position_ids_override=torch.zeros((3, 8), dtype=torch.int32),
+        )
+        stage_block_table_uploads(runner, ctx_dummy, 4)
+        assert not ctx_dummy.staged_block_tables[0].any()
+        staged, uploaded = self._stage(runner, 3)
+        assert uploaded
+        assert torch.equal(staged[0], self._expected(table, 3))
