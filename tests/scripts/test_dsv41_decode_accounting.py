@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """CPU regression tests for natural serving counter/window alignment."""
 
+import datetime
 import sys
 import unittest
 from pathlib import Path
@@ -12,8 +13,28 @@ if str(_SCRIPTS) not in sys.path:
     sys.path.insert(0, str(_SCRIPTS))
 pytestmark = pytest.mark.cpu_test
 
+from bench_cached_extend import assert_no_compilation  # noqa: E402
 from bench_decode import summarize  # noqa: E402
 from server_step_worker import SCENARIOS, classify_rows, token_counts  # noqa: E402
+
+
+@pytest.mark.parametrize("color", ["", "\x1b[90m"])
+def test_compilation_audit_with_server_log_colors(color):
+    start = int(datetime.datetime(2026, 10, 15, 7, 8).timestamp() * 1e9)
+    intervals = [[start, start + 10_000_000_000]]
+
+    def line(stamp):
+        return (
+            f"(Worker_DP0_EP0 pid=761) INFO {color}{stamp}\x1b[0m "
+            "[monitor.py:40] [v41_encoder] Starting torch.compile"
+        )
+
+    assert_no_compilation(line("10-15 06:44:06"), intervals)
+    assert_no_compilation(line("10-15 07:10:00"), intervals)
+    with pytest.raises(ValueError, match="Compilation in formal serving window"):
+        assert_no_compilation(line("10-15 07:08:05"), intervals)
+    with pytest.raises(ValueError, match="Cannot timestamp compiler log event"):
+        assert_no_compilation(line("missing timestamp"), intervals)
 
 
 def records(count: int = 20) -> list:

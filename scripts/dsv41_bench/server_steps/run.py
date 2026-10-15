@@ -18,7 +18,11 @@ import time
 from pathlib import Path
 
 import requests
-from bench_cached_extend import assert_no_compilation, summarize_startup
+from bench_cached_extend import (
+    assert_no_compilation,
+    load_frozen_input,
+    summarize_startup,
+)
 from server_step_worker import DECODE_SCENARIO
 
 
@@ -128,6 +132,8 @@ def main() -> None:
         args.rounds = 1 if args.scenario == "decode" else 5
     if args.rounds < 1:
         parser.error("The integrated launcher requires at least one formal window")
+    if args.scenario == "encoder_extend":
+        load_frozen_input(args.input)
 
     def terminate(signum, frame):
         raise SystemExit(128 + signum)

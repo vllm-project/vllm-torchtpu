@@ -39,7 +39,8 @@ python scripts/dsv41_bench/server_steps/bench_cached_extend.py prepare \
   --out /path/to/dsv41-code-96k-c128.json
 ```
 
-The client verifies the frozen input SHA256:
+The launcher and client verify the frozen input SHA256 after normalizing only
+the tokenizer mount path to `/models/DeepSeek-V4.1-Flash`:
 `9ca4086c68c610b9205e1e46e1a51d3d18bb10495ed88d341c63b725ccca4064`.
 The first eight deterministic code windows are used for this scenario. They
 have distinct prefixes, but come from adjacent windows of the same document;
