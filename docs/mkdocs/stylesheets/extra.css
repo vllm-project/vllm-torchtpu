@@ -102,3 +102,11 @@ body[data-md-color-scheme="slate"] .md-nav__item--section > label.md-nav__link .
 .md-nav__button.md-logo .md-logo__plus {
   font-size: 1.6rem;
 }
+
+/* Secondary description under a model family name in supported_models.md */
+.md-typeset .family-desc {
+  display: inline-block;
+  margin-top: 0.2em;
+  color: var(--md-default-fg-color--light);
+  font-size: 0.9em;
+}
