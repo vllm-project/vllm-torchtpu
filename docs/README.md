@@ -51,7 +51,7 @@ vLLM TorchTPU is the integration of **TorchTPU** and **vLLM**. It is a vLLM plat
     [:octicons-arrow-right-24: Buildkite Pipelines](developers_guide/buildkite.md)
 
 - :material-code-tags:{ .lg .middle } __I Want to Learn More__
-  
+
     Learn the architecture, run tests & benchmarks, and profile TPU kernels.
 
     [:octicons-arrow-right-24: Coding Guidance](developers_guide/coding_guidance.md)
