@@ -1047,3 +1047,79 @@ def test_deepseek_v41_causal_lm(monkeypatch: pytest.MonkeyPatch):
         NotImplementedError, match="does not support speculative method"
     ):
         v2_model.DeepseekV41ForCausalLM(vllm_config=vllm_cfg)
+
+
+def test_select_engram_split_layer(monkeypatch: pytest.MonkeyPatch):
+    def layer(host_offload):
+        if host_offload is None:
+            return SimpleNamespace(engram=None)
+        return SimpleNamespace(
+            engram=SimpleNamespace(
+                embed_tokens=SimpleNamespace(host_offload=host_offload)
+            )
+        )
+
+    model = SimpleNamespace(
+        start_layer=0,
+        _ced_boundary=6,
+        _tp_size=1,
+        use_sequence_parallel=True,
+        aux_hidden_state_layers=(8,),
+        layers=[layer(None), layer(True), layer(None), layer(False), layer(True)]
+        + [layer(None)] * 3,
+    )
+    select = v2_model.DeepseekV41Model._select_engram_split_layer
+    monkeypatch.setattr(v2_model.envs, "TPU_DEEPSEEK_V41_ENGRAM_SPLIT", False)
+    assert select(model) is None
+    monkeypatch.setattr(v2_model.envs, "TPU_DEEPSEEK_V41_ENGRAM_SPLIT", True)
+    # The last host-offloaded Engram layer before the CED boundary.
+    assert select(model) == 4
+    # Sequence parallel shards encoder rows only at TP > 1.
+    model._tp_size = 2
+    assert select(model) is None
+    model._tp_size = 1
+    # Encoder aux hidden states would cross the head/tail boundary.
+    model.aux_hidden_state_layers = (3,)
+    assert select(model) is None
+    model.aux_hidden_state_layers = ()
+    model.layers[4] = layer(None)
+    model.layers[1] = layer(None)
+    assert select(model) is None
+
+
+def test_split_encoder_stages_tail_engram_after_head_dispatch(monkeypatch):
+    class TpuTensor(torch.Tensor):
+        @property
+        def device(self):
+            return SimpleNamespace(type="tpu")
+
+    order = []
+    carry = tuple(torch.ones(4, 16).as_subclass(TpuTensor) for _ in range(5))
+
+    def head(*args):
+        order.append("head")
+        return carry
+
+    def dispatch(tensors, wait):
+        assert wait is False
+        assert all(a is b for a, b in zip(tensors, carry, strict=True))
+        order.append("dispatch")
+
+    def tail(ids, positions, hidden, residual, post_mix, res_mix, pre_mix):
+        order.append("tail")
+        got = (hidden, residual, post_mix, res_mix, pre_mix)
+        assert all(a is b for a, b in zip(got, carry, strict=True))
+        return "encoded"
+
+    monkeypatch.setattr(v2_model, "synchronize_tensors", dispatch)
+    model = SimpleNamespace(
+        encoder_head_stage=head,
+        encoder_tail_stage=tail,
+        _engram_prepared_outside_stage=True,
+        _stage_deferred_engram=lambda: order.append("stage tail engram"),
+    )
+    out = v2_model.DeepseekV41Model._forward_split_encoder(
+        model, torch.arange(4), torch.arange(4), None, None, None
+    )
+    assert out == "encoded"
+    assert order == ["head", "dispatch", "stage tail engram", "tail"]
