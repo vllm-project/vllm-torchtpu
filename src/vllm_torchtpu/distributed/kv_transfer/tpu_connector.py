@@ -6378,10 +6378,15 @@ class TPURaidenConnectorWorker:
         # the same context axis, so one logical page spans all CP ranks.
         # Their supported configurations use at most one of PCP/DCP > 1.
         parallel = self.vllm_config.parallel_config
-        cp_size = max(
-            parallel.prefill_context_parallel_size,
-            parallel.decode_context_parallel_size,
-        )
+        pcp_size = parallel.prefill_context_parallel_size
+        dcp_size = parallel.decode_context_parallel_size
+        if pcp_size > 1 and dcp_size > 1:
+            raise ValueError(
+                "Raiden staging capacity does not support PCP and DCP both > 1 "
+                f"(prefill_context_parallel_size={pcp_size}, "
+                f"decode_context_parallel_size={dcp_size})."
+            )
+        cp_size = max(pcp_size, dcp_size)
         block_size = self.vllm_config.cache_config.block_size * cp_size
         max_model_len = self.vllm_config.model_config.max_model_len
         return max(1, (max_model_len + block_size - 1) // block_size)
