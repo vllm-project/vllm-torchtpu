@@ -515,13 +515,13 @@ def test_safe_pack_tensor_if_large():
 
 def test_omni_tpu_patches_configuration(monkeypatch):
     # Call the undecorated body so the run-once cache is left alone, and
-    # restore the process-global state it edits (env var, F.interpolate).
-    orig_interpolate = torch.nn.functional.interpolate
-    monkeypatch.setattr(torch.nn.functional, "interpolate", orig_interpolate)
+    # restore the process-global state it edits (env var).
+    orig = torch.nn.functional.interpolate
     with patch.dict(os.environ):
         os.environ.pop("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", None)
         apply_omni_tpu_patches.__wrapped__()
         assert os.environ["VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT"] == "1800.0"
+        assert torch.nn.functional.interpolate is orig
 
 
 def test_startup_warmup_device_sync(monkeypatch):
