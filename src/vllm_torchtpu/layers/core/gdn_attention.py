@@ -847,13 +847,14 @@ def run_jax_gdn_attention_pooled_local(
     kernel_size: int,
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
+    conv_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
 
     ``recurrent_state`` is the attention-shaped pool holding the SSM region
-    in ``recurrent_state_dtype`` at token offset 0 and the fixed-BF16 Conv
-    region in the following tokens. All pool knowledge lives here: this
+    in ``recurrent_state_dtype`` at token offset 0 and the Conv region in
+    ``conv_state_dtype`` (fp32; the kernel rejects bf16) in the following tokens. All pool knowledge lives here: this
     function builds the copy-plan that maps those two regions onto the V3
     kernel's state operands, so the kernel itself never sees the pool layout.
     """
@@ -882,7 +883,7 @@ def run_jax_gdn_attention_pooled_local(
         d_v=d_v,
         kernel_size=kernel_size,
         recurrent_dtype=jnp.dtype(recurrent_state_dtype),
-        conv_dtype=jnp.dtype(jnp.float32),
+        conv_dtype=jnp.dtype(conv_state_dtype),
         num_spec_tokens=num_spec_tokens,
         prefill_ckpt_offsets=prefill_ckpt_offsets,
         prefill_ckpt_indices=prefill_ckpt_indices,
@@ -914,6 +915,7 @@ def run_jax_gdn_attention_pooled(
     pool_block_tokens: int,
     mesh: jax.sharding.Mesh,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
+    conv_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
     prefill_ckpt_offsets: jnp.ndarray | None = None,
     prefill_ckpt_indices: jnp.ndarray | None = None,
@@ -927,7 +929,7 @@ def run_jax_gdn_attention_pooled(
         recurrent_state: The attention-shaped pool
           `(num_blocks, block_size, num_kv_heads * 2, head_size)` in the KV
           dtype, carrying the SSM region in ``recurrent_state_dtype`` and the
-          fixed-BF16 Conv region as token-ranges of each state block. Block 0
+          configured Conv region as token-ranges of each state block. Block 0
           is the null block, only used for padded / invalid tokens.
         j_conv_weight: Convolutional weight tensor of shape `(dim, 1,
           kernel_size)`.
@@ -1026,6 +1028,7 @@ def run_jax_gdn_attention_pooled(
         pool_block_tokens=pool_block_tokens,
         num_spec_tokens=num_spec_tokens,
         recurrent_state_dtype=recurrent_state_dtype,
+        conv_state_dtype=conv_state_dtype,
     )
     mapped_fn = jax.shard_map(
         p_run_jax_gdn_attention_pooled_local,

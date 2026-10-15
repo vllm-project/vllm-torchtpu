@@ -54,6 +54,8 @@ POOLED_GDN_ARCHITECTURES = QWEN_GDN_ARCHITECTURES | frozenset(
         # kernel). Kimi-K3's TP32 geometry is validated: prefix-cache hits are
         # byte-identical to misses and GSM8K scores 100/100 with and without the
         # pool.
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
         "KimiLinearForCausalLM",
         "KimiK3ForConditionalGeneration",
     }
@@ -108,15 +110,16 @@ def unified_kv_layout_enabled_for_architecture(architecture: str | None) -> bool
     return architecture in POOLED_GDN_ARCHITECTURES
 
 
-def pooled_gdn_conv_state_bytes(*, kernel_size: int, conv_dim: int) -> int:
-    """Live bytes of one slot's conv region: (kernel_size - 1) dense bf16
-    rows of conv_dim channels. The kernel keeps no spec-decode widening in
+def pooled_gdn_conv_state_bytes(
+    *,
+    kernel_size: int,
+    conv_dim: int,
+    dtype: object = DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
+) -> int:
+    """Live bytes of one slot's conv region: (kernel_size - 1) dense rows
+    of conv_dim channels in ``dtype``. The kernel keeps no spec-decode widening in
     the pool (verify windows roll back via per-slot checkpoints instead)."""
-    return (
-        (kernel_size - 1)
-        * conv_dim
-        * pooled_gdn_state_itemsize(DEFAULT_POOLED_GDN_CONV_STATE_DTYPE)
-    )
+    return (kernel_size - 1) * conv_dim * pooled_gdn_state_itemsize(dtype)
 
 
 def pooled_gdn_ssm_state_bytes(

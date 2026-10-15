@@ -205,6 +205,7 @@ def gdn_attention_pooled_core_tpu(
     kernel_size: int,
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype,
+    conv_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     return run_jax_gdn_attention_pooled(
@@ -231,6 +232,7 @@ def gdn_attention_pooled_core_tpu(
         kernel_size=kernel_size,
         pool_block_tokens=pool_block_tokens,
         recurrent_state_dtype=recurrent_state_dtype,
+        conv_state_dtype=conv_state_dtype,
         mesh=mesh,
         num_spec_tokens=num_spec_tokens,
     )
@@ -376,6 +378,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     # with `(pool_index, layout)` once bound by `set_block_major_pool()`.
     # Class-level defaults support test/mock instances constructed without `__init__`.
     _bm_kernel: bool = False
+    _pooled_conv_state_dtype: torch.dtype = torch.float32
     _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
     _checkpoint_alignment: int | None = None
 
@@ -383,7 +386,18 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     # pyrefly: ignore[bad-override-mutable-attribute]
     conv1d: GdnColumnParallelLinear
 
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self, *args, pooled_conv_state_dtype: torch.dtype = torch.float32, **kwargs
+    ):
+        # The pooled V3 kernel stores conv state in fp32 only (bf16 conv is
+        # rejected by the kernel); the argument is kept so model code can state
+        # the format it expects.
+        if pooled_conv_state_dtype != torch.float32:
+            raise ValueError(
+                "pooled GDN conv state must be torch.float32, got "
+                f"{pooled_conv_state_dtype}"
+            )
+        self._pooled_conv_state_dtype = pooled_conv_state_dtype
         super().__init__(*args, **kwargs)
         self._create_conv1d()
         # Bound by the runner during KV-cache initialization; None until then
@@ -764,6 +778,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         d_v = self.head_v_dim
         kernel_size = self.conv_kernel_size
         recurrent_state_dtype = _to_jax_ssm_state_dtype(self.get_state_dtype()[1])
+        conv_state_dtype = _to_jax_ssm_state_dtype(self._pooled_conv_state_dtype)
         # Speculative decoding: verify windows run in the GDN kernel's SPEC
         # mode with one state checkpoint per window position kept inside
         # the request's state block; rejected drafts are rolled back by
@@ -826,6 +841,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 # full-attention layer would ever see the adjusted value.
                 pool_block_tokens=vllm_config.cache_config.block_size,
                 recurrent_state_dtype=recurrent_state_dtype,
+                conv_state_dtype=conv_state_dtype,
                 num_spec_tokens=num_spec_tokens,
             )
             if not block_major:
@@ -860,6 +876,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 d_v,
                 kernel_size,
                 recurrent_state_dtype,
+                conv_state_dtype,
                 num_spec_tokens,
             ),
             build_op,
