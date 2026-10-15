@@ -18,6 +18,7 @@ ReqId = str
 class SendMeta:
     uuid: int
     local_block_ids: list[int]
+    # Unix timestamp in seconds, compared by workers on different hosts.
     expiration_time: float
     # Exact transfer extent for controller-planned PCP striping. Legacy send
     # paths leave this unset.
