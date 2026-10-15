@@ -759,9 +759,16 @@ def fused_ep_moe_v2(
     )
     NS = jax.sharding.NamedSharding
     args = tuple(jax.device_put(a, NS(mesh, sp)) for a, sp in zip(args, in_specs))
+    # Under an outer trace -- torch_tpu's export of the op, or a caller's jit --
+    # the shard_map is traced into that program, so it is cached as is and the
+    # program stays what it was. Called eagerly, as the device tests do, a bare
+    # shard_map runs op by op and compiles every op again on every call, so an
+    # eager call caches its jit, which compiles once per key.
+    traced = any(isinstance(a, jax.core.Tracer) for a in args)
     # local_fn closes over config-static values only -- the per-call data
     # are the shard_map arguments -- so this key is exact.
     key = (
+        traced,
         mesh,
         T,
         hidden,
@@ -790,11 +797,11 @@ def fused_ep_moe_v2(
         has_hash_ids and hash_topk_ids.dtype,
         float(routed_scaling_factor),
     )
-    sm = _LAYER_SM_CACHE.get(key)
-    if sm is None:
+    fn = _LAYER_SM_CACHE.get(key)
+    if fn is None:
         with _LAYER_SM_CACHE_LOCK:
-            sm = _LAYER_SM_CACHE.get(key)
-            if sm is None:
+            fn = _LAYER_SM_CACHE.get(key)
+            if fn is None:
                 sm = jax.shard_map(
                     local_fn,
                     mesh=mesh,
@@ -802,5 +809,6 @@ def fused_ep_moe_v2(
                     out_specs=P(ax),
                     check_vma=False,
                 )
-                _LAYER_SM_CACHE[key] = sm
-    return sm(*args)
+                fn = sm if traced else jax.jit(sm)
+                _LAYER_SM_CACHE[key] = fn
+    return fn(*args)
