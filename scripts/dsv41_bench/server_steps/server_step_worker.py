@@ -9,7 +9,6 @@ import functools
 import hashlib
 import json
 import logging
-import os
 import socket
 import time
 from dataclasses import asdict, dataclass
@@ -278,7 +277,7 @@ def _gather_dp(value: dict) -> list[dict]:
 
 
 class ServerStepWorker:
-    def synchronized_profile_arm(self):
+    def synchronized_profile_arm(self, output_dir: str):
         import torch.distributed as dist
         from vllm.distributed import get_dp_group
 
@@ -301,7 +300,7 @@ class ServerStepWorker:
             "profile_rank": rank,
         }
         self._sync_capture = state
-        root = Path(os.environ["ARTIFACT_LOCAL_DIR"]) / "synchronized-profile"
+        root = Path(output_dir) / "synchronized-profile"
         root.mkdir(exist_ok=True)
 
         def boundary(*args, **kwargs):

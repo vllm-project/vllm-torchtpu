@@ -56,7 +56,7 @@ import os
 import struct
 import threading
 import time
-from collections.abc import Generator
+from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
@@ -196,6 +196,8 @@ def _sharded_runai_weights_iterator(
     hf_weights_files: list[str],
     local_expert_ids: set[int],
     use_tqdm_on_load: bool,
+    *,
+    weight_filter: Callable[[str], bool] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Stream only this rank's tensors from the safetensors files.
 
@@ -203,7 +205,9 @@ def _sharded_runai_weights_iterator(
     ``gs://`` and local paths both work), drops non-local expert tensors
     from the request plan, and streams the surviving byte ranges as
     contiguous runs. Tensors with a registered row slice are fetched as
-    just those rows. The skipped bytes are never requested from storage.
+    just those rows. An optional model-provided weight filter excludes unused
+    checkpoint tensors before fetch. The skipped bytes are never requested
+    from storage.
     """
     import runai_model_streamer.safetensors_streamer.safetensors_pytorch as sp
     from runai_model_streamer.file_streamer import FileChunks
@@ -229,6 +233,7 @@ def _sharded_runai_weights_iterator(
         zero_size_tensors: list = []
         kept = skipped = sliced = 0
         kept_bytes = skipped_bytes = sliced_bytes = 0
+        skipped_model = skipped_model_bytes = 0
 
         run_start: int | None = None
         run_sizes: list[int] = []
@@ -248,7 +253,12 @@ def _sharded_runai_weights_iterator(
         for path, meta in zip(hf_weights_files, metas):
             pos = meta.offset
             for tensor_meta, size in zip(meta.tensors_metadata, meta.read_sizes):
-                if _should_skip(tensor_meta.name, local_expert_ids):
+                if weight_filter is not None and not weight_filter(tensor_meta.name):
+                    skipped_model += 1
+                    skipped_model_bytes += size
+                    if size:
+                        _flush(path)
+                elif _should_skip(tensor_meta.name, local_expert_ids):
                     skipped += 1
                     skipped_bytes += size
                     # A zero-byte skip leaves the byte stream contiguous, so
@@ -306,6 +316,13 @@ def _sharded_runai_weights_iterator(
             sliced,
             sliced_bytes / 1e9,
         )
+        if weight_filter is not None:
+            logger.info(
+                "[sharded-ep-load] model filter: skipping %d tensors (%.1f GB) "
+                "before fetch",
+                skipped_model,
+                skipped_model_bytes / 1e9,
+            )
 
         fs.stream_files(requests, credentials=None, device="cpu", is_distributed=False)
 
@@ -366,15 +383,23 @@ def patch_runai_sharded_expert_streaming() -> None:
     Inert unless ``--enable-expert-parallel`` AND
     ``--enable-ep-weight-filter`` are both set (and EPLB is off); any
     failure to set up the filter falls back to the stock full-checkpoint
-    streaming.
+    streaming. Models may expose ``should_load_weight(name)`` to exclude
+    unused checkpoint tensors before fetch.
     """
+    from vllm.config import ModelConfig
     from vllm.model_executor.model_loader import runai_streamer_loader as rsl
 
     if getattr(rsl.RunaiModelStreamerLoader, "_tpu_sharded_ep_patch", False):
         return
     original_get_iterator = rsl.RunaiModelStreamerLoader._get_weights_iterator
 
-    def _get_weights_iterator(self, model_or_path: str, revision: str | None):
+    def _get_weights_iterator(
+        self,
+        model_or_path: str,
+        revision: str | None,
+        *,
+        weight_filter: Callable[[str], bool] | None = None,
+    ):
         try:
             local_expert_ids = _compute_local_expert_ids()
         except AttributeError:
@@ -404,10 +429,25 @@ def patch_runai_sharded_expert_streaming() -> None:
             )
         hf_weights_files = self._prepare_weights(model_or_path, revision)
         return _sharded_runai_weights_iterator(
-            hf_weights_files, local_expert_ids, self.load_config.use_tqdm_on_load
+            hf_weights_files,
+            local_expert_ids,
+            self.load_config.use_tqdm_on_load,
+            weight_filter=weight_filter,
+        )
+
+    def load_weights(self, model: torch.nn.Module, model_config: ModelConfig) -> None:
+        model_weights = model_config.model_weights or model_config.model
+        model.load_weights(
+            _get_weights_iterator(
+                self,
+                model_weights,
+                model_config.revision,
+                weight_filter=getattr(model, "should_load_weight", None),
+            )
         )
 
     rsl.RunaiModelStreamerLoader._get_weights_iterator = _get_weights_iterator
+    rsl.RunaiModelStreamerLoader.load_weights = load_weights
     rsl.RunaiModelStreamerLoader._tpu_sharded_ep_patch = True
     logger.info(
         "Applied TPU patch: EP-sharded Run:AI weight streaming "

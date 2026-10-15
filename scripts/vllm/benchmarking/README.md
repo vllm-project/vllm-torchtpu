@@ -140,23 +140,44 @@ entry of that config, writing `<results-dir>/decode/sweep.md`:
   --config deepseek-v41-flash-tp8-ep-100k-decode --results-dir <DIR>
 ```
 
-### C64 DSpark and Engram offload CI
+### DP8 cached-extend and steady DSpark decode CI
 
-The `epic/dsv41` lane includes
-`deepseek-v41-flash-tp8-ep-100k-decode-c64-dspark-offload`: C64, 98,000 input
-tokens, 5,000 output tokens, TP8/EP8/DP1, FP8 KV, DSpark K=5, and Engram CPU
-offload. The maximum model length is 103424. It uses 8192-token prefill chunks
-and `[64,384,8192]` compile buckets.
-SP and local Q are off; SparseCore MoE is on. These settings are separate from
-the C4/C8/C16 baseline. The job warms up, measures one round, and keeps all
-benchmark and server artifacts. It has no throughput regression threshold yet.
+The `epic/dsv41` lane runs the audited recipes from
+[`server_steps`](../../dsv41_bench/server_steps/README.md), using TP1/DP8/EP8,
+FP8 KV, CED, Engram CPU offload and DSpark K5:
 
-The job calls `run_decode_benchmark.sh` and publishes Buildkite artifacts exactly
-like the C4/C8/C16 decode job. Results are under
-`perf_eval_results/deepseek-v41-flash-tp8-ep-100k-decode-c64-dspark-offload/decode/`:
-`sweep.md` contains the run table, and `isl98000_osl5000_c64/` contains
-`summary.json`, `summary.md`, and per-round measurements. Downstream reporting
-can consume the same artifact format. The CI step does not access Google Sheets.
+- Cached extend: C8, 98,304 cached prefix tokens plus 16,384 new input tokens,
+  2,048-token chunks, one output token and five formal rounds. The model-default
+  serving context limit and automatic KV sizing are retained.
+- Steady decode: C384 (48 requests per DP), 98,304 input tokens and 512 output
+  tokens, 2,048-token chunks, one warmup and one formal window. The serving
+  context limit is 98,816; compile buckets are `[384,2048]`.
+
+These replace the TP8/DP1 C64 DSpark and C1 cold-prefill CI steps. Their old
+config scripts, the unused DSpark config helper and prefill perf baseline are
+removed. The ordinary
+C4/C8/C16 decode and smoke/GSM8K steps remain separate. Related: #1794, #1890
+and #1912; #1891 improves priming for the superseded TP8/DP1 C64 recipe.
+
+`run_dsv41_dp8_benchmark.sh` mounts the checkpoint read-only through GCSFuse,
+prepares scenario-specific LongBench-v2 inputs with the existing dataset SHA
+check, and invokes `server_steps/run.py` with a fresh cold compilation cache.
+The measured Run:ai streamer version is installed only in the disposable test
+container. Compilation caches use the agent's persistent disk and are removed
+when the job exits; model weights are streamed, not copied to that disk.
+
+Buildkite publishes inputs, package versions, startup records, server/client
+logs and `benchmark/fixed/round-*-summary.json` under:
+
+- `perf_eval_results/deepseek-v41-flash-dp8-96k-c8-cached-extend/`
+- `perf_eval_results/deepseek-v41-flash-dp8-96k-c384-decode/`
+
+The existing harness rejects incomplete requests, incorrect cache hits,
+preemptions, missing full-DP windows and compilation in formal windows. Prefill
+reports new-input host cadence; decode counts accepted outputs including bonus
+tokens. These metrics are not directly comparable with the old CI metrics.
+There is no throughput regression threshold yet. CI measurements do not enable
+profiling; use the same audited launcher with `--profile` for a separate capture.
 
 ## Prerequisites
 

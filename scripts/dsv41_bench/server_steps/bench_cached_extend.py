@@ -18,6 +18,22 @@ from prometheus_client.parser import text_string_to_metric_families
 from server_step_worker import SCENARIO, SCENARIOS, token_counts
 
 DATA_SHA256 = "15d61c22d92c96900b3c4948b6aeea218d3214b676a65df48e7b8555604c7fe2"
+INPUT_SHA256 = "9ca4086c68c610b9205e1e46e1a51d3d18bb10495ed88d341c63b725ccca4064"
+
+
+def load_frozen_input(path: Path) -> dict:
+    data = json.loads(path.read_text())
+    # Match the frozen corpus while allowing a different tokenizer mount path.
+    frozen = {
+        **data,
+        "manifest": {
+            **data["manifest"],
+            "tokenizer": "/models/DeepSeek-V4.1-Flash",
+        },
+    }
+    if hashlib.sha256(json.dumps(frozen).encode()).hexdigest() != INPUT_SHA256:
+        raise ValueError("Input differs from the frozen DeepSeek natural-code corpus")
+    return data
 
 
 def prepare_main(argv: list[str]) -> None:
@@ -256,6 +272,7 @@ def summarize_main(argv: list[str]) -> None:
 def assert_no_compilation(log: str, intervals: list[list[int]]) -> None:
     """Reject compilation in formal windows, using the server's local clock."""
     for line in log.splitlines():
+        line = re.sub(r"\x1b\[[0-9;]*m", "", line)
         if not any(
             phrase in line
             for phrase in (
@@ -347,22 +364,27 @@ def client_main(argv: list[str]) -> None:
     parser.add_argument("--model", default="deepseek-v41")
     parser.add_argument("--rounds", type=int, default=5)
     parser.add_argument(
+        "--profile-only",
+        action="store_true",
+        help="One diagnostic wave on an already warmed server",
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="Separate diagnostic run; do not pool with formal rounds",
     )
     parser.add_argument("--admission-settle-seconds", type=float, default=5.0)
     args = parser.parse_args(argv)
+    if args.profile_only:
+        args.profile = True
+        args.rounds = 1
     if args.admission_settle_seconds <= 0:
         parser.error("admission settle time must be positive")
     if args.rounds < 1:
         parser.error("rounds must be positive")
     args.out.mkdir(parents=True, exist_ok=False)
     scenario = SCENARIO
-    input_sha = hashlib.sha256(args.input.read_bytes()).hexdigest()
-    if input_sha != "9ca4086c68c610b9205e1e46e1a51d3d18bb10495ed88d341c63b725ccca4064":
-        raise ValueError("Input differs from the frozen DeepSeek natural-code corpus")
-    data = json.loads(args.input.read_text())
+    data = load_frozen_input(args.input)
     rows = data["prompts"][: scenario.concurrency]
     suffixes = data["prime_suffix"][: scenario.concurrency]
     length = scenario.prefix_tokens + scenario.extend_tokens
@@ -469,7 +491,7 @@ def client_main(argv: list[str]) -> None:
                 post("/resume", {})
             return [future.result() for future in futures]
 
-    for round_id in range(args.rounds + 1):
+    for round_id in range(1 if args.profile_only else 0, args.rounds + 1):
         label = "warmup" if round_id == 0 else f"round-{round_id}"
         post("/reset_prefix_cache", {})
         prime_before = metrics()

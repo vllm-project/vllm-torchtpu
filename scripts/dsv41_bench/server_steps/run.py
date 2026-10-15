@@ -8,7 +8,7 @@ import hashlib
 import importlib.metadata
 import json
 import os
-import shutil
+import re
 import signal
 import socket
 import subprocess
@@ -17,7 +17,11 @@ import time
 from pathlib import Path
 
 import requests
-from bench_cached_extend import assert_no_compilation, summarize_startup
+from bench_cached_extend import (
+    assert_no_compilation,
+    load_frozen_input,
+    summarize_startup,
+)
 from server_step_worker import DECODE_SCENARIO
 
 
@@ -26,6 +30,45 @@ def cache_inventory(root: Path) -> dict:
     return {
         "files": len(files),
         "bytes": sum(p.stat().st_size for p in files),
+    }
+
+
+def source_identity(
+    root: Path, package: str, *, build_commit: str | None = None
+) -> dict:
+    if any((parent / ".git").exists() for parent in (root, *root.parents)):
+        return {
+            "commit": subprocess.check_output(
+                ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
+            ).strip(),
+            "diff_sha256": hashlib.sha256(
+                subprocess.check_output(
+                    ["git", "-C", str(root), "diff", "HEAD", "--", "."]
+                )
+            ).hexdigest(),
+        }
+
+    # CI excludes .git; its image records the build SHA. The installed vLLM
+    # Git dependency instead records its upstream SHA in direct_url.json.
+    distribution = importlib.metadata.distribution(package)
+    if build_commit is not None:
+        if re.fullmatch(r"[0-9a-f]{40}", build_commit) is None:
+            raise ValueError("Buildkite image source requires a full Git commit SHA")
+        return {
+            "commit": build_commit,
+            "package_version": distribution.version,
+            "provenance": "Buildkite CI image",
+        }
+    direct_url_text = distribution.read_text("direct_url.json")
+    if direct_url_text is None:
+        raise ValueError(f"{package} requires Git source provenance for cache identity")
+    direct_url = json.loads(direct_url_text)
+    if "vcs_info" not in direct_url or not direct_url["vcs_info"].get("commit_id"):
+        raise ValueError(f"{package} direct_url.json has no VCS commit identity")
+    return {
+        "commit": direct_url["vcs_info"]["commit_id"],
+        "package_version": distribution.version,
+        "direct_url": direct_url,
     }
 
 
@@ -88,11 +131,14 @@ def main() -> None:
         args.rounds = 1 if args.scenario == "decode" else 5
     if args.rounds < 1:
         parser.error("The integrated launcher requires at least one formal window")
+    if args.scenario == "encoder_extend":
+        load_frozen_input(args.input)
 
     def terminate(signum, frame):
         raise SystemExit(128 + signum)
 
     signal.signal(signal.SIGTERM, terminate)
+    args.out = args.out.resolve()
     args.out.mkdir(parents=True, exist_ok=False)
     before = cache_inventory(args.cache_dir)
     if args.cache_mode == "cold" and before["files"]:
@@ -139,9 +185,9 @@ def main() -> None:
         env["MAX_MODEL_LEN"] = str(
             DECODE_SCENARIO.prefix_tokens + DECODE_SCENARIO.output_tokens
         )
-        env["USE_PHASED_PROFILER"] = "0"
     else:
         env.pop("MAX_MODEL_LEN", None)
+    env["USE_PHASED_PROFILER"] = "0"
     env["PYTHONPATH"] = str(here) + os.pathsep + env.get("PYTHONPATH", "")
     server_command = [
         "bash",
@@ -151,15 +197,13 @@ def main() -> None:
         "--compilation-config",
         json.dumps({"compile_sizes": buckets}),
     ]
-    if env.get("ARTIFACT_LOCAL_DIR"):
+    if args.profile:
         server_command += [
             "--profiler-config",
             json.dumps(
                 {
                     "profiler": "torch",
-                    "torch_profiler_dir": str(
-                        Path(env.get("TMPDIR", "/tmp")) / "dsv41-profile"
-                    ),
+                    "torch_profiler_dir": str(args.out / "profile"),
                 }
             ),
         ]
@@ -179,25 +223,17 @@ def main() -> None:
     }
     import vllm
 
-    def source_identity(root: Path) -> dict:
-        return {
-            "commit": subprocess.check_output(
-                ["git", "-C", str(root), "rev-parse", "HEAD"], text=True
-            ).strip(),
-            "diff_sha256": hashlib.sha256(
-                subprocess.check_output(
-                    ["git", "-C", str(root), "diff", "HEAD", "--", "."]
-                )
-            ).hexdigest(),
-        }
-
     model = Path(env["MODEL_PATH"])
     identity = {
         "scenario": args.scenario,
         "compile_sizes": buckets,
         "packages": manifest["packages"],
-        "torchtpu": source_identity(here.parents[2]),
-        "vllm": source_identity(Path(vllm.__file__).resolve().parent),
+        "torchtpu": source_identity(
+            here.parents[2],
+            "vllm-torchtpu",
+            build_commit=env.get("BUILDKITE_COMMIT"),
+        ),
+        "vllm": source_identity(Path(vllm.__file__).resolve().parent, "vllm"),
         "model": str(model.resolve()),
         "model_config_sha256": hashlib.sha256(
             (model / "config.json").read_bytes()
@@ -218,7 +254,12 @@ def main() -> None:
     bootstrap_ports(env, args.out)
     server = None
     started = time.monotonic()
-    timing = {"launch_wall_ns": time.time_ns(), "completed": False}
+    timing = {
+        "launch_wall_ns": time.time_ns(),
+        "completed": False,
+        "formal_status": "pending",
+        "profile_status": "pending" if args.profile else "disabled",
+    }
     try:
         with (args.out / "server.log").open("w") as log:
             server = subprocess.Popen(
@@ -270,6 +311,7 @@ def main() -> None:
             ]
             if decode:
                 base += ["--server-log", str(args.out / "server.log")]
+            timing["formal_status"] = "failed"
             with (args.out / "client-fixed.log").open("w") as client_log:
                 subprocess.run(
                     [
@@ -291,7 +333,9 @@ def main() -> None:
                 for index in range(1, args.rounds + 1)
             ]
             assert_no_compilation((args.out / "server.log").read_text(), intervals)
+            timing["formal_status"] = "passed"
             if args.profile:
+                timing["profile_status"] = "failed"
                 with (args.out / "client-profile.log").open("w") as profile_log:
                     subprocess.run(
                         [
@@ -301,7 +345,7 @@ def main() -> None:
                             *(
                                 ["--profile-only", "--reuse-prefix"]
                                 if decode
-                                else ["--rounds", "1", "--profile"]
+                                else ["--profile-only"]
                             ),
                         ],
                         env=env,
@@ -309,6 +353,7 @@ def main() -> None:
                         stderr=subprocess.STDOUT,
                         check=True,
                     )
+                timing["profile_status"] = "passed"
             timing["completed"] = True
     finally:
         stop(server)
@@ -322,13 +367,6 @@ def main() -> None:
                 )
                 + "\n"
             )
-        if args.profile and env.get("ARTIFACT_LOCAL_DIR"):
-            profile_root = Path(env.get("TMPDIR", "/tmp")) / "dsv41-profile"
-            destination = Path(env["ARTIFACT_LOCAL_DIR"]) / "profile"
-            for path in profile_root.rglob("*.xplane.pb"):
-                target = destination / path.relative_to(profile_root)
-                target.parent.mkdir(parents=True, exist_ok=True)
-                shutil.copy2(path, target)
         timing["finished_wall_ns"] = time.time_ns()
         (args.out / "startup.json").write_text(json.dumps(timing, indent=2) + "\n")
 

@@ -17,6 +17,25 @@
 # not run here.
 
 steps:
+  - label: "DeepSeek-V4.1 benchmark scripts: CPU regression tests"
+    key: "dsv41_benchmark_scripts_cpu"
+    depends_on: "build_docker"
+    timeout_in_minutes: 10
+    agents:
+      queue: "cpu_64_core"
+    env:
+      CPU_ONLY: "1"
+    commands:
+      - >-
+        bash .buildkite/scripts/run_in_docker.sh
+        python -m pytest --confcutdir=tests/scripts
+        tests/scripts/test_dsv41_server_session.py
+        tests/scripts/test_dsv41_decode_worker_capture.py
+        tests/scripts/test_dsv41_decode_accounting.py
+        -q --junitxml=/perf_eval_results/dsv41-benchmark-cpu.xml
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
   - group: "DeepSeek-V4.1-Flash on TPU"
     depends_on: "build_docker"
     steps:
@@ -95,8 +114,10 @@ steps:
         artifact_paths:
           - "perf_eval_results/**/*"
 
-      - label: "DeepSeek-V4.1-Flash: C64 DSpark + Engram offload decode"
-        key: "dsv41_flash_tp8_ep_c64_dspark_offload_decode"
+      - label: "DeepSeek-V4.1-Flash: DP8 C384 steady DSpark decode"
+        key: "dsv41_flash_dp8_c384_decode"
+        # Keep the hour-long cold startup off the PR path while loading improves.
+        if: 'build.branch == "epic/dsv41" && build.pull_request.id == null'
         timeout_in_minutes: 180
         agents:
           queue: "tpu_v7x_8_queue"
@@ -104,22 +125,19 @@ steps:
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
         commands:
-          # C64, 98k input / 5k output, DSpark K=5, Engram CPU offload.
-          # Use the same benchmark runner and artifacts as C4/C8/C16.
           - >-
             bash .buildkite/scripts/run_in_docker.sh
-            env MODEL_URI=gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
-            EXTRA_SERVE_ARGS=--language-model-only
-            bash ./scripts/vllm/benchmarking/run_decode_benchmark.sh
-            --config deepseek-v41-flash-tp8-ep-100k-decode-c64-dspark-offload
-            --results-dir /perf_eval_results/deepseek-v41-flash-tp8-ep-100k-decode-c64-dspark-offload
+            bash .buildkite/scripts/run_dsv41_dp8_benchmark.sh
+            decode
+            gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
+            /perf_eval_results/deepseek-v41-flash-dp8-96k-c384-decode
         artifact_paths:
           - "perf_eval_results/**/*"
 
-      - label: "DeepSeek-V4.1-Flash: 100k prefill benchmark (TPU v7x-8)"
-        key: "dsv41_flash_tp8_ep_100k_prefill"
-        # Same weight streaming and startup as the GSM8K step, then a warmup
-        # and 4 measured requests of a few seconds each.
+      - label: "DeepSeek-V4.1-Flash: DP8 C8 cached 96K + 16K extend"
+        key: "dsv41_flash_dp8_c8_cached_extend"
+        # Keep the hour-long cold startup off the PR path while loading improves.
+        if: 'build.branch == "epic/dsv41" && build.pull_request.id == null'
         timeout_in_minutes: 180
         agents:
           queue: "tpu_v7x_8_queue"
@@ -127,25 +145,11 @@ steps:
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
         commands:
-          # Weights stream from gs://wdhongtw-hf-flat as in the GSM8K step.
-          #
-          # Requests have a 100k-token prompt and output one token, sent one
-          # at a time, so total_token_throughput in
-          # isl100000_osl1_c1.json is the prefill tok/s and TTFT the 100k
-          # prefill time. The perf baseline holds only the request count, so
-          # the step fails when a request fails, not on throughput; the
-          # numbers are published as artifacts and not yet gated. The config
-          # runs the SP, LOCAL_Q and 8192-token chunk settings of #1617/#1673;
-          # #1673 measured 50965 tok/s at C1 with them. With 2048-token chunks
-          # and SP off, builds 4189-4264 measured ~29.4k tok/s (TTFT 3.4 s).
-          # CI hosts run ~4-7% below CDK pods for the same image, so compare
-          # runs from the same environment only.
           - >-
             bash .buildkite/scripts/run_in_docker.sh
-            env MODEL_URI=gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
-            EXTRA_SERVE_ARGS=--language-model-only
-            bash ./scripts/vllm/benchmarking/run_eval_flow.sh
-            --config deepseek-v41-flash-tp8-ep-100k-prefill
-            --results-dir /perf_eval_results/deepseek-v41-flash-tp8-ep-100k-prefill
+            bash .buildkite/scripts/run_dsv41_dp8_benchmark.sh
+            encoder_extend
+            gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
+            /perf_eval_results/deepseek-v41-flash-dp8-96k-c8-cached-extend
         artifact_paths:
           - "perf_eval_results/**/*"
