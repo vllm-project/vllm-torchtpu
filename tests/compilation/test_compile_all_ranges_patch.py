@@ -33,6 +33,7 @@ SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 @pytest.fixture
 def compile_all_ranges(monkeypatch):
     monkeypatch.setenv("TPU_PARALLEL_PRECOMPILE", "1")
+    monkeypatch.setenv("TPU_PRECOMPILE_BIGGEST_FIRST", "1")
     monkeypatch.setattr(
         piecewise_backend, "create_concrete_args", lambda graph, size: [size]
     )
@@ -92,8 +93,15 @@ def test_every_rank_compiles_every_range(compile_all_ranges, monkeypatch):
         assert sorted(order) == SIZES
 
 
-def test_biggest_first_off_keeps_vllm_order(compile_all_ranges, monkeypatch):
-    monkeypatch.setenv("TPU_PRECOMPILE_BIGGEST_FIRST", "0")
+@pytest.mark.parametrize("biggest_first", ["0", None])
+def test_biggest_first_off_keeps_vllm_order(
+    compile_all_ranges, monkeypatch, biggest_first
+):
+    """Off, explicitly or by default: ranks keep vLLM's order."""
+    if biggest_first is None:
+        monkeypatch.delenv("TPU_PRECOMPILE_BIGGEST_FIRST")
+    else:
+        monkeypatch.setenv("TPU_PRECOMPILE_BIGGEST_FIRST", biggest_first)
     firsts = [
         _compile_order(compile_all_ranges, monkeypatch, rank)[0] for rank in range(8)
     ]
