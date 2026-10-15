@@ -499,6 +499,7 @@ def test_only_the_last_pipeline_stage_hosts_a_drafter():
 def test_dp_idle_pairing_replays_the_draft_only_where_a_drafter_lives():
     def runner(is_drafter):
         return SimpleNamespace(
+            _is_dspark_pd_producer=False,
             _execute_dp_mm_encoder=MagicMock(),
             _run_dp_dummy_chunk=MagicMock(),
             _is_async_drafter=is_drafter,
