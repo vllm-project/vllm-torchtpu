@@ -240,9 +240,8 @@ class _MockOmniTorchProfilerWrapper:
         self.profiler = self._create_profiler(profiler_config, self._activities)
         self._on_trace_ready = MagicMock()
 
-        self._trace_filename = getattr(
-            profiler_config, "torch_profiler_trace_filename", None
-        )
+        # Upstream sets this only via set_trace_filename().
+        self._trace_filename = None
         self._trace_dir = getattr(profiler_config, "torch_profiler_dir", ".")
         self.started = False
         self.stopped = False
@@ -260,10 +259,13 @@ class _MockOmniTorchProfilerWrapper:
         import os
         import time
 
+        # Mirror upstream: <trace_dir>/<YYYYmmdd-HHMMSS>_<name>, a sibling of
+        # the TPU run root rather than nested under it.
         name = self._trace_filename or self._worker_name
-        if not os.path.dirname(name):
-            name = os.path.join(self._trace_dir, name)
-        return os.path.join(name, str(time.time()))
+        ts = time.strftime("%Y%m%d-%H%M%S")
+        session_dir = os.path.join(self._trace_dir, f"{ts}_{os.path.basename(name)}")
+        os.makedirs(session_dir, exist_ok=True)
+        return session_dir
 
     def _start(self):
         self.started = True

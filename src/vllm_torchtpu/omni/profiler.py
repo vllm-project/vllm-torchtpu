@@ -4,8 +4,18 @@
 vLLM-Omni's ``OmniTorchProfilerWrapper`` only records CUDA-family device
 activities. This subclass records the TPU (``PrivateUse1``) activity through
 the torch_tpu profiler, which writes an XSpace (``*.xplane.pb``, for xprof /
-TensorBoard) next to the chrome trace Omni exports, in the same per-capture
-session directory.
+TensorBoard). The XSpace and the chrome trace Omni exports land in sibling
+directories under ``torch_profiler_dir``:
+
+- chrome trace, in Omni's per-capture session directory:
+  ``<torch_profiler_dir>/<YYYYmmdd-HHMMSS>_<prefix>/trace_rank<N>.json.gz``
+- XSpace, in a run root shared by all ranks:
+  ``<torch_profiler_dir>/<prefix>/plugins/profile/<canonical_ts>/``
+
+The run root is keyed on the profile prefix rather than the session directory
+because each rank picks its session timestamp independently, and ranks can be
+a second apart; keying on the prefix lets every rank merge into one
+``<canonical_ts>`` run.
 
 Enable it the usual Omni way (``profiler_config={"profiler": "torch",
 "torch_profiler_dir": ...}``) and drive it with ``start_profile()`` /
@@ -41,8 +51,7 @@ class TpuOmniTorchProfilerWrapper(OmniTorchProfilerWrapper):
         if self._tpu_python_tracer:
             logger.info(
                 "torch_profiler_with_stack: recording Python stacks with "
-                "the TPU tracer "
-                "(python_tracer_level=1), enforcing torch.profiler with_stack=False."
+                "the TPU python tracer, enforcing torch.profiler with_stack=False."
             )
         profiler_config = dataclasses.replace(
             profiler_config, torch_profiler_with_stack=False
@@ -52,7 +61,12 @@ class TpuOmniTorchProfilerWrapper(OmniTorchProfilerWrapper):
         self._capture_state: tuple[str, str, str, int, int, str] | None = None
 
     def _get_default_activities(self) -> list[Any]:
-        # TPU activity is added in _start; Omni's activity map has no TPU key.
+        # "TPU" is a placeholder: Omni's activity map has no TPU key, so the real
+        # PrivateUse1 activity is added in _start. Two entries also keep the base
+        # class's CPU-only dump_cpu_time_total off.
+        # TODO: Override _resolve_memory_history_backend() once torch.tpu exposes
+        # _record_memory_history/_dump_snapshot; the base (None, None) no-op is
+        # correct until then.
         return ["CPU", "TPU"]
 
     def _create_profiler(self, profiler_config: Any, activities: list[Any]) -> None:

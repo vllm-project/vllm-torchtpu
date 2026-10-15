@@ -545,15 +545,7 @@ def test_tpu_omni_profiler_wrapper(tmp_path, caplog):
     import os
     from unittest.mock import MagicMock, patch
 
-    # Use a real vllm.config.ProfilerConfig if available, else a mock that acts like it
-    try:
-        from vllm.config import ProfilerConfig
-    except ImportError:
-
-        class ProfilerConfig:
-            def __init__(self, **kwargs):
-                for k, v in kwargs.items():
-                    setattr(self, k, v)
+    from vllm.config import ProfilerConfig
 
     from vllm_torchtpu.omni.profiler import TpuOmniTorchProfilerWrapper
 
@@ -565,7 +557,6 @@ def test_tpu_omni_profiler_wrapper(tmp_path, caplog):
         torch_profiler_with_memory=False,
         torch_profiler_with_flops=True,
     )
-    cfg.torch_profiler_trace_filename = None
     with caplog.at_level(logging.INFO):
         wrapper = TpuOmniTorchProfilerWrapper(cfg, "worker_0", 0)
 
@@ -634,7 +625,6 @@ def test_tpu_omni_profiler_wrapper(tmp_path, caplog):
         torch_profiler_with_memory=False,
         torch_profiler_with_flops=True,
     )
-    cfg2.torch_profiler_trace_filename = "my_trace"
     w1 = TpuOmniTorchProfilerWrapper(cfg2, "worker_1", 0)
     w1.set_trace_filename("my_trace")
     w2 = TpuOmniTorchProfilerWrapper(cfg2, "worker_2", 0)
@@ -650,6 +640,17 @@ def test_tpu_omni_profiler_wrapper(tmp_path, caplog):
 
         assert w1._capture_state[1] == w2._capture_state[1]
         assert w1._capture_state[1] == os.path.join(str(tmp_path), "my_trace")
+
+        # Omni's chrome-trace session dir and the XSpace run root are
+        # siblings under torch_profiler_dir, not nested in each other.
+        session_dir = w1._ensure_session_dir()
+        run_root = w1._capture_state[1]
+        assert os.path.dirname(session_dir) == str(tmp_path)
+        assert os.path.dirname(run_root) == str(tmp_path)
+        assert os.path.basename(session_dir).endswith("_my_trace")
+        assert session_dir != run_root
+        assert not session_dir.startswith(run_root + os.sep)
+        assert not run_root.startswith(session_dir + os.sep)
 
         # Case 2: torch_profiler_with_stack=False means python_tracer_level is 0
         _, tpu_kwargs = mock_tpu_config_2.call_args
@@ -667,7 +668,6 @@ def test_tpu_omni_profiler_wrapper(tmp_path, caplog):
         torch_profiler_with_memory=False,
         torch_profiler_with_flops=True,
     )
-    cfg3.torch_profiler_trace_filename = None
     w3 = TpuOmniTorchProfilerWrapper(cfg3, "w3", 0)
     with (
         patch(
@@ -721,7 +721,6 @@ def test_tpu_omni_profiler_canonical_ts_sync(tmp_path):
         torch_profiler_with_memory=False,
         torch_profiler_with_flops=True,
     )
-    cfg.torch_profiler_trace_filename = "my_trace"
 
     w0 = TpuOmniTorchProfilerWrapper(cfg, "w0", 0)
     w0.set_trace_filename("my_trace")
