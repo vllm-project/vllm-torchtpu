@@ -27,6 +27,11 @@ one-window packing must stay as close as the four-to-a-window reference.
 **greedy** replays the fixed prompt and four short prompts on the decoder, then
 writes each request's greedy tokens and text to ``--output`` (JSON): two kernel
 configs' files compare a layout change (e.g. attention DP) on real text.
+
+**masked** drives the decoder with grammar bitmasks (structured outputs): an
+all-ones mask must reproduce the unmasked tokens exactly, random masks must
+never yield a disallowed token, and a mask allowing a single token must force
+it, greedy or sampled, wherever in the vocabulary the token lives.
 """
 
 from __future__ import annotations
@@ -77,7 +82,19 @@ def add_arguments(parser) -> None:
     greedy.add_argument("--prompt-tokens", type=int, default=5000)
     greedy.add_argument("--generate", type=int, default=128)
     greedy.add_argument("--output", required=True)
-    for check in (spec, handoff, packing, greedy):
+    masked = sub.add_parser(
+        "masked", help="grammar-masked (structured outputs) vs unmasked decode"
+    )
+    masked.add_argument("--prompt-tokens", type=int, default=4000)
+    masked.add_argument("--generate", type=int, default=48)
+    masked.add_argument(
+        "--dspark",
+        default=None,
+        help="the DSpark speculator checkpoint: run every case on a speculating "
+        "decoder (masked steps fall back to plain ones) and check speculation "
+        "around a run of masked steps",
+    )
+    for check in (spec, handoff, packing, greedy, masked):
         check.add_argument(
             "--model",
             required=True,
@@ -91,6 +108,7 @@ def run(args, records: harness.Records) -> None:
         "handoff": run_handoff,
         "packing": run_packing,
         "greedy": run_greedy,
+        "masked": run_masked,
     }[args.check](args, records)
 
 
@@ -164,6 +182,230 @@ def run_greedy(args, records: harness.Records) -> None:
 def _agree(a: list[int], b: list[int]) -> int:
     n = min(len(a), len(b))
     return next((i for i in range(n) if a[i] != b[i]), n)
+
+
+def run_masked(args, records: harness.Records) -> None:
+    import torch
+
+    from vllm_torchtpu.megakernel import program as mk
+    from vllm_torchtpu.megakernel.kimi_k3 import program as k3_program
+    from vllm_torchtpu.megakernel.kimi_k3.decode_ops import DecodeOps
+
+    all_ids, tokenizer = k3.fixed_prompt(args.prompt_tokens, args.model)
+    prompts = [
+        np.asarray(all_ids, np.int32),
+        np.asarray(
+            tokenizer.encode(
+                "Write a short story about a robot who learns to paint.",
+                disallowed_special=(),
+            ),
+            np.int32,
+        ),
+    ]
+    words = k3_program.VOCAB // 32
+    # Speculative steps take up to eight tokens each.
+    pages = -(-(args.prompt_tokens + 8 * args.generate + 64) // k3.logical()) + 1
+    ops = DecodeOps(args.presharded, num_slots=2 * 4 + 1, batch_sizes=(1, 2, 4))
+    pools = k3.Pools(16 * pages + 1, pages, 1)
+    draft = None
+    if args.dspark:
+        from vllm_torchtpu.megakernel.kimi_k3.draft import DsparkDraft
+
+        draft = DsparkDraft(
+            max_position=args.prompt_tokens + 8 * args.generate + 64,
+            checkpoint=args.dspark,
+            presharded=args.presharded,
+        )
+    decoder = k3.decoder(
+        ops,
+        pools,
+        max_num_seqs=4,
+        max_model_len=pages * k3.logical(),
+        draft=draft,
+        # Seven drafts alone, three for two to four requests.
+        schedule=((1, 1, 7), (2, 4, 3)) if draft else None,
+    )
+    harness.sync()
+    decoder.warmup()
+    tables = [
+        pools.scheduled(np.arange(1 + n * pages, 1 + (n + 1) * pages), n)
+        for n in range(len(prompts))
+    ]
+    names = tuple(f"m{n}" for n in range(len(prompts)))
+
+    def decode(tag, steps, masks, sampling=(0.0, 1.0, 0, 0)):
+        """``steps`` decode steps of both prompts; ``masks``: step -> the
+        rows' ``[2, words]`` int32 bitmasks (None: unmasked). Returns the
+        steps' first tokens, ``[steps, 2]``."""
+        outs = [
+            decoder.step(
+                mk.StepInput(
+                    [
+                        k3.request(tag + n, ids, table, sampling)
+                        for n, ids, table in zip(names, prompts, tables, strict=True)
+                    ],
+                    mask=masks(0),
+                )
+            ).tokens[:2, :1]
+        ]
+        for step in range(1, steps):
+            outs.append(
+                decoder.step(
+                    mk.StepInput(
+                        [
+                            k3.request(tag + n, [0], table, sampling)
+                            for n, table in zip(names, tables, strict=True)
+                        ],
+                        mask=masks(step),
+                    )
+                ).tokens[:2, :1]
+            )
+        decoder.forget(tuple(tag + n for n in names))
+        return torch.stack(outs).cpu().numpy().reshape(-1, 2)
+
+    steps = args.generate
+    ones = np.full((2, words), -1, np.int32)
+    # The plain reference. A speculating decoder would verify the requests'
+    # first step (their anchors); an all-ones mask keeps it plain like the
+    # masked runs', so masked and unmasked plain ops are compared alone.
+    reference = decode(
+        "u", steps, lambda s: ones if draft is not None and s == 0 else None
+    )
+    unmasked = decode("a", steps, lambda _: ones)
+    same = int((unmasked == reference).sum())
+    harness.log(
+        f"all-ones masks: {same} of {reference.size} tokens identical to unmasked"
+    )
+
+    # Random masks: every token the op chooses must be allowed.
+    rng = np.random.default_rng(0)
+    random_masks = [
+        rng.integers(-(2**31), 2**31, (2, words), np.int32) for _ in range(steps)
+    ]
+    chosen = decode("r", steps, lambda s: random_masks[s])
+    violations = sum(
+        not (random_masks[s][n][token // 32] >> (token % 32)) & 1
+        for s in range(steps)
+        for n, token in enumerate(chosen[s])
+        if token >= 0
+    )
+    harness.log(f"random masks: {violations} disallowed tokens of {chosen.size}")
+
+    # A mask allowing a single token forces it, greedy or sampled, wherever
+    # the token lives in the (vocabulary-sharded) range.
+    forced_ok = True
+    for sampling, label in (
+        ((0.0, 1.0, 0, 0), "greedy"),
+        ((0.7, 0.9, 0, 42), "sampled"),
+    ):
+        for token in (17, 81920, k3_program.VOCAB - 13):
+            mask = np.zeros((2, words), np.int32)
+            mask[:, token // 32] = np.int32(1 << (token % 32))
+            out = decode("f", 1, lambda _, mask=mask: mask, sampling)
+            ok = bool((out[0] == token).all())
+            forced_ok &= ok
+            harness.log(
+                f"forced token {token} ({label}): {out[0].tolist()} "
+                f"({'ok' if ok else 'WRONG'})"
+            )
+
+    # A masked request must not move its unmasked batch-mate (row mapping).
+    blocked = np.full((2, words), -1, np.int32)
+    blocked[0, reference[0, 0] // 32] &= ~np.int32(1 << (reference[0, 0] % 32))
+    mixed = decode("b", 1, lambda _: blocked)
+    row_maps = int(mixed[0, 1]) == int(reference[0, 1])
+    blocks = bool(
+        int(mixed[0, 0]) != int(reference[0, 0])
+        and (blocked[0, mixed[0, 0] // 32] >> (mixed[0, 0] % 32)) & 1
+    )
+    harness.log(
+        f"mixed batch: unmasked row unchanged {row_maps}; masked row blocks "
+        f"{int(reference[0, 0])} -> {int(mixed[0, 0])} ({'ok' if blocks else 'WRONG'})"
+    )
+    spec_ok = True
+    if draft is not None:
+        spec_ok = _masked_around_speculation(decoder, prompts, tables, names, reference)
+    records.add(
+        check="masked",
+        dspark=bool(draft),
+        generate=steps,
+        all_ones_identical=[same, int(reference.size)],
+        random_violations=int(violations),
+        forced_ok=forced_ok,
+        mixed_rows_ok=bool(row_maps and blocks),
+        speculation_ok=spec_ok,
+    )
+    ok = same == reference.size and not violations and forced_ok and row_maps and blocks
+    if not (ok and spec_ok):
+        harness.fail("masked check")
+
+
+def _masked_around_speculation(decoder, prompts, tables, names, reference) -> bool:
+    """Both prompts speculating (three drafts each, as vLLM schedules them),
+    then a run of masked steps (all-ones masks: the batch steps plain), then
+    speculating again; and the same steps speculating throughout. The masked
+    steps must not speculate, speculation must resume after them (a
+    multi-token step), and the greedy streams must follow the plain
+    reference (until a near-tie: the verify and plain ops reduce in
+    different orders) about as far as the pure DSpark streams do."""
+    from vllm_torchtpu.megakernel import program as mk
+    from vllm_torchtpu.megakernel.kimi_k3 import program as k3_program
+
+    ones = np.full((2, k3_program.VOCAB // 32), -1, np.int32)
+    plain_ref = [[int(t) for t in reference[:, n]] for n in range(2)]
+
+    def run(tag, windows):
+        streams, bounds = [[], []], []
+        first, resumed, stepped_ok = True, False, True
+        for window, (label, mask, steps) in enumerate(windows):
+            before = dict(decoder.stats)
+            for _ in range(steps):
+                requests = [
+                    k3.request(tag + n, ids if first else np.zeros(4, np.int32), table)
+                    for n, ids, table in zip(names, prompts, tables, strict=True)
+                ]
+                rows = decoder.step(mk.StepInput(requests, mask=mask)).tokens[:2]
+                rows = rows.cpu().numpy()
+                for n in range(2):
+                    tokens = [int(t) for t in rows[n] if t >= 0]
+                    streams[n] += tokens
+                    resumed |= window == 2 and len(tokens) > 1
+                first = False
+            bounds.append([len(st) for st in streams])
+            speculated = decoder.stats["batched"] - before.get("batched", 0)
+            plain = decoder.stats["plain"] - before.get("plain", 0)
+            expected = plain == steps if label == "masked" else speculated > 0
+            stepped_ok &= expected
+            harness.log(
+                f"dspark {tag}, {label} window: {speculated} speculative and "
+                f"{plain} plain steps, streams end at {bounds[-1]} "
+                f"({'ok' if expected else 'WRONG'})"
+            )
+        decoder.forget(tuple(tag + n for n in names))
+        return streams, bounds, resumed, stepped_ok
+
+    masked_windows = (
+        ("speculate", None, 6),
+        ("masked", ones, 6),
+        ("speculate", None, 10),
+    )
+    pure_windows = (
+        ("speculate", None, 6),
+        ("speculate", None, 6),
+        ("speculate", None, 10),
+    )
+    mixed, bounds, resumed, stepped_ok = run("s", masked_windows)
+    pure, _, _, _ = run("n", pure_windows)
+    vs_plain = [_agree(st, ref) for st, ref in zip(mixed, plain_ref, strict=True)]
+    pure_vs_plain = [_agree(st, ref) for st, ref in zip(pure, plain_ref, strict=True)]
+    vs_pure = [_agree(a, b) for a, b in zip(mixed, pure, strict=True)]
+    harness.log(
+        f"dspark, agreement (tokens): masked run vs plain {vs_plain}, pure DSpark "
+        f"vs plain {pure_vs_plain}, masked run vs pure DSpark {vs_pure}; the "
+        f"masked window spans tokens {bounds[0]} to {bounds[1]}; speculation "
+        f"resumed after it: {resumed}"
+    )
+    return stepped_ok and resumed and all(a > 0 for a in vs_plain)
 
 
 def run_spec(args, records: harness.Records) -> None:

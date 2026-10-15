@@ -309,8 +309,15 @@ speculator fills its draft KV during prefill and its KV connector moves it.
 from it with speculation from a cold ring.
 
 The decode role rejects sampling parameters the ops do not implement
-(logprobs, structured outputs, penalties, min_p, logit bias, allowed/bad
-words, min_tokens; `platforms/tpu_platform.py`).
+(logprobs, penalties, min_p, logit bias, allowed/bad words, min_tokens;
+`platforms/tpu_platform.py`). Structured outputs (the grammar bitmask) the
+plain decoder applies in its step op: a step with a structured request is
+deferred to `sample_tokens` (the engine computes the bitmask from the
+previous step's tokens), which runs the program with the requests' masks
+(`StepInput.mask`) and loses that step's async overlap. With DSpark the
+verify ops do not mask: while a structured request decodes, the whole batch
+steps plain and masked (no drafts), and speculation resumes once no
+structured request is left in the batch.
 
 ## Limits and known issues
 

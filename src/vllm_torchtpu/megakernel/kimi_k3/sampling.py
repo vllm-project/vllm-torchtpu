@@ -177,6 +177,31 @@ def _request_candidates(local_logits, temperature, top_k):
     return values, ids, lse
 
 
+def mask_logits(local_logits: jax.Array, mask: jax.Array, rank: jax.Array) -> jax.Array:
+    """``rank``'s ``[rows, V / 32]`` logits with its disallowed tokens masked.
+
+    ``mask`` is ``[rows, vocab_words]`` int32: bit ``j`` of word ``w`` is the
+    allowed-ness of token ``32 * w + j`` (1: allowed; xgrammar's
+    ``allocate_token_bitmask``), so rank ``r``'s logits take words
+    ``[r * V / 32 / 32, (r + 1) * V / 32 / 32)``. Disallowed logits take a
+    large finite value rather than -inf: a rank whose whole shard is
+    disallowed (a narrow schema can allow tokens of a single shard) would
+    otherwise give NaN local normalizers that poison the global softmax of
+    :func:`sample_rows`.
+    """
+    rows, width = local_logits.shape
+    local = jax.lax.dynamic_index_in_dim(
+        mask.reshape(rows, TP_SIZE, width // 32), rank, axis=1, keepdims=False
+    )
+    allowed = ((local[:, :, None] >> jnp.arange(32, dtype=jnp.int32)) & 1) != 0
+    return jnp.where(allowed.reshape(rows, width), local_logits, -1e30)
+
+
+def apply_grammar_mask(local_logits: jax.Array, mask: jax.Array) -> jax.Array:
+    """Mask each row's disallowed tokens (:func:`mask_logits` at this rank)."""
+    return mask_logits(local_logits, mask, jax.lax.axis_index(AXIS))
+
+
 def uniforms(seed: jax.Array, position: jax.Array, rows: int) -> jax.Array:
     """``[rows, 2]`` uniforms for one step of a sequence: a function of its
     seed and the step's (first row's) position, identical on every rank."""

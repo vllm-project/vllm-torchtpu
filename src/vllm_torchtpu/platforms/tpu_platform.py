@@ -1077,7 +1077,11 @@ class TpuPlatform(Platform):
                 for name, used in (
                     ("logprobs", params.logprobs is not None),
                     ("prompt_logprobs", params.prompt_logprobs is not None),
-                    ("structured outputs", params.structured_outputs is not None),
+                    (
+                        "structured outputs",
+                        params.structured_outputs is not None
+                        and not capabilities.structured_outputs,
+                    ),
                     (
                         "presence/frequency/repetition penalties",
                         params.presence_penalty != 0

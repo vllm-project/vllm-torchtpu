@@ -39,7 +39,7 @@ from vllm_torchtpu.megakernel.kimi_k3.pools import (
     KDA_LAYERS,
     group_slots,
 )
-from vllm_torchtpu.megakernel.kimi_k3.program import TP_SIZE, kernel_modules
+from vllm_torchtpu.megakernel.kimi_k3.program import TP_SIZE, VOCAB, kernel_modules
 
 logger = init_logger(__name__)
 
@@ -257,15 +257,19 @@ class DecodeOps:
                 old.set_(fresh)  # keep vLLM's and the connector's tensor identity
 
     def _build_plain(
-        self, batch: int, control: Any, sub_base: int, sampled: bool
+        self, batch: int, control: Any, sub_base: int, sampled: bool, masked: bool
     ) -> Any:
         """The plain step for ``batch`` rows: the rows' tokens, positions and
         KDA state slots from the control (:class:`Control`), the decoder, the
         next tokens chosen in the op (greedy; with ``sampled`` rows with a
-        temperature draw theirs), and the control advanced. Returns
+        temperature draw theirs), and the control advanced. With ``masked``
+        the operand is the control and the rows' grammar bitmasks packed by
+        :meth:`_build_mask_pack` (one operand: Torch ops take at most 64),
+        and the op chooses among the allowed tokens (xgrammar's bitmask: bit
+        ``j`` of word ``w`` is token ``32 * w + j``'s allowed-ness). Returns
         ``(tokens [batch, VERIFY_ROWS] (column 0; the rest -1), control,
         slots, pools)``."""
-        key = ("owned", batch, control.key(), sub_base, sampled)
+        key = ("owned", batch, control.key(), sub_base, sampled, masked)
         if key in self._ops:
             return self._ops[key]
         if batch not in self.batch_sizes:
@@ -286,7 +290,13 @@ class DecodeOps:
             weights = {name: args[i][0] for i, name in enumerate(names)}
             conv, recurrent = args[count][0], args[count + 1][0]
             pool = args[count + 2 : count + 2 + pools]
-            (state,) = args[count + 2 + pools :]
+            state = args[count + 2 + pools]
+            mask = None
+            if masked:
+                state, mask = (
+                    state[: control.size],
+                    state[control.size :].reshape(batch, -1),
+                )
             slot, token, position, row, plan, tables = control.inputs(state, batch)
             state_slot = control.state_slot(slot, row)
             logits, conv, recurrent, pool = paged.decode_paged(
@@ -304,6 +314,8 @@ class DecodeOps:
                 dcp_owner_table=owner_table,
                 **options,
             )
+            if masked:
+                logits = sampling.apply_grammar_mask(logits, mask)
             chosen = sampling.greedy(logits)
             if sampled:
                 temperature, top_p, top_k, seed = control.sampling(plan)
@@ -322,7 +334,10 @@ class DecodeOps:
 
         in_specs = (P(AXIS),) * (count + 2 + pools) + (P(),)
         out_specs = (P(), P(), P(AXIS), P(AXIS)) + (P(AXIS),) * pools
-        name = f"pallas::k3_decode_owned_b{batch}{'_sampled' if sampled else ''}"
+        name = (
+            f"pallas::k3_decode_owned_b{batch}"
+            f"{'_sampled' if sampled else ''}{'_masked' if masked else ''}"
+        )
         export_key = repr(
             (
                 "owned",
@@ -336,6 +351,7 @@ class DecodeOps:
                 sub_base,
                 sampled,
             )
+            + (("masked",) if masked else ())
         )
         self._ops[key] = register_op(
             name,
@@ -356,10 +372,13 @@ class DecodeOps:
         spec_alone: bool,
         spec_shapes: tuple[tuple[int, int], ...],
         synthetic_rates=None,
+        masked_ops: bool = False,
     ) -> list:
         """The configured primary decoder graphs, using shape-only operands.
         ``synthetic_rates``: the rates, or ``drafts -> rates`` (per draft
-        width), the verify ops are built with."""
+        width), the verify ops are built with. ``masked_ops``: also compile
+        the grammar-masked plain steps (structured outputs; with DSpark, the
+        steps where a structured request decodes)."""
         from vllm_torchtpu.megakernel.compilation import CompileCall
 
         operands = self._operands()
@@ -375,14 +394,31 @@ class DecodeOps:
                 )
             )
 
-        for sampled in (False, True):
-            for batch in self.batch_sizes:
-                add(
-                    self._build_plain(batch, control, sub_base, sampled),
-                    batch,
-                    control.size,
-                    sampled,
-                )
+        masked_variants = (False, True) if masked_ops else (False,)
+        for masked in masked_variants:
+            for sampled in (False, True):
+                for batch in self.batch_sizes:
+                    if masked:
+                        words = VOCAB // 32
+                        calls.append(
+                            CompileCall(
+                                self._build_mask_pack(control, batch),
+                                (
+                                    torch.empty(control.size, dtype=torch.int32),
+                                    torch.empty((batch, words), dtype=torch.int32),
+                                ),
+                                {},
+                                priority=0,
+                            )
+                        )
+                    add(
+                        self._build_plain(batch, control, sub_base, sampled, masked),
+                        batch,
+                        control.size + batch * (VOCAB // 32)
+                        if masked
+                        else control.size,
+                        sampled,
+                    )
 
         def add_verify(requests, rows_per, single=False):
             rows = requests * rows_per
@@ -431,6 +467,27 @@ class DecodeOps:
             return {"xla_tpu_enable_deduplicated_calls": "DISABLED"}
         return {}
 
+    def _build_mask_pack(self, control: Any, batch: int) -> Any:
+        """Keep the masked plain step within Torch's 64-operand limit: pack
+        the control and the rows' grammar bitmasks into one operand (the
+        verifier's metadata op does the same)."""
+        key = ("mask_pack", control.key(), batch)
+        if key in self._ops:
+            return self._ops[key]
+
+        def body(state, mask):
+            return (jnp.concatenate((state, mask.reshape(-1))),)
+
+        self._ops[key] = register_op(
+            f"pallas::k3_mask_pack_{batch}",
+            self.mesh,
+            body,
+            (P(), P()),
+            (P(),),
+            export_key=repr(key),
+        )
+        return self._ops[key]
+
     def plain_step(
         self,
         state: torch.Tensor,
@@ -438,10 +495,14 @@ class DecodeOps:
         control: Any,
         sub_base: int,
         sampled: bool,
+        mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Run :meth:`_build_plain`; returns
-        ``(tokens [batch, VERIFY_ROWS], state)``."""
-        op = self._build_plain(batch, control, sub_base, sampled)
+        ``(tokens [batch, VERIFY_ROWS], state)``. ``mask``: the rows' grammar
+        bitmasks ``[batch, VOCAB // 32]`` int32 (all-ones rows unconstrained)."""
+        op = self._build_plain(batch, control, sub_base, sampled, mask is not None)
+        if mask is not None:
+            (state,) = self._build_mask_pack(control, batch)(state, mask)
         outputs = self._run(op, batch, *self._operands(), state)
         emitted, state, conv, recurrent, *pools = outputs
         self._adopt(conv, recurrent, pools)

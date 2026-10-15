@@ -16,7 +16,9 @@ host's tokens lag (async scheduling). A step is one of:
   :meth:`DsparkDraft.step_single`;
 * three drafts alone, or several requests: :meth:`DecodeOps.verify_batched`,
   then :meth:`DsparkDraft.step_batched` (each request keeps its own ring);
-* otherwise a plain step (:meth:`DecodeOps.plain_step`).
+* otherwise a plain step (:meth:`DecodeOps.plain_step`), also whenever a
+  structured-output request decodes (grammar masks: the verify ops do not
+  mask, so the whole batch steps plain, without drafts).
 
 The verify ops decide acceptance and commit only the selected KDA post-state.
 Under attention DP a request's pages and KDA state live on the DP group its MLA
@@ -52,6 +54,7 @@ from vllm_torchtpu.megakernel.kimi_k3.pools import (
 )
 from vllm_torchtpu.megakernel.kimi_k3.program import (
     SPEC_BATCHES,
+    VOCAB,
     kernel_modules,
     spec_tokens_per_batch,
 )
@@ -230,8 +233,15 @@ class KimiDecoder:
             raise NotImplementedError(
                 "K3 decode: copy-on-write block copies (prefix hits inside a block)"
             )
+        mask = step_input.mask
+        if mask is not None and mask.shape != (len(step_input.requests), VOCAB // 32):
+            raise ValueError(
+                f"K3 decode: grammar masks {mask.shape} do not cover "
+                f"{len(step_input.requests)} requests of the {VOCAB}-token "
+                "vocabulary"
+            )
         self.forget(step_input.finished)
-        return StepOutput(self._decode(step_input.requests))
+        return StepOutput(self._decode(step_input.requests, mask))
 
     def _admit(self, request: RequestInput, slot: int) -> None:
         """A request's first step: import its KDA state after the tokens
@@ -591,12 +601,15 @@ class KimiDecoder:
         return batch, placed_entries, placed_tables, rows
 
     # ------------------------------------------------------------ the step
-    def _decode(self, requests: Sequence[RequestInput]) -> torch.Tensor:
+    def _decode(
+        self, requests: Sequence[RequestInput], mask: np.ndarray | None = None
+    ) -> torch.Tensor:
         """One decode step for ``requests`` (the runner's batch order): the
         tokens ``[>= len(requests), 8]`` int32, row i the request's accepted
         drafts then its bonus token, -1 padded (all -1 for a request that
         takes no token this step: a partial prefill chunk or an unscheduled
-        one)."""
+        one). ``mask``: the requests' grammar bitmasks (row ``i`` request
+        ``i``'s; all-ones unconstrained), applied to the plain step's logits."""
         pages = self._pages
         assert pages is not None
         layout = self._prepare(pages)
@@ -653,6 +666,10 @@ class KimiDecoder:
             if len(decoding) < len(self.spec_tokens)
             else 0
         )
+        if mask is not None:
+            # A structured request decodes: the whole batch steps plain and
+            # masked (the verify ops do not mask), its drafts unused.
+            k = 0
         if len(decoding) == 1 and k == self.WIDTH - 1:
             emitted = self._speculate(decoding[0][1], entries, tables, sampled)
         elif k > 0 and (
@@ -684,8 +701,17 @@ class KimiDecoder:
                     )
             self._sync_plan(entries, tables)
             self.stats["plain"] += 1
+            mask_operand = None
+            if mask is not None:
+                # One row per plan row (the decoding requests' rows, in their
+                # placement order); padding rows unconstrained.
+                mask_operand = np.full((batch, VOCAB // 32), -1, np.int32)
+                rows = placed if placed is not None else range(len(decoding))
+                for plan_row, (i, _) in zip(rows, decoding, strict=True):
+                    mask_operand[plan_row] = mask[i]
+                mask_operand = torch.from_numpy(mask_operand).to("tpu")
             emitted, self.control = self.ops.plain_step(
-                self.control, batch, layout, self.sub_base, sampled
+                self.control, batch, layout, self.sub_base, sampled, mask_operand
             )
         decoded = [i for i, _ in decoding]
         if placed is not None:
@@ -821,11 +847,16 @@ class KimiDecoder:
         assert self.layout is not None
         null = np.zeros(pages, np.int32)
 
-        def plain_step(batch: int, sampled: bool) -> torch.Tensor:
+        def plain_step(batch: int, sampled: bool, masked: bool = False) -> torch.Tensor:
             params = (0.7, 0.9, 20, 1) if sampled else GREEDY
             self._sync_plan([(0, True, 0, 0, params)] * batch, [null] * batch)
+            mask = None
+            if masked:
+                mask = torch.full(
+                    (batch, VOCAB // 32), -1, dtype=torch.int32, device="tpu"
+                )
             emitted, self.control = self.ops.plain_step(
-                self.control, batch, self.layout, self.sub_base, sampled
+                self.control, batch, self.layout, self.sub_base, sampled, mask
             )
             return emitted
 
@@ -849,6 +880,7 @@ class KimiDecoder:
                 self.spec_alone,
                 self.spec_shapes,
                 self.draft._synthetic_rates if self.draft is not None else None,
+                masked_ops=True,
             )
             if self.draft is not None:
                 calls.extend(
@@ -872,8 +904,10 @@ class KimiDecoder:
                     time.perf_counter() - started,
                 )
 
-        def plain(sampled: bool) -> None:
-            outs = [plain_step(batch, sampled) for batch in self.ops.batch_sizes]
+        def plain(sampled: bool, masked: bool = False) -> None:
+            outs = [
+                plain_step(batch, sampled, masked) for batch in self.ops.batch_sizes
+            ]
             for emitted in outs:
                 materialize(emitted)
 
@@ -1006,6 +1040,19 @@ class KimiDecoder:
                         )
                         speculate_batched(sampled, 1, 4, states=states[:1])
                 plain(sampled)
+            # Structured outputs: the grammar-masked variants (all-ones masks
+            # here) run the same op history serving does; with DSpark a masked
+            # step also follows and precedes speculative ones.
+            plain(sampled, masked=True)
+            if speculating:
+                if self.spec_alone:
+                    speculate(sampled)
+                    plain(sampled, masked=True)
+                    speculate(sampled)
+                for requests, rows_per in self.spec_shapes:
+                    speculate_batched(sampled, requests, rows_per)
+                    plain(sampled, masked=True)
+                    speculate_batched(sampled, requests, rows_per)
         self.spec_req, self.draft_state, self.next_ids, self.device_plan = (
             None,
             None,

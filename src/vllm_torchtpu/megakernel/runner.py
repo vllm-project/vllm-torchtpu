@@ -12,6 +12,14 @@ It reuses ``TPUModelRunner`` for the persistent batch, the unified
 KV-cache allocation and the connector registration; the program is built
 from the model's configuration after vLLM builds the (weightless) model,
 whose layers still declare the KV cache spec.
+
+Structured outputs: the grammar bitmask only reaches ``sample_tokens``, so a
+decode step with a structured request is deferred -- ``execute_model`` holds
+its :class:`StepInput` and ``sample_tokens`` runs the program with the masks
+(``StepInput.mask``); the plain ops then choose among the allowed tokens.
+With DSpark such a step runs plain too: its drafts stay on the device, so
+vLLM's per-draft rows are unconstrained and only each request's first row
+is used.
 """
 
 from __future__ import annotations
@@ -20,6 +28,7 @@ import dataclasses
 from pathlib import Path
 from typing import Any, cast
 
+import numpy as np
 import torch
 from torch_tpu._internal import execution_mode
 from vllm.distributed import get_tensor_model_parallel_rank
@@ -61,8 +70,38 @@ class MegakernelStepState:
     """What ``sample_tokens`` needs from a megakernel step."""
 
     scheduler_output: SchedulerOutput
-    tokens: torch.Tensor  # [>= rows, width] device int32, -1 padded
+    tokens: torch.Tensor | None  # [>= rows, width] device int32, -1 padded
     num_draft_per_req: dict[int, int]
+    # Set when the step was deferred to sample_tokens (structured outputs:
+    # the grammar bitmask only arrives there, so the program runs there too).
+    step_input: StepInput | None = None
+
+
+def grammar_bitmask_rows(
+    grammar_output: Any,
+    req_id_to_index: dict[str, int],
+    num_reqs: int,
+    words: int,
+    spec_tokens: dict[str, list[int]] | None = None,
+) -> np.ndarray | None:
+    """The batch's per-request grammar bitmasks ``[num_reqs, words]`` int32
+    (all-ones rows unconstrained), from ``grammar_output``'s compact rows
+    (ordered by ``structured_output_request_ids``). A structured request
+    has one row, or with speculative decoding one per scheduled draft
+    (``spec_tokens``, vLLM's ``scheduled_spec_decode_tokens``) and then the
+    bonus row; its first row, the next token's given the tokens it has
+    committed, is the one a step that does not verify drafts uses. None: no
+    structured request of this batch has a row."""
+    mask = np.full((num_reqs, words), -1, np.int32)
+    mapped = False
+    row = 0
+    for req_id in grammar_output.structured_output_request_ids:
+        index = req_id_to_index.get(req_id)
+        if index is not None and index < num_reqs:
+            mask[index] = grammar_output.grammar_bitmask[row]
+            mapped = True
+        row += 1 + len((spec_tokens or {}).get(req_id, ()))
+    return mask if mapped else None
 
 
 def build_program(vllm_config: Any, tp_rank: int) -> MegakernelProgram:
@@ -312,6 +351,23 @@ class MegakernelModelRunner(TPUModelRunner):
             )
         step_input = self._prepare_step_input(scheduler_output)
         assert self.program is not None
+        if (
+            self.megakernel_role == "decode"
+            and scheduler_output.has_structured_output_requests
+        ):
+            # A structured request decodes this step: the grammar bitmask
+            # only reaches sample_tokens (the engine computes it from the
+            # previous step's tokens), so the program runs there, masks in
+            # hand. The step's async overlap is lost (its op no longer
+            # launches ahead of the previous step's host-side output
+            # processing).
+            self.execute_model_state = MegakernelStepState(
+                scheduler_output,
+                None,
+                self._num_draft_per_req(step_input),
+                step_input,
+            )
+            return None
         output = self.program.step(step_input)
         self.execute_model_state = MegakernelStepState(
             scheduler_output, output.tokens, self._num_draft_per_req(step_input)
@@ -323,6 +379,21 @@ class MegakernelModelRunner(TPUModelRunner):
         self.execute_model_state = None
         if not isinstance(state, MegakernelStepState):
             raise RuntimeError("sample_tokens() without a megakernel step")
+        if state.step_input is not None:
+            # The deferred structured-output step: run it now, masked (an
+            # all-ones mask for unconstrained rows; no structured row mapped:
+            # the plain unmasked step).
+            assert self.program is not None
+            if grammar_output is not None:
+                state.step_input.mask = grammar_bitmask_rows(
+                    grammar_output,
+                    self.input_batch.req_id_to_index,
+                    self.input_batch.num_reqs,
+                    -(-self.vocab_size // 32),
+                    state.scheduler_output.scheduled_spec_decode_tokens,
+                )
+            state.tokens = self.program.step(state.step_input).tokens
+        assert state.tokens is not None
         scheduler_output = state.scheduler_output
         num_reqs = self.input_batch.num_reqs
         req_ids = cast(list[str], self.input_batch.req_ids[:num_reqs])

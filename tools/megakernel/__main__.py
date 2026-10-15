@@ -13,6 +13,7 @@ Commands (Kimi-K3; see each module's docstring):
                                 seeded sampling
     check handoff               prefill -> pools -> decode against a decode-only replay
     check greedy --output FILE  prompts replayed on the decoder, then greedy tokens
+    check masked                grammar-masked (structured outputs) vs unmasked decode
     profile decode|prefill ...  the bench's cases with an xprof trace (--trace) and,
                                 with --llo DIR, the compiled LLO of every op (fresh
                                 compile caches, so nothing is skipped)

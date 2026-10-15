@@ -113,6 +113,10 @@ class Capabilities:
     page_aligned_chunks: bool
     # applies the scheduler's copy-on-write block copies (prefix hits inside a block)
     block_copies: bool
+    # applies the grammar bitmask of vLLM structured outputs to the tokens the
+    # ops choose (the prefill declares it to accept the requests; it ignores
+    # the masks -- only the decode role's tokens are served)
+    structured_outputs: bool = False
 
 
 @dataclasses.dataclass
@@ -125,6 +129,11 @@ class StepInput:
     finished: Iterable[str] = ()
     # Copy-on-write block copies (src, dst) to apply before the step.
     copies: Sequence[tuple[int, int]] = ()
+    # Structured-output grammar masks: row ``i`` is request ``i``'s xgrammar
+    # bitmask, ``ceil(vocab_size / 32)`` int32 words with bit ``j`` of word
+    # ``w`` the allowed-ness of token ``32 * w + j`` (1: allowed); an all-ones
+    # row is unconstrained. None: no structured request this step.
+    mask: np.ndarray | None = None
 
 
 @dataclasses.dataclass
