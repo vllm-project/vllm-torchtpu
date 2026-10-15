@@ -8,9 +8,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.qwen4_exp import decode_indexer
+from vllm_torchtpu.kernels.qwen4_exp import decode_indexer, pooled_qsa
 from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
     block_sparse_gqa_attention,
 )
@@ -37,6 +38,78 @@ def test_shared_causal_default_keeps_current_group_visible():
         streamindex._effective_row_lengths(*args, components=qsa_indexing(3)),
         [0, 0, 0, 1, 1, 1, 1, 2],
     )
+
+
+def test_bf16_indexer_retains_fp32_head_reduction(tpu_info):
+    config = streamindex._BlockedPrefillConfig.create(
+        bq_sz=128,
+        bkv_sz=256,
+        num_q_heads=4,
+        q_dtype=jnp.bfloat16,
+        seq_batch_size=1,
+    )
+    assert config.enabled
+    assert not config.bf16_reduce
+    assert config.wb_dtype == jnp.float32
+
+
+@pytest.mark.parametrize("tokens", [512, 8192])
+@pytest.mark.parametrize(
+    "dtype,packing,view",
+    [
+        (jnp.bfloat16, 2, None),
+        (jnp.uint8, 4, "bfloat16"),
+        (jnp.float8_e4m3fn, 4, "bfloat16"),
+    ],
+)
+def test_blocked_prefill_traces_native_and_pooled_bf16(tokens, dtype, packing, view):
+    mesh = jax.sharding.AbstractMesh(
+        (1,),
+        ("x",),
+        abstract_device=jax.sharding.AbstractDevice("TPU7x", 1, "tpu"),
+    )
+    shape = jax.ShapeDtypeStruct
+    with jax.sharding.use_abstract_mesh(mesh):
+        output = jax.eval_shape(
+            functools.partial(
+                streamindex.streamindex_topk,
+                k=512,
+                compression_ratio=4,
+                num_kv_pages_per_block=(8, 8, 8),
+                num_queries_per_block=(1, 128, 128),
+                chunk_tokens=512,
+                components=qsa_indexing(3),
+                return_scores=True,
+            ),
+            shape((tokens, 4, 256), jnp.bfloat16),
+            shape((tokens, 4), jnp.float32),
+            shape((640, 16, packing, 256), dtype),
+            shape((3,), jnp.int32),
+            shape((960,), jnp.int32),
+            shape((4,), jnp.int32),
+            shape((3,), jnp.int32),
+        )
+    assert all(x.shape == (tokens, 512) and x.dtype == jnp.int32 for x in output)
+
+
+@pytest.mark.parametrize("context", [0, 1, 2047, 2048, 262144 - 8192])
+def test_completed_groups_for_full_prefill_with_idle_request(context):
+    # An empty request between two live requests must not hide the last one.
+    starts = np.array([0, 4096, 4096, 8191], np.int32)
+    seq_lens = np.array([context + 4096, 0, context + 4095], np.int32)
+    expected = np.concatenate(
+        ((context + np.arange(1, 4097)) // 4, (context + np.arange(1, 4096)) // 4, [0])
+    )
+    actual = streamindex._effective_row_lengths(
+        jnp.asarray(seq_lens),
+        jnp.asarray(starts),
+        jnp.array([0, 0, 3]),
+        num_tokens=8192,
+        num_positions=65536,
+        compression_ratio=4,
+        components=qsa_indexing(3),
+    )
+    np.testing.assert_array_equal(actual, expected)
 
 
 @pytest.mark.parametrize("pages", [64, 2048, 65536])
@@ -86,6 +159,35 @@ def test_nonpooled_prefill_bounds_expansion_and_preserves_request_ownership(
     assert chunk_shapes and all(q <= limit and n == q * pages for q, n in chunk_shapes)
 
 
+def test_pooled_prefill_keeps_live_requests_after_empty_rows(monkeypatch):
+    def transport(q, weights, cache, lengths, table, starts, distribution, **kwargs):
+        assert kwargs["components"].schedule.causal_position_offset == 3
+        np.testing.assert_array_equal(distribution, [0, 0, 3])
+        return streamindex._effective_row_lengths(
+            lengths,
+            starts,
+            distribution,
+            len(q),
+            65536,
+            4,
+            components=kwargs["components"],
+        )
+
+    monkeypatch.setattr(pooled_qsa, "streamindex_topk", transport)
+    actual = pooled_qsa.select_blocks(
+        jnp.zeros((8, 4, 128), jnp.bfloat16),
+        jnp.zeros((3, 128, 1, 4, 256), jnp.float8_e4m3fn),
+        jnp.zeros(8, jnp.int32),
+        jnp.zeros((3, 1), jnp.int32),
+        jnp.array([0, 0, 0, 2, 2, 2, 2, 2]),
+        jnp.array([0, 3, 3, 8]),
+        jnp.array([0, 0, 2048]),
+        ratio=4,
+        block_topk=512,
+    )
+    np.testing.assert_array_equal(actual, [0, 0, 0, 512, 512, 512, 513, 513])
+
+
 @pytest.mark.parametrize("heads,dim,ratio", [(1, 256, 4), (4, 64, 8), (8, 256, 4)])
 @pytest.mark.parametrize("fp8", [False, True])
 def test_single_prefill_supports_tp_head_counts_and_padded_dimensions(
@@ -115,3 +217,64 @@ def test_single_prefill_supports_tp_head_counts_and_padded_dimensions(
     )
     assert result == query
     assert cache.shape[0] == 3
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("tokens", [512, 8192])
+@pytest.mark.parametrize("carrier", ["uint8", "float8_e4m3fn"])
+def test_blocked_prefill_bf16_pool_view_matches_native_cache(tokens, carrier):
+    rng = np.random.default_rng(1641)
+    query = jnp.asarray(rng.normal(size=(tokens, 4, 256)), jnp.bfloat16)
+    native = jnp.asarray(rng.normal(size=(640, 16, 2, 256)), jnp.bfloat16)
+    starts = jnp.array([0, tokens // 2, tokens // 2, tokens], jnp.int32)
+    lengths = jnp.array([tokens // 2, 0, 32769 + tokens // 2], jnp.int32)
+    table = jnp.asarray(rng.permutation(640).reshape(2, 320)[[0, 0, 1]], jnp.int32)
+
+    def encode(src, dst):
+        dst.bitcast(jnp.bfloat16)[...] = src[...]
+
+    packed = pl.pallas_call(
+        encode,
+        grid=(len(native),),
+        in_specs=[pl.BlockSpec((1, 16, 2, 256), lambda p: (p, 0, 0, 0))],
+        out_specs=pl.BlockSpec((1, 16, 4, 256), lambda p: (p, 0, 0, 0)),
+        out_shape=jax.ShapeDtypeStruct(
+            (len(native), 16, 4, 256), getattr(jnp, carrier)
+        ),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+    )(native)
+    before = np.asarray(packed).view(np.uint8).copy()
+
+    def select(cache, **kwargs):
+        return streamindex.streamindex_topk(
+            query,
+            jnp.full(query.shape[:2], 256**-0.5, jnp.float32),
+            cache,
+            lengths,
+            table.reshape(-1),
+            starts,
+            jnp.array([0, 0, 3]),
+            k=512,
+            compression_ratio=4,
+            num_kv_pages_per_block=(8, 8, 8),
+            num_queries_per_block=(1, 128, 128),
+            chunk_tokens=512,
+            components=qsa_indexing(3),
+            return_scores=True,
+            **kwargs,
+        )
+
+    expected = select(native)
+    actual = select(packed)
+    for wanted, got in zip(expected, actual):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(wanted))
+    visible = np.concatenate(
+        (
+            np.arange(1, tokens // 2 + 1) // 4,
+            (32769 + np.arange(1, tokens // 2 + 1)) // 4,
+        )
+    )
+    ids = np.asarray(actual[0])
+    assert np.all((ids == -1) | ((ids >= 0) & (ids < visible[:, None])))
+    np.testing.assert_array_equal(np.sum(ids >= 0, axis=1), np.minimum(visible, 512))
+    np.testing.assert_array_equal(np.asarray(packed).view(np.uint8), before)

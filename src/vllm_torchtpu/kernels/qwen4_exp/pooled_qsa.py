@@ -520,6 +520,36 @@ def select_blocks(
             components=qsa_indexing(),
         )
 
+    if len(query) > len(context):
+        # Present prefill as its native ragged request batch. The previous path
+        # treated every query as a one-token decode sequence, so every row
+        # reloaded the same KV history and ran an M=1 score matmul. BQ128 reuses
+        # each KV tile across neighboring queries; chunking overlaps chunk g's
+        # SparseCore top-k with chunk g+1's TensorCore scoring.
+        query_lens = starts[1:] - starts[:-1]
+        num_seqs = jnp.max(
+            jnp.where(query_lens > 0, jnp.arange(len(context), dtype=jnp.int32) + 1, 0)
+        )
+        seq_lens = context + query_lens
+        chunk_tokens = 512 if len(query) % 512 == 0 else None
+        return streamindex_topk(
+            jnp.pad(query, ((0, 0), (0, 0), (0, width - query.shape[-1]))),
+            jnp.full(query.shape[:2], query.shape[-1] ** -0.5, jnp.float32),
+            cache,
+            seq_lens,
+            expand_pages(table),
+            starts,
+            jnp.asarray([0, 0, num_seqs], dtype=jnp.int32),
+            k=block_topk,
+            compression_ratio=ratio,
+            num_kv_pages_per_block=(256 // rows,) * 3,
+            num_queries_per_block=(1, 128, 128),
+            decode_req_batch_size=8,
+            enable_early_exit=True,
+            chunk_tokens=chunk_tokens,
+            components=qsa_indexing(ratio - 1),
+        )
+
     pages_per_query = table.shape[1] * logical_pages
     chunk_size = min(len(query), decode_query_chunk_size(pages_per_query))
     if len(query) <= chunk_size:
