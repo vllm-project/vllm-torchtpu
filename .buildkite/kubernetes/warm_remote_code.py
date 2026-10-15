@@ -17,8 +17,8 @@
 
 Usage: warm_remote_code.py <object-storage model URI>
 
-For a pod of a multi-host engine other than index 0, run before Ray starts
-the engine's workers there. On index 0 the API server pulls the aux files
+For a pod of a multi-host engine other than index 0, run before the engine
+starts its workers there. On index 0 the API server pulls the aux files
 and imports the remote code before any worker exists. On the other hosts
 every worker would otherwise copy the same modules into an empty HF modules
 cache at once, and one can import a half-written file - for Kimi-K3,

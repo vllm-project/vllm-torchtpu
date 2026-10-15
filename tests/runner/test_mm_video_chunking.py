@@ -109,6 +109,17 @@ class TestChunkPatchSize:
         with patch.dict(os.environ, {"MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": "4096"}):
             assert mvc.get_video_chunk_patch_size(model_config) == 0
 
+    def test_default_max_patches_and_env_min(self):
+        """Use `default_max_patches` when env is unset, or cap by env."""
+        cfg = SimpleNamespace(multimodal_config=None)
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("MM_ENCODER_FRAME_CHUNK_PATCH_SIZE", None)
+            assert mvc.get_video_chunk_patch_size(cfg, default_max_patches=2048) == 2048
+        with patch.dict(os.environ, {"MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": "1024"}):
+            assert mvc.get_video_chunk_patch_size(cfg, default_max_patches=2048) == 1024
+        with patch.dict(os.environ, {"MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": "4096"}):
+            assert mvc.get_video_chunk_patch_size(cfg, default_max_patches=2048) == 2048
+
 
 class TestChunkedVideoEncodingContext:
     """``chunked_video_encoding`` swaps ``embed_multimodal`` only while the

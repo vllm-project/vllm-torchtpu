@@ -220,6 +220,7 @@ def _assert_close(actual, expected, *, rtol, name):
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.tpu_test
 def test_decode_kda_abi_shapes_and_dtypes() -> None:
     """The three returns a caller unpacks, without compiling."""
     inputs = _build(4, 8, seed=3)
@@ -240,6 +241,7 @@ def test_decode_kda_abi_shapes_and_dtypes() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize(
     ("num_live", "bucket"),
     [
@@ -274,6 +276,7 @@ def test_decode_kda_matches_the_reference(
         )
 
 
+@pytest.mark.tpu_test
 def test_decode_kda_starts_from_zero_on_a_sequences_first_step() -> None:
     """No carried state means zero, even though the slot holds something else.
 
@@ -298,6 +301,7 @@ def test_decode_kda_starts_from_zero_on_a_sequences_first_step() -> None:
         )
 
 
+@pytest.mark.tpu_test
 def test_decode_kda_mixes_carried_and_fresh_sequences_in_one_batch() -> None:
     """Carry-in is per sequence, and a real batch is mixed.
 
@@ -325,6 +329,7 @@ def test_decode_kda_mixes_carried_and_fresh_sequences_in_one_batch() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.tpu_test
 def test_decode_kda_zeroes_padded_request_rows() -> None:
     """Rows past the live requests must emit zeros, not stale values."""
     inputs = _build(3, 16, seed=5)
@@ -335,6 +340,7 @@ def test_decode_kda_zeroes_padded_request_rows() -> None:
     )
 
 
+@pytest.mark.tpu_test
 def test_decode_kda_leaves_the_null_block_untouched() -> None:
     """Slot 0 is reserved, and every padded row's write is routed to it.
 
@@ -350,6 +356,7 @@ def test_decode_kda_leaves_the_null_block_untouched() -> None:
     )
 
 
+@pytest.mark.tpu_test
 def test_decode_kda_leaves_slots_of_unscheduled_requests_untouched() -> None:
     """A slot that belongs to no row this step must survive the call.
 
@@ -365,6 +372,7 @@ def test_decode_kda_leaves_slots_of_unscheduled_requests_untouched() -> None:
     )
 
 
+@pytest.mark.tpu_test
 def test_decode_kda_advances_only_the_scheduled_slots() -> None:
     """The complement of the checks above: live slots really do change."""
     inputs = _build(3, 16, seed=13)
@@ -377,6 +385,7 @@ def test_decode_kda_advances_only_the_scheduled_slots() -> None:
         )
 
 
+@pytest.mark.tpu_test
 def test_decode_kda_honours_out_of_order_slot_assignments() -> None:
     """Slots are handed out by the block manager, so they are not sorted.
 
@@ -400,6 +409,7 @@ def test_decode_kda_honours_out_of_order_slot_assignments() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.tpu_test
 def test_decode_kda_reads_a_transposed_state_pool() -> None:
     """``state_transposed`` describes a pool holding ``[d_v, d_k]`` per head.
 
@@ -422,6 +432,7 @@ def test_decode_kda_reads_a_transposed_state_pool() -> None:
     )
 
 
+@pytest.mark.tpu_test
 def test_decode_kda_reads_a_dim_first_conv_state() -> None:
     """``conv_state_dim_first`` is the ``DS`` cache layout, and round-trips."""
     inputs = _build(4, 8, seed=23)
@@ -439,6 +450,7 @@ def test_decode_kda_reads_a_dim_first_conv_state() -> None:
     )
 
 
+@pytest.mark.tpu_test
 def test_decode_kda_accepts_native_rank5_conv_state() -> None:
     """The production Kimi cache keeps Q/K/V and heads explicit."""
     inputs = _build(4, 8, seed=31)
@@ -466,6 +478,7 @@ def test_decode_kda_accepts_native_rank5_conv_state() -> None:
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.tpu_test
 def test_decode_kda_matches_mains_two_op_path() -> None:
     """The fused kernel must be a drop-in for sconv + SiLU + ragged_kda.
 

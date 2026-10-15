@@ -15,13 +15,15 @@
 quantization config resolution."""
 
 import torch
-from vllm.model_executor.layers.quantization.fp8 import Fp8Config
 
-from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
+from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+    VllmFp8Config,
+    VllmFp8LinearMethodTPU,
+)
 from vllm_torchtpu.layers.core.quant_methods import DEEPSEEK_V4_FP8
 
 
-class _DummyDeepseekV4Fp8Config(Fp8Config):
+class _DummyDeepseekV4Fp8Config(VllmFp8Config):
     """Stub DeepSeek-V4 FP8 config for testing weight block size resolution."""
 
     @classmethod
@@ -51,11 +53,14 @@ def test_linear_weight_loading_quant_config_resolving():
 
 def test_linear_weight_loading_unquantized_fallback():
     """Verify dynamic quantization fallback when checkpoint is unquantized."""
+    # Upstream `Fp8Config` rejects online quantization at construction since
+    # vLLM v0.31; the TPU config builds as serialized and flips the flag too.
     dummy_quant_config = _DummyDeepseekV4Fp8Config(
-        is_checkpoint_fp8_serialized=False,
+        is_checkpoint_fp8_serialized=True,
         activation_scheme="dynamic",
         weight_block_size=None,
     )
+    dummy_quant_config.is_checkpoint_fp8_serialized = False
     dense_method = VllmFp8LinearMethodTPU(
         quant_config=dummy_quant_config,
         prefix="model.layers.0.self_attn.fused_wqa_wkv",

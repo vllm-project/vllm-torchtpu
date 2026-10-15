@@ -449,12 +449,6 @@ def recurrent_kda(
 
     # Delta rule step-size beta in [0, 1]
     beta = jnp.where(mask, jax.nn.sigmoid(b_compact.astype(jnp.float32)), 0.0)
-    if cfg.window_size > 1:
-        # Match `_activate_beta` feeding the one-token K3 decode kernel: its
-        # sigmoid result is rounded to the model activation dtype before the
-        # recurrent update. Return to fp32 here so the fused scan itself keeps
-        # its existing compute dtype and layout.
-        beta = beta.astype(cfg.dtypes.act_out).astype(jnp.float32)
     beta = compute_gdn.fused_transpose_broadcast(beta, src_dim=4, dst_dim=1)
     beta = beta[:, : cfg.num_v_heads, :, 0, :]
 

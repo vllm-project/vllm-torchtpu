@@ -1,14 +1,36 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import ctypes
 import gc
 from collections.abc import Callable
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import torch
 from torch.nn import Parameter
 
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+
+    class StagedParameter(Parameter):
+        """Typing-only view of a parameter staged by the CPU weight loader."""
+
+        _cpu_scratch: Parameter
+        _orig_shape: tuple[int, ...]
+
 
 def get_cpu_weight_loader_hook(
-    layer: torch.nn.Module,
+    layer: "RoutedExperts",
     orig_loader: Callable | None,
     tp_size: int,
     tp_rank: int,
@@ -23,7 +45,7 @@ def get_cpu_weight_loader_hook(
     """
 
     def _cpu_weight_loader_hook(
-        param: torch.nn.Parameter,
+        param: "StagedParameter",
         loaded_weight: torch.Tensor,
         weight_name: str,
         shard_id: str,
@@ -138,7 +160,7 @@ def release_memory_to_os() -> None:
     gc.collect()
     try:  # noqa: SIM105 (malloc_trim exists only on glibc)
         ctypes.CDLL(None).malloc_trim(0)
-    except Exception:
+    except Exception:  # noqa: S110
         pass
 
 

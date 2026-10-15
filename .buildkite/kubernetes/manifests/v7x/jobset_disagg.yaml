@@ -125,7 +125,7 @@ spec:
                     mountPath: "/usr/vllm"
               containers:
               - name: vllm-tpu
-                image: us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-prod:latest
+                image: us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/vllm-torchtpu-prod:latest
                 imagePullPolicy: IfNotPresent
                 command: [ "/bin/bash", "-c", "--" ]
                 args:
@@ -334,7 +334,7 @@ spec:
                     mountPath: "/usr/vllm"
               containers:
               - name: vllm-tpu
-                image: us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-prod:latest
+                image: us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/vllm-torchtpu-prod:latest
                 imagePullPolicy: IfNotPresent
                 command: [ "/bin/bash", "-c", "--" ]
                 args:
@@ -500,7 +500,7 @@ spec:
               restartPolicy: Never
               containers:
               - name: benchmark-runner
-                image: us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/torchtpu-vllm-prod:latest
+                image: us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/vllm-torchtpu-prod:latest
                 imagePullPolicy: IfNotPresent
                 env:
                 # vllm bench serve is a pure HTTP client on a CPU node; loading
@@ -528,7 +528,7 @@ spec:
                     # Remove it so vLLM falls back to the CPU platform.
                     pip uninstall -y libtpu libtpu-nightly >/dev/null 2>&1 || true
                     echo "Starting proxy server..."
-                    python3 /root/torchtpu-vllm/examples/disagg/toy_proxy_server.py \
+                    python3 /workspace/vllm-torchtpu/examples/disagg/toy_proxy_server.py \
                       --host 0.0.0.0 \
                       --port 10000 \
                       --prefiller-host vllm-service-prefill \

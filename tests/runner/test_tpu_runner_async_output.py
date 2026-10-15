@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import numpy as np
+import pytest
 import torch
 from vllm.v1.outputs import LogprobsTensors, ModelRunnerOutput
 
@@ -30,6 +31,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
 )
 
 
+@pytest.mark.tpu_test
 def test_assemble_spec_next_tokens(device):
     # 2 requests, K=3. Rejection rows: req0 has 2 accepted drafts + bonus (3
     # valid cols), req1 has bonus only (1 valid). Bonus = last non-(-1) col.
@@ -54,6 +56,7 @@ def test_assemble_spec_next_tokens(device):
     assert torch.equal(src, expected)
 
 
+@pytest.mark.tpu_test
 def test_assemble_spec_next_tokens_ignores_padded_rows(device):
     # next_tokens / drafts are bucket-padded to 3 rows; only 2 real requests.
     next_tokens = torch.tensor(
@@ -70,6 +73,7 @@ def test_assemble_spec_next_tokens_ignores_padded_rows(device):
     assert torch.equal(src, expected)
 
 
+@pytest.mark.tpu_test
 def test_subtract_num_rejected_tokens(device):
     # 2 reqs, K=3, n_sched=4 each → positions flat length 8. req0 rejected 1
     # draft, req1 rejected none; seq_lens/positions advanced optimistically.
@@ -90,6 +94,7 @@ def test_subtract_num_rejected_tokens(device):
     assert new_pos.tolist() == [5, 6, 7, 8, 16, 17, 18, 19]
 
 
+@pytest.mark.tpu_test
 def test_subtract_num_rejected_tokens_skips_invalid(device):
     # A -1 index leaves the slot unchanged (e.g. a new request with no prior
     # spec step).
@@ -107,6 +112,7 @@ def test_subtract_num_rejected_tokens_skips_invalid(device):
     assert new_pos.tolist() == [5, 4]
 
 
+@pytest.mark.tpu_test
 def test_extract_draft_token_ids(device):
     input_ids = torch.tensor(
         [10, 11, 12, 13, 14, 15, 16, 17], dtype=torch.int32, device=device
@@ -124,6 +130,7 @@ def test_extract_draft_token_ids(device):
     assert torch.equal(out, expected)
 
 
+@pytest.mark.tpu_test
 def test_compute_num_rejected(device):
     # K=3. req0: 3 accepted + bonus (4 valid) -> 0 rejected; req1: 1 accepted +
     # bonus (2 valid) -> 2; req2: bonus only (1 valid) -> 3.
@@ -139,6 +146,7 @@ def test_compute_num_rejected(device):
     assert out.tolist() == [0, 2, 3]
 
 
+@pytest.mark.tpu_test
 def test_compute_num_rejected_variable_draft(device):
     # Mixed scheduled draft counts (near max-model-len). req0 K=3 all accepted
     # -> 0; req1 K=1, draft rejected (1 valid = bonus only) -> 1.

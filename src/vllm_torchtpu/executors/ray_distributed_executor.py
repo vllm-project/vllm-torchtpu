@@ -109,7 +109,8 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
 
         assert self.uses_ray
         self._initialize_ray_cluster()
-        placement_group = self.parallel_config.placement_group
+        # _initialize_ray_cluster() sets the placement group.
+        placement_group = cast(PlacementGroup, self.parallel_config.placement_group)
 
         # Disable Ray usage stats collection. Ray accepts exactly "0" or "1"
         # here and raises on anything else (ray/_common/usage/usage_lib.py),

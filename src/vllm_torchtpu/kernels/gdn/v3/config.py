@@ -14,7 +14,7 @@
 
 import dataclasses
 import enum
-from typing import Any
+from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -215,7 +215,10 @@ class GDNConfig:
         suffix = f"_w{self.window_size}" if self.window_size > 1 else ""
         if self.is_kda and self.gate_lower_bound is not None:
             suffix += "_bounded"
-        return f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}{suffix}"
+        return (
+            f"fused_conv1d_{self.attention_mode.value}_{self.mode.value}"
+            f"_b{self.seq_tile_size}_c{self.chunk_size}{suffix}"
+        )
 
     def get_metadata(self) -> dict[str, str | int | float]:
         cfgs_dict = dataclasses.asdict(self)
@@ -235,19 +238,18 @@ class GDNConfig:
 
     # Fraction of VMEM the kernel may use. A multi-token window holds one
     # state checkpoint per position in VMEM, so for large-head models the
-    # default 0.7 budget is not enough; those get a higher limit and the
+    # default 0.80 budget is not enough; those get a higher limit and the
     # wrapper sizes the tile against the same factor.
-    DEFAULT_VMEM_FRACTION = 0.7
-    WINDOWED_VMEM_FRACTION = 0.9
+    DEFAULT_VMEM_FRACTION: ClassVar[float] = 0.80
+    WINDOWED_VMEM_FRACTION: ClassVar[float] = 0.90
 
-    def get_vmem_limit_bytes(self) -> int:
-        tpu_info = pltpu.get_tpu_info()
+    @classmethod
+    def get_vmem_limit_bytes(cls, window_size: int = 1) -> int:
+        """Returns the VMEM limit for a kernel keeping window_size checkpoints."""
         fraction = (
-            self.WINDOWED_VMEM_FRACTION
-            if self.window_size > 1
-            else self.DEFAULT_VMEM_FRACTION
+            cls.WINDOWED_VMEM_FRACTION if window_size > 1 else cls.DEFAULT_VMEM_FRACTION
         )
-        return int(fraction * tpu_info.vmem_capacity_bytes)
+        return int(fraction * pltpu.get_tpu_info().vmem_capacity_bytes)
 
     def get_scratch_shape_dict(self) -> dict[str, Any]:
         conv_shape = (self.seq_tile_size, self.prev_kernel_size, 1, self.dim_size)

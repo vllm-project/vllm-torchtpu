@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Unit tests for ZmqShmKvConnectorBase and its module-level helpers.
 
 Validates the KV-transfer coordination protocol, shared-memory staging
@@ -482,7 +495,7 @@ def _send_entry(conn, uuid=7, req_id="r0", slot_idx=0, num_blocks=2, ttl=60.0):
         req_id=req_id,
         slot_idx=slot_idx,
         num_blocks=num_blocks,
-        expiration_time=time.perf_counter() + ttl,
+        expiration_time=time.time() + ttl,
         tp_size=conn.tp_size,
     )
     conn._coord_send[uuid] = entry
@@ -916,9 +929,7 @@ class TestCoordSetup:
             patch.object(conn, "_pool_attach", side_effect=FileNotFoundError("shm")),
             patch(
                 f"{_BASE}.time",
-                new=_ModuleStub(
-                    time, sleep=lambda _s: None, perf_counter=lambda: next(clock)
-                ),
+                new=_ModuleStub(time, sleep=lambda _s: None, time=lambda: next(clock)),
             ),
             pytest.raises(RuntimeError, match="could not attach"),
         ):
@@ -1158,7 +1169,7 @@ class TestHandleNewSend:
         conn = _attach_runner(_make_conn(tp_size=2))
         conn._coord_rank_to_identity = {1: b"r1"}
         meta = SendMeta(
-            uuid=42, local_block_ids=[0, 1, 2], expiration_time=time.perf_counter() + 30
+            uuid=42, local_block_ids=[0, 1, 2], expiration_time=time.time() + 30
         )
         conn._coord_rank0_handle_new_send("req-a", meta)
         entry = conn._coord_send[42]
@@ -2224,7 +2235,7 @@ class TestBuildPullResponse:
         entry.staged_events[0].set()
         with patch(f"{_BASE}.dist_utils.get_p2p_wait_pull_timeout", return_value=1):
             conn._coord_rank0_build_pull_response(7, b"7", 0, [0])
-        assert entry.expiration_time > time.perf_counter()
+        assert entry.expiration_time > time.time()
 
     def test_stage_timeout_returns_none(self):
         conn = _attach_runner(_make_conn())
@@ -2302,6 +2313,53 @@ class TestExpireLoop:
         assert conn._coord_done_sending == {"r7"}
         assert conn._coord_pool.released == [1]
         assert 7 not in conn._coord_send
+
+    def test_cross_host_send_does_not_expire_under_perf_counter_skew(self):
+        from vllm.v1.request import RequestStatus
+
+        from vllm_torchtpu.distributed.kv_transfer import tpu_connector as tc
+
+        conn = _attach_runner(_make_conn())
+        cfg = _make_vllm_config(is_producer=True, block_size=16)
+        cfg.parallel_config.tensor_parallel_size = 1
+        with (
+            patch.object(tc.dist_utils, "get_host_ip", return_value="10.0.0.1"),
+            patch.object(tc.dist_utils, "get_kv_transfer_port", return_value="9100"),
+            patch.object(tc.dist_utils, "get_side_channel_port", return_value="9600"),
+        ):
+            scheduler = tc.TPUConnectorScheduler(cfg)
+
+        req = MagicMock()
+        req.request_id = "r7"
+        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+        req.num_computed_tokens = 32
+
+        host_a_clock = _ModuleStub(
+            time,
+            perf_counter=lambda: 100.0,
+            time=lambda: 1_700_000_000.0,
+        )
+        host_b_clock = _ModuleStub(
+            time,
+            perf_counter=lambda: 604_800.0,
+            time=lambda: 1_700_000_001.0,
+        )
+        with (
+            patch.object(tc, "time", host_a_clock),
+            patch.object(tc, "get_uuid", return_value=7),
+            patch.object(tc.dist_utils, "get_p2p_wait_pull_timeout", return_value=30.0),
+        ):
+            delay, _ = scheduler.request_finished(req, [0, 1])
+            assert delay
+            meta = scheduler.build_connector_meta()
+
+        conn._stop_event = _ScriptedEvent([False])
+        with patch(f"{_BASE}.time", new=host_b_clock):
+            conn._coord_rank0_handle_new_send("r7", meta.reqs_to_send["r7"])
+            conn._coord_rank0_expire_loop()
+        assert 7 in conn._coord_send
+        assert conn._coord_pool.released == []
+        assert conn._coord_done_sending == set()
 
     def test_acked_entries_are_left_for_get_finished(self):
         conn = _attach_runner(_make_conn())
@@ -2402,7 +2460,7 @@ class TestCoordinatorWorkerHandoff:
         coord._coord_rank_to_identity = {1: b"tpu_rank_1"}
 
         meta = SendMeta(
-            uuid=42, local_block_ids=[0, 1], expiration_time=time.perf_counter() + 30
+            uuid=42, local_block_ids=[0, 1], expiration_time=time.time() + 30
         )
         coord._coord_rank0_handle_new_send("req-a", meta)
 

@@ -20,6 +20,51 @@ BUILDKITE_DIR=".buildkite"
 MODEL_LIST_KEY="model-list"
 FEATURE_LIST_KEY="feature-list"
 
+# --kube uploads the same steps for the Kueue fleet (pipeline_verify_kube.yml).
+KUBE="false"
+if [[ "${1:-}" == "--kube" ]]; then
+  KUBE="true"
+fi
+
+# On the Kueue fleet a TPU step runs through the launcher: it needs the kube
+# queue, the agent pod template that carries the launcher, and its pod shape in
+# SHAPE in place of run_in_docker.sh. Steps on the cpu queue - the placeholders
+# and the record steps - pass through unchanged. Reads YAML step fragments on
+# stdin; $1 and $2 are the shapes for TPU_QUEUE_MULTI and TPU_QUEUE_SINGLE.
+kube_steps() {
+  if [[ "${KUBE}" != "true" ]]; then
+    cat
+    return
+  fi
+  python3 -c "$(cat <<'PY'
+import re
+import sys
+
+shapes = {"MULTI": sys.argv[1], "SINGLE": sys.argv[2]}
+queue = re.compile(
+    r'^(?P<indent>[ \t]*)queue: "\$\{TPU_QUEUE_(?P<kind>MULTI|SINGLE)[^"]*\}"[ \t]*$', re.M)
+out = []
+for step in re.split(r"(?m)^(?=[ \t]*- label:)", sys.stdin.read()):
+    m = queue.search(step)
+    if m:
+        indent = m["indent"]
+        top = indent[:-2]
+        step = step.replace(m.group(0), "\n".join([
+            f'{indent}queue: "kube"',
+            f"{top}plugins:",
+            f"{top}  - kubernetes:",
+            f"{top}      podTemplate: tpu-launcher",
+        ]), 1)
+        step = step.replace(
+            ".buildkite/scripts/run_in_docker.sh",
+            f"SHAPE={shapes[m['kind']]} .buildkite/kubernetes/run.sh")
+        step = re.sub(r'(- label: ")', r"\1:kubernetes: ", step, count=1)
+    out.append(step)
+sys.stdout.write("".join(out))
+PY
+)" "$1" "$2"
+}
+
 if [[ ! "${JOB_PRIORITY:-1}" =~ ^-?[0-9]+$ ]]; then
   echo "ERROR: JOB_PRIORITY must be an integer, got: '${JOB_PRIORITY:-}'"
   exit 1
@@ -78,7 +123,9 @@ for folder_path in "${TARGET_FOLDERS[@]}"; do
   while IFS= read -r -d '' yml_file; do
     echo "--- handling yml file: ${yml_file}"
 
-    # Use the first occurrence of CI_TARGET as the subject name
+    # Use the first occurrence of CI_TARGET as the subject name. Reset per
+    # file: one without CI_TARGET must not inherit the previous file's.
+    subject_name=""
     subject_name_line=$(grep -m 1 "^[[:space:]]*CI_TARGET:" "${yml_file}" || true)
 
     if [[ -n "$subject_name_line" ]]; then
@@ -142,7 +189,8 @@ if [[ "${#pipeline_v6e_fragments[@]}" -gt 0 ]]; then
     echo "    key: \"v6e-group\""
     echo "    depends_on: \"build_docker\""
     echo "    steps:"
-    printf "%s\n" "${pipeline_v6e_fragments[@]}" | sed 's/^/      /'
+    printf "%s\n" "${pipeline_v6e_fragments[@]}" |
+      kube_steps "ct6e-standard-8t/2x4" "ct6e-standard-1t/1x1" | sed 's/^/      /'
   } | buildkite-agent pipeline upload
 else
   echo "--- No .yml files found, nothing to upload."
@@ -165,7 +213,8 @@ if [[ "${#pipeline_v7x_fragments[@]}" -gt 0 ]]; then
     echo "    key: \"v7x-group\""
     echo "    depends_on: \"build_docker\""
     echo "    steps:"
-    printf "%s\n" "${pipeline_v7x_fragments[@]}" | sed 's/^/      /'
+    printf "%s\n" "${pipeline_v7x_fragments[@]}" |
+      kube_steps "tpu7x-standard-4t/2x2x1" "tpu7x-standard-1t/1x1x1" | sed 's/^/      /'
   } | buildkite-agent pipeline upload
 else
   echo "--- No .yml files found, nothing to upload."

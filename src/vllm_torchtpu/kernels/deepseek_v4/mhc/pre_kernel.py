@@ -13,6 +13,7 @@
 # limitations under the License.
 
 import functools
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -158,7 +159,7 @@ def mhc_pre_mixes(
         compiler_params=compiler_params,
     )(x2d, fn_hi, fn_mid, fn_lo)
 
-    return utils.trim_to(num_tokens, mixes, sqrsum)
+    return cast(tuple[jax.Array, jax.Array], utils.trim_to(num_tokens, mixes, sqrsum))
 
 
 @functools.partial(
@@ -250,7 +251,10 @@ def mhc_pre_mixes_collapse(
         compiler_params=compiler_params,
     )(x2d, fn_hi, fn_mid, fn_lo, sc2d, hb2d)
 
-    return utils.trim_to(num_tokens, mixes, sqrsum, layer2d)
+    return cast(
+        tuple[jax.Array, jax.Array, jax.Array],
+        utils.trim_to(num_tokens, mixes, sqrsum, layer2d),
+    )
 
 
 def mhc_pre(

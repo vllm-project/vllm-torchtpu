@@ -235,12 +235,9 @@ def test_mesh_expert_order_is_closed_into_the_built_op():
     assert seen and seen[0][_MESH_ORDER_ARG] == order
 
 
-def test_mesh_expert_order_is_none_when_the_mesh_is_rank_ordered():
-    """The permutation exists only to undo a mesh ordered by device id.
-
-    Since google-pytorch/torch_tpu#3522 `build_ep_mesh` orders by rank, so mesh
-    index i holds EP rank i's experts and the op must be handed nothing.
-    """
+def test_mesh_expert_order_is_none_when_ranks_follow_device_ids():
+    """The permutation exists only to undo a mesh ordered by device id; where
+    EP rank order already is device order the op must be handed nothing."""
     seen = []
     assert (
         _prebuild(
@@ -251,15 +248,6 @@ def test_mesh_expert_order_is_none_when_the_mesh_is_rank_ordered():
         == "op"
     )
     assert seen and seen[0][_MESH_ORDER_ARG] is None
-
-
-def test_ep_rank_order_is_the_identity():
-    """It no longer depends on how the group's ranks are arranged."""
-    from vllm_torchtpu.distributed import ep_mesh
-
-    group = SimpleNamespace(ranks=[3, 1, 2, 0])
-    with patch.object(ep_mesh, "get_ep_group", return_value=group):
-        assert ep_mesh.ep_rank_order() == (0, 1, 2, 3)
 
 
 def test_ep_rank_order_is_none_without_a_group():
@@ -372,11 +360,63 @@ def test_refused_on_routing_the_kernel_does_not_implement(routing):
     assert _prebuild(_layer(**routing)) is None
 
 
-def test_refused_while_the_routing_simulator_is_on():
+def test_refused_while_a_non_uniform_routing_simulator_is_on():
     from vllm_torchtpu.layers.adapter import moe_routing
 
-    with patch.object(moe_routing, "_SIMULATION_STRATEGY", object()):
+    with (
+        patch.object(moe_routing, "_SIMULATION_STRATEGY", object()),
+        patch.object(moe_routing, "_strategy_name", "normal_routing"),
+    ):
         assert _prebuild(_layer()) is None
+
+
+def test_arms_under_uniform_random_routing_simulation():
+    """uniform_random is honoured in-op (`_simulated_routing_operands`)."""
+    from vllm_torchtpu.layers.adapter import moe_routing
+
+    with (
+        patch.object(moe_routing, "_SIMULATION_STRATEGY", object()),
+        patch.object(moe_routing, "_strategy_name", moe_routing._UNIFORM_RANDOM),
+    ):
+        assert _prebuild(_layer()) == "op"
+
+
+def test_simulated_routing_operands_are_untouched_without_a_simulator():
+    from vllm_torchtpu.layers.adapter import moe_routing
+
+    logits = torch.randn(4, 8, dtype=torch.bfloat16)
+    bias = torch.randn(8)
+    ids = torch.zeros(4, 2, dtype=torch.int32)
+    with patch.object(moe_routing, "_SIMULATION_STRATEGY", None):
+        got = bridge._simulated_routing_operands(logits, bias, ids)
+    assert got[0] is logits and got[1] is bias and got[2] is ids
+
+
+def test_simulated_routing_operands_draw_uniform_experts():
+    from vllm_torchtpu.layers.adapter import moe_routing
+
+    tokens, experts, topk = 8192, 64, 4
+    logits = torch.randn(tokens, experts, dtype=torch.bfloat16)
+    bias = torch.randn(experts)
+    ids = torch.zeros(tokens, topk, dtype=torch.int32)
+    with (
+        patch.object(moe_routing, "_SIMULATION_STRATEGY", object()),
+        patch.object(moe_routing, "_strategy_name", moe_routing._UNIFORM_RANDOM),
+    ):
+        gating, zero_bias, sim_ids = bridge._simulated_routing_operands(
+            logits, bias, ids
+        )
+    # f32 noise: bf16 would tie and bias top-k toward low expert ids.
+    assert gating.dtype == torch.float32 and gating.shape == logits.shape
+    assert torch.equal(zero_bias, torch.zeros_like(bias))
+    assert sim_ids.dtype == torch.int32 and sim_ids.shape == ids.shape
+    # Hash ids are the noise's own top-k: distinct per token, in range.
+    assert torch.equal(sim_ids, torch.topk(gating, k=topk, dim=-1).indices.int())
+    assert int(sim_ids.min()) >= 0 and int(sim_ids.max()) < experts
+    assert all(len(set(row)) == topk for row in sim_ids.tolist())
+    # Uniform: every expert's load is near tokens * topk / experts (512 here).
+    load = torch.bincount(sim_ids.flatten().long(), minlength=experts).float()
+    assert float(load.max() / load.mean()) < 1.25
 
 
 def test_arming_is_per_layer_not_per_process():
@@ -458,6 +498,74 @@ def test_forward_passes_router_logits_without_a_full_expert_gather():
     assert seen[0][5] is logits
 
 
+def test_forward_masks_padded_router_logits_when_enabled(monkeypatch):
+    """Padded rows of router_logits become NaN when TPU_MOE_SKIP_PADDED_TOKENS=1."""
+    from vllm_torchtpu.layers.adapter import token_padding
+
+    seen = []
+    owner = SimpleNamespace()
+    setattr(
+        owner, bridge.FUSED_MOE_EP_OP_ATTR, lambda *args: seen.append(args) or args[0]
+    )
+    hidden = torch.zeros(4, 8)
+    weights = torch.empty(0)
+    scales = torch.ones(1, 1)
+    logits = torch.ones(4, 8, dtype=torch.float32)
+    state = token_padding.TokenPaddingState(
+        local_padding_mask=torch.tensor([False, True, False, True])
+    )
+    token_padding.set_padding_state(state)
+    try:
+        monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", False)
+        bridge.fused_moe_ep(owner, hidden, weights, weights, scales, scales, logits)
+        assert seen[-1][5] is logits
+
+        monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", True)
+        bridge.fused_moe_ep(owner, hidden, weights, weights, scales, scales, logits)
+        masked = seen[-1][5]
+        assert torch.equal(masked[0], logits[0])
+        assert torch.isnan(masked[1]).all()
+        assert torch.equal(masked[2], logits[2])
+        assert torch.isnan(masked[3]).all()
+    finally:
+        token_padding.set_padding_state(None)
+
+
+def test_forward_masks_padding_after_uniform_random_simulation(monkeypatch):
+    """Padded rows stay NaN and real rows finite under uniform_random.
+
+    Masking first would put NaN into the simulation's mean anchor and so into
+    every row, leaving every token unrouted.
+    """
+    from vllm_torchtpu.layers.adapter import moe_routing, token_padding
+
+    seen = []
+    owner = SimpleNamespace()
+    setattr(
+        owner, bridge.FUSED_MOE_EP_OP_ATTR, lambda *args: seen.append(args) or args[0]
+    )
+    hidden = torch.zeros(4, 8)
+    weights = torch.empty(0)
+    scales = torch.ones(1, 1)
+    logits = torch.ones(4, 8, dtype=torch.bfloat16)
+    monkeypatch.setattr(envs, "TPU_MOE_SKIP_PADDED_TOKENS", True)
+    monkeypatch.setattr(moe_routing, "_SIMULATION_STRATEGY", object())
+    monkeypatch.setattr(moe_routing, "_strategy_name", moe_routing._UNIFORM_RANDOM)
+    token_padding.set_padding_state(
+        token_padding.TokenPaddingState(
+            local_padding_mask=torch.tensor([False, True, False, True])
+        )
+    )
+    try:
+        bridge.fused_moe_ep(owner, hidden, weights, weights, scales, scales, logits)
+    finally:
+        token_padding.set_padding_state(None)
+    gating = seen[-1][5]
+    assert gating.dtype == torch.float32
+    assert torch.isfinite(gating[[0, 2]]).all()
+    assert torch.isnan(gating[[1, 3]]).all()
+
+
 @pytest.mark.parametrize(
     "order,expected",
     [
@@ -470,25 +578,23 @@ def test_mesh_expert_order(order, expected):
         assert bridge._mesh_expert_order(len(order)) == expected
 
 
-def test_ep_rank_order_does_not_depend_on_where_the_devices_sit():
-    """It used to undo a mesh ordered by device id.
-
-    google-pytorch/torch_tpu#3522 binds partition p to rank p and
-    `build_ep_mesh` orders by rank to match, so mesh index i holds EP rank i's
-    experts whatever the chips underneath are doing.
-    """
+def test_ep_rank_order_maps_ranks_to_ascending_device_ids():
+    """The mesh is in ascending device-id order (the rank-ordered one makes the
+    fused MoE's all-gathers slow), so this is what says which rank sits where."""
     from vllm_torchtpu.distributed import ep_mesh
 
+    # EP ranks 0..7 on a tpu7x host's device ids. Sorted ascending, rank r ends
+    # up at the position of its device id.
+    device_ids = (0, 1, 4, 5, 6, 7, 2, 3)
     group = SimpleNamespace(ranks=list(range(8)), world_size=8)
-    orders = []
-    for device_ids in ((0, 1, 4, 5, 6, 7, 2, 3), (0, 1, 2, 3, 4, 5, 6, 7)):
-        with (
-            patch.object(ep_mesh, "get_ep_group", return_value=group),
-            patch.object(ep_mesh, "ep_device_ids", return_value=device_ids),
-        ):
-            orders.append(ep_mesh.ep_rank_order())
+    with (
+        patch.object(ep_mesh, "get_ep_group", return_value=group),
+        patch.object(ep_mesh, "ep_device_ids", return_value=device_ids),
+    ):
+        order = ep_mesh.ep_rank_order()
 
-    assert orders[0] == orders[1] == tuple(range(8))
+    assert order == tuple(rank for _, rank in sorted(zip(device_ids, range(8))))
+    assert order == (0, 1, 6, 7, 2, 3, 4, 5)
 
 
 def test_supports_internal_mk_tracks_both_owners():
@@ -1076,3 +1182,29 @@ def test_pcp_size_reads_the_layer_parallel_config():
     assert bridge._pcp_size(layer) == 1
     layer.moe_config.moe_parallel_config.pcp_size = 4
     assert bridge._pcp_size(layer) == 4
+
+
+def test_fused_scale_buffers_are_fresh_bases_aliased_by_the_parameters():
+    # A view graph input costs a materializing program per step on torch_tpu,
+    # so the kernel's tables must be base tensors, bit-identical to the
+    # squeezed loader tables, and the 4-D parameters must not hold a 2nd copy.
+    layer = torch.nn.Module()
+    w13 = torch.rand(3, 4, 1, 256)
+    w2 = torch.rand(3, 2, 1, 128)
+    layer.w13_weight_scale = torch.nn.Parameter(w13.clone(), requires_grad=False)
+    layer.w2_weight_scale = torch.nn.Parameter(w2.clone(), requires_grad=False)
+    loaded = {
+        p: getattr(layer, p).data_ptr() for p in ("w13_weight_scale", "w2_weight_scale")
+    }
+    bridge.register_fused_scale_buffers(layer)
+    for param, buf, ref in (
+        ("w13_weight_scale", "_tpu_fused_w13_scale", w13),
+        ("w2_weight_scale", "_tpu_fused_w2_scale", w2),
+    ):
+        table, weight = getattr(layer, buf), getattr(layer, param)
+        assert table._base is None and table.is_contiguous()
+        assert table.data_ptr() != loaded[param]
+        assert torch.equal(table.view(torch.int32), ref.squeeze(2).view(torch.int32))
+        assert buf in dict(layer.named_buffers())
+        assert isinstance(weight, torch.nn.Parameter) and not weight.requires_grad
+        assert weight.shape == ref.shape and weight.data_ptr() == table.data_ptr()

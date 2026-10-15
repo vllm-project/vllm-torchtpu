@@ -31,6 +31,7 @@ from unittest import mock
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import parameterized
 
 from vllm_torchtpu import envs
@@ -142,6 +143,7 @@ def _causal_topk(positions: list[int], topk: int) -> np.ndarray:
     return rows
 
 
+@pytest.mark.tpu_test
 class SparseMlaAttentionTest(parameterized.TestCase):
     def setUp(self):
         super().setUp()
@@ -551,6 +553,7 @@ class SparseMlaAttentionTest(parameterized.TestCase):
         self._check(output, expected, valid)
 
 
+@pytest.mark.tpu_test
 class SparseMlaAttentionDcpValidationTest(parameterized.TestCase):
     """Argument checks in `sparse_mla_attention_dcp`, the decode-context-
     parallel (DCP) variant where the KV cache is split across several chips.
@@ -772,6 +775,7 @@ ROUTE_COMPOSITIONS = (
 )
 
 
+@pytest.mark.tpu_test
 class MaskedDenseDispatchTest(parameterized.TestCase):
     """End to end: every route computes the same attention as sparse.
 

@@ -5,12 +5,14 @@ import dataclasses
 import functools
 import inspect
 import math
-from typing import Any, ClassVar
+from collections.abc import Callable
+from typing import Any, ClassVar, cast
 
 import jax
 import torch
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
+from vllm.compilation import backends as vllm_compilation_backends
 from vllm.config import (
     VllmConfig,
     get_current_vllm_config,
@@ -23,10 +25,11 @@ from vllm.v1.attention.backend import (
     AttentionLayer,
     AttentionType,
     MLAAttentionImpl,
+    MultipleOf,
 )
 from vllm.v1.attention.backends.mla.indexer import DeepseekV32IndexerBackend
 from vllm.v1.attention.backends.registry import AttentionBackendEnum, register_backend
-from vllm.v1.kv_cache_interface import AttentionSpec
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout as VllmKVCacheLayout
 
 import vllm_torchtpu.kernels.experimental.batched_rpa.wrapper as rpa_batched_wrapper
@@ -39,7 +42,13 @@ from vllm_torchtpu.block_major_pool import (
 )
 from vllm_torchtpu.distributed.dcp import get_dcp_group as _get_dcp_group
 from vllm_torchtpu.distributed.dcp import get_or_create_dcp_mesh
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import DCP_AXIS_NAME
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    DCP_AXIS_NAME,
+    indexer_kv_layout,
+)
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    get_kv_cache_shape as _get_indexer_kv_cache_shape,
+)
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs as batched_rpa_configs,
 )
@@ -58,6 +67,7 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     SparseMLAKVCacheSpec,
 )
 from vllm_torchtpu.kernels.mla.v2 import kernel as mla_v2_kernel
+from vllm_torchtpu.layers.adapter import cp_mla_attention as _cp_mla_attention
 from vllm_torchtpu.layers.adapter.cp_attention import (
     build_dcp_kernels as _build_dcp_kernels,
 )
@@ -66,6 +76,7 @@ from vllm_torchtpu.layers.adapter.cp_attention import (
 )
 from vllm_torchtpu.layers.adapter.cp_mla_attention import (
     all_gather_heads,
+    all_gather_q_nope_pe_heads,
     merge_lse_partials_scatter_heads,
 )
 from vllm_torchtpu.layers.core.attention_interface import (
@@ -161,7 +172,7 @@ def get_dtype_packing(dtype: torch.dtype, packing_bits: int = 32) -> int:
 
 
 # HND is SEQ_ALONG_LANE: head_dim, not KV heads, fills the 32-bit words, so an
-# fp8 page is genuinely half a bf16 one (b/510425663).
+# fp8 page is genuinely half a bf16 one.
 KV_LAYOUT_BY_VLLM_LAYOUT: dict[VllmKVCacheLayout, batched_rpa_configs.KVLayout] = {
     VllmKVCacheLayout.LBNHC: batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
     VllmKVCacheLayout.BLNHC: batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
@@ -230,6 +241,7 @@ def _pallas_rpa_kernel_impl(
     # zero-copy bitcasts on the donated buffer, preserving in-place updates.
     if block_major:
         kv_cache = kernel_view(kv_cache)
+    packed_pool_shape = None
     if kv_cache.ndim == 4:
         if (
             kv_layout is batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
@@ -293,6 +305,8 @@ def _pallas_rpa_kernel_impl(
         kv_layout=kv_layout,
     )
     if len(pool_shape) == 4:
+        # A 4-D pool is never block-major, so the ndim == 4 branch set this.
+        assert packed_pool_shape is not None
         new_kv_cache = _reshape_packed_kv_cache(
             new_kv_cache, packed_pool_shape
         ).reshape(pool_shape)
@@ -663,7 +677,14 @@ class PallasAttentionBackend(AttentionBackend):
     @staticmethod
     def get_max_num_seqs(model_len: int, page_size: int) -> int:
         num_page_per_req = cdiv(model_len, page_size)
-        return 1024 * 1024 // 2 // num_page_per_req // 4
+        return PallasAttentionBackend.get_max_num_seqs_for_pages(num_page_per_req)
+
+    @staticmethod
+    def get_max_num_seqs_for_pages(pages_per_req: int) -> int:
+        """Budget the page table actually prefetched into SMEM."""
+        if pages_per_req <= 0:
+            raise ValueError("pages_per_req must be positive")
+        return 1024 * 1024 // 2 // pages_per_req // 4
 
     # TPU has limited SREGs (scalar registers), if page_size is too small, we
     # can spill SREGs easily which leads to bad performance. The strategy we
@@ -755,7 +776,9 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
         )
 
     @staticmethod
-    def get_supported_kernel_block_sizes():
+    def get_supported_kernel_block_sizes(
+        kv_cache_spec: KVCacheSpec | None = None,
+    ) -> list[int | MultipleOf]:
         if (
             get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
             is VllmKVCacheLayout.LBHNC
@@ -776,7 +799,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
     # Each Impl subclass points at its own RPA kernel entry function. Wrapped
     # with `staticmethod` so attribute access through `self` doesn't bind it
     # as a method. Subclasses override this to select a different kernel.
-    _kernel_entry: ClassVar = staticmethod(_pallas_rpa_kernel_default)
+    _kernel_entry: ClassVar[Callable[..., tuple[jax.Array, jax.Array]]] = staticmethod(
+        _pallas_rpa_kernel_default
+    )
     _kernel_op_prefix: ClassVar[str] = "pallas::rpa_kernel"
     decode_query_size: int = 1
 
@@ -901,7 +926,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         block_major: bool = False,
     ):
         ctx = get_vllm_model_wrapper_context()
-        vllm_config = ctx.vllm_config
+        vllm_config = cast("VllmConfig | None", ctx.vllm_config)
         max_model_len = (
             vllm_config.model_config.max_model_len
             if use_pcp_streaming and vllm_config is not None
@@ -972,6 +997,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         kernel_instance_id = self._allocate_kernel_instance_id()
         op_name = f"{self._kernel_op_prefix}_{kernel_instance_id}"
 
+        pcp_make_kwargs: dict[str, Any] = {}
         if use_pcp_streaming:
             pcp_make_kwargs = dict(
                 mesh=mesh,
@@ -989,7 +1015,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             wrapped_fn = make_pcp_streaming_rpa_kernel(**pcp_make_kwargs)
         else:
             entry_params = inspect.signature(self._kernel_entry).parameters
-            entry_kwargs = {}
+            entry_kwargs: dict[str, Any] = {}
             if "kv_layout" in entry_params:
                 entry_kwargs["kv_layout"] = self.kv_layout
             elif self._pool_is_seq_along_lane:
@@ -1305,7 +1331,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
         # cache aliasing for how the shared cache tensor is set up.
         skip_kv_update = self.kv_sharing_target_layer_name is not None
         ctx = get_vllm_model_wrapper_context()
-        vllm_config = ctx.vllm_config
+        vllm_config = cast("VllmConfig | None", ctx.vllm_config)
         parallel_config = None if vllm_config is None else vllm_config.parallel_config
         pcp_configured = (
             parallel_config is not None
@@ -1478,13 +1504,15 @@ class PallasAttentionBackendImpl(AttentionImpl):
             v_scale_value = layer._v_scale_float
             if k_scale_value == 0.0 or v_scale_value == 0.0:
                 raise ValueError("k_scale_float and v_scale_float must be non-zero")
-            key, value = quantize_kv(
+            key, quantized_value = quantize_kv(
                 self.kv_cache_quantized_dtype, key, value, k_scale_value, v_scale_value
             )
+            assert quantized_value is not None
+            value = quantized_value
 
         sink = self.sinks
         ctx = get_vllm_model_wrapper_context()
-        vllm_config = ctx.vllm_config
+        vllm_config = cast("VllmConfig | None", ctx.vllm_config)
         parallel_config = None if vllm_config is None else vllm_config.parallel_config
 
         if self.dcp_world_size > 1:
@@ -1515,11 +1543,11 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 "the PCP streaming sequence layout."
             )
         skip_kv_update = self.kv_sharing_target_layer_name is not None
+        cp_kv_cache_interleave_size = 0
         if use_pcp_streaming:
             self._validate_pcp_streaming_support(skip_kv_update)
-        cp_kv_cache_interleave_size = (
-            parallel_config.cp_kv_cache_interleave_size if use_pcp_streaming else 0
-        )
+            assert parallel_config is not None
+            cp_kv_cache_interleave_size = parallel_config.cp_kv_cache_interleave_size
         rpa_kernel = self._build_rpa_kernel(
             None,
             layer._k_scale_float if self.kv_cache_quantized_dtype else None,
@@ -1546,6 +1574,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
                     "VLLM_TPU_BLOCK_MAJOR_KV=1: the bundled RPA path does "
                     "not support PCP streaming or KV sharing"
                 )
+            assert self.rpa_kernel_bundled is not None
             outputs = self.rpa_kernel_bundled(
                 ctx.kv_cache_bundle,
                 self._bundle_layer_idx_tensor,
@@ -1559,8 +1588,9 @@ class PallasAttentionBackendImpl(AttentionImpl):
                 sink,
             )
         else:
-            block_tables = attn_metadata.block_tables
+            block_tables = cast(torch.Tensor, attn_metadata.block_tables)
             if self._bm_kernel:
+                assert self._bm_region is not None
                 pool_index, layout = self._bm_region
                 block_tables = flat_kernel_ids(
                     block_tables, pool_index, layout.num_pools, layout.split
@@ -1804,9 +1834,10 @@ class PallasMLAttentionBackend(AttentionBackend):
 class VllmTPUDeepseekV32IndexerBackend(DeepseekV32IndexerBackend):
     """Indexer backend for TPU.
 
-    The TPU materializer retains the native 3-D indexer K cache shape
-    `(num_blocks, block_size, head_size)` consumed by streamindex. vLLM 0.29
-    no longer owns this backend shape hook.
+    Sizes and allocates the 4-D packed `uint8` indexer K cache in either
+    `HEAD_ALONG_SUBLANE` (`(num_blocks, block_size // 4, 4, 256)`, 256 B/token)
+    or `SEQ_ALONG_LANE` (`(num_blocks, 33, 4, block_size)`, 132 B/token) layout,
+    decided once via `indexer_kv_layout(block_size)`.
 
     The page size hooks below delegate to `PallasMLAttentionBackend`. They are
     not the indexer's own page size: `cache_config.block_size` is global across
@@ -1826,7 +1857,47 @@ class VllmTPUDeepseekV32IndexerBackend(DeepseekV32IndexerBackend):
         head_size: int,
         cache_dtype_str: str | torch.dtype = "auto",
     ) -> tuple[int, ...]:
-        return (num_blocks, block_size, head_size)
+        del num_kv_heads, cache_dtype_str
+        kv_layout = indexer_kv_layout(block_size)
+        return _get_indexer_kv_cache_shape(
+            total_num_pages=num_blocks,
+            page_size=block_size,
+            actual_head_dim=head_size,
+            kv_layout=kv_layout,
+        )
+
+    @classmethod
+    def get_kv_cache_page_size_bytes(
+        cls,
+        block_size: int,
+        num_kv_heads: int,
+        head_size: int,
+        cache_dtype_str: str | torch.dtype = "auto",
+    ) -> int:
+        dtype = (
+            torch.uint8
+            if isinstance(cache_dtype_str, str)
+            and cache_dtype_str.lower().strip() == "auto"
+            else _resolve_kv_cache_dtype(cache_dtype_str)
+        )
+        shape = cls.get_kv_cache_shape(
+            1,
+            block_size,
+            num_kv_heads,
+            head_size,
+            dtype,
+        )
+        num_elements = functools.reduce(lambda x, y: x * y, shape, 1)
+        return num_elements * torch.empty((), dtype=dtype).element_size()
+
+    @classmethod
+    def customize_spec(cls, spec: AttentionSpec) -> AttentionSpec:
+        page_bytes = cls.get_kv_cache_page_size_bytes(
+            spec.block_size, spec.num_kv_heads, spec.head_size, spec.dtype
+        )
+        return dataclasses.replace(
+            spec, num_head_slots=1, state_content_bytes=page_bytes // spec.block_size
+        )
 
     @classmethod
     def supported_kv_cache_layouts(cls) -> tuple[VllmKVCacheLayout, ...]:
@@ -1891,6 +1962,14 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             parallel_config, "cp_kv_cache_interleave_size", 1
         )
         self._dcp_mesh = None
+
+        if self.dcp_size > 1 and envs.TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER:
+            logger.info_once(
+                "Applied TPU patch: TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER - one "
+                "all-gather of concatenated (q_nope, q_pe) whenever q is "
+                "not replicated and both share a dtype (dcp=%d).",
+                self.dcp_size,
+            )
         if self.dcp_size > 1:
             # The indexer refuses pcp>1 and dcp>1 together (see
             # `VllmTPUSparseAttnIndexer.__init__`)
@@ -1976,7 +2055,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
             )
-            return mla_attention(
+            results = mla_attention(
                 q_nope,
                 q_pe,
                 kv_c_normed,
@@ -1992,6 +2071,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 v_scale=v_scale,
                 use_causal_mask=not self.non_causal_multi_token_decode,
             )
+            # mla_attention returns (kv_cache, out), and more with return_lse.
+            return results[0], results[1]
 
         op_name = f"pallas::mla_attention_{layer.layer_name.replace('.', '_')}"
         mla_jax_op = pallas.jax_op(op_name, mla_attention_core_tpu, donate_argnums=(0,))
@@ -2156,6 +2237,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         )
 
         mesh = self._dcp_mesh
+        # Set in __init__ when dcp_size > 1, the only case that builds this op.
+        assert mesh is not None
 
         k_scale = None
         if layer.kv_cache_quantized_dtype is not None:
@@ -2262,7 +2345,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         q: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         kv_c_normed: torch.Tensor,
         k_pe: torch.Tensor,
-        kv_cache: torch.Tensor,
+        kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor],
         attn_metadata: Any,
         output: torch.Tensor | None = None,
         output_scale: torch.Tensor | None = None,
@@ -2329,6 +2412,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         q_scale, k_scale, v_scale = self._get_kv_scales(layer)
 
         if layer.kv_cache_quantized_dtype is not None:
+            assert k_scale is not None
             kv_c_normed, _ = quantize_kv(
                 layer.kv_cache_quantized_dtype, kv_c_normed, value=None, k_scale=k_scale
             )
@@ -2357,10 +2441,19 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 # KV shard, and the head axis is scattered back after the
                 # merge. Under qrep the group's heads are already local, so
                 # the gather is the identity and is skipped outright.
-                ql_nope_dcp = (
-                    ql_nope_flat if use_qrep else all_gather_heads(ql_nope_flat)
-                )
-                q_pe_dcp = q_pe_flat if use_qrep else all_gather_heads(q_pe_flat)
+                if use_qrep:
+                    ql_nope_dcp, q_pe_dcp = ql_nope_flat, q_pe_flat
+                elif (
+                    envs.TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER
+                    and ql_nope_flat.dtype == q_pe_flat.dtype
+                    and all_gather_heads is _cp_mla_attention.all_gather_heads
+                ):
+                    ql_nope_dcp, q_pe_dcp = all_gather_q_nope_pe_heads(
+                        ql_nope_flat, q_pe_flat, layer.kv_lora_rank
+                    )
+                else:
+                    ql_nope_dcp = all_gather_heads(ql_nope_flat)
+                    q_pe_dcp = all_gather_heads(q_pe_flat)
                 # `topk_indices` here is not global positions: the DCP indexer
                 # already resolved each token's global top-k into this rank's
                 # own local cache indices, `-1` where it owns nothing.
@@ -2377,7 +2470,21 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     attn_metadata.request_distribution,
                 )
                 # The scatter undoes the head all-gather above.
-                outputs = merge_lse_partials_scatter_heads(partial, lse)
+                #
+                # Only the backbone may use the all-to-all merge. The merge
+                # picks it by comparing the token count to
+                # TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS at trace time, and only
+                # the backbone is traced multiple times, once per bucket
+                # group (`_precompile_backbone`). The MTP drafter (model_tag
+                # "eagle_head") is traced once for every bucket: the
+                # comparison would pin its graph to the first size, and the
+                # large buckets fail with ShapeSpecializationError. So the
+                # drafter keeps the reduce-scatter, as with the flag off.
+                outputs = merge_lse_partials_scatter_heads(
+                    partial,
+                    lse,
+                    is_backbone=vllm_compilation_backends.model_tag == "backbone",
+                )
             else:
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:
                     layer.sparse_mla_op = self._build_sparse_mla_op(layer)
@@ -2400,6 +2507,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     layer, q_scale=q_scale, k_scale=k_scale, v_scale=v_scale
                 )
 
+            # Only the sparse path receives a tuple of caches.
+            assert isinstance(kv_cache, torch.Tensor)
             outputs = layer.mla_op(
                 kv_cache,
                 ql_nope_flat,
@@ -2443,6 +2552,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         attn_metadata: AttentionMetadata,
         k_scale: torch.Tensor,
         output: torch.Tensor,
+        # Unused; matches vLLM's forward_mha signature.
+        output_scale: torch.Tensor | None = None,
     ) -> None:
         """Structural no-op. TPU Pallas MLA unifies projection and evaluation
         inside `self.forward`."""

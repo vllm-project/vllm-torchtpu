@@ -18,6 +18,7 @@ expert-parallel mesh axis: quantize, dispatch, kernel, combine.
 """
 
 import threading
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -30,6 +31,8 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     ROWBLK,
     U32_SUBLANE_TILE,
     GatheredPairs,
+    RoutingTables,
+    ShardRoutingTables,
     WeightFormat,
     act_scale_slab_rows,
     align_up,
@@ -75,6 +78,18 @@ def _apply_scoring_fn(logits, scoring_fn):
         return jnp.sqrt(jax.nn.softplus(scores))
     raise NotImplementedError(
         f"the fused EP MoE router scores with {SCORING_FNS}; got {scoring_fn!r}"
+    )
+
+
+def _row_routes(scores, gate_l):
+    """Per-token `[rows, 1]` mask: True iff the row has a finite score and logit.
+
+    `gate_l` is checked too: under sigmoid/sqrtsoftplus a `-inf` logit scores a
+    finite `0`, so replica padding (`token_layout.split(..., fill_value=-jnp.inf)`)
+    would otherwise pass the score check.
+    """
+    return jnp.any(jnp.isfinite(scores), axis=-1, keepdims=True) & jnp.any(
+        jnp.isfinite(gate_l), axis=-1, keepdims=True
     )
 
 
@@ -517,13 +532,16 @@ def fused_ep_moe_v2(
         # a wider accumulator, a reassociating compiler pass, or a different
         # renormalization would silently turn such a row from dropped into
         # routed at full weight to expert zero. Mask it explicitly instead.
-        row_routes = jnp.any(jnp.isfinite(scores), axis=-1, keepdims=True)
+        # gate_l is checked too: under sigmoid/sqrtsoftplus a -inf logit scores
+        # a finite 0, so replica padding would otherwise pass the score check.
+        row_routes = _row_routes(scores, gate_l)
         if renormalize:
             denom = jnp.maximum(topk_weights.sum(axis=-1, keepdims=True), 1e-20)
             topk_weights = topk_weights / jnp.where(row_routes, denom, 1.0)
         if routed_scaling_factor != 1.0:
             topk_weights = topk_weights * jnp.float32(routed_scaling_factor)
         topk_weights = jnp.where(row_routes, topk_weights, 0.0)
+        topk_idx = jnp.where(row_routes, topk_idx, jnp.int32(e_total))
         # A count of the masked rows would be the other half of this: an
         # incident today is degraded output against a completely clean log.
         # It is not added here because the only in-trace channel for it,
@@ -623,7 +641,7 @@ def fused_ep_moe_v2(
         # dropped; nothing reads them, and the slab's own rows are the same
         # either way.
         if form.quantized_activations:
-            scale_bits = jnp.repeat(scale_bits_g, topk)
+            scale_bits = jnp.repeat(cast(jax.Array, scale_bits_g), topk)
             scale_rows = act_scale_slab_rows(ragged_stride)
             scale_slab = lax.bitcast_convert_type(
                 jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
@@ -680,22 +698,29 @@ def fused_ep_moe_v2(
 
         # The destination's own table: one arrival row per selection slot.
         pos = (
-            routing.pos
+            cast(ShardRoutingTables, routing).pos
             if sharded_plan
             else lax.dynamic_slice(
-                routing.arrival_row, (me * t_local, 0), (t_local, topk)
+                cast(RoutingTables, routing).arrival_row,
+                (me * t_local, 0),
+                (t_local, topk),
             )
         )
         mirror_pos = (
-            routing.mirror_pos
+            cast(ShardRoutingTables, routing).mirror_pos
             if sharded_plan
             else lax.dynamic_slice(
-                routing.mirror_row, (me * t_local, 0), (t_local, topk)
+                cast(RoutingTables, routing).mirror_row,
+                (me * t_local, 0),
+                (t_local, topk),
             )
         )
         combined = _combine_arrivals(
             arrivals, arrival_scales, pos, mirror_pos, topk_weights, x_l.dtype
         )
+        # A row that routed nowhere read arrival rows nobody wrote; its weight is
+        # zero, but zero times an unwritten NaN is not.
+        combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
         return token_layout.restore(combined, ax)
 
     # The biases ride the same expert-axis sharding as the weights they
@@ -761,7 +786,7 @@ def fused_ep_moe_v2(
         has_w1_bias and w1_bias.dtype,
         has_w2_bias and w2_bias.dtype,
         scoring_fn,
-        has_score_bias and score_bias.dtype,
+        has_score_bias and cast(jax.Array, score_bias).dtype,
         has_hash_ids and hash_topk_ids.dtype,
         float(routed_scaling_factor),
     )

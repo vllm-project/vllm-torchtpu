@@ -384,9 +384,12 @@ class DeepseekV4Model(nn.Module):
         # rows they want. They are built from one config and armed by one
         # weight-load path, so disagreeing is a bug here rather than a case to
         # handle -- and it would be a silent shape mismatch deep in a layer.
-        hash_layers = self.layers[
-            self.start_layer : min(self.end_layer, self.config.num_hash_layers)
-        ]
+        hash_layers = typing.cast(
+            Iterable[DeepseekV4DecoderLayer],
+            self.layers[
+                self.start_layer : min(self.end_layer, self.config.num_hash_layers)
+            ],
+        )
         wants = {layer.ffn.routes_dp_gathered_tokens for layer in hash_layers}
         assert len(wants) == 1, (
             "DeepSeek-V4 hash MoE layers disagree on whether the MoE runner "
@@ -689,7 +692,7 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
 
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: torch.Tensor | None,
         positions: torch.Tensor,
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,

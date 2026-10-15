@@ -3,11 +3,18 @@
 
 import functools
 import os
+import sys
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     TPU_K3_SP_PREFILL: bool = False
+    TPU_DCP_MLA_TOPK_CAP: int = 0
+    TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
+    TPU_DCP_LSE_MERGE_A2A: bool = False
+    TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
+    TPU_DCP_RS_OUT_PRECISION: bool = True
+    TPU_MLA_SPARSE_SPLIT_Q: bool = False
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -48,12 +55,18 @@ if TYPE_CHECKING:
     TPU_RAIDEN_PREFIX_AWARE_LOAD: bool = False
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
+    TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
+    FUSED_MOE_DECODE_KERNEL: bool = False
+    FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
+    TPU_MOE_SINGLE_SORT: bool = True
+    USE_MOE_TP_DECODE_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
     TPU_KERNEL_RELOAD_MODULES: str = ""
+    TPU_GREEDY_TOP_TOKENS: bool = False
     DP_SCHED_ENABLED: bool = False
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
@@ -64,6 +77,7 @@ if TYPE_CHECKING:
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
+    TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -75,8 +89,10 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
+    TPU_TOKEN_BUCKET_LINEAR: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
     TPU_PP_CHUNK_SLACK: float = 0.1
+    TPU_PP_LAZY_PUSH: bool = False
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
@@ -84,7 +100,15 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
+    TPU_DCP_INDEXER_A2A_MERGE: bool = False
+    TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
+    TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
+    TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
+    TPU_STREAMIDX_SMALL_BUCKET_TOKENS: int = 64
+    VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
+    TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
+    TPU_MOE_FP8_ALL_GATHER: bool = False
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
     USE_RPA_PIPELINED_DMA_STAGING: bool = False
     USE_PIPELINED_DMA_STAGING: bool = False
@@ -102,6 +126,7 @@ if TYPE_CHECKING:
     TPU_P2P_WAIT_PULL_TIMEOUT: int = 120
     TPU_RAIDEN_STAGE3_STATUS_PROBE_S: float = 1.0
     TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT: bool = True
+    TPU_RAIDEN_STAGE3_REGISTER_AHEAD: bool = True
     TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S: float = 30.0
     TPU_RAIDEN_TEST_REGISTRATION_DELAY_S: float = 0.0
     TPU_KV_STAGE_WAIT_TIMEOUT_SECS: float = 30.0
@@ -129,18 +154,29 @@ if TYPE_CHECKING:
     SPEC_WARMUP: bool = True
     RAIDEN_DISABLE_SINGLETON_WORKER: bool = True
     RAIDEN_SHM_KEY: str = ""
+    RAIDEN_STORAGE_PATH: str = ""
+    RAIDEN_STORAGE_TYPE: str = ""
+    RAIDEN_STORAGE_CAPACITY_GB: str = ""
+    RAIDEN_STORAGE_PROPERTIES: str = ""
+    EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK: bool = False
     VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S: float = 30.0
     VLLM_TPU_OFFLOAD_SAVE_RETRIES: int = 1
+    VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP: bool = False
     VLLM_TORCHTPU_IPC_KEY: str = ""
     TPU_SHARDED_LOAD_SYNC_EVERY: int = 512
+    VLLM_TPU_MXFP4_DEVICE_DEQUANT: bool = True
     VLLM_TPU_DEBUG_PCP_LAYOUT: bool = False
     TPU_LOCAL_RANK_OFFSET: int = 0
+    VLLM_TPU_DEVICE_ORDER: str = ""
     DEBUG_TPU_LOCAL_RANK_OFFSET: int = 0
     TORCH_TPU_BASE_PORT: int = 8070
     TORCH_TPU_MP_RENDEZVOUS_PORT: int | None = None
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
+    TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
+    VLLM_TPU_STATIC_POOLER: bool = True
+    VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
 
 
 def env_with_choices(
@@ -190,6 +226,7 @@ def env_with_choices(
 
 _TRUE_STRINGS = ("true", "1", "yes", "on")
 _FALSE_STRINGS = ("false", "0", "no", "off")
+DEFAULT_INDEXER_KV_CACHE_MODE = "sal"
 
 
 def env_bool(env_name: str, default: bool = False) -> Callable[[], bool]:
@@ -350,6 +387,34 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
 environment_variables: dict[str, Callable[[], Any]] = {
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
+    # DCP sparse MLA (SparseCore cache layout): gather and attend this many
+    # top-k slots per token instead of all `topk`; tokens owning more are
+    # recomputed exactly in-kernel over all their windows
+    # (`sparse_ragged_paged_attention(topk_cap=...)`). Opt-in; 0 = off.
+    "TPU_DCP_MLA_TOPK_CAP": env_int("TPU_DCP_MLA_TOPK_CAP", 0),
+    # Gather/attention chunk (query tokens) of the capped path: fewer, larger
+    # chunks amortise the per-chunk calls; each chunk's static gather buffer
+    # is chunk * topk rows (~335 MB at 256), of which only the live windows
+    # are written.
+    "TPU_DCP_MLA_TOPK_CAP_CHUNK": env_int("TPU_DCP_MLA_TOPK_CAP_CHUNK", 256),
+    # Opt in to the all-to-all DCP MLA lse merge for decode-sized steps.
+    "TPU_DCP_LSE_MERGE_A2A": env_bool("TPU_DCP_LSE_MERGE_A2A", default=False),
+    # Largest step (tokens) that uses it; above this, the reduce-scatter is
+    # faster. Only the backbone uses the all-to-all; the MTP drafter, traced
+    # once for every bucket, always takes the reduce-scatter.
+    "TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS": env_int("TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", 64),
+    # Backbone MLA merge: reduce-scatter the weighted outputs in the output's
+    # precision (bf16), half f32's bytes. MTP drafter stays f32; 0 = f32.
+    "TPU_DCP_RS_OUT_PRECISION": env_bool("TPU_DCP_RS_OUT_PRECISION", default=True),
+    # Sparse MLA split q (`sparse_ragged_paged_attention(q_pe=...)`): hand
+    # q_nope and q_pe to the kernel as separate operands. The kernel joins
+    # them in VMEM and its output aliases q_nope (512 wide), instead of the
+    # caller materialising a concat the wrapper pads to [T, H, 640]. Where the
+    # caller also needs the log-sum-exp (DCP), it is exported lane-dense as
+    # f32[T, H] (`lse_lane_dense=True`) instead of f32[T, H, 1], whose
+    # lane-padded tiles cost a broadcast init, a relayout copy and padded
+    # copies through the LSE merge. Bit-identical outputs.
+    "TPU_MLA_SPARSE_SPLIT_Q": env_bool("TPU_MLA_SPARSE_SPLIT_Q", default=False),
     # QK pair-blocked pooled GDN conv layout: full-width states interleave
     # Q and K row-pairs per tap so a TP-rank shard's first conv token maps
     # to one whole destination pool token (2 contiguous transfer spans per
@@ -361,6 +426,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # variable's default — so it is on by default under raiden).
     "TPU_GDN_CONV_QK_PAIR_LAYOUT": env_bool(
         "TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False
+    ),
+    # Size GDN v3 decode tiles and prefill chunks from per-rank heads, active
+    # sequences and the VMEM estimate (kernels/gdn/v3/tiling.py) instead of
+    # the fixed defaults.
+    "TPU_ENABLE_GDN_DYNAMIC_TILING": env_bool(
+        "TPU_ENABLE_GDN_DYNAMIC_TILING", default=False
     ),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
@@ -527,6 +598,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # threshold. The knob and its row-count semantics come from
     # tpu-inference PR #2674.
     "ONEHOT_MOE_PERMUTE_THRESHOLD": env_optional_int("ONEHOT_MOE_PERMUTE_THRESHOLD"),
+    # Shard tokens over TP between attention and MoE: attention reduce-scatters
+    # instead of all-reducing, the router, shared expert, and experts run on
+    # T/tp tokens, and the next layer all-gathers. Qwen3.5 MoE with
+    # EP and TP > 1 only.
+    "TPU_MOE_SEQUENCE_PARALLEL": env_bool("TPU_MOE_SEQUENCE_PARALLEL", default=False),
     # Select the blockwise owner-output kernel after the outer one-hot MoE
     # threshold has selected the TensorCore path. "off" keeps the dense
     # one-hot combine; "on" enables the kernel for every shape that passes
@@ -540,6 +616,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_DENSE_EXPERT_THRESHOLD": env_nonnegative_int(
         "TPU_MOE_DENSE_EXPERT_THRESHOLD", 0
     ),
+    # Serve eligible MoE layers (TP experts, or EP with TP attention) with the
+    # fused MoE decode kernel: routed experts, shared expert and all-reduce in
+    # one Pallas call (layers/adapter/fused_moe_decode.py). Armed once after
+    # load. Steps above FUSED_MOE_DECODE_KERNEL_MAX_TOKENS tokens run the GMM
+    # MoE path; arming refuses a cap whose buffers do not fit in VMEM.
+    "FUSED_MOE_DECODE_KERNEL": env_bool("FUSED_MOE_DECODE_KERNEL"),
+    "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS": env_int(
+        "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS", 256
+    ),
+    # Build the MoE permutation, its inverse, and the sorted token ids from
+    # one packed sort instead of three. The ragged (counting sort) path ignores it.
+    "TPU_MOE_SINGLE_SORT": env_bool("TPU_MOE_SINGLE_SORT", True),
+    # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
+    # top-k with renormalization, one shared expert, FP8 per-channel weights)
+    # with one op that also covers the shared expert and the TP all-reduce:
+    # at 16, 32 and 64 tokens a single Pallas kernel per rank, at other token
+    # counts the usual path plus a psum (layers/adapter/moe_tp_decode.py).
+    # Armed once after load; needs TPU_MOE_SKIP_PADDED_TOKENS=1 (the op reads
+    # the real token count from its padding mask), otherwise every layer keeps
+    # the usual path. Arms nothing while FUSED_MOE_DECODE_KERNEL is set. Remove
+    # once the path is the default for these layers or is replaced by another
+    # fused TP MoE path.
+    "USE_MOE_TP_DECODE_KERNEL": env_bool("USE_MOE_TP_DECODE_KERNEL"),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
@@ -560,6 +659,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # to the in-tree experimental RPA kernel modules; see
     # compilation/kernel_reload.py.
     "TPU_KERNEL_RELOAD_MODULES": lambda: os.getenv("TPU_KERNEL_RELOAD_MODULES", ""),
+    # Greedy steps without logprobs or grammar take the vocabulary-parallel
+    # argmax (runner/greedy_top_tokens.py) instead of gathering the logits.
+    "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS"),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
     # Tile size for MLA transpose pipeline.
@@ -661,12 +763,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_TOKEN_BUCKET_EXTRA": lambda: [
         int(v) for v in os.getenv("TPU_TOKEN_BUCKET_EXTRA", "").split(",") if v.strip()
     ],
+    # Add linear token buckets above a quarter of the token budget, for
+    # prompt-sized steps (platforms/tpu_platform.py _get_linear_token_paddings).
+    "TPU_TOKEN_BUCKET_LINEAR": env_bool("TPU_TOKEN_BUCKET_LINEAR"),
     # Pipeline parallelism: size prefill chunks by a per-step time budget
     # instead of a token budget (core/pp_chunks.py). 0 keeps token budgets.
     "TPU_PP_DYNAMIC_CHUNKS": env_bool("TPU_PP_DYNAMIC_CHUNKS", default=True),
     # Fraction above the time of a full prefix-free step that a step may
     # take before its chunks are shortened.
     "TPU_PP_CHUNK_SLACK": lambda: float(os.getenv("TPU_PP_CHUNK_SLACK", "0.1")),
+    # Pipeline parallelism over more than two stages: the engine core pushes
+    # the pipeline only when stage 0 would otherwise idle and drops empty
+    # steps, so requests share the pipeline (core/pp_lazy_step.py).
+    "TPU_PP_LAZY_PUSH": env_bool("TPU_PP_LAZY_PUSH", default=False),
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE": env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
     # Under TPU_PARALLEL_PRECOMPILE, take a subgraph's ranges biggest first,
@@ -686,11 +795,66 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_STREAMIDX_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_STREAMIDX_CHUNK_TOKENS"
     ),
+    # Merge the DCP indexer candidates with an all-to-all over the token axis
+    # instead of an all-gather over the candidate axis. Same result.
+    "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=False),
+    # Smallest padded token bucket that takes the all-to-all merge when
+    # TPU_DCP_INDEXER_A2A_MERGE is on. The bucket is static, so each compiled
+    # variant picks one merge with no runtime cost.
+    "TPU_DCP_INDEXER_A2A_MIN_TOKENS": env_nonnegative_int(
+        "TPU_DCP_INDEXER_A2A_MIN_TOKENS", 64
+    ),
+    # MIXED-pass query block for StreamIndex top-k token buckets of at most
+    # TPU_STREAMIDX_SMALL_BUCKET_TOKENS. Under MTP every decode request has
+    # q_len = gamma + 1 and runs in the MIXED pass, whose default 128-row block
+    # scores ~124 padding rows per request. 4 is the recommended value. Unset
+    # keeps 128 everywhere.
+    "TPU_STREAMIDX_SMALL_BUCKET_BQ": env_positive_int_or_none(
+        "TPU_STREAMIDX_SMALL_BUCKET_BQ"
+    ),
+    # MIXED-pass KV pages per block for those buckets; unset takes 8. Read only
+    # when TPU_STREAMIDX_SMALL_BUCKET_BQ is set.
+    "TPU_STREAMIDX_SMALL_BUCKET_BKVP": env_positive_int_or_none(
+        "TPU_STREAMIDX_SMALL_BUCKET_BKVP"
+    ),
+    # Largest padded token bucket that takes the small-bucket block sizes. A
+    # small query block re-reads a sequence's keys once per block, so one long
+    # q_len row in the bucket erodes the win: at 64 a lone 60-token tail is at
+    # parity with the 128-row block.
+    "TPU_STREAMIDX_SMALL_BUCKET_TOKENS": env_int(
+        "TPU_STREAMIDX_SMALL_BUCKET_TOKENS", 64
+    ),
+    # Indexer K-cache writer and layout mode for GLM-5.2 / DSv4 StreamIndex:
+    #   "sal" (default): Pallas coalesced_kv_append(_dcp) in SEQ_ALONG_LANE layout
+    #     (falls back to "has" when block_size < 128 or when Raiden GLM admission
+    #     is active with the default mode; an explicit "sal" with Raiden GLM
+    #     admission raises ValueError).
+    #   "has": Pallas coalesced_kv_append(_dcp) in HEAD_ALONG_SUBLANE layout.
+    #   "xla": XLA .at[].set scatter in HEAD_ALONG_SUBLANE layout.
+    "VLLM_TPU_INDEXER_KV_CACHE_MODE": lambda: (
+        env_with_choices(
+            "VLLM_TPU_INDEXER_KV_CACHE_MODE",
+            DEFAULT_INDEXER_KV_CACHE_MODE,
+            ["xla", "has", "sal"],
+            case_sensitive=False,
+        )()
+        or DEFAULT_INDEXER_KV_CACHE_MODE
+    ).lower(),
+    "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER": env_bool(
+        "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", True
+    ),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.
     "TPU_MOE_COLLECTION_CHUNK_SIZE": lambda: int(
         os.getenv("TPU_MOE_COLLECTION_CHUNK_SIZE") or "0"
     ),
+    # Row-quantize MoE activations to fp8 before the DP/PCP all-gather and
+    # restore them on arrival, so the gather moves one byte per element
+    # instead of two while everything downstream of it is unchanged. Costs one
+    # rounding of the activations plus a second collective for the row scales;
+    # only takes effect on the grouped-matmul MoE path (the fused EP kernel
+    # already carries fp8 on its own wire).
+    "TPU_MOE_FP8_ALL_GATHER": env_bool("TPU_MOE_FP8_ALL_GATHER"),
     # 0 = the arithmetic device-order layout (the one every disaggregated
     # Raiden pair was verified with before #587; also the only option on a
     # torch_tpu older than 2026-08-13, which lacks the API).
@@ -745,6 +909,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # On by default; inline-load mode overrides it back to off.
     "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT": env_bool(
         "TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT", default=True
+    ),
+    # On by default: a PCP, TP or DP Stage-3 producer registers a request's
+    # KV blocks in the step that completes its prompt rather than in the step
+    # after its finish response (pipeline producers always do).
+    "TPU_RAIDEN_STAGE3_REGISTER_AHEAD": env_bool(
+        "TPU_RAIDEN_STAGE3_REGISTER_AHEAD", default=True
     ),
     # Seconds, bounded by TPU_P2P_WAIT_PULL_TIMEOUT downstream.
     "TPU_RAIDEN_STAGE3_REGISTRATION_WAIT_S": env_float(
@@ -814,6 +984,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Read raw, not through env_str: the check must see the same bytes the
     # raiden library sees, and a whitespace-only key still counts as set.
     "RAIDEN_SHM_KEY": lambda: os.getenv("RAIDEN_SHM_KEY", ""),
+    # Directory for the TPU offloading connector's storage tier, a third
+    # tier behind host DRAM. Every block the connector offloads to DRAM is
+    # also written under this directory. "" (the default) turns the tier off.
+    # The raiden_storage_path key in kv_connector_extra_config wins over it.
+    "RAIDEN_STORAGE_PATH": env_str("RAIDEN_STORAGE_PATH", ""),
+    # Storage backend type for RAIDEN_STORAGE_PATH; "" means "posix", the
+    # only type supported today.
+    "RAIDEN_STORAGE_TYPE": env_str("RAIDEN_STORAGE_TYPE", ""),
+    # Storage capacity in GiB, reported to the raiden store; "" leaves it
+    # unset. Kept as a string here; raiden_store.py parses and validates it.
+    "RAIDEN_STORAGE_CAPACITY_GB": env_str("RAIDEN_STORAGE_CAPACITY_GB", ""),
+    # Further storage backend properties, passed to raiden unread as
+    # comma-separated key=value pairs, e.g.
+    # "direct_io=true,metadata_cache_max_entries=4096". The store's metadata
+    # cache is tuned this way too: metadata_cache_max_entries (raiden's
+    # default, 0, turns it off; -1 removes the limit) and
+    # metadata_cache_ttl_secs (60 by default; -1 for no expiry). The
+    # raiden_storage_properties key in kv_connector_extra_config wins key by
+    # key.
+    "RAIDEN_STORAGE_PROPERTIES": env_str("RAIDEN_STORAGE_PROPERTIES", ""),
+    # Experimental, for testing only: lets the storage tier start under
+    # pipeline parallelism, which is refused by default until end-to-end
+    # validation completes. The
+    # experimental_raiden_storage_skip_parallelism_check key in
+    # kv_connector_extra_config wins over it.
+    "EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK": env_bool(
+        "EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK", default=False
+    ),
     # Seconds; upper bound on a scheduler-side drain of in-flight offload
     # jobs whose blocks are about to be reused.
     "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S": env_float(
@@ -821,17 +1019,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # How many times an offload save whose transfer failed is retried.
     "VLLM_TPU_OFFLOAD_SAVE_RETRIES": env_int("VLLM_TPU_OFFLOAD_SAVE_RETRIES", 1),
+    # Scheduler: keep the trailing prefix-cache block that EAGLE/MTP normally
+    # drops (controls vLLM's disable_eagle_block_drop). Host-only.
+    "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(
+        "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", default=False
+    ),
     # Secret for the KV-transfer IPC socket; "" derives one from the host.
     # Read raw, not through env_str: a secret's bytes must not be trimmed.
     "VLLM_TORCHTPU_IPC_KEY": lambda: os.getenv("VLLM_TORCHTPU_IPC_KEY", ""),
     # Sync the device every N tensors during sharded EP weight loading so
     # queued host copies are released; 0 disables the periodic sync.
     "TPU_SHARDED_LOAD_SYNC_EVERY": env_int("TPU_SHARDED_LOAD_SYNC_EVERY", 512),
+    # Dequantize and pad MXFP4 expert weights on the TPU, where they already
+    # sit after loading, instead of round-tripping them through host memory.
+    "VLLM_TPU_MXFP4_DEVICE_DEQUANT": env_bool("VLLM_TPU_MXFP4_DEVICE_DEQUANT", True),
     # Log the PCP sequence layout window on every step.
     "VLLM_TPU_DEBUG_PCP_LAYOUT": env_bool("VLLM_TPU_DEBUG_PCP_LAYOUT"),
     # Added to every worker's local rank when it binds to a physical chip.
     # worker/tpu_rank_binding.py reads it from the env mapping it is given.
     "TPU_LOCAL_RANK_OFFSET": env_int("TPU_LOCAL_RANK_OFFSET", 0),
+    # Physical device index per local rank ("0,2,1,3,4,6,5,7"); empty = native.
+    "VLLM_TPU_DEVICE_ORDER": lambda: os.getenv("VLLM_TPU_DEVICE_ORDER", ""),
     # Same offset for the legacy worker init path; debug only.
     "DEBUG_TPU_LOCAL_RANK_OFFSET": env_int("DEBUG_TPU_LOCAL_RANK_OFFSET", 0),
     # First slicebuilder port; each chip on a host takes base + local rank.
@@ -860,12 +1068,27 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   - EP-DP lockstep: run_dp_dummy_draft only replays the per-step
     #     collective trace.
     "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
+    # Non-greedy sampling filters the vocab to this many 128-logit blocks,
+    # ranked by block max, before running top-k (and any subsequent top-p).
+    # 0 searches the full vocab. Used only when every active request has
+    # 1 <= top_k <= value // 2 and no grammar mask applies.
+    "TPU_SAMPLER_TOPK_CANDIDATES": env_nonnegative_int(
+        "TPU_SAMPLER_TOPK_CANDIDATES", 0
+    ),
     # Chunk the vision encoder over video frames to bound peak VMEM: encode at
     # most this many patches (t*h*w) per vision forward, then concatenate the
     # per-chunk outputs. 0 disables (encode the whole video in one batch).
     "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE": env_nonnegative_int(
         "MM_ENCODER_FRAME_CHUNK_PATCH_SIZE", 0
     ),
+    # Pooling models: run LAST/CLS/MEAN embed pooling through the AOT-compiled
+    # static pooler over the (token, request) bucket grid. 0 falls back to the
+    # eager vLLM pooler (finished-mask gating still applies).
+    "VLLM_TPU_STATIC_POOLER": env_bool("VLLM_TPU_STATIC_POOLER", True),
+    # Pooling models: KV cache token budget. -1 (default) derives a
+    # deterministic cap from the scheduler config, 0 disables the cap (all
+    # post-profile HBM goes to KV), N > 0 caps KV at N tokens.
+    "VLLM_TPU_POOLING_KV_CACHE_TOKENS": env_int("VLLM_TPU_POOLING_KV_CACHE_TOKENS", -1),
 }
 
 
@@ -902,3 +1125,14 @@ def enable_envs_cache() -> None:
 
 def __dir__() -> list[str]:
     return list(environment_variables.keys())
+
+
+def use_raiden_glm_admission() -> bool:
+    """True when Raiden KV-cache manager and GLM Stage-3 admission are both enabled."""
+    mod = sys.modules[__name__]
+    return bool(mod.TPU_USE_RAIDEN_KV_CACHE_MANAGER and mod.TPU_RAIDEN_GLM_ADMISSION)
+
+
+def is_indexer_kv_cache_mode_explicit() -> bool:
+    """True when VLLM_TPU_INDEXER_KV_CACHE_MODE was explicitly set."""
+    return "VLLM_TPU_INDEXER_KV_CACHE_MODE" in os.environ

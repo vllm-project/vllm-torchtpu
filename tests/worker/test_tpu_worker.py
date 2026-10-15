@@ -25,7 +25,7 @@ from vllm.config import ParallelConfig
 from vllm.v1.engine.core import EngineCoreProc
 
 import vllm_torchtpu as plugin
-from vllm_torchtpu import patch_registry
+from vllm_torchtpu import patch_registry, utils
 from vllm_torchtpu.worker.tpu_worker import TPUWorker, _configure_tpu_process_env
 
 
@@ -292,6 +292,60 @@ def test_initialize_from_config_updates_num_gpu_blocks():
     worker.model_runner.initialize_kv_cache.assert_called_once_with(kv_cache_config)
 
 
+def _ep_dp_worker(monkeypatch, dp_size, expert_parallel, local, peer):
+    """Build a TPUWorker whose MIN reduce across DP engines returns at most peer."""
+    budget = utils.HbmBudget(total_limit=0, total_used=0, cap=0, available=local)
+    monkeypatch.setattr(utils, "compute_hbm_budget", lambda *_: budget)
+    monkeypatch.setenv("TORCH_TPU_DP_SIZE", str(dp_size))
+    cpu_group = object()
+    monkeypatch.setattr(
+        "vllm.distributed.parallel_state.get_dp_group",
+        lambda: SimpleNamespace(cpu_group=cpu_group),
+    )
+
+    def all_reduce(t, op, group):
+        assert (op, group) == (torch.distributed.ReduceOp.MIN, cpu_group)
+        t.clamp_(max=peer)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", all_reduce)
+    worker = TPUWorker.__new__(TPUWorker)
+    worker.cache_config = SimpleNamespace(
+        kv_cache_memory_bytes=None, gpu_memory_utilization=0.9
+    )
+    worker.parallel_config = SimpleNamespace(
+        data_parallel_size=1, enable_expert_parallel=expert_parallel
+    )
+    worker.vllm_config = SimpleNamespace(kv_transfer_config=None)
+    worker.devices = []
+    worker.model_runner = MagicMock(is_pooling_model=False)
+    return worker
+
+
+@pytest.mark.parametrize(
+    "dp_size, expert_parallel, coupled",
+    [(2, True, True), (1, True, False), (2, False, False)],
+)
+def test_determine_available_memory_is_min_across_ep_dp(
+    monkeypatch, dp_size, expert_parallel, coupled
+):
+    """EP-coupled DP engines bake their KV extent into the compiled programs,
+    so they must all size the cache from the smallest per-engine budget."""
+    local, peer = 7 * utils.GBYTES, 6 * utils.GBYTES
+    worker = _ep_dp_worker(monkeypatch, dp_size, expert_parallel, local, peer)
+
+    assert worker.determine_available_memory() == (peer if coupled else local)
+
+
+def test_determine_available_memory_fails_on_every_ep_dp_engine(monkeypatch):
+    """An engine whose own budget fits still fails when a coupled peer's does not."""
+    worker = _ep_dp_worker(
+        monkeypatch, dp_size=2, expert_parallel=True, local=utils.GBYTES, peer=0
+    )
+
+    with pytest.raises(ValueError, match="gpu-memory-utilization"):
+        worker.determine_available_memory()
+
+
 @patch("vllm_torchtpu.worker.tpu_worker.get_pp_group")
 @patch("vllm_torchtpu.worker.tpu_worker.get_tensor_model_parallel_rank", return_value=3)
 @patch("vllm_torchtpu.worker.tpu_worker.get_kv_transfer_group")
@@ -322,8 +376,9 @@ def test_model_load_stage_precedes_runner(monkeypatch):
 
 
 @pytest.mark.parametrize("managed_by_vllm, runtime_threads", [(True, 1), (False, 2)])
+@pytest.mark.parametrize("speculative", [False, True])
 def test_warmup_restores_runtime_threads_without_overriding_user_choice(
-    monkeypatch, managed_by_vllm, runtime_threads
+    monkeypatch, managed_by_vllm, runtime_threads, speculative
 ):
     from vllm.utils.torch_utils import OMP_NUM_THREADS_SET_BY_VLLM
 
@@ -341,12 +396,23 @@ def test_warmup_restores_runtime_threads_without_overriding_user_choice(
     worker = SimpleNamespace(
         model_runner=SimpleNamespace(capture_model=capture_model),
         compilation_config=SimpleNamespace(compilation_time=0.0),
+        speculative_config=object() if speculative else None,
     )
     previous_threads = torch.get_num_threads()
     try:
         torch.set_num_threads(2)
-        result = TPUWorker.compile_or_warm_up_model(worker)
-        assert warmup_threads == [2]
+        with (
+            patch("vllm_torchtpu.worker.tpu_worker.freeze_gc_heap") as freeze,
+            patch(
+                "vllm_torchtpu.worker.tpu_worker.maybe_attach_gc_debug_callback"
+            ) as gc_debug,
+        ):
+            result = TPUWorker.compile_or_warm_up_model(worker)
+        freeze.assert_called_once_with()
+        gc_debug.assert_called_once_with()
+        # Speculative decoding warms up at the serving thread count; other
+        # models keep the startup count during warm-up.
+        assert warmup_threads == [runtime_threads if speculative else 2]
         assert torch.get_num_threads() == runtime_threads
         assert result.language_model == worker.compilation_config.compilation_time
         assert result.encoder == 0.0
@@ -360,7 +426,10 @@ def test_real_patch_entrypoints_in_spawned_processes():
 
     probe = Path(__file__).resolve()
     source = probe.parents[2] / "src"
-    env = dict(os.environ, PYTHONPATH=str(source), JAX_PLATFORMS="tpu")
+    pythonpath = os.pathsep.join(
+        filter(None, [str(source), os.environ.get("PYTHONPATH")])
+    )
+    env = dict(os.environ, PYTHONPATH=pythonpath, JAX_PLATFORMS="tpu")
     result = subprocess.run(
         [sys.executable, str(probe)],
         env=env,

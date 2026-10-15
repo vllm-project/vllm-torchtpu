@@ -64,6 +64,8 @@ class _MockSDPAImpl:
         self.head_size = head_size
         self.scale = scale
         self.num_kv_heads = num_kv_heads or num_heads
+        self.softmax_scale = kwargs.get("softmax_scale", scale)
+        self.causal = kwargs.get("causal", False)
 
     def _forward_impl(
         self, query, key, value, attn_metadata=None, mask_mode="broadcast_k"
@@ -97,6 +99,59 @@ class _MockLTXRuntime:
         return MagicMock(output=self.output)
 
 
+def _init_mock_qwen_rope(self):
+    self.pos_freqs = torch.polar(
+        torch.ones(8, 4), torch.arange(32, dtype=torch.float32).view(8, 4)
+    )
+
+
+def _forward_mock_qwen_rope(self, video_fhw, txt_seq_lens, device):
+    return (
+        torch.cat([self.pos_freqs[:2]], dim=0),
+        self.pos_freqs[2 : 2 + max(txt_seq_lens), ...],
+    )
+
+
+class _MockQwenEmbedRope:
+    __init__ = _init_mock_qwen_rope
+    forward = _forward_mock_qwen_rope
+
+
+class _MockQwenEmbedLayer3DRope:
+    __init__ = _init_mock_qwen_rope
+    forward = _forward_mock_qwen_rope
+
+
+class _MockColumnParallelGELU(torch.nn.Module):
+    """vLLM-Omni's Wan FFN up-projection + tanh GELU."""
+
+    def __init__(self, dim_in, dim_out, approximate="tanh"):
+        super().__init__()
+        self.proj = torch.nn.Linear(dim_in, dim_out)
+        self.approximate = approximate
+
+    def forward(self, x):
+        return torch.nn.functional.gelu(self.proj(x), approximate=self.approximate)
+
+
+class _MockRotaryEmbeddingWan(torch.nn.Module):
+    """vLLM-Omni's CustomOp-style Wan RoPE (native interleaved formula)."""
+
+    def __init__(self, is_neox_style=False, half_head_dim=False):
+        super().__init__()
+        self.interleaved = not is_neox_style
+        self.half_head_dim = half_head_dim
+        self._forward_method = self.forward_native
+
+    def forward(self, *args, **kwargs):
+        return self._forward_method(*args, **kwargs)
+
+    def forward_native(self, x, cos, sin):
+        x1, x2 = x.unflatten(-1, (-1, 2)).unbind(-1)
+        rotated = torch.stack((x1 * cos - x2 * sin, x1 * sin + x2 * cos), dim=-1)
+        return rotated.flatten(-2, -1).to(x.dtype)
+
+
 vllm_omni_mock = MagicMock()
 vllm_omni_mock.platforms.interface.OmniPlatform = _MockOmniPlatform
 vllm_omni_mock.platforms.interface.OmniPlatformEnum = _MockOmniPlatformEnum
@@ -106,6 +161,14 @@ vllm_omni_mock.diffusion.attention.backends.registry.register_diffusion_backend 
     lambda *args, **kwargs: None
 )
 vllm_omni_mock.diffusion.models.ltx2.ltx2_runtime.LTXRuntime = _MockLTXRuntime
+qwen_transformer_mock = (
+    vllm_omni_mock.diffusion.models.qwen_image.qwen_image_transformer
+)
+qwen_transformer_mock.QwenEmbedRope = _MockQwenEmbedRope
+qwen_transformer_mock.QwenEmbedLayer3DRope = _MockQwenEmbedLayer3DRope
+vllm_omni_mock.diffusion.layers.rope.RotaryEmbeddingWan = _MockRotaryEmbeddingWan
+_wan2_2 = vllm_omni_mock.diffusion.models.wan2_2
+_wan2_2.wan2_2_transformer.ColumnParallelGELU = _MockColumnParallelGELU
 
 sys.modules["vllm_omni"] = vllm_omni_mock
 sys.modules["vllm_omni.platforms"] = vllm_omni_mock.platforms
@@ -130,3 +193,15 @@ sys.modules["vllm_omni.diffusion.models.ltx2"] = vllm_omni_mock.diffusion.models
 sys.modules["vllm_omni.diffusion.models.ltx2.ltx2_runtime"] = (
     vllm_omni_mock.diffusion.models.ltx2.ltx2_runtime
 )
+sys.modules["vllm_omni.diffusion.models.qwen_image"] = (
+    vllm_omni_mock.diffusion.models.qwen_image
+)
+sys.modules["vllm_omni.diffusion.models.qwen_image.qwen_image_transformer"] = (
+    vllm_omni_mock.diffusion.models.qwen_image.qwen_image_transformer
+)
+sys.modules["vllm_omni.diffusion.models.wan2_2"] = _wan2_2
+sys.modules["vllm_omni.diffusion.models.wan2_2.wan2_2_transformer"] = (
+    _wan2_2.wan2_2_transformer
+)
+sys.modules["vllm_omni.diffusion.layers"] = vllm_omni_mock.diffusion.layers
+sys.modules["vllm_omni.diffusion.layers.rope"] = vllm_omni_mock.diffusion.layers.rope

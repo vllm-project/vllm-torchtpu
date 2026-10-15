@@ -51,6 +51,11 @@ repos:
   hooks:
   - id: detect-missing-init
     args: ['--create', "--track", "--python-folders", "src/vllm_torchtpu"]
+# Keeps the lines inside each keep-sorted block in sorted order.
+- repo: https://github.com/google/keep-sorted
+  rev: v0.10.0
+  hooks:
+  - id: keep-sorted
 - repo: local
   hooks:
   - id: signoff-commit
@@ -90,6 +95,17 @@ repos:
     additional_dependencies: [ruff==0.14.0]
     always_run: true
     pass_filenames: false
+  - id: check-license-header
+    name: Python files carry the Apache 2.0 license header
+    # Either form counts: the full Apache text or the one-line SPDX tag. It
+    # must sit in the comment block at the top of the file, after an optional
+    # shebang. `\A\Z` matches an empty file, so a bare __init__.py passes.
+    entry: '\A\Z|\A(#![^\n]*\n)?(#[^\n]*\n|\n)*?#[^\n]*(Licensed under the Apache License|SPDX-License-Identifier: Apache-2\.0)'
+    language: pygrep
+    args: [--negate, --multiline]
+    types: [python]
+    # protoc writes this file; see scripts/update_xplane_proto.sh.
+    exclude: ^src/vllm_torchtpu/tools/xplane_pb2\.py$
   - id: check-filenames
     name: Check for spaces in all filenames
     entry: bash
@@ -99,6 +115,15 @@ repos:
     language: system
     always_run: true
     pass_filenames: false
+  - id: no-internal-refs
+    name: No internal links, bug numbers or source paths
+    # The repo is public, so internal links, bug and change numbers, and
+    # internal source paths mean nothing to most readers. Put the reasoning in
+    # the comment or cite a public source. A link must start a word or follow
+    # http:// or https://, so paths such as /usr/local/go/bin pass.
+    entry: '(^|[\s(\[{"''`<,]|https?://)(go/[A-Za-z]|b/[0-9]{6,}|cl/[0-9]{6,})|\bgoogle3\b'
+    language: pygrep
+    types: [text]
   - id: pyrefly
     name: Pyrefly type check
     # Checks the whole project (see [tool.pyrefly] in pyproject.toml) rather
