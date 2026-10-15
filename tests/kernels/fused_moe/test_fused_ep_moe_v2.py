@@ -1097,3 +1097,118 @@ def test_fp4_agrees_across_every_weight_schedule(at_prefetch_depth):
             deepest,
             err_msg=f"depth {depth} disagrees with the deepest schedule",
         )
+
+
+# --------------------------------------------------------------------------- #
+# The tile-height ladder.
+#
+# Serving runs two rungs (MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE=2), whose short
+# rung sits at the expected rows per expert. Every other device test runs the
+# default four-rung ladder, so the heights only the two-rung ladder emits are
+# reached by setting the override, which the build reads.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.fixture
+def at_height_rungs(monkeypatch):
+    """Build with the height-rung override at `rungs` (None for the default),
+    and report the ladders built.
+
+    Yields `rungs -> observed`, where `observed` fills with each build's
+    ladder, so a case cannot pass on a ladder other than the one it names.
+    Both caches are cleared for the reason `at_prefetch_depth` gives: the
+    override is read at build time and is in neither cache key.
+    """
+    observed = []
+    real = kernel.tile_height_rungs
+
+    def recording(*args):
+        ladder = real(*args)
+        observed.append(ladder)
+        return ladder
+
+    monkeypatch.setattr(kernel, "tile_height_rungs", recording)
+
+    def clear():
+        kernel._BUILD_CACHE.clear()
+        layer._LAYER_SM_CACHE.clear()
+
+    def at(rungs):
+        if rungs is None:
+            monkeypatch.delenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", raising=False)
+        else:
+            monkeypatch.setenv("MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE", str(rungs))
+        observed.clear()
+        clear()
+        return observed
+
+    yield at
+    clear()
+
+
+@pytest.mark.parametrize(
+    "tokens,ladder,rows_per_local",
+    [
+        # Expected rows per expert 24 (+2 sd) -> a 48-row short rung. One
+        # expert past it runs the full-tile body, three under it the short.
+        (128, (48, CAPACITY), (52, 8, 2, 2)),
+        # Expected rows 16 (+2 sd) -> 32, the floor.
+        (64, (32, CAPACITY), (24, 6, 2, 0)),
+    ],
+    ids=["short48", "short32"],
+)
+def test_fp4_two_rung_ladder_matches_the_default_ladder(
+    at_height_rungs, tokens, ladder, rows_per_local
+):
+    """The two-rung ladder's short rung computes what the default ladder does.
+
+    A rung changes only how many rows a tile's body computes, never which, so
+    the outputs agree bit for bit; the dense reference keeps that agreement
+    from being vacuous.
+    """
+    mesh = _mesh()
+    weights, scales, decoded = _make_fp4_weights(
+        mesh,
+        46,
+        hidden=STREAM["hidden"],
+        inter=STREAM["inter"],
+        e_total=STREAM["e_total"],
+        rhs_qb=STREAM_QB,
+    )
+    x, gating = _make_inputs(
+        mesh, 47, tokens=tokens, hidden=STREAM["hidden"], e_total=STREAM["e_total"]
+    )
+    hash_ids = _make_ids_with_expert_rows(
+        mesh,
+        48,
+        rows_per_local=rows_per_local,
+        tokens=tokens,
+        topk=STREAM["topk"],
+        e_total=STREAM["e_total"],
+    )
+    common = dict(
+        hash_topk_ids=hash_ids,
+        topk=STREAM["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=STREAM_QB,
+    )
+
+    observed = at_height_rungs(2)
+    two_rung = np.asarray(fused_ep_moe_v2(x, *weights, *scales, gating, **common))
+    assert observed and all(built == ladder for built in observed), observed
+
+    observed = at_height_rungs(None)
+    default = np.asarray(fused_ep_moe_v2(x, *weights, *scales, gating, **common))
+    assert observed and all(len(built) == kernel.HEIGHT_RUNGS for built in observed)
+
+    np.testing.assert_array_equal(two_rung, default)
+    want = _dense_reference(
+        mesh, x, *decoded, None, None, gating, topk=STREAM["topk"], hash_ids=hash_ids
+    )
+    error = _relative_l2(two_rung, want)
+    assert error < FP8_RELATIVE_BOUND, f"relative L2 {error:.4f} past the band"
+    worst = _worst_token_relative_l2(two_rung, want)
+    assert worst < FP8_TOKEN_BOUND, f"worst token {worst:.4f} past the band"

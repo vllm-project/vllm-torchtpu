@@ -17,6 +17,7 @@ result row to the shard that owns its token, so the layer needs no dense
 combine reduce-scatter."""
 
 import functools
+import math
 import threading
 from typing import cast
 
@@ -65,6 +66,10 @@ FP4_OUTPUT_CHUNK = 256
 # top rung is always tile_m, so a full tile is unchanged. Overridable per
 # process by MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE, read at BUILD time.
 HEIGHT_RUNGS = 4
+# The two-rung ladder's short rung: a multiple of this many rows, and no
+# shorter than LOW_RUNG_MIN (the shortest height measured on the fp4 path).
+LOW_RUNG_ALIGN = 16
+LOW_RUNG_MIN = 32
 # DMA priority the weight refills take, so that they stay off the in-order
 # queue the token gather issues on.
 WEIGHT_DMA_PRIORITY = 1
@@ -155,6 +160,10 @@ def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
     of every routed row landing on one shard, so `ep` shards' worth of it is
     what a shard's `g_local` experts actually expect to hold.
 
+    A two-rung ladder puts its short rung at the expected per-expert load
+    (mean plus two standard deviations of a uniform routing, rounded up to
+    LOW_RUNG_ALIGN rows and at least LOW_RUNG_MIN) when that is below the
+    half-tile, since at decode almost every expert is a single short tile.
     """
     rungs = envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE or HEIGHT_RUNGS
     step = tile_m // rungs
@@ -165,6 +174,12 @@ def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
         or rows_alloc > ep * g_local * tile_m
     ):
         return (tile_m,)
+    if rungs == 2:
+        mean = rows_alloc / (ep * g_local)
+        low = -(-int(math.ceil(mean + 2 * math.sqrt(mean))) // LOW_RUNG_ALIGN)
+        low = max(low * LOW_RUNG_ALIGN, LOW_RUNG_MIN)
+        if low < step and low % ROWBLK == 0:
+            return (low, tile_m)
     return tuple(range(step, tile_m + 1, step))
 
 
