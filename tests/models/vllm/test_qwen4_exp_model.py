@@ -10,7 +10,18 @@ from torch import nn
 from tests.models.vllm.qwen4_exp_test_utils import q4exp_text_config
 
 
-@pytest.mark.usefixtures("vllm_config_context")
+@pytest.fixture
+def model_cpu_config_context():
+    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
+    with set_current_vllm_config(config):
+        yield
+
+
+@pytest.mark.usefixtures("model_cpu_config_context")
 @pytest.mark.parametrize(
     "layer_types",
     [
@@ -92,3 +103,25 @@ def test_rope_sharing_is_model_local_and_excludes_kv_state(monkeypatch, layer_ty
     assert other.rope_cache.shape[0] == 256
     assert other.rope_cache is not attentions[0].rope_cache
     assert not any(name.endswith("rope_cache") for name in first.state_dict())
+
+
+def test_qwen_decoder_opts_into_compact_gdn_inputs(monkeypatch):
+    from unittest.mock import Mock
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import model
+
+    text = q4exp_text_config(ple_layer_ids=[], layer_types=["linear_attention"])
+    cfg = NS(model_config=NS(hf_text_config=text), additional_config={})
+    attention = Mock(return_value=nn.Identity())
+    monkeypatch.setattr(
+        model, "get_tp_group", lambda: NS(rank_in_group=0, world_size=1)
+    )
+    monkeypatch.setattr(model, "Qwen4ExpGatedDeltaNetAttention", attention)
+    monkeypatch.setattr(model, "Qwen3NextSparseMoeBlock", lambda **kw: nn.Identity())
+    monkeypatch.setattr(model, "GatedResidual", lambda *a, **kw: nn.Identity())
+
+    layer = model.Qwen4ExpDecoderLayer(cfg, 0, "model.layers.0")
+
+    assert layer.linear_attn is attention.return_value
+    assert "use_compact_qkv" not in attention.call_args.kwargs
+    assert attention.call_args.kwargs["pooled_conv_state_dtype"] == torch.float32
