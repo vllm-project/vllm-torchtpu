@@ -181,6 +181,18 @@ RUN --mount=type=cache,target=/root/.cache/uv \
       --group vllm \
       --extra omni
 
+# vllm-omni 0.31.0rc1 depends on s3tokenizer, which pulls the PyPI torchaudio:
+# a CUDA build that fails to load libcudart here. transformers imports
+# torchaudio whenever it is installed, so every vLLM import would fail. Install
+# the CPU build of the same version instead. --reinstall-package is needed
+# because uv treats torchaudio==2.11.0 as already satisfied, and --no-deps
+# keeps torch 2.13.0+cpu. 2.11.0 is the newest CPU torchaudio wheel and
+# imports against torch 2.13.0.
+RUN --mount=type=cache,target=/root/.cache/uv \
+    uv pip install --system --no-deps --reinstall-package torchaudio \
+      --index-url https://download.pytorch.org/whl/cpu "torchaudio==2.11.0" && \
+    python -c "import torchaudio, torchaudio.functional as F; F.melscale_fbanks; import transformers.audio_utils"
+
 
 # Variant 5: Production/Full Image (Production/Minimal Variant)
 # This variant copies all source code and installs the package regularly

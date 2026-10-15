@@ -48,7 +48,7 @@ dependencies = [
     #
     # Uncap upper bound in base dependencies so upstream vLLM HEAD canary builds
     # (vllm-torchtpu-integration, requiring transformers>=5.16.1) can resolve.
-    # vllm-omni 0.29.0rc1 specifies its own <5.15 constraint in its package metadata
+    # vllm-omni 0.31.0rc1 specifies its own <5.15 constraint in its package metadata
     # for the -omni image. Monitored for potential structured-output spec-decode
     # divergence (#1093) on transformers>=5.17.
     "transformers>=5.10.4",
@@ -96,7 +96,7 @@ benchmarking = [
 
 # vLLM-Omni optional dependency
 omni = [
-    "vllm-omni==0.29.0rc1",
+    "vllm-omni==0.31.0rc1",
 ]
 
 [project.entry-points."vllm.platform_plugins"]
