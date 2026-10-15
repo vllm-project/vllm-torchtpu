@@ -84,6 +84,7 @@ def _request_kernel(
         q,
         weights,
         pool,
+        None,
         out.at[:, 0, :],
         words,
         unpacked,
