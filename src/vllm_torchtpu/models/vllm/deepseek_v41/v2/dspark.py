@@ -378,6 +378,10 @@ class DSparkDeepseekV41ForCausalLM(nn.Module):
 
     # --- Weight loading -----------------------------------------------------
 
+    def should_load_weight(self, name: str) -> bool:
+        """Let the streaming loader reject unused tensors before reading them."""
+        return self._remap_dspark_name(name) is not None
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load the ``mtp.{0,1,2}.*`` draft weights from the target checkpoint."""
         first_layer = self.model.layers[0]

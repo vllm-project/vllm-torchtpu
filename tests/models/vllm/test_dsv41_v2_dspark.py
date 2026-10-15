@@ -92,6 +92,27 @@ def test_remap_dspark_name():
     )
 
 
+@pytest.mark.parametrize(
+    "name,confidence_head,expected",
+    [
+        ("layers.0.attn.wq_a.weight", False, False),
+        ("mtp.invalid.attn.wq_a.weight", False, False),
+        ("mtp.0.main_proj.weight", False, True),
+        ("mtp.2.attn.wq_a.weight", False, True),
+        ("mtp.0.markov_head.embed.weight", False, True),
+        ("mtp.0.confidence_head.w1.weight", False, False),
+        ("mtp.0.confidence_head.w1.weight", True, True),
+    ],
+)
+def test_checkpoint_weight_filter(name, confidence_head, expected):
+    model = v2_dspark.DSparkDeepseekV41ForCausalLM.__new__(
+        v2_dspark.DSparkDeepseekV41ForCausalLM
+    )
+    nn.Module.__init__(model)
+    model.model = SimpleNamespace(confidence_head=object() if confidence_head else None)
+    assert model.should_load_weight(name) is expected
+
+
 def test_insert_context_kv(monkeypatch: pytest.MonkeyPatch):
     inserted: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
 
