@@ -13,12 +13,39 @@
 # limitations under the License.
 """Tests for the UE8M0 (power-of-two) block scales in `quantize_tensor`."""
 
+import pytest
 import torch
 
-from vllm_torchtpu.layers.core.quantization import e8m0_to_fp32, quantize_tensor
+from vllm_torchtpu.layers.core.quantization import (
+    e8m0_to_fp32,
+    e8m0_to_fp32_bits,
+    quantize_tensor,
+)
 
 FP8_DTYPE = torch.float8_e4m3fn
 FP8_MAX = float(torch.finfo(FP8_DTYPE).max)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("strided", [False, True])
+def test_bit_decoder_matches_cpu_ldexp_for_every_byte(strided):
+    values = torch.arange(256, dtype=torch.int32).to(torch.uint8).reshape(16, 16)
+    if strided:
+        values = values.T
+    expected = e8m0_to_fp32(values)
+    actual = e8m0_to_fp32_bits(values)
+    assert actual.dtype == torch.float32
+    assert actual.shape == expected.shape
+    assert torch.equal(
+        actual.view(torch.int32), expected.contiguous().view(torch.int32)
+    )
+
+
+def test_bit_decoder_on_device_matches_cpu_bits(device):
+    values = torch.arange(256, dtype=torch.int32).to(torch.uint8)
+    expected = e8m0_to_fp32(values)
+    actual = e8m0_to_fp32_bits(values.to(device)).cpu()
+    assert torch.equal(actual.view(torch.int32), expected.view(torch.int32))
 
 
 def _quantize_ue8m0(tensor: torch.Tensor, block_size: int | None = None):

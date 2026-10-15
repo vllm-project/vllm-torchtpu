@@ -114,6 +114,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
     create_sequence_layout_planner,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.model_loader_patches import runai_metadata_cache
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
@@ -4844,6 +4845,7 @@ class TPUModelRunner(GPUModelRunner):
 
         return async_output
 
+    @runai_metadata_cache()
     def load_model(self) -> None:
         self.device_config.device = torch.device("tpu")
         self.device = self.device_config.device

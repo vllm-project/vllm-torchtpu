@@ -224,7 +224,7 @@ class TestMxfp4MoETPU:
         assert w2_weight_scale.shape[0] == w2_weight_processed.shape[0]
 
 
-def test_device_dequant_matches_cpu_reference_bit_for_bit():
+def test_device_dequant_matches_cpu_reference_bit_for_bit(device):
     # The select-based decode must reproduce the LUT reference exactly for
     # every packed byte (all 16 x 16 nibble pairs), in fp32 and bf16.
     from vllm_torchtpu.layers.adapter.quantization.mxfp4 import (
@@ -240,6 +240,8 @@ def test_device_dequant_matches_cpu_reference_bit_for_bit():
 
     for out_dtype in (torch.float32, torch.bfloat16):
         expected = dequantize_mxfp4_packed(packed, scale, -1, out_dtype)
-        actual = _dequantize_mxfp4_packed_on_device(packed, scale, -1, out_dtype)
+        actual = _dequantize_mxfp4_packed_on_device(
+            packed.to(device), scale.to(device), -1, out_dtype
+        ).cpu()
         assert actual.dtype == expected.dtype
         assert torch.equal(actual, expected)

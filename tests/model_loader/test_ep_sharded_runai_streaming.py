@@ -20,14 +20,16 @@ safetensors metadata. No TPU, no network: the Run:AI streamer is faked.
 
 import sys
 from types import ModuleType, SimpleNamespace
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock, call, patch
 
 import pytest
 
 from vllm_torchtpu.model_loader_patches import (
     _compute_local_expert_ids,
+    _runai_metadata,
     _sharded_runai_weights_iterator,
     _should_skip,
+    runai_metadata_cache,
 )
 
 # ---------------------------------------------------------------------------
@@ -35,6 +37,58 @@ from vllm_torchtpu.model_loader_patches import (
 # ---------------------------------------------------------------------------
 
 _LOCAL = {0, 1, 27}
+
+
+@pytest.mark.cpu_test
+def test_metadata_reuse_preserves_file_order_and_reloads_after_scope():
+    metadata = SimpleNamespace(
+        from_files=MagicMock(
+            side_effect=[["a-header", "b-header"], ["c-header"], ["new-a-header"]]
+        )
+    )
+    module = ModuleType("runai_model_streamer.safetensors_streamer.safetensors_pytorch")
+    module.SafetensorsMetadata = metadata
+    with patch.dict(sys.modules, {module.__name__: module}):
+        with runai_metadata_cache():
+            assert _runai_metadata("target-stream", ["a", "b"]) == [
+                "a-header",
+                "b-header",
+            ]
+            with runai_metadata_cache():
+                assert _runai_metadata("draft-stream", ["b", "a"]) == [
+                    "b-header",
+                    "a-header",
+                ]
+            assert _runai_metadata("other-stream", ["c", "a"]) == [
+                "c-header",
+                "a-header",
+            ]
+        with runai_metadata_cache():
+            assert _runai_metadata("reload-stream", ["a"]) == ["new-a-header"]
+    assert metadata.from_files.call_args_list == [
+        call("target-stream", ["a", "b"], None),
+        call("other-stream", ["c"], None),
+        call("reload-stream", ["a"], None),
+    ]
+
+
+@pytest.mark.cpu_test
+def test_metadata_failure_does_not_survive_load_scope():
+    metadata = SimpleNamespace(
+        from_files=MagicMock(
+            side_effect=[OSError("header read failed"), ["new-header"]]
+        )
+    )
+    module = ModuleType("runai_model_streamer.safetensors_streamer.safetensors_pytorch")
+    module.SafetensorsMetadata = metadata
+    with patch.dict(sys.modules, {module.__name__: module}):
+        with (
+            pytest.raises(OSError, match="header read failed"),
+            runai_metadata_cache(),
+        ):
+            _runai_metadata("failed-stream", ["a"])
+        with runai_metadata_cache():
+            assert _runai_metadata("new-stream", ["a"]) == ["new-header"]
 
 
 @pytest.mark.parametrize(

@@ -126,6 +126,17 @@ def e8m0_to_fp32(u8: torch.Tensor) -> torch.Tensor:
     return result
 
 
+def e8m0_to_fp32_bits(u8: torch.Tensor) -> torch.Tensor:
+    """Decode scale bytes on their device with the CPU ldexp result's bits.
+
+    Byte zero is the subnormal 2**-127. Byte 255 retains the existing
+    decoder's infinity result rather than changing its reserved-byte policy.
+    """
+    exponent_bits = u8.to(torch.int32) << 23
+    bits = torch.where(u8 == 0, 1 << 22, exponent_bits)
+    return bits.contiguous().view(torch.float32)
+
+
 def unpack_uint8_to_fp4(packed: torch.Tensor) -> torch.Tensor:
     """Unpack uint8 tensor containing two fp4 (e2m1) values per byte.
 

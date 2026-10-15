@@ -58,6 +58,9 @@ import threading
 import time
 from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
+from contextvars import ContextVar
+from typing import TYPE_CHECKING
 
 import torch
 
@@ -65,6 +68,51 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from runai_model_streamer.distributed_streamer import DistributedStreamer
+    from runai_model_streamer.safetensors_streamer.safetensors_pytorch import (
+        SafetensorsMetadata,
+    )
+
+_RUNAI_METADATA: ContextVar[dict[str, "SafetensorsMetadata"] | None] = ContextVar(
+    "runai_load_metadata", default=None
+)
+
+
+@contextmanager
+def runai_metadata_cache() -> Generator[None, None, None]:
+    """Reuse immutable headers across target and draft loading in one worker.
+
+    The cache ends with the enclosing model load, including on failure. A
+    later reload reads headers again even when the weight URIs are unchanged.
+    """
+    if _RUNAI_METADATA.get() is not None:
+        yield
+        return
+    token = _RUNAI_METADATA.set({})
+    try:
+        yield
+    finally:
+        _RUNAI_METADATA.reset(token)
+
+
+def _runai_metadata(
+    fs: "DistributedStreamer", filenames: list[str]
+) -> list["SafetensorsMetadata"]:
+    from runai_model_streamer.safetensors_streamer.safetensors_pytorch import (
+        SafetensorsMetadata,
+    )
+
+    cache = _RUNAI_METADATA.get()
+    if cache is None:
+        return SafetensorsMetadata.from_files(fs, filenames, None)
+    missing = list(dict.fromkeys(path for path in filenames if path not in cache))
+    if missing:
+        metadata = SafetensorsMetadata.from_files(fs, missing, None)
+        cache.update(zip(missing, metadata, strict=True))
+    return [cache[path] for path in filenames]
+
 
 # Suffixes of per-expert tensors that are safe to skip for non-local
 # experts. Anything else (dense, shared experts, gate, norms) is fetched by
@@ -219,7 +267,7 @@ def _sharded_runai_weights_iterator(
 
     with SafetensorsStreamer() as streamer:
         fs = streamer.file_streamer
-        metas = sp.SafetensorsMetadata.from_files(fs, hf_weights_files, None)
+        metas = _runai_metadata(fs, hf_weights_files)
 
         # Requests are indexed by their position: FileChunks.id == list index,
         # and tensors_by_request[id] lists the metadata of that run's chunks
