@@ -68,6 +68,7 @@ class RejectionSampler:
         do_sampling: bool = False,
         topk_candidates: int = 0,
         target_argmax: torch.Tensor | None = None,
+        apply_topk_topp: bool = True,
     ) -> torch.Tensor:
         return self.forward(
             draft_token_ids=draft_token_ids,
@@ -85,6 +86,7 @@ class RejectionSampler:
             do_sampling=do_sampling,
             topk_candidates=topk_candidates,
             target_argmax=target_argmax,
+            apply_topk_topp=apply_topk_topp,
         )
 
     def forward(
@@ -104,6 +106,7 @@ class RejectionSampler:
         do_sampling: bool = False,
         topk_candidates: int = 0,
         target_argmax: torch.Tensor | None = None,
+        apply_topk_topp: bool = True,
     ) -> torch.Tensor:
         """Performs rejection sampling for speculative decoding.
 
@@ -129,6 +132,10 @@ class RejectionSampler:
             the full vocab. See `apply_top_k_top_p_candidates`.
           target_argmax: The target's greedy token per row, standing in for
             target_logits on the greedy path (TPU_GREEDY_TOP_TOKENS).
+          apply_topk_topp: False skips `apply_top_k_top_p` on the non-greedy
+            path. The caller passes False only when no request sets top-k or
+            top-p, where the two 31-step bisections over the vocabulary are
+            the identity (7.5 ms per 512 rows on Flash). A separate graph.
 
         Returns:
           A tensor of shape [batch_size, max_draft_tokens + 1] containing the
@@ -167,6 +174,7 @@ class RejectionSampler:
                 self.synthetic_conditional_rates,
                 self.synthetic_mode,
                 topk_candidates,
+                apply_topk_topp,
             )
         if self.synthetic_mode and accept_u is None:
             raise ValueError("Synthetic rejection sampling requires accept_u.")
@@ -437,6 +445,7 @@ def _random_rejection_sample_with_segment(
     synthetic_conditional_rates: torch.Tensor | None,
     synthetic_mode: bool,
     topk_candidates: int = 0,
+    apply_topk_topp: bool = True,
 ) -> torch.Tensor:
     """Vectorized non-greedy speculative decoding validation in Torch."""
     total_tokens = draft_token_ids.shape[0]
@@ -455,7 +464,10 @@ def _random_rejection_sample_with_segment(
     scaled_logits = target_logits.to(torch.float32) / (
         temperatures.to(torch.float32) + TEMPERATURE_EPS
     )
-    masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p, topk_candidates)
+    if apply_topk_topp:
+        masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p, topk_candidates)
+    else:
+        masked_logits = scaled_logits
     target_probs = torch.softmax(masked_logits, dim=-1)
 
     # Accept test is the Leviathan ratio min(1, p(x) / q(x))

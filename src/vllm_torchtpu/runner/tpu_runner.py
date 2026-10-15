@@ -4353,6 +4353,7 @@ class TPUModelRunner(GPUModelRunner):
                     req_top_p,
                     all_greedy=False,
                     topk_candidates=topk_candidates,
+                    apply_topk_topp=self._sampler_applies_topk_topp(),
                 ).view(-1)
         accept_u = None
         assert self.rejection_sampler is not None
@@ -4397,6 +4398,7 @@ class TPUModelRunner(GPUModelRunner):
             recover_u=recover_u,
             do_sampling=True,
             topk_candidates=topk_candidates,
+            apply_topk_topp=self._sampler_applies_topk_topp(),
         )
 
     def sample_tokens(
@@ -4544,6 +4546,7 @@ class TPUModelRunner(GPUModelRunner):
                                 topk_candidates=self._sampler_topk_candidates(
                                     cur_start_idx, cur_end_idx, grammar_output
                                 ),
+                                apply_topk_topp=self._sampler_applies_topk_topp(),
                             )
                     assert self.speculative_config is not None
                     padded = torch.full(
@@ -4610,6 +4613,7 @@ class TPUModelRunner(GPUModelRunner):
                             topk_candidates=self._sampler_topk_candidates(
                                 cur_start_idx, cur_end_idx, grammar_output
                             ),
+                            apply_topk_topp=self._sampler_applies_topk_topp(),
                         )
                 # NOTE (NickLucche) Use the original logits (before any penalties or
                 # temperature scaling) for the top-k logprobs. We can't enforce it
@@ -5867,10 +5871,15 @@ class TPUModelRunner(GPUModelRunner):
                 dummy_top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(
                     self.device
                 )
-                variants = [(False, 0), (True, 0)]
+                # (all_greedy, topk_candidates, apply_topk_topp): under
+                # speculative decoding the random path has a no-top-k/top-p
+                # graph next to the full one (_sampler_applies_topk_topp).
+                variants = [(False, 0, True), (True, 0, True)]
+                if self.speculative_config is not None:
+                    variants.insert(1, (False, 0, False))
                 if blocks := self._topk_candidate_blocks():
-                    variants.append((False, blocks))
-                for all_greedy, topk_candidates in variants:
+                    variants.append((False, blocks, True))
+                for all_greedy, topk_candidates, apply_topk_topp in variants:
                     out = self.sample_from_logits_func(
                         dummy_logits,
                         dummy_temperatures,
@@ -5879,6 +5888,7 @@ class TPUModelRunner(GPUModelRunner):
                         dummy_top_p,
                         all_greedy=all_greedy,
                         topk_candidates=topk_candidates,
+                        apply_topk_topp=apply_topk_topp,
                     )
                     synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
@@ -6102,6 +6112,24 @@ class TPUModelRunner(GPUModelRunner):
                         accept_u=warm_accept_u,
                         recover_u=warm_recover_u,
                         do_sampling=True,
+                    )
+                    synchronize_tensors(out)
+                    # Same path without top-k/top-p (no request sets them).
+                    out = self.rejection_sampler(
+                        draft_token_ids=draft_token_ids,
+                        num_draft_tokens=draft_lengths,
+                        target_logits=target_logits_ng,
+                        bonus_token_ids=bonus_token_ids,
+                        segment_ids=segment_ids,
+                        group_indices=group_indices,
+                        max_draft_tokens=k,
+                        temperatures=warm_temps,
+                        top_k=warm_top_k,
+                        top_p=warm_top_p,
+                        accept_u=warm_accept_u,
+                        recover_u=warm_recover_u,
+                        do_sampling=True,
+                        apply_topk_topp=False,
                     )
                     synchronize_tensors(out)
                     if blocks := self._topk_candidate_blocks():
@@ -7389,6 +7417,23 @@ class TPUModelRunner(GPUModelRunner):
             return 0
         return num_blocks
 
+    def _sampler_applies_topk_topp(self) -> bool:
+        """False when speculative decoding is on and no running request sets
+        top-k or top-p.
+
+        `apply_top_k_top_p` runs two 31-step bisections over the whole
+        vocabulary per row (7.5 ms for 512 verify rows on Flash) and is the
+        identity for top_k == 0 and top_p == 1.0, the vLLM defaults; vLLM's
+        GPU sampler skips it in the same case, keyed on the same
+        `InputBatch.no_top_k` / `no_top_p`. The samplers skip it on a
+        separate compiled graph that the precompiles warm next to the full
+        one. Without speculative decoding the sampler keeps its single
+        full-path graph.
+        """
+        if self.speculative_config is None:
+            return True
+        return not (self.input_batch.no_top_k and self.input_batch.no_top_p)
+
     def _sampler_topk_candidates(
         self,
         cur_start_idx: int,
@@ -7518,6 +7563,7 @@ class TPUModelRunner(GPUModelRunner):
         top_p: torch.Tensor,
         all_greedy: bool = False,
         topk_candidates: int = 0,
+        apply_topk_topp: bool = True,
     ) -> torch.Tensor:
         """
         Sample with xla-friendly function. This function is to be traced
@@ -7527,7 +7573,14 @@ class TPUModelRunner(GPUModelRunner):
             return torch.argmax(logits, dim=-1, keepdim=True)
         is_greedy = temperatures <= SAMPLING_EPS
         scaled_logits = self._apply_temperature(logits, temperatures)
-        masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p, topk_candidates)
+        if apply_topk_topp:
+            masked_logits = apply_top_k_top_p(
+                scaled_logits, top_k, top_p, topk_candidates
+            )
+        else:
+            # No request sets top-k/top-p: skip the two 31-step vocabulary
+            # bisections (separate graph, warmed in the precompile).
+            masked_logits = scaled_logits
         u_clamped = torch.clamp(
             u, min=torch.finfo(u.dtype).tiny, max=1.0 - torch.finfo(u.dtype).eps
         )
