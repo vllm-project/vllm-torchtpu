@@ -20,7 +20,7 @@
 /mkdocs.yml @bvrockwell @RobMulla @qizzzh @Nanfang-Li
 
 # Kernel Implementations
-/src/vllm_torchtpu/kernels/ @kyuyeunk @qizzzh
+/src/vllm_torchtpu/kernels/ @kyuyeunk @qizzzh @bigeye
 /src/vllm_torchtpu/kernels/experimental/batched_rpa/ @kwang3939 @a1yssan13
 /src/vllm_torchtpu/kernels/gdn/v3/ @brianseung-google @mhhuang-machine
 
