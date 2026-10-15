@@ -34,6 +34,8 @@
 #   RECIPE_SET                    oct13 for the doc's Oct 13 set; unset for the first
 #   RECIPE_STORE_SERVERS          1: the Oct 13 decode-host store servers
 #   RECIPE_STORE_NODE_BYTES       each store server's DRAM; optional
+#   RECIPE_PARSERS                0: no K3 reasoning or tool-call parsers and no
+#                                 tool-call suite, the doc's command line; default 1
 #
 # Two readers:
 #   k3_agentx_client_pod.sh  sources it with K3_1P1D_ROLE=decode for the shape,
@@ -46,9 +48,15 @@
 #                            launches with --nnodes
 #
 # Where this departs from the doc, each needed on GKE: distinct Raiden ids per
-# role and --headless on hosts 1-3 (which k3_1p1d.sh adds). Not here, as in the doc: --enable-auto-tool-choice,
-# --tool-call-parser and --reasoning-parser, and so not the Kimi tool-call
-# post-eval either.
+# role and --headless on hosts 1-3 (which k3_1p1d.sh adds).
+#
+# Not in the doc: both roles run --enable-auto-tool-choice and the kimi_k3
+# tool-call and reasoning parsers, and the Kimi tool-call suite runs after
+# the replay, as InferenceX does for every K3 point. The suite's strict tool
+# calls decode under a grammar, which the decoder applies from
+# inferact/megakernel-integration-1015 on; the replay sends no tools.
+# RECIPE_PARSERS=0 drops the parsers and the suite. AGENTX_EVAL_JOB=1, the
+# GSM8K eval-only job, has DSpark verify drafts for real.
 #
 # RECIPE_SET=oct13 serves the doc's Oct 13 set as its "Changes from" list reads:
 # TPU P-state 7 and RAIDEN_NUMA_POLICY=bind on both roles, the prefill without
@@ -92,6 +100,14 @@ if [ -n "${RECIPE_STORE_SERVERS:-}" ] && [ "${RECIPE_SET:-}" != oct13 ]; then
   echo "ERROR: kimi-k3-megakernel: RECIPE_STORE_SERVERS is the Oct 13 set's (RECIPE_SET=oct13)" >&2
   return 2
 fi
+# The eval-only job always runs the parsers.
+_eval_job="${AGENTX_EVAL_JOB:-0}"
+_parsers="${RECIPE_PARSERS:-1}"
+case "$_eval_job:$_parsers" in [01]:[01]) ;;
+  *) echo "ERROR: kimi-k3-megakernel: AGENTX_EVAL_JOB='$_eval_job' and RECIPE_PARSERS='$_parsers' must be 0 or 1" >&2
+     return 2 ;;
+esac
+[ "$_eval_job" != 1 ] || _parsers=1
 
 # ---- what the AgentX client reads ----------------------------------------------
 # Each role is TP32 with EP over all 32 ranks and no DP, launched with --nnodes.
@@ -108,13 +124,13 @@ AGENTX_ALLOW_SEQS_BELOW_CONC=1
 AGENTX_CONC_LIST="$RECIPE_CONCURRENCY"
 AGENTX_MODEL_PREFIX=kimik3
 AGENTX_PRECISION=fp4
-# The Kimi tool-call suite needs the tool-call parser this recipe does not run.
+# The Kimi tool-call suite; it needs the tool-call parser.
 AGENTX_POST_EVAL_SUITES=""
+[ "$_parsers" = 0 ] || AGENTX_POST_EVAL_SUITES=kimi_tool_call_schema_full
 # The doc's request path: vllm-router in its prefill/decode mode.
 AGENTX_PROXY=router
-# No GSM8K probe: the DSpark points accept drafts at a synthetic length, so
-# their answers are not the model's, and no point runs the reasoning parser
-# that strips K3's channel markers from the answer.
+# No GSM8K before the replay (DSpark answers are synthetic there); the
+# eval-only job runs it.
 AGENTX_GSM8K_LIMIT=0
 if [ "$_no_spec" = 1 ]; then
   AGENTX_SPEC_METHOD=none
@@ -300,6 +316,9 @@ COMMON_ARGS=(
   --mamba-cache-mode align --enable-prefix-caching
   --enable-prompt-tokens-details
 )
+if [ "$_parsers" = 1 ]; then
+  COMMON_ARGS+=(--enable-auto-tool-choice --tool-call-parser kimi_k3 --reasoning-parser kimi_k3)
+fi
 
 # ---- per role and point ---------------------------------------------------------
 # The host-memory KV store the roles add beside Raiden: the doc's 1.5 TiB
@@ -398,14 +417,23 @@ elif [ "$RECIPE_DECODE" = dcp32 ]; then
     --kv-transfer-config "{${_raiden},\"kv_role\":\"kv_consumer\"}"
   )
 else
-  _loader=$(printf '{"presharded":"%s","synthetic_acceptance_lengths":{"3":2.87,"7":3.78}}' "$PRESHARDED_DIR")
+  # The eval-only job verifies drafts against the target; the replay accepts
+  # them at the doc's synthetic length.
   if [ "$RECIPE_DECODE" = dspark ]; then
-    _spec=$(printf '{"method":"dspark","model":"%s","num_speculative_tokens":%s,"rejection_sample_method":"synthetic","synthetic_acceptance_length":%s}' \
-      "$DSPARK_DIR" "$RECIPE_DRAFTS" "$RECIPE_ACCEPTANCE")
+    _acceptance="$RECIPE_ACCEPTANCE"
+    _drafts="\"num_speculative_tokens\":$RECIPE_DRAFTS"
   else
-    _spec=$(printf '{"method":"dspark","model":"%s","num_speculative_tokens":7,"num_speculative_tokens_per_batch_size":%s,"rejection_sample_method":"synthetic","synthetic_acceptance_length":3.78}' \
-      "$DSPARK_DIR" "$RECIPE_DRAFTS_PER_BATCH_SIZE")
+    _acceptance=3.78
+    _drafts="\"num_speculative_tokens\":7,\"num_speculative_tokens_per_batch_size\":$RECIPE_DRAFTS_PER_BATCH_SIZE"
   fi
+  if [ "$_eval_job" = 1 ]; then
+    _loader=$(printf '{"presharded":"%s"}' "$PRESHARDED_DIR")
+    _synthetic=""
+  else
+    _loader=$(printf '{"presharded":"%s","synthetic_acceptance_lengths":{"3":2.87,"7":3.78}}' "$PRESHARDED_DIR")
+    _synthetic=",\"rejection_sample_method\":\"synthetic\",\"synthetic_acceptance_length\":$_acceptance"
+  fi
+  _spec=$(printf '{"method":"dspark","model":"%s",%s%s}' "$DSPARK_DIR" "$_drafts" "$_synthetic")
   if [ -n "${RECIPE_STORE_SERVERS:-}" ]; then
     # The store servers' pool replaces the decode's own host store.
     _kv="{${_raiden},\"kv_role\":\"kv_consumer\"}"
@@ -457,5 +485,5 @@ if [ "$_no_spec" = 0 ]; then
 fi
 K3_1P1D_IMPORTS=(vllm_torchtpu.megakernel)
 unset _v _role _cache_user _offload_bytes _raiden _loader _kv _kv_cache_bytes _spec
-unset _registry _registry_port _pool_group _retention _no_spec
+unset _registry _registry_port _pool_group _retention _no_spec _synthetic _acceptance _drafts _eval_job _parsers
 unset -f _offload_connector _multi_connector

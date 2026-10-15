@@ -23,8 +23,8 @@
 #   K3_ENGINE_REF=<ref>      build the image from that ref of this repo - a
 #                            branch, a tag, a full 40-character commit SHA (git
 #                            cannot fetch a short one) or refs/pull/<N>/head;
-#                            default inferact/megakernel-integration - or reuse
-#                            it if the registry already has it
+#                            default inferact/megakernel-integration-1015 - or
+#                            reuse it if the registry already has it
 set -euo pipefail
 
 if [ -n "${K3_ENGINE_IMAGE:-}" ]; then
@@ -33,7 +33,7 @@ if [ -n "${K3_ENGINE_IMAGE:-}" ]; then
   exit 0
 fi
 
-REF="${K3_ENGINE_REF:-inferact/megakernel-integration}"
+REF="${K3_ENGINE_REF:-inferact/megakernel-integration-1015}"
 # setup_docker_env.sh's repository; its tags are <commit>-<vllm>, so a k3engine-
 # prefix keeps these apart from the per-build CI images.
 IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu"

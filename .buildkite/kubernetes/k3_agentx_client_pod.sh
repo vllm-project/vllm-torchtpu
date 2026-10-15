@@ -52,8 +52,8 @@
 #   and AGENTX_DURATION and AGENTX_FAST, which the environment overrides.
 # Optional: AGENTX_DURATION, AGENTX_FAST, AGENTX_GSM8K_LIMIT, AGENTX_GSM8K_CONC,
 #   AGENTX_IX_REF, AGENTX_GCS_ROOT, AGENTX_READY_WAIT_MIN, AGENTX_EVAL_JOB=1
-#   (set by the eval step alone, not the build: a build-level value reaches
-#   every step's pods, and the throughput step must not take this branch),
+#   (the eval step's own env, or the build's on the dev lane, whose one step
+#   is then the eval-only job),
 #   AGENTX_EVAL_SMOKE=1 (the evals as a link check, not a result: 20 GSM8K
 #   questions in place of the split, the verifier's two-case suite in place
 #   of the full one), AGENTX_SKIP_POST_EVAL=1 (throughput: replay only).
