@@ -10,6 +10,7 @@ from typing import cast
 import torch
 from torch import nn
 from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention.attention import set_default_quant_scales
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
@@ -27,6 +28,8 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import build_qsa_op
+from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 
 @dataclass(frozen=True)
@@ -156,6 +159,32 @@ class Qwen4ExpQSABackend(AttentionBackend):
         return (2, num_blocks, block_size, num_kv_heads, head_size)
 
 
+class Qwen4ExpPooledQSABackend(PallasAttentionBackend):
+    """Native pool geometry; QSA maps manager pages to 4-token RPA pages."""
+
+    @staticmethod
+    def get_name():
+        return "QWEN4_EXP_TPU_POOLED_QSA"
+
+    @staticmethod
+    def get_supported_kernel_block_sizes(
+        kv_cache_spec: KVCacheSpec | None = None,
+    ) -> list[MultipleOf | int]:
+        return [MultipleOf(QSA_BLOCK_SIZE)]
+
+    @staticmethod
+    def get_min_page_size(vllm_config):
+        from .pool_layout import pooled_cache_specs
+
+        return pooled_cache_specs(vllm_config)[0].block_size
+
+    @classmethod
+    def supported_kv_cache_layouts(cls):
+        from vllm.v1.kv_cache_interface import KVCacheLayout
+
+        return (KVCacheLayout.BLHNC,)
+
+
 class _Indexer(nn.Module):
     def __init__(self, config, prefix):
         super().__init__()
@@ -217,11 +246,13 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         device=None,
         cache_dtype: str = "auto",
         prefix: str = "",
+        pooled: bool = False,
     ):
         super().__init__()
         if not 0 <= tp_rank < tp_size:
             raise ValueError("QSA requires an in-range TP rank")
         self.tp_rank, self.tp_size, self.prefix = tp_rank, tp_size, prefix
+        self.pooled = pooled
         self.fp8_kv = cache_dtype in ("fp8", "fp8_e4m3")
         self.cache_dtype = cache_dtype
         self.config = config
@@ -308,7 +339,16 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         )
 
     def get_attn_backend(self):
-        return Qwen4ExpQSABackend
+        return Qwen4ExpPooledQSABackend if self.pooled else Qwen4ExpQSABackend
+
+    def bind_pool(self, pool):
+        from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import build_pooled_qsa_op
+
+        self.cache_owners = (pool,)
+        self._op = partial(
+            build_pooled_qsa_op(),
+            **self._op.keywords,
+        )
 
     def get_kv_cache_spec(self, vllm_config):
         return get_qsa_cache_specs(self.config, self.tp_size, self.cache_dtype)[0]
@@ -437,9 +477,25 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             raise ValueError(f"Missing QSA checkpoint tensors: {sorted(missing)}")
 
     def forward_with_indices(self, hidden, positions, metadata: QSAMetadata):
-        assert len(self.cache_owners) == 4, (
+        assert len(self.cache_owners) == (1 if self.pooled else 4), (
             "Task4 must bind real or profiling scratch QSA owners"
         )
+        if self.pooled:
+            per_layer = cast(
+                dict[str, AttentionMetadata], get_forward_context().attn_metadata
+            )
+            metadata = replace(
+                metadata,
+                state_slots=cast(
+                    torch.Tensor, per_layer[self.prefix + ".raw_ring"].block_tables
+                ),
+                main_block_table=cast(
+                    torch.Tensor, per_layer[self.prefix].block_tables
+                ),
+                compressed_block_table=cast(
+                    torch.Tensor, per_layer[self.prefix + ".compressed_k"].block_tables
+                ),
+            )
         output, selected = self._op(
             self.q_proj(hidden),
             self.k_proj(hidden),
