@@ -15,12 +15,18 @@
 
 vLLM-Omni diffusion workers run in separate worker processes spawned by
 vLLM-Omni's DiffusionEngine rather than through TPUWorker's worker_init /
-model_load lifecycle stages, so Omni patches are applied from
-OmniTpuPlatform at platform registration and attention backend import
-(tracked in #1862 for unification with patch_registry.py). Because
-importing vllm_torchtpu sets TORCH_TPU_DEFER_AND_FUSE=1 in
-vllm_torchtpu/__init__.py, deferred graph execution is active in diffusion
-workers when helpers such as synchronize_tensors() run.
+model_load lifecycle stages, so OmniTpuPlatform applies the Omni patches
+itself: apply_omni_tpu_patches() when the platform is constructed, and
+apply_omni_model_specific_patches() at attention backend selection
+(get_diffusion_attn_backend_cls). Tracked in #1862 for unification with
+patch_registry.py.
+
+Deferred graph execution (DEFER_AND_FUSE) is active in diffusion workers
+when helpers such as synchronize_tensors() run. Diffusion workers build a
+VllmConfig, so TpuPlatform.check_and_update_config runs the
+platform_activation patches, including _configure_torchtpu_eager_mode() in
+platforms/tpu_platform.py, which selects DEFER_AND_FUSE unless
+TPU_KERNEL_ITER_MODE is set.
 """
 
 from functools import cache as run_once
@@ -290,7 +296,9 @@ def _patch_wan_fresh_timestep() -> None:
     # Fix: clone the timestep on entry and flush the clone right away, so only
     #   a tiny copy graph sees the view.
     # Effect (v7x, 480x832x81, 8 cores): first 12-step request 53.0 s -> 26.9 s
-    #   (warm: 15.5 s); output is bit-identical.
+    #   (warm: 15.3 s); output is bit-identical.
+    # Scope: WanTransformer3DModel only (T2V, I2V, TI2V, both A14B experts).
+    #   VACE overrides forward and S2V is a separate class; neither is covered.
     # TODO: remove once torch_tpu passes view offsets as runtime inputs.
     from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
         WanTransformer3DModel,
