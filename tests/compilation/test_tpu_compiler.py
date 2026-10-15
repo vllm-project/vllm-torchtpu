@@ -469,15 +469,20 @@ class TestTpuCompilerCache:
         assert firsts == [1, 1]
 
     @staticmethod
-    def _peer_compilers(tmp_path, monkeypatch, n=2):
+    def _peer_compilers(tmp_path, monkeypatch, n=2, peer_replay="1"):
         """Compilers for local ranks 0..n-1 of one host, with a fake backend
-        that records which ranks really compiled."""
+        that records which ranks really compiled. peer_replay=None leaves
+        TPU_PRECOMPILE_PEER_REPLAY unset."""
         import torch
         from vllm.config.utils import Range
 
         from vllm_torchtpu.compilation import tpu_compiler
         from vllm_torchtpu.compilation.tpu_compiler import TpuCompilerAdaptor
 
+        if peer_replay is None:
+            monkeypatch.delenv("TPU_PRECOMPILE_PEER_REPLAY", raising=False)
+        else:
+            monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", peer_replay)
         compiled, replayed = [], []
 
         class Compiled:
@@ -613,9 +618,13 @@ class TestTpuCompilerCache:
         compile(b)
         assert compiled == [0, 1]
 
-    def test_peer_replay_off_compiles_every_rank_itself(self, tmp_path, monkeypatch):
-        """TPU_PRECOMPILE_PEER_REPLAY=0: no peer lookup, no wait, no link,
-        and no fingerprint recorded; each rank compiles and saves its own."""
+    @pytest.mark.parametrize("peer_replay", ["0", None])
+    def test_peer_replay_off_compiles_every_rank_itself(
+        self, tmp_path, monkeypatch, peer_replay
+    ):
+        """TPU_PRECOMPILE_PEER_REPLAY off, explicitly or by default (None): no
+        peer lookup, no wait, no link, and no fingerprint recorded; each rank
+        compiles and saves its own."""
         import pickle
 
         from vllm_torchtpu.compilation import tpu_compiler
@@ -624,9 +633,8 @@ class TestTpuCompilerCache:
             wait_for_peer_artifact,
         )
 
-        monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", "0")
         (a, b), compile, compiled, replayed = self._peer_compilers(
-            tmp_path, monkeypatch
+            tmp_path, monkeypatch, peer_replay=peer_replay
         )
 
         def no_peer_lookup(*args, **kwargs):

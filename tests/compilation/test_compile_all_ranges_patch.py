@@ -35,6 +35,8 @@ SIZES = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 @pytest.fixture
 def compile_all_ranges(monkeypatch):
     monkeypatch.setenv("TPU_PARALLEL_PRECOMPILE", "1")
+    monkeypatch.setenv("TPU_PRECOMPILE_BIGGEST_FIRST", "1")
+    monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", "1")
     monkeypatch.setattr(
         piecewise_backend, "create_concrete_args", lambda graph, size: [size]
     )
@@ -157,15 +159,24 @@ def test_biggest_first_off_deals_in_vllm_order(compile_all_ranges, monkeypatch):
     [
         ("1", [4096, 2048, 1024, 512, 256, 128, 64, 32]),
         ("0", SIZES[:8]),
+        (None, SIZES[:8]),
     ],
 )
+@pytest.mark.parametrize("peer_replay", ["0", None])
 def test_peer_replay_off_compiles_every_range_without_waiting(
-    compile_all_ranges, monkeypatch, biggest_first, firsts
+    compile_all_ranges, monkeypatch, peer_replay, biggest_first, firsts
 ):
-    """TPU_PRECOMPILE_PEER_REPLAY=0: no owners and no waits; each local rank
-    starts on a different range and compiles every range itself."""
-    monkeypatch.setenv("TPU_PRECOMPILE_PEER_REPLAY", "0")
-    monkeypatch.setenv("TPU_PRECOMPILE_BIGGEST_FIRST", biggest_first)
+    """TPU_PRECOMPILE_PEER_REPLAY off, explicitly or by default (None): no
+    owners and no waits; each local rank starts on a different range and
+    compiles every range itself."""
+    for name, value in [
+        ("TPU_PRECOMPILE_PEER_REPLAY", peer_replay),
+        ("TPU_PRECOMPILE_BIGGEST_FIRST", biggest_first),
+    ]:
+        if value is None:
+            monkeypatch.delenv(name)
+        else:
+            monkeypatch.setenv(name, value)
     runs = [_compile(compile_all_ranges, monkeypatch, r) for r in range(8)]
     assert [calls[0][0] for calls in runs] == firsts
     for calls in runs:

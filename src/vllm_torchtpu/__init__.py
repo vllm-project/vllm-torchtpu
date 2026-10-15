@@ -362,15 +362,14 @@ def _patch_vllm_disable_compile_ranges() -> None:
 def _patch_vllm_compile_all_ranges() -> None:
     """Patch vllm compile all ranges so the ranks of a host split the ranges.
 
-    Each range is compiled by one rank of the host, its owner; every other rank
-    replays the artifact the owner saves to vLLM's compile cache instead of
-    tracing and compiling the range again (see TpuCompilerAdaptor.compile).
-    Startup then takes about as long as the slowest single range instead of
-    the sum over ranges.
+    With TPU_PRECOMPILE_PEER_REPLAY=1, each range is compiled by one rank of
+    the host, its owner; every other rank replays the artifact the owner saves
+    to vLLM's compile cache instead of tracing and compiling the range again
+    (see TpuCompilerAdaptor.compile). Startup then takes about as long as the
+    slowest single range instead of the sum over ranges.
 
-    TPU_PRECOMPILE_PEER_REPLAY=0 turns that off: each rank compiles every
-    range itself, starting on a different one, and the ranks share only
-    through the Tier-2 cache.
+    Off, the default, each rank compiles every range itself, starting on a
+    different one, and the ranks share only through the Tier-2 cache.
     """
     import os
     from collections import deque
