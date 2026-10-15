@@ -3000,6 +3000,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         top_p,
         all_greedy=False,
         topk_candidates=0,
+        apply_topk_topp=True,
     ):
         seen_u_dtypes.append(u.dtype)
         return torch.zeros((logits.shape[0], 1), dtype=torch.int32)
@@ -3011,19 +3012,22 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         torch.ones((2, 1), dtype=torch.float32),
     )
 
-    # 1. _precompile_sample_from_logits
-    precompile_runner = SimpleNamespace(
-        num_reqs_paddings=[2],
-        _hidden_states_dtype=torch.bfloat16,
-        device=torch.device("cpu"),
-        _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
-        _topk_candidate_blocks=lambda: 0,
-        _precompile_timed=lambda _name: contextlib.nullcontext(),
-        sample_from_logits_func=fake_sample_from_logits,
-    )
-    TPUModelRunner._precompile_sample_from_logits(precompile_runner)
-    assert seen_u_dtypes == [torch.float32, torch.float32]
-    seen_u_dtypes.clear()
+    # 1. _precompile_sample_from_logits: two graphs without speculative
+    # decoding, plus the no-top-k/top-p graph with it.
+    for speculative_config, num_graphs in ((None, 2), (SimpleNamespace(), 3)):
+        precompile_runner = SimpleNamespace(
+            num_reqs_paddings=[2],
+            _hidden_states_dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+            _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
+            _topk_candidate_blocks=lambda: 0,
+            _precompile_timed=lambda _name: contextlib.nullcontext(),
+            sample_from_logits_func=fake_sample_from_logits,
+            speculative_config=speculative_config,
+        )
+        TPUModelRunner._precompile_sample_from_logits(precompile_runner)
+        assert seen_u_dtypes == [torch.float32] * num_graphs
+        seen_u_dtypes.clear()
 
     # 2. _sample_spec_verify_chunk (bonus_u and recover_u)
     seen_recover_dtypes: list[torch.dtype] = []
@@ -3039,6 +3043,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         ),
         _build_padded_sampling_params=lambda start, end, logits: sampling_params,
         _sampler_topk_candidates=lambda start, end, grammar: 0,
+        _sampler_applies_topk_topp=lambda: True,
         sample_from_logits_func=fake_sample_from_logits,
         speculative_config=SimpleNamespace(num_speculative_tokens=1),
     )
@@ -3117,6 +3122,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             _get_sampling_generator=lambda: None,
             _build_padded_sampling_params=lambda start, end, logits: sampling_params,
             _sampler_topk_candidates=lambda start, end, grammar: 0,
+            _sampler_applies_topk_topp=lambda: True,
             sample_from_logits_func=fake_sample_from_logits,
             _update_mamba_slot_read_offsets=lambda *_args: None,
             _update_num_xla_graphs=lambda *_args: None,
