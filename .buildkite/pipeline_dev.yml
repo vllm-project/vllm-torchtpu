@@ -71,6 +71,14 @@ steps:
       queue: cpu_64_core
     commands:
       - bash .buildkite/scripts/setup_docker_env.sh
+    # The torch-tpu virtual registry sometimes 404s a wheel it serves moments
+    # later, and a build that fails that way passes on a later try. Twice
+    # rather than pipeline_build.yml's once: a failed image build here fails
+    # the whole run, Kimi-K3 pair included.
+    retry: &image_build_retry
+      automatic:
+        - exit_status: 1
+          limit: 2
 
   # -----------------------------------------------------------------
   # Demo 1: offline_inference.py
@@ -164,6 +172,7 @@ steps:
       queue: cpu_64_core
     commands:
       - bash .buildkite/scripts/build_k3_engine_image.sh
+    retry: *image_build_retry
 
   - label: ":kubernetes: :tpu: Perf: Kimi-K3 AgentX 1P1D ${K3_PD_CONFIG} (TPU v7x 2x2x4 x2)"
     key: k3_mk_agentx_1p1d
