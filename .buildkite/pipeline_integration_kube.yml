@@ -3,9 +3,9 @@
 #
 # qwen35-pcp8-dp8-disagg-correctness and qwen35-gpc-correctness reach their
 # second host by ssh on bare metal, starting a container there with ROLE=decode
-# or GPC_ROLE=worker. They cannot go through run_multihost.sh, which brings up a
-# Ray cluster and runs one command on the head, so each has a JobSet naming its
-# two roles instead, and run_jobset.sh submits it.
+# or GPC_ROLE=worker. That is not one command on a Ray head, which is what
+# run_multihost.sh runs by default, so each has a JobSet naming its two roles
+# instead, and run_multihost.sh --manifest submits it.
 
 # Every step here writes its results under this directory and the pod uploads
 # whatever it finds there. Declared once for the pipeline rather than per step:
@@ -20,9 +20,6 @@ x-kube-plugin: &kube_plugin
 x-integration-step-defaults: &integration_step
   depends_on:
     - "build_docker"
-  # Shared with pipeline_perf_kube.yml, which says why six.
-  concurrency_group: "tpu/v7x"
-  concurrency: 6
   # Covers queueing as well as running, so it cannot be set from how long the
   # work takes. The sum of the launcher's two limits, so a step is stopped by
   # whichever of those it exceeded and not by this.
@@ -55,11 +52,27 @@ steps:
         commands:
           - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_qwen35_p4d2_disagg_correctness.sh
 
-      # pipeline_integration.yml gates this on build.pull_request.id, which no
-      # scheduled build has. Kept ungated rather than migrated as a step that
-      # could never run: this lane exists to put work on the fleet.
+      # pipeline_integration.yml also sets the prefill and decode layout
+      # (ROLE, PREFILL_*, DECODE_*, TPU_RAIDEN_DST_SHARDS, VLLM_KV_CACHE_LAYOUT).
+      # Those names do not reach the pod, and the values there are the script's
+      # own defaults, so the script supplies them.
+      - label: ":kubernetes: Integration: qwen35-pcp4tp1-tp4dcp2-disagg-correctness"
+        key: "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness"
+        env:
+          SHAPE: *shape_8_core
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
+          RUN_ROOT: "perf_eval_results/qwen35_pcp4tp1_tp4dcp2_disagg_ci"
+        <<: *integration_step
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_qwen35_pcp_tp_dcp_disagg_correctness.sh
+
+      # PR builds only, as on bare metal; a nightly does not run it there.
       - label: ":kubernetes: Presubmit: disagg-single-host"
         key: "presubmit_disagg_single_host"
+        if: "build.pull_request.id != null"
         env:
           SHAPE: *shape_8_core
         <<: *integration_step
@@ -194,10 +207,8 @@ steps:
           - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_k3_pruned75_apc_offload_correctness.sh
 
   # A two-host slice, so it goes through run_multihost.sh and the JobSet in
-  # manifests/. Not in the tpu/v7x concurrency group: a group counts steps, not
-  # chips, so no slot can say "the whole fleet" - the dependency below is what
-  # reserves the hardware instead. allow_failure because what this needs from
-  # those steps is their chips, not their results.
+  # manifests/. Kueue holds it until a 2x2x2 slice is free, so it starts with
+  # the rest of the lane.
   #
   # This is the only step in either integration lane that exercises the fleet's
   # 2x2x2 profile, which has held zero chip-hours since the fleet was built.
@@ -205,8 +216,6 @@ steps:
     key: "vllm_torchtpu_multihost_presubmit"
     depends_on:
       - "build_docker"
-      - step: "integration_tpu"
-        allow_failure: true
     timeout_in_minutes: 1440
     agents:
       queue: "kube"
@@ -214,7 +223,7 @@ steps:
       - *kube_plugin
     commands:
       - >-
-        .buildkite/kubernetes/run_multihost.sh
+        .buildkite/kubernetes/run_multihost.sh --topology 2x2x2
         python3 examples/offline_inference.py
         --model Qwen/Qwen3-0.6B
         --tensor-parallel-size 16
@@ -222,16 +231,11 @@ steps:
         --max-num-batched-tokens 256
         --max-tokens 32
 
-  # The role-per-host tests. Each holds both hosts - two engines of eight
-  # devices, which is one whole tpu7x-standard-4t each - so like the multihost
-  # step above they sit outside the tpu/v7x concurrency group, which counts
-  # steps rather than chips.
-  #
-  # Chained one after another rather than all depending on the TPU group: three
-  # steps that each want the fleet would start their clocks together and queue,
-  # and the last would spend its budget waiting rather than running.
-  # allow_failure throughout because what each needs from the step before is
-  # its chips, not its result.
+  # The role-per-host tests. Each holds two hosts - two engines of eight
+  # devices, which is one whole tpu7x-standard-4t each - and like the multihost
+  # step above they start with the rest of the lane: eight chips apiece, which
+  # Kueue holds them for. The step timeout covers that wait, and the launcher's
+  # limits run to hours.
   #
   # None uploads artifacts. The pod is deleted when the run ends and these
   # submit a manifest rather than going through run.sh's upload wrapper, so the
@@ -240,29 +244,25 @@ steps:
     key: "integration_qwen35_pcp8_dp8_disagg_correctness"
     depends_on:
       - "build_docker"
-      - step: "vllm_torchtpu_multihost_presubmit"
-        allow_failure: true
     timeout_in_minutes: 1440
     agents:
       queue: "kube"
     plugins:
       - *kube_plugin
     commands:
-      - .buildkite/kubernetes/run_jobset.sh qwen3.5-p8d8-disagg.yaml
+      - .buildkite/kubernetes/run_multihost.sh --manifest qwen3.5-p8d8-disagg.yaml
 
   - label: ":kubernetes: Integration: qwen35-gpc-correctness"
     key: "integration_qwen35_gpc_correctness"
     depends_on:
       - "build_docker"
-      - step: "integration_qwen35_pcp8_dp8_disagg_correctness"
-        allow_failure: true
     timeout_in_minutes: 1440
     agents:
       queue: "kube"
     plugins:
       - *kube_plugin
     commands:
-      - .buildkite/kubernetes/run_jobset.sh qwen3.5-gpc-two-replica.yaml
+      - .buildkite/kubernetes/run_multihost.sh --manifest qwen3.5-gpc-two-replica.yaml
 
   # Nightly only, as on bare metal: a DSv4 boot is ~27 min of weight streaming
   # and compile before the probes start.
@@ -271,12 +271,10 @@ steps:
     if: 'build.env("NIGHTLY") == "1"'
     depends_on:
       - "build_docker"
-      - step: "integration_qwen35_gpc_correctness"
-        allow_failure: true
     timeout_in_minutes: 1440
     agents:
       queue: "kube"
     plugins:
       - *kube_plugin
     commands:
-      - .buildkite/kubernetes/run_jobset.sh dsv4-pd-disagg.yaml
+      - .buildkite/kubernetes/run_multihost.sh --manifest dsv4-pd-disagg.yaml

@@ -163,7 +163,7 @@ def _attention_hca(
         swa_m=swa_m,
         sm_scale=sm_scale,
         # The following parameters are tuned based on microbenchmark results.
-        num_kv_pages_per_block=(32, 32, 32),
+        num_kv_pages_per_block=(128, 64, 64),
         num_queries_per_block=(1, 32, 32),
     )
     return output, updated_sw_cache
@@ -219,6 +219,13 @@ def _attention_csa(
     if two_caches_same_buffer:
         main_cache_kv = updated_sw_cache
 
+    gather_and_attention_chunk_size = 128
+    attention_kernel_batch_size = 16
+    # small chunks override:
+    if q.shape[0] <= 128:
+        gather_and_attention_chunk_size = 32
+        attention_kernel_batch_size = 8
+
     output = sparse_ragged_paged_attention(
         q=q,
         cache_kv_nope=main_cache_kv,
@@ -232,6 +239,8 @@ def _attention_csa(
         swa_l=swa_l,
         swa_m=swa_m,
         sm_scale=sm_scale,
+        gather_and_attention_chunk_size=gather_and_attention_chunk_size,
+        attention_kernel_batch_size=attention_kernel_batch_size,
     )
     return output, updated_sw_cache
 
@@ -292,7 +301,7 @@ class VllmDeepseekV4SWACache(DeepseekV4SWACache):
             return block_size
         return min(block_size, window_size)
 
-    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec | None:
+    def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         # Update self.block_size so the returned spec and the Pallas kernel's
         # logical_page_size in attention.py agree on the final runtime block size.
         self.block_size = self._swa_block_size(

@@ -11,7 +11,13 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Combined native-SparseCore NOPE/ROPE gather for GLM-5.2."""
+"""Combined native-SparseCore NOPE/ROPE gather for GLM-5.2.
+
+An optional traced live-row count (``num_live_indices``) bounds the outer
+emit_pipeline grid so only the logical batches holding live rows are gathered;
+rows beyond are left unwritten (the attention grid never reads them). Without
+it every row is gathered.
+"""
 
 from __future__ import annotations
 
@@ -50,6 +56,8 @@ def _kernel(
     nope_out_hbm_ref: Any,
     rope_out_hbm_ref: Any,
     sem_ref: Any,
+    live_vmem_ref: Any = None,
+    live_sem_ref: Any = None,
     *,
     core_axis_name: str,
     subcore_axis_name: str,
@@ -58,8 +66,23 @@ def _kernel(
     batches_per_owner: int,
     wait_mode: str,
     serve_pipelined: bool,
+    live_hbm_ref: Any = None,
+    guard_tail: bool = False,
 ):
     owner = lax.axis_index((core_axis_name, subcore_axis_name))
+    live_batches = None
+    if live_hbm_ref is not None:
+        # The live logical-batch count arrives as a broadcast i32[NUM_LANES]
+        # vector. On SparseCore a scalar load is legal only from SMEM and SMEM
+        # only at rank 0 (jax/_src/pallas/mosaic/sc_lowering.py), so the count is
+        # DMA'd into a VMEM vector and lane 0 extracted -- the same shape as the
+        # in-repo dsa_gather.py:90 (`valid_ref[pl.ds(0, 16)][0]`).
+        cp = pltpu.make_async_copy(live_hbm_ref, live_vmem_ref, live_sem_ref.at[0])
+        cp.start()
+        cp.wait()
+        # Lanes [0,16) broadcast the live logical-batch count, lanes [16,32)
+        # the per-owner trip count; only lane 0 of a vector is ever extracted.
+        live_batches = live_vmem_ref[pl.ds(0, NUM_LANES)][0]
 
     def serve_batch(indices_ref):
         owner_batch = pl.program_id(0)
@@ -135,27 +158,55 @@ def _kernel(
             (QUADS_PER_ATOM, 128),
             lambda atom: (logical_batch * atoms_per_batch + atom, 0),
         )
-        pltpu.emit_pipeline(
-            body,
-            grid=(atoms_per_batch,),
-            in_specs=nope_specs + rope_specs,
-            out_specs=(rope_out_spec,),
-            no_pipelining=not serve_pipelined,
-        )(
-            *([nope_hbm_ref] * ROPE_PACKING),
-            *([rope_hbm_ref] * ROPE_PACKING),
-            rope_out_hbm_ref,
-        )
+
+        def run_inner():
+            pltpu.emit_pipeline(
+                body,
+                grid=(atoms_per_batch,),
+                in_specs=nope_specs + rope_specs,
+                out_specs=(rope_out_spec,),
+                no_pipelining=not serve_pipelined,
+            )(
+                *([nope_hbm_ref] * ROPE_PACKING),
+                *([rope_hbm_ref] * ROPE_PACKING),
+                rope_out_hbm_ref,
+            )
+
+        if live_batches is not None and guard_tail:
+            # Owners share a uniform traced grid of cdiv(live, num_owners);
+            # the ragged last round is skipped per owner.
+            pl.when(logical_batch < live_batches)(run_inner)
+        else:
+            run_inner()
 
     indices_spec = pl.BlockSpec(
         (1, atoms_per_batch, ROPE_PACKING, NUM_LANES),
         lambda batch: (owner + batch * num_owners, 0, 0, 0),
     )
-    pltpu.emit_pipeline(
-        serve_batch,
-        grid=(batches_per_owner,),
-        in_specs=(indices_spec,),
-    )(indices_hbm_ref)
+    if live_batches is None:
+        pltpu.emit_pipeline(
+            serve_batch,
+            grid=(batches_per_owner,),
+            in_specs=(indices_spec,),
+        )(indices_hbm_ref)
+    else:
+        # Traced grid length for emit_pipeline on a VectorSubcoreMesh, and
+        # pl.when around it for the zero-trip case -- both lower on v7x SC.
+        # No upstream SparseCore test traces an emit_pipeline grid (the
+        # tpu_sparsecore_pallas_test.py grids are static); the nearest
+        # upstream form, tests/pallas/tpu_pallas_pipeline_test.py:2420-2452
+        # @ce57049, is a TensorCore test. This SC form is measured in-repo.
+        # Uniform per-owner trip count; no scalar division on SC: the wrapper
+        # sends live_batches as a multiple-of-num_owners-rounded pair.
+        owner_batches = live_vmem_ref[pl.ds(NUM_LANES, NUM_LANES)][0]
+
+        @pl.when(owner_batches > 0)
+        def _serve_live():
+            pltpu.emit_pipeline(
+                serve_batch,
+                grid=(owner_batches,),
+                in_specs=(indices_spec,),
+            )(indices_hbm_ref)
 
 
 @functools.partial(
@@ -165,6 +216,7 @@ def _kernel(
         "atoms_per_batch",
         "wait_mode",
         "serve_pipelined",
+        "live_multiple",
     ),
 )
 def dsa_gather_native_sc(
@@ -176,6 +228,8 @@ def dsa_gather_native_sc(
     atoms_per_batch: int = 16,
     wait_mode: str = "overlap_rope",
     serve_pipelined: bool = True,
+    num_live_indices: jax.Array | None = None,
+    live_multiple: int = 1,
 ) -> tuple[jax.Array, jax.Array]:
     """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
 
@@ -183,6 +237,12 @@ def dsa_gather_native_sc(
     128-word row per group of four tokens; each token owns a consecutive
     32-word quarter. The returned ROPE is register-transposed into the grouped
     TensorCore format expected by the shared attention consumer.
+
+    ``num_live_indices`` (traced i32 scalar, optional) gathers only the logical
+    batches covering the first ``num_live_indices`` rows; later rows are left
+    unwritten. ``live_multiple`` is a static promise that ``num_live_indices``
+    is a multiple of it; when that multiple covers whole owner rounds the
+    per-owner tail guard is dropped.
     """
     if wait_mode not in ("overlap_rope", "before_rope"):
         raise ValueError(f"unknown {wait_mode=}")
@@ -219,23 +279,64 @@ def dsa_gather_native_sc(
         )
     num_batches = out_size // occurrences_per_batch
     batches_per_owner = num_batches // num_owners
+    live = num_live_indices is not None
+    scratch_types = {"sem_ref": pltpu.SemaphoreType.DMA((ROPE_PACKING,))}
+    operands = [
+        nope_cache.reshape(-1, 128),
+        rope_cache.reshape(-1, 32),
+        indices.reshape(num_batches, atoms_per_batch, ROPE_PACKING, NUM_LANES),
+    ]
+    guard_tail = False
+    if live:
+        # Live logical batches = cdiv(num_live_indices, occurrences/batch),
+        # clamped to the static count; per-owner trip = cdiv(live, num_owners).
+        live_b = jnp.clip(
+            (jnp.asarray(num_live_indices, jnp.int32) + occurrences_per_batch - 1)
+            // occurrences_per_batch,
+            0,
+            num_batches,
+        )
+        owner_b = (live_b + num_owners - 1) // num_owners
+        # Lanes [0,16) = live logical batches, [16,32) = per-owner grid length.
+        live_vec = jnp.concatenate(
+            [
+                jnp.full((NUM_LANES,), live_b, jnp.int32),
+                jnp.full((NUM_LANES,), owner_b, jnp.int32),
+            ]
+        )
+        operands.append(live_vec)
+        scratch_types["live_vmem_ref"] = pltpu.VMEM((2 * NUM_LANES,), jnp.int32)
+        scratch_types["live_sem_ref"] = pltpu.SemaphoreType.DMA((1,))
+        # Per-owner guard is needed only if a live count can leave a ragged
+        # last round, i.e. unless the caller promises num_live_indices is a
+        # multiple of num_owners * occurrences_per_batch (at topk=2048,
+        # atoms=1: 32 * 64 = 2048 = one token, so decode needs no guard).
+        guard_tail = live_multiple % owner_batch_size != 0
     mesh = plsc.VectorSubcoreMesh(
         num_cores=num_cores,
         num_subcores=num_subcores,
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
+    body = functools.partial(
+        _kernel,
+        core_axis_name=mesh.core_axis_name,
+        subcore_axis_name=mesh.subcore_axis_name,
+        num_owners=num_owners,
+        atoms_per_batch=atoms_per_batch,
+        batches_per_owner=batches_per_owner,
+        wait_mode=wait_mode,
+        serve_pipelined=serve_pipelined,
+        guard_tail=guard_tail,
+    )
+    if live:
+        inner = body
+
+        def body(nope, rope, idx, live_hbm, nope_o, rope_o, **scr):
+            return inner(nope, rope, idx, nope_o, rope_o, live_hbm_ref=live_hbm, **scr)
+
     return core_map_helper.kernel(
-        functools.partial(
-            _kernel,
-            core_axis_name=mesh.core_axis_name,
-            subcore_axis_name=mesh.subcore_axis_name,
-            num_owners=num_owners,
-            atoms_per_batch=atoms_per_batch,
-            batches_per_owner=batches_per_owner,
-            wait_mode=wait_mode,
-            serve_pipelined=serve_pipelined,
-        ),
+        body,
         out_type=(
             jax.ShapeDtypeStruct((out_size, 128), jnp.uint32),
             jax.ShapeDtypeStruct((out_size // ROPE_PACKING, 128), jnp.uint32),
@@ -245,14 +346,10 @@ def dsa_gather_native_sc(
             needs_layout_passes=True,
             disable_bounds_checks=True,
         ),
-        scratch_types={"sem_ref": pltpu.SemaphoreType.DMA((ROPE_PACKING,))},
+        scratch_types=scratch_types,
         mesh=mesh,
         name=(
             f"sc_native_sc_gather_a{atoms_per_batch}_{wait_mode}_"
-            f"{'pipe' if serve_pipelined else 'nopipe'}"
+            f"{'pipe' if serve_pipelined else 'nopipe'}{'_live' if live else ''}"
         ),
-    )(
-        nope_cache.reshape(-1, 128),
-        rope_cache.reshape(-1, 32),
-        indices.reshape(num_batches, atoms_per_batch, ROPE_PACKING, NUM_LANES),
-    )
+    )(*operands)

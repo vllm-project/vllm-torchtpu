@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """TPU roundtrip tests for the unified-pool region adapters."""
 
 import jax.numpy as jnp
@@ -20,6 +33,7 @@ def _pool():
     )
 
 
+@pytest.mark.tpu_test
 def test_f32_region_roundtrip_preserves_complement():
     pool = _pool()
     before = np.asarray(pool)
@@ -42,6 +56,7 @@ def test_f32_region_roundtrip_preserves_complement():
     np.testing.assert_array_equal(after[untouched_blocks], before[untouched_blocks])
 
 
+@pytest.mark.tpu_test
 def test_same_dtype_region_roundtrip():
     pool = _pool()
     idx = jnp.asarray([3, 0], dtype=jnp.int32)
@@ -58,6 +73,7 @@ def test_same_dtype_region_roundtrip():
     np.testing.assert_array_equal(np.asarray(got), np.asarray(vals))
 
 
+@pytest.mark.tpu_test
 def test_copy_blocks():
     pool = _pool()
     before = np.asarray(pool)
@@ -73,6 +89,7 @@ def test_copy_blocks():
     np.testing.assert_array_equal(after[2], before[2])
 
 
+@pytest.mark.tpu_test
 def test_unaligned_region_gcd_decomposition_roundtrip():
     # tok0=12, ntok=8: 12 % 8 != 0, so the region moves as two aligned
     # 4-token chunks; the bytes round-trip exactly.
@@ -102,6 +119,7 @@ def test_out_of_block_region_rejected():
         pool_adapters.gather_region(pool, idx, tok0=48, ntok=32, out_dtype=jnp.float32)
 
 
+@pytest.mark.tpu_test
 class TestSidePoolGeometry:
     """The envelope side pool: bf16 (nb, 1, rows, 128), same-dtype payload.
 
@@ -153,6 +171,7 @@ class TestSidePoolGeometry:
         assert (pool2[3] == pool[3]).all()
 
 
+@pytest.mark.tpu_test
 class TestInt8PoolPairs:
     """Adapter dtype pairs an int8-born pool needs: f32 ssm (ratio 4) and
     bf16 conv (ratio 2), at a real in-block geometry (block 512-token
@@ -199,6 +218,7 @@ class TestInt8PoolPairs:
         self._roundtrip(jnp.bfloat16, self.ROWS // 2)
 
 
+@pytest.mark.tpu_test
 class TestInt8Pool3D:
     """1-byte pools as 3-D (nb, rows, lanes): the block ref is 2-D, so
     the bitcast follows the old validated sublane convention."""
@@ -262,6 +282,7 @@ class TestInt8Pool3D:
         assert (got2 == new_vals).all()
 
 
+@pytest.mark.tpu_test
 class TestFp8PoolSsmPattern:
     """The fp8-config ssm access: f32 region at tok0=0 (partial range from
     row 0) of a 1-byte 4-D pool — the exact production corner."""
@@ -295,6 +316,7 @@ class TestFp8PoolSsmPattern:
         assert (pool2[0].view(jnp.int8) == pool[0].view(jnp.int8)).all()
 
 
+@pytest.mark.tpu_test
 class TestLaneSplitGather:
     """out_lanes narrower than pool lanes: the narrowing happens on the ref
     before the load, so the narrow view is the wide view's own row-major
@@ -354,6 +376,7 @@ class TestLaneSplitGather:
         assert (pool2.view(jnp.int16) == pool.view(jnp.int16)).all()
 
 
+@pytest.mark.tpu_test
 class TestPartialSelfConsistency:
     """Production needs gather/scatter to be mutual inverses per window
     (linear byte order is NOT the contract — Mosaic bitcast interleaves
@@ -437,6 +460,7 @@ def _arange_pool(shape, dtype):
     return (jnp.arange(n, dtype=jnp.float32) % 251).astype(dtype).reshape(shape)
 
 
+@pytest.mark.tpu_test
 class TestGatherScatterBlocks:
     """split>1: a manager-block token range routes through one DMA window
     per request and equals the per-kernel-block gathers concatenated."""
@@ -478,6 +502,7 @@ class TestGatherScatterBlocks:
         assert jnp.array_equal(got.view(jnp.uint16), want.view(jnp.uint16))
 
 
+@pytest.mark.tpu_test
 class TestGatherScatterBlocksFp8:
     """fp8 (1-byte) pool with f32 region access — the ratio-4 bitcast on a
     manager-block window (the 397B fp8 serving shape)."""

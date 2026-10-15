@@ -66,10 +66,8 @@ export TMPDIR="${TMPDIR:-${SCRATCH_ROOT}/tmp}"
 mkdir -p "${TMPDIR}" "${VLLM_CACHE_ROOT}" || exit 1
 
 # Everything down to the next blank line is the GLM-5.2 NVFP4 recipe's
-# environment (cloud-devkit-recipes: recipes/experimental/torchtpu-vllm/
-# disagg/glm52-nvfp4-disagg-raiden-dp8.yml), minus what only its JobSet needs;
-# what follows that is rig plumbing carried over from the DSv4 sibling and
-# holds for any model.
+# environment, minus what only its JobSet needs; what follows that is rig
+# plumbing carried over from the DSv4 sibling and holds for any model.
 #
 # Block-512 requantization of the checkpoint's block-16 fp4 MoE weights
 # (nvfp4.py): ~32x less scale data and no in-kernel dequant. The recipe sets

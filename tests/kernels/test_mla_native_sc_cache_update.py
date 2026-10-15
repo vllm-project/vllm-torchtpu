@@ -18,6 +18,7 @@ import functools
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 from absl.testing import parameterized
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
@@ -29,6 +30,8 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
     update_sparse_mla_kv_cache,
 )
 from vllm_torchtpu.kernels.mla.sparse import native_sc_cache_layout as layout
+
+pytestmark = pytest.mark.tpu_test
 
 
 class NativeScCacheUpdateTest(parameterized.TestCase):

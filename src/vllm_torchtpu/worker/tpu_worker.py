@@ -25,6 +25,7 @@ from vllm.distributed.parallel_state import (
     get_tensor_model_parallel_rank,
     init_distributed_environment,
 )
+from vllm.utils.gc_utils import freeze_gc_heap, maybe_attach_gc_debug_callback
 from vllm.utils.torch_utils import set_torch_threads_for_runtime
 from vllm.v1 import utils as vllm_utils
 from vllm.v1.kv_cache_interface import KVCacheConfig
@@ -35,6 +36,7 @@ from vllm_torchtpu import envs, profiler_trace, utils
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
 from vllm_torchtpu.worker.tpu_rank_binding import get_tpu_worker_binding
@@ -505,7 +507,9 @@ class TPUWorker(WorkerBase):
         kv_connector_hbm_reserve = utils.estimate_kv_connector_hbm_reserve(
             self.vllm_config
         )
-        available = budget.available - kv_connector_hbm_reserve
+        available = utils.min_across_ep_dp(
+            self.parallel_config, budget.available - kv_connector_hbm_reserve
+        )
 
         total_hbm_limit_gb = round(budget.total_limit / utils.GBYTES, 2)
         total_hbm_limit_cap_gb = round(budget.cap / utils.GBYTES, 2)
@@ -534,7 +538,50 @@ class TPUWorker(WorkerBase):
                 f"increasing --gpu-memory-utilization from "
                 f"{gpu_memory_utilization} to a larger value."
             )
+
+        cap = self._pooling_kv_cache_cap_bytes()
+        if cap is not None and cap < available:
+            logger.info(
+                "Pooling KV cache cap: %.2f GiB of %.2f GiB available; "
+                "%.2f GiB reclaimed (consider raising --max-num-batched-tokens; "
+                "set VLLM_TPU_POOLING_KV_CACHE_TOKENS=0 to disable).",
+                cap / utils.GBYTES,
+                available / utils.GBYTES,
+                (available - cap) / utils.GBYTES,
+            )
+            available = cap
         return available
+
+    def _pooling_kv_cache_cap_bytes(self) -> int | None:
+        """Deterministic KV budget for pure pooling models, or None.
+
+        Pooling requests are prefill-only, so KV only has to hold the in-flight
+        steps plus the earlier chunks of requests still in chunked prefill.
+        The cap is derived from the config alone, so num_gpu_blocks (and thus
+        the backbone compile hash) is identical across restarts and ranks.
+        """
+        runner = getattr(self, "model_runner", None)
+        setting = envs.VLLM_TPU_POOLING_KV_CACHE_TOKENS
+        if (
+            runner is None
+            or not getattr(runner, "is_pooling_model", False)
+            or setting == 0
+            or self.cache_config.num_gpu_blocks_override is not None
+            or self.parallel_config.pipeline_parallel_size > 1
+            or self.vllm_config.kv_transfer_config is not None
+            or getattr(self.model_config, "is_hybrid", False)
+        ):
+            return None
+        sc = self.scheduler_config
+        return compute_pooling_kv_cache_cap_bytes(
+            runner.get_kv_cache_spec(),
+            max_model_len=self.model_config.max_model_len,
+            max_num_batched_tokens=sc.max_num_batched_tokens,
+            max_num_seqs=sc.max_num_seqs,
+            async_scheduling=bool(sc.async_scheduling),
+            long_prefill_token_threshold=sc.long_prefill_token_threshold,
+            override_tokens=setting if setting > 0 else None,
+        )
 
     def execute_model(self, scheduler_output):
         return self.model_runner.execute_model(scheduler_output)
@@ -547,6 +594,12 @@ class TPUWorker(WorkerBase):
 
     def pp_settle(self):
         return self.model_runner.pp_settle()
+
+    def pp_drains_before_handoff(self) -> bool:
+        """Whether this worker's stage drains the slice before each hand-off
+        launch."""
+        wave = self.model_runner._pp_wave
+        return bool(getattr(wave, "drain_before_handoff", False))
 
     def profile_pipeline_chunks(self) -> dict:
         return self.model_runner.profile_pipeline_chunks()
@@ -697,10 +750,19 @@ class TPUWorker(WorkerBase):
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
+        if getattr(self, "speculative_config", None) is not None:
+            # Record the warm-up traces under the serving thread count. Other
+            # models keep upstream's warm-up at the startup count.
+            set_torch_threads_for_runtime()
         self.model_runner.capture_model()
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
         set_torch_threads_for_runtime()
+        # The warmed worker holds a large static heap (model, compiled
+        # executables, KV bookkeeping); freezing it keeps a gen-2 collection
+        # from scanning those objects mid-step.
+        freeze_gc_heap()
+        maybe_attach_gc_debug_callback()
         return CompilationTimes(language_model=compilation_time, encoder=0.0)
 
     def reload_kernels(self, modules: list[str] | None = None) -> dict:

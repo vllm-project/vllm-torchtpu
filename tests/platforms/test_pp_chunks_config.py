@@ -76,6 +76,7 @@ def test_negative_slack_fails_at_config_time(monkeypatch):
         _configure(_config())
 
 
-def test_chunk_knobs_do_not_change_the_compile_cache_key():
+def test_pipeline_knobs_do_not_change_the_compile_cache_key():
     assert "TPU_PP_DYNAMIC_CHUNKS" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
     assert "TPU_PP_CHUNK_SLACK" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+    assert "TPU_PP_LAZY_PUSH" in tpu_compiler._TPU_COMPILE_ENV_IGNORED

@@ -133,13 +133,22 @@ _TPU_COMPILE_ENV_IGNORED = {
     # are keyed by shape inside the same cache.
     "TPU_PP_DYNAMIC_CHUNKS",
     "TPU_PP_CHUNK_SLACK",
+    # Engine-side timing of the pipeline pushes; the workers' programs are
+    # the same either way.
+    "TPU_PP_LAZY_PUSH",
     # Startup and host-side knobs: ports, an IPC secret, two raiden startup
-    # checks, offload retry and drain limits, a weight-load sync cadence, a
-    # debug log switch, and the local-rank offsets, which move a worker to a
-    # different chip without changing the executable it runs.
+    # checks, the raiden offload storage tier, offload retry and drain
+    # limits, a weight-load sync cadence, a debug log switch, and the
+    # local-rank offsets, which move a worker to a different chip without
+    # changing the executable it runs.
     "DEBUG_TPU_LOCAL_RANK_OFFSET",
+    "EXPERIMENTAL_RAIDEN_STORAGE_SKIP_PARALLELISM_CHECK",
     "RAIDEN_DISABLE_SINGLETON_WORKER",
     "RAIDEN_SHM_KEY",
+    "RAIDEN_STORAGE_CAPACITY_GB",
+    "RAIDEN_STORAGE_PATH",
+    "RAIDEN_STORAGE_PROPERTIES",
+    "RAIDEN_STORAGE_TYPE",
     # Compiles the same spec-decode artifacts, just eagerly at startup.
     "SPEC_WARMUP",
     "TORCH_TPU_BASE_PORT",
@@ -150,9 +159,15 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_DEBUG_PCP_LAYOUT",
     "VLLM_TPU_OFFLOAD_SAVE_RETRIES",
     "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
+    # Scheduler prefix-cache hit length only.
+    "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP",
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
     # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.
     "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
+    # Pooling: the static pooler is a separate backend="tpu" helper outside the
+    # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
+    "VLLM_TPU_STATIC_POOLER",
+    "VLLM_TPU_POOLING_KV_CACHE_TOKENS",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
@@ -176,24 +191,39 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # export is chosen from their source, so an edit here has to invalidate
     # the compiled executables like any other kernel change.
     "vllm_torchtpu/layers/adapter/fused_moe_ep.py",
+    # Same for the TP decode MoE op, whose body this module builds.
+    "vllm_torchtpu/layers/adapter/moe_tp_decode.py",
     # Still listed: on this base `pp_shift.py` is a second caller, so the
     # module stays even though the fused EP op no longer needs it.
     "vllm_torchtpu/distributed/sharded_jax_op.py",
-    # And the mesh they export with. Since google-pytorch/torch_tpu#3522 the
-    # order is the process group's rank order rather than something
-    # `build_ep_mesh` chooses, but the file still decides the axis and the
-    # shape the kernel exports against.
+    # And the mesh they export with: `build_ep_mesh` decides the axis, the
+    # shape and the device order (the DeviceAssignment) the kernel runs on.
     "vllm_torchtpu/distributed/ep_mesh.py",
     "vllm_torchtpu/distributed/pcp.py",
+    # Same reason: dcp.py owns the DCP kernels' mesh shape and device order.
+    "vllm_torchtpu/distributed/dcp.py",
     "vllm_torchtpu/distributed/pallas_shapes.py",
     "vllm_torchtpu/layers/adapter/linear_common.py",
     "vllm_torchtpu/layers/adapter/router_topk.py",
     "vllm_torchtpu/layers/adapter/quantization",
     "vllm_torchtpu/layers/adapter/vision_attention.py",
     "vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
+    # `get_pallas_op_mesh` decides whether the DSv4 Pallas ops are built with
+    # the wrapper mesh or with none, like `build_ep_mesh` above.
+    "vllm_torchtpu/models/vllm/vllm_model_wrapper_context.py",
     # K3 custom-op registration, sharding, and Attention Residual bridges.
     "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
+)
+
+# vLLM-Omni diffusion code, dropped from the hashed set above. Diffusion
+# workers never compile through TpuCompilerAdaptor (OmniTpuPlatform does not
+# support torch inductor and vLLM-Omni skips torch.compile), and nothing
+# outside these paths imports their kernels, so they cannot change a cached
+# executable; hashing them would only invalidate LLM compile caches.
+_RUNTIME_CACHE_KEY_EXCLUDED_PATHS = (
+    "vllm_torchtpu/kernels/diffusion_attention",
+    "vllm_torchtpu/omni/attention.py",
 )
 
 
@@ -212,6 +242,17 @@ def _iter_runtime_cache_key_files(repo_root: Path) -> list[Path]:
                 files_by_relpath[child_relpath] = child
             continue
         logger.warning("[TpuCompilerAdaptor] Cache key source path missing: %s", path)
+
+    excluded_files = set(_RUNTIME_CACHE_KEY_EXCLUDED_PATHS)
+    excluded_dirs = tuple(
+        f"{rel_path}/" for rel_path in _RUNTIME_CACHE_KEY_EXCLUDED_PATHS
+    )
+    for relpath in [
+        key
+        for key in files_by_relpath
+        if key in excluded_files or key.startswith(excluded_dirs)
+    ]:
+        del files_by_relpath[relpath]
 
     if envs.TPU_KERNEL_ITER_MODE:
         for relpath in _reloadable_kernel_relpaths(repo_root):

@@ -133,6 +133,44 @@ def test_waiting_for_the_exception_settles_too():
     assert [c[0] for c in executor.calls] == ["pp_settle"]
 
 
+def test_lazy_waits_settle_and_never_push():
+    executor = _Executor()
+    wave = pp_push._WaveState(stages=8)
+    wave.lazy = True
+    step = wave.dispatched()
+    wave.dispatched()
+    pending = Future()
+    future = pp_push._PushFuture(pending, executor, wave, step, 1)
+    # a finished step is read without sending anything
+    assert pp_push._PushFuture(_done(1), executor, wave, step, 1).result() == 1
+    assert executor.calls == [] and wave.open
+    # waiting for an unfinished one settles, although a later step exists
+    pending.set_running_or_notify_cancel()
+    with pytest.raises(TimeoutError):
+        future.result(timeout=0)
+    assert [c[0] for c in executor.calls] == ["pp_settle"]
+    assert wave.pushes == 0 and not wave.open
+
+
+def test_push_and_settle_count_the_burst():
+    executor = _Executor()
+    wave = pp_push._WaveState(stages=4)
+    # nothing dispatched: nothing to settle
+    assert wave.settle(executor) is None and executor.calls == []
+    wave.dispatched()
+    step, _ = wave.push(executor)
+    assert step == 2 and wave.steps == 2 and wave.pushes == 1
+    # a push is not a step the scheduler produced
+    assert wave.last_step == 1 and wave.real_steps == 1
+    wave.settle(executor)
+    assert not wave.open and wave.settles == 1
+    reply = {"non_block": True, "unique_reply_rank": 7}
+    assert executor.calls == [("pp_push", reply), ("pp_settle", reply)]
+    # a push alone opens a burst
+    wave.push(executor)
+    assert wave.open
+
+
 def test_rpc_ring_holds_the_pipeline_lookahead():
     assert pp_push.rpc_ring_chunks(8) == 40
     assert pp_push.rpc_ring_chunks(2) == 16
@@ -252,3 +290,9 @@ def test_each_executor_pushes_for_its_own_pipeline_size(monkeypatch, queue):
     assert four.execute_model(_step(16, 1)) == ("forward", 1)
     assert [c[0] for c in four.calls] == ["pp_settle"]
     assert queue(1, 1).kwargs["max_chunks"] == 24
+
+
+def test_pipeline_executor_never_asks_the_workers_for_draft_tokens(monkeypatch, queue):
+    executor = _install_on_fake_executor(monkeypatch, stages=4)
+    assert executor.take_draft_token_ids() is None
+    assert executor.calls == []

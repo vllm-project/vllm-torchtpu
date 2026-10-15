@@ -18,6 +18,7 @@ combine reduce-scatter."""
 
 import functools
 import threading
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -818,9 +819,11 @@ def _build_fused_ep_moe_kernel(
             return _slot_copy(w2_hbm.at[expert], w2_vm, w2_sems, slot)
 
         def w1s_copy(expert, slot):
+            assert w1s_hbm is not None
             return _slot_copy(w1s_hbm.at[expert], w1s_vm, w1s_sems, slot)
 
         def w2s_copy(expert, slot):
+            assert w2s_hbm is not None
             return _slot_copy(w2s_hbm.at[expert], w2s_vm, w2s_sems, slot)
 
         def prefetch_w1(expert, slot):
@@ -982,6 +985,7 @@ def _build_fused_ep_moe_kernel(
                 # ls rides along on the same sem. The slab is the dense
                 # lane-block view of one f32 per row, so a tile's window is
                 # the sublanes its rows fall in, not a row range.
+                assert ls_hbm is not None and ls_vm is not None
                 pltpu.make_async_copy(
                     ls_hbm.at[pl.ds(row_base // HIDDEN_LANE_BLOCK, ls_window_rows)],
                     ls_vm.at[slot],
@@ -998,6 +1002,7 @@ def _build_fused_ep_moe_kernel(
                 lhs_sems.at[slot],
             ).wait()
             if has_act_scale:
+                assert ls_vm is not None
                 pltpu.make_async_copy(
                     ls_vm.at[slot], ls_vm.at[slot], lhs_sems.at[slot]
                 ).wait()
@@ -1031,6 +1036,7 @@ def _build_fused_ep_moe_kernel(
 
         def wait_commits(parity, live_blocks):
             """Wait one tile's commits on `parity`: data rows, then scales."""
+            assert commit_sems is not None and commit_scl_sems is not None
             _rows_wait(commit_sems.at[parity], contrib_hbm, live_blocks * ROWBLK)
             # One tile committed one mirror sublane, whatever its row count.
             _rows_wait(commit_scl_sems.at[parity], cscl_hbm, 1)
@@ -1137,6 +1143,7 @@ def _build_fused_ep_moe_kernel(
 
             def commit_tile(parity, t, tile_block_base, live_blocks):
                 """Commit the tile's intersection with each (expert, dest) run."""
+                assert commit_sems is not None and commit_scl_sems is not None
                 # The runs tile the expert slab contiguously, so the
                 # per-dest lengths sum to exactly live_blocks. Rows go per
                 # run; the scales go once, below, because a tile's are one
@@ -1361,11 +1368,13 @@ def _build_fused_ep_moe_kernel(
                         lhs_vm[parity] if full else lhs_vm[parity, pl.ds(0, height)]
                     ).reshape(height, hidden)
                     act_scales = (
-                        _tile_row_scales(ls_vm[parity], row_base, height)
+                        _tile_row_scales(cast(jax.Ref, ls_vm)[parity], row_base, height)
                         if has_act_scale
                         else None
                     )
-                    w1b_row = w1b_vm[pl.ds(e, 1), :] if has_w1_bias else None
+                    w1b_row = (
+                        cast(jax.Ref, w1b_vm)[pl.ds(e, 1), :] if has_w1_bias else None
+                    )
 
                     def wait_down_weights():
                         # One wait per expert, at its first down read. All
@@ -1382,6 +1391,7 @@ def _build_fused_ep_moe_kernel(
                         # The block scales apply inside
                         # expert_ffn_blockscale, so the epilogues below must
                         # not apply w2s again.
+                        assert w1s_vm is not None and w2s_vm is not None
                         w1s_blocks = w1s_vm[slot]  # [nb1, 2*inter] f32
                         w2s_blocks = w2s_vm[slot]  # [nb2, hidden] f32
                         w1_block, w2_block = _fp4_block_readers(
@@ -1399,6 +1409,7 @@ def _build_fused_ep_moe_kernel(
                             w1b=w1b_row,
                         )
                     elif weight_format == host.WeightFormat.INT8:
+                        assert w1s_vm is not None
                         w1_chunk, w2_chunk = _int8_chunk_readers(
                             slot, w2_slot, wait_down_weights
                         )
@@ -1421,6 +1432,7 @@ def _build_fused_ep_moe_kernel(
                             w1b=w1b_row,
                         )
                     else:
+                        assert w1s_vm is not None
                         acc2, mid_scale = expert_ffn_fp8(
                             act_rows,
                             act_scales,
@@ -1443,11 +1455,15 @@ def _build_fused_ep_moe_kernel(
                         acc2,
                         mid_scale,
                         w2s=(
-                            w2s_vm[pl.ds(e, 1), :]
+                            cast(jax.Ref, w2s_vm)[pl.ds(e, 1), :]
                             if (has_scales and not rhs_packed4)
                             else None
                         ),
-                        w2b=w2b_vm[pl.ds(e, 1), :] if has_w2_bias else None,
+                        w2b=(
+                            cast(jax.Ref, w2b_vm)[pl.ds(e, 1), :]
+                            if has_w2_bias
+                            else None
+                        ),
                         wire_dtype=form.wire_dtype,
                         tile_m=height,
                     )
@@ -2048,7 +2064,7 @@ def _build_combine_kernel(*, t_local, topk, hidden, lane_blocks, wire_dtype, out
                     * coef_sm[(base + i) * topk + k]
                 )
                 acc = term if acc is None else acc + term
-            tile_vm[i] = acc.astype(out_dtype)
+            tile_vm[i] = cast(jax.Array, acc).astype(out_dtype)
 
         def one_step(step, parity):
             # The step's rows were started a step ago; the next step's are

@@ -16,6 +16,7 @@ normalization remains with the caller.
 from __future__ import annotations
 
 import functools
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -262,7 +263,7 @@ def decode_kda(
             f"KDA decode currently requires d_v == d_k, got {d_v} and {d_k}."
         )
     if scale is None:
-        scale = d_k**-0.5
+        scale = cast(float, d_k**-0.5)
     if dt_bias is None:
         dt_bias = jnp.zeros((n_v, d_k), dtype=jnp.float32)
     if dt_bias.shape != (n_v, d_k):

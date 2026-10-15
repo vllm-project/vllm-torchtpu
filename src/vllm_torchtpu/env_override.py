@@ -133,7 +133,7 @@ def _fetch_tpu_type_from_metadata() -> str | None:
         )
         if resp.status_code == 200 and resp.text:
             return resp.text
-    except Exception:
+    except Exception:  # noqa: S110
         pass
     return None
 

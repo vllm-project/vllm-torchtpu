@@ -31,7 +31,7 @@ prefill_host=${WORKLOAD_NAME}-prefill-0-0.${WORKLOAD_NAME}
 decode_host=${WORKLOAD_NAME}-decode-0-0.${WORKLOAD_NAME}
 
 echo "Starting proxy server..."
-python3 /root/torchtpu-vllm/examples/disagg/toy_proxy_server.py \
+python3 /workspace/vllm-torchtpu/examples/disagg/toy_proxy_server.py \
   --host 0.0.0.0 \
   --port 10000 \
   --prefiller-host "$prefill_host" \
@@ -107,7 +107,7 @@ publish_result() {
   # Not fatal on its own - the artifact is already up - but
   # the step goes red at the end so a silent gap in the
   # table cannot pass.
-  python3 /root/torchtpu-vllm/.buildkite/scripts/parse_gke_results.py \
+  python3 /workspace/vllm-torchtpu/.buildkite/scripts/parse_gke_results.py \
     "$path" "${record_base}-${name%.json}" \
     || { echo "WARNING: BigQuery insert failed for $name"; publish_failed=1; }
 }

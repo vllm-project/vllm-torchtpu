@@ -328,7 +328,7 @@ def main_kernel(
                 # efficiency. We just repeat the write of lastest accumulated data
                 # multiple times.
                 # `src_row_idx_in_vmem` tracks the right idx in vmem for each hbm write.
-                src_row_idx_in_vmem = []
+                src_row_idx_in_vmem: list[int | jax.Array] = []
                 row_valid_vec = []
                 for row_vmem_idx in reversed(range(num_simd_lanes)):
                     row_idx = row_block_id * num_simd_lanes + row_vmem_idx

@@ -201,8 +201,8 @@ def _load_recurrent_state(
 def load_and_select_states(
     metadata_ref: memory_ref.MetadataRef,
     p_id: jax.Array,
-    conv_state_slot_ref: jax.Ref,
-    recurrent_slot_ref: jax.Ref,
+    conv_state_in_slot_ref: jax.Ref,
+    recurrent_in_slot_ref: jax.Ref,
     carry_conv_scratch_ref: jax.Ref | None,
     carry_recurrent_scratch_ref: jax.Ref | None,
     cfg: config.GDNConfig,
@@ -215,16 +215,16 @@ def load_and_select_states(
     zero initialized.
 
     When `cfg.state_plan` is set, the state refs hold raw source-layout
-    tiles (see `memory_ref.ExternalStateBufferedRef`) and are decoded
+    tiles (see `memory_ref.ExternalStateInBufferedRef`) and are decoded
     through the plan's typed region views instead of read directly.
 
     Args:
         metadata_ref: Metadata reference containing grid and sequence mappings.
         p_id: Current Pallas program ID.
-        conv_state_slot_ref: Convolution state read from HBM of shape
-            [seq_tile_size, window_size, prev_kernel_size, 1, dim_size].
-        recurrent_slot_ref: Recurrent state read from HBM of shape [seq_tile_size,
-            window_size, num_v_heads, kq_head_dim, v_head_dim].
+        conv_state_in_slot_ref: Convolution state read from HBM of shape
+            [seq_tile_size, 1, prev_kernel_size, 1, dim_size].
+        recurrent_in_slot_ref: Recurrent state read from HBM of shape
+            [seq_tile_size, 1, num_v_heads, kq_head_dim, v_head_dim].
         carry_conv_scratch_ref: Optional inter-tile convolution carry of shape
             [seq_tile_size, prev_kernel_size, 1, dim_size].
         carry_recurrent_scratch_ref: Optional inter-tile recurrent state carry of
@@ -249,21 +249,22 @@ def load_and_select_states(
         is_first_tile = metadata_ref.p_id_is_first_tile[p_id, idx]
         has_initial_state = metadata_ref.s_idx_has_initial_state[s_idx]
 
-        # NOTE: The VMEM window holds one state per window position and the
-        # initial state was DMA'd into position 0.
+        # NOTE: The input VMEM window holds one initial state per sequence at
+        # position 0.
         # Both scratches are allocated together (see GDNConfig.scratch_shapes).
         # Only the pool decode is worth guarding; a dense slot read is cheap
         # enough that the guard costs more than it saves.
         if carry_conv_scratch_ref is None or cfg.state_plan is None:
             prev_conv_state = jnp.where(
-                has_initial_state, _load_conv_state(conv_state_slot_ref, cfg, idx), 0
+                has_initial_state, _load_conv_state(conv_state_in_slot_ref, cfg, idx), 0
             )
             prev_recurrent_state = jnp.where(
                 has_initial_state,
-                _load_recurrent_state(recurrent_slot_ref, cfg, idx),
+                _load_recurrent_state(recurrent_in_slot_ref, cfg, idx),
                 0,
             )
             if carry_conv_scratch_ref is not None:
+                assert carry_recurrent_scratch_ref is not None
                 prev_conv_state = jnp.where(
                     is_first_tile, prev_conv_state, carry_conv_scratch_ref[idx]
                 )
@@ -276,16 +277,18 @@ def load_and_select_states(
             # Later tiles resume from the carry, so decode both sources once
             # instead of on every tile. One guard, not one per state.
             # pl.when traces the body here, so `idx` is this iteration's.
+            assert carry_recurrent_scratch_ref is not None
+
             @pl.when(is_first_tile)
             def _():
                 carry_conv_scratch_ref[idx] = jnp.where(
                     has_initial_state,
-                    _load_conv_state(conv_state_slot_ref, cfg, idx),
+                    _load_conv_state(conv_state_in_slot_ref, cfg, idx),
                     0,
                 )
                 carry_recurrent_scratch_ref[idx] = jnp.where(
                     has_initial_state,
-                    _load_recurrent_state(recurrent_slot_ref, cfg, idx),
+                    _load_recurrent_state(recurrent_in_slot_ref, cfg, idx),
                     0,
                 )
 

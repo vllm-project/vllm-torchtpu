@@ -14,6 +14,7 @@
 """TPU DeepSeek-V4 KV/score compressor, on the compress-and-store kernels."""
 
 import functools
+from typing import TYPE_CHECKING, cast
 
 import jax
 import torch
@@ -34,9 +35,12 @@ from vllm_torchtpu.kernels.deepseek_v4.compress_and_store.compressor_v1 import (
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-    get_vllm_model_wrapper_context,
+    get_pallas_op_mesh,
 )
-from vllm_torchtpu.utils import align_to
+from vllm_torchtpu.utils import align_to, synchronize_tensors
+
+if TYPE_CHECKING:
+    from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 logger = init_logger(__name__)
 
@@ -141,6 +145,8 @@ def _compressor_jax_csa(
         rms_eps=rms_eps,
         quant_block=quant_block,
     )
+    # The CSA kernel always returns a rope cache.
+    assert new_rope_cache is not None
     return new_cache, new_rope_cache
 
 
@@ -189,6 +195,8 @@ def _compressor_jax_hca(
         rms_eps=rms_eps,
         quant_block=quant_block,
     )
+    # The HCA kernel always returns a state cache.
+    assert new_state_cache is not None
     return new_cache, new_state_cache
 
 
@@ -364,9 +372,16 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         """
         if self._wkv_wgate_transposed:
             return
-        weight = self.fused_wkv_wgate.weight.data.t().contiguous()
+        w_t = cast(torch.Tensor, self.fused_wkv_wgate.weight).data.t().contiguous()
+        # torch_tpu can keep `w_t` as a view chain on the old parameter and
+        # re-materialize it at the `pallas.jax_op` boundary every step
+        # (`tt_jit_as_strided`). A fresh buffer + copy_ breaks the chain; same
+        # pattern as `_fresh()` in mla_attention_op.py and the flip in fp8.py.
+        weight = torch.empty(w_t.shape, dtype=w_t.dtype, device=w_t.device).copy_(w_t)
         self.fused_wkv_wgate.weight = torch.nn.Parameter(weight, requires_grad=False)
         self._wkv_wgate_transposed = True
+        if weight.device.type == "tpu":
+            synchronize_tensors([weight])
 
     # head_dim == 512 with overlap: CSA, which splits NoPE and RoPE.
     # head_dim == 512 without:      HCA, whose state lives on a CSA array.
@@ -394,8 +409,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         return op
 
     def _build_compressor_op(self):
-        vllm_context = get_vllm_model_wrapper_context()
-        mesh = vllm_context.mesh
+        mesh = get_pallas_op_mesh()
 
         assert self.head_dim in (512, 128), self.head_dim
         if self._has_rope_cache:
@@ -538,8 +552,9 @@ class VllmDeepseekCompressor(DeepseekCompressor):
                     "attention metadata; using another layer's would corrupt "
                     f"its pages. Known: {sorted(attn_ctx)}"
                 )
-        state_metadata = attn_ctx[state_prefix]
-        k_cache_metadata = attn_ctx[k_cache_prefix]
+        assert k_cache_prefix is not None
+        state_metadata = cast("AttentionMetadata | None", attn_ctx[state_prefix])
+        k_cache_metadata = cast("AttentionMetadata | None", attn_ctx[k_cache_prefix])
         if state_metadata is None or k_cache_metadata is None:
             return
 
@@ -590,8 +605,8 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         operands = (
             hidden_states,
             self.fused_wkv_wgate.weight,
-            self.ape.clone(),
-            self.norm.weight.clone(),
+            self.ape,
+            self.norm.weight,
             rotary_emb.cos_sin_cache,
             positions,
             state_block_tables,

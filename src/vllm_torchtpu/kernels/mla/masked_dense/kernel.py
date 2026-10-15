@@ -208,7 +208,7 @@ def _mla_ragged_paged_attention_kernel(
         pv = jnp.einsum("nm,md->nd", p, kv, preferred_element_type=jnp.float32)
         # We use `k_scale` for the PV step as well since MLA uses a shared
         # compressed latent for k/v and k_scale ~= v_scale.
-        # TODO(b/539630772): Add a separate v_scale param and apply it to the
+        # TODO: Add a separate v_scale param and apply it to the
         # PV step.
         if k_scale != 1.0:
             pv *= k_scale
@@ -712,7 +712,7 @@ def masked_dense_ragged_paged_attention(
     num_page_indices = page_indices.shape[0]
     assert num_page_indices % max_num_seqs == 0
     pages_per_seq = num_page_indices // max_num_seqs
-    page_table_span = pages_per_seq * page_size
+    page_table_span: int = pages_per_seq * page_size
     if max_kv_len is None:
         max_kv_len = page_table_span
     assert 0 < max_kv_len <= page_table_span, (

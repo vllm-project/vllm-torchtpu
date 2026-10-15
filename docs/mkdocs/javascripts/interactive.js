@@ -18,22 +18,22 @@
 
 const COMMAND_DATA = {
     "uv_pip": {
-        cmd: `# 1. Create a working directory:\nmkdir ~/work-dir\ncd ~/work-dir\n\n# 2. Install uv and set up a Python virtual environment:\n# If you prefer standard pip, simply use \`python3.12 -m venv vllm_env\`\ncurl -LsSf https://astral.sh/uv/install.sh | sh\nsource $HOME/.local/bin/env\nuv venv vllm_env --python 3.12\nsource vllm_env/bin/activate\n\n# 3. Use the following command to install vllm-tpu using uv or pip:\nuv pip install vllm-tpu\n# Or instead: pip install vllm-tpu`,
-        inst: "Install the latest official release using uv pip for any supported TPU."
+        cmd: `# 1. Authenticate with GCP Artifact Registry (for torch_tpu wheels):\ngcloud auth application-default login\n\n# 2. Clone the repository and install with uv:\ngit clone https://github.com/vllm-project/vllm-torchtpu.git\ncd vllm-torchtpu\nuv sync --group vllm\nsource .venv/bin/activate`,
+        inst: "Install <code>vllm-torchtpu</code> and its pinned <code>vllm</code> and <code>torch_tpu</code> dependencies into a managed virtual environment using <code>uv</code>."
     },
     "docker": {
         "latest": {
-            cmd: `export DOCKER_URI=vllm/vllm-tpu:latest\nsudo docker run -it --rm --name $USER-vllm --privileged --net=host \\\n  -v /dev/shm:/dev/shm \\\n  --shm-size 150gb \\\n  -p 8000:8000 \\\n  --entrypoint /bin/bash \${DOCKER_URI}`,
-            inst: "Run the official <strong>release</strong> Docker container (<code>vllm/vllm-tpu:latest</code>). Include the <code>--privileged</code>, <code>--net=host</code>, and <code>--shm-size=150gb</code> options to enable TPU interaction and shared memory."
+            cmd: `export DOCKER_URI=us-central1-docker.pkg.dev/tpu-pytorch-releases/docker/development:tpu7x_20260405\ngcloud auth configure-docker us-central1-docker.pkg.dev --quiet\nsudo docker run -it --rm --name $USER-vllm --privileged --net=host \\\n  -v /dev/shm:/dev/shm \\\n  --shm-size 150gb \\\n  -p 8000:8000 \\\n  --entrypoint /bin/bash \${DOCKER_URI}`,
+            inst: "Run the pre-built <strong>TPU development</strong> container with <code>torch_tpu</code>, <code>libtpu</code>, and <code>jax</code> pre-installed. Include <code>--privileged</code>, <code>--net=host</code>, and <code>--shm-size=150gb</code> to enable TPU access and shared memory."
         },
         "nightly": {
-            cmd: `export DOCKER_URI=vllm/vllm-tpu:nightly\nsudo docker run -it --rm --name $USER-vllm --privileged --net=host \\\n  -v /dev/shm:/dev/shm \\\n  --shm-size 150gb \\\n  -p 8000:8000 \\\n  --entrypoint /bin/bash \${DOCKER_URI}`,
-            inst: "Run the pre-built <strong>nightly</strong> Docker container (<code>vllm/vllm-tpu:nightly</code>) containing the latest development changes. Include the <code>--privileged</code>, <code>--net=host</code>, and <code>--shm-size=150gb</code> options to enable TPU interaction and shared memory."
+            cmd: `git clone https://github.com/vllm-project/vllm-torchtpu.git\ncd vllm-torchtpu\ndocker build -f docker/Dockerfile -t vllm-torchtpu:dev .\nsudo docker run -it --rm --name $USER-vllm --privileged --net=host \\\n  -v /dev/shm:/dev/shm \\\n  --shm-size 150gb \\\n  -p 8000:8000 \\\n  --entrypoint /bin/bash vllm-torchtpu:dev`,
+            inst: "Build and run the <strong>vllm-torchtpu</strong> image from <code>docker/Dockerfile</code> containing the latest repository source."
         }
     },
     "source": {
-        cmd: `# 1. Install system dependencies:\nsudo apt-get update && sudo apt-get install -y libopenblas-base libopenmpi-dev libomp-dev\n\n# 2. Clone the vllm and tpu-inference repositories:\ngit clone https://github.com/vllm-project/tpu-inference.git\nexport VLLM_COMMIT_HASH=$(cat tpu-inference/.buildkite/vllm_lkg.version)\ngit clone https://github.com/vllm-project/vllm.git\ncd vllm\ngit checkout "\${VLLM_COMMIT_HASH}"\ncd ..\n\n# 3. Install uv and set up a Python virtual environment:\ncurl -LsSf https://astral.sh/uv/install.sh | sh\nsource $HOME/.local/bin/env\nuv venv vllm_env --python 3.12\nsource vllm_env/bin/activate\n\n# 4. Install vllm from source, targeting the TPU device:\ncd vllm\nuv pip install -r requirements/tpu.txt --torch-backend=cpu\nVLLM_TARGET_DEVICE="tpu" uv pip install -e . --no-build-isolation\ncd ..\n\n# 5. Install tpu-inference from source:\ncd tpu-inference\nuv pip install -e .\ncd ..`,
-        inst: "For debugging or development purposes, you can install <code>tpu-inference</code> from source. <code>tpu-inference</code> is a plugin for <code>vllm</code>, so you need to install both from source."
+        cmd: `# 1. Authenticate with GCP Artifact Registry:\ngcloud auth application-default login\n\n# 2. Clone vllm-torchtpu and create a virtual environment:\ngit clone https://github.com/vllm-project/vllm-torchtpu.git\ncd vllm-torchtpu\nuv venv --python 3.12 --seed\nsource .venv/bin/activate\n\n# 3. Install in editable mode with vllm and dev dependencies:\nuv pip install --prerelease=allow -e . --group vllm --group dev\n\n# 4. (Optional) Editable vllm checkout for cross-repo development:\ngit clone --branch v0.29.0 --depth 1 https://github.com/vllm-project/vllm.git ../vllm\nVLLM_TARGET_DEVICE=empty uv pip install -e ../vllm --no-deps`,
+        inst: "For development or debugging, install <code>vllm-torchtpu</code> in editable mode with <code>--group vllm --group dev</code>. Optionally mount an editable <code>vllm</code> checkout."
     }
 };
 
@@ -45,7 +45,7 @@ function highlightShell(code) {
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;');
-    const tokenRegex = /("[^"]*"|'[^']*'|\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*|--[a-zA-Z0-9_-]+|-[a-zA-Z0-9]+|&&|\|\||\||\\|\b(?:export|source|sudo|cd|mkdir|git|uv|pip|curl|gcloud|docker|apt-get|python|python3\.12)\b|\b(?:install|run|clone|checkout|update|venv|create|compute|tpus|queued-resources|tpu-vm|ssh|alpha)\b)/g;
+    const tokenRegex = /("[^"]*"|'[^']*'|\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*|--[a-zA-Z0-9_-]+|-[a-zA-Z0-9]+|&&|\|\||\||\\|\b(?:export|source|sudo|cd|mkdir|git|uv|pip|curl|gcloud|docker|apt-get|python|python3\.12)\b|\b(?:install|run|clone|checkout|update|venv|create|compute|tpus|queued-resources|tpu-vm|ssh|alpha|sync|auth|build)\b)/g;
     return escaped.split('\n').map(line => {
         if (/^\s*#/.test(line)) {
             return '<span class="c1">' + line + '</span>';
@@ -99,6 +99,14 @@ function updateCommandGenerator() {
 }
 
 const PROVISION_DATA = {
+    "v7x": {
+        runtime: "v2-alpha-tpuv7x",
+        zone: "us-central1-c",
+        accel_prefix: "tpu7x-",
+        uses_core_count: true,
+        supports_flex: true,
+        valid_chips: [1, 4, 8, 16, 32, 64]
+    },
     "v6e": {
         runtime: "v2-alpha-tpuv6e",
         zone: "us-east5-a",
@@ -210,6 +218,7 @@ function updateProvisionGenerator() {
             const gceNote = hw === 'v6e' ? ' <em>(Note: 16+ chip topologies require multi-host MIGs or GKE)</em>' : ' <em>(Note: 8+ chip topologies require multi-host MIGs or GKE)</em>';
             if (model === 'flex_start') {
                 cmdEl.innerHTML = highlightShell(`gcloud compute instances create my-tpu-vm \\
+  --project=PROJECT_ID \\
   --zone=ZONE \\
   --machine-type=${machineType} \\
   --provisioning-model=FLEX_START \\
@@ -219,15 +228,16 @@ function updateProvisionGenerator() {
   --image-project=ubuntu-os-accelerator-images \\
   --image-family=ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e \\
   --maintenance-policy=TERMINATE`);
-                instEl.innerHTML = `Provision a discounted <strong>${chips}-chip TPU ${hw.toUpperCase()}</strong> VM instance using Compute Engine (GCE) with Flex-start (DWS). Replace <code>ZONE</code> with your target zone.${gceNote}`;
+                instEl.innerHTML = `Provision a discounted <strong>${chips}-chip TPU ${hw.toUpperCase()}</strong> VM instance using Compute Engine (GCE) with Flex-start (DWS). Replace <code>PROJECT_ID</code> and <code>ZONE</code> with your values.${gceNote}`;
             } else {
                 cmdEl.innerHTML = highlightShell(`gcloud compute instances create my-tpu-vm \\
+  --project=PROJECT_ID \\
   --zone=ZONE \\
   --machine-type=${machineType} \\
   --image-project=ubuntu-os-accelerator-images \\
   --image-family=ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e \\
   --maintenance-policy=TERMINATE`);
-                instEl.innerHTML = `Provision a standard <strong>${chips}-chip TPU ${hw.toUpperCase()}</strong> VM instance using Compute Engine (GCE). Replace <code>ZONE</code> with your target zone.${gceNote}`;
+                instEl.innerHTML = `Provision a standard <strong>${chips}-chip TPU ${hw.toUpperCase()}</strong> VM instance using Compute Engine (GCE). Replace <code>PROJECT_ID</code> and <code>ZONE</code> with your values.${gceNote}`;
             }
         } else {
             let accelerator;
@@ -254,7 +264,7 @@ function updateProvisionGenerator() {
   --max-run-duration 4h \\
   --valid-until-duration 4h \\
   --service-account SERVICE_ACCOUNT`);
-                instEl.innerHTML = `Provision a discounted <strong>${chips}-chip TPU ${hw.toUpperCase()}${coreNote}</strong> using Flex-start with the legacy Queued Resources API. Replace <code>PROJECT_ID</code>, <code>ZONE</code>, and <code>SERVICE_ACCOUNT</code> with your values.`;
+                instEl.innerHTML = `Provision a discounted <strong>${chips}-chip TPU ${hw.toUpperCase()}${coreNote}</strong> using Flex-start with the legacy Queued Resources API. Replace <code>PROJECT_ID</code> and <code>ZONE</code> with your values. <code>--service-account</code> is optional; remove it to use the Compute Engine default service account.`;
             } else {
                 cmdEl.innerHTML = highlightShell(`gcloud alpha compute tpus queued-resources create my-queued-resource \\
   --node-id my-tpu-name \\
@@ -263,7 +273,7 @@ function updateProvisionGenerator() {
   --accelerator-type ${accelerator} \\
   --runtime-version ${data.runtime} \\
   --service-account SERVICE_ACCOUNT`);
-                instEl.innerHTML = `Provision a standard <strong>${chips}-chip TPU ${hw.toUpperCase()}${coreNote}</strong> using the legacy Queued Resources API. Replace <code>PROJECT_ID</code>, <code>ZONE</code>, and <code>SERVICE_ACCOUNT</code> with your values.`;
+                instEl.innerHTML = `Provision a standard <strong>${chips}-chip TPU ${hw.toUpperCase()}${coreNote}</strong> using the legacy Queued Resources API. Replace <code>PROJECT_ID</code> and <code>ZONE</code> with your values. <code>--service-account</code> is optional; remove it to use the Compute Engine default service account.`;
             }
         }
     }
@@ -302,9 +312,65 @@ function initCommandGenerator() {
     updateProvisionGenerator();
 }
 
+// Tables wrapped in <div class="expandable-table" data-detail-column="..."> hide
+// the named column and show its contents in a full-width row when a row is
+// clicked. Without JS the table renders with every column.
+function initExpandableTables() {
+    document.querySelectorAll('.expandable-table').forEach(container => {
+        const table = container.querySelector('table');
+        if (!table || table.dataset.etInitialized === 'true') return;
+        table.dataset.etInitialized = 'true';
+
+        const detailName = container.getAttribute('data-detail-column');
+        const headers = Array.from(table.querySelectorAll('thead th'));
+        const detailIdx = headers.findIndex(th => th.textContent.trim() === detailName);
+        if (detailIdx < 0) return;
+        headers[detailIdx].classList.add('et-hidden');
+
+        table.querySelectorAll('tbody tr').forEach(row => {
+            const detailCell = row.children[detailIdx];
+            if (!detailCell) return;
+            detailCell.classList.add('et-hidden');
+
+            const detailRow = document.createElement('tr');
+            detailRow.className = 'et-detail';
+            detailRow.hidden = true;
+            const td = document.createElement('td');
+            td.colSpan = headers.length - 1;
+            const label = document.createElement('span');
+            label.className = 'et-detail-label';
+            label.textContent = detailName;
+            td.appendChild(label);
+            td.insertAdjacentHTML('beforeend', detailCell.innerHTML);
+            detailRow.appendChild(td);
+            row.after(detailRow);
+
+            row.classList.add('et-row');
+            row.tabIndex = 0;
+            row.setAttribute('aria-expanded', 'false');
+            const toggle = () => {
+                const open = detailRow.hidden;
+                detailRow.hidden = !open;
+                row.classList.toggle('et-open', open);
+                row.setAttribute('aria-expanded', String(open));
+            };
+            row.addEventListener('click', e => {
+                if (!e.target.closest('a')) toggle();
+            });
+            row.addEventListener('keydown', e => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    toggle();
+                }
+            });
+        });
+    });
+}
+
 function initInteractiveComponents() {
     initCommandGenerator();
     initSimpleSearch();
+    initExpandableTables();
 }
 
 document.addEventListener("DOMContentLoaded", function() {

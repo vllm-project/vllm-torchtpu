@@ -16,27 +16,51 @@ vLLM TorchTPU is the integration of **TorchTPU** and **vLLM**. It is a vLLM plat
 
 ## What are you trying to do today?
 
-<div class="grid cards three-columns" markdown>
+<div class="grid cards two-columns" markdown>
 
 - :material-rocket-launch:{ .lg .middle } __I'm New__
 
-    Install the plugin, start a server, and send your first request.
+    Provision a Cloud TPU, install `vllm-torchtpu`, and send your first request.
 
-    [:octicons-arrow-right-24: Installation and Quickstart](https://github.com/vllm-project/vllm-torchtpu#readme)
+    [:octicons-arrow-right-24: Cloud TPU Setup](getting_started/tpu_setup.md)
 
-- :material-speedometer:{ .lg .middle } __I Want to Tune__
+    [:octicons-arrow-right-24: Installation](getting_started/installation.md)
 
-    Cut compile times and capture TPU traces to find where time goes.
+    [:octicons-arrow-right-24: Quickstart](getting_started/quickstart.md)
 
-    [:octicons-arrow-right-24: TorchTPU Compilation Cache](torch_tpu_compilation.md)
+- :material-speedometer:{ .lg .middle } __I Want to Serve & Scale__
+
+    Explore supported models, 6D parallelism, P/D disaggregation, and TPU recipes.
+
+    [:octicons-arrow-right-24: Supported Models & Features](user_guide/supported_models.md)
+
+    [:octicons-arrow-right-24: Parallelism & Scaling](user_guide/parallelism.md)
+
+    [:octicons-arrow-right-24: Disaggregated Serving (P/D)](user_guide/disaggregated_serving.md)
+
+    [:octicons-arrow-right-24: TPU v7x Serving Recipes](deployment/v7x_recipes.md)
+
+- :material-code-tags:{ .lg .middle } __I Want to Contribute__
+
+    Contribute code, dive into inference examples, and follow the submission flow.
+
+    [:octicons-arrow-right-24: Inference Examples](api_and_code_examples/offline_inference.md)
+
+    [:octicons-arrow-right-24: Contributing](developers_guide/contributing.md)
+
+    [:octicons-arrow-right-24: Testing & CI](developers_guide/testing_and_ci.md)
+
+- :material-lightbulb-on-outline:{ .lg .middle } __I Want to Learn More__
+
+    Learn the architecture, run benchmarks, and profile TPU kernels.
+
+    [:octicons-arrow-right-24: Coding Guidance](developers_guide/coding_guidance.md)
+
+    [:octicons-arrow-right-24: Benchmarking](developers_guide/benchmarking.md)
 
     [:octicons-arrow-right-24: Profiling](developers_guide/profiling.md)
 
-- :material-code-tags:{ .lg .middle } __I Want to Build__
-
-    Contribute code and follow the submission flow.
-
-    [:octicons-arrow-right-24: Contributing](developers_guide/contributing.md)
+    [:octicons-arrow-right-24: Environment Variables](reference/env_vars.md)
 
 </div>
 

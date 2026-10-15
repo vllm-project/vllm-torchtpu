@@ -20,7 +20,7 @@ then chunks are cut by token count alone.
 """
 
 import math
-from typing import Any
+from typing import Any, cast
 
 from vllm.v1.core.sched.scheduler import Scheduler
 
@@ -93,6 +93,23 @@ class TpuPipelineChunkScheduler(Scheduler):
                 self._account(1, computed)
                 self._seeded.add(request.request_id)
         return super().schedule(throttle_prefills)
+
+    def step_estimate_ms(self, scheduler_output: Any) -> float | None:
+        """Modelled time on one stage of the step the last ``schedule``
+        produced, in ms; None until the cost model is installed."""
+        if self._cost is None:
+            return None
+        pairs = squares = 0.0
+        for req_id, tokens in scheduler_output.num_scheduled_tokens.items():
+            request = self.requests.get(req_id)
+            # schedule() already counted the step's tokens as computed.
+            prefix = request.num_computed_tokens - tokens if request is not None else 0
+            pairs += float(tokens) * prefix
+            squares += float(tokens) * tokens
+        buckets = self._cost.buckets
+        total = scheduler_output.total_num_scheduled_tokens
+        bucket = next((b for b in buckets if b >= total), buckets[-1])
+        return self._cost.step_ms(bucket, pairs, squares)
 
     def _pending_step_limit(self) -> int | None:
         """The bucket a step is held to: the prefill work still to schedule
@@ -199,7 +216,8 @@ def profile_and_install_cost_model(scheduler: Any, executor: Any) -> None:
         [[tuple(s) for s in report["samples"]] for report in reports],
         envs.TPU_PP_CHUNK_SLACK,
         granularity,
-        min(schedules) if schedules else None,
+        # Each worker reports its kernel schedule as (pairs, bq, bkv).
+        cast(tuple[int, int, int], min(schedules)) if schedules else None,
     )
     scheduler.install_cost_model(model)
 

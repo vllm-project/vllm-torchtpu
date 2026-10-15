@@ -53,7 +53,6 @@ def test_deepseek_v4_model_registration():
     assert model_cls is DeepseekV4ForCausalLM
 
 
-@pytest.mark.cpu_test
 def test_weight_loader_drops_mtp_after_mapping_and_keeps_plain_weights():
     model = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
     nn.Module.__init__(model)
@@ -191,7 +190,6 @@ def dist_ctx():
     yield
 
 
-@pytest.mark.cpu_test
 @pytest.mark.parametrize("compress_ratio", [1, 4, 128])
 def test_attention_constructs_tpu_swa_cache(monkeypatch, request, compress_ratio):
     """Exercise upstream construction, including its SWA backend argument."""
@@ -288,6 +286,7 @@ def _expected_aux(fc, tag):
     return _FakePostOp()(x, residual, post_mix, res_mix).mean(dim=1)
 
 
+@pytest.mark.tpu_test
 def test_untagged_forward_is_bare_tensor_and_unchanged(tiny_fc):
     out = _forward(tiny_fc, ())
     assert isinstance(out, torch.Tensor)
@@ -300,6 +299,7 @@ def test_untagged_forward_is_bare_tensor_and_unchanged(tiny_fc):
     torch.testing.assert_close(out, expected)
 
 
+@pytest.mark.tpu_test
 def test_tagged_forward_captures_and_keeps_main_output(tiny_fc):
     for bad in [(0,), (N_LAYERS + 1,)]:
         with pytest.raises(ValueError, match="aux hidden-state layers"):

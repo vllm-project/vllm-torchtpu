@@ -15,9 +15,7 @@ from vllm_torchtpu.distributed import mesh_utils, pcp
 @pytest.fixture(autouse=True)
 def isolated_caches(monkeypatch):
     monkeypatch.setattr(mesh_utils, "_LAYOUT_CACHE", {})
-    monkeypatch.setattr(mesh_utils, "_MESH_CACHE", {})
-    # PCP keeps its own mesh cache: it builds a Torchtpu PallasMesh, not the
-    # device mesh mesh_utils builds, so the two cannot share one dict.
+    # Each axis keeps its own mesh cache; mesh_utils holds only the layout.
     monkeypatch.setattr(pcp, "_MESH_CACHE", {})
 
 
@@ -225,9 +223,8 @@ def _pcp_mesh_environment(monkeypatch, layout_holder, world_size=2):
     """Everything ``get_or_create_pcp_mesh`` reads, except Torchtpu itself.
 
     ``get_cp_group_layout`` is patched on ``pcp`` rather than on
-    ``mesh_utils``: PCP now builds its own mesh instead of going through
-    ``mesh_utils.get_or_create_cp_mesh``, so the name that gets called is the
-    one bound in ``pcp``'s namespace by its ``from ... import``.
+    ``mesh_utils``: PCP builds its own mesh, so the name that gets called is
+    the one bound in ``pcp``'s namespace by its ``from ... import``.
     """
     monkeypatch.setattr(pcp, "get_cp_group_layout", lambda group: layout_holder[0])
     monkeypatch.setattr(
@@ -255,6 +252,7 @@ def _pcp_mesh_environment(monkeypatch, layout_holder, world_size=2):
     return get_pallas_mesh
 
 
+@pytest.mark.tpu_test
 def test_mesh_comes_from_pallas_and_caches_by_axis_and_devices(monkeypatch):
     holder = [pcp.PcpGroupLayout((0, 1), (30, 10), 0, 2)]
     get_pallas_mesh = _pcp_mesh_environment(monkeypatch, holder)
@@ -271,6 +269,7 @@ def test_mesh_comes_from_pallas_and_caches_by_axis_and_devices(monkeypatch):
     assert get_pallas_mesh.call_count == 3
 
 
+@pytest.mark.tpu_test
 def test_mesh_rejects_a_pcp_group_smaller_than_the_world(monkeypatch):
     holder = [pcp.PcpGroupLayout((0, 1), (30, 10), 0, 2)]
     get_pallas_mesh = _pcp_mesh_environment(monkeypatch, holder, world_size=2)
@@ -282,6 +281,63 @@ def test_mesh_rejects_a_pcp_group_smaller_than_the_world(monkeypatch):
     assert pcp._MESH_CACHE == {}
 
 
+def _stage_mesh_environment(monkeypatch, holder, mesh_device_ids):
+    """A slice of four pipeline stages of two devices, seen from stage 1."""
+    _pcp_mesh_environment(monkeypatch, holder, world_size=2)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda *a, **k: 8)
+    monkeypatch.setattr(
+        parallel_state,
+        "get_pp_group",
+        lambda: SimpleNamespace(world_size=4, rank_in_group=1),
+    )
+    group = SimpleNamespace(
+        world_size=2, rank_in_group=0, ranks=[2, 3], device_group=object()
+    )
+    monkeypatch.setattr(parallel_state, "get_pcp_group", lambda: group)
+    from torch_tpu._internal import pallas as pallas_module
+
+    mesh = SimpleNamespace(
+        devices=SimpleNamespace(
+            flat=[SimpleNamespace(id=device_id) for device_id in mesh_device_ids]
+        )
+    )
+    get_pallas_mesh = Mock(return_value=mesh)
+    monkeypatch.setattr(pallas_module, "get_pallas_mesh", get_pallas_mesh)
+    return group, mesh, get_pallas_mesh
+
+
+@pytest.mark.tpu_test
+def test_mesh_covers_the_stage_under_pipeline_parallelism(monkeypatch):
+    holder = [pcp.PcpGroupLayout((2, 3), (4, 5), 0, 2)]
+    group, mesh, get_pallas_mesh = _stage_mesh_environment(monkeypatch, holder, (4, 5))
+
+    assert pcp.get_or_create_pcp_mesh() is mesh
+    get_pallas_mesh.assert_called_once_with(
+        axis_names=("pcp",), mesh_shape=(2,), process_group=group.device_group
+    )
+
+
+@pytest.mark.tpu_test
+def test_stage_mesh_rejects_devices_other_than_the_stage(monkeypatch):
+    holder = [pcp.PcpGroupLayout((2, 3), (4, 5), 0, 2)]
+    _stage_mesh_environment(monkeypatch, holder, (0, 1))
+
+    with pytest.raises(RuntimeError, match="stage's devices"):
+        pcp.get_or_create_pcp_mesh()
+    assert pcp._MESH_CACHE == {}
+
+
+@pytest.mark.tpu_test
+def test_stage_mesh_rejects_ranks_outside_the_stage(monkeypatch):
+    holder = [pcp.PcpGroupLayout((0, 1), (0, 1), 0, 2)]
+    _, _, get_pallas_mesh = _stage_mesh_environment(monkeypatch, holder, (0, 1))
+
+    with pytest.raises(RuntimeError, match=r"ranks 0\.\.N-1"):
+        pcp.get_or_create_pcp_mesh()
+    get_pallas_mesh.assert_not_called()
+
+
+@pytest.mark.tpu_test
 def test_mesh_rejects_a_permuted_pcp_group(monkeypatch):
     monkeypatch.setattr(pcp, "_MESH_CACHE", {})
     # rank_in_group 0 is PyTorch rank 2, but the kernel's partition 0 is
@@ -294,6 +350,7 @@ def test_mesh_rejects_a_permuted_pcp_group(monkeypatch):
     assert pcp._MESH_CACHE == {}
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("pcp_size,tp_size", [(4, 2), (8, 1), (1, 8), (16, 2)])
 def test_pcp_tp_mesh_uses_runtime_rank_factorization(monkeypatch, pcp_size, tp_size):
     for rank in range(pcp_size * tp_size):
@@ -321,6 +378,7 @@ def test_pcp_tp_mesh_uses_runtime_rank_factorization(monkeypatch, pcp_size, tp_s
         pcp._MESH_CACHE.clear()
 
 
+@pytest.mark.tpu_test
 def test_pcp_tp_mesh_rejects_wrong_tp_rank_order(monkeypatch):
     holder = [pcp.PcpGroupLayout((0, 2, 4, 6), (0, 4, 6, 2), 0, 4)]
     native = _pcp_mesh_environment(monkeypatch, holder, 8)

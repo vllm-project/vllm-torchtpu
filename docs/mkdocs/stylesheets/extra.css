@@ -26,21 +26,20 @@ body[data-md-color-scheme="slate"] .md-nav__item--section > label.md-nav__link .
   font-weight: 700;
 }
 
-/* Custom 3-Column Grid for Persona Cards */
-@media screen and (min-width: 961px) {
-  .grid.cards.three-columns > ul {
-    grid-template-columns: repeat(3, minmax(0, 1fr)) !important;
-  }
+/* Indent second-layer nav items under section titles */
+[dir="ltr"] .md-nav__item--section > .md-nav {
+  margin-left: 0.15rem;
 }
 
-@media screen and (max-width: 960px) {
-  .grid.cards.three-columns > ul {
+/* Custom 2x2 Grid for Persona Cards */
+@media screen and (min-width: 721px) {
+  .grid.cards.two-columns > ul {
     grid-template-columns: repeat(2, minmax(0, 1fr)) !important;
   }
 }
 
 @media screen and (max-width: 720px) {
-  .grid.cards.three-columns > ul {
+  .grid.cards.two-columns > ul {
     grid-template-columns: minmax(0, 1fr) !important;
   }
 }
@@ -96,4 +95,12 @@ body[data-md-color-scheme="slate"] .md-nav__item--section > label.md-nav__link .
 
 .md-nav__button.md-logo .md-logo__plus {
   font-size: 1.6rem;
+}
+
+/* Secondary description under a model family name in supported_models.md */
+.md-typeset .family-desc {
+  display: inline-block;
+  margin-top: 0.2em;
+  color: var(--md-default-fg-color--light);
+  font-size: 0.9em;
 }

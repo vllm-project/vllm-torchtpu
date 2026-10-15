@@ -17,7 +17,7 @@ Base configuration classes for TPU quantization.
 These classes provide the foundation for all TPU-specific quantization configs.
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.fused_moe import RoutedExperts
@@ -28,7 +28,49 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 if TYPE_CHECKING:
+    import torch
+    from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tensors import (  # noqa: E501
+        CompressedTensorsScheme,
+    )
+
     from vllm_torchtpu.layers.adapter.quantization.online_fp8 import OnlineFp8Policy
+
+    class TpuRoutedExperts(RoutedExperts):
+        """Typing-only view of a RoutedExperts layer with the parameters and
+        buffers that the TPU MoE quantization methods register on it."""
+
+        w13_weight: torch.nn.Parameter
+        w2_weight: torch.nn.Parameter
+        w13_weight_scale: torch.nn.Parameter
+        w2_weight_scale: torch.nn.Parameter
+        w13_weight_scale_inv: torch.nn.Parameter
+        w2_weight_scale_inv: torch.nn.Parameter
+        w13_weight_scale_2: torch.nn.Parameter
+        w2_weight_scale_2: torch.nn.Parameter
+        w13_weight_packed: torch.nn.Parameter
+        w2_weight_packed: torch.nn.Parameter
+        w13_bias: torch.nn.Parameter | None
+        w2_bias: torch.nn.Parameter | None
+        num_groups_w13: int
+        num_groups_w2: int
+        _experts_start: torch.Tensor | None
+        _tpu_fused_w13_scale: torch.Tensor
+        _tpu_fused_w2_scale: torch.Tensor
+        _rhs_quant_dtype: Any
+
+    class TpuLinear(LinearBase):
+        """Typing-only view of a LinearBase layer with the parameters and
+        attributes that the TPU linear quantization methods set on it."""
+
+        weight: torch.nn.Parameter
+        weight_scale: torch.nn.Parameter
+        weight_scale_inv: torch.nn.Parameter
+        weight_scale_2: torch.nn.Parameter
+        logical_widths: list[int]
+        weight_block_size: tuple[int, int] | int
+        scheme: CompressedTensorsScheme
+        _tpu_online_fp8_processed: bool
+
 
 logger = init_logger(__name__)
 
@@ -49,7 +91,7 @@ class VllmQuantLinearConfig:
 
     def __init__(
         self,
-        vllm_config: VllmConfig,
+        vllm_config: VllmConfig | None,
         layer: LinearBase,
     ):
         assert isinstance(layer, LinearBase)
@@ -81,7 +123,10 @@ class VllmQuantConfig:
     online_fp8_policy: "OnlineFp8Policy | None" = None
 
     # Class-level config storage (set once, shared by all instances)
-    vllm_config: VllmConfig = None
+    vllm_config: VllmConfig | None = None
+
+    # Set by vLLM's QuantizationConfig, which every concrete subclass extends.
+    packed_modules_mapping: dict[str, list[str]]
 
     @classmethod
     def set_configs(cls, vllm_config: VllmConfig):
@@ -129,6 +174,7 @@ class VllmQuantConfig:
         """
         assert isinstance(layer, RoutedExperts)
         moe_config = layer.moe_config
+        assert self.vllm_config is not None
         use_ep = self.vllm_config.parallel_config.enable_expert_parallel
         moe_config.moe_parallel_config.use_ep = use_ep
         return moe_config
