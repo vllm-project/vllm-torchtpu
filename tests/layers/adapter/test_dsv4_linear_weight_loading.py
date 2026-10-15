@@ -53,11 +53,14 @@ def test_linear_weight_loading_quant_config_resolving():
 
 def test_linear_weight_loading_unquantized_fallback():
     """Verify dynamic quantization fallback when checkpoint is unquantized."""
+    # Upstream `Fp8Config` rejects online quantization at construction since
+    # vLLM v0.31; the TPU config builds as serialized and flips the flag too.
     dummy_quant_config = _DummyDeepseekV4Fp8Config(
-        is_checkpoint_fp8_serialized=False,
+        is_checkpoint_fp8_serialized=True,
         activation_scheme="dynamic",
         weight_block_size=None,
     )
+    dummy_quant_config.is_checkpoint_fp8_serialized = False
     dense_method = VllmFp8LinearMethodTPU(
         quant_config=dummy_quant_config,
         prefix="model.layers.0.self_attn.fused_wqa_wkv",

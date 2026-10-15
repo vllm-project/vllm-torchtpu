@@ -21,8 +21,8 @@ def compile_mock(monkeypatch):
 def manager(compile_mock):
     model = Mock()
     model.get_encoder_cudagraph_config.return_value = SimpleNamespace(
-        padding_logics={},
         capture_axes=(),
+        padding_logics={},
         paths={
             "global": SimpleNamespace(min_token_budget=None, allow_zero_tokens=False),
             "local": SimpleNamespace(min_token_budget=8, allow_zero_tokens=True),
@@ -137,12 +137,12 @@ def test_capture_preserves_template_mapping_and_registers_after_sync(
     def synchronize(values, *, wait):
         assert values is output
         assert wait
-        assert 4 not in manager._get_graph_set("global")
+        assert 4 not in manager.compiled_budgets["global"]
 
     manager._compiled_budget_forward.side_effect = forward
     monkeypatch.setattr(mm, "synchronize_tensors", synchronize)
     manager._capture_budget_graph(4, "global")
-    assert manager._get_graph_set("global")[4] is template
+    assert 4 in manager.compiled_budgets["global"]
     assert "pixels" in template
 
 
@@ -153,7 +153,7 @@ def test_capture_failure_leaves_budget_unregistered(manager, monkeypatch, failur
     target.side_effect = RuntimeError("capture failed")
     monkeypatch.setattr(mm, "synchronize_tensors", synchronize)
     manager._capture_budget_graph(4, "global")
-    assert 4 not in manager._get_graph_set("global")
+    assert 4 not in manager.compiled_budgets["global"]
     assert manager.graph_hits == manager.graph_misses == 0
 
 
@@ -168,8 +168,8 @@ def test_precompile_continues_after_one_budget_fails(manager, monkeypatch):
     manager.precompile_vision_encoder()
     assert manager._compiled_budget_forward.call_count == 3
     assert synchronize.call_count == 2
-    assert set(manager._get_graph_set("global")) == {8}
-    assert set(manager._get_graph_set("local")) == {8}
+    assert manager.compiled_budgets["global"] == {8}
+    assert manager.compiled_budgets["local"] == {8}
 
 
 @pytest.mark.parametrize("path, budget", [("missing", 4), ("global", 16), ("local", 0)])
@@ -198,7 +198,7 @@ def test_replay_counts_items_and_passes_padded_values(manager):
 
     manager._compiled_budget_forward.side_effect = forward
     for _ in range(2):
-        assert manager._run_budget_graph(mm_kwargs, 4, "global") is output
+        assert manager._run_budget_graph(mm_kwargs, 4, "global", axis_keys=()) is output
     assert manager.graph_hits == 4
     assert manager.graph_misses == 0
     assert "pixels" in manager.budget_templates["global"][4]
@@ -285,18 +285,8 @@ def test_coordinated_encoder_matches_peer_buckets_and_restores_item_order(
         assert (output == count).all()
     assert manager._run_budget_graph.call_args_list == (
         [
-            call(
-                {"tokens": [1, 3]},
-                8,
-                axis_keys=(),
-                allow_eager_fallback=False,
-            ),
-            call(
-                {"tokens": [4]},
-                8,
-                axis_keys=(),
-                allow_eager_fallback=False,
-            ),
+            call({"tokens": [1, 3]}, 8, axis_keys=(), allow_eager_fallback=False),
+            call({"tokens": [4]}, 8, axis_keys=(), allow_eager_fallback=False),
         ]
         if active
         else []
@@ -370,21 +360,25 @@ def test_coordinated_encoder_dp_shards_and_gathers_empty_and_uneven_ranks(
     tp.all_gather.assert_called_once()
 
 
+@pytest.mark.parametrize("capture_axes", [(), ((1, 2),)])
 @pytest.mark.parametrize(
     "enabled, supported", [(False, True), (True, False), (True, True)]
 )
-def test_factory_requires_enabled_and_supported(monkeypatch, enabled, supported):
+def test_factory_requires_enabled_and_supported(
+    monkeypatch, enabled, supported, capture_axes
+):
     config = SimpleNamespace(
         compilation_config=SimpleNamespace(cudagraph_mm_encoder=enabled)
     )
     model = Mock()
+    model.get_encoder_cudagraph_config.return_value.capture_axes = capture_axes
     device = torch.device("cpu")
     supports = Mock(return_value=supported)
     constructor = Mock()
     monkeypatch.setattr(mm, "supports_encoder_cudagraph", supports)
     monkeypatch.setattr(mm, "MMEncoderManager", constructor)
     result = mm.maybe_create_mm_encoder_manager(config, device, model)
-    if enabled and supported:
+    if enabled and supported and not capture_axes:
         assert result is constructor.return_value
         constructor.assert_called_once_with(config, device, model)
     else:
@@ -398,8 +392,8 @@ def test_execute_local_chunks_oversized_video_into_compiled_budgets(compile_mock
     """Chunk an oversized video so each chunk hits a compiled budget graph."""
     model = Mock()
     model.get_encoder_cudagraph_config.return_value = SimpleNamespace(
-        padding_logics={},
         capture_axes=(),
+        padding_logics={},
         paths={
             "default": SimpleNamespace(min_token_budget=None, allow_zero_tokens=False),
         },

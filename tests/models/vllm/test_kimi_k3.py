@@ -2602,7 +2602,7 @@ def test_kimi_k3_encoder_cudagraph_capture_grid_fits_rope_table(
     stub.vision_tower.prepare_encoder_cudagraph_metadata = metadata
 
     inputs = KimiK3ForConditionalGeneration.prepare_encoder_cudagraph_capture_inputs(
-        stub, budget, items, 1, torch.device("cpu"), torch.float32
+        stub, budget, items, 1, torch.device("cpu"), torch.float32, axis_keys=()
     )
 
     assert seen["grid"] == [grid] * items

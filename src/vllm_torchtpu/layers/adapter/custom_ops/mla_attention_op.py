@@ -80,6 +80,33 @@ logger = init_logger(__name__)
 # traffic and not at all once any request in the batch is past `index_topk`
 # tokens.
 STREAMIDX_ENABLE_EARLY_EXIT = True
+# StreamIdx block sizes as (decode, prefill, MIXED), tuned by microbenchmark.
+STREAMIDX_KV_PAGES_PER_BLOCK = (2, 2, 2)
+STREAMIDX_QUERIES_PER_BLOCK = (1, 128, 128)
+# MIXED-pass KV pages per block for small buckets when only the bq knob is set.
+STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP = 8
+
+
+def _streamidx_block_sizes(
+    num_tokens: int,
+    small_bucket_bq: int | None,
+    small_bucket_bkvp: int | None,
+    small_bucket_tokens: int,
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    """(num_kv_pages_per_block, num_queries_per_block) for a padded token bucket.
+
+    MIXED-pass query blocks hold one sequence each, so an MTP request
+    (q_len = gamma + 1) in a 128-row block scores ~124 padding rows. Buckets up
+    to `small_bucket_tokens` take the small-bucket sizes instead.
+    """
+    if small_bucket_bq is None or num_tokens > small_bucket_tokens:
+        return STREAMIDX_KV_PAGES_PER_BLOCK, STREAMIDX_QUERIES_PER_BLOCK
+    bkvp = small_bucket_bkvp or STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP
+    return (
+        STREAMIDX_KV_PAGES_PER_BLOCK[:2] + (bkvp,),
+        STREAMIDX_QUERIES_PER_BLOCK[:2] + (small_bucket_bq,),
+    )
+
 
 _INDEXER_KV_CACHE_FALLBACK_LOGGED: set[tuple[str, str]] = set()
 _INDEXER_KV_CACHE_INFO_LOGGED: set[tuple[str, str, str, tuple[int, ...]]] = set()
@@ -417,6 +444,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # None means unchunked. The kernel falls back to a single unpipelined
         # pass when `max_num_tokens` is not a multiple of the chunk.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+        small_bucket = (
+            envs.TPU_STREAMIDX_SMALL_BUCKET_BQ,
+            envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP,
+            envs.TPU_STREAMIDX_SMALL_BUCKET_TOKENS,
+        )
         kv_cache_mode = (
             envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
             if envs.is_indexer_kv_cache_mode_explicit()
@@ -476,6 +508,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
+            kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
+                q.shape[0], *small_bucket
+            )
             topk_indices = streamindex_topk(
                 q,
                 weights,
@@ -486,10 +521,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 distribution,
                 k=topk,
                 compression_ratio=1,
-                # The following parameters are tuned based on microbenchmark
-                # results.
-                num_kv_pages_per_block=(2, 2, 2),
-                num_queries_per_block=(1, 128, 128),
+                num_kv_pages_per_block=kv_pages_per_block,
+                num_queries_per_block=queries_per_block,
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
                 kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
@@ -529,6 +562,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
         a2a_merge = envs.TPU_DCP_INDEXER_A2A_MERGE
         a2a_min_tokens = envs.TPU_DCP_INDEXER_A2A_MIN_TOKENS
+        small_bucket = (
+            envs.TPU_STREAMIDX_SMALL_BUCKET_BQ,
+            envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP,
+            envs.TPU_STREAMIDX_SMALL_BUCKET_TOKENS,
+        )
         kv_cache_mode = (
             envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
             if envs.is_indexer_kv_cache_mode_explicit()
@@ -565,6 +603,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
+            kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
+                q.shape[0], *small_bucket
+            )
             local_topk = streamindex_topk_dcp(
                 q,
                 weights,
@@ -578,8 +619,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 compression_ratio=1,
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
-                num_kv_pages_per_block=(2, 2, 2),
-                num_queries_per_block=(1, 128, 128),
+                num_kv_pages_per_block=kv_pages_per_block,
+                num_queries_per_block=queries_per_block,
                 kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
                 a2a_merge=_dcp_indexer_a2a_for_bucket(

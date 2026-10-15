@@ -18,14 +18,34 @@
 # The client runs off the slices because aiperf's replay is the measurement.
 #
 # Exclusive-topology gives each engine role a slice of its own rather than
-# splitting both across the two. ${WORKLOAD_NAME} and ${IMAGE} are substituted
-# before submission, so a literal dollar is $$; every container is `workload`.
+# splitting both across the two. ${WORKLOAD_NAME}, ${IMAGE}, ${K3_ENGINE_IMAGE}
+# and ${K3_FLEET_CACHES} are substituted before submission, so a literal dollar
+# is $$; every container is `workload`.
+#
+# Two images. The client runs the build's image; the engines run
+# ${K3_ENGINE_IMAGE}, which common.sh defaults to the build's image too, and
+# which a lane sets to serve a vLLM build from elsewhere (the Kimi-K3 megakernel
+# engines, built from another branch by build_k3_engine_image.sh). Either way
+# the engines run this commit's .buildkite/kubernetes and benchmark configs: an
+# init container copies them out of the build's image and they are mounted over
+# the engine image's. The configs that serve the K3 checkpoint as files read it
+# at /ckpt/k3. A step picks the config with K3_PD_CONFIG, forwarded over the
+# default below.
 
 apiVersion: jobset.x-k8s.io/v1alpha2
 kind: JobSet
 metadata:
   annotations:
     tpu-ci.google.com/defaults: standard
+    # The fleet's caches: `none` for the megakernel points, empty (kept) for
+    # the rest (common.sh). A megakernel boot streams the TP32 pre-shard once,
+    # and through the fleet's /cache/hf/hub the shards fill a 65Gi gcsfuse file
+    # cache, which is host memory: 61-67 GiB on every engine host in
+    # vllm-torchtpu-dev builds 562, 588 and 589, enough to get build 562's
+    # prefill head evicted under a 1.5 TiB host KV store. Without the caches
+    # the points also compile from scratch every boot, into the container's
+    # disk. Quoted, so that empty is an empty string rather than null.
+    tpu-ci.google.com/caches: "${K3_FLEET_CACHES}"
     alpha.jobset.sigs.k8s.io/exclusive-topology: cloud.google.com/gke-nodepool
 spec:
   # <jobset>-<role>-0-<index> under a headless service named for the JobSet,
@@ -60,9 +80,17 @@ spec:
               nodeSelector:
                 cloud.google.com/gke-tpu-topology: 2x2x4
                 cloud.google.com/gke-tpu-accelerator: tpu7x
+              # This commit's pair scripts and configs, for the engine image.
+              initContainers:
+                - name: lane-scripts
+                  image: ${IMAGE}
+                  command: ["/bin/sh", "-c", "cp -a /workspace/vllm-torchtpu/.buildkite/kubernetes /lane/kubernetes && cp -a /workspace/vllm-torchtpu/scripts/vllm/benchmarking/configs /lane/configs"]
+                  volumeMounts:
+                    - name: lane-scripts
+                      mountPath: /lane
               containers:
                 - name: workload
-                  image: ${IMAGE}
+                  image: ${K3_ENGINE_IMAGE}
                   command: ["/bin/bash", "/workspace/vllm-torchtpu/.buildkite/kubernetes/k3_1p1d.sh", "prefill"]
                   env:
                     # Host i of this role is <prefix>i.<domain>.
@@ -72,6 +100,8 @@ spec:
                       value: ${WORKLOAD_NAME}
                     - name: DECODE_HOST
                       value: ${WORKLOAD_NAME}-decode-0-0.${WORKLOAD_NAME}
+                    - name: PREFILL_HOST
+                      value: ${WORKLOAD_NAME}-prefill-0-0.${WORKLOAD_NAME}
                     - name: NUM_HOSTS
                       value: "4"
                     # Both roles and the client read this one config.
@@ -80,6 +110,8 @@ spec:
                     # Serve only; the client pod drives the run.
                     - name: K3_PD_EXTERNAL_CLIENT
                       value: "1"
+                    - name: K3_ENGINE_IMAGE
+                      value: ${K3_ENGINE_IMAGE}
                     # The downward API, so it cannot come from the script.
                     - name: POD_IP
                       valueFrom:
@@ -109,11 +141,66 @@ spec:
                     # kv=0 graph instead of compiling it.
                     - name: vllm-profile-cache
                       mountPath: /cache/jax/vllm/profile_cache
+                    - name: lane-scripts
+                      mountPath: /workspace/vllm-torchtpu/.buildkite/kubernetes
+                      subPath: kubernetes
+                    - name: lane-scripts
+                      mountPath: /workspace/vllm-torchtpu/scripts/vllm/benchmarking/configs
+                      subPath: configs
+                    - name: k3-checkpoint
+                      mountPath: /ckpt/k3
+                      readOnly: true
+                    # Inside the fleet's /cache/hf/hub when the pod has it,
+                    # which the launcher mounts ahead of these.
+                    - name: k3-presharded
+                      mountPath: /cache/hf/hub/presharded/kimi-k3-tp32
+                      readOnly: true
+                    - name: k3-dspark
+                      mountPath: /cache/hf/hub/models--RedHatAI--Kimi-K3-speculator.dspark
+                      readOnly: true
               volumes:
                 - name: vllm-profile-cache
                   emptyDir:
                     medium: Memory
                     sizeLimit: 16Gi
+                - name: lane-scripts
+                  emptyDir: {}
+                # The checkpoint's files (gs://tpu-commons-ci/moonshootai/kimi/k3),
+                # at the path the TP32 pre-shard was written from.
+                - name: k3-checkpoint
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    readOnly: true
+                    volumeAttributes:
+                      bucketName: tpu-commons-ci
+                      mountOptions: "implicit-dirs,only-dir=moonshootai/kimi/k3"
+                      skipCSIBucketAccessCheck: "true"
+                # What the megakernel configs read from the model bucket the
+                # fleet mounts at /cache/hf/hub (us-central1's, the only cluster
+                # with 2x2x4 pools), each mounted on its own: the TP32 pre-shard,
+                # with the DSpark kernel shards, and the DSpark speculator, of
+                # which they read only the config. Their own mounts because
+                # without the fleet's caches nothing else puts them at those
+                # paths, and with them the pre-shard would fill the fleet
+                # mount's file cache. With no fileCacheCapacity these have no
+                # file cache; read_ahead_kb is the fleet mount's, for the
+                # loader's large sequential reads.
+                - name: k3-presharded
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    readOnly: true
+                    volumeAttributes:
+                      bucketName: tpu-ci-models-60b4c3c7
+                      mountOptions: "implicit-dirs,only-dir=presharded/kimi-k3-tp32,read_ahead_kb=131072"
+                      skipCSIBucketAccessCheck: "true"
+                - name: k3-dspark
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    readOnly: true
+                    volumeAttributes:
+                      bucketName: tpu-ci-models-60b4c3c7
+                      mountOptions: "implicit-dirs,only-dir=models--RedHatAI--Kimi-K3-speculator.dspark"
+                      skipCSIBucketAccessCheck: "true"
 
     - name: decode
       groupName: decode
@@ -130,9 +217,17 @@ spec:
               nodeSelector:
                 cloud.google.com/gke-tpu-topology: 2x2x4
                 cloud.google.com/gke-tpu-accelerator: tpu7x
+              # This commit's pair scripts and configs, for the engine image.
+              initContainers:
+                - name: lane-scripts
+                  image: ${IMAGE}
+                  command: ["/bin/sh", "-c", "cp -a /workspace/vllm-torchtpu/.buildkite/kubernetes /lane/kubernetes && cp -a /workspace/vllm-torchtpu/scripts/vllm/benchmarking/configs /lane/configs"]
+                  volumeMounts:
+                    - name: lane-scripts
+                      mountPath: /lane
               containers:
                 - name: workload
-                  image: ${IMAGE}
+                  image: ${K3_ENGINE_IMAGE}
                   command: ["/bin/bash", "/workspace/vllm-torchtpu/.buildkite/kubernetes/k3_1p1d.sh", "decode"]
                   env:
                     # Host i of this role is <prefix>i.<domain>.
@@ -142,6 +237,8 @@ spec:
                       value: ${WORKLOAD_NAME}
                     - name: DECODE_HOST
                       value: ${WORKLOAD_NAME}-decode-0-0.${WORKLOAD_NAME}
+                    - name: PREFILL_HOST
+                      value: ${WORKLOAD_NAME}-prefill-0-0.${WORKLOAD_NAME}
                     - name: NUM_HOSTS
                       value: "4"
                     # Both roles and the client read this one config.
@@ -150,6 +247,8 @@ spec:
                     # Serve only; the client pod drives the run.
                     - name: K3_PD_EXTERNAL_CLIENT
                       value: "1"
+                    - name: K3_ENGINE_IMAGE
+                      value: ${K3_ENGINE_IMAGE}
                     - name: POD_IP
                       valueFrom:
                         fieldRef:
@@ -172,11 +271,55 @@ spec:
                   volumeMounts:
                     - name: vllm-profile-cache
                       mountPath: /cache/jax/vllm/profile_cache
+                    - name: lane-scripts
+                      mountPath: /workspace/vllm-torchtpu/.buildkite/kubernetes
+                      subPath: kubernetes
+                    - name: lane-scripts
+                      mountPath: /workspace/vllm-torchtpu/scripts/vllm/benchmarking/configs
+                      subPath: configs
+                    - name: k3-checkpoint
+                      mountPath: /ckpt/k3
+                      readOnly: true
+                    - name: k3-presharded
+                      mountPath: /cache/hf/hub/presharded/kimi-k3-tp32
+                      readOnly: true
+                    - name: k3-dspark
+                      mountPath: /cache/hf/hub/models--RedHatAI--Kimi-K3-speculator.dspark
+                      readOnly: true
               volumes:
                 - name: vllm-profile-cache
                   emptyDir:
                     medium: Memory
                     sizeLimit: 16Gi
+                - name: lane-scripts
+                  emptyDir: {}
+                # The checkpoint's files (gs://tpu-commons-ci/moonshootai/kimi/k3),
+                # at the path the TP32 pre-shard was written from.
+                - name: k3-checkpoint
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    readOnly: true
+                    volumeAttributes:
+                      bucketName: tpu-commons-ci
+                      mountOptions: "implicit-dirs,only-dir=moonshootai/kimi/k3"
+                      skipCSIBucketAccessCheck: "true"
+                # The pre-shard and the speculator, as prefill's.
+                - name: k3-presharded
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    readOnly: true
+                    volumeAttributes:
+                      bucketName: tpu-ci-models-60b4c3c7
+                      mountOptions: "implicit-dirs,only-dir=presharded/kimi-k3-tp32,read_ahead_kb=131072"
+                      skipCSIBucketAccessCheck: "true"
+                - name: k3-dspark
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    readOnly: true
+                    volumeAttributes:
+                      bucketName: tpu-ci-models-60b4c3c7
+                      mountOptions: "implicit-dirs,only-dir=models--RedHatAI--Kimi-K3-speculator.dspark"
+                      skipCSIBucketAccessCheck: "true"
 
     # Chipless, so it is scheduled by its requests onto a worker-cpu node rather
     # than onto a slice, as qwen3.5-397b-1p1d.yaml's benchmark role is.

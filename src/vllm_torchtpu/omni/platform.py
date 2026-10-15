@@ -46,11 +46,20 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
 
         apply_omni_model_specific_patches()
+        if selected_backend is not None and selected_backend.upper() in (
+            "SDPA",
+            "TPU_SDPA",
+            "TORCH_SDPA",
+        ):
+            backend = "vllm_torchtpu.omni.attention.TpuSDPABackend"
+        else:
+            backend = "vllm_torchtpu.omni.attention.TpuFlashAttentionBackend"
         logger.info_once(
-            "Using TpuSDPABackend for diffusion attention (requested: %s).",
+            "Using %s for diffusion attention (requested: %s).",
+            backend,
             selected_backend,
         )
-        return "vllm_torchtpu.omni.attention.TpuSDPABackend"
+        return backend
 
     @classmethod
     def supports_torch_inductor(cls) -> bool:

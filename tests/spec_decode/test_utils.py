@@ -156,3 +156,12 @@ def test_top_level_lm_head_draft_is_unchanged():
     assert list(utils.iter_mtp_shared_heads(draft)) == []
     logits = torch.randn(2, 3)
     assert draft.logits_processor._gather_logits(logits) is logits
+
+
+def test_fit_rows_returns_slices_or_pads_the_leading_dim():
+    t = torch.arange(8, dtype=torch.int32).view(4, 2)
+    assert utils.fit_rows(t, 4) is t
+    assert torch.equal(utils.fit_rows(t, 2), t[:2])
+    out = utils.fit_rows(t, 6, value=-1)
+    assert out.dtype == torch.int32 and out.shape == (6, 2)
+    assert torch.equal(out[:4], t) and out[4:].eq(-1).all()

@@ -58,7 +58,10 @@ if TYPE_CHECKING:
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
+    FUSED_MOE_DECODE_KERNEL: bool = False
+    FUSED_MOE_DECODE_KERNEL_MAX_TOKENS: int = 256
     TPU_MOE_SINGLE_SORT: bool = True
+    USE_MOE_TP_DECODE_KERNEL: bool = False
     RAGGED_GATHER_REDUCE_VERSION: str = "v2"
     USE_PHASED_PROFILER: bool = False
     TPU_KERNEL_ITER_MODE: bool = False
@@ -74,6 +77,7 @@ if TYPE_CHECKING:
     TPU_MLA_MASKED_DENSE_MAX_KV_LEN: int | None = None
     VLLM_TPU_MOST_MODEL_LEN: int | None = None
     TPU_GDN_CONV_QK_PAIR_LAYOUT: bool = False
+    TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -96,6 +100,9 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
+    TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
+    TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
+    TPU_STREAMIDX_SMALL_BUCKET_TOKENS: int = 64
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
@@ -418,6 +425,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_GDN_CONV_QK_PAIR_LAYOUT": env_bool(
         "TPU_GDN_CONV_QK_PAIR_LAYOUT", default=False
     ),
+    # Size GDN v3 decode tiles and prefill chunks from per-rank heads, active
+    # sequences and the VMEM estimate (kernels/gdn/v3/tiling.py) instead of
+    # the fixed defaults.
+    "TPU_ENABLE_GDN_DYNAMIC_TILING": env_bool(
+        "TPU_ENABLE_GDN_DYNAMIC_TILING", default=False
+    ),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
     # eval config turns it on, since a prefilled assistant turn needs it.
@@ -601,9 +614,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_MOE_DENSE_EXPERT_THRESHOLD": env_nonnegative_int(
         "TPU_MOE_DENSE_EXPERT_THRESHOLD", 0
     ),
+    # Serve eligible MoE layers (TP experts, or EP with TP attention) with the
+    # fused MoE decode kernel: routed experts, shared expert and all-reduce in
+    # one Pallas call (layers/adapter/fused_moe_decode.py). Armed once after
+    # load. Steps above FUSED_MOE_DECODE_KERNEL_MAX_TOKENS tokens run the GMM
+    # MoE path; arming refuses a cap whose buffers do not fit in VMEM.
+    "FUSED_MOE_DECODE_KERNEL": env_bool("FUSED_MOE_DECODE_KERNEL"),
+    "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS": env_int(
+        "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS", 256
+    ),
     # Build the MoE permutation, its inverse, and the sorted token ids from
     # one packed sort instead of three. The ragged (counting sort) path ignores it.
     "TPU_MOE_SINGLE_SORT": env_bool("TPU_MOE_SINGLE_SORT", True),
+    # Serve eligible tensor-parallel MoE layers (sigmoid + correction-bias
+    # top-k with renormalization, one shared expert, FP8 per-channel weights)
+    # with one op that also covers the shared expert and the TP all-reduce:
+    # at 16, 32 and 64 tokens a single Pallas kernel per rank, at other token
+    # counts the usual path plus a psum (layers/adapter/moe_tp_decode.py).
+    # Armed once after load; needs TPU_MOE_SKIP_PADDED_TOKENS=1 (the op reads
+    # the real token count from its padding mask), otherwise every layer keeps
+    # the usual path. Arms nothing while FUSED_MOE_DECODE_KERNEL is set. Remove
+    # once the path is the default for these layers or is replaced by another
+    # fused TP MoE path.
+    "USE_MOE_TP_DECODE_KERNEL": env_bool("USE_MOE_TP_DECODE_KERNEL"),
     # SparseCore MoE gather-reduce (combine) kernel version used by
     # fused_moe_gmm. "v2" is the default; "v1" selects the legacy kernel and
     # "v3" selects the destination-major prototype.
@@ -758,6 +791,26 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # variant picks one merge with no runtime cost.
     "TPU_DCP_INDEXER_A2A_MIN_TOKENS": env_nonnegative_int(
         "TPU_DCP_INDEXER_A2A_MIN_TOKENS", 64
+    ),
+    # MIXED-pass query block for StreamIndex top-k token buckets of at most
+    # TPU_STREAMIDX_SMALL_BUCKET_TOKENS. Under MTP every decode request has
+    # q_len = gamma + 1 and runs in the MIXED pass, whose default 128-row block
+    # scores ~124 padding rows per request. 4 is the recommended value. Unset
+    # keeps 128 everywhere.
+    "TPU_STREAMIDX_SMALL_BUCKET_BQ": env_positive_int_or_none(
+        "TPU_STREAMIDX_SMALL_BUCKET_BQ"
+    ),
+    # MIXED-pass KV pages per block for those buckets; unset takes 8. Read only
+    # when TPU_STREAMIDX_SMALL_BUCKET_BQ is set.
+    "TPU_STREAMIDX_SMALL_BUCKET_BKVP": env_positive_int_or_none(
+        "TPU_STREAMIDX_SMALL_BUCKET_BKVP"
+    ),
+    # Largest padded token bucket that takes the small-bucket block sizes. A
+    # small query block re-reads a sequence's keys once per block, so one long
+    # q_len row in the bucket erodes the win: at 64 a lone 60-token tail is at
+    # parity with the 128-row block.
+    "TPU_STREAMIDX_SMALL_BUCKET_TOKENS": env_int(
+        "TPU_STREAMIDX_SMALL_BUCKET_TOKENS", 64
     ),
     # Indexer K-cache writer and layout mode for GLM-5.2 / DSv4 StreamIndex:
     #   "sal" (default): Pallas coalesced_kv_append(_dcp) in SEQ_ALONG_LANE layout

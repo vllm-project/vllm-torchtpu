@@ -190,6 +190,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     # export is chosen from their source, so an edit here has to invalidate
     # the compiled executables like any other kernel change.
     "vllm_torchtpu/layers/adapter/fused_moe_ep.py",
+    # Same for the TP decode MoE op, whose body this module builds.
+    "vllm_torchtpu/layers/adapter/moe_tp_decode.py",
     # Still listed: on this base `pp_shift.py` is a second caller, so the
     # module stays even though the fused EP op no longer needs it.
     "vllm_torchtpu/distributed/sharded_jax_op.py",
@@ -213,6 +215,16 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
 )
 
+# vLLM-Omni diffusion code, dropped from the hashed set above. Diffusion
+# workers never compile through TpuCompilerAdaptor (OmniTpuPlatform does not
+# support torch inductor and vLLM-Omni skips torch.compile), and nothing
+# outside these paths imports their kernels, so they cannot change a cached
+# executable; hashing them would only invalidate LLM compile caches.
+_RUNTIME_CACHE_KEY_EXCLUDED_PATHS = (
+    "vllm_torchtpu/kernels/diffusion_attention",
+    "vllm_torchtpu/omni/attention.py",
+)
+
 
 def _iter_runtime_cache_key_files(repo_root: Path) -> list[Path]:
     """Return runtime source files that affect TPU custom-op lowering."""
@@ -229,6 +241,17 @@ def _iter_runtime_cache_key_files(repo_root: Path) -> list[Path]:
                 files_by_relpath[child_relpath] = child
             continue
         logger.warning("[TpuCompilerAdaptor] Cache key source path missing: %s", path)
+
+    excluded_files = set(_RUNTIME_CACHE_KEY_EXCLUDED_PATHS)
+    excluded_dirs = tuple(
+        f"{rel_path}/" for rel_path in _RUNTIME_CACHE_KEY_EXCLUDED_PATHS
+    )
+    for relpath in [
+        key
+        for key in files_by_relpath
+        if key in excluded_files or key.startswith(excluded_dirs)
+    ]:
+        del files_by_relpath[relpath]
 
     if envs.TPU_KERNEL_ITER_MODE:
         for relpath in _reloadable_kernel_relpaths(repo_root):

@@ -12,6 +12,7 @@ Tested FLUX Components:
 """
 
 import math
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -19,37 +20,10 @@ from vllm_omni.diffusion.layers.rope import RotaryEmbedding, apply_rope_to_qk
 from vllm_omni.diffusion.models.flux.flux_transformer import FluxPosEmbed
 from vllm_omni.diffusion.models.flux2.flux2_transformer import Flux2PosEmbed
 
-from vllm_torchtpu.omni.attention import TpuSDPAImpl
+from tests_omni.omni_test_utils import assert_numerical_parity
+from vllm_torchtpu.omni.attention import TpuFlashAttentionImpl, TpuSDPAImpl
 
 pytestmark = [pytest.mark.omni]
-
-
-def _assert_numerical_parity(
-    actual: torch.Tensor,
-    reference: torch.Tensor,
-    atol: float = 1e-2,
-    rtol: float = 1e-2,
-    min_cos_sim: float = 0.999,
-):
-    """Assert cosine similarity and floating-point tolerance bounds."""
-    a_flat = actual.flatten().float()
-    r_flat = reference.flatten().float()
-
-    norm_a = torch.linalg.norm(a_flat)
-    norm_r = torch.linalg.norm(r_flat)
-    if norm_a > 0 and norm_r > 0:
-        cos_sim = float(torch.dot(a_flat, r_flat) / (norm_a * norm_r))
-        assert cos_sim >= min_cos_sim, (
-            f"Cosine similarity {cos_sim:.5f} fell below minimum required {min_cos_sim}"
-        )
-
-    torch.testing.assert_close(
-        actual.float(),
-        reference.float(),
-        atol=atol,
-        rtol=rtol,
-        msg="TPU kernel output diverged from CPU baseline",
-    )
 
 
 def _sdpa_reference(
@@ -89,7 +63,8 @@ class TestFluxTpuSDPAAttention:
     abs error 0.0043 against atol 1e-2).
     """
 
-    def test_flux_standard_attention_numeric_parity_on_tpu(self):
+    @pytest.mark.parametrize("impl_cls", [TpuSDPAImpl, TpuFlashAttentionImpl])
+    def test_flux_standard_attention_numeric_parity_on_tpu(self, impl_cls):
         """Test FLUX.1 standard attention numeric parity against CPU baseline."""
         torch.manual_seed(42)
         batch_size = 1
@@ -98,7 +73,7 @@ class TestFluxTpuSDPAAttention:
         head_size = 128
         scale = 1.0 / math.sqrt(head_size)
 
-        impl = TpuSDPAImpl(
+        impl = impl_cls(
             num_heads=num_heads,
             head_size=head_size,
             softmax_scale=scale,
@@ -138,9 +113,10 @@ class TestFluxTpuSDPAAttention:
         )
 
         # Numerical parity against CPU baseline (CosSim >= 0.999, bfloat16 tolerance)
-        _assert_numerical_parity(tpu_out.cpu(), ref_out, atol=1e-2, rtol=1e-2)
+        assert_numerical_parity(tpu_out.cpu(), ref_out, atol=1e-2, rtol=1e-2)
 
-    def test_flux_joint_attention_asymmetry_numeric_parity_on_tpu(self):
+    @pytest.mark.parametrize("impl_cls", [TpuSDPAImpl, TpuFlashAttentionImpl])
+    def test_flux_joint_attention_asymmetry_numeric_parity_on_tpu(self, impl_cls):
         """Test asymmetric joint text/image cross-attention numeric parity on TPU."""
         torch.manual_seed(123)
         batch_size = 2
@@ -150,7 +126,7 @@ class TestFluxTpuSDPAAttention:
         head_size = 128
         scale = 1.0 / math.sqrt(head_size)
 
-        impl = TpuSDPAImpl(
+        impl = impl_cls(
             num_heads=num_heads,
             head_size=head_size,
             softmax_scale=scale,
@@ -177,9 +153,10 @@ class TestFluxTpuSDPAAttention:
         assert tpu_out.shape == (batch_size, q_len, num_heads, head_size)
         assert torch.all(torch.isfinite(tpu_out.cpu()))
 
-        _assert_numerical_parity(tpu_out.cpu(), ref_out, atol=1e-2, rtol=1e-2)
+        assert_numerical_parity(tpu_out.cpu(), ref_out, atol=1e-2, rtol=1e-2)
 
-    def test_flux_gqa_repeat_interleave_numeric_parity_on_tpu(self):
+    @pytest.mark.parametrize("impl_cls", [TpuSDPAImpl, TpuFlashAttentionImpl])
+    def test_flux_gqa_repeat_interleave_numeric_parity_on_tpu(self, impl_cls):
         """Test grouped-query attention repeat-interleave numeric parity on TPU."""
         torch.manual_seed(456)
         batch_size = 1
@@ -189,7 +166,7 @@ class TestFluxTpuSDPAAttention:
         head_size = 128
         scale = 1.0 / math.sqrt(head_size)
 
-        impl = TpuSDPAImpl(
+        impl = impl_cls(
             num_heads=num_heads,
             head_size=head_size,
             softmax_scale=scale,
@@ -217,7 +194,128 @@ class TestFluxTpuSDPAAttention:
         assert tpu_out.shape == (batch_size, seq_len, num_heads, head_size)
         assert torch.all(torch.isfinite(tpu_out.cpu()))
 
-        _assert_numerical_parity(tpu_out.cpu(), ref_out, atol=1e-2, rtol=1e-2)
+        assert_numerical_parity(tpu_out.cpu(), ref_out, atol=1e-2, rtol=1e-2)
+
+    @pytest.mark.parametrize("impl_cls", [TpuSDPAImpl, TpuFlashAttentionImpl])
+    def test_flux_long_sequence_fixed_m_numeric_parity_on_tpu(self, impl_cls):
+        """Test multi-block fixed-m flash attention parity at seq_len > 2048 on TPU."""
+        torch.manual_seed(42)
+        batch_size = 1
+        seq_len = 4133
+        num_heads = 4
+        head_size = 128
+        scale = 1.0 / math.sqrt(head_size)
+
+        impl = impl_cls(
+            num_heads=num_heads,
+            head_size=head_size,
+            softmax_scale=scale,
+        )
+
+        query_cpu = torch.randn(
+            batch_size, seq_len, num_heads, head_size, dtype=torch.bfloat16
+        )
+        key_cpu = torch.randn(
+            batch_size, seq_len, num_heads, head_size, dtype=torch.bfloat16
+        )
+        value_cpu = torch.randn(
+            batch_size, seq_len, num_heads, head_size, dtype=torch.bfloat16
+        )
+
+        ref_out = _sdpa_reference(query_cpu, key_cpu, value_cpu, scale)
+
+        q_tpu = query_cpu.to(device="tpu")
+        k_tpu = key_cpu.to(device="tpu")
+        v_tpu = value_cpu.to(device="tpu")
+
+        tpu_out = impl.forward(q_tpu, k_tpu, v_tpu)
+        assert_numerical_parity(
+            tpu_out.cpu(), ref_out, atol=2e-2, rtol=2e-2, min_cos_sim=0.999
+        )
+
+    def test_flux_masked_attention_fallback_matches_sdpa_on_tpu(self, monkeypatch):
+        """Verify masked calls fall back from TpuFlashAttentionImpl to TpuSDPAImpl."""
+        from unittest.mock import MagicMock
+
+        torch.manual_seed(42)
+        batch_size = 1
+        seq_len = 64
+        num_heads = 2
+        head_size = 128
+        scale = 1.0 / math.sqrt(head_size)
+
+        mask_cpu = torch.ones(batch_size, seq_len, dtype=torch.bool)
+        mask_cpu[:, -16:] = False
+
+        flash_impl = TpuFlashAttentionImpl(
+            num_heads=num_heads, head_size=head_size, softmax_scale=scale
+        )
+        sdpa_impl = TpuSDPAImpl(
+            num_heads=num_heads, head_size=head_size, softmax_scale=scale
+        )
+
+        query_cpu = torch.randn(
+            batch_size,
+            seq_len,
+            num_heads,
+            head_size,
+            dtype=torch.bfloat16,
+        )
+        key_cpu = torch.randn(
+            batch_size,
+            seq_len,
+            num_heads,
+            head_size,
+            dtype=torch.bfloat16,
+        )
+        value_cpu = torch.randn(
+            batch_size,
+            seq_len,
+            num_heads,
+            head_size,
+            dtype=torch.bfloat16,
+        )
+
+        q_tpu = query_cpu.to(device="tpu")
+        k_tpu = key_cpu.to(device="tpu")
+        v_tpu = value_cpu.to(device="tpu")
+        mask_tpu = mask_cpu.to(device="tpu")
+        attn_metadata = SimpleNamespace(attn_mask=mask_tpu)
+
+        orig_sdpa_forward = TpuSDPAImpl.forward
+        spy_calls = []
+
+        def _spy_sdpa(self_obj, q_in, k_in, v_in, meta=None):
+            spy_calls.append((q_in, k_in, v_in, meta))
+            return orig_sdpa_forward(self_obj, q_in, k_in, v_in, meta)
+
+        mock_warn = MagicMock()
+        monkeypatch.setattr(TpuSDPAImpl, "forward", _spy_sdpa)
+        monkeypatch.setattr(
+            "vllm_torchtpu.omni.attention.logger.warning_once", mock_warn
+        )
+
+        masked_out = flash_impl.forward(
+            q_tpu, k_tpu, v_tpu, attn_metadata=attn_metadata
+        )
+        assert len(spy_calls) == 1
+        assert spy_calls[0][3] is attn_metadata
+        assert masked_out.device.type == "tpu"
+        assert masked_out.shape == (batch_size, seq_len, num_heads, head_size)
+        mock_warn.assert_called_once_with(
+            "TpuFlashAttentionImpl falling back to PyTorch SDPA (%s).",
+            "attn_mask is not None",
+        )
+
+        # Deterministic numeric parity on the float32 SDPA fallback path
+        q_f32 = query_cpu.float().to(device="tpu")
+        k_f32 = key_cpu.float().to(device="tpu")
+        v_f32 = value_cpu.float().to(device="tpu")
+        flash_f32 = flash_impl.forward(q_f32, k_f32, v_f32).cpu()
+        sdpa_f32 = sdpa_impl.forward(q_f32, k_f32, v_f32).cpu()
+        torch.testing.assert_close(flash_f32, sdpa_f32, atol=0.0, rtol=0.0)
+        ref_out = _sdpa_reference(query_cpu, key_cpu, value_cpu, scale)
+        assert_numerical_parity(flash_f32, ref_out, atol=1e-2, rtol=1e-2)
 
 
 class TestFluxRoPEPositionEmbeddingOnTpu:
@@ -312,5 +410,5 @@ class TestFluxRoPEKernelApplication:
         torch.testing.assert_close(tpu_k.cpu(), tpu_k_replay.cpu(), atol=0.0, rtol=0.0)
 
         # Numerical parity against CPU ground truth
-        _assert_numerical_parity(tpu_q.cpu(), ref_q, atol=1e-4, rtol=1e-4)
-        _assert_numerical_parity(tpu_k.cpu(), ref_k, atol=1e-4, rtol=1e-4)
+        assert_numerical_parity(tpu_q.cpu(), ref_q, atol=1e-4, rtol=1e-4)
+        assert_numerical_parity(tpu_k.cpu(), ref_k, atol=1e-4, rtol=1e-4)

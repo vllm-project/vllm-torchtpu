@@ -218,6 +218,7 @@ function updateProvisionGenerator() {
             const gceNote = hw === 'v6e' ? ' <em>(Note: 16+ chip topologies require multi-host MIGs or GKE)</em>' : ' <em>(Note: 8+ chip topologies require multi-host MIGs or GKE)</em>';
             if (model === 'flex_start') {
                 cmdEl.innerHTML = highlightShell(`gcloud compute instances create my-tpu-vm \\
+  --project=PROJECT_ID \\
   --zone=ZONE \\
   --machine-type=${machineType} \\
   --provisioning-model=FLEX_START \\
@@ -227,15 +228,16 @@ function updateProvisionGenerator() {
   --image-project=ubuntu-os-accelerator-images \\
   --image-family=ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e \\
   --maintenance-policy=TERMINATE`);
-                instEl.innerHTML = `Provision a discounted <strong>${chips}-chip TPU ${hw.toUpperCase()}</strong> VM instance using Compute Engine (GCE) with Flex-start (DWS). Replace <code>ZONE</code> with your target zone.${gceNote}`;
+                instEl.innerHTML = `Provision a discounted <strong>${chips}-chip TPU ${hw.toUpperCase()}</strong> VM instance using Compute Engine (GCE) with Flex-start (DWS). Replace <code>PROJECT_ID</code> and <code>ZONE</code> with your values.${gceNote}`;
             } else {
                 cmdEl.innerHTML = highlightShell(`gcloud compute instances create my-tpu-vm \\
+  --project=PROJECT_ID \\
   --zone=ZONE \\
   --machine-type=${machineType} \\
   --image-project=ubuntu-os-accelerator-images \\
   --image-family=ubuntu-accel-2204-amd64-tpu-v5e-v5p-v6e \\
   --maintenance-policy=TERMINATE`);
-                instEl.innerHTML = `Provision a standard <strong>${chips}-chip TPU ${hw.toUpperCase()}</strong> VM instance using Compute Engine (GCE). Replace <code>ZONE</code> with your target zone.${gceNote}`;
+                instEl.innerHTML = `Provision a standard <strong>${chips}-chip TPU ${hw.toUpperCase()}</strong> VM instance using Compute Engine (GCE). Replace <code>PROJECT_ID</code> and <code>ZONE</code> with your values.${gceNote}`;
             }
         } else {
             let accelerator;
@@ -262,7 +264,7 @@ function updateProvisionGenerator() {
   --max-run-duration 4h \\
   --valid-until-duration 4h \\
   --service-account SERVICE_ACCOUNT`);
-                instEl.innerHTML = `Provision a discounted <strong>${chips}-chip TPU ${hw.toUpperCase()}${coreNote}</strong> using Flex-start with the legacy Queued Resources API. Replace <code>PROJECT_ID</code>, <code>ZONE</code>, and <code>SERVICE_ACCOUNT</code> with your values.`;
+                instEl.innerHTML = `Provision a discounted <strong>${chips}-chip TPU ${hw.toUpperCase()}${coreNote}</strong> using Flex-start with the legacy Queued Resources API. Replace <code>PROJECT_ID</code> and <code>ZONE</code> with your values. <code>--service-account</code> is optional; remove it to use the Compute Engine default service account.`;
             } else {
                 cmdEl.innerHTML = highlightShell(`gcloud alpha compute tpus queued-resources create my-queued-resource \\
   --node-id my-tpu-name \\
@@ -271,7 +273,7 @@ function updateProvisionGenerator() {
   --accelerator-type ${accelerator} \\
   --runtime-version ${data.runtime} \\
   --service-account SERVICE_ACCOUNT`);
-                instEl.innerHTML = `Provision a standard <strong>${chips}-chip TPU ${hw.toUpperCase()}${coreNote}</strong> using the legacy Queued Resources API. Replace <code>PROJECT_ID</code>, <code>ZONE</code>, and <code>SERVICE_ACCOUNT</code> with your values.`;
+                instEl.innerHTML = `Provision a standard <strong>${chips}-chip TPU ${hw.toUpperCase()}${coreNote}</strong> using the legacy Queued Resources API. Replace <code>PROJECT_ID</code> and <code>ZONE</code> with your values. <code>--service-account</code> is optional; remove it to use the Compute Engine default service account.`;
             }
         }
     }
@@ -310,9 +312,65 @@ function initCommandGenerator() {
     updateProvisionGenerator();
 }
 
+// Tables wrapped in <div class="expandable-table" data-detail-column="..."> hide
+// the named column and show its contents in a full-width row when a row is
+// clicked. Without JS the table renders with every column.
+function initExpandableTables() {
+    document.querySelectorAll('.expandable-table').forEach(container => {
+        const table = container.querySelector('table');
+        if (!table || table.dataset.etInitialized === 'true') return;
+        table.dataset.etInitialized = 'true';
+
+        const detailName = container.getAttribute('data-detail-column');
+        const headers = Array.from(table.querySelectorAll('thead th'));
+        const detailIdx = headers.findIndex(th => th.textContent.trim() === detailName);
+        if (detailIdx < 0) return;
+        headers[detailIdx].classList.add('et-hidden');
+
+        table.querySelectorAll('tbody tr').forEach(row => {
+            const detailCell = row.children[detailIdx];
+            if (!detailCell) return;
+            detailCell.classList.add('et-hidden');
+
+            const detailRow = document.createElement('tr');
+            detailRow.className = 'et-detail';
+            detailRow.hidden = true;
+            const td = document.createElement('td');
+            td.colSpan = headers.length - 1;
+            const label = document.createElement('span');
+            label.className = 'et-detail-label';
+            label.textContent = detailName;
+            td.appendChild(label);
+            td.insertAdjacentHTML('beforeend', detailCell.innerHTML);
+            detailRow.appendChild(td);
+            row.after(detailRow);
+
+            row.classList.add('et-row');
+            row.tabIndex = 0;
+            row.setAttribute('aria-expanded', 'false');
+            const toggle = () => {
+                const open = detailRow.hidden;
+                detailRow.hidden = !open;
+                row.classList.toggle('et-open', open);
+                row.setAttribute('aria-expanded', String(open));
+            };
+            row.addEventListener('click', e => {
+                if (!e.target.closest('a')) toggle();
+            });
+            row.addEventListener('keydown', e => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                    e.preventDefault();
+                    toggle();
+                }
+            });
+        });
+    });
+}
+
 function initInteractiveComponents() {
     initCommandGenerator();
     initSimpleSearch();
+    initExpandableTables();
 }
 
 document.addEventListener("DOMContentLoaded", function() {

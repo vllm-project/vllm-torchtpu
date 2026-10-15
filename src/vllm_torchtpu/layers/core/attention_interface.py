@@ -670,7 +670,8 @@ def mla_attention(
     v_scale: float | None = None,
     sm_scale: float | None = None,
     use_causal_mask: bool = True,
-) -> tuple[jax.Array, jax.Array]:
+    return_lse: bool = False,
+) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Main shared interface for Multi-Head Latent Attention (MLA).
 
     Computes sharded MLA paged attention and applies in-place KV cache updates across
@@ -695,10 +696,14 @@ def mla_attention(
         k_scale: Optional scalar parameter quantization scale for latent keys.
         v_scale: Optional scalar parameter quantization scale for latent values.
         sm_scale: Softmax temperature scale factor.
+        return_lse: Also return each (token, head)'s log-sum-exp of the scaled
+            scores, f32 `(T, N)`, with which this output can be merged with the
+            output of the same queries over a disjoint set of keys (context
+            parallelism). The output and the cache are unchanged by the flag.
 
     Returns:
         Tuple of `(updated_kv_cache, output_TNA)` in token-major sequence
-        layout `(T, N, D)`.
+        layout `(T, N, D)`, plus `lse_TN` when `return_lse`.
     """
     in_specs = (
         P(None, "model", None),  # q_TNA
@@ -715,6 +720,8 @@ def mla_attention(
         P(None, "model", None),  # attn output in token-major sequence format (T, N, D)
         P(None),  # kv cache
     )
+    if return_lse:
+        out_specs = (*out_specs, P(None, "model"))  # lse (T, N)
 
     def _mla_ragged_paged_attention(
         q,
@@ -778,7 +785,7 @@ def mla_attention(
         # (N, T, L) layout: [num_heads, num_tokens, lkv_dim]
         q = q.transpose((1, 0, 2))
 
-        out, new_cache = mla_ragged_paged_attention(
+        results = mla_ragged_paged_attention(
             q,
             q_rope,
             k,
@@ -800,15 +807,19 @@ def mla_attention(
             k_scale=k_scale,
             v_scale=v_scale,
             use_causal_mask=use_causal_mask,
+            return_lse=return_lse,
         )
+        out, new_cache = results[0], results[1]
 
         # tpu-inference kernel returns out in head-major (N, T, D) layout:
         # [num_heads, num_tokens, head_dim]. Transpose back to (T, N, D).
         out = out.transpose((1, 0, 2))
+        if return_lse:
+            return out, new_cache, results[2]
 
         return out, new_cache
 
-    output_TNA, kv_cache = jax.jit(
+    results = jax.jit(
         shard_map.shard_map(
             _mla_ragged_paged_attention,
             mesh=mesh,
@@ -827,6 +838,9 @@ def mla_attention(
         md.query_start_loc,
         md.request_distribution,
     )
+    output_TNA, kv_cache = results[0], results[1]
+    if return_lse:
+        return kv_cache, output_TNA, results[2]
     return kv_cache, output_TNA
 
 

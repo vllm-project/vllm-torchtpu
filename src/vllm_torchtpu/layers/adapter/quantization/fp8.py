@@ -683,6 +683,10 @@ class VllmFp8Config(Fp8Config, VllmQuantConfig):
             raise NotImplementedError(
                 "FP8 store_dtype is not supported by the TPU quantization path"
             )
+        # vLLM v0.31 rejects online quantization in `Fp8Config` and moved it to
+        # the `fp8_per_tensor` shorthand. The TPU path still quantizes BF16
+        # checkpoints online through its own linear/MoE methods, so construct
+        # the parent as serialized and restore the requested mode.
         super().__init__(
             is_checkpoint_fp8_serialized=True,
             activation_scheme=activation_scheme,
@@ -1164,6 +1168,15 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 router_logits,
                 score_bias_operand(layer),
             )
+        from vllm_torchtpu.layers.adapter.moe_tp_decode import (
+            moe_tp_decode_forward,
+            moe_tp_decode_supported,
+        )
+
+        if moe_tp_decode_supported(self):
+            # Armed layer: the runner no longer runs the shared expert or the
+            # all-reduce, so this returns the reduced shared + routed sum.
+            return moe_tp_decode_forward(self, layer, x, router_logits)
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
         # custom_routing_function -> select_experts); shared across all TPU MoE
@@ -1202,6 +1215,16 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         }
         if owns_collectives:
             return pipelined_fused_moe_gmm(**kwargs)
+
+        from vllm_torchtpu.layers.adapter.fused_moe_decode import (
+            fused_moe_decode,
+            fused_moe_decode_supported,
+        )
+
+        if fused_moe_decode_supported(self):
+            # Armed layer: the runner no longer runs the shared expert or the
+            # all-reduce, so this returns the reduced shared + routed sum.
+            return fused_moe_decode(self, layer, x, topk_weights, topk_ids)
 
         return fused_moe_gmm(**kwargs)
 

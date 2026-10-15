@@ -12,6 +12,15 @@ logger = init_logger(__name__)
 
 
 @run_once
+def _optimization_barrier_op() -> Any:
+    from vllm_torchtpu.layers.adapter.custom_ops.optimization_barrier_op import (
+        optimization_barrier_op,
+    )
+
+    return optimization_barrier_op()
+
+
+@run_once
 def apply_omni_tpu_patches() -> None:
     """Extend async output timeout and patch TPU unsupported ops."""
 
@@ -141,6 +150,8 @@ def apply_omni_model_specific_patches() -> None:
 
     _patch_qwen_image_rope_txt_freqs_clone()
     _patch_wan_pair_swap_rope()
+    _patch_wan_ffn_gelu_fence()
+    _patch_diffusion_startup_warmup_sync()
 
 
 def _patch_qwen_image_rope_txt_freqs_clone() -> None:
@@ -200,3 +211,70 @@ def _patch_wan_pair_swap_rope() -> None:
 
     RotaryEmbeddingWan.forward = rotary_embedding_wan_forward
     logger.info("Applied TPU patch: pair-swap matmul RotaryEmbeddingWan.")
+
+
+def _patch_wan_ffn_gelu_fence() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove this patch once XLA stops duplicating the elementwise producer
+    # into the matmul operand fusion here, or torch_tpu exposes a fusion fence.
+    #
+    # XLA fuses the Wan FFN up-projection's bias add and tanh-GELU into the
+    # operand fusion of the down-projection matmul, so the GELU of the
+    # (tokens, 13824) activation is recomputed for every output tile of the
+    # down-projection instead of once. torch_tpu has no way to stop a
+    # producer fusion. An XLA optimization barrier on the GELU output (an
+    # identity that fusion passes cannot see through) makes XLA materialize
+    # it once, in bf16, which is also the value eager PyTorch produces.
+    # Measured on v7x, Wan2.2-I2V-A14B: 72.72 -> 71.39 ms per block at
+    # 32,760 tokens on one core; 0.939 -> 0.927 s/step end to end at
+    # 480x832x81 on 8 cores (CFG 2 x Ulysses 4).
+    # -------------------------------------------------------------------------
+    from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
+        ColumnParallelGELU,
+    )
+
+    orig_forward = getattr(
+        ColumnParallelGELU, "_tpu_orig_forward", ColumnParallelGELU.forward
+    )
+    ColumnParallelGELU._tpu_orig_forward = orig_forward
+
+    def _fenced_gelu_forward(self: Any, x: torch.Tensor) -> torch.Tensor:
+        return _optimization_barrier_op()(orig_forward(self, x))
+
+    ColumnParallelGELU.forward = _fenced_gelu_forward
+    logger.info("Applied TPU patch: fusion fence after Wan FFN GELU.")
+
+
+# TODO: Remove once vLLM-Omni synchronizes the device at the end of its
+# startup warmup (e.g. self.executor.collective_rpc("synchronize_device") in
+# _dummy_run).
+def _patch_diffusion_startup_warmup_sync() -> None:
+    """Synchronize the device after vLLM-Omni's diffusion startup warmup.
+
+    Root cause: ``DiffusionEngine._dummy_run`` (startup warmup) drops its output
+    without a host sync. Under torch_tpu DEFER_AND_FUSE the warmup's tail ops
+    (VAE decode) stay pending in torch_tpu's process-global deferred-op queue and
+    are materialized together with the first real request, which then gets cut
+    into different fused programs than later identical requests (those start
+    from an empty queue because the previous output's ``.cpu()`` flushed it).
+    The first request after startup therefore differs numerically from later
+    same-seed requests.
+
+    Scope: this only takes effect when the engine runs its worker in-process
+    (the uniproc executor, the single-device default). With the mp executor,
+    only the worker processes install this patch, and they never call
+    run_startup_warmup.
+    """
+    from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+
+    orig_run_startup_warmup = DiffusionEngine.run_startup_warmup
+
+    def _synced_run_startup_warmup(self: Any) -> None:
+        orig_run_startup_warmup(self)
+        # TODO: Once the vllm-omni pin is >= 0.30, sync every worker with
+        # self.executor.collective_rpc("synchronize_device") and install this
+        # patch at platform init, so that mp engines are covered too.
+        torch.accelerator.synchronize()
+
+    DiffusionEngine.run_startup_warmup = _synced_run_startup_warmup
+    logger.info("Applied TPU patch: device sync after diffusion startup warmup.")

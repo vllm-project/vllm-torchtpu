@@ -903,11 +903,6 @@
     {
       "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
       "name": "bad-argument-type",
-      "concise_description": "Argument `SmemWrapper` is not assignable to parameter `is_last_k` with type `Ref` in function `vllm_torchtpu.kernels.experimental.batched_rpa.flash_attention.flash_attention_qk_softmax`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
-      "name": "bad-argument-type",
       "concise_description": "Argument `Array | int | None` is not assignable to parameter `v_scale` with type `Array | None` in function `vllm_torchtpu.kernels.experimental.batched_rpa.flash_attention.flash_attention_pv`"
     },
     {
@@ -1889,11 +1884,6 @@
       "path": "src/vllm_torchtpu/runner/kv_cache_manager.py",
       "name": "missing-attribute",
       "concise_description": "Class `AttentionBackend` has no class attribute `get_kv_cache_shape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/mm_encoder_manager.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[int, BudgetGraphMetadata]`"
     },
     {
       "path": "src/vllm_torchtpu/runner/mm_video_chunking.py",

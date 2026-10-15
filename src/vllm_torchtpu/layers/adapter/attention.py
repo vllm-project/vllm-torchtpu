@@ -2055,7 +2055,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 query_start_loc=query_start_loc,
                 request_distribution=request_distribution,
             )
-            return mla_attention(
+            results = mla_attention(
                 q_nope,
                 q_pe,
                 kv_c_normed,
@@ -2071,6 +2071,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 v_scale=v_scale,
                 use_causal_mask=not self.non_causal_multi_token_decode,
             )
+            # mla_attention returns (kv_cache, out), and more with return_lse.
+            return results[0], results[1]
 
         op_name = f"pallas::mla_attention_{layer.layer_name.replace('.', '_')}"
         mla_jax_op = pallas.jax_op(op_name, mla_attention_core_tpu, donate_argnums=(0,))

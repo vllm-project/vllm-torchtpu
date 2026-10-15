@@ -750,6 +750,10 @@ class TPUWorker(WorkerBase):
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
+        if getattr(self, "speculative_config", None) is not None:
+            # Record the warm-up traces under the serving thread count. Other
+            # models keep upstream's warm-up at the startup count.
+            set_torch_threads_for_runtime()
         self.model_runner.capture_model()
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time

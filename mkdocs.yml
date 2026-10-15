@@ -60,6 +60,10 @@ nav:
     - 'Quantization': user_guide/quantization.md
     - 'Speculative Decoding': user_guide/speculative_decoding.md
     - 'Compilation & Warmup Cache': user_guide/compilation_cache.md
+    - 'Code Examples':
+      - 'Offline Inference': api_and_code_examples/offline_inference.md
+      - 'Multi Modal Inference': api_and_code_examples/multi_modal_inference.md
+      - 'Offline LoRA': api_and_code_examples/offline_lora_inference.md
   - 'Deployment & Recipes':
     - 'TPU v7x (Ironwood) Recipes': deployment/v7x_recipes.md
     - 'TPU v6e (Trillium) Recipes': deployment/v6e_recipes.md
