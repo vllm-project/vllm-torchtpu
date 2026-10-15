@@ -97,6 +97,8 @@ steps:
 
       - label: "DeepSeek-V4.1-Flash: DP8 C384 steady DSpark decode"
         key: "dsv41_flash_dp8_c384_decode"
+        # Keep the hour-long cold startup off the PR path while loading improves.
+        if: 'build.branch == "epic/dsv41" && build.pull_request.id == null'
         timeout_in_minutes: 180
         agents:
           queue: "tpu_v7x_8_queue"
@@ -115,6 +117,8 @@ steps:
 
       - label: "DeepSeek-V4.1-Flash: DP8 C8 cached 96K + 16K extend"
         key: "dsv41_flash_dp8_c8_cached_extend"
+        # Keep the hour-long cold startup off the PR path while loading improves.
+        if: 'build.branch == "epic/dsv41" && build.pull_request.id == null'
         timeout_in_minutes: 180
         agents:
           queue: "tpu_v7x_8_queue"

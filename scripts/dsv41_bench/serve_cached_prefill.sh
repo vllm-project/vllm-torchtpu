@@ -14,7 +14,7 @@ export TPU_DEEPSEEK_V41_IMPL=v2 TPU_DEEPSEEK_V41_CED=1 TPU_DEEPSEEK_V41_SP=1 TPU
 export USE_MOE_SPARSE_CORE=0 USE_MOE_FUSED_EP_KERNEL=1 MOE_FUSED_EP_ENABLE_W4A8=1 MOE_FUSED_EP_V2_SHARDED_PLAN=1
 export RUNAI_STREAMER_MEMORY_LIMIT=34359738368 TPU_SHARDED_LOAD_SYNC_EVERY=512
 export VLLM_ENGINE_READY_TIMEOUT_S=7200 TORCHINDUCTOR_AUTOGRAD_CACHE=0 TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS=false
-export LIBTPU_INIT_ARGS='--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0'
+export LIBTPU_INIT_ARGS='--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes=0 --xla_tpu_dvfs_p_state=7'
 export VLLM_SERVER_DEV_MODE=1
 # Cache roots, when supplied, must be keyed by source/runtime/topology/buckets.
 server_args=(--gpu-memory-utilization 0.85)

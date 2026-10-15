@@ -18,6 +18,11 @@ This stabilizes shapes within a bin; crossing a bin boundary still recompiles.
 This is a prefill benchmark; one-token output comparison does not qualify
 long-generation accuracy or steady decode performance.
 
+The shared serving launcher sets `--xla_tpu_dvfs_p_state=7` in
+`LIBTPU_INIT_ARGS`. The two DP8 Buildkite benchmarks run only on non-PR builds
+of `epic/dsv41` while cold startup takes about an hour. Remove their step-level
+`if` conditions to restore pre-merge coverage after startup improves.
+
 The harness has three scripts:
 
 - `run.py`: launch configuration, cold/reuse cache lifecycle and cleanup.
