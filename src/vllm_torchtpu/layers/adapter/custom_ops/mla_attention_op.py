@@ -336,9 +336,7 @@ def _scatter_indexer_k_rows(
 
     # Same notion of "where does this row belong" as the latent-cache
     # writers, so the two cannot drift apart.
-    _, seq_id, pos, in_batch = _row_positions(
-        k_packed.shape[0], seq_lens, cu_q_lens
-    )
+    _, seq_id, pos, in_batch = _row_positions(k_packed.shape[0], seq_lens, cu_q_lens)
 
     virtual_page_size = jnp.int32(page_size * cp_size)
     cycle = jnp.int32(cp_size * interleave_size)
@@ -349,9 +347,9 @@ def _scatter_indexer_k_rows(
 
     # Virtual ordinal -> physical block in this rank's own shard, exactly
     # as `streamindex_topk_dcp` resolves it on the read side.
-    local_page_indices = jnp.mod(
-        page_indices, jnp.int32(cache_kv.shape[0])
-    ).reshape(seq_lens.shape[0], -1)
+    local_page_indices = jnp.mod(page_indices, jnp.int32(cache_kv.shape[0])).reshape(
+        seq_lens.shape[0], -1
+    )
     # A padded token's `pos` is meaningless and can run off the end of the
     # page table; clip so the gather stays in bounds and let `valid` drop
     # the row, the same way the sparse MLA writer does.
@@ -501,9 +499,21 @@ def pcp_prefill_topk(
     from vllm_torchtpu.kernels.mla import pcp_workspace as ws
 
     def _local(
-        cache_kv, q_bytes, weights, k_packed, restore_idx, split_seq_lens,
-        split_page_indices, split_cu_q_lens, ws_req, ws_vpage,
-        ws_page_offset, seq_lens, cu_q_lens, distribution, num_split_reqs,
+        cache_kv,
+        q_bytes,
+        weights,
+        k_packed,
+        restore_idx,
+        split_seq_lens,
+        split_page_indices,
+        split_cu_q_lens,
+        ws_req,
+        ws_vpage,
+        ws_page_offset,
+        seq_lens,
+        cu_q_lens,
+        distribution,
+        num_split_reqs,
         ws_used_pages,
     ):
         num_tokens = q_bytes.shape[0]
@@ -512,9 +522,9 @@ def pcp_prefill_topk(
         page_size = rows_per_page * kv_packing
         virtual_page = page_size * dcp_size
         max_seq_pages = (
-            None if max_model_len is None
-            else -(-int(max_model_len) // page_size)
+            None if max_model_len is None else -(-int(max_model_len) // virtual_page)
         )
+        pages_per_block = ws.index_pages_per_block(virtual_page)
         # Workspace page buckets; the smallest that fits is picked at run time.
         buckets = sorted(
             {
@@ -527,7 +537,9 @@ def pcp_prefill_topk(
         def run(cache_kv):
             rank = cp_rank_as_data(DCP_AXIS_NAME, dcp_size)
             k_split = ws.pcp_gather_rows(
-                k_packed, restore_idx, axis_name=DCP_AXIS_NAME,
+                k_packed,
+                restore_idx,
+                axis_name=DCP_AXIS_NAME,
                 pcp_size=pcp_size,
             )
             cache_kv = _scatter_indexer_k_rows(
@@ -563,13 +575,13 @@ def pcp_prefill_topk(
                         ws_kv,
                         seq_lens,
                         ws.workspace_index_page_table(
-                            ws_page_offset, size, dcp_size, max_seq_pages
+                            ws_page_offset, size, max_seq_pages
                         ),
                         cu_q_lens,
                         distribution,
                         k=topk,
                         compression_ratio=1,
-                        num_kv_pages_per_block=(2, 2, 2),
+                        num_kv_pages_per_block=(pages_per_block,) * 3,
                         num_queries_per_block=(1, 128, 128),
                         enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
                         chunk_tokens=chunk_tokens,
@@ -597,9 +609,21 @@ def pcp_prefill_topk(
         out_specs=out_specs,
         check_vma=False,
     )(
-        cache_kv, q_bytes, weights, k_packed, restore_idx, split_seq_lens,
-        split_page_indices, split_cu_q_lens, ws_req, ws_vpage,
-        ws_page_offset, seq_lens, cu_q_lens, distribution, num_split_reqs,
+        cache_kv,
+        q_bytes,
+        weights,
+        k_packed,
+        restore_idx,
+        split_seq_lens,
+        split_page_indices,
+        split_cu_q_lens,
+        ws_req,
+        ws_vpage,
+        ws_page_offset,
+        seq_lens,
+        cu_q_lens,
+        distribution,
+        num_split_reqs,
         ws_used_pages,
     )
 
@@ -891,9 +915,13 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
         return op
 
-    def _build_pcp_prefill_topk_op(self, dcp_size: int, pcp_size: int,
-                                   interleave_size: int,
-                                   max_model_len: int | None = None):
+    def _build_pcp_prefill_topk_op(
+        self,
+        dcp_size: int,
+        pcp_size: int,
+        interleave_size: int,
+        max_model_len: int | None = None,
+    ):
         """Split-prefill top-k: write the split rows' K, gather the K
         workspace, top-k the local queries over it (global positions).
 
@@ -925,9 +953,21 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             ws_used_pages: jax.Array,
         ) -> tuple[jax.Array, jax.Array]:
             return pcp_prefill_topk(
-                cache_kv, q_bytes, weights, k_packed, restore_idx, split_seq_lens,
-                split_page_indices, split_cu_q_lens, ws_req, ws_vpage,
-                ws_page_offset, seq_lens, cu_q_lens, distribution, num_split_reqs,
+                cache_kv,
+                q_bytes,
+                weights,
+                k_packed,
+                restore_idx,
+                split_seq_lens,
+                split_page_indices,
+                split_cu_q_lens,
+                ws_req,
+                ws_vpage,
+                ws_page_offset,
+                seq_lens,
+                cu_q_lens,
+                distribution,
+                num_split_reqs,
                 ws_used_pages,
                 mesh=mesh,
                 topk=topk,
