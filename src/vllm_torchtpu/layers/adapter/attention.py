@@ -2479,15 +2479,21 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 # comparison would pin its graph to the first size, and the
                 # large buckets fail with ShapeSpecializationError. So the
                 # drafter keeps the reduce-scatter, as with the flag off.
+                is_backbone = vllm_compilation_backends.model_tag == "backbone"
                 wire_dtype = partial.dtype
                 if uv_first:
+                    # A narrowed merge rounds to the wire dtype anyway.
+                    narrow = envs.TPU_DCP_RS_OUT_PRECISION and is_backbone
                     partial = project_uv_heads(
-                        partial, layer.W_UV_dcp_qrep, layer.W_UV_dcp_qrep_scale
+                        partial,
+                        layer.W_UV_dcp_qrep,
+                        layer.W_UV_dcp_qrep_scale,
+                        out_dtype=wire_dtype if narrow else torch.float32,
                     )
                 outputs = merge_lse_partials_scatter_heads(
                     partial,
                     lse,
-                    is_backbone=vllm_compilation_backends.model_tag == "backbone",
+                    is_backbone=is_backbone,
                     wire_dtype=wire_dtype,
                 )
             else:

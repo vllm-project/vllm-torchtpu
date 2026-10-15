@@ -181,6 +181,30 @@ def test_a_projected_partial_crosses_in_the_wire_dtype(
     assert got.dtype == torch.float32
 
 
+def test_a_narrow_projection_is_the_f32_projection_rounded_once():
+    """bf16 out is one rounding of the exact projection, not a bf16 dot of
+    rounded operands; the scaled path still projects in f32 first."""
+    rng = np.random.default_rng(23)
+    partial = torch.from_numpy(rng.standard_normal((5, 4, 64)).astype(np.float32))
+    partial = partial.to(torch.bfloat16)
+    w_uv = torch.from_numpy(
+        (rng.standard_normal((4, 64, 16)) / 8).astype(np.float32)
+    ).to(torch.bfloat16)
+    exact = cp_mla.project_uv_heads(partial, w_uv, None)
+    narrow = cp_mla.project_uv_heads(partial, w_uv, None, out_dtype=torch.bfloat16)
+    assert exact.dtype == torch.float32 and narrow.dtype == torch.bfloat16
+    exact64 = exact.double().numpy()
+    err = np.abs(narrow.double().numpy() - exact64)
+    assert (err <= 2.0**-8 * np.abs(exact64) + 1e-6).all()
+
+    scale = torch.from_numpy(rng.uniform(0.5, 2.0, (4, 1, 16)).astype(np.float32))
+    scaled = cp_mla.project_uv_heads(partial, w_uv, scale, out_dtype=torch.bfloat16)
+    assert scaled.dtype == torch.bfloat16
+    torch.testing.assert_close(
+        scaled, cp_mla.project_uv_heads(partial, w_uv, scale).to(torch.bfloat16)
+    )
+
+
 def test_projection_applies_the_per_head_output_scale():
     rng = np.random.default_rng(11)
     partial = torch.from_numpy(rng.standard_normal((3, 4, 16)).astype(np.float32))

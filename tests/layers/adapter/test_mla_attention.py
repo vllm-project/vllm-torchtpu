@@ -995,6 +995,66 @@ def test_mla_forward_qrep_applies_w_uv_before_the_merge(monkeypatch):
     )
 
 
+@pytest.mark.parametrize(
+    "model_tag, rs_bf16, want",
+    [
+        ("backbone", True, torch.bfloat16),
+        ("backbone", False, torch.float32),
+        ("eagle_head", True, torch.float32),
+    ],
+)
+def test_mla_forward_qrep_projects_into_the_wire_dtype(
+    model_tag, rs_bf16, want, monkeypatch
+):
+    """A bf16 partial is projected straight to bf16 when the merge narrows
+    anyway (backbone, TPU_DCP_RS_OUT_PRECISION); otherwise it stays f32."""
+    dcp_size, local_heads, num_tokens = 2, 16, 4
+    impl, layer, inputs, _ = _make_impl_and_layer()
+    impl.dcp_size = dcp_size
+    group_heads = local_heads * dcp_size
+
+    torch.manual_seed(3)
+    layer.W_UK_T_dcp_qrep = torch.randn(group_heads, 128, 512) * 0.05
+    layer.W_UK_T_dcp_qrep_scale = None
+    layer.W_UV_dcp_qrep = (torch.randn(group_heads, 512, 128) * 0.05).to(torch.bfloat16)
+    layer.W_UV_dcp_qrep_scale = None
+    layer.W_UV = None
+    partial = torch.randn(num_tokens, group_heads, 512).to(torch.bfloat16)
+    lse = torch.zeros(num_tokens, group_heads)
+    layer.sparse_mla_dcp_op = MagicMock(return_value=(partial, lse))
+    inputs["kv_cache"] = tuple(
+        torch.zeros(spec.shape, dtype=spec.torch_dtype)
+        for spec in PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            2, 8, 576, torch.float8_e4m3fn
+        )
+    )
+    monkeypatch.setattr(attention_adapter.envs, "TPU_DCP_RS_OUT_PRECISION", rs_bf16)
+    monkeypatch.setattr(
+        attention_adapter.vllm_compilation_backends, "model_tag", model_tag
+    )
+    seen = []
+    monkeypatch.setattr(
+        attention_adapter,
+        "merge_lse_partials_scatter_heads",
+        lambda out, _lse, **kw: seen.append((out, kw)) or out[:, :local_heads, :],
+    )
+
+    impl.forward(
+        layer=layer,
+        **inputs,
+        topk_indices=torch.zeros((num_tokens, 8), dtype=torch.int32),
+        q_dcp_replicated=(
+            torch.randn(num_tokens, group_heads, 128),
+            torch.randn(num_tokens, group_heads, 64),
+        ),
+    )
+
+    ((out, kw),) = seen
+    assert out.dtype == want
+    assert kw["is_backbone"] == (model_tag == "backbone")
+    assert kw["wire_dtype"] == torch.bfloat16
+
+
 def test_mla_forward_without_qrep_still_gathers(monkeypatch):
     """The gather is only skipped when a replicated q actually arrives; the
     unreplicated DCP path is untouched."""
