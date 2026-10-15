@@ -18,6 +18,7 @@ steps:
     steps:
       - label: "Integration: qwen35-pcp4-dp4-disagg-correctness"
         key: "integration_qwen35_pcp4_dp4_disagg_correctness"
+        skip: "${GLM_AGENTX_SKIP:-}"
         agents:
           queue: "tpu_v7x_8_queue"
         env:
@@ -30,6 +31,7 @@ steps:
 
       - label: "Integration: qwen35-pcp4tp1-tp4dcp2-disagg-correctness"
         key: "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness"
+        skip: "${GLM_AGENTX_SKIP:-}"
         agents:
           queue: "tpu_v7x_8_queue"
         env:
@@ -54,6 +56,7 @@ steps:
 
       - label: "Integration: qwen35-pcp8-dp8-disagg-correctness"
         key: "integration_qwen35_pcp8_dp8_disagg_correctness"
+        skip: "${GLM_AGENTX_SKIP:-}"
         agents:
           queue: "tpu_v7x_16_queue"
         env:
@@ -66,6 +69,7 @@ steps:
 
       - label: "Presubmit: disagg-single-host"
         key: "presubmit_disagg_single_host"
+        skip: "${GLM_AGENTX_SKIP:-}"
         if: "build.pull_request.id != null"
         agents:
           queue: "tpu_v7x_8_queue"
@@ -82,6 +86,7 @@ steps:
 
       - label: "Integration: qwen35-gpc-correctness"
         key: "integration_qwen35_gpc_correctness"
+        skip: "${GLM_AGENTX_SKIP:-}"
         agents:
           queue: "tpu_v7x_16_queue"
         commands:
@@ -91,6 +96,7 @@ steps:
 
       - label: "Integration: qwen35-apc-correctness"
         key: "integration_qwen35_apc_correctness"
+        skip: "${GLM_AGENTX_SKIP:-}"
         timeout_in_minutes: 30
         agents:
           queue: "tpu_v7x_8_queue"
@@ -104,6 +110,7 @@ steps:
 
       - label: "Integration: qwen35-gpc-global-dram-pool"
         key: "integration_qwen35_gpc_global_dram_pool"
+        skip: "${GLM_AGENTX_SKIP:-}"
         agents:
           queue: "tpu_v7x_8_queue"
         env:
@@ -116,6 +123,7 @@ steps:
 
       - label: "Integration: Nightly qwen35-block-major-disagg-offload"
         key: "integration_nightly_qwen35_block_major_disagg_offload"
+        skip: "${GLM_AGENTX_SKIP:-}"
         # Nightly only: VLLM_TPU_BLOCK_MAJOR_KV=1 is an opt-in layout that no
         # default-path test reaches, and the P/D pair's boot dominates the step.
         if: 'build.env("NIGHTLY") == "1"'
@@ -133,6 +141,7 @@ steps:
 
       - label: "Integration: k3-pruned75-apc-offload-correctness"
         key: "integration_k3_pruned75_apc_offload_correctness"
+        skip: "${GLM_AGENTX_SKIP:-}"
         # Kimi-K3 (hybrid MLA + KDA) prefix caching and host KV offload in one
         # boot: HBM hits, multi-turn hits, and recall from the Raiden host
         # store after both a cache reset and a real HBM eviction, each gated on
@@ -171,6 +180,7 @@ steps:
 
       - label: "Integration: Nightly dsv4-offload-correctness"
         key: "integration_nightly_dsv4_offload_correctness"
+        skip: "${GLM_AGENTX_SKIP:-}"
         # Nightly only: a full DSv4 boot is ~27 min of weight load plus compile
         # before the smoke even starts, which is too much to spend on every PR.
         # The same boot cost is why the Buildkite default timeout is not enough
@@ -196,6 +206,7 @@ steps:
 
       - label: "Integration: Nightly dsv4-pd-disagg-correctness"
         key: "integration_nightly_dsv4_pd_disagg_correctness"
+        skip: "${GLM_AGENTX_SKIP:-}"
         if: 'build.env("NIGHTLY") == "1"'
         timeout_in_minutes: 150
         agents:

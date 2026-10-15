@@ -195,6 +195,66 @@ for lane in ${lanes}; do
     exit 1
   fi
 done
+# glm-agentx serves GLM-5.2 only. Its builds -- the branch itself, and PRs that
+# target it or a stack branch named after it -- skip the integration steps and
+# unit tests of other models (Qwen, Kimi, DeepSeek-V4, multimodal, Omni) and of
+# disaggregated serving. A PR labelled `full-ci` runs everything. The pipeline
+# files read these at upload: GLM_AGENTX_SKIP as a step's `skip:` reason (empty
+# runs it; Buildkite rejects a reason over 70 characters), the two
+# UNIT_TEST_EXCLUDE_* as the unit-test steps' test-file-exclude-pattern.
+#
+# Kept on purpose: tests named after DeepSeek-V4 that cover GLM-5.2's indexer
+# (test_dsv4_streamindex*, test_dsv4_sparsecore_topk,
+# test_dsv4_indexer_kv_cache_append, test_dsv4_moe_routing), the PCP streaming
+# wrapper GLM's DCP indexer reuses, FP4/compressed-tensors quantization (the
+# GLM-5.2-FP4 nightly), and the model-agnostic compilation-cache and multihost
+# steps.
+GLM_AGENTX_SKIP=""
+UNIT_TEST_EXCLUDE_CPU=""
+UNIT_TEST_EXCLUDE_TPU=""
+glm_target="${BUILDKITE_BRANCH:-}"
+if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
+  glm_target="${BUILDKITE_PULL_REQUEST_BASE_BRANCH:-}"
+fi
+if [[ "${glm_target}" == *glm-agentx* ]] \
+    && ! grep -qx "full-ci" <<< "${pr_labels//,/$'\n'}"; then
+  GLM_AGENTX_SKIP="Not GLM-5.2: skipped on glm-agentx (label full-ci runs it)"
+  glm_agentx_test_excludes=(
+    "tests/kernels/test_kimi_*.py"
+    "tests/models/vllm/test_kimi_k3.py"
+    "tests/scripts/test_k3_sweep_summary.py"
+    "tests/kernels/gdn/**"
+    "tests/kernels/test_gdn_*.py"
+    "tests/layers/adapter/test_gdn_*.py"
+    "tests/layers/core/test_gdn_*.py"
+    "tests/models/vllm/test_qwen*.py"
+    "tests/kernels/deepseek_v4/**"
+    "tests/layers/adapter/test_dsv4_compressor_op.py"
+    "tests/layers/adapter/test_dsv4_indexer_op.py"
+    "tests/layers/adapter/test_dsv4_linear_weight_loading.py"
+    "tests/models/vllm/test_dsv4_*.py"
+    "tests/distributed/test_dsv4_*.py"
+    "tests/spec_decode/test_dflash.py"
+    "tests/spec_decode/test_dspark.py"
+    "tests/entrypoints/llm/test_mm_*.py"
+    "tests/runner/test_mm_*.py"
+    "tests/kernels/experimental/batched_rpa/**"
+    "tests/kernels/test_batched_rpa_*.py"
+    "tests/layers/core/test_batched_rpa_*.py"
+    "tests/disagg/**"
+    "tests/distributed/test_raiden_*.py"
+    "tests/distributed/test_pd_*.py"
+    "tests/distributed/test_pcp_tp_dcp_*.py"
+    "tests/offload/test_raiden_*.py"
+  )
+  glm_globs="$(IFS=,; echo "${glm_agentx_test_excludes[*]}")"
+  UNIT_TEST_EXCLUDE_CPU="{${glm_globs}}"
+  UNIT_TEST_EXCLUDE_TPU="{tests/entrypoints/llm/test_speculative_decoding.py,${glm_globs}}"
+  buildkite-agent annotate --style info --context glm-agentx-scope \
+    "glm-agentx build: skips the integration steps and unit tests of other models and of disaggregated serving. Add the \`full-ci\` label to run everything."
+fi
+export GLM_AGENTX_SKIP UNIT_TEST_EXCLUDE_CPU UNIT_TEST_EXCLUDE_TPU
+
 suffix=""
 if [[ "${CI_FLEET}" == "kube" ]]; then
   suffix="_kube"
@@ -228,6 +288,8 @@ fi
 OMNI_IMAGE_SKIP=""
 if [[ " ${lanes} " != *" tests "* ]]; then
   OMNI_IMAGE_SKIP="Only the tests lane uses the -omni image; this build has none."
+elif [[ -n "${GLM_AGENTX_SKIP}" ]]; then
+  OMNI_IMAGE_SKIP="${GLM_AGENTX_SKIP}"
 fi
 export OMNI_IMAGE_SKIP
 

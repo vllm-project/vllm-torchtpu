@@ -57,6 +57,8 @@ steps:
           <<: *tests_plugin_defaults
           test-file-pattern: "tests/**/{test_*,*_test}.py"
           fail-on-no-tests: true
+          # glm-agentx exclusions (bootstrap.sh); the default names no test file.
+          test-file-exclude-pattern: "${UNIT_TEST_EXCLUDE_CPU:-tests/conftest.py}"
           test-cmd: "pytest -sv --timeout=600 -m 'not tpu_test and not multichip and not nightly' --junit-xml={{resultPath}} {{testExamples}}"
 
   - label: "Unit Tests - CPU (Nightly)"
@@ -68,6 +70,8 @@ steps:
           <<: *tests_plugin_defaults
           test-file-pattern: "tests/**/{test_*,*_test}.py"
           fail-on-no-tests: true
+          # glm-agentx exclusions (bootstrap.sh); the default names no test file.
+          test-file-exclude-pattern: "${UNIT_TEST_EXCLUDE_CPU:-tests/conftest.py}"
           test-cmd: "pytest -sv --timeout=600 -m 'not tpu_test and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
   - group: "Unit Tests on TPU"
@@ -92,7 +96,7 @@ steps:
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-file-exclude-pattern: "${UNIT_TEST_EXCLUDE_TPU:-tests/entrypoints/llm/test_speculative_decoding.py}"
               test-cmd: "pytest -sv --timeout=600 -m 'tpu_test and not nightly and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: "Unit Tests - Multichip (PR)"
@@ -104,7 +108,7 @@ steps:
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-file-exclude-pattern: "${UNIT_TEST_EXCLUDE_TPU:-tests/entrypoints/llm/test_speculative_decoding.py}"
               test-cmd: "pytest -sv --timeout=600 -m 'not nightly and multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       # Representative correctness cases run on PRs; the full parameter
@@ -151,6 +155,7 @@ steps:
       # Omni multimodal and diffusion models on TPU.
       - label: "Unit Tests - Omni (PR)"
         key: "unit_tests_omni_pr"
+        skip: "${GLM_AGENTX_SKIP:-}"
         <<: *unit_test_defaults
         depends_on: "build_docker_omni"
         if: 'build.env("NIGHTLY") != "1"'
@@ -211,7 +216,7 @@ steps:
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-file-exclude-pattern: "${UNIT_TEST_EXCLUDE_TPU:-tests/entrypoints/llm/test_speculative_decoding.py}"
               test-cmd: "pytest -sv --timeout=600 -m 'tpu_test and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       - label: "Unit Tests - Multichip (Nightly)"
@@ -223,12 +228,13 @@ steps:
         plugins:
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
-              test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
+              test-file-exclude-pattern: "${UNIT_TEST_EXCLUDE_TPU:-tests/entrypoints/llm/test_speculative_decoding.py}"
               test-cmd: "pytest -sv --timeout=600 -m 'multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
       # Omni multimodal and diffusion models on TPU.
       - label: "Unit Tests - Omni (Nightly)"
         key: "unit_tests_omni_nightly"
+        skip: "${GLM_AGENTX_SKIP:-}"
         <<: *unit_test_defaults
         depends_on: "build_docker_omni"
         if: 'build.env("NIGHTLY") == "1"'
