@@ -97,7 +97,7 @@ You can also choose between two capacity models:
 - **Standard (On-Demand)**: Immediate allocation at standard pay-as-you-go rates.
 - **Flex-start (DWS)**: Discounted capacity via Dynamic Workload Scheduler (DWS) that runs uninterrupted for up to 7 days. Flex-start is supported on **TPU v7x**, **TPU v6e**, **TPU v5p**, and **TPU v5e** (not on **TPU v4**). For more details, see [About Flex-start VMs](https://cloud.google.com/compute/docs/instances/about-flex-start-vms) and [DWS Pricing](https://cloud.google.com/products/dws/pricing#flex-start-tpu-vm-pricing).
 
-Select your target TPU generation, chip count, and provisioning model below to generate the `gcloud` provisioning command. Be sure to replace placeholder variables (like `PROJECT_ID` and `SERVICE_ACCOUNT`) with your own values before running.
+Select your target TPU generation, chip count, and provisioning model below to generate the `gcloud` provisioning command. Be sure to replace placeholder variables (like `PROJECT_ID` and `ZONE`) with your own values before running.
 
 <div class="command-generator-container" id="prov-generator">
   <div class="cg-row">
@@ -138,7 +138,7 @@ Select your target TPU generation, chip count, and provisioning model below to g
 |-----------|-------------|
 | `PROJECT_ID` | Your Google Cloud project ID. |
 | `ZONE` | The Google Cloud zone where you have TPU quota (e.g., `us-central1-c`, `us-east5-a`, `europe-west4-a`, `us-central2-b`). See [TPU regions and zones](https://cloud.google.com/tpu/docs/regions-zones) for availability. |
-| `SERVICE_ACCOUNT` | The email address for your service account, found in the Cloud Console under IAM Service Accounts (e.g., `tpu-service-account@<your_project_ID>.iam.gserviceaccount.com`). Required for Cloud TPU API (queued resources) commands. |
+| `SERVICE_ACCOUNT` | The email address for your service account, found in the Cloud Console under IAM Service Accounts (e.g., `tpu-service-account@<your_project_ID>.iam.gserviceaccount.com`). Optional for Cloud TPU API (queued resources) commands; if you omit `--service-account`, the Compute Engine default service account is used. |
 | `RUNTIME_VERSION` | Automatically populated by the generator above based on your selected TPU hardware generation. |
 
 !!! note "TPU v7x dual-core architecture"
