@@ -121,11 +121,8 @@ def apply_omni_model_specific_patches() -> None:
 
     orig_pack_tensor = ipc._pack_tensor_if_large
 
-    def _safe_pack_tensor_if_large(
-        val: torch.Tensor,
-        d2h_stream: Any = None,
-    ) -> Any:
-        return orig_pack_tensor(val.cpu(), d2h_stream=d2h_stream)
+    def _safe_pack_tensor_if_large(val: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+        return orig_pack_tensor(val.cpu(), *args, **kwargs)
 
     ipc._pack_tensor_if_large = _safe_pack_tensor_if_large
     logger.info("Applied TPU patch: safe CPU serialization for diffusion IPC tensors.")

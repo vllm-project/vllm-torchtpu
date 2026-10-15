@@ -455,14 +455,19 @@ def test_safe_pack_tensor_if_large():
     from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
 
     # Provide an original pack function to mock_omni's ipc
-    orig_mock = MagicMock(
-        side_effect=lambda tensor, d2h_stream=None: {
-            "packed": True,
+    def _orig_mock(
+        tensor, d2h_stream=None, created=None, *, enable_registered_shm=False
+    ):
+        return {
             "device": getattr(tensor, "device", None).type
             if hasattr(tensor, "device")
             else "unknown",
+            "d2h_stream": d2h_stream,
+            "created": created,
+            "registered": enable_registered_shm,
         }
-    )
+
+    orig_mock = MagicMock(side_effect=_orig_mock)
     ipc._pack_tensor_if_large = orig_mock
 
     apply_omni_model_specific_patches.cache_clear()
@@ -476,12 +481,36 @@ def test_safe_pack_tensor_if_large():
 
         def cpu(self):
             self.cpu_called = True
-            return torch.empty(1, device="cpu")
+
+            class Res:
+                device = MagicMock()
+                device.type = "cpu"
+
+            return Res()
 
     t = MockDeviceTensor("tpu")
-    res = ipc._pack_tensor_if_large(t)
+    created_list = []
+    res = ipc._pack_tensor_if_large(
+        t, d2h_stream="s", created=created_list, enable_registered_shm=True
+    )
     assert t.cpu_called is True
-    assert res["device"] == "cpu"
+    assert res == {
+        "device": "cpu",
+        "d2h_stream": "s",
+        "created": created_list,
+        "registered": True,
+    }
+    assert res["created"] is created_list
+
+    t2 = MockDeviceTensor("tpu")
+    res2 = ipc._pack_tensor_if_large(t2)
+    assert t2.cpu_called is True
+    assert res2 == {
+        "device": "cpu",
+        "d2h_stream": None,
+        "created": None,
+        "registered": False,
+    }
 
 
 def test_omni_tpu_patches_configuration(monkeypatch):
