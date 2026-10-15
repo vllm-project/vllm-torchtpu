@@ -32,9 +32,6 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# The measured recipes use this FileChunks interface. Scope the pin to this
-# disposable CI container rather than changing dependencies for other lanes.
-uv pip install --system 'runai-model-streamer[gcs]==0.16.1'
 uv pip freeze --system > "$results/pip-freeze.txt"
 
 # Mount weights instead of copying the checkpoint onto the CI agent's disk.
