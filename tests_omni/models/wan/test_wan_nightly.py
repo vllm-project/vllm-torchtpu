@@ -69,5 +69,7 @@ def test_wan_full_model_matrix_and_golden_answers_tpu(
     """
     inputs, sampling_params = build_wan_golden_request(config)
     outputs = list(omni_runner.generate(inputs, sampling_params))
-    video = extract_wan_video(outputs, config)
+    video = extract_wan_video(
+        outputs, (config.num_frames, config.height, config.width, 3)
+    )
     assert_wan_golden_parity(video, config)

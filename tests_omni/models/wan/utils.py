@@ -251,7 +251,8 @@ def build_wan_golden_request(
 
 
 def extract_wan_video(
-    outputs: list[OmniRequestOutput], config: WanTestConfig
+    outputs: list[OmniRequestOutput],
+    expected_shape: tuple[int, int, int, int],
 ) -> np.ndarray:
     """Extract and validate the (F, H, W, 3) float32 video from Omni outputs.
 
@@ -265,14 +266,12 @@ def extract_wan_video(
     assert output.final_output_type == "video", output.final_output_type
     assert len(output.images) == 1, f"Expected 1 video, got {len(output.images)}"
     video: np.ndarray = output.images[0]
-    expected_shape = (1, config.num_frames, config.height, config.width, 3)
-    assert video.shape == expected_shape, (
-        f"Expected shape {expected_shape}, got {video.shape}"
+    batch_shape = (1, *expected_shape)
+    assert video.shape == batch_shape, (
+        f"Expected shape {batch_shape}, got {video.shape}"
     )
     video_arr: np.ndarray = video[0]  # (F, H, W, C)
-    assert np.all(np.isfinite(video_arr)), (
-        f"Video generated for {config.config_id} contains NaN or Inf values"
-    )
+    assert np.all(np.isfinite(video_arr)), "Video contains NaN or Inf values"
     return video_arr
 
 
