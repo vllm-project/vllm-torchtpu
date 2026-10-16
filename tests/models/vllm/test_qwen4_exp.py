@@ -23,7 +23,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen4ExpTextConfig
-from vllm.config import CompilationMode
+from vllm.config import (
+    CompilationMode,
+    DeviceConfig,
+    VllmConfig,
+    set_current_vllm_config,
+)
 from vllm.model_executor import parameter as vllm_parameter
 from vllm.model_executor.layers import linear as vllm_linear
 from vllm.model_executor.layers import vocab_parallel_embedding as vpe
@@ -37,6 +42,7 @@ from vllm.models.qwen4_exp.common.ngram_embedding import (
     Qwen4ExpPLEEmbeddingMethod,
     Qwen4ExpPLEFp8EmbeddingMethod,
 )
+from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
 import vllm_torchtpu.models.vllm.qwen4_exp.model as qwen4_model
 from vllm_torchtpu.gdn_pool_layout import QWEN_GDN_ARCHITECTURES
@@ -48,6 +54,7 @@ from vllm_torchtpu.models.vllm.qwen4_exp.ple import (
     PLEInputs,
     Qwen4ExpNGramEmbedding,
     Qwen4ExpPLELayer,
+    Qwen4ExpPLETable,
     head_vocab_sizes,
     layer_multipliers,
     ngram_ids,
@@ -76,6 +83,11 @@ def _cpu_model_tests(monkeypatch):
         monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
         monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
         monkeypatch.setattr(torch.accelerator, "device_count", lambda: 0)
+
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
+    with set_current_vllm_config(config):
+        yield
 
 
 def _text_config(**overrides) -> Qwen4ExpTextConfig:
@@ -1012,3 +1024,60 @@ def test_ple_layer_rejects_kernel_size_one(monkeypatch) -> None:
     config = _text_config(**{**_PLE, "ple_conv_kernel_size": 1})
     with pytest.raises(NotImplementedError, match="ple_conv_kernel_size"):
         Qwen4ExpPLELayer(config, 0, None, prefix="model.layers.0.ple")
+
+
+def test_ple_storage_factory_allocates_once_and_reuses_shard_loader(monkeypatch):
+    _set_tp(monkeypatch, 0, 1)
+    allocations = []
+
+    class RecordingTable(Qwen4ExpPLETable):
+        def allocate_embedding_weight(self, rows, width, dtype):
+            allocations.append((rows, width, dtype))
+            return torch.zeros(rows, width, dtype=dtype)
+
+    ple = Qwen4ExpPLELayer(
+        _text_config(**_PLE),
+        0,
+        None,
+        prefix="model.layers.0.ple",
+        table_factory=RecordingTable,
+    )
+    table = ple.ple_embedding.ngram_embedding
+    assert isinstance(table, RecordingTable)
+    assert allocations == [(_TABLE_ROWS, _HEAD_DIM, torch.float32)]
+    rows = torch.arange(_TABLE_ROWS * _HEAD_DIM).reshape(_TABLE_ROWS, _HEAD_DIM).float()
+    ple.ple_embedding.load_weights(
+        (f"ngram_embedding.shard_{i}.weight", shard)
+        for i, shard in enumerate(rows.split(22))
+    )
+    ids = torch.tensor([[0, 21, 22, 63]])
+    assert torch.equal(table(ids), rows[ids])
+
+
+def test_ple_explicit_group_controls_sharding_and_reduction(monkeypatch):
+    _set_tp(monkeypatch, 0, 1)
+
+    class Group:
+        rank_in_group = 1
+        world_size = 2
+
+        def all_reduce(self, rows):
+            self.seen = rows.clone()
+            return rows + 1
+
+    group = Group()
+    table = Qwen4ExpPLETable(
+        _TABLE_ROWS,
+        _HEAD_DIM,
+        embedding_method=Qwen4ExpPLEEmbeddingMethod.from_quant_config(None, "ple"),
+        padding_size=16,
+        prefix="ple",
+        parallel_group=group,
+    )
+    rows = torch.arange(_TABLE_ROWS * _HEAD_DIM).reshape(_TABLE_ROWS, _HEAD_DIM).float()
+    table.weight_loader(table.weight, rows, checkpoint_start=0)
+    assert table.weight.shape == (32, _HEAD_DIM)
+    ids = torch.tensor([[0, 31, 32, 63]])
+    expected = rows[ids].masked_fill((ids < 32).unsqueeze(-1), 0)
+    assert torch.equal(table(ids), expected + 1)
+    assert torch.equal(group.seen, expected)

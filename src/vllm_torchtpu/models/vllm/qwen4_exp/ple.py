@@ -28,12 +28,13 @@ from __future__ import annotations
 import math
 from collections.abc import Iterable
 from dataclasses import dataclass
+from typing import Protocol
 
 import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen4ExpTextConfig
-from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.distributed import GroupCoordinator, tensor_model_parallel_all_reduce
 from vllm.model_executor.layers.linear import ReplicatedLinear
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.models.qwen4_exp.common.hyperconnection import GroupedGemmaRMSNorm
@@ -259,6 +260,7 @@ class Qwen4ExpPLETable(PLEVocabParallelEmbedding):
         embedding_method: Qwen4ExpPLEEmbeddingMethod,
         padding_size: int,
         prefix: str,
+        parallel_group: GroupCoordinator | None = None,
     ) -> None:
         super().__init__(
             num_embeddings,
@@ -266,6 +268,7 @@ class Qwen4ExpPLETable(PLEVocabParallelEmbedding):
             padding_size=padding_size,
             prefix=prefix,
             quant_method=embedding_method,
+            parallel_group=parallel_group,
         )
         self.embedding_method = embedding_method
         self.output_dtype = torch.get_default_dtype()
@@ -302,8 +305,26 @@ class Qwen4ExpPLETable(PLEVocabParallelEmbedding):
     def forward(self, input_: torch.Tensor) -> torch.Tensor:
         rows = self.local_rows(input_)
         if self.tp_size > 1:
-            rows = tensor_model_parallel_all_reduce(rows)
+            rows = (
+                tensor_model_parallel_all_reduce(rows)
+                if self.parallel_group is None
+                else self.parallel_group.all_reduce(rows)
+            )
         return rows
+
+
+class PLETableFactory(Protocol):
+    """Choose storage before the embedding method allocates the table."""
+
+    def __call__(
+        self,
+        num_embeddings: int,
+        embedding_dim: int,
+        *,
+        embedding_method: Qwen4ExpPLEEmbeddingMethod,
+        padding_size: int,
+        prefix: str,
+    ) -> Qwen4ExpPLETable: ...
 
 
 class Qwen4ExpNGramEmbedding(nn.Module):
@@ -320,6 +341,8 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         ple_layer_index: int,
         quant_config: QuantizationConfig | None,
         prefix: str,
+        *,
+        table_factory: PLETableFactory = Qwen4ExpPLETable,
     ) -> None:
         super().__init__()
         ngram_heads = (config.ngram_size - 1) * config.heads_per_ngram
@@ -357,7 +380,7 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         self.register_buffer("ngram_heads_offsets", torch.tensor(offsets))
         divisor = config.make_ngram_vocab_size_divisible_by
         table_prefix = f"{prefix}.ngram_embedding"
-        self.ngram_embedding = Qwen4ExpPLETable(
+        self.ngram_embedding = table_factory(
             math.ceil(sum(sizes) / divisor) * divisor,
             embedding_dim // ngram_heads,
             embedding_method=Qwen4ExpPLEEmbeddingMethod.from_quant_config(
@@ -467,6 +490,8 @@ class Qwen4ExpPLELayer(nn.Module):
         ple_layer_index: int,
         quant_config: QuantizationConfig | None,
         prefix: str,
+        *,
+        table_factory: PLETableFactory = Qwen4ExpPLETable,
     ) -> None:
         super().__init__()
         if config.ple_conv_kernel_size < 2:
@@ -489,6 +514,7 @@ class Qwen4ExpPLELayer(nn.Module):
             ple_layer_index,
             quant_config,
             prefix=f"{prefix}.ple_embedding",
+            table_factory=table_factory,
         )
         self.key_proj = ReplicatedLinear(
             embed_dim,
@@ -541,6 +567,22 @@ class Qwen4ExpPLELayer(nn.Module):
         embeddings = self.ple_embedding(
             inputs.input_ids, inputs.ngram_context, request, chunk_pos
         )
+        gated_value = self.gated_values(hidden_states, embeddings)
+        conv_output, new_windows = dilated_short_conv(
+            self.norm_conv(gated_value),
+            self.conv1d.weight[:, 0, :],
+            self.conv_dilation,
+            conv_windows,
+            inputs.query_start_loc,
+            request,
+            chunk_pos,
+        )
+        return gated_value + F.silu(conv_output), new_windows
+
+    def gated_values(
+        self, hidden_states: torch.Tensor, embeddings: torch.Tensor
+    ) -> torch.Tensor:
+        """PLE values before convolution; storage and history remain caller-owned."""
         key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
         streams = (self.hc_count, self.hidden_size)
@@ -552,13 +594,4 @@ class Qwen4ExpPLELayer(nn.Module):
         gate = dot / math.sqrt(self.hidden_size)
         gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
         gated_value = (torch.sigmoid(gate) * value.unsqueeze(-2)).flatten(-2)
-        conv_output, new_windows = dilated_short_conv(
-            self.norm_conv(gated_value),
-            self.conv1d.weight[:, 0, :],
-            self.conv_dilation,
-            conv_windows,
-            inputs.query_start_loc,
-            request,
-            chunk_pos,
-        )
-        return gated_value + F.silu(conv_output), new_windows
+        return gated_value
