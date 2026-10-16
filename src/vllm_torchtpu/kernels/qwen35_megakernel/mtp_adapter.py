@@ -86,6 +86,23 @@ def _parse_buckets(name: str, default: Sequence[int]) -> tuple[int, ...]:
     return tuple(buckets)
 
 
+def _padded(n: int, paddings: Sequence[int]) -> int:
+    """`n` rounded up to the runner's token padding (`n` itself past the largest)."""
+    return next((p for p in sorted(paddings) if p >= n), n)
+
+
+def _covering_buckets(
+    raw: Sequence[int], cap: int, paddings: Sequence[int]
+) -> tuple[int, ...]:
+    """The buckets of `raw` up to the first one that holds `cap` rows after the runner
+    pads them (a step of `cap` rows arrives padded, e.g. 28 requests as 32 rows)."""
+    need = _padded(cap, paddings)
+    keep = [b for b in raw if b <= need]
+    if not keep or keep[-1] < need:
+        keep += [b for b in raw if b > need][:1]
+    return tuple(keep) or (raw[0],)
+
+
 def _fit(x: jax.Array, rows: int) -> jax.Array:
     """The first `rows` rows of `x`, zero-padded when `x` is shorter."""
     if x.shape[0] >= rows:
@@ -254,6 +271,9 @@ class Qwen35MtpMegakernel:
         self.tiles = K.default_tiles(base_cfg)
         self.tk = K.plan(base_cfg, self.tiles)["tk"]
         max_reqs = int(getattr(runner, "max_num_reqs", 0) or 0)
+        self._paddings = tuple(
+            int(x) for x in getattr(runner, "num_tokens_paddings", ()) or ()
+        )
         raw_loop = _parse_buckets(
             "VLLM_TPU_QWEN35_MTP_MK_BUCKETS", _DEFAULT_LOOP_BUCKETS
         )
@@ -262,13 +282,10 @@ class Qwen35MtpMegakernel:
             _DEFAULT_VERIFY_BUCKETS,
         )
         if max_reqs > 0:
-            self.loop_buckets = tuple(b for b in raw_loop if b <= max_reqs) or (
-                raw_loop[0],
+            self.loop_buckets = _covering_buckets(raw_loop, max_reqs, self._paddings)
+            self.verify_buckets = _covering_buckets(
+                raw_verify, (_NUM_SPEC_TOKENS + 1) * max_reqs, self._paddings
             )
-            max_verify = (_NUM_SPEC_TOKENS + 1) * max_reqs
-            self.verify_buckets = tuple(
-                b for b in raw_verify if b <= max_verify
-            ) or (raw_verify[0],)
         else:
             self.loop_buckets = raw_loop
             self.verify_buckets = raw_verify
@@ -544,6 +561,15 @@ class Qwen35MtpMegakernel:
             fake=fake,
         )
 
+    def padded_rows(self, rows: int) -> int:
+        """The rows a draft step of `rows` rows arrives at after the runner pads it.
+
+        `use_for_step` admits step-0 steps up to `padded_rows((K + 1) *
+        max_num_reqs)` rows, so the step-0 program must compile every token
+        bucket up to that count.
+        """
+        return _padded(rows, self._paddings)
+
     def use_for_step(self, attn_metadata: Any, num_rows: int, *, step0: bool) -> bool:
         """Whether a draft step of `num_rows` rows runs on the megakernel.
 
@@ -556,8 +582,13 @@ class Qwen35MtpMegakernel:
             if isinstance(attn_metadata, dict)
             else None
         )
+        # A step-0 step arrives padded to the runner's token bucket: its rows past the
+        # requests' K + 1 tokens each are inert (no live sequence, no gather index).
         max_rows = (
-            min(buckets[-1] * 2, int(md.seq_lens.shape[0]) * (_NUM_SPEC_TOKENS + 1))
+            min(
+                buckets[-1] * 2,
+                self.padded_rows(int(md.seq_lens.shape[0]) * (_NUM_SPEC_TOKENS + 1)),
+            )
             if (step0 and md is not None)
             else (buckets[-1] * 2 if step0 else buckets[-1])
         )
