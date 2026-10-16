@@ -240,6 +240,9 @@ def _make_vllm_config(
 ):
     cfg = MagicMock()
     cfg.speculative_config = None
+    cfg.additional_config = {}
+    cfg.kv_transfer_config.kv_role = "kv_producer" if is_producer else "kv_consumer"
+    cfg.kv_transfer_config.kv_load_failure_policy = "recompute"
     cfg.kv_transfer_config.is_kv_producer = is_producer
     cfg.kv_transfer_config.kv_connector_extra_config = {}
     cfg.cache_config.block_size = block_size
@@ -362,6 +365,8 @@ def _make_raiden_worker(
     pp_size: int = 1,
     kv_ips: Any = "127.0.0.1",
     kv_ports: Any = 9100,
+    send_completion: bool = False,
+    load_failure_policy: str = "recompute",
 ) -> TPURaidenConnectorWorker:
     cfg = _make_vllm_config(
         is_producer=is_producer,
@@ -374,6 +379,9 @@ def _make_raiden_worker(
         interleave_size=interleave_size,
         pp_size=pp_size,
     )
+    cfg.additional_config = {"raiden_pd_send_completion": send_completion}
+    cfg.kv_transfer_config.kv_connector = "TPURaidenConnector"
+    cfg.kv_transfer_config.kv_load_failure_policy = load_failure_policy
     with (
         patch(f"{_MOD}.get_tensor_model_parallel_rank", return_value=tp_rank),
         patch(f"{_MOD}.get_tensor_model_parallel_world_size", return_value=tp_size),
@@ -382,6 +390,151 @@ def _make_raiden_worker(
         patch(f"{_MOD}.dist_utils.get_kv_transfer_port", return_value=kv_ports),
     ):
         return TPURaidenConnectorWorker(cfg)
+
+
+@pytest.mark.parametrize("block_ids", [[41, 43], []])
+@pytest.mark.parametrize("inline_load", [False, True])
+def test_pd_decode_failure_uses_transfer_results_failed_recving(
+    block_ids, inline_load, monkeypatch
+):
+    monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
+    monkeypatch.setattr(
+        f"{_MOD}.dist_utils.get_raiden_inline_load", lambda: inline_load
+    )
+    worker = _make_raiden_worker(is_producer=False, load_failure_policy="fail")
+    engine = _FakeRaidenEngine()
+    engine.poll_results = [([], [], [])]
+    worker._raiden_transfer_engine = engine
+    worker._record_stage3_load_failure("failed-load", block_ids)
+    connector = TPURaidenConnector.__new__(TPURaidenConnector)
+    connector.connector_worker = worker
+    connector.use_raiden = True
+    connector._stage3_fa_group_index = 3
+
+    results = connector.get_transfer_results(set())
+    assert results.finished_sending == set()
+    assert results.finished_recving == {"failed-load"}
+    if inline_load:
+        assert results.failed_recving == set()
+        assert connector.get_block_ids_with_load_errors() == set(block_ids)
+    else:
+        assert results.failed_recving == {"failed-load"}
+        assert connector.get_block_ids_with_load_errors() == set()
+
+
+@pytest.mark.parametrize("send_completion", [False, True])
+def test_pd_send_results_preserve_outcomes_without_changing_cleanup(
+    send_completion, monkeypatch
+):
+    from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
+        RaidenSendOutcome,
+    )
+
+    monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
+    worker = _make_raiden_worker(tp_rank=0, tp_size=1, send_completion=send_completion)
+    worker._stage3_send_outcomes = {
+        "ok": "done",
+        "bad": "failed",
+        "unused": "cancelled",
+    }
+    assert worker._stage3_ready_producer_send_terminals() == (
+        {"ok"},
+        {"bad"},
+        {"unused"},
+    )
+    connector = TPURaidenConnector.__new__(TPURaidenConnector)
+    connector.connector_worker = worker
+    results = connector.build_connector_worker_meta()
+    if send_completion:
+        assert results is not None
+        assert results.outcomes == {
+            "ok": RaidenSendOutcome.SUCCESS,
+            "bad": RaidenSendOutcome.SEND_FAILURE,
+            "unused": RaidenSendOutcome.UNCLAIMED_TIMEOUT,
+        }
+    else:
+        assert results is None
+    assert connector.build_connector_worker_meta() is None
+
+
+@pytest.mark.parametrize("invalid", [None, 1, "true"])
+def test_pd_send_completion_requires_boolean_config(invalid):
+    from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
+        raiden_pd_completion_modes,
+    )
+
+    cfg = _make_vllm_config()
+    cfg.kv_transfer_config.kv_connector = "TPURaidenConnector"
+    cfg.additional_config = {"raiden_pd_send_completion": invalid}
+    with pytest.raises(ValueError, match="must be a bool"):
+        raiden_pd_completion_modes(cfg)
+
+
+def test_pd_completion_preserves_hash_only_additional_config():
+    from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
+        raiden_pd_completion_modes,
+    )
+
+    cfg = _make_vllm_config()
+    cfg.additional_config = SimpleNamespace(compute_hash=lambda: "test")
+    assert raiden_pd_completion_modes(cfg) is False
+
+
+@pytest.mark.parametrize(
+    "unsupported", ["transport", "role", "tp", "dp", "pp", "connector"]
+)
+def test_pd_send_completion_checks_its_deployment_boundary(unsupported, monkeypatch):
+    from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
+        raiden_pd_completion_modes,
+    )
+
+    monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
+    cfg = _make_vllm_config(tp_size=1, pcp_size=4)
+    cfg.kv_transfer_config.kv_connector = "TPURaidenConnector"
+    cfg.additional_config = {"raiden_pd_send_completion": True}
+    assert raiden_pd_completion_modes(cfg) is True
+    if unsupported == "transport":
+        monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "zmq")
+    elif unsupported == "role":
+        cfg.kv_transfer_config.kv_role = "kv_consumer"
+    elif unsupported == "connector":
+        cfg.kv_transfer_config.kv_connector = "TPUMultiConnector"
+        cfg.kv_transfer_config.kv_connector_extra_config = {
+            "connectors": [{"kv_connector": "TPURaidenConnector"}] * 2
+        }
+    else:
+        name = {"tp": "tensor", "dp": "data", "pp": "pipeline"}[unsupported]
+        setattr(cfg.parallel_config, f"{name}_parallel_size", 2)
+    with pytest.raises(ValueError, match="raiden_pd_send_completion requires"):
+        raiden_pd_completion_modes(cfg)
+
+
+@pytest.mark.parametrize("send_completion", [False, True])
+def test_stage3_publish_send_sets_kv_transfer_pending_only_when_opted_in(
+    send_completion, monkeypatch
+):
+    monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
+    monkeypatch.setenv("TPU_RAIDEN_CONTROLLER_ADDRESS", "prefill-controller.test:27000")
+    monkeypatch.setenv("TPU_RAIDEN_TRANSFER_PARALLELISM", "8")
+    producer = _make_raiden_scheduler(is_producer=True, block_size=4096, pcp_size=8)
+    producer.vllm_config.parallel_config.tensor_parallel_size = 1
+    producer.vllm_config.parallel_config.data_parallel_size = 1
+    producer.vllm_config.parallel_config.pipeline_parallel_size = 1
+    producer.vllm_config.kv_transfer_config.kv_connector = "TPURaidenConnector"
+    producer.vllm_config.additional_config = {
+        "raiden_pd_send_completion": send_completion
+    }
+    req = MagicMock()
+    req.request_id = "req-opt-in"
+    req.prompt_token_ids = [0] * 65_024
+    req.num_prompt_tokens = 65_024
+    req.num_computed_tokens = 65_024
+    req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+    delay, params = producer.request_finished(req, [100, 101])
+    assert delay is True
+    assert ("kv_transfer_pending" in params) is send_completion
+    if send_completion:
+        assert params["kv_transfer_pending"] is True
 
 
 # ---------------------------------------------------------------------------
@@ -8198,3 +8351,26 @@ class TestSpecSourceFenceRegisterAhead:
         assert fences == [(2, True)]
         worker.process_send_load(self._meta(c=False))
         assert fences == [(2, True), (2, True)]
+
+
+@pytest.mark.parametrize("policy", ["fail", "recompute"])
+def test_pd_native_load_failure_retains_identity_across_cleanup(policy, monkeypatch):
+    tpu_envs.__dict__.pop("TPU_KV_RESHARD_TRANSPORT", None)
+    monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
+    monkeypatch.setattr(f"{_MOD}.dist_utils.get_raiden_inline_load", lambda: False)
+    worker = _make_raiden_worker(is_producer=False, load_failure_policy=policy)
+    engine = _FakeRaidenEngine()
+    engine.poll_results = [([], [], ["source"])]
+    worker._raiden_transfer_engine = engine
+    worker._stage3_source_req_ids = {"destination": "source"}
+    worker._stage3_destination_req_ids = {"source": "destination"}
+    worker._stage3_submitted_loads = {"destination": 123}
+    worker._stage3_controller_accepted = {"destination"}
+    worker._load_block_ids = {"destination": [41]}
+    results = worker.get_transfer_results(set())
+    assert results.finished_sending == set()
+    assert results.finished_recving == {"destination"}
+    assert results.failed_recving == {"destination"}
+    assert worker.get_block_ids_with_load_errors() == set()
+    assert worker.get_transfer_results({"destination"}).failed_recving == set()
+    assert "destination" not in worker._failed_recving
