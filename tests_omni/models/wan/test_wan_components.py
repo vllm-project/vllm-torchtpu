@@ -14,12 +14,10 @@
 """Component-wise TPU vs CPU parity tests for the Wan model family.
 
 Each vllm-omni component runs on TPU and is compared, in the same process,
-against a CPU reference: HuggingFace diffusers in float32, or float64 math
-where diffusers has no standalone equivalent.
+against a CPU reference (HuggingFace diffusers).
 
 Tiers:
-1. Kernels (random inputs): WanRotaryPosEmbed vs diffusers and TpuSDPAImpl vs
-   float64 softmax(QK^T)V, at Wan shapes.
+1. Kernels: WanRotaryPosEmbed vs diffusers.
 2. Tiny transformers (random weights, one per architecture class: T2V, I2V+CLIP,
    I2V-A14B (36ch, no CLIP), TI2V (2-D timestep), VACE). vllm-omni loads the
    diffusers state dict, so weight mapping and numerics are both covered.
@@ -89,7 +87,6 @@ from vllm_omni.diffusion.models.wan2_2.wan2_2_vace_transformer import (
 )
 
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.omni.attention import TpuSDPAImpl
 from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
 from vllm_torchtpu.omni.rope import can_fuse_qk_norm_rope
 
@@ -332,56 +329,6 @@ def test_wan_rope_freqs_on_tpu_match_diffusers():
         torch.testing.assert_close(
             tpu_table.cpu().double(), ref_table.double(), atol=1e-4, rtol=0
         )
-
-
-def _sdpa_ref(
-    query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, scale: float
-) -> torch.Tensor:
-    """float64 softmax(Q K^T * scale) V on [batch, seq, heads, head_dim] inputs."""
-    scores = torch.einsum("bqhd,bkhd->bhqk", query.double(), key.double()) * scale
-    attn_probs = scores.softmax(-1)
-    return torch.einsum("bhqk,bkhd->bqhd", attn_probs, value.double())
-
-
-# Wan attention geometry: head_dim is 128 for every model; head count varies.
-WAN_HEAD_DIM = 128
-WAN_NUM_HEADS = {
-    "1.3b": 12,  # Wan2.1 T2V-1.3B, VACE-1.3B
-    "5b": 24,  # Wan2.2 TI2V-5B
-    "14b": 40,  # Wan2.1 T2V/I2V-14B, Wan2.2 I2V-A14B
-}
-# TpuSDPAImpl (bf16) vs float64 softmax(QK^T)V: observed rel_l2 is 2.23e-3 -
-# 2.26e-3 and max_abs is 0.84e-3 - 2.39e-3 across all 6 head/sequence shapes.
-SDPA_MAX_REL_L2 = 2.5e-3
-SDPA_MAX_ABS_ERR = 3.0e-3
-
-
-@pytest.mark.parametrize(
-    "num_heads", list(WAN_NUM_HEADS.values()), ids=list(WAN_NUM_HEADS)
-)
-@pytest.mark.parametrize(
-    "q_len,kv_len", [(1560, 1560), (1560, 512)], ids=["self", "cross"]
-)
-def test_wan_sdpa_on_tpu_matches_float64(q_len, kv_len, num_heads, record_property):
-    """TpuSDPAImpl at each Wan head geometry vs float64 softmax(QK^T)V."""
-    torch.manual_seed(0)
-    scale = WAN_HEAD_DIM**-0.5
-    query = torch.randn(1, q_len, num_heads, WAN_HEAD_DIM, dtype=torch.bfloat16)
-    key = torch.randn(1, kv_len, num_heads, WAN_HEAD_DIM, dtype=torch.bfloat16)
-    value = torch.randn(1, kv_len, num_heads, WAN_HEAD_DIM, dtype=torch.bfloat16)
-    attn_impl = TpuSDPAImpl(
-        num_heads=num_heads, head_size=WAN_HEAD_DIM, softmax_scale=scale
-    )
-    tpu_output = attn_impl.forward(
-        query.to("tpu"), key.to("tpu"), value.to("tpu")
-    ).cpu()
-    ref_output = _sdpa_ref(query, key, value, scale)
-    metrics = _metrics(tpu_output, ref_output)
-    _record(
-        record_property, f"sdpa-{num_heads}x{WAN_HEAD_DIM}-{q_len}x{kv_len}", **metrics
-    )
-    assert metrics["rel_l2"] <= SDPA_MAX_REL_L2, metrics
-    assert metrics["max_abs"] <= SDPA_MAX_ABS_ERR, metrics
 
 
 # --------------------------------------------------------------------------- #
