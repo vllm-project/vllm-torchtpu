@@ -88,6 +88,10 @@ def _make_runner(
         compilation_config=SimpleNamespace(static_forward_context={}),
     )
     runner.sequence_layout_planner = create_sequence_layout_planner(runner.vllm_config)
+    runner.pcp_manager = None
+    runner._dummy_pcp_kv_gather_fields = types.MethodType(
+        TPUModelRunner._dummy_pcp_kv_gather_fields, runner
+    )
     runner.cache_config = SimpleNamespace(
         block_size=block_size, num_gpu_blocks=8, num_gpu_blocks_override=None
     )
