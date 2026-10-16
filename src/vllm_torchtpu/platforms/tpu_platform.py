@@ -602,17 +602,21 @@ class TpuPlatform(Platform):
         vLLM builds ``num_tokens_across_dp_cpu`` on CPU, but TPU compiled
         forwards require tensor arguments to be on device.
         """
+        additional = {}
         dp_metadata = kwargs.get("dp_metadata")
         if dp_metadata is not None:
             t = dp_metadata.num_tokens_across_dp_cpu
             if t.device.type == "cpu":
+                # Keep host consumers off the device stream. In particular,
+                # Engram needs these sizes before preparing the next chunk.
+                additional["tpu_num_tokens_across_dp_cpu"] = tuple(t.tolist())
                 tpu_t = t.to("tpu")
                 try:
                     dp_metadata.num_tokens_across_dp_cpu = tpu_t
                 except Exception:
                     # Frozen dataclass fallback.
                     object.__setattr__(dp_metadata, "num_tokens_across_dp_cpu", tpu_t)
-        return {}
+        return additional
 
     @classmethod
     def check_and_update_config(cls, vllm_config: VllmConfig) -> None:

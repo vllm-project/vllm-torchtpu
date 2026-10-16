@@ -108,6 +108,7 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram import (
     _async_source_tokens_cpu,
     _resolve_decode_lookback_cpu,
     capture_host_engram_inputs,
+    gather_host_engram_hashes,
     install_host_engram_inputs,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import DeepseekV41Model
@@ -790,6 +791,67 @@ class TestV2HostEngramFull:
         assert inp6 is not None
         assert inp6.host_ready is True
 
+    def test_gather_host_engram_hashes_branches(self):
+        hashes_cpu = torch.ones((2, 2, 1), dtype=torch.int32, device="cpu")
+
+        # 1. CPU, not dp_shared_memory, dp_group with world_size > 1 and cpu_group
+        mock_cpu_group = MagicMock()
+        mock_dp_group = SimpleNamespace(world_size=2, cpu_group=mock_cpu_group)
+        mock_ctx = SimpleNamespace(dp_metadata=SimpleNamespace())
+
+        with (
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.get_engram_dp_group",
+                return_value=mock_dp_group,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.is_forward_context_available",
+                return_value=True,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.get_forward_context",
+                return_value=mock_ctx,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.engram_gathered_num_tokens",
+                return_value=4,
+            ),
+            patch("torch.distributed.all_gather_into_tensor") as mock_all_gather,
+        ):
+            out = gather_host_engram_hashes(hashes_cpu, dp_shared_memory=False)
+            assert out.shape == (8, 2, 1)
+            mock_all_gather.assert_called_once()
+
+            # Exceeds slot -> raises ValueError
+            with (
+                patch(
+                    "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.engram_gathered_num_tokens",
+                    return_value=1,
+                ),
+                pytest.raises(ValueError, match="exceeds the DP token slot"),
+            ):
+                gather_host_engram_hashes(hashes_cpu, dp_shared_memory=False)
+
+        # 2. gather_fn provided
+        called_fn = []
+        gather_host_engram_hashes(
+            hashes_cpu,
+            dp_shared_memory=True,
+            gather_fn=lambda h, dp_shared_memory: called_fn.append(
+                (h.shape, dp_shared_memory)
+            ),
+        )
+        assert called_fn == [((2, 2, 1), True)]
+
+        # 3. Fallback to upstream gather_engram_hashes
+        with patch(
+            "vllm.models.deepseek_v41.common.engram.gather_engram_hashes",
+            return_value=torch.ones((4, 2, 1)),
+        ) as mock_up_gather:
+            out3 = gather_host_engram_hashes(hashes_cpu, dp_shared_memory=True)
+            assert out3.shape == (4, 2, 1)
+            mock_up_gather.assert_called_once()
+
     def test_install_host_engram_inputs(self):
         class MockRunner:
             def _prepare_lookback_token_ids(self, num_reqs: int):
@@ -917,7 +979,7 @@ class TestV2ModelHostEngramStaging:
                 return_value=torch.zeros(2, dtype=torch.bool),
             ),
             patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.gather_engram_hashes",
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.gather_host_engram_hashes",
                 return_value=torch.ones((2, 2, 1)),
             ),
         ):
@@ -973,7 +1035,7 @@ class TestV2ModelHostEngramStaging:
                 return_value=None,
             ),
             patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.gather_engram_hashes",
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.gather_host_engram_hashes",
                 return_value=torch.ones((2, 2, 1)),
             ),
         ):

@@ -13,12 +13,20 @@ editing the shared runner: ``forward_model`` calls
 ``input_ids_cpu``, ``positions_cpu`` and ``query_start_loc_cpu`` are final.
 """
 
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
 import torch
+from vllm.distributed import get_dp_group, get_engram_dp_group
 from vllm.forward_context import get_forward_context, is_forward_context_available
+from vllm.models.deepseek_v41.common.engram import (
+    DEAD_ID,
+)
+from vllm.models.deepseek_v41.common.engram import (
+    engram_gathered_num_tokens as upstream_engram_gathered_num_tokens,
+)
 
 HOST_ENGRAM_KEY = "deepseek_v41_host_engram"
 
@@ -183,6 +191,65 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
         all_prompt=all_prompt,
         host_ready=True,
     )
+
+
+def engram_gathered_num_tokens() -> int:
+    """Read the host snapshot, before any work waiting on the device stream."""
+    context = get_forward_context()
+    sizes = context.additional_kwargs.get("tpu_num_tokens_across_dp_cpu")
+    if sizes is None:
+        return upstream_engram_gathered_num_tokens()
+    group = get_engram_dp_group()
+    assert group is not None
+    start = get_dp_group().rank_in_group - group.rank_in_group
+    # Engram groups are contiguous slices of the global DP group.
+    return max(sizes[start : start + group.world_size])
+
+
+def gather_host_engram_hashes(
+    engram_hashes: torch.Tensor,
+    *,
+    dp_shared_memory: bool = False,
+    gather_fn: Callable[..., torch.Tensor] | None = None,
+) -> torch.Tensor:
+    """Gather Engram hashes across DP, using ``dp_group.cpu_group`` on CPU."""
+    if engram_hashes.device.type == "cpu" and not dp_shared_memory:
+        dp_group = get_engram_dp_group()
+        if (
+            dp_group is not None
+            and getattr(dp_group, "world_size", 1) > 1
+            and getattr(dp_group, "cpu_group", None) is not None
+        ):
+            dp_metadata = (
+                getattr(get_forward_context(), "dp_metadata", None)
+                if is_forward_context_available()
+                else None
+            )
+            slot = (
+                engram_gathered_num_tokens()
+                if dp_metadata is not None
+                else int(engram_hashes.shape[0])
+            )
+            if engram_hashes.shape[0] > slot:
+                raise ValueError("Engram token count exceeds the DP token slot")
+            if engram_hashes.shape[0] < slot:
+                pad = engram_hashes.new_full(
+                    (slot - engram_hashes.shape[0], *engram_hashes.shape[1:]),
+                    DEAD_ID,
+                )
+                engram_hashes = torch.cat((engram_hashes, pad))
+            out = engram_hashes.new_empty(
+                (dp_group.world_size * slot, *engram_hashes.shape[1:])
+            )
+            torch.distributed.all_gather_into_tensor(
+                out, engram_hashes.contiguous(), group=dp_group.cpu_group
+            )
+            return out
+    if gather_fn is not None:
+        return gather_fn(engram_hashes, dp_shared_memory=dp_shared_memory)
+    from vllm.models.deepseek_v41.common.engram import gather_engram_hashes
+
+    return gather_engram_hashes(engram_hashes, dp_shared_memory=dp_shared_memory)
 
 
 def install_host_engram_inputs() -> None:

@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""CPU-only distributed regression for DP-shared host Engram tables."""
+"""CPU distributed regression for shared and head-sharded host Engram tables."""
 
 import os
 from datetime import timedelta
@@ -11,6 +11,7 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 
 from vllm_torchtpu.models.vllm.deepseek_v41.common import engram as common_engram
+from vllm_torchtpu.models.vllm.deepseek_v41.v2 import host_engram
 
 _HEAD_SIZES = (8, 8, 8, 8)
 _DIM = 32
@@ -37,7 +38,9 @@ def _table(rows: int) -> tuple[torch.Tensor, torch.Tensor]:
     return weight.view(torch.float8_e4m3fn), scales.view(rows, -1)
 
 
-def _worker(rank: int, size: int, rendezvous: str, shm_dir: str) -> None:
+def _worker(
+    rank: int, size: int, rendezvous: str, shm_dir: str, shared_memory: bool
+) -> None:
     torch.set_num_threads(1)
     dist.init_process_group(
         "gloo",
@@ -61,45 +64,76 @@ def _worker(rank: int, size: int, rendezvous: str, shm_dir: str) -> None:
             _HEAD_SIZES,
             block_size=_BLOCK,
             cpu_offload=True,
-            dp_shared_memory=True,
+            dp_shared_memory=shared_memory,
         )
-        # Every replica keeps all (TP-local) heads and needs no DP exchange.
-        assert emb.dp_size == 1
-        assert emb.part_n_hash_cols == len(_HEAD_SIZES)
-        assert emb.part_num_embeddings == sum(_HEAD_SIZES)
+        shards = 1 if shared_memory else size
+        assert emb.dp_size == shards
+        assert emb.part_n_hash_cols == len(_HEAD_SIZES) // shards
+        assert emb.part_num_embeddings == sum(_HEAD_SIZES) // shards
         dist.barrier()
         # The leader unlinks the backing file once every rank has mapped it.
         assert os.listdir(shm_dir) == []
 
-        weight, scales = _table(emb.part_num_embeddings)
-        start, rows = common_engram._shared_row_range(emb.part_num_embeddings, group)
+        weight, scales = _table(sum(_HEAD_SIZES))
+        start, rows = (
+            common_engram._shared_row_range(emb.part_num_embeddings, group)
+            if shared_memory
+            else (emb.vocab_start_idx, emb.part_num_embeddings)
+        )
         # Run:AI streams only this rank's row slice; the other loader sees
         # the full table. Both write disjoint ranges of one mapping.
         loaded = weight.narrow(0, start, rows) if rank == 0 else weight
         emb.weight.weight_loader(emb.weight, loaded)
         emb.weight_scale_inv.weight_loader(emb.weight_scale_inv, scales)
-        assert torch.equal(emb.weight.view(torch.uint8), weight.view(torch.uint8))
-        assert torch.equal(emb.weight_scale_inv, scales)
+        local_weight = weight.narrow(0, emb.vocab_start_idx, emb.part_num_embeddings)
+        local_scales = scales.narrow(0, emb.vocab_start_idx, emb.part_num_embeddings)
+        assert torch.equal(emb.weight.view(torch.uint8), local_weight.view(torch.uint8))
+        assert torch.equal(emb.weight_scale_inv, local_scales)
 
-        # Each replica looks up its own tokens in the shared table.
-        ids = torch.tensor([[1 + rank, 9, 17, 25 + rank], [0, 8, 16, 24]])
-        raw = torch.empty(2, len(_HEAD_SIZES), _DIM, dtype=torch.uint8)
-        out_scales = torch.empty(2, len(_HEAD_SIZES), _DIM // _BLOCK, dtype=torch.uint8)
-        emb.gather_raw(ids, raw, out_scales)
-        assert torch.equal(raw, weight.view(torch.uint8)[ids])
-        assert torch.equal(out_scales, scales[ids])
+        host_engram.get_engram_dp_group = lambda: group
+        host_engram.get_dp_group = lambda: group
+        host_engram.is_forward_context_available = lambda: True
+        context = SimpleNamespace(additional_kwargs={}, dp_metadata=object())
+        host_engram.get_forward_context = lambda: context
+        engram = object.__new__(common_engram.Engram)
+        torch.nn.Module.__init__(engram)
+        engram.embed_tokens = emb
+        engram._init_staging(2, _DIM)
+        for counts in ((2, 1), (1, 2), (0, 2), (2, 0), (2, 1)):
+            context.additional_kwargs["tpu_num_tokens_across_dp_cpu"] = counts
+            ids = torch.tensor(
+                [[1 + rank, 9, 17, 25 + rank], [0, 8, 16, 24]], dtype=torch.int32
+            )[: counts[rank]]
+            gathered = host_engram.gather_host_engram_hashes(
+                ids,
+                dp_shared_memory=shared_memory,
+                gather_fn=upstream.gather_engram_hashes,
+            )
+            if shared_memory:
+                assert torch.equal(gathered, ids)
+            else:
+                assert gathered.shape[0] == size * max(counts)
+            pending = engram.start_prepare_embeddings(gathered)
+            assert (pending.exchange is None) is shared_memory
+            engram.finish_prepare_embeddings(pending)
+            actual = engram._ready_rows(ids.shape[0])
+            expected = common_engram.dequant_fp8_rows(
+                weight.view(torch.uint8)[ids.long()], scales[ids.long()], _BLOCK
+            )
+            assert torch.equal(actual, expected)
     finally:
         dist.destroy_process_group()
 
 
 @pytest.mark.cpu_test
-def test_dp_shared_table_maps_once_and_loads_disjoint_ranges(tmp_path):
+@pytest.mark.parametrize("shared_memory", [False, True])
+def test_dp_host_table_loading_and_staging(tmp_path, shared_memory):
     shm_dir = tmp_path / "shm"
     shm_dir.mkdir()
     size = 2
     mp.spawn(
         _worker,
-        args=(size, (tmp_path / "gloo").as_uri(), str(shm_dir)),
+        args=(size, (tmp_path / "gloo").as_uri(), str(shm_dir), shared_memory),
         nprocs=size,
     )
 

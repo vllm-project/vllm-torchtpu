@@ -35,11 +35,11 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram import (
     _async_source_tokens_cpu,
     _resolve_decode_lookback_cpu,
     capture_host_engram_inputs,
+    gather_host_engram_hashes,
     install_host_engram_inputs,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import (
     DeepseekV41Model,
-    _stage_engram_layers,
 )
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
@@ -244,6 +244,86 @@ class TestHostEngram:
         runner._pre_async_results.req_id_to_index_copy = {"other": 0}
         cap_no_match = capture_host_engram_inputs(runner, 3)
         assert cap_no_match.can_hash_on_host is True
+
+    def test_gather_host_engram_hashes_all_branches(self):
+        hashes = torch.tensor([[[1, 2]]], dtype=torch.int32)  # [1, 1, 2]
+
+        # 1. Fallback to default gather_engram_hashes when dp_shared_memory=True
+        with patch(
+            "vllm.models.deepseek_v41.common.engram.gather_engram_hashes",
+            side_effect=lambda x, **kw: x,
+        ) as mock_default_gather:
+            out = gather_host_engram_hashes(hashes, dp_shared_memory=True)
+            assert torch.equal(out, hashes)
+            mock_default_gather.assert_called_once()
+
+        # 2. CPU group all_gather with dp_metadata (padding, exact, and ValueError)
+        fake_dp_group = SimpleNamespace(world_size=2, cpu_group="fake_cpu_group")
+
+        def fake_all_gather(out_t, in_t, group=None):
+            out_t.copy_(torch.cat([in_t, in_t], dim=0))
+
+        with (
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.get_engram_dp_group",
+                return_value=fake_dp_group,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.is_forward_context_available",
+                return_value=True,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.get_forward_context",
+                return_value=SimpleNamespace(dp_metadata=object()),
+            ),
+            patch(
+                "torch.distributed.all_gather_into_tensor",
+                side_effect=fake_all_gather,
+            ),
+        ):
+            # 2a. Padding when shape[0] < slot
+            with patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.engram_gathered_num_tokens",
+                return_value=3,
+            ):
+                out_pad = gather_host_engram_hashes(hashes)
+                assert out_pad.shape == (6, 1, 2)
+
+            # 2b. Exact slot when shape[0] == slot
+            with patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.engram_gathered_num_tokens",
+                return_value=1,
+            ):
+                out_exact = gather_host_engram_hashes(hashes)
+                assert out_exact.shape == (2, 1, 2)
+
+            # 2c. ValueError when shape[0] > slot
+            with (
+                patch(
+                    "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.engram_gathered_num_tokens",
+                    return_value=0,
+                ),
+                pytest.raises(ValueError, match="exceeds the DP token slot"),
+            ):
+                gather_host_engram_hashes(hashes)
+
+        # 3. CPU group all_gather without forward context (dp_metadata is None)
+        with (
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.get_engram_dp_group",
+                return_value=fake_dp_group,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.is_forward_context_available",
+                return_value=False,
+            ),
+            patch(
+                "torch.distributed.all_gather_into_tensor",
+                side_effect=fake_all_gather,
+            ),
+        ):
+            out_no_ctx = gather_host_engram_hashes(hashes)
+            assert out_no_ctx.shape == (2, 1, 2)
 
 
 # ==============================================================================
@@ -459,82 +539,43 @@ class TestEngramModuleStagingAndEmbed:
         engram.embed_tokens = embed_tokens
         return engram
 
-    def test_dp_shared_staging_uploads_only_local_tokens(self):
-        # A DP-shared table holds every TP head, so each replica gathers and
-        # uploads only its own tokens, exactly as with DP1.
+    def test_dp_staging_uploads_only_local_tokens(self, monkeypatch):
+        from vllm_torchtpu.models.vllm.deepseek_v41.common import engram as common
+
         engram = self._create_mock_engram(cpu_offload=True)
-        engram.embed_tokens.part_n_hash_cols = 16
+        engram.embed_tokens.dp_size = 8
         engram.embed_tokens.n_hash_cols = 16
         engram._init_staging(max_tokens=16, head_dim=32)
         assert engram._host_raw.shape == (16, 16, 32)
         assert not hasattr(engram, "staged_rows")
+        group = SimpleNamespace(world_size=8, cpu_group=object())
+        monkeypatch.setattr(common.upstream, "get_engram_dp_group", lambda: group)
 
         def gather(ids, raw, scales):
-            assert raw.shape == (ids.shape[0], 16, 32)
+            assert raw.shape == (ids.shape[0], 2, 32)
             raw.fill_(56)  # E4M3 1.0
             scales.fill_(127)
 
+        def exchange(raw, scales, cpu_group, size):
+            assert cpu_group is group.cpu_group and size == 8
+            # Exchange correctness is covered by the real Gloo regression.
+            tokens = raw.shape[0] // size
+            return SimpleNamespace(
+                wait=lambda: (
+                    raw[:tokens].repeat(1, size, 1),
+                    scales[:tokens].repeat(1, size, 1),
+                )
+            )
+
         engram.embed_tokens.gather_raw = gather
+        monkeypatch.setattr(common, "start_exchange_rows", exchange)
         for tokens in (16, 8, 16):
-            engram.prepare_embeddings(torch.zeros(tokens, 16, dtype=torch.int32))
+            engram.prepare_embeddings(torch.zeros(tokens * 8, 16, dtype=torch.int32))
             rows = engram._ready_rows(tokens)
             assert rows.shape == (tokens, 16, 32)
             assert torch.equal(rows, torch.ones_like(rows))
             assert engram._active_raw.numel() * 4 == tokens * 16 * (32 + 2)
         assert len(engram._staged_by_tokens) == 2
-
-    def test_model_staging_reuses_bucket_buffers_and_updates_rows(self):
-        engram = self._create_mock_engram(cpu_offload=True)
-        engram.layer_hash_index = 0
-        engram.embed_tokens.part_n_hash_cols = 3
-        engram.embed_tokens.n_hash_cols = 3
-        engram._init_staging(8, 32)
-        table = torch.arange(16 * 32).reshape(16, 32).remainder(8).add(1)
-        raw = table.to(torch.float8_e4m3fn).view(torch.uint8)
-        scales = torch.arange(16).remainder(3).add(126).to(torch.uint8)
-
-        def gather(ids, output, output_scales):
-            output.copy_(raw[ids.long()])
-            output_scales.copy_(scales[ids.long(), None].expand(*ids.shape, 2))
-
-        engram.embed_tokens.gather_raw = gather
-        buffers = {}
-        with torch.inference_mode():
-            for step, tokens in enumerate((1, 5, 2, 8, 1, 5)):
-                hashes = (torch.arange(tokens * 3).reshape(tokens, 1, 3) + step) % 16
-                _stage_engram_layers([SimpleNamespace(engram=engram)], hashes)
-                staged = engram._staged_tensors(tokens)
-                if tokens in buffers:
-                    assert staged is buffers[tokens]
-                buffers[tokens] = staged
-                assert engram._active_raw.untyped_storage().data_ptr() == (
-                    staged.untyped_storage().data_ptr()
-                )
-                values = torch.arange(32).remainder(8).add(1).float()
-                powers = torch.pow(2.0, hashes[:, 0].remainder(3).float() - 1)
-                expected = (values * powers[..., None]).to(torch.bfloat16)
-                assert torch.equal(engram._ready_rows(tokens), expected)
-
-    def test_model_staging_finishes_lookups_before_cached_uploads(self, monkeypatch):
-        order = []
-        layers = []
-        for index in (0, 1):
-            engram = self._create_mock_engram(cpu_offload=True)
-            engram.layer_hash_index = index
-            layers.append(SimpleNamespace(engram=engram))
-
-        def start(engram, hashes):
-            order.append(("lookup", engram.layer_hash_index))
-            return hashes.shape[0]
-
-        def finish(engram, tokens):
-            assert tokens == 2
-            order.append(("copy", engram.layer_hash_index))
-
-        monkeypatch.setattr(Engram, "start_prepare_embeddings", start)
-        monkeypatch.setattr(Engram, "finish_prepare_embeddings", finish)
-        _stage_engram_layers(layers, torch.zeros((2, 2, 3)))
-        assert order == [("lookup", 0), ("lookup", 1), ("copy", 0), ("copy", 1)]
 
     def test_init_staging_cpu_offload_false_and_true(self):
         # cpu_offload = False
@@ -667,6 +708,68 @@ class TestEngramModuleStagingAndEmbed:
 
 
 class TestModelEngramPreparation:
+    def test_prepare_all_host_tables_before_waiting_and_uploading(self, monkeypatch):
+        from vllm_torchtpu.models.vllm.deepseek_v41.common import engram as common
+        from vllm_torchtpu.models.vllm.deepseek_v41.v2 import model as model_module
+
+        model = self._create_mock_model(use_slot_cache=False)
+        model.end_layer = 2
+        model.engram_dp_shared_memory = False
+        model.engram_hash.ensure_cache = lambda: False
+        issued = []
+        group = SimpleNamespace(world_size=2, cpu_group=object())
+        monkeypatch.setattr(common.upstream, "get_engram_dp_group", lambda: group)
+        monkeypatch.setattr(model_module.upstream, "get_engram_dp_size", lambda: 2)
+        monkeypatch.setattr(
+            model_module, "gather_host_engram_hashes", lambda hashes, **kw: hashes
+        )
+        monkeypatch.setattr(
+            model_module.upstream, "is_forward_context_available", lambda: True
+        )
+        monkeypatch.setattr(
+            model_module.upstream,
+            "get_forward_context",
+            lambda: SimpleNamespace(attn_metadata={}),
+        )
+
+        def gather(ids, raw, scales):
+            raw.fill_(56 + 8 * int(ids[0, 0]))  # FP8 1.0 or 2.0.
+            scales.fill_(127)
+
+        def exchange(raw, scales, cpu_group, size):
+            issued.append(int(raw[0, 0, 0]))
+
+            def wait():
+                assert issued == [56, 64]
+                tokens = raw.shape[0] // size
+                return (
+                    raw[:tokens].repeat(1, size, 1),
+                    scales[:tokens].repeat(1, size, 1),
+                )
+
+            return SimpleNamespace(wait=wait)
+
+        monkeypatch.setattr(common, "start_exchange_rows", exchange)
+        stagers = []
+        for index in range(2):
+            engram = TestEngramModuleStagingAndEmbed()._create_mock_engram(True)
+            engram.layer_hash_index = index
+            engram.embed_tokens.dp_size = 2
+            engram.embed_tokens.gather_raw = gather
+            engram._init_staging(7, 32)
+            stagers.append(engram)
+        model.layers = [SimpleNamespace(engram=e) for e in stagers]
+
+        for tokens in (7, 2, 7):
+            issued.clear()
+            hashes = torch.tensor([0, 1]).view(1, 2, 1).expand(tokens * 2, 2, 4)
+            model.engram_hash.dummy_hashes = lambda ids, hashes=hashes: (hashes, None)
+            model._prepare_engram(torch.arange(tokens), torch.arange(tokens), None)
+            for index, engram in enumerate(stagers):
+                rows = engram._ready_rows(tokens)
+                assert rows.shape == (tokens, 4, 32)
+                assert torch.equal(rows, torch.full_like(rows, index + 1))
+
     def _create_mock_model(
         self,
         cpu_offload: bool = True,

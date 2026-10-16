@@ -116,13 +116,22 @@ Use the existing benchmark flow with
 That configuration sets the V4.1 gather workaround explicitly, without changing
 other models' automatic libtpu flags.
 
-v2 DP (TP1, EP, `TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD=1`) requires
-`engram_config.dp_shared_memory`, which vLLM enables by default for DP. The DP
-replicas on a node map one copy of each host Engram table from `/dev/shm`, and
-each replica looks up only its own tokens, so a step has no Engram DP
-collective. `/dev/shm` must hold every table (about 190 GiB for
-DeepSeek-V4.1-Flash) in addition to other users such as the compilation cache.
-When it cannot, vLLM disables sharing and the model refuses to start.
+v2 DP (TP1, EP, `TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD=1`) supports both host
+Engram table layouts through the existing `engram_config.dp_shared_memory`:
+
+- When enabled, node-local DP replicas map one copy of each host Engram table
+  from `/dev/shm`. Each replica looks up only its own tokens, so a step has no
+  Engram DP collective. The replicas must access the same shared-memory files,
+  and `/dev/shm` must hold every table (about 190 GiB for DeepSeek-V4.1-Flash)
+  in addition to other users such as the compilation cache.
+- When disabled, each replica holds its own head shard. The original CPU
+  hashes gather and row exchange assemble each replica's rows before H2D.
+  This layout does not need a shared-memory copy of the tables.
+
+vLLM enables sharing by default for DP and disables it when `/dev/shm` cannot
+hold the tables; the non-shared path remains available in that case. Both
+layouts retain the existing encoder head/tail schedule and cached uploads,
+and require one node-local Engram group covering all DP replicas.
 
 Validation scripts and raw experiment evidence are maintained separately from
 the runtime change. Cache validation alone does not establish full-model
