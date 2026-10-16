@@ -32,7 +32,8 @@ The goal is simple: **the same vLLM you already use — same CLI, same OpenAI-co
 | TPU generation | Status |
 | :--- | :--- |
 | **TPU v7x (Ironwood)** | Recommended — validated in CI on every pull request and nightly |
-| TPU v6e / v5e / v5p | Experimental — not covered by CI |
+| **TPU v6e (Trillium)** | Supported — not covered by CI |
+| TPU v5e / v5p | Experimental — not covered by CI |
 
 See [Cloud TPU Setup](docs/getting_started/tpu_setup.md) for project setup, quota, and provisioning commands.
 
