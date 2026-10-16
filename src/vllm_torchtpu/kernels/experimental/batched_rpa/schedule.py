@@ -214,7 +214,9 @@ class RpaSchedule:
     is_last_k: SmemWrapper  # [steps, batch]
     do_writeback: SmemWrapper  # [steps, batch]
     dma_q: SmemWrapper  # [steps, batch, 2]
-    dma_kv_cache: SmemWrapper  # [steps, batch, bkv_p_cache, 3]
+    # [steps, batch, 2]: (page_indices offset of the block's first page, cached
+    # tokens). Under CP, [steps, batch, bkv_p_cache, 3] per page.
+    dma_kv_cache: SmemWrapper
     dma_kv_new: SmemArrayOfStructs  # [steps, batch, bkv_p_new]
     total_wait_kv_in: SmemWrapper  # [steps]
     total_wait_kv_out: SmemWrapper  # [steps]
@@ -291,16 +293,11 @@ class RpaSchedule:
             p_offset = self.dma_kv_cache[step, batch_idx, 0]
             bkv_sz_cache = self.dma_kv_cache[step, batch_idx, 1]
             dst_off = page_idx << self.cfgs.serve.page_size_log2
-            dma_sz = jnp.clip(
-                bkv_sz_cache - dst_off, 0, self.cfgs.serve.page_size
-            )
+            dma_sz = jnp.clip(bkv_sz_cache - dst_off, 0, self.cfgs.serve.page_size)
             src_off = jnp.minimum(
                 p_offset + page_idx, self.cfgs.serve.num_page_indices - 1
             )
-            if self.cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-                sz = jnp.where(dma_sz > 0, 1, 0)
-            else:
-                sz = dma_sz
+            sz = utils.align_to(dma_sz, self.cfgs.kv_token_align)
             return src_off, dst_off, sz
         # 0: src_hbm, 1: dst_vmem, 2: size
         src_off = self.dma_kv_cache[step, batch_idx, page_idx, 0]
@@ -452,35 +449,19 @@ def _compute_waits(
         # KV IN
         kv_in_tokens = 0
         for b in range(cfgs.batch_size):
-            if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-                if cfgs.bkv_p_cache > 0:
-                    if cfgs.serve.cp_group_size is None:
-                        bkv_sz_cache = schedule.dma_kv_cache[step, b, 1]
-                        kv_in_tokens += utils.align_to(
-                            bkv_sz_cache, cfgs.serve.page_size
-                        )
-                    else:
-                        for i in range(cfgs.bkv_p_cache):
-                            _, _, dma_valid = schedule.get_dma_kv_cache(step, b, i)
-                            kv_in_tokens += dma_valid * cfgs.serve.page_size
-                for i in range(cfgs.bkv_p_new):
-                    dma_entry = schedule.dma_kv_new[step, b, i]
-                    kv_in_tokens += jnp.where(
-                        dma_entry.fetch_val > 0, cfgs.serve.page_size, 0
-                    )
+            if cfgs.bkv_p_cache > 0 and cfgs.serve.cp_group_size is None:
+                # The per-page fetches `get_dma_kv_cache` derives from the
+                # compact entry sum to the block's cached token count rounded up
+                # to kv_token_align, which divides page_size.
+                kv_in_tokens += utils.align_to(
+                    schedule.dma_kv_cache[step, b, 1], cfgs.kv_token_align
+                )
             else:
-                if cfgs.bkv_p_cache > 0:
-                    if cfgs.serve.cp_group_size is None:
-                        kv_in_tokens += schedule.dma_kv_cache[step, b, 1]
-                    else:
-                        for i in range(cfgs.bkv_p_cache):
-                            _, _, sz = schedule.get_dma_kv_cache(step, b, i)
-                            kv_in_tokens += sz
-                total_new_sz = 0
-                for i in range(cfgs.bkv_p_new):
-                    dma_entry = schedule.dma_kv_new[step, b, i]
-                    total_new_sz += dma_entry.fetch_val
-                kv_in_tokens += total_new_sz
+                for i in range(cfgs.bkv_p_cache):
+                    _, _, sz = schedule.get_dma_kv_cache(step, b, i)
+                    kv_in_tokens += sz
+            for i in range(cfgs.bkv_p_new):
+                kv_in_tokens += schedule.dma_kv_new[step, b, i].fetch_val
 
         schedule.total_wait_kv_in[step] = (
             kv_in_tokens * kv_bytes_per_token
@@ -707,19 +688,13 @@ class BaseMetadataComputer:
                     dma_sz = kv_left_frm_cache - dst_vmem
                     dma_sz = jnp.clip(dma_sz, 0, cfgs.serve.page_size)
 
-                    src_hbm = jnp.minimum(
-                        p_offset + i, cfgs.serve.num_page_indices - 1
-                    )
+                    src_hbm = jnp.minimum(p_offset + i, cfgs.serve.num_page_indices - 1)
 
-                    if cfgs.serve.kv_layout == configs.KVLayout.SEQ_ALONG_LANE:
-                        dma_valid = jnp.where(dma_sz > 0, 1, 0)
-                        schedule.dma_kv_cache[step, target_lane, i, 0] = src_hbm
-                        schedule.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
-                        schedule.dma_kv_cache[step, target_lane, i, 2] = dma_valid
-                    else:
-                        schedule.dma_kv_cache[step, target_lane, i, 0] = src_hbm
-                        schedule.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
-                        schedule.dma_kv_cache[step, target_lane, i, 2] = dma_sz
+                    schedule.dma_kv_cache[step, target_lane, i, 0] = src_hbm
+                    schedule.dma_kv_cache[step, target_lane, i, 1] = dst_vmem
+                    schedule.dma_kv_cache[step, target_lane, i, 2] = utils.align_to(
+                        dma_sz, cfgs.kv_token_align
+                    )
 
         new_sz = jnp.minimum(cfgs.bkv_sz - bkv_sz_cache, kv_left_frm_new)
 
