@@ -111,6 +111,11 @@ shared quantization registry; it does not select NVFP4 for this model.
 
 ## Launch and validation
 
+DSpark loading uses the draft model configuration for both model construction
+and the active vLLM context. EP weight filtering reads that context to select
+the draft expert count (`dspark_n_routed_experts`); using the target context
+can omit local draft weights when the two expert counts differ.
+
 Use the existing benchmark flow with
 `scripts/vllm/benchmarking/configs/deepseek-v41-flash-tp8-ep.sh`.
 That configuration sets the V4.1 gather workaround explicitly, without changing

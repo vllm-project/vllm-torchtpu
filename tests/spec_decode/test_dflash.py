@@ -91,6 +91,48 @@ def _fake_gather_sharded_weight(module):
     return weight, weight.shape[0], weight.shape[1], weight.device
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("draft_tp", [1, 8])
+def test_draft_loader_uses_own_model_config(draft_tp):
+    """Expert filtering and model construction must see the same draft config."""
+    proposer = _make_proposer(draft_tp=draft_tp, target_tp=8)
+    proposer.runner = SimpleNamespace(
+        mesh=object(),
+        num_reqs_paddings=[1, 8],
+        num_reqs_max_model_len=8,
+        num_reqs_most_model_len=None,
+    )
+    proposer.vllm_config.load_config = object()
+    target_config = proposer.vllm_config.model_config
+    draft_config = proposer.speculative_config.draft_model_config
+    target_config.runner_type = "generate"
+    draft_config.runner_type = "generate"
+    draft_model = object()
+
+    with (
+        mock.patch.object(dflash_module, "get_model_loader") as get_loader,
+        mock.patch.object(dflash_module, "set_current_vllm_config") as set_config,
+        mock.patch.object(dflash_module, "set_model_tag"),
+        mock.patch.object(dflash_module, "set_vllm_model_wrapper_context"),
+        mock.patch.object(dflash_module, "_force_draft_tp1"),
+    ):
+        loader = get_loader.return_value
+        loader.load_model.return_value = draft_model
+        proposer._load_draft_model()
+
+    loaded_config = loader.load_model.call_args.kwargs["vllm_config"]
+    loaded_model_config = loader.load_model.call_args.kwargs["model_config"]
+    set_config.assert_called_once_with(loaded_config)
+    assert loaded_config is not proposer.vllm_config
+    assert loaded_config.model_config is loaded_model_config
+    assert loaded_model_config is not draft_config
+    assert loaded_model_config.hf_config is draft_config.hf_config
+    assert loaded_model_config.runner_type == "draft"
+    assert proposer.vllm_config.model_config is target_config
+    assert target_config.runner_type == draft_config.runner_type == "generate"
+    assert proposer.draft_model is draft_model
+
+
 @pytest.mark.parametrize("draft_tp,target_tp", [(1, 1), (1, 8), (8, 8)])
 def test_load_model_vocab_weights_follow_tp_layout(draft_tp, target_tp, monkeypatch):
     proposer = _make_proposer(draft_tp=draft_tp, target_tp=target_tp)

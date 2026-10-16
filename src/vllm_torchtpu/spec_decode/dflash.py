@@ -253,6 +253,8 @@ class DFlashProposer:
         draft_vllm_config = copy.copy(self.vllm_config)
         draft_model_config = copy.copy(self.speculative_config.draft_model_config)
         draft_model_config.runner_type = "draft"
+        # Fetch-time expert filtering reads the active model configuration.
+        draft_vllm_config.model_config = draft_model_config
         draft_vllm_config.compilation_config = copy.copy(
             self.vllm_config.compilation_config
         )
