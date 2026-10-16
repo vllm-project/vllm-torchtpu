@@ -356,12 +356,13 @@ def calculate_block_sizes(
         )
 
         # Step 3: Sum up all memory usage.
-        total_bytes = buffer_bytes + compute_bytes
-
-        # Account for batch size.
-        total_bytes *= batch_size
         if is_decode:
+            # Pipeline buffers are allocated per batch item, whereas active
             # compute tiles are live for one batch item at a time.
+            total_bytes = buffer_bytes * batch_size + compute_bytes
+        else:
+            # Account for batch size.
+            total_bytes = (buffer_bytes + compute_bytes) * batch_size
 
         # Online-softmax scratch (m, l, and the output accumulator)
         lm_array_size = (
