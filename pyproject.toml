@@ -225,10 +225,10 @@ project-includes = ["src"]
 preset = "default"
 baseline = ".pyrefly-baseline.json"
 
-# Entries match on file, error kind, and message text. A baselined error keeps
-# matching when lines move, and a new error of the same kind next to it is
-# still reported. The baseline can hide only an exact repeat of a recorded
-# message in the same file.
+# Entries match on file, error kind, and message text, so a baselined error
+# keeps matching when lines move. pyrefly lets one entry cover every repeat of
+# its message in a file; both checks run through tools/check_pyrefly_baseline.py,
+# which also requires one entry per error.
 baseline-matching-mode = "concise-description"
 baseline-format = "minimal"
 

@@ -9,6 +9,12 @@ Two pyrefly checks gate every PR:
   in the CI image, where calls into torch, jax and vllm are checked against
   their real signatures. Its baseline is `.pyrefly-baseline-full.json`.
 
+Both checks run pyrefly through `tools/check_pyrefly_baseline.py`, which
+counts: each error needs its own baseline entry, and each entry needs its own
+error, matched on file, error kind and message. pyrefly's own baseline
+matching lets one entry cover every repeat of its message in a file, so on its
+own it would not notice a fixed error coming back.
+
 Run ruff and pyrefly through pre-commit, not from `PATH`: a `ruff` or
 `pyrefly` on `PATH` may differ from the pinned version and report different
 results.
@@ -64,7 +70,10 @@ TYPECHECK_IMAGE=us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torch
 
 ## Fixing a new error
 
-When either check reports a new error:
+When either check reports a new error, it prints the file, the error kind
+and message, how many times the baseline lists that message, how many times
+pyrefly found it, and the lines. If the message was already listed, any of
+those lines can be the new one.
 
 - Fix the code. Do not add new errors to either baseline.
 - Keep runtime behavior unchanged. Do not add `try`/`except` or fallback
@@ -84,10 +93,11 @@ When either check reports a new error:
 ## Regenerating the baselines
 
 Regenerate the baselines only to remove entries for errors your change fixed.
-A stale entry does not fail the checks, but it can hide a later error with the
-same message in the same file. Regenerating records every current error, so
-first make both checks pass without it. Then regenerate and run pre-commit
-(pyrefly writes the files without a trailing newline):
+A change that fixes an error must delete its entry: an entry with no matching
+error fails the check, because it would hide the next error with the same
+message in that file. Regenerating records every current error, so first fix
+every error the checks report as not covered. Then regenerate and run
+pre-commit (pyrefly writes the files without a trailing newline):
 
 ```bash
 uvx pyrefly@1.3.0 check --update-baseline

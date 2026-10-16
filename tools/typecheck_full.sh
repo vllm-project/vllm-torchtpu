@@ -65,10 +65,20 @@ uv pip install --system --quiet pyrefly==1.3.0
 site_packages="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
 
 status=0
-pyrefly check \
-  --site-package-path "${site_packages}" \
-  --baseline .pyrefly-baseline-full.json \
-  "$@" || status=$?
+if [[ " $* " == *" --update-baseline "* ]]; then
+  pyrefly check \
+    --site-package-path "${site_packages}" \
+    --baseline .pyrefly-baseline-full.json \
+    "$@" || status=$?
+else
+  # pyrefly's own baseline check lets a listed message repeat any number of
+  # times in a file; the script also compares the counts.
+  python3 tools/check_pyrefly_baseline.py \
+    --baseline .pyrefly-baseline-full.json \
+    --update-command "bash tools/typecheck_full.sh --update-baseline" \
+    --site-package-path "${site_packages}" \
+    "$@" || status=$?
+fi
 
 # As root in a container, `--update-baseline` writes the file as root; give it
 # the owner of the checkout.

@@ -22,6 +22,11 @@
     },
     {
       "path": "src/vllm_torchtpu/__init__.py",
+      "name": "bad-assignment",
+      "concise_description": "`property` is not assignable to attribute `use_sequence_parallel_moe` with type `(self: ParallelConfig) -> bool`"
+    },
+    {
+      "path": "src/vllm_torchtpu/__init__.py",
       "name": "missing-attribute",
       "concise_description": "Class `EngineCoreProc` has no class attribute `_tpu_original_run_engine_core`"
     },
@@ -166,11 +171,6 @@
       "concise_description": "`descriptors` may be uninitialized"
     },
     {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector_stats.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of type `Counter | Gauge | Histogram` has no attribute `set`"
-    },
-    {
       "path": "src/vllm_torchtpu/distributed/pcp_rank_order.py",
       "name": "missing-attribute",
       "concise_description": "No attribute `tpu` in module `torch`"
@@ -261,16 +261,6 @@
       "concise_description": "Class member `RoPEOutputRef.wait_out` overrides parent class `_BufferedRef` in an inconsistent manner"
     },
     {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/compress_and_store/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `global_idx` with type `int` in function `vllm_torchtpu.kernels.deepseek_v4.compress_and_store.compute.gather_from_page_buffer`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/core_attention/csa_gather.py",
-      "name": "not-iterable",
-      "concise_description": "Type `[_T](...) -> _T` is not iterable"
-    },
-    {
       "path": "src/vllm_torchtpu/kernels/deepseek_v4/core_attention/csa_gather.py",
       "name": "bad-argument-count",
       "concise_description": "Expected 1 positional argument, got 4"
@@ -337,6 +327,11 @@
     },
     {
       "path": "src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py",
+      "name": "unsupported-operation",
+      "concise_description": "`<` is not supported between `None` and `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `(i: Unknown, woff: Unknown) -> Unknown` is not assignable to parameter with type `(Array) -> None`"
     },
@@ -344,21 +339,6 @@
       "path": "src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py",
       "name": "bad-argument-count",
       "concise_description": "Expected 1 positional argument, got 2"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py",
-      "name": "not-iterable",
-      "concise_description": "Type `XlaMetadataContextManager` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py",
-      "name": "not-iterable",
-      "concise_description": "Type `[_T](...) -> _T` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/deepseek_v4/sparsecore_topk.py",
-      "name": "not-iterable",
-      "concise_description": "Type `None` is not iterable"
     },
     {
       "path": "src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk/bref_override.py",
@@ -409,6 +389,16 @@
       "path": "src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk/dcp_sc_compact.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `(i: Unknown, woff: Unknown) -> Unknown` is not assignable to parameter with type `(Array) -> None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk/dcp_sc_compact.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `(i: Unknown, woff: Unknown) -> Unknown` is not assignable to parameter with type `(Array) -> None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk/dcp_sc_compact.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `FunctionType` has no attribute `reshape`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/deepseek_v4/streamindex_topk/dcp_sc_compact.py",
@@ -546,34 +536,9 @@
       "concise_description": "Argument `float | None` is not assignable to parameter `sm_scale` with type `float` in function `vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper.sharded_pcp_ragged_paged_attention`"
     },
     {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/layer.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `int` has no attribute `astype`"
-    },
-    {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
       "name": "bad-override",
       "concise_description": "Class member `BaseBufferedRef.create` overrides parent class `BufferedRef` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `tuple[BufferedRef, BufferedRef, BufferedRef, BufferedRef, BufferedRef, BufferedRef]` is not assignable to declared return type `tuple[InBufferedRef, InBufferedRef, InBufferedRef, StateBufferedRef, StateBufferedRef, OutBufferedRef]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `ndim`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `ndim`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `shape`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
@@ -604,16 +569,6 @@
       "path": "src/vllm_torchtpu/kernels/gdn/v3/vmem_ldst.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `Ref` has no attribute `reshape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `astype`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `reshape`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
@@ -757,11 +712,6 @@
     },
     {
       "path": "src/vllm_torchtpu/kernels/megablox/moe_onehot_unpermute.py",
-      "name": "unexpected-keyword",
-      "concise_description": "Unexpected keyword argument `scratches` in function `jax._src.pallas.mosaic.pipeline.wrapped`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/moe_onehot_unpermute.py",
       "name": "bad-assignment",
       "concise_description": "`Literal[128]` is not assignable to dict value type `str`"
     },
@@ -781,24 +731,9 @@
       "concise_description": "`int` is not assignable to dict value type `str`"
     },
     {
-      "path": "src/vllm_torchtpu/kernels/mla/dispatch.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `tuple[int, ...]` is not assignable to parameter `limits` with type `tuple[int, int]` in function `_masked_dense_prefill_cost_tier`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/mla/masked_dense/csa_mask.py",
-      "name": "unsupported-operation",
-      "concise_description": "`<callable>` is not subscriptable"
-    },
-    {
       "path": "src/vllm_torchtpu/kernels/mla/scatter_utils.py",
       "name": "bad-argument-count",
       "concise_description": "Expected 1 positional argument, got 3"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/mla/sparse/dsa_gather.py",
-      "name": "not-iterable",
-      "concise_description": "Type `[_T](...) -> _T` is not iterable"
     },
     {
       "path": "src/vllm_torchtpu/kernels/mla/sparse/dsa_gather.py",
@@ -831,11 +766,6 @@
       "concise_description": "Argument `float` is not assignable to parameter `copy` with type `bool` in function `jax.numpy.nan_to_num`"
     },
     {
-      "path": "src/vllm_torchtpu/kernels/sparse_core/core_map_helper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `AbstractValue` has no attribute `memory_space`"
-    },
-    {
       "path": "src/vllm_torchtpu/kernels/sparse_core/ragged_gather.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `Ref` has no attribute `bitcast`"
@@ -874,11 +804,6 @@
       "path": "src/vllm_torchtpu/kernels/sparse_core/ragged_gather_reduce_v3.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `Ref` is not assignable to parameter `ref` with type `AbstractRef | TransformedRef` in function `jax._src.pallas.mosaic.sc_primitives.addupdate_scatter`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/sparse_core/ragged_gather_reduce_v3.py",
-      "name": "unexpected-keyword",
-      "concise_description": "Unexpected keyword argument `scratches` in function `jax._src.pallas.mosaic.pipeline.wrapped`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/sparse_core/ragged_gather_v2.py",
@@ -909,11 +834,6 @@
       "path": "src/vllm_torchtpu/layers/adapter/attention.py",
       "name": "bad-return",
       "concise_description": "Function declared to return `tuple[Tensor, Tensor | None]` but is missing an explicit `return`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/custom_ops/deepseek_v4/deepseek_v4_compressor.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array | None` is not assignable to parameter `rope_cache` with type `Array` in function `vllm_torchtpu.kernels.deepseek_v4.compress_and_store.compressor_v1.compressor_forward`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/custom_ops/deepseek_v4/deepseek_v4_compressor.py",
@@ -952,11 +872,6 @@
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/custom_ops/gdn_attention_op.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `Tensor`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/custom_ops/gdn_attention_op.py",
       "name": "bad-override",
       "concise_description": "Class member `VllmGatedDeltaNetAttention.get_state_shape` overrides parent class `QwenGatedDeltaNetAttention` in an inconsistent manner"
     },
@@ -979,11 +894,6 @@
       "path": "src/vllm_torchtpu/layers/adapter/custom_ops/gdn_attention_op.py",
       "name": "not-callable",
       "concise_description": "Expected a callable, got `Tensor`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/custom_ops/kda_attention_op.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/custom_ops/mla_attention_op.py",
@@ -1174,11 +1084,6 @@
       "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/moe.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `None` is not assignable to parameter `value` with type `Module | Tensor` in function `torch.nn.modules.module.Module.__setattr__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `RotaryEmbedding | None` is not assignable to parameter `rotary_emb` with type `Module` in function `vllm.model_executor.layers.mla.MLAModules.__init__`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
@@ -1417,11 +1322,6 @@
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "missing-attribute",
-      "concise_description": "No attribute `tpu` in module `torch`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "bad-assignment",
       "concise_description": "`(batch: Unknown) -> PoolingMetadata` is not assignable to attribute `get_pooling_metadata` with type `(self: InputBatch) -> PoolingMetadata`"
     },
@@ -1487,11 +1387,6 @@
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `Tensor`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
       "name": "bad-override-mutable-attribute",
       "concise_description": "Class member `TPUModelRunner.sample_tokens` overrides parent class `GPUModelRunner` in an inconsistent manner"
     },
@@ -1546,9 +1441,9 @@
       "concise_description": "Expected a callable, got `Tensor`"
     },
     {
-      "path": "src/vllm_torchtpu/runner/tpu_runner.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `Tensor`"
+      "path": "src/vllm_torchtpu/runner/tpu_runner_async_output.py",
+      "name": "missing-attribute",
+      "concise_description": "No attribute `tpu` in module `torch`"
     },
     {
       "path": "src/vllm_torchtpu/runner/tpu_runner_async_output.py",
@@ -1557,16 +1452,21 @@
     },
     {
       "path": "src/vllm_torchtpu/spec_decode/dflash.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `PallasAttentionBackendImpl` has no attribute `layer_idx`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/dflash.py",
       "name": "unexpected-keyword",
       "concise_description": "Unexpected keyword argument `vllm_config`"
     },
     {
       "path": "src/vllm_torchtpu/spec_decode/dflash.py",
+      "name": "unexpected-keyword",
+      "concise_description": "Unexpected keyword argument `model_config`"
+    },
+    {
+      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
+      "name": "unexpected-keyword",
+      "concise_description": "Unexpected keyword argument `vllm_config`"
+    },
+    {
+      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
       "name": "unexpected-keyword",
       "concise_description": "Unexpected keyword argument `model_config`"
     },
