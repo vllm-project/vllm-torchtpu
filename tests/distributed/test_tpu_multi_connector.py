@@ -229,3 +229,51 @@ class TestTPUMultiConnectorDivergentHitWarning:
         )
 
         assert not log.warning.called
+
+
+class TestTPUMultiConnectorHybridHitForwarding:
+    """The prefix-hit hooks PrefixAwareScheduler calls on the connector."""
+
+    @staticmethod
+    def _multi(*children):
+        connector = object.__new__(TPUMultiConnector)
+        connector._connectors = list(children)
+        return connector
+
+    def test_divergent_hits_claimed_when_any_child_supports_them(self):
+        producer = SimpleNamespace(supports_divergent_local_hybrid_hits=False)
+        offload = SimpleNamespace(supports_divergent_local_hybrid_hits=True)
+
+        assert self._multi(producer, offload).supports_divergent_local_hybrid_hits
+        assert not self._multi(producer).supports_divergent_local_hybrid_hits
+
+    def test_divergent_hit_resolved_by_first_child_with_an_answer(self):
+        disagg = SimpleNamespace()
+        declines = SimpleNamespace(resolve_divergent_local_hit_tokens=lambda *a: None)
+        offload = SimpleNamespace(
+            resolve_divergent_local_hit_tokens=MagicMock(return_value=256)
+        )
+
+        multi = self._multi(disagg, declines, offload)
+        assert multi.resolve_divergent_local_hit_tokens("req", 512, 128, 128) == 256
+        offload.resolve_divergent_local_hit_tokens.assert_called_once_with(
+            "req", 512, 128, 128
+        )
+        assert (
+            self._multi(disagg).resolve_divergent_local_hit_tokens("req", 512, 128, 128)
+            is None
+        )
+
+    def test_transfer_polls_are_summed_across_children(self):
+        scheduler = object()
+        first = SimpleNamespace(
+            poll_and_complete_transfers=MagicMock(return_value=(10, 1, 0, False))
+        )
+        second = SimpleNamespace(
+            poll_and_complete_transfers=MagicMock(return_value=(5, 0, 2, True))
+        )
+
+        multi = self._multi(first, SimpleNamespace(), second)
+        assert multi.poll_and_complete_transfers(scheduler) == (15, 1, 2, True)
+        first.poll_and_complete_transfers.assert_called_once_with(scheduler)
+        second.poll_and_complete_transfers.assert_called_once_with(scheduler)
