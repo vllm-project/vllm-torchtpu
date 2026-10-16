@@ -1978,3 +1978,5 @@ def test_pooled_input_preparation_separates_cached_ops(cpu_vllm_config_context):
         ) as dispatch:
             function(*operands)
         torch.testing.assert_close(dispatch.call_args.args[0], operands[0] + index)
+        if index == 0:
+            assert dispatch.call_args.args[0] is operands[0]
