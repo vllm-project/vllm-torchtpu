@@ -959,8 +959,14 @@ class HybridStateRetention:
 
     def evict_oldest_conversation(self) -> bool:
         """Evict the least-recently-used conversation from ``_conv_lru``
-        (or ``_fork_lru`` if ``_conv_lru`` is empty)."""
+        (preferring compacted prior-turn entries first, or ``_fork_lru`` if
+        ``_conv_lru`` is empty)."""
         if self._conv_lru:
+            prior_key = next(
+                (k for k, v in self._conv_lru.items() if v.is_prior), None
+            )
+            if prior_key is not None:
+                return self.evict_conversation(prior_key)
             oldest_key = next(iter(self._conv_lru))
             return self.evict_conversation(oldest_key)
         if self._fork_lru:
