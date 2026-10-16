@@ -25,6 +25,7 @@ from vllm.config import (
 )
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.kv_cache_interface import (
@@ -181,14 +182,18 @@ def test_priority_policy_and_throttle_prefills_skip_hold(shared_model_config):
     assert scheduler._chunks_to_hold() == []
 
 
-def test_inherits_prefix_aware_waiting_promotion_and_deduplicates_warmth_lookup(
-    shared_model_config, monkeypatch
+def test_holds_for_next_waiting_request_without_reordering_waiting(
+    shared_model_config,
 ):
+    """SRPT extends AsyncScheduler: it holds for the request upstream admits
+    next (queue order) and does not promote a warmer request behind it."""
     scheduler, hasher = _build_real_scheduler(
         shared_model_config,
         num_blocks=32,
         max_num_batched_tokens=16,
     )
+    assert isinstance(scheduler, AsyncScheduler)
+    assert not isinstance(scheduler, PrefixAwareScheduler)
     # Prime 32 tokens (2 blocks) into the prefix cache.
     shared_prefix = [900_000 + i for i in range(32)]
     primer = _make_real_request(
@@ -200,42 +205,23 @@ def test_inherits_prefix_aware_waiting_promotion_and_deduplicates_warmth_lookup(
     scheduler.finish_requests("primer", RequestStatus.FINISHED_ABORTED)
     scheduler.schedule()
 
-    # Put a long running prefill chunk in self.running so both _chunks_to_hold
-    # and _promote_warmest evaluate the waiting queue in the same step.
+    # `long` runs its first 16-token chunk (48 tokens remaining).
     req_long = _make_real_request("long", 64, hasher, seed=10)
     scheduler.add_request(req_long)
     scheduler.schedule()
     assert req_long.is_prefill_chunk is True
 
-    # Add a cold 48-token request ahead of a warm 48-token request (32 cached,
-    # 16 uncached).
-    req_cold = _make_real_request("cold", 48, hasher, seed=2)
-    req_warm = _make_real_request(
-        "warm", 48, hasher, seed=3, shared_prefix=shared_prefix
-    )
-    scheduler.add_request(req_cold)
-    scheduler.add_request(req_warm)
-
-    lookup_calls = []
-    orig_find = scheduler.kv_cache_manager.coordinator.find_longest_cache_hit
-
-    def counting_find(*args, **kwargs):
-        lookup_calls.append(args)
-        return orig_find(*args, **kwargs)
-
-    monkeypatch.setattr(
-        scheduler.kv_cache_manager.coordinator,
-        "find_longest_cache_hit",
-        counting_find,
+    # `next` (32 uncached) arrives ahead of `warm` (48 tokens, 32 cached).
+    scheduler.add_request(_make_real_request("next", 32, hasher, seed=2))
+    scheduler.add_request(
+        _make_real_request("warm", 48, hasher, seed=3, shared_prefix=shared_prefix)
     )
 
     out = scheduler.schedule()
-    assert "warm" in out.num_scheduled_tokens
-    assert "cold" not in out.num_scheduled_tokens
-    # PrefixAware warmth scoring for (cold, warm) is memoized across
-    # _chunks_to_hold and _promote_warmest (plus 1 direct get_computed_blocks
-    # call inside upstream Scheduler.schedule() when admitting `warm`).
-    assert len(lookup_calls) == 3
+    # `long` is held so `next` gets the budget; `warm` keeps its place.
+    assert set(out.num_scheduled_tokens) == {"next"}
+    assert [r.request_id for r in scheduler.waiting] == ["warm"]
+    assert req_long in scheduler.running
 
 
 @pytest.mark.parametrize(

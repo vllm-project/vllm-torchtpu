@@ -19,21 +19,19 @@ the step's token budget before ``Scheduler.schedule()`` visits ``self.waiting``,
 forcing newly arrived short or prefix-cached requests to wait behind the entire
 long prefill.
 
-``SrptPrefillScheduler`` extends :class:`PrefixAwareScheduler` so that each
-step (under ``SchedulingPolicy.FCFS``):
+``SrptPrefillScheduler`` extends ``AsyncScheduler`` (so it expects
+``--async-scheduling``) so that each step (under ``SchedulingPolicy.FCFS``):
 
 * keeps every decoding request (decode and speculative verify) ahead of all
   in-progress prefill chunks, preserving their relative order;
 * orders RUNNING prefill chunks by remaining prompt tokens, fewest first — so
   shorter prefills finish first and the longest remaining prefill sits at
   ``self.running[-1]``;
-* delegates WAITING queue promotion (including ``kv_holding_waiting`` priority,
-  preempted-request priority tier, and bounded ``WINDOW`` prefix-cache warmth
-  evaluation) to :class:`PrefixAwareScheduler`;
 * holds back, for the current step, only the longest running prefill chunks
-  needed so that the step's remaining token budget can admit the highest-ranked
-  waiting request within ``WINDOW`` when that waiting request has strictly fewer
-  remaining uncached tokens and sufficient free KV blocks exist.
+  needed so that the step's remaining token budget can admit the next
+  admissible waiting request (the one upstream admits next, in queue order;
+  WAITING is not reordered) when that request has strictly fewer remaining
+  uncached tokens and sufficient free KV blocks exist.
 
 Held-back chunks retain their allocated KV blocks and are restored to
 ``self.running`` immediately after ``super().schedule()`` while lowering both
@@ -56,20 +54,20 @@ Select with ``--scheduler-cls``
 ``vllm_torchtpu.core.experimental.srpt_prefill_scheduler.SrptPrefillScheduler``.
 """
 
-from itertools import islice
+from itertools import chain
 
 from vllm.logger import init_logger
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.request import Request
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
 
 logger = init_logger("vllm." + __name__)
 
 
-class SrptPrefillScheduler(PrefixAwareScheduler):
+class SrptPrefillScheduler(AsyncScheduler):
     """Order RUNNING decodes first and prefill chunks by fewest remaining tokens,
     holding back longer running prefill chunks when shorter waiting requests exist."""
 
@@ -92,9 +90,9 @@ class SrptPrefillScheduler(PrefixAwareScheduler):
         self._blocked_hold_cooldown: dict[str, int] = {}
         self._consecutive_holds: dict[str, int] = {}
         self._step_warmth_cache: dict[tuple[str, int], tuple[int, tuple]] = {}
+        self._warmth_lookup_broken = False
         logger.info(
-            "SrptPrefillScheduler active (window=%d, max_consecutive_holds=%d)",
-            self.WINDOW,
+            "SrptPrefillScheduler active (max_consecutive_holds=%d)",
             self.MAX_CONSECUTIVE_HOLDS,
         )
 
@@ -175,11 +173,11 @@ class SrptPrefillScheduler(PrefixAwareScheduler):
                 )
                 res = (int(num_computed), tuple(computed_blocks))
             except Exception:
-                if not self._paw_scoring_broken:
-                    self._paw_scoring_broken = True
+                if not self._warmth_lookup_broken:
+                    self._warmth_lookup_broken = True
                     logger.exception(
-                        "PrefixAwareScheduler: warmth scoring failed; "
-                        "falling back to FCFS."
+                        "SrptPrefillScheduler: prefix-cache lookup failed; "
+                        "treating waiting requests as uncached."
                     )
                 res = (0, default_blocks)
 
@@ -323,23 +321,19 @@ class SrptPrefillScheduler(PrefixAwareScheduler):
         max_active = getattr(self, "max_num_active_reqs", self.max_num_running_reqs)
         if len(self.running) + num_streaming >= max_active:
             return [], None
-        queue = getattr(self, "kv_holding_waiting", None) or getattr(
-            self, "waiting", None
+        # Hold only for the request upstream admits next: the first admissible
+        # one in scan order (kv_holding_waiting drains before waiting).
+        queues = (getattr(self, "kv_holding_waiting", ()), self.waiting)
+        best_req = next(
+            (
+                r
+                for r in chain(*queues)
+                if not self._is_blocked_waiting_status(r.status)
+            ),
+            None,
         )
-        if not queue:
+        if best_req is None:
             return [], None
-        admissible = [
-            r
-            for r in islice(queue, self.WINDOW)
-            if not self._is_blocked_waiting_status(r.status)
-        ]
-        if not admissible:
-            return [], None
-
-        # Rank using PrefixAwareScheduler._rank_and_warmth so preempted waiting
-        # requests (tier 1) take precedence over normal waiting requests (tier 2),
-        # matching the exact request _promote_warmest will place at queue[0].
-        best_req = min(admissible, key=lambda r: self._rank_and_warmth(r)[0])
         best_id = best_req.request_id
         cooldown = self._blocked_hold_cooldown.get(best_id, 0)
         if cooldown > 0:
