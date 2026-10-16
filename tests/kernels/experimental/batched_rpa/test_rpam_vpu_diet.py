@@ -24,9 +24,16 @@ import pytest
 
 from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 
-pytestmark = pytest.mark.skipif(
-    jax.devices()[0].platform != "tpu", reason="Mosaic kernel needs a TPU"
-)
+pytestmark = pytest.mark.tpu_test
+
+
+@pytest.fixture(autouse=True)
+def _require_tpu():
+    # At setup, not in a module-level skipif: asking for devices at import
+    # starts a JAX backend during collection (see tests/conftest.py).
+    if jax.devices()[0].platform != "tpu":
+        pytest.skip("Mosaic kernel needs a TPU")
+
 
 _LAYOUT = configs.KVLayout.SEQ_ALONG_LANE
 _PAGE = 128
@@ -220,7 +227,7 @@ def test_bq1024_matches_bq128_bkv128(monkeypatch):
     inputs, logical, page_table = _setup(jnp.float8_e4m3fn, _SHORT)
     total = int(inputs["cu_q_lens"][-1])
     blocks = configs.BlockSizes(
-        bq_sz=128, bq_c_sz=64, bkv_sz=128, batch_size=2, n_buffer=3
+        bq_sz=128, bq_c_sz=64, bkv_sz=128, batch_size=2
     )
     out_1024, _ = _run(monkeypatch, inputs, diet=False)
     out_128, cache_128 = _run(monkeypatch, inputs, diet=False, prefill_blocks=blocks)
@@ -267,7 +274,7 @@ def test_vpu_diet_bit_exact(monkeypatch, kv_dtype, seqs, bkv, bq_c):
     blocks = None
     if bkv is not None:
         blocks = configs.BlockSizes(
-            bq_sz=1024, bq_c_sz=bq_c, bkv_sz=bkv, batch_size=2, n_buffer=3
+            bq_sz=1024, bq_c_sz=bq_c, bkv_sz=bkv, batch_size=2
         )
     old, old_cache = _run(monkeypatch, inputs, diet=False, prefill_blocks=blocks)
     new, new_cache = _run(monkeypatch, inputs, diet=True, prefill_blocks=blocks)
@@ -310,7 +317,7 @@ def test_ef9e078de_tiling(monkeypatch):
     inputs, logical, _ = _setup(jnp.float8_e4m3fn, _SHORT, seed=4)
     total = int(inputs["cu_q_lens"][-1])
     blocks = configs.BlockSizes(
-        bq_sz=128, bq_c_sz=16, bkv_sz=4096, batch_size=2, n_buffer=3
+        bq_sz=128, bq_c_sz=16, bkv_sz=4096, batch_size=2
     )
     out, _ = _run(monkeypatch, inputs, diet=False, prefill_blocks=blocks)
     np.testing.assert_allclose(out[:total], _reference(inputs, logical, _SHORT)[0],
