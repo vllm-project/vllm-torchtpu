@@ -14,7 +14,9 @@ from tests_omni.models.wan.utils import (
     WAN2_1_T2V_1_3B,
     WAN2_1_T2V_1_3B_EULER,
     WanTestConfig,
-    run_wan_golden_test,
+    assert_wan_golden_parity,
+    build_wan_golden_request,
+    extract_wan_video,
 )
 
 pytestmark = [
@@ -105,4 +107,7 @@ def test_wan_deterministic_seed_parity_tpu(omni_runner: OmniRunner):
 )
 def test_wan_golden_answers_tpu(omni_runner: OmniRunner, config: WanTestConfig):
     """Verify Wan 2.1 1.3B output against CPU fp32 golden reference videos."""
-    run_wan_golden_test(omni_runner, config)
+    inputs, sampling_params = build_wan_golden_request(config)
+    outputs = list(omni_runner.generate(inputs, sampling_params))
+    video = extract_wan_video(outputs, config)
+    assert_wan_golden_parity(video, config)

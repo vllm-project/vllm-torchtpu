@@ -28,7 +28,9 @@ from tests_omni.models.wan.utils import (
     WAN2_2_I2V_A14B_MOE,
     WAN2_2_TI2V_5B,
     WanTestConfig,
-    run_wan_golden_test,
+    assert_wan_golden_parity,
+    build_wan_golden_request,
+    extract_wan_video,
 )
 
 pytestmark = [
@@ -65,4 +67,7 @@ def test_wan_full_model_matrix_and_golden_answers_tpu(
     4. Matches the CPU fp32 golden video within the per-config limits.
     5. High-frequency energy and motion ratios.
     """
-    run_wan_golden_test(omni_runner, config)
+    inputs, sampling_params = build_wan_golden_request(config)
+    outputs = list(omni_runner.generate(inputs, sampling_params))
+    video = extract_wan_video(outputs, config)
+    assert_wan_golden_parity(video, config)
