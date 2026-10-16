@@ -542,6 +542,7 @@ def rpa_body(
         l_scratch_ref,
         acc_scratch_ref,
         step=step,
+        stitch_meta=stitch_meta,
         step_meta=step_meta,
         cfgs=cfgs,
     )
@@ -556,6 +557,8 @@ def rpa_body(
     @pl.when(jnp.logical_not(full))
     def _masked():
         run_step(apply_mask=True)
+
+
 def _rpa_step(
     # Inputs.
     q_vref: jax.Ref,
@@ -570,9 +573,16 @@ def _rpa_step(
     acc_scratch_ref: jax.Ref,
     *,
     step: jax.Array,
+    stitch_meta: StitchMetadata,
+    step_meta: ComputeMetadata,
     apply_mask: bool,
     cfgs: configs.RpaConfigs,
 ):
+    """Runs one step's attention over the stitched KV block.
+
+    `apply_mask=False` skips the QK mask, for a block `block_fully_visible`
+    proved fully visible.
+    """
     # Step 2b: Fetch inputs.
     q_p = cfgs.aligned_num_q_heads_per_kv_head // cfgs.serve.packing_q
     q_ref = q_vref.bitcast(jnp.uint32).reshape(-1, cfgs.aligned_q_head_dim)
