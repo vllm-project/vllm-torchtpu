@@ -16,6 +16,16 @@ import numpy as np
 import pytest
 
 
+pytestmark = pytest.mark.tpu_test
+
+
+@pytest.fixture(autouse=True)
+def _require_tpu():
+    # At setup, not in a module-level skipif: asking for devices at import
+    # starts a JAX backend during collection (see tests/conftest.py).
+    if jax.devices()[0].platform != "tpu":
+        pytest.skip("Mosaic kernel needs a TPU")
+
 
 _LAYOUT = configs.KVLayout.SEQ_ALONG_LANE
 _PAGE = 128
