@@ -18,6 +18,7 @@ from unittest.mock import MagicMock, patch
 
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
+from vllm.v1.request import RequestStatus
 
 from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
 
@@ -316,3 +317,32 @@ def test_no_step_token_cap_with_many_decoders(monkeypatch):
     assert s.max_num_scheduled_tokens == 8192
 
 
+def test_waiting_loop_stop_reason_and_admission_telemetry():
+    s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
+    s.running = []
+    s.waiting = [object()]
+    s.max_num_scheduled_tokens = 8192
+    s.block_size = 640
+    out = SimpleNamespace(total_num_scheduled_tokens=640, num_scheduled_tokens={})
+
+    s._step_wait_event = None
+
+    # The first stop of a waiting request wins; running requests are ignored.
+    s._note_waiting_stop(SimpleNamespace(status=RequestStatus.RUNNING), "align0")
+    assert s._step_wait_event is None
+    s._note_waiting_stop(SimpleNamespace(status=RequestStatus.WAITING), "align0")
+
+    s._step_wait_event = None
+    assert s._waiting_loop_stop_reason(out, 1) == "other"
+    full = SimpleNamespace(total_num_scheduled_tokens=8192, num_scheduled_tokens={})
+    assert s._waiting_loop_stop_reason(full, 1) == "budget"
+    s.waiting = []
+    assert s._waiting_loop_stop_reason(out, 0) == "idle"
+
+    s.waiting = [object()]
+    s._record_step_telemetry(full, 0, "idle")
+    # Every waiting request got in: a short step is not a small step then.
+    s.waiting = []
+    s._record_step_telemetry(out, 2, "drained")
+    # The per-minute counters restart after each telemetry line.
+    text = s._admission_telemetry("idle")
