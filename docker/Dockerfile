@@ -179,6 +179,10 @@ CMD ["/bin/bash"]
 # Variant 4: Omni Image (Omni Variant with dev + omni dependencies)
 FROM dev AS omni
 
+# vllm-omni depends on opencv-python (not -headless), whose cv2 links libGL and
+# glib; without them multi-rank diffusion workers crash at startup.
+RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
+
 # --group vllm keeps vLLM's source pin in this resolution, so vllm-omni cannot
 # replace it with a PyPI vllm.
 RUN --mount=type=cache,target=/root/.cache/uv \
