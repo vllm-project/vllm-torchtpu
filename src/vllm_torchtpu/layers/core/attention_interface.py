@@ -60,6 +60,26 @@ mla_ragged_paged_attention = mla_v2_kernel.mla_ragged_paged_attention
 sparse_mla_ragged_paged_attention = sparse_mla_kernel.sparse_ragged_paged_attention
 
 
+def sparse_mla_chunk_kwargs() -> dict[str, int]:
+    """Kernel kwargs for the sparse MLA gather + attention chunk size.
+
+    Empty unless `TPU_SPARSE_MLA_CHUNK_TOKENS` is set, so the kernel keeps its
+    default chunk. The chunk must be a multiple of the attention kernel's batch
+    size: the attention grid walks a chunk in whole batches, and the SparseCore
+    gather splits a chunk's `chunk * topk` rows into whole owner batches.
+    """
+    chunk = envs.TPU_SPARSE_MLA_CHUNK_TOKENS
+    if chunk is None:
+        return {}
+    batch = sparse_mla_kernel.DEFAULT_ATTENTION_KERNEL_BATCH_SIZE
+    if chunk % batch:
+        raise ValueError(
+            f"TPU_SPARSE_MLA_CHUNK_TOKENS={chunk} must be a multiple of the "
+            f"sparse MLA attention kernel batch size ({batch})."
+        )
+    return {"gather_and_attention_chunk_size": chunk}
+
+
 def sharded_flash_attention(
     mesh: Mesh,
     causal: bool = True,
@@ -919,6 +939,7 @@ def sparse_mla_attention(
             f"got {nope_spec.layout.value} and {rope_spec.layout.value}"
         )
     cache_layout = nope_spec.layout.value
+    chunk_kwargs = sparse_mla_chunk_kwargs()
 
     def _sparse_mla_ragged_paged_attention(
         ql_nope,
@@ -976,6 +997,7 @@ def sparse_mla_attention(
             sm_scale=sm_scale or 1.0,
             k_scale=dequant_scale,
             cache_layout=cache_layout,
+            **chunk_kwargs,
         )
 
         lkv_dim = ql_nope.shape[-1]
@@ -1190,7 +1212,7 @@ def sparse_mla_attention_dcp(
                 "capped_live_rows": envs.TPU_SPARSE_MLA_LIVE_GATHER,
             }
             if topk_cap
-            else {}
+            else sparse_mla_chunk_kwargs()
         )
         # Virtual page ordinal -> physical block in this rank's own shard, the
         # same resolution the scatter above and `streamindex_topk_dcp` use.
