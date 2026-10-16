@@ -98,7 +98,7 @@ _PIN_MAX_MISSED_PROBES = 3
 _MAX_FORK_LRU_ENTRIES = 16
 # Safety bound on per-request fork decisions (normally popped on finish).
 _MAX_FORK_DECISIONS = 8192
-# Why KVCacheManager.allocate_slots returned None (vLLM v0.29.0):
+# Why KVCacheManager.allocate_slots returned None (vLLM v0.31.0):
 #   inflight_reserve: required <= free but required > free - reserved_blocks, the
 #     async-load admission gate that keeps the remaining-prompt blocks of every
 #     in-flight prefill free (Scheduler._inflight_prefill_reserved_blocks).
@@ -505,7 +505,7 @@ class HybridStateRetention:
         self, request: Any, kwargs: dict[str, Any]
     ) -> tuple[str, int, int]:
         """Returns (reason, required blocks, free blocks) for a None from
-        allocate_slots; mirrors the two refusal checks in vLLM v0.29.0
+        allocate_slots; mirrors the two refusal checks in vLLM v0.31.0
         KVCacheManager.allocate_slots."""
         free = self._get_num_free_blocks()
         if self._same_step_hit(kwargs.get("new_computed_blocks")):
