@@ -12,10 +12,8 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import numpy as np
-import pytest
 import torch
 import torch.nn as nn
-from vllm.models.deepseek_v41.common.engram import DEAD_ID
 
 from vllm_torchtpu.layers.core.sequence_layout import SequenceLayoutKind
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram import (
@@ -24,7 +22,6 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram import (
     _async_source_tokens_cpu,
     _resolve_decode_lookback_cpu,
     capture_host_engram_inputs,
-    gather_host_engram_hashes,
     install_host_engram_inputs,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import DeepseekV41Model
@@ -428,144 +425,6 @@ class TestCaptureHostEngramInputs:
 
 
 # ==============================================================================
-# 5. gather_host_engram_hashes Tests
-# ==============================================================================
-
-
-class TestGatherHostEngramHashes:
-    def test_device_non_cpu_fallback(self):
-        hashes_meta = torch.tensor([[[1, 2]]], device="meta")
-        mock_gather = MagicMock(return_value=hashes_meta)
-
-        out = gather_host_engram_hashes(
-            hashes_meta, dp_shared_memory=False, gather_fn=mock_gather
-        )
-        mock_gather.assert_called_once_with(hashes_meta, dp_shared_memory=False)
-        assert out is hashes_meta
-
-    def test_cpu_dp_shared_memory_true_fallback(self):
-        hashes = torch.tensor([[[1, 2]]], dtype=torch.int32)
-        mock_gather = MagicMock(return_value=hashes)
-
-        out = gather_host_engram_hashes(
-            hashes, dp_shared_memory=True, gather_fn=mock_gather
-        )
-        mock_gather.assert_called_once_with(hashes, dp_shared_memory=True)
-        assert out is hashes
-
-    def test_cpu_dp_group_none_or_single_world_size_fallback(self):
-        hashes = torch.tensor([[[1, 2]]], dtype=torch.int32)
-        mock_gather = MagicMock(return_value=hashes)
-
-        # dp_group is None
-        with patch(
-            "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.get_engram_dp_group",
-            return_value=None,
-        ):
-            out = gather_host_engram_hashes(
-                hashes, dp_shared_memory=False, gather_fn=mock_gather
-            )
-            assert out is hashes
-
-        # dp_group world_size == 1
-        fake_dp_1 = SimpleNamespace(world_size=1, cpu_group="fake_cpu")
-        with patch(
-            "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.get_engram_dp_group",
-            return_value=fake_dp_1,
-        ):
-            out = gather_host_engram_hashes(
-                hashes, dp_shared_memory=False, gather_fn=mock_gather
-            )
-            assert out is hashes
-
-        # dp_group cpu_group is None
-        fake_dp_no_cpu = SimpleNamespace(world_size=2, cpu_group=None)
-        with patch(
-            "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.get_engram_dp_group",
-            return_value=fake_dp_no_cpu,
-        ):
-            out = gather_host_engram_hashes(
-                hashes, dp_shared_memory=False, gather_fn=mock_gather
-            )
-            assert out is hashes
-
-    def test_cpu_all_gather_into_tensor_all_branches(self):
-        hashes = torch.tensor([[[1, 2]]], dtype=torch.int32)  # shape [1, 1, 2]
-        fake_dp_group = SimpleNamespace(world_size=2, cpu_group="fake_cpu_group")
-
-        def fake_all_gather(out_tensor, in_tensor, group=None):
-            out_tensor.copy_(torch.cat([in_tensor, in_tensor], dim=0))
-
-        with (
-            patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.get_engram_dp_group",
-                return_value=fake_dp_group,
-            ),
-            patch(
-                "torch.distributed.all_gather_into_tensor",
-                side_effect=fake_all_gather,
-            ),
-        ):
-            # 1. Without forward context (dp_metadata is None) -> slot = shape[0]
-            with patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.is_forward_context_available",
-                return_value=False,
-            ):
-                out_no_ctx = gather_host_engram_hashes(hashes)
-                assert out_no_ctx.shape == (2, 1, 2)
-
-            # 2. With forward context and dp_metadata:
-            with (
-                patch(
-                    "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.is_forward_context_available",
-                    return_value=True,
-                ),
-                patch(
-                    "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.get_forward_context",
-                    return_value=SimpleNamespace(dp_metadata=object()),
-                ),
-            ):
-                # 2a. engram_hashes.shape[0] < slot -> pad with DEAD_ID
-                with patch(
-                    "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.engram_gathered_num_tokens",
-                    return_value=3,
-                ):
-                    out_padded = gather_host_engram_hashes(hashes)
-                    assert out_padded.shape == (6, 1, 2)
-                    # rank 0 padded tokens 1..2 have DEAD_ID
-                    assert out_padded[1, 0, 0].item() == DEAD_ID
-
-                # 2b. engram_hashes.shape[0] == slot -> no pad
-                with patch(
-                    "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.engram_gathered_num_tokens",
-                    return_value=1,
-                ):
-                    out_exact = gather_host_engram_hashes(hashes)
-                    assert out_exact.shape == (2, 1, 2)
-
-                # 2c. engram_hashes.shape[0] > slot -> ValueError
-                with (
-                    patch(
-                        "vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram.engram_gathered_num_tokens",
-                        return_value=0,
-                    ),
-                    pytest.raises(ValueError, match="exceeds the DP token slot"),
-                ):
-                    gather_host_engram_hashes(hashes)
-
-    def test_fallback_import_when_gather_fn_none(self):
-        hashes = torch.tensor([[[1, 2]]], device="meta")
-        with patch(
-            "vllm.models.deepseek_v41.common.engram.gather_engram_hashes",
-            return_value="default_nvidia_gather",
-        ):
-            out = gather_host_engram_hashes(
-                hashes, dp_shared_memory=True, gather_fn=None
-            )
-            assert out == "default_nvidia_gather"
-
-
-# ==============================================================================
 # 6. install_host_engram_inputs Tests
 # ==============================================================================
 
@@ -789,7 +648,7 @@ class TestModelDecodeEngram:
                 return_value=torch.zeros(2, dtype=torch.bool),
             ),
             patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.gather_host_engram_hashes",
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.gather_engram_hashes",
                 return_value=torch.tensor([[[5, 6]]], dtype=torch.int32),
             ) as mock_gather_fn,
         ):
@@ -827,7 +686,7 @@ class TestModelDecodeEngram:
                 return_value=torch.zeros(2, dtype=torch.bool),
             ),
             patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.gather_host_engram_hashes",
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.gather_engram_hashes",
                 return_value=torch.tensor([[[5, 6]]], dtype=torch.int32),
             ) as mock_gather_fn2,
         ):
@@ -866,7 +725,7 @@ class TestModelDecodeEngram:
                 return_value=torch.zeros(2, dtype=torch.bool),
             ),
             patch(
-                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.gather_host_engram_hashes",
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.gather_engram_hashes",
                 return_value=torch.tensor([[[5, 6]]], dtype=torch.int32),
             ),
         ):

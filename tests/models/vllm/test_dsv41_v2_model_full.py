@@ -1755,6 +1755,45 @@ class TestDeepseekV41ForCausalLM:
         with pytest.raises(NotImplementedError, match="DP requires TP1, EP"):
             DeepseekV41ForCausalLM(vllm_config=cfg_dp)
 
+        # DP > 1 without a DP-shared host table (no head-sharded fallback)
+        cfg_dp = _mock_vllm_config(dp_size=2, ep_enabled=True)
+        cfg_dp.engram_config = SimpleNamespace(dp_shared_memory=False)
+        with (
+            patch.dict(os.environ, {"TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD": "1"}),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_engram_dp_size",
+                return_value=2,
+            ),
+            pytest.raises(NotImplementedError, match="dp_shared_memory"),
+        ):
+            DeepseekV41ForCausalLM(vllm_config=cfg_dp)
+
+    def test_dp_requires_shared_engram_after_upstream_resolution(self) -> None:
+        cfg = _mock_vllm_config(dp_size=2, ep_enabled=True)
+        cfg.engram_config = SimpleNamespace(dp_shared_memory=True)
+
+        def init(self, *, vllm_config, prefix=""):
+            # Upstream drops sharing when /dev/shm cannot hold the tables.
+            vllm_config.engram_config.dp_shared_memory = False
+
+        with (
+            patch.dict(os.environ, {"TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD": "1"}),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_engram_dp_size",
+                return_value=2,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.install_host_engram_inputs"
+            ),
+            patch(
+                "vllm.models.deepseek_v41.nvidia.model.DeepseekV41LLMForCausalLM.__init__",
+                init,
+            ),
+            pytest.raises(NotImplementedError, match="/dev/shm"),
+        ):
+            model = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
+            model.__init__(vllm_config=cfg)
+
         # Speculation not None
         cfg_spec = _mock_vllm_config(speculative_config=object())
         with pytest.raises(
