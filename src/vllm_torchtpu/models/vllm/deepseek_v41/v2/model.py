@@ -3,6 +3,7 @@
 """Upstream V4.1 model assembly with TPU device operations."""
 
 from dataclasses import replace
+from functools import partial
 from itertools import islice
 
 import torch
@@ -12,6 +13,9 @@ from vllm.forward_context import override_forward_context
 from vllm.models.deepseek_v41.nvidia import model as upstream
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_mhc_op import (
+    initialize_shifted_mhc,
+)
 from vllm_torchtpu.layers.adapter.quantization.deepseek_v41 import DeepseekV41MoE
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
@@ -109,7 +113,7 @@ class DeepseekV41DecoderLayer(upstream.DeepseekV4DecoderLayer):
         upstream.DeepseekV4DecoderLayer.forward,
         mhc_pre_delayed_tilelang=pre,
         mhc_post_tilelang=post,
-        mhc_shifted_post_pre=shifted_post_pre,
+        mhc_shifted_post_pre=partial(shifted_post_pre, fuse_rms=True),
         sp_all_gather=lambda x: x,
     )
 
@@ -965,6 +969,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         self.prefix = prefix
         initialize_cache_ops()
         initialize_delayed_mhc()
+        initialize_shifted_mhc()
         initialize_mhc_post()
         initialize_paged_attention()
         initialize_indexer()

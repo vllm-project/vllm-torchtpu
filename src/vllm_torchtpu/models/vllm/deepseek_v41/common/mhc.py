@@ -11,6 +11,9 @@ import torch
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.model_executor.kernels.mhc.torch import mhc_post_torch, mhc_pre_delayed_torch
 
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_mhc_op import (
+    get_shifted_post_pre_rms_op,
+)
 from vllm_torchtpu.layers.adapter.normalization import rms_norm
 
 
@@ -733,6 +736,7 @@ def shifted_post_pre(
     *,
     stream=None,
     reduce_results=False,
+    fuse_rms: bool = False,
 ):
     if stream is not None:
         raise ValueError("TPU mHC does not use CUDA streams")
@@ -741,23 +745,44 @@ def shifted_post_pre(
     if residual.device.type == "tpu" and _post_pre_flat_op is not None:
         if pre_mix is None:
             pre_mix = _default_pre_mix(residual, hc_scale.dtype)
-        residual, post_mix, comb_mix, value, next_pre = delayed_post_pre(
-            x,
-            residual,
-            post_layer_mix,
-            comb_res_mix,
-            fn,
-            hc_scale,
-            hc_base,
-            pre_mix,
-            rms_eps,
-            hc_pre_eps,
-            hc_sinkhorn_eps,
-            hc_post_mult_value,
-            sinkhorn_repeat,
-        )
-        if norm_weight is not None:
-            value = rms_norm(value, norm_weight, norm_eps)
+        if fuse_rms and norm_weight is not None:
+            op = get_shifted_post_pre_rms_op()
+            flat_new, post_mix, comb_mix, value, next_pre = op(
+                x,
+                residual.flatten(1),
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                pre_mix,
+                norm_weight,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+                norm_eps,
+            )
+            residual = flat_new.view_as(residual)
+        else:
+            residual, post_mix, comb_mix, value, next_pre = delayed_post_pre(
+                x,
+                residual,
+                post_layer_mix,
+                comb_res_mix,
+                fn,
+                hc_scale,
+                hc_base,
+                pre_mix,
+                rms_eps,
+                hc_pre_eps,
+                hc_sinkhorn_eps,
+                hc_post_mult_value,
+                sinkhorn_repeat,
+            )
+            if norm_weight is not None:
+                value = rms_norm(value, norm_weight, norm_eps)
         aux = residual.mean(1) if capture_aux else x.new_empty(0, x.shape[-1])
         return residual, post_mix, comb_mix, value, next_pre, aux
     residual = post(x, residual, post_layer_mix, comb_res_mix)
