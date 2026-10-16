@@ -117,7 +117,7 @@ We welcome contributions of all kinds — bug reports, model and feature request
 - **👀 Review pull requests:** help us keep quality high by reviewing [open PRs](https://github.com/vllm-project/vllm-torchtpu/pulls).
 - **💻 Write code:** start with the **[Contributing Guide](CONTRIBUTING.md)**, which covers environment setup, DCO sign-off, the `ready`-label CI gate, and the PR lifecycle. [Good first issues](https://github.com/vllm-project/vllm-torchtpu/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are a great place to begin.
 
-Developer references: [Testing & CI](docs/developers_guide/testing_and_ci.md) · [Profiling](docs/developers_guide/profiling.md) · [Benchmarking](docs/developers_guide/benchmarking.md) · [Coding guidance](docs/developers_guide/coding_guidance.md) · [Optimization best practices](docs/developers_guide/optimization_best_practices.md)
+Developer references: [Testing & CI](docs/developers_guide/testing_and_ci.md) · [Profiling](docs/developers_guide/profiling/index.md) · [Benchmarking](docs/developers_guide/benchmarking.md) · [Coding guidance](docs/developers_guide/coding_guidance.md) · [Optimization best practices](docs/developers_guide/optimization_best_practices.md)
 
 <br>
 

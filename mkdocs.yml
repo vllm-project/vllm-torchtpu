@@ -39,6 +39,7 @@ theme:
     - content.code.copy
     - content.tabs.link
     - navigation.tracking
+    - navigation.indexes
     - navigation.sections
     - navigation.top
     - search.highlight
@@ -76,7 +77,15 @@ nav:
     - 'Type Checking': developers_guide/type_checking.md
     - 'Testing & CI': developers_guide/testing_and_ci.md
     - 'Benchmarking': developers_guide/benchmarking.md
-    - 'Profiling': developers_guide/profiling.md
+    - 'Profiling':
+      - developers_guide/profiling/index.md
+      - 'Offline (tpu_profiling.py)': developers_guide/profiling/offline.md
+      - 'Server-side Capture': developers_guide/profiling/server.md
+      - 'Phased Profiling': developers_guide/profiling/phased.md
+      - 'Disaggregated Serving (P/D)': developers_guide/profiling/disaggregated.md
+      - 'Output Layout': developers_guide/profiling/output.md
+      - 'Viewing Traces': developers_guide/profiling/viewing.md
+      - 'Troubleshooting': developers_guide/profiling/troubleshooting.md
   - 'Reference':
     - 'Environment Variables': reference/env_vars.md
 
