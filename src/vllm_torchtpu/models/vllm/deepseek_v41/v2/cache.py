@@ -962,8 +962,45 @@ def gather_cache_page_words(
     starts = jnp.where(first_records >= 0, first_records // per_row, spread)
     # A single-row index gather stays on SparseCore; vmap(dynamic_slice)
     # lowers to a windowed gather that measured ~25x slower on TPU7x.
-    indices = (starts[:, None] + jnp.arange(rows, dtype=starts.dtype)[None]).reshape(-1)
+    total = starts.size * rows
+    if (
+        envs.TPU_DEEPSEEK_V41_PAGE_ROWS_ONEHOT
+        and 1 < rows <= 128
+        and 128 % rows == 0
+        and total % 1024 == 0
+    ):
+        indices = _lane_dense_page_rows(starts, rows)
+    else:
+        indices = (
+            starts[:, None] + jnp.arange(rows, dtype=starts.dtype)[None]
+        ).reshape(-1)
     return _gather_raw_rows(cache, indices)
+
+
+def _lane_dense_page_rows(starts, rows):
+    """``(starts[:, None] + arange(rows)).reshape(-1)`` without the [N, rows] array.
+
+    The [N, rows] intermediate pads its rows-wide minor dim to 128 lanes and
+    then needs a relayout to 1-D. Instead expand each 128-lane row (128 // rows
+    starts) with an exact 0/1 matmul: split the int32 starts into 12-bit
+    halves, so every f32 product sum has one nonzero term below 2**24.
+    """
+    import jax
+    import jax.numpy as jnp
+
+    per = 128 // rows
+    grid = starts.reshape(-1, per)
+    expand = (jnp.arange(128)[None, :] // rows == jnp.arange(per)[:, None]).astype(
+        jnp.float32
+    )
+
+    def spread(x):
+        return jnp.dot(
+            x.astype(jnp.float32), expand, precision=jax.lax.Precision.HIGHEST
+        ).astype(starts.dtype)
+
+    lanes = (jnp.arange(128, dtype=starts.dtype) % rows)[None]
+    return ((spread(grid >> 12) << 12) + spread(grid & 4095) + lanes).reshape(-1)
 
 
 def gather_cache_page_values(

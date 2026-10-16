@@ -17,6 +17,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_PREFILL_INDEXER: str = "streaming"
     TPU_DEEPSEEK_V41_INDEX_KEY_LAYOUT: str = "halfplane"
     TPU_DEEPSEEK_V41_MOE_SCALE_ROW_PADDED: bool = True
+    TPU_DEEPSEEK_V41_PAGE_ROWS_ONEHOT: bool = True
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
@@ -409,6 +410,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # [E, rows, N] view is a bitcast instead of a per-layer relayout copy.
     "TPU_DEEPSEEK_V41_MOE_SCALE_ROW_PADDED": env_bool(
         "TPU_DEEPSEEK_V41_MOE_SCALE_ROW_PADDED", default=True
+    ),
+    # Build whole-page gather row indices lane-dense with an exact 0/1 matmul
+    # instead of a [pages, rows] iota whose padded minor dim needs a relayout.
+    # Read at trace time.
+    "TPU_DEEPSEEK_V41_PAGE_ROWS_ONEHOT": env_bool(
+        "TPU_DEEPSEEK_V41_PAGE_ROWS_ONEHOT", default=True
     ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
