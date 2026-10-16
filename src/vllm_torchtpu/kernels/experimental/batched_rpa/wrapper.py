@@ -19,6 +19,7 @@ and invokes the Pallas Batched RPA kernel.
 
 import os
 import re
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -281,7 +282,6 @@ def calculate_block_sizes(
 
     def calculate_vmem_usage(
         batch_size: int,
-        n_buffer: int,
         bq_sz: int,
         bkv_sz: int,
         is_decode: bool = False,
@@ -356,13 +356,12 @@ def calculate_block_sizes(
 
         # Step 3: Sum up all memory usage.
         if is_decode:
-            # Scratch buffers are allocated per batch item, whereas active
+            # Pipeline buffers are allocated per batch item, whereas active
             # compute tiles are live for one batch item at a time.
-            return buffer_bytes * batch_size + compute_bytes
-        total_bytes = buffer_bytes + compute_bytes
-
-        # Account for batch size.
-        total_bytes *= batch_size
+            total_bytes = buffer_bytes * batch_size + compute_bytes
+        else:
+            # Account for batch size.
+            total_bytes = (buffer_bytes + compute_bytes) * batch_size
 
         # Online-softmax scratch (m, l, and the output accumulator)
         lm_array_size = (
@@ -424,27 +423,21 @@ def calculate_block_sizes(
         # fits within VMEM limit.
         while (
             batch_size > 1
-            and calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz, is_decode)
+            and calculate_vmem_usage(batch_size, bq_sz, bkv_sz, is_decode)
             > capped_vmem_limit_bytes
         ):
             batch_size -= 1
 
-        # As a last resort, attempt to decrease number of buffers to avoid OOM.
-        while (
-            calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz, is_decode)
-            > capped_vmem_limit_bytes
-        ):
-            n_buffer -= 1
-
-        # Indicates OOM was triggered even when batch_size=1 or n_buffer=1.
-        # NOTE: If the function does not exit at this point even when either values
-        # are zero, it will trigger infinite loop at the next while loop.
-        if batch_size == 0 or n_buffer == 0:
+        # Indicates OOM was triggered even when batch_size=1.
+        # NOTE: If the function does not exit at this point even when the value is
+        # zero, it will trigger infinite loop at the next while loop.
+        if batch_size == 0:
             raise ValueError("Cannot find batch size that fits within VMEM limit.")
 
         # Step 2: Increase block sizes until the kernel is unable to fit into VMEM.
+        max_seq_len = serve_cfgs.pages_per_seq * serve_cfgs.page_size
         while (
-            calculate_vmem_usage(batch_size, n_buffer, bq_sz, bkv_sz, is_decode)
+            calculate_vmem_usage(batch_size, bq_sz, bkv_sz, is_decode)
             < capped_vmem_limit_bytes
             and bkv_sz <= max_seq_len
             and bkv_sz <= 4096  # TEMP PATCH
@@ -480,6 +473,7 @@ def calculate_block_sizes(
 
         # Threshold value based on hardware generation and precision.
         tpu_info = pltpu.get_tpu_info()
+
         is_8bit = jnp.dtype(serve_cfgs.dtype_q).itemsize == 1 or (
             kv_bytes == 1 and not serve_cfgs.return_lse
         )
@@ -517,8 +511,6 @@ def calculate_block_sizes(
             batch_size=batch_size,
         )
 
-    # Default to triple buffer as its almost always beneficial.
-    n_buffer = 3
     prefill_batch_size = 2
 
     decode_block_sizes = find_best_block_sizes(decode_batch_size, decode_query_size)
@@ -661,6 +653,7 @@ def ragged_paged_attention(
             "qk2", "pv2", "qk2pv2"); see
             `configs.ServingConfigs.native_fp8`. Defaults to the
             TPU_RPA_NATIVE_FP8 environment variable (unset: off).
+
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
         new_kv_cache: [num_pages, page_size, cdiv(num_kv_heads * 2, kv_packing),
@@ -730,9 +723,7 @@ def ragged_paged_attention(
         native_fp8 = os.environ.get("TPU_RPA_NATIVE_FP8", "")
     if native_fp8 in ("1", "true", "True"):
         native_fp8 = "qkpv"
-    if native_fp8 not in ("", "0") and not re.fullmatch(
-        r"(qk2?)?(pv2?)?", native_fp8
-    ):
+    if native_fp8 not in ("", "0") and not re.fullmatch(r"(qk2?)?(pv2?)?", native_fp8):
         raise ValueError(
             f"native_fp8 must match (qk[2])(pv[2]), e.g. qkpv or qk2pv2; got "
             f"{native_fp8!r}"
@@ -905,18 +896,19 @@ def ragged_paged_attention(
         o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
             configs.RpaCase.DECODE, q_hbm, kv_cache, lse_hbm_init
         )
+        # "cond" skips the MIXED call when its sequence range
+        # [distribution[0], distribution[2]) (`configs.RpaConfigs.seq_range`)
+        # is empty.
         rpa_skip_mode = os.environ.get("TPU_RPA_SKIP_MIXED", "cond")
         if rpa_skip_mode == "cond":
             if return_lse:
 
                 def _do_mixed_lse(args):
                     o_in, kv_in, lse_in = args
-                    return run_rpa_kernel(
-                        configs.RpaCase.MIXED, o_in, kv_in, lse_in
-                    )
+                    return run_rpa_kernel(configs.RpaCase.MIXED, o_in, kv_in, lse_in)
 
                 o_hbm_alias_q_hbm, kv_cache, lse_hbm = jax.lax.cond(
-                    distribution[1] < distribution[2],
+                    distribution[0] < distribution[2],
                     _do_mixed_lse,
                     lambda args: args,
                     (o_hbm_alias_q_hbm, kv_cache, lse_hbm),
@@ -931,7 +923,7 @@ def ragged_paged_attention(
                     return o_out, kv_out
 
                 o_hbm_alias_q_hbm, kv_cache = jax.lax.cond(
-                    distribution[1] < distribution[2],
+                    distribution[0] < distribution[2],
                     _do_mixed,
                     lambda args: args,
                     (o_hbm_alias_q_hbm, kv_cache),
@@ -941,6 +933,7 @@ def ragged_paged_attention(
             o_hbm_alias_q_hbm, kv_cache, lse_hbm = run_rpa_kernel(
                 configs.RpaCase.MIXED, o_hbm_alias_q_hbm, kv_cache, lse_hbm
             )
+
     # before: [kv_heads, max_tokens, q_per_kv // q_packing, q_packing, d]
     o_hbm = prepare_outputs(o_hbm_alias_q_hbm)
     # after: [kv_heads, max_tokens, q_per_kv, d]
