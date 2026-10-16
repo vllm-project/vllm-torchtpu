@@ -123,8 +123,10 @@ def _run_case(scope, kv_dtype, prefill_bq_sz, fill_value):
         jnp.asarray(_DISTRIBUTION, jnp.int32),
         sm_scale=_HEAD_DIM**-0.5,
         decode_block_sizes=configs.BlockSizes(
+            bq_sz=1, bq_c_sz=1, bkv_sz=256, batch_size=1
         ),
         prefill_block_sizes=configs.BlockSizes(
+            bq_sz=prefill_bq_sz, bq_c_sz=32, bkv_sz=256, batch_size=1
         ),
         kv_layout=configs.KVLayout.SEQ_ALONG_LANE,
         attention_scope=scope,
