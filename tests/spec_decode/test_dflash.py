@@ -121,6 +121,36 @@ def test_load_model_vocab_weights_follow_tp_layout(draft_tp, target_tp, monkeypa
         assert torch.equal(draft.lm_head.weight, target.lm_head.weight)
 
 
+def test_draft_load_uses_own_compile_sizes_and_shared_attention_registry():
+    proposer = _make_proposer()
+    proposer.runner = SimpleNamespace(
+        mesh=object(),
+        num_reqs_paddings=[8, 16, 32, 48],
+        num_reqs_max_model_len=48,
+        num_reqs_most_model_len=None,
+    )
+    proposer.vllm_config.load_config = object()
+    target = proposer.vllm_config.compilation_config
+    target.compile_sizes = [288, 2048]
+    module = "vllm_torchtpu.spec_decode.dflash"
+    with (
+        mock.patch(f"{module}.get_model_loader") as get_loader,
+        mock.patch(f"{module}.set_model_tag"),
+        mock.patch(f"{module}.set_vllm_model_wrapper_context"),
+        mock.patch(f"{module}.set_current_vllm_config"),
+        mock.patch(f"{module}._force_draft_tp1"),
+    ):
+        proposer._load_draft_model()
+    loaded = get_loader.return_value.load_model.call_args.kwargs["vllm_config"]
+    assert loaded.compilation_config is not target
+    assert loaded.compilation_config.compile_sizes == [40, 80, 160, 240]
+    assert target.compile_sizes == [288, 2048]
+    assert (
+        loaded.compilation_config.static_forward_context
+        is target.static_forward_context
+    )
+
+
 def test_propose_empty_batch():
     proposer = _make_proposer(draft_tp=1)
     proposer.runner = SimpleNamespace(input_batch=SimpleNamespace(num_reqs=0))
@@ -130,11 +160,11 @@ def test_propose_empty_batch():
 @pytest.mark.parametrize(
     "buckets,max_reqs,kv_buckets,draft_buckets",
     [
-        ([1, 8, 16, 512], 8, [1, 8, 16, 512], [8, 16, 512]),
-        ([128, 2048], 1, [128, 2048], [128]),
+        ([1, 8, 16, 512], 8, [1, 8, 16, 512], [8, 16, 32, 64]),
+        ([128, 2048], 1, [128, 2048], [8]),
     ],
 )
-def test_precompile_skips_sub_block_draft_forward(
+def test_precompile_separates_context_and_query_buckets(
     buckets, max_reqs, kv_buckets, draft_buckets
 ):
     proposer = _make_proposer(draft_tp=8, target_tp=8)
@@ -151,6 +181,7 @@ def test_precompile_skips_sub_block_draft_forward(
         most_model_len=None,
         max_num_blocks_per_req=4,
         num_tokens_paddings=buckets,
+        num_reqs_paddings=[1, 2, 4, 8],
         _precompile_timed=mock.MagicMock(
             return_value=mock.MagicMock(
                 __enter__=mock.MagicMock(return_value=None),
@@ -374,6 +405,9 @@ def test_prepare_dflash_inputs(device):
     proposer.runner = SimpleNamespace(
         device=device,
         num_tokens_paddings=[8, 16, 32],
+        num_reqs_paddings=[1, 2, 4, 8],
+        num_reqs_max_model_len=8,
+        num_reqs_most_model_len=None,
         max_num_reqs=8,
         _dp_lockstep_enabled=lambda: False,
     )
@@ -424,6 +458,9 @@ def test_update_draft_kv_cache_from_target_unit(device):
         kv_caches=[torch.zeros((1, 8, 2, 2, 16), dtype=torch.float32, device=device)],
         block_size=8,
         num_tokens_paddings=[8, 16, 32],
+        num_reqs_paddings=[1, 2, 4, 8],
+        num_reqs_max_model_len=8,
+        num_reqs_most_model_len=None,
         mesh=None,
         _dp_lockstep_enabled=lambda: False,
     )
@@ -660,6 +697,9 @@ def test_prepare_dflash_inputs_dp_lockstep(device):
     proposer.runner = SimpleNamespace(
         device=device,
         num_tokens_paddings=[8, 16, 32],
+        num_reqs_paddings=[1, 2, 4, 8],
+        num_reqs_max_model_len=8,
+        num_reqs_most_model_len=None,
         _dp_lockstep_enabled=lambda: True,
         _dp_step_max_reqs=4,
         max_num_reqs=8,
@@ -794,15 +834,21 @@ def test_context_only_prefill_updates_real_and_padding_chunks_without_proposals(
     proposer._dp_dummy_forward.assert_not_called()
 
 
-@pytest.mark.parametrize("buckets,expected", [([2048], 2048), ([128, 2048], 128)])
+@pytest.mark.parametrize("buckets", [[2048], [128, 2048]])
 def test_single_request_draft_bucket_is_separate_from_prefill_token_budget(
-    buckets, expected
+    buckets,
 ):
     proposer = _make_proposer(draft_tp=8, target_tp=8)
     proposer.speculative_config.num_speculative_tokens = 5
-    proposer.runner = SimpleNamespace(_dp_step_max_reqs=1, num_tokens_paddings=buckets)
+    proposer.runner = SimpleNamespace(
+        _dp_step_max_reqs=1,
+        num_tokens_paddings=buckets,
+        num_reqs_paddings=[8],
+        num_reqs_max_model_len=8,
+        num_reqs_most_model_len=None,
+    )
     assert proposer.block_size == 6
-    assert proposer._dp_draft_bucket() == expected
+    assert proposer._dp_draft_bucket() == 48
 
 
 def test_v41_dspark_tp1_pairs_idle_dp_draft_collectives():

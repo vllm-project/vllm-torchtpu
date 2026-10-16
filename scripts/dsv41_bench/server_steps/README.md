@@ -8,8 +8,10 @@ The workload uses eight distinct 98304-token cached prefixes, 16384 new input
 tokens per request, and one greedy output token. Each DP engine admits one
 request with a 2048-token budget. The model uses CED, FP8 KV, CPU Engram offload
 and DSpark K5. KV is automatically sized with memory utilization 0.85, rather
-than capped at 4 GiB. Compile buckets are `[128,2048]`: DSpark's small query
-block selects 128, while target chunks larger than 128 still select 2048.
+than capped at 4 GiB. Target compile buckets are `[128,2048]`; target chunks
+larger than 128 select 2048. DSpark query forwards use a separate 40-row
+bucket (the runner's minimum eight-request bucket times K5). This pads
+query rows only; the SWA128 history window is unchanged.
 The 2048-token scheduler budget is unchanged. The server uses the model's default context limit; it does not cap
 `max_model_len` to this benchmark's 114688-token input. The 96K prefix and 16K
 extension are client workload sizes.
@@ -282,11 +284,17 @@ python scripts/dsv41_bench/server_steps/run.py --scenario decode \
 
 This compiles `[288,2048]`. Steady target verification is exactly
 48 requests x (K + 1) = 288 rows. The 2048-token bucket covers prefix preparation
-and mixed batches. The scheduler input budget is 2048. Request count, prompt
-length, output length and DSpark K remain unchanged. Startup readiness, phase
-timings and source/runtime identities are saved. Persistent caches are disabled
-through environment variables; the compiler retains its default serialization
-path.
+and mixed batches. The scheduler input budget is 2048. DSpark query forwards
+use a separate request-based ladder: `[40,80,160,240]` rows for up to 48
+requests at K5. The C8 prefill scenario has one request per DP rank; the
+runner's minimum eight-request bucket gives 40 draft rows even though the
+target compiles `[128,2048]`. Draft context-KV updates still consume the
+target bucket.
+
+Request count, prompt length, output length and DSpark K remain unchanged.
+Startup readiness, phase timings and source/runtime identities are saved.
+Persistent caches are disabled through environment variables; the compiler
+retains its default serialization path.
 
 The full-DP checks remain mandatory. They require a common C384 steady window
 through the real scheduler; synthetic startup warmup does not establish this.

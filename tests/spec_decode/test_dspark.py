@@ -190,3 +190,59 @@ def test_target_aux_capture_layer_mapping(model_type, layer_fields, expected):
         {"model_type": model_type, "dspark_noise_token_id": 7, **layer_fields}
     )
     assert p._target_aux_layer_ids() == expected
+
+
+@pytest.mark.parametrize("target_buckets", [[2048], [128, 2048], [288, 2048]])
+@pytest.mark.parametrize(
+    "max_reqs,most_reqs,expected",
+    [
+        (1, None, [5]),
+        (8, None, [40]),
+        (48, None, [40, 80, 160, 240]),
+        (20, 48, [40, 80, 160, 240]),
+    ],
+)
+def test_draft_query_buckets_are_independent_of_target(
+    target_buckets, max_reqs, most_reqs, expected
+):
+    proposer = _make_proposer(
+        {"dspark_noise_token_id": 7, **_LAYER_IDS}, num_speculative_tokens=5
+    )
+    capacity = max(max_reqs, most_reqs or 0)
+    proposer.runner = SimpleNamespace(
+        num_tokens_paddings=target_buckets,
+        num_reqs_paddings=[min(n, capacity) for n in (8, 16, 32, 48)],
+        num_reqs_max_model_len=max_reqs,
+        num_reqs_most_model_len=most_reqs,
+        _dp_step_max_reqs=capacity,
+    )
+    assert proposer._draft_token_paddings() == expected
+    assert proposer._get_padded_len(5) == expected[0]
+    assert proposer._dp_draft_bucket() == capacity * 5
+    with pytest.raises(ValueError, match="exceed the request capacity"):
+        proposer._get_padded_len(capacity * 5 + 1)
+
+
+def test_draft_precompile_keeps_context_kv_on_target_buckets():
+    proposer = _make_proposer(
+        {"dspark_noise_token_id": 7, **_LAYER_IDS}, num_speculative_tokens=5
+    )
+    proposer.runner = SimpleNamespace(
+        num_tokens_paddings=[2048],
+        num_reqs_paddings=[8],
+        num_reqs_max_model_len=8,
+        num_reqs_most_model_len=None,
+        most_model_len=None,
+        max_num_blocks_per_req=4,
+        _precompile_timed=mock.MagicMock(),
+    )
+    proposer.draft_model = object()
+    proposer._dummy_precompute_and_update_kv_cache = mock.Mock()
+    proposer._dummy_draft_forward = mock.Mock()
+    proposer.precompile()
+    proposer._dummy_precompute_and_update_kv_cache.assert_called_once_with(
+        num_tokens=2048, num_reqs=8, num_blocks=4, sync=True
+    )
+    proposer._dummy_draft_forward.assert_called_once_with(
+        num_tokens=40, use_max_model_len=True, sync=True
+    )

@@ -253,6 +253,12 @@ class DFlashProposer:
         draft_vllm_config = copy.copy(self.vllm_config)
         draft_model_config = copy.copy(self.speculative_config.draft_model_config)
         draft_model_config.runner_type = "draft"
+        draft_vllm_config.compilation_config = copy.copy(
+            self.vllm_config.compilation_config
+        )
+        draft_vllm_config.compilation_config.compile_sizes = (
+            self._draft_token_paddings()
+        )
         with (
             set_model_tag("dflash_head"),
             set_vllm_model_wrapper_context(mesh=self.runner.mesh),
@@ -264,11 +270,22 @@ class DFlashProposer:
                 model_config=draft_model_config,
             )
 
+    def _draft_token_paddings(self) -> list[int]:
+        """Query blocks follow request buckets, independently of target rows."""
+        runner = self.runner
+        max_reqs = max(
+            runner.num_reqs_max_model_len, runner.num_reqs_most_model_len or 0
+        )
+        return sorted(
+            {min(n, max_reqs) * self.block_size for n in runner.num_reqs_paddings}
+            | {max_reqs * self.block_size}
+        )
+
     def _get_padded_len(self, target_len: int) -> int:
-        for p in self.runner.num_tokens_paddings:
-            if p >= target_len:
-                return p
-        return target_len
+        for size in self._draft_token_paddings():
+            if size >= target_len:
+                return size
+        raise ValueError(f"Draft query rows {target_len} exceed the request capacity")
 
     def _build_attn_metadata_for_draft(
         self,
@@ -644,17 +661,6 @@ class DFlashProposer:
         logger.info("Precompiling DFlash draft model buckets...")
 
         runner = self.runner
-        block_size = self.block_size
-        # A most-model-len chunk holds up to num_reqs_most_model_len
-        # requests (> num_reqs_max_model_len), and under EP-DP lockstep the
-        # coordinated bucket is sized from the DP-wide max chunk request
-        # count — so warm draft forwards up to the larger bound, or the
-        # first such step compiles XLA mid-serving.
-        max_chunk_reqs = max(
-            runner.num_reqs_max_model_len, runner.num_reqs_most_model_len or 0
-        )
-        max_draft_tokens = self._get_padded_len(max_chunk_reqs * block_size)
-
         with runner._precompile_timed("drafter first pass"):
             for num_tokens in runner.num_tokens_paddings:
                 # Precompile KV Cache Update Graph (used in both prefill and decode)
@@ -674,11 +680,9 @@ class DFlashProposer:
                         sync=True,
                     )
 
-                # Context-KV updates allow short chunks;
-                # draft forward needs a full block.
-                if not block_size <= num_tokens <= max_draft_tokens:
-                    continue
-
+            # Context-KV consumes target hidden rows; query forwards consume
+            # one draft block per request. Warm each on its own shape ladder.
+            for num_tokens in self._draft_token_paddings():
                 self._dummy_draft_forward(
                     num_tokens=num_tokens, use_max_model_len=True, sync=True
                 )
