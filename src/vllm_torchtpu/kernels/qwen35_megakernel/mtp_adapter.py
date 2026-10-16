@@ -120,8 +120,8 @@ def _step_operands(
     j = jnp.arange(T, dtype=jnp.int32)
     pos = jnp.where(live[:, None], lens[:, None] - T + j, j).reshape(B)
     live_rows = jnp.repeat(live, T)
-    rows = hidden.shape[0]
-    hid = jnp.zeros((M, hidden.shape[1]), hidden.dtype).at[:rows].set(hidden)
+    rows = min(hidden.shape[0], M)
+    hid = jnp.zeros((M, hidden.shape[1]), hidden.dtype).at[:rows].set(hidden[:rows])
     hid = jnp.where(_fit(live_rows, M)[:, None], hid, jnp.zeros_like(hid))
     if gather_indices is None:
         moe_rows = live_rows.astype(jnp.int32)
@@ -414,7 +414,7 @@ class Qwen35MtpMegakernel:
             n_in = len(meta)
             b_max = buckets[-1]
 
-            if gather and rows > b_max:
+            if gather and rows > b_max and knr > (b_max // T):
                 b0 = b_max
                 ns0 = b0 // T
                 rows1 = rows - b0
@@ -488,8 +488,8 @@ class Qwen35MtpMegakernel:
                 )(out0, out1, gidx)
                 return out, new_pool
 
-            c, step = self._step(T, select_bucket(rows, buckets), width)
-            _need(rows <= c.M, f"{rows} rows exceed the {c.M}-row step")
+            c, step = self._step(T, select_bucket(min(rows, b_max), buckets), width)
+            _need(min(rows, b_max) <= c.M, f"{rows} rows exceed the {c.M}-row step")
 
             def prep(*xs: jax.Array) -> tuple[jax.Array, ...]:
                 return _step_operands(c, *xs[:4], xs[4] if gather else None)
@@ -556,7 +556,11 @@ class Qwen35MtpMegakernel:
             if isinstance(attn_metadata, dict)
             else None
         )
-        max_rows = buckets[-1] * 2 if step0 else buckets[-1]
+        max_rows = (
+            min(buckets[-1] * 2, int(md.seq_lens.shape[0]) * (_NUM_SPEC_TOKENS + 1))
+            if (step0 and md is not None)
+            else (buckets[-1] * 2 if step0 else buckets[-1])
+        )
         ok = bool(
             self.bound
             and buckets
