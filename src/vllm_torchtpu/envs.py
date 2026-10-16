@@ -65,6 +65,8 @@ if TYPE_CHECKING:
     TPU_KERNEL_RELOAD_MODULES: str = ""
     TPU_GREEDY_TOP_TOKENS: bool = False
     DP_SCHED_ENABLED: bool = False
+    VLLM_TPU_PREFILL_GATE_MIN_CADENCES: int = 0
+    VLLM_TPU_PREFILL_GATE_LOG_STEPS: int = 1000
     MLA_XPOSE_N_TILE_SIZE: int = 160
     MIXED_Q_SPLIT: int | None = None
     MIXED_NUM_QUERIES_PER_BLOCK: int | None = None
@@ -630,6 +632,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_GREEDY_TOP_TOKENS": env_bool("TPU_GREEDY_TOP_TOKENS"),
     # Enable TpuDpScheduler.
     "DP_SCHED_ENABLED": lambda: bool(int(os.getenv("DP_SCHED_ENABLED") or "0")),
+    # DpPrefillGateScheduler: consecutive cadence-aligned steps that must exhaust
+    # the token budget with admissible requests still waiting before a DP rank
+    # skips the prefill hold-back. 0 keeps vLLM's own capacity-bound test.
+    "VLLM_TPU_PREFILL_GATE_MIN_CADENCES": env_nonnegative_int(
+        "VLLM_TPU_PREFILL_GATE_MIN_CADENCES", 0
+    ),
+    # DpPrefillGateScheduler: steps between per-rank hold-back stats log lines
+    # (0 disables the log).
+    "VLLM_TPU_PREFILL_GATE_LOG_STEPS": env_nonnegative_int(
+        "VLLM_TPU_PREFILL_GATE_LOG_STEPS", 1000
+    ),
     # Tile size for MLA transpose pipeline.
     "MLA_XPOSE_N_TILE_SIZE": lambda: int(os.getenv("MLA_XPOSE_N_TILE_SIZE", "160")),
     "MIXED_Q_SPLIT": env_optional_int("MIXED_Q_SPLIT"),
