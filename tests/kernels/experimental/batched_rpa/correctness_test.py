@@ -442,6 +442,13 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
             4: 0.2,
         }
         tol = tols[dtype_bits]
+        if nan_rows is not None:
+            # Every other sequence must stay finite and match the reference.
+            self.assertTrue(jnp.isnan(output[nan_rows]).all().item())
+            keep = np.ones(output.shape[0], dtype=bool)
+            keep[nan_rows] = False
+            output, expected = output[keep], expected[keep]
+            self.assertTrue(jnp.isfinite(output).all().item())
         self.assertFalse(
             jnp.any(jnp.isnan(output)).item(),
             "output contains NaNs",
@@ -961,14 +968,26 @@ class RaggedPagedAttentionKernelTest(jtu.JaxTestCase):
         pages_per_seq = 8
         q_len, kv_len = 4, 260
 
-        q = jnp.array(rng.random((4, num_q_heads, head_dim), dtype=np.float32), dtype=dtype)
-        k = jnp.array(rng.random((4, num_kv_heads, head_dim), dtype=np.float32), dtype=dtype)
-        v = jnp.array(rng.random((4, num_kv_heads, head_dim), dtype=np.float32), dtype=dtype)
+        q = jnp.array(
+            rng.random((4, num_q_heads, head_dim), dtype=np.float32), dtype=dtype
+        )
+        k = jnp.array(
+            rng.random((4, num_kv_heads, head_dim), dtype=np.float32), dtype=dtype
+        )
+        v = jnp.array(
+            rng.random((4, num_kv_heads, head_dim), dtype=np.float32), dtype=dtype
+        )
         kv_packing = utils.get_dtype_packing(dtype)
         num_kv_heads_x2 = utils.align_to(num_kv_heads * 2, kv_packing)
         kv_cache = jnp.array(
             rng.random(
-                (num_pages, page_size, num_kv_heads_x2 // kv_packing, kv_packing, head_dim),
+                (
+                    num_pages,
+                    page_size,
+                    num_kv_heads_x2 // kv_packing,
+                    kv_packing,
+                    head_dim,
+                ),
                 dtype=np.float32,
             ),
             dtype=dtype,
