@@ -12,13 +12,14 @@ import torch
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import wo_a_projection
 from vllm_torchtpu.kernels.deepseek_v41.csa2 import csa2
 from vllm_torchtpu.kernels.deepseek_v41.csa2_cache import (
-    gather_csa2_kv_sc,
     publish_csa2_kv,
 )
 from vllm_torchtpu.kernels.deepseek_v41.csa2_metadata import (
     prepare_main_records,
     prepare_swa_metadata,
 )
+from vllm_torchtpu.kernels.deepseek_v41.csa2_pipeline import csa2_pipeline
+from vllm_torchtpu.kernels.deepseek_v41.tuned_block_sizes import csa2_gather_chunk_size
 from vllm_torchtpu.kernels.mla.paged_swa import swa_word_pages, write_swa_word_pool
 
 if TYPE_CHECKING:
@@ -61,23 +62,17 @@ def _publish_swa_banked(
     return write_swa_word_pool((raw, high), records, values, page_size=page_size)
 
 
-def _gather(
-    raw: jax.Array,
-    high: jax.Array | None,
-    scales: jax.Array,
-    high_scales: jax.Array | None,
-    selected: jax.Array,
-    pages: jax.Array,
-    starts: jax.Array,
-    page_size: int,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
-    records, counts = prepare_main_records(selected, pages, starts, page_size=page_size)
-    words, scale = gather_csa2_kv_sc(
-        raw if high is None else (raw, high),
-        scales if high_scales is None else (scales, high_scales),
-        records,
+def _inverse_rope(cos_sin: jax.Array, positions: jax.Array) -> jax.Array:
+    # Q/K already carry RoPE; CSA2 consumes this small inverse-rotation table.
+    table = cos_sin[positions].astype(jnp.float32)
+    cos = jnp.concatenate(
+        (jnp.ones((positions.shape[0], 64)), jnp.repeat(table[:, :32], 2, axis=1)),
+        axis=1,
     )
-    return words, scale, counts
+    sin = jnp.repeat(table[:, 32:], 2, axis=1)
+    sin *= jnp.where(jnp.arange(64) % 2 == 0, 1.0, -1.0)
+    sin = jnp.concatenate((jnp.zeros((positions.shape[0], 64)), sin), axis=1)
+    return jnp.stack((cos, sin), axis=1)
 
 
 def _attend(
@@ -97,16 +92,8 @@ def _attend(
     ratio: int,
     scale: float,
     non_causal: bool,
+    bq: int,
 ) -> jax.Array:
-    # CSA2 keeps its adjacent-pair inverse-RoPE lane layout. Q/K were rotated
-    # by the existing model producer. This is only a small per-token table.
-    table = cos_sin[positions].astype(jnp.float32)
-    cos = jnp.concatenate(
-        (jnp.ones((q.shape[0], 64)), jnp.repeat(table[:, :32], 2, axis=1)), axis=1
-    )
-    sin = jnp.repeat(table[:, 32:], 2, axis=1)
-    sin *= jnp.where(jnp.arange(64) % 2 == 0, 1.0, -1.0)
-    sin = jnp.concatenate((jnp.zeros((q.shape[0], 64)), sin), axis=1)
     return csa2(
         q,
         words,
@@ -115,13 +102,70 @@ def _attend(
         starts,
         positions,
         sink.astype(jnp.float32),
-        jnp.stack((cos, sin), axis=1),
+        _inverse_rope(cos_sin, positions),
         swa_metadata=metadata,
         swa_bounds=bounds if non_causal else None,
         main_lengths=counts,
         compress_ratio=ratio,
         scale=scale,
-        bq=6 if q.shape[0] <= 384 else 16,
+        bq=bq,
+    )
+
+
+def _gather_attend(
+    q: jax.Array,
+    raw: jax.Array,
+    high: jax.Array | None,
+    scales: jax.Array,
+    high_scales: jax.Array | None,
+    selected: jax.Array,
+    pages: jax.Array,
+    main_starts: jax.Array,
+    swa: jax.Array,
+    swa_high: jax.Array | None,
+    starts: jax.Array,
+    positions: jax.Array,
+    sink: jax.Array,
+    cos_sin: jax.Array,
+    metadata: jax.Array,
+    bounds: jax.Array,
+    main_page_size: int,
+    swa_page_size: int,
+    ratio: int,
+    scale: float,
+    non_causal: bool,
+    bq: int,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    records, counts = prepare_main_records(
+        selected, pages, main_starts, page_size=main_page_size
+    )
+    output, words, scales = csa2_pipeline(
+        q,
+        raw if high is None else (raw, high),
+        scales if high_scales is None else (scales, high_scales),
+        records,
+        swa_word_pages(swa if swa_high is None else (swa, swa_high), swa_page_size),
+        starts,
+        positions,
+        sink.astype(jnp.float32),
+        _inverse_rope(cos_sin, positions),
+        metadata,
+        bounds if non_causal else None,
+        counts,
+        chunk_size=csa2_gather_chunk_size(q.shape[0]),
+        bq=bq,
+        scale=scale,
+        compress_ratio=ratio,
+    )
+    return output, words, scales, counts
+
+
+def _fake_gather_attend(q, raw, high, scales, high_scales, *_):
+    return (
+        torch.empty_like(q),
+        raw.new_empty((q.shape[0], 512, 128)),
+        scales.new_empty((q.shape[0], 512)),
+        raw.new_empty((q.shape[0],)),
     )
 
 
@@ -216,20 +260,16 @@ def initialize_csa2_ops() -> None:
             lambda r, h, *_: (torch.empty_like(r), torch.empty_like(h)),
         ),
         (
-            "gather",
-            _gather,
-            (P(),) * 7 + (None,),
-            lambda r, h, s, hs, ids, *_: (
-                r.new_empty((ids.shape[0], 512, 128)),
-                s.new_empty((ids.shape[0], 512)),
-                ids.new_empty((ids.shape[0],), dtype=torch.int32),
-            ),
-        ),
-        (
             "attend",
             _attend,
-            (P(),) * 12 + (None,) * 4,
+            (P(),) * 12 + (None,) * 5,
             lambda q, *_: torch.empty_like(q),
+        ),
+        (
+            "gather_attend",
+            _gather_attend,
+            (P(),) * 16 + (None,) * 6,
+            _fake_gather_attend,
         ),
         (
             "project",
@@ -243,7 +283,7 @@ def initialize_csa2_ops() -> None:
         "publish_main": 2,
         "publish_main_banked": 4,
         "publish_swa_banked": 2,
-        "gather": 3,
+        "gather_attend": 4,
     }
     donated = {
         "publish_main": (0, 1),
@@ -323,6 +363,8 @@ def attention(
 ) -> torch.Tensor:
     from . import attention_kernels
 
+    if not q.shape[0]:
+        return q
     if pages is None:
         # Already physical records: a single synthetic sequence preserves IDs.
         page_size = (
@@ -338,10 +380,12 @@ def attention(
         page_size = main.shape[1]
     assert main_starts is not None and main.scale is not None
     cache = attention_kernels._active_gathered_kv
+    bq = 6 if q.shape[0] <= 384 else 16
     layout = ("csa2", page_size)
     gathered = cache.get(main, records, layout) if cache is not None else None
     if gathered is None:
-        words, scales, counts = _ops["gather"](
+        output, words, scales, counts = _ops["gather_attend"](
+            q,
             main.raw,
             main.raw_hi,
             main.scale,
@@ -349,14 +393,25 @@ def attention(
             records.int(),
             pages.int(),
             main_starts.int(),
+            swa.raw,
+            swa.raw_hi,
+            starts.int(),
+            positions.int(),
+            sink,
+            cos_sin,
+            metadata.int(),
+            bounds.int(),
             page_size,
+            swa.shape[1],
+            ratio,
+            scale,
+            non_causal,
+            bq,
         )
-        gathered = (words, scales)
         if cache is not None:
-            cache.put(main, records, layout, gathered, valid_counts=counts)
-    else:
-        assert cache is not None and cache.valid_counts is not None
-        counts = cache.valid_counts
+            cache.put(main, records, layout, (words, scales), valid_counts=counts)
+        return output
+    assert cache is not None and cache.valid_counts is not None
     words, scales = gathered
     return _ops["attend"](
         q,
@@ -370,11 +425,12 @@ def attention(
         cos_sin,
         metadata.int(),
         bounds.int(),
-        counts,
+        cache.valid_counts,
         swa.shape[1],
         ratio,
         scale,
         non_causal,
+        bq,
     )
 
 
