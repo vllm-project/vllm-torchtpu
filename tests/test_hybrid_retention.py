@@ -643,7 +643,7 @@ class _GuardPool:
 
 
 class _GuardKVM:
-    """KVCacheManager stand-in with v0.29.0's two allocate_slots refusals."""
+    """KVCacheManager stand-in with v0.31.0's two allocate_slots refusals."""
 
     def __init__(self, free: int, need: int):
         self.pool = _GuardPool(free)
