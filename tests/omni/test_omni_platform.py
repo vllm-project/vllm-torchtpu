@@ -689,34 +689,19 @@ def test_tpu_omni_profiler_stop_error_still_merges(tmp_path, tpu_profiler):
     trace.clear.assert_called_once()
 
 
-def test_tpu_omni_profiler_canonical_ts_sync(tmp_path):
-    from vllm.config import ProfilerConfig
-
-    from vllm_torchtpu.omni.profiler import TpuOmniTorchProfilerWrapper
-
-    cfg = ProfilerConfig(
-        profiler="torch",
-        torch_profiler_dir=str(tmp_path),
-        torch_profiler_with_stack=False,
-        torch_profiler_record_shapes=True,
-        torch_profiler_with_memory=False,
-        torch_profiler_with_flops=True,
-    )
-
+def test_tpu_omni_profiler_canonical_ts_sync(tmp_path, tpu_profiler, monkeypatch):
+    cfg = _profiler_config(tmp_path)
     w0 = TpuOmniTorchProfilerWrapper(cfg, "w0", 0)
     w0.set_trace_filename("my_trace")
     w1 = TpuOmniTorchProfilerWrapper(cfg, "w1", 0)
     w1.set_trace_filename("my_trace")
 
-    with (
-        patch("torch.distributed.is_initialized", return_value=True),
-        patch("torch.distributed.get_world_size", return_value=2),
-        patch("torch.profiler.profile"),
-        patch("vllm_torchtpu.omni.profiler.TpuProfilerConfig"),
-    ):
-        with patch("torch.distributed.get_rank", return_value=0):
-            w0._start()
-        with patch("torch.distributed.get_rank", return_value=1):
-            w1._start()
+    # Two ranks of one distributed run, sharing the real profiler_trace marker.
+    monkeypatch.setattr("torch.distributed.is_initialized", lambda: True)
+    monkeypatch.setattr("torch.distributed.get_world_size", lambda: 2)
+    monkeypatch.setattr("torch.distributed.get_rank", lambda: 0)
+    w0._start()
+    monkeypatch.setattr("torch.distributed.get_rank", lambda: 1)
+    w1._start()
 
-        assert w0._capture_state[2] == w1._capture_state[2]
+    assert w0._capture_state[2] == w1._capture_state[2]
