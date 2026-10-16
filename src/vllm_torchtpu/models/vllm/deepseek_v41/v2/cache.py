@@ -8,6 +8,7 @@ import jax
 import torch
 from vllm.v1.worker.utils import allocate_kv_cache as allocate_upstream_kv_cache
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.csa_cache_layout import ROW_WORDS
 
 ROW_BYTES = ROW_WORDS * 4
@@ -63,6 +64,7 @@ class MaterializedNativeKVCache:
     native_raw_cache: dict[str, RawCachePool] = field(default_factory=dict)
     native_cache_layouts: dict[str, tuple] = field(default_factory=dict)
     rope_pools: dict[str, RawCachePool] = field(default_factory=dict)
+    scale_pools: dict[str, RawCachePool] = field(default_factory=dict)
 
 
 def native_cache_view(raw, shape, dtype, block_stride_bytes, offset_bytes):
@@ -181,7 +183,26 @@ def materialize_upstream_kv_cache(
     # 32-word slot per pool row, budgeted by `reserve_rope_companion`.
     fp8_layers = [name for name, view in views.items() if view.dtype == torch.uint8]
     rope_pools: dict[str, RawCachePool] = {}
-    if fp8_layers:
+    scale_pools: dict[str, RawCachePool] = {}
+    if fp8_layers and envs.TPU_DEEPSEEK_V41_ATTENTION == "csa2_paged":
+        assert word_rows
+
+        def scale_owner(owner):
+            if isinstance(owner, tuple):
+                return tuple(
+                    torch.zeros((bank.shape[0],), dtype=torch.float32, device=device)
+                    for bank in owner
+                )
+            return torch.zeros((owner.shape[0],), dtype=torch.float32, device=device)
+
+        scale_owners = [scale_owner(owner) for owner in pool_owners]
+        scale_pools = {name: scale_owners[pool_indices[name]] for name in fp8_layers}
+        raw_tensors += [
+            bank
+            for owner in scale_owners
+            for bank in (owner if isinstance(owner, tuple) else (owner,))
+        ]
+    elif fp8_layers:
         assert word_rows
         if split_banks:
             rope_owners: list[RawCachePool] = [
@@ -222,6 +243,7 @@ def materialize_upstream_kv_cache(
         native_raw_cache=native_raw_cache,
         native_cache_layouts=native_cache_layouts,
         rope_pools=rope_pools,
+        scale_pools=scale_pools,
     )
 
 
@@ -245,7 +267,9 @@ class PagedCacheRows:
     record units, before any device arithmetic or int32 index conversion.
     """
 
-    def __init__(self, raw, layout, rope=None):
+    def __init__(self, raw, layout, rope=None, scale=None, swa_words=False):
+        self.scale, self.scale_hi = scale if isinstance(scale, tuple) else (scale, None)
+        self.swa_words = swa_words
         if isinstance(raw, tuple):
             if len(raw) != 2:
                 raise ValueError("Split native cache requires exactly two banks")
@@ -268,17 +292,21 @@ class PagedCacheRows:
             raise ValueError("Native cache requires DSV4 int32[..., 128] word rows")
         if self.dtype not in (torch.bfloat16, torch.float32, torch.uint8):
             raise ValueError("Native cache records must be BF16, FP32 or FP8 bytes")
-        if self.dtype == torch.uint8 and (
-            self.row_bytes != ROW_BYTES
-            or self.rope is None
-            or (self.rope_hi is not None) != (self.raw_hi is not None)
-            or self.rope.shape
-            != (self.raw.shape[0] * ROPE_WORDS // ROW_WORDS, ROW_WORDS)
-            or (
-                self.raw_hi is not None
-                and self.rope_hi is not None
-                and self.rope_hi.shape
-                != (self.raw_hi.shape[0] * ROPE_WORDS // ROW_WORDS, ROW_WORDS)
+        if (
+            self.dtype == torch.uint8
+            and self.scale is None
+            and (
+                self.row_bytes != ROW_BYTES
+                or self.rope is None
+                or (self.rope_hi is not None) != (self.raw_hi is not None)
+                or self.rope.shape
+                != (self.raw.shape[0] * ROPE_WORDS // ROW_WORDS, ROW_WORDS)
+                or (
+                    self.raw_hi is not None
+                    and self.rope_hi is not None
+                    and self.rope_hi.shape
+                    != (self.raw_hi.shape[0] * ROPE_WORDS // ROW_WORDS, ROW_WORDS)
+                )
             )
         ):
             raise ValueError("FP8 records are one pool row plus a RoPE companion")
@@ -306,6 +334,25 @@ class PagedCacheRows:
         self.bank_records = self.raw.nbytes // self.row_bytes
         self.page_stride = stride_bytes // self.row_bytes
         self.row_offset = offset_bytes // self.row_bytes
+        if self.scale is not None:
+            if self.dtype != torch.uint8 or self.row_bytes != ROW_BYTES:
+                raise ValueError("CSA2 scale companion requires 512-byte main records")
+            scale_banks = (
+                (self.scale,) if self.scale_hi is None else (self.scale, self.scale_hi)
+            )
+            if len(scale_banks) != len(banks) or any(
+                s.dtype != torch.float32 or s.shape != b.shape[:1]
+                for b, s in zip(banks, scale_banks)
+            ):
+                raise ValueError("CSA2 scales must match each physical main owner")
+        if self.swa_words and (
+            self.dtype != torch.bfloat16
+            or self.row_bytes != 1024
+            or self.row_offset % self.shape[1]
+            or self.page_stride % self.shape[1]
+            or any(bank.shape[0] % (2 * self.shape[1]) for bank in banks)
+        ):
+            raise ValueError("CSA2 SWA owners must preserve whole plane-major pages")
 
     def numel(self):
         return math.prod(self.shape)
@@ -387,6 +434,15 @@ class PagedCacheRows:
     def write(self, slots, values, after=None):
         """``after`` (optional) must be computed before the in-place write."""
         records = self.row_indices(slots.clamp(min=0)).masked_fill(slots < 0, -1)
+        if self.swa_words:
+            if after is not None:
+                raise NotImplementedError(
+                    "CSA2 SWA publication does not accept deferred-write dependencies"
+                )
+            from .csa2_adapter import publish_swa
+
+            publish_swa(self, records, values.to(torch.bfloat16).reshape(-1, 512))
+            return
         if self.dtype == torch.uint8:
             self._write_fp8(records, values)
             return
@@ -432,6 +488,11 @@ class PagedCacheRows:
 
     def _write_fp8(self, records, values):
         """Quantize BF16 latents into NoPE rows and their RoPE companion slots."""
+        if self.scale is not None:
+            from .csa2_adapter import publish_main
+
+            publish_main(self, records, values.to(torch.bfloat16).reshape(-1, 512))
+            return
         assert self.rope is not None
         if self.raw.device.type == "cpu":
             import numpy as np
@@ -480,7 +541,11 @@ class NativeCacheView:
         raw = getattr(self, "_tpu_raw_cache", None)
         if torch.compiler.is_compiling() and raw is not None:
             return PagedCacheRows(
-                raw, self._tpu_cache_layout, getattr(self, "_tpu_rope_pool", None)
+                raw,
+                self._tpu_cache_layout,
+                getattr(self, "_tpu_rope_pool", None),
+                getattr(self, "_tpu_scale_pool", None),
+                getattr(self, "_tpu_swa_words", False),
             )
         return self._bound_cache
 
@@ -488,10 +553,13 @@ class NativeCacheView:
     def kv_cache(self, cache):
         self._bound_cache = cache
 
-    def bind_kv_cache(self, cache, *, raw_cache=None, layout=None, rope_pool=None):
+    def bind_kv_cache(
+        self, cache, *, raw_cache=None, layout=None, rope_pool=None, scale_pool=None
+    ):
         cast(_CacheBinding, super()).bind_kv_cache(cache)
         self._tpu_raw_cache = raw_cache
         self._tpu_rope_pool = rope_pool
+        self._tpu_scale_pool = scale_pool
         if layout is not None:
             self._tpu_cache_layout = layout
             return
@@ -823,6 +891,10 @@ def encode_fp8_kv(latent: jax.Array) -> tuple[jax.Array, jax.Array]:
 
 
 def initialize_cache_ops():
+    if envs.TPU_DEEPSEEK_V41_ATTENTION == "csa2_paged":
+        from .csa2_adapter import initialize_csa2_ops
+
+        initialize_csa2_ops()
     global _read_values_op, _read_values_2bank_op, _write_op, _write_values_op
     global _encode_fp8_op, _write_values_after_op
     if _write_op is not None:

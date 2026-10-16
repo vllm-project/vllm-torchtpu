@@ -1369,6 +1369,7 @@ class KVCacheManager:
         native_raw_cache = None
         native_cache_layouts = None
         native_rope_pools = None
+        native_scale_pools = None
         if use_upstream_allocator:
             if envs.TPU_DEEPSEEK_V41_IMPL == "v2":
                 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
@@ -1382,6 +1383,7 @@ class KVCacheManager:
                     word_rows=True,
                 )
                 native_rope_pools = materialized.rope_pools
+                native_scale_pools = materialized.scale_pools
             else:
                 materialized = self.ds_v4.initialize_v41(
                     kv_cache_config, layer_name_to_spec.__getitem__
@@ -1751,6 +1753,7 @@ class KVCacheManager:
             native_raw_cache=native_raw_cache,
             native_cache_layouts=native_cache_layouts,
             native_rope_pools=native_rope_pools,
+            native_scale_pools=native_scale_pools,
         )
 
         # Pre-build and cache bundled RPA kernels across all attention layers before

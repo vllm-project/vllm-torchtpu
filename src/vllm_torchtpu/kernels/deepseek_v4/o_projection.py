@@ -175,7 +175,7 @@ def _kernel(
     x_ref: jax.Ref,  # VMEM (tile_t, H, head_dim) bf16
     w_ref: jax.Ref,  # VMEM (D, tile_r) fp8
     scale_ref: jax.Ref,  # VMEM (1, tile_r) f32
-    cos_sin_ref: jax.Ref,  # VMEM (tile_t, 2 * LANE) f32
+    cos_sin_ref: jax.Ref | None,  # VMEM (tile_t, 2 * LANE) f32
     # output
     out_ref: jax.Ref,  # VMEM (tile_t, tile_r) out_dtype
     *,
@@ -186,14 +186,16 @@ def _kernel(
 ) -> None:
     rhs = w_ref[...]
     scale = scale_ref[...]
-    cos_sin = cos_sin_ref[...]
+    cos_sin = cos_sin_ref[...] if cos_sin_ref is not None else None
     sub_t = tile_t // num_sub_t
     out_dtype = x_ref.dtype
     for s in range(num_sub_t):
         # Subchunk the tile to allow more Instruction level parallelism
         # opportunities to be exploited by the LLO compiler.
         rows = slice(s * sub_t, (s + 1) * sub_t)
-        x = _rope_heads(x_ref[rows], cos_sin[rows], head_dim=head_dim)
+        x = x_ref[rows]
+        if cos_sin is not None:
+            x = _rope_heads(x, cos_sin[rows], head_dim=head_dim)
         x = x.reshape(sub_t, -1)
         inv = None
         if quantize_activations:
@@ -231,7 +233,7 @@ def wo_a_projection(
     x: jax.Array,  # [T, G * H, head_dim] bf16
     wo_a: jax.Array,  # [D, G * R] fp8
     wo_a_scale: jax.Array,  # [G * R] float32
-    cos_sin: jax.Array,  # [T, 2 * LANE] float32
+    cos_sin: jax.Array | None,  # [T, 2 * LANE] float32, or already rotated
     *,
     tile_t: int | None = None,
     tile_r: int | None = None,
@@ -253,7 +255,8 @@ def wo_a_projection(
     preferred_element_type=f32) * wo_a_scale.view(g, r).to(bf16)``
 
     ``quantize_activations`` quantizes each activation block's rows to fp8 in
-    the kernel so both MXU operands are fp8.
+    the kernel so both MXU operands are fp8. ``cos_sin=None`` consumes an
+    already inverse-rotated input without loading a cache or rotating again.
     """
     assert x.ndim == 3
     assert x.dtype == jnp.bfloat16
@@ -275,7 +278,8 @@ def wo_a_projection(
     assert out_features % num_groups == 0
     lora_rank = out_features // num_groups
 
-    assert cos_sin.ndim == 2 and cos_sin.shape == (num_tokens, 2 * LANE)
+    if cos_sin is not None:
+        assert cos_sin.ndim == 2 and cos_sin.shape == (num_tokens, 2 * LANE)
     assert head_dim % LANE == 0
 
     if tile_r is None:
@@ -311,7 +315,11 @@ def wo_a_projection(
             # wo_a_scale
             pl.BlockSpec((1, tile_r), lambda g, t, r: (0, g * num_r_tiles + r)),
             # cos_sin: one token block
-            pl.BlockSpec((tile_t, 2 * LANE), lambda g, t, r: (t, 0)),
+            (
+                pl.BlockSpec((tile_t, 2 * LANE), lambda g, t, r: (t, 0))
+                if cos_sin is not None
+                else None
+            ),
         ],
         out_specs=pl.BlockSpec(
             (tile_t, tile_r), lambda g, t, r: (t, g * num_r_tiles + r)

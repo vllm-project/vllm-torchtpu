@@ -63,6 +63,7 @@ class _GatheredKVCache:
     records: torch.Tensor | None = None
     layout: tuple = ()
     values: tuple[torch.Tensor, torch.Tensor | None] | None = None
+    valid_counts: torch.Tensor | None = None
 
     def get(
         self, source: Any, records: torch.Tensor, layout: tuple
@@ -77,6 +78,8 @@ class _GatheredKVCache:
         records: torch.Tensor,
         layout: tuple,
         values: tuple[torch.Tensor, torch.Tensor | None],
+        *,
+        valid_counts: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
         self.source, self.records, self.layout, self.values = (
             source,
@@ -84,6 +87,7 @@ class _GatheredKVCache:
             layout,
             values,
         )
+        self.valid_counts = valid_counts
         return values
 
 

@@ -282,6 +282,9 @@ def tpu_bind_kv_cache(
     native_rope_pools: (
         Mapping[str, torch.Tensor | tuple[torch.Tensor, torch.Tensor]] | None
     ) = None,
+    native_scale_pools: (
+        Mapping[str, torch.Tensor | tuple[torch.Tensor, torch.Tensor]] | None
+    ) = None,
 ) -> None:
     """Bind kv_caches to ModelRunner and forward context."""
     assert len(runner_kv_caches) == 0
@@ -312,6 +315,13 @@ def tpu_bind_kv_cache(
             )
             if native_cache_layouts is None:
                 layer.bind_kv_cache(kv_cache, raw_cache=raw)
+            elif native_scale_pools:
+                layer.bind_kv_cache(
+                    kv_cache,
+                    raw_cache=raw,
+                    layout=native_cache_layouts[layer_name],
+                    scale_pool=native_scale_pools.get(layer_name),
+                )
             elif native_rope_pools is not None:
                 layer.bind_kv_cache(
                     kv_cache,

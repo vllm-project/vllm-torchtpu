@@ -197,6 +197,8 @@ class DSparkDeepseekV41Model(nn.Module):
                     f"DSpark draft block of up to {max_block_rows} rows "
                     f"exceeds the DSV4.1 sliding window ({layer.attn.window_size})."
                 )
+            if layer.attn._csa2 and max_block_rows > 64:
+                raise ValueError("CSA2 supports DSpark blocks of at most 64 queries")
             layer.attn.non_causal_multi_token_decode = True
             layer.attn.dspark_block_size = int(dspark_block_size)
 
