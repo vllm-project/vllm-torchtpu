@@ -221,6 +221,12 @@ sys.modules["vllm_omni.diffusion.models.wan2_2"] = _wan2_2
 sys.modules["vllm_omni.diffusion.models.wan2_2.wan2_2_transformer"] = (
     _wan2_2.wan2_2_transformer
 )
+sys.modules["vllm_omni.diffusion.models.wan2_2.wan2_2_vace_transformer"] = (
+    _wan2_2.wan2_2_vace_transformer
+)
+sys.modules["vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer"] = (
+    _wan2_2.wan2_2_s2v_transformer
+)
 sys.modules["vllm_omni.diffusion.layers"] = vllm_omni_mock.diffusion.layers
 sys.modules["vllm_omni.diffusion.layers.rope"] = vllm_omni_mock.diffusion.layers.rope
 sys.modules["vllm_omni.diffusion.layers.norm"] = vllm_omni_mock.diffusion.layers.norm

@@ -297,28 +297,48 @@ def _patch_wan_fresh_timestep() -> None:
     #   a tiny copy graph sees the view.
     # Effect (v7x, 480x832x81, 8 cores): first 12-step request 53.0 s -> 26.9 s
     #   (warm: 15.3 s); output is bit-identical.
-    # Scope: WanTransformer3DModel only (T2V, I2V, TI2V, both A14B experts).
-    #   VACE overrides forward and S2V is a separate class; neither is covered.
+    # Scope: WanTransformer3DModel (T2V, I2V, TI2V, both A14B experts), VACE
+    #   (overrides forward) and S2V (separate class). The numbers above are
+    #   T2V; VACE and S2V are covered but not measured on TPU.
     # TODO: remove once torch_tpu passes view offsets as runtime inputs.
+    from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import (
+        WanS2VTransformer3DModel,
+    )
     from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
         WanTransformer3DModel,
     )
-
-    from vllm_torchtpu.utils import synchronize_tensors
-
-    # On a re-run after cache_clear(), wrap the original forward, not ours.
-    orig_wan_forward = getattr(
-        WanTransformer3DModel, "_tpu_orig_forward", WanTransformer3DModel.forward
+    from vllm_omni.diffusion.models.wan2_2.wan2_2_vace_transformer import (
+        WanVACETransformer3DModel,
     )
-    WanTransformer3DModel._tpu_orig_forward = orig_wan_forward
+
+    for cls in (
+        WanTransformer3DModel,
+        WanVACETransformer3DModel,
+        WanS2VTransformer3DModel,
+    ):
+        _wrap_fresh_timestep(cls)
+    logger.info("Applied TPU patch: fresh timestep buffer for Wan, VACE and S2V.")
+
+
+_FRESH_TIMESTEP_PATCHED = "_tpu_fresh_timestep_patched"
+
+
+def _wrap_fresh_timestep(cls: type) -> None:
+    # cls.__dict__, not hasattr: VACE inherits attributes from
+    # WanTransformer3DModel.
+    if cls.__dict__.get(_FRESH_TIMESTEP_PATCHED):
+        return
+    forward = cls.forward
 
     def _fresh_timestep_forward(
         self: Any, hidden_states: Any, timestep: Any, *args: Any, **kwargs: Any
     ) -> Any:
         if isinstance(timestep, torch.Tensor):
+            from vllm_torchtpu.utils import synchronize_tensors
+
             timestep = timestep.clone()
             synchronize_tensors(timestep, wait=False)
-        return orig_wan_forward(self, hidden_states, timestep, *args, **kwargs)
+        return forward(self, hidden_states, timestep, *args, **kwargs)
 
-    WanTransformer3DModel.forward = _fresh_timestep_forward
-    logger.info("Applied TPU patch: fresh timestep buffer for Wan transformers.")
+    cls.forward = _fresh_timestep_forward
+    setattr(cls, _FRESH_TIMESTEP_PATCHED, True)

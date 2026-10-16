@@ -38,6 +38,7 @@ PR/nightly tests.
 
 import copy
 import dataclasses
+import importlib
 
 import pytest
 import torch
@@ -608,3 +609,76 @@ def test_wan_tiny_clip_parity(tmp_path, record_property):
     _assert_hf_encoder_parity(
         record_property, "tiny-clip", CLIPVisionModel, tmp_path, forward
     )
+
+
+class TestWanFreshTimestepPatch:
+    """The patched Wan forward gets a flushed copy of the timestep view."""
+
+    @pytest.mark.parametrize(
+        ("module_name", "cls_name"),
+        [
+            ("wan2_2_transformer", "WanTransformer3DModel"),
+            ("wan2_2_vace_transformer", "WanVACETransformer3DModel"),
+            ("wan2_2_s2v_transformer", "WanS2VTransformer3DModel"),
+        ],
+        ids=["wan", "vace", "s2v"],
+    )
+    def test_forward_gets_flushed_copy_of_timestep_view(
+        self, monkeypatch: pytest.MonkeyPatch, module_name: str, cls_name: str
+    ) -> None:
+        """Keyword only: the wrapper names timestep, and the pipelines call
+        forward by keyword."""
+        from vllm_torchtpu.omni import patches
+
+        cls = getattr(
+            importlib.import_module(f"vllm_omni.diffusion.models.wan2_2.{module_name}"),
+            cls_name,
+        )
+
+        calls = []
+        monkeypatch.setattr(
+            cls,
+            "forward",
+            lambda self, hidden_states, timestep, *args, **kwargs: calls.append(
+                (hidden_states, timestep, kwargs)
+            ),
+        )
+        # apply_omni_model_specific_patches() may already have patched the
+        # class in this session; reset the flag so this test can re-wrap.
+        monkeypatch.setattr(cls, patches._FRESH_TIMESTEP_PATCHED, False, raising=False)
+        synced = []
+        monkeypatch.setattr(
+            "vllm_torchtpu.utils.synchronize_tensors",
+            lambda t, wait=True: synced.append((t, wait)),
+        )
+        patches._wrap_fresh_timestep(cls)
+
+        # What the pipelines pass: t.expand(batch), a view into the schedule.
+        view = torch.arange(6.0)[3].expand(2)
+        hidden = torch.zeros(2, 4)
+        ctx = torch.ones(2, 3)
+        cls.forward(
+            object(), hidden_states=hidden, timestep=view, encoder_hidden_states=ctx
+        )
+
+        assert len(calls) == 1, f"original forward ran {len(calls)} times, expected 1"
+        got_hidden, got_t, got_kwargs = calls[0]
+        assert got_t._base is None, (
+            "forward got a view; the timestep should own its storage"
+        )
+        torch.testing.assert_close(
+            got_t, view, msg="copied timestep values differ from the view"
+        )
+        assert len(synced) == 1, (
+            f"synchronize_tensors called {len(synced)} times, expected 1"
+        )
+        assert synced[0][0] is got_t, (
+            "synchronize_tensors was not called on the tensor passed to forward"
+        )
+        assert synced[0][1] is False, (
+            "synchronize_tensors should not block (expected wait=False)"
+        )
+        assert got_hidden is hidden, "hidden_states was not passed through unchanged"
+        assert got_kwargs["encoder_hidden_states"] is ctx, (
+            "encoder_hidden_states was not passed through unchanged"
+        )

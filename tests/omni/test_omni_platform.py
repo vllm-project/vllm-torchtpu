@@ -13,7 +13,6 @@
 # limitations under the License.
 import os
 import sys
-import types
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -38,7 +37,6 @@ from vllm_torchtpu.omni.attention import (
 )
 from vllm_torchtpu.omni.patches import (
     _patch_diffusion_startup_warmup_sync,
-    _patch_wan_fresh_timestep,
     apply_omni_model_specific_patches,
     apply_omni_tpu_patches,
 )
@@ -238,42 +236,6 @@ def test_wan_ffn_gelu_fence(monkeypatch):
     torch.testing.assert_close(ffn(x), want * 2, rtol=0, atol=0)
     assert len(fenced) == 1
     torch.testing.assert_close(fenced[0], want, rtol=0, atol=0)
-
-
-@pytest.mark.parametrize("by_keyword", [False, True])
-def test_wan_timestep_fresh_buffer(monkeypatch, by_keyword):
-    """The patched Wan forward gets a flushed copy of the timestep view, not
-    the view itself; the other arguments pass through untouched."""
-
-    class StubWan(torch.nn.Module):
-        def forward(self, hidden_states, timestep, encoder_hidden_states=None):
-            self.got = (hidden_states, timestep, encoder_hidden_states)
-
-    monkeypatch.setitem(
-        sys.modules,
-        "vllm_omni.diffusion.models.wan2_2.wan2_2_transformer",
-        types.SimpleNamespace(WanTransformer3DModel=StubWan),
-    )
-    synced = []
-    monkeypatch.setattr(
-        "vllm_torchtpu.utils.synchronize_tensors",
-        lambda t, wait=True: synced.append((t, wait)),
-    )
-    _patch_wan_fresh_timestep()
-
-    model = StubWan()
-    hidden, ctx = torch.zeros(2, 4), torch.ones(2, 3)
-    view = torch.arange(6.0)[3].expand(2)
-    if by_keyword:
-        model(hidden_states=hidden, timestep=view, encoder_hidden_states=ctx)
-    else:
-        model(hidden, view, ctx)
-
-    got_hidden, got_t, got_ctx = model.got
-    assert got_t is not view and got_t._base is None
-    torch.testing.assert_close(got_t, view)
-    assert len(synced) == 1 and synced[0][0] is got_t and synced[0][1] is False
-    assert got_hidden is hidden and got_ctx is ctx
 
 
 def test_device_control_env_var():
