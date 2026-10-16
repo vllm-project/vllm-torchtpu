@@ -245,9 +245,7 @@ def _run_role(role: str, exchange: Path) -> None:
 
 @pytest.mark.parametrize("ssm_dtype", ["bfloat16", "float32"])
 def test_qwen_all_owner_pages_over_native_reshard(tmp_path, ssm_dtype):
-    from torch_tpu._internal.distributed.launchers.singlehost_wrapper import (
-        prepare_tpu_environment,
-    )
+    from tests.distributed.tpu_test_utils import prepare_tpu_environment
 
     _publish(tmp_path / "test-config.json", dict(ssm_dtype=ssm_dtype))
     roles = ("prefill", "decode")
