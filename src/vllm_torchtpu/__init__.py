@@ -1879,6 +1879,12 @@ def _patch_vllm_abort_on_preemption() -> None:
     patch_scheduler_init()
 
 
+def _patch_vllm_raiden_pd_completion() -> None:
+    from vllm_torchtpu.core.raiden_pd import patch_scheduler_init
+
+    patch_scheduler_init()
+
+
 def _patch_vllm_same_step_prefix_hits() -> None:
     """Keep prefix-cache hits off blocks the current step has not written.
 
