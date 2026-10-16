@@ -736,8 +736,8 @@ class TestTpuPlatform:
         [
             (None, "vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"),
             (
-                "vllm_torchtpu.core.srpt_prefill_scheduler.SrptPrefillScheduler",
-                "vllm_torchtpu.core.srpt_prefill_scheduler.SrptPrefillScheduler",
+                "vllm_torchtpu.core.experimental.srpt_prefill_scheduler.SrptPrefillScheduler",
+                "vllm_torchtpu.core.experimental.srpt_prefill_scheduler.SrptPrefillScheduler",
             ),
         ],
     )

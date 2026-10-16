@@ -52,8 +52,8 @@ waiting head require, ensuring that under KV pressure the longest remaining
 prefill chunk stays at ``self.running[-1]`` and active decodes or shorter
 prefills are never preempted in its place.
 
-Select with:
-    --scheduler-cls vllm_torchtpu.core.srpt_prefill_scheduler.SrptPrefillScheduler
+Select with ``--scheduler-cls``
+``vllm_torchtpu.core.experimental.srpt_prefill_scheduler.SrptPrefillScheduler``.
 """
 
 from itertools import islice

@@ -35,8 +35,8 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
+from vllm_torchtpu.core.experimental.srpt_prefill_scheduler import SrptPrefillScheduler
 from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
-from vllm_torchtpu.core.srpt_prefill_scheduler import SrptPrefillScheduler
 
 BLOCK_SIZE = 16
 
