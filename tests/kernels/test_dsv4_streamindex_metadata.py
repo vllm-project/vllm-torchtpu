@@ -548,6 +548,7 @@ class ChunkedMetadataTest(parameterized.TestCase):
         np.testing.assert_array_equal(np.array(meta_.num_steps), [0, 0, 0])
 
 
+@pytest.mark.tpu_test
 class RaggedScheduleBoundTest(parameterized.TestCase):
     """`max_steps` against ragged chunked schedules, with the slack taken out.
 
@@ -559,9 +560,11 @@ class RaggedScheduleBoundTest(parameterized.TestCase):
     blocks the schedule really uses times 1024. An undercount of a single bq
     block anywhere fails.
 
-    None of this builds a kernel, so it is a CPU test. The smem check is
-    stubbed out: these caps are sized to test the arithmetic, not to fit smem,
-    and on a TPU host it would refuse the larger ones.
+    None of this builds a kernel, but the 1024x step count makes the schedule's
+    [segments, max_steps] arrays 5-11 GB on CPU, which gets the CPU CI pod
+    killed; a TPU host runs it in seconds. The smem check is stubbed out: these
+    caps are sized to test the arithmetic, not to fit smem, and on a TPU host
+    it would refuse the larger ones.
     """
 
     PAGE_SIZE = 16
