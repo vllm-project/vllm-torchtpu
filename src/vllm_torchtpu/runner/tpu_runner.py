@@ -10641,6 +10641,17 @@ class TPUModelRunner(GPUModelRunner):
             # sweep one synthetic request per prompt-token bucket at nr=1. Each
             # runs the REAL two-phase propose+verify+sampling dispatch, so
             # torch-tpu emits the same fused programs serving will hit.
+            # With a draft megakernel step-0 program, a prompt of 1 + K tokens
+            # verifies K + 1 rows and runs that program, so the draft's own
+            # program would never be traced at that token bucket: warm a
+            # 1-token prompt there first (same bucket, q_len 1, the draft's own
+            # program).
+            drafter = getattr(self, "drafter", None)
+            mk_step0_bucket = (
+                1 + self.speculative_config.num_speculative_tokens
+                if getattr(drafter, "_mtp_mk_step0", None) is not None
+                else None
+            )
             with shape_variants.warmup() as buckets:
                 for i, P in enumerate(self.num_tokens_paddings):
                     # A single request's prompt can't exceed max_model_len; skip
@@ -10659,19 +10670,25 @@ class TPUModelRunner(GPUModelRunner):
                             cast("torch.nn.Module", self.drafter.draft_model),
                             cast("Eagle3Proposer", self.drafter).draft_vllm_config,
                         )
+                    p_candidates = (
+                        (1, int(P)) if int(P) == mk_step0_bucket else (int(P),)
+                    )
                     # Greedy and non-greedy (do_sampling=True) verify+sample are
                     # DISTINCT fused programs, so sweep both at every prompt bucket.
-                    for greedy in (True, False):
-                        if not self._warmup_one_spec_request(
-                            int(P), idx=i, quiet=True, greedy=greedy
-                        ):
-                            # First attempt cold-compiles the draft forward; a
-                            # SymInt from that cold compile can leak into the
-                            # dynamic=False gather wrapper on the first bucket. Retry
-                            # once now that the forward is compiled and returns
-                            # concrete-shaped tensors (this attempt logs loudly if it
-                            # also fails).
-                            self._warmup_one_spec_request(int(P), idx=i, greedy=greedy)
+                    for p_req in p_candidates:
+                        for greedy in (True, False):
+                            if not self._warmup_one_spec_request(
+                                p_req, idx=i, quiet=True, greedy=greedy
+                            ):
+                                # First attempt cold-compiles the draft forward;
+                                # a SymInt from that cold compile can leak into
+                                # the dynamic=False gather wrapper on the first
+                                # bucket. Retry once now that the forward is
+                                # compiled and returns concrete-shaped tensors
+                                # (this attempt logs loudly if it also fails).
+                                self._warmup_one_spec_request(
+                                    p_req, idx=i, greedy=greedy
+                                )
             # (2) Batched spec steps. A bucketed-draft proposer depends on no
             # exact request count, so one count per program-bucket combination
             # (`_spec_warmup_bucket_grid`), each with a short decode run and a

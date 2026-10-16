@@ -667,6 +667,51 @@ def test_spec_decode_warmup_sweeps_batches_at_the_shortest_and_longest_prompt(
     ]
 
 
+def test_spec_decode_warmup_traces_the_draft_before_its_megakernel_step0():
+    """With a draft megakernel step-0 program, the 1 + K prompt bucket first
+    warms a 1-token prompt (the draft's own program at that bucket), then the
+    1 + K one (the megakernel program); other buckets are unchanged."""
+    one = MagicMock(return_value=True)
+    runner = SimpleNamespace(
+        enforce_eager=False,
+        _is_async_drafter=True,
+        input_batch=SimpleNamespace(num_reqs=0),
+        num_tokens_paddings=[4, 8, 16],
+        num_reqs_paddings=[1],
+        max_model_len=8192,
+        scheduler_config=SimpleNamespace(max_num_seqs=1, async_scheduling=True),
+        speculative_config=SimpleNamespace(num_speculative_tokens=3),
+        drafter=SimpleNamespace(_mtp_mk_step0=object()),
+        num_xla_graphs=3,
+        _precompile_timed=lambda _label: contextlib.nullcontext(),
+        _warmup_one_spec_request=one,
+        _warmup_spec_batch=MagicMock(),
+    )
+    with (
+        patch.object(tpu_runner.envs, "SPEC_WARMUP", True),
+        patch.object(
+            tpu_runner,
+            "_suspend_kv_transfer_group",
+            return_value=contextlib.nullcontext(),
+        ),
+    ):
+        TPUModelRunner._warmup_spec_decode(runner)
+    assert [c.args[0] for c in one.call_args_list] == [1, 1, 4, 4, 8, 8, 16, 16]
+
+    one.reset_mock()
+    runner.drafter = SimpleNamespace(_mtp_mk_step0=None)
+    with (
+        patch.object(tpu_runner.envs, "SPEC_WARMUP", True),
+        patch.object(
+            tpu_runner,
+            "_suspend_kv_transfer_group",
+            return_value=contextlib.nullcontext(),
+        ),
+    ):
+        TPUModelRunner._warmup_spec_decode(runner)
+    assert [c.args[0] for c in one.call_args_list] == [4, 4, 8, 8, 16, 16]
+
+
 def _runner(K: int, block: int, max_seqs: int, budget: int, paddings: list[int]):
     return SimpleNamespace(
         speculative_config=SimpleNamespace(num_speculative_tokens=K),
