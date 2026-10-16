@@ -14,6 +14,7 @@
 """Standalone sparse-attention tests for both physical cache layouts."""
 
 import functools
+from unittest import mock
 
 import jax
 import jax.numpy as jnp
@@ -572,6 +573,129 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             np.abs(real - np.asarray(problem["q"], np.float32)[:real_tokens]).max(),
             2e-2,
         )
+
+    def _capped_live_problem(self, query_tokens, real_tokens, seed):
+        topk = 2048
+        rng = np.random.default_rng(seed)
+        problem = _build_problem(
+            rng, k_scale=0.75, query_tokens=query_tokens, topk=topk
+        )
+        # 0 / 1 live, atom boundaries (64, 128), the cap and one past it
+        # (window 2), every window (2048).
+        counts = np.resize(
+            np.array([0, 1, 63, 64, 65, 128, 255, 256, 257, 511, 512, 513, 1025, 2048]),
+            query_tokens,
+        )
+        rng.shuffle(counts)
+        live = np.arange(topk)[None, :] < counts[:, None]
+        topk_idx = jnp.where(jnp.asarray(live), problem["topk"], -1)
+
+        def run(jit=True, **extra):
+            fn = functools.partial(sparse_mla.sparse_ragged_paged_attention, **extra)
+            if not jit:
+                # Fresh trace, so a patched gather is picked up.
+                impl = sparse_mla.sparse_ragged_paged_attention.__wrapped__
+                fn = jax.jit(functools.partial(impl, **extra))
+            return fn(
+                problem["q"],
+                problem["sparsecore_nope"],
+                problem["sparsecore_rope"],
+                topk_idx,
+                problem["page_table"],
+                jnp.array([0, real_tokens], jnp.int32),
+                jnp.array([0, 1, 1], jnp.int32),
+            )
+
+        base = dict(
+            sm_scale=0.125,
+            k_scale=0.75,
+            return_lse=True,
+            cache_layout=sparse_mla.SPARSECORE_CACHE_LAYOUT,
+            attention_kernel_batch_size=16,
+        )
+        return run, base, counts
+
+    @parameterized.parameters(
+        {"query_tokens": 128, "real_tokens": 100, "chunk": 64, "topk_cap": 512},
+        {"query_tokens": 128, "real_tokens": 128, "chunk": 128, "topk_cap": 256},
+        {"query_tokens": 16, "real_tokens": 13, "chunk": 64, "topk_cap": 512},
+    )
+    def test_capped_live_rows_matches_capped(
+        self, query_tokens, real_tokens, chunk, topk_cap
+    ):
+        """`capped_live_rows` only skips slots past `kv_len`: bit-exact vs off."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        run, base, _ = self._capped_live_problem(query_tokens, real_tokens, 20261014)
+        kw = dict(base, gather_and_attention_chunk_size=chunk)
+        live_jaxpr = str(
+            jax.make_jaxpr(
+                lambda: run(topk_cap=topk_cap, capped_live_rows=True, **kw)
+            )()
+        )
+        self.assertIn("rowlive", live_jaxpr)
+        (ref, ref_lse), (off, off_lse), (on, on_lse) = jax.block_until_ready(
+            (
+                run(**kw),
+                run(topk_cap=topk_cap, **kw),
+                run(topk_cap=topk_cap, capped_live_rows=True, **kw),
+            )
+        )
+        n = real_tokens
+        np.testing.assert_array_equal(
+            np.asarray(on, np.float32)[:n], np.asarray(off, np.float32)[:n]
+        )
+        np.testing.assert_array_equal(np.asarray(on_lse)[:n], np.asarray(off_lse)[:n])
+        np.testing.assert_allclose(
+            np.asarray(on, np.float32)[:n],
+            np.asarray(ref, np.float32)[:n],
+            rtol=2e-2,
+            atol=2e-2,
+        )
+        np.testing.assert_allclose(
+            np.asarray(on_lse)[:n], np.asarray(ref_lse)[:n], rtol=1e-4, atol=1e-4
+        )
+
+    def test_capped_live_rows_skipped_destinations_never_reach_output(self):
+        """Skipped gather rows NaN-poisoned (fp8 0xFF) in place: output unchanged.
+        A positive control poisons one live slot."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("SparseCore cache-layout attention requires a TPU")
+        query_tokens = real_tokens = 128
+        cap, atom = 512, sparse_mla.GATHER_ATOM_ROWS
+        run, base, counts = self._capped_live_problem(query_tokens, real_tokens, 7)
+        kw = dict(base, gather_and_attention_chunk_size=64, topk_cap=cap)
+        gather = sparse_mla.native_sc_gather.dsa_gather_native_sc
+        poison_live_row = []
+
+        def poisoned(nope_c, rope_c, idx, *, row_live_atoms=None, **k):
+            nope, rope = gather(nope_c, rope_c, idx, row_live_atoms=row_live_atoms, **k)
+            assert row_live_atoms is not None
+            slot = jnp.arange(idx.shape[1])[None, :]
+            dead = (slot >= row_live_atoms[:, None] * atom).reshape(-1)
+            if poison_live_row:
+                dead = dead.at[poison_live_row[0]].set(True)
+            nan = jnp.uint32(0xFFFFFFFF)
+            nope = jnp.where(dead[:, None], nan, nope)
+            rope = jnp.where(dead[::4, None], nan, rope)
+            return nope, rope
+
+        ref, ref_lse = jax.block_until_ready(run(**kw))
+        with mock.patch.object(
+            sparse_mla.native_sc_gather, "dsa_gather_native_sc", poisoned
+        ):
+            out, lse = jax.block_until_ready(
+                run(jit=False, capped_live_rows=True, **kw)
+            )
+            # Control: poison slot 0 of a token with live rows in window 0 (row 0
+            # of chunk 0 is token 0); its output must turn NaN.
+            token = int(np.argmax(counts[:64] > 0))
+            poison_live_row.append(token * cap)
+            ctl, _ = jax.block_until_ready(run(jit=False, capped_live_rows=True, **kw))
+        np.testing.assert_array_equal(np.asarray(out), np.asarray(ref))
+        np.testing.assert_array_equal(np.asarray(lse), np.asarray(ref_lse))
+        self.assertTrue(np.isnan(np.asarray(ctl, np.float32)[token]).any())
+        self.assertFalse(np.isnan(np.asarray(out, np.float32)).any())
 
     @parameterized.product(
         (
