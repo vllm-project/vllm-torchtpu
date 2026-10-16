@@ -11,10 +11,6 @@ import numpy as np
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
-from vllm_torchtpu.logger import init_logger
-
-logger = init_logger(__name__)
-
 
 @dataclass(frozen=True)
 class WanTestConfig:
@@ -337,21 +333,21 @@ def assert_wan_golden_parity(video_arr: np.ndarray, config: WanTestConfig) -> No
     mae_max, ssim_min, shift_max = config.limits
     hf_lo, hf_hi = HF_ENERGY_RATIO_RANGE
     motion_lo, motion_hi = MOTION_RATIO_RANGE
-    summary = (
-        f"{config.config_id} vs CPU golden: "
-        f"MAE={golden_metrics['mae']:.4f} (max {mae_max}), "
-        f"SSIM={golden_metrics['ssim']:.4f} (min {ssim_min}), "
-        f"mean shift={golden_metrics['mean_shift']:.4f} (max {shift_max}), "
-        f"HF energy ratio={golden_metrics['hf_ratio']:.3f} "
-        f"(range {hf_lo}-{hf_hi}), "
-        f"motion ratio={golden_metrics['motion_ratio']:.3f} "
-        f"(range {motion_lo}-{motion_hi})"
+    assert golden_metrics["mae"] <= mae_max, (
+        f"{config.config_id} MAE {golden_metrics['mae']:.4f} exceeds max {mae_max}"
     )
-    logger.info(summary)
-    assert (
-        golden_metrics["mae"] <= mae_max
-        and golden_metrics["ssim"] >= ssim_min
-        and golden_metrics["mean_shift"] <= shift_max
-        and hf_lo <= golden_metrics["hf_ratio"] <= hf_hi
-        and motion_lo <= golden_metrics["motion_ratio"] <= motion_hi
-    ), summary
+    assert golden_metrics["ssim"] >= ssim_min, (
+        f"{config.config_id} SSIM {golden_metrics['ssim']:.4f} is below min {ssim_min}"
+    )
+    assert golden_metrics["mean_shift"] <= shift_max, (
+        f"{config.config_id} mean shift {golden_metrics['mean_shift']:.4f} "
+        f"exceeds max {shift_max}"
+    )
+    assert hf_lo <= golden_metrics["hf_ratio"] <= hf_hi, (
+        f"{config.config_id} HF energy ratio {golden_metrics['hf_ratio']:.3f} "
+        f"outside [{hf_lo}, {hf_hi}]"
+    )
+    assert motion_lo <= golden_metrics["motion_ratio"] <= motion_hi, (
+        f"{config.config_id} motion ratio {golden_metrics['motion_ratio']:.3f} "
+        f"outside [{motion_lo}, {motion_hi}]"
+    )
