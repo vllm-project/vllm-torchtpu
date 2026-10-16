@@ -35,7 +35,12 @@ class TPUMultiConnector(MultiConnector):
 
     def __init__(self, vllm_config, role, kv_cache_config):
         super().__init__(vllm_config, role, kv_cache_config)
-        if role != KVConnectorRole.SCHEDULER:
+        # Only a consumer starts from a decode-local hit; on a producer the
+        # transfer child always reports False, whatever the other children say.
+        if (
+            role != KVConnectorRole.SCHEDULER
+            or vllm_config.kv_transfer_config.is_kv_producer
+        ):
             return
         # Upstream reports divergent local hybrid hits only if every child
         # does. A child that cannot turns Stage-3 suffix loads off for the

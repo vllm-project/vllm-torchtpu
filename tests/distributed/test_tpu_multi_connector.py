@@ -200,3 +200,20 @@ class TestTPUMultiConnectorDivergentHitWarning:
         )
 
         assert not log.warning.called
+
+    def test_producers_do_not_warn(self, monkeypatch):
+        # Prefill wraps a producer transfer child, which always reports False,
+        # with an offload child that reports True when the flag is on. Only a
+        # consumer starts from a decode-local hit, so that mix loses nothing.
+        log = MagicMock()
+        monkeypatch.setattr(tpu_multi_connector, "logger", log)
+
+        TPUMultiConnector(
+            _make_vllm_config(
+                kv_role="kv_producer", children=("_IncapableChild", "_CapableChild")
+            ),
+            KVConnectorRole.SCHEDULER,
+            MagicMock(),
+        )
+
+        assert not log.warning.called
