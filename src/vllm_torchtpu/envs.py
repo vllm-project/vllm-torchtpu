@@ -11,7 +11,7 @@ if TYPE_CHECKING:
     TPU_K3_SP_PREFILL: bool = False
     TPU_DCP_MLA_TOPK_CAP: int = -1
     TPU_DCP_MLA_TOPK_CAP_CHUNK: int = 256
-    TPU_SPARSE_MLA_LIVE_GATHER: bool = False
+    TPU_SPARSE_MLA_LIVE_GATHER: bool = True
     TPU_DCP_LSE_MERGE_A2A: bool = True
     TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS: int = 64
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 4
@@ -418,8 +418,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # are written.
     "TPU_DCP_MLA_TOPK_CAP_CHUNK": env_int("TPU_DCP_MLA_TOPK_CAP_CHUNK", 256),
     # Capped path: the native gather skips each window row's atoms past its live
-    # top-k count (outputs unchanged). Opt-in.
-    "TPU_SPARSE_MLA_LIVE_GATHER": env_bool("TPU_SPARSE_MLA_LIVE_GATHER", default=False),
+    # top-k count (outputs unchanged). On by default.
+    "TPU_SPARSE_MLA_LIVE_GATHER": env_bool("TPU_SPARSE_MLA_LIVE_GATHER", default=True),
     # Opt in to the all-to-all DCP MLA lse merge for decode-sized steps.
     "TPU_DCP_LSE_MERGE_A2A": env_bool("TPU_DCP_LSE_MERGE_A2A", default=True),
     # Largest step (tokens) that uses it; above this, the reduce-scatter is
