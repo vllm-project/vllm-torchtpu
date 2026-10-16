@@ -558,7 +558,7 @@ class RpaConfigs:
         the sublane dim, where single tokens are addressable.
         """
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
-            return pltpu.get_tpu_info().num_lanes
+            return _get_tpu_info().num_lanes
         return 1
 
     @property
