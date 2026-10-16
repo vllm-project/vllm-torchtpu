@@ -6233,9 +6233,12 @@ class TPUModelRunner(GPUModelRunner):
                     synchronize_tensors(out)
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
-        if not _get_sequence_layout_planner_for_runner(
-            self
-        ).uses_selected_logits_hidden_states:
+        if (
+            self.pcp_manager is None
+            and not _get_sequence_layout_planner_for_runner(
+                self
+            ).uses_selected_logits_hidden_states
+        ):
             return
         with self._precompile_timed("compute_top_tokens_from_hidden_states"):
             for num_reqs in self.num_reqs_paddings:
