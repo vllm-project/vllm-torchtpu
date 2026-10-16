@@ -20,12 +20,15 @@ This stabilizes shapes within a bin; crossing a bin boundary still recompiles.
 This is a prefill benchmark; one-token output comparison does not qualify
 long-generation accuracy or steady decode performance.
 
-DFlash/DSpark context KV updates still run during intermediate prefill.
+DFlash/DSpark use the shared context-only KV update path during intermediate prefill.
 Candidate generation is skipped only when no EP-DP peer has a request at
 the prompt boundary or in decode. Mixed steps retain proposal forwards on
 every participating rank to keep collectives paired. The final prefill
 step still generates the candidates needed to bootstrap async decode,
-including when the benchmark's one-token request will then finish.
+including when the benchmark's one-token request will then finish. Draft seeds
+and proposals keep one bucketed tensor per chunk; real request indices skip
+padding rows from earlier chunks. Speculative warmup covers the bucket grid
+and mixed prefill/verify steps.
 
 The shared serving launcher sets `--xla_tpu_dvfs_p_state=7` in
 `LIBTPU_INIT_ARGS`. Both DP8 Buildkite benchmarks run on every build of the

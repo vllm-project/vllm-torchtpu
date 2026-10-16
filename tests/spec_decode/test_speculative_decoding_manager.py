@@ -205,7 +205,8 @@ def test_propose_draft_token_ids_async_bootstrap_returns_device_tensor():
     assert kwargs["device_seed"] is seed
 
 
-def test_stage_and_take_draft_token_ids_snapshots_req_ids():
+@pytest.mark.parametrize("bucketed", [False, True])
+def test_stage_and_take_draft_token_ids_snapshots_req_ids(bucketed):
     # Async scheduling: stage launches the D2H copy and snapshots req_ids;
     # take is only called after the NEXT step's execute_model has already
     # mutated input_batch, so it must answer from the snapshot.
@@ -213,7 +214,11 @@ def test_stage_and_take_draft_token_ids_snapshots_req_ids():
     mock_runner.input_batch.req_ids = ["req-a", "req-b", None]
     drafts = torch.tensor([[1, 2, 3], [4, 5, 6]], dtype=torch.int32)
 
-    manager.stage_draft_token_ids_for_host(drafts)
+    if bucketed:
+        chunks = [torch.cat([row, torch.full_like(row, -1)]) for row in drafts.split(1)]
+        manager.stage_draft_token_ids_for_host(chunks, [1, 1])
+    else:
+        manager.stage_draft_token_ids_for_host(drafts)
 
     # Simulate the next step's batch update (req-a finished, req-c joined).
     mock_runner.input_batch.num_reqs = 2

@@ -49,6 +49,17 @@ def set_padding_state(state: "TokenPaddingState | None") -> None:
     _padding_state = state
 
 
+def mark_padding(num_valid_tokens: int, num_padded_tokens: int) -> None:
+    """Describe the rows of the next forward: [num_valid_tokens,
+    num_padded_tokens) are padding. A no-op when no padding state is set.
+
+    The mask is shared by every forward on this rank, so a forward whose rows
+    differ from the target step's (a drafter) must call this before it runs.
+    """
+    if _padding_state is not None:
+        _padding_state.update(num_valid_tokens, num_padded_tokens)
+
+
 def zero_routing_weights_for_padding(
     topk_ids: torch.Tensor, topk_weights: torch.Tensor, is_local_tensor: bool = False
 ) -> tuple[torch.Tensor, torch.Tensor]:

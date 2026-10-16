@@ -136,11 +136,13 @@ def test_dflash_partial_prefill_saves_context_without_async_draft_bootstrap(
     events = []
     propose = MagicMock(
         side_effect=lambda **kwargs: events.append("draft")
-        or (torch.tensor([[8]]) if is_async else None)
+        or ([torch.tensor([[8]])] if is_async else None)
     )
     runner = _fake_runner("mtp", is_async, False, propose)
     drafter = DFlashProposer.__new__(DFlashProposer)
-    drafter.update_context = MagicMock(side_effect=lambda: events.append("context"))
+    drafter.prepare_prefill_handoff = MagicMock(
+        side_effect=lambda: events.append("context")
+    )
     runner.drafter = runner._async_drafter = drafter
     runner._draft_proposals_needed = proposals_needed
     runner.input_batch.generators = {}

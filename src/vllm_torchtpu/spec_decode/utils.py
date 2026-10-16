@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Any, cast
 import numpy as np
 import torch
 import torch.distributed as dist
+import torch.nn.functional as F
 from torch.nn import Parameter
 from vllm.distributed.parallel_state import get_tp_group
 from vllm.model_executor.layers.vocab_parallel_embedding import (
@@ -31,6 +32,21 @@ _DEFAULT_DRAFT_SEQUENCE_LAYOUT_PLAN = AllSequenceLayoutPlanner().prepare_dummy(
     num_reqs=0,
     kv_cache_initialized=False,
 )
+
+
+def fit_rows(t: torch.Tensor, rows: int, value: int = 0) -> torch.Tensor:
+    """`t` with its leading dim sliced or padded (with `value`) to `rows`.
+
+    `rows` is always a bucket, never the live request count: torch-tpu compiles
+    a program per shape, so an exact-count slice costs a program per count.
+    """
+    n = t.shape[0]
+    if n == rows:
+        return t
+    if n > rows:
+        return t[:rows]
+    pad = [0] * (2 * (t.dim() - 1)) + [0, rows - n]
+    return F.pad(t, pad, value=value)
 
 
 @dataclass

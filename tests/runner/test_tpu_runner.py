@@ -2611,3 +2611,115 @@ def test_init_num_reqs_caps_deepseek_v41_v2_vs_rpa(monkeypatch):
     runner._init_num_reqs_caps()
     assert runner.num_reqs_max_model_len == 20
     assert runner.num_reqs_most_model_len is None
+
+
+def _runner(K: int, block: int, max_reqs: int, budget: int, paddings: list[int]):
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=K),
+        drafter=SimpleNamespace(block_size=block),
+        max_num_reqs=max_reqs,
+        max_num_tokens=budget,
+        num_tokens_paddings=paddings,
+    )
+
+
+def _step_keys(runner, R: int, mixed: bool) -> set[tuple]:
+    """The program buckets of a verify step with R decoders (and, with
+    ``mixed``, one more request prefilling a token), as the runner keys them."""
+    K = runner.speculative_config.num_speculative_tokens
+    block = runner.drafter.block_size
+    pads = runner.num_tokens_paddings
+    max_reqs = runner.max_num_reqs
+
+    def tok_bucket(n: int) -> int:
+        return tpu_runner._get_padded_token_len(pads, n) if n <= pads[-1] else pads[-1]
+
+    keys = set()
+    if runner.max_num_tokens >= R * (1 + K):
+        keys.add(
+            (
+                "decode",
+                tpu_runner._get_padded_num_reqs_with_upper_limit(R, max_reqs),
+                tok_bucket(R * (1 + K)),
+                tok_bucket(R * block),
+            )
+        )
+    if mixed and max_reqs >= R + 1 and runner.max_num_tokens >= R * (1 + K) + 1:
+        keys.add(
+            (
+                "mixed",
+                tpu_runner._get_padded_num_reqs_with_upper_limit(R + 1, max_reqs),
+                tok_bucket(R * (1 + K) + 1),
+                tok_bucket((R + 1) * block),
+            )
+        )
+    return keys
+
+
+FLASH = dict(
+    K=5, block=5, max_reqs=64, budget=1024, paddings=[16, 32, 64, 128, 256, 512, 1024]
+)
+AGENTX = dict(K=5, block=5, max_reqs=8, budget=256, paddings=[16, 32, 64, 128, 256])
+# 8 decoders x 6 rows = 48 > a 32-token budget: counts above 5 have no step.
+TIGHT = dict(K=5, block=5, max_reqs=8, budget=32, paddings=[16, 32])
+
+
+@pytest.mark.parametrize(
+    "cfg", [FLASH, AGENTX, TIGHT], ids=["flash", "agentx", "tight"]
+)
+@pytest.mark.parametrize("mixed", [False, True])
+def test_grid_covers_every_bucket_combination_once(cfg, mixed):
+    runner = _runner(**cfg)
+    grid = TPUModelRunner._spec_warmup_bucket_grid(runner, mixed=mixed)
+
+    assert grid == sorted(set(grid))
+    assert all(1 <= R <= cfg["max_reqs"] for R in grid)
+    # Every bucket combination a serving step can take is warmed ...
+    covered = set().union(*(_step_keys(runner, R, mixed) for R in grid))
+    needed = set().union(
+        *(_step_keys(runner, R, mixed) for R in range(1, cfg["max_reqs"] + 1))
+    )
+    assert covered == needed
+    # ... by one count each: every grid entry brings a bucket no earlier one had.
+    seen: set[tuple] = set()
+    for R in grid:
+        keys = _step_keys(runner, R, mixed)
+        assert keys - seen, f"count {R} adds no new bucket"
+        seen |= keys
+
+
+@pytest.mark.parametrize("verify", [False, True])
+def test_bucketed_drafts_preserve_real_request_offsets_across_chunks(verify):
+    runner = object.__new__(TPUModelRunner)
+    runner.drafter = SimpleNamespace(bucketed_drafts=True)
+    drafts = [torch.full((8, 2), 11), torch.full((4, 2), 22)]
+    selected = [torch.tensor([7, 0, 0, 0]), torch.tensor([8, 0])]
+    if verify:
+        next_tokens = [
+            torch.stack([s, torch.full_like(s, -1), torch.full_like(s, -1)], dim=1)
+            for s in selected
+        ]
+        state = SimpleNamespace(
+            num_reqs_list=[1, 1],
+            spec_decode_metadata_list=[
+                SimpleNamespace(
+                    draft_lengths=torch.tensor([2, 0, 0, 0]),
+                    draft_lengths_cpu=np.array([2]),
+                ),
+                None,
+            ],
+        )
+        chunks, indices, rejected, counts = runner._assemble_async_spec_substitution(
+            drafts, next_tokens, state
+        )
+    else:
+        chunks, indices, rejected, counts = runner._assemble_async_prefill_bootstrap(
+            drafts, selected, [1, 1]
+        )
+    assert indices == {0: 0, 1: 4}
+    assert [c.numel() for c in chunks] == [12, 6]
+    source = torch.cat(chunks).reshape(-1, 3)
+    assert source[indices[0]].tolist() == [7, 11, 11]
+    assert source[indices[1]].tolist() == [8, 22, 22]
+    assert rejected.tolist() == ([2, 0, 0, 0, 0, 0] if verify else [0] * 6)
+    assert counts == ({0: 2} if verify else {0: 0, 1: 0})

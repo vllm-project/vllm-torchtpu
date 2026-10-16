@@ -20,6 +20,10 @@ import pytest
 import torch
 import torch._dynamo
 
+from vllm_torchtpu.layers.adapter import token_padding
+from vllm_torchtpu.layers.adapter.token_padding import TokenPaddingState
+from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
+from vllm_torchtpu.spec_decode import dflash as dflash_module
 from vllm_torchtpu.spec_decode import utils as spec_decode_utils
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.eagle3 import DraftChunkInputs
@@ -169,6 +173,7 @@ def test_precompile_skips_sub_block_draft_forward(
     ] == draft_buckets
 
 
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("has_upstream_hook", [False, True])
 def test_tpu_precompute_context_kv(device, has_upstream_hook):
     # Setup dimension sizes
@@ -294,6 +299,7 @@ def test_tpu_precompute_context_kv(device, has_upstream_hook):
     assert torch.allclose(all_v, expected_v_all, atol=1e-5)
 
 
+@pytest.mark.tpu_test
 def test_tpu_precompute_context_kv_uses_explicit_tpu_hook(device):
     proposer = _make_proposer(draft_tp=1)
     hidden_states = torch.randn(3, 32, device=device)
@@ -342,6 +348,11 @@ def _make_chunk(
             query_start_loc=query_start_loc,
             use_max_model_len=True,
             position_ids_override=None,
+            # [decode_end, prefill_end, num_reqs]: the compiled input builders
+            # read the live request count from its last entry on device.
+            request_distribution=torch.tensor(
+                [0, 0, num_reqs], dtype=torch.int32, device=device
+            ),
         ),
         start_index=start_index,
         num_reqs=num_reqs,
@@ -355,6 +366,7 @@ def _make_chunk(
     )
 
 
+@pytest.mark.tpu_test
 def test_prepare_dflash_inputs(device):
     proposer = _make_proposer(draft_tp=1)
     K = 3
@@ -397,6 +409,7 @@ def test_prepare_dflash_inputs(device):
     )
 
 
+@pytest.mark.tpu_test
 def test_update_draft_kv_cache_from_target_unit(device):
     proposer = _make_proposer(draft_tp=1)
     proposer._tpu_precompute_and_update_kv_cache = mock.MagicMock(
@@ -442,6 +455,7 @@ def test_update_draft_kv_cache_from_target_unit(device):
     proposer._tpu_precompute_and_update_kv_cache.assert_called_once()
 
 
+@pytest.mark.tpu_test
 def test_propose_unit(device):
     proposer = _make_proposer(draft_tp=1)
     K = 3
@@ -506,6 +520,94 @@ def test_propose_unit(device):
     proposer._dflash_forward_and_sample.assert_called_once()
 
 
+def _padding_mask_at_draft_forward(proposer, run, num_rows: int) -> list[bool]:
+    """Run `run()` with the padding mask left in a target step's state and
+    return the mask the draft forward saw."""
+    state = TokenPaddingState.create(32, torch.device("cpu"))
+    # A target step with 3 real rows of 16: stale for any draft forward.
+    state.update(3, 16)
+    seen = []
+
+    def _forward(input_ids, positions, block_size):
+        seen.append(state.get_local_padding_mask(num_rows).tolist())
+        num_reqs = input_ids.shape[0] // block_size
+        return torch.zeros((num_reqs, block_size - 1), dtype=torch.int64), None
+
+    proposer._dflash_forward_and_sample = _forward
+    token_padding.set_padding_state(state)
+    try:
+        run()
+    finally:
+        token_padding.set_padding_state(None)
+    assert len(seen) == 1
+    return seen[0]
+
+
+def test_propose_marks_padding_for_draft_rows():
+    proposer = _make_proposer(draft_tp=1)
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer.runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        input_batch=SimpleNamespace(num_reqs=2),
+        mesh=None,
+        max_num_reqs=8,
+        _dp_lockstep_enabled=lambda: False,
+        _dp_num_tokens_across_dp=lambda num_tokens: None,
+    )
+    proposer.draft_chunks = [
+        SimpleNamespace(
+            num_reqs=2,
+            start_index=0,
+            # The live count reaches the builders as a device scalar.
+            attn_ctx=SimpleNamespace(
+                request_distribution=torch.tensor([0, 0, 2], dtype=torch.int32)
+            ),
+        )
+    ]
+    proposer._update_draft_kv_cache_from_target = mock.MagicMock()
+    # 2 requests x block 4 = 8 real draft rows, padded to a 16-row bucket.
+    proposer._prepare_dflash_inputs = mock.MagicMock(
+        return_value=(
+            torch.zeros(16, dtype=torch.int32),
+            torch.zeros(16, dtype=torch.int32),
+            torch.zeros(2, dtype=torch.int32),
+        )
+    )
+    proposer._build_draft_attn_metadata = mock.MagicMock(return_value={})
+
+    mask = _padding_mask_at_draft_forward(
+        proposer,
+        lambda: proposer.propose(
+            [], [], None, None, return_device=True, device_seed=[torch.zeros(2)]
+        ),
+        num_rows=16,
+    )
+
+    assert mask == [False] * 8 + [True] * 8
+
+
+def test_dummy_draft_forward_marks_all_rows_padding(monkeypatch):
+    proposer = _make_proposer(draft_tp=1)
+    proposer.speculative_config.num_speculative_tokens = 3
+    proposer.runner = SimpleNamespace(
+        device=torch.device("cpu"),
+        mesh=None,
+        _dp_num_tokens_across_dp=lambda num_tokens: None,
+    )
+    proposer._build_attn_metadata_for_draft = mock.MagicMock(return_value={})
+    monkeypatch.setattr(dflash_module, "synchronize_tensors", lambda *a, **k: None)
+
+    mask = _padding_mask_at_draft_forward(
+        proposer,
+        lambda: proposer._dummy_draft_forward(
+            num_tokens=8, use_max_model_len=True, sync=False
+        ),
+        num_rows=8,
+    )
+
+    assert mask == [True] * 8
+
+
 def test_build_draft_layer_metadata_rejects_an_unresolved_layer():
     """An unnamed draft layer must raise, not borrow another group's metadata.
 
@@ -532,8 +634,7 @@ def test_build_draft_layer_metadata_rejects_an_unresolved_layer():
     assert proposer._build_draft_layer_metadata(md) == (md["dummy_layer"],)
 
 
-@pytest.mark.parametrize("propose_tokens", [False, True])
-def test_dp_lockstep_run_dummy_draft(propose_tokens):
+def test_dp_lockstep_run_dummy_draft():
     proposer = _make_proposer(draft_tp=8, target_tp=8)
     proposer.draft_model = mock.MagicMock()
     proposer.runner = SimpleNamespace(
@@ -545,45 +646,13 @@ def test_dp_lockstep_run_dummy_draft(propose_tokens):
     proposer._dp_dummy_kv_update = mock.MagicMock()
     proposer._dp_dummy_forward = mock.MagicMock()
 
-    proposer.run_dp_dummy_draft(num_chunks=2, propose_tokens=propose_tokens)
+    proposer.run_dp_dummy_draft(num_chunks=2)
 
     assert proposer._dp_dummy_kv_update.call_count == 2
-    assert proposer._dp_dummy_forward.call_count == (2 if propose_tokens else 0)
+    assert proposer._dp_dummy_forward.call_count == 2
 
 
-def test_context_only_prefill_updates_real_and_padding_chunks_without_proposals():
-    proposer = _make_proposer(draft_tp=8, target_tp=8)
-    proposer.runner = SimpleNamespace(
-        _dp_lockstep_enabled=lambda: True, _dp_step_num_chunks=3
-    )
-    proposer.draft_chunks = [SimpleNamespace(), SimpleNamespace()]
-    calls = []
-    proposer._update_draft_kv_cache_from_target = mock.Mock(
-        side_effect=lambda chunk: calls.append("context")
-    )
-    proposer._dp_dummy_kv_update = mock.Mock(
-        side_effect=lambda: calls.append("dummy-kv")
-    )
-    proposer._dflash_forward_and_sample = mock.Mock()
-    proposer._dp_dummy_forward = mock.Mock()
-
-    assert proposer.update_context() == 1
-    assert calls == ["context", "context", "dummy-kv"]
-    proposer._dflash_forward_and_sample.assert_not_called()
-    proposer._dp_dummy_forward.assert_not_called()
-
-
-@pytest.mark.parametrize("buckets,expected", [([2048], 2048), ([128, 2048], 128)])
-def test_single_request_draft_bucket_is_separate_from_prefill_token_budget(
-    buckets, expected
-):
-    proposer = _make_proposer(draft_tp=8, target_tp=8)
-    proposer.speculative_config.num_speculative_tokens = 5
-    proposer.runner = SimpleNamespace(_dp_step_max_reqs=1, num_tokens_paddings=buckets)
-    assert proposer.block_size == 6
-    assert proposer._dp_draft_bucket() == expected
-
-
+@pytest.mark.tpu_test
 def test_prepare_dflash_inputs_dp_lockstep(device):
     proposer = _make_proposer(draft_tp=8, target_tp=8)
     K = 3
@@ -615,6 +684,127 @@ def test_prepare_dflash_inputs_dp_lockstep(device):
     assert position_ids.shape == (16,)
 
 
+class _FakeMoERunner(torch.nn.Module):
+    pass
+
+
+def _lockstep_proposer(draft_model):
+    """A replicated (tp=1) draft on an EP-DP lockstep runner: the only
+    configuration where the gate depends on detecting MoE in the draft."""
+    proposer = _make_proposer(draft_tp=1, target_tp=1)
+    proposer.draft_model = draft_model
+    proposer.runner = SimpleNamespace(_dp_lockstep_enabled=lambda: True)
+    return proposer
+
+
+def test_dp_lockstep_sharded_detects_moe_draft_without_protocol(monkeypatch):
+    """The TPU DSV4/K3 drafts hold fused-MoE runners but do not implement
+    vLLM's MixtureOfExperts protocol; a replicated such draft must still
+    join the lockstep, or its EP all-to-alls hang against idle ranks."""
+    import vllm.model_executor.layers.fused_moe as fused_moe
+
+    monkeypatch.setattr(fused_moe, "MoERunner", _FakeMoERunner)
+    moe_draft = torch.nn.Module()
+    moe_draft.layer = torch.nn.Module()
+    moe_draft.layer.experts = _FakeMoERunner()
+    assert _lockstep_proposer(moe_draft)._dp_lockstep_sharded() is True
+
+    dense_draft = torch.nn.Module()
+    dense_draft.layer = torch.nn.Linear(2, 2)
+    assert _lockstep_proposer(dense_draft)._dp_lockstep_sharded() is False
+
+
+def test_dp_lockstep_sharded_off_without_lockstep():
+    proposer = _make_proposer(draft_tp=1, target_tp=1)
+    proposer.draft_model = mock.MagicMock()
+    proposer.runner = SimpleNamespace(_dp_lockstep_enabled=lambda: False)
+    assert proposer._dp_lockstep_sharded() is False
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("builder", ["next_tokens", "seed"])
+def test_compiled_input_builders_compile_no_program_per_request_count(device, builder):
+    """The builders take the live request count as a device scalar, so one
+    shape bucket is one program however many requests are live."""
+    if device.type != "tpu":
+        pytest.skip("needs the TPU compile cache")
+    K, block, rows, padded_len = 5, 5, 32, 128
+    proposer = DFlashProposer.__new__(DFlashProposer)
+    proposer._max_model_len = 9216
+    proposer.mask_token_id = 7777
+    # rows verify windows of 1 + K tokens; query_start_loc and positions.
+    qsl = torch.arange(0, (rows + 1) * (1 + K), 1 + K, dtype=torch.int32).to(device)
+    pos = torch.arange(rows * (1 + K), dtype=torch.int32).to(device)
+
+    def run(num_reqs: int):
+        nr = torch.tensor(num_reqs, dtype=torch.int32).to(device)
+        if builder == "seed":
+            seed = torch.ones(rows, dtype=torch.int32).to(device)
+            return proposer._tpu_build_dflash_inputs_seed(
+                seed, qsl, pos, nr, block, padded_len, 7777
+            )
+        next_tokens = torch.ones(rows, K + 1, dtype=torch.int32).to(device)
+        draft_lengths = torch.full((rows,), K, dtype=torch.int32).to(device)
+        return proposer._tpu_build_dflash_inputs_next_tokens(
+            next_tokens,
+            qsl,
+            pos,
+            draft_lengths,
+            nr,
+            block,
+            padded_len,
+            7777,
+            INVALID_TOKEN_ID,
+        )
+
+    def programs() -> int:
+        return len(torch.tpu._get_cache_stats().per_entry_stats)
+
+    run(1)  # the first use of the shape may compile
+    before = programs()
+    for num_reqs in (2, 17, 32):
+        run(num_reqs)
+    assert programs() == before, (
+        f"{builder} builder compiled a program per request count"
+    )
+
+
+def test_context_only_prefill_updates_real_and_padding_chunks_without_proposals():
+    proposer = _make_proposer(draft_tp=8, target_tp=8)
+    proposer.runner = SimpleNamespace(
+        _dp_lockstep_enabled=lambda: True, _dp_step_num_chunks=3
+    )
+    proposer.draft_chunks = [
+        SimpleNamespace(aux_hidden_states=[torch.ones(1)]),
+        SimpleNamespace(aux_hidden_states=[torch.ones(1)]),
+    ]
+    calls = []
+    proposer._update_draft_kv_cache_from_target = mock.Mock(
+        side_effect=lambda chunk: calls.append("context")
+    )
+    proposer._dp_dummy_kv_update = mock.Mock(
+        side_effect=lambda: calls.append("dummy-kv")
+    )
+    proposer._dflash_forward_and_sample = mock.Mock()
+    proposer._dp_dummy_forward = mock.Mock()
+
+    proposer.prepare_prefill_handoff()
+    assert calls == ["context", "context", "dummy-kv"]
+    proposer._dflash_forward_and_sample.assert_not_called()
+    proposer._dp_dummy_forward.assert_not_called()
+
+
+@pytest.mark.parametrize("buckets,expected", [([2048], 2048), ([128, 2048], 128)])
+def test_single_request_draft_bucket_is_separate_from_prefill_token_budget(
+    buckets, expected
+):
+    proposer = _make_proposer(draft_tp=8, target_tp=8)
+    proposer.speculative_config.num_speculative_tokens = 5
+    proposer.runner = SimpleNamespace(_dp_step_max_reqs=1, num_tokens_paddings=buckets)
+    assert proposer.block_size == 6
+    assert proposer._dp_draft_bucket() == expected
+
+
 def test_v41_dspark_tp1_pairs_idle_dp_draft_collectives():
     from vllm_torchtpu.models.vllm.deepseek_v41.v2.dspark import (
         DSparkDeepseekV41ForCausalLM,
@@ -638,3 +828,13 @@ def test_v41_dspark_tp1_pairs_idle_dp_draft_collectives():
     assert proposer._dp_dummy_forward.call_count == 2
     proposer.runner._dp_lockstep_enabled.return_value = False
     assert not proposer._dp_lockstep_sharded()
+
+
+@pytest.mark.parametrize("chunks", [[], [SimpleNamespace(aux_hidden_states=None)]])
+def test_context_only_prefill_requires_captured_aux_states(chunks):
+    proposer = _make_proposer(draft_tp=8, target_tp=8)
+    proposer.draft_chunks = chunks
+    proposer._update_draft_kv_cache_from_target = mock.Mock()
+    with pytest.raises(RuntimeError, match="requires"):
+        proposer.prepare_prefill_handoff()
+    proposer._update_draft_kv_cache_from_target.assert_not_called()
