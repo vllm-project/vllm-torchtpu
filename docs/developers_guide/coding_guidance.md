@@ -147,25 +147,25 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
 ## 3. Reuse upstream first
 
 - **R-3.1** **Search order for any new functionality: vLLM upstream →
-  vllm-torchtpu → JAX/Pallas utilities → write it.** Subclass the deepest
-  applicable vLLM base class and override only what differs on TPU.
-  Leveraging existing vLLM functions instead of copying them is what keeps
-  this plugin maintainable against a fast-moving upstream. Example — a quant
-  MoE method should inherit the upstream method and override the TPU-specific
-  steps, not duplicate `create_weights`:
+    vllm-torchtpu → JAX/Pallas utilities → write it.** Subclass the deepest
+    applicable vLLM base class and override only what differs on TPU.
+    Leveraging existing vLLM functions instead of copying them is what keeps
+    this plugin maintainable against a fast-moving upstream. Example — a quant
+    MoE method should inherit the upstream method and override the TPU-specific
+    steps, not duplicate `create_weights`:
 
-  ```python
-  from vllm.model_executor.layers.quantization.compressed_tensors import (
-      CompressedTensorsW8A8Fp8MoEMethod)
+    ```python
+    from vllm.model_executor.layers.quantization.compressed_tensors import (
+        CompressedTensorsW8A8Fp8MoEMethod)
 
-  class TpuW8A8Fp8MoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
-      # create_weights inherited from upstream — do not copy it.
-      def process_weights_after_loading(self, layer):
-          ...  # TPU-specific reshaping only
+    class TpuW8A8Fp8MoEMethod(CompressedTensorsW8A8Fp8MoEMethod):
+        # create_weights inherited from upstream — do not copy it.
+        def process_weights_after_loading(self, layer):
+            ...  # TPU-specific reshaping only
 
-      def apply(self, layer, x, ...):
-          ...  # dispatch to the Pallas kernel
-  ```
+        def apply(self, layer, x, ...):
+            ...  # dispatch to the Pallas kernel
+    ```
 
 - **R-3.2** **No per-model forks of shared layers.** New models extend or
   subclass the common attention/MoE/RoPE implementation — never carry private
@@ -188,59 +188,59 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
 ## 4. Derive, don't declare
 
 - **R-4.1** **No string-based or attribute-probing dispatch.** No model-name
-  matching, no `hasattr`/`getattr`-with-default on config objects, no
-  dtype-by-string. Use `isinstance`, enums, and direct attribute access that
-  fails loudly. Key behavior off capabilities, not names:
+    matching, no `hasattr`/`getattr`-with-default on config objects, no
+    dtype-by-string. Use `isinstance`, enums, and direct attribute access that
+    fails loudly. Key behavior off capabilities, not names:
 
-  ```python
-  # Bad: if upstream renames the field, the default is returned forever —
-  # no error, just silently wrong parallelism. And name matching breaks on
-  # every finetune/renamed checkpoint.
-  pp_size = getattr(parallel_config, "pipeline_parallel_size", 1)
-  use_mrope = "qwen3" in model_config.model.lower()
+    ```python
+    # Bad: if upstream renames the field, the default is returned forever —
+    # no error, just silently wrong parallelism. And name matching breaks on
+    # every finetune/renamed checkpoint.
+    pp_size = getattr(parallel_config, "pipeline_parallel_size", 1)
+    use_mrope = "qwen3" in model_config.model.lower()
 
-  # Good: fails loudly on an upstream rename; keyed on the capability.
-  assert isinstance(parallel_config, ParallelConfig)
-  pp_size = parallel_config.pipeline_parallel_size
-  use_mrope = model_config.uses_mrope
-  ```
+    # Good: fails loudly on an upstream rename; keyed on the capability.
+    assert isinstance(parallel_config, ParallelConfig)
+    pp_size = parallel_config.pipeline_parallel_size
+    use_mrope = model_config.uses_mrope
+    ```
 
 - **R-4.2** **Derive from argument shapes, not object state.** Logic that
-  determines a value purely from the shapes/dtypes of weights and scales is
-  robust to upstream changes. Question every argument that can be derived
-  from another argument:
+    determines a value purely from the shapes/dtypes of weights and scales is
+    robust to upstream changes. Question every argument that can be derived
+    from another argument:
 
-  ```python
-  # Bad: caller must keep block_size consistent with the scale tensor.
-  def dequant(w, scale, block_size): ...
+    ```python
+    # Bad: caller must keep block_size consistent with the scale tensor.
+    def dequant(w, scale, block_size): ...
 
-  # Good: derived at the point of use; inconsistency is impossible.
-  def dequant(w, scale):
-      block_size = w.shape[-1] // scale.shape[-1]
-  ```
+    # Good: derived at the point of use; inconsistency is impossible.
+    def dequant(w, scale):
+        block_size = w.shape[-1] // scale.shape[-1]
+    ```
 
 - **R-4.3** **No env reads inside jitted/compiled functions.** Closed-over
-  constants are a JAX footgun. Read envs in a thin wrapper and pass values as
-  arguments, so one glance at the wrapper shows every env that affects
-  behavior:
+    constants are a JAX footgun. Read envs in a thin wrapper and pass values as
+    arguments, so one glance at the wrapper shows every env that affects
+    behavior:
 
-  ```python
-  # Bad: the env is read at trace time and baked into the compiled graph.
-  # Changing it later has no effect, and nothing reveals it was captured.
-  @jax.jit
-  def attention(q, k, v):
-      if os.environ.get("USE_FANCY_PATH", "0") == "1":
-          ...
+    ```python
+    # Bad: the env is read at trace time and baked into the compiled graph.
+    # Changing it later has no effect, and nothing reveals it was captured.
+    @jax.jit
+    def attention(q, k, v):
+        if os.environ.get("USE_FANCY_PATH", "0") == "1":
+            ...
 
-  # Good: the un-jitted wrapper reads the env once and passes it in;
-  # the jitted function is pure.
-  def attention(q, k, v):
-      return _attention_jit(q, k, v, use_fancy_path=envs.USE_FANCY_PATH)
+    # Good: the un-jitted wrapper reads the env once and passes it in;
+    # the jitted function is pure.
+    def attention(q, k, v):
+        return _attention_jit(q, k, v, use_fancy_path=envs.USE_FANCY_PATH)
 
-  @functools.partial(jax.jit, static_argnames=("use_fancy_path", ))
-  def _attention_jit(q, k, v, *, use_fancy_path):
-      ...
-  ```
+    @functools.partial(jax.jit, static_argnames=("use_fancy_path", ))
+    def _attention_jit(q, k, v, *, use_fancy_path):
+        ...
+    ```
 
 - **R-4.4** **No hard-coded hardware constants.** VMEM/SMEM capacity, head-size
   alignment, cores-per-chip, device kind: use runtime queries
@@ -248,19 +248,20 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
   `120 * 1024 * 1024` or `if "v6e" in name`. Prefer self-explanatory
   constants: `jnp.iinfo(jnp.int16).max`, not `32767`.
 - **R-4.5** **No magic mesh-axis strings.** Define and use a shared
-  axis-name constant; a hard-coded string breaks silently everywhere when
-  the mesh layout changes. The good example in-repo is
-  `distributed/ep_mesh.py`:
+    axis-name constant; a hard-coded string breaks silently everywhere when
+    the mesh layout changes. The good example in-repo is
+    `distributed/ep_mesh.py`:
 
-  ```python
-  EP_AXIS_NAME = "d"
-  def build_ep_mesh(axis_name: str = EP_AXIS_NAME): ...
-  ```
+    ```python
+    EP_AXIS_NAME = "d"
+    def build_ep_mesh(axis_name: str = EP_AXIS_NAME): ...
+    ```
 
-  The anti-pattern is the literal `P("model")` repeated across
-  `layers/core/` (e.g. `gdn_attention.py`, `attention_interface.py`) —
-  every copy is a place a mesh-layout change can miss. New code uses a
-  constant; touched code migrates.
+    The anti-pattern is the literal `P("model")` repeated across
+    `layers/core/` (e.g. `gdn_attention.py`, `attention_interface.py`) —
+    every copy is a place a mesh-layout change can miss. New code uses a
+    constant; touched code migrates.
+
 - **R-4.6** **Config flows through vLLM's typed config**, never
   `additional_config` dict-digging wrapped in try/except. Use
   `ParallelConfig.data_parallel_size`, `load_config.load_format`; infer DP
@@ -363,16 +364,17 @@ op = pallas.jax_op("pallas::quantized_matmul_kernel",
   the relevant tests. Never send a diff containing lines nobody can account
   for.
 - **R-7.8** **Check for duplicate work before opening a PR.** Search open
-  issues and PRs for the same fix or feature first:
+    issues and PRs for the same fix or feature first:
 
-  ```bash
-  gh issue view <issue_number> --repo vllm-project/vllm-torchtpu --comments
-  gh pr list --repo vllm-project/vllm-torchtpu --state open \
-      --search "<short area keywords>"
-  ```
+    ```bash
+    gh issue view <issue_number> --repo vllm-project/vllm-torchtpu --comments
+    gh pr list --repo vllm-project/vllm-torchtpu --state open \
+        --search "<short area keywords>"
+    ```
 
-  If an open PR already addresses it, don't open another; if your approach is
-  materially different, explain the difference on the issue first.
+    If an open PR already addresses it, don't open another; if your approach
+    is materially different, explain the difference on the issue first.
+
 - **R-7.9** **No low-value busywork PRs.** Don't open one-off PRs for a
   single typo, an isolated style fix, or one mutable default. A mechanical
   cleanup lands only when it belongs to the same purpose as substantive work

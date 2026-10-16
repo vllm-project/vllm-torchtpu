@@ -774,6 +774,7 @@ def build_qwen35_pool_manifest(
     per_layer_tags: bool = False,
     fa_layout: FaLayoutHook | None = None,
     block_major: BlockMajorPoolLayout | None = None,
+    layer_index_by_name: Mapping[str, int] | None = None,
 ) -> PoolManifest:
     """Builds the canonical pool manifest from the live materialization.
 
@@ -785,6 +786,11 @@ def build_qwen35_pool_manifest(
     (``fa.l3``, ``gdn.conv.g0.l0`` ...) so pools pair up by layer: a
     pipeline-parallel producer registers only its own layers, and the
     controller matches each of them to the same layer on the destination.
+
+    ``layer_index_by_name`` overrides the layer index parsed from a cache's
+    name. An MTP draft layer (``mtp.layers.0``) is given an index after the
+    target's layers, so it orders and tags after them instead of colliding
+    with the target's layer of the same local index.
 
     ``mamba_group_ordinal_by_layer`` (opt-in, state-reshard deployments):
     suffixes GDN pool tags with the layer's mamba kv-cache-group ordinal
@@ -807,7 +813,7 @@ def build_qwen35_pool_manifest(
 
     # Flatten to (pool key, typed/logical tensor) in canonical order.
     flat: list[tuple[str, str, Any]] = []  # (tag, layer_name, tensor)
-    for layer_name in _ordered_layers(named_kv_caches):
+    for layer_name in _ordered_layers(named_kv_caches, layer_index_by_name):
         cache = named_kv_caches[layer_name]
         placement = None
         if block_major is not None:
@@ -862,7 +868,7 @@ def build_qwen35_pool_manifest(
     if per_layer_tags:
         tagged = []
         for tag, layer_name, tensor in flat:
-            layer_index = layer_index_from_name(layer_name)
+            layer_index = _pool_layer_index(layer_name, layer_index_by_name)
             if layer_index is None:
                 raise ManifestError(
                     f"per-layer pool tags need a layer index in {layer_name}"
@@ -1002,8 +1008,12 @@ def build_kimi_k3_pool_manifest(
                 f"Kimi cache {layer_name} has invalid packed-row geometry"
             )
         declared_block_size = getattr(spec, "block_size", None)
+        # Attention blocks count stored tokens. A Mamba block describes a
+        # logical sequence interval, not the row capacity of its state page.
+        # Validate state capacity through page bytes and _pooled_kda_regions.
         if (
-            declared_block_size is not None
+            not is_state
+            and declared_block_size is not None
             and int(declared_block_size) != rows * packing
         ):
             raise ManifestError(
@@ -1047,14 +1057,25 @@ def build_kimi_k3_pool_manifest(
     return _bind_pool_manifest(entries, raw_tensors)
 
 
-def _ordered_layers(named_kv_caches: Mapping[str, Any]) -> list[str]:
+def _pool_layer_index(
+    layer_name: str, layer_index_by_name: Mapping[str, int] | None
+) -> int | None:
+    if layer_index_by_name and layer_name in layer_index_by_name:
+        return int(layer_index_by_name[layer_name])
+    return layer_index_from_name(layer_name)
+
+
+def _ordered_layers(
+    named_kv_caches: Mapping[str, Any],
+    layer_index_by_name: Mapping[str, int] | None = None,
+) -> list[str]:
     if not named_kv_caches:
         raise ManifestError("named_kv_caches is empty")
     return sorted(
         named_kv_caches,
         key=lambda name: (
-            layer_index_from_name(name) is None,
-            layer_index_from_name(name) or 0,
+            _pool_layer_index(name, layer_index_by_name) is None,
+            _pool_layer_index(name, layer_index_by_name) or 0,
             str(name),
         ),
     )
@@ -1301,13 +1322,24 @@ def build_glm_mla_pool_manifest(
     for tag, layer_name, dtype_tag, tensor in flat:
         nbytes = _nbytes(tensor)
         shape = tuple(int(dim) for dim in getattr(tensor, "shape", ()))
-        if len(shape) != 4:
+        itemsize = _element_size(tensor)
+        if len(shape) == 4:
+            num_blocks, rows, packing, width = shape
+            tokens_per_row = packing
+        elif (
+            len(shape) == 3
+            and itemsize == 4
+            and class_tag(tag) in (TAG_MLA_NOPE, TAG_MLA_ROPE)
+        ):
+            num_blocks, rows, width = shape
+            packing = 1
+            tokens_per_row = block_size_tokens // rows if rows > 0 else 0
+        else:
             raise ManifestError(
-                f"cache {layer_name} must be [blocks, rows, packing, width]: "
+                f"cache {layer_name} must be [blocks, rows, packing, width] "
+                "(or a SparseCore uint32 [blocks, rows, words] MLA cache): "
                 f"got shape {shape}"
             )
-        num_blocks, rows, packing, width = shape
-        itemsize = _element_size(tensor)
         if num_blocks <= 0 or nbytes % num_blocks != 0:
             raise ManifestError(
                 f"cache {layer_name} nbytes {nbytes} is not divisible by "
@@ -1321,9 +1353,9 @@ def build_glm_mla_pool_manifest(
                     f"cache {layer_name} nope rows {rows} do not match the "
                     f"KV block size {block_size_tokens}"
                 )
-        elif rows * packing != block_size_tokens:
+        elif rows * tokens_per_row != block_size_tokens:
             raise ManifestError(
-                f"cache {layer_name} rows*packing {rows}*{packing} does not "
+                f"cache {layer_name} rows*packing {rows}*{tokens_per_row} does not "
                 f"match the KV block size {block_size_tokens}"
             )
         # The packing axis must fill one 32-bit word (see the layout

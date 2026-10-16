@@ -156,6 +156,7 @@ steps:
         if: 'build.env("NIGHTLY") != "1"'
         commands:
           - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--black-forest-labs--FLUX.1-schnell/"
+          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--Qwen--Qwen-Image-Edit/"
           - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/golden/ /mnt/disks/persist/models"
           - "bash .buildkite/scripts/run_in_docker.sh bktec run"
         env:
@@ -234,6 +235,12 @@ steps:
         if: 'build.env("NIGHTLY") == "1"'
         commands:
           - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--black-forest-labs--FLUX.1-schnell/"
+          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--Qwen--Qwen-Image-Edit/"
+          # Loaded only by the nightly Qwen test, at the revisions pinned in MODEL_REVISIONS
+          # (tests_omni/models/qwen_image/test_qwen_image_nightly.py). Stage each snapshot
+          # at its pinned revision, or the test downloads it from the Hub (~58 GB each).
+          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--Qwen--Qwen-Image-Edit-2511/"
+          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--Qwen--Qwen-Image/"
           - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/golden/ /mnt/disks/persist/models"
           - "bash .buildkite/scripts/run_in_docker.sh bktec run"
         env:

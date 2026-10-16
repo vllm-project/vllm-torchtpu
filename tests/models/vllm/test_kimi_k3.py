@@ -881,7 +881,10 @@ def test_kda_forward_dispatches_to_both_custom_ops(monkeypatch) -> None:
     )
 
 
-def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache(monkeypatch) -> None:
+@pytest.mark.parametrize("speculative", [False, True])
+def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache(
+    monkeypatch, speculative
+) -> None:
     """A one-tensor kv_cache means the unified pool: the layer must take the
     pooled op and never the dense dispatched op."""
     layer = KimiDeltaAttention.__new__(KimiDeltaAttention)
@@ -913,7 +916,13 @@ def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache(monkeypatch) -> 
         seq_lens=torch.tensor([2], dtype=torch.int32),
         request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
         mamba_slot_read_offsets=None,
+        mamba_request_distribution=None,
+        mamba_ckpt_indices=None,
     )
+    if speculative:
+        metadata.mamba_slot_read_offsets = torch.tensor([0, 1], dtype=torch.int32)
+        metadata.mamba_request_distribution = torch.tensor([1, 1, 1], dtype=torch.int32)
+        metadata.mamba_ckpt_indices = torch.tensor([[1, 3]], dtype=torch.int32)
     layer._metadata = lambda: metadata
 
     calls: list[str] = []
@@ -921,6 +930,9 @@ def test_kda_forward_dispatches_to_pooled_op_on_singleton_cache(monkeypatch) -> 
     def pooled_kda_op(mixed_qkv, *args):
         calls.append("pooled")
         assert args[3] is pool
+        assert args[-3] is metadata.mamba_request_distribution
+        assert args[-2] is metadata.mamba_slot_read_offsets
+        assert args[-1] is metadata.mamba_ckpt_indices
         return mixed_qkv[:, :4].view(-1, 2, 2)
 
     def unexpected(name):
@@ -1363,20 +1375,62 @@ def test_core_attention_pooled_rejects_pcp_streaming(
         layer._core_attention_pooled(None, None, None, None, None, metadata)
 
 
-def test_core_attention_pooled_rejects_speculative_verify(
+def test_core_attention_pooled_forwards_speculative_verify_metadata(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """`mamba_slot_read_offsets` is only set for speculative-decode verify
-    steps, which the pooled path cannot handle (it keeps one state per block,
-    not the per-window checkpoints verify needs)."""
+    """Pooled verify forwards accepted-state offsets and noncontiguous checkpoints."""
     layer = _make_bare_kda_layer()
     monkeypatch.setattr(
         kimi_attention, "is_pcp_streaming_attention_metadata", lambda md: False
     )
-    metadata = SimpleNamespace(mamba_slot_read_offsets=torch.zeros(1))
+    metadata = SimpleNamespace(
+        query_start_loc=torch.tensor([0, 6], dtype=torch.int32),
+        mamba_state_indices=torch.tensor([1], dtype=torch.int32),
+        seq_lens=torch.tensor([12], dtype=torch.int32),
+        request_distribution=torch.tensor([0, 0, 1], dtype=torch.int32),
+        mamba_request_distribution=torch.tensor([1, 1, 1], dtype=torch.int32),
+        mamba_slot_read_offsets=torch.tensor([0, 2], dtype=torch.int32),
+        mamba_ckpt_indices=torch.tensor([[1, 3, 5, 7, 9, 11]], dtype=torch.int32),
+    )
+    mixed_qkv = torch.zeros(6, 12)
+    raw_gate = torch.zeros(6, 4)
+    beta = torch.zeros(6, 2)
+    output_gate = torch.zeros(6, 4)
+    pool = torch.empty(12, 1, 1, 1)
+    expected_output = torch.ones(6, 2, 2)
+    calls = []
 
-    with pytest.raises(NotImplementedError, match="Speculative decoding"):
-        layer._core_attention_pooled(None, None, None, None, None, metadata)
+    def pooled_kda_op(*args):
+        calls.append(args)
+        return expected_output
+
+    layer.pooled_kda_op = pooled_kda_op
+    output = layer._core_attention_pooled(
+        mixed_qkv, raw_gate, beta, output_gate, pool, metadata
+    )
+
+    assert output is expected_output
+    assert len(calls) == 1
+    expected_args = (
+        mixed_qkv,
+        raw_gate,
+        beta,
+        output_gate,
+        pool,
+        layer.conv_weight_fused,
+        layer.A_log,
+        layer.dt_bias,
+        layer.o_norm.weight,
+        metadata.query_start_loc,
+        metadata.mamba_state_indices,
+        metadata.seq_lens,
+        metadata.request_distribution,
+        metadata.mamba_request_distribution,
+        metadata.mamba_slot_read_offsets,
+        metadata.mamba_ckpt_indices,
+    )
+    assert len(calls[0]) == len(expected_args)
+    assert all(actual is expected for actual, expected in zip(calls[0], expected_args))
 
 
 def test_core_attention_pooled_requires_state_indices(
@@ -2548,7 +2602,7 @@ def test_kimi_k3_encoder_cudagraph_capture_grid_fits_rope_table(
     stub.vision_tower.prepare_encoder_cudagraph_metadata = metadata
 
     inputs = KimiK3ForConditionalGeneration.prepare_encoder_cudagraph_capture_inputs(
-        stub, budget, items, 1, torch.device("cpu"), torch.float32
+        stub, budget, items, 1, torch.device("cpu"), torch.float32, axis_keys=()
     )
 
     assert seen["grid"] == [grid] * items

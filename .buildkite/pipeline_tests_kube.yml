@@ -179,12 +179,13 @@ steps:
               test-file-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
               test-cmd: "pytest -sv --timeout=3600 -m 'not nightly and multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
-      # Omni multimodal and diffusion models, on the -omni image. The FLUX test
-      # compares against a golden image under $HF_HOME/golden. Bare metal stages
-      # it onto the host before the container starts; here only $HF_HOME/hub is
-      # the shared cache, so the pod stages it with the same script. The weights
-      # come through the shared cache, downloaded by the first run that needs
-      # them.
+      # Omni multimodal and diffusion models, on the -omni image. The FLUX and
+      # Qwen tests compare against golden files under $HF_HOME/golden. Bare
+      # metal stages it onto the host before the container starts; here only
+      # $HF_HOME/hub is the shared cache, so the pod stages it with the same
+      # script. The weights come through the shared cache, downloaded by the
+      # first run that needs them, except the nightly-only Qwen snapshots,
+      # which the nightly step stages.
       - label: ":kubernetes: Unit Tests - Omni (PR)"
         key: "unit_tests_omni_pr"
         <<: *tpu_step
@@ -282,7 +283,17 @@ steps:
           SHAPE: *shape_single
           DOCKER_IMAGE_SUFFIX: "-omni"
         commands:
-          - *omni_test
+          # The nightly Qwen test also loads Qwen-Image-Edit-2511 and Qwen-Image
+          # at the revisions pinned in MODEL_REVISIONS
+          # (tests_omni/models/qwen_image/test_qwen_image_nightly.py). Stage them
+          # into the shared cache from the bucket, as bare metal does, so a cold
+          # cache does not download ~58 GB each from the Hub inside the test.
+          - |
+            .buildkite/kubernetes/run.sh bash -c '
+              bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/golden/ "$$HF_HOME" &&
+              bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--Qwen--Qwen-Image-Edit-2511/ "$$HF_HOME/hub" &&
+              bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--Qwen--Qwen-Image/ "$$HF_HOME/hub" &&
+              bktec run'
         plugins:
           - *kube_plugin
           - tests#v1.0.0:

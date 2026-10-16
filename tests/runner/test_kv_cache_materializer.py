@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import pytest
 import torch
 from vllm.v1.kv_cache_interface import (
@@ -556,8 +569,27 @@ def test_native_placements_preserve_pool_budget_and_aliases(hybrid):
     cache_config.kv_cache_layout = "LBNHC"
     num_blocks = 4
     budget = 2 * num_blocks * attention.page_size_bytes
+
+    class _StubVllmConfig:
+        def __init__(self, cache_config):
+            self.cache_config = cache_config
+            self.parallel_config = SimpleNamespace(
+                tensor_parallel_size=1,
+                data_parallel_size=1,
+                pipeline_parallel_size=1,
+                prefill_context_parallel_size=1,
+                decode_context_parallel_size=1,
+            )
+            self.attention_config = SimpleNamespace(hisparse_config=None)
+            self.model_config = None
+
+        def __getattr__(self, name):
+            if name.startswith("__") and name.endswith("__"):
+                raise AttributeError(name)
+            return None
+
     config = get_kv_cache_config_from_groups(
-        SimpleNamespace(cache_config=cache_config), groups, budget
+        _StubVllmConfig(cache_config), groups, budget
     )
     assert config.num_blocks == num_blocks
     assert all(tensor.size == budget for tensor in config.kv_cache_tensors)

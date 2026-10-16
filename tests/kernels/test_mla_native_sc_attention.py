@@ -29,11 +29,10 @@ ROPE_DIM = 64
 HEAD_DIM = NOPE_DIM + ROPE_DIM
 
 
-def _build_problem(rng, *, k_scale, query_tokens=128, topk=256):
+def _build_problem(rng, *, k_scale, query_tokens=128, topk=256, num_heads=8):
     page_size = 256
     cache_tokens = 8192
     pages = cache_tokens // page_size
-    num_heads = 8
 
     def quantized_bytes(dim):
         values = rng.random((pages, page_size, dim), dtype=np.float32) * 2 - 1
@@ -616,6 +615,74 @@ class SparseMlaCacheLayoutsTest(parameterized.TestCase):
             np.testing.assert_array_equal(got(lw)[:, :lw], want[:, :lw])
         # Positive control: a different scatter modulus moves the padding rows.
         self.assertFalse(np.array_equal(got(windows, total_pages + 1), want))
+
+    @parameterized.product(
+        (
+            # Decode buckets (MTP 3: q=4 per request) and a mixed step.
+            {"query_tokens": 16, "seq_q": (4, 4)},
+            {"query_tokens": 512, "seq_q": (4, 4, 492)},
+        ),
+        cache_layout=(
+            sparse_mla.SPARSECORE_CACHE_LAYOUT,
+            sparse_mla.TENSORCORE_CACHE_LAYOUT,
+        ),
+    )
+    def test_split_q_lse_matches_concat(self, query_tokens, seq_q, cache_layout):
+        """TPU_MLA_SPARSE_SPLIT_Q on (`q_pe=`, `lse_lane_dense=True`) == off.
+
+        DCP-shaped: 64 heads, per-row live counts incl. empty rows and rows
+        past the 512 cap. Out and lse must match bit for bit.
+        """
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("Sparse MLA attention requires a TPU")
+        rng = np.random.default_rng(20261006)
+        topk = 2048
+        problem = _build_problem(
+            rng, k_scale=0.75, query_tokens=query_tokens, topk=topk, num_heads=64
+        )
+        counts = rng.integers(0, topk + 1, size=query_tokens)
+        counts[0], counts[1] = 0, 1025  # an empty row and an overflow row
+        live = np.arange(topk)[None, :] < counts[:, None]
+        topk_idx = jnp.where(jnp.asarray(live), problem["topk"], -1)
+        # As `sparse_mla_attention_dcp`: a row owning none of its top-k gets
+        # key 0, and `owns` masks its lse afterwards.
+        owns = jnp.any(topk_idx >= 0, axis=-1)
+        topk_idx = topk_idx.at[:, 0].set(jnp.where(owns, topk_idx[:, 0], 0))
+        num_seqs = len(seq_q)
+        page_table = jnp.tile(problem["page_table"], num_seqs)
+        cu_q_lens = jnp.asarray(np.concatenate([[0], np.cumsum(seq_q)]), jnp.int32)
+        num_decode = sum(1 for n in seq_q if n == 4)
+        distribution = jnp.array([num_decode, num_decode, num_seqs], jnp.int32)
+        sparsecore = cache_layout == sparse_mla.SPARSECORE_CACHE_LAYOUT
+        q_nope = problem["q"][..., :NOPE_DIM]
+        q_pe = problem["q"][..., NOPE_DIM:]
+
+        def run(split):
+            out, lse = sparse_mla.sparse_ragged_paged_attention(
+                q_nope if split else problem["q"],
+                problem[f"{cache_layout}_nope"],
+                problem[f"{cache_layout}_rope"],
+                topk_idx,
+                page_table,
+                cu_q_lens,
+                distribution,
+                sm_scale=0.125,
+                k_scale=0.75,
+                return_lse=True,
+                cache_layout=cache_layout,
+                **({"topk_cap": 512} if sparsecore else {}),
+                **({"q_pe": q_pe, "lse_lane_dense": True} if split else {}),
+            )
+            return out[..., :NOPE_DIM], jnp.where(owns[:, None], lse, -jnp.inf)
+
+        (ref, ref_lse), (out, lse) = jax.block_until_ready((run(False), run(True)))
+        np.testing.assert_array_equal(
+            np.asarray(jax.lax.bitcast_convert_type(out, jnp.uint16)),
+            np.asarray(jax.lax.bitcast_convert_type(ref, jnp.uint16)),
+        )
+        np.testing.assert_array_equal(
+            np.asarray(lse).view(np.uint32), np.asarray(ref_lse).view(np.uint32)
+        )
 
     def test_topk_cap_validation(self):
         q = jnp.zeros((16, 8, HEAD_DIM), jnp.bfloat16)

@@ -62,7 +62,7 @@ IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-
 # Point Test Steps to the Metadata-Driven Image Tag
 IMAGE_TAG=""
 if command -v buildkite-agent &> /dev/null; then
-  IMAGE_TAG="$(buildkite-agent meta-data get "CI_IMAGE_TAG" --default "" 2>/dev/null || true)"
+  IMAGE_TAG="$(buildkite-agent meta-data get "${CI_IMAGE_TAG_KEY:-CI_IMAGE_TAG}" --default "" 2>/dev/null || true)"
 fi
 
 # Fallback if metadata is not found: construct the dual-tag <repo>-<vllm>
@@ -268,6 +268,11 @@ if [ "${EXIT_CODE}" -ne 0 ] && [ -n "${MULTIHOST_RUN_LOG:-}" ] && [ -s "${MULTIH
   fi
   echo "Last 40 lines of head-container output:"
   tail -n 40 "${MULTIHOST_RUN_LOG}"
+
+  python3 "${SCRIPT_DIR}/record_ci_failure.py" \
+    --log-file "${MULTIHOST_RUN_LOG}" \
+    --exit-code "${EXIT_CODE}" \
+    --step-label "${BUILDKITE_LABEL:-}" || true
 fi
 if [[ "${MULTIHOST_RUN_LOG:-}" == /tmp/* ]]; then
   rm -f "${MULTIHOST_RUN_LOG}"

@@ -30,7 +30,7 @@
 # also name its own image, which the disagg lane does - it builds one of its
 # own rather than using the CI image.
 if [[ -z "${WORKLOAD_IMAGE:-}" ]]; then
-  WORKLOAD_IMAGE=$(buildkite-agent meta-data get "CI_IMAGE_TAG${DOCKER_IMAGE_SUFFIX:-}" \
+  WORKLOAD_IMAGE=$(buildkite-agent meta-data get "${CI_IMAGE_TAG_KEY:-CI_IMAGE_TAG${DOCKER_IMAGE_SUFFIX:-}}" \
     --default "" 2>/dev/null || true)
 fi
 if [[ -z "${WORKLOAD_IMAGE:-}" ]]; then
@@ -42,6 +42,28 @@ if [[ -z "${WORKLOAD_IMAGE:-}" ]]; then
   exit 2
 fi
 export WORKLOAD_IMAGE
+
+# The image the Kimi-K3 AgentX pair's engines run (kimi-k3-agentx-1p1d.yaml
+# substitutes it; no pod reads it from here): the step's, else the one the build
+# published from build_k3_engine_image.sh, else the build's own.
+if [[ -z "${K3_ENGINE_IMAGE:-}" ]]; then
+  K3_ENGINE_IMAGE=$(buildkite-agent meta-data get K3_ENGINE_IMAGE --default "" 2>/dev/null || true)
+fi
+export K3_ENGINE_IMAGE="${K3_ENGINE_IMAGE:-$WORKLOAD_IMAGE}"
+
+# Whether that pair's pods get the fleet's caches (kimi-k3-agentx-1p1d.yaml
+# substitutes it; no pod reads it from here): the step's, else `none` for a
+# megakernel point and empty, which keeps them, for anything else. A megakernel
+# boot needs the host memory the gcsfuse file cache would hold; see the
+# manifest. Tested for set rather than empty, so a step can keep the caches by
+# setting it empty.
+if [[ -z "${K3_FLEET_CACHES+set}" ]]; then
+  case "${K3_PD_CONFIG:-}" in
+    kimi-k3-megakernel*/*) K3_FLEET_CACHES=none ;;
+    *) K3_FLEET_CACHES="" ;;
+  esac
+fi
+export K3_FLEET_CACHES
 
 # Anything exported here must also be named in FORWARD below: the launcher
 # forwards only what --env names.
@@ -96,6 +118,13 @@ FORWARD=(
   MULTIHOST_ARGS_B64
   # Names the directory whose contents the pod uploads as artifacts.
   ARTIFACTS_DIR
+  # The Kimi-K3 AgentX pair's job switches, read by k3_agentx_client_pod.sh
+  # and the megakernel recipe: the eval-only job, the eval smoke, and skipping
+  # the post-replay eval.
+  AGENTX_EVAL_JOB AGENTX_EVAL_SMOKE AGENTX_SKIP_POST_EVAL
+  # The config both engines of the pair and its client read, when a step serves
+  # another than the manifest's default (a Kimi-K3 megakernel recipe point).
+  K3_PD_CONFIG
 )
 
 # The `tests` plugin mints these on the agent and their two-hour life starts

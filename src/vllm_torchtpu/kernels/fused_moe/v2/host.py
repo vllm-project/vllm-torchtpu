@@ -18,7 +18,7 @@ fits. Nothing here runs inside the Pallas body."""
 
 import enum
 import math
-from typing import NamedTuple
+from typing import Any, NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -295,7 +295,7 @@ class WeightForm(NamedTuple):
     """
 
     name: WeightFormat
-    weight_dtype: object
+    weight_dtype: jax.typing.DTypeLike
     act_dtype: object
     act_max: object
     scale_layout: str
@@ -880,6 +880,7 @@ def build_routing_tables_sharded(
             expert_blocks, (me * blocks_per_dest, 0), (blocks_per_dest, block)
         )
         my_hist = _block_hist(my_blocks, bins)
+        assert all_gather_rows is not None
         rows_by_dest = all_gather_rows(my_hist.sum(axis=0, keepdims=True))
     else:
         my_blocks, my_hist = gathered.local_blocks, gathered.block_hist
@@ -1478,7 +1479,7 @@ def vmem_tile_body_arrays(
     """
     form = weight_form(weight_format)
     tile_m = capacity
-    arrays = [
+    arrays: list[tuple[str, tuple[int, ...], Any]] = [
         ("acc1", (tile_m, 2 * inter), jnp.float32),
         ("mid_chunks", (tile_m, inter), jnp.bfloat16),
     ]
@@ -1644,4 +1645,5 @@ def fit_weight_slots(
             break
     # The first depth that fits, or distance zero over budget for the
     # caller to refuse by name.
+    assert slots is not None
     return slots

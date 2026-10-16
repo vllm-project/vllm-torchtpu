@@ -49,6 +49,9 @@ from vllm.model_executor.layers.quantization.base_config import (
     QuantizationConfig,
     QuantizeMethodBase,
 )
+from vllm.model_executor.layers.vocab_parallel_embedding import (
+    VocabParallelEmbedding,
+)
 from vllm.model_executor.utils import replace_parameter
 
 from vllm_torchtpu.layers.adapter import moe_routing
@@ -190,7 +193,7 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
         Returns:
             A QuantizeMethodBase implementation, or None to use defaults.
         """
-        if isinstance(layer, LinearBase):
+        if isinstance(layer, (LinearBase, VocabParallelEmbedding)):
             # Skip kv_b_proj: MLAAttention slices W_UK_T/W_UV from unquantized
             # kv_b_proj.weight and quantizes them separately after loading.
             if should_quantize_on_load(prefix) and "kv_b_proj" not in prefix.split("."):
@@ -203,14 +206,19 @@ class VllmUnquantizedConfig(QuantizationConfig, VllmQuantConfig):
                     is_checkpoint_fp8_serialized=False,
                     activation_scheme="dynamic",
                 )
-                return VllmFp8LinearMethodTPU(
-                    fp8_config, self.get_linear_config(layer), prefix=prefix
+                linear_cfg = (
+                    self.get_linear_config(layer)
+                    if isinstance(layer, LinearBase)
+                    else None
                 )
+                return VllmFp8LinearMethodTPU(fp8_config, linear_cfg, prefix=prefix)
 
-            # TPU-native dense linear: canonical (k, n) weight layout so the
-            # forward pass is (m, k) @ (k, n) rather than vLLM's
-            # (m, k) @ (n, k).T.
-            return VllmUnquantizedLinearMethod()
+            if isinstance(layer, LinearBase):
+                # TPU-native dense linear: canonical (k, n) weight layout so the
+                # forward pass is (m, k) @ (k, n) rather than vLLM's
+                # (m, k) @ (n, k).T.
+                return VllmUnquantizedLinearMethod()
+            return None
 
         if isinstance(layer, RoutedExperts):
             # For MoE layers, use our custom TPU implementation

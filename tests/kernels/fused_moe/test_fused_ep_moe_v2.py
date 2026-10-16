@@ -687,6 +687,73 @@ def test_nonidentity_mesh_order_relabels_after_topk_bit_exactly():
     np.testing.assert_array_equal(np.asarray(remapped), np.asarray(identity))
 
 
+@pytest.mark.parametrize("sharded_plan", [False, True])
+def test_split_stages_with_a_reordered_gather_are_bit_exact(sharded_plan):
+    """route, a caller-side gather in another order, compute == fused.
+
+    The caller gathers the wire rows in an order of its own -- block i of q_g
+    holds mesh index order[i]'s rows -- and tells compute where each mesh
+    index's block landed. Nothing else about the layer may change.
+    """
+    mesh = _mesh()
+    w1, w2, w1_scale, w2_scale = _make_weights(
+        mesh,
+        24,
+        hidden=SMALL["hidden"],
+        inter=SMALL["inter"],
+        e_total=SMALL["e_total"],
+        weight_format=WeightFormat.FP8,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        25,
+        tokens=SMALL["tokens"],
+        hidden=SMALL["hidden"],
+        e_total=SMALL["e_total"],
+    )
+    common = dict(
+        topk=SMALL["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP8,
+        sharded_plan=sharded_plan,
+    )
+    weights = (w1, w2, w1_scale, w2_scale)
+    fused = fused_ep_moe_v2(x, *weights, gating, **common)
+
+    q, router_weights, payload = fused_ep_moe_v2(
+        x, *weights, gating, stage="route", **common
+    )
+    order = (0, 1, 6, 7, 2, 3, 4, 5)
+    blocks = np.asarray(q).reshape((EP, -1) + q.shape[1:])
+    gathered = blocks[np.asarray(order)].reshape(q.shape)
+    # Every shard holds the whole gather, as the caller's collective leaves it.
+    q_g = jax.device_put(np.concatenate([gathered] * EP), NamedSharding(mesh, P(AXIS)))
+    positions = tuple(order.index(i) for i in range(EP))
+    split = fused_ep_moe_v2(
+        x,
+        *weights,
+        gating,
+        stage="compute",
+        routed=(q_g, router_weights, payload),
+        gather_positions=positions,
+        **common,
+    )
+    np.testing.assert_array_equal(np.asarray(split), np.asarray(fused))
+
+    # The control: the same gather with compute told it is in mesh order.
+    wrong = fused_ep_moe_v2(
+        x,
+        *weights,
+        gating,
+        stage="compute",
+        routed=(q_g, router_weights, payload),
+        **common,
+    )
+    assert not np.array_equal(np.asarray(wrong), np.asarray(fused))
+
+
 @pytest.fixture(scope="module")
 def production_weights():
     """The Qwen3.5-397B MoE weights, fp8 e4m3 with per-channel scales.

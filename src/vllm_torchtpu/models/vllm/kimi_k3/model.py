@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Hashable, Iterable
 from typing import cast
 from unittest.mock import patch
 
@@ -65,7 +65,7 @@ from vllm.transformers_utils.configs.kimi_linear import KimiLinearConfig
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 from .attention import KimiDeltaAttention, MultiHeadLatentAttention, kda_state_dtype
 from .collective_ops import TokenShardCollectives
@@ -520,7 +520,7 @@ class KimiLinearForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
 def _tpu_tp_all_gather(input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """Gather a materialized encoder output without leaving the TPU."""
-    materialized = torch.empty_like(input_).copy_(input_)
+    materialized = fresh_buffer(input_)
     synchronize_tensors(materialized)
     gathered = tensor_model_parallel_all_gather(materialized, dim=dim)
     synchronize_tensors(gathered)
@@ -777,10 +777,13 @@ class KimiK3ForConditionalGeneration(
         device: torch.device,
         dtype: torch.dtype,
         path: str = "default",
+        axis_keys: tuple[Hashable, ...] | None = None,
     ):
         from vllm.v1.worker.encoder_cudagraph_defs import EncoderCudaGraphCaptureInputs
 
         del max_frames_per_batch  # image-only modality
+        if axis_keys:
+            raise ValueError("Kimi K3 does not define encoder capture axes")
 
         merge_h, merge_w = self.vision_tower.merge_kernel_size
         # Ceil so captured capacity is never smaller than token_budget when
@@ -945,7 +948,7 @@ class KimiK3ForConditionalGeneration(
         if merged.device.type != "tpu":
             return merged
 
-        materialized = torch.empty_like(merged).copy_(merged)
+        materialized = fresh_buffer(merged)
         synchronize_tensors(materialized)
         return materialized
 

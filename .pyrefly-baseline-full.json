@@ -461,6 +461,11 @@
       "concise_description": "No attribute `tpu` in module `torch`"
     },
     {
+      "path": "src/vllm_torchtpu/distributed/pp_shift.py",
+      "name": "no-matching-overload",
+      "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (str, ((x: Array) -> Array) | ((*xs: Array) -> tuple[Unknown, ...]), mesh=Mesh, input_partition_specs=tuple[P, ...], output_partition_specs=tuple[P, ...])"
+    },
+    {
       "path": "src/vllm_torchtpu/distributed/sharded_jax_op.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `tuple[P, ...]` is not assignable to parameter `input_partition_specs` with type `tuple[tuple[str, ...], ...] | None` in function `torch_tpu._internal.pallas.pallas.JaxCallable.__init__`"
@@ -702,138 +707,8 @@
     },
     {
       "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/host.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `numpy.dtype.__new__` called with arguments: (type[dtype[_ScalarT_co]], object)"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/host.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/host.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `tuple[Literal['widened_weight_block'], tuple[Literal[2], int | Unknown, Unknown], Any]` is not assignable to parameter `object` with type `tuple[str, tuple[Unknown, Unknown], Any]` in function `list.append`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/host.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `tuple[Literal['widened_weight_block'], tuple[Literal[2], Literal[512], Unknown], Any]` is not assignable to parameter `object` with type `tuple[str, tuple[Unknown, Unknown], Any]` in function `list.append`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/host.py",
       "name": "unbound-name",
       "concise_description": "`estimate` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `astype`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/layer.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `int` has no attribute `astype`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/layer.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `numpy.dtype.__new__` called with arguments: (type[dtype[_ScalarT_co]], object)"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/layer.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array | None` is not assignable to parameter `a` with type `Array | builtins.bool | numpy.bool | complex | float | int | ndarray | number` in function `jax.numpy.repeat`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/experimental/adaptive_fused_moe/vllm_adapter.py",
@@ -857,16 +732,6 @@
     },
     {
       "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/bref_override.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `int`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/bref_override.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int` is not assignable to parameter `x` with type `Array` in function `jax._src.pallas.primitives.multiple_of`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/bref_override.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `at`"
     },
@@ -874,11 +739,6 @@
       "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/bref_override.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/bref_override.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `int`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/bref_override.py",
@@ -922,11 +782,6 @@
     },
     {
       "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/bref_override.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+=` is not supported between `int` and `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/bref_override.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `at`"
     },
@@ -939,11 +794,6 @@
       "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/bref_override.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/bref_override.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `None` is not assignable to parameter `x` with type `Array | builtins.bool | numpy.bool | complex | float | int | ndarray | number` in function `jax.numpy.where`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/bref_override.py",
@@ -1042,31 +892,6 @@
     },
     {
       "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `shape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int` is not assignable to parameter `b_idx` with type `Array` in function `_accum`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `dtype | None` is not assignable to parameter `ty` with type `SupportsDType | dtype | str | type[Any]` in function `jax._src.pallas.mosaic.primitives.bitcast`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `dtype | None` is not assignable to parameter `ty` with type `SupportsDType | dtype | str | type[Any]` in function `jax._src.pallas.mosaic.primitives.bitcast`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
       "name": "bad-return",
       "concise_description": "Returned type `list[Array]` is not assignable to declared return type `Array`"
     },
@@ -1078,42 +903,12 @@
     {
       "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
       "name": "bad-argument-type",
-      "concise_description": "Argument `SmemWrapper` is not assignable to parameter `is_last_k` with type `Ref` in function `vllm_torchtpu.kernels.experimental.batched_rpa.flash_attention.flash_attention_qk_softmax`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `list[Array] | None` is not assignable to parameter `alpha_list` with type `list[Array]` in function `vllm_torchtpu.kernels.experimental.batched_rpa.flash_attention.flash_attention_pv`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
-      "name": "bad-argument-type",
       "concise_description": "Argument `Array | int | None` is not assignable to parameter `v_scale` with type `Array | None` in function `vllm_torchtpu.kernels.experimental.batched_rpa.flash_attention.flash_attention_pv`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
       "name": "bad-argument-type",
-      "concise_description": "Argument `list[Array] | None` is not assignable to parameter `alpha_list` with type `list[Array]` in function `vllm_torchtpu.kernels.experimental.batched_rpa.flash_attention.flash_attention_pv`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
-      "name": "bad-argument-type",
       "concise_description": "Argument `Array | int | None` is not assignable to parameter `v_scale` with type `Array | None` in function `vllm_torchtpu.kernels.experimental.batched_rpa.flash_attention.flash_attention_pv`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `acc_list` with type `list[Array]` in function `calculate_and_store_out`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `l_list` with type `list[Array]` in function `calculate_and_store_out`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `m_list` with type `list[Array]` in function `calculate_and_store_out`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
@@ -1124,16 +919,6 @@
       "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
       "name": "bad-return",
       "concise_description": "Returned type `tuple[BufferedRef, BufferedRef, BufferedRef, BufferedRef | None]` is not assignable to declared return type `tuple[BatchingQRef, KVBufferedRefHeadAlongSublane | KVBufferedRefSeqAlongLane, BatchingORef, BatchingLSERef | None]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `spec`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
-      "name": "unexpected-keyword",
-      "concise_description": "Unexpected keyword argument `scratches` in function `jax._src.pallas.mosaic.pipeline.wrapped`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/kernel.py",
@@ -1152,48 +937,8 @@
     },
     {
       "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/schedule.py",
-      "name": "unsupported-operation",
-      "concise_description": "`>` is not supported between `None` and `Literal[0]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/schedule.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+=` is not supported between `int` and `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/schedule.py",
-      "name": "unsupported-operation",
-      "concise_description": "`>` is not supported between `None` and `Literal[0]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/schedule.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `None` is not assignable to parameter `x` with type `Array | builtins.bool | numpy.bool | complex | float | int | ndarray | number` in function `jax.numpy.where`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/schedule.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `Ref` is not assignable to parameter `distribution` with type `Array` in function `vllm_torchtpu.kernels.experimental.batched_rpa.configs.RpaCase.get_range`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `dtype | None` is not assignable to parameter `dtype` with type `SupportsDType | dtype | str | type[Any]` in function `jax._src.dtypes.itemsize_bits`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `dtype | None` is not assignable to parameter `dtype` with type `SupportsDType | dtype | str | type[Any]` in function `jax._src.dtypes.itemsize_bits`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/wrapper.py",
-      "name": "bad-assignment",
-      "concise_description": "`floating` is not assignable to variable `mask_value` with type `float | None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `float | None` is not assignable to parameter `mask_value` with type `float` in function `vllm_torchtpu.kernels.experimental.batched_rpa.configs.ModelConfigs.__init__`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/wrapper.py",
@@ -1209,21 +954,6 @@
       "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/wrapper.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `float | None` is not assignable to parameter `scale_v` with type `int | None` in function `vllm_torchtpu.kernels.experimental.batched_rpa.configs.ServingConfigs.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | None` is not assignable to parameter `vmem_limit_bytes` with type `int` in function `calculate_block_sizes`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | None` is not assignable to parameter `vmem_limit_bytes` with type `int` in function `vllm_torchtpu.kernels.experimental.batched_rpa.configs.RpaConfigs.__init__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `reshape`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/experimental/batched_rpa/wrapper.py",
@@ -1291,204 +1021,9 @@
       "concise_description": "Argument `float | None` is not assignable to parameter `sm_scale` with type `float` in function `vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper.sharded_pcp_ragged_paged_attention`"
     },
     {
-      "path": "src/vllm_torchtpu/kernels/experimental/pcp_streaming_rpa/wrapper.py",
-      "name": "unsupported-operation",
-      "concise_description": "`//` is not supported between `Array` and `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/experimental/pcp_streaming_rpa/wrapper.py",
-      "name": "unsupported-operation",
-      "concise_description": "`//` is not supported between `Array` and `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/host.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `numpy.dtype.__new__` called with arguments: (type[dtype[_ScalarT_co]], object)"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/host.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/host.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `tuple[Literal['widened_weight_block'], tuple[Literal[2], int | Unknown, Unknown], Any]` is not assignable to parameter `object` with type `tuple[str, tuple[Unknown, Unknown], Any]` in function `list.append`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/host.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `tuple[Literal['widened_weight_block'], tuple[Literal[2], Literal[512], Unknown], Any]` is not assignable to parameter `object` with type `tuple[str, tuple[Unknown, Unknown], Any]` in function `list.append`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `distance`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `nbuf`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `fits`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `vmem_bytes`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `limit`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `vmem_bytes`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `limit`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `astype`"
-    },
-    {
       "path": "src/vllm_torchtpu/kernels/fused_moe/v2/layer.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `int` has no attribute `astype`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/layer.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `numpy.dtype.__new__` called with arguments: (type[dtype[_ScalarT_co]], object)"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/layer.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array | None` is not assignable to parameter `a` with type `Array | builtins.bool | numpy.bool | complex | float | int | ndarray | number` in function `jax.numpy.repeat`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/layer.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `RoutingTables` has no attribute `pos`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/layer.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `ShardRoutingTables` has no attribute `arrival_row`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/layer.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `RoutingTables` has no attribute `mirror_pos`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/layer.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `ShardRoutingTables` has no attribute `mirror_row`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/fused_moe/v2/layer.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `dtype`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
@@ -1497,173 +1032,23 @@
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `_IndexUpdateRef` is not assignable to parameter `vmem_ref` with type `Ref` in function `StateBufferedRef._wait_slice`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `_IndexUpdateRef` is not assignable to parameter `vmem_ref` with type `Ref` in function `StateBufferedRef._wait_slice`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `whole_block_dma`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `_IndexUpdateRef` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/memory_ref.py",
       "name": "bad-return",
       "concise_description": "Returned type `tuple[BufferedRef, BufferedRef, BufferedRef, BufferedRef, BufferedRef, BufferedRef]` is not assignable to declared return type `tuple[InBufferedRef, InBufferedRef, InBufferedRef, StateBufferedRef, StateBufferedRef, OutBufferedRef]`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int` is not assignable to parameter `pcp_rank` with type `Array` in function `_mesh_device_id`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int` is not assignable to parameter `pcp_rank` with type `Array` in function `_mesh_device_id`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `ndim`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
       "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `ndim`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `at`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `shape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `_IndexUpdateRef` is not assignable to parameter `barrier_sem` with type `Array` in function `_all_rank_barrier`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "unexpected-keyword",
-      "concise_description": "Unexpected keyword argument `scratches` in function `jax._src.pallas.mosaic.pipeline.wrapped`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
-      "name": "unexpected-keyword",
-      "concise_description": "Unexpected keyword argument `body_prologue` in function `jax._src.pallas.mosaic.pipeline.wrapped`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
@@ -1696,106 +1081,6 @@
       "concise_description": "Object of class `Ref` has no attribute `reshape`"
     },
     {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/vmem_ldst.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/vmem_ldst.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/vmem_ldst.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `conv_state_slot_ref` with type `Ref` in function `vllm_torchtpu.kernels.gdn.v3.vmem_ldst.load_and_select_states`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `recurrent_slot_ref` with type `Ref` in function `vllm_torchtpu.kernels.gdn.v3.vmem_ldst.load_and_select_states`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array | None` is not assignable to parameter `carry_conv_scratch_ref` with type `Ref | None` in function `vllm_torchtpu.kernels.gdn.v3.vmem_ldst.load_and_select_states`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array | None` is not assignable to parameter `carry_recurrent_scratch_ref` with type `Ref | None` in function `vllm_torchtpu.kernels.gdn.v3.vmem_ldst.load_and_select_states`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `_IndexUpdateRef` is not assignable to parameter `slot_ref` with type `Ref` in function `vllm_torchtpu.kernels.gdn.v3.vmem_ldst.store_state_region`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `_IndexUpdateRef` is not assignable to parameter `slot_ref` with type `Ref` in function `vllm_torchtpu.kernels.gdn.v3.vmem_ldst.store_state_region`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `qkv_vmem_ref` with type `Ref` in function `vllm_torchtpu.kernels.gdn.v3.vmem_ldst.load_activation_as_compact`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `b_vmem_ref` with type `Ref` in function `vllm_torchtpu.kernels.gdn.v3.vmem_ldst.load_activation_as_compact`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `a_vmem_ref` with type `Ref` in function `vllm_torchtpu.kernels.gdn.v3.vmem_ldst.load_activation_as_compact`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `qkv_vmem_ref` with type `Ref` in function `vllm_torchtpu.kernels.gdn.v3.vmem_ldst.load_activation_as_large`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `b_vmem_ref` with type `Ref` in function `vllm_torchtpu.kernels.gdn.v3.vmem_ldst.load_activation_as_large`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array` is not assignable to parameter `a_vmem_ref` with type `Ref` in function `vllm_torchtpu.kernels.gdn.v3.vmem_ldst.load_activation_as_large`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `_IndexUpdateRef` is not assignable to parameter `slot_ref` with type `Ref` in function `vllm_torchtpu.kernels.gdn.v3.vmem_ldst.store_state_region`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `_IndexUpdateRef` is not assignable to parameter `slot_ref` with type `Ref` in function `vllm_torchtpu.kernels.gdn.v3.vmem_ldst.store_state_region`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "unexpected-keyword",
-      "concise_description": "Unexpected keyword argument `scratches` in function `jax._src.pallas.mosaic.pipeline.wrapped`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `dtype`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `dtype`"
-    },
-    {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `astype`"
@@ -1803,17 +1088,7 @@
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
       "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `shape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `reshape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `dtype`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/wrapper.py",
@@ -1881,19 +1156,9 @@
       "concise_description": "`recurrent_out_dtype` may be uninitialized"
     },
     {
-      "path": "src/vllm_torchtpu/kernels/kimi_k3/decode_kda.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `float | None` is not assignable to parameter `x` with type `Buffer | SupportsFloat | SupportsIndex | str` in function `float.__new__`"
-    },
-    {
       "path": "src/vllm_torchtpu/kernels/kimi_k3/mega_kda/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `Array`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/kimi_k3/mega_kda/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `Array`"
+      "name": "unbound-name",
+      "concise_description": "`A_inv` may be uninitialized"
     },
     {
       "path": "src/vllm_torchtpu/kernels/kimi_k3/mega_kda/kernel.py",
@@ -1907,23 +1172,8 @@
     },
     {
       "path": "src/vllm_torchtpu/kernels/kimi_k3/mega_kda/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `Array`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/kimi_k3/mega_kda/kernel.py",
       "name": "unbound-name",
       "concise_description": "`A_inv` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/kimi_k3/mega_kda/kernel.py",
-      "name": "unbound-name",
-      "concise_description": "`A_inv` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/kimi_k3/mega_kda/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`*` is not supported between `None` and `Array`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/kimi_k3/mega_kda/kernel.py",
@@ -1946,119 +1196,14 @@
       "concise_description": "`A_inv` may be uninitialized"
     },
     {
-      "path": "src/vllm_torchtpu/kernels/kimi_k3/mega_kda/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `shape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `jax._src.pallas.utils.cdiv` called with arguments: (int, int | None)"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "unsupported-operation",
-      "concise_description": "`//` is not supported between `Array` and `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | None` is not assignable to parameter `step` with type `SupportsIndex` in function `range.__new__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+` is not supported between `int` and `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "unsupported-operation",
-      "concise_description": "`//` is not supported between `int` and `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `dtype | None` is not assignable to parameter `arg1` with type `SupportsDType | dtype | str | type[Any]` in function `jax.numpy.issubdtype`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | None` is not assignable to parameter `step` with type `SupportsIndex` in function `range.__new__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "unsupported-operation",
-      "concise_description": "`+` is not supported between `int` and `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "unsupported-operation",
-      "concise_description": "`//` is not supported between `int` and `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array | None` is not assignable to parameter `zero_ref` with type `Array` in function `zero_out_start`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array | None` is not assignable to parameter `semaphore_ref` with type `Array` in function `zero_out_start`"
-    },
-    {
       "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
       "name": "bad-assignment",
       "concise_description": "`FusedWeightsRef` is not assignable to variable `rhs_ref` with type `WeightsRef`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "unexpected-keyword",
-      "concise_description": "Unexpected keyword argument `scratches` in function `jax._src.pallas.mosaic.pipeline.wrapped`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array | None` is not assignable to parameter `semaphore_ref` with type `Array` in function `zero_out_end`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
       "name": "unbound-name",
       "concise_description": "`zero_size` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "unsupported-operation",
-      "concise_description": "`%` is not supported between `int` and `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "unsupported-operation",
-      "concise_description": "`%` is not supported between `None` and `int`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `dtype | None` is not assignable to parameter `dtype` with type `SupportsDType | dtype | str | type[Any]` in function `jax._src.dtypes.itemsize_bits`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `jax._src.pallas.utils.cdiv` called with arguments: (int, int | None)"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `dtype | None` is not assignable to parameter `arg1` with type `SupportsDType | dtype | str | type[Any]` in function `jax.numpy.issubdtype`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `dtype | None` is not assignable to parameter `dtype` with type `SupportsDType | dtype | str | type[Any]` in function `jax._src.dtypes.itemsize_bits`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | None` is not assignable to parameter with type `int`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/megablox/gmm_v2.py",
@@ -2151,66 +1296,6 @@
       "concise_description": "Object of class `NoneType` has no attribute `at`"
     },
     {
-      "path": "src/vllm_torchtpu/kernels/mla/sparse/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `shape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/mla/sparse/kernel.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `dtype`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/mla/sparse/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Array | None` is not assignable to parameter `object` with type `Array` in function `list.append`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/mla/sparse/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int` is not assignable to parameter `start_seq_idx` with type `Array` in function `run_mla_kernel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/mla/sparse/kernel.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/mla/v2/kernel.py",
-      "name": "bad-assignment",
-      "concise_description": "`floating` is not assignable to variable `mask_value` with type `float | None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/mla/v2/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `list[int] | tuple[int, int, int]` is not assignable to parameter `num_kv_pages_per_blocks` with type `tuple[int, int, int] | None` in function `static_validate_inputs`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/mla/v2/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `list[int] | tuple[int, int, int]` is not assignable to parameter `num_queries_per_blocks` with type `tuple[int, int, int] | None` in function `static_validate_inputs`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/mla/v2/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `float | None` is not assignable to parameter `mask_value` with type `float` in function `_mla_ragged_paged_attention_kernel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/mla/v2/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | None` is not assignable to parameter `static_q_len` with type `int` in function `_mla_ragged_paged_attention_kernel`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/quantized_matmul/blockwise_kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `list[None]` is not assignable to parameter `arrays` with type `Array | Sequence[ArrayLike] | ndarray` in function `jax.numpy.concatenate`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/quantized_matmul/blockwise_kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `None` is not assignable to parameter `x_abs_max` with type `Array` in function `vllm_torchtpu.kernels.quantized_matmul.util.validate_inputs`"
-    },
-    {
       "path": "src/vllm_torchtpu/kernels/quantized_matmul/kernel.py",
       "name": "unbound-name",
       "concise_description": "`x_scale_tmp` may be uninitialized"
@@ -2219,31 +1304,6 @@
       "path": "src/vllm_torchtpu/kernels/quantized_matmul/util.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `float` is not assignable to parameter `copy` with type `bool` in function `jax.numpy.nan_to_num`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/ragged_paged_attention/v3/kernel.py",
-      "name": "bad-assignment",
-      "concise_description": "`floating` is not assignable to variable `mask_value` with type `float | None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/ragged_paged_attention/v3/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `float | None` is not assignable to parameter `y` with type `Array | builtins.bool | numpy.bool | complex | float | int | ndarray | number` in function `jax.numpy.where`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/ragged_paged_attention/v3/kernel.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `float | None` is not assignable to parameter `y` with type `Array | builtins.bool | numpy.bool | complex | float | int | ndarray | number` in function `jax.numpy.where`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/ragged_paged_attention/v3/kernel.py",
-      "name": "bad-assignment",
-      "concise_description": "`floating` is not assignable to variable `mask_value` with type `float | None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/kernels/ragged_paged_attention/v3/kernel_hd64.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `float | None` is not assignable to parameter `mask_value` with type `float` in function `_ragged_paged_attention_kernel`"
     },
     {
       "path": "src/vllm_torchtpu/kernels/sparse_core/core_map_helper.py",
@@ -2317,11 +1377,6 @@
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `object` has no attribute `model_config`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
       "name": "unsupported-operation",
       "concise_description": "`None` is not subscriptable"
     },
@@ -2344,16 +1399,6 @@
       "path": "src/vllm_torchtpu/layers/adapter/attention.py",
       "name": "no-matching-overload",
       "concise_description": "No matching overload found for function `torch_tpu._internal.pallas.pallas.jax_op` called with arguments: (str, ((...) -> tuple[Array, Array]) | partial[tuple[Array, Array]], donate_argnums=tuple[Literal[0]] | None, mesh=Any | None, input_partition_specs=tuple[P, P, P, P, P, P, P, P] | tuple[P, *tuple[P, ...]] | None)"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `object` has no attribute `parallel_config`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `object` has no attribute `parallel_config`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/attention.py",
@@ -2477,38 +1522,8 @@
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/gdn_linear.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `BasevLLMParameter` has no attribute `output_dim`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/gdn_linear.py",
       "name": "bad-override",
       "concise_description": "Class member `GdnInterleavedColumnParallelLinear.weight_loader` overrides parent class `MergedColumnParallelLinear` in an inconsistent manner"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/gdn_linear.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `Module`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/gdn_linear.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `BasevLLMParameter` has no attribute `output_dim`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/gdn_linear.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Literal[0] | Tensor | Unknown` is not assignable to parameter `*shape` with type `SymInt | int` in function `torch._C.TensorBase.reshape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/gdn_linear.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `torch._C.TensorBase.narrow` called with arguments: (Literal[1], Literal[0] | Tensor | Unknown, Tensor | Unknown)"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/gdn_linear.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `BasevLLMParameter` has no attribute `output_dim`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/quantization/compressed_tensors/compressed_tensors_moe/compressed_tensors_moe_w4a16.py",
@@ -2696,16 +1711,6 @@
       "concise_description": "`None` is not assignable to attribute `kv_cache` with type `tuple[Tensor, ...]`"
     },
     {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "unbound-name",
-      "concise_description": "`output_gate` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/attention.py",
-      "name": "unbound-name",
-      "concise_description": "`output_gate` may be uninitialized"
-    },
-    {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/dspark.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `Tensor` has no attribute `shard_id`"
@@ -2744,11 +1749,6 @@
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
       "name": "bad-return",
       "concise_description": "Returned type `tuple[tuple[int, ...], tuple[int, int, int]]` is not assignable to declared return type `tuple[tuple[int, int], tuple[int, int, int]]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/moe.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `FusedMoEMethodBase` has no attribute `apply_with_routing`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py",
@@ -2884,11 +1884,6 @@
       "path": "src/vllm_torchtpu/runner/kv_cache_manager.py",
       "name": "missing-attribute",
       "concise_description": "Class `AttentionBackend` has no class attribute `get_kv_cache_shape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/mm_encoder_manager.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `dict[int, BudgetGraphMetadata]`"
     },
     {
       "path": "src/vllm_torchtpu/runner/mm_video_chunking.py",
@@ -3159,11 +2154,6 @@
       "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `Tensor | ndarray` is not assignable to parameter `t` with type `Tensor` in function `_maybe_pad_dim0`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/eagle3.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `Tensor` has no attribute `astype`"
     },
     {
       "path": "src/vllm_torchtpu/spec_decode/eagle3.py",

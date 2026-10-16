@@ -89,7 +89,7 @@ All environment variables read by `vllm-torchtpu` are declared and validated in 
 
 | Variable | Default | Description |
 | :--- | :--- | :--- |
-| `USE_PHASED_PROFILER` | `False` | Captures separate XProf traces for prefill and decode phases during a single benchmark run. See [Profiling](../developers_guide/profiling.md). |
+| `USE_PHASED_PROFILER` | `False` | Captures separate XProf traces for prefill and decode phases during a single benchmark run. See [Profiling](../developers_guide/profiling/phased.md). |
 | `PYTHON_TRACER_LEVEL` | `1` | Python host call-stack tracing level (`0` = off, `1` = standard, `2` = verbose). |
 | `HOST_TRACER_LEVEL` | `2` | XLA runtime host activity tracing level. |
 | `DEVICE_TRACER_LEVEL` | `1` | TPU device TensorCore/SparseCore execution tracing level. |

@@ -20,9 +20,6 @@ x-kube-plugin: &kube_plugin
 x-integration-step-defaults: &integration_step
   depends_on:
     - "build_docker"
-  # Shared with pipeline_perf_kube.yml, which says what it limits.
-  concurrency_group: "tpu/v7x"
-  concurrency: 12
   # Covers queueing as well as running, so it cannot be set from how long the
   # work takes. The sum of the launcher's two limits, so a step is stopped by
   # whichever of those it exceeded and not by this.
@@ -210,9 +207,8 @@ steps:
           - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_k3_pruned75_apc_offload_correctness.sh
 
   # A two-host slice, so it goes through run_multihost.sh and the JobSet in
-  # manifests/. Not in the tpu/v7x concurrency group, which limits concurrent
-  # model loads rather than chips; Kueue holds it until a 2x2x2 slice is free,
-  # so it starts with the rest of the lane.
+  # manifests/. Kueue holds it until a 2x2x2 slice is free, so it starts with
+  # the rest of the lane.
   #
   # This is the only step in either integration lane that exercises the fleet's
   # 2x2x2 profile, which has held zero chip-hours since the fleet was built.
@@ -237,9 +233,9 @@ steps:
 
   # The role-per-host tests. Each holds two hosts - two engines of eight
   # devices, which is one whole tpu7x-standard-4t each - and like the multihost
-  # step above they sit outside the tpu/v7x concurrency group and start with
-  # the rest of the lane: eight chips apiece, which Kueue holds them for. The
-  # step timeout covers that wait, and the launcher's limits run to hours.
+  # step above they start with the rest of the lane: eight chips apiece, which
+  # Kueue holds them for. The step timeout covers that wait, and the launcher's
+  # limits run to hours.
   #
   # None uploads artifacts. The pod is deleted when the run ends and these
   # submit a manifest rather than going through run.sh's upload wrapper, so the

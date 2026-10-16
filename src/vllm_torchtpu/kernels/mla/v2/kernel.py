@@ -15,7 +15,9 @@
 
 import functools
 import math
+from collections.abc import Sequence
 from enum import Enum
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -153,8 +155,8 @@ def static_validate_inputs(
     # Kernel optimization params.
     chunk_prefill_size: int | None = None,
     # Kernel tuning params.
-    num_kv_pages_per_blocks: tuple[int, int, int] | None = None,
-    num_queries_per_blocks: tuple[int, int, int] | None = None,
+    num_kv_pages_per_blocks: Sequence[int] | None = None,
+    num_queries_per_blocks: Sequence[int] | None = None,
     vmem_limit_bytes: int | None = None,
     decode_batch_size: int = 1,
     mixed_q_split: int = 1,
@@ -325,12 +327,18 @@ def _mla_ragged_paged_attention_kernel(
     #     align_to(lkv_dim + r_dim, 128)] if not transpose_kv_cache else
     # [total_num_pages, align_to(lkv_dim + r_dim, 128), page_size]
     cache_kv_hbm_ref,
+    # f32[max_num_tokens, num_q_heads, 128] with return_lse, else None.
+    # Aliased with lse_hbm_ref.
+    lse_in_hbm_ref,
     # Output
     o_hbm_ref,  # [max_num_tokens, num_q_heads, lkv_dim]
     # [total_num_pages, page_size_per_kv_packing, kv_packing,
     #     align_to(lkv_dim + r_dim, 128)] if not transpose_kv_cache else
     # [total_num_pages, align_to(lkv_dim + r_dim, 128), page_size]
     updated_cache_kv_hbm_ref,
+    # f32[max_num_tokens, num_q_heads, 128] with return_lse, else None.
+    # Same lane-replicated layout as m_ref and l_ref; the wrapper reads lane 0.
+    lse_hbm_ref,
     # Scratch
     # [2, batch_size, bkv_buf_sz_per_kv_packing, kv_packing, lkv_dim]
     # if not transpose_kv_cache else [2, batch_size, lkv_dim, bkv_sz + 256]
@@ -341,12 +349,14 @@ def _mla_ragged_paged_attention_kernel(
     bq_nope_x2_ref,  # [2, batch_size, bq_sz, num_q_heads, lkv_dim]
     bq_rope_x2_ref,  # [2, batch_size, bq_sz, num_q_heads, r_dim]
     bo_x2_ref,  # [2, batch_size, bq_sz, num_q_heads, lkv_dim]
-    sems,  # [4, batch_size, 2]
+    sems,  # [5 if return_lse else 4, batch_size, 2]
     l_ref,  # [batch_size, bq_sz * num_q_heads, 128],
     m_ref,  # [batch_size, bq_sz * num_q_heads, 128],
     acc_ref,  # [batch_size, bq_sz * num_q_heads, lkv_dim],
+    # f32[2, batch_size, bq_sz, padded_num_q_heads, 128] with return_lse, else None
+    blse_x2_ref,
     *,
-    static_q_len: int,
+    static_q_len: int | None,
     sm_scale: float,
     mask_value: float,
     s_dtype: jnp.dtype,
@@ -364,7 +374,9 @@ def _mla_ragged_paged_attention_kernel(
     batch_size: int = 1,
     q_split: int = 1,
     debug_mode: bool = False,
+    return_lse: bool = False,
 ):
+    del lse_in_hbm_ref
     assert ql_nope_hbm_ref.shape == o_hbm_ref.shape
     # Validation checks on the dimensions
     nope_dim = ql_nope_hbm_ref.shape[-1]
@@ -1638,13 +1650,21 @@ def _mla_ragged_paged_attention_kernel(
             debug_print("[RPA debug] sz={}", sz)
 
             @pl.when(sz > 0)
-            def _copy(vmem_ref=vmem_ref, sz=sz, q_len_start=q_len_start, sem=sem):
+            def _copy(b=b, vmem_ref=vmem_ref, sz=sz, q_len_start=q_len_start, sem=sem):
                 _async_copy(
                     vmem_ref.at[pl.ds(0, sz), :num_q_heads],
                     o_hbm_ref.at[pl.ds(q_len_start, sz)],
                     sem,
                     wait,
                 )
+                if return_lse:
+                    assert blse_x2_ref is not None and lse_hbm_ref is not None
+                    _async_copy(
+                        blse_x2_ref.at[bo_sem_idx, b, pl.ds(0, sz), :num_q_heads],
+                        lse_hbm_ref.at[pl.ds(q_len_start, sz)],
+                        sems.at[4, b, bo_sem_idx],
+                        wait,
+                    )
 
     # TODO: Split out the KV handling functions into separate files.
     _fetch_bkv_fn = _fetch_bkv if not transpose_kv_cache else _fetch_transposed_bkv
@@ -2070,6 +2090,13 @@ def _mla_ragged_paged_attention_kernel(
             sem_ids_ref[2] = lax.select(bo_sem_idx == 0, 1, 0)
             wait_send_bo(bo_sem_idx)
 
+            if return_lse:
+                assert blse_x2_ref is not None
+                lse = m_ref[...] + jnp.log(l_ref[...])
+                blse_x2_ref.at[bo_sem_idx][:, :, :num_q_heads] = lse.reshape(
+                    batch_size, bq_sz, num_q_heads, 128
+                )
+
             # Store output from acc to bo.
             bo_x2_ref.at[bo_sem_idx].bitcast(jnp.int32).reshape(
                 batch_size,
@@ -2282,6 +2309,7 @@ def prepare_outputs(
         "two_step_flash_attention",
         "p_same_dtype_as_v",
         "use_causal_mask",
+        "return_lse",
         "debug_mode",
     ),
     donate_argnames=("cache_kv",),
@@ -2320,14 +2348,22 @@ def mla_ragged_paged_attention(
     two_step_flash_attention: bool = True,
     p_same_dtype_as_v: bool = True,
     use_causal_mask: bool = True,
+    return_lse: bool = False,
     # Debug params.
     debug_mode: bool = False,
-) -> tuple[
-    jax.Array,  # [actual_num_q_heads, max_num_tokens, actual_lkv_dim]
-    # [total_num_pages, page_size_per_kv_packing, kv_packing,
-    #     align_to(lkv_dim, 128) + align_to(r_dim, 128)]
-    jax.Array,
-]:
+) -> (
+    tuple[
+        jax.Array,  # [actual_num_q_heads, max_num_tokens, actual_lkv_dim]
+        # [total_num_pages, page_size_per_kv_packing, kv_packing,
+        #     align_to(lkv_dim, 128) + align_to(r_dim, 128)]
+        jax.Array,
+    ]
+    | tuple[
+        jax.Array,  # [actual_num_q_heads, max_num_tokens, actual_lkv_dim]
+        jax.Array,  # the updated kv cache, as above
+        jax.Array,  # f32[max_num_tokens, actual_num_q_heads] log-sum-exp
+    ]
+):
     """MLA Ragged paged attention that supports mixed prefill and decode.
 
     Args:
@@ -2365,14 +2401,19 @@ def mla_ragged_paged_attention(
         AV attention in two separate steps to make them be more parallelized
         with VALU ops instead of batched matmul in one step.
       p_same_dtype_as_v: if true, cast p to the same dtype as v before p @ v.
+      return_lse: if true, also return the log-sum-exp of the scaled scores per
+        (token, head) as f32 `[max_num_tokens, actual_num_q_heads]`, for
+        merging partial attention outputs across ranks. Rows of tokens outside
+        every sequence are 0.
       debug_mode: if true, RPA does not issue any DMAs or run flash attention but
         print debug info. Need to compile with `--xla_tpu_enable_log_recorder`.
 
     Returns:
-      The output of attention and the updated kv cache.
+      The output of attention and the updated kv cache, and with `return_lse`
+      the log-sum-exp as a third array.
     """
     if mask_value is None:
-        mask_value = jnp.finfo(s_dtype).min
+        mask_value = cast(float, jnp.finfo(s_dtype).min)
 
     if num_kv_pages_per_block is None or num_queries_per_block is None:
         raise ValueError(
@@ -2470,6 +2511,7 @@ def mla_ragged_paged_attention(
         start_seq_idx: jax.Array,  # i32
         end_seq_idx: jax.Array,  # i32
         static_q_len: int | None,
+        lse: jax.Array | None,  # f32[max_num_tokens, num_q_heads, 128] or None
         num_kv_pages_per_block: int,
         num_queries_per_block: int,
         s_dtype: jnp.dtype,
@@ -2507,12 +2549,15 @@ def mla_ragged_paged_attention(
             pl.BlockSpec(memory_space=pltpu.HBM),  # new_kv_c
             pl.BlockSpec(memory_space=pltpu.HBM),  # new_k_pe
             pl.BlockSpec(memory_space=pltpu.HBM),  # cache_kv
+            pl.BlockSpec(memory_space=pltpu.HBM) if return_lse else None,  # lse in
         ]
 
         out_specs = [
             pl.BlockSpec(memory_space=pltpu.HBM),  # o
             pl.BlockSpec(memory_space=pltpu.HBM),  # updated_cache_kv
+            pl.BlockSpec(memory_space=pltpu.HBM) if return_lse else None,  # lse
         ]
+        assert (lse is not None) == return_lse
 
         if not transpose_kv_cache:
             bkv_sz_per_kv_packing = bkv_p * page_size_per_kv_packing
@@ -2574,12 +2619,16 @@ def mla_ragged_paged_attention(
             bq_nope_double_buf,
             bq_rope_double_buf,
             bo_double_buf,  # Double buffering for output block.
-            # Semaphores for double buffering of bkv, bq, bo and bkv_update.
-            pltpu.SemaphoreType.DMA((4, batch_size, 2)),
+            # Semaphores for double buffering of bkv, bq, bo, bkv_update, lse.
+            pltpu.SemaphoreType.DMA((5 if return_lse else 4, batch_size, 2)),
             # Intermediate buffers per kv head for flash attention.
             l_scratch,
             m_scratch,
             acc_scratch,
+            # Double buffering for the lse block.
+            pltpu.VMEM((2, batch_size, bq_sz, padded_num_q_heads, 128), jnp.float32)
+            if return_lse
+            else None,
         ]
 
         scalar_prefetches = (
@@ -2598,6 +2647,7 @@ def mla_ragged_paged_attention(
 
         scope_name = (
             f"MLA-{case.symbol}-bq_{bq_sz}-bkvp_{bkv_p}-p_{page_size}-bsz_{batch_size}"
+            + ("-lse" if return_lse else "")
         )
         kernel = jax.named_scope(scope_name)(
             pl.pallas_call(
@@ -2606,7 +2656,7 @@ def mla_ragged_paged_attention(
                     sm_scale=sm_scale,
                     sliding_window=sliding_window,
                     soft_cap=soft_cap,
-                    mask_value=mask_value,
+                    mask_value=cast(float, mask_value),
                     q_scale=q_scale,
                     k_scale=k_scale,
                     v_scale=v_scale,
@@ -2621,6 +2671,7 @@ def mla_ragged_paged_attention(
                     p_same_dtype_as_v=p_same_dtype_as_v,
                     use_causal_mask=use_causal_mask,
                     debug_mode=debug_mode,
+                    return_lse=return_lse,
                 ),
                 grid_spec=pltpu.PrefetchScalarGridSpec(
                     num_scalar_prefetch=len(scalar_prefetches),
@@ -2637,26 +2688,33 @@ def mla_ragged_paged_attention(
                 out_shape=[
                     jax.ShapeDtypeStruct(shape=ql_nope.shape, dtype=ql_nope.dtype),
                     jax.ShapeDtypeStruct(shape=cache_kv.shape, dtype=cache_kv.dtype),
+                    jax.ShapeDtypeStruct(shape=lse.shape, dtype=lse.dtype)
+                    if lse is not None
+                    else None,
                 ],
+                # Operand indices count the scalar prefetches.
                 input_output_aliases={
                     7: 0,  # Alias output activation with ql_nope
                     11: 1,  # Aliasing cache_kv with updated_cache_kv
+                    **({12: 2} if return_lse else {}),  # lse in with lse out
                 },
                 name=scope_name,
             )
         )
-        return kernel(
-            *scalar_prefetches,
-            ql_nope,
-            q_pe,
-            new_kv_c,
-            new_k_pe,
-            cache_kv,
+        o, updated_cache_kv, lse = kernel(
+            *scalar_prefetches, ql_nope, q_pe, new_kv_c, new_k_pe, cache_kv, lse
         )
+        return o, updated_cache_kv, lse
 
     batch_distribution = (distribution[0] // decode_batch_size) * decode_batch_size
+    # Aliased through the calls below; unwritten rows stay 0.
+    lse = (
+        jnp.zeros((ql_nope.shape[0], num_q_heads, 128), jnp.float32)
+        if return_lse
+        else None
+    )
     # Batched decode
-    ql_nope, updated_kv = run_mla_kernel(
+    ql_nope, updated_kv, lse = run_mla_kernel(
         ql_nope,
         q_pe,
         new_kv_c,
@@ -2665,6 +2723,7 @@ def mla_ragged_paged_attention(
         kv_lens,
         page_indices,
         cu_q_lens,
+        lse=lse,
         num_kv_pages_per_block=num_kv_pages_per_blocks[0],
         num_queries_per_block=num_queries_per_blocks[0],
         start_seq_idx=jnp.array(0),
@@ -2676,7 +2735,7 @@ def mla_ragged_paged_attention(
         case=MlaCase.BATCHED_DECODE,
     )
     # Decode-only
-    ql_nope, updated_kv = run_mla_kernel(
+    ql_nope, updated_kv, lse = run_mla_kernel(
         ql_nope,
         q_pe,
         new_kv_c,
@@ -2685,6 +2744,7 @@ def mla_ragged_paged_attention(
         kv_lens,
         page_indices,
         cu_q_lens,
+        lse=lse,
         num_kv_pages_per_block=num_kv_pages_per_blocks[0],
         num_queries_per_block=num_queries_per_blocks[0],
         start_seq_idx=batch_distribution,
@@ -2698,7 +2758,7 @@ def mla_ragged_paged_attention(
 
     if chunk_prefill_size is not None:
         # Handle prefill where the query length is fixed per sequence.
-        ql_nope, updated_kv = run_mla_kernel(
+        ql_nope, updated_kv, lse = run_mla_kernel(
             ql_nope,
             q_pe,
             new_kv_c,
@@ -2707,6 +2767,7 @@ def mla_ragged_paged_attention(
             kv_lens,
             page_indices,
             cu_q_lens,
+            lse=lse,
             num_kv_pages_per_block=num_kv_pages_per_blocks[1],
             num_queries_per_block=num_queries_per_blocks[1],
             start_seq_idx=distribution[0],
@@ -2719,7 +2780,7 @@ def mla_ragged_paged_attention(
         )
 
     # Handle mixed case where the query length per sequence is variable.
-    ql_nope, updated_kv = run_mla_kernel(
+    ql_nope, updated_kv, lse = run_mla_kernel(
         ql_nope,
         q_pe,
         new_kv_c,
@@ -2728,6 +2789,7 @@ def mla_ragged_paged_attention(
         kv_lens,
         page_indices,
         cu_q_lens,
+        lse=lse,
         num_kv_pages_per_block=num_kv_pages_per_blocks[2],
         num_queries_per_block=num_queries_per_blocks[2],
         start_seq_idx=distribution[1],
@@ -2747,4 +2809,8 @@ def mla_ragged_paged_attention(
         vmem_limit_bytes=vmem_limit_bytes,
     )  # [actual_num_q_heads, max_num_tokens, actual_lkv_dim]
 
-    return output, updated_kv
+    if not return_lse:
+        return output, updated_kv
+    assert lse is not None
+    lse = lse[:actual_max_num_tokens, :actual_num_q_heads, 0]
+    return output, updated_kv, lse

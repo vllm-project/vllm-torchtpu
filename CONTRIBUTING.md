@@ -30,7 +30,9 @@ Create signed commits using `git commit -s`, which automatically appends the tra
 Signed-off-by: Your Name <your.email@example.com>
 ```
 
-> [!TIP] Automatic Sign-Off in IDEs
+> [!TIP]
+> **Automatic Sign-Off in IDEs**:
+>
 > * **VS Code**: Enable `Git: Always Sign Off` (`git.alwaysSignOff: true`) in your settings.
 > * **PyCharm**: In the Commit window, enable `Sign-off commit`.
 
@@ -43,7 +45,7 @@ git push origin HEAD --force-with-lease
 
 ### 2. Google Cloud Authentication
 <!-- TODO: Once torch_tpu and vllm-torchtpu are open-sourced, torch_tpu will be installable directly from PyPI without GCP authentication. -->
-We authenticate with Google Cloud to access the Torch TPU Virtual Registry (`https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/`), which contains `torch-tpu`, `torch`, and other TPU dependencies.
+We authenticate with Google Cloud to access the Torch TPU Virtual Registry (`https://us-python.pkg.dev/ml-oss-artifacts-published/torch-tpu-release-virtual-registry/simple/`), which contains `torch-tpu`, `torch`, and other TPU dependencies.
 
 Check your active account:
 
@@ -58,8 +60,8 @@ gcloud auth login
 gcloud auth application-default login
 ```
 
-> [!TIP] Troubleshooting Stale Credentials
-> A common cause of authentication errors when using `keyring` with `uv` is an existing `~/.netrc` file containing stale credentials. Open `~/.netrc` and delete any expired block associated with `us-python.pkg.dev`.
+> [!TIP]
+> **Troubleshooting Stale Credentials**: A common cause of authentication errors when using `keyring` with `uv` is an existing `~/.netrc` file containing stale credentials. Open `~/.netrc` and delete any expired block associated with `us-python.pkg.dev`.
 
 ### 3. Clone and Install Dependencies
 
@@ -96,7 +98,7 @@ pip install --upgrade pip
 # Install keyring plugin for persistent auth
 pip install keyring keyrings.google-artifactregistry-auth
 # TODO: Replace with the public index once torch_tpu is open-sourced
-export PIP_INDEX_URL="https://oauth2accesstoken@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
+export PIP_INDEX_URL="https://oauth2accesstoken@us-python.pkg.dev/ml-oss-artifacts-published/torch-tpu-release-virtual-registry/simple/"
 
 # Install vllm-torchtpu and dependencies in editable mode (--group vllm pulls vLLM from source;
 # needs pip >= 25.1)
@@ -107,8 +109,8 @@ VLLM_TARGET_DEVICE="empty" pip install --pre -e . --group vllm
 If you are developing or debugging vLLM core in tandem with `vllm-torchtpu`:
 
 ```bash
-# Clone matching vLLM version (e.g. v0.29.0)
-git clone --depth 1 --branch v0.29.0 https://github.com/vllm-project/vllm.git ../vllm
+# Clone matching vLLM version (e.g. v0.31.0)
+git clone --depth 1 --branch v0.31.0 https://github.com/vllm-project/vllm.git ../vllm
 
 # Install in editable mode without overwriting dependencies
 VLLM_TARGET_DEVICE="empty" uv pip install --no-deps -e ../vllm

@@ -133,7 +133,8 @@ def merge_lse_partials_scatter_heads(
     ):
         return merge_lse_partials_all_to_all(output, lse, group)
 
-    return cp_lse_ag_out_rs(output, lse, group)
+    rs_dtype = output.dtype if envs.TPU_DCP_RS_OUT_PRECISION and is_backbone else None
+    return cp_lse_ag_out_rs(output, lse, group, rs_dtype=rs_dtype)
 
 
 def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:
@@ -142,7 +143,9 @@ def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:
     from torch.distributed import _functional_collectives as funcol
 
     out = funcol.all_to_all_single(x.contiguous(), None, None, group.device_group)
-    return funcol.wait_tensor(out)
+    if isinstance(out, funcol.AsyncCollectiveTensor):
+        return funcol.wait_tensor(out)
+    return out
 
 
 def merge_lse_partials_all_to_all(

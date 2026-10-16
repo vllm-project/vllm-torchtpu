@@ -70,7 +70,7 @@ from vllm_torchtpu.layers.adapter.quantization.configs import should_quantize_on
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 from vllm_torchtpu.layers.core.quantization import quantize_tensor
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 logger = init_logger(__name__)
 
@@ -80,6 +80,33 @@ logger = init_logger(__name__)
 # traffic and not at all once any request in the batch is past `index_topk`
 # tokens.
 STREAMIDX_ENABLE_EARLY_EXIT = True
+# StreamIdx block sizes as (decode, prefill, MIXED), tuned by microbenchmark.
+STREAMIDX_KV_PAGES_PER_BLOCK = (2, 2, 2)
+STREAMIDX_QUERIES_PER_BLOCK = (1, 128, 128)
+# MIXED-pass KV pages per block for small buckets when only the bq knob is set.
+STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP = 8
+
+
+def _streamidx_block_sizes(
+    num_tokens: int,
+    small_bucket_bq: int | None,
+    small_bucket_bkvp: int | None,
+    small_bucket_tokens: int,
+) -> tuple[tuple[int, int, int], tuple[int, int, int]]:
+    """(num_kv_pages_per_block, num_queries_per_block) for a padded token bucket.
+
+    MIXED-pass query blocks hold one sequence each, so an MTP request
+    (q_len = gamma + 1) in a 128-row block scores ~124 padding rows. Buckets up
+    to `small_bucket_tokens` take the small-bucket sizes instead.
+    """
+    if small_bucket_bq is None or num_tokens > small_bucket_tokens:
+        return STREAMIDX_KV_PAGES_PER_BLOCK, STREAMIDX_QUERIES_PER_BLOCK
+    bkvp = small_bucket_bkvp or STREAMIDX_SMALL_BUCKET_DEFAULT_BKVP
+    return (
+        STREAMIDX_KV_PAGES_PER_BLOCK[:2] + (bkvp,),
+        STREAMIDX_QUERIES_PER_BLOCK[:2] + (small_bucket_bq,),
+    )
+
 
 _INDEXER_KV_CACHE_FALLBACK_LOGGED: set[tuple[str, str]] = set()
 _INDEXER_KV_CACHE_INFO_LOGGED: set[tuple[str, str, str, tuple[int, ...]]] = set()
@@ -210,6 +237,18 @@ def _resolve_indexer_kv_cache_mode(
 
     _log_indexer_kv_cache_once(effective_mode, "pallas", kv_layout, cache_kv.shape)
     return "pallas", kv_layout
+
+
+def _dcp_indexer_a2a_for_bucket(
+    num_tokens: int, enabled: bool, min_tokens: int
+) -> bool:
+    """Whether the DCP indexer merge for this token bucket uses the all-to-all.
+
+    `num_tokens` is the static padded bucket, so this picks one merge per
+    compiled variant: decode-sized buckets keep the all-gather merge and
+    prefill-sized ones (>= `min_tokens`) take the all-to-all.
+    """
+    return enabled and num_tokens >= min_tokens
 
 
 def _topk_rows_update_jax(buf: jax.Array, rows: jax.Array) -> jax.Array:
@@ -405,6 +444,11 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # None means unchunked. The kernel falls back to a single unpipelined
         # pass when `max_num_tokens` is not a multiple of the chunk.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+        small_bucket = (
+            envs.TPU_STREAMIDX_SMALL_BUCKET_BQ,
+            envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP,
+            envs.TPU_STREAMIDX_SMALL_BUCKET_TOKENS,
+        )
         kv_cache_mode = (
             envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
             if envs.is_indexer_kv_cache_mode_explicit()
@@ -464,6 +508,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
+            kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
+                q.shape[0], *small_bucket
+            )
             topk_indices = streamindex_topk(
                 q,
                 weights,
@@ -474,10 +521,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 distribution,
                 k=topk,
                 compression_ratio=1,
-                # The following parameters are tuned based on microbenchmark
-                # results.
-                num_kv_pages_per_block=(2, 2, 2),
-                num_queries_per_block=(1, 128, 128),
+                num_kv_pages_per_block=kv_pages_per_block,
+                num_queries_per_block=queries_per_block,
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
                 kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
@@ -515,6 +560,13 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         # Chunking cuts the replicated query-token axis, which is orthogonal to
         # the KV axis DCP shards, so the same knob applies here unchanged.
         chunk_tokens = envs.TPU_STREAMIDX_CHUNK_TOKENS
+        a2a_merge = envs.TPU_DCP_INDEXER_A2A_MERGE
+        a2a_min_tokens = envs.TPU_DCP_INDEXER_A2A_MIN_TOKENS
+        small_bucket = (
+            envs.TPU_STREAMIDX_SMALL_BUCKET_BQ,
+            envs.TPU_STREAMIDX_SMALL_BUCKET_BKVP,
+            envs.TPU_STREAMIDX_SMALL_BUCKET_TOKENS,
+        )
         kv_cache_mode = (
             envs.VLLM_TPU_INDEXER_KV_CACHE_MODE
             if envs.is_indexer_kv_cache_mode_explicit()
@@ -551,6 +603,9 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             )
 
             q = jax.lax.bitcast_convert_type(q_bytes, jnp.float8_e4m3fn)
+            kv_pages_per_block, queries_per_block = _streamidx_block_sizes(
+                q.shape[0], *small_bucket
+            )
             local_topk = streamindex_topk_dcp(
                 q,
                 weights,
@@ -564,10 +619,13 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 compression_ratio=1,
                 dcp_size=dcp_size,
                 interleave_size=interleave_size,
-                num_kv_pages_per_block=(2, 2, 2),
-                num_queries_per_block=(1, 128, 128),
+                num_kv_pages_per_block=kv_pages_per_block,
+                num_queries_per_block=queries_per_block,
                 kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
+                a2a_merge=_dcp_indexer_a2a_for_bucket(
+                    q.shape[0], a2a_merge, a2a_min_tokens
+                ),
             )
             return cache_kv, local_topk
 
@@ -811,12 +869,6 @@ class VllmTPUIndexer(Indexer):
         return self.indexer_op(hidden_states, q_fp8, k, weights)
 
 
-def _fresh(t: torch.Tensor) -> torch.Tensor:
-    """Allocate a fresh contiguous device buffer (breaks view/stride chains so
-    the torch_tpu pallas boundary ships a plain row-major buffer)."""
-    return torch.empty(t.shape, dtype=t.dtype, device=t.device).copy_(t)
-
-
 class TPUDummyMLAPrefillBackend:
     def __init__(self, *args, **kwargs):
         pass
@@ -945,15 +997,15 @@ class VllmTPUMLAAttention(MLAAttention):
             self.W_UK_T = Parameter(W_UK_T, requires_grad=False)
             self.W_UV = Parameter(W_UV, requires_grad=False)
             self.W_UK_T_scale = Parameter(
-                _fresh(w_uk_scale.to(act_dtype)).to(device), requires_grad=False
+                fresh_buffer(w_uk_scale.to(act_dtype)).to(device), requires_grad=False
             )
             self.W_UV_scale = Parameter(
-                _fresh(w_uv_scale.to(act_dtype)).to(device), requires_grad=False
+                fresh_buffer(w_uv_scale.to(act_dtype)).to(device), requires_grad=False
             )
 
         # move W_UK_T and W_UV into fresh contiguous buffers
-        self.W_UK_T = Parameter(_fresh(self.W_UK_T), requires_grad=False)
-        self.W_UV = Parameter(_fresh(self.W_UV), requires_grad=False)
+        self.W_UK_T = Parameter(fresh_buffer(self.W_UK_T), requires_grad=False)
+        self.W_UV = Parameter(fresh_buffer(self.W_UV), requires_grad=False)
 
         # Keep W_UK_T/W_UV in the activation dtype unless quantized on load via
         # QUANTIZE_ON_LOAD_PREFIXES. There is no quantized bmm for these two, so
@@ -975,11 +1027,11 @@ class VllmTPUMLAAttention(MLAAttention):
                     "dcp_q_replicate is set but no DCP group is initialized, "
                     "so W_UK_T cannot be gathered across the group."
                 )
-            self.W_UK_T_dcp_qrep = _fresh(
+            self.W_UK_T_dcp_qrep = fresh_buffer(
                 dcp_group.all_gather(self.W_UK_T.contiguous(), dim=0)
             )
             if hasattr(self, "W_UK_T_scale"):
-                self.W_UK_T_dcp_qrep_scale = _fresh(
+                self.W_UK_T_dcp_qrep_scale = fresh_buffer(
                     dcp_group.all_gather(self.W_UK_T_scale.contiguous(), dim=0)
                 )
 

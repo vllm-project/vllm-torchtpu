@@ -22,6 +22,12 @@ Every axis builds its own Pallas mesh, because torch_tpu requires one that
 spans the whole world and the axes factor the world differently. `ep_mesh.py`
 takes the rank/device helpers from here too, which is why this module is
 named for the job rather than for an axis.
+
+Under pipeline parallelism a group is one pipeline stage, a part of the slice.
+Its mesh then holds the stage's devices alone (`get_stage_mesh`): torch_tpu
+compiles a program whose kernels and collectives all name the devices of one
+process group for those devices, so a stage launches its programs while the
+other stages launch theirs.
 """
 
 from __future__ import annotations
@@ -144,3 +150,51 @@ def get_cp_group_layout(group: Any | None) -> CpGroupLayout:
     )
     _LAYOUT_CACHE[cache_key] = layout
     return layout
+
+
+def get_pipeline_stage() -> tuple[int, int]:
+    """This worker's pipeline stage and the number of stages.
+
+    (0, 1) without pipeline parallelism or before distributed init.
+    """
+    try:
+        from vllm.distributed.parallel_state import get_pp_group
+
+        group = get_pp_group()
+    except (AssertionError, ImportError):
+        return 0, 1
+    return int(group.rank_in_group), int(group.world_size)
+
+
+def get_stage_mesh(
+    axis_names: tuple[str, ...],
+    mesh_shape: tuple[int, ...],
+    group: Any,
+    device_ids: tuple[int, ...],
+) -> Any:
+    """Build a rank-aligned JAX mesh over `group`, one pipeline stage.
+
+    Args:
+      axis_names: the mesh axes.
+      mesh_shape: the mesh shape; its product is the size of `group`.
+      group: the stage's process group.
+      device_ids: the TPU device ids of `group`, in rank order.
+    """
+    from torch_tpu._internal.pallas import get_pallas_mesh
+
+    # TODO(yinlin): torch_tpu releases refuse a mesh smaller than the world
+    # here, and pp_validation turns such stages away; make the stage group
+    # standalone once the pinned torch_tpu has google-pytorch/torch_tpu#4387.
+    mesh = get_pallas_mesh(
+        axis_names=axis_names,
+        mesh_shape=mesh_shape,
+        process_group=group.device_group,
+    )
+    mesh_device_ids = tuple(int(device.id) for device in mesh.devices.flat)
+    if mesh_device_ids != tuple(device_ids):
+        raise RuntimeError(
+            "The stage mesh does not hold the stage's devices in rank order: "
+            f"mesh={mesh_device_ids}, stage={tuple(device_ids)}, "
+            f"ranks={tuple(group.ranks)}."
+        )
+    return mesh

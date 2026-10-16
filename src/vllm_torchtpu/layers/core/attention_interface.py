@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import functools
 import math
 from collections.abc import Callable
@@ -58,6 +71,26 @@ get_kv_cache_shape_hd64 = rpa_hd64.get_kv_cache_shape
 
 mla_ragged_paged_attention = mla_v2_kernel.mla_ragged_paged_attention
 sparse_mla_ragged_paged_attention = sparse_mla_kernel.sparse_ragged_paged_attention
+
+
+def sparse_mla_chunk_kwargs() -> dict[str, int]:
+    """Kernel kwargs for the sparse MLA gather + attention chunk size.
+
+    Empty unless `TPU_SPARSE_MLA_CHUNK_TOKENS` is set, so the kernel keeps its
+    default chunk. The chunk must be a multiple of the attention kernel's batch
+    size: the attention grid walks a chunk in whole batches, and the SparseCore
+    gather splits a chunk's `chunk * topk` rows into whole owner batches.
+    """
+    chunk = envs.TPU_SPARSE_MLA_CHUNK_TOKENS
+    if chunk is None:
+        return {}
+    batch = sparse_mla_kernel.DEFAULT_ATTENTION_KERNEL_BATCH_SIZE
+    if chunk % batch:
+        raise ValueError(
+            f"TPU_SPARSE_MLA_CHUNK_TOKENS={chunk} must be a multiple of the "
+            f"sparse MLA attention kernel batch size ({batch})."
+        )
+    return {"gather_and_attention_chunk_size": chunk}
 
 
 def sharded_flash_attention(
@@ -657,7 +690,8 @@ def mla_attention(
     v_scale: float | None = None,
     sm_scale: float | None = None,
     use_causal_mask: bool = True,
-) -> tuple[jax.Array, jax.Array]:
+    return_lse: bool = False,
+) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Main shared interface for Multi-Head Latent Attention (MLA).
 
     Computes sharded MLA paged attention and applies in-place KV cache updates across
@@ -682,10 +716,14 @@ def mla_attention(
         k_scale: Optional scalar parameter quantization scale for latent keys.
         v_scale: Optional scalar parameter quantization scale for latent values.
         sm_scale: Softmax temperature scale factor.
+        return_lse: Also return each (token, head)'s log-sum-exp of the scaled
+            scores, f32 `(T, N)`, with which this output can be merged with the
+            output of the same queries over a disjoint set of keys (context
+            parallelism). The output and the cache are unchanged by the flag.
 
     Returns:
         Tuple of `(updated_kv_cache, output_TNA)` in token-major sequence
-        layout `(T, N, D)`.
+        layout `(T, N, D)`, plus `lse_TN` when `return_lse`.
     """
     in_specs = (
         P(None, "model", None),  # q_TNA
@@ -702,6 +740,8 @@ def mla_attention(
         P(None, "model", None),  # attn output in token-major sequence format (T, N, D)
         P(None),  # kv cache
     )
+    if return_lse:
+        out_specs = (*out_specs, P(None, "model"))  # lse (T, N)
 
     def _mla_ragged_paged_attention(
         q,
@@ -765,7 +805,7 @@ def mla_attention(
         # (N, T, L) layout: [num_heads, num_tokens, lkv_dim]
         q = q.transpose((1, 0, 2))
 
-        out, new_cache = mla_ragged_paged_attention(
+        results = mla_ragged_paged_attention(
             q,
             q_rope,
             k,
@@ -787,15 +827,19 @@ def mla_attention(
             k_scale=k_scale,
             v_scale=v_scale,
             use_causal_mask=use_causal_mask,
+            return_lse=return_lse,
         )
+        out, new_cache = results[0], results[1]
 
         # tpu-inference kernel returns out in head-major (N, T, D) layout:
         # [num_heads, num_tokens, head_dim]. Transpose back to (T, N, D).
         out = out.transpose((1, 0, 2))
+        if return_lse:
+            return out, new_cache, results[2]
 
         return out, new_cache
 
-    output_TNA, kv_cache = jax.jit(
+    results = jax.jit(
         shard_map.shard_map(
             _mla_ragged_paged_attention,
             mesh=mesh,
@@ -814,6 +858,9 @@ def mla_attention(
         md.query_start_loc,
         md.request_distribution,
     )
+    output_TNA, kv_cache = results[0], results[1]
+    if return_lse:
+        return kv_cache, output_TNA, results[2]
     return kv_cache, output_TNA
 
 
@@ -919,6 +966,7 @@ def sparse_mla_attention(
             f"got {nope_spec.layout.value} and {rope_spec.layout.value}"
         )
     cache_layout = nope_spec.layout.value
+    chunk_kwargs = sparse_mla_chunk_kwargs()
 
     def _sparse_mla_ragged_paged_attention(
         ql_nope,
@@ -976,6 +1024,7 @@ def sparse_mla_attention(
             sm_scale=sm_scale or 1.0,
             k_scale=dequant_scale,
             cache_layout=cache_layout,
+            **chunk_kwargs,
         )
 
         lkv_dim = ql_nope.shape[-1]
@@ -1154,7 +1203,13 @@ def sparse_mla_attention_dcp(
         owns = jnp.any(topk_idx >= 0, axis=-1)
         topk_idx = topk_idx.at[:, 0].set(jnp.where(owns, topk_idx[:, 0], jnp.int32(0)))
 
-        q = jnp.concatenate([ql_nope, q_pe], axis=-1)
+        # Split q: the kernel joins q_nope and q_pe in VMEM (no padded
+        # [T, H, 640] concat). The merge below needs the lse, so it also comes
+        # out lane-dense as f32[T, H] rather than f32[T, H, 1].
+        if envs.TPU_MLA_SPARSE_SPLIT_Q:
+            q, split_kwargs = ql_nope, {"q_pe": q_pe, "lse_lane_dense": True}
+        else:
+            q, split_kwargs = jnp.concatenate([ql_nope, q_pe], axis=-1), {}
         # The capped path (and its chunk) applies only where the kernel takes
         # it: SparseCore caches and a top-k wider than the cap.
         topk_cap = envs.TPU_DCP_MLA_TOPK_CAP
@@ -1167,7 +1222,7 @@ def sparse_mla_attention_dcp(
         chunk_kwargs = (
             {"gather_and_attention_chunk_size": envs.TPU_DCP_MLA_TOPK_CAP_CHUNK}
             if topk_cap
-            else {}
+            else sparse_mla_chunk_kwargs()
         )
         # Virtual page ordinal -> physical block in this rank's own shard, the
         # same resolution the scatter above and `streamindex_topk_dcp` use.
@@ -1189,6 +1244,7 @@ def sparse_mla_attention_dcp(
             # exact in-kernel overflow pass for the rows that need more.
             topk_cap=topk_cap,
             **chunk_kwargs,
+            **split_kwargs,
         )
         lse = jnp.where(owns[:, None], lse, -jnp.inf)
         # Drop the rope tail: only the nope part is the MLA value (P @ latent).

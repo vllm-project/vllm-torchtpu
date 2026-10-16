@@ -1104,6 +1104,8 @@ class TestTPURaidenConnectorScheduler:
             assert len(req.prompt_token_ids) == 32
             assert req.num_prompt_tokens == 32
             assert req.kv_transfer_params["_p_side_truncated"] is True
+            # The dropped token seeds a prefill-only draft's boundary row.
+            assert req.kv_transfer_params["_p_side_next_prompt_token_id"] == 32
 
             # Re-admission after preemption must not truncate again.
             producer.on_new_request(req)
@@ -1324,6 +1326,7 @@ class TestTPURaidenConnectorScheduler:
             patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 8, create=True),
             patch(f"{_MOD}.get_uuid", return_value=777),
             patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=30.0),
+            patch(f"{_MOD}.time.time", return_value=1_700_000_000.0),
         ):
             delay, params = producer.request_finished(req, block_ids)
             first_meta = producer.build_connector_meta()
@@ -1352,6 +1355,9 @@ class TestTPURaidenConnectorScheduler:
         assert "remote_block_ids" not in params
         assert first_meta.reqs_to_send[req.request_id].local_block_ids == (block_ids)
         assert first_meta.reqs_to_send[req.request_id].num_tokens == (65_023)
+        assert (
+            first_meta.reqs_to_send[req.request_id].expiration_time == 1_700_000_030.0
+        )
         assert duplicate_meta.reqs_to_send == {}
 
     @pytest.mark.parametrize("num_computed_tokens", [32_775, 32_768])
@@ -3302,7 +3308,7 @@ class TestTPURaidenConnectorWorker:
             uuid=2468,
             local_block_ids=[90, 91],
             num_tokens=65_023,
-            expiration_time=time.perf_counter() - 1.0,
+            expiration_time=time.time() - 1.0,
         )
 
         with (
@@ -3330,7 +3336,7 @@ class TestTPURaidenConnectorWorker:
         assert tombstone.uuid == 2468
         assert tombstone.local_block_ids == (90, 91)
         assert tombstone.num_tokens == 65_023
-        assert tombstone.expiration_time > time.perf_counter()
+        assert tombstone.expiration_time > time.time()
         assert worker._stage3_terminal_cleanup == {}
         assert facade.complete_request_blocks_calls == []
         assert facade.cancel_request_blocks_calls == []
@@ -3452,7 +3458,8 @@ class TestTPURaidenConnectorWorker:
             else []
         )
 
-    def test_v3_stage3_unconsumed_send_cancels_only_if_unclaimed(self):
+    @pytest.mark.parametrize("perf_counter_s", [1.0, 1_700_000_000.0 + 7 * 86400])
+    def test_v3_stage3_unconsumed_send_cancels_only_if_unclaimed(self, perf_counter_s):
         worker = _make_raiden_worker(
             tp_rank=0,
             tp_size=1,
@@ -3469,19 +3476,25 @@ class TestTPURaidenConnectorWorker:
         worker._raiden_controller_address = "prefill-controller.test:27000"
         worker._raiden_work_unit = SimpleNamespace(job_name="prefill")
         worker._local_raiden_transfer_rank = MagicMock(return_value=0)
+        wall_time_s = 1_700_000_000.0
         meta = TPUConnectorMetadata()
         meta.reqs_to_send["unconsumed"] = MagicMock(
             uuid=765,
             local_block_ids=[12],
             num_tokens=1,
-            expiration_time=time.perf_counter() - 1.0,
+            expiration_time=wall_time_s + 10.0,
         )
 
         with (
             patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
             patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 8, create=True),
+            patch(f"{_MOD}.time.time", return_value=wall_time_s) as wall_clock,
+            patch(f"{_MOD}.time.perf_counter", return_value=perf_counter_s),
         ):
             worker.process_send_load(meta)
+            assert worker.get_finished() == (set(), set())
+            assert facade.cancel_request_blocks_calls == []
+            wall_clock.return_value = wall_time_s + 11.0
             assert worker.get_finished() == ({"unconsumed"}, set())
 
         assert facade.cancel_request_blocks_calls == [
@@ -3492,6 +3505,66 @@ class TestTPURaidenConnectorWorker:
         ]
         assert facade.complete_request_blocks_calls == []
         assert worker._stage3_registered_sends == {}
+
+    def test_v3_stage3_cross_host_send_does_not_expire_under_perf_counter_skew(
+        self,
+    ):
+        producer = _make_raiden_scheduler(is_producer=True, block_size=4096, pcp_size=8)
+        req = MagicMock()
+        req.request_id = "cross-host-req"
+        req.prompt_token_ids = [0] * 32_768
+        req.num_prompt_tokens = 32_768
+        req.num_computed_tokens = 32_768
+        req.status = RequestStatus.FINISHED_LENGTH_CAPPED
+
+        worker = _make_raiden_worker(
+            tp_rank=0,
+            tp_size=1,
+            is_producer=True,
+            dp_size=1,
+            pcp_size=8,
+            block_size=4096,
+        )
+        engine = _FakeRaidenEngine()
+        engine.poll_results = [([], [], [])]
+        facade = _FakeRaidenControllerFacade()
+        worker._raiden_transfer_engine = engine
+        worker._raiden_controller_facade = facade
+        worker._raiden_controller_address = "prefill-controller.test:27000"
+        worker._raiden_work_unit = SimpleNamespace(job_name="prefill")
+        worker._local_raiden_transfer_rank = MagicMock(return_value=0)
+
+        with (
+            patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+            patch(
+                f"{_MOD}.tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS",
+                "prefill-controller.test:27000",
+                create=True,
+            ),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 8, create=True),
+            patch(f"{_MOD}.get_uuid", return_value=766),
+            patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=30.0),
+        ):
+            # Host A (Prefill Scheduler): recently booted (perf_counter=100s).
+            with (
+                patch(f"{_MOD}.time.perf_counter", return_value=100.0),
+                patch(f"{_MOD}.time.time", return_value=1_700_000_000.0),
+            ):
+                delay, _ = producer.request_finished(req, [12])
+                assert delay
+                meta = producer.build_connector_meta()
+
+            # Host B (Prefill Worker): 1s later in wall clock, but 7 days uptime
+            # (perf_counter=604800s).
+            with (
+                patch(f"{_MOD}.time.perf_counter", return_value=604_800.0),
+                patch(f"{_MOD}.time.time", return_value=1_700_000_001.0),
+            ):
+                worker.process_send_load(meta)
+                assert worker.get_finished() == (set(), set())
+
+        assert facade.cancel_request_blocks_calls == []
+        assert "cross-host-req" in worker._stage3_registered_sends
 
     def test_v3_stage3_claimed_send_cannot_expire_under_active_transfer(self):
         worker = _make_raiden_worker(
@@ -3516,7 +3589,7 @@ class TestTPURaidenConnectorWorker:
             uuid=766,
             local_block_ids=[13],
             num_tokens=1,
-            expiration_time=time.perf_counter() - 1.0,
+            expiration_time=time.time() - 1.0,
         )
 
         with (
@@ -4213,9 +4286,7 @@ class TestTPURaidenConnectorWorker:
         if prior_state == "accepted":
             worker._stage3_controller_accepted.add("dst-late")
         if prior_state == "uncertain":
-            worker._stage3_pending_controller_failures["dst-late"] = (
-                time.perf_counter() + 120
-            )
+            worker._stage3_pending_controller_failures["dst-late"] = time.time() + 120
         _, facade = self._park_missing_registration_load(
             worker,
             [RuntimeError(error_text)],
@@ -7124,10 +7195,16 @@ class TestPipelineParallelRegisterAhead:
                 assert meta.reqs_to_send[req.request_id].uuid == index + 1
         assert list(producer._stage3_finished_sends) == ["live-2", "live-3"]
 
-    def test_stage3_pcp_build_meta_ignores_scheduler_output(self):
+    def test_stage3_pcp_build_meta_ignores_scheduler_output_when_disabled(self):
         producer = _make_raiden_scheduler(is_producer=True, block_size=4096, pcp_size=8)
         req = _stage3_request("pcp", 65_024)
-        with _stage3_producer_env(777):
+        with (
+            _stage3_producer_env(777),
+            patch(
+                f"{_MOD}.dist_utils.get_stage3_register_ahead_enabled",
+                return_value=False,
+            ),
+        ):
             producer.update_state_after_alloc(req, MagicMock(), 0)
             meta = producer.build_connector_meta(
                 _scheduler_output(
@@ -7268,7 +7345,7 @@ class TestPipelineParallelRegisterAheadWorker:
         worker, facade = self._stage_worker()
         meta = TPUConnectorMetadata()
         meta.reqs_to_send["early"] = _stage3_send(
-            1234, expiration_time=time.perf_counter() - 1.0
+            1234, expiration_time=time.time() - 1.0
         )
         # The store has no row yet (a lagging stage would see UNKNOWN too).
         facade.request_block_statuses[("early", 1234)] = 1
@@ -7290,7 +7367,7 @@ class TestPipelineParallelRegisterAheadWorker:
             assert worker.get_finished({"early"}) == (set(), set())
             registration = worker._stage3_registered_sends["early"]
             assert not registration.finish_pending
-            assert registration.expiration_time > time.perf_counter()
+            assert registration.expiration_time > time.time()
             # Armed, the probe runs as for a finish-time registration.
             assert worker.get_finished() == ({"early"}, set())
 
@@ -7303,7 +7380,7 @@ class TestPipelineParallelRegisterAheadWorker:
         worker, facade = self._stage_worker()
         meta = TPUConnectorMetadata()
         meta.reqs_to_send["early"] = _stage3_send(
-            1234, expiration_time=time.perf_counter() - 1.0
+            1234, expiration_time=time.time() - 1.0
         )
         with (
             _stage3_worker_env(),
@@ -7319,3 +7396,367 @@ class TestPipelineParallelRegisterAheadWorker:
         assert facade.cancel_request_blocks_calls == [{"req_id": "early", "uuid": 1234}]
         assert worker._stage3_registered_sends == {}
         assert "early" in worker._stage3_terminal_sends
+
+
+class TestContextParallelRegisterAhead:
+    """A PCP8 producer (TPU_RAIDEN_STAGE3_REGISTER_AHEAD, default on)
+    publishes a request's Stage-3 send in the step whose chunk completes
+    the prompt; the finish adopts or releases that uuid exactly as a
+    pipeline producer's does."""
+
+    # Two 32_768-token PCP scheduler blocks (4096-token pages x 8 ranks);
+    # the transfer excludes the last token.
+    PROMPT = 65_024
+
+    @staticmethod
+    def _producer(**kwargs):
+        return _make_raiden_scheduler(
+            is_producer=True, block_size=4096, pcp_size=8, **kwargs
+        )
+
+    def _register_ahead(self, producer, req, block_ids=(100, 101), num_tokens=None):
+        producer.update_state_after_alloc(req, MagicMock(), 0)
+        return producer.build_connector_meta(
+            _scheduler_output(
+                new_reqs=[(req.request_id, (list(block_ids),), 0)],
+                num_scheduled_tokens={
+                    req.request_id: num_tokens or int(req.num_prompt_tokens)
+                },
+            )
+        )
+
+    def test_stage3_pcp_registers_in_prompt_completing_step(self):
+        producer = self._producer()
+        req = _stage3_request("pcp", self.PROMPT)
+        with _stage3_producer_env(777):
+            meta = self._register_ahead(producer, req)
+            delay, params = producer.request_finished(req, [100, 101])
+            after_finish = producer.build_connector_meta(_scheduler_output())
+
+        send = meta.reqs_to_send["pcp"]
+        assert send.uuid == 777
+        assert send.registered_ahead is True
+        assert send.num_tokens == self.PROMPT - 1
+        assert send.local_block_ids == [100, 101]
+        assert meta.reqs_to_release == {}
+        assert delay
+        assert params["uuid"] == 777
+        assert params["num_tokens"] == self.PROMPT - 1
+        # The finish adopted the published uuid: no second SendMeta.
+        assert after_finish.reqs_to_send == {}
+        assert after_finish.reqs_to_release == {}
+        assert producer._stage3_early_sends == {}
+        assert producer._stage3_early_requests == {}
+        assert producer._stage3_block_tables == {}
+
+    def test_stage3_send_carries_the_dropped_prompt_token(self):
+        producer = self._producer()
+        req = _stage3_request("seed", self.PROMPT)
+        req.kv_transfer_params = {"_p_side_next_prompt_token_id": 4242}
+        with _stage3_producer_env(777):
+            meta = self._register_ahead(producer, req)
+        assert meta.reqs_to_send["seed"].next_prompt_token_id == 4242
+
+    def test_stage3_finish_time_send_is_not_marked_ahead(self):
+        producer = self._producer()
+        req = _stage3_request("late", self.PROMPT)
+        with _stage3_producer_env(777):
+            delay, params = producer.request_finished(req, [100, 101])
+            meta = producer.build_connector_meta(_scheduler_output())
+
+        assert delay and params["uuid"] == 777
+        assert meta.reqs_to_send["late"].registered_ahead is False
+
+    def test_stage3_pcp_chunked_prompt_registers_only_when_complete(self):
+        producer = self._producer()
+        req = _stage3_request("chunked", self.PROMPT)
+        with _stage3_producer_env(777):
+            producer.update_state_after_alloc(req, MagicMock(), 0)
+            first = producer.build_connector_meta(
+                _scheduler_output(
+                    new_reqs=[("chunked", ([100],), 0)],
+                    num_scheduled_tokens={"chunked": 32_768},
+                )
+            )
+            second = producer.build_connector_meta(
+                _scheduler_output(
+                    cached_reqs=[("chunked", ([101],), 32_768, False)],
+                    num_scheduled_tokens={"chunked": self.PROMPT - 32_768},
+                )
+            )
+            delay, params = producer.request_finished(req, [100, 101])
+
+        assert first.reqs_to_send == {}
+        send = second.reqs_to_send["chunked"]
+        assert send.uuid == 777
+        assert send.registered_ahead is True
+        assert send.local_block_ids == [100, 101]
+        assert send.num_tokens == self.PROMPT - 1
+        assert delay
+        assert params["uuid"] == 777
+
+    def test_stage3_pcp_short_prefix_is_bypassed_ahead_and_at_finish(self):
+        # FA-only PCP sends fewer than pcp_size * interleave tokens are not
+        # transferred: nothing is published ahead and nothing at the finish.
+        producer = self._producer()
+        req = _stage3_request("short", 4)
+        with _stage3_producer_env(777):
+            meta = self._register_ahead(producer, req, block_ids=(100,), num_tokens=4)
+            delay, params = producer.request_finished(req, [100])
+            finish_meta = producer.build_connector_meta(_scheduler_output())
+
+        assert meta.reqs_to_send == {}
+        assert producer._stage3_early_sends == {}
+        assert (delay, params) == (False, {})
+        assert finish_meta.reqs_to_send == {}
+        assert finish_meta.reqs_to_release == {}
+
+    def test_stage3_pcp_abort_releases_ahead_registration(self):
+        producer = self._producer()
+        req = _stage3_request("aborted", self.PROMPT)
+        with _stage3_producer_env(777):
+            self._register_ahead(producer, req)
+            req.status = RequestStatus.FINISHED_ABORTED
+            delay, params = producer.request_finished(req, [100, 101])
+            meta = producer.build_connector_meta(_scheduler_output())
+
+        assert (delay, params) == (False, None)
+        assert meta.reqs_to_release == {"aborted": 777}
+        assert meta.reqs_to_send == {}
+        assert producer._stage3_finished_sends == {}
+        assert producer._stage3_early_sends == {}
+
+    def test_stage3_pcp_shorter_finish_mints_fresh_transfer(self):
+        producer = self._producer()
+        req = _stage3_request("shorter", self.PROMPT)
+        with _stage3_producer_env(777, 778):
+            self._register_ahead(producer, req)
+            # One PCP scheduler block fewer than the published send.
+            req.num_computed_tokens = 32_768
+            delay, params = producer.request_finished(req, [100, 101])
+            meta = producer.build_connector_meta(_scheduler_output())
+
+        assert delay
+        assert params["uuid"] == 778
+        assert params["num_tokens"] == 32_768
+        assert meta.reqs_to_release == {"shorter": 777}
+        send = meta.reqs_to_send["shorter"]
+        assert send.uuid == 778
+        assert send.local_block_ids == [100]
+        assert send.registered_ahead is False
+
+    def test_stage3_dp_producer_registers_ahead(self):
+        producer = _make_raiden_scheduler(is_producer=True, block_size=16)
+        req = _stage3_request("dp", 32)
+        with (
+            _stage3_producer_env(777),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 1, create=True),
+        ):
+            meta = self._register_ahead(producer, req, num_tokens=32)
+            delay, params = producer.request_finished(req, [100, 101])
+
+        send = meta.reqs_to_send["dp"]
+        assert send.uuid == 777
+        assert send.registered_ahead is True
+        assert send.num_tokens == 31
+        assert delay and params["uuid"] == 777
+
+    @pytest.mark.parametrize(
+        ("pcp_size", "tp_size", "pp_size"), ((8, 1, 1), (4, 2, 1), (1, 1, 1))
+    )
+    def test_stage3_register_ahead_gate(self, pcp_size, tp_size, pp_size):
+        producer = _make_raiden_scheduler(
+            is_producer=True, pcp_size=pcp_size, tp_size=tp_size, pp_size=pp_size
+        )
+        consumer = _make_raiden_scheduler(is_producer=False, pcp_size=pcp_size)
+        with _stage3_producer_env():
+            assert producer._stage3_register_ahead_enabled()
+            assert not consumer._stage3_register_ahead_enabled()
+            with patch(
+                f"{_MOD}.dist_utils.get_stage3_register_ahead_enabled",
+                return_value=False,
+            ):
+                assert not producer._stage3_register_ahead_enabled()
+            for gate in (
+                "_use_raiden_glm_admission",
+                "_use_raiden_dsv4_admission",
+                "_uses_tp_stage3_source",
+            ):
+                with patch(f"{_MOD}.{gate}", return_value=True):
+                    assert not producer._stage3_register_ahead_enabled()
+
+    def test_stage3_pipeline_register_ahead_ignores_the_flag(self):
+        producer = _make_raiden_scheduler(is_producer=True, pp_size=8)
+        with (
+            _stage3_producer_env(),
+            patch(
+                f"{_MOD}.dist_utils.get_stage3_register_ahead_enabled",
+                return_value=False,
+            ),
+        ):
+            assert producer._stage3_register_ahead_enabled()
+
+
+class TestContextParallelRegisterAheadWorker:
+    """A PCP rank's registration of a send published ahead of the finish
+    starts finish_pending, like a pipeline stage's; a finish-time send
+    keeps its TTL."""
+
+    @staticmethod
+    def _pcp_worker():
+        worker = _make_raiden_worker(
+            tp_rank=0,
+            tp_size=1,
+            is_producer=True,
+            dp_size=1,
+            pcp_size=8,
+            interleave_size=256,
+            block_size=4096,
+        )
+        engine = _FakeRaidenEngine()
+        engine.poll_results = []
+        facade = _FakeRaidenControllerFacade()
+        worker._raiden_transfer_engine = engine
+        worker._raiden_controller_facade = facade
+        worker._raiden_controller_address = _STAGE3_CONTROLLER
+        worker._raiden_work_unit = SimpleNamespace(
+            job_name="prefill",
+            job_replica_id="producer-engine-rank3",
+            data_name="kv.fa",
+            data_replica_idx=0,
+        )
+        worker._local_raiden_transfer_rank = MagicMock(return_value=3)
+        # 1024 bytes per token: an 8,191-token stripe lowers onto one page.
+        worker._stage3_fa_token_bytes = MagicMock(return_value=1024)
+        return worker, facade
+
+    @staticmethod
+    def _send(uuid: int, *, registered_ahead: bool, expiration_time: float):
+        return SendMeta(
+            uuid=uuid,
+            local_block_ids=[100, 101],
+            num_tokens=65_023,
+            expiration_time=expiration_time,
+            registered_ahead=registered_ahead,
+        )
+
+    def test_v3_stage3_pcp_ahead_registration_is_armed_by_finished_req_ids(self):
+        worker, facade = self._pcp_worker()
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_send["early"] = self._send(
+            1234, registered_ahead=True, expiration_time=time.time() - 1.0
+        )
+        # The store has no row yet (a lagging rank would see UNKNOWN too).
+        facade.request_block_statuses[("early", 1234)] = 1
+        with (
+            _stage3_worker_env(),
+            patch(f"{_MOD}.dist_utils.get_stage3_status_probe_s", return_value=1e-9),
+            patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=30.0),
+        ):
+            worker.process_send_load(meta)
+            pending = worker._stage3_registered_sends["early"]
+            assert pending.finish_pending
+            assert pending.expiration_time == float("inf")
+            assert worker.get_finished() == (set(), set())
+            assert worker.get_finished() == (set(), set())
+            assert facade.cancel_request_blocks_calls == []
+            assert facade.get_request_block_status_calls == []
+            assert worker.get_finished({"early"}) == (set(), set())
+            registration = worker._stage3_registered_sends["early"]
+            assert not registration.finish_pending
+            assert registration.expiration_time > time.time()
+            assert worker.get_finished() == ({"early"}, set())
+
+        assert [call["uuid"] for call in facade.register_request_blocks_calls] == [1234]
+        assert facade.get_request_block_status_calls == [[("early", 1234)]]
+        assert facade.cancel_request_blocks_calls == []
+        assert worker._stage3_registered_sends == {}
+        assert "early" in worker._stage3_terminal_sends
+
+    def test_v3_stage3_pcp_finish_time_registration_keeps_its_ttl(self):
+        worker, facade = self._pcp_worker()
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_send["late"] = self._send(
+            1234, registered_ahead=False, expiration_time=time.time() - 1.0
+        )
+        with (
+            _stage3_worker_env(),
+            patch(f"{_MOD}.dist_utils.get_stage3_status_probe_s", return_value=0.0),
+            patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=0.0),
+        ):
+            worker.process_send_load(meta)
+            registration = worker._stage3_registered_sends["late"]
+            assert not registration.finish_pending
+            assert registration.expiration_time < float("inf")
+            # Already expired: the sweep cancels it unclaimed.
+            assert worker.get_finished() == ({"late"}, set())
+
+        assert facade.cancel_request_blocks_calls == [{"req_id": "late", "uuid": 1234}]
+        assert worker._stage3_registered_sends == {}
+
+    def test_v3_stage3_pcp_legacy_send_meta_is_finish_time(self):
+        worker, facade = self._pcp_worker()
+        meta = TPUConnectorMetadata()
+        meta.reqs_to_send["mock"] = _stage3_send(
+            1234, block_ids=[100, 101], num_tokens=65_023
+        )
+        with _stage3_worker_env():
+            worker.process_send_load(meta)
+        registration = worker._stage3_registered_sends["mock"]
+        assert not registration.finish_pending
+        assert registration.expiration_time == 1e20
+
+
+class TestSpecSourceFenceRegisterAhead:
+    """A send published ahead of the finish is registered before its own
+    forward, so the worker-side KV fence (which would wait for the previous
+    batch) is skipped for it; a finish-time send still fences."""
+
+    def _worker(self, monkeypatch):
+        monkeypatch.setattr(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden")
+        monkeypatch.setattr(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 1)
+        worker = _make_raiden_worker(tp_rank=0, tp_size=1)
+        worker.vllm_config.speculative_config = SimpleNamespace(method="mtp")
+        caches = [torch.zeros(1) for _ in range(2)]
+        worker.runner = SimpleNamespace(kv_caches=caches)
+        worker._raiden_transfer_engine = _FakeRaidenEngine()
+        worker._raiden_work_unit = SimpleNamespace()
+        facade = _FakeRaidenControllerFacade()
+        worker._raiden_controller_facade = facade
+        worker._raiden_controller_address = "producer:27000"
+        worker._stage3_fa_token_bytes = MagicMock(return_value=64)
+        fences = []
+        monkeypatch.setattr(
+            f"{_MOD}.synchronize_tensors",
+            lambda tensors, *, wait: fences.append((len(tensors), wait)),
+        )
+        return worker, facade, fences
+
+    @staticmethod
+    def _meta(**sends):
+        meta = TPUConnectorMetadata()
+        for index, (req_id, ahead) in enumerate(sends.items()):
+            meta.reqs_to_send[req_id] = SendMeta(
+                uuid=index + 1,
+                local_block_ids=[7 + index],
+                num_tokens=1,
+                expiration_time=1e20,
+                registered_ahead=ahead,
+            )
+        return meta
+
+    def test_ahead_sends_skip_the_worker_fence(self, monkeypatch):
+        worker, facade, fences = self._worker(monkeypatch)
+        worker.process_send_load(self._meta(a=True, b=True))
+        assert fences == []
+        assert [c["req_id"] for c in facade.register_request_blocks_calls] == [
+            "a",
+            "b",
+        ]
+
+    def test_finish_time_sends_still_fence_once(self, monkeypatch):
+        worker, facade, fences = self._worker(monkeypatch)
+        worker.process_send_load(self._meta(a=True, b=False))
+        assert fences == [(2, True)]
+        worker.process_send_load(self._meta(c=False))
+        assert fences == [(2, True), (2, True)]

@@ -30,6 +30,7 @@ from vllm_torchtpu.layers.adapter.attention import (
 from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
     VllmMLAAttention,
     VllmMultiHeadLatentAttentionWrapper,
+    _dcp_indexer_a2a_for_bucket,
 )
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
@@ -1074,6 +1075,46 @@ def test_indexer_kv_cache_mode_env_validation(monkeypatch):
     monkeypatch.setenv("VLLM_TPU_INDEXER_KV_CACHE_MODE", "invalid_mode")
     with pytest.raises(ValueError, match="VLLM_TPU_INDEXER_KV_CACHE_MODE"):
         envs.environment_variables["VLLM_TPU_INDEXER_KV_CACHE_MODE"]()
+
+
+@pytest.mark.parametrize(
+    "num_tokens,enabled,min_tokens,expected",
+    [
+        (16, True, 64, False),  # decode bucket keeps the all-gather merge
+        (32, True, 64, False),
+        (64, True, 64, True),  # the threshold itself takes the all-to-all
+        (4096, True, 64, True),
+        (4096, False, 64, False),  # the flag off wins at every bucket
+        (16, False, 0, False),
+        (16, True, 0, True),  # min_tokens=0: all-to-all at every bucket
+    ],
+)
+def test_dcp_indexer_a2a_is_chosen_per_bucket(
+    num_tokens, enabled, min_tokens, expected
+):
+    assert _dcp_indexer_a2a_for_bucket(num_tokens, enabled, min_tokens) is expected
+
+
+def test_dcp_indexer_a2a_env_defaults_and_forwarding(monkeypatch):
+    """Off by default, threshold 64, and both reach the workers on multi-host."""
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    monkeypatch.delenv("TPU_DCP_INDEXER_A2A_MERGE", raising=False)
+    monkeypatch.delenv("TPU_DCP_INDEXER_A2A_MIN_TOKENS", raising=False)
+    assert envs.environment_variables["TPU_DCP_INDEXER_A2A_MERGE"]() is False
+    assert envs.environment_variables["TPU_DCP_INDEXER_A2A_MIN_TOKENS"]() == 64
+
+    monkeypatch.setenv("TPU_DCP_INDEXER_A2A_MERGE", "1")
+    monkeypatch.setenv("TPU_DCP_INDEXER_A2A_MIN_TOKENS", "256")
+    assert envs.environment_variables["TPU_DCP_INDEXER_A2A_MERGE"]() is True
+    assert envs.environment_variables["TPU_DCP_INDEXER_A2A_MIN_TOKENS"]() == 256
+
+    monkeypatch.setenv("TPU_DCP_INDEXER_A2A_MIN_TOKENS", "-1")
+    with pytest.raises(ValueError, match="TPU_DCP_INDEXER_A2A_MIN_TOKENS"):
+        envs.environment_variables["TPU_DCP_INDEXER_A2A_MIN_TOKENS"]()
+
+    assert "TPU_DCP_INDEXER_A2A_MERGE" in TpuPlatform.additional_env_vars
+    assert "TPU_DCP_INDEXER_A2A_MIN_TOKENS" in TpuPlatform.additional_env_vars
 
 
 def test_resolve_indexer_kv_cache_mode_and_fallback_warning(monkeypatch, caplog):

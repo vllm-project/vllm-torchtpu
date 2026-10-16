@@ -14,7 +14,7 @@
 
 import dataclasses
 import functools
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -172,7 +172,7 @@ class InBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -189,7 +189,7 @@ class InBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         dma_size = 0
@@ -211,7 +211,7 @@ class OutBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -228,7 +228,7 @@ class OutBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_wait_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         dma_size = 0
@@ -244,50 +244,20 @@ class OutBufferedRef(BaseBufferedRef):
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class StateBufferedRef(BaseBufferedRef):
-    """Input/output buffered ref for per-sequence state (conv / recurrent).
+class StateInBufferedRef(BaseBufferedRef):
+    """Input buffered ref for per-sequence initial state (conv / recurrent).
 
-    The VMEM window holds one state per window position,
-    [seq_tile_size, window_size, *state_shape]. The initial state is read
-    from `state_indices[s] + read_offset[s]` into position 0 of the
-    sequence's window row, and after compute the first
-    `min(r_size, window_size)` checkpoints are written back to
-    `state_indices[s] .. + that many slots`.
-
-    Without speculative decoding `window_size` is 1 and `read_offset` is 0,
-    so this reduces to reading and writing the single state at
-    `state_indices[s]`.
+    The VMEM window holds one initial state per sequence in the tile,
+    [seq_tile_size, 1, *state_shape], read from
+    `state_indices[s] + read_offset[s]` into position 0 of row `idx`.
     """
-
-    # --- source-layout hooks; overridden for an external (pooled) source ---
-
-    def _src_slice(self, ref: jax.Ref, state_idx, count):
-        """One slot's source window: `count` states at the slot's index."""
-        return ref.at[pl.ds(state_idx, count)]
-
-    def _unit(self) -> int:
-        """Source rows one state occupies (checkpoints for the dense path)."""
-        return 1
-
-    def _wait_slice(self, vmem_ref: jax.Ref, count):
-        """Never-executed self-copy ref carrying the bytes to wait on.
-
-        ``count`` is a number of participating SLOTS, not source rows: one
-        slot's copy is `_unit()` rows, and this ref must cover exactly the
-        bytes those copies moved.
-        """
-        return vmem_ref.at[0, pl.ds(0, count)]
-
-    def _read_offset(self, s_idx):
-        """Spec-decode checkpoint to resume from; 0 without a window."""
-        return self.metadata_ref.s_idx_to_read_offset[s_idx]
 
     def copy_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_recvs is not None
         assert self.window_ref is not None
         slot = self.current_copy_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -296,17 +266,14 @@ class StateBufferedRef(BaseBufferedRef):
             state_idx = self.metadata_ref.s_idx_to_state_indices[s_idx]
             has_initial_state = self.metadata_ref.s_idx_has_initial_state[s_idx]
             should_read = jnp.logical_and(is_first_tile, has_initial_state)
-            dma_size = jnp.where(should_read, self._unit(), 0)
+            dma_size = jnp.where(should_read, 1, 0)
 
             # Resume from the checkpoint of the last accepted token.
-            state_idx += self._read_offset(s_idx)
+            state_idx += self.metadata_ref.s_idx_to_read_offset[s_idx]
 
-            # Into the dedicated incoming-state position (see
-            # `GDNConfig.state_in_pos`), never a checkpoint position that an
-            # in-flight copy_out of this slot may still be reading.
             pltpu.make_async_copy(
-                self._src_slice(src_ref, state_idx, dma_size),
-                vmem_ref.at[idx, pl.ds(self.cfg.state_in_pos, dma_size)],
+                src_ref.at[pl.ds(state_idx, dma_size)],
+                vmem_ref.at[idx, pl.ds(0, dma_size)],
                 sem,
             ).start()
 
@@ -315,7 +282,7 @@ class StateBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_wait_in_slot
         sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         dma_size = 0
@@ -329,15 +296,29 @@ class StateBufferedRef(BaseBufferedRef):
         # NOTE: With bounds checks disabled, the self-copy descriptor may
         # nominally exceed the window row; it is never executed, only used
         # to wait for the same number of bytes `copy_in` issued.
-        wait_ref = self._wait_slice(vmem_ref, dma_size)
+        wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
         pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class StateOutBufferedRef(BaseBufferedRef):
+    """Output buffered ref for per-sequence state checkpoints (conv / recurrent).
+
+    The VMEM window holds one state per window position,
+    [seq_tile_size, window_size, *state_shape]. After compute, the first
+    `min(r_size, window_size)` checkpoints are written back to
+    `state_indices[s] .. + that many slots`. Keeping loads in a separate
+    window stops the load for tile p + 2, issued during step p + 1, from
+    overwriting the slot that tile p's store is still reading.
+    """
 
     def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
         assert self.window_ref is not None
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -350,11 +331,11 @@ class StateBufferedRef(BaseBufferedRef):
             # many tokens but keep only the final state.
             r_size = self.metadata_ref.p_id_to_r_size[p_id, idx]
             num_ckpts = jnp.minimum(r_size, self.cfg.window_size)
-            dma_size = jnp.where(is_last_tile, num_ckpts * self._unit(), 0)
+            dma_size = jnp.where(is_last_tile, num_ckpts, 0)
 
             pltpu.make_async_copy(
                 vmem_ref.at[idx, pl.ds(0, dma_size)],
-                self._src_slice(dst_ref, state_idx, dma_size),
+                dst_ref.at[pl.ds(state_idx, dma_size)],
                 sem,
             ).start()
 
@@ -363,7 +344,7 @@ class StateBufferedRef(BaseBufferedRef):
         assert self.window_ref is not None
         slot = self.current_wait_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         dma_size = 0
@@ -376,32 +357,124 @@ class StateBufferedRef(BaseBufferedRef):
         # NOTE: With bounds checks disabled, the self-copy descriptor may
         # nominally exceed the window row; it is never executed, only used
         # to wait for the same number of bytes `copy_out` issued.
-        wait_ref = self._wait_slice(vmem_ref, dma_size)
+        wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
         pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
 
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True, kw_only=True)
-class ExternalStateBufferedRef(StateBufferedRef):
-    """State tiles streamed from/to an indexed external state source.
+class ExternalStateInBufferedRef(StateInBufferedRef):
+    """Initial state tiles streamed from an indexed external state source.
 
-    Unlike ``StateBufferedRef``'s dense per-slot state tensor, the source
+    Unlike ``StateInBufferedRef``'s dense per-slot state tensor, the source
     stores each slot's state as raw bytes inside a window of ``stride``
     consecutive source blocks addressed by the slot's state index;
     ``region`` selects the block/row range of this state within that
-    window. copy_in/copy_out move the whole region with one contiguous
-    async copy per slot, gated by the same first/last-tile and
-    has_initial_state metadata as the dense path, so padded or invalid
-    slots move no bytes in either direction. vmem_ldst applies the
-    region's typed view when the tile is loaded or stored.
+    window. copy_in moves the whole region with one contiguous async copy
+    per slot, gated by the same first-tile and has_initial_state metadata as
+    the dense path, so padded or invalid slots move no bytes. vmem_ldst
+    applies the region's typed view when the tile is loaded.
+
+    The VMEM tile holds one region per slot,
+    [seq_tile_size, 1, nblocks, nrows, *payload]: the initial state, the
+    checkpoint selected by the sequence's read offset, is read into
+    position 0.
+    """
+
+    region: config.StateRegion = dataclasses.field(metadata=dict(static=True))
+    stride: int = dataclasses.field(metadata=dict(static=True))
+
+    def _ckpt_state_idx(self, s_idx, ckpt):
+        """Source block holding checkpoint `ckpt` of sequence `s_idx`.
+
+        With speculative decoding every checkpoint is an independent
+        source block, so the index is looked up rather than derived from a
+        base. Without it there is only checkpoint 0, in the slot's own
+        state block.
+        """
+        ckpt_indices = self.metadata_ref.s_idx_to_ckpt_indices
+        if ckpt_indices is None:
+            return self.metadata_ref.s_idx_to_state_indices[s_idx]
+        return ckpt_indices[s_idx, ckpt]
+
+    def _region_slice(self, src_ref: jax.Ref, state_idx, nblocks):
+        assert self.cfg.state_plan is not None
+        base = state_idx * self.stride + self.region.kb0
+        if self.cfg.state_plan.whole_block_dma or (
+            self.region.row0 == 0 and self.region.nrows == src_ref.shape[1]
+        ):
+            return src_ref.at[pl.ds(base, nblocks)]
+        return src_ref.at[
+            pl.ds(base, nblocks), pl.ds(self.region.row0, self.region.nrows)
+        ]
+
+    def copy_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
+        slot = self.current_copy_in_slot
+        sem = self.sem_recvs.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
+        p_id = grid_indices[0]
+
+        for idx in range(self.cfg.seq_tile_size):
+            is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
+            s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
+            has_initial_state = self.metadata_ref.s_idx_has_initial_state[s_idx]
+            should_read = jnp.logical_and(is_first_tile, has_initial_state)
+            nblocks = jnp.where(should_read, self.region.nblocks, 0)
+
+            # Resume from the checkpoint of the last accepted token.
+            read_ckpt = self.metadata_ref.s_idx_to_read_offset[s_idx]
+            state_idx = self._ckpt_state_idx(s_idx, read_ckpt)
+
+            pltpu.make_async_copy(
+                self._region_slice(src_ref, state_idx, nblocks),
+                vmem_ref.at[idx, 0, pl.ds(0, nblocks)],
+                sem,
+            ).start()
+
+    def wait_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
+        slot = self.current_wait_in_slot
+        sem = self.sem_recvs.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
+        p_id = grid_indices[0]
+
+        dma_size = 0
+        for idx in range(self.cfg.seq_tile_size):
+            is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
+            s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
+            has_initial_state = self.metadata_ref.s_idx_has_initial_state[s_idx]
+            should_read = jnp.logical_and(is_first_tile, has_initial_state)
+            dma_size += jnp.where(should_read, 1, 0)
+
+        # Each slot's copy covers one full region tile (all nblocks), read
+        # into position 0 of its row; wait per slot. NOTE: With bounds checks
+        # disabled, the descriptor may nominally exceed the window row; it is
+        # never executed, only used to wait for the same number of bytes
+        # `copy_in` issued.
+        wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
+        pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class ExternalStateOutBufferedRef(StateOutBufferedRef):
+    """Output state checkpoint tiles streamed to an indexed external state source.
+
+    The source layout and ``region`` addressing match
+    ``ExternalStateInBufferedRef``. copy_out writes each valid window
+    position's region with its own async copy, gated by the last-tile
+    metadata, so padded or invalid slots move no bytes. The kernel encodes
+    each checkpoint through the region's typed view before the tile is
+    stored.
 
     The VMEM tile holds one region per window position,
-    [seq_tile_size, window_size, nblocks, nrows, *payload], mirroring the
-    dense path: the initial state — the checkpoint selected by the
-    sequence's read offset — is read into window position 0, and after
-    compute the first `min(r_size, window_size)` checkpoints are written
-    back to the slot's checkpoints `0..`. Without speculative decoding
-    `window_size` is 1, reducing to a single region per slot.
+    [seq_tile_size, window_size, nblocks, nrows, *payload]; after compute
+    the first `min(r_size, window_size)` checkpoints are written back to the
+    slot's checkpoints `0..`. Without speculative decoding `window_size` is
+    1, reducing to a single region per slot.
     """
 
     region: config.StateRegion = dataclasses.field(metadata=dict(static=True))
@@ -430,6 +503,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
         return ckpt_indices[s_idx, ckpt]
 
     def _region_slice(self, src_ref: jax.Ref, state_idx, nblocks):
+        assert self.cfg.state_plan is not None
         base = state_idx * self.stride + self.region.kb0
         if self.cfg.state_plan.whole_block_dma or (
             self.region.row0 == 0 and self.region.nrows == src_ref.shape[1]
@@ -438,33 +512,6 @@ class ExternalStateBufferedRef(StateBufferedRef):
         return src_ref.at[
             pl.ds(base, nblocks), pl.ds(self.region.row0, self.region.nrows)
         ]
-
-    def copy_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
-        assert self.sem_recvs is not None
-        assert self.window_ref is not None
-        slot = self.current_copy_in_slot
-        sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
-        p_id = grid_indices[0]
-
-        for idx in range(self.cfg.seq_tile_size):
-            is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
-            s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
-            has_initial_state = self.metadata_ref.s_idx_has_initial_state[s_idx]
-            should_read = jnp.logical_and(is_first_tile, has_initial_state)
-            nblocks = jnp.where(should_read, self.region.nblocks, 0)
-
-            # Resume from the checkpoint of the last accepted token.
-            read_ckpt = self.metadata_ref.s_idx_to_read_offset[s_idx]
-            state_idx = self._ckpt_state_idx(s_idx, read_ckpt)
-
-            pltpu.make_async_copy(
-                self._region_slice(src_ref, state_idx, nblocks),
-                # Dedicated incoming-state position; see
-                # `GDNConfig.state_in_pos`.
-                vmem_ref.at[idx, self.cfg.state_in_pos, pl.ds(0, nblocks)],
-                sem,
-            ).start()
 
     def _unit(self) -> int:
         return self.region.nblocks
@@ -479,9 +526,10 @@ class ExternalStateBufferedRef(StateBufferedRef):
         """
         assert self.sem_sends is not None
         assert self.window_ref is not None
+        assert self.compact_output_ref is not None
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -504,7 +552,7 @@ class ExternalStateBufferedRef(StateBufferedRef):
         assert self.window_ref is not None
         slot = self.current_copy_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         for idx in range(self.cfg.seq_tile_size):
@@ -527,36 +575,12 @@ class ExternalStateBufferedRef(StateBufferedRef):
                     sem,
                 ).start()
 
-    def wait_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
-        assert self.sem_recvs is not None
-        assert self.window_ref is not None
-        slot = self.current_wait_in_slot
-        sem = self.sem_recvs.at[slot]
-        vmem_ref = self.window_ref.at[slot]
-        p_id = grid_indices[0]
-
-        dma_size = 0
-        for idx in range(self.cfg.seq_tile_size):
-            is_first_tile = self.metadata_ref.p_id_is_first_tile[p_id, idx]
-            s_idx = self.metadata_ref.p_id_to_s_idx[p_id, idx]
-            has_initial_state = self.metadata_ref.s_idx_has_initial_state[s_idx]
-            should_read = jnp.logical_and(is_first_tile, has_initial_state)
-            dma_size += jnp.where(should_read, 1, 0)
-
-        # Each slot's copy covers one full region tile (all nblocks), read
-        # into window position 0; wait per slot along the window dim of one
-        # sequence row. NOTE: With bounds checks disabled, the descriptor
-        # may nominally exceed the window row; it is never executed, only
-        # used to wait for the same number of bytes `copy_in` issued.
-        wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
-        pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
-
     def wait_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
         assert self.window_ref is not None
         slot = self.current_wait_out_slot
         sem = self.sem_sends.at[slot]
-        vmem_ref = self.window_ref.at[slot]
+        vmem_ref = cast(jax.Ref, self.window_ref.at[slot])
         p_id = grid_indices[0]
 
         dma_size = 0
@@ -568,7 +592,8 @@ class ExternalStateBufferedRef(StateBufferedRef):
 
         # Each checkpoint's copy covers one full region tile; wait for that
         # many region tiles along the window dim of one sequence row (the
-        # descriptor may nominally exceed it, see wait_in's NOTE).
+        # descriptor may nominally exceed it, see the NOTE in
+        # ExternalStateInBufferedRef.wait_in).
         wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
         pltpu.make_async_copy(wait_ref, wait_ref, sem).wait()
 
@@ -585,12 +610,14 @@ def create_allocs(
     conv_state_output_ref: jax.Array | None = None,
     recurrent_state_output_ref: jax.Array | None = None,
 ) -> tuple[
-    InBufferedRef,
-    InBufferedRef,
-    InBufferedRef,
-    StateBufferedRef,
-    StateBufferedRef,
-    OutBufferedRef,
+    pltpu.BufferedRef,
+    pltpu.BufferedRef,
+    pltpu.BufferedRef,
+    pltpu.BufferedRef,
+    pltpu.BufferedRef,
+    pltpu.BufferedRef,
+    pltpu.BufferedRef,
+    pltpu.BufferedRef,
 ]:
     compact_state_output = conv_state_output_ref is not None
     if compact_state_output != (recurrent_state_output_ref is not None):
@@ -651,93 +678,176 @@ def create_allocs(
     )
 
     if cfg.state_plan is None:
-        # One state checkpoint per window position per sequence (a single one
-        # without speculative decoding, where window_size is 1).
-        conv_shape = (
+        # Initial state needs only 1 slot per sequence; output holds one
+        # checkpoint per window position (1 without speculative decoding).
+        conv_in_shape = (
             cfg.seq_tile_size,
-            cfg.state_window_alloc,
+            1,
             cfg.prev_kernel_size,
             1,
             cfg.dim_size,
         )
-        recurrent_shape = (
+        recurrent_in_shape = (
             cfg.seq_tile_size,
-            cfg.state_window_alloc,
+            1,
             cfg.num_v_heads,
             cfg.kq_head_dim,
             cfg.v_head_dim,
         )
-        state_buffered_partial = functools.partial(
-            StateBufferedRef.input_output,
+        conv_out_shape = (
+            cfg.seq_tile_size,
+            cfg.window_size,
+            cfg.prev_kernel_size,
+            1,
+            cfg.dim_size,
+        )
+        recurrent_out_shape = (
+            cfg.seq_tile_size,
+            cfg.window_size,
+            cfg.num_v_heads,
+            cfg.kq_head_dim,
+            cfg.v_head_dim,
+        )
+        state_in_partial = functools.partial(
+            StateInBufferedRef.input,
             buffer_count=pipeline_mode.buffer_count,
             use_lookahead=pipeline_mode.use_lookahead,
             cfg=cfg,
             metadata_ref=metadata_ref,
         )
-        conv_alloc = state_buffered_partial(
-            spec=block_spec_partial(block_shape=conv_shape),
+        conv_in_alloc = state_in_partial(
+            spec=block_spec_partial(block_shape=conv_in_shape),
             dtype_or_type=conv_state_ref,
         )
-        recurrent_alloc = state_buffered_partial(
-            spec=block_spec_partial(block_shape=recurrent_shape),
+        recurrent_in_alloc = state_in_partial(
+            spec=block_spec_partial(block_shape=recurrent_in_shape),
+            dtype_or_type=recurrent_state_ref,
+        )
+        state_out_partial = functools.partial(
+            StateOutBufferedRef.output,
+            buffer_count=pipeline_mode.buffer_count,
+            use_lookahead=pipeline_mode.use_lookahead,
+            cfg=cfg,
+            metadata_ref=metadata_ref,
+        )
+        conv_out_alloc = state_out_partial(
+            spec=block_spec_partial(block_shape=conv_out_shape),
+            dtype_or_type=conv_state_ref,
+        )
+        recurrent_out_alloc = state_out_partial(
+            spec=block_spec_partial(block_shape=recurrent_out_shape),
             dtype_or_type=recurrent_state_ref,
         )
     else:
-        # Both state regions stream from the one external source ref
+        # Both state regions stream from/to the one external source ref
         # (passed as both state refs); the tiles keep the source's raw
         # block layout and vmem_ldst applies the typed region view. Like
-        # the dense path, the tile holds one region per window position
-        # (a single one without speculative decoding).
+        # the dense path, the input tile holds one region per sequence and
+        # the output tile one region per window position (a single one
+        # without speculative decoding).
         plan = cfg.state_plan
         if plan.whole_block_dma:
             # Whole-block DMA transfers complete pages, retaining all inner dims.
-            conv_shape = (
+            conv_in_shape = (
                 cfg.seq_tile_size,
-                cfg.state_window_alloc,
+                1,
                 plan.conv.nblocks,
                 *conv_state_ref.shape[1:],
             )
-            recurrent_shape = (
+            recurrent_in_shape = (
                 cfg.seq_tile_size,
-                cfg.state_window_alloc,
+                1,
+                plan.recurrent.nblocks,
+                *recurrent_state_ref.shape[1:],
+            )
+            conv_out_shape = (
+                cfg.seq_tile_size,
+                cfg.window_size,
+                plan.conv.nblocks,
+                *conv_state_ref.shape[1:],
+            )
+            recurrent_out_shape = (
+                cfg.seq_tile_size,
+                cfg.window_size,
                 plan.recurrent.nblocks,
                 *recurrent_state_ref.shape[1:],
             )
         else:
             payload = conv_state_ref.shape[2:]
-            conv_shape = (
+            conv_in_shape = (
                 cfg.seq_tile_size,
-                cfg.state_window_alloc,
+                1,
                 plan.conv.nblocks,
                 plan.conv.nrows,
                 *payload,
             )
-            recurrent_shape = (
+            recurrent_in_shape = (
                 cfg.seq_tile_size,
-                cfg.state_window_alloc,
+                1,
                 plan.recurrent.nblocks,
                 plan.recurrent.nrows,
                 *payload,
             )
-        state_buffered_partial = functools.partial(
-            ExternalStateBufferedRef.input_output,
+            conv_out_shape = (
+                cfg.seq_tile_size,
+                cfg.window_size,
+                plan.conv.nblocks,
+                plan.conv.nrows,
+                *payload,
+            )
+            recurrent_out_shape = (
+                cfg.seq_tile_size,
+                cfg.window_size,
+                plan.recurrent.nblocks,
+                plan.recurrent.nrows,
+                *payload,
+            )
+        ext_in_partial = functools.partial(
+            ExternalStateInBufferedRef.input,
             buffer_count=pipeline_mode.buffer_count,
             use_lookahead=pipeline_mode.use_lookahead,
             cfg=cfg,
             metadata_ref=metadata_ref,
             stride=plan.stride,
         )
-        conv_alloc = state_buffered_partial(
-            spec=block_spec_partial(block_shape=conv_shape),
+        conv_in_alloc = ext_in_partial(
+            spec=block_spec_partial(block_shape=conv_in_shape),
+            dtype_or_type=conv_state_ref,
+            region=plan.conv,
+        )
+        recurrent_in_alloc = ext_in_partial(
+            spec=block_spec_partial(block_shape=recurrent_in_shape),
+            dtype_or_type=conv_state_ref,
+            region=plan.recurrent,
+        )
+        ext_out_partial = functools.partial(
+            ExternalStateOutBufferedRef.output,
+            buffer_count=pipeline_mode.buffer_count,
+            use_lookahead=pipeline_mode.use_lookahead,
+            cfg=cfg,
+            metadata_ref=metadata_ref,
+            stride=plan.stride,
+        )
+        conv_out_alloc = ext_out_partial(
+            spec=block_spec_partial(block_shape=conv_out_shape),
             dtype_or_type=conv_state_ref,
             region=plan.conv,
             compact_output_ref=conv_state_output_ref,
         )
-        recurrent_alloc = state_buffered_partial(
-            spec=block_spec_partial(block_shape=recurrent_shape),
+        recurrent_out_alloc = ext_out_partial(
+            spec=block_spec_partial(block_shape=recurrent_out_shape),
             dtype_or_type=conv_state_ref,
             region=plan.recurrent,
             compact_output_ref=recurrent_state_output_ref,
         )
 
-    return qkv_alloc, b_alloc, a_alloc, conv_alloc, recurrent_alloc, out_alloc
+    return (
+        qkv_alloc,
+        b_alloc,
+        a_alloc,
+        conv_in_alloc,
+        recurrent_in_alloc,
+        out_alloc,
+        conv_out_alloc,
+        recurrent_out_alloc,
+    )

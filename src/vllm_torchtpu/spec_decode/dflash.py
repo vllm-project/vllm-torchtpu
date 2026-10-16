@@ -28,6 +28,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
 from vllm_torchtpu.spec_decode.utils import (
     DraftChunkInputs,
     _force_draft_tp1,
+    fit_rows,
     maybe_share_embeddings,
     maybe_share_lm_head,
     normalize_draft_config,
@@ -143,10 +144,23 @@ class DFlashProposer:
             self._static_attn_tensors_cache[padded_num_reqs] = (qsl, rd)
         return self._static_attn_tensors_cache[padded_num_reqs]
 
+    bucketed_drafts = True
+
     # Whether load_model overwrites the draft's embed_tokens/lm_head with the
     # target's unconditionally. DSpark sets this False to honor the draft's
     # has_own_embed_tokens / has_own_lm_head flags instead.
     _force_share_target_embeddings = True
+
+    @staticmethod
+    def _chunk_num_reqs_device(chunk: DraftChunkInputs) -> torch.Tensor:
+        """The chunk's live request count as a device scalar (int32, 0-d).
+
+        Read from the attention metadata's `request_distribution`, whose last
+        entry is the chunk's request count, so no extra upload is needed. As a
+        tensor it stays out of the compiled builders' program keys; a Python
+        int would compile one program per request count.
+        """
+        return chunk.attn_ctx.request_distribution[2]
 
     def _query_block_size(self, K: int) -> int:
         """Query tokens per request: 1 anchor + K mask slots. DSpark's dense
@@ -339,6 +353,8 @@ class DFlashProposer:
         """
         # 1. Calculate static padded shapes
         num_reqs = chunk.num_reqs
+        # The live count the compiled builders mask with.
+        num_reqs_device = self._chunk_num_reqs_device(chunk)
         block_size = self.block_size
         total_draft_tokens = num_reqs * block_size
 
@@ -378,7 +394,7 @@ class DFlashProposer:
                 query_start_loc_device,
                 position_ids_device,
                 draft_lengths,
-                num_reqs,
+                num_reqs_device,
                 block_size,
                 padded_len,
                 self.mask_token_id,
@@ -389,7 +405,7 @@ class DFlashProposer:
                 device_seed,
                 query_start_loc_device,
                 position_ids_device,
-                num_reqs,
+                num_reqs_device,
                 block_size,
                 padded_len,
                 self.mask_token_id,
@@ -485,6 +501,36 @@ class DFlashProposer:
                 target_hidden, positions, draft_md_tuple
             )
 
+    def _update_context_kv(self, chunks: list[DraftChunkInputs]) -> int:
+        """Update all context chunks before any draft forward (DP lockstep)."""
+        extra_chunks = 0
+        if self._dp_lockstep_sharded():
+            extra_chunks = max(0, self.runner._dp_step_num_chunks - len(chunks))
+        for chunk in chunks:
+            self._update_draft_kv_cache_from_target(chunk)
+        for _ in range(extra_chunks):
+            self._dp_dummy_kv_update()
+        return extra_chunks
+
+    @torch.no_grad()
+    def prepare_prefill_handoff(self) -> None:
+        """Build draft context without proposing tokens on a PD producer.
+
+        The caller must materialize cache writes before publishing the handoff.
+        Missing aux states are an error here: transferring target KV alone is
+        insufficient to resume DFlash/DSpark on the consumer.
+        """
+        chunks = self.draft_chunks
+        if not chunks:
+            raise RuntimeError("PD context update requires captured prefill chunks.")
+        for chunk in chunks:
+            aux = chunk.aux_hidden_states
+            if aux is None or (isinstance(aux, (list, tuple)) and not aux):
+                raise RuntimeError(
+                    "PD context update requires target aux hidden states."
+                )
+        self._update_context_kv(chunks)
+
     @torch.no_grad()
     def propose(
         self,
@@ -494,9 +540,13 @@ class DFlashProposer:
         scheduler_output,
         return_device: bool = False,
         next_tokens_per_chunk: list[torch.Tensor] | None = None,
-        device_seed: torch.Tensor | None = None,
-    ) -> list[list[int]] | torch.Tensor:
+        device_seed: list[torch.Tensor] | None = None,
+    ) -> list[list[int]] | list[torch.Tensor]:
         """Main execution step to propose draft tokens.
+
+        `device_seed` is one bucketed `[rows]` tensor per chunk. With
+        `return_device`, returns one `[rows, K]` tensor per chunk at the
+        draft's row bucket; consumers fit or trim it (see `bucketed_drafts`).
 
         `sampled_token_ids`, `discard_sampled_tokens_req_indices`,
         `num_rejected_tokens_np` and `scheduler_output` are unused here: this
@@ -521,15 +571,8 @@ class DFlashProposer:
         # collectives pair across ranks by emission order, and propose emits
         # ALL KV updates before ALL draft forwards, so the padding must
         # follow the same phase structure (never interleave per chunk).
-        extra_chunks = 0
-        if self._dp_lockstep_sharded():
-            extra_chunks = max(0, runner._dp_step_num_chunks - len(chunks))
-
         # 1. Hoist all KV cache updates across chunks to the top of propose
-        for chunk in chunks:
-            self._update_draft_kv_cache_from_target(chunk)
-        for _ in range(extra_chunks):
-            self._dp_dummy_kv_update()
+        extra_chunks = self._update_context_kv(chunks)
 
         # 2. Process each chunk
         draft_logits_per_chunk = []
@@ -537,12 +580,7 @@ class DFlashProposer:
             next_tokens_device = (
                 next_tokens_per_chunk[i] if next_tokens_per_chunk else None
             )
-            # Slice seed tokens for this chunk's requests.
-            chunk_seed = (
-                device_seed[chunk.start_index : chunk.start_index + chunk.num_reqs]
-                if device_seed is not None
-                else None
-            )
+            chunk_seed = device_seed[i] if device_seed is not None else None
             input_ids, positions, seq_lens = self._prepare_dflash_inputs(
                 chunk, next_tokens_device=next_tokens_device, device_seed=chunk_seed
             )
@@ -578,15 +616,9 @@ class DFlashProposer:
 
         # 3. Extract K tokens from logits
         if return_device:
-            if len(draft_logits_per_chunk) == 1:
-                return draft_logits_per_chunk[0][: chunks[0].num_reqs]
-            sliced_chunks = [
-                logits
-                if logits.shape[0] == chunk.num_reqs
-                else logits[: chunk.num_reqs]
-                for logits, chunk in zip(draft_logits_per_chunk, chunks)
-            ]
-            return torch.cat(sliced_chunks, dim=0)
+            # One bucketed `[rows, K]` tensor per chunk; never sliced to the
+            # live count (see `bucketed_drafts`).
+            return draft_logits_per_chunk
 
         # Single synchronization and transfer to the host (return_device=False)
         # We transfer the ENTIRE padded tensor to CPU to avoid
@@ -846,6 +878,16 @@ class DFlashProposer:
         return self._draft_has_moe_cache
 
     @torch.no_grad()
+    def run_dp_dummy_context(self, num_chunks: int) -> None:
+        """Pair context-only producer updates without proposing draft tokens."""
+        if num_chunks <= 0 or self.draft_model is None:
+            return
+        if not self._dp_lockstep_sharded():
+            return
+        for _ in range(num_chunks):
+            self._dp_dummy_kv_update()
+
+    @torch.no_grad()
     def run_dp_dummy_draft(self, num_chunks: int) -> None:
         """Replay a busy rank's draft collectives on an idle/padding rank
         for `num_chunks` padding chunks (EP-DP lockstep)."""
@@ -856,8 +898,7 @@ class DFlashProposer:
         # Collectives pair across ranks by emission order, and propose()
         # emits ALL KV-updates before ALL draft forwards, so the replay
         # keeps that phase structure -- never interleaved per chunk.
-        for _ in range(num_chunks):
-            self._dp_dummy_kv_update()
+        self.run_dp_dummy_context(num_chunks)
         for _ in range(num_chunks):
             self._dp_dummy_forward()
 
@@ -1016,18 +1057,22 @@ class DFlashProposer:
         self,
         query_start_loc: torch.Tensor,
         position_ids: torch.Tensor,
-        num_reqs: int,
+        num_reqs: torch.Tensor,
         padded_num_reqs: int,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Per padded request row: the clamped request index, a
         `[padded_num_reqs, 1]` int32 live-row mask, and the positions of the
         request's first and last query token this step. Padding rows alias
         the last live request; callers zero them with the mask. Traced
-        inline by both compiled input builders."""
+        inline by both compiled input builders.
+
+        `num_reqs` is a device scalar: the clamp and the mask are computed on
+        device so the traced program does not depend on the live count."""
         req_indices = torch.arange(
             padded_num_reqs, dtype=torch.int32, device=query_start_loc.device
         )
-        safe_req_indices = torch.clamp(req_indices, max=max(num_reqs - 1, 0))
+        last_live = torch.clamp(num_reqs - 1, min=0)
+        safe_req_indices = torch.minimum(req_indices, last_live)
         valid_mask = (req_indices < num_reqs).unsqueeze(1).to(torch.int32)
         start_positions = position_ids[query_start_loc[safe_req_indices]].unsqueeze(1)
         end_indices = torch.clamp(query_start_loc[safe_req_indices + 1] - 1, min=0)
@@ -1086,7 +1131,7 @@ class DFlashProposer:
         query_start_loc: torch.Tensor,
         position_ids: torch.Tensor,
         draft_lengths: torch.Tensor,
-        num_reqs: int,
+        num_reqs: torch.Tensor,
         block_size: int,
         padded_len: int,
         mask_token_id: int,
@@ -1097,12 +1142,13 @@ class DFlashProposer:
         model's output.
 
         Args:
-            next_tokens_device: Tensor of shape [num_reqs, K+1] containing the target
-                model's accepted tokens for this step. Padded with `invalid_token_id`.
+            next_tokens_device: Tensor of shape [rows, K+1] containing the target
+                model's accepted tokens for this step, `rows` the chunk's bucketed
+                request count. Padded with `invalid_token_id`.
             query_start_loc: 1D Tensor containing starting query locations per request.
             position_ids: 1D Tensor containing position IDs.
             draft_lengths: Number of verified drafts per request (0 for prompt chunks).
-            num_reqs: Number of active requests.
+            num_reqs: Number of active requests, as a device scalar (int32).
             block_size: K + 1 (1 base token + K draft mask slots).
             padded_len: Total length of the flattened tensors
                 (padded_num_reqs * block_size).
@@ -1121,11 +1167,9 @@ class DFlashProposer:
         """
         padded_num_reqs = padded_len // block_size
 
-        # Pad target output tokens to static shape on-device
-        next_tokens_device_padded = F.pad(
-            next_tokens_device,
-            (0, 0, 0, padded_num_reqs - next_tokens_device.shape[0]),
-            value=invalid_token_id,
+        # Both are static buckets; the live count enters only via `num_reqs`.
+        next_tokens_device_padded = fit_rows(
+            next_tokens_device, padded_num_reqs, invalid_token_id
         ).to(torch.int32)
 
         (safe_req_indices, valid_mask, start_positions, last_positions) = (
@@ -1169,7 +1213,7 @@ class DFlashProposer:
         device_seed: torch.Tensor,
         query_start_loc: torch.Tensor,
         position_ids: torch.Tensor,
-        num_reqs: int,
+        num_reqs: torch.Tensor,
         block_size: int,
         padded_len: int,
         mask_token_id: int,
@@ -1179,10 +1223,11 @@ class DFlashProposer:
         1D tensor of seed tokens.
 
         Args:
-            device_seed: 1D Tensor of shape [num_reqs] containing base tokens.
+            device_seed: 1D Tensor of shape [rows] containing base tokens,
+                `rows` the chunk's bucketed request count.
             query_start_loc: 1D Tensor containing starting query locations per request.
             position_ids: 1D Tensor containing position IDs.
-            num_reqs: Number of active requests.
+            num_reqs: Number of active requests, as a device scalar (int32).
             block_size: K + 1 (1 base token + K draft mask slots).
             padded_len: Total length of the flattened tensors
                 (padded_num_reqs * block_size).
@@ -1199,10 +1244,8 @@ class DFlashProposer:
         """
         padded_num_reqs = padded_len // block_size
 
-        # Pad seed tokens to static shape on-device
-        base_tokens = F.pad(
-            device_seed, (0, padded_num_reqs - device_seed.shape[0]), value=0
-        ).to(torch.int32)
+        # Fit the bucketed seed rows to the draft rows (static buckets).
+        base_tokens = fit_rows(device_seed, padded_num_reqs, 0).to(torch.int32)
 
         # Anchor one past the last prompt token in the chunk.
         _, valid_mask, _, last_positions = self._request_window_bounds(

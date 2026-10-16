@@ -652,6 +652,14 @@ def fused_moe_func(
     # callers return FP32 weights and would otherwise promote downstream.
     topk_weights = topk_weights.astype(hidden_states.dtype)
 
+    if use_ep and use_sparse_core and num_tokens * topk <= onehot_moe_permute_threshold:
+        # The one-hot permute and unpermute are matmuls across all tokens, and
+        # 0 * NaN == NaN: one token with a non-finite hidden state or routing
+        # weight would turn every token's output into NaN. Zero those values
+        # so the damage stays with that token.
+        hidden_states = jnp.where(jnp.isfinite(hidden_states), hidden_states, 0)
+        topk_weights = jnp.where(jnp.isfinite(topk_weights), topk_weights, 0)
+
     if use_ep and experts_start is not None:
         local_ids = topk_ids - experts_start
         valid = (local_ids >= 0) & (local_ids < w1.shape[0])

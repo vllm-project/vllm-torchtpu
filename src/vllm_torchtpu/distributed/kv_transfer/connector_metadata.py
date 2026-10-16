@@ -18,6 +18,7 @@ ReqId = str
 class SendMeta:
     uuid: int
     local_block_ids: list[int]
+    # Unix timestamp in seconds, compared by workers on different hosts.
     expiration_time: float
     # Exact transfer extent for controller-planned PCP striping. Legacy send
     # paths leave this unset.
@@ -30,6 +31,13 @@ class SendMeta:
     # order. Only DSv4 sets it, because its groups page at different sizes;
     # single-group models leave it None and use local_block_ids.
     group_block_ids: list[list[int]] | None = None
+    # The prompt token the producer dropped for the consumer to compute; a
+    # prefill-only drafter seeds its boundary row with it.
+    next_prompt_token_id: int | None = None
+    # Published in the step that completes the prompt, ahead of the finish:
+    # the worker registration starts finish_pending (no TTL, no status
+    # probe) until finished_req_ids names the request.
+    registered_ahead: bool = False
 
 
 @dataclass

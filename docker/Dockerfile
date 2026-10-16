@@ -2,6 +2,32 @@
 # This Dockerfile builds images for running vLLM on Google Cloud TPUs.
 # It pre-installs all dependencies from pyproject.toml (including torch-tpu) in the base variant.
 
+# vllm-router (vllm-project/router), the prefill/decode router the
+# disaggregated benchmarks put in front of an engine pair. Built from source
+# in a stage of its own; the pin is a build arg so a run can try another
+# commit without touching this file.
+FROM python:3.12-slim-bookworm AS router-build
+
+# pkg-config and libssl-dev: hf-hub links the system OpenSSL.
+RUN apt-get update && apt-get install -y curl git build-essential pkg-config libssl-dev && rm -rf /var/lib/apt/lists/*
+
+ENV RUSTUP_HOME=/opt/rustup CARGO_HOME=/opt/cargo PATH=/opt/cargo/bin:$PATH
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --no-modify-path --profile minimal --default-toolchain 1.95
+
+ARG VLLM_ROUTER_COMMIT=5d3c3af9a41dec2d5ecff412024b7a743763472d
+WORKDIR /build/router
+RUN git clone --quiet --filter=blob:none https://github.com/vllm-project/router.git . && \
+    git checkout --quiet "${VLLM_ROUTER_COMMIT}"
+
+# The soft open-file limit of a BuildKit RUN step (1024) is too low for one
+# rustc per core.
+RUN --mount=type=cache,target=/opt/cargo/registry \
+    --mount=type=cache,target=/opt/cargo/git \
+    ulimit -n "$(ulimit -Hn)" && \
+    cargo build --release --locked --bin vllm-router && \
+    install -m 0755 target/release/vllm-router /usr/local/bin/vllm-router && \
+    vllm-router --version
+
 # Variant 1: The Runtime (Base Image with pre-installed dependencies)
 # This variant provides the core runtime environment with all external dependencies
 # (including torch-tpu) pre-installed.
@@ -55,7 +81,7 @@ RUN --mount=type=cache,target=/root/.cache/uv \
     export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken; \
     export UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD="${TOKEN}"; \
     uv pip install --system \
-      --index https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/ \
+      --index https://us-python.pkg.dev/ml-oss-artifacts-published/torch-tpu-release-virtual-registry/simple/ \
       --extra-index-url https://pypi.org/simple \
       --index-strategy unsafe-best-match \
       -r pyproject.toml \
@@ -80,6 +106,11 @@ RUN apt-get update && apt-get install -y apt-transport-https ca-certificates gnu
     echo "deb [signed-by=/usr/share/keyrings/cloud.google.gpg] https://packages.cloud.google.com/apt gcsfuse-$(lsb_release -c -s) main" | tee -a /etc/apt/sources.list.d/gcsfuse.list && \
     apt-get update && apt-get install -y google-cloud-cli gcsfuse && \
     rm -rf /var/lib/apt/lists/*
+
+# The P/D router the disaggregated benchmark clients start when the serve
+# config asks for it (AGENTX_PROXY=router). A client-side tool, so ci and
+# dev only; prod serves and does not route.
+COPY --from=router-build /usr/local/bin/vllm-router /usr/local/bin/vllm-router
 
 # Start from an empty PYTHONPATH; the dev and prod stages set their own.
 ENV PYTHONPATH=""
@@ -147,6 +178,10 @@ CMD ["/bin/bash"]
 
 # Variant 4: Omni Image (Omni Variant with dev + omni dependencies)
 FROM dev AS omni
+
+# vllm-omni depends on opencv-python (not -headless), whose cv2 links libGL and
+# glib; without them multi-rank diffusion workers crash at startup.
+RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
 
 # --group vllm keeps vLLM's source pin in this resolution, so vllm-omni cannot
 # replace it with a PyPI vllm.

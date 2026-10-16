@@ -297,8 +297,18 @@ def patch_executor_for_pp_wave(vllm_config: Any) -> None:
         future = _PushFuture(inner, self, state, state.last_step, state.real_steps)
         return future if non_block else future.result()
 
+    def take_draft_token_ids(self):
+        # A pipeline admits prefill-only MTP alone (pp_validation): its
+        # drafts exist to fill the draft layer's KV, and no step consumes
+        # them. Asking the workers would also deadlock. The engine asks with
+        # a blocking RPC right after dispatching a step, while a stage can
+        # still sit in that step's hand-off, waiting for a push that only a
+        # wait on the step's future sends.
+        return None
+
     MultiprocExecutor.execute_model = execute_model
     MultiprocExecutor.sample_tokens = sample_tokens
+    MultiprocExecutor.take_draft_token_ids = take_draft_token_ids
     MultiprocExecutor._tpu_pp_wave_patch = True
     logger.info(
         "PP wave: engine push and settle installed, message ring %d chunks",

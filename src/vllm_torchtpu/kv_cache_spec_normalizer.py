@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 import math
 from dataclasses import replace
 from typing import Any
@@ -24,7 +37,7 @@ def normalize_kv_cache_specs_for_tpu(
     *,
     enable_unified_kv_layout: bool = False,
     exempt_layers: set[str] | None = None,
-    attention_backend: type[PallasAttentionBackend],
+    attention_backend: type[PallasAttentionBackend] | None,
 ) -> dict[str, KVCacheSpec]:
     """Normalize KV cache specs to the TPU's real page geometry.
 
@@ -109,7 +122,7 @@ def _normalize_one_spec(
     spec: KVCacheSpec,
     kv_cache_dtype: torch.dtype,
     *,
-    attention_backend: type[PallasAttentionBackend],
+    attention_backend: type[PallasAttentionBackend] | None,
 ) -> KVCacheSpec:
     if not isinstance(spec, AttentionSpec):
         return spec
@@ -128,6 +141,7 @@ def _normalize_one_spec(
     elif isinstance(spec, MLAAttentionSpec):
         backend = PallasMLAttentionBackend
     else:
+        assert attention_backend is not None
         backend = attention_backend
     page_size = backend.get_kv_cache_page_size_bytes(
         spec.block_size,

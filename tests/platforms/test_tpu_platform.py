@@ -33,6 +33,7 @@ from vllm.config.compilation import DynamicShapesType
 from vllm.model_executor.layers.attention import Attention
 from vllm.v1.core.sched.scheduler import Scheduler
 from vllm.v1.engine.core import EngineCoreProc
+from vllm.v1.engine.input_processor import InputProcessor
 
 import vllm_torchtpu as plugin
 import vllm_torchtpu.platforms.tpu_platform as tpu_platform
@@ -46,6 +47,53 @@ from vllm_torchtpu.platforms.tpu_platform import (
     _validate_phased_profiling_config,
     get_tpu_multihost_topology,
 )
+
+
+@pytest.mark.parametrize(
+    "hybrid,unified,resumable,blocked",
+    [
+        (True, False, True, True),
+        (True, False, False, False),
+        (True, True, True, False),
+        (False, False, True, False),
+    ],
+)
+@pytest.mark.parametrize("positional", [False, True])
+@pytest.mark.parametrize("connector", [None, "DecodeBenchConnector", "RaidenConnector"])
+def test_compact_mamba_rejects_resumable_input_before_admission(
+    monkeypatch, hybrid, unified, resumable, blocked, positional, connector
+):
+    calls = []
+
+    def process_inputs(self, request_id, resumable=False):
+        calls.append(request_id)
+        return request_id
+
+    monkeypatch.setattr(InputProcessor, "process_inputs", process_inputs)
+    monkeypatch.setattr(
+        "vllm_torchtpu.platforms.tpu_block_size_utils.unified_kv_layout_enabled",
+        lambda config: unified,
+    )
+    plugin._patch_vllm_compact_mamba_streaming_input()
+    wrapped = InputProcessor.process_inputs
+    plugin._patch_vllm_compact_mamba_streaming_input()
+    assert InputProcessor.process_inputs is wrapped
+    processor = object.__new__(InputProcessor)
+    processor.vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(is_hybrid=hybrid),
+        kv_transfer_config=(
+            SimpleNamespace(kv_connector=connector) if connector is not None else None
+        ),
+    )
+    args = ("request", resumable) if positional else ("request",)
+    kwargs = {} if positional else {"resumable": resumable}
+    if blocked and connector != "RaidenConnector":
+        with pytest.raises(ValueError, match="resumable.*compact Mamba"):
+            processor.process_inputs(*args, **kwargs)
+        assert calls == []
+    else:
+        assert processor.process_inputs(*args, **kwargs) == "request"
+        assert calls == ["request"]
 
 
 def test_grouped_topk_dynamic_compile_wrapper_is_unwrapped(monkeypatch):
@@ -80,8 +128,12 @@ def test_scheduler_mamba_split_accepts_external_kv_tokens():
         cache_config=SimpleNamespace(block_size=16),
         block_size=16,
         use_eagle=False,
+        use_eagle_block_drop=False,
         mamba_partial_cache_hit=False,
         mamba_has_prefill_checkpoint_blocks=False,
+        mamba_shared_prefix_checkpoint=False,
+        max_num_scheduled_tokens=16384,
+        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
         hash_block_size=16,
     )
     request = SimpleNamespace(

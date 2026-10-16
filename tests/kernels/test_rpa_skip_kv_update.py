@@ -37,11 +37,9 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import wrapper as KB
 from vllm_torchtpu.kernels.ragged_paged_attention.v3 import kernel as K
 from vllm_torchtpu.kernels.ragged_paged_attention.v3 import kernel_hd64 as K64
 
-_BATCHED_DECODE_BLOCKS = KBC.BlockSizes(
-    bq_sz=1, bq_c_sz=1, bkv_sz=256, batch_size=8, n_buffer=3
-)
+_BATCHED_DECODE_BLOCKS = KBC.BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=256, batch_size=8)
 _BATCHED_PREFILL_BLOCKS = KBC.BlockSizes(
-    bq_sz=1792, bq_c_sz=28, bkv_sz=256, batch_size=2, n_buffer=3
+    bq_sz=1792, bq_c_sz=28, bkv_sz=256, batch_size=2
 )
 
 # One entry per kernel family. Each kernel family ships its own cache layout

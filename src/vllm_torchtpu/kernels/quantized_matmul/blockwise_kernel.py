@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 """Quantized matmul kernel with blockwise quantization support."""
 
+from typing import cast
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -186,7 +188,7 @@ def quantized_matmul_kernel(
         is_last_step = pid_k == (orig_n_in // in_block_size - 1)
 
         def accum(is_first_step, is_last_step):
-            accumulators = [None] * steps_n
+            accumulators = cast(list[jax.Array], [None] * steps_n)
 
             for i in range(steps_k):
                 k_start, k_end = i * block_size, (i + 1) * block_size

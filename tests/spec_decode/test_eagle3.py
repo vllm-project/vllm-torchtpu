@@ -43,12 +43,16 @@ def _make_proposer(
     speculative_config = SimpleNamespace(
         draft_tensor_parallel_size=draft_tp, method=method, draft_model_config=None
     )
-    parallel_config = SimpleNamespace(tensor_parallel_size=target_tp)
+    parallel_config = SimpleNamespace(
+        tensor_parallel_size=target_tp, pipeline_parallel_size=1
+    )
     vllm_config = SimpleNamespace(
         speculative_config=speculative_config, parallel_config=parallel_config
     )
     return Eagle3Proposer(
-        runner=mock.MagicMock(_pcp_enabled=False, _mtp_enabled=method == "mtp"),
+        runner=mock.MagicMock(
+            _pcp_enabled=False, _mtp_enabled=method == "mtp", _mtp_prefill_only=False
+        ),
         vllm_config=vllm_config,
     )
 
@@ -142,7 +146,7 @@ def test_load_model_vocab_weights_follow_tp_layout(draft_tp, target_tp, monkeypa
     draft_head = draft.lm_head
     original_gather_logits = draft.logits_processor._gather_logits
 
-    def load_draft_model():
+    def load_draft_model(_target):
         proposer.draft_model = draft
 
     proposer._load_draft_model = load_draft_model
@@ -660,6 +664,75 @@ def test_prepare_draft_inputs_async_device(device):
 
 
 @pytest.mark.tpu_test
+@pytest.mark.parametrize("discard", [[], [1]])
+def test_prepare_draft_inputs_async_device_keeps_padded_width(device, discard):
+    """The async path works at the sampler's padded request width: rows past
+    num_reqs repeat the last real request's seed position and token, so the
+    scatter result equals the host path's, and they report no rejections.
+    A last request still in partial prefill seeds from its known next prompt
+    token, and the padding rows repeat that token, not its sampled one."""
+    proposer = _make_proposer(draft_tp=1)
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(req_ids=["r0", "r1"]),
+        device=device,
+        requests={
+            "r1": SimpleNamespace(num_computed_tokens=0, get_token_id=lambda _i: 777)
+        },
+        num_tokens_paddings=[16, 32, 64, 128],
+        _dp_lockstep_enabled=lambda: False,
+    )
+    scheduler_output = SimpleNamespace(num_scheduled_tokens={"r1": 4})
+
+    def make_chunk():
+        # Two real requests (qsl [0, 4, 8]) inside a request padding of 4:
+        # the padded qsl and draft_lengths rows repeat the last real value.
+        return _make_chunk(
+            input_ids=torch.arange(8, dtype=torch.int32, device=device),
+            position_ids=torch.arange(8, dtype=torch.int32, device=device),
+            query_start_loc_np=np.array([0, 4, 8], dtype=np.int32),
+            start_index=0,
+            num_reqs=2,
+            device=device,
+            draft_lengths=torch.tensor([3, 3, 3, 3], dtype=torch.int32, device=device),
+            attn_ctx=SimpleNamespace(
+                query_start_loc=torch.tensor(
+                    [0, 4, 8, 8, 8], dtype=torch.int32, device=device
+                )
+            ),
+        )
+
+    # Padding rows carry no valid token at all; without the mask their
+    # clamp(min=1) seed would land on a real request's slot.
+    next_tokens = torch.tensor(
+        [[91, 92, 201, -1], [202, -1, -1, -1], [-1, -1, -1, -1], [-1, -1, -1, -1]],
+        dtype=torch.int32,
+        device=device,
+    )
+    dev_ids, _, dev_last, dev_rej = proposer._prepare_draft_inputs(
+        make_chunk(),
+        sampled_token_ids=None,
+        discard_sampled_tokens_req_indices=discard,
+        num_rejected_tokens_np=None,
+        scheduler_output=scheduler_output,
+        next_tokens_device=next_tokens,
+    )
+    host_ids, _, host_last, host_rej = proposer._prepare_draft_inputs(
+        make_chunk(),
+        sampled_token_ids=[[201], [202]],
+        discard_sampled_tokens_req_indices=discard,
+        num_rejected_tokens_np=np.array([1, 3], dtype=np.int32),
+        scheduler_output=scheduler_output,
+    )
+
+    assert torch.equal(dev_ids, host_ids)
+    assert torch.equal(dev_last.cpu()[:2], host_last.cpu()[:2])
+    assert dev_last.shape[0] == 16
+    assert dev_rej.shape[0] == 4
+    assert dev_rej.cpu().tolist() == [1, 3, 0, 0]
+    assert host_rej.tolist() == [1, 3]
+
+
+@pytest.mark.tpu_test
 @pytest.mark.parametrize("num_speculative_tokens", [1, 3, 8])
 @pytest.mark.parametrize("chunk_sizes", [[2], [2, 2], [3, 1]])
 @pytest.mark.parametrize("return_device", [False, True])
@@ -906,69 +979,107 @@ def test_propose_empty_batch():
     )
 
 
-@pytest.mark.tpu_test
-def test_propose_pads_to_coordinated_chunk_bound(device):
-    """Under EP-DP lockstep, a rank with fewer chunks than the coordinated
-    bound must pad with run_dp_dummy_draft chunks so draft-forward counts pair
-    across DP ranks."""
-    proposer = _make_proposer(draft_tp=1)
-    proposer.speculative_config.num_speculative_tokens = 1
+def _lockstep_draft_trace(monkeypatch, method, K, num_chunks, num_real):
+    """The draft programs one EP-DP lockstep rank emits in a step whose
+    coordinated chunk bound is `num_chunks`: propose() with `num_real` real
+    chunks, or the idle-rank replay when it has none."""
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+
+    monkeypatch.setattr(e3, "synchronize_tensors", lambda *a, **k: None)
+    bucket, reqs = 64, 16
+    proposer = _make_proposer(draft_tp=1, method=method)
+    proposer.speculative_config.num_speculative_tokens = K
+    proposer._draft_has_moe_cache = True
     proposer.runner = SimpleNamespace(
-        input_batch=SimpleNamespace(num_reqs=1),
-        max_num_reqs=16,
-        num_reqs_max_model_len=16,
-        num_reqs_most_model_len=16,
-        num_tokens_paddings=[16],
-        device=device,
-        # Lockstep ON with a coordinated bound of 3 chunks; this rank has 1.
+        input_batch=SimpleNamespace(num_reqs=num_real * reqs),
+        _dp_target_bucket=bucket,
+        _dp_step_num_chunks=num_chunks,
+        num_reqs_max_model_len=reqs,
+        num_reqs_most_model_len=None,
+        max_num_reqs=reqs,
+        num_tokens_paddings=[16, 32, 64],
+        device=torch.device("cpu"),
+        _hidden_states_dtype=torch.float32,
+        uses_mrope=False,
         _dp_lockstep_enabled=lambda: True,
-        _dp_step_num_chunks=3,
-        _dp_target_bucket=16,
+    )
+    proposer.draft_model = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=8),
+        model=SimpleNamespace(use_aux_hidden_state=True, fc_input_size=24),
     )
 
-    chunk = _make_chunk(
-        input_ids=torch.zeros(16, dtype=torch.int32, device=device),
-        position_ids=torch.zeros(16, dtype=torch.int32, device=device),
-        query_start_loc_np=np.arange(2, dtype=np.int32),
-        start_index=0,
-        num_reqs=1,
-        device=device,
-        attn_ctx=SimpleNamespace(use_max_model_len=True),
+    trace = []
+
+    def combine(*aux):
+        trace.append(("combine", [tuple(a.shape) for a in aux]))
+        return aux[0]
+
+    def forward(*, step_idx, num_tokens_padded, **_):
+        trace.append(("forward", step_idx, num_tokens_padded))
+        hidden = torch.zeros((num_tokens_padded, 8))
+        return hidden, hidden
+
+    def propose_token(hidden):
+        trace.append(("lm_head", tuple(hidden.shape)))
+        return torch.zeros(hidden.shape[0], dtype=torch.int32)
+
+    proposer._draft_combine_hidden_states = combine
+    proposer._forward_draft = forward
+    proposer._draft_propose_token = propose_token
+    proposer._draft_gather_carries = lambda h, pos, lh, _idx: (
+        h[:reqs],
+        pos[:reqs],
+        lh[:reqs],
     )
-    proposer.draft_chunks = [chunk]
-
-    class _StubDraft:
-        model = SimpleNamespace(use_aux_hidden_state=True)
-
-        def combine_hidden_states(self, x):
-            return x
-
-        def compute_logits(self, hidden):
-            return torch.zeros((hidden.shape[0], 4), device=device)
-
-    proposer.draft_model = _StubDraft()
-    proposer._prepare_draft_inputs = lambda *a, **k: (
-        torch.zeros(16, dtype=torch.int32, device=device),
-        torch.zeros(16, dtype=torch.int32, device=device),
-        torch.zeros(1, dtype=torch.int64, device=device),
-        np.zeros(1, dtype=np.int32),
+    proposer._prepare_draft_inputs = lambda *_a, **_k: (
+        torch.zeros(bucket, dtype=torch.int32),
+        torch.zeros(bucket, dtype=torch.int32),
+        torch.arange(reqs, dtype=torch.int64),
+        np.zeros(reqs, dtype=np.int32),
     )
-    proposer._forward_draft = lambda **k: (
-        torch.zeros((16, 8), device=device),
-        torch.zeros((16, 8), device=device),
-    )
-    dummy_chunks = []
-    proposer.run_dp_dummy_draft = lambda n: dummy_chunks.append(n)
 
+    if num_real == 0:
+        proposer.run_dp_dummy_draft(num_chunks)
+        return trace
+    proposer.draft_chunks = [
+        _make_chunk(
+            input_ids=torch.zeros(bucket, dtype=torch.int32),
+            position_ids=torch.zeros(bucket, dtype=torch.int32),
+            query_start_loc_np=np.arange(reqs + 1, dtype=np.int32),
+            start_index=ci * reqs,
+            num_reqs=reqs,
+            device=torch.device("cpu"),
+            hidden_states=torch.zeros((bucket, 8)),
+            attn_ctx=SimpleNamespace(use_max_model_len=True),
+        )
+        for ci in range(num_real)
+    ]
     proposer.propose(
-        sampled_token_ids=[[0]],
+        sampled_token_ids=[[0]] * (num_real * reqs),
         discard_sampled_tokens_req_indices=[],
         num_rejected_tokens_np=None,
         scheduler_output=SimpleNamespace(num_scheduled_tokens={}),
     )
+    return trace
 
-    # coordinated bound 3 − 1 real chunk = 2 padding chunks.
-    assert dummy_chunks == [2]
+
+@pytest.mark.parametrize("method", ["eagle3", "mtp"])
+@pytest.mark.parametrize("K", [1, 2, 3])
+@pytest.mark.parametrize("num_chunks", [1, 2, 3])
+def test_dp_lockstep_draft_trace_independent_of_real_chunk_count(
+    monkeypatch, method, K, num_chunks
+):
+    """Every EP-DP lockstep rank must emit the same draft program sequence in a
+    step, however many of the coordinated chunks it fills with real requests.
+
+    Collectives pair across ranks in emission order. A rank that ran its
+    padding chunks chunk-major after its real ones paired a first pass
+    @bucket against a peer's loop step @p, and the DP group hung.
+    """
+    full = _lockstep_draft_trace(monkeypatch, method, K, num_chunks, num_chunks)
+    for num_real in range(num_chunks):
+        padded = _lockstep_draft_trace(monkeypatch, method, K, num_chunks, num_real)
+        assert padded == full, f"{num_real} of {num_chunks} chunks real"
 
 
 def test_loop_bucket_constant_under_sharded_lockstep():
@@ -996,7 +1107,7 @@ def test_run_dp_dummy_draft_sharded_replays_propose_trace(monkeypatch):
     """Sharded draft under EP-DP lockstep: each padding chunk must replay the
     real propose's collective trace — combine (1/chunk), first-pass forward
     @bucket, K lm-head gathers @constant loop bucket, K-1 loop forwards @that
-    bucket — not just K bare forwards."""
+    bucket — not just K bare forwards, and in propose()'s step-major order."""
     import vllm_torchtpu.spec_decode.eagle3 as e3
 
     monkeypatch.setattr(e3, "synchronize_tensors", lambda *a, **k: None)
@@ -1039,10 +1150,10 @@ def test_run_dp_dummy_draft_sharded_replays_propose_trace(monkeypatch):
     # One combine per chunk, at the coordinated bucket width (aux thirds).
     assert len(combine) == 2
     assert all(t.shape == (64, 8) for t in combine[0])
-    # K forwards per chunk: first pass @bucket=64, then K-1 loop @p=16
-    # (constant loop bucket = pad(max_num_reqs)).
-    assert [f["num_tokens_padded"] for f in fwd] == [64, 16, 16] * 2
-    assert [f["step_idx"] for f in fwd] == [0, 1, 2] * 2
+    # Both chunks' first passes @bucket=64, then each of the K-1 loop steps
+    # @p=16 across both (constant loop bucket = pad(max_num_reqs)).
+    assert [f["num_tokens_padded"] for f in fwd] == [64, 64, 16, 16, 16, 16]
+    assert [f["step_idx"] for f in fwd] == [0, 0, 1, 1, 2, 2]
     # Loop steps carry the loop metadata tensors (shape parity with propose).
     assert all(
         f.get("loop_query_start_loc") is not None for f in fwd if f["step_idx"] > 0
@@ -1101,8 +1212,8 @@ def test_run_dp_dummy_draft_mtp_replays_no_combine(monkeypatch):
     proposer.run_dp_dummy_draft(2)
 
     # Same forward/lm-head trace as eagle3, only without the combine step.
-    assert [f["num_tokens_padded"] for f in fwd] == [64, 16, 16] * 2
-    assert [f["step_idx"] for f in fwd] == [0, 1, 2] * 2
+    assert [f["num_tokens_padded"] for f in fwd] == [64, 64, 16, 16, 16, 16]
+    assert [f["step_idx"] for f in fwd] == [0, 0, 1, 1, 2, 2]
     assert tok_shapes == [(16, 8)] * 6
 
 
@@ -1569,6 +1680,7 @@ def test_forward_draft_uses_saved_draft_config_in_both_contexts(monkeypatch, dev
     proposer.runner = SimpleNamespace(
         mesh=object(),
         _dp_num_tokens_across_dp=lambda n: n,
+        num_tokens_paddings=[16],
     )
     proposer._build_draft_attn_metadata = lambda **_kwargs: {"draft": "md"}
 
@@ -1610,8 +1722,9 @@ def test_forward_draft_uses_saved_draft_config_in_both_contexts(monkeypatch, dev
     assert torch.equal(carry, hidden)
 
 
-def test_pcp_mtp_draft_cache_specs_require_full_attention():
-    """PCP K=1 rejects draft cache specs that need unsupported routing."""
+def test_prefill_only_mtp_draft_cache_specs_require_full_attention():
+    """A prefill-only producer rejects draft cache specs that need
+    unsupported routing."""
     proposer = _make_proposer(draft_tp=1, method="mtp")
     draft_attn_layer_names = {"draft.attn"}
     full_spec = FullAttentionSpec(
@@ -1621,14 +1734,14 @@ def test_pcp_mtp_draft_cache_specs_require_full_attention():
         get_kv_cache_spec=lambda: {"draft.attn": full_spec}
     )
 
-    proposer._validate_pcp_draft_model(draft_attn_layer_names)
+    proposer._validate_prefill_only_draft_model(draft_attn_layer_names)
 
     mamba_spec = MambaSpec(block_size=1, shapes=((1, 4, 8),), dtypes=(torch.bfloat16,))
     proposer.runner = SimpleNamespace(
         get_kv_cache_spec=lambda: {"draft.attn": mamba_spec}
     )
     with pytest.raises(NotImplementedError, match="FullAttentionSpec.*draft.attn"):
-        proposer._validate_pcp_draft_model(draft_attn_layer_names)
+        proposer._validate_prefill_only_draft_model(draft_attn_layer_names)
 
 
 @pytest.mark.tpu_test
@@ -1873,6 +1986,93 @@ def test_propose_index_share_order_across_two_chunks():
         )
 
 
+def test_propose_index_share_survives_dp_padding_first_pass(monkeypatch):
+    """Under EP-DP lockstep a padding chunk's first pass runs the indexer
+    between a real chunk's step 0 and its loop steps, rewriting the shared
+    top-k buffer. The restore before each loop step must hand the real chunk
+    its own rows back, also when it is the rank's only real chunk."""
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+
+    monkeypatch.setattr(e3, "synchronize_tensors", lambda *a, **k: None)
+    device = torch.device("cpu")
+    K = 3
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.speculative_config.num_speculative_tokens = K
+    proposer._draft_has_moe_cache = True
+    proposer.runner = SimpleNamespace(
+        input_batch=SimpleNamespace(num_reqs=2, req_ids=["r0", "r1"]),
+        device=device,
+        num_tokens_paddings=[2, 4, 8],
+        max_num_reqs=2,
+        uses_mrope=False,
+        num_reqs_max_model_len=2,
+        num_reqs_most_model_len=None,
+        _hidden_states_dtype=torch.float32,
+        _dp_lockstep_enabled=lambda: True,
+        _dp_step_num_chunks=2,
+        _dp_target_bucket=2,
+    )
+    proposer.vllm_config.scheduler_config = SimpleNamespace(max_num_batched_tokens=8)
+
+    buf = torch.zeros(8, 4, dtype=torch.int32)
+    proposer.draft_model = SimpleNamespace(
+        config=SimpleNamespace(hidden_size=1), model=_FakeMtpModel(buf)
+    )
+    proposer.speculative_config.draft_model_config = SimpleNamespace(
+        hf_config=SimpleNamespace(index_share_for_mtp_iteration=True)
+    )
+    proposer._init_mtp_index_sharing()
+    assert proposer._share_mtp_indices is True
+
+    chunk = _make_chunk(
+        input_ids=torch.zeros(2, dtype=torch.int32, device=device),
+        position_ids=torch.zeros(2, dtype=torch.int32, device=device),
+        query_start_loc_np=np.array([0, 1, 2], dtype=np.int32),
+        start_index=0,
+        num_reqs=2,
+        hidden=1,
+        device=device,
+        hidden_states=torch.zeros((2, 1), device=device),
+        attn_ctx=SimpleNamespace(use_max_model_len=True),
+    )
+    proposer.draft_chunks = [chunk]
+    proposer._prepare_draft_inputs = lambda *_a, **_k: (
+        torch.zeros(2, dtype=torch.int32, device=device),
+        torch.zeros(2, dtype=torch.int32, device=device),
+        torch.tensor([0, 1], dtype=torch.int64, device=device),
+        np.zeros(2, dtype=np.int32),
+    )
+
+    real_rows = torch.tensor([[10, 11, 12, 13], [14, 15, 16, 17]], dtype=torch.int32)
+    padding_rows = torch.full((2, 4), 99, dtype=torch.int32)
+    live = proposer._mtp_topk_buffers[0]
+    seen = []
+
+    def fake_forward(*, chunk, step_idx, **_k):
+        is_real = chunk is proposer.draft_chunks[0]
+        if step_idx == 0:
+            live[:2] = real_rows if is_real else padding_rows
+        elif is_real:
+            seen.append(live[:2].clone())
+        return (torch.zeros((2, 1), device=device), torch.zeros((2, 1), device=device))
+
+    proposer._forward_draft = fake_forward
+    proposer._draft_gather_carries = lambda h, p, lh, gi: (h[:2], p[:2], lh[:2])
+    proposer._draft_propose_token = lambda lh: torch.zeros(
+        lh.shape[0], dtype=torch.int32, device=device
+    )
+
+    proposer.propose(
+        sampled_token_ids=[[1], [2]],
+        discard_sampled_tokens_req_indices=[],
+        num_rejected_tokens_np=None,
+        scheduler_output=SimpleNamespace(num_scheduled_tokens={}),
+    )
+
+    assert len(seen) == K - 1
+    assert all(torch.equal(rows, real_rows) for rows in seen)
+
+
 # --------------------------------------------------------------------------
 # DSA (sparse-MLA) draft KV-cache validation
 # --------------------------------------------------------------------------
@@ -2060,7 +2260,7 @@ def _forward_draft_harness(monkeypatch):
     proposer = _make_proposer(draft_tp=1, method="mtp")
     proposer.draft_vllm_config = object()
     proposer.runner = SimpleNamespace(
-        mesh=object(), _dp_num_tokens_across_dp=lambda n: n
+        mesh=object(), _dp_num_tokens_across_dp=lambda n: n, num_tokens_paddings=[2]
     )
     proposer._build_draft_attn_metadata = lambda **_kwargs: {}
 
@@ -2487,3 +2687,113 @@ def test_static_shape_args_passes_non_tensors_through():
 
     t, step_idx, flag = region(torch.zeros(2), 3, flag=None)
     assert step_idx == 3 and flag is None and t.shape == (2,)
+
+
+@pytest.mark.parametrize("own_lm_head", [False, True])
+@pytest.mark.parametrize("head_style", ["lm_head", "shared_head"])
+def test_mtp_draft_borrows_target_head_before_loading_weights(
+    monkeypatch, own_lm_head, head_style
+):
+    """The target's embed_tokens and lm_head are bound before the draft's
+    weights stream in, and only the checkpoint copies of borrowed modules are
+    skipped: a draft that keeps its own lm_head still loads it. A
+    DeepSeek-style draft keeps its head at ``model.layers.<N>.shared_head.head``
+    and must not load that checkpoint copy over the borrowed target head."""
+    import vllm.model_executor.model_loader.utils as loader_utils
+    from vllm.model_executor.model_loader import base_loader
+
+    import vllm_torchtpu.spec_decode.eagle3 as e3
+
+    proposer = _make_proposer(draft_tp=1, method="mtp")
+    proposer.runner = SimpleNamespace(mesh=object())
+    proposer.vllm_config.load_config = SimpleNamespace(device=None)
+    proposer.vllm_config.device_config = SimpleNamespace(device="cpu")
+    proposer.vllm_config.compilation_config = SimpleNamespace(
+        inductor_compile_config={}
+    )
+    proposer.speculative_config.draft_model_config = SimpleNamespace(
+        runner_type=None, dtype=torch.bfloat16
+    )
+    proposer._draft_tp_matches_target = True
+    proposer._draft_replicated = False
+
+    target_embed = torch.nn.Embedding(4, 2)
+    target_head = torch.nn.Linear(2, 4)
+    target = SimpleNamespace(
+        model=SimpleNamespace(embed_tokens=target_embed), lm_head=target_head
+    )
+    seen = {}
+
+    class Draft(torch.nn.Module):
+        has_own_embed_tokens = False
+        has_own_lm_head = own_lm_head
+
+        def __init__(self):
+            super().__init__()
+            self.model = torch.nn.Module()
+            self.model.embed_tokens = torch.nn.Embedding(4, 2)
+            if head_style == "lm_head":
+                self.lm_head = torch.nn.Linear(2, 4)
+            else:
+                layer = torch.nn.Module()
+                layer.shared_head = torch.nn.Module()
+                layer.shared_head.head = torch.nn.Linear(2, 4)
+                self.model.layers = torch.nn.ModuleDict({"92": layer})
+
+        def _head(self):
+            if head_style == "lm_head":
+                return self.lm_head
+            return self.model.layers["92"].shared_head.head
+
+        def load_weights(self, weights):
+            seen["names"] = [name for name, _ in weights]
+            seen["embed_is_target"] = self.model.embed_tokens is target_embed
+            seen["head_is_target"] = self._head() is target_head
+            return set(seen["names"])
+
+    head_name = (
+        "lm_head.weight"
+        if head_style == "lm_head"
+        else "model.layers.92.shared_head.head.weight"
+    )
+
+    class _Loader:
+        def load_weights(self, model, model_config):
+            model.load_weights(
+                [
+                    ("model.embed_tokens.weight", 1),
+                    (head_name, 2),
+                    ("model.layers.92.mlp.gate.weight", 3),
+                ]
+            )
+
+    processed = []
+    monkeypatch.setattr(loader_utils, "initialize_model", lambda **kw: Draft())
+    monkeypatch.setattr(base_loader, "_has_online_quant", lambda model: False)
+    monkeypatch.setattr(
+        base_loader,
+        "process_weights_after_loading",
+        lambda model, config, device: processed.append(model),
+    )
+    monkeypatch.setattr(e3, "get_model_loader", lambda _cfg: _Loader())
+    monkeypatch.setattr(e3, "set_model_tag", lambda _tag: contextlib.nullcontext())
+    monkeypatch.setattr(
+        e3, "set_current_vllm_config", lambda _cfg: contextlib.nullcontext()
+    )
+    monkeypatch.setattr(
+        e3,
+        "set_vllm_model_wrapper_context",
+        lambda **kw: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(e3, "_force_draft_tp1", lambda: contextlib.nullcontext())
+
+    proposer._load_draft_model(target)
+
+    assert seen["embed_is_target"]
+    assert seen["head_is_target"] is not own_lm_head
+    expected = ["model.layers.92.mlp.gate.weight"]
+    if own_lm_head:
+        expected = [head_name] + expected
+    assert seen["names"] == expected
+    assert processed == [proposer.draft_model]
+    assert "load_weights" not in proposer.draft_model.__dict__

@@ -7,7 +7,7 @@
 # Analysis includes full history from tpu_commons, tpu_inference, and vllm-torchtpu paths.
 
 # Default owners for everything in the repo (fallback)
-* @qizzzh @angelayi @colin2328 @QiliangCui @caojx-google
+* @qizzzh @angelayi @colin2328 @QiliangCui @caojx-google @Nanfang-Li @yinlin09
 
 # CI/CD and Build Configuration
 /.buildkite/ @QiliangCui @theminghuang
@@ -21,6 +21,8 @@
 
 # Kernel Implementations
 /src/vllm_torchtpu/kernels/ @kyuyeunk @qizzzh
+/src/vllm_torchtpu/kernels/experimental/batched_rpa/ @kwang3939 @a1yssan13
+/src/vllm_torchtpu/kernels/gdn/v3/ @brianseung-google @mhhuang-machine
 
 # Model layers
 /src/vllm_torchtpu/layers/ @kyuyeunk @qizzzh

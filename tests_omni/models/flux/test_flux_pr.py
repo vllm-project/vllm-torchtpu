@@ -11,8 +11,10 @@ import os
 import numpy as np
 import pytest
 from PIL import Image
-from vllm_omni import Omni
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
+
+from tests_omni.conftest import OmniRunner
+from tests_omni.omni_test_utils import compute_ssim, high_freq_energy
 
 pytestmark = [
     pytest.mark.omni,
@@ -80,56 +82,20 @@ def _load_golden_reference_image() -> np.ndarray:
     return np.load(path).astype(np.float32)
 
 
-def _compute_ssim(img1: np.ndarray, img2: np.ndarray) -> float:
-    """Mean SSIM across RGB channels."""
-    c1 = (0.01 * 1.0) ** 2
-    c2 = (0.03 * 1.0) ** 2
-    ssims = []
-    for c in range(3):
-        x, y = img1[..., c], img2[..., c]
-        mu_x, mu_y = x.mean(), y.mean()
-        var_x, var_y = x.var(), y.var()
-        cov_xy = np.mean((x - mu_x) * (y - mu_y))
-        num = (2 * mu_x * mu_y + c1) * (2 * cov_xy + c2)
-        den = (mu_x**2 + mu_y**2 + c1) * (var_x + var_y + c2)
-        ssims.append(float(num / den))
-    return float(np.mean(ssims))
-
-
 def _extract_image(output) -> Image.Image:
     """Extract PIL Image from Omni generate output."""
     return output.images[0]
 
 
-def _high_freq_energy(img: np.ndarray) -> float:
-    """Mean absolute Laplacian: drops with blur, rises with noise or blocking."""
-    laplacian = (
-        4 * img[1:-1, 1:-1]
-        - img[:-2, 1:-1]
-        - img[2:, 1:-1]
-        - img[1:-1, :-2]
-        - img[1:-1, 2:]
-    )
-    return float(np.abs(laplacian).mean())
-
-
+@pytest.mark.parametrize(
+    "omni_runner",
+    ["black-forest-labs/FLUX.1-schnell"],
+    indirect=True,
+)
 class TestFluxPrCiOnTpu:
     """Fast PR CI functional and numerical tests for FLUX on TPU v7x."""
 
-    @pytest.fixture(scope="class")
-    def schnell_engine(self):
-        """Class-scoped Omni engine fixture: loads FLUX.1-schnell once per class."""
-        omni = Omni(
-            "black-forest-labs/FLUX.1-schnell",
-            init_timeout=600,
-            stage_init_timeout=600,
-        )
-        try:
-            yield omni
-        finally:
-            omni.shutdown()
-
-    def test_flux1_schnell_fast_t2i_tpu(self, schnell_engine):
+    def test_flux1_schnell_fast_t2i_tpu(self, omni_runner: OmniRunner):
         """Test FLUX.1-schnell 2-step fast generation on TPU v7x without file writes."""
 
         prompt = (
@@ -143,7 +109,7 @@ class TestFluxPrCiOnTpu:
             guidance_scale=0.0,
             seed=42,
         )
-        outputs = schnell_engine.generate(prompt, sampling_params)
+        outputs = omni_runner.generate(prompt, sampling_params)
         assert outputs, "Omni returned empty output list"
 
         img = _extract_image(outputs[0])
@@ -158,7 +124,7 @@ class TestFluxPrCiOnTpu:
             "likely blank"
         )
 
-    def test_flux_deterministic_seed_parity_tpu(self, schnell_engine):
+    def test_flux_deterministic_seed_parity_tpu(self, omni_runner: OmniRunner):
         """Test that identical seeds produce bitwise identical output on TPU v7x."""
 
         prompt = "A red flower in an open sunny green meadow"
@@ -172,7 +138,7 @@ class TestFluxPrCiOnTpu:
             guidance_scale=0.0,
             seed=fixed_seed,
         )
-        out1 = schnell_engine.generate(prompt, params1)
+        out1 = omni_runner.generate(prompt, params1)
         img1 = _extract_image(out1[0])
 
         # Run 2 with identical seed
@@ -183,7 +149,7 @@ class TestFluxPrCiOnTpu:
             guidance_scale=0.0,
             seed=fixed_seed,
         )
-        out2 = schnell_engine.generate(prompt, params2)
+        out2 = omni_runner.generate(prompt, params2)
         img2 = _extract_image(out2[0])
 
         # Run 3 with distinct seed
@@ -194,7 +160,7 @@ class TestFluxPrCiOnTpu:
             guidance_scale=0.0,
             seed=99999,
         )
-        out3 = schnell_engine.generate(prompt, params3)
+        out3 = omni_runner.generate(prompt, params3)
         img3 = _extract_image(out3[0])
 
         arr1 = np.array(img1.convert("RGB"), dtype=np.float32)
@@ -213,7 +179,7 @@ class TestFluxPrCiOnTpu:
             "Different seeds should produce divergent pixel values"
         )
 
-    def test_flux_golden_full_image_parity_tpu(self, schnell_engine):
+    def test_flux_golden_full_image_parity_tpu(self, omni_runner: OmniRunner):
         """Compare full 512x512 image against CPU diffusers golden reference.
 
         The reference image is staged from gs://tpu-commons-ci/golden/.
@@ -235,7 +201,7 @@ class TestFluxPrCiOnTpu:
             seed=0,
             generator_device="cpu",
         )
-        outputs = schnell_engine.generate(prompt, params)
+        outputs = omni_runner.generate(prompt, params)
         assert outputs, "Omni returned empty output list"
 
         img = _extract_image(outputs[0])
@@ -249,14 +215,14 @@ class TestFluxPrCiOnTpu:
         )
 
         mae = float(np.mean(np.abs(arr - ref_img)))
-        ssim_val = _compute_ssim(arr, ref_img)
+        ssim_val = compute_ssim(arr, ref_img)
         pearsons = [
             float(np.corrcoef(arr[..., c].ravel(), ref_img[..., c].ravel())[0, 1])
             for c in range(3)
         ]
         min_pearson = min(pearsons)
-        ref_hf = _high_freq_energy(ref_img)
-        hf_ratio = _high_freq_energy(arr) / ref_hf
+        ref_hf = high_freq_energy(ref_img)
+        hf_ratio = high_freq_energy(arr) / ref_hf
         lo, hi = HF_ENERGY_RATIO_RANGE
 
         summary = (

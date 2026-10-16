@@ -33,7 +33,7 @@ IMAGE_REPO="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-
 # Point Test Steps to the Metadata-Driven Image Tag
 IMAGE_TAG=""
 if command -v buildkite-agent &> /dev/null; then
-  IMAGE_TAG="$(buildkite-agent meta-data get "CI_IMAGE_TAG${DOCKER_IMAGE_SUFFIX:-}" --default "" 2>/dev/null || true)"
+  IMAGE_TAG="$(buildkite-agent meta-data get "${CI_IMAGE_TAG_KEY:-CI_IMAGE_TAG${DOCKER_IMAGE_SUFFIX:-}}" --default "" 2>/dev/null || true)"
 fi
 
 # Fallback if metadata is not found: construct the dual-tag <repo>-<vllm>
@@ -200,6 +200,11 @@ if [ "${DOCKER_EXIT_CODE}" -ne 0 ]; then
   fi
   echo "Last 40 lines of container output:"
   tail -n 40 "${RUN_LOG}"
+
+  python3 "${SCRIPT_DIR}/record_ci_failure.py" \
+    --log-file "${RUN_LOG}" \
+    --exit-code "${DOCKER_EXIT_CODE}" \
+    --step-label "${BUILDKITE_LABEL:-}" || true
 fi
 
 exit "$DOCKER_EXIT_CODE"

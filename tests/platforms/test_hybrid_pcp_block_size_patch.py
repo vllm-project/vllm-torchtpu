@@ -1,3 +1,16 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from types import SimpleNamespace
 
 import pytest
@@ -27,6 +40,7 @@ def _config(
             prefill_context_parallel_size=pcp,
         ),
         kv_transfer_config=object() if connector_enabled else None,
+        attention_config=SimpleNamespace(hisparse_config=None),
     )
 
 
@@ -80,7 +94,10 @@ def test_hybrid_full_attention_mamba_pcp_resolves_effective_block_size():
     ) == (32768, 4096)
 
 
-def test_hybrid_full_attention_mamba_pcp_builds_prefix_cache_coordinator():
+@pytest.mark.parametrize("allow_partial_hash_hits", [False, True])
+def test_hybrid_full_attention_mamba_pcp_builds_prefix_cache_coordinator(
+    allow_partial_hash_hits,
+):
     _patch_vllm_hybrid_pcp_block_sizes()
     from vllm.v1.core.kv_cache_coordinator import (
         HybridKVCacheCoordinator,
@@ -112,10 +129,12 @@ def test_hybrid_full_attention_mamba_pcp_builds_prefix_cache_coordinator():
         dcp_world_size=1,
         pcp_world_size=8,
         scheduler_block_size=scheduler_block_size,
-        hash_block_size=hash_block_size,
+        hash_block_size=hash_block_size // 2,
+        allow_partial_hash_hits=allow_partial_hash_hits,
     )
 
     assert isinstance(coordinator, HybridKVCacheCoordinator)
+    assert coordinator.enable_partial_hash_hits is allow_partial_hash_hits
     assert [
         group.kv_cache_spec.block_size
         for group in coordinator.kv_cache_config.kv_cache_groups
@@ -260,7 +279,10 @@ def test_hybrid_pcp_coordinator_patch_keeps_non_mamba_scope():
         ],
     )
 
-    with pytest.raises(AssertionError, match="PCP not support hybrid"):
+    with pytest.raises(
+        AssertionError,
+        match=r"PCP (?:not support hybrid|only supports full attention)",
+    ):
         get_kv_cache_coordinator(
             kv_cache_config=kv_cache_config,
             max_model_len=4096,

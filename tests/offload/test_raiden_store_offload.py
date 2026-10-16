@@ -1168,6 +1168,11 @@ class _FakeFinishedRequest:
     def is_finished(self):
         return True
 
+    def __getattr__(self, name):
+        if name.startswith("__") and name.endswith("__"):
+            raise AttributeError(name)
+        return None
+
 
 class TestFinishedRequestStoreBuild(unittest.TestCase):
     """_build_store_jobs on aborted/finished requests, against the real
@@ -1192,7 +1197,13 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
 
         from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingScheduler
 
-        sched = object.__new__(TPURaidenOffloadingScheduler)
+        class _TestTPURaidenOffloadingScheduler(TPURaidenOffloadingScheduler):
+            def __getattr__(self, name):
+                if name.startswith("__") and name.endswith("__"):
+                    raise AttributeError(name)
+                return None
+
+        sched = object.__new__(_TestTPURaidenOffloadingScheduler)
         sched.config = SchedulerOffloadConfig(
             kv_group_configs=(
                 GroupOffloadConfig(
@@ -1202,6 +1213,8 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
                     hashes_per_chunk=1,
                     kv_event_group_spec=MagicMock(),
                     sliding_window_size_in_chunks=None,
+                    kv_cache_spec=MagicMock(),
+                    manager_cls=MagicMock(),
                 ),
             ),
             blocks_per_chunk=1,
@@ -1251,7 +1264,11 @@ class TestFinishedRequestStoreBuild(unittest.TestCase):
         )
 
     def _sched_output(self, req_id):
-        return SimpleNamespace(num_scheduled_tokens={}, finished_req_ids={req_id})
+        from vllm.v1.core.sched.output import SchedulerOutput
+
+        output = SchedulerOutput.make_empty()
+        output.finished_req_ids = {req_id}
+        return output
 
     def _aborted_setup(self, num_tokens=32, num_computed_tokens=12, num_blocks=3):
         from vllm.v1.request import RequestStatus
