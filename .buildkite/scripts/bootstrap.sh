@@ -28,7 +28,7 @@ determine_job_priority() {
   local priority=""
   local workload_priority=""
   echo "--- Determining job priority" >&2
-  if [[ "${NIGHTLY:-0}" == "1" ]]; then
+  if [[ "${NIGHTLY:-0}" == "1" || "${TORCHTPU_NIGHTLY:-0}" == "1" ]]; then
     # Nightly build (Lowest priority). Unclassed on kube, level with the
     # tpu-inference nightlies it shares the TPU queues with, which record no
     # class either.
