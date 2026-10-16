@@ -32,6 +32,17 @@ DEFAULT_GATHER_AND_ATTENTION_CHUNK_SIZE = 64
 DEFAULT_ATTENTION_KERNEL_BATCH_SIZE = 16
 # The native SparseCore gather's unit, which `topk_cap` must be a multiple of.
 GATHER_ATOM_ROWS = native_sc_gather.OCCURRENCES_PER_ATOM
+# Token buckets with more gather/attention chunks than this run them in a loop.
+MAX_UNROLLED_CHUNKS = 1
+# Chunks per loop step: within a step the scheduler overlaps one chunk's
+# SparseCore gather with another chunk's attention, as in the unrolled code.
+CHUNKS_PER_LOOP_STEP = 8
+
+
+def _slice_rows(arr: jax.Array, start: int | jax.Array, length: int) -> jax.Array:
+    if isinstance(start, int):
+        return arr[start : start + length]
+    return lax.dynamic_slice_in_dim(arr, start, length)
 
 
 def cdiv(a, b):
@@ -1528,9 +1539,8 @@ def sparse_ragged_paged_attention(
         else None
     )
 
-    for i in range(num_chunks):
+    def gather_and_attend(i, chunk_size, q, lse):
         start_pos = i * gather_and_attention_chunk_size
-        end_pos = min(start_pos + gather_and_attention_chunk_size, q.shape[0])
         result = sparse_attention_chunk(
             q,
             cache_kv_nope,
@@ -1539,7 +1549,8 @@ def sparse_ragged_paged_attention(
             physical_indices,
             lse,
             start_pos=start_pos,
-            end_pos=end_pos,
+            end_pos=start_pos + chunk_size,
+            chunk_size=chunk_size,
             token_end=cu_q_lens[distribution[2]],
             sm_scale=sm_scale,
             k_scale=k_scale,
@@ -1561,17 +1572,37 @@ def sparse_ragged_paged_attention(
             window_indices=(
                 None
                 if window_indices_all is None
-                else window_indices_all[
-                    i * chunk_window_rows : (i + 1) * chunk_window_rows
-                ]
+                else _slice_rows(
+                    window_indices_all, i * chunk_window_rows, chunk_window_rows
+                )
             ),
             q_pe=q_pe,
             lse_lane_dense=lse_lane_dense,
         )
         if return_lse:
             q, lse = result
-        else:
-            q = result
+            return q, lse
+        return result, lse
+
+    chunk = gather_and_attention_chunk_size
+    num_full_chunks, tail = divmod(q.shape[0], chunk)
+    if num_chunks <= MAX_UNROLLED_CHUNKS:
+        for i in range(num_chunks):
+            start_pos = i * chunk
+            q, lse = gather_and_attend(i, min(chunk, q.shape[0] - start_pos), q, lse)
+    else:
+        # One copy of the gather + attention kernels whatever the token
+        # bucket: unrolled, every chunk adds its own kernel code and keeps its
+        # own gathered KV buffers live.
+        q, lse = lax.fori_loop(
+            0,
+            num_full_chunks,
+            lambda i, carry: gather_and_attend(i, chunk, *carry),
+            (q, lse),
+            unroll=min(CHUNKS_PER_LOOP_STEP, num_full_chunks),
+        )
+        if tail:
+            q, lse = gather_and_attend(num_full_chunks, tail, q, lse)
 
     # [max_num_tokens, actual_num_q_heads, actual_head_dim]
     out = prepare_outputs(q, actual_num_q_heads, actual_head_dim)
@@ -1656,8 +1687,9 @@ def sparse_attention_chunk(
     physical_indices: jax.Array | None,  # i32[max_num_tokens, csa_topk]
     lse: jax.Array | None,  # f32[max_num_tokens, num_q_heads, 1]
     *,
-    start_pos: int,
-    end_pos: int,
+    start_pos: int | jax.Array,
+    end_pos: int | jax.Array,
+    chunk_size: int | None = None,
     token_end: jax.Array,  # i32
     sm_scale: float,
     k_scale: float,
@@ -1723,7 +1755,9 @@ def sparse_attention_chunk(
     split_q = q_pe is not None
     if split_q:
         head_dim = align_to(head_dim + q_pe.shape[-1], 128)
-    chunk_size = end_pos - start_pos
+    if chunk_size is None:
+        assert isinstance(start_pos, int) and isinstance(end_pos, int)
+        chunk_size = end_pos - start_pos
     capped_windows = None if topk_cap is None else topk // topk_cap
 
     def run_mla_kernel(
@@ -1886,7 +1920,11 @@ def sparse_attention_chunk(
             operands.append(lse)
         return kernel(*scalar_prefetches, *operands)
 
-    indices = None if physical_indices is None else physical_indices[start_pos:end_pos]
+    indices = (
+        None
+        if physical_indices is None
+        else _slice_rows(physical_indices, start_pos, chunk_size)
+    )
 
     tc_num_row_subchunks = 32
     dcp_gather_atoms = sparsecore_atoms_per_batch
@@ -1916,7 +1954,8 @@ def sparse_attention_chunk(
         ) * gather_window_size
         if indices is not None:
             indices = jnp.where(
-                window_start[None, :] >= kv_lens[start_pos:end_pos, None],
+                window_start[None, :]
+                >= _slice_rows(kv_lens, start_pos, chunk_size)[:, None],
                 dsa_gather.SKIP_INDEX,
                 indices,
             )
@@ -1958,7 +1997,8 @@ def sparse_attention_chunk(
         live_tokens = batch_end - start_pos
         token_windows = jnp.where(
             jnp.arange(chunk_size) < live_tokens,
-            (jnp.maximum(kv_lens[start_pos:end_pos], 1) + topk_cap - 1) // topk_cap,
+            (jnp.maximum(_slice_rows(kv_lens, start_pos, chunk_size), 1) + topk_cap - 1)
+            // topk_cap,
             1,
         )
         live_windows = jnp.clip(jnp.max(token_windows), 1, capped_windows)
@@ -1977,7 +2017,10 @@ def sparse_attention_chunk(
             # Window w of a gridded token holds prefix-packed slots [w*cap, (w+1)*cap).
             window_start = topk_cap * jnp.arange(capped_windows, dtype=jnp.int32)
             live_slots = jnp.clip(
-                kv_lens[start_pos:end_pos][None, :] - window_start[:, None], 0, topk_cap
+                _slice_rows(kv_lens, start_pos, chunk_size)[None, :]
+                - window_start[:, None],
+                0,
+                topk_cap,
             )
             live_slots = jnp.where(jnp.arange(chunk_size) < live_tokens, live_slots, 0)
             row_live_atoms = (

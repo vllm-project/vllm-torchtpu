@@ -15,10 +15,13 @@
 
 from unittest import mock
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from absl.testing import absltest, parameterized
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import metadata
 
@@ -889,6 +892,329 @@ class SmemBudgetCheckTest(absltest.TestCase):
             metadata, "generate_max_steps", side_effect=ValueError("no TPU")
         ):
             self.assertEqual(self._meta().bq_idx.shape[0], 1024)
+
+
+def _in_kernel_schedule(
+    seq_lens,
+    cu_q_lens,
+    start,
+    end,
+    cp_rank,
+    max_steps,
+    build=metadata.build_chunk_schedule,
+    entries_per_step=1,
+    **kw,
+):
+    """Runs a schedule builder in an interpreted kernel; returns its tables."""
+
+    def body(sl, cu, se, rank, n_out, bt_out, bq_out, bkv_out, *scratch):
+        meta_ = metadata.MetadataRef.create(*scratch)
+        build(meta_, sl, cu, se[0], se[1], cp_rank=rank[0], **kw)
+        n_out[0] = meta_.num_steps[0]
+
+        def copy(i, carry):
+            bt_out[i] = meta_.batch_tile_idx[i]
+            bq_out[i] = meta_.bq_idx[i]
+            bkv_out[i] = meta_.bkv_idx[i]
+            return carry
+
+        jax.lax.fori_loop(0, n_out[0] * entries_per_step, copy, 0)
+
+    smem = pl.BlockSpec(memory_space=pltpu.SMEM)
+    tables = [jax.ShapeDtypeStruct((max_steps,), jnp.int32)] * 3
+    outs = pl.pallas_call(
+        body,
+        out_shape=[jax.ShapeDtypeStruct((1,), jnp.int32), *tables],
+        in_specs=[smem] * 4,
+        out_specs=[smem] * 4,
+        scratch_shapes=[pltpu.SMEM((1,), jnp.int32)]
+        + [pltpu.SMEM((max_steps,), jnp.int32)] * 3,
+        interpret=True,
+    )(
+        seq_lens,
+        cu_q_lens,
+        jnp.array([start, end], jnp.int32),
+        jnp.array([cp_rank], jnp.int32),
+    )
+    num_steps = int(outs[0][0])
+    return num_steps, [np.asarray(t)[: num_steps * entries_per_step] for t in outs[1:]]
+
+
+class InKernelScheduleTest(parameterized.TestCase):
+    """`build_chunk_schedule` gives each chunk the steps the XLA schedule does."""
+
+    @parameterized.named_parameters(
+        ("batched_decode", 4, 1, 1, [1] * 8, 0, 8, None),
+        ("ragged_batched_decode_cp", 4, 1, 1, [1] * 6, 0, 4, None, 16, 4, 3),
+        ("decode_tail", 1, 1, 1, [1] * 7, 4, 7, None),
+        ("mixed", 1, None, 128, [1, 1, 300, 90, 4], 2, 5, None),
+        ("mixed_chunked_cp", 1, None, 128, [1, 1, 300, 90, 4], 2, 5, 128, 16, 4, 5),
+        ("decode_chunked", 4, 1, 1, [1] * 8, 0, 8, 4),
+        ("empty_pass", 1, None, 128, [1, 1, 300], 3, 3, 128),
+    )
+    def test_matches_compute_batched_seq_metadata(
+        self,
+        seq_batch_size,
+        static_q_len,
+        bq_sz,
+        q_lens,
+        start,
+        end,
+        chunk_tokens,
+        cp_size=1,
+        interleave_c=1,
+        cp_rank=0,
+    ):
+        rng = np.random.default_rng(len(q_lens) + start)
+        max_num_seqs, page_size, bkv_sz = 8, 128, 256
+        n = len(q_lens)
+        seq_lens = np.zeros(max_num_seqs, np.int32)
+        seq_lens[:n] = np.asarray(q_lens) + rng.integers(0, 20000, n)
+        cu_q_lens = np.zeros(max_num_seqs + 1, np.int32)
+        cu_q_lens[1 : n + 1] = np.cumsum(q_lens)
+        cu_q_lens[n + 1 :] = cu_q_lens[n]
+        max_num_tokens = 512
+        chunk_starts = (
+            tuple(range(0, max_num_tokens, chunk_tokens)) if chunk_tokens else (None,)
+        )
+        common = dict(
+            bq_sz=bq_sz,
+            bkv_sz=bkv_sz,
+            compression_ratio=4,
+            static_q_len=static_q_len,
+            seq_batch_size=seq_batch_size,
+            cp_size=cp_size,
+            interleave_c=interleave_c,
+        )
+        pages_per_seq = int(seq_lens.max()) // 4 // cp_size // page_size + 1
+        ref = metadata.compute_batched_seq_metadata(
+            seq_lens=jnp.asarray(seq_lens),
+            cu_q_lens=jnp.asarray(cu_q_lens),
+            start_seq_idx=start,
+            end_seq_idx=end,
+            pages_per_seq=pages_per_seq,
+            page_size=page_size,
+            max_num_tokens=max_num_tokens,
+            chunk_token_start=chunk_starts,
+            chunk_tokens=chunk_tokens,
+            cp_rank=cp_rank,
+            **common,
+        )
+        max_steps = metadata.chunk_steps_bound(
+            max_num_seqs=max_num_seqs,
+            bq_sz=bq_sz,
+            bkv_sz=bkv_sz,
+            pages_per_seq=pages_per_seq,
+            page_size=page_size,
+            max_num_tokens=max_num_tokens,
+            static_q_len=static_q_len,
+            seq_batch_size=seq_batch_size,
+            chunk_tokens=chunk_tokens,
+        )
+        offset = 0
+        for m, chunk_start in enumerate(chunk_starts):
+            num_steps, tables = _in_kernel_schedule(
+                jnp.asarray(seq_lens),
+                jnp.asarray(cu_q_lens),
+                start,
+                end,
+                cp_rank,
+                max_steps,
+                chunk_token_start=chunk_start,
+                chunk_tokens=chunk_tokens or max_num_tokens,
+                **common,
+            )
+            self.assertEqual(num_steps, int(ref.num_steps[m]))
+            self.assertLessEqual(num_steps, max_steps)
+            want = (ref.batch_tile_idx, ref.bq_idx, ref.bkv_idx)
+            for got, full in zip(tables, want):
+                np.testing.assert_array_equal(
+                    got, np.asarray(full)[offset : offset + num_steps]
+                )
+            offset += num_steps
+        if end > start:
+            self.assertGreater(offset, 0)
+
+
+class PackedDecodeScheduleTest(parameterized.TestCase):
+    """`build_packed_decode_schedule` packs exactly the blocks each decode needs."""
+
+    @parameterized.named_parameters(
+        ("ragged", [9000, 2000, 7000, 30000, 0, 0, 0, 0], 0, 4, None, 1),
+        ("odd_count_cp", [90000, 20000, 70000, 3, 64000, 0, 0, 0], 0, 5, None, 16),
+        ("single", [77000, 0, 0, 0, 0, 0, 0, 0], 0, 1, None, 1),
+        ("chunked", [9000, 2000, 7000, 30000, 5000, 100, 0, 0], 0, 6, (4, 4), 1),
+        ("empty", [9000, 2000, 0, 0, 0, 0, 0, 0], 2, 2, None, 1),
+    )
+    def test_items_are_each_sequences_own_blocks(
+        self, seq_lens, start, end, chunk, cp_size
+    ):
+        seq_batch_size, bkv_sz, interleave_c = 4, 256, 4
+        seq_lens = np.asarray(seq_lens, np.int32)
+        cu_q_lens = np.zeros(9, np.int32)
+        cu_q_lens[1 : end + 1] = np.arange(1, end + 1)
+        cu_q_lens[end + 1 :] = end
+        chunk_start, chunk_tokens = chunk or (None, 16)
+        max_items = 512
+        num_steps, (seqs, bqs, bkvs) = _in_kernel_schedule(
+            jnp.asarray(seq_lens),
+            jnp.asarray(cu_q_lens),
+            start,
+            end,
+            0,
+            max_items,
+            build=metadata.build_packed_decode_schedule,
+            entries_per_step=seq_batch_size,
+            bkv_sz=bkv_sz,
+            compression_ratio=1,
+            seq_batch_size=seq_batch_size,
+            chunk_token_start=chunk_start,
+            chunk_tokens=chunk_tokens,
+            cp_size=cp_size,
+            interleave_c=interleave_c,
+        )
+        want = []
+        for i in range(start, end):
+            if chunk_start is not None and not (
+                chunk_start <= cu_q_lens[i] < chunk_start + chunk_tokens
+            ):
+                continue
+            kv_len = int(
+                metadata.cp_local_length(seq_lens[i], 0, cp_size, interleave_c)
+            )
+            want += [(i, j) for j in range(-(-kv_len // bkv_sz))]
+        self.assertEqual(num_steps, -(-len(want) // seq_batch_size))
+        padded = want + want[-1:] * (num_steps * seq_batch_size - len(want))
+        self.assertEqual(list(zip(seqs.tolist(), bkvs.tolist())), padded)
+        np.testing.assert_array_equal(bqs, 0)
+
+
+class MergeRowBoundsTest(parameterized.TestCase):
+    """`_merge_row_bounds` partitions rows into <=256-row blocks without <32 tails."""
+
+    @parameterized.named_parameters(
+        ("small_single_block", 64, [0, 64]),
+        ("exact_one_block", 256, [0, 256]),
+        ("exact_four_blocks", 1024, [0, 256, 512, 768, 1024]),
+        ("tail_below_32_coalesced", 256 + 16, [0, 272]),
+        ("tail_at_32_kept_separate", 256 + 32, [0, 256, 288]),
+        ("two_blocks_plus_tiny_tail", 512 + 8, [0, 256, 520]),
+    )
+    def test_merge_row_bounds_partition(self, num_rows, expected_bounds):
+        import importlib
+
+        st_mod = importlib.import_module(
+            "vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.streamindex_topk"
+        )
+        bounds = st_mod._merge_row_bounds(num_rows)
+        self.assertEqual(bounds, expected_bounds)
+        self.assertEqual(bounds[0], 0)
+        self.assertEqual(bounds[-1], num_rows)
+        for lo, hi in zip(bounds[:-1], bounds[1:]):
+            self.assertGreaterEqual(hi - lo, min(32, num_rows))
+
+
+def _import_sparse_mla_kernel():
+    import sys
+    import types
+
+    if "torch" not in sys.modules:
+        fake_torch = types.ModuleType("torch")
+        fake_torch.Tensor = object
+        fake_torch.dtype = object
+        sys.modules["torch"] = fake_torch
+    if "torch_tpu" not in sys.modules:
+        fake_tt = types.ModuleType("torch_tpu")
+        fake_tt_int = types.ModuleType("torch_tpu._internal")
+        fake_tt_pallas = types.ModuleType("torch_tpu._internal.pallas")
+        fake_tt_pallas.pallas = object()
+        sys.modules["torch_tpu"] = fake_tt
+        sys.modules["torch_tpu._internal"] = fake_tt_int
+        sys.modules["torch_tpu._internal.pallas"] = fake_tt_pallas
+    from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_kernel
+
+    return sparse_kernel
+
+
+class SparseMlaChunkLoopTest(parameterized.TestCase):
+    """`_slice_rows` and `lax.fori_loop` over chunks in `mla/sparse/kernel.py`."""
+
+    def test_slice_rows_static_and_dynamic(self):
+        sparse_kernel = _import_sparse_mla_kernel()
+
+        x = jnp.arange(64 * 4, dtype=jnp.int32).reshape(64, 4)
+        static_slice = sparse_kernel._slice_rows(x, 16, 8)
+        np.testing.assert_array_equal(np.asarray(static_slice), np.asarray(x[16:24]))
+
+        @jax.jit
+        def _traced_slice(arr, start):
+            return sparse_kernel._slice_rows(arr, start, 8)
+
+        traced_slice = _traced_slice(x, jnp.int32(16))
+        np.testing.assert_array_equal(np.asarray(traced_slice), np.asarray(x[16:24]))
+
+    @parameterized.named_parameters(
+        ("single_chunk_unrolled", 64, 64),
+        ("four_full_chunks_fori_loop", 256, 64),
+        ("four_full_chunks_plus_tail", 272, 64),
+    )
+    def test_sparse_ragged_paged_attention_fori_loop_and_tail(
+        self, num_tokens, chunk_size
+    ):
+        from unittest import mock
+
+        sparse_kernel = _import_sparse_mla_kernel()
+
+        def _stub_chunk(
+            q,
+            cache_kv_nope,
+            cache_kv_rope,
+            kv_lens,
+            physical_indices,
+            lse,
+            *,
+            start_pos,
+            end_pos,
+            chunk_size,
+            **kwargs,
+        ):
+            del cache_kv_nope, cache_kv_rope, kv_lens, physical_indices, end_pos, kwargs
+            rows = sparse_kernel._slice_rows(q, start_pos, chunk_size)
+            updated = rows + jnp.float32(1.0)
+            q = jax.lax.dynamic_update_slice_in_dim(q, updated, start_pos, axis=0)
+            if lse is not None:
+                lse_rows = sparse_kernel._slice_rows(lse, start_pos, chunk_size)
+                lse = jax.lax.dynamic_update_slice_in_dim(
+                    lse, jnp.zeros_like(lse_rows) + jnp.float32(2.0), start_pos, axis=0
+                )
+                return q, lse
+            return q
+
+        q = jnp.arange(num_tokens * 8 * 128, dtype=jnp.float32).reshape(
+            num_tokens, 8, 128
+        )
+        cache_nope = jnp.zeros((4, 64, 128), dtype=jnp.uint32)
+        cache_rope = jnp.zeros((4, 16, 128), dtype=jnp.uint32)
+        topk_indices = jnp.zeros((num_tokens, 64), dtype=jnp.int32)
+        cu_q_lens = jnp.array([0, num_tokens], dtype=jnp.int32)
+        distribution = jnp.array([0, 0, 1], dtype=jnp.int32)
+
+        with mock.patch.object(sparse_kernel, "sparse_attention_chunk", _stub_chunk):
+            out, lse = sparse_kernel.sparse_ragged_paged_attention.__wrapped__(
+                q,
+                cache_nope,
+                cache_rope,
+                topk_indices,
+                None,
+                cu_q_lens,
+                distribution,
+                gather_and_attention_chunk_size=chunk_size,
+                cache_layout=sparse_kernel.SPARSECORE_CACHE_LAYOUT,
+                return_lse=True,
+                lse_lane_dense=True,
+            )
+        np.testing.assert_allclose(np.asarray(out), np.asarray(q) + 1.0)
+        np.testing.assert_allclose(np.asarray(lse), 2.0)
 
 
 if __name__ == "__main__":

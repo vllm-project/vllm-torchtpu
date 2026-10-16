@@ -14,6 +14,7 @@
 """Calculates batch_tile_idx, bq_idx, and bkv_idx for the 1D pipeline schedule."""
 
 import dataclasses
+import functools
 from typing import Any
 
 import jax
@@ -158,6 +159,48 @@ def _check_smem_budget(
         f"(page_size={page_size}, cp_size={cp_size}, num_seqs={num_seqs}). "
         f"Raise --block-size to cut pages_per_seq."
     )
+
+
+def chunk_steps_bound(
+    max_num_seqs: int,
+    bq_sz: int,
+    bkv_sz: int,
+    pages_per_seq: int,
+    page_size: int,
+    max_num_tokens: int,
+    static_q_len: int | None,
+    seq_batch_size: int,
+    chunk_tokens: int | None,
+) -> int:
+    """Upper bound on one chunk's pipeline steps; `chunk_tokens=None` is unchunked."""
+    max_seq_tiles = pl.cdiv(max_num_seqs, seq_batch_size)
+    if static_q_len == 1:
+        total_max_bq = max_seq_tiles
+    elif static_q_len is not None:
+        total_max_bq = max_seq_tiles * max(1, pl.cdiv(static_q_len, bq_sz))
+    else:
+        # Here, cdiv(max_q_len_ub, bq_sz) covers the total token volume, while
+        # + max_seq_tiles accounts for up to one partially filled tail block per
+        # sequence tile.
+        max_q_len_ub = next_power_of_2(max_num_tokens)
+        total_max_bq = max(1, pl.cdiv(max_q_len_ub, bq_sz)) + max_seq_tiles
+
+    max_kv_pages_per_block = max(1, bkv_sz // page_size) if bkv_sz >= page_size else 1
+    max_bkv = max(1, pl.cdiv(pages_per_seq, max_kv_pages_per_block))
+
+    if chunk_tokens is None:
+        return total_max_bq * max_bkv
+    # A chunk can cut across a sequence tile, in which case we compute the
+    # block holding the seam twice: once for the tail of the first sequence,
+    # once for the head of the next. That is one extra block per tile the
+    # chunk touches, and it touches at most max_seq_tiles tiles, or at most
+    # chunk_tokens of them since a touched tile owns at least one token.
+    per_chunk_bq = min(
+        total_max_bq,
+        pl.cdiv(chunk_tokens, seq_batch_size * bq_sz)
+        + min(max_seq_tiles, chunk_tokens),
+    )
+    return per_chunk_bq * max_bkv
 
 
 def compute_batched_seq_metadata(
@@ -377,6 +420,145 @@ def compute_batched_seq_metadata(
         )
 
     return jax.lax.cond(is_empty_pass, _empty_schedule, _compute_schedule)
+
+
+def build_chunk_schedule(
+    meta: MetadataRef,
+    seq_lens_ref: Any,
+    cu_q_lens_ref: Any,
+    start_seq_idx: jax.Array,
+    end_seq_idx: jax.Array,
+    *,
+    bq_sz: int,
+    bkv_sz: int,
+    compression_ratio: int,
+    static_q_len: int | None,
+    seq_batch_size: int,
+    chunk_token_start: int | None,
+    chunk_tokens: int,
+    cp_rank: jax.Array | int = 0,
+    cp_size: int = 1,
+    interleave_c: int = 1,
+) -> None:
+    """Writes one chunk's schedule into `meta`'s SMEM refs, inside the kernel.
+
+    The steps, and their order, are those `compute_batched_seq_metadata` gives
+    the chunk, built with O(num_seqs + num_steps) scalar work. Entries from
+    `meta.num_steps[0]` on are left unwritten.
+    """
+    max_num_seqs = seq_lens_ref.shape[0]
+    max_seq_tiles = pl.cdiv(max_num_seqs, seq_batch_size)
+
+    def in_pass(i):
+        return (i >= start_seq_idx) & (i < end_seq_idx)
+
+    def local_kv_len(i):
+        if i >= max_num_seqs:
+            return 0
+        kv_len = jnp.where(in_pass(i), seq_lens_ref[i], 0) // compression_ratio
+        return cp_local_length(kv_len, cp_rank, cp_size, interleave_c)
+
+    def tile_num_bq(first):
+        if chunk_token_start is not None:
+            # The tile keeps only the tokens this chunk owns, [lo, hi).
+            tok_start = cu_q_lens_ref[min(first, max_num_seqs)]
+            tok_end = cu_q_lens_ref[min(first + seq_batch_size, max_num_seqs)]
+            lo = jnp.minimum(jnp.maximum(chunk_token_start, tok_start), tok_end)
+            hi = jnp.minimum(
+                jnp.maximum(chunk_token_start + chunk_tokens, tok_start), tok_end
+            )
+            return pl.cdiv(hi - lo, seq_batch_size * bq_sz)
+        if static_q_len is not None:
+            return max(1, pl.cdiv(static_q_len, bq_sz))
+        max_q_len = functools.reduce(
+            jnp.maximum,
+            [
+                cu_q_lens_ref[i + 1] - cu_q_lens_ref[i]
+                for i in range(first, first + seq_batch_size)
+            ],
+        )
+        return jnp.maximum(1, pl.cdiv(max_q_len, bq_sz))
+
+    num_steps = jnp.int32(0)
+    for tile in range(max_seq_tiles):
+        first = tile * seq_batch_size
+        max_kv_len = functools.reduce(
+            jnp.maximum, [local_kv_len(first + b) for b in range(seq_batch_size)]
+        )
+        num_bkv = jnp.where(
+            in_pass(first), jnp.maximum(1, pl.cdiv(max_kv_len, bkv_sz)), 0
+        )
+
+        def bq_body(bq, step, first=first, num_bkv=num_bkv):
+            def bkv_body(bkv, step):
+                meta.batch_tile_idx[step] = jnp.int32(first)
+                meta.bq_idx[step] = bq
+                meta.bkv_idx[step] = bkv
+                return step + 1
+
+            return lax.fori_loop(0, num_bkv, bkv_body, step)
+
+        num_steps = lax.fori_loop(0, tile_num_bq(first), bq_body, num_steps)
+    meta.num_steps[0] = num_steps
+
+
+def build_packed_decode_schedule(
+    meta: MetadataRef,
+    seq_lens_ref: Any,
+    cu_q_lens_ref: Any,
+    start_seq_idx: jax.Array,
+    end_seq_idx: jax.Array,
+    *,
+    bkv_sz: int,
+    compression_ratio: int,
+    seq_batch_size: int,
+    chunk_token_start: int | None,
+    chunk_tokens: int,
+    cp_rank: jax.Array | int = 0,
+    cp_size: int = 1,
+    interleave_c: int = 1,
+) -> None:
+    """Schedules a pass of one-token decodes as packed (sequence, KV block) items.
+
+    Entry k of `meta.batch_tile_idx` / `meta.bkv_idx` is item k: a sequence and
+    one of its KV blocks (`bq_idx` is 0). Step p runs items [p * seq_batch_size,
+    (p + 1) * seq_batch_size), so a step's rows need not share a sequence and
+    each sequence costs only the blocks its own KV length needs, not the
+    longest one's. The last step is padded with copies of the last item.
+    """
+    num_items = jnp.int32(0)
+    for i in range(seq_lens_ref.shape[0]):
+        live = (i >= start_seq_idx) & (i < end_seq_idx)
+        if chunk_token_start is not None:
+            # The chunk that holds the sequence's (first) token scores it.
+            token = cu_q_lens_ref[i]
+            in_chunk = (token >= chunk_token_start) & (
+                token < chunk_token_start + chunk_tokens
+            )
+            live &= in_chunk & (token < cu_q_lens_ref[i + 1])
+        kv_len = jnp.where(live, seq_lens_ref[i], 0) // compression_ratio
+        kv_len = cp_local_length(kv_len, cp_rank, cp_size, interleave_c)
+
+        def item(bkv, k, i=i):
+            meta.batch_tile_idx[k] = jnp.int32(i)
+            meta.bq_idx[k] = jnp.int32(0)
+            meta.bkv_idx[k] = bkv
+            return k + 1
+
+        num_items = lax.fori_loop(0, pl.cdiv(kv_len, bkv_sz), item, num_items)
+
+    num_steps = pl.cdiv(num_items, seq_batch_size)
+    last = num_items - 1
+    for pad in range(seq_batch_size - 1):
+        k = num_items + pad
+
+        @pl.when(k < num_steps * seq_batch_size)
+        def _(k=k):
+            meta.batch_tile_idx[k] = meta.batch_tile_idx[last]
+            meta.bq_idx[k] = jnp.int32(0)
+            meta.bkv_idx[k] = meta.bkv_idx[last]
+
+    meta.num_steps[0] = num_steps
 
 
 def compute_metadata(

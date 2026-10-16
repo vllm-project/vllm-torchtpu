@@ -435,6 +435,29 @@ def _stage_group_ids(monkeypatch, b, n, k, **kwargs) -> list[int | None]:
     return seen
 
 
+def test_tiled_and_out_rows_validation():
+    """Verify argument validation on `tiled_out`, `out_rows`, and `col_map`."""
+    b, n, k = COOPERATIVE
+    assert _pick_partition(b, n, k) == 8
+    scores_coop = jnp.zeros((b, n), jnp.float32)
+
+    with pytest.raises(ValueError, match="tiled_out needs p == 1"):
+        sc_module.sparsecore_topk.__wrapped__(scores_coop, k, tiled_out=True)
+
+    with pytest.raises(ValueError, match="col_map needs p == 1"):
+        sc_module.sparsecore_topk.__wrapped__(scores_coop, k, col_map=(4, 64))
+
+    b1, n1, k1 = 32, 2048, 256
+    assert _pick_partition(b1, n1, k1) == 1
+    scores_p1 = jnp.zeros((b1, n1), jnp.float32)
+    with pytest.raises(ValueError, match="out_rows needs tiled_out"):
+        sc_module.sparsecore_topk.__wrapped__(
+            scores_p1, k1, tiled_out=False, out_rows=2 * b1
+        )
+    with pytest.raises(ValueError, match="col_map needs p == 1 and a power-of-two"):
+        sc_module.sparsecore_topk.__wrapped__(scores_p1, k1, col_map=(3, 64))
+
+
 @pytest.mark.parametrize(
     "shape,expected_p,kwargs,expected",
     [
@@ -497,4 +520,52 @@ def test_scheduling_group_ids_do_not_change_the_selection(kind):
     np.testing.assert_array_equal(
         np.sort(np.take_along_axis(scores, np.maximum(plain, 0), axis=1), axis=1),
         np.sort(np.take_along_axis(scores, np.maximum(grouped, 0), axis=1), axis=1),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Output placement.
+# --------------------------------------------------------------------------- #
+# `col_map`, `tiled_out` and `out_rows`/`into` change only where and in which
+# order the SparseCore writes each row and which value it writes for an index,
+# never the selection, so the result must equal the flat path's bit for bit.
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("col_map", [None, (4, 64)], ids=["unmapped", "mapped"])
+def test_tiled_in_place_output_matches_the_flat_one(col_map):
+    b, n, k = 32, 2048, 256
+    assert _pick_partition(b, n, k) == 1
+    rng = np.random.default_rng(SEED)
+    scores = jnp.asarray(_scores("random", 2 * b, n, rng))
+    row_lengths = jnp.asarray(rng.integers(0, n + 1, size=2 * b), jnp.int32)
+    offset = 12
+    mapping = {} if col_map is None else dict(col_map=col_map, col_offset=offset)
+
+    placed = None
+    flat = []
+    for m in range(2):
+        rows = slice(m * b, (m + 1) * b)
+        placed = sparsecore_topk(
+            scores[rows],
+            k,
+            row_lengths,
+            return_scores=True,
+            tiled_out=True,
+            out_rows=2 * b,
+            row_offset=m * b,
+            into=placed,
+            **mapping,
+        )
+        flat.append(
+            sparsecore_topk(scores[rows], k, row_lengths[rows], return_scores=True)
+        )
+
+    idx = np.concatenate([np.asarray(f[0]) for f in flat])
+    if col_map is not None:
+        block, stride = col_map
+        idx = np.where(idx >= 0, idx // block * stride + offset + idx % block, -1)
+    np.testing.assert_array_equal(np.asarray(placed[0]), idx)
+    np.testing.assert_array_equal(
+        np.asarray(placed[1]), np.concatenate([np.asarray(f[1]) for f in flat])
     )

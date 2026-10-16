@@ -94,6 +94,9 @@ def _topk_body(
     write_empty: bool,
     return_scores: bool,
     local_idxs_hbm: Any = None,
+    col_map: tuple[int, int] | None = None,
+    tiled: bool = False,
+    row_offset: int = 0,
 ):
     dcp_merge = local_idxs_hbm is not None
     num_subcores = 16
@@ -115,6 +118,7 @@ def _topk_body(
     col_base = s * slice_len
 
     lane_iota = jnp.arange(LANES, dtype=jnp.int32)
+    per_group = 128 // LANES  # vectors per 128-lane column group of a tiled row
     neg_inf_key = jnp.int32(KEY_NEG_INF)
 
     def vec_at(ref, idx):
@@ -431,13 +435,33 @@ def _topk_body(
         )(emit_ranked)
 
         if p == 1:
+            # Lane 1 of a row's lengths block carries the `col_map` offset.
+            col_offset = None if col_map is None else len_slice_vmem[pl.ds(0, LANES)][1]
+
+            def map_cols(slots, col_offset):
+                assert col_map is not None
+                block, stride = col_map
+                mapped = (
+                    jnp.right_shift(slots, block.bit_length() - 1) * stride
+                    + col_offset
+                    + jnp.bitwise_and(slots, block - 1)
+                )
+                return jnp.where(slots >= 0, mapped, -1)
 
             def copy_out(i):
-                out_vmem[pl.ds(i * LANES, LANES)] = rowbuf_vmem[pl.ds(i * LANES, LANES)]
+                slots = rowbuf_vmem[pl.ds(i * LANES, LANES)]
+                if col_map is not None:
+                    slots = map_cols(slots, col_offset)
+                # A tiled row block is [k // 128, 128]: one 128-lane column
+                # group per row.
+                dst = (
+                    (i // per_group, pl.ds(i % per_group * LANES, LANES))
+                    if tiled
+                    else (pl.ds(i * LANES, LANES),)
+                )
+                out_vmem[dst] = slots
                 if return_scores:
-                    keys_vmem[pl.ds(i * LANES, LANES)] = keybuf_vmem[
-                        pl.ds(i * LANES, LANES)
-                    ]
+                    keys_vmem[dst] = keybuf_vmem[pl.ds(i * LANES, LANES)]
 
             plsc.parallel_loop(0, k // LANES, unroll=4)(copy_out)
         else:
@@ -567,10 +591,25 @@ def _topk_body(
             ),
             pl.BlockSpec(
                 (LANES,),
-                lambda w: (w * cores_per_chip + flat,),
+                lambda w: (row_offset + w * cores_per_chip + flat,),
                 pipeline_mode=pl.Buffered(buf_count),
             ),
         )
+        if tiled:
+            # out_hbm is [rows // 8, k // 128, 8, 128]: the (8, 128)-tiled
+            # layout of [rows, k], so the caller's reshape to [rows, k] moves
+            # no data.
+            def out_index(w):
+                r = row_offset + w * cores_per_chip + flat
+                return (r // 8, 0, r % 8, 0)
+
+            out_block: tuple[int | None, ...] = (None, k // 128, None, 128)
+        else:
+
+            def out_index(w):
+                return (w * cores_per_chip + flat,)
+
+            out_block = (k,)
         if return_scores:
 
             def pipeline_step_p1_scores(
@@ -580,13 +619,13 @@ def _topk_body(
 
             out_specs = (
                 pl.BlockSpec(
-                    (k,),
-                    lambda w: (w * cores_per_chip + flat,),
+                    out_block,
+                    out_index,
                     pipeline_mode=pl.Buffered(buf_count),
                 ),
                 pl.BlockSpec(
-                    (k,),
-                    lambda w: (w * cores_per_chip + flat,),
+                    out_block,
+                    out_index,
                     pipeline_mode=pl.Buffered(buf_count),
                 ),
             )
@@ -609,8 +648,8 @@ def _topk_body(
 
             out_specs = (
                 pl.BlockSpec(
-                    (k,),
-                    lambda w: (w * cores_per_chip + flat,),
+                    out_block,
+                    out_index,
                     pipeline_mode=pl.Buffered(buf_count),
                 ),
             )
@@ -649,13 +688,19 @@ def _topk_body(
 def _sc_topk_direct(
     scores: jax.Array,  # f32[b, n]
     k: int,
-    row_lengths: jax.Array,  # i32[b]
+    row_lengths: jax.Array,  # i32[b], or i32[out_rows] with out_rows
     *,
     local_idxs: jax.Array | None = None,  # i32[b, k]
     p: int = 1,
     write_empty: bool = True,
     return_scores: bool = True,
     scheduling_group_id: int | None = None,
+    col_map: tuple[int, int] | None = None,
+    col_offset: jax.Array | int = 0,
+    tiled: bool = False,
+    out_rows: int | None = None,
+    row_offset: int = 0,
+    into: jax.Array | tuple[jax.Array, jax.Array] | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:
     """Single-stage SparseCore top-k on 32 subcores.
 
@@ -665,6 +710,10 @@ def _sc_topk_direct(
 
     ``scores`` may be f32 or the same values already bitcast to i32; the kernel
     compares raw bits either way.
+
+    With ``out_rows`` (tiled only), the rows land at ``[row_offset, row_offset +
+    b)`` of ``[out_rows, k]`` buffers, which are returned whole: ``into``'s,
+    updated in place, or fresh ones whose other rows are left unwritten.
     """
     b, n = scores.shape
     info = pltpu.get_tpu_info()
@@ -686,10 +735,21 @@ def _sc_topk_direct(
     if pad_b > 0 or pad_n > 0:
         words = jnp.pad(words, ((0, pad_b), (0, pad_n)))
 
-    lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, padded_b - b))
+    if out_rows is None:
+        lengths = jnp.pad(row_lengths.astype(jnp.int32), (0, padded_b - b))
+    else:
+        # Every row block of the output reads its lengths from one [out_rows]
+        # block, so the blocks share the ops that build it.
+        lengths = row_lengths.astype(jnp.int32)
     if p > 1:
         lengths = jnp.repeat(lengths, p)
-    lengths_2d = jnp.pad(lengths[:, None], ((0, 0), (0, LANES - 1)))
+    if col_map is None:
+        lengths_2d = jnp.pad(lengths[:, None], ((0, 0), (0, LANES - 1)))
+    else:
+        offsets = jnp.broadcast_to(jnp.asarray(col_offset, jnp.int32), lengths.shape)
+        lengths_2d = jnp.pad(
+            jnp.stack([lengths, offsets], axis=1), ((0, 0), (0, LANES - 2))
+        )
 
     extra_inputs = ()
     if local_idxs is not None:
@@ -704,8 +764,36 @@ def _sc_topk_direct(
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
-    slot_type = jax.ShapeDtypeStruct((padded_b * k,), jnp.int32)
-    out_type = (slot_type, slot_type if return_scores else None)
+    rows = padded_b
+    if out_rows is not None:
+        if not tiled or pad_b or out_rows % 8 or row_offset + b > out_rows:
+            raise ValueError(
+                f"rows [{row_offset}, {row_offset + b}) of {out_rows=} need the"
+                " tiled layout, b % 32 == 0 and out_rows % 8 == 0"
+            )
+        if row_lengths.shape != (out_rows,):
+            raise ValueError(
+                f"row_lengths must be [{out_rows=}], got {row_lengths.shape}"
+            )
+        rows = out_rows
+    elif into is not None or row_offset:
+        raise ValueError("into and row_offset need out_rows.")
+    if tiled:
+        slot_type = jax.ShapeDtypeStruct((rows // 8, k // 128, 8, 128), jnp.int32)
+    else:
+        slot_type = jax.ShapeDtypeStruct((padded_b * k,), jnp.int32)
+    if into is None:
+        out_type: Any = (slot_type, slot_type if return_scores else None)
+        into_refs: tuple[Any, ...] = ()
+    else:
+        into_bufs = into if isinstance(into, tuple) else (into,)
+        out_type = ()
+        into_refs = tuple(
+            jax.new_ref(buf.reshape(rows // 8, 8, k // 128, 128).transpose(0, 2, 1, 3))
+            for buf in into_bufs
+        )
+        if not return_scores and len(into_refs) == 1:
+            into_refs = (into_refs[0], None)
 
     scratch_types = (
         pltpu.VMEM((NUM_BUCKETS + LANES,), jnp.int32),  # glob_vmem
@@ -742,6 +830,9 @@ def _sc_topk_direct(
         num_waves=num_waves,
         write_empty=write_empty,
         return_scores=return_scores,
+        col_map=col_map,
+        tiled=tiled,
+        row_offset=row_offset,
     )
     if local_idxs is not None:
         orig_body = body_fn
@@ -758,7 +849,12 @@ def _sc_topk_direct(
         scratch_types=scratch_types,
         mesh=mesh,
         name=f"sc_topk_direct_b{b}_n{n}_k{k}_p{p}",
-    )(words.reshape(-1), lengths_2d.reshape(-1), *extra_inputs)
+    )(words.reshape(-1), lengths_2d.reshape(-1), *extra_inputs, *into_refs)
+    if into is not None:
+        out = (
+            jax.freeze(into_refs[0]),
+            jax.freeze(into_refs[1]) if into_refs[1] is not None else None,
+        )
     if scheduling_group_id is not None:
         out = xla_metadata.set_xla_metadata(
             out, _scheduling_group_id=scheduling_group_id
@@ -766,6 +862,16 @@ def _sc_topk_direct(
     # pl.kernel and set_xla_metadata are untyped upstream; both return the
     # out_type pytree here.
     slots, keys = cast(tuple[jax.Array, jax.Array | None], out)
+    if tiled:
+        slots = slots.transpose(0, 2, 1, 3)
+        if keys is not None:
+            keys = keys.transpose(0, 2, 1, 3)
+    if out_rows is not None:
+        slots_2d = slots.reshape(out_rows, k)
+        if return_scores:
+            assert keys is not None
+            return slots_2d, keys.reshape(out_rows, k)
+        return slots_2d
     slots_2d = slots.reshape(padded_b, k)[:b]
     if return_scores:
         assert keys is not None
@@ -803,6 +909,10 @@ def _pick_partition(b: int, n: int, k: int) -> int:
         "write_empty_rows",
         "scheduling_group_id",
         "return_scores",
+        "col_map",
+        "tiled_out",
+        "out_rows",
+        "row_offset",
     ),
 )
 def sparsecore_topk(
@@ -813,6 +923,12 @@ def sparsecore_topk(
     write_empty_rows: bool = True,
     scheduling_group_id: int | None = None,
     return_scores: bool = False,
+    col_map: tuple[int, int] | None = None,
+    col_offset: jax.Array | int = 0,
+    tiled_out: bool = False,
+    out_rows: int | None = None,
+    row_offset: int = 0,
+    into: jax.Array | tuple[jax.Array, jax.Array] | None = None,
 ) -> jax.Array | tuple[jax.Array, jax.Array]:  # i32[b, k] or (i32[b, k], i32[b, k])
     """Exact top-k indices per row, unsorted, -1 suffix-padded.
 
@@ -823,6 +939,23 @@ def sparsecore_topk(
 
     ``scores`` may be f32 or i32 holding those f32 bits; the comparison is on
     raw bits either way.
+
+    ``col_map=(block, stride)`` returns column ``i`` as
+    ``(i // block) * stride + col_offset + i % block`` (``block`` a power of
+    two), computed as the SparseCore writes the row out, so a caller whose
+    columns are a strided slice of a wider axis gets positions on that axis with
+    no pass of its own. ``p == 1`` shapes only.
+
+    ``tiled_out`` has the SparseCore write rows in the (8, 128)-tiled order of
+    ``[b, k]`` instead of flat, so the result needs no relayout copy before a
+    tiled consumer. ``p == 1`` shapes with ``k % 128 == 0`` only.
+
+    ``out_rows`` (with ``tiled_out`` and ``b % 32 == 0``) writes the result into
+    rows ``[row_offset, row_offset + b)`` of ``[out_rows, k]`` buffers and
+    returns them whole, so a caller assembling row blocks needs no concatenate:
+    ``into`` (indices, or (indices, scores)) are updated in place, or without it
+    fresh buffers are allocated with the other rows unwritten. ``row_lengths``
+    then covers all ``out_rows`` rows, of which the call reads its own.
     """
     if scores.ndim != 2:
         raise ValueError(f"scores must be 2D, got {scores.shape}")
@@ -835,11 +968,22 @@ def sparsecore_topk(
         raise ValueError(f"{k=} must be a positive multiple of {LANES}, at most 4096")
 
     if row_lengths is None:
-        row_lengths = jnp.full((b,), n, jnp.int32)
+        row_lengths = jnp.full((b if out_rows is None else out_rows,), n, jnp.int32)
     else:
         row_lengths = row_lengths.astype(jnp.int32)
 
     p = _pick_partition(b, n, k)
+    if col_map is not None:
+        block, _ = col_map
+        if p != 1 or block < 1 or block & (block - 1):
+            raise ValueError(
+                f"col_map needs p == 1 and a power-of-two block; {p=} {col_map=}"
+            )
+    if tiled_out and (p != 1 or k % 128):
+        raise ValueError(f"tiled_out needs p == 1 and k % 128 == 0; {p=} {k=}")
+    if out_rows is not None and not tiled_out:
+        raise ValueError("out_rows needs tiled_out.")
+
     return _sc_topk_direct(
         scores,
         k,
@@ -848,6 +992,12 @@ def sparsecore_topk(
         write_empty=write_empty_rows,
         return_scores=return_scores,
         scheduling_group_id=scheduling_group_id,
+        col_map=col_map,
+        col_offset=col_offset,
+        tiled=tiled_out,
+        out_rows=out_rows,
+        row_offset=row_offset,
+        into=into,
     )
 
 

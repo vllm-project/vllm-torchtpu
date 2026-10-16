@@ -803,20 +803,8 @@ def test_pallas_smem_oom_when_unclamped(monkeypatch):
     """Verifies that Pallas compilation of _scores_kernel fails with SMEM OOM"""
     from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import metadata
 
-    orig_compute_metadata = metadata.compute_metadata
-
-    def _mock_compute_metadata(*args, **kwargs):
-        res = orig_compute_metadata(*args, **kwargs)
-        # Return metadata arrays of length 100,000.
-        # In Pallas, 100,000 steps require ~2.4 MB of SMEM.
-        return metadata.MetadataRef.create(
-            num_steps=res.num_steps,
-            batch_tile_idx=jnp.zeros((100000,), dtype=jnp.int32),
-            bq_idx=jnp.zeros((100000,), dtype=jnp.int32),
-            bkv_idx=jnp.zeros((100000,), dtype=jnp.int32),
-        )
-
-    monkeypatch.setattr(metadata, "compute_metadata", _mock_compute_metadata)
+    # Schedule tables of 100,000 steps each need ~1.2 MB of SMEM.
+    monkeypatch.setattr(metadata, "chunk_steps_bound", lambda **_: 100000)
 
     num_seqs = 32
     seq_len = 128
@@ -1369,9 +1357,8 @@ class TestChunkedPipelining:
                 _fragmented_pages(2), 16, _HAS,
                 id="partial_query_block",
             ),
-            # 14. Ten decodes, so `decode_batch_end` is 10 // 4 * 4 = 8 and
-            # the ragged remainder pass (seq_batch_size=1) covers sequences
-            # [8, 10).
+            # 14. Ten decodes: the packed decode pass takes the two past the
+            # last full group of four as well.
             pytest.param(
                 11, (1,) * 10 + (118,), (512,) * 11, 128, 4, 128, 128, 1, 8, 2,
                 _fragmented_pages(11), 32, _HAS,

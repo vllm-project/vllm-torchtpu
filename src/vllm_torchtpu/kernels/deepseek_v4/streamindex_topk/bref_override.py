@@ -22,9 +22,14 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 
-def _step_offset(meta_ref: Any, chunk_idx: int):
-    """Flat schedule row where chunk `chunk_idx`'s pipeline steps begin."""
-    return sum(meta_ref.num_steps[m] for m in range(chunk_idx))
+def step_item(meta_ref: Any, p_id, batch_idx: int, seq_batch_size: int):
+    """(sequence, KV block) that row `batch_idx` of pipeline step `p_id` scores.
+
+    With `seq_batch_size > 1` the schedule holds packed decode items, one per
+    row; see `metadata.build_packed_decode_schedule`.
+    """
+    k = p_id if seq_batch_size == 1 else p_id * seq_batch_size + batch_idx
+    return meta_ref.batch_tile_idx[k], meta_ref.bkv_idx[k]
 
 
 def _token_window(
@@ -34,17 +39,19 @@ def _token_window(
     *,
     bq_sz: int,
     seq_batch_size: int,
-    chunk_idx: int = 0,
 ):
-    """Flat-token rows one pipeline step covers, as (token_start, size)."""
+    """Flat-token rows one pipeline step covers, as (token_start, size).
+
+    Packed decode steps (`seq_batch_size > 1`) gather one token per row, so they
+    have no single start and only the size is meaningful.
+    """
+    if seq_batch_size > 1:
+        return None, seq_batch_size
     _, cu_q_lens_ref, meta_ref, start_end_seq_idx_ref = refs
     chunk_start = start_end_seq_idx_ref[2]
-    p_id = p_id + _step_offset(meta_ref, chunk_idx)
     seq_idx = meta_ref.batch_tile_idx[p_id]
     lo = jnp.maximum(cu_q_lens_ref[seq_idx], chunk_start)
 
-    if seq_batch_size > 1:
-        return lo, seq_batch_size
     token_start = lo + meta_ref.bq_idx[p_id] * bq_sz
     if bq_sz == 1:
         return token_start, 1
@@ -64,7 +71,6 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
     kv_packing: int = dataclasses.field(default=4, metadata=dict(static=True))
     pages_per_seq: int = dataclasses.field(default=1, metadata=dict(static=True))
     seq_batch_size: int = dataclasses.field(default=1, metadata=dict(static=True))
-    chunk_idx: int = dataclasses.field(default=0, metadata=dict(static=True))
 
     @classmethod
     def create(  # pytype: disable=signature-mismatch
@@ -80,7 +86,6 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
         pages_per_seq: int,
         seq_batch_size: int,
         grid_rank: int = 1,
-        chunk_idx: int = 0,
     ):
         assert buffer_type == pltpu.BufferType.INPUT
         standard_ref = pltpu.BufferedRef.create(
@@ -97,7 +102,6 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
             kv_packing=kv_packing,
             pages_per_seq=pages_per_seq,
             seq_batch_size=seq_batch_size,
-            chunk_idx=chunk_idx,
             **{
                 f.name: getattr(standard_ref, f.name)
                 for f in dataclasses.fields(pltpu.BufferedRef)
@@ -117,7 +121,6 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
         pages_per_seq: int,
         seq_batch_size: int,
         grid_rank: int = 1,
-        chunk_idx: int = 0,
         **kwargs: Any,
     ):
         return cls.create(
@@ -132,7 +135,6 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
             pages_per_seq=pages_per_seq,
             seq_batch_size=seq_batch_size,
             grid_rank=grid_rank,
-            chunk_idx=chunk_idx,
         )
 
     def copy_in(  # pytype: disable=attribute-error
@@ -141,9 +143,7 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
         grid_indices: tuple[int | jax.Array, ...],
     ):
         cache_kv_hbm, page_indices_ref, meta_ref = src_ref
-        p_id = grid_indices[0] + _step_offset(meta_ref, self.chunk_idx)
-        batch_tile_idx = meta_ref.batch_tile_idx[p_id]
-        bkv_idx = meta_ref.bkv_idx[p_id]
+        p_id = grid_indices[0]
 
         assert self.sem_recvs is not None
         assert self.window_ref is not None
@@ -161,13 +161,11 @@ class StreamIndexKVBufferedRef(pltpu.BufferedRef):
         )
         max_hbm_pages = reshaped_cache_hbm_ref.shape[0]
         num_page_indices = page_indices_ref.shape[0]
-        effective_seq_idx = batch_tile_idx
 
         for batch_idx in range(self.seq_batch_size):
+            seq_idx, bkv_idx = step_item(meta_ref, p_id, batch_idx, self.seq_batch_size)
             kv_p_start = bkv_idx * self.bkv_p
-            page_indices_offset = (
-                effective_seq_idx + batch_idx
-            ) * self.pages_per_seq + kv_p_start
+            page_indices_offset = seq_idx * self.pages_per_seq + kv_p_start
             for i in range(self.bkv_p):
                 page_idx = jnp.minimum(page_indices_offset + i, num_page_indices - 1)
                 safe_page_offset = jnp.minimum(
@@ -224,7 +222,6 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
     page_size: int = dataclasses.field(default=128, metadata=dict(static=True))
     pages_per_seq: int = dataclasses.field(default=1, metadata=dict(static=True))
     seq_batch_size: int = dataclasses.field(default=1, metadata=dict(static=True))
-    chunk_idx: int = dataclasses.field(default=0, metadata=dict(static=True))
 
     @classmethod
     def create(  # pytype: disable=signature-mismatch
@@ -239,7 +236,6 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
         pages_per_seq: int,
         seq_batch_size: int,
         grid_rank: int = 1,
-        chunk_idx: int = 0,
     ):
         assert buffer_type == pltpu.BufferType.INPUT
         standard_ref = pltpu.BufferedRef.create(
@@ -255,7 +251,6 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
             page_size=page_size,
             pages_per_seq=pages_per_seq,
             seq_batch_size=seq_batch_size,
-            chunk_idx=chunk_idx,
             **{
                 f.name: getattr(standard_ref, f.name)
                 for f in dataclasses.fields(pltpu.BufferedRef)
@@ -274,7 +269,6 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
         pages_per_seq: int,
         seq_batch_size: int,
         grid_rank: int = 1,
-        chunk_idx: int = 0,
         **kwargs: Any,
     ):
         return cls.create(
@@ -288,7 +282,6 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
             pages_per_seq=pages_per_seq,
             seq_batch_size=seq_batch_size,
             grid_rank=grid_rank,
-            chunk_idx=chunk_idx,
         )
 
     def copy_in(  # pytype: disable=attribute-error
@@ -297,9 +290,7 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
         grid_indices: tuple[int | jax.Array, ...],
     ):
         cache_kv_hbm, page_indices_ref, meta_ref = src_ref
-        p_id = grid_indices[0] + _step_offset(meta_ref, self.chunk_idx)
-        batch_tile_idx = meta_ref.batch_tile_idx[p_id]
-        bkv_idx = meta_ref.bkv_idx[p_id]
+        p_id = grid_indices[0]
 
         assert self.sem_recvs is not None
         assert self.window_ref is not None
@@ -310,13 +301,11 @@ class StreamIndexKVSeqAlongLaneBufferedRef(pltpu.BufferedRef):
 
         max_hbm_pages = cache_kv_hbm.shape[0]
         num_page_indices = page_indices_ref.shape[0]
-        effective_seq_idx = batch_tile_idx
 
         for batch_idx in range(self.seq_batch_size):
+            seq_idx, bkv_idx = step_item(meta_ref, p_id, batch_idx, self.seq_batch_size)
             kv_p_start = bkv_idx * self.bkv_p
-            page_indices_offset = (
-                effective_seq_idx + batch_idx
-            ) * self.pages_per_seq + kv_p_start
+            page_indices_offset = seq_idx * self.pages_per_seq + kv_p_start
             for i in range(self.bkv_p):
                 page_idx = jnp.minimum(page_indices_offset + i, num_page_indices - 1)
                 safe_page = jnp.minimum(page_indices_ref[page_idx], max_hbm_pages - 1)
@@ -364,7 +353,6 @@ class StreamIndexQBufferedRef(pltpu.BufferedRef):
     bq_sz: int = dataclasses.field(default=16, metadata=dict(static=True))
     seq_batch_size: int = dataclasses.field(default=1, metadata=dict(static=True))
     chunk_tokens: int = dataclasses.field(default=0, metadata=dict(static=True))
-    chunk_idx: int = dataclasses.field(default=0, metadata=dict(static=True))
 
     @classmethod
     def create(  # pytype: disable=signature-mismatch
@@ -378,7 +366,6 @@ class StreamIndexQBufferedRef(pltpu.BufferedRef):
         chunk_tokens: int,
         seq_batch_size: int = 1,
         grid_rank: int = 1,
-        chunk_idx: int = 0,
     ):
         assert buffer_type == pltpu.BufferType.INPUT
         standard_ref = pltpu.BufferedRef.create(
@@ -393,7 +380,6 @@ class StreamIndexQBufferedRef(pltpu.BufferedRef):
             bq_sz=bq_sz,
             seq_batch_size=seq_batch_size,
             chunk_tokens=chunk_tokens,
-            chunk_idx=chunk_idx,
             **{
                 f.name: getattr(standard_ref, f.name)
                 for f in dataclasses.fields(pltpu.BufferedRef)
@@ -411,7 +397,6 @@ class StreamIndexQBufferedRef(pltpu.BufferedRef):
         chunk_tokens: int,
         seq_batch_size: int = 1,
         grid_rank: int = 1,
-        chunk_idx: int = 0,
         **kwargs: Any,
     ):
         return cls.create(
@@ -424,7 +409,6 @@ class StreamIndexQBufferedRef(pltpu.BufferedRef):
             seq_batch_size=seq_batch_size,
             chunk_tokens=chunk_tokens,
             grid_rank=grid_rank,
-            chunk_idx=chunk_idx,
         )
 
     def copy_in(  # pytype: disable=attribute-error
@@ -439,13 +423,26 @@ class StreamIndexQBufferedRef(pltpu.BufferedRef):
         sem = self.sem_recvs.at[slot]
         vmem_dst: Any = self.window_ref.at[slot]  # pytype: disable=attribute-error
 
+        if self.seq_batch_size > 1:
+            # Packed decode items: each row is its own sequence's single token.
+            _, cu_q_lens_ref, meta_ref, _ = src_ref
+            for batch_idx in range(self.seq_batch_size):
+                seq_idx, _ = step_item(
+                    meta_ref, grid_indices[0], batch_idx, self.seq_batch_size
+                )
+                pltpu.make_async_copy(
+                    q_hbm.at[pl.ds(cu_q_lens_ref[seq_idx], 1)],
+                    vmem_dst.at[pl.ds(batch_idx, 1)],  # pytype: disable=attribute-error
+                    sem,
+                ).start()
+            return
+
         q_len_start, total_sz = _token_window(
             src_ref,
             grid_indices[0],
             self.chunk_tokens,
             bq_sz=self.bq_sz,
             seq_batch_size=self.seq_batch_size,
-            chunk_idx=self.chunk_idx,
         )
 
         pltpu.make_async_copy(
@@ -474,7 +471,6 @@ class StreamIndexQBufferedRef(pltpu.BufferedRef):
             self.chunk_tokens,
             bq_sz=self.bq_sz,
             seq_batch_size=self.seq_batch_size,
-            chunk_idx=self.chunk_idx,
         )
 
         pltpu.make_async_copy(
@@ -492,7 +488,6 @@ class StreamIndexOBufferedRef(pltpu.BufferedRef):
     bq_sz: int = dataclasses.field(default=16, metadata=dict(static=True))
     num_sublanes: int = dataclasses.field(default=1, metadata=dict(static=True))
     seq_batch_size: int = dataclasses.field(default=1, metadata=dict(static=True))
-    chunk_idx: int = dataclasses.field(default=0, metadata=dict(static=True))
 
     @classmethod
     def create(  # pytype: disable=signature-mismatch
@@ -506,7 +501,6 @@ class StreamIndexOBufferedRef(pltpu.BufferedRef):
         num_sublanes: int,
         seq_batch_size: int = 1,
         grid_rank: int = 1,
-        chunk_idx: int = 0,
     ):
         assert buffer_type == pltpu.BufferType.OUTPUT
         standard_ref = pltpu.BufferedRef.create(
@@ -521,7 +515,6 @@ class StreamIndexOBufferedRef(pltpu.BufferedRef):
             bq_sz=bq_sz,
             num_sublanes=num_sublanes,
             seq_batch_size=seq_batch_size,
-            chunk_idx=chunk_idx,
             **{
                 f.name: getattr(standard_ref, f.name)
                 for f in dataclasses.fields(pltpu.BufferedRef)
@@ -539,7 +532,6 @@ class StreamIndexOBufferedRef(pltpu.BufferedRef):
         num_sublanes: int,
         seq_batch_size: int = 1,
         grid_rank: int = 1,
-        chunk_idx: int = 0,
         **kwargs: Any,
     ):
         return cls.create(
@@ -552,7 +544,6 @@ class StreamIndexOBufferedRef(pltpu.BufferedRef):
             num_sublanes=num_sublanes,
             seq_batch_size=seq_batch_size,
             grid_rank=grid_rank,
-            chunk_idx=chunk_idx,
         )
 
     def copy_out(  # pytype: disable=attribute-error
@@ -560,10 +551,7 @@ class StreamIndexOBufferedRef(pltpu.BufferedRef):
         dst_ref: tuple[Any, ...],
         grid_indices: tuple[int | jax.Array, ...],
     ):
-        scores_hbm, _, meta_ref, start_end_seq_idx_ref = dst_ref
-        bkv_idx = meta_ref.bkv_idx[
-            grid_indices[0] + _step_offset(meta_ref, self.chunk_idx)
-        ]
+        scores_hbm, cu_q_lens_ref, meta_ref, start_end_seq_idx_ref = dst_ref
 
         assert self.sem_sends is not None
         assert self.window_ref is not None
@@ -571,13 +559,32 @@ class StreamIndexOBufferedRef(pltpu.BufferedRef):
         sem = self.sem_sends.at[slot]
         vmem_src: Any = self.window_ref.at[slot]  # pytype: disable=attribute-error
 
+        if self.seq_batch_size > 1:
+            # Packed decode items: row b lands in its own sequence's token row,
+            # at its own KV block.
+            for batch_idx in range(self.seq_batch_size):
+                seq_idx, bkv_idx = step_item(
+                    meta_ref, grid_indices[0], batch_idx, self.seq_batch_size
+                )
+                dst_row = cu_q_lens_ref[seq_idx] - start_end_seq_idx_ref[2]
+                pltpu.make_async_copy(
+                    vmem_src.at[pl.ds(batch_idx, 1)],  # pytype: disable=attribute-error
+                    scores_hbm.at[
+                        pl.ds(dst_row, 1),
+                        pl.ds(bkv_idx * self.num_sublanes, self.num_sublanes),
+                    ],
+                    sem,
+                ).start()
+            return
+
+        bkv_idx = meta_ref.bkv_idx[grid_indices[0]]
+
         token_start, total_sz = _token_window(
             dst_ref,
             grid_indices[0],
             scores_hbm.shape[0],
             bq_sz=self.bq_sz,
             seq_batch_size=self.seq_batch_size,
-            chunk_idx=self.chunk_idx,
         )
         # HBM scores hold one chunk, so rebase the write onto the chunk's start.
         dst_start = token_start - start_end_seq_idx_ref[2]
@@ -613,7 +620,6 @@ class StreamIndexOBufferedRef(pltpu.BufferedRef):
             dst_ref[0].shape[0],
             bq_sz=self.bq_sz,
             seq_batch_size=self.seq_batch_size,
-            chunk_idx=self.chunk_idx,
         )
 
         unpadded_src = self._unpadded_slice(vmem_src, total_sz)
