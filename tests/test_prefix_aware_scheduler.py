@@ -103,7 +103,17 @@ def test_promotes_warmest_within_window():
         assert s.schedule(throttle_prefills=True) is expected
 
 
+def test_promotes_waiting_while_kv_holding_waiting_is_not_empty():
+    now = time.time()
+    r_cold = _make_request("cold", num_tokens=1000, arrival_time=now - 10)
+    r_warm = _make_request("warm", num_tokens=1000, arrival_time=now - 5)
+    s = _make_scheduler([r_cold, r_warm], {"cold": 0, "warm": 800})
+    loading = _make_request("loading", num_computed_tokens=900)
+    s.kv_holding_waiting.add_request(loading)
+
     q = s._select_waiting_queue_for_scheduling()
+    assert q is s.kv_holding_waiting
+    assert [r.request_id for r in s.waiting] == ["warm", "cold"]
 
 
 def test_ranks_by_uncached_tokens_not_hit_ratio():
@@ -321,7 +331,9 @@ def test_waiting_loop_stop_reason_and_admission_telemetry():
     s = PrefixAwareScheduler.__new__(PrefixAwareScheduler)
     s.running = []
     s.waiting = [object()]
+    s.kv_holding_waiting = []
     s.max_num_scheduled_tokens = 8192
+    s.max_num_active_reqs = 32
     s.block_size = 640
     out = SimpleNamespace(total_num_scheduled_tokens=640, num_scheduled_tokens={})
 
@@ -336,8 +348,18 @@ def test_waiting_loop_stop_reason_and_admission_telemetry():
     assert s._waiting_loop_stop_reason(out, 1) == "other"
     full = SimpleNamespace(total_num_scheduled_tokens=8192, num_scheduled_tokens={})
     assert s._waiting_loop_stop_reason(full, 1) == "budget"
+    # A skipped request back in `waiting` is deferred, not unreached.
+    s.deferred_waiting = set(s.waiting)
+    assert s._waiting_loop_stop_reason(out, 1) == "drained"
+    s.deferred_waiting = set()
+    s.running = [object()] * 32
+    assert s._waiting_loop_stop_reason(out, 1) == "max_running"
+    s.running = []
     s.waiting = []
     assert s._waiting_loop_stop_reason(out, 0) == "idle"
+    s.kv_holding_waiting = [object()]
+    assert s._waiting_loop_stop_reason(out, 0) == "drained"
+    s.kv_holding_waiting = []
 
     s.waiting = [object()]
     s._record_step_telemetry(full, 0, "idle")
