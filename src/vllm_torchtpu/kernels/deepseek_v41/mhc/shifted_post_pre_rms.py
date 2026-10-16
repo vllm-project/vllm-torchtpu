@@ -42,6 +42,10 @@ def _truncate_bf16(values: jax.Array) -> jax.Array:
     return jax.lax.bitcast_convert_type(bits, jnp.float32)
 
 
+def is_supported_shape(t: int, m: int, d: int) -> bool:
+    return t > 0 and t % 32 == 0 and m == 4 and d == 5120
+
+
 def shifted_post_pre_rms(
     x: jax.Array,
     flat: jax.Array,
@@ -87,7 +91,7 @@ def shifted_post_pre_rms(
     info = pltpu.get_tpu_info()
     assert info.chip_version == pltpu.ChipVersion.TPU_7X, "Requires TPU7x"
     mixes = m * (m + 2)
-    assert t > 0 and t % 32 == 0 and m == 4 and d == 5120
+    assert is_supported_shape(t, m, d)
     gate_tokens = (t + 127) // 128 * 128
     tuning = PostPreTuning(token_tile, 32, 256, 50 * 1024 * 1024)
     tile, group, columns = (

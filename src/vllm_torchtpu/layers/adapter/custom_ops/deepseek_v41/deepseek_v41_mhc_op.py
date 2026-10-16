@@ -5,6 +5,7 @@
 from typing import Any
 
 import jax
+import jax.numpy as jnp
 import torch
 
 from vllm_torchtpu.kernels.deepseek_v41.mhc import shifted_post_pre_rms
@@ -29,6 +30,34 @@ def _post_pre_rms_jax(
     repeats: int,
     norm_eps: float,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    tokens, mult = pre.shape
+    dim = flat.shape[1] // mult
+    if not shifted_post_pre_rms.is_supported_shape(tokens, mult, dim):
+        from vllm_torchtpu.models.vllm.deepseek_v41.common.mhc import (
+            delayed_post_pre_flat_jax,
+        )
+
+        residual, next_post, next_comb, value, next_pre = delayed_post_pre_flat_jax(
+            x,
+            flat,
+            post,
+            comb,
+            weight,
+            scale,
+            base,
+            pre,
+            rms_eps,
+            pre_eps,
+            sinkhorn_eps,
+            post_multiplier,
+            repeats,
+        )
+        normalized = value.astype(jnp.float32) * jax.lax.rsqrt(
+            jnp.mean(jnp.square(value.astype(jnp.float32)), axis=-1, keepdims=True)
+            + norm_eps
+        )
+        value = (normalized * norm_weight.astype(jnp.float32)).astype(value.dtype)
+        return residual, next_post, next_comb, value, next_pre
     return shifted_post_pre_rms.shifted_post_pre_rms(
         x.reshape(flat.shape[0], -1).astype(flat.dtype),
         flat,
