@@ -366,7 +366,9 @@ class PrefixAwareScheduler(AsyncScheduler):
         if getattr(self, "_memo_xstep", False):
             self._memo_trim_log()
         try:
+            # vLLM's Scheduler walks the waiting queues without a selection
             # hook, so the warmest-first promotion runs here, once per step.
+            self._select_waiting_queue_for_scheduling()
             out = super().schedule(*args, **kwargs)
             if getattr(out, "scheduled_new_reqs", None):
                 self._maybe_pack_prompt_ids(out)
@@ -408,15 +410,31 @@ class PrefixAwareScheduler(AsyncScheduler):
         event = getattr(self, "_step_wait_event", None)
         if event is not None:
             return event
+        if waiting_at_start == 0 and not getattr(self, "kv_holding_waiting", None):
             return "idle"
         if getattr(out, "preempted_req_ids", None):
             return "preempted"
+        max_active = getattr(self, "max_num_active_reqs", None)
+        num_active = len(self.running) + int(
+            getattr(self, "num_waiting_for_streaming_input", 0) or 0
+        )
+        if isinstance(max_active, int) and num_active >= max_active:
             return "max_running"
         budget = int(getattr(self, "max_num_scheduled_tokens", 8192) or 8192)
         if getattr(out, "total_num_scheduled_tokens", 0) >= budget:
             return "budget"
+        if not self._has_undeferred_waiting():
             return "drained"
         return "other"
+
+    def _has_undeferred_waiting(self) -> bool:
+        """Whether ``waiting`` holds a request vLLM has not deferred.
+
+        The scan puts a skipped request that holds no KV blocks back into
+        ``waiting`` and keeps it in ``deferred_waiting`` until it is scheduled.
+        """
+        deferred = getattr(self, "deferred_waiting", None) or ()
+        return any(r not in deferred for r in getattr(self, "waiting", None) or ())
 
     def _record_step_telemetry(self, out, waiting_at_start: int, stop: str) -> None:
         """Accumulates the per-minute step counters of the telemetry line.
@@ -435,6 +453,9 @@ class PrefixAwareScheduler(AsyncScheduler):
         tm["steps"] += 1
         if waiting_at_start > 0:
             tokens = getattr(out, "total_num_scheduled_tokens", 0)
+            if (
+                tokens <= _SMALL_STEP_BLOCKS * self._get_block_size()
+                and self._has_undeferred_waiting()
             ):
                 tm["small_steps_waiting"] += 1
             stops = tm["stops"]
@@ -699,10 +720,24 @@ class PrefixAwareScheduler(AsyncScheduler):
         return (tier, cold_tokens, request.arrival_time), warmth
 
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
+        """Promotes the warmest request of each waiting queue to its head.
 
+        vLLM's scan drains ``kv_holding_waiting`` (requests holding KV blocks,
+        such as async loads) before ``waiting`` on every step, so ``waiting``
+        is promoted even while ``kv_holding_waiting`` is not empty. Returns
+        the queue the scan reads first.
+        """
+        kv_holding = getattr(self, "kv_holding_waiting", None)
+        if kv_holding:
+            self._promote_warmest(kv_holding)
+        waiting = getattr(self, "waiting", None)
+        if waiting:
+            self._promote_warmest(waiting)
+        return kv_holding or waiting
 
     def _promote_warmest(self, queue: RequestQueue) -> None:
         """Promote the request with the fewest uncached tokens within WINDOW."""
+        if len(queue) < 2 or self.policy != SchedulingPolicy.FCFS:
             return
 
         window = list(islice(queue, self.WINDOW))
