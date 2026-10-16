@@ -48,6 +48,8 @@ docs/
 # results into BigQuery.
 !.buildkite/kubernetes/
 !.buildkite/scripts/
+# CPU regression tests execute the GitHub Check publication hook.
+!.buildkite/hooks/post-command
 .github/
 mkdocs.yml
 .readthedocs.yaml
