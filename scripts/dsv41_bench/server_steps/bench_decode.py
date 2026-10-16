@@ -240,6 +240,7 @@ def client_main(argv: list[str]) -> None:
             json.dumps(
                 {
                     "round": label,
+                    "decode_throughput": report["decode_throughput"],
                     "categories": {
                         k: {
                             a: b
@@ -450,6 +451,9 @@ def summarize(results: list, scenario_name: str) -> dict:
     seconds = sum(w["seconds"] for w in windows)
     tokens = sum(w["effective_tokens"] for w in windows)
     rate = tokens / seconds
+    median_step_seconds = statistics.median(s["seconds"] for s in samples)
+    mean_tokens = tokens / sum(w["request_observations"] for w in windows)
+    median_rate = scenario.concurrency * mean_tokens / median_step_seconds
     return {
         "scenario": scenario.to_dict(),
         "timing": "native_output_observation_cadence",
@@ -459,20 +463,25 @@ def summarize(results: list, scenario_name: str) -> dict:
             "stage starts/ends are optimistic scheduler metadata; "
             "accepted-output context is reconstructed"
         ),
+        "decode_throughput": {
+            "basis": "median_step_estimate",
+            "global_tokens_s": median_rate,
+            "per_device_tokens_s": median_rate / scenario.dp_size,
+            "per_physical_chip_tokens_s": median_rate / scenario.physical_chips,
+        },
         "windows": windows,
         "categories": {
             "decode": {
+                "throughput_basis": "observed_window",
                 "steps": len(samples),
                 "total_seconds": seconds,
-                "median_step_ms": 1000
-                * statistics.median(s["seconds"] for s in samples),
+                "median_step_ms": 1000 * median_step_seconds,
                 "effective_tokens": tokens,
                 "global_tokens_s": rate,
                 "per_device_tokens_s": rate / scenario.dp_size,
                 "per_physical_chip_tokens_s": rate / scenario.physical_chips,
                 "token_kind": "accepted_output_including_bonus",
-                "mean_tokens_per_request_step": tokens
-                / sum(w["request_observations"] for w in windows),
+                "mean_tokens_per_request_step": mean_tokens,
                 "first_20": samples[:20],
                 "last_20": samples[-20:],
                 "samples": samples,

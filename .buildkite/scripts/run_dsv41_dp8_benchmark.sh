@@ -20,28 +20,26 @@ export PIP_CACHE_DIR=/tmp/tpu_logs/pip-cache UV_CACHE_DIR=/tmp/tpu_logs/uv-cache
 export PYTHONUNBUFFERED=1 PYTHONNOUSERSITE=1
 # The shared CI image preloads tcmalloc; heap trimming requires glibc malloc.
 export TPU_RECLAIM_COMPILE_MEMORY=0
-mkdir -p "$TMPDIR" "$results" /local_hf_cache/dsv41-ci
+mkdir -p "$TMPDIR" "$results"
 exec > >(tee "$results/task.log") 2>&1
 scratch=$(mktemp -d "$TMPDIR/dsv41-dp8.XXXXXX")
-cache_dir=$(mktemp -d /local_hf_cache/dsv41-ci/"$scenario".XXXXXX)
 model_mount="$scratch/model"
 mkdir -p "$model_mount"
 cleanup() {
   if mountpoint -q "$model_mount"; then
     umount "$model_mount" || true
   fi
-  rm -rf "$cache_dir"
 }
 trap cleanup EXIT
 
 uv pip freeze --system > "$results/pip-freeze.txt"
 
-# Mount weights instead of copying the checkpoint onto the CI agent's disk.
+# Input preparation uses the mount; serving streams weights from the GCS URI.
 model_path="${model_uri#gs://}"
 bucket="${model_path%%/*}"
 prefix="${model_path#*/}"
 gcsfuse --implicit-dirs --only-dir "$prefix" -o ro "$bucket" "$model_mount"
-export MODEL_PATH="$model_mount"
+export MODEL_PATH="$model_mount" MODEL_URI="$model_uri"
 test -f "$MODEL_PATH/config.json"
 
 curl --fail --location --retry 3 \
@@ -55,11 +53,10 @@ sha256sum "$results/inputs.json" > "$results/input.sha256"
 
 python scripts/dsv41_bench/server_steps/run.py \
   --scenario "$scenario" --input "$results/inputs.json" \
-  --out "$results/benchmark" --cache-dir "$cache_dir" --cache-mode cold \
+  --out "$results/benchmark" \
   --startup-timeout 7200
 
-# Publish the existing summary verbatim, including its token accounting and
-# full-DP checks. Profiling stays separate from the untraced CI measurements.
+# Raw observations stay in artifacts; print the throughput metrics in the log.
 python - "$results/benchmark/fixed" <<'PY_SUMMARY'
 import json
 import sys
@@ -69,6 +66,18 @@ summaries = sorted(Path(sys.argv[1]).glob("round-*-summary.json"))
 if not summaries:
     raise RuntimeError("DP8 benchmark completed without a formal round summary")
 for path in summaries:
+    report = json.loads(path.read_text())
+    metrics = {}
+    if "decode_throughput" in report:
+        metrics["decode_throughput"] = report["decode_throughput"]
+    metrics["categories"] = {
+        category: {
+            key: value
+            for key, value in values.items()
+            if key not in ("samples", "first_20", "last_20")
+        }
+        for category, values in report["categories"].items()
+    }
     print(f"DSV41_DP8_BENCHMARK_SUMMARY {path.name}")
-    print(json.dumps(json.loads(path.read_text()), indent=2))
+    print(json.dumps(metrics, indent=2))
 PY_SUMMARY

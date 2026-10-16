@@ -2,14 +2,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # Activate the pinned experiment environment before invoking this launcher.
 set -Eeuo pipefail
-model=${MODEL_PATH:-/models/DeepSeek-V4.1-Flash}
+model_path=${MODEL_PATH:-/models/DeepSeek-V4.1-Flash}
+model=${MODEL_URI:-$model_path}
 tp=${TP:-1}
 dp=${DP:-8}
 chunk=${CHUNK:-2048}
 max_seqs=${MAX_SEQS:-1}
 export TPU_RECLAIM_COMPILE_MEMORY="${TPU_RECLAIM_COMPILE_MEMORY:-1}"
 export OMP_NUM_THREADS=1 NEW_MODEL_DESIGN=1 MODEL_IMPL_TYPE=vllm VLLM_TARGET_DEVICE=tpu
-export VLLM_USE_BREAKABLE_CUDAGRAPH=0 VLLM_USE_AOT_COMPILE=0 VLLM_DISABLE_COMPILE_CACHE=0
+export VLLM_USE_BREAKABLE_CUDAGRAPH=0 VLLM_USE_AOT_COMPILE=0
+export VLLM_DISABLE_COMPILE_CACHE="${VLLM_DISABLE_COMPILE_CACHE:-0}"
 export TPU_DEEPSEEK_V41_IMPL=v2 TPU_DEEPSEEK_V41_CED=1 TPU_DEEPSEEK_V41_SP=1 TPU_DEEPSEEK_V41_LOCAL_Q=1 TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD=1
 export TPU_DEEPSEEK_V41_ENGRAM_SPLIT="${TPU_DEEPSEEK_V41_ENGRAM_SPLIT:-1}"
 export USE_MOE_SPARSE_CORE=0 USE_MOE_FUSED_EP_KERNEL=1 MOE_FUSED_EP_ENABLE_W4A8=1 MOE_FUSED_EP_V2_SHARDED_PLAN=1
@@ -26,6 +28,7 @@ if [[ -n "${MAX_MODEL_LEN:-}" ]]; then
   server_args+=(--max-model-len "$MAX_MODEL_LEN")
 fi
 exec vllm serve "$model" \
+  --tokenizer "$model_path" \
   --load-format runai_streamer --served-model-name deepseek-v41 \
   --host "${HOST:-127.0.0.1}" --port "${PORT:-8000}" \
   --tensor-parallel-size "$tp" --data-parallel-size "$dp" \

@@ -82,12 +82,13 @@ and 240 draft rows padded to 288. Eight-device profiles confirmed execution of
 the grouped scorer; device timings exclude auxiliary graphs and host gaps.
 
 Follow `server_steps/README.md` to prepare the frozen input and runtime, then
-run each version with a separate empty cache and output directory:
+run each version with a separate output directory. The current launcher disables
+persistent caches and uses buckets `[288,2048]` with a 2048-token scheduler
+input budget. Historical results above retain their recorded cache configuration:
 
 ```bash
 python scripts/dsv41_bench/server_steps/run.py --scenario decode \
   --input /path/to/inputs.json --out /path/to/results \
-  --cache-dir /path/to/empty-cache --cache-mode cold \
   --rounds 3 --startup-timeout 5400 --profile
 ```
 

@@ -13,6 +13,7 @@ import signal
 import socket
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -23,14 +24,6 @@ from bench_cached_extend import (
     summarize_startup,
 )
 from server_step_worker import DECODE_SCENARIO
-
-
-def cache_inventory(root: Path) -> dict:
-    files = [p for p in root.rglob("*") if p.is_file()]
-    return {
-        "files": len(files),
-        "bytes": sum(p.stat().st_size for p in files),
-    }
 
 
 def source_identity(
@@ -61,7 +54,7 @@ def source_identity(
         }
     direct_url_text = distribution.read_text("direct_url.json")
     if direct_url_text is None:
-        raise ValueError(f"{package} requires Git source provenance for cache identity")
+        raise ValueError(f"{package} requires Git source provenance for the benchmark")
     direct_url = json.loads(direct_url_text)
     if "vcs_info" not in direct_url or not direct_url["vcs_info"].get("commit_id"):
         raise ValueError(f"{package} direct_url.json has no VCS commit identity")
@@ -118,8 +111,6 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--input", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
-    parser.add_argument("--cache-dir", type=Path, required=True)
-    parser.add_argument("--cache-mode", choices=["cold", "reuse"], required=True)
     parser.add_argument("--startup-timeout", type=float, default=3000)
     parser.add_argument(
         "--scenario", choices=["encoder_extend", "decode"], default="encoder_extend"
@@ -140,11 +131,6 @@ def main() -> None:
     signal.signal(signal.SIGTERM, terminate)
     args.out = args.out.resolve()
     args.out.mkdir(parents=True, exist_ok=False)
-    before = cache_inventory(args.cache_dir)
-    if args.cache_mode == "cold" and before["files"]:
-        parser.error("Cold startup requires a new, empty cache directory")
-    if args.cache_mode == "reuse" and not before["files"]:
-        parser.error("Reuse startup requires a populated cache directory")
     try:
         response = requests.get("http://127.0.0.1:8000/health", timeout=2)
     except requests.RequestException:
@@ -155,16 +141,23 @@ def main() -> None:
 
     here = Path(__file__).resolve().parent
     env = os.environ.copy()
-    for key, subdir in [
-        ("VLLM_CACHE_ROOT", "vllm"),
-        ("JAX_COMPILATION_CACHE_DIR", "jax"),
-        ("TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT", "torchtpu"),
-    ]:
-        path = args.cache_dir / subdir
-        path.mkdir(parents=True, exist_ok=True)
-        env[key] = str(path.resolve())
-    env["TORCH_TPU_TIER2_COMPILATION_CACHE"] = "disabled"
-    env["TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE"] = "disabled"
+    compiler_scratch = tempfile.TemporaryDirectory(prefix="dsv41-compiler-")
+    env["VLLM_CACHE_ROOT"] = compiler_scratch.name
+    # Do not inherit persistent cache paths from the task or the host.
+    for key in (
+        "JAX_COMPILATION_CACHE_DIR",
+        "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
+        "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT",
+    ):
+        env.pop(key, None)
+    env.update(
+        VLLM_DISABLE_COMPILE_CACHE="1",
+        JAX_ENABLE_COMPILATION_CACHE="false",
+        TORCHINDUCTOR_FORCE_DISABLE_CACHES="1",
+        TORCHINDUCTOR_AUTOGRAD_CACHE="0",
+        TORCH_TPU_TIER2_COMPILATION_CACHE="disabled",
+        TORCH_TPU_INTERNAL_TIER2_COMPILATION_CACHE="disabled",
+    )
     env["KV_BYTES"] = "auto"
     decode = args.scenario == "decode"
     # Steady target verification is exactly local_concurrency * (K + 1) rows;
@@ -172,9 +165,7 @@ def main() -> None:
     verify_rows = DECODE_SCENARIO.local_concurrency * (
         DECODE_SCENARIO.dspark_tokens + 1
     )
-    buckets = (
-        [verify_rows, DECODE_SCENARIO.chunk_tokens] if decode else [128, 256, 2048]
-    )
+    buckets = [verify_rows, DECODE_SCENARIO.chunk_tokens] if decode else [2048]
     env.update(
         TP="1",
         DP="8",
@@ -210,16 +201,14 @@ def main() -> None:
     manifest = {
         "scenario": args.scenario,
         "compile_sizes": buckets,
-        "cache_mode": args.cache_mode,
-        "cache_before": before,
-        "cache_dir": str(args.cache_dir),
+        "cache_mode": "disabled",
+        "serialization": "enabled",
         "tier2": "disabled (public and internal)",
         "packages": {
             name: importlib.metadata.version(name)
             for name in ["torch", "torch-tpu", "jax", "jaxlib", "libtpu"]
         },
         "startup_scope": "server launch through HTTP health readiness",
-        "cache_hit_claim": "Inspect server logs; populated cache is not proof of hits",
     }
     import vllm
 
@@ -235,20 +224,12 @@ def main() -> None:
         ),
         "vllm": source_identity(Path(vllm.__file__).resolve().parent, "vllm"),
         "model": str(model.resolve()),
+        "model_weights": env.get("MODEL_URI") or env["MODEL_PATH"],
         "model_config_sha256": hashlib.sha256(
             (model / "config.json").read_bytes()
         ).hexdigest(),
         "parallelism": "TP1/DP8/EP8/PP1 on one v7x-8 host",
     }
-    identity_path = args.cache_dir / "benchmark-identity.json"
-    if args.cache_mode == "reuse":
-        if (
-            not identity_path.is_file()
-            or json.loads(identity_path.read_text()) != identity
-        ):
-            parser.error("Cache identity differs; use a new cold cache directory")
-    else:
-        identity_path.write_text(json.dumps(identity, indent=2) + "\n")
     manifest["identity"] = identity
     (args.out / "manifest.json").write_text(json.dumps(manifest, indent=2) + "\n")
     bootstrap_ports(env, args.out)
@@ -299,7 +280,6 @@ def main() -> None:
             timing.update(
                 ready_wall_ns=time.time_ns(),
                 startup_seconds=time.monotonic() - started,
-                cache_after_startup=cache_inventory(args.cache_dir),
             )
             (args.out / "startup.json").write_text(json.dumps(timing, indent=2) + "\n")
             base = [
@@ -357,6 +337,7 @@ def main() -> None:
             timing["completed"] = True
     finally:
         stop(server)
+        compiler_scratch.cleanup()
         if (args.out / "server.log").exists():
             (args.out / "startup-phases.json").write_text(
                 json.dumps(

@@ -8,9 +8,10 @@ The workload uses eight distinct 98304-token cached prefixes, 16384 new input
 tokens per request, and one greedy output token. Each DP engine admits one
 request with a 2048-token budget. The model uses CED, FP8 KV, CPU Engram offload
 and DSpark K5. KV is automatically sized with memory utilization 0.85, rather
-than capped at 4 GiB. Compile buckets are `[128,256,2048]`. The server uses the model's default
-context limit; it does not cap `max_model_len` to this benchmark's 114688-token
-input. The 96K prefix and 16K extension are client workload sizes.
+than capped at 4 GiB. The only compile bucket is `[2048]`; the tail also pads
+to 2048. The server uses the model's default context limit; it does not cap
+`max_model_len` to this benchmark's 114688-token input. The 96K prefix and 16K
+extension are client workload sizes.
 Automatic FP8 KV budgets round down to binary steps smaller than 1/32 of the
 measured budget (1 GiB at 32–64 GiB), before the RoPE companion reserve.
 This stabilizes shapes within a bin; crossing a bin boundary still recompiles.
@@ -19,13 +20,12 @@ This is a prefill benchmark; one-token output comparison does not qualify
 long-generation accuracy or steady decode performance.
 
 The shared serving launcher sets `--xla_tpu_dvfs_p_state=7` in
-`LIBTPU_INIT_ARGS`. The two DP8 Buildkite benchmarks run only on non-PR builds
-of `epic/dsv41` while cold startup takes about an hour. Remove their step-level
-`if` conditions to restore pre-merge coverage after startup improves.
+`LIBTPU_INIT_ARGS`. Both DP8 Buildkite benchmarks run on every build of the
+`epic/dsv41` lane, including PR builds admitted by the `ready` label check.
 
 The harness has three scripts:
 
-- `run.py`: launch configuration, cold/reuse cache lifecycle and cleanup.
+- `run.py`: launch configuration, cache disabling and cleanup.
 - `bench_cached_extend.py`: input preparation, client, throughput and startup audit.
 - `server_step_worker.py`: opt-in worker observations and shared workload definition.
 
@@ -68,9 +68,12 @@ export MODEL_PATH=/models/DeepSeek-V4.1-Flash
 python scripts/dsv41_bench/server_steps/run.py \
   --input /path/to/dsv41-code-96k-c128.json \
   --out /path/to/results/candidate-cold \
-  --cache-dir /path/to/persistent-cache/candidate \
-  --cache-mode cold --rounds 5 --profile
+  --rounds 5 --profile
 ```
+
+For native GCS weight streaming, also set `MODEL_URI=gs://bucket/model-prefix`.
+The target and DSpark models use that URI; `MODEL_PATH` remains the local
+checkpoint metadata and tokenizer path. CI sets both paths and omits `--profile`.
 
 `run.py` starts the server, waits for HTTP health readiness,
 runs a separate warmup and five formal rounds, optionally collects a separate
@@ -79,26 +82,17 @@ to 3000 seconds. Compiler events in formal serving windows fail the run.
 The profile-only prefill client skips a second warmup but still resets and primes
 the prefix before measuring the extension. Five formal rounds plus a profile
 therefore need seven priming waves instead of eight. Formal warmup, workload
-lengths, compile buckets and round counts are unchanged. `startup.json` reports
+lengths and round counts are unchanged. `startup.json` reports
 formal and profile status separately; a profile failure still fails the run.
-A cold run rejects a nonempty cache directory. Keep the cache
-on persistent storage, and use separate directories for baseline and candidate.
-Both public and internal native Tier-2 shared-memory caches are disabled;
-vLLM, JAX and native Tier-3 paths are recorded in the run manifest.
+This performance harness disables persistent compilation caches through environment
+variables and retains the compiler's default serialization path. It clears inherited
+JAX and native Tier-3 cache paths, disables
+JAX, vLLM and TorchInductor disk caches, and keeps both native Tier-2 caches
+disabled. vLLM compiler metadata uses a temporary local directory removed after
+server shutdown. Compiled callables remain reusable within the server process.
+No cache directory or GCS cache mount is needed. The launcher no longer accepts
+`--cache-dir` or `--cache-mode`; use a separate cache experiment for reuse tests.
 
-A cache-reuse restart uses the same code, model, hardware, runtime, compile
-buckets and cache directory, with a new result directory:
-
-```bash
-python scripts/dsv41_bench/server_steps/run.py \
-  --input /path/to/dsv41-code-96k-c128.json \
-  --out /path/to/results/candidate-reuse \
-  --cache-dir /path/to/persistent-cache/candidate \
-  --cache-mode reuse --rounds 5
-```
-
-A populated cache does not prove a cache hit. Check load attempts, recompiles,
-artifact warnings and timings. Do not drop cache-key fields to force reuse.
 Profiles are enabled only by `--profile` and written directly under `--out/profile`.
 No `ARTIFACT_LOCAL_DIR` or shared scratch directory is required. Do not enable compiler
 dumps during timed startup, and never pool profiled and unprofiled rounds.
@@ -111,9 +105,10 @@ prefill wave; the server must have been started with a profiler configuration.
 
 ### CI coverage
 
-The DP8 cases in `.buildkite/pipeline_dsv41.yml` each start one server with a cold
-cache and no profile: prefill runs one warmup plus five formal rounds; decode
-runs one warmup plus one formal round. They already avoid a second server start,
+The DP8 cases in `.buildkite/pipeline_dsv41.yml` each start one server with
+persistent compilation caches disabled and no profile: prefill runs one warmup
+plus five formal rounds; decode runs one warmup plus one formal round.
+They already avoid a second server start,
 so skipping the diagnostic prefill warmup does not speed up these CI cases.
 The TP8 GSM8K and 100K decode cases use other scripts and are unaffected.
 
@@ -271,29 +266,24 @@ python scripts/dsv41_bench/server_steps/bench_cached_extend.py prepare \
 ```bash
 export MODEL_PATH=/models/DeepSeek-V4.1-Flash
 python scripts/dsv41_bench/server_steps/run.py --scenario decode \
-  --input /data/dsv41-inputs.json --out /results/decode \
-  --cache-dir /cache/dsv41-decode --cache-mode cold
+  --input /data/dsv41-inputs.json --out /results/decode
 ```
 
-This compiles buckets `[288,2048]`, omitting 384 to reduce precompile work.
-Steady target verification remains exactly 48 requests x (K + 1) = 288 rows.
-Draft inputs (240 rows) still pad to 288; chunked prefill uses 2048.
-Replay/mixed target batches above 288 rows now use 2048. These transitional
-batches are excluded from the steady decode metric, but can affect preparation
-time and window availability. Startup savings have not yet been measured;
-the historical results below retain their original bucket configurations.
-The larger prefill budget admits the 48 requests per rank before early requests
-finish: exact-prefix cache hits leave 256 tokens per request to compute.
-With a 512-token budget, admission overlapped request draining and produced no
-common full-DP steady window in the C384 workload. It keeps
-automatic KV sizing, disables both Tier2 caches and persists the JAX/vLLM/Tier3
-caches. Startup readiness, phase timings, compile/load counts and package/source
-identities are saved. Future runs may use `--cache-mode reuse` with that directory;
-the launcher rejects mismatched source/runtime/model/scenario identities. A
-populated cache is not proof of a hit; inspect `startup-phases.json` and logs.
-Do not reuse earlier cache directories without an identity file.
+This compiles `[288,2048]`. Steady target verification is exactly
+48 requests x (K + 1) = 288 rows. The 2048-token bucket covers prefix preparation
+and mixed batches. The scheduler input budget is 2048. Request count, prompt
+length, output length and DSpark K remain unchanged. Startup readiness, phase
+timings and source/runtime identities are saved. Persistent caches are disabled
+through environment variables; the compiler retains its default serialization
+path.
 
-For manual operation, start a dedicated server (terminal 1):
+The full-DP checks remain mandatory. They require a common C384 steady window
+through the real scheduler; synthetic startup warmup does not establish this.
+Historical measurements below retain their original configurations.
+
+For manual operation, start a dedicated server (terminal 1). This lower-level
+launcher retains its cache defaults; use `run.py` above for the cache-disabled
+performance harness:
 
 ```bash
 export MODEL_PATH=/models/DeepSeek-V4.1-Flash
@@ -328,10 +318,27 @@ The summary retains only consecutive full-C decode observations: 48 requests,
 Mixed phases, membership changes, gaps and drain observations split/exclude
 windows. At least eight intervals in a segment of ten observations are required.
 Node cadence uses the latest rank observation, never the sum of rank times.
-Throughput counts accepted output events, **including bonus tokens**, within a
-common host-clock window; do not multiply it by K. Host cadence is distinct from
-isolated target/draft device duration. Contexts derived from accepted outputs
-are reported separately from asynchronous scheduler metadata.
+The primary `decode_throughput` metric estimates throughput from the median
+host-observation step interval:
+
+```text
+mean_accepted_tokens = window_accepted_tokens / window_request_observations
+decode_tokens_s = global_concurrency * mean_accepted_tokens / median_step_seconds
+```
+
+Accepted tokens include bonus tokens; do not substitute K or K+1. The summary
+and each printed round report this estimate at node, logical-device and
+physical-chip scope. Median step time uses the same qualifying consecutive
+full-C observations as before. It reduces the effect of occasional long
+intervals but does not measure sustained output over the whole window.
+
+`categories.decode.global_tokens_s` and its per-device/per-chip values retain
+the observed window rate: accepted output tokens divided by the common
+host-clock window duration. They carry `throughput_basis=observed_window`;
+`decode_throughput` carries `basis=median_step_estimate`. Report both metrics
+with their labels. Host cadence is distinct from isolated target/draft device
+duration. Contexts derived from accepted outputs are reported separately from
+asynchronous scheduler metadata.
 
 Reprocess saved observations without running the model:
 

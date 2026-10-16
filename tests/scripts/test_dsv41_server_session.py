@@ -2,6 +2,7 @@
 """CPU regressions for CI launches and profiling on an already warmed server."""
 
 import json
+import os
 import subprocess
 import sys
 from dataclasses import replace
@@ -20,15 +21,19 @@ pytestmark = pytest.mark.cpu_test
 
 @pytest.mark.parametrize(
     "scenario,rounds,buckets",
-    [("encoder_extend", 5, [128, 256, 2048]), ("decode", 1, [288, 2048])],
+    [("encoder_extend", 5, [2048]), ("decode", 1, [288, 2048])],
 )
 @pytest.mark.parametrize("profile", ["disabled", "passed", "failed"])
+@pytest.mark.parametrize("model_uri", [None, "gs://test-bucket/checkpoint"])
 def test_ci_launch_and_optional_profile_share_one_server(
-    tmp_path, monkeypatch, scenario, rounds, buckets, profile
+    tmp_path, monkeypatch, scenario, rounds, buckets, profile, model_uri
 ):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "config.json").write_text("{}")
     monkeypatch.setenv("MODEL_PATH", str(tmp_path))
+    monkeypatch.delenv("MODEL_URI", raising=False)
+    if model_uri is not None:
+        monkeypatch.setenv("MODEL_URI", model_uri)
     # Artifact collection alone must not enable a profiler on a formal CI run.
     monkeypatch.setenv("ARTIFACT_LOCAL_DIR", str(tmp_path / "artifacts"))
     monkeypatch.setenv("USE_PHASED_PROFILER", "1")
@@ -44,10 +49,6 @@ def test_ci_launch_and_optional_profile_share_one_server(
             "inputs.json",
             "--out",
             "results",
-            "--cache-dir",
-            "cache",
-            "--cache-mode",
-            "cold",
             "--startup-timeout",
             "7200",
             *(["--profile"] if profile != "disabled" else []),
@@ -59,13 +60,28 @@ def test_ci_launch_and_optional_profile_share_one_server(
     monkeypatch.setattr(launcher, "bootstrap_ports", lambda *a: None)
     health = iter([SimpleNamespace(ok=False), SimpleNamespace(ok=True)])
     monkeypatch.setattr(launcher.requests, "get", lambda *a, **kw: next(health))
+    inherited_roots = (
+        "JAX_COMPILATION_CACHE_DIR",
+        "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
+        "TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_ROOT",
+    )
+    for key in inherited_roots:
+        monkeypatch.setenv(key, str(tmp_path / "persistent-cache"))
+    compiler_roots = []
     starts, clients, stopped, audits = [], [], [], []
     server = SimpleNamespace(poll=lambda: None)
 
     def start(command, *, env, **kwargs):
         starts.append(command)
+        compiler_roots.append(Path(env["VLLM_CACHE_ROOT"]))
+        assert compiler_roots[-1].is_dir()
         assert env["USE_PHASED_PROFILER"] == "0"
         assert env["TP"] == "1" and env["DP"] == "8"
+        assert env["CHUNK"] == "2048"
+        assert env["VLLM_DISABLE_COMPILE_CACHE"] == "1"
+        assert env["JAX_ENABLE_COMPILATION_CACHE"] == "false"
+        assert env["TORCHINDUCTOR_FORCE_DISABLE_CACHES"] == "1"
+        assert all(key not in env for key in inherited_roots)
         return server
 
     def client(command, **kwargs):
@@ -93,6 +109,12 @@ def test_ci_launch_and_optional_profile_share_one_server(
     else:
         launcher.main()
     assert len(starts) == 1 and stopped == [server]
+    assert not (tmp_path / "persistent-cache").exists()
+    assert all(not root.exists() for root in compiler_roots)
+    manifest = json.loads((tmp_path / "results/manifest.json").read_text())
+    assert manifest["cache_mode"] == "disabled"
+    assert manifest["serialization"] == "enabled"
+    assert manifest["identity"]["model_weights"] == (model_uri or str(tmp_path))
     command = starts[0]
     assert json.loads(command[command.index("--compilation-config") + 1]) == {
         "compile_sizes": buckets
@@ -195,3 +217,37 @@ def test_prefill_keeps_formal_warmup_but_skips_duplicate_profile_warmup(
     for path in summaries:
         report = json.loads(path.read_text())
         assert report["profiled"] is profile_only and not report["warmup"]
+
+
+@pytest.mark.parametrize("model_uri", [None, "gs://test-bucket/checkpoint"])
+def test_shell_model_source_and_disabled_compile_cache(tmp_path, model_uri):
+    executable = tmp_path / "vllm"
+    executable.write_text(
+        '#!/bin/sh\nprintf "%s\\n" "$VLLM_DISABLE_COMPILE_CACHE" '
+        '"$LIBTPU_INIT_ARGS" "$@"\n'
+    )
+    executable.chmod(0o755)
+    env = {
+        **os.environ,
+        "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"],
+        "VLLM_DISABLE_COMPILE_CACHE": "1",
+        "MODEL_PATH": str(tmp_path),
+    }
+    env.pop("MODEL_URI", None)
+    if model_uri is not None:
+        env["MODEL_URI"] = model_uri
+    result = subprocess.run(
+        ["bash", str(_SCRIPTS.parent / "serve_cached_prefill.sh")],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    cache, compiler_flags, *command = result.stdout.splitlines()
+    assert cache == "1"
+    assert "--xla_tpu_dvfs_p_state=7" in compiler_flags
+    assert command[:2] == ["serve", model_uri or str(tmp_path)]
+    assert command[command.index("--tokenizer") + 1] == str(tmp_path)
+    draft = json.loads(command[command.index("--speculative-config") + 1])
+    assert draft["model"] == command[1]
+    assert "--profiler-config" not in command

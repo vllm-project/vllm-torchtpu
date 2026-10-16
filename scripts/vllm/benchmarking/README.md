@@ -147,11 +147,15 @@ The `epic/dsv41` lane runs the audited recipes from
 FP8 KV, CED, Engram CPU offload and DSpark K5:
 
 - Cached extend: C8, 98,304 cached prefix tokens plus 16,384 new input tokens,
-  2,048-token chunks, one output token and five formal rounds. The model-default
-  serving context limit and automatic KV sizing are retained.
+  2,048-token chunks, one output token and five formal rounds. The only compile
+  bucket is `[2048]`. The model-default serving context limit and automatic KV
+  sizing are retained.
 - Steady decode: C384 (48 requests per DP), 98,304 input tokens and 512 output
   tokens, 2,048-token chunks, one warmup and one formal window. The serving
-  context limit is 98,816; compile buckets are `[384,2048]`.
+  context limit is 98,816; compile buckets are `[288,2048]`.
+
+Both jobs run on every build of this lane, including PR builds admitted by the
+repository's `ready` label check.
 
 These replace the TP8/DP1 C64 DSpark and C1 cold-prefill CI steps. Their old
 config scripts, the unused DSpark config helper and prefill perf baseline are
@@ -159,12 +163,13 @@ removed. The ordinary
 C4/C8/C16 decode and smoke/GSM8K steps remain separate. Related: #1794, #1890
 and #1912; #1891 improves priming for the superseded TP8/DP1 C64 recipe.
 
-`run_dsv41_dp8_benchmark.sh` mounts the checkpoint read-only through GCSFuse,
-prepares scenario-specific LongBench-v2 inputs with the existing dataset SHA
-check, and invokes `server_steps/run.py` with a fresh cold compilation cache.
-The measured Run:ai streamer version is installed only in the disposable test
-container. Compilation caches use the agent's persistent disk and are removed
-when the job exits; model weights are streamed, not copied to that disk.
+`run_dsv41_dp8_benchmark.sh` mounts checkpoint metadata read-only through
+GCSFuse and prepares scenario-specific LongBench-v2 inputs with the existing
+dataset SHA check. The target and DSpark models stream weights directly from
+the GCS URI; tokenization uses the mount. The wrapper uses the shared CI image's
+dependencies and records their versions. `server_steps/run.py` disables
+persistent compilation caches through environment variables and retains the
+compiler's default serialization path.
 
 Buildkite publishes inputs, package versions, startup records, server/client
 logs and `benchmark/fixed/round-*-summary.json` under:
@@ -174,8 +179,11 @@ logs and `benchmark/fixed/round-*-summary.json` under:
 
 The existing harness rejects incomplete requests, incorrect cache hits,
 preemptions, missing full-DP windows and compilation in formal windows. Prefill
-reports new-input host cadence; decode counts accepted outputs including bonus
-tokens. These metrics are not directly comparable with the old CI metrics.
+reports new-input host cadence. Decode's primary `decode_throughput` is global
+concurrency times the actual mean accepted output length, including bonus
+tokens, divided by the median full-DP step interval. The observed window rate
+remains in `categories.decode`. These metrics are not directly comparable with
+the old CI metrics.
 There is no throughput regression threshold yet. CI measurements do not enable
 profiling; use the same audited launcher with `--profile` for a separate capture.
 

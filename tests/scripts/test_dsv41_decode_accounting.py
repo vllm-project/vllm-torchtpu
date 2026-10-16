@@ -104,8 +104,38 @@ class AccountingTest(unittest.TestCase):
             for step in rank["steps"]:
                 step["accepted_output_counts"] = [6] * 48
                 step["accepted_output_tokens"] = 288
-        result = summarize(data, "decode")["categories"]["decode"]
+        report = summarize(data, "decode")
+        result = report["categories"]["decode"]
         self.assertEqual(result["mean_tokens_per_request_step"], 6)
+        throughput = report["decode_throughput"]
+        self.assertEqual(throughput["basis"], "median_step_estimate")
+        self.assertAlmostEqual(throughput["global_tokens_s"], 384 * 6 / 0.2)
+        self.assertAlmostEqual(throughput["per_device_tokens_s"], 48 * 6 / 0.2)
+        self.assertAlmostEqual(throughput["per_physical_chip_tokens_s"], 96 * 6 / 0.2)
+
+    def test_median_throughput_retains_slow_interval_in_window_rate(self):
+        data = records()
+        for rank in data:
+            for step in rank["steps"]:
+                step["accepted_output_counts"] = [2] * 48
+                step["accepted_output_tokens"] = 96
+        baseline = summarize(data, "decode")
+        for rank in data:
+            for step in rank["steps"][10:]:
+                step["start_ns"] += 1_000_000_000
+                step["observed_ns"] += 1_000_000_000
+        delayed = summarize(data, "decode")
+        self.assertEqual(delayed["decode_throughput"], baseline["decode_throughput"])
+        self.assertAlmostEqual(
+            delayed["decode_throughput"]["global_tokens_s"], 384 * 2 / 0.2
+        )
+        self.assertEqual(
+            delayed["categories"]["decode"]["throughput_basis"], "observed_window"
+        )
+        self.assertLess(
+            delayed["categories"]["decode"]["global_tokens_s"],
+            baseline["categories"]["decode"]["global_tokens_s"],
+        )
 
     def test_gap_is_not_joined(self):
         data = records(22)
