@@ -34,8 +34,6 @@
 #   RECIPE_SET                    oct13 for the doc's Oct 13 set; unset for the first
 #   RECIPE_STORE_SERVERS          1: the Oct 13 decode-host store servers
 #   RECIPE_STORE_NODE_BYTES       each store server's DRAM; optional
-#   RECIPE_PARSERS                0: no K3 reasoning or tool-call parsers and no
-#                                 tool-call suite, the doc's command line; default 1
 #
 # Two readers:
 #   k3_agentx_client_pod.sh  sources it with K3_1P1D_ROLE=decode for the shape,
@@ -50,13 +48,10 @@
 # Where this departs from the doc, each needed on GKE: distinct Raiden ids per
 # role and --headless on hosts 1-3 (which k3_1p1d.sh adds).
 #
-# Not in the doc: both roles run --enable-auto-tool-choice and the kimi_k3
-# tool-call and reasoning parsers, and the Kimi tool-call suite runs after
-# the replay, as InferenceX does for every K3 point. The suite's strict tool
-# calls decode under a grammar, which the decoder applies from
-# inferact/megakernel-integration-1015 on; the replay sends no tools.
-# RECIPE_PARSERS=0 drops the parsers and the suite. AGENTX_EVAL_JOB=1, the
-# GSM8K eval-only job, has DSpark verify drafts for real.
+# The replay runs the doc's bare command line. AGENTX_EVAL_JOB=1 adds
+# --enable-auto-tool-choice and the kimi_k3 parsers, verifies drafts for
+# real and runs GSM8K and the Kimi tool-call suite. The suite's strict tool
+# calls need the grammar support in inferact/megakernel-integration-1015.
 #
 # RECIPE_SET=oct13 serves the doc's Oct 13 set as its "Changes from" list reads:
 # TPU P-state 7 and RAIDEN_NUMA_POLICY=bind on both roles, the prefill without
@@ -100,14 +95,12 @@ if [ -n "${RECIPE_STORE_SERVERS:-}" ] && [ "${RECIPE_SET:-}" != oct13 ]; then
   echo "ERROR: kimi-k3-megakernel: RECIPE_STORE_SERVERS is the Oct 13 set's (RECIPE_SET=oct13)" >&2
   return 2
 fi
-# The eval-only job always runs the parsers.
+# The eval-only job runs the parsers; the replay does not.
 _eval_job="${AGENTX_EVAL_JOB:-0}"
-_parsers="${RECIPE_PARSERS:-1}"
-case "$_eval_job:$_parsers" in [01]:[01]) ;;
-  *) echo "ERROR: kimi-k3-megakernel: AGENTX_EVAL_JOB='$_eval_job' and RECIPE_PARSERS='$_parsers' must be 0 or 1" >&2
+case "$_eval_job" in 0|1) ;;
+  *) echo "ERROR: kimi-k3-megakernel: AGENTX_EVAL_JOB='$_eval_job' must be 0 or 1" >&2
      return 2 ;;
 esac
-[ "$_eval_job" != 1 ] || _parsers=1
 
 # ---- what the AgentX client reads ----------------------------------------------
 # Each role is TP32 with EP over all 32 ranks and no DP, launched with --nnodes.
@@ -124,9 +117,10 @@ AGENTX_ALLOW_SEQS_BELOW_CONC=1
 AGENTX_CONC_LIST="$RECIPE_CONCURRENCY"
 AGENTX_MODEL_PREFIX=kimik3
 AGENTX_PRECISION=fp4
-# The Kimi tool-call suite; it needs the tool-call parser.
+# No post-replay suite: the Kimi tool-call suite needs the parsers, so the
+# eval-only job runs it after GSM8K.
 AGENTX_POST_EVAL_SUITES=""
-[ "$_parsers" = 0 ] || AGENTX_POST_EVAL_SUITES=kimi_tool_call_schema_full
+AGENTX_EVAL_JOB_SUITES="gsm8k kimi_tool_call_schema_full"
 # The doc's request path: vllm-router in its prefill/decode mode.
 AGENTX_PROXY=router
 # No GSM8K before the replay (DSpark answers are synthetic there); the
@@ -316,7 +310,7 @@ COMMON_ARGS=(
   --mamba-cache-mode align --enable-prefix-caching
   --enable-prompt-tokens-details
 )
-if [ "$_parsers" = 1 ]; then
+if [ "$_eval_job" = 1 ]; then
   COMMON_ARGS+=(--enable-auto-tool-choice --tool-call-parser kimi_k3 --reasoning-parser kimi_k3)
 fi
 
@@ -485,5 +479,5 @@ if [ "$_no_spec" = 0 ]; then
 fi
 K3_1P1D_IMPORTS=(vllm_torchtpu.megakernel)
 unset _v _role _cache_user _offload_bytes _raiden _loader _kv _kv_cache_bytes _spec
-unset _registry _registry_port _pool_group _retention _no_spec _synthetic _acceptance _drafts _eval_job _parsers
+unset _registry _registry_port _pool_group _retention _no_spec _synthetic _acceptance _drafts _eval_job
 unset -f _offload_connector _multi_connector
