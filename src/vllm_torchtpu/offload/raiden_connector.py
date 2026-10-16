@@ -86,6 +86,7 @@ from vllm.v1.kv_offload.base import (
     CanonicalKVCacheTensor,
     GPULoadStoreSpec,
     OffloadKey,
+    OffloadPolicy,
 )
 from vllm.v1.outputs import KVConnectorOutput
 
@@ -272,7 +273,11 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                     fenced_jobs={},
                 ),
             )
-            scheduler._update_from_kv_xfer_finished(kv_out)
+            self.update_connector_output(kv_out)
+            if finished_recving:
+                scheduler._update_from_kv_xfer_finished(
+                    KVConnectorOutput(finished_recving=finished_recving)
+                )
         return len(finished_recving)
 
     def poll_and_complete_transfers(
@@ -438,9 +443,246 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
             failed_load_req_ids=failed_load_req_ids,
         )
 
+    def _lookup(self, req_status: Any) -> int | None:
+        complete_hit = self._lookup_complete_chunks(req_status)
+        req_status.partial_tail_boundary = None
+        if complete_hit is None or not self.config.supports_partial_tail:
+            return complete_hit
+
+        local_tokens = req_status.num_locally_computed_tokens
+        complete_boundary = local_tokens + complete_hit
+        tokens_per_hash = self.config.tokens_per_hash
+        block_end = complete_boundary + self._partial_tail_block_size
+        max_boundary = (
+            min(req_status.req.num_prompt_tokens - 1, block_end - 1)
+            // tokens_per_hash
+        ) * tokens_per_hash
+        min_boundary = complete_boundary
+        if complete_hit == 0:
+            local_hit = int(
+                getattr(req_status.req, "_tpu_local_hit_tokens", 0) or 0
+            )
+            if local_hit > min_boundary:
+                min_boundary = local_hit
+        if max_boundary <= min_boundary:
+            return complete_hit
+
+        from vllm.v1.kv_offload.base import LookupResult
+
+        pending = False
+        for boundary in range(max_boundary, min_boundary, -tokens_per_hash):
+            boundary_pending = False
+            boundary_missed = False
+            boundary_keys = []
+            for group_config in self.config.kv_group_configs:
+                key = self._make_boundary_key(
+                    req_status.req, group_config.group_idx, boundary
+                )
+                boundary_keys.append(key)
+                result = self.manager.lookup(key, req_status.req_context)
+                if result is LookupResult.MISS:
+                    boundary_missed = True
+                    break
+                if result in (LookupResult.HIT_PENDING, LookupResult.RETRY):
+                    boundary_pending = True
+
+            pending |= boundary_pending
+            if not boundary_missed and not boundary_pending:
+                for group_config, key in zip(
+                    self.config.kv_group_configs, boundary_keys
+                ):
+                    self._events_tracker.record_partial_lookup(
+                        req_status.req, group_config, boundary, key
+                    )
+                req_status.partial_tail_boundary = boundary
+                return boundary - local_tokens
+
+        if pending and complete_hit == 0:
+            return None
+        return complete_hit
+
+    def get_num_new_matched_tokens(
+        self, request: Request, num_computed_tokens: int
+    ) -> tuple[int | None, bool]:
+        if (
+            num_computed_tokens > 0
+            and self.config.kv_group_configs
+            and num_computed_tokens
+            % self.config.kv_group_configs[0].tokens_per_chunk
+            != 0
+        ):
+            req_status = self._req_status.get(request.request_id)
+            if req_status is None:
+                self.on_new_request(request)
+                req_status = self._req_status.get(request.request_id)
+            if req_status is not None:
+                req_status.num_locally_computed_tokens = num_computed_tokens
+                req_status.update_offload_keys()
+                req_status.update_num_hit_chunks(num_computed_tokens)
+                self._touch(req_status)
+            return 0, False
+        max_loads = getattr(self, "_max_async_load_reqs", None)
+        if max_loads is None:
+            try:
+                max_loads = int(
+                    os.environ.get("TPU_OFFLOAD_MAX_ASYNC_LOAD_REQS", "4")
+                )
+            except ValueError:
+                max_loads = 4
+            self._max_async_load_reqs = max_loads
+        if max_loads > 0:
+            active_loads = sum(
+                1 for js in self._jobs.values() if not js.is_store
+            )
+            if active_loads >= max_loads:
+                req_status = self._req_status.get(request.request_id)
+                if req_status is None:
+                    self.on_new_request(request)
+                    req_status = self._req_status.get(request.request_id)
+                if req_status is not None and not req_status.transfer_jobs:
+                    req_status.update_offload_keys()
+                    orig_local = req_status.num_locally_computed_tokens
+                    orig_partial = req_status.partial_tail_boundary
+                    try:
+                        probe_hit = self._quiet_lookup(
+                            req_status, num_computed_tokens
+                        )
+                    finally:
+                        req_status.num_locally_computed_tokens = orig_local
+                        req_status.partial_tail_boundary = orig_partial
+                    if probe_hit is None or probe_hit > 0:
+                        return None, False
+        num_hit_tokens, load_async = super().get_num_new_matched_tokens(
+            request, num_computed_tokens
+        )
+        if not num_hit_tokens:
+            local_hit = int(
+                getattr(request, "_tpu_local_hit_tokens", 0) or 0
+            )
+            if local_hit > num_computed_tokens:
+                req_status = self._req_status.get(request.request_id)
+                if req_status is not None:
+                    req_status.num_locally_computed_tokens = local_hit
+                    if (
+                        self.config.supports_partial_tail
+                        and local_hit % self._partial_tail_block_size != 0
+                        and local_hit % self.config.tokens_per_hash == 0
+                        and local_hit // self.config.tokens_per_hash - 1
+                        < len(request.block_hashes)
+                    ):
+                        self.manager.touch(
+                            tuple(
+                                self._make_boundary_key(
+                                    request, group.group_idx, local_hit
+                                )
+                                for group in self.config.kv_group_configs
+                            ),
+                            req_status.req_context,
+                        )
+        return num_hit_tokens, load_async
+
+    def update_state_after_alloc(
+        self, request: Request, blocks: Any, num_external_tokens: int
+    ) -> None:
+        super().update_state_after_alloc(request, blocks, num_external_tokens)
+        req_status = self._req_status.get(request.request_id)
+        if req_status is not None:
+            for group_config, group_state in zip(
+                self.config.kv_group_configs, req_status.group_states
+            ):
+                if group_config.sliding_window_size_in_chunks is None:
+                    # Keep next_stored_chunk_idx = 0 for FullAttention so
+                    # _build_store_jobs lets prepare_store probe 0..num_chunks
+                    # (skipping resident HOST/HOST_AND_HBM blocks in memory and
+                    # re-storing any HBM-resident prefix chunks displaced from
+                    # the host LRU).
+                    group_state.next_stored_chunk_idx = 0
+
+    def _touch(self, req_status: Any) -> None:
+        local_tokens = int(
+            getattr(req_status, "num_locally_computed_tokens", 0) or 0
+        )
+        local_hit = int(
+            getattr(req_status.req, "_tpu_local_hit_tokens", 0) or 0
+        )
+        if local_hit > local_tokens:
+            local_tokens = local_hit
+        shared_boundary = int(
+            getattr(req_status.req, "shared_prefix_boundary", 0) or 0
+        )
+        # 1. Touch ALL FullAttention chunks in reverse order (tail -> chunk_0)
+        #    so the entire active conversation stays ahead of inactive
+        #    conversations AND chunk_0 (the prefix root) is the most recently
+        #    used entry and can never be evicted before the tail.
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            if group_config.sliding_window_size_in_chunks is not None:
+                continue
+            if group_state.offload_keys:
+                self.manager.touch(
+                    list(reversed(group_state.offload_keys)),
+                    req_status.req_context,
+                )
+
+        # 2. Touch Mamba / sliding-window boundary chunks AFTER FullAttention so
+        #    active recurrent boundary states stay at the MRU head of the host cache.
+        for group_config, group_state in zip(
+            self.config.kv_group_configs, req_status.group_states
+        ):
+            if group_config.sliding_window_size_in_chunks is None:
+                continue
+            chunks_to_skip = max(
+                0,
+                group_state.num_hit_chunks
+                - group_config.sliding_window_size_in_chunks,
+            )
+            keys_to_touch = list(group_state.offload_keys[chunks_to_skip:])
+            if shared_boundary >= group_config.tokens_per_chunk:
+                fork_idx = (
+                    shared_boundary // group_config.tokens_per_chunk
+                ) - 1
+                if 0 <= fork_idx < chunks_to_skip and fork_idx < len(
+                    group_state.offload_keys
+                ):
+                    keys_to_touch.append(group_state.offload_keys[fork_idx])
+            if keys_to_touch:
+                self.manager.touch(keys_to_touch, req_status.req_context)
+
+        # 3. Touch partial-tail boundary keys LAST (both CPU-matched partial
+        #    tails and HBM-matched partial tails).
+        boundaries_to_touch: list[int] = []
+        if req_status.partial_tail_boundary is not None:
+            boundaries_to_touch.append(int(req_status.partial_tail_boundary))
+        if (
+            self.config.supports_partial_tail
+            and local_tokens > 0
+            and local_tokens % self._partial_tail_block_size != 0
+            and local_tokens % self.config.tokens_per_hash == 0
+            and local_tokens not in boundaries_to_touch
+        ):
+            boundaries_to_touch.append(local_tokens)
+        for boundary in boundaries_to_touch:
+            if boundary // self.config.tokens_per_hash - 1 < len(
+                req_status.req.block_hashes
+            ):
+                self.manager.touch(
+                    tuple(
+                        self._make_boundary_key(
+                            req_status.req,
+                            group.group_idx,
+                            boundary,
+                        )
+                        for group in self.config.kv_group_configs
+                    ),
+                    req_status.req_context,
+                )
+
+
     def update_connector_output(self, connector_output: KVConnectorOutput):
         meta = connector_output.kv_connector_worker_meta
         if isinstance(meta, RaidenOffloadingWorkerMetadata) and meta.fenced_jobs:
+            ready_jobs: list[tuple[int, _ParkedStore]] = []
             for job_id, count in meta.fenced_jobs.items():
                 parked = self._fence_pending.get(job_id)
                 if parked is None:
@@ -450,9 +692,12 @@ class TPURaidenOffloadingScheduler(OffloadingConnectorScheduler):
                 assert parked.acks <= self.config.num_workers
                 if parked.acks == self.config.num_workers:
                     del self._fence_pending[job_id]
-                    self._raiden_manager.submit_store_job(
-                        job_id, parked.keys, parked.device_block_ids
-                    )
+                    ready_jobs.append((job_id, parked))
+            ready_jobs.sort(key=lambda item: (-len(item[1].keys), item[0]))
+            for job_id, parked in ready_jobs:
+                self._raiden_manager.submit_store_job(
+                    job_id, parked.keys, parked.device_block_ids
+                )
         super().update_connector_output(connector_output)
 
     def _quiet_lookup(self, req_status: Any, base_tokens: int) -> int | None:
@@ -560,6 +805,7 @@ class TPURaidenOffloadingConnector(OffloadingConnector):
         return self.connector_scheduler.resolve_divergent_local_hit_tokens(
             request, num_local, num_reconciled, block_size
         )
+
 
     @classmethod
     def get_required_kvcache_layout(cls, vllm_config: VllmConfig) -> str | None:
