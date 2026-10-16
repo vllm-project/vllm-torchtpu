@@ -302,6 +302,7 @@ def _topk_rows(
         rows = torch.nn.functional.pad(rows, (0, pad_cols), value=-1)
     return rows
 
+
 # PCP manager: indexer K workspace buckets (context tokens); the smallest that
 # fits is used, and TPU_PCP_KV_WORKSPACE_TOKENS is always the largest.
 PCP_INDEXER_BUCKET_TOKENS = (131072, 262144, 524288)

@@ -155,17 +155,17 @@ from vllm_torchtpu.runner import greedy_top_tokens
 from vllm_torchtpu.runner import utils as runner_utils
 from vllm_torchtpu.runner.kernel_block_table import install_kernel_block_tables
 from vllm_torchtpu.runner.kv_cache_manager import KVCacheManager
+from vllm_torchtpu.runner.mm_encoder_manager import (
+    MMEncoderManager,
+    maybe_create_mm_encoder_manager,
+)
+from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
 from vllm_torchtpu.runner.pcp_manager import (
     PcpManager,
     dummy_pcp_kv_gather_fields,
     mla_kv_page_size,
     pcp_kv_gather_fields,
 )
-from vllm_torchtpu.runner.mm_encoder_manager import (
-    MMEncoderManager,
-    maybe_create_mm_encoder_manager,
-)
-from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
 from vllm_torchtpu.runner.speculative_decoding_manager import (
     SpecDecodeMetadata,
     SpeculativeDecodingManager,
@@ -3195,7 +3195,7 @@ class TPUModelRunner(GPUModelRunner):
             num_reqs, self.max_num_reqs
         )
 
-        # TODO(weiyulin) PCP currently supports two layout plan, once 
+        # TODO(weiyulin) PCP currently supports two layout plan, once
         # we merge the batched RPA ring scheduler, we have to unify the interface.
         # pcp_manager: dualchunk input sharding
         # sequence_layout_palnner: sequence interleaved sharding
@@ -3496,9 +3496,7 @@ class TPUModelRunner(GPUModelRunner):
             seq_lens=seq_lens,
             query_start_loc=query_start_loc,
             request_distribution=request_distribution,
-            block_table_rows=(
-                None if pcp_plan is None else pcp_plan.local_block_rows
-            ),
+            block_table_rows=(None if pcp_plan is None else pcp_plan.local_block_rows),
             pcp_kv_gather=(
                 None
                 if pcp_plan is None

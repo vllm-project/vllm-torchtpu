@@ -1269,7 +1269,6 @@ def sparse_mla_attention_dcp(
     )
 
 
-
 def sparse_mla_pcp_write_split(
     kv_cache_nope: jax.Array,
     kv_cache_rope: jax.Array,
@@ -1314,8 +1313,14 @@ def sparse_mla_pcp_write_split(
     out_specs = (sharded, sharded)
 
     def _local(
-        kv_cache_nope, kv_cache_rope, kv_c_normed, k_pe, restore_idx_,
-        split_seq_lens_, split_block_tables_, split_qsl_,
+        kv_cache_nope,
+        kv_cache_rope,
+        kv_c_normed,
+        k_pe,
+        restore_idx_,
+        split_seq_lens_,
+        split_block_tables_,
+        split_qsl_,
     ):
         gather = functools.partial(
             ws.pcp_gather_rows, axis_name=dcp_axis_name, pcp_size=pcp_size
@@ -1414,9 +1419,19 @@ def sparse_mla_attention_pcp_prefill(
     out_specs = sharded
 
     def _local(
-        kv_cache_nope, kv_cache_rope, ql_nope, q_pe, topk_idx,
-        split_block_tables_, ws_req_,
-        ws_vpage_, ws_page_offset_, qsl_, rd_, num_split_, ws_used_pages_,
+        kv_cache_nope,
+        kv_cache_rope,
+        ql_nope,
+        q_pe,
+        topk_idx,
+        split_block_tables_,
+        ws_req_,
+        ws_vpage_,
+        ws_page_offset_,
+        qsl_,
+        rd_,
+        num_split_,
+        ws_used_pages_,
     ):
         num_tokens, num_heads, lkv_dim = ql_nope.shape
 

@@ -178,14 +178,14 @@ def dummy_pcp_kv_gather_fields(
     """Same shapes as `pcp_kv_gather_fields`, for dummy/warmup runs."""
     window = rep_window_size(num_reqs, dcp_size)
     return PcpKvGatherFields(
-        split_query_start_loc=torch.arange(num_reqs + 1, dtype=torch.int32).to(
-            device
-        ),
+        split_query_start_loc=torch.arange(num_reqs + 1, dtype=torch.int32).to(device),
         split_seq_lens=torch.ones((num_reqs,), dtype=torch.int32).to(device),
         hidden_restore_idx=torch.remainder(
             torch.arange(max(restore_capacity, num_tokens * pcp_size)),
             num_tokens * pcp_size,
-        ).to(torch.int32).to(device),
+        )
+        .to(torch.int32)
+        .to(device),
         rep_window=window,
         rep_row_idx=torch.clamp(
             torch.arange(window, dtype=torch.int32), max=num_tokens - 1
@@ -194,9 +194,9 @@ def dummy_pcp_kv_gather_fields(
             torch.arange(window + 1, dtype=torch.int32), max=num_reqs
         ).to(device),
         rep_seq_lens=(torch.arange(window) < num_reqs).to(torch.int32).to(device),
-        rep_request_distribution=torch.tensor(
-            [num_reqs] * 3, dtype=torch.int32
-        ).to(device),
+        rep_request_distribution=torch.tensor([num_reqs] * 3, dtype=torch.int32).to(
+            device
+        ),
         ws_req=torch.zeros((num_ws_pages,), dtype=torch.int32).to(device),
         ws_vpage=torch.zeros((num_ws_pages,), dtype=torch.int32).to(device),
         ws_page_offset=torch.zeros((num_reqs,), dtype=torch.int32).to(device),
@@ -404,9 +404,7 @@ class PcpManager:
         _grow_host_token_buffers(runner, num_packed)
         gather_idx = torch.as_tensor(plan.padded_gather_idx, dtype=torch.long)
         valid = torch.as_tensor(plan.gathered_valid, dtype=torch.bool)
-        packed_ids = torch.where(
-            valid, global_input_ids.index_select(0, gather_idx), 0
-        )
+        packed_ids = torch.where(valid, global_input_ids.index_select(0, gather_idx), 0)
         runner.input_ids_cpu[:num_packed] = packed_ids
         packed_pos = np.where(
             np.asarray(plan.gathered_valid),

@@ -2550,8 +2550,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
         from vllm_torchtpu.layers.adapter import pcp_kv_gather as kvg
 
         assert getattr(layer, "pcp_prefill_op", None) is not None, (
-            "PCP ops were never built; `process_weights_after_loading` must run "
-            "first."
+            "PCP ops were never built; `process_weights_after_loading` must run first."
         )
         pcp = md.pcp_metadata
         assert pcp is not None

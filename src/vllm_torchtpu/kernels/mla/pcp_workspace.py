@@ -57,7 +57,8 @@ def gather_workspace(
 
 
 def position_ordered(workspace: jax.Array, interleave: int) -> jax.Array:
-    """Reorder `[dcp, Pw, P/4, 4, W]` rank-major workspace to `[Pw, dcp * P/4, 4, W]`."""
+    """Reorder the rank-major `[dcp, Pw, P/4, 4, W]` workspace to
+    `[Pw, dcp * P/4, 4, W]`."""
     dcp, num_ws_pages, rows, packing, width = workspace.shape
     page_size = rows * packing
     x = workspace.reshape(dcp, num_ws_pages, page_size // interleave, interleave, width)

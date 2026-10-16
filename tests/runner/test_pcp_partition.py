@@ -103,14 +103,17 @@ def test_only_decodes_replicate():
     assert plan.replicated == [False, True, False]
     for rank in range(4):
         segments = plan.local_segments(rank)
-        tail = segments[plan.num_split_segments(rank):]
+        tail = segments[plan.num_split_segments(rank) :]
         assert [s.req_idx for s in tail] == [1]
     _check_invariants(plan, [3, 1, 63])
 
 
 def test_uneven_prefill_and_padding():
     plan = build_pcp_batch_plan(
-        [10, 1, 7], [True, False, True], pcp_size=2, num_local_tokens_padded=16,
+        [10, 1, 7],
+        [True, False, True],
+        pcp_size=2,
+        num_local_tokens_padded=16,
     )
     assert plan.num_local_tokens_padded == 16
     assert len(plan.padded_gather_idx) == 32
@@ -169,8 +172,7 @@ def test_max_local_tokens_bounds_every_schedulable_step(pcp_size):
 
 def test_workspace_plan_lays_requests_back_to_back():
     # virtual page = 64 tokens; req 1 is a decode and is left out.
-    plan = build_workspace_plan([0, 2], [100, 7, 64], virtual_page_size=64,
-                                num_pages=4)
+    plan = build_workspace_plan([0, 2], [100, 7, 64], virtual_page_size=64, num_pages=4)
     assert plan.page_offset == {0: 0, 2: 2}
     assert plan.ws_req == [0, 0, 2, 0]
     assert plan.ws_vpage == [0, 1, 0, 0]
