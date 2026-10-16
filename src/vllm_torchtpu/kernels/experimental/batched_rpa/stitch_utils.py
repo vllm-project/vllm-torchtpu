@@ -130,7 +130,9 @@ def _stitch_prefill_lane(
         jnp.int32, rolled_u32[..., : cfgs.bkv_sz].shape, 2
     )
     valid_end = bkv_sz_cache + bkv_sz_new
+    cached_valid_end = jnp.minimum(bkv_sz_cache, valid_end)
     merged_cache_u32 = jax.lax.select(
+        lane_idx < cached_valid_end,
         vmem_u32_reshaped[..., : cfgs.bkv_sz],
         jnp.where(lane_idx < valid_end, rolled_u32[..., : cfgs.bkv_sz], 0),
     )
