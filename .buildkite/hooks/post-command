@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+# SPDX-License-Identifier: Apache-2.0
+set -euo pipefail
+
+case "${BUILDKITE_STEP_KEY:-}" in
+  dsv41_flash_dp8_c384_decode) result_name=deepseek-v41-flash-dp8-96k-c384-decode ;;
+  dsv41_flash_dp8_c8_cached_extend) result_name=deepseek-v41-flash-dp8-96k-c8-cached-extend ;;
+  *) exit 0 ;;
+esac
+
+# run_in_docker.sh copies artifacts to the host before this hook runs.
+status=0
+python3 .buildkite/scripts/dsv41_check_summary.py \
+  "perf_eval_results/$result_name/benchmark" \
+  "$BUILDKITE_COMMAND_EXIT_STATUS" "$BUILDKITE_COMMIT" \
+  "$BUILDKITE_BUILD_URL#$BUILDKITE_JOB_ID" || status=$?
+if [[ "$BUILDKITE_COMMAND_EXIT_STATUS" != 0 ]]; then
+  exit "$BUILDKITE_COMMAND_EXIT_STATUS"
+fi
+exit "$status"

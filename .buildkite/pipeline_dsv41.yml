@@ -30,6 +30,7 @@ steps:
         bash .buildkite/scripts/run_in_docker.sh
         python -m pytest --confcutdir=tests/scripts
         tests/scripts/test_dsv41_server_session.py
+        tests/scripts/test_dsv41_check_summary.py
         tests/scripts/test_dsv41_decode_worker_capture.py
         tests/scripts/test_dsv41_decode_accounting.py
         -q --junitxml=/perf_eval_results/dsv41-benchmark-cpu.xml
@@ -117,6 +118,12 @@ steps:
       - label: "DeepSeek-V4.1-Flash: DP8 C384 steady DSpark decode"
         key: "dsv41_flash_dp8_c384_decode"
         # Exercise the default TP1/DP8 CSA2 path before merge as well as on epic.
+        notify:
+          - github_check:
+              name: "DeepSeek-V4.1 DP8 Decode throughput"
+              output:
+                title: "DP8 C384 DSpark decode"
+                summary: "No valid throughput result has been published yet."
         timeout_in_minutes: 180
         agents:
           queue: "tpu_v7x_8_queue"
@@ -136,6 +143,12 @@ steps:
       - label: "DeepSeek-V4.1-Flash: DP8 C8 cached 96K + 16K extend"
         key: "dsv41_flash_dp8_c8_cached_extend"
         # Exercise the default TP1/DP8 CSA2 path before merge as well as on epic.
+        notify:
+          - github_check:
+              name: "DeepSeek-V4.1 DP8 Prefill throughput"
+              output:
+                title: "DP8 C8 cached 96K + 16K extend"
+                summary: "No valid throughput result has been published yet."
         timeout_in_minutes: 180
         agents:
           queue: "tpu_v7x_8_queue"

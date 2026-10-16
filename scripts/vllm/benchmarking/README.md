@@ -177,6 +177,17 @@ logs and `benchmark/fixed/round-*-summary.json` under:
 - `perf_eval_results/deepseek-v41-flash-dp8-96k-c8-cached-extend/`
 - `perf_eval_results/deepseek-v41-flash-dp8-96k-c384-decode/`
 
+Each job also publishes a native GitHub Check with global and per-chip
+throughput, the median across formal rounds, benchmark duration and commit.
+Open the PR's **Checks** tab and select **DeepSeek-V4.1 DP8 Prefill throughput**
+or **DeepSeek-V4.1 DP8 Decode throughput**; reading the summary requires no
+Buildkite account. Duration runs from server launch through shutdown and
+excludes CI queueing, image setup and input preparation. Failed commands or
+incomplete results report no valid throughput. The host `post-command` hook
+updates `notify.github_check.output.summary` after Docker copies results back;
+this requires Buildkite's GitHub App integration. Publication errors fail the
+step, while an existing command failure keeps its original exit code.
+
 The existing harness rejects incomplete requests, incorrect cache hits,
 preemptions, missing full-DP windows and compilation in formal windows. Prefill
 reports new-input host cadence. Decode's primary `decode_throughput` is global
