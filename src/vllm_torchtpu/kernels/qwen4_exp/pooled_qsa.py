@@ -25,6 +25,7 @@ from vllm_torchtpu.kernels.qwen4_exp.qsa_state import (
     read_ring_and_tags,
     write_ring_and_tags,
 )
+from vllm_torchtpu.kernels.qwen4_exp.request_types import decode_prefix
 from vllm_torchtpu.kernels.qwen4_exp.tuned_block_sizes import (
     get_main_kv_dma_batch,
 )
@@ -535,6 +536,7 @@ def select_blocks(
         num_seqs = jnp.max(
             jnp.where(query_lens > 0, jnp.arange(len(context), dtype=jnp.int32) + 1, 0)
         )
+        num_decodes = decode_prefix(starts)
         seq_lens = context + query_lens
         chunk_tokens = 512 if len(query) % 512 == 0 else None
         return streamindex_topk(
@@ -544,7 +546,7 @@ def select_blocks(
             seq_lens,
             expand_pages(table),
             starts,
-            jnp.asarray([0, 0, num_seqs], dtype=jnp.int32),
+            jnp.asarray([num_decodes, num_decodes, num_seqs], dtype=jnp.int32),
             k=block_topk,
             compression_ratio=ratio,
             num_kv_pages_per_block=(256 // rows,) * 3,

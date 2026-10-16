@@ -118,7 +118,10 @@ def test_pooled_ple_matches_private_state_and_preserves_other_pages(dtype, chann
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("fp8", [False, True])
-def test_pooled_qsa_continuation_across_manager_page_and_partial_pairs(fp8):
+@pytest.mark.parametrize("first_query", [1, 3])
+def test_pooled_qsa_continuation_across_manager_page_and_partial_pairs(
+    fp8, first_query
+):
     from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import pooled_qsa_step
     from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import qsa_step
 
@@ -152,7 +155,7 @@ def test_pooled_qsa_continuation_across_manager_page_and_partial_pairs(fp8):
     def expand(t):
         return (t[..., None] * 13 + jnp.arange(13)).reshape(3, -1)
 
-    starts = jnp.array([0, 3, 7, 7], jnp.int32)
+    starts = jnp.array([0, first_query, 7, 7], jnp.int32)
     slots = jnp.array([0, 1, -1], jnp.int32)
     nq, nk, niq, nik = rand((256,)), rand((256,)), rand((128,)), rand((128,))
     angle = jnp.arange(4096)[:, None] * jnp.arange(32)[None, :] / 8192
@@ -174,8 +177,8 @@ def test_pooled_qsa_continuation_across_manager_page_and_partial_pairs(fp8):
     for step in range(3):
         positions = jnp.concatenate(
             [
-                context[0] + jnp.arange(3),
-                context[1] + jnp.arange(4),
+                context[0] + jnp.arange(first_query),
+                context[1] + jnp.arange(7 - first_query),
                 jnp.zeros(1, jnp.int32),
             ]
         )
@@ -221,6 +224,10 @@ def test_pooled_qsa_continuation_across_manager_page_and_partial_pairs(fp8):
             rtol=0.05,
             atol=0.03,
         )
+        assert np.isfinite(np.asarray(actual, np.float32)).all()
+        np.testing.assert_array_equal(
+            np.sort(np.asarray(blocks)), np.sort(np.asarray(selected))
+        )
         # Check full main-cache contents under both scheduler pages.
         expected_main = np.asarray(native).reshape(pool.shape)[[2, 5, 7, 9]]
         np.testing.assert_array_equal(
@@ -251,7 +258,7 @@ def test_pooled_qsa_continuation_across_manager_page_and_partial_pairs(fp8):
         np.testing.assert_array_equal(
             np.asarray(pool)[[0, 11]].view(np.uint8), before[[0, 11]]
         )
-        context = context + jnp.array([3, 4, 0], jnp.int32)
+        context = context + jnp.array([first_query, 7 - first_query, 0], jnp.int32)
 
 
 @pytest.mark.tpu_test

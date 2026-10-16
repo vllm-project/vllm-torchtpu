@@ -111,6 +111,7 @@ def _check_lifecycle(
     index_dim=128,
     ratio=4,
     budget=2048,
+    first_query=3,
 ):
     rng = np.random.default_rng(313)
 
@@ -188,10 +189,12 @@ def _check_lifecycle(
         decode = phase != "prefill"
         tokens = 8 if decode else prefill_count
         starts = jnp.array(
-            [0, 1, 2, 2, 2, 2, 2, 2, 2] if decode else [0, 3, prefill_count], jnp.int32
+            [0, 1, 2, 2, 2, 2, 2, 2, 2] if decode else [0, first_query, prefill_count],
+            jnp.int32,
         )
         context = jnp.array(
-            [context_base + 3, context_base + prefill_count + 1] + [0] * 6
+            [context_base + first_query, context_base + prefill_count - first_query + 4]
+            + [0] * 6
             if decode
             else [context_base, context_base + 4],
             jnp.int32,
@@ -199,10 +202,13 @@ def _check_lifecycle(
         slots = jnp.array([0, 1] + [-1] * 6 if decode else [0, 1], jnp.int32)
         tt = jnp.pad(table, ((0, 6), (0, 0))) if decode else table
         pos = jnp.array(
-            [context_base + 3, context_base + prefill_count + 1] + [0] * 6
+            [context_base + first_query, context_base + prefill_count - first_query + 4]
+            + [0] * 6
             if decode
-            else list(range(context_base, context_base + 3))
-            + list(range(context_base + 4, context_base + prefill_count + 1)),
+            else list(range(context_base, context_base + first_query))
+            + list(
+                range(context_base + 4, context_base + prefill_count - first_query + 4)
+            ),
             jnp.int32,
         )
         producer = (
@@ -319,3 +325,9 @@ def test_empty_step_preserves_native_owners(fp8):
         np.testing.assert_array_equal(actual, expected)
     assert result[4].shape == (0, 768)
     assert result[5].shape == (0, 2051)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("fp8", [False, True])
+def test_mixed_prefill_decode_matches_independent_state_reference(fp8):
+    _check_lifecycle(fp8, 126, 8, first_query=1)
