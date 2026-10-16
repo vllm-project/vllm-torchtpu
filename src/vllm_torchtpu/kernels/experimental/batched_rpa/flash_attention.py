@@ -29,7 +29,36 @@ from vllm_torchtpu.kernels.experimental.batched_rpa.schedule import SmemWrapper
 
 
 def _use_native_fp8(cfgs: configs.RpaConfigs, which: str) -> bool:
-    return cfgs.mode == configs.RpaCase.DECODE and cfgs.serve.native_fp8_enabled(which)
+    if cfgs.mode == configs.RpaCase.DECODE:
+        return cfgs.serve.native_fp8_enabled(which)
+    return cfgs.serve.native_fp8_enabled(which, prefill=True)
+
+
+def _static_fp8(cfgs: configs.RpaConfigs, which: str) -> bool:
+    """Whether a native fp8 operand takes the static scale (prefill only)."""
+    return cfgs.mode != configs.RpaCase.DECODE and cfgs.serve.native_fp8_prefill_static(
+        which
+    )
+
+
+# The softmax weights are at most 1. The static PV path casts p * P_SCALE
+# to fp8, so the PV accumulator carries the factor, and the final division
+# by l (which sums the unscaled weights) removes it. A power of two keeps the
+# product exact in bf16 and below the e4m3 maximum.
+P_SCALE = 256.0
+
+
+def static_pv(cfgs: configs.RpaConfigs) -> bool:
+    """Whether PV takes fp8 weights at the static scale P_SCALE.
+
+    Per-token V scales multiply p before the cast and can push it past the
+    fp8 range, so that case keeps the per-row scale.
+    """
+    return (
+        _use_native_fp8(cfgs, "pv")
+        and _static_fp8(cfgs, "pv")
+        and not cfgs.serve.per_token_scale
+    )
 
 
 # Weight of the low fp8 half in a split (hi + lo / _SPLIT_LO) quantization.
@@ -127,12 +156,18 @@ def flash_attention_qk_softmax(
     diet = vpu_diet_enabled()
     row_scale = None
     native_qk = _use_native_fp8(cfgs, "qk")
-    split_qk = native_qk and cfgs.serve.native_fp8_split("qk")
+    static_qk = native_qk and _static_fp8(cfgs, "qk")
+    split_qk = (
+        native_qk and cfgs.mode == configs.RpaCase.DECODE
+    ) and cfgs.serve.native_fp8_split("qk")
     folded_scale = q_folded_scale(cfgs) if (diet and not native_qk) else None
     if folded_scale is not None and folded_scale != 1.0:
         q = q * jnp.asarray(folded_scale, dtype=q.dtype)
 
-    if native_qk:
+    if static_qk:
+        fp8_max = float(jnp.finfo(k.dtype).max)
+        q = jnp.clip(q, -fp8_max, fp8_max).astype(k.dtype)
+    elif native_qk:
         q, row_scale = _quantize_rows(q, k.dtype, split=split_qk)
     elif cfgs.serve.scale_q is not None:
         q = q / cfgs.serve.scale_q
@@ -273,8 +308,12 @@ def flash_attention_pv(
 
     p_row_scale = None
     native_pv = _use_native_fp8(cfgs, "pv")
-    split_pv = native_pv and cfgs.serve.native_fp8_split("pv")
-    if native_pv:
+    split_pv = (
+        native_pv and cfgs.mode == configs.RpaCase.DECODE
+    ) and cfgs.serve.native_fp8_split("pv")
+    if static_pv(cfgs):
+        p = (p * jnp.asarray(P_SCALE, p.dtype)).astype(v.dtype)
+    elif native_pv:
         p, p_row_scale = _quantize_rows(p, v.dtype, split=split_pv)
     p_rows = 2 * tq if split_pv else tq
 

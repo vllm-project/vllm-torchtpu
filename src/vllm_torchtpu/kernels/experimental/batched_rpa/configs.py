@@ -194,6 +194,12 @@ class ServingConfigs:
     # residual halves stacked along the matmul rows (~bf16 accuracy for 2x
     # LHS rows). Empty: off.
     native_fp8: str = ""
+    # The same for the PREFILL and MIXED kernels: "qk", "pv", "qkpv", each
+    # optionally with "s" for a static operand scale instead of a per-row
+    # one. "qks" casts q to fp8 as is (q after q_norm and RoPE sits well
+    # inside the e4m3 range); "pvs" casts the softmax weights times a fixed
+    # power of two (flash_attention.P_SCALE) and divides it out with l.
+    native_fp8_prefill: str = ""
 
     def __post_init__(self):
         if self.mask_invalid_v is None:
@@ -207,9 +213,13 @@ class ServingConfigs:
         """Whether the native fp8 `which` operand is split into hi/lo halves."""
         return f"{which}2" in self.native_fp8
 
-    def native_fp8_enabled(self, which: str) -> bool:
+    def native_fp8_prefill_static(self, which: str) -> bool:
+        """Whether the prefill `which` operand takes the static fp8 scale."""
+        return f"{which}s" in self.native_fp8_prefill
+
+    def native_fp8_enabled(self, which: str, *, prefill: bool = False) -> bool:
         """Whether the native fp8 `which` ("qk" or "pv") matmul is enabled."""
-        if which not in self.native_fp8:
+        if which not in (self.native_fp8_prefill if prefill else self.native_fp8):
             return False
         is_fp8_kv = jnp.dtype(self.dtype_kv) in (
             jnp.dtype(jnp.float8_e4m3fn),
@@ -504,7 +514,7 @@ class RpaConfigs:
         the sublane dim, where single tokens are addressable.
         """
         if self.serve.kv_layout == KVLayout.SEQ_ALONG_LANE:
-            return pltpu.get_tpu_info().num_lanes
+            return _get_tpu_info().num_lanes
         return 1
 
     @property
