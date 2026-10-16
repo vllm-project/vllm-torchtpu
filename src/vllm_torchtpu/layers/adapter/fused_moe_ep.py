@@ -367,8 +367,9 @@ def fused_moe_ep(
     """
     op = getattr(owner, FUSED_MOE_EP_OP_ATTR)
     if w1.dtype == torch.float4_e2m1fn_x2:
-        # FP4 scales are already [E, K/block, N]. Even a single block must
-        # retain its axis; the per-channel helper would incorrectly drop it.
+        # FP4 scales are already [E, K/block, N] (or the kernel's row-padded
+        # flat [E * rows, N]). Even a single block must retain its axis; the
+        # per-channel helper would incorrectly drop it.
         scales = (w1_scale, w2_scale)
     else:
         scales = (

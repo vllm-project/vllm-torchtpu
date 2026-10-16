@@ -370,6 +370,22 @@ REQUANTIZED_BLOCK_SIZE = (
 )
 
 
+def _row_padded_flat_block_scale(scale: torch.Tensor) -> torch.Tensor:
+    """[E, K/block, 1, N] -> the kernel's row-padded flat [E * rows, N].
+
+    rows is K/block rounded up to the f32 sublane tile (fp4_scale_rows); the
+    padding rows are zero and the kernel never reads them. `clone()` for the
+    reason the 3-D form has one: it makes a real 2-D device buffer rather
+    than a view of the padded 3-D one.
+    """
+    from vllm_torchtpu.kernels.fused_moe.v2.host import fp4_scale_rows
+
+    experts, blocks, _, n = scale.shape
+    rows = fp4_scale_rows(blocks, 1, padded=True)
+    padded = torch.nn.functional.pad(scale.squeeze(2), (0, 0, 0, rows - blocks))
+    return padded.reshape(experts * rows, n).clone()
+
+
 # TODO(upstream): Replace this subclass with upstream vLLM's MXFP4 method once
 # vLLM natively supports DeepSeek-V4 split w1/w3/w2 checkpoint loading.
 class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
@@ -738,19 +754,37 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             # its (1, 128)-tiled layout: the compiled step then relayouts both
             # scale tables (two copies each) in every MoE layer. `clone()`
             # materializes a real 3-D buffer in the kernel's layout.
+            #
+            # It does not, quite: torch_tpu stores the 3-D f32 [E, K/block, N]
+            # table with the block axis major ({2,0,1}), which spares padding
+            # K/block (10 or 5) to 16 sublanes, and the kernel's operand is
+            # {2,1,0}, so the compiled step still copies both tables in every
+            # MoE layer. So register them in the kernel's row-padded flat form
+            # instead (fp4_scale_rows): a 2-D [E * align_up(K/block, 8), N]
+            # buffer, whose only layout is the one the kernel's [E, rows, N]
+            # view of it is a bitcast of. TPU_DEEPSEEK_V41_MOE_SCALE_ROW_PADDED=0
+            # keeps the 3-D tables.
+            row_padded = envs.TPU_DEEPSEEK_V41_MOE_SCALE_ROW_PADDED
+            if row_padded:
+                w13_scale = _row_padded_flat_block_scale(layer.w13_weight_scale)
+                w2_scale = _row_padded_flat_block_scale(layer.w2_weight_scale)
+            else:
+                w13_scale = layer.w13_weight_scale.squeeze(2).clone()
+                w2_scale = layer.w2_weight_scale.squeeze(2).clone()
             layer.register_buffer(
                 "_tpu_fused_w13_scale",
-                layer.w13_weight_scale.squeeze(2).clone(),
+                w13_scale,
                 persistent=False,
             )
             layer.register_buffer(
                 "_tpu_fused_w2_scale",
-                layer.w2_weight_scale.squeeze(2).clone(),
+                w2_scale,
                 persistent=False,
             )
             logger.info_once(
-                "DeepSeek-V4 MXFP4 fused EP W4A8 enabled: block-%d",
+                "DeepSeek-V4 MXFP4 fused EP W4A8 enabled: block-%d%s",
                 REQUANTIZED_BLOCK_SIZE,
+                ", row-padded flat scales" if row_padded else "",
             )
 
     def _forward_monolithic_tpu(

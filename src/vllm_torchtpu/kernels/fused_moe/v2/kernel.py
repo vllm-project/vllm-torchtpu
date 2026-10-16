@@ -528,8 +528,22 @@ def _build_fused_ep_moe_kernel(
     act_fn="silu",
     has_w1_bias=False,
     has_w2_bias=False,
+    pad_scale_rows=False,
 ):
-    """Build the pallas_call and the function that invokes it."""
+    """Build the pallas_call and the function that invokes it.
+
+    `pad_scale_rows` takes the four-bit scale tables as [G, rows, N] with
+    rows = host.fp4_scale_rows(K, rhs_qb, padded=True): K / rhs_qb blocks
+    padded to the f32 sublane tile, the [G * rows, N] row-padded flat operand
+    viewed per expert. Each slot then stages an expert's whole padded table
+    and the FFN reads only its first K / rhs_qb rows, so the result is the
+    unpadded build's bit for bit.
+    """
+    if pad_scale_rows and weight_format != host.WeightFormat.FP4:
+        raise ValueError(
+            "pad_scale_rows describes the four-bit block-scale tables; "
+            f"weight format {weight_format!r} has none"
+        )
     if act_fn not in ACT_FNS:
         raise NotImplementedError(
             f"the fused EP MoE kernel fuses {ACT_FNS}; got {act_fn!r}"
@@ -1526,8 +1540,14 @@ def _build_fused_ep_moe_kernel(
                         # The block scales apply inside
                         # expert_ffn_blockscale, so the epilogues below must
                         # not apply w2s again.
-                        w1s_blocks = w1s_vm[slot]  # [nb1, 2*inter] f32
-                        w2s_blocks = w2s_vm[slot]  # [nb2, hidden] f32
+                        if pad_scale_rows:
+                            # The slot holds the padded table; the rows
+                            # past the last block are padding.
+                            w1s_blocks = w1s_vm[slot, pl.ds(0, hidden // rhs_qb), :]
+                            w2s_blocks = w2s_vm[slot, pl.ds(0, inter // rhs_qb), :]
+                        else:
+                            w1s_blocks = w1s_vm[slot]  # [nb1, 2*inter] f32
+                            w2s_blocks = w2s_vm[slot]  # [nb2, hidden] f32
                         first_tile, last_tile = t == 0, t == n_tiles - 1
                         w1_block, w2_block = _fp4_block_readers(
                             slot,
@@ -1862,6 +1882,7 @@ def _build_fused_ep_moe_kernel(
                 rhs_qb=rhs_qb,
                 has_w1_bias=has_w1_bias,
                 has_w2_bias=has_w2_bias,
+                pad_scale_rows=pad_scale_rows,
             )
         ]
         + [

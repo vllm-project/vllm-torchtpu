@@ -36,6 +36,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     build_routing_tables,
     build_routing_tables_sharded,
     expert_visit_list,
+    fp4_scale_rows,
     local_slab_rows,
     pair_block_hist,
     pow2_shift,
@@ -272,6 +273,10 @@ def fused_ep_moe_v2(
     2 * inter] and [experts, hidden], and per contraction block for fp4
     e2m1, [experts, blocks, 2 * inter] and [experts, blocks, hidden]; on an
     unquantized weight (bf16) there are no scales and both must be None.
+    The fp4 tables may instead come row-padded and flat, [experts * rows,
+    2 * inter] and [experts * rows, hidden] with rows from
+    host.fp4_scale_rows(K, rhs_qb, padded=True), which reads the same values
+    and keeps a per-call relayout of the tables out of the program.
     Both are taken in the kernel's own operand layout, so a table shaped
     for a loader rather than for the kernel is refused. The token rows are
     quantized to fp8 only where the format's matmuls take fp8 rows: an
@@ -355,7 +360,29 @@ def fused_ep_moe_v2(
     # instead stand between the parameter and the kernel call on every call,
     # and it is a layout change rather than free. A table carrying a
     # loader's singleton axes is refused rather than reshaped.
-    if form.has_scales:
+    #
+    # The four-bit tables also come in one more form, the row-padded flat
+    # [E * rows, N] of host.fp4_scale_rows: a 2-D device buffer has only one
+    # layout, so unlike the 3-D table it cannot be stored in a layout the
+    # kernel then has to undo on every call. Both tables take the same form.
+    pad_scale_rows = (
+        form.has_scales
+        and form.scale_layout == "per_contraction_block"
+        and w1_scale.ndim == 2
+    )
+    if pad_scale_rows:
+        for name, s, k, n in (
+            ("w1_scale", w1_scale, hidden, 2 * inter),
+            ("w2_scale", w2_scale, inter, hidden),
+        ):
+            want = (e_total * fp4_scale_rows(k, rhs_qb, padded=True), n)
+            if tuple(s.shape) != want:
+                raise ValueError(
+                    f"{name} layout {tuple(s.shape)} is not the row-padded "
+                    f"flat per_contraction_block form {want} the kernel "
+                    "takes"
+                )
+    elif form.has_scales:
         ndim = 3 if form.scale_layout == "per_contraction_block" else 2
         for name, s, n in (
             ("w1_scale", w1_scale, 2 * inter),
@@ -441,6 +468,7 @@ def fused_ep_moe_v2(
         act_fn=act_fn,
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
+        pad_scale_rows=pad_scale_rows,
     )
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
@@ -450,8 +478,18 @@ def fused_ep_moe_v2(
         # had: a format that supplies no scales drops them out of the middle
         # rather than moving anything that stayed.
         operands = iter(scales_gating_biases)
-        w1s_l = next(operands) if form.has_scales else None
-        w2s_l = next(operands) if form.has_scales else None
+        if pad_scale_rows:
+            # [G * rows, N] -> [G, rows, N]: whole sublane tiles per expert,
+            # so this is a bitcast of the operand rather than a relayout.
+            w1s_l = next(operands).reshape(
+                g_local, fp4_scale_rows(hidden, rhs_qb, padded=True), 2 * inter
+            )
+            w2s_l = next(operands).reshape(
+                g_local, fp4_scale_rows(inter, rhs_qb, padded=True), hidden
+            )
+        else:
+            w1s_l = next(operands) if form.has_scales else None
+            w2s_l = next(operands) if form.has_scales else None
         gate_l = next(operands)
         hash_l = next(operands) if has_hash_ids else None
         score_bias_l = next(operands) if has_score_bias else None
@@ -757,6 +795,7 @@ def fused_ep_moe_v2(
         w1.dtype,
         w2.dtype,
         form.has_scales and w1_scale.dtype,
+        pad_scale_rows,
         gating.dtype,
         has_w1_bias and w1_bias.dtype,
         has_w2_bias and w2_bias.dtype,

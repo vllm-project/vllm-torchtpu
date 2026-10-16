@@ -16,6 +16,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_LOCAL_Q: bool = False
     TPU_DEEPSEEK_V41_PREFILL_INDEXER: str = "streaming"
     TPU_DEEPSEEK_V41_INDEX_KEY_LAYOUT: str = "halfplane"
+    TPU_DEEPSEEK_V41_MOE_SCALE_ROW_PADDED: bool = True
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
@@ -403,6 +404,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # o_group on that shard, shrinking both attention all_to_alls.
     # Costs replicated wq_b/wo_a HBM per rank.
     "TPU_DEEPSEEK_V41_LOCAL_Q": env_bool("TPU_DEEPSEEK_V41_LOCAL_Q", default=False),
+    # Register the fused EP MXFP4 block-scale tables as row-padded flat 2-D
+    # [E * align_up(K/block, 8), N] buffers: one layout, so the kernel's
+    # [E, rows, N] view is a bitcast instead of a per-layer relayout copy.
+    "TPU_DEEPSEEK_V41_MOE_SCALE_ROW_PADDED": env_bool(
+        "TPU_DEEPSEEK_V41_MOE_SCALE_ROW_PADDED", default=True
+    ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # Keep the staged block tables on device between steps and upload only

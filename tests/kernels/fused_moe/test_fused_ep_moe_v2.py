@@ -796,3 +796,98 @@ def test_fp4_agrees_across_every_weight_schedule(at_prefetch_depth):
             deepest,
             err_msg=f"depth {depth} disagrees with the deepest schedule",
         )
+
+
+# --------------------------------------------------------------------------- #
+# The row-padded flat fp4 scale operand.
+#
+# A 3-D f32 [E, K / qb, N] table is stored by torch_tpu with the block axis
+# major whenever K / qb is not a whole sublane tile, and the kernel's operand
+# is row-major, so every call re-lays the tables out. The [E * rows, N] form,
+# rows = K / qb padded to the sublane tile, has only the one layout. It has to
+# read exactly the values the 3-D form does.
+# --------------------------------------------------------------------------- #
+
+
+def _row_padded_flat(mesh, scale, k, rhs_qb):
+    """`scale` [E, K / qb, N] as the [E * rows, N] row-padded flat operand.
+
+    The padding rows are NaN, not zero: a kernel that read one would carry
+    the NaN into the output rather than agree by accident.
+    """
+    s = np.asarray(scale)
+    experts, blocks, n = s.shape
+    rows = host.fp4_scale_rows(k, rhs_qb, padded=True)
+    assert rows % host.U32_SUBLANE_TILE == 0 and rows >= blocks
+    padded = np.full((experts, rows, n), np.nan, np.float32)
+    padded[:, :blocks] = s
+    return jax.device_put(
+        padded.reshape(experts * rows, n), NamedSharding(mesh, P(AXIS))
+    )
+
+
+@pytest.mark.parametrize(
+    "hidden,inter,rhs_qb",
+    [
+        # DeepSeek-V4.1's block counts (10 and 5), both off the sublane tile.
+        (1280, 640, 128),
+        # Several blocks on W1 and a single-block W2.
+        (1024, 512, 512),
+    ],
+)
+def test_fp4_row_padded_flat_scales_are_bit_exact(hidden, inter, rhs_qb):
+    """The row-padded flat scale tables give the 3-D tables' output, bit for
+    bit, at each weight schedule's default depth."""
+    mesh = _mesh()
+    e_total, topk, tokens = 32, 4, 256
+    weights, scales, _ = _make_fp4_weights(
+        mesh, 46, hidden=hidden, inter=inter, e_total=e_total, rhs_qb=rhs_qb
+    )
+    x, gating = _make_inputs(mesh, 47, tokens=tokens, hidden=hidden, e_total=e_total)
+    flat = (
+        _row_padded_flat(mesh, scales[0], hidden, rhs_qb),
+        _row_padded_flat(mesh, scales[1], inter, rhs_qb),
+    )
+    common = dict(
+        topk=topk,
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=rhs_qb,
+        sharded_plan=True,
+    )
+    ref = np.asarray(fused_ep_moe_v2(x, *weights, *scales, gating, **common))
+    out = np.asarray(fused_ep_moe_v2(x, *weights, *flat, gating, **common))
+    assert np.isfinite(out.astype(np.float32)).all()
+    np.testing.assert_array_equal(out, ref)
+
+
+def test_fp4_row_padded_flat_scales_refuse_the_wrong_row_count():
+    """A flat table whose rows are not the padded block count is refused by
+    name rather than read at the wrong expert offsets."""
+    mesh = _mesh()
+    hidden, inter, rhs_qb, e_total = 1280, 640, 128, 32
+    weights, scales, _ = _make_fp4_weights(
+        mesh, 48, hidden=hidden, inter=inter, e_total=e_total, rhs_qb=rhs_qb
+    )
+    x, gating = _make_inputs(mesh, 49, tokens=256, hidden=hidden, e_total=e_total)
+    unpadded = tuple(
+        jax.device_put(
+            np.asarray(s).reshape(-1, s.shape[-1]), NamedSharding(mesh, P(AXIS))
+        )
+        for s in scales
+    )
+    with pytest.raises(ValueError, match="row-padded flat"):
+        fused_ep_moe_v2(
+            x,
+            *weights,
+            *unpadded,
+            gating,
+            topk=4,
+            renormalize=True,
+            mesh=mesh,
+            capacity=CAPACITY,
+            weight_format=WeightFormat.FP4,
+            rhs_qb=rhs_qb,
+        )
