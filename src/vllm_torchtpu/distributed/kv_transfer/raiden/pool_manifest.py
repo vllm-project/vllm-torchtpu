@@ -1589,11 +1589,199 @@ def _dsv4_check_role_rows(
             )
 
 
+def _build_dsv41_pool_manifest(
+    *,
+    named_kv_caches: Mapping[str, Any],
+    kv_cache_groups: Sequence[Any],
+    raw_tensors: Sequence[Any],
+    materialized: Any,
+) -> PoolManifest:
+    """Builds the Pool Manifest for DeepSeek-V4.1 shared word-row KV pools."""
+    layouts = getattr(materialized, "native_cache_layouts", None) or {}
+    raw_by_layer = getattr(materialized, "native_raw_cache", None) or {}
+    rope_pools = getattr(materialized, "rope_pools", None) or {}
+    scale_pools = getattr(materialized, "scale_pools", None) or {}
+    if not layouts:
+        raise ManifestError("DSv4.1 materialized KV cache has no native_cache_layouts")
+
+    storages = _StorageTable()
+    for raw in raw_tensors:
+        storages.index_for(raw)
+
+    pools: list[PoolEntry] = []
+    claimed_ranges: dict[tuple[int, int], list[tuple[int, int, str]]] = {}
+
+    def _claim_range(
+        group_idx: int,
+        storage_idx: int,
+        base_offset: int,
+        live_bytes: int,
+        stride: int,
+        layer: str,
+    ) -> None:
+        page_offset = base_offset % stride if stride > 0 else base_offset
+        end_offset = page_offset + live_bytes
+        if stride > 0 and end_offset > stride:
+            raise ManifestError(
+                f"DSv4.1 layer {layer} live range [{page_offset}, {end_offset}) "
+                f"exceeds block stride {stride}"
+            )
+        existing = claimed_ranges.setdefault((group_idx, storage_idx), [])
+        for prev_start, prev_end, prev_layer in existing:
+            if page_offset < prev_end and prev_start < end_offset:
+                raise ManifestError(
+                    f"DSv4.1 layers {prev_layer} and {layer} overlap in "
+                    f"(group={group_idx}, storage={storage_idx}): "
+                    f"[{prev_start}, {prev_end}) vs [{page_offset}, {end_offset})"
+                )
+        existing.append((page_offset, end_offset, layer))
+
+    for group_index, group in enumerate(kv_cache_groups):
+        for layer_name in group.layer_names:
+            if layer_name not in layouts:
+                if layer_name in named_kv_caches:
+                    # KV-sharing consumer layer aliasing a source layer's cache.
+                    continue
+                raise ManifestError(
+                    f"DSv4.1 layer {layer_name} has no native cache layout"
+                )
+            raw = raw_by_layer.get(layer_name)
+            if raw is None or isinstance(raw, tuple):
+                raise ManifestError(
+                    f"DSv4.1 layer {layer_name} requires a single-bank raw pool"
+                )
+            shape, dtype, stride_bytes, offset_bytes = layouts[layer_name]
+            num_blocks, rows = int(shape[0]), int(shape[1])
+            itemsize = int(
+                getattr(dtype, "itemsize", 0)
+                or _element_size(named_kv_caches[layer_name])
+            )
+            row_bytes = math.prod(int(d) for d in shape[2:]) * itemsize
+            stride_bytes = int(stride_bytes)
+            offset_bytes = int(offset_bytes)
+            spec = _dsv4_layer_spec(group.kv_cache_spec, layer_name)
+            tokens_per_state = int(getattr(spec, "tokens_per_state", 1) or 1)
+
+            rope = rope_pools.get(layer_name)
+            scale = scale_pools.get(layer_name)
+            if isinstance(rope, tuple) or isinstance(scale, tuple):
+                raise ManifestError(
+                    f"DSv4.1 layer {layer_name} companion pool must be single-bank"
+                )
+
+            if layer_name.endswith(DSV4_STATE_CACHE_SUFFIX):
+                kv_layer = dsv4_compressed_kv_layer_name(layer_name)
+                tag_base = (
+                    TAG_DSV4_STATE_IDX
+                    if kv_layer.endswith(DSV4_INDEXER_CACHE_SUFFIX)
+                    else TAG_DSV4_STATE_CSA
+                )
+            elif "swa_cache" in layer_name:
+                tag_base = TAG_DSV4_SWA
+            elif layer_name.endswith(DSV4_INDEXER_CACHE_SUFFIX):
+                tag_base = f"{TAG_DSV4_IDX}.r{tokens_per_state}"
+            else:
+                has_companion = (rope is not None) or (scale is not None)
+                base = TAG_DSV4_CSA_NOPE if has_companion else TAG_DSV4_HCA
+                tag_base = f"{base}.r{tokens_per_state}"
+
+            storage_index = storages.index_for(raw)
+            _claim_range(
+                group_index,
+                storage_index,
+                offset_bytes,
+                rows * row_bytes,
+                stride_bytes,
+                layer_name,
+            )
+            pools.append(
+                PoolEntry(
+                    tag=dsv4_group_tag(tag_base, group_index),
+                    layer_name=layer_name,
+                    storage_index=storage_index,
+                    base_offset_bytes=offset_bytes,
+                    block_stride_bytes=stride_bytes,
+                    num_blocks=num_blocks,
+                    regions=_dsv4_row_region(row_bytes=row_bytes, num_rows=rows),
+                    dtype_tag=_dtype_tag(raw),
+                )
+            )
+
+            if rope is not None:
+                rope_row_bytes = 128
+                rope_offset = offset_bytes // 4
+                rope_stride = stride_bytes // 4
+                rope_storage_index = storages.index_for(rope)
+                rope_tag_base = f"{TAG_DSV4_CSA_ROPE}.r{tokens_per_state}"
+                _claim_range(
+                    group_index,
+                    rope_storage_index,
+                    rope_offset,
+                    rows * rope_row_bytes,
+                    rope_stride,
+                    f"{layer_name}.rope",
+                )
+                pools.append(
+                    PoolEntry(
+                        tag=dsv4_group_tag(rope_tag_base, group_index),
+                        layer_name=layer_name,
+                        storage_index=rope_storage_index,
+                        base_offset_bytes=rope_offset,
+                        block_stride_bytes=rope_stride,
+                        num_blocks=num_blocks,
+                        regions=_dsv4_row_region(
+                            row_bytes=rope_row_bytes, num_rows=rows
+                        ),
+                        dtype_tag=_dtype_tag(rope),
+                    )
+                )
+            elif scale is not None:
+                scale_row_bytes = 4
+                scale_offset = offset_bytes // 128
+                scale_stride = stride_bytes // 128
+                scale_storage_index = storages.index_for(scale)
+                scale_tag_base = f"{TAG_DSV4_CSA_ROPE}.scale.r{tokens_per_state}"
+                _claim_range(
+                    group_index,
+                    scale_storage_index,
+                    scale_offset,
+                    rows * scale_row_bytes,
+                    scale_stride,
+                    f"{layer_name}.scale",
+                )
+                pools.append(
+                    PoolEntry(
+                        tag=dsv4_group_tag(scale_tag_base, group_index),
+                        layer_name=layer_name,
+                        storage_index=scale_storage_index,
+                        base_offset_bytes=scale_offset,
+                        block_stride_bytes=scale_stride,
+                        num_blocks=num_blocks,
+                        regions=_dsv4_row_region(
+                            row_bytes=scale_row_bytes, num_rows=rows
+                        ),
+                        dtype_tag=_dtype_tag(scale),
+                    )
+                )
+
+    if not pools:
+        raise ManifestError("DSv4.1 admission produced no pool entries")
+    manifest = PoolManifest(
+        binding=BINDING_ALIASED_RAW, storages=storages.storages, pools=pools
+    )
+    block_counts = {pool.num_blocks for pool in manifest.pools}
+    if len(block_counts) != 1:
+        raise ManifestError(f"pools disagree on num_blocks: {sorted(block_counts)}")
+    manifest.geometry_by_tag()
+    return manifest
+
+
 def build_dsv4_pool_manifest(
     *,
     named_kv_caches: Mapping[str, Any],
     kv_cache_groups: Sequence[Any],
     raw_tensors: Sequence[Any],
+    dsv41_materialized_kv: Any | None = None,
 ) -> PoolManifest:
     """Builds the Pool Manifest for DeepSeek-V4, one pool per (layer, array).
 
@@ -1609,6 +1797,13 @@ def build_dsv4_pool_manifest(
         raise ManifestError("named_kv_caches is empty")
     if not kv_cache_groups:
         raise ManifestError("DSv4 admission needs at least one KV cache group")
+    if dsv41_materialized_kv is not None:
+        return _build_dsv41_pool_manifest(
+            named_kv_caches=named_kv_caches,
+            kv_cache_groups=kv_cache_groups,
+            raw_tensors=raw_tensors,
+            materialized=dsv41_materialized_kv,
+        )
 
     entries = _dsv4_classify(kv_cache_groups, named_kv_caches)
 

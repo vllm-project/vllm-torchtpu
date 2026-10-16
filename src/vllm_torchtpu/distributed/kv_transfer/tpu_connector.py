@@ -1556,9 +1556,13 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             return "Stage-3 source transfer parallelism must be a positive integer"
         tp_size = int(self.vllm_config.parallel_config.tensor_parallel_size)
         dcp_size = int(self.vllm_config.parallel_config.decode_context_parallel_size)
-        if not _uses_tp_stage3_source(self.vllm_config) and (
-            _as_int(params.get("dst_tp_size")) != tp_size
-            or _as_int(params.get("dst_dcp_size")) != dcp_size
+        if (
+            not _uses_tp_stage3_source(self.vllm_config)
+            and not _use_raiden_dsv4_admission()
+            and (
+                _as_int(params.get("dst_tp_size")) != tp_size
+                or _as_int(params.get("dst_dcp_size")) != dcp_size
+            )
         ):
             return (
                 "Stage-3 metadata requires explicit matching destination "
@@ -2195,10 +2199,11 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         if src_parallelism <= 0:
             raise ValueError("TPU_RAIDEN_TRANSFER_PARALLELISM must be positive")
         if _use_raiden_dsv4_admission():
-            if src_parallelism != 1:
+            tp_size = int(parallel_config.tensor_parallel_size or 1)
+            if src_parallelism != tp_size:
                 raise ValueError(
-                    "Stage-3 DSv4 producer transfer parallelism must be 1 "
-                    f"under DP attention; got {src_parallelism}"
+                    "Stage-3 DSv4 producer transfer parallelism must equal "
+                    f"TP size ({tp_size}); got {src_parallelism}"
                 )
         elif _uses_tp_stage3_source(self.vllm_config):
             tp_size = int(parallel_config.tensor_parallel_size or 1)
@@ -2313,7 +2318,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             return int(
                 parallel_config.tensor_parallel_size or 1
             ) * _pipeline_parallel_size(self.vllm_config)
-        if _uses_tp_stage3_source(self.vllm_config):
+        if _uses_tp_stage3_source(self.vllm_config) or _use_raiden_dsv4_admission():
             return int(parallel_config.tensor_parallel_size or 1)
         if _engine_is_pipeline(self.vllm_config):
             return _pipeline_parallel_size(self.vllm_config)
@@ -2920,10 +2925,12 @@ class TPURaidenConnectorWorker:
         kv_cache_groups = tuple(runner.kv_cache_config.kv_cache_groups or ())
         raw_tensors = tuple(runner.kv_cache_raw_tensors or ())
 
+        dsv41_materialized_kv = getattr(runner, "dsv41_materialized_kv", None)
         manifest = rpm.build_dsv4_pool_manifest(
             named_kv_caches=named_kv_caches,
             kv_cache_groups=kv_cache_groups,
             raw_tensors=raw_tensors,
+            dsv41_materialized_kv=dsv41_materialized_kv,
         )
         rpm.verify_storage_binding(
             manifest=manifest,
@@ -3029,19 +3036,22 @@ class TPURaidenConnectorWorker:
         return tuple(pools)
 
     def _raiden_dsv4_admission_topology(self) -> str:
-        """Step 1: P and D run the same DP-attention sharding, so each rank
-        owns whole requests and there is nothing to stripe."""
+        """Supports DP attention (tp1/dp{N}) and TP-replicated KV (tp{N}/dp1)."""
         parallel_config = self.vllm_config.parallel_config
         pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
         tp_size = int(self.tp_size)
         dp_size = int(parallel_config.data_parallel_size or 1)
-        if pcp_size != 1 or tp_size != 1:
+        if pcp_size != 1 or (tp_size > 1 and dp_size > 1):
             raise ValueError(
-                "Raiden DSv4 admission supports DP attention only "
-                f"(tp1/pcp1); got tensor_parallel_size={tp_size}, "
+                "Raiden DSv4 admission supports tp1/dp{N} or tp{N}/dp1 only "
+                f"(pcp1); got tensor_parallel_size={tp_size}, "
+                f"data_parallel_size={dp_size}, "
                 f"prefill_context_parallel_size={pcp_size}"
             )
-        return f"dp{dp_size}_prefill" if self.is_producer else f"dp{dp_size}_decode"
+        role = "prefill" if self.is_producer else "decode"
+        if tp_size > 1:
+            return f"tp{tp_size}_{role}"
+        return f"dp{dp_size}_{role}"
 
     @staticmethod
     def _measure_raiden_dsv4_layout(
@@ -3144,12 +3154,10 @@ class TPURaidenConnectorWorker:
         byte-span lowering assumes: TP ranks for GLM and Kimi, a single rank
         for DSv4, PCP ranks otherwise."""
         if _use_raiden_dsv4_admission():
-            # DP attention: every rank owns whole requests, so there is one
-            # transfer rank and no page striping.
-            if transfer_parallelism != 1:
+            if transfer_parallelism != int(self.tp_size):
                 raise ValueError(
-                    "DSv4 producer transfer parallelism must be 1 under DP "
-                    f"attention; got {transfer_parallelism}"
+                    "DSv4 producer transfer parallelism must equal TP size "
+                    f"({self.tp_size}); got {transfer_parallelism}"
                 )
             return
         if _uses_tp_stage3_source(self.vllm_config):
@@ -3221,8 +3229,7 @@ class TPURaidenConnectorWorker:
         if _uses_tp_stage3_source(self.vllm_config):
             return int(self.tp_rank)
         if _use_raiden_dsv4_admission():
-            # DP attention: one transfer rank per engine.
-            return 0
+            return int(self.tp_rank)
         # The chunk whose KV this worker holds is the one its kernels computed,
         # so this is the kernels' partition index. That index is the position
         # of this worker's device in the PCP mesh, and the mesh is built in
@@ -3334,6 +3341,8 @@ class TPURaidenConnectorWorker:
             not self.is_producer
             or transfer_parallelism == 1
             or _engine_is_pipeline(self.vllm_config)
+            or _uses_tp_stage3_source(self.vllm_config)
+            or _use_raiden_dsv4_admission()
         ):
             return page_tokens
         parallel_config = self.vllm_config.parallel_config
@@ -5727,14 +5736,25 @@ class TPURaidenConnectorWorker:
             # order fixes the H2D order ranks executor-side (the first
             # tag = group 0 uploads first). Each tag replays over the
             # same destination pages.
-            transfer_tags = (
-                list(self._stage3_row_geometry)
-                if _use_raiden_glm_admission()
-                else self._stage3_fa_registration_tags()
-            )
+            if _use_raiden_dsv4_admission():
+                group_blocks = self._stage3_dsv4_group_blocks(req_meta, num_tokens)
+                transfer_tags = []
+                dst_blocks = []
+                dst_counts = []
+                for pool in self._stage3_dsv4_plan:
+                    pages = group_blocks[pool.plan_position].pages
+                    transfer_tags.append(pool.tag)
+                    dst_blocks.extend(pages)
+                    dst_counts.append(len(pages))
+            else:
+                transfer_tags = (
+                    list(self._stage3_row_geometry)
+                    if _use_raiden_glm_admission()
+                    else self._stage3_fa_registration_tags()
+                )
+                dst_blocks = list(local_blocks) * len(transfer_tags)
+                dst_counts = [len(local_blocks)] * len(transfer_tags)
             fa_tag_count = len(transfer_tags)
-            dst_blocks = list(local_blocks) * len(transfer_tags)
-            dst_counts = [len(local_blocks)] * len(transfer_tags)
             mamba_state_block_ids = getattr(req_meta, "mamba_state_block_ids", None)
             if self._stage3_state_group_count:
                 if (

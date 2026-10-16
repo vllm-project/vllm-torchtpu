@@ -53,6 +53,8 @@ def reserve_rope_companion(vllm_config, available: int, *, auto: bool = False) -
         quantum = 1 << max(0, available.bit_length() - 6)
         available = available // quantum * quantum
     main_budget = available * 4 // 5
+    if envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER:
+        return min(main_budget, SPARSECORE_MAX_POOL_BYTES)
     if main_budget < SPARSECORE_MAX_POOL_BYTES + SPARSECORE_MIN_SECOND_BANK_BYTES:
         return min(main_budget, SPARSECORE_MAX_POOL_BYTES)
     return min(
@@ -257,9 +259,16 @@ def materialize_upstream_kv_cache(
             for bank in pair
         ]
     else:
+        pool_rows = pool_bytes // ROW_BYTES
+        if word_rows and envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER:
+            # Pad the leading row dimension to a multiple of 1024 so 1D FP32
+            # CSA2 scale companions (which TPU tiles to 1024 elements) have
+            # zero device-side tile padding and satisfy Raiden's
+            # `physical_size % major_dim_size == 0` invariant for any block count.
+            pool_rows = ((pool_rows + 1023) // 1024) * 1024
         raw_tensors = [
             torch.zeros(
-                (pool_bytes // ROW_BYTES, ROW_WORDS) if word_rows else (pool_bytes,),
+                (pool_rows, ROW_WORDS) if word_rows else (pool_bytes,),
                 dtype=torch.int32 if word_rows else torch.int8,
                 device=device,
             )

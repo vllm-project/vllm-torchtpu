@@ -356,15 +356,35 @@ def _measure_packed_row_layouts(
         tag = class_tag(pool.tag)
         tensor = manifest.storages[pool.storage_index]
         shape = tuple(int(dim) for dim in getattr(tensor, "shape", ()))
-        word_rows = len(shape) == 3 and int(tensor.element_size()) == 4
+        word_rows_1d = (
+            len(shape) == 1
+            and int(tensor.element_size()) == 4
+            and len(pool.regions) == 1
+        )
+        word_rows_2d = (
+            len(shape) == 2
+            and int(tensor.element_size()) == 4
+            and len(pool.regions) == 1
+        )
+        word_rows = (
+            (len(shape) == 3 and int(tensor.element_size()) == 4)
+            or word_rows_2d
+            or word_rows_1d
+        )
         if len(shape) != 4 and not word_rows:
             raise RuntimeError(
                 f"admitted {pool.tag} storage must be rank-4: shape={shape}"
             )
-        known = shape_by_tag.setdefault(tag, shape)
-        if known != shape:
+        region = pool.regions[0] if (word_rows_2d or word_rows_1d) else None
+        shape_key = (
+            (int(region.num_units), int(region.unit_bytes), shape[-1])
+            if region is not None
+            else shape
+        )
+        known = shape_by_tag.setdefault(tag, shape_key)
+        if known != shape_key:
             raise RuntimeError(
-                f"admitted {pool.tag} storages disagree on shape: {known} vs {shape}"
+                f"admitted {pool.tag} storages disagree on shape: {known} vs {shape_key}"
             )
         layout = getter(tensor)
         if layout is None:
@@ -377,8 +397,17 @@ def _measure_packed_row_layouts(
         # The measured element bits are unreliable (0 for these tensors);
         # the dtype is authoritative.
         element_bits = 8 * int(tensor.element_size())
-        rows, width = shape[1], shape[-1]
-        packing = 1 if word_rows else shape[2]
+        if region is not None:
+            rows = int(region.num_units)
+            width = shape[-1]
+            packing = 1
+            row_bytes = int(region.unit_bytes)
+            page_width = row_bytes // int(tensor.element_size())
+        else:
+            rows, width = shape[1], shape[-1]
+            packing = 1 if word_rows else shape[2]
+            row_bytes = packing * width * element_bits // 8
+            page_width = width
         if page_tokens is not None:
             page_rows_tokens = rows if tag == TAG_MLA_NOPE else rows * packing
             if page_rows_tokens != page_tokens:
@@ -387,7 +416,9 @@ def _measure_packed_row_layouts(
                     f"match page_tokens {page_tokens}"
                 )
         expected_order = (
-            _row_major_minor_to_major(3) if word_rows else ROW_CACHE_MINOR_TO_MAJOR
+            _row_major_minor_to_major(len(shape))
+            if word_rows
+            else ROW_CACHE_MINOR_TO_MAJOR
         )
         if minor_to_major != expected_order:
             raise RuntimeError(
@@ -395,7 +426,15 @@ def _measure_packed_row_layouts(
                 f"tag={pool.tag}, layer={pool.layer_name}, "
                 f"minor_to_major={minor_to_major}"
             )
-        if word_rows:
+        if word_rows_1d:
+            tiles_ok = len(tiles) <= 1
+        elif word_rows_2d:
+            tiles_ok = (
+                len(tiles) == 1
+                and tiles[0][1] == width
+                and shape[0] % tiles[0][0] == 0
+            )
+        elif word_rows:
             # A row prefix is a byte prefix only under one tile level that
             # spans the row and divides the page. XLA shrinks the (8, 128)
             # tile on pages under 8 rows rather than padding them.
@@ -412,12 +451,12 @@ def _measure_packed_row_layouts(
         measured = per_tag.setdefault(
             tag,
             {
-                "row_bytes": packing * width * element_bits // 8,
+                "row_bytes": row_bytes,
                 "minor_to_major": list(minor_to_major),
                 "tiles": [list(tile) for tile in tiles],
                 "element_size_in_bits": element_bits,
             },
         )
         if include_page_shape:
-            measured["page_shape"] = [rows, packing, width]
+            measured["page_shape"] = [rows, packing, page_width]
     return per_tag
