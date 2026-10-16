@@ -119,10 +119,8 @@ FORWARD=(
   # Names the directory whose contents the pod uploads as artifacts.
   ARTIFACTS_DIR
   # The Kimi-K3 AgentX pair's job switches, read by k3_agentx_client_pod.sh
-  # and the megakernel recipe:
-  # the eval-only job (the eval step's own env, distinct from the
-  # K3_AGENTX_EVAL_ONLY build trigger), the eval smoke, and skipping the
-  # post-replay eval.
+  # and the megakernel recipe: the eval-only job, the eval smoke, and skipping
+  # the post-replay eval.
   AGENTX_EVAL_JOB AGENTX_EVAL_SMOKE AGENTX_SKIP_POST_EVAL
   # The config both engines of the pair and its client read, when a step serves
   # another than the manifest's default (a Kimi-K3 megakernel recipe point).
