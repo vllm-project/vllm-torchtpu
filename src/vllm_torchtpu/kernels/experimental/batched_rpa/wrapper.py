@@ -25,6 +25,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs,
     kernel,
@@ -576,6 +577,7 @@ def calculate_block_sizes(
         "return_lse",
         "mask_invalid_v",
         "native_fp8",
+        "native_fp8_prefill",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -622,6 +624,7 @@ def ragged_paged_attention(
     return_lse: bool = False,
     mask_invalid_v: bool | None = None,
     native_fp8: str = "",
+    native_fp8_prefill: str | None = None,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -693,6 +696,10 @@ def ragged_paged_attention(
             the fp8 KV dtype ("qk", "pv", "qkpv", or with hi/lo split operands
             "qk2", "pv2", "qk2pv2"); see
             `configs.ServingConfigs.native_fp8`. Defaults to "" (off).
+        native_fp8_prefill: The same for the PREFILL and MIXED kernels ("qk",
+            "pv", "qkpv", each operand optionally with "s" for its static
+            scale, e.g. "qkpvs"); see `configs.ServingConfigs`. Defaults to
+            the TPU_RPA_NATIVE_FP8_PREFILL environment variable (unset: off).
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -766,8 +773,18 @@ def ragged_paged_attention(
             f"native_fp8 must match (qk[2])(pv[2]), e.g. qkpv or qk2pv2; got "
             f"{native_fp8!r}"
         )
+    if native_fp8_prefill is None:
+        native_fp8_prefill = envs.TPU_RPA_NATIVE_FP8_PREFILL
+    if native_fp8_prefill not in ("", "0") and not re.fullmatch(
+        r"(qks?)?(pvs?)?", native_fp8_prefill
+    ):
+        raise ValueError(
+            f"native_fp8_prefill must match (qk[s])(pv[s]), e.g. qkpv or pvs; "
+            f"got {native_fp8_prefill!r}"
+        )
     serve_cfgs = configs.ServingConfigs(
         native_fp8="" if native_fp8 == "0" else native_fp8,
+        native_fp8_prefill="" if native_fp8_prefill == "0" else native_fp8_prefill,
         num_seqs=max_num_seqs,
         num_page_indices=num_page_indices,
         total_q_tokens=queries.shape[0],
