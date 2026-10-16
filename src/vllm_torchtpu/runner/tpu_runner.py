@@ -365,6 +365,33 @@ def _substitute_placeholder_token(
 logger = init_logger(__name__)
 
 
+def _rotate_precompile_sweep(items: Collection[Any], sweep: str) -> list[Any]:
+    """Start this local rank at its own share of a precompile sweep.
+
+    Under TPU_PARALLEL_PRECOMPILE every rank walks every shape of the sweep.
+    Starting each local rank at its own share (8 local ranks per host, as
+    compile_all_ranges assumes) lets the ranks of a host compile different
+    shapes first, so later shapes are mostly loads from the compile cache they
+    share. Ranks then reach a given shape at different times, which is safe
+    only for sweeps whose graphs hold no collective; the tests in
+    tests/runner/test_rejection_sampler_sweep.py and
+    tests/runner/test_sampler_sweeps.py trace them to check.
+    """
+    items = list(items)
+    if not envs.TPU_PARALLEL_PRECOMPILE or not items:
+        return items
+    local_rank = int(os.environ.get("LOCAL_RANK", "0")) % 8
+    start = local_rank * len(items) // 8
+    logger.info(
+        "Rotating the %s precompile sweep: local rank %d starts at shape %d of %d.",
+        sweep,
+        local_rank,
+        start + 1,
+        len(items),
+    )
+    return items[start:] + items[:start]
+
+
 def _spec_warmup_all_token_ids(
     req_ids: list[str], num_computed_tokens: list[int]
 ) -> dict[str, list[int]]:
@@ -5955,7 +5982,9 @@ class TPUModelRunner(GPUModelRunner):
     def _precompile_structured_decoding(self) -> None:
         with self._precompile_timed("structured_decoding"):
             arange = self.structured_decoding_manager.structured_decode_arange
-            for num_reqs in self.num_reqs_paddings:
+            for num_reqs in _rotate_precompile_sweep(
+                self.num_reqs_paddings, "structured_decoding"
+            ):
                 out = self.structured_decoding_manager.structured_decode(
                     self.structured_decoding_manager.require_structured_out_cpu[
                         :num_reqs
@@ -5994,7 +6023,9 @@ class TPUModelRunner(GPUModelRunner):
 
     def _precompile_sample_from_logits(self) -> None:
         with self._precompile_timed("sample_from_logits"):
-            for num_reqs in self.num_reqs_paddings:
+            for num_reqs in _rotate_precompile_sweep(
+                self.num_reqs_paddings, "sample_from_logits"
+            ):
                 dummy_logits = self._dummy_logits(num_reqs)
                 dummy_temperatures = torch.ones(
                     (num_reqs, 1), dtype=self._hidden_states_dtype
@@ -6024,7 +6055,9 @@ class TPUModelRunner(GPUModelRunner):
 
     def _precompile_gather_logprobs(self) -> None:
         with self._precompile_timed("gather_logprobs"):
-            for num_reqs in self.num_reqs_paddings:
+            for num_reqs in _rotate_precompile_sweep(
+                self.num_reqs_paddings, "gather_logprobs"
+            ):
                 out = self.gather_logprobs(
                     self._dummy_logits(num_reqs),
                     torch.zeros((num_reqs, 1), dtype=torch.int64).to(self.device),
@@ -6156,24 +6189,7 @@ class TPUModelRunner(GPUModelRunner):
                 pairs.append((num_tokens, num_reqs))
                 if num_reqs >= min(num_tokens, self.max_num_reqs):
                     break
-        if envs.TPU_PARALLEL_PRECOMPILE and pairs:
-            # Every rank walks every shape. Starting each local rank at its own
-            # share of the sweep (8 local ranks per host, as compile_all_ranges
-            # assumes) lets the ranks of a host compile different shapes first,
-            # so later shapes are mostly loads from the compile cache they share.
-            # Ranks reach a given shape at different times, which is safe only
-            # because these graphs hold no collective; a test traces them to
-            # check (tests/runner/test_rejection_sampler_sweep.py).
-            local_rank = int(os.environ.get("LOCAL_RANK", "0")) % 8
-            start = local_rank * len(pairs) // 8
-            pairs = pairs[start:] + pairs[:start]
-            logger.info(
-                "Rotating the rejection-sampler precompile sweep: local rank %d "
-                "starts at shape %d of %d.",
-                local_rank,
-                start + 1,
-                len(pairs),
-            )
+        pairs = _rotate_precompile_sweep(pairs, "rejection_sampler")
         with self._precompile_timed("rejection_sampler"):
             # padded_logits_length-shaped inputs, rebuilt when the length
             # changes; dtypes mirror get_spec_decode_metadata so the graph is

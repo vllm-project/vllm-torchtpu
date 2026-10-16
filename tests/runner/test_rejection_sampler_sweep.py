@@ -21,6 +21,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from tests.runner.precompile_sweep_checks import ops_outside_aten as _ops_outside_aten
 from vllm_torchtpu.layers.adapter.sample import rejection_sampler as rs
 from vllm_torchtpu.layers.adapter.sample.top_k_top_p import CANDIDATE_BLOCK
 from vllm_torchtpu.runner import tpu_runner
@@ -119,26 +120,6 @@ def test_flag_starts_each_local_rank_at_its_share_of_the_sweep(monkeypatch, rank
     # 8 local ranks per host; a local rank past 8 wraps around.
     start = rank % 8 * len(PAIRS) // 8
     assert _sweep(monkeypatch, "1", rank=rank) == PAIRS[start:] + PAIRS[:start]
-
-
-def _ops_outside_aten(graph_module: torch.fx.GraphModule) -> list[str]:
-    """Calls in a Dynamo graph to anything that may communicate: a registered
-    op outside aten/prims (custom and Pallas ops included, since a collective
-    can hide inside them) or a torch.distributed function."""
-    found = []
-    for gm in graph_module.modules():
-        if not isinstance(gm, torch.fx.GraphModule):
-            continue
-        for node in gm.graph.nodes:
-            if node.op != "call_function":
-                continue
-            target = node.target
-            if isinstance(target, (torch._ops.OpOverload, torch._ops.OpOverloadPacket)):
-                if str(target).split(".")[0] not in ("aten", "prims"):
-                    found.append(str(target))
-            elif getattr(target, "__module__", "").startswith("torch.distributed"):
-                found.append(str(target))
-    return found
 
 
 def _recording(fn, graphs):
