@@ -515,6 +515,7 @@ def _run_spawn_probes():
     processes = []
     connections = []
     try:
+        # One child at a time: two full-stack children OOM the CPU CI pod.
         for stage, target in (
             ("engine_core", EngineCoreProc.run_engine_core),
             ("worker_init", _worker_entry),
@@ -530,7 +531,6 @@ def _run_spawn_probes():
             child.close()
             processes.append(process)
             connections.append((stage, parent))
-        for process, (stage, parent) in zip(processes, connections):
             assert parent.poll(60), f"{stage} did not reach its entrypoint"
             actual_stage, pid = parent.recv()
             assert actual_stage == stage and pid != os.getpid()
