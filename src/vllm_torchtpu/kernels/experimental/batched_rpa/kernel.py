@@ -284,6 +284,7 @@ def fetch_stitch_metadata(
     for b_idx in range(cfgs.batch_size):
         s_idx = schedule_ref.s_idx[step, b_idx]
         is_valid = s_idx != -1
+        s_idx = jnp.maximum(s_idx, 0)  # padded lanes (-1): no SMEM read at -1
         k_idx = schedule_ref.k_idx[step, b_idx]
         k_id = jnp.where(is_valid, k_idx * cfgs.bkv_sz, 0)
         kv_cache_len_val = jnp.where(is_valid, kv_cache_lens_ref[s_idx], 0)
@@ -937,9 +938,15 @@ def rpa_kernel(
                 scratches[0][...] = jnp.full_like(scratches[0], -jnp.inf)
 
                 num_lanes = pltpu.get_tpu_info().num_lanes
+                q_ref_flat = q_alloc.window_ref.bitcast(jnp.uint32).reshape(
+                    -1, num_lanes
+                )
+                )
                     ref[...] = jnp.zeros_like(ref)
 
                 def execute_schedule_chunk(start_step, num_steps):
+                    # All reads are aligned to 128 and some extra steps are copied
+                    # in the process.
                     aligned_start_step = (start_step // 128) * 128
                     prefix_steps = start_step - aligned_start_step
 
@@ -965,9 +972,53 @@ def rpa_kernel(
                             dma_list.append(copy)
                     jax.tree.map(lambda x: x.wait(), dma_list)
 
+                    total_steps = num_steps + prefix_steps
+                    kv_bound = kv_cache_alloc.bind(
+                    )
+                    q_bound = q_alloc.bind(src_ref=(q_hbm_ref, schedule_ref))
+                    o_bound = o_alloc.bind(dst_ref=(o_hbm_ref, schedule_ref))
+                    lse_bound = (
+                        lse_alloc.bind(dst_ref=(lse_hbm_ref, schedule_ref))
+                        if return_lse
+                        else None
+                    )
 
+                    def compute_fn(
                         step,
                         slot,
+                        total_steps,
+                        out_slot,
+                        start_next_fetch,
+                        start_kv_writeback,
+                    ):
+                        del total_steps
+                        rpa_body(
+                            step,
+                            slot,
+                            q_alloc.window_ref.at[slot],
+                            kv_cache_alloc.window_ref.at[slot],
+                            o_alloc.window_ref.at[out_slot],
+                            lse_alloc.window_ref.at[out_slot] if return_lse else None,
+                            schedule_ref,
+                            scratches[0],
+                            scratches[1],
+                            scratches[2],
+                            cu_q_lens_ref=cu_q_lens_ref,
+                            q_offsets_ref=q_offsets_ref,
+                            kv_cache_lens_ref=kv_cache_lens_ref,
+                            kv_new_lens_ref=kv_new_lens_ref,
+                            cfgs=cfgs,
+                            start_next_fetch=start_next_fetch,
+                            start_kv_writeback=start_kv_writeback,
+                        )
+
+                    pipeline.run_manual_triple_buffer(
+                        total_steps,
+                        compute_fn,
+                        q_bound,
+                        o_bound,
+                        kv_bound,
+                        lse_bref=lse_bound,
                     )
 
                 @pl.loop(0, num_safe_step_iterations)
@@ -976,6 +1027,7 @@ def rpa_kernel(
                     rem = actual_steps % cfgs.max_steps_ub
                     last_step_size = jnp.where(rem == 0, cfgs.max_steps_ub, rem)
                     is_last_step = step_idx == num_safe_step_iterations - 1
+                    size = jnp.where(is_last_step, last_step_size, cfgs.max_steps_ub)
 
                     execute_schedule_chunk(start, size)
 
