@@ -97,11 +97,18 @@ class TPUMultiConnector(MultiConnector):
 
     @property
     def supports_divergent_local_hybrid_hits(self) -> bool:
+        """Claims divergent hybrid hits when any child can complete them.
+
+        Upstream's MultiConnector requires every child. The offloading child
+        restores the lagging recurrent state from the host tier by itself, so
+        a disagg producer next to it (which never loads) must not veto the
+        capability. PrefixAwareScheduler then asks that child, through
+        ``resolve_divergent_local_hit_tokens``, how much of the hit to keep.
+        """
         return any(c.supports_divergent_local_hybrid_hits for c in self._connectors)
 
-    def poll_and_complete_transfers(
-        self, scheduler
-    ) -> tuple[int, int, int, bool]:
+    def poll_and_complete_transfers(self, scheduler) -> tuple[int, int, int, bool]:
+        """Sums every child's schedule-start completion poll."""
         total_ns = 0
         total_early = 0
         total_waited = 0
@@ -123,6 +130,7 @@ class TPUMultiConnector(MultiConnector):
         num_reconciled: int,
         block_size: int,
     ) -> int | None:
+        """Returns the first child's answer; None when no child can serve it."""
         for c in self._connectors:
             fn = getattr(c, "resolve_divergent_local_hit_tokens", None)
             if fn is not None:
