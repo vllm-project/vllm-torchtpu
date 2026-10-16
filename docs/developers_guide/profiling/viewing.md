@@ -50,7 +50,7 @@ All of a run's **XPlane** files are merged into one
 `plugins/profile/<timestamp>/` directory, so pointing XProf at the run directory
 loads them together — use the host picker to switch between ranks, or view them
 side by side, without merging anything by hand. This is the reason the capture
-goes through the rank-prefix merge described above; a per-rank directory layout
+goes through the [rank-prefix merge](output.md#why-the-rank-prefix-exists); a per-rank directory layout
 would force you to open each rank as a separate session.
 
 The Chrome-format JSON traces do **not** go through that merge. They are already

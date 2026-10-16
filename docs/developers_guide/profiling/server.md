@@ -86,7 +86,7 @@ llm.start_profile(
   and are merged with any options supplied in `profiler_kwargs` (with
   `profiler_kwargs` taking precedence on key collisions).
 
-Those are two separate steps, and the rest of this page keeps them distinct:
+Those are two separate steps, and the rest of these guides keep them distinct:
 
 - **Configured** — the server was started with a profiler kind and a trace
   directory, so the profile endpoints will work. Nothing is being recorded yet.

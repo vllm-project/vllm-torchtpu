@@ -49,4 +49,4 @@ with three phases captured that is 12 of each.
   [Perfetto](https://ui.perfetto.dev) or Chrome Tracing.
 * **`*.async_llm.*.pt.trace.json.gz`** — the vLLM AsyncLLM CPU frontend traces.
   These are not written when `--profiler-config.ignore_frontend true` is set,
-  which the examples on this page do set.
+  which the examples in these guides do set.

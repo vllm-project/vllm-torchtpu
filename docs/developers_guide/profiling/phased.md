@@ -25,7 +25,7 @@ EXTRA_SERVE_ARGS='--profiler-config.profiler torch --profiler-config.torch_profi
 
 The harness makes both calls itself: it infers `CAPTURE_PROFILE=1` from the
 trace directory in `EXTRA_SERVE_ARGS`
-([as above](server.md#through-the-benchmark-harness)) and passes `--profile` to
+([as in server-side capture](server.md#through-the-benchmark-harness)) and passes `--profile` to
 `vllm bench serve` for the extra profile run, which POSTs to the two endpoints
 around it.
 

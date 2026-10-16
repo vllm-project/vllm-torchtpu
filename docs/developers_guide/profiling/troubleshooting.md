@@ -31,7 +31,8 @@ and nothing else. Check the `batch_composition_stats_*.json` files to see which
 phases the scheduler actually produced.
 
 **Traces are split across two timestamped directories** — ranks disagreed on the
-canonical timestamp; see the multi-host warning above.
+canonical timestamp; see the
+[multi-host warning](output.md#why-the-rank-prefix-exists) in Output layout.
 
 **Per-expert MoE timings look skewed** — with expert parallelism, a single
 device's profile reflects only the experts routed to it.
