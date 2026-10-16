@@ -11,10 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-import logging
 import os
 import sys
-from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -27,7 +25,6 @@ from .mock_omni import (  # isort: split
 )
 
 import vllm_omni
-from vllm.config import ProfilerConfig
 from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
 
 from vllm_torchtpu.omni import register_omni_tpu_platform
@@ -44,7 +41,6 @@ from vllm_torchtpu.omni.patches import (
     apply_omni_tpu_patches,
 )
 from vllm_torchtpu.omni.platform import OmniTpuPlatform
-from vllm_torchtpu.omni.profiler import TpuOmniTorchProfilerWrapper
 from vllm_torchtpu.omni.rope import (
     _pair_swap_matrix,
     apply_rotary_pair_swap,
@@ -88,10 +84,6 @@ def test_platform_attributes():
             platform.get_diffusion_attn_backend_cls(name, 64)
             == "vllm_torchtpu.omni.attention.TpuSDPABackend"
         )
-    assert (
-        platform.get_profiler_cls()
-        == "vllm_torchtpu.omni.profiler.TpuOmniTorchProfilerWrapper"
-    )
     with patch("torch.device") as mock_dev:
         platform.get_torch_device()
         mock_dev.assert_called_once_with("tpu")
@@ -542,166 +534,3 @@ def test_wan_self_attention_patch_falls_back_on_f32():
 
     apply_omni_model_specific_patches()
     assert WanSelfAttention()(torch.ones(1, 3, 8)) == "native"
-
-
-_PROFILER_TS = "2026_01_01_12_00_00"
-
-
-def _profiler_config(tmp_path, with_stack=False):
-    return ProfilerConfig(
-        profiler="torch",
-        torch_profiler_dir=str(tmp_path),
-        torch_profiler_with_stack=with_stack,
-        torch_profiler_record_shapes=True,
-        torch_profiler_with_memory=False,
-        torch_profiler_with_flops=True,
-    )
-
-
-@pytest.fixture
-def tpu_profiler(monkeypatch, tmp_path):
-    """Stubs torch.profiler and the TPU profiler config for the wrapper tests.
-
-    torch.distributed starts out uninitialized and profiler_trace is the real
-    module. ``fake_rank(rank, world_size)`` fakes a distributed run, stubs the
-    profiler_trace helpers and returns those stubs.
-    """
-    mocks = SimpleNamespace(profile=MagicMock(), tpu_config=MagicMock())
-    monkeypatch.setattr("torch.profiler.profile", mocks.profile)
-    monkeypatch.setattr(
-        "vllm_torchtpu.omni.profiler.TpuProfilerConfig", mocks.tpu_config
-    )
-    monkeypatch.setattr("torch.distributed.is_initialized", lambda: False)
-
-    def fake_rank(rank, world_size):
-        monkeypatch.setattr("torch.distributed.is_initialized", lambda: True)
-        monkeypatch.setattr("torch.distributed.get_rank", lambda: rank)
-        monkeypatch.setattr("torch.distributed.get_world_size", lambda: world_size)
-        trace = SimpleNamespace(
-            resolve=MagicMock(return_value=_PROFILER_TS),
-            capture=MagicMock(return_value=str(tmp_path / f"rank_{rank}")),
-            merge=MagicMock(),
-            clear=MagicMock(),
-        )
-        monkeypatch.setattr(
-            "vllm_torchtpu.profiler_trace.resolve_canonical_dst_ts", trace.resolve
-        )
-        monkeypatch.setattr(
-            "vllm_torchtpu.profiler_trace.rank_capture_dir", trace.capture
-        )
-        monkeypatch.setattr(
-            "vllm_torchtpu.profiler_trace.merge_rank_capture", trace.merge
-        )
-        monkeypatch.setattr(
-            "vllm_torchtpu.profiler_trace.clear_canonical_ts_marker", trace.clear
-        )
-        return trace
-
-    mocks.fake_rank = fake_rank
-    return mocks
-
-
-def test_tpu_omni_profiler_init(tmp_path, caplog):
-    with caplog.at_level(logging.INFO):
-        wrapper = TpuOmniTorchProfilerWrapper(
-            _profiler_config(tmp_path, with_stack=True), "worker_0", 0
-        )
-
-    assert wrapper._activities == ["CPU", "TPU"]
-    assert getattr(wrapper, "dump_cpu_time_total", False) is False
-    assert getattr(wrapper, "profiler", None) is None
-    assert "Deferring torch.profiler construction" in caplog.text
-    assert "enforcing torch.profiler with_stack=False" in caplog.text
-    # The base config always gets with_stack=False.
-    assert wrapper.profiler_config.torch_profiler_with_stack is False
-
-
-def test_tpu_omni_profiler_start_stop_merges_rank(tmp_path, tpu_profiler):
-    wrapper = TpuOmniTorchProfilerWrapper(
-        _profiler_config(tmp_path, with_stack=True), "worker_0", 0
-    )
-    trace = tpu_profiler.fake_rank(2, world_size=4)
-
-    wrapper._start()
-    assert trace.resolve.called
-    assert trace.capture.called
-    tpu_profiler.profile.assert_called_once()
-    # with_stack=True records Python stacks through the TPU python tracer.
-    _, tpu_kwargs = tpu_profiler.tpu_config.call_args
-    assert tpu_kwargs.get("python_tracer_level") == 1
-
-    wrapper._stop()
-    tpu_profiler.profile.return_value.stop.assert_called_once()
-    trace.merge.assert_called_once_with(
-        str(tmp_path / "rank_2"),
-        str(tmp_path / "worker_0"),
-        _PROFILER_TS,
-        2,
-        world_size=4,
-    )
-    # Only rank 0 clears the canonical timestamp marker.
-    trace.clear.assert_not_called()
-
-
-def test_tpu_omni_profiler_shared_run_root(tmp_path, tpu_profiler):
-    # Same trace filename on two workers in one process: one shared run root.
-    cfg = _profiler_config(tmp_path)
-    w1 = TpuOmniTorchProfilerWrapper(cfg, "worker_1", 0)
-    w1.set_trace_filename("my_trace")
-    w2 = TpuOmniTorchProfilerWrapper(cfg, "worker_2", 0)
-    w2.set_trace_filename("my_trace")
-
-    w1._start()
-    w2._start()
-
-    assert w1._capture_state[1] == w2._capture_state[1]
-    assert w1._capture_state[1] == os.path.join(str(tmp_path), "my_trace")
-
-    # Omni's chrome-trace session dir and the XSpace run root are
-    # siblings under torch_profiler_dir, not nested in each other.
-    session_dir = w1._ensure_session_dir()
-    run_root = w1._capture_state[1]
-    assert os.path.dirname(session_dir) == str(tmp_path)
-    assert os.path.dirname(run_root) == str(tmp_path)
-    assert os.path.basename(session_dir).endswith("_my_trace")
-    assert session_dir != run_root
-    assert not session_dir.startswith(run_root + os.sep)
-    assert not run_root.startswith(session_dir + os.sep)
-
-    # with_stack=False turns the TPU python tracer off.
-    _, tpu_kwargs = tpu_profiler.tpu_config.call_args
-    assert tpu_kwargs.get("python_tracer_level") == 0
-
-    w1._stop()
-    w2._stop()
-
-
-def test_tpu_omni_profiler_stop_error_still_merges(tmp_path, tpu_profiler):
-    wrapper = TpuOmniTorchProfilerWrapper(_profiler_config(tmp_path), "w3", 0)
-    trace = tpu_profiler.fake_rank(0, world_size=1)
-    wrapper._start()
-    wrapper.profiler.stop.side_effect = ValueError("Intentional error")
-
-    with pytest.raises(ValueError, match="Intentional error"):
-        wrapper._stop()
-
-    trace.merge.assert_called_once()
-    trace.clear.assert_called_once()
-
-
-def test_tpu_omni_profiler_canonical_ts_sync(tmp_path, tpu_profiler, monkeypatch):
-    cfg = _profiler_config(tmp_path)
-    w0 = TpuOmniTorchProfilerWrapper(cfg, "w0", 0)
-    w0.set_trace_filename("my_trace")
-    w1 = TpuOmniTorchProfilerWrapper(cfg, "w1", 0)
-    w1.set_trace_filename("my_trace")
-
-    # Two ranks of one distributed run, sharing the real profiler_trace marker.
-    monkeypatch.setattr("torch.distributed.is_initialized", lambda: True)
-    monkeypatch.setattr("torch.distributed.get_world_size", lambda: 2)
-    monkeypatch.setattr("torch.distributed.get_rank", lambda: 0)
-    w0._start()
-    monkeypatch.setattr("torch.distributed.get_rank", lambda: 1)
-    w1._start()
-
-    assert w0._capture_state[2] == w1._capture_state[2]
