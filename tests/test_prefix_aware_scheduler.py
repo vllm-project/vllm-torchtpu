@@ -54,6 +54,7 @@ def _make_scheduler(
         q.add_request(r)
     s.waiting = q
     s.kv_holding_waiting = FCFSRequestQueue()
+    s.running = []
     s.policy = SchedulingPolicy.FCFS
     s.WINDOW = window
     s._paw_n = 0

@@ -296,6 +296,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         if getattr(self, "_memo_xstep", False):
             self._memo_trim_log()
         try:
+            # hook, so the warmest-first promotion runs here, once per step.
             out = super().schedule(*args, **kwargs)
             if getattr(out, "scheduled_new_reqs", None):
                 self._maybe_pack_prompt_ids(out)
