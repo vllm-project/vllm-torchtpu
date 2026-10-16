@@ -1181,3 +1181,127 @@ def test_ple_storage_rejects_missing_and_duplicate_rows(monkeypatch):
         embedding.load_weights([shard])
     with pytest.raises(ValueError, match="Missing"):
         embedding.ngram_embedding.finalize_weights()
+
+
+@pytest.mark.parametrize("storage", ["resident", "host", "shared"])
+def test_ple_native_adapter_reuses_common_math_and_checkpoint(
+    monkeypatch, tmp_path, storage
+):
+    """CPU adapter contract; only device lookup/conv bridges are dense doubles."""
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import ple_offload, ple_storage, pooled_ple
+    from vllm_torchtpu.models.vllm.qwen4_exp.parallel import PLEParallel
+    from vllm_torchtpu.models.vllm.qwen4_exp.ple import dilated_short_conv
+
+    _set_tp(monkeypatch, 0, 1)
+
+    class Group:
+        rank_in_group = 0
+        world_size = 1
+
+        def all_reduce(self, rows):
+            return rows
+
+    group = Group()
+    parallel = PLEParallel(group, group, embedding_across_dp=False)
+
+    def raw_lookup(start, rows, width):
+        def run(table, ids):
+            result = table.reshape(rows, width)[ids.clamp(0, rows - 1)].clone()
+            result[(ids < 0) | (ids >= rows)] = 0
+            return result.flatten(-2)
+
+        return run
+
+    monkeypatch.setattr(ple_storage, "build_raw_lookup_op", raw_lookup)
+    monkeypatch.setattr(
+        ple_storage,
+        "build_decode_op",
+        lambda: lambda raw, scale: raw.view(torch.bfloat16),
+    )
+
+    def conv_bridge(dilation):
+        def run(x, weight, history, starts, slots, initial):
+            request, chunk = token_requests(starts, x.shape[0])
+            windows = torch.where(
+                initial[:, None, None], history[slots.clamp_min(0)], 0
+            )
+            output, updated = dilated_short_conv(
+                x, weight, dilation, windows, starts, request, chunk
+            )
+            for i, slot in enumerate(slots.tolist()):
+                if slot > 0 and starts[i + 1] > starts[i]:
+                    history[slot] = updated[i]
+            return F.silu(output)
+
+        return run
+
+    monkeypatch.setattr(pooled_ple, "build_short_conv_op", conv_bridge)
+    shared = (
+        ple_storage.SharedPLEOptions(tmp_path, "layer", {"checkpoint": "fixture"}, 1)
+        if storage == "shared"
+        else None
+    )
+    with set_default_torch_dtype(torch.bfloat16):
+        reference = Qwen4ExpPLELayer(_text_config(**_PLE), 0, None, "ple")
+        _randomize_ple(reference)
+        adapted = pooled_ple.Qwen4ExpPooledPLE(
+            _text_config(**_PLE),
+            0,
+            None,
+            "ple",
+            parallel=parallel,
+            table_group=group,
+            cpu_offload=storage != "resident",
+            shared=shared,
+        )
+    weights = dict(reference.state_dict())
+    full_table = weights.pop("ple_embedding.ngram_embedding.weight")
+    for i, rows in enumerate(full_table.split(22)):
+        weights[f"ple_embedding.ngram_embedding.shard_{i}.weight"] = rows
+    adapted.load_checkpoint(iter(weights.items()))
+    adapted.finalize_weights()
+    monkeypatch.setattr(
+        ple_offload,
+        "get_forward_context",
+        lambda: SimpleNamespace(no_compile_layers={"ple": adapted}),
+    )
+    history = torch.zeros(
+        4, reference.conv_state_len, HC * HIDDEN, dtype=torch.bfloat16
+    )
+    history[1].fill_(4)  # A reused slot must ignore stale history on first prefill.
+    adapted.bind_history(history)
+    contexts = torch.full((3, 2), _PLE["eos_token_id"], dtype=torch.int64)
+    expected_history = history.clone()
+    generator = torch.Generator(device="cpu").manual_seed(314)
+    with torch.no_grad():
+        for ids, starts, slots, initial in (
+            ([3, 4, 5, 6, 7, 0], [0, 3, 5, 5], [1, 2, -1], [False, False, False]),
+            ([8, 9, 0], [0, 1, 2, 2], [2, 1, -1], [True, True, False]),
+        ):
+            ids, starts, slots = map(torch.tensor, (ids, starts, slots))
+            initial = torch.tensor(initial)
+            inputs = PLEInputs(ids, starts, contexts)
+            hidden = torch.randn(len(ids), HC * HIDDEN, generator=generator).to(
+                torch.bfloat16
+            )
+            windows = torch.where(
+                initial[:, None, None], expected_history[slots.clamp_min(0)], 0
+            )
+            expected, next_windows = reference(hidden, inputs, windows)
+            valid = starts[-1]
+            raw = (
+                adapted.lookup_for_model(inputs, valid) if adapted.cpu_offload else None
+            )
+            actual = adapted.forward_with_history(
+                hidden, inputs, slots, initial, valid, raw
+            )
+            torch.testing.assert_close(actual[:valid], expected[:valid], rtol=0, atol=0)
+            assert torch.count_nonzero(actual[valid:]) == 0
+            for i, slot in enumerate(slots.tolist()):
+                if slot > 0:
+                    expected_history[slot] = next_windows[i]
+            torch.testing.assert_close(history, expected_history, rtol=0, atol=0)
+    if isinstance(adapted.storage, ple_storage.HostPLETable):
+        adapted.storage.close()

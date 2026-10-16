@@ -399,13 +399,24 @@ class Qwen4ExpNGramEmbedding(nn.Module):
         request: torch.Tensor,
         chunk_pos: torch.Tensor,
     ) -> torch.Tensor:
+        ids = self.compute_ids(input_ids, ngram_context, request, chunk_pos)
+        return self.ngram_embedding(ids).flatten(-2)
+
+    def compute_ids(
+        self,
+        input_ids: torch.Tensor,
+        ngram_context: torch.Tensor,
+        request: torch.Tensor,
+        chunk_pos: torch.Tensor,
+    ) -> torch.Tensor:
+        """Hash rows independently of resident or host table lookup."""
         if ngram_context.shape[-1] != self.ngram_size - 1:
             raise ValueError(
                 f"ngram_context has {ngram_context.shape[-1]} tokens per "
                 f"request; ngram_size={self.ngram_size} needs "
                 f"{self.ngram_size - 1}."
             )
-        ids = ngram_ids(
+        return ngram_ids(
             input_ids,
             ngram_context,
             request,
@@ -416,7 +427,6 @@ class Qwen4ExpNGramEmbedding(nn.Module):
             eos_token_id=self.eos_token_id,
             heads_per_ngram=self.heads_per_ngram,
         )
-        return self.ngram_embedding(ids).flatten(-2)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load the hash buffers, the table scale and the split table rows.
