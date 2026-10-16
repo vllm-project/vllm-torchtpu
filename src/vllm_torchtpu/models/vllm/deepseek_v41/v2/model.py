@@ -771,18 +771,19 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         stage: str = "full",
     ) -> torch.Tensor | upstream.IntermediateTensors | tuple[torch.Tensor, ...]:
         split = getattr(self, "_engram_split_layer", None)
-        start_layer = {
-            "decoder": self._ced_boundary,
-            "encoder_tail": split,
-        }.get(stage, self.start_layer)
-        end_layer = {
-            "encoder": self._ced_boundary,
-            "encoder_head": split,
-            "encoder_tail": self._ced_boundary,
-        }.get(stage, self.end_layer)
-        stage_sp = self._stage_uses_sequence_parallel(stage)
-        if stage in ("encoder_head", "encoder_tail"):
+        start_layer: int = self.start_layer
+        end_layer: int = self.end_layer
+        if stage == "decoder":
+            start_layer = self._ced_boundary
+        elif stage == "encoder":
+            end_layer = self._ced_boundary
+        elif stage == "encoder_head":
             assert split is not None
+            end_layer = split
+        elif stage == "encoder_tail":
+            assert split is not None
+            start_layer, end_layer = split, self._ced_boundary
+        stage_sp = self._stage_uses_sequence_parallel(stage)
         if stage in ("decoder", "encoder_tail"):
             hidden_states = inputs_embeds
         elif upstream.get_pp_group().is_first_rank:
