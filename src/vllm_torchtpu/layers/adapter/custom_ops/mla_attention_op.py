@@ -1014,15 +1014,17 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
     ) -> torch.Tensor:
         """PCP manager top-k: rank-local DCP cache indices for the decode rows,
         global positions for the split prefill rows."""
-        rep_rd = md.pcp_rep_request_distribution
+        pcp = md.pcp_metadata
+        assert pcp is not None
+        rep_rd = pcp.rep_request_distribution
         decode_topk = self.topk_op_dcp(
             kvg.take_decode_rows(q_bytes, md),
             kvg.take_decode_rows(weights, md),
             kv_cache,
             kvg.take_decode_rows(k_packed, md),
-            md.pcp_rep_seq_lens,
-            md.pcp_rep_block_tables,
-            md.pcp_rep_query_start_loc,
+            pcp.rep_seq_lens,
+            pcp.rep_block_tables,
+            pcp.rep_query_start_loc,
             torch.stack([rep_rd[0], rep_rd[0], rep_rd[2]]),
         )
 
@@ -1032,18 +1034,18 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             q_bytes,
             weights,
             k_packed,
-            md.pcp_hidden_restore_idx,
-            md.pcp_split_seq_lens,
-            md.pcp_split_block_tables,
-            md.pcp_split_query_start_loc,
-            md.pcp_ws_req,
-            md.pcp_ws_vpage,
-            md.pcp_ws_page_offset,
+            pcp.hidden_restore_idx,
+            pcp.split_seq_lens,
+            pcp.split_block_tables,
+            pcp.split_query_start_loc,
+            pcp.ws_req,
+            pcp.ws_vpage,
+            pcp.ws_page_offset,
             md.seq_lens,
             md.query_start_loc,
             torch.stack([rd[0], rd[0], rd[2]]),
-            md.pcp_num_split_reqs,
-            md.pcp_ws_used_pages,
+            pcp.num_split_reqs,
+            pcp.ws_used_pages,
         )
         return kvg.merge_decode_rows(prefill_topk, decode_topk, md)
 

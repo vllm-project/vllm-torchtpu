@@ -1998,16 +1998,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 self.dcp_size,
             )
         pcp_size = getattr(parallel_config, "prefill_context_parallel_size", 1)
-        # PCP manager: the cache keeps its DCP sharding; split prefills read
-        # it through a gathered workspace (`pcp_kv_gather.py`).
         self.pcp_kv_gather = envs.USE_TPU_PCP_MANAGER and self.dcp_size > 1
         self.pcp_size = pcp_size if self.pcp_kv_gather else 1
-        if self.pcp_kv_gather:
-            from vllm_torchtpu.layers.adapter.pcp_kv_gather import (
-                verify_dcp_rank_order,
-            )
-
-            verify_dcp_rank_order()
         if self.dcp_size > 1:
             if self.dcp_interleave_size % kv_cache_utils.WORD_BYTES:
                 raise ValueError(
@@ -2561,6 +2553,8 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             "PCP ops were never built; `process_weights_after_loading` must run "
             "first."
         )
+        pcp = md.pcp_metadata
+        assert pcp is not None
         # All cache writes precede all cache reads, so XLA never copies the
         # cache: split rows, then the decode op (writes, then reads), then the
         # read-only split prefill op.
@@ -2568,10 +2562,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             kv_cache,
             kv_c_normed,
             k_pe,
-            md.pcp_hidden_restore_idx,
-            md.pcp_split_seq_lens,
-            md.pcp_split_block_tables,
-            md.pcp_split_query_start_loc,
+            pcp.hidden_restore_idx,
+            pcp.split_seq_lens,
+            pcp.split_block_tables,
+            pcp.split_query_start_loc,
         )
         partial, lse = layer.sparse_mla_dcp_op(
             kv_cache,
@@ -2580,10 +2574,10 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             kvg.take_decode_rows(kv_c_normed, md),
             kvg.take_decode_rows(k_pe, md),
             kvg.take_decode_rows(topk_indices, md),
-            md.pcp_rep_seq_lens,
-            md.pcp_rep_block_tables,
-            md.pcp_rep_query_start_loc,
-            md.pcp_rep_request_distribution,
+            pcp.rep_seq_lens,
+            pcp.rep_block_tables,
+            pcp.rep_query_start_loc,
+            pcp.rep_request_distribution,
         )
         decode_out = merge_lse_partials_scatter_heads(partial, lse)
 
@@ -2592,14 +2586,14 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             ql_nope,
             q_pe,
             topk_indices,
-            md.pcp_split_block_tables.view(md.pcp_split_seq_lens.shape[0], -1),
-            md.pcp_ws_req,
-            md.pcp_ws_vpage,
-            md.pcp_ws_page_offset,
+            pcp.split_block_tables.view(pcp.split_seq_lens.shape[0], -1),
+            pcp.ws_req,
+            pcp.ws_vpage,
+            pcp.ws_page_offset,
             md.query_start_loc,
             md.request_distribution,
-            md.pcp_num_split_reqs,
-            md.pcp_ws_used_pages,
+            pcp.num_split_reqs,
+            pcp.ws_used_pages,
         )
         return kvg.merge_decode_rows(prefill_out, decode_out, md)
 

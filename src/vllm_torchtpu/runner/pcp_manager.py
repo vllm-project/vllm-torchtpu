@@ -11,8 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""PCP manager (`USE_TPU_PCP_MANAGER=1`): a `SequenceLayoutPlanner` after
-upstream vLLM's MRV2 `PCPManager`.
+"""PCP manager (`USE_TPU_PCP_MANAGER=1`), after upstream vLLM's MRV2
+`PCPManager`.
 
 Each PCP rank runs its DualChunkSwap slice of the step's prefills as rank-local
 requests; decodes are replicated. Attention reads the split prefills' context
@@ -30,14 +30,10 @@ import torch
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.pcp import (
-    all_gather_equal_tokens,
     all_reduce_sum,
     get_pcp_group,
 )
-from vllm_torchtpu.layers.adapter.pcp_kv_gather import (
-    PCP_KV_GATHER_SEQUENCE_LAYOUT_PROTOCOL,
-    pcp_chunk_pages,
-)
+from vllm_torchtpu.layers.adapter.pcp_kv_gather import pcp_chunk_pages
 from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutDescriptor,
     SequenceLayoutKind,
@@ -56,7 +52,7 @@ logger = init_logger(__name__)
 
 PCP_KV_GATHER_SEQUENCE_LAYOUT_DESCRIPTOR = SequenceLayoutDescriptor(
     kind=SequenceLayoutKind.PARTIAL,
-    protocol=PCP_KV_GATHER_SEQUENCE_LAYOUT_PROTOCOL,
+    protocol="pcp_kv_gather",
     version=1,
 )
 
@@ -100,8 +96,8 @@ def rep_window_size(max_reqs: int, dcp_size: int) -> int:
 
 @dataclass
 class PcpKvGatherFields:
-    """Device tensors for the `pcp_*` `AttentionMetadata` fields (same shapes
-    for dummy runs, so warmup traces the serving program)."""
+    """Device tensors for `PcpMetadata` (same shapes for dummy runs, so warmup
+    traces the serving program)."""
 
     split_query_start_loc: torch.Tensor
     split_seq_lens: torch.Tensor
@@ -290,7 +286,7 @@ def mla_kv_page_size(kv_cache_config: Any) -> int:
 
 
 class PcpManager:
-    """`SequenceLayoutPlanner` for PCP x DCP with KV-gather attention."""
+    """PCP x DCP manager with KV-gather attention."""
 
     def __init__(
         self,
@@ -342,19 +338,6 @@ class PcpManager:
             max_num_batched_tokens=vllm_config.scheduler_config.max_num_batched_tokens,
             max_num_seqs=vllm_config.scheduler_config.max_num_seqs,
         )
-
-    # --- SequenceLayoutPlanner ---------------------------------------------
-    @property
-    def requires_backend_preinit(self) -> bool:
-        return False
-
-    @property
-    def backend_preinit_world_size(self) -> int:
-        return 1
-
-    @property
-    def uses_selected_logits_hidden_states(self) -> bool:
-        return True
 
     @property
     def max_local_num_tokens(self) -> int:
@@ -517,19 +500,6 @@ class PcpManager:
             owner_mask[num_reqs:] = False
             logits_local = (last_rows % local_padded).astype(np.int32)
 
-        # Request-major token -> packed row (this rank's copy when it has one).
-        request_to_packed = np.asarray(plan.hidden_restore_idx, dtype=np.int64)
-        for seg in segments:
-            base = self.pcp_rank * local_padded
-            request_to_packed[seg.global_start : seg.global_stop] = np.arange(
-                base + seg.local_start, base + seg.local_stop
-            )
-        packed_to_request = np.where(
-            np.asarray(plan.gathered_valid),
-            np.asarray(plan.padded_gather_idx, dtype=np.int64),
-            -1,
-        )
-
         local_start = self.pcp_rank * local_padded
         return PcpKvGatherPlan(
             descriptor=PCP_KV_GATHER_SEQUENCE_LAYOUT_DESCRIPTOR,
@@ -541,9 +511,6 @@ class PcpManager:
             logits_indices_cpu=torch.from_numpy(logits_indices.astype(np.int32)),
             logits_local_indices_cpu=torch.from_numpy(logits_local),
             logits_owner_mask_cpu=torch.from_numpy(owner_mask),
-            requires_hidden_state_gather=True,
-            _packed_to_request_major_token_indices=packed_to_request,
-            _request_major_to_packed_token_indices=request_to_packed,
             local_num_reqs=local_num_reqs,
             local_num_split_reqs=num_split,
             rep_row_start=rep_row_start,
@@ -582,26 +549,8 @@ class PcpManager:
             global_padded_num_tokens=num_packed,
             local_num_tokens=num_tokens,
             local_padded_num_tokens=num_tokens,
-            requires_hidden_state_gather=True,
             local_num_reqs=int(num_reqs),
-            hidden_restore_idx=torch.arange(num_packed, dtype=torch.int32),
         )
-
-    def finalize_hidden_states(
-        self,
-        hidden_states: torch.Tensor,
-        plan: SequenceLayoutPlan | None,
-    ) -> torch.Tensor:
-        """Restore the step's request-major hidden states on every rank."""
-        if not isinstance(plan, PcpKvGatherPlan) or plan.hidden_restore_idx is None:
-            return hidden_states
-        gathered = all_gather_equal_tokens(hidden_states, dim=0)
-        full = plan._request_major_to_packed_token_indices
-        if full is not None:
-            restore = torch.from_numpy(np.asarray(full, dtype=np.int64))
-        else:
-            restore = plan.hidden_restore_idx[: gathered.shape[0]]
-        return gathered.index_select(0, restore.to(hidden_states.device))
 
     def maybe_select_logits_hidden_states(
         self,
