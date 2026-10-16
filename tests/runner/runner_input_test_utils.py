@@ -89,6 +89,7 @@ def _make_runner(
     )
     runner.sequence_layout_planner = create_sequence_layout_planner(runner.vllm_config)
     runner.pcp_manager = None
+    runner.get_pcp_planner = types.MethodType(TPUModelRunner.get_pcp_planner, runner)
     runner._dummy_pcp_kv_gather_fields = types.MethodType(
         TPUModelRunner._dummy_pcp_kv_gather_fields, runner
     )

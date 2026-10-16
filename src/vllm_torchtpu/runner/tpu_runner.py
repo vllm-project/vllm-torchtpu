@@ -143,6 +143,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
 )
 from vllm_torchtpu.layers.core.sequence_layout import (
     SequenceLayoutKind,
+    SequenceLayoutPlanner,
     create_sequence_layout_planner,
 )
 from vllm_torchtpu.logger import init_logger
@@ -161,6 +162,7 @@ from vllm_torchtpu.runner.mm_encoder_manager import (
 )
 from vllm_torchtpu.runner.mm_video_chunking import chunked_video_encoding
 from vllm_torchtpu.runner.pcp_manager import (
+    PcpKvGatherPlan,
     PcpManager,
     dummy_pcp_kv_gather_fields,
     mla_kv_page_size,
@@ -493,10 +495,6 @@ def _build_kv_connector_output(
 # Smallest output size
 MIN_NUM_SEQS = 8
 SAMPLING_EPS = 1e-5
-
-
-def _get_sequence_layout_planner_for_runner(runner: Any):
-    return runner.sequence_layout_planner
 
 
 def _validate_libtpu_version() -> None:
@@ -3008,6 +3006,14 @@ class TPUModelRunner(GPUModelRunner):
             num_draft_per_req,
         )
 
+    # TODO(weiyulin): unify sequence_plan and pcp_manager so that 
+    # pcp manager own both pcp sharding plan.
+    def get_pcp_planner(self) -> PcpManager | SequenceLayoutPlanner:
+        if self.pcp_manager is not None:
+            return self.pcp_manager
+        assert self.sequence_layout_planner is not None
+        return self.sequence_layout_planner
+
     def _dummy_pcp_kv_gather_fields(self, plan: Any, num_tokens: int, num_reqs: int):
         """PCP manager metadata fields for a dummy run, or None."""
         if self.pcp_manager is None:
@@ -3086,15 +3092,8 @@ class TPUModelRunner(GPUModelRunner):
 
         num_reqs = len(num_scheduled_tokens_per_req)
 
-        sequence_layout_planner = _get_sequence_layout_planner_for_runner(self)
-        if self.pcp_manager is not None:
-            self.pcp_manager.reserve_host_token_capacity(
-                self, int(total_num_scheduled_tokens)
-            )
-        else:
-            sequence_layout_planner.reserve_host_token_capacity(
-                self, int(total_num_scheduled_tokens)
-            )
+        pcp_planner = self.get_pcp_planner()
+        pcp_planner.reserve_host_token_capacity(self, int(total_num_scheduled_tokens))
 
         if self.uses_mrope:
             self._calc_mrope_positions(scheduler_output)
@@ -3199,34 +3198,19 @@ class TPUModelRunner(GPUModelRunner):
         # we merge the batched RPA ring scheduler, we have to unify the interface.
         # pcp_manager: dualchunk input sharding
         # sequence_layout_palnner: sequence interleaved sharding
-        if self.pcp_manager is not None:
-            pcp_plan = self.pcp_manager.prepare_real(
-                runner=self,
-                scheduler_output=scheduler_output,
-                start_index=start_index,
-                num_reqs=num_reqs,
-                num_scheduled_tokens_per_req=num_scheduled_tokens_per_req,
-                total_num_scheduled_tokens=int(total_num_scheduled_tokens),
-                use_max_model_len=use_max_model_len,
-                target_num_reqs=target_num_reqs,
-                padded_num_reqs=padded_num_reqs,
-            )
-            layout_plan = pcp_plan
-            meta_num_reqs = pcp_plan.local_num_reqs
-        else:
-            pcp_plan = None
-            layout_plan = sequence_layout_planner.prepare_real(
-                runner=self,
-                scheduler_output=scheduler_output,
-                start_index=start_index,
-                num_reqs=num_reqs,
-                num_scheduled_tokens_per_req=num_scheduled_tokens_per_req,
-                total_num_scheduled_tokens=int(total_num_scheduled_tokens),
-                use_max_model_len=use_max_model_len,
-                target_num_reqs=target_num_reqs,
-                padded_num_reqs=padded_num_reqs,
-            )
-            meta_num_reqs = num_reqs
+        layout_plan = pcp_planner.prepare_real(
+            runner=self,
+            scheduler_output=scheduler_output,
+            start_index=start_index,
+            num_reqs=num_reqs,
+            num_scheduled_tokens_per_req=num_scheduled_tokens_per_req,
+            total_num_scheduled_tokens=int(total_num_scheduled_tokens),
+            use_max_model_len=use_max_model_len,
+            target_num_reqs=target_num_reqs,
+            padded_num_reqs=padded_num_reqs,
+        )
+        pcp_plan = layout_plan if isinstance(layout_plan, PcpKvGatherPlan) else None
+        meta_num_reqs = pcp_plan.local_num_reqs if pcp_plan is not None else num_reqs
         self._last_sequence_layout_plan = layout_plan
         padded_total_num_scheduled_tokens = layout_plan.global_padded_num_tokens
         request_major_input_ids = None
@@ -4200,11 +4184,7 @@ class TPUModelRunner(GPUModelRunner):
             if self._pp_wave is not None:
                 self._pp_wave.end_forward(None, num_tokens_padded)
 
-            planner = (
-                self.pcp_manager
-                if self.pcp_manager is not None
-                else _get_sequence_layout_planner_for_runner(self)
-            )
+            planner = self.get_pcp_planner()
             layout_plan = self._last_sequence_layout_plan
             if self.is_pooling_model:
                 hidden_states = planner.finalize_hidden_states(
@@ -5701,11 +5681,7 @@ class TPUModelRunner(GPUModelRunner):
         request_distribution = torch.tensor(distribution, dtype=torch.int32).to(
             self.device
         )
-        planner = (
-            self.pcp_manager
-            if self.pcp_manager is not None
-            else _get_sequence_layout_planner_for_runner(self)
-        )
+        planner = self.get_pcp_planner()
         dummy_layout_plan = planner.prepare_dummy(
             num_tokens=num_tokens,
             num_reqs=num_reqs,
@@ -6231,12 +6207,7 @@ class TPUModelRunner(GPUModelRunner):
                     synchronize_tensors(out)
                     if num_reqs >= min(num_tokens, self.max_num_reqs):
                         break
-        if (
-            self.pcp_manager is None
-            and not _get_sequence_layout_planner_for_runner(
-                self
-            ).uses_selected_logits_hidden_states
-        ):
+        if not self.get_pcp_planner().uses_selected_logits_hidden_states:
             return
         with self._precompile_timed("compute_top_tokens_from_hidden_states"):
             for num_reqs in self.num_reqs_paddings:
@@ -6630,12 +6601,7 @@ class TPUModelRunner(GPUModelRunner):
             # Only the last stage holds the lm_head and samples.
             return
         self._precompile_compute_selected_logits()
-        if (
-            self.pcp_manager is not None
-            or _get_sequence_layout_planner_for_runner(
-                self
-            ).uses_selected_logits_hidden_states
-        ):
+        if self.get_pcp_planner().uses_selected_logits_hidden_states:
             self._precompile_compute_logits_from_hidden_states()
         self._precompile_compute_top_tokens()
         self._precompile_structured_decoding()

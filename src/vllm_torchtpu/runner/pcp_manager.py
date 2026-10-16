@@ -288,6 +288,8 @@ def mla_kv_page_size(kv_cache_config: Any) -> int:
 class PcpManager:
     """PCP x DCP manager with KV-gather attention."""
 
+    uses_selected_logits_hidden_states: bool = True
+
     def __init__(
         self,
         pcp_size: int,
@@ -569,3 +571,11 @@ class PcpManager:
         mask = plan.logits_owner_mask_cpu.to(device, non_blocking=True)
         selected = torch.where(mask.unsqueeze(1), selected, torch.zeros_like(selected))
         return all_reduce_sum(selected)
+
+    def finalize_hidden_states(
+        self,
+        hidden_states: torch.Tensor,
+        plan: SequenceLayoutPlan | None,
+    ) -> torch.Tensor:
+        del plan
+        return hidden_states
