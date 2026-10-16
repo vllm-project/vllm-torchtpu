@@ -6,13 +6,19 @@ PiecewiseBackend to compile FX graphs via TorchTPU's FX->MLIR->PjRt
 pipeline. Each shape bucket gets its own compiled executable.
 """
 
+import contextlib
 import copy
 import dataclasses
+import glob
 import hashlib
 import importlib.util
 import json
 import os
 import pickle
+import re
+import shutil
+import threading
+import time
 from collections.abc import Callable
 from importlib import metadata as importlib_metadata
 from pathlib import Path
@@ -47,6 +53,10 @@ class TpuCompilationHandle:
     `signature` pins the graph the entry was built from, so a replay against a
     structurally different graph is refused instead of silently executing.
 
+    `fingerprint` pins the whole graph, body included (see
+    `_graph_fingerprint`). Another rank's artifact is only replayed if it
+    matches, since vLLM's key names a (bucket, subgraph) and nothing else.
+
     Defaults are deliberately "unusable": an older pickle restored into this
     class keeps its own __dict__ and picks up these class defaults for the
     fields it lacks, so it fails the version check rather than being replayed.
@@ -56,9 +66,71 @@ class TpuCompilationHandle:
     entry: Any | None = None
     signature: tuple | None = None
     was_wrapped: bool = False
+    fingerprint: str | None = None
 
 
 _tpu_backend = TpuBackend()
+
+# How long a rank waits for the rank of its host that compiles a bucket, and
+# how often it looks. The wait is bounded only for a peer that never saves the
+# artifact (its serialize() failed); the rank then compiles the bucket itself.
+PEER_WAIT_S = 3600.0
+_PEER_POLL_S = 5.0
+# get_attr tensors up to this size are hashed by value; bigger ones, which are
+# weights rather than constants, by dtype and shape.
+_FINGERPRINT_MAX_NUMEL = 1 << 16
+
+_peer_wait = threading.local()
+
+
+@contextlib.contextmanager
+def wait_for_peer_artifact(timeout_s: float):
+    """Within this block, `compile` waits up to `timeout_s` for another rank
+    of this host to save the bucket, and replays it, before compiling it.
+
+    Outside it, `compile` still replays an artifact a peer has already saved,
+    but does not wait for one.
+    """
+    _peer_wait.timeout_s = timeout_s
+    try:
+        yield
+    finally:
+        _peer_wait.timeout_s = 0.0
+
+
+def _graph_fingerprint(graph: fx.GraphModule) -> str | None:
+    """Hash of the code of `graph` and its submodules and of their constants.
+
+    Two ranks with the same fingerprint traced the same program, so either can
+    replay the other's artifact. A rank-dependent value baked into the graph,
+    e.g. a Python int from `rank_in_group`, changes the code and so the hash.
+    None if the graph cannot be hashed; its artifact is then only replayed by
+    the rank that saved it.
+    """
+    try:
+        h = hashlib.sha256()
+        for name, module in graph.named_modules():
+            if not isinstance(module, fx.GraphModule):
+                continue
+            h.update(f"{name}\n{module.code}".encode())
+            for node in module.graph.nodes:
+                if node.op != "get_attr":
+                    continue
+                value = module
+                for atom in str(node.target).split("."):
+                    value = getattr(value, atom)
+                h.update(str(node.target).encode())
+                if not isinstance(value, torch.Tensor):
+                    h.update(type(value).__qualname__.encode())
+                    continue
+                h.update(f"{value.dtype}{tuple(value.shape)}".encode())
+                if value.numel() <= _FINGERPRINT_MAX_NUMEL:
+                    flat = value.detach().to("cpu").contiguous().reshape(-1)
+                    h.update(flat.view(torch.uint8).numpy().tobytes())
+        return h.hexdigest()
+    except Exception as e:
+        logger.warning("[TpuCompilerAdaptor] Could not fingerprint graph: %s", e)
+        return None
 
 
 def _deserialize_entry(entry: Any) -> Callable[..., Any]:
@@ -99,6 +171,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_XLA_CHECK_RECOMPILATION",
     "TPU_PARALLEL_PRECOMPILE",
     "TPU_PRECOMPILE_BIGGEST_FIRST",
+    "TPU_PRECOMPILE_PEER_REPLAY",
     # KV-transfer wiring: ports, socket paths, staging pool, pool sizes,
     # timeouts. Same reasoning as the Raiden group above. Every registry
     # entry not named here joins the cache key, so omitting these would
@@ -488,8 +561,13 @@ class TpuCompilerAdaptor(CompilerInterface):
         entry: Any,
         graph: fx.GraphModule,
         was_wrapped: bool,
+        fingerprint: str | None,
     ) -> bool:
-        """Write the bundled entry for `graph` to `path`. True if it landed."""
+        """Write the bundled entry for `graph` to `path`. True if it landed.
+
+        `fingerprint` is `_graph_fingerprint(graph)` taken before the backend
+        ran, as a peer replaying this artifact computes it.
+        """
         try:
             os.makedirs(os.path.dirname(path), exist_ok=True)
             payload = TpuCompilationHandle(
@@ -497,6 +575,7 @@ class TpuCompilerAdaptor(CompilerInterface):
                 entry=entry,
                 signature=shape_variants.graph_signature(graph),
                 was_wrapped=was_wrapped,
+                fingerprint=fingerprint,
             )
             # Write-then-rename: a crash or a full disk partway through
             # pickling a 400 MB entry would otherwise leave a truncated file
@@ -518,12 +597,15 @@ class TpuCompilerAdaptor(CompilerInterface):
         path: str,
         graph: fx.GraphModule,
         was_wrapped: bool,
+        fingerprint: str | None = None,
     ) -> Callable[..., Any] | None:
         """Rebuild the runnable saved at `path`, or None to recompile.
 
         Every rejection here costs one recompile and nothing else, so this is
         deliberately strict: an artifact is replayed only if it is the current
         format and was built from a graph with this one's input signature.
+        With `fingerprint` (another rank's artifact), it must also have been
+        built from exactly this graph.
         """
         try:
             with open(path, "rb") as f:
@@ -554,6 +636,10 @@ class TpuCompilerAdaptor(CompilerInterface):
             )
         elif payload.was_wrapped != was_wrapped:
             reason = "output-tuple wrapping differs from the saved graph"
+        elif fingerprint is not None and payload.fingerprint != fingerprint:
+            reason = (
+                f"built from a different graph ({payload.fingerprint} vs {fingerprint})"
+            )
         if reason is not None:
             logger.warning(
                 "[TpuCompilerAdaptor] Ignoring artifact %s: %s", path, reason
@@ -569,6 +655,75 @@ class TpuCompilerAdaptor(CompilerInterface):
                 e,
             )
             return None
+
+    def _peer_paths(self, key: str) -> list[str]:
+        """Where the other ranks have saved their artifact for `key`.
+
+        vLLM gives each rank its own `<hash>/rank_<rank>_<dp_rank>/<prefix>`
+        cache dir, so another rank's artifact for the same bucket sits at the
+        same relative path under its `rank_*` dir. Any DP rank counts: the
+        owner of a bucket can be in another DP group of the host, and the
+        fingerprint check decides whether its artifact fits. Only dirs on this
+        host's disk are seen unless the cache root is shared.
+        """
+        assert self.cache_dir is not None
+        own = os.path.normpath(self.cache_dir)
+        rank_dir, prefix = os.path.split(own)
+        if re.fullmatch(r"rank_\d+_\d+", os.path.basename(rank_dir)) is None:
+            return []
+        pattern = os.path.join(
+            glob.escape(os.path.dirname(rank_dir)),
+            "rank_*_*",
+            glob.escape(prefix),
+            glob.escape(key),
+        )
+        mine = os.path.join(own, key)
+        return sorted(p for p in glob.glob(pattern) if p != mine)
+
+    def _replay_from_peer(
+        self,
+        key: str,
+        graph: fx.GraphModule,
+        was_wrapped: bool,
+        fingerprint: str,
+    ) -> tuple[Callable[..., Any], str] | None:
+        """Replay the artifact another rank saved for this bucket.
+
+        Waits for one to appear inside `wait_for_peer_artifact`. Returns the
+        runnable and the peer's path, or None to compile: nothing appeared in
+        time, or what appeared was built from a different graph -- then the
+        ranks do not trace the same program and waiting on would not help.
+        """
+        deadline = time.monotonic() + getattr(_peer_wait, "timeout_s", 0.0)
+        paths = self._peer_paths(key)
+        while not paths and time.monotonic() < deadline:
+            time.sleep(_PEER_POLL_S)
+            paths = self._peer_paths(key)
+        if not paths:
+            return None
+        compiled_fn = self._replay(paths[0], graph, was_wrapped, fingerprint)
+        return None if compiled_fn is None else (compiled_fn, paths[0])
+
+    @staticmethod
+    def _link_artifact(src: str, dst: str) -> bool:
+        """Make `dst` the same file as `src`: a hard link, a copy if `src`
+        is on another filesystem. True if `dst` now exists."""
+        tmp = f"{dst}.{os.getpid()}.tmp"
+        try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)
+            try:
+                os.link(src, tmp)
+            except OSError:
+                shutil.copyfile(src, tmp)
+            os.replace(tmp, dst)
+            return True
+        except Exception as e:
+            logger.warning(
+                "[TpuCompilerAdaptor] Could not link %s to %s: %s", src, dst, e
+            )
+            with contextlib.suppress(OSError):
+                os.remove(tmp)
+            return False
 
     def compile(
         self,
@@ -611,6 +766,46 @@ class TpuCompilerAdaptor(CompilerInterface):
         graph = copy.deepcopy(graph)
         graph, was_wrapped = _ensure_tuple_output(graph)
 
+        caching = (
+            key is not None and self.cache_dir is not None and not self._disable_cache
+        )
+
+        # Another rank of this host compiled, or is compiling, this bucket:
+        # replay its artifact instead of tracing, lowering and compiling it
+        # again. The artifact is the one vLLM's compile cache already holds for
+        # that rank; this rank's cache entry becomes a hard link to it.
+        # With peer replay off, nothing replays another rank's artifact, so
+        # none records a fingerprint either: `load` replays a rank's own
+        # artifact without one, and a peer with replay on refuses it.
+        peer = None
+        fingerprint = (
+            _graph_fingerprint(graph)
+            if caching and envs.TPU_PRECOMPILE_PEER_REPLAY
+            else None
+        )
+        if fingerprint is not None:
+            assert key is not None
+            peer = self._replay_from_peer(key, graph, was_wrapped, fingerprint)
+        if peer is not None:
+            assert key is not None and self.cache_dir is not None
+            compiled_fn, peer_path = peer
+            logger.info(
+                "[TpuCompilerAdaptor] Replayed range %s from %s",
+                compile_range,
+                peer_path,
+            )
+            save_path = os.path.join(self.cache_dir, key)
+            handle = (
+                (key, save_path, was_wrapped)
+                if self._link_artifact(peer_path, save_path)
+                else None
+            )
+            if was_wrapped:
+                compiled_fn = self._unwrap_compiled_fn(compiled_fn)
+            if size is not None:
+                shape_variants.remember(self.cache_dir, key, graph, compiled_fn)
+            return compiled_fn, handle
+
         compiled_fn, entry = self._run_backend(graph, example_inputs)
 
         if was_wrapped:
@@ -631,12 +826,11 @@ class TpuCompilerAdaptor(CompilerInterface):
         # the PJRT binary itself (torch_tpu_tier3/*.bin); that covers the
         # recompile path in `load`, not this one.
         handle = None
-        caching = (
-            key is not None and self.cache_dir is not None and not self._disable_cache
-        )
         if caching and entry is not None:
             save_path = os.path.join(self.cache_dir, key)
-            if self._save_handle(key, save_path, entry, graph, was_wrapped):
+            if self._save_handle(
+                key, save_path, entry, graph, was_wrapped, fingerprint
+            ):
                 handle = (key, save_path, was_wrapped)
         elif caching:
             logger.info(
@@ -693,6 +887,9 @@ class TpuCompilerAdaptor(CompilerInterface):
 
         compiled_fn = self._replay(path, graph, was_wrapped)
         if compiled_fn is None:
+            fingerprint = (
+                _graph_fingerprint(graph) if envs.TPU_PRECOMPILE_PEER_REPLAY else None
+            )
             compiled_fn, entry = self._run_backend(graph, example_inputs)
             # Self-heal: overwrite the artifact vLLM will hand us again next
             # run. Without this a single stale entry recompiles forever.
@@ -701,7 +898,7 @@ class TpuCompilerAdaptor(CompilerInterface):
                 and self.cache_dir is not None
                 and not self._disable_cache
             ):
-                self._save_handle(key, path, entry, graph, was_wrapped)
+                self._save_handle(key, path, entry, graph, was_wrapped, fingerprint)
 
         if was_wrapped:
             compiled_fn = self._unwrap_compiled_fn(compiled_fn)
