@@ -41,7 +41,9 @@ from typing import Any
 
 import jax
 try:
-    _vcr = os.environ.get("VLLM_CACHE_ROOT", "")
+    import vllm.envs as _vllm_envs
+
+    _vcr = _vllm_envs.VLLM_CACHE_ROOT
     if _vcr and _vcr.startswith("/compile-cache"):
         _jcd = os.path.join(os.path.dirname(_vcr.rstrip("/")), "jax_cache")
         os.makedirs(_jcd, exist_ok=True)
@@ -1936,11 +1938,12 @@ class Qwen35Megakernel:
         ]
         self.attn_layer_name = self.backbone.layers[3].self_attn.attn.layer_name
 
-        # The stock GDN op and the KV connectors place manager block b's GDN state at kernel page
-        # b * (block_size // page_size), so checkpoint slots sit that many pages apart.
-        block_size = int(
-            getattr(runner, "block_size", 0) or runner.vllm_config.cache_config.block_size
-        )
+        # The stock GDN op and the KV connectors place manager block b's GDN
+        # state at kernel page b * (block_size // page_size), so checkpoint
+        # slots sit that many pages apart. They read the finalized
+        # cache_config.block_size; runner.block_size is a snapshot taken
+        # before the platform adjusts the block size after the model load.
+        block_size = int(runner.vllm_config.cache_config.block_size)
         _need(
             block_size % self.page_size == 0,
             f"vLLM block_size {block_size} is not a multiple of the kernel page size {self.page_size}",
