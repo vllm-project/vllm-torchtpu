@@ -51,7 +51,11 @@ def test_multiplier_covers_the_worst_case_pairs():
     assert _mult(configs.RpaCase.MIXED, 1024, 1 << 20, 16, 16, 1) == 128
 
 
+@pytest.mark.tpu_test
 def test_schedule_overflow_is_dropped_not_written_out_of_bounds(monkeypatch):
+    # Checked here, not in a skipif, so collection starts no JAX backend.
+    if jax.default_backend() != "tpu":
+        pytest.skip("Mosaic lowering (dynamic DMA sizes)")
     monkeypatch.setattr(
         configs.RpaConfigs, "max_schedule_size_multiplier", property(lambda s: 1)
     )
