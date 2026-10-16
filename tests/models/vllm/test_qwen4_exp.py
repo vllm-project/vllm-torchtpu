@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import math
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -1081,3 +1082,102 @@ def test_ple_explicit_group_controls_sharding_and_reduction(monkeypatch):
     expected = rows[ids].masked_fill((ids < 32).unsqueeze(-1), 0)
     assert torch.equal(table(ids), expected + 1)
     assert torch.equal(group.seen, expected)
+
+
+@pytest.mark.parametrize("storage", ["resident", "host", "shared"])
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+def test_ple_storage_reuses_common_checkpoint_loader(
+    monkeypatch, tmp_path, storage, fp8
+):
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.ple_storage import (
+        HostPLETable,
+        ResidentPLETable,
+        SharedPLEOptions,
+    )
+
+    _set_tp(monkeypatch, 0, 1)
+    if storage == "resident":
+        factory = ResidentPLETable
+    else:
+        options = (
+            SharedPLEOptions(tmp_path, "fixture", {"checkpoint": "small"}, 1)
+            if storage == "shared"
+            else None
+        )
+        factory = partial(HostPLETable, shared=options)
+    dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
+    config = _text_config(**_PLE, ple_embedding_dtype="float8_e4m3fn" if fp8 else None)
+    with set_default_torch_dtype(torch.bfloat16):
+        embedding = Qwen4ExpNGramEmbedding(
+            config, _PLE["ple_embed_dim"], 0, None, "ple", table_factory=factory
+        )
+    table = embedding.ngram_embedding
+    checkpoint = (
+        (torch.arange(_TABLE_ROWS * _HEAD_DIM).float() % 8)
+        .reshape(_TABLE_ROWS, _HEAD_DIM)
+        .to(dtype)
+    )
+    try:
+        assert table.weight.is_meta == (storage == "shared")
+        weights = [
+            (f"ngram_embedding.shard_{i}.weight", shard)
+            for i, shard in enumerate(checkpoint.split(22))
+        ]
+        if fp8:
+            weights.append(("ngram_embedding.weight_scale", torch.tensor([0.25])))
+        embedding.load_weights(weights)
+        visited = []
+        weight = table.weight
+
+        def visit(tensor):
+            visited.append(tensor)
+            return tensor
+
+        table._apply(visit)
+        assert table.weight is weight
+        assert all(tensor is not weight for tensor in visited)
+        table.finalize_weights()
+        table.finalize_weights()
+        if storage == "resident":
+            assert table.weight.numel() == 0
+            assert torch.equal(
+                table.table.reshape(_TABLE_ROWS, _HEAD_DIM).view(dtype).float(),
+                checkpoint.float(),
+            )
+        else:
+            ids = torch.tensor([[0, 22, 63, -1], [64, 31, 32, 1]])
+            raw = table.lookup_host(ids).reshape(*ids.shape, _HEAD_DIM)
+            expected = checkpoint[ids.clamp(0, 63)].float()
+            expected[(ids < 0) | (ids >= 64)] = 0
+            assert torch.equal(raw.view(dtype).float(), expected)
+        with pytest.raises(ValueError, match="finalized"):
+            embedding.load_weights(weights[:1])
+    finally:
+        if isinstance(table, HostPLETable):
+            table.close()
+    assert not list(tmp_path.iterdir())
+
+
+def test_ple_storage_rejects_missing_and_duplicate_rows(monkeypatch):
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.ple_storage import ResidentPLETable
+
+    _set_tp(monkeypatch, 0, 1)
+    with set_default_torch_dtype(torch.bfloat16):
+        embedding = Qwen4ExpNGramEmbedding(
+            _text_config(**_PLE),
+            _PLE["ple_embed_dim"],
+            0,
+            None,
+            "ple",
+            table_factory=ResidentPLETable,
+        )
+    shard = ("ngram_embedding.shard_0.weight", torch.ones(22, 4, dtype=torch.bfloat16))
+    embedding.load_weights([shard])
+    with pytest.raises(ValueError, match="Duplicate"):
+        embedding.load_weights([shard])
+    with pytest.raises(ValueError, match="Missing"):
+        embedding.ngram_embedding.finalize_weights()

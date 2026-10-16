@@ -164,6 +164,15 @@ class SharedPLETable:
         assert self._mapping is not None
         self._mapping[offset : offset + len(value)] = value
 
+    @contextlib.contextmanager
+    def writable_buffer(self):
+        """Borrow writer storage for the upstream tensor checkpoint loader."""
+        if not self.is_writer or self._published or self._closed:
+            raise RuntimeError("PLE table is read-only or already published")
+        assert self._mapping is not None
+        with memoryview(self._mapping) as view:
+            yield view
+
     def finish(self, metadata=None):
         """Publish writer bytes and wait until every expected reader is ready."""
         if self._ready:
