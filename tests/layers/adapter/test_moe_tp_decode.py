@@ -157,6 +157,7 @@ class _Harness:
         self.selftest_calls = 0
         self.selftest_failures = []
         self.logs = []
+        self.statics = []
 
     def runner(self, name, *, scoring_func="sigmoid", shared=True, **config):
         mcfg = _moe_config(**config)
@@ -240,7 +241,12 @@ def harness(monkeypatch):
         lambda: moe_tp_decode._Topology(mesh=SimpleNamespace(size=16), mesh_index=0),
     )
     monkeypatch.setattr(moe_tp_decode, "_gather", lambda obj: [obj])
-    monkeypatch.setattr(moe_tp_decode, "_get_op", lambda mesh, statics: h.op)
+
+    def get_op(mesh, statics):
+        h.statics.append(statics)
+        return h.op
+
+    monkeypatch.setattr(moe_tp_decode, "_get_op", get_op)
 
     def selftest(topo, buckets, device):
         h.selftest_calls += 1
@@ -440,3 +446,77 @@ def test_failed_selftest_raises_and_arms_nothing(harness):
         moe_tp_decode.arm(model)
     runner = model.layers[0]
     assert not _armed(runner) and runner.shared_experts is not None
+
+
+@pytest.mark.parametrize(("prefill", "want"), [(True, 256), (False, None)])
+def test_prefill_kernel_arms_with_the_cap(harness, monkeypatch, prefill, want):
+    # FUSED_MOE_PREFILL_KERNEL arms the prefill kernel above the decode cap;
+    # without it the op keeps the psum path at every token count.
+    monkeypatch.setattr(envs, "FUSED_MOE_PREFILL_KERNEL", prefill)
+    monkeypatch.setattr(envs, "FUSED_MOE_DECODE_KERNEL_MAX_TOKENS", 256)
+    assert moe_tp_decode.arm(harness.model({})) == 1
+    assert harness.statics[0].prefill_above == want
+
+
+def test_prefill_kernel_does_not_arm_ep_layers(harness, monkeypatch):
+    # The prefill kernel serves TP experts only; an EP layer is not armed.
+    monkeypatch.setattr(envs, "FUSED_MOE_PREFILL_KERNEL", True)
+    assert moe_tp_decode.arm(harness.model({"use_ep": True})) == 0
+    assert harness.statics == []
+
+
+@pytest.mark.parametrize(("tokens", "prefill"), [(512, True), (256, False), (128, False)])
+def test_op_body_runs_the_prefill_kernel_above_the_cap(monkeypatch, tokens, prefill):
+    import jax
+    import jax.numpy as jnp
+
+    calls = []
+
+    def fake_prefill(x, *args):
+        calls.append(("prefill", x.shape[0], args[-1]))
+        return jnp.full_like(x, 7)
+
+    def fake_chain(x, *args):
+        calls.append(("chain", x.shape[0]))
+        return jnp.ones_like(x)
+
+    monkeypatch.setattr(moe_tp_decode, "_prefill_chain", fake_prefill)
+    monkeypatch.setattr(moe_tp_decode, "_tp_chain", fake_chain)
+    monkeypatch.setattr(
+        moe_tp_decode.kernel, "can_use_moe_tp_decode", lambda *a, **k: False
+    )
+    statics = moe_tp_decode._OpStatics(
+        topk=TOPK,
+        routed_scale=ROUTED_SCALE,
+        activation="silu",
+        use_sparse_core=False,
+        onehot_threshold=0,
+        prefill_above=256,
+    )
+    body = moe_tp_decode._op_body(statics, n_ranks=2, axis="d")
+    f32, f8 = jnp.float32, jnp.float8_e4m3fn
+    operands = (
+        jnp.zeros((tokens, H), jnp.bfloat16),
+        jnp.zeros((tokens, E), f32),
+        jnp.zeros((E,), f32),
+        jnp.zeros((tokens,), jnp.bool_),
+        jnp.zeros((E, H, 2 * INTER), f8),
+        jnp.zeros((E, INTER, H), f8),
+        jnp.zeros((E, 1, 1, 2 * INTER), f32),
+        jnp.zeros((E, 1, 1, H), f32),
+        jnp.zeros((H, 2 * FS), f8),
+        jnp.zeros((2 * FS,), f32),
+        jnp.zeros((FS, H), f8),
+        jnp.zeros((H,), f32),
+        jnp.zeros((1, 1), jnp.int32),
+    )
+    # Two "ranks" under vmap give the psum its named axis.
+    stacked = [jnp.stack([a, a]) for a in operands]
+    out = jax.vmap(body, axis_name="d")(*stacked)
+    if prefill:
+        # The prefill kernel's output is already summed: no psum on top.
+        assert calls == [("prefill", tokens, "d")]
+        assert bool(jnp.all(out == 7))
+    else:
+        assert calls == [("chain", tokens)]
+        assert bool(jnp.all(out == 2))  # the chain's partial, psummed over 2
