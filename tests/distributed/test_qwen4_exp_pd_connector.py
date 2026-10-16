@@ -462,7 +462,10 @@ def test_qwen_loaded_requires_controller_and_native_completion(
 @pytest.mark.parametrize(
     "fault", [None, "checkpoint", "scale", "layout_flag", "binding"]
 )
-def test_qwen_register_runner_admits_actual_materialized_owners(monkeypatch, fault):
+@pytest.mark.parametrize("ssm_dtype", ["bfloat16", "float32"])
+def test_qwen_register_runner_admits_actual_materialized_owners(
+    monkeypatch, fault, ssm_dtype
+):
     import torch
 
     from tests.runner.test_qwen4_exp_pd_manifest import live_pool
@@ -476,8 +479,8 @@ def test_qwen_register_runner_admits_actual_materialized_owners(monkeypatch, fau
     worker._qwen_page_plan = None
     worker._raiden_transfer_engine = None
     worker.vllm_config.parallel_config.enable_expert_parallel = False
-    worker.vllm_config.cache_config.mamba_ssm_cache_dtype = "bfloat16"
-    config, materialized = live_pool(tp=8)
+    worker.vllm_config.cache_config.mamba_ssm_cache_dtype = ssm_dtype
+    config, materialized = live_pool(tp=8, ssm=ssm_dtype)
     cache = Qwen4ExpPooledCache.__new__(Qwen4ExpPooledCache)
     cache.native_config, cache.materialized = config, materialized
     attention = SimpleNamespace(
@@ -567,6 +570,7 @@ def test_qwen_register_runner_admits_actual_materialized_owners(monkeypatch, fau
             worker._qwen_page_plan.manifest.storages[0] is materialized.raw_tensors[0]
         )
         payload = worker._raiden_layout_fingerprint_payload
+        assert payload["semantics"]["ranks"][0]["state_flags"]["ssm_dtype"] == ssm_dtype
         assert payload["semantics"]["ranks"][0]["checkpoint"] == "a" * 64
         assert payload["semantics"]["ranks"][0]["kv_scales"] == [(0, 0.5, 0.25)]
         assert (

@@ -414,7 +414,7 @@ def validate_config(cfg):
             or not pooled
             or c.cache_dtype not in ("fp8", "fp8_e4m3")
             or c.enable_prefix_caching
-            or c.mamba_ssm_cache_dtype != "bfloat16"
+            or c.mamba_ssm_cache_dtype not in ("bfloat16", "float32")
             or envs.TPU_KV_RESHARD_TRANSPORT != "raiden"
             or any(
                 (
@@ -427,7 +427,8 @@ def validate_config(cfg):
         ):
             raise ValueError(
                 "Qwen4Exp PD requires its model-owned Raiden connector, a producer "
-                "or consumer role, DP8/TP1/EP8, unified FP8 pages, BF16 SSM and APC off"
+                "or consumer role, DP8/TP1/EP8, unified FP8 pages, "
+                "BF16/FP32 SSM and APC off"
             )
     if envs.VLLM_TPU_BLOCK_MAJOR_KV:
         raise ValueError("Qwen4Exp requires its native HEAD_ALONG_SUBLANE cache layout")

@@ -185,13 +185,14 @@ def test_pool_page_override_respects_upstream_prefix_validation(monkeypatch, pre
 
 
 @pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])
-def test_pd_admits_only_model_owned_fp8_dp8(monkeypatch, role):
+@pytest.mark.parametrize("ssm_dtype", ["bfloat16", "float32"])
+def test_pd_admits_only_model_owned_fp8_dp8(monkeypatch, role, ssm_dtype):
     from types import SimpleNamespace
 
     monkeypatch.setenv("TPU_KV_RESHARD_TRANSPORT", "raiden")
     cfg = config()
     cfg.cache_config.cache_dtype = "fp8"
-    cfg.cache_config.mamba_ssm_cache_dtype = "bfloat16"
+    cfg.cache_config.mamba_ssm_cache_dtype = ssm_dtype
     cfg.kv_transfer_config = SimpleNamespace(
         kv_connector="Qwen4ExpRaidenConnector",
         kv_connector_module_path=None,
@@ -202,7 +203,7 @@ def test_pd_admits_only_model_owned_fp8_dp8(monkeypatch, role):
         ("parallel_config", "tensor_parallel_size", 2),
         ("parallel_config", "enable_expert_parallel", False),
         ("cache_config", "cache_dtype", "auto"),
-        ("cache_config", "mamba_ssm_cache_dtype", "float32"),
+        ("cache_config", "mamba_ssm_cache_dtype", "float16"),
         ("cache_config", "enable_prefix_caching", True),
         ("kv_transfer_config", "kv_role", "kv_both"),
         ("kv_transfer_config", "kv_connector", "TPURaidenConnector"),

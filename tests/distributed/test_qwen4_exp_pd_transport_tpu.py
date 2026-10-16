@@ -67,7 +67,8 @@ def _run_role(role: str, exchange: Path) -> None:
         batch_transfer_d2h_sync([raw], [host])
         return host.numpy()
 
-    config, materialized = live_pool(device="tpu", num_blocks=128)
+    ssm_dtype = _receive(exchange / "test-config.json")["ssm_dtype"]
+    config, materialized = live_pool(device="tpu", num_blocks=128, ssm=ssm_dtype)
     manifest = build_transfer_manifest(config, materialized)
     assert len(manifest.storages) == 1
     raw = manifest.storages[0]
@@ -232,6 +233,7 @@ def _run_role(role: str, exchange: Path) -> None:
             pid=os.getpid(),
             owners=len(tags),
             pages=cursor - 1,
+            ssm_dtype=ssm_dtype,
             transferred_bytes=moved,
             compared_bytes=after.size,
             raw_sha256=hashlib.sha256(after).hexdigest(),
@@ -241,11 +243,13 @@ def _run_role(role: str, exchange: Path) -> None:
     _receive(exchange / f"{peer_role}-done.json")
 
 
-def test_qwen_all_owner_pages_over_native_reshard(tmp_path):
+@pytest.mark.parametrize("ssm_dtype", ["bfloat16", "float32"])
+def test_qwen_all_owner_pages_over_native_reshard(tmp_path, ssm_dtype):
     from torch_tpu._internal.distributed.launchers.singlehost_wrapper import (
         prepare_tpu_environment,
     )
 
+    _publish(tmp_path / "test-config.json", dict(ssm_dtype=ssm_dtype))
     roles = ("prefill", "decode")
     with patch.dict(os.environ):
         for key in (
@@ -284,6 +288,7 @@ def test_qwen_all_owner_pages_over_native_reshard(tmp_path):
                 time.sleep(0.1)
             assert child.wait() == 0
             records = [_receive(tmp_path / f"{role}-done.json") for role in roles]
+            assert all(record["ssm_dtype"] == ssm_dtype for record in records)
             print("QWEN_NATIVE_PAGE_TRANSFER " + json.dumps(records))
         finally:
             if child.poll() is None:

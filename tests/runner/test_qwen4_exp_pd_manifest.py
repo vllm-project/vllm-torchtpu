@@ -19,11 +19,17 @@ from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import pooled_cache_specs
 from vllm_torchtpu.models.vllm.qwen4_exp.qsa import Qwen4ExpPooledQSABackend
 
 
-def live_pool(tp=1, device="cpu", num_blocks=64):
-    cfg = pool_config(tp=tp)
+def live_pool(tp=1, device="cpu", num_blocks=64, ssm="bfloat16"):
+    cfg = pool_config(tp=tp, ssm=ssm)
     cfg.cache_config.enable_prefix_caching = False
     cfg.cache_config.mamba_cache_mode = "none"
     layout, specs = pooled_cache_specs(cfg)
+    expected_ssm = torch.float32 if ssm == "float32" else torch.bfloat16
+    assert all(
+        spec.dtypes[1] == expected_ssm
+        for name, spec in specs.items()
+        if name.endswith(".linear_attn")
+    )
     cfg.cache_config.block_size = layout.block_size
     cfg.cache_config.mamba_block_size = cfg.model_config.max_model_len
     groups = get_kv_cache_groups(cfg, specs)
@@ -53,8 +59,9 @@ def live_pool(tp=1, device="cpu", num_blocks=64):
 
 
 @pytest.mark.parametrize("tp", [1, 2, 4, 8])
-def test_full_pages_keep_all_owners_and_group_specific_aliases(tp):
-    config, materialized = live_pool(tp)
+@pytest.mark.parametrize("ssm", ["bfloat16", "float32"])
+def test_full_pages_keep_all_owners_and_group_specific_aliases(tp, ssm):
+    config, materialized = live_pool(tp, ssm=ssm)
     manifest = build_transfer_manifest(config, materialized)
     assert len(manifest.pools) == len(materialized.kv_caches)
     assert len({p.tag for p in manifest.pools}) == len(manifest.pools)

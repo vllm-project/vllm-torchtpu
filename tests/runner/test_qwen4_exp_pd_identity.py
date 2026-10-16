@@ -91,3 +91,17 @@ def test_rank_identity_keeps_filtered_expert_and_scale_differences_in_signature(
     rows = ranks()
     rows[1]["kv_scales"] = [(0, 1.0, 0.25)]
     assert canonical_rank_identity(rows, world_size=2) != first
+
+
+@pytest.mark.parametrize("ssm_dtype", ["bfloat16", "float32"])
+def test_rank_identity_requires_matching_ssm_dtype(ssm_dtype):
+    rows = ranks()
+    for row in rows:
+        row["state_flags"]["ssm_dtype"] = ssm_dtype
+    identity = canonical_rank_identity(rows, world_size=2)
+    assert identity["ranks"][0]["state_flags"]["ssm_dtype"] == ssm_dtype
+    rows[1]["state_flags"]["ssm_dtype"] = (
+        "float32" if ssm_dtype == "bfloat16" else "bfloat16"
+    )
+    with pytest.raises(ValueError, match="state configuration"):
+        canonical_rank_identity(rows, world_size=2)
