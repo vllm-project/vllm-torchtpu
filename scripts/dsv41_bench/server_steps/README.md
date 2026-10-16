@@ -333,21 +333,31 @@ The primary `decode_throughput` metric estimates throughput from the median
 host-observation step interval:
 
 ```text
-mean_accepted_tokens = window_accepted_tokens / window_request_observations
-decode_tokens_s = global_concurrency * mean_accepted_tokens / median_step_seconds
+fixed_accepted_tokens_per_request_step = 3.47
+decode_tokens_s = global_concurrency * 3.47 / median_step_seconds
 ```
 
-Accepted tokens include bonus tokens; do not substitute K or K+1. The summary
-and each printed round report this estimate at node, logical-device and
-physical-chip scope. Median step time uses the same qualifying consecutive
-full-C observations as before. It reduces the effect of occasional long
-intervals but does not measure sustained output over the whole window.
+The fixed 3.47 tokens/request/step is a reporting constant, not the measured
+acceptance of the run. It holds token yield constant when comparing step
+cadence. The summary and each printed round report this estimate at node,
+logical-device and physical-chip scope. Median step time uses the same
+qualifying consecutive full-C observations as before. It reduces the effect
+of occasional long intervals but does not measure sustained output over the
+whole window. Do not compare this estimate directly with historical primary
+metrics that used actual acceptance; recompute those from median step time
+with the same 3.47 constant.
 
 `categories.decode.global_tokens_s` and its per-device/per-chip values retain
 the observed window rate: accepted output tokens divided by the common
 host-clock window duration. They carry `throughput_basis=observed_window`;
-`decode_throughput` carries `basis=median_step_estimate`. Report both metrics
-with their labels. Host cadence is distinct from isolated target/draft device
+`decode_throughput` carries
+`basis=fixed_accepted_tokens_median_step_estimate` and
+`accepted_tokens_per_request_step=3.47`. Actual mean accepted tokens per
+request/step, including bonus tokens, remain in
+`categories.decode.mean_tokens_per_request_step`. The GitHub Check labels the
+fixed estimate and reports median step time. For multiple formal rounds, it
+takes the median of each round's throughput. Report both metrics with their
+labels. Host cadence is distinct from isolated target/draft device
 duration. Contexts derived from accepted outputs are reported separately from
 asynchronous scheduler metadata.
 
