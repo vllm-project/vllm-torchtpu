@@ -1107,9 +1107,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # deterministic cap from the scheduler config, 0 disables the cap (all
     # post-profile HBM goes to KV), N > 0 caps KV at N tokens.
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS": env_int("VLLM_TPU_POOLING_KV_CACHE_TOKENS", -1),
-    # SrptPrefillScheduler: maximum consecutive steps a running prefill chunk
-    # may be held back before it is guaranteed a step to advance (0 disables
-    # hold-back). Prefixed with VLLM_ so vLLM's Ray worker env propagation
+    # SrptPrefillScheduler: consecutive steps a running prefill chunk may go
+    # without getting one KV block of tokens before it moves ahead of the
+    # other prefill chunks and is no longer held (0 disables hold-back).
+    # Prefixed with VLLM_ so vLLM's Ray worker env propagation
     # copies it automatically to DP/Ray engine-core actors.
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS": env_nonnegative_int(
         "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", 8

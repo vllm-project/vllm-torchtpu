@@ -19,7 +19,8 @@ request is reached. Each step (FCFS policy, prefills not throttled) this
 scheduler:
 
 * orders RUNNING as decodes first, in their existing order, then prefill
-  chunks by remaining prompt tokens, fewest first;
+  chunks by remaining prompt tokens, fewest first, with stalled chunks (below)
+  ahead of the rest;
 * holds back, for this step, the longest running prefill chunks needed for the
   request upstream admits next (the first admissible request in
   ``kv_holding_waiting``, then ``waiting``) to fit in the remaining budget,
@@ -28,12 +29,18 @@ scheduler:
 
 Held chunks keep their KV blocks; ``max_num_running_reqs`` and
 ``max_num_active_reqs`` are lowered by the number held during the step so
-admission never exceeds ``max_num_seqs``. A request is held at most
-``VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS`` steps in a row, and a hold whose target
-is not admitted backs off exponentially for that target.
+admission never exceeds ``max_num_seqs``. A hold whose target is not
+admitted backs off exponentially for that target.
+
+Anti-starvation: a running prefill chunk that goes
+``VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS`` steps in a row without getting at least
+one KV block of tokens in a step, whether it was held or crowded out by shorter
+prefills, is stalled: it moves ahead of the other prefill chunks and is not
+held until it gets a block. Decodes still go first, so a stalled chunk can
+still wait while decodes fill the budget.
 
 Under KV pressure upstream preempts ``running[-1]``, which is the longest
-prefill chunk.
+non-stalled prefill chunk, so a long prompt can be preempted repeatedly.
 
 Select with ``--scheduler-cls``
 ``vllm_torchtpu.core.experimental.srpt_prefill_scheduler.SrptPrefillScheduler``.
@@ -66,7 +73,9 @@ class SrptPrefillScheduler(AsyncScheduler):
         self._draft_slots = (
             spec.max_num_new_slots_for_drafting if spec is not None else 0
         )
-        self._consecutive_holds: dict[str, int] = {}
+        # Running prefill request id -> consecutive steps with less than one
+        # block of progress.
+        self._stalled_steps: dict[str, int] = {}
         # Target request id -> (failed holds, first step a hold may retry).
         self._hold_backoff: dict[str, tuple[int, int]] = {}
         logger.info(
@@ -77,14 +86,14 @@ class SrptPrefillScheduler(AsyncScheduler):
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         held: list[Request] = []
         target = None
+        prefilling: list[Request] = []
         if not throttle_prefills and self.policy == SchedulingPolicy.FCFS:
-            self._order_running()
             self._prune_hold_state()
+            self._order_running()
+            prefilling = [r for r in self.running if r.is_prefill_chunk]
             held, target = self._select_chunks_to_hold()
 
         held_ids = {r.request_id for r in held}
-        for req_id in held_ids:
-            self._consecutive_holds[req_id] = self._consecutive_holds.get(req_id, 0) + 1
         self.running[:] = [r for r in self.running if r.request_id not in held_ids]
         self.max_num_running_reqs -= len(held)
         self.max_num_active_reqs -= len(held)
@@ -95,8 +104,16 @@ class SrptPrefillScheduler(AsyncScheduler):
             self.max_num_active_reqs += len(held)
             self.running.extend(held)
 
-        for req_id in output.num_scheduled_tokens:
-            self._consecutive_holds.pop(req_id, None)
+        for r in prefilling:
+            if (
+                output.num_scheduled_tokens.get(r.request_id, 0) >= self.block_size
+                or not r.is_prefill_chunk
+            ):
+                self._stalled_steps.pop(r.request_id, None)
+            else:
+                self._stalled_steps[r.request_id] = (
+                    self._stalled_steps.get(r.request_id, 0) + 1
+                )
         if target is not None:
             self._record_hold_outcome(target)
         return output
@@ -105,17 +122,23 @@ class SrptPrefillScheduler(AsyncScheduler):
     def _remaining(request: Request) -> int:
         return request.num_tokens - request.num_computed_tokens
 
+    def _is_stalled(self, request: Request) -> bool:
+        return (
+            self._stalled_steps.get(request.request_id, 0) >= self.max_consecutive_holds
+        )
+
     def _order_running(self) -> None:
         decoding = [r for r in self.running if not r.is_prefill_chunk]
         prefilling = sorted(
-            (r for r in self.running if r.is_prefill_chunk), key=self._remaining
+            (r for r in self.running if r.is_prefill_chunk),
+            key=lambda r: (not self._is_stalled(r), self._remaining(r)),
         )
         self.running[:] = decoding + prefilling
 
     def _prune_hold_state(self) -> None:
         prefilling = {r.request_id for r in self.running if r.is_prefill_chunk}
-        self._consecutive_holds = {
-            k: v for k, v in self._consecutive_holds.items() if k in prefilling
+        self._stalled_steps = {
+            k: v for k, v in self._stalled_steps.items() if k in prefilling
         }
         if self._hold_backoff:
             waiting = {
@@ -248,7 +271,8 @@ class SrptPrefillScheduler(AsyncScheduler):
             need = min(target_remaining, lptt) if lptt > 0 else target_remaining
             if left >= need:
                 break
-            # `kept` is ordered by remaining tokens, so this is the longest.
+            # Non-stalled prefill chunks sit last in `kept`, ordered by
+            # remaining tokens, so this is the longest one.
             candidate = next(
                 (
                     r
@@ -256,8 +280,7 @@ class SrptPrefillScheduler(AsyncScheduler):
                     if r.request_id in alloc
                     and r.is_prefill_chunk
                     and self._remaining(r) > target_remaining
-                    and self._consecutive_holds.get(r.request_id, 0)
-                    < self.max_consecutive_holds
+                    and not self._is_stalled(r)
                 ),
                 None,
             )

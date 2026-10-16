@@ -466,6 +466,28 @@ def test_consecutive_holds_are_capped(shared_model_config):
     assert req_long.num_computed_tokens > 16
 
 
+def test_prefill_crowded_out_by_shorter_running_prefill_is_promoted(
+    shared_model_config,
+):
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        max_num_batched_tokens=16,
+    )
+    scheduler.max_consecutive_holds = 2
+    req_long = _running_long_prefill(scheduler, hasher)
+    scheduler.add_request(_make_real_request("mid", 40, hasher, seed=2))
+
+    # Step 2: `long` is held so `mid` (40 < 48 tokens left) is admitted.
+    assert set(scheduler.schedule().num_scheduled_tokens) == {"mid"}
+    # Step 3: no hold, but `mid` (24 left) runs first and takes the budget.
+    assert set(scheduler.schedule().num_scheduled_tokens) == {"mid"}
+    # Two steps without a block of progress: `long` now runs ahead of `mid`.
+    assert scheduler.schedule().num_scheduled_tokens == {"long": 16}
+    assert req_long.num_computed_tokens == 32
+    # Having advanced, `long` falls back behind the shorter `mid`.
+    assert scheduler.schedule().num_scheduled_tokens == {"mid": 8, "long": 8}
+
+
 def test_max_consecutive_holds_env_var_and_compile_cache(
     shared_model_config, monkeypatch
 ):
