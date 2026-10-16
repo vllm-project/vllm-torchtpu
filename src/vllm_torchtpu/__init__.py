@@ -1110,13 +1110,67 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         logger.info("Applied TPU patch: hybrid full-attention + Mamba PCP block sizes.")
 
 
+# CPU KV offloading connectors (vLLM's and the Raiden store-backed one). They
+# hash at the scheduler's hash unit and chunk at the logical block.
+_OFFLOADING_CONNECTORS = frozenset(
+    {"OffloadingConnector", "TPURaidenOffloadingConnector"}
+)
+
+
+def _is_offloading_connector(kv_transfer_config) -> bool:
+    return getattr(kv_transfer_config, "kv_connector", None) in _OFFLOADING_CONNECTORS
+
+
+def _patch_vllm_offload_fine_prefix_alignment() -> None:
+    """Load offloaded chunks only from a chunk-aligned GPU prefix hit.
+
+    With DCP fine prefix hits a GPU hit can end inside a logical block. The
+    manager then copy-on-writes that shared block into a fresh one, and the
+    copy is applied by the runner at the next forward. An offload load of the
+    same chunk would DMA into that fresh block concurrently, and whichever
+    lands last wins -- the copy carries the other sequence's tail past the hit
+    point. A hit that ends mid-block means the prompt diverged inside that
+    block (eviction frees whole blocks, tail first), so the offload tier holds
+    nothing past it either; skip the lookup there instead of racing.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+        OffloadingConnectorScheduler,
+    )
+
+    if getattr(OffloadingConnectorScheduler, "_tpu_fine_prefix_alignment", False):
+        return
+    original_lookup = OffloadingConnectorScheduler._lookup
+
+    def _lookup(self, req_status, *args, **kwargs):
+        local_tokens = req_status.num_locally_computed_tokens
+        for group_config in self.config.kv_group_configs:
+            if (
+                group_config.hashes_per_chunk > 1
+                and local_tokens % group_config.tokens_per_chunk
+            ):
+                return 0
+        return original_lookup(self, req_status, *args, **kwargs)
+
+    OffloadingConnectorScheduler._lookup = _lookup
+    OffloadingConnectorScheduler._tpu_fine_prefix_alignment = True
+    logger.info(
+        "Applied TPU patch: chunk-aligned offload loads under fine prefix hits."
+    )
+
+
 def _dcp_fine_prefix_match_unit(kv_cache_config, vllm_config) -> int | None:
     """Return the fine prefix-hit unit for a single-group DCP model, or None.
 
     Opt-in: only a single full-attention (incl. MLA) group under DCP with
-    prefix caching, no PCP, no KV connector, and an explicit
-    ``--prefix-match-unit`` smaller than the logical block (block_size * dcp).
-    Everything else keeps upstream behavior (hash == scheduler block).
+    prefix caching, no PCP, no KV connector other than a CPU offloading one,
+    and an explicit ``--prefix-match-unit`` smaller than the logical block
+    (block_size * dcp). Everything else keeps upstream behavior (hash ==
+    scheduler block).
+
+    Offloading connectors chunk at the logical block and key each chunk by its
+    last fine hash, so they work with a finer hash unit; see
+    ``_patch_vllm_offload_fine_prefix_alignment`` for the one load case that
+    needs care.
     """
     from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
     from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
@@ -1132,8 +1186,11 @@ def _dcp_fine_prefix_match_unit(kv_cache_config, vllm_config) -> int | None:
         or not cache_config.enable_prefix_caching
         or dcp <= 1
         or parallel_config.prefill_context_parallel_size != 1
-        # Connectors (P/D, offload) consume block hashes at block granularity.
-        or vllm_config.kv_transfer_config is not None
+        # P/D connectors consume block hashes at block granularity.
+        or (
+            vllm_config.kv_transfer_config is not None
+            and not _is_offloading_connector(vllm_config.kv_transfer_config)
+        )
         or len(groups) != 1
     ):
         return None
@@ -1226,7 +1283,14 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
         resolve_kv_cache_block_sizes._tpu_dcp_fine_prefix_patch = True
         kv_cache_utils.resolve_kv_cache_block_sizes = resolve_kv_cache_block_sizes
         resolve = resolve_kv_cache_block_sizes
-    for module_name in ("vllm.v1.engine.core", "vllm.v1.kv_offload.base"):
+    # The offloading config builder imports it by name too; its tokens_per_hash
+    # must match the scheduler's hash unit or offload keys land on the wrong
+    # hash boundaries.
+    for module_name in (
+        "vllm.v1.engine.core",
+        "vllm.v1.kv_offload.base",
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.config",
+    ):
         module = sys.modules.get(module_name)
         if module is not None and hasattr(module, "resolve_kv_cache_block_sizes"):
             module.resolve_kv_cache_block_sizes = resolve

@@ -217,3 +217,59 @@ def test_dcp_rescales_chunk_block_size():
 
     assert tuple(g.tokens_per_block for g in config.groups) == (4096,)
     assert config.cache.blocks_per_chunk == 2
+
+
+def test_offload_lookup_skips_unaligned_fine_prefix_hit(monkeypatch):
+    """A GPU hit ending inside a chunk never starts an offload load."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+        OffloadingConnectorScheduler,
+    )
+
+    from vllm_torchtpu import _patch_vllm_offload_fine_prefix_alignment
+
+    calls = []
+    monkeypatch.setattr(
+        OffloadingConnectorScheduler,
+        "_lookup",
+        lambda self, req_status, *a, **k: calls.append(req_status) or 8192,
+    )
+    monkeypatch.setattr(
+        OffloadingConnectorScheduler,
+        "_tpu_fine_prefix_alignment",
+        False,
+        raising=False,
+    )
+    _patch_vllm_offload_fine_prefix_alignment()
+
+    def sched(hashes_per_chunk):
+        group = SimpleNamespace(
+            hashes_per_chunk=hashes_per_chunk, tokens_per_chunk=4096
+        )
+        return SimpleNamespace(config=SimpleNamespace(kv_group_configs=(group,)))
+
+    def req(local_tokens):
+        return SimpleNamespace(num_locally_computed_tokens=local_tokens)
+
+    lookup = OffloadingConnectorScheduler._lookup
+    # Fine hashes (16 per chunk): only a chunk-aligned GPU hit is looked up.
+    assert lookup(sched(16), req(4096 + 256)) == 0
+    assert lookup(sched(16), req(8192)) == 8192
+    assert lookup(sched(16), req(0)) == 8192
+    # Hash == chunk: upstream behavior, every hit is chunk-aligned anyway.
+    assert lookup(sched(1), req(4096 + 256)) == 8192
+    assert len(calls) == 3
+
+
+def test_dcp_fine_prefix_offload_hashes_finer_than_chunk():
+    """With the fine prefix unit, offload chunks span 4096 tokens of 256 hashes."""
+    from vllm_torchtpu import _patch_vllm_dcp_fine_prefix_hits
+
+    _patch_vllm_dcp_fine_prefix_hits()
+    module = _patched_offloading_config_module()
+    vllm_config = _vllm_config(pcp=1, block_size=256, dcp=16)
+    vllm_config.cache_config.prefix_match_unit = 256
+    vllm_config.kv_transfer_config.kv_connector = "TPURaidenOffloadingConnector"
+    config = module.build_offloading_config(vllm_config, _mixed_mla_kv_cache_config())
+
+    assert tuple(g.tokens_per_block for g in config.groups) == (4096,)
+    assert config.cache.tokens_per_hash == 256
