@@ -133,6 +133,10 @@ hold the tables; the non-shared path remains available in that case. Both
 layouts retain the existing encoder head/tail schedule and cached uploads,
 and require one node-local Engram group covering all DP replicas.
 
+`scripts/dsv41_bench/serve_cached_prefill.sh` uses this default. To select the
+non-shared layout explicitly, append
+`--engram-config '{"dp_shared_memory":false}'` to the launcher command.
+
 Validation scripts and raw experiment evidence are maintained separately from
 the runtime change. Cache validation alone does not establish full-model
 numerical equivalence, memory usage or serving performance.

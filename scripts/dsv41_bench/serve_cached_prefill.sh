@@ -32,7 +32,6 @@ exec vllm serve "$model" \
   --enable-expert-parallel --enable-ep-weight-filter --language-model-only \
   --async-scheduling --enable-prefix-caching --kv-cache-dtype fp8 \
   --attention-config '{"indexer_kv_dtype":"fp8"}' \
-  --engram-config '{"dp_shared_memory":false}' \
   --block-size 16 \
   --max-num-batched-tokens "$chunk" --max-num-seqs "$max_seqs" \
   "${server_args[@]}" \
