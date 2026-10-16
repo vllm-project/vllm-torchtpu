@@ -67,8 +67,10 @@ multi-turn think-time within a strictly bounded HBM pin budget:
    Total pinned Mamba blocks across ``_conv_lru`` and ``_fork_lru`` are
    strictly capped by
    ``TPU_HYBRID_RETENTION_MAX_PINNED_BLOCKS`` (default 360, <= 5% of pool), and
-   guards on ``block_pool.get_new_blocks`` / ``allocate_slots`` automatically
-   evict retained entries whenever free blocks run low.
+   guards on ``block_pool.get_new_blocks`` / ``allocate_slots`` evict retained
+   entries when the pool itself is short of blocks. An ``allocate_slots``
+   refusal is classified first (see ``ALLOC_NONE_REASONS``); only a real
+   shortage evicts, and only as many entries as cover it.
 
 Models without a Mamba group, or with prefix caching off, are untouched.
 """
@@ -96,6 +98,28 @@ _PIN_MAX_MISSED_PROBES = 3
 _MAX_FORK_LRU_ENTRIES = 16
 # Safety bound on per-request fork decisions (normally popped on finish).
 _MAX_FORK_DECISIONS = 8192
+# Why KVCacheManager.allocate_slots returned None (vLLM v0.29.0):
+#   inflight_reserve: required <= free but required > free - reserved_blocks, the
+#     async-load admission gate that keeps the remaining-prompt blocks of every
+#     in-flight prefill free (Scheduler._inflight_prefill_reserved_blocks).
+#   no_blocks: required > free, a real shortage.
+#   same_step: the hit ends on a Mamba block cached earlier in this step, which
+#     MambaManager.get_num_blocks_to_allocate refuses with num_gpu_blocks + 1.
+#   unknown: none of the above could be established.
+# "required" is the coordinator's block count plus the waiting-request watermark.
+ALLOC_NONE_REASONS = ("inflight_reserve", "no_blocks", "same_step", "unknown")
+_WAITING_STATUS_NAMES = frozenset(("WAITING", "PREEMPTED"))
+
+
+def is_waiting_status(request: Any) -> bool:
+    """Returns whether ``request`` sits in the waiting queue (WAITING or PREEMPTED)."""
+    status = getattr(request, "status", None)
+    return getattr(status, "name", None) in _WAITING_STATUS_NAMES
+
+
+def format_counts(counts: dict[str, int]) -> str:
+    """Formats a reason -> count map as ``a:1,b:2`` for a telemetry field."""
+    return ",".join(f"{k}:{v}" for k, v in counts.items()) or "-"
 
 
 def _is_spec(spec: Any, name: str) -> bool:
@@ -203,6 +227,18 @@ class HybridStateRetention:
         self._n_fork_retained = 0
         self._n_fork_evicted = 0
         self._last_log_t = time.monotonic()
+        # allocate_slots refusals by reason, and the retained entries each
+        # reason evicted (cumulative).
+        self.alloc_none: dict[str, int] = dict.fromkeys(ALLOC_NONE_REASONS, 0)
+        self.alloc_none_evicted: dict[str, int] = dict.fromkeys(ALLOC_NONE_REASONS, 0)
+        # Per scheduler step (reset by begin_step): refusal reasons of
+        # waiting-request allocations, and waiting-request admissions.
+        self.step_waiting_none: list[str] = []
+        self.step_admits = 0
+        self.step_async_admits = 0
+        # Last coordinator.get_num_blocks_to_allocate result inside the
+        # current allocate_slots call.
+        self._last_need: int | None = None
 
         if self.enabled:
             self._install_mamba_manager_hooks()
@@ -363,8 +399,8 @@ class HybridStateRetention:
 
     def _install_block_pool_guards(self) -> None:
         """Guard BlockPool.get_new_blocks (and KVCacheManager.allocate_slots /
-        reset_prefix_cache) so cross-turn Mamba pins are automatically evicted
-        whenever free blocks run low."""
+        reset_prefix_cache) so cross-turn Mamba pins are evicted when the pool
+        is short of blocks."""
         pool = self.block_pool
         if pool is not None and not getattr(
             pool, "_hybrid_retention_guarded", False
@@ -402,6 +438,19 @@ class HybridStateRetention:
             kvm, "_hybrid_retention_guarded", False
         ):
             kvm._hybrid_retention_guarded = True
+            coordinator = self.coordinator
+            orig_need = getattr(coordinator, "get_num_blocks_to_allocate", None)
+            if callable(orig_need):
+
+                def _recorded_need(
+                    *args: Any, _orig: Any = orig_need, **kwargs: Any
+                ) -> Any:
+                    need = _orig(*args, **kwargs)
+                    self._last_need = need
+                    return need
+
+                coordinator.get_num_blocks_to_allocate = _recorded_need
+
             orig_allocate_slots = getattr(kvm, "allocate_slots", None)
             if callable(orig_allocate_slots):
 
@@ -410,14 +459,91 @@ class HybridStateRetention:
                     _orig: Any = orig_allocate_slots,
                     **kwargs: Any,
                 ) -> Any:
-                    res = _orig(*args, **kwargs)
-                    while res is None and (self._conv_lru or self._fork_lru):
-                        if not self.evict_oldest_retained():
-                            break
-                        res = _orig(*args, **kwargs)
-                    return res
+                    return self._allocate_slots_with_eviction(_orig, args, kwargs)
 
                 kvm.allocate_slots = _guarded_allocate_slots
+
+    def _allocate_slots_with_eviction(
+        self, orig: Any, args: tuple[Any, ...], kwargs: dict[str, Any]
+    ) -> Any:
+        """Calls allocate_slots; on a real block shortage evicts the shortfall
+        from the retained entries and retries."""
+        request = args[0] if args else kwargs.get("request")
+        self._last_need = None
+        res = orig(*args, **kwargs)
+        reason = None
+        while res is None:
+            reason, required, free = self._classify_allocate_none(request, kwargs)
+            if reason != "no_blocks" or not (self._conv_lru or self._fork_lru):
+                break
+            evicted = 0
+            while (self._conv_lru or self._fork_lru) and (
+                self._get_num_free_blocks() < required
+            ):
+                if not self.evict_oldest_retained():
+                    break
+                evicted += 1
+            if evicted == 0:
+                break
+            self.alloc_none_evicted["no_blocks"] += evicted
+            self._last_need = None
+            res = orig(*args, **kwargs)
+        waiting = is_waiting_status(request)
+        if res is None:
+            if reason is None:
+                reason = "unknown"
+            self.alloc_none[reason] += 1
+            if waiting:
+                self.step_waiting_none.append(reason)
+        elif waiting:
+            self.step_admits += 1
+            if kwargs.get("delay_cache_blocks", False):
+                self.step_async_admits += 1
+        return res
+
+    def _classify_allocate_none(
+        self, request: Any, kwargs: dict[str, Any]
+    ) -> tuple[str, int, int]:
+        """Returns (reason, required blocks, free blocks) for a None from
+        allocate_slots; mirrors the two refusal checks in vLLM v0.29.0
+        KVCacheManager.allocate_slots."""
+        free = self._get_num_free_blocks()
+        if self._same_step_hit(kwargs.get("new_computed_blocks")):
+            return "same_step", 0, free
+        need = self._last_need
+        if not isinstance(need, int):
+            return "unknown", 0, free
+        watermark = 0
+        if kwargs.get("has_scheduled_reqs", True) and is_waiting_status(request):
+            watermark = int(getattr(self.kvm, "watermark_blocks", 0) or 0)
+        required = need + watermark
+        if required > free:
+            return "no_blocks", required, free
+        reserved = int(kwargs.get("reserved_blocks", 0) or 0)
+        if reserved > 0 and required > free - reserved:
+            return "inflight_reserve", required, free
+        return "unknown", required, free
+
+    def _same_step_hit(self, new_computed_blocks: Any) -> bool:
+        """Returns whether the hit's last Mamba block was cached earlier this step."""
+        blocks = getattr(new_computed_blocks, "blocks", None)
+        if not blocks:
+            return False
+        managers = getattr(self.coordinator, "single_type_managers", None) or ()
+        for group in self.mamba_groups:
+            for gid in group.group_ids:
+                if gid >= len(blocks) or gid >= len(managers) or not blocks[gid]:
+                    continue
+                cached = getattr(managers[gid], "cached_blocks_this_step", None)
+                if cached and getattr(blocks[gid][-1], "block_hash", None) in cached:
+                    return True
+        return False
+
+    def begin_step(self) -> None:
+        """Clears the per-step allocation record; called once per schedule()."""
+        self.step_waiting_none.clear()
+        self.step_admits = 0
+        self.step_async_admits = 0
 
     def _get_num_free_blocks(self) -> int:
         pool = self.block_pool
@@ -1170,7 +1296,8 @@ class HybridStateRetention:
             "hybrid-retention telemetry: freed=%d pinned=%d refreshed=%d "
             "no_state=%d demoted_blocks=%d live_pins=%d conv_lru=%d "
             "fork_lru=%d pinned_blocks=%d free_blocks=%d conv_retained=%d "
-            "conv_evicted=%d fork_retained=%d fork_evicted=%d",
+            "conv_evicted=%d fork_retained=%d fork_evicted=%d "
+            "alloc_none=%s alloc_none_evicted=%s",
             self._n_freed,
             self._n_pinned,
             self._n_refreshed,
@@ -1185,6 +1312,8 @@ class HybridStateRetention:
             self._n_conv_evicted,
             self._n_fork_retained,
             self._n_fork_evicted,
+            format_counts(self.alloc_none),
+            format_counts(self.alloc_none_evicted),
         )
 
     def pin_running(self, running: Any) -> None:

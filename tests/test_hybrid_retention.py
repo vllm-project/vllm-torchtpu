@@ -19,7 +19,9 @@ from typing import NamedTuple
 
 import pytest
 
-from vllm_torchtpu.core.hybrid_retention import HybridStateRetention
+from vllm.v1.request import RequestStatus
+
+from vllm_torchtpu.core.hybrid_retention import HybridStateRetention, _ConvLRUEntry
 
 BS = 256  # attention / mamba block size
 HB = 128  # hash block size (fine-grained partial hits)
@@ -608,3 +610,169 @@ def test_fork_candidate_off_without_smart_fork():
     r.smart_fork = False
     assert r._is_fork_candidate(_req("y", 6500), 0) is False
     assert r._fork_decision == {}
+
+
+class _MambaSpec:
+    pass
+
+
+_MambaSpec.__name__ = "MambaSpec"
+
+
+class _FullAttentionSpec:
+    pass
+
+
+_FullAttentionSpec.__name__ = "FullAttentionSpec"
+
+
+class _GuardPool:
+    num_gpu_blocks = 8000
+
+    def __init__(self, free: int):
+        self.free = free
+
+    def get_num_free_blocks(self) -> int:
+        return self.free
+
+    def free_blocks(self, blocks) -> None:
+        for b in blocks:
+            b.ref_cnt -= 1
+            if b.ref_cnt == 0:
+                self.free += 1
+
+
+class _GuardKVM:
+    """KVCacheManager stand-in with v0.29.0's two allocate_slots refusals."""
+
+    def __init__(self, free: int, need: int):
+        self.pool = _GuardPool(free)
+        self.need = need
+        self.mamba_mgr = SimpleNamespace(block_size=640, cached_blocks_this_step=set())
+        groups = [
+            SimpleNamespace(spec=_FullAttentionSpec(), group_ids=[0]),
+            SimpleNamespace(spec=_MambaSpec(), group_ids=[1]),
+        ]
+        self.coordinator = SimpleNamespace(
+            attention_groups=groups,
+            single_type_managers=[SimpleNamespace(block_size=640), self.mamba_mgr],
+            block_pool=self.pool,
+            get_num_blocks_to_allocate=self._need,
+        )
+        self.enable_caching = True
+        self.watermark_blocks = 0
+        self.calls = 0
+
+    def _need(self, **kwargs) -> int:
+        blocks = kwargs.get("new_computed_blocks") or ((), ())
+        mamba = blocks[1] if len(blocks) > 1 else ()
+        if mamba and mamba[-1].block_hash in self.mamba_mgr.cached_blocks_this_step:
+            return self.pool.num_gpu_blocks + 1
+        return self.need
+
+    def allocate_slots(
+        self,
+        request,
+        num_new_tokens,
+        new_computed_blocks=None,
+        delay_cache_blocks=False,
+        reserved_blocks=0,
+        has_scheduled_reqs=True,
+        **kwargs,
+    ):
+        self.calls += 1
+        need = self.coordinator.get_num_blocks_to_allocate(
+            new_computed_blocks=getattr(new_computed_blocks, "blocks", None)
+        )
+        if need > self.pool.get_num_free_blocks() - reserved_blocks:
+            return None
+        self.pool.free -= need
+        return "blocks"
+
+
+def _guarded(free: int, need: int, n_convs: int = 10, blocks_per_conv: int = 5):
+    kvm = _GuardKVM(free, need)
+    ret = HybridStateRetention(kvm, max_conversations=256)
+    assert ret.enabled
+    for i in range(n_convs):
+        blocks = [
+            SimpleNamespace(ref_cnt=1, is_null=False) for _ in range(blocks_per_conv)
+        ]
+        ret._conv_lru[("c", i)] = _ConvLRUEntry(
+            conv_key=("c", i),
+            req_id=f"r{i}",
+            first_hash=None,
+            boundary_idx=0,
+            boundary_hash=None,
+            blocks=blocks,
+            hit=640,
+        )
+    return kvm, ret
+
+
+def _waiting_req(request_id: str = "w") -> SimpleNamespace:
+    return SimpleNamespace(request_id=request_id, status=RequestStatus.WAITING)
+
+
+def test_retention_guard_keeps_lru_when_refused_by_inflight_reservation():
+    kvm, ret = _guarded(free=7000, need=350)
+    ret.begin_step()
+    res = kvm.allocate_slots(
+        _waiting_req(), 0, delay_cache_blocks=True, reserved_blocks=6900
+    )
+    assert res is None
+    assert len(ret._conv_lru) == 10
+    assert ret.alloc_none["inflight_reserve"] == 1
+    assert ret.alloc_none_evicted["no_blocks"] == 0
+    assert ret.step_waiting_none == ["inflight_reserve"]
+    assert kvm.calls == 1
+
+
+def test_retention_guard_evicts_only_the_shortfall():
+    # 112 needed, 100 free: three 5-block conversations cover the 12 missing.
+    kvm, ret = _guarded(free=100, need=112)
+    ret.begin_step()
+    assert kvm.allocate_slots(_waiting_req(), 640) == "blocks"
+    assert len(ret._conv_lru) == 7
+    assert ret.alloc_none_evicted["no_blocks"] == 3
+    assert sum(ret.alloc_none.values()) == 0
+    assert ret.step_admits == 1 and ret.step_async_admits == 0
+
+
+def test_retention_guard_shortfall_then_reservation_stops_after_shortfall():
+    kvm, ret = _guarded(free=100, need=112)
+    ret.begin_step()
+    res = kvm.allocate_slots(
+        _waiting_req(), 0, delay_cache_blocks=True, reserved_blocks=50
+    )
+    assert res is None
+    assert len(ret._conv_lru) == 7
+    assert ret.alloc_none_evicted["no_blocks"] == 3
+    assert ret.alloc_none["inflight_reserve"] == 1
+
+
+def test_retention_guard_ignores_same_step_mamba_refusal():
+    kvm, ret = _guarded(free=7000, need=10)
+    mamba_block = SimpleNamespace(block_hash="h-mamba")
+    kvm.mamba_mgr.cached_blocks_this_step.add("h-mamba")
+    attn_block = SimpleNamespace(block_hash="h-attn")
+    hit = SimpleNamespace(blocks=((attn_block,), (mamba_block,)))
+    ret.begin_step()
+    assert kvm.allocate_slots(_waiting_req(), 640, new_computed_blocks=hit) is None
+    assert len(ret._conv_lru) == 10
+    assert ret.alloc_none["same_step"] == 1
+    assert ret.step_waiting_none == ["same_step"]
+
+
+def test_retention_guard_counts_async_admission_and_running_refusals():
+    kvm, ret = _guarded(free=5, need=3, n_convs=0)
+    ret.begin_step()
+    assert kvm.allocate_slots(_waiting_req(), 0, delay_cache_blocks=True) == "blocks"
+    assert ret.step_admits == 1 and ret.step_async_admits == 1
+    running = SimpleNamespace(request_id="r", status=RequestStatus.RUNNING)
+    assert kvm.allocate_slots(running, 640) is None
+    assert ret.alloc_none["no_blocks"] == 1
+    # A running request's refusal does not end the waiting loop.
+    assert ret.step_waiting_none == []
+
+
