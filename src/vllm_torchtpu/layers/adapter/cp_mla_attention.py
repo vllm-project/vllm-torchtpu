@@ -36,6 +36,7 @@ from __future__ import annotations
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group
@@ -151,13 +152,63 @@ def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:
     return out
 
 
+def _pack_and_exchange_all_to_all(
+    o_send: torch.Tensor,
+    l_send: torch.Tensor,
+    group: Any,
+    out_dtype: torch.dtype,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exchange `(o_send, l_send)` in a single `_all_to_all` collective.
+
+    For 16-bit `out_dtype` (`bfloat16`/`float16`), each `float32` LSE entry is
+    losslessly split into two `int16` words via shape-preserving `.view(int32)`
+    and packed into `extra = (2 * rows + vdim - 1) // vdim` trailing `vdim`-wide
+    row(s) of `[world, rows + extra, vdim]` (`rows = T * local`). This keeps
+    the minor dimension `vdim` (e.g. `512`) 128-lane aligned across all token
+    buckets (`T <= 16`) with at most 1 extra row per rank.
+    """
+    world, num_tokens, local, vdim = o_send.shape
+    if out_dtype.itemsize != 2:
+        o_f32 = o_send.to(torch.float32)
+        packed = torch.cat([o_f32, l_send.unsqueeze(-1)], dim=-1)
+        recv = _all_to_all(packed, group)
+        return recv[..., :vdim].to(out_dtype), recv[..., vdim]
+
+    rows = num_tokens * local
+    o_i16 = o_send.contiguous().view(torch.int16).reshape(world, rows, vdim)
+    bits = l_send.contiguous().view(torch.int32).reshape(world, rows)
+    hi = (bits >> 16).to(torch.int16)
+    lo = bits.to(torch.int16)
+
+    extra = (2 * rows + vdim - 1) // vdim
+    l_flat = torch.cat([hi, lo], dim=-1)
+    pad = extra * vdim - 2 * rows
+    if pad:
+        l_flat = F.pad(l_flat, (0, pad))
+    l_rows = l_flat.reshape(world, extra, vdim)
+    packed = torch.cat([o_i16, l_rows], dim=1)
+    recv = _all_to_all(packed, group)
+    o_recv = (
+        recv[:, :rows, :]
+        .contiguous()
+        .view(out_dtype)
+        .reshape(world, num_tokens, local, vdim)
+    )
+    l_recv_flat = recv[:, rows:, :].reshape(world, extra * vdim)
+    hi_r = l_recv_flat[:, :rows].to(torch.int32)
+    lo_r = l_recv_flat[:, rows : 2 * rows].to(torch.int32) & 0xFFFF
+    l_recv = ((hi_r << 16) | lo_r).view(torch.float32).reshape(world, num_tokens, local)
+    return o_recv, l_recv
+
+
 def merge_lse_partials_all_to_all(
     output: torch.Tensor, lse: torch.Tensor, group: Any
 ) -> torch.Tensor:
-    """Same result as the reduce-scatter merge, via all-to-all.
+    """Same result as the reduce-scatter merge, via a single all-to-all.
 
-    Each rank sends head block `d` of its partial and lse to rank `d`, then
-    merges its own heads locally in f32. Faster for small token counts.
+    Each rank packs head block `d` of its partial and lse into one tensor,
+    exchanges across `group` in a single `all_to_all_single`, and merges its
+    own heads locally in f32. Faster for small token counts (`T <= 16`).
     """
     world = int(group.world_size)
     num_tokens, num_heads, vdim = output.shape
@@ -165,8 +216,7 @@ def merge_lse_partials_all_to_all(
     # Destination-major: [world, T, local, V] and [world, T, local].
     o_send = output.reshape(num_tokens, world, local, vdim).transpose(0, 1)
     l_send = lse.to(torch.float32).reshape(num_tokens, world, local).transpose(0, 1)
-    o_recv = _all_to_all(o_send, group)
-    l_recv = _all_to_all(l_send, group)
+    o_recv, l_recv = _pack_and_exchange_all_to_all(o_send, l_send, group, output.dtype)
     return _merge_received(o_recv, l_recv).to(output.dtype)
 
 

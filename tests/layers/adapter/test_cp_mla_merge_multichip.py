@@ -176,10 +176,17 @@ def _merge_unrolled(o_recv, l_recv):
 MERGE_VARIANTS = {"a2a_reduce_sum": _merge_reduce_sum, "a2a_unrolled": _merge_unrolled}
 
 
+def _exchange_2col(cp_mla, o_send, l_send, group):
+    """The 2-collective baseline exchange (PR #1521): separate all_to_all calls."""
+    o_recv = cp_mla._all_to_all(o_send.contiguous(), group)
+    l_recv = cp_mla._all_to_all(l_send.contiguous(), group)
+    return o_recv, l_recv
+
+
 def _set_arm(cp_mla, arm):
-    cp_mla.envs.TPU_DCP_LSE_MERGE_A2A = ARMS[arm]
+    cp_mla.envs.TPU_DCP_LSE_MERGE_A2A = arm not in ("today", "today_bf16_rs")
     cp_mla.envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS = 1 << 30
-    cp_mla.envs.TPU_DCP_RS_OUT_PRECISION = False  # "today" stays the f32 reference
+    cp_mla.envs.TPU_DCP_RS_OUT_PRECISION = arm == "today_bf16_rs"
 
 
 def _compile(fn):
@@ -286,9 +293,15 @@ def _bench(rank, cp_mla, tokens_list, reps=10):
         o = torch.randn(tokens, HEADS, VDIM).to(torch.bfloat16).to("tpu")
         lse = (torch.randn(tokens, HEADS) * 3).to("tpu")
         real_merge = cp_mla._merge_received
-        for arm in ("today", "a2a", *MERGE_VARIANTS):
-            _set_arm(cp_mla, "a2a" if arm in MERGE_VARIANTS else arm)
+        real_exchange = cp_mla._pack_and_exchange_all_to_all
+        for arm in ("today", "today_bf16_rs", "a2a_2col", "a2a", *MERGE_VARIANTS):
+            _set_arm(cp_mla, arm)
             cp_mla._merge_received = MERGE_VARIANTS.get(arm, real_merge)
+            cp_mla._pack_and_exchange_all_to_all = (
+                (lambda o_s, l_s, g: _exchange_2col(cp_mla, o_s, l_s, g))
+                if arm == "a2a_2col"
+                else real_exchange
+            )
             try:
                 times = {}
                 for k in (1, 1 + reps):
@@ -311,6 +324,7 @@ def _bench(rank, cp_mla, tokens_list, reps=10):
                 out[f"{arm}@{tokens}"] = {"error": repr(exc)[:400]}
             finally:
                 cp_mla._merge_received = real_merge
+                cp_mla._pack_and_exchange_all_to_all = real_exchange
             if rank == 0:
                 print(f"BENCH T={tokens} {arm}: {out[f'{arm}@{tokens}']}", flush=True)
     return out

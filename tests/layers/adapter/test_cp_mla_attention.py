@@ -408,9 +408,12 @@ def _bf16_close(got, reference):
     )
 
 
+@pytest.mark.parametrize("tokens", [5, 12])
 @pytest.mark.parametrize("dcp_size", [2, 4, 8, 16])
-def test_all_to_all_merge_matches_the_f64_reference(dcp_size, monkeypatch):
-    outputs, lses = _hard_partials(np.random.default_rng(20261002), dcp_size)
+def test_all_to_all_merge_matches_the_f64_reference(dcp_size, tokens, monkeypatch):
+    outputs, lses = _hard_partials(
+        np.random.default_rng(20261002 + tokens), dcp_size, tokens=tokens
+    )
     got = _a2a_merge_whole(outputs, lses, monkeypatch)
     assert got.dtype == torch.bfloat16
     assert got.shape == outputs.shape[1:]
@@ -420,6 +423,132 @@ def test_all_to_all_merge_matches_the_f64_reference(dcp_size, monkeypatch):
     # token nobody owns is zero, not NaN.
     torch.testing.assert_close(got[2], outputs[0, 2], rtol=0, atol=0)
     assert (got[3] == 0).all()
+
+
+@pytest.mark.parametrize(
+    "tokens,local_heads,vdim,dtype,expected_packed_shape",
+    [
+        # T=1, local=8, V=512: rows = 8, extra = 1 -> [world, 9, 512]
+        (1, 8, 512, torch.bfloat16, (4, 9, 512)),
+        # T=8, local=8, V=512: rows = 64, extra = 1 -> [world, 65, 512]
+        (8, 8, 512, torch.bfloat16, (4, 65, 512)),
+        # T=16, local=8, V=512: rows = 128, extra = 1 -> [world, 129, 512]
+        (16, 8, 512, torch.bfloat16, (4, 129, 512)),
+        # 2 * rows > vdim (rows = 40, V = 8 -> extra = 10 rows -> [world, 50, 8])
+        (5, 8, 8, torch.bfloat16, (4, 50, 8)),
+        # 32-bit float fallback: [world, T, local, V + 1]
+        (6, 4, 16, torch.float32, (4, 6, 4, 17)),
+    ],
+)
+def test_all_to_all_merge_issues_single_collective_and_is_bitwise_exact(
+    tokens, local_heads, vdim, dtype, expected_packed_shape, monkeypatch
+):
+    """Each rank issues exactly 1 `_all_to_all` call per merge, and the unpacked
+    result is 100% bitwise identical to a two-collective exchange."""
+    dcp_size = 4
+    outputs, lses = _hard_partials(
+        np.random.default_rng(20261013),
+        dcp_size,
+        tokens=tokens if tokens >= 5 else 5,
+        local_heads=local_heads,
+        vdim=vdim,
+    )
+    outputs = outputs[:, :tokens].to(dtype)
+    lses = lses[:, :tokens]
+
+    seen_shapes = [[] for _ in range(dcp_size)]
+
+    def spy_a2a(x, group):
+        seen_shapes[group.rank_in_group].append((tuple(x.shape), x.dtype))
+        return group.all_to_all(x)
+
+    monkeypatch.setattr(cp_mla, "_all_to_all", spy_a2a)
+    hub = _ExchangeHub(dcp_size)
+
+    def run_1col(rank):
+        return cp_mla.merge_lse_partials_all_to_all(
+            outputs[rank], lses[rank], _A2AGroup(hub, rank)
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(dcp_size) as pool:
+        got_1col = torch.cat(list(pool.map(run_1col, range(dcp_size))), dim=1)
+
+    for rank in range(dcp_size):
+        assert len(seen_shapes[rank]) == 1, (
+            f"expected 1 _all_to_all call on rank {rank}, got {seen_shapes[rank]}"
+        )
+        assert seen_shapes[rank][0][0] == expected_packed_shape
+
+    # Compare against the 2-collective reference exchange on the exact same inputs.
+    hub_2col = _ExchangeHub(dcp_size)
+
+    def run_2col(rank):
+        group = _A2AGroup(hub_2col, rank)
+        o_send = (
+            outputs[rank].reshape(tokens, dcp_size, local_heads, vdim).transpose(0, 1)
+        )
+        l_send = (
+            lses[rank]
+            .to(torch.float32)
+            .reshape(tokens, dcp_size, local_heads)
+            .transpose(0, 1)
+        )
+        o_recv = group.all_to_all(o_send)
+        l_recv = group.all_to_all(l_send)
+        return cp_mla._merge_received(o_recv, l_recv).to(dtype)
+
+    with concurrent.futures.ThreadPoolExecutor(dcp_size) as pool:
+        got_2col = torch.cat(list(pool.map(run_2col, range(dcp_size))), dim=1)
+
+    torch.testing.assert_close(got_1col, got_2col, rtol=0, atol=0)
+
+
+def test_all_to_all_merge_repeat_and_input_immutability(monkeypatch):
+    """Repeated calls across multiple token counts do not mutate caller inputs
+    or leak state across invocations."""
+    for tokens in (5, 12):
+        outputs, lses = _hard_partials(
+            np.random.default_rng(900 + tokens), 4, tokens=tokens
+        )
+        outputs_orig = outputs.clone()
+        lses_orig = lses.clone()
+        first = _a2a_merge_whole(outputs, lses, monkeypatch)
+        second = _a2a_merge_whole(outputs, lses, monkeypatch)
+        torch.testing.assert_close(outputs, outputs_orig, rtol=0, atol=0)
+        torch.testing.assert_close(lses, lses_orig, rtol=0, atol=0)
+        torch.testing.assert_close(first, second, rtol=0, atol=0)
+
+
+def test_default_max_tokens_threshold_is_16(monkeypatch):
+    """With `TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS` at its default (16), backbone
+    steps with `T <= 16` take `merge_lse_partials_all_to_all` while `T >= 17`
+    takes `cp_lse_ag_out_rs`."""
+    monkeypatch.delenv("TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS", raising=False)
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A", True, raising=False)
+    assert cp_mla.envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS == 16
+
+    a2a_calls = []
+    rs_calls = []
+    monkeypatch.setattr(
+        cp_mla,
+        "merge_lse_partials_all_to_all",
+        lambda o, lse, g: a2a_calls.append(o.shape[0]) or o[:, :2],
+    )
+    monkeypatch.setattr(
+        cp_mla,
+        "cp_lse_ag_out_rs",
+        lambda o, lse, g, **kw: rs_calls.append(o.shape[0]) or o[:, :2],
+    )
+    for tokens in (1, 8, 16, 17, 32, 64):
+        outputs, lses = _partials(
+            np.random.default_rng(tokens), 2, tokens=tokens, vdim=4
+        )
+        group = _FakeGroup(outputs, lses, 0)
+        monkeypatch.setattr(cp_mla, "get_dcp_group", lambda g=group: g)
+        cp_mla.merge_lse_partials_scatter_heads(outputs[0], lses[0], is_backbone=True)
+
+    assert a2a_calls == [1, 8, 16]
+    assert rs_calls == [17, 32, 64]
 
 
 def test_all_to_all_merge_agrees_with_the_reduce_scatter_merge(monkeypatch):
