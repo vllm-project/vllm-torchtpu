@@ -494,6 +494,7 @@ class PrefixAwareScheduler(AsyncScheduler):
                         num_new_computed_tokens + num_uncached if num_uncached else 0
                     )
                     blocks = kvm.create_kv_cache_blocks(computed_blocks)
+                    request._tpu_local_hit_tokens = num_new_computed_tokens
                     return (
                         blocks,
                         num_new_computed_tokens,
@@ -511,6 +512,7 @@ class PrefixAwareScheduler(AsyncScheduler):
                 request, num_local, num_reconciled, block_size
             )
             if target_local is None:
+                request._tpu_local_hit_tokens = num_reconciled
                 return (
                     reconciled_blocks,
                     num_reconciled,
@@ -518,6 +520,7 @@ class PrefixAwareScheduler(AsyncScheduler):
                     False,
                 )
             if target_local <= 0:
+                request._tpu_local_hit_tokens = 0
                 return (
                     kvm.empty_kv_cache_blocks,
                     0,
@@ -527,7 +530,24 @@ class PrefixAwareScheduler(AsyncScheduler):
             if target_local < num_local:
                 blocks = kvm.truncate_computed_blocks(blocks, target_local)
                 num_local = target_local
+        request._tpu_local_hit_tokens = num_local
         return blocks, num_local, shared_prefix_boundary, hit_diverged
+
+    def _external_warmth(self, request: Request, local_warmth: int) -> int:
+        if getattr(self, "_is_kv_consumer", False):
+            return 0
+        connector = getattr(self, "connector", None)
+        if connector is None:
+            return 0
+        fn = getattr(connector, "estimate_external_hit_tokens", None)
+        if not callable(fn):
+            return 0
+        if request.num_tokens - local_warmth < self._get_block_size():
+            return 0
+        try:
+            return max(0, int(fn(request, local_warmth) or 0))
+        except Exception:
+            return 0
 
 
     def _rank_and_warmth(
@@ -549,6 +569,7 @@ class PrefixAwareScheduler(AsyncScheduler):
 
         window = list(islice(queue, self.WINDOW))
         head = window[0]
+        head_local_warmth = self._prefix_warmth(head)
 
         free_blocks = (
             None
@@ -557,6 +578,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         )
         free_blocks_for_fit: int | None = None
         if free_blocks is not None:
+            head_cold_tokens = max(head.num_tokens - head_local_warmth, 0)
             head_needed_blocks = math.ceil(head_cold_tokens / self._get_block_size())
             if free_blocks < head_needed_blocks:
                 free_blocks_for_fit = free_blocks
