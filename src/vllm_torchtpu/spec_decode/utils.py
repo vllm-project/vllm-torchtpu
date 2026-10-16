@@ -25,6 +25,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.models.utils import PPMissingLayer
 
 from vllm_torchtpu.layers.core.sequence_layout import (
     AllSequenceLayoutPlanner,
@@ -232,6 +233,24 @@ def maybe_share_embeddings(
         if target_lm_model is not None
         else None
     )
+
+    if isinstance(target_embed, PPMissingLayer):
+        # DeepseekV2-style targets build embed_tokens only on the first PP stage, so
+        # the draft on the last stage keeps its own checkpoint-loaded embedding.
+        draft_embed = getattr(getattr(draft_model, "model", None), "embed_tokens", None)
+        needs_target = force_share or not getattr(
+            draft_model, "has_own_embed_tokens", True
+        )
+        if draft_embed is None or needs_target:
+            raise RuntimeError(
+                "The target's embed_tokens is not on this pipeline stage and the "
+                "draft has no loaded embed_tokens of its own"
+            )
+        logger.info(
+            "Target embed_tokens is not on this pipeline stage; the draft "
+            "keeps its own embed_tokens."
+        )
+        return
 
     if force_share:
         share_embed = True

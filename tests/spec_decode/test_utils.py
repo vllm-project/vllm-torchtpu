@@ -16,6 +16,7 @@ from types import SimpleNamespace
 
 import pytest
 import torch
+from vllm.model_executor.models.utils import PPMissingLayer
 
 from vllm_torchtpu.spec_decode import utils
 
@@ -43,6 +44,41 @@ def test_own_vocab_weights_are_kept_when_tp_layout_matches():
 
     assert draft.model.embed_tokens is draft_embed
     assert draft.lm_head is draft_head
+
+
+@pytest.mark.parametrize("has_own_embed_tokens", [None, True])
+def test_draft_keeps_own_embed_when_target_embed_is_on_another_pp_stage(
+    has_own_embed_tokens,
+):
+    # Only the first PP stage builds a DeepseekV2 target's embed_tokens.
+    target = SimpleNamespace(model=SimpleNamespace(embed_tokens=PPMissingLayer()))
+    draft_embed = object()
+    draft = SimpleNamespace(model=SimpleNamespace(embed_tokens=draft_embed))
+    if has_own_embed_tokens is not None:
+        draft.has_own_embed_tokens = has_own_embed_tokens
+
+    utils.maybe_share_embeddings(draft, target, tp_layout_matches=True)
+
+    assert draft.model.embed_tokens is draft_embed
+
+
+@pytest.mark.parametrize(
+    ("draft_embed", "has_own_embed_tokens", "force_share"),
+    [(None, None, False), (object(), None, True), (object(), False, False)],
+    ids=["no-draft-embed", "force-share", "declares-no-own-embed"],
+)
+def test_draft_needing_target_embed_raises_when_it_is_on_another_pp_stage(
+    draft_embed, has_own_embed_tokens, force_share
+):
+    target = SimpleNamespace(model=SimpleNamespace(embed_tokens=PPMissingLayer()))
+    draft = SimpleNamespace(model=SimpleNamespace(embed_tokens=draft_embed))
+    if has_own_embed_tokens is not None:
+        draft.has_own_embed_tokens = has_own_embed_tokens
+
+    with pytest.raises(RuntimeError, match="not on this pipeline stage"):
+        utils.maybe_share_embeddings(
+            draft, target, tp_layout_matches=True, force_share=force_share
+        )
 
 
 def test_handoff_seed_tokens_replaces_only_rows_with_a_published_send():
