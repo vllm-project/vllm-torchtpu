@@ -11,44 +11,29 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Shortest-Remaining-Processing-Time (SRPT) prefill scheduler for RUNNING and WAITING.
+"""Shortest-remaining-first ordering and hold-back of running prefill chunks.
 
-vLLM schedules the RUNNING queue in admission order and the WAITING queue after
-it. When an in-progress long prefill chunk sits in ``self.running``, it consumes
-the step's token budget before ``Scheduler.schedule()`` visits ``self.waiting``,
-forcing newly arrived short or prefix-cached requests to wait behind the entire
-long prefill.
+vLLM schedules RUNNING in admission order before WAITING, so an in-progress
+long prefill chunk can take the step's token budget before a short waiting
+request is reached. Each step (FCFS policy, prefills not throttled) this
+scheduler:
 
-``SrptPrefillScheduler`` extends ``AsyncScheduler`` (so it expects
-``--async-scheduling``) so that each step (under ``SchedulingPolicy.FCFS``):
+* orders RUNNING as decodes first, in their existing order, then prefill
+  chunks by remaining prompt tokens, fewest first;
+* holds back, for this step, the longest running prefill chunks needed for the
+  request upstream admits next (the first admissible request in
+  ``kv_holding_waiting``, then ``waiting``) to fit in the remaining budget,
+  when that request has fewer uncached tokens and free KV blocks cover the
+  kept requests plus it, so a hold does not cause preemption.
 
-* keeps every decoding request (decode and speculative verify) ahead of all
-  in-progress prefill chunks, preserving their relative order;
-* orders RUNNING prefill chunks by remaining prompt tokens, fewest first — so
-  shorter prefills finish first and the longest remaining prefill sits at
-  ``self.running[-1]``;
-* holds back, for the current step, only the longest running prefill chunks
-  needed so that the step's remaining token budget can admit the next
-  admissible waiting request (the one upstream admits next, in queue order;
-  WAITING is not reordered) when that request has strictly fewer remaining
-  uncached tokens and sufficient free KV blocks exist.
+Held chunks keep their KV blocks; ``max_num_running_reqs`` and
+``max_num_active_reqs`` are lowered by the number held during the step so
+admission never exceeds ``max_num_seqs``. A request is held at most
+``VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS`` steps in a row, and a hold whose target
+is not admitted backs off exponentially for that target.
 
-Held-back chunks retain their allocated KV blocks and are restored to
-``self.running`` immediately after ``super().schedule()`` while lowering both
-``max_num_running_reqs`` and ``max_num_active_reqs`` by ``len(held)`` during the
-step so admission never exceeds ``max_num_seqs``. To bound starvation, a running
-prefill chunk may be held back at most ``MAX_CONSECUTIVE_HOLDS`` steps in a row
-(configurable via ``VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS``, default ``8``) before
-it is guaranteed a step to advance (under continuous short arrivals, a long
-prompt advances on at least 1 step in ``MAX_CONSECUTIVE_HOLDS + 1``, i.e. 1 step
-in 9 by default).
-
-Note on preemption: upstream FCFS preemption pops ``self.running[-1]`` when KV
-blocks are exhausted. Hold-back is skipped whenever free KV blocks are below
-what the non-held running requests, in-flight prefill reservations, and the
-waiting head require, ensuring that under KV pressure the longest remaining
-prefill chunk stays at ``self.running[-1]`` and active decodes or shorter
-prefills are never preempted in its place.
+Under KV pressure upstream preempts ``running[-1]``, which is the longest
+prefill chunk.
 
 Select with ``--scheduler-cls``
 ``vllm_torchtpu.core.experimental.srpt_prefill_scheduler.SrptPrefillScheduler``.
@@ -56,503 +41,302 @@ Select with ``--scheduler-cls``
 
 from itertools import chain
 
-from vllm.logger import init_logger
+from vllm.v1.core.kv_cache_manager import KVCacheBlocks
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.output import SchedulerOutput
 from vllm.v1.core.sched.request_queue import SchedulingPolicy
-from vllm.v1.request import Request
+from vllm.v1.request import Request, RequestStatus
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.logger import init_logger
 
-logger = init_logger("vllm." + __name__)
+logger = init_logger(__name__)
+
+_MAX_BACKOFF_SHIFT = 6
 
 
 class SrptPrefillScheduler(AsyncScheduler):
-    """Order RUNNING decodes first and prefill chunks by fewest remaining tokens,
-    holding back longer running prefill chunks when shorter waiting requests exist."""
-
-    #: Maximum consecutive steps a running prefill chunk may be held back
-    #: before it is guaranteed a step to make progress (at least 1 step in
-    #: ``MAX_CONSECUTIVE_HOLDS + 1`` under continuous short arrivals).
-    #: Configurable via ``VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS``.
-    MAX_CONSECUTIVE_HOLDS = 8
+    """Order RUNNING prefill chunks by fewest remaining tokens and hold back
+    longer ones for a shorter waiting request."""
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        if (
-            type(self).MAX_CONSECUTIVE_HOLDS
-            == SrptPrefillScheduler.MAX_CONSECUTIVE_HOLDS
-        ):
-            self.MAX_CONSECUTIVE_HOLDS = envs.VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS
-        self._skip_hold_next_step = False
-        self._blocked_hold_state: tuple[str, int] | None = None
-        self._blocked_hold_failures: dict[str, int] = {}
-        self._blocked_hold_cooldown: dict[str, int] = {}
+        self.max_consecutive_holds = envs.VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS
+        spec = self.vllm_config.speculative_config
+        self._draft_slots = (
+            spec.max_num_new_slots_for_drafting if spec is not None else 0
+        )
         self._consecutive_holds: dict[str, int] = {}
-        self._step_warmth_cache: dict[tuple[str, int], tuple[int, tuple]] = {}
-        self._warmth_lookup_broken = False
+        # Target request id -> (failed holds, first step a hold may retry).
+        self._hold_backoff: dict[str, tuple[int, int]] = {}
         logger.info(
             "SrptPrefillScheduler active (max_consecutive_holds=%d)",
-            self.MAX_CONSECUTIVE_HOLDS,
+            self.max_consecutive_holds,
         )
+
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        held: list[Request] = []
+        target = None
+        if not throttle_prefills and self.policy == SchedulingPolicy.FCFS:
+            self._order_running()
+            self._prune_hold_state()
+            held, target = self._select_chunks_to_hold()
+
+        held_ids = {r.request_id for r in held}
+        for req_id in held_ids:
+            self._consecutive_holds[req_id] = self._consecutive_holds.get(req_id, 0) + 1
+        self.running[:] = [r for r in self.running if r.request_id not in held_ids]
+        self.max_num_running_reqs -= len(held)
+        self.max_num_active_reqs -= len(held)
+        try:
+            output = super().schedule(throttle_prefills)
+        finally:
+            self.max_num_running_reqs += len(held)
+            self.max_num_active_reqs += len(held)
+            self.running.extend(held)
+
+        for req_id in output.num_scheduled_tokens:
+            self._consecutive_holds.pop(req_id, None)
+        if target is not None:
+            self._record_hold_outcome(target)
+        return output
 
     @staticmethod
-    def _running_remaining(request: Request) -> int:
+    def _remaining(request: Request) -> int:
         return request.num_tokens - request.num_computed_tokens
 
-    def _effective_long_prefill_threshold(self, num_running: int | None = None) -> int:
-        """Return the runtime-adjusted ``long_prefill_token_threshold`` matching
-        upstream ``Scheduler.schedule()`` (0 when at most one request is
-        eligible, and floored at ``input_budget // num_eligible_reqs`` when
-        ``adaptive_long_prefill_threshold`` is enabled)."""
-        lptt = self.scheduler_config.long_prefill_token_threshold
-        if lptt <= 0:
-            return 0
-        get_counts = getattr(self, "get_request_counts", None)
-        if callable(get_counts):
-            cur_running, num_waiting = get_counts()
-            running_cnt = cur_running if num_running is None else num_running
-        else:
-            running_cnt = len(self.running) if num_running is None else num_running
-            queue = getattr(self, "kv_holding_waiting", None) or getattr(
-                self, "waiting", None
-            )
-            num_waiting = len(queue) if queue is not None else 0
-        num_eligible_reqs = running_cnt + num_waiting
-        if num_eligible_reqs <= 1:
-            return 0
-        if getattr(self, "adaptive_long_prefill_threshold", False):
-            input_budget = self.scheduler_config.max_num_batched_tokens
-            lptt = max(lptt, input_budget // num_eligible_reqs)
-        return lptt
-
-    def _running_step_tokens(self, request: Request, lptt: int | None = None) -> int:
-        tokens = (
-            request.num_tokens_with_spec
-            + request.num_output_placeholders
-            - request.num_computed_tokens
-        )
-        if lptt is None:
-            lptt = self._effective_long_prefill_threshold()
-        if 0 < lptt < tokens:
-            tokens = lptt
-        return max(tokens, 0)
-
-    def _draft_slots(self) -> int:
-        spec = self.vllm_config.speculative_config
-        return spec.max_num_new_slots_for_drafting if spec is not None else 0
-
-    def _step_token_budget(self) -> int:
-        draft_slots = self._draft_slots()
-        return min(
-            self.max_num_scheduled_tokens,
-            max(self.scheduler_config.max_num_batched_tokens - draft_slots, 0),
-        )
-
-    def _warmth_and_blocks(self, request: Request) -> tuple[int, tuple]:
-        """Return ``(cached_prompt_tokens, cached_blocks_by_group)`` for
-        ``request``, memoized for the current ``schedule()`` step."""
-        key = (request.request_id, request.num_computed_tokens)
-        cached = self._step_warmth_cache.get(key)
-        if cached is not None:
-            return cached
-
-        kvm = self.kv_cache_manager
-        empty_blocks = getattr(kvm, "empty_kv_cache_blocks", None)
-        default_blocks = empty_blocks.blocks if empty_blocks is not None else ()
-        if not kvm.enable_caching or request.skip_reading_prefix_cache:
-            res = (0, default_blocks)
-        elif request.num_computed_tokens > 0:
-            res = (request.num_computed_tokens, default_blocks)
-        else:
-            try:
-                computed_blocks, num_computed, _ = (
-                    kvm.coordinator.find_longest_cache_hit(
-                        request.block_hashes, max(request.num_tokens - 1, 0)
-                    )
-                )
-                res = (int(num_computed), tuple(computed_blocks))
-            except Exception:
-                if not self._warmth_lookup_broken:
-                    self._warmth_lookup_broken = True
-                    logger.exception(
-                        "SrptPrefillScheduler: prefix-cache lookup failed; "
-                        "treating waiting requests as uncached."
-                    )
-                res = (0, default_blocks)
-
-        self._step_warmth_cache[key] = res
-        return res
-
-    def _prefix_warmth(self, request: Request) -> int:
-        return self._warmth_and_blocks(request)[0]
-
-    def _waiting_remaining(self, request: Request) -> int:
-        return max(request.num_tokens - self._prefix_warmth(request), 1)
-
-    def _num_free_blocks(self) -> int:
-        block_pool = getattr(self.kv_cache_manager, "block_pool", None)
-        if block_pool is None:
-            return 0
-        return int(block_pool.get_num_free_blocks())
-
-    def _has_kv_blocks_for_hold(
-        self,
-        kept_running: list[Request],
-        best_waiting: Request,
-        waiting_step_tokens: int,
-        step_budget: int,
-    ) -> bool:
-        """Return True iff enough free KV blocks exist to schedule all
-        ``kept_running`` requests plus ``best_waiting`` without triggering
-        preemption or violating full-sequence-fit / in-flight reservations."""
-        kvm = self.kv_cache_manager
-        coordinator = getattr(kvm, "coordinator", None)
-        if coordinator is None or not hasattr(
-            coordinator, "get_num_blocks_to_allocate"
-        ):
-            return True
-
-        free_blocks = self._num_free_blocks()
-        empty_blocks = kvm.empty_kv_cache_blocks.blocks
-        draft_slots = self._draft_slots()
-        rem_token_budget = min(self.max_num_scheduled_tokens, step_budget)
-        rem_input_budget = self.scheduler_config.max_num_batched_tokens
-        held_lptt = self._effective_long_prefill_threshold(
-            num_running=len(kept_running)
-        )
-
-        inflight_fn = getattr(self, "_inflight_prefill_reserved_blocks", None)
-        spec_step_fn = getattr(self, "_spec_decode_step_blocks", None)
-        inflight_reqs = getattr(self, "_inflight_prefills", ()) or ()
-        has_inflight_fn = callable(inflight_fn)
-
-        needed_blocks = 0
-        for req in kept_running:
-            if rem_token_budget <= 0 or rem_input_budget <= draft_slots:
-                break
-            req_new_tokens = min(
-                self._running_step_tokens(req, lptt=held_lptt),
-                rem_token_budget,
-                rem_input_budget - draft_slots,
-            )
-            if req_new_tokens <= 0:
-                continue
-            rem_token_budget -= req_new_tokens
-            rem_input_budget -= req_new_tokens + draft_slots
-            # Requests in `_inflight_prefills` already have their full remaining
-            # blocks counted by `_inflight_prefill_reserved_blocks()` below.
-            if has_inflight_fn and req in inflight_reqs:
-                continue
-            main_tokens = req.num_computed_tokens + req_new_tokens
-            slot_tokens = min(
-                main_tokens + self.num_lookahead_tokens, self.max_model_len
-            )
-            needed_blocks += coordinator.get_num_blocks_to_allocate(
-                request_id=req.request_id,
-                num_tokens=slot_tokens,
-                new_computed_blocks=empty_blocks,
-                num_encoder_tokens=0,
-                total_computed_tokens=req.num_computed_tokens,
-                num_local_computed_tokens=req.num_computed_tokens,
-                num_tokens_main_model=main_tokens,
-            )
-
-        warmth, computed_blocks = self._warmth_and_blocks(best_waiting)
-        w_main_tokens = warmth + waiting_step_tokens
-        w_slot_tokens = min(
-            w_main_tokens + self.num_lookahead_tokens, self.max_model_len
-        )
-        waiting_blocks = coordinator.get_num_blocks_to_allocate(
-            request_id=best_waiting.request_id,
-            num_tokens=w_slot_tokens,
-            new_computed_blocks=computed_blocks,
-            num_encoder_tokens=0,
-            total_computed_tokens=warmth,
-            num_local_computed_tokens=warmth,
-            num_tokens_main_model=w_main_tokens,
-        )
-        if getattr(self, "scheduler_reserve_full_isl", False):
-            full_num_tokens = min(best_waiting.num_tokens, self.max_model_len)
-            full_blocks = coordinator.get_num_blocks_to_allocate(
-                request_id=best_waiting.request_id,
-                num_tokens=full_num_tokens,
-                new_computed_blocks=computed_blocks,
-                num_encoder_tokens=0,
-                total_computed_tokens=warmth,
-                num_local_computed_tokens=warmth,
-                num_tokens_main_model=full_num_tokens,
-            )
-            waiting_blocks = max(waiting_blocks, full_blocks)
-        needed_blocks += waiting_blocks
-
-        if kept_running:
-            needed_blocks += getattr(kvm, "watermark_blocks", 0)
-
-        reserved_blocks = (inflight_fn() if callable(inflight_fn) else 0) + (
-            spec_step_fn() if callable(spec_step_fn) else 0
-        )
-        return free_blocks - reserved_blocks >= needed_blocks
-
     def _order_running(self) -> None:
-        """Sort RUNNING: decodes first (preserving their relative order), then
-        in-progress prefill chunks by remaining tokens (fewest first)."""
-        if self.policy != SchedulingPolicy.FCFS or len(self.running) < 2:
-            return
         decoding = [r for r in self.running if not r.is_prefill_chunk]
         prefilling = sorted(
-            (r for r in self.running if r.is_prefill_chunk),
-            key=self._running_remaining,
+            (r for r in self.running if r.is_prefill_chunk), key=self._remaining
         )
         self.running[:] = decoding + prefilling
 
-    def _select_chunks_to_hold(
-        self, throttle_prefills: bool = False
-    ) -> tuple[list[Request], Request | None]:
-        """Return ``(chunks_to_hold, target_waiting_request)``."""
-        if self._skip_hold_next_step:
-            self._skip_hold_next_step = False
-            return [], None
-        if throttle_prefills or self.policy != SchedulingPolicy.FCFS:
-            return [], None
-        if not any(r.is_prefill_chunk for r in self.running):
-            return [], None
-        num_streaming = getattr(self, "num_waiting_for_streaming_input", 0)
-        max_active = getattr(self, "max_num_active_reqs", self.max_num_running_reqs)
-        if len(self.running) + num_streaming >= max_active:
-            return [], None
-        # Hold only for the request upstream admits next: the first admissible
-        # one in scan order (kv_holding_waiting drains before waiting).
-        queues = (getattr(self, "kv_holding_waiting", ()), self.waiting)
-        best_req = next(
+    def _prune_hold_state(self) -> None:
+        prefilling = {r.request_id for r in self.running if r.is_prefill_chunk}
+        self._consecutive_holds = {
+            k: v for k, v in self._consecutive_holds.items() if k in prefilling
+        }
+        if self._hold_backoff:
+            waiting = {
+                r.request_id for r in chain(self.kv_holding_waiting, self.waiting)
+            }
+            self._hold_backoff = {
+                k: v for k, v in self._hold_backoff.items() if k in waiting
+            }
+
+    def _record_hold_outcome(self, target: Request) -> None:
+        # Admission either runs the target or starts its KV load; both move it
+        # out of WAITING / PREEMPTED.
+        if target.status not in (RequestStatus.WAITING, RequestStatus.PREEMPTED):
+            self._hold_backoff.pop(target.request_id, None)
+            return
+        failures = self._hold_backoff.get(target.request_id, (0, 0))[0] + 1
+        delay = 1 << min(failures - 1, _MAX_BACKOFF_SHIFT)
+        self._hold_backoff[target.request_id] = (
+            failures,
+            self.current_step + 1 + delay,
+        )
+
+    def _long_prefill_threshold(self, num_eligible_reqs: int) -> int:
+        # Mirrors the long_prefill_token_threshold computation inline in
+        # Scheduler.schedule() (vLLM v0.31.0, scheduler.py ~L611-626). Re-sync
+        # on vLLM upgrades.
+        lptt = (
+            self.scheduler_config.long_prefill_token_threshold
+            if num_eligible_reqs > 1
+            else 0
+        )
+        if lptt > 0 and self.adaptive_long_prefill_threshold:
+            lptt = max(
+                lptt,
+                self.scheduler_config.max_num_batched_tokens // num_eligible_reqs,
+            )
+        return lptt
+
+    def _plan_running(
+        self, reqs: list[Request], lptt: int
+    ) -> tuple[dict[str, int], int]:
+        """Tokens the RUNNING pass of Scheduler.schedule() would give ``reqs``
+        and the budget it leaves for WAITING.
+
+        Mirrors the per-request ``num_new_tokens`` math inline in that pass
+        (vLLM v0.31.0, scheduler.py ~L628-722); re-sync on vLLM upgrades.
+        Encoder, Mamba-alignment and KV-allocation limits are not modelled, so
+        a misestimate only makes a hold miss, which the backoff absorbs.
+        """
+        next_step = self.current_step + 1
+        token_budget = self.max_num_scheduled_tokens
+        input_budget = self.scheduler_config.max_num_batched_tokens
+        alloc: dict[str, int] = {}
+        for r in reqs:
+            if token_budget <= 0 or input_budget <= self._draft_slots:
+                break
+            if (
+                r.num_output_placeholders > 0
+                and r.num_computed_tokens + 2 - r.num_output_placeholders
+                >= r.num_prompt_tokens + r.max_tokens
+            ) or next_step < r.next_decode_eligible_step:
+                continue
+            n = (
+                r.num_tokens_with_spec
+                + r.num_output_placeholders
+                - r.num_computed_tokens
+            )
+            if 0 < lptt < n:
+                n = lptt
+            n = min(
+                n,
+                token_budget,
+                input_budget - self._draft_slots,
+                self.max_model_len
+                - r.num_computed_tokens
+                - self.num_sampled_tokens_per_step,
+            )
+            n = self._reserve_prefill_lookahead(r, r.num_computed_tokens, n)
+            if n <= 0:
+                continue
+            alloc[r.request_id] = n
+            token_budget -= n
+            input_budget -= n + self._draft_slots
+        return alloc, min(token_budget, input_budget - self._draft_slots)
+
+    def _next_waiting(self) -> Request | None:
+        """The request upstream's WAITING pass admits next."""
+        return next(
             (
                 r
-                for r in chain(*queues)
+                for r in chain(self.kv_holding_waiting, self.waiting)
                 if not self._is_blocked_waiting_status(r.status)
             ),
             None,
         )
-        if best_req is None:
-            return [], None
-        best_id = best_req.request_id
-        cooldown = self._blocked_hold_cooldown.get(best_id, 0)
-        if cooldown > 0:
-            if cooldown <= 1:
-                self._blocked_hold_cooldown.pop(best_id, None)
-            else:
-                self._blocked_hold_cooldown[best_id] = cooldown - 1
-            return [], None
 
-        free_blocks = self._num_free_blocks()
-        if self._blocked_hold_state is not None:
-            blocked_req_id, blocked_free_blocks = self._blocked_hold_state
-            if best_id == blocked_req_id and free_blocks <= blocked_free_blocks:
-                self._blocked_hold_state = (blocked_req_id, free_blocks)
-                return [], None
-            self._blocked_hold_state = None
-
-        target_remaining = self._waiting_remaining(best_req)
-        draft_slots = self._draft_slots()
-        token_budget = self.max_num_scheduled_tokens
-        input_budget = self.scheduler_config.max_num_batched_tokens
-        lptt = self._effective_long_prefill_threshold()
-        for r in self.running:
-            if r.is_prefill_chunk:
-                continue
-            if token_budget <= 0 or input_budget <= draft_slots:
-                token_budget = 0
-                input_budget = 0
-                break
-            toks = min(
-                self._running_step_tokens(r, lptt=lptt),
-                token_budget,
-                input_budget - draft_slots,
+    def _prefix_hit(self, request: Request) -> tuple[KVCacheBlocks, int]:
+        if request.num_computed_tokens > 0:
+            return (
+                self.kv_cache_manager.empty_kv_cache_blocks,
+                request.num_computed_tokens,
             )
-            if toks <= 0:
-                continue
-            token_budget -= toks
-            input_budget -= toks + draft_slots
+        blocks, num_hit_tokens, _, _ = self._get_local_prefix_cache_hit(request)
+        return blocks, num_hit_tokens
 
-        budget_after_decodes = min(token_budget, input_budget - draft_slots)
-        if budget_after_decodes <= 0:
+    def _select_chunks_to_hold(self) -> tuple[list[Request], Request | None]:
+        """Return ``(chunks_to_hold, target_waiting_request)``."""
+        if not any(r.is_prefill_chunk for r in self.running):
+            return [], None
+        if (
+            len(self.running) + self.num_waiting_for_streaming_input
+            >= self.max_num_active_reqs
+        ):
+            return [], None
+        target = self._next_waiting()
+        if target is None:
+            return [], None
+        _, retry_step = self._hold_backoff.get(target.request_id, (0, 0))
+        if self.current_step + 1 < retry_step:
             return [], None
 
-        waiting_step_need = target_remaining
-        if 0 < lptt < waiting_step_need:
-            waiting_step_need = lptt
-        waiting_step_need = min(waiting_step_need, budget_after_decodes)
+        hit_blocks, hit_tokens = self._prefix_hit(target)
+        target_remaining = max(target.num_tokens - hit_tokens, 1)
+        _, num_waiting = self.get_request_counts()
+        kept = list(self.running)
+        held: list[Request] = []
+        while True:
+            lptt = self._long_prefill_threshold(len(kept) + num_waiting)
+            alloc, left = self._plan_running(kept, lptt)
+            need = min(target_remaining, lptt) if lptt > 0 else target_remaining
+            if left >= need:
+                break
+            # `kept` is ordered by remaining tokens, so this is the longest.
+            candidate = next(
+                (
+                    r
+                    for r in reversed(kept)
+                    if r.request_id in alloc
+                    and r.is_prefill_chunk
+                    and self._remaining(r) > target_remaining
+                    and self._consecutive_holds.get(r.request_id, 0)
+                    < self.max_consecutive_holds
+                ),
+                None,
+            )
+            if candidate is None:
+                break
+            kept.remove(candidate)
+            held.append(candidate)
+        if not held or left <= 0:
+            return [], None
+        if not self._kv_fits_hold(
+            kept, alloc, target, hit_blocks, hit_tokens, min(need, left)
+        ):
+            return [], None
+        return held, target
 
-        # Sort prefill chunks locally by remaining tokens so `_chunks_to_hold()`
-        # does not depend on `_order_running()` having been called first.
-        prefilling = sorted(
-            (r for r in self.running if r.is_prefill_chunk),
-            key=self._running_remaining,
-        )
-        prefill_step_tokens = [
-            self._running_step_tokens(r, lptt=lptt) for r in prefilling
-        ]
-        total_prefill_tokens = sum(prefill_step_tokens)
-        total_prefill_count = sum(1 for t in prefill_step_tokens if t > 0)
+    def _kv_fits_hold(
+        self,
+        kept: list[Request],
+        alloc: dict[str, int],
+        target: Request,
+        hit_blocks: KVCacheBlocks,
+        hit_tokens: int,
+        target_tokens: int,
+    ) -> bool:
+        """Whether free KV blocks cover ``kept`` running requests plus
+        ``target``, counted as KVCacheManager.allocate_slots() counts them,
+        so a hold never forces a preemption."""
+        coordinator = self.kv_cache_manager.coordinator
+        empty_blocks = self.kv_cache_manager.empty_kv_cache_blocks.blocks
 
-        def _waiting_budget_after_prefills(
-            prefill_toks: int, prefill_count: int
+        def blocks_for(
+            request: Request,
+            computed_tokens: int,
+            num_new_tokens: int,
+            computed_blocks: tuple,
         ) -> int:
-            return min(
-                token_budget - prefill_toks,
-                input_budget - prefill_toks - (prefill_count + 1) * draft_slots,
+            num_tokens_main = computed_tokens + num_new_tokens
+            return coordinator.get_num_blocks_to_allocate(
+                request_id=request.request_id,
+                num_tokens=min(
+                    num_tokens_main + self.num_lookahead_tokens, self.max_model_len
+                ),
+                new_computed_blocks=computed_blocks,
+                num_encoder_tokens=0,
+                total_computed_tokens=computed_tokens,
+                num_local_computed_tokens=computed_tokens,
+                num_tokens_main_model=num_tokens_main,
+                prefill_end=max(request.num_prompt_tokens, request.num_tokens - 1),
             )
 
-        # If running prefills already leave enough budget for best_req, hold nothing.
-        if (
-            _waiting_budget_after_prefills(total_prefill_tokens, total_prefill_count)
-            >= waiting_step_need
-        ):
-            return [], None
-
-        # Hold only the longest eligible running prefill chunks needed to free
-        # waiting_step_need tokens of budget.
-        held_ids: set[str] = set()
-        remaining_prefill_tokens = total_prefill_tokens
-        remaining_prefill_count = total_prefill_count
-        for r, step_toks in zip(reversed(prefilling), reversed(prefill_step_tokens)):
-            if (
-                _waiting_budget_after_prefills(
-                    remaining_prefill_tokens, remaining_prefill_count
-                )
-                >= waiting_step_need
-            ):
-                break
-            if self._running_remaining(r) <= target_remaining:
-                continue
-            if (
-                self._consecutive_holds.get(r.request_id, 0)
-                >= self.MAX_CONSECUTIVE_HOLDS
-            ):
-                continue
-            held_ids.add(r.request_id)
-            remaining_prefill_tokens -= step_toks
-            if step_toks > 0:
-                remaining_prefill_count -= 1
-
-        avail_after_held = _waiting_budget_after_prefills(
-            remaining_prefill_tokens, remaining_prefill_count
+        needed = sum(
+            blocks_for(r, r.num_computed_tokens, alloc[r.request_id], empty_blocks)
+            for r in kept
+            # In-flight prefills are covered by the reservation below.
+            if r.request_id in alloc and r not in self._inflight_prefills
         )
-        if not held_ids or avail_after_held <= 0:
-            return [], None
-
-        held = [r for r in prefilling if r.request_id in held_ids]
-        kept_running = [r for r in self.running if r.request_id not in held_ids]
-        waiting_avail_budget = min(waiting_step_need, avail_after_held)
-        if not self._has_kv_blocks_for_hold(
-            kept_running,
-            best_req,
-            waiting_avail_budget,
-            self._step_token_budget(),
-        ):
-            return [], None
-
-        return held, best_req
-
-    def _chunks_to_hold(self, throttle_prefills: bool = False) -> list[Request]:
-        """Return running prefill chunks to hold back for the current step."""
-        return self._select_chunks_to_hold(throttle_prefills)[0]
-
-    def _prune_hold_tracking(self) -> None:
-        """Drop per-request hold counters and failure/cooldown state for
-        requests that are no longer active prefill chunks or waiting."""
-        active_prefill_ids = {r.request_id for r in self.running if r.is_prefill_chunk}
-        for req_id in list(self._consecutive_holds):
-            if req_id not in active_prefill_ids:
-                del self._consecutive_holds[req_id]
-
-        if (
-            not self._blocked_hold_failures
-            and not self._blocked_hold_cooldown
-            and self._blocked_hold_state is None
-        ):
-            return
-        waiting_ids: set[str] = set()
-        for q_attr in ("kv_holding_waiting", "waiting"):
-            q = getattr(self, q_attr, None)
-            if q:
-                waiting_ids.update(r.request_id for r in q)
-        for req_id in list(self._blocked_hold_failures):
-            if req_id not in waiting_ids:
-                del self._blocked_hold_failures[req_id]
-        for req_id in list(self._blocked_hold_cooldown):
-            if req_id not in waiting_ids:
-                del self._blocked_hold_cooldown[req_id]
-        if (
-            self._blocked_hold_state is not None
-            and self._blocked_hold_state[0] not in waiting_ids
-        ):
-            self._blocked_hold_state = None
-
-    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
-        self._step_warmth_cache.clear()
-        try:
-            self._order_running()
-            self._prune_hold_tracking()
-
-            held, target_req = self._select_chunks_to_hold(throttle_prefills)
-            if not held:
-                output = super().schedule(throttle_prefills)
-                for req_id, n_tok in output.num_scheduled_tokens.items():
-                    if n_tok > 0:
-                        self._consecutive_holds.pop(req_id, None)
-                        self._blocked_hold_failures.pop(req_id, None)
-                        self._blocked_hold_cooldown.pop(req_id, None)
-                if self._blocked_hold_state is not None:
-                    blocked_id, blocked_free = self._blocked_hold_state
-                    self._blocked_hold_state = (
-                        blocked_id,
-                        min(blocked_free, self._num_free_blocks()),
-                    )
-                return output
-
-            held_ids = {r.request_id for r in held}
-            for r in held:
-                self._consecutive_holds[r.request_id] = (
-                    self._consecutive_holds.get(r.request_id, 0) + 1
-                )
-            self.running[:] = [r for r in self.running if r.request_id not in held_ids]
-            len_before = len(self.running)
-            k = len(held)
-            self.max_num_running_reqs -= k
-            has_max_active = hasattr(self, "max_num_active_reqs")
-            if has_max_active:
-                self.max_num_active_reqs -= k
-            try:
-                output = super().schedule(throttle_prefills)
-                for req_id, n_tok in output.num_scheduled_tokens.items():
-                    if n_tok > 0:
-                        self._consecutive_holds.pop(req_id, None)
-                        self._blocked_hold_failures.pop(req_id, None)
-                        self._blocked_hold_cooldown.pop(req_id, None)
-                # Note: `len(self.running) > len_before` also treats a simultaneous
-                # preemption + admission in the same step as a failed hold, which is
-                # conservative (harmlessly skips holding on the next step).
-                admitted = len(self.running) > len_before
-                self._skip_hold_next_step = not admitted
-                if not admitted and target_req is not None:
-                    target_id = target_req.request_id
-                    failures = self._blocked_hold_failures.get(target_id, 0) + 1
-                    self._blocked_hold_failures[target_id] = failures
-                    # Exponential backoff (in addition to _skip_hold_next_step) so
-                    # non-KV admission failures (LoRA limit, stale output, connector
-                    # returning None) do not retry every step as decodes free blocks.
-                    self._blocked_hold_cooldown[target_id] = 1 << min(failures - 1, 6)
-                    self._blocked_hold_state = (
-                        target_id,
-                        self._num_free_blocks(),
-                    )
-                else:
-                    self._blocked_hold_state = None
-                return output
-            finally:
-                self.max_num_running_reqs += k
-                if has_max_active:
-                    self.max_num_active_reqs += k
-                self.running.extend(held)
-        finally:
-            self._step_warmth_cache.clear()
+        target_blocks = blocks_for(target, hit_tokens, target_tokens, hit_blocks.blocks)
+        if self.scheduler_reserve_full_isl:
+            full_num_tokens = min(target.num_tokens, self.max_model_len)
+            target_blocks = max(
+                target_blocks,
+                coordinator.get_num_blocks_to_allocate(
+                    request_id=target.request_id,
+                    num_tokens=full_num_tokens,
+                    new_computed_blocks=hit_blocks.blocks,
+                    num_encoder_tokens=0,
+                    total_computed_tokens=hit_tokens,
+                    num_local_computed_tokens=hit_tokens,
+                    num_tokens_main_model=full_num_tokens,
+                    apply_admission_cap=True,
+                    prefill_end=max(target.num_prompt_tokens, target.num_tokens - 1),
+                ),
+            )
+        needed += target_blocks
+        if kept:
+            # allocate_slots() adds the watermark when others are scheduled.
+            needed += self.kv_cache_manager.watermark_blocks
+        reserved = (
+            self._inflight_prefill_reserved_blocks() + self._spec_decode_step_blocks()
+        )
+        free = self.kv_cache_manager.block_pool.get_num_free_blocks()
+        return free - reserved >= needed

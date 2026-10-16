@@ -11,6 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+"""SrptPrefillScheduler tests on a real scheduler, through schedule()."""
 
 import pytest
 import torch
@@ -21,12 +22,12 @@ from vllm.config import (
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
+    SpeculativeConfig,
     VllmConfig,
 )
 from vllm.utils.hashing import sha256
 from vllm.v1.core.kv_cache_utils import get_request_block_hasher, init_none_hash
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
-from vllm.v1.core.sched.request_queue import SchedulingPolicy
 from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
@@ -36,17 +37,17 @@ from vllm.v1.kv_cache_interface import (
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.structured_output import StructuredOutputManager
 
+from vllm_torchtpu.compilation import tpu_compiler
 from vllm_torchtpu.core.experimental.srpt_prefill_scheduler import SrptPrefillScheduler
 from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
 
 BLOCK_SIZE = 16
+MODEL = "facebook/opt-125m"
 
 
 @pytest.fixture(scope="module")
 def shared_model_config():
-    return ModelConfig(
-        model="facebook/opt-125m", dtype="float16", seed=42, max_model_len=2048
-    )
+    return ModelConfig(model=MODEL, dtype="float16", seed=42, max_model_len=2048)
 
 
 def _build_real_scheduler(
@@ -57,7 +58,22 @@ def _build_real_scheduler(
     max_num_seqs: int = 8,
     max_num_batched_tokens: int = 64,
     long_prefill_token_threshold: int = 0,
+    scheduler_reserve_full_isl: bool = False,
+    policy: str = "fcfs",
+    num_draft_tokens: int = 0,
 ):
+    parallel_config = ParallelConfig()
+    speculative_config = None
+    if num_draft_tokens:
+        # Parallel drafting reserves num_draft_tokens slots per request.
+        speculative_config = SpeculativeConfig(
+            target_model_config=model_config,
+            target_parallel_config=parallel_config,
+            method="draft_model",
+            model=MODEL,
+            num_speculative_tokens=num_draft_tokens,
+            parallel_drafting=True,
+        )
     vllm_config = VllmConfig(
         scheduler_config=SchedulerConfig(
             max_num_seqs=max_num_seqs,
@@ -65,10 +81,11 @@ def _build_real_scheduler(
             max_model_len=2048,
             enable_chunked_prefill=True,
             long_prefill_token_threshold=long_prefill_token_threshold,
-            scheduler_reserve_full_isl=False,
+            scheduler_reserve_full_isl=scheduler_reserve_full_isl,
             is_encoder_decoder=False,
             watermark=0.0,
             async_scheduling=True,
+            policy=policy,
         ),
         model_config=model_config,
         cache_config=CacheConfig(
@@ -77,7 +94,8 @@ def _build_real_scheduler(
             cache_dtype="auto",
             enable_prefix_caching=True,
         ),
-        parallel_config=ParallelConfig(),
+        parallel_config=parallel_config,
+        speculative_config=speculative_config,
         device_config=DeviceConfig(device="cpu"),
     )
     kv_cache_config = KVCacheConfig(
@@ -123,73 +141,84 @@ def _make_real_request(
     return Request(request_id, prompt, params, None, block_hasher=hasher)
 
 
-def test_decodes_first_then_prefill_chunks_by_remaining(shared_model_config):
-    scheduler, hasher = _build_real_scheduler(
-        shared_model_config,
-        num_blocks=32,
-        max_num_batched_tokens=64,
-        long_prefill_token_threshold=BLOCK_SIZE,
-    )
-    req_long = _make_real_request("long_prefill", 64, hasher, seed=1)
-    req_dec_1 = _make_real_request("dec_1", 16, hasher, seed=2)
-    req_short = _make_real_request("short_prefill", 32, hasher, seed=3)
-    req_dec_2 = _make_real_request("dec_2", 16, hasher, seed=4)
-
-    for req in (req_long, req_dec_1, req_short, req_dec_2):
-        scheduler.add_request(req)
-
-    scheduler.schedule()
-    assert req_dec_1.is_prefill_chunk is False
-    assert req_dec_2.is_prefill_chunk is False
-    assert req_short.is_prefill_chunk is True
+def _running_long_prefill(scheduler, hasher, num_tokens: int = 64) -> Request:
+    """Admit `long` and run its first chunk so it is a running prefill."""
+    req_long = _make_real_request("long", num_tokens, hasher, seed=1)
+    scheduler.add_request(req_long)
+    out = scheduler.schedule()
+    assert set(out.num_scheduled_tokens) == {"long"}
     assert req_long.is_prefill_chunk is True
-
-    # Scramble running order and verify _order_running places decodes first
-    # (preserving relative order) followed by prefill chunks fewest-remaining first.
-    scheduler.running[:] = [req_long, req_dec_1, req_short, req_dec_2]
-    scheduler._order_running()
-    assert [r.request_id for r in scheduler.running] == [
-        "dec_1",
-        "dec_2",
-        "short_prefill",
-        "long_prefill",
-    ]
+    return req_long
 
 
-def test_priority_policy_and_throttle_prefills_skip_hold(shared_model_config):
+@pytest.mark.parametrize(
+    ("scheduler_cls", "expected"),
+    [
+        # Admission order: `long` (48 left) takes its 16-token cap first.
+        (AsyncScheduler, {"long": 16, "short": 8}),
+        # SRPT order: `short` (40 left) goes first.
+        (SrptPrefillScheduler, {"short": 16, "long": 8}),
+    ],
+)
+def test_runs_running_prefill_chunks_fewest_remaining_first(
+    shared_model_config, scheduler_cls, expected
+):
     scheduler, hasher = _build_real_scheduler(
         shared_model_config,
-        num_blocks=32,
+        scheduler_cls=scheduler_cls,
+        max_num_batched_tokens=24,
+        long_prefill_token_threshold=16,
+    )
+    scheduler.add_request(_make_real_request("long", 64, hasher, seed=1))
+    scheduler.add_request(_make_real_request("short", 48, hasher, seed=2))
+    assert scheduler.schedule().num_scheduled_tokens == {"long": 16, "short": 8}
+
+    assert scheduler.schedule().num_scheduled_tokens == expected
+
+
+@pytest.mark.parametrize(
+    ("scheduler_cls", "expected_step2_scheduled"),
+    [
+        # Upstream schedules running `long` first, which takes the whole
+        # 16-token budget and leaves `short_wait` waiting.
+        (PrefixAwareScheduler, {"long"}),
+        # SRPT holds `long` (48 left > 16) so `short_wait` is admitted.
+        (SrptPrefillScheduler, {"short_wait"}),
+    ],
+)
+def test_holds_back_long_running_chunk_for_shorter_waiting_request(
+    shared_model_config,
+    scheduler_cls,
+    expected_step2_scheduled,
+):
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        scheduler_cls=scheduler_cls,
+        max_num_seqs=4,
         max_num_batched_tokens=16,
     )
-    req_long = _make_real_request("long_prefill", 64, hasher, seed=1)
-    scheduler.add_request(req_long)
-    scheduler.schedule()
-
+    req_long = _running_long_prefill(scheduler, hasher)
     req_short_wait = _make_real_request("short_wait", 16, hasher, seed=2)
     scheduler.add_request(req_short_wait)
 
-    # 1. throttle_prefills=True skips holding.
-    assert scheduler._chunks_to_hold(throttle_prefills=True) == []
+    out2 = scheduler.schedule()
+    assert set(out2.num_scheduled_tokens) == expected_step2_scheduled
+    assert scheduler.max_num_running_reqs == 4
 
-    # 2. SchedulingPolicy.PRIORITY skips _order_running and _chunks_to_hold.
-    req_dec = _make_real_request("dec", 16, hasher, seed=3)
-    req_dec.num_computed_tokens = 16
-    scheduler.running[:] = [req_long, req_dec]
-    scheduler.policy = SchedulingPolicy.PRIORITY
-    scheduler._order_running()
-    assert [r.request_id for r in scheduler.running] == ["long_prefill", "dec"]
-    assert scheduler._chunks_to_hold() == []
+    if scheduler_cls is SrptPrefillScheduler:
+        # The held chunk is restored with its KV blocks.
+        assert req_long in scheduler.running
+        assert req_long.status == RequestStatus.RUNNING
+        assert req_short_wait.is_prefill_chunk is False
 
 
 def test_holds_for_next_waiting_request_without_reordering_waiting(
     shared_model_config,
 ):
-    """SRPT extends AsyncScheduler: it holds for the request upstream admits
-    next (queue order) and does not promote a warmer request behind it."""
+    """SRPT holds for the request upstream admits next (queue order) and does
+    not promote a warmer request behind it."""
     scheduler, hasher = _build_real_scheduler(
         shared_model_config,
-        num_blocks=32,
         max_num_batched_tokens=16,
     )
     assert isinstance(scheduler, AsyncScheduler)
@@ -205,7 +234,6 @@ def test_holds_for_next_waiting_request_without_reordering_waiting(
     scheduler.finish_requests("primer", RequestStatus.FINISHED_ABORTED)
     scheduler.schedule()
 
-    # `long` runs its first 16-token chunk (48 tokens remaining).
     req_long = _make_real_request("long", 64, hasher, seed=10)
     scheduler.add_request(req_long)
     scheduler.schedule()
@@ -218,251 +246,137 @@ def test_holds_for_next_waiting_request_without_reordering_waiting(
     )
 
     out = scheduler.schedule()
-    # `long` is held so `next` gets the budget; `warm` keeps its place.
     assert set(out.num_scheduled_tokens) == {"next"}
     assert [r.request_id for r in scheduler.waiting] == ["warm"]
     assert req_long in scheduler.running
 
 
+def test_no_hold_when_waiting_request_is_longer(shared_model_config):
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        max_num_batched_tokens=16,
+    )
+    _running_long_prefill(scheduler, hasher, num_tokens=32)  # 16 left
+    scheduler.add_request(_make_real_request("longer", 48, hasher, seed=2))
+
+    assert set(scheduler.schedule().num_scheduled_tokens) == {"long"}
+
+
+def test_no_hold_at_max_num_seqs(shared_model_config):
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        max_num_seqs=2,
+        max_num_batched_tokens=32,
+        long_prefill_token_threshold=16,
+    )
+    scheduler.add_request(_make_real_request("long", 64, hasher, seed=1))
+    scheduler.add_request(_make_real_request("dec", 16, hasher, seed=2))
+    assert set(scheduler.schedule().num_scheduled_tokens) == {"long", "dec"}
+    # Both running slots are taken, so holding `long` cannot admit `short`.
+    scheduler.add_request(_make_real_request("short", 16, hasher, seed=3))
+
+    out = scheduler.schedule()
+    assert "long" in out.num_scheduled_tokens
+    assert "short" not in out.num_scheduled_tokens
+
+
 @pytest.mark.parametrize(
-    ("scheduler_cls", "expected_step2_scheduled"),
-    [
-        # Plain PrefixAwareScheduler schedules running `long` first, which
-        # consumes the entire 16-token step budget and leaves `short_wait`
-        # unscheduled in self.waiting.
-        (PrefixAwareScheduler, {"long"}),
-        # SrptPrefillScheduler holds back `long` (48 remaining > 16 waiting)
-        # for Step 2 so `short_wait` is admitted immediately, then restores
-        # `long` to self.running.
-        (SrptPrefillScheduler, {"short_wait"}),
-    ],
+    ("throttle_prefills", "policy"),
+    [(True, "fcfs"), (False, "priority")],
 )
-def test_holds_back_long_running_chunk_for_shorter_waiting_request(
-    shared_model_config,
-    scheduler_cls,
-    expected_step2_scheduled,
+def test_no_hold_on_throttled_step_or_priority_policy(
+    shared_model_config, throttle_prefills, policy
 ):
     scheduler, hasher = _build_real_scheduler(
         shared_model_config,
-        scheduler_cls=scheduler_cls,
-        num_blocks=32,
-        max_num_seqs=4,
         max_num_batched_tokens=16,
+        policy=policy,
     )
-    req_long = _make_real_request("long", 64, hasher, seed=1)
-    scheduler.add_request(req_long)
+    _running_long_prefill(scheduler, hasher)
+    scheduler.add_request(_make_real_request("short_wait", 16, hasher, seed=2))
 
-    # Step 1: `long` runs its first 16-token chunk (48 tokens remaining).
-    out1 = scheduler.schedule()
-    assert set(out1.num_scheduled_tokens.keys()) == {"long"}
-    assert req_long.is_prefill_chunk is True
-    assert req_long.num_computed_tokens == 16
-
-    # A short 16-token request arrives in self.waiting while `long` is in self.running.
-    req_short_wait = _make_real_request("short_wait", 16, hasher, seed=2)
-    scheduler.add_request(req_short_wait)
-
-    out2 = scheduler.schedule()
-    assert set(out2.num_scheduled_tokens.keys()) == expected_step2_scheduled
-    assert scheduler.max_num_running_reqs == 4
-
-    if scheduler_cls is SrptPrefillScheduler:
-        # Both `short_wait` (now decoding) and `long` (restored) are in self.running.
-        assert [r.request_id for r in scheduler.running] == ["short_wait", "long"]
-        assert req_short_wait.is_prefill_chunk is False
-        assert req_long.is_prefill_chunk is True
+    out = scheduler.schedule(throttle_prefills=throttle_prefills)
+    assert set(out.num_scheduled_tokens) == {"long"}
 
 
-def test_no_hold_when_waiting_is_longer_or_blocked_or_at_capacity(shared_model_config):
+def test_holds_only_the_chunks_needed(shared_model_config):
     scheduler, hasher = _build_real_scheduler(
         shared_model_config,
-        num_blocks=32,
-        max_num_seqs=2,
-        max_num_batched_tokens=16,
-    )
-    req_chunk = _make_real_request("chunk", 32, hasher, seed=1)
-    scheduler.add_request(req_chunk)
-    scheduler.schedule()
-    assert req_chunk.is_prefill_chunk is True
-    assert req_chunk.num_computed_tokens == 16  # 16 remaining
-
-    # 1. Waiting request has more remaining tokens (48 > 16): do not hold.
-    req_longer = _make_real_request("longer", 48, hasher, seed=2)
-    scheduler.add_request(req_longer)
-    assert scheduler._chunks_to_hold() == []
-    scheduler.waiting.clear()
-
-    # 2. Waiting request is blocked on remote KVs: do not hold.
-    req_blocked = _make_real_request("blocked", 16, hasher, seed=3)
-    req_blocked.status = RequestStatus.WAITING_FOR_REMOTE_KVS
-    scheduler.add_request(req_blocked)
-    assert scheduler._chunks_to_hold() == []
-    scheduler.waiting.clear()
-
-    # 3. Running queue is already at max_num_seqs capacity (2 == 2): do not hold.
-    req_dec = _make_real_request("dec", 16, hasher, seed=4)
-    scheduler.running.append(req_dec)
-    req_short = _make_real_request("short", 16, hasher, seed=5)
-    scheduler.add_request(req_short)
-    assert scheduler._chunks_to_hold() == []
-
-
-def test_holds_only_needed_chunks_and_respects_preempted_tier(shared_model_config):
-    scheduler, hasher = _build_real_scheduler(
-        shared_model_config,
-        num_blocks=32,
-        max_num_seqs=8,
         max_num_batched_tokens=48,
         long_prefill_token_threshold=32,
     )
-    # Admit two prefill chunks: `medium` (48 tokens -> 32 scheduled, 16 left)
-    # and `long` (80 tokens -> 16 scheduled, 64 left).
-    req_medium = _make_real_request("medium", 48, hasher, seed=1)
-    req_long = _make_real_request("long", 80, hasher, seed=2)
-    scheduler.add_request(req_medium)
-    scheduler.add_request(req_long)
-    out1 = scheduler.schedule()
-    assert out1.num_scheduled_tokens == {"medium": 32, "long": 16}
-    assert req_medium.is_prefill_chunk is True  # 16 remaining
-    assert req_long.is_prefill_chunk is True  # 64 remaining (wants 32 on next step)
+    scheduler.add_request(_make_real_request("medium", 48, hasher, seed=1))
+    scheduler.add_request(_make_real_request("long", 80, hasher, seed=2))
+    assert scheduler.schedule().num_scheduled_tokens == {"medium": 32, "long": 16}
 
-    # 1. If a preempted long request (64 remaining) and a normal short request
-    # (16 remaining) are both waiting, _promote_warmest prioritizes the
-    # preempted request (tier 1), so _chunks_to_hold compares against 64 and
-    # does not hold either running chunk.
-    req_preempted_long = _make_real_request("preempted_long", 64, hasher, seed=3)
-    req_preempted_long.num_preemptions = 1
-    req_short_wait = _make_real_request("short_wait", 16, hasher, seed=4)
-    scheduler.add_request(req_preempted_long)
-    scheduler.add_request(req_short_wait)
-    assert scheduler._chunks_to_hold() == []
-
-    # 2. Remove the preempted request so `short_wait` (16 tokens) is the target.
-    # Step budget is 48: `medium` needs 16 and `long` wants 32 (total 48).
-    # Holding only `long` leaves 48 - 16 = 32 >= 16 tokens for `short_wait`, so
-    # `medium` is NOT held and runs alongside `short_wait` in Step 2.
-    scheduler.waiting.remove(req_preempted_long)
-    held = scheduler._chunks_to_hold()
-    assert [r.request_id for r in held] == ["long"]
-
-    out2 = scheduler.schedule()
-    assert set(out2.num_scheduled_tokens.keys()) == {"medium", "short_wait"}
+    # `medium` (16 left) plus `long` (32-token cap) fill the 48-token budget;
+    # holding `long` alone leaves 32 for `short_wait`, so `medium` still runs.
+    scheduler.add_request(_make_real_request("short_wait", 16, hasher, seed=3))
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens == {"medium": 16, "short_wait": 16}
 
 
-def test_near_capacity_hold_never_exceeds_max_num_seqs(shared_model_config):
-    """Reviewer Test #1: Near-capacity (max_num_seqs=4, 3 running including a
-    long chunk, >=2 short waiting requests that fit the budget)."""
+def test_hold_never_exceeds_max_num_seqs(shared_model_config):
     scheduler, hasher = _build_real_scheduler(
         shared_model_config,
-        num_blocks=32,
         max_num_seqs=4,
         max_num_batched_tokens=64,
         long_prefill_token_threshold=16,
     )
-    req_dec_1 = _make_real_request("dec_1", 16, hasher, seed=1)
-    req_dec_2 = _make_real_request("dec_2", 16, hasher, seed=2)
-    req_long = _make_real_request("long", 64, hasher, seed=3)
-    for req in (req_dec_1, req_dec_2, req_long):
-        scheduler.add_request(req)
+    for request_id, num_tokens, seed in (("dec_1", 16, 1), ("dec_2", 16, 2)):
+        scheduler.add_request(_make_real_request(request_id, num_tokens, hasher, seed))
+    scheduler.add_request(_make_real_request("long", 64, hasher, seed=3))
+    assert set(scheduler.schedule().num_scheduled_tokens) == {"dec_1", "dec_2", "long"}
 
-    # Step 1: dec_1 (16), dec_2 (16), long (16 of 64) -> 3 running requests.
-    out1 = scheduler.schedule()
-    assert set(out1.num_scheduled_tokens.keys()) == {"dec_1", "dec_2", "long"}
-    assert len(scheduler.running) == 3
-
-    # Add 2 short waiting requests (16 tokens each) that both fit the 64-token
-    # step budget. Because 1 chunk (`long`) is held, active cap is lowered from
-    # 4 to 3 during super().schedule(), admitting only `short_1` so restored
-    # running length is 4 (never 5 > max_num_seqs).
-    req_short_1 = _make_real_request("short_1", 16, hasher, seed=4)
-    req_short_2 = _make_real_request("short_2", 16, hasher, seed=5)
-    scheduler.add_request(req_short_1)
-    scheduler.add_request(req_short_2)
-
-    scheduler.max_num_active_reqs = 4
-    out2 = scheduler.schedule()
-    assert "short_1" in out2.num_scheduled_tokens
-    assert "short_2" not in out2.num_scheduled_tokens
+    # Holding `long` lowers the admission cap to 3 for the step, so only one of
+    # two short requests is admitted and `long` restored makes 4, not 5.
+    scheduler.add_request(_make_real_request("short_1", 16, hasher, seed=4))
+    scheduler.add_request(_make_real_request("short_2", 16, hasher, seed=5))
+    out = scheduler.schedule()
+    assert "short_1" in out.num_scheduled_tokens
+    assert "short_2" not in out.num_scheduled_tokens
     assert len(scheduler.running) == 4
     assert scheduler.max_num_running_reqs == 4
     assert scheduler.max_num_active_reqs == 4
 
 
-def test_failed_hold_skips_until_waiting_head_changes_or_blocks_free(
-    shared_model_config,
-):
-    """Reviewer Test #2: When a held step fails to admit the waiting head, sets
-    _skip_hold_next_step and suppresses further holds on subsequent steps until
-    either free KV blocks increase or the waiting head changes."""
+def test_failed_hold_backs_off_exponentially_per_target(shared_model_config):
     scheduler, hasher = _build_real_scheduler(
         shared_model_config,
-        num_blocks=32,
         max_num_seqs=4,
         max_num_batched_tokens=16,
     )
-    req_long = _make_real_request("long", 96, hasher, seed=1)
-    scheduler.add_request(req_long)
+    _running_long_prefill(scheduler, hasher, num_tokens=160)
+    # Deliverable stale output in flight: upstream skips this request in its
+    # WAITING pass, so a hold for it admits nothing.
+    req_stuck = _make_real_request("stuck", 16, hasher, seed=2)
+    req_stuck.num_stale_output_tokens = 1
+    req_stuck.drop_stale_output = False
+    scheduler.add_request(req_stuck)
 
-    # Step 1: `long` runs first 16-token chunk (80 remaining).
-    scheduler.schedule()
-    assert req_long.num_computed_tokens == 16
+    scheduled = [set(scheduler.schedule().num_scheduled_tokens) for _ in range(5)]
+    # Failed hold, 1 step off, failed hold, 2 steps off.
+    assert scheduled == [set(), {"long"}, set(), {"long"}, {"long"}]
 
-    # Add `short_unadmittable` (16 tokens) with deliverable stale output in
-    # flight (`num_stale_output_tokens=1`, `drop_stale_output=False`) so
-    # upstream Scheduler.schedule() skips it during waiting admission.
-    req_unadmittable = _make_real_request("short_unadmittable", 16, hasher, seed=2)
-    req_unadmittable.num_stale_output_tokens = 1
-    req_unadmittable.drop_stale_output = False
-    scheduler.add_request(req_unadmittable)
-
-    # Step 2: `long` is held back, admission of `short_unadmittable` fails, and
-    # `_skip_hold_next_step` + `_blocked_hold_state` are armed.
-    out2 = scheduler.schedule()
-    assert out2.num_scheduled_tokens == {}
-    assert scheduler._skip_hold_next_step is True
-
-    # Step 3: `_skip_hold_next_step` lets `long` run (32 computed).
-    out3 = scheduler.schedule()
-    assert set(out3.num_scheduled_tokens.keys()) == {"long"}
-    assert req_long.num_computed_tokens == 32
-    assert scheduler._skip_hold_next_step is False
-
-    # Step 4: `short_unadmittable` is still at the head and free blocks have not
-    # increased -> `_blocked_hold_state` keeps suppressing hold so `long` does
-    # NOT lose every other step (48 computed).
-    out4 = scheduler.schedule()
-    assert set(out4.num_scheduled_tokens.keys()) == {"long"}
-    assert req_long.num_computed_tokens == 48
-
-    # Step 5: A new admissible request arrives and becomes the best candidate ->
-    # hold re-engages and admits `short_fresh` immediately.
-    req_unadmittable.num_stale_output_tokens = 0
-    req_fresh = _make_real_request("short_fresh", 16, hasher, seed=3)
-    scheduler.waiting.clear()
-    scheduler.add_request(req_fresh)
-    out5 = scheduler.schedule()
-    assert set(out5.num_scheduled_tokens.keys()) == {"short_fresh"}
+    req_stuck.num_stale_output_tokens = 0
+    assert set(scheduler.schedule().num_scheduled_tokens) == {"stuck"}
 
 
 @pytest.mark.parametrize(
     ("scheduler_cls", "expected_running", "expected_preempted"),
     [
-        # Plain PrefixAwareScheduler leaves running in [long, short, dec], so
-        # long takes the block and dec (at running[-1]) is preempted.
+        # Admission order leaves `dec` at running[-1], so it is preempted.
         (PrefixAwareScheduler, ["long", "short"], "dec"),
-        # SrptPrefillScheduler reorders running to [dec, short, long], so dec
-        # and short proceed and long (at running[-1]) is preempted.
+        # SRPT order puts `long` at running[-1], so it is preempted instead.
         (SrptPrefillScheduler, ["dec", "short"], "long"),
     ],
 )
-def test_real_scheduler_orders_running_and_preempts_longest_prefill(
+def test_kv_pressure_preempts_longest_prefill(
     shared_model_config,
     scheduler_cls,
     expected_running,
     expected_preempted,
 ):
-    """Compare PrefixAwareScheduler vs SrptPrefillScheduler under KV pressure
-    on a real Scheduler + KVCacheManager."""
     scheduler, hasher = _build_real_scheduler(
         shared_model_config,
         scheduler_cls=scheduler_cls,
@@ -470,249 +384,94 @@ def test_real_scheduler_orders_running_and_preempts_longest_prefill(
         max_num_batched_tokens=48,
         long_prefill_token_threshold=BLOCK_SIZE,
     )
+    reqs = {
+        "long": _make_real_request("long", 64, hasher, seed=1),
+        "short": _make_real_request("short", 32, hasher, seed=2),
+        "dec": _make_real_request("dec", 16, hasher, seed=3),
+    }
+    for req in reqs.values():
+        scheduler.add_request(req)
+    assert set(scheduler.schedule().num_scheduled_tokens) == set(reqs)
+    # An older long prefill ahead of newer requests, and no free KV blocks.
+    scheduler.running[:] = [reqs["long"], reqs["short"], reqs["dec"]]
+    pinned = _make_real_request("pinned", 16, hasher, seed=4)
+    scheduler.kv_cache_manager.allocate_slots(pinned, 16)
+    # A short waiting request must not trigger a hold under KV pressure.
+    scheduler.add_request(_make_real_request("short_wait", 16, hasher, seed=5))
 
-    req_long = _make_real_request("long", 64, hasher, seed=1)
-    req_short = _make_real_request("short", 32, hasher, seed=2)
-    req_dec = _make_real_request("dec", 16, hasher, seed=3)
-
-    scheduler.add_request(req_long)
-    scheduler.add_request(req_short)
-    scheduler.add_request(req_dec)
-
-    out1 = scheduler.schedule()
-    assert set(out1.num_scheduled_tokens.keys()) == {"dec", "short", "long"}
-    assert req_dec.is_prefill_chunk is False
-    assert req_short.is_prefill_chunk is True
-    assert req_long.is_prefill_chunk is True
-
-    # Place req_long at the front of self.running to simulate FCFS admission order
-    # where an older long prefill sits ahead of newer decode / short prefill.
-    scheduler.running[:] = [req_long, req_short, req_dec]
-
-    # Pin the 1 remaining free block so 0 blocks are free entering Step 2.
-    extra_dummy = _make_real_request("pinned", 16, hasher, seed=4)
-    scheduler.kv_cache_manager.allocate_slots(extra_dummy, 16)
-
-    out2 = scheduler.schedule()
-
+    out = scheduler.schedule()
     assert [r.request_id for r in scheduler.running] == expected_running
-    assert expected_preempted not in out2.num_scheduled_tokens
-    reqs = {"long": req_long, "short": req_short, "dec": req_dec}
+    assert set(out.num_scheduled_tokens) == set(expected_running)
     assert reqs[expected_preempted].status == RequestStatus.PREEMPTED
 
 
-def test_preemption_while_waiting_request_present_does_not_hold_or_preempt_decode(
-    shared_model_config,
+@pytest.mark.parametrize(
+    ("scheduler_reserve_full_isl", "expected"), [(False, "wait_32"), (True, "long")]
+)
+def test_full_isl_reservation_checks_whole_prompt_before_holding(
+    shared_model_config, scheduler_reserve_full_isl, expected
 ):
-    """Reviewer Test #3: With the KV pool full and a short waiting request
-    present, SrptPrefillScheduler must NOT hold `long` (which would leave `dec`
-    or `short` at `self.running[-1]` to be preempted while `long` keeps its KV
-    blocks). Instead, `long` stays at `self.running[-1]` and is preempted."""
     scheduler, hasher = _build_real_scheduler(
         shared_model_config,
-        num_blocks=6,
-        max_num_batched_tokens=48,
-        long_prefill_token_threshold=BLOCK_SIZE,
+        num_blocks=16,
+        max_num_batched_tokens=16,
+        scheduler_reserve_full_isl=scheduler_reserve_full_isl,
     )
-    req_long = _make_real_request("long", 64, hasher, seed=1)
-    req_short = _make_real_request("short", 32, hasher, seed=2)
-    req_dec = _make_real_request("dec", 16, hasher, seed=3)
+    _running_long_prefill(scheduler, hasher)
+    # `long` (48 tokens left) reserves 3 more blocks; leave 4 free: room for one
+    # 16-token chunk of `wait_32` (1 block) but not its whole prompt (2 blocks).
+    pool = scheduler.kv_cache_manager.block_pool
+    pin_tokens = (pool.get_num_free_blocks() - 4) * BLOCK_SIZE
+    pinned = _make_real_request("pinned", pin_tokens, hasher, seed=6)
+    scheduler.kv_cache_manager.allocate_slots(pinned, pin_tokens)
+    assert pool.get_num_free_blocks() == 4
+    scheduler.add_request(_make_real_request("wait_32", 32, hasher, seed=7))
 
-    for req in (req_long, req_short, req_dec):
-        scheduler.add_request(req)
-
-    scheduler.schedule()
-    scheduler.running[:] = [req_long, req_short, req_dec]
-
-    # Exhaust the last free block AND add a short waiting request that would
-    # normally trigger hold-back if KV blocks were available.
-    extra_dummy = _make_real_request("pinned", 16, hasher, seed=4)
-    scheduler.kv_cache_manager.allocate_slots(extra_dummy, 16)
-    req_wait = _make_real_request("short_wait", 16, hasher, seed=5)
-    scheduler.add_request(req_wait)
-
-    guard_results: list[bool] = []
-    orig_guard = scheduler._has_kv_blocks_for_hold
-
-    def _spy_guard(*args, **kwargs):
-        res = orig_guard(*args, **kwargs)
-        guard_results.append(res)
-        return res
-
-    scheduler._has_kv_blocks_for_hold = _spy_guard
-    assert scheduler._chunks_to_hold() == []
-    assert guard_results == [False]
-    out2 = scheduler.schedule()
-    assert guard_results == [False, False]
-
-    # `dec` and `short` are scheduled; `long` (at running[-1]) is preempted.
-    assert [r.request_id for r in scheduler.running] == ["dec", "short"]
-    assert set(out2.num_scheduled_tokens.keys()) == {"dec", "short"}
-    assert req_long.status == RequestStatus.PREEMPTED
-    assert req_dec.status == RequestStatus.RUNNING
+    assert set(scheduler.schedule().num_scheduled_tokens) == {expected}
 
 
-def test_spec_decode_draft_slots_and_full_isl_and_backoff(shared_model_config):
-    """Reviewer §3.1, §3.3, §3.4:
-    1. `draft_slots` is subtracted per scheduled request (both decode and prefill).
-    2. `scheduler_reserve_full_isl=True` checks the waiting request's full prompt
-       length against free blocks, not only its first step chunk.
-    3. Exponential backoff suppresses repeated holds even if free blocks grow.
-    """
-    from types import SimpleNamespace
-
+def test_hold_with_speculative_decoding_draft_slots(shared_model_config):
     scheduler, hasher = _build_real_scheduler(
         shared_model_config,
-        num_blocks=32,
-        max_num_seqs=8,
-        max_num_batched_tokens=64,
+        max_num_batched_tokens=40,
+        num_draft_tokens=2,
     )
-    # 1. Configure draft_slots = 6 (like DSpark K=6).
-    scheduler.vllm_config.speculative_config = SimpleNamespace(
-        max_num_new_slots_for_drafting=6
-    )
+    _running_long_prefill(scheduler, hasher, num_tokens=96)
+    scheduler.add_request(_make_real_request("short_wait", 16, hasher, seed=2))
 
-    req_dec_1 = _make_real_request("dec_1", 16, hasher, seed=1)
-    req_dec_2 = _make_real_request("dec_2", 16, hasher, seed=2)
-    req_med = _make_real_request("med", 48, hasher, seed=3)
-    req_long = _make_real_request("long", 96, hasher, seed=4)
-    for req in (req_dec_1, req_dec_2, req_med, req_long):
-        scheduler.add_request(req)
-
-    # Step 1: admit dec_1 (16+6=22), dec_2 (16+6=22), med (14+6=20 -> 34 rem).
-    # `long` stays in waiting; give it 16 computed tokens manually and place in running
-    # so we have 2 decodes (1 tok each) + `med` (32 rem) + `long` (80 rem).
-    scheduler.schedule()
-    scheduler.waiting.clear()
-    req_med.num_computed_tokens = 20
-    req_med.is_prefill_chunk = True
-    req_long.num_computed_tokens = 16
-    req_long.is_prefill_chunk = True
-    req_long.status = RequestStatus.RUNNING
-    scheduler.running[:] = [req_dec_1, req_dec_2, req_med, req_long]
-    scheduler.requests["long"] = req_long
-
-    # With input_budget=64 and draft_slots=6:
-    # - 2 decodes consume (1 + 6) * 2 = 14 input_budget -> 50 left.
-    # - `med` wants 48 - 20 = 28 tokens, consuming 28 + 6 = 34 input_budget -> 16 left.
-    # - `short_wait` (16 tokens) needs 16 + 6 = 22 input_budget!
-    # If draft_slots were only subtracted once, 64 - 6 - 2 - 28 = 28 >= 16 would
-    # falsely claim `med` leaves enough room. With per-request draft_slots, only
-    # 16 - 6 = 10 tokens remain after `med`, so BOTH `long` and `med` must be held.
-    req_short_wait = _make_real_request("short_wait", 16, hasher, seed=5)
-    scheduler.add_request(req_short_wait)
-    held = scheduler._chunks_to_hold()
-    assert [r.request_id for r in held] == ["med", "long"]
-
-    # 2. Full-ISL fit check (`scheduler_reserve_full_isl=True`):
-    # Reset speculative config and set step budget = lptt = 16 so `req_long`
-    # alone consumes the 16-token step budget. Test a waiting request whose step
-    # chunk (lptt=16 -> 1 block) fits in free_blocks, but whose full prompt
-    # (48 tokens -> 3 blocks) does not fit.
-    scheduler.vllm_config.speculative_config = None
-    scheduler.scheduler_config.max_num_batched_tokens = 16
-    scheduler.scheduler_config.long_prefill_token_threshold = 16
-    scheduler.scheduler_reserve_full_isl = True
-    scheduler.waiting.clear()
-    scheduler.running[:] = [req_long]
-    scheduler._inflight_prefills.clear()
-
-    # Leave exactly 2 free blocks: enough for a 1-block step chunk, but < 3 blocks
-    # needed for `wait_48`'s full 48-token prompt.
-    free_now = scheduler._num_free_blocks()
-    if free_now > 2:
-        pin_toks = (free_now - 2) * BLOCK_SIZE
-        pin_req = _make_real_request("pin_isl", pin_toks, hasher, seed=6)
-        scheduler.kv_cache_manager.allocate_slots(pin_req, pin_toks)
-    assert scheduler._num_free_blocks() == 2
-
-    req_wait_48 = _make_real_request("wait_48", 48, hasher, seed=7)
-    scheduler.add_request(req_wait_48)
-    assert scheduler._chunks_to_hold() == []
-    scheduler.scheduler_reserve_full_isl = False
-    assert [r.request_id for r in scheduler._chunks_to_hold()] == ["long"]
-
-    # 3. Exponential backoff when a non-KV failure blocks `wait_48` across steps
-    # even as free blocks increase. Simulate two consecutive failed holds on
-    # `wait_48` (`failures=2` -> cooldown=2 steps):
-    scheduler._blocked_hold_failures["wait_48"] = 2
-    scheduler._blocked_hold_cooldown["wait_48"] = 2
-    scheduler._blocked_hold_target_id = "wait_48"
-    scheduler._blocked_hold_free_blocks = 1  # free_now=2 > 1, yet cooldown blocks!
-    assert scheduler._chunks_to_hold() == []
-    assert scheduler._blocked_hold_cooldown["wait_48"] == 1
-    assert scheduler._chunks_to_hold() == []
-    assert scheduler._blocked_hold_cooldown.get("wait_48", 0) == 0
-    assert [r.request_id for r in scheduler._chunks_to_hold()] == ["long"]
+    out = scheduler.schedule()
+    assert out.num_scheduled_tokens == {"short_wait": 16}
+    # Upstream charges each scheduled request its 2 drafting slots.
+    assert out.total_num_scheduled_tokens + 2 * len(out.num_scheduled_tokens) <= 40
 
 
-def test_starvation_bound_caps_consecutive_holds(shared_model_config):
-    """Reviewer Test #4: After MAX_CONSECUTIVE_HOLDS consecutive holds, the
-    long prefill chunk is guaranteed a step to advance."""
+def test_consecutive_holds_are_capped(shared_model_config):
     scheduler, hasher = _build_real_scheduler(
         shared_model_config,
-        num_blocks=32,
-        max_num_seqs=8,
         max_num_batched_tokens=16,
     )
-    scheduler.MAX_CONSECUTIVE_HOLDS = 2
+    scheduler.max_consecutive_holds = 2
+    req_long = _running_long_prefill(scheduler, hasher)
 
-    req_long = _make_real_request("long", 64, hasher, seed=1)
-    scheduler.add_request(req_long)
-
-    # Step 1: `long` runs its first 16-token chunk (48 remaining).
-    out1 = scheduler.schedule()
-    assert set(out1.num_scheduled_tokens.keys()) == {"long"}
-    assert req_long.num_computed_tokens == 16
-
-    # Step 2 (hold #1): `short_1` arrives and is admitted while `long` is held.
-    scheduler.add_request(_make_real_request("short_1", 16, hasher, seed=2))
-    out2 = scheduler.schedule()
-    assert "short_1" in out2.num_scheduled_tokens
-    assert "long" not in out2.num_scheduled_tokens
-    assert req_long.num_computed_tokens == 16
-
-    # Step 3 (hold #2): `short_2` arrives and is admitted while `long` is held.
-    scheduler.add_request(_make_real_request("short_2", 16, hasher, seed=3))
-    out3 = scheduler.schedule()
-    assert "short_2" in out3.num_scheduled_tokens
-    assert "long" not in out3.num_scheduled_tokens
-    assert req_long.num_computed_tokens == 16
-
-    # Step 4: `short_3` arrives, but `long` has reached MAX_CONSECUTIVE_HOLDS=2,
-    # so `long` is exempt from holding, runs its next chunk, and resets its
-    # consecutive-hold counter to 0.
+    for i in (1, 2):
+        scheduler.add_request(_make_real_request(f"short_{i}", 16, hasher, seed=i + 1))
+        out = scheduler.schedule()
+        # `long` is held; earlier shorts may decode alongside.
+        assert f"short_{i}" in out.num_scheduled_tokens
+        assert "long" not in out.num_scheduled_tokens
+    # Held twice in a row: `long` is not held again and runs its chunk.
     scheduler.add_request(_make_real_request("short_3", 16, hasher, seed=4))
-    out4 = scheduler.schedule()
-    assert "long" in out4.num_scheduled_tokens
+    out = scheduler.schedule()
+    assert "long" in out.num_scheduled_tokens
     assert req_long.num_computed_tokens > 16
-    assert scheduler._consecutive_holds.get("long", 0) == 0
-
-    # Step 5: With its hold counter reset, `long` can be held again for `short_3`.
-    out5 = scheduler.schedule()
-    assert "short_3" in out5.num_scheduled_tokens
 
 
-def test_env_var_and_pruning_and_adaptive_lptt(shared_model_config, monkeypatch):
-    """Verify:
-    1. `VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS` configures `MAX_CONSECUTIVE_HOLDS`.
-    2. `_prune_hold_tracking` cleans up `_blocked_hold_failures`,
-       `_blocked_hold_cooldown`, and `_blocked_hold_state` for aborted waiting.
-    3. `_effective_long_prefill_threshold` returns 0 when only 1 request is
-       eligible and applies the adaptive floor when enabled.
-    """
+def test_max_consecutive_holds_env_var_and_compile_cache(
+    shared_model_config, monkeypatch
+):
     monkeypatch.setenv("VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", "16")
-    scheduler, hasher = _build_real_scheduler(
-        shared_model_config,
-        num_blocks=32,
-        max_num_seqs=8,
-        max_num_batched_tokens=64,
-        long_prefill_token_threshold=16,
-    )
-    assert scheduler.MAX_CONSECUTIVE_HOLDS == 16
-
-    from vllm_torchtpu.compilation import tpu_compiler
-
+    scheduler, _ = _build_real_scheduler(shared_model_config)
+    assert scheduler.max_consecutive_holds == 16
     assert (
         "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
     )
@@ -720,35 +479,3 @@ def test_env_var_and_pruning_and_adaptive_lptt(shared_model_config, monkeypatch)
         "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS"
         not in tpu_compiler._tpu_compile_env_factors()
     )
-
-    # 2. Aborted waiting request state is pruned on the next step.
-    req_wait = _make_real_request("aborted_wait", 16, hasher, seed=1)
-    scheduler.add_request(req_wait)
-    scheduler._blocked_hold_failures["aborted_wait"] = 3
-    scheduler._blocked_hold_cooldown["aborted_wait"] = 4
-    scheduler._blocked_hold_state = ("aborted_wait", 10)
-    scheduler._prune_hold_tracking()
-    assert "aborted_wait" in scheduler._blocked_hold_failures
-
-    scheduler.waiting.clear()
-    scheduler._prune_hold_tracking()
-    assert "aborted_wait" not in scheduler._blocked_hold_failures
-    assert "aborted_wait" not in scheduler._blocked_hold_cooldown
-    assert scheduler._blocked_hold_state is None
-
-    # 3. Runtime-adjusted long_prefill_token_threshold:
-    # With only 1 eligible request, threshold becomes 0 (no cap).
-    req_1 = _make_real_request("r1", 48, hasher, seed=2)
-    scheduler.running[:] = [req_1]
-    assert scheduler._effective_long_prefill_threshold() == 0
-    assert scheduler._running_step_tokens(req_1) == 48
-
-    # With 2 eligible requests and adaptive_long_prefill_threshold=True:
-    # input_budget=64 // 2 = 32 > lptt=16 -> floor is 32.
-    req_2 = _make_real_request("r2", 16, hasher, seed=3)
-    scheduler.add_request(req_2)
-    scheduler.adaptive_long_prefill_threshold = False
-    assert scheduler._effective_long_prefill_threshold() == 16
-    scheduler.adaptive_long_prefill_threshold = True
-    assert scheduler._effective_long_prefill_threshold() == 32
-    assert scheduler._running_step_tokens(req_1) == 32
