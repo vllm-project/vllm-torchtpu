@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Opt-in TP1 CSA2 bridges, retaining stage-scoped gathered KV ownership."""
+"""TP1 CSA2 bridges, retaining stage-scoped gathered KV ownership."""
 
 import functools
 import math

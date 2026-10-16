@@ -14,6 +14,7 @@ from vllm.distributed import (
     tensor_model_parallel_all_gather,
 )
 from vllm.forward_context import get_forward_context
+from vllm.logger import init_logger
 from vllm.models.common.ops.sequence_parallel import sp_all_gather
 from vllm.models.deepseek_v41 import attention as upstream
 from vllm.models.deepseek_v41 import compressor as compressor_upstream
@@ -35,6 +36,8 @@ from .cache import ROW_BYTES, NativeCacheView, PagedCacheRows, write_cache
 from .candidate_cache import prepare_candidate_cache, select_candidate_cache
 from .ced import prefix_replay_enabled
 from .ops import device_hooks, rms_norm, rotary, round_fp8_activation
+
+logger = init_logger(__name__)
 
 _active_stage_attn_cache: dict[Any, Any] | None = None
 
@@ -517,20 +520,33 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         # FP8 main KV uses DSV4's packed record (448 e4m3 + 64 e8m0 bytes)
         # plus a BF16 RoPE companion; see cache.encode_fp8_kv.
         self._fp8_kv = self.kv_cache_torch_dtype == torch.float8_e4m3fn
-        self._csa2 = envs.TPU_DEEPSEEK_V41_ATTENTION == "csa2_paged" and bool(
-            self.compress_ratio
+        attention_mode = envs.TPU_DEEPSEEK_V41_ATTENTION
+        csa2_supported = (
+            get_tensor_model_parallel_world_size() == 1
+            and self._fp8_kv
+            and self.head_dim == 512
+            and self.window_size == 128
+            and self.n_local_heads == 64
         )
-        if self._csa2 and (
-            get_tensor_model_parallel_world_size() != 1
-            or not self._fp8_kv
-            or self.head_dim != 512
-            or self.window_size != 128
-            or self.n_local_heads != 64
+        if (
+            attention_mode == "csa2_paged"
+            and self.compress_ratio
+            and not csa2_supported
         ):
             raise ValueError(
-                "csa2_paged currently requires TP1, FP8 KV, H64/D512, window128"
+                "csa2_paged requires TP1, FP8 KV, H64/D512, window128; "
+                "use auto or native for other configurations"
             )
+        self._csa2 = (
+            attention_mode != "native" and bool(self.compress_ratio) and csa2_supported
+        )
         self.swa_cache_layer._tpu_swa_words = self._csa2
+        if self.compress_ratio:
+            logger.info_once(
+                "DeepSeek-V4.1 attention backend: %s (requested=%s)",
+                "csa2_paged" if self._csa2 else "native",
+                attention_mode,
+            )
 
         self.register_buffer(
             "_tpu_rope_cache", self.rotary_emb.cos_sin_cache, persistent=False

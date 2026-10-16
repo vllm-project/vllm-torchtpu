@@ -83,7 +83,12 @@ def native_cache_view(raw, shape, dtype, block_stride_bytes, offset_bytes):
 
 
 def materialize_upstream_kv_cache(
-    kv_cache_config, device, layout, *, word_rows=False
+    kv_cache_config,
+    device,
+    layout,
+    *,
+    word_rows=False,
+    csa2_layers: frozenset[str] = frozenset(),
 ) -> MaterializedNativeKVCache:
     """Keep upstream placements, with one TPU input per shared physical region."""
     from vllm_torchtpu.kv_cache_materializer import layer_to_pool_index
@@ -184,7 +189,12 @@ def materialize_upstream_kv_cache(
     fp8_layers = [name for name, view in views.items() if view.dtype == torch.uint8]
     rope_pools: dict[str, RawCachePool] = {}
     scale_pools: dict[str, RawCachePool] = {}
-    if fp8_layers and envs.TPU_DEEPSEEK_V41_ATTENTION == "csa2_paged":
+    # Follow the attention modules' resolved mode, not the global preference:
+    # auto must retain native RoPE companions for unsupported TP/shape configs.
+    csa2_layers = csa2_layers.intersection(views)
+    if csa2_layers and csa2_layers != frozenset(fp8_layers):
+        raise ValueError("Shared FP8 cache consumers must agree on the CSA2 layout")
+    if csa2_layers:
         assert word_rows
 
         def scale_owner(owner):
@@ -891,7 +901,7 @@ def encode_fp8_kv(latent: jax.Array) -> tuple[jax.Array, jax.Array]:
 
 
 def initialize_cache_ops():
-    if envs.TPU_DEEPSEEK_V41_ATTENTION == "csa2_paged":
+    if envs.TPU_DEEPSEEK_V41_ATTENTION != "native":
         from .csa2_adapter import initialize_csa2_ops
 
         initialize_csa2_ops()

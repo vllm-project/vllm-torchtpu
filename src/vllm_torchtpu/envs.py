@@ -10,7 +10,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CED: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_SPLIT: bool = False
     TPU_DEEPSEEK_V41_IMPL: str = "v1"
-    TPU_DEEPSEEK_V41_ATTENTION: str = "native"
+    TPU_DEEPSEEK_V41_ATTENTION: str = "auto"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_SP: bool = False
     TPU_DEEPSEEK_V41_LOCAL_Q: bool = False
@@ -365,9 +365,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # CED encoder as two graphs split at the last host-offloaded Engram layer:
     # that layer's host lookup, DP exchange and H2D upload overlap the head.
     "TPU_DEEPSEEK_V41_ENGRAM_SPLIT": env_bool("TPU_DEEPSEEK_V41_ENGRAM_SPLIT"),
-    # Experimental full-row FP8 + direct paged SWA; changes cache numerics.
+    # Default to full-row FP8 + paged SWA on supported v2 configurations.
+    # Use native to retain the original KV quantization (restart required).
     "TPU_DEEPSEEK_V41_ATTENTION": env_with_choices(
-        "TPU_DEEPSEEK_V41_ATTENTION", "native", ["native", "csa2_paged"]
+        "TPU_DEEPSEEK_V41_ATTENTION", "auto", ["auto", "native", "csa2_paged"]
     ),
     # Opt in to upstream V4.1 sequence parallelism (token-sharded mHC, norms,
     # Engram and MoE; reduce-scatter/all-gather around attention) at DP1.

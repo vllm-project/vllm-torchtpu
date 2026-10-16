@@ -1381,6 +1381,13 @@ class KVCacheManager:
                     self.runner.device,
                     self.runner.cache_config.get_resolved_kv_cache_layout(),
                     word_rows=True,
+                    csa2_layers=frozenset(
+                        name
+                        for name, module in (
+                            self.runner.vllm_config.compilation_config.static_forward_context.items()  # noqa: E501
+                        )
+                        if getattr(module, "_csa2", False) is True
+                    ),
                 )
                 native_rope_pools = materialized.rope_pools
                 native_scale_pools = materialized.scale_pools
