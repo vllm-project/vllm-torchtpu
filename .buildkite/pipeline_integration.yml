@@ -276,3 +276,16 @@ steps:
           queue: "tpu_v7x_2_queue"
         commands:
           - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_compilation_cache_e2e.sh"
+
+      - label: "Presubmit: parallel-compilation-and-mlir-invariance"
+        key: "presubmit_parallel_compilation_and_mlir_invariance"
+        if: "build.pull_request.id != null"
+        agents:
+          queue: "tpu_v7x_2_queue"
+        commands:
+          - >-
+            bash .buildkite/scripts/run_in_docker.sh
+            env TPU_PARALLEL_PRECOMPILE=1
+            pytest -v tests/compilation/test_parallel_compilation.py
+                      tests/compilation/test_rank_mlir_invariance.py
+                      tests/compilation/test_kernel_mlir_invariance.py
