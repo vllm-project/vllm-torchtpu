@@ -35,6 +35,19 @@ def _native_fp8(cfgs: configs.RpaConfigs) -> configs.NativeFp8:
         return cfgs.serve.native_fp8
 
 
+# The softmax weights are at most 1. The static PV path casts p * P_SCALE
+# to fp8, so the PV accumulator carries the factor, and the final division
+# by l (which sums the unscaled weights) removes it. A power of two keeps the
+# product exact in bf16 and below the e4m3 maximum.
+P_SCALE = 256.0
+
+
+def static_pv(cfgs: configs.RpaConfigs) -> bool:
+    """Whether PV takes fp8 weights at the static scale P_SCALE.
+
+    """
+
+
 # Weight of the low fp8 half in a split (hi + lo / _SPLIT_LO) quantization.
 _SPLIT_LO = 16.0
 
@@ -145,7 +158,10 @@ def flash_attention_qk_softmax(
     if folded_scale is not None and folded_scale != 1.0:
         q = q * jnp.asarray(folded_scale, dtype=q.dtype)
 
-    if native_qk:
+    if static_qk:
+        fp8_max = float(jnp.finfo(k.dtype).max)
+        q = jnp.clip(q, -fp8_max, fp8_max).astype(k.dtype)
+    elif native_qk:
         q, row_scale = _quantize_rows(q, k.dtype, split=split_qk)
     elif cfgs.serve.scale_q is not None:
         q = q / cfgs.serve.scale_q
@@ -283,7 +299,8 @@ def flash_attention_pv(
     pv_operand = _native_fp8(cfgs).pv
     native_pv = pv_operand is not configs.Fp8Operand.OFF
     split_pv = pv_operand is configs.Fp8Operand.SPLIT
-    if native_pv:
+        p = (p * jnp.asarray(P_SCALE, p.dtype)).astype(v.dtype)
+    elif native_pv:
         p, p_row_scale = _quantize_rows(p, v.dtype, split=split_pv)
     p_rows = 2 * tq if split_pv else tq
 
