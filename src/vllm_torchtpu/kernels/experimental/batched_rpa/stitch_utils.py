@@ -140,9 +140,9 @@ def _stitch_prefill_lane(
     valid_end = bkv_sz_cache + bkv_sz_new
     if local_k_end is not None:
         valid_end = jnp.minimum(valid_end, local_k_end.astype(jnp.int32))
-    cache_end = jnp.minimum(bkv_sz_cache, valid_end)
+    cached_valid_end = jnp.minimum(bkv_sz_cache, valid_end)
     merged_cache_u32 = jax.lax.select(
-        lane_idx < cache_end,
+        lane_idx < cached_valid_end,
         vmem_u32_reshaped[..., : cfgs.bkv_sz],
         jnp.where(lane_idx < valid_end, rolled_u32[..., : cfgs.bkv_sz], 0),
     )
@@ -225,7 +225,7 @@ def stitch_new_kv_lane(
             cache_end,
             new_tok_offset,
             bkv_sz_frm_new.astype(jnp.int32),
-            v_len,
+            cfgs.kv_vmem_lanes,
             cfgs=cfgs,
             local_k_end=local_k_end,
         )
