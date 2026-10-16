@@ -30,7 +30,9 @@ Create signed commits using `git commit -s`, which automatically appends the tra
 Signed-off-by: Your Name <your.email@example.com>
 ```
 
-> [!TIP] Automatic Sign-Off in IDEs
+> [!TIP]
+> **Automatic Sign-Off in IDEs**:
+>
 > * **VS Code**: Enable `Git: Always Sign Off` (`git.alwaysSignOff: true`) in your settings.
 > * **PyCharm**: In the Commit window, enable `Sign-off commit`.
 
@@ -58,8 +60,8 @@ gcloud auth login
 gcloud auth application-default login
 ```
 
-> [!TIP] Troubleshooting Stale Credentials
-> A common cause of authentication errors when using `keyring` with `uv` is an existing `~/.netrc` file containing stale credentials. Open `~/.netrc` and delete any expired block associated with `us-python.pkg.dev`.
+> [!TIP]
+> **Troubleshooting Stale Credentials**: A common cause of authentication errors when using `keyring` with `uv` is an existing `~/.netrc` file containing stale credentials. Open `~/.netrc` and delete any expired block associated with `us-python.pkg.dev`.
 
 ### 3. Clone and Install Dependencies
 

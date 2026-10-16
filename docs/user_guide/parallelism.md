@@ -2,12 +2,12 @@
 
 `vllm-torchtpu` supports **6D composable parallelism** across single-host and multi-host Cloud TPU slices:
 
-1. **Tensor Parallelism (TP)**: `--tensor-parallel-size`
-2. **Data Parallelism (DP)**: `--data-parallel-size`
-3. **Pipeline Parallelism (PP)**: `--pipeline-parallel-size`
-4. **Expert Parallelism (EP)**: `--enable-expert-parallel`
-5. **Prefill Context Parallelism (PCP)**: `--prefill-context-parallel-size`
-6. **Decode Context Parallelism (DCP)**: `--decode-context-parallel-size`
+- **Tensor Parallelism (TP)**: `--tensor-parallel-size`
+- **Data Parallelism (DP)**: `--data-parallel-size`
+- **Pipeline Parallelism (PP)**: `--pipeline-parallel-size`
+- **Expert Parallelism (EP)**: `--enable-expert-parallel`
+- **Prefill Context Parallelism (PCP)**: `--prefill-context-parallel-size`
+- **Decode Context Parallelism (DCP)**: `--decode-context-parallel-size`
 
 ---
 

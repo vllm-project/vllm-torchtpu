@@ -39,7 +39,7 @@ Click a family to see its architecture-specific TPU support.
 
 </div>
 
-See the [TPU v7x](../deployment/v7x_recipes.md) and [TPU v6e](../deployment/v6e_recipes.md) serving recipes for the exact slice topologies, parallelism layouts, and `vllm serve` flags used for the CI checkpoints.
+See the [TPU v7x serving recipes](../deployment/v7x_recipes.md) for the exact slice topologies, parallelism layouts, and `vllm serve` flags used for the CI checkpoints. The [TPU v6e serving recipes](../deployment/v6e_recipes.md) are reference configurations that are not run in CI.
 
 ---
 

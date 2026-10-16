@@ -64,12 +64,12 @@ To add TPU patches or workarounds for a new model architecture or family:
 1. Implement the patch callback in `src/vllm_torchtpu/models/vllm/<model_name>_patch.py`
    (e.g., `maybe_patch_<model>`).
 2. Inside the callback:
-   - Accept `model_config: Optional["ModelConfig"] = None`.
-   - Inspect `model_config` to check if it matches the target model family.
-   - Return `False` if `model_config` is `None` or non-matching, allowing retry at
-     later lifecycle stages (e.g., `model_load`).
-   - If matched, apply the model-specific patches and return `None` (or any non-`False`
-     value) to mark the patch complete.
+    - Accept `model_config: Optional["ModelConfig"] = None`.
+    - Inspect `model_config` to check if it matches the target model family.
+    - Return `False` if `model_config` is `None` or non-matching, allowing retry at
+      later lifecycle stages (e.g., `model_load`).
+    - If matched, apply the model-specific patches and return `None` (or any non-`False`
+      value) to mark the patch complete.
 3. Append a new `Patch` entry under the `# Model-specific patches` section of `PATCHES`
    in `src/vllm_torchtpu/patch_registry.py`:
 

@@ -101,6 +101,7 @@ markdown_extensions:
   - attr_list
   - md_in_html
   - admonition
+  - github-callouts
   - pymdownx.details
   # For content tabs
   - pymdownx.superfences

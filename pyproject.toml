@@ -209,6 +209,12 @@ ignore = [
 [tool.ruff.format]
 docstring-code-format = true
 
+[tool.pymarkdown]
+# The docs site (Python-Markdown) only nests a list indented by 4 spaces. MD007
+# would rewrite nested lists to 2 spaces (or to the parent's text column under
+# a numbered item), which renders them flat.
+plugins.md007.enabled = false
+
 [tool.pyrefly]
 project-includes = ["src"]
 
