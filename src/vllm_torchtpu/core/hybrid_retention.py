@@ -242,9 +242,11 @@ class HybridStateRetention:
                     def _wrapped_cache_partial(
                         request: Any,
                         num_tokens: int,
+                        *args: Any,
                         _orig: Any = orig_cache_partial,
                         _mgr: Any = mgr,
                         _gid: int = gid,
+                        **kwargs: Any,
                     ) -> Any:
                         orig_prompt = int(
                             getattr(request, "num_prompt_tokens", 0) or 0
@@ -269,7 +271,7 @@ class HybridStateRetention:
                         ):
                             return None
                         try:
-                            res = _orig(request, num_tokens)
+                            res = _orig(request, num_tokens, *args, **kwargs)
                         finally:
                             if adjusted_prompt:
                                 request.num_prompt_tokens = orig_prompt
