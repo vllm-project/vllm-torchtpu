@@ -49,6 +49,8 @@ from vllm_torchtpu.core.packed_ids import pack_new_request_prompt_ids
 logger = init_logger("vllm." + __name__)
 
 _LOG_EVERY = 1000
+# Telemetry counts a step of at most this many Mamba blocks of tokens, taken
+_SMALL_STEP_BLOCKS = 2
 
 # Priority tiers: lower values admit earlier.
 _TIER_FREE_BLOCK_FIT = 0
@@ -58,6 +60,22 @@ _TIER_NORMAL = 2
 
 def _is_decoding(request: Request) -> bool:
     return request.num_computed_tokens >= request.num_prompt_tokens > 0
+
+
+def _wait_seconds(request: Request, now: float) -> float:
+    """Seconds since ``request.arrival_time``.
+
+    ``arrival_time`` is the wall-clock time (``time.time()``) at which this
+    engine's API server received the request; on a disaggregated prefill leg
+    that is the proxy's prefill hop. It covers time in the waiting queue and
+    time in ``running``, and does not reset on preemption.
+    """
+    arrival = getattr(request, "arrival_time", None)
+    if arrival is None:
+        return 0.0
+    return max(now - float(arrival), 0.0)
+
+
 def _hit_signature(result) -> tuple:
     """Comparable form of a find_longest_cache_hit result (block ids)."""
     blocks = result[0]
@@ -103,6 +121,19 @@ def trim_resend_token_ids(cached_reqs) -> int:
         all_ids[req_id] = trimmed
     return saved
 
+
+_WAITING_STATUS_NAMES = frozenset(("WAITING", "PREEMPTED"))
+
+
+def is_waiting_status(request: Request) -> bool:
+    """Returns whether ``request`` sits in the waiting queue (WAITING or PREEMPTED)."""
+    status = getattr(request, "status", None)
+    return getattr(status, "name", None) in _WAITING_STATUS_NAMES
+
+
+def format_counts(counts: dict[str, int]) -> str:
+    """Formats a reason -> count map as ``a:1,b:2`` for a telemetry field."""
+    return ",".join(f"{k}:{v}" for k, v in counts.items()) or "-"
 
 
 
@@ -257,6 +288,20 @@ class PrefixAwareScheduler(AsyncScheduler):
 
 
         """
+
+    def _now(self) -> float:
+        """Wall-clock time of the current schedule() call."""
+        now = getattr(self, "_step_wall_time", None)
+        return time.time() if now is None else now
+
+    def _note_waiting_stop(self, request: Request, reason: str) -> None:
+        """Records why the waiting loop stopped at ``request`` (first stop of
+        the step wins; running requests are ignored)."""
+        if getattr(self, "_step_wait_event", None) is None and is_waiting_status(
+            request
+        ):
+            self._step_wait_event = reason
+
     def _maybe_pack_prompt_ids(self, out) -> None:
         if getattr(self, "_pack_ids", None) is None:
         if not self._pack_ids:
@@ -311,9 +356,13 @@ class PrefixAwareScheduler(AsyncScheduler):
         # Decoders first: vLLM schedules ``running`` in list order and a
         # partial prefill takes min(remaining, budget), so a prefill ahead of
         # a decoder can leave it no tokens. Stably move every decoding request
+        now_wall = time.time()
+        self._step_wall_time = now_wall
         decoding = [r for r in self.running if _is_decoding(r)]
         prefilling = [r for r in self.running if not _is_decoding(r)]
             self.running[:] = decoding + prefilling
+        self._step_wait_event = None
+        waiting_at_start = len(getattr(self, "waiting", ()) or ())
         if getattr(self, "_memo_xstep", False):
             self._memo_trim_log()
         try:
@@ -321,6 +370,8 @@ class PrefixAwareScheduler(AsyncScheduler):
             out = super().schedule(*args, **kwargs)
             if getattr(out, "scheduled_new_reqs", None):
                 self._maybe_pack_prompt_ids(out)
+            stop = self._waiting_loop_stop_reason(out, waiting_at_start)
+            self._record_step_telemetry(out, waiting_at_start, stop)
             now = time.monotonic()
             if now - getattr(self, "_last_sched_log_t", 0.0) >= 60.0:
                 self._last_sched_log_t = now
@@ -332,6 +383,7 @@ class PrefixAwareScheduler(AsyncScheduler):
                     len(prefilling),
                     self._get_num_free_blocks(),
                     getattr(out, "total_num_scheduled_tokens", 0),
+                    self._admission_telemetry(stop),
                 )
                 if getattr(self, "_memo_xstep", False) or getattr(
                     self, "_memo_computes", 0
@@ -346,6 +398,79 @@ class PrefixAwareScheduler(AsyncScheduler):
                     )
             return out
         finally:
+            self._step_wall_time = None
+            self._step_wait_event = None
+
+    def _waiting_loop_stop_reason(self, out, waiting_at_start: int) -> str:
+        """Names what ended vLLM's waiting loop on this step.
+
+        """
+        event = getattr(self, "_step_wait_event", None)
+        if event is not None:
+            return event
+            return "idle"
+        if getattr(out, "preempted_req_ids", None):
+            return "preempted"
+            return "max_running"
+        budget = int(getattr(self, "max_num_scheduled_tokens", 8192) or 8192)
+        if getattr(out, "total_num_scheduled_tokens", 0) >= budget:
+            return "budget"
+            return "drained"
+        return "other"
+
+    def _record_step_telemetry(self, out, waiting_at_start: int, stop: str) -> None:
+        """Accumulates the per-minute step counters of the telemetry line.
+
+        A small step counts only when requests are still waiting after it, so
+        a step that admitted every waiting request with a short chunk is not
+        one.
+        """
+        tm = getattr(self, "_tm", None)
+        if tm is None:
+            tm = self._tm = {
+                "steps": 0,
+                "small_steps_waiting": 0,
+                "stops": {},
+            }
+        tm["steps"] += 1
+        if waiting_at_start > 0:
+            tokens = getattr(out, "total_num_scheduled_tokens", 0)
+            ):
+                tm["small_steps_waiting"] += 1
+            stops = tm["stops"]
+            stops[stop] = stops.get(stop, 0) + 1
+
+    def _admission_telemetry(self, stop: str) -> str:
+        """Formats the sampled step's admission state plus the per-minute step
+        counters, and resets the counters."""
+        tm = getattr(self, "_tm", None) or {}
+        reserved = "-"
+        fn = getattr(self, "_inflight_prefill_reserved_blocks", None)
+        if callable(fn) and hasattr(self, "_inflight_prefills"):
+            try:
+                reserved = str(fn())
+            except Exception:
+                reserved = "-"
+        pool_free = "-"
+        pool = getattr(getattr(self, "kv_cache_manager", None), "block_pool", None)
+        get_free = getattr(pool, "get_num_free_blocks", None)
+        if callable(get_free):
+            try:
+                pool_free = str(int(get_free()))
+            except Exception:
+                pool_free = "-"
+        stops = dict(sorted((tm.get("stops") or {}).items(), key=lambda kv: -kv[1]))
+        text = (
+            f"stop={stop} "
+            f"inflight_reserved={reserved} pool_free={pool_free} "
+            f"min_steps={tm.get('steps', 0)} "
+            f"min_small_steps_waiting={tm.get('small_steps_waiting', 0)} "
+            f"min_stops={format_counts(stops)}"
+        )
+        tm["steps"] = 0
+        tm["small_steps_waiting"] = 0
+        tm["stops"] = {}
+        return text
 
     def _mamba_block_aligned_split(
         self,
@@ -353,6 +478,14 @@ class PrefixAwareScheduler(AsyncScheduler):
         num_new_tokens: int,
         num_new_local_computed_tokens: int = 0,
         num_external_computed_tokens: int = 0,
+    ) -> int:
+            request,
+            num_new_tokens,
+            num_new_local_computed_tokens,
+            num_external_computed_tokens,
+        )
+        if aligned <= 0:
+        return aligned
 
     def _reserve_prefill_lookahead(
         self,
@@ -363,6 +496,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         reserved = super()._reserve_prefill_lookahead(
             request, num_computed_tokens, num_new_tokens
         )
+        if reserved <= 0:
         return reserved
 
     def _get_block_size(self) -> int:
@@ -554,7 +688,11 @@ class PrefixAwareScheduler(AsyncScheduler):
         self,
         request: Request,
         free_blocks_for_fit: int | None = None,
+        now: float | None = None,
     ) -> tuple[tuple[int, float, float], int]:
+        """Return (sort_key, warmth). Lower sort_key is admitted first.
+
+        """
         warmth = self._prefix_warmth(request)
         cold_tokens = float(request.num_tokens - warmth)
         tier = _TIER_PREEMPTED if request.num_preemptions > 0 else _TIER_NORMAL
@@ -569,6 +707,8 @@ class PrefixAwareScheduler(AsyncScheduler):
 
         window = list(islice(queue, self.WINDOW))
         head = window[0]
+        now = self._now()
+        head_scored = self._rank_and_warmth(head, now=now)
         head_local_warmth = self._prefix_warmth(head)
 
         free_blocks = (
@@ -586,6 +726,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         scored = [(head_scored, head)] + [
             (
                 self._rank_and_warmth(
+                    r, free_blocks_for_fit=free_blocks_for_fit, now=now
                 ),
                 r,
             )
