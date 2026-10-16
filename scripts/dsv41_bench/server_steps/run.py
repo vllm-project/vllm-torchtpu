@@ -165,7 +165,9 @@ def main() -> None:
     verify_rows = DECODE_SCENARIO.local_concurrency * (
         DECODE_SCENARIO.dspark_tokens + 1
     )
-    buckets = [verify_rows, DECODE_SCENARIO.chunk_tokens] if decode else [2048]
+    # DSpark shares the bucket ladder: retain a small proposal bucket even
+    # though the target's prefill scheduler budget remains 2048 tokens.
+    buckets = [verify_rows, DECODE_SCENARIO.chunk_tokens] if decode else [128, 2048]
     env.update(
         TP="1",
         DP="8",

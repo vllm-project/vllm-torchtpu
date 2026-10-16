@@ -25,6 +25,7 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     AsyncTPUCopyState,
     AsyncTPUModelRunnerOutput,
 )
+from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 
 
 def _recording_connector(events: list[str]) -> MagicMock:
@@ -123,6 +124,58 @@ def _host_copy(chunks, lengths, spec_logprobs=None):
         copy_ready_event=MagicMock(),
         spec_logprobs=spec_logprobs,
     )
+
+
+@pytest.mark.parametrize("is_async", [False, True])
+@pytest.mark.parametrize(
+    "partial_prefill,proposals_needed", [(False, True), (True, False), (True, True)]
+)
+def test_dflash_partial_prefill_saves_context_without_async_draft_bootstrap(
+    is_async, partial_prefill, proposals_needed
+):
+    events = []
+    propose = MagicMock(
+        side_effect=lambda **kwargs: events.append("draft")
+        or (torch.tensor([[8]]) if is_async else None)
+    )
+    runner = _fake_runner("mtp", is_async, False, propose)
+    drafter = DFlashProposer.__new__(DFlashProposer)
+    drafter.update_context = MagicMock(side_effect=lambda: events.append("context"))
+    runner.drafter = runner._async_drafter = drafter
+    runner._draft_proposals_needed = proposals_needed
+    runner.input_batch.generators = {}
+    runner._assemble_async_prefill_bootstrap = MagicMock(
+        return_value=([torch.tensor([7, 8])], {0: 0}, None, {"r0": 1})
+    )
+    if partial_prefill:
+        runner.requests["r0"].num_tokens = 10
+    connector = _recording_connector(events)
+    with (
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.has_kv_transfer_group", return_value=True
+        ),
+        patch(
+            "vllm_torchtpu.runner.tpu_runner.get_kv_transfer_group",
+            return_value=connector,
+        ),
+        patch.object(AsyncTPUCopyState, "from_device_chunks", side_effect=_host_copy),
+    ):
+        output = TPUModelRunner.sample_tokens(runner, None)
+    if is_async:
+        output = output.get_output()
+    assert output.sampled_token_ids == ([[]] if partial_prefill else [[7]])
+    assert events == [
+        "draft" if proposals_needed else "context",
+        "save",
+        "poll",
+        "clear",
+    ]
+    assert propose.call_count == int(proposals_needed)
+    assert runner._assemble_async_prefill_bootstrap.call_count == int(
+        is_async and proposals_needed
+    )
+    if is_async and partial_prefill:
+        assert runner._pre_async_results is None
 
 
 @pytest.mark.parametrize(

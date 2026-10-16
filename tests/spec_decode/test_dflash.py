@@ -123,7 +123,16 @@ def test_propose_empty_batch():
     assert proposer.propose([], [], None, None) == []
 
 
-def test_precompile_skips_sub_block_draft_forward():
+@pytest.mark.parametrize(
+    "buckets,max_reqs,kv_buckets,draft_buckets",
+    [
+        ([1, 8, 16, 512], 8, [1, 8, 16, 512], [8, 16, 512]),
+        ([128, 2048], 1, [128, 2048], [128]),
+    ],
+)
+def test_precompile_skips_sub_block_draft_forward(
+    buckets, max_reqs, kv_buckets, draft_buckets
+):
     proposer = _make_proposer(draft_tp=8, target_tp=8)
     proposer.speculative_config.num_speculative_tokens = 7
     proposer.draft_model = SimpleNamespace(
@@ -133,11 +142,11 @@ def test_precompile_skips_sub_block_draft_forward():
         )
     )
     proposer.runner = SimpleNamespace(
-        num_reqs_max_model_len=8,
+        num_reqs_max_model_len=max_reqs,
         num_reqs_most_model_len=None,
         most_model_len=None,
         max_num_blocks_per_req=4,
-        num_tokens_paddings=[1, 8, 16, 512],
+        num_tokens_paddings=buckets,
         _precompile_timed=mock.MagicMock(
             return_value=mock.MagicMock(
                 __enter__=mock.MagicMock(return_value=None),
@@ -153,13 +162,11 @@ def test_precompile_skips_sub_block_draft_forward():
     assert [
         call.kwargs["num_tokens"]
         for call in proposer._dummy_precompute_and_update_kv_cache.call_args_list
-    ] == [1, 8, 16, 512]
-    # 1 is skipped (sub-block); 512 stays: _get_padded_len rounds the
-    # 8-req * 8-token upper bound (64) up to the next runner bucket.
+    ] == kv_buckets
     assert [
         call.kwargs["num_tokens"]
         for call in proposer._dummy_draft_forward.call_args_list
-    ] == [8, 16, 512]
+    ] == draft_buckets
 
 
 @pytest.mark.parametrize("has_upstream_hook", [False, True])
@@ -525,7 +532,8 @@ def test_build_draft_layer_metadata_rejects_an_unresolved_layer():
     assert proposer._build_draft_layer_metadata(md) == (md["dummy_layer"],)
 
 
-def test_dp_lockstep_run_dummy_draft():
+@pytest.mark.parametrize("propose_tokens", [False, True])
+def test_dp_lockstep_run_dummy_draft(propose_tokens):
     proposer = _make_proposer(draft_tp=8, target_tp=8)
     proposer.draft_model = mock.MagicMock()
     proposer.runner = SimpleNamespace(
@@ -537,10 +545,43 @@ def test_dp_lockstep_run_dummy_draft():
     proposer._dp_dummy_kv_update = mock.MagicMock()
     proposer._dp_dummy_forward = mock.MagicMock()
 
-    proposer.run_dp_dummy_draft(num_chunks=2)
+    proposer.run_dp_dummy_draft(num_chunks=2, propose_tokens=propose_tokens)
 
     assert proposer._dp_dummy_kv_update.call_count == 2
-    assert proposer._dp_dummy_forward.call_count == 2
+    assert proposer._dp_dummy_forward.call_count == (2 if propose_tokens else 0)
+
+
+def test_context_only_prefill_updates_real_and_padding_chunks_without_proposals():
+    proposer = _make_proposer(draft_tp=8, target_tp=8)
+    proposer.runner = SimpleNamespace(
+        _dp_lockstep_enabled=lambda: True, _dp_step_num_chunks=3
+    )
+    proposer.draft_chunks = [SimpleNamespace(), SimpleNamespace()]
+    calls = []
+    proposer._update_draft_kv_cache_from_target = mock.Mock(
+        side_effect=lambda chunk: calls.append("context")
+    )
+    proposer._dp_dummy_kv_update = mock.Mock(
+        side_effect=lambda: calls.append("dummy-kv")
+    )
+    proposer._dflash_forward_and_sample = mock.Mock()
+    proposer._dp_dummy_forward = mock.Mock()
+
+    assert proposer.update_context() == 1
+    assert calls == ["context", "context", "dummy-kv"]
+    proposer._dflash_forward_and_sample.assert_not_called()
+    proposer._dp_dummy_forward.assert_not_called()
+
+
+@pytest.mark.parametrize("buckets,expected", [([2048], 2048), ([128, 2048], 128)])
+def test_single_request_draft_bucket_is_separate_from_prefill_token_budget(
+    buckets, expected
+):
+    proposer = _make_proposer(draft_tp=8, target_tp=8)
+    proposer.speculative_config.num_speculative_tokens = 5
+    proposer.runner = SimpleNamespace(_dp_step_max_reqs=1, num_tokens_paddings=buckets)
+    assert proposer.block_size == 6
+    assert proposer._dp_draft_bucket() == expected
 
 
 def test_prepare_dflash_inputs_dp_lockstep(device):

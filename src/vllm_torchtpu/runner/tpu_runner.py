@@ -741,6 +741,7 @@ class TPUModelRunner(GPUModelRunner):
         self._dp_target_bucket: int | None = None
         self._dp_step_num_chunks: int = 0
         self._dp_step_max_reqs: int = 0
+        self._draft_proposals_needed: bool = True
         self._dp_step_has_encoder_inputs = False
         self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
@@ -3449,14 +3450,27 @@ class TPUModelRunner(GPUModelRunner):
             num_chunks += 1
         return num_chunks, max_chunk_reqs
 
+    def _needs_draft_proposals(self, scheduler_output: "SchedulerOutput") -> bool:
+        """DFlash/DSpark candidates are useful only once a prompt is complete."""
+        if not isinstance(self.drafter, DFlashProposer):
+            return True
+        for req_id, count in scheduler_output.num_scheduled_tokens.items():
+            index = self.input_batch.req_id_to_index[req_id]
+            computed = int(self.input_batch.num_computed_tokens_cpu[index])
+            if computed + count >= int(self.input_batch.num_prompt_tokens[index]):
+                return True
+        return False
+
     def _dp_coordinated_step(
         self,
         local_num_tokens: int,
         local_num_chunks: int,
         local_num_reqs: int = 0,
         has_encoder_inputs: bool = False,
+        needs_draft_proposals: bool = True,
     ) -> "tuple[int | None, int]":
         """Return the DP-wide padded token bucket and forward chunk count."""
+        self._draft_proposals_needed = needs_draft_proposals
         if not self._dp_lockstep_enabled():
             return None, local_num_chunks
         from vllm.distributed.parallel_state import get_dp_group
@@ -3471,6 +3485,7 @@ class TPUModelRunner(GPUModelRunner):
                 int(local_num_chunks),
                 int(local_num_reqs),
                 int(has_encoder_inputs),
+                int(needs_draft_proposals),
             ],
             dtype=torch.int64,
             device="cpu",
@@ -3485,6 +3500,7 @@ class TPUModelRunner(GPUModelRunner):
         # second collective.
         self._dp_step_max_reqs = int(t[2].item())
         self._dp_step_has_encoder_inputs = bool(t[3].item())
+        self._draft_proposals_needed = bool(t[4].item())
         return bucket, int(t[1].item())
 
     def _execute_dp_mm_encoder(
@@ -3558,7 +3574,13 @@ class TPUModelRunner(GPUModelRunner):
         # use_eagle() covers every hidden-state drafter, dflash included.
         spec = self.speculative_config
         if num_chunks > 0 and spec is not None and spec.use_eagle():
-            self._async_drafter.run_dp_dummy_draft(num_chunks)
+            drafter = self._async_drafter
+            if isinstance(drafter, DFlashProposer):
+                drafter.run_dp_dummy_draft(
+                    num_chunks, propose_tokens=self._draft_proposals_needed
+                )
+            else:
+                drafter.run_dp_dummy_draft(num_chunks)
 
     def _dp_num_tokens_across_dp(self, num_tokens: int) -> torch.Tensor | None:
         if not self._dp_lockstep_enabled():
@@ -3623,6 +3645,7 @@ class TPUModelRunner(GPUModelRunner):
             local_num_chunks,
             local_num_reqs=local_max_chunk_reqs,
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
+            needs_draft_proposals=self._needs_draft_proposals(scheduler_output),
         )
         self._dp_step_num_chunks = target_num_chunks
 
@@ -4612,8 +4635,17 @@ class TPUModelRunner(GPUModelRunner):
         # below.
         is_async = bool(self.scheduler_config.async_scheduling)
         eagle3_drafts = None
+        context_only_draft = (
+            self._is_async_drafter
+            and isinstance(self.drafter, DFlashProposer)
+            and not self._draft_proposals_needed
+        )
         if self._is_async_drafter and combined_selected_tokens:
-            if is_spec_step:
+            if context_only_draft:
+                assert isinstance(self.drafter, DFlashProposer)
+                with self._stage_timing.stage("draft_context_update"):
+                    self.drafter.update_context()
+            elif is_spec_step:
                 with self._stage_timing.stage("draft_propose"):
                     eagle3_drafts = self.spec_decode_manager.propose_draft_token_ids(
                         sampled_token_ids=None,
@@ -4715,7 +4747,11 @@ class TPUModelRunner(GPUModelRunner):
                 ) = self._assemble_async_spec_substitution(
                     eagle3_drafts, next_tokens_per_chunk, state
                 )
-            elif self._is_async_drafter and next_tokens_tpu_chunks:
+            elif (
+                self._is_async_drafter
+                and next_tokens_tpu_chunks
+                and not context_only_draft
+            ):
                 # Prefill / pure-non-spec eagle3 bootstrap: the non-spec sampling
                 # branch parked a stride-1 source (sampled token only). Rebuild
                 # it as a stride-(1+K) [bonus, draft_1..K] source carrying real

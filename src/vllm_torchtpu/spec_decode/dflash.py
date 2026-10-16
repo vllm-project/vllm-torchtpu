@@ -476,6 +476,26 @@ class DFlashProposer:
             )
 
     @torch.no_grad()
+    def update_context(self) -> int:
+        """Update context KV and pair missing chunks without generating drafts.
+
+        Returns the number of padding chunks whose proposal forwards must be
+        paired if this step also generates candidates.
+        """
+        chunks = self.draft_chunks
+        if not chunks:
+            raise RuntimeError("DFlash context update called without captured chunks.")
+        extra_chunks = 0
+        if self._dp_lockstep_sharded():
+            extra_chunks = max(0, self.runner._dp_step_num_chunks - len(chunks))
+        # Every rank emits all context updates before any proposal forwards.
+        for chunk in chunks:
+            self._update_draft_kv_cache_from_target(chunk)
+        for _ in range(extra_chunks):
+            self._dp_dummy_kv_update()
+        return extra_chunks
+
+    @torch.no_grad()
     def propose(
         self,
         sampled_token_ids: list[list[int]] | None,
@@ -506,20 +526,7 @@ class DFlashProposer:
 
         block_size = self.block_size
 
-        # EP-DP lockstep: a rank whose step produced fewer chunks than the
-        # DP-group max must pad each draft phase to the group's chunk count —
-        # collectives pair across ranks by emission order, and propose emits
-        # ALL KV updates before ALL draft forwards, so the padding must
-        # follow the same phase structure (never interleave per chunk).
-        extra_chunks = 0
-        if self._dp_lockstep_sharded():
-            extra_chunks = max(0, runner._dp_step_num_chunks - len(chunks))
-
-        # 1. Hoist all KV cache updates across chunks to the top of propose
-        for chunk in chunks:
-            self._update_draft_kv_cache_from_target(chunk)
-        for _ in range(extra_chunks):
-            self._dp_dummy_kv_update()
+        extra_chunks = self.update_context()
 
         # 2. Process each chunk
         draft_logits_per_chunk = []
@@ -835,9 +842,14 @@ class DFlashProposer:
         return self._draft_has_moe_cache
 
     @torch.no_grad()
-    def run_dp_dummy_draft(self, num_chunks: int) -> None:
+    def run_dp_dummy_draft(
+        self, num_chunks: int, *, propose_tokens: bool = True
+    ) -> None:
         """Replay a busy rank's draft collectives on an idle/padding rank
-        for `num_chunks` padding chunks (EP-DP lockstep)."""
+        for `num_chunks` padding chunks (EP-DP lockstep).
+
+        Context-only prefill steps omit proposal forwards on every rank.
+        """
         if num_chunks <= 0 or self.draft_model is None:
             return
         if not self._dp_lockstep_sharded():
@@ -847,8 +859,9 @@ class DFlashProposer:
         # keeps that phase structure -- never interleaved per chunk.
         for _ in range(num_chunks):
             self._dp_dummy_kv_update()
-        for _ in range(num_chunks):
-            self._dp_dummy_forward()
+        if propose_tokens:
+            for _ in range(num_chunks):
+                self._dp_dummy_forward()
 
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _tpu_precompute_and_update_kv_cache(

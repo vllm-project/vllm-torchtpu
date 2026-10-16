@@ -8,8 +8,9 @@ The workload uses eight distinct 98304-token cached prefixes, 16384 new input
 tokens per request, and one greedy output token. Each DP engine admits one
 request with a 2048-token budget. The model uses CED, FP8 KV, CPU Engram offload
 and DSpark K5. KV is automatically sized with memory utilization 0.85, rather
-than capped at 4 GiB. The only compile bucket is `[2048]`; the tail also pads
-to 2048. The server uses the model's default context limit; it does not cap
+than capped at 4 GiB. Compile buckets are `[128,2048]`: DSpark's small query
+block selects 128, while target chunks larger than 128 still select 2048.
+The 2048-token scheduler budget is unchanged. The server uses the model's default context limit; it does not cap
 `max_model_len` to this benchmark's 114688-token input. The 96K prefix and 16K
 extension are client workload sizes.
 Automatic FP8 KV budgets round down to binary steps smaller than 1/32 of the
@@ -18,6 +19,13 @@ This stabilizes shapes within a bin; crossing a bin boundary still recompiles.
 
 This is a prefill benchmark; one-token output comparison does not qualify
 long-generation accuracy or steady decode performance.
+
+DFlash/DSpark context KV updates still run during intermediate prefill.
+Candidate generation is skipped only when no EP-DP peer has a request at
+the prompt boundary or in decode. Mixed steps retain proposal forwards on
+every participating rank to keep collectives paired. The final prefill
+step still generates the candidates needed to bootstrap async decode,
+including when the benchmark's one-token request will then finish.
 
 The shared serving launcher sets `--xla_tpu_dvfs_p_state=7` in
 `LIBTPU_INIT_ARGS`. Both DP8 Buildkite benchmarks run on every build of the

@@ -21,7 +21,7 @@ pytestmark = pytest.mark.cpu_test
 
 @pytest.mark.parametrize(
     "scenario,rounds,buckets",
-    [("encoder_extend", 5, [2048]), ("decode", 1, [288, 2048])],
+    [("encoder_extend", 5, [128, 2048]), ("decode", 1, [288, 2048])],
 )
 @pytest.mark.parametrize("profile", ["disabled", "passed", "failed"])
 @pytest.mark.parametrize("model_uri", [None, "gs://test-bucket/checkpoint"])
