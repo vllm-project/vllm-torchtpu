@@ -1400,6 +1400,13 @@ class KVCacheManager:
                         )
                         if getattr(module, "_csa2", False) is True
                     ),
+                    swa_word_layers=frozenset(
+                        name
+                        for name, module in (
+                            self.runner.vllm_config.compilation_config.static_forward_context.items()  # noqa: E501
+                        )
+                        if getattr(module, "_tpu_swa_words", False) is True
+                    ),
                 )
                 native_rope_pools = materialized.rope_pools
                 native_scale_pools = materialized.scale_pools

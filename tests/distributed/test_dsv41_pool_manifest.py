@@ -187,16 +187,29 @@ def test_csa2_records_and_scales_share_one_block_table():
     assert _live_byte_ranges(scale, 1, 13, 128) == [(256, 256 + 7 * 4)]
 
 
-def test_manifest_refuses_an_swa_cache_it_cannot_place():
+def _build_with(materialized_overrides):
     named, groups, raw, materialized = _materialization()
-    materialized.csa2_layers = frozenset({"model.layers.9.attn"})
-    with pytest.raises(rpm.ManifestError, match="cannot decide its page layout"):
-        rpm.build_dsv4_pool_manifest(
-            named_kv_caches=named,
-            kv_cache_groups=groups,
-            raw_tensors=raw,
-            dsv41_materialized_kv=materialized,
-        )
+    for key, value in materialized_overrides.items():
+        setattr(materialized, key, value)
+    return rpm.build_dsv4_pool_manifest(
+        named_kv_caches=named, kv_cache_groups=groups, raw_tensors=raw,
+        dsv41_materialized_kv=materialized)
+
+
+def test_consumer_layer_swa_keeps_token_rows():
+    """KV-sharing consumer layers have `_csa2=False`: their SWA cache is
+    written token-major even while the source layers write plane-major."""
+    manifest = _build_with({"csa2_layers": frozenset({"model.layers.9.attn"})})
+    swa = _pool(manifest, "dsv4.swa.g0")
+    assert swa.regions[0].unit_bytes == 1024 and swa.regions[0].num_units == 32
+
+
+def test_exact_swa_word_flag_wins_over_owner_heuristic():
+    planes = _build_with({"csa2_layers": frozenset(), "swa_word_layers": frozenset({SWA})})
+    assert {p.tag for p in planes.pools} >= {"dsv4.swa.p0.g0", "dsv4.swa.p1.g0"}
+    rows = _build_with({"csa2_layers": frozenset({ATTN}),
+                        "swa_word_layers": frozenset({"model.layers.9.attn.swa_cache"})})
+    assert _pool(rows, "dsv4.swa.g0").regions[0].unit_bytes == 1024
 
 
 def test_ring_groups_are_slot_groups_in_the_transfer_plan():

@@ -75,6 +75,11 @@ class MaterializedNativeKVCache:
     # written plane-major (`write_swa_word_pool`): a page of P tokens is
     # [plane 0: P rows][plane 1: P rows] of 512 bytes, not P rows of 1024.
     csa2_layers: frozenset[str] = frozenset()
+    # SWA cache layers whose module carries `_tpu_swa_words=True`: the exact
+    # per-layer flag `PagedCacheRows.write` branches on. Only the CSA2 owner
+    # layers (the KV-source layers) write plane-major; KV-sharing consumer
+    # layers write token-major 1024-byte rows.
+    swa_word_layers: frozenset[str] = frozenset()
 
 
 def native_cache_view(raw, shape, dtype, block_stride_bytes, offset_bytes):
@@ -202,6 +207,7 @@ def materialize_upstream_kv_cache(
     *,
     word_rows=False,
     csa2_layers: frozenset[str] = frozenset(),
+    swa_word_layers: frozenset[str] = frozenset(),
 ) -> MaterializedNativeKVCache:
     """Keep upstream placements, with one TPU input per shared physical region."""
     from vllm_torchtpu.kv_cache_materializer import layer_to_pool_index
@@ -391,6 +397,7 @@ def materialize_upstream_kv_cache(
         rope_pools=rope_pools,
         scale_pools=scale_pools,
         csa2_layers=frozenset(csa2_layers),
+        swa_word_layers=frozenset(swa_word_layers),
     )
 
 

@@ -1606,6 +1606,7 @@ def _build_dsv41_pool_manifest(
     rope_pools = getattr(materialized, "rope_pools", None) or {}
     scale_pools = getattr(materialized, "scale_pools", None) or {}
     csa2_layers = frozenset(getattr(materialized, "csa2_layers", None) or ())
+    swa_word_layers = frozenset(getattr(materialized, "swa_word_layers", None) or ())
     if not layouts:
         raise ManifestError("DSv4.1 materialized KV cache has no native_cache_layouts")
 
@@ -1616,19 +1617,23 @@ def _build_dsv41_pool_manifest(
         t (plane 0) and P + t (plane 1), 512 bytes each. The upstream view
         shape ([blocks, P, 1024 B]) describes the same bytes but not that
         order, so a row-prefix transfer against the view would ship plane 0
-        of 2n tokens and none of plane 1. The owning attention module
-        (`<owner>.swa_cache`) records the kernel mode as `_csa2`.
+        of 2n tokens and none of plane 1.
+
+        Only the CSA2 owner layers (the KV-source layers, `_csa2=True`) write
+        plane-major; the KV-sharing consumer layers have no compressor, keep
+        `_csa2=False`, and write token-major 1024-byte rows. The materialized
+        cache carries the exact per-layer `_tpu_swa_words` flag; the owner's
+        membership in `csa2_layers` is the fallback (`<owner>.swa_cache`).
         """
+        if layer_name in swa_word_layers:
+            return True
+        if swa_word_layers:
+            return False
         if not csa2_layers:
             return False
         owner = layer_name.rsplit(DSV41_SWA_CACHE_SUFFIX, 1)[0]
-        if owner in csa2_layers:
-            return True
-        if any(name == owner or owner.startswith(name + ".") for name in csa2_layers):
-            return True
-        raise ManifestError(
-            f"DSv4.1 SWA cache {layer_name} has no CSA2 owner among "
-            f"{sorted(csa2_layers)[:4]}...: cannot decide its page layout"
+        return owner in csa2_layers or any(
+            owner.startswith(name + ".") for name in csa2_layers
         )
 
     storages = _StorageTable()
