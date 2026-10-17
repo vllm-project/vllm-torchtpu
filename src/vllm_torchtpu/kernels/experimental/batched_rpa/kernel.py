@@ -483,17 +483,19 @@ def _zero_unattended_v_lanes(
 
     SEQ_ALONG_LANE counterpart of `_mask_unattended_v`, for scopes without a
     `local_k_start` (FULL and CACHE_ONLY), where every unattended token of a
-    lane lies in the suffix ``[hi, bkv_sz)``. Only that suffix is written: a
-    masked select of the 128-lane column holding ``hi`` and zero stores of the
-    columns after it, so a full KV block costs no vector work. The per-token
-    v_scale rows sit in the same V head rows and are zeroed with them.
+    lane lies in the suffix ``[hi, bkv_sz)``. The 128-lane column holding
+    ``hi`` is rewritten by `stitch_utils._stitch_decode_lane`, which zeroes
+    its lanes past the last valid token, so only the whole columns after it
+    are stored here, with zeros and without reading them. A full KV block
+    costs no vector work. The per-token v_scale rows sit in the same V head
+    rows and are zeroed with them.
 
     Zeroing in place (rather than selecting on the loaded V) is safe for the KV
     writeback: lanes past ``hi`` are past the sequence's end (or its
     rank-local end), which the decode stitch already zero-fills on writeback.
     It is also what makes the per-call zeroing of every KV VMEM buffer
     unnecessary: lanes the step did not fetch can hold anything, and they are
-    exactly the lanes zeroed here.
+    exactly the lanes the stitch and this function zero.
     """
     num_lanes = pltpu.get_tpu_info().num_lanes
     for b in range(cfgs.batch_size):
@@ -507,29 +509,23 @@ def _zero_unattended_v_lanes(
 
 
 def zero_v_lanes_from(flat: jax.Ref, hi: jax.Array, *, cfgs: configs.RpaConfigs):
-    """Zeroes lanes [hi, bkv_sz) of every V head in one lane's KV buffer.
+    """Zeroes every V head's whole lane columns past the one holding `hi`.
 
     `flat` is the lane's SEQ_ALONG_LANE buffer viewed as u32 [-1, num_lanes].
+    Lanes at or past `hi` in the column holding it are the stitch's to zero
+    (see `_zero_unattended_v_lanes`).
     """
     num_lanes = pltpu.get_tpu_info().num_lanes
     lanes_per_col = cfgs.kv_vmem_lanes // num_lanes
     n_cols = cfgs.bkv_sz // num_lanes
     pack_dim = cfgs.aligned_kv_head_dim // cfgs.serve.packing_kv
-    lane_idx = lax.broadcasted_iota(jnp.int32, (pack_dim, num_lanes), 1)
     zeros = jnp.zeros((pack_dim, num_lanes), jnp.uint32)
 
     hi = jnp.clip(hi, 0, cfgs.bkv_sz).astype(jnp.int32)
-    first_col = hi // num_lanes
-    rem = hi % num_lanes
-    first_full_col = jnp.where(rem != 0, first_col + 1, first_col)
+    first_full_col = pl.cdiv(hi, num_lanes)
 
     for kv_head in range(cfgs.model.num_kv_heads):
         base = (kv_head * 2 + 1) * pack_dim * lanes_per_col
-
-        @pl.when(rem != 0)
-        def _partial_col(base=base):
-            col = pl.ds(base + first_col, pack_dim, lanes_per_col)
-            flat[col] = jnp.where(lane_idx < rem, flat[col], 0)
 
         @pl.loop(first_full_col, n_cols)
         def _full_cols(c, base=base):
@@ -646,10 +642,12 @@ def rpa_body(
 
         start_kv_writeback()
 
-        # Inside the fence, so these stores land before the K/V loads below. The
-        # writeback issued above ends with the 128-lane column of the last valid
-        # token; the V lanes of that column it shares with this zeroing lie past
-        # the sequence end, where the decode stitch already wrote zeros.
+        # Inside the fence, so these stores land before the K/V loads below.
+        # With `no_hazard_no_deps` nothing orders them against the stitch
+        # stores above, so they must not touch a lane the stitch writes with
+        # anything but zero: they only store zeros into whole columns past the
+        # one holding the last valid token, which the stitch rewrites itself,
+        # and never read. The writeback issued above ends with that column.
         if (
             _zeroes_v_in_place(cfgs)
             and cfgs.block.bq_sz <= pltpu.get_tpu_info().num_lanes
