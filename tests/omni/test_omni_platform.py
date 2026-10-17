@@ -45,6 +45,7 @@ from vllm_torchtpu.omni.patches import (
     _SDPA_FALLBACK_PATCHED,
     _patch_diffusion_startup_warmup_sync,
     _patch_diffusion_worker_d2h_stream,
+    _patch_ltx2_vocoder_cpu_init,
     _patch_sdpa_fallback_dispatch,
     apply_omni_model_specific_patches,
     apply_omni_tpu_patches,
@@ -680,3 +681,38 @@ def test_d2h_stream_patch_targets_real_worker_proc():
     if result.returncode == 77:
         pytest.skip(f"vllm_omni is not importable: {result.stdout.strip()}")
     assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_ltx2_vocoder_cpu_init_patch(monkeypatch):
+    calls = []
+
+    def _load_component(
+        component_cls, model, subfolder, *, local_files_only, dtype, revision
+    ):
+        calls.append((subfolder, local_files_only, dtype, revision))
+        return torch.empty(0).device.type
+
+    # A real module: the MagicMock-backed ltx2 package reports every
+    # attribute as present, which would trip the idempotency guard.
+    ltx2_components = types.ModuleType("ltx2_components")
+    ltx2_components._load_component = _load_component
+    monkeypatch.setattr(
+        vllm_omni_mock.diffusion.models.ltx2, "ltx2_components", ltx2_components
+    )
+
+    apply_omni_model_specific_patches.cache_clear()
+    apply_omni_model_specific_patches()
+    assert ltx2_components._tpu_orig_load_component is _load_component
+    patched = ltx2_components._load_component
+
+    load_kwargs = {"local_files_only": True, "dtype": torch.float32, "revision": None}
+    with torch.device("meta"):
+        assert patched(object, "m", "vocoder", **load_kwargs) == "cpu"
+        assert patched(object, "m", "vae", **load_kwargs) == "meta"
+    assert calls == [
+        ("vocoder", True, torch.float32, None),
+        ("vae", True, torch.float32, None),
+    ]
+
+    _patch_ltx2_vocoder_cpu_init()
+    assert ltx2_components._load_component is patched
