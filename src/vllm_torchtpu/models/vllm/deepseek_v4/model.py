@@ -723,15 +723,23 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         )
 
         # Post-load weight surgery goes here.
-        # `fused_wkv_wgate` is built with `quant_config=None`, so it never
-        # reaches a TPU linear method and the canonical (k, n) flip does not
-        # apply; the compress-and-store kernel still wants
-        # [hidden_size, 2 * coff * head_dim], so transpose it once here.
+        self.process_weights_after_loading()
+
+        return loaded_params
+
+    def process_weights_after_loading(self) -> None:
+        """Post-load weight surgery for DeepSeek-V4.
+
+        `fused_wkv_wgate` is built with `quant_config=None`, so it never
+        reaches a TPU linear method and the canonical (k, n) flip does not
+        apply; the compress-and-store kernel still wants
+        [hidden_size, 2 * coff * head_dim], so transpose it once here.
+        This hook is called by vLLM's base loader during both normal and
+        dummy weight loading.
+        """
         for module in self.modules():
             if isinstance(module, VllmDeepseekCompressor):
                 module.transpose_wkv_wgate()
-
-        return loaded_params
 
     def get_expert_mapping(self) -> list[tuple[str, str, int, str]]:
         return self.model.get_expert_mapping()

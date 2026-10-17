@@ -316,3 +316,35 @@ def test_tagged_forward_captures_and_keeps_main_output(tiny_fc):
     # reuses its reconstruction: one post-op call per tag, none extra.
     torch.testing.assert_close(hidden, baseline)
     assert tiny_fc.model.mhc_post_op.calls == len(tags)
+
+
+def test_process_weights_after_loading_transposes_compressors_without_load_weights():
+    """Dummy model loading (--load-format dummy) skips load_weights() and only
+    runs base_loader.process_weights_after_loading(); every VllmDeepseekCompressor
+    must still have fused_wkv_wgate transposed."""
+    from vllm.model_executor.model_loader import base_loader
+
+    from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (  # noqa: E501
+        VllmDeepseekCompressor,
+    )
+
+    model = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
+    nn.Module.__init__(model)
+    model.model = nn.Module()
+
+    comp = VllmDeepseekCompressor.__new__(VllmDeepseekCompressor)
+    nn.Module.__init__(comp)
+    comp._wkv_wgate_transposed = False
+    comp.fused_wkv_wgate = nn.Linear(4, 8, bias=False)
+    orig_weight = comp.fused_wkv_wgate.weight.detach().clone()
+    model.model.add_module("kv_compressor", comp)
+
+    model_config = SimpleNamespace(
+        quantization=None,
+        dtype=torch.float32,
+        word_embeddings_untied_by_checkpoint=False,
+    )
+    base_loader.process_weights_after_loading(model, model_config, torch.device("cpu"))
+
+    assert comp._wkv_wgate_transposed
+    torch.testing.assert_close(comp.fused_wkv_wgate.weight, orig_weight.t())

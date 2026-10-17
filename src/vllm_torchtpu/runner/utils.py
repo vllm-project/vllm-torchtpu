@@ -4,13 +4,18 @@
 import datetime
 import json
 import os
+import types
 from enum import Enum
 from typing import Any
 
 import torch
 import torch.profiler
 from torch_tpu._internal.profiler import TpuProfilerConfig
-from vllm.model_executor.layers.rotary_embedding.base import RotaryEmbeddingBase
+from vllm.model_executor.layers.rotary_embedding.base import (
+    ApplyRotaryEmb,
+    RotaryEmbedding,
+    RotaryEmbeddingBase,
+)
 from vllm.v1.core.sched.output import SchedulerOutput as VllmSchedulerOutput
 
 from vllm_torchtpu import profiler_trace
@@ -453,6 +458,230 @@ def relayout_rope_caches(model: torch.nn.Module):
     if num_changed:
         _install_entry_layout_pin()
     logger.info("Row-major relayouted %d rope caches", num_changed)
+
+
+def _in_graph_rope_eligible(module: torch.nn.Module) -> bool:
+    """Whether `module`'s cos/sin values depend only on its `inv_freq`.
+
+    Holds for `RotaryEmbedding` and subclasses that override only
+    `_compute_inv_freq` (e.g. Llama3, NTK, Gemma4). Excludes M-RoPE (2-D
+    positions), variants whose cache scales positions or values (YaRN mscale,
+    linear and dynamic-NTK scaling), and variants with their own forward
+    (DeepSeek, Fourier). Those keep their `cos_sin_cache`.
+    """
+    cls = type(module)
+    return (
+        isinstance(module, RotaryEmbedding)
+        and cls.forward_native is RotaryEmbedding.forward_native
+        and cls._compute_cos_sin_cache is RotaryEmbeddingBase._compute_cos_sin_cache
+    )
+
+
+# TODO: Delete the cache comparison, the correction table, the correction limit
+# and the inv_freq candidates below together with the cached RoPE path. They only
+# keep the in-graph values bitwise equal to the cache; the remaining differences
+# are ordinary floating-point rounding.
+#
+# Limit on the positions whose computed cos/sin row may differ from the cache:
+# max(_IN_GRAPH_ROPE_MIN_CORRECTION_LIMIT, fraction * num_positions). Device
+# sin/cos rounding differs in well under 1% of rows, but a CPU-built cache can
+# also carry less accurate cos values in whole per-thread row blocks (observed
+# up to 1/8 of the rows). A cache that is not cos/sin(positions * inv_freq)
+# differs in nearly all rows. Corrections are applied with a
+# [num_tokens, num_corrections] comparison.
+_IN_GRAPH_ROPE_MAX_CORRECTION_FRACTION = 0.25
+_IN_GRAPH_ROPE_MIN_CORRECTION_LIMIT = 64
+# Positions per call when comparing computed cos/sin against the cache at load.
+_IN_GRAPH_ROPE_VERIFY_CHUNK = 32768
+
+
+def _in_graph_cos_sin(
+    positions: torch.Tensor,
+    inv_freq: tuple[float, ...],
+    cache_dtype: torch.dtype,
+    dtype: torch.dtype,
+) -> torch.Tensor:
+    """Returns `[cos | sin](positions * inv_freq)` rows in `dtype`.
+
+    Rounds through `cache_dtype` first, as the cached path stores the table in
+    `cache_dtype` and converts it to the query dtype on use.
+    """
+    # A Python-constant table traces as a graph constant, not an input.
+    inv = torch.tensor(inv_freq, dtype=torch.float32, device=positions.device)
+    freqs = torch.outer(positions.to(torch.float32), inv)
+    return torch.cat((freqs.cos(), freqs.sin()), dim=-1).to(cache_dtype).to(dtype)
+
+
+def _in_graph_rope_forward(
+    self: Any,
+    positions: torch.Tensor,
+    query: torch.Tensor,
+    key: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor | None]:
+    """`RotaryEmbedding.forward_native` computing cos/sin from positions."""
+    if query.dtype != self._in_graph_rope_dtype:
+        raise ValueError(
+            f"In-graph RoPE was prepared for {self._in_graph_rope_dtype} "
+            f"queries, got {query.dtype}"
+        )
+    positions = positions.flatten()
+    num_tokens = positions.shape[0]
+    cos_sin = _in_graph_cos_sin(
+        positions,
+        self._in_graph_rope_inv_freq,
+        self._in_graph_rope_cache_dtype,
+        self._in_graph_rope_dtype,
+    )
+    if self._in_graph_rope_fix_positions:
+        # Rows where device sin/cos rounds differently from the cache.
+        fix_positions = torch.tensor(
+            self._in_graph_rope_fix_positions,
+            dtype=positions.dtype,
+            device=positions.device,
+        )
+        fix_rows = torch.tensor(
+            self._in_graph_rope_fix_rows,
+            dtype=self._in_graph_rope_dtype,
+            device=positions.device,
+        )
+        match = positions[:, None] == fix_positions[None, :]
+        fixed = fix_rows[match.to(torch.int32).argmax(dim=-1)]
+        cos_sin = torch.where(match.any(dim=-1, keepdim=True), fixed, cos_sin)
+    cos, sin = cos_sin.chunk(2, dim=-1)
+
+    query_shape = query.shape
+    query = query.view(num_tokens, -1, self.head_size)
+    query_rot = ApplyRotaryEmb.forward_static(
+        query[..., : self.rotary_dim], cos, sin, self.is_neox_style
+    )
+    query = torch.cat((query_rot, query[..., self.rotary_dim :]), dim=-1).reshape(
+        query_shape
+    )
+    if key is not None:
+        key_shape = key.shape
+        key = key.view(num_tokens, -1, self.head_size)
+        key_rot = ApplyRotaryEmb.forward_static(
+            key[..., : self.rotary_dim], cos, sin, self.is_neox_style
+        )
+        key = torch.cat((key_rot, key[..., self.rotary_dim :]), dim=-1).reshape(
+            key_shape
+        )
+    return query, key
+
+
+def _in_graph_rope_mismatched_positions(
+    cache: torch.Tensor, inv_freq: tuple[float, ...], dtype: torch.dtype
+) -> list[int]:
+    """Positions whose `_in_graph_cos_sin` row differs bitwise from `cache`.
+
+    Both sides are compared after conversion to `dtype`, the dtype the forward
+    runs in. Runs `_in_graph_cos_sin` on the cache's device (compiled on TPU),
+    so the result reflects that device's sin/cos rounding.
+    """
+    table_fn = _in_graph_cos_sin
+    if cache.device.type == "tpu":
+        table_fn = torch.compile(_in_graph_cos_sin, backend="tpu", dynamic=False)
+    int_dtype = {2: torch.int16, 4: torch.int32}[
+        torch.empty((), dtype=dtype).element_size()
+    ]
+    num_positions = cache.shape[0]
+    chunk = min(num_positions, _IN_GRAPH_ROPE_VERIFY_CHUNK)
+    mismatched: list[int] = []
+    for start in range(0, num_positions, chunk):
+        # Fixed-size chunks (the last one clamped) keep a single compiled shape.
+        positions = torch.arange(start, start + chunk, device=cache.device).clamp_(
+            max=num_positions - 1
+        )
+        computed = table_fn(positions, inv_freq, cache.dtype, dtype)
+        expected = cache[positions].to(dtype)
+        differs = (
+            (computed.view(int_dtype) != expected.view(int_dtype)).any(dim=-1).cpu()
+        )
+        mismatched.extend(sorted(set(positions.cpu()[differs].tolist())))
+    return sorted(set(mismatched))
+
+
+def _in_graph_rope_inv_freq_candidates(
+    module: torch.nn.Module, device: torch.device
+) -> list[tuple[float, ...]]:
+    """`inv_freq` as computed on CPU and on `device`, without duplicates.
+
+    vLLM's model loader builds modules under the target device, so the cache
+    may come from a device `pow`, which can differ from CPU `pow` by an ulp.
+    """
+    candidates = [tuple(module._compute_inv_freq(module.base).float().tolist())]
+    if device.type != "cpu":
+        with torch.device(device):
+            on_device = module._compute_inv_freq(module.base).float().cpu()
+        candidates.append(tuple(on_device.tolist()))
+    return list(dict.fromkeys(candidates))
+
+
+def patch_in_graph_rotary_embedding(model: torch.nn.Module, dtype: torch.dtype) -> int:
+    """Computes RoPE cos/sin in-graph for the eligible rotary modules of `model`.
+
+    Each eligible module drops its `cos_sin_cache` buffers and gets an
+    instance-level forward that evaluates cos/sin of `positions * inv_freq` for
+    `dtype` queries. The result is bitwise equal to the cached path: at patch
+    time the computed rows are compared with the cache, both converted to
+    `dtype`, on the cache's device, and the few rows where that device's
+    sin/cos rounds differently are kept as a constant correction table. The
+    vLLM rotary classes and other models are not modified. Raises if too many
+    rows differ, i.e. the module's cache is not cos/sin(positions * inv_freq).
+
+    Returns the number of patched modules.
+    """
+    num_patched = 0
+    for name, module in model.named_modules():
+        if not _in_graph_rope_eligible(module):
+            continue
+        cache = module.cos_sin_cache.detach()
+        # Use whichever inv_freq the cache was built from.
+        inv_freq_values, fix_positions = min(
+            (
+                (
+                    candidate,
+                    _in_graph_rope_mismatched_positions(cache, candidate, dtype),
+                )
+                for candidate in _in_graph_rope_inv_freq_candidates(
+                    module, cache.device
+                )
+            ),
+            key=lambda pair: len(pair[1]),
+        )
+        limit = max(
+            _IN_GRAPH_ROPE_MIN_CORRECTION_LIMIT,
+            int(_IN_GRAPH_ROPE_MAX_CORRECTION_FRACTION * cache.shape[0]),
+        )
+        if len(fix_positions) > limit:
+            raise RuntimeError(
+                f"Rotary module {name!r} ({type(module).__name__}): "
+                f"{len(fix_positions)} of {cache.shape[0]} computed cos/sin rows "
+                f"differ from the cache (limit {limit}); refusing to compute it "
+                "in-graph"
+            )
+        fix_rows = cache[torch.tensor(fix_positions, dtype=torch.long)].to(dtype)
+        module._in_graph_rope_inv_freq = inv_freq_values
+        module._in_graph_rope_cache_dtype = cache.dtype
+        module._in_graph_rope_dtype = dtype
+        module._in_graph_rope_fix_positions = tuple(fix_positions)
+        module._in_graph_rope_fix_rows = tuple(
+            tuple(row) for row in fix_rows.to("cpu", torch.float32).tolist()
+        )
+        bound = types.MethodType(_in_graph_rope_forward, module)
+        module.forward_native = bound
+        module._forward_method = bound
+        for buf_name in ("cos_sin_cache", "cos_sin_cache_bf16"):
+            module._buffers.pop(buf_name, None)
+            module.__dict__.pop(buf_name, None)
+        logger.info(
+            "Computing RoPE in-graph for %s with %d corrected positions",
+            name,
+            len(fix_positions),
+        )
+        num_patched += 1
+    logger.info("Computing RoPE in-graph for %d rotary modules", num_patched)
+    return num_patched
 
 
 def relayout_hash_tables(model: torch.nn.Module):

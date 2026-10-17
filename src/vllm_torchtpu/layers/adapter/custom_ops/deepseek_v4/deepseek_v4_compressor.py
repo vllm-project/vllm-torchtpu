@@ -383,6 +383,9 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         if weight.device.type == "tpu":
             synchronize_tensors([weight])
 
+    def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
+        self.transpose_wkv_wgate()
+
     # head_dim == 512 with overlap: CSA, which splits NoPE and RoPE.
     # head_dim == 512 without:      HCA, whose state lives on a CSA array.
     # head_dim == 128:              lightning indexer, one array for both.

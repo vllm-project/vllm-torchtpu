@@ -58,6 +58,11 @@ os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "0"
 # turning this off loses nothing and is what lets a warm start reuse them.
 os.environ.setdefault("VLLM_USE_MEGA_AOT_ARTIFACT", "0")
 
+# When exporting StableHLO, run LLMEngine in-process by default so sys.exit(0)
+# terminates cleanly without parent-child IPC failure.
+if envs.VLLM_TORCHTPU_EXPORT_HLO_DIR:
+    os.environ.setdefault("VLLM_ENABLE_V1_MULTIPROCESSING", "0")
+
 # Size libtpu's premapped (DMA-mapped) host buffer pool when the Raiden KV
 # transfer stack is enabled. Raiden's XlaHostMemoryAllocator deliberately
 # skips per-allocation DMA mapping on multi-process v7x workers

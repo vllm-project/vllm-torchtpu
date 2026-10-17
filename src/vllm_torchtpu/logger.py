@@ -10,9 +10,14 @@ class _LazyVllmLogger:
 
     def _resolve(self):
         if self._logger is None:
-            from vllm.logger import init_logger as init_vllm_logger
+            try:
+                from vllm.logger import init_logger as init_vllm_logger
 
-            self._logger = init_vllm_logger(self._name)
+                self._logger = init_vllm_logger(self._name)
+            except ImportError:
+                import logging
+
+                self._logger = logging.getLogger(self._name)
         return self._logger
 
     def __getattr__(self, name: str) -> Any:

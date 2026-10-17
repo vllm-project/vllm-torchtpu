@@ -96,6 +96,7 @@ if TYPE_CHECKING:
     TPU_PP_LAZY_PUSH: bool = False
     TPU_ROPE_CACHE_TRUNCATE: bool = False
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
+    TPU_ROPE_IN_GRAPH: bool = True
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
@@ -179,6 +180,8 @@ if TYPE_CHECKING:
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
+    VLLM_TORCHTPU_EXPORT_HLO_DIR: bool | str = False
+    VLLM_TORCHTPU_LOAD_HLO_DIR: str = ""
 
 
 def env_with_choices(
@@ -387,6 +390,8 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "VLLM_TORCHTPU_EXPORT_HLO_DIR": env_str("VLLM_TORCHTPU_EXPORT_HLO_DIR", default=""),
+    "VLLM_TORCHTPU_LOAD_HLO_DIR": env_str("VLLM_TORCHTPU_LOAD_HLO_DIR", default=""),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # DCP sparse MLA (SparseCore cache layout): gather and attend this many
@@ -763,6 +768,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Materialize the rotary cos_sin caches with a row-major ({1,0}) device
     # layout at load, May cost more HBM due to padding.
     "TPU_ROPE_CACHE_ROW_MAJOR": env_bool("TPU_ROPE_CACHE_ROW_MAJOR", default=False),
+    # Compute rotary cos/sin in-graph from positions instead of gathering them
+    # from cos_sin_cache, for rotary modules whose cache depends only on
+    # inv_freq (plain, Llama3, NTK). Other variants keep their cache.
+    # TODO: Delete the cached path for these modules (this flag, and the
+    # cos_sin_cache handling of TPU_ROPE_CACHE_TRUNCATE and
+    # TPU_ROPE_CACHE_ROW_MAJOR for them) once in-graph RoPE has been stable as
+    # the default. Delete with it the load-time comparison against the cache,
+    # the correction table and the inv_freq candidates: they only keep the
+    # in-graph values bitwise equal to the cache, whose last-bit differences
+    # are ordinary floating-point rounding, not errors.
+    "TPU_ROPE_IN_GRAPH": env_bool("TPU_ROPE_IN_GRAPH", default=True),
     "TPU_MOE_HASH_TABLE_ROW_MAJOR": env_bool(
         "TPU_MOE_HASH_TABLE_ROW_MAJOR", default=False
     ),
@@ -1106,6 +1122,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # deterministic cap from the scheduler config, 0 disables the cap (all
     # post-profile HBM goes to KV), N > 0 caps KV at N tokens.
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS": env_int("VLLM_TPU_POOLING_KV_CACHE_TOKENS", -1),
+    "HF_HOME": lambda: os.environ.get("HF_HOME", ""),
 }
 
 

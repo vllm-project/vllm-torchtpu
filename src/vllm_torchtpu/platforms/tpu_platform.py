@@ -668,6 +668,12 @@ class TpuPlatform(Platform):
         patch_registry.apply(
             "platform_activation", model_config=vllm_config.model_config
         )
+        if envs.VLLM_TORCHTPU_EXPORT_HLO_DIR or envs.VLLM_TORCHTPU_LOAD_HLO_DIR:
+            from vllm_torchtpu.export.stablehlo_export import (
+                _install_warmup_early_exit_hook,
+            )
+
+            _install_warmup_early_exit_hook(vllm_config)
         _register_tpu_kv_connectors()
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:

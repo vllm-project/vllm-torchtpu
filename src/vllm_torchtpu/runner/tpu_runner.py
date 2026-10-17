@@ -5159,6 +5159,10 @@ class TPUModelRunner(GPUModelRunner):
             )
         validate_online_fp8(model, self.vllm_config.quant_config)
         self.model = model
+        with contextlib.suppress(Exception):
+            from vllm_torchtpu.export.stablehlo_export import register_active_model
+
+            register_active_model(self.model)
         if self.is_pooling_model:
             self._resolve_static_pooler()
         if self.parallel_config.pipeline_parallel_size > 1:
@@ -5170,6 +5174,13 @@ class TPUModelRunner(GPUModelRunner):
             if self._pp_topk_buffer is not None:
                 # -1 is "no token": a row of it attends to nothing.
                 self._pp_topk_buffer.fill_(-1)
+        # TODO: Make this unconditional and delete the cos_sin_cache path for the
+        # patched rotary modules once in-graph RoPE has been stable as the default,
+        # together with the cache comparison and correction table it uses.
+        if envs.TPU_ROPE_IN_GRAPH:
+            runner_utils.patch_in_graph_rotary_embedding(
+                self.model, self.model_config.dtype
+            )
         if envs.TPU_ROPE_CACHE_TRUNCATE:
             self._truncate_rope_caches()
         if envs.TPU_ROPE_CACHE_ROW_MAJOR:
@@ -6334,6 +6345,13 @@ class TPUModelRunner(GPUModelRunner):
         if not self._pp_is_last:
             # Only the last stage holds the lm_head and samples.
             return
+        if envs.VLLM_TORCHTPU_EXPORT_HLO_DIR:
+            from vllm_torchtpu.export.stablehlo_export import (
+                maybe_export_sampling_subgraphs,
+            )
+
+            maybe_export_sampling_subgraphs(self)
+            return
         self._precompile_compute_selected_logits()
         if _get_sequence_layout_planner_for_runner(
             self
@@ -6425,6 +6443,8 @@ class TPUModelRunner(GPUModelRunner):
                 self._precompile_backbone()
 
             self._precompile_sampling_subgraphs()
+            if envs.VLLM_TORCHTPU_EXPORT_HLO_DIR:
+                return
             self._precompile_pooler_subgraphs()
             self._precompile_mamba_rollback_helpers()
 
@@ -7384,7 +7404,7 @@ class TPUModelRunner(GPUModelRunner):
 
             # Sampling subgraphs (Phase A) — uses the restored cache_dir.
             # Pooling models compile their pooler grid here instead.
-            if not self.enforce_eager:
+            if not self.enforce_eager and not envs.VLLM_TORCHTPU_EXPORT_HLO_DIR:
                 with self.maybe_setup_dummy_loras(self.lora_config):
                     self._precompile_sampling_subgraphs()
                     self._precompile_pooler_subgraphs()
