@@ -1044,15 +1044,18 @@ def initialize_cache_ops():
         get_vllm_model_wrapper_context,
     )
 
+    def read_cache_values(
+        cache: jax.Array,
+        records: jax.Array,
+        elements: int,
+        fp32: bool = False,
+        halfplane: bool = False,
+    ) -> jax.Array:
+        return gather_cache_values(cache, records, elements, fp32, halfplane=halfplane)
+
     _read_values_op = pallas.jax_op(
         "pallas::dsv41v2_cache_read_values",
-        lambda cache,
-        records,
-        elements,
-        fp32=False,
-        halfplane=False: gather_cache_values(
-            cache, records, elements, fp32, halfplane=halfplane
-        ),
+        read_cache_values,
         mesh=get_vllm_model_wrapper_context().mesh,
         input_partition_specs=(P(), P(), None, None, None),
     )
@@ -1141,8 +1144,14 @@ def initialize_cache_ops():
     _write_values_after_op.register_fake(
         lambda cache, records, values, after: torch.empty_like(cache)
     )
+
+    def write_index_values_jax(
+        cache: jax.Array, records: jax.Array, values: jax.Array
+    ) -> jax.Array:
+        return cast(jax.Array, scatter_index_keys(cache, records, values))
+
     write_index_values = jax.shard_map(
-        scatter_index_keys,
+        write_index_values_jax,
         mesh=mesh,
         in_specs=(P(), P(), P()),
         out_specs=P(),
@@ -1159,7 +1168,9 @@ def initialize_cache_ops():
         lambda cache, records, values: torch.empty_like(cache)
     )
 
-    def write_index_after(cache, records, values, after):
+    def write_index_after(
+        cache: jax.Array, records: jax.Array, values: jax.Array, after: jax.Array
+    ) -> jax.Array:
         cache, _ = jax.lax.optimization_barrier((cache, after))
         return write_index_values(cache, records, values)
 
