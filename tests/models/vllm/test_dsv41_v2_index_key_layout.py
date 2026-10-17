@@ -262,3 +262,37 @@ def test_model_startup_registers_real_jax_ops_on_cpu(monkeypatch):
         attention_kernels.initialize_indexer()
         assert cache._read_values_op is read
         assert attention_kernels._indexer_op is indexer
+
+
+@pytest.mark.parametrize("after", [False, True])
+@pytest.mark.parametrize("two_banks", [False, True])
+def test_halfplane_writer_normalizes_long_slots_at_jax_boundary(
+    monkeypatch, after, two_banks
+):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import cache as cache_module
+
+    # Meta owners select the accelerator bridge without allocating a TPU.
+    # Real CPU metadata retains the model's int64 slot arithmetic.
+    raw = torch.empty((4, 128), dtype=torch.int32, device="meta")
+    banks = (raw, torch.empty_like(raw)) if two_banks else raw
+    view = cache_module.PagedCacheRows(
+        banks, ((4, 4, 128), torch.bfloat16, 1024, 0), index_key_layout="halfplane"
+    )
+    slots = torch.tensor([-1, 0, 1, 7, 8, 15], dtype=torch.int64)
+    keys = torch.ones((6, 128), dtype=torch.bfloat16)
+    dependency = torch.tensor(1.0) if after else None
+    observed = []
+
+    def check_boundary(owner, records, values, *dependencies):
+        assert records.dtype == torch.int32, "JAX writer requires int32 record IDs"
+        assert dependencies == (() if dependency is None else (dependency,))
+        observed.append(records.tolist())
+        return owner
+
+    monkeypatch.setattr(cache_module, "_write_index_values_op", check_boundary)
+    monkeypatch.setattr(cache_module, "_write_index_values_after_op", check_boundary)
+    view.write(slots, keys, after=dependency)
+    assert observed[0] == [-1, 0, 1, 7, -1, -1]
+    if two_banks:
+        assert observed[1] == [-1, -1, -1, -1, 0, 7]
+    assert len(observed) == (2 if two_banks else 1)

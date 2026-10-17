@@ -510,6 +510,7 @@ class PagedCacheRows:
                     bank[record // 2] = (bank[record // 2] & mask) | (bits[i] << shift)
                 return
             assert _write_index_values_op is not None
+            records = records.int()
             rec_lo = records.masked_fill(records >= self.bank_records, -1)
             if after is None:
                 self.raw.copy_(_write_index_values_op(self.raw, rec_lo, keys))
