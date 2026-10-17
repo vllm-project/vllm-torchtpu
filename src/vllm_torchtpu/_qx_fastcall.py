@@ -173,6 +173,9 @@ def _wrap(compiled: Any, fn: types.FunctionType) -> Any:
     qx_fast_compiled._torchdynamo_orig_callable = getattr(  # type: ignore[attr-defined]
         compiled, "_torchdynamo_orig_callable", fn
     )
+    # torch._dynamo.eval_frame.innermost_fn (used by torch._dynamo.disable)
+    # follows _torchdynamo_orig_callable only from the wrapper it names.
+    qx_fast_compiled._torchdynamo_wrapper_id = id(qx_fast_compiled)  # type: ignore[attr-defined]
     return qx_fast_compiled
 
 
