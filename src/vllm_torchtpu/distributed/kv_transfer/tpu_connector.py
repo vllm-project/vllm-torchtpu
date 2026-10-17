@@ -20,6 +20,7 @@ either via the dedicated ``TPUConnectorHMA`` connector class or via
 import dataclasses
 import importlib
 import json
+import os
 import queue
 import threading
 import time
@@ -4332,6 +4333,75 @@ class TPURaidenConnectorWorker:
             )
         return trimmed
 
+    @staticmethod
+    def _stage3_dsv4_debug_enabled() -> bool:
+        return os.environ.get("TPU_RAIDEN_DSV4_DEBUG_CHECKSUMS", "0") == "1"
+
+    def _stage3_dsv4_page_digests(self, req_meta: Any, num_tokens: int) -> dict[str, Any]:
+        """MD5 of every transferred page's live bytes and of its whole block.
+
+        Debug aid (TPU_RAIDEN_DSV4_DEBUG_CHECKSUMS=1): the producer logs this
+        at registration and the consumer at receive completion, so a byte-level
+        diff of the transfer needs only the two logs. Live spans follow
+        `lower_dsv4_row_spans` exactly; the whole-block digest also covers bytes
+        the manifest does not declare live, which exposes rows a kernel wrote
+        that the manifest never transferred.
+        """
+        import hashlib
+
+        from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
+            lower_dsv4_row_spans,
+        )
+
+        storages = list(self._raiden_manifest.storages)
+        flat_cache: dict[int, Any] = {}
+
+        def flat(storage_index: int):
+            if storage_index not in flat_cache:
+                flat_cache[storage_index] = storages[storage_index].reshape(-1)
+            return flat_cache[storage_index]
+
+        def digest(storage_index: int, byte_offset: int, nbytes: int) -> str:
+            view = flat(storage_index)
+            itemsize = int(view.element_size())
+            start, count = byte_offset // itemsize, nbytes // itemsize
+            chunk = view[start : start + count].cpu().numpy().tobytes()
+            return hashlib.md5(chunk).hexdigest()[:12]
+
+        group_blocks = self._stage3_dsv4_group_blocks(req_meta, num_tokens)
+        by_pool: dict[str, Any] = {}
+        pools_by_tag = {str(pool.tag): pool for pool in self._raiden_manifest.pools}
+        for plan_pool in self._stage3_dsv4_plan:
+            group = group_blocks[plan_pool.plan_position]
+            if not group.pages:
+                continue
+            registration = lower_dsv4_row_spans(
+                tag=plan_pool.tag,
+                num_tokens=group.num_tokens,
+                transfer_rank=0,
+                parallelism=1,
+                page_tokens=plan_pool.page_tokens,
+                live_bytes_per_block=plan_pool.live_bytes_per_block,
+                row_bytes=plan_pool.row_bytes,
+                block_ids=group.pages,
+            )
+            pool = pools_by_tag[plan_pool.tag]
+            entries = []
+            for span in registration.spans:
+                block = int(group.pages[span.src_block_ordinal])
+                base = int(pool.base_offset_bytes) + block * int(pool.block_stride_bytes)
+                entries.append(
+                    {
+                        "page": int(span.src_block_ordinal),
+                        "block": block,
+                        "live_bytes": int(span.size_bytes),
+                        "live": digest(pool.storage_index, base + int(span.src_offset_bytes), int(span.size_bytes)),
+                        "full": digest(pool.storage_index, base, int(pool.block_stride_bytes)),
+                    }
+                )
+            by_pool[plan_pool.tag] = entries
+        return by_pool
+
     def _register_stage3_request_blocks_dsv4(
         self, metadata: TPUConnectorMetadata
     ) -> None:
@@ -4374,6 +4444,21 @@ class TPURaidenConnectorWorker:
                     "Stage-3 producer send metadata requires a positive expiration_time"
                 )
             group_blocks = self._stage3_dsv4_group_blocks(req_meta, num_tokens)
+            if self._stage3_dsv4_debug_enabled() and req_id not in self._stage3_registered_sends:
+                logger.info(
+                    "%s",
+                    json.dumps(
+                        {
+                            "event": "dsv4_debug_digests",
+                            "role": "producer",
+                            "req_id": req_id,
+                            "uuid": uuid,
+                            "num_tokens": num_tokens,
+                            "digests": self._stage3_dsv4_page_digests(req_meta, num_tokens),
+                        },
+                        sort_keys=True,
+                    ),
+                )
             pool_spans = []
             for pool in self._stage3_dsv4_plan:
                 group = group_blocks[pool.plan_position]
@@ -5284,6 +5369,10 @@ class TPURaidenConnectorWorker:
                 group_blocks = self._stage3_dsv4_group_blocks(
                     req_meta, pending.num_tokens
                 )
+                if self._stage3_dsv4_debug_enabled():
+                    if not hasattr(self, "_stage3_dsv4_debug_loads"):
+                        self._stage3_dsv4_debug_loads = {}
+                    self._stage3_dsv4_debug_loads[req_id] = (req_meta, int(pending.num_tokens))
                 transfer_tags = []
                 dst_blocks = []
                 dst_counts = []
@@ -5803,6 +5892,10 @@ class TPURaidenConnectorWorker:
             # same destination pages.
             if _use_raiden_dsv4_admission():
                 group_blocks = self._stage3_dsv4_group_blocks(req_meta, num_tokens)
+                if self._stage3_dsv4_debug_enabled():
+                    if not hasattr(self, "_stage3_dsv4_debug_loads"):
+                        self._stage3_dsv4_debug_loads = {}
+                    self._stage3_dsv4_debug_loads[req_id] = (req_meta, int(num_tokens))
                 transfer_tags = []
                 dst_blocks = []
                 dst_counts = []
@@ -6226,6 +6319,24 @@ class TPURaidenConnectorWorker:
                                     "uuid": uuid,
                                     "num_tokens": num_tokens,
                                     "reshard_e2e_latency_ms": latency_ms,
+                                },
+                                sort_keys=True,
+                            ),
+                        )
+                    debug_load = getattr(self, "_stage3_dsv4_debug_loads", {}).pop(req_id, None)
+                    if debug_load is not None and uuid is not None:
+                        debug_meta, debug_tokens = debug_load
+                        logger.info(
+                            "%s",
+                            json.dumps(
+                                {
+                                    "event": "dsv4_debug_digests",
+                                    "role": "consumer",
+                                    "req_id": source_req_id,
+                                    "destination_req_id": req_id,
+                                    "uuid": uuid,
+                                    "num_tokens": debug_tokens,
+                                    "digests": self._stage3_dsv4_page_digests(debug_meta, debug_tokens),
                                 },
                                 sort_keys=True,
                             ),
