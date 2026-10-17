@@ -466,6 +466,31 @@ def test_consecutive_holds_are_capped(shared_model_config):
     assert req_long.num_computed_tokens > 16
 
 
+def test_progress_is_measured_in_kv_cache_blocks(shared_model_config):
+    scheduler, hasher = _build_real_scheduler(
+        shared_model_config,
+        max_num_batched_tokens=20,
+    )
+    scheduler.max_consecutive_holds = 2
+    # Hybrid models use the LCM of all KV group block sizes here, which can
+    # exceed a whole chunk; progress must not be measured against it.
+    scheduler.block_size = 64 * BLOCK_SIZE
+    req_long = _running_long_prefill(scheduler, hasher, num_tokens=96)
+
+    for i in (1, 2):
+        scheduler.add_request(_make_real_request(f"short_{i}", 16, hasher, seed=i + 1))
+        assert "long" not in scheduler.schedule().num_scheduled_tokens
+    # Stalled: runs a chunk of at least one KV cache block next to decodes.
+    scheduler.add_request(_make_real_request("short_3", 16, hasher, seed=4))
+    assert "long" in scheduler.schedule().num_scheduled_tokens
+    computed = req_long.num_computed_tokens
+    # Progress resets the count, so `long` can be held again.
+    scheduler.add_request(_make_real_request("short_4", 16, hasher, seed=5))
+    out = scheduler.schedule()
+    assert "long" not in out.num_scheduled_tokens
+    assert req_long.num_computed_tokens == computed
+
+
 def test_prefill_crowded_out_by_shorter_running_prefill_is_promoted(
     shared_model_config,
 ):

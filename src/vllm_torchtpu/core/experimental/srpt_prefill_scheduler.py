@@ -104,9 +104,13 @@ class SrptPrefillScheduler(AsyncScheduler):
             self.max_num_active_reqs += len(held)
             self.running.extend(held)
 
+        # One KV cache block of the main attention group; not self.block_size,
+        # which for hybrid models is the LCM of all group block sizes and can
+        # exceed a whole chunk.
+        progress_tokens = self.cache_config.block_size
         for r in prefilling:
             if (
-                output.num_scheduled_tokens.get(r.request_id, 0) >= self.block_size
+                output.num_scheduled_tokens.get(r.request_id, 0) >= progress_tokens
                 or not r.is_prefill_chunk
             ):
                 self._stalled_steps.pop(r.request_id, None)
