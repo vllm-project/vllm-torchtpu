@@ -5372,7 +5372,7 @@ class TPURaidenConnectorWorker:
                 if self._stage3_dsv4_debug_enabled():
                     if not hasattr(self, "_stage3_dsv4_debug_loads"):
                         self._stage3_dsv4_debug_loads = {}
-                    self._stage3_dsv4_debug_loads[req_id] = (req_meta, int(pending.num_tokens))
+                    self._stage3_dsv4_debug_loads[destination_req_id] = (req_meta, int(pending.num_tokens))
                 transfer_tags = []
                 dst_blocks = []
                 dst_counts = []
@@ -5895,7 +5895,7 @@ class TPURaidenConnectorWorker:
                 if self._stage3_dsv4_debug_enabled():
                     if not hasattr(self, "_stage3_dsv4_debug_loads"):
                         self._stage3_dsv4_debug_loads = {}
-                    self._stage3_dsv4_debug_loads[req_id] = (req_meta, int(num_tokens))
+                    self._stage3_dsv4_debug_loads[destination_req_id] = (req_meta, int(num_tokens))
                 transfer_tags = []
                 dst_blocks = []
                 dst_counts = []
