@@ -359,6 +359,17 @@ def calculate_block_sizes(
             # Pipeline buffers are allocated per batch item, whereas active
             # compute tiles are live for one batch item at a time.
             total_bytes = buffer_bytes * batch_size + compute_bytes
+            bq_c_sz = pick_bq_c_sz(batch_size, bq_sz, bkv_sz)
+            if bq_c_sz < bq_sz:
+                # Every q sub-chunk's QK and PV matmuls read the K and V tiles
+                # of all lanes, stacked, so Mosaic keeps them in register
+                # allocator spill slots across the sub-chunk loop, with one
+                # sub-chunk's f32 scores and its two softmax weight tiles.
+                stacked_kv_bytes = 2 * loaded_bkv_bytes
+                sub_chunk_bytes = (
+                    bq_c_sz * model_cfgs.num_q_heads * bkv_sz * (4 + 2 * out_bytes)
+                )
+                total_bytes += batch_size * (stacked_kv_bytes + sub_chunk_bytes)
         else:
             # Account for batch size.
             total_bytes = (buffer_bytes + compute_bytes) * batch_size
@@ -387,6 +398,39 @@ def calculate_block_sizes(
         num_muls = bq_c_sz * num_k * model_cfgs.num_q_heads
 
         return batch_size * num_muls
+
+    # Threshold value based on hardware generation and precision.
+    is_8bit = jnp.dtype(serve_cfgs.dtype_q).itemsize == 1 or (
+        kv_bytes == 1 and not serve_cfgs.return_lse
+    )
+
+    match tpu_info.generation:
+        case 8 if _is_sfs(tpu_info):
+            threshold = 800
+        case 7:
+            threshold = 1500
+        case _:
+            threshold = 1500
+
+    if is_8bit:
+        flops_ratio = round(tpu_info.fp8_ops_per_second / tpu_info.bf16_ops_per_second)
+        threshold *= flops_ratio
+
+    def pick_bq_c_sz(batch_size: int, bq_sz: int, bkv_sz: int) -> int:
+        """Picks the q sub-chunk size the compute threshold allows for a tile."""
+        num_bq_c = 1
+        last_valid_bq_c_sz = bq_c_sz = bq_sz
+        bq_c_rem = 0
+
+        while (
+            calculate_compute_buffer_time(batch_size, bq_c_sz, bkv_sz) > threshold
+            or bq_c_rem != 0
+        ) and num_bq_c < bq_sz:
+            if bq_c_rem == 0:
+                last_valid_bq_c_sz = bq_c_sz
+            num_bq_c += 1
+            bq_c_sz, bq_c_rem = divmod(bq_sz, num_bq_c)
+        return last_valid_bq_c_sz
 
     def find_best_block_sizes(
         max_batch_size: int, fixed_bq_sz: int | None = None
@@ -470,43 +514,9 @@ def calculate_block_sizes(
             bq_sz = min(bq_sz, max_useful_bq_sz)
 
         # Step 3: Given current tile size, calculate compute tile size.
-
-        # Threshold value based on hardware generation and precision.
-        tpu_info = pltpu.get_tpu_info()
-
-        is_8bit = jnp.dtype(serve_cfgs.dtype_q).itemsize == 1 or (
-            kv_bytes == 1 and not serve_cfgs.return_lse
-        )
-
-        match tpu_info.generation:
-            case 8 if _is_sfs(tpu_info):
-                threshold = 800
-            case 7:
-                threshold = 1500
-            case _:
-                threshold = 1500
-
-        if is_8bit:
-            flops_ratio = round(
-                tpu_info.fp8_ops_per_second / tpu_info.bf16_ops_per_second
-            )
-            threshold *= flops_ratio
-        num_bq_c = 1
-        last_valid_bq_c_sz = bq_c_sz = bq_sz
-        bq_c_rem = 0
-
-        while (
-            calculate_compute_buffer_time(batch_size, bq_c_sz, bkv_sz) > threshold
-            or bq_c_rem != 0
-        ) and num_bq_c < bq_sz:
-            if bq_c_rem == 0:
-                last_valid_bq_c_sz = bq_c_sz
-            num_bq_c += 1
-            bq_c_sz, bq_c_rem = divmod(bq_sz, num_bq_c)
-
         return configs.BlockSizes(
             bq_sz=bq_sz,
-            bq_c_sz=last_valid_bq_c_sz,
+            bq_c_sz=pick_bq_c_sz(batch_size, bq_sz, bkv_sz),
             bkv_sz=bkv_sz,
             batch_size=batch_size,
         )
