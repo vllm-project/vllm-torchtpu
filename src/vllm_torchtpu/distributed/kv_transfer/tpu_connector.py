@@ -56,7 +56,7 @@ from vllm.distributed.parallel_state import (
 )
 from vllm.utils.math_utils import round_down
 from vllm.v1.core.sched.output import SchedulerOutput
-from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
+from vllm.v1.kv_cache_interface import CircularBufferSpec, KVCacheConfig, MambaSpec
 from vllm.v1.request import RequestStatus
 
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
@@ -182,6 +182,28 @@ class _Stage3TransferGroup:
     cache_group_index: int
     page_tokens: int
     window_tokens: int | None = None
+    # A ring-buffer state group (`CircularBufferSpec`, DSv4.1's compressor
+    # state): one block per request for its whole life, slot = position %
+    # page_tokens. It is not paged by tokens, so it neither trims by window
+    # nor expects ceil(num_tokens / page_tokens) blocks; the one block always
+    # travels whole, like Mamba state.
+    slot: bool = False
+
+
+def _stage3_slot_block(block_ids: Sequence[int], *, group_label: str) -> list[int]:
+    """The single state block of a ring-buffer group, validated."""
+    ids = [int(block_id) for block_id in block_ids]
+    if not ids:
+        raise ValueError(
+            f"Stage-3 ring-buffer state group {group_label} has no block: "
+            "the allocator must hand each request exactly one state slot"
+        )
+    if ids[0] == _STAGE3_NULL_BLOCK_ID:
+        raise ValueError(
+            f"Stage-3 ring-buffer state group {group_label} points at the null "
+            f"block: ids={ids}"
+        )
+    return ids[:1]
 
 
 # vLLM reserves block 0 as the null block and points every freed sliding-window
@@ -303,7 +325,12 @@ def _stage3_transfer_groups(
         _Stage3TransferGroup(
             cache_group_index=index,
             page_tokens=int(group.kv_cache_spec.block_size),
-            window_tokens=_stage3_group_window_tokens(group.kv_cache_spec),
+            window_tokens=(
+                None
+                if isinstance(group.kv_cache_spec, CircularBufferSpec)
+                else _stage3_group_window_tokens(group.kv_cache_spec)
+            ),
+            slot=isinstance(group.kv_cache_spec, CircularBufferSpec),
         )
         for index, group in enumerate(kv_cache_groups)
         if not isinstance(group.kv_cache_spec, MambaSpec)
@@ -1803,6 +1830,17 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             group_block_ids = []
             for group in self._stage3_transfer_groups:
                 ids = list(grouped_block_ids[group.cache_group_index])
+                if group.slot:
+                    try:
+                        group_block_ids.append(
+                            _stage3_slot_block(
+                                ids, group_label=f"g{group.cache_group_index}"
+                            )
+                        )
+                    except ValueError as exc:
+                        self._fail_load(request, local_block_ids, str(exc))
+                        return
+                    continue
                 reason = _incomplete_pages(ids, group.page_tokens)
                 if reason is not None:
                     self._fail_load(request, local_block_ids, reason)
@@ -2146,6 +2184,21 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                 )
             normalized_group_block_ids = []
             for group, ids in zip(self._stage3_transfer_groups, group_block_ids):
+                if group.slot:
+                    try:
+                        slot_ids = _stage3_slot_block(
+                            ids, group_label=f"g{group.cache_group_index}"
+                        )
+                    except ValueError as exc:
+                        logger.error(
+                            "Stage-3 producer cannot publish req_id=%s: %s; "
+                            "skipping the transfer",
+                            request.request_id,
+                            exc,
+                        )
+                        return False, {}
+                    normalized_group_block_ids.append(slot_ids)
+                    continue
                 normalized = _normalize(ids, group.page_tokens)
                 if normalized is None:
                     return False, {}
@@ -2156,6 +2209,8 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             for group, ids in zip(
                 self._stage3_transfer_groups, normalized_group_block_ids
             ):
+                if group.slot:
+                    continue
                 dead = _stage3_recycled_transfer_pages(
                     ids,
                     num_tokens=num_tokens,
@@ -4251,6 +4306,16 @@ class TPURaidenConnectorWorker:
             )
         trimmed: list[_Stage3Dsv4GroupPages] = []
         for group, ids in zip(groups, group_block_ids):
+            if group.slot:
+                trimmed.append(
+                    _Stage3Dsv4GroupPages(
+                        pages=_stage3_slot_block(
+                            ids, group_label=f"g{group.cache_group_index}"
+                        ),
+                        num_tokens=int(group.page_tokens),
+                    )
+                )
+                continue
             pages = _stage3_trim_window_pages(
                 ids,
                 num_tokens=num_tokens,

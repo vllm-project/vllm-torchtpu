@@ -71,6 +71,10 @@ class MaterializedNativeKVCache:
     native_cache_layouts: dict[str, tuple] = field(default_factory=dict)
     rope_pools: dict[str, RawCachePool] = field(default_factory=dict)
     scale_pools: dict[str, RawCachePool] = field(default_factory=dict)
+    # Attention modules resolved to the CSA2 kernels. Their SWA companions are
+    # written plane-major (`write_swa_word_pool`): a page of P tokens is
+    # [plane 0: P rows][plane 1: P rows] of 512 bytes, not P rows of 1024.
+    csa2_layers: frozenset[str] = frozenset()
 
 
 def native_cache_view(raw, shape, dtype, block_stride_bytes, offset_bytes):
@@ -386,6 +390,7 @@ def materialize_upstream_kv_cache(
         native_cache_layouts=native_cache_layouts,
         rope_pools=rope_pools,
         scale_pools=scale_pools,
+        csa2_layers=frozenset(csa2_layers),
     )
 
 

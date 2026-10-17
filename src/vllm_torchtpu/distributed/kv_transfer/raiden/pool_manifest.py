@@ -1372,6 +1372,10 @@ def build_glm_mla_pool_manifest(
 # duplicated rather than imported because this module must stay deviceless.
 DSV4_STATE_CACHE_SUFFIX = ".compressor.state_cache"
 DSV4_INDEXER_CACHE_SUFFIX = ".indexer.k_cache"
+DSV41_SWA_CACHE_SUFFIX = ".swa_cache"
+# CSA2 plane-major SWA pages: one pool per plane, sharing the group's block
+# table exactly as `dsv4.csa.nope` and `dsv4.csa.rope.scale` do.
+TAG_DSV41_SWA_PLANES = ("dsv4.swa.p0", "dsv4.swa.p1")
 DSV4_CSA_COMPRESS_RATIO = 4
 
 _DSV4_STATE_TAG_BY_KV_TAG = {
@@ -1601,8 +1605,31 @@ def _build_dsv41_pool_manifest(
     raw_by_layer = getattr(materialized, "native_raw_cache", None) or {}
     rope_pools = getattr(materialized, "rope_pools", None) or {}
     scale_pools = getattr(materialized, "scale_pools", None) or {}
+    csa2_layers = frozenset(getattr(materialized, "csa2_layers", None) or ())
     if not layouts:
         raise ManifestError("DSv4.1 materialized KV cache has no native_cache_layouts")
+
+    def _swa_plane_major(layer_name: str) -> bool:
+        """Whether this SWA cache is written by the CSA2 plane-major kernel.
+
+        `write_swa_word_pool` stores token t of a P-token page at word rows
+        t (plane 0) and P + t (plane 1), 512 bytes each. The upstream view
+        shape ([blocks, P, 1024 B]) describes the same bytes but not that
+        order, so a row-prefix transfer against the view would ship plane 0
+        of 2n tokens and none of plane 1. The owning attention module
+        (`<owner>.swa_cache`) records the kernel mode as `_csa2`.
+        """
+        if not csa2_layers:
+            return False
+        owner = layer_name.rsplit(DSV41_SWA_CACHE_SUFFIX, 1)[0]
+        if owner in csa2_layers:
+            return True
+        if any(name == owner or owner.startswith(name + ".") for name in csa2_layers):
+            return True
+        raise ManifestError(
+            f"DSv4.1 SWA cache {layer_name} has no CSA2 owner among "
+            f"{sorted(csa2_layers)[:4]}...: cannot decide its page layout"
+        )
 
     storages = _StorageTable()
     for raw in raw_tensors:
@@ -1686,6 +1713,47 @@ def _build_dsv41_pool_manifest(
                 tag_base = f"{base}.r{tokens_per_state}"
 
             storage_index = storages.index_for(raw)
+            if tag_base == TAG_DSV4_SWA and _swa_plane_major(layer_name):
+                # Plane-major page: [plane 0: rows x 512 B][plane 1: rows x 512 B].
+                # Token t lives at row t of each plane, so each plane is its own
+                # row-prefix pool and both must travel.
+                plane_rows = rows
+                plane_row_bytes = row_bytes // 2
+                if plane_row_bytes * 2 != row_bytes or plane_row_bytes != 512:
+                    raise ManifestError(
+                        f"DSv4.1 CSA2 SWA cache {layer_name} needs 1024-byte token "
+                        f"rows (two 512-byte planes); got row_bytes={row_bytes}"
+                    )
+                if stride_bytes != 2 * plane_rows * plane_row_bytes:
+                    raise ManifestError(
+                        f"DSv4.1 CSA2 SWA cache {layer_name} page stride "
+                        f"{stride_bytes} is not two planes of {plane_rows} rows"
+                    )
+                for plane, plane_tag in enumerate(TAG_DSV41_SWA_PLANES):
+                    plane_offset = offset_bytes + plane * plane_rows * plane_row_bytes
+                    _claim_range(
+                        group_index,
+                        storage_index,
+                        plane_offset,
+                        plane_rows * plane_row_bytes,
+                        stride_bytes,
+                        f"{layer_name}.p{plane}",
+                    )
+                    pools.append(
+                        PoolEntry(
+                            tag=dsv4_group_tag(plane_tag, group_index),
+                            layer_name=layer_name,
+                            storage_index=storage_index,
+                            base_offset_bytes=plane_offset,
+                            block_stride_bytes=stride_bytes,
+                            num_blocks=num_blocks,
+                            regions=_dsv4_row_region(
+                                row_bytes=plane_row_bytes, num_rows=plane_rows
+                            ),
+                            dtype_tag=_dtype_tag(raw),
+                        )
+                    )
+                continue
             _claim_range(
                 group_index,
                 storage_index,
