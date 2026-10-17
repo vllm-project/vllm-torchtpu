@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Tests for ModelOpt MXFP8 linear support (`quantization/mxfp8.py`).
+"""Tests for ModelOpt MXFP8 support (`quantization/mxfp8.py`).
 
 The reference for every numeric test is the checkpoint's own meaning: each FP8
 value times 2^(e - 127) for the E8M0 byte `e` of its 32-value block.
@@ -27,6 +27,7 @@ from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.quantization.mxfp8 import (
     VllmModelOptMxfp8Config,
     VllmModelOptMxfp8LinearMethod,
+    VllmModelOptMxfp8MoEMethod,
 )
 from vllm_torchtpu.layers.adapter.quantization.unquantized import (
     VllmUnquantizedFusedMoEMethod,
@@ -163,11 +164,13 @@ class TestMxfp8Config:
     def test_attention_not_quantized(self):
         assert _config().get_quant_method(_bare(Attention), prefix="attn") is None
 
-    def test_quantized_moe_not_supported(self, monkeypatch):
+    def test_moe_dispatch(self, monkeypatch):
         cfg = _config()
         monkeypatch.setattr(cfg, "get_moe_config", lambda layer: None)
-        with pytest.raises(NotImplementedError, match="MXFP8 MoE"):
-            cfg.get_quant_method(_bare(RoutedExperts), prefix="model.layers.1.mlp")
+        method = cfg.get_quant_method(_bare(RoutedExperts), prefix="model.layers.1.mlp")
+        assert isinstance(method, VllmModelOptMxfp8MoEMethod)
+        assert method.block_quant
+        assert list(method.weight_block_size) == [1, BLOCK]
 
     def test_excluded_moe_unquantized(self, monkeypatch):
         from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
@@ -352,3 +355,155 @@ class TestMxfp8Linear:
         torch.testing.assert_close(
             got.float().cpu(), want, rtol=0.1, atol=0.1 * want.abs().max().item()
         )
+
+
+def _moe_layer(monkeypatch, tp_size, tp_rank, hidden, full_inter):
+    from types import SimpleNamespace
+
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.fused_moe.config import (
+        FusedMoEConfig,
+        FusedMoEParallelConfig,
+        MoEActivation,
+        RoutingMethodType,
+    )
+    from vllm.model_executor.layers.fused_moe.expert_map_manager import ExpertMapManager
+
+    _mock_tp(monkeypatch, tp_size, tp_rank)
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.fp8."
+        "get_tensor_model_parallel_world_size",
+        lambda: tp_size,
+    )
+    parallel = FusedMoEParallelConfig(
+        tp_size=tp_size,
+        pcp_size=1,
+        dp_size=1,
+        ep_size=1,
+        tp_rank=tp_rank,
+        pcp_rank=0,
+        dp_rank=0,
+        ep_rank=0,
+        sp_size=1,
+        use_ep=False,
+        all2all_backend="allgather_reducescatter",
+        enable_eplb=False,
+    )
+    moe_config = FusedMoEConfig(
+        num_experts=2,
+        experts_per_token=1,
+        hidden_dim=hidden,
+        intermediate_size=full_inter,
+        num_local_experts=2,
+        num_logical_experts=2,
+        activation=MoEActivation.SILU,
+        device=torch.device("cpu"),
+        routing_method=RoutingMethodType.Renormalize,
+        moe_parallel_config=parallel,
+        in_dtype=torch.bfloat16,
+    )
+    expert_map = ExpertMapManager(
+        max_num_batched_tokens=16,
+        top_k=1,
+        global_num_experts=2,
+        num_redundant_experts=0,
+        num_expert_group=None,
+        moe_parallel_config=parallel,
+        placement_strategy="linear",
+        enable_eplb=False,
+    )
+    quant = _config()
+    quant.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(enable_expert_parallel=False),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(expert_dtype="fp8")),
+    )
+    with set_current_vllm_config(quant.vllm_config):
+        return RoutedExperts(
+            layer_name="model.layers.1.mlp.experts",
+            params_dtype=torch.bfloat16,
+            moe_config=moe_config,
+            quant_config=quant,
+            expert_map_manager=expert_map,
+        )
+
+
+def _runtime_expert(w_q, scale, e):
+    """Expert e's runtime (k, n) weight times its scale, as [n, k]."""
+    w, s = w_q[e].float(), scale[e].float()
+    # per channel: [1, 1, n]; blockwise: [k / block, 1, n]
+    block = w.shape[0] // s.shape[0]
+    return (w * s[:, 0, :].repeat_interleave(block, dim=0)).T
+
+
+class TestMxfp8MoE:
+    @pytest.mark.parametrize("runtime_block", [None, BLOCK])
+    @pytest.mark.parametrize("tp_size,full_inter", [(1, 64), (2, 128), (4, 128)])
+    def test_load_and_convert(self, monkeypatch, tp_size, full_inter, runtime_block):
+        from vllm_torchtpu import envs
+
+        monkeypatch.setattr(envs, "MOE_REQUANTIZE_BLOCK_SIZE", runtime_block)
+        hidden = 128
+        shard = full_inter // tp_size
+        experts = []
+        for e in range(2):
+            w1, s1, r1 = _mxfp8_checkpoint(full_inter, hidden, seed=3 * e)
+            w3, s3, r3 = _mxfp8_checkpoint(full_inter, hidden, seed=3 * e + 1)
+            w2, s2, r2 = _mxfp8_checkpoint(hidden, full_inter, seed=3 * e + 2)
+            experts.append(((w1, s1, r1), (w3, s3, r3), (w2, s2, r2)))
+        for tp_rank in range(tp_size):
+            layer = _moe_layer(monkeypatch, tp_size, tp_rank, hidden, full_inter)
+            assert isinstance(layer.quant_method, VllmModelOptMxfp8MoEMethod)
+            assert layer.w13_weight.dtype == torch.float8_e4m3fn
+            assert layer.w13_weight_scale.dtype == torch.uint8
+            assert layer.w13_weight_scale.shape == (2, 2 * shard, hidden // BLOCK)
+            assert layer.w2_weight_scale.shape == (2, hidden, shard // BLOCK)
+            for e, parts in enumerate(experts):
+                for sid, (w, s, _) in zip(("w1", "w3", "w2"), parts):
+                    attr = "w2" if sid == "w2" else "w13"
+                    layer.weight_loader(
+                        getattr(layer, f"{attr}_weight"), w, f"{sid}.weight", sid, e
+                    )
+                    layer.weight_loader(
+                        getattr(layer, f"{attr}_weight_scale"),
+                        s,
+                        f"{sid}.weight_scale",
+                        sid,
+                        e,
+                    )
+            layer.quant_method.process_weights_after_loading(layer)
+
+            assert not hasattr(layer, "w13_weight_scale")
+            assert layer.w13_weight_scale_inv.shape[1] == (
+                1 if runtime_block is None else hidden // BLOCK
+            )
+            rows = slice(tp_rank * shard, (tp_rank + 1) * shard)
+            for e, ((_, _, r1), (_, _, r3), (_, _, r2)) in enumerate(experts):
+                got13 = _runtime_expert(layer.w13_weight, layer.w13_weight_scale_inv, e)
+                got2 = _runtime_expert(layer.w2_weight, layer.w2_weight_scale_inv, e)
+                # The GMM layout pads each half of w13 (and w2's input) to
+                # `padded`; the padding must be zero.
+                padded = got13.shape[0] // 2
+                assert padded >= shard and got2.shape[1] == padded
+                _assert_close_to_fp8_rounding(got13[:shard], r1[rows])
+                _assert_close_to_fp8_rounding(got13[padded : padded + shard], r3[rows])
+                _assert_close_to_fp8_rounding(got2[:, :shard], r2[:, rows])
+                assert not got13[shard:padded].any()
+                assert not got13[padded + shard :].any()
+                assert not got2[:, shard:].any()
+
+    def test_reload_reentry_is_a_no_op(self, monkeypatch):
+        layer = _moe_layer(monkeypatch, 1, 0, 128, 64)
+        for name in ("w13", "w2"):
+            scale = getattr(layer, f"{name}_weight_scale")
+            scale.data.fill_(127)
+            getattr(layer, f"{name}_weight").data.zero_()
+        layer.quant_method.process_weights_after_loading(layer)
+        before = layer.w13_weight.clone()
+        layer.quant_method.process_weights_after_loading(layer)
+        assert torch.equal(layer.w13_weight, before)
+
+    def test_rejects_non_e8m0_scale(self, monkeypatch):
+        layer = _moe_layer(monkeypatch, 1, 0, 128, 64)
+        layer.w13_weight_scale.data = layer.w13_weight_scale.data.float()
+        with pytest.raises(ValueError, match="uint8 E8M0 w13"):
+            layer.quant_method.process_weights_after_loading(layer)

@@ -24,12 +24,18 @@ no MXFP8 kernel, so the weights are converted to the existing FP8 runtime:
     `weight_block_size = (1, 32)`, which dequantizes, requantizes to the
     configured runtime block, and lays the weight out for the matmul.
 
+  - Routed experts follow the same pattern: parameters from upstream
+    `ModelOptMxFp8FusedMoE.create_weights` (FP8 `w13_weight` / `w2_weight`,
+    uint8 E8M0 `w13_weight_scale` / `w2_weight_scale`), scales decoded to
+    `w13_weight_scale_inv` / `w2_weight_scale_inv`, then
+    `VllmFp8MoEMethodTPU`, which dequantizes with the (1, 32) blocks and
+    requantizes for the GMM kernel.
+
 The runtime block follows the FP8 runtime's settings. Its default requantizes
 per output channel and quantizes activations to FP8, which can cost accuracy;
 `REQUANTIZE_BLOCK_SIZE=32` with `ENABLE_QUANTIZED_MATMUL_KERNEL=1` keeps the
-checkpoint's own blocks, at the speed of the blockwise kernel.
-
-MoE layers are not supported yet.
+checkpoint's own blocks, at the speed of the blockwise kernel. MoE layers
+follow `MOE_REQUANTIZE_BLOCK_SIZE` / `MOE_REQUANTIZE_WEIGHT_DTYPE`.
 """
 
 from __future__ import annotations
@@ -50,6 +56,7 @@ from vllm.model_executor.layers.quantization.modelopt import (
     CkptCtx,
     KMxfp8Static,
     ModelOptMxFp8Config,
+    ModelOptMxFp8FusedMoE,
     Shapes,
 )
 from vllm.model_executor.layers.quantization.utils.mxfp8_utils import (
@@ -60,6 +67,7 @@ from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.layers.adapter.quantization.configs import VllmQuantConfig
 from vllm_torchtpu.layers.adapter.quantization.fp8 import (
     VllmFp8LinearMethodTPU,
+    VllmFp8MoEMethodTPU,
     resolve_online_fp8,
 )
 from vllm_torchtpu.layers.adapter.quantization.online_fp8 import map_online_fp8
@@ -122,13 +130,57 @@ class VllmModelOptMxfp8LinearMethod(VllmFp8LinearMethodTPU):
         super().process_weights_after_loading(layer)
 
 
+class VllmModelOptMxfp8MoEMethod(VllmFp8MoEMethodTPU):
+    """MXFP8 routed experts for TPU: E8M0 block scales decoded, then the FP8
+    MoE path."""
+
+    def create_weights(
+        self,
+        layer: torch.nn.Module,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ) -> None:
+        # Reads only `self.moe.is_act_and_mul`.
+        ModelOptMxFp8FusedMoE.create_weights(
+            cast("ModelOptMxFp8FusedMoE", self),
+            cast("RoutedExperts", layer),
+            num_experts,
+            hidden_size,
+            intermediate_size_per_partition,
+            params_dtype,
+            **extra_weight_attrs,
+        )
+
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        if not hasattr(layer, "w13_weight_scale"):
+            return  # already converted; reload paths re-enter this hook
+        for name in ("w13", "w2"):
+            scale_u8 = getattr(layer, f"{name}_weight_scale").data
+            if scale_u8.dtype != torch.uint8:
+                raise ValueError(
+                    f"MXFP8 expects uint8 E8M0 {name} scales, got {scale_u8.dtype}"
+                )
+            # Decoded on CPU, as for linear layers. The FP8 MoE path reads
+            # the block scale from `*_weight_scale_inv` and replaces it.
+            scale = e8m0_to_fp32(scale_u8.to("cpu")).to(scale_u8.device)
+            delattr(layer, f"{name}_weight_scale")
+            layer.register_parameter(
+                f"{name}_weight_scale_inv",
+                torch.nn.Parameter(scale, requires_grad=False),
+            )
+        super().process_weights_after_loading(layer)
+
+
 @register_quantization_config(get_tpu_quant_method(MODELOPT_MXFP8))
 class VllmModelOptMxfp8Config(ModelOptMxFp8Config, VllmQuantConfig):
     """MXFP8 config for TPU. Inherits ModelOpt checkpoint parsing from upstream;
-    dispatches linear layers to the FP8 runtime."""
+    dispatches linear and routed-expert layers to the FP8 runtime."""
 
-    # Read by `VllmFp8LinearMethodTPU`: an FP8 checkpoint with (1, 32) block
-    # scales and dynamically quantized activations.
+    # Read by `VllmFp8LinearMethodTPU` and `VllmFp8MoEMethodTPU`: an FP8
+    # checkpoint with (1, 32) block scales and dynamically quantized activations.
     is_checkpoint_fp8_serialized = True
     weight_block_size = [1, MXFP8_BLOCK_SIZE]
     activation_scheme = "dynamic"
@@ -175,7 +227,7 @@ class VllmModelOptMxfp8Config(ModelOptMxFp8Config, VllmQuantConfig):
                 )
 
                 return VllmUnquantizedFusedMoEMethod(self.get_moe_config(layer))
-            raise NotImplementedError(
-                f"MXFP8 MoE layers are not supported on TPU yet ({prefix})"
+            return VllmModelOptMxfp8MoEMethod(
+                cast("Fp8Config", self), self.get_moe_config(layer)
             )
         return None
