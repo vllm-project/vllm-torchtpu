@@ -76,9 +76,9 @@ class MaterializedNativeKVCache:
     # [plane 0: P rows][plane 1: P rows] of 512 bytes, not P rows of 1024.
     csa2_layers: frozenset[str] = frozenset()
     # SWA cache layers whose module carries `_tpu_swa_words=True`: the exact
-    # per-layer flag `PagedCacheRows.write` branches on. Only the CSA2 owner
-    # layers (the KV-source layers) write plane-major; KV-sharing consumer
-    # layers write token-major 1024-byte rows.
+    # per-layer flag `PagedCacheRows.write` branches on. On V4.1 Flash every
+    # layer with a compress ratio (2..39) writes plane-major; the two
+    # compressor-less layers (0..1) write token-major 1024-byte rows.
     swa_word_layers: frozenset[str] = frozenset()
 
 
