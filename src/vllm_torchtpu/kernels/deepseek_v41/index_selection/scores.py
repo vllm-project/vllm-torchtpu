@@ -62,9 +62,7 @@ def _kernel(
     pool,
     out,
     words,
-    unpacked,
-    sem,
-    *,
+    *scratch,
     page_records,
     tile,
     coalesce,
@@ -72,7 +70,9 @@ def _kernel(
     profile_stages,
     row_lengths=None,
     row_offset=0,
+    halfplane=False,
 ):
+    unpacked, sem = (None, scratch[0]) if halfplane else scratch
     scope = jax.named_scope if profile_stages else contextlib.nullcontext
     with scope("prefill_kernel_body"):
         rows, heads, _ = q_ref.shape
@@ -173,7 +173,11 @@ def _kernel(
             # Keep the fused vector/MXU region in one scope: splitting dot and
             # reduction introduces materialization/spills in the Mosaic compiler.
             with scope("prefill_unpack_dot_reduce_store"):
-                keys = unpack_word_rows(words[bank], unpacked)
+                keys = (
+                    pltpu.bitcast(words[bank], jnp.bfloat16)
+                    if halfplane
+                    else unpack_word_rows(words[bank], unpacked)
+                )
                 logits = jax.lax.dot_general(
                     query,
                     keys,
@@ -221,6 +225,7 @@ def _kernel(
         "interpret",
         "prefetch",
         "profile_stages",
+        "halfplane",
     ),
 )
 def prefill_index_scores(
@@ -237,6 +242,7 @@ def prefill_index_scores(
     interpret: bool = False,
     prefetch: bool = True,
     profile_stages: bool = False,
+    halfplane: bool = False,
 ) -> jax.Array:
     """Score one shared request; caller applies per-query causal/record masks.
 
@@ -290,6 +296,7 @@ def prefill_index_scores(
             coalesce=coalesce,
             prefetch=prefetch,
             profile_stages=profile_stages,
+            halfplane=halfplane,
         ),
         out_shape=jax.ShapeDtypeStruct((tokens, width), jnp.float32),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -303,7 +310,11 @@ def prefill_index_scores(
             out_specs=pl.BlockSpec((query_tile, window), lambda i, j, *_: (i, j)),
             scratch_shapes=(
                 pltpu.VMEM((2, key_tile // SLOTS, ROW_WORDS), jnp.int32),
-                pltpu.VMEM((key_tile, ROW_WORDS), jnp.int32),
+                *(
+                    (pltpu.VMEM((key_tile, ROW_WORDS), jnp.int32),)
+                    if not halfplane
+                    else ()
+                ),
                 pltpu.SemaphoreType.DMA,
             ),
         ),

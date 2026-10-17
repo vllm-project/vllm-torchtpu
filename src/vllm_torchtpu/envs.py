@@ -15,6 +15,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_SP: bool = False
     TPU_DEEPSEEK_V41_LOCAL_Q: bool = False
     TPU_DEEPSEEK_V41_PREFILL_INDEXER: str = "streaming"
+    TPU_DEEPSEEK_V41_INDEX_KEY_LAYOUT: str = "ordinary"
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
@@ -378,6 +379,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (models/vllm/deepseek_v41/v2: FP8 main KV + RoPE companion pool).
     "TPU_DEEPSEEK_V41_IMPL": env_with_choices(
         "TPU_DEEPSEEK_V41_IMPL", "v1", ["v1", "v2"]
+    ),
+    # Index-K storage is fixed at process startup; ordinary remains the default.
+    "TPU_DEEPSEEK_V41_INDEX_KEY_LAYOUT": env_with_choices(
+        "TPU_DEEPSEEK_V41_INDEX_KEY_LAYOUT", "ordinary", ["ordinary", "halfplane"]
     ),
     # Prefill defaults to resident-Q scoring + streaming TopK (8K/8K).
     # Keep baseline as an A/B escape hatch while qualifying the new route.

@@ -2,6 +2,7 @@
 
 import math
 from dataclasses import dataclass, field
+from functools import lru_cache
 from typing import Any, Protocol, cast
 
 import jax
@@ -263,6 +264,8 @@ _write_op = None
 _write_values_op = None
 _write_values_after_op = None
 _encode_fp8_op = None
+_write_index_values_op = None
+_write_index_values_after_op = None
 
 
 class _CacheBinding(Protocol):
@@ -277,7 +280,18 @@ class PagedCacheRows:
     record units, before any device arithmetic or int32 index conversion.
     """
 
-    def __init__(self, raw, layout, rope=None, scale=None, swa_words=False):
+    def __init__(
+        self,
+        raw,
+        layout,
+        rope=None,
+        scale=None,
+        swa_words=False,
+        index_key_layout: str = "ordinary",
+    ):
+        if index_key_layout not in ("ordinary", "halfplane"):
+            raise ValueError("Unknown Index-K layout")
+        self.index_key_layout = index_key_layout
         self.scale, self.scale_hi = scale if isinstance(scale, tuple) else (scale, None)
         self.swa_words = swa_words
         if isinstance(raw, tuple):
@@ -364,6 +378,17 @@ class PagedCacheRows:
         ):
             raise ValueError("CSA2 SWA owners must preserve whole plane-major pages")
 
+        if self.index_key_layout == "halfplane" and (
+            self.dtype != torch.bfloat16
+            or self.row_bytes != 256
+            or self.shape[1] % 2
+            or self.row_offset % 2
+            or self.page_stride % 2
+            or self.rope is not None
+            or self.scale is not None
+        ):
+            raise ValueError("Halfplane Index-K requires whole 512-byte owner rows")
+
     def numel(self):
         return math.prod(self.shape)
 
@@ -402,6 +427,21 @@ class PagedCacheRows:
     def __getitem__(self, indices):
         blocks, rows = indices
         records = self.row_indices(blocks * self.shape[1] + rows)
+        if self.index_key_layout == "halfplane" and self.raw.device.type == "cpu":
+            rec = records.long()
+            capacity = self.total_rows * 2
+            if bool(((rec < 0) | (rec >= capacity)).any()):
+                raise IndexError("Halfplane Index-K record is outside its owner")
+            in_hi = rec >= self.bank_records
+            source = self.raw[(rec.masked_fill(in_hi, 0)) // 2]
+            if self.raw_hi is not None:
+                source_hi = self.raw_hi[
+                    (rec - self.bank_records).masked_fill(~in_hi, 0) // 2
+                ]
+                source = torch.where(in_hi[..., None], source_hi, source)
+            bits = ((source >> ((rec % 2)[..., None] * 16)) & 65535).to(torch.int16)
+            split = bits.contiguous().view(torch.bfloat16)
+            return torch.stack((split[..., :64], split[..., 64:]), -1).flatten(-2)
         if self.raw.device.type == "cpu":
             pool = self.raw.view(torch.int8).reshape(-1, self.row_bytes)
             if self.raw_hi is None:
@@ -429,6 +469,7 @@ class PagedCacheRows:
                 records.flatten().int(),
                 elem_count,
                 is_fp32,
+                self.index_key_layout == "halfplane",
             )
         else:
             assert _read_values_2bank_op is not None
@@ -438,12 +479,57 @@ class PagedCacheRows:
                 records.flatten().int(),
                 elem_count,
                 is_fp32,
+                self.index_key_layout == "halfplane",
             )
         return gathered.reshape(*records.shape, *self.shape[2:])
 
     def write(self, slots, values, after=None):
         """``after`` (optional) must be computed before the in-place write."""
         records = self.row_indices(slots.clamp(min=0)).masked_fill(slots < 0, -1)
+        if self.index_key_layout == "halfplane":
+            keys = values.to(torch.bfloat16).reshape(-1, 128)
+            if self.raw.device.type == "cpu":
+                split = torch.cat((keys[:, ::2], keys[:, 1::2]), -1)
+                bits = split.contiguous().view(torch.int16).to(torch.int32) & 65535
+                nan = ((bits & 0x7F80) == 0x7F80) & ((bits & 0x7F) != 0)
+                bits = torch.where(nan, (bits & 0x8000) | 0x7FC0, bits)
+                for i in range(records.numel()):
+                    record = int(records[i])
+                    if record < 0:
+                        continue
+                    bank = self.raw
+                    if record >= self.bank_records:
+                        if self.raw_hi is None:
+                            continue
+                        bank = self.raw_hi
+                        record -= self.bank_records
+                    if record >= bank.shape[0] * 2:
+                        continue
+                    shift = (record % 2) * 16
+                    mask = -65536 if shift == 0 else 65535
+                    bank[record // 2] = (bank[record // 2] & mask) | (bits[i] << shift)
+                return
+            assert _write_index_values_op is not None
+            rec_lo = records.masked_fill(records >= self.bank_records, -1)
+            if after is None:
+                self.raw.copy_(_write_index_values_op(self.raw, rec_lo, keys))
+            else:
+                assert _write_index_values_after_op is not None
+                self.raw.copy_(
+                    _write_index_values_after_op(self.raw, rec_lo, keys, after)
+                )
+            if self.raw_hi is not None:
+                rec_hi = (records - self.bank_records).masked_fill(
+                    records < self.bank_records, -1
+                )
+                if after is None:
+                    self.raw_hi.copy_(_write_index_values_op(self.raw_hi, rec_hi, keys))
+                else:
+                    assert _write_index_values_after_op is not None
+                    self.raw_hi.copy_(
+                        _write_index_values_after_op(self.raw_hi, rec_hi, keys, after)
+                    )
+            return
         if self.swa_words:
             if after is not None:
                 raise NotImplementedError(
@@ -541,6 +627,12 @@ class PagedCacheRows:
             self.rope_hi.copy_(_write_values_op(self.rope_hi, rec_hi, rope))
 
 
+@lru_cache(maxsize=1)
+def index_key_layout() -> str:
+    """Index cache format is fixed for the process; changing it needs a restart."""
+    return envs.TPU_DEEPSEEK_V41_INDEX_KEY_LAYOUT
+
+
 class NativeCacheView:
     """Expose each shared physical pool once, deriving layer views in the graph."""
 
@@ -549,13 +641,19 @@ class NativeCacheView:
     @property
     def kv_cache(self):
         raw = getattr(self, "_tpu_raw_cache", None)
-        if torch.compiler.is_compiling() and raw is not None:
+        index_layout = getattr(self, "_tpu_index_key_layout", "ordinary")
+        if getattr(self, "_tpu_bound_index_key_layout", index_layout) != index_layout:
+            raise ValueError("Cannot change Index-K layout after binding a live cache")
+        if (
+            torch.compiler.is_compiling() or index_layout == "halfplane"
+        ) and raw is not None:
             return PagedCacheRows(
                 raw,
                 self._tpu_cache_layout,
                 getattr(self, "_tpu_rope_pool", None),
                 getattr(self, "_tpu_scale_pool", None),
                 getattr(self, "_tpu_swa_words", False),
+                index_layout,
             )
         return self._bound_cache
 
@@ -566,12 +664,22 @@ class NativeCacheView:
     def bind_kv_cache(
         self, cache, *, raw_cache=None, layout=None, rope_pool=None, scale_pool=None
     ):
+        index_layout = getattr(self, "_tpu_index_key_layout", "ordinary")
+        if getattr(self, "_tpu_bound_index_key_layout", index_layout) != index_layout:
+            raise ValueError("Cannot change Index-K layout after binding a live cache")
+        self._tpu_bound_index_key_layout = index_layout
+        if index_layout == "halfplane" and (raw_cache is None or layout is None):
+            raise ValueError(
+                "Halfplane Index-K requires an explicit native owner/layout"
+            )
         cast(_CacheBinding, super()).bind_kv_cache(cache)
         self._tpu_raw_cache = raw_cache
         self._tpu_rope_pool = rope_pool
         self._tpu_scale_pool = scale_pool
         if layout is not None:
             self._tpu_cache_layout = layout
+            if getattr(self, "_tpu_index_key_layout", "ordinary") == "halfplane":
+                PagedCacheRows(raw_cache, layout, index_key_layout="halfplane")
             return
         raw_tensor = raw_cache[0] if isinstance(raw_cache, tuple) else raw_cache
         if raw_tensor is not None and raw_tensor.device.type != "cpu":
@@ -784,6 +892,7 @@ def gather_cache_values(
     elements: int,
     fp32: bool = False,
     split: bool = False,
+    halfplane: bool = False,
 ) -> jax.Array:
     """Read physical records without flattening or converting the whole pool.
 
@@ -795,6 +904,17 @@ def gather_cache_values(
     """
     import jax.numpy as jnp
 
+    if halfplane:
+        if elements != 128 or fp32:
+            raise ValueError("Halfplane is only valid for D128 BF16 Index-K")
+        from vllm_torchtpu.kernels.deepseek_v41.index_key_layout import gather_records
+
+        values = gather_records(cache, records)
+        if split:
+            return values
+        return jnp.stack((values[..., :64], values[..., 64:]), axis=-1).reshape(
+            *values.shape[:-1], 128
+        )
     if split:
         if elements // 2 <= ROW_WORDS:
             words = _gather_records(cache, records, elements // 2)
@@ -850,6 +970,7 @@ def gather_cache_page_values(
     first_records: jax.Array,
     page_records: int,
     elements: int,
+    halfplane: bool = False,
 ) -> jax.Array:
     """`gather_cache_values` (``split=True``) of whole pages.
 
@@ -863,6 +984,12 @@ def gather_cache_page_values(
     import jax.numpy as jnp
 
     words = gather_cache_page_words(cache, first_records, page_records, elements)
+    if halfplane:
+        if elements != 128:
+            raise ValueError("Halfplane is only valid for D128 Index-K")
+        from vllm_torchtpu.kernels.deepseek_v41.index_key_layout import unpack_rows
+
+        return unpack_rows(words)
     words = words.reshape(first_records.size * page_records, elements // 2)
     return jnp.concatenate(_split_words(words), axis=1)
 
@@ -907,6 +1034,7 @@ def initialize_cache_ops():
         initialize_csa2_ops()
     global _read_values_op, _read_values_2bank_op, _write_op, _write_values_op
     global _encode_fp8_op, _write_values_after_op
+    global _write_index_values_op, _write_index_values_after_op
     if _write_op is not None:
         return
     from jax.sharding import PartitionSpec as P
@@ -918,12 +1046,18 @@ def initialize_cache_ops():
 
     _read_values_op = pallas.jax_op(
         "pallas::dsv41v2_cache_read_values",
-        gather_cache_values,
+        lambda cache,
+        records,
+        elements,
+        fp32=False,
+        halfplane=False: gather_cache_values(
+            cache, records, elements, fp32, halfplane=halfplane
+        ),
         mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(), P(), None, None),
+        input_partition_specs=(P(), P(), None, None, None),
     )
     _read_values_op.register_fake(
-        lambda cache, records, elements, fp32=False: cache.new_empty(
+        lambda cache, records, elements, fp32=False, halfplane=False: cache.new_empty(
             (records.numel(), elements), dtype=torch.float32 if fp32 else torch.bfloat16
         )
     )
@@ -934,19 +1068,29 @@ def initialize_cache_ops():
         records: jax.Array,
         elements: int,
         fp32: bool = False,
+        halfplane: bool = False,
     ) -> jax.Array:
         return gather_cache_values(
-            cast(Any, (cache_lo, cache_hi)), records, elements, fp32
+            cast(Any, (cache_lo, cache_hi)),
+            records,
+            elements,
+            fp32,
+            halfplane=halfplane,
         )
 
     _read_values_2bank_op = pallas.jax_op(
         "pallas::dsv41v2_cache_read_values_2bank",
         read_cache_values_2bank,
         mesh=get_vllm_model_wrapper_context().mesh,
-        input_partition_specs=(P(), P(), P(), None, None),
+        input_partition_specs=(P(), P(), P(), None, None, None),
     )
     _read_values_2bank_op.register_fake(
-        lambda cache_lo, cache_hi, records, elements, fp32=False: cache_lo.new_empty(
+        lambda cache_lo,
+        cache_hi,
+        records,
+        elements,
+        fp32=False,
+        halfplane=False: cache_lo.new_empty(
             (records.numel(), elements), dtype=torch.float32 if fp32 else torch.bfloat16
         )
     )
@@ -995,6 +1139,38 @@ def initialize_cache_ops():
         input_partition_specs=(P(), P(), P(), P()),
     )
     _write_values_after_op.register_fake(
+        lambda cache, records, values, after: torch.empty_like(cache)
+    )
+    write_index_values = jax.shard_map(
+        scatter_index_keys,
+        mesh=mesh,
+        in_specs=(P(), P(), P()),
+        out_specs=P(),
+        check_vma=False,
+    )
+    _write_index_values_op = pallas.jax_op(
+        "pallas::dsv41v2_index_halfplane_write",
+        write_index_values,
+        donate_argnums=(0,),
+        mesh=mesh,
+        input_partition_specs=(P(), P(), P()),
+    )
+    _write_index_values_op.register_fake(
+        lambda cache, records, values: torch.empty_like(cache)
+    )
+
+    def write_index_after(cache, records, values, after):
+        cache, _ = jax.lax.optimization_barrier((cache, after))
+        return write_index_values(cache, records, values)
+
+    _write_index_values_after_op = pallas.jax_op(
+        "pallas::dsv41v2_index_halfplane_write_after",
+        write_index_after,
+        donate_argnums=(0,),
+        mesh=mesh,
+        input_partition_specs=(P(), P(), P(), P()),
+    )
+    _write_index_values_after_op.register_fake(
         lambda cache, records, values, after: torch.empty_like(cache)
     )
     _encode_fp8_op = pallas.jax_op(
@@ -1215,3 +1391,27 @@ def scatter_cache_values(
         # Flatten only the small update batch. A partial DMA from a tiled 2D
         # source can straddle its padded minor dimension; the cache stays 2D.
     )(records, words.reshape(-1), cache)
+
+
+def scatter_index_keys(
+    cache: jax.Array | tuple[jax.Array, jax.Array],
+    records: jax.Array,
+    values: jax.Array,
+) -> jax.Array | tuple[jax.Array, jax.Array]:
+    """Index-only half-plane RMW, retaining the existing aliased pool writer."""
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.kernels.deepseek_v41.index_key_layout import merge_record_rows
+
+    if isinstance(cache, tuple):
+        boundary = cache[0].shape[0] * 2
+        return (
+            scatter_index_keys(
+                cache[0], jnp.where(records < boundary, records, -1), values
+            ),
+            scatter_index_keys(
+                cache[1], jnp.where(records >= boundary, records - boundary, -1), values
+            ),
+        )
+    rows, words = merge_record_rows(cache, records, values)
+    return scatter_cache_values(cache, rows, words)

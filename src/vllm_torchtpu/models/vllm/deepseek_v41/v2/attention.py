@@ -32,7 +32,13 @@ from .attention_kernels import (
     sparse_fp8_attention,
     sparse_fp8_attention_qo,
 )
-from .cache import ROW_BYTES, NativeCacheView, PagedCacheRows, write_cache
+from .cache import (
+    ROW_BYTES,
+    NativeCacheView,
+    PagedCacheRows,
+    index_key_layout,
+    write_cache,
+)
 from .candidate_cache import prepare_candidate_cache, select_candidate_cache
 from .ced import prefix_replay_enabled
 from .ops import device_hooks, rms_norm, rotary, round_fp8_activation
@@ -362,6 +368,18 @@ class SWACache(NativeCacheView, DeepseekV4SWACache):
 
 class IndexerCache(NativeCacheView, upstream.DeepseekV4IndexerCache):
     def __init__(self, *args, **kwargs):
+        self._tpu_index_key_layout = index_key_layout()
+        logger.info_once("V4.1 Index-K cache layout: %s", self._tpu_index_key_layout)
+        config = get_current_vllm_config()
+        if self._tpu_index_key_layout == "halfplane":
+            if getattr(config, "kv_transfer_config", None) is not None:
+                raise ValueError(
+                    "Halfplane Index-K does not support external KV transfer"
+                )
+            if getattr(config.cache_config, "kv_offloading_size", 0):
+                raise ValueError(
+                    "Halfplane Index-K does not support external KV offload"
+                )
         # The first TPU path stores rounded values in BF16; ownership and
         # compression ratio still come from upstream. Packed storage follows
         # when the corresponding TPU kernel is connected.
@@ -1722,6 +1740,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             # Publication and index-K writes explicitly version their sources.
             cache_key = (
                 "candidate_index_keys",
+                getattr(index_cache, "index_key_layout", "ordinary"),
                 indexer.k_cache.prefix,
                 stage_cache.get(("candidate_index_version", indexer.k_cache.prefix), 0),
                 self.candidate_source_layer,

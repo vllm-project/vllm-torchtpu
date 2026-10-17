@@ -47,8 +47,12 @@ def unpack_word_rows(words, keys_ref):
     return jnp.where(first, lo, pltpu.roll(hi, half, 1))
 
 
-def _kernel(q_ref, w_ref, words_ref, out_ref, keys_ref):
-    key = unpack_word_rows(words_ref[0], keys_ref)
+def _kernel(q_ref, w_ref, words_ref, out_ref, *scratch, halfplane=False):
+    key = (
+        pltpu.bitcast(words_ref[0], jnp.bfloat16)
+        if halfplane
+        else unpack_word_rows(words_ref[0], scratch[0])
+    )
     for t in range(q_ref.shape[0]):
         logits = jax.lax.dot_general(
             q_ref[t], key, (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32
@@ -57,9 +61,14 @@ def _kernel(q_ref, w_ref, words_ref, out_ref, keys_ref):
 
 
 # Jitted: the memory-space constraint below cannot run eagerly.
-@functools.partial(jax.jit, static_argnames=("interpret",))
+@functools.partial(jax.jit, static_argnames=("interpret", "halfplane"))
 def score_word_rows(
-    q: jax.Array, weights: jax.Array, words: jax.Array, *, interpret: bool = False
+    q: jax.Array,
+    weights: jax.Array,
+    words: jax.Array,
+    *,
+    interpret: bool = False,
+    halfplane: bool = False,
 ) -> jax.Array:
     """Scores ``[tokens, SLOTS * rows]`` of the keys in ``words``.
 
@@ -91,7 +100,7 @@ def score_word_rows(
     words = pltpu.with_memory_space_constraint(words, pltpu.MemorySpace.HBM)
     keys = SLOTS * block
     return pl.pallas_call(
-        _kernel,
+        functools.partial(_kernel, halfplane=halfplane),
         grid=(groups, rows // block),
         in_specs=[
             pl.BlockSpec((group_tokens, heads, DIM), lambda i, j: (i, 0, 0)),
@@ -101,7 +110,7 @@ def score_word_rows(
         # A unit middle axis keeps the block's last two dims TPU-legal.
         out_specs=pl.BlockSpec((group_tokens, 1, keys), lambda i, j: (i, 0, j)),
         out_shape=jax.ShapeDtypeStruct((tokens, 1, SLOTS * rows), jnp.float32),
-        scratch_shapes=[pltpu.VMEM((keys, ROW_WORDS), jnp.int32)],
+        scratch_shapes=[] if halfplane else [pltpu.VMEM((keys, ROW_WORDS), jnp.int32)],
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "parallel")
         ),

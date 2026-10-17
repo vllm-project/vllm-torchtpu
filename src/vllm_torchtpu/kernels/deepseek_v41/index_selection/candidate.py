@@ -115,33 +115,58 @@ def _unpack_words(words, scratch):
     )
 
 
-def _unpack_kernel(words_ref, out_ref, scratch):
-    out_ref[0] = _unpack_words(words_ref[0], scratch)
+def _unpack_kernel(words_ref, out_ref, *scratch, halfplane=False):
+    out_ref[0] = (
+        pltpu.bitcast(words_ref[0], jnp.bfloat16)
+        if halfplane
+        else _unpack_words(words_ref[0], scratch[0])
+    )
 
 
-@functools.partial(jax.jit, static_argnames=("interpret",))
-def unpack_candidate_words(words: jax.Array, *, interpret: bool = False) -> jax.Array:
+@functools.partial(jax.jit, static_argnames=("interpret", "halfplane"))
+def unpack_candidate_words(
+    words: jax.Array, *, interpret: bool = False, halfplane: bool = False
+) -> jax.Array:
     """Unpack native word pairs once into split-order BF16 [request, key, 128]."""
     groups, rows, dim = words.shape
     if dim != 128 or words.dtype != jnp.int32 or rows < 1:
         raise ValueError("Expected nonempty int32 [requests, word rows, 128]")
     tile = math.gcd(rows, 1024)
     return pl.pallas_call(
-        _unpack_kernel,
+        functools.partial(_unpack_kernel, halfplane=halfplane),
         out_shape=jax.ShapeDtypeStruct((groups, rows * 2, dim), jnp.bfloat16),
         grid=(groups, rows // tile),
         in_specs=[pl.BlockSpec((1, tile, dim), lambda g, t: (g, t, 0))],
         out_specs=pl.BlockSpec((1, tile * 2, dim), lambda g, t: (g, t, 0)),
-        scratch_shapes=[pltpu.VMEM((tile * 2, dim), jnp.int32)],
+        scratch_shapes=[] if halfplane else [pltpu.VMEM((tile * 2, dim), jnp.int32)],
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",) * 2),
         interpret=interpret,
         name="candidate_unpack_cache",
     )(words)
 
 
-def _score_kernel(q, weights, keys, ids, membership, lengths, out, *scratch):
+def _score_kernel(
+    q,
+    weights,
+    keys,
+    ids,
+    membership,
+    lengths,
+    out,
+    *scratch,
+    packed=False,
+    halfplane=False,
+):
     queries, heads, dim = q.shape[1:]
-    kk = _unpack_words(keys[0], scratch[0]) if scratch else keys[0]
+    kk = (
+        (
+            pltpu.bitcast(keys[0], jnp.bfloat16)
+            if halfplane
+            else _unpack_words(keys[0], scratch[0])
+        )
+        if packed
+        else keys[0]
+    )
     logits = jax.lax.dot_general(
         q[0].reshape(queries * heads, dim),
         kk,
@@ -155,7 +180,9 @@ def _score_kernel(q, weights, keys, ids, membership, lengths, out, *scratch):
     out[0] = jnp.where(allow, values, -jnp.inf)
 
 
-@functools.partial(jax.jit, static_argnames=("block_size", "key_tile", "interpret"))
+@functools.partial(
+    jax.jit, static_argnames=("block_size", "key_tile", "interpret", "halfplane")
+)
 def candidate_scores(
     q: jax.Array,
     weights: jax.Array,
@@ -167,6 +194,7 @@ def candidate_scores(
     block_size: int,
     key_tile: int = 4096,
     interpret: bool = False,
+    halfplane: bool = False,
 ) -> jax.Array:
     """Per-head dot/ReLU/weight/sum with per-query membership and causal masks."""
     groups, queries, heads, dim = q.shape
@@ -192,7 +220,7 @@ def candidate_scores(
     logical = jnp.where(jnp.repeat(ids >= 0, block_size, 1), logical, -1)
     members = jnp.repeat(membership, block_size, 1)
     return pl.pallas_call(
-        _score_kernel,
+        functools.partial(_score_kernel, packed=packed, halfplane=halfplane),
         out_shape=jax.ShapeDtypeStruct((groups, queries, width), jnp.float32),
         grid=(groups, width // key_tile),
         in_specs=[
@@ -207,7 +235,9 @@ def candidate_scores(
             pl.BlockSpec((1, 1, queries), lambda g, t: (g, 0, 0)),
         ],
         out_specs=pl.BlockSpec((1, queries, key_tile), lambda g, t: (g, 0, t)),
-        scratch_shapes=[pltpu.VMEM((key_tile, dim), jnp.int32)] if packed else [],
+        scratch_shapes=[pltpu.VMEM((key_tile, dim), jnp.int32)]
+        if packed and not halfplane
+        else [],
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",) * 2),
         interpret=interpret,
         name="candidate_union_packed_scores" if packed else "candidate_union_scores",
@@ -216,7 +246,14 @@ def candidate_scores(
 
 @functools.partial(
     jax.jit,
-    static_argnames=("block_size", "key_tile", "request_tile", "k", "overlap"),
+    static_argnames=(
+        "block_size",
+        "key_tile",
+        "request_tile",
+        "k",
+        "overlap",
+        "halfplane",
+    ),
 )
 def candidate_indexer(
     q: jax.Array,
@@ -231,6 +268,7 @@ def candidate_indexer(
     request_tile: int | None = None,
     k: int = 512,
     overlap: bool = True,
+    halfplane: bool = False,
 ) -> jax.Array:
     """Pipeline whole-request score groups and SC selection over a reusable union."""
     requests, queries = q.shape[:2]
@@ -259,7 +297,7 @@ def candidate_indexer(
 
     def score(args):
         return candidate_scores(
-            *args, block_size=block_size, key_tile=key_tile
+            *args, block_size=block_size, key_tile=key_tile, halfplane=halfplane
         ).reshape(request_tile * queries, width)
 
     def select(i, values):
