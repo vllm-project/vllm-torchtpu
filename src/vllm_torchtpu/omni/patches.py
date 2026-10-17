@@ -78,6 +78,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_pair_swap_rope()
     _patch_wan_ffn_gelu_fence()
     _patch_diffusion_startup_warmup_sync()
+    _patch_ltx2_split_rope()
     _patch_wan_fused_qk_norm_rope()
     _patch_wan_fresh_timestep()
 
@@ -340,3 +341,73 @@ def _wrap_fresh_timestep(cls: type) -> None:
 
     setattr(_fresh_timestep_forward, _FRESH_TIMESTEP_PATCHED, True)
     cls.forward = _fresh_timestep_forward
+
+
+def _patch_ltx2_split_rope() -> None:
+    # -------------------------------------------------------------------------
+    # TODO: Remove this patch once vLLM-Omni's LTX-2 split RoPE rotates q and
+    # k in their (B, T, H * D) layout instead of reshaping them per head.
+    #
+    # LTX2AudioVideoRotaryPosEmbed builds split-RoPE tables as (B, H, T, D/2),
+    # so apply_split_rotary_emb transposes every (B, T, H * D) q and k to
+    # (B, H, T, D) and back in each attention layer. Here the rope module
+    # returns the tables in the layout of q and k, (B, 1, T, H * D) with the
+    # sign of each half folded into sin (split_rope_natural_tables), and
+    # apply_split_rotary_emb rotates such tables elementwise. T stays at dim
+    # 2, where the split-RoPE sequence-parallel plan shards the tables.
+    # LTX2AudioVideoAttnProcessor._slice_rope_for_tp slices 4-D tables by
+    # heads on dim 1 and so passes these through whole; the rotation takes
+    # the lanes of the local heads instead. Interleaved RoPE and
+    # (B, H, T, D/2) tables keep using the original functions.
+    # -------------------------------------------------------------------------
+    from vllm_omni.diffusion.models.ltx2 import ltx2_transformer
+
+    from vllm_torchtpu.omni.rope import (
+        apply_split_rotary_half_swap,
+        split_rope_natural_tables,
+    )
+
+    rope_cls = ltx2_transformer.LTX2AudioVideoRotaryPosEmbed
+    if hasattr(rope_cls, "_tpu_orig_forward"):
+        return
+    orig_rope_forward = rope_cls.forward
+    rope_cls._tpu_orig_forward = orig_rope_forward
+    orig_apply_split_rotary_emb = ltx2_transformer.apply_split_rotary_emb
+
+    def _natural_rope_forward(
+        self: Any,
+        coords: torch.Tensor,
+        device: str | torch.device | None = None,
+        out_dtype: torch.dtype | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        tables = orig_rope_forward(self, coords, device, out_dtype)
+        if self.rope_type != "split" or tables[0].ndim != 4:
+            return tables
+        return split_rope_natural_tables(*tables)
+
+    def _apply_split_rotary_emb(
+        x: torch.Tensor,
+        freqs: tuple[torch.Tensor, torch.Tensor],
+        *,
+        head_dim: int,
+    ) -> torch.Tensor:
+        cos, sin = freqs
+        if cos.ndim != 4 or cos.shape[1] != 1 or cos.shape[-1] == head_dim // 2:
+            return orig_apply_split_rotary_emb(x, freqs, head_dim=head_dim)
+        width = x.shape[-1]
+        if cos.shape[-1] != width:
+            tp_size = ltx2_transformer.get_tensor_model_parallel_world_size()
+            if cos.shape[-1] != width * tp_size:
+                raise ValueError(
+                    f"LTX-2 split RoPE tables of width {cos.shape[-1]} do not "
+                    f"match q/k of width {width} on {tp_size} tensor-parallel "
+                    "ranks; the tables must cover all heads of all ranks."
+                )
+            start = ltx2_transformer.get_tensor_model_parallel_rank() * width
+            cos = cos[..., start : start + width]
+            sin = sin[..., start : start + width]
+        return apply_split_rotary_half_swap(x, cos, sin, head_dim)
+
+    rope_cls.forward = _natural_rope_forward
+    ltx2_transformer.apply_split_rotary_emb = _apply_split_rotary_emb
+    logger.info("Applied TPU patch: LTX-2 split RoPE on the q/k layout.")
