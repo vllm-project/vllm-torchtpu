@@ -13,6 +13,7 @@
 # limitations under the License.
 import os
 import sys
+import types
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -37,6 +38,7 @@ from vllm_torchtpu.omni.attention import (
 )
 from vllm_torchtpu.omni.patches import (
     _patch_diffusion_startup_warmup_sync,
+    _patch_ltx2_vocoder_cpu_init,
     apply_omni_model_specific_patches,
     apply_omni_tpu_patches,
 )
@@ -546,3 +548,38 @@ def test_wan_self_attention_patch_falls_back_on_f32():
 
     apply_omni_model_specific_patches()
     assert WanSelfAttention()(torch.ones(1, 3, 8)) == "native"
+
+
+def test_ltx2_vocoder_cpu_init_patch(monkeypatch):
+    calls = []
+
+    def _load_component(
+        component_cls, model, subfolder, *, local_files_only, dtype, revision
+    ):
+        calls.append((subfolder, local_files_only, dtype, revision))
+        return torch.empty(0).device.type
+
+    # A real module: the MagicMock-backed ltx2 package reports every
+    # attribute as present, which would trip the idempotency guard.
+    ltx2_components = types.ModuleType("ltx2_components")
+    ltx2_components._load_component = _load_component
+    monkeypatch.setattr(
+        vllm_omni_mock.diffusion.models.ltx2, "ltx2_components", ltx2_components
+    )
+
+    apply_omni_model_specific_patches.cache_clear()
+    apply_omni_model_specific_patches()
+    assert ltx2_components._tpu_orig_load_component is _load_component
+    patched = ltx2_components._load_component
+
+    load_kwargs = {"local_files_only": True, "dtype": torch.float32, "revision": None}
+    with torch.device("meta"):
+        assert patched(object, "m", "vocoder", **load_kwargs) == "cpu"
+        assert patched(object, "m", "vae", **load_kwargs) == "meta"
+    assert calls == [
+        ("vocoder", True, torch.float32, None),
+        ("vae", True, torch.float32, None),
+    ]
+
+    _patch_ltx2_vocoder_cpu_init()
+    assert ltx2_components._load_component is patched
