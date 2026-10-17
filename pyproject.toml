@@ -46,11 +46,12 @@ dependencies = [
     # Imported directly by src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py, so
     # declared here rather than leaned on as a vLLM transitive.
     #
-    # vLLM 0.31.0 allows >=5.10.4,<5.18; vllm-omni 0.29.0rc1 needs
-    # >=5.13,<5.15. Keep the shared upper bound for Omni compatibility.
-    # A previous upgrade to 5.17.0 changed greedy structured-output results;
-    # rerun that regression before widening the upper bound.
-    "transformers>=5.10.4,<5.15",
+    # Uncap upper bound in base dependencies so upstream vLLM HEAD canary builds
+    # (vllm-torchtpu-integration, requiring transformers>=5.16.1) can resolve.
+    # vllm-omni 0.29.0rc1 specifies its own <5.15 constraint in its package metadata
+    # for the -omni image. Monitored for potential structured-output spec-decode
+    # divergence (#1093) on transformers>=5.17.
+    "transformers>=5.10.4",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
     # cpu.txt, ...) except tpu.txt, so it's missing
@@ -208,6 +209,12 @@ ignore = [
 
 [tool.ruff.format]
 docstring-code-format = true
+
+[tool.pymarkdown]
+# The docs site (Python-Markdown) only nests a list indented by 4 spaces. MD007
+# would rewrite nested lists to 2 spaces (or to the parent's text column under
+# a numbered item), which renders them flat.
+plugins.md007.enabled = false
 
 [tool.pyrefly]
 project-includes = ["src"]

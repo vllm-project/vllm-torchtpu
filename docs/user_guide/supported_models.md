@@ -39,7 +39,7 @@ Click a family to see its architecture-specific TPU support.
 
 </div>
 
-See the [TPU v7x](../deployment/v7x_recipes.md) and [TPU v6e](../deployment/v6e_recipes.md) serving recipes for the exact slice topologies, parallelism layouts, and `vllm serve` flags used for the CI checkpoints.
+See the [TPU v7x serving recipes](../deployment/v7x_recipes.md) for the exact slice topologies, parallelism layouts, and `vllm serve` flags used for the CI checkpoints. The [TPU v6e serving recipes](../deployment/v6e_recipes.md) are reference configurations that are not run in CI.
 
 ---
 
@@ -70,7 +70,7 @@ All features below are merged in `main`. "Validated with" lists the models and v
 | **Compilation & warmup cache** | `VLLM_XLA_CACHE_PATH`, `--compilation-config '{"compile_sizes": [...]}'`, `TPU_PARALLEL_PRECOMPILE=1`, `VLLM_XLA_CHECK_RECOMPILATION=1` | <ul><li>✅ Qwen3-0.6B (compilation-cache end-to-end test)</li><li>Every recipe</li></ul> | [Compilation Cache](compilation_cache.md) |
 | **Weight streaming & loading** | `--load-format runai_streamer` (from `gs://`), `--enable-ep-weight-filter`, `--safetensors-load-strategy prefetch`, `--model-loader-extra-config '{"memory_limit": ...}'` | <ul><li>🌙 GLM-5.2</li><li>🌙 DeepSeek-V4-Pro</li><li>Kimi-K3 (multi-host recipes)</li></ul> | [Multi-Host Serving](multihost.md) |
 | **SparseCore offload** | `USE_MOE_SPARSE_CORE=1` (default), `ONEHOT_MOE_PERMUTE_THRESHOLD` | <ul><li>Every MoE recipe</li><li>🌙 Sparse MLA top-k on DeepSeek-V4</li></ul> | [Parallelism](parallelism.md) |
-| **Profiling & observability** | `--profiler-config.profiler torch` with `--profile-result-dir`; `USE_PHASED_PROFILER=1`; Python / host / device tracer levels; vLLM Prometheus metrics (local and external prefix-cache hit counters) | <ul><li>📝 `examples/tpu_profiling.py`</li><li>📝 `examples/run_profiling_suite.sh`</li></ul> | [Profiling](../developers_guide/profiling.md) |
+| **Profiling & observability** | `--profiler-config.profiler torch` with `--profile-result-dir`; `USE_PHASED_PROFILER=1`; Python / host / device tracer levels; vLLM Prometheus metrics (local and external prefix-cache hit counters) | <ul><li>📝 `examples/tpu_profiling.py`</li><li>📝 `examples/run_profiling_suite.sh`</li></ul> | [Profiling](../developers_guide/profiling/index.md) |
 
 </div>
 

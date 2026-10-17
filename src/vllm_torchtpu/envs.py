@@ -98,6 +98,8 @@ if TYPE_CHECKING:
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
+    TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
+    TPU_PRECOMPILE_PEER_REPLAY: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
@@ -106,6 +108,7 @@ if TYPE_CHECKING:
     TPU_STREAMIDX_SMALL_BUCKET_TOKENS: int = 64
     VLLM_TPU_INDEXER_KV_CACHE_MODE: str = "sal"
     TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER: bool = True
+    TPU_SPARSE_MLA_CHUNK_TOKENS: int | None = None
     TPU_MOE_COLLECTION_CHUNK_SIZE: int = 0
     TPU_MOE_FP8_ALL_GATHER: bool = False
     TPU_PCP_TOPOLOGY_AWARE_MESH: bool = True
@@ -782,6 +785,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_PP_LAZY_PUSH": env_bool("TPU_PP_LAZY_PUSH", default=False),
     # Enable pre-compile rotation to speed up the startup time.
     "TPU_PARALLEL_PRECOMPILE": env_bool("TPU_PARALLEL_PRECOMPILE", default=False),
+    # Under TPU_PARALLEL_PRECOMPILE, take a subgraph's ranges biggest first,
+    # so local rank 0 starts on the biggest one. Off keeps vLLM's order.
+    "TPU_PRECOMPILE_BIGGEST_FIRST": env_bool(
+        "TPU_PRECOMPILE_BIGGEST_FIRST", default=False
+    ),
+    # Replay a bucket another rank of the host compiled instead of compiling
+    # it again: under TPU_PARALLEL_PRECOMPILE each bucket gets one owner rank
+    # per host and the others wait for its artifact. Off compiles every bucket
+    # on every rank, sharing only through the Tier-2 cache.
+    "TPU_PRECOMPILE_PEER_REPLAY": env_bool("TPU_PRECOMPILE_PEER_REPLAY", default=False),
     # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
     # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
     # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.
@@ -836,6 +849,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ).lower(),
     "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER": env_bool(
         "TPU_SPARSE_MLA_DCP_FUSED_Q_GATHER", True
+    ),
+    # Query-token chunk size for sparse MLA attention (GLM-5.2 / DSv3.2-style):
+    # each chunk gathers its tokens' top-k KV rows into one buffer and then
+    # attends over it. The chunk loop is unrolled at trace time, so a graph
+    # holds `num_tokens / chunk` gather + attention kernel pairs per layer;
+    # bigger chunks compile faster but need a bigger gather buffer
+    # (chunk * top-k rows) and pipeline gather with attention more coarsely.
+    # Unset keeps the kernel default (64).
+    "TPU_SPARSE_MLA_CHUNK_TOKENS": env_positive_int_or_none(
+        "TPU_SPARSE_MLA_CHUNK_TOKENS"
     ),
     # Post-gather MoE token chunk size for communication-computation pipelining.
     # When set to 0, chunking and communication pipelining are disabled.

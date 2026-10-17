@@ -411,10 +411,16 @@ def _patch_vllm_disable_compile_ranges() -> None:
 
 
 def _patch_vllm_compile_all_ranges() -> None:
-    """Patch vllm compile all ranges to support compilation rotation.
+    """Patch vllm compile all ranges so the ranks of a host split the ranges.
 
-    Compilation rotation allows vllm to compile multiple sizes at the same time,
-    which greatly reduce the vllm startup time.
+    With TPU_PRECOMPILE_PEER_REPLAY=1, each range is compiled by one rank of
+    the host, its owner; every other rank replays the artifact the owner saves
+    to vLLM's compile cache instead of tracing and compiling the range again
+    (see TpuCompilerAdaptor.compile). Startup then takes about as long as the
+    slowest single range instead of the sum over ranges.
+
+    Off, the default, each rank compiles every range itself, starting on a
+    different one, and the ranks share only through the Tier-2 cache.
     """
     import os
     from collections import deque
@@ -425,16 +431,54 @@ def _patch_vllm_compile_all_ranges() -> None:
         get_fake_args_from_graph,
     )
 
-    def compile_all_ranges(self) -> None:
-        """Compile all range entries for this piecewise subgraph up front."""
-        assert self.graph is not None, (
-            "Cannot compile without a graph. "
-            "When loading from cache/AOT artifacts, "
-            "compile_all_ranges should not be called."
+    def ranks_per_host() -> int | None:
+        """How many ranks share this host, or None if that is unknown."""
+        try:
+            from vllm.distributed.parallel_state import (
+                get_node_count,
+                get_world_group,
+            )
+
+            world_size = get_world_group().world_size
+            nodes = get_node_count()
+        except Exception:
+            return None
+        if nodes <= 0 or world_size % nodes:
+            return None
+        return world_size // nodes
+
+    def compile_entry(self, range_entry) -> None:
+        self._log_compile_start(range_entry.compile_range)
+
+        if range_entry.compile_range.is_single_size():
+            args_list = create_concrete_args(
+                self.graph, range_entry.compile_range.start
+            )
+        else:
+            args_list = get_fake_args_from_graph(self.graph)
+
+        range_entry.runnable = self.vllm_backend.compiler_manager.compile(
+            self.graph,
+            args_list,
+            self.vllm_backend.inductor_config,
+            self.compilation_config,
+            compile_range=range_entry.compile_range,
+            graph_index=self.piecewise_compile_index,
+            num_graphs=self.total_piecewise_compiles,
+            is_encoder=self.vllm_backend.is_encoder,
         )
 
-        local_rank = int(os.environ["LOCAL_RANK"])
+        range_entry.compiled = True
+
+    def compile_rotated(self, local_rank: int) -> None:
+        """Compile every range here, each local rank starting on a different
+        one: the order without peer replay."""
         range_entry_list = list(self.range_entries.values())
+        if envs.TPU_PRECOMPILE_BIGGEST_FIRST:
+            # Biggest first: local rank 0 starts on the biggest range, which
+            # takes far longer than the others and so bounds startup, instead
+            # of reaching it only after the smallest one.
+            range_entry_list.sort(key=lambda e: e.compile_range.end, reverse=True)
 
         range_entry_len = len(range_entry_list)
 
@@ -452,27 +496,53 @@ def _patch_vllm_compile_all_ranges() -> None:
             if range_entry.compiled:
                 continue
 
-            self._log_compile_start(range_entry.compile_range)
+            compile_entry(self, range_entry)
 
-            if range_entry.compile_range.is_single_size():
-                args_list = create_concrete_args(
-                    self.graph, range_entry.compile_range.start
-                )
+    def compile_all_ranges(self) -> None:
+        """Compile all range entries for this piecewise subgraph up front."""
+        assert self.graph is not None, (
+            "Cannot compile without a graph. "
+            "When loading from cache/AOT artifacts, "
+            "compile_all_ranges should not be called."
+        )
+        local_rank = int(os.environ["LOCAL_RANK"])
+        if not envs.TPU_PRECOMPILE_PEER_REPLAY:
+            compile_rotated(self, local_rank)
+            return
+
+        from vllm_torchtpu.compilation.tpu_compiler import (
+            PEER_WAIT_S,
+            wait_for_peer_artifact,
+        )
+
+        ranks = ranks_per_host()
+        # Unknown: assume a full host, but do not wait on owners that may not
+        # exist; a range nobody saved yet is then compiled here.
+        wait_s = PEER_WAIT_S if ranks is not None and local_rank < ranks else 0.0
+        ranks = ranks or 8
+
+        # Biggest first, dealt out in a snake: local rank 0 starts on the
+        # biggest range, which takes far longer than the others and so bounds
+        # startup, and a rank whose first range is small gets the next one.
+        # TPU_PRECOMPILE_BIGGEST_FIRST=0 deals them in vLLM's order instead.
+        entries = [e for e in self.range_entries.values() if not e.compiled]
+        if envs.TPU_PRECOMPILE_BIGGEST_FIRST:
+            entries.sort(key=lambda e: e.compile_range.end, reverse=True)
+        mine, others = [], []
+        for i, range_entry in enumerate(entries):
+            turn, slot = divmod(i, ranks)
+            owner = slot if turn % 2 == 0 else ranks - 1 - slot
+            if owner == local_rank:
+                mine.append(range_entry)
             else:
-                args_list = get_fake_args_from_graph(self.graph)
+                # In the order the owners finish them: by turn, small first.
+                others.append((turn, range_entry.compile_range.end, range_entry))
 
-            range_entry.runnable = self.vllm_backend.compiler_manager.compile(
-                self.graph,
-                args_list,
-                self.vllm_backend.inductor_config,
-                self.compilation_config,
-                compile_range=range_entry.compile_range,
-                graph_index=self.piecewise_compile_index,
-                num_graphs=self.total_piecewise_compiles,
-                is_encoder=self.vllm_backend.is_encoder,
-            )
-
-            range_entry.compiled = True
+        for range_entry in mine:
+            compile_entry(self, range_entry)
+        with wait_for_peer_artifact(wait_s):
+            for _, _, range_entry in sorted(others, key=lambda o: o[:2]):
+                compile_entry(self, range_entry)
 
     if envs.TPU_PARALLEL_PRECOMPILE:
         PiecewiseBackend.compile_all_ranges = compile_all_ranges
@@ -1017,13 +1087,67 @@ def _patch_vllm_hybrid_pcp_block_sizes() -> None:
         logger.info("Applied TPU patch: hybrid full-attention + Mamba PCP block sizes.")
 
 
+# CPU KV offloading connectors (vLLM's and the Raiden store-backed one). They
+# hash at the scheduler's hash unit and chunk at the logical block.
+_OFFLOADING_CONNECTORS = frozenset(
+    {"OffloadingConnector", "TPURaidenOffloadingConnector"}
+)
+
+
+def _is_offloading_connector(kv_transfer_config) -> bool:
+    return getattr(kv_transfer_config, "kv_connector", None) in _OFFLOADING_CONNECTORS
+
+
+def _patch_vllm_offload_fine_prefix_alignment() -> None:
+    """Load offloaded chunks only from a chunk-aligned GPU prefix hit.
+
+    With DCP fine prefix hits a GPU hit can end inside a logical block. The
+    manager then copy-on-writes that shared block into a fresh one, and the
+    copy is applied by the runner at the next forward. An offload load of the
+    same chunk would DMA into that fresh block concurrently, and whichever
+    lands last wins -- the copy carries the other sequence's tail past the hit
+    point. A hit that ends mid-block means the prompt diverged inside that
+    block (eviction frees whole blocks, tail first), so the offload tier holds
+    nothing past it either; skip the lookup there instead of racing.
+    """
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (
+        OffloadingConnectorScheduler,
+    )
+
+    if getattr(OffloadingConnectorScheduler, "_tpu_fine_prefix_alignment", False):
+        return
+    original_lookup = OffloadingConnectorScheduler._lookup
+
+    def _lookup(self, req_status, *args, **kwargs):
+        local_tokens = req_status.num_locally_computed_tokens
+        for group_config in self.config.kv_group_configs:
+            if (
+                group_config.hashes_per_chunk > 1
+                and local_tokens % group_config.tokens_per_chunk
+            ):
+                return 0
+        return original_lookup(self, req_status, *args, **kwargs)
+
+    OffloadingConnectorScheduler._lookup = _lookup
+    OffloadingConnectorScheduler._tpu_fine_prefix_alignment = True
+    logger.info(
+        "Applied TPU patch: chunk-aligned offload loads under fine prefix hits."
+    )
+
+
 def _dcp_fine_prefix_match_unit(kv_cache_config, vllm_config) -> int | None:
     """Return the fine prefix-hit unit for a single-group DCP model, or None.
 
     Opt-in: only a single full-attention (incl. MLA) group under DCP with
-    prefix caching, no PCP, no KV connector, and an explicit
-    ``--prefix-match-unit`` smaller than the logical block (block_size * dcp).
-    Everything else keeps upstream behavior (hash == scheduler block).
+    prefix caching, no PCP, no KV connector other than a CPU offloading one,
+    and an explicit ``--prefix-match-unit`` smaller than the logical block
+    (block_size * dcp). Everything else keeps upstream behavior (hash ==
+    scheduler block).
+
+    Offloading connectors chunk at the logical block and key each chunk by its
+    last fine hash, so they work with a finer hash unit; see
+    ``_patch_vllm_offload_fine_prefix_alignment`` for the one load case that
+    needs care.
     """
     from vllm.v1.core.single_type_kv_cache_manager import FullAttentionManager
     from vllm.v1.kv_cache_interface import UniformTypeKVCacheSpecs
@@ -1039,8 +1163,11 @@ def _dcp_fine_prefix_match_unit(kv_cache_config, vllm_config) -> int | None:
         or not cache_config.enable_prefix_caching
         or dcp <= 1
         or parallel_config.prefill_context_parallel_size != 1
-        # Connectors (P/D, offload) consume block hashes at block granularity.
-        or vllm_config.kv_transfer_config is not None
+        # P/D connectors consume block hashes at block granularity.
+        or (
+            vllm_config.kv_transfer_config is not None
+            and not _is_offloading_connector(vllm_config.kv_transfer_config)
+        )
         or len(groups) != 1
     ):
         return None
@@ -1139,7 +1266,14 @@ def _patch_vllm_dcp_fine_prefix_hits() -> None:
         resolve_kv_cache_block_sizes._tpu_dcp_fine_prefix_patch = True
         kv_cache_utils.resolve_kv_cache_block_sizes = resolve_kv_cache_block_sizes
         resolve = resolve_kv_cache_block_sizes
-    for module_name in ("vllm.v1.engine.core", "vllm.v1.kv_offload.base"):
+    # The offloading config builder imports it by name too; its tokens_per_hash
+    # must match the scheduler's hash unit or offload keys land on the wrong
+    # hash boundaries.
+    for module_name in (
+        "vllm.v1.engine.core",
+        "vllm.v1.kv_offload.base",
+        "vllm.distributed.kv_transfer.kv_connector.v1.offloading.config",
+    ):
         module = sys.modules.get(module_name)
         if module is not None and hasattr(module, "resolve_kv_cache_block_sizes"):
             module.resolve_kv_cache_block_sizes = resolve

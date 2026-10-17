@@ -69,14 +69,14 @@ When either check reports a new error:
 - Fix the code. Do not add new errors to either baseline.
 - Keep runtime behavior unchanged. Do not add `try`/`except` or fallback
   values to silence an error. Common fixes:
-  - `assert x is not None` directly before the use, in the same branch, when
-    setup guarantees the value.
-  - Narrow into a local variable and assert before storing it on `self`, so
-    the attribute keeps the narrow type.
-  - `typing.cast` where vLLM declares a looser type than the value the code
-    receives.
-  - Initialize a variable before a conditional block instead of relying on
-    every branch to set it.
+    - `assert x is not None` directly before the use, in the same branch, when
+      setup guarantees the value.
+    - Narrow into a local variable and assert before storing it on `self`, so
+      the attribute keeps the narrow type.
+    - `typing.cast` where vLLM declares a looser type than the value the code
+      receives.
+    - Initialize a variable before a conditional block instead of relying on
+      every branch to set it.
 - Use an own-line `# pyrefly: ignore[<error-code>]` only for false positives,
   such as narrowing an inherited attribute (`bad-override-mutable-attribute`).
   Always name the error code.

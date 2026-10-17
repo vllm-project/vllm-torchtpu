@@ -58,7 +58,7 @@ vLLM TorchTPU is the integration of **TorchTPU** and **vLLM**. It is a vLLM plat
 
     [:octicons-arrow-right-24: Benchmarking](developers_guide/benchmarking.md)
 
-    [:octicons-arrow-right-24: Profiling](developers_guide/profiling.md)
+    [:octicons-arrow-right-24: Profiling](developers_guide/profiling/index.md)
 
     [:octicons-arrow-right-24: Environment Variables](reference/env_vars.md)
 

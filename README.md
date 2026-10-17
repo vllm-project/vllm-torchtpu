@@ -31,9 +31,8 @@ The goal is simple: **the same vLLM you already use — same CLI, same OpenAI-co
 
 | TPU generation | Status |
 | :--- | :--- |
-| **TPU v7x (Ironwood)** | Recommended — validated nightly in CI |
-| **TPU v6e (Trillium)** | Recommended — validated nightly in CI |
-| TPU v5e / v5p | Experimental — not covered by nightly CI |
+| **TPU v7x (Ironwood)** | Recommended — validated in CI on every pull request and nightly |
+| TPU v6e / v5e / v5p | Experimental — not covered by CI |
 
 See [Cloud TPU Setup](docs/getting_started/tpu_setup.md) for project setup, quota, and provisioning commands.
 
@@ -95,7 +94,7 @@ The [Quickstart](docs/getting_started/quickstart.md) covers offline batch infere
 `vllm-torchtpu` can serve most PyTorch models supported by vLLM, with first-class TPU kernel, quantization, and parallelism support for Qwen3 / Qwen3.5, DeepSeek-V3 / R1 / V4, Kimi-K2.5 / K3, GLM-5, Llama 3 / 4, GPT-OSS, Gemma 3 / 4, Mixtral, Qwen-VL and Gemma VL families, and diffusion models via `vllm-omni`.
 
 - **[Supported Models & Features](docs/user_guide/supported_models.md)** — validated model families, feature status, and quantization formats.
-- **[Nightly support matrices](support_matrices/nightly/)** — per-generation (v6e / v7x) unit, correctness, and benchmark status, updated automatically from CI.
+- **[Nightly support matrices](support_matrices/nightly/)** — TPU v7x unit, correctness, and benchmark status, updated automatically from nightly CI.
 
 <br>
 
@@ -117,7 +116,7 @@ We welcome contributions of all kinds — bug reports, model and feature request
 - **👀 Review pull requests:** help us keep quality high by reviewing [open PRs](https://github.com/vllm-project/vllm-torchtpu/pulls).
 - **💻 Write code:** start with the **[Contributing Guide](CONTRIBUTING.md)**, which covers environment setup, DCO sign-off, the `ready`-label CI gate, and the PR lifecycle. [Good first issues](https://github.com/vllm-project/vllm-torchtpu/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are a great place to begin.
 
-Developer references: [Testing & CI](docs/developers_guide/testing_and_ci.md) · [Profiling](docs/developers_guide/profiling.md) · [Benchmarking](docs/developers_guide/benchmarking.md) · [Coding guidance](docs/developers_guide/coding_guidance.md) · [Optimization best practices](docs/developers_guide/optimization_best_practices.md)
+Developer references: [Testing & CI](docs/developers_guide/testing_and_ci.md) · [Profiling](docs/developers_guide/profiling/index.md) · [Benchmarking](docs/developers_guide/benchmarking.md) · [Coding guidance](docs/developers_guide/coding_guidance.md) · [Optimization best practices](docs/developers_guide/optimization_best_practices.md)
 
 <br>
 

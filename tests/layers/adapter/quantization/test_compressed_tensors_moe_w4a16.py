@@ -162,20 +162,52 @@ class FakeRoutedExperts(RoutedExperts):
 
 
 class TestW4MoEUpstreamHooks:
-    """Inherited hooks must not read state the skipped __init__ never set."""
+    """Inherited hooks must not read state the skipped __init__ never set.
 
-    def test_eplb_hook_does_not_need_upstream_backend(self):
-        # RoutedExperts.__init__ reads supports_eplb when EPLB is enabled, and
-        # the inherited version reads self.wna16_backend, which only the
-        # upstream __init__ sets. get_fused_moe_quant_config has the same
-        # problem; test_moe_runner.py covers VllmMoERunner never calling it.
+    Regression for Kimi-K2.x (compressed-tensors W4A16 MoE) on vLLM 0.29:
+        AttributeError: 'VllmCompressedTensorsW4A16MoEMethod' object has no
+        attribute 'wna16_backend'
+    """
+
+    @staticmethod
+    def _make():
         layer = FakeRoutedExperts(experts_per_token=2)
-        method = VllmCompressedTensorsW4A16MoEMethod(
+        layer.quant_method = VllmCompressedTensorsW4A16MoEMethod(
             FakeQuantArgs(), None, layer.moe_config
         )
+        layer.w13_weight_scale = torch.nn.Parameter(
+            torch.ones(2, 1, 4), requires_grad=False
+        )
+        layer.w2_weight_scale = torch.nn.Parameter(
+            torch.ones(2, 1, 4), requires_grad=False
+        )
+        return layer, layer.quant_method
 
-        assert not hasattr(method, "wna16_backend")
+    def test_eplb_hook_does_not_need_upstream_backend(self):
+        # RoutedExperts.__init__ reads supports_eplb when EPLB is enabled.
+        _, method = self._make()
         assert method.supports_eplb is False
+
+    def test_quant_config_hook_does_not_need_upstream_backend(self):
+        # MoERunner._forward_impl -> RoutedExperts._ensure_moe_quant_config_init
+        # -> quant_method.get_fused_moe_quant_config on the first forward.
+        # Call the *upstream* RoutedExperts method unbound so the test does not
+        # depend on VllmMoERunner's per-instance override being installed.
+        layer, method = self._make()
+        assert method.get_fused_moe_quant_config(layer) is None
+        RoutedExperts._ensure_moe_quant_config_init(layer)
+        assert method.moe_quant_config is None
+
+    def test_upstream_backend_state_is_defined(self):
+        # Anything else inherited from CompressedTensorsWNA16MoEMethod that
+        # keys on the backend must see an explicit "no upstream backend"
+        # rather than an AttributeError.
+        _, method = self._make()
+        assert method.wna16_backend is None
+        assert method.experts_cls is None
+        assert method.is_marlin is False
+        assert method.moe_kernel is None
+        assert method.is_monolithic is True
 
 
 class TestW4MoEWeightPreprocessing:

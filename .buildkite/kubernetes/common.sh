@@ -30,7 +30,7 @@
 # also name its own image, which the disagg lane does - it builds one of its
 # own rather than using the CI image.
 if [[ -z "${WORKLOAD_IMAGE:-}" ]]; then
-  WORKLOAD_IMAGE=$(buildkite-agent meta-data get "CI_IMAGE_TAG${DOCKER_IMAGE_SUFFIX:-}" \
+  WORKLOAD_IMAGE=$(buildkite-agent meta-data get "${CI_IMAGE_TAG_KEY:-CI_IMAGE_TAG${DOCKER_IMAGE_SUFFIX:-}}" \
     --default "" 2>/dev/null || true)
 fi
 if [[ -z "${WORKLOAD_IMAGE:-}" ]]; then
@@ -119,10 +119,8 @@ FORWARD=(
   # Names the directory whose contents the pod uploads as artifacts.
   ARTIFACTS_DIR
   # The Kimi-K3 AgentX pair's job switches, read by k3_agentx_client_pod.sh
-  # and the megakernel recipe:
-  # the eval-only job (the eval step's own env, distinct from the
-  # K3_AGENTX_EVAL_ONLY build trigger), the eval smoke, and skipping the
-  # post-replay eval.
+  # and the megakernel recipe: the eval-only job, the eval smoke, and skipping
+  # the post-replay eval.
   AGENTX_EVAL_JOB AGENTX_EVAL_SMOKE AGENTX_SKIP_POST_EVAL
   # The config both engines of the pair and its client read, when a step serves
   # another than the manifest's default (a Kimi-K3 megakernel recipe point).

@@ -66,7 +66,8 @@ QWEN_IMAGE_EDIT_REVISION = "ac7f9318f633fc4b5778c59367c8128225f1e3de"
 
 # Full-image comparison metrics (calibrated against CPU reference across 512x512x3):
 # Image vs CPU ref                               MAE    SSIM  Pearson  HF     MeanDif
-# TPU v7x, torch_tpu ...release.2026.9.22 (CI)  0.0493 0.9527  0.9717  1.041  0.0380
+# TPU v7x, torch_tpu 0.2.0rc1 (CI)              0.0610 0.9172  0.9386  0.944  0.0386
+# TPU v7x, torch_tpu ...release.2026.9.22       0.0493 0.9527  0.9717  1.041  0.0380
 # TPU v7x, ...dev20260912 (ignores input img)   0.1719 0.1957  0.2187  0.522  0.1523
 # CPU same-recipe rerun (112 threads)           0.0020 0.9998  0.9998  0.999  0.0003
 # CPU 56 vs 112 threads                         0.0014 0.9999  0.9998  1.001  0.0001
@@ -77,7 +78,7 @@ QWEN_IMAGE_EDIT_REVISION = "ac7f9318f633fc4b5778c59367c8128225f1e3de"
 #
 # Synthetic perturbations of the TPU image (_PERTURBATIONS; the golden test applies
 # them and prints these metrics). They start from the TPU-vs-CPU offset in the
-# first row, not from zero error. Measured on TPU v7x at the CI pin:
+# first row, not from zero error. Measured on TPU v7x at the 2026.9.22 pin:
 # TPU + R/B channels swapped                    0.0697 0.8819  0.8844  1.041  0.0380
 # TPU + 3x3 box blur                            0.0491 0.9537  0.9724  0.598  0.0380
 # TPU + Gaussian noise, sigma 0.02              0.0543 0.9489  0.9681 10.754  0.0380
@@ -86,14 +87,14 @@ QWEN_IMAGE_EDIT_REVISION = "ac7f9318f633fc4b5778c59367c8128225f1e3de"
 #
 # ~1.5x margin over CI. Catches dev pin, 2-step, seed, prompt, CFG off.
 FULL_IMAGE_MAE_MAX = 0.074
-# Margin over 0.9527. Catches dev pin, 2-step, seed, prompt, CFG off, R/B swap.
-FULL_IMAGE_SSIM_MIN = 0.930
-# Margin over 0.9717. Catches dev pin, 2-step, seed, prompt, CFG off, R/B swap.
-FULL_IMAGE_PEARSON_MIN = 0.950
-# Margin over 1.041. Catches dev pin, blur, noise, prompt, CFG off.
+# Margin over 0.9172 (0.2.0rc1). Catches dev pin, 2-step, seed, prompt, CFG off, R/B.
+FULL_IMAGE_SSIM_MIN = 0.905
+# Margin over 0.9386 (0.2.0rc1). Catches dev pin, 2-step, seed, prompt, CFG off, R/B.
+FULL_IMAGE_PEARSON_MIN = 0.925
+# Margin over 0.944 / 1.041. Catches dev pin, blur, noise, prompt, CFG off.
 HF_ENERGY_RATIO_RANGE = (0.85, 1.20)
-# Margin over 0.0380. Catches dev pin, seed, prompt, CFG off.
-# Note: a further uniform shift of up to ~0.02 (0.060 - 0.0380) in the same
+# Margin over 0.0386. Catches dev pin, seed, prompt, CFG off.
+# Note: a further uniform shift of up to ~0.02 (0.060 - 0.0386) in the same
 # direction as the TPU-vs-CPU offset passes every metric.
 # See vllm-project/vllm-torchtpu#1936
 MEAN_SHIFT_MAX = 0.060

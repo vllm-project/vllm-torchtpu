@@ -358,15 +358,39 @@ class SparseMlaAttentionTest(parameterized.TestCase):
             topk=64,
             force_sparse=True,
         ),
+        # TPU_SPARSE_MLA_CHUNK_TOKENS: several chunks, and a ragged last one.
+        dict(
+            testcase_name="mixed_prefill_sparse_chunk16",
+            q_lens=[40, 24],
+            topk=64,
+            force_sparse=True,
+            chunk_tokens=16,
+        ),
+        dict(
+            testcase_name="mixed_prefill_sparse_chunk48",
+            q_lens=[40, 24],
+            topk=64,
+            force_sparse=True,
+            chunk_tokens=48,
+        ),
     )
-    def test_causal_matches_dense_reference(self, q_lens, topk, force_sparse=False):
+    def test_causal_matches_dense_reference(
+        self, q_lens, topk, force_sparse=False, chunk_tokens=None
+    ):
         """Causal-arange topk == dense MLA; validates the full path.
 
         These sequences are far below the masked-dense limit, so the default
         run exercises the masked-dense kernel; `force_sparse` pins the same
-        case to the gather kernel.
+        case to the gather kernel. `chunk_tokens` sets
+        TPU_SPARSE_MLA_CHUNK_TOKENS for the gather kernel's chunk loop.
         """
         self._require_tpu()
+        if chunk_tokens is not None:
+            self.enter_context(
+                mock.patch.dict(
+                    os.environ, {"TPU_SPARSE_MLA_CHUNK_TOKENS": str(chunk_tokens)}
+                )
+            )
         num_seqs = len(q_lens)
         total = sum(q_lens)
         num_tokens = math.ceil(total / TOKEN_PAD) * TOKEN_PAD
