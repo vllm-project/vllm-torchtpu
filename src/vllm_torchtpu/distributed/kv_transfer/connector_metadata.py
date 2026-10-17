@@ -55,3 +55,6 @@ class LoadMeta:
 class TPUConnectorMetadata(KVConnectorMetadata):
     reqs_to_send: dict[ReqId, SendMeta] = field(default_factory=dict)
     reqs_to_load: dict[ReqId, LoadMeta] = field(default_factory=dict)
+    # Debug only (TPU_RAIDEN_DSV4_DEBUG_CHECKSUMS=1): finished consumer
+    # requests whose prompt KV pages the worker digests and logs.
+    debug_digest_reqs: list = field(default_factory=list)

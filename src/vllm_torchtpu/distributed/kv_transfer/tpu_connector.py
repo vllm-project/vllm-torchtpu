@@ -1284,6 +1284,10 @@ class TPUConnectorScheduler:
         else:
             meta.reqs_to_load = self.reqs_to_load
             self.reqs_to_load = {}
+        debug_items = getattr(self, "_stage3_debug_digest_reqs", None)
+        if debug_items:
+            meta.debug_digest_reqs = list(debug_items)
+            debug_items.clear()
         return meta
 
     def get_finished_count(self) -> int:
@@ -2059,6 +2063,12 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         if not _use_raiden_stage3_transport():
             return super().request_finished(request, block_ids)
         if not self.is_producer:
+            if (
+                os.environ.get("TPU_RAIDEN_DSV4_DEBUG_CHECKSUMS", "0") == "1"
+                and _use_raiden_dsv4_admission()
+                and group_block_ids
+            ):
+                self._queue_stage3_dsv4_debug_digest(request, group_block_ids)
             params = request.kv_transfer_params
             if isinstance(params, dict) and params.get(_KV_PARAMS_ADMITTED):
                 source_req_id = params["req_id"]
@@ -2360,6 +2370,78 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             controller_address,
         )
         return True, params
+
+    def _queue_stage3_dsv4_debug_digest(
+        self, request: "Request", group_block_ids: list[list[int]]
+    ) -> None:
+        """Debug aid: ask the worker to digest this request's prompt KV pages.
+
+        Runs for every finished consumer request, so a local prefill of a
+        prompt and a PD run of the same prompt can be compared byte for byte
+        after the consumer computed its own first token.
+        """
+        # Every computed position, generated tokens included: a local request
+        # that consumed its own first output token then covers the same
+        # positions as a PD request for the one-token-longer prompt.
+        num_tokens = int(request.num_computed_tokens)
+        if num_tokens <= 0 or len(group_block_ids) != len(
+            self._stage3_transfer_groups
+        ):
+            return
+        tables: list[list[int]] = []
+        for group, ids in zip(self._stage3_transfer_groups, group_block_ids):
+            if group.slot:
+                try:
+                    tables.append(
+                        _stage3_slot_block(
+                            ids, group_label=f"g{group.cache_group_index}"
+                        )
+                    )
+                except ValueError as exc:
+                    logger.info(
+                        "dsv4_debug_digests: skip req_id=%s (%s)",
+                        request.request_id,
+                        exc,
+                    )
+                    return
+                continue
+            normalized = self._stage3_normalize_producer_blocks(
+                ids,
+                num_tokens=num_tokens,
+                page_tokens=group.page_tokens,
+                pcp_size=1,
+            )
+            if normalized is None:
+                logger.info(
+                    "dsv4_debug_digests: skip req_id=%s g%d blocks=%d "
+                    "num_tokens=%d page_tokens=%d",
+                    request.request_id,
+                    group.cache_group_index,
+                    len(tuple(ids)),
+                    num_tokens,
+                    group.page_tokens,
+                )
+                return
+            tables.append(list(normalized))
+        params = request.kv_transfer_params
+        uuid = (
+            int(params["uuid"])
+            if isinstance(params, dict) and params.get("uuid")
+            else None
+        )
+        queue = getattr(self, "_stage3_debug_digest_reqs", None)
+        if queue is None:
+            queue = self._stage3_debug_digest_reqs = []
+        queue.append(
+            {
+                "req_id": request.request_id,
+                "num_tokens": num_tokens,
+                "num_prompt_tokens": int(request.num_prompt_tokens),
+                "pd": uuid is not None,
+                "uuid": uuid,
+                "group_block_ids": tables,
+            }
+        )
 
     def update_connector_output(self, connector_output: Any) -> None:
         for req_id in connector_output.finished_sending or ():
@@ -3703,6 +3785,8 @@ class TPURaidenConnectorWorker:
         report_completion: bool = True,
     ) -> None:
         engine = self._ensure_raiden_transfer_engine()
+        if not self.is_producer:
+            self._stage3_dsv4_debug_digest_finished(metadata)
         if self.is_producer:
             if (
                 metadata.reqs_to_send
@@ -4337,7 +4421,48 @@ class TPURaidenConnectorWorker:
     def _stage3_dsv4_debug_enabled() -> bool:
         return os.environ.get("TPU_RAIDEN_DSV4_DEBUG_CHECKSUMS", "0") == "1"
 
-    def _stage3_dsv4_page_digests(self, req_meta: Any, num_tokens: int) -> dict[str, Any]:
+    def _stage3_dsv4_debug_digest_finished(self, metadata: Any) -> None:
+        """Debug aid: log page digests for finished consumer requests."""
+        items = getattr(metadata, "debug_digest_reqs", None)
+        if not items or not self._stage3_dsv4_debug_enabled():
+            return
+        if not _use_raiden_dsv4_admission() or not getattr(
+            self, "_stage3_dsv4_plan", None
+        ):
+            return
+        from types import SimpleNamespace
+
+        for item in items:
+            meta = SimpleNamespace(group_block_ids=item["group_block_ids"])
+            try:
+                digests = self._stage3_dsv4_page_digests(
+                    meta, int(item["num_tokens"]), rows=True
+                )
+            except Exception as exc:  # noqa: BLE001 - debug aid only
+                logger.warning(
+                    "dsv4_debug_digests failed req_id=%s: %s", item["req_id"], exc
+                )
+                continue
+            logger.info(
+                "%s",
+                json.dumps(
+                    {
+                        "event": "dsv4_debug_digests",
+                        "role": "finished",
+                        "req_id": item["req_id"],
+                        "uuid": item.get("uuid"),
+                        "pd": bool(item.get("pd")),
+                        "num_tokens": int(item["num_tokens"]),
+                        "num_prompt_tokens": item.get("num_prompt_tokens"),
+                        "digests": digests,
+                    },
+                    sort_keys=True,
+                ),
+            )
+
+    def _stage3_dsv4_page_digests(
+        self, req_meta: Any, num_tokens: int, rows: bool = False
+    ) -> dict[str, Any]:
         """MD5 of every transferred page's live bytes and of its whole block.
 
         Debug aid (TPU_RAIDEN_DSV4_DEBUG_CHECKSUMS=1): the producer logs this
@@ -4361,11 +4486,13 @@ class TPURaidenConnectorWorker:
                 flat_cache[storage_index] = storages[storage_index].reshape(-1)
             return flat_cache[storage_index]
 
-        def digest(storage_index: int, byte_offset: int, nbytes: int) -> str:
+        def fetch(storage_index: int, byte_offset: int, nbytes: int) -> bytes:
             view = flat(storage_index)
             itemsize = int(view.element_size())
             start, count = byte_offset // itemsize, nbytes // itemsize
-            chunk = view[start : start + count].cpu().numpy().tobytes()
+            return view[start : start + count].cpu().numpy().tobytes()
+
+        def md5(chunk: bytes) -> str:
             return hashlib.md5(chunk).hexdigest()[:12]
 
         group_blocks = self._stage3_dsv4_group_blocks(req_meta, num_tokens)
@@ -4387,18 +4514,37 @@ class TPURaidenConnectorWorker:
             )
             pool = pools_by_tag[plan_pool.tag]
             entries = []
-            for span in registration.spans:
+            spans = list(registration.spans)
+            row_bytes = int(plan_pool.row_bytes or 0)
+            for span in spans:
                 block = int(group.pages[span.src_block_ordinal])
                 base = int(pool.base_offset_bytes) + block * int(pool.block_stride_bytes)
-                entries.append(
-                    {
-                        "page": int(span.src_block_ordinal),
-                        "block": block,
-                        "live_bytes": int(span.size_bytes),
-                        "live": digest(pool.storage_index, base + int(span.src_offset_bytes), int(span.size_bytes)),
-                        "full": digest(pool.storage_index, base, int(pool.block_stride_bytes)),
-                    }
+                stride = int(pool.block_stride_bytes)
+                off, size = int(span.src_offset_bytes), int(span.size_bytes)
+                # One fetch per page; the live region is a slice of that window
+                # unless the pool's base offset pushes the span past it.
+                blob = fetch(pool.storage_index, base, stride)
+                live_blob = (
+                    blob[off : off + size]
+                    if off + size <= len(blob)
+                    else fetch(pool.storage_index, base + off, size)
                 )
+                entry = {
+                    "page": int(span.src_block_ordinal),
+                    "block": block,
+                    "live_bytes": size,
+                    "live": md5(live_blob),
+                    "full": md5(blob),
+                }
+                is_slot = bool(
+                    self._stage3_dsv4_transfer_groups[plan_pool.plan_position].slot
+                )
+                if rows and row_bytes > 0 and (is_slot or span is spans[-1]):
+                    entry["rows"] = [
+                        md5(live_blob[i : i + row_bytes])
+                        for i in range(0, len(live_blob), row_bytes)
+                    ][:256]
+                entries.append(entry)
             by_pool[plan_pool.tag] = entries
         return by_pool
 
