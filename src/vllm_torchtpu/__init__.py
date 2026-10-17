@@ -201,6 +201,135 @@ def _patch_vllm_aot_compile_cache_key() -> None:
     logger.info("Applied TPU patch: include compiler hash in AOT cache key.")
 
 
+def _aot_load_vote_group(model):
+    """The ranks that must take the same AOT load path as this one: those the
+    model's compiled graphs run collectives with, or None for no vote.
+
+    An encoder only talks within its tensor-parallel group, and not at all in
+    data-parallel encoder mode, where a rank without images skips it. Under
+    pipeline parallelism there is no vote: speculative decoding, the one
+    known trigger of a split, is rejected there (pp_validation).
+    """
+    import torch.distributed as dist
+    from vllm.distributed import parallel_state
+
+    if not dist.is_initialized():
+        return None
+    if model._is_encoder:
+        mm_config = model.vllm_config.model_config.multimodal_config
+        if mm_config is not None and mm_config.mm_encoder_tp_mode == "data":
+            return None
+        return parallel_state.get_tp_group()
+    if model.vllm_config.parallel_config.pipeline_parallel_size > 1:
+        return None
+    return parallel_state.get_world_group()
+
+
+def _aot_load_ranks_missing(ok, group, path, step):
+    """Gather `ok` from every rank of `group`; return the ranks where it is false.
+
+    `step` ("find" or "load") is the same on every rank, unlike `path`, which
+    names this rank's own artifact; it tags the gather, so a rank at the other
+    vote fails loudly instead of being read as an answer.
+    """
+    from vllm_torchtpu.distributed.rank_agreement import gather_step_reports
+
+    logger.debug("Waiting for %d ranks to %s %s.", group.world_size, step, path)
+    reports = gather_step_reports(
+        group,
+        f"AOT artifact {step} vote",
+        (int(ok),),
+        on_timeout=f"It was voting to {step} {path}. "
+        "Clear the compile cache, or raise --cpu-distributed-timeout-seconds if "
+        "a rank is legitimately slow to load.",
+    )
+    return [r for r, (rank_ok,) in enumerate(reports) if not rank_ok]
+
+
+def _patch_vllm_aot_load_unanimous() -> None:
+    """Use a rank's AOT artifact only if every rank that shares its collectives
+    loaded its own.
+
+    ``_try_load_aot_compiled_fn`` decides per rank: a rank whose
+    ``rank_{r}_{dp}/model`` is missing, truncated, or stale falls back to a
+    Dynamo compile while its peers run the loaded artifact. The two paths are
+    not collective-equivalent. The spec-decode warmup's first attempt fails
+    only on a Dynamo-compiling rank (see ``_warmup_one_spec_request``), so
+    that rank alone unwinds and retries while its peers are already inside
+    the draft step's collectives, which can halt the device.
+
+    The ranks agree twice. First on whether each one has a non-empty artifact,
+    before anything is loaded, so the common split (a missing file) leaves no
+    loaded state behind. Then on whether the load itself succeeded, which
+    catches an artifact that exists but cannot be loaded.
+    """
+    from vllm import envs as vllm_envs
+    from vllm.compilation import decorators
+
+    original = decorators._try_load_aot_compiled_fn
+    if getattr(original, "_tpu_unanimous_patch", False):
+        return
+
+    def tpu_try_load_aot_compiled_fn(model, aot_compilation_path):
+        import os
+
+        group = _aot_load_vote_group(model)
+        if group is None or group.world_size == 1:
+            return original(model, aot_compilation_path)
+
+        try:
+            present = os.path.getsize(aot_compilation_path) > 0
+        except OSError:
+            present = False
+        missing = _aot_load_ranks_missing(present, group, aot_compilation_path, "find")
+        if missing:
+            if vllm_envs.VLLM_FORCE_AOT_LOAD:
+                raise RuntimeError(
+                    f"VLLM_FORCE_AOT_LOAD is set but ranks {missing} have no AOT "
+                    f"artifact {aot_compilation_path}."
+                )
+            if present:
+                logger.warning(
+                    "Not loading AOT artifact %s: ranks %s of %d have none, so "
+                    "every rank compiles.",
+                    aot_compilation_path,
+                    missing,
+                    group.world_size,
+                )
+            return None
+
+        error = None
+        try:
+            loaded_fn = original(model, aot_compilation_path)
+        except Exception as e:  # VLLM_FORCE_AOT_LOAD re-raises
+            loaded_fn, error = None, e
+        failed = _aot_load_ranks_missing(
+            loaded_fn is not None, group, aot_compilation_path, "load"
+        )
+        if error is not None:
+            raise error
+        if not failed:
+            return loaded_fn
+        if vllm_envs.VLLM_FORCE_AOT_LOAD:
+            raise RuntimeError(
+                f"VLLM_FORCE_AOT_LOAD is set but the AOT artifact "
+                f"{aot_compilation_path} failed to load on ranks {failed}."
+            )
+        if loaded_fn is not None:
+            logger.warning(
+                "Discarding AOT artifact %s: it failed to load on ranks %s of %d, "
+                "so every rank compiles.",
+                aot_compilation_path,
+                failed,
+                group.world_size,
+            )
+        return None
+
+    tpu_try_load_aot_compiled_fn.__dict__["_tpu_unanimous_patch"] = True
+    decorators._try_load_aot_compiled_fn = tpu_try_load_aot_compiled_fn
+    logger.info("Applied TPU patch: load AOT artifacts only when all ranks can.")
+
+
 def _patch_vllm_config_hash_ignore_diagnostics() -> None:
     """Keep diagnostics-only ``additional_config`` keys out of cache keys.
 

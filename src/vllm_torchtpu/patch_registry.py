@@ -59,6 +59,9 @@ PATCHES = (
     Patch("vllm_torchtpu.layers.adapter.custom_ops:_register_custom_ops", _ACTIVE),
     # Compilation and cache keys.
     Patch("vllm_torchtpu:_patch_vllm_aot_compile_cache_key", _ACTIVE),
+    # TODO(https://github.com/vllm-project/vllm/issues/60391): Remove this
+    # patch once vLLM makes the AOT artifact load decision collective.
+    Patch("vllm_torchtpu:_patch_vllm_aot_load_unanimous", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_compile_all_ranges", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_compile_prefix_isolation", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_config_hash_ignore_diagnostics", _ACTIVE),
