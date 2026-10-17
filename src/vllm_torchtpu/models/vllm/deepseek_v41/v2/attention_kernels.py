@@ -336,6 +336,41 @@ def _attend_window(
     )
 
 
+def _swa_attention(q, pool, records, sink, scale):
+    """Fuse pure SWA without materializing split Q or merged O layouts."""
+    from vllm_torchtpu.kernels.mla.swa_attention import attend_swa
+
+    def direct(q, records):
+        kv = gather_cache_pieces(pool, records.reshape(-1), q.shape[-1])
+        kv = kv.reshape(4, *records.shape, 128)
+        return attend_swa(q, kv, (records >= 0)[:, None, :], sink, scale)
+
+    tokens = q.shape[0]
+    if tokens < 128 or tokens % 64 or tokens % 6 == 0 or records.shape[1] != 128:
+        return direct(q, records)
+    union, mask, uncovered = _window_union(records, 64)
+
+    def shared(_):
+        # A 192-row union is padded to one 256-row MXU RHS tile.
+        padded = jnp.pad(union, ((0, 0), (0, 256 - union.shape[1])), constant_values=-1)
+        kv = gather_cache_pieces(pool, padded.reshape(-1), q.shape[-1])
+        kv = kv.reshape(4, *padded.shape, 128)
+        padded_mask = jnp.pad(mask, ((0, 0), (0, 0), (0, 256 - union.shape[1])))
+        result = attend_swa(q, kv, padded_mask, sink, scale)
+
+        def patch(result):
+            index = jnp.nonzero(uncovered.reshape(-1), size=64, fill_value=tokens)[0]
+            source = jnp.minimum(index, tokens - 1)
+            sub_records = jnp.where((index < tokens)[:, None], records[source], -1)
+            return result.at[index].set(direct(q[source], sub_records), mode="drop")
+
+        return jax.lax.cond(uncovered.any(), patch, lambda x: x, result)
+
+    return jax.lax.cond(
+        uncovered.sum() > 64, lambda _: direct(q, records), shared, None
+    )
+
+
 def paged_attention_jax(
     q: jax.Array,
     swa_pool: jax.Array,
@@ -346,6 +381,10 @@ def paged_attention_jax(
     scale: float,
     gathered: jax.Array | None = None,
 ) -> jax.Array:
+    from vllm_torchtpu.kernels.mla.swa_attention import supports_swa
+
+    if main_records.shape[1] == 0 and supports_swa(q, swa_records):
+        return _swa_attention(q, swa_pool, swa_records, sink, scale)
     # SWA widths in the released model are multiples of 64, preserving the
     # reference's accumulation boundaries when compressed rows follow.
     maximum, denominator, numerator = _attend(

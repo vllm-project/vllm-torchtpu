@@ -807,3 +807,51 @@ def test_query_split_traces_one_graph_for_all_buckets():
         compiled(x)
     torch._dynamo.reset()
     assert counter.frame_count == 1
+
+
+@pytest.mark.parametrize("layout", ["shared", "boundary", "decode"])
+@pytest.mark.parametrize("banked", [False, True])
+def test_pure_swa_pallas_preserves_cache_addressing(monkeypatch, layout, banked):
+    """Check union reuse, request-tail patching and per-token windows end to end."""
+    import functools
+
+    from vllm_torchtpu.kernels.mla import swa_attention
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import _pack_bf16_words
+
+    if jax.default_backend() != "tpu":
+        monkeypatch.setattr(swa_attention, "supports_swa", lambda q, records: True)
+        monkeypatch.setattr(
+            swa_attention,
+            "attend_swa",
+            functools.partial(swa_attention.attend_swa, interpret=True),
+        )
+    rng = np.random.default_rng(17)
+    tokens, heads, dim = 128, 8, 512
+    values = jnp.asarray(rng.normal(size=(512, dim)), jnp.bfloat16)
+    pool = _pack_bf16_words(values).reshape(-1, 128)
+    if banked:
+        pool = (pool[:512], pool[512:])
+    positions = np.arange(tokens) + 127
+    if layout == "boundary":
+        positions[37:] = np.arange(tokens - 37) + 300
+    elif layout == "decode":
+        positions = rng.integers(127, 512, tokens)
+    records = positions[:, None] - 127 + np.arange(128)[None]
+    records[-1] = -1
+    records = jnp.asarray(records, jnp.int32)
+    q = jnp.asarray(rng.normal(size=(tokens, heads, dim)), jnp.bfloat16)
+    sink = jnp.asarray(rng.normal(size=heads), jnp.float32)
+    got = paged_attention_jax(
+        q, pool, pool, records, jnp.empty((tokens, 0), jnp.int32), sink, dim**-0.5
+    )
+    kv = values[jnp.maximum(records, 0)].astype(jnp.float32)
+    scores = jnp.einsum("thd,tkd->thk", q.astype(jnp.float32), kv) * dim**-0.5
+    scores = jnp.where((records >= 0)[:, None], scores, -jnp.inf)
+    maximum = jnp.maximum(scores.max(-1), sink)
+    prob = jnp.exp(scores - maximum[..., None])
+    expected = jnp.einsum("thk,tkd->thd", prob, kv)
+    expected /= (prob.sum(-1) + jnp.exp(sink - maximum))[..., None]
+    np.testing.assert_allclose(
+        np.asarray(got, np.float32), expected, atol=3e-3, rtol=1e-2
+    )
+    np.testing.assert_array_equal(got[-1], 0)
