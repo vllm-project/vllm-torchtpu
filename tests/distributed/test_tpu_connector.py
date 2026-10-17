@@ -4344,6 +4344,69 @@ class TestTPURaidenConnectorWorker:
         expected_errors = {41, 43} if terminal_result == "failure" else set()
         assert worker.get_block_ids_with_load_errors() == expected_errors
 
+    def test_v4_stage3_layout_fingerprint_mismatch_fails_without_waiting(self):
+        # The controller rejects peers whose layout fingerprints differ before
+        # it plans the transfer (no receiver is armed), so the load fails at
+        # once instead of waiting out the pull timeout for a native terminal.
+        scheduler = _make_raiden_scheduler(is_producer=False, block_size=1024)
+        req = MagicMock()
+        req.request_id = "mismatch-load"
+        req.num_prompt_tokens = 1537
+        req.kv_transfer_params = {
+            "req_id": "mismatch-load",
+            "uuid": 912,
+            "num_tokens": 1536,
+            "src_controller_address": "source-controller.test:27000",
+            "src_job_name": "prefill",
+            "src_engine_id": "source-engine",
+            "src_data_replica_idx": 0,
+            "src_parallelism": 8,
+            "dst_tp_size": 1,
+            "dst_dcp_size": 1,
+        }
+        blocks = MagicMock()
+        blocks.get_block_ids.return_value = ([41, 43],)
+        with patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True):
+            scheduler.update_state_after_alloc(req, blocks, 1536)
+            meta = scheduler.build_connector_meta()
+
+        worker = _make_raiden_worker(
+            tp_rank=0, tp_size=1, is_producer=False, dp_size=8, pcp_size=1
+        )
+        engine = _FakeRaidenEngine()
+        engine.poll_results = [([], [], [])]
+        facade = _FakeRaidenControllerFacade()
+        facade.start_transfer = MagicMock(
+            side_effect=RuntimeError(
+                "Remote Controller Server execution failed: Layout fingerprint "
+                "mismatch between source and destination"
+            )
+        )
+        worker._raiden_transfer_engine = engine
+        worker._raiden_controller_facade = facade
+        worker._raiden_controller_address = "dest-controller.test:28000"
+        worker._new_raiden_controller_facade = MagicMock(return_value=facade)
+        worker._raiden_work_unit = SimpleNamespace(job_name="decode")
+        worker._raiden_manifest = SimpleNamespace(
+            tag_counts=lambda: {"fa": 15, "gdn.conv": 45, "gdn.ssm": 45}
+        )
+        worker._new_raiden_id = MagicMock(
+            side_effect=lambda fields: SimpleNamespace(**fields)
+        )
+        worker._raiden_hbm_memory_type = MagicMock(return_value="HBM")
+
+        with (
+            patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+            patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 8, create=True),
+            patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=300.0),
+        ):
+            worker.process_send_load(meta)
+            _flush_stage3_submits(worker)
+            assert worker.get_finished() == (set(), {"mismatch-load"})
+
+        assert worker.get_block_ids_with_load_errors() == {41, 43}
+        assert worker._stage3_pending_controller_failures == {}
+
     def test_v4_stage3_uncertain_rpc_times_out_before_recompute(self):
         # Exercise the no-native-terminal fallback without duplicating the
         # full scheduler setup used above.

@@ -25,6 +25,7 @@ def _runner(**attrs):
         "_pp_take_topk_indices",
         "_pp_outgoing_tensors",
         "_sample_tokens_pp_intermediate_stage",
+        "_build_kv_connector_output",
         "sample_tokens",
     ):
         setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))

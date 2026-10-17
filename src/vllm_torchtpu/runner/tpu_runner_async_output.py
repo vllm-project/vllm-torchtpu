@@ -169,10 +169,13 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
         model_runner_output: ModelRunnerOutput,
         copy_state: AsyncTPUCopyState | None,
         discard_sampled_tokens_req_indices: list[int],
+        *,
+        materialize_token_ids: bool = True,
     ):
         self._model_runner_output: ModelRunnerOutput = model_runner_output
         self.copy_state = copy_state
         self.discard_sampled_tokens_req_indices = discard_sampled_tokens_req_indices
+        self.materialize_token_ids = materialize_token_ids
 
     def get_output(self) -> ModelRunnerOutput:
         if self.copy_state is None:
@@ -180,6 +183,8 @@ class AsyncTPUModelRunnerOutput(AsyncModelRunnerOutput):
             return self._model_runner_output
 
         self.copy_state.wait()
+        if not self.materialize_token_ids:
+            return self._model_runner_output
         selected_token_ids = self.copy_state.sampled_token_ids_cpu
         if selected_token_ids.numel() == 0:
             self._model_runner_output.sampled_token_ids = []

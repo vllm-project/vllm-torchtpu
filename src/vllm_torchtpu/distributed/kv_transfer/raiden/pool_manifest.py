@@ -614,6 +614,7 @@ def _pooled_kda_regions(
     spec: Any,
     row_bytes: int,
     page_bytes: int,
+    extra_conv_rows: int = 0,
 ) -> dict[str, tuple[int, tuple[RegionSpec, ...]]]:
     """Expose KDA's live state through Qwen's two state pool tags.
 
@@ -624,6 +625,10 @@ def _pooled_kda_regions(
     retains aligned, padded source-head shards in rank order. The KDA pool
     adapter restores logical tap/QKV/head order on load and reverses it on
     store, so each source shard transfers as one contiguous byte range.
+
+    ``extra_conv_rows`` extends the convolution region over that many rows
+    after its taps: the megakernel's DSpark draft ring
+    (``megakernel.kimi_k3.layout``), carried with the state.
     """
     shapes = tuple(getattr(spec, "shapes", ()))
     dtypes = tuple(getattr(spec, "dtypes", ()))
@@ -640,10 +645,11 @@ def _pooled_kda_regions(
         )
     except ValueError as exc:
         raise ManifestError(str(exc)) from exc
-    if layout.required_bytes > page_bytes:
+    if layout.required_bytes + extra_conv_rows * row_bytes > page_bytes:
         raise ManifestError(
             "KDA state exceeds its pooled page: "
             f"state={layout.required_bytes}, "
+            f"extra={extra_conv_rows * row_bytes}, "
             f"page={page_bytes}"
         )
     if str(ssm_dtype) != "torch.float32" or row_bytes % 4:
@@ -657,7 +663,11 @@ def _pooled_kda_regions(
             layout.ssm_tokens * row_bytes,
             (
                 RegionSpec(
-                    "kda_conv_rank_blocks", 0, row_bytes, row_bytes, layout.conv_tokens
+                    "kda_conv_rank_blocks",
+                    0,
+                    row_bytes,
+                    row_bytes,
+                    layout.conv_tokens + extra_conv_rows,
                 ),
             ),
         ),
@@ -964,11 +974,14 @@ def build_kimi_k3_pool_manifest(
     kv_cache_groups: Sequence[Any],
     raw_tensors: Sequence[Any],
     mamba_group_ordinal_by_layer: Mapping[str, int] | None = None,
+    extra_state_rows: int = 0,
 ) -> PoolManifest:
     """Describe K3's packed MLA/KDA rows using the shared hybrid pool tags.
 
     Only the layout differs from Qwen: storage binding, pool admission and
     Stage-3 transfers all use the same model-independent machinery.
+    ``extra_state_rows``: state-block rows after the conv taps that travel
+    with them (see ``_pooled_kda_regions``); both peers must agree.
     """
     entries: list[tuple[Any, PoolEntry]] = []
     for layer_name in _ordered_layers(named_kv_caches):
@@ -983,13 +996,13 @@ def build_kimi_k3_pool_manifest(
         shape = tuple(int(dim) for dim in tensor.shape)
         spec = _group_spec_for_layer(kv_cache_groups, layer_name)
         page_bytes = int(spec.page_size_bytes)
-        if len(shape) != 4 or _dtype_tag(tensor) != "bfloat16":
+        if len(shape) != 4 or _dtype_tag(tensor) not in ("bfloat16", "float8_e4m3fn"):
             raise ManifestError(
-                f"Kimi cache {layer_name} must be bf16 "
+                f"Kimi cache {layer_name} must be bf16 or E4M3FN "
                 f"[blocks, rows, packing, width], got {shape}"
             )
         num_blocks, rows, packing, width = shape
-        if min(shape) <= 0 or packing != 2:
+        if min(shape) <= 0 or packing * _element_size(tensor) != 4:
             raise ManifestError(
                 f"Kimi cache {layer_name} has invalid packed-row geometry"
             )
@@ -1009,7 +1022,10 @@ def build_kimi_k3_pool_manifest(
             )
         if is_state:
             layouts = _pooled_kda_regions(
-                spec=spec, row_bytes=row_bytes, page_bytes=page_bytes
+                spec=spec,
+                row_bytes=row_bytes,
+                page_bytes=page_bytes,
+                extra_conv_rows=extra_state_rows,
             )
             suffix = _state_tag_suffix(layer_name, mamba_group_ordinal_by_layer)
             tags = (TAG_GDN_CONV, TAG_GDN_SSM)

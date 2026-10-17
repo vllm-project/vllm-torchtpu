@@ -37,14 +37,14 @@ dependencies = [
     # torch==2.13.0 above; a mismatched pair fails at operator-registration time,
     # not at install time.
     "torchvision==0.28.0",
-    "torch-tpu==0.1.1.dev20260924085621",
+    "torch-tpu==0.1.1+release.2026.9.22.20261003154636",
     # High-bandwidth PJRT raw-transfer / KV-cache DMA engine backing the
     # raiden KV connector (disaggregated serving) and host KV offload; the
     # import name is `tpu_sync`. The wheel bundles one extension per
     # supported torch ABI and dispatches to the variant matching the
     # installed torch at import time. Published to PyPI as nightly .dev
     # pre-releases, so it needs no registry source below.
-    "tpu-sync-torch==0.0.1.dev20260923040928",
+    "tpu-sync-torch==0.0.1.dev20261013083150",
     # Imported directly by src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py, so
     # declared here rather than leaned on as a vLLM transitive.
     #
@@ -165,9 +165,21 @@ ignore = [
 # tools/check_b023_baseline.py counts the findings per file and fails when a
 # file gains one. Both move together.
 "src/vllm_torchtpu/kernels/**" = ["B023"]
+# The megakernel kernels (one file per role, several thousand lines) keep
+# their own dense 120-column layout, so `ruff format` skips them (see
+# [tool.ruff.format]); B023 is exempt for the reason above, under the same
+# ratchet.
+"src/vllm_torchtpu/megakernel/common/**" = ["B023", "E501", "E701", "E702", "E741"]
+"src/vllm_torchtpu/megakernel/kimi_k3/kernels/**" = [
+    "B023", "E501", "E701", "E702", "E741",
+]
 
 [tool.ruff.format]
 docstring-code-format = true
+exclude = [
+    "src/vllm_torchtpu/megakernel/common/**",
+    "src/vllm_torchtpu/megakernel/kimi_k3/kernels/**",
+]
 
 [tool.pyrefly]
 project-includes = ["src"]
@@ -204,6 +216,7 @@ ignore-missing-imports = [
     "google.protobuf", "google.protobuf.*",
     "jax", "jax.*",
     "jaxlib", "jaxlib.*",
+    "ml_dtypes", "ml_dtypes.*",
     "numpy", "numpy.*",
     "packaging", "packaging.*",
     "pathwaysutils", "pathwaysutils.*",
@@ -211,9 +224,11 @@ ignore-missing-imports = [
     "ray", "ray.*",
     "requests", "requests.*",
     "sympy", "sympy.*",
+    "tiktoken", "tiktoken.*",
     "torch", "torch.*",
     "torch_tpu", "torch_tpu.*",
     "runai_model_streamer", "runai_model_streamer.*",
+    "safetensors", "safetensors.*",
     "tpu_sync", "tpu_sync.*",
     "tqdm", "tqdm.*",
     "transformers", "transformers.*",

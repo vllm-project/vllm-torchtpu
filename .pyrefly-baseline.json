@@ -76,6 +76,11 @@
       "concise_description": "`input_mask` may be uninitialized"
     },
     {
+      "path": "src/vllm_torchtpu/__init__.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `FunctionType` has no attribute `_tpu_megakernel_prefix_hits_patch`"
+    },
+    {
       "path": "src/vllm_torchtpu/compilation/shape_variants.py",
       "name": "bad-argument-type",
       "concise_description": "Argument `int | None` is not assignable to parameter `element` with type `int` in function `set.add`"
@@ -1614,6 +1619,581 @@
       "path": "src/vllm_torchtpu/layers/core/sequence_layout.py",
       "name": "unsupported-delete",
       "concise_description": "Invalid target for `del`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/common/pool_alias.py",
+      "name": "bad-argument-count",
+      "concise_description": "Expected 0 positional arguments, got 1 in function `Reinterpret.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/decode.py",
+      "name": "bad-argument-count",
+      "concise_description": "Expected 4 positional arguments, got 6 in function `vllm_torchtpu.megakernel.kimi_k3.pools.KdaImporter.import_state`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/decode.py",
+      "name": "bad-argument-count",
+      "concise_description": "Expected 4 positional arguments, got 6 in function `vllm_torchtpu.megakernel.kimi_k3.pools.KdaImporter.import_state`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "bad-argument-count",
+      "concise_description": "Expected 0 positional arguments, got 1 in function `_PaddedBf16Rows.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`initial_first` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`initial_second` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`+` is not supported between `Literal[1]` and `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`+` is not supported between `Literal[1]` and `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`raw_recurrent_gate` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `finish`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`output_gate` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `table_ref`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `pool_ref`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "bad-argument-count",
+      "concise_description": "Expected 4 positional arguments, got 6 in function `vllm_torchtpu.megakernel.kimi_k3.kernels.mla_dcp.DcpAttention.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`output_gate_values` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`output_gate_values` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Keyword argument `embedding` with type `tuple[int | Unknown, int | Unknown]` is not assignable to parameter `**kwargs` with type `tuple[int | Unknown, int | Unknown, int] | tuple[int | Unknown, int, int | Unknown] | tuple[int | Unknown, int, int] | tuple[int | Unknown, int, int, int] | tuple[int | Unknown, int, int, int, int]` in function `typing.MutableMapping.update`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Keyword argument `lm_head` with type `tuple[int | Unknown, int | Unknown]` is not assignable to parameter `**kwargs` with type `tuple[int | Unknown, int | Unknown, int] | tuple[int | Unknown, int, int | Unknown] | tuple[int | Unknown, int, int] | tuple[int | Unknown, int, int, int] | tuple[int | Unknown, int, int, int, int]` in function `typing.MutableMapping.update`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Keyword argument `dense_gu` with type `tuple[int | Unknown, Literal[2304]]` is not assignable to parameter `**kwargs` with type `tuple[int | Unknown, int | Unknown, int] | tuple[int | Unknown, int, int | Unknown] | tuple[int | Unknown, int, int] | tuple[int | Unknown, int, int, int] | tuple[int | Unknown, int, int, int, int]` in function `typing.MutableMapping.update`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Keyword argument `dense_down` with type `tuple[Literal[1152], int | Unknown]` is not assignable to parameter `**kwargs` with type `tuple[int | Unknown, int | Unknown, int] | tuple[int | Unknown, int, int | Unknown] | tuple[int | Unknown, int, int] | tuple[int | Unknown, int, int, int] | tuple[int | Unknown, int, int, int, int]` in function `typing.MutableMapping.update`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Keyword argument `output_res` with type `tuple[Literal[1], int | Unknown]` is not assignable to parameter `**kwargs` with type `tuple[int | Unknown, int | Unknown, int] | tuple[int | Unknown, int, int | Unknown] | tuple[int | Unknown, int, int] | tuple[int | Unknown, int, int, int] | tuple[int | Unknown, int, int, int, int]` in function `typing.MutableMapping.update`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Keyword argument `final_norm` with type `tuple[Literal[1], int | Unknown]` is not assignable to parameter `**kwargs` with type `tuple[int | Unknown, int | Unknown, int] | tuple[int | Unknown, int, int | Unknown] | tuple[int | Unknown, int, int] | tuple[int | Unknown, int, int, int] | tuple[int | Unknown, int, int, int, int]` in function `typing.MutableMapping.update`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "no-matching-overload",
+      "concise_description": "No matching overload found for function `max` called with arguments: (dict[Unknown, int], key=Overload[\n  (key: Unknown, default: None = None, /) -> int | None\n  (key: Unknown, default: int, /) -> int\n  [_T](key: Unknown, default: _T, /) -> int | _T\n])"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `view`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `request`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `request`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`group_positions_smem` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `ChunkedWeightStream` has no attribute `shards`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "bad-argument-count",
+      "concise_description": "Expected 13 positional arguments, got 15 in function `KimiDeltaAttentionWeights.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "bad-argument-count",
+      "concise_description": "Expected 13 positional arguments, got 15 in function `KimiDeltaAttentionWeights.__init__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `str | None` is not assignable to parameter `probability_value_mxu` with type `Literal['bf16', 'hilo'] | None` in function `mla`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`dcp_scoped` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `str | None` is not assignable to parameter `probability_value_mxu` with type `Literal['bf16', 'hilo'] | None` in function `mla`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `at`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`row_slice` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "bad-unpacking",
+      "concise_description": "Cannot unpack list[Unknown] | tuple[Unknown, Unknown, Unknown, Unknown] (of size 4) into 2 values"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `dtype`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/decode_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/dspark.py",
+      "name": "bad-return",
+      "concise_description": "Returned type `dict[str, tuple[int] | tuple[int, int]]` is not assignable to declared return type `dict[str, tuple[int, ...]]`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/dspark.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `wait`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/dspark.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `wait`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/mla_dcp.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `DcpAttention` has no attribute `_attend_chunked`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/paged.py",
+      "name": "bad-unpacking",
+      "concise_description": "Cannot unpack tuple[Unknown, tuple[Unknown, Unknown, Unknown, Unknown]] | tuple[Unknown, Unknown, tuple[Unknown, Unknown, Unknown, Unknown]] (of size 2) into 3 values"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/paged.py",
+      "name": "bad-unpacking",
+      "concise_description": "Cannot unpack tuple[Unknown, tuple[Unknown, Unknown, Unknown, Unknown]] | tuple[Unknown, Unknown, tuple[Unknown, Unknown, Unknown, Unknown]] (of size 3) into 2 values"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/paged.py",
+      "name": "bad-unpacking",
+      "concise_description": "Cannot unpack tuple[Unknown, tuple[Unknown, Unknown, Unknown, Unknown] | Unknown, Unknown, Unknown, Unknown] | tuple[Unknown, Unknown, Unknown, Unknown] (of size 5) into 4 values"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/paged.py",
+      "name": "bad-index",
+      "concise_description": "Cannot index into `tuple[Unknown, Unknown, Unknown, Unknown]`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `int | None` is not assignable to parameter `step` with type `SupportsIndex` in function `range.__new__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`+` is not supported between `int` and `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`//` is not supported between `int` and `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `int | None` is not assignable to parameter `step` with type `SupportsIndex` in function `range.__new__`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`+` is not supported between `int` and `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`//` is not supported between `int` and `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_megakernel.py",
+      "name": "bad-assignment",
+      "concise_description": "`FusedWeightsRef` is not assignable to variable `rhs_ref` with type `WeightsRef`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`zero_size` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`%` is not supported between `int` and `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`%` is not supported between `None` and `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_megakernel.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `int | None` is not assignable to parameter with type `int`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "`None` is not subscriptable"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`count` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`lengths` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`segment` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`segment` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`layer_ref` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`prefix_k_hbm` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_megakernel.py",
+      "name": "unbound-name",
+      "concise_description": "`prefix_v_hbm` may be uninitialized"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_megakernel.py",
+      "name": "unsupported-operation",
+      "concise_description": "Cannot set item in `None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_megakernel.py",
+      "name": "bad-unpacking",
+      "concise_description": "Cannot unpack tuple[Unknown, Unknown, Unknown, Unknown] | tuple[Unknown, Unknown, Unknown, Unknown, Unknown] (of size 4) into 5 values"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/prefill_megakernel.py",
+      "name": "bad-argument-count",
+      "concise_description": "Expected 17 positional arguments, got 18 in function `project_ring_residual_body`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/rank_loader.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `tuple[Literal['dense'], int, () -> dict[str, Unknown]]` is not assignable to parameter `object` with type `tuple[str, int, (n: str = ...) -> Unknown] | tuple[str, Unknown, (filename: Unknown = ..., lo: Unknown = ..., hi: Unknown = ...) -> Unknown]` in function `list.append`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/rank_loader.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `tuple[Literal['dense'], int, () -> dict[str, Unknown]]` is not assignable to parameter `object` with type `tuple[str, int, (n: str = ...) -> Unknown] | tuple[str, Unknown, (filename: Unknown = ..., lo: Unknown = ..., hi: Unknown = ...) -> Unknown]` in function `list.append`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/kernels/rank_loader.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `tuple[Literal['latent_down', 'latent_up', 'shared_down', 'shared_gu'], Unknown, () -> Unknown]` is not assignable to parameter `object` with type `tuple[str, int, (n: str = ...) -> Unknown] | tuple[str, Unknown, (filename: Unknown = ..., lo: Unknown = ..., hi: Unknown = ...) -> Unknown]` in function `list.append`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/prefill.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `read_states`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/prefill.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `mla_pools`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/kimi_k3/prefill.py",
+      "name": "missing-attribute",
+      "concise_description": "Object of class `NoneType` has no attribute `write_packed`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/runner.py",
+      "name": "bad-override",
+      "concise_description": "Class member `MegakernelModelRunner.capture_model` overrides parent class `TPUModelRunner` in an inconsistent manner"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/runner.py",
+      "name": "bad-assignment",
+      "concise_description": "`MegakernelStepState` is not assignable to attribute `execute_model_state` with type `ExecuteModelState | None`"
+    },
+    {
+      "path": "src/vllm_torchtpu/megakernel/runner.py",
+      "name": "bad-argument-type",
+      "concise_description": "Argument `list[tuple[int, Unknown, Never, str]]` is not assignable to parameter `request_seq_lens` with type `list[tuple[int, Any, int, str]]` in function `vllm_torchtpu.runner.tpu_runner_async_output.AsyncPreResults.__init__`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
