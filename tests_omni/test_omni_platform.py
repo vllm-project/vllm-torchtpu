@@ -78,6 +78,7 @@ _UPSTREAM_SDPA_FORWARD = SDPAImpl.forward
 _UPSTREAM_ROPE_FORWARD = ltx2_transformer.LTX2AudioVideoRotaryPosEmbed.forward
 _UPSTREAM_APPLY_SPLIT_ROTARY_EMB = ltx2_transformer.apply_split_rotary_emb
 _UPSTREAM_RESTORE_BWE_FILTER = ltx2_runtime._restore_ltx_bwe_resampler_filter
+_UPSTREAM_DENOISE_TIMESTEP_KWARGS = ltx2_runtime.LTXRuntime._denoise_timestep_kwargs
 
 
 def test_register_omni_tpu_platform(monkeypatch):
@@ -945,3 +946,47 @@ def test_ltx2_split_rope_tables_reused_for_coords_views(ltx2, table_syncs, infer
 def test_supports_talker_mtp_graph_capture_disabled():
     assert OmniTpuPlatform.supports_talker_mtp_graph_capture() is False
     assert OmniTpuPlatform().supports_talker_mtp_graph_capture() is False
+
+
+def test_ltx2_per_sample_timestep_patch(monkeypatch):
+    runtime_cls = ltx2_runtime.LTXRuntime
+    monkeypatch.setattr(
+        runtime_cls, "_denoise_timestep_kwargs", _UPSTREAM_DENOISE_TIMESTEP_KWARGS
+    )
+    monkeypatch.setattr(
+        runtime_cls, "_tpu_orig_denoise_timestep_kwargs", None, raising=False
+    )
+    monkeypatch.delattr(runtime_cls, "_tpu_orig_denoise_timestep_kwargs")
+
+    apply_omni_model_specific_patches.cache_clear()
+    apply_omni_model_specific_patches()
+    assert (
+        runtime_cls._tpu_orig_denoise_timestep_kwargs
+        is _UPSTREAM_DENOISE_TIMESTEP_KWARGS
+    )
+
+    runtime = runtime_cls.__new__(runtime_cls)
+    runtime.guidance_executor = ltx2_runtime.LTXGuidanceExecutor()
+    ts = torch.tensor([500.0, 250.0])
+    counts = {"video_token_count": 7, "audio_token_count": 3}
+
+    unconditioned = SimpleNamespace(conditioning_mask=None)
+    kwargs = runtime._denoise_timestep_kwargs(ts, None, unconditioned, **counts)
+    assert kwargs["timestep"].shape == (2,)
+    assert kwargs["audio_timestep"].shape == (2,)
+    torch.testing.assert_close(kwargs["timestep"], ts)
+    torch.testing.assert_close(kwargs["sigma"], ts)
+
+    conditioned = SimpleNamespace(conditioning_mask=torch.ones(2, 7))
+    kwargs = runtime._denoise_timestep_kwargs(ts, None, conditioned, **counts)
+    assert kwargs["timestep"].shape == (2, 7)
+    assert kwargs["audio_timestep"].shape == (2, 3)
+    torch.testing.assert_close(kwargs["timestep"][:, 0], ts)
+
+    # Re-applying is a no-op and single-sample (B=1) stays 1-D.
+    installed = runtime_cls._denoise_timestep_kwargs
+    patches._patch_ltx2_per_sample_timestep()
+    assert runtime_cls._denoise_timestep_kwargs is installed
+    ts1 = torch.tensor([125.0])
+    kwargs1 = runtime._denoise_timestep_kwargs(ts1, None, unconditioned, **counts)
+    assert kwargs1["timestep"].shape == (1,) and kwargs1["audio_timestep"].shape == (1,)
