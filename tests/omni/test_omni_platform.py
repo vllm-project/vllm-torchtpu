@@ -63,6 +63,7 @@ from vllm_torchtpu.omni.rope import (
     apply_rotary_pair_swap,
     can_fuse_qk_norm_rope,
     rotary_embedding_wan_forward,
+    split_rope_natural_tables,
     wan_self_attention_fused,
 )
 
@@ -823,7 +824,19 @@ def test_ltx2_bwe_filter_cpu_restore_patch(monkeypatch):
 
 
 @pytest.fixture
-def ltx2(monkeypatch):
+def table_syncs(monkeypatch):
+    """Records the patch's synchronize_tensors calls instead of syncing."""
+    syncs = []
+
+    def record(tensors, wait):
+        syncs.append(tensors)
+
+    monkeypatch.setattr("vllm_torchtpu.utils.synchronize_tensors", record)
+    return syncs
+
+
+@pytest.fixture
+def ltx2(monkeypatch, table_syncs):
     """The mocked LTX-2 transformer module with _patch_ltx2_split_rope applied.
 
     The patch is installed on a fresh rope class; the module attributes it
@@ -915,3 +928,38 @@ def test_ltx2_split_rope_passes_other_tables_through(ltx2):
     _patch_ltx2_split_rope()
     assert ltx2.LTX2AudioVideoRotaryPosEmbed.forward is forward
     assert ltx2.apply_split_rotary_emb is apply_split_rotary_emb
+
+
+def test_ltx2_split_rope_tables_reused(ltx2, table_syncs):
+    # The original forward runs, and the tables are synced, once per coords
+    # tensor, coords version, device and out_dtype.
+    torch.manual_seed(0)
+    rope = ltx2.LTX2AudioVideoRotaryPosEmbed()
+    coords = _ltx2_coords()
+    cpu, bf16, f32 = torch.device("cpu"), torch.bfloat16, torch.float32
+    tables = rope(coords, device=cpu, out_dtype=bf16)
+    assert rope(coords, device=cpu, out_dtype=bf16) is tables
+    assert (rope.calls, len(table_syncs)) == (1, 1)
+    rope(coords.clone(), device=cpu, out_dtype=bf16)
+    rope(coords, device=cpu, out_dtype=f32)
+    stale = rope(coords, out_dtype=f32)
+    assert rope(coords, out_dtype=f32) is stale
+    assert (rope.calls, len(table_syncs)) == (4, 4)
+
+    coords.add_(1.0)  # bumps the version counter
+    fresh = rope(coords, out_dtype=f32)
+    assert rope.calls == 5
+    want = split_rope_natural_tables(*rope._tpu_orig_forward(coords, None, f32))
+    assert torch.equal(fresh[0], want[0]) and torch.equal(fresh[1], want[1])
+    assert not torch.equal(fresh[0], stale[0])
+
+    # Inference tensors have no version counter; they are keyed on identity.
+    with torch.inference_mode():
+        coords = _ltx2_coords()
+    tables = rope(coords)
+    assert rope(coords) is tables
+
+    rope = ltx2.LTX2AudioVideoRotaryPosEmbed(rope_type="interleaved")
+    rope(coords)
+    rope(coords)
+    assert rope.calls == 2
