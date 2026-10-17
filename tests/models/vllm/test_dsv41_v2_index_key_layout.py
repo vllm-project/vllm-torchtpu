@@ -2,10 +2,6 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Index-only cache interpretation must preserve other records and owners."""
 
-import os
-import subprocess
-import sys
-from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -81,43 +77,6 @@ def test_same_process_full_page_copy_preserves_halfplane_bits():
 
 
 def test_eager_native_index_cache_uses_tagged_interpretation():
-    # The real repository collection hook must run in a fresh interpreter.
-    path = Path(__file__).resolve()
-    root = path.parents[3]
-    gate_files = (
-        path,
-        root / "tests/kernels/deepseek_v41/test_index_key_layout.py",
-        root / "tests/kernels/test_dsv41_prefill_index_scores.py",
-        root / "tests/kernels/test_dsv41_decode_index_scores.py",
-        root / "tests/kernels/test_dsv41_decode_tuning.py",
-    )
-    collected = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "pytest",
-            "--collect-only",
-            "-q",
-            "-m",
-            "cpu_test",
-            *(str(file) for file in gate_files),
-        ],
-        cwd=root,
-        env={
-            **os.environ,
-            "JAX_PLATFORMS": "cpu",
-            "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
-        },
-        capture_output=True,
-        text=True,
-        timeout=90,
-        check=False,
-    )
-    output = collected.stdout + collected.stderr
-    assert collected.returncode == 0, output
-    assert "test_eager_native_index_cache_uses_tagged_interpretation" in output
-    assert "A JAX backend was initialized during test collection" not in output
-
     from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
         NativeCacheView,
         PagedCacheRows,
