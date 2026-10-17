@@ -60,10 +60,38 @@ def union_metadata(
     requests, queries, _ = candidates.shape
     if not 1 <= queries <= 8 or min(logical_blocks, capacity_blocks) < 1:
         raise ValueError("Union requires 1..8 queries and positive block capacities")
-    # Preserve the calibrated dense route through 128K index records. For
-    # longer contexts, bound metadata work by candidate count, not ID space.
+    # For longer contexts, bound metadata work by candidate count, not ID space.
     if logical_blocks > 131072 // 8:
         return _sorted_union_metadata(candidates, logical_blocks, capacity_blocks)
+    if (
+        jax.default_backend() == "tpu"
+        and candidates.dtype == jnp.int32
+        and requests > 0
+        and candidates.shape[-1] > 0
+        and candidates.shape[-1] % 128 == 0
+    ):
+        from jax.experimental.pallas import tpu as pltpu
+
+        from .union import sparse_union_metadata
+
+        tpu_info = pltpu.get_tpu_info()
+        info = tpu_info.sparse_core
+        if info is None or tpu_info.chip_version != pltpu.ChipVersion.TPU_7X:
+            return _dense_union_metadata(candidates, logical_blocks, capacity_blocks)
+        hist_size = queries * pl.cdiv(logical_blocks, 128) * 128
+        out_size = pl.cdiv(capacity_blocks, 128) * 128 + info.num_lanes
+        scratch_bytes = 4 * (hist_size + candidates.shape[-1] + 2 * out_size + 128)
+        if scratch_bytes <= info.vmem_capacity_bytes:
+            return UnionMetadata(
+                *sparse_union_metadata(candidates, logical_blocks, capacity_blocks)
+            )
+    return _dense_union_metadata(candidates, logical_blocks, capacity_blocks)
+
+
+def _dense_union_metadata(
+    candidates: jax.Array, logical_blocks: int, capacity_blocks: int
+) -> UnionMetadata:
+    requests, queries, _ = candidates.shape
     valid = (candidates >= 0) & (candidates < logical_blocks)
     safe = jnp.where(valid, candidates, logical_blocks)
     presence = jnp.zeros((requests, queries, logical_blocks + 1), jnp.int32)

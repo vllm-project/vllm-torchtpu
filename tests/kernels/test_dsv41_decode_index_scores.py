@@ -234,3 +234,48 @@ def test_candidate_scores_match_independent_per_head_reference(seed, packed):
                 ):
                     expected[r, query, slot] = -np.inf
     np.testing.assert_allclose(scores, expected, rtol=1e-5, atol=4e-5)
+
+
+@pytest.mark.parametrize(
+    "queries,logical_blocks,capacity",
+    [
+        (1, 129, 7),
+        (6, 12352, 6144),
+        (8, 16384, 6144),
+        (6, 12352, 1),
+        (6, 12352, 12352),
+    ],
+)
+def test_sparse_candidate_union_exact(queries, logical_blocks, capacity):
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
+        union_metadata,
+    )
+
+    if jax.default_backend() != "tpu":
+        pytest.skip("SparseCore lowering requires a TPU")
+    rng = np.random.default_rng(20261017)
+    values = rng.integers(-2, logical_blocks + 2, (5, queries, 2048), dtype=np.int32)
+    values[0] = -1
+    values[1] = logical_blocks - 1
+    values[2, :, ::2] = 0
+    result = jax.jit(
+        lambda x: union_metadata(
+            x, logical_blocks=logical_blocks, capacity_blocks=capacity
+        )
+    )(jnp.asarray(values))
+    for request, rows in enumerate(values):
+        expected = {}
+        for query, ids in enumerate(rows):
+            for block in ids:
+                if 0 <= block < logical_blocks:
+                    expected[int(block)] = expected.get(int(block), 0) | (1 << query)
+        ids = sorted(expected)[:capacity]
+        np.testing.assert_array_equal(
+            result.ids[request], ids + [-1] * (capacity - len(ids))
+        )
+        np.testing.assert_array_equal(
+            result.membership[request],
+            [expected[i] for i in ids] + [0] * (capacity - len(ids)),
+        )
+        assert int(result.actual_count[request]) == len(expected)
+        assert bool(result.overflow[request]) == (len(expected) > capacity)
