@@ -670,10 +670,19 @@ class TpuPlatform(Platform):
             patch_executor_for_pp_wave(vllm_config)
             _configure_pipeline_chunks(vllm_config)
 
+        from vllm_torchtpu.megakernel import backend as megakernel
+
+        # The megakernel program's capabilities (see validate_request), or None.
+        cls._megakernel_capabilities = megakernel.capabilities(vllm_config)
+
         from vllm.config import CompilationMode
 
         compilation_config = vllm_config.compilation_config
-        if compilation_config.mode == CompilationMode.NONE:
+        if cls._megakernel_capabilities is not None:
+            # A megakernel program is JAX-compiled ops called eagerly; the
+            # runner never traces the model (megakernel.runner).
+            compilation_config.mode = CompilationMode.NONE
+        elif compilation_config.mode == CompilationMode.NONE:
             # --enforce-eager is set
             pass
         else:
@@ -1059,6 +1068,53 @@ class TpuPlatform(Platform):
         from vllm.sampling_params import SamplingParams, SamplingType
 
         del processed_inputs
+        capabilities = getattr(cls, "_megakernel_capabilities", None)
+        if isinstance(params, SamplingParams) and capabilities is not None:
+            # A megakernel program chooses tokens in its ops: only the
+            # sampling parameters it declares.
+            unsupported = [
+                name
+                for name, used in (
+                    ("logprobs", params.logprobs is not None),
+                    ("prompt_logprobs", params.prompt_logprobs is not None),
+                    (
+                        "structured outputs",
+                        params.structured_outputs is not None
+                        and not capabilities.structured_outputs,
+                    ),
+                    (
+                        "presence/frequency/repetition penalties",
+                        params.presence_penalty != 0
+                        or params.frequency_penalty != 0
+                        or params.repetition_penalty != 1,
+                    ),
+                    ("min_p", params.min_p > 0),
+                    ("logit_bias", bool(params.logit_bias)),
+                    ("allowed_token_ids", bool(params.allowed_token_ids)),
+                    ("bad_words", bool(params.bad_words)),
+                    ("min_tokens", params.min_tokens > 0),
+                    (
+                        "seed",
+                        params.seed is not None and "seed" not in capabilities.sampling,
+                    ),
+                    (
+                        "top_k",
+                        (params.top_k or 0) > 0
+                        and "top_k" not in capabilities.sampling,
+                    ),
+                    (
+                        "top_p",
+                        params.top_p < 1 and "top_p" not in capabilities.sampling,
+                    ),
+                )
+                if used
+            ]
+            if unsupported:
+                raise ValueError(
+                    "the megakernel program chooses tokens in its ops and does not "
+                    f"support {', '.join(unsupported)}"
+                )
+            return
         if isinstance(params, SamplingParams):
             if params.sampling_type == SamplingType.RANDOM_SEED:
                 raise ValueError("JAX does not support per-request seed.")

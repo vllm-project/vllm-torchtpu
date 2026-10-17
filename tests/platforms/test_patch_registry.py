@@ -211,9 +211,11 @@ def test_manifest_preserves_lifecycle_dependencies():
     assert stages["engine_core"] == [
         "_patch_vllm_hybrid_pcp_block_sizes",
         "_patch_vllm_mamba_split_scheduler_block_size",
+        "_patch_vllm_megakernel_prefix_hits",
         "_patch_vllm_offloading_config_build",
         "_patch_vllm_hybrid_kv_load_failure_recovery",
         "_patch_vllm_same_step_prefix_hits",
+        "install",
         "_patch_vllm_merge_multimodal_embeddings",
     ]
     assert stages["platform_activation"] == (

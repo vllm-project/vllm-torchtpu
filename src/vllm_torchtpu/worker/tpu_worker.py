@@ -444,7 +444,14 @@ class TPUWorker(WorkerBase):
         is_last_rank = pp_group.is_last_rank
 
         # TODO: Fix device assignment
-        self.model_runner = TPUModelRunner(
+        runner_cls = TPUModelRunner
+        from vllm_torchtpu.megakernel import backend as megakernel
+
+        if megakernel.role(self.vllm_config) is not None:
+            from vllm_torchtpu.megakernel.runner import MegakernelModelRunner
+
+            runner_cls = MegakernelModelRunner
+        self.model_runner = runner_cls(
             self.vllm_config,
             self.devices[0],
             profiler_rank=self.profile_rank,

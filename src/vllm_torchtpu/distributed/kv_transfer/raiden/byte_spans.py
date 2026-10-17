@@ -547,3 +547,110 @@ def lower_dsv4_row_spans(
         declared_bytes=sum(span.size_bytes for span in spans),
         dst_space_version=1,
     )
+
+
+def lower_dcp_page_spans(
+    *,
+    tag: str,
+    transfer_rank: int,
+    live_bytes_per_block: int,
+    block_ids: Sequence[int],
+) -> PoolSpanRegistration:
+    """Lower one rank's share of a decode-context-parallel cache.
+
+    Under vLLM decode context parallelism every rank holds a different page
+    under each of the request's logical block ids (rank r: global page
+    ``N j + r`` at logical block j), so no page is replicated and there is
+    nothing to stripe: rank r sends every one of its blocks, whole, to the
+    destination unit of the same ordinal, which holds the same share. Spans
+    address the request-global compact byte space (block j at ``j *
+    live_bytes_per_block``) so the controller can still clip a destination
+    prefix hit (``dst_skip_bytes``, whole logical blocks); every destination
+    unit is covered over the same extents (full final page included).
+    """
+    if not tag:
+        raise ValueError("pool tag must not be empty")
+    if transfer_rank < 0:
+        raise ValueError("transfer rank must be non-negative")
+    if live_bytes_per_block <= 0:
+        raise ValueError("live_bytes_per_block must be positive")
+    spans = tuple(
+        PoolByteSpan(
+            src_block_ordinal=j,
+            src_offset_bytes=0,
+            dst_block_index=0,
+            dst_offset_bytes=j * live_bytes_per_block,
+            size_bytes=live_bytes_per_block,
+            dst_unit_ordinal=transfer_rank,
+        )
+        for j in range(len(block_ids))
+    )
+    return PoolSpanRegistration(
+        tag=tag,
+        block_ids=tuple(int(block_id) for block_id in block_ids),
+        spans=spans,
+        declared_bytes=len(spans) * live_bytes_per_block,
+        dst_space_version=1,
+    )
+
+
+def lower_dcp_page_spans_to_dcp(
+    *,
+    tag: str,
+    transfer_rank: int,
+    live_bytes_per_block: int,
+    block_ids: Sequence[int],
+    src_dcp_size: int,
+    dst_dcp_size: int,
+    dst_units: int,
+    num_tokens: int,
+    page_tokens: int,
+) -> PoolSpanRegistration:
+    """Lower one rank's share of a decode-context-parallel cache to a
+    destination with a smaller DCP degree that divides it.
+
+    Source rank r holds global page ``src_dcp_size * j + r`` at logical
+    block j. At the destination, page g belongs to every unit u with
+    ``u % dst_dcp_size == g % dst_dcp_size`` (the DCP groups are
+    contiguous destination units, so each group holds a full copy), at local page
+    ``g // dst_dcp_size`` of its compact byte space. Pages past the
+    destination's ``ceil(num_tokens / (page_tokens * dst_dcp_size))``
+    blocks are padding and are not sent, so every destination unit is
+    covered over the same extents.
+    """
+    if not tag:
+        raise ValueError("pool tag must not be empty")
+    if live_bytes_per_block <= 0:
+        raise ValueError("live_bytes_per_block must be positive")
+    if not 0 <= transfer_rank < src_dcp_size:
+        raise ValueError("transfer rank must be a source DCP rank")
+    if src_dcp_size % dst_dcp_size or dst_units % dst_dcp_size:
+        raise ValueError(
+            "destination DCP size must divide the source DCP size and the "
+            "destination unit count"
+        )
+    dst_blocks = -(-int(num_tokens) // (page_tokens * dst_dcp_size))
+    spans = []
+    for j in range(len(block_ids)):
+        page = src_dcp_size * j + transfer_rank
+        local = page // dst_dcp_size
+        if local >= dst_blocks:
+            continue
+        for unit in range(page % dst_dcp_size, dst_units, dst_dcp_size):
+            spans.append(
+                PoolByteSpan(
+                    src_block_ordinal=j,
+                    src_offset_bytes=0,
+                    dst_block_index=0,
+                    dst_offset_bytes=local * live_bytes_per_block,
+                    size_bytes=live_bytes_per_block,
+                    dst_unit_ordinal=unit,
+                )
+            )
+    return PoolSpanRegistration(
+        tag=tag,
+        block_ids=tuple(int(block_id) for block_id in block_ids),
+        spans=tuple(spans),
+        declared_bytes=len(spans) * live_bytes_per_block,
+        dst_space_version=1,
+    )

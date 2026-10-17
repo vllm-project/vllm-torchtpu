@@ -85,6 +85,62 @@ def _patch_vllm_hybrid_kv_load_failure_recovery() -> None:
     )
 
 
+def _model_needs_page_aligned_chunks(vllm_config) -> bool:
+    """Whether prefill chunks must end on physical KV blocks (a megakernel
+    program that declares it: the K3 prefill writes and attends whole pages)."""
+    from vllm_torchtpu.megakernel import backend
+
+    capabilities = backend.capabilities(vllm_config)
+    return capabilities is not None and capabilities.page_aligned_chunks
+
+
+def _disable_partial_hits_without_block_copies(scheduler) -> bool:
+    """Round prefix hits down to scheduler blocks for a megakernel program
+    that cannot apply copy-on-write block copies, which vLLM's partial hits
+    inside a DCP logical block need (on a KV consumer the transfer replaces the
+    sub-block tail anyway). Returns whether it changed anything.
+    """
+    from vllm_torchtpu.megakernel import backend
+
+    capabilities = backend.capabilities(scheduler.vllm_config)
+    coordinator = scheduler.kv_cache_manager.coordinator
+    if (
+        capabilities is None
+        or capabilities.block_copies
+        or not coordinator.enable_partial_hash_hits
+    ):
+        return False
+    coordinator.enable_partial_hash_hits = False
+    for manager in coordinator.single_type_managers:
+        manager.cache_hit_alignment_tokens = coordinator.scheduler_block_size
+    scheduler.mamba_partial_cache_hit = False
+    return True
+
+
+def _patch_vllm_megakernel_prefix_hits() -> None:
+    """Apply ``_disable_partial_hits_without_block_copies`` to every scheduler."""
+    from functools import wraps
+
+    from vllm.v1.core.sched.scheduler import Scheduler
+
+    original_init = Scheduler.__init__
+    if getattr(original_init, "_tpu_megakernel_prefix_hits_patch", False):
+        return
+
+    @wraps(original_init)
+    def init(self, *args, **kwargs):
+        original_init(self, *args, **kwargs)
+        if _disable_partial_hits_without_block_copies(self):
+            logger.info(
+                "Prefix hits round down to %d-token blocks: the megakernel "
+                "program does not apply block copies.",
+                self.kv_cache_manager.coordinator.scheduler_block_size,
+            )
+
+    init._tpu_megakernel_prefix_hits_patch = True
+    Scheduler.__init__ = init
+
+
 def _patch_vllm_mamba_split_scheduler_block_size() -> None:
     """Align Mamba prefill splits to the scheduler block size.
 
@@ -106,10 +162,22 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
         return
 
     @wraps(original_split)
-    def split_with_scheduler_block_size(self, *args, **kwargs):
+    def split_with_scheduler_block_size(
+        self,
+        request,
+        num_new_tokens,
+        num_new_local_computed_tokens=0,
+        num_external_computed_tokens=0,
+    ):
+        args = (
+            request,
+            num_new_tokens,
+            num_new_local_computed_tokens,
+            num_external_computed_tokens,
+        )
         physical_cache_config = self.cache_config
         if physical_cache_config.block_size == self.block_size:
-            return original_split(self, *args, **kwargs)
+            return original_split(self, *args)
 
         scheduler_cache_config = copy.copy(physical_cache_config)
         scheduler_cache_config.block_size = self.block_size
@@ -117,9 +185,35 @@ def _patch_vllm_mamba_split_scheduler_block_size() -> None:
         # and the upstream implementation contains no callback or await point.
         self.cache_config = scheduler_cache_config
         try:
-            return original_split(self, *args, **kwargs)
+            num_new_tokens = original_split(self, *args)
         finally:
             self.cache_config = physical_cache_config
+        # A scheduler block wider than the prefill budget (DCP/PCP: 256 x
+        # ranks tokens) leaves chunks inside it wherever the shared token
+        # budget cuts them. A program that declares ``page_aligned_chunks``
+        # keeps those ends on the physical block; the prompt's last chunk stays
+        # exempt, as upstream.
+        needs_pages = getattr(self, "_tpu_page_aligned_chunks", None)
+        if needs_pages is None:
+            needs_pages = _model_needs_page_aligned_chunks(self.vllm_config)
+            self._tpu_page_aligned_chunks = needs_pages
+        if not needs_pages:
+            return num_new_tokens
+        page = physical_cache_config.block_size
+        start = (
+            request.num_computed_tokens
+            + num_new_local_computed_tokens
+            + num_external_computed_tokens
+        )
+        end = start + num_new_tokens
+        prefill_end = max(request.num_prompt_tokens, request.num_tokens - 1)
+        if start < prefill_end and end < prefill_end and end % page:
+            aligned = end // page * page
+            if aligned > start:
+                return aligned - start
+            if start % page == 0:
+                return 0  # less than a page of budget left: next step
+        return num_new_tokens
 
     split_with_scheduler_block_size._tpu_scheduler_block_size_patch = True
     Scheduler._mamba_block_aligned_split = split_with_scheduler_block_size

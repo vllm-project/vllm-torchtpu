@@ -28,6 +28,7 @@ def _fake_connector(num_groups: int):
             num_blocks=NUM_BLOCKS, kv_cache_groups=[object() for _ in range(num_groups)]
         ),
         _init_worker=captured.append,
+        spec=SimpleNamespace(pool_sources=[]),
     )
     return SimpleNamespace(connector_worker=worker), captured
 
@@ -107,3 +108,35 @@ def test_register_kv_caches_ds_v4_alias_groups():
     # Aliases collapse: four layer entries, three distinct arrays.
     assert len(canonical.tensors) == 3
     assert [t.page_size_bytes for t in canonical.tensors] == [256, 64, 128]
+
+
+def test_registration_follows_pools_rebound_in_place():
+    """The connector hands the worker and its save fences the runner's own pool
+    tensors, so registered views follow pools re-bound with `Tensor.set_` (see
+    `view_on_current_storage`)."""
+    from vllm_torchtpu.offload.raiden_store import view_on_current_storage
+
+    pool = torch.zeros(8, 16, dtype=torch.float32)
+    kv_caches = {
+        "model.layers.0.attn": pool,
+        "model.layers.1.mamba": [pool],
+    }
+    fake, captured = _fake_connector(num_groups=2)
+    TPURaidenOffloadingConnector.register_kv_caches(fake, kv_caches)
+
+    assert fake._pool_sync_tensors == [pool]
+    assert fake._pool_sync_tensors[0] is pool
+    assert fake.connector_worker.spec.pool_sources[0] is pool
+    registered = captured[0].tensors[0].tensor
+
+    fresh = torch.ones(8, 16, dtype=torch.float32)
+    pool.set_(fresh)
+    assert registered.untyped_storage().data_ptr() != pool.untyped_storage().data_ptr()
+
+    rebuilt = view_on_current_storage(registered, pool)
+    assert rebuilt.shape == registered.shape
+    assert rebuilt.dtype == registered.dtype
+    assert rebuilt.untyped_storage().data_ptr() == fresh.untyped_storage().data_ptr()
+    pool.view(torch.int8)[0, 0] = 7
+    assert rebuilt[0, 0].item() == 7
+    assert view_on_current_storage(registered, None) is registered

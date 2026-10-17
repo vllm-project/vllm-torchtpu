@@ -51,7 +51,11 @@ BASELINE_PATH = REPO_ROOT / "tools" / "b023_baseline.txt"
 
 # The directory B023 is switched off for. Mirrors the per-file-ignores entry
 # in pyproject.toml; the two move together.
-KERNELS = "src/vllm_torchtpu/kernels"
+KERNELS = (
+    "src/vllm_torchtpu/kernels",
+    "src/vllm_torchtpu/megakernel/common",
+    "src/vllm_torchtpu/megakernel/kimi_k3/kernels",
+)
 
 
 def count_findings() -> dict[str, int]:
@@ -72,7 +76,7 @@ def count_findings() -> dict[str, int]:
             "lint.per-file-ignores={}",
             "--output-format",
             "json",
-            KERNELS,
+            *KERNELS,
         ],
         cwd=REPO_ROOT,
         stdout=subprocess.PIPE,

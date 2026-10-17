@@ -12,9 +12,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import pickle
+
 import numpy as np
 import torch
-from vllm.v1.outputs import LogprobsTensors, ModelRunnerOutput
+from vllm.v1.outputs import KVConnectorOutput, LogprobsTensors, ModelRunnerOutput
 
 from vllm_torchtpu.runner.tpu_runner import _spec_logprob_row_tokens
 from vllm_torchtpu.runner.tpu_runner_async_output import (
@@ -231,3 +233,68 @@ def test_get_output_attaches_spec_logprobs():
         1,
     ]
     assert out.logprobs.slice_request(2, 1).logprobs[:, 0].tolist() == [-6.0]
+
+
+def test_connector_only_output_waits_without_materializing_tokens():
+    class CopyState:
+        waited = False
+
+        def wait(self):
+            self.waited = True
+
+        @property
+        def sampled_token_ids_cpu(self):
+            raise AssertionError("Non-output ranks must not materialize tokens")
+
+    copy_state = CopyState()
+    connector_output = KVConnectorOutput(finished_recving={"loaded_request"})
+    output = AsyncTPUModelRunnerOutput(
+        model_runner_output=ModelRunnerOutput.with_kv_conn_output_only(
+            connector_output
+        ),
+        copy_state=copy_state,
+        discard_sampled_tokens_req_indices=[0],
+        materialize_token_ids=False,
+    ).get_output()
+    assert copy_state.waited
+    assert output.req_ids == []
+    assert output.sampled_token_ids == []
+    assert output.kv_connector_output is connector_output
+
+
+def test_connector_only_outputs_preserve_all_rank_completions():
+    from vllm.distributed.kv_transfer.kv_connector.utils import KVOutputAggregator
+
+    outputs = []
+    for rank in range(32):
+        connector_output = KVConnectorOutput(
+            finished_sending={"sent_request"},
+            finished_recving={"received_request"},
+            invalid_block_ids={rank},
+            expected_finished_count=32,
+        )
+        model_output = ModelRunnerOutput(
+            req_ids=["a"] if rank == 0 else [],
+            req_id_to_index={"a": 0} if rank == 0 else {},
+            kv_connector_output=connector_output,
+        )
+        copy_state = AsyncTPUCopyState(
+            chunks_cpu=[torch.tensor([[123]], dtype=torch.int32)],
+            chunk_real_lens=[1],
+            copy_ready_event=None,
+            completed=True,
+        )
+        result = AsyncTPUModelRunnerOutput(
+            model_runner_output=model_output,
+            copy_state=copy_state,
+            discard_sampled_tokens_req_indices=[],
+            materialize_token_ids=rank == 0,
+        ).get_output()
+        outputs.append(pickle.loads(pickle.dumps(result)))
+
+    result = KVOutputAggregator(32).aggregate(outputs)
+    assert result.req_ids == ["a"]
+    assert result.sampled_token_ids == [[123]]
+    assert result.kv_connector_output.finished_sending == {"sent_request"}
+    assert result.kv_connector_output.finished_recving == {"received_request"}
+    assert result.kv_connector_output.invalid_block_ids == set(range(32))
