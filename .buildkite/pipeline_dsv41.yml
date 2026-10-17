@@ -117,7 +117,7 @@ steps:
 
       - label: "DeepSeek-V4.1-Flash: DP8 C384 steady DSpark decode"
         key: "dsv41_flash_dp8_c384_decode"
-        # Exercise the default TP1/DP8 CSA2 path before merge as well as on epic.
+        # Exercise halfplane Index-K in the TP1/DP8 benchmark path.
         notify:
           - github_check:
               name: "DeepSeek-V4.1 DP8 Decode throughput"
@@ -133,6 +133,7 @@ steps:
         commands:
           - >-
             bash .buildkite/scripts/run_in_docker.sh
+            env TPU_DEEPSEEK_V41_INDEX_KEY_LAYOUT=halfplane
             bash .buildkite/scripts/run_dsv41_dp8_benchmark.sh
             decode
             gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
@@ -142,7 +143,7 @@ steps:
 
       - label: "DeepSeek-V4.1-Flash: DP8 C8 cached 96K + 16K extend"
         key: "dsv41_flash_dp8_c8_cached_extend"
-        # Exercise the default TP1/DP8 CSA2 path before merge as well as on epic.
+        # Exercise halfplane Index-K in the TP1/DP8 benchmark path.
         notify:
           - github_check:
               name: "DeepSeek-V4.1 DP8 Prefill throughput"
@@ -158,6 +159,7 @@ steps:
         commands:
           - >-
             bash .buildkite/scripts/run_in_docker.sh
+            env TPU_DEEPSEEK_V41_INDEX_KEY_LAYOUT=halfplane
             bash .buildkite/scripts/run_dsv41_dp8_benchmark.sh
             encoder_extend
             gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
