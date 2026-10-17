@@ -95,10 +95,12 @@ def test_index_layout_is_process_lifetime_static(monkeypatch):
 
     index_key_layout.cache_clear()
     try:
-        monkeypatch.setenv("TPU_DEEPSEEK_V41_INDEX_KEY_LAYOUT", "halfplane")
+        monkeypatch.delenv("TPU_DEEPSEEK_V41_INDEX_KEY_LAYOUT", raising=False)
         assert index_key_layout() == "halfplane"
         monkeypatch.setenv("TPU_DEEPSEEK_V41_INDEX_KEY_LAYOUT", "ordinary")
         assert index_key_layout() == "halfplane"
+        index_key_layout.cache_clear()
+        assert index_key_layout() == "ordinary"
     finally:
         index_key_layout.cache_clear()
 
