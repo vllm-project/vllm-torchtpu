@@ -76,13 +76,15 @@ def test_rendezvous_orders_peers_and_shares_session(monkeypatch, rank):
         port=9001,
         world_size=2,
         is_master=rank == 0,
-        timeout=timedelta(seconds=300),
+        timeout=timedelta(seconds=mp._RENDEZVOUS_TIMEOUT_S),
     )
     expected_sets = [call(f"test_ip_{rank}", f"10.0.0.{rank + 1}")]
     if rank == 0:
         expected_sets.append(call("test_xprof_session_id", "12345"))
     assert store.set.call_args_list == expected_sets
-    store.wait.assert_called_once_with(list(values), timedelta(seconds=300))
+    store.wait.assert_called_once_with(
+        list(values), timedelta(seconds=mp._RENDEZVOUS_TIMEOUT_S)
+    )
     assert mp._keepalive_stores == ([store] if rank == 0 else [])
 
 
