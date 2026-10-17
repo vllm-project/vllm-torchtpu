@@ -153,6 +153,51 @@ class _MockColumnParallelGELU(torch.nn.Module):
         return torch.nn.functional.gelu(self.proj(x), approximate=self.approximate)
 
 
+def _mock_ltx2_rope_cls():
+    """A fresh class of vLLM-Omni's LTX-2 RoPE (patches install on the class)."""
+
+    class LTX2AudioVideoRotaryPosEmbed(torch.nn.Module):
+        """LTX-2 RoPE: (cos, sin) of coords with per-head frequencies."""
+
+        def __init__(self, rope_type="split", heads=3, head_dim=8):
+            super().__init__()
+            self.rope_type = rope_type
+            self.freqs = 4 * torch.rand(heads, head_dim // 2)
+            self.calls = 0
+
+        def forward(self, coords, device=None, out_dtype=None):
+            self.calls += 1
+            # (B, P, T, 2) patch bounds -> (B, H, T, D/2) angles.
+            pos = coords.float().mean(dim=(1, 3))
+            angles = pos[:, None, :, None] * self.freqs[:, None, :]
+            if self.rope_type == "interleaved":
+                # (B, T, H * D), each frequency repeated for its pair.
+                angles = angles.transpose(1, 2).flatten(2).repeat_interleave(2, -1)
+            cos, sin = angles.cos(), angles.sin()
+            if out_dtype is not None:
+                cos, sin = cos.to(out_dtype), sin.to(out_dtype)
+            return cos, sin
+
+    return LTX2AudioVideoRotaryPosEmbed
+
+
+def _mock_apply_split_rotary_emb(x, freqs, *, head_dim):
+    """vLLM-Omni's LTX-2 split RoPE of (B, T, H * D) with (B, H, T, D/2) tables.
+
+    Same operations as upstream: products in the promoted dtype of x and the
+    tables, addcmul_, and no cast back to x.dtype.
+    """
+    cos, sin = freqs
+    b, t = x.shape[:2]
+    h, r = cos.shape[1], cos.shape[-1]
+    split_x = x.reshape(b, t, h, head_dim).swapaxes(1, 2).reshape(b, h, t, 2, r)
+    cos_u, sin_u = cos.unsqueeze(-2), sin.unsqueeze(-2)
+    out = split_x * cos_u
+    out[..., :1, :].addcmul_(-sin_u, split_x[..., 1:, :])
+    out[..., 1:, :].addcmul_(sin_u, split_x[..., :1, :])
+    return out.reshape(b, h, t, head_dim).swapaxes(1, 2).reshape(b, t, h * head_dim)
+
+
 class _MockRotaryEmbeddingWan(torch.nn.Module):
     """vLLM-Omni's CustomOp-style Wan RoPE (native interleaved formula)."""
 
@@ -207,6 +252,12 @@ qwen_transformer_mock = (
 )
 qwen_transformer_mock.QwenEmbedRope = _MockQwenEmbedRope
 qwen_transformer_mock.QwenEmbedLayer3DRope = _MockQwenEmbedLayer3DRope
+
+_ltx2_transformer = vllm_omni_mock.diffusion.models.ltx2.ltx2_transformer
+_ltx2_transformer.LTX2AudioVideoRotaryPosEmbed = _mock_ltx2_rope_cls()
+_ltx2_transformer.apply_split_rotary_emb = _mock_apply_split_rotary_emb
+_ltx2_transformer.get_tensor_model_parallel_world_size = lambda: 1
+_ltx2_transformer.get_tensor_model_parallel_rank = lambda: 0
 vllm_omni_mock.diffusion.layers.rope.RotaryEmbeddingWan = _MockRotaryEmbeddingWan
 vllm_omni_mock.diffusion.layers.norm.RMSNorm = _MockRMSNorm
 _wan2_2 = vllm_omni_mock.diffusion.models.wan2_2

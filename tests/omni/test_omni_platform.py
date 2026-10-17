@@ -24,6 +24,8 @@ import pytest
 import torch
 
 from .mock_omni import (  # isort: split
+    _mock_apply_split_rotary_emb,
+    _mock_ltx2_rope_cls,
     _MockRMSNorm,
     _MockRotaryEmbeddingWan,
     vllm_omni_mock,
@@ -31,6 +33,7 @@ from .mock_omni import (  # isort: split
 
 import vllm_omni
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
+from vllm_omni.diffusion.models.ltx2 import ltx2_transformer
 from vllm_omni.diffusion.models.qwen_image import qwen_image_transformer
 
 from vllm_torchtpu.omni import register_omni_tpu_platform
@@ -48,6 +51,7 @@ from vllm_torchtpu.omni.patches import (
     _VOCODER_CPU_INIT_PATCHED,
     _patch_diffusion_startup_warmup_sync,
     _patch_diffusion_worker_d2h_stream,
+    _patch_ltx2_split_rope,
     _patch_ltx2_vocoder_cpu_init,
     _patch_sdpa_fallback_dispatch,
     apply_omni_model_specific_patches,
@@ -816,3 +820,98 @@ def test_ltx2_bwe_filter_cpu_restore_patch(monkeypatch):
     assert calls[-1][0] == "cpu"
     assert other.filter is original
     assert not hasattr(other, "_ltx_restored_filter")
+
+
+@pytest.fixture
+def ltx2(monkeypatch):
+    """The mocked LTX-2 transformer module with _patch_ltx2_split_rope applied.
+
+    The patch is installed on a fresh rope class; the module attributes it
+    replaces are restored after the test.
+    """
+    for name, value in (
+        ("LTX2AudioVideoRotaryPosEmbed", _mock_ltx2_rope_cls()),
+        ("apply_split_rotary_emb", _mock_apply_split_rotary_emb),
+        ("get_tensor_model_parallel_world_size", lambda: 1),
+        ("get_tensor_model_parallel_rank", lambda: 0),
+    ):
+        monkeypatch.setattr(ltx2_transformer, name, value)
+    _patch_ltx2_split_rope()
+    return ltx2_transformer
+
+
+def _ltx2_coords(batch=2, tokens=5):
+    # (B, 3, T, 2) patch bounds, the input of LTX2AudioVideoRotaryPosEmbed.
+    return 10 * torch.rand(batch, 3, tokens, 2)
+
+
+@pytest.mark.parametrize(
+    "x_dtype,table_dtype,tol",
+    [
+        (torch.float32, torch.float32, 1e-6),
+        (torch.bfloat16, torch.bfloat16, None),
+        (torch.bfloat16, None, None),  # f32 tables (no out_dtype)
+    ],
+)
+def test_ltx2_split_rope_matches_upstream(ltx2, x_dtype, table_dtype, tol):
+    # The patched rope and apply_split_rotary_emb give upstream's rotation
+    # with its per-head (B, H, T, D/2) tables, in x.dtype.
+    torch.manual_seed(0)
+    rope = ltx2.LTX2AudioVideoRotaryPosEmbed(heads=3, head_dim=8)
+    coords = _ltx2_coords()
+    tables = rope(coords, out_dtype=table_dtype)
+    assert tables[0].shape == (2, 1, 5, 3 * 8)
+    x = torch.randn(2, 5, 3 * 8, dtype=x_dtype)
+    out = ltx2.apply_split_rotary_emb(x, tables, head_dim=8)
+
+    upstream_tables = rope._tpu_orig_forward(coords, None, table_dtype)
+    want = _mock_apply_split_rotary_emb(x, upstream_tables, head_dim=8)
+    assert out.dtype == x_dtype
+    torch.testing.assert_close(out, want.to(x_dtype), rtol=tol, atol=tol)
+
+
+def test_ltx2_split_rope_tensor_parallel_lanes(ltx2, monkeypatch):
+    # _slice_rope_for_tp leaves the (B, 1, T, H * D) tables whole; rank 1 of
+    # 2 rotates its two local heads with heads 2 and 3 of the tables.
+    torch.manual_seed(0)
+    rope = ltx2.LTX2AudioVideoRotaryPosEmbed(heads=4, head_dim=8)
+    coords = _ltx2_coords()
+    tables = rope(coords)
+    cos, sin = rope._tpu_orig_forward(coords)
+    monkeypatch.setattr(ltx2, "get_tensor_model_parallel_world_size", lambda: 2)
+    monkeypatch.setattr(ltx2, "get_tensor_model_parallel_rank", lambda: 1)
+    x = torch.randn(2, 5, 2 * 8)
+    out = ltx2.apply_split_rotary_emb(x, tables, head_dim=8)
+    want = _mock_apply_split_rotary_emb(x, (cos[:, 2:], sin[:, 2:]), head_dim=8)
+    torch.testing.assert_close(out, want, rtol=1e-6, atol=1e-6)
+
+    monkeypatch.setattr(ltx2, "get_tensor_model_parallel_world_size", lambda: 3)
+    with pytest.raises(ValueError, match="tensor-parallel"):
+        ltx2.apply_split_rotary_emb(x, tables, head_dim=8)
+
+
+def test_ltx2_split_rope_passes_other_tables_through(ltx2):
+    torch.manual_seed(0)
+    coords = _ltx2_coords()
+    rope = ltx2.LTX2AudioVideoRotaryPosEmbed(rope_type="interleaved")
+    for got, want in zip(rope(coords), rope._tpu_orig_forward(coords), strict=True):
+        assert torch.equal(got, want)
+
+    # (B, H, T, D/2) tables, also with a single head, use upstream's function.
+    for heads, head_dim in ((3, 8), (1, 24)):
+        rope = ltx2.LTX2AudioVideoRotaryPosEmbed(heads=heads, head_dim=head_dim)
+        tables = rope._tpu_orig_forward(coords)
+        x = torch.randn(2, 5, heads * head_dim)
+        torch.testing.assert_close(
+            ltx2.apply_split_rotary_emb(x, tables, head_dim=head_dim),
+            _mock_apply_split_rotary_emb(x, tables, head_dim=head_dim),
+            rtol=0,
+            atol=0,
+        )
+
+    # Installing again keeps the single wrapper.
+    forward = ltx2.LTX2AudioVideoRotaryPosEmbed.forward
+    apply_split_rotary_emb = ltx2.apply_split_rotary_emb
+    _patch_ltx2_split_rope()
+    assert ltx2.LTX2AudioVideoRotaryPosEmbed.forward is forward
+    assert ltx2.apply_split_rotary_emb is apply_split_rotary_emb
