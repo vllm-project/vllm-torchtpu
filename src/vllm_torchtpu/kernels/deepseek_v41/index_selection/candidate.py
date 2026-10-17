@@ -264,7 +264,7 @@ def candidate_indexer(
     lengths: jax.Array,
     *,
     block_size: int,
-    key_tile: int = 4096,
+    key_tile: int | None = None,
     request_tile: int | None = None,
     k: int = 512,
     overlap: bool = True,
@@ -273,6 +273,14 @@ def candidate_indexer(
     """Pipeline whole-request score groups and SC selection over a reusable union."""
     requests, queries = q.shape[:2]
     width = ids.shape[1] * block_size
+    if key_tile is None:
+        key_tile = tuned_block_sizes.get_candidate_key_tile(
+            jax.devices()[0].device_kind,
+            q.shape,
+            width,
+            k,
+            keys.dtype == jnp.int32,
+        )
     if request_tile is None:
         request_tile = tuned_block_sizes.get_candidate_request_tile(
             tuned_block_sizes.CandidateTuningKey(

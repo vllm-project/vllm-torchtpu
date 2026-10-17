@@ -42,10 +42,18 @@ def write_result(root, scenario):
         report = dict(
             warmup=False,
             scenario=spec,
-            decode_throughput={"basis": "median_step_estimate", **metric},
+            decode_throughput={
+                "basis": "fixed_accepted_tokens_median_step_estimate",
+                "accepted_tokens_per_request_step": 3.47,
+                **metric,
+            },
             categories={
                 "encoder_middle": metric,
-                "decode": dict(global_tokens_s=200, per_physical_chip_tokens_s=50),
+                "decode": dict(
+                    global_tokens_s=200,
+                    per_physical_chip_tokens_s=50,
+                    median_step_ms=384 * 3.47 / rate * 1000,
+                ),
             },
         )
         (root / f"fixed/round-{i}-summary.json").write_text(json.dumps(report))
@@ -58,7 +66,10 @@ def test_formal_median_and_duration_are_visible(tmp_path, scenario):
     assert "| 800.00 | 200.00 |" in text
     assert "2.00 min" in text and "3 formal round(s)" in text
     if scenario == "decode":
-        assert "Decode (median step)" in text
+        assert "Decode (median step, fixed 3.47)" in text
+        assert "fixed 3.47 accepted tokens/request/step" in text
+        assert "Median step: 1665.600 ms" in text
+        assert "not measured output throughput" in text
         assert "Decode (observed window) | 200.00 | 50.00" in text
     else:
         assert "Prefill (middle chunks)" in text
@@ -83,6 +94,20 @@ def test_unverified_results_are_rejected(tmp_path, invalid):
         path.write_text(json.dumps(data))
     with pytest.raises((ValueError, OSError)):
         summary.render_summary(tmp_path, commit)
+
+
+@pytest.mark.parametrize("invalid", ["legacy_basis", "wrong_fixed_tokens"])
+def test_decode_check_rejects_other_accounting_policies(tmp_path, invalid):
+    write_result(tmp_path, "decode")
+    path = tmp_path / "fixed/round-1-summary.json"
+    report = json.loads(path.read_text())
+    if invalid == "legacy_basis":
+        report["decode_throughput"]["basis"] = "median_step_estimate"
+    else:
+        report["decode_throughput"]["accepted_tokens_per_request_step"] = 4.0
+    path.write_text(json.dumps(report))
+    with pytest.raises(ValueError, match="fixed 3.47"):
+        summary.render_summary(tmp_path, "abc")
 
 
 @pytest.mark.parametrize(

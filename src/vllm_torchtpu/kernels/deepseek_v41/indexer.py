@@ -10,6 +10,8 @@ vllm-torchtpu's existing SparseCore top-k, not a full-context XLA sort.
 """
 
 import functools
+from collections.abc import Callable
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -486,6 +488,42 @@ def native_paged_scores(
         scales,
         jnp.full((q.shape[0], width), -jnp.inf, jnp.float32),
     )[:, :capacity]
+
+
+def pipeline_score_topk_bounded(
+    num_tiles: int,
+    prepare: Callable[[jax.Array], Any],
+    score: Callable[[Any], jax.Array],
+    select: Callable[[jax.Array, jax.Array], Any],
+    write: Callable[[jax.Array, Any, Any], Any],
+    output: Any,
+) -> Any:
+    """Bound prefetch and score lifetime for the chunk-2K prefill route."""
+    if num_tiles < 1:
+        raise ValueError("The score/top-k pipeline requires at least one tile")
+    if num_tiles > 16:
+        return pipeline_score_topk(num_tiles, prepare, score, select, write, output)
+
+    # Gate current scores and next preparation on the previous selection
+    # so unrolling does not extend every score buffer's lifetime.
+    with jax.named_scope("DSV41ScoreTopKBoundedPipeline"):
+        current = score(prepare(jnp.int32(0)))
+        previous = None
+        for tile in range(num_tiles - 1):
+            prepared = prepare(jnp.int32(tile + 1))
+            if previous is not None:
+                previous, current, prepared = lax.optimization_barrier(
+                    (previous, current, prepared)
+                )
+                output = write(jnp.int32(tile - 1), previous, output)
+            following = score(prepared)
+            previous = select(jnp.int32(tile), current)
+            current = following
+        if previous is not None:
+            previous, current = lax.optimization_barrier((previous, current))
+            output = write(jnp.int32(num_tiles - 2), previous, output)
+        last = jnp.int32(num_tiles - 1)
+        return write(last, select(last, current), output)
 
 
 def pipeline_score_topk(num_tiles, prepare, score, select, write, output):

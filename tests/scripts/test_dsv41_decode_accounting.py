@@ -108,10 +108,33 @@ class AccountingTest(unittest.TestCase):
         result = report["categories"]["decode"]
         self.assertEqual(result["mean_tokens_per_request_step"], 6)
         throughput = report["decode_throughput"]
-        self.assertEqual(throughput["basis"], "median_step_estimate")
-        self.assertAlmostEqual(throughput["global_tokens_s"], 384 * 6 / 0.2)
-        self.assertAlmostEqual(throughput["per_device_tokens_s"], 48 * 6 / 0.2)
-        self.assertAlmostEqual(throughput["per_physical_chip_tokens_s"], 96 * 6 / 0.2)
+        self.assertEqual(
+            throughput["basis"], "fixed_accepted_tokens_median_step_estimate"
+        )
+        self.assertEqual(throughput["accepted_tokens_per_request_step"], 3.47)
+        self.assertAlmostEqual(throughput["global_tokens_s"], 384 * 3.47 / 0.2)
+        self.assertAlmostEqual(throughput["per_device_tokens_s"], 48 * 3.47 / 0.2)
+        self.assertAlmostEqual(
+            throughput["per_physical_chip_tokens_s"], 96 * 3.47 / 0.2
+        )
+
+    def test_primary_throughput_is_independent_of_actual_acceptance(self):
+        data = records()
+        baseline = summarize(data, "decode")
+        for rank in data:
+            for step in rank["steps"]:
+                step["accepted_output_counts"] = [3] * 48
+                step["accepted_output_tokens"] = 144
+        changed = summarize(data, "decode")
+        self.assertEqual(changed["decode_throughput"], baseline["decode_throughput"])
+        self.assertNotEqual(
+            changed["categories"]["decode"]["mean_tokens_per_request_step"],
+            baseline["categories"]["decode"]["mean_tokens_per_request_step"],
+        )
+        self.assertGreater(
+            changed["categories"]["decode"]["global_tokens_s"],
+            baseline["categories"]["decode"]["global_tokens_s"],
+        )
 
     def test_median_throughput_retains_slow_interval_in_window_rate(self):
         data = records()
@@ -127,7 +150,7 @@ class AccountingTest(unittest.TestCase):
         delayed = summarize(data, "decode")
         self.assertEqual(delayed["decode_throughput"], baseline["decode_throughput"])
         self.assertAlmostEqual(
-            delayed["decode_throughput"]["global_tokens_s"], 384 * 2 / 0.2
+            delayed["decode_throughput"]["global_tokens_s"], 384 * 3.47 / 0.2
         )
         self.assertEqual(
             delayed["categories"]["decode"]["throughput_basis"], "observed_window"

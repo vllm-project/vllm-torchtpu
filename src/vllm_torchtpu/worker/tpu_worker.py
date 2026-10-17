@@ -570,7 +570,9 @@ class TPUWorker(WorkerBase):
     def execute_dummy_batch(self) -> None:
         """Run an idle DP step with the same collective pattern as active DP."""
         runner = self.model_runner
-        bucket, target_num_chunks = runner._dp_coordinated_step(0, 0)
+        bucket, target_num_chunks = runner._dp_coordinated_step(
+            0, 0, needs_draft_proposals=False
+        )
         if bucket is None:
             # TPU compiles exact token buckets, so the idle-engine dummy must
             # use one of the precompiled model-forward shapes.
@@ -710,6 +712,8 @@ class TPUWorker(WorkerBase):
 
     def compile_or_warm_up_model(self) -> CompilationTimes:
         start = time.perf_counter()
+        if self.speculative_config is not None:
+            set_torch_threads_for_runtime()
         self.model_runner.capture_model()
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time

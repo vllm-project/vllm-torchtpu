@@ -2502,7 +2502,7 @@ def _decode_select(
 
 
 def _prefill_score(
-    q, weights, pool, pages, limit, *, page_records, halfplane: bool = False
+    q, weights, pool, records, limit, *, page_records, halfplane: bool = False
 ):
     """Resident-query scorer, manually replicated across the wrapper mesh."""
     from jax.sharding import PartitionSpec as P
@@ -2511,20 +2511,27 @@ def _prefill_score(
         get_vllm_model_wrapper_context,
     )
 
-    score = functools.partial(
-        prefill_index_scores.prefill_index_scores,
-        page_records=page_records,
-        query_tile=prefill_tuning.QUERY_TILE,
-        key_tile=prefill_tuning.KEY_TILE,
-        halfplane=halfplane,
-    )
+    def score(q, weights, pool, records, limit):
+        return prefill_index_scores.prefill_index_scores(
+            q,
+            weights,
+            pool,
+            records[:, ::page_records],
+            limit,
+            page_records=page_records,
+            query_tile=prefill_tuning.QUERY_TILE,
+            key_tile=prefill_tuning.KEY_TILE,
+            records=records,
+            halfplane=halfplane,
+        )
+
     try:
         mesh = get_vllm_model_wrapper_context().mesh
     except AssertionError:
-        return score(q, weights, pool, pages, limit)
+        return score(q, weights, pool, records, limit)
     return jax.shard_map(
         score, mesh=mesh, in_specs=(P(),) * 5, out_specs=P(), check_vma=False
-    )(q, weights, pool, pages, limit)
+    )(q, weights, pool, records, limit)
 
 
 def _prefill_top_k(scores, lengths):
@@ -2884,12 +2891,14 @@ def paged_indexer_jax(
                     # The outer route proves every live query shares a request.
                     # Entries are first-record addresses, not page numbers.
                     request = requests[jnp.argmax(lengths)]
-                    pages = jax.lax.dynamic_slice_in_dim(row_records, request, 1)
-                    scores = _prefill_score(
+                    shared_records = jax.lax.dynamic_slice_in_dim(
+                        row_records, request, 1
+                    )
+                    return _prefill_score(
                         split_halves(queries),
                         row_weights.astype(jnp.float32)[:, :, None],
                         pool,
-                        pages[:, ::page_records],
+                        shared_records,
                         jnp.max(row_lengths, keepdims=True),
                         page_records=page_records,
                         halfplane=halfplane,
@@ -2963,7 +2972,12 @@ def paged_indexer_jax(
                 ),
                 published,
             )
-            selected, published = indexer.pipeline_score_topk(
+            pipeline = (
+                indexer.pipeline_score_topk_bounded
+                if use_prefill
+                else indexer.pipeline_score_topk
+            )
+            selected, published = pipeline(
                 count // tile, prepare, score, select, write, output
             )
             return selected[:rows], published[:rows]

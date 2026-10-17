@@ -8,8 +8,11 @@ The workload uses eight distinct 98304-token cached prefixes, 16384 new input
 tokens per request, and one greedy output token. Each DP engine admits one
 request with a 2048-token budget. The model uses CED, FP8 KV, CPU Engram offload
 and DSpark K5. KV is automatically sized with memory utilization 0.85, rather
-than capped at 4 GiB. The only compile bucket is `[2048]`; the tail also pads
-to 2048. The server uses the model's default context limit; it does not cap
+than capped at 4 GiB. Target compile buckets are `[128,2048]`; target chunks
+larger than 128 select 2048. DSpark query forwards use a separate 40-row
+bucket (the runner's minimum eight-request bucket times K5). This pads
+query rows only; the SWA128 history window is unchanged.
+The 2048-token scheduler budget is unchanged. The server uses the model's default context limit; it does not cap
 `max_model_len` to this benchmark's 114688-token input. The 96K prefix and 16K
 extension are client workload sizes.
 Automatic FP8 KV budgets round down to binary steps smaller than 1/32 of the
@@ -18,6 +21,16 @@ This stabilizes shapes within a bin; crossing a bin boundary still recompiles.
 
 This is a prefill benchmark; one-token output comparison does not qualify
 long-generation accuracy or steady decode performance.
+
+DFlash/DSpark use the shared context-only KV update path during intermediate prefill.
+Candidate generation is skipped only when no EP-DP peer has a request at
+the prompt boundary or in decode. Mixed steps retain proposal forwards on
+every participating rank to keep collectives paired. The final prefill
+step still generates the candidates needed to bootstrap async decode,
+including when the benchmark's one-token request will then finish. Draft seeds
+and proposals keep one bucketed tensor per chunk; real request indices skip
+padding rows from earlier chunks. Speculative warmup covers the bucket grid
+and mixed prefill/verify steps.
 
 The shared serving launcher sets `--xla_tpu_dvfs_p_state=7` in
 `LIBTPU_INIT_ARGS`. Both DP8 Buildkite benchmarks run on every build of the
@@ -271,11 +284,17 @@ python scripts/dsv41_bench/server_steps/run.py --scenario decode \
 
 This compiles `[288,2048]`. Steady target verification is exactly
 48 requests x (K + 1) = 288 rows. The 2048-token bucket covers prefix preparation
-and mixed batches. The scheduler input budget is 2048. Request count, prompt
-length, output length and DSpark K remain unchanged. Startup readiness, phase
-timings and source/runtime identities are saved. Persistent caches are disabled
-through environment variables; the compiler retains its default serialization
-path.
+and mixed batches. The scheduler input budget is 2048. DSpark query forwards
+use a separate request-based ladder: `[40,80,160,240]` rows for up to 48
+requests at K5. The C8 prefill scenario has one request per DP rank; the
+runner's minimum eight-request bucket gives 40 draft rows even though the
+target compiles `[128,2048]`. Draft context-KV updates still consume the
+target bucket.
+
+Request count, prompt length, output length and DSpark K remain unchanged.
+Startup readiness, phase timings and source/runtime identities are saved.
+Persistent caches are disabled through environment variables; the compiler
+retains its default serialization path.
 
 The full-DP checks remain mandatory. They require a common C384 steady window
 through the real scheduler; synthetic startup warmup does not establish this.
@@ -322,21 +341,31 @@ The primary `decode_throughput` metric estimates throughput from the median
 host-observation step interval:
 
 ```text
-mean_accepted_tokens = window_accepted_tokens / window_request_observations
-decode_tokens_s = global_concurrency * mean_accepted_tokens / median_step_seconds
+fixed_accepted_tokens_per_request_step = 3.47
+decode_tokens_s = global_concurrency * 3.47 / median_step_seconds
 ```
 
-Accepted tokens include bonus tokens; do not substitute K or K+1. The summary
-and each printed round report this estimate at node, logical-device and
-physical-chip scope. Median step time uses the same qualifying consecutive
-full-C observations as before. It reduces the effect of occasional long
-intervals but does not measure sustained output over the whole window.
+The fixed 3.47 tokens/request/step is a reporting constant, not the measured
+acceptance of the run. It holds token yield constant when comparing step
+cadence. The summary and each printed round report this estimate at node,
+logical-device and physical-chip scope. Median step time uses the same
+qualifying consecutive full-C observations as before. It reduces the effect
+of occasional long intervals but does not measure sustained output over the
+whole window. Do not compare this estimate directly with historical primary
+metrics that used actual acceptance; recompute those from median step time
+with the same 3.47 constant.
 
 `categories.decode.global_tokens_s` and its per-device/per-chip values retain
 the observed window rate: accepted output tokens divided by the common
 host-clock window duration. They carry `throughput_basis=observed_window`;
-`decode_throughput` carries `basis=median_step_estimate`. Report both metrics
-with their labels. Host cadence is distinct from isolated target/draft device
+`decode_throughput` carries
+`basis=fixed_accepted_tokens_median_step_estimate` and
+`accepted_tokens_per_request_step=3.47`. Actual mean accepted tokens per
+request/step, including bonus tokens, remain in
+`categories.decode.mean_tokens_per_request_step`. The GitHub Check labels the
+fixed estimate and reports median step time. For multiple formal rounds, it
+takes the median of each round's throughput. Report both metrics with their
+labels. Host cadence is distinct from isolated target/draft device
 duration. Contexts derived from accepted outputs are reported separately from
 asynchronous scheduler metadata.
 

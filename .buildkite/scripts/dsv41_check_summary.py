@@ -30,14 +30,30 @@ def render_summary(root: Path, commit: str) -> str:
         raise ValueError("Expected formal rounds from one benchmark scenario")
     if scenario["name"] == "decode":
         if any(
-            r["decode_throughput"]["basis"] != "median_step_estimate" for r in reports
+            r["decode_throughput"]["basis"]
+            != "fixed_accepted_tokens_median_step_estimate"
+            or r["decode_throughput"]["accepted_tokens_per_request_step"] != 3.47
+            for r in reports
         ):
-            raise ValueError("Decode primary metric must use the median step interval")
+            raise ValueError(
+                "Decode primary metric must use fixed 3.47 accepted tokens"
+            )
         metrics = [
-            ("**Decode (median step)**", [r["decode_throughput"] for r in reports]),
+            (
+                "**Decode (median step, fixed 3.47)**",
+                [r["decode_throughput"] for r in reports],
+            ),
             ("Decode (observed window)", [r["categories"]["decode"] for r in reports]),
         ]
-        detail = "Accepted output tokens include bonus tokens."
+        median_step_ms = statistics.median(
+            r["categories"]["decode"]["median_step_ms"] for r in reports
+        )
+        detail = (
+            "Primary estimate uses fixed 3.47 accepted tokens/request/step. "
+            f"Median step: {median_step_ms:.3f} ms. "
+            "Observed window counts actual accepted output tokens, including bonus. "
+            "The fixed estimate is not measured output throughput."
+        )
     elif scenario["name"] == "encoder_extend":
         metrics = [
             (

@@ -143,7 +143,11 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
 from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 from vllm_torchtpu.spec_decode.dspark import DSparkProposer
 from vllm_torchtpu.spec_decode.eagle3 import Eagle3Proposer
-from vllm_torchtpu.spec_decode.utils import DraftChunkInputs, normalize_draft_config
+from vllm_torchtpu.spec_decode.utils import (
+    DraftChunkInputs,
+    fit_rows,
+    normalize_draft_config,
+)
 from vllm_torchtpu.tracing.annotation import TraceAnnotation
 from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
 from vllm_torchtpu.tracing.utils import (
@@ -741,6 +745,7 @@ class TPUModelRunner(GPUModelRunner):
         self._dp_target_bucket: int | None = None
         self._dp_step_num_chunks: int = 0
         self._dp_step_max_reqs: int = 0
+        self._draft_proposals_needed: bool = True
         self._dp_step_has_encoder_inputs = False
         self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
@@ -2644,16 +2649,24 @@ class TPUModelRunner(GPUModelRunner):
         return placeholder_req_id_to_index
 
     def _sync_replicated_drafts_across_tp(
-        self, drafts: torch.Tensor | None
-    ) -> torch.Tensor | None:
+        self, drafts: torch.Tensor | list[torch.Tensor] | None
+    ) -> torch.Tensor | list[torch.Tensor] | None:
         """Pin a replicated drafter's device proposal to rank 0's on every rank.
 
         Broadcast emulated as mask + all_reduce (tpu_dist has no broadcast);
         tiny (num_reqs x K int32), fully on device. No-ops for a sharded
-        drafter, TP=1, the sync host-list form, and empty steps.
+        drafter, TP=1, the sync host-list form, and empty steps. Bucketed
+        drafters hand over one tensor per chunk; each is pinned.
         """
-        if drafts is None or not isinstance(drafts, torch.Tensor):
+        if drafts is None:
+            return None
+        if isinstance(drafts, list):
+            return [self._sync_one_replicated_draft(d) for d in drafts]
+        if not isinstance(drafts, torch.Tensor):
             return drafts
+        return self._sync_one_replicated_draft(drafts)
+
+    def _sync_one_replicated_draft(self, drafts: torch.Tensor) -> torch.Tensor:
         if (
             self.speculative_config is None
             or self.speculative_config.draft_tensor_parallel_size != 1
@@ -2686,6 +2699,25 @@ class TPUModelRunner(GPUModelRunner):
 
         return tensor_model_parallel_all_reduce(drafts * rank0_mask)
 
+    @staticmethod
+    def _drafts_per_chunk(
+        drafts: torch.Tensor | list[torch.Tensor], num_reqs_list: list[int]
+    ) -> list[torch.Tensor]:
+        """Per-chunk view of a proposer's device drafts.
+
+        A bucketed-draft proposer hands back one ``[rows, K]`` tensor per chunk
+        already; eagle3 hands back one exact ``[num_reqs, K]`` batch tensor, split
+        here by the chunks' real counts.
+        """
+        if isinstance(drafts, list):
+            return drafts
+        out = []
+        off = 0
+        for n in num_reqs_list:
+            out.append(drafts[off : off + n])
+            off += n
+        return out
+
     def _assemble_async_spec_substitution(self, drafts, next_tokens_per_chunk, state):
         """Async-spec substitution assembler.
 
@@ -2705,23 +2737,36 @@ class TPUModelRunner(GPUModelRunner):
             "async spec substitution requires the eagle3 drafts proposed "
             "earlier in sample_tokens"
         )
+        drafts_per_chunk = self._drafts_per_chunk(drafts, state.num_reqs_list)
+        # Bucketed drafters keep the sampler's padded rows (an exact-count slice
+        # would compile a program per request count); others keep exact rows.
+        bucketed = getattr(getattr(self, "drafter", None), "bucketed_drafts", False)
         next_tokens_tpu_chunks: list[torch.Tensor] = []
         next_token_indices: dict[int, int] = {}
         num_rejected_chunks: list[torch.Tensor] = []
         num_draft_per_req: dict[int, int] = {}
         req_offset = 0
+        padded_req_offset = 0
         # Uniform `1+K` source span per request: req position `p` maps to source
         # `[p*(1+K) .. p*(1+K)+K]`, and `req_id_to_index_copy` stores `p` (the
         # index builder multiplies by the stride). All chunks carry their next
         # proposals, even if they did not verify drafts in the current step.
-        for nt_chunk, num_reqs, md in zip(
-            next_tokens_per_chunk, state.num_reqs_list, state.spec_decode_metadata_list
+        for nt_chunk, num_reqs, md, drafts_chunk in zip(
+            next_tokens_per_chunk,
+            state.num_reqs_list,
+            state.spec_decode_metadata_list,
+            drafts_per_chunk,
         ):
-            drafts_chunk = drafts[req_offset : req_offset + num_reqs]
-            src = assemble_spec_next_tokens(nt_chunk, drafts_chunk, num_reqs)
+            chunk_padded_num_reqs = nt_chunk.shape[0] if bucketed else num_reqs
+            drafts_chunk = fit_rows(drafts_chunk, chunk_padded_num_reqs)
+            src = assemble_spec_next_tokens(
+                nt_chunk, drafts_chunk, None if bucketed else num_reqs
+            )
             if md is not None:
                 num_rejected_chunks.append(
-                    compute_num_rejected(nt_chunk, md.draft_lengths[:num_reqs])
+                    compute_num_rejected(
+                        nt_chunk, fit_rows(md.draft_lengths, chunk_padded_num_reqs)
+                    )
                 )
                 for r in range(num_reqs):
                     num_draft_per_req[req_offset + r] = int(md.draft_lengths_cpu[r])
@@ -2729,12 +2774,15 @@ class TPUModelRunner(GPUModelRunner):
                 # No drafts were verified this step, so there is no rejection
                 # correction or speculative output-placeholder rollback.
                 num_rejected_chunks.append(
-                    torch.zeros(num_reqs, dtype=torch.int32, device=nt_chunk.device)
+                    torch.zeros(
+                        chunk_padded_num_reqs, dtype=torch.int32, device=nt_chunk.device
+                    )
                 )
             next_tokens_tpu_chunks.append(src)
             for r in range(num_reqs):
-                next_token_indices[req_offset + r] = req_offset + r
+                next_token_indices[req_offset + r] = padded_req_offset + r
             req_offset += num_reqs
+            padded_req_offset += chunk_padded_num_reqs
         spec_num_rejected = (
             torch.cat(num_rejected_chunks) if num_rejected_chunks else None
         )
@@ -2755,32 +2803,44 @@ class TPUModelRunner(GPUModelRunner):
         stride-(1+K) `[bonus, draft_1..K]` source so the NEXT step substitutes
         REAL prompt-context drafts. Returns ``(next_tokens_tpu_chunks,
         next_token_indices, spec_num_rejected=zeros, num_draft_per_req)``.
+
+        For bucketed drafters each chunk contributes its padded request count
+        of source rows (a request's source position is its row in its chunk
+        plus the padded rows of earlier chunks); other drafters keep exact rows.
         """
         assert drafts is not None, (
             "async prefill bootstrap requires the eagle3 drafts proposed "
             "earlier in sample_tokens"
         )
+        drafts_per_chunk = self._drafts_per_chunk(drafts, combined_real_lens)
+        bucketed = getattr(getattr(self, "drafter", None), "bucketed_drafts", False)
         next_tokens_tpu_chunks: list[torch.Tensor] = []
         next_token_indices: dict[int, int] = {}
         num_rejected_chunks: list[torch.Tensor] = []
         num_draft_per_req: dict[int, int] = {}
         req_offset = 0
-        for sel, n in zip(combined_selected_tokens, combined_real_lens):
-            bonus = sel.view(-1)[:n].unsqueeze(1)  # [n, 1]
-            drafts_chunk = drafts[req_offset : req_offset + n]  # [n, K]
+        padded_req_offset = 0
+        for sel, n, drafts_chunk in zip(
+            combined_selected_tokens, combined_real_lens, drafts_per_chunk
+        ):
+            flat = sel.view(-1)
+            chunk_padded_num_reqs = flat.shape[0] if bucketed else n
+            bonus = (flat if bucketed else flat[:n]).unsqueeze(1)  # [rows, 1]
+            drafts_chunk = fit_rows(drafts_chunk, chunk_padded_num_reqs)
             src = torch.cat(
                 [bonus.to(drafts_chunk.dtype), drafts_chunk], dim=1
-            )  # [n, 1+K] = [bonus, draft_1..K]
+            )  # [chunk_padded_num_reqs, 1+K] = [bonus, draft_1..K]
             next_tokens_tpu_chunks.append(src.reshape(-1))
             num_rejected_chunks.append(
-                torch.zeros(n, dtype=torch.int32, device=src.device)
+                torch.zeros(chunk_padded_num_reqs, dtype=torch.int32, device=src.device)
             )
             for r in range(n):
-                next_token_indices[req_offset + r] = req_offset + r
+                next_token_indices[req_offset + r] = padded_req_offset + r
                 # These drafts belong to the NEXT step. The current prefill
                 # sampled one token and has only one output placeholder.
                 num_draft_per_req[req_offset + r] = 0
             req_offset += n
+            padded_req_offset += chunk_padded_num_reqs
         spec_num_rejected = (
             torch.cat(num_rejected_chunks) if num_rejected_chunks else None
         )
@@ -3449,14 +3509,27 @@ class TPUModelRunner(GPUModelRunner):
             num_chunks += 1
         return num_chunks, max_chunk_reqs
 
+    def _needs_draft_proposals(self, scheduler_output: "SchedulerOutput") -> bool:
+        """DFlash/DSpark candidates are useful only once a prompt is complete."""
+        if not isinstance(self.drafter, DFlashProposer):
+            return True
+        for req_id, count in scheduler_output.num_scheduled_tokens.items():
+            index = self.input_batch.req_id_to_index[req_id]
+            computed = int(self.input_batch.num_computed_tokens_cpu[index])
+            if computed + count >= int(self.input_batch.num_prompt_tokens[index]):
+                return True
+        return False
+
     def _dp_coordinated_step(
         self,
         local_num_tokens: int,
         local_num_chunks: int,
         local_num_reqs: int = 0,
         has_encoder_inputs: bool = False,
+        needs_draft_proposals: bool = True,
     ) -> "tuple[int | None, int]":
         """Return the DP-wide padded token bucket and forward chunk count."""
+        self._draft_proposals_needed = needs_draft_proposals
         if not self._dp_lockstep_enabled():
             return None, local_num_chunks
         from vllm.distributed.parallel_state import get_dp_group
@@ -3471,6 +3544,7 @@ class TPUModelRunner(GPUModelRunner):
                 int(local_num_chunks),
                 int(local_num_reqs),
                 int(has_encoder_inputs),
+                int(needs_draft_proposals),
             ],
             dtype=torch.int64,
             device="cpu",
@@ -3485,6 +3559,7 @@ class TPUModelRunner(GPUModelRunner):
         # second collective.
         self._dp_step_max_reqs = int(t[2].item())
         self._dp_step_has_encoder_inputs = bool(t[3].item())
+        self._draft_proposals_needed = bool(t[4].item())
         return bucket, int(t[1].item())
 
     def _execute_dp_mm_encoder(
@@ -3558,7 +3633,11 @@ class TPUModelRunner(GPUModelRunner):
         # use_eagle() covers every hidden-state drafter, dflash included.
         spec = self.speculative_config
         if num_chunks > 0 and spec is not None and spec.use_eagle():
-            self._async_drafter.run_dp_dummy_draft(num_chunks)
+            drafter = self._async_drafter
+            if isinstance(drafter, DFlashProposer) and not self._draft_proposals_needed:
+                drafter.run_dp_dummy_context(num_chunks)
+            else:
+                drafter.run_dp_dummy_draft(num_chunks)
 
     def _dp_num_tokens_across_dp(self, num_tokens: int) -> torch.Tensor | None:
         if not self._dp_lockstep_enabled():
@@ -3623,6 +3702,7 @@ class TPUModelRunner(GPUModelRunner):
             local_num_chunks,
             local_num_reqs=local_max_chunk_reqs,
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
+            needs_draft_proposals=self._needs_draft_proposals(scheduler_output),
         )
         self._dp_step_num_chunks = target_num_chunks
 
@@ -4612,8 +4692,17 @@ class TPUModelRunner(GPUModelRunner):
         # below.
         is_async = bool(self.scheduler_config.async_scheduling)
         eagle3_drafts = None
+        context_only_draft = (
+            self._is_async_drafter
+            and isinstance(self.drafter, DFlashProposer)
+            and not self._draft_proposals_needed
+        )
         if self._is_async_drafter and combined_selected_tokens:
-            if is_spec_step:
+            if context_only_draft:
+                assert isinstance(self.drafter, DFlashProposer)
+                with self._stage_timing.stage("draft_context_update"):
+                    self.drafter.prepare_prefill_handoff()
+            elif is_spec_step:
                 with self._stage_timing.stage("draft_propose"):
                     eagle3_drafts = self.spec_decode_manager.propose_draft_token_ids(
                         sampled_token_ids=None,
@@ -4627,14 +4716,19 @@ class TPUModelRunner(GPUModelRunner):
                 # Seed = the just-sampled tokens, kept on-device (no D2H):
                 # propose takes the sync seed path but reads the seed from
                 # `device_seed`.
-                device_seed = torch.cat(
-                    [
-                        sel.view(-1)[:n]
-                        for sel, n in zip(
-                            combined_selected_tokens, combined_selected_tokens_real_lens
-                        )
-                    ]
-                )
+                device_seed: torch.Tensor | list[torch.Tensor]
+                if getattr(self._async_drafter, "bucketed_drafts", False):
+                    device_seed = [sel.view(-1) for sel in combined_selected_tokens]
+                else:
+                    device_seed = torch.cat(
+                        [
+                            sel.view(-1)[:n]
+                            for sel, n in zip(
+                                combined_selected_tokens,
+                                combined_selected_tokens_real_lens,
+                            )
+                        ]
+                    )
                 with self._stage_timing.stage("draft_propose"):
                     eagle3_drafts = self.spec_decode_manager.propose_draft_token_ids(
                         sampled_token_ids=[],
@@ -4699,7 +4793,9 @@ class TPUModelRunner(GPUModelRunner):
                 # take_draft_token_ids() to replace the async scheduler's -1
                 # splaceholders. Stage after the TP pin above so the host
                 # copy matches what gets substituted on device.
-                self.spec_decode_manager.stage_draft_token_ids_for_host(eagle3_drafts)
+                self.spec_decode_manager.stage_draft_token_ids_for_host(
+                    eagle3_drafts, state.num_reqs_list
+                )
 
             # Build the async substitution source from the drafts proposed
             # above: the [bonus, draft_1..K] source + 1+K next_token_indices,
@@ -4715,7 +4811,11 @@ class TPUModelRunner(GPUModelRunner):
                 ) = self._assemble_async_spec_substitution(
                     eagle3_drafts, next_tokens_per_chunk, state
                 )
-            elif self._is_async_drafter and next_tokens_tpu_chunks:
+            elif (
+                self._is_async_drafter
+                and next_tokens_tpu_chunks
+                and not context_only_draft
+            ):
                 # Prefill / pure-non-spec eagle3 bootstrap: the non-spec sampling
                 # branch parked a stride-1 source (sampled token only). Rebuild
                 # it as a stride-(1+K) [bonus, draft_1..K] source carrying real
@@ -6299,11 +6399,29 @@ class TPUModelRunner(GPUModelRunner):
                         # concrete-shaped tensors (this attempt logs loudly if it
                         # also fails).
                         self._warmup_one_spec_request(int(P), idx=i, greedy=greedy)
-            # (2) The propose+verify+sampling fusions are also keyed on the
-            # decode batch size (num_reqs). Only relevant when serving actually
-            # batches (>1 concurrent request); sweep real multi-request batches
-            # so nr>1 serving steps are cached too -- both greedy and non-greedy.
-            if self.scheduler_config.max_num_seqs > 1:
+            # (2) Batched spec steps. A bucketed-draft proposer depends on no
+            # exact request count, so one count per program-bucket combination
+            # (`_spec_warmup_bucket_grid`), each with a short decode run and a
+            # mixed verify+prefill step, covers every count serving visits.
+            # Other drafters keep the full count sweep below.
+            if self.scheduler_config.max_num_seqs > 1 and getattr(
+                getattr(self, "drafter", None), "bucketed_drafts", False
+            ):
+                P_small = int(self.num_tokens_paddings[0])
+                sweep = self._spec_warmup_bucket_grid(mixed=True)
+                logger.info(
+                    "spec-decode warmup: bucket grid of %d request counts %s",
+                    len(sweep),
+                    sweep,
+                )
+                for R in sweep:
+                    self._warmup_spec_batch(
+                        int(R), P_small, greedy=True, short=True, mixed=True
+                    )
+                    self._warmup_spec_batch(
+                        int(R), P_small, greedy=False, short=True, mixed=True
+                    )
+            elif self.scheduler_config.max_num_seqs > 1:
                 P_small = int(self.num_tokens_paddings[0])
                 for R in self.num_reqs_paddings:
                     if int(R) > 1:
@@ -6311,7 +6429,60 @@ class TPUModelRunner(GPUModelRunner):
                         self._warmup_spec_batch(int(R), P_small, greedy=False)
         logger.info("spec-decode warmup compiled %d graphs", self.num_xla_graphs - n0)
 
-    def _warmup_spec_batch(self, R: int, P: int, greedy: bool = True) -> None:
+    def _spec_warmup_bucket_grid(self, mixed: bool) -> list[int]:
+        """Request counts to warm: the first count at which any program bucket
+        of a verify step changes (request pad, token bucket, logits-row bucket,
+        draft-row bucket), for decode-only steps and, with `mixed`,
+        verify+prefill steps. With bucketed drafts the programs are keyed on
+        these buckets only, so one count per combination covers every count."""
+        assert self.speculative_config is not None
+        K = self.speculative_config.num_speculative_tokens
+        drafter = self.drafter
+        block = int(getattr(drafter, "block_size", K + 1))
+        max_reqs = int(self.max_num_reqs)
+        budget = int(self.max_num_tokens)
+        pads = list(self.num_tokens_paddings)
+
+        def tok_bucket(n: int) -> int:
+            return _get_padded_token_len(pads, n) if n <= pads[-1] else pads[-1]
+
+        seen: set[tuple] = set()
+        grid: list[int] = []
+        for R in range(1, max_reqs + 1):
+            keys = []
+            if budget >= R * (1 + K):
+                keys.append(
+                    (
+                        "decode",
+                        _get_padded_num_reqs_with_upper_limit(R, max_reqs),
+                        tok_bucket(R * (1 + K)),
+                        tok_bucket(R * block),
+                    )
+                )
+            if mixed and max_reqs >= R + 1 and budget >= R * (1 + K) + 1:
+                keys.append(
+                    (
+                        "mixed",
+                        _get_padded_num_reqs_with_upper_limit(R + 1, max_reqs),
+                        tok_bucket(R * (1 + K) + 1),
+                        tok_bucket((R + 1) * block),
+                    )
+                )
+            new = [k for k in keys if k not in seen]
+            if new:
+                seen.update(new)
+                grid.append(R)
+        return grid
+
+    def _warmup_spec_batch(
+        self,
+        R: int,
+        P: int,
+        greedy: bool = True,
+        *,
+        short: bool = False,
+        mixed: bool = False,
+    ) -> None:
         """Warm an nr=R decode batch: prefill R synthetic requests then decode
         them together so the multi-request fused programs are compiled.
 
@@ -6328,7 +6499,7 @@ class TPUModelRunner(GPUModelRunner):
         assert self.kv_cache_config is not None
         K = self.speculative_config.num_speculative_tokens
         room = self.max_model_len - P
-        n_decode = min(max(5, K + 2), max(0, room // (1 + K) - 1))
+        n_decode = min(3 if short else max(5, K + 2), max(0, room // (1 + K) - 1))
         max_pos = min(self.max_model_len, P + n_decode * (1 + K))
         # Per-group block counts at each group's own block size (see
         # _warmup_one_spec_request); the per-request stride uses the widest
@@ -6343,6 +6514,8 @@ class TPUModelRunner(GPUModelRunner):
             logger.warning("skip spec-decode warmup R=%d: not enough kv blocks", R)
             return
         rids = [f"__spec_warmup_b{R}_{j}__" for j in range(R)]
+        mix_rid = f"__spec_warmup_b{R}_mix"
+        mix_ids: list[str] = []
         sp = SamplingParams(temperature=0.0 if greedy else 1.0)
         logger.info("spec-decode warmup batch: R=%d P=%d greedy=%s", R, P, greedy)
         try:
@@ -6404,10 +6577,79 @@ class TPUModelRunner(GPUModelRunner):
                 self.sample_tokens(None)
                 self.take_draft_token_ids()
                 nct = [x + 1 for x in nct]
+            if (
+                mixed
+                and self.max_num_reqs >= R + 1
+                and int(self.max_num_tokens) - R * (1 + K) >= P
+            ):
+                # Mixed verify+prefill steps at the full step budget: R verify
+                # windows plus one prefill chunk filling the budget, then two
+                # prefill requests sharing the step while the first finishes.
+                # Saturated serving runs both shapes; the decode-only steps
+                # above never compile them.
+                P_mix = int(self.max_num_tokens) - R * (1 + K)
+                P_mix = max(P, min(P_mix, self.max_model_len - (1 + K) - 1))
+                mix_nblks = [
+                    _spec_warmup_group_num_blocks(self, g, P_mix + 1 + K)
+                    for g in self.kv_cache_config.kv_cache_groups
+                ]
+                mix_nblk = max(mix_nblks)
+                variants = [[P_mix]]
+                if self.max_num_reqs >= R + 2 and P_mix >= 2 * P:
+                    variants.append([P_mix // 2, P_mix - P_mix // 2])
+                prev_ids: list[str] = []
+                base_lo = 1 + R * nblk
+                for vi, plist in enumerate(variants):
+                    if top <= base_lo + (vi + 1) * len(plist) * mix_nblk + 1:
+                        break
+                    extras = []
+                    for k_, Pk in enumerate(plist):
+                        lo = base_lo + (vi * 2 + k_) * mix_nblk
+                        extras.append(
+                            NewRequestData(
+                                req_id=f"{mix_rid}{vi}_{k_}",
+                                prompt_token_ids=[0] * Pk,
+                                mm_features=[],
+                                sampling_params=sp,
+                                pooling_params=None,
+                                block_ids=tuple(
+                                    list(range(lo, lo + g_nblk)) for g_nblk in mix_nblks
+                                ),
+                                num_computed_tokens=0,
+                                lora_request=None,
+                            )
+                        )
+                    mix_ids.extend(e.req_id for e in extras)
+                    all_token_ids = _spec_warmup_all_token_ids(rids, nct)
+                    creq = CachedRequestData(
+                        req_ids=list(rids),
+                        resumed_req_ids=set(),
+                        new_token_ids=[],
+                        all_token_ids=all_token_ids,
+                        new_block_ids=[None] * R,
+                        num_computed_tokens=list(nct),
+                        num_output_tokens=[n_decode + 1 + vi] * R,
+                    )
+                    so = SchedulerOutput.make_empty()
+                    so.scheduled_new_reqs = extras
+                    so.scheduled_cached_reqs = creq
+                    so.num_scheduled_tokens = {rid: 1 + K for rid in rids}
+                    for e, Pk in zip(extras, plist):
+                        so.num_scheduled_tokens[e.req_id] = Pk
+                    so.total_num_scheduled_tokens = R * (1 + K) + sum(plist)
+                    so.scheduled_spec_decode_tokens = {rid: [0] * K for rid in rids}
+                    # The previous variant's prefill requests finish in this
+                    # step, as a prompt's last chunk does in serving.
+                    so.finished_req_ids = set(prev_ids)
+                    assert self.execute_model(so) is None
+                    self.sample_tokens(None)
+                    self.take_draft_token_ids()
+                    nct = [x + 1 for x in nct]
+                    prev_ids = [e.req_id for e in extras]
         except Exception:
             logger.exception("spec-decode warmup R=%d failed; continuing", R)
         finally:
-            self._warmup_spec_decode_cleanup(rids)
+            self._warmup_spec_decode_cleanup(rids + mix_ids)
 
     def _warmup_one_spec_request(
         self, P: int, idx: int, quiet: bool = False, greedy: bool = True

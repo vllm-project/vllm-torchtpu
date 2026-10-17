@@ -23,10 +23,13 @@ def supports_chunked_prefill(
     pool: jax.Array | tuple[jax.Array, jax.Array],
     page_records: int | None,
 ) -> bool:
-    """Static envelope for the measured chunk-2K packed-cache route."""
+    """Packed-cache prefill with complete resident-query tiles."""
     banks = pool if isinstance(pool, tuple) else (pool,)
     return (
-        q.shape == (2048, 32, DIM)
+        q.ndim == 3
+        and q.shape[0] >= tuned_block_sizes.QUERY_TILE
+        and q.shape[0] % tuned_block_sizes.QUERY_TILE == 0
+        and q.shape[1:] == (32, DIM)
         and q.dtype == jnp.bfloat16
         and page_records is not None
         and 0 < page_records <= tuned_block_sizes.KEY_TILE
@@ -60,6 +63,7 @@ def _kernel(
     q_ref,
     w_ref,
     pool,
+    records_ref,
     out,
     words,
     *scratch,
@@ -185,6 +189,9 @@ def _kernel(
                     preferred_element_type=jnp.float32,
                 ).reshape(rows, heads, tile)
                 values = (jnp.maximum(logits, 0) * weights).sum(1)
+                if records_ref is not None:
+                    valid = records_ref[:, pl.ds(block * tile, tile)] >= 0
+                    values = jnp.where(valid, values, -jnp.inf)
                 if row_lengths is not None:
                     position = window_start + block * tile + jnp.arange(tile)
                     causal = (
@@ -243,19 +250,26 @@ def prefill_index_scores(
     prefetch: bool = True,
     profile_stages: bool = False,
     halfplane: bool = False,
+    records: jax.Array | None = None,
 ) -> jax.Array:
-    """Score one shared request; caller applies per-query causal/record masks.
+    """Score one shared request; caller applies per-query causal lengths.
 
     Q is split-order BF16 [T,H,128]; weights are FP32 [T,H,1]. Pages are
     first-record addresses [1,N]. The limit [1] bounds the shared scan.
     ``prefetch=False`` is a diagnostic serial-DMA ablation; ``profile_stages``
     enables standalone JAX trace scopes. Serving defaults remain uninstrumented.
+    Optional full record addresses [1,width] mask individual invalid entries
+    during score writeback. Without records, the caller masks invalid entries.
     """
     if min(page_records, query_tile, key_tile) <= 0:
         raise ValueError("Tile and page sizes must be positive")
     tokens, heads, dim = q.shape
     banks = pool if isinstance(pool, tuple) else (pool,)
     width = pages.shape[1] * page_records
+    if records is not None and (
+        records.shape != (1, width) or records.dtype != jnp.int32
+    ):
+        raise ValueError("Records must be int32 with shape [1, score width]")
     if (
         tokens < 1
         or heads < 1
@@ -306,6 +320,11 @@ def prefill_index_scores(
                 pl.BlockSpec((query_tile, heads, DIM), lambda i, j, *_: (i, 0, 0)),
                 pl.BlockSpec((query_tile, heads, 1), lambda i, j, *_: (i, 0, 0)),
                 (hbm, hbm) if isinstance(pool, tuple) else hbm,
+                (
+                    pl.BlockSpec((1, window), lambda i, j, *_: (0, j))
+                    if records is not None
+                    else None
+                ),
             ),
             out_specs=pl.BlockSpec((query_tile, window), lambda i, j, *_: (i, j)),
             scratch_shapes=(
@@ -328,4 +347,4 @@ def prefill_index_scores(
         ),
         interpret=interpret,
         name="prefill_paged_bf16_index_scores",
-    )(pages.reshape(-1), row_limit, q, weights, pool)
+    )(pages.reshape(-1), row_limit, q, weights, pool, records)

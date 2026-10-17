@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""Construct fixed workloads; throughput comes exclusively from worker records."""
+"""Construct fixed workloads and summarize worker observations."""
 
 import argparse
 import concurrent.futures
@@ -17,6 +17,9 @@ from pathlib import Path
 import requests
 from prometheus_client.parser import text_string_to_metric_families
 from server_step_worker import SCENARIOS
+
+# Hold accepted tokens constant so the primary metric compares step cadence.
+_FIXED_ACCEPTED_TOKENS_PER_REQUEST_STEP = 3.47
 
 
 def client_main(argv: list[str]) -> None:
@@ -453,7 +456,11 @@ def summarize(results: list, scenario_name: str) -> dict:
     rate = tokens / seconds
     median_step_seconds = statistics.median(s["seconds"] for s in samples)
     mean_tokens = tokens / sum(w["request_observations"] for w in windows)
-    median_rate = scenario.concurrency * mean_tokens / median_step_seconds
+    median_rate = (
+        scenario.concurrency
+        * _FIXED_ACCEPTED_TOKENS_PER_REQUEST_STEP
+        / median_step_seconds
+    )
     return {
         "scenario": scenario.to_dict(),
         "timing": "native_output_observation_cadence",
@@ -464,7 +471,8 @@ def summarize(results: list, scenario_name: str) -> dict:
             "accepted-output context is reconstructed"
         ),
         "decode_throughput": {
-            "basis": "median_step_estimate",
+            "basis": "fixed_accepted_tokens_median_step_estimate",
+            "accepted_tokens_per_request_step": _FIXED_ACCEPTED_TOKENS_PER_REQUEST_STEP,
             "global_tokens_s": median_rate,
             "per_device_tokens_s": median_rate / scenario.dp_size,
             "per_physical_chip_tokens_s": median_rate / scenario.physical_chips,

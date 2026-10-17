@@ -165,7 +165,9 @@ def main() -> None:
     verify_rows = DECODE_SCENARIO.local_concurrency * (
         DECODE_SCENARIO.dspark_tokens + 1
     )
-    buckets = [verify_rows, DECODE_SCENARIO.chunk_tokens] if decode else [2048]
+    # Target and context-KV buckets; draft queries derive their own ladder
+    # from request buckets and the draft block size.
+    buckets = [verify_rows, DECODE_SCENARIO.chunk_tokens] if decode else [128, 2048]
     env.update(
         TP="1",
         DP="8",

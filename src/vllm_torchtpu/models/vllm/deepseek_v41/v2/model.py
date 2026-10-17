@@ -1114,7 +1114,7 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
         return super().forward(*args, **kwargs)
 
     def __init__(self, *, vllm_config, prefix=""):
-        # Limit DP to the node-local host-sharded topology implemented here.
+        # Both host-table layouts require one node-local Engram DP group.
         parallel = vllm_config.parallel_config
         if parallel.pipeline_parallel_size != 1:
             raise NotImplementedError("V4.1 TPU currently requires PP1")
@@ -1126,11 +1126,6 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
             ):
                 raise NotImplementedError(
                     "V4.1 TPU DP requires TP1, EP and Engram CPU offload"
-                )
-            if vllm_config.engram_config.dp_shared_memory:
-                raise NotImplementedError(
-                    "V4.1 TPU DP uses head-sharded host Engram tables; "
-                    "set engram_config.dp_shared_memory=False"
                 )
             if upstream.get_engram_dp_size() != parallel.data_parallel_size:
                 raise NotImplementedError(

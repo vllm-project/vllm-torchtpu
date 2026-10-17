@@ -74,6 +74,87 @@ def test_idle_dp_rank_encodes_before_decoder_pairing():
     assert order == ["encoder", ("decoder", 8), ("decoder", 8), ("draft", 2)]
 
 
+@pytest.mark.parametrize("propose_tokens", [False, True])
+def test_idle_dflash_rank_pairs_context_before_optional_proposals(propose_tokens):
+    order = []
+    drafter = tpu_runner.DFlashProposer.__new__(tpu_runner.DFlashProposer)
+    drafter.draft_model = SimpleNamespace()
+    drafter._dp_lockstep_sharded = lambda: True
+    drafter._dp_dummy_kv_update = lambda: order.append("context")
+    drafter._dp_dummy_forward = lambda: order.append("proposal")
+    runner = SimpleNamespace(
+        _execute_dp_mm_encoder=lambda: None,
+        _run_dp_dummy_chunk=lambda bucket: order.append("target"),
+        speculative_config=SimpleNamespace(use_eagle=lambda: True),
+        _async_drafter=drafter,
+        _draft_proposals_needed=propose_tokens,
+    )
+    TPUModelRunner._run_dp_idle_pairing(runner, 2048, 2)
+    assert order == ["target", "target", "context", "context"] + (
+        ["proposal", "proposal"] if propose_tokens else []
+    )
+
+
+@pytest.mark.parametrize(
+    "computed,scheduled,prompts,needed",
+    [
+        ([0], [2048], [4096], False),
+        ([2048], [2048], [4096], True),
+        ([4096], [6], [4096], True),
+        ([0, 4096], [2048, 6], [4096, 4096], True),
+        ([0, 1024], [2048, 2048], [4096, 4096], False),
+    ],
+)
+def test_dflash_proposes_only_at_prompt_boundary_or_decode(
+    computed, scheduled, prompts, needed
+):
+    ids = [str(i) for i in range(len(computed))]
+    runner = SimpleNamespace(
+        drafter=tpu_runner.DFlashProposer.__new__(tpu_runner.DFlashProposer),
+        input_batch=SimpleNamespace(
+            req_id_to_index={key: i for i, key in enumerate(ids)},
+            num_computed_tokens_cpu=np.array(computed),
+            num_prompt_tokens=np.array(prompts),
+        ),
+    )
+    output = SimpleNamespace(
+        num_scheduled_tokens=dict(zip(ids, scheduled, strict=True))
+    )
+    assert TPUModelRunner._needs_draft_proposals(runner, output) is needed
+
+
+@pytest.mark.parametrize("peer_needs_draft", [False, True])
+def test_dp_draft_decision_includes_ready_peers_and_idle_ranks(peer_needs_draft):
+    runner = SimpleNamespace(
+        _dp_lockstep_enabled=lambda: True,
+        num_tokens_paddings=[128, 2048],
+    )
+
+    def reduce(tensor, **kwargs):
+        assert tensor.tolist() == [0, 0, 0, 0, 0]
+        tensor.copy_(torch.tensor([2048, 2, 1, 0, int(peer_needs_draft)]))
+
+    with (
+        patch("vllm.distributed.parallel_state.get_dp_group") as group,
+        patch.object(torch.distributed, "all_reduce", side_effect=reduce) as collective,
+    ):
+        group.return_value.cpu_group = "cpu-group"
+        result = TPUModelRunner._dp_coordinated_step(
+            runner, 0, 0, needs_draft_proposals=False
+        )
+    assert result == (2048, 2)
+    assert runner._draft_proposals_needed is peer_needs_draft
+    collective.assert_called_once()
+
+
+def test_non_lockstep_partial_prefill_skips_proposals():
+    runner = SimpleNamespace(_dp_lockstep_enabled=lambda: False)
+    assert TPUModelRunner._dp_coordinated_step(
+        runner, 2048, 1, needs_draft_proposals=False
+    ) == (None, 1)
+    assert not runner._draft_proposals_needed
+
+
 def test_spec_warmup_all_token_ids_matches_current_sequence_lengths():
     all_token_ids = tpu_runner._spec_warmup_all_token_ids(
         ["request-0", "request-1"], [7, 12]
@@ -2530,3 +2611,115 @@ def test_init_num_reqs_caps_deepseek_v41_v2_vs_rpa(monkeypatch):
     runner._init_num_reqs_caps()
     assert runner.num_reqs_max_model_len == 20
     assert runner.num_reqs_most_model_len is None
+
+
+def _runner(K: int, block: int, max_reqs: int, budget: int, paddings: list[int]):
+    return SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=K),
+        drafter=SimpleNamespace(block_size=block),
+        max_num_reqs=max_reqs,
+        max_num_tokens=budget,
+        num_tokens_paddings=paddings,
+    )
+
+
+def _step_keys(runner, R: int, mixed: bool) -> set[tuple]:
+    """The program buckets of a verify step with R decoders (and, with
+    ``mixed``, one more request prefilling a token), as the runner keys them."""
+    K = runner.speculative_config.num_speculative_tokens
+    block = runner.drafter.block_size
+    pads = runner.num_tokens_paddings
+    max_reqs = runner.max_num_reqs
+
+    def tok_bucket(n: int) -> int:
+        return tpu_runner._get_padded_token_len(pads, n) if n <= pads[-1] else pads[-1]
+
+    keys = set()
+    if runner.max_num_tokens >= R * (1 + K):
+        keys.add(
+            (
+                "decode",
+                tpu_runner._get_padded_num_reqs_with_upper_limit(R, max_reqs),
+                tok_bucket(R * (1 + K)),
+                tok_bucket(R * block),
+            )
+        )
+    if mixed and max_reqs >= R + 1 and runner.max_num_tokens >= R * (1 + K) + 1:
+        keys.add(
+            (
+                "mixed",
+                tpu_runner._get_padded_num_reqs_with_upper_limit(R + 1, max_reqs),
+                tok_bucket(R * (1 + K) + 1),
+                tok_bucket((R + 1) * block),
+            )
+        )
+    return keys
+
+
+FLASH = dict(
+    K=5, block=5, max_reqs=64, budget=1024, paddings=[16, 32, 64, 128, 256, 512, 1024]
+)
+AGENTX = dict(K=5, block=5, max_reqs=8, budget=256, paddings=[16, 32, 64, 128, 256])
+# 8 decoders x 6 rows = 48 > a 32-token budget: counts above 5 have no step.
+TIGHT = dict(K=5, block=5, max_reqs=8, budget=32, paddings=[16, 32])
+
+
+@pytest.mark.parametrize(
+    "cfg", [FLASH, AGENTX, TIGHT], ids=["flash", "agentx", "tight"]
+)
+@pytest.mark.parametrize("mixed", [False, True])
+def test_grid_covers_every_bucket_combination_once(cfg, mixed):
+    runner = _runner(**cfg)
+    grid = TPUModelRunner._spec_warmup_bucket_grid(runner, mixed=mixed)
+
+    assert grid == sorted(set(grid))
+    assert all(1 <= R <= cfg["max_reqs"] for R in grid)
+    # Every bucket combination a serving step can take is warmed ...
+    covered = set().union(*(_step_keys(runner, R, mixed) for R in grid))
+    needed = set().union(
+        *(_step_keys(runner, R, mixed) for R in range(1, cfg["max_reqs"] + 1))
+    )
+    assert covered == needed
+    # ... by one count each: every grid entry brings a bucket no earlier one had.
+    seen: set[tuple] = set()
+    for R in grid:
+        keys = _step_keys(runner, R, mixed)
+        assert keys - seen, f"count {R} adds no new bucket"
+        seen |= keys
+
+
+@pytest.mark.parametrize("verify", [False, True])
+def test_bucketed_drafts_preserve_real_request_offsets_across_chunks(verify):
+    runner = object.__new__(TPUModelRunner)
+    runner.drafter = SimpleNamespace(bucketed_drafts=True)
+    drafts = [torch.full((8, 2), 11), torch.full((4, 2), 22)]
+    selected = [torch.tensor([7, 0, 0, 0]), torch.tensor([8, 0])]
+    if verify:
+        next_tokens = [
+            torch.stack([s, torch.full_like(s, -1), torch.full_like(s, -1)], dim=1)
+            for s in selected
+        ]
+        state = SimpleNamespace(
+            num_reqs_list=[1, 1],
+            spec_decode_metadata_list=[
+                SimpleNamespace(
+                    draft_lengths=torch.tensor([2, 0, 0, 0]),
+                    draft_lengths_cpu=np.array([2]),
+                ),
+                None,
+            ],
+        )
+        chunks, indices, rejected, counts = runner._assemble_async_spec_substitution(
+            drafts, next_tokens, state
+        )
+    else:
+        chunks, indices, rejected, counts = runner._assemble_async_prefill_bootstrap(
+            drafts, selected, [1, 1]
+        )
+    assert indices == {0: 0, 1: 4}
+    assert [c.numel() for c in chunks] == [12, 6]
+    source = torch.cat(chunks).reshape(-1, 3)
+    assert source[indices[0]].tolist() == [7, 11, 11]
+    assert source[indices[1]].tolist() == [8, 22, 22]
+    assert rejected.tolist() == ([2, 0, 0, 0, 0, 0] if verify else [0] * 6)
+    assert counts == ({0: 2} if verify else {0: 0, 1: 0})

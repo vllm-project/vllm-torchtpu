@@ -1744,6 +1744,46 @@ class TestModelInitAndWeights:
 
 
 class TestDeepseekV41ForCausalLM:
+    @pytest.mark.parametrize(
+        ("shared_memory", "resolved_shared_memory"),
+        [(False, False), (True, True), (True, False)],
+    )
+    def test_dp_accepts_both_host_table_layouts(
+        self, shared_memory: bool, resolved_shared_memory: bool
+    ) -> None:
+        cfg = _mock_vllm_config(dp_size=2, ep_enabled=True)
+        cfg.engram_config = SimpleNamespace(dp_shared_memory=shared_memory)
+
+        def init(self, *, vllm_config, prefix=""):
+            # Upstream may disable sharing when /dev/shm is too small.
+            vllm_config.engram_config.dp_shared_memory = resolved_shared_memory
+            self.config = SimpleNamespace(expert_dtype="fp4")
+
+        with (
+            patch.dict(os.environ, {"TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD": "1"}),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_engram_dp_size",
+                return_value=2,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.install_host_engram_inputs"
+            ) as mock_host_engram,
+            patch(
+                "vllm.models.deepseek_v41.nvidia.model.DeepseekV41LLMForCausalLM.__init__",
+                init,
+            ),
+            patch(
+                "vllm.models.deepseek_v41.nvidia.model._make_deepseek_v4_weights_mapper",
+                return_value="mock_mapper",
+            ),
+        ):
+            model = DeepseekV41ForCausalLM.__new__(DeepseekV41ForCausalLM)
+            model.__init__(vllm_config=cfg)
+
+        assert cfg.engram_config.dp_shared_memory is resolved_shared_memory
+        assert model.hf_to_vllm_mapper == "mock_mapper"
+        mock_host_engram.assert_called_once()
+
     def test_init_capability_guards(self) -> None:
         # PP > 1
         cfg_pp = _mock_vllm_config(pp_size=2)

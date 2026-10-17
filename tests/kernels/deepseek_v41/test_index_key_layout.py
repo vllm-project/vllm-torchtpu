@@ -89,7 +89,10 @@ def test_merge_updates_both_halfplanes_and_preserves_untouched_bits():
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("fused", [False, True])
 @pytest.mark.parametrize("prefetch", [False, True])
-def test_all_score_routes_match_ordinary(fused, prefetch):
+@pytest.mark.parametrize("record_mask", [False, True])
+def test_all_score_routes_match_ordinary(monkeypatch, fused, prefetch, record_mask):
+    # Exercise record masking across score windows as well as within key tiles.
+    monkeypatch.setattr(scores.tuned_block_sizes, "SCORE_WINDOW", 16)
     rng = np.random.default_rng(71)
     keys = jnp.asarray(rng.integers(-8, 9, (128, 128)), jnp.bfloat16)
     ordinary, native = pools(keys)
@@ -118,6 +121,8 @@ def test_all_score_routes_match_ordinary(fused, prefetch):
         **options,
     )
     np.testing.assert_array_equal(actual.view(jnp.uint32), reference.view(jnp.uint32))
+    records = jnp.arange(64, dtype=jnp.int32)[None]
+    records = records.at[0, jnp.array([7, 9, 31, 32, 63])].set(-1)
     for function, arguments, kwargs in (
         (score_word_rows, (q[0], weights[0]), {}),
         (
@@ -130,6 +135,7 @@ def test_all_score_routes_match_ordinary(fused, prefetch):
                 query_tile=3,
                 key_tile=32,
                 prefetch=prefetch,
+                records=records if record_mask else None,
             ),
         ),
     ):
@@ -147,6 +153,9 @@ def test_all_score_routes_match_ordinary(fused, prefetch):
             **kwargs,
         )
         np.testing.assert_array_equal(left.view(jnp.uint32), right.view(jnp.uint32))
+        if function is scores.prefill_index_scores and record_mask:
+            # Invalid slots inside pages and across tiles must never reach Top-K.
+            assert np.isneginf(np.asarray(right)[:, np.asarray(records[0]) < 0]).all()
     unpacked = candidate.unpack_candidate_words(
         native[None], interpret=True, halfplane=True
     )
