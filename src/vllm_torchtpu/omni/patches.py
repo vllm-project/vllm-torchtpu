@@ -77,6 +77,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_qwen_image_rope_txt_freqs_clone()
     _patch_wan_pair_swap_rope()
     _patch_wan_ffn_gelu_fence()
+    _patch_diffusion_worker_d2h_stream()
     _patch_diffusion_startup_warmup_sync()
     _patch_wan_fused_qk_norm_rope()
     _patch_wan_fresh_timestep()
@@ -200,6 +201,59 @@ def _patch_wan_ffn_gelu_fence() -> None:
 
     ColumnParallelGELU.forward = _fenced_gelu_forward
     logger.info("Applied TPU patch: fusion fence after Wan FFN GELU.")
+
+
+# TODO: Remove once vLLM-Omni creates the D2H stream of
+# WorkerProc._async_output_loop (vllm_omni/diffusion/worker/diffusion_worker.py)
+# on the current device index instead of
+# torch.device(torch.accelerator.current_accelerator().type, self.gpu_id).
+def _patch_diffusion_worker_d2h_stream() -> None:
+    """Create the diffusion worker's D2H side stream on the selected device.
+
+    ``WorkerProc._async_output_loop`` creates its D2H stream on device index
+    ``self.gpu_id``. On TPU, ``OmniTpuPlatform.set_device`` selects device
+    index 0 in every worker process, so a worker with ``gpu_id >= 1`` would
+    ask for a stream on a device index that its process did not select.
+
+    The loop runs with a proxy as ``self`` whose ``gpu_id`` is the current
+    device index. The proxy is in place for the whole lifetime of the output
+    thread, not only while the stream is created. Only attribute reads and
+    writes are forwarded to the worker, so identity or type checks on ``self``
+    inside the loop would see the proxy; the upstream loop does not do any.
+    """
+    from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
+
+    if hasattr(WorkerProc, "_tpu_orig_async_output_loop"):
+        return
+    orig_async_output_loop = getattr(WorkerProc, "_async_output_loop", None)
+    if orig_async_output_loop is None:
+        logger.warning(
+            "Skipping TPU patch: vLLM-Omni WorkerProc has no _async_output_loop."
+        )
+        return
+    WorkerProc._tpu_orig_async_output_loop = orig_async_output_loop
+
+    def _tpu_async_output_loop(self: Any) -> None:
+        orig_async_output_loop(_CurrentDeviceWorkerProxy(self))
+
+    WorkerProc._async_output_loop = _tpu_async_output_loop
+    logger.info("Applied TPU patch: diffusion D2H stream on the current device.")
+
+
+class _CurrentDeviceWorkerProxy:
+    """Forward attribute access to a worker, reporting the current device as
+    ``gpu_id``."""
+
+    def __init__(self, worker: Any) -> None:
+        object.__setattr__(self, "_worker", worker)
+
+    def __getattr__(self, name: str) -> Any:
+        if name == "gpu_id":
+            return torch.accelerator.current_device_index()
+        return getattr(self._worker, name)
+
+    def __setattr__(self, name: str, value: Any) -> None:
+        setattr(self._worker, name, value)
 
 
 # TODO: Remove once vLLM-Omni synchronizes the device at the end of its
