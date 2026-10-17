@@ -75,7 +75,10 @@ logger = init_logger(__name__)
 
 _DONE_SENTINEL = "_TORCH_TPU_MP_MULTIHOST_ENV_PREPARED"
 _DP_DONE_SENTINEL = "_TORCH_TPU_MP_MULTIHOST_DP_ENV_PREPARED"
-_RENDEZVOUS_TIMEOUT_S = 300
+# The hosts of one slice can reach the rendezvous minutes apart: a pod that
+# starts late and then spends minutes pre-pulling the model config from GCS
+# arrived 5.5 min after the other three prefill hosts of a PP4xPCP8 job.
+_RENDEZVOUS_TIMEOUT_S = 1200
 
 # The master's TCPStore server thread stops as soon as the TCPStore object is
 # garbage-collected. Other hosts may still be reading keys from it after this
