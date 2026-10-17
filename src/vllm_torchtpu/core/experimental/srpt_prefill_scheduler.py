@@ -69,10 +69,6 @@ class SrptPrefillScheduler(AsyncScheduler):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self.max_consecutive_holds = envs.VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS
-        spec = self.vllm_config.speculative_config
-        self._draft_slots = (
-            spec.max_num_new_slots_for_drafting if spec is not None else 0
-        )
         # Running prefill request id -> consecutive steps with less than one
         # block of progress.
         self._stalled_steps: dict[str, int] = {}
@@ -193,11 +189,13 @@ class SrptPrefillScheduler(AsyncScheduler):
         a misestimate only makes a hold miss, which the backoff absorbs.
         """
         next_step = self.current_step + 1
+        spec = self.vllm_config.speculative_config
+        draft_slots = spec.max_num_new_slots_for_drafting if spec is not None else 0
         token_budget = self.max_num_scheduled_tokens
         input_budget = self.scheduler_config.max_num_batched_tokens
         alloc: dict[str, int] = {}
         for r in reqs:
-            if token_budget <= 0 or input_budget <= self._draft_slots:
+            if token_budget <= 0 or input_budget <= draft_slots:
                 break
             if (
                 r.num_output_placeholders > 0
@@ -215,7 +213,7 @@ class SrptPrefillScheduler(AsyncScheduler):
             n = min(
                 n,
                 token_budget,
-                input_budget - self._draft_slots,
+                input_budget - draft_slots,
                 self.max_model_len
                 - r.num_computed_tokens
                 - self.num_sampled_tokens_per_step,
@@ -225,8 +223,8 @@ class SrptPrefillScheduler(AsyncScheduler):
                 continue
             alloc[r.request_id] = n
             token_budget -= n
-            input_budget -= n + self._draft_slots
-        return alloc, min(token_budget, input_budget - self._draft_slots)
+            input_budget -= n + draft_slots
+        return alloc, min(token_budget, input_budget - draft_slots)
 
     def _next_waiting(self) -> Request | None:
         """The request upstream's WAITING pass admits next."""

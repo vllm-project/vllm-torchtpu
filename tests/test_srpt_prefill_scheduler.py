@@ -13,6 +13,8 @@
 # limitations under the License.
 """SrptPrefillScheduler tests on a real scheduler, through schedule()."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 from vllm import SamplingParams
@@ -22,7 +24,6 @@ from vllm.config import (
     ModelConfig,
     ParallelConfig,
     SchedulerConfig,
-    SpeculativeConfig,
     VllmConfig,
 )
 from vllm.utils.hashing import sha256
@@ -60,20 +61,7 @@ def _build_real_scheduler(
     long_prefill_token_threshold: int = 0,
     scheduler_reserve_full_isl: bool = False,
     policy: str = "fcfs",
-    num_draft_tokens: int = 0,
 ):
-    parallel_config = ParallelConfig()
-    speculative_config = None
-    if num_draft_tokens:
-        # Parallel drafting reserves num_draft_tokens slots per request.
-        speculative_config = SpeculativeConfig(
-            target_model_config=model_config,
-            target_parallel_config=parallel_config,
-            method="draft_model",
-            model=MODEL,
-            num_speculative_tokens=num_draft_tokens,
-            parallel_drafting=True,
-        )
     vllm_config = VllmConfig(
         scheduler_config=SchedulerConfig(
             max_num_seqs=max_num_seqs,
@@ -94,8 +82,7 @@ def _build_real_scheduler(
             cache_dtype="auto",
             enable_prefix_caching=True,
         ),
-        parallel_config=parallel_config,
-        speculative_config=speculative_config,
+        parallel_config=ParallelConfig(),
         device_config=DeviceConfig(device="cpu"),
     )
     kv_cache_config = KVCacheConfig(
@@ -434,9 +421,13 @@ def test_hold_with_speculative_decoding_draft_slots(shared_model_config):
     scheduler, hasher = _build_real_scheduler(
         shared_model_config,
         max_num_batched_tokens=40,
-        num_draft_tokens=2,
     )
     _running_long_prefill(scheduler, hasher, num_tokens=96)
+    # Scheduler.schedule() reads the drafting slots per step; a stand-in config
+    # keeps the test independent of which platforms support a real drafter.
+    scheduler.vllm_config.speculative_config = SimpleNamespace(
+        max_num_new_slots_for_drafting=2
+    )
     scheduler.add_request(_make_real_request("short_wait", 16, hasher, seed=2))
 
     out = scheduler.schedule()
