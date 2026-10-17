@@ -90,7 +90,6 @@ def test_eager_native_index_cache_uses_tagged_interpretation():
         root / "tests/kernels/test_dsv41_prefill_index_scores.py",
         root / "tests/kernels/test_dsv41_decode_index_scores.py",
         root / "tests/kernels/test_dsv41_decode_tuning.py",
-        root / "tests/scripts/test_dsv41_single_k_smoke_placement.py",
     )
     collected = subprocess.run(
         [
