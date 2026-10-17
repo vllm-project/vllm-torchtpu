@@ -83,9 +83,27 @@ def test_same_process_full_page_copy_preserves_halfplane_bits():
 def test_eager_native_index_cache_uses_tagged_interpretation():
     # The real repository collection hook must run in a fresh interpreter.
     path = Path(__file__).resolve()
+    root = path.parents[3]
+    gate_files = (
+        path,
+        root / "tests/kernels/deepseek_v41/test_index_key_layout.py",
+        root / "tests/kernels/test_dsv41_prefill_index_scores.py",
+        root / "tests/kernels/test_dsv41_decode_index_scores.py",
+        root / "tests/kernels/test_dsv41_decode_tuning.py",
+        root / "tests/scripts/test_dsv41_single_k_smoke_placement.py",
+    )
     collected = subprocess.run(
-        [sys.executable, "-m", "pytest", "--collect-only", "-q", str(path)],
-        cwd=path.parents[3],
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "--collect-only",
+            "-q",
+            "-m",
+            "cpu_test",
+            *(str(file) for file in gate_files),
+        ],
+        cwd=root,
         env={
             **os.environ,
             "JAX_PLATFORMS": "cpu",

@@ -75,9 +75,10 @@ def test_grouped_decode_scores_reject_incompatible_query_weights():
         )
 
 
-@pytest.mark.skipif(jax.default_backend() != "tpu", reason="TPU SMEM lowering")
 @pytest.mark.parametrize("fuse_mask", [False, True])
 def test_grouped_decode_page_table_beyond_128_entries(fuse_mask):
+    if jax.default_backend() != "tpu":
+        pytest.skip("TPU SMEM lowering")
     requests, queries, width, page = 3, 6, 4096, 16
     values = jnp.arange(requests * width, dtype=jnp.float32).astype(jnp.bfloat16)
     keys = jnp.broadcast_to(values[:, None], (requests * width, 128))

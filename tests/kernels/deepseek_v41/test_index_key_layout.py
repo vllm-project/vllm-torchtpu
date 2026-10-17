@@ -181,9 +181,10 @@ def test_all_score_routes_match_ordinary(fused, prefetch):
     np.testing.assert_array_equal(left.view(jnp.uint32), right.view(jnp.uint32))
 
 
-@pytest.mark.skipif(jax.default_backend() != "tpu", reason="native TPU lowering")
 def test_halfplane_decode_native_bitcast_on_eight_devices():
     """Exercise native bitcast under the model's manual eight-device partition."""
+    if jax.default_backend() != "tpu":
+        pytest.skip("native TPU lowering")
     from jax.sharding import Mesh
     from jax.sharding import PartitionSpec as P
 

@@ -214,7 +214,7 @@ def main():
     cases = []
     for seed in (0, 73):
         inputs = [
-            jax.device_put_sharded([value] * 8, devices) for value in fixture(seed)
+            np.stack([np.asarray(value)] * len(devices)) for value in fixture(seed)
         ]
         checks = np.asarray(run(*inputs).block_until_ready())
         if not checks.all():
