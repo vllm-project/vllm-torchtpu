@@ -293,3 +293,29 @@ def test_lane_dense_pack_is_pack_tokens(cell):
         assert got.shape == (num_tokens, 128)
         np.testing.assert_array_equal(got[:, : want.shape[1]], want)
         assert not got[:, want.shape[1] :].any()
+
+
+def test_live_rows_with_two_round_write_is_rejected():
+    """row_live_atoms with a kv_write of more than 16 tokens (two write rounds)
+    hangs the kernel on v7x; the wrapper refuses it before launching."""
+    _require_tpu()
+    tokens = 32
+    out_size = tokens * 2048
+    write = native_sc_gather.pack_write_rows(
+        jnp.full((tokens,), -1, jnp.int32),
+        jnp.zeros((tokens, 128), jnp.uint32),
+        jnp.zeros((tokens, native_sc_gather.ROPE_WORDS), jnp.uint32),
+    )
+    with pytest.raises(ValueError, match="hangs the kernel"):
+        native_sc_gather.dsa_gather_native_sc(
+            jnp.zeros((64, 256, 128), jnp.uint32),
+            jnp.zeros((64, 64, 128), jnp.uint32),
+            jnp.zeros((out_size // 128 + 8, 128), jnp.int32),
+            out_size=out_size,
+            atoms_per_batch=1,
+            live_multiple=2048,
+            live_vec_offset=out_size,
+            linear_indices=True,
+            row_live_atoms=jnp.zeros((4 * tokens,), jnp.int32),
+            kv_write=write,
+        )

@@ -739,6 +739,14 @@ def dsa_gather_native_sc(
                 f"write_rows must be uint32[3 * Tp, 128], Tp in (16, 32); got "
                 f"{write_rows.shape} {write_rows.dtype}"
             )
+        if row_kwargs and padded > NUM_SUBCORES:
+            # Deterministic device hang on v7x (both atom sizes, either live
+            # form): a two-round write phase together with the per-row live
+            # gather never completes. One round (<= 16 tokens) runs correctly.
+            raise ValueError(
+                f"row_live_atoms with a {padded}-token kv_write (more than "
+                f"{NUM_SUBCORES}) hangs the kernel; drop one of them"
+            )
         operands.append(write_rows)
         rounds = write_slots(padded, write_fault)
         scratch_types["write_dst_vmem"] = pltpu.VMEM((rounds, NUM_LANES), jnp.int32)
