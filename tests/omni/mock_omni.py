@@ -79,9 +79,23 @@ class _MockSDPAImpl:
         self.softmax_scale = kwargs.get("softmax_scale", scale)
         self.causal = kwargs.get("causal", False)
 
+    def forward(self, query, key, value, attn_metadata=None):
+        # AttentionImpl.forward has no branch for out-of-tree platforms.
+        raise NotImplementedError("No forward implementation for platform: oot")
+
     def _forward_impl(
         self, query, key, value, attn_metadata=None, mask_mode="broadcast_k"
     ):
+        # Mirrors _maybe_reshape_attn_mask: a 2D [B, Sk] keep mask is cast to
+        # bool and broadcast over heads and queries.
+        assert mask_mode == "broadcast_k"
+        attn_mask = getattr(attn_metadata, "attn_mask", None)
+        if (
+            attn_mask is not None
+            and attn_mask.ndim == 2
+            and attn_mask.shape == (query.shape[0], key.shape[1])
+        ):
+            attn_mask = attn_mask.to(torch.bool)[:, None, None, :]
         if self.num_kv_heads != self.num_heads:
             n_rep = self.num_heads // self.num_kv_heads
             key = torch.repeat_interleave(key, n_rep, dim=2)
@@ -90,7 +104,7 @@ class _MockSDPAImpl:
         k = key.transpose(1, 2)
         v = value.transpose(1, 2)
         out = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, scale=self.scale
+            q, k, v, attn_mask=attn_mask, scale=self.softmax_scale
         )
         return out.transpose(1, 2)
 
