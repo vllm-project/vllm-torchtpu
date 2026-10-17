@@ -2,21 +2,21 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Index-only cache interpretation must preserve other records and owners."""
 
+import os
+import subprocess
+import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
-    NativeCacheView,
-    PagedCacheRows,
-    index_key_layout,
-)
-
 pytestmark = pytest.mark.cpu_test
 
 
 def _cache(raw=None, *, layout=None, mode="halfplane"):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import PagedCacheRows
+
     if raw is None:
         raw = torch.zeros((8, 128), dtype=torch.int32)
     if layout is None:
@@ -81,6 +81,31 @@ def test_same_process_full_page_copy_preserves_halfplane_bits():
 
 
 def test_eager_native_index_cache_uses_tagged_interpretation():
+    # The real repository collection hook must run in a fresh interpreter.
+    path = Path(__file__).resolve()
+    collected = subprocess.run(
+        [sys.executable, "-m", "pytest", "--collect-only", "-q", str(path)],
+        cwd=path.parents[3],
+        env={
+            **os.environ,
+            "JAX_PLATFORMS": "cpu",
+            "TORCH_DEVICE_BACKEND_AUTOLOAD": "0",
+        },
+        capture_output=True,
+        text=True,
+        timeout=90,
+        check=False,
+    )
+    output = collected.stdout + collected.stderr
+    assert collected.returncode == 0, output
+    assert "test_eager_native_index_cache_uses_tagged_interpretation" in output
+    assert "A JAX backend was initialized during test collection" not in output
+
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
+        NativeCacheView,
+        PagedCacheRows,
+    )
+
     view = NativeCacheView()
     view._tpu_index_key_layout = "halfplane"
     view._tpu_raw_cache = torch.zeros((8, 128), dtype=torch.int32)
@@ -90,6 +115,8 @@ def test_eager_native_index_cache_uses_tagged_interpretation():
 
 
 def test_index_layout_is_process_lifetime_static(monkeypatch):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import index_key_layout
+
     index_key_layout.cache_clear()
     try:
         monkeypatch.setenv("TPU_DEEPSEEK_V41_INDEX_KEY_LAYOUT", "halfplane")
@@ -140,6 +167,8 @@ def test_halfplane_cpu_all_bf16_patterns_normalize_only_nan_payloads():
 
 
 def test_bound_cache_cannot_change_interpretation():
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import NativeCacheView
+
     view = NativeCacheView()
     view._tpu_index_key_layout = "halfplane"
     view._tpu_bound_index_key_layout = "ordinary"
