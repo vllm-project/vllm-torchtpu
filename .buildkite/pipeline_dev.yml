@@ -63,7 +63,9 @@ steps:
   # -----------------------------------------------------------------
   # Build step (required by every demo below)
   # Builds docker/Dockerfile --target dev and pushes it tagged with this
-  # commit. Same script the CI pipeline_build.yml uses.
+  # commit. Same script the CI pipeline_build.yml uses. A commit whose image
+  # is already in the registry reuses it (CI_IMAGE_REBUILD=1 builds anyway),
+  # and a build that sets CI_IMAGE=<image> uses that image as it is.
   # -----------------------------------------------------------------
   - label: ":docker: Build and Push Dev Image"
     key: build_docker
@@ -162,6 +164,9 @@ steps:
   #                    refs/pull/<N>/head; default
   #                    inferact/megakernel-integration-1016
   #   K3_ENGINE_IMAGE  an engine image to use as it is, instead of building one
+  #   CI_IMAGE         the same for the client's image (Build and Push Dev
+  #                    Image), e.g. to rerun a point on an earlier build's
+  #                    images
   # One point per build, since each needs its own decode server. Point 1 took
   # ~45 min from admission. The step passes even when every request fails,
   # because the client exits 0 after writing what it has: read "requests ok"

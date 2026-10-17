@@ -16,9 +16,6 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-echo "--- Cleaning up old Docker images and cache"
-bash "${SCRIPT_DIR}/cleanup_docker.sh"
-
 TARGET="${1:-dev}"
 IMAGE_SUFFIX=""
 if [ "${TARGET}" = "omni" ]; then
@@ -39,6 +36,40 @@ fi
 
 BASE_TAG="${COMMIT_HASH}-${VLLM_COMMIT_HASH}${IMAGE_SUFFIX}"
 BASE_IMAGE_TAG="${IMAGE_REPO}:${BASE_TAG}"
+
+# CI_IMAGE=<image> (the dev target only): publish that image as this build's
+# and build nothing, as K3_ENGINE_IMAGE does for the Kimi-K3 engine image. The
+# image's code is what the steps run, so give one built from a commit whose
+# image would be the same - a rerun of a pipeline-only change, say.
+if [[ -n "${CI_IMAGE:-}" && -z "${IMAGE_SUFFIX}" ]]; then
+  if ! docker manifest inspect "${CI_IMAGE}" >/dev/null 2>&1; then
+    echo "[FATAL] CI_IMAGE=${CI_IMAGE} is not in the registry." >&2
+    exit 1
+  fi
+  echo "--- Image given: ${CI_IMAGE}"
+  buildkite-agent meta-data set "CI_IMAGE_TAG" "${CI_IMAGE}"
+  echo "--- Done setup_docker_env.sh"
+  exit 0
+fi
+
+# A rerun of a commit - a retried build, or a second build of the same commit -
+# finds its image in the registry already: publish it and skip the build, as
+# build_k3_engine_image.sh does for the engine image. The tag names this commit
+# and the vLLM ref the image is built from, and the steps pull it by that tag
+# either way. Skipping also keeps the rerun off the builder's disk and off the
+# package registries, either of which can fail a build with nothing new to
+# build. CI_IMAGE_REBUILD=1 builds anyway. The nightly canary below layers
+# fresh wheels over the base image, so it always builds.
+if [[ "${TORCHTPU_NIGHTLY:-0}" != "1" && "${CI_IMAGE_REBUILD:-0}" != "1" ]] \
+    && docker manifest inspect "${BASE_IMAGE_TAG}" >/dev/null 2>&1; then
+  echo "--- ${BASE_IMAGE_TAG} is already in the registry; reusing it"
+  buildkite-agent meta-data set "CI_IMAGE_TAG${IMAGE_SUFFIX:-}" "${BASE_IMAGE_TAG}"
+  echo "--- Done setup_docker_env.sh"
+  exit 0
+fi
+
+echo "--- Cleaning up old Docker images and cache"
+bash "${SCRIPT_DIR}/cleanup_docker.sh"
 
 if [[ "${TORCHTPU_NIGHTLY:-0}" != "1" ]]; then
   echo "--- Building Docker Image: ${BASE_IMAGE_TAG} (target: ${TARGET})"
