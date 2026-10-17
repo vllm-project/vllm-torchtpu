@@ -196,9 +196,10 @@ def _build_with(materialized_overrides):
         dsv41_materialized_kv=materialized)
 
 
-def test_consumer_layer_swa_keeps_token_rows():
-    """KV-sharing consumer layers have `_csa2=False`: their SWA cache is
-    written token-major even while the source layers write plane-major."""
+def test_layer_without_csa2_keeps_token_rows():
+    """A layer whose attention does not run CSA2 (`_csa2=False`, e.g. the two
+    compressor-less layers 0..1 of V4.1 Flash) keeps token-major 1024-byte
+    SWA rows even while CSA2 layers write plane-major."""
     manifest = _build_with({"csa2_layers": frozenset({"model.layers.9.attn"})})
     swa = _pool(manifest, "dsv4.swa.g0")
     assert swa.regions[0].unit_bytes == 1024 and swa.regions[0].num_units == 32

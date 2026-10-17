@@ -1619,11 +1619,14 @@ def _build_dsv41_pool_manifest(
         order, so a row-prefix transfer against the view would ship plane 0
         of 2n tokens and none of plane 1.
 
-        Only the CSA2 owner layers (the KV-source layers, `_csa2=True`) write
-        plane-major; the KV-sharing consumer layers have no compressor, keep
-        `_csa2=False`, and write token-major 1024-byte rows. The materialized
-        cache carries the exact per-layer `_tpu_swa_words` flag; the owner's
-        membership in `csa2_layers` is the fallback (`<owner>.swa_cache`).
+        Which layers write plane-major is a per-layer kernel property, not a
+        count to assume: on DeepSeek-V4.1 Flash every layer with a compress
+        ratio (layers 2..39, `_csa2=True`, KV-sharing layers included) does,
+        while the two layers without a compressor (layers 0..1, compress
+        ratio 0, `_csa2=False`) write token-major 1024-byte rows. The
+        materialized cache carries the exact per-layer `_tpu_swa_words` flag;
+        the owner's membership in `csa2_layers` is the fallback
+        (`<owner>.swa_cache`).
         """
         if layer_name in swa_word_layers:
             return True
