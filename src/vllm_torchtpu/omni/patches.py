@@ -359,6 +359,18 @@ def _patch_ltx2_split_rope() -> None:
     # heads on dim 1 and so passes these through whole; the rotation takes
     # the lanes of the local heads instead. Interleaved RoPE and
     # (B, H, T, D/2) tables keep using the original functions.
+    #
+    # The LTX-2 pipeline builds the RoPE coords once per request and passes
+    # the same tensor at every denoising step. Each rope module keeps the
+    # tables of its last split-RoPE call, keyed on the coords tensor
+    # (identity and version counter), device and out_dtype, and returns them
+    # without running the original forward while the key matches. They stay
+    # alive until a call with another key replaces them. Inference tensors
+    # have no version counter, so in-place edits of coords made in inference
+    # mode are not seen; vLLM-Omni does not edit coords after building them.
+    # The cross-attention ropes get a new slice of coords at every step and
+    # rebuild their tables. synchronize_tensors materializes the cached
+    # tables on the device once.
     # -------------------------------------------------------------------------
     from vllm_omni.diffusion.models.ltx2 import ltx2_transformer
 
@@ -366,6 +378,7 @@ def _patch_ltx2_split_rope() -> None:
         apply_split_rotary_half_swap,
         split_rope_natural_tables,
     )
+    from vllm_torchtpu.utils import synchronize_tensors
 
     rope_cls = ltx2_transformer.LTX2AudioVideoRotaryPosEmbed
     if hasattr(rope_cls, "_tpu_orig_forward"):
@@ -374,16 +387,26 @@ def _patch_ltx2_split_rope() -> None:
     rope_cls._tpu_orig_forward = orig_rope_forward
     orig_apply_split_rotary_emb = ltx2_transformer.apply_split_rotary_emb
 
-    def _natural_rope_forward(
+    def _cached_rope_forward(
         self: Any,
         coords: torch.Tensor,
         device: str | torch.device | None = None,
         out_dtype: torch.dtype | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.rope_type != "split":
+            return orig_rope_forward(self, coords, device, out_dtype)
+        version = None if coords.is_inference() else coords._version
+        key = (version, device, out_dtype)
+        cached = getattr(self, "_tpu_split_rope_cache", None)
+        if cached is not None and cached[0] is coords and cached[1] == key:
+            return cached[2]
         tables = orig_rope_forward(self, coords, device, out_dtype)
-        if self.rope_type != "split" or tables[0].ndim != 4:
+        if tables[0].ndim != 4:
             return tables
-        return split_rope_natural_tables(*tables)
+        tables = split_rope_natural_tables(*tables)
+        synchronize_tensors(list(tables), wait=False)
+        self._tpu_split_rope_cache = (coords, key, tables)
+        return tables
 
     def _apply_split_rotary_emb(
         x: torch.Tensor,
@@ -408,6 +431,6 @@ def _patch_ltx2_split_rope() -> None:
             sin = sin[..., start : start + width]
         return apply_split_rotary_half_swap(x, cos, sin, head_dim)
 
-    rope_cls.forward = _natural_rope_forward
+    rope_cls.forward = _cached_rope_forward
     ltx2_transformer.apply_split_rotary_emb = _apply_split_rotary_emb
-    logger.info("Applied TPU patch: LTX-2 split RoPE on the q/k layout.")
+    logger.info("Applied TPU patch: cached LTX-2 split RoPE on the q/k layout.")
