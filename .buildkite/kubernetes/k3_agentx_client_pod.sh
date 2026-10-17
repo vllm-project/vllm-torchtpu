@@ -180,7 +180,7 @@ ix_export_topology "$CFG_TP" "$CFG_DP" "$EP" 1
 # The probe's size: the step's, else the config's, else agentx_client.sh's.
 GSM8K_LIMIT="${AGENTX_GSM8K_LIMIT:-$CFG_GSM8K_LIMIT}"
 # The replay's length and fast mode: the environment's, else the config's (the
-# Oct 13 recipe points ask for the doc's one-hour run).
+# Oct 13 and Oct 16 recipe points run for one hour).
 DURATION="${AGENTX_DURATION:-$CFG_DURATION}"
 FAST="${AGENTX_FAST:-$CFG_FAST}"
 

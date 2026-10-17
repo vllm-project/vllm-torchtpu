@@ -19,20 +19,24 @@
 # TP32 on its own 2x2x4 slice, the megakernel backend on the TP32 pre-shard,
 # FP8 KV in 512-token blocks, Raiden prefill-to-decode transfer and a host
 # memory KV store, behind vLLM's Rust frontend - on the AgentX 1P1D pair
-# (kimi-k3-agentx-1p1d.yaml). A point is one file beside this one, or in
-# kimi-k3-megakernel-1013/ for the doc's Oct 13 set (its pruned points a-h),
-# that sets the RECIPE_* values below and sources it, and
-# K3_PD_CONFIG=<directory>/<point> serves it.
+# (kimi-k3-agentx-1p1d.yaml). A point is one file beside this one, in
+# kimi-k3-megakernel-1013/ for the doc's Oct 13 set (its pruned points a-h), or
+# in kimi-k3-megakernel-1016/ for its Oct 16 set (points 1-9), that sets the
+# RECIPE_* values below and sources it, and K3_PD_CONFIG=<directory>/<point>
+# serves it.
 #
 #   RECIPE_CONCURRENCY            the AgentX concurrency
-#   RECIPE_DECODE                 dspark | dspark_mixed | dp2_dcp16 | dcp32
+#   RECIPE_DECODE                 dspark | dspark_mixed | dspark_dp2 | dp2_dcp16 | dcp32
 #   RECIPE_DECODE_MAX_NUM_SEQS    decode's --max-num-seqs
-#   RECIPE_DRAFTS                 dspark: drafts
-#   RECIPE_ACCEPTANCE             dspark: synthetic acceptance length
-#   RECIPE_DRAFTS_PER_BATCH_SIZE  dspark_mixed: drafts by decode batch size
+#   RECIPE_DRAFTS                 dspark, dspark_dp2: drafts
+#   RECIPE_ACCEPTANCE             dspark, dspark_dp2: synthetic acceptance length
+#   RECIPE_DRAFTS_PER_BATCH_SIZE  dspark_mixed, dspark_dp2: drafts by decode batch size
+#   RECIPE_PREFILL                long: the prefill of the points without
+#                                 speculation, on a DSpark point (oct16); optional
 #   RECIPE_OFFLOAD_BYTES          host KV store size, all ranks; optional
-#   RECIPE_SET                    oct13 for the doc's Oct 13 set; unset for the first
-#   RECIPE_STORE_SERVERS          1: the Oct 13 decode-host store servers
+#   RECIPE_SET                    oct13 or oct16 for the doc's Oct 13 or Oct 16
+#                                 set; unset for the first
+#   RECIPE_STORE_SERVERS          1: the decode-host store servers (oct13, oct16)
 #   RECIPE_STORE_NODE_BYTES       each store server's DRAM; optional
 #
 # Two readers:
@@ -62,6 +66,12 @@
 # registry on the prefill head and a host-store server on each decode host,
 # which k3_1p1d.sh starts; the prefill's host store joins their pool and the
 # decode drops its own.
+#
+# RECIPE_SET=oct16 is the Oct 13 set's setup with the doc's Oct 16 changes: the
+# MLA draft Inferact/Kimi-K3-DSpark instead of RedHatAI's speculator, draft
+# counts by decode batch size (dspark_mixed), DSpark on attention DP2 x DCP16
+# (dspark_dp2), and RECIPE_PREFILL=long, the prefill of the points without
+# speculation on a DSpark point.
 
 for _v in RECIPE_CONCURRENCY RECIPE_DECODE RECIPE_DECODE_MAX_NUM_SEQS; do
   [ -n "${!_v:-}" ] || { echo "ERROR: kimi-k3-megakernel: the point sets no $_v" >&2; return 2; }
@@ -77,24 +87,50 @@ case "$RECIPE_DECODE" in
       echo "ERROR: kimi-k3-megakernel: dspark_mixed needs RECIPE_DRAFTS_PER_BATCH_SIZE" >&2
       return 2
     fi ;;
+  dspark_dp2)
+    if [ -z "${RECIPE_DRAFTS:-}" ] || [ -z "${RECIPE_ACCEPTANCE:-}" ] || [ -z "${RECIPE_DRAFTS_PER_BATCH_SIZE:-}" ]; then
+      echo "ERROR: kimi-k3-megakernel: dspark_dp2 needs RECIPE_DRAFTS, RECIPE_ACCEPTANCE and RECIPE_DRAFTS_PER_BATCH_SIZE" >&2
+      return 2
+    fi ;;
   dp2_dcp16|dcp32) ;;
-  *) echo "ERROR: kimi-k3-megakernel: RECIPE_DECODE='$RECIPE_DECODE'; expected dspark, dspark_mixed, dp2_dcp16 or dcp32" >&2
+  *) echo "ERROR: kimi-k3-megakernel: RECIPE_DECODE='$RECIPE_DECODE'; expected dspark, dspark_mixed, dspark_dp2, dp2_dcp16 or dcp32" >&2
      return 2 ;;
 esac
-# The decodes without speculation: attention DP2 x DCP16, or plain DCP32 (the
-# doc's pruned point h: the DP2 points' prefill and decode, with the transfer
-# keeping DCP32 and the decode without attention DP).
+# The decodes without speculation: attention DP2 x DCP16, or plain DCP32 (Oct
+# 13 point h, Oct 16 point 9: the DP2 points' prefill and decode, with the
+# transfer keeping DCP32 and the decode without attention DP).
 _no_spec=0
 case "$RECIPE_DECODE" in dp2_dcp16|dcp32) _no_spec=1 ;; esac
+# Attention DP2 x DCP16 decodes, with or without DSpark.
+_dp2=0
+case "$RECIPE_DECODE" in dp2_dcp16|dspark_dp2) _dp2=1 ;; esac
 case "${RECIPE_SET:-}" in
-  ''|oct13) ;;
-  *) echo "ERROR: kimi-k3-megakernel: RECIPE_SET='$RECIPE_SET'; expected oct13 or unset" >&2
+  ''|oct13|oct16) ;;
+  *) echo "ERROR: kimi-k3-megakernel: RECIPE_SET='$RECIPE_SET'; expected oct13, oct16 or unset" >&2
      return 2 ;;
 esac
-if [ -n "${RECIPE_STORE_SERVERS:-}" ] && [ "${RECIPE_SET:-}" != oct13 ]; then
-  echo "ERROR: kimi-k3-megakernel: RECIPE_STORE_SERVERS is the Oct 13 set's (RECIPE_SET=oct13)" >&2
+if [ -n "${RECIPE_STORE_SERVERS:-}" ] && [ -z "${RECIPE_SET:-}" ]; then
+  echo "ERROR: kimi-k3-megakernel: RECIPE_STORE_SERVERS needs RECIPE_SET=oct13 or oct16" >&2
   return 2
 fi
+if [ "$RECIPE_DECODE" = dspark_dp2 ] && [ "${RECIPE_SET:-}" != oct16 ]; then
+  echo "ERROR: kimi-k3-megakernel: dspark_dp2 is the Oct 16 set's (RECIPE_SET=oct16)" >&2
+  return 2
+fi
+# The bigger prefill (2 TiB host store, 22 GiB of KV) of the points without
+# speculation, or of a DSpark point that asks for it.
+_long=$_no_spec
+case "${RECIPE_PREFILL:-}" in
+  '') ;;
+  long)
+    if [ "${RECIPE_SET:-}" != oct16 ]; then
+      echo "ERROR: kimi-k3-megakernel: RECIPE_PREFILL=long is the Oct 16 set's (RECIPE_SET=oct16)" >&2
+      return 2
+    fi
+    _long=1 ;;
+  *) echo "ERROR: kimi-k3-megakernel: RECIPE_PREFILL='$RECIPE_PREFILL'; expected long or unset" >&2
+     return 2 ;;
+esac
 # The eval-only job runs the parsers; the replay does not.
 _eval_job="${AGENTX_EVAL_JOB:-0}"
 case "$_eval_job" in 0|1) ;;
@@ -134,16 +170,16 @@ fi
 # The row's topology, in ix_export_topology's terms: both roles DCP32, except
 # the DP2 points' decode, DCP16 with attention DP2.
 AGENTX_PREFILL_DCP_SIZE=32
-if [ "$RECIPE_DECODE" = dp2_dcp16 ]; then
+if [ "$_dp2" = 1 ]; then
   AGENTX_DECODE_DCP_SIZE=16 AGENTX_DECODE_DP_ATTN=true AGENTX_DECODE_NUM_WORKERS=2
 else
   AGENTX_DECODE_DCP_SIZE=32 AGENTX_DECODE_DP_ATTN=false AGENTX_DECODE_NUM_WORKERS=1
 fi
-# The Oct 13 set's benchmark: one hour of aiperf's agentx scenario at its own
-# defaults, which are the doc's options (seed 42, trajectories from 25-75% in,
-# ten warmup requests per lane, 393 dataset entries, server token counts). The
-# first set keeps the lane's 20-minute fast mode.
-if [ "${RECIPE_SET:-}" = oct13 ]; then
+# The Oct 13 and Oct 16 sets' benchmark: one hour of aiperf's agentx scenario
+# at its own defaults, which are the doc's options (seed 42, trajectories from
+# 25-75% in, ten warmup requests per lane, 393 dataset entries, server token
+# counts). The first set keeps the lane's 20-minute fast mode.
+if [ -n "${RECIPE_SET:-}" ]; then
   AGENTX_DURATION=3600
   AGENTX_FAST=0
 fi
@@ -162,7 +198,7 @@ done
 NODE_RANK="$INDEX"
 NODE_IP="$POD_IP"
 HEAD_IP="$DP_ADDRESS"
-# The prefill head, where the Oct 13 store servers' global registry runs: this
+# The prefill head, where the store servers' global registry runs: this
 # role's head on the prefill, PREFILL_HOST resolved on the decode.
 if [ -n "${RECIPE_STORE_SERVERS:-}" ]; then
   if [ "$_role" = prefill ]; then
@@ -181,14 +217,20 @@ CACHE_ROOT="/cache/jax/k3-mk/$(printf '%s' "${K3_ENGINE_IMAGE:-unknown}" | sha1s
 mkdir -p "$CACHE_ROOT/$_role"/{vllm-runtime,vllm-config,torch_tpu_tier3} "$HF_HOME_DIR" "$LOG_DIR"
 # The checkpoint (gs://tpu-commons-ci/moonshootai/kimi/k3, the doc's revision
 # 9f62e4e9), which the manifest mounts at the path the pre-shard was written
-# from. The pre-shard and the speculator snapshot are in the model bucket
-# (tpu-ci-models-*), which the manifest mounts at these two paths under
+# from. The pre-shard and the draft snapshot are in the model bucket
+# (tpu-ci-models-*), which the manifest mounts at these paths under
 # /cache/hf/hub; PROVENANCE.txt in the pre-shard records how it was made.
 MODEL_DIR=/ckpt/k3
 HF_HUB_CACHE_DIR=/cache/hf/hub
 PRESHARDED_DIR="$HF_HUB_CACHE_DIR/presharded/kimi-k3-tp32"
-DSPARK_REVISION=38a88101e0d46bb22134b9da340f381b954d40d4
-DSPARK_DIR="$HF_HUB_CACHE_DIR/models--RedHatAI--Kimi-K3-speculator.dspark/snapshots/$DSPARK_REVISION"
+if [ "${RECIPE_SET:-}" = oct16 ]; then
+  # The MLA draft; its shards are in the pre-shard's dspark-cf6b8244.
+  DSPARK_REVISION=cf6b8244620e7ea4b0651d214f28e89eac75bed6
+  DSPARK_DIR="$HF_HUB_CACHE_DIR/models--Inferact--Kimi-K3-DSpark/snapshots/$DSPARK_REVISION"
+else
+  DSPARK_REVISION=38a88101e0d46bb22134b9da340f381b954d40d4
+  DSPARK_DIR="$HF_HUB_CACHE_DIR/models--RedHatAI--Kimi-K3-speculator.dspark/snapshots/$DSPARK_REVISION"
+fi
 
 # ---- environment shared by both roles (all points) -----------------------------
 export PYTHONPATH="$PLUGIN_SRC"
@@ -251,7 +293,7 @@ export TORCH_TPU_INTERNAL_TIER3_COMPILATION_CACHE_LOCAL_BACKUP_TASK=0
 export NPROC=2
 export TMPDIR=/dev/shm
 export LIBTPU_INIT_ARGS="--xla_tpu_enable_diagnostic_coordinator=false --tpu_hbm_report_enable=false --enable_runtime_uptime_telemetry=false"
-if [ "${RECIPE_SET:-}" = oct13 ]; then
+if [ -n "${RECIPE_SET:-}" ]; then
   # P-state 7, 2.2 GHz against the default P3's 1.9 GHz; outputs are
   # bit-identical.
   export LIBTPU_INIT_ARGS="$LIBTPU_INIT_ARGS --xla_tpu_dvfs_p_state=7"
@@ -290,9 +332,9 @@ else
   export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE=28440
   export TPU_KV_TRANSFER_PORT=30340
   export TPU_SIDE_CHANNEL_PORT=30740
-  # The Oct 13 points without speculation keep the default deferred Stage-3
-  # submit.
-  if [ "${RECIPE_SET:-}" != oct13 ] || [ "$_no_spec" = 0 ]; then
+  # The Oct 13 and Oct 16 points with the long prefill keep the default
+  # deferred Stage-3 submit.
+  if [ -z "${RECIPE_SET:-}" ] || [ "$_long" = 0 ]; then
     export TPU_RAIDEN_STAGE3_DEFERRED_SUBMIT=0
   fi
 fi
@@ -325,15 +367,15 @@ fi
 # (build 601). The size matters: at 384 GiB the first set's point 4 prefill
 # recomputed 3.2x the trace's minimum prompt tokens with P90 TTFT 19.2 s
 # (build 588), at 768 GiB 2.6x and 7.5 s (589), at 1.5 TiB 6.2 s with 5% more
-# throughput than 768 GiB (597). The doc's points without speculation (e-h)
-# give the prefill 2 TiB (2199023255552, 64 GiB per rank, 512 GiB per host). A
-# point may set RECIPE_OFFLOAD_BYTES.
-if [ "$_no_spec" = 1 ]; then
+# throughput than 768 GiB (597). The doc's long prefill (points without
+# speculation, and RECIPE_PREFILL=long) has 2 TiB (2199023255552, 64 GiB per
+# rank, 512 GiB per host). A point may set RECIPE_OFFLOAD_BYTES.
+if [ "$_long" = 1 ]; then
   _offload_bytes="${RECIPE_OFFLOAD_BYTES:-2199023255552}"
 else
   _offload_bytes="${RECIPE_OFFLOAD_BYTES:-1649267441664}"
 fi
-# The Oct 13 store servers' pool: the prefill's host store registers with the
+# The store servers' pool: the prefill's host store registers with the
 # global registry and joins the pool group the decode-host store servers serve.
 _registry_port=27900
 _pool_group=k3-mk-1p1d-host-store
@@ -349,29 +391,29 @@ _multi_connector() {  # _multi_connector <kv_role> <raiden connector json> <offl
 }
 _raiden='"kv_connector":"TPURaidenConnector","kv_connector_module_path":"vllm_torchtpu.distributed.kv_transfer.tpu_connector"'
 # The first set's prefill sets --prefix-cache-retention-interval 16384; the Oct
-# 13 set leaves vLLM's default, 0.
+# 13 and Oct 16 sets leave vLLM's default, 0.
 _retention=(--prefix-cache-retention-interval 16384)
-[ "${RECIPE_SET:-}" != oct13 ] || _retention=()
+[ -z "${RECIPE_SET:-}" ] || _retention=()
 
 if [ "$_role" = prefill ]; then
-  if [ "$RECIPE_DECODE" = dp2_dcp16 ]; then
-    # The DP2 points: no draft, and the transfer reshards for decode's DCP16.
+  # A DSpark point's prefill loads the draft; an attention DP2 decode has the
+  # transfer reshard for its DCP16.
+  if [ "$_no_spec" = 1 ]; then
     _loader=$(printf '{"presharded":"%s"}' "$PRESHARDED_DIR")
+  else
+    _loader=$(printf '{"presharded":"%s","draft":"%s"}' "$PRESHARDED_DIR" "$DSPARK_DIR")
+  fi
+  if [ "$_dp2" = 1 ]; then
     _kv=$(_multi_connector kv_producer \
       "{${_raiden},\"kv_role\":\"kv_producer\",\"kv_connector_extra_config\":{\"destination_decode_context_parallel_size\":16}}" \
       "$(_offload_connector 27800)")
-    _kv_cache_bytes=23622320128
-  elif [ "$RECIPE_DECODE" = dcp32 ]; then
-    # Point h: the DP2 points' prefill, except that the transfer keeps DCP32.
-    _loader=$(printf '{"presharded":"%s"}' "$PRESHARDED_DIR")
+  else
     _kv=$(_multi_connector kv_producer \
       "{${_raiden},\"kv_role\":\"kv_producer\"}" "$(_offload_connector 27800)")
+  fi
+  if [ "$_long" = 1 ]; then
     _kv_cache_bytes=23622320128
   else
-    # Every DSpark point: the same prefill.
-    _loader=$(printf '{"presharded":"%s","draft":"%s"}' "$PRESHARDED_DIR" "$DSPARK_DIR")
-    _kv=$(_multi_connector kv_producer \
-      "{${_raiden},\"kv_role\":\"kv_producer\"}" "$(_offload_connector 27800)")
     _kv_cache_bytes=19327352832
   fi
   ROLE_ARGS=(
@@ -382,12 +424,12 @@ if [ "$_role" = prefill ]; then
     "${_retention[@]}"
     --kv-transfer-config "$_kv"
   )
-  # The Oct 13 points without speculation: a long prompt takes at most 4,096
+  # The Oct 13 and Oct 16 long prefill: a long prompt takes at most 4,096
   # tokens of the 8,192-token step, so short requests share it. --numa-bind
   # pins ranks 0-3 to NUMA node 0 and 4-7 to node 1, CPUs and memory, so each
   # rank's host store lands on its own node; vLLM launches the workers under
   # numactl, which k3_1p1d.sh checks the engine image for.
-  if [ "${RECIPE_SET:-}" = oct13 ] && [ "$_no_spec" = 1 ]; then
+  if [ -n "${RECIPE_SET:-}" ] && [ "$_long" = 1 ]; then
     ROLE_ARGS+=(--long-prefill-token-threshold 4096)
     ROLE_ARGS+=(--numa-bind --numa-bind-nodes 0 0 0 0 1 1 1 1)
   fi
@@ -401,7 +443,8 @@ elif [ "$RECIPE_DECODE" = dp2_dcp16 ]; then
     --kv-transfer-config "{${_raiden},\"kv_role\":\"kv_consumer\"}"
   )
 elif [ "$RECIPE_DECODE" = dcp32 ]; then
-  # Point h: the DP2 points' decode on DCP32, without attention DP.
+  # Oct 13 point h, Oct 16 point 9: the DP2 points' decode on DCP32, without
+  # attention DP.
   _loader=$(printf '{"presharded":"%s"}' "$PRESHARDED_DIR")
   ROLE_ARGS=(
     --decode-context-parallel-size 32
@@ -416,15 +459,27 @@ else
   if [ "$RECIPE_DECODE" = dspark ]; then
     _acceptance="$RECIPE_ACCEPTANCE"
     _drafts="\"num_speculative_tokens\":$RECIPE_DRAFTS"
+  elif [ "$RECIPE_DECODE" = dspark_dp2 ]; then
+    _acceptance="$RECIPE_ACCEPTANCE"
+    _drafts="\"num_speculative_tokens\":$RECIPE_DRAFTS,\"num_speculative_tokens_per_batch_size\":$RECIPE_DRAFTS_PER_BATCH_SIZE"
   else
     _acceptance=3.78
     _drafts="\"num_speculative_tokens\":7,\"num_speculative_tokens_per_batch_size\":$RECIPE_DRAFTS_PER_BATCH_SIZE"
   fi
+  # The attention DP2 decode's loader names its DP and only its draft width's
+  # acceptance length.
+  if [ "$_dp2" = 1 ]; then
+    _loader_dp=',"attention_dp":2'
+    _lengths=$(printf '{"%s":%s}' "$RECIPE_DRAFTS" "$RECIPE_ACCEPTANCE")
+  else
+    _loader_dp=''
+    _lengths='{"3":2.87,"7":3.78}'
+  fi
   if [ "$_eval_job" = 1 ]; then
-    _loader=$(printf '{"presharded":"%s"}' "$PRESHARDED_DIR")
+    _loader=$(printf '{"presharded":"%s"%s}' "$PRESHARDED_DIR" "$_loader_dp")
     _synthetic=""
   else
-    _loader=$(printf '{"presharded":"%s","synthetic_acceptance_lengths":{"3":2.87,"7":3.78}}' "$PRESHARDED_DIR")
+    _loader=$(printf '{"presharded":"%s"%s,"synthetic_acceptance_lengths":%s}' "$PRESHARDED_DIR" "$_loader_dp" "$_lengths")
     _synthetic=",\"rejection_sample_method\":\"synthetic\",\"synthetic_acceptance_length\":$_acceptance"
   fi
   _spec=$(printf '{"method":"dspark","model":"%s",%s%s}' "$DSPARK_DIR" "$_drafts" "$_synthetic")
@@ -435,18 +490,23 @@ else
     _kv=$(_multi_connector kv_consumer \
       "{${_raiden},\"kv_role\":\"kv_consumer\"}" "$(_offload_connector 28800)")
   fi
+  # 28 GiB of KV after the long prefill, 18 GiB otherwise.
+  _kv_cache_bytes=19327352832
+  [ "$_long" = 0 ] || _kv_cache_bytes=30064771072
+  _dcp=32
+  [ "$_dp2" = 0 ] || _dcp=16
   ROLE_ARGS=(
-    --decode-context-parallel-size 32
+    --decode-context-parallel-size "$_dcp"
     --load-format megakernel --model-loader-extra-config "$_loader"
     --max-num-seqs "$RECIPE_DECODE_MAX_NUM_SEQS" --max-num-batched-tokens 512
-    --kv-cache-memory-bytes 19327352832
+    --kv-cache-memory-bytes "$_kv_cache_bytes"
     --speculative-config "$_spec"
     --kv-transfer-config "$_kv"
   )
 fi
 SERVE_ARGS=("$MODEL_DIR" "${COMMON_ARGS[@]}" "${ROLE_ARGS[@]}")
 
-# The Oct 13 store servers, which k3_1p1d.sh starts: the global registry on the
+# The store servers, which k3_1p1d.sh starts: the global registry on the
 # prefill head before its serve, and a host-store server on each decode host
 # once the decode head serves, as the doc starts them after the engines are up.
 # Each server lends the doc's 512 GiB (549755813888). Before
@@ -478,6 +538,11 @@ if [ "$_no_spec" = 0 ]; then
   K3_1P1D_INPUTS+=("$DSPARK_DIR/config.json" "$PRESHARDED_DIR/dspark-${DSPARK_REVISION:0:8}")
 fi
 K3_1P1D_IMPORTS=(vllm_torchtpu.megakernel)
+# The MLA draft's kernels, which an engine image before the 1016 branch lacks.
+if [ "${RECIPE_SET:-}" = oct16 ] && [ "$_no_spec" = 0 ]; then
+  K3_1P1D_IMPORTS+=(vllm_torchtpu.megakernel.kimi_k3.kernels.dspark_mla)
+fi
 unset _v _role _cache_user _offload_bytes _raiden _loader _kv _kv_cache_bytes _spec
 unset _registry _registry_port _pool_group _retention _no_spec _synthetic _acceptance _drafts _eval_job
+unset _dp2 _long _loader_dp _lengths _dcp
 unset -f _offload_connector _multi_connector
