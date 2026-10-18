@@ -459,7 +459,9 @@ class VllmDeepseekCompressor(DeepseekCompressor):
             wrapped_fn,
             mesh=get_kernel_mesh(mesh),
             donate_argnums=donate_argnums,
-            input_partition_specs=input_partition_specs,
+            input_partition_specs=cast(
+                tuple[tuple[str, ...], ...], input_partition_specs
+            ),
         )
 
         if variant == "indexer":

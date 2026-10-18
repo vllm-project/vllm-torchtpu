@@ -305,7 +305,7 @@ def initialize_csa2_ops() -> None:
             # JAX kernel; otherwise publication can copy the entire KV pool.
             donate_argnums=donated.get(name, ()),
             mesh=get_kernel_mesh(mesh),
-            input_partition_specs=cast(Any, specs),
+            input_partition_specs=cast(tuple[tuple[str, ...], ...], cast(Any, specs)),
         )
         op.register_fake(fake)
         _ops[name] = op

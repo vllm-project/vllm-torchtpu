@@ -1,6 +1,7 @@
 """V4.1 decoder SWA state and native CSA integration."""
 
 import functools
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -169,7 +170,7 @@ def initialize_ced_attention():
         "pallas::deepseek_v41_ced_attention",
         attend,
         mesh=get_kernel_mesh(mesh),
-        input_partition_specs=specs + (None,) * 5,
+        input_partition_specs=cast(tuple[tuple[str, ...], ...], specs + (None,) * 5),
     )
     _attention_op.register_fake(lambda q, *args: torch.empty_like(q))
 

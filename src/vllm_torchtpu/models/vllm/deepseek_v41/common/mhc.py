@@ -4,6 +4,7 @@ Shared by the v1 and v2 DeepSeek V4.1 implementations.
 """
 
 import functools
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -526,18 +527,21 @@ def initialize_delayed_mhc():
         "pallas::deepseek_v41_delayed_mhc_pre",
         delayed_pre_jax,
         mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
-        input_partition_specs=(
-            P(),
-            P(),
-            P(),
-            P(),
-            P(),
-            P(),
-            None,
-            None,
-            None,
-            None,
-            None,
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...],
+            (
+                P(),
+                P(),
+                P(),
+                P(),
+                P(),
+                P(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            ),
         ),
     )
 
@@ -557,7 +561,9 @@ def initialize_delayed_mhc():
         "pallas::deepseek_v41_delayed_mhc_pre_flat",
         delayed_pre_flat_jax,
         mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
-        input_partition_specs=(P(),) * 5 + (None,) * 5,
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...], (P(),) * 5 + (None,) * 5
+        ),
     )
 
     def fake_flat(flat, fn, scale, base, previous_pre, *args):
@@ -576,7 +582,9 @@ def initialize_delayed_mhc():
         "pallas::deepseek_v41_delayed_mhc_post_pre_flat",
         delayed_post_pre_flat_jax,
         mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
-        input_partition_specs=(P(),) * 8 + (None,) * 5,
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...], (P(),) * 8 + (None,) * 5
+        ),
     )
 
     def fake_post_pre_flat(

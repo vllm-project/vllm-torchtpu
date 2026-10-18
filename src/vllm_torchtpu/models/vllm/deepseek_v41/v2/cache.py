@@ -1096,7 +1096,9 @@ def initialize_cache_ops():
         "pallas::dsv41v2_cache_read_values",
         read_cache_values,
         mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
-        input_partition_specs=(P(), P(), None, None, None),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...], (P(), P(), None, None, None)
+        ),
     )
     _read_values_op.register_fake(
         lambda cache, records, elements, fp32=False, halfplane=False: cache.new_empty(
@@ -1124,7 +1126,9 @@ def initialize_cache_ops():
         "pallas::dsv41v2_cache_read_values_2bank",
         read_cache_values_2bank,
         mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
-        input_partition_specs=(P(), P(), P(), None, None, None),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...], (P(), P(), P(), None, None, None)
+        ),
     )
     _read_values_2bank_op.register_fake(
         lambda cache_lo,
@@ -1141,7 +1145,7 @@ def initialize_cache_ops():
         _scatter_rows,
         donate_argnums=(0,),
         mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
-        input_partition_specs=(P(), P(), P()),
+        input_partition_specs=cast(tuple[tuple[str, ...], ...], (P(), P(), P())),
     )
     _write_op.register_fake(lambda cache, slots, values: torch.empty_like(cache))
     mesh = get_vllm_model_wrapper_context().mesh
@@ -1159,7 +1163,7 @@ def initialize_cache_ops():
         write_values,
         donate_argnums=(0,),
         mesh=get_kernel_mesh(mesh),
-        input_partition_specs=(P(), P(), P()),
+        input_partition_specs=cast(tuple[tuple[str, ...], ...], (P(), P(), P())),
     )
     _write_values_op.register_fake(
         lambda cache, records, values: torch.empty_like(cache)
@@ -1178,7 +1182,7 @@ def initialize_cache_ops():
         write_values_after,
         donate_argnums=(0,),
         mesh=get_kernel_mesh(mesh),
-        input_partition_specs=(P(), P(), P(), P()),
+        input_partition_specs=cast(tuple[tuple[str, ...], ...], (P(), P(), P(), P())),
     )
     _write_values_after_op.register_fake(
         lambda cache, records, values, after: torch.empty_like(cache)
@@ -1201,7 +1205,7 @@ def initialize_cache_ops():
         write_index_values,
         donate_argnums=(0,),
         mesh=get_kernel_mesh(mesh),
-        input_partition_specs=(P(), P(), P()),
+        input_partition_specs=cast(tuple[tuple[str, ...], ...], (P(), P(), P())),
     )
     _write_index_values_op.register_fake(
         lambda cache, records, values: torch.empty_like(cache)
@@ -1218,7 +1222,7 @@ def initialize_cache_ops():
         write_index_after,
         donate_argnums=(0,),
         mesh=get_kernel_mesh(mesh),
-        input_partition_specs=(P(), P(), P(), P()),
+        input_partition_specs=cast(tuple[tuple[str, ...], ...], (P(), P(), P(), P())),
     )
     _write_index_values_after_op.register_fake(
         lambda cache, records, values, after: torch.empty_like(cache)
@@ -1227,7 +1231,7 @@ def initialize_cache_ops():
         "pallas::dsv41v2_encode_fp8_kv",
         encode_fp8_kv,
         mesh=get_kernel_mesh(mesh),
-        input_partition_specs=(P(),),
+        input_partition_specs=cast(tuple[tuple[str, ...], ...], (P(),)),
     )
     _encode_fp8_op.register_fake(
         lambda latent: (

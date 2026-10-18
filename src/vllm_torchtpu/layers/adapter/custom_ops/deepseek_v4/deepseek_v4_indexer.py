@@ -184,16 +184,19 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             op_name,
             wrapped_fn,
             mesh=get_kernel_mesh(mesh),
-            input_partition_specs=(
-                P(attn_data_axis, attn_head_axis, None),  # q
-                P(attn_data_axis),  # positions
-                P(),  # cos_sin_cache
-                P(attn_data_axis, attn_head_axis),  # indexer_weights
-                P(),  # cache_kv
-                P(batch_axis),  # seq_lens
-                P(batch_axis),  # page_indices
-                P(),  # cu_q_lens
-                P(),  # distribution
+            input_partition_specs=cast(
+                tuple[tuple[str, ...], ...],
+                (
+                    P(attn_data_axis, attn_head_axis, None),  # q
+                    P(attn_data_axis),  # positions
+                    P(),  # cos_sin_cache
+                    P(attn_data_axis, attn_head_axis),  # indexer_weights
+                    P(),  # cache_kv
+                    P(batch_axis),  # seq_lens
+                    P(batch_axis),  # page_indices
+                    P(),  # cu_q_lens
+                    P(),  # distribution
+                ),
             ),
         )
 

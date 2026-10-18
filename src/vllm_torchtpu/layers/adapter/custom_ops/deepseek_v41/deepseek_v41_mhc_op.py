@@ -2,7 +2,7 @@
 
 """TorchTPU binding for shifted mHC with fused input RMS."""
 
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -93,7 +93,9 @@ def initialize_shifted_mhc() -> None:
         "pallas::deepseek_v41_v2_shifted_post_pre_rms",
         _post_pre_rms_jax,
         mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
-        input_partition_specs=(P(),) * 9 + (None,) * 6,
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...], (P(),) * 9 + (None,) * 6
+        ),
     )
 
     def fake(x, flat, post, comb, weight, scale, base, pre, *args):

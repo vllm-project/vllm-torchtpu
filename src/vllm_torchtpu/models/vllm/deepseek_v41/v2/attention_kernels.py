@@ -1293,7 +1293,9 @@ def initialize_paged_attention():
         "pallas::dsv41v2_paged_bf16_attention",
         paged_attention_jax,
         mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
-        input_partition_specs=cast(Any, (P(),) * 6 + (None, P())),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 6 + (None, P()))
+        ),
     )
     _attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
@@ -1324,7 +1326,9 @@ def initialize_paged_attention():
         "pallas::dsv41v2_paged_bf16_attention_2bank",
         paged_attention_2bank,
         mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
-        input_partition_specs=cast(Any, (P(),) * 8 + (None, P())),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 8 + (None, P()))
+        ),
     )
     _attention_2bank_op.register_fake(lambda q, *args: q.new_empty(q.shape))
     mesh = get_vllm_model_wrapper_context().mesh
@@ -1343,7 +1347,9 @@ def initialize_paged_attention():
         "pallas::dsv41v2_gather_bf16_kv",
         gather_bf16_kv_jax,
         mesh=get_kernel_mesh(mesh),
-        input_partition_specs=cast(Any, (P(),) * 3 + (None,)),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 3 + (None,))
+        ),
     )
     _gather_bf16_op.register_fake(
         lambda pool, pool_hi, records, dim: pool.new_empty(
@@ -1386,7 +1392,9 @@ def initialize_paged_attention():
         "pallas::dsv41v2_gather_fp8_kv",
         gather_fp8_bridge,
         mesh=get_kernel_mesh(tp_mesh),
-        input_partition_specs=cast(Any, (P(),) * 8 + (None,) * 3),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 8 + (None,) * 3)
+        ),
     )
 
     def fake_gather_fp8(
@@ -1569,7 +1577,10 @@ def initialize_paged_attention():
         "pallas::dsv41v2_sparse_fp8_attention",
         fp8_attention,
         mesh=get_kernel_mesh(tp_mesh),
-        input_partition_specs=cast(Any, (P(),) * 11 + (None,) * 7 + (P(),) * 2),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...],
+            cast(Any, (P(),) * 11 + (None,) * 7 + (P(),) * 2),
+        ),
     )
     _fp8_attention_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
@@ -1625,7 +1636,10 @@ def initialize_paged_attention():
         "pallas::dsv41v2_sparse_fp8_attention_2bank",
         fp8_attention_2bank,
         mesh=get_kernel_mesh(tp_mesh),
-        input_partition_specs=cast(Any, (P(),) * 14 + (None,) * 7 + (P(),) * 2),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...],
+            cast(Any, (P(),) * 14 + (None,) * 7 + (P(),) * 2),
+        ),
     )
     _fp8_attention_2bank_op.register_fake(lambda q, *args: q.new_empty(q.shape))
 
@@ -1847,7 +1861,10 @@ def initialize_paged_attention():
         "pallas::dsv41v2_sparse_fp8_attention_qo",
         fp8_attention_qo,
         mesh=get_kernel_mesh(tp_mesh),
-        input_partition_specs=cast(Any, (P(),) * 23 + (None,) * 5 + (P(),) * 2),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...],
+            cast(Any, (P(),) * 23 + (None,) * 5 + (P(),) * 2),
+        ),
     )
     # [T, o_lora_rank]: positions is args[5], wo_a is args[17].
     _fp8_attention_qo_op.register_fake(
@@ -1926,7 +1943,10 @@ def initialize_paged_attention():
         "pallas::dsv41v2_sparse_fp8_attention_qo_2bank",
         fp8_attention_qo_2bank,
         mesh=get_kernel_mesh(tp_mesh),
-        input_partition_specs=cast(Any, (P(),) * 26 + (None,) * 5 + (P(),) * 2),
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...],
+            cast(Any, (P(),) * 26 + (None,) * 5 + (P(),) * 2),
+        ),
     )
     # [T, o_lora_rank]: positions is args[5], wo_a is args[20].
     _fp8_attention_qo_2bank_op.register_fake(
@@ -3430,7 +3450,9 @@ def initialize_indexer():
         update_and_select_jax,
         donate_argnums=(1,),
         mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
-        input_partition_specs=(P(),) * 10 + (None,) * 8,
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...], (P(),) * 10 + (None,) * 8
+        ),
     )
 
     def fake(
@@ -3467,7 +3489,9 @@ def initialize_indexer():
         update_and_select_2bank_jax,
         donate_argnums=(1, 2),
         mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
-        input_partition_specs=(P(),) * 11 + (None,) * 8,
+        input_partition_specs=cast(
+            tuple[tuple[str, ...], ...], (P(),) * 11 + (None,) * 8
+        ),
     )
 
     def fake_2bank(

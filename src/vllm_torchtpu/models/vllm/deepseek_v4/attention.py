@@ -330,7 +330,9 @@ class DeepseekTPUAttentionMixin:
             wrapped_fn,
             mesh=get_kernel_mesh(mesh),
             donate_argnums=(2,),
-            input_partition_specs=input_partition_specs,
+            input_partition_specs=cast(
+                tuple[tuple[str, ...], ...], input_partition_specs
+            ),
         )
 
         def _fake_attn(q, new_kv, sw_cache, *args, **kwargs):
@@ -361,10 +363,13 @@ class DeepseekTPUAttentionMixin:
                 op_name,
                 _rope_jax,
                 mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
-                input_partition_specs=(
-                    P(),  # kv
-                    P(),  # positions
-                    P(),  # cos_sin_cache
+                input_partition_specs=cast(
+                    tuple[tuple[str, ...], ...],
+                    (
+                        P(),  # kv
+                        P(),  # positions
+                        P(),  # cos_sin_cache
+                    ),
                 ),
             )
             op.register_fake(_fake_rope)
@@ -554,12 +559,15 @@ class DeepseekTPUAttentionMixin:
                 op_name,
                 functools.partial(_o_proj_jax, head_dim=head_dim),
                 mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
-                input_partition_specs=(
-                    P(None, "model", None),  # o
-                    P(),  # positions
-                    P(),  # cos_sin_cache
-                    P(),  # wo_a
-                    P(),  # wo_a_scale
+                input_partition_specs=cast(
+                    tuple[tuple[str, ...], ...],
+                    (
+                        P(None, "model", None),  # o
+                        P(),  # positions
+                        P(),  # cos_sin_cache
+                        P(),  # wo_a
+                        P(),  # wo_a_scale
+                    ),
                 ),
             )
             op.register_fake(_fake_o_proj)
@@ -819,10 +827,13 @@ class VllmDeepseekV4MLAAttention(
                 op_name,
                 functools.partial(_qnorm_rope_jax, eps=eps),
                 mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
-                input_partition_specs=(
-                    P(None, "model", None),  # q
-                    P(),  # positions
-                    P(),  # cos_sin_cache
+                input_partition_specs=cast(
+                    tuple[tuple[str, ...], ...],
+                    (
+                        P(None, "model", None),  # q
+                        P(),  # positions
+                        P(),  # cos_sin_cache
+                    ),
                 ),
             )
             op.register_fake(_fake_rope)
