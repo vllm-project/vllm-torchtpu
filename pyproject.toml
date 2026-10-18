@@ -39,14 +39,14 @@ dependencies = [
     # torch==2.13.0 above; a mismatched pair fails at operator-registration time,
     # not at install time.
     "torchvision==0.28.0",
-    "torch-tpu==0.1.1.dev20260924085621",
+    "torch-tpu==0.2.0rc1",
     # High-bandwidth PJRT raw-transfer / KV-cache DMA engine backing the
     # raiden KV connector (disaggregated serving) and host KV offload; the
     # import name is `tpu_sync`. The wheel bundles one extension per
     # supported torch ABI and dispatches to the variant matching the
     # installed torch at import time. Published to PyPI as nightly .dev
     # pre-releases, so it needs no registry source below.
-    "tpu-sync-torch==0.0.1.dev20260923040928",
+    "tpu-sync-torch==0.0.1.dev20261012084241",
     # Imported directly by src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py, so
     # declared here rather than leaned on as a vLLM transitive.
     #
@@ -243,9 +243,10 @@ keyring-provider = "subprocess"
 
 [[tool.uv.index]]
 name = "torch-tpu-registry"
-# torch-tpu-virtual-registry is a virtual registry that combines the PyTorch CPU index, Torch TPU index,
-# and the PyPI index. It priortizes package installs as such: PyTorch CPU index > Torch TPU index > PyPI index.
-url = "https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
+# torch-tpu-release-virtual-registry combines the PyTorch CPU, Torch TPU,
+# and PyPI indexes.
+# Priority: PyTorch CPU index > Torch TPU index > PyPI index.
+url = "https://us-python.pkg.dev/ml-oss-artifacts-published/torch-tpu-release-virtual-registry/simple/"
 explicit = true
 
 [tool.uv.sources]
