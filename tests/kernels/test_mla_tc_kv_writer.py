@@ -110,18 +110,25 @@ _CELLS = {
 _CONTROL_CELLS = ("decode_t16", "straddle_chunk_t32")
 
 
-def _specs(layout=KVCacheLayout.SPARSECORE):
+def _specs(layout=KVCacheLayout.SPARSECORE, packed_rope=False):
+    """`packed_rope`: TPU_SPARSE_MLA_PACKED_ROPE's 64-byte rope tokens."""
     return (
         SparseMLAKVCacheSpec.create(
             KVCacheType.NOPE, layout, NUM_PAGES, PAGE_SIZE, LKV_DIM, KV_PACKING
         ),
         SparseMLAKVCacheSpec.create(
-            KVCacheType.ROPE, layout, NUM_PAGES, PAGE_SIZE, ROPE_DIM, KV_PACKING
+            KVCacheType.ROPE,
+            layout,
+            NUM_PAGES,
+            PAGE_SIZE,
+            ROPE_DIM,
+            KV_PACKING,
+            packed_rope=packed_rope,
         ),
     )
 
 
-def _inputs(seqs, num_tokens, seed=0, wrap_ordinals=True):
+def _inputs(seqs, num_tokens, seed=0, wrap_ordinals=True, packed_rope=False):
     """Addressing, rows and random-word caches for one cell."""
     rng = np.random.default_rng(seed)
     q_lens = np.asarray([n for _, n in seqs], np.int32)
@@ -142,7 +149,7 @@ def _inputs(seqs, num_tokens, seed=0, wrap_ordinals=True):
     # is byte transport, and a float8 concatenate on TPU canonicalizes NaN.
     kv_c_u8 = rng.integers(0, 256, (num_tokens, LKV_DIM), np.uint8)
     k_pe_u8 = rng.integers(0, 256, (num_tokens, ROPE_DIM), np.uint8)
-    nope_spec, rope_spec = _specs()
+    nope_spec, rope_spec = _specs(packed_rope=packed_rope)
     caches = tuple(
         jnp.asarray(rng.integers(0, 2**32, s.shape, np.uint32), s.jax_dtype)
         for s in (nope_spec, rope_spec)
@@ -157,6 +164,7 @@ def _inputs(seqs, num_tokens, seed=0, wrap_ordinals=True):
         block_tables=jnp.asarray(block_tables),
         query_start_loc=jnp.asarray(query_start_loc),
         num_valid=num_valid,
+        packed_rope=packed_rope,
     )
 
 
@@ -172,7 +180,7 @@ def _args(inp):
 
 
 def _golden(inp, rank):
-    nope_spec, rope_spec = _specs()
+    nope_spec, rope_spec = _specs(packed_rope=inp["packed_rope"])
     return kv_cache_utils.update_sparse_mla_kv_cache_dcp_jax(
         *_args(inp),
         jnp.int32(rank),
@@ -206,7 +214,7 @@ _tc_scatter_caches = jax.jit(
 
 
 def _tc_write(inp, dst_rows, interpret, fault=None):
-    nope_spec, rope_spec = _specs()
+    nope_spec, rope_spec = _specs(packed_rope=inp["packed_rope"])
     return _tc_scatter_caches(
         *inp["caches"],
         inp["kv_c_normed"],
@@ -251,6 +259,24 @@ class TcKvWriterTest(parameterized.TestCase):
                 )
         # Ownership is a partition: every real token on exactly one rank.
         self.assertEqual(owned, inp["num_valid"])
+
+    @parameterized.named_parameters(*((name, name) for name in _CELLS))
+    def test_packed_rope_matches_the_golden_on_every_rank(self, cell):
+        """TPU_SPARSE_MLA_PACKED_ROPE: eight 16-word rope tokens share a row,
+        so the read-modify-write merges eight lane groups instead of four."""
+        seqs, num_tokens = _CELLS[cell]
+        inp = _inputs(seqs, num_tokens, packed_rope=True)
+        self.assertEqual(inp["caches"][1].shape, (NUM_PAGES, PAGE_SIZE // 8, 128))
+        for rank in range(DCP_SIZE):
+            dst_rows = _dst_rows(inp, rank)
+            got = _tc_write(inp, dst_rows, self.interpret)
+            want = _golden(inp, rank)
+            for name, g, w in zip(("nope", "rope"), got, want):
+                np.testing.assert_array_equal(
+                    np.asarray(g),
+                    np.asarray(w),
+                    err_msg=f"{cell} rank {rank}: packed {name} cache differs",
+                )
 
     @parameterized.named_parameters(
         dict(testcase_name=f"{fault}_{cell}", fault=fault, cell=cell)
@@ -372,6 +398,8 @@ class TcKvWriterContractTest(parameterized.TestCase):
             tc_scatter.supports(nope_spec, rope_spec, tc_scatter.MAX_TOKENS)
         )
         self.assertFalse(tc_scatter.supports(nope_spec, rope_spec, 0))
+        _, packed_rope_spec = _specs(packed_rope=True)
+        self.assertTrue(tc_scatter.supports(nope_spec, packed_rope_spec, 16))
         self.assertFalse(
             tc_scatter.supports(nope_spec, rope_spec, tc_scatter.MAX_TOKENS + 1)
         )

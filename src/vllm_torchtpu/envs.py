@@ -156,6 +156,7 @@ if TYPE_CHECKING:
     TPU_MLA_DECODE_PROLOGUE: bool = False
     TPU_MLA_KV_WRITE_IN_GATHER: bool = False
     TPU_INDEXER_QB_OVERLAP: bool = False
+    TPU_SPARSE_MLA_PACKED_ROPE: bool = False
     TPU_KV_TRANSFER_PORT: str = "9100"
     TPU_SIDE_CHANNEL_PORT: str = "9600"
     TPU_NODE_ID: int = 0
@@ -657,6 +658,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # would otherwise idle on the top-k's call-done. Same kernel, same inputs:
     # bit-identical q. Needs the fp8 Pallas q_b site (TPU_FP8_LINEAR_PALLAS).
     "TPU_INDEXER_QB_OVERLAP": env_bool("TPU_INDEXER_QB_OVERLAP", default=False),
+    # Store each token's 64-byte fp8 RoPE key in 64 bytes instead of a padded
+    # 128-byte row (eight tokens per 128-word row), cutting the sparse MLA
+    # latent cache from 640 to 576 B/token. SparseCore layouts only; the
+    # gather expands the rows back to the padded format the attention kernel
+    # reads. Changes the cache layout: a disagg pair must agree on it.
+    "TPU_SPARSE_MLA_PACKED_ROPE": env_bool("TPU_SPARSE_MLA_PACKED_ROPE", default=False),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS": lambda: os.getenv("JAX_PLATFORMS", "").lower(),
     # TPU accelerator type (e.g., "v5litepod-16", "v4-8")

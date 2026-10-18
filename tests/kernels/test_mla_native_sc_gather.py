@@ -69,6 +69,57 @@ class NativeScGatherTest(absltest.TestCase):
                 )
                 np.testing.assert_array_equal(np.asarray(gathered_rope), expected_rope)
 
+    def test_packed_rope_gather_matches_the_padded_cache(self):
+        """``packed_rope``: a 64-byte-per-token ROPE cache gathers to the same
+        rows as the padded one, rope tail zeroed, with and without a live
+        bound."""
+        if jax.devices()[0].platform != "tpu":
+            self.skipTest("native-SC gather requires a TPU SparseCore")
+
+        pages, page_size = 64, 1024
+        cache_tokens = pages * page_size
+        query_tokens, topk = 16, 2048
+        count = query_tokens * topk
+        rng = np.random.default_rng(20261018)
+        nope_u8 = rng.integers(0, 256, (pages, page_size, 4, 128), np.uint8)
+        rope_u8 = rng.integers(0, 256, (pages, page_size // 4, 4, 128), np.uint8)
+        rope_u8[..., 64:] = 0
+        nope_i32 = jnp.asarray(native_sc_cache_layout.pack_nope(nope_u8))
+        flat_rope_u8 = rope_u8.reshape(-1, 128)
+        packed_rope_i32 = jnp.asarray(
+            native_sc_cache_layout.pack_rope_packed(
+                flat_rope_u8[:, :64].reshape(pages, page_size, 64)
+            )
+        )
+        self.assertEqual(packed_rope_i32.shape, (pages, page_size // 8, 128))
+        flat_indices = rng.integers(0, cache_tokens, count, dtype=np.int32)
+        expected_rope = native_sc_cache_layout.pack_selected_rope_for_tc(
+            flat_rope_u8[flat_indices]
+        )
+
+        for atoms, live_kwargs in (
+            (16, {}),
+            (1, dict(num_live_indices=jnp.int32(5 * topk), live_multiple=topk)),
+        ):
+            with self.subTest(atoms=atoms, live=bool(live_kwargs)):
+                _, gathered_rope = jax.block_until_ready(
+                    native_sc_gather.dsa_gather_native_sc(
+                        nope_i32,
+                        packed_rope_i32,
+                        jnp.asarray(flat_indices.reshape(query_tokens, topk)),
+                        out_size=count,
+                        atoms_per_batch=atoms,
+                        packed_rope=True,
+                        **live_kwargs,
+                    )
+                )
+                groups = (
+                    count if not live_kwargs else 5 * topk
+                ) // native_sc_gather.ROPE_PACKING
+                np.testing.assert_array_equal(
+                    np.asarray(gathered_rope)[:groups], expected_rope[:groups]
+                )
+
     def test_live_bounded_gather_is_byte_exact_on_live_rows(self):
         """The decode bucket (16 tokens x topk 2048) with a traced live count.
 

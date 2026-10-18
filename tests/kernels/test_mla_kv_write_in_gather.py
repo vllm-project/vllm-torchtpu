@@ -79,14 +79,14 @@ def _packed(inp):
     """As the wiring hands them over: 128-lane rows (rope zero-padded)."""
     from vllm_torchtpu.layers.core import attention_interface
 
-    nope_spec, rope_spec = tcw._specs()
+    nope_spec, rope_spec = tcw._specs(packed_rope=inp["packed_rope"])
     return (
         attention_interface._pack_lane_dense(inp["kv_c_normed"], nope_spec.token_bytes),
         attention_interface._pack_lane_dense(inp["k_pe"], rope_spec.token_bytes),
     )
 
 
-def _gather(caches, indices, num_live, kv_write=None, fault=None):
+def _gather(caches, indices, num_live, kv_write=None, fault=None, packed_rope=False):
     return jax.block_until_ready(
         native_sc_gather.dsa_gather_native_sc(
             caches[0],
@@ -98,6 +98,7 @@ def _gather(caches, indices, num_live, kv_write=None, fault=None):
             live_multiple=2048,
             kv_write=kv_write,
             write_fault=fault,
+            packed_rope=packed_rope,
         )
     )
 
@@ -108,8 +109,14 @@ def _run_rank(inp, rank, num_live, fault=None):
     want_caches = tcw._golden(inp, rank)
     num_rows = want_caches[0].shape[0] * want_caches[0].shape[1]
     idx = _indices(dst, num_rows, seed=rank)
-    want = (*_gather(want_caches, idx, num_live), *want_caches)
-    got = _gather(inp["caches"], idx, num_live, (dst, *_packed(inp)), fault)
+    packed_rope = inp["packed_rope"]
+    want = (
+        *_gather(want_caches, idx, num_live, packed_rope=packed_rope),
+        *want_caches,
+    )
+    got = _gather(
+        inp["caches"], idx, num_live, (dst, *_packed(inp)), fault, packed_rope
+    )
     return got, want, dst
 
 
@@ -138,6 +145,35 @@ def test_gather_write_matches_writer_then_gather(cell, num_live):
         ok = _compare(got, want, num_live)
         assert all(ok), f"{cell} rank {rank} live {num_live}: nope/rope/caches {ok}"
     assert owned == inp["num_valid"]
+
+
+@pytest.mark.parametrize("num_live", [OUT_SIZE, 0])
+@pytest.mark.parametrize("cell", _WRITE_CELLS)
+def test_packed_rope_gather_write_matches_writer_then_gather(cell, num_live):
+    """TPU_SPARSE_MLA_PACKED_ROPE: the write phase DMAs 16-word rope tokens
+    (eight to a cache row) and the gather reads them back padded."""
+    _require_tpu()
+    seqs, num_tokens = tcw._CELLS[cell]
+    inp = tcw._inputs(seqs, num_tokens, packed_rope=True)
+    for rank in range(tcw.DCP_SIZE):
+        got, want, _ = _run_rank(inp, rank, num_live)
+        ok = _compare(got, want, num_live)
+        assert all(ok), f"{cell} rank {rank} live {num_live}: nope/rope/caches {ok}"
+
+
+@pytest.mark.parametrize("fault", ["wrong_row", "skip_write"])
+def test_packed_rope_gather_write_positive_control_fails(fault):
+    _require_tpu()
+    seqs, num_tokens = tcw._CELLS["straddle_chunk_t32"]
+    inp = tcw._inputs(seqs, num_tokens, packed_rope=True)
+    owning = caught = 0
+    for rank in range(tcw.DCP_SIZE):
+        got, want, dst = _run_rank(inp, rank, OUT_SIZE, fault)
+        if bool(jnp.any(dst >= 0)):
+            owning += 1
+            caught += not all(_compare(got, want, OUT_SIZE))
+    assert owning > 1
+    assert caught == owning, f"{fault} missed on {owning - caught} ranks"
 
 
 @pytest.mark.parametrize(
@@ -182,7 +218,7 @@ def test_gather_write_positive_control_fails(cell, fault):
 # --- DCP: sparse_mla_attention_dcp, caches + partials on every rank --------
 
 
-def _dcp(dcp, flag, kv_write_fault=None):
+def _dcp(dcp, flag, kv_write_fault=None, packed_rope=False):
     env = dict(prologue.PROD_ENV, TPU_MLA_DECODE_PROLOGUE="1")
     if flag:
         env[FLAG] = "1"
@@ -203,7 +239,7 @@ def _dcp(dcp, flag, kv_write_fault=None):
         if not flag:
             os.environ.pop(FLAG, None)
         extra = {} if kv_write_fault is None else {"kv_write_fault": kv_write_fault}
-        res = prologue._dcp_run(dcp, candidate=True, **extra)
+        res = prologue._dcp_run(dcp, candidate=True, packed_rope=packed_rope, **extra)
         writes_in_gather = sum(
             c.kwargs.get("kv_write") is not None for c in gather_spy.call_args_list
         )
@@ -230,6 +266,42 @@ def test_dcp_caches_partials_and_lse_bit_identical():
             np.testing.assert_array_equal(b[k], a[k], err_msg=f"step {i} {k}")
         lse = a["lse"].view(np.float32).reshape(dcp, -1, prologue.HEADS)
         assert np.isfinite(lse).any(axis=0)[: a["real"]].all(), f"step {i}"
+
+
+def _rope_tokens(words, token_words):
+    """A SparseCore rope cache -> u8[tokens, 64], each token's real bytes.
+
+    Word `w` byte `b` of a token holds its byte `b * token_words + w`
+    (`pack_tokens`); a padded token's bytes past 64 are dropped.
+    """
+    u8 = np.asarray(words).reshape(-1, token_words).view(np.uint8)
+    tokens = (
+        u8.reshape(-1, token_words, 4).transpose(0, 2, 1).reshape(-1, 4 * token_words)
+    )
+    return tokens[:, :64]
+
+
+@pytest.mark.parametrize("flag", [False, True])
+def test_dcp_packed_rope_matches_padded(flag):
+    """TPU_SPARSE_MLA_PACKED_ROPE through `sparse_mla_attention_dcp` (the cache
+    writer, or the write in the gather with the flag): same partials, lse and
+    nope caches as the padded rope cache, the same rope bytes per token."""
+    _require_tpu()
+    dcp = _dcp_size()
+    if dcp < 2:
+        pytest.skip("DCP needs at least 2 devices")
+    ref, _, ref_kvw = _dcp(dcp, flag=flag)
+    got, _, got_kvw = _dcp(dcp, flag=flag, packed_rope=True)
+    assert got_kvw == ref_kvw == (2 if flag else 0)
+    for i, (a, b) in enumerate(zip(ref, got)):
+        for k in ("nope", "out", "lse"):
+            np.testing.assert_array_equal(b[k], a[k], err_msg=f"step {i} {k}")
+        assert b["rope"].size * 2 == a["rope"].size
+        np.testing.assert_array_equal(
+            _rope_tokens(b["rope"], native_sc_gather.PACKED_ROPE_WORDS),
+            _rope_tokens(a["rope"], native_sc_gather.ROPE_WORDS),
+            err_msg=f"step {i} rope",
+        )
 
 
 @pytest.mark.parametrize(
@@ -318,4 +390,56 @@ def test_live_rows_with_two_round_write_is_rejected():
             linear_indices=True,
             row_live_atoms=jnp.zeros((4 * tokens,), jnp.int32),
             kv_write=write,
+        )
+
+
+def test_lane_dense_pack_is_pack_tokens_packed_rope():
+    """Packed rope: the 128-lane rope row carries the 16-word token."""
+    from vllm_torchtpu.layers.core import attention_interface
+
+    seqs, num_tokens = tcw._CELLS["decode_t16"]
+    inp = tcw._inputs(seqs, num_tokens, packed_rope=True)
+    _, rope_spec = tcw._specs(packed_rope=True)
+    assert rope_spec.token_bytes == 64
+    want = np.asarray(kv_cache_utils.pack_tokens(inp["k_pe"], rope_spec.token_bytes))
+    got = np.asarray(
+        attention_interface._pack_lane_dense(inp["k_pe"], rope_spec.token_bytes)
+    )
+    assert want.shape == (num_tokens, native_sc_gather.PACKED_ROPE_WORDS)
+    np.testing.assert_array_equal(got[:, : want.shape[1]], want)
+    assert not got[:, want.shape[1] :].any()
+
+
+@pytest.mark.parametrize("width", [16, 32, 128])
+def test_pack_write_rows_takes_every_rope_width(width):
+    """16-word (packed) and 32-word rope tokens, or their 128-lane rows, all
+    land in words [0, width) of the rope block, zeros after."""
+    t = 5
+    rng = np.random.default_rng(width)
+    rope = rng.integers(0, 2**32, (t, width), np.uint32)
+    rows = native_sc_gather.pack_write_rows(
+        jnp.arange(t, dtype=jnp.int32),
+        jnp.zeros((t, 128), jnp.uint32),
+        jnp.asarray(rope),
+    )
+    tp = native_sc_gather.NUM_SUBCORES
+    block = np.asarray(rows)[native_sc_gather.WRITE_ROPE_PART * tp :][:t]
+    np.testing.assert_array_equal(block[:, :width], rope)
+    assert not block[:, width:].any()
+    with pytest.raises(ValueError, match="rope_rows"):
+        native_sc_gather.pack_write_rows(
+            jnp.arange(t, dtype=jnp.int32),
+            jnp.zeros((t, 128), jnp.uint32),
+            jnp.zeros((t, 64), jnp.uint32),
+        )
+
+
+@pytest.mark.parametrize("packed_rope", [False, True])
+def test_kv_write_in_gather_supports_packed_rope(packed_rope):
+    from vllm_torchtpu.layers.core import attention_interface
+
+    nope_spec, rope_spec = tcw._specs(packed_rope=packed_rope)
+    with mock.patch.dict(os.environ, {"TPU_DCP_MLA_TOPK_CAP": "512"}):
+        assert attention_interface.kv_write_in_gather_supported(
+            nope_spec, rope_spec, 16, 2048
         )

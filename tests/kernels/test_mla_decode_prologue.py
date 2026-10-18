@@ -310,7 +310,11 @@ def _causal_rows(positions, topk, rng):
     return rows
 
 
-def _dcp_run(dcp, *, candidate, fault=None, big_mixed=False, **dcp_kwargs):
+def _dcp_run(
+    dcp, *, candidate, fault=None, big_mixed=False, packed_rope=False, **dcp_kwargs
+):
+    """`packed_rope`: TPU_SPARSE_MLA_PACKED_ROPE's rope cache, initialised to
+    the same token bytes as the padded run's (whose pad bytes it drops)."""
     from jax.sharding import NamedSharding
     from jax.sharding import PartitionSpec as P
 
@@ -325,12 +329,26 @@ def _dcp_run(dcp, *, candidate, fault=None, big_mixed=False, **dcp_kwargs):
     axis = streamindex_topk.DCP_AXIS_NAME
     mesh = jax.sharding.Mesh(np.array(jax.devices()[:dcp]), (axis,))
     packing = sparse_mla.get_dtype_packing(jnp.float8_e4m3fn)
-    specs = tuple(
+    padded_specs = tuple(
         SparseMLAKVCacheSpec.create(
             t, KVCacheLayout.SPARSECORE, PAGES_PER_RANK, PAGE_SIZE, d, packing
         )
         for t, d in ((KVCacheType.NOPE, NOPE_DIM), (KVCacheType.ROPE, ROPE_DIM))
     )
+    specs = padded_specs
+    if packed_rope:
+        specs = (
+            padded_specs[0],
+            SparseMLAKVCacheSpec.create(
+                KVCacheType.ROPE,
+                KVCacheLayout.SPARSECORE,
+                PAGES_PER_RANK,
+                PAGE_SIZE,
+                ROPE_DIM,
+                packing,
+                packed_rope=True,
+            ),
+        )
     rng = np.random.default_rng(31)
     cache = _cos_sin_cache()
     prior = [int(x) for x in rng.integers(300, 2400, size=4)]
@@ -397,12 +415,16 @@ def _dcp_run(dcp, *, candidate, fault=None, big_mixed=False, **dcp_kwargs):
         b |= rng.integers(0, 2, size=b.shape, dtype=np.uint8) << 7
         return b.view(np.uint32)[..., 0]
 
-    caches = tuple(
-        jax.device_put(
-            jnp.asarray(finite_words((dcp * s.shape[0], *s.shape[1:]))), shard
-        )
-        for s in specs
-    )
+    host_caches = [finite_words((dcp * s.shape[0], *s.shape[1:])) for s in padded_specs]
+    if packed_rope:
+        # Padded token word w byte b = token byte 32 b + w; packed: 16 b + w.
+        rope_u8 = host_caches[1].reshape(-1, 32).view(np.uint8).reshape(-1, 32, 4)
+        token_u8 = rope_u8.transpose(0, 2, 1).reshape(-1, 128)[:, :64]
+        packed = np.ascontiguousarray(
+            token_u8.reshape(-1, 4, 16).transpose(0, 2, 1)
+        ).view(np.uint32)
+        host_caches[1] = packed.reshape(dcp * specs[1].shape[0], *specs[1].shape[1:])
+    caches = tuple(jax.device_put(jnp.asarray(c), shard) for c in host_caches)
     results = []
     # A mixed step (2 decode requests + a 248-token prefill chunk of seq 2),
     # then decode steps in the 16 and 32 buckets on top of it.
