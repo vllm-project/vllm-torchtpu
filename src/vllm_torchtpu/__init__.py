@@ -649,10 +649,13 @@ def _patch_vllm_compile_all_ranges() -> None:
 def _patch_sequence_parallel_moe_admission() -> None:
     """Gate vLLM's sequence-parallel MoE on TPU.
 
-    Off by default. With TPU_MOE_SEQUENCE_PARALLEL=1, admit it at DP1
-    when EP is on and TP > 1. The GPU all2all-backend and DP > 1 conjuncts do
-    not apply on TPU. EP is required: without it the row-parallel expert sum
-    is never reduced.
+    Off by default. With TPU_MOE_SEQUENCE_PARALLEL=1, admit it when EP is on
+    and TP > 1, at any data-parallel size: the EP group spans the dp x tp
+    ranks, so a sequence-parallel step's dispatch and combine over it see
+    every replica's rows once, and the fused EP kernel's all-to-all covers
+    the same mesh. The GPU all2all-backend and DP > 1 conjuncts do not apply
+    on TPU. EP is required: without it the row-parallel expert sum is never
+    reduced.
     """
     from vllm.config.parallel import ParallelConfig
 
@@ -663,7 +666,6 @@ def _patch_sequence_parallel_moe_admission() -> None:
         ParallelConfig.use_sequence_parallel_moe = property(
             lambda self: self.enable_expert_parallel
             and self.tensor_parallel_size > 1
-            and self.data_parallel_size == 1
         )
     else:
         ParallelConfig.use_sequence_parallel_moe = property(lambda self: False)
