@@ -249,18 +249,24 @@ def get_tpu_worker_binding(
         # a contiguous host-major rank layout (true for --data-parallel-
         # start-rank, e.g. host 0 = ranks 0-7 and host 1 = ranks 8-15), unlike
         # the authoritative field.
+        # A collapsed per-engine config retains the slice size only in env.
+        dp_size_local = (
+            parallel_config.data_parallel_size_local
+            if parallel_config.data_parallel_size > 1
+            else dp_size
+        ) or dp_size
         dp_rank_local = parallel_config.data_parallel_rank_local
         if dp_rank_local is None:
-            dp_size_local = parallel_config.data_parallel_size_local or dp_size
             dp_rank_local = dp_rank % dp_size_local
         native_local_rank = dp_rank_local * world_size + local_rank
         global_rank = dp_rank * world_size + rank
         global_world = world_size * dp_size
+        local_world = world_size * dp_size_local
         if pcp_size > 1 and use_spawned_pcp_local_rank:
             tpu_local_rank = _get_spawned_pcp_local_rank(
                 env=env,
                 local_rank_offset=local_rank_offset,
-                local_world=global_world,
+                local_world=local_world,
             )
         else:
             tpu_local_rank = native_local_rank
@@ -268,7 +274,7 @@ def get_tpu_worker_binding(
             rank=global_rank,
             local_rank=local_rank_offset + tpu_local_rank,
             world_size=global_world,
-            local_world_size=local_rank_offset + global_world,
+            local_world_size=local_rank_offset + local_world,
             init_rank=rank,
             init_world_size=world_size,
             init_local_rank=tpu_local_rank,

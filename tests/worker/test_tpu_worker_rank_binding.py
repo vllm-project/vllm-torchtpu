@@ -189,6 +189,55 @@ def test_dense_dp_binding_keeps_native_local_rank_dp_aware_but_stays_local():
         assert b.world_size == 2, "non-EP DP must stay replica-local"
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    ("hosts", "local_dp_size"), [(1, 8), (2, 8), (3, 8), (4, 4), (8, 2)]
+)
+@pytest.mark.parametrize("local_rank_known", [False, True])
+def test_multihost_dp_binding_uses_local_replica_count(
+    hosts, local_dp_size, local_rank_known
+):
+    dp_size = hosts * local_dp_size
+    for dp_rank in range(dp_size):
+        local_dp_rank = dp_rank % local_dp_size
+        pc = _parallel_config(
+            world_size=1,
+            data_parallel_size=dp_size,
+            data_parallel_size_local=local_dp_size,
+            data_parallel_index=dp_rank,
+            data_parallel_rank_local=local_dp_rank if local_rank_known else None,
+            prefill_context_parallel_size=1,
+            enable_expert_parallel=True,
+        )
+        b = binding.get_tpu_worker_binding(pc, rank=0, local_rank=0, env={})
+        assert b.as_env() == {
+            "RANK": str(dp_rank),
+            "LOCAL_RANK": str(local_dp_rank),
+            "WORLD_SIZE": str(dp_size),
+            "LOCAL_WORLD_SIZE": str(local_dp_size),
+        }
+        assert b.native_local_rank == local_dp_rank
+        assert b.init_local_rank == local_dp_rank
+        assert (b.init_rank, b.init_world_size) == (0, 1)
+
+
+@pytest.mark.cpu_test
+def test_multihost_dp_binding_prefers_assigned_local_rank():
+    pc = _parallel_config(
+        world_size=1,
+        data_parallel_size=24,
+        data_parallel_size_local=8,
+        data_parallel_index=17,
+        data_parallel_rank_local=5,
+        prefill_context_parallel_size=1,
+        enable_expert_parallel=True,
+    )
+    b = binding.get_tpu_worker_binding(pc, rank=0, local_rank=0, env={})
+    assert b.rank == 17
+    assert b.local_rank == b.native_local_rank == b.init_local_rank == 5
+    assert b.local_world_size == 8
+
+
 def test_dp_binding_rejects_unresolved_data_parallel_index():
     # data_parallel_index is resolved by ParallelConfig.__post_init__; an
     # unresolved index under DP must fail loudly instead of being defaulted.

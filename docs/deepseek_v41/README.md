@@ -136,7 +136,32 @@ Engram table layouts through the existing `engram_config.dp_shared_memory`:
 vLLM enables sharing by default for DP and disables it when `/dev/shm` cannot
 hold the tables; the non-shared path remains available in that case. Both
 layouts retain the existing encoder head/tail schedule and cached uploads,
-and require one node-local Engram group covering all DP replicas.
+and use vLLM's node-local Engram groups. Each group must contain more than
+one DP replica, and its size must divide the global DP size. The number of
+hosts is not fixed. Each host holds the complete tables: one shared copy
+when sharing is enabled, or head shards spread across its local ranks
+otherwise. Table allocation, loading barriers and hash/row exchange stay
+within the local Engram group. EP communication spans the global DP group.
+
+For `N` hosts with `L` DP replicas per host, launch each host with
+`--data-parallel-size N*L --data-parallel-size-local L` (substitute numeric
+values). Host `h`, numbered from zero, uses
+`--data-parallel-start-rank h*L`. The launcher must assign contiguous DP
+ranks per host and a common rendezvous. Existing TP1, PP1, EP, CPU-offload
+and table-sharding constraints still apply.
+
+Workers use vLLM's resolved `data_parallel_index` for the global DP rank
+and `data_parallel_rank_local` for the local DP rank. If the latter is
+unset, the contiguous layout gives `local_dp_rank = global_dp_rank % L`.
+For TP1, `RANK`/`WORLD_SIZE` describe global DP, while
+`LOCAL_RANK`/`LOCAL_WORLD_SIZE` describe the current host. No host count is
+hard-coded in the binding. Each host needs its own table memory; a path
+broadcast in one local group is never mapped by another host's group.
+
+CPU distributed regressions emulate one through four host groups, with
+different table contents and token counts per group. Rank-binding tests
+cover up to eight hosts and both assigned and inferred local ranks.
+Physical multi-host execution and throughput require a separate benchmark.
 
 `scripts/dsv41_bench/serve_cached_prefill.sh` uses this default. To select the
 non-shared layout explicitly, append

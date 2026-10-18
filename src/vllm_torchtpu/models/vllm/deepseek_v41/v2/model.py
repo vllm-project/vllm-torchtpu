@@ -1114,7 +1114,8 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
         return super().forward(*args, **kwargs)
 
     def __init__(self, *, vllm_config, prefix=""):
-        # Both host-table layouts require one node-local Engram DP group.
+        # Each node-local Engram DP group owns a complete host table. EP
+        # still spans the global DP group when the deployment uses more hosts.
         parallel = vllm_config.parallel_config
         if parallel.pipeline_parallel_size != 1:
             raise NotImplementedError("V4.1 TPU currently requires PP1")
@@ -1127,11 +1128,17 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
                 raise NotImplementedError(
                     "V4.1 TPU DP requires TP1, EP and Engram CPU offload"
                 )
-            if upstream.get_engram_dp_size() != parallel.data_parallel_size:
+            engram_dp_size = upstream.get_engram_dp_size()
+            if engram_dp_size <= 1 or parallel.data_parallel_size % engram_dp_size != 0:
                 raise NotImplementedError(
-                    "V4.1 TPU DP requires one node-local Engram group covering "
-                    "all DP replicas; refusing to replicate host tables"
+                    "V4.1 TPU DP requires node-local Engram groups with size > 1 "
+                    "dividing the global DP size; refusing per-rank host tables"
                 )
+            logger.info_once(
+                "V4.1 TPU Engram: node-local DP size=%d, global DP size=%d",
+                engram_dp_size,
+                parallel.data_parallel_size,
+            )
         spec_cfg = getattr(vllm_config, "speculative_config", None)
         if spec_cfg is not None and getattr(spec_cfg, "method", None) not in (
             "dspark",
