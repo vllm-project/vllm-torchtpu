@@ -70,6 +70,11 @@ if (
     or os.getenv("TPU_USE_RAIDEN_KV_CACHE_MANAGER") == "1"
 ):
     os.environ.setdefault("TPU_PREMAPPED_BUFFER_SIZE", str(16 << 30))
+elif envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD:
+    # Engram uploads packed host rows on every forward. Reserve a small
+    # DMA-mapped staging pool for these recurring transfers. Keep explicit
+    # settings (including zero), and let Raiden retain its larger pool.
+    os.environ.setdefault("TPU_PREMAPPED_BUFFER_SIZE", str(256 << 20))
 
 # TPU_GDN_CONV_QK_PAIR_LAYOUT resolves in two layers:
 #   1. An explicitly set value always wins (enable or disable), for both

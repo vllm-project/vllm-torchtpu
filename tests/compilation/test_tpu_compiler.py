@@ -271,6 +271,38 @@ class TestTpuCompilerCache:
                 os.environ.get("TORCH_TPU_TIER2_COMPILATION_CACHE") == "tpu_tier2_cache"
             )
 
+    @pytest.mark.parametrize(
+        "offload,transport,manager,explicit,expected",
+        [
+            ("0", "", "0", None, None),
+            ("1", "", "0", None, str(256 << 20)),
+            ("true", "", "0", None, str(256 << 20)),
+            ("1", "", "0", "0", "0"),
+            ("1", "", "0", "1048576", "1048576"),
+            ("1", "raiden", "0", None, str(16 << 30)),
+            ("1", "", "1", None, str(16 << 30)),
+            ("1", "raiden", "0", "0", "0"),
+        ],
+    )
+    def test_engram_premapped_pool_defaults(
+        self, offload, transport, manager, explicit, expected
+    ):
+        """Set Engram staging before device init without overriding pool choices."""
+        values = {
+            "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD": offload,
+            "TPU_KV_RESHARD_TRANSPORT": transport,
+            "TPU_USE_RAIDEN_KV_CACHE_MANAGER": manager,
+            "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES": "0",
+        }
+        if explicit is not None:
+            values["TPU_PREMAPPED_BUFFER_SIZE"] = explicit
+        with patch.dict(os.environ, values, clear=True):
+            import vllm_torchtpu.env_override
+
+            importlib.reload(vllm_torchtpu.env_override)
+
+            assert os.environ.get("TPU_PREMAPPED_BUFFER_SIZE") == expected
+
     @staticmethod
     def _sc_offload_flags() -> list[str]:
         return [
