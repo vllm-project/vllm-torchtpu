@@ -58,30 +58,21 @@ COMPILER_PARAMS = dict(use_tc_tiling_on_sc=True,
 
 
 def _jax_private():
-    """jax's private core-map lowering and ref constructor. Both are bound
-    here so missing APIs raise an error identifying the installed JAX
-    version and required interfaces."""
+    """jax's private core-map lowering and ref constructor, for the programs
+    that update their operands in place. Both are bound here so missing APIs
+    raise an error identifying the installed JAX version and required
+    interfaces."""
     try:
         from jax._src import core as jax_core
         from jax._src import tree_util
         from jax._src.pallas import core as pallas_core
-        return (jax_core.new_ref, jax_core.MemorySpace, tree_util,
-                pallas_core.core_map, pallas_core._convert_out_shape_to_aval)
+        return jax_core.new_ref, tree_util, pallas_core.core_map
     except (ImportError, AttributeError) as e:
         raise NotImplementedError(
-            "the sparse-core programs go through jax's private core-map "
-            "lowering (jax._src.pallas.core.core_map, jax._src.core.new_ref) "
-            f"and jax {device.jax_version()} no longer carries it as "
-            "written") from e
-
-
-def _empty_output_ref(out_type):
-    new_ref, memory_space_type, _, _, out_shape_to_aval = _jax_private()
-    aval = out_shape_to_aval(out_type)
-    memory_space = (None if isinstance(aval.memory_space, memory_space_type)
-                    else aval.memory_space)
-    value = lax.empty(aval.shape, aval.dtype, out_sharding=aval.sharding)
-    return new_ref(value, memory_space=memory_space)
+            "the in-place sparse-core programs go through jax's private "
+            "core-map lowering (jax._src.pallas.core.core_map, "
+            f"jax._src.core.new_ref) and jax {device.jax_version()} no "
+            "longer carries it as written") from e
 
 
 def sparse_core_program(body,
@@ -94,20 +85,36 @@ def sparse_core_program(body,
                         in_place_outputs=0):
     """Wraps `body(*operand_refs, *out_refs, *scratch_refs)` as a jitted
     function over the vector-subcore mesh, returning the outputs as a tuple
-    in out_types order. With in_place_outputs, that many trailing operands
-    ARE the outputs: taken with their contents and updated in place."""
-    new_ref, _, tree_util, core_map, _ = _jax_private()
+    in out_types order. The outputs are the kernel's own, buffers the
+    compiler allocates for the call: an allocation made in the program
+    (lax.empty) is identical in every inlined copy of the program, so the
+    torch bridge's common-subexpression pass merges one model's layers onto
+    a single buffer, which then has to be copied before every in-place
+    write. With in_place_outputs, that many trailing operands ARE the
+    outputs: taken with their contents and updated in place."""
     assert in_place_outputs in (0, len(out_types)), (in_place_outputs,
                                                      out_types)
+    if not in_place_outputs:
+        program = pl.kernel(body,
+                            tuple(out_types),
+                            mesh=mesh,
+                            scratch_types=tuple(scratch_types),
+                            compiler_params=compiler_params,
+                            name=name)
+
+        @jax.jit
+        def run(*operands):
+            return tuple(program(*operands))
+
+        return run
+
+    new_ref, tree_util, core_map = _jax_private()
 
     @jax.jit
     def run(*operands):
         n_in = len(operands) - in_place_outputs
         operand_refs = tree_util.tree_map(new_ref, operands[:n_in])
-        if in_place_outputs:
-            out_refs = [new_ref(v) for v in operands[n_in:]]
-        else:
-            out_refs = [_empty_output_ref(t) for t in out_types]
+        out_refs = [new_ref(v) for v in operands[n_in:]]
 
         @core_map(mesh,
                   scratch_shapes=scratch_types,
