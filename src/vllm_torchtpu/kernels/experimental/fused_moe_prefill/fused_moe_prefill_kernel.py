@@ -42,6 +42,7 @@ top-k stays with the caller.
 """
 
 import functools
+import math
 
 import jax
 import jax.numpy as jnp
@@ -178,6 +179,23 @@ def _cdiv(a, b):
     return (a + b - 1) // b
 
 
+def _byte_transpose4(a):
+    """Byte t of result j is byte j of a[t], for four u32 arrays: a 4x4 byte
+    transpose per element, by shifts and masks only."""
+    lo16, hi16 = jnp.uint32(0x0000FFFF), jnp.uint32(0xFFFF0000)
+    even8, odd8 = jnp.uint32(0x00FF00FF), jnp.uint32(0xFF00FF00)
+    b0 = (a[0] & lo16) | (a[2] << 16)
+    b2 = (a[0] >> 16) | (a[2] & hi16)
+    b1 = (a[1] & lo16) | (a[3] << 16)
+    b3 = (a[1] >> 16) | (a[3] & hi16)
+    return (
+        (b0 & even8) | ((b1 & even8) << 8),
+        ((b0 >> 8) & even8) | (b1 & odd8),
+        (b2 & even8) | ((b3 & even8) << 8),
+        ((b2 >> 8) & even8) | (b3 & odd8),
+    )
+
+
 def _tile_rows(tokens):
     """Tile height for a token count. Every tile pays a fixed cost (index
     window, scale window, waits), so tall tiles win once experts hold a few
@@ -202,6 +220,21 @@ def _build_expert_kernel(
     n_p = _cdiv(n_q, 2)
     rungs = [tile_rows * (r + 1) // _TILE_RUNGS for r in range(_TILE_RUNGS)]
     lane_blocks = h // _LANES
+    # Layouts the tile body can move as whole u32 words (compute below): 8-bit
+    # rows whose lane blocks come in fours, at rung heights of whole 32-row
+    # tiles, for the lhs; pairs of bf16 lane blocks, at rung heights of whole
+    # 8-row tiles, for the slab rows. The lhs loads have sublane stride L, and
+    # libtpu splits a strided load into gcd(stride, 32) / 4 loads (at least
+    # one) to avoid VMEM bank conflicts: 4 at L = 48, but 8 one-sublane loads
+    # at L = 32 (h = 4096), more bundles than the retile they replace, so L
+    # that are multiples of 32 keep the retile.
+    lhs_from_words = (
+        jnp.dtype(weight_dtype).itemsize == 1
+        and lane_blocks % 4 == 0
+        and tile_rows % (4 * _TILE_RUNGS * 8) == 0
+        and math.gcd(lane_blocks, 32) <= 16
+    )
+    out_by_pairs = lane_blocks % 2 == 0 and tile_rows % (8 * _TILE_RUNGS) == 0
     shared = experts  # visit-table id of the shared expert
     slab_rows = routes + tokens + tile_rows
     scale_rows = _cdiv(slab_rows, _LANES) + 1
@@ -273,7 +306,8 @@ def _build_expert_kernel(
           out_vmem [2, tile_rows, L, 128] bf16: double-buffered tile output.
           w1_ring, w2_ring, w1_scale_ring, w2_scale_ring: [nb, ...] expert
             weight ring.
-          token_window [2, window] int32 (SMEM): token numbers of a tile's rows.
+          token_window [2 * window] int32 (SMEM): token numbers of a tile's rows,
+            window slot s at [s * window, (s + 1) * window).
           act_sems [n_act], window_sems [2], out_sems [2], ring_sems [nb]: DMA.
           shared_w1_vmem, shared_w2_vmem, shared_w1_scale_vmem,
             shared_w2_scale_vmem, shared_sem: the shared expert, loaded once.
@@ -346,9 +380,12 @@ def _build_expert_kernel(
         # ---- token-number windows (routed tiles only) ----
         def window_copy(start, slot):
             aligned = pl.multiple_of(start - lax.rem(start, _LANES), _LANES)
+            lo = slot * window  # the slot's first entry in the flat ring
+            if not isinstance(lo, int):
+                lo = pl.multiple_of(lo, _LANES)
             return pltpu.make_async_copy(
                 row_token_hbm.at[pl.ds(aligned, window)],
-                token_window.at[slot],
+                token_window.at[pl.ds(lo, window)],
                 window_sems.at[slot],
             )
 
@@ -393,8 +430,7 @@ def _build_expert_kernel(
                     act_vmem.at[slot],
                     act_sems.at[slot],
                     token_window,
-                    wslot,
-                    lax.rem(start, _LANES),
+                    wslot * window + lax.rem(start, _LANES),
                     tile_live(v, t),
                 )
 
@@ -496,7 +532,38 @@ def _build_expert_kernel(
                 out_wait(p, n_prev)
 
             def compute(rows, w1, w2, w1_scale, w2_scale):
-                act = act_vmem[aslot, pl.ds(0, rows)].reshape(rows, h)
+                if lhs_from_words:
+                    # The matmul's 8-bit layout packs 4 consecutive rows into
+                    # each u32 word (row 4s + t in byte t of sublane s). A
+                    # gathered row is L / 4 u32 word-rows, word-row k packing
+                    # lane blocks 4k..4k+3 (block 4k + j in byte j), which are
+                    # also the 512 columns of activation scale block k. So load
+                    # rows t, t + 4, ... of word-row k with one sublane-strided
+                    # load per t and transpose bytes across the four loads:
+                    # the gathered bytes as they are, no relayout, no casts.
+                    wpr = lane_blocks // 4
+                    a32 = (
+                        act_vmem.at[aslot]
+                        .bitcast(jnp.uint32)
+                        .reshape(tile_rows * wpr, _LANES)
+                    )
+                    act_lanes = []
+                    for k in range(wpr):
+                        quads = [
+                            a32[pl.ds(t * wpr + k, rows // 4, stride=4 * wpr)]
+                            for t in range(4)
+                        ]
+                        act_lanes += [
+                            pltpu.bitcast(b, weight_dtype)
+                            for b in _byte_transpose4(quads)
+                        ]
+                    act = jnp.concatenate(act_lanes, axis=1)
+                else:
+                    # Retile the gathered rows ([rows, L, 128] blocks) into the
+                    # matmul layout [rows, h] as bf16, then cast back: cheaper
+                    # than retiling the packed fp8 value; both casts are exact.
+                    act = act_vmem[aslot, pl.ds(0, rows)].astype(jnp.bfloat16)
+                    act = act.reshape(rows, h).astype(weight_dtype)
                 act_scales = _unpack_scales(
                     [
                         _tile_row_scales(act_scale_vmem[aslot, k], start, rows)
@@ -504,39 +571,73 @@ def _build_expert_kernel(
                     ],
                     n_q,
                 )
+                # Gate/up and the requantized intermediate; the down matmul
+                # runs in the store branch below. The weights are refs, loaded
+                # where they are used.
                 acc1 = _gate_up(act, act_scales, w1)
-                blocks = _quantize_mid(acc1, w1.shape[-1] // 2, w1_scale)
-                acc2 = _down(blocks, w2, slice(None))
-                # Retile into the per-row slab layout while still f32 (8x8
-                # sublane blocks), then pack to bf16: cheaper than retiling the
-                # packed bf16 value.
-                out = (acc2 * w2_scale).reshape(rows, lane_blocks, _LANES)
-                out = out.astype(jnp.bfloat16)
+                inter = w1.shape[-1] // 2  # i, or i_s on the shared visit
+                blocks = _quantize_mid(acc1, inter, w1_scale[...])
                 for par in range(2):
 
                     @pl.when(p == par)
                     def _(par=par):
-                        out_vmem[par, pl.ds(0, rows)] = out
+                        # The down matmul and the epilogue in the branch that
+                        # stores them, so the bf16 rows go straight into
+                        # out_vmem[par] rather than through a value finished
+                        # before the branch (same operations, same bits).
+                        acc2 = _down(blocks, w2, slice(None))
+                        out = acc2 * w2_scale[...]
+                        if out_by_pairs:
+                            # Store straight into the per-row slab layout. In a
+                            # u32 view of out_vmem[par], word-row r * L/2 + q
+                            # holds lane blocks 2q (low half) and 2q + 1 (high
+                            # half) of row r: pack each pair to bf16 elementwise
+                            # and store it with one sublane-strided store per 8
+                            # rows. Same products and rounding, no relayout.
+                            half = lane_blocks // 2
+                            out32 = (
+                                out_vmem.at[par]
+                                .bitcast(jnp.uint32)
+                                .reshape(tile_rows * half, _LANES)
+                            )
+                            for q in range(half):
+                                pair = [
+                                    out[
+                                        :,
+                                        (2 * q + j) * _LANES : (2 * q + j + 1) * _LANES,
+                                    ]
+                                    for j in range(2)
+                                ]
+                                out32[pl.ds(q, rows, stride=half)] = (
+                                    pltpu.pack_elementwise(
+                                        pair, packed_dtype=jnp.bfloat16
+                                    )
+                                )
+                        else:
+                            # Retile into the per-row slab layout while still
+                            # f32 (8x8 sublane blocks), then pack to bf16.
+                            out = out.reshape(rows, lane_blocks, _LANES)
+                            out_vmem[par, pl.ds(0, rows)] = out.astype(jnp.bfloat16)
 
             def compute_visit(rows):
                 @pl.when(is_shared(v))
                 def _():
                     compute(
                         rows,
-                        shared_w1_vmem[...],
-                        shared_w2_vmem[...],
-                        shared_w1_scale_vmem[...],
-                        shared_w2_scale_vmem[...],
+                        shared_w1_vmem,
+                        shared_w2_vmem,
+                        shared_w1_scale_vmem,
+                        shared_w2_scale_vmem,
                     )
 
                 @pl.when(jnp.logical_not(is_shared(v)))
                 def _():
                     compute(
                         rows,
-                        w1_ring[slot],
-                        w2_ring[slot],
-                        w1_scale_ring[slot],
-                        w2_scale_ring[slot],
+                        w1_ring.at[slot],
+                        w2_ring.at[slot],
+                        w1_scale_ring.at[slot],
+                        w2_scale_ring.at[slot],
                     )
 
             for r, rows in enumerate(rungs):
@@ -576,7 +677,7 @@ def _build_expert_kernel(
                 pltpu.VMEM((nb, i, h), weight_dtype),
                 pltpu.VMEM((nb, 1, 2 * i), jnp.float32),
                 pltpu.VMEM((nb, 1, h), jnp.float32),
-                pltpu.SMEM((2, window), jnp.int32),
+                pltpu.SMEM((2 * window,), jnp.int32),
                 pltpu.SemaphoreType.DMA((n_act,)),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((2,)),
@@ -611,19 +712,23 @@ def _shared_scratch(h, i_s, weight_dtype):
     )
 
 
-def _gather_rows(x_hbm, dst, sem, token_window, wslot, offset, live):
+def _gather_rows(x_hbm, dst, sem, token_window, ptr0, live):
     """Start one DMA per activation row: row r of `dst` gets token
-    token_window[wslot, offset + r], for whole blocks of _GATHER_UNROLL rows
-    covering `live` (dead rows read in-bounds table entries)."""
+    token_window[ptr0 + r] (the flat token ring), for whole blocks of
+    _GATHER_UNROLL rows covering `live` (dead rows read in-bounds table
+    entries)."""
 
-    def block(b, carry):
+    # The carry is the flat-ring index of the block's first row, so each row
+    # costs one SMEM load at a constant offset plus its DMA (no 2-D index
+    # arithmetic per row).
+    def block(b, ptr):
+        r0 = b * _GATHER_UNROLL
         for u in range(_GATHER_UNROLL):
-            r = b * _GATHER_UNROLL + u
-            token = token_window[wslot, offset + r]
-            pltpu.make_async_copy(x_hbm.at[token], dst.at[r], sem).start()
-        return carry
+            token = token_window[ptr + u]
+            pltpu.make_async_copy(x_hbm.at[token], dst.at[r0 + u], sem).start()
+        return ptr + _GATHER_UNROLL
 
-    lax.fori_loop(0, _cdiv(live, _GATHER_UNROLL), block, 0)
+    lax.fori_loop(0, _cdiv(live, _GATHER_UNROLL), block, ptr0)
 
 
 # ---- Blocked mode: experts streamed in intermediate blocks ----------------
@@ -808,9 +913,12 @@ def _build_blocked_expert_kernel(
         def window_copy(c, slot):
             start = chunk_start[c]
             aligned = pl.multiple_of(start - lax.rem(start, _LANES), _LANES)
+            lo = slot * window  # the slot's first entry in the flat ring
+            if not isinstance(lo, int):
+                lo = pl.multiple_of(lo, _LANES)
             return pltpu.make_async_copy(
                 row_token_hbm.at[pl.ds(aligned, window)],
-                token_window.at[slot],
+                token_window.at[pl.ds(lo, window)],
                 window_sems.at[slot],
             )
 
@@ -851,8 +959,7 @@ def _build_blocked_expert_kernel(
                     act_vmem.at[buf],
                     act_sems.at[buf],
                     token_window,
-                    buf,
-                    lax.rem(start, _LANES),
+                    buf * window + lax.rem(start, _LANES),
                     live,
                 )
 
@@ -1049,7 +1156,7 @@ def _build_blocked_expert_kernel(
                 pltpu.VMEM((nb, ib, h), weight_dtype),
                 pltpu.VMEM((nb, 1, 2 * ib), jnp.float32),
                 pltpu.VMEM((nb, 1, h), jnp.float32),
-                pltpu.SMEM((2, window), jnp.int32),
+                pltpu.SMEM((2 * window,), jnp.int32),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA((2,)),
                 pltpu.SemaphoreType.DMA(()),
@@ -1137,13 +1244,14 @@ def _routing_plan(topk_ids, route_valid, experts, row_scale):
     """Expert-major slab order for the routed rows, with no scatter or gather
     over the routes.
 
-    One key/value sort orders the routes by expert, carrying each route's id
-    and its token's packed activation scales (row_scale [T, P] int32, one
-    payload per word; a gather instead would be a slow TensorCore index
-    gather);
-    a second sort of that permutation gives
-    its inverse (each route's slab row). Routes where route_valid [T, K] is
-    False get the sentinel expert E, sort last and are never visited.
+    One sort orders the routes by expert, carrying each route's id and its
+    token's packed activation scales (row_scale [T, P] int32, one payload per
+    word; a gather instead would be a slow TensorCore index gather); a second
+    sort of that permutation gives its inverse (each route's slab row). While
+    the ids fit, each is a single unstable sort of packed uint32 keys: the
+    keys are distinct, so it gives the stable key/value sort's permutation, at
+    a lower cost. Routes where route_valid [T, K] is False get the sentinel
+    expert E, sort last and are never visited.
 
     Returns the token of each slab row [R], the slab row of each route [T, K],
     the packed activation scales of each slab row [P, R], the visit tables
@@ -1160,10 +1268,26 @@ def _routing_plan(topk_ids, route_valid, experts, row_scale):
         jnp.broadcast_to(row_scale[:, k, None], (tokens, topk)).reshape(-1)
         for k in range(row_scale.shape[1])
     ]
-    _, order, *sorted_scales = lax.sort(
-        (route_expert, iota, *route_scales), num_keys=1, is_stable=True
-    )
-    _, slab_row = lax.sort((order, iota), num_keys=1, is_stable=False)
+    if routes < 1 << 20 and experts < 1 << 11:
+        # One sort on (expert << 20) | route (expert ids up to E < 2^11, route
+        # ids < 2^20): the route id breaks ties within an expert, so this is
+        # the stable expert order.
+        key = (route_expert.astype(jnp.uint32) << 20) | iota.astype(jnp.uint32)
+        key, *sorted_scales = lax.sort(
+            (key, *route_scales), num_keys=1, is_stable=False
+        )
+        order = (key & ((1 << 20) - 1)).astype(jnp.int32)
+    else:
+        _, order, *sorted_scales = lax.sort(
+            (route_expert, iota, *route_scales), num_keys=1, is_stable=True
+        )
+    if routes <= 1 << 16:
+        # One sort on (route << 16) | slab row, the route being order[slab row]:
+        # entry r ends up holding route r's slab row in its low 16 bits.
+        key = (order.astype(jnp.uint32) << 16) | iota.astype(jnp.uint32)
+        slab_row = (lax.sort(key, is_stable=False) & 0xFFFF).astype(jnp.int32)
+    else:
+        _, slab_row = lax.sort((order, iota), num_keys=1, is_stable=False)
     counts = jnp.sum(
         route_expert[None, :] == jnp.arange(experts, dtype=jnp.int32)[:, None],
         axis=1,
