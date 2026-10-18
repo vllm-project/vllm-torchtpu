@@ -234,7 +234,6 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_patch_vllm_hybrid_kv_load_failure_recovery",
         "_patch_vllm_abort_on_preemption",
         "_patch_vllm_same_step_prefix_hits",
-        "patch_disable_eagle_block_drop",
         "_patch_dflash_drafting_slot_budget",
         "_patch_vllm_merge_multimodal_embeddings",
     ]

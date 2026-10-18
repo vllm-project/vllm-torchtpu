@@ -208,6 +208,104 @@ def inner_kernel(
         carry_recurrent_scratch_ref[...] = new_recurrent_state[:, -1]
 
 
+def export_prefill_checkpoint(
+    metadata_ref: memory_ref.MetadataRef,
+    conv_state_out_slot_ref: jax.Ref,
+    recurrent_out_slot_ref: jax.Ref,
+    conv_state_out_ref: jax.Ref,
+    recurrent_state_out_ref: jax.Ref,
+    sems: jax.Ref,
+    *,
+    cfg: config.GDNConfig,
+    p_id: jax.Array,
+) -> None:
+    """Writes the state after a checkpoint tile into its prefill checkpoint block.
+
+    `inner_kernel` leaves the tile's final state in the output slots in the
+    encoding `StateOutBufferedRef.copy_out` writes for a sequence's last tile,
+    so the checkpoint is a copy of those granules to block
+    `s_idx_to_prefill_ckpt_index[s]` at the same offsets, waited inline.
+    Reading the output slots inside the pipeline body is race-free: any prior
+    step's copy-out completed before the body, and the current step's pipeline
+    copy-out runs after the body and only fires on a sequence's last tile,
+    which a checkpoint tile never is.
+    """
+    # Inter-tile carry only exists in PER_SEQ mode (one sequence per tile).
+    assert cfg.mode == config.GDNMode.PER_SEQ and cfg.seq_tile_size == 1
+    assert cfg.window_size == 1
+    idx = 0
+
+    @pl.when(metadata_ref.is_prefill_ckpt_tile(p_id, idx))
+    def _():
+        s_idx = metadata_ref.p_id_to_s_idx[p_id, idx]
+        block = metadata_ref.s_idx_to_prefill_ckpt_index[s_idx]
+        regions = (
+            (conv_state_out_slot_ref, conv_state_out_ref, cfg.conv_hbm_offset),
+            (recurrent_out_slot_ref, recurrent_state_out_ref, cfg.recurrent_hbm_offset),
+        )
+        copies = []
+        for sem_idx, (slot_ref, dst_ref, offset) in enumerate(regions):
+            src = memory_ref.granule_view(slot_ref, slot_ref.shape[:2])
+            dst = memory_ref.granule_view(dst_ref, dst_ref.shape[:1])
+            num_granules = src.shape[2]
+            copy = pltpu.make_async_copy(
+                src.at[pl.ds(idx, 1), 0],
+                dst.at[pl.ds(block, 1), pl.ds(offset, num_granules)],
+                sems.at[sem_idx],
+            )
+            copy.start()
+            copies.append(copy)
+        for copy in copies:
+            copy.wait()
+
+
+def inner_kernel_with_prefill_ckpt(
+    qkv_slot_ref: jax.Ref,
+    b_slot_ref: jax.Ref,
+    a_slot_ref: jax.Ref,
+    conv_state_in_slot_ref: jax.Ref,
+    recurrent_in_slot_ref: jax.Ref,
+    out_slot_ref: jax.Ref,
+    conv_state_out_slot_ref: jax.Ref,
+    recurrent_out_slot_ref: jax.Ref,
+    metadata_ref: memory_ref.MetadataRef,
+    weights_ref: memory_ref.WeightRefs,
+    carry_conv_scratch_ref: jax.Ref,
+    carry_recurrent_scratch_ref: jax.Ref,
+    conv_state_out_ref: jax.Ref,
+    recurrent_state_out_ref: jax.Ref,
+    prefill_ckpt_sems: jax.Ref,
+    *,
+    cfg: config.GDNConfig,
+):
+    """Runs one PER_SEQ tile, then exports its prefill checkpoint if any."""
+    inner_kernel(
+        qkv_slot_ref,
+        b_slot_ref,
+        a_slot_ref,
+        conv_state_in_slot_ref,
+        recurrent_in_slot_ref,
+        out_slot_ref,
+        conv_state_out_slot_ref,
+        recurrent_out_slot_ref,
+        metadata_ref,
+        weights_ref,
+        carry_conv_scratch_ref,
+        carry_recurrent_scratch_ref,
+        cfg=cfg,
+    )
+    export_prefill_checkpoint(
+        metadata_ref,
+        conv_state_out_slot_ref,
+        recurrent_out_slot_ref,
+        conv_state_out_ref,
+        recurrent_state_out_ref,
+        prefill_ckpt_sems,
+        cfg=cfg,
+        p_id=pl.program_id(0),
+    )
+
+
 def outer_kernel(
     # Inputs.
     metadata_ref: memory_ref.MetadataRef,
@@ -223,6 +321,7 @@ def outer_kernel(
     # Scratches.
     carry_conv_scratch_ref: jax.Array | None,
     carry_recurrent_scratch_ref: jax.Array | None,
+    prefill_ckpt_sems: jax.Array | None = None,
     *,
     cfg: config.GDNConfig,
 ):
@@ -260,7 +359,17 @@ def outer_kernel(
         cfg=cfg,
     )
     num_tiles = metadata_ref.num_tiles[...]
-    body = functools.partial(inner_kernel, cfg=cfg)
+    body = inner_kernel
+    scratches = (
+        metadata_ref,
+        weights_ref,
+        carry_conv_scratch_ref,
+        carry_recurrent_scratch_ref,
+    )
+    if metadata_ref.s_idx_to_prefill_ckpt_row is not None:
+        body = inner_kernel_with_prefill_ckpt
+        scratches += (conv_state_out_ref, recurrent_state_out_ref, prefill_ckpt_sems)
+    body = functools.partial(body, cfg=cfg)
     state_allocs = (conv_in_alloc, recurrent_in_alloc)
     out_allocs = (out_alloc, conv_out_alloc, recurrent_out_alloc)
     state_out_args = (conv_state_out_ref, recurrent_state_out_ref)
@@ -295,12 +404,7 @@ def outer_kernel(
             recurrent_state_ref,
             out_ref,
             *state_out_args,
-            scratches=(
-                metadata_ref,
-                weights_ref,
-                carry_conv_scratch_ref,
-                carry_recurrent_scratch_ref,
-            ),
+            scratches=scratches,
             allocations=allocations,
         )
 
@@ -343,6 +447,8 @@ def fused_conv1d_gdn(
     seq_lens: jax.Array,  # [num_seqs]
     read_offsets: jax.Array | None = None,  # [num_seqs]
     ckpt_indices: jax.Array | None = None,  # [num_seqs, num_spec_tokens + 1]
+    prefill_ckpt_offsets: jax.Array | None = None,  # [num_seqs]
+    prefill_ckpt_indices: jax.Array | None = None,  # [num_seqs]
     *,
     n_kq: int,
     n_v: int,
@@ -401,6 +507,14 @@ def fused_conv1d_gdn(
             `state_indices[s] + read_offsets[s]` and write one checkpoint
             per window position to `state_indices[s] + t`. Required when
             `num_spec_tokens > 0`.
+        prefill_ckpt_offsets: Optional [num_seqs] int32. Query token offset
+            of each sequence's internal prefill checkpoint (0 for none). When
+            0 < offset < query_len and prefill_ckpt_indices is non-negative,
+            the state after the first offset query tokens is also written,
+            encoded like the final state, to block prefill_ckpt_indices[s].
+            Must be passed together with prefill_ckpt_indices.
+        prefill_ckpt_indices: Optional [num_seqs] int32. Destination state
+            block of each sequence's prefill checkpoint (-1 for none).
         n_kq: Number of key/query heads.
         n_v: Number of value heads.
         d_k: Key/query dimension.
@@ -504,6 +618,15 @@ def fused_conv1d_gdn(
         # Iniitalize the ckpt_indices to default value.
         spec_offset = jnp.arange(num_spec_tokens + 1).reshape(1, -1)
         ckpt_indices = state_indices.reshape(-1, 1) + spec_offset
+    assert (prefill_ckpt_offsets is None) == (prefill_ckpt_indices is None), (
+        "prefill_ckpt_offsets and prefill_ckpt_indices go together"
+    )
+    if prefill_ckpt_offsets is not None:
+        assert prefill_ckpt_indices is not None
+        assert prefill_ckpt_offsets.shape == (num_seqs,), prefill_ckpt_offsets.shape
+        assert prefill_ckpt_indices.shape == (num_seqs,), prefill_ckpt_indices.shape
+        prefill_ckpt_offsets = prefill_ckpt_offsets.astype(jnp.int32)
+        prefill_ckpt_indices = prefill_ckpt_indices.astype(jnp.int32)
 
     act_in_dtype = qkv.dtype
     assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
@@ -673,10 +796,15 @@ def fused_conv1d_gdn(
                 start_seq=distribution[0],
                 end_seq=distribution[-1],
                 ckpt_indices=ckpt_indices,
+                prefill_ckpt_offsets=prefill_ckpt_offsets,
+                prefill_ckpt_indices=prefill_ckpt_indices,
             )
 
         metadata_spec = jax.tree.map(lambda _: smem_spec, metadata_obj)
         state_spec = jax.tree.map(lambda _: hbm_spec, in_states)
+        scratch_shapes = cfg.get_scratch_shape_dict()
+        if metadata_obj.s_idx_to_prefill_ckpt_row is not None:
+            scratch_shapes |= cfg.get_prefill_ckpt_scratch_shape_dict()
 
         # Step 7: Handle case where write needs to be done in existing out.
         input_output_aliases = {}
@@ -711,7 +839,7 @@ def fused_conv1d_gdn(
                 weights_spec,
             ),
             out_specs=(hbm_spec, state_spec),
-            scratch_shapes=cfg.get_scratch_shape_dict(),
+            scratch_shapes=scratch_shapes,
             input_output_aliases=input_output_aliases,
             compiler_params=pltpu.CompilerParams(
                 disable_bounds_checks=True,
