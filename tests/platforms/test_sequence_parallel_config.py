@@ -196,8 +196,9 @@ def test_sequence_parallel_moe_admission(monkeypatch, tp, dp, ep, drafter, expec
     from vllm.config.parallel import ParallelConfig
 
     import vllm_torchtpu
+    from vllm_torchtpu import envs
 
-    monkeypatch.setenv("TPU_MOE_SEQUENCE_PARALLEL", "1")
+    monkeypatch.setattr(envs, "TPU_MOE_SEQUENCE_PARALLEL", True)
     saved = ParallelConfig.__dict__.get("use_sequence_parallel_moe")
     saved_flag = ParallelConfig.__dict__.get("_tpu_no_sp_moe_patch")
     ParallelConfig._tpu_no_sp_moe_patch = False
