@@ -179,6 +179,7 @@ if TYPE_CHECKING:
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
+    VLLM_TPU_LAZY_REASONING_COUNT: bool = True
 
 
 def env_with_choices(
@@ -1106,6 +1107,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # deterministic cap from the scheduler config, 0 disables the cap (all
     # post-profile HBM goes to KV), N > 0 caps KV at N tokens.
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS": env_int("VLLM_TPU_POOLING_KV_CACHE_TOKENS", -1),
+    # API server: in chat streaming, recount reasoning tokens only when the
+    # count is observable (frontend/lazy_reasoning_count.py). Kill switch;
+    # 0 restores vLLM's recount after every delta.
+    "VLLM_TPU_LAZY_REASONING_COUNT": env_bool(
+        "VLLM_TPU_LAZY_REASONING_COUNT", default=True
+    ),
 }
 
 

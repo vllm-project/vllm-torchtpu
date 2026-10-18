@@ -241,6 +241,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     # backbone graph, and the KV cap reaches the hash through num_gpu_blocks.
     "VLLM_TPU_STATIC_POOLER",
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS",
+    # API-server frontend patches; never reach the compiled model.
+    "VLLM_TPU_LAZY_REASONING_COUNT",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (

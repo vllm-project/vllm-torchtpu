@@ -265,6 +265,7 @@ class TestTpuCompilerCache:
             "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
             "SC_ALLREDUCE_ALLGATHER_OFFLOAD_MIN_BYTES",
             "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
+            "VLLM_TPU_LAZY_REASONING_COUNT",
         }
 
         assert serving_only <= _TPU_COMPILE_ENV_IGNORED
