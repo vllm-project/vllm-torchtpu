@@ -16,6 +16,9 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+echo "--- Cleaning up old Docker images and cache"
+bash "${SCRIPT_DIR}/cleanup_docker.sh"
+
 TARGET="${1:-dev}"
 IMAGE_SUFFIX=""
 if [ "${TARGET}" = "omni" ]; then
@@ -67,9 +70,6 @@ if [[ "${TORCHTPU_NIGHTLY:-0}" != "1" && "${CI_IMAGE_REBUILD:-0}" != "1" ]] \
   echo "--- Done setup_docker_env.sh"
   exit 0
 fi
-
-echo "--- Cleaning up old Docker images and cache"
-bash "${SCRIPT_DIR}/cleanup_docker.sh"
 
 if [[ "${TORCHTPU_NIGHTLY:-0}" != "1" ]]; then
   echo "--- Building Docker Image: ${BASE_IMAGE_TAG} (target: ${TARGET})"
