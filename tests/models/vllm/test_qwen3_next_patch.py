@@ -1105,9 +1105,14 @@ def test_patched_sparse_moe_forward_takes_prenorm_outputs(monkeypatch):
         (32, 1024, 32, 32),  # 32-aligned decode bucket (TP=8)
         (64, 1024, 32, 32),  # 32-aligned sub-block for float8_e4m3fn (32, 128) tiles
         (512, 1024, 512, 64),  # TP=8 prefill: 512-row block, 64-row in-kernel steps
-        # TP=2 prefill: the 16-row VREG step is not 32-aligned, so each 512-row
-        # block runs as one step.
-        (4096, 4096, 512, 512),
+        # TP=2 prefill: the 16-row VREG step is not 32-aligned, so each block
+        # runs as one step; the 16 MiB tile budget holds a 4096-wide block to
+        # 384 rows, and 256 is the largest 32-aligned divisor of 4096 under it.
+        (4096, 4096, 256, 256),
+        # TP=1 prefill (a pipeline stage): the budget holds an 8192-wide block
+        # to 192 rows, so a 2176-row chunk and an 8192-row step tile at 128.
+        (2176, 8192, 128, 128),
+        (8192, 8192, 128, 128),
     ],
 )
 def test_sigmoid_gate_quant_tile_selection(rows, cols, expected_bm, expected_step):
@@ -1118,6 +1123,8 @@ def test_sigmoid_gate_quant_tile_selection(rows, cols, expected_bm, expected_ste
     assert (bm, step) == (expected_bm, expected_step)
     assert bm == rows or (rows % bm == 0 and bm % 32 == 0)
     assert step == bm or (bm % step == 0 and step % 32 == 0)
+    # Two bf16 inputs and one fp8 output, double buffered, within 16 MiB.
+    assert bm * cols * 10 <= (16 << 20)
 
 
 def test_patched_sparse_moe_forward_v2_owns_combine_no_double_all_reduce(monkeypatch):
