@@ -19,9 +19,9 @@
 # and nightly tests-lane step passed, the vLLM / vllm-torchtpu commit pair
 # recorded as verified.
 #
-# Only the fleet that owns the nightly pushes: bare metal, or kube once its
-# schedule sets KUBE_OWNS_NIGHTLY=1 (with the bare-metal schedule off), so the
-# two never both commit. CI_FLEET comes from the step's env.
+# Only the scheduled nightly pushes: its schedule sets KUBE_OWNS_NIGHTLY=1, and
+# a manual or validation build with NIGHTLY=1 leaves it unset so it never
+# commits.
 set -euo pipefail
 
 SCRIPTS="$(dirname "${BASH_SOURCE[0]}")"
@@ -36,9 +36,6 @@ meta() {
 # pair being recorded, never let one through.
 tests_lane_passed() {
   local file=".buildkite/pipeline_tests.yml" key outcome passed=true
-  if [[ "${CI_FLEET:-bare}" == "kube" ]]; then
-    file=".buildkite/pipeline_tests_kube.yml"
-  fi
   while IFS= read -r key; do
     outcome=$(buildkite-agent step get outcome --step "${key}" 2>/dev/null || true)
     echo "tests lane ${key}: ${outcome:-no outcome}"
@@ -63,9 +60,9 @@ for tpu in v6e v7x; do
 done
 
 owns_nightly=true
-if [[ "${CI_FLEET:-bare}" == "kube" && "${KUBE_OWNS_NIGHTLY:-0}" != "1" ]]; then
+if [[ "${KUBE_OWNS_NIGHTLY:-0}" != "1" ]]; then
   owns_nightly=false
-  echo "--- Kube does not own the nightly (KUBE_OWNS_NIGHTLY unset): nothing is pushed"
+  echo "--- Not the scheduled nightly (KUBE_OWNS_NIGHTLY unset): nothing is pushed"
 fi
 main_nightly=false
 if [[ "${NIGHTLY:-0}" == "1" && "${BUILDKITE_BRANCH:-}" == "main" ]]; then

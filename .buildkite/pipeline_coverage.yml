@@ -13,15 +13,16 @@
 # limitations under the License.
 
 # Unit-test line-coverage measurement, including engine subprocess coverage
-# (see .coveragerc). Runs the same test selection as CI's unit-test jobs on
-# the 2-chip and 8-chip queues, then combines the data and reports.
+# (see .coveragerc). Runs the same test selection as CI's unit-test jobs on a
+# 1-chip and a 4-chip v7x slice, then combines the data and reports.
 #
 # Uploaded by a dedicated coverage Buildkite pipeline; run on demand.
 #
 # NOTES
 # ─────
-# * Coverage data files must NOT be dotfiles: run_in_docker.sh copies
-#   results out of the container with 'cp -r .../*', which skips dotfiles.
+# * The TPU steps write their data under ARTIFACTS_DIR, which run.sh uploads
+#   from the pod as the step's artifacts. Keep the data files out of dotfile
+#   names: the upload globs '**/*'.
 # * The combine step runs on a cpu agent outside docker; it installs
 #   coverage with pip --user because those agents lack python3-venv.
 
@@ -38,35 +39,43 @@ steps:
     key: cov_2chip
     depends_on: build_docker
     agents:
-      queue: tpu_v7x_2_queue
+      queue: "kube"
+    plugins:
+      - kubernetes:
+          podTemplate: tpu-launcher
     timeout_in_minutes: 330
+    env:
+      SHAPE: "tpu7x-standard-1t/1x1x1"
+      ARTIFACTS_DIR: "perf_eval_results"
     commands:
       - |
-        .buildkite/scripts/run_in_docker.sh bash -c '
+        .buildkite/kubernetes/run.sh bash -c '
           test -f .coveragerc || { echo "[coverage] .coveragerc missing in the image; branch/parallel/subprocess settings would be silently dropped"; exit 1; };
-          COVERAGE_FILE=/perf_eval_results/coverage_2chip.dat \
+          COVERAGE_FILE=perf_eval_results/coverage_2chip.dat \
           python3 -m pytest -q --timeout=1800 -m "not nightly and not multichip" \
             --cov=vllm_torchtpu --cov-report= tests/ || true;
-          ls -la /perf_eval_results/'
-    artifact_paths:
-      - "perf_eval_results/coverage_2chip.dat*"
+          ls -la perf_eval_results/'
 
   - label: "coverage: 8-chip (multichip)"
     key: cov_8chip
     depends_on: build_docker
     agents:
-      queue: tpu_v7x_8_queue
+      queue: "kube"
+    plugins:
+      - kubernetes:
+          podTemplate: tpu-launcher
     timeout_in_minutes: 330
+    env:
+      SHAPE: "tpu7x-standard-4t/2x2x1"
+      ARTIFACTS_DIR: "perf_eval_results"
     commands:
       - |
-        .buildkite/scripts/run_in_docker.sh bash -c '
+        .buildkite/kubernetes/run.sh bash -c '
           test -f .coveragerc || { echo "[coverage] .coveragerc missing in the image; branch/parallel/subprocess settings would be silently dropped"; exit 1; };
-          COVERAGE_FILE=/perf_eval_results/coverage_8chip.dat \
+          COVERAGE_FILE=perf_eval_results/coverage_8chip.dat \
           python3 -m pytest -q --timeout=3600 -m "not nightly and multichip" \
             --cov=vllm_torchtpu --cov-report= tests/ || true;
-          ls -la /perf_eval_results/'
-    artifact_paths:
-      - "perf_eval_results/coverage_8chip.dat*"
+          ls -la perf_eval_results/'
 
   - label: "coverage: combine + report"
     key: cov_combine

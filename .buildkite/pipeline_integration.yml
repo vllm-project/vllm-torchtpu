@@ -1,278 +1,270 @@
-# Copyright 2026 Google LLC
+# The integration suite on the Kueue fleet.
 #
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
+# qwen35-pcp8-dp8-disagg-correctness and qwen35-gpc-correctness run a second
+# role on a second host (ROLE=decode or GPC_ROLE=worker). That is not one command on a Ray head, which is what
+# run_multihost.sh runs by default, so each has a JobSet naming its two roles
+# instead, and run_multihost.sh --manifest submits it.
+
+# Every step here writes its results under this directory and the pod uploads
+# whatever it finds there. Declared once for the pipeline rather than per step:
+# it is a property of this lane, not of any one test.
+env:
+  ARTIFACTS_DIR: "perf_eval_results"
+
+x-kube-plugin: &kube_plugin
+  kubernetes:
+    podTemplate: tpu-launcher
+
+x-integration-step-defaults: &integration_step
+  depends_on:
+    - "build_docker"
+  # Covers queueing as well as running, so it cannot be set from how long the
+  # work takes. The sum of the launcher's two limits, so a step is stopped by
+  # whichever of those it exceeded and not by this.
+  timeout_in_minutes: 1440
+  agents:
+    queue: "kube"
+
+# Eight TensorCores, which is four v7x chips on one host. Machine type names
+# chips, the queue names cores, so the two numbers differ for one shape.
+x-shape-8-core: &shape_8_core "tpu7x-standard-4t/2x2x1"
+x-shape-2-core: &shape_2_core "tpu7x-standard-1t/1x1x1"
 
 steps:
   - group: "Integration Tests on TPU"
-    depends_on: "build_docker"
+    key: "integration_tpu"
     steps:
+      # RUN_ROOT is relative: a pod has no writable /perf_eval_results, and only
+      # what is under ARTIFACTS_DIR is uploaded before the pod is deleted.
       - label: "Integration: qwen35-pcp4-dp4-disagg-correctness"
         key: "integration_qwen35_pcp4_dp4_disagg_correctness"
-        agents:
-          queue: "tpu_v7x_8_queue"
         env:
+          SHAPE: *shape_8_core
           TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
-          RUN_ROOT: "/perf_eval_results/qwen35_pcp4_dp4_disagg_ci"
+          RUN_ROOT: "perf_eval_results/qwen35_pcp4_dp4_disagg_ci"
+        <<: *integration_step
+        plugins:
+          - *kube_plugin
         commands:
-          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_qwen35_p4d2_disagg_correctness.sh"
-        artifact_paths:
-          - "perf_eval_results/**/*"
+          - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_qwen35_p4d2_disagg_correctness.sh
 
+      # The prefill and decode layout (ROLE, PREFILL_*, DECODE_*,
+      # TPU_RAIDEN_DST_SHARDS, VLLM_KV_CACHE_LAYOUT) is the script's own default;
+      # those names do not reach the pod.
       - label: "Integration: qwen35-pcp4tp1-tp4dcp2-disagg-correctness"
         key: "integration_qwen35_pcp4tp1_tp4dcp2_disagg_correctness"
-        agents:
-          queue: "tpu_v7x_8_queue"
         env:
+          SHAPE: *shape_8_core
           TPU_ACCELERATOR_TYPE: "tpu7x"
           TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
-          RUN_ROOT: "/perf_eval_results/qwen35_pcp4tp1_tp4dcp2_disagg_ci"
-          ROLE: "all"
-          PREFILL_PCP: "4"
-          PREFILL_TP: "1"
-          DECODE_TP: "4"
-          DECODE_DCP: "2"
-          DECODE_DP: "1"
-          PREFILL_BLOCK_SIZE: "256"
-          DECODE_BLOCK_SIZE: "256"
-          PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE: "128"
-          TPU_RAIDEN_DST_SHARDS: "4"
-          VLLM_KV_CACHE_LAYOUT: "HND"
+          RUN_ROOT: "perf_eval_results/qwen35_pcp4tp1_tp4dcp2_disagg_ci"
+        <<: *integration_step
+        plugins:
+          - *kube_plugin
         commands:
-          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_qwen35_pcp_tp_dcp_disagg_correctness.sh"
-        artifact_paths:
-          - "perf_eval_results/**/*"
+          - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_qwen35_pcp_tp_dcp_disagg_correctness.sh
 
-      - label: "Integration: qwen35-pcp8-dp8-disagg-correctness"
-        key: "integration_qwen35_pcp8_dp8_disagg_correctness"
-        agents:
-          queue: "tpu_v7x_16_queue"
-        env:
-          TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
-          RUN_ROOT: "/perf_eval_results/qwen35_pcp8_dp8_disagg_ci"
-        commands:
-          - "bash .buildkite/scripts/run_disagg_multihost.sh"
-        artifact_paths:
-          - "perf_eval_results/**/*"
-
+      # PR builds only; a nightly does not run it.
       - label: "Presubmit: disagg-single-host"
         key: "presubmit_disagg_single_host"
         if: "build.pull_request.id != null"
-        agents:
-          queue: "tpu_v7x_8_queue"
+        env:
+          SHAPE: *shape_8_core
+        <<: *integration_step
+        plugins:
+          - *kube_plugin
         commands:
           - >-
-            bash .buildkite/scripts/run_in_docker.sh
+            .buildkite/kubernetes/run.sh
             env
-            -u TPU_USE_RAIDEN_CONNECTOR
-            -u TPU_USE_RAIDEN_KV_CACHE_MANAGER
-            -u TPU_RAIDEN_QWEN35_ADMISSION
             TPU_KV_RESHARD_TRANSPORT=zmq
-            LOG_DIR=/perf_eval_results/disagg_single_host
+            LOG_DIR=perf_eval_results/disagg_single_host
             bash ./examples/disagg/run_disagg_single_host.sh
-
-      - label: "Integration: qwen35-gpc-correctness"
-        key: "integration_qwen35_gpc_correctness"
-        agents:
-          queue: "tpu_v7x_16_queue"
-        commands:
-          - "bash .buildkite/scripts/run_gpc_multihost.sh"
-        artifact_paths:
-          - "perf_eval_results/**/*"
 
       - label: "Integration: qwen35-apc-correctness"
         key: "integration_qwen35_apc_correctness"
-        timeout_in_minutes: 30
-        agents:
-          queue: "tpu_v7x_8_queue"
         env:
-          RUN_ROOT: "/perf_eval_results/qwen35_apc_ci"
+          SHAPE: *shape_8_core
+          RUN_ROOT: "perf_eval_results/qwen35_apc_ci"
+        <<: *integration_step
+        plugins:
+          - *kube_plugin
         commands:
-          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-35B-A3B-FP8/"
-          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_qwen35_apc_correctness.sh"
-        artifact_paths:
-          - "perf_eval_results/**/*"
+          - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_qwen35_apc_correctness.sh
 
       - label: "Integration: qwen35-gpc-global-dram-pool"
         key: "integration_qwen35_gpc_global_dram_pool"
-        agents:
-          queue: "tpu_v7x_8_queue"
         env:
-          RUN_ROOT: "/perf_eval_results/qwen35_gpc_dram_pool_ci"
+          SHAPE: *shape_8_core
+          RUN_ROOT: "perf_eval_results/qwen35_gpc_dram_pool_ci"
+        <<: *integration_step
+        plugins:
+          - *kube_plugin
         commands:
-          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-35B-A3B-FP8/"
-          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_qwen35_gpc_global_dram_pool.sh"
-        artifact_paths:
-          - "perf_eval_results/**/*"
+          - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_qwen35_gpc_global_dram_pool.sh
 
+      # Nightly only: an opt-in layout no default-path test
+      # reaches, behind a P/D boot that dominates the step.
       - label: "Integration: Nightly qwen35-block-major-disagg-offload"
         key: "integration_nightly_qwen35_block_major_disagg_offload"
-        # Nightly only: VLLM_TPU_BLOCK_MAJOR_KV=1 is an opt-in layout that no
-        # default-path test reaches, and the P/D pair's boot dominates the step.
         if: 'build.env("NIGHTLY") == "1"'
-        timeout_in_minutes: 120
-        agents:
-          queue: "tpu_v7x_8_queue"
         env:
+          SHAPE: *shape_8_core
           TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
-          RUN_ROOT: "/perf_eval_results/qwen35_block_major_ci"
+          RUN_ROOT: "perf_eval_results/qwen35_block_major_ci"
+        <<: *integration_step
+        plugins:
+          - *kube_plugin
         commands:
-          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-inference-hf-llm-model-checkpoints/models--Qwen--Qwen3.5-35B-A3B-FP8/"
-          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_qwen35_block_major_disagg_offload.sh"
-        artifact_paths:
-          - "perf_eval_results/**/*"
-
-      - label: "Integration: k3-pruned75-apc-offload-correctness"
-        key: "integration_k3_pruned75_apc_offload_correctness"
-        # Kimi-K3 (hybrid MLA + KDA) prefix caching and host KV offload in one
-        # boot: HBM hits, multi-turn hits, and recall from the Raiden host
-        # store after both a cache reset and a real HBM eviction, each gated on
-        # token equality with the uncached run. ~17 min on a v7x-8 agent: ~13
-        # of GCS weight stream + compile, under 3 of smokes.
-        timeout_in_minutes: 45
-        agents:
-          queue: "tpu_v7x_8_queue"
-        env:
-          TPU_ACCELERATOR_TYPE: "tpu7x"
-          RUN_ROOT: "/perf_eval_results/k3_pruned75_apc_offload_ci"
-          SERVED_MODEL_NAME: "mgoin/Kimi-K3-pruned75"
-        commands:
-          # Not staged with stage_model_snapshot.sh: at ~443 GiB the
-          # checkpoint does not fit a tpu7x-8 agent's disk (see the GLM-5.2
-          # step below). The rig's default MODEL is the gs:// copy of
-          # mgoin/Kimi-K3-pruned75, which it streams with runai_streamer and
-          # --enable-ep-weight-filter.
-          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_k3_pruned75_apc_offload_correctness.sh"
-        artifact_paths:
-          - "perf_eval_results/**/*"
-
-      - label: "Multihost TorchTPU Presubmit (v7x 16-chip)"
-        key: "vllm_torchtpu_multihost_presubmit"
-        agents:
-          queue: "tpu_v7x_16_queue"
-        commands:
-          - |
-            bash .buildkite/scripts/run_multihost.sh \
-              python3 examples/offline_inference.py \
-                --model Qwen/Qwen3-0.6B \
-                --tensor-parallel-size 16 \
-                --max-model-len 256 \
-                --max-num-batched-tokens 256 \
-                --max-tokens 32
-
-      - label: "Integration: Nightly dsv4-offload-correctness"
-        key: "integration_nightly_dsv4_offload_correctness"
-        # Nightly only: a full DSv4 boot is ~27 min of weight load plus compile
-        # before the smoke even starts, which is too much to spend on every PR.
-        # The same boot cost is why the Buildkite default timeout is not enough
-        # headroom here.
-        if: 'build.env("NIGHTLY") == "1"'
-        timeout_in_minutes: 120
-        agents:
-          queue: "tpu_v7x_8_queue"
-        env:
-          TPU_ACCELERATOR_TYPE: "tpu7x"
-          RUN_ROOT: "/perf_eval_results/dsv4_offload_ci"
-        commands:
-          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--deepseek-ai--DeepSeek-V4-Flash/"
-          # MODEL is not on run_in_docker.sh's forwarding list, and the rig
-          # defaults it to a dev-box path; hand it the HF id the staged
-          # snapshot resolves under HF_HOME instead.
-          - >-
-            bash .buildkite/scripts/run_in_docker.sh
-            env MODEL=deepseek-ai/DeepSeek-V4-Flash
-            bash ./scripts/vllm/integration/run_dsv4_offload_correctness.sh
-        artifact_paths:
-          - "perf_eval_results/**/*"
-
-      - label: "Integration: Nightly dsv4-pd-disagg-correctness"
-        key: "integration_nightly_dsv4_pd_disagg_correctness"
-        if: 'build.env("NIGHTLY") == "1"'
-        timeout_in_minutes: 150
-        agents:
-          queue: "tpu_v7x_16_queue"
-        env:
-          TPU_ACCELERATOR_TYPE: "tpu7x"
-          DISAGG_SCRIPT: "./scripts/vllm/integration/run_dsv4_pd_correctness.sh"
-          DISAGG_RUN_ROOT: "/perf_eval_results/dsv4_pd_disagg_ci"
-          # Streamed, not staged: the checkpoint is 149 GiB and v7x-16 agents
-          # have ~30 GB free on the boot disk and nothing attached.
-          MODEL_PATH: "gs://tpu-commons-ci/models--deepseek-ai--DeepSeek-V4-Flash/snapshots/60d8d70770c6776ff598c94bb586a859a38244f1"
-          SERVED_MODEL_NAME: "deepseek-ai/DeepSeek-V4-Flash"
-          TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "0"
-          # DP attention on both sides, so no page is ever striped across ranks.
-          PREFILL_DP: "8"
-          DECODE_DP: "8"
-          TPU_RAIDEN_TRANSFER_PARALLELISM: "1"
-        commands:
-          - "bash .buildkite/scripts/run_disagg_multihost.sh"
-        artifact_paths:
-          - "perf_eval_results/**/*"
-
-      - label: "Integration: Nightly glm52-fp4-offload-correctness"
-        key: "integration_nightly_glm52_fp4_offload_correctness"
-        # Nightly only, like its DSv4 sibling above and for the same reason:
-        # the boot dominates. At ~465 GB the weight load is ~7 min of GCS
-        # streaming and the warmup precompile another ~22, so a PR pays close
-        # to half an hour before a smoke that itself runs in under a minute.
-        #
-        # The explicit timeout stays, and stays larger than that sibling's,
-        # because the Buildkite default does not cover that boot.
-        if: 'build.env("NIGHTLY") == "1"'
-        timeout_in_minutes: 180
-        agents:
-          queue: "tpu_v7x_8_queue"
-        env:
-          TPU_ACCELERATOR_TYPE: "tpu7x"
-          RUN_ROOT: "/perf_eval_results/glm52_fp4_offload_ci"
-          SERVED_MODEL_NAME: "nvidia/GLM-5.2-NVFP4"
-        commands:
-          # Deliberately NOT staged with stage_model_snapshot.sh, and going
-          # back to nightly does not change that: at ~433 GiB the checkpoint
-          # does not fit a tpu7x-8 agent's disk alongside what else lives
-          # there. The staging copy died at 123/174 files with ENOSPC, having
-          # written 304.5 GiB of 432.9 GiB, and the rig never started. A warm
-          # per-agent cache would only hide that on agents that already hold
-          # the snapshot, so the step streams from GCS and stages nothing.
-          #
-          # MODEL is not on run_in_docker.sh's forwarding list, and the rig
-          # defaults it to the HF id, which would download the checkpoint;
-          # hand it the bucket URI. A gs:// MODEL makes the rig serve with
-          # --load-format runai_streamer (runai-model-streamer[gcs] is a
-          # pyproject dependency). The prefix is a plain checkpoint directory
-          # with config.json at its root, not a models--<org>--<name> hub
-          # snapshot, so it needs no snapshots/ subdirectory resolution.
-          #
-          # It is a copy of gs://cloud-devkit/ckpt/hf/nvidia/GLM-5.2-NVFP4,
-          # and the copy is what makes streaming work at all. runai's GCS
-          # backend resolves a prefix through storage.Client.get_bucket()
-          # (runai_model_streamer_gcs/files/files.py), a bucket-metadata GET
-          # needing storage.buckets.get. The agent SA has only object-level
-          # access to cloud-devkit -- enough for the gcloud staging copy that
-          # ENOSPC'd above, not for get_bucket, which 403'd before a single
-          # weight moved. On tpu-commons-ci the same SA is covered by the
-          # bucket's projectEditor/projectViewer legacy bindings, so
-          # get_bucket resolves. Sibling of the GLM-5.2-FP8 prefix already
-          # there.
-          - >-
-            bash .buildkite/scripts/run_in_docker.sh
-            env MODEL=gs://tpu-commons-ci/glm/GLM-5.2-NVFP4
-            bash ./scripts/vllm/integration/run_glm52_fp4_offload_correctness.sh
-        artifact_paths:
-          - "perf_eval_results/**/*"
+          - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_qwen35_block_major_disagg_offload.sh
 
       - label: "Integration: compilation-cache-e2e"
         key: "integration_compilation_cache_e2e"
-        agents:
-          queue: "tpu_v7x_2_queue"
+        env:
+          SHAPE: *shape_2_core
+        <<: *integration_step
+        plugins:
+          - *kube_plugin
         commands:
-          - "bash .buildkite/scripts/run_in_docker.sh bash ./scripts/vllm/integration/run_compilation_cache_e2e.sh"
+          - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_compilation_cache_e2e.sh
+
+      # Nightly only: a full DSv4 boot is ~27 min of weight
+      # load plus compile before the smoke starts.
+      - label: "Integration: Nightly dsv4-offload-correctness"
+        key: "integration_nightly_dsv4_offload_correctness"
+        if: 'build.env("NIGHTLY") == "1"'
+        env:
+          SHAPE: *shape_8_core
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          RUN_ROOT: "perf_eval_results/dsv4_offload_ci"
+        <<: *integration_step
+        plugins:
+          - *kube_plugin
+        commands:
+          # The one step that still stages. Everywhere else the config names
+          # a model HF resolves out of the claim, but this rig defaults MODEL
+          # to a dev-box path and the id that replaces it - DeepSeek-V4-Flash,
+          # undated - is the one in the bucket, not the dated one the perf lane
+          # pulls from HF. Until that id is known published, the bucket is
+          # where this model comes from.
+          - >-
+            .buildkite/kubernetes/run.sh bash -c
+            'bash .buildkite/scripts/stage_model_snapshot.sh
+            gs://tpu-commons-ci/models--deepseek-ai--DeepSeek-V4-Flash/
+            /cache/hf/hub
+            && MODEL=deepseek-ai/DeepSeek-V4-Flash
+            bash ./scripts/vllm/integration/run_dsv4_offload_correctness.sh'
+
+      # Nightly only, like its DSv4 sibling and for the same reason: the boot
+      # dominates. Streams from GCS and stages nothing - at ~433 GiB the
+      # checkpoint does not fit an agent's disk, and a gs:// MODEL makes the rig
+      # serve with --load-format runai_streamer.
+      #
+      # runai's GCS backend resolves the prefix through get_bucket(), which
+      # needs storage.buckets.get rather than object access, so the tpu-workload
+      # service account the pod runs as needs bucket metadata read on the bucket.
+      - label: "Integration: Nightly glm52-fp4-offload-correctness"
+        key: "integration_nightly_glm52_fp4_offload_correctness"
+        if: 'build.env("NIGHTLY") == "1"'
+        env:
+          SHAPE: *shape_8_core
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          RUN_ROOT: "perf_eval_results/glm52_fp4_offload_ci"
+          SERVED_MODEL_NAME: "nvidia/GLM-5.2-NVFP4"
+        <<: *integration_step
+        plugins:
+          - *kube_plugin
+        commands:
+          - >-
+            .buildkite/kubernetes/run.sh
+            env MODEL=gs://tpu-commons-ci/glm/GLM-5.2-NVFP4
+            bash ./scripts/vllm/integration/run_glm52_fp4_offload_correctness.sh
+
+      # Kimi-K3 (hybrid MLA + KDA) prefix caching and host KV offload in one
+      # boot. Not staged: the rig's default MODEL is the gs:// copy, streamed
+      # with runai_streamer, since ~443 GiB does not fit an agent's disk.
+      - label: "Integration: k3-pruned75-apc-offload-correctness"
+        key: "integration_k3_pruned75_apc_offload_correctness"
+        env:
+          SHAPE: *shape_8_core
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+          RUN_ROOT: "perf_eval_results/k3_pruned75_apc_offload_ci"
+          SERVED_MODEL_NAME: "mgoin/Kimi-K3-pruned75"
+        <<: *integration_step
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_k3_pruned75_apc_offload_correctness.sh
+
+  # A two-host slice, so it goes through run_multihost.sh and the JobSet in
+  # manifests/. Kueue holds it until a 2x2x2 slice is free, so it starts with
+  # the rest of the lane.
+  #
+  # This is the only step in either integration lane that exercises the fleet's
+  # 2x2x2 profile, which has held zero chip-hours since the fleet was built.
+  - label: "Multihost TorchTPU Presubmit (v7x 16-chip)"
+    key: "vllm_torchtpu_multihost_presubmit"
+    depends_on:
+      - "build_docker"
+    timeout_in_minutes: 1440
+    agents:
+      queue: "kube"
+    plugins:
+      - *kube_plugin
+    commands:
+      - >-
+        .buildkite/kubernetes/run_multihost.sh --topology 2x2x2
+        python3 examples/offline_inference.py
+        --model Qwen/Qwen3-0.6B
+        --tensor-parallel-size 16
+        --max-model-len 256
+        --max-num-batched-tokens 256
+        --max-tokens 32
+
+  # The role-per-host tests. Each holds two hosts - two engines of eight
+  # devices, which is one whole tpu7x-standard-4t each - and like the multihost
+  # step above they start with the rest of the lane: eight chips apiece, which
+  # Kueue holds them for. The step timeout covers that wait, and the launcher's
+  # limits run to hours.
+  #
+  # None uploads artifacts. The pod is deleted when the run ends and these
+  # submit a manifest rather than going through run.sh's upload wrapper, so the
+  # logs are the record - as for the multihost step above.
+  - label: "Integration: qwen35-pcp8-dp8-disagg-correctness"
+    key: "integration_qwen35_pcp8_dp8_disagg_correctness"
+    depends_on:
+      - "build_docker"
+    timeout_in_minutes: 1440
+    agents:
+      queue: "kube"
+    plugins:
+      - *kube_plugin
+    commands:
+      - .buildkite/kubernetes/run_multihost.sh --manifest qwen3.5-p8d8-disagg.yaml
+
+  - label: "Integration: qwen35-gpc-correctness"
+    key: "integration_qwen35_gpc_correctness"
+    depends_on:
+      - "build_docker"
+    timeout_in_minutes: 1440
+    agents:
+      queue: "kube"
+    plugins:
+      - *kube_plugin
+    commands:
+      - .buildkite/kubernetes/run_multihost.sh --manifest qwen3.5-gpc-two-replica.yaml
+
+  # Nightly only: a DSv4 boot is ~27 min of weight streaming
+  # and compile before the probes start.
+  - label: "Integration: Nightly dsv4-pd-disagg-correctness"
+    key: "integration_nightly_dsv4_pd_disagg_correctness"
+    if: 'build.env("NIGHTLY") == "1"'
+    depends_on:
+      - "build_docker"
+    timeout_in_minutes: 1440
+    agents:
+      queue: "kube"
+    plugins:
+      - *kube_plugin
+    commands:
+      - .buildkite/kubernetes/run_multihost.sh --manifest dsv4-pd-disagg.yaml
