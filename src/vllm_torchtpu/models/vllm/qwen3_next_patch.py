@@ -169,10 +169,15 @@ def _select_gate_q_tile(rows: int, cols: int) -> int:
     overhead at T=8192 without spilling VREGs.
     """
     vreg_cap = _select_gate_q_vreg_step(cols)
+    # Two bf16 inputs and one fp8 output, double buffered: 10 bytes per
+    # element of the tile. 16 MiB keeps the unsharded width (TP1 under
+    # pipeline parallelism, 8192 columns) inside the scoped VMEM limit;
+    # widths of 2048 columns or less are unaffected.
+    budget_cap = max(32, ((16 << 20) // (10 * cols)) // 32 * 32)
     if rows <= 256:
         dma_cap = max(32, (rows // 6 // 32) * 32)
-        return min(vreg_cap, dma_cap)
-    return max(vreg_cap, 512)
+        return min(vreg_cap, dma_cap, budget_cap)
+    return min(max(vreg_cap, 512), budget_cap)
 
 
 def _sigmoid_gate_quant_kernel(attn_ref, gate_ref, q_ref, s_ref, *, step_m: int):
