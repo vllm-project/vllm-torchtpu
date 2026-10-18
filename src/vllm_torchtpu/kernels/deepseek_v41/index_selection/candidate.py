@@ -602,6 +602,7 @@ def candidate_indexer(
             width,
             k,
             keys.dtype == jnp.int32,
+            halfplane=halfplane,
         )
     if request_tile is None:
         request_tile = tuned_block_sizes.get_candidate_request_tile(
@@ -614,6 +615,7 @@ def candidate_indexer(
                 key_tile,
                 k,
                 keys.dtype == jnp.int32,
+                halfplane=halfplane and keys.dtype == jnp.int32,
             )
         )
     if request_tile < 1 or requests % request_tile:

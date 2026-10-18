@@ -111,7 +111,7 @@ def test_candidate_default_groups_bound_scores_without_splitting_requests(
 
 @pytest.mark.cpu_test
 def test_candidate_exact_tuning_precedes_default(monkeypatch):
-    lookup = ("TPU7x", (24, 6, 32, 128), 49152, 512, False)
+    lookup = ("TPU7x", (24, 6, 32, 128), 49152, 512, False, False)
     monkeypatch.setitem(tuning.CANDIDATE_KEY_TILES, lookup, 4096)
     assert tuning.get_candidate_key_tile(*lookup) == 4096
     request_key = tuning.CandidateTuningKey("TPU7x", 24, 6, 32, 49152, 4096, 512)
@@ -184,3 +184,65 @@ def test_candidate_indexer_default_dispatch_uses_measured_tiles(
     )
     assert result.shape == (requests * 6, 512)
     assert calls and all(call == (request_tile, expected) for call in calls)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "halfplane,expected_key,expected_request", [(False, 4096, 16), (True, 8192, 48)]
+)
+def test_packed_candidate_tuning_distinguishes_halfplane(
+    monkeypatch, halfplane, expected_key, expected_request
+):
+    monkeypatch.setattr(tuning, "logger", Mock())
+    tile = tuning.get_candidate_key_tile(
+        "TPU7x", (48, 6, 32, 128), 49152, 512, True, halfplane=halfplane
+    )
+    lookup = tuning.CandidateTuningKey(
+        "TPU7x", 48, 6, 32, 49152, tile, 512, True, halfplane=halfplane
+    )
+    assert tile == expected_key
+    assert tuning.get_candidate_request_tile(lookup) == expected_request
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "halfplane,expected_key,expected_request", [(False, 4096, 16), (True, 8192, 48)]
+)
+def test_packed_candidate_default_dispatch_preserves_measured_group(
+    monkeypatch, halfplane, expected_key, expected_request
+):
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection import candidate
+
+    calls = []
+    monkeypatch.setattr(tuning, "logger", Mock())
+    monkeypatch.setattr(jax, "devices", lambda: [Mock(device_kind="TPU7x")])
+
+    def score(
+        q, weights, keys, ids, membership, lengths, *, block_size, key_tile, halfplane
+    ):
+        assert keys.dtype == jnp.int32
+        calls.append((q.shape[0], key_tile))
+        return jnp.zeros((*q.shape[:2], ids.shape[1] * block_size), jnp.float32)
+
+    monkeypatch.setattr(candidate, "candidate_scores", score)
+    monkeypatch.setattr(
+        candidate.decode,
+        "_select",
+        lambda scores, lengths, k, *args: jnp.zeros((scores.shape[0], k), jnp.int32),
+    )
+    inputs = (
+        jax.ShapeDtypeStruct((48, 6, 32, 128), jnp.bfloat16),
+        jax.ShapeDtypeStruct((48, 6, 32), jnp.float32),
+        jax.ShapeDtypeStruct((48, 24576, 128), jnp.int32),
+        jax.ShapeDtypeStruct((48, 6144), jnp.int32),
+        jax.ShapeDtypeStruct((48, 6144), jnp.int32),
+        jax.ShapeDtypeStruct((48, 6), jnp.int32),
+    )
+    result = jax.eval_shape(
+        lambda *args: candidate.candidate_indexer(
+            *args, block_size=8, halfplane=halfplane
+        ),
+        *inputs,
+    )
+    assert result.shape == (288, 512)
+    assert calls and all(x == (expected_request, expected_key) for x in calls)

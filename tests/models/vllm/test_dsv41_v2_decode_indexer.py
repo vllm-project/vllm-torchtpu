@@ -976,8 +976,21 @@ def test_candidate_envelope_keeps_token_rows_dynamic():
 
 
 @pytest.mark.cpu_test
-def test_candidate_cache_reuses_only_within_stage_and_source_version(monkeypatch):
+@pytest.mark.parametrize(
+    "groups,width,layout,packed",
+    [
+        (2, 98304, "ordinary", False),
+        (48, 98816, "halfplane", True),
+        (48, 98816, "ordinary", False),
+        (24, 98816, "halfplane", False),
+        (48, 98304, "halfplane", False),
+    ],
+)
+def test_candidate_cache_reuses_only_within_stage_and_source_version(
+    monkeypatch, groups, width, layout, packed
+):
     """Four reindexes share keys; publication, source and new stage invalidate."""
+    count = groups * 6
     attn = TestAttentionSelectPagedIndicesDecode()._setup_mock_attn(
         monkeypatch, ranks=1
     )
@@ -985,20 +998,23 @@ def test_candidate_cache_reuses_only_within_stage_and_source_version(monkeypatch
     attn.compress_ratio = 1
     attn.candidate_block_size = 8
     attn.candidate_source_layer = 20
-    attn.candidate_block_buffer = torch.zeros((12, 2048), dtype=torch.int32)
+    attn.candidate_block_buffer = torch.zeros((count, 2048), dtype=torch.int32)
     attn.indexer.k_cache = SimpleNamespace(prefix="source-a")
-    cache = SimpleNamespace(raw=torch.zeros((128, 128), dtype=torch.int32))
-    q = torch.zeros((12, 32, 128), dtype=torch.bfloat16)
-    positions = torch.arange(12, dtype=torch.int32)
-    records = torch.arange(2 * 98304, dtype=torch.int32).reshape(2, -1)
-    requests = torch.arange(2, dtype=torch.int32).repeat_interleave(6)
-    weights = torch.ones((12, 32))
-    lengths = torch.full((12, 1), 98304, dtype=torch.int32)
-    slots = torch.arange(12, dtype=torch.int32)
+    cache = SimpleNamespace(
+        raw=torch.zeros((128, 128), dtype=torch.int32), index_key_layout=layout
+    )
+    q = torch.zeros((count, 32, 128), dtype=torch.bfloat16)
+    positions = torch.arange(count, dtype=torch.int32)
+    records = torch.arange(groups * width, dtype=torch.int32).reshape(groups, -1)
+    requests = torch.arange(groups, dtype=torch.int32).repeat_interleave(6)
+    weights = torch.ones((count, 32))
+    lengths = torch.full((count, 1), width, dtype=torch.int32)
+    swa_valid = torch.ones(count, dtype=torch.bool)
     prepared = []
     used = []
 
     def prepare(cache, records, candidates, requests, lengths, **kwargs):
+        assert kwargs["packed"] is packed
         result = object()
         prepared.append((result, requests.clone()))
         return result
@@ -1016,10 +1032,10 @@ def test_candidate_cache_reuses_only_within_stage_and_source_version(monkeypatch
         **kwargs,
     ):
         used.append(prepared)
-        return torch.zeros((12, 512), dtype=torch.int32)
+        return torch.zeros((count, 512), dtype=torch.int32)
 
     def old(q, cache, records, weights, lengths, candidates, *args, **kwargs):
-        return cache.raw, torch.zeros((12, 512), dtype=torch.int32), candidates + 1
+        return cache.raw, torch.zeros((count, 512), dtype=torch.int32), candidates + 1
 
     monkeypatch.setattr(v2_attn, "_index_page_records", lambda cache: 128)
     monkeypatch.setattr(v2_attn, "prepare_candidate_cache", prepare)
@@ -1028,7 +1044,7 @@ def test_candidate_cache_reuses_only_within_stage_and_source_version(monkeypatch
 
     def run(mapping):
         return attn._select_paged_indices(
-            q, positions, cache, records, mapping, weights, lengths, slots, None
+            q, positions, cache, records, mapping, weights, lengths, swa_valid, None
         )
 
     with v2_attn.stage_attention_cache_scope():

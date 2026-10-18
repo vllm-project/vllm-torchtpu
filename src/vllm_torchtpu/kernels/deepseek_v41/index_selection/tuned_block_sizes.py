@@ -70,6 +70,7 @@ class CandidateTuningKey:
     key_tile: int
     k: int
     packed: bool = False
+    halfplane: bool = False
 
 
 # Native two-bank preparation, BF16 reusable union, seeds 824/825, JAX 0.10.2
@@ -79,12 +80,15 @@ CANDIDATE_REQUEST_TILES: dict[CandidateTuningKey, int] = {
     # Captured C384 candidates, synthetic Q/weights/pages, seeds 825/826.
     CandidateTuningKey("TPU7x", 48, 6, 32, 49152, 4096, 512): 48,
     CandidateTuningKey("TPU7x", 48, 6, 32, 49152, 8192, 512): 48,
+    CandidateTuningKey("TPU7x", 48, 6, 32, 49152, 8192, 512, True, True): 48,
 }
 # JAX 0.10.2 / libtpu 0.0.47, seeds 825/826 plus tied scores: preparation
 # and four serial reindexes improve 5.8-7.1% with key/request tiles 8192/48.
 # Key: device, request-major Q shape, union capacity, top-k, packed keys.
-CANDIDATE_KEY_TILES: dict[tuple[str, tuple[int, ...], int, int, bool], int] = {
-    ("TPU7x", (48, 6, 32, 128), 49152, 512, False): 8192,
+CANDIDATE_KEY_TILES: dict[tuple[str, tuple[int, ...], int, int, bool, bool], int] = {
+    ("TPU7x", (48, 6, 32, 128), 49152, 512, False, False): 8192,
+    # Halfplane prepare + four consumers, captured candidate IDs, synthetic Q/K.
+    ("TPU7x", (48, 6, 32, 128), 49152, 512, True, True): 8192,
 }
 # 40K overflowed in 12/48 profiled rank-steps. The 48K bucket covers the
 # captured maximum of 5138 blocks with headroom, at 576 MiB per 48 requests.
@@ -103,11 +107,12 @@ def get_candidate_key_tile(
     capacity: int,
     k: int,
     packed: bool,
+    halfplane: bool = False,
 ) -> int:
     """Prefer measured tiles, then use an aligned default for related workloads."""
     if capacity < 1:
         raise ValueError("candidate capacity must be positive")
-    key = (device_kind, query_shape, capacity, k, packed)
+    key = (device_kind, query_shape, capacity, k, packed, packed and halfplane)
     tile = CANDIDATE_KEY_TILES.get(key)
     if tile is None:
         related = (

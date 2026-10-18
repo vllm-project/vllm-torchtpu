@@ -256,3 +256,94 @@ def test_halfplane_writer_normalizes_long_slots_at_jax_boundary(
     if two_banks:
         assert observed[1] == [-1, -1, -1, -1, 0, 7]
     assert len(observed) == (2 if two_banks else 1)
+
+
+@pytest.mark.parametrize("rows", [384, 2048])
+def test_packed_candidate_fake_shape_and_non_q6_fallback(monkeypatch, rows):
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+    from jax.sharding import Mesh
+
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import (
+        attention_kernels,
+        candidate_cache,
+    )
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        set_vllm_model_wrapper_context,
+    )
+
+    mesh = Mesh(np.asarray(jax.devices("cpu")[:1]), ("registration",))
+    with set_vllm_model_wrapper_context(mesh=mesh):
+        candidate_cache.initialize_candidate_cache()
+    pool = torch.empty((128, 128), dtype=torch.int32, device="meta")
+    records = torch.empty((48, 98816), dtype=torch.int32, device="meta")
+    candidates = torch.empty((rows, 2048), dtype=torch.int32, device="meta")
+    requests = torch.empty((rows,), dtype=torch.int32, device="meta")
+    assert candidate_cache._prepare_2bank_op is not None
+    fake = candidate_cache._prepare_2bank_op(
+        pool, pool, records, candidates, requests, requests, 8, 49152, True, True
+    )
+    assert fake[0].shape == (48, 24576, 128)
+    assert fake[0].dtype == torch.int32
+
+    def shape(tensor):
+        return jax.ShapeDtypeStruct(tuple(tensor.shape), jnp.int32)
+
+    inputs = (
+        (shape(pool), shape(pool)),
+        shape(records),
+        shape(candidates),
+        shape(requests),
+        shape(requests),
+    )
+    prepared = jax.eval_shape(
+        lambda *args: candidate_cache.prepare_candidate_cache_jax(
+            *args, 8, 49152, True, halfplane=True
+        ),
+        *inputs,
+    )
+    assert prepared[0].shape == tuple(fake[0].shape)
+    assert prepared[0].dtype == jnp.int32
+    calls = []
+
+    def fallback(q, *args, **kwargs):
+        calls.append(q.shape[0])
+        return jnp.full((q.shape[0], 512), -1, jnp.int32), args[4]
+
+    def cached(*args, **kwargs):
+        raise AssertionError("Non-Q6 compilation buckets must retain the fallback")
+
+    monkeypatch.setattr(attention_kernels, "paged_indexer_jax", fallback)
+    monkeypatch.setattr(candidate_cache.candidate, "candidate_indexer", cached)
+    selected = jax.eval_shape(
+        lambda q,
+        weights,
+        keys,
+        ids,
+        membership,
+        usable: candidate_cache.select_candidate_cache_jax(
+            q,
+            (jnp.zeros((128, 128), jnp.int32),) * 2,
+            jnp.zeros((48, 98816), jnp.int32),
+            weights,
+            jnp.zeros((rows,), jnp.int32),
+            jnp.zeros((rows, 2048), jnp.int32),
+            jnp.zeros((rows,), jnp.int32),
+            jnp.zeros((1,), jnp.int32),
+            keys,
+            ids,
+            membership,
+            usable,
+            8,
+            128,
+            None,
+            halfplane=True,
+        ),
+        jax.ShapeDtypeStruct((rows, 32, 128), jnp.bfloat16),
+        jax.ShapeDtypeStruct((rows, 32), jnp.float32),
+        *prepared[:3],
+        prepared[4],
+    )
+    assert selected.shape == (rows, 512)
+    assert calls == [rows]
