@@ -38,6 +38,8 @@ import sympy
 import torch
 import vllm
 from torch import fx, nn
+from torch._dynamo.source import LocalSource, TensorProperty, TensorPropertySource
+from torch.fx.experimental.symbolic_shapes import DimDynamic, ShapeEnv
 from torch.utils._sympy.value_ranges import ValueRanges
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import (
@@ -838,3 +840,54 @@ def test_signature_delta_ignores_order():
     assert shape_variants._signature_delta(a, a[::-1]) == (
         "2 inputs vs 2. Only in the earlier trace: nothing. Only in this one: nothing"
     )
+
+
+def _token_symint(shape_env, source, hint=4):
+    symbol = shape_env.create_symbol(hint, source, dynamic_dim=DimDynamic.DYNAMIC)
+    return shape_env.create_symintnode(symbol, hint=hint, source=source)
+
+
+def _int_graph(order, metas, sources=()):
+    """A GraphModule with the given placeholders, int ones among them;
+    ``sources`` maps a name to the Dynamo source it was read from."""
+    graph = fx.Graph()
+    for name in order:
+        node = graph.placeholder(name)
+        node.meta["val"] = metas[name]
+        if name in sources:
+            node.meta["grapharg"] = SimpleNamespace(source=sources[name])
+    graph.output(tuple(graph.nodes))
+    return fx.GraphModule(nn.Module(), graph)
+
+
+POSITIONS_SIZE = TensorPropertySource(LocalSource("positions"), TensorProperty.SIZE, 0)
+HIDDEN_SIZE = TensorPropertySource(LocalSource("hidden"), TensorProperty.SIZE, 0)
+
+
+def _int_metas():
+    env = ShapeEnv()
+    return {
+        "s_pos": _token_symint(env, POSITIONS_SIZE),
+        "s_hid": _token_symint(env, HIDDEN_SIZE),
+        "hidden": torch.empty(4, HIDDEN, dtype=torch.bfloat16),
+        "weight": torch.empty(HIDDEN, 2, dtype=torch.bfloat16),
+    }
+
+
+def test_input_delta_names_the_int_input_one_trace_dropped():
+    metas = _int_metas()
+    sources = {"s_pos": POSITIONS_SIZE, "s_hid": HIDDEN_SIZE}
+    stored = _int_graph(["s_pos", "s_hid", "hidden", "weight"], metas, sources)
+    current = _int_graph(["s_pos", "hidden", "weight"], metas, sources)
+    session = shape_variants.BucketExecutables()
+    session.put("dir", "key", stored, lambda *a: a)
+
+    with pytest.raises(shape_variants.ShapeSpecializationError) as info:
+        session.get("dir", "key", current)
+
+    message = str(info.value)
+    assert "4 inputs vs 3" in message
+    assert "Named, earlier trace: s_hid SymInt" in message
+    assert "from L['hidden'].size()[0]" in message
+    assert "in this trace" in message  # what the current ShapeEnv knows of it
+    assert "s_pos" not in message.split("Named")[1]  # both traces take it
