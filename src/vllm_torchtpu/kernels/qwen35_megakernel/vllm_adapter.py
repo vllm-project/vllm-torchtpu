@@ -63,12 +63,14 @@ import torch.nn.functional as F
 from jax.sharding import PartitionSpec as P
 
 from vllm.forward_context import get_forward_context
+from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.sharded_jax_op import sharded_jax_callable
 from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
 from vllm_torchtpu.logger import init_logger
 
 from . import megakernel as K
 from . import pool_io
+from .config import WIDE_MAX_ROWS
 
 logger = init_logger(__name__)
 
@@ -321,6 +323,20 @@ def parse_mk_fused_pool_io_min_b_hi(env_val: str | None = None) -> int:
         else os.environ.get("VLLM_TPU_QWEN35_MK_FUSED_POOL_IO_MIN_B_HI", "56")
     )
     return int(raw.strip())
+
+
+def parse_mk_wide_mb(env_val: str | None = None) -> int:
+    """`VLLM_TPU_QWEN35_MK_WIDE_MB` (default 0 = off): rows per microbatch of the wide step.
+    Set (32 is the value with device parity against the per-microbatch calls), a verify bucket
+    of 80 < B <= WIDE_MAX_ROWS rows runs as one kernel call whose MoE phase streams each hit
+    expert once for all rows (`MKConfig.mb_rows`); wider buckets keep the split plan of 80-row
+    calls."""
+    if env_val is None:
+        v = envs.VLLM_TPU_QWEN35_MK_WIDE_MB
+    else:
+        v = int(env_val.strip() or "0")
+    _need(v == 0 or (16 <= v <= 80 and v % 4 == 0), f"VLLM_TPU_QWEN35_MK_WIDE_MB={v}")
+    return v
 
 
 def parse_mk_zero_copy(env_val: str | None = None) -> bool:
@@ -1764,6 +1780,7 @@ class Qwen35Megakernel:
         )
         self.fused_pool_io_max_b = parse_mk_fused_pool_io_max_b()
         self.fused_pool_io_min_b_hi = parse_mk_fused_pool_io_min_b_hi()
+        self.wide_mb = parse_mk_wide_mb()
         self._hlo_checked = False
         self.zero_copy = parse_mk_zero_copy() if zero_copy is None else bool(zero_copy)
         self._runner_ref: Any = runner
@@ -2107,10 +2124,17 @@ class Qwen35Megakernel:
                 self._merge_steps.clear()
         single_keys = [(T, b) for T, b in keys if b <= _MAX_SINGLE_KERNEL_B]
         split_keys = [(T, b) for T, b in keys if b > _MAX_SINGLE_KERNEL_B]
-        for T, b in single_keys:
+        # wide step: one call over all rows up to WIDE_MAX_ROWS (only verify buckets, T > 1)
+        wide_keys = [
+            (T, b) for T, b in split_keys
+            if self.wide_mb and T > 1 and b <= WIDE_MAX_ROWS and b % self.wide_mb % T == 0
+        ]
+        split_keys = [k for k in split_keys if k not in wide_keys]
+        for T, b in single_keys + wide_keys:
             m_rows = max(16, K.rup(b, 16))
             out_rows = self._runner_out_rows(b, m_rows)
-            step = self._build_bucket_op(b, tokens_per_seq=T, out_pad_rows=out_rows)
+            wide_kw = {"mb_rows": self.wide_mb} if (T, b) in wide_keys else {}
+            step = self._build_bucket_op(b, tokens_per_seq=T, out_pad_rows=out_rows, **wide_kw)
             self._bucket_steps[(T, b)] = step
             if T == 1:
                 self._bucket_steps[b] = step
@@ -2255,22 +2279,27 @@ class Qwen35Megakernel:
         bucket_t: int,
         tokens_per_seq: int = 1,
         out_pad_rows: int | None = None,
+        mb_rows: int = 0,
     ) -> Any:
-        """Build the `sharded_jax_callable` custom op and fused `torch.compile` step for `(tokens_per_seq, bucket_t)`."""
+        """Build the `sharded_jax_callable` custom op and fused `torch.compile` step for
+        `(tokens_per_seq, bucket_t)`. mb_rows > 0: the wide step (microbatches of mb_rows rows
+        inside the kernel, fused pool I/O required)."""
         bucket_fused = bool(
-            self.fused_pool_io and self._bucket_is_fused(bucket_t)
+            mb_rows or (self.fused_pool_io and self._bucket_is_fused(bucket_t))
         )
         c = dataclasses.replace(
-            self.base_cfg, B=bucket_t, T=tokens_per_seq, fused_pool_io=bucket_fused
+            self.base_cfg, B=bucket_t, T=tokens_per_seq, fused_pool_io=bucket_fused,
+            mb_rows=mb_rows,
         )
         tiles = K.default_tiles(c)
         tiles = apply_mk_tile_env_overrides(tiles, bucket_t)
         logger.info(
-            "Qwen3.5 megakernel: building bucket (T=%d, B=%d) pool_io=%s nbe=%d nbd=%d "
+            "Qwen3.5 megakernel: building bucket (T=%d, B=%d) pool_io=%s microbatches=%d nbe=%d nbd=%d "
             "hier=%d amask=%d ecopy_opt=%d r2_direct=%s route_vec=%s dense_acc_pair=%s",
             tokens_per_seq,
             bucket_t,
             "fused" if bucket_fused else "3stage",
+            c.n_mb,
             tiles.nbe,
             tiles.nbd,
             tiles.hier,
@@ -2345,6 +2374,8 @@ class Qwen35Megakernel:
         # Distinct op / trace names per pool-I/O mode so the two kernels never
         # share a compilation-cache key.
         io_tag = "" if bucket_fused else "_3stage"
+        if mb_rows:
+            io_tag += f"_w{mb_rows}"
         fn_name = f"qwen35_mk_step_t{tokens_per_seq}_b{bucket_t}_{self.mode}{io_tag}"
         src = (
             f"def {fn_name}({', '.join(a + ': jax.Array' for a in args)}) -> {ret}:\n"

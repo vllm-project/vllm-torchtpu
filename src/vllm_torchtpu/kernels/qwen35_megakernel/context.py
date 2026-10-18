@@ -67,6 +67,7 @@ from .config import (
     U8,
     U32,
     W_NAMES,
+    WIDE_CAP,
     default_tiles,
     kernel_out_shapes,
     plan,
@@ -75,6 +76,26 @@ from .config import (
     smalls_layout,
     weight_shapes,
 )
+
+
+# Wide step (A2) MoE phase switches. WIDE_DYN_ROW: expert e's routing-weight row by a dynamic
+# sublane load of wnT_all (else a select-reduce over its rows). WIDE_SCATTER_TN: the one-hot
+# scatter-add as a transposed-LHS dot_general (else an explicit transpose then a plain matmul).
+WIDE_DYN_ROW = True
+WIDE_SCATTER_TN = True
+# All-reduce buffer slots of a wide step: 2 keeps the mixer (slot 0) and MoE (slot 1) payload
+# buffers apart as in the single-microbatch kernel; 1 shares them (every all-reduce waits for the
+# previous one's sends before rewriting them, and the cross-chip round couples all peers, so a
+# peer cannot start the next all-reduce before this one's payload was read).
+WIDE_AR_SLOTS = 1
+# GatedDeltaNet input-state prefetch slots of a wide step's microbatch, and whether the routed
+# expert tile reuses the idle microbatch buffers xb / xb2 / acc (else its own scratch).
+WIDE_NGI = 1
+WIDE_TILE_REUSE = True
+# Bisect switch: False runs the expert loop but drops its output (part_all keeps the shared
+# expert only), so a parity against the no-experts kernel shows whether the loop itself disturbs
+# later phases.
+WIDE_SCATTER = True
 
 
 class MKBuildContext:
@@ -99,8 +120,17 @@ class MKBuildContext:
         c.check()
         assert set(skip) <= set(ABLATIONS), skip
         tiles = default_tiles(c) if tiles is None else tiles
+        # Wide step: the geometry below is the microbatch's; c_wide keeps the whole step's row
+        # count for the operand shapes and the all-rows MoE buffers.
+        c_wide = c
+        c = c.microbatch()
+        c.check()
+        N_MB = c_wide.n_mb
+        BW = N_MB * c.B  # rows of the wide step, the tail microbatch padded
+        WIDE_MB = c_wide.wide
 
         self.c = c
+        self.c_wide = c_wide
         self.tiles = tiles
         self.interpret = interpret
         self.forced_routing = forced_routing
@@ -143,6 +173,14 @@ class MKBuildContext:
         p = plan(c, tiles)
         tk, nt, kinds = p["tk"], p["nt"], p["kinds"]
         t_gdn, t_att, t_block = p["t_gdn"], p["t_att"], p["t_block"]
+        # dense tiles of one microbatch's mixer (input and output projections); a wide step
+        # streams them once per microbatch and the MoE dense tiles once per layer
+        MB_GDN = nt["lin_in"] + nt["lin_out"]
+        MB_ATT = nt["att_in"] + nt["att_out"]
+        if WIDE_MB:
+            t_gdn = N_MB * MB_GDN + (t_gdn - MB_GDN)
+            t_att = N_MB * MB_ATT + (t_att - MB_ATT)
+            t_block = (AE - 1) * t_gdn + t_att
         T_TOTAL = (L // AE) * t_block
         lay, S = smalls_layout(c)
         NBD, NBE = tiles.nbd, tiles.nbe
@@ -227,6 +265,11 @@ class MKBuildContext:
         assert not GPR or GCONV_ROWS <= 64, GCONV_ROWS
         NGI = min(NS, 1 if B > 96 else (2 if B > 80 else (4 if B > 64 else 8)))
         NGO = min(NS, 1 if B > 64 else 2)
+        if WIDE_MB:  # the microbatch buffers share VMEM with the all-rows MoE buffers
+            NGI, NGO = min(NS, WIDE_NGI), 1
+            # the mixer blocks take a whole input projection from the ring at once (GDEF, ZDEF
+            # and the dtake_group paths), so a tile's bank must not be reused before that
+            assert NBD >= max(nt["att_in"], nt["lin_in"]), (NBD, nt["att_in"], nt["lin_in"])
         G_PER_ATT = max(1, AE - 1)
         qkv_128 = QKV // 128
         A_conv = 16
@@ -298,7 +341,10 @@ class MKBuildContext:
             if ARPIPE
             else []
         )
-        ARP = bool(ARPIPE and R > 1 and "ar" not in skip and "dense" not in skip)
+        ARP = bool(ARPIPE and R > 1 and "ar" not in skip and "dense" not in skip
+                   and not WIDE_MB)
+        NSL = WIDE_AR_SLOTS if WIDE_MB else 2  # all-reduce payload buffer slots
+        assert NSL in (1, 2) and (NSL == 2 or not ARP)
         LCV_NH = 3 * qkv_128
         LCV_NH16 = -(-LCV_NH // 16) * 16
         LCV = bool(
@@ -348,15 +394,15 @@ class MKBuildContext:
             "part": pltpu.VMEM((MB, H), F32),
             "mix": pltpu.VMEM((MB, NMIX), F32),
             # all-reduce [slot, ...]; rsag: lane chunks [slot, rank, AR_R, CW]
-            "send": pltpu.VMEM((N_HIER3, 2, AR_R, AR_C) if HIER == 3 else
-                               (2, 2, AR_R, HC2) if HIER == 2 else
-                               (2, R, AR_R, CW) if RSAG else (2, AR_R, AR_C), BF16),
-            "recv": pltpu.VMEM((N_HIER3, 2, 2, AR_R, AR_C) if HIER == 3 else
-                               (2, 2, AR_R, HC2) if HIER == 2 else
-                               (2, 2, AR_R, AR_C) if HIER == 1 else
-                               (2, R, AR_R, CW) if RSAG else (2, R, AR_R, AR_C), BF16),
-            "ar_ssem": pltpu.SemaphoreType.DMA((len(AR_ROUNDS), 2, AR_PEERS)),
-            "ar_rsem": pltpu.SemaphoreType.DMA((len(AR_ROUNDS), 2, AR_PEERS)),
+            "send": pltpu.VMEM((N_HIER3, NSL, AR_R, AR_C) if HIER == 3 else
+                               (NSL, 2, AR_R, HC2) if HIER == 2 else
+                               (NSL, R, AR_R, CW) if RSAG else (NSL, AR_R, AR_C), BF16),
+            "recv": pltpu.VMEM((N_HIER3, NSL, 2, AR_R, AR_C) if HIER == 3 else
+                               (NSL, 2, AR_R, HC2) if HIER == 2 else
+                               (NSL, 2, AR_R, AR_C) if HIER == 1 else
+                               (NSL, R, AR_R, CW) if RSAG else (NSL, R, AR_R, AR_C), BF16),
+            "ar_ssem": pltpu.SemaphoreType.DMA((len(AR_ROUNDS), NSL, AR_PEERS)),
+            "ar_rsem": pltpu.SemaphoreType.DMA((len(AR_ROUNDS), NSL, AR_PEERS)),
             # GatedDeltaNet
             "recb": pltpu.VMEM((B * vh, KD, VD), BF16),  # key-major states
             "sbuf": pltpu.VMEM((vh, KD, VD), F32),
@@ -464,21 +510,49 @@ class MKBuildContext:
                 "rin_sem": pltpu.SemaphoreType.DMA((NS,)),  # recurrent state in, per sequence
             })
         if RSAG:  # round 2: this rank's chunk sum, and the chunk sums gathered from every rank
-            scratch["ag_send"] = pltpu.VMEM((2, AR_R, CW), BF16)
-            scratch["ag_recv"] = pltpu.VMEM((2, R, AR_R, CW), BF16)
+            scratch["ag_send"] = pltpu.VMEM((NSL, AR_R, CW), BF16)
+            scratch["ag_recv"] = pltpu.VMEM((NSL, R, AR_R, CW), BF16)
         elif HIER == 1:
-            scratch["ag_send"] = pltpu.VMEM((2, AR_R, AR_C), BF16)
-            scratch["ag_recv"] = pltpu.VMEM((2, 4, AR_R, AR_C), BF16)
+            scratch["ag_send"] = pltpu.VMEM((NSL, AR_R, AR_C), BF16)
+            scratch["ag_recv"] = pltpu.VMEM((NSL, 4, AR_R, AR_C), BF16)
         elif HIER == 2:
-            scratch["ag_send"] = pltpu.VMEM((2, AR_R, HC2), BF16)
-            scratch["ag_recv"] = pltpu.VMEM((2, 4, AR_R, HC2), BF16)
-            scratch["s2_send"] = pltpu.VMEM((2, AR_R, HC2), BF16)
-            scratch["s2_recv"] = pltpu.VMEM((2, 2, AR_R, HC2), BF16)
+            scratch["ag_send"] = pltpu.VMEM((NSL, AR_R, HC2), BF16)
+            scratch["ag_recv"] = pltpu.VMEM((NSL, 4, AR_R, HC2), BF16)
+            scratch["s2_send"] = pltpu.VMEM((NSL, AR_R, HC2), BF16)
+            scratch["s2_recv"] = pltpu.VMEM((NSL, 2, AR_R, HC2), BF16)
         if ARPIPE:
             scratch["arp"] = pltpu.VMEM((MB, 128), F32)
         if forced_routing:
-            scratch["rb"] = pltpu.VMEM((2, M, E), F32)
+            # wide: 128-row chunks, double-buffered. The next chunk's copy must not land in the
+            # buffer a chunk's top-k is still reading (the loads are not complete when the copy
+            # starts), so it goes to the other slot.
+            scratch["rb"] = pltpu.VMEM((2, 128, E) if WIDE_MB else (2, M, E), F32)
             scratch["rb_sem"] = pltpu.SemaphoreType.DMA((2,))
+        BWP = rup(BW, 128)  # all-rows buffers in 128-row chunks (the routing chunk)
+        CAP = min(WIDE_CAP, MB)  # gathered rows per expert tile (the tile reuses xb's rows)
+        if WIDE_MB:
+            del scratch["part"], scratch["wn"]  # the MoE phase works on part_all / wnT_all
+            scratch.update({
+                # residual rows of every microbatch (bf16-exact values), the MoE input rows and
+                # the MoE output accumulator of the whole step
+                "res_all": pltpu.VMEM((BW, H), BF16),
+                "xb_all": pltpu.VMEM((BWP, H), BF16),
+                "part_all": pltpu.VMEM((BWP, H), F32),
+                # routing weights transposed: expert e's row holds its weight for every row
+                "wnT_all": pltpu.VMEM((E, BWP), F32),
+                "io_sem": pltpu.SemaphoreType.DMA((2,)),
+            })
+            if not WIDE_TILE_REUSE:
+                scratch.update({
+                    "xgw": pltpu.VMEM((CAP, H), BF16),
+                    "midw": pltpu.VMEM((CAP, IR), BF16),
+                    "accw": pltpu.VMEM((CAP, max(2 * IR, H)), F32),
+                })
+            # the expert tile's gathered rows, intermediate and accumulators reuse the
+            # microbatch buffers xb, xb2 and acc (idle during the MoE phase); the per-expert
+            # row counts ride in hitv / hits rows MROW + 1 .. 2 * MROW
+            assert CAP % 8 == 0 and KX2 >= IR and NACC >= H and MR >= 2 * (E // 128) + 1, (
+                MB, CAP, KX2, IR, NACC, H, MR, E)
         if GCH:  # [buffer, CB * vh, KD, VD]: one row chunk of a layer's key-major states
             scratch["recb"] = pltpu.VMEM((NRB, CBV, KD, VD), BF16)
             scratch["rec_sem"] = pltpu.SemaphoreType.DMA((2, NRB))  # [in / out, buffer]
@@ -601,6 +675,14 @@ class MKBuildContext:
             and c.E < (1 << self.CP_SH)
             and 128 % self.ER == 0
         )
+        self.WIDE_MB, self.N_MB, self.BW, self.BWP, self.CAP = WIDE_MB, N_MB, BW, BWP, CAP
+        self.MB_GDN, self.MB_ATT = MB_GDN, MB_ATT
+        self.WIDE_DYN_ROW = WIDE_DYN_ROW
+        self.WIDE_SCATTER_TN = WIDE_SCATTER_TN
+        self.N_AR_SLOTS, self.AR1_SLOT = NSL, NSL - 1  # the MoE all-reduce's slot
+        self.WIDE_TILE_REUSE = WIDE_TILE_REUSE
+        self.WIDE_SCATTER = WIDE_SCATTER
+        self.BLIVE = c_wide.B  # live rows of the wide step (the rest of the tail is padding)
         self.vshape, self.vdtype = vshape, vdtype
         self.scratch = scratch
         self.s_names = s_names
@@ -610,7 +692,7 @@ class MKBuildContext:
         self.comm = R > 1 and "ar" not in skip
 
         # Precompute Pallas BlockSpecs, output shapes, aliases, and info dictionary
-        oshapes = kernel_out_shapes(c)
+        oshapes = kernel_out_shapes(c_wide)
         if GPR:  # bf16 conv history output (exact: cached bf16 taps + bf16-rounded inputs)
             oshapes = {**oshapes, "conv": (oshapes["conv"][0], BF16)}
         w_specs = [
@@ -627,8 +709,9 @@ class MKBuildContext:
             else pl.BlockSpec(memory_space=pltpu.HBM)
             for k in st_names
         ]
+        hid_space = pltpu.HBM if WIDE_MB else pltpu.VMEM
         self.in_specs = (
-            [pl.BlockSpec(memory_space=pltpu.SMEM), pl.BlockSpec(memory_space=pltpu.VMEM)]
+            [pl.BlockSpec(memory_space=pltpu.SMEM), pl.BlockSpec(memory_space=hid_space)]
             + w_specs
             + s_specs
             + ([pl.BlockSpec(memory_space=pltpu.HBM)] if forced_routing else [])
@@ -642,7 +725,7 @@ class MKBuildContext:
             for k in o_names
         ]
         self.out_specs = [
-            pl.BlockSpec(memory_space=pltpu.VMEM)
+            pl.BlockSpec(memory_space=hid_space)
             if k == "hidden"
             else tuple(pl.BlockSpec(memory_space=pltpu.HBM) for _ in range(c.NATT))
             if k == "raw"
@@ -751,6 +834,8 @@ class MKBuildContext:
             else (self.ST["raw"] if self.c.paged_kv else None)
         )
         self.scr = dict(zip(self.s_names, refs[k_ + len(self.o_names) :]))
+        self.pos_all, self.hid_all, self.out_all = self.pos_ref, self.hid_ref, self.out_ref
+        self.ST_all = dict(self.ST)
         self.me = lax.axis_index("tp").astype(I32)
         self.gi = lax.rem(self.me, self.G) if self.SPLIT else jnp.int32(0)
         self.arp_c = (
@@ -765,3 +850,24 @@ class MKBuildContext:
         self.live = self.row_m < self.B
         self.EM = (1 << max(1, (self.E - 1).bit_length())) - 1
         self.FLT_MIN = float(jnp.finfo(F32).tiny)
+
+    def bind_microbatch(self, m) -> None:
+        """Points the per-row and per-sequence operand refs at microbatch m of a wide step."""
+        if not self.WIDE_MB:
+            return
+        nb, ns = self.c.B, self.c.NS
+        r0 = pl.multiple_of(m * nb, nb)
+        s0 = pl.multiple_of(m * ns, ns)
+        self.pos_ref = self.pos_all.at[pl.ds(r0, nb)]
+        st = dict(self.ST_all)
+        if "page_table" in st:
+            st["page_table"] = self.ST_all["page_table"].at[pl.ds(s0, ns)]
+        if "ckpt_indices" in st:
+            ck = self.ST_all["ckpt_indices"]
+            st["ckpt_indices"] = ck.at[:, pl.ds(s0, ns)] if self.ckpt_is_3d else ck.at[pl.ds(s0, ns)]
+        if "read_offsets" in st:
+            ro = self.ST_all["read_offsets"]
+            st["read_offsets"] = ro.at[:, pl.ds(s0, ns)] if self.roff_is_2d else ro.at[pl.ds(s0, ns)]
+        if "active_seqs" in st:
+            st["active_seqs"] = self.ST_all["active_seqs"].at[pl.ds(s0, ns)]
+        self.ST = st

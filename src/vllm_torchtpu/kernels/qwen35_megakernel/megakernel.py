@@ -112,6 +112,9 @@ def build(
     R = ctx.R
 
     def kernel(*refs):
+        if ctx.WIDE_MB:
+            kernel_wide(ctx, refs)
+            return
         ctx.bind_refs(refs)
         rings = WeightRings(ctx)
         allreduce_blk = PallasAllReduce(ctx)
@@ -337,6 +340,202 @@ def build(
         name="qwen3_5_decode_megakernel",
     )
     return call, ctx.info
+
+
+def kernel_wide(ctx: MKBuildContext, refs):
+    """Wide step body: layer by layer, the mixer phase runs per microbatch on the microbatch's
+    rows and the MoE phase once over every row (MoEBlock.moe_wide), so each hit expert's
+    weights stream once per layer. Residual rows live in res_all (bf16-exact) across layers;
+    hidden in and out are HBM operands copied per microbatch."""
+    ctx.bind_refs(refs)
+    rings = WeightRings(ctx)
+    allreduce_blk = PallasAllReduce(ctx)
+    gdn_dma = GDNPoolDMA(ctx)
+    kv_dma = KVPoolDMA(ctx)
+    gdn_blk = GDNBlock(ctx, rings, gdn_dma)
+    att_blk = PagedAttentionBlock(ctx, rings, kv_dma)
+    moe_blk = MoEBlock(ctx, rings)
+
+    c, scr, R = ctx.c, ctx.scr, ctx.R
+    W, hid_hbm, out_hbm = ctx.W, ctx.hid_ref, ctx.out_ref
+    sc, sm, rms_zc = ctx.sc, ctx.sm, ctx.rms_zc
+    B, MB, MR, H, L, E, AE = ctx.B, ctx.MB, ctx.MR, ctx.H, ctx.L, ctx.E, ctx.AE
+    NS, NBD, NGI, NGO = ctx.NS, ctx.NBD, ctx.NGI, ctx.NGO
+    FUSED, ECOPY, SPLIT, GQ, PACK, QV = ctx.FUSED, ctx.ECOPY, ctx.SPLIT, ctx.GQ, ctx.PACK, ctx.QV
+    t_block, t_gdn, lay = ctx.t_block, ctx.t_gdn, ctx.lay
+    me, rb_hbm = ctx.me, ctx.rb_hbm
+    N_MB, BW, BWP, MB_GDN, MB_ATT = ctx.N_MB, ctx.BW, ctx.BWP, ctx.MB_GDN, ctx.MB_ATT
+    M_OUT = ctx.c_wide.M
+    res_all, xb_all, part_all = scr["res_all"], scr["xb_all"], scr["part_all"]
+    assert FUSED and MB == B and B % 16 == 0, (FUSED, MB, B)
+    assert not ctx.ARP
+
+    def rows(m):
+        return pl.ds(pl.multiple_of(m * B, B), B)
+
+    # ------------------------------ layer loop ------------------------------
+    def layer(l, carry):
+        slot = l % 2
+        with sc("norm_in"):
+            pltpu.make_async_copy(
+                W["smalls"].at[0], scr["sm"].at[slot], scr["sm_sem"].at[slot]
+            ).wait()
+            if ECOPY:
+                o_ec = lay["ecopy"][0]
+                pltpu.make_async_copy(
+                    W["smalls"].at[0, :, pl.ds(o_ec, E)],
+                    scr["ecopy"].at[slot],
+                    scr["ec_sem"].at[slot],
+                ).wait()
+
+            @pl.when(l + 1 < L)
+            def _():
+                pltpu.make_async_copy(
+                    W["smalls"].at[l + 1],
+                    scr["sm"].at[1 - slot],
+                    scr["sm_sem"].at[1 - slot],
+                ).start()
+                if ECOPY:
+                    o_ec = lay["ecopy"][0]
+                    pltpu.make_async_copy(
+                        W["smalls"].at[l + 1, :, pl.ds(o_ec, E)],
+                        scr["ecopy"].at[1 - slot],
+                        scr["ec_sem"].at[1 - slot],
+                    ).start()
+
+        is_att = l % AE == AE - 1
+        base_l = (l // AE) * t_block + (l % AE) * t_gdn
+        per_mb = jnp.where(is_att, MB_ATT, MB_GDN)
+
+        def mixer(m, carry_m):
+            ctx.bind_microbatch(m)
+            with sc("norm_in"):
+                scr["res"][...] = res_all[rows(m)].astype(F32)
+                scr["xb"][...] = rms_zc(scr["res"][...], sm(slot, "in_norm")).astype(BF16)
+            first = jnp.logical_and(l == 0, m == 0)
+            g0 = base_l + m * per_mb
+
+            def att_branch():
+                att_blk.init_worklist()
+                att_blk.init_rope()
+                if ctx.AR0S and ctx.comm:
+                    att_blk.attention(l, slot, g0, ar0=allreduce_blk.ar0_spec(slot, first))
+                    allreduce_blk.ar0_finish(0, first)
+                    return
+                allreduce_blk.add_residual(
+                    allreduce_blk.allreduce(0, att_blk.attention(l, slot, g0), first)
+                )
+
+            def gdn_branch():
+                if ctx.AR0S and ctx.comm:
+                    gdn_blk.gdn(l, slot, g0, ar0=allreduce_blk.ar0_spec(slot, first))
+                    allreduce_blk.ar0_finish(0, first)
+                    return
+                allreduce_blk.add_residual(
+                    allreduce_blk.allreduce(0, gdn_blk.gdn(l, slot, g0), first)
+                )
+
+            if AE == 1:
+                att_branch()
+            else:
+                lax.cond(is_att, att_branch, gdn_branch)
+            with sc("moe_router"):
+                xb_all[rows(m)] = rms_zc(scr["res"][...], sm(slot, "post_norm")).astype(BF16)
+                res_all[rows(m)] = scr["res"][...].astype(BF16)
+            return carry_m
+
+        lax.fori_loop(0, N_MB, mixer, 0)
+        moe_blk.moe_wide(l, slot, base_l + N_MB * per_mb)
+
+        def moe_ar(m, carry_m):
+            # the slot's first use: with one slot set the mixer all-reduces used it already, and
+            # their sends must be waited for before the payload buffers are rewritten
+            first = jnp.logical_and(l == 0, m == 0) if ctx.N_AR_SLOTS == 2 else jnp.bool_(False)
+            tot = allreduce_blk.allreduce(ctx.AR1_SLOT, part_all[rows(m)], first)
+            with sc("ar_res"):
+                res_all[rows(m)] = rnd(res_all[rows(m)].astype(F32) + tot[0:B]).astype(BF16)
+            return carry_m
+
+        lax.fori_loop(0, N_MB, moe_ar, 0)
+        return carry
+
+    # ------------------------------ step ------------------------------
+    scr["hitv"][...] = jnp.zeros((MR, 128), I32)
+    zero_seen = pltpu.make_async_copy(
+        scr["hitv"].at[pl.ds(0, 8)], scr["seen"], scr["misc_sem"]
+    )
+    zero_seen.start()
+    for i in range(NBD):
+        rings.fetch(jnp.int32(i))
+    pltpu.make_async_copy(
+        W["smalls"].at[0], scr["sm"].at[0], scr["sm_sem"].at[0]
+    ).start()
+    if ECOPY:
+        o_ec = lay["ecopy"][0]
+        pltpu.make_async_copy(
+            W["smalls"].at[0, :, pl.ds(o_ec, E)],
+            scr["ecopy"].at[0],
+            scr["ec_sem"].at[0],
+        ).start()
+    if ctx.forced_routing:  # the first 128-row routing chunk; moe_wide chains the rest
+        pltpu.make_async_copy(
+            rb_hbm.at[0, pl.ds(0, 128)], scr["rb"].at[0], scr["rb_sem"].at[0]
+        ).start()
+    hid_in = pltpu.make_async_copy(
+        hid_hbm, res_all.at[pl.ds(0, M_OUT)], scr["io_sem"].at[0]
+    )
+    hid_in.start()
+    if R > 1:
+        barrier = pltpu.get_barrier_semaphore()
+        for off in range(1, R):
+            pl.semaphore_signal(
+                barrier,
+                1,
+                device_id=(me ^ off,),
+                device_id_type=pl.DeviceIdType.MESH,
+            )
+        pl.semaphore_wait(barrier, R - 1)
+    scr["mix"][...] = jnp.zeros(scr["mix"].shape, F32)
+    scr["knew_o"][...] = jnp.zeros((MR, ctx.HD), FP8)
+    scr["vnew_o"][...] = jnp.zeros((MR, ctx.HD), FP8)
+    for s in range(NS):
+        scr["kv_rd_pend"][s] = jnp.int32(0)
+        scr["kv_wr_pend"][s] = jnp.int32(0)
+    if c.NGDN > 0:
+        for slot_i in range(NGI):
+            scr["gdn_in_pend"][slot_i] = jnp.int32(0)
+        for slot_o in range(NGO):
+            scr["gdn_out_mode"][slot_o] = jnp.int32(0)
+        scr["gdn_out_page"][...] = jnp.zeros(scr["gdn_out_page"].shape, FP8)
+    if SPLIT and not GQ:
+        scr["pso"][...] = jnp.zeros(scr["pso"].shape, F32)
+    if PACK or QV:
+        scr["qg"][...] = jnp.zeros(scr["qg"].shape, F32)
+    xb_all[...] = jnp.zeros(xb_all.shape, BF16)
+    hid_in.wait()
+    if BW > M_OUT:
+        res_all[M_OUT:BW, :] = jnp.zeros((BW - M_OUT, H), BF16)
+    zero_seen.wait()
+    lax.fori_loop(0, L, layer, 0)
+    allreduce_blk.wait_sends()
+    if c.NGDN > 0:
+        for slot_o in range(NGO):
+            gdn_dma.wait_gdn_out(slot_o)
+    for s in range(NS):
+        kv_dma.wait_kv_wr(s)
+    cp = pltpu.make_async_copy(W["final_norm"], scr["fn"], scr["misc_sem"])
+    cp.start()
+    cp.wait()
+    for m in range(N_MB):
+        n = min(B, M_OUT - m * B)
+        if n <= 0:
+            break
+        scr["xb"][...] = rms_zc(res_all[m * B:(m + 1) * B, :].astype(F32), scr["fn"][...]).astype(BF16)
+        out_cp = pltpu.make_async_copy(
+            scr["xb"].at[pl.ds(0, n)], out_hbm.at[pl.ds(m * B, n)], scr["io_sem"].at[1]
+        )
+        out_cp.start()
+        out_cp.wait()
 
 
 def make_step(

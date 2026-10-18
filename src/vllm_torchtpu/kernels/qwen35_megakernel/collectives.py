@@ -481,7 +481,7 @@ class PallasAllReduce:
         """Wait for all in-flight all-reduce sends at kernel exit."""
         ctx = self.ctx
         if ctx.comm:
-            for ar_slot in range(2):
+            for ar_slot in range(ctx.N_AR_SLOTS):
                 for rnd_i in self.ar_rounds(ar_slot):
                     for d in self.ar_copies(ar_slot, rnd_i):
                         d.wait_send()

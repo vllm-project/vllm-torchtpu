@@ -604,6 +604,367 @@ class MoEBlock:
 
     moe_route = route
 
+    def moe_wide(self, l, slot, seg_r):
+        """Wide step MoE over every microbatch's rows: router, shared expert and routed experts
+        read scr["xb_all"], each hit expert's weights stream once per layer, and scr["part_all"]
+        holds the MoE output of all rows (the all-reduce and residual add follow per microbatch).
+
+        Rows are routed in 128-row chunks (the top-k machinery is built for at most 128 rows);
+        the deduplicated hit set of the whole step goes through the usual EP dedup and Po2C
+        copy choice. Expert e then gathers its rows with a one-hot matmul into CAP-row tiles
+        (groups of CAP rows when it has more), runs the expert on the tile and scatters the
+        weighted rows back with the transposed one-hot (the routing weight split into a bf16
+        high and low part, so the f32 weight is applied exactly to 2^-16).
+        """
+        ctx = self.ctx
+        c, tiles, scr, sc, sm, mm = ctx.c, ctx.tiles, ctx.scr, ctx.sc, ctx.sm, ctx.mm
+        dtake, fetch, fetch_range = self.rings.dtake, self.rings.fetch, self.rings.fetch_range
+        etake, egive = self.rings.etake, self.rings.egive
+        E, H, IR, ER, R, EXTRA = ctx.E, ctx.H, ctx.IR, ctx.ER, ctx.R, ctx.EXTRA
+        L, NBD, NBE, NSS, T13, T2, TE, tk, nt = (
+            ctx.L, ctx.NBD, ctx.NBE, ctx.NSS, ctx.T13, ctx.T2, ctx.TE, ctx.tk, ctx.nt)
+        BWP, BLIVE, CAP, N_MOE = ctx.BWP, ctx.BLIVE, ctx.CAP, ctx.N_MOE
+        EM, FLT_MIN, me, skip = ctx.EM, ctx.FLT_MIN, ctx.me, ctx.skip
+        forced_routing, rb_hbm = ctx.forced_routing, ctx.rb_hbm
+        MROW = E // 128
+        NCP = R * EXTRA
+        NQ = BWP // 128
+        assert ctx.ECOPY and tiles.route_vec and E % 128 == 0 and MROW + 1 <= ctx.MR, (
+            "the wide step uses the vector dedup (EP with copy slots)")
+        assert NCP + R + 1 <= 128 and tiles.topk and ctx.topk_lanes and c.TOPK <= 128
+        assert N_MOE <= NBD, (N_MOE, NBD)
+        xb_all, part_all, wnT = scr["xb_all"], scr["part_all"], scr["wnT_all"]
+        if ctx.WIDE_TILE_REUSE:
+            xgw, midw, accw = scr["xb"], scr["xb2"], scr["acc"]  # idle microbatch buffers
+        else:
+            xgw, midw, accw = scr["xgw"], scr["midw"], scr["accw"]
+        lane_e = lax.broadcasted_iota(I32, (128, E), 1)
+        row_q = lax.broadcasted_iota(I32, (128, 1), 0)
+        lane_1e = lax.broadcasted_iota(I32, (1, E), 1)
+        lane_bw = lax.broadcasted_iota(I32, (1, BWP), 1)
+        row_c = lax.broadcasted_iota(I32, (CAP, 1), 0)
+        sub_e = lax.broadcasted_iota(I32, (E, 1), 0)
+
+        g_r = seg_r
+        g_13 = seg_r + nt["router"]
+        g_2 = g_13 + nt["sh13"]
+        with sc("moe_router"):
+            w_r = [dtake("router", g_r + t) for t in range(nt["router"])]
+            w_13 = [dtake("sh13", g_13 + t) for t in range(nt["sh13"])]
+            w_2 = [dtake("sh2", g_2 + t) for t in range(nt["sh2"])]
+        tk_r, tk_13, tk_2 = tk["router"], tk["sh13"], tk["sh2"]
+        sh_gate, sh13_s, sh2_s = sm(slot, "sh_gate"), sm(slot, "sh13_s"), sm(slot, "sh2_s")
+        hitf = jnp.zeros((1, E), I32)
+        cnt = jnp.zeros((1, E), I32)
+
+        def rb_copy(l_, q_):
+            """Routing-bias chunk q_ of layer l_ into slot (l_ * NQ + q_) % 2."""
+            rs = lax.rem(l_ * NQ + q_, 2)
+            return pltpu.make_async_copy(
+                rb_hbm.at[l_, pl.ds(q_ * 128, 128)], scr["rb"].at[rs], scr["rb_sem"].at[rs]
+            )
+
+        for q in range(NQ):
+            r0 = q * 128
+            with sc("moe_router"):
+                x = xb_all[r0:r0 + 128, :]
+                logits = None
+                for t in range(nt["router"]):
+                    p_ = mm(x[:, t * tk_r:(t + 1) * tk_r], w_r[t][...])
+                    logits = p_ if logits is None else logits + p_
+                xf = x.astype(F32)
+                glog = jnp.sum(xf * sh_gate, axis=-1, keepdims=True)
+                sg = jax.nn.sigmoid(glog)
+                mx = jnp.max(logits, axis=-1, keepdims=True)
+                pexp = jnp.exp(logits - mx)
+            with sc("moe_shared"):
+                g13 = None
+                for t in range(nt["sh13"]):
+                    p_ = mm(x[:, t * tk_13:(t + 1) * tk_13], w_13[t][...])
+                    g13 = p_ if g13 is None else g13 + p_
+                g13 = g13 * sh13_s
+                mid = rnd(rnd(jax.nn.silu(rnd(g13[:, :c.ISR]))) * rnd(g13[:, c.ISR:])).astype(BF16)
+                ysh = None
+                for t in range(nt["sh2"]):
+                    p_ = mm(mid[:, t * tk_2:(t + 1) * tk_2], w_2[t][...])
+                    ysh = p_ if ysh is None else ysh + p_
+                part_all[r0:r0 + 128, :] = ysh * sh2_s * sg
+            with sc("moe_route"):
+                choice = pexp
+                if forced_routing:
+                    rb_copy(l, q).wait()
+                    choice = scr["rb"][lax.rem(l * NQ + q, 2)]
+                    if q + 1 < NQ:
+                        rb_copy(l, q + 1).start()
+                    else:
+                        pl.when(l + 1 < L)(lambda: rb_copy(l + 1, 0).start())
+                live = row_q < (BLIVE - r0)
+                kb = lax.bitcast_convert_type(jnp.maximum(choice, FLT_MIN), I32)
+                key = lax.bitcast_convert_type((kb & ~EM) | (EM - lane_e), F32)
+                _, sel = topk_rows_on_lanes(key, c.TOPK, EM, need_ids=False)
+                sel = jnp.logical_and(sel, live)
+                wsel = jnp.where(sel, pexp, 0.0)
+                wn = jnp.where(live, wsel / jnp.sum(wsel, axis=-1, keepdims=True), 0.0)
+                wnT[:, r0:r0 + 128] = wn.T
+                seli = sel.astype(I32)
+                hitf = jnp.maximum(hitf, jnp.max(seli, axis=0, keepdims=True))
+                cnt = cnt + jnp.sum(seli, axis=0, keepdims=True)
+        if "experts" in skip:
+            hitf = jnp.zeros_like(hitf)
+        # the MoE dense tiles are consumed: refill their slots (lazy)
+        with sc("refill"):
+            for t in range(N_MOE):
+                fetch(seg_r + t + NBD)
+
+        # ---- dedup and Po2C over the step's hit set (the vector route of `route`) ----
+        with sc("route_topk", 2):
+            cpi = sm(slot, "ecopy").astype(I32)  # [1, E]: 0 or 1 + copy slot
+            fixed = jnp.where(cpi > 0, 0, hitf)  # hit, no redundant copy
+            for j in range(MROW):
+                scr["hitv"][j:j + 1, :] = fixed[:, j * 128:(j + 1) * 128]
+            v1 = (lane_1e + 1) * hitf
+            row_a = lax.broadcasted_iota(I32, (16, E), 0)
+            a = jnp.where(
+                row_a == 0,
+                lax.shift_right_logical(v1, 5),
+                jnp.where(row_a == 1, lax.bitwise_and(v1, 31), jnp.where(row_a == 2, hitf, 0)),
+            )
+            a = a.astype(F32).astype(BF16)
+            row_b = lax.broadcasted_iota(I32, (128, E), 0)
+            lane_b = lax.broadcasted_iota(I32, (128, E), 1)
+            rr = row_b - NCP
+            in_rank = jnp.logical_and(lane_b >= rr * ER, lane_b < (rr + 1) * ER)
+            cp_code = (row_b % R) * EXTRA + lax.div(row_b, R) + 1
+            bm = jnp.where(
+                row_b < NCP,
+                jnp.where(cpi == cp_code, 1.0, 0.0),
+                jnp.where(rr < R, jnp.where(in_rank, 1.0, 0.0), jnp.where(rr == R, 1.0, 0.0)),
+            ).astype(BF16)
+            res = mm(a, bm, NT)  # [16, 128]
+            lane_r = lax.broadcasted_iota(I32, (1, 128), 1)
+            meta = jnp.where(lane_r < NCP, res[0:1] * 32.0 + res[1:2], res[2:3])
+            scr["hitv"][MROW:MROW + 1, :] = meta.astype(I32)
+            for j in range(MROW):  # rows per expert, read by the expert loop from hits
+                scr["hitv"][MROW + 1 + j:MROW + 2 + j, :] = cnt[:, j * 128:(j + 1) * 128]
+        with sc("route_dma", 2):
+            cp = pltpu.make_async_copy(scr["hitv"], scr["hits"], scr["misc_sem"])
+            cp.start()
+            cp.wait()
+        RSHRINK = bool(ctx.ROUTE_SHRINK and E < (1 << ctx.CP_SH))
+        PRIM_NOW_K = ctx.PRIM_NOW_K
+        CP_SH = ctx.CP_SH
+
+        def cp_dec(w):
+            e = lax.bitwise_and(w, (1 << CP_SH) - 1)
+            j = lax.shift_right_logical(w, CP_SH)
+            if ER & (ER - 1) == 0:
+                r0_ = lax.shift_right_logical(e, ER.bit_length() - 1)
+                s0 = lax.bitwise_and(e, ER - 1)
+            else:
+                r0_ = lax.div(e, ER)
+                s0 = e - r0_ * ER
+            if R & (R - 1) == 0:
+                r1 = lax.bitwise_and(j, R - 1)
+                s1 = ER + lax.shift_right_logical(j, R.bit_length() - 1)
+            else:
+                r1 = lax.rem(j, R)
+                s1 = ER + lax.div(j, R)
+            return e, r0_, s0, r1, s1
+
+        with sc("route_dedup", 2):
+            for r in range(R):
+                scr["rload"][r] = scr["hits"][MROW, NCP + r]
+            n_tot = scr["hits"][MROW, NCP + R]
+            base = me * ER
+
+            def prim(s_, n):
+                e = base + s_
+                f = scr["hits"][lax.shift_right_logical(e, 7), lax.bitwise_and(e, 127)]
+                scr["elist"][n] = e
+                if not PRIM_NOW_K:
+                    scr["wlist"][n] = s_
+                return n + f
+
+            n_hit = lax.fori_loop(0, ER, prim, jnp.int32(0), unroll=True)
+            if PRIM_NOW_K:
+                scr["st"][5] = n_hit
+            EARLY_FILL = "experts" not in skip
+            n_fill0 = jnp.int32(0)
+            if EARLY_FILL:
+                n_fill0 = jnp.minimum(NBE, n_hit * TE)
+                with sc("route_fetch0", 2):
+                    fetch_range(jnp.int32(0), n_fill0, l, fixed=PRIM_NOW_K)
+            if RSHRINK:
+                n_cp = jnp.int32(0)
+                for c0 in range(0, NCP, 16):
+                    vs = [scr["hits"][MROW, j] for j in range(c0, min(c0 + 16, NCP))]
+                    for k, v1_ in enumerate(vs):
+                        scr["cplist"][n_cp] = v1_ + (((c0 + k) << CP_SH) - 1)
+                        n_cp = n_cp + lax.shift_right_logical(-v1_, 31)
+            else:
+                def cpl(j, n):
+                    v1_ = scr["hits"][MROW, j]
+                    scr["cplist"][n] = v1_ - 1
+                    return n + jnp.where(v1_ > 0, 1, 0).astype(I32)
+
+                n_cp = lax.fori_loop(0, NCP, cpl, jnp.int32(0), unroll=True)
+
+            def cp_fields(j):
+                if RSHRINK:
+                    return cp_dec(scr["cplist"][j])
+                e = scr["cplist"][j]
+                r0_ = lax.div(e, ER)
+                s0 = e - r0_ * ER
+                c0 = scr["ecopy"][slot, 0, e].astype(I32) - 1
+                r1 = lax.div(c0, EXTRA)
+                s1 = ER + (c0 - r1 * EXTRA)
+                return e, r0_, s0, r1, s1
+
+            def po2c_pass1(j, _):
+                e, r0_, _s0, r1, _s1 = cp_fields(j)
+                l0 = scr["rload"][r0_]
+                l1 = scr["rload"][r1]
+                use_c = jnp.logical_or(
+                    l1 + 1 < l0,
+                    jnp.logical_and(l1 < l0, jnp.logical_or(l0 * R > n_tot, l1 * R < n_tot)),
+                )
+                d = jnp.where(use_c, 1, 0).astype(I32)
+                scr["rload"][r0_] = l0 - d
+                scr["rload"][r1] = l1 + d
+                scr["cpchoice"][j] = d
+                return 0
+
+            def po2c_pass2(j, n):
+                e, r0_, s0, r1, s1 = cp_fields(j)
+                use_c = scr["cpchoice"][j] != 0
+                cur = jnp.where(use_c, r1, r0_)
+                alt = jnp.where(use_c, r0_, r1)
+                l_cur = scr["rload"][cur]
+                l_alt = scr["rload"][alt]
+                flip = jnp.logical_or(
+                    l_alt + 1 < l_cur,
+                    jnp.logical_and(
+                        l_alt < l_cur, jnp.logical_and(l_cur * R > n_tot, l_alt * R < n_tot)
+                    ),
+                )
+                d = jnp.where(flip, 1, 0).astype(I32)
+                scr["rload"][cur] = l_cur - d
+                scr["rload"][alt] = l_alt + d
+                final_c = jnp.not_equal(use_c, flip)
+                pick_r = jnp.where(final_c, r1, r0_)
+                pick_w = jnp.where(final_c, s1, s0)
+                mine = pick_r == me
+                scr["elist"][n] = e
+                scr["wlist"][n] = pick_w
+                return n + jnp.where(mine, 1, 0).astype(I32)
+
+            lax.fori_loop(0, n_cp, po2c_pass1, 0)
+            n_hit = lax.fori_loop(0, n_cp, po2c_pass2, n_hit)
+        if "experts" in skip:
+            n_hit = jnp.int32(0)
+        scr["st"][0] = n_hit * TE
+        with sc("route_fetch", 2):
+            if EARLY_FILL:
+                fetch_range(n_fill0, jnp.minimum(NBE, n_hit * TE), l)
+
+        # ---- expert-major loop: each hit expert once over the rows of every microbatch ----
+        TK13, TK2 = tk["e13"], tk["e2"]
+        BN = 2 * IR
+        sh_hi = [1 << k for k in range(7)]
+
+        def lane_scan(v):
+            """Inclusive prefix sum of v [1, 128] (i32) along lanes."""
+            lane = lax.broadcasted_iota(I32, (1, 128), 1)
+            for sh in sh_hi:
+                v = v + jnp.where(lane >= sh, pltpu.roll(v, sh, 1), 0)
+            return v
+
+        def expert_w(i, carry):
+            e = scr["elist"][i]
+            s_ = i % NSS
+            base_u = i * TE
+            # the expert's rows: its routing-weight row over every row of the step
+            if ctx.WIDE_DYN_ROW:
+                col = wnT[pl.ds(e, 1), :]
+            else:
+                col = jnp.sum(jnp.where(sub_e == e, wnT[...], 0.0), axis=0, keepdims=True)
+            nz = col != 0.0
+            nzi = nz.astype(I32)
+            # exclusive prefix count of the hit rows, 128 lanes at a time
+            segs = []
+            carry_n = jnp.zeros((1, 1), I32)
+            for q in range(NQ):
+                inc = lane_scan(nzi[:, q * 128:(q + 1) * 128])
+                segs.append(inc + carry_n)
+                carry_n = carry_n + inc[:, 127:128]
+            pos = jnp.concatenate(segs, axis=1) - nzi if NQ > 1 else segs[0] - nzi
+            n_e = scr["hits"][MROW + 1 + lax.shift_right_logical(e, 7), lax.bitwise_and(e, 127)]
+            n_grp = lax.div(n_e + (CAP - 1), CAP)
+            w13 = [etake("e13", base_u + t) for t in range(T13)]
+            self.es_wait(i)
+            es = scr["es"][s_]  # [1, 2 * IR + H]
+            w2 = [etake("e2", base_u + T13 + t) for t in range(T2)]
+
+            def group(g, carry_g):
+                last = g == n_grp - 1
+                with sc("moe_gather"):
+                    sel_g = jnp.logical_and(pos - g * CAP == row_c, nz)  # [CAP, BWP]
+                    gm = sel_g.astype(BF16)
+                    w = jnp.sum(jnp.where(sel_g, col, 0.0), axis=1, keepdims=True)  # [CAP, 1]
+                    # one-hot gather in 128-row pieces of the contraction (small temporaries)
+                    xg = None
+                    for q in range(NQ):
+                        p_ = mm(gm[:, q * 128:(q + 1) * 128], xb_all[q * 128:(q + 1) * 128, :])
+                        xg = p_ if xg is None else xg + p_
+                    xgw[0:CAP, :] = xg.astype(BF16)
+                with sc("moe_experts"):
+                    for t in range(T13):
+                        m13 = mm(xgw[0:CAP, t * TK13:(t + 1) * TK13], w13[t][...])
+                        if t == 0:
+                            accw[0:CAP, 0:BN] = m13
+                        else:
+                            accw[0:CAP, 0:BN] += m13
+                        pl.when(last)(lambda t=t: egive(base_u + t, l, t))
+                    h = accw[0:CAP, 0:BN] * es[:, :BN]
+                    midw[0:CAP, 0:IR] = rnd(
+                        rnd(jax.nn.silu(rnd(h[:, :IR]))) * rnd(h[:, IR:])
+                    ).astype(BF16)
+                    for t in range(T2):
+                        m2 = mm(midw[0:CAP, t * TK2:(t + 1) * TK2], w2[t][...])
+                        if t == 0:
+                            accw[0:CAP, 0:H] = m2
+                        else:
+                            accw[0:CAP, 0:H] += m2
+                        pl.when(last)(lambda t=t: egive(base_u + T13 + t, l, T13 + t))
+                    y = rnd(accw[0:CAP, 0:H] * es[:, BN:])  # [CAP, H], bf16-exact
+                with sc("moe_scatter"):
+                    w_hi = w.astype(BF16).astype(F32)
+                    w_lo = w - w_hi
+                    gmf = sel_g.astype(F32)
+                    gw = jnp.concatenate([gmf * w_hi, gmf * w_lo], axis=0)  # [2 * CAP, BWP] f32
+                    y2 = jnp.concatenate([y, y], axis=0).astype(BF16)  # [2 * CAP, H]
+                    # transposed one-hot scatter-add in 64-row pieces of part_all
+                    if not ctx.WIDE_SCATTER:
+                        part_all[0:8, 0:128] += 0.0 * y[0:8, 0:128]  # keeps the expert work live
+                    elif ctx.WIDE_SCATTER_TN:
+                        gwb = gw.astype(BF16)
+                        for r0 in range(0, BWP, 64):
+                            part_all[r0:r0 + 64, :] += lax.dot_general(
+                                gwb[:, r0:r0 + 64], y2, (((0,), (0,)), ((), ())),
+                                preferred_element_type=F32,
+                            )
+                    else:
+                        gwT = gw.T.astype(BF16)  # [BWP, 2 * CAP]
+                        for r0 in range(0, BWP, 64):
+                            part_all[r0:r0 + 64, :] += mm(gwT[r0:r0 + 64, :], y2)
+                return carry_g
+
+            lax.fori_loop(0, n_grp, group, 0)
+            return carry
+
+        with sc("moe_experts"):
+            lax.fori_loop(0, n_hit, expert_w, 0)
+
     def expert(self, l, i, carry):
         """Listed expert i on all rows: part += wn[:, e] * expert_e(xb). EP: the whole expert;
         TP: this rank's slice of the intermediate dim (the all-reduce sums the slices)."""

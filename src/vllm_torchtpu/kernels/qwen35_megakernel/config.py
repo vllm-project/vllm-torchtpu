@@ -211,6 +211,24 @@ class MKConfig:
     ckpt_2d: bool = False        # True when ckpt_indices is 2D [NS, K] instead of 3D [G_PER_ATT, NS, K]
     ckpt_k: int = 0              # K dimension of ckpt_indices (0 -> T)
     roff_1d: bool = False        # True when read_offsets is 1D [NS] instead of 2D [G_PER_ATT, NS]
+    # Wide step (A2): B rows run as microbatches of mb_rows rows inside one call, the attention
+    # and GatedDeltaNet phases per microbatch and the MoE phase once over all rows, so each hit
+    # expert's weights stream once per layer per step. 0: one microbatch of B rows.
+    mb_rows: int = 0
+
+    @property
+    def wide(self) -> bool:
+        return self.mb_rows > 0
+
+    @property
+    def n_mb(self):  # microbatches of a wide step (the last one padded with inactive rows)
+        return -(-self.B // self.mb_rows) if self.wide else 1
+
+    def microbatch(self) -> "MKConfig":
+        """The per-microbatch geometry of a wide step (mb_rows rows, itself when not wide)."""
+        if not self.wide:
+            return self
+        return dataclasses.replace(self, B=self.mb_rows, mb_rows=0)
 
     @property
     def NS(self):  # sequences (KV caches, GDN input states)
@@ -334,7 +352,11 @@ class MKConfig:
         assert self.L % self.att_every == 0 and self.NH % self.R == 0 and self.R % self.NKV == 0
         assert self.KH % self.R == 0 and self.VH % self.R == 0 and self.E % self.R == 0
         assert self.IS % self.R == 0 and (not self.moe_tp or self.I % self.R == 0)
-        assert self.vh <= 64 and self.B * self.TOPK <= 1280 and 1 <= self.B <= self.M <= 128
+        b_max = 1024 if self.wide else 128
+        assert self.vh <= 64 and 1 <= self.B <= self.M <= b_max, (self.B, self.M)
+        assert self.wide or self.B * self.TOPK <= 1280, (self.B, self.TOPK)
+        if self.wide:
+            assert self.mb_rows % self.T == 0 and 16 <= self.mb_rows <= 128, (self.mb_rows, self.T)
         assert self.E % 128 == 0 and self.E <= 1024 and self.H % self.PC == 0 and self.nh <= 8
         assert self.ROT % 2 == 0 and self.R & (self.R - 1) == 0 and self.VH % self.KH == 0
         assert self.T >= 1 and self.B % self.T == 0, (self.B, self.T)
@@ -475,6 +497,11 @@ ARPIPE_OFF_B = (20, 24, 32)
 ARPIPE_H1_ON = True
 AR0S_ON = True
 FUSED_WIDE_NBD = {32: 12, 40: 12, 48: 12, 56: 11, 64: 9, 80: 8, 96: 5, 112: 2}
+# Wide step (mb_rows > 0): dense ring slots, gathered rows per routed-expert tile, and the row
+# count above which the all-rows MoE buffers no longer fit VMEM beside the microbatch buffers.
+WIDE_NBD = 8
+WIDE_CAP = 32
+WIDE_MAX_ROWS = 256
 
 # ROUTE_SHRINK (VEC route): shorter serial scalar chain from the EARLY_FILL issue to the first
 # expert compute. The copy-candidate scan packs each candidate's copy slot (its meta lane) above
@@ -511,6 +538,11 @@ def default_tiles(c: MKConfig) -> Tiles:
     meshes (e.g. R=16) they become the flat all-reduce (hier=0): reduce-scatter + all-gather where
     the bucket has rsag, the one-shot push at 1..4 rows. At R=16 on 2x2x2 flat rsag beats the
     log2(R)-step butterfly (hier=3) by 10-21% of the step at 8..32 rows."""
+    if c.wide:
+        # the microbatch's tiles; the dense ring keeps every tile of one input projection (the
+        # attention and GatedDeltaNet blocks take them at once)
+        t = default_tiles(c.microbatch())
+        return dataclasses.replace(t, nbd=min(t.nbd, WIDE_NBD))
     # EP mode has 12 tiles per expert (T13=8, T2=4); nbe=12 fits 1 whole expert in the ring and
     # unlocks PIPE_EP (overlapping 1 w2 tile of expert i with 2 w13 tiles of expert i+1).
     nbe_ep = 12 if not c.moe_tp else 10

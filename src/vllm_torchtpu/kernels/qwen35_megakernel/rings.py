@@ -60,6 +60,9 @@ class DenseWeightRing:
         T_TOTAL, skip = ctx.T_TOTAL, ctx.skip
         t_block, t_gdn, t_att, AE, NBD = ctx.t_block, ctx.t_gdn, ctx.t_att, ctx.AE, ctx.NBD
         nt = ctx.nt
+        if ctx.WIDE_MB:
+            self.fetch_wide(g)
+            return
 
         @pl.when(jnp.logical_and(g < T_TOTAL, "dense" not in skip))
         def _():
@@ -108,6 +111,63 @@ class DenseWeightRing:
                     (blk, layer),
                     bank,
                 )
+
+    def fetch_wide(self, g):
+        """Wide step: a layer's dense stream is N_MB copies of the mixer tiles (input then
+        output projection, one per microbatch) followed by the MoE dense tiles (router, sh13,
+        sh2) once."""
+        ctx = self.ctx
+        T_TOTAL, skip = ctx.T_TOTAL, ctx.skip
+        t_block, t_gdn, t_att, AE, NBD = ctx.t_block, ctx.t_gdn, ctx.t_att, ctx.AE, ctx.NBD
+        nt, N_MB, MB_GDN, MB_ATT = ctx.nt, ctx.N_MB, ctx.MB_GDN, ctx.MB_ATT
+
+        @pl.when(jnp.logical_and(g < T_TOTAL, "dense" not in skip))
+        def _():
+            blk = g // t_block
+            sub = g - blk * t_block
+            lt = jnp.minimum(sub // t_gdn, AE - 1)
+            r = sub - lt * t_gdn
+            layer = blk * AE + lt
+            bank = g % NBD
+
+            def issue(lt_s, names, per_mb):
+                mb_tiles = N_MB * per_mb
+                ords = (
+                    (blk if lt_s == AE - 1 else blk * (AE - 1) + lt_s),
+                    layer,
+                )
+                a0 = nt[names[0]]
+
+                @pl.when(r < mb_tiles)
+                def _mixer():
+                    rr = lax.rem(r, per_mb)
+                    self.seg_issue(
+                        [(names[0], 0, a0, 0), (names[1], a0, per_mb, 0)], rr, ords, bank
+                    )
+
+                @pl.when(r >= mb_tiles)
+                def _moe():
+                    rm = r - mb_tiles
+                    b1 = nt["router"]
+                    b2 = b1 + nt["sh13"]
+                    self.seg_issue(
+                        [("router", 0, b1, 1), ("sh13", b1, b2, 1), ("sh2", b2, b2 + nt["sh2"], 1)],
+                        rm,
+                        ords,
+                        bank,
+                    )
+
+            if AE > 1:
+                @pl.when(lt < AE - 1)
+                def _gdn():
+                    for lt_s in range(AE - 1):
+                        pl.when(lt == lt_s)(
+                            lambda lt_s=lt_s: issue(lt_s, ("lin_in", "lin_out"), MB_GDN)
+                        )
+
+            @pl.when(lt == AE - 1)
+            def _att():
+                issue(AE - 1, ("att_in", "att_out"), MB_ATT)
 
     def dtake(self, kind: str, g):
         ctx = self.ctx
@@ -228,9 +288,13 @@ class DenseWeightRing:
     def fetch_rel(self, g, blk, lt, r: int, dt=None, dt_vals=(0,), lts=None):
         """fetch(g) for g = tile r + dt of layer lt of block blk: r a trace-time int, dt None or
         a traced int taking only the trace-time values dt_vals, lt an int or traced (taking only
-        the values lts). The (layer, kind) decode of tile g is resolved at trace time."""
+        the values lts). The (layer, kind) decode of tile g is resolved at trace time. A wide
+        step decodes at run time (the stream position depends on the microbatch)."""
         ctx = self.ctx
         AE, L, NBD, skip, W = ctx.AE, ctx.L, ctx.NBD, ctx.skip, ctx.W
+        if ctx.WIDE_MB:
+            self.fetch_wide(g)
+            return
         if not isinstance(lt, int):
             for lt_s in (range(AE) if lts is None else lts):
                 pl.when(lt == lt_s)(

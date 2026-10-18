@@ -67,6 +67,7 @@ def bare_mk(monkeypatch, **attrs) -> VA.Qwen35Megakernel:
     mk.fused_pool_io = True
     mk.fused_pool_io_max_b = VA.parse_mk_fused_pool_io_max_b()
     mk.fused_pool_io_min_b_hi = VA.parse_mk_fused_pool_io_min_b_hi()
+    mk.wide_mb = VA.parse_mk_wide_mb("0")
     mk._bucket_steps, mk._bucket_ops, mk._bucket_out_rows = {}, {}, {}
     mk._bucket_fused, mk._prep_steps = {}, {}
     for k, v in attrs.items():

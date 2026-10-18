@@ -183,3 +183,29 @@ def test_split_step_slices_rows_per_microbatch_and_chains_pools(monkeypatch):
     # the 80-row op ran twice, the 32-row op once, and the pools passed through all three
     assert ops[80].calls == 2 and ops[32].calls == 1
     assert torch.equal(pools[0], torch.full((2,), 3.0))
+
+
+def test_wide_mb_routes_mid_buckets_to_one_call(monkeypatch):
+    """With VLLM_TPU_QWEN35_MK_WIDE_MB set, verify buckets up to WIDE_MAX_ROWS build as one
+    wide call (mb_rows forwarded) and wider ones keep the split plan."""
+    mk = bare_mk(monkeypatch, buckets=(4,), verify_buckets=(64, 192, 256, 800))
+    mk._runner_token_paddings = ()
+    mk.wide_mb = 64
+    seen = {}
+
+    def fake_single(b, tokens_per_seq=1, out_pad_rows=None, mb_rows=0):
+        seen[(tokens_per_seq, b)] = mb_rows
+        mk._bucket_fused[(tokens_per_seq, b)] = bool(mb_rows)
+        return ("single", b, mb_rows)
+
+    def fake_split(b, tokens_per_seq=1, out_pad_rows=None):
+        return ("split", b)
+
+    mk._build_bucket_op = fake_single
+    mk._build_split_bucket_op = fake_split
+    mk._build_all_buckets()
+    assert seen == {(1, 4): 0, (4, 64): 0, (4, 192): 64, (4, 256): 64}, seen
+    assert mk._bucket_steps[(4, 800)] == ("split", 800)
+    assert VA.parse_mk_wide_mb("0") == 0 and VA.parse_mk_wide_mb("64") == 64
+    with pytest.raises(Exception):
+        VA.parse_mk_wide_mb("100")
