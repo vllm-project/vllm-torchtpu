@@ -185,7 +185,6 @@ def test_default_tiles_r16_only_change_the_all_reduce():
         for base in (K.FULL_EP, K.FULL):
             t8 = K.default_tiles(dataclasses.replace(base, B=b))
             t16 = K.default_tiles(dataclasses.replace(base, R=16, B=b))
-            assert t16.hier == (3 if b <= 32 else 0), b
+            assert t16.hier == 0, b
             assert dataclasses.replace(t16, hier=t8.hier) == t8, b
-            if b > 32:
-                assert t16.rsag
+            assert t16.rsag == (b > 4), b

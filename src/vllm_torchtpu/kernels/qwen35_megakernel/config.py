@@ -508,9 +508,9 @@ def default_tiles(c: MKConfig) -> Tiles:
     (WIDE_TILES with nbd=8, hier=2) and 49..64 rows (nbd=8 up to 56 rows, nbd=7 above).
 
     The hierarchical all-reduces (hier=1 / 2) are built for the 2x2x1 v7x-8 topology. On other
-    meshes (e.g. R=16) they become the log2(R)-step butterfly (hier=3) up to 32 rows and the flat
-    reduce-scatter + all-gather (hier=0 with rsag) above, where the butterfly's per-round
-    [MR, H] buffers would not fit VMEM."""
+    meshes (e.g. R=16) they become the flat all-reduce (hier=0): reduce-scatter + all-gather where
+    the bucket has rsag, the one-shot push at 1..4 rows. At R=16 on 2x2x2 flat rsag beats the
+    log2(R)-step butterfly (hier=3) by 10-21% of the step at 8..32 rows."""
     # EP mode has 12 tiles per expert (T13=8, T2=4); nbe=12 fits 1 whole expert in the ring and
     # unlocks PIPE_EP (overlapping 1 w2 tile of expert i with 2 w13 tiles of expert i+1).
     nbe_ep = 12 if not c.moe_tp else 10
@@ -535,7 +535,7 @@ def default_tiles(c: MKConfig) -> Tiles:
     else:
         t = dataclasses.replace(DEFAULT_TILES, nbe=nbe_small, ecopy_opt=1)
     if c.R != 8 and t.hier in (1, 2):
-        t = dataclasses.replace(t, hier=3 if c.B <= 32 else 0)
+        t = dataclasses.replace(t, hier=0)
     if c.T > 1 and c.paged_kv and c.fused_pool_io and c.B in FUSED_WIDE_NBD:
         t = dataclasses.replace(t, nbd=FUSED_WIDE_NBD[c.B])
     if c.NGDN == 0:
