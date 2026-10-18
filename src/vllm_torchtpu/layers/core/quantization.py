@@ -62,6 +62,16 @@ def is_floating_dtype(dtype: torch.dtype) -> bool:
     return torch.is_floating_point(torch.empty((), dtype=dtype))
 
 
+def materialize_static_scale(scale: torch.Tensor) -> torch.Tensor:
+    """Materialize a static scale in its logical shape during weight loading.
+
+    TorchTPU can retain a higher-rank physical buffer after clone or copy.
+    A one-time CPU transfer removes that view, avoiding per-step device copies.
+    This helper must not run in the inference path.
+    """
+    return scale.cpu().contiguous().to(device=scale.device)
+
+
 def _safe_inverse_scale(scale: torch.Tensor) -> torch.Tensor:
     """Return 1 / scale while keeping zero-scale blocks exactly zero."""
     return torch.where(scale == 0, torch.zeros_like(scale), 1.0 / scale)

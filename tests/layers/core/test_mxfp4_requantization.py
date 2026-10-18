@@ -42,6 +42,7 @@ from vllm_torchtpu.layers.core.quantization import (  # isort: skip
     dequantize_mxfp4_packed,
     e8m0_to_fp32,
     fp4_indices_to_float,
+    materialize_static_scale,
     pack_fp4_indices,
     quantize_tensor_to_fp4,
     unpack_uint8_to_fp4,
@@ -478,3 +479,21 @@ class TestFullDequantRequantCycle:
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.parametrize("shape", [(3, 16, 128), (3, 8, 128), (128, 1, 1)])
+def test_materialize_static_scale_preserves_bits(shape):
+    """Load-time layout materialization preserves all FP32 bits and dimensions."""
+    bits = torch.tensor(
+        [0, -2147483648, 1065353216, 2139095040, -8388608, 2143289345],
+        dtype=torch.int32,
+    )
+    count = int(np.prod(shape))
+    source = bits.repeat((count + len(bits) - 1) // len(bits))[:count]
+    scale = source.view(torch.float32).reshape(shape).transpose(0, -1)
+    result = materialize_static_scale(scale)
+    assert result.shape == scale.shape
+    assert result.dtype == scale.dtype
+    assert result.device == scale.device
+    assert result.is_contiguous()
+    assert torch.equal(result.view(torch.int32), scale.contiguous().view(torch.int32))

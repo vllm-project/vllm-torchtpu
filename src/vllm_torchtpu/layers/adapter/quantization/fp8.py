@@ -94,7 +94,11 @@ from vllm_torchtpu.layers.adapter.quantization.online_fp8 import (
     quantize_online_fp8,
 )
 from vllm_torchtpu.layers.core.quant_methods import FP8, get_tpu_quant_method
-from vllm_torchtpu.layers.core.quantization import dequantize_tensor, quantize_tensor
+from vllm_torchtpu.layers.core.quantization import (
+    dequantize_tensor,
+    materialize_static_scale,
+    quantize_tensor,
+)
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import synchronize_tensors
 
@@ -1380,11 +1384,7 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
         weight = torch.empty(
             weight.shape[0], weight.shape[1], dtype=weight.dtype, device=weight.device
         ).copy_(weight)
-        weight_scale = torch.empty(
-            *weight_scale.shape,
-            dtype=weight_scale.dtype,
-            device=weight_scale.device,
-        ).copy_(weight_scale)
+        weight_scale = materialize_static_scale(weight_scale)
 
         replace_parameter(
             layer, "weight", torch.nn.Parameter(weight, requires_grad=False)
