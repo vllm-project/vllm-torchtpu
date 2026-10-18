@@ -13,6 +13,7 @@ import functools
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
+from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 from jax.experimental.pallas import tpu_sc as plsc
 
@@ -31,6 +32,7 @@ def _ordered_bits(keys: jax.Array) -> jax.Array:
         "block_size",
         "reconstruct_threshold",
         "exclude_neg_inf",
+        "scheduling_group_id",
     ),
 )
 def streaming_topk(
@@ -41,6 +43,7 @@ def streaming_topk(
     block_size: int = 8192,
     reconstruct_threshold: int = 8192,
     exclude_neg_inf: bool = False,
+    scheduling_group_id: int | None = None,
 ) -> jax.Array:
     """Return unordered logical TopK indices, padded with -1.
 
@@ -351,6 +354,10 @@ def streaming_topk(
             ).wait()
 
     result = kernel(scores, lengths)
+    if scheduling_group_id is not None:
+        result = xla_metadata.set_xla_metadata(
+            result, _scheduling_group_id=scheduling_group_id
+        )
     if output_width != k:
         result = jax.tree.map(lambda x: x[:, :k], result)
     return result

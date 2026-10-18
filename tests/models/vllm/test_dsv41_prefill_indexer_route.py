@@ -97,7 +97,17 @@ def test_prefill_route_excludes_decode_and_mixed(
         assert halfplane == expected_halfplane
         return jnp.ones((q.shape[0], records.shape[1]), jnp.float32)
 
-    def new_score(q, weights, pool, shared_records, limit, *, page_records, halfplane):
+    def new_score(
+        q,
+        weights,
+        pool,
+        shared_records,
+        limit,
+        *,
+        page_records,
+        halfplane,
+        scheduling_group_id=None,
+    ):
         assert halfplane == expected_halfplane
         assert page_records == 128
         # The active request need not be row zero. Pass all records to preserve

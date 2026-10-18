@@ -12,6 +12,7 @@ import math
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
+from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 
 from ..index_word_scores import DIM, ROW_WORDS, SLOTS, unpack_word_rows
@@ -244,6 +245,7 @@ def _kernel(
         "prefetch",
         "profile_stages",
         "halfplane",
+        "scheduling_group_id",
     ),
 )
 def prefill_index_scores(
@@ -262,6 +264,7 @@ def prefill_index_scores(
     profile_stages: bool = False,
     halfplane: bool = False,
     records: jax.Array | None = None,
+    scheduling_group_id: int | None = None,
 ) -> jax.Array:
     """Score one shared request; caller applies per-query causal lengths.
 
@@ -313,7 +316,7 @@ def prefill_index_scores(
         else math.gcd(width, max(key_tile, tuned_block_sizes.SCORE_WINDOW))
     )
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    return pl.pallas_call(
+    result = pl.pallas_call(
         functools.partial(
             _kernel,
             page_records=page_records,
@@ -359,3 +362,8 @@ def prefill_index_scores(
         interpret=interpret,
         name="prefill_paged_bf16_index_scores",
     )(pages.reshape(-1), row_limit, q, weights, pool, records)
+    if scheduling_group_id is not None:
+        result = xla_metadata.set_xla_metadata(
+            result, _scheduling_group_id=scheduling_group_id
+        )
+    return result

@@ -19,6 +19,8 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import config
+
 QUERY_TILE = 32
 KEY_TILE = 128
 HEAD_DIM = 128
@@ -493,21 +495,29 @@ def native_paged_scores(
 def pipeline_score_topk_bounded(
     num_tiles: int,
     prepare: Callable[[jax.Array], Any],
-    score: Callable[[Any], jax.Array],
-    select: Callable[[jax.Array, jax.Array], Any],
+    score: Callable[[Any, int | None], jax.Array],
+    select: Callable[[jax.Array, jax.Array, int | None], Any],
     write: Callable[[jax.Array, Any, Any], Any],
     output: Any,
 ) -> Any:
-    """Bound prefetch and score lifetime for the chunk-2K prefill route."""
+    """Bound score lifetime and pair next-tile scoring with current selection.
+
+    Callbacks accept an optional scheduling group after their data arguments.
+    Each pair gets a program-unique group so the compiler keeps TensorCore
+    scoring between SparseCore selection start and completion.
+    """
     if num_tiles < 1:
         raise ValueError("The score/top-k pipeline requires at least one tile")
     if num_tiles > 16:
         return pipeline_score_topk(num_tiles, prepare, score, select, write, output)
 
+    group_base = (
+        config.reserve_scheduling_group_ids(num_tiles - 1) if num_tiles > 1 else 0
+    )
     # Gate current scores and next preparation on the previous selection
     # so unrolling does not extend every score buffer's lifetime.
     with jax.named_scope("DSV41ScoreTopKBoundedPipeline"):
-        current = score(prepare(jnp.int32(0)))
+        current = score(prepare(jnp.int32(0)), None)
         previous = None
         for tile in range(num_tiles - 1):
             prepared = prepare(jnp.int32(tile + 1))
@@ -516,14 +526,15 @@ def pipeline_score_topk_bounded(
                     (previous, current, prepared)
                 )
                 output = write(jnp.int32(tile - 1), previous, output)
-            following = score(prepared)
-            previous = select(jnp.int32(tile), current)
+            group = group_base + tile
+            following = score(prepared, group)
+            previous = select(jnp.int32(tile), current, group)
             current = following
         if previous is not None:
             previous, current = lax.optimization_barrier((previous, current))
             output = write(jnp.int32(num_tiles - 2), previous, output)
         last = jnp.int32(num_tiles - 1)
-        return write(last, select(last, current), output)
+        return write(last, select(last, current, None), output)
 
 
 def pipeline_score_topk(num_tiles, prepare, score, select, write, output):

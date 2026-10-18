@@ -2562,7 +2562,15 @@ def _decode_select(
 
 
 def _prefill_score(
-    q, weights, pool, records, limit, *, page_records, halfplane: bool = False
+    q,
+    weights,
+    pool,
+    records,
+    limit,
+    *,
+    page_records,
+    halfplane: bool = False,
+    scheduling_group_id: int | None = None,
 ):
     """Resident-query scorer, manually replicated across the wrapper mesh."""
     from jax.sharding import PartitionSpec as P
@@ -2583,6 +2591,7 @@ def _prefill_score(
             key_tile=prefill_tuning.KEY_TILE,
             records=records,
             halfplane=halfplane,
+            scheduling_group_id=scheduling_group_id,
         )
 
     try:
@@ -2594,7 +2603,7 @@ def _prefill_score(
     )(q, weights, pool, records, limit)
 
 
-def _prefill_top_k(scores, lengths):
+def _prefill_top_k(scores, lengths, *, scheduling_group_id: int | None = None):
     from jax.sharding import PartitionSpec as P
 
     from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
@@ -2602,7 +2611,9 @@ def _prefill_top_k(scores, lengths):
     )
 
     def select(s, n):
-        ids = streaming_topk.streaming_topk(s, valid_lengths=n, k=512)
+        ids = streaming_topk.streaming_topk(
+            s, valid_lengths=n, k=512, scheduling_group_id=scheduling_group_id
+        )
         values = jnp.take_along_axis(s, jnp.maximum(ids, 0), axis=1)
         ids = jnp.where((ids >= 0) & (values > -jnp.inf), ids, -1)
         return _compact_selected(ids)
@@ -2945,7 +2956,7 @@ def paged_indexer_jax(
                     return (*values[:-1], local_requests, row_records)
                 return (*values, records)
 
-            def score(args):
+            def score(args, scheduling_group_id: int | None = None):
                 queries, row_weights, row_lengths, _, row_requests, row_records = args
                 if use_prefill:
                     # The outer route proves every live query shares a request.
@@ -2962,6 +2973,7 @@ def paged_indexer_jax(
                         jnp.max(row_lengths, keepdims=True),
                         page_records=page_records,
                         halfplane=halfplane,
+                        scheduling_group_id=scheduling_group_id,
                     )
                 else:
                     scores = paged_index_scores_jax(
@@ -2978,10 +2990,12 @@ def paged_indexer_jax(
                     jnp.take(row_records >= 0, row_requests, axis=0), scores, -jnp.inf
                 )
 
-            def select(i, scores):
+            def select(i, scores, scheduling_group_id: int | None = None):
                 _, _, row_lengths, row_candidates, _, _ = prepare(i)
                 if use_prefill:
-                    selected = _prefill_top_k(scores, row_lengths)
+                    selected = _prefill_top_k(
+                        scores, row_lengths, scheduling_group_id=scheduling_group_id
+                    )
                     return selected, row_candidates
                 return select_indices_jax(
                     scores,
