@@ -1763,8 +1763,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     packed=(
                         getattr(index_cache, "index_key_layout", "ordinary")
                         == "halfplane"
-                        and tuple(records.shape) == (48, 98816)
-                        and capacity == 49152
                     ),
                 )
                 stage_cache[cache_key] = prepared

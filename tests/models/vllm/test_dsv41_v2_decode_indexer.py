@@ -977,19 +977,24 @@ def test_candidate_envelope_keeps_token_rows_dynamic():
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize(
-    "groups,width,layout,packed",
+    "groups,width,layout,capacity,packed",
     [
-        (2, 98304, "ordinary", False),
-        (48, 98816, "halfplane", True),
-        (48, 98816, "ordinary", False),
-        (24, 98816, "halfplane", False),
-        (48, 98304, "halfplane", False),
+        (2, 98304, "ordinary", 49152, False),
+        (48, 98816, "halfplane", 49152, True),
+        (48, 98816, "ordinary", 49152, False),
+        (24, 98816, "halfplane", 49152, True),
+        (48, 98304, "halfplane", 49152, True),
+        (8, 65536, "halfplane", 32768, True),
+        (2, 1048576, "halfplane", 49152, True),
     ],
 )
 def test_candidate_cache_reuses_only_within_stage_and_source_version(
-    monkeypatch, groups, width, layout, packed
+    monkeypatch, groups, width, layout, capacity, packed
 ):
-    """Four reindexes share keys; publication, source and new stage invalidate."""
+    """Eligible halfplane shapes share packed keys only within a source stage."""
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection import tuned_block_sizes
+
+    monkeypatch.setattr(tuned_block_sizes, "CANDIDATE_KEY_CAPACITY", capacity)
     count = groups * 6
     attn = TestAttentionSelectPagedIndicesDecode()._setup_mock_attn(
         monkeypatch, ranks=1
@@ -1015,6 +1020,7 @@ def test_candidate_cache_reuses_only_within_stage_and_source_version(
 
     def prepare(cache, records, candidates, requests, lengths, **kwargs):
         assert kwargs["packed"] is packed
+        assert kwargs["capacity"] == capacity
         result = object()
         prepared.append((result, requests.clone()))
         return result
