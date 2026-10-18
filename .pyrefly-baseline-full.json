@@ -121,11 +121,6 @@
       "concise_description": "Object of class `FunctionType` has no attribute `_tpu_same_step_prefix_hit_patch`"
     },
     {
-      "path": "src/vllm_torchtpu/compilation/tpu_compiler.py",
-      "name": "no-matching-overload",
-      "concise_description": "No matching overload found for function `posixpath.join` called with arguments: (str | None, str)"
-    },
-    {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/kv_scatter.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `custom_jax_kernel`"
@@ -137,186 +132,11 @@
     },
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `TPUConnectorScheduler` has no attribute `_stage3_fa_group_index`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `TPUConnectorScheduler` has no attribute `_stage3_transfer_groups`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `TPUConnectorScheduler` has no attribute `_stage3_mamba_group_indices`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `TPUConnectorScheduler` has no attribute `_stage3_mamba_num_speculative_blocks`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
       "name": "bad-override",
       "concise_description": "Class member `TPUConnector.start_load_kv` overrides parent class `KVConnectorBase_V1` in an inconsistent manner"
     },
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `is_kv_producer`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `get`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `list[int] | None` is not assignable to parameter `obj` with type `Sized` in function `len`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `get`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `get`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `get`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `list[int] | None` is not assignable to parameter `obj` with type `Sized` in function `len`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `list[int] | None` is not assignable to parameter `obj` with type `Sized` in function `len`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "unsupported-operation",
-      "concise_description": "Cannot set item in `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
       "name": "unsupported-operation",
       "concise_description": "Cannot set item in `dict[str, LoadMeta]`"
     },
@@ -329,71 +149,11 @@
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
       "name": "unsupported-operation",
       "concise_description": "Cannot set item in `dict[str, LoadMeta]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `is_kv_producer`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `kv_cache_groups`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `kv_cache_groups`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Any | None` is not assignable to parameter `manifest` with type `PoolManifest` in function `vllm_torchtpu.distributed.kv_transfer.raiden.seq_on_lane.sol_fa_geometry_from_manifest`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `binding`"
     },
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
       "name": "unbound-name",
       "concise_description": "`payload` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Any | None` is not assignable to parameter `manifest` with type `PoolManifest` in function `vllm_torchtpu.distributed.kv_transfer.raiden.seq_on_lane.sol_fa_geometry_from_manifest`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `pools`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "not-iterable",
-      "concise_description": "Type `None` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `items`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Any | None` is not assignable to parameter `manifest` with type `PoolManifest` in function `vllm_torchtpu.distributed.kv_transfer.raiden.seq_on_lane.sol_fa_geometry_from_manifest`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `int`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | list[int]` is not assignable to parameter `x` with type `Buffer | SupportsIndex | SupportsInt | SupportsTrunc | str` in function `int.__new__`"
     },
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector_stats.py",
@@ -1857,11 +1617,6 @@
     },
     {
       "path": "src/vllm_torchtpu/spec_decode/utils.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `Tensor`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/utils.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `Tensor` has no attribute `embed_tokens`"
     },
@@ -1889,11 +1644,6 @@
       "path": "src/vllm_torchtpu/spec_decode/utils.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `Tensor` has no attribute `weight`"
-    },
-    {
-      "path": "src/vllm_torchtpu/spec_decode/utils.py",
-      "name": "not-callable",
-      "concise_description": "Expected a callable, got `Tensor`"
     },
     {
       "path": "src/vllm_torchtpu/spec_decode/utils.py",

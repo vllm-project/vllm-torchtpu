@@ -37,6 +37,8 @@ from vllm_torchtpu.utils import synchronize_tensors
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
+    from vllm.model_executor.models.interfaces import SupportsMultiModal
+
     from vllm_torchtpu.layers.core.attention_metadata import (
         AttentionMetadataBuilderContext,
     )
@@ -223,7 +225,7 @@ def maybe_share_embeddings(
     force_share: bool = False,
 ) -> None:
     target_lm = (
-        target_model.get_language_model()
+        cast("SupportsMultiModal", target_model).get_language_model()
         if hasattr(target_model, "get_language_model")
         else target_model
     )
@@ -368,7 +370,7 @@ def maybe_share_lm_head(
     materialize_if_mismatched: bool = True,
 ) -> None:
     target_lm = (
-        target_model.get_language_model()
+        cast("SupportsMultiModal", target_model).get_language_model()
         if hasattr(target_model, "get_language_model")
         else target_model
     )

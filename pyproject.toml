@@ -248,6 +248,7 @@ python-version = "3.12"
 ignore-missing-imports = [
     "compressed_tensors", "compressed_tensors.*",
     "einops", "einops.*",
+    "fastapi", "fastapi.*",
     "google.protobuf", "google.protobuf.*",
     "jax", "jax.*",
     "jaxlib", "jaxlib.*",

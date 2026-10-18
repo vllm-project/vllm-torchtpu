@@ -849,6 +849,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         # recompile path in `load`, not this one.
         handle = None
         if caching and entry is not None:
+            assert self.cache_dir is not None
             save_path = os.path.join(self.cache_dir, key)
             if self._save_handle(
                 key, save_path, entry, graph, was_wrapped, fingerprint
