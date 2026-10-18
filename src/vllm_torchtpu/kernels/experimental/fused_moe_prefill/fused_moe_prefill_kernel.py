@@ -20,8 +20,9 @@ BF16 slab in HBM. The shared expert is one more visit over every token, with
 contiguous rows. The combine is fused_moe/v2's destination combine: per token,
 the router-weighted sum of its top-k routed rows (times `routed_scale`) plus
 its shared row, gated unless the shared expert has no gate.
-The sum over the ranks' intermediate shards is an all-reduce issued per
-combine chunk, so each chunk's all-reduce runs under the next chunk's combine.
+The sum over the ranks' intermediate shards is a reduce-scatter plus an
+all-gather issued per combine chunk, so each chunk's reduction runs under the
+next chunk's combine.
 
 With expert parallelism and TP attention a rank holds whole experts instead of
 slices and the call is the same, restricted to the rank's expert range.
@@ -693,9 +694,27 @@ def _quantize_rows(x, dtype):
     return q, scale.reshape(-1)
 
 
+def _psum_rows(y, axis_name):
+    """psum(y, axis_name) as a reduce-scatter over the rows plus an all-gather.
+
+    The same sum up to rounding order, but never one all-reduce of the whole
+    chunk: offloaded to the SparseCore, that all-reduce rounded the sum so that
+    the first token's attention sink formed too weakly for some GLM-5.2 prompts
+    (fp8 KV cache) and generation degenerated; this form served them correctly.
+    Rows are zero-padded to a multiple of the axis size and sliced back, so
+    every chunk shape takes this form."""
+    rows = y.shape[0]
+    pad = -rows % lax.axis_size(axis_name)
+    if pad:
+        y = jnp.pad(y, ((0, pad),) + ((0, 0),) * (y.ndim - 1))
+    y = lax.psum_scatter(y, axis_name, scatter_dimension=0, tiled=True)
+    y = lax.all_gather(y, axis_name, axis=0, tiled=True)
+    return y[:rows] if pad else y
+
+
 def _combine(slab, slab_row, coeff, axis_name):
     """out[t] = psum(sum_k coeff[t, k] * slab[slab_row[t, k]]) in equal token
-    chunks of at most _COMBINE_CHUNK_TOKENS."""
+    chunks of at most _COMBINE_CHUNK_TOKENS, each chunk reduced by _psum_rows."""
     tokens, slots = slab_row.shape
     h = slab.shape[1] * _LANES
     chunks = next(
@@ -722,9 +741,9 @@ def _combine(slab, slab_row, coeff, axis_name):
             y = y.astype(jnp.bfloat16)
         if outs:
             # Tie chunk c's input to chunk c - 1's reduced output so XLA keeps
-            # the all-reduces separate and each runs under the next combine.
+            # the reductions separate and each runs under the next combine.
             y, _ = lax.optimization_barrier((y, outs[-1]))
-        outs.append(lax.psum(y, axis_name))
+        outs.append(_psum_rows(y, axis_name))
     return outs[0] if chunks == 1 else jnp.concatenate(outs, 0)
 
 

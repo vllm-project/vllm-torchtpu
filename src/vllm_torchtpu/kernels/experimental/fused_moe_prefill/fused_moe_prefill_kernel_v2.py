@@ -48,6 +48,7 @@ from vllm_torchtpu.kernels.experimental.fused_moe_prefill.fused_moe_prefill_kern
     _WEIGHT_DMA_PRIORITY,
     _byte_transpose4,
     _cdiv,
+    _psum_rows,
     _quantize_rows,
     _routing_plan,
 )
@@ -906,7 +907,7 @@ def combine(slab, slab_row, coeff, axis_name, flat=False):
             y = jnp.sum(gathered * coeff[rows][..., None], axis=1).astype(jnp.bfloat16)
         if outs:
             y, _ = lax.optimization_barrier((y, outs[-1]))
-        outs.append(lax.psum(y, axis_name))
+        outs.append(_psum_rows(y, axis_name))
     return outs[0] if chunks == 1 else jnp.concatenate(outs, 0)
 
 
