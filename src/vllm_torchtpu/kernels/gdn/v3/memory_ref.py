@@ -343,9 +343,12 @@ class StateBufferedRef(BaseBufferedRef):
         # NOTE: With bounds checks disabled, the self-copy descriptor may
         # nominally exceed the window row; it is never executed, only used
         # to wait for the same number of bytes `copy_in` issued.
-        wait_ref = self._wait_slice(vmem_ref, dma_size)
-        pltpu.make_async_copy(wait_ref, wait_ref,
-                              sem).wait(strict_ordering=self.strict_ordering)
+        @pl.when(dma_size > 0)
+        def _():
+            wait_ref = self._wait_slice(vmem_ref, dma_size)
+            pltpu.make_async_copy(
+                wait_ref, wait_ref,
+                sem).wait(strict_ordering=self.strict_ordering)
 
     def copy_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
@@ -394,9 +397,12 @@ class StateBufferedRef(BaseBufferedRef):
         # NOTE: With bounds checks disabled, the self-copy descriptor may
         # nominally exceed the window row; it is never executed, only used
         # to wait for the same number of bytes `copy_out` issued.
-        wait_ref = self._wait_slice(vmem_ref, dma_size)
-        pltpu.make_async_copy(wait_ref, wait_ref,
-                              sem).wait(strict_ordering=self.strict_ordering)
+        @pl.when(dma_size > 0)
+        def _():
+            wait_ref = self._wait_slice(vmem_ref, dma_size)
+            pltpu.make_async_copy(
+                wait_ref, wait_ref,
+                sem).wait(strict_ordering=self.strict_ordering)
 
 
 @jax.tree_util.register_dataclass
@@ -574,9 +580,12 @@ class ExternalStateBufferedRef(StateBufferedRef):
         # sequence row. NOTE: With bounds checks disabled, the descriptor
         # may nominally exceed the window row; it is never executed, only
         # used to wait for the same number of bytes `copy_in` issued.
-        wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
-        pltpu.make_async_copy(wait_ref, wait_ref,
-                              sem).wait(strict_ordering=self.strict_ordering)
+        @pl.when(dma_size > 0)
+        def _():
+            wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
+            pltpu.make_async_copy(
+                wait_ref, wait_ref,
+                sem).wait(strict_ordering=self.strict_ordering)
 
     def wait_out(self, dst_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_sends is not None
@@ -596,9 +605,12 @@ class ExternalStateBufferedRef(StateBufferedRef):
         # Each checkpoint's copy covers one full region tile; wait for that
         # many region tiles along the window dim of one sequence row (the
         # descriptor may nominally exceed it, see wait_in's NOTE).
-        wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
-        pltpu.make_async_copy(wait_ref, wait_ref,
-                              sem).wait(strict_ordering=self.strict_ordering)
+        @pl.when(dma_size > 0)
+        def _():
+            wait_ref = vmem_ref.at[0, pl.ds(0, dma_size)]
+            pltpu.make_async_copy(
+                wait_ref, wait_ref,
+                sem).wait(strict_ordering=self.strict_ordering)
 
 
 def create_allocs(
@@ -668,8 +680,8 @@ def create_allocs(
     qkv_alloc = in_buffered_partial(spec=qkv_spec,
                                     dtype_or_type=qkv_ref,
                                     priority=1)
-    b_alloc = in_buffered_partial(spec=b_spec, dtype_or_type=b_ref)
-    a_alloc = in_buffered_partial(spec=a_spec, dtype_or_type=a_ref)
+    b_alloc = in_buffered_partial(spec=b_spec, dtype_or_type=b_ref, priority=1)
+    a_alloc = in_buffered_partial(spec=a_spec, dtype_or_type=a_ref, priority=1)
 
     out_alloc = OutBufferedRef.output(
         spec=block_spec_partial(block_shape=out_shape),
@@ -678,6 +690,7 @@ def create_allocs(
         use_lookahead=pipeline_mode.use_lookahead,
         cfg=cfg,
         metadata_ref=metadata_ref,
+        priority=1,
     )
 
     if cfg.state_plan is None:
