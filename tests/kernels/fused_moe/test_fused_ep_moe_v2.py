@@ -499,6 +499,146 @@ def test_sharded_routing_plan_is_bit_exact_with_the_replicated_plan():
     np.testing.assert_array_equal(np.asarray(sharded), np.asarray(replicated))
 
 
+@pytest.mark.parametrize("wire_dtype", [FP8, jnp.bfloat16], ids=["fp8", "bf16"])
+def test_pallas_combine_kernel_isolates_nan_arrivals_on_unrouted_padded_tokens(
+    wire_dtype,
+):
+    """Pallas `_build_combine_kernel` keeps NaN arrival rows on padded rows.
+
+    In `fused_ep_moe_v2`, a freshly allocated `arrivals` buffer may contain
+    zeroes on TPU rather than `NaN`. This single-chip test calls
+    `layer._combine_arrivals` directly at `t_local = COMBINE_MIN_TOKENS` (256),
+    where `kernel.combine_step_tokens(t_local) > 0` dispatches to the Pallas
+    DMA/reduce combine kernel (`_build_combine_kernel`), with `arrivals` and
+    `arrival_scales` explicitly poisoned with `NaN` at all sentinel positions,
+    followed by the layer's `jnp.where(row_routes, combined, jnp.zeros_like(combined))`.
+    """
+    t_local = kernel.COMBINE_MIN_TOKENS
+    assert kernel.combine_step_tokens(t_local) > 0
+    topk, lane_blocks, lanes, tile_m = 4, 2, 128, 128
+    hidden = lane_blocks * lanes
+    block = host.routing_block(t_local, topk)
+    recv_rows = block + 64
+    active = t_local // 2
+    padded = t_local - active
+
+    with jax.default_device(jax.devices()[0]):
+        arrivals_f32 = np.ones((recv_rows, lane_blocks, lanes), dtype=np.float32)
+        arrivals_f32[:block] = np.nan
+        arrivals = jnp.asarray(arrivals_f32).astype(wire_dtype)
+        assert np.isnan(np.asarray(arrivals[:block].astype(jnp.float32))).all()
+
+        scales_f32 = np.ones((4, tile_m), dtype=np.float32)
+        scales_f32[: block // tile_m, :] = np.nan
+        arrival_scales = jnp.asarray(scales_f32)
+
+        pos = np.full((t_local, topk), block, dtype=np.int32)
+        mirror_pos = np.full((t_local, topk), block, dtype=np.int32)
+        topk_weights = np.full((t_local, topk), 1.0 / topk, dtype=np.float32)
+
+        # Sentinel pairs receive their rank in `[0, block)` within each routing block.
+        sentinel_ranks = (
+            np.arange(padded * topk, dtype=np.int32).reshape(padded, topk) % block
+        )
+        pos[active:] = sentinel_ranks
+        mirror_pos[active:] = sentinel_ranks
+        topk_weights[active:] = 0.0
+        row_routes = jnp.asarray([[True]] * active + [[False]] * padded)
+
+        combined = layer._combine_arrivals(
+            arrivals,
+            arrival_scales,
+            jnp.asarray(pos),
+            jnp.asarray(mirror_pos),
+            jnp.asarray(topk_weights),
+            jnp.bfloat16,
+        )
+        out = np.asarray(jnp.where(row_routes, combined, jnp.zeros_like(combined)))
+
+    assert np.isfinite(out).all()
+    np.testing.assert_allclose(out[:active].astype(np.float32), 1.0)
+    np.testing.assert_array_equal(
+        out[active:].astype(np.float32),
+        np.zeros((padded, hidden), dtype=np.float32),
+    )
+
+
+@pytest.mark.parametrize("sharded_plan", [False, True], ids=["replicated", "sharded"])
+@pytest.mark.parametrize("scoring_fn", ["softmax", "sigmoid", "sqrtsoftplus"])
+def test_padded_tokens_on_pallas_combine_and_all_padded_warmup(
+    sharded_plan, scoring_fn
+):
+    """Padded rows become exact zero and leave active rows bit-identical.
+
+    Runs at `t_local = 256` (`tokens = EP * 256 = 2048`), where
+    `kernel.combine_step_tokens(t_local) > 0` selects the Pallas combine
+    kernel (`_build_combine_kernel`) rather than the XLA epilogue. Also gates
+    the warmup (`_dummy_run`) case where every row on every shard is NaN-masked.
+    """
+    t_local = kernel.COMBINE_MIN_TOKENS
+    assert kernel.combine_step_tokens(t_local) > 0
+    tokens = EP * t_local
+    mesh = _mesh()
+    w1, w2, w1_scale, w2_scale = _make_weights(
+        mesh,
+        24,
+        hidden=SMALL["hidden"],
+        inter=SMALL["inter"],
+        e_total=SMALL["e_total"],
+        weight_format=WeightFormat.FP8,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        25,
+        tokens=tokens,
+        hidden=SMALL["hidden"],
+        e_total=SMALL["e_total"],
+    )
+    common = dict(
+        topk=SMALL["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP8,
+        sharded_plan=sharded_plan,
+        scoring_fn=scoring_fn,
+    )
+    unmasked = np.asarray(
+        fused_ep_moe_v2(x, w1, w2, w1_scale, w2_scale, gating, **common)
+    )
+
+    # Mask the second half of each shard's rows (and all of shard 1's rows):
+    # use NaN on even shards and -inf on odd shards (matching token_layout.split
+    # replica padding) so both non-finite forms are verified under every scoring_fn.
+    gating_host = np.asarray(gating).copy()
+    valid_mask = np.ones(tokens, dtype=bool)
+    for d in range(EP):
+        start = d * t_local if d == 1 else d * t_local + t_local // 2
+        fill = np.nan if d % 2 == 0 else -np.inf
+        gating_host[start : (d + 1) * t_local, :] = fill
+        valid_mask[start : (d + 1) * t_local] = False
+    token_sharding = NamedSharding(mesh, P(AXIS))
+    gating_masked = jax.device_put(gating_host, token_sharding)
+
+    masked = np.asarray(
+        fused_ep_moe_v2(x, w1, w2, w1_scale, w2_scale, gating_masked, **common)
+    )
+    assert np.isfinite(masked).all()
+    np.testing.assert_array_equal(masked[valid_mask], unmasked[valid_mask])
+    np.testing.assert_array_equal(
+        masked[~valid_mask],
+        np.zeros_like(masked[~valid_mask]),
+    )
+
+    # All-padded batch (as in vLLM `_dummy_run` warmup): every row on every
+    # shard is non-finite.
+    gating_all_nan = jax.device_put(np.full_like(gating_host, np.nan), token_sharding)
+    all_padded_out = np.asarray(
+        fused_ep_moe_v2(x, w1, w2, w1_scale, w2_scale, gating_all_nan, **common)
+    )
+    np.testing.assert_array_equal(all_padded_out, np.zeros_like(all_padded_out))
+
+
 def test_nonidentity_mesh_order_relabels_after_topk_bit_exactly():
     """Physical expert placement may follow device order, not EP-rank order.
 
@@ -545,6 +685,73 @@ def test_nonidentity_mesh_order_relabels_after_topk_bit_exactly():
     placed = tuple(place_in_mesh_order(a) for a in (w1, w2, w1_scale, w2_scale))
     remapped = fused_ep_moe_v2(x, *placed, gating, mesh_ep_ranks=order, **common)
     np.testing.assert_array_equal(np.asarray(remapped), np.asarray(identity))
+
+
+@pytest.mark.parametrize("sharded_plan", [False, True])
+def test_split_stages_with_a_reordered_gather_are_bit_exact(sharded_plan):
+    """route, a caller-side gather in another order, compute == fused.
+
+    The caller gathers the wire rows in an order of its own -- block i of q_g
+    holds mesh index order[i]'s rows -- and tells compute where each mesh
+    index's block landed. Nothing else about the layer may change.
+    """
+    mesh = _mesh()
+    w1, w2, w1_scale, w2_scale = _make_weights(
+        mesh,
+        24,
+        hidden=SMALL["hidden"],
+        inter=SMALL["inter"],
+        e_total=SMALL["e_total"],
+        weight_format=WeightFormat.FP8,
+    )
+    x, gating = _make_inputs(
+        mesh,
+        25,
+        tokens=SMALL["tokens"],
+        hidden=SMALL["hidden"],
+        e_total=SMALL["e_total"],
+    )
+    common = dict(
+        topk=SMALL["topk"],
+        renormalize=True,
+        mesh=mesh,
+        capacity=CAPACITY,
+        weight_format=WeightFormat.FP8,
+        sharded_plan=sharded_plan,
+    )
+    weights = (w1, w2, w1_scale, w2_scale)
+    fused = fused_ep_moe_v2(x, *weights, gating, **common)
+
+    q, router_weights, payload = fused_ep_moe_v2(
+        x, *weights, gating, stage="route", **common
+    )
+    order = (0, 1, 6, 7, 2, 3, 4, 5)
+    blocks = np.asarray(q).reshape((EP, -1) + q.shape[1:])
+    gathered = blocks[np.asarray(order)].reshape(q.shape)
+    # Every shard holds the whole gather, as the caller's collective leaves it.
+    q_g = jax.device_put(np.concatenate([gathered] * EP), NamedSharding(mesh, P(AXIS)))
+    positions = tuple(order.index(i) for i in range(EP))
+    split = fused_ep_moe_v2(
+        x,
+        *weights,
+        gating,
+        stage="compute",
+        routed=(q_g, router_weights, payload),
+        gather_positions=positions,
+        **common,
+    )
+    np.testing.assert_array_equal(np.asarray(split), np.asarray(fused))
+
+    # The control: the same gather with compute told it is in mesh order.
+    wrong = fused_ep_moe_v2(
+        x,
+        *weights,
+        gating,
+        stage="compute",
+        routed=(q_g, router_weights, payload),
+        **common,
+    )
+    assert not np.array_equal(np.asarray(wrong), np.asarray(fused))
 
 
 @pytest.fixture(scope="module")

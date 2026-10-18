@@ -13,7 +13,10 @@ import pytest
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
-from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import TokenReplicaLayout
+from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import (
+    TokenReplicaLayout,
+    replica_wire_rows,
+)
 
 
 @pytest.mark.cpu_test
@@ -36,6 +39,7 @@ def test_singleton_preserves_unaligned_inputs_without_traced_operations(groups, 
     assert layout.local_rows == rows
 
 
+@pytest.mark.multichip
 @pytest.mark.parametrize(
     "groups",
     [
@@ -106,3 +110,43 @@ def test_unique_rows_and_original_output_on_every_tp_rank(groups, rows, alignmen
 def test_invalid_replica_groups_are_rejected(groups):
     with pytest.raises(ValueError):
         TokenReplicaLayout.create(ep=4, input_rows=16, groups=groups)
+
+
+@pytest.mark.parametrize("width", [1, 2, 3, 4, 8, 16])
+@pytest.mark.parametrize("alignment", [1, 2, 8, 16])
+def test_wire_rows_bound_the_layout_and_match_it_from_one_block(width, alignment):
+    """Never fewer rows than a member computes; the same from one block up."""
+    groups = (
+        None
+        if width == 1
+        else tuple(tuple(range(g * width, (g + 1) * width)) for g in range(2))
+    )
+    for rows in range(1, 4097):
+        local = TokenReplicaLayout.create(
+            ep=2 * width, input_rows=rows, groups=groups, row_alignment=alignment
+        ).local_rows
+        wire = replica_wire_rows(rows, width, alignment)
+        assert wire >= local
+        if width == 1 or -(-rows // width) > alignment // 2:
+            assert wire == local
+
+
+def test_wire_rows_leave_a_symbolic_row_count_unguarded():
+    """One graph serves every token count, as vLLM's MTP drafter requires.
+
+    The route op's fake sizes its outputs with replica_wire_rows over a
+    symbolic row count; any comparison on it would bound the traced graph.
+    """
+    import torch
+    from torch._dynamo.testing import CompileCounter
+
+    torch._dynamo.reset()
+    counter = CompileCounter()
+
+    @torch.compile(backend=counter, dynamic=True, fullgraph=True)
+    def fake(x):
+        return x.new_empty((replica_wire_rows(x.shape[0], 16, 8),))
+
+    for rows in (16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 100, 7):
+        assert fake(torch.empty(rows)).shape[0] == replica_wire_rows(rows, 16, 8)
+    assert counter.frame_count == 1

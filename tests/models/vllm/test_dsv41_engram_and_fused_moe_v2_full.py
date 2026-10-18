@@ -1901,11 +1901,11 @@ class TestV2KernelFull:
         assert s2.shape == (4, 1)
 
         # expert_ffn_blockscale
-        def w1_block(b):
-            return jnp.ones((16, 16), dtype=kernel.FP8)
+        def w1_block(b, n_start, n_end):
+            return jnp.ones((16, n_end - n_start), dtype=kernel.FP8)
 
-        def w2_block(b):
-            return jnp.ones((8, 16), dtype=kernel.FP8)
+        def w2_block(b, n_start, n_end):
+            return jnp.ones((8, n_end - n_start), dtype=kernel.FP8)
 
         w1s_blocks = jnp.ones((1, 16), dtype=jnp.float32)
         w2s_blocks = jnp.ones((1, 16), dtype=jnp.float32)
@@ -2701,10 +2701,10 @@ class TestV2KernelFull:
         mock_copy.wait.return_value = None
 
         def mock_blockscale(act_rows, act_scales, w1_block, w2_block, *args, **kwargs):
-            w1_block(0)
-            w1_block(1)
-            w2_block(0)
-            w2_block(1)
+            w1_block(0, 0, 256)
+            w1_block(1, 0, 256)
+            w2_block(0, 0, 128)
+            w2_block(1, 0, 128)
             return jnp.ones((32, 128), jnp.float32), jnp.ones((32, 1), jnp.float32)
 
         with (
