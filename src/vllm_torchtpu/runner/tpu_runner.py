@@ -21,6 +21,7 @@ import contextlib
 import copy
 import dataclasses
 import math
+import datetime
 import os
 import time
 from collections.abc import Callable, Collection, Iterator, Sequence
@@ -5991,9 +5992,23 @@ class TPUModelRunner(GPUModelRunner):
         # rank's store key. Ranks can finish streaming the target weights
         # further apart than that, so they meet first on the gloo group, whose
         # timeout is the CPU distributed timeout.
-        logger.info("Rank %d waiting at the draft load barrier", world.rank)
+        # The gloo group's default timeout is 30 min, shorter than a weight
+        # load under model-store contention (rank 6 of j-eca39730 and stage 3 of
+        # j-ced36433 were still streaming after 30 min and the barrier killed
+        # prefill). monitored_barrier takes an explicit timeout; default it to
+        # the bench's server wait.
+        timeout_s = float(os.environ.get("TPU_DRAFT_LOAD_BARRIER_TIMEOUT_S", "10800"))
+        logger.info(
+            "Rank %d waiting at the draft load barrier (timeout %.0f s)",
+            world.rank,
+            timeout_s,
+        )
         start = time.perf_counter()
-        torch.distributed.barrier(group=world.cpu_group)
+        torch.distributed.monitored_barrier(
+            group=world.cpu_group,
+            timeout=datetime.timedelta(seconds=timeout_s),
+            wait_all_ranks=True,
+        )
         logger.info(
             "Rank %d passed the draft load barrier after %.1f s",
             world.rank,
