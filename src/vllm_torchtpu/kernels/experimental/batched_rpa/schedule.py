@@ -108,6 +108,9 @@ class SmemWrapper:
 
     data: Any
     shape: tuple[int, ...] = dataclasses.field(metadata=dict(static=True))
+    base_offset: int = dataclasses.field(default=0, metadata=dict(static=True))
+    batch_stride: int = dataclasses.field(default=0,
+                                          metadata=dict(static=True))
 
     @classmethod
     def create_shape_dtype(cls, shape):
@@ -115,13 +118,26 @@ class SmemWrapper:
                    shape=shape)
 
     def _get_pos(self, indices):
+        if self.batch_stride > 0:
+            step = indices[0]
+            b_idx = indices[1]
+            sub_indices = indices[2:]
+            sub_shape = self.shape[2:]
+            sub_pos = 0
+            if sub_indices:
+                sub_strides = pl.strides_from_shape(sub_shape)
+                for stride, idx in zip(sub_strides, sub_indices):
+                    sub_pos += stride * idx
+            return (step * self.shape[1] +
+                    b_idx) * self.batch_stride + self.base_offset + sub_pos
+
         strides = pl.strides_from_shape(self.shape)
         assert len(strides) == len(indices)
 
         pos = 0
         for stride, idx in zip(strides, indices):
             pos += stride * idx
-        return pos
+        return self.base_offset + pos
 
     def __getitem__(self, indices):
         return self.data[self._get_pos(indices)]
@@ -135,8 +151,9 @@ class SmemWrapper:
 class SmemArrayOfStructs(SmemWrapper):
     """Maps physical 1-D data into logical Array of Structs."""
 
-    struct_cls: type = dataclasses.field(metadata=dict(static=True))
-    struct_size: int = dataclasses.field(metadata=dict(static=True))
+    struct_cls: type = dataclasses.field(default=SeqAlongLaneDmaNew,
+                                         metadata=dict(static=True))
+    struct_size: int = dataclasses.field(default=0, metadata=dict(static=True))
 
     @classmethod
     def create_shape_dtype(cls, shape, struct_cls, struct_size):
@@ -149,13 +166,26 @@ class SmemArrayOfStructs(SmemWrapper):
         )
 
     def _get_pos(self, indices):
+        if self.batch_stride > 0:
+            step = indices[0]
+            b_idx = indices[1]
+            sub_indices = indices[2:]
+            sub_shape = self.shape[2:]
+            sub_pos = 0
+            if sub_indices:
+                sub_strides = pl.strides_from_shape(sub_shape)
+                for stride, idx in zip(sub_strides, sub_indices):
+                    sub_pos += stride * idx
+            return ((step * self.shape[1] + b_idx) * self.batch_stride +
+                    self.base_offset + sub_pos * self.struct_size)
+
         strides = pl.strides_from_shape(self.shape)
         assert len(strides) == len(indices)
 
         pos = 0
         for stride, idx in zip(strides, indices):
             pos += stride * idx
-        return pos * self.struct_size
+        return self.base_offset + pos * self.struct_size
 
     def __getitem__(self, indices):
         pos_start = self._get_pos(indices)
@@ -165,48 +195,121 @@ class SmemArrayOfStructs(SmemWrapper):
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
 class RpaSchedule:
-    """Container for metadata arrays with integrated shape/spec logic."""
+    """Container for metadata arrays with integrated shape/spec logic.
 
-    s_idx: SmemWrapper  # [steps, batch]
-    q_idx: SmemWrapper  # [steps, batch]
-    k_idx: SmemWrapper  # [steps, batch]
-    is_last_k: SmemWrapper  # [steps, batch]
-    do_writeback: SmemWrapper  # [steps, batch]
-    dma_q: SmemWrapper  # [steps, batch, 2]
-    dma_kv_cache: SmemWrapper  # [steps, batch, bkv_p_cache, 3]
-    dma_kv_new: SmemArrayOfStructs  # [steps, batch, bkv_p_new]
-    actual_steps: Any  # [1]
+    Packs all per-(step, batch) metadata fields into a single contiguous 1-D
+    buffer `data` with step-major interleaved layout so that both
+    `rpa_metadata_schedule_kernel` and `rpa_kernel` transfer the schedule via a
+    single HBM<->SMEM DMA transaction instead of 8 separate DMAs.
+    """
+
+    data: Any  # [max_steps_ub * batch_size * words_per_batch]
+    actual_steps: Any  # [2]
 
     cfgs: configs.RpaConfigs = dataclasses.field(metadata=dict(static=True))
 
+    @property
+    def words_per_batch(self) -> int:
+        return (5 + 2 + 3 * self.cfgs.bkv_p_cache +
+                self.cfgs.bkv_p_new * self.cfgs.dma_kv_new_size)
+
+    @property
+    def s_idx(self) -> SmemWrapper:
+        return SmemWrapper(
+            data=self.data,
+            shape=(self.cfgs.max_steps_ub, self.cfgs.batch_size),
+            base_offset=0,
+            batch_stride=self.words_per_batch,
+        )
+
+    @property
+    def q_idx(self) -> SmemWrapper:
+        return SmemWrapper(
+            data=self.data,
+            shape=(self.cfgs.max_steps_ub, self.cfgs.batch_size),
+            base_offset=1,
+            batch_stride=self.words_per_batch,
+        )
+
+    @property
+    def k_idx(self) -> SmemWrapper:
+        return SmemWrapper(
+            data=self.data,
+            shape=(self.cfgs.max_steps_ub, self.cfgs.batch_size),
+            base_offset=2,
+            batch_stride=self.words_per_batch,
+        )
+
+    @property
+    def is_last_k(self) -> SmemWrapper:
+        return SmemWrapper(
+            data=self.data,
+            shape=(self.cfgs.max_steps_ub, self.cfgs.batch_size),
+            base_offset=3,
+            batch_stride=self.words_per_batch,
+        )
+
+    @property
+    def do_writeback(self) -> SmemWrapper:
+        return SmemWrapper(
+            data=self.data,
+            shape=(self.cfgs.max_steps_ub, self.cfgs.batch_size),
+            base_offset=4,
+            batch_stride=self.words_per_batch,
+        )
+
+    @property
+    def dma_q(self) -> SmemWrapper:
+        return SmemWrapper(
+            data=self.data,
+            shape=(self.cfgs.max_steps_ub, self.cfgs.batch_size, 2),
+            base_offset=5,
+            batch_stride=self.words_per_batch,
+        )
+
+    @property
+    def dma_kv_cache(self) -> SmemWrapper:
+        return SmemWrapper(
+            data=self.data,
+            shape=(
+                self.cfgs.max_steps_ub,
+                self.cfgs.batch_size,
+                self.cfgs.bkv_p_cache,
+                3,
+            ),
+            base_offset=7,
+            batch_stride=self.words_per_batch,
+        )
+
+    @property
+    def dma_kv_new(self) -> SmemArrayOfStructs:
+        return SmemArrayOfStructs(
+            data=self.data,
+            shape=(
+                self.cfgs.max_steps_ub,
+                self.cfgs.batch_size,
+                self.cfgs.bkv_p_new,
+            ),
+            base_offset=7 + 3 * self.cfgs.bkv_p_cache,
+            batch_stride=self.words_per_batch,
+            struct_cls=(SeqAlongLaneDmaNew if self.cfgs.serve.kv_layout
+                        == configs.KVLayout.SEQ_ALONG_LANE else
+                        HeadAlongSublaneDmaNew),
+            struct_size=self.cfgs.dma_kv_new_size,
+        )
+
     @classmethod
     def create_shape_dtype(cls, cfgs: configs.RpaConfigs):
-
-        idx_wrapper = SmemWrapper.create_shape_dtype(
-            (cfgs.max_steps_ub, cfgs.batch_size))
-
+        words_per_batch = (5 + 2 + 3 * cfgs.bkv_p_cache +
+                           cfgs.bkv_p_new * cfgs.dma_kv_new_size)
+        total_words = cfgs.max_steps_ub * cfgs.batch_size * words_per_batch
+        # Pad actual_steps to shape (2,) so XLA's ShapeUtil::IsEffectiveScalar
+        # returns False and passes it by HBM pointer rather than emitting a
+        # synchronous HBM->VMEM->VREG->v2sf->SREG caller stub before every
+        # rpa_kernel invocation.
         return cls(
-            s_idx=idx_wrapper,
-            q_idx=idx_wrapper,
-            k_idx=idx_wrapper,
-            is_last_k=idx_wrapper,
-            do_writeback=idx_wrapper,
-            dma_q=SmemWrapper.create_shape_dtype(
-                (cfgs.max_steps_ub, cfgs.batch_size, 2)),
-            dma_kv_cache=SmemWrapper.create_shape_dtype(
-                (cfgs.max_steps_ub, cfgs.batch_size, cfgs.bkv_p_cache, 3)),
-            dma_kv_new=SmemArrayOfStructs.create_shape_dtype(
-                (
-                    cfgs.max_steps_ub,
-                    cfgs.batch_size,
-                    cfgs.bkv_p_new,
-                ),
-                struct_cls=(SeqAlongLaneDmaNew if cfgs.serve.kv_layout
-                            == configs.KVLayout.SEQ_ALONG_LANE else
-                            HeadAlongSublaneDmaNew),
-                struct_size=cfgs.dma_kv_new_size,
-            ),
-            actual_steps=jax.ShapeDtypeStruct((1, ), jnp.int32),
+            data=jax.ShapeDtypeStruct((total_words, ), jnp.int32),
+            actual_steps=jax.ShapeDtypeStruct((2, ), jnp.int32),
             cfgs=cfgs,
         )
 
@@ -242,13 +345,9 @@ class RpaSchedule:
         """Returns a Pytree of input BlockSpecs."""
 
         def wrapper(x):
-            if x.size == 1:
+            if x.size <= 2:
                 return pl.BlockSpec(memory_space=pltpu.SMEM)
             else:
-                # Since we use maximum upper bound when allocating scheduler data,
-                # it is not feasible to use scalar prefetch and fetch entire scheduler
-                # data into the kernel. Instead, we stored it to HBM first and perform
-                # dynamic sized DMA inside the kernel using actual number of steps.
                 return pl.BlockSpec(memory_space=pltpu.HBM)
 
         return jax.tree.map(wrapper, self)
@@ -545,6 +644,7 @@ def rpa_metadata_schedule_kernel(
         max_steps = jnp.maximum(max_steps, lane_lengths_ref[b_idx])
 
     schedule_ref.actual_steps[0] = max_steps
+    schedule_ref.actual_steps[1] = 0
 
     safe_max_steps = jnp.minimum(max_steps + cfgs.n_buffer + 1,
                                  cfgs.max_steps_ub)
@@ -582,25 +682,27 @@ def rpa_metadata_schedule_kernel(
         mask_step_fn = functools.partial(mask_out_steps, b_idx=b_idx)
         jax.lax.fori_loop(start_step, safe_max_steps, mask_step_fn, None)
 
-    # Ste 4: Write back results to HBM.
-    flat_hbm = jax.tree_util.tree_leaves(schedule_hbm_ref)
-    flat_smem = jax.tree_util.tree_leaves(schedule_ref)
-    dma_list = []
-    for h, s in zip(flat_hbm, flat_smem):
-        write_size = h.shape[0]
-        if write_size > 1:
-            write_size = (write_size // cfgs.max_steps_ub) * safe_max_steps
-            write_size = utils.align_to(write_size, 1024)
-
-        copy = pltpu.make_async_copy(
-            s.at[pl.ds(0, write_size)],
-            h.at[pl.ds(0, write_size)],
-            dma_sem.at[0],
-        )
-        dma_list.append(copy)
-
-    jax.tree.map(lambda x: x.start(), dma_list)
-    jax.tree.map(lambda x: x.wait(), dma_list)
+    # Step 4: Write back results to HBM.
+    total_words = schedule_hbm_ref.data.shape[0]
+    words_per_step = total_words // cfgs.max_steps_ub
+    write_size = jnp.minimum(
+        utils.align_to(words_per_step * safe_max_steps, 256),
+        total_words,
+    )
+    copy_data = pltpu.make_async_copy(
+        schedule_ref.data.at[pl.ds(0, write_size)],
+        schedule_hbm_ref.data.at[pl.ds(0, write_size)],
+        dma_sem.at[0],
+    )
+    copy_steps = pltpu.make_async_copy(
+        schedule_ref.actual_steps.at[pl.ds(0, 2)],
+        schedule_hbm_ref.actual_steps.at[pl.ds(0, 2)],
+        dma_sem.at[0],
+    )
+    copy_data.start()
+    copy_steps.start()
+    copy_data.wait()
+    copy_steps.wait()
 
 
 def generate_rpa_metadata(
