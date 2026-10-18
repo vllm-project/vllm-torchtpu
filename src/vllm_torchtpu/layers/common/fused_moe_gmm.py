@@ -190,7 +190,8 @@ _COUNTING_SORT_BLOCKS = (512, 256, 128)
 
 def _counting_sort_positions(
         sort_keys: jax.Array,
-        num_buckets: int) -> tuple[jax.Array | None, jax.Array | None]:
+        num_buckets: int,
+        has_invalid: bool = True) -> tuple[jax.Array | None, jax.Array | None]:
     """Stable counting sort: row -> its position, plus the bucket totals.
     Keys must be in ``[0, num_buckets)`` or the result is not a permutation.
 
@@ -207,15 +208,18 @@ def _counting_sort_positions(
         if size <= block and m % size == 0:
             block = size
             break
-    if num_buckets > block:
+    pad = -m % block
+    eff_buckets = num_buckets + 1 if (has_invalid or pad > 0) else num_buckets
+    if eff_buckets > block:
         # XLA miscompiles the rank matmul here on jaxlib 0.10.2 + libtpu
         # 0.0.44.1: under jit the positions come back not a permutation. Only
         # num_buckets > block is affected, so that is the excluded region.
         return None, None
-    pad = -m % block
-    sort_keys = jnp.pad(sort_keys, (0, pad), constant_values=num_buckets - 1)
+    if pad > 0:
+        sort_keys = jnp.pad(sort_keys, (0, pad),
+                            constant_values=eff_buckets - 1)
     onehot = jax.nn.one_hot(sort_keys.reshape(-1, block),
-                            num_buckets,
+                            eff_buckets,
                             dtype=jnp.bfloat16)
     # fp32 accumulate: positions run to M, bf16 is exact only to 2**8.
     hist = onehot.sum(axis=1, dtype=jnp.float32)
@@ -227,11 +231,13 @@ def _counting_sort_positions(
                       onehot,
                       preferred_element_type=jnp.float32)
     pos = ((base[:, None, :] + rank) * onehot).sum(axis=2)
-    # Pad rows sort after every real one, so only that bucket's total is off;
-    # pad is static, so a masked subtraction beats an indexed update.
-    counts -= jnp.where(
-        jnp.arange(num_buckets) == num_buckets - 1, float(pad), 0.0)
-    return pos.reshape(-1)[:m].astype(jnp.int32), counts.astype(jnp.int32)
+    if pad > 0 and eff_buckets == num_buckets:
+        # Pad rows sort after every real one, so only that bucket's total is off;
+        # pad is static, so a masked subtraction beats an indexed update.
+        counts -= jnp.where(
+            jnp.arange(eff_buckets) == eff_buckets - 1, float(pad), 0.0)
+    return (pos.reshape(-1)[:m].astype(jnp.int32),
+            counts[:num_buckets].astype(jnp.int32))
 
 
 def prepare_routed_gmm_inputs(
@@ -261,14 +267,19 @@ def prepare_routed_gmm_inputs(
     token_indices_flat = jnp.arange(num_tokens_local,
                                     dtype=jnp.int32).repeat(topk)
 
+    has_invalid = use_ep or skip_padded_tokens
     if skip_padded_tokens:
         # Padded tokens keep their selected expert ids, but carry zero
         # expert routing weights. Treat them as invalid to remove them
         # from GMM work.
         valid_mask = (topk_indices_flat >= 0) & (topk_weights_flat != 0)
-    else:
+        sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
+    elif use_ep:
         valid_mask = topk_indices_flat >= 0
-    sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
+        sort_keys = jnp.where(valid_mask, topk_indices_flat, local_num_experts)
+    else:
+        valid_mask = jnp.ones_like(topk_indices_flat, dtype=jnp.bool_)
+        sort_keys = topk_indices_flat
     # The keys take only `local_num_experts + 1` values, so counting sort
     # provides positions and `group_sizes` without a second comparison
     # sort. USE_MOE_COUNTING_SORT also applies to the one-hot path and
@@ -278,16 +289,17 @@ def prepare_routed_gmm_inputs(
     use_counting_sort = (envs.USE_MOE_COUNTING_SORT
                          if "USE_MOE_COUNTING_SORT" in os.environ else True)
     argsort_revert_indices, bucket_counts = (_counting_sort_positions(
-        sort_keys, local_num_experts + 1) if use_counting_sort else
+        sort_keys, local_num_experts, has_invalid=has_invalid)
+                                             if use_counting_sort else
                                              (None, None))
     # The packed (key, token) sort requires both fields to fit in int32.
     # Shapes that exceed that range use the gather path to avoid overflow.
+    max_key_bits = (local_num_experts + (1 if has_invalid else 0)).bit_length()
     if argsort_revert_indices is not None and (
-        (local_num_experts + 1).bit_length() +
-            max(1, (num_tokens_local - 1).bit_length()) >= 31):
+            max_key_bits + max(1, (num_tokens_local - 1).bit_length()) >= 31):
         argsort_revert_indices, bucket_counts = None, None
     if argsort_revert_indices is not None:
-        group_sizes_local = bucket_counts[:local_num_experts]
+        group_sizes_local = bucket_counts
 
         token_bits = (num_tokens_local - 1).bit_length()
         # (key, token) packed: no payload, no gather, and token_indices_flat is
@@ -301,10 +313,14 @@ def prepare_routed_gmm_inputs(
         sorted_indices = jnp.argsort(sort_keys)
         argsort_revert_indices = jnp.argsort(sorted_indices)
         token_indices_sorted = token_indices_flat[sorted_indices]
-        topk_indices_for_count = jnp.where(valid_mask, topk_indices_flat, 0)
-        group_sizes_local = (jax.nn.one_hot(
-            topk_indices_for_count, local_num_experts, dtype=jnp.int32) *
-                             valid_mask[:, None].astype(jnp.int32))
+        topk_indices_for_count = (jnp.where(valid_mask, topk_indices_flat, 0)
+                                  if has_invalid else topk_indices_flat)
+        group_sizes_local = jax.nn.one_hot(topk_indices_for_count,
+                                           local_num_experts,
+                                           dtype=jnp.int32)
+        if has_invalid:
+            group_sizes_local = (group_sizes_local *
+                                 valid_mask[:, None].astype(jnp.int32))
         group_sizes_local = group_sizes_local.sum(axis=0)
 
     if use_ep and use_sparse_core:
@@ -441,9 +457,10 @@ def moe_gmm(
     token_hidden = gmm2_res[argsort_revert_indices]
     token_topk_hidden = token_hidden.reshape(
         (num_tokens, topk, gmm2_res.shape[-1]))
+    if use_ep or skip_padded_tokens:
+        topk_weights = jnp.where(valid_mask, topk_weights, 0)
     token_topk_hidden = token_topk_hidden * jnp.expand_dims(topk_weights,
                                                             axis=-1)
-    token_topk_hidden = jnp.where(valid_mask[:, :, None], token_topk_hidden, 0)
     # FP32 top-k weights can promote BF16 outputs; keep the custom-op dtype.
     return token_topk_hidden.sum(axis=1).astype(x.dtype)
 

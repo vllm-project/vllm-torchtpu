@@ -109,8 +109,9 @@ def fill_and_wrap(qsl_ref, seq_lens_ref, state_ref, read_ref, dist_ref,
         sc["tb_has_init"][s] = ((seq_lens_ref[s] - q_len) > 0).astype(I32)
         return carry
 
-    lax.fori_loop(0, jnp.where(end_b > 0, max_seqs, 0), body_b, jnp.int32(0))
-    sc["tb_num_tiles"][0] = pl.cdiv(end_b, cfg_b.tile_size)
+    num_tiles_b = pl.cdiv(end_b, cfg_b.tile_size)
+    lax.fori_loop(0, num_tiles_b * cfg_b.tile_size, body_b, jnp.int32(0))
+    sc["tb_num_tiles"][0] = num_tiles_b
 
     chunk = cfg_p.chunk_size
     tile = cfg_p.tile_size

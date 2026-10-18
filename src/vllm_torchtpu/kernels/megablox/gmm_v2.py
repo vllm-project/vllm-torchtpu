@@ -480,7 +480,7 @@ def inner_kernel(
                 end_n = min(rhs_tile_n, start_n + mxu_size)
                 col_size = end_n - start_n
 
-                acc_n = jnp.zeros((bucket_m, col_size), dtype=acc_ref.dtype)
+                acc_n = None
                 for start_k in range(0, cfgs.tiles.tile_k, rhs_qbs):
                     end_k = min(cfgs.tiles.tile_k, start_k + rhs_qbs)
 
@@ -488,16 +488,17 @@ def inner_kernel(
                         tiled_lhs[:, start_k:end_k],
                         tiled_rhs[start_k:end_k, start_n:end_n],
                         preferred_element_type=jnp.float32,
-                    ).astype(acc_ref.dtype)
+                    ).astype(cfgs.acc_dtype)
 
                     if cfgs.rhs_cfgs.should_dequantize_after_matmul:
                         b_id = start_k // rhs_qbs
                         rhs_scale_replicated = tiled_rhs_ref.get_scale(
                             replicate_size=bucket_m)[b_id, :, start_n:start_n +
                                                      col_size]
-                        block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
+                        block_acc *= rhs_scale_replicated.astype(
+                            cfgs.acc_dtype)
 
-                    acc_n += block_acc
+                    acc_n = block_acc if acc_n is None else acc_n + block_acc
                 acc_list.append(acc_n)
         else:
             # Quantized matmul path.
@@ -521,7 +522,7 @@ def inner_kernel(
                 end_n = min(rhs_tile_n, start_n + mxu_size)
                 col_size = end_n - start_n
 
-                acc_n = jnp.zeros((bucket_m, col_size), dtype=acc_ref.dtype)
+                acc_n = None
                 for start_k in range(0, cfgs.tiles.tile_k, q_block_size):
                     end_k = min(cfgs.tiles.tile_k, start_k + q_block_size)
 
@@ -556,9 +557,9 @@ def inner_kernel(
                         block_lhs_q,
                         block_rhs,
                         preferred_element_type=preferred_element_type,
-                    ).astype(acc_ref.dtype)
+                    ).astype(cfgs.acc_dtype)
 
-                    block_acc *= block_scale.astype(acc_ref.dtype)
+                    block_acc *= block_scale.astype(cfgs.acc_dtype)
 
                     # Apply rhs subchannel scale per quant block.
                     if cfgs.rhs_cfgs.should_dequantize_after_matmul:
@@ -566,9 +567,10 @@ def inner_kernel(
                         rhs_scale_replicated = tiled_rhs_ref.get_scale(
                             replicate_size=bucket_m)[b_id, :, start_n:start_n +
                                                      col_size]
-                        block_acc *= rhs_scale_replicated.astype(acc_ref.dtype)
+                        block_acc *= rhs_scale_replicated.astype(
+                            cfgs.acc_dtype)
 
-                    acc_n += block_acc
+                    acc_n = block_acc if acc_n is None else acc_n + block_acc
                 acc_list.append(acc_n)
         acc = jnp.concatenate(acc_list, axis=1)
 
@@ -622,6 +624,8 @@ def inner_kernel(
         else:
             acc_ref[:acc_m] = acc
 
+    static_num_k = pl.cdiv(cfgs.dims.size_k, cfgs.tiles.tile_k)
+
     def run_matmul_step(bucket_idx: int):
         bucket_m = cfgs.tiles.bucket_base * (bucket_idx + 1)
 
@@ -630,6 +634,10 @@ def inner_kernel(
             _matmul(is_first_k_step=True,
                     is_last_k_step=True,
                     bucket_m=bucket_m)
+
+        if static_num_k == 1:
+            matmul_first_last()
+            return
 
         @jax.named_scope(f"bm{bucket_m}_first")
         def matmul_first():
@@ -933,6 +941,7 @@ def kernel_main(
         grid=(num_n, num_gm, num_k),
         in_specs=(lhs_spec, rhs_spec),
         out_specs=out_spec,
+        priority=1,
     )
 
     # Bounded slice requires second last dim to be aligned to the sublane size.
@@ -1387,11 +1396,13 @@ def gmm_v2(
     # Initialize scratch shapes.
     max_num_gm = dims.size_group + pl.cdiv(dims.size_m, tiles.tile_m) - 1
     acc_cols = 2 * tiles.tile_n if cfgs.fuse_act is not None else tiles.tile_n
+    num_k = pl.cdiv(dims.size_k, tiles.tile_k)
     scratch_shapes = [
         # partial_out_ref
         pltpu.VMEM((dims.size_lhs_sublane, tiles.tile_n), cfgs.out_dtype),
-        # acc_ref
-        pltpu.VMEM((tiles.tile_m, acc_cols), cfgs.acc_dtype),
+        # acc_ref (only needed when accumulating across multiple k tiles)
+        pltpu.VMEM(
+            (tiles.tile_m, acc_cols), cfgs.acc_dtype) if num_k > 1 else None,
         # metadata_ref
         MetadataRef(
             gm_id_to_group_id=pltpu.SMEM((max_num_gm, ), jnp.int32),
