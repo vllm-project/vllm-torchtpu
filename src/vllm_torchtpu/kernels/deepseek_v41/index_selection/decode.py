@@ -14,6 +14,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v41 import indexer
 from vllm_torchtpu.kernels.deepseek_v41.index_selection import scores, streaming_topk
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.tuned_block_sizes import (
@@ -21,6 +22,14 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection.tuned_block_sizes import
     get_decode_request_tile,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_word_scores import DIM, ROW_WORDS, SLOTS
+
+
+def flat_request_group(requests: int, queries: int) -> int:
+    """Requests per grid step for an 8-row-aligned 2D block; 0 if none fits."""
+    group = 8 // math.gcd(queries, 8)
+    if requests % group or (group * queries) % 8:
+        return 0
+    return group
 
 
 def supports_decode(
@@ -98,6 +107,57 @@ def _request_kernel(
     )
 
 
+def _flat_request_kernel(
+    pages,
+    limits,
+    query_limits,
+    q,
+    weights,
+    pool,
+    out,
+    words,
+    *scratch,
+    group,
+    page_records,
+    tile,
+    coalesce,
+    prefetch,
+    profile_stages,
+    fuse_mask,
+    halfplane=False,
+):
+    """`_request_kernel` for `group` requests sharing one 2D out block.
+
+    Request r owns rows r*Q..r*Q+Q-1; each is scored exactly as in the
+    per-request kernel (same dot shapes and order), so results are bitwise equal.
+    """
+    queries = q.shape[0] // group
+    page_count = pages.shape[0] // limits.shape[0]
+    out[...] = jnp.full(out.shape, -jnp.inf, jnp.float32)
+    for r in range(group):
+        request = pl.program_id(0) * group + r
+        scores._kernel(
+            pages.at[pl.ds(request * page_count, page_count)],
+            limits.at[pl.ds(request, 1)],
+            q.at[pl.ds(r * queries, queries)],
+            weights.at[pl.ds(r * queries, queries)],
+            pool,
+            None,
+            out,
+            words,
+            *scratch,
+            page_records=page_records,
+            tile=tile,
+            coalesce=coalesce,
+            prefetch=prefetch,
+            profile_stages=profile_stages,
+            row_lengths=query_limits if fuse_mask else None,
+            row_offset=request * queries,
+            out_row_offset=r * queries,
+            halfplane=halfplane,
+        )
+
+
 @functools.partial(
     jax.jit,
     static_argnames=(
@@ -109,6 +169,8 @@ def _request_kernel(
         "score_window",
         "fuse_mask",
         "halfplane",
+        "request_group",
+        "out_window",
     ),
 )
 def grouped_decode_scores(
@@ -126,11 +188,19 @@ def grouped_decode_scores(
     score_window: int = 32768,
     fuse_mask: bool = False,
     halfplane: bool = False,
+    request_group: int = 0,
+    out_window: int = 0,
 ) -> jax.Array:
     """Score split-order Q [requests, queries, heads, 128] against paged keys.
 
     Pages contain physical first-record addresses; -1 invalidates a whole page.
     Lengths [requests, queries] apply independently, including zero-length rows.
+
+    ``request_group`` > 0 scores that many requests per grid step into a 2D
+    [requests * queries, width] output (``request_group * queries`` must be a
+    multiple of 8), avoiding the T(1,128) layout of the legacy 3D output and
+    its XLA relayout before top-k. ``out_window`` optionally narrows that
+    path's out block columns. Results are bitwise identical to the default.
     """
     requests, queries, heads, dim = q.shape
     width = pages.shape[1] * page_records
@@ -148,6 +218,8 @@ def grouped_decode_scores(
         or page_records % 16
         or key_tile % page_records
         or width % key_tile
+        or request_group < 0
+        or out_window < 0
         or any(
             bank.dtype != jnp.int32
             or bank.shape[1] != ROW_WORDS
@@ -158,6 +230,24 @@ def grouped_decode_scores(
         raise ValueError("Expected aligned paged BF16 request-major decode inputs")
     window = math.gcd(width, max(key_tile, score_window))
     hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    if request_group:
+        return _flat_decode_scores(
+            q,
+            weights,
+            pool,
+            pages,
+            lengths,
+            page_records=page_records,
+            key_tile=key_tile,
+            prefetch=prefetch,
+            profile_stages=profile_stages,
+            interpret=interpret,
+            window=window,
+            fuse_mask=fuse_mask,
+            request_group=request_group,
+            out_window=out_window,
+            halfplane=halfplane,
+        )
     result = pl.pallas_call(
         functools.partial(
             _request_kernel,
@@ -207,6 +297,90 @@ def grouped_decode_scores(
     valid = jnp.arange(width)[None, None] < lengths[:, :, None]
     valid &= jnp.repeat(pages >= 0, page_records, axis=1)[:, None]
     return jnp.where(valid, result, -jnp.inf).reshape(requests * queries, width)
+
+
+def _flat_decode_scores(
+    q,
+    weights,
+    pool,
+    pages,
+    lengths,
+    *,
+    page_records,
+    key_tile,
+    prefetch,
+    profile_stages,
+    interpret,
+    window,
+    fuse_mask,
+    request_group,
+    out_window,
+    halfplane=False,
+):
+    requests, queries, heads, _ = q.shape
+    width = pages.shape[1] * page_records
+    rows = request_group * queries
+    if requests % request_group or rows % 8:
+        raise ValueError("request_group must divide requests into 8-row blocks")
+    if out_window and math.gcd(window, out_window) % key_tile == 0:
+        window = math.gcd(window, out_window)
+    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
+    result = pl.pallas_call(
+        functools.partial(
+            _flat_request_kernel,
+            group=request_group,
+            page_records=page_records,
+            tile=key_tile,
+            coalesce=True,
+            prefetch=prefetch,
+            profile_stages=profile_stages,
+            fuse_mask=fuse_mask,
+            halfplane=halfplane,
+        ),
+        out_shape=jax.ShapeDtypeStruct((requests * queries, width), jnp.float32),
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=3,
+            grid=(requests // request_group, width // window),
+            in_specs=(
+                pl.BlockSpec((rows, heads, DIM), lambda i, j, *_: (i, 0, 0)),
+                pl.BlockSpec((rows, heads, 1), lambda i, j, *_: (i, 0, 0)),
+                (hbm, hbm) if isinstance(pool, tuple) else hbm,
+            ),
+            out_specs=pl.BlockSpec((rows, window), lambda i, j, *_: (i, j)),
+            scratch_shapes=(
+                pltpu.VMEM((2, key_tile // SLOTS, ROW_WORDS), jnp.int32),
+                *(
+                    (pltpu.VMEM((key_tile, ROW_WORDS), jnp.int32),)
+                    if not halfplane
+                    else ()
+                ),
+                pltpu.SemaphoreType.DMA,
+            ),
+        ),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel", "parallel"),
+            # A (24, 131072) f32 out block is 12 MiB, double-buffered.
+            vmem_limit_bytes=(
+                None
+                if interpret
+                else int(0.9 * pltpu.get_tpu_info().vmem_capacity_bytes)
+            ),
+        ),
+        interpret=interpret,
+        name="decode_grouped_paged_index_scores_2d",
+    )(
+        pages.reshape(-1),
+        jnp.max(lengths, axis=1),
+        lengths.reshape(-1),
+        q.reshape(-1, heads, DIM),
+        weights.reshape(-1, heads, 1),
+        pool,
+    )
+    if fuse_mask:
+        return result
+    valid = jnp.arange(width)[None] < lengths.reshape(-1, 1)
+    valid &= jnp.repeat(jnp.repeat(pages >= 0, page_records, axis=1), queries, axis=0)
+    return jnp.where(valid, result, -jnp.inf)
 
 
 def _select(scores, lengths, k, block_size, threshold, fuse_validity):
@@ -301,6 +475,15 @@ def decode_indexer(
     if type(request_tile) is not int or request_tile < 1 or requests % request_tile:
         raise ValueError("request_tile must divide the request-major batch")
 
+    # Score whole requests into an 8-row-aligned 2D request-major block: the
+    # legacy (requests * queries, 1, width) output takes a T(1,128) HBM tiling
+    # that XLA relayouts (copies) before streaming top-k. Read at trace time.
+    request_group_2d = (
+        flat_request_group(request_tile, queries)
+        if envs.TPU_DEEPSEEK_V41_INDEX_SCORES_2D
+        else 0
+    )
+
     def prepare(i):
         return jax.tree.map(
             lambda x: jax.lax.dynamic_slice_in_dim(x, i * request_tile, request_tile),
@@ -322,6 +505,7 @@ def decode_indexer(
             score_window=score_window,
             fuse_mask=fuse_mask,
             halfplane=halfplane,
+            request_group=request_group_2d,
         )
 
     def select(i, values):

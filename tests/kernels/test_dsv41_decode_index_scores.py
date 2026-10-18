@@ -104,6 +104,203 @@ def test_grouped_decode_page_table_beyond_128_entries(fuse_mask):
     np.testing.assert_array_equal(result, expected)
 
 
+def _paged_decode_inputs(seed, requests, queries, heads, width, page, banks):
+    """Random paged decode inputs with ragged/zero lengths and invalid pages."""
+    rng = np.random.default_rng(seed)
+    records = requests * width
+    keys = rng.normal(size=(records, 128)).astype(np.float32)
+    words = jax.lax.bitcast_convert_type(
+        jnp.asarray(keys, jnp.bfloat16).reshape(-1, 64, 2), jnp.int32
+    ).reshape(-1, 128)
+    split = (records // 2 // 3) // (page // 2) * (page // 2)
+    pool = (words[:split], words[split:]) if banks == 2 else words
+    order = rng.permutation(records // page).reshape(requests, -1)
+    pages = order.astype(np.int32) * page
+    pages[rng.random(pages.shape) < 0.05] = -1
+    lengths = rng.integers(0, width + 1, size=(requests, queries)).astype(np.int32)
+    lengths[0] = width
+    lengths[-1, 0] = 0
+    if requests > 2:
+        lengths[1] = 0
+        lengths[2] = rng.integers(0, min(width, 300), size=queries)
+    q = jnp.asarray(rng.normal(size=(requests, queries, heads, 128)), jnp.bfloat16)
+    weights = jnp.asarray(rng.normal(size=(requests, queries, heads, 1)), jnp.float32)
+    return q, weights, pool, jnp.asarray(pages), jnp.asarray(lengths)
+
+
+def _assert_2d_matches_legacy(
+    seed, requests, queries, heads, width, page, key_tile, banks, **options
+):
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.decode import (
+        flat_request_group,
+    )
+
+    q, weights, pool, pages, lengths = _paged_decode_inputs(
+        seed, requests, queries, heads, width, page, banks
+    )
+    group = options.pop("request_group", None) or flat_request_group(requests, queries)
+    assert group
+    out_window = options.pop("out_window", 0)
+    kwargs = dict(page_records=page, key_tile=key_tile, **options)
+    legacy = grouped_decode_scores(q, weights, pool, pages, lengths, **kwargs)
+    flat = grouped_decode_scores(
+        q,
+        weights,
+        pool,
+        pages,
+        lengths,
+        request_group=group,
+        out_window=out_window,
+        **kwargs,
+    )
+    assert flat.shape == legacy.shape == (requests * queries, width)
+    assert flat.dtype == legacy.dtype
+    # Bitwise, including -inf masking and signed zeros.
+    np.testing.assert_array_equal(
+        np.asarray(flat).view(np.uint32), np.asarray(legacy).view(np.uint32)
+    )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "requests,queries,group",
+    [(4, 6, None), (8, 6, None), (8, 6, 8), (8, 4, None), (8, 3, None), (2, 8, 1)],
+)
+@pytest.mark.parametrize("banks", [1, 2])
+@pytest.mark.parametrize("fuse_mask", [False, True])
+@pytest.mark.parametrize("score_window,out_window", [(32768, 0), (32768, 128)])
+def test_grouped_decode_scores_2d_out_is_bitwise_legacy(
+    requests, queries, group, banks, fuse_mask, score_window, out_window
+):
+    _assert_2d_matches_legacy(
+        11,
+        requests,
+        queries,
+        4,
+        512,
+        16,
+        64,
+        banks,
+        request_group=group,
+        out_window=out_window,
+        prefetch=True,
+        interpret=True,
+        fuse_mask=fuse_mask,
+        score_window=score_window,
+    )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("halfplane", [False, True])
+@pytest.mark.parametrize("banks", [1, 2])
+def test_grouped_decode_scores_2d_out_halfplane(halfplane, banks):
+    # The 2D request-major path keeps the halfplane Index-K.
+    _assert_2d_matches_legacy(
+        13,
+        8,
+        6,
+        4,
+        512,
+        16,
+        64,
+        banks,
+        prefetch=True,
+        interpret=True,
+        fuse_mask=True,
+        halfplane=halfplane,
+    )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("prefetch", [False, True])
+def test_grouped_decode_scores_2d_out_serving_heads_and_tiles(prefetch):
+    # Serving head/query/tile geometry with a reduced width (CPU interpret).
+    _assert_2d_matches_legacy(
+        5,
+        16,
+        6,
+        32,
+        8192,
+        256,
+        4096,
+        2,
+        prefetch=prefetch,
+        interpret=True,
+        fuse_mask=True,
+        score_window=131072,
+    )
+
+
+@pytest.mark.cpu_test
+def test_grouped_decode_scores_2d_out_rejects_unaligned_groups():
+    q, weights, pool, pages, lengths = _paged_decode_inputs(0, 6, 6, 4, 256, 16, 1)
+    with pytest.raises(ValueError, match="8-row"):
+        grouped_decode_scores(
+            q,
+            weights,
+            pool,
+            pages,
+            lengths,
+            page_records=16,
+            key_tile=64,
+            interpret=True,
+            request_group=2,
+        )
+
+
+@pytest.mark.skipif(
+    jax.default_backend() != "tpu", reason="Production widths are TPU-sized"
+)
+@pytest.mark.parametrize("requests,width", [(16, 131072), (12, 65536)])
+@pytest.mark.parametrize("out_window", [0, 32768])
+def test_grouped_decode_scores_2d_out_production_shapes(requests, width, out_window):
+    _assert_2d_matches_legacy(
+        3,
+        requests,
+        6,
+        32,
+        width,
+        256,
+        4096,
+        2,
+        out_window=out_window,
+        fuse_mask=True,
+        score_window=131072,
+    )
+
+
+@pytest.mark.skipif(jax.default_backend() != "tpu", reason="SparseCore top-k")
+@pytest.mark.parametrize("requests,width", [(16, 131072), (12, 65536)])
+@pytest.mark.parametrize("candidate_count", [0, 128])
+def test_decode_indexer_2d_out_selection_is_identical(
+    monkeypatch, requests, width, candidate_count
+):
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection import decode
+
+    q, weights, pool, pages, lengths = _paged_decode_inputs(
+        9, requests, 6, 32, width, 256, 2
+    )
+    kwargs = dict(
+        page_records=256,
+        key_tile=4096,
+        request_tile=requests,
+        candidate_count=candidate_count,
+        candidate_block_size=128,
+    )
+
+    def run(enabled):
+        # Read at trace time: drop the other setting's trace.
+        monkeypatch.setenv("TPU_DEEPSEEK_V41_INDEX_SCORES_2D", enabled)
+        decode.decode_indexer.clear_cache()
+        return jax.tree.map(
+            np.asarray,
+            decode.decode_indexer(q, weights, pool, pages, lengths, **kwargs),
+        )
+
+    legacy, flat = run("0"), run("1")
+    jax.tree.map(np.testing.assert_array_equal, flat, legacy)
+
+
 @pytest.mark.cpu_test
 def test_candidate_union_membership_overflow_and_invalid_pages():
     from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (

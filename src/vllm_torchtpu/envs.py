@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_INDEX_KEY_LAYOUT: str = "halfplane"
     TPU_DEEPSEEK_V41_MOE_SCALE_ROW_PADDED: bool = True
     TPU_DEEPSEEK_V41_PAGE_ROWS_ONEHOT: bool = True
+    TPU_DEEPSEEK_V41_INDEX_SCORES_2D: bool = True
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
@@ -416,6 +417,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Read at trace time.
     "TPU_DEEPSEEK_V41_PAGE_ROWS_ONEHOT": env_bool(
         "TPU_DEEPSEEK_V41_PAGE_ROWS_ONEHOT", default=True
+    ),
+    # Decode index scores: write whole requests into 8-row-aligned 2D
+    # request-major [requests * queries, width] blocks, avoiding the legacy
+    # output's T(1,128) tiling and its XLA relayout before top-k. Read at
+    # trace time; results are bitwise identical.
+    "TPU_DEEPSEEK_V41_INDEX_SCORES_2D": env_bool(
+        "TPU_DEEPSEEK_V41_INDEX_SCORES_2D", default=True
     ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),

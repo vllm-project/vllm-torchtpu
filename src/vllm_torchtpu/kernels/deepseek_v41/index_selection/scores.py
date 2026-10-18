@@ -75,7 +75,14 @@ def _kernel(
     row_lengths=None,
     row_offset=0,
     halfplane=False,
+    out_row_offset=None,
 ):
+    """Score ``q_ref`` rows into ``out``.
+
+    With ``out_row_offset`` set, ``out`` is a shared multi-request block: this
+    call writes rows ``[out_row_offset, out_row_offset + rows)`` only, and the
+    caller owns the -inf initialization of the whole block.
+    """
     unpacked, sem = (None, scratch[0]) if halfplane else scratch
     scope = jax.named_scope if profile_stages else contextlib.nullcontext
     with scope("prefill_kernel_body"):
@@ -86,7 +93,8 @@ def _kernel(
         tile_pages = tile // page_records
         window_start = pl.program_id(1) * out.shape[1]
         steps = pl.cdiv(jnp.clip(limit[0] - window_start, 0, out.shape[1]), tile)
-        out[...] = jnp.full(out.shape, -jnp.inf, jnp.float32)
+        if out_row_offset is None:
+            out[...] = jnp.full(out.shape, -jnp.inf, jnp.float32)
 
         def copy(address, count, dest):
             if isinstance(pool, tuple):
@@ -217,7 +225,10 @@ def _kernel(
                     )
                     valid = causal & (page_valid != 0)
                     values = jnp.where(valid, values, -jnp.inf)
-                out[:, pl.ds(block * tile, tile)] = values
+                if out_row_offset is None:
+                    out[:, pl.ds(block * tile, tile)] = values
+                else:
+                    out[pl.ds(out_row_offset, rows), pl.ds(block * tile, tile)] = values
 
         jax.lax.fori_loop(0, steps, body, None)
 
