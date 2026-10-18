@@ -64,14 +64,14 @@ dependencies = [
     # See the JAX fori-loop lowering monkey-patch in
     # src/vllm_torchtpu/env_override.py; it works around a Pallas remainder-loop
     # bloat this JAX pin regresses on (validated on Qwen3.5-397B DP=8 EP).
-    "jax==0.10.2",
-    "jaxlib==0.10.2",
+    "jax==0.11.2",
+    "jaxlib==0.11.2",
     # tpu-sync-torch requires libtpu>=0.0.47. The workarounds in
     # src/vllm_torchtpu/env_override.py (SC-offload threshold gate) and the
     # per-config LIBTPU_INIT_ARGS additions under
     # scripts/vllm/benchmarking/configs/ were tuned against an earlier libtpu;
     # re-verify those runs when bumping.
-    "libtpu==0.0.47",
+    "libtpu==0.0.50",
     "ray[default]",
     "ray[data]",
 ]
