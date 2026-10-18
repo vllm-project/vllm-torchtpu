@@ -251,6 +251,8 @@ def test_str_keeps_an_explicit_empty_value_distinct_from_unset(monkeypatch):
         ("TPU_DEEPSEEK_V41_MOE_SCALE_ROW_PADDED", True),
         ("TPU_DEEPSEEK_V41_PAGE_ROWS_ONEHOT", True),
         ("TPU_DEEPSEEK_V41_INDEX_SCORES_2D", True),
+        ("TPU_DEEPSEEK_V41_CANDIDATE_FLAT", 8),
+        ("TPU_DEEPSEEK_V41_CANDIDATE_SKIP", True),
     ],
 )
 def test_migrated_knob_defaults(monkeypatch, name, expected):

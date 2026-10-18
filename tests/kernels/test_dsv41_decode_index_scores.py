@@ -476,3 +476,276 @@ def test_sparse_candidate_union_exact(queries, logical_blocks, capacity):
         )
         assert int(result.actual_count[request]) == len(expected)
         assert bool(result.overflow[request]) == (len(expected) > capacity)
+
+
+def _assert_scores_match(actual, reference, *, exact):
+    """Identical -inf masks, no NaN/+inf; finite values exact or within ~ULPs.
+
+    Infinities only come from the explicit -inf masks, so their positions must
+    match exactly. Finite values come from the same FP32 dot + ReLU-weighted
+    head sum, but on the TPU backend (even with interpret=True) XLA lowers
+    each kernel body separately: in-kernel key unpack/bitcast or the flat
+    kernel's per-request loop changes the dot/head-reduction order, giving a
+    few-ULP differences (and +0 vs -0 for all-zero ReLU slots). ``exact``
+    keeps bitwise equality (up to the sign of zero) for identical bodies.
+    """
+    actual, reference = np.asarray(actual), np.asarray(reference)
+    assert not np.isnan(actual).any() and not np.isnan(reference).any()
+    assert not np.isposinf(actual).any() and not np.isposinf(reference).any()
+    masked = np.isneginf(reference)
+    np.testing.assert_array_equal(np.isneginf(actual), masked)
+    if exact:
+        np.testing.assert_array_equal(
+            np.where(actual == 0, np.float32(0), actual).view(np.uint32),
+            np.where(reference == 0, np.float32(0), reference).view(np.uint32),
+        )
+    else:
+        # Head sums cancel, so bound the error by the score scale, not each value.
+        finite = reference[~masked]
+        scale = float(np.abs(finite).max()) if finite.size else 0.0
+        np.testing.assert_allclose(
+            actual[~masked], finite, rtol=1e-5, atol=1e-6 * scale
+        )
+
+
+def _candidate_skip_inputs(seed, requests=4, width=256):
+    """Unions with an empty capacity tail: ordinary/halfplane words and BF16 keys."""
+    from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout as layout
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
+        union_metadata,
+        unpack_candidate_words,
+    )
+
+    rng = np.random.default_rng(seed)
+    queries, heads = 6, 4
+    native = jnp.asarray(rng.integers(-8, 9, (requests, width, 128)), jnp.bfloat16)
+    ordinary = jax.lax.bitcast_convert_type(
+        native.reshape(requests, -1, 64, 2), jnp.int32
+    ).reshape(requests, -1, 128)
+    bits = layout.encode_records(native.reshape(-1, 128))
+    halfplane = (bits[::2] | (bits[1::2] << 16)).astype(jnp.int32)
+    halfplane = halfplane.reshape(requests, -1, 128)
+    candidates = rng.integers(-2, 10, size=(requests, queries, 5), dtype=np.int32)
+    candidates[1] = -1  # Empty union: every tile is skipped.
+    candidates[-1, :, 0] = 31  # Union reaches the last tile.
+    meta = union_metadata(
+        jnp.asarray(candidates), logical_blocks=40, capacity_blocks=width // 8
+    )
+    q = jnp.asarray(rng.normal(size=(requests, queries, heads, 128)), jnp.bfloat16)
+    weights = jnp.asarray(rng.normal(size=(requests, queries, heads)), jnp.float32)
+    lengths = jnp.asarray(rng.integers(0, 320, (requests, queries)), jnp.int32)
+    keys = {
+        (False, False): unpack_candidate_words(ordinary, interpret=True),
+        (True, False): ordinary,
+        (False, True): unpack_candidate_words(
+            halfplane, interpret=True, halfplane=True
+        ),
+        (True, True): halfplane,
+    }
+    return q, weights, keys, meta.ids, meta.membership, lengths
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("seed", [81, 82])
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("halfplane", [False, True])
+def test_candidate_scores_skip_matches_default(seed, packed, halfplane):
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
+        candidate_scores,
+    )
+
+    q, weights, keys, ids, membership, lengths = _candidate_skip_inputs(seed)
+    reference = candidate_scores(
+        q,
+        weights,
+        keys[False, False],
+        ids,
+        membership,
+        lengths,
+        block_size=8,
+        key_tile=32,
+        interpret=True,
+    )
+    actual = candidate_scores(
+        q,
+        weights,
+        keys[packed, halfplane],
+        ids,
+        membership,
+        lengths,
+        block_size=8,
+        key_tile=32,
+        interpret=True,
+        halfplane=halfplane,
+        skip=True,
+    )
+    # BF16 keys run the same kernel body as the reference; packed keys add an
+    # in-kernel unpack/bitcast that changes the TPU reduction order.
+    _assert_scores_match(actual, reference, exact=not packed)
+    assert np.isneginf(np.asarray(actual)[1]).all()
+
+
+def _reference_select(scores, lengths, k, *args):
+    width = scores.shape[1]
+    masked = jnp.where(jnp.arange(width)[None] < lengths[:, None], scores, -jnp.inf)
+    values, selected = jax.lax.top_k(masked, k)
+    selected = jnp.sort(jnp.where(values > -jnp.inf, selected, width), axis=1)
+    return jnp.where(selected < width, selected, -1)
+
+
+def _run_candidate_indexer(
+    monkeypatch, inputs, halfplane, overlap, request_tile=2, flat=0, skip=False
+):
+    import functools
+
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection import candidate
+
+    with monkeypatch.context() as patch:
+        for name in ("candidate_scores", "candidate_scores_flat"):
+            if hasattr(candidate, name):
+                patch.setattr(
+                    candidate,
+                    name,
+                    functools.partial(getattr(candidate, name), interpret=True),
+                )
+        patch.setattr(candidate.decode, "_select", _reference_select)
+        patch.setenv("TPU_DEEPSEEK_V41_CANDIDATE_FLAT", str(flat))
+        patch.setenv("TPU_DEEPSEEK_V41_CANDIDATE_SKIP", str(int(skip)))
+        # Switches are read at trace time; drop traces from other settings.
+        jax.clear_caches()
+        result = candidate.candidate_indexer(
+            *inputs,
+            block_size=8,
+            key_tile=32,
+            request_tile=request_tile,
+            k=16,
+            overlap=overlap,
+            halfplane=halfplane,
+        )
+    jax.clear_caches()
+    return np.asarray(result)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("halfplane", [False, True])
+@pytest.mark.parametrize("overlap", [False, True])
+def test_candidate_indexer_skip_is_identical(monkeypatch, packed, halfplane, overlap):
+    q, weights, keys, ids, membership, lengths = _candidate_skip_inputs(83)
+    reference = _run_candidate_indexer(
+        monkeypatch,
+        (q, weights, keys[False, False], ids, membership, lengths),
+        False,
+        overlap,
+    )
+    actual = _run_candidate_indexer(
+        monkeypatch,
+        (q, weights, keys[packed, halfplane], ids, membership, lengths),
+        halfplane,
+        overlap,
+        skip=True,
+    )
+    np.testing.assert_array_equal(actual, reference)
+    assert (reference >= 0).any()
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("halfplane", [False, True])
+@pytest.mark.parametrize("skip", [False, True])
+# Eight-request groups take 2-D [G, W] records; four-request groups [G, 1, W].
+@pytest.mark.parametrize("group_tile", [4, 8])
+def test_candidate_scores_flat_matches_grouped(packed, halfplane, skip, group_tile):
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
+        candidate_scores,
+        candidate_scores_flat,
+    )
+
+    q, weights, keys, ids, membership, lengths = _candidate_skip_inputs(84, requests=8)
+    reference = candidate_scores(
+        q,
+        weights,
+        keys[False, False],
+        ids,
+        membership,
+        lengths,
+        block_size=8,
+        key_tile=32,
+        interpret=True,
+    ).reshape(-1, ids.shape[1] * 8)
+    actual = candidate_scores_flat(
+        q,
+        weights,
+        keys[packed, halfplane],
+        ids,
+        membership,
+        lengths,
+        block_size=8,
+        key_tile=32,
+        group_tile=group_tile,
+        skip=skip,
+        interpret=True,
+        halfplane=halfplane,
+    )
+    _assert_scores_match(actual, reference, exact=False)
+
+
+@pytest.mark.cpu_test
+def test_candidate_scores_flat_rejects_unaligned_request_tile():
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
+        candidate_scores_flat,
+    )
+
+    q, weights, keys, ids, membership, lengths = _candidate_skip_inputs(85)
+    with pytest.raises(ValueError, match="8-row-aligned"):
+        candidate_scores_flat(
+            q,
+            weights,
+            keys[False, False],
+            ids,
+            membership,
+            lengths,
+            block_size=8,
+            key_tile=32,
+            group_tile=2,
+            interpret=True,
+        )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("packed", [False, True])
+@pytest.mark.parametrize("halfplane", [False, True])
+@pytest.mark.parametrize("skip", [False, True])
+@pytest.mark.parametrize("flat", [4, 8])
+def test_candidate_indexer_flat_is_identical(
+    monkeypatch, packed, halfplane, skip, flat
+):
+    q, weights, keys, ids, membership, lengths = _candidate_skip_inputs(86, requests=8)
+    reference = _run_candidate_indexer(
+        monkeypatch,
+        (q, weights, keys[False, False], ids, membership, lengths),
+        False,
+        False,
+        request_tile=8,
+    )
+    actual = _run_candidate_indexer(
+        monkeypatch,
+        (q, weights, keys[packed, halfplane], ids, membership, lengths),
+        halfplane,
+        True,
+        request_tile=8,
+        flat=flat,
+        skip=skip,
+    )
+    np.testing.assert_array_equal(actual, reference)
+    assert (reference >= 0).any()
+
+
+@pytest.mark.cpu_test
+def test_candidate_indexer_flat_falls_back_for_unaligned_tiles(monkeypatch):
+    # Two six-query requests per tile cannot fill 8-row flat blocks of 8.
+    q, weights, keys, ids, membership, lengths = _candidate_skip_inputs(87)
+    inputs = (q, weights, keys[False, False], ids, membership, lengths)
+    reference = _run_candidate_indexer(monkeypatch, inputs, False, False)
+    actual = _run_candidate_indexer(monkeypatch, inputs, False, True, flat=8)
+    np.testing.assert_array_equal(actual, reference)

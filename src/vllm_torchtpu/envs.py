@@ -19,6 +19,8 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_MOE_SCALE_ROW_PADDED: bool = True
     TPU_DEEPSEEK_V41_PAGE_ROWS_ONEHOT: bool = True
     TPU_DEEPSEEK_V41_INDEX_SCORES_2D: bool = True
+    TPU_DEEPSEEK_V41_CANDIDATE_FLAT: int = 8
+    TPU_DEEPSEEK_V41_CANDIDATE_SKIP: bool = True
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
@@ -424,6 +426,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # trace time; results are bitwise identical.
     "TPU_DEEPSEEK_V41_INDEX_SCORES_2D": env_bool(
         "TPU_DEEPSEEK_V41_INDEX_SCORES_2D", default=True
+    ),
+    # Candidate (union) index scores: requests per grid step of the flat
+    # request-major kernel (8 gives 48-row blocks with 2-D records). 0 uses the
+    # grouped kernel; groups that do not divide the request tile into 8-row
+    # blocks fall back to it. Read at trace time.
+    "TPU_DEEPSEEK_V41_CANDIDATE_FLAT": env_nonnegative_int(
+        "TPU_DEEPSEEK_V41_CANDIDATE_FLAT", 8
+    ),
+    # Candidate index scores: skip key tiles past each compacted union (their
+    # DMA and compute) and limit top-k to the union. Exact. Read at trace time.
+    "TPU_DEEPSEEK_V41_CANDIDATE_SKIP": env_bool(
+        "TPU_DEEPSEEK_V41_CANDIDATE_SKIP", default=True
     ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
