@@ -501,6 +501,8 @@ def create_allocs(
         buffer_count=cfgs.n_buffer,
         use_lookahead=True,
         cfgs=cfgs,
+        priority=1,
+        strict_ordering=False,
     )
     q_alloc = bref_override.BatchingQRef.input(
         spec=q_spec,
@@ -508,6 +510,8 @@ def create_allocs(
         buffer_count=cfgs.n_buffer,
         use_lookahead=True,
         cfgs=cfgs,
+        priority=1,
+        strict_ordering=False,
     )
     o_alloc = bref_override.BatchingORef.output(
         spec=o_spec,
@@ -515,6 +519,8 @@ def create_allocs(
         buffer_count=2,
         use_lookahead=False,
         cfgs=cfgs,
+        priority=0,
+        strict_ordering=False,
     )
     lse_alloc = None
     if cfgs.serve.return_lse:
@@ -530,6 +536,8 @@ def create_allocs(
             buffer_count=2,
             use_lookahead=False,
             cfgs=cfgs,
+            priority=0,
+            strict_ordering=False,
         )
     return q_alloc, kv_cache_alloc, o_alloc, lse_alloc
 
@@ -704,9 +712,9 @@ def rpa_kernel(
                             s.at[pl.ds(0, read_size)],
                             dma_sem.at[0],
                         )
-                        copy.start()
+                        copy.start(priority=1, strict_ordering=False)
                         dma_list.append(copy)
-                jax.tree.map(lambda x: x.wait(), dma_list)
+                jax.tree.map(lambda x: x.wait(strict_ordering=False), dma_list)
 
                 pipeline_func = pltpu.emit_pipeline(
                     body=functools.partial(

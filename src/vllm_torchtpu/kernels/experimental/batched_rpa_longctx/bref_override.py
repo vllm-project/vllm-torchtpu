@@ -50,6 +50,8 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         buffer_count: int,
         use_lookahead: bool,
         cfgs: configs.RpaConfigs,
+        priority: int = 0,
+        strict_ordering: bool = False,
     ):
         assert buffer_type == pltpu.BufferType.INPUT_OUTPUT
 
@@ -60,6 +62,8 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
             buffer_count=buffer_count,
             grid_rank=1,
             use_lookahead=use_lookahead,
+            priority=priority,
+            strict_ordering=strict_ordering,
         )
         return cls(
             cfgs=cfgs,
@@ -98,7 +102,10 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
                     vmem_dst_lane.at[b, :, :, :,
                                      pl.ds(dst_off, sz)],
                     sem,
-                ).start()
+                ).start(
+                    priority=self.priority,
+                    strict_ordering=self.strict_ordering,
+                )
 
             for i in range(self.cfgs.bkv_p_new):
                 dma_entry = schedule_ref.dma_kv_new[block_idx, b, i]
@@ -116,7 +123,10 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
                     vmem_dst_lane.at[b, :, :, :,
                                      pl.ds(dst_vmem_off, sz)],
                     sem,
-                ).start()
+                ).start(
+                    priority=self.priority,
+                    strict_ordering=self.strict_ordering,
+                )
 
     def copy_out(
         self,
@@ -147,7 +157,10 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
                     kv_out_ref.at[hbm_p_idx, :, :, :,
                                   pl.ds(0, sz)],
                     sem,
-                ).start()
+                ).start(
+                    priority=self.priority,
+                    strict_ordering=self.strict_ordering,
+                )
 
     def wait_in(
         self,
@@ -168,7 +181,7 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
             flat_dst.at[pl.ds(0, wait_lanes), :],
             flat_dst.at[pl.ds(0, wait_lanes), :],
             sem,
-        ).wait()
+        ).wait(strict_ordering=self.strict_ordering)
 
     def wait_out(
         self,
@@ -188,7 +201,7 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
             flat_src.at[pl.ds(0, wait_lanes), :],
             flat_src.at[pl.ds(0, wait_lanes), :],
             sem,
-        ).wait()
+        ).wait(strict_ordering=self.strict_ordering)
 
 
 @jax.tree_util.register_dataclass
@@ -207,6 +220,8 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         buffer_count: int,
         use_lookahead: bool,
         cfgs: configs.RpaConfigs,
+        priority: int = 0,
+        strict_ordering: bool = False,
     ):
         assert buffer_type == pltpu.BufferType.INPUT_OUTPUT
 
@@ -217,6 +232,8 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
             buffer_count=buffer_count,
             grid_rank=1,
             use_lookahead=use_lookahead,
+            priority=priority,
+            strict_ordering=strict_ordering,
         )
         return cls(
             cfgs=cfgs,
@@ -268,7 +285,10 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
                 kv_cache_hbm_flat.at[pl.ds(src_off, sz)],
                 vmem_dst.at[b, pl.ds(dst_off, sz)],
                 sem,
-            ).start()
+            ).start(
+                priority=self.priority,
+                strict_ordering=self.strict_ordering,
+            )
 
         for i in range(len(dma_list_new)):
             src_off, dst_off, sz, b = dma_list_new[i]
@@ -276,7 +296,10 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
                 new_kv_hbm.at[pl.ds(src_off, sz)],
                 vmem_dst.at[b, pl.ds(dst_off, sz)],
                 sem,
-            ).start()
+            ).start(
+                priority=self.priority,
+                strict_ordering=self.strict_ordering,
+            )
 
     def copy_out(
         self,
@@ -307,7 +330,10 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
                     vmem_src.at[b, pl.ds(src_vmem_off, sz)],
                     kv_out_ref_flat.at[pl.ds(dst_hbm_off, sz)],
                     sem,
-                ).start()
+                ).start(
+                    priority=self.priority,
+                    strict_ordering=self.strict_ordering,
+                )
 
     def wait_in(
         self,
@@ -327,7 +353,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
             flat_dst.at[pl.ds(0, wait_lanes), :],
             flat_dst.at[pl.ds(0, wait_lanes), :],
             sem,
-        ).wait()
+        ).wait(strict_ordering=self.strict_ordering)
 
     def wait_out(
         self,
@@ -347,7 +373,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
             flat_src.at[pl.ds(0, wait_lanes), :],
             flat_src.at[pl.ds(0, wait_lanes), :],
             sem,
-        ).wait()
+        ).wait(strict_ordering=self.strict_ordering)
 
 
 @jax.tree_util.register_dataclass
@@ -366,6 +392,8 @@ class BatchingORef(pltpu.BufferedRef):
         buffer_count: int,
         use_lookahead: bool,
         cfgs: configs.RpaConfigs,
+        priority: int = 0,
+        strict_ordering: bool = False,
     ):
         assert buffer_type == pltpu.BufferType.OUTPUT
 
@@ -376,6 +404,8 @@ class BatchingORef(pltpu.BufferedRef):
             buffer_count=buffer_count,
             grid_rank=1,
             use_lookahead=use_lookahead,
+            priority=priority,
+            strict_ordering=strict_ordering,
         )
         return cls(
             cfgs=cfgs,
@@ -411,7 +441,10 @@ class BatchingORef(pltpu.BufferedRef):
                 vmem_src.at[b, :, pl.ds(0, q_sz)],
                 o_hbm.at[:, pl.ds(q_src, q_sz)],
                 sem,
-            ).start()
+            ).start(
+                priority=self.priority,
+                strict_ordering=self.strict_ordering,
+            )
 
     def wait_out(
         self,
@@ -431,7 +464,7 @@ class BatchingORef(pltpu.BufferedRef):
             flat_ref.at[pl.ds(0, wait_lanes), :],
             flat_ref.at[pl.ds(0, wait_lanes), :],
             sem,
-        ).wait()
+        ).wait(strict_ordering=self.strict_ordering)
 
 
 @jax.tree_util.register_dataclass
@@ -449,6 +482,8 @@ class BatchingLSERef(pltpu.BufferedRef):
         buffer_count: int,
         use_lookahead: bool,
         cfgs: configs.RpaConfigs,
+        priority: int = 0,
+        strict_ordering: bool = False,
     ):
         standard_ref = pltpu.BufferedRef.create(
             spec=spec,
@@ -457,6 +492,8 @@ class BatchingLSERef(pltpu.BufferedRef):
             buffer_count=buffer_count,
             grid_rank=1,
             use_lookahead=use_lookahead,
+            priority=priority,
+            strict_ordering=strict_ordering,
         )
         return cls(
             cfgs=cfgs,
@@ -490,7 +527,10 @@ class BatchingLSERef(pltpu.BufferedRef):
                 vmem_src.at[b, :, pl.ds(0, q_sz)],
                 lse_hbm.at[:, pl.ds(q_src, q_sz)],
                 sem,
-            ).start()
+            ).start(
+                priority=self.priority,
+                strict_ordering=self.strict_ordering,
+            )
 
     def wait_out(
         self,
@@ -509,7 +549,7 @@ class BatchingLSERef(pltpu.BufferedRef):
             flat_ref.at[pl.ds(0, wait_lanes), :],
             flat_ref.at[pl.ds(0, wait_lanes), :],
             sem,
-        ).wait()
+        ).wait(strict_ordering=self.strict_ordering)
 
 
 @jax.tree_util.register_dataclass
@@ -528,6 +568,8 @@ class BatchingQRef(pltpu.BufferedRef):
         buffer_count: int,
         use_lookahead: bool,
         cfgs: configs.RpaConfigs,
+        priority: int = 0,
+        strict_ordering: bool = False,
     ):
         assert buffer_type == pltpu.BufferType.INPUT
 
@@ -538,6 +580,8 @@ class BatchingQRef(pltpu.BufferedRef):
             buffer_count=buffer_count,
             grid_rank=1,
             use_lookahead=use_lookahead,
+            priority=priority,
+            strict_ordering=strict_ordering,
         )
         return cls(
             cfgs=cfgs,
@@ -570,7 +614,10 @@ class BatchingQRef(pltpu.BufferedRef):
                 q_hbm.at[:, pl.ds(q_src, q_sz)],
                 vmem_dst.at[b, :, pl.ds(0, q_sz)],
                 sem,
-            ).start()
+            ).start(
+                priority=self.priority,
+                strict_ordering=self.strict_ordering,
+            )
 
     def wait_in(
         self,
@@ -590,4 +637,4 @@ class BatchingQRef(pltpu.BufferedRef):
             flat_vmem.at[pl.ds(0, wait_lanes), :],
             flat_vmem.at[pl.ds(0, wait_lanes), :],
             sem,
-        ).wait()
+        ).wait(strict_ordering=self.strict_ordering)
