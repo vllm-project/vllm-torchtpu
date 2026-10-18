@@ -1942,9 +1942,23 @@ def resolve_online_fp8(
 
 
 def _fused_kernel_takes(rows: int, gate: int) -> bool:
+    """Whether this step's MoE runs through the fused EP kernel.
+
+    Under tensor parallelism only a sequence-parallel step qualifies, and when
+    the SP threshold already puts every SP step's rows per rank at or above
+    the gate, that settles it without reading ``rows``. Comparing the traced
+    row count against the gate would put a lower bound on the token symbol;
+    a trace whose only bucket sits on that bound (the small all-reduce fork
+    bounds the same symbol from above at 128 rows) then specializes the
+    symbol, which vLLM's dynamic-shape trace rejects.
+    """
     from vllm_torchtpu.layers.adapter.fused_moe_ep_v3 import tensor_parallel_size
-    if tensor_parallel_size() > 1:
+
+    tp = tensor_parallel_size()
+    if tp > 1:
         from vllm_torchtpu.layers.adapter import sequence_parallel as _sp
         if not _sp.is_active():
             return False
+        if _sp.min_rows() // tp >= gate:
+            return True
     return rows >= gate
