@@ -90,8 +90,37 @@ _DEFAULT_VERIFY_BUCKETS_64 = (4, 8, 12, 16, 20, 24, 32, 40, 48, 56, 64)
 # `(4, 64)` and `(4, b1)` Pallas kernels without exceeding the 62 MiB VMEM limit
 # or falling back to slow stock_t4_b96 / stock_t4_b128 (256-padded XLA).
 _DEFAULT_WIDE_VERIFY_BUCKETS_128 = (80, 84, 88, 96, 104, 112, 120, 128)
+# Buckets above 160 rows run as N microbatches of at most _SPLIT_BASE_B rows
+# (`_split_plan`): every microbatch reuses a compiled single-call callable, so
+# VMEM does not grow with B. The remainders of this list (80, 32, 64, 16, 48)
+# are all in the 64-row verify list or the 80-row base, so no extra kernel
+# compiles. Each microbatch streams the hit experts again: the expert-major
+# MoE phase across microbatches (A2) is the kernel work that removes that
+# re-read; this plan only makes 33..200 sequences at K=3 reachable.
+_DEFAULT_WIDE_VERIFY_BUCKETS_800 = (
+    160, 192, 224, 256, 320, 384, 448, 512, 640, 768, 800,
+)
+_MAX_WIDE_VERIFY_ROWS = 800
 _MAX_SINGLE_KERNEL_B = 80
 _SPLIT_BASE_B = 80
+
+
+def _split_plan(bucket_t: int, tokens_per_seq: int) -> tuple[int, ...]:
+    """Microbatch row counts of a wide bucket: full _SPLIT_BASE_B microbatches
+    and one remainder of 1.._SPLIT_BASE_B rows, each a multiple of
+    tokens_per_seq. (80, B - 80) for 80 < B <= 160, as before.
+    """
+    B, T = int(bucket_t), int(tokens_per_seq)
+    if B <= _SPLIT_BASE_B or B % T != 0 or _SPLIT_BASE_B % T != 0:
+        raise ValueError(
+            f"Split bucket requires B > {_SPLIT_BASE_B} with B and {_SPLIT_BASE_B} "
+            f"multiples of tokens_per_seq={T}, got B={B}"
+        )
+    full, rem = divmod(B, _SPLIT_BASE_B)
+    plan = [_SPLIT_BASE_B] * full
+    if rem:
+        plan.append(rem)
+    return tuple(plan)
 
 
 def _env_off(name: str, default: str = "1") -> bool:
@@ -205,7 +234,7 @@ def parse_mk_buckets(env_val: str | None = None) -> tuple[int, ...]:
         return ()
     buckets = sorted({int(x.strip()) for x in raw.split(",") if x.strip()})
     _need(
-        len(buckets) > 0 and all(1 <= b <= 128 for b in buckets),
+        len(buckets) > 0 and all(1 <= b <= _MAX_WIDE_VERIFY_ROWS for b in buckets),
         f"invalid VLLM_TPU_QWEN35_MK_BUCKETS={raw!r}",
     )
     return tuple(buckets)
@@ -231,7 +260,8 @@ def parse_mk_verify_buckets(env_val: str | None = None) -> tuple[int, ...]:
         return ()
     buckets = sorted({int(x.strip()) for x in raw.split(",") if x.strip()})
     _need(
-        len(buckets) > 0 and all(4 <= b <= 128 and b % 4 == 0 for b in buckets),
+        len(buckets) > 0
+        and all(4 <= b <= _MAX_WIDE_VERIFY_ROWS and b % 4 == 0 for b in buckets),
         f"invalid VLLM_TPU_QWEN35_MK_VERIFY_BUCKETS={raw!r}",
     )
     return tuple(buckets)
@@ -2022,20 +2052,24 @@ class Qwen35Megakernel:
         )
         if runner_max_reqs <= 16:
             return
-        target_rows = min(128, 4 * runner_max_reqs)
-        max_wide = select_bucket(target_rows, _DEFAULT_WIDE_VERIFY_BUCKETS_128)
+        wide_list = _DEFAULT_WIDE_VERIFY_BUCKETS_128 + _DEFAULT_WIDE_VERIFY_BUCKETS_800
+        target_rows = min(_MAX_WIDE_VERIFY_ROWS, 4 * runner_max_reqs)
+        max_wide = select_bucket(target_rows, wide_list)
+        # a split bucket is free of extra kernel compiles when its remainder
+        # microbatch is an existing verify bucket or the 80-row base
+        built = set(self.verify_buckets) | {_SPLIT_BASE_B}
         wide_extra = [
             b
-            for b in _DEFAULT_WIDE_VERIFY_BUCKETS_128
+            for b in wide_list
             if b <= max_wide
-            and (b <= _MAX_SINGLE_KERNEL_B or (b - _SPLIT_BASE_B) in self.verify_buckets)
+            and (b <= _MAX_SINGLE_KERNEL_B or _split_plan(b, 4)[-1] in built)
             and b not in self.verify_buckets
         ]
         if wide_extra:
             self.verify_buckets = tuple(sorted((*self.verify_buckets, *wide_extra)))
             self.max_verify_bucket = max(self.verify_buckets)
             logger.info(
-                "Qwen3.5 megakernel: enabled 2-microbatch split verify buckets %s "
+                "Qwen3.5 megakernel: enabled microbatch-split verify buckets %s "
                 "(runner_max_reqs=%d, max_verify_bucket=%d)",
                 wide_extra,
                 runner_max_reqs,
@@ -2082,8 +2116,8 @@ class Qwen35Megakernel:
                 self._bucket_steps[b] = step
             self._bucket_out_rows[(T, b)] = out_rows
         for T, b in split_keys:
-            b1 = b - _SPLIT_BASE_B
-            m_rows = _SPLIT_BASE_B + max(16, K.rup(b1, 16))
+            plan = _split_plan(b, T)
+            m_rows = sum(plan[:-1]) + max(16, K.rup(plan[-1], 16))
             out_rows = self._runner_out_rows(b, m_rows)
             step = self._build_split_bucket_op(b, tokens_per_seq=T, out_pad_rows=out_rows)
             self._bucket_steps[(T, b)] = step
@@ -2571,29 +2605,23 @@ class Qwen35Megakernel:
         tokens_per_seq: int = 1,
         out_pad_rows: int | None = None,
     ) -> Any:
-        """Build a 2-microbatch megakernel step for wide buckets (64 < B <= 128).
+        """Build an N-microbatch megakernel step for wide buckets (B > 80).
 
         Sequences in verify/decode have disjoint KV pages (`page_table[s]`) and
         disjoint GDN state checkpoint slots (`ckpt_indices[:, s, :]`), so
-        splitting `B` rows into `b0 = 64` (`16` seqs) + `b1 = B - 64` (`1..16`
-        seqs) is mathematically exact, stays within the 62 MiB v7x VMEM ceiling,
-        and reuses the already-compiled `(T, 64)` and `(T, b1)` Pallas callables
-        with zero extra kernel compilations.
+        splitting `B` rows into microbatches of at most `_SPLIT_BASE_B` rows
+        (`_split_plan`: full 80-row microbatches and one remainder) is
+        mathematically exact, stays within the 62 MiB v7x VMEM ceiling, and
+        reuses the already-compiled single-call Pallas callables. The
+        microbatches run in order and each one takes the pools the previous
+        one wrote. Up to 160 rows this is the former 2-microbatch split.
         """
         T = int(tokens_per_seq)
         B = int(bucket_t)
-        if B % T != 0:
-            raise ValueError(f"bucket_t={B} must be a multiple of tokens_per_seq={T}")
-        b0 = _SPLIT_BASE_B
-        b1 = B - b0
-        if b1 <= 0 or b1 > _SPLIT_BASE_B or b1 % T != 0:
-            raise ValueError(
-                f"Split bucket requires {_SPLIT_BASE_B} < B <= {2 * _SPLIT_BASE_B} "
-                f"and B % {T} == 0, got B={B}"
-            )
-        s0_len = b0 // T
-        s1_len = b1 // T
-        S = s0_len + s1_len
+        plan = _split_plan(B, T)
+        n_mb = len(plan)
+        seq_lens = [b_i // T for b_i in plan]
+        S = sum(seq_lens)
         max_pages = int(self.max_pages_per_seq)
         n_p = len(self.raw_pools)
 
@@ -2602,30 +2630,28 @@ class Qwen35Megakernel:
         if not hasattr(self, "_merge_steps"):
             self._merge_steps = {}
 
-        if (T, b0) not in self._flat_callables:
-            self._build_bucket_op(b0, tokens_per_seq=T)
-        if (T, b1) not in self._flat_callables:
-            self._build_bucket_op(b1, tokens_per_seq=T)
-        flat_callable_0 = self._flat_callables[(T, b0)]
-        flat_callable_1 = self._flat_callables[(T, b1)]
-        op_0 = self._bucket_ops[(T, b0)]
-        op_1 = self._bucket_ops[(T, b1)]
-        self._bucket_fused[(T, B)] = bool(
-            self._bucket_fused.get((T, b0), False)
-            or self._bucket_fused.get((T, b1), False)
+        for b_i in sorted(set(plan)):
+            if (T, b_i) not in self._flat_callables:
+                self._build_bucket_op(b_i, tokens_per_seq=T)
+        flat_callables = [self._flat_callables[(T, b_i)] for b_i in plan]
+        ops = [self._bucket_ops[(T, b_i)] for b_i in plan]
+        self._bucket_fused[(T, B)] = any(
+            self._bucket_fused.get((T, b_i), False) for b_i in plan
         )
 
-        m_rows_0 = dataclasses.replace(self.base_cfg, B=b0, T=T).M
-        m_rows_1 = dataclasses.replace(self.base_cfg, B=b1, T=T).M
-        m_rows_total = b0 + max(16, K.rup(b1, 16))
+        m_rows = [dataclasses.replace(self.base_cfg, B=b_i, T=T).M for b_i in plan]
+        m_rows_total = sum(plan[:-1]) + max(16, K.rup(plan[-1], 16))
         target_out_rows = int(out_pad_rows or m_rows_total)
+        # row and sequence offsets of each microbatch inside the step
+        row_off = [sum(plan[:i]) for i in range(n_mb)]
+        seq_off = [sum(seq_lens[:i]) for i in range(n_mb)]
 
         logger.info(
-            "Qwen3.5 megakernel: building 2-microbatch split bucket (T=%d, B=%d -> %d+%d, out_rows=%d)",
+            "Qwen3.5 megakernel: building %d-microbatch split bucket (T=%d, B=%d -> %s, out_rows=%d)",
+            n_mb,
             T,
             B,
-            b0,
-            b1,
+            "+".join(str(b_i) for b_i in plan),
             target_out_rows,
         )
 
@@ -2648,8 +2674,6 @@ class Qwen35Megakernel:
                 else:
                     bt = bt.reshape(int(s0.shape[0]), -1)
             pt_all = _slice_or_pad_2d(bt, S, max_pages).to(torch.int32)
-            pt0 = pt_all[:s0_len].contiguous()
-            pt1 = pt_all[s0_len:S].contiguous()
 
             roff_1d = roff.reshape(-1)
             has_roff = roff_1d.numel() > 1
@@ -2698,10 +2722,6 @@ class Qwen35Megakernel:
 
             ckpt_all = torch.stack(ckpt_rows, dim=0)
             roff_all = torch.stack(roff_rows, dim=0)
-            ckpt0 = ckpt_all[:, :s0_len, :].contiguous()
-            ckpt1 = ckpt_all[:, s0_len:S, :].contiguous()
-            roff0 = roff_all[:, :s0_len].contiguous()
-            roff1 = roff_all[:, s0_len:S].contiguous()
 
             active_seq = ckpt_all[0, :, 0] > 0
             active_tok = active_seq.unsqueeze(1).expand(S, T).reshape(B)
@@ -2713,22 +2733,30 @@ class Qwen35Megakernel:
             pos_all = torch.where(
                 active_tok, _slice_or_pad_1d(pos_1d, B).to(torch.int32), zero_b
             )
-            pos0 = pos_all[:b0].contiguous()
-            pos1 = pos_all[b0:B].contiguous()
-
             h_all = self.embed_tokens(ids_all)
-            h0_0 = h_all[:b0]
-            if h0_0.shape[0] < m_rows_0:
-                h0_0 = F.pad(h0_0, (0, 0, 0, m_rows_0 - h0_0.shape[0]))
-            h0_1 = h_all[b0:B]
-            if h0_1.shape[0] < m_rows_1:
-                h0_1 = F.pad(h0_1, (0, 0, 0, m_rows_1 - h0_1.shape[0]))
-            return pos0, h0_0, pt0, ckpt0, roff0, pos1, h0_1, pt1, ckpt1, roff1
 
-        def merge_split_out(
-            h_out_0: torch.Tensor, h_out_1: torch.Tensor
-        ) -> torch.Tensor:
-            h_out = torch.cat((h_out_0[:b0], h_out_1[:b1]), dim=0)
+            outs: list[torch.Tensor] = []
+            for i in range(n_mb):
+                r0, r1 = row_off[i], row_off[i] + plan[i]
+                q0, q1 = seq_off[i], seq_off[i] + seq_lens[i]
+                h_i = h_all[r0:r1]
+                if h_i.shape[0] < m_rows[i]:
+                    h_i = F.pad(h_i, (0, 0, 0, m_rows[i] - h_i.shape[0]))
+                outs.extend(
+                    (
+                        pos_all[r0:r1].contiguous(),
+                        h_i,
+                        pt_all[q0:q1].contiguous(),
+                        ckpt_all[:, q0:q1, :].contiguous(),
+                        roff_all[:, q0:q1].contiguous(),
+                    )
+                )
+            return tuple(outs)
+
+        def merge_split_out(*h_outs: torch.Tensor) -> torch.Tensor:
+            h_out = torch.cat(
+                [h_i[:b_i] for h_i, b_i in zip(h_outs, plan)], dim=0
+            )
             if h_out.shape[0] > target_out_rows:
                 return h_out[:target_out_rows].clone()
             if h_out.shape[0] < target_out_rows:
@@ -2771,7 +2799,7 @@ class Qwen35Megakernel:
                 pools: list[torch.Tensor],
             ) -> torch.Tensor:
                 prep_fn = self._prep_steps[(T, B)]
-                pos0, h0_0, pt0, ckpt0, roff0, pos1, h0_1, pt1, ckpt1, roff1 = prep_fn(
+                prepped = prep_fn(
                     input_ids, positions, block_tables, s0, c0, s1, c1, s2, c2, roff
                 )
                 cache_key = (id(weights), id(pools))
@@ -2779,16 +2807,17 @@ class Qwen35Megakernel:
                 if wp_tuple is None:
                     wp_tuple = (*weights, *pools)
                     _static_wp_cache[cache_key] = wp_tuple
-                outs0 = flat_callable_0(pos0, h0_0, *wp_tuple, pt0, ckpt0, roff0)
-                for dst, src in zip(pools, outs0[1 : 1 + n_p]):
-                    dst.set_(src)
-                outs1 = flat_callable_1(pos1, h0_1, *wp_tuple, pt1, ckpt1, roff1)
-                for dst, src in zip(pools, outs1[1 : 1 + n_p]):
-                    dst.set_(src)
+                h_outs: list[torch.Tensor] = []
+                for i in range(n_mb):
+                    pos_i, h_i, pt_i, ckpt_i, roff_i = prepped[5 * i : 5 * i + 5]
+                    outs_i = flat_callables[i](pos_i, h_i, *wp_tuple, pt_i, ckpt_i, roff_i)
+                    for dst, src in zip(pools, outs_i[1 : 1 + n_p]):
+                        dst.set_(src)
+                    h_outs.append(outs_i[0])
                 if self._raiden_sync_views:
                     self._sync_raiden_pool_storages(pools)
                 merge_fn = self._merge_steps[(T, B)]
-                return merge_fn(outs0[0], outs1[0])
+                return merge_fn(*h_outs)
 
             return zero_copy_split_step
 
@@ -2806,19 +2835,19 @@ class Qwen35Megakernel:
             weights: list[torch.Tensor],
             pools: list[torch.Tensor],
         ) -> torch.Tensor:
-            pos0, h0_0, pt0, ckpt0, roff0, pos1, h0_1, pt1, ckpt1, roff1 = prep_split(
+            prepped = prep_split(
                 input_ids, positions, block_tables, s0, c0, s1, c1, s2, c2, roff
             )
-            outs0 = op_0(
-                pos0, h0_0, pt0, ckpt0, roff0, list(weights), list(pools)
-            )
-            mid_pools = list(outs0[1 : 1 + n_p])
-            outs1 = op_1(
-                pos1, h0_1, pt1, ckpt1, roff1, list(weights), mid_pools
-            )
-            for dst, src in zip(pools, outs1[1 : 1 + n_p]):
+            cur_pools = list(pools)
+            h_outs: list[torch.Tensor] = []
+            for i in range(n_mb):
+                pos_i, h_i, pt_i, ckpt_i, roff_i = prepped[5 * i : 5 * i + 5]
+                outs_i = ops[i](pos_i, h_i, pt_i, ckpt_i, roff_i, list(weights), cur_pools)
+                cur_pools = list(outs_i[1 : 1 + n_p])
+                h_outs.append(outs_i[0])
+            for dst, src in zip(pools, cur_pools):
                 dst.copy_(src)
-            return merge_split_out(outs0[0], outs1[0])
+            return merge_split_out(*h_outs)
 
         split_step.__code__ = split_step.__code__.replace(
             co_name=f"split_step_t{tokens_per_seq}_b{bucket_t}"
@@ -3671,4 +3700,3 @@ class Qwen35Megakernel:
         if out_rows <= hidden_out.shape[0]:
             return hidden_out[:out_rows]
         return F.pad(hidden_out, (0, 0, 0, out_rows - hidden_out.shape[0]))
-
