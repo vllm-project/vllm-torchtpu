@@ -111,8 +111,10 @@ class Context:
 
 def wait_rows(sem, ref, rows):
     """Waits until `rows` rows' worth of DMAs on `sem` have landed."""
-    pltpu.make_async_copy(ref.at[pl.ds(0, rows)], ref.at[pl.ds(0, rows)],
-                          sem).wait()
+    pltpu.make_async_copy(ref.at[pl.ds(0, rows)],
+                          ref.at[pl.ds(0, rows)],
+                          sem,
+                          strict_ordering=False).wait()
 
 
 def and_nonempty(predicate, count):
@@ -154,7 +156,10 @@ def resident_copy(ctx, src, dst):
     destination (a placement's copy slots after the shard's primaries) contributes its head only."""
     if src.shape[0] != dst.shape[0]:
         src = src.at[pl.ds(0, dst.shape[0])]
-    copy = pltpu.make_async_copy(src, dst, ctx.sems.copy)
+    copy = pltpu.make_async_copy(src,
+                                 dst,
+                                 ctx.sems.copy,
+                                 strict_ordering=False)
     copy.start()
     copy.wait()
 
@@ -220,14 +225,17 @@ def start_token_window(ctx, row_base, window_ref, sem):
     """Starts the copy of the token table's window covering the rows from
     row_base (the window's whole length, one descriptor)."""
     start = window_start(ctx, row_base, window_ref)
-    pltpu.make_async_copy(
-        ctx.operands.token_of_row.at[pl.ds(start, window_ref.shape[0])],
-        window_ref, sem).start()
+    pltpu.make_async_copy(ctx.operands.token_of_row.at[pl.ds(
+        start, window_ref.shape[0])],
+                          window_ref,
+                          sem,
+                          strict_ordering=False).start()
 
 
 def wait_token_window(window_ref, sem):
     """Waits the window's copy (byte-counted on the window itself)."""
-    pltpu.make_async_copy(window_ref, window_ref, sem).wait()
+    pltpu.make_async_copy(window_ref, window_ref, sem,
+                          strict_ordering=False).wait()
 
 
 def window_offset(ctx, row_base, window_ref):
@@ -262,7 +270,9 @@ def issue_rows(ctx, row_base, live_blocks, row_ref_of, window_ref_of, sem,
         token_of = tokens_of(i)
         for r in range(ROW_BLOCK):
             pltpu.make_async_copy(ctx.operands.tokens.at[token_of(r)],
-                                  row_ref_of(i * ROW_BLOCK + r), sem).start()
+                                  row_ref_of(i * ROW_BLOCK + r),
+                                  sem,
+                                  strict_ordering=False).start()
         return carry
 
     lax.fori_loop(0, live_blocks, issue_block, jnp.int32(0))
@@ -271,7 +281,9 @@ def issue_rows(ctx, row_base, live_blocks, row_ref_of, window_ref_of, sem,
             ctx.operands.token_scales.at[plane,
                                          pl.ds(row_base //
                                                LANES, b.window_rows)],
-            window_ref_of(plane), sem).start()
+            window_ref_of(plane),
+            sem,
+            strict_ordering=False).start()
 
 
 # ---- commits and staging ----
@@ -306,13 +318,15 @@ def commit_tile(ctx, expert, slot, tile_block_base, live_blocks):
                                              ROW_BLOCK)],
                 outputs.outgoing.at[pl.ds(dst_block * ROW_BLOCK,
                                           overlap * ROW_BLOCK)],
-                sems.commit.at[slot]).start()
+                sems.commit.at[slot],
+                strict_ordering=False).start()
             if ctx.b.has_result_scales:
                 pltpu.make_async_copy(
                     scratch.result_scales.at[slot,
                                              pl.ds(src_block, overlap)],
                     outputs.outgoing_scales.at[pl.ds(dst_block, overlap)],
-                    sems.commit_scales.at[slot]).start()
+                    sems.commit_scales.at[slot],
+                    strict_ordering=False).start()
 
 
 def stage_tile(ctx, slot, result, result_scales):
@@ -453,7 +467,8 @@ def down_product(ctx, expert, weight_slot, rows, row_scales):
                               elementwise=b.elementwise,
                               swiglu_limit=b.swiglu_limit,
                               columns_per_pass=b.activation_columns_per_pass,
-                              token_block=b.token_block)
+                              token_block=b.token_block,
+                              mask_non_finite=False)
 
 
 def finish_rows(ctx, expert, acc2, mid_scales):
@@ -468,7 +483,8 @@ def finish_rows(ctx, expert, acc2, mid_scales):
                            w2_scales=w2_scales,
                            w2_bias=w2_bias,
                            dtype=b.result_dtype,
-                           elementwise=b.elementwise)
+                           elementwise=b.elementwise,
+                           mask_non_finite=False)
 
 
 # ---- the push and the drains ----
@@ -495,7 +511,8 @@ def push_expert(ctx, expert):
                     send_sem=sems.push_send,
                     recv_sem=sems.push_receive,
                     device_id=device_coords(jnp.int32(d), b.mesh_axes),
-                    device_id_type=pl.DeviceIdType.MESH).start()
+                    device_id_type=pl.DeviceIdType.MESH,
+                    strict_ordering=False).start()
 
             pl.when(rows > 0)(push_run)  # a run can be empty
             if b.has_result_scales:
@@ -507,7 +524,8 @@ def push_expert(ctx, expert):
                     send_sem=sems.push_send_scales,
                     recv_sem=sems.push_receive_scales,
                     device_id=device_coords(jnp.int32(d), b.mesh_axes),
-                    device_id_type=pl.DeviceIdType.MESH).start()
+                    device_id_type=pl.DeviceIdType.MESH,
+                    strict_ordering=False).start()
 
         @pl.when(and_nonempty(is_me, blocks))
         def _():
@@ -516,12 +534,14 @@ def push_expert(ctx, expert):
                                           blocks * ROW_BLOCK)],
                 outputs.arrivals.at[pl.ds(dst_block * ROW_BLOCK,
                                           blocks * ROW_BLOCK)],
-                sems.local_hop).start()
+                sems.local_hop,
+                strict_ordering=False).start()
             if b.has_result_scales:
                 pltpu.make_async_copy(
                     outputs.outgoing_scales.at[pl.ds(src_block, blocks)],
                     outputs.arrival_scales.at[pl.ds(dst_block, blocks)],
-                    sems.local_hop_scales).start()
+                    sems.local_hop_scales,
+                    strict_ordering=False).start()
 
 
 def drain_transport(ctx):

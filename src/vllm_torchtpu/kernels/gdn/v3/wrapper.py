@@ -522,9 +522,7 @@ def fused_conv1d_gdn(
         recurrent_out_dtype = recurrent_state.dtype
         conv_state = conv_state.astype(jnp.float32)
 
-    qkv = qkv.astype(jnp.float32)
-    b = b.astype(jnp.float32)
-    a = a.astype(jnp.float32)
+    assert a.dtype == b.dtype == qkv.dtype
 
     # Step 1: Validate inputs.
     is_kda = attention_mode == config.AttentionMode.KDA
@@ -572,8 +570,7 @@ def fused_conv1d_gdn(
                                       1), (ckpt_indices.shape, num_seqs,
                                            num_spec_tokens)
         ckpt_indices = ckpt_indices.astype(jnp.int32)
-    act_in_dtype = qkv.dtype
-    assert a.dtype == b.dtype == qkv.dtype == act_in_dtype
+    act_in_dtype = jnp.dtype(jnp.float32)
 
     num_lanes = pltpu.get_tpu_info().num_lanes
     packing = 4 // act_in_dtype.itemsize
@@ -615,13 +612,16 @@ def fused_conv1d_gdn(
     # lane multiple of n_v * d_k rather than of n_v.
     gate_dim = n_v * d_k if is_kda else n_v
     gate_padding_size = (pl.cdiv(gate_dim, num_lanes) * num_lanes) - gate_dim
-    qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
-    b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
-    a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
+    if batch_padding_size:
+        qkv = jnp.pad(qkv, ((0, batch_padding_size), (0, 0)))
+    if batch_padding_size or num_v_padding_size:
+        b = jnp.pad(b, ((0, batch_padding_size), (0, num_v_padding_size)))
+    if batch_padding_size or gate_padding_size:
+        a = jnp.pad(a, ((0, batch_padding_size), (0, gate_padding_size)))
 
-    qkv = qkv.reshape(padded_batch_size, 1, -1)
-    b = b.reshape(padded_batch_size, 1, -1)
-    a = a.reshape(padded_batch_size, 1, -1)
+    qkv = qkv.reshape(padded_batch_size, 1, -1).astype(jnp.float32)
+    b = b.reshape(padded_batch_size, 1, -1).astype(jnp.float32)
+    a = a.reshape(padded_batch_size, 1, -1).astype(jnp.float32)
 
     # Step 3: States and weights pre-processing.
     if not pooled:

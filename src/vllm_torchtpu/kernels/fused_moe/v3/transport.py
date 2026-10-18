@@ -223,7 +223,8 @@ class Exchange:
             send_sem=self.send_sem,
             recv_sem=sem,
             device_id=device_coords(peer, self.mesh_axes),
-            device_id_type=pl.DeviceIdType.MESH)
+            device_id_type=pl.DeviceIdType.MESH,
+            strict_ordering=False)
 
     def wait_landed(self, rows, sem):
         """Wait for `rows` of the gathered rows to land on `sem`. Under the
@@ -235,7 +236,9 @@ class Exchange:
         descriptor's receive wait."""
         if layout.SHARD_INDEX_OPERAND:
             pltpu.make_async_copy(self.gathered_rows.at[rows],
-                                  self.gathered_rows.at[rows], sem).wait()
+                                  self.gathered_rows.at[rows],
+                                  sem,
+                                  strict_ordering=False).wait()
         else:
             self.remote_copy(rows, sem, self.mate).wait_recv()
 
@@ -532,16 +535,19 @@ def start_transport(rows,
         all_shards_barrier(num_shards, mesh_axes)
 
         def fetch_rows(i):
-            return pltpu.make_async_copy(
-                rows_hbm.at[pl.ds(i * tile, rows_of(i))],
-                rows_vmem.at[i % 2,
-                             pl.ds(0, rows_of(i))], row_fetch_sems.at[i % 2])
+            return pltpu.make_async_copy(rows_hbm.at[pl.ds(
+                i * tile, rows_of(i))],
+                                         rows_vmem.at[i % 2,
+                                                      pl.ds(0, rows_of(i))],
+                                         row_fetch_sems.at[i % 2],
+                                         strict_ordering=False)
 
         def write_gathered_rows(i):
             return pltpu.make_async_copy(
                 quantized_vmem.at[i % 2, pl.ds(0, rows_of(i))],
                 gathered_rows.at[pl.ds(shard * tokens + i * tile, rows_of(i))],
-                gathered_rows_write_sems.at[i % 2])
+                gathered_rows_write_sems.at[i % 2],
+                strict_ordering=False)
 
         def share_with_mate(i):
             return pltpu.make_async_remote_copy(
@@ -551,7 +557,8 @@ def start_transport(rows,
                 send_sem=mate_send_sems.at[i % 2],
                 recv_sem=receive_sems.at[MATE_TILE_SEMAPHORE],
                 device_id=device_coords(exchange.mate, mesh_axes),
-                device_id_type=pl.DeviceIdType.MESH)
+                device_id_type=pl.DeviceIdType.MESH,
+                strict_ordering=False)
 
         def send_message(peer):
             return pltpu.make_async_remote_copy(
@@ -560,7 +567,8 @@ def start_transport(rows,
                 send_sem=message_send_sem,
                 recv_sem=message_receive_sem,
                 device_id=device_coords(peer, mesh_axes),
-                device_id_type=pl.DeviceIdType.MESH)
+                device_id_type=pl.DeviceIdType.MESH,
+                strict_ordering=False)
 
         fetch_rows(0).start()
         for i in range(n_tiles):
@@ -575,7 +583,8 @@ def start_transport(rows,
                 quantized, scale = quantize_rows(rows_vmem[i % 2],
                                                  scale_dtype,
                                                  block=activation_block,
-                                                 dtype=elementwise)
+                                                 dtype=elementwise,
+                                                 mask_non_finite=False)
             if i >= 2:
                 write_gathered_rows(i - 2).wait()
                 if num_shards > 1:
@@ -600,7 +609,8 @@ def start_transport(rows,
                     column.T[0:1, :], jnp.int32)
         local_message = pltpu.make_async_copy(message_in,
                                               routing_messages.at[shard],
-                                              message_local_sem)
+                                              message_local_sem,
+                                              strict_ordering=False)
         local_message.start()
         for i in range(1, num_shards):
             send_message((shard + i) & (num_shards - 1)).start()
@@ -615,7 +625,8 @@ def start_transport(rows,
                                            rows_of(i))],
                     gathered_rows.at[pl.ds(shard * tokens + i * tile,
                                            rows_of(i))],
-                    receive_sems.at[MATE_TILE_SEMAPHORE]).wait()
+                    receive_sems.at[MATE_TILE_SEMAPHORE],
+                    strict_ordering=False).wait()
             else:
                 share_with_mate(i).wait_recv()
         issue_first_round(exchange)
@@ -623,7 +634,8 @@ def start_transport(rows,
             if layout.SHARD_INDEX_OPERAND:
                 pltpu.make_async_copy(routing_messages.at[shard],
                                       routing_messages.at[shard],
-                                      message_receive_sem).wait()
+                                      message_receive_sem,
+                                      strict_ordering=False).wait()
             else:
                 send_message(shard ^ 1).wait_recv()
         for _ in range(1, num_shards):
