@@ -19,8 +19,8 @@ requantization and down, then writes its unweighted rows into an expert-major
 BF16 slab in HBM. The shared expert is one more visit over every token, with
 contiguous rows. The combine is fused_moe/v2's destination combine: per token,
 the router-weighted sum of its top-k routed rows plus its shared row. The sum
-over the ranks is an all-reduce issued per combine chunk, so each chunk's
-all-reduce runs under the next chunk's combine.
+over the ranks is a reduce-scatter plus an all-gather issued per combine chunk,
+so each chunk's reduction runs under the next chunk's combine.
 
 With expert parallelism and TP attention a rank holds whole experts instead of
 slices and the call is the same, restricted to the rank's expert range.
@@ -1219,10 +1219,28 @@ def _pack_scales(bits):
     return lax.bitcast_convert_type(bits[:, 0::2] | (bits[:, 1::2] >> 16), jnp.int32)
 
 
+def _psum_rows(y, axis_name):
+    """psum(y, axis_name) as a reduce-scatter over the rows plus an all-gather.
+
+    The same sum up to rounding order, but never one all-reduce of the whole
+    chunk: offloaded to the SparseCore, that all-reduce rounded the sum so that
+    the first token's attention sink formed too weakly for some GLM-5.2 prompts
+    (fp8 KV cache) and generation degenerated; this form served them correctly.
+    Rows are zero-padded to a multiple of the axis size and sliced back, so
+    every chunk shape takes this form."""
+    rows = y.shape[0]
+    pad = -rows % lax.axis_size(axis_name)
+    if pad:
+        y = jnp.pad(y, ((0, pad),) + ((0, 0),) * (y.ndim - 1))
+    y = lax.psum_scatter(y, axis_name, scatter_dimension=0, tiled=True)
+    y = lax.all_gather(y, axis_name, axis=0, tiled=True)
+    return y[:rows] if pad else y
+
+
 def _chunked_psum(tokens, combine_chunk, axis_name):
     """psum(combine_chunk(rows)) over equal token chunks of at most
     _COMBINE_CHUNK_TOKENS, concatenated. Chunk c's input is tied to chunk
-    c - 1's reduced output so XLA keeps the all-reduces separate and each runs
+    c - 1's reduced output so XLA keeps the reductions separate and each runs
     under the next chunk's combine."""
     chunks = next(
         n
@@ -1235,7 +1253,7 @@ def _chunked_psum(tokens, combine_chunk, axis_name):
         y = combine_chunk(slice(c * chunk, (c + 1) * chunk))
         if outs:
             y, _ = lax.optimization_barrier((y, outs[-1]))
-        outs.append(lax.psum(y, axis_name))
+        outs.append(_psum_rows(y, axis_name))
     return outs[0] if chunks == 1 else jnp.concatenate(outs, 0)
 
 
