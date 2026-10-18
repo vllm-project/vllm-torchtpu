@@ -5778,8 +5778,13 @@ class TPUModelRunner(GPUModelRunner):
             or self._pp_chunk_granularity is not None
         ):
             return
+        # The scheduler clips a prefill chunk at a mamba block boundary under
+        # this same condition, so a granule that is not a whole block would
+        # clip a lone prompt's first chunk to nothing.
         block_aligned = (
-            self._has_mamba_state and self.cache_config.mamba_cache_mode == "align"
+            self.kv_cache_config is not None
+            and self.kv_cache_config.has_mamba_layers
+            and self.cache_config.mamba_cache_mode == "align"
         )
         granularity = chunk_granularity(
             self.cache_config.block_size, self.max_num_tokens, block_aligned
