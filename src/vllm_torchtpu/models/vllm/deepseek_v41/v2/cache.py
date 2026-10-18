@@ -10,6 +10,7 @@ import torch
 from vllm.v1.worker.utils import allocate_kv_cache as allocate_upstream_kv_cache
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.distributed.pallas_shapes import get_kernel_mesh
 from vllm_torchtpu.kernels.deepseek_v4.csa_cache_layout import ROW_WORDS
 
 ROW_BYTES = ROW_WORDS * 4
@@ -1094,7 +1095,7 @@ def initialize_cache_ops():
     _read_values_op = pallas.jax_op(
         "pallas::dsv41v2_cache_read_values",
         read_cache_values,
-        mesh=get_vllm_model_wrapper_context().mesh,
+        mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
         input_partition_specs=(P(), P(), None, None, None),
     )
     _read_values_op.register_fake(
@@ -1122,7 +1123,7 @@ def initialize_cache_ops():
     _read_values_2bank_op = pallas.jax_op(
         "pallas::dsv41v2_cache_read_values_2bank",
         read_cache_values_2bank,
-        mesh=get_vllm_model_wrapper_context().mesh,
+        mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
         input_partition_specs=(P(), P(), P(), None, None, None),
     )
     _read_values_2bank_op.register_fake(
@@ -1139,7 +1140,7 @@ def initialize_cache_ops():
         "pallas::dsv41v2_cache_write",
         _scatter_rows,
         donate_argnums=(0,),
-        mesh=get_vllm_model_wrapper_context().mesh,
+        mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
         input_partition_specs=(P(), P(), P()),
     )
     _write_op.register_fake(lambda cache, slots, values: torch.empty_like(cache))
@@ -1157,7 +1158,7 @@ def initialize_cache_ops():
         "pallas::dsv41v2_cache_write_values",
         write_values,
         donate_argnums=(0,),
-        mesh=mesh,
+        mesh=get_kernel_mesh(mesh),
         input_partition_specs=(P(), P(), P()),
     )
     _write_values_op.register_fake(
@@ -1176,7 +1177,7 @@ def initialize_cache_ops():
         "pallas::dsv41v2_cache_write_values_after",
         write_values_after,
         donate_argnums=(0,),
-        mesh=mesh,
+        mesh=get_kernel_mesh(mesh),
         input_partition_specs=(P(), P(), P(), P()),
     )
     _write_values_after_op.register_fake(
@@ -1199,7 +1200,7 @@ def initialize_cache_ops():
         "pallas::dsv41v2_index_halfplane_write",
         write_index_values,
         donate_argnums=(0,),
-        mesh=mesh,
+        mesh=get_kernel_mesh(mesh),
         input_partition_specs=(P(), P(), P()),
     )
     _write_index_values_op.register_fake(
@@ -1216,7 +1217,7 @@ def initialize_cache_ops():
         "pallas::dsv41v2_index_halfplane_write_after",
         write_index_after,
         donate_argnums=(0,),
-        mesh=mesh,
+        mesh=get_kernel_mesh(mesh),
         input_partition_specs=(P(), P(), P(), P()),
     )
     _write_index_values_after_op.register_fake(
@@ -1225,7 +1226,7 @@ def initialize_cache_ops():
     _encode_fp8_op = pallas.jax_op(
         "pallas::dsv41v2_encode_fp8_kv",
         encode_fp8_kv,
-        mesh=mesh,
+        mesh=get_kernel_mesh(mesh),
         input_partition_specs=(P(),),
     )
     _encode_fp8_op.register_fake(

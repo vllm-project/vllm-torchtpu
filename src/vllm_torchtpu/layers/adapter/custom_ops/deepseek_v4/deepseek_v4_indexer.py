@@ -27,6 +27,7 @@ from vllm.models.deepseek_v4 import attention as dsv4_attention
 from vllm.models.deepseek_v4.attention import DeepseekV4Indexer, DeepseekV4IndexerCache
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
+from vllm_torchtpu.distributed.pallas_shapes import get_kernel_mesh
 from vllm_torchtpu.kernels.deepseek_v4.rope import rope_quant
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
@@ -182,7 +183,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         indexer_jax_op = pallas.jax_op(
             op_name,
             wrapped_fn,
-            mesh=mesh,
+            mesh=get_kernel_mesh(mesh),
             input_partition_specs=(
                 P(attn_data_axis, attn_head_axis, None),  # q
                 P(attn_data_axis),  # positions

@@ -36,12 +36,19 @@ def supports_swa(q: jax.Array, records: jax.Array) -> bool:
 
 
 def _kernel(
-    q_ref, kv_ref, mask_ref, sink_ref, out_ref, *, scale, query_tile, interpret
+    q_ref,
+    kv_ref,
+    mask_ref,
+    sink_ref,
+    out_ref,
+    *accumulators,
+    scale,
+    query_tile,
+    interpret,
 ):
     total_queries, heads, dim = q_ref.shape
     groups, queries, keys = mask_ref.shape
     rows = pl.cdiv(query_tile * heads, 16) * 16
-    stride = rows // 4
     tiles = total_queries // query_tile
 
     def permute(x, *, inverse):
@@ -59,19 +66,27 @@ def _kernel(
             return jnp.dot(x, matrix, preferred_element_type=jnp.float32).astype(
                 x.dtype
             )
-        for k in range(2):
-            for mxu in range(2):
-                pltpu.matmul_push_rhs(
-                    matrix[k * 256 : (k + 1) * 256, mxu * 256 : (mxu + 1) * 256], 0, mxu
-                )
-                pltpu.matmul_acc_lhs(4 * stride, x[:, k * 256 : (k + 1) * 256], mxu, 0)
-        return jnp.concatenate(
-            [
-                pltpu.matmul_pop(4 * stride, (x.shape[0], 256), jnp.float32, mxu)
-                for mxu in range(2)
-            ],
-            axis=1,
-        ).astype(x.dtype)
+
+        def compute(*permutation_accumulators):
+            for k in range(2):
+                for mxu in range(2):
+                    pltpu.matmul_push_rhs(
+                        matrix[k * 256 : (k + 1) * 256, mxu * 256 : (mxu + 1) * 256],
+                        0,
+                        mxu,
+                    )
+                    pltpu.matmul_acc_lhs(
+                        permutation_accumulators[mxu], x[:, k * 256 : (k + 1) * 256], 0
+                    )
+            return jnp.concatenate(
+                [pltpu.matmul_pop(permutation_accumulators[mxu]) for mxu in range(2)],
+                axis=1,
+            ).astype(x.dtype)
+
+        return pl.run_scoped(
+            compute,
+            *(pltpu.ACC(mxu)((x.shape[0], 256), jnp.float32) for mxu in range(2)),
+        )
 
     def load_kv(group):
         mask = mask_ref[group]
@@ -101,27 +116,24 @@ def _kernel(
         for k in range(2):
             ks = slice(k * 256, (k + 1) * 256)
             pltpu.matmul_push_rhs(kv[:, ks], 0, 0, transpose=True)
-            pltpu.matmul_acc_lhs((i % 2) * stride, q[:, ks], 0, 0)
+            pltpu.matmul_acc_lhs(accumulators[i % 2], q[:, ks], 0)
 
     def pop_qk(i):
         if interpret:
             return jnp.dot(query(i), get_kv(i).T, preferred_element_type=jnp.float32)
-        return pltpu.matmul_pop((i % 2) * stride, (rows, 256), jnp.float32, 0)
+        return pltpu.matmul_pop(accumulators[i % 2])
 
     def launch_pv(i, p):
         kv = get_kv(i)
         for mxu in range(2):
             pltpu.matmul_push_rhs(kv[:, mxu * 256 : (mxu + 1) * 256], 0, mxu)
-            pltpu.matmul_acc_lhs((2 + i % 2) * stride, p, mxu, 0)
+            pltpu.matmul_acc_lhs(accumulators[mxu * 4 + 2 + i % 2], p, 0)
 
     def pop_pv(i, p):
         if interpret:
             return jnp.dot(p, get_kv(i), preferred_element_type=jnp.float32)
         return jnp.concatenate(
-            [
-                pltpu.matmul_pop((2 + i % 2) * stride, (rows, 256), jnp.float32, mxu)
-                for mxu in range(2)
-            ],
+            [pltpu.matmul_pop(accumulators[mxu * 4 + 2 + i % 2]) for mxu in range(2)],
             axis=1,
         )
 
@@ -227,6 +239,15 @@ def attend_swa(
         ),
         out_specs=q_spec,
         out_shape=jax.ShapeDtypeStruct(q.shape, q.dtype),
+        scratch_shapes=(
+            tuple(
+                pltpu.ACC(mxu)((pl.cdiv(query_tile * heads, 16) * 16, 256), jnp.float32)
+                for mxu in range(2)
+                for _ in range(4)
+            )
+            if not interpret
+            else ()
+        ),
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("parallel", "arbitrary")
         ),

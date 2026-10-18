@@ -441,34 +441,6 @@ def main_kernel(
 
             transfer_group(next_request, next_t0, 1 - bank)
 
-        def csa_launch(i, addr, *, pv):
-            for k in range(2):
-                ks = pl.ds(k * 256, 256)
-                for mxu in range(2):
-                    ns = pl.ds(mxu * 256, 256)
-                    rhs = main_bf16_ref[i, ks, ns] if pv else main_bf16_ref[i, ns, ks]
-                    pltpu.matmul_push_rhs(
-                        rhs, staging_register=0, mxu_index=mxu, transpose=not pv
-                    )
-                    lhs = main_p_ref[i, :, ks] if pv else q_ref[i, :, ks]
-                    lhs = jnp.pad(lhs, ((0, mxu_heads - num_heads), (0, 0)))
-                    pltpu.matmul_acc_lhs(addr, lhs, mxu_index=mxu, load_staged_rhs=0)
-
-        def csa_pop(i, addr, *, pv):
-            if interpret:
-                lhs = main_p_ref[i] if pv else q_ref[i]
-                rhs = main_bf16_ref[i] if pv else main_bf16_ref[i].T
-                return jnp.dot(lhs, rhs, preferred_element_type=jnp.float32)
-            return jnp.concatenate(
-                tuple(
-                    pltpu.matmul_pop(
-                        addr, (mxu_heads, 256), jnp.float32, mxu_index=mxu
-                    )[:num_heads]
-                    for mxu in range(2)
-                ),
-                axis=1,
-            )
-
         if interpret:
             swa_score_ref[...] = jnp.dot(
                 q_ref[...].reshape(bq * num_heads, 512),
@@ -483,289 +455,346 @@ def main_kernel(
                 partitions.append(
                     (len(partitions), first_heads, num_heads - first_heads)
                 )
-            for k in range(2):
-                ks = pl.ds(k * 256, 256)
-                rhs = swa_shared_ref[:, ks]
-                for mxu, head_start, heads in partitions:
-                    rows = pl.cdiv(heads, 16) * 16
-                    pltpu.matmul_push_rhs(
-                        rhs, staging_register=0, mxu_index=mxu, transpose=True
-                    )
-                    for i in range(bq):
-                        lhs = q_ref[i, pl.ds(head_start, heads), ks]
-                        lhs = jnp.pad(lhs, ((0, rows - heads), (0, 0)))
+
+            def compute_swa_qk(*accumulators):
+                for k in range(2):
+                    ks = pl.ds(k * 256, 256)
+                    rhs = swa_shared_ref[:, ks]
+                    for mxu, head_start, heads in partitions:
+                        rows = pl.cdiv(heads, 16) * 16
+                        pltpu.matmul_push_rhs(
+                            rhs, staging_register=0, mxu_index=mxu, transpose=True
+                        )
+                        for i in range(bq):
+                            lhs = q_ref[i, pl.ds(head_start, heads), ks]
+                            lhs = jnp.pad(lhs, ((0, rows - heads), (0, 0)))
+                            pltpu.matmul_acc_lhs(
+                                accumulators[mxu * bq + i],
+                                lhs,
+                                load_staged_rhs=0 if i == 0 else None,
+                            )
+                for i in range(bq):
+                    for mxu, head_start, heads in partitions:
+                        rows = pl.cdiv(heads, 16) * 16
+                        swa_score_ref[i, pl.ds(head_start, heads), :] = (
+                            pltpu.matmul_pop(accumulators[mxu * bq + i])[:heads]
+                        )
+
+            pl.run_scoped(
+                compute_swa_qk,
+                *(
+                    pltpu.ACC(mxu)((pl.cdiv(heads, 16) * 16, 256), jnp.float32)
+                    for mxu, _, heads in partitions
+                    for _ in range(bq)
+                ),
+            )
+
+        accumulator_slots = 10 if 10 * mrb_stride <= 256 else 6
+
+        def compute_main(*accumulators):
+            def accumulator(mxu, address):
+                return accumulators[mxu * accumulator_slots + address // mrb_stride]
+
+            def csa_launch(i, addr, *, pv):
+                for k in range(2):
+                    ks = pl.ds(k * 256, 256)
+                    for mxu in range(2):
+                        ns = pl.ds(mxu * 256, 256)
+                        rhs = (
+                            main_bf16_ref[i, ks, ns] if pv else main_bf16_ref[i, ns, ks]
+                        )
+                        pltpu.matmul_push_rhs(
+                            rhs, staging_register=0, mxu_index=mxu, transpose=not pv
+                        )
+                        lhs = main_p_ref[i, :, ks] if pv else q_ref[i, :, ks]
+                        lhs = jnp.pad(lhs, ((0, mxu_heads - num_heads), (0, 0)))
                         pltpu.matmul_acc_lhs(
-                            i * rows // 4,
-                            lhs,
-                            mxu_index=mxu,
-                            load_staged_rhs=0 if i == 0 else None,
+                            accumulator(mxu, addr), lhs, load_staged_rhs=0
                         )
-            for i in range(bq):
-                for mxu, head_start, heads in partitions:
-                    rows = pl.cdiv(heads, 16) * 16
-                    swa_score_ref[i, pl.ds(head_start, heads), :] = pltpu.matmul_pop(
-                        i * rows // 4, (rows, 256), jnp.float32, mxu_index=mxu
-                    )[:heads]
 
-        dequant(0)
-        if not interpret:
-            csa_launch(0, 0, pv=False)
-
-        def softmax(i, addr, *, has_next=True):
-            if has_next:
-                dequant(i + 1)
-            if not interpret and has_next:
-                csa_launch(i + 1, mrb_stride - addr, pv=False)
-            main_logits = csa_pop(i, addr, pv=False) * scale
-            main_count = main_lengths_ref[t0 + i]
-            main_logits = jnp.where(
-                jnp.arange(512)[None, :] < main_count, main_logits, -jnp.inf
-            )
-            lanes = jnp.arange(128)
-            key_positions = jnp.concatenate(
-                (swa_cache_bases[0] + lanes, swa_cache_bases[1] + lanes)
-            )
-            # Concatenate integer boundaries before constructing the boolean mask.
-            unique = key_positions >= jnp.concatenate(
-                tuple(
-                    jnp.full((128,), anchor + swa_cache_ids[slot] * 128, jnp.int32)
-                    for slot in range(2)
+            def csa_pop(i, addr, *, pv):
+                if interpret:
+                    lhs = main_p_ref[i] if pv else q_ref[i]
+                    rhs = main_bf16_ref[i] if pv else main_bf16_ref[i].T
+                    return jnp.dot(lhs, rhs, preferred_element_type=jnp.float32)
+                return jnp.concatenate(
+                    tuple(
+                        pltpu.matmul_pop(accumulator(mxu, addr))[:num_heads]
+                        for mxu in range(2)
+                    ),
+                    axis=1,
                 )
-            )
-            swa_valid = (key_positions >= jnp.maximum(0, p0 + i - window_size + 1)) & (
-                key_positions <= p0 + i
-            )
-            if swa_bounds_ref is not None:
-                swa_valid = (key_positions >= swa_bounds_ref[request_index, 0]) & (
-                    key_positions < swa_bounds_ref[request_index, 1]
+
+            dequant(0)
+            if not interpret:
+                csa_launch(0, 0, pv=False)
+
+            def softmax(i, addr, *, has_next=True):
+                if has_next:
+                    dequant(i + 1)
+                if not interpret and has_next:
+                    csa_launch(i + 1, mrb_stride - addr, pv=False)
+                main_logits = csa_pop(i, addr, pv=False) * scale
+                main_count = main_lengths_ref[t0 + i]
+                main_logits = jnp.where(
+                    jnp.arange(512)[None, :] < main_count, main_logits, -jnp.inf
                 )
-            if swa_metadata_ref is not None:
-                swa_valid &= key_positions >= swa_metadata_ref[request_index, 1]
-            swa_logits = jnp.where(
-                (swa_valid & unique)[None, :], swa_score_ref[i] * scale, -jnp.inf
-            )
-            # Keep both branches in one FP32 softmax tile; round only P.
-            logits = jnp.concatenate((main_logits, swa_logits), axis=1)
-            maximum = jnp.maximum(sink, jnp.max(logits, axis=1, keepdims=True))
-            exponentials = jnp.exp(logits - maximum)
-            denominator = jnp.exp(sink - maximum) + jnp.sum(
-                exponentials, axis=1, keepdims=True
-            )
-            probabilities = (exponentials / denominator).astype(jnp.bfloat16)
-            main_p_ref[i] = probabilities[:, :512]
-            swa_p_ref[i] = probabilities[:, 512:]
-
-        # Each 256-wide FP32 MRB has 256 addresses, four rows per address.
-        if 10 * mrb_stride <= 256:
-
-            def launch_tile(first, slot, *, size=2, has_next=True):
-                for row in range(size):
-                    softmax(
-                        first + row,
-                        row * mrb_stride,
-                        has_next=row + 1 < size or has_next,
+                lanes = jnp.arange(128)
+                key_positions = jnp.concatenate(
+                    (swa_cache_bases[0] + lanes, swa_cache_bases[1] + lanes)
+                )
+                # Concatenate integer boundaries before constructing the boolean mask.
+                unique = key_positions >= jnp.concatenate(
+                    tuple(
+                        jnp.full((128,), anchor + swa_cache_ids[slot] * 128, jnp.int32)
+                        for slot in range(2)
                     )
-                    if not interpret:
-                        csa_launch(
-                            first + row, (2 + 2 * slot + row) * mrb_stride, pv=True
+                )
+                swa_valid = (
+                    key_positions >= jnp.maximum(0, p0 + i - window_size + 1)
+                ) & (key_positions <= p0 + i)
+                if swa_bounds_ref is not None:
+                    swa_valid = (key_positions >= swa_bounds_ref[request_index, 0]) & (
+                        key_positions < swa_bounds_ref[request_index, 1]
+                    )
+                if swa_metadata_ref is not None:
+                    swa_valid &= key_positions >= swa_metadata_ref[request_index, 1]
+                swa_logits = jnp.where(
+                    (swa_valid & unique)[None, :], swa_score_ref[i] * scale, -jnp.inf
+                )
+                # Keep both branches in one FP32 softmax tile; round only P.
+                logits = jnp.concatenate((main_logits, swa_logits), axis=1)
+                maximum = jnp.maximum(sink, jnp.max(logits, axis=1, keepdims=True))
+                exponentials = jnp.exp(logits - maximum)
+                denominator = jnp.exp(sink - maximum) + jnp.sum(
+                    exponentials, axis=1, keepdims=True
+                )
+                probabilities = (exponentials / denominator).astype(jnp.bfloat16)
+                main_p_ref[i] = probabilities[:, :512]
+                swa_p_ref[i] = probabilities[:, 512:]
+
+            # Each 256-wide FP32 MRB has 256 addresses, four rows per address.
+            if 10 * mrb_stride <= 256:
+
+                def launch_tile(first, slot, *, size=2, has_next=True):
+                    for row in range(size):
+                        softmax(
+                            first + row,
+                            row * mrb_stride,
+                            has_next=row + 1 < size or has_next,
                         )
-                if not interpret:
+                        if not interpret:
+                            csa_launch(
+                                first + row, (2 + 2 * slot + row) * mrb_stride, pv=True
+                            )
+                    if not interpret:
+                        for mxu in range(2):
+                            pltpu.matmul_push_rhs(
+                                swa_shared_ref[:, pl.ds(mxu * 256, 256)],
+                                staging_register=0,
+                                mxu_index=mxu,
+                            )
+                            for row in range(size):
+                                lhs = jnp.pad(
+                                    swa_p_ref[first + row],
+                                    ((0, mxu_heads - num_heads), (0, 0)),
+                                )
+                                pltpu.matmul_acc_lhs(
+                                    accumulator(mxu, (6 + 2 * slot + row) * mrb_stride),
+                                    lhs,
+                                    load_staged_rhs=0 if row == 0 else None,
+                                )
+
+                def finish_tile_output(i, slot, row):
+                    main_output = csa_pop(i, (2 + 2 * slot + row) * mrb_stride, pv=True)
+                    if interpret:
+                        swa_output = jnp.dot(
+                            swa_p_ref[i],
+                            swa_shared_ref[...],
+                            preferred_element_type=jnp.float32,
+                        )
+                    else:
+                        swa_output = jnp.concatenate(
+                            tuple(
+                                pltpu.matmul_pop(
+                                    accumulator(mxu, (6 + 2 * slot + row) * mrb_stride)
+                                )[:num_heads]
+                                for mxu in range(2)
+                            ),
+                            axis=1,
+                        )
+                    output = main_output + swa_output
+                    tail = output[:, 384:]
+                    partner = jnp.where(
+                        (jnp.arange(128) % 2 == 0)[None, :],
+                        pltpu.roll(tail, 127, axis=1),
+                        pltpu.roll(tail, 1, axis=1),
+                    )
+                    rotated = (
+                        tail * rope_ref[i, 0][None, :]
+                        + partner * rope_ref[i, 1][None, :]
+                    )
+                    output_ref[i, :, :384] = output[:, :384].astype(jnp.bfloat16)
+                    output_ref[i, :, 384:] = rotated.astype(jnp.bfloat16)
+                    pltpu.make_async_copy(
+                        output_ref.at[i],
+                        output_hbm_ref.at[t0 + i],
+                        dma_sem.at[2 + 8 * bq + i],
+                    ).start()
+
+                def finish_tile(first, slot, *, size=2):
+                    for row in range(size):
+                        finish_tile_output(first + row, slot, row)
+
+                def advance_tile(first, slot, *, size=2, has_next=True):
+                    launch_tile(first, slot, size=size, has_next=has_next)
+                    finish_tile(first - 2, 1 - slot)
+
+                @pl.when(count == 1)
+                def one():
+                    launch_tile(0, 0, size=1, has_next=False)
+                    finish_tile(0, 0, size=1)
+
+                @pl.when(count == 2)
+                def two():
+                    launch_tile(0, 0, has_next=False)
+                    finish_tile(0, 0)
+
+                @pl.when(count > 2)
+                def tiled_pipeline():
+                    full_tiles = (count - 1) // 2
+                    launch_tile(0, 0)
+
+                    @pl.loop(0, (full_tiles - 1) // 2)
+                    def tile_pairs(pair):
+                        advance_tile(4 * pair + 2, 1)
+                        advance_tile(4 * pair + 4, 0)
+
+                    def tail(slot):
+                        @pl.when(count % 2 == 0)
+                        def even():
+                            advance_tile(2 * full_tiles, slot, has_next=False)
+                            finish_tile(2 * full_tiles, slot)
+
+                        @pl.when(count % 2 != 0)
+                        def odd():
+                            advance_tile(2 * full_tiles, slot, size=1, has_next=False)
+                            finish_tile(2 * full_tiles, slot, size=1)
+
+                    @pl.when(full_tiles % 2 == 0)
+                    def even_full():
+                        advance_tile(2 * (full_tiles - 1), 1)
+                        tail(0)
+
+                    @pl.when(full_tiles % 2 != 0)
+                    def odd_full():
+                        tail(1)
+
+            else:
+
+                def pv_launch(i, slot):
+                    if interpret:
+                        return
+                    # Keep QK, CSA PV and SWA PV in disjoint MRB ranges. Each side
+                    # owns N=256, so H<=128 needs at most 6*32 of 256 addresses.
+                    csa_launch(i, (2 + slot) * mrb_stride, pv=True)
                     for mxu in range(2):
                         pltpu.matmul_push_rhs(
                             swa_shared_ref[:, pl.ds(mxu * 256, 256)],
                             staging_register=0,
                             mxu_index=mxu,
                         )
-                        for row in range(size):
-                            lhs = jnp.pad(
-                                swa_p_ref[first + row],
-                                ((0, mxu_heads - num_heads), (0, 0)),
-                            )
-                            pltpu.matmul_acc_lhs(
-                                (6 + 2 * slot + row) * mrb_stride,
-                                lhs,
-                                mxu_index=mxu,
-                                load_staged_rhs=0 if row == 0 else None,
-                            )
+                        lhs = jnp.pad(
+                            swa_p_ref[i], ((0, mxu_heads - num_heads), (0, 0))
+                        )
+                        pltpu.matmul_acc_lhs(
+                            accumulator(mxu, (4 + slot) * mrb_stride),
+                            lhs,
+                            load_staged_rhs=0,
+                        )
 
-            def finish_tile_output(i, slot, row):
-                main_output = csa_pop(i, (2 + 2 * slot + row) * mrb_stride, pv=True)
-                if interpret:
-                    swa_output = jnp.dot(
-                        swa_p_ref[i],
-                        swa_shared_ref[...],
-                        preferred_element_type=jnp.float32,
+                def finish_output(i, slot):
+                    main_output = csa_pop(i, (2 + slot) * mrb_stride, pv=True)
+                    if interpret:
+                        swa_output = jnp.dot(
+                            swa_p_ref[i],
+                            swa_shared_ref[...],
+                            preferred_element_type=jnp.float32,
+                        )
+                    else:
+                        swa_output = jnp.concatenate(
+                            tuple(
+                                pltpu.matmul_pop(
+                                    accumulator(mxu, (4 + slot) * mrb_stride)
+                                )[:num_heads]
+                                for mxu in range(2)
+                            ),
+                            axis=1,
+                        )
+                    output = main_output + swa_output
+                    tail = output[:, 384:]
+                    partner = jnp.where(
+                        (jnp.arange(128) % 2 == 0)[None, :],
+                        pltpu.roll(tail, 127, axis=1),
+                        pltpu.roll(tail, 1, axis=1),
                     )
-                else:
-                    swa_output = jnp.concatenate(
-                        tuple(
-                            pltpu.matmul_pop(
-                                (6 + 2 * slot + row) * mrb_stride,
-                                (mxu_heads, 256),
-                                jnp.float32,
-                                mxu_index=mxu,
-                            )[:num_heads]
-                            for mxu in range(2)
-                        ),
-                        axis=1,
+                    rotated = (
+                        tail * rope_ref[i, 0][None, :]
+                        + partner * rope_ref[i, 1][None, :]
                     )
-                output = main_output + swa_output
-                tail = output[:, 384:]
-                partner = jnp.where(
-                    (jnp.arange(128) % 2 == 0)[None, :],
-                    pltpu.roll(tail, 127, axis=1),
-                    pltpu.roll(tail, 1, axis=1),
-                )
-                rotated = (
-                    tail * rope_ref[i, 0][None, :] + partner * rope_ref[i, 1][None, :]
-                )
-                output_ref[i, :, :384] = output[:, :384].astype(jnp.bfloat16)
-                output_ref[i, :, 384:] = rotated.astype(jnp.bfloat16)
-                pltpu.make_async_copy(
-                    output_ref.at[i],
-                    output_hbm_ref.at[t0 + i],
-                    dma_sem.at[2 + 8 * bq + i],
-                ).start()
+                    output_ref[i, :, :384] = output[:, :384].astype(jnp.bfloat16)
+                    output_ref[i, :, 384:] = rotated.astype(jnp.bfloat16)
+                    pltpu.make_async_copy(
+                        output_ref.at[i],
+                        output_hbm_ref.at[t0 + i],
+                        dma_sem.at[2 + 8 * bq + i],
+                    ).start()
 
-            def finish_tile(first, slot, *, size=2):
-                for row in range(size):
-                    finish_tile_output(first + row, slot, row)
+                def advance(i, slot, *, has_next=True):
+                    softmax(i, slot * mrb_stride, has_next=has_next)
+                    pv_launch(i, slot)
+                    # The previous P@V remains in its own MRB while the current Q
+                    # runs softmax. Output DMA uses a distinct per-Q buffer.
+                    finish_output(i - 1, 1 - slot)
 
-            def advance_tile(first, slot, *, size=2, has_next=True):
-                launch_tile(first, slot, size=size, has_next=has_next)
-                finish_tile(first - 2, 1 - slot)
+                @pl.when(count == 1)
+                def single_query():
+                    softmax(0, 0, has_next=False)
+                    pv_launch(0, 0)
+                    finish_output(0, 0)
 
-            @pl.when(count == 1)
-            def one():
-                launch_tile(0, 0, size=1, has_next=False)
-                finish_tile(0, 0, size=1)
+                @pl.when(count > 1)
+                def query_pipeline():
+                    softmax(0, 0)
+                    pv_launch(0, 0)
 
-            @pl.when(count == 2)
-            def two():
-                launch_tile(0, 0, has_next=False)
-                finish_tile(0, 0)
+                    @pl.loop(0, (count - 2) // 2)
+                    def pairs(pair):
+                        advance(2 * pair + 1, 1)
+                        advance(2 * pair + 2, 0)
 
-            @pl.when(count > 2)
-            def tiled_pipeline():
-                full_tiles = (count - 1) // 2
-                launch_tile(0, 0)
-
-                @pl.loop(0, (full_tiles - 1) // 2)
-                def tile_pairs(pair):
-                    advance_tile(4 * pair + 2, 1)
-                    advance_tile(4 * pair + 4, 0)
-
-                def tail(slot):
                     @pl.when(count % 2 == 0)
-                    def even():
-                        advance_tile(2 * full_tiles, slot, has_next=False)
-                        finish_tile(2 * full_tiles, slot)
+                    def even_tail():
+                        advance(count - 1, 1, has_next=False)
+                        finish_output(count - 1, 1)
 
                     @pl.when(count % 2 != 0)
-                    def odd():
-                        advance_tile(2 * full_tiles, slot, size=1, has_next=False)
-                        finish_tile(2 * full_tiles, slot, size=1)
+                    def odd_tail():
+                        advance(count - 2, 1)
+                        advance(count - 1, 0, has_next=False)
+                        finish_output(count - 1, 0)
 
-                @pl.when(full_tiles % 2 == 0)
-                def even_full():
-                    advance_tile(2 * (full_tiles - 1), 1)
-                    tail(0)
-
-                @pl.when(full_tiles % 2 != 0)
-                def odd_full():
-                    tail(1)
-
+        if interpret:
+            compute_main()
         else:
-
-            def pv_launch(i, slot):
-                if interpret:
-                    return
-                # Keep QK, CSA PV and SWA PV in disjoint MRB ranges. Each side
-                # owns N=256, so H<=128 needs at most 6*32 of 256 addresses.
-                csa_launch(i, (2 + slot) * mrb_stride, pv=True)
-                for mxu in range(2):
-                    pltpu.matmul_push_rhs(
-                        swa_shared_ref[:, pl.ds(mxu * 256, 256)],
-                        staging_register=0,
-                        mxu_index=mxu,
-                    )
-                    lhs = jnp.pad(swa_p_ref[i], ((0, mxu_heads - num_heads), (0, 0)))
-                    pltpu.matmul_acc_lhs(
-                        (4 + slot) * mrb_stride, lhs, mxu_index=mxu, load_staged_rhs=0
-                    )
-
-            def finish_output(i, slot):
-                main_output = csa_pop(i, (2 + slot) * mrb_stride, pv=True)
-                if interpret:
-                    swa_output = jnp.dot(
-                        swa_p_ref[i],
-                        swa_shared_ref[...],
-                        preferred_element_type=jnp.float32,
-                    )
-                else:
-                    swa_output = jnp.concatenate(
-                        tuple(
-                            pltpu.matmul_pop(
-                                (4 + slot) * mrb_stride,
-                                (mxu_heads, 256),
-                                jnp.float32,
-                                mxu_index=mxu,
-                            )[:num_heads]
-                            for mxu in range(2)
-                        ),
-                        axis=1,
-                    )
-                output = main_output + swa_output
-                tail = output[:, 384:]
-                partner = jnp.where(
-                    (jnp.arange(128) % 2 == 0)[None, :],
-                    pltpu.roll(tail, 127, axis=1),
-                    pltpu.roll(tail, 1, axis=1),
-                )
-                rotated = (
-                    tail * rope_ref[i, 0][None, :] + partner * rope_ref[i, 1][None, :]
-                )
-                output_ref[i, :, :384] = output[:, :384].astype(jnp.bfloat16)
-                output_ref[i, :, 384:] = rotated.astype(jnp.bfloat16)
-                pltpu.make_async_copy(
-                    output_ref.at[i],
-                    output_hbm_ref.at[t0 + i],
-                    dma_sem.at[2 + 8 * bq + i],
-                ).start()
-
-            def advance(i, slot, *, has_next=True):
-                softmax(i, slot * mrb_stride, has_next=has_next)
-                pv_launch(i, slot)
-                # The previous P@V remains in its own MRB while the current Q
-                # runs softmax. Output DMA uses a distinct per-Q buffer.
-                finish_output(i - 1, 1 - slot)
-
-            @pl.when(count == 1)
-            def single_query():
-                softmax(0, 0, has_next=False)
-                pv_launch(0, 0)
-                finish_output(0, 0)
-
-            @pl.when(count > 1)
-            def query_pipeline():
-                softmax(0, 0)
-                pv_launch(0, 0)
-
-                @pl.loop(0, (count - 2) // 2)
-                def pairs(pair):
-                    advance(2 * pair + 1, 1)
-                    advance(2 * pair + 2, 0)
-
-                @pl.when(count % 2 == 0)
-                def even_tail():
-                    advance(count - 1, 1, has_next=False)
-                    finish_output(count - 1, 1)
-
-                @pl.when(count % 2 != 0)
-                def odd_tail():
-                    advance(count - 2, 1)
-                    advance(count - 1, 0, has_next=False)
-                    finish_output(count - 1, 0)
+            pl.run_scoped(
+                compute_main,
+                *(
+                    pltpu.ACC(mxu)((mxu_heads, 256), jnp.float32)
+                    for mxu in range(2)
+                    for _ in range(accumulator_slots)
+                ),
+            )
 
         @pl.loop(0, count)
         def wait_output(i):

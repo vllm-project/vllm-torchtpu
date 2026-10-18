@@ -25,7 +25,8 @@ leaves the TensorCore free.
 """
 
 import functools
-from typing import Any
+from collections.abc import Callable
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -135,21 +136,24 @@ def generate_mask_sc(
         subcore_axis_name="subcore",
     )
 
-    out = pl.kernel(
-        functools.partial(
-            mask_kernel,
-            core_axis_name=vector_mesh.core_axis_name,
-            subcore_axis_name=vector_mesh.subcore_axis_name,
-            topk=topk,
-            max_kv_len=max_kv_len,
+    out = cast(
+        Callable[..., jax.Array],
+        pl.kernel(
+            functools.partial(
+                mask_kernel,
+                core_axis_name=vector_mesh.core_axis_name,
+                subcore_axis_name=vector_mesh.subcore_axis_name,
+                topk=topk,
+                max_kv_len=max_kv_len,
+            ),
+            out_type=jax.ShapeDtypeStruct((padded_chunk_size, max_kv_len), jnp.int32),
+            compiler_params=pltpu.CompilerParams(
+                use_tc_tiling_on_sc=True,
+                disable_bounds_checks=True,
+            ),
+            mesh=vector_mesh,
+            name="sc_mask_generate",
         ),
-        out_type=jax.ShapeDtypeStruct((padded_chunk_size, max_kv_len), jnp.int32),
-        compiler_params=pltpu.CompilerParams(
-            use_tc_tiling_on_sc=True,
-            disable_bounds_checks=True,
-        ),
-        mesh=vector_mesh,
-        name="sc_mask_generate",
     )(padded_topk_indices)
 
     return out[:chunk_size, :]

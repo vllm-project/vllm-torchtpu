@@ -7,6 +7,8 @@ existing native cache as these words.
 """
 
 import functools
+from collections.abc import Callable
+from typing import cast
 
 import jax
 import jax.numpy as jnp
@@ -168,25 +170,28 @@ def _gather_sc_banked(words, scales, records):
             ),
         )(ids_ref)
 
-    out, scale_out = pl.kernel(
-        kernel,
-        out_type=(
-            jax.ShapeDtypeStruct((count + padding, 128), jnp.int32),
-            jax.ShapeDtypeStruct((count + padding,), jnp.float32),
+    out, scale_out = cast(
+        Callable[..., tuple[jax.Array, jax.Array]],
+        pl.kernel(
+            kernel,
+            out_type=(
+                jax.ShapeDtypeStruct((count + padding, 128), jnp.int32),
+                jax.ShapeDtypeStruct((count + padding,), jnp.float32),
+            ),
+            scratch_types=(
+                pltpu.VMEM((2, streams, lanes, 128), jnp.int32),
+                pltpu.VMEM((2, streams, lanes), jnp.float32),
+                pltpu.SemaphoreType.DMA((2, len(words), streams, 2)),
+                pltpu.SemaphoreType.DMA((streams, 2)),
+            ),
+            compiler_params=pltpu.CompilerParams(
+                use_tc_tiling_on_sc=False,
+                needs_layout_passes=True,
+                disable_bounds_checks=True,
+            ),
+            mesh=mesh,
+            name="csa2_banked_word_scale_gather",
         ),
-        scratch_types=(
-            pltpu.VMEM((2, streams, lanes, 128), jnp.int32),
-            pltpu.VMEM((2, streams, lanes), jnp.float32),
-            pltpu.SemaphoreType.DMA((2, len(words), streams, 2)),
-            pltpu.SemaphoreType.DMA((streams, 2)),
-        ),
-        compiler_params=pltpu.CompilerParams(
-            use_tc_tiling_on_sc=False,
-            needs_layout_passes=True,
-            disable_bounds_checks=True,
-        ),
-        mesh=mesh,
-        name="csa2_banked_word_scale_gather",
     )(words, scales, indices)
     return out[:count].reshape(*records.shape, 128), scale_out[:count].reshape(
         records.shape
@@ -279,16 +284,19 @@ def publish_csa2_kv(
             ),
         )(ids_ref, values_ref, scales_ref)
 
-    pl.kernel(
-        kernel,
-        mesh=mesh,
-        scratch_types=(pltpu.SemaphoreType.DMA((len(banks), 2)),),
-        compiler_params=pltpu.CompilerParams(
-            use_tc_tiling_on_sc=False,
-            needs_layout_passes=True,
-            disable_bounds_checks=True,
+    cast(
+        Callable[..., tuple[()]],
+        pl.kernel(
+            kernel,
+            mesh=mesh,
+            scratch_types=(pltpu.SemaphoreType.DMA((len(banks), 2)),),
+            compiler_params=pltpu.CompilerParams(
+                use_tc_tiling_on_sc=False,
+                needs_layout_passes=True,
+                disable_bounds_checks=True,
+            ),
+            name="csa2_publish_words_scales",
         ),
-        name="csa2_publish_words_scales",
     )(ids, values, value_scales, word_refs, scale_refs)
     out_words, out_scales = (
         tuple(r[...] for r in word_refs),

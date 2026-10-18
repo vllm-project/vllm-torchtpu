@@ -8,6 +8,7 @@ import jax
 import jax.numpy as jnp
 import torch
 
+from vllm_torchtpu.distributed.pallas_shapes import get_kernel_mesh
 from vllm_torchtpu.kernels.deepseek_v41.mhc import shifted_post_pre_rms
 
 _post_pre_rms_op = None
@@ -91,7 +92,7 @@ def initialize_shifted_mhc() -> None:
     _post_pre_rms_op = pallas.jax_op(
         "pallas::deepseek_v41_v2_shifted_post_pre_rms",
         _post_pre_rms_jax,
-        mesh=get_vllm_model_wrapper_context().mesh,
+        mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
         input_partition_specs=(P(),) * 9 + (None,) * 6,
     )
 

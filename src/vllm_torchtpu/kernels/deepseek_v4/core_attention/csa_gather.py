@@ -13,7 +13,8 @@
 # limitations under the License.
 
 import functools
-from typing import Any
+from collections.abc import Callable
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -414,41 +415,44 @@ def csa_gather(
         core_axis_name="core",
         subcore_axis_name="subcore",
     )
-    nope_out, rope_out = pl.kernel(
-        functools.partial(
-            _banked_kernel if banked else main_kernel,
-            core_axis_name=vector_mesh.core_axis_name,
-            subcore_axis_name=vector_mesh.subcore_axis_name,
-            num_row_subchunks=num_row_subchunks,
-            num_streams=num_streams,
-            top_k=top_k,
-        ),
-        out_type=(
-            jax.ShapeDtypeStruct(
-                (out_size + out_pad_size, csa_cache_layout.ROW_WORDS), jnp.int32
+    nope_out, rope_out = cast(
+        Callable[..., tuple[jax.Array, jax.Array]],
+        pl.kernel(
+            functools.partial(
+                _banked_kernel if banked else main_kernel,
+                core_axis_name=vector_mesh.core_axis_name,
+                subcore_axis_name=vector_mesh.subcore_axis_name,
+                num_row_subchunks=num_row_subchunks,
+                num_streams=num_streams,
+                top_k=top_k,
             ),
-            jax.ShapeDtypeStruct(
-                ((out_size + out_pad_size) // 4, csa_cache_layout.ROW_WORDS),
-                jnp.int32,
+            out_type=(
+                jax.ShapeDtypeStruct(
+                    (out_size + out_pad_size, csa_cache_layout.ROW_WORDS), jnp.int32
+                ),
+                jax.ShapeDtypeStruct(
+                    ((out_size + out_pad_size) // 4, csa_cache_layout.ROW_WORDS),
+                    jnp.int32,
+                ),
             ),
+            # One DMA semaphore per stream for the direct nope gather-buffer -> HBM
+            # copies issued in `main_kernel`.
+            scratch_types=(
+                pltpu.VMEM((2, num_streams, row_subchunk_size, 128), jnp.int32),
+                pltpu.VMEM((2, num_streams, row_subchunk_size, 32), jnp.int32),
+                pltpu.VMEM((num_streams, row_subchunk_size // 2, 64), jnp.int32),
+                pltpu.SemaphoreType.DMA((2, 2, num_streams, 2)),
+                pltpu.SemaphoreType.DMA((num_streams, 2)),
+            )
+            if banked
+            else (pltpu.SemaphoreType.DMA((num_streams,)),),
+            compiler_params=pltpu.CompilerParams(
+                use_tc_tiling_on_sc=False,
+                needs_layout_passes=True,
+                disable_bounds_checks=True,
+            ),
+            mesh=vector_mesh,
+            name="sc_csa_gather",
         ),
-        # One DMA semaphore per stream for the direct nope gather-buffer -> HBM
-        # copies issued in `main_kernel`.
-        scratch_types=(
-            pltpu.VMEM((2, num_streams, row_subchunk_size, 128), jnp.int32),
-            pltpu.VMEM((2, num_streams, row_subchunk_size, 32), jnp.int32),
-            pltpu.VMEM((num_streams, row_subchunk_size // 2, 64), jnp.int32),
-            pltpu.SemaphoreType.DMA((2, 2, num_streams, 2)),
-            pltpu.SemaphoreType.DMA((num_streams, 2)),
-        )
-        if banked
-        else (pltpu.SemaphoreType.DMA((num_streams,)),),
-        compiler_params=pltpu.CompilerParams(
-            use_tc_tiling_on_sc=False,
-            needs_layout_passes=True,
-            disable_bounds_checks=True,
-        ),
-        mesh=vector_mesh,
-        name="sc_csa_gather",
     )(nope_inputs, rope_inputs, indices, valid_indices)
     return nope_out[:out_size], rope_out[: out_size // 4]

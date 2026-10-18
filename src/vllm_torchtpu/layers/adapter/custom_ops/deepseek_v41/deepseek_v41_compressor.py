@@ -6,6 +6,7 @@ import torch
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v41 import compressor as compressor_upstream
 
+from vllm_torchtpu.distributed.pallas_shapes import get_kernel_mesh
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 from vllm_torchtpu.layers.adapter.normalization import rms_norm
 from vllm_torchtpu.layers.adapter.upstream_bindings import device_hooks
@@ -153,7 +154,7 @@ def initialize_compressor_ops():
     _write_op = pallas.jax_op(
         "pallas::deepseek_v41_write_compressed_kv",
         write,
-        mesh=mesh,
+        mesh=get_kernel_mesh(mesh),
         donate_argnums=(0, 1),
         input_partition_specs=(P(),) * 4,
     )

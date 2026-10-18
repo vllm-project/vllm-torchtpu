@@ -33,6 +33,7 @@ from vllm.models.deepseek_v4 import attention as dsv4_attention
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
+from vllm_torchtpu.distributed.pallas_shapes import get_kernel_mesh
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 
 if TYPE_CHECKING:
@@ -327,7 +328,7 @@ class DeepseekTPUAttentionMixin:
         attn_jax_op = pallas.jax_op(
             op_name,
             wrapped_fn,
-            mesh=mesh,
+            mesh=get_kernel_mesh(mesh),
             donate_argnums=(2,),
             input_partition_specs=input_partition_specs,
         )
@@ -359,7 +360,7 @@ class DeepseekTPUAttentionMixin:
             op = pallas.jax_op(
                 op_name,
                 _rope_jax,
-                mesh=get_vllm_model_wrapper_context().mesh,
+                mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
                 input_partition_specs=(
                     P(),  # kv
                     P(),  # positions
@@ -552,7 +553,7 @@ class DeepseekTPUAttentionMixin:
             op = pallas.jax_op(
                 op_name,
                 functools.partial(_o_proj_jax, head_dim=head_dim),
-                mesh=get_vllm_model_wrapper_context().mesh,
+                mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
                 input_partition_specs=(
                     P(None, "model", None),  # o
                     P(),  # positions
@@ -817,7 +818,7 @@ class VllmDeepseekV4MLAAttention(
             op = pallas.jax_op(
                 op_name,
                 functools.partial(_qnorm_rope_jax, eps=eps),
-                mesh=get_vllm_model_wrapper_context().mesh,
+                mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
                 input_partition_specs=(
                     P(None, "model", None),  # q
                     P(),  # positions

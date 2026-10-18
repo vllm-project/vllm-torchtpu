@@ -11,6 +11,7 @@ import torch
 from vllm.distributed import tensor_model_parallel_all_reduce
 from vllm.model_executor.kernels.mhc.torch import mhc_post_torch, mhc_pre_delayed_torch
 
+from vllm_torchtpu.distributed.pallas_shapes import get_kernel_mesh
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_mhc_op import (
     get_shifted_post_pre_rms_op,
 )
@@ -524,7 +525,7 @@ def initialize_delayed_mhc():
     _pre_op = pallas.jax_op(
         "pallas::deepseek_v41_delayed_mhc_pre",
         delayed_pre_jax,
-        mesh=get_vllm_model_wrapper_context().mesh,
+        mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
         input_partition_specs=(
             P(),
             P(),
@@ -555,7 +556,7 @@ def initialize_delayed_mhc():
     _pre_flat_op = pallas.jax_op(
         "pallas::deepseek_v41_delayed_mhc_pre_flat",
         delayed_pre_flat_jax,
-        mesh=get_vllm_model_wrapper_context().mesh,
+        mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
         input_partition_specs=(P(),) * 5 + (None,) * 5,
     )
 
@@ -574,7 +575,7 @@ def initialize_delayed_mhc():
     _post_pre_flat_op = pallas.jax_op(
         "pallas::deepseek_v41_delayed_mhc_post_pre_flat",
         delayed_post_pre_flat_jax,
-        mesh=get_vllm_model_wrapper_context().mesh,
+        mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
         input_partition_specs=(P(),) * 8 + (None,) * 5,
     )
 

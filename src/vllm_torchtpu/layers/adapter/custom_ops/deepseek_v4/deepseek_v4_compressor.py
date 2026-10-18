@@ -27,6 +27,7 @@ from vllm.models.deepseek_v4 import compressor as dsv4_compressor
 from vllm.models.deepseek_v4.compressor import CompressorStateCache, DeepseekCompressor
 from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowMLASpec
 
+from vllm_torchtpu.distributed.pallas_shapes import get_kernel_mesh
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
     config as compressor_config,
 )
@@ -456,7 +457,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         compressor_jax_op = pallas.jax_op(
             op_name,
             wrapped_fn,
-            mesh=mesh,
+            mesh=get_kernel_mesh(mesh),
             donate_argnums=donate_argnums,
             input_partition_specs=input_partition_specs,
         )

@@ -26,6 +26,7 @@ import torch
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu.distributed.pallas_shapes import get_kernel_mesh
 from vllm_torchtpu.kernels.deepseek_v4.mhc import (
     fused_post_pre_kernel,
     post_kernel,
@@ -192,7 +193,7 @@ def _mhc_pre_op(
                 hc_post_mult_value=hc_post_mult_value,
                 sinkhorn_repeat=sinkhorn_repeat,
             ),
-            mesh=get_vllm_model_wrapper_context().mesh,
+            mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
             input_partition_specs=(
                 P(ATTN_DATA_AXIS, None, None),  # residual
                 P(),  # fn
@@ -217,7 +218,7 @@ def get_mhc_post_op():
         op = pallas.jax_op(
             op_name,
             _mhc_post_jax,
-            mesh=get_vllm_model_wrapper_context().mesh,
+            mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
             input_partition_specs=(
                 P(ATTN_DATA_AXIS, None),  # x
                 P(ATTN_DATA_AXIS, None, None),  # residual
@@ -252,7 +253,7 @@ def _mhc_fused_post_pre_op(
                 hc_post_mult_value=hc_post_mult_value,
                 sinkhorn_repeat=sinkhorn_repeat,
             ),
-            mesh=get_vllm_model_wrapper_context().mesh,
+            mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
             input_partition_specs=(
                 P(ATTN_DATA_AXIS, None),  # x
                 P(ATTN_DATA_AXIS, None, None),  # residual
