@@ -211,6 +211,7 @@ if TYPE_CHECKING:
     TPU_GC_POLICY: str = "freeze"
     TPU_GC_COLLECT_EVERY: int = 500
     TPU_GC_TRACE: bool = False
+    VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
 
 
 def env_with_choices(
@@ -1358,6 +1359,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # engine core (generation, duration, wall-clock ns), to line stalls up
     # with collections in the step records. Independent of TPU_GC_POLICY.
     "TPU_GC_TRACE": env_bool("TPU_GC_TRACE", default=False),
+    # SrptPrefillScheduler: consecutive steps a running prefill chunk may go
+    # without getting one KV block of tokens before it moves ahead of the
+    # other prefill chunks and is no longer held (0 disables hold-back).
+    # Prefixed with VLLM_ so vLLM's Ray worker env propagation
+    # copies it automatically to DP/Ray engine-core actors.
+    "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS": env_nonnegative_int(
+        "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", 8
+    ),
 }
 
 
