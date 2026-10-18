@@ -152,7 +152,8 @@ def _resolve_sc_offload_threshold_bytes() -> int | None:
             return None
         return value if value > 0 else None
 
-    tpu_type = os.getenv("TPU_ACCELERATOR_TYPE")
+    tpu_type = (os.getenv("TPU_ACCELERATOR_TYPE")
+                or os.getenv("HIEREVO_TARGET_NAME"))
     if not tpu_type:
         tpu_type = _fetch_tpu_type_from_metadata()
     if not tpu_type:
@@ -186,11 +187,16 @@ if not _user_has_flag("--xla_tpu_use_dynamic_smem_negotiation"):
 # --xla_tpu_sparse_core_{all_reduce,all_gather}_offload_min_size_in_bytes:
 # raise the SC-offload threshold to the per-tensor-core VMEM capacity so
 # typical per-layer AR/AG collectives run on TensorCore instead of being
-# offloaded to SparseCore. The chip family is detected from
-# TPU_ACCELERATOR_TYPE / GCE metadata and mapped to a VMEM constant above;
-# each flag is added only if the user hasn't supplied it explicitly.
+# offloaded to SparseCore. Also disable SparseCore all-reduce offload via
+# --xla_tpu_enable_sparse_core_collective_offload_all_reduce=false so XLA's
+# AsyncCollectiveCreator keeps its 4 KiB async threshold for TensorCore
+# all-reduce instead of inheriting the 64 MiB SC threshold.
 _sc_offload_bytes = _resolve_sc_offload_threshold_bytes()
 if _sc_offload_bytes is not None:
+    if not _user_has_flag(
+            "--xla_tpu_enable_sparse_core_collective_offload_all_reduce"):
+        _libtpu_extra_args.append(
+            "--xla_tpu_enable_sparse_core_collective_offload_all_reduce=false")
     for _flag_name in (
             "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes",
             "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes",

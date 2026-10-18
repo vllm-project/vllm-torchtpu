@@ -194,11 +194,18 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin,
     CUDA-only router.select_experts() path.
     """
 
+    _layer_tag_assigned: bool = False
+
     def __init__(self, moe: FusedMoEConfig):
         super().__init__(moe)
         # Parent sets _is_monolithic=False on TPU and skips wiring
         # apply_monolithic.  Override both after super().__init__().
         self.apply_monolithic = self._select_monolithic()
+        if not VllmUnquantizedFusedMoEMethod._layer_tag_assigned:
+            VllmUnquantizedFusedMoEMethod._layer_tag_assigned = True
+            self._layer_tag = True
+        else:
+            self._layer_tag = False
 
     @property
     def is_monolithic(self) -> bool:
@@ -293,6 +300,7 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin,
             topk=layer.moe_config.experts_per_token,
             activation=activation_str,
             use_ep=layer.moe_config.moe_parallel_config.use_ep,
+            layer_tag=self._layer_tag,
         )
 
     def _forward_monolithic_tpu(
@@ -329,4 +337,4 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin,
         if enable_pipelined_collective_and_compute():
             return pipelined_fused_moe_gmm(**kwargs)
 
-        return fused_moe_gmm(**kwargs)
+        return fused_moe_gmm(**kwargs, layer_tag=self._layer_tag)
