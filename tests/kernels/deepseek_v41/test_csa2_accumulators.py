@@ -10,7 +10,6 @@ import pytest
 from vllm_torchtpu.kernels.deepseek_v41.csa2 import csa2
 
 
-@pytest.mark.tpu_test
 @pytest.mark.parametrize("heads", [8, 16, 32, 64, 96, 104, 128])
 def test_csa2_accumulator_pipeline_matches_interpret(heads: int) -> None:
     """Cover both accumulator layouts and every one-to-six-query tail."""
