@@ -180,6 +180,7 @@ if TYPE_CHECKING:
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
     VLLM_TPU_LAZY_REASONING_COUNT: bool = True
+    VLLM_TPU_TOKENIZE_PREFIX_CACHE: bool = False
 
 
 def env_with_choices(
@@ -1113,6 +1114,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_LAZY_REASONING_COUNT": env_bool(
         "VLLM_TPU_LAZY_REASONING_COUNT", default=True
     ),
+    # API server: tokenize chat prompts incrementally at <|im_start|> turn
+    # boundaries, reusing the ids of recent prompts that share a prefix
+    # (frontend/tokenize_prefix_cache.py). Token ids are unchanged.
+    "VLLM_TPU_TOKENIZE_PREFIX_CACHE": env_bool("VLLM_TPU_TOKENIZE_PREFIX_CACHE"),
 }
 
 

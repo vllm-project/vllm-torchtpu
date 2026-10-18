@@ -45,3 +45,14 @@ def _install_frontend_patches() -> None:
             "per-delta reasoning-token recount.",
             exc_info=True,
         )
+    try:
+        from vllm_torchtpu.frontend.tokenize_prefix_cache import (
+            maybe_install_tokenize_prefix_cache,
+        )
+
+        maybe_install_tokenize_prefix_cache()
+    except Exception:
+        logger.warning(
+            "Tokenize prefix cache install failed; prompts are tokenized in full.",
+            exc_info=True,
+        )

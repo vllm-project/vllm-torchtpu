@@ -243,6 +243,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_POOLING_KV_CACHE_TOKENS",
     # API-server frontend patches; never reach the compiled model.
     "VLLM_TPU_LAZY_REASONING_COUNT",
+    "VLLM_TPU_TOKENIZE_PREFIX_CACHE",
 }
 
 _NATIVE_TPU_COMPILE_ENV_VARS = (
