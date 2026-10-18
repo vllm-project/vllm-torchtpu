@@ -1744,14 +1744,23 @@ class TestModelInitAndWeights:
 
 
 class TestDeepseekV41ForCausalLM:
+    @pytest.mark.cpu_test
     @pytest.mark.parametrize(
         ("shared_memory", "resolved_shared_memory"),
         [(False, False), (True, True), (True, False)],
     )
+    @pytest.mark.parametrize(
+        ("dp_size", "engram_dp_size"),
+        [(8, 8), (16, 8), (24, 8), (32, 8), (64, 8), (12, 4)],
+    )
     def test_dp_accepts_both_host_table_layouts(
-        self, shared_memory: bool, resolved_shared_memory: bool
+        self,
+        shared_memory: bool,
+        resolved_shared_memory: bool,
+        dp_size: int,
+        engram_dp_size: int,
     ) -> None:
-        cfg = _mock_vllm_config(dp_size=2, ep_enabled=True)
+        cfg = _mock_vllm_config(dp_size=dp_size, ep_enabled=True)
         cfg.engram_config = SimpleNamespace(dp_shared_memory=shared_memory)
 
         def init(self, *, vllm_config, prefix=""):
@@ -1763,7 +1772,7 @@ class TestDeepseekV41ForCausalLM:
             patch.dict(os.environ, {"TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD": "1"}),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_engram_dp_size",
-                return_value=2,
+                return_value=engram_dp_size,
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.install_host_engram_inputs"
@@ -1783,6 +1792,20 @@ class TestDeepseekV41ForCausalLM:
         assert cfg.engram_config.dp_shared_memory is resolved_shared_memory
         assert model.hf_to_vllm_mapper == "mock_mapper"
         mock_host_engram.assert_called_once()
+
+    @pytest.mark.cpu_test
+    @pytest.mark.parametrize("engram_dp_size", [1, 3, 32])
+    def test_dp_rejects_unsupported_host_table_groups(self, engram_dp_size):
+        cfg = _mock_vllm_config(dp_size=16, ep_enabled=True)
+        with (
+            patch.dict(os.environ, {"TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD": "1"}),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_engram_dp_size",
+                return_value=engram_dp_size,
+            ),
+            pytest.raises(NotImplementedError, match="node-local Engram groups"),
+        ):
+            DeepseekV41ForCausalLM(vllm_config=cfg)
 
     def test_init_capability_guards(self) -> None:
         # PP > 1

@@ -1325,6 +1325,24 @@ def array_vmem_bytes(shape, dtype, info):
 U32_SUBLANE_TILE = 8
 
 
+def fp4_scale_rows(k, rhs_qb, *, padded=False):
+    """Rows one expert's four-bit block-scale table takes: K / rhs_qb blocks,
+    rounded up to the f32 sublane tile when `padded`.
+
+    The padded form is the "row-padded flat" scale operand: the table for E
+    experts comes in as one 2-D [E * rows, N] f32 array rather than as
+    [E, K / rhs_qb, N]. A device buffer of the 3-D shape is free to take a
+    layout of its own -- torch_tpu stores f32 [48, 10, 5120] as {2,0,1}, the
+    block axis major, so that 10 rows need not pad to 16 -- and the kernel's
+    operand is {2,1,0}, so XLA re-lays the table out on every call. A 2-D
+    buffer has only the one layout, and with whole sublane tiles per expert
+    the [E, rows, N] view the kernel takes of it is a bitcast. The padded
+    rows are zero and never read.
+    """
+    blocks = k // rhs_qb
+    return align_up(blocks, U32_SUBLANE_TILE) if padded else blocks
+
+
 def check_u32_sublane_tile(info=None):
     """Refuse a chip whose 32-bit sublane tiling is not the one the packed
     four-bit weight layout is written for.
@@ -1362,12 +1380,18 @@ def vmem_scratch_arrays(
     rhs_qb=QB4,
     has_w1_bias=False,
     has_w2_bias=False,
+    pad_scale_rows=False,
 ):
     """The kernel's VMEM scratch buffers, as (name, shape, dtype).
 
     _build_fused_ep_moe_kernel declares its scratch from this list, in this
     order, and the VMEM accounting below sums this same list, so a buffer
     cannot be resized on one side only.
+
+    `pad_scale_rows` sizes the four-bit scale slots for the row-padded flat
+    scale operand (fp4_scale_rows). The accounting leaves it at its default:
+    an f32 slot's rows tile to U32_SUBLANE_TILE sublanes either way, so the
+    two forms cost the same VMEM.
 
     Every element type here comes off the weight format's record: the
     weight slabs, the row staging the activations arrive in, the wire
@@ -1395,8 +1419,20 @@ def vmem_scratch_arrays(
         weights = [
             ("w1_vm", (nbuf, hidden // PACK4, 2 * inter), jnp.uint32),
             ("w2_vm", (nbuf, inter // PACK4, hidden), jnp.uint32),
-            ("w1s_vm", (nbuf, hidden // rhs_qb, 2 * inter), jnp.float32),
-            ("w2s_vm", (nbuf, inter // rhs_qb, hidden), jnp.float32),
+            (
+                "w1s_vm",
+                (
+                    nbuf,
+                    fp4_scale_rows(hidden, rhs_qb, padded=pad_scale_rows),
+                    2 * inter,
+                ),
+                jnp.float32,
+            ),
+            (
+                "w2s_vm",
+                (nbuf, fp4_scale_rows(inter, rhs_qb, padded=pad_scale_rows), hidden),
+                jnp.float32,
+            ),
         ]
     else:
         weights = [

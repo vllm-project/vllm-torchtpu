@@ -219,3 +219,35 @@ def test_score_word_rows_wrapper_mesh_and_standalone():
         sharded = ak._score_word_rows(q, weights, words)
     shard_map.assert_called_once()
     np.testing.assert_allclose(np.asarray(sharded), reference, rtol=1e-6, atol=1e-5)
+
+
+@pytest.mark.parametrize("rows", [2, 8, 64, 128])
+def test_lane_dense_page_rows_match_iota(rows):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import _lane_dense_page_rows
+
+    # Starts span the full 2-D pool row range, including 12-bit split edges.
+    rng = np.random.default_rng(rows)
+    starts = rng.integers(0, 33423360, size=8 * 128 // rows, dtype=np.int32)
+    starts[:3] = [0, 4095, 4096]
+    starts = jnp.asarray(starts)
+    expected = (starts[:, None] + jnp.arange(rows, dtype=jnp.int32)[None]).reshape(-1)
+    np.testing.assert_array_equal(_lane_dense_page_rows(starts, rows), expected)
+
+
+@pytest.mark.parametrize("onehot", ["0", "1"])
+def test_gather_cache_page_words_page_rows_switch(monkeypatch, onehot):
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_PAGE_ROWS_ONEHOT", onehot)
+    rng = np.random.default_rng(5)
+    cache = _words(rng, (1024, ROW_WORDS))
+    # 128 pages of 8 rows: 1024 gathered rows, eligible for the lane-dense path.
+    first = jnp.asarray(rng.permutation(128).astype(np.int32) * PAGE)
+    first = first.at[3].set(-1)
+    got = gather_cache_page_words(cache, first, PAGE, 128)
+    rows = PAGE * 64 // ROW_WORDS
+    starts = np.asarray(first) // 2
+    for page, start in enumerate(starts):
+        if start >= 0:
+            np.testing.assert_array_equal(
+                np.asarray(got).reshape(128, rows, -1)[page],
+                np.asarray(cache)[start : start + rows],
+            )

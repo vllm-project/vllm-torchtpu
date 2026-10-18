@@ -18,28 +18,33 @@ _DIM = 32
 _BLOCK = 16
 
 
-def _group(rank: int, size: int) -> SimpleNamespace:
+def _group(rank: int, ranks: list[int], cpu_group) -> SimpleNamespace:
     def broadcast_object(obj=None):
         objects = [obj]
-        dist.broadcast_object_list(objects, src=0)
+        dist.broadcast_object_list(objects, src=ranks[0], group=cpu_group)
         return objects[0]
 
     return SimpleNamespace(
-        world_size=size,
-        rank_in_group=rank,
-        cpu_group=dist.group.WORLD,
+        world_size=len(ranks),
+        rank_in_group=ranks.index(rank),
+        cpu_group=cpu_group,
         broadcast_object=broadcast_object,
     )
 
 
-def _table(rows: int) -> tuple[torch.Tensor, torch.Tensor]:
-    weight = (torch.arange(rows * _DIM) % 120).to(torch.uint8).view(rows, _DIM)
+def _table(rows: int, host: int = 0) -> tuple[torch.Tensor, torch.Tensor]:
+    weight = ((torch.arange(rows * _DIM) + 8 * host) % 120).to(torch.uint8)
+    weight = weight.view(rows, _DIM)
     scales = (127 + torch.arange(rows * (_DIM // _BLOCK)) % 3).to(torch.uint8)
     return weight.view(torch.float8_e4m3fn), scales.view(rows, -1)
 
 
 def _worker(
-    rank: int, size: int, rendezvous: str, shm_dir: str, shared_memory: bool
+    rank: int,
+    size: int,
+    rendezvous: str,
+    shm_dirs: list[str],
+    shared_memory: bool,
 ) -> None:
     torch.set_num_threads(1)
     dist.init_process_group(
@@ -50,10 +55,19 @@ def _worker(
         timeout=timedelta(seconds=45),
     )
     upstream = common_engram.upstream
-    group = _group(rank, size)
+    local_size = size // len(shm_dirs)
+    host, local_rank = divmod(rank, local_size)
+    group = None
+    for start in range(0, size, local_size):
+        ranks = list(range(start, start + local_size))
+        cpu_group = dist.new_group(ranks, backend="gloo")
+        if rank in ranks:
+            group = _group(rank, ranks, cpu_group)
+    assert group is not None
+    shm_dir = shm_dirs[host]
     upstream.SHM_PATH = shm_dir
     upstream.get_engram_dp_group = lambda: group
-    upstream.get_engram_dp_size = lambda: size
+    upstream.get_engram_dp_size = lambda: local_size
     upstream.get_tensor_model_parallel_world_size = lambda: 1
     upstream.get_tensor_model_parallel_rank = lambda: 0
     torch.accelerator.current_device_index = lambda: 0
@@ -66,7 +80,7 @@ def _worker(
             cpu_offload=True,
             dp_shared_memory=shared_memory,
         )
-        shards = 1 if shared_memory else size
+        shards = 1 if shared_memory else local_size
         assert emb.dp_size == shards
         assert emb.part_n_hash_cols == len(_HEAD_SIZES) // shards
         assert emb.part_num_embeddings == sum(_HEAD_SIZES) // shards
@@ -74,7 +88,8 @@ def _worker(
         # The leader unlinks the backing file once every rank has mapped it.
         assert os.listdir(shm_dir) == []
 
-        weight, scales = _table(sum(_HEAD_SIZES))
+        # Different contents make an accidental lookup on another host visible.
+        weight, scales = _table(sum(_HEAD_SIZES), host)
         start, rows = (
             common_engram._shared_row_range(emb.part_num_embeddings, group)
             if shared_memory
@@ -82,7 +97,7 @@ def _worker(
         )
         # Run:AI streams only this rank's row slice; the other loader sees
         # the full table. Both write disjoint ranges of one mapping.
-        loaded = weight.narrow(0, start, rows) if rank == 0 else weight
+        loaded = weight.narrow(0, start, rows) if local_rank == 0 else weight
         emb.weight.weight_loader(emb.weight, loaded)
         emb.weight_scale_inv.weight_loader(emb.weight_scale_inv, scales)
         local_weight = weight.narrow(0, emb.vocab_start_idx, emb.part_num_embeddings)
@@ -91,7 +106,7 @@ def _worker(
         assert torch.equal(emb.weight_scale_inv, local_scales)
 
         host_engram.get_engram_dp_group = lambda: group
-        host_engram.get_dp_group = lambda: group
+        host_engram.get_dp_group = lambda: SimpleNamespace(rank_in_group=rank)
         host_engram.is_forward_context_available = lambda: True
         context = SimpleNamespace(additional_kwargs={}, dp_metadata=object())
         host_engram.get_forward_context = lambda: context
@@ -99,10 +114,19 @@ def _worker(
         torch.nn.Module.__init__(engram)
         engram.embed_tokens = emb
         engram._init_staging(2, _DIM)
-        for counts in ((2, 1), (1, 2), (0, 2), (2, 0), (2, 1)):
+        waves = ((2, 1), (1, 2), (0, 2), (2, 0), (2, 1), (0, 0))
+        for step in range(len(waves)):
+            counts = tuple(
+                count
+                for node in range(len(shm_dirs))
+                for count in waves[(step + node) % len(waves)]
+            )
             context.additional_kwargs["tpu_num_tokens_across_dp_cpu"] = counts
+            local_counts = counts[host * local_size : (host + 1) * local_size]
+            assert host_engram.engram_gathered_num_tokens() == max(local_counts)
             ids = torch.tensor(
-                [[1 + rank, 9, 17, 25 + rank], [0, 8, 16, 24]], dtype=torch.int32
+                [[1 + local_rank, 9, 17, 25 + local_rank], [0, 8, 16, 24]],
+                dtype=torch.int32,
             )[: counts[rank]]
             gathered = host_engram.gather_host_engram_hashes(
                 ids,
@@ -112,7 +136,7 @@ def _worker(
             if shared_memory:
                 assert torch.equal(gathered, ids)
             else:
-                assert gathered.shape[0] == size * max(counts)
+                assert gathered.shape[0] == local_size * max(local_counts)
             pending = engram.start_prepare_embeddings(gathered)
             assert (pending.exchange is None) is shared_memory
             engram.finish_prepare_embeddings(pending)
@@ -127,13 +151,20 @@ def _worker(
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("shared_memory", [False, True])
-def test_dp_host_table_loading_and_staging(tmp_path, shared_memory):
-    shm_dir = tmp_path / "shm"
-    shm_dir.mkdir()
-    size = 2
+@pytest.mark.parametrize("hosts", [1, 2, 3, 4])
+def test_dp_host_table_loading_and_staging(tmp_path, shared_memory, hosts):
+    shm_dirs = [tmp_path / f"shm-{host}" for host in range(hosts)]
+    for shm_dir in shm_dirs:
+        shm_dir.mkdir()
+    size = 2 * hosts
     mp.spawn(
         _worker,
-        args=(size, (tmp_path / "gloo").as_uri(), str(shm_dir), shared_memory),
+        args=(
+            size,
+            (tmp_path / "gloo").as_uri(),
+            [str(shm_dir) for shm_dir in shm_dirs],
+            shared_memory,
+        ),
         nprocs=size,
     )
 

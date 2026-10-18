@@ -123,8 +123,9 @@ def test_candidate_exact_tuning_precedes_default(monkeypatch):
 @pytest.mark.parametrize("key_tile,expected", [(None, 8192), (4096, 4096)])
 @pytest.mark.parametrize("requests,request_tile", [(48, 48), (24, 24), (64, 32)])
 @pytest.mark.parametrize("halfplane", [False, True])
+@pytest.mark.parametrize("flat", [0, 8])
 def test_candidate_indexer_default_dispatch_uses_measured_tiles(
-    monkeypatch, key_tile, expected, requests, request_tile, halfplane
+    monkeypatch, key_tile, expected, requests, request_tile, halfplane, flat
 ):
     from vllm_torchtpu.kernels.deepseek_v41.index_selection import candidate
 
@@ -132,14 +133,36 @@ def test_candidate_indexer_default_dispatch_uses_measured_tiles(
     expected_halfplane = halfplane
 
     def score(
-        q, weights, keys, ids, membership, lengths, *, block_size, key_tile, halfplane
+        q,
+        weights,
+        keys,
+        ids,
+        membership,
+        lengths,
+        *,
+        block_size,
+        key_tile,
+        halfplane,
+        skip,
     ):
-        assert halfplane is expected_halfplane
+        assert halfplane is expected_halfplane and skip
         calls.append((q.shape[0], key_tile))
         return jnp.zeros((*q.shape[:2], ids.shape[1] * block_size), jnp.float32)
 
+    def score_flat(*args, group_tile, **kwargs):
+        assert group_tile == flat
+        return score(*args, **kwargs).reshape(-1, args[3].shape[1] * 8)
+
+    # The switch is read at trace time: drop traces of the other setting.
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_CANDIDATE_FLAT", str(flat))
+    candidate.candidate_indexer.clear_cache()
     monkeypatch.setattr(jax, "devices", lambda: [Mock(device_kind="TPU7x")])
     monkeypatch.setattr(candidate, "candidate_scores", score)
+    monkeypatch.setattr(
+        candidate,
+        "candidate_scores_flat",
+        score_flat if flat else Mock(side_effect=AssertionError("flat")),
+    )
     monkeypatch.setattr(
         candidate.decode,
         "_select",
