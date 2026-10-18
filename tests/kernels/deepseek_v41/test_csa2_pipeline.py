@@ -1,12 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 """Chunk boundaries preserve ragged requests, SWA visibility and cached KV."""
 
+from types import SimpleNamespace
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.kernels.deepseek_v41 import tuned_block_sizes
 from vllm_torchtpu.kernels.deepseek_v41.csa2 import csa2
 from vllm_torchtpu.kernels.deepseek_v41.csa2_cache import encode_csa2_kv
 from vllm_torchtpu.kernels.deepseek_v41.csa2_metadata import prepare_swa_metadata
@@ -23,13 +26,14 @@ def sparsecore_device():
 
 @pytest.mark.parametrize("banked", [False, True])
 @pytest.mark.parametrize("non_causal", [False, True])
+@pytest.mark.parametrize("heads,bq", [(8, 6), (64, 32)])
 def test_chunked_attention_preserves_requests_and_reusable_kv(
-    sparsecore_device, banked, non_causal
+    sparsecore_device, banked, non_causal, heads, bq
 ):
     # Three requests straddle chunk boundaries, with empty requests interleaved
     # and a final chunk containing only padding. Noncausal windows include KV
     # beyond the end of the current chunk.
-    tokens, heads, chunk_size, page_size = 193, 8, 64, 32
+    tokens, chunk_size, page_size = 193, 64, 32
     rng = np.random.default_rng(31)
 
     def random(shape):
@@ -111,7 +115,7 @@ def test_chunked_attention_preserves_requests_and_reusable_kv(
         bounds if non_causal else None,
         counts,
         chunk_size=chunk_size,
-        **kwargs,
+        **dict(kwargs, bq=bq),
     )
     np.testing.assert_allclose(output, expected, atol=2e-3, rtol=2e-2)
     np.testing.assert_array_equal(output[155:], 0)
@@ -123,3 +127,72 @@ def test_chunked_attention_preserves_requests_and_reusable_kv(
     np.testing.assert_allclose(
         reused, attend(next_q, expected_words, expected_scales), atol=2e-3, rtol=2e-2
     )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("chip", [pltpu.ChipVersion.TPU_7X, pltpu.ChipVersion.TPU_V6E])
+@pytest.mark.parametrize(
+    "tokens,heads,requests,page_size,non_causal,default_bq,expected",
+    [
+        (2048, 64, 8, 32, False, 16, 32),
+        (48, 64, 1, 32, False, 6, 16),
+        (48, 64, 8, 32, False, 6, 6),
+        (48, 64, 48, 32, False, 6, 1),
+        (128, 64, 8, 32, False, 16, 16),
+        (2048, 8, 8, 32, False, 16, 16),
+        (2048, 64, 8, 64, False, 16, 16),
+        (2048, 64, 8, 32, True, 16, 16),
+    ],
+)
+def test_attention_tuning_respects_call_shape_and_fallback(
+    monkeypatch,
+    chip,
+    tokens,
+    heads,
+    requests,
+    page_size,
+    non_causal,
+    default_bq,
+    expected,
+):
+    monkeypatch.setattr(
+        pltpu,
+        "get_tpu_info",
+        lambda: SimpleNamespace(chip_version=chip),
+    )
+    warnings = []
+    monkeypatch.setattr(
+        tuned_block_sizes,
+        "logger",
+        SimpleNamespace(warning_once=lambda *a: warnings.append(a)),
+    )
+    if chip != pltpu.ChipVersion.TPU_7X:
+        expected = default_bq
+    assert (
+        tuned_block_sizes.csa2_attention_bq(
+            tokens, heads, requests, page_size, non_causal, default_bq=default_bq
+        )
+        == expected
+    )
+    if chip != pltpu.ChipVersion.TPU_7X or heads != 64 or page_size != 32 or non_causal:
+        assert warnings
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "heads,bq", [(8, 32), (128, 32), (64, 24), (64, 33), (64, True)]
+)
+def test_attention_rejects_unsupported_group_capacity(heads, bq):
+    with pytest.raises(ValueError, match="bq must be a static Python int"):
+        csa2(
+            jnp.empty((0, heads, 512), jnp.bfloat16),
+            jnp.empty((0, 512, 128), jnp.int32),
+            jnp.empty((0, 512), jnp.float32),
+            jnp.empty((0, 128, 512), jnp.bfloat16),
+            jnp.zeros((2,), jnp.int32),
+            jnp.empty((0,), jnp.int32),
+            jnp.zeros((heads,), jnp.float32),
+            jnp.empty((0, 2, 128), jnp.float32),
+            bq=bq,
+            interpret=True,
+        )

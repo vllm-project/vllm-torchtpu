@@ -90,6 +90,7 @@ def main_kernel(
     swa_kv_hbm_ref = swa_banks[0]
     request_limit = starts_ref.shape[0] - 1
     num_heads = q_hbm_ref.shape[1]
+    kv_slots = main_bf16_ref.shape[0]
     mxu_heads = pl.cdiv(num_heads, 16) * 16
     mrb_stride = mxu_heads // 4
     window_size = 128
@@ -406,6 +407,7 @@ def main_kernel(
                     swa_prefetched_id[0] = wanted + 1
 
         def dequant(i):
+            slot = i if kv_slots == bq else i % kv_slots
             # Byte g of each word holds feature g * 128 + lane.
             words_ref = main_fp8_ref.at[i].bitcast(jnp.uint32).reshape(512, 128)
             for row in range(0, 512, 128):
@@ -426,7 +428,7 @@ def main_kernel(
                     values = lax.bitcast_convert_type(
                         bits.astype(jnp.uint8), jnp.float8_e4m3fn
                     ).astype(jnp.float32)
-                    main_bf16_ref[i, rows, pl.ds(group * 128, 128)] = (
+                    main_bf16_ref[slot, rows, pl.ds(group * 128, 128)] = (
                         values * scales
                     ).astype(jnp.bfloat16)
 
@@ -442,11 +444,16 @@ def main_kernel(
             transfer_group(next_request, next_t0, 1 - bank)
 
         def csa_launch(i, addr, *, pv):
+            slot = i if kv_slots == bq else i % kv_slots
             for k in range(2):
                 ks = pl.ds(k * 256, 256)
                 for mxu in range(2):
                     ns = pl.ds(mxu * 256, 256)
-                    rhs = main_bf16_ref[i, ks, ns] if pv else main_bf16_ref[i, ns, ks]
+                    rhs = (
+                        main_bf16_ref[slot, ks, ns]
+                        if pv
+                        else main_bf16_ref[slot, ns, ks]
+                    )
                     pltpu.matmul_push_rhs(
                         rhs, staging_register=0, mxu_index=mxu, transpose=not pv
                     )
@@ -898,7 +905,8 @@ def csa2(
         Gather metadata must include all these positions, including future KV.
       scale: Static attention logit scale.
       compress_ratio: Positive static integer compression ratio.
-      bq: Static group capacity in [1, 16]. Tails use only their valid Qs.
+      bq: Static group capacity in [1, 16], or 32 for H=64. BQ=32 reuses
+        four dequantized KV slots. Tails use only their valid Qs.
       interpret: Run the Pallas body on CPU without TPU code generation.
 
     Returns:
@@ -927,8 +935,10 @@ def csa2(
         swa_kv = low
     if num_heads < 8 or num_heads > 128 or num_heads % 8:
         raise NotImplementedError("CSA2 requires H divisible by 8, with 8 <= H <= 128")
-    if type(bq) is not int or not 1 <= bq <= 16:
-        raise ValueError("CSA2 bq must be a static Python int in [1,16]")
+    if type(bq) is not int or not (1 <= bq <= 16 or (bq == 32 and num_heads == 64)):
+        raise ValueError(
+            "CSA2 bq must be a static Python int in [1,16], or 32 for H=64"
+        )
     if type(compress_ratio) is not int or compress_ratio < 1:
         raise ValueError("CSA2 compress_ratio must be a positive static Python int")
     if starts.ndim != 1 or starts.shape[0] < 2:
@@ -992,6 +1002,10 @@ def csa2(
     elif main_lengths.shape != (num_tokens,) or main_lengths.dtype != jnp.int32:
         raise ValueError("Main lengths must be INT32 [T]")
     shared_window_size = 256
+    # QK/PV consume KV i before dequant(i+4) reuses its slot; delayed PV
+    # pops consume MRB only. Keep Ref reads so the compiler preserves WAR.
+    # CPU interpret computes dots at pop time, so it needs all BQ entries.
+    kv_slots = bq if interpret or bq <= 16 else 4
     scalars = (
         (starts, positions, main_lengths)
         if swa_metadata is None
@@ -1026,7 +1040,7 @@ def csa2(
                 pltpu.VMEM((2, bq, num_heads, 512), jnp.bfloat16),
                 pltpu.VMEM((2, bq, *main_shape[1:]), main_dtype),
                 pltpu.VMEM((2, bq, 1, 512), jnp.float32),
-                pltpu.VMEM((bq, 512, 512), jnp.bfloat16),
+                pltpu.VMEM((kv_slots, 512, 512), jnp.bfloat16),
                 pltpu.VMEM(
                     (2, 128, 128) if swa_word_pages else (128, 512),
                     jnp.int32 if swa_word_pages else jnp.bfloat16,

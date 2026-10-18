@@ -19,7 +19,10 @@ from vllm_torchtpu.kernels.deepseek_v41.csa2_metadata import (
     prepare_swa_metadata,
 )
 from vllm_torchtpu.kernels.deepseek_v41.csa2_pipeline import csa2_pipeline
-from vllm_torchtpu.kernels.deepseek_v41.tuned_block_sizes import csa2_gather_chunk_size
+from vllm_torchtpu.kernels.deepseek_v41.tuned_block_sizes import (
+    csa2_attention_bq,
+    csa2_gather_chunk_size,
+)
 from vllm_torchtpu.kernels.mla.paged_swa import swa_word_pages, write_swa_word_pool
 
 if TYPE_CHECKING:
@@ -108,7 +111,14 @@ def _attend(
         main_lengths=counts,
         compress_ratio=ratio,
         scale=scale,
-        bq=bq,
+        bq=csa2_attention_bq(
+            q.shape[0],
+            q.shape[1],
+            starts.shape[0] - 1,
+            page_size,
+            non_causal,
+            default_bq=bq,
+        ),
     )
 
 
@@ -139,6 +149,7 @@ def _gather_attend(
     records, counts = prepare_main_records(
         selected, pages, main_starts, page_size=main_page_size
     )
+    chunk_size = csa2_gather_chunk_size(q.shape[0])
     output, words, scales = csa2_pipeline(
         q,
         raw if high is None else (raw, high),
@@ -152,8 +163,15 @@ def _gather_attend(
         metadata,
         bounds if non_causal else None,
         counts,
-        chunk_size=csa2_gather_chunk_size(q.shape[0]),
-        bq=bq,
+        chunk_size=chunk_size,
+        bq=csa2_attention_bq(
+            min(q.shape[0], chunk_size),
+            q.shape[1],
+            starts.shape[0] - 1,
+            swa_page_size,
+            non_causal,
+            default_bq=bq,
+        ),
         scale=scale,
         compress_ratio=ratio,
     )
