@@ -205,26 +205,47 @@ def test_packed_candidate_tuning_distinguishes_halfplane(
 
 
 @pytest.mark.cpu_test
+@pytest.mark.parametrize("flat", [0, 8])
+@pytest.mark.parametrize("skip", [False, True])
 @pytest.mark.parametrize(
     "halfplane,expected_key,expected_request", [(False, 4096, 16), (True, 8192, 48)]
 )
 def test_packed_candidate_default_dispatch_preserves_measured_group(
-    monkeypatch, halfplane, expected_key, expected_request
+    monkeypatch, halfplane, expected_key, expected_request, flat, skip
 ):
     from vllm_torchtpu.kernels.deepseek_v41.index_selection import candidate
 
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_CANDIDATE_FLAT", str(flat))
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_CANDIDATE_SKIP", str(int(skip)))
+    expected_skip = skip
     calls = []
     monkeypatch.setattr(tuning, "logger", Mock())
     monkeypatch.setattr(jax, "devices", lambda: [Mock(device_kind="TPU7x")])
 
     def score(
-        q, weights, keys, ids, membership, lengths, *, block_size, key_tile, halfplane
+        q,
+        weights,
+        keys,
+        ids,
+        membership,
+        lengths,
+        *,
+        block_size,
+        key_tile,
+        halfplane,
+        skip,
+        group_tile=None,
     ):
         assert keys.dtype == jnp.int32
+        assert skip is expected_skip
+        assert group_tile == (flat or None)
         calls.append((q.shape[0], key_tile))
-        return jnp.zeros((*q.shape[:2], ids.shape[1] * block_size), jnp.float32)
+        rows = (q.shape[0] * q.shape[1],) if flat else q.shape[:2]
+        return jnp.zeros((*rows, ids.shape[1] * block_size), jnp.float32)
 
+    candidate.candidate_indexer.clear_cache()
     monkeypatch.setattr(candidate, "candidate_scores", score)
+    monkeypatch.setattr(candidate, "candidate_scores_flat", score)
     monkeypatch.setattr(
         candidate.decode,
         "_select",
