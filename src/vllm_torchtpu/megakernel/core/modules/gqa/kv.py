@@ -25,6 +25,7 @@ from jax.experimental.pallas import tpu as pltpu
 from ...dma import pool_alias
 from ...ops import U32, bswitch
 from ...pool.config import cache_exec, resolved_max_pages_per_seq
+from ...pool.dcp import dcp_rank, local_kv_len
 from .context import GQAEmit
 from .params import GQAParams
 
@@ -48,8 +49,12 @@ def build_worklist(ctx: Any, ap: GQAParams) -> None:
     """Build this rank's KV worklist (`wl_b`, `wl_t`, `wl_kp`, `wl_cnt[0]`)."""
     ex, scr, ST, pos_ref = ctx.ex, ctx.scr, ctx.ST, ctx.pos_ref
     NS, T = ex.NS, ex.T
-    BLK, TS, SPLIT = ap.BLK, ap.TS, ap.SPLIT
+    BLK, TS, SPLIT, DCP = ap.BLK, ap.TS, ap.SPLIT, ap.DCP
     gi = lax.rem(ctx.me, ap.G) if SPLIT else jnp.int32(0)
+    # DCP: `dr` is the shard this rank holds; the split rotates over the
+    # G // DCP ranks holding it (`gs` is this rank's index among them).
+    dr = dcp_rank(ctx.me, DCP)
+    gs = lax.div(gi, DCP) if DCP > 1 else gi
     eff_ctx = (
         max(ex.ctx, resolved_max_pages_per_seq(ex) * cache_exec(ex).page_size)
         if cache_exec(ex).paged_kv
@@ -59,9 +64,11 @@ def build_worklist(ctx: Any, ap: GQAParams) -> None:
     max_p = resolved_max_pages_per_seq(ex)
 
     n = jnp.int32(0)
+    page_size = cache_exec(ex).page_size
     for b in range(NS):
-        nb = jnp.minimum(jnp.maximum((pos_ref[b * T] + BLK - 1) // BLK, 0), max_nb)
-        t0 = lax.rem(gi + (TS - b % TS), TS) if SPLIT else jnp.int32(0)
+        plen = local_kv_len(pos_ref[b * T], page_size, DCP, dr)
+        nb = jnp.minimum(jnp.maximum((plen + BLK - 1) // BLK, 0), max_nb)
+        t0 = lax.rem(gs + (TS - b % TS), TS) if SPLIT else jnp.int32(0)
         cnt = jnp.maximum(nb - t0 + TS - 1, 0) // TS
 
         def put(j, carry, b=b, t0=t0, n=n):

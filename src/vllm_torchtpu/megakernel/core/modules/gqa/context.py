@@ -22,6 +22,7 @@ import jax.numpy as jnp
 from jax import lax
 
 from ...pool.config import cache_exec
+from ...pool.dcp import dcp_rank
 from .params import GQAParams
 
 
@@ -31,7 +32,7 @@ class GQAEmit:
 
     `gi` is this rank's index in its KV-head group, `a` the layer's index into
     the module's stacked states, `n_items` the KV worklist length and `KR` the
-    KV ring depth.
+    KV ring depth. `dr` is this rank's DCP rank (`0` at `DCP == 1`).
     """
 
     ctx: Any
@@ -54,6 +55,7 @@ class GQAEmit:
     aacc: Any
     n_items: Any
     KR: int
+    dr: Any = 0
 
     @classmethod
     def build(cls, ctx: Any, ap: GQAParams, l: Any, name: str) -> GQAEmit:  # noqa: E741
@@ -84,4 +86,5 @@ class GQAEmit:
             aacc=scr["aacc"],
             n_items=n_items,
             KR=ap.NKVR if cache_exec(ex).paged_kv else ap.NKV,
+            dr=dcp_rank(ctx.me, ap.DCP),
         )

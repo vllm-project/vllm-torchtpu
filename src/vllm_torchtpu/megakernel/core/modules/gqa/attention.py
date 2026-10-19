@@ -24,6 +24,7 @@ from jax.experimental.pallas import tpu as pltpu
 
 from ...ops import BF16, F32, FP8, I32, U32
 from ...pool.config import cache_exec
+from ...pool.dcp import local_kv_len
 from .context import GQAEmit
 from .kv import KVRing
 from .params import NN, NT
@@ -39,6 +40,8 @@ def item_front(cx: GQAEmit, kv: KVRing, col: Any, col_v: Any, i: Any) -> Any:
     s = i % KR
     b, t = scr["wl_b"][i], scr["wl_t"][i]
     plen = pos_ref[b * T] if VER else pos_ref[b]
+    if ap.DCP > 1:  # this rank's cached tokens of the sequence
+        plen = local_kv_len(plen, cache_exec(ex).page_size, ap.DCP, cx.dr)
     qrows = scr["qb"][b]
     k_full: Any = None
     v_full: Any = None

@@ -23,6 +23,7 @@ from jax import lax
 from jax.experimental.pallas import tpu as pltpu
 
 from ..ops import BF16, FP8, I32
+from .dcp import dcp_rank, page_owner_col
 from .layout import PoolLayout
 
 
@@ -80,6 +81,9 @@ class ScatterGeom:
     ckpt_is_3d: bool = False
     ckpt_t_off: int = 0
     ckpt_ndim: int = 0
+    # Decode context parallel size (`CacheExec.dcp`): a new token lands only on
+    # the DCP rank holding its kernel page, at page-table column `page // dcp`.
+    dcp: int = 1
 
 
 @dataclass(frozen=True)
@@ -116,6 +120,11 @@ class ScatterKernel:
     # plus the live conv rows (one such row holds two bf16 lane-rows).
     CP_ROWS: int
     SLOT_ROWS: int
+    # This rank's DCP rank (`0` at `dcp == 1`), from the kernel's position on
+    # the "tp" mesh axis: Mosaic lowers `lax.axis_index` inside the Pallas
+    # body from the device id (in the shard_map body the same query lowers to
+    # an XLA partition id, which the serving engine's SPMD program rejects).
+    dcp_rank: Any = 0
 
     @classmethod
     def build(cls, sg: ScatterGeom, refs: Any) -> ScatterKernel:
@@ -153,6 +162,7 @@ class ScatterKernel:
         )
         total_gdn = NATT * G_PER_ATT
         CP_ROWS = sg.conv_rows_pad // 2
+        rank = dcp_rank(lax.axis_index("tp").astype(I32), sg.dcp) if sg.dcp > 1 else 0
         return cls(
             sg=sg,
             pos_ref=pos_ref,
@@ -182,6 +192,7 @@ class ScatterKernel:
             total_gdn=total_gdn,
             CP_ROWS=CP_ROWS,
             SLOT_ROWS=sg.rec_pages * sg.page_rows + CP_ROWS,
+            dcp_rank=rank,
         )
 
 
@@ -194,6 +205,13 @@ def is_active(kc: ScatterKernel, s: Any) -> Any:
     if act_mode == "from_ckpt":
         return (ckpt_ref[0, s, 0] > 0) if ckpt_is_3d else (ckpt_ref[s, 0] > 0)
     return act_ref[s] != 0
+
+
+def kv_token_col(kc: ScatterKernel, p_pos: Any) -> tuple[Any, Any]:
+    """`(this rank holds it, page-table column)` of the KV page of position
+    `p_pos >= 0`: always held, at column `p_pos // page_size`, at `dcp == 1`."""
+    sg = kc.sg
+    return page_owner_col(lax.div(p_pos, sg.page_size), sg.dcp, kc.dcp_rank)
 
 
 def batch_to_i32_cols(kc: ScatterKernel, tok_mr_hd: Any) -> Any:

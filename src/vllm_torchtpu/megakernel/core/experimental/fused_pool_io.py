@@ -85,6 +85,7 @@ from ..modules.gdn.gate import gdn_gate_act
 from ..ops import BF16, F32, FP8, I32, U32, bswitch, round_bf16, round_up
 from ..pool.checks import safe_kv_page, safe_page_base
 from ..pool.config import POOL_STATE_NAME, cache_exec
+from ..pool.dcp import dcp_rank, page_owner_col
 from ..pool.layout import LANES
 from ..spec import StateDecl
 
@@ -164,15 +165,36 @@ def _gqa_seq_active(ctx: Any, s: Any) -> Any:
     return (ck_ref[s, 0] > 0) if cache_exec(ex).ckpt_2d else (ck_ref[0, s, 0] > 0)
 
 
-def _gqa_tok_kp(ctx: Any, s: Any, t: int) -> tuple[Any, Any]:
+def _gqa_tok_col(
+    ctx: Any, p_raw: Any, p_pos: Any, dr: Any, nonneg: Any = None
+) -> tuple[Any, Any]:
+    """`(page-table column, p_ok)` of the new token at position `p_raw`
+    (`p_pos = max(p_raw, 0)`; `nonneg = p_raw >= 0` if the caller traced it
+    already, so the DCP 1 program keeps its op order).
+
+    `p_ok` is False for a padded row, a position past the page table and,
+    under DCP, a token whose page another DCP rank holds (this rank doesn't
+    write it); the caller routes those to page 0 or skips them.
+    """
+    ex, pt_ref = ctx.ex, ctx.ST["page_table"]
+    dcp = cache_exec(ex).dcp
+    lp_raw = lax.div(p_pos, cache_exec(ex).page_size)
+    own, lp_raw = page_owner_col(lp_raw, dcp, dr)
+    if nonneg is None:
+        nonneg = p_raw >= 0
+    p_ok = jnp.logical_and(nonneg, lp_raw < pt_ref.shape[1])
+    if dcp > 1:
+        p_ok = jnp.logical_and(p_ok, own)
+    return lp_raw, p_ok
+
+
+def _gqa_tok_kp(ctx: Any, s: Any, t: int, dr: Any) -> tuple[Any, Any]:
     ex, ST, pos_ref = ctx.ex, ctx.ST, ctx.pos_ref
     pt_ref = ST["page_table"]
-    page_size = cache_exec(ex).page_size
     num_pages = cache_exec(ex).num_pages
     p_raw = pos_ref[s * ex.T + t]
     p_pos = jnp.maximum(p_raw, jnp.int32(0))
-    lp_raw = lax.div(p_pos, page_size)
-    p_ok = jnp.logical_and(p_raw >= 0, lp_raw < pt_ref.shape[1])
+    lp_raw, p_ok = _gqa_tok_col(ctx, p_raw, p_pos, dr)
     lp = jnp.where(p_ok, lp_raw, jnp.int32(0))
     kp = jnp.where(p_ok, safe_kv_page(pt_ref[s, lp], num_pages), jnp.int32(0))
     return kp, p_ok
@@ -184,6 +206,7 @@ def gqa_fused_init_buffers(ctx: Any) -> None:
     """
     ex, scr = ctx.ex, ctx.scr
     NS, T = ex.NS, ex.T
+    dr = dcp_rank(ctx.me, cache_exec(ex).dcp)
     act_list = [_gqa_seq_active(ctx, s) for s in range(NS)]
     kp_st: list[list[Any]] = []
     for s in range(NS):
@@ -192,7 +215,7 @@ def gqa_fused_init_buffers(ctx: Any) -> None:
         kps_s: list[Any] = []
         oks_s: list[Any] = []
         for t in range(T):
-            kp_t, ok_t = _gqa_tok_kp(ctx, s, t)
+            kp_t, ok_t = _gqa_tok_kp(ctx, s, t, dr)
             kps_s.append(kp_t)
             oks_s.append(ok_t)
         kp_st.append(kps_s)
@@ -306,6 +329,7 @@ def gqa_fused_kv_rmw(ctx: Any, ap: Any, a_cur: Any) -> None:
     kv_kp0, kv_mode = scr["kv_kp0"], scr["kv_mode"]
     page_size = cache_exec(ex).page_size
     lane_iota_kv = lax.broadcasted_iota(I32, (h4, page_size), 1)
+    dr = dcp_rank(ctx.me, cache_exec(ex).dcp)
 
     def _batch_to_i32_cols(tok_mr_hd):
         rows_bf16 = tok_mr_hd.astype(BF16)
@@ -343,9 +367,8 @@ def gqa_fused_kv_rmw(ctx: Any, ap: Any, a_cur: Any) -> None:
                 b_t = b0 + t
                 p_raw = pos_ref[b_t]
                 p_t = jnp.maximum(p_raw, jnp.int32(0))
-                p_ok = jnp.logical_and(
-                    p_raw >= 0, lax.div(p_t, page_size) < pt_ref.shape[1]
-                )
+                nonneg = p_raw >= 0
+                _, p_ok = _gqa_tok_col(ctx, p_raw, p_t, dr, nonneg)
                 ln_t = lax.rem(p_t, page_size)
                 mask_ln = jnp.logical_and(p_ok, lane_iota_kv == ln_t)
                 if interpret:
@@ -403,8 +426,7 @@ def gqa_fused_kv_rmw(ctx: Any, ap: Any, a_cur: Any) -> None:
                         b_t = b0 + t
                         p_raw = pos_ref[b_t]
                         p_t = jnp.maximum(p_raw, jnp.int32(0))
-                        lp_raw = lax.div(p_t, page_size)
-                        p_ok = jnp.logical_and(p_raw >= 0, lp_raw < pt_ref.shape[1])
+                        lp_raw, p_ok = _gqa_tok_col(ctx, p_raw, p_t, dr)
                         lp_t = jnp.where(p_ok, lp_raw, jnp.int32(0))
                         ln_t = lax.rem(p_t, page_size)
                         kp_t = jnp.where(

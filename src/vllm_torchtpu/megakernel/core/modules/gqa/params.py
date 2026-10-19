@@ -92,6 +92,9 @@ class GQAParams:
     rope_fp32: bool = False
     in_scaled: bool = True
     out_scaled: bool = True
+    # Decode context parallel size (`CacheExec.dcp`): the G ranks of a
+    # KV-head group hold DCP page shards, each shard on G // DCP ranks.
+    DCP: int = 1
 
     def qrow(self, b: int) -> tuple[int, int]:
         return b // self.PB, (b % self.PB) * self.nh
@@ -243,7 +246,17 @@ def derive_params(
             f"GQA split attention requires G = R // NKV to be a power of two, "
             f"got G={G} (R={ex.R}, NKV={g.NKV})"
         )
-    TS = G if SPLIT else 1
+    # DCP: the group's DCP shards each hold 1 / DCP of the pages, so the split
+    # runs over the G // DCP ranks of one shard (every local item is this
+    # rank's at DCP == G); the merge over the G partials is the same.
+    DCP = cache_exec(ex).dcp
+    if DCP > 1 and (G % DCP != 0 or not SPLIT):
+        raise MegakernelConfigError(
+            f"GQA under decode context parallelism needs dcp ({DCP}) to divide "
+            f"G = R // NKV ({G}) and the sequence-split attention (split="
+            f"{tt.split}), whose merge combines the DCP shards' partials"
+        )
+    TS = (G // DCP) if SPLIT else 1
     QR = round_up(G * nh, 8) if SPLIT else 8
     TQ = ex.T * QR
     PW = g.HD + 128
@@ -351,6 +364,7 @@ def derive_params(
         rope_fp32=bool(tt.rope_fp32),
         in_scaled=bool(in_scaled),
         out_scaled=bool(out_scaled),
+        DCP=DCP,
     )
 
 

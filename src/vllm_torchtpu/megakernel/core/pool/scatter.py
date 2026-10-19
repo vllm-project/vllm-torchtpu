@@ -143,10 +143,15 @@ def scatter_pool_states(
     # Pre-gather only the (NS, T) active KV page indices for SMEM; route
     # negative positions, positions past page_table (`lp >= pt_cols`), or
     # out-of-range physical page ids to shared null page 0 instead of clamping.
+    # Under DCP the page-table column is `page // dcp` on every rank; which
+    # rank writes the token is decided in the kernel (`kv_token_col`).
+    dcp = cache_exec(ex).dcp
     pt_cols = page_table.shape[1]
     pos_raw = pos[: NS * T].reshape(NS, T)
     pos_st = jnp.maximum(pos_raw, jnp.int32(0))
     lp_raw = lax.div(pos_st, page_size)
+    if dcp > 1:
+        lp_raw = lax.div(lp_raw, dcp)
     p_in_range = jnp.logical_and(pos_raw >= 0, lp_raw < pt_cols)
     lp_idx = jnp.where(p_in_range, lp_raw, jnp.int32(0))
     s_idx_arr = jnp.arange(NS, dtype=I32)[:, None]
@@ -218,6 +223,7 @@ def scatter_pool_states(
         s_names=tuple(s_names),
         n_pairs=n_pairs,
         pt_cols=pt_cols,
+        dcp=dcp,
         **ckpt_geom,
     )
 
