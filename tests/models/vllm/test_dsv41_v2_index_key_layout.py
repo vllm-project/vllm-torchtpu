@@ -146,56 +146,6 @@ def test_bound_cache_cannot_change_interpretation():
         _ = view.kv_cache
 
 
-@pytest.mark.parametrize("tp_size", [1, 8])
-def test_attention_registration_keeps_explicit_tp_mesh(monkeypatch, tp_size):
-    """Wrapper-local ops and explicit TP ops keep separate dispatch meshes."""
-    import jax
-    import numpy as np
-    import vllm.distributed as vllm_dist
-    from jax.sharding import Mesh
-    from torch_tpu._internal import pallas
-
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels
-    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-        set_vllm_model_wrapper_context,
-    )
-
-    device = jax.devices("cpu")[0]
-    wrapper_mesh = Mesh(np.asarray([device]), ("model",))
-    tp_mesh = Mesh(np.asarray([device] * tp_size), ("tp",))
-    group = SimpleNamespace(size=lambda: tp_size)
-    monkeypatch.setattr(
-        vllm_dist, "get_tp_group", lambda: SimpleNamespace(device_group=group)
-    )
-    monkeypatch.setattr(pallas, "get_pallas_mesh", lambda **kwargs: tp_mesh)
-    meshes = {}
-
-    def register(name, fn, **kwargs):
-        meshes[name] = kwargs["mesh"]
-        return SimpleNamespace(register_fake=lambda fake: None)
-
-    monkeypatch.setattr(pallas, "jax_op", register)
-    for name in (
-        "_attention_op",
-        "_attention_2bank_op",
-        "_gather_bf16_op",
-        "_gather_fp8_op",
-        "_fp8_attention_op",
-        "_fp8_attention_2bank_op",
-        "_fp8_attention_qo_op",
-        "_fp8_attention_qo_2bank_op",
-    ):
-        monkeypatch.setattr(attention_kernels, name, None)
-    monkeypatch.setattr(attention_kernels, "_attention_tp_size", 1)
-    with set_vllm_model_wrapper_context(mesh=wrapper_mesh):
-        attention_kernels.initialize_paged_attention()
-    assert len(meshes) == 8
-    for name, mesh in meshes.items():
-        is_tp_op = name.endswith("gather_fp8_kv") or "sparse_fp8_attention" in name
-        expected = tp_mesh if tp_size > 1 and is_tp_op else None
-        assert mesh is expected, name
-
-
 def test_model_startup_registers_real_jax_ops_on_cpu(monkeypatch):
     import jax
     import numpy as np

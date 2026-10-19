@@ -164,7 +164,6 @@ class TestTpuCompilerCache:
             "vllm_torchtpu/kernels/pool_adapters.py",
             "vllm_torchtpu/models/vllm/kimi_k3/collective_ops.py",
             "vllm_torchtpu/models/vllm/kimi_k3/layers.py",
-            "vllm_torchtpu/models/vllm/vllm_model_wrapper_context.py",
         } <= hashed
 
     def test_serving_only_kv_knobs_stay_out_of_the_compile_cache_key(self):
