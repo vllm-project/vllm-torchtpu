@@ -237,7 +237,7 @@ def test_smem_caps_refresh_after_placeholder_table_rebuild(monkeypatch):
     runner._refresh_smem_request_caps()
     assert runner.num_reqs_max_model_len == 47
 
-    def rebuild(_self, _config, _sizes):
+    def rebuild(_self, _config):
         runner.input_batch.block_table[0] = final_table
 
     monkeypatch.setattr(GPUModelRunner, "may_reinitialize_input_batch", rebuild)
@@ -247,9 +247,7 @@ def test_smem_caps_refresh_after_placeholder_table_rebuild(monkeypatch):
     real_runner._refresh_smem_request_caps = (
         TPUModelRunner._refresh_smem_request_caps.__get__(real_runner)
     )
-    TPUModelRunner.may_reinitialize_input_batch(
-        real_runner, runner.kv_cache_config, [384]
-    )
+    TPUModelRunner.may_reinitialize_input_batch(real_runner, runner.kv_cache_config)
     assert real_runner.num_reqs_max_model_len == 64
     assert real_runner.max_num_blocks_per_req == 342
     assert real_runner.block_table_cpu.shape == (64, 342)
