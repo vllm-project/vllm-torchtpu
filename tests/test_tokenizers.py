@@ -28,12 +28,13 @@ too, only with a real tokenizer.
 
 import copy
 import pickle
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, call
 
 import pytest
 
 from vllm_torchtpu.tokenizers import (
     TpuDeepseekV4Tokenizer,
+    TPUHfTokenizer,
     _tpu_deepseek_v4_tokenizer,
     register_tokenizers,
 )
@@ -263,16 +264,21 @@ def test_pickle_round_trip_keeps_the_wrapping(tokenizer):
 # ---------------------------------------------------------------------------
 
 
-def test_registration_is_skipped_unless_the_env_var_is_set(monkeypatch):
+def test_deepseek_registration_is_skipped_unless_enabled(monkeypatch):
     """Off by default, so tokenizer behaviour matches stock vLLM unless a
     config opts in."""
     registry = MagicMock()
     monkeypatch.setattr("vllm.tokenizers.registry.TokenizerRegistry", registry)
+    monkeypatch.delattr(
+        "vllm.tokenizers.hf._load_chat_template_fallback", raising=False
+    )
     monkeypatch.delenv("TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE", raising=False)
 
     register_tokenizers()
 
-    registry.register.assert_not_called()
+    registry.register.assert_called_once_with(
+        "hf", "vllm_torchtpu.tokenizers", "TPUHfTokenizer"
+    )
 
 
 def test_registration_binds_the_deepseek_v4_tokenizer_mode(monkeypatch):
@@ -281,13 +287,17 @@ def test_registration_binds_the_deepseek_v4_tokenizer_mode(monkeypatch):
     vLLM's registry resolves it in a worker process."""
     registry = MagicMock()
     monkeypatch.setattr("vllm.tokenizers.registry.TokenizerRegistry", registry)
+    monkeypatch.delattr(
+        "vllm.tokenizers.hf._load_chat_template_fallback", raising=False
+    )
     monkeypatch.setenv("TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE", "1")
 
     register_tokenizers()
 
-    registry.register.assert_called_once_with(
-        "deepseek_v4", "vllm_torchtpu.tokenizers", "TpuDeepseekV4Tokenizer"
-    )
+    assert registry.register.call_args_list == [
+        call("hf", "vllm_torchtpu.tokenizers", "TPUHfTokenizer"),
+        call("deepseek_v4", "vllm_torchtpu.tokenizers", "TpuDeepseekV4Tokenizer"),
+    ]
 
 
 def test_from_pretrained_returns_a_wrapped_tokenizer(monkeypatch):
@@ -302,3 +312,65 @@ def test_from_pretrained_returns_a_wrapped_tokenizer(monkeypatch):
     deepseek_cls.from_pretrained.assert_called_once_with("some/model", trust=True)
     assert type(wrapped).__name__ == "_TpuDeepseekV4Tokenizer"
     assert isinstance(wrapped, _FakeBaseTokenizer)
+
+
+@pytest.fixture
+def hf_checkpoint(tmp_path):
+    from tokenizers import Tokenizer, models
+    from transformers import PreTrainedTokenizerFast
+
+    backend = Tokenizer(models.WordLevel({"[UNK]": 0, "hello": 1}, unk_token="[UNK]"))
+    PreTrainedTokenizerFast(
+        tokenizer_object=backend, unk_token="[UNK]"
+    ).save_pretrained(tmp_path)
+    return tmp_path
+
+
+def test_hf_standalone_template_survives_pickle(hf_checkpoint):
+    template = "{{ cutoff_date }}|{{ current_date }}|{{ messages[0].content }}"
+    (hf_checkpoint / "model_chat.jinja").write_text(template)
+    tokenizer = TPUHfTokenizer.from_pretrained(hf_checkpoint, local_files_only=True)
+    for tok in (tokenizer, pickle.loads(pickle.dumps(tokenizer))):
+        assert tok.chat_template == template
+        assert (
+            tok.apply_chat_template(
+                [{"role": "user", "content": "hello"}],
+                tokenize=False,
+                cutoff_date="2025-02-03",
+                current_date="",
+            )
+            == "2025-02-03||hello"
+        )
+    explicit = TPUHfTokenizer.from_pretrained(
+        hf_checkpoint, local_files_only=True, chat_template="explicit"
+    )
+    assert explicit.chat_template == "explicit"
+
+
+def test_hf_content_detection_handles_namespace_assignments(monkeypatch):
+    from vllm.renderers import hf
+
+    from vllm_torchtpu.tokenizers import _iter_nodes_assign_var_or_elems
+
+    monkeypatch.setattr(
+        hf, "_iter_nodes_assign_var_or_elems", _iter_nodes_assign_var_or_elems
+    )
+    template = """{% set ns = namespace(rest=messages) %}
+    {% set ns.rest = messages[1:] %}
+    {% for message in messages %}
+      {% for part in message.content %}{{ part.text }}{% endfor %}
+    {% endfor %}"""
+    assert hf._detect_content_format(template, default="string") == "openai"
+
+
+def test_hf_registration_defers_to_upstream_when_available(monkeypatch):
+    registry = MagicMock()
+    monkeypatch.setattr("vllm.tokenizers.registry.TokenizerRegistry", registry)
+    monkeypatch.setattr(
+        "vllm.tokenizers.hf._load_chat_template_fallback",
+        lambda *a, **kw: None,
+        raising=False,
+    )
+    monkeypatch.delenv("TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE", raising=False)
+    register_tokenizers()
+    registry.register.assert_not_called()

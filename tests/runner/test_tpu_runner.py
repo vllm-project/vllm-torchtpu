@@ -53,6 +53,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadataBuilder,
     AttentionMetadataBuilderContext,
 )
+from vllm_torchtpu.layers.core.sequence_layout import AllSequenceLayoutPlanner
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import tpu_runner
 from vllm_torchtpu.runner import utils as runner_utils_module
@@ -61,6 +62,49 @@ from vllm_torchtpu.runner.tpu_runner_async_output import (
     INVALID_TOKEN_ID,
     AsyncPreResults,
 )
+
+
+def test_dummy_run_preserves_multimodal_embedding_dtype(monkeypatch):
+    runner = TPUModelRunner.__new__(TPUModelRunner)
+    runner.device = torch.device("cpu")
+    runner.dtype = torch.bfloat16
+    runner.supports_mm_inputs = True
+    runner._pp_is_first = True
+    runner._profile_inputs = {}
+    runner.max_num_tokens = 3
+    runner.max_model_len = runner.vocab_size = 32
+    runner.uses_mrope = False
+    runner.kv_cache_config = None
+    runner._attn_layer_names = ["layer.0"]
+    runner.sequence_layout_planner = AllSequenceLayoutPlanner()
+    runner.vllm_config = SimpleNamespace()
+    runner.mesh = runner._kv_cache_bundle = runner.lora_config = None
+    runner._pp_topk_buffer = None
+    runner.maybe_select_dummy_loras = lambda *args: contextlib.nullcontext()
+    runner.model = SimpleNamespace(
+        embed_input_ids=lambda ids, **kwargs: torch.full(
+            (len(ids), 4), 1.001, dtype=torch.float32
+        )
+    )
+    runner.forward_model = MagicMock(return_value=(torch.zeros(3, 4), None))
+    monkeypatch.setattr(
+        tpu_runner,
+        "set_forward_context",
+        lambda *args, **kwargs: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(
+        tpu_runner,
+        "set_vllm_model_wrapper_context",
+        lambda *args, **kwargs: contextlib.nullcontext(),
+    )
+    monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *args: None)
+
+    runner._dummy_run(num_tokens=3, num_reqs=3, num_blocks=1, profile_prefix=4)
+
+    inputs = runner.forward_model.call_args.kwargs
+    assert inputs["input_ids"] is None
+    assert inputs["inputs_embeds"].dtype == torch.float32
+    torch.testing.assert_close(inputs["inputs_embeds"], torch.full((3, 4), 1.001))
 
 
 def test_idle_dp_rank_encodes_before_decoder_pairing():

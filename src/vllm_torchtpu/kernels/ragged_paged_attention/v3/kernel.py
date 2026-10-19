@@ -1589,6 +1589,8 @@ def get_default_block_sizes(
                 bkv_csz = min(min_bkv_sz_to_peak, max_kv)
             else:
                 bq_sz = min(2048 // num_q_heads_per_kv_head, max_q // 2)
+                # Bound Q/output tiles to fit VMEM across all query heads.
+                bq_sz = min(bq_sz, 8192 // next_power_of_2(actual_num_q_heads))
                 bkv_sz = min(2048, max_kv)
                 bq_csz = min(1024 // num_q_heads_per_kv_head, max_q // 2)
                 bkv_csz = min(512, align_to(max_kv // 2, page_size))

@@ -252,6 +252,10 @@ _NATIVE_TPU_COMPILE_ENV_VARS = (
 )
 
 _RUNTIME_CACHE_KEY_PATHS = (
+    # Warmup and embedding assembly can change traced input dtypes.
+    "vllm_torchtpu/runner/tpu_runner.py",
+    "vllm_torchtpu/models/vllm/muse_spark/multimodal.py",
+    "vllm_torchtpu/models/vllm/muse_spark/expert_matmul.py",
     # Pallas implementations execute behind torch custom-op boundaries, so
     # Dynamo's traced-file validation cannot see their source changes.
     "vllm_torchtpu/kernels",

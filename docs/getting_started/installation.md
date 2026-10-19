@@ -110,8 +110,20 @@ VLLM_TARGET_DEVICE=empty uv pip install -e ../vllm --no-deps
 | :--- | :--- |
 | `--group vllm` | Installs pinned upstream `vllm` (`v0.31.0`) from source. |
 | `--group test` | Installs `pytest`, `pytest-mock`, `pytest-cov`, `parameterized`, and `vllm_test_utils`. |
+| `--extra multimodal` | Installs PyAV, SciPy, SoundFile, and TorchAudio for video decoding and audio decoding/resampling. |
 | `--extra benchmarking` | Installs `lm-eval`, `evalscope`, `datasets`, and `runai-model-streamer[gcs]`. |
 | `--extra omni` | Installs `vllm-omni` for multimodal diffusion models (e.g., FLUX, Wan2.2). |
+
+For audio or video serving, install the multimodal extra before starting the server:
+
+```bash
+uv pip install --prerelease=allow -e ".[multimodal]" --group vllm \
+  --extra-index-url https://download.pytorch.org/whl/cpu
+# Or with uv sync:
+uv sync --group vllm --extra multimodal
+```
+
+Use the CPU wheel of TorchAudio; the default PyPI wheel requires CUDA libraries. [TorchAudio 2.11 supports PyTorch 2.11 and newer through its stable ABI](https://github.com/pytorch/audio/blob/main/docs/source/installation.rst). Restart servers started before installing the extra so they load the audio dependencies during initialization.
 
 ---
 

@@ -30,9 +30,16 @@ class _TPUKimiK3Config(VerifyAndUpdateConfig):
 
 
 def register_models() -> None:
+    from transformers import AutoConfig
     from vllm.model_executor.models import ModelRegistry
     from vllm.model_executor.models.config import MODELS_CONFIG_MAP
 
+    from vllm_torchtpu.models.vllm.muse_spark.config import (
+        MuseSparkAudioConfig,
+        MuseSparkConfig,
+        MuseSparkTextConfig,
+        MuseSparkVisionConfig,
+    )
     from vllm_torchtpu.models.vllm.qwen4_exp.config import TPUQwen4ExpConfig
 
     ModelRegistry.register_model("KimiLinearForCausalLM", _KIMI_MODEL)
@@ -50,3 +57,19 @@ def register_models() -> None:
     MODELS_CONFIG_MAP["KimiK3ForConditionalGeneration"] = _TPUKimiK3Config
     MODELS_CONFIG_MAP["Qwen4ExpForCausalLM"] = TPUQwen4ExpConfig
     MODELS_CONFIG_MAP["Qwen4ExpForConditionalGeneration"] = TPUQwen4ExpConfig
+
+    for config in (
+        MuseSparkConfig,
+        MuseSparkTextConfig,
+        MuseSparkVisionConfig,
+        MuseSparkAudioConfig,
+    ):
+        AutoConfig.register(config.model_type, config, exist_ok=True)
+    for architecture, module in (
+        ("MuseSparkForCausalLM", "model"),
+        ("MuseSparkForConditionalGeneration", "multimodal"),
+    ):
+        ModelRegistry.register_model(
+            architecture,
+            f"vllm_torchtpu.models.vllm.muse_spark.{module}:{architecture}",
+        )

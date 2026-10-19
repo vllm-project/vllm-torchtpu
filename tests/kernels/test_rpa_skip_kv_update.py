@@ -73,6 +73,30 @@ def _require_tpu() -> None:
         pytest.skip(f"Requires TPU backend, found {backend!r}.")
 
 
+def test_v7_default_tile_caps_large_query_head_geometry(monkeypatch):
+    monkeypatch.setattr(K, "get_tpu_version", lambda: 7)
+
+    sizes = K.get_default_block_sizes(
+        jnp.bfloat16,
+        jnp.bfloat16,
+        actual_num_q_heads=64,
+        actual_num_kv_heads=8,
+        head_dim=128,
+        page_size=16,
+        max_num_tokens=512,
+        max_num_seqs=8,
+        pages_per_seq=2048,
+        case=K.RpaCase.MIXED,
+    )
+
+    assert sizes == {
+        "bq_sz": 128,
+        "bkv_sz": 2048,
+        "bq_csz": 128,
+        "bkv_csz": 512,
+    }
+
+
 def _build_packed_cache(
     cfg, target_k, target_v, kv_len, total_pages, page_size, num_kv_heads, dtype
 ):
