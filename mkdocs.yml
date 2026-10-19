@@ -67,6 +67,7 @@ nav:
       - 'Offline LoRA': api_and_code_examples/offline_lora_inference.md
   - 'Deployment & Recipes':
     - 'TPU v7x (Ironwood) Recipes': deployment/v7x_recipes.md
+    - 'MiniMax-H3 (vLLM-Omni) on TPU v7x': deployment/v7x_minimax_h3_omni.md
     - 'TPU v6e (Trillium) Recipes': deployment/v6e_recipes.md
     - 'Kubernetes & GKE': deployment/kubernetes.md
   - 'Developer Guide':
