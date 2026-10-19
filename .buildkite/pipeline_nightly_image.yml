@@ -13,6 +13,36 @@
 # limitations under the License.
 
 steps:
+  # Releases only: a build of releases/vX.Y.Z started by hand waits here, like
+  # a wait step, until someone approves. Scheduled builds skip it and publish
+  # to GAR only. This pipeline runs no tests, so the approver checks that the
+  # vllm-torchtpu-ci build of this commit passed.
+  - block: ":rotating_light: Approve vllm-torchtpu release"
+    key: "approve_release"
+    if: 'build.branch =~ /^releases\/v[0-9]+\.[0-9]+\.[0-9]+$/ && build.source != "schedule"'
+    prompt: "Did the vllm-torchtpu-ci build of this commit pass? Build and publish this release?"
+    # TODO(release-approvers): limit who can unblock to a Buildkite team.
+    fields:
+      - select: "Move the latest tag on Docker Hub to this version?"
+        key: "dockerhub_move_latest"
+        hint: "Choose No for a patch to an older release. A pre-release (RELEASE_VERSION) never moves latest."
+        required: true
+        options:
+          - label: "Yes"
+            value: "yes"
+          - label: "No"
+            value: "no"
+      - select: "Overwrite vX.Y.Z if it is already on Docker Hub?"
+        key: "dockerhub_overwrite"
+        hint: "Released tags should not change; choose Yes only to replace a broken image."
+        required: true
+        default: "no"
+        options:
+          - label: "No"
+            value: "no"
+          - label: "Yes"
+            value: "yes"
+
   - group: "Publish Nightly Docker Images"
     key: "publish_nightly_images_group"
     steps:
@@ -20,5 +50,11 @@ steps:
         key: "publish_nightly_images"
         agents:
           queue: cpu_64_core
+        env:
+          PUBLISH_DOCKERHUB: "1"
+          DOCKERHUB_REPO: "vllm/vllm-torchtpu"
+          DOCKERHUB_USERNAME: "vllm"
+        secrets:
+          - DOCKERHUB_TOKEN_VLLM_TORCHTPU
         commands:
           - bash .buildkite/scripts/publish_nightly_images.sh
