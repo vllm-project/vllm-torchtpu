@@ -33,7 +33,6 @@ from vllm.models.deepseek_v4 import attention as dsv4_attention
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
-from vllm_torchtpu.distributed.pallas_shapes import get_kernel_mesh
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 
 if TYPE_CHECKING:
@@ -58,6 +57,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer imp
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    get_pallas_op_mesh,
     get_vllm_model_wrapper_context,
 )
 
@@ -195,7 +195,7 @@ class DeepseekTPUAttentionMixin:
 
     def _build_attn_op(self):
         vllm_context = get_vllm_model_wrapper_context()
-        mesh = vllm_context.mesh
+        mesh = get_pallas_op_mesh()
 
         swa_only = self.attention_kind == "swa"
         is_csa = self.attention_kind == "csa"
@@ -328,7 +328,7 @@ class DeepseekTPUAttentionMixin:
         attn_jax_op = pallas.jax_op(
             op_name,
             wrapped_fn,
-            mesh=get_kernel_mesh(mesh),
+            mesh=mesh,
             donate_argnums=(2,),
             input_partition_specs=cast(
                 tuple[tuple[str, ...], ...], input_partition_specs
@@ -362,7 +362,7 @@ class DeepseekTPUAttentionMixin:
             op = pallas.jax_op(
                 op_name,
                 _rope_jax,
-                mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
+                mesh=get_pallas_op_mesh(),
                 input_partition_specs=cast(
                     tuple[tuple[str, ...], ...],
                     (
@@ -558,7 +558,7 @@ class DeepseekTPUAttentionMixin:
             op = pallas.jax_op(
                 op_name,
                 functools.partial(_o_proj_jax, head_dim=head_dim),
-                mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
+                mesh=get_pallas_op_mesh(),
                 input_partition_specs=cast(
                     tuple[tuple[str, ...], ...],
                     (
@@ -826,7 +826,7 @@ class VllmDeepseekV4MLAAttention(
             op = pallas.jax_op(
                 op_name,
                 functools.partial(_qnorm_rope_jax, eps=eps),
-                mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
+                mesh=get_pallas_op_mesh(),
                 input_partition_specs=cast(
                     tuple[tuple[str, ...], ...],
                     (

@@ -7,7 +7,6 @@ from typing import Any, NamedTuple, cast
 import jax
 import torch
 
-from vllm_torchtpu.distributed.pallas_shapes import get_kernel_mesh
 from vllm_torchtpu.kernels.deepseek_v4.csa_cache_layout import ROW_WORDS
 
 ROW_BYTES = ROW_WORDS * 4
@@ -300,13 +299,14 @@ def initialize_cache_ops():
     from torch_tpu._internal import pallas
 
     from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        get_pallas_op_mesh,
         get_vllm_model_wrapper_context,
     )
 
     _read_values_op = pallas.jax_op(
         "pallas::deepseek_v41_cache_read_values",
         read_cache_values,
-        mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
+        mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(
             tuple[tuple[str, ...], ...], (P(), P(), None, None, None, None, None)
         ),
@@ -319,7 +319,7 @@ def initialize_cache_ops():
     _write_op = pallas.jax_op(
         "pallas::deepseek_v41_cache_write",
         _scatter_rows,
-        mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
+        mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(tuple[tuple[str, ...], ...], (P(), P(), P())),
     )
     _write_op.register_fake(lambda cache, slots, values: torch.empty_like(cache))
@@ -349,7 +349,7 @@ def initialize_cache_ops():
         "pallas::deepseek_v41_cache_write_values",
         write_values,
         donate_argnums=(0,),
-        mesh=get_kernel_mesh(mesh),
+        mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(
             tuple[tuple[str, ...], ...], (P(), P(), P(), None, None, None)
         ),

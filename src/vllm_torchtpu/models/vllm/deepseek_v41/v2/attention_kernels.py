@@ -11,7 +11,6 @@ import jax
 import jax.numpy as jnp
 import torch
 
-from vllm_torchtpu.distributed.pallas_shapes import get_kernel_mesh
 from vllm_torchtpu.kernels.deepseek_v41 import (
     index_word_scores,
     indexer,
@@ -1284,6 +1283,7 @@ def initialize_paged_attention():
     from vllm.distributed import get_tp_group
 
     from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        get_pallas_op_mesh,
         get_vllm_model_wrapper_context,
     )
 
@@ -1291,7 +1291,7 @@ def initialize_paged_attention():
     _attention_op = pallas.jax_op(
         "pallas::dsv41v2_paged_bf16_attention",
         paged_attention_jax,
-        mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
+        mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(
             tuple[tuple[str, ...], ...], cast(Any, (P(),) * 6 + (None, P()))
         ),
@@ -1324,7 +1324,7 @@ def initialize_paged_attention():
     _attention_2bank_op = pallas.jax_op(
         "pallas::dsv41v2_paged_bf16_attention_2bank",
         paged_attention_2bank,
-        mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
+        mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(
             tuple[tuple[str, ...], ...], cast(Any, (P(),) * 8 + (None, P()))
         ),
@@ -1339,13 +1339,15 @@ def initialize_paged_attention():
         tp_size = 1
     if tp_size > 1 and tp_group is not None:
         tp_mesh = pallas.get_pallas_mesh(axis_names=("tp",), process_group=tp_group)
+        tp_op_mesh = tp_mesh
     else:
         tp_mesh = mesh
+        tp_op_mesh = get_pallas_op_mesh()
     _attention_tp_size = tp_size
     _gather_bf16_op = pallas.jax_op(
         "pallas::dsv41v2_gather_bf16_kv",
         gather_bf16_kv_jax,
-        mesh=get_kernel_mesh(mesh),
+        mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(
             tuple[tuple[str, ...], ...], cast(Any, (P(),) * 3 + (None,))
         ),
@@ -1390,7 +1392,7 @@ def initialize_paged_attention():
     _gather_fp8_op = pallas.jax_op(
         "pallas::dsv41v2_gather_fp8_kv",
         gather_fp8_bridge,
-        mesh=get_kernel_mesh(tp_mesh),
+        mesh=tp_op_mesh,
         input_partition_specs=cast(
             tuple[tuple[str, ...], ...], cast(Any, (P(),) * 8 + (None,) * 3)
         ),
@@ -1575,7 +1577,7 @@ def initialize_paged_attention():
     _fp8_attention_op = pallas.jax_op(
         "pallas::dsv41v2_sparse_fp8_attention",
         fp8_attention,
-        mesh=get_kernel_mesh(tp_mesh),
+        mesh=tp_op_mesh,
         input_partition_specs=cast(
             tuple[tuple[str, ...], ...],
             cast(Any, (P(),) * 11 + (None,) * 7 + (P(),) * 2),
@@ -1634,7 +1636,7 @@ def initialize_paged_attention():
     _fp8_attention_2bank_op = pallas.jax_op(
         "pallas::dsv41v2_sparse_fp8_attention_2bank",
         fp8_attention_2bank,
-        mesh=get_kernel_mesh(tp_mesh),
+        mesh=tp_op_mesh,
         input_partition_specs=cast(
             tuple[tuple[str, ...], ...],
             cast(Any, (P(),) * 14 + (None,) * 7 + (P(),) * 2),
@@ -1859,7 +1861,7 @@ def initialize_paged_attention():
     _fp8_attention_qo_op = pallas.jax_op(
         "pallas::dsv41v2_sparse_fp8_attention_qo",
         fp8_attention_qo,
-        mesh=get_kernel_mesh(tp_mesh),
+        mesh=tp_op_mesh,
         input_partition_specs=cast(
             tuple[tuple[str, ...], ...],
             cast(Any, (P(),) * 23 + (None,) * 5 + (P(),) * 2),
@@ -1941,7 +1943,7 @@ def initialize_paged_attention():
     _fp8_attention_qo_2bank_op = pallas.jax_op(
         "pallas::dsv41v2_sparse_fp8_attention_qo_2bank",
         fp8_attention_qo_2bank,
-        mesh=get_kernel_mesh(tp_mesh),
+        mesh=tp_op_mesh,
         input_partition_specs=cast(
             tuple[tuple[str, ...], ...],
             cast(Any, (P(),) * 26 + (None,) * 5 + (P(),) * 2),
@@ -3455,14 +3457,14 @@ def initialize_indexer():
     from torch_tpu._internal import pallas
 
     from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-        get_vllm_model_wrapper_context,
+        get_pallas_op_mesh,
     )
 
     _indexer_op = pallas.jax_op(
         "pallas::dsv41v2_exact_indexer",
         update_and_select_jax,
         donate_argnums=(1,),
-        mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
+        mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(
             tuple[tuple[str, ...], ...], (P(),) * 10 + (None,) * 8
         ),
@@ -3501,7 +3503,7 @@ def initialize_indexer():
         "pallas::dsv41v2_exact_indexer_2bank",
         update_and_select_2bank_jax,
         donate_argnums=(1, 2),
-        mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
+        mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(
             tuple[tuple[str, ...], ...], (P(),) * 11 + (None,) * 8
         ),

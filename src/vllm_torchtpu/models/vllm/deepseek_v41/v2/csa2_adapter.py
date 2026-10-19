@@ -9,7 +9,6 @@ import jax
 import jax.numpy as jnp
 import torch
 
-from vllm_torchtpu.distributed.pallas_shapes import get_kernel_mesh
 from vllm_torchtpu.kernels.deepseek_v4.o_projection import wo_a_projection
 from vllm_torchtpu.kernels.deepseek_v41.csa2 import csa2
 from vllm_torchtpu.kernels.deepseek_v41.csa2_cache import (
@@ -230,6 +229,7 @@ def initialize_csa2_ops() -> None:
     from torch_tpu._internal import pallas
 
     from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        get_pallas_op_mesh,
         get_vllm_model_wrapper_context,
     )
 
@@ -304,7 +304,7 @@ def initialize_csa2_ops() -> None:
             # Carry ownership through the Torch boundary as well as the inner
             # JAX kernel; otherwise publication can copy the entire KV pool.
             donate_argnums=donated.get(name, ()),
-            mesh=get_kernel_mesh(mesh),
+            mesh=get_pallas_op_mesh(),
             input_partition_specs=cast(tuple[tuple[str, ...], ...], cast(Any, specs)),
         )
         op.register_fake(fake)

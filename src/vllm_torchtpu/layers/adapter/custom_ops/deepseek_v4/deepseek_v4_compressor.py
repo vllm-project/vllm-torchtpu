@@ -27,7 +27,6 @@ from vllm.models.deepseek_v4 import compressor as dsv4_compressor
 from vllm.models.deepseek_v4.compressor import CompressorStateCache, DeepseekCompressor
 from vllm.v1.kv_cache_interface import KVCacheSpec, SlidingWindowMLASpec
 
-from vllm_torchtpu.distributed.pallas_shapes import get_kernel_mesh
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
     config as compressor_config,
 )
@@ -36,7 +35,7 @@ from vllm_torchtpu.kernels.deepseek_v4.compress_and_store.compressor_v1 import (
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-    get_vllm_model_wrapper_context,
+    get_pallas_op_mesh,
 )
 from vllm_torchtpu.utils import align_to
 
@@ -403,8 +402,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         return op
 
     def _build_compressor_op(self):
-        vllm_context = get_vllm_model_wrapper_context()
-        mesh = vllm_context.mesh
+        mesh = get_pallas_op_mesh()
 
         assert self.head_dim in (512, 128), self.head_dim
         if self._has_rope_cache:
@@ -457,7 +455,7 @@ class VllmDeepseekCompressor(DeepseekCompressor):
         compressor_jax_op = pallas.jax_op(
             op_name,
             wrapped_fn,
-            mesh=get_kernel_mesh(mesh),
+            mesh=mesh,
             donate_argnums=donate_argnums,
             input_partition_specs=cast(
                 tuple[tuple[str, ...], ...], input_partition_specs

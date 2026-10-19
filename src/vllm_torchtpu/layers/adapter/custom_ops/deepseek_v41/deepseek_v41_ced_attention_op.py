@@ -7,8 +7,6 @@ import jax
 import jax.numpy as jnp
 import torch
 
-from vllm_torchtpu.distributed.pallas_shapes import get_kernel_mesh
-
 from .deepseek_v41_cache import gather_cache_values, masked_row_indices
 
 _attention_op = None
@@ -117,6 +115,7 @@ def initialize_ced_attention():
     from torch_tpu._internal import pallas
 
     from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        get_pallas_op_mesh,
         get_vllm_model_wrapper_context,
     )
 
@@ -169,7 +168,7 @@ def initialize_ced_attention():
     _attention_op = pallas.jax_op(
         "pallas::deepseek_v41_ced_attention",
         attend,
-        mesh=get_kernel_mesh(mesh),
+        mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(tuple[tuple[str, ...], ...], specs + (None,) * 5),
     )
     _attention_op.register_fake(lambda q, *args: torch.empty_like(q))

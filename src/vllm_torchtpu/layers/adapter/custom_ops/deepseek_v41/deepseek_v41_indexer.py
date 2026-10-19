@@ -8,7 +8,6 @@ import torch
 from vllm.config import get_current_vllm_config
 from vllm.models.deepseek_v41 import attention as upstream
 
-from vllm_torchtpu.distributed.pallas_shapes import get_kernel_mesh
 from vllm_torchtpu.kernels.deepseek_v41.cache_write import write_index_cache
 from vllm_torchtpu.kernels.deepseek_v41.indexer import (
     QUERY_TILE,
@@ -737,14 +736,14 @@ def initialize_indexer():
     from torch_tpu._internal import pallas
 
     from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-        get_vllm_model_wrapper_context,
+        get_pallas_op_mesh,
     )
 
     _indexer_op = pallas.jax_op(
         "pallas::deepseek_v41_fp8_indexer",
         update_and_select_jax,
         donate_argnums=(1, 2),
-        mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
+        mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(
             tuple[tuple[str, ...], ...], (P(),) * 10 + (None,) * 8
         ),
@@ -782,7 +781,7 @@ def initialize_indexer():
         "pallas::deepseek_v41_write_index_keys",
         write_paged_index_keys,
         donate_argnums=(0, 1),
-        mesh=get_kernel_mesh(get_vllm_model_wrapper_context().mesh),
+        mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(
             tuple[tuple[str, ...], ...], (P(),) * 4 + (None,) * 3
         ),

@@ -9,18 +9,6 @@ placeholders; keep JaxCallable, packed dtype handling and dispatch upstream.
 
 import math
 
-from jax.sharding import Mesh
-
-
-def get_kernel_mesh(mesh: Mesh) -> Mesh | None:
-    """Use rank-local dispatch for a one-device kernel mesh.
-
-    TorchTPU 0.2 validates explicit meshes against the distributed world.
-    Model-local ops use one device per rank; only collective ops pass a mesh
-    to the Torch boundary. The JAX function keeps its own shard_map mesh.
-    """
-    return None if mesh.size == 1 else mesh
-
 
 def _convert_partitioned_shape(shape, mesh, partition_spec, *, to_global):
     if mesh is None or partition_spec is None:
