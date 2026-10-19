@@ -30,7 +30,10 @@ bash tools/typecheck_full.sh
 
 Other package versions report different errors, so `tools/typecheck_full.sh`
 reruns itself inside the nightly [`vllm/vllm-torchtpu:nightly`](https://hub.docker.com/r/vllm/vllm-torchtpu/tags)
-image when started outside a container. It needs Docker, but no TPU.
+image (built from the `--target dev` stage, which includes `--group test`
+dependencies; do not use `:latest`, which is built from `--target prod` without
+test dependencies) when started outside a container. It needs Docker, but no
+TPU.
 
 To check against a locally built image instead (for example, when your PR
 changes dependencies), build the `dev` target locally and point the script at

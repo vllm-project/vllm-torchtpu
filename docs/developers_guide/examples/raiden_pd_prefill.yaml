@@ -54,7 +54,6 @@ spec:
             fi
       containers:
       - name: vllm-tpu
-        # Replace with your vllm-torchtpu container image
         image: vllm/vllm-torchtpu:latest
         imagePullPolicy: Always
         command: ["/bin/bash", "-c"]

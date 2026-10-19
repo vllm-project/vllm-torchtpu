@@ -6,7 +6,15 @@ This folder contains the Dockerfile used to build the main image variants for vl
 
 Official pre-built `vllm-torchtpu` Docker images are publicly available on Docker Hub at [`vllm/vllm-torchtpu`](https://hub.docker.com/r/vllm/vllm-torchtpu/tags). No registry authentication is required.
 
-### Release Images
+| Docker Hub Tag | Dockerfile Stage | Installed Dependencies | Intended Use |
+| :--- | :--- | :--- | :--- |
+| `vllm/vllm-torchtpu:latest`<br>`vllm/vllm-torchtpu:vX.Y.Z` | `--target prod` | Runtime only (`--group vllm` + `vllm-torchtpu`) | Production serving and inference |
+| `vllm/vllm-torchtpu:nightly`<br>`vllm/vllm-torchtpu:nightly-YYYYMMDD-<commit>-<vllm>` | `--target dev` | Runtime + test & benchmark tools (`--group vllm --group test --extra benchmarking`, editable install) | Local development, running `pytest`, type checking, and benchmarking |
+
+> [!NOTE]
+> Release images (`:latest`, `:vX.Y.Z`) are built from `--target prod` and do **not** include test or benchmarking dependencies. For development, testing, or running `tools/typecheck_full.sh`, use `vllm/vllm-torchtpu:nightly` (`--target dev`). The intermediate `--target ci` base stage (which does not install `vllm-torchtpu` itself) is not published to Docker Hub; build it locally with `./docker/build_image.sh --target ci` if needed.
+
+### Release Images (`--target prod`)
 
 Release images are built from the `--target prod` Dockerfile stage and contain a standard runtime installation of `vllm` and `vllm-torchtpu`.
 
@@ -22,9 +30,9 @@ Release images are built from the `--target prod` Dockerfile stage and contain a
   docker pull vllm/vllm-torchtpu:v0.29.0
   ```
 
-### Nightly Images
+### Nightly Images (`--target dev`)
 
-Nightly images are built automatically every night from the `main` branch (`--target dev` stage, which includes the repository source, test dependencies, and benchmarking tools):
+Nightly images are built automatically every night from the `main` branch (`--target dev` stage, which includes the repository source, `--group test` dependencies, and `--extra benchmarking` tools):
 
 * **Latest Nightly Build** (`:nightly`):
 
