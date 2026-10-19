@@ -14,9 +14,7 @@
 
 import dataclasses
 import functools
-import itertools
-from collections.abc import Callable
-from typing import TYPE_CHECKING, Any, Protocol, cast
+from typing import TYPE_CHECKING, Protocol, cast
 
 import jax
 import jax.numpy as jnp
@@ -70,7 +68,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_vllm_model_wrapper_context,
 )
-from vllm_torchtpu.utils import fresh_buffer
+from vllm_torchtpu.utils import fresh_buffer, get_shared_jax_op
 
 _GDN_PCP_AXIS_NAME = "pcp"
 _GDN_TP_AXIS_NAME = "tp"
@@ -339,26 +337,6 @@ def _localize_gdn_mamba_spec_for_pcp(
         shapes=geometry.local_state_shapes(spec.shapes, d_k, d_v),
         page_size_padded=page_size_padded,
     )
-
-
-# GDN custom ops shared by every layer with the same kernel config. A
-# JaxCallable caches its jax.export per instance, so one op per layer re-exported
-# (and re-lowered) the identical kernel for every layer at every compile bucket.
-_shared_gdn_ops: dict[tuple, Any] = {}
-_shared_gdn_op_ids = itertools.count()
-
-
-def _get_shared_gdn_op(kind: str, key: tuple, build: Callable[[str], Any]) -> Any:
-    """Return the ``pallas::<kind>_<n>`` op for ``(kind, key)``, building it once.
-
-    ``kind`` and ``key`` together must cover every value that the op's kernel
-    and fake capture.
-    """
-    op = _shared_gdn_ops.get((kind, key))
-    if op is None:
-        op = build(f"pallas::{kind}_{next(_shared_gdn_op_ids)}")
-        _shared_gdn_ops[(kind, key)] = op
-    return op
 
 
 @QwenGatedDeltaNetAttention.register_oot
@@ -799,7 +777,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             op.register_fake(_fake_gdn)
             return op
 
-        gdn_jax_op = _get_shared_gdn_op(
+        gdn_jax_op = get_shared_jax_op(
             "gdn_attention_pooled_bm" if block_major else "gdn_attention_pooled",
             (
                 id(mesh),
