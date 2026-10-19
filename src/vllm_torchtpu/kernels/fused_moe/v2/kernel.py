@@ -247,7 +247,17 @@ def wire_row_and_scale(
     return down_bf16, jnp.ones((rows, 1), jnp.float32)
 
 
-def _intermediate_rows(acc1, act_scale, inter, *, w1s, act_fn, w1b, requantize=True):
+def _intermediate_rows(
+    acc1,
+    act_scale,
+    inter,
+    *,
+    w1s,
+    act_fn,
+    w1b,
+    requantize=True,
+    logical_intermediate_size=None,
+):
     """acc1's gate and up halves through the activation, as the second
     matmul's left-hand side.
 
@@ -274,9 +284,12 @@ def _intermediate_rows(acc1, act_scale, inter, *, w1s, act_fn, w1b, requantize=T
             scaled = scaled * w1s[:, lo:hi]
         return scaled
 
+    active_inter = (
+        inter if logical_intermediate_size is None else logical_intermediate_size
+    )
     mid_chunks, amax = [], None
-    for c0 in range(0, inter, QCHUNK):
-        c1 = min(c0 + QCHUNK, inter)
+    for c0 in range(0, active_inter, QCHUNK):
+        c1 = min(c0 + QCHUNK, active_inter)
         gate = half(c0, c1)
         up = half(inter + c0, inter + c1)
         # The gate and up biases land on the POST-SCALE halves, before the
@@ -408,7 +421,13 @@ def expert_ffn_blockscale(
 
     acc1 = contract(act_q, w1_block, w1s_blocks, n_blocks1, 2 * inter)
     mid_q, mid_scale = _intermediate_rows(
-        acc1, act_scale, inter, w1s=None, act_fn=act_fn, w1b=w1b
+        acc1,
+        act_scale,
+        inter,
+        w1s=None,
+        act_fn=act_fn,
+        w1b=w1b,
+        logical_intermediate_size=logical_intermediate_size,
     )
     acc2 = contract(mid_q, w2_block, w2s_blocks, n_blocks2, hidden, down=True)
     return acc2, mid_scale
