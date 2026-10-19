@@ -1,0 +1,3790 @@
+#!/usr/bin/env python3
+"""Drop-in `cdk-g3` CLI Client and Evergreen Mode 2 XManager/Forge Dispatcher Daemon.
+
+Bridges `tpu-perf-forge` (`perfkit/cluster.py` and `perfkit/cdk_arm.py`, running
+on
+hosted GCE VMs or locally) with Google3 XManager / Borg TPU
+(`xm_abc.Borg`, `group:msca-dynamic/tpu-perf-team-dynamic-xm`) and Forge TPU
+(`requires-ghostfish` / `requires-ghostfish:4`) over a shared GCS bucket
+(`gs://forge-gcs-<env>/forge/_cdk_g3`) or local filesystem store (`file://...`).
+
+Architecture (Evergreen Mode 2):
+1. Stateless Client CLI (`cdk-g3` on GCE VM):
+   - Implements the exact 8 `cdk` subcommands invoked by `perfkit/cluster.py`
+   and
+     `perfkit/cdk_arm.py`:
+     * `cdk-g3 agent-letter`
+     * `cdk-g3 usage -o json`
+     * `cdk-g3 job create <recipe_name> [KEY=VAL ...] [-t TAGS] [--map-dir
+     SRC:JOB:DEST] ...`
+     * `cdk-g3 job list [-a] [-A] [-t TAG] [-u USER] [-n LIMIT] [-o json]`
+     * `cdk-g3 job desc <job_id>`
+     * `cdk-g3 job log <job_id> [-p POD] [-c CONTAINER]`
+     * `cdk-g3 job delete <job_id>`
+     * `cdk-g3 job sync-outputs <job_id>`
+   - Requires zero Borg network access, zero LOAS credentials, and zero CitC
+   mounts on
+     the GCE VM. All state transitions go through `<storage_uri>/` in GCS.
+
+2. Evergreen Mode 2 Dispatcher Daemon (`cdk-g3 daemon-run` / `cdk-g3
+daemon-poll-once`
+   in Google3 / Cloudtop / Borg):
+   - Polls `<storage_uri>/jobs/*/request.json` for `Pending` jobs.
+   - Atomically claims each job, synthesizes and launches a dynamic XManager
+   Borg TPU
+     job (`--xm_deployment_env=alphabet
+     --xm_resource_alloc=group:msca-dynamic/tpu-perf-team-dynamic-xm
+     --noxm_monitor_on_launch`)
+     or Forge TPU test (`requires-ghostfish`), mirrors live `desc.yaml` and
+     `job.log`
+     back to `<storage_uri>/jobs/<job_id>/`, and honors `cancel.json` (`cdk-g3
+     job delete`).
+"""
+
+from __future__ import annotations
+
+import argparse
+import ast
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+import datetime
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tarfile
+import tempfile
+import threading
+import time
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+import uuid
+import zipfile
+from zoneinfo import ZoneInfo
+
+PT_TZ = ZoneInfo("America/Los_Angeles")
+
+JOB_ID_RE = re.compile(r"\bj-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}\b")
+ACK_RE = re.compile(r"\[ack (\d+)/(\d+): ([0-9A-Fa-f]+)\]")
+XID_RE = re.compile(
+    r"(?:Experiment ID|experiments/|xid|XID)[:=\s/]*(\d{4,})", re.I
+)
+
+DEFAULT_FORGE_TEST_TARGET = (
+    "//experimental/users/jfy/cdk_g3:cdk_g3_forge_executor_test"
+)
+DEFAULT_SHARED_GCS_STORAGE_URI = (
+    "gs://forge-gcs-vm/forge/perfkit-cluster/_cdk_g3"
+)
+
+AGENT_LETTER_TEXT = """\
+Cloud DevKit G3 (cdk-g3) Evergreen Mode 2 Agent Operating Rules:
+1. Tag every job with your AI_AGENT identifier and campaign name [ack 1/4: 7A1F]
+2. Respect cluster and personal concurrency caps before submitting [ack 2/4: 8B2E]
+3. Never delete a job owned by another user; verify with job desc first [ack 3/4: 9C3D]
+4. Use --noxm_monitor_on_launch and group:msca-dynamic/tpu-perf-team-dynamic-xm [ack 4/4: 0D4C]
+"""
+
+EXPECTED_ACK_CODE = "7A1F-8B2E-9C3D-0D4C"
+VALID_BORG_ALLOC_SUBSTR = "msca-dynamic/tpu-perf-team-dynamic-xm"
+
+SUPPORTED_BACKENDS: Tuple[str, ...] = ("auto", "forge", "minibench", "xmanager")
+SUPPORTED_MINIBENCH_MODES: Tuple[str, ...] = (
+    "auto",
+    "mlcr",
+    "local_hermetic",
+    "xm_local",
+    "xm_pathways",
+    "llo_orchestrate",
+)
+MLCR_WARM_POOL_TOPOLOGY_PREFIXES: Tuple[str, ...] = (
+    "vlp",
+    "vlp1t",
+    "vlp2t",
+    "glp",
+    "pf",
+    "vf",
+)
+GHOSTFISH_TOPOLOGY_PREFIXES: Tuple[str, ...] = (
+    "gf",
+    "ghostfish",
+    "tpu7x",
+    "v7x",
+)
+
+TRAP36E_MULTIHOST_REQUIRES_XMANAGER_BORG = (
+    "TRAP36E_MULTIHOST_REQUIRES_XMANAGER_BORG"
+)
+TRAP36F_OUT_OF_CDK_G3_KERNEL_SCOPE = "TRAP36F_OUT_OF_CDK_G3_KERNEL_SCOPE"
+TRAP36G_FORBIDDEN_FRAMEWORK_IMPORT_IN_KERNEL_SCOPE = (
+    "TRAP36G_FORBIDDEN_FRAMEWORK_IMPORT_IN_KERNEL_SCOPE"
+)
+TRAP36H_MLCR_GHOSTFISH_SILENT_PATHWAYS_FALLBACK = (
+    "TRAP36H_MLCR_GHOSTFISH_SILENT_PATHWAYS_FALLBACK"
+)
+TRAP36I_MISSING_TELEMETRY_ARTIFACTS = "TRAP36I_MISSING_TELEMETRY_ARTIFACTS"
+
+TELEMETRY_REQUIRED_CATEGORIES: Tuple[str, ...] = (
+    "xprof",
+    "trace_json",
+    "hlo",
+    "llo",
+)
+
+DESIGNATED_CDK_G3_REL_PREFIXES: Tuple[str, ...] = (
+    "vllm_torchtpu/kernels/",
+    "src/vllm_torchtpu/kernels/",
+    "kernels/",
+)
+DESIGNATED_CDK_G3_EXACT_FILES: Tuple[str, ...] = (
+    "vllm_torchtpu/envs.py",
+    "src/vllm_torchtpu/envs.py",
+    "envs.py",
+    "xm_launch.py",
+)
+OUT_OF_SCOPE_PYTORCH_VLLM_PREFIXES: Tuple[str, ...] = (
+    "vllm_torchtpu/models/",
+    "src/vllm_torchtpu/models/",
+    "models/",
+    "vllm_torchtpu/worker/",
+    "src/vllm_torchtpu/worker/",
+    "worker/",
+    "vllm_torchtpu/attention/",
+    "src/vllm_torchtpu/attention/",
+    "attention/",
+    "vllm_torchtpu/communicator/",
+    "src/vllm_torchtpu/communicator/",
+    "communicator/",
+    "vllm/",
+    "csrc/",
+    "docker/",
+)
+FORBIDDEN_KERNEL_FRAMEWORKS: Tuple[str, ...] = (
+    "torch",
+    "torch_xla",
+    "vllm",
+    "triton",
+)
+STUBBED_INTERNAL_MODULES: Tuple[str, ...] = (
+    "vllm_torchtpu",
+    "vllm_torchtpu.__init__",
+    "vllm_torchtpu.logger",
+)
+
+
+def _now_utc() -> datetime.datetime:
+  return datetime.datetime.now(datetime.timezone.utc)
+
+
+def _now_pt_iso() -> str:
+  return datetime.datetime.now(PT_TZ).isoformat()
+
+
+def _stamp_utc(dt: Optional[datetime.datetime] = None) -> str:
+  d = dt or _now_utc()
+  return d.astimezone(datetime.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _new_job_id() -> str:
+  """Generate a 4-group job ID matching `r'\\bj-[0-9a-f]{8}(?:-[0-9a-f]{4}){3}\\b'`."""
+  raw = uuid.uuid4().hex
+  return f"j-{raw[0:8]}-{raw[8:12]}-{raw[12:16]}-{raw[16:20]}"
+
+
+def _user_spellings(user: str) -> set[str]:
+  bare = (user or "").split("_")[0].strip()
+  if not bare:
+    return {user} - {""}
+  return {user, bare, f"{bare}_google_com"}
+
+
+@contextmanager
+def _file_lock(lock_path: Path):
+  lock_path.parent.mkdir(parents=True, exist_ok=True)
+  fd = os.open(str(lock_path), os.O_CREAT | os.O_RDWR, 0o644)
+  try:
+    fcntl.flock(fd, fcntl.LOCK_EX)
+    yield
+  finally:
+    try:
+      fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+      os.close(fd)
+
+
+def _atomic_write_bytes_unlocked(path: Path, data: bytes) -> None:
+  path.parent.mkdir(parents=True, exist_ok=True)
+  if path.is_file() and path.suffix == ".json":
+    bak_path = path.with_suffix(path.suffix + ".bak")
+    try:
+      shutil.copyfile(path, bak_path)
+    except OSError:
+      pass
+  fd, tmp_name = tempfile.mkstemp(
+      prefix=f".{path.name}.",
+      suffix=".tmp",
+      dir=str(path.parent),
+  )
+  try:
+    with os.fdopen(fd, "wb") as fh:
+      fh.write(data)
+      fh.flush()
+      os.fsync(fh.fileno())
+    os.replace(tmp_name, str(path))
+  finally:
+    if os.path.exists(tmp_name):
+      try:
+        os.unlink(tmp_name)
+      except OSError:
+        pass
+
+
+def _atomic_write_bytes(path: Path, data: bytes) -> None:
+  path.parent.mkdir(parents=True, exist_ok=True)
+  lock_path = path.with_suffix(path.suffix + ".lock")
+  with _file_lock(lock_path):
+    _atomic_write_bytes_unlocked(path, data)
+
+
+def _atomic_write_json(path: Path, payload: Any) -> None:
+  text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+  _atomic_write_bytes(path, text.encode("utf-8"))
+
+
+def _read_json_with_bak_recovery(path: Path) -> Any:
+  lock_path = path.with_suffix(path.suffix + ".lock")
+  bak_path = path.with_suffix(path.suffix + ".bak")
+  with _file_lock(lock_path):
+    try:
+      return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+      if bak_path.is_file():
+        recovered = json.loads(bak_path.read_text(encoding="utf-8"))
+        _atomic_write_bytes_unlocked(
+            path,
+            (json.dumps(recovered, indent=2, sort_keys=True) + "\n").encode(
+                "utf-8"
+            ),
+        )
+        return recovered
+      raise exc
+
+
+class StorageBackend:
+  """Unified storage abstraction over `gs://...` and local filesystem paths."""
+
+  def __init__(self, uri: str):
+    raw = (uri or "").strip().rstrip("/")
+    if not raw:
+      raise ValueError(
+          "Storage URI is empty. Set CDK_G3_STORAGE_URI,"
+          " PERFKIT_CLUSTER_BUCKET, or AMPLIO_GCS_ROOT."
+      )
+    self.uri = raw
+    self.is_gcs = raw.startswith("gs://")
+    if not self.is_gcs:
+      local_str = raw[len("file://") :] if raw.startswith("file://") else raw
+      self.root = Path(local_str).expanduser().resolve()
+      self.root.mkdir(parents=True, exist_ok=True)
+    else:
+      self.root = Path("/nonexistent")
+
+  def _local_path(self, rel_path: str) -> Path:
+    rel = rel_path.lstrip("/")
+    return self.root / rel
+
+  def _gcs_uri(self, rel_path: str) -> str:
+    rel = rel_path.lstrip("/")
+    return f"{self.uri}/{rel}" if rel else self.uri
+
+  def exists(self, rel_path: str) -> bool:
+    if not self.is_gcs:
+      return self._local_path(rel_path).exists()
+    r = subprocess.run(
+        ["gsutil", "-q", "stat", self._gcs_uri(rel_path)],
+        capture_output=True,
+        timeout=120,
+        check=False,
+    )
+    return r.returncode == 0
+
+  def read_bytes(self, rel_path: str) -> bytes:
+    if not self.is_gcs:
+      p = self._local_path(rel_path)
+      if not p.is_file():
+        raise FileNotFoundError(f"Object not found: {p}")
+      return p.read_bytes()
+    uri = self._gcs_uri(rel_path)
+    r = subprocess.run(
+        ["gsutil", "cat", uri],
+        capture_output=True,
+        timeout=180,
+        check=False,
+    )
+    if r.returncode != 0:
+      raise FileNotFoundError(
+          f"gsutil cat {uri} failed ({r.returncode}): "
+          f"{r.stderr.decode(errors='replace').strip()}"
+      )
+    return r.stdout
+
+  def read_json(self, rel_path: str) -> Any:
+    if not self.is_gcs:
+      return _read_json_with_bak_recovery(self._local_path(rel_path))
+    return json.loads(self.read_bytes(rel_path).decode("utf-8"))
+
+  def write_bytes(
+      self, rel_path: str, data: bytes, *, if_not_exists: bool = False
+  ) -> bool:
+    if not self.is_gcs:
+      p = self._local_path(rel_path)
+      if if_not_exists:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        lock_path = p.with_suffix(p.suffix + ".lock")
+        with _file_lock(lock_path):
+          if p.exists():
+            return False
+          _atomic_write_bytes_unlocked(p, data)
+          return True
+      _atomic_write_bytes(p, data)
+      return True
+
+    uri = self._gcs_uri(rel_path)
+    with tempfile.TemporaryDirectory(prefix="cdk-g3-gs-") as tmp:
+      f = Path(tmp) / Path(rel_path).name
+      f.write_bytes(data)
+      cmd = ["gsutil", "-q", "cp"]
+      if if_not_exists:
+        cmd.append("-n")
+      cmd.extend([str(f), uri])
+      r = subprocess.run(cmd, capture_output=True, timeout=300, check=False)
+      if r.returncode != 0:
+        raise RuntimeError(
+            f"gsutil cp to {uri} failed ({r.returncode}): "
+            f"{r.stderr.decode(errors='replace').strip()}"
+        )
+      if if_not_exists and b"Skipping existing" in (r.stderr + r.stdout):
+        return False
+      return True
+
+  def write_json(
+      self, rel_path: str, payload: Any, *, if_not_exists: bool = False
+  ) -> bool:
+    text = json.dumps(payload, indent=2, sort_keys=True) + "\n"
+    return self.write_bytes(
+        rel_path, text.encode("utf-8"), if_not_exists=if_not_exists
+    )
+
+  def list_rel_paths(self, prefix: str) -> List[str]:
+    clean_prefix = prefix.strip("/")
+    if not self.is_gcs:
+      base = self._local_path(clean_prefix)
+      if not base.exists():
+        return []
+      if base.is_file():
+        return [clean_prefix]
+      return sorted(
+          str(p.relative_to(self.root))
+          for p in base.rglob("*")
+          if (
+              p.is_file()
+              and not p.name.endswith(".lock")
+              and not p.name.endswith(".tmp")
+              and not p.name.endswith(".bak")
+          )
+      )
+    uri_prefix = f"{self._gcs_uri(clean_prefix).rstrip('/')}/**"
+    r = subprocess.run(
+        ["gsutil", "ls", uri_prefix],
+        capture_output=True,
+        timeout=180,
+        check=False,
+    )
+    if r.returncode != 0:
+      if b"matched no objects" in (
+          r.stderr + r.stdout
+      ) or b"One or more URLs matched no objects" in (r.stderr + r.stdout):
+        return []
+      raise RuntimeError(
+          f"gsutil ls {uri_prefix} failed ({r.returncode}): "
+          f"{r.stderr.decode(errors='replace').strip()}"
+      )
+    out = []
+    base_uri = self.uri.rstrip("/") + "/"
+    for line in r.stdout.decode(errors="replace").splitlines():
+      line = line.strip()
+      if line.startswith(base_uri) and not line.endswith("/"):
+        out.append(line[len(base_uri) :])
+    return sorted(out)
+
+
+def resolve_storage_uri(
+    explicit_uri: Optional[str] = None,
+    env: Optional[Dict[str, str]] = None,
+    *,
+    use_shared_bucket: bool = False,
+) -> str:
+  env_map = os.environ if env is None else env
+  if explicit_uri and explicit_uri.strip():
+    return explicit_uri.strip().rstrip("/")
+  for key in ("CDK_G3_STORAGE_URI", "PERFKIT_CLUSTER_BUCKET"):
+    val = env_map.get(key, "").strip().rstrip("/")
+    if val:
+      if key == "PERFKIT_CLUSTER_BUCKET":
+        return f"{val}/_cdk_g3"
+      return val
+  gcs_root = env_map.get("AMPLIO_GCS_ROOT", "").strip().rstrip("/")
+  if gcs_root:
+    return f"{gcs_root}/perfkit-cluster/_cdk_g3"
+  if use_shared_bucket or env_map.get(
+      "CDK_G3_USE_SHARED_BUCKET", ""
+  ).strip().lower() in ("1", "true", "yes"):
+    return DEFAULT_SHARED_GCS_STORAGE_URI
+  default_local = Path(env_map.get("TMPDIR", "/tmp")) / "cdk_g3_default_store"
+  return str(default_local)
+
+
+def parse_values_yml(yaml_text: str) -> Dict[str, Any]:
+  """Extract job metadata, env vars, topology, image, and POD_SCRIPT from values.yml."""
+  name_m = re.search(r"^\s*name:\s*([^\s#]+)", yaml_text, re.M)
+  job_name = (
+      json.loads(name_m.group(1))
+      if (name_m and name_m.group(1).startswith('"'))
+      else (name_m.group(1) if name_m else "job")
+  )
+
+  rep_m = re.search(r"replicatedJobs:\s*\n\s*-\s*name:\s*([^\s#]+)", yaml_text)
+  replicated_job = "scorer"
+  if rep_m:
+    raw_rep = rep_m.group(1).strip()
+    replicated_job = json.loads(raw_rep) if raw_rep.startswith('"') else raw_rep
+
+  accel_m = re.search(
+      r"cloud\.google\.com/gke-tpu-accelerator:\s*([^\s#]+)", yaml_text
+  )
+  accelerator = "tpu7x"
+  if accel_m:
+    raw_acc = accel_m.group(1).strip()
+    accelerator = json.loads(raw_acc) if raw_acc.startswith('"') else raw_acc
+
+  topo_m = re.search(
+      r"cloud\.google\.com/gke-tpu-topology:\s*([^\s#]+)", yaml_text
+  )
+  topology = "2x2x1"
+  if topo_m:
+    raw_topo = topo_m.group(1).strip()
+    topology = json.loads(raw_topo) if raw_topo.startswith('"') else raw_topo
+
+  img_m = re.search(r"^\s*image:\s*([^\s#]+)", yaml_text, re.M)
+  image = ""
+  if img_m:
+    raw_img = img_m.group(1).strip()
+    image = json.loads(raw_img) if raw_img.startswith('"') else raw_img
+
+  env_vars: Dict[str, str] = {}
+  for m in re.finditer(
+      r"^\s*-\s*name:\s*([A-Za-z_][A-Za-z0-9_]*)\s*\n\s*value:\s*(.+)$",
+      yaml_text,
+      re.M,
+  ):
+    k = m.group(1).strip()
+    v_raw = m.group(2).strip()
+    if v_raw.startswith('"') and v_raw.endswith('"'):
+      try:
+        v = str(json.loads(v_raw))
+      except ValueError:
+        v = v_raw[1:-1]
+    elif v_raw.startswith("'") and v_raw.endswith("'"):
+      v = v_raw[1:-1]
+    else:
+      v = v_raw
+    env_vars[k] = v
+
+  script_lines: List[str] = []
+  args_m = re.search(r"args:\s*\n\s*-\s*\|\s*\n((?:[ \t]+.*\n?)*)", yaml_text)
+  if args_m:
+    block = args_m.group(1)
+    raw_lines = block.splitlines()
+    non_empty_indents = [
+        len(line) - len(line.lstrip(" ")) for line in raw_lines if line.strip()
+    ]
+    min_indent = min(non_empty_indents) if non_empty_indents else 0
+    script_lines = [
+        line[min_indent:] if len(line) >= min_indent else line.lstrip()
+        for line in raw_lines
+    ]
+  pod_script = "\n".join(script_lines).strip()
+
+  return {
+      "job_name": job_name,
+      "replicated_job": replicated_job,
+      "accelerator": accelerator,
+      "topology": topology,
+      "image": image,
+      "env": env_vars,
+      "pod_script": pod_script,
+  }
+
+
+def format_desc_yaml(meta: Dict[str, Any]) -> str:
+  """Render YAML text compatible with `perfkit.cluster.parse_desc()`."""
+  job_id = meta["id"]
+  user = meta.get("user") or "jfy"
+  recipe = meta.get("recipe") or "job"
+  state = meta.get("state") or "Pending"
+  job_status = meta.get("job_status") or "Pending"
+  rep_job = meta.get("replicated_job") or "scorer"
+  pods = meta.get("pods") or []
+  xid = str(meta.get("xid") or "").strip()
+
+  lines = [
+      f"id: {job_id}",
+      f"user: {user}",
+      f"recipe: {recipe}",
+      f"state: {state}",
+      f"job_status: {job_status}",
+  ]
+  if xid:
+    lines.append(f"xid: {xid}")
+  lines.extend([
+      "jobs:",
+      f"  - name: {job_id}-{rep_job}-0",
+  ])
+  if not pods:
+    lines.append("    pods: []")
+  else:
+    lines.append("    pods:")
+    for p in pods:
+      p_name = p["name"]
+      p_status = p.get("status") or job_status
+      p_created = p.get("created") or meta.get("create_time") or _stamp_utc()
+      lines.extend([
+          f"      - name: {p_name}",
+          f"        status: {p_status}",
+          "        k8s_events:",
+          "          - reason: Created",
+          f"            message: 'Created pod: {p_name}'",
+          f"            first_seen: '{p_created}'",
+      ])
+  return "\n".join(lines) + "\n"
+
+
+def build_cluster_usage_nodes(
+    store: StorageBackend,
+    *,
+    singlehost_slots: int = 8,
+    multihost_slots: int = 4,
+    accelerator: str = "tpu7x",
+) -> List[Dict[str, Any]]:
+  """Construct `cdk usage -o json` node list reflecting active jobs in the store."""
+  active_single: List[Dict[str, str]] = []
+  active_multi: List[Dict[str, str]] = []
+  for rel in store.list_rel_paths("jobs"):
+    if not rel.endswith("/meta.json"):
+      continue
+    try:
+      meta = store.read_json(rel)
+    except Exception:
+      continue
+    if meta.get("job_status") in ("Running", "Pending") and meta.get(
+        "active", True
+    ):
+      entry = {
+          "user": str(meta.get("user") or "jfy"),
+          "job_id": str(meta.get("id") or ""),
+      }
+      if str(meta.get("topology") or "2x2x1") == "2x2x1":
+        active_single.append(entry)
+      else:
+        active_multi.append(entry)
+
+  nodes: List[Dict[str, Any]] = []
+  for i in range(max(1, singlehost_slots)):
+    pods = [active_single[i]] if i < len(active_single) else []
+    nodes.append({
+        "name": f"borg-{accelerator}-singlehost-{i}",
+        "node_pool": f"{accelerator}-singlehost-pool",
+        "topology": "cloud.google.com/gke-tpu-topology=2x2x1",
+        "status": "Ready",
+        "pods": pods,
+    })
+  for i in range(max(1, multihost_slots)):
+    pods = [active_multi[i]] if i < len(active_multi) else []
+    nodes.append({
+        "name": f"borg-{accelerator}-multihost-{i}",
+        "node_pool": f"{accelerator}-multihost-pool",
+        "topology": "cloud.google.com/gke-tpu-topology=2x2x2",
+        "status": "Ready",
+        "pods": pods,
+    })
+  return nodes
+
+
+def parse_topology_prefix_and_shape(
+    topology: str, accelerator: str = "tpu7x"
+) -> Tuple[str, str, str]:
+  """Parse a topology string into `(chip_prefix, geometry_shape, canonical_tpu_topology)`."""
+  raw = (topology or "").strip()
+  acc = (accelerator or "tpu7x").strip().lower()
+  if not raw:
+    raw = "2x2x1"
+  low = raw.lower()
+  if low == "v7x_1chip":
+    return "gf", "1x1x1", "gf=1x1x1"
+  if low == "v7x_1host":
+    return "gf", "2x2x1", "gf=2x2x1"
+  if low == "v7x_2host":
+    return "gf", "2x2x2", "gf=2x2x2"
+
+  for sep in ("=", ":"):
+    if sep in raw:
+      pref_raw, shape_raw = raw.split(sep, 1)
+      pref = pref_raw.strip().lower()
+      shape = shape_raw.strip()
+      if pref in GHOSTFISH_TOPOLOGY_PREFIXES:
+        return "gf", shape, f"gf={shape}"
+      return pref, shape, f"{pref}={shape}"
+
+  if acc in GHOSTFISH_TOPOLOGY_PREFIXES or not acc:
+    return "gf", raw, f"gf={raw}"
+  return acc, raw, f"{acc}={raw}"
+
+
+def is_ghostfish_topology(topology: str, accelerator: str = "tpu7x") -> bool:
+  """Return True if `topology` targets Ghostfish (`gf` / `ghostfish` / `tpu7x`)."""
+  pref, _, _ = parse_topology_prefix_and_shape(topology, accelerator)
+  return pref in GHOSTFISH_TOPOLOGY_PREFIXES
+
+
+def is_multihost_topology(topology: str, accelerator: str = "tpu7x") -> bool:
+  """Return True if `topology` requires multi-host (> 4 chips on Ghostfish, e.g., `2x2x2`)."""
+  pref, shape, _ = parse_topology_prefix_and_shape(topology, accelerator)
+  if shape == "2x2x2" or (topology or "").strip().lower() == "v7x_2host":
+    return True
+  dims = [int(d) for d in shape.split("x") if d.isdigit()]
+  if dims and pref == "gf":
+    prod = 1
+    for d in dims:
+      prod *= d
+    return prod > 4
+  return False
+
+
+def validate_minibench_command_and_spec(
+    command: Optional[Sequence[str]] = None,
+    *,
+    topology: str = "gf=1x1x1",
+    tpu_topology: Optional[str] = None,
+    accelerator: str = "tpu7x",
+    minibench_mode: str = "auto",
+    reference_code: Optional[str] = None,
+    custom_code: Optional[str] = None,
+    input_generation_code: Optional[str] = None,
+    kernel_item: str = "",
+    kernelbench_profile_llo: bool = True,
+    enable_percale: bool = True,
+    generate_runtime_llo_report: bool = True,
+    borg_alloc: str = f"group:{VALID_BORG_ALLOC_SUBSTR}",
+    spec: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+  """Validate a Minibench backend job spec/command and enforce `TRAP36H`.
+
+  Per
+  `//depot/google3/learning/performance/agents/tools/minibench/g3doc/usage_guide.md:518-532`,
+  MLCR (`mlcr_configs.py:24-64`) only has warm pools for `vlp`, `vlp1t`,
+  `vlp2t`,
+  `glp`, `pf`, and `vf`—it has NO Ghostfish (`gf` / `tpu7x`) slices, and passing
+  `--mode=mlcr` with `gf` silently falls back to spinning up a slow self-owned
+  Pathways cluster via `xm_pathways`.
+  """
+  if tpu_topology:
+    topology = tpu_topology
+  reference_code = reference_code or ""
+  custom_code = custom_code or ""
+  input_generation_code = input_generation_code or ""
+  if spec is not None:
+    topology = str(spec.get("tpu_topology") or spec.get("topology") or topology)
+    accelerator = str(spec.get("accelerator") or accelerator)
+    minibench_mode = str(
+        spec.get("minibench_mode") or spec.get("mode") or minibench_mode
+    )
+    reference_code = str(spec.get("reference_code") or reference_code)
+    custom_code = str(spec.get("custom_code") or custom_code)
+    input_generation_code = str(
+        spec.get("input_generation_code") or input_generation_code
+    )
+    kernel_item = str(spec.get("kernel_item") or kernel_item)
+    if "kernelbench_profile_llo" in spec:
+      kernelbench_profile_llo = bool(spec["kernelbench_profile_llo"])
+    if "enable_percale" in spec:
+      enable_percale = bool(spec["enable_percale"])
+    if "generate_runtime_llo_report" in spec:
+      generate_runtime_llo_report = bool(spec["generate_runtime_llo_report"])
+    borg_alloc = str(spec.get("borg_alloc") or borg_alloc)
+    if command is None and spec.get("command"):
+      command = list(spec["command"])
+
+  cmd_tokens = list(command or ())
+  for tok in cmd_tokens:
+    if tok.startswith("--tpu_topology="):
+      topology = tok.split("=", 1)[1].strip()
+    elif tok.startswith("--mode="):
+      cmd_mode = tok.split("=", 1)[1].strip()
+      if minibench_mode == "auto" and cmd_mode in ("mlcr", "mlcr_hermetic"):
+        minibench_mode = "mlcr"
+
+  mode_clean = (minibench_mode or "auto").strip().lower()
+  if mode_clean == "mlcr_hermetic":
+    mode_clean = "mlcr"
+  if mode_clean not in SUPPORTED_MINIBENCH_MODES:
+    raise ValueError(
+        f"Unsupported minibench_mode={minibench_mode!r}; must be one of"
+        f" {SUPPORTED_MINIBENCH_MODES}."
+    )
+
+  prefix, shape, canonical_topology = parse_topology_prefix_and_shape(
+      topology, accelerator
+  )
+  is_gf = prefix in GHOSTFISH_TOPOLOGY_PREFIXES
+
+  if mode_clean == "mlcr":
+    if is_gf:
+      raise ValueError(
+          f"[{TRAP36H_MLCR_GHOSTFISH_SILENT_PATHWAYS_FALLBACK}] Explicit"
+          " '--mode=mlcr' / minibench_mode='mlcr' is forbidden on Ghostfish"
+          f" topology '{canonical_topology}' (input='{topology}'). Per"
+          " //depot/google3/learning/performance/agents/tools/minibench/g3doc/usage_guide.md:518-532"
+          " and mlcr_configs.py:24-64, MLCR warm pools only support"
+          f" {MLCR_WARM_POOL_TOPOLOGY_PREFIXES} and have NO Ghostfish ('gf')"
+          " slices; passing '--mode=mlcr' with 'gf' silently falls back to"
+          " spinning up a slow self-owned Pathways cluster via xm_pathways."
+          " Use '--minibench-mode=auto', '--minibench-mode=local_hermetic'"
+          " (single-host Forge Ghostfish), or '--minibench-mode=xm_local' /"
+          " '--minibench-mode=xm_pathways' (Borg Ghostfish in"
+          f" group:{VALID_BORG_ALLOC_SUBSTR}) instead."
+      )
+    if prefix not in MLCR_WARM_POOL_TOPOLOGY_PREFIXES:
+      raise ValueError(
+          f"[{TRAP36H_MLCR_GHOSTFISH_SILENT_PATHWAYS_FALLBACK}] Topology prefix"
+          f" '{prefix}' (from '{topology}') is not in"
+          " MLCR_WARM_POOL_TOPOLOGY_PREFIXES"
+          f" {MLCR_WARM_POOL_TOPOLOGY_PREFIXES}; '--mode=mlcr' would silently"
+          " degrade to a self-owned Pathways cluster."
+      )
+
+  if mode_clean == "auto":
+    if prefix in MLCR_WARM_POOL_TOPOLOGY_PREFIXES:
+      effective_mode = "mlcr"
+      minibench_flag_mode = "mlcr"
+      execution_target = "mlcr_warm_pool"
+      reason = (
+          f"Auto-routed topology '{canonical_topology}' (prefix '{prefix}' in "
+          "MLCR_WARM_POOL_TOPOLOGY_PREFIXES) to '--mode=mlcr' warm pool."
+      )
+    elif is_gf:
+      if is_multihost_topology(canonical_topology, accelerator):
+        effective_mode = "xm_pathways"
+        minibench_flag_mode = "pathways"
+        execution_target = "xmanager_borg_minibench"
+        reason = (
+            f"Auto-routed multi-host Ghostfish '{canonical_topology}' to"
+            " XManager Borg 'launch_minibench_xm --mode=pathways' (avoiding"
+            " silent MLCR fallback)."
+        )
+      else:
+        effective_mode = "local_hermetic"
+        minibench_flag_mode = "local_hermetic"
+        execution_target = "forge_tpu_minibench"
+        reason = (
+            f"Auto-routed single-host Ghostfish '{canonical_topology}' to Forge"
+            " hermetic '--mode=local_hermetic' (avoiding silent MLCR fallback"
+            " per TRAP36H)."
+        )
+    else:
+      raise ValueError(
+          f"[{TRAP36H_MLCR_GHOSTFISH_SILENT_PATHWAYS_FALLBACK}] Unrecognized"
+          f" topology '{topology}' (prefix='{prefix}') for minibench auto"
+          f" routing; expected one of {MLCR_WARM_POOL_TOPOLOGY_PREFIXES} or"
+          " Ghostfish ('gf')."
+      )
+  elif mode_clean == "mlcr":
+    effective_mode = "mlcr"
+    minibench_flag_mode = "mlcr"
+    execution_target = "mlcr_warm_pool"
+    reason = (
+        "Validated explicit '--mode=mlcr' on supported warm-pool topology"
+        f" '{canonical_topology}'."
+    )
+  elif mode_clean == "local_hermetic":
+    if is_gf and is_multihost_topology(canonical_topology, accelerator):
+      raise ValueError(
+          f"[{TRAP36E_MULTIHOST_REQUIRES_XMANAGER_BORG}] Multi-host Ghostfish"
+          f" topology '{canonical_topology}' cannot run in single-host Forge"
+          " 'local_hermetic' mode; use '--minibench-mode=xm_pathways' or"
+          " '--minibench-mode=xm_local'."
+      )
+    effective_mode = "local_hermetic"
+    minibench_flag_mode = "local_hermetic"
+    execution_target = "forge_tpu_minibench"
+    reason = (
+        f"Validated explicit '--mode=local_hermetic' on '{canonical_topology}'."
+    )
+  elif mode_clean in ("xm_local", "xm_pathways"):
+    effective_mode = mode_clean
+    minibench_flag_mode = "local" if mode_clean == "xm_local" else "pathways"
+    execution_target = "xmanager_borg_minibench"
+    reason = (
+        f"Validated explicit '{mode_clean}' ('launch_minibench_xm"
+        f" --mode={minibench_flag_mode}') on '{canonical_topology}'."
+    )
+  else:  # llo_orchestrate
+    effective_mode = "llo_orchestrate"
+    minibench_flag_mode = "llo_orchestrate"
+    execution_target = "minibench_cli_llo_orchestrate"
+    reason = (
+        "Validated 'minibench_cli llo_orchestrate' comparative LLO"
+        " orchestration mode."
+    )
+
+  if (
+      effective_mode in ("xm_local", "xm_pathways")
+      and VALID_BORG_ALLOC_SUBSTR not in borg_alloc
+  ):
+    raise ValueError(
+        "[TRAP36_INVALID_XM_BORG_ALLOC_OR_PLATFORM] Invalid Borg alloc"
+        f" {borg_alloc!r}; must use {VALID_BORG_ALLOC_SUBSTR!r}."
+    )
+
+  return {
+      "status": "VALID",
+      "backend": "minibench",
+      "requested_mode": mode_clean,
+      "effective_mode": effective_mode,
+      "resolved_mode": effective_mode,
+      "minibench_flag_mode": minibench_flag_mode,
+      "execution_target": execution_target,
+      "topology_prefix": prefix,
+      "topology_shape": shape,
+      "canonical_topology": canonical_topology,
+      "is_ghostfish": is_gf,
+      "reference_code": reference_code,
+      "custom_code": custom_code,
+      "input_generation_code": input_generation_code,
+      "kernel_item": kernel_item,
+      "kernelbench_profile_llo": bool(kernelbench_profile_llo),
+      "enable_percale": bool(enable_percale),
+      "generate_runtime_llo_report": bool(generate_runtime_llo_report),
+      "borg_alloc": borg_alloc,
+      "reason": reason,
+  }
+
+
+def build_minibench_command(
+    *,
+    topology: str = "gf=1x1x1",
+    tpu_topology: Optional[str] = None,
+    accelerator: str = "tpu7x",
+    minibench_mode: str = "auto",
+    reference_code: Optional[str] = None,
+    custom_code: Optional[str] = None,
+    input_generation_code: Optional[str] = None,
+    kernel_item: str = "",
+    output_dir: str = "/tmp/minibench_out",
+    temp_dir: str = "/tmp/minibench_exec",
+    kernelbench_profile_llo: bool = True,
+    enable_percale: bool = True,
+    generate_runtime_llo_report: bool = True,
+    borg_alloc: str = f"group:{VALID_BORG_ALLOC_SUBSTR}",
+    baseline_trace: str = "/tmp/baseline.pb",
+    treatment_trace: str = "/tmp/treatment.pb",
+    baseline_db: str = "/tmp/baseline.db",
+    treatment_db: str = "/tmp/treatment.db",
+    min_speedup: float = 15.0,
+    output_md: str = "",
+    output_json: str = "",
+    extra_dump_flags: Sequence[str] = (),
+    allow_tiny_shape_waiver: bool = False,
+) -> Dict[str, Any]:
+  """Validate and construct the Google3 Minibench / MLCR / Forge / XM command line."""
+  del allow_tiny_shape_waiver
+  effective_topo = tpu_topology or topology
+  validated = validate_minibench_command_and_spec(
+      topology=effective_topo,
+      accelerator=accelerator,
+      minibench_mode=minibench_mode,
+      reference_code=reference_code or "",
+      custom_code=custom_code or "",
+      input_generation_code=input_generation_code or "",
+      kernel_item=kernel_item,
+      kernelbench_profile_llo=kernelbench_profile_llo,
+      enable_percale=enable_percale,
+      generate_runtime_llo_report=generate_runtime_llo_report,
+      borg_alloc=borg_alloc,
+  )
+  eff_mode = validated["effective_mode"]
+  flag_mode = validated["minibench_flag_mode"]
+  canon_topo = validated["canonical_topology"]
+
+  code_flags: List[str] = []
+  if kernel_item:
+    code_flags.append(f"--kernel_item={kernel_item}")
+  if reference_code:
+    code_flags.append(f"--reference_code={reference_code}")
+  if custom_code:
+    code_flags.append(f"--custom_code={custom_code}")
+  if input_generation_code:
+    code_flags.append(f"--input_generation_code={input_generation_code}")
+  if kernelbench_profile_llo:
+    code_flags.append("--kernelbench_profile_llo")
+  if enable_percale:
+    code_flags.append("--enable_percale")
+  if generate_runtime_llo_report:
+    code_flags.append("--generate_runtime_llo_report")
+  for df in extra_dump_flags:
+    if df:
+      code_flags.append(df)
+
+  forge_test_command: List[str] = []
+  if eff_mode == "llo_orchestrate":
+    md_out = output_md or str(Path(output_dir) / "llo_report.md")
+    json_out = output_json or str(Path(output_dir) / "llo_telemetry.json")
+    cmd = [
+        "/google/bin/releases/arca9-local-blaze-cli/blaze-for-agents",
+        "run",
+        "-c",
+        "opt",
+        "//learning/performance/agents/tools/minibench/llo_analysis:llo_orchestrate",
+        "--",
+        f"--baseline_trace={baseline_trace}",
+        f"--treatment_trace={treatment_trace}",
+        f"--baseline_db={baseline_db}",
+        f"--treatment_db={treatment_db}",
+        f"--min_speedup={min_speedup}",
+        f"--output_md={md_out}",
+        f"--output_json={json_out}",
+        *code_flags,
+    ]
+  elif eff_mode in ("xm_local", "xm_pathways"):
+    cmd = [
+        "/google/bin/releases/xmanager/cli/xmanager",
+        "launch",
+        "--xm_build_from_citc",
+        "//learning/performance/agents/tools/minibench:launch_minibench_xm",
+        "--",
+        f"--mode={flag_mode}",
+        f"--tpu_topology={canon_topo}",
+        "--pathways_mpm_version=live",
+        f"--xm_resource_alloc={borg_alloc}",
+        "--noxm_monitor_on_launch",
+        "--xm_skip_launch_confirmation",
+        f"--output_dir={output_dir}",
+        *code_flags,
+    ]
+  elif eff_mode == "local_hermetic":
+    target_suffix = (
+        "2x2x1"
+        if validated["topology_shape"] in ("2x2x1", "1x2x1")
+        else "1x1x1"
+    )
+    hermetic_target = f"//learning/performance/agents/tools/minibench:run_minibench_gf_{target_suffix}"
+    cmd = [
+        "/google/bin/releases/arca9-local-blaze-cli/blaze-for-agents",
+        "test",
+        "-c",
+        "opt",
+        "--test_strategy=remote",
+        "--nocache_test_results",
+        "--test_output=errors",
+        hermetic_target,
+        f"--test_arg=--mode={flag_mode}",
+        f"--test_arg=--tpu_topology={canon_topo}",
+        f"--test_arg=--output_dir={output_dir}",
+        "--mode=local_hermetic",
+        f"--tpu_topology={canon_topo}",
+        *code_flags,
+    ]
+    forge_test_command = list(cmd)
+  else:  # "mlcr"
+    cmd = [
+        "/google/bin/releases/arca9-local-blaze-cli/blaze-for-agents",
+        "run",
+        "-c",
+        "opt",
+        "//learning/performance/agents/tools/minibench:minibench",
+        "--",
+        f"--mode={flag_mode}",
+        f"--tpu_topology={canon_topo}",
+        f"--output_dir={output_dir}",
+        f"--temp_dir={temp_dir}",
+        *code_flags,
+    ]
+
+  out = dict(validated)
+  out["command"] = cmd
+  out["forge_test_command"] = forge_test_command
+  return out
+
+
+def resolve_backend(
+    backend: str = "auto",
+    *,
+    topology: str = "2x2x1",
+    accelerator: str = "tpu7x",
+    active_deadline_seconds: int = 7200,
+    has_sweep_axes: bool = False,
+    reference_code: Optional[str] = None,
+    custom_code: Optional[str] = None,
+    input_generation_code: Optional[str] = None,
+    kernel_item: str = "",
+    minibench_mode: str = "auto",
+    kernelbench_profile_llo: bool = True,
+    enable_percale: bool = True,
+    generate_runtime_llo_report: bool = True,
+    borg_alloc: str = f"group:{VALID_BORG_ALLOC_SUBSTR}",
+    output_dir: str = "/tmp/minibench_out",
+) -> Dict[str, Any]:
+  """Resolve one of the 3 execution backends (`forge`, `minibench`, `xmanager`)."""
+  b_clean = (backend or "auto").strip().lower()
+  if b_clean not in SUPPORTED_BACKENDS:
+    raise ValueError(
+        f"Unsupported backend={backend!r}; must be one of {SUPPORTED_BACKENDS}."
+    )
+
+  prefix, _, canon_topo = parse_topology_prefix_and_shape(topology, accelerator)
+  has_minibench_inputs = (
+      any(
+          bool(x and str(x).strip())
+          for x in (
+              reference_code,
+              custom_code,
+              input_generation_code,
+              kernel_item,
+          )
+      )
+      or (minibench_mode or "auto").strip().lower() != "auto"
+  )
+
+  if b_clean == "minibench" or (
+      b_clean == "auto"
+      and (has_minibench_inputs or prefix in MLCR_WARM_POOL_TOPOLOGY_PREFIXES)
+  ):
+    mb = build_minibench_command(
+        topology=topology,
+        accelerator=accelerator,
+        minibench_mode=minibench_mode,
+        reference_code=reference_code or "",
+        custom_code=custom_code or "",
+        input_generation_code=input_generation_code or "",
+        kernel_item=kernel_item,
+        output_dir=output_dir,
+        kernelbench_profile_llo=kernelbench_profile_llo,
+        enable_percale=enable_percale,
+        generate_runtime_llo_report=generate_runtime_llo_report,
+        borg_alloc=borg_alloc,
+    )
+    return {
+        "status": "RESOLVED",
+        "requested_backend": b_clean,
+        "backend": "minibench",
+        "resolved_backend": "minibench",
+        "dispatch_mode": "minibench",
+        "canonical_topology": canon_topo,
+        "minibench_mode": mb["effective_mode"],
+        "minibench_flag_mode": mb["minibench_flag_mode"],
+        "execution_target": mb["execution_target"],
+        "command": mb["command"],
+        "forge_test_command": mb["forge_test_command"],
+        "minibench_spec": mb,
+        "reason": mb["reason"],
+    }
+
+  multihost = is_multihost_topology(topology, accelerator)
+  if b_clean == "forge":
+    if multihost:
+      raise ValueError(
+          f"[{TRAP36E_MULTIHOST_REQUIRES_XMANAGER_BORG}] Multi-host topology"
+          f" '{canon_topo}' cannot run on single-host Forge TPU; use"
+          " '--backend=xmanager' or '--backend=minibench'."
+      )
+    return {
+        "status": "RESOLVED",
+        "requested_backend": b_clean,
+        "backend": "forge",
+        "resolved_backend": "forge",
+        "minibench_mode": "none",
+        "dispatch_mode": "forge_tpu",
+        "canonical_topology": canon_topo,
+        "reason": (
+            f"Selected Backend A (Forge TPU) for single-host '{canon_topo}'."
+        ),
+    }
+
+  if (
+      b_clean == "xmanager"
+      or multihost
+      or active_deadline_seconds > 900
+      or has_sweep_axes
+  ):
+    if VALID_BORG_ALLOC_SUBSTR not in borg_alloc:
+      raise ValueError(
+          "[TRAP36_INVALID_XM_BORG_ALLOC_OR_PLATFORM] Invalid Borg alloc"
+          f" {borg_alloc!r}; must use {VALID_BORG_ALLOC_SUBSTR!r}."
+      )
+    return {
+        "status": "RESOLVED",
+        "requested_backend": b_clean,
+        "backend": "xmanager",
+        "resolved_backend": "xmanager",
+        "minibench_mode": "none",
+        "dispatch_mode": "xmanager_borg",
+        "canonical_topology": canon_topo,
+        "reason": f"Selected Backend C (XManager Borg TPU) for '{canon_topo}'.",
+    }
+
+  return {
+      "status": "RESOLVED",
+      "requested_backend": b_clean,
+      "backend": "forge",
+      "resolved_backend": "forge",
+      "minibench_mode": "none",
+      "dispatch_mode": "forge_tpu",
+      "canonical_topology": canon_topo,
+      "reason": (
+          f"Auto-selected Backend A (Forge TPU) for single-host '{canon_topo}'"
+          " (<= 900s)."
+      ),
+  }
+
+
+def synthesize_xm_borg_launcher_script(
+    request: Dict[str, Any], storage_uri: str
+) -> str:
+  """Generate an XManager (`xm_abc.Borg`) launcher script for a queued `cdk-g3` job."""
+  job_id = request["id"]
+  job_name = request["recipe"]
+  topology = request.get("topology") or "2x2x1"
+  alloc = request.get("borg_alloc") or f"group:{VALID_BORG_ALLOC_SUBSTR}"
+  if VALID_BORG_ALLOC_SUBSTR not in alloc:
+    raise ValueError(
+        "[TRAP36_INVALID_XM_BORG_ALLOC_OR_PLATFORM] Invalid Borg alloc"
+        f" {alloc!r}; must use {VALID_BORG_ALLOC_SUBSTR!r}."
+    )
+  pod_name = request["pod_name"]
+  env_dict = dict(request.get("env") or {})
+  env_dict["POD_NAME"] = pod_name
+  env_dict["CDK_G3_JOB_ID"] = job_id
+  env_dict["CDK_G3_STORAGE_URI"] = storage_uri
+
+  return (
+      "from xmanager import xm\nfrom xmanager import xm_abc\n\nJOB_ID ="
+      f" {job_id!r}\nJOB_NAME = {job_name!r}\nBORG_ALLOC = {alloc!r}\nTOPOLOGY"
+      f" = {topology!r}\nENV_VARS ="
+      f" {json.dumps(env_dict, sort_keys=True)}\n\ndef main(argv) -> None:\n "
+      " del argv\n  with"
+      " xm_abc.create_experiment(experiment_title=f'cdk_g3_{JOB_NAME}_{JOB_ID}')"
+      " as exp:\n    requirements = xm.JobRequirements(\n       "
+      " location='us-central1',\n        service_tier=xm.ServiceTier.PROD,\n  "
+      "       ghostfish=TOPOLOGY,\n    )\n    executor ="
+      " xm_abc.Borg(alloc=BORG_ALLOC, requirements=requirements)\n    pkg, ="
+      " exp.package([\n        xm.python_container(\n           "
+      " executor_spec=executor.Spec(),\n            path='.',\n           "
+      " base_image='gcr.io/deeplearning-platform-release/base-cpu',\n         "
+      "   entrypoint=xm.CommandList(['bash', '/workspace/pod_script.sh']),\n  "
+      "      )\n    ])\n    exp.add(xm.Job(pkg, executor,"
+      " env_vars=ENV_VARS))\n"
+  )
+
+
+# ---------------------------------------------------------------------------
+# Stateless `cdk-g3` Client Subcommands
+# ---------------------------------------------------------------------------
+
+
+def cmd_agent_letter() -> int:
+  sys.stdout.write(AGENT_LETTER_TEXT)
+  sys.stdout.flush()
+  return 0
+
+
+def cmd_usage(store: StorageBackend, as_json: bool) -> int:
+  nodes = build_cluster_usage_nodes(store)
+  try:
+    store.write_json("cluster/usage.json", nodes)
+  except Exception:
+    pass
+  if as_json:
+    sys.stdout.write(json.dumps(nodes, indent=2, sort_keys=True) + "\n")
+  else:
+    for n in nodes:
+      busy = len(n.get("pods") or [])
+      sys.stdout.write(
+          f"{n['name']:<32} {n['node_pool']:<24} {n['status']:<8} busy={busy}\n"
+      )
+  sys.stdout.flush()
+  return 0
+
+
+BUILTIN_RECIPE_VALUES_YML: Dict[str, str] = {
+    "forge-microbench": (
+        """\
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: "forge-microbench"
+  namespace: "cloud-devkit-jobs"
+spec:
+  replicatedJobs:
+    - name: scorer
+      replicas: 1
+      template:
+        spec:
+          template:
+            spec:
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: "tpu7x"
+                cloud.google.com/gke-tpu-topology: "2x2x1"
+              containers:
+                - name: "scorer"
+                  image: "us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu/vllm-tpu:latest"
+                  env:
+                    - name: JOB_NAME
+                      value: "forge-microbench"
+                    - name: TPU_TOPOLOGY
+                      value: "gf=2x2x1"
+                    - name: FORGE_RESULTS
+                      value: "/workspace/results"
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      set -euo pipefail
+                      mkdir -p "${FORGE_RESULTS}/telemetry"
+                      echo "PERFKIT_CLUSTER_SCORE_BEGIN rep=1 pod=${POD_NAME:-local}"
+                      echo '{"status": "ok", "backend": "forge", "topology": "gf=2x2x1"}'
+                      echo "PERFKIT_CLUSTER_SCORE_END rep=1 pod=${POD_NAME:-local}"
+"""
+    ),
+    "minibench-ab": (
+        """\
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: "minibench-ab"
+  namespace: "cloud-devkit-jobs"
+spec:
+  replicatedJobs:
+    - name: scorer
+      replicas: 1
+      template:
+        spec:
+          template:
+            spec:
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: "tpu7x"
+                cloud.google.com/gke-tpu-topology: "1x1x1"
+              containers:
+                - name: "scorer"
+                  image: "us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu/vllm-tpu:latest"
+                  env:
+                    - name: JOB_NAME
+                      value: "minibench-ab"
+                    - name: TPU_TOPOLOGY
+                      value: "gf=1x1x1"
+                    - name: REFERENCE_CODE
+                      value: "examples/pallas_relu_ref.py"
+                    - name: CUSTOM_CODE
+                      value: "examples/pallas_relu_cand.py"
+                    - name: INPUT_GENERATION_CODE
+                      value: "examples/input_gen.py"
+                    - name: FORGE_RESULTS
+                      value: "/workspace/results"
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      set -euo pipefail
+                      mkdir -p "${FORGE_RESULTS}/telemetry"
+                      echo "PERFKIT_CLUSTER_SCORE_BEGIN rep=1 pod=${POD_NAME:-local}"
+                      echo '{"status": "ok", "backend": "minibench", "topology": "gf=1x1x1"}'
+                      echo "PERFKIT_CLUSTER_SCORE_END rep=1 pod=${POD_NAME:-local}"
+"""
+    ),
+    "xm-sweep": (
+        """\
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: "xm-sweep"
+  namespace: "cloud-devkit-jobs"
+spec:
+  replicatedJobs:
+    - name: slice
+      replicas: 2
+      template:
+        spec:
+          template:
+            spec:
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: "tpu7x"
+                cloud.google.com/gke-tpu-topology: "2x2x2"
+              containers:
+                - name: "slice"
+                  image: "us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu/vllm-tpu:latest"
+                  env:
+                    - name: JOB_NAME
+                      value: "xm-sweep"
+                    - name: TPU_TOPOLOGY
+                      value: "gf=2x2x2"
+                    - name: BORG_ALLOC
+                      value: "group:msca-dynamic/tpu-perf-team-dynamic-xm"
+                    - name: FORGE_RESULTS
+                      value: "/workspace/results"
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      set -euo pipefail
+                      mkdir -p "${FORGE_RESULTS}/telemetry"
+                      echo "PERFKIT_CLUSTER_SCORE_BEGIN rep=1 pod=${POD_NAME:-local}"
+                      echo '{"status": "ok", "backend": "xmanager", "topology": "gf=2x2x2"}'
+                      echo "PERFKIT_CLUSTER_SCORE_END rep=1 pod=${POD_NAME:-local}"
+"""
+    ),
+    "simple-run-command": (
+        """\
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: "simple-run-command"
+  namespace: "cloud-devkit-jobs"
+spec:
+  replicatedJobs:
+    - name: slice
+      replicas: 1
+      template:
+        spec:
+          template:
+            spec:
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: "tpu7x"
+                cloud.google.com/gke-tpu-topology: "2x2x1"
+              containers:
+                - name: "slice"
+                  image: "us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu/vllm-tpu:latest"
+                  env:
+                    - name: JOB_NAME
+                      value: "simple-run-command"
+                    - name: FORGE_RESULTS
+                      value: "/workspace/results"
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      set -euo pipefail
+                      mkdir -p "${FORGE_RESULTS}/telemetry"
+                      echo "simple-run-command completed on ${POD_NAME:-local}"
+"""
+    ),
+    "simple-run-command-2node": (
+        """\
+apiVersion: jobset.x-k8s.io/v1alpha2
+kind: JobSet
+metadata:
+  name: "simple-run-command-2node"
+  namespace: "cloud-devkit-jobs"
+spec:
+  replicatedJobs:
+    - name: slice
+      replicas: 2
+      template:
+        spec:
+          template:
+            spec:
+              nodeSelector:
+                cloud.google.com/gke-tpu-accelerator: "tpu7x"
+                cloud.google.com/gke-tpu-topology: "2x2x2"
+              containers:
+                - name: "slice"
+                  image: "us-central1-docker.pkg.dev/cloud-tpu-inference-test/vllm-tpu/vllm-tpu:latest"
+                  env:
+                    - name: JOB_NAME
+                      value: "simple-run-command-2node"
+                    - name: TPU_TOPOLOGY
+                      value: "gf=2x2x2"
+                    - name: FORGE_RESULTS
+                      value: "/workspace/results"
+                  command: ["/bin/bash", "-c"]
+                  args:
+                    - |
+                      set -euo pipefail
+                      mkdir -p "${FORGE_RESULTS}/telemetry"
+                      echo "simple-run-command-2node completed on ${POD_NAME:-local}"
+"""
+    ),
+}
+
+
+def _locate_recipe_values_yml(
+    recipe_name: str, recipes_dir: Optional[Path] = None
+) -> Path:
+  candidates: List[Path] = []
+  if recipes_dir:
+    candidates.append(
+        Path(recipes_dir) / "recipes" / recipe_name / "values.yml"
+    )
+    candidates.append(Path(recipes_dir) / recipe_name / "values.yml")
+  candidates.append(Path.cwd() / "recipes" / recipe_name / "values.yml")
+  script_dir = Path(os.path.abspath(__file__)).parent
+  candidates.append(script_dir.parent / "recipes" / recipe_name / "values.yml")
+  candidates.append(script_dir / "recipes" / recipe_name / "values.yml")
+  cdk_root = os.environ.get("CDK_ROOT_DIR", "").strip()
+  if cdk_root:
+    candidates.append(
+        Path(cdk_root).expanduser() / "recipes" / recipe_name / "values.yml"
+    )
+  candidates.append(
+      Path.home() / "cdk-g3" / "recipes" / recipe_name / "values.yml"
+  )
+  candidates.append(
+      Path.home() / "cloud-devkit" / "recipes" / recipe_name / "values.yml"
+  )
+
+  for c in candidates:
+    if c.is_file():
+      return c
+  raise FileNotFoundError(
+      f"cdk-g3 job create: could not find recipes/{recipe_name}/values.yml in "
+      f"{[str(c) for c in candidates]}"
+  )
+
+
+def load_recipe_values_yml(
+    recipe_name: str, recipes_dir: Optional[Path] = None
+) -> str:
+  """Load `recipes/<recipe_name>/values.yml` from disk or built-in fallback."""
+  try:
+    values_path = _locate_recipe_values_yml(recipe_name, recipes_dir)
+    return values_path.read_text(encoding="utf-8")
+  except FileNotFoundError:
+    if recipe_name in BUILTIN_RECIPE_VALUES_YML:
+      return BUILTIN_RECIPE_VALUES_YML[recipe_name]
+    raise
+
+
+def _normalize_scope_rel_path(raw_path: str) -> str:
+  cleaned = raw_path.strip().replace("\\", "/")
+  while cleaned.startswith("./"):
+    cleaned = cleaned[2:]
+  cleaned = cleaned.lstrip("/")
+  return cleaned
+
+
+def is_path_in_designated_cdk_g3_scope(
+    rel_path: str, *, allow_dependency_closure: bool = False
+) -> Tuple[bool, str]:
+  """Check whether `rel_path` falls within the designated `cdk-g3` Levels 1-4 kernel scope."""
+  norm = _normalize_scope_rel_path(rel_path)
+  if not norm:
+    return (
+        False,
+        (
+            f"[{TRAP36F_OUT_OF_CDK_G3_KERNEL_SCOPE}] Empty file path is not"
+            " allowed."
+        ),
+    )
+
+  base_name = Path(norm).name
+  if (
+      base_name == "Dockerfile"
+      or base_name.startswith("Dockerfile.")
+      or norm.startswith(("vllm/", "csrc/", "docker/"))
+      or base_name.endswith((".cu", ".cuh"))
+  ):
+    return (
+        False,
+        (
+            f"[{TRAP36F_OUT_OF_CDK_G3_KERNEL_SCOPE}] '{norm}' modifies vLLM"
+            " EngineCore/HTTP server, Dockerfile, or C++/CUDA extension layers"
+            " (Level 5/6); route this benchmark to GKE 'cdk'."
+        ),
+    )
+
+  if not allow_dependency_closure:
+    for bad_prefix in OUT_OF_SCOPE_PYTORCH_VLLM_PREFIXES:
+      if norm.startswith(bad_prefix):
+        return (
+            False,
+            (
+                f"[{TRAP36F_OUT_OF_CDK_G3_KERNEL_SCOPE}] '{norm}' modifies"
+                " PyTorch/vLLM model or host runtime layers (Level 5/6); route"
+                " this benchmark to GKE 'cdk'."
+            ),
+        )
+
+  if norm in DESIGNATED_CDK_G3_EXACT_FILES:
+    return True, "Designated pure-JAX/Pallas env or launcher file (Levels 1-4)."
+
+  for good_prefix in DESIGNATED_CDK_G3_REL_PREFIXES:
+    if norm.startswith(good_prefix):
+      return True, "Designated pure-JAX/Pallas kernel directory (Levels 1-4)."
+
+  if (
+      norm.startswith(("probes/", "examples/"))
+      or base_name.endswith((
+          "_bench.py",
+          "_bench_test.py",
+          "_probe.py",
+          "_kernel.py",
+          "_kernel.cc",
+          ".s",
+          "_ref.py",
+          "_cand.py",
+          "_custom.py",
+          "_input_gen.py",
+          ".pbtxt",
+          ".textproto",
+          ".recordio",
+      ))
+      or "bench" in base_name
+      or "probe" in base_name
+      or "minibench" in base_name
+      or "input_gen" in base_name
+  ):
+    return (
+        True,
+        (
+            "Standalone microbenchmark, Minibench, or TPU-C kernel source"
+            " (Levels 1-4)."
+        ),
+    )
+
+  if allow_dependency_closure and norm.endswith(".py"):
+    return (
+        True,
+        (
+            "Pure-Python sublayer/module eligible via AST dependency-closure"
+            " verification."
+        ),
+    )
+
+  return (
+      False,
+      (
+          f"[{TRAP36F_OUT_OF_CDK_G3_KERNEL_SCOPE}] '{norm}' is outside the"
+          " designated cdk-g3 kernel scope (vllm_torchtpu/kernels/**,"
+          " vllm_torchtpu/envs.py); route to GKE 'cdk'."
+      ),
+  )
+
+
+def _discover_git_changed_files(source_root: Path) -> List[str]:
+  """Auto-discover modified, staged, or untracked candidate files via `git`."""
+  root = Path(source_root).expanduser().resolve()
+  if not root.is_dir():
+    return []
+  found: List[str] = []
+  for git_args in (
+      ["git", "-C", str(root), "--no-pager", "diff", "--name-only", "HEAD"],
+      ["git", "-C", str(root), "--no-pager", "status", "--porcelain"],
+  ):
+    try:
+      proc = subprocess.run(
+          git_args,
+          capture_output=True,
+          text=True,
+          timeout=15,
+          check=False,
+      )
+    except (OSError, subprocess.SubprocessError):
+      continue
+    if proc.returncode != 0:
+      continue
+    for raw_line in (proc.stdout or "").splitlines():
+      line = raw_line.rstrip()
+      if not line:
+        continue
+      if "status" in git_args:
+        path_part = line[3:].strip() if len(line) > 3 else line.strip()
+        if " -> " in path_part:
+          path_part = path_part.split(" -> ", 1)[1].strip()
+      else:
+        path_part = line.strip()
+      norm = _normalize_scope_rel_path(path_part)
+      if norm and norm not in found:
+        found.append(norm)
+  return found
+
+
+def _resolve_candidate_file_on_disk(
+    rel_path: str, source_root: Optional[Path]
+) -> Tuple[Optional[Path], str]:
+  """Resolve `rel_path` against `source_root` and return `(disk_path, canonical_pkg_rel)`."""
+  norm = _normalize_scope_rel_path(rel_path)
+  if norm.startswith("src/vllm_torchtpu/"):
+    canonical_rel = norm[len("src/") :]
+  elif norm.startswith("kernels/") or norm == "envs.py":
+    canonical_rel = f"vllm_torchtpu/{norm}"
+  else:
+    canonical_rel = norm
+
+  if source_root is None:
+    p = Path(rel_path)
+    return (p.resolve() if p.is_file() else None), canonical_rel
+
+  root = Path(source_root).expanduser().resolve()
+  search_candidates = [
+      root / norm,
+      root / canonical_rel,
+      root / "src" / canonical_rel,
+  ]
+  if norm.startswith("vllm_torchtpu/"):
+    sub = norm[len("vllm_torchtpu/") :]
+    search_candidates.append(root / sub)
+  for c in search_candidates:
+    if c.is_file():
+      return c.resolve(), canonical_rel
+  return None, canonical_rel
+
+
+def _extract_python_imports(
+    py_file: Path, current_canonical_rel: str
+) -> Tuple[List[str], List[str]]:
+  """Parse a `.py` file and return `(forbidden_frameworks, internal_module_rel_candidates)`."""
+  source_text = py_file.read_text(encoding="utf-8")
+  tree = ast.parse(source_text, filename=str(py_file))
+  forbidden: List[str] = []
+  internal_rels: List[str] = []
+
+  pkg_parts = list(Path(current_canonical_rel).parent.parts)
+
+  for node in ast.walk(tree):
+    if isinstance(node, ast.Import):
+      for alias in node.names:
+        mod_name = alias.name.strip()
+        top_pkg = mod_name.split(".", 1)[0]
+        if top_pkg in FORBIDDEN_KERNEL_FRAMEWORKS and top_pkg not in forbidden:
+          forbidden.append(top_pkg)
+        if (
+            mod_name.startswith("vllm_torchtpu.")
+            and mod_name not in STUBBED_INTERNAL_MODULES
+        ):
+          rel_mod = mod_name.replace(".", "/") + ".py"
+          internal_rels.append(rel_mod)
+    elif isinstance(node, ast.ImportFrom):
+      mod_name = (node.module or "").strip()
+      if node.level and node.level > 0:
+        up = max(0, len(pkg_parts) - (node.level - 1))
+        base_parts = pkg_parts[:up]
+        if mod_name:
+          target_parts = base_parts + mod_name.split(".")
+          internal_rels.append("/".join(target_parts) + ".py")
+        for alias in node.names:
+          if alias.name != "*":
+            cand_parts = (
+                base_parts + ([mod_name] if mod_name else []) + [alias.name]
+            )
+            internal_rels.append("/".join(cand_parts) + ".py")
+      else:
+        top_pkg = mod_name.split(".", 1)[0] if mod_name else ""
+        if top_pkg in FORBIDDEN_KERNEL_FRAMEWORKS and top_pkg not in forbidden:
+          forbidden.append(top_pkg)
+        if mod_name.startswith("vllm_torchtpu"):
+          if mod_name not in STUBBED_INTERNAL_MODULES:
+            internal_rels.append(mod_name.replace(".", "/") + ".py")
+          for alias in node.names:
+            if alias.name != "*":
+              sub_mod = f"{mod_name}.{alias.name}"
+              if sub_mod not in STUBBED_INTERNAL_MODULES:
+                internal_rels.append(sub_mod.replace(".", "/") + ".py")
+
+  return forbidden, internal_rels
+
+
+def verify_cdk_g3_benchmark_scope(
+    changed_files: Sequence[str] = (),
+    *,
+    source_root: Optional[Path] = None,
+    stage_bundle_dir: Optional[Path] = None,
+    output_receipt: Optional[Path] = None,
+    reference_code: Optional[str] = "",
+    custom_code: Optional[str] = "",
+    input_generation_code: Optional[str] = "",
+    allow_dependency_closure: bool = False,
+    topology: str = "gf=2x2x1",
+    backend: str = "auto",
+    backend_hint: Optional[str] = None,
+) -> Dict[str, Any]:
+  """Verify that candidate edits stay within the designated `cdk-g3` pure-JAX/Pallas scope.
+
+  Enforces:
+  1. `TRAP36F_OUT_OF_CDK_G3_KERNEL_SCOPE`: Every modified file (including
+  Minibench
+     `reference_code`, `custom_code`, and `input_generation_code`) must reside
+     under
+     `vllm_torchtpu/kernels/**`, `vllm_torchtpu/envs.py`, standalone
+     microbenchmark files, or (when `allow_dependency_closure=True`) pure-Python
+     sublayer modules whose AST import closure uses only pre-linked Google3 TPU
+     runner deps. Modifications to `vllm/`, `Dockerfile`, `csrc/`, or host
+     runtime layers are rejected and routed to GKE `cdk` (Level 5/6).
+  2. `TRAP36G_FORBIDDEN_FRAMEWORK_IMPORT_IN_KERNEL_SCOPE`: Walks the transitive
+  Python
+     AST import closure across `source_root` and rejects any kernel module that
+     imports
+     `torch`, `torch_xla`, `vllm`, or `triton`.
+  3. Optional Auto-Staging (`stage_bundle_dir`): Copies the transitive `.py`
+  closure
+     byte-for-byte into `stage_bundle_dir`, writes empty `__init__.py` stubs for
+     every
+     parent package directory, and emits `MANIFEST.sha256`.
+  """
+  if backend_hint is not None:
+    backend = backend_hint
+  combined_raw = list(changed_files) + [
+      x
+      for x in (reference_code, custom_code, input_generation_code)
+      if x and str(x).strip()
+  ]
+  cleaned_inputs = [
+      _normalize_scope_rel_path(f)
+      for f in combined_raw
+      if f and _normalize_scope_rel_path(f)
+  ]
+  if not cleaned_inputs and source_root is not None:
+    cleaned_inputs = _discover_git_changed_files(Path(source_root))
+
+  if not cleaned_inputs:
+    receipt: Dict[str, Any] = {
+        "status": "REJECTED_EMPTY_SCOPE",
+        "routing_target": "NONE",
+        "recommended_cli": "none",
+        "recommended_backend": "none",
+        "recommended_recipe": "none",
+        "timestamp_pt": _now_pt_iso(),
+        "eligible_files": [],
+        "out_of_scope_files": [],
+        "ast_closure_files": [],
+        "forbidden_imports": {},
+        "stubbed_init_dirs": [],
+        "sha256_manifest": {},
+        "reason": (
+            f"[{TRAP36F_OUT_OF_CDK_G3_KERNEL_SCOPE}] No candidate files"
+            " provided to verify-scope; pass --changed-files with at least one"
+            " file or --source-root with modified git working tree files."
+        ),
+    }
+    if output_receipt is not None:
+      _atomic_write_json(Path(output_receipt), receipt)
+    return receipt
+
+  eligible_files: List[str] = []
+  out_of_scope_files: List[Dict[str, str]] = []
+  for rel in cleaned_inputs:
+    ok, msg = is_path_in_designated_cdk_g3_scope(
+        rel, allow_dependency_closure=allow_dependency_closure
+    )
+    if ok:
+      if rel not in eligible_files:
+        eligible_files.append(rel)
+    else:
+      out_of_scope_files.append({"file": rel, "reason": msg})
+
+  if out_of_scope_files:
+    bad_list = ", ".join(item["file"] for item in out_of_scope_files)
+    receipt = {
+        "status": "REJECTED_OUT_OF_SCOPE",
+        "routing_target": "GKE_CDK",
+        "recommended_cli": "cdk",
+        "recommended_backend": "gke_cdk",
+        "recommended_recipe": "run-vllm-torchtpu-bench",
+        "timestamp_pt": _now_pt_iso(),
+        "eligible_files": eligible_files,
+        "out_of_scope_files": out_of_scope_files,
+        "ast_closure_files": [],
+        "forbidden_imports": {},
+        "stubbed_init_dirs": [],
+        "sha256_manifest": {},
+        "reason": (
+            f"[{TRAP36F_OUT_OF_CDK_G3_KERNEL_SCOPE}] Candidate modifies file(s)"
+            " outside the designated pure-JAX/Pallas cdk-g3 scope:"
+            f" [{bad_list}]. Only Levels 1-4 (vllm_torchtpu/kernels/**,"
+            " vllm_torchtpu/envs.py, shard_map collectives, and XLA flags) can"
+            " be microbenchmarked via cdk-g3; route Level 5/6 PyTorch/vLLM"
+            " edits to GKE 'cdk'."
+        ),
+    }
+    if output_receipt is not None:
+      _atomic_write_json(Path(output_receipt), receipt)
+    return receipt
+
+  # Walk transitive Python AST import closure when files are resolvable on disk
+  queue: List[str] = list(eligible_files)
+  visited_canonical: Dict[str, Path] = {}
+  ast_closure_files: List[str] = []
+  forbidden_imports: Dict[str, List[str]] = {}
+  sha256_manifest: Dict[str, str] = {}
+
+  while queue:
+    curr_rel = queue.pop(0)
+    disk_path, canonical_rel = _resolve_candidate_file_on_disk(
+        curr_rel, source_root
+    )
+    if canonical_rel in visited_canonical:
+      continue
+    if disk_path is None:
+      if canonical_rel not in ast_closure_files:
+        ast_closure_files.append(canonical_rel)
+      continue
+
+    visited_canonical[canonical_rel] = disk_path
+    if canonical_rel not in ast_closure_files:
+      ast_closure_files.append(canonical_rel)
+    sha256_manifest[canonical_rel] = hashlib.sha256(
+        disk_path.read_bytes()
+    ).hexdigest()
+
+    if disk_path.suffix == ".py":
+      try:
+        bad_mods, dep_rels = _extract_python_imports(disk_path, canonical_rel)
+      except SyntaxError as exc:
+        forbidden_imports[canonical_rel] = [f"SyntaxError:{exc.msg}"]
+        continue
+      if bad_mods:
+        forbidden_imports[canonical_rel] = bad_mods
+      for dep_rel in dep_rels:
+        if dep_rel.endswith("/__init__.py") or dep_rel.endswith("/logger.py"):
+          continue
+        dep_disk, dep_canon = _resolve_candidate_file_on_disk(
+            dep_rel, source_root
+        )
+        if dep_disk is not None and dep_canon not in visited_canonical:
+          ok_dep, _ = is_path_in_designated_cdk_g3_scope(
+              dep_canon, allow_dependency_closure=allow_dependency_closure
+          )
+          if not ok_dep:
+            forbidden_imports.setdefault(canonical_rel, []).append(
+                f"out_of_scope:{dep_canon}"
+            )
+          else:
+            queue.append(dep_canon)
+
+  if forbidden_imports:
+    details = "; ".join(
+        f"{k} -> {v}" for k, v in sorted(forbidden_imports.items())
+    )
+    receipt = {
+        "status": "REJECTED_FORBIDDEN_IMPORT",
+        "routing_target": "GKE_CDK",
+        "recommended_cli": "cdk",
+        "recommended_backend": "gke_cdk",
+        "recommended_recipe": "run-vllm-torchtpu-bench",
+        "timestamp_pt": _now_pt_iso(),
+        "eligible_files": eligible_files,
+        "out_of_scope_files": [],
+        "ast_closure_files": sorted(ast_closure_files),
+        "forbidden_imports": forbidden_imports,
+        "stubbed_init_dirs": [],
+        "sha256_manifest": sha256_manifest,
+        "reason": (
+            f"[{TRAP36G_FORBIDDEN_FRAMEWORK_IMPORT_IN_KERNEL_SCOPE}] Transitive"
+            " AST import closure contains forbidden PyTorch/vLLM framework"
+            f" imports ({details}). Hermetic Google3 Forge/Borg JAX targets"
+            " only provide jax/pallas/numpy; remove framework imports or route"
+            " to GKE 'cdk'."
+        ),
+    }
+    if output_receipt is not None:
+      _atomic_write_json(Path(output_receipt), receipt)
+    return receipt
+
+  stubbed_init_dirs: List[str] = []
+  if stage_bundle_dir is not None and visited_canonical:
+    bundle_root = Path(stage_bundle_dir).expanduser().resolve()
+    bundle_root.mkdir(parents=True, exist_ok=True)
+    init_dirs_set: set[Path] = set()
+    for canon_rel, src_disk in sorted(visited_canonical.items()):
+      dest_file = bundle_root / canon_rel
+      dest_file.parent.mkdir(parents=True, exist_ok=True)
+      _atomic_write_bytes(dest_file, src_disk.read_bytes())
+      cur_parent = dest_file.parent
+      while cur_parent != bundle_root and bundle_root in cur_parent.parents:
+        init_dirs_set.add(cur_parent)
+        cur_parent = cur_parent.parent
+
+    for pkg_dir in sorted(init_dirs_set):
+      init_file = pkg_dir / "__init__.py"
+      rel_dir = str(pkg_dir.relative_to(bundle_root))
+      if not init_file.exists():
+        _atomic_write_bytes(init_file, b"")
+      stubbed_init_dirs.append(rel_dir)
+
+    manifest_lines = [
+        f"# source_root: {source_root or ''}",
+        f"# synced_utc: {_stamp_utc()}",
+    ]
+    for canon_rel, digest in sorted(sha256_manifest.items()):
+      manifest_lines.append(f"{digest}  {canon_rel}")
+    _atomic_write_bytes(
+        bundle_root / "MANIFEST.sha256",
+        ("\n".join(manifest_lines) + "\n").encode("utf-8"),
+    )
+
+  b_req = (backend or "auto").strip().lower()
+  has_mb_pair = bool(
+      (reference_code and str(reference_code).strip())
+      or (custom_code and str(custom_code).strip())
+  )
+  if b_req == "minibench" or (b_req == "auto" and has_mb_pair):
+    rec_backend = "minibench"
+    rec_recipe = "minibench-ab"
+  elif (
+      b_req == "xmanager"
+      or is_multihost_topology(topology)
+      or any(f.endswith("xm_launch.py") for f in eligible_files)
+  ):
+    rec_backend = "xmanager"
+    rec_recipe = "xm-sweep"
+  else:
+    rec_backend = "forge"
+    rec_recipe = "forge-microbench"
+
+  receipt = {
+      "status": "ELIGIBLE_FOR_CDK_G3",
+      "routing_target": "CDK_G3",
+      "routing_target_detail": "CDK_G3_FORGE_OR_BORG",
+      "recommended_cli": "cdk-g3",
+      "recommended_backend": rec_backend,
+      "recommended_recipe": rec_recipe,
+      "timestamp_pt": _now_pt_iso(),
+      "eligible_files": eligible_files,
+      "out_of_scope_files": [],
+      "ast_closure_files": sorted(ast_closure_files),
+      "forbidden_imports": {},
+      "stubbed_init_dirs": stubbed_init_dirs,
+      "sha256_manifest": sha256_manifest,
+      "reason": (
+          f"All {len(eligible_files)} modified file(s) and"
+          f" {len(ast_closure_files)} transitive AST closure file(s) are pure"
+          " JAX/Pallas/TPU-C within the designated cdk-g3 scope (Levels 1-4;"
+          f" recommended_backend={rec_backend}, recommended_recipe={rec_recipe})."
+      ),
+  }
+  if output_receipt is not None:
+    _atomic_write_json(Path(output_receipt), receipt)
+  return receipt
+
+
+def _append_missing_flag_tokens(
+    existing_str: str, required_tokens: Sequence[str]
+) -> str:
+  """Append any missing `--key=...` flag tokens while preserving user-supplied flags."""
+  parts = [tok for tok in (existing_str or "").strip().split() if tok]
+  existing_keys = {tok.split("=", 1)[0] for tok in parts}
+  for req in required_tokens:
+    req_key = req.split("=", 1)[0]
+    if req_key not in existing_keys and req not in parts:
+      parts.append(req)
+      existing_keys.add(req_key)
+  return " ".join(parts)
+
+
+def build_guaranteed_telemetry_env(
+    telemetry_dir: str,
+    existing_env: Optional[Dict[str, str]] = None,
+) -> Dict[str, str]:
+  """Inject canonical HLO, LLO/Mosaic, and XProf output directories and compiler flags.
+
+  Preserves any user-supplied `XLA_FLAGS` and `LIBTPU_INIT_ARGS` tokens while
+  appending
+  missing HLO (`--xla_dump_to=...`) and LLO/Mosaic (`--xla_mosaic_dump_to=...`,
+  `--xla_jf_dump_to=...`, `--xla_jf_dump_llo_text=true`,
+  `--xla_jf_dump_llo_static_gaps=true`)
+  dump flags so every physical TPU run emits all 4 telemetry artifact
+  categories.
+  """
+  t_dir = str(telemetry_dir).strip().rstrip("/")
+  if not t_dir:
+    raise ValueError("telemetry_dir must be a non-empty path string.")
+  env_out: Dict[str, str] = dict(existing_env or {})
+  env_out["CDK_G3_TELEMETRY_DIR"] = t_dir
+  env_out.setdefault("CDK_G3_XPROF_DIR", f"{t_dir}/xprof")
+  env_out.setdefault("CDK_G3_TRACE_JSON_DIR", f"{t_dir}/trace_json")
+  env_out.setdefault("CDK_G3_HLO_DIR", f"{t_dir}/hlo")
+  env_out.setdefault("CDK_G3_LLO_DIR", f"{t_dir}/llo")
+
+  required_xla_flags = (
+      f"--xla_dump_to={t_dir}/hlo",
+      "--xla_dump_hlo_as_text=true",
+      "--xla_dump_hlo_as_proto=true",
+  )
+  env_out["XLA_FLAGS"] = _append_missing_flag_tokens(
+      env_out.get("XLA_FLAGS", ""),
+      required_xla_flags,
+  )
+
+  required_libtpu_flags = (
+      f"--xla_mosaic_dump_to={t_dir}/llo",
+      f"--xla_jf_dump_to={t_dir}/llo",
+      "--xla_jf_dump_llo_text=true",
+      "--xla_jf_dump_llo_static_gaps=true",
+  )
+  env_out["LIBTPU_INIT_ARGS"] = _append_missing_flag_tokens(
+      env_out.get("LIBTPU_INIT_ARGS", ""),
+      required_libtpu_flags,
+  )
+  return env_out
+
+
+def _classify_telemetry_artifact(rel_path: str) -> Optional[str]:
+  """Classify a relative file path under `telemetry_root` into one of the 4 categories."""
+  low = rel_path.replace("\\", "/").lower()
+  name = Path(low).name
+  parts = low.split("/")
+
+  if name.endswith(".xplane.pb") or "xprof" in parts:
+    if name.endswith(".xplane.pb") or name.endswith(".pb"):
+      return "xprof"
+  if (
+      name == "trace_summary.json"
+      or "trace_summary" in name
+      or name.endswith(".trace.json")
+      or name.endswith(".trace.json.gz")
+      or "perfetto" in name
+      or "trace_json" in parts
+  ):
+    return "trace_json"
+  if (
+      "hlo" in parts
+      or name.endswith((".hlo.txt", ".hlo.pb", ".hlo", "_hlo.txt"))
+      or "after_optimizations" in name
+      or "before_optimizations" in name
+      or ("hlo" in name and name.endswith(".txt"))
+  ):
+    return "hlo"
+  if (
+      "llo" in parts
+      or name.endswith((".llo.txt", ".mosaic.mlir", ".mlir", ".s"))
+      or "percale" in name
+      or "llo_report" in name
+      or "llo_telemetry" in name
+      or ("llo" in name and name.endswith((".txt", ".md", ".json")))
+  ):
+    return "llo"
+  return None
+
+
+def verify_telemetry_artifacts(
+    telemetry_root: Path | str,
+    require_all: bool = True,
+    output_receipt: Optional[Path | str] = None,
+) -> Dict[str, Any]:
+  """Scan `telemetry_root` for the 4 telemetry categories and enforce `TRAP36I`."""
+  root = Path(telemetry_root).expanduser().resolve()
+  categories: Dict[str, List[str]] = {
+      cat: [] for cat in TELEMETRY_REQUIRED_CATEGORIES
+  }
+  telemetry_manifest: Dict[str, Dict[str, Any]] = {}
+  empty_files: List[str] = []
+
+  if root.is_dir():
+    for f in sorted(root.rglob("*")):
+      if not f.is_file():
+        continue
+      if f.name.endswith((".lock", ".tmp", ".bak")):
+        continue
+      rel = str(f.relative_to(root)).replace("\\", "/")
+      cat = _classify_telemetry_artifact(rel)
+      if cat is None:
+        continue
+      data = f.read_bytes()
+      size_bytes = len(data)
+      digest = hashlib.sha256(data).hexdigest()
+      telemetry_manifest[rel] = {
+          "category": cat,
+          "size_bytes": size_bytes,
+          "sha256": digest,
+      }
+      if size_bytes == 0:
+        empty_files.append(rel)
+      else:
+        categories[cat].append(rel)
+
+  missing_categories = [
+      cat for cat in TELEMETRY_REQUIRED_CATEGORIES if not categories.get(cat)
+  ]
+
+  if require_all and (missing_categories or empty_files):
+    problems: List[str] = []
+    if missing_categories:
+      problems.append(f"missing_categories={missing_categories}")
+    if empty_files:
+      problems.append(f"empty_0byte_files={empty_files}")
+    detail_str = "; ".join(problems)
+    payload: Dict[str, Any] = {
+        "status": "FAILED",
+        "timestamp_pt": _now_pt_iso(),
+        "telemetry_root": str(root),
+        "require_all": bool(require_all),
+        "categories": categories,
+        "missing_categories": missing_categories,
+        "empty_files": empty_files,
+        "telemetry_manifest": telemetry_manifest,
+        "reason": (
+            f"[{TRAP36I_MISSING_TELEMETRY_ARTIFACTS}] Telemetry completeness"
+            f" check failed under '{root}': {detail_str}. Every"
+            " telemetry-enabled cdk-g3 run must materialize all 4 non-empty"
+            " artifact categories (xprof *.xplane.pb, trace_json"
+            " trace_summary.json/perfetto_trace.json.gz, hlo *.hlo.txt, and"
+            " llo *.llo.txt/*.mosaic.mlir/*.s/percale_llo_report.md)."
+        ),
+    }
+  else:
+    payload = {
+        "status": "PASSED",
+        "timestamp_pt": _now_pt_iso(),
+        "telemetry_root": str(root),
+        "require_all": bool(require_all),
+        "categories": categories,
+        "missing_categories": missing_categories,
+        "empty_files": empty_files,
+        "telemetry_manifest": telemetry_manifest,
+        "reason": (
+            f"Verified {len(telemetry_manifest)} non-empty telemetry"
+            " artifact(s) across"
+            f" {[c for c in TELEMETRY_REQUIRED_CATEGORIES if categories.get(c)]}"
+            " with SHA-256 manifest."
+        ),
+    }
+
+  if output_receipt is not None:
+    _atomic_write_json(Path(output_receipt), payload)
+  return payload
+
+
+def cmd_job_create(
+    store: StorageBackend,
+    recipe_name: str,
+    kv_overrides: Dict[str, str],
+    *,
+    tags: Sequence[str] = (),
+    map_dirs: Sequence[str] = (),
+    active_deadline_seconds: int = 7200,
+    recipes_dir: Optional[Path] = None,
+    user: Optional[str] = None,
+    verify_scope_files: Sequence[str] = (),
+    source_root: Optional[Path] = None,
+    backend: str = "auto",
+    minibench_mode: str = "auto",
+    tpu_topology: Optional[str] = None,
+    reference_code: Optional[str] = None,
+    custom_code: Optional[str] = None,
+    input_generation_code: Optional[str] = None,
+    kernelbench_profile_llo: bool = True,
+    enable_percale: bool = True,
+    generate_runtime_llo_report: bool = True,
+    allow_tiny_shape_waiver: bool = False,
+    collect_telemetry: bool = False,
+    verify_telemetry_dir: Optional[Path] = None,
+    two_phase_xm: bool = False,
+) -> int:
+  if verify_telemetry_dir is not None:
+    tel_check = verify_telemetry_artifacts(
+        verify_telemetry_dir, require_all=True
+    )
+    if tel_check["status"] != "PASSED":
+      sys.stderr.write(
+          "cdk-g3 job create blocked by telemetry gate:"
+          f" {tel_check['reason']}\n"
+      )
+      return 2
+  effective_scope_files: List[str] = list(verify_scope_files)
+  for code_arg in (reference_code, custom_code, input_generation_code):
+    if code_arg and str(code_arg).strip():
+      clean_code = str(code_arg).strip()
+      if clean_code not in effective_scope_files:
+        effective_scope_files.append(clean_code)
+
+  if effective_scope_files:
+    scope_res = verify_cdk_g3_benchmark_scope(
+        effective_scope_files,
+        source_root=source_root,
+        reference_code=reference_code if not verify_scope_files else None,
+        custom_code=custom_code if not verify_scope_files else None,
+        input_generation_code=input_generation_code
+        if not verify_scope_files
+        else None,
+    )
+    if scope_res["status"] != "ELIGIBLE_FOR_CDK_G3":
+      sys.stderr.write(
+          f"cdk-g3 job create blocked by scope gate: {scope_res['reason']}\n"
+      )
+      return 2
+
+  yaml_text = load_recipe_values_yml(recipe_name, recipes_dir)
+  parsed = parse_values_yml(yaml_text)
+
+  merged_env = dict(parsed["env"])
+  merged_env.update(kv_overrides)
+  if collect_telemetry:
+    tel_dir = (
+        merged_env.get("CDK_G3_TELEMETRY_DIR") or "/workspace/results/telemetry"
+    )
+    merged_env = build_guaranteed_telemetry_env(tel_dir, merged_env)
+
+  effective_topology = (
+      tpu_topology
+      or merged_env.get("TPU_TOPOLOGY")
+      or parsed["topology"]
+      or "gf=2x2x1"
+  )
+  effective_ref = reference_code or merged_env.get("REFERENCE_CODE")
+  effective_custom = custom_code or merged_env.get("CUSTOM_CODE")
+  effective_input_gen = input_generation_code or merged_env.get(
+      "INPUT_GENERATION_CODE"
+  )
+
+  effective_deadline = active_deadline_seconds
+  if recipe_name == "forge-microbench" and active_deadline_seconds == 7200:
+    effective_deadline = 600
+
+  try:
+    resolved_route = resolve_backend(
+        backend=backend,
+        topology=effective_topology,
+        active_deadline_seconds=effective_deadline,
+        minibench_mode=minibench_mode,
+        reference_code=effective_ref,
+        custom_code=effective_custom,
+    )
+  except ValueError as exc:
+    sys.stderr.write(f"cdk-g3 job create blocked by backend router: {exc}\n")
+    return 2
+
+  minibench_spec: Optional[Dict[str, Any]] = None
+  if resolved_route["backend"] == "minibench":
+    try:
+      minibench_spec = build_minibench_command(
+          reference_code=effective_ref or "probes/ref_kernel.py",
+          custom_code=effective_custom
+          or effective_ref
+          or "probes/cand_kernel.py",
+          input_generation_code=effective_input_gen,
+          tpu_topology=effective_topology,
+          minibench_mode=minibench_mode,
+          kernelbench_profile_llo=kernelbench_profile_llo,
+          enable_percale=enable_percale,
+          generate_runtime_llo_report=generate_runtime_llo_report,
+          borg_alloc=f"group:{VALID_BORG_ALLOC_SUBSTR}",
+          allow_tiny_shape_waiver=allow_tiny_shape_waiver,
+      )
+    except ValueError as exc:
+      sys.stderr.write(f"cdk-g3 job create blocked by minibench gate: {exc}\n")
+      return 2
+
+  job_id = _new_job_id()
+  now_iso = _stamp_utc()
+  effective_user = (user or os.environ.get("USER") or "jfy").strip()
+  rep_job = parsed["replicated_job"]
+  pod_name = f"{job_id}-{rep_job}-0-0-g3pod"
+
+  mapped_mounts: List[Dict[str, str]] = []
+  for spec in map_dirs:
+    parts = spec.split(":")
+    if len(parts) != 3:
+      raise ValueError(f"Invalid --map-dir {spec!r}; expected SRC:JOB:DEST")
+    src_dir, target_job, dest_path = parts
+    src_path = Path(src_dir).expanduser().resolve()
+    if not src_path.exists():
+      raise FileNotFoundError(f"--map-dir source {src_path} does not exist")
+    with tempfile.TemporaryDirectory(prefix="cdk-g3-mapdir-") as tmp:
+      tgz_path = Path(tmp) / "map_dir.tgz"
+      with tarfile.open(tgz_path, "w:gz") as tf:
+        tf.add(str(src_path), arcname=".")
+      rel_tgz = f"jobs/{job_id}/map_dir_{len(mapped_mounts)}.tgz"
+      store.write_bytes(rel_tgz, tgz_path.read_bytes())
+      mapped_mounts.append({
+          "archive_rel_path": rel_tgz,
+          "target_job": target_job,
+          "dest_path": dest_path,
+      })
+
+  tag_list: List[str] = []
+  for t in tags:
+    for item in t.split(","):
+      clean = item.strip()
+      if clean and clean not in tag_list:
+        tag_list.append(clean)
+  ai_agent = os.environ.get("AI_AGENT", "").strip()
+  if ai_agent and ai_agent not in tag_list:
+    tag_list.append(ai_agent)
+
+  meta = {
+      "id": job_id,
+      "user": effective_user,
+      "recipe": recipe_name,
+      "replicated_job": rep_job,
+      "tags": tag_list,
+      "topology": effective_topology,
+      "accelerator": parsed["accelerator"],
+      "image": parsed["image"],
+      "backend": resolved_route["backend"],
+      "minibench_mode": resolved_route["minibench_mode"],
+      "dispatch_mode": resolved_route["dispatch_mode"],
+      "state": "Pending",
+      "job_status": "Pending",
+      "active": True,
+      "create_time": now_iso,
+      "complete_time": "",
+      "pods": [{
+          "name": pod_name,
+          "status": "Pending",
+          "created": now_iso,
+      }],
+  }
+  request = {
+      "id": job_id,
+      "user": effective_user,
+      "recipe": recipe_name,
+      "replicated_job": rep_job,
+      "pod_name": pod_name,
+      "tags": tag_list,
+      "topology": effective_topology,
+      "accelerator": parsed["accelerator"],
+      "image": parsed["image"],
+      "backend": resolved_route["backend"],
+      "minibench_mode": resolved_route["minibench_mode"],
+      "dispatch_mode": resolved_route["dispatch_mode"],
+      "route_reason": resolved_route["reason"],
+      "minibench_spec": minibench_spec,
+      "collect_telemetry": bool(collect_telemetry),
+      "two_phase_xm": bool(two_phase_xm),
+      "env": merged_env,
+      "pod_script": parsed["pod_script"],
+      "values_yml": yaml_text,
+      "mapped_mounts": mapped_mounts,
+      "active_deadline_seconds": effective_deadline,
+      "borg_alloc": f"group:{VALID_BORG_ALLOC_SUBSTR}",
+      "created_at": now_iso,
+      "timestamp_pt": _now_pt_iso(),
+  }
+
+  store.write_json(f"jobs/{job_id}/request.json", request)
+  store.write_json(f"jobs/{job_id}/meta.json", meta)
+  store.write_bytes(
+      f"jobs/{job_id}/desc.yaml", format_desc_yaml(meta).encode("utf-8")
+  )
+  store.write_bytes(
+      f"jobs/{job_id}/job.log",
+      (
+          f"cdk-g3: queued job {job_id} ({recipe_name},"
+          f" backend={resolved_route['backend']},"
+          f" mode={resolved_route['minibench_mode']}) at {now_iso}\n"
+      ).encode("utf-8"),
+  )
+
+  sys.stdout.write(f"Created job {job_id}\n")
+  sys.stdout.flush()
+  return 0
+
+
+def create_job(
+    store: StorageBackend,
+    recipe_name: str,
+    kv_overrides: Optional[Dict[str, str]] = None,
+    **kwargs: Any,
+) -> int:
+  """Programmatic alias for `cmd_job_create` supporting `--backend=minibench`."""
+  return cmd_job_create(store, recipe_name, kv_overrides or {}, **kwargs)
+
+
+def cmd_job_list(
+    store: StorageBackend,
+    *,
+    tag_filter: Optional[str] = None,
+    user_filter: Optional[str] = None,
+    limit: int = 300,
+    as_json: bool = False,
+) -> int:
+  rows: List[Dict[str, Any]] = []
+  allowed_users = _user_spellings(user_filter) if user_filter else set()
+
+  for rel in store.list_rel_paths("jobs"):
+    if not rel.endswith("/meta.json"):
+      continue
+    try:
+      meta = store.read_json(rel)
+    except Exception:
+      continue
+    if tag_filter:
+      tags = set(meta.get("tags") or [])
+      if tag_filter not in tags and meta.get("recipe") != tag_filter:
+        continue
+    if allowed_users and meta.get("user") not in allowed_users:
+      continue
+    rows.append(meta)
+
+  rows.sort(key=lambda r: str(r.get("create_time") or ""))
+  if limit > 0:
+    rows = rows[-limit:]
+
+  if as_json:
+    sys.stdout.write(json.dumps(rows, indent=2, sort_keys=True) + "\n")
+  else:
+    sys.stdout.write(
+        f"{'ID':<28} {'USER':<12} {'RECIPE':<32} {'JOB STATUS':<12}\n"
+    )
+    for r in rows:
+      sys.stdout.write(
+          f"{r.get('id', ''):<28} {r.get('user', ''):<12} "
+          f"{r.get('recipe', ''):<32} {r.get('job_status', ''):<12}\n"
+      )
+  sys.stdout.flush()
+  return 0
+
+
+def cmd_job_desc(store: StorageBackend, job_id: str) -> int:
+  rel_desc = f"jobs/{job_id}/desc.yaml"
+  if store.exists(rel_desc):
+    sys.stdout.write(store.read_bytes(rel_desc).decode("utf-8"))
+    sys.stdout.flush()
+    return 0
+  rel_meta = f"jobs/{job_id}/meta.json"
+  if store.exists(rel_meta):
+    meta = store.read_json(rel_meta)
+    sys.stdout.write(format_desc_yaml(meta))
+    sys.stdout.flush()
+    return 0
+  sys.stderr.write(f"cdk-g3 job desc: job {job_id} not found\n")
+  return 1
+
+
+def cmd_job_log(store: StorageBackend, job_id: str) -> int:
+  rel_log = f"jobs/{job_id}/job.log"
+  if not store.exists(rel_log):
+    sys.stderr.write(f"cdk-g3 job log: no log found for {job_id}\n")
+    return 1
+  sys.stdout.buffer.write(store.read_bytes(rel_log))
+  sys.stdout.buffer.flush()
+  return 0
+
+
+def cmd_job_delete(store: StorageBackend, job_id: str) -> int:
+  rel_meta = f"jobs/{job_id}/meta.json"
+  if not store.exists(rel_meta):
+    sys.stderr.write(f"cdk-g3 job delete: job {job_id} not found\n")
+    return 1
+  now_iso = _stamp_utc()
+  cancel_payload = {
+      "id": job_id,
+      "deleted_at": now_iso,
+      "timestamp_pt": _now_pt_iso(),
+      "reason": "Deleted via cdk-g3 job delete",
+  }
+  store.write_json(f"jobs/{job_id}/cancel.json", cancel_payload)
+  meta = store.read_json(rel_meta)
+  meta["state"] = "Complete"
+  meta["job_status"] = "Deleted"
+  meta["active"] = False
+  meta["complete_time"] = now_iso
+  for p in meta.get("pods") or []:
+    p["status"] = "Deleted"
+  store.write_json(rel_meta, meta)
+  store.write_bytes(
+      f"jobs/{job_id}/desc.yaml", format_desc_yaml(meta).encode("utf-8")
+  )
+  sys.stdout.write(f"Deleted job {job_id}\n")
+  sys.stdout.flush()
+  return 0
+
+
+def cmd_job_sync_outputs(store: StorageBackend, job_id: str) -> int:
+  out_base = Path(
+      os.environ.get("CDK_JOB_OUTPUTS_DIR")
+      or (Path.home() / "cloud-devkit-data" / "job-outputs")
+  ).expanduser()
+  job_out_dir = out_base / job_id
+  job_out_dir.mkdir(parents=True, exist_ok=True)
+
+  rel_meta = f"jobs/{job_id}/meta.json"
+  pod_name = f"{job_id}-slice-0-0-g3pod"
+  if store.exists(rel_meta):
+    meta = store.read_json(rel_meta)
+    pods = meta.get("pods") or []
+    if pods and pods[0].get("name"):
+      pod_name = pods[0]["name"]
+
+  rel_log = f"jobs/{job_id}/job.log"
+  if store.exists(rel_log):
+    log_dir = job_out_dir / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    (log_dir / f"{pod_name}.log").write_bytes(store.read_bytes(rel_log))
+
+  prefix = f"jobs/{job_id}/outputs/"
+  for rel in store.list_rel_paths(f"jobs/{job_id}/outputs"):
+    if not rel.startswith(prefix):
+      continue
+    sub = rel[len(prefix) :]
+    dest = job_out_dir / sub
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_bytes(store.read_bytes(rel))
+
+  sys.stdout.write(f"Synced outputs for {job_id} to {job_out_dir}\n")
+  sys.stdout.flush()
+  return 0
+
+
+# ---------------------------------------------------------------------------
+# Evergreen Mode 2 Dispatcher Daemon (`daemon-poll-once` & `daemon-run`)
+# ---------------------------------------------------------------------------
+
+
+def _extract_outputs_zip_to_results(
+    candidate_zip_paths: Sequence[Path],
+    local_results_dir: Path,
+) -> List[str]:
+  """Extract any valid Forge `outputs.zip` archives into `local_results_dir`."""
+  extracted: List[str] = []
+  for zf_path in candidate_zip_paths:
+    if zf_path.is_file() and zipfile.is_zipfile(zf_path):
+      with zipfile.ZipFile(zf_path, "r") as zf:
+        zf.extractall(local_results_dir)
+        extracted.extend(zf.namelist())
+  return extracted
+
+
+def execute_queued_job_in_daemon(
+    store: StorageBackend,
+    job_id: str,
+    *,
+    dispatch_mode: str = "local_exec",
+    xm_launcher_target: str = "",
+    forge_test_target: str = "",
+    runner_fn: Optional[
+        Callable[[List[str], Dict[str, str], Path], Tuple[int, str]]
+    ] = None,
+    forge_stage_root: Optional[Path] = None,
+    two_phase_xm: bool = False,
+    worker_id: str = "",
+) -> Dict[str, Any]:
+  """Claim and execute a single queued `cdk-g3` job in Evergreen Mode 2."""
+  rel_meta = f"jobs/{job_id}/meta.json"
+  rel_req = f"jobs/{job_id}/request.json"
+  rel_cancel = f"jobs/{job_id}/cancel.json"
+
+  if store.exists(rel_cancel):
+    meta = store.read_json(rel_meta)
+    meta["state"] = "Complete"
+    meta["job_status"] = "Deleted"
+    meta["active"] = False
+    store.write_json(rel_meta, meta)
+    store.write_bytes(
+        f"jobs/{job_id}/desc.yaml", format_desc_yaml(meta).encode("utf-8")
+    )
+    return {
+        "id": job_id,
+        "status": "Deleted",
+        "reason": "Job cancelled before claim.",
+    }
+
+  claim_payload = {
+      "id": job_id,
+      "claimed_at": _stamp_utc(),
+      "timestamp_pt": _now_pt_iso(),
+      "dispatch_mode": dispatch_mode,
+      "worker_id": worker_id or f"{socket.gethostname()}-{os.getpid()}",
+      "pid": os.getpid(),
+  }
+  if not store.write_json(
+      f"jobs/{job_id}/claim.json", claim_payload, if_not_exists=True
+  ):
+    return {
+        "id": job_id,
+        "status": "SKIPPED",
+        "reason": "Job already claimed by another daemon worker.",
+    }
+
+  request = store.read_json(rel_req)
+  meta = store.read_json(rel_meta)
+  pod_name = request["pod_name"]
+  now_iso = _stamp_utc()
+
+  meta["state"] = "Running"
+  meta["job_status"] = "Running"
+  meta["active"] = True
+  meta["pods"] = [{"name": pod_name, "status": "Running", "created": now_iso}]
+  store.write_json(rel_meta, meta)
+  store.write_bytes(
+      f"jobs/{job_id}/desc.yaml", format_desc_yaml(meta).encode("utf-8")
+  )
+  build_cluster_usage_nodes(store)
+
+  with tempfile.TemporaryDirectory(prefix=f"cdk-g3-exec-{job_id}-") as tmp_str:
+    work_root = Path(tmp_str)
+    if forge_stage_root is not None:
+      base_stage_root = Path(forge_stage_root)
+    elif os.environ.get("CDK_G3_FORGE_STAGE_ROOT", "").strip():
+      base_stage_root = Path(os.environ["CDK_G3_FORGE_STAGE_ROOT"].strip())
+    else:
+      cwd_pkg = Path.cwd() / "experimental" / "users" / "jfy" / "cdk_g3"
+      if cwd_pkg.is_dir() and os.access(cwd_pkg, os.W_OK):
+        base_stage_root = cwd_pkg / "staging"
+      else:
+        base_stage_root = work_root / "staging"
+    job_stage_dir = base_stage_root / job_id
+
+    try:
+      try:
+        job_stage_dir.mkdir(parents=True, exist_ok=True)
+      except OSError:
+        job_stage_dir = work_root / "staging" / job_id
+        job_stage_dir.mkdir(parents=True, exist_ok=True)
+      env = {
+          **os.environ,
+          **(request.get("env") or {}),
+          "POD_NAME": pod_name,
+          "CDK_G3_JOB_ID": job_id,
+          "CDK_G3_STAGE_DIR": str(job_stage_dir),
+          "WORK_DIR": str(work_root / "work"),
+          "TMPDIR": str(work_root / "tmp"),
+      }
+      (work_root / "work").mkdir(parents=True, exist_ok=True)
+      (work_root / "tmp").mkdir(parents=True, exist_ok=True)
+
+      # Unpack any --map-dir tarballs into work_root Mapped Paths and job_stage_dir
+      path_rewrites: List[Tuple[str, str]] = []
+      for idx, mount in enumerate(request.get("mapped_mounts") or []):
+        rel_tgz = mount["archive_rel_path"]
+        dest_virtual = mount["dest_path"]
+        local_mount_dir = work_root / f"mapped_{idx}"
+        local_mount_dir.mkdir(parents=True, exist_ok=True)
+        tgz_file = work_root / f"mapped_{idx}.tgz"
+        tgz_file.write_bytes(store.read_bytes(rel_tgz))
+        with tarfile.open(tgz_file, "r:gz") as tf:
+          tf.extractall(local_mount_dir, filter="data")
+          tf.extractall(job_stage_dir, filter="data")
+        path_rewrites.append((dest_virtual, str(local_mount_dir)))
+        if env.get("REPO_DIR") == dest_virtual:
+          env["REPO_DIR"] = str(local_mount_dir)
+
+      local_results_dir = work_root / "forge_results"
+      local_results_dir.mkdir(parents=True, exist_ok=True)
+      if env.get("FORGE_RESULTS") == "/workspace/results" or not env.get(
+          "FORGE_RESULTS"
+      ):
+        path_rewrites.append(("/workspace/results", str(local_results_dir)))
+        env["FORGE_RESULTS"] = str(local_results_dir)
+
+      local_telemetry_dir = local_results_dir / "telemetry"
+      if request.get("collect_telemetry") or env.get("CDK_G3_TELEMETRY_DIR"):
+        for sub_cat in TELEMETRY_REQUIRED_CATEGORIES:
+          (local_telemetry_dir / sub_cat).mkdir(parents=True, exist_ok=True)
+        env = build_guaranteed_telemetry_env(str(local_telemetry_dir), env)
+        path_rewrites.append(
+            ("/workspace/results/telemetry", str(local_telemetry_dir))
+        )
+
+      script_text = request.get("pod_script") or ""
+      for old_p, new_p in path_rewrites:
+        script_text = script_text.replace(old_p, new_p)
+
+      script_file = work_root / "pod_script.sh"
+      script_file.write_text(script_text + "\n", encoding="utf-8")
+      script_file.chmod(0o755)
+      shutil.copy2(script_file, job_stage_dir / "pod_script.sh")
+      _atomic_write_json(
+          job_stage_dir / "stage_manifest.json",
+          {
+              "job_id": job_id,
+              "recipe": request.get("recipe"),
+              "pod_name": pod_name,
+              "topology": request.get("topology"),
+              "env": request.get("env") or {},
+              "timestamp_pt": _now_pt_iso(),
+          },
+      )
+
+      xm_launcher_py = synthesize_xm_borg_launcher_script(request, store.uri)
+      (work_root / "xm_borg_launcher.py").write_text(
+          xm_launcher_py, encoding="utf-8"
+      )
+      store.write_bytes(
+          f"jobs/{job_id}/xm_borg_launcher.py", xm_launcher_py.encode("utf-8")
+      )
+
+      effective_mode = dispatch_mode
+      if effective_mode == "auto":
+        effective_mode = str(request.get("dispatch_mode") or "local_exec")
+
+      target = ""
+      minibench_spec = request.get("minibench_spec")
+      if (
+          isinstance(minibench_spec, dict)
+          and minibench_spec.get("command")
+          and (
+              effective_mode.startswith("minibench")
+              or (
+                  request.get("backend") == "minibench"
+                  and dispatch_mode in ("auto", "minibench")
+              )
+          )
+      ):
+        cmd = [str(x) for x in minibench_spec["command"]]
+      elif effective_mode == "xmanager_borg":
+        target = (
+            xm_launcher_target
+            or f"//experimental/users/jfy/tpu_autonomous_loop/cdk_g3:{request['recipe']}_xm"
+        )
+        cmd = [
+            "/google/bin/releases/xmanager/cli/xmanager",
+            "launch",
+            target,
+            "--",
+            "--xm_deployment_env=alphabet",
+            (
+                f"--xm_resource_alloc={request.get('borg_alloc') or ('group:' + VALID_BORG_ALLOC_SUBSTR)}"
+            ),
+            "--noxm_monitor_on_launch",
+        ]
+      elif effective_mode == "forge_tpu":
+        target = forge_test_target or DEFAULT_FORGE_TEST_TARGET
+        cmd = [
+            "/google/bin/releases/arca9-local-blaze-cli/blaze-for-agents",
+            "test",
+            "--test_strategy=remote",
+            f"--test_env=CDK_G3_JOB_ID={job_id}",
+            f"--test_env=CDK_G3_STAGE_DIR={job_stage_dir}",
+            target,
+        ]
+      else:
+        cmd = ["/bin/bash", str(script_file)]
+
+      if runner_fn is not None:
+        rc, log_output = runner_fn(cmd, env, work_root)
+      else:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(work_root),
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=int(request.get("active_deadline_seconds") or 3600),
+            check=False,
+        )
+        rc = proc.returncode
+        log_output = (proc.stdout or "") + (proc.stderr or "")
+
+      # Extract Forge `outputs.zip` undeclared test outputs if produced
+      zip_candidates: List[Path] = [
+          work_root / "outputs.zip",
+          job_stage_dir / "outputs.zip",
+      ]
+      if env.get("CDK_G3_OUTPUTS_ZIP"):
+        zip_candidates.insert(0, Path(env["CDK_G3_OUTPUTS_ZIP"]))
+      if target.startswith("//"):
+        target_rel = target.lstrip("/").replace(":", "/")
+        zip_candidates.append(
+            Path.cwd()
+            / "blaze-testlogs"
+            / target_rel
+            / "test.outputs"
+            / "outputs.zip"
+        )
+      _extract_outputs_zip_to_results(zip_candidates, local_results_dir)
+
+      xid_match = XID_RE.search(log_output or "")
+      extracted_xid = (
+          xid_match.group(1)
+          if xid_match
+          else str(env.get("CDK_G3_XM_XID") or "").strip()
+      )
+      if extracted_xid:
+        meta["xid"] = extracted_xid
+
+      store.write_bytes(f"jobs/{job_id}/job.log", log_output.encode("utf-8"))
+
+      if local_results_dir.is_dir():
+        for f in sorted(local_results_dir.rglob("*")):
+          if f.is_file():
+            rel_sub = f.relative_to(local_results_dir)
+            store.write_bytes(
+                f"jobs/{job_id}/outputs/{rel_sub}", f.read_bytes()
+            )
+
+      # Phase 1 of 2-phase non-blocking XManager lifecycle:
+      # When `xmanager launch ... --noxm_monitor_on_launch` succeeds and returns an XID,
+      # keep the job in `Running` state so `poll_running_xmanager_job` polls it in Phase 2.
+      use_two_phase_xm = bool(two_phase_xm or request.get("two_phase_xm"))
+      if (
+          effective_mode == "xmanager_borg"
+          and use_two_phase_xm
+          and rc == 0
+          and extracted_xid
+          and not store.exists(rel_cancel)
+      ):
+        meta["state"] = "Running"
+        meta["job_status"] = "Running"
+        meta["active"] = True
+        meta["xid"] = extracted_xid
+        meta["pods"] = [
+            {"name": pod_name, "status": "Running", "created": now_iso}
+        ]
+        store.write_json(rel_meta, meta)
+        store.write_bytes(
+            f"jobs/{job_id}/desc.yaml", format_desc_yaml(meta).encode("utf-8")
+        )
+        build_cluster_usage_nodes(store)
+        return {
+            "id": job_id,
+            "status": "Running",
+            "xid": extracted_xid,
+            "exit_code": 0,
+            "pod_name": pod_name,
+            "dispatch_mode": effective_mode,
+            "reason": (
+                f"Job {job_id} launched XManager experiment xid={extracted_xid}"
+                " (Phase 1 Running)."
+            ),
+        }
+
+      # Check if cancelled during execution
+      if store.exists(rel_cancel):
+        final_status = "Deleted"
+      else:
+        final_status = "Succeeded" if rc == 0 else "Failed"
+
+      end_iso = _stamp_utc()
+      meta["state"] = "Complete"
+      meta["job_status"] = final_status
+      meta["active"] = False
+      meta["complete_time"] = end_iso
+      meta["exit_code"] = rc
+      meta["pods"] = [
+          {"name": pod_name, "status": final_status, "created": now_iso}
+      ]
+      store.write_json(rel_meta, meta)
+      store.write_bytes(
+          f"jobs/{job_id}/desc.yaml", format_desc_yaml(meta).encode("utf-8")
+      )
+      build_cluster_usage_nodes(store)
+
+      return {
+          "id": job_id,
+          "status": final_status,
+          "xid": extracted_xid,
+          "exit_code": rc,
+          "pod_name": pod_name,
+          "dispatch_mode": effective_mode,
+          "reason": (
+              f"Job {job_id} completed with status {final_status} (rc={rc})."
+          ),
+      }
+    finally:
+      shutil.rmtree(job_stage_dir, ignore_errors=True)
+
+
+def poll_running_xmanager_job(
+    store: StorageBackend,
+    job_id: str,
+    *,
+    xm_poll_fn: Optional[
+        Callable[[str, str, Dict[str, Any]], Dict[str, Any]]
+    ] = None,
+) -> Dict[str, Any]:
+  """Phase 2: Poll an active XManager (`xid`) job and transition on completion."""
+  rel_meta = f"jobs/{job_id}/meta.json"
+  rel_cancel = f"jobs/{job_id}/cancel.json"
+  if not store.exists(rel_meta):
+    return {"id": job_id, "status": "SKIPPED", "reason": "Missing meta.json"}
+  meta = store.read_json(rel_meta)
+  xid = str(meta.get("xid") or "").strip()
+
+  if store.exists(rel_cancel):
+    meta["state"] = "Complete"
+    meta["job_status"] = "Deleted"
+    meta["active"] = False
+    meta["complete_time"] = _stamp_utc()
+    for p in meta.get("pods") or []:
+      p["status"] = "Deleted"
+    store.write_json(rel_meta, meta)
+    store.write_bytes(
+        f"jobs/{job_id}/desc.yaml", format_desc_yaml(meta).encode("utf-8")
+    )
+    build_cluster_usage_nodes(store)
+    return {
+        "id": job_id,
+        "status": "Deleted",
+        "xid": xid,
+        "reason": "Honored cancel.json",
+    }
+
+  if xm_poll_fn is not None:
+    poll_res = xm_poll_fn(job_id, xid, meta)
+  elif store.exists(f"jobs/{job_id}/xm_status.json"):
+    poll_res = store.read_json(f"jobs/{job_id}/xm_status.json")
+  else:
+    return {
+        "id": job_id,
+        "status": "Running",
+        "xid": xid,
+        "reason": f"XManager experiment xid={xid} still running.",
+    }
+
+  raw_state = str(
+      poll_res.get("status") or poll_res.get("state") or "Running"
+  ).strip()
+  upper_state = raw_state.upper()
+  if upper_state in ("COMPLETED", "SUCCEEDED", "SUCCESS"):
+    norm_state = "Succeeded"
+  elif upper_state in ("FAILED", "ERROR", "ABORTED", "CANCELLED", "CANCELED"):
+    norm_state = "Failed"
+  else:
+    norm_state = "Running"
+
+  if poll_res.get("log"):
+    store.write_bytes(
+        f"jobs/{job_id}/job.log", str(poll_res["log"]).encode("utf-8")
+    )
+  elif poll_res.get("log_append"):
+    existing_log = (
+        store.read_bytes(f"jobs/{job_id}/job.log").decode(
+            "utf-8", errors="replace"
+        )
+        if store.exists(f"jobs/{job_id}/job.log")
+        else ""
+    )
+    store.write_bytes(
+        f"jobs/{job_id}/job.log",
+        (existing_log + str(poll_res["log_append"])).encode("utf-8"),
+    )
+
+  outputs_map = poll_res.get("outputs")
+  if isinstance(outputs_map, dict):
+    for rel_sub, content in outputs_map.items():
+      data = (
+          content
+          if isinstance(content, bytes)
+          else str(content).encode("utf-8")
+      )
+      store.write_bytes(f"jobs/{job_id}/outputs/{rel_sub}", data)
+
+  if norm_state in ("Succeeded", "Failed"):
+    end_iso = _stamp_utc()
+    meta["state"] = "Complete"
+    meta["job_status"] = norm_state
+    meta["active"] = False
+    meta["complete_time"] = end_iso
+    meta["exit_code"] = int(
+        poll_res.get("exit_code", 0 if norm_state == "Succeeded" else 1)
+    )
+    for p in meta.get("pods") or []:
+      p["status"] = norm_state
+    store.write_json(rel_meta, meta)
+    store.write_bytes(
+        f"jobs/{job_id}/desc.yaml", format_desc_yaml(meta).encode("utf-8")
+    )
+    build_cluster_usage_nodes(store)
+
+  return {
+      "id": job_id,
+      "status": norm_state,
+      "xid": xid,
+      "reason": f"XManager experiment xid={xid} status={norm_state}.",
+  }
+
+
+def daemon_poll_once(
+    store: StorageBackend,
+    *,
+    dispatch_mode: str = "local_exec",
+    xm_launcher_target: str = "",
+    forge_test_target: str = "",
+    runner_fn: Optional[
+        Callable[[List[str], Dict[str, str], Path], Tuple[int, str]]
+    ] = None,
+    max_workers: int = 1,
+    worker_id: Optional[str] = None,
+    two_phase_xm: bool = False,
+    xm_poll_fn: Optional[
+        Callable[[str, str, Dict[str, Any]], Dict[str, Any]]
+    ] = None,
+    forge_stage_root: Optional[Path] = None,
+) -> Dict[str, Any]:
+  """Run one Evergreen Mode 2 dispatcher poll pass over `<storage_uri>/jobs/`."""
+  effective_workers = max(1, min(8, int(max_workers)))
+  base_worker_id = (
+      worker_id or f"{socket.gethostname()}-{os.getpid()}"
+  ).strip()
+
+  nodes = build_cluster_usage_nodes(store)
+  store.write_json("cluster/usage.json", nodes)
+
+  processed: List[Dict[str, Any]] = []
+  pending_job_ids: List[str] = []
+  running_xm_job_ids: List[str] = []
+
+  for rel in store.list_rel_paths("jobs"):
+    if not rel.endswith("/meta.json"):
+      continue
+    try:
+      meta = store.read_json(rel)
+    except Exception:
+      continue
+    job_id = str(meta.get("id") or "")
+    if not job_id:
+      continue
+    if (
+        store.exists(f"jobs/{job_id}/cancel.json")
+        and meta.get("job_status") != "Deleted"
+    ):
+      meta["state"] = "Complete"
+      meta["job_status"] = "Deleted"
+      meta["active"] = False
+      meta["complete_time"] = _stamp_utc()
+      for p in meta.get("pods") or []:
+        p["status"] = "Deleted"
+      store.write_json(rel, meta)
+      store.write_bytes(
+          f"jobs/{job_id}/desc.yaml", format_desc_yaml(meta).encode("utf-8")
+      )
+      processed.append(
+          {"id": job_id, "status": "Deleted", "reason": "Honored cancel.json"}
+      )
+      continue
+
+    if meta.get("job_status") == "Running" and meta.get("xid"):
+      running_xm_job_ids.append(job_id)
+      continue
+
+    if meta.get("job_status") == "Pending" and not store.exists(
+        f"jobs/{job_id}/claim.json"
+    ):
+      pending_job_ids.append(job_id)
+
+  for jid in running_xm_job_ids:
+    processed.append(
+        poll_running_xmanager_job(store, jid, xm_poll_fn=xm_poll_fn)
+    )
+
+  def _run_slot(slot_idx: int, jid: str) -> Dict[str, Any]:
+    slot_worker = f"{base_worker_id}-{slot_idx}"
+    store.write_json(
+        f"cluster/workers/{slot_worker}.json",
+        {
+            "worker_id": slot_worker,
+            "status": "BUSY",
+            "active_job_id": jid,
+            "dispatch_mode": dispatch_mode,
+            "timestamp_pt": _now_pt_iso(),
+            "pid": os.getpid(),
+            "thread_id": threading.get_ident(),
+        },
+    )
+    res = execute_queued_job_in_daemon(
+        store,
+        jid,
+        dispatch_mode=dispatch_mode,
+        xm_launcher_target=xm_launcher_target,
+        forge_test_target=forge_test_target,
+        runner_fn=runner_fn,
+        forge_stage_root=forge_stage_root,
+        two_phase_xm=two_phase_xm,
+        worker_id=slot_worker,
+    )
+    store.write_json(
+        f"cluster/workers/{slot_worker}.json",
+        {
+            "worker_id": slot_worker,
+            "status": "IDLE",
+            "last_job_id": jid,
+            "last_job_status": res.get("status"),
+            "dispatch_mode": dispatch_mode,
+            "timestamp_pt": _now_pt_iso(),
+            "pid": os.getpid(),
+            "thread_id": threading.get_ident(),
+        },
+    )
+    return res
+
+  if not pending_job_ids:
+    store.write_json(
+        f"cluster/workers/{base_worker_id}-0.json",
+        {
+            "worker_id": f"{base_worker_id}-0",
+            "status": "IDLE",
+            "last_job_id": "",
+            "dispatch_mode": dispatch_mode,
+            "timestamp_pt": _now_pt_iso(),
+            "pid": os.getpid(),
+        },
+    )
+  elif effective_workers == 1 or len(pending_job_ids) == 1:
+    for jid in pending_job_ids:
+      processed.append(_run_slot(0, jid))
+  else:
+    with ThreadPoolExecutor(max_workers=effective_workers) as pool:
+      futs = [
+          pool.submit(_run_slot, idx % effective_workers, jid)
+          for idx, jid in enumerate(pending_job_ids)
+      ]
+      for fut in as_completed(futs):
+        processed.append(fut.result())
+
+  summary = {
+      "status": "PASSED",
+      "timestamp_pt": _now_pt_iso(),
+      "storage_uri": store.uri,
+      "dispatch_mode": dispatch_mode,
+      "max_workers": effective_workers,
+      "worker_id": base_worker_id,
+      "processed_jobs": processed,
+      "reason": f"Polled {store.uri}: processed {len(processed)} job(s).",
+  }
+  store.write_json("cluster/daemon_heartbeat.json", summary)
+  return summary
+
+
+def generate_systemd_unit(
+    storage_uri: str,
+    *,
+    dispatch_mode: str = "xmanager_borg",
+    poll_seconds: float = 3.0,
+    max_workers: int = 1,
+) -> str:
+  script_path = Path(os.path.abspath(__file__))
+  effective_workers = max(1, min(8, int(max_workers)))
+  return (
+      "[Unit]\n"
+      "Description=Evergreen Mode 2 cdk-g3 GCS-to-Borg/Forge/Minibench"
+      " Dispatcher Daemon\n"
+      "After=network-online.target\n\n"
+      "[Service]\n"
+      "Type=simple\n"
+      f"Environment=CDK_G3_STORAGE_URI={storage_uri}\n"
+      f"ExecStart=/usr/bin/env python3 {script_path} daemon-run "
+      f"--storage-uri {shlex.quote(storage_uri)} "
+      f"--dispatch-mode {shlex.quote(dispatch_mode)} "
+      f"--max-workers {effective_workers} "
+      f"--poll-seconds {poll_seconds}\n"
+      "Restart=always\n"
+      "RestartSec=5\n\n"
+      "[Install]\n"
+      "WantedBy=default.target\n"
+  )
+
+
+# ---------------------------------------------------------------------------
+# CLI Argument Parser (Supports Both Flag Orders & Full `cdk` Compatibility)
+# ---------------------------------------------------------------------------
+
+
+def main(argv: Optional[Sequence[str]] = None) -> int:
+  raw_args = list(sys.argv[1:] if argv is None else argv)
+
+  # Extract global & position-independent flags (`--agent-code`, `--storage-uri`,
+  # `--backend`, `--minibench-mode`, `--tpu-topology`, etc.) regardless of where
+  # they appear on the command line (Rule 16 Gate 3).
+  agent_code: Optional[str] = None
+  storage_uri_arg: Optional[str] = None
+  use_shared_bucket = False
+  global_backend: Optional[str] = None
+  global_minibench_mode: Optional[str] = None
+  global_tpu_topology: Optional[str] = None
+  global_collect_telemetry = False
+  global_verify_telemetry_dir: Optional[str] = None
+  cleaned: List[str] = []
+  i = 0
+  while i < len(raw_args):
+    tok = raw_args[i]
+    if tok.startswith("--agent-code="):
+      agent_code = tok.split("=", 1)[1]
+      i += 1
+    elif tok == "--agent-code" and i + 1 < len(raw_args):
+      agent_code = raw_args[i + 1]
+      i += 2
+    elif tok.startswith("--storage-uri="):
+      storage_uri_arg = tok.split("=", 1)[1]
+      i += 1
+    elif tok == "--storage-uri" and i + 1 < len(raw_args):
+      storage_uri_arg = raw_args[i + 1]
+      i += 2
+    elif tok == "--use-shared-bucket":
+      use_shared_bucket = True
+      i += 1
+    elif tok.startswith("--use-shared-bucket="):
+      use_shared_bucket = tok.split("=", 1)[1].lower() in ("1", "true", "yes")
+      i += 1
+    elif tok.startswith("--backend="):
+      global_backend = tok.split("=", 1)[1]
+      i += 1
+    elif tok == "--backend" and i + 1 < len(raw_args):
+      global_backend = raw_args[i + 1]
+      i += 2
+    elif tok.startswith("--minibench-mode="):
+      global_minibench_mode = tok.split("=", 1)[1]
+      i += 1
+    elif tok == "--minibench-mode" and i + 1 < len(raw_args):
+      global_minibench_mode = raw_args[i + 1]
+      i += 2
+    elif tok.startswith("--tpu-topology="):
+      global_tpu_topology = tok.split("=", 1)[1]
+      i += 1
+    elif tok == "--tpu-topology" and i + 1 < len(raw_args):
+      global_tpu_topology = raw_args[i + 1]
+      i += 2
+    elif tok == "--collect-telemetry":
+      global_collect_telemetry = True
+      i += 1
+    elif tok.startswith("--collect-telemetry="):
+      global_collect_telemetry = tok.split("=", 1)[1].lower() in (
+          "1",
+          "true",
+          "yes",
+      )
+      i += 1
+    elif tok == "--nocollect-telemetry":
+      global_collect_telemetry = False
+      i += 1
+    elif tok.startswith("--verify-telemetry-dir="):
+      global_verify_telemetry_dir = tok.split("=", 1)[1]
+      i += 1
+    elif tok == "--verify-telemetry-dir" and i + 1 < len(raw_args):
+      global_verify_telemetry_dir = raw_args[i + 1]
+      i += 2
+    elif tok in ("--color", "--no-color"):
+      i += 1
+    else:
+      cleaned.append(tok)
+      i += 1
+
+  if not cleaned and global_verify_telemetry_dir:
+    tel_res = verify_telemetry_artifacts(
+        global_verify_telemetry_dir, require_all=True
+    )
+    sys.stdout.write(json.dumps(tel_res, indent=2, sort_keys=True) + "\n")
+    sys.stdout.flush()
+    if tel_res["status"] != "PASSED":
+      sys.stderr.write(f"{tel_res['reason']}\n")
+      return 2
+    return 0
+
+  if not cleaned or cleaned[0] in ("-h", "--help"):
+    sys.stdout.write(
+        "Usage: cdk-g3 [--agent-code CODE] [--storage-uri URI]"
+        " [--use-shared-bucket] [--backend auto|forge|minibench|xmanager]"
+        " [--collect-telemetry] [--verify-telemetry-dir DIR]"
+        " <agent-letter|usage|job|verify-scope|route|verify-telemetry|daemon-poll-once|daemon-run|print-systemd-unit>"
+        " ...\n"
+    )
+    return 0
+
+  cmd = cleaned[0]
+  rest = cleaned[1:]
+
+  if cmd == "agent-letter":
+    return cmd_agent_letter()
+
+  if cmd == "verify-telemetry":
+    p = argparse.ArgumentParser(prog="cdk-g3 verify-telemetry")
+    p.add_argument(
+        "--telemetry-dir",
+        default=global_verify_telemetry_dir or "",
+        help=(
+            "Root telemetry directory containing xprof/, trace_json/, hlo/, and"
+            " llo/ artifacts."
+        ),
+    )
+    p.add_argument(
+        "--require-all",
+        action="store_true",
+        default=True,
+        help=(
+            "Require all 4 telemetry categories (xprof, trace_json, hlo, llo)"
+            " to be non-empty."
+        ),
+    )
+    p.add_argument(
+        "--output-receipt",
+        default="",
+        help="Optional JSON receipt output path.",
+    )
+    ns = p.parse_args(rest)
+    t_dir = ns.telemetry_dir.strip()
+    if not t_dir:
+      sys.stderr.write(
+          "cdk-g3 verify-telemetry: missing --telemetry-dir /"
+          " --verify-telemetry-dir\n"
+      )
+      return 2
+    out_rec = Path(ns.output_receipt) if ns.output_receipt.strip() else None
+    res = verify_telemetry_artifacts(
+        t_dir,
+        require_all=ns.require_all,
+        output_receipt=out_rec,
+    )
+    sys.stdout.write(json.dumps(res, indent=2, sort_keys=True) + "\n")
+    sys.stdout.flush()
+    if res["status"] != "PASSED":
+      sys.stderr.write(f"{res['reason']}\n")
+      return 2
+    return 0
+
+  if cmd in ("verify-scope", "route"):
+    p = argparse.ArgumentParser(prog=f"cdk-g3 {cmd}")
+    p.add_argument(
+        "--changed-files",
+        default="",
+        help=(
+            "Comma-separated relative paths of candidate files modified in the"
+            " worktree. When omitted, auto-detects git diff/status under"
+            " --source-root / --source."
+        ),
+    )
+    p.add_argument(
+        "--reference-code",
+        default="",
+        help=(
+            "Optional Minibench reference_code path to include in scope"
+            " verification."
+        ),
+    )
+    p.add_argument(
+        "--custom-code",
+        default="",
+        help=(
+            "Optional Minibench custom_code path to include in scope"
+            " verification."
+        ),
+    )
+    p.add_argument(
+        "--input-generation-code",
+        default="",
+        help=(
+            "Optional Minibench input_generation_code path to include in scope"
+            " verification."
+        ),
+    )
+    p.add_argument(
+        "--source-root",
+        "--source",
+        dest="source_root",
+        default="",
+        help=(
+            "Optional root directory of the candidate checkout for AST import"
+            " closure checks and automatic git diff discovery."
+        ),
+    )
+    p.add_argument(
+        "--stage-bundle-dir",
+        default="",
+        help=(
+            "Optional directory to stage verified closure + empty __init__.py"
+            " stubs + MANIFEST.sha256."
+        ),
+    )
+    p.add_argument(
+        "--output-receipt",
+        default="",
+        help="Optional JSON receipt output path.",
+    )
+    p.add_argument(
+        "--topology",
+        "--tpu-topology",
+        dest="topology",
+        default="1x1x1",
+        help="Target TPU topology (e.g., 1x1x1, 2x2x1, 2x2x2).",
+    )
+    p.add_argument(
+        "--backend",
+        default=global_backend or "auto",
+        help="Preferred backend hint (auto, forge, minibench, xmanager).",
+    )
+    p.add_argument(
+        "--allow-dependency-closure",
+        action="store_true",
+        default=False,
+        help=(
+            "Allow pure-Python sublayer/module paths outside the default"
+            " kernel prefix allowlist when their transitive AST import closure"
+            " only uses pre-linked Google3 TPU runner packages."
+        ),
+    )
+    ns = p.parse_args(rest)
+    file_list = [
+        item.strip() for item in ns.changed_files.split(",") if item.strip()
+    ]
+    raw_src = ns.source_root.strip()
+    if not raw_src and cmd == "route" and not file_list:
+      raw_src = str(Path.cwd())
+    src_root = Path(raw_src) if raw_src else None
+    stage_dir = (
+        Path(ns.stage_bundle_dir) if ns.stage_bundle_dir.strip() else None
+    )
+    out_rec = Path(ns.output_receipt) if ns.output_receipt.strip() else None
+    res = verify_cdk_g3_benchmark_scope(
+        file_list,
+        source_root=src_root,
+        stage_bundle_dir=stage_dir,
+        output_receipt=out_rec,
+        reference_code=ns.reference_code.strip() or None,
+        custom_code=ns.custom_code.strip() or None,
+        input_generation_code=ns.input_generation_code.strip() or None,
+        topology=ns.topology.strip() or "1x1x1",
+        backend_hint=ns.backend.strip() or "auto",
+        allow_dependency_closure=ns.allow_dependency_closure,
+    )
+    sys.stdout.write(json.dumps(res, indent=2, sort_keys=True) + "\n")
+    sys.stdout.flush()
+    if res["status"] != "ELIGIBLE_FOR_CDK_G3":
+      sys.stderr.write(f"{res['reason']}\n")
+      return 2
+    return 0
+
+  if agent_code is not None and agent_code != EXPECTED_ACK_CODE:
+    if not re.fullmatch(r"[0-9A-Fa-f]+(?:-[0-9A-Fa-f]+)+", agent_code):
+      sys.stderr.write(f"cdk-g3: invalid --agent-code {agent_code!r}\n")
+      return 2
+
+  store = StorageBackend(
+      resolve_storage_uri(storage_uri_arg, use_shared_bucket=use_shared_bucket)
+  )
+
+  if cmd == "usage":
+    as_json = "-o" in rest and "json" in rest
+    return cmd_usage(store, as_json=as_json)
+
+  if cmd == "job":
+    if not rest:
+      sys.stderr.write(
+          "cdk-g3 job: missing subcommand"
+          " (create|list|desc|log|delete|sync-outputs)\n"
+      )
+      return 2
+    sub = rest[0]
+    sub_args = rest[1:]
+
+    if sub == "create":
+      if not sub_args:
+        sys.stderr.write("cdk-g3 job create: missing <recipe_name>\n")
+        return 2
+      recipe_name: Optional[str] = None
+      kv_overrides: Dict[str, str] = {}
+      tags: List[str] = []
+      map_dirs: List[str] = []
+      deadline = 7200
+      recipes_dir: Optional[Path] = None
+      verify_scope_files: List[str] = []
+      source_root: Optional[Path] = None
+      backend = global_backend or "auto"
+      minibench_mode = global_minibench_mode or "auto"
+      tpu_topology: Optional[str] = global_tpu_topology
+      reference_code: Optional[str] = None
+      custom_code: Optional[str] = None
+      input_generation_code: Optional[str] = None
+      kernelbench_profile_llo = True
+      enable_percale = True
+      generate_runtime_llo_report = True
+      allow_tiny_shape_waiver = False
+      two_phase_xm = False
+
+      j = 0
+      while j < len(sub_args):
+        a = sub_args[j]
+        if a in ("-t", "--tags") and j + 1 < len(sub_args):
+          tags.append(sub_args[j + 1])
+          j += 2
+        elif a.startswith("-t="):
+          tags.append(a.split("=", 1)[1])
+          j += 1
+        elif a == "--map-dir" and j + 1 < len(sub_args):
+          map_dirs.append(sub_args[j + 1])
+          j += 2
+        elif a.startswith("--map-dir="):
+          map_dirs.append(a.split("=", 1)[1])
+          j += 1
+        elif a in ("--mount-nfs", "--log-mode") and j + 1 < len(sub_args):
+          j += 2
+        elif a == "--active-deadline-seconds" and j + 1 < len(sub_args):
+          deadline = int(sub_args[j + 1])
+          j += 2
+        elif a.startswith("--active-deadline-seconds="):
+          deadline = int(a.split("=", 1)[1])
+          j += 1
+        elif a == "--recipes-dir" and j + 1 < len(sub_args):
+          recipes_dir = Path(sub_args[j + 1])
+          j += 2
+        elif a.startswith("--recipes-dir="):
+          recipes_dir = Path(a.split("=", 1)[1])
+          j += 1
+        elif a == "--verify-scope-files" and j + 1 < len(sub_args):
+          verify_scope_files.extend(
+              x.strip() for x in sub_args[j + 1].split(",") if x.strip()
+          )
+          j += 2
+        elif a.startswith("--verify-scope-files="):
+          verify_scope_files.extend(
+              x.strip() for x in a.split("=", 1)[1].split(",") if x.strip()
+          )
+          j += 1
+        elif a == "--source-root" and j + 1 < len(sub_args):
+          source_root = Path(sub_args[j + 1])
+          j += 2
+        elif a.startswith("--source-root="):
+          source_root = Path(a.split("=", 1)[1])
+          j += 1
+        elif a == "--reference-code" and j + 1 < len(sub_args):
+          reference_code = sub_args[j + 1]
+          j += 2
+        elif a.startswith("--reference-code="):
+          reference_code = a.split("=", 1)[1]
+          j += 1
+        elif a == "--custom-code" and j + 1 < len(sub_args):
+          custom_code = sub_args[j + 1]
+          j += 2
+        elif a.startswith("--custom-code="):
+          custom_code = a.split("=", 1)[1]
+          j += 1
+        elif a == "--input-generation-code" and j + 1 < len(sub_args):
+          input_generation_code = sub_args[j + 1]
+          j += 2
+        elif a.startswith("--input-generation-code="):
+          input_generation_code = a.split("=", 1)[1]
+          j += 1
+        elif a in (
+            "--kernelbench-profile-llo",
+            "--enable-percale",
+            "--generate-runtime-llo-report",
+            "--allow-tiny-shape-waiver",
+            "--two-phase-xm",
+        ):
+          if a == "--allow-tiny-shape-waiver":
+            allow_tiny_shape_waiver = True
+          elif a == "--two-phase-xm":
+            two_phase_xm = True
+          j += 1
+        elif a.startswith("--two-phase-xm="):
+          two_phase_xm = a.split("=", 1)[1].lower() in ("1", "true", "yes")
+          j += 1
+        elif a.startswith("--kernelbench-profile-llo="):
+          kernelbench_profile_llo = a.split("=", 1)[1].lower() in (
+              "1",
+              "true",
+              "yes",
+          )
+          j += 1
+        elif a == "--nokernelbench-profile-llo":
+          kernelbench_profile_llo = False
+          j += 1
+        elif a.startswith("--enable-percale="):
+          enable_percale = a.split("=", 1)[1].lower() in ("1", "true", "yes")
+          j += 1
+        elif a == "--noenable-percale":
+          enable_percale = False
+          j += 1
+        elif a.startswith("--generate-runtime-llo-report="):
+          generate_runtime_llo_report = a.split("=", 1)[1].lower() in (
+              "1",
+              "true",
+              "yes",
+          )
+          j += 1
+        elif a == "--nogenerate-runtime-llo-report":
+          generate_runtime_llo_report = False
+          j += 1
+        elif "=" in a and not a.startswith("-"):
+          k, v = a.split("=", 1)
+          kv_overrides[k] = v
+          j += 1
+        elif recipe_name is None and not a.startswith("-"):
+          recipe_name = a
+          j += 1
+        else:
+          j += 1
+      if not recipe_name:
+        sys.stderr.write("cdk-g3 job create: missing <recipe_name>\n")
+        return 2
+      return cmd_job_create(
+          store,
+          recipe_name,
+          kv_overrides,
+          tags=tags,
+          map_dirs=map_dirs,
+          active_deadline_seconds=deadline,
+          recipes_dir=recipes_dir,
+          verify_scope_files=verify_scope_files,
+          source_root=source_root,
+          backend=backend,
+          minibench_mode=minibench_mode,
+          tpu_topology=tpu_topology,
+          reference_code=reference_code,
+          custom_code=custom_code,
+          input_generation_code=input_generation_code,
+          kernelbench_profile_llo=kernelbench_profile_llo,
+          enable_percale=enable_percale,
+          generate_runtime_llo_report=generate_runtime_llo_report,
+          allow_tiny_shape_waiver=allow_tiny_shape_waiver,
+          collect_telemetry=global_collect_telemetry,
+          verify_telemetry_dir=Path(global_verify_telemetry_dir)
+          if global_verify_telemetry_dir
+          else None,
+          two_phase_xm=two_phase_xm,
+      )
+
+    if sub == "list":
+      tag_filter: Optional[str] = None
+      user_filter: Optional[str] = None
+      limit = 300
+      as_json = False
+      j = 0
+      while j < len(sub_args):
+        a = sub_args[j]
+        if a in ("-a", "-A"):
+          j += 1
+        elif a == "-t" and j + 1 < len(sub_args):
+          tag_filter = sub_args[j + 1]
+          j += 2
+        elif a == "-u" and j + 1 < len(sub_args):
+          user_filter = sub_args[j + 1]
+          j += 2
+        elif a == "-n" and j + 1 < len(sub_args):
+          limit = int(sub_args[j + 1])
+          j += 2
+        elif a == "-o" and j + 1 < len(sub_args):
+          as_json = sub_args[j + 1] == "json"
+          j += 2
+        else:
+          j += 1
+      return cmd_job_list(
+          store,
+          tag_filter=tag_filter,
+          user_filter=user_filter,
+          limit=limit,
+          as_json=as_json,
+      )
+
+    if sub == "desc":
+      job_ids = [a for a in sub_args if not a.startswith("-")]
+      if not job_ids:
+        sys.stderr.write("cdk-g3 job desc: missing <job_id>\n")
+        return 2
+      return cmd_job_desc(store, job_ids[0])
+
+    if sub == "log":
+      job_ids = []
+      j = 0
+      while j < len(sub_args):
+        a = sub_args[j]
+        if a in ("-p", "-c") and j + 1 < len(sub_args):
+          j += 2
+        elif not a.startswith("-"):
+          job_ids.append(a)
+          j += 1
+        else:
+          j += 1
+      if not job_ids:
+        sys.stderr.write("cdk-g3 job log: missing <job_id>\n")
+        return 2
+      return cmd_job_log(store, job_ids[0])
+
+    if sub == "delete":
+      job_ids = [a for a in sub_args if not a.startswith("-")]
+      if not job_ids:
+        sys.stderr.write("cdk-g3 job delete: missing <job_id>\n")
+        return 2
+      return cmd_job_delete(store, job_ids[0])
+
+    if sub == "sync-outputs":
+      job_ids = [a for a in sub_args if not a.startswith("-")]
+      if not job_ids:
+        sys.stderr.write("cdk-g3 job sync-outputs: missing <job_id>\n")
+        return 2
+      return cmd_job_sync_outputs(store, job_ids[0])
+
+    sys.stderr.write(f"cdk-g3 job: unknown subcommand {sub!r}\n")
+    return 2
+
+  if cmd in ("daemon-poll-once", "daemon-run"):
+    p = argparse.ArgumentParser(prog=f"cdk-g3 {cmd}")
+    p.add_argument(
+        "--dispatch-mode",
+        choices=[
+            "local_exec",
+            "xmanager_borg",
+            "forge_tpu",
+            "minibench",
+            "auto",
+        ],
+        default="local_exec",
+    )
+    p.add_argument("--xm-launcher-target", default="")
+    p.add_argument("--forge-test-target", default="")
+    p.add_argument("--poll-seconds", type=float, default=3.0)
+    p.add_argument("--max-polls", type=int, default=0)
+    p.add_argument("--max-workers", type=int, default=1)
+    p.add_argument("--worker-id", default="")
+    p.add_argument("--two-phase-xm", action="store_true", default=False)
+    ns = p.parse_args(rest)
+
+    if cmd == "daemon-poll-once":
+      res = daemon_poll_once(
+          store,
+          dispatch_mode=ns.dispatch_mode,
+          xm_launcher_target=ns.xm_launcher_target,
+          forge_test_target=ns.forge_test_target,
+          max_workers=ns.max_workers,
+          worker_id=ns.worker_id or None,
+          two_phase_xm=ns.two_phase_xm,
+      )
+      sys.stdout.write(json.dumps(res, indent=2, sort_keys=True) + "\n")
+      return 0
+
+    polls = 0
+    while True:
+      daemon_poll_once(
+          store,
+          dispatch_mode=ns.dispatch_mode,
+          xm_launcher_target=ns.xm_launcher_target,
+          forge_test_target=ns.forge_test_target,
+          max_workers=ns.max_workers,
+          worker_id=ns.worker_id or None,
+          two_phase_xm=ns.two_phase_xm,
+      )
+      polls += 1
+      if ns.max_polls > 0 and polls >= ns.max_polls:
+        break
+      time.sleep(max(0.1, ns.poll_seconds))
+    return 0
+
+  if cmd == "print-systemd-unit":
+    p = argparse.ArgumentParser(prog="cdk-g3 print-systemd-unit")
+    p.add_argument(
+        "--dispatch-mode",
+        choices=[
+            "local_exec",
+            "xmanager_borg",
+            "forge_tpu",
+            "minibench",
+            "auto",
+        ],
+        default="xmanager_borg",
+    )
+    p.add_argument("--poll-seconds", type=float, default=3.0)
+    p.add_argument("--max-workers", type=int, default=1)
+    ns = p.parse_args(rest)
+    sys.stdout.write(
+        generate_systemd_unit(
+            store.uri,
+            dispatch_mode=ns.dispatch_mode,
+            poll_seconds=ns.poll_seconds,
+            max_workers=ns.max_workers,
+        )
+    )
+    return 0
+
+  sys.stderr.write(f"cdk-g3: unknown command {cmd!r}\n")
+  return 2
+
+
+if __name__ == "__main__":
+  sys.exit(main())
