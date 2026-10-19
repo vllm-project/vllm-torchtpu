@@ -13,24 +13,24 @@
 # limitations under the License.
 """TPU_SCHED_PAW_SORT_WAITING: the waiting queue is sorted inside schedule().
 
-vLLM v0.31.0 no longer calls ``_select_waiting_queue_for_scheduling`` from its
-waiting loop, so these tests check the order the base scheduler sees when it
-starts admitting, i.e. inside ``AsyncScheduler.schedule``.
+These tests check the order the base scheduler sees when it starts admitting,
+i.e. inside ``AsyncScheduler.schedule``. The warmest-first promotion that
+schedule() runs on the same queue is stubbed out so the order is the sort's.
 """
 
 import time
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
-import pytest
-import vllm
 from vllm.v1.core.sched.async_scheduler import AsyncScheduler
 from vllm.v1.core.sched.request_queue import FCFSRequestQueue, SchedulingPolicy
 
 from vllm_torchtpu.core.prefix_aware_scheduler import PrefixAwareScheduler
 
 
-def _req(request_id, num_tokens, arrival_time, num_computed_tokens=0, num_preemptions=0):
+def _req(
+    request_id, num_tokens, arrival_time, num_computed_tokens=0, num_preemptions=0
+):
     return SimpleNamespace(
         request_id=request_id,
         num_tokens=num_tokens,
@@ -61,6 +61,11 @@ def _scheduler(monkeypatch, requests, warmth, sort="1", aging="0", window=None):
     s._paw_prompt_tokens = 0
     s._paw_scoring_broken = False
     s._mk_max_running = 0
+    s._is_kv_producer = False
+    s._is_kv_consumer = False
+    s._kv_prefetch_n = 0
+    s._kv_prefetch_cap = None
+    s._select_waiting_queue_for_scheduling = lambda: None
     s.block_size = 2176
 
     coordinator = MagicMock()
@@ -102,6 +107,7 @@ def test_flag_off_leaves_waiting_fcfs(monkeypatch):
     warmth = {"small_warm": 90_000, "mid_warm": 50_000}
     s = _scheduler(monkeypatch, reqs, warmth, sort="0")
     assert _order_seen_by_base_schedule(s) == ["big_cold", "small_warm", "mid_warm"]
+    assert s._paw_sort_steps == 0
 
 
 def test_sorts_by_uncached_tokens_before_base_schedule(monkeypatch):
@@ -211,9 +217,3 @@ def test_sort_failure_disables_the_flag_and_schedule_still_runs(monkeypatch):
     s._paw_sort_key = boom
     assert _order_seen_by_base_schedule(s) == ["a", "b"]
     assert s._paw_sort is False
-
-
-@pytest.mark.skipif(vllm.__version__ != "0.31.0", reason="pins v0.31.0 behaviour")
-def test_vllm_0_31_waiting_loop_skips_the_selection_hook():
-    # The reason the flag exists: on v0.31.0 _promote_warmest is never reached.
-    assert PrefixAwareScheduler._base_calls_waiting_hook() is False
