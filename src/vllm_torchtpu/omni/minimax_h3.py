@@ -1,10 +1,13 @@
 # SPDX-License-Identifier: Apache-2.0
 """TPU patches for the vLLM-Omni MiniMax-H3 pipeline.
 
-The patches replace the pipeline's hand-rolled broadcasts and object
-collectives, the video VAE device context and the Triton-only
-indexed-modulation kernels, none of which run on torch_tpu as written
-upstream.
+The patches fall into two groups, in file order:
+
+- Correctness: the pipeline's hand-rolled broadcasts and object collectives,
+  the video VAE device context and the Triton-only indexed-modulation
+  kernels, none of which run on torch_tpu as written upstream.
+- Denoise performance: keep host syncs out of the denoise loop (AdaLN
+  cache).
 
 Each patch carries its rationale in a comment block at its entry point.
 Patches only touch modules that are already loaded, do nothing without
@@ -15,6 +18,7 @@ nothing.
 import functools
 import pickle
 import sys
+import types
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -831,6 +835,101 @@ def patch_indexed_modulation() -> bool:
     return changed
 
 
+# -----------------------------------------------------------------------------
+# DiT forward: exact AdaLN projection cache.
+# -----------------------------------------------------------------------------
+
+ADALN_CACHE_MODULE = "vllm_omni.diffusion.models.minimax_h3.adaln_cache"
+
+
+def _is_tpu(value: Any) -> bool:
+    """Whether a tensor, device or device string is on torch_tpu.
+
+    Values with no device (e.g. ``None``) count as not TPU.
+    """
+    device = getattr(value, "device", value)
+    if isinstance(device, str):
+        return device.split(":", 1)[0] == "tpu"
+    return getattr(device, "type", None) == "tpu"
+
+
+def _loaded_module(name: str) -> types.ModuleType | None:
+    """``sys.modules[name]`` if it is a loaded module (never imports it)."""
+    module = sys.modules.get(name)
+    return module if isinstance(module, types.ModuleType) else None
+
+
+def patch_adaln_projection_cache() -> bool:
+    # -------------------------------------------------------------------------
+    # Upstream vLLM-Omni Root Cause Tracking:
+    # Upstream: MiniMaxH3DiTModel.forward calls adaln_cache.prepare(t_emb)
+    # after the embedders and the token refiner (minimax_h3_transformer.py
+    # :1812-1813 at vllm-omni e1d77a3). ExactProjectionCache.prepare hashes
+    # t_emb with tensor_digest, which copies it to the host
+    # (exact_projection_cache.py:56-62, :175-180). Every AdaLN projection (50
+    # blocks + the final layer, minimax_h3_transformer.py:885-903) then goes
+    # through ExactProjectionCache.project, which at TP > 1 votes on the hit
+    # with get_tp_group().all_reduce(vote).item() (exact_projection_cache.py
+    # :136-138) before it runs or skips the GEMM. The cache is on by default
+    # (256 MiB, minimax_h3_transformer.py:1294-1333).
+    #
+    # Problem on TPU: under torch_tpu eager DEFER_AND_FUSE every host read is
+    # a device sync, so each forward pays one digest sync plus 51 all-reduce
+    # + .item() round trips, and the host cannot queue block i+1 before block
+    # i has finished. Hits only happen for a repeated schedule. They skip
+    # ~2 ms of [M, 2688] x [2688, 96768 / TP] GEMMs per forward but run a
+    # different (GEMM-free) program, which torch_tpu compiles again: on v7x-8
+    # the second request spent 2.25 s / 2.85 s / 4.47 s on each of steps 1-2
+    # against 0.27 / 0.5 / 1.26 s warm steps (256x256x4s / 480x480x4s /
+    # 768x768x5s).
+    #
+    # Fix: on TPU, prepare() leaves the cache unarmed (_input = _key = None),
+    # the state upstream itself uses for max_bytes=0 and grad mode. project()
+    # then returns compute() before the vote, so every forward runs the same
+    # projections without a host round trip. Outputs are bit-identical (a hit
+    # returns a clone of the same projection). Other devices keep the cache.
+    #
+    # REMOVAL / FIX CONDITION:
+    # Remove once upstream ExactProjectionCache decides hits without a host
+    # digest and a per-projection TP vote (or skips arming itself on devices
+    # where that sync costs more than the projection), or torch_tpu overlaps
+    # host reads with already queued device work.
+    # -------------------------------------------------------------------------
+    module = _loaded_module(ADALN_CACHE_MODULE)
+    cls = getattr(module, "MiniMaxH3RuntimeAdalnCache", None)
+    if not isinstance(cls, type):
+        msg = "Skipping MiniMax-H3 AdaLN cache TPU patch: %s is not loaded."
+        if _loaded_module(PIPELINE_MODULE):
+            # Skipping on only some TP ranks would hang the TP all-reduce vote.
+            logger.warning(msg, ADALN_CACHE_MODULE)
+        else:
+            logger.debug(msg, ADALN_CACHE_MODULE)
+        return False
+    if "_tpu_orig_prepare" in cls.__dict__:
+        return False
+    original = cls.prepare
+
+    @torch.compiler.disable
+    @functools.wraps(original)
+    def prepare(self: Any, embedding: torch.Tensor) -> None:
+        if not _is_tpu(embedding):
+            return original(self, embedding)
+        self._input = None
+        self._key = None
+        # _sidecar_plan = None loses nothing on TPU because math_identity(device)
+        # never matches a CUDA-built manifest.
+        self._sidecar_plan = None
+        return None
+
+    cls._tpu_orig_prepare = original
+    cls.prepare = prepare
+    logger.info(
+        "Applied TPU patch: MiniMax-H3 AdaLN projections without the host "
+        "digest and TP hit vote."
+    )
+    return True
+
+
 def apply_minimax_h3_patches() -> bool:
     """Patch the MiniMax-H3 pipeline module if it is already loaded.
 
@@ -850,4 +949,5 @@ def apply_minimax_h3_patches() -> bool:
     patched = patch_pipeline_tensor_broadcasts(pipeline)
     patched = patch_pipeline_object_collectives(pipeline) or patched
     patched = patch_video_vae_device_module(pipeline) or patched
-    return patch_indexed_modulation() or patched
+    patched = patch_indexed_modulation() or patched
+    return patch_adaln_projection_cache() or patched
