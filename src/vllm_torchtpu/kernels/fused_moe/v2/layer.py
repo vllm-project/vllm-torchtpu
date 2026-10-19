@@ -278,6 +278,7 @@ def fused_ep_moe_v2(
     hash_topk_ids=None,
     routed_scaling_factor=1.0,
     token_replica_groups=None,
+    logical_intermediate_size=None,
     stage="fused",
     routed=None,
     gather_positions=None,
@@ -518,6 +519,7 @@ def fused_ep_moe_v2(
         has_w1_bias=has_w1_bias,
         has_w2_bias=has_w2_bias,
         pad_scale_rows=pad_scale_rows,
+        logical_intermediate_size=logical_intermediate_size,
     )
 
     layout = _exchange_layout(t_local, topk, e_total, form.quantized_activations)
@@ -985,6 +987,7 @@ def fused_ep_moe_v2(
         float(routed_scaling_factor),
         stage,
         gather_positions,
+        logical_intermediate_size,
     )
     body, out_specs = {
         "fused": (local_fn, P(ax)),
