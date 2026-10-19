@@ -17,39 +17,11 @@ Follow these installation steps:
 
 > We recommend using `uv` for installing dependencies as it is significantly faster than standard `pip`.
 
-> [!TIP]
-> A common cause of authentication errors when using `keyring` with `uv` is an existing `~/.netrc` file containing stale credentials.
->
-> To resolve this, open `~/.netrc` in your preferred text editor and delete the block associated with `us-python.pkg.dev`. It will look something like this:
->
-> ```text
-> machine us-python.pkg.dev
-> login oauth2accesstoken
-> password <your_expired_token>
-> ```
+> `torch-tpu` and the other dependencies are installed from PyPI; `torch` and
+> `torchvision` come from the PyTorch CPU index
+> (`https://download.pytorch.org/whl/cpu`). No authentication is required.
 
-### 1. Google Cloud Authentication
-
-We need to authenticate with Google Cloud to access the private Torch TPU Virtual Registry (`https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/`). This registry contains packages like `torch-tpu`, `torch`, and other dependencies required by `vllm-torchtpu`.
-
-Make sure you are logged into `gcloud` using your corporate account (i.e., one that has read permissions for the Torch TPU registry). If you need access to this registry, please reach out to the Torch TPU team.
-
-You can check your active account by running:
-
-```bash
-gcloud auth list
-```
-
-If the active account is not your corporate account, switch to it or log in by running:
-
-```bash
-gcloud auth login
-
-# For keyring authentication, see https://github.com/GoogleCloudPlatform/artifact-registry-python-tools?tab=readme-ov-file#authentication
-gcloud auth application-default login
-```
-
-### 2. Install vLLM-TorchTPU and dependencies
+### 1. Install vLLM-TorchTPU and dependencies
 
 First, clone the repo, for one viewing this doc from web.
 
@@ -88,12 +60,6 @@ source during this process.
 uv venv --python 3.12 ~/uv_venv
 source ~/uv_venv/bin/activate
 
-# Set the username for the index
-export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken"
-
-# Install keyring and Google Artifact Registry plugin for persistent auth
-uv tool install keyring --with keyrings.google-artifactregistry-auth
-
 # Use CPU Torch when building vLLM's editable TPU package.
 export UV_TORCH_BACKEND=cpu
 
@@ -108,18 +74,13 @@ python3.12 -m venv ~/pip_venv --symlinks
 source ~/pip_venv/bin/activate
 pip install --upgrade pip
 
-# Install keyring and Google Artifact Registry plugin for persistent auth
-pip install keyring keyrings.google-artifactregistry-auth
-
-# Set the PIP_INDEX_URL environment variable (using keyring)
-export PIP_INDEX_URL="https://oauth2accesstoken@us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple/"
-
 # Install vLLM-TorchTPU and dependencies (--group vllm pulls vLLM from source;
-# needs pip >= 25.1)
-VLLM_TARGET_DEVICE="empty" pip install --pre -e . --group vllm
+# needs pip >= 25.1). torch and torchvision come from the PyTorch CPU index.
+VLLM_TARGET_DEVICE="empty" pip install --pre -e . --group vllm \
+  --extra-index-url https://download.pytorch.org/whl/cpu
 ```
 
-### 3. \[Optional\] Install vLLM
+### 2. \[Optional\] Install vLLM
 
 The local installation of `vllm` is optional. Follow these steps when
 one need to develop with `vllm` directly.

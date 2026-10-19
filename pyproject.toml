@@ -35,7 +35,7 @@ dependencies = [
     # torch==2.13.0 above; a mismatched pair fails at operator-registration time,
     # not at install time.
     "torchvision==0.28.0",
-    "torch-tpu==0.2.0rc5",
+    "torch-tpu==0.2.0",
     # High-bandwidth PJRT raw-transfer / KV-cache DMA engine backing the
     # raiden KV connector (disaggregated serving) and host KV offload; the
     # import name is `tpu_sync`. The wheel bundles one extension per
@@ -274,15 +274,14 @@ include = ["vllm_torchtpu*"]
 
 [tool.setuptools_scm]
 
-[tool.uv]
-keyring-provider = "subprocess"
-
+# torch and torchvision come from the PyTorch CPU index: PyPI's Linux wheels of
+# torch are the CUDA build and would pull in the nvidia-* stack. torch-tpu and
+# everything else come from PyPI.
 [[tool.uv.index]]
-name = "torch-tpu-registry"
-# torch-tpu-release-virtual-registry is a virtual registry that combines the PyTorch CPU index, Torch TPU index,
-# and the PyPI index. It priortizes package installs as such: PyTorch CPU index > Torch TPU index > PyPI index.
-url = "https://us-python.pkg.dev/ml-oss-artifacts-published/torch-tpu-release-virtual-registry/simple/"
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.sources]
-torch-tpu = { index = "torch-tpu-registry" }
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }
