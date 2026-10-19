@@ -42,7 +42,9 @@ def test_decode_route(monkeypatch, width, mode):
         page_records,
         candidate_count,
         candidate_block_size,
+        halfplane=False,
     ):
+        assert not halfplane
         calls.append(True)
         assert page_records == 128
         assert pages.shape == (count, (1 << (width - 1).bit_length()) // 128)
@@ -59,7 +61,10 @@ def test_decode_route(monkeypatch, width, mode):
         assert candidate_count == 0
         return result
 
-    def old_score(q, pool, records, weights, lengths, requests, page_records):
+    def old_score(
+        q, pool, records, weights, lengths, requests, page_records, *, halfplane=False
+    ):
+        assert not halfplane
         return jnp.ones((q.shape[0], records.shape[1]), jnp.float32)
 
     def old_select(scores, lengths, candidates, *args):

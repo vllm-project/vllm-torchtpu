@@ -1460,7 +1460,8 @@ class TestModelInitAndWeights:
             mock_super.assert_called_once()
             mock_pack.assert_called_once_with([])
 
-    def test_model_init_validation_and_ced_setup(self) -> None:
+    @patch("vllm_torchtpu.models.vllm.deepseek_v41.v2.model.initialize_shifted_mhc")
+    def test_model_init_validation_and_ced_setup(self, _mock_shifted_mhc) -> None:
         def fake_super_init(self: Any, *, vllm_config: Any, prefix: str = "") -> None:
             torch.nn.Module.__init__(self)
             self.use_sequence_parallel = getattr(
@@ -1765,7 +1766,9 @@ class TestDeepseekV41ForCausalLM:
         engram_dp_size: int,
     ) -> None:
         cfg = _mock_vllm_config(dp_size=dp_size, ep_enabled=True)
-        cfg.engram_config = SimpleNamespace(dp_shared_memory=shared_memory)
+        cfg.engram_config = SimpleNamespace(
+            cpu_offload=True, dp_shared_memory=shared_memory
+        )
 
         def init(self, *, vllm_config, prefix=""):
             # Upstream may disable sharing when /dev/shm is too small.

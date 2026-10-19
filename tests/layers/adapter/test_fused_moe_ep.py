@@ -590,7 +590,7 @@ def test_nvfp4_requires_explicit_w4a8_opt_in(monkeypatch, setting, enabled):
         monkeypatch.setenv(name, setting)
     value = envs.environment_variables[name]()
     assert value is enabled
-    monkeypatch.setattr(envs, name, value)
+    monkeypatch.setitem(vars(envs), name, value)
     assert _prebuild(_fp4_layer(), weight_format="fp4", rhs_qb=512) == (
         "op" if enabled else None
     )
@@ -769,7 +769,7 @@ def test_nvfp4_load_prepares_scales_and_dispatches_only_when_armed(
         return op if admitted else None
 
     monkeypatch.setattr(bridge, "prebuild_fused_moe_ep", prebuild)
-    monkeypatch.setattr(envs, "MOE_REQUANTIZE_BLOCK_SIZE", block)
+    monkeypatch.setitem(vars(envs), "MOE_REQUANTIZE_BLOCK_SIZE", block)
     method.process_weights_after_loading(layer)
     # Requantization must not enable FP8 activations in the GMM fallback,
     # even when the layer is also admitted to fused EP.
@@ -885,9 +885,9 @@ def test_nvfp4_default_block_and_explicit_override(
         with patch.object(bridge, "prebuild_fused_moe_ep", original_prebuild):
             return _prebuild(layer, **kwargs)
 
-    monkeypatch.setattr(envs, "USE_MOE_FUSED_EP_KERNEL", fused_enabled)
-    monkeypatch.setattr(envs, "MOE_FUSED_EP_ENABLE_W4A8", w4a8_enabled)
-    monkeypatch.setattr(envs, "MOE_REQUANTIZE_BLOCK_SIZE", configured_block)
+    monkeypatch.setitem(vars(envs), "USE_MOE_FUSED_EP_KERNEL", fused_enabled)
+    monkeypatch.setitem(vars(envs), "MOE_FUSED_EP_ENABLE_W4A8", w4a8_enabled)
+    monkeypatch.setitem(vars(envs), "MOE_REQUANTIZE_BLOCK_SIZE", configured_block)
     monkeypatch.setattr(nvfp4, "RoutedExperts", torch.nn.Module)
     monkeypatch.setattr(nvfp4, "load_kmajor_fp4", load)
     monkeypatch.setattr(nvfp4, "requant_load_kmajor_fp4", requant)
@@ -1000,7 +1000,7 @@ def test_nvfp4_admission_and_prepared_weight_validation(
         with patch.object(bridge, "prebuild_fused_moe_ep", original_prebuild):
             return _prebuild(candidate, **admission, **kwargs)
 
-    monkeypatch.setattr(envs, "MOE_REQUANTIZE_BLOCK_SIZE", configured_block)
+    monkeypatch.setitem(vars(envs), "MOE_REQUANTIZE_BLOCK_SIZE", configured_block)
     monkeypatch.setattr(nvfp4, "RoutedExperts", torch.nn.Module)
     monkeypatch.setattr(nvfp4, "load_kmajor_fp4", load)
     monkeypatch.setattr(nvfp4, "requant_load_kmajor_fp4", requant)

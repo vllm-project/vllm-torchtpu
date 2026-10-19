@@ -908,6 +908,7 @@ def test_model_init_validation_and_ced_setup(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(v2_model.upstream.DeepseekV4Model, "__init__", fake_super_init)
     monkeypatch.setattr(v2_model, "initialize_cache_ops", lambda: None)
     monkeypatch.setattr(v2_model, "initialize_delayed_mhc", lambda: None)
+    monkeypatch.setattr(v2_model, "initialize_shifted_mhc", lambda: None)
     monkeypatch.setattr(v2_model, "initialize_mhc_post", lambda: None)
     monkeypatch.setattr(v2_model, "initialize_paged_attention", lambda: None)
     monkeypatch.setattr(v2_model, "initialize_indexer", lambda: None)
