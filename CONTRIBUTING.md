@@ -195,7 +195,7 @@ Tests requiring physical TPU hardware run in Buildkite CI.
 When opening a pull request, please select the appropriate category prefix from the PR template (`[Bugfix]`, `[Core]`, `[Kernel]`, `[Model]`, `[Frontend]`, `[CI/Build]`, `[Doc]`, `[Misc]`) and complete the description and test plan checklists.
 
 ### Reviewer Routing
-GitHub Actions automatically matches changed files against `.github/CODEOWNERS` and requests reviews from the appropriate area owners upon PR creation.
+GitHub automatically requests reviews from the owners in `.github/CODEOWNERS` of the files a PR changes, and a PR needs an approval from a code owner of each area it touches before it can merge.
 
 ---
 
