@@ -25,7 +25,6 @@ leaves the TensorCore free.
 """
 
 import functools
-from collections.abc import Callable
 from typing import Any, cast
 
 import jax
@@ -137,7 +136,7 @@ def generate_mask_sc(
     )
 
     out = cast(
-        Callable[..., jax.Array],
+        jax.Array,
         pl.kernel(
             functools.partial(
                 mask_kernel,
@@ -153,7 +152,7 @@ def generate_mask_sc(
             ),
             mesh=vector_mesh,
             name="sc_mask_generate",
-        ),
-    )(padded_topk_indices)
+        )(padded_topk_indices),
+    )
 
     return out[:chunk_size, :]

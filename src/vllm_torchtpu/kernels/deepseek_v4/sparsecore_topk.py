@@ -31,7 +31,6 @@ or beyond ``row_lengths`` are never selected. NaNs are unsupported.
 """
 
 import functools
-from collections.abc import Callable
 from typing import cast
 
 import jax
@@ -442,32 +441,29 @@ def _sc_topk_direct(
         pltpu.VMEM((k + LANES,), jnp.int32),
     )
 
-    out = cast(
-        Callable[..., tuple[jax.Array, jax.Array]],
-        pl.kernel(
-            functools.partial(
-                _topk_kernel,
-                b=b,
-                n=n,
-                k=k,
-                slice_len=slice_len,
-                num_waves=num_waves,
-                write_empty=write_empty,
-            ),
-            out_type=out_type,
-            compiler_params=pltpu.CompilerParams(
-                disable_bounds_checks=True, needs_layout_passes=False
-            ),
-            scratch_types=scratch_types,
-            mesh=mesh,
-            name=f"sc_topk_direct_b{b}_n{n}_k{k}",
+    out = pl.kernel(
+        functools.partial(
+            _topk_kernel,
+            b=b,
+            n=n,
+            k=k,
+            slice_len=slice_len,
+            num_waves=num_waves,
+            write_empty=write_empty,
         ),
+        out_type=out_type,
+        compiler_params=pltpu.CompilerParams(
+            disable_bounds_checks=True, needs_layout_passes=False
+        ),
+        scratch_types=scratch_types,
+        mesh=mesh,
+        name=f"sc_topk_direct_b{b}_n{n}_k{k}",
     )(words.reshape(-1), lengths_2d.reshape(-1))
     if scheduling_group_id is not None:
         out = xla_metadata.set_xla_metadata(
             out, _scheduling_group_id=scheduling_group_id
         )
-    slots, keys = out
+    slots, keys = cast(tuple[jax.Array, jax.Array], out)
     slots_2d = slots.reshape(padded_b, k)[:b]
     keys_2d = keys.reshape(padded_b, k)[:b]
     return slots_2d, keys_2d

@@ -13,7 +13,6 @@
 # limitations under the License.
 
 import functools
-from collections.abc import Callable
 from typing import Any, cast
 
 import jax
@@ -416,7 +415,7 @@ def csa_gather(
         subcore_axis_name="subcore",
     )
     nope_out, rope_out = cast(
-        Callable[..., tuple[jax.Array, jax.Array]],
+        tuple[jax.Array, jax.Array],
         pl.kernel(
             functools.partial(
                 _banked_kernel if banked else main_kernel,
@@ -453,6 +452,6 @@ def csa_gather(
             ),
             mesh=vector_mesh,
             name="sc_csa_gather",
-        ),
-    )(nope_inputs, rope_inputs, indices, valid_indices)
+        )(nope_inputs, rope_inputs, indices, valid_indices),
+    )
     return nope_out[:out_size], rope_out[: out_size // 4]

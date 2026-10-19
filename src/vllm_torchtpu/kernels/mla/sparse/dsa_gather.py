@@ -12,7 +12,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 import functools
-from collections.abc import Callable
 from typing import Any, cast
 
 import jax
@@ -272,7 +271,7 @@ def dsa_gather(
         subcore_axis_name="subcore",
     )
     nope_out, rope_out = cast(
-        Callable[..., tuple[jax.Array, jax.Array]],
+        tuple[jax.Array, jax.Array],
         pl.kernel(
             functools.partial(
                 main_kernel,
@@ -300,8 +299,8 @@ def dsa_gather(
             ),
             mesh=vector_mesh,
             name="sc_dsa_gather",
-        ),
-    )(nope_cache, rope_cache, indices, valid_indices)
+        )(nope_cache, rope_cache, indices, valid_indices),
+    )
     return (
         nope_out.reshape(-1, word_bytes, tile_lane_bytes)[:out_size],
         rope_out[:out_size],

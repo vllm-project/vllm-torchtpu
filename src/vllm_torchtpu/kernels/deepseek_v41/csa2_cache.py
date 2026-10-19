@@ -7,7 +7,6 @@ existing native cache as these words.
 """
 
 import functools
-from collections.abc import Callable
 from typing import cast
 
 import jax
@@ -171,7 +170,7 @@ def _gather_sc_banked(words, scales, records):
         )(ids_ref)
 
     out, scale_out = cast(
-        Callable[..., tuple[jax.Array, jax.Array]],
+        tuple[jax.Array, jax.Array],
         pl.kernel(
             kernel,
             out_type=(
@@ -191,8 +190,13 @@ def _gather_sc_banked(words, scales, records):
             ),
             mesh=mesh,
             name="csa2_banked_word_scale_gather",
+        )(
+            words,
+            # pyrefly: ignore[bad-argument-count]
+            scales,
+            indices,
         ),
-    )(words, scales, indices)
+    )
     return out[:count].reshape(*records.shape, 128), scale_out[:count].reshape(
         records.shape
     )
@@ -284,20 +288,24 @@ def publish_csa2_kv(
             ),
         )(ids_ref, values_ref, scales_ref)
 
-    cast(
-        Callable[..., tuple[()]],
-        pl.kernel(
-            kernel,
-            mesh=mesh,
-            scratch_types=(pltpu.SemaphoreType.DMA((len(banks), 2)),),
-            compiler_params=pltpu.CompilerParams(
-                use_tc_tiling_on_sc=False,
-                needs_layout_passes=True,
-                disable_bounds_checks=True,
-            ),
-            name="csa2_publish_words_scales",
+    pl.kernel(
+        kernel,
+        mesh=mesh,
+        scratch_types=(pltpu.SemaphoreType.DMA((len(banks), 2)),),
+        compiler_params=pltpu.CompilerParams(
+            use_tc_tiling_on_sc=False,
+            needs_layout_passes=True,
+            disable_bounds_checks=True,
         ),
-    )(ids, values, value_scales, word_refs, scale_refs)
+        name="csa2_publish_words_scales",
+    )(
+        ids,
+        # pyrefly: ignore[bad-argument-count]
+        values,
+        value_scales,
+        word_refs,
+        scale_refs,
+    )
     out_words, out_scales = (
         tuple(r[...] for r in word_refs),
         tuple(r[...] for r in scale_refs),
