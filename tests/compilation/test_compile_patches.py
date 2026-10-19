@@ -41,6 +41,10 @@ class _Wrapped(torch.nn.Module, TorchCompileWithNoGuardsWrapper):
             self.prefix = prefix
 
 
+class _OtherWrapped(_Wrapped):
+    """A second decorated class without a prefix."""
+
+
 class TestResetCompileWrapperRecursion:
     """`reset_compile_wrapper` must reach wrappers nested below the model."""
 
@@ -141,18 +145,40 @@ class TestCompilePrefixIsolation:
     """Each instance must get its own on-disk compile-cache identity."""
 
     @pytest.fixture
-    def prefixes(self):
-        """Record the compile_prefix the patch forwards to the real __init__."""
+    def install(self):
+        """Patch over a recorder of the compile_prefix forwarded to __init__.
+
+        Each call starts again from the unpatched recorder, as a new process
+        does, and returns the emptied list the recorder appends to.
+        """
         original = TorchCompileWithNoGuardsWrapper.__init__
         seen = []
 
         def recorder(self, compile_prefix="", is_encoder=False):
             seen.append(compile_prefix)
 
-        TorchCompileWithNoGuardsWrapper.__init__ = recorder
-        _patch_vllm_compile_prefix_isolation()
-        yield seen
+        def install():
+            seen.clear()
+            TorchCompileWithNoGuardsWrapper.__init__ = recorder
+            _patch_vllm_compile_prefix_isolation()
+            return seen
+
+        yield install
         TorchCompileWithNoGuardsWrapper.__init__ = original
+
+    @pytest.fixture
+    def prefixes(self, install):
+        """Prefixes recorded under one installed patch."""
+        return install()
+
+    @staticmethod
+    def _build(*layers):
+        for layer in layers:
+            TorchCompileWithNoGuardsWrapper.__init__(layer)
+
+    @staticmethod
+    def _fallback(cls, index):
+        return f"{cls.__module__}.{cls.__qualname__}_{index}"
 
     def test_uses_self_prefix(self, prefixes):
         layer = _Wrapped(prefix="model.layers.7")
@@ -166,11 +192,31 @@ class TestCompilePrefixIsolation:
             )
         assert prefixes == ["model.layers.0", "model.layers.1"]
 
-    def test_missing_prefix_falls_back_to_a_unique_counter(self, prefixes):
+    def test_missing_prefix_falls_back_to_class_and_index(self, prefixes):
+        self._build(_Wrapped(), _Wrapped(prefix="model.layers.3"), _Wrapped())
+        assert prefixes == [
+            self._fallback(_Wrapped, 0),
+            "model.layers.3",
+            self._fallback(_Wrapped, 1),
+        ]
+
+    def test_fallback_index_counts_per_class(self, prefixes):
+        # Another class built in between does not shift _Wrapped's names.
+        self._build(_Wrapped(), _OtherWrapped(), _Wrapped())
+        assert prefixes == [
+            self._fallback(_Wrapped, 0),
+            self._fallback(_OtherWrapped, 0),
+            self._fallback(_Wrapped, 1),
+        ]
+
+    def test_fallback_names_repeat_after_a_restart(self, install):
+        runs = []
         for _ in range(2):
-            TorchCompileWithNoGuardsWrapper.__init__(_Wrapped())
-        assert all(p.startswith("_tpu_instance_") for p in prefixes)
-        assert len(set(prefixes)) == 2
+            seen = install()
+            self._build(_Wrapped(), _Wrapped(prefix="model.layers.3"), _Wrapped())
+            runs.append(list(seen))
+        assert runs[0] == runs[1]
+        assert len(set(runs[0])) == 3
 
     def test_explicit_prefix_is_left_alone(self, prefixes):
         TorchCompileWithNoGuardsWrapper.__init__(
