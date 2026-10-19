@@ -34,6 +34,11 @@ pairs as the batched attention kernel can schedule, which bounds a chunk
 deep in a very long prompt so the kernel never overruns its SMEM. The
 limits arrive after the engine core has built its executor and scheduler;
 until then chunks are cut by token count alone.
+
+On a hybrid attention + GDN model the scheduler also keeps the GDN state
+snapshots a later turn hits on (``core/hybrid_retention.py``), the way
+``PrefixAwareScheduler`` does for a single-stage engine: the retention stops
+are applied to a chunk after the step's limits have clipped it.
 """
 
 import math
@@ -42,6 +47,7 @@ from typing import Any, cast
 from vllm.v1.core.sched.scheduler import Scheduler
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.core.hybrid_retention import HybridStateRetention
 from vllm_torchtpu.core.pp_chunks import StepCostModel, chunk_pairs, step_limit
 from vllm_torchtpu.logger import init_logger
 
@@ -85,11 +91,25 @@ class TpuPipelineChunkScheduler(Scheduler):
         self._seeded: set[str] = set()
         self._clips = 0
         self._waits = 0
+        kv_transfer_config = self.vllm_config.kv_transfer_config
+        self._is_kv_consumer = (
+            kv_transfer_config is not None
+            and kv_transfer_config.kv_role != "kv_producer"
+        )
+        self._retention: HybridStateRetention | None = None
+        wanted = envs.TPU_HYBRID_STATE_RETENTION
+        if wanted is None:
+            wanted = not self._is_kv_consumer
+        if wanted:
+            retention = HybridStateRetention(self.kv_cache_manager)
+            if retention.enabled:
+                self._retention = retention
         logger.info(
             "Pipeline chunk scheduler (lone-prompt %s, equal-cost %s): waiting "
-            "for the chunk limits",
+            "for the chunk limits (hybrid_state_retention=%s)",
             self._lone_prompt,
             self._equal_cost,
+            self._retention is not None,
         )
 
     def install_chunk_limits(
@@ -118,7 +138,55 @@ class TpuPipelineChunkScheduler(Scheduler):
         self._step_pairs += float(tokens) * prefix
         self._step_squares += float(tokens) * tokens
 
+    def _retention_failed(self) -> None:
+        logger.exception(
+            "Pipeline chunk scheduler: hybrid state retention failed; disabling it."
+        )
+        self._retention = None
+
+    def _connector_finished(self, request: Any):
+        result = super()._connector_finished(request)
+        if result[0] and self._retention is not None:
+            try:
+                self._retention.pin_running((request,))
+            except Exception:
+                self._retention_failed()
+        return result
+
+    def _free_request_blocks(self, request: Any):
+        retention = self._retention
+        if retention is None:
+            return super()._free_request_blocks(request)
+        try:
+            attn_blocks = retention.snapshot_attention_blocks(request)
+        except Exception:
+            self._retention_failed()
+            return super()._free_request_blocks(request)
+        result = super()._free_request_blocks(request)
+        try:
+            retention.on_request_freed(request, attn_blocks)
+        except Exception:
+            self._retention_failed()
+        return result
+
     def schedule(self, throttle_prefills: bool = False):
+        connector = getattr(self, "connector", None)
+        poll = getattr(connector, "poll_and_complete_transfers", None)
+        if callable(poll):
+            # Completed async loads promote their requests this step.
+            try:
+                poll(self)
+            except Exception:
+                logger.exception(
+                    "Pipeline chunk scheduler: poll_and_complete_transfers failed."
+                )
+        if self._retention is not None:
+            try:
+                self._retention.pin_running(self.running)
+            except Exception:
+                self._retention_failed()
+            else:
+                self._retention.begin_step()
         self._step_tokens = 0
         self._step_pairs = 0.0
         self._step_squares = 0.0
@@ -237,9 +305,10 @@ class TpuPipelineChunkScheduler(Scheduler):
                     self._step_tokens,
                 )
             num_new_tokens = cap
-        if self._mamba_split and num_new_tokens > 0:
-            num_new_tokens = super()._mamba_block_aligned_split(
+        if num_new_tokens > 0:
+            num_new_tokens = self._retention_split(
                 request,
+                start,
                 num_new_tokens,
                 num_new_local_computed_tokens,
                 num_external_computed_tokens,
@@ -275,6 +344,38 @@ class TpuPipelineChunkScheduler(Scheduler):
                 total = self._step_tokens + cap - 1
                 cap = total - total % granularity - self._step_tokens
         return max(cap, 0)
+
+    def _retention_split(
+        self,
+        request: Any,
+        start: int,
+        num_new_tokens: int,
+        num_new_local_computed_tokens: int,
+        num_external_computed_tokens: int,
+    ) -> int:
+        """Ends the clipped chunk where the GDN state must be written: at the
+        base scheduler's block alignment and the retention stops."""
+        retention = self._retention
+        if retention is not None:
+            try:
+                retention.prepare_prefill_split(request, start, num_new_tokens)
+            except Exception:
+                self._retention_failed()
+                retention = None
+        aligned = num_new_tokens
+        if self._mamba_split:
+            aligned = super()._mamba_block_aligned_split(
+                request,
+                num_new_tokens,
+                num_new_local_computed_tokens,
+                num_external_computed_tokens,
+            )
+        if retention is not None:
+            try:
+                aligned = retention.adjust_prefill_split(request, start, aligned)
+            except Exception:
+                self._retention_failed()
+        return aligned
 
 
 def install_chunk_limits_from_workers(scheduler: Any, executor: Any) -> None:
