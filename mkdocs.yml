@@ -88,6 +88,7 @@ nav:
       - 'Troubleshooting': developers_guide/profiling/troubleshooting.md
   - 'Reference':
     - 'Environment Variables': reference/env_vars.md
+  - 'Roadmap': roadmap.md
 
 validation:
   nav:
