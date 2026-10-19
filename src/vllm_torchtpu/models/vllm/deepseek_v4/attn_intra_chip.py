@@ -83,9 +83,13 @@ def _load_current_chiplet_slice(layer: torch.nn.Module, rank: int, size: int) ->
     Both are read from the global TP group at construction, which is size 1
     here, so they are set to this core's place in the chip pair instead.
     """
+    # torch's Module.__setattr__ stub only accepts modules and tensors.
+    # pyrefly: ignore[bad-argument-type]
     layer.tp_rank, layer.tp_size = rank, size
     for param in layer.parameters():
         if hasattr(param, "tp_rank"):
+            # vLLM adds tp_rank/tp_size to quantized parameters at runtime.
+            # pyrefly: ignore[missing-attribute]
             param.tp_rank, param.tp_size = rank, size
 
 
@@ -101,6 +105,9 @@ def _swap_with_peer_chiplet(group, mine: torch.Tensor, theirs: torch.Tensor):
 
 class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
     """DSv4 attention with `wq_b`/`wo_a`/`wo_b` split across a chip's two cores."""
+
+    # Set with object.__setattr__ in __init__, outside nn.Module's registry.
+    _chip_pair: parallel_state.GroupCoordinator
 
     def __init__(self, vllm_config, prefix: str = "", *args, **kwargs) -> None:
         # The split halves a layer that holds all heads; under vLLM TP>1 the
@@ -136,6 +143,8 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
             tp_rank=rank,
             tp_size=size,
         )
+        # torch's Module.__setattr__ stub only accepts modules and tensors.
+        # pyrefly: ignore[bad-argument-type]
         self.wo_a.is_bmm = True
         self.wo_a.bmm_batch_size = self.n_groups // size
         # RowParallelLinear takes no tp_rank/tp_size, so it is built at current
