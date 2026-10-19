@@ -123,3 +123,5 @@ Example using the helper script with build arguments:
   --target prod \
   -t prod:latest
 ```
+
+<!-- Fork CI probe: test PR for the ready-label gate. Do not merge. -->
