@@ -752,9 +752,7 @@ class TestFp8LinearSubBlockTP:
             )
 
 
-def _make_fp8_experts(
-    monkeypatch, block_size, shard_size, *, tp_size=2, tp_rank=1, deepseek_v4=False
-):
+def _make_fp8_experts(monkeypatch, block_size, shard_size, *, tp_size=2, tp_rank=1):
     from types import SimpleNamespace
 
     from vllm.config import set_current_vllm_config
@@ -813,14 +811,7 @@ def _make_fp8_experts(
         "vllm.distributed.get_tensor_model_parallel_world_size",
         lambda: tp_size,
     )
-    quant_cls = VllmFp8Config
-    if deepseek_v4:
-        from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import (
-            VllmDeepseekV4Fp8Config,
-        )
-
-        quant_cls = VllmDeepseekV4Fp8Config
-    quant = quant_cls(
+    quant = VllmFp8Config(
         is_checkpoint_fp8_serialized=True,
         activation_scheme="dynamic",
         weight_block_size=block_size,
