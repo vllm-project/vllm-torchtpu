@@ -12,6 +12,7 @@ from urllib.parse import urlparse
 import torch
 import torch.profiler
 import torch_tpu  # noqa: F401
+from torch.compiler._cache import CacheArtifactManager
 from torch_tpu._internal.profiler import TpuProfilerConfig
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.kv_transfer import (
@@ -758,6 +759,9 @@ class TPUWorker(WorkerBase):
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
         set_torch_threads_for_runtime()
+        # torch records every compile artifact for save_cache_artifacts(), which
+        # vLLM never calls; drop the record so its memory can be freed.
+        CacheArtifactManager.clear()
         # The warmed worker holds a large static heap (model, compiled
         # executables, KV bookkeeping); freezing it keeps a gen-2 collection
         # from scanning those objects mid-step.
