@@ -6759,7 +6759,7 @@ def test_store_mode_peer_rank_waits_past_30s_for_dispatch_controller_ready():
         kv_caches=[storage],
         node_id=3,
         local_control_port=9106,
-        max_blocks=4,
+        max_blocks=worker._max_request_blocks(),
         num_slots=1,
         timeout_s=12.0,
         listener_port=0,
