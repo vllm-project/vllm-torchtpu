@@ -78,6 +78,8 @@ def _scheduler(
     scheduler._seeded = set()
     scheduler._clips = 0
     scheduler._waits = 0
+    scheduler._retention = None
+    scheduler.kv_cache_manager = SimpleNamespace()
     return scheduler
 
 
@@ -548,3 +550,105 @@ def test_an_unclipped_mtp_prompt_runs_whole_with_internal_checkpoints(
     assert scheduler._mamba_block_aligned_split(request, 8191) == chunk
     assert scheduler._clips == 0
     assert scheduler._step_prefill_tokens == chunk
+
+
+class _Retention:
+    """Records the retention calls and clips every chunk at ``stop``."""
+
+    enabled = True
+
+    def __init__(self, stop=None, fail=False):
+        self.stop = stop
+        self.fail = fail
+        self.calls: list[tuple] = []
+
+    def pin_running(self, running):
+        self.calls.append(("pin", tuple(r.request_id for r in running)))
+        if self.fail:
+            raise RuntimeError("pin")
+
+    def begin_step(self):
+        self.calls.append(("begin",))
+
+    def prepare_prefill_split(self, request, start, num_new_tokens):
+        self.calls.append(("prepare", request.request_id, start, num_new_tokens))
+
+    def adjust_prefill_split(self, request, start, aligned):
+        self.calls.append(("adjust", request.request_id, start, aligned))
+        if self.stop is not None and start < self.stop < start + aligned:
+            return self.stop - start
+        return aligned
+
+    def snapshot_attention_blocks(self, request):
+        self.calls.append(("snapshot", request.request_id))
+        return ["attn"]
+
+    def on_request_freed(self, request, attn_blocks):
+        self.calls.append(("freed", request.request_id, attn_blocks))
+
+
+def test_retention_stops_apply_after_the_time_budget_clip():
+    # The clip leaves 4096 of 16384; retention stops the chunk 1024 in.
+    scheduler = _scheduler(cost=_model(), step_limit=4096)
+    scheduler._retention = _Retention(stop=1024)
+    request = _request(0, 65536)
+    got = scheduler._mamba_block_aligned_split(request, 16384)
+    assert got == 1024
+    assert scheduler._retention.calls == [
+        ("prepare", "r", 0, 4096),
+        ("adjust", "r", 0, 4096),
+    ]
+    assert scheduler._step_tokens == 1024
+    assert scheduler._step_prefill_tokens == 1024
+
+
+def test_retention_runs_after_the_mamba_alignment():
+    scheduler = _scheduler(mamba_split=True, cost=_model(), step_limit=4096)
+    scheduler._retention = _Retention()
+    request = _request(0, 65536)
+    with patch.object(Scheduler, "_mamba_block_aligned_split", return_value=3840):
+        assert scheduler._mamba_block_aligned_split(request, 16384) == 3840
+    assert scheduler._retention.calls[-1] == ("adjust", "r", 0, 3840)
+
+
+def test_a_failing_retention_hook_disables_retention():
+    scheduler = _scheduler(running=[_decode("d")])
+    scheduler._retention = _Retention(fail=True)
+    with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+        scheduler.schedule()
+    assert scheduler._retention is None
+
+
+def test_schedule_pins_the_running_requests():
+    scheduler = _scheduler(running=[_decode("d")])
+    retention = _Retention()
+    scheduler._retention = retention
+    output = SimpleNamespace(
+        total_num_scheduled_tokens=1, num_scheduled_tokens={"d": 1}
+    )
+    with patch.object(Scheduler, "schedule", return_value=output):
+        assert scheduler.schedule() is output
+    assert retention.calls[:2] == [("pin", ("d",)), ("begin",)]
+
+
+def test_freeing_a_request_snapshots_its_attention_blocks_first():
+    scheduler = _scheduler()
+    retention = _Retention()
+    scheduler._retention = retention
+    request = _request(100, 100, "f")
+    with patch.object(Scheduler, "_free_request_blocks", return_value=None) as base:
+        scheduler._free_request_blocks(request)
+    base.assert_called_once_with(request)
+    assert retention.calls == [("snapshot", "f"), ("freed", "f", ["attn"])]
+
+
+def test_a_finished_connector_request_is_pinned():
+    scheduler = _scheduler()
+    retention = _Retention()
+    scheduler._retention = retention
+    request = _request(100, 100, "c")
+    with patch.object(Scheduler, "_connector_finished", return_value=(True, None)):
+        assert scheduler._connector_finished(request) == (True, None)
+    with patch.object(Scheduler, "_connector_finished", return_value=(False, None)):
+        scheduler._connector_finished(request)
+    assert retention.calls == [("pin", ("c",))]

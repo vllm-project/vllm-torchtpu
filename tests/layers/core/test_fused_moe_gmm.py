@@ -1107,6 +1107,51 @@ def test_prepare_routed_onehot_permute_matches_plain_gather():
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 
+def test_prepare_routed_ragged_permute_falls_back_past_the_counting_sort_block(
+    monkeypatch,
+):
+    """Every expert local to one rank (EP under a tp=1 pipeline stage): the
+    counting sort declines 513 buckets, and the ragged permute must then take
+    the comparison sort rather than read the missing bucket counts."""
+    num_tokens, topk, hidden, experts = 8, 2, 8, 512
+    hidden_states = (
+        (jnp.arange(num_tokens * hidden, dtype=jnp.float32) / 7)
+        .reshape(num_tokens, hidden)
+        .astype(jnp.bfloat16)
+    )
+    topk_indices = (
+        jnp.arange(num_tokens * topk, dtype=jnp.int32).reshape(num_tokens, topk)
+        * 31
+        % experts
+    )
+    topk_weights = jnp.full((num_tokens, topk), 0.5, dtype=jnp.float32)
+    monkeypatch.setattr(
+        fused_moe_gmm,
+        "ragged_gather_v2",
+        lambda x, indices, starts, counts: x[indices],
+    )
+    common = dict(local_num_experts=experts, topk=topk, use_ep=True)
+    ragged_out = fused_moe_gmm.prepare_routed_gmm_inputs(
+        hidden_states,
+        topk_indices,
+        topk_weights,
+        use_sparse_core=True,
+        onehot_moe_permute_threshold=0,
+        **common,
+    )
+    plain_out = fused_moe_gmm.prepare_routed_gmm_inputs(
+        hidden_states,
+        topk_indices,
+        topk_weights,
+        use_sparse_core=False,
+        onehot_moe_permute_threshold=0,
+        **common,
+    )
+    for got, want in zip(ragged_out, plain_out):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    assert int(ragged_out[1].sum()) == num_tokens * topk
+
+
 def test_moe_gmm_onehot_combine_matches_plain_reduce(monkeypatch):
     num_tokens, topk, hidden = 4, 2, 8
     rows = num_tokens * topk

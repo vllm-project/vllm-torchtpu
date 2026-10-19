@@ -389,6 +389,11 @@ def prepare_routed_gmm_inputs(
         if counting_sort
         else (None, None)
     )
+    if ragged_permute and bucket_counts is None:
+        # The counting sort declines more buckets than its block (every
+        # expert local to one rank); the comparison sort below gives the same
+        # positions and the one-hot histogram the same group sizes.
+        ragged_permute = False
     token_bits = max(1, (num_tokens_local - 1).bit_length())
     packable = (local_num_experts + 1).bit_length() + token_bits < 31
     flat_bits = max(1, (token_indices_flat.shape[0] - 1).bit_length())
