@@ -3006,7 +3006,7 @@ class TPUModelRunner(GPUModelRunner):
             num_draft_per_req,
         )
 
-    # TODO(weiyulin): unify sequence_plan and pcp_manager so that 
+    # TODO(weiyulin): unify sequence_plan and pcp_manager so that
     # pcp manager own both pcp sharding plan.
     def get_pcp_planner(self) -> PcpManager | SequenceLayoutPlanner:
         if self.pcp_manager is not None:

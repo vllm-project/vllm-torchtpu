@@ -1017,6 +1017,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         global positions for the split prefill rows."""
         pcp = md.pcp_metadata
         assert pcp is not None
+        assert self.topk_op_dcp is not None
         rep_rd = pcp.rep_request_distribution
         decode_topk = self.topk_op_dcp(
             kvg.take_decode_rows(q_bytes, md),

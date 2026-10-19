@@ -756,13 +756,8 @@ def test_runner_precompile_pooler_noop_cases(monkeypatch, overrides):
 
 
 @pytest.mark.parametrize("is_pooling", [True, False])
-def test_runner_sampling_precompile_bypassed_for_pooling(monkeypatch, is_pooling):
+def test_runner_sampling_precompile_bypassed_for_pooling(is_pooling):
     runner_mod = _import_runner()
-    monkeypatch.setattr(
-        runner_mod,
-        "_get_sequence_layout_planner_for_runner",
-        lambda runner: SimpleNamespace(uses_selected_logits_hidden_states=True),
-    )
     names = (
         "_precompile_compute_selected_logits",
         "_precompile_compute_logits_from_hidden_states",
@@ -771,7 +766,13 @@ def test_runner_sampling_precompile_bypassed_for_pooling(monkeypatch, is_pooling
         "_precompile_sample_from_logits",
         "_precompile_gather_logprobs",
     )
-    runner = SimpleNamespace(is_pooling_model=is_pooling, _pp_is_last=True)
+    runner = SimpleNamespace(
+        is_pooling_model=is_pooling,
+        _pp_is_last=True,
+        get_pcp_planner=lambda: SimpleNamespace(
+            uses_selected_logits_hidden_states=True
+        ),
+    )
     for name in names:
         setattr(runner, name, MagicMock())
     runner_mod.TPUModelRunner._precompile_sampling_subgraphs(runner)

@@ -2534,7 +2534,7 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
     def _forward_pcp_kv_gather(
         self,
         layer: Any,
-        kv_cache: tuple[torch.Tensor, torch.Tensor],
+        kv_cache: tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor],
         ql_nope: torch.Tensor,
         q_pe: torch.Tensor,
         kv_c_normed: torch.Tensor,
