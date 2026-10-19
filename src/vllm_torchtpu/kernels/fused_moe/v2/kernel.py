@@ -978,6 +978,15 @@ def _build_fused_ep_moe_kernel(
 
         def w2_copy(expert, slot):
             """The down weight slab of `expert`, into weight slot `slot`."""
+            if rhs_packed4 and trim_gate_up_padding:
+                # C03's down contractions never read the padded K tail.
+                # Start and wait use the same shortened descriptor and bytes.
+                packed_active = effective_inter // PACK4
+                return pltpu.make_async_copy(
+                    w2_hbm.at[expert, pl.ds(0, packed_active), :],
+                    w2_vm.at[slot, pl.ds(0, packed_active), :],
+                    w2_sems.at[slot],
+                )
             return _slot_copy(w2_hbm.at[expert], w2_vm, w2_sems, slot)
 
         def w1s_copy(expert, slot):
