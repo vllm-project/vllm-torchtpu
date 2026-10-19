@@ -6,8 +6,8 @@ The patches fall into two groups, in file order:
 - Correctness: the pipeline's hand-rolled broadcasts and object collectives,
   the video VAE device context and the Triton-only indexed-modulation
   kernels, none of which run on torch_tpu as written upstream.
-- Denoise performance: keep host syncs out of the denoise loop (AdaLN
-  cache).
+- Denoise performance: keep every DiT step on one set of shapes and keep
+  host syncs out of the denoise loop (AdaLN cache, timestep table).
 
 Each patch carries its rationale in a comment block at its entry point.
 Patches only touch modules that are already loaded, do nothing without
@@ -930,6 +930,106 @@ def patch_adaln_projection_cache() -> bool:
     return True
 
 
+# -----------------------------------------------------------------------------
+# Denoise loop: fixed-width timestep table.
+# -----------------------------------------------------------------------------
+
+DENOISE_LOOP_MODULE = "vllm_omni.diffusion.models.minimax_h3.denoise_loop"
+
+# Distinct row timesteps one request without latent edits can carry
+# (adaln_cache.MODES): the video target (also the text and padding rows), the
+# audio target, the image/video condition and the audio reference.
+H3_UNIQUE_TIMESTEP_ROWS = 4
+
+
+def pad_unique_timesteps(unique_timesteps: torch.Tensor, rows: int) -> torch.Tensor:
+    """Pad a sorted ``[M]`` timestep table to ``[rows]`` with its last value.
+
+    ``inverse_indices`` only address rows ``< M``, so the padded rows are
+    computed but never read, and the table stays sorted. Tables that are not
+    1-D, are empty, or already have ``rows`` or more entries (latent-edit
+    schedules) are returned unchanged. The pad runs on the host so that the
+    unpadded width never reaches a traced device program.
+    """
+    if unique_timesteps.dim() != 1:
+        return unique_timesteps
+    count = unique_timesteps.shape[0]
+    if count == 0 or count >= rows:
+        return unique_timesteps
+
+    if unique_timesteps.is_cpu:
+        return torch.cat((unique_timesteps, unique_timesteps[-1:].expand(rows - count)))
+
+    host = unique_timesteps.detach().cpu()
+    padded = torch.cat((host, host[-1:].expand(rows - count)))
+    return padded.to(unique_timesteps.device)
+
+
+def patch_denoise_branch_timestep_rows() -> bool:
+    # -------------------------------------------------------------------------
+    # Upstream vLLM-Omni Root Cause Tracking:
+    # Upstream: MiniMaxH3DenoiseBranch.forward_kwargs builds the DiT's
+    # timestep table with fill_timesteps and torch.unique(timesteps,
+    # sorted=True, return_inverse=True) (denoise_loop.py:208 at vllm-omni
+    # e1d77a3). Its length M is the number of distinct row timesteps and
+    # changes with the step: at step 0 (sigma = 1) the video, audio, text and
+    # padding rows all sit at t = 0 (M = 1 for t2va); later steps add the
+    # audio timestep when the audio shift differs (M = 2), and fl2va / ref2va
+    # add their condition timesteps. t_emb [M, 2688], every block's AdaLN
+    # output [3M, 5376] (minimax_h3_transformer.py:898-906, :1709, :1815) and
+    # the final layer's [M, 2 x 5376] depend on M.
+    #
+    # Problem on TPU: torch_tpu compiles every DiT program once per M. On
+    # v7x-8 the first request compiled the whole DiT again at step 2: 8.4 s /
+    # 10 s / 12 s for step 2 against 0.27 / 0.5 / 1.3 s warm steps
+    # (256x256x4s / 480x480x4s / 768x768x5s).
+    #
+    # Fix: on TPU the table is padded to H3_UNIQUE_TIMESTEP_ROWS rows with
+    # its last value (the internal JAX port's fixed_num_unique), so every
+    # step of every task without latent edits runs one set of shapes. The
+    # padded rows only go through row-independent ops (time embedder, AdaLN
+    # linears) and are never gathered: inverse_indices and the
+    # combined_indices derived from them are unchanged. Wider tables (edit
+    # schedules) and other devices keep the upstream table.
+    #
+    # REMOVAL / FIX CONDITION:
+    # Remove once upstream gives the timestep table a fixed width or
+    # torch_tpu reuses one compiled program across M.
+    # -------------------------------------------------------------------------
+    module = _loaded_module(DENOISE_LOOP_MODULE)
+    cls = getattr(module, "MiniMaxH3DenoiseBranch", None)
+    if not isinstance(cls, type):
+        msg = "Skipping MiniMax-H3 timestep table TPU patch: %s is not loaded."
+        if _loaded_module(PIPELINE_MODULE):
+            # Skipping on only some TP ranks would give them other DiT shapes.
+            logger.warning(msg, DENOISE_LOOP_MODULE)
+        else:
+            logger.debug(msg, DENOISE_LOOP_MODULE)
+        return False
+    if "_tpu_orig_forward_kwargs" in cls.__dict__:
+        return False
+    original = cls.forward_kwargs
+
+    @functools.wraps(original)
+    def forward_kwargs(self: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        result = original(self, *args, **kwargs)
+        unique_timesteps = result.get("unique_timesteps")
+        if isinstance(unique_timesteps, torch.Tensor) and _is_tpu(unique_timesteps):
+            # forward_kwargs returns a fresh dict per call.
+            result["unique_timesteps"] = pad_unique_timesteps(
+                unique_timesteps, H3_UNIQUE_TIMESTEP_ROWS
+            )
+        return result
+
+    cls._tpu_orig_forward_kwargs = original
+    cls.forward_kwargs = forward_kwargs
+    logger.info(
+        "Applied TPU patch: MiniMax-H3 timestep table padded to %d rows.",
+        H3_UNIQUE_TIMESTEP_ROWS,
+    )
+    return True
+
+
 def apply_minimax_h3_patches() -> bool:
     """Patch the MiniMax-H3 pipeline module if it is already loaded.
 
@@ -950,4 +1050,5 @@ def apply_minimax_h3_patches() -> bool:
     patched = patch_pipeline_object_collectives(pipeline) or patched
     patched = patch_video_vae_device_module(pipeline) or patched
     patched = patch_indexed_modulation() or patched
-    return patch_adaln_projection_cache() or patched
+    patched = patch_adaln_projection_cache() or patched
+    return patch_denoise_branch_timestep_rows() or patched

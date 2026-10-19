@@ -206,3 +206,188 @@ def test_apply_installs_adaln_cache_patch(monkeypatch):
     patched = module.MiniMaxH3RuntimeAdalnCache.prepare
     assert not minimax_h3.apply_minimax_h3_patches()
     assert module.MiniMaxH3RuntimeAdalnCache.prepare is patched
+
+
+# -----------------------------------------------------------------------------
+# (b) fixed-width timestep table
+# -----------------------------------------------------------------------------
+
+# Row groups of a packed request: text/padding (video timestep), video target,
+# image condition, audio target, audio reference (denoise_loop.py:235-265).
+_GROUPS = {
+    "t2va": [0, 0, 1, 1, 1, 3, 3, 0],
+    "fl2va": [0, 2, 2, 1, 1, 3, 3, 0],
+    "ref2va-mixed": [0, 2, 1, 1, 3, 4, 3, 0],
+}
+
+
+def _fake_denoise_loop_module(monkeypatch) -> types.ModuleType:
+    module = types.ModuleType(minimax_h3.DENOISE_LOOP_MODULE)
+
+    class MiniMaxH3DenoiseBranch:
+        def __init__(self, groups):
+            self.groups = torch.tensor(groups)
+            self.static_kwargs = {"token_tags": self.groups % 3}
+
+        def forward_kwargs(
+            self,
+            *,
+            video_rows=None,
+            audio_rows=None,
+            t_video,
+            t_audio,
+            imgvid_cond_timestep,
+            audio_ref_cond_timestep,
+            video_target_timesteps=None,
+            audio_target_timesteps=None,
+        ):
+            """Upstream forward_kwargs (denoise_loop.py:182-215)."""
+            values = torch.tensor(
+                [
+                    t_video,
+                    t_video,
+                    imgvid_cond_timestep,
+                    t_audio,
+                    audio_ref_cond_timestep,
+                ],
+                dtype=torch.float32,
+            )
+            timesteps = values[self.groups]
+            if video_target_timesteps is not None:
+                timesteps = timesteps.clone()
+                timesteps[self.groups == 1] = video_target_timesteps
+            unique, inverse = torch.unique(timesteps, sorted=True, return_inverse=True)
+            return {
+                **self.static_kwargs,
+                "timesteps": timesteps,
+                "unique_timesteps": unique,
+                "inverse_indices": inverse,
+            }
+
+    module.MiniMaxH3DenoiseBranch = MiniMaxH3DenoiseBranch
+    return _install(monkeypatch, module)
+
+
+def _step_kwargs(sigma_video, sigma_audio):
+    t_v, t_a = 1.0 - sigma_video, 1.0 - sigma_audio
+    return {
+        "t_video": t_v,
+        "t_audio": t_a,
+        "imgvid_cond_timestep": max(t_v, 0.999),
+        "audio_ref_cond_timestep": max(t_a, 1.0),
+    }
+
+
+def test_pad_unique_timesteps():
+    pad = minimax_h3.pad_unique_timesteps
+    one = torch.tensor([0.0])
+    assert pad(one, 4).tolist() == [0.0, 0.0, 0.0, 0.0]
+    two = torch.tensor([0.25, 0.5], dtype=torch.float32)
+    padded = pad(two, 4)
+    assert padded.dtype == torch.float32
+    assert padded.tolist() == [0.25, 0.5, 0.5, 0.5]
+    for unchanged in (
+        torch.tensor([0.1, 0.2, 0.3, 0.4]),
+        torch.arange(6, dtype=torch.float32),
+        torch.empty(0),
+        torch.zeros(2, 2),
+    ):
+        assert pad(unchanged, 4) is unchanged
+
+
+def test_timestep_table_padded_on_tpu(monkeypatch):
+    module = _fake_denoise_loop_module(monkeypatch)
+    cls = module.MiniMaxH3DenoiseBranch
+    original = cls.forward_kwargs
+    assert minimax_h3.patch_denoise_branch_timestep_rows()
+    assert cls._tpu_orig_forward_kwargs is original
+    assert cls.forward_kwargs.__wrapped__ is original
+    rows = minimax_h3.H3_UNIQUE_TIMESTEP_ROWS
+    schedule = [(1.0, 1.0), (0.9, 0.7), (0.5, 0.25), (0.05, 0.01)]
+
+    # CPU: the upstream table, whose width changes with the step.
+    branch = cls(_GROUPS["t2va"])
+    widths = {
+        branch.forward_kwargs(**_step_kwargs(*s))["unique_timesteps"].shape[0]
+        for s in schedule
+    }
+    assert widths == {1, 2}
+
+    _force_tpu(monkeypatch)
+    for task, groups in _GROUPS.items():
+        branch = cls(groups)
+        for sigmas in schedule:
+            kwargs = _step_kwargs(*sigmas)
+            expected = original(branch, **kwargs)
+            out = branch.forward_kwargs(**kwargs)
+            unique = out["unique_timesteps"]
+            exact = expected["unique_timesteps"]
+            count = exact.shape[0]
+            assert unique.shape == (rows,), (task, sigmas)
+            assert torch.equal(unique[:count], exact)
+            assert torch.equal(unique[count:], exact[-1:].expand(rows - count))
+            assert torch.equal(out["inverse_indices"], expected["inverse_indices"])
+            assert int(out["inverse_indices"].max()) < count
+            # Every row still reads its own timestep.
+            assert torch.equal(unique[out["inverse_indices"]], out["timesteps"])
+            assert out["token_tags"] is branch.static_kwargs["token_tags"]
+
+    # Latent-edit schedules wider than the pad keep the upstream table.
+    branch = cls(_GROUPS["t2va"])
+    kwargs = _step_kwargs(0.5, 0.25)
+    edit = torch.tensor([0.1, 0.2, 0.3])
+    out = branch.forward_kwargs(**kwargs, video_target_timesteps=edit)
+    assert out["unique_timesteps"].shape[0] == 5
+
+
+def test_padded_timestep_table_feeds_the_same_rows(monkeypatch):
+    """The DiT's consumers (time embedder, AdaLN, gathers) are row-independent."""
+    torch.manual_seed(0)
+    module = _fake_denoise_loop_module(monkeypatch)
+    cls = module.MiniMaxH3DenoiseBranch
+    assert minimax_h3.patch_denoise_branch_timestep_rows()
+    _force_tpu(monkeypatch)
+    proj_in = torch.nn.Linear(16, 32)
+    adaln = torch.nn.Linear(32, 3 * 2 * 8)
+    modality_num = 3
+
+    def consume(kwargs):
+        # minimax_h3_transformer.py:368-381, :898-906, :1815.
+        t = kwargs["unique_timesteps"]
+        freqs = torch.exp(-torch.arange(8, dtype=torch.float32) / 8)
+        args = t[:, None] * freqs[None]
+        t_emb = proj_in(torch.cat([torch.cos(args), torch.sin(args)], dim=-1))
+        x = adaln(torch.nn.functional.silu(t_emb))
+        x = x.view(x.shape[0] * modality_num, -1)
+        combined = kwargs["inverse_indices"] * modality_num + kwargs["token_tags"]
+        return x.index_select(0, combined)
+
+    branch = cls(_GROUPS["fl2va"])
+    for sigmas in [(1.0, 1.0), (0.6, 0.3)]:
+        kwargs = _step_kwargs(*sigmas)
+        exact = cls._tpu_orig_forward_kwargs(branch, **kwargs)
+        padded = branch.forward_kwargs(**kwargs)
+        assert padded["unique_timesteps"].shape[0] == 4
+        torch.testing.assert_close(consume(padded), consume(exact))
+
+
+def test_timestep_table_patch_idempotent_and_noop(monkeypatch):
+    module = _fake_denoise_loop_module(monkeypatch)
+    assert minimax_h3.patch_denoise_branch_timestep_rows()
+    patched = module.MiniMaxH3DenoiseBranch.forward_kwargs
+    assert not minimax_h3.patch_denoise_branch_timestep_rows()
+    assert module.MiniMaxH3DenoiseBranch.forward_kwargs is patched
+
+    monkeypatch.setitem(sys.modules, minimax_h3.DENOISE_LOOP_MODULE, None)
+    assert minimax_h3.patch_denoise_branch_timestep_rows() is False
+
+
+def test_apply_installs_timestep_table_patch(monkeypatch):
+    _fake_pipeline(monkeypatch)
+    module = _fake_denoise_loop_module(monkeypatch)
+    assert minimax_h3.apply_minimax_h3_patches()
+    cls = module.MiniMaxH3DenoiseBranch
+    assert "_tpu_orig_forward_kwargs" in cls.__dict__
+    patched = cls.forward_kwargs
+    assert not minimax_h3.apply_minimax_h3_patches()
+    assert cls.forward_kwargs is patched
