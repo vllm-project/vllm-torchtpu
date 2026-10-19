@@ -521,9 +521,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # block boundary. Set it to the same value on every rank and PP stage: the
     # scheduler requires identical MambaSpecs.
     "TPU_GDN_PREFILL_CHECKPOINT": env_bool("TPU_GDN_PREFILL_CHECKPOINT", default=True),
-    # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
-    # Off by default so tokenizer behavior matches stock vLLM; the DSv4
-    # eval config turns it on, since a prefilled assistant turn needs it.
+    # Register the DeepSeek-V4 / V4.1 tokenizers that honor continue_final_message.
+    # Off by default so tokenizer behavior matches stock vLLM; set it to 1 for
+    # evals that use prefilled assistant turns (e.g. the DSv4 benchmark configs).
     "TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE": env_bool(
         "TPU_DSV4_HONOR_CONTINUE_FINAL_MESSAGE", default=False
     ),
