@@ -488,6 +488,16 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
             rhs_qb=block,
             weights=weights,
             supplies_hash_ids=True,
+            # _dequantize_and_pad zero-fills each gate/up half and down K.
+            # Only opt into the kernel's supported trailing-block contract.
+            logical_intermediate_size=(
+                orig_intermediate_size
+                if block == 512
+                and 0 < orig_intermediate_size < inter
+                and orig_intermediate_size % 256 == 0
+                and inter - orig_intermediate_size < block
+                else None
+            ),
             policy=FusedEPPolicy.REQUIRED if self.fused_ep else FusedEPPolicy.LEGACY,
         )
         if self.fused_ep and op is None:

@@ -183,6 +183,7 @@ def _build_op(
     has_hash_ids=False,
     *,
     token_replica_groups=None,
+    logical_intermediate_size: int | None = None,
 ):
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
@@ -200,6 +201,7 @@ def _build_op(
         routed_scaling_factor,
         has_hash_ids,
         token_replica_groups,
+        logical_intermediate_size,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -239,6 +241,7 @@ def _build_op(
             mesh_ep_ranks=mesh_expert_order,
             sharded_plan=sharded_plan,
             token_replica_groups=token_replica_groups,
+            logical_intermediate_size=logical_intermediate_size,
             **bias_kw,
             **routing_kw,
         )
@@ -489,6 +492,7 @@ def prebuild_fused_moe_ep(
     rhs_qb=None,
     weights=None,
     supplies_hash_ids=False,
+    logical_intermediate_size: int | None = None,
     policy: FusedEPPolicy = FusedEPPolicy.LEGACY,
 ) -> Any | None:
     """Resolve the mesh and build the fused-EP op for one layer.
@@ -514,6 +518,8 @@ def prebuild_fused_moe_ep(
     requantized layout so admission precedes any lossy weight conversion.
     The caller must validate the actual prepared tensors before installing
     them; the built op closes over configuration, never these tensors.
+    `logical_intermediate_size` certifies trailing zero-padded gate/up and
+    down weights; only the loader that creates that padding may supply it.
     """
     if policy == FusedEPPolicy.LEGACY:
         if not envs.USE_MOE_FUSED_EP_KERNEL:
@@ -667,6 +673,7 @@ def prebuild_fused_moe_ep(
         routed_scale,
         has_hash_ids,
         token_replica_groups=token_replica_groups,
+        logical_intermediate_size=logical_intermediate_size,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
