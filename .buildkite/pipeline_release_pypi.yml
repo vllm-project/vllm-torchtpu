@@ -1,0 +1,114 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# ------------------------------------------------------
+# Release fragment: (CI passes) -> approve -> build -> publish
+# vllm-torchtpu-core -> build -> publish the combined vllm-torchtpu wheel,
+# which pins that core version.
+#
+# bootstrap.sh uploads this into the regular CI build for release builds
+# (see its release condition), so it runs after every CI lane.
+#
+# Release version (both wheels get the same one):
+#   - Official release (default): the release branch name,
+#     e.g. releases/vX.Y.Z -> X.Y.Z (with leading "v" removed).
+#   - Pre-release: set RELEASE_VERSION when starting the build (Buildkite
+#     "New Build" -> Environment Variables), e.g. RELEASE_VERSION=vX.Y.Zrc1.
+# build_core_wheel.sh exits 1 if PyPI would not accept the version.
+#
+# Publishing uses PyPI Trusted Publishing via Google Cloud (no API token).
+# The publish steps must run on a GCE VM agent whose service account is
+# registered as a Trusted Publisher for both PyPI projects.
+# See .buildkite/scripts/publish_wheel.sh for details.
+# ------------------------------------------------------
+
+# PyPI project names to publish under. Each publish step checks its wheel's
+# name against its PUBLISH_PYPI before uploading.
+x-core-env: &core_env
+  PUBLISH_PYPI: "vllm-torchtpu-core"
+
+x-vllm-torchtpu-env: &vllm_torchtpu_env
+  PUBLISH_PYPI: "vllm-torchtpu"
+
+steps:
+  # 1. Manual approval once all CI steps have passed. PyPI uploads are
+  #    permanent, so this is the last place to stop. One approval releases
+  #    both wheels.
+  # TODO: limit the team on Buildkite to filter who can unblock this blocker.
+  - block: "Build and publish vllm-torchtpu-core and vllm-torchtpu?"
+    key: "approve_release"
+    # "bootstrap" = first step's key (set in Buildkite pipeline settings).
+    # Waits for everything bootstrap.sh uploads, i.e. all of CI.
+    depends_on: "bootstrap"
+    prompt: "CI passed. Build and publish vllm-torchtpu-core, then vllm-torchtpu, to PyPI? This cannot be undone."
+
+  # 2. Build the core wheel once; the publish step uses this exact file.
+  - label: "Build core wheel"
+    key: "build_core_wheel"
+    depends_on: "approve_release"
+    agents:
+      queue: cpu_64_core
+    env: *core_env   # PUBLISH_PYPI: fail early if the version is already on PyPI.
+    commands:
+      - bash .buildkite/scripts/build_core_wheel.sh
+
+  # 3. Upload via Trusted Publishing, then wait until the index serves it.
+  - label: "Publish core wheel"
+    key: "publish_core_wheel"
+    depends_on: "build_core_wheel"
+    agents:
+      queue: cpu_64_core
+    env: *core_env
+    # Never publish two releases at once.
+    concurrency: 1
+    concurrency_group: "vllm-torchtpu-core-publish"
+    commands:
+      - 'echo "Passed: skipping publish_wheel.sh core"'
+      # TODO: uncomment after publish
+      # - bash .buildkite/scripts/publish_wheel.sh core
+
+  # 4. Build the combined wheel and sdist: upstream vLLM at the ref pinned in
+  #    pyproject.toml, renamed to vllm-torchtpu and pinned to the published
+  #    core version (CORE_PUBLISHED_VERSION, also used as this wheel's version).
+  #    `$$` defers variable expansion to the shell at runtime.
+  - label: "Build vllm-torchtpu wheel"
+    key: "build_vllm_torchtpu"
+    depends_on: "publish_core_wheel"
+    agents:
+      queue: cpu_64_core
+    commands:
+      # TODO: TEMP (CI test): Change CORE_RELEASE_VERSION
+      # to CORE_PUBLISHED_VERSION once step 3 publishes.
+      - |
+        set -euo pipefail
+        CORE_VERSION="$$(buildkite-agent meta-data get CORE_RELEASE_VERSION)"
+        bash .buildkite/scripts/build_vllm_torchtpu.sh "$$CORE_VERSION"
+        buildkite-agent artifact upload "dist/vllm_torchtpu-*.whl"
+        buildkite-agent artifact upload "dist/vllm_torchtpu-*.tar.gz"
+        buildkite-agent meta-data set "VLLM_TORCHTPU_RELEASE_VERSION" "$$CORE_VERSION"
+
+  # 5. Upload the combined wheel and its sdist with the same script as step 3.
+  - label: "Publish vllm-torchtpu wheel"
+    key: "publish_vllm_torchtpu"
+    depends_on: "build_vllm_torchtpu"
+    agents:
+      queue: cpu_64_core
+    env: *vllm_torchtpu_env
+    # Never publish two releases at once.
+    concurrency: 1
+    concurrency_group: "vllm-torchtpu-publish"
+    commands:
+      - 'echo "Passed: skipping publish_wheel.sh vllm-torchtpu"'
+      # TODO: uncomment after publish
+      # - bash .buildkite/scripts/publish_wheel.sh vllm-torchtpu
