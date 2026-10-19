@@ -127,6 +127,7 @@ if TYPE_CHECKING:
     TPU_PARALLEL_PRECOMPILE: bool = False
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
+    TPU_PRECOMPILE_TRACE_FIRST: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
@@ -1064,6 +1065,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per host and the others wait for its artifact. Off compiles every bucket
     # on every rank, sharing only through the Tier-2 cache.
     "TPU_PRECOMPILE_PEER_REPLAY": env_bool("TPU_PRECOMPILE_PEER_REPLAY", default=False),
+    # With shape-specialized backbone traces (one per token-bucket group, see
+    # compilation/shape_variants.py), trace every group before compiling any
+    # bucket, then compile all buckets at once across the host's ranks
+    # (owners compile, peers replay). Without it each group's buckets compile
+    # before the next group is even traced, so the groups run one after
+    # another and most ranks wait. Needs TPU_PARALLEL_PRECOMPILE.
+    "TPU_PRECOMPILE_TRACE_FIRST": env_bool("TPU_PRECOMPILE_TRACE_FIRST", default=False),
     # Token-axis chunk size for the GLM-5.2 / DSv4 StreamIndex top-k kernel.
     # Cutting the flat token axis into `chunk_tokens`-sized pieces lets each
     # chunk's SparseCore top-k overlap the next chunk's TensorCore scoring.

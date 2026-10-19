@@ -734,3 +734,46 @@ def test_small_collective_row_fork_hands_buckets_over(tmp_path, model_name, reta
             retain,
         )
     )
+
+
+def _trace_first_compiles_after_every_trace(cache_root):
+    os.environ.update(
+        TPU_PARALLEL_PRECOMPILE="1",
+        TPU_PRECOMPILE_BIGGEST_FIRST="1",
+        TPU_PRECOMPILE_PEER_REPLAY="0",
+        LOCAL_RANK="0",
+    )
+    buckets = [16, 2048, 4096, 8192]
+    config, backend = prepare(cache_root)
+    config.compilation_config.compile_sizes = buckets
+    vllm_torchtpu._patch_vllm_compile_all_ranges()
+    model = build(TieredModel, config)
+
+    retraces = 0
+    with set_current_vllm_config(config), shape_variants.warmup() as tracked:
+        with shape_variants.trace_only() as deferred:
+            for num_tokens in buckets:
+                if tracked.needs_retrace(num_tokens):
+                    shape_variants.retrace(model, config)
+                    retraces += 1
+                # The warmup forward runs the placeholder: right shape, zeros.
+                out = run(model, config, num_tokens)
+                assert out.shape == (num_tokens, HIDDEN)
+            assert not tracked.refused
+        # Every trace exists before anything compiles.
+        assert retraces == 2
+        assert backend.compiled == []
+        deferred.compile()
+
+    # One compile per bucket, biggest first, each with its own trace's structure.
+    assert backend.compiled == [(8192, 4), (4096, 2), (2048, 1), (16, 1)]
+    CALLS.clear()
+    for num_tokens in buckets:
+        assert run(model, config, num_tokens).shape[0] == num_tokens
+    assert CALLS == [(16, 1), (2048, 1), (4096, 2), (8192, 4)]
+
+
+def test_trace_first_compiles_every_bucket_once_after_all_traces(tmp_path):
+    """TPU_PRECOMPILE_TRACE_FIRST: the same executables as the serial ladder,
+    built in one pass once every bucket group has been traced."""
+    in_child(partial(_trace_first_compiles_after_every_trace, str(tmp_path)))
