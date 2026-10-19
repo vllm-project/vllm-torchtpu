@@ -1,9 +1,11 @@
 # Roadmap
 
-This page is the public roadmap for open source PyTorch inference on Cloud TPU. It covers `vllm-torchtpu`, its sibling project `sglang-torchtpu`, the shared `torch_tpu` runtime, and the kernels, recipes, and tooling they build on, so that the community can see what is coming, plan around it, and get involved.
+This page is the public roadmap for **vLLM TorchTPU** (`vllm-torchtpu`): what the project is working on over the coming quarter, published so that the community can see what is coming, plan around it, and get involved.
 
 !!! info "Last updated: October 19, 2026"
     Items are grouped by **target window**. Dates are planning targets rather than commitments and may shift as upstream dependencies, model releases, and community priorities evolve. This page is refreshed at least once per quarter.
+
+    `vllm-torchtpu` shares the `torch_tpu` runtime, the Tokamax kernel library, and the TPU recipes with its sibling project `sglang-torchtpu`, so platform-level milestones below benefit both projects. SGLang-specific plans are tracked by that project.
 
 For what is supported **today**, see [Supported Models & Features](user_guide/supported_models.md).
 
@@ -15,11 +17,11 @@ For what is supported **today**, see [Supported Models & Features](user_guide/su
 
 | Milestone | Area | Description |
 | :--- | :--- | :--- |
-| **vLLM, SGLang & TorchTPU Launch** | Core OSS Repositories | Official public release and migration of `google-pytorch/torch_tpu`, `vllm-project/vllm-torchtpu`, `sgl-project/sglang-torchtpu`, and TorchTitan to GitHub as a PyTorch Foundation supported accelerator, backed by a contributor TPU pool (256 v6e / 32 v7x chips). |
-| **Inferact & RadixArk Co-Engineering** | Partner Ecosystem & Governance | Establish a community-led governance model by onboarding Inferact maintainers to `vllm-torchtpu` and partnering with RadixArk on `sglang-torchtpu`, delivering custom megakernels and SOTA price-performance on InferenceX & AgentX. |
+| **vLLM TorchTPU Launch** | Core OSS Repositories | Official public release of `vllm-project/vllm-torchtpu` and the `google-pytorch/torch_tpu` runtime on GitHub, with TorchTPU as a PyTorch Foundation supported accelerator, backed by a contributor TPU pool (256 v6e / 32 v7x chips). |
+| **Inferact Co-Maintainership** | Partner Ecosystem & Governance | Establish a community-led governance model by onboarding Inferact maintainers to `vllm-torchtpu`, delivering custom megakernels and SOTA price-performance on InferenceX & AgentX. |
 | **Qwen 3.5 397B & Gemma 4 Recipes** | Reproducible Recipes | Publish reproducible Ironwood (TPU v7x) FP8 W8A8 inference recipes for Qwen 3.5 397B and Gemma 4 in [AI-Hypercomputer/tpu-recipes](https://github.com/AI-Hypercomputer/tpu-recipes). |
 | **TPU Agent Suite (Experimental) & Ray** | Agentic Tooling & Orchestration | Launch the TPU Agent Suite (experimental release) and native Ray integration to streamline distributed orchestration and agentic developer workflows on Cloud TPU. |
-| **100% Tokamax PyTorch Interfaces** | Kernel Ecosystem | Deliver production PyTorch interfaces for 100% of [Tokamax](https://github.com/openxla/tokamax) kernels, establishing a unified integration layer across vLLM, SGLang, and TorchTitan. |
+| **100% Tokamax PyTorch Interfaces** | Kernel Ecosystem | Deliver production PyTorch interfaces for 100% of [Tokamax](https://github.com/openxla/tokamax) kernels, giving `vllm-torchtpu` a single kernel integration layer shared with the rest of the TorchTPU ecosystem (SGLang, TorchTitan). |
 | **Multi-Host Disaggregation (xP-yD)** | Distributed Serving | Enable low-latency multi-host prefill/decode disaggregated serving ([llm-d](https://llm-d.ai)) for frontier open models to unblock massive-scale, long-context, and agentic workloads. |
 | **TPU-Sync & Lustre KV-Cache Offloading** | Memory & Context Scaling | Integrate zero-copy TPU-Sync KV-cache connectors across host RAM and Google Cloud Managed Lustre, scaling context windows from 128K to 1M+ tokens with throughput gains. |
 
@@ -30,7 +32,7 @@ For what is supported **today**, see [Supported Models & Features](user_guide/su
 | **24-Hour Day-0 Model Onboarding Pipeline** | Community Enablement | Deploy an automated CI pipeline to ingest, benchmark, and publish support matrices for newly released open-weight models within 24 hours of launch. |
 | **Qwen 3.8, Kimi K3 & GLM 5.2/5.3 Benchmarks** | SOTA Performance | Complete performance hill-climbing and publish competitive AgentX load-tester submissions (including llm-d xP/yD runs) for Qwen 3.5/3.8, Kimi K3, and GLM 5.2 / 5.3 (1M context). |
 | **Speculative Decoding & Agentic Traces** | Latency Acceleration | Roll out Speculative Decoding (including Multi-Token Prediction / MTP) and publish official AgentX benchmark submissions for multi-host speculative decoding and real-world agentic trace distributions. |
-| **Native Diffusion Model Serving** | Multimodal Serving | Integrate native serving support for major video and image diffusion models (e.g., Wan 2.2, Lightrick2) directly into `vllm-torchtpu` and `sglang-torchtpu`. |
+| **Native Diffusion Model Serving** | Multimodal Serving | Integrate native serving support for major video and image diffusion models (e.g., Wan 2.2, Lightrick2) directly into `vllm-torchtpu` via `vllm-omni`. |
 | **Public Nightly CI/CD Support Matrix** | Developer Tooling | Launch a public, nightly-updated CI/CD support matrix tracking model execution status, quantization formats (BF16, FP8, MXFP4), serving features, and automated evaluation scores. |
 
 ### December 2026
