@@ -91,7 +91,7 @@ VERSION="$("$PY" "$WHEEL_UTILS" validate_version "$VERSION")" \
 echo "Release version: ${VERSION}"
 
 # Stop before building if this version is already on PyPI (versions can't be
-# reused). PUBLISH_PYPI comes from the step's env in pipeline_release_pypi.yml.
+# reused). PUBLISH_PYPI comes from the step's env in .buildkite/release/pipeline.yml.
 [[ -n "${PUBLISH_PYPI:-}" ]] || die "PyPI project (PUBLISH_PYPI) is not set."
 INDEX_BASE="${PYPI_BASE_URL:-https://pypi.org}"
 "$PY" "$WHEEL_UTILS" check_not_published "${INDEX_BASE%/}" "$PUBLISH_PYPI" "$VERSION"

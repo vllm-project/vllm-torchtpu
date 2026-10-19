@@ -20,16 +20,17 @@ steps not gated on it. The schedules keep clear of the hours the nightly's
 perf steps take. The integration pipeline also runs the lane, because its LKG
 promotion waits on two of its steps.
 
-The `vllm-torchtpu-nightly-image` pipeline runs `pipeline_nightly_image.yml`,
-which builds the `ci`, `dev` and `prod` images with
-`scripts/publish_nightly_images.sh` and publishes public images to Docker Hub
-([`vllm/vllm-torchtpu`](https://hub.docker.com/r/vllm/vllm-torchtpu/tags)). It
-has no git triggers; its schedules pick the branch. A build of `main` pushes
-`nightly-YYYYMMDD-<commit>-<vllm>` and `nightly` (`dev` target), and an
-approved build of `releases/vX.Y.Z` pushes `vX.Y.Z` and `latest` (`prod`
-target; see `docs/getting_started/docker.md`). To start nightly images for a
-new release branch, add a schedule on that pipeline with the branch set to
-`releases/vX.Y.Z`.
+Releases and nightly images are published by the `vllm-torchtpu-release`
+pipeline in the TPU Release cluster; [`release/README.md`](release/README.md)
+has how to cut a release. Its nightly step runs
+`scripts/publish_nightly_images.sh` on `main`, pushing the `ci`, `dev` and
+`prod` images to GAR as `nightly-YYYYMMDD` and `latest`, and the `dev` image to
+Docker Hub ([`vllm/vllm-torchtpu`](https://hub.docker.com/r/vllm/vllm-torchtpu/tags))
+as `nightly-YYYYMMDD-<commit>-<vllm>` and `nightly`. A release publishes the
+`prod` image as `vX.Y.Z`, and `latest` if the approver chooses (see
+`docs/getting_started/docker.md`). `pipeline_nightly_image.yml` is the same
+nightly step for the `vllm-torchtpu-nightly-image` pipeline, which runs until
+the new pipeline's schedule takes over.
 
 Unit tests run on CPU by default. For a test file that requires a single-host
 TPU, add `pytestmark = pytest.mark.tpu_test` after its imports (or

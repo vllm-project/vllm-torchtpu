@@ -15,7 +15,7 @@
 #
 # ------------------------------------------------------
 # Publish a release to PyPI with Trusted Publishing (no stored API token).
-# Steps 3 and 5 of pipeline_release_pypi.yml.
+# The PyPI publish steps of vllm-torchtpu-release (.buildkite/release/).
 #
 # Usage:
 #   publish_wheel.sh core            # vllm-torchtpu-core (wheel only)
