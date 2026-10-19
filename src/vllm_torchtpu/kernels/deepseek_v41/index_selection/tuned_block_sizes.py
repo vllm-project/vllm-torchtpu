@@ -14,8 +14,30 @@ QUERY_TILE = 128
 KEY_TILE = 2048
 
 
+@dataclass(frozen=True)
+class PersistentScoreConfig:
+    key_tile: int
+    compute_tile: int
+    head_group: int
+
+    def __post_init__(self):
+        if any(
+            type(value) is not int or value < 1
+            for value in (self.key_tile, self.compute_tile, self.head_group)
+        ):
+            raise ValueError("Score tiles and head_group must be positive integers")
+        if self.key_tile % self.compute_tile:
+            raise ValueError("key_tile must be a multiple of compute_tile")
+
+
+PERSISTENT_SCORE_CONFIGS: dict[tuple[int, ...], PersistentScoreConfig] = {
+    (6, 32, 128, 65536, 2): PersistentScoreConfig(99328, 1024, 32),
+    (6, 32, 128, 131072, 2): PersistentScoreConfig(99328, 1024, 32),
+}
+
+
 # Decode tables are calibrated with decode_indexer's default score/top-k options.
-# The dimensions describe one logical device, not global DP concurrency.
+# Request tiles bound per-group buffers; total batch size is not a lookup key.
 logger = init_logger(__name__)
 DEFAULT_DECODE_REQUEST_TILE = 16
 
@@ -23,41 +45,47 @@ DEFAULT_DECODE_REQUEST_TILE = 16
 @dataclass(frozen=True)
 class DecodeTuningKey:
     device_kind: str
-    requests: int
     queries: int
     heads: int
     score_capacity: int
     page_records: int
-    key_tile: int
     k: int
     banks: int
 
 
-# Calibrated on TPU7x, JAX 0.10.2 / libtpu 0.0.47; DSpark K5.
+# Calibrated at R48 on TPU7x, JAX 0.10.2 / libtpu 0.0.47; DSpark K5.
 # Seeds 517/519, effective lengths 49408/98816; all other options default.
 DECODE_REQUEST_TILES: dict[DecodeTuningKey, int] = {
-    DecodeTuningKey("TPU7x", 48, 6, 32, 65536, 128, 4096, 512, 2): 12,
-    DecodeTuningKey("TPU7x", 48, 6, 32, 131072, 128, 4096, 512, 2): 16,
+    DecodeTuningKey("TPU7x", 6, 32, 65536, 128, 512, 2): 12,
+    DecodeTuningKey("TPU7x", 6, 32, 131072, 128, 512, 2): 16,
 }
 
 
-def get_decode_request_tile(key: DecodeTuningKey) -> int:
-    """Resolve a static request group; unknown shapes keep a bounded divisor."""
-    if key.requests < 1:
+def get_persistent_score_config(key: tuple[int, ...]) -> PersistentScoreConfig:
+    """Choose persistent tiles; table misses keep the same kernel."""
+    config = PERSISTENT_SCORE_CONFIGS.get(key)
+    if config is None:
+        # The native ragged-query suite exercises 4K DMA / 1K compute fragments.
+        config = PersistentScoreConfig(4096, 1024, 32)
+        logger.warning_once(
+            "[persistent_scores] No tuned config for %s; using %s", key, config
+        )
+    return config
+
+
+def get_decode_request_tile(key: DecodeTuningKey, requests: int) -> int:
+    """Bound each score group independently of the total batch size."""
+    if requests < 1:
         raise ValueError("decode requests must be positive")
     tile = DECODE_REQUEST_TILES.get(key)
     if tile is None:
-        tile = next(
-            n
-            for n in range(min(DEFAULT_DECODE_REQUEST_TILE, key.requests), 0, -1)
-            if key.requests % n == 0
-        )
+        tile = min(DEFAULT_DECODE_REQUEST_TILE, requests)
         logger.warning_once(
             "[decode_indexer] No tuned request_tile for %s; using %d", key, tile
         )
-    if type(tile) is not int or tile < 1 or key.requests % tile:
+    if type(tile) is not int or tile < 1:
         raise ValueError(f"Invalid decode request_tile={tile} for {key}")
-    return tile
+    return min(tile, requests)
 
 
 @dataclass(frozen=True)

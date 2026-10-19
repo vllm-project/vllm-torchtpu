@@ -1906,12 +1906,16 @@ def test_paged_indexer_query_tiles_preserve_selection(
     monkeypatch, mode, banks, unordered
 ):
     """Bound score rows, including a partial tile, without changing selection."""
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import _pack_bf16_words
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import scatter_index_keys
 
     rng = np.random.default_rng(17)
     rows, width, topk = 65, 128, 16
     keys = jnp.asarray(rng.standard_normal((2 * width, 128)), jnp.bfloat16)
-    pool = _pack_bf16_words(keys).reshape(-1, 128)
+    pool = scatter_index_keys(
+        jnp.zeros((keys.shape[0] // 2, 128), jnp.int32),
+        jnp.arange(keys.shape[0], dtype=jnp.int32),
+        keys,
+    )
     if banks == 2:
         pool = tuple(jnp.split(pool, 2))
     q = jnp.asarray(rng.standard_normal((rows, 2, 128)), jnp.bfloat16)
@@ -1978,15 +1982,18 @@ def test_paged_indexer_query_tiles_share_request_keys(
 ):
     """Six-query requests share keys across tile boundaries and restore row order."""
     from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
-        _pack_bf16_words,
-        gather_cache_values,
+        scatter_index_keys,
         split_halves,
     )
 
     rng = np.random.default_rng(31)
     rows, width, page, topk = 8 * request_count, 128, 16, 16
     keys = jnp.asarray(rng.standard_normal((request_count * width, 128)), jnp.bfloat16)
-    pool = _pack_bf16_words(keys).reshape(-1, 128)
+    pool = scatter_index_keys(
+        jnp.zeros((request_count * width // 2, 128), jnp.int32),
+        jnp.arange(request_count * width, dtype=jnp.int32),
+        keys,
+    )
     if banks == 2:
         pool = tuple(jnp.split(pool, 2))
     records = jnp.arange(request_count * width, dtype=jnp.int32).reshape(
@@ -2012,9 +2019,7 @@ def test_paged_indexer_query_tiles_share_request_keys(
     weights = jnp.asarray(rng.random((rows, 2)), jnp.float32)
     candidates = jnp.tile(jnp.arange(candidate_width, dtype=jnp.int32), (rows, 1))
     token_records = records[requests]
-    dense_keys = gather_cache_values(
-        pool, token_records.reshape(-1), 128, split=True
-    ).reshape(rows, width, 128)
+    dense_keys = split_halves(keys[jnp.maximum(token_records, 0)])
     logits = jnp.einsum(
         "thd,tcd->thc", split_halves(q), dense_keys, preferred_element_type=jnp.float32
     )
@@ -2074,7 +2079,7 @@ def test_paged_indexer_context_bucket_preserves_boundary_and_fallback(
     monkeypatch, length, banks
 ):
     """Bucket edges and the long-context fallback preserve exact selection."""
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import _pack_bf16_words
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import scatter_index_keys
 
     monkeypatch.setattr(
         attention_kernels.tuned_block_sizes, "PAGED_INDEXER_PREFILL_BUCKET", (128, 64)
@@ -2082,7 +2087,11 @@ def test_paged_indexer_context_bucket_preserves_boundary_and_fallback(
     rng = np.random.default_rng(23)
     rows, width, topk = 129, 256, 16
     keys = jnp.asarray(rng.standard_normal((width, 128)), jnp.bfloat16)
-    pool = _pack_bf16_words(keys).reshape(-1, 128)
+    pool = scatter_index_keys(
+        jnp.zeros((keys.shape[0] // 2, 128), jnp.int32),
+        jnp.arange(keys.shape[0], dtype=jnp.int32),
+        keys,
+    )
     if banks == 2:
         pool = tuple(jnp.split(pool, 2))
     q = jnp.asarray(rng.standard_normal((rows, 2, 128)), jnp.bfloat16)
@@ -2370,13 +2379,17 @@ def test_paged_indexer_decode_rows_skip_query_tiles(monkeypatch, banks):
     DSpark verification has K + 1 rows per request. Query tiles smaller than
     the request-row count would defeat grouped per-request key sharing.
     """
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import _pack_bf16_words
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import scatter_index_keys
 
     rng = np.random.default_rng(31)
     requests_count, group, width, topk = 16, 6, 256, 16
     rows = requests_count * group
     keys = jnp.asarray(rng.standard_normal((requests_count * width, 128)), jnp.bfloat16)
-    pool = _pack_bf16_words(keys).reshape(-1, 128)
+    pool = scatter_index_keys(
+        jnp.zeros((keys.shape[0] // 2, 128), jnp.int32),
+        jnp.arange(keys.shape[0], dtype=jnp.int32),
+        keys,
+    )
     if banks == 2:
         pool = tuple(jnp.split(pool, 2))
     q = jnp.asarray(rng.standard_normal((rows, 2, 128)), jnp.bfloat16)

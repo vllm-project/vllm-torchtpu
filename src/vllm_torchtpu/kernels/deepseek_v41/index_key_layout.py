@@ -11,6 +11,14 @@ import jax
 import jax.numpy as jnp
 
 DIM = 128
+ROW_WORDS = DIM
+KEY_BITS = jnp.finfo(jnp.bfloat16).bits
+KEY_MASK = (1 << KEY_BITS) - 1
+SLOTS = (
+    ROW_WORDS
+    * jnp.dtype(jnp.int32).itemsize
+    // (DIM * jnp.dtype(jnp.bfloat16).itemsize)
+)
 
 
 def encode_records(keys: jax.Array) -> jax.Array:
@@ -18,7 +26,7 @@ def encode_records(keys: jax.Array) -> jax.Array:
     if keys.ndim != 2 or keys.shape[1] != DIM or keys.dtype != jnp.bfloat16:
         raise ValueError("Expected ordinary-channel BF16 [records,128] index keys")
     bits = jax.lax.bitcast_convert_type(keys, jnp.uint16).astype(jnp.uint32)
-    normalized = jax.lax.bitcast_convert_type(bits << 16, jnp.float32).astype(
+    normalized = jax.lax.bitcast_convert_type(bits << KEY_BITS, jnp.float32).astype(
         jnp.bfloat16
     )
     split = jnp.concatenate((normalized[:, ::2], normalized[:, 1::2]), axis=1)
@@ -42,12 +50,14 @@ def unpack_rows(words: jax.Array) -> jax.Array:
     """
     if words.dtype != jnp.int32 or words.shape[-1] != DIM or words.ndim < 2:
         raise ValueError("Expected int32 [...,rows,128] index words")
-    low = jax.lax.bitcast_convert_type(words << 16, jnp.float32).astype(jnp.bfloat16)
-    high = jax.lax.bitcast_convert_type(words & jnp.int32(-65536), jnp.float32).astype(
+    low = jax.lax.bitcast_convert_type(words << KEY_BITS, jnp.float32).astype(
         jnp.bfloat16
     )
+    high = jax.lax.bitcast_convert_type(
+        words & jnp.int32(~KEY_MASK), jnp.float32
+    ).astype(jnp.bfloat16)
     return jnp.stack((low, high), axis=-2).reshape(
-        (*words.shape[:-2], words.shape[-2] * 2, DIM)
+        (*words.shape[:-2], words.shape[-2] * SLOTS, DIM)
     )
 
 
@@ -69,13 +79,15 @@ def gather_records(
     valid = jnp.zeros(records.shape, jnp.bool_)
     for bank in banks:
         local = records - offset
-        selected = (local >= 0) & (local < bank.shape[0] * 2)
-        fetched = bank[jnp.clip(local // 2, 0, bank.shape[0] - 1)]
+        selected = (local >= 0) & (local < bank.shape[0] * SLOTS)
+        fetched = bank[jnp.clip(local // SLOTS, 0, bank.shape[0] - 1)]
         words = jnp.where(selected[..., None], fetched, words)
         valid |= selected
-        offset += bank.shape[0] * 2
-    bits = jax.lax.shift_right_logical(words, ((records % 2) * 16)[..., None])
-    values = jax.lax.bitcast_convert_type(bits << 16, jnp.float32).astype(jnp.bfloat16)
+        offset += bank.shape[0] * SLOTS
+    bits = jax.lax.shift_right_logical(words, ((records % SLOTS) * KEY_BITS)[..., None])
+    values = jax.lax.bitcast_convert_type(bits << KEY_BITS, jnp.float32).astype(
+        jnp.bfloat16
+    )
     return jnp.where(valid[..., None], values, jnp.bfloat16(0))
 
 
@@ -99,14 +111,14 @@ def merge_record_rows(
     encoded = encode_records(values)
     if values.shape[0] == 0:
         return records, jnp.zeros((0, DIM), jnp.int32)
-    valid = (records >= 0) & (records < cache.shape[0] * 2)
-    rows = jnp.where(valid, records // 2, -1)
+    valid = (records >= 0) & (records < cache.shape[0] * SLOTS)
+    rows = jnp.where(valid, records // SLOTS, -1)
     old = cache[jnp.clip(rows, 0, cache.shape[0] - 1)].astype(jnp.uint32)
     same = (rows[:, None] == rows[None, :]) & valid[:, None] & valid[None, :]
     parts = []
-    for parity in (0, 1):
-        writers = same & ((records[None, :] % 2) == parity)
+    for parity in range(SLOTS):
+        writers = same & ((records[None, :] % SLOTS) == parity)
         source = encoded[jnp.argmax(writers, axis=1)]
-        original = (old >> (16 * parity)) & jnp.uint32(65535)
+        original = (old >> (KEY_BITS * parity)) & jnp.uint32(KEY_MASK)
         parts.append(jnp.where(writers.any(axis=1)[:, None], source, original))
-    return rows, (parts[0] | (parts[1] << 16)).astype(jnp.int32)
+    return rows, (parts[0] | (parts[1] << KEY_BITS)).astype(jnp.int32)

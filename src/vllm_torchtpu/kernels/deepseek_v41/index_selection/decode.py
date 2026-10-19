@@ -14,21 +14,17 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.deepseek_v41 import indexer
-from vllm_torchtpu.kernels.deepseek_v41.index_selection import scores, streaming_topk
+from vllm_torchtpu.kernels.deepseek_v41.index_key_layout import DIM, ROW_WORDS, SLOTS
+from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
+    persistent_scores,
+    streaming_topk,
+)
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.tuned_block_sizes import (
     DecodeTuningKey,
+    PersistentScoreConfig,
     get_decode_request_tile,
+    get_persistent_score_config,
 )
-from vllm_torchtpu.kernels.deepseek_v41.index_word_scores import DIM, ROW_WORDS, SLOTS
-
-
-def flat_request_group(requests: int, queries: int) -> int:
-    """Requests per grid step for an 8-row-aligned 2D block; 0 if none fits."""
-    group = 8 // math.gcd(queries, 8)
-    if requests % group or (group * queries) % 8:
-        return 0
-    return group
 
 
 def supports_decode(
@@ -38,10 +34,9 @@ def supports_decode(
     page_records: int | None,
 ) -> bool:
     """Static envelope; the caller must also prove request-major live rows."""
-    banks = pool if isinstance(pool, tuple) else (pool,)
     requests = records.shape[0]
-    return (
-        requests > 1
+    if not (
+        requests > 0
         and q.shape[0] % requests == 0
         and 1 < q.shape[0] // requests <= 8
         and q.shape[1:] == (32, DIM)
@@ -49,330 +44,51 @@ def supports_decode(
         and 512 <= records.shape[1] <= 131072
         and records.dtype == jnp.int32
         and page_records is not None
-        and 0 < page_records <= 4096
-        and page_records % 16 == 0
-        and 4096 % page_records == 0
+        and page_records >= SLOTS
+        and page_records % SLOTS == 0
+        and isinstance(pool, tuple)
+        and len(pool) == 2
         and records.shape[1] % page_records == 0
         and all(
             bank.dtype == jnp.int32
             and bank.ndim == 2
             and bank.shape[1] == ROW_WORDS
             and bank.shape[0] % (page_records // SLOTS) == 0
-            for bank in banks
-        )
-    )
-
-
-def _flat_request_kernel(
-    pages,
-    limits,
-    query_limits,
-    q,
-    weights,
-    pool,
-    out,
-    words,
-    *scratch,
-    group,
-    page_records,
-    tile,
-    coalesce,
-    prefetch,
-    profile_stages,
-    fuse_mask,
-    halfplane=False,
-):
-    """Score `group` requests into a 2D block or a singleton-axis basic layout.
-
-    Request r owns rows r*Q..r*Q+Q-1; each is scored exactly as in the
-    per-request kernel (same dot shapes and order), so results are bitwise equal.
-    """
-    queries = q.shape[0] // group
-    if out.ndim == 3:
-        out = out.at[:, 0, :]
-    page_count = pages.shape[0] // limits.shape[0]
-    out[...] = jnp.full(out.shape, -jnp.inf, jnp.float32)
-    for r in range(group):
-        request = pl.program_id(0) * group + r
-        scores._kernel(
-            pages.at[pl.ds(request * page_count, page_count)],
-            limits.at[pl.ds(request, 1)],
-            q.at[pl.ds(r * queries, queries)],
-            weights.at[pl.ds(r * queries, queries)],
-            pool,
-            None,
-            out,
-            words,
-            *scratch,
-            page_records=page_records,
-            tile=tile,
-            coalesce=coalesce,
-            prefetch=prefetch,
-            profile_stages=profile_stages,
-            row_lengths=query_limits if fuse_mask else None,
-            row_offset=request * queries,
-            out_row_offset=r * queries,
-            halfplane=halfplane,
-        )
-
-
-@functools.partial(
-    jax.jit,
-    static_argnames=(
-        "page_records",
-        "key_tile",
-        "prefetch",
-        "profile_stages",
-        "interpret",
-        "score_window",
-        "fuse_mask",
-        "halfplane",
-        "request_group",
-        "out_window",
-    ),
-)
-def grouped_decode_scores(
-    q: jax.Array,
-    weights: jax.Array,
-    pool: jax.Array | tuple[jax.Array, jax.Array],
-    pages: jax.Array,
-    lengths: jax.Array,
-    *,
-    page_records: int,
-    key_tile: int,
-    prefetch: bool = True,
-    profile_stages: bool = False,
-    interpret: bool = False,
-    score_window: int = 32768,
-    fuse_mask: bool = False,
-    halfplane: bool = False,
-    request_group: int = 0,
-    out_window: int = 0,
-) -> jax.Array:
-    """Score split-order Q [requests, queries, heads, 128] against paged keys.
-
-    Pages contain physical first-record addresses; -1 invalidates a whole page.
-    Lengths [requests, queries] apply independently, including zero-length rows.
-
-    ``request_group`` > 0 scores that many requests per grid step into a 2D
-    [requests * queries, width] output (``request_group * queries`` must be a
-    multiple of 8), avoiding the T(1,128) layout of the legacy 3D output and
-    its XLA relayout before top-k. ``out_window`` optionally narrows that
-    path's out block columns. Results are bitwise identical to the default.
-    """
-    requests, queries, heads, dim = q.shape
-    width = pages.shape[1] * page_records
-    banks = pool if isinstance(pool, tuple) else (pool,)
-    if (
-        min(requests, queries, heads, page_records, key_tile, score_window) < 1
-        or dim != DIM
-        or q.dtype != jnp.bfloat16
-        or weights.dtype != jnp.float32
-        or weights.shape != (requests, queries, heads, 1)
-        or pages.shape[0] != requests
-        or pages.dtype != jnp.int32
-        or lengths.shape != (requests, queries)
-        or lengths.dtype != jnp.int32
-        or page_records % 16
-        or key_tile % page_records
-        or width % key_tile
-        or request_group < 0
-        or out_window < 0
-        or any(
-            bank.dtype != jnp.int32
-            or bank.shape[1] != ROW_WORDS
-            or bank.shape[0] % (page_records // SLOTS)
-            for bank in banks
+            for bank in pool
         )
     ):
-        raise ValueError("Expected aligned paged BF16 request-major decode inputs")
-    window = math.gcd(width, max(key_tile, score_window))
-    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    if request_group:
-        return _flat_decode_scores(
-            q,
-            weights,
-            pool,
-            pages,
-            lengths,
-            page_records=page_records,
-            key_tile=key_tile,
-            prefetch=prefetch,
-            profile_stages=profile_stages,
-            interpret=interpret,
-            window=window,
-            fuse_mask=fuse_mask,
-            request_group=request_group,
-            out_window=out_window,
-            halfplane=halfplane,
-        )
-    result = pl.pallas_call(
-        functools.partial(
-            _flat_request_kernel,
-            group=1,
-            page_records=page_records,
-            tile=key_tile,
-            coalesce=True,
-            prefetch=prefetch,
-            profile_stages=profile_stages,
-            fuse_mask=fuse_mask,
-            halfplane=halfplane,
-        ),
-        out_shape=jax.ShapeDtypeStruct((requests * queries, 1, width), jnp.float32),
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=3,
-            grid=(requests, width // window),
-            in_specs=(
-                pl.BlockSpec((queries, heads, DIM), lambda i, j, *_: (i, 0, 0)),
-                pl.BlockSpec((queries, heads, 1), lambda i, j, *_: (i, 0, 0)),
-                (hbm, hbm) if isinstance(pool, tuple) else hbm,
-            ),
-            out_specs=pl.BlockSpec((queries, 1, window), lambda i, j, *_: (i, 0, j)),
-            scratch_shapes=(
-                pltpu.VMEM((2, key_tile // SLOTS, ROW_WORDS), jnp.int32),
-                *(
-                    (pltpu.VMEM((key_tile, ROW_WORDS), jnp.int32),)
-                    if not halfplane
-                    else ()
-                ),
-                pltpu.SemaphoreType.DMA,
-            ),
-        ),
-        compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "parallel"),
-        ),
-        interpret=interpret,
-        name="decode_grouped_paged_index_scores",
-    )(
-        pages.reshape(-1),
-        jnp.max(lengths, axis=1),
-        lengths.reshape(-1),
-        q.reshape(-1, heads, DIM),
-        weights.reshape(-1, heads, 1),
-        pool,
-    ).reshape(requests, queries, width)
-    if fuse_mask:
-        return result.reshape(requests * queries, width)
-    valid = jnp.arange(width)[None, None] < lengths[:, :, None]
-    valid &= jnp.repeat(pages >= 0, page_records, axis=1)[:, None]
-    return jnp.where(valid, result, -jnp.inf).reshape(requests * queries, width)
-
-
-def _flat_decode_scores(
-    q,
-    weights,
-    pool,
-    pages,
-    lengths,
-    *,
-    page_records,
-    key_tile,
-    prefetch,
-    profile_stages,
-    interpret,
-    window,
-    fuse_mask,
-    request_group,
-    out_window,
-    halfplane=False,
-):
-    requests, queries, heads, _ = q.shape
-    width = pages.shape[1] * page_records
-    rows = request_group * queries
-    if requests % request_group or rows % 8:
-        raise ValueError("request_group must divide requests into 8-row blocks")
-    if out_window and math.gcd(window, out_window) % key_tile == 0:
-        window = math.gcd(window, out_window)
-    hbm = pl.BlockSpec(memory_space=pltpu.HBM)
-    result = pl.pallas_call(
-        functools.partial(
-            _flat_request_kernel,
-            group=request_group,
-            page_records=page_records,
-            tile=key_tile,
-            coalesce=True,
-            prefetch=prefetch,
-            profile_stages=profile_stages,
-            fuse_mask=fuse_mask,
-            halfplane=halfplane,
-        ),
-        out_shape=jax.ShapeDtypeStruct((requests * queries, width), jnp.float32),
-        grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=3,
-            grid=(requests // request_group, width // window),
-            in_specs=(
-                pl.BlockSpec((rows, heads, DIM), lambda i, j, *_: (i, 0, 0)),
-                pl.BlockSpec((rows, heads, 1), lambda i, j, *_: (i, 0, 0)),
-                (hbm, hbm) if isinstance(pool, tuple) else hbm,
-            ),
-            out_specs=pl.BlockSpec((rows, window), lambda i, j, *_: (i, j)),
-            scratch_shapes=(
-                pltpu.VMEM((2, key_tile // SLOTS, ROW_WORDS), jnp.int32),
-                *(
-                    (pltpu.VMEM((key_tile, ROW_WORDS), jnp.int32),)
-                    if not halfplane
-                    else ()
-                ),
-                pltpu.SemaphoreType.DMA,
-            ),
-        ),
-        compiler_params=pltpu.CompilerParams(
-            dimension_semantics=("parallel", "parallel"),
-            # A (24, 131072) f32 out block is 12 MiB, double-buffered.
-            vmem_limit_bytes=(
-                None
-                if interpret
-                else int(0.9 * pltpu.get_tpu_info().vmem_capacity_bytes)
-            ),
-        ),
-        interpret=interpret,
-        name="decode_grouped_paged_index_scores_2d",
-    )(
-        pages.reshape(-1),
-        jnp.max(lengths, axis=1),
-        lengths.reshape(-1),
-        q.reshape(-1, heads, DIM),
-        weights.reshape(-1, heads, 1),
-        pool,
+        return False
+    assert page_records is not None
+    width = 1 << (records.shape[1] - 1).bit_length()
+    config = get_persistent_score_config(
+        (q.shape[0] // requests, *q.shape[1:], width, len(pool))
     )
-    if fuse_mask:
-        return result
-    valid = jnp.arange(width)[None] < lengths.reshape(-1, 1)
-    valid &= jnp.repeat(jnp.repeat(pages >= 0, page_records, axis=1), queries, axis=0)
-    return jnp.where(valid, result, -jnp.inf)
+    return (
+        page_records % (SLOTS * pltpu.get_tpu_info().num_sublanes) == 0
+        and width % page_records == 0
+        and config.compute_tile % page_records == 0
+    )
 
 
-def _select(scores, lengths, k, block_size, threshold, fuse_validity):
-    selected = streaming_topk.streaming_topk(
+def _select(scores, lengths, k, block_size, threshold, fuse_validity=True):
+    return streaming_topk.streaming_topk(
         scores,
         valid_lengths=lengths,
         k=k,
         block_size=block_size,
         reconstruct_threshold=threshold,
-        exclude_neg_inf=fuse_validity,
+        exclude_neg_inf=True,
     )
-    valid = selected >= 0
-    if not fuse_validity:
-        values = jnp.take_along_axis(scores, jnp.maximum(selected, 0), axis=1)
-        valid &= values > -jnp.inf
-    ordered = jnp.sort(jnp.where(valid, selected, scores.shape[1]), axis=1)
-    return jnp.where(ordered < scores.shape[1], ordered, -1)
 
 
 @functools.partial(
     jax.jit,
     static_argnames=(
         "page_records",
-        "key_tile",
         "request_tile",
+        "score_config",
         "k",
         "overlap",
-        "prefetch",
-        "profile_stages",
-        "score_window",
-        "fuse_mask",
-        "halfplane",
-        "fuse_validity",
         "topk_block",
         "topk_threshold",
         "candidate_count",
@@ -387,16 +103,10 @@ def decode_indexer(
     lengths: jax.Array,
     *,
     page_records: int,
-    key_tile: int,
     request_tile: int | None = None,
+    score_config: PersistentScoreConfig | None = None,
     k: int = 512,
     overlap: bool = True,
-    prefetch: bool = True,
-    profile_stages: bool = False,
-    score_window: int = 131072,
-    fuse_mask: bool = True,
-    halfplane: bool = False,
-    fuse_validity: bool = True,
     topk_block: int = 8192,
     topk_threshold: int = 8192,
     candidate_count: int = 0,
@@ -407,8 +117,11 @@ def decode_indexer(
     None selects a shape-tuned request tile.
 
     Tables target the default score/top-k options; ablations should pass an
-    explicit request_tile. Selection happens at tracing time, never on device.
+    explicit request_tile. score_config overrides scorer tiles for benchmarking.
+    Selection happens at tracing time, never on device.
     """
+    if score_config is not None and request_tile is None:
+        raise ValueError("score_config overrides require an explicit request_tile")
     requests, queries = q.shape[:2]
     width = pages.shape[1] * page_records
     if candidate_count and (
@@ -417,69 +130,76 @@ def decode_indexer(
         or candidate_count >= width // candidate_block_size
     ):
         raise ValueError("Candidate publication requires fewer candidates than blocks")
+    if page_records < 1:
+        raise ValueError("page_records must be positive")
+    if not isinstance(pool, tuple) or len(pool) != 2:
+        raise NotImplementedError("Persistent decode requires two packed cache banks")
+    fused_blocks = candidate_count > 0 and candidate_block_size == 8
     if request_tile is None:
         request_tile = get_decode_request_tile(
             DecodeTuningKey(
                 device_kind=jax.devices()[0].device_kind,
-                requests=requests,
                 queries=queries,
                 heads=q.shape[2],
                 score_capacity=pages.shape[1] * page_records,
                 page_records=page_records,
-                key_tile=key_tile,
                 k=k,
                 banks=len(pool) if isinstance(pool, tuple) else 1,
-            )
+            ),
+            requests,
         )
-    if type(request_tile) is not int or request_tile < 1 or requests % request_tile:
-        raise ValueError("request_tile must divide the request-major batch")
+    elif type(request_tile) is not int or request_tile < 1:
+        raise ValueError("request_tile must be a positive integer")
+    request_tile = min(request_tile, requests)
 
-    # Score whole requests into an 8-row-aligned 2D request-major block: the
-    # legacy (requests * queries, 1, width) output takes a T(1,128) HBM tiling
-    # that XLA relayouts (copies) before streaming top-k. Read at trace time.
-    request_group_2d = flat_request_group(request_tile, queries)
-
-    def prepare(i):
+    def prepare(i, size=request_tile):
         return jax.tree.map(
-            lambda x: jax.lax.dynamic_slice_in_dim(x, i * request_tile, request_tile),
+            lambda x: jax.lax.dynamic_slice_in_dim(x, i * request_tile, size),
             (q, weights, pages, lengths),
         )
 
     def score(args):
         qr, wr, pr, lr = args
-        return grouped_decode_scores(
+        return persistent_scores.grouped_decode_scores(
             qr,
             wr,
             pool,
             pr,
             lr,
             page_records=page_records,
-            key_tile=key_tile,
-            prefetch=prefetch,
-            profile_stages=profile_stages,
-            score_window=score_window,
-            fuse_mask=fuse_mask,
-            halfplane=halfplane,
-            request_group=request_group_2d,
+            score_config=score_config,
+            block_size=candidate_block_size if fused_blocks else 0,
+            disable_bounds_checks=True,
         )
 
     def select(i, values):
-        row_lengths = prepare(i)[-1].reshape(-1)
+        block_scores = None
+        if fused_blocks:
+            values, block_scores = values
+        group_size = math.prod(values.shape[:-1]) // queries
+        row_lengths = jax.lax.dynamic_slice_in_dim(
+            lengths, i * request_tile, group_size
+        ).reshape(-1)
         selected = _select(
             values,
             row_lengths,
             k,
             topk_block,
             topk_threshold,
-            fuse_validity,
         )
         if not candidate_count:
             return selected
         blocks = width // candidate_block_size
-        block_scores = values.reshape(-1, blocks, candidate_block_size).max(-1)
+        if not fused_blocks:
+            block_scores = values.reshape(
+                group_size * queries, blocks, candidate_block_size
+            ).max(-1)
+        assert block_scores is not None
         last = (row_lengths - 1) // candidate_block_size
         block_scores = jnp.where(
-            jnp.arange(blocks)[None] == last[:, None], jnp.inf, block_scores
+            jnp.arange(blocks)[None] == last[:, None],
+            jnp.inf,
+            block_scores,
         )
         published = _select(
             block_scores,
@@ -487,29 +207,44 @@ def decode_indexer(
             candidate_count,
             topk_block,
             topk_threshold,
-            fuse_validity,
         )
         return selected, published
 
-    def write(i, selected, out):
-        return jax.tree.map(
-            lambda target, value: jax.lax.dynamic_update_slice_in_dim(
-                target, value, i * request_tile * queries, axis=0
-            ),
-            out,
-            selected,
-        )
-
-    out = jnp.full((requests * queries, k), -1, jnp.int32)
-    if candidate_count:
-        out = (out, jnp.full((requests * queries, candidate_count), -1, jnp.int32))
-    count = requests // request_tile
+    count = pl.cdiv(requests, request_tile)
+    selected_groups = []
+    previous = None
     if overlap:
-        return indexer.pipeline_score_topk(count, prepare, score, select, write, out)
-
-    def serial(i, out):
-        args, out = jax.lax.optimization_barrier((prepare(i), out))
-        selected = select(i, score(args))
-        return write(i, selected, out)
-
-    return jax.lax.fori_loop(0, count, serial, out)
+        current = score(prepare(jnp.int32(0)))
+        for i in range(count - 1):
+            prepared = prepare(
+                jnp.int32(i + 1),
+                min(request_tile, requests - (i + 1) * request_tile),
+            )
+            if previous is None:
+                prepared, current = jax.lax.optimization_barrier((prepared, current))
+            else:
+                prepared, current, previous = jax.lax.optimization_barrier(
+                    (prepared, current, previous)
+                )
+                selected_groups.append(previous)
+            following = score(prepared)
+            previous = select(jnp.int32(i), current)
+            current = following
+        if previous is not None:
+            previous, current = jax.lax.optimization_barrier((previous, current))
+            selected_groups.append(previous)
+        selected_groups.append(select(jnp.int32(count - 1), current))
+    else:
+        for i in range(count):
+            prepared = prepare(
+                jnp.int32(i), min(request_tile, requests - i * request_tile)
+            )
+            if previous is not None:
+                prepared, previous = jax.lax.optimization_barrier((prepared, previous))
+            previous = select(jnp.int32(i), score(prepared))
+            selected_groups.append(previous)
+    if count == 1:
+        return selected_groups[0]
+    return jax.tree.map(
+        lambda *groups: jnp.concatenate(groups, axis=0), *selected_groups
+    )

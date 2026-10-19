@@ -8,7 +8,7 @@ import numpy as np
 import pytest
 from jax.sharding import Mesh
 
-from vllm_torchtpu.kernels.deepseek_v41 import index_word_scores
+from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout, index_word_scores
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels as ak
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
     ROW_WORDS,
@@ -24,16 +24,21 @@ PAGE = 16  # records per page: 8 word rows of two 128-element BF16 keys
 
 
 def _words(rng, shape):
-    bits = rng.integers(-(2**31), 2**31, size=shape, dtype=np.int32)
-    # Finite normal BF16 halves.
-    return jnp.asarray((bits & np.int32(-0x40004001)) | np.int32(0x00800080))
+    groups = shape[:-2]
+    keys = jnp.asarray(rng.standard_normal((*groups, shape[-2] * 2, 128)), jnp.bfloat16)
+    encoded = index_key_layout.encode_records(keys.reshape(-1, 128)).reshape(
+        *groups, shape[-2] * 2, 128
+    )
+    return (encoded[..., ::2, :] | (encoded[..., 1::2, :] << 16)).astype(jnp.int32)
 
 
 def _reference(q, weights, words):
-    """XLA path: split words into keys [tokens, 2 * rows, 128], einsum."""
+    """Independent low/high-half decoding followed by dense FP32 scoring."""
     groups, rows, _ = words.shape
     tokens = q.shape[0]
-    keys = jnp.concatenate(_split_words(words.reshape(-1, ROW_WORDS // 2)), axis=1)
+    bits = np.asarray(words).view(np.uint32)
+    record_bits = np.stack((bits & 65535, bits >> 16), axis=-2).astype(np.uint16)
+    keys = jax.lax.bitcast_convert_type(jnp.asarray(record_bits), jnp.bfloat16)
     keys = jnp.repeat(keys.reshape(groups, 2 * rows, -1), tokens // groups, axis=0)
     logits = jnp.einsum("thd,tcd->thc", q, keys, preferred_element_type=jnp.float32)
     scores = (jnp.maximum(logits, 0) * weights).sum(1)
@@ -84,7 +89,8 @@ def test_score_word_rows_rejects_shapes(q_shape, words_shape):
 
 def test_gather_cache_page_words_is_raw_page_rows():
     rng = np.random.default_rng(0)
-    pool = _words(rng, (64, ROW_WORDS))
+    bits = rng.integers(-(2**31), 2**31, size=(64, ROW_WORDS), dtype=np.int32)
+    pool = jnp.asarray((bits & np.int32(-0x40004001)) | np.int32(0x00800080))
     first = jnp.asarray([32, -1, 0], jnp.int32)
     words = gather_cache_page_words(pool, first, PAGE, 128)
     assert words.shape == (3 * 8, ROW_WORDS)
@@ -113,42 +119,53 @@ def _paged_inputs(rng, tokens, width, lengths, q_dtype=jnp.bfloat16):
 @pytest.mark.parametrize(
     "tokens,width,lengths", [(2, 3000, (3000, 1700)), (3, 2048, (0, 2048, 900))]
 )
-def test_paged_index_scores_word_path_matches_record_path(tokens, width, lengths):
+def test_paged_index_scores_matches_dense(tokens, width, lengths):
     rng = np.random.default_rng(width)
     q, pool, records, weights, n = _paged_inputs(rng, tokens, width, lengths)
-    with mock.patch.object(
-        ak, "_score_word_rows", wraps=ak._score_word_rows
-    ) as word_rows:
-        paged = np.asarray(
-            ak.paged_index_scores_jax(
-                q, pool, jnp.asarray(records), weights, n, None, PAGE
-            )
-        )
-    word_rows.assert_called()
-    per_record = np.asarray(
-        ak.paged_index_scores_jax(q, pool, jnp.asarray(records), weights, n)
+    actual = ak.paged_index_scores_jax(
+        q, pool, jnp.asarray(records), weights, n, None, PAGE
     )
-    # Invalid (-1) records read arbitrary rows on both paths; callers mask them.
-    scored = np.isfinite(per_record)
-    np.testing.assert_array_equal(np.isfinite(paged), scored)
-    valid = scored & (records >= 0)
-    np.testing.assert_allclose(paged[valid], per_record[valid], rtol=1e-6, atol=1e-5)
+    expected = _paged_reference(q, weights, pool, records, lengths)
+    _assert_paged_scores(actual, expected, records, lengths)
+
+
+def _paged_reference(q, weights, pool, records, lengths):
+    bits = np.asarray(pool).view(np.uint32)
+    ids = np.maximum(records, 0)
+    selected = bits[ids // 2]
+    halves = (selected >> ((ids % 2) * 16)[..., None]).astype(np.uint16)
+    keys = jax.lax.bitcast_convert_type(jnp.asarray(halves), jnp.bfloat16)
+    q = jnp.concatenate((q[..., ::2], q[..., 1::2]), axis=-1)
+    logits = jnp.einsum("thd,tkd->thk", q, keys, preferred_element_type=jnp.float32)
+    scores = (jnp.maximum(logits, 0) * weights[..., None]).sum(1)
+    valid = (records >= 0) & (
+        np.arange(records.shape[1])[None] < np.asarray(lengths)[:, None]
+    )
+    return jnp.where(valid, scores, -jnp.inf)
+
+
+def _assert_paged_scores(actual, expected, records, lengths):
+    # The bridge scores whole tiles; its caller masks invalid/causally hidden IDs.
+    valid = (records >= 0) & (
+        np.arange(records.shape[1])[None] < np.asarray(lengths)[:, None]
+    )
+    masked = jnp.where(valid, actual, -jnp.inf)
+    np.testing.assert_allclose(masked, expected, rtol=1e-6, atol=1e-5)
 
 
 @pytest.mark.parametrize(
-    "tokens,requests,expected_groups",
+    "tokens,requests",
     [
-        (6, [1, 1, 1, 1, 1, 1], 1),
-        (12, [0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2], 2),
-        # tokens=6 with heterogeneous requests: can_group is False
-        (6, [0, 0, 0, 1, 1, 1], 6),
-        (4, [0, 0, 1, 1], 4),  # tokens < 6: ungrouped path
-        (4, [0, 1, 2, 3], 4),
-        (3, [0, 0, 1], 3),
+        (6, [1, 1, 1, 1, 1, 1]),
+        (12, [0, 0, 0, 0, 0, 0, 2, 2, 2, 2, 2, 2]),
+        (6, [0, 0, 0, 1, 1, 1]),
+        (4, [0, 0, 1, 1]),
+        (4, [0, 1, 2, 3]),
+        (3, [0, 0, 1]),
     ],
 )
-def test_paged_index_scores_grouped_decode_requests(tokens, requests, expected_groups):
-    rng = np.random.default_rng(tokens * 100 + expected_groups)
+def test_paged_index_scores_grouped_decode_requests(tokens, requests):
+    rng = np.random.default_rng(tokens * 100)
     width = 1024
     _, pool, records, _, _ = _paged_inputs(
         rng, max(tokens, 4), width, [width] * max(tokens, 4)
@@ -157,43 +174,24 @@ def test_paged_index_scores_grouped_decode_requests(tokens, requests, expected_g
     weights = jnp.asarray(rng.standard_normal((tokens, 4)), jnp.float32)
     lengths = jnp.full((tokens,), width, jnp.int32)
     req_arr = jnp.asarray(requests, jnp.int32)
-    records_arr = jnp.asarray(records)
-    observed_groups = []
-
-    orig_score = ak._score_word_rows
-
-    def _spy(q_in, w_in, words_in, *, halfplane=False):
-        observed_groups.append(words_in.shape[0])
-        return orig_score(q_in, w_in, words_in, halfplane=halfplane)
-
-    with mock.patch.object(ak, "_score_word_rows", side_effect=_spy):
-        grouped = np.asarray(
-            ak.paged_index_scores_jax(
-                q, pool, records_arr, weights, lengths, req_arr, PAGE
-            )
-        )
-    assert expected_groups in observed_groups
-    expanded_records = np.asarray(records)[np.asarray(requests)]
-    per_record = np.asarray(
-        ak.paged_index_scores_jax(
-            q, pool, jnp.asarray(expanded_records), weights, lengths
-        )
+    grouped = ak.paged_index_scores_jax(
+        q, pool, jnp.asarray(records), weights, lengths, req_arr, PAGE
     )
-    valid = np.isfinite(per_record) & (expanded_records >= 0)
-    np.testing.assert_allclose(grouped[valid], per_record[valid], rtol=1e-6, atol=1e-5)
+    expanded_records = np.asarray(records)[np.asarray(requests)]
+    expected = _paged_reference(q, weights, pool, expanded_records, lengths)
+    _assert_paged_scores(grouped, expected, expanded_records, lengths)
 
 
-def test_paged_index_scores_fp32_query_keeps_xla_page_path():
+def test_paged_index_scores_fp32_query_matches_dense():
     rng = np.random.default_rng(1)
     q, pool, records, weights, n = _paged_inputs(
         rng, 2, 1024, (1024, 512), q_dtype=jnp.float32
     )
-    with mock.patch.object(ak, "_score_word_rows") as word_rows:
-        scores = ak.paged_index_scores_jax(
-            q, pool, jnp.asarray(records), weights, n, None, PAGE
-        )
-    word_rows.assert_not_called()
-    assert scores.shape == (2, 1024)
+    actual = ak.paged_index_scores_jax(
+        q, pool, jnp.asarray(records), weights, n, None, PAGE
+    )
+    expected = _paged_reference(q, weights, pool, records, n)
+    _assert_paged_scores(actual, expected, records, n)
 
 
 def test_score_word_rows_wrapper_mesh_and_standalone():

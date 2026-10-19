@@ -11,7 +11,7 @@ import torch
 from vllm_torchtpu.kernels.deepseek_v41.index_selection import candidate
 
 from .cache import (
-    PagedCacheRows,
+    IndexCacheRows,
     _cache_num_rows,
     gather_cache_page_words,
     split_halves,
@@ -19,12 +19,13 @@ from .cache import (
 
 
 class CandidateCache(NamedTuple):
+    """Packed Index-K, union block IDs/counts and per-query membership."""
+
     keys: torch.Tensor
-    ids: torch.Tensor
+    union_block_ids: torch.Tensor
     membership: torch.Tensor
-    actual_count: torch.Tensor
+    union_block_count: torch.Tensor
     usable: torch.Tensor
-    index_key_layout: str = "ordinary"
 
 
 _prepare_op = None
@@ -36,33 +37,36 @@ _select_2bank_op = None
 def prepare_candidate_cache_jax(
     pool: jax.Array,
     records: jax.Array,
-    candidates: jax.Array,
+    candidate_block_ids: jax.Array,
     requests: jax.Array,
     lengths: jax.Array,
     block_size: int,
     capacity: int,
-    packed: bool = False,
-    halfplane: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Gather request-local candidate blocks; capacity counts Index-K records."""
+    if block_size <= 0 or block_size % 2 or capacity <= 0 or capacity % block_size:
+        raise ValueError("Candidate capacity must contain whole even-sized blocks")
     groups = records.shape[0]
-    key_shape = (groups, capacity // 2 if packed else capacity, 128)
-    key_dtype = jnp.int32 if packed else jnp.bfloat16
-    if candidates.shape[0] % groups or not 1 <= candidates.shape[0] // groups <= 8:
+    key_shape = (groups, capacity // 2, 128)
+    if (
+        candidate_block_ids.shape[0] % groups
+        or not 1 <= candidate_block_ids.shape[0] // groups <= 8
+    ):
         # These shapes are concrete in JAX lowering, unlike Dynamo token rows.
         return (
-            jnp.zeros(key_shape, key_dtype),
+            jnp.zeros(key_shape, jnp.int32),
             jnp.full((groups, capacity // block_size), -1, jnp.int32),
             jnp.zeros((groups, capacity // block_size), jnp.int32),
             jnp.zeros((groups,), jnp.int32),
             jnp.zeros((1,), jnp.bool_),
         )
-    queries = candidates.shape[0] // groups
+    queries = candidate_block_ids.shape[0] // groups
     expected = jnp.repeat(jnp.arange(groups, dtype=jnp.int32), queries)
     regular = jnp.all((requests == expected) | (lengths == 0))
     if records.shape[1] > 131072:
-        candidates = jnp.where(lengths[:, None] > 0, candidates, -1)
+        candidate_block_ids = jnp.where(lengths[:, None] > 0, candidate_block_ids, -1)
     meta = candidate.union_metadata(
-        candidates.reshape(groups, queries, -1),
+        candidate_block_ids.reshape(groups, queries, -1),
         logical_blocks=(records.shape[1] + block_size - 1) // block_size,
         capacity_blocks=capacity // block_size,
     )
@@ -72,44 +76,36 @@ def prepare_candidate_cache_jax(
     usable = regular & ~jnp.any(meta.overflow)
 
     def gather():
-        words = gather_cache_page_words(pool, starts, block_size, 128)
-        words = words.reshape(groups, -1, 128)
-        return (
-            words
-            if packed
-            else candidate.unpack_candidate_words(words, halfplane=halfplane)
-        )
+        return gather_cache_page_words(pool, starts, block_size, 128).reshape(key_shape)
 
-    keys = jax.lax.cond(
-        usable,
-        gather,
-        lambda: jnp.zeros(key_shape, key_dtype),
+    keys = jax.lax.cond(usable, gather, lambda: jnp.zeros(key_shape, jnp.int32))
+    return (
+        keys,
+        meta.union_block_ids,
+        membership,
+        meta.union_block_count,
+        usable.reshape(1),
     )
-    return keys, meta.ids, membership, meta.actual_count, usable.reshape(1)
 
 
 def prepare_candidate_cache_2bank_jax(
     pool_lo: jax.Array,
     pool_hi: jax.Array,
     records: jax.Array,
-    candidates: jax.Array,
+    candidate_block_ids: jax.Array,
     requests: jax.Array,
     lengths: jax.Array,
     block_size: int,
     capacity: int,
-    packed: bool = False,
-    halfplane: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
     return prepare_candidate_cache_jax(
         cast(Any, (pool_lo, pool_hi)),
         records,
-        candidates,
+        candidate_block_ids,
         requests,
         lengths,
         block_size,
         capacity,
-        packed,
-        halfplane=halfplane,
     )
 
 
@@ -119,17 +115,16 @@ def select_candidate_cache_jax(
     records: jax.Array,
     weights: jax.Array,
     lengths: jax.Array,
-    candidates: jax.Array,
+    candidate_block_ids: jax.Array,
     requests: jax.Array,
     batch_max: jax.Array,
     keys: jax.Array,
-    ids: jax.Array,
+    union_block_ids: jax.Array,
     membership: jax.Array,
     usable: jax.Array,
     block_size: int,
     page_records: int,
     request_tile: int | None,
-    halfplane: bool = False,
 ) -> jax.Array:
     from .attention_kernels import paged_indexer_jax
 
@@ -141,12 +136,12 @@ def select_candidate_cache_jax(
             split_halves(q).reshape(groups, queries, *q.shape[1:]),
             weights.astype(jnp.float32).reshape(groups, queries, q.shape[1]),
             keys,
-            ids,
+            union_block_ids,
             membership,
             lengths.reshape(groups, queries),
             block_size=block_size,
             request_tile=request_tile,
-            halfplane=halfplane,
+            halfplane=True,
         )
 
     def fallback():
@@ -156,7 +151,7 @@ def select_candidate_cache_jax(
             records,
             weights,
             lengths,
-            candidates,
+            candidate_block_ids,
             requests,
             512,
             block_size,
@@ -165,7 +160,6 @@ def select_candidate_cache_jax(
             True,
             batch_max,
             page_records,
-            halfplane=halfplane,
         )[0]
 
     if q.shape[0] % groups or not 1 <= queries <= 8:
@@ -184,17 +178,16 @@ def select_candidate_cache_2bank_jax(
     records: jax.Array,
     weights: jax.Array,
     lengths: jax.Array,
-    candidates: jax.Array,
+    candidate_block_ids: jax.Array,
     requests: jax.Array,
     batch_max: jax.Array,
     keys: jax.Array,
-    ids: jax.Array,
+    union_block_ids: jax.Array,
     membership: jax.Array,
     usable: jax.Array,
     block_size: int,
     page_records: int,
     request_tile: int | None,
-    halfplane: bool = False,
 ) -> jax.Array:
     return select_candidate_cache_jax(
         q,
@@ -202,17 +195,16 @@ def select_candidate_cache_2bank_jax(
         records,
         weights,
         lengths,
-        candidates,
+        candidate_block_ids,
         requests,
         batch_max,
         keys,
-        ids,
+        union_block_ids,
         membership,
         usable,
         block_size,
         page_records,
         request_tile,
-        halfplane=halfplane,
     )
 
 
@@ -233,7 +225,7 @@ def initialize_candidate_cache() -> None:
         prepare_candidate_cache_jax,
         mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(
-            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 5 + (None,) * 4)
+            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 5 + (None,) * 2)
         ),
     )
     _prepare_2bank_op = pallas.jax_op(
@@ -241,27 +233,22 @@ def initialize_candidate_cache() -> None:
         prepare_candidate_cache_2bank_jax,
         mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(
-            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 6 + (None,) * 4)
+            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 6 + (None,) * 2)
         ),
     )
 
     def fake_prepare(
         pool,
         records,
-        candidates,
+        candidate_block_ids,
         requests,
         lengths,
         block_size,
         capacity,
-        packed=False,
-        halfplane=False,
     ):
         groups = records.shape[0]
         return (
-            pool.new_empty(
-                (groups, capacity // 2 if packed else capacity, 128),
-                dtype=torch.int32 if packed else torch.bfloat16,
-            ),
+            pool.new_empty((groups, capacity // 2, 128), dtype=torch.int32),
             records.new_empty((groups, capacity // block_size)),
             records.new_empty((groups, capacity // block_size)),
             records.new_empty((groups,)),
@@ -272,24 +259,20 @@ def initialize_candidate_cache() -> None:
         pool_lo: torch.Tensor,
         pool_hi: torch.Tensor,
         records: torch.Tensor,
-        candidates: torch.Tensor,
+        candidate_block_ids: torch.Tensor,
         requests: torch.Tensor,
         lengths: torch.Tensor,
         block_size: int,
         capacity: int,
-        packed: bool = False,
-        halfplane: bool = False,
     ) -> tuple[torch.Tensor, ...]:
         return fake_prepare(
             pool_lo,
             records,
-            candidates,
+            candidate_block_ids,
             requests,
             lengths,
             block_size,
             capacity,
-            packed,
-            halfplane,
         )
 
     _prepare_op.register_fake(fake_prepare)
@@ -299,7 +282,7 @@ def initialize_candidate_cache() -> None:
         select_candidate_cache_jax,
         mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(
-            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 12 + (None,) * 4)
+            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 12 + (None,) * 3)
         ),
     )
     _select_2bank_op = pallas.jax_op(
@@ -307,7 +290,7 @@ def initialize_candidate_cache() -> None:
         select_candidate_cache_2bank_jax,
         mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(
-            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 13 + (None,) * 4)
+            tuple[tuple[str, ...], ...], cast(Any, (P(),) * 13 + (None,) * 3)
         ),
     )
 
@@ -317,17 +300,16 @@ def initialize_candidate_cache() -> None:
         records: torch.Tensor,
         weights: torch.Tensor,
         lengths: torch.Tensor,
-        candidates: torch.Tensor,
+        candidate_block_ids: torch.Tensor,
         requests: torch.Tensor,
         batch_max: torch.Tensor,
         keys: torch.Tensor,
-        ids: torch.Tensor,
+        union_block_ids: torch.Tensor,
         membership: torch.Tensor,
         usable: torch.Tensor,
         block_size: int,
         page_records: int,
         request_tile: int | None,
-        halfplane: bool = False,
     ) -> torch.Tensor:
         return records.new_empty((q.shape[0], 512))
 
@@ -338,17 +320,16 @@ def initialize_candidate_cache() -> None:
         records: torch.Tensor,
         weights: torch.Tensor,
         lengths: torch.Tensor,
-        candidates: torch.Tensor,
+        candidate_block_ids: torch.Tensor,
         requests: torch.Tensor,
         batch_max: torch.Tensor,
         keys: torch.Tensor,
-        ids: torch.Tensor,
+        union_block_ids: torch.Tensor,
         membership: torch.Tensor,
         usable: torch.Tensor,
         block_size: int,
         page_records: int,
         request_tile: int | None,
-        halfplane: bool = False,
     ) -> torch.Tensor:
         return fake_select(
             q,
@@ -356,17 +337,16 @@ def initialize_candidate_cache() -> None:
             records,
             weights,
             lengths,
-            candidates,
+            candidate_block_ids,
             requests,
             batch_max,
             keys,
-            ids,
+            union_block_ids,
             membership,
             usable,
             block_size,
             page_records,
             request_tile,
-            halfplane,
         )
 
     _select_op.register_fake(fake_select)
@@ -374,46 +354,41 @@ def initialize_candidate_cache() -> None:
 
 
 def prepare_candidate_cache(
-    cache: PagedCacheRows,
+    cache: IndexCacheRows,
     records: torch.Tensor,
-    candidates: torch.Tensor,
+    candidate_block_ids: torch.Tensor,
     requests: torch.Tensor,
     lengths: torch.Tensor,
     *,
     block_size: int,
     capacity: int,
-    packed: bool = False,
 ) -> CandidateCache:
-    """Prepare once; packed mode avoids the separate BF16 unpack temporary."""
+    """Gather reusable Index-K in the native packed halfplane layout."""
     assert _prepare_op is not None and _prepare_2bank_op is not None
     args = (
         records.int(),
-        candidates.int(),
+        candidate_block_ids.int(),
         requests.int(),
         lengths.flatten().int(),
         block_size,
         capacity,
-        packed,
-        cache.index_key_layout == "halfplane",
     )
     result = (
         _prepare_2bank_op(cache.raw, cache.raw_hi, *args)
         if cache.raw_hi is not None
         else _prepare_op(cache.raw, *args)
     )
-    keys, ids, membership, actual_count, usable = result
-    return CandidateCache(
-        keys, ids, membership, actual_count, usable, cache.index_key_layout
-    )
+    keys, union_block_ids, membership, union_block_count, usable = result
+    return CandidateCache(keys, union_block_ids, membership, union_block_count, usable)
 
 
 def select_candidate_cache(
     q: torch.Tensor,
-    cache: PagedCacheRows,
+    cache: IndexCacheRows,
     records: torch.Tensor,
     weights: torch.Tensor,
     lengths: torch.Tensor,
-    candidates: torch.Tensor,
+    candidate_block_ids: torch.Tensor,
     requests: torch.Tensor,
     batch_max: torch.Tensor,
     prepared: CandidateCache,
@@ -423,23 +398,20 @@ def select_candidate_cache(
     request_tile: int | None,
 ) -> torch.Tensor:
     assert _select_op is not None and _select_2bank_op is not None
-    if prepared.index_key_layout != cache.index_key_layout:
-        raise ValueError("Prepared Index-K cache layout differs from source cache")
     args = (
         records.int(),
         weights,
         lengths.flatten().int(),
-        candidates.int(),
+        candidate_block_ids.int(),
         requests.int(),
         batch_max.reshape(1).int(),
         prepared.keys,
-        prepared.ids,
+        prepared.union_block_ids,
         prepared.membership,
         prepared.usable,
         block_size,
         page_records,
         request_tile,
-        cache.index_key_layout == "halfplane",
     )
     return (
         _select_2bank_op(q, cache.raw, cache.raw_hi, *args)

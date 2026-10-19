@@ -18,7 +18,10 @@ import pytest
 import torch
 
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention as v2_attn
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import PagedCacheRows
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
+    IndexCacheRows,
+    PagedCacheRows,
+)
 
 
 def _make_dummy_vllm_config(max_num_seqs=4, max_model_len=4096):
@@ -659,7 +662,7 @@ def test_prepare_tpu_indexer_not_all_indices_fit_both_branches(monkeypatch):
         n_head=2,
         head_dim=16,
         k_cache=SimpleNamespace(
-            prefix="idx_k", kv_cache=MagicMock(spec=PagedCacheRows)
+            prefix="idx_k", kv_cache=MagicMock(spec=IndexCacheRows)
         ),
     )
     indexer_mock.k_cache.kv_cache.row_indices = lambda slots: slots.int()

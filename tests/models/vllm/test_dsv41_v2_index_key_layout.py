@@ -10,14 +10,14 @@ import torch
 pytestmark = pytest.mark.cpu_test
 
 
-def _cache(raw=None, *, layout=None, mode="halfplane"):
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import PagedCacheRows
+def _cache(raw=None, *, layout=None):
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import IndexCacheRows
 
     if raw is None:
         raw = torch.zeros((8, 128), dtype=torch.int32)
     if layout is None:
         layout = ((4, 4, 128), torch.bfloat16, 1024, 0)
-    return PagedCacheRows(raw, layout, index_key_layout=mode)
+    return IndexCacheRows(raw, layout)
 
 
 def test_halfplane_cpu_write_read_preserves_sibling_and_shared_regions():
@@ -34,10 +34,19 @@ def test_halfplane_cpu_write_read_preserves_sibling_and_shared_regions():
     torch.testing.assert_close(
         raw[1:3], torch.full((2, 128), 731, dtype=torch.int32), rtol=0, atol=0
     )
-    ordinary = _cache(mode="ordinary")
-    ordinary.write(torch.tensor([0]), keys[:1])
-    torch.testing.assert_close(ordinary[torch.tensor([0]), torch.tensor([0])], keys[:1])
     assert cache.raw is raw
+    cache.write(torch.tensor([0]), keys[3:])
+    torch.testing.assert_close(
+        cache[torch.tensor([0]), torch.tensor([1])], keys[1:2], rtol=0, atol=0
+    )
+    neighbor = _cache(raw, layout=((4, 4, 128), torch.bfloat16, 1024, 512))
+    neighbor.write(torch.tensor([0]), keys[:1])
+    torch.testing.assert_close(
+        cache[torch.tensor([0]), torch.tensor([1])], keys[1:2], rtol=0, atol=0
+    )
+    torch.testing.assert_close(
+        neighbor[torch.tensor([0]), torch.tensor([0])], keys[:1], rtol=0, atol=0
+    )
 
 
 def test_halfplane_cpu_bank_boundary_and_invalid_metadata():
@@ -76,36 +85,35 @@ def test_same_process_full_page_copy_preserves_halfplane_bits():
     torch.testing.assert_close(cache[slots // 4, slots % 4], keys, rtol=0, atol=0)
 
 
-def test_eager_native_index_cache_uses_tagged_interpretation():
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
-        NativeCacheView,
-        PagedCacheRows,
-    )
+def test_indexer_cache_eager_halfplane_round_trip():
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention import IndexerCache
 
-    view = NativeCacheView()
-    view._tpu_index_key_layout = "halfplane"
+    view = object.__new__(IndexerCache)
+    torch.nn.Module.__init__(view)
     view._tpu_raw_cache = torch.zeros((8, 128), dtype=torch.int32)
     view._tpu_cache_layout = ((4, 4, 128), torch.bfloat16, 1024, 0)
-    assert isinstance(view.kv_cache, PagedCacheRows)
-    assert view.kv_cache.index_key_layout == "halfplane"
+    keys = torch.arange(128).reshape(1, 128).to(torch.bfloat16)
+    view.kv_cache.write(torch.tensor([0]), keys)
+    torch.testing.assert_close(
+        view.kv_cache[torch.tensor([0]), torch.tensor([0])], keys
+    )
 
 
-def test_index_layout_is_halfplane_independent_of_retired_env(monkeypatch):
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import index_key_layout
-
-    monkeypatch.setenv("TPU_DEEPSEEK_V41_INDEX_KEY_LAYOUT", "ordinary")
-    assert index_key_layout() == "halfplane"
-
-
-def test_halfplane_refuses_unversioned_external_kv_transfer(monkeypatch):
+@pytest.mark.parametrize(
+    "transfer,offloading,message",
+    [(object(), 0, "external KV transfer"), (None, 1, "offload")],
+)
+def test_halfplane_refuses_unsupported_transfer_and_offload(
+    monkeypatch, transfer, offloading, message
+):
     from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention
 
     config = SimpleNamespace(
-        kv_transfer_config=object(), cache_config=SimpleNamespace(kv_offloading_size=0)
+        kv_transfer_config=transfer,
+        cache_config=SimpleNamespace(kv_offloading_size=offloading),
     )
-    monkeypatch.setattr(attention, "index_key_layout", lambda: "halfplane")
     monkeypatch.setattr(attention, "get_current_vllm_config", lambda: config)
-    with pytest.raises(ValueError, match="external KV transfer"):
+    with pytest.raises(ValueError, match=message):
         attention.IndexerCache()
 
 
@@ -134,16 +142,6 @@ def test_halfplane_cpu_all_bf16_patterns_normalize_only_nan_payloads():
     is_nan = ((bits & 0x7F80) == 0x7F80) & ((bits & 127) != 0)
     expected = torch.where(is_nan, (bits & 0x8000) | 0x7FC0, bits).to(torch.int16)
     torch.testing.assert_close(actual, expected, rtol=0, atol=0)
-
-
-def test_bound_cache_cannot_change_interpretation():
-    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import NativeCacheView
-
-    view = NativeCacheView()
-    view._tpu_index_key_layout = "halfplane"
-    view._tpu_bound_index_key_layout = "ordinary"
-    with pytest.raises(ValueError, match="Cannot change Index-K layout"):
-        _ = view.kv_cache
 
 
 def test_model_startup_registers_real_jax_ops_on_cpu(monkeypatch):
@@ -175,13 +173,11 @@ def test_model_startup_registers_real_jax_ops_on_cpu(monkeypatch):
         with pytest.raises(ValueError, match="Missing argument type annotation"):
             pallas.jax_op(
                 "pallas::dsv41_test_untyped_read_regression",
-                lambda pool, records, elements, fp32=False, halfplane=False: (
-                    cache.gather_cache_values(
-                        pool, records, elements, fp32, halfplane=halfplane
-                    )
+                lambda pool, records, elements, fp32=False: (
+                    cache.gather_cache_values(pool, records, elements, fp32)
                 ),
                 mesh=mesh,
-                input_partition_specs=(P(), P(), None, None, None),
+                input_partition_specs=(P(), P(), None, None),
             )
         # Match the six startup registration calls in v2/model.py. These are
         # real jax_op registrations, with no model weights or TPU execution.
@@ -196,6 +192,8 @@ def test_model_startup_registers_real_jax_ops_on_cpu(monkeypatch):
             for operation in (
                 cache._read_values_op,
                 cache._read_values_2bank_op,
+                cache._read_index_values_op,
+                cache._read_index_values_2bank_op,
                 cache._write_index_values_op,
                 cache._write_index_values_after_op,
                 attention_kernels._indexer_op,
@@ -226,9 +224,7 @@ def test_halfplane_writer_normalizes_long_slots_at_jax_boundary(
     # Real CPU metadata retains the model's int64 slot arithmetic.
     raw = torch.empty((4, 128), dtype=torch.int32, device="meta")
     banks = (raw, torch.empty_like(raw)) if two_banks else raw
-    view = cache_module.PagedCacheRows(
-        banks, ((4, 4, 128), torch.bfloat16, 1024, 0), index_key_layout="halfplane"
-    )
+    view = cache_module.IndexCacheRows(banks, ((4, 4, 128), torch.bfloat16, 1024, 0))
     slots = torch.tensor([-1, 0, 1, 7, 8, 15], dtype=torch.int64)
     keys = torch.ones((6, 128), dtype=torch.bfloat16)
     dependency = torch.tensor(1.0) if after else None
@@ -273,7 +269,7 @@ def test_packed_candidate_shape_and_route_bounds(monkeypatch, rows):
     requests = torch.empty((rows,), dtype=torch.int32, device="meta")
     assert candidate_cache._prepare_2bank_op is not None
     fake = candidate_cache._prepare_2bank_op(
-        pool, pool, records, candidates, requests, requests, 8, 49152, True, True
+        pool, pool, records, candidates, requests, requests, 8, 49152
     )
     assert fake[0].shape == (48, 24576, 128)
     assert fake[0].dtype == torch.int32
@@ -289,9 +285,7 @@ def test_packed_candidate_shape_and_route_bounds(monkeypatch, rows):
         shape(requests),
     )
     prepared = jax.eval_shape(
-        lambda *args: candidate_cache.prepare_candidate_cache_jax(
-            *args, 8, 49152, True, halfplane=True
-        ),
+        lambda *args: candidate_cache.prepare_candidate_cache_jax(*args, 8, 49152),
         *inputs,
     )
     assert prepared[0].shape == tuple(fake[0].shape)
@@ -332,7 +326,6 @@ def test_packed_candidate_shape_and_route_bounds(monkeypatch, rows):
             8,
             128,
             None,
-            halfplane=True,
         ),
         jax.ShapeDtypeStruct((rows, 32, 128), jnp.bfloat16),
         jax.ShapeDtypeStruct((rows, 32), jnp.float32),

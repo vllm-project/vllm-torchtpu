@@ -69,10 +69,14 @@ def build_inputs(
     page_records: int,
 ) -> dict[str, np.ndarray]:
     """Full-batch decode inputs: request ``i`` owns token ``i``."""
+    import jax.numpy as jnp
+
+    from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout
+
     rng = np.random.default_rng(seed + 4049)
-    words = rng.integers(-(2**31), 2**31, size=(pool_rows * head_dim // 256, 128))
-    # Finite normal BF16 halves (as bench_indexer.py).
-    pool = (words.astype(np.int32) & np.int32(-0x40004001)) | np.int32(0x00800080)
+    keys = jnp.asarray(rng.standard_normal((pool_rows, 128)), jnp.bfloat16)
+    encoded = index_key_layout.encode_records(keys)
+    pool = np.asarray((encoded[::2] | (encoded[1::2] << 16)).astype(jnp.int32)).copy()
     if page_records:
         # As `_request_row_slots`: each request owns random distinct pages and
         # logical row r is record ``page[r // page_records] * page + r % page``.

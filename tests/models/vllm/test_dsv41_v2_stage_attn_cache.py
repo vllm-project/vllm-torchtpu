@@ -31,7 +31,11 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention as v2_attn
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels as v2_kernels
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import cache as v2_cache
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import model as v2_model
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import ROW_WORDS, PagedCacheRows
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
+    ROW_WORDS,
+    IndexCacheRows,
+    PagedCacheRows,
+)
 
 # ==============================================================================
 # Helper Mock Factories
@@ -540,7 +544,7 @@ class TestCompressorStateAndGlobalKvAddressingCache:
         kv_cache_mock.shape = (4, 32, 128)
         attn.kv_cache = kv_cache_mock
 
-        idx_cache_mock = MagicMock(spec=PagedCacheRows)
+        idx_cache_mock = MagicMock(spec=IndexCacheRows)
         idx_cache_mock.shape = (4, 32, 128)
         idx_cache_mock.row_indices = lambda slots: slots + 100
 
@@ -912,7 +916,7 @@ class TestCompressedAttentionAndQuerySplitCaching:
         # TP=2 all-gather of each rank's part (only the split branch calls it).
         monkeypatch.setattr(v2_attn, "_gather_query_rows", lambda x: torch.cat([x, x]))
 
-        index_cache_mock = MagicMock(spec=PagedCacheRows)
+        index_cache_mock = MagicMock(spec=IndexCacheRows)
         index_cache_mock.raw = MagicMock()
         index_records = torch.zeros((count, 4), dtype=torch.int32)
 

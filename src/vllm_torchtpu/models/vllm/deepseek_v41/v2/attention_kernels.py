@@ -12,6 +12,7 @@ import jax.numpy as jnp
 import torch
 
 from vllm_torchtpu.kernels.deepseek_v41 import (
+    index_key_layout,
     index_word_scores,
     indexer,
     tuned_block_sizes,
@@ -33,12 +34,9 @@ from .cache import (
     ROPE_WORDS,
     ROW_WORDS,
     _cache_num_rows,
-    gather_cache_page_values,
     gather_cache_page_words,
     gather_cache_pieces,
-    gather_cache_values,
     merge_pieces,
-    scatter_cache_values,
     scatter_index_keys,
     split_halves,
     split_pieces,
@@ -2257,7 +2255,6 @@ def paged_index_scores_jax(
     lengths: jax.Array,
     requests: jax.Array | None = None,
     page_records: int | None = None,
-    halfplane: bool = False,
 ) -> jax.Array:
     """Index scores ``[tokens, width]``.
 
@@ -2267,7 +2264,7 @@ def paged_index_scores_jax(
     ``page_records``: records per cache page when logical rows ``k * page ..``
     of every records row are one page's contiguous, pool-word-aligned records
     (`_request_row_slots` layout); score tiles, shared or per-token, then
-    gather whole pages (see `gather_cache_page_values`).
+    gather whole pages before decoding their halfplane words.
     """
     tokens, dim = q.shape[0], q.shape[-1]
     width = records.shape[1]
@@ -2347,17 +2344,13 @@ def paged_index_scores_jax(
                     records, (row, index * tile), (1, tile)
                 ).reshape(-1)
                 if pages:
-                    keys = gather_cache_page_values(
-                        pool,
-                        addresses[::page_records],
-                        page_records,
-                        dim,
-                        halfplane=halfplane,
+                    keys = index_key_layout.unpack_rows(
+                        gather_cache_page_words(
+                            pool, addresses[::page_records], page_records, dim
+                        )
                     )
                 else:
-                    keys = gather_cache_values(
-                        pool, addresses, dim, split=True, halfplane=halfplane
-                    )
+                    keys = index_key_layout.gather_records(pool, addresses)
                 values = head_sum(
                     jnp.einsum(
                         "thd,cd->thc",
@@ -2420,7 +2413,6 @@ def paged_index_scores_jax(
                         words.reshape(
                             groups, tile // index_word_scores.SLOTS, ROW_WORDS
                         ),
-                        halfplane=halfplane,
                     )
                     # Sentinel token IDs are dropped, including duplicate
                     # padding slots. Every active token is written once.
@@ -2464,7 +2456,6 @@ def paged_index_scores_jax(
                     q,
                     weights,
                     words.reshape(n_rows, rows, ROW_WORDS),
-                    halfplane=halfplane,
                 )
                 return jax.lax.dynamic_update_slice_in_dim(
                     result, values, index * tile, axis=1
@@ -2502,17 +2493,13 @@ def paged_index_scores_jax(
         if pages:
             assert page_records is not None
             # Tiles start on page boundaries: one gather per page.
-            keys = gather_cache_page_values(
-                pool,
-                addresses[:, ::page_records],
-                page_records,
-                dim,
-                halfplane=halfplane,
+            keys = index_key_layout.unpack_rows(
+                gather_cache_page_words(
+                    pool, addresses[:, ::page_records], page_records, dim
+                )
             )
         else:
-            keys = gather_cache_values(
-                pool, addresses.reshape(-1), dim, split=True, halfplane=halfplane
-            )
+            keys = index_key_layout.gather_records(pool, addresses.reshape(-1))
         keys = keys.reshape(records.shape[0], tile, dim)
         logits = jnp.einsum("thd,tcd->thc", q, keys, preferred_element_type=jnp.float32)
         return jax.lax.dynamic_update_slice_in_dim(
@@ -2536,7 +2523,6 @@ def _decode_select(
     page_records,
     candidate_count=0,
     candidate_block_size=1,
-    halfplane: bool = False,
 ):
     """Run the complete TC/SC decode pipeline inside the manual wrapper mesh."""
     from jax.sharding import PartitionSpec as P
@@ -2548,10 +2534,8 @@ def _decode_select(
     select = functools.partial(
         decode_index_selection.decode_indexer,
         page_records=page_records,
-        key_tile=4096,
         candidate_count=candidate_count,
         candidate_block_size=candidate_block_size,
-        halfplane=halfplane,
     )
     try:
         mesh = get_vllm_model_wrapper_context().mesh
@@ -2570,7 +2554,6 @@ def _prefill_score(
     limit,
     *,
     page_records,
-    halfplane: bool = False,
     scheduling_group_id: int | None = None,
 ):
     """Resident-query scorer, manually replicated across the wrapper mesh."""
@@ -2591,7 +2574,6 @@ def _prefill_score(
             query_tile=prefill_tuning.QUERY_TILE,
             key_tile=prefill_tuning.KEY_TILE,
             records=records,
-            halfplane=halfplane,
             scheduling_group_id=scheduling_group_id,
         )
 
@@ -2612,12 +2594,13 @@ def _prefill_top_k(scores, lengths, *, scheduling_group_id: int | None = None):
     )
 
     def select(s, n):
-        ids = streaming_topk.streaming_topk(
-            s, valid_lengths=n, k=512, scheduling_group_id=scheduling_group_id
+        return streaming_topk.streaming_topk(
+            s,
+            valid_lengths=n,
+            k=512,
+            exclude_neg_inf=True,
+            scheduling_group_id=scheduling_group_id,
         )
-        values = jnp.take_along_axis(s, jnp.maximum(ids, 0), axis=1)
-        ids = jnp.where((ids >= 0) & (values > -jnp.inf), ids, -1)
-        return _compact_selected(ids)
 
     try:
         mesh = get_vllm_model_wrapper_context().mesh
@@ -2628,9 +2611,7 @@ def _prefill_top_k(scores, lengths, *, scheduling_group_id: int | None = None):
     )(scores, lengths)
 
 
-def _score_word_rows(
-    q: jax.Array, weights: jax.Array, words: jax.Array, halfplane: bool = False
-) -> jax.Array:
+def _score_word_rows(q: jax.Array, weights: jax.Array, words: jax.Array) -> jax.Array:
     """`index_word_scores.score_word_rows` on every device (replicated)."""
     from jax.sharding import PartitionSpec as P
 
@@ -2641,7 +2622,6 @@ def _score_word_rows(
     score = functools.partial(
         index_word_scores.score_word_rows,
         interpret=jax.default_backend() != "tpu",
-        halfplane=halfplane,
     )
     try:
         mesh = get_vllm_model_wrapper_context().mesh
@@ -2889,7 +2869,6 @@ def paged_indexer_jax(
     batch_max: jax.Array | None = None,
     page_records: int | None = None,
     prefill_mode: str = "streaming",
-    halfplane: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     """``records`` is ``[requests, width]``; ``requests`` maps tokens to rows.
 
@@ -2968,12 +2947,11 @@ def paged_indexer_jax(
                     )
                     return _prefill_score(
                         split_halves(queries),
-                        row_weights.astype(jnp.float32)[:, :, None],
+                        row_weights.astype(jnp.float32),
                         pool,
                         shared_records,
                         jnp.max(row_lengths, keepdims=True),
                         page_records=page_records,
-                        halfplane=halfplane,
                         scheduling_group_id=scheduling_group_id,
                     )
                 else:
@@ -2985,7 +2963,6 @@ def paged_indexer_jax(
                         row_lengths,
                         row_requests,
                         page_records,
-                        halfplane=halfplane,
                     )
                 return jnp.where(
                     jnp.take(row_records >= 0, row_requests, axis=0), scores, -jnp.inf
@@ -3120,14 +3097,13 @@ def paged_indexer_jax(
         )
         result = _decode_select(
             split_halves(q).reshape(count, queries, *q.shape[1:]),
-            weights.astype(jnp.float32).reshape(count, queries, q.shape[1], 1),
+            weights.astype(jnp.float32).reshape(count, queries, q.shape[1]),
             pool,
             pages,
             lengths.reshape(count, queries),
             page_records=page_records,
             candidate_count=candidates.shape[1] if publish else 0,
             candidate_block_size=block_size,
-            halfplane=halfplane,
         )
         return result if publish else (result, candidates)
 
@@ -3259,7 +3235,6 @@ def paged_indexer_jax(
             weights,
             compact_lengths,
             page_records=segment,
-            halfplane=halfplane,
         )
         scores = jnp.where(compact >= 0, scores, -jnp.inf)
         output_width = min(topk, width)
@@ -3344,16 +3319,13 @@ def write_index_keys(
     pool: jax.Array | tuple[jax.Array, jax.Array],
     write_records: jax.Array,
     keys: jax.Array,
-    halfplane: bool = False,
 ):
-    """Publish index records through the same cache writer as KV and state."""
+    """Publish BF16 index records into native packed halfplane storage."""
     if keys.dtype != jnp.bfloat16:
         raise ValueError("Index keys must be BF16")
     if keys.ndim != 2 or write_records.shape != (keys.shape[0],):
         raise ValueError("One physical record index per key is required")
-    if halfplane:
-        return scatter_index_keys(pool, write_records, keys)
-    return scatter_cache_values(cast(Any, pool), write_records, keys)
+    return scatter_index_keys(pool, write_records, keys)
 
 
 def update_and_select_jax(
@@ -3374,10 +3346,9 @@ def update_and_select_jax(
     unordered: bool,
     page_records: int = 0,
     prefill_mode: str = "streaming",
-    halfplane: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """``page_records`` 0 disables page gathers (see `paged_indexer_jax`)."""
-    updated = write_index_keys(pool, write_records, keys, halfplane=halfplane)
+    updated = write_index_keys(pool, write_records, keys)
     selected, published = paged_indexer_jax(
         q,
         updated,
@@ -3394,7 +3365,6 @@ def update_and_select_jax(
         batch_max,
         page_records or None,
         prefill_mode,
-        halfplane=halfplane,
     )
     return updated, selected, published
 
@@ -3418,7 +3388,6 @@ def update_and_select_2bank_jax(
     unordered: bool,
     page_records: int = 0,
     prefill_mode: str = "streaming",
-    halfplane: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     (updated_lo, updated_hi), selected, published = cast(
         Any,
@@ -3440,7 +3409,6 @@ def update_and_select_2bank_jax(
             unordered,
             page_records,
             prefill_mode,
-            halfplane=halfplane,
         ),
     )
     return updated_lo, updated_hi, selected, published
@@ -3466,7 +3434,7 @@ def initialize_indexer():
         donate_argnums=(1,),
         mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(
-            tuple[tuple[str, ...], ...], (P(),) * 10 + (None,) * 8
+            tuple[tuple[str, ...], ...], (P(),) * 10 + (None,) * 7
         ),
     )
 
@@ -3488,7 +3456,6 @@ def initialize_indexer():
         unordered,
         page_records=0,
         prefill_mode="streaming",
-        halfplane=False,
     ):
         return (
             torch.empty_like(pool),
@@ -3505,7 +3472,7 @@ def initialize_indexer():
         donate_argnums=(1, 2),
         mesh=get_pallas_op_mesh(),
         input_partition_specs=cast(
-            tuple[tuple[str, ...], ...], (P(),) * 11 + (None,) * 8
+            tuple[tuple[str, ...], ...], (P(),) * 11 + (None,) * 7
         ),
     )
 
@@ -3528,7 +3495,6 @@ def initialize_indexer():
         unordered,
         page_records=0,
         prefill_mode="streaming",
-        halfplane=False,
     ):
         return (
             torch.empty_like(pool_lo),
@@ -3591,7 +3557,6 @@ def paged_indexer(
         unordered,
         page_records or 0,
         prefill_mode,
-        getattr(cache, "index_key_layout", "ordinary") == "halfplane",
     )
     if _has_hi_bank(cache):
         assert _indexer_2bank_op is not None

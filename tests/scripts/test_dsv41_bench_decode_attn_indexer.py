@@ -544,14 +544,14 @@ class TestBenchDecodeIndexerSplit:
             kv_len=64,
             pool_rows=256,
             heads=8,
-            head_dim=64,
+            head_dim=128,
             candidate_blocks=4,
             block_size=16,
             page_records=16,
         )
-        assert inp1["pool"].shape == (256 * 64 // 256, 128)
+        assert inp1["pool"].shape == (128, 128)
         assert inp1["records"].shape == (4, 64)
-        assert inp1["q"].shape == (4, 8, 64)
+        assert inp1["q"].shape == (4, 8, 128)
         assert inp1["weights"].shape == (4, 8)
         assert inp1["lengths"].shape == (4,)
         assert inp1["candidates"].shape == (4, 4)
@@ -564,7 +564,7 @@ class TestBenchDecodeIndexerSplit:
             kv_len=64,
             pool_rows=256,
             heads=8,
-            head_dim=64,
+            head_dim=128,
             candidate_blocks=4,
             block_size=16,
             page_records=0,
@@ -573,7 +573,7 @@ class TestBenchDecodeIndexerSplit:
 
         # 3. rank_slice: part=2, rank=1, tp=4 -> count=4, padding = 2*4 - 4 = 4
         sliced = bdis.rank_slice(inp1, part=2, rank=1, tp=4)
-        assert sliced["q"].shape == (2, 8, 64)
+        assert sliced["q"].shape == (2, 8, 128)
         assert sliced["lengths"].shape == (2,)
         assert sliced["candidates"].shape == (2, 4)
         assert sliced["requests"].shape == (2,)

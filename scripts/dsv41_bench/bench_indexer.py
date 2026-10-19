@@ -75,18 +75,21 @@ def _build_indexer_inputs(
     query_split: str = "pad16",
 ) -> dict[str, Any]:
     """Construct deterministic CPU inputs for all Indexer sub-operations."""
+    import jax.numpy as jnp
     import torch
+
+    from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout
 
     rng = np.random.default_rng(rng_seed + 2027)
     width = max(topk, kv_len // compress_ratio)
     # Allocate a compact physical pool of 4096 BF16 rows and map `records`
     # (`[num_seqs, width]`) into it so we don't allocate 45k physical rows.
     phys_rows = 4096
-    words_per_row = head_dim // 2  # 64 int32 words per 128-dim BF16 key
-    pool_words = phys_rows * words_per_row // 128
-    pool_np = rng.integers(-(2**31), 2**31, size=(pool_words, 128), dtype=np.int32)
-    # Mask exponent bits so all BF16 values are finite normal numbers (no NaN/Inf).
-    pool_np = (pool_np & np.int32(-0x40004001)) | np.int32(0x00800080)
+    keys = jnp.asarray(rng.standard_normal((phys_rows, 128)), jnp.bfloat16)
+    encoded = index_key_layout.encode_records(keys)
+    pool_np = np.asarray(
+        (encoded[::2] | (encoded[1::2] << 16)).astype(jnp.int32)
+    ).copy()
 
     records_np = rng.integers(0, phys_rows, size=(num_seqs, width), dtype=np.int32)
     # Inject invalid (-1) tail records on the last 4 columns.
@@ -163,7 +166,7 @@ def _build_indexer_inputs(
     requests_part = _pad_and_slice(requests_full, 0)
 
     # Write keys for `cache_write_only` and `all` (`compress_ratio=2`).
-    # Valid destinations must be unique per `scatter_cache_values` contract.
+    # Valid destinations must be unique per `scatter_index_keys` contract.
     if phys_rows >= tokens:
         write_records_np = rng.permutation(phys_rows)[:tokens].astype(np.int32)
     else:

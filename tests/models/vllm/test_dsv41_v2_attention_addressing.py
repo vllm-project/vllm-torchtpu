@@ -21,6 +21,7 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
     paged_indexer_jax,
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
+    IndexCacheRows,
     PagedCacheRows,
     gather_cache_page_values,
     gather_cache_pieces,
@@ -169,9 +170,12 @@ def test_paged_attention_matches_dense(width):
 def test_paged_index_scores_matches_dense(tokens, width):
     rng = np.random.default_rng(tokens)
     dim, heads = 128, 4
-    pool = jnp.asarray(rng.integers(-(2**31), 2**31, (256, 128)), dtype=jnp.int32)
-    # Keep BF16 keys finite: clear exponent-overflow patterns.
-    pool = pool & jnp.int32(0x3FFF3FFF)
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import scatter_index_keys
+
+    all_keys = jnp.asarray(rng.standard_normal((512, dim)), jnp.bfloat16)
+    pool = scatter_index_keys(
+        jnp.zeros((256, 128), jnp.int32), jnp.arange(512, dtype=jnp.int32), all_keys
+    )
     records = rng.integers(0, 256 * 2, (tokens, width)).astype(np.int32)
     records[:, width - 5 :] = -1
     lengths = rng.integers(1, width + 1, tokens).astype(np.int32)
@@ -180,9 +184,7 @@ def test_paged_index_scores_matches_dense(tokens, width):
     got = np.asarray(
         paged_index_scores_jax(q, pool, jnp.asarray(records), weights, lengths)
     )
-    keys = gather_cache_values(
-        pool, jnp.asarray(np.maximum(records, 0)).reshape(-1), dim
-    ).reshape(tokens, width, dim)
+    keys = all_keys[jnp.asarray(np.maximum(records, 0))]
     logits = jnp.einsum("thd,tcd->thc", q, keys, preferred_element_type=jnp.float32)
     dense = np.asarray((jnp.maximum(logits, 0) * weights[:, :, None]).sum(1))
     valid = (records >= 0) & (np.arange(width)[None] < lengths[:, None])
@@ -308,9 +310,12 @@ def test_shared_index_scores_grouped_queries_match_dense(layout):
     # Padding belongs to request zero but must not consume grouping capacity.
     rng = np.random.default_rng(219)
     tokens, rows, width, page = 128, 16, 257, 16
-    pool = jnp.asarray(
-        rng.integers(-(2**31), 2**31, (256, 128)), jnp.int32
-    ) & jnp.int32(0x3FFF3FFF)
+    from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import scatter_index_keys
+
+    all_keys = jnp.asarray(rng.standard_normal((512, 128)), jnp.bfloat16)
+    pool = scatter_index_keys(
+        jnp.zeros((256, 128), jnp.int32), jnp.arange(512, dtype=jnp.int32), all_keys
+    )
     records = _paged_records(rng, rows, width, page, 512)
     records[3, -page:] = -1
     requests = np.pad(np.repeat(np.arange(rows), 6), (0, 32)).astype(np.int32)
@@ -324,9 +329,7 @@ def test_shared_index_scores_grouped_queries_match_dense(layout):
         lengths[:] = 0
     q = jnp.asarray(rng.standard_normal((tokens, 4, 128)), jnp.bfloat16)
     weights = jnp.asarray(rng.standard_normal((tokens, 4)), jnp.float32)
-    keys = gather_cache_values(
-        pool, jnp.asarray(records[requests].reshape(-1)), 128, split=True
-    ).reshape(tokens, width, 128)
+    keys = split_halves(all_keys[jnp.asarray(np.maximum(records[requests], 0))])
     logits = jnp.einsum(
         "thd,tcd->thc",
         split_halves(q),
@@ -448,19 +451,11 @@ def test_candidate_filter_sparsecore_selection_matches_top_k(monkeypatch):
     assert (np.asarray(got)[-1] == -1).all()
 
 
-def test_index_page_records_requires_row_aligned_pages():
+def test_index_page_records_requires_index_owner():
     raw = torch.zeros((64, 128), dtype=torch.int32)
-
-    def cache(block, stride, offset, dtype=torch.bfloat16, dim=128):
-        record = dim * dtype.itemsize
-        layout = ((4, block, dim), dtype, stride * record, offset * record)
-        return PagedCacheRows(raw, layout)
-
-    assert _index_page_records(cache(16, 32, 16)) == 16
-    assert _index_page_records(cache(16, 32, 1)) == 0  # offset splits a row
-    assert _index_page_records(cache(16, 33, 0)) == 0  # stride splits a row
-    assert _index_page_records(cache(3, 4, 0)) == 0  # page ends mid-row
-    assert _index_page_records(cache(8, 8, 0, torch.float32, 64)) == 0
+    layout = ((4, 16, 128), torch.bfloat16, 32 * 256, 16 * 256)
+    assert _index_page_records(IndexCacheRows(raw, layout)) == 16
+    assert _index_page_records(PagedCacheRows(raw, layout)) == 0
     assert _index_page_records(raw) == 0
 
 

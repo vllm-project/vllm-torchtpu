@@ -23,7 +23,6 @@ def main():
     parser.add_argument("--seed", type=int, default=824)
     parser.add_argument("--repeats", type=int, default=21)
     parser.add_argument("--tiles", type=int, nargs="+", default=[4, 8, 12, 16, 48])
-    parser.add_argument("--packed", action="store_true")
     parser.add_argument("--capacity", type=int, default=40960)
     parser.add_argument("--candidate-file", type=Path)
     args = parser.parse_args()
@@ -35,13 +34,14 @@ def main():
         args.requests, 6, args.width, args.width - 1, 128, True, "random", 2, args.seed
     )
     q, weights, pool, records, lengths = inputs[:5]
+
     print("fixture", [(getattr(x, "shape", None)) for x in inputs], flush=True)
     rng = np.random.default_rng(args.seed + 1)
     common = 1434
-    candidates = []
+    candidate_block_ids = []
     for _ in range(args.requests):
         ids = rng.permutation(args.width // 8)
-        candidates.append(
+        candidate_block_ids.append(
             np.stack(
                 [
                     np.concatenate(
@@ -57,22 +57,26 @@ def main():
                 ]
             )
         )
-    candidates = (
+    candidate_block_ids = (
         np.load(args.candidate_file)["candidates"]
         if args.candidate_file
-        else np.stack(candidates)
+        else np.stack(candidate_block_ids)
     )
-    if candidates.shape != (args.requests, 6, 2048):
+    if candidate_block_ids.shape != (args.requests, 6, 2048):
         raise ValueError("Expected candidate IDs [requests, 6, 2048]")
-    counts = [len(np.unique(r[(r >= 0) & (r < args.width // 8)])) for r in candidates]
+    counts = [
+        len(np.unique(r[(r >= 0) & (r < args.width // 8)])) for r in candidate_block_ids
+    ]
     capacity = args.capacity
     if capacity % 4096 or max(counts) * 8 > capacity:
         raise ValueError("Capacity must cover every union and be divisible by 4096")
-    candidates = jnp.asarray(candidates, jnp.int32)
+    candidate_block_ids = jnp.asarray(candidate_block_ids, jnp.int32)
 
-    def prepare(pool, records, candidates):
+    def prepare(pool, records, candidate_block_ids):
         meta = candidate.union_metadata(
-            candidates, logical_blocks=args.width // 8, capacity_blocks=capacity // 8
+            candidate_block_ids,
+            logical_blocks=args.width // 8,
+            capacity_blocks=capacity // 8,
         )
         starts, bits = candidate.union_record_starts(
             meta,
@@ -81,14 +85,17 @@ def main():
             pool_records=native["_cache_num_rows"](pool) * 2,
         )
         words = native["gather_cache_page_words"](pool, starts, 8, 128)
-        words = words.reshape(args.requests, -1, 128)
-        keys = words if args.packed else candidate.unpack_candidate_words(words)
-        return keys, meta.ids, bits
+        keys = words.reshape(args.requests, -1, 128)
+        return keys, meta.union_block_ids, bits
 
-    def baseline(q, weights, pool, records, candidates, lengths):
+    def baseline(q, weights, pool, records, candidate_block_ids, lengths):
         blocks = args.width // 8
         ids = jnp.sort(
-            jnp.where((candidates >= 0) & (candidates < blocks), candidates, blocks),
+            jnp.where(
+                (candidate_block_ids >= 0) & (candidate_block_ids < blocks),
+                candidate_block_ids,
+                blocks,
+            ),
             axis=-1,
         ).reshape(-1, 2048)
         unique = jnp.concatenate(
@@ -121,13 +128,15 @@ def main():
 
     prepare = jax.jit(prepare)
     baseline = jax.jit(baseline)
-    prepared = prepare(pool, records, candidates)
+    prepared = prepare(pool, records, candidate_block_ids)
     jax.block_until_ready(prepared)
     split_q = native["split_halves"](q)
-    expected = baseline(q, weights, pool, records, candidates, lengths)
+    expected = baseline(q, weights, pool, records, candidate_block_ids, lengths)
     jax.block_until_ready(expected)
     variants = {
-        "baseline": lambda: baseline(q, weights, pool, records, candidates, lengths)
+        "baseline": lambda: baseline(
+            q, weights, pool, records, candidate_block_ids, lengths
+        )
     }
     for tile in args.tiles:
         fn = functools.partial(
@@ -142,7 +151,7 @@ def main():
         actual = invoke()
         np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
         variants[f"union_tile{tile}"] = invoke
-    variants["prepare"] = lambda: prepare(pool, records, candidates)
+    variants["prepare"] = lambda: prepare(pool, records, candidate_block_ids)
     # Four different Q/weights calls; runtime prepare remains in the timed chain.
     raw_qs = [q] + [
         jnp.asarray(rng.normal(size=q.shape) * 0.25, jnp.bfloat16) for _ in range(3)
@@ -155,7 +164,7 @@ def main():
 
     def baseline_chain():
         return tuple(
-            baseline(qi, wi, pool, records, candidates, lengths)
+            baseline(qi, wi, pool, records, candidate_block_ids, lengths)
             for qi, wi in zip(raw_qs, ws)
         )
 
@@ -165,7 +174,7 @@ def main():
     for tile in args.tiles:
 
         def chain(tile=tile):
-            cache = prepare(pool, records, candidates)
+            cache = prepare(pool, records, candidate_block_ids)
             return tuple(
                 candidate.candidate_indexer(
                     qi, wi, *cache, lengths, block_size=8, request_tile=tile
@@ -198,7 +207,6 @@ def main():
                 capacity=capacity,
                 candidate_source=str(args.candidate_file or "synthetic_70pct_core"),
                 union_blocks=counts,
-                representation="packed" if args.packed else "bf16",
                 latency_ms=float(np.median(values)),
                 samples_ms=values,
                 runtime={

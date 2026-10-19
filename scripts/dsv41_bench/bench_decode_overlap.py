@@ -16,6 +16,7 @@ import logging
 import sys
 import time
 import types
+from dataclasses import asdict
 from pathlib import Path
 
 import jax
@@ -36,14 +37,20 @@ def load_kernels(root: Path):
     logger_module.init_logger = lambda name: logger
     sys.modules[logger_module.__name__] = logger_module
     from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import sparsecore_topk
-    from vllm_torchtpu.kernels.deepseek_v41 import index_word_scores
+    from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout, index_word_scores
     from vllm_torchtpu.kernels.deepseek_v41.index_selection.decode import (
         decode_indexer,
+    )
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection.persistent_scores import (
         grouped_decode_scores,
     )
 
     namespace = dict(
-        jax=jax, jnp=jnp, ROW_WORDS=128, index_word_scores=index_word_scores
+        jax=jax,
+        jnp=jnp,
+        ROW_WORDS=128,
+        index_key_layout=index_key_layout,
+        index_word_scores=index_word_scores,
     )
     source = root / "src/vllm_torchtpu/models/vllm/deepseek_v41/v2"
     cache = ast.parse((source / "cache.py").read_text())
@@ -55,20 +62,10 @@ def load_kernels(root: Path):
         in {
             "_cache_num_rows",
             "_gather_raw_rows",
-            "_gather_words",
             "_permute",
             "piece_order",
             "split_halves",
-            "merge_halves",
-            "split_pieces",
-            "merge_pieces",
-            "_valid_records",
-            "_gather_records",
-            "_split_words",
-            "gather_cache_pieces",
-            "gather_cache_values",
             "gather_cache_page_words",
-            "gather_cache_page_values",
         }
     ]
     exec(
@@ -111,10 +108,13 @@ def fixture(
     bits &= np.uint16(0x807F)
     bits |= np.uint16(0x3E00)
     keys = bits.view(ml_dtypes.bfloat16)
-    words = bits.reshape(-1, 2).copy().view(np.int32).reshape(-1, 128)
+    from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout
+
+    encoded = index_key_layout.encode_records(jnp.asarray(keys))
+    words = (encoded[::2] | (encoded[1::2] << 16)).astype(jnp.int32)
     del bits
     q = rng.standard_normal((requests, queries, 32, 128), dtype=np.float32) * 0.25
-    w = rng.standard_normal((requests, queries, 32, 1), dtype=np.float32) * 0.02
+    w = rng.standard_normal((requests, queries, 32), dtype=np.float32) * 0.02
     if distribution == "ties":
         q.fill(0)
     order = np.arange(requests * width // page, dtype=np.int32).reshape(requests, -1)
@@ -174,7 +174,6 @@ def main():
     parser.add_argument("--requests", type=int, default=48)
     parser.add_argument("--queries", type=int, default=6)
     parser.add_argument("--page", type=int, default=128)
-    parser.add_argument("--key-tile", type=int, default=4096)
     parser.add_argument("--repeats", type=int, default=25)
     parser.add_argument(
         "--modes", nargs="+", default=["baseline", "serial8", "overlap8"]
@@ -183,7 +182,6 @@ def main():
     parser.add_argument("--banks", type=int, choices=[1, 2], default=2)
     parser.add_argument("--distribution", choices=["random", "ties"], default="random")
     parser.add_argument("--profile", action="store_true")
-    parser.add_argument("--profile-stages", action="store_true")
     parser.add_argument(
         "--variants", type=Path, help="JSON mapping names to decode kwargs"
     )
@@ -201,14 +199,16 @@ def main():
         parser.error("requests and repeats must be positive")
     variants = json.loads(args.variants.read_text()) if args.variants else {}
     if args.tune_request_tiles:
-        if any(t < 1 or args.requests % t for t in args.tune_request_tiles):
-            parser.error("Every request_tile must be positive and divide requests")
+        if any(t < 1 for t in args.tune_request_tiles):
+            parser.error("Every request_tile must be positive")
         variants = {f"tile{t}": {"request_tile": t} for t in args.tune_request_tiles}
     if variants:
         args.modes = list(variants)
     root = Path(__file__).resolve().parents[2]
     args.out.mkdir(parents=True, exist_ok=True)
     ns, old_topk, decode, _ = load_kernels(root)
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection import tuned_block_sizes
+
     runtime = {
         name: importlib.metadata.version(name) for name in ("jax", "jaxlib", "libtpu")
     }
@@ -256,26 +256,63 @@ def main():
             records[:, :: args.page],
             lengths,
             page_records=args.page,
-            key_tile=args.key_tile,
             request_tile=tile,
             overlap=overlap,
-            profile_stages=args.profile_stages,
             **options,
         )
 
     compiled, outputs, compilation, memory = {}, {}, {}, {}
+    effective_configs = {}
     for mode in args.modes:
         if mode == "baseline":
             fn = baseline
-        elif mode in variants:
-            options = dict(variants[mode])
-            tile = options.pop("request_tile", None)
-            overlap = options.pop("overlap", True)
-            fn = functools.partial(candidate, tile=tile, overlap=overlap, **options)
+            effective_configs[mode] = None
         else:
-            overlap = mode.startswith("overlap")
-            tile = int(mode.removeprefix("overlap").removeprefix("serial"))
-            fn = functools.partial(candidate, tile=tile, overlap=overlap)
+            if mode in variants:
+                options = dict(variants[mode])
+                tile = options.pop("request_tile", None)
+                overlap = options.pop("overlap", True)
+            else:
+                options = {}
+                overlap = mode.startswith("overlap")
+                tile = int(mode.removeprefix("overlap").removeprefix("serial"))
+            score_options = options.pop("score_config", None)
+            if score_options is not None and tile is None:
+                parser.error("score_config overrides require an explicit request_tile")
+            score_config = (
+                tuned_block_sizes.get_persistent_score_config(
+                    (args.queries, 32, 128, args.width, args.banks)
+                )
+                if score_options is None
+                else tuned_block_sizes.PersistentScoreConfig(**score_options)
+            )
+            if tile is None:
+                tile = tuned_block_sizes.get_decode_request_tile(
+                    tuned_block_sizes.DecodeTuningKey(
+                        jax.devices()[0].device_kind,
+                        args.queries,
+                        32,
+                        args.width,
+                        args.page,
+                        options.get("k", 512),
+                        args.banks,
+                    ),
+                    args.requests,
+                )
+            tile = min(tile, args.requests)
+            effective_configs[mode] = dict(
+                request_tile=tile,
+                overlap=overlap,
+                score_config=asdict(score_config),
+                **options,
+            )
+            fn = functools.partial(
+                candidate,
+                tile=tile,
+                overlap=overlap,
+                score_config=score_config,
+                **options,
+            )
         t = time.perf_counter()
         executable = jax.jit(fn).lower(*inputs).compile()
         compilation[mode] = time.perf_counter() - t
@@ -311,7 +348,6 @@ def main():
             queries=args.queries,
             score_capacity=args.width,
             length=args.length,
-            key_tile=args.key_tile,
             shuffled=args.shuffled,
             banks=args.banks,
             distribution=args.distribution,
@@ -321,27 +357,21 @@ def main():
             latency_ms=float(np.median(samples[mode])),
             samples_ms=samples[mode],
             compile_seconds=compilation[mode],
-            profile_stages=args.profile_stages,
             config=variants.get(mode, {}),
+            effective_config=effective_configs[mode],
             **memory[mode],
         )
         with (args.out / "metrics.jsonl").open("a") as f:
             f.write(json.dumps(metric) + "\n")
         print(json.dumps(metric), flush=True)
     if args.tune_request_tiles:
-        from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
-            tuned_block_sizes,
-        )
-
         winner = min(samples, key=lambda mode: np.median(samples[mode]))
         key = tuned_block_sizes.DecodeTuningKey(
             jax.devices()[0].device_kind,
-            args.requests,
             args.queries,
             32,
             args.width,
             args.page,
-            args.key_tile,
             512,
             args.banks,
         )

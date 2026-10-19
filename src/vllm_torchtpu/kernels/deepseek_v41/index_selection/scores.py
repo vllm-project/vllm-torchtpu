@@ -2,7 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Single-request prefill scoring, with resident Q and pipelined packed K.
 
-Uses a two-bank packed word cache and preserves FP32 multiply/reduce semantics.
+Uses canonical halfplane word rows and preserves FP32 multiply/reduce semantics.
 """
 
 import contextlib
@@ -15,7 +15,7 @@ from jax.experimental import pallas as pl
 from jax.experimental import xla_metadata
 from jax.experimental.pallas import tpu as pltpu
 
-from ..index_word_scores import DIM, ROW_WORDS, SLOTS, unpack_word_rows
+from ..index_key_layout import DIM, ROW_WORDS, SLOTS
 from . import tuned_block_sizes
 
 
@@ -58,6 +58,37 @@ def context_buckets(capacity: int) -> tuple[int, ...]:
     return (*widths, capacity)
 
 
+def _block_max(values, lanes, block_size):
+    indices = jnp.broadcast_to(
+        (jnp.arange(lanes // block_size) * block_size + block_size - 1)[None, :, None],
+        (values.shape[0], lanes // block_size, 1),
+    )
+    parts = []
+    for start in range(0, values.shape[1], lanes):
+        window = values[:, start : start + lanes]
+        for power in range(block_size.bit_length() - 1):
+            shift = 1 << power
+            window = jnp.maximum(window, pltpu.roll(window, shift, axis=1))
+        # Preserve the row batching dimension even for one query. take_along_axis
+        # squeezes it in that case, which Mosaic's gather lowering cannot handle.
+        parts.append(
+            jax.lax.gather(
+                window,
+                indices,
+                dimension_numbers=jax.lax.GatherDimensionNumbers(
+                    offset_dims=(),
+                    collapsed_slice_dims=(1,),
+                    start_index_map=(1,),
+                    operand_batching_dims=(0,),
+                    start_indices_batching_dims=(0,),
+                ),
+                slice_sizes=(1, 1),
+                mode="promise_in_bounds",
+            )
+        )
+    return jnp.concatenate(parts, axis=1)
+
+
 def _kernel(
     pages,
     limit,
@@ -67,7 +98,8 @@ def _kernel(
     records_ref,
     out,
     words,
-    *scratch,
+    sem,
+    *,
     page_records,
     tile,
     coalesce,
@@ -75,16 +107,12 @@ def _kernel(
     profile_stages,
     row_lengths=None,
     row_offset=0,
-    halfplane=False,
+    block_scores=None,
+    block_size=0,
+    mask_tokens=True,
     out_row_offset=None,
+    window_start=None,
 ):
-    """Score ``q_ref`` rows into ``out``.
-
-    With ``out_row_offset`` set, ``out`` is a shared multi-request block: this
-    call writes rows ``[out_row_offset, out_row_offset + rows)`` only, and the
-    caller owns the -inf initialization of the whole block.
-    """
-    unpacked, sem = (None, scratch[0]) if halfplane else scratch
     scope = jax.named_scope if profile_stages else contextlib.nullcontext
     with scope("prefill_kernel_body"):
         rows, heads, _ = q_ref.shape
@@ -92,10 +120,13 @@ def _kernel(
         weights = w_ref[...]
         page_rows = page_records // SLOTS
         tile_pages = tile // page_records
-        window_start = pl.program_id(1) * out.shape[1]
+        if window_start is None:
+            window_start = pl.program_id(1) * out.shape[1]
         steps = pl.cdiv(jnp.clip(limit[0] - window_start, 0, out.shape[1]), tile)
         if out_row_offset is None:
             out[...] = jnp.full(out.shape, -jnp.inf, jnp.float32)
+        if block_scores is not None and out_row_offset is None:
+            block_scores[...] = jnp.full(block_scores.shape, -jnp.inf, jnp.float32)
 
         def copy(address, count, dest):
             if isinstance(pool, tuple):
@@ -186,11 +217,7 @@ def _kernel(
             # Keep the fused vector/MXU region in one scope: splitting dot and
             # reduction introduces materialization/spills in the Mosaic compiler.
             with scope("prefill_unpack_dot_reduce_store"):
-                keys = (
-                    pltpu.bitcast(words[bank], jnp.bfloat16)
-                    if halfplane
-                    else unpack_word_rows(words[bank], unpacked)
-                )
+                keys = pltpu.bitcast(words[bank], jnp.bfloat16)
                 logits = jax.lax.dot_general(
                     query,
                     keys,
@@ -201,6 +228,7 @@ def _kernel(
                 if records_ref is not None:
                     valid = records_ref[:, pl.ds(block * tile, tile)] >= 0
                     values = jnp.where(valid, values, -jnp.inf)
+                masked_values = values
                 if row_lengths is not None:
                     position = window_start + block * tile + jnp.arange(tile)
                     causal = (
@@ -225,11 +253,31 @@ def _kernel(
                         axis=1,
                     )
                     valid = causal & (page_valid != 0)
-                    values = jnp.where(valid, values, -jnp.inf)
+                    masked_values = jnp.where(valid, values, -jnp.inf)
+                token_values = masked_values if mask_tokens else values
                 if out_row_offset is None:
-                    out[:, pl.ds(block * tile, tile)] = values
+                    out[:, pl.ds(block * tile, tile)] = token_values
                 else:
-                    out[pl.ds(out_row_offset, rows), pl.ds(block * tile, tile)] = values
+                    out[pl.ds(out_row_offset, rows), pl.ds(block * tile, tile)] = (
+                        token_values
+                    )
+                if block_scores is not None:
+                    lanes = pltpu.get_tpu_info().num_lanes
+                    if block_size == 8 and tile % lanes == 0:
+                        maxima = _block_max(masked_values, lanes, block_size)
+                    else:
+                        maxima = masked_values.reshape(
+                            rows, tile // block_size, block_size
+                        ).max(-1)
+                    block_columns = pl.ds(
+                        block * (tile // block_size), tile // block_size
+                    )
+                    if out_row_offset is None:
+                        block_scores[:, block_columns] = maxima
+                    else:
+                        block_scores[pl.ds(out_row_offset, rows), block_columns] = (
+                            maxima
+                        )
 
         jax.lax.fori_loop(0, steps, body, None)
 
@@ -244,7 +292,6 @@ def _kernel(
         "interpret",
         "prefetch",
         "profile_stages",
-        "halfplane",
         "scheduling_group_id",
     ),
 )
@@ -262,14 +309,15 @@ def prefill_index_scores(
     interpret: bool = False,
     prefetch: bool = True,
     profile_stages: bool = False,
-    halfplane: bool = False,
     records: jax.Array | None = None,
     scheduling_group_id: int | None = None,
 ) -> jax.Array:
     """Score one shared request; caller applies per-query causal lengths.
 
-    Q is split-order BF16 [T,H,128]; weights are FP32 [T,H,1]. Pages are
+    Q is split-order BF16 [T,H,128]; weights are FP32 [T,H]. Pages are
     first-record addresses [1,N]. The limit [1] bounds the shared scan.
+    Pool banks are int32 [rows,128]: low16 holds the even record, high16 the
+    odd record, each in split feature order (even64 then odd64).
     ``prefetch=False`` is a diagnostic serial-DMA ablation; ``profile_stages``
     enables standalone JAX trace scopes. Serving defaults remain uninstrumented.
     Optional full record addresses [1,width] mask individual invalid entries
@@ -293,7 +341,7 @@ def prefill_index_scores(
         or dim != DIM
         or q.dtype != jnp.bfloat16
         or weights.dtype != jnp.float32
-        or weights.shape != (tokens, heads, 1)
+        or weights.shape != (tokens, heads)
         or pages.shape[0] != 1
         or row_limit.shape != (1,)
         or tokens % query_tile
@@ -324,7 +372,6 @@ def prefill_index_scores(
             coalesce=coalesce,
             prefetch=prefetch,
             profile_stages=profile_stages,
-            halfplane=halfplane,
         ),
         out_shape=jax.ShapeDtypeStruct((tokens, width), jnp.float32),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -343,11 +390,6 @@ def prefill_index_scores(
             out_specs=pl.BlockSpec((query_tile, window), lambda i, j, *_: (i, j)),
             scratch_shapes=(
                 pltpu.VMEM((2, key_tile // SLOTS, ROW_WORDS), jnp.int32),
-                *(
-                    (pltpu.VMEM((key_tile, ROW_WORDS), jnp.int32),)
-                    if not halfplane
-                    else ()
-                ),
                 pltpu.SemaphoreType.DMA,
             ),
         ),
@@ -361,7 +403,7 @@ def prefill_index_scores(
         ),
         interpret=interpret,
         name="prefill_paged_bf16_index_scores",
-    )(pages.reshape(-1), row_limit, q, weights, pool, records)
+    )(pages.reshape(-1), row_limit, q, weights[..., None], pool, records)
     if scheduling_group_id is not None:
         result = xla_metadata.set_xla_metadata(
             result, _scheduling_group_id=scheduling_group_id

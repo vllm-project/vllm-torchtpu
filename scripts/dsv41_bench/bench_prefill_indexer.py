@@ -17,6 +17,7 @@ import numpy as np
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.scores import (
     supports_chunked_prefill,
 )
@@ -70,8 +71,8 @@ def main():
             ],
             (width, 128),
         )
-    words = jax.lax.bitcast_convert_type(keys.reshape(width, 64, 2), jnp.int32)
-    words = words.reshape(width // 2, 128)
+    encoded = index_key_layout.encode_records(keys)
+    words = (encoded[::2] | (encoded[1::2] << 16)).astype(jnp.int32)
     split = (width // (2 * page)) * (page // 2)
     pool = (words[:split], words[split:])
     assert supports_chunked_prefill(queries, pool, page)

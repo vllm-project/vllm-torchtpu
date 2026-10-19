@@ -20,22 +20,22 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection import decode, tuned_blo
 
 
 class UnionMetadata(NamedTuple):
-    ids: jax.Array
+    union_block_ids: jax.Array
     membership: jax.Array
-    actual_count: jax.Array
+    union_block_count: jax.Array
     overflow: jax.Array
 
 
 def _sorted_union_metadata(
-    candidates: jax.Array, logical_blocks: int, capacity_blocks: int
+    candidate_block_ids: jax.Array, logical_blocks: int, capacity_blocks: int
 ) -> UnionMetadata:
-    requests, queries, _ = candidates.shape
-    valid = (candidates >= 0) & (candidates < logical_blocks)
+    requests, queries, _ = candidate_block_ids.shape
+    valid = (candidate_block_ids >= 0) & (candidate_block_ids < logical_blocks)
     # Include query ownership in the sort key so duplicate IDs within one
     # query contribute its membership bit only once.
     encoded = jnp.where(
         valid,
-        candidates * queries + jnp.arange(queries)[None, :, None],
+        candidate_block_ids * queries + jnp.arange(queries)[None, :, None],
         logical_blocks * queries,
     )
     encoded = jnp.sort(encoded.reshape(requests, -1), axis=1)
@@ -54,21 +54,23 @@ def _sorted_union_metadata(
 
 
 def union_metadata(
-    candidates: jax.Array, *, logical_blocks: int, capacity_blocks: int
+    candidate_block_ids: jax.Array, *, logical_blocks: int, capacity_blocks: int
 ) -> UnionMetadata:
-    """Compact [request, query, candidate] IDs without losing overflow evidence."""
-    requests, queries, _ = candidates.shape
+    """Compact request-local logical block IDs and retain full union counts."""
+    requests, queries, _ = candidate_block_ids.shape
     if not 1 <= queries <= 8 or min(logical_blocks, capacity_blocks) < 1:
         raise ValueError("Union requires 1..8 queries and positive block capacities")
     # For longer contexts, bound metadata work by candidate count, not ID space.
     if logical_blocks > 131072 // 8:
-        return _sorted_union_metadata(candidates, logical_blocks, capacity_blocks)
+        return _sorted_union_metadata(
+            candidate_block_ids, logical_blocks, capacity_blocks
+        )
     if (
         jax.default_backend() == "tpu"
-        and candidates.dtype == jnp.int32
+        and candidate_block_ids.dtype == jnp.int32
         and requests > 0
-        and candidates.shape[-1] > 0
-        and candidates.shape[-1] % 128 == 0
+        and candidate_block_ids.shape[-1] > 0
+        and candidate_block_ids.shape[-1] % 128 == 0
     ):
         from jax.experimental.pallas import tpu as pltpu
 
@@ -77,23 +79,29 @@ def union_metadata(
         tpu_info = pltpu.get_tpu_info()
         info = tpu_info.sparse_core
         if info is None or tpu_info.chip_version != pltpu.ChipVersion.TPU_7X:
-            return _dense_union_metadata(candidates, logical_blocks, capacity_blocks)
+            return _dense_union_metadata(
+                candidate_block_ids, logical_blocks, capacity_blocks
+            )
         hist_size = queries * pl.cdiv(logical_blocks, 128) * 128
         out_size = pl.cdiv(capacity_blocks, 128) * 128 + info.num_lanes
-        scratch_bytes = 4 * (hist_size + candidates.shape[-1] + 2 * out_size + 128)
+        scratch_bytes = 4 * (
+            hist_size + candidate_block_ids.shape[-1] + 2 * out_size + 128
+        )
         if scratch_bytes <= info.vmem_capacity_bytes:
             return UnionMetadata(
-                *sparse_union_metadata(candidates, logical_blocks, capacity_blocks)
+                *sparse_union_metadata(
+                    candidate_block_ids, logical_blocks, capacity_blocks
+                )
             )
-    return _dense_union_metadata(candidates, logical_blocks, capacity_blocks)
+    return _dense_union_metadata(candidate_block_ids, logical_blocks, capacity_blocks)
 
 
 def _dense_union_metadata(
-    candidates: jax.Array, logical_blocks: int, capacity_blocks: int
+    candidate_block_ids: jax.Array, logical_blocks: int, capacity_blocks: int
 ) -> UnionMetadata:
-    requests, queries, _ = candidates.shape
-    valid = (candidates >= 0) & (candidates < logical_blocks)
-    safe = jnp.where(valid, candidates, logical_blocks)
+    requests, queries, _ = candidate_block_ids.shape
+    valid = (candidate_block_ids >= 0) & (candidate_block_ids < logical_blocks)
+    safe = jnp.where(valid, candidate_block_ids, logical_blocks)
     presence = jnp.zeros((requests, queries, logical_blocks + 1), jnp.int32)
     presence = presence.at[
         jnp.arange(requests)[:, None, None], jnp.arange(queries)[None, :, None], safe
@@ -117,9 +125,9 @@ def union_record_starts(
     pool_records: int,
 ) -> tuple[jax.Array, jax.Array]:
     """Resolve logical blocks to aligned physical runs; invalidate bad pages."""
-    logical = jnp.maximum(metadata.ids, 0) * block_size
+    logical = jnp.maximum(metadata.union_block_ids, 0) * block_size
     starts = jnp.take_along_axis(records, jnp.minimum(logical, records.shape[1] - 1), 1)
-    valid = (metadata.ids >= 0) & (logical < records.shape[1])
+    valid = (metadata.union_block_ids >= 0) & (logical < records.shape[1])
     valid &= (starts >= 0) & (starts + block_size <= pool_records)
     # D128 BF16 packs two records into one pool word row. Logical blocks
     # need not start at a multiple of block_size in the physical allocation.

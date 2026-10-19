@@ -22,7 +22,10 @@ import torch.nn as nn
 from vllm_torchtpu import envs
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention as v2_attn
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import model as v2_model
-from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import PagedCacheRows
+from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
+    IndexCacheRows,
+    PagedCacheRows,
+)
 
 # ==============================================================================
 # 1. Tests for v2/model.py: _ced_config, DeepseekV41DecoderLayer, DeepseekV41Model
@@ -601,7 +604,7 @@ def test_prepare_tpu_branches(monkeypatch):
         n_head=2,
         head_dim=16,
         k_cache=SimpleNamespace(
-            prefix="idx_k", kv_cache=MagicMock(spec=PagedCacheRows)
+            prefix="idx_k", kv_cache=MagicMock(spec=IndexCacheRows)
         ),
     )
     indexer_mock.k_cache.kv_cache.row_indices = lambda slots: slots.int()

@@ -6,6 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels as ak
 
@@ -15,6 +16,8 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels as ak
 @pytest.mark.parametrize("mode", ["regular", "padded", "draft", "ordered", "publish"])
 def test_decode_route(monkeypatch, width, mode):
     monkeypatch.setattr(jax, "default_backend", lambda: "tpu")
+    tpu_info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: tpu_info)
     count, queries, heads = 4, 6, 32
     rows = count * queries
     q = jnp.arange(rows * heads * 128, dtype=jnp.float32).reshape(rows, heads, 128)
@@ -29,7 +32,7 @@ def test_decode_route(monkeypatch, width, mode):
     elif mode == "draft":
         requests = jnp.arange(rows, dtype=jnp.int32) % count
     candidates = jnp.zeros((rows, 128 if mode == "publish" else 0), jnp.int32)
-    pool = jnp.zeros((128, 128), jnp.int32)
+    pool = (jnp.zeros((128, 128), jnp.int32),) * 2
     calls = []
 
     def new_select(
@@ -42,15 +45,14 @@ def test_decode_route(monkeypatch, width, mode):
         page_records,
         candidate_count,
         candidate_block_size,
-        halfplane=False,
     ):
-        assert not halfplane
         calls.append(True)
         assert page_records == 128
         assert pages.shape == (count, (1 << (width - 1).bit_length()) // 128)
         np.testing.assert_array_equal(pages[:, : width // 128], records[:, ::128])
         np.testing.assert_array_equal(pages[:, width // 128 :], -1)
         np.testing.assert_array_equal(grouped_q.reshape(q.shape), ak.split_halves(q))
+        assert grouped_weights.shape == (count, queries, heads)
         np.testing.assert_array_equal(grouped_weights.reshape(weights.shape), weights)
         np.testing.assert_array_equal(limits.reshape(-1), lengths)
         result = jnp.where(lengths[:, None] > 0, jnp.full((rows, 512), 2), -1)
@@ -61,10 +63,7 @@ def test_decode_route(monkeypatch, width, mode):
         assert candidate_count == 0
         return result
 
-    def old_score(
-        q, pool, records, weights, lengths, requests, page_records, *, halfplane=False
-    ):
-        assert not halfplane
+    def old_score(q, pool, records, weights, lengths, requests, page_records):
         return jnp.ones((q.shape[0], records.shape[1]), jnp.float32)
 
     def old_select(scores, lengths, candidates, *args):
@@ -104,8 +103,10 @@ def test_decode_route_tpu_matches_existing(monkeypatch, width, candidate_count):
     rng = np.random.default_rng(721)
     count, queries, page = 4, 6, 128
     keys = jnp.asarray(rng.normal(size=(count * width, 128)), jnp.bfloat16)
-    words = jax.lax.bitcast_convert_type(keys.reshape(-1, 64, 2), jnp.int32)
-    words = words.reshape(-1, 128)
+    from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout as layout
+
+    encoded = layout.encode_records(keys)
+    words = (encoded[::2] | (encoded[1::2] << layout.KEY_BITS)).astype(jnp.int32)
     bank_rows = words.shape[0] // 2
     pool = (words[:bank_rows], words[bank_rows:])
     page_order = rng.permutation(count * width // page).reshape(count, -1)
@@ -160,9 +161,8 @@ def test_decode_route_tpu_matches_existing(monkeypatch, width, candidate_count):
         "shifted_pages",
     ],
 )
-@pytest.mark.parametrize("packed", [False, True])
-def test_candidate_cache_matches_existing_with_fallback(mode, packed):
-    _check_candidate_cache(mode, packed, groups=2, width=8192, capacity=4096)
+def test_candidate_cache_matches_existing_with_fallback(mode):
+    _check_candidate_cache(mode, groups=2, width=8192, capacity=4096)
 
 
 @pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="TPU candidate pipeline")
@@ -178,10 +178,11 @@ def test_candidate_cache_matches_existing_with_fallback(mode, packed):
     ],
 )
 def test_long_candidate_cache_matches_existing(groups, mode):
-    _check_candidate_cache(mode, False, groups=groups, width=1048576, capacity=49152)
+    _check_candidate_cache(mode, groups=groups, width=1048576, capacity=49152)
 
 
-def _check_candidate_cache(mode, packed, *, groups, width, capacity, queries=6):
+def _check_candidate_cache(mode, *, groups, width, capacity, queries=6):
+    from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout as layout
     from vllm_torchtpu.models.vllm.deepseek_v41.v2.candidate_cache import (
         prepare_candidate_cache_jax,
         select_candidate_cache_jax,
@@ -192,8 +193,8 @@ def _check_candidate_cache(mode, packed, *, groups, width, capacity, queries=6):
     if mode == "ragged_rows":
         rows += 1
     keys = jnp.asarray(rng.normal(size=(groups * width, 128)), jnp.bfloat16)
-    words = jax.lax.bitcast_convert_type(keys.reshape(-1, 64, 2), jnp.int32)
-    words = words.reshape(-1, 128)
+    encoded = layout.encode_records(keys)
+    words = (encoded[::2] | (encoded[1::2] << 16)).astype(jnp.int32)
     pool = (words[:4096], words[4096:]) if groups > 1 else words
     pages = rng.permutation(groups * width // 128).reshape(groups, -1) * 128
     records = jnp.asarray(
@@ -231,9 +232,9 @@ def _check_candidate_cache(mode, packed, *, groups, width, capacity, queries=6):
         candidates = candidates.at[0].set(-1)
         lengths = lengths.at[min(1, rows - 1)].set(519)
     batch_max = lengths.max().reshape(1)
-    prepare = jax.jit(prepare_candidate_cache_jax, static_argnums=(5, 6, 7))
+    prepare = jax.jit(prepare_candidate_cache_jax, static_argnums=(5, 6))
     dense, ids, bits, actual, usable = prepare(
-        pool, records, candidates, requests, lengths, 8, capacity, packed
+        pool, records, candidates, requests, lengths, 8, capacity
     )
     assert bool(usable[0]) == (mode not in ("overflow", "reordered", "ragged_rows"))
     if mode == "overflow":
@@ -280,5 +281,5 @@ def _check_candidate_cache(mode, packed, *, groups, width, capacity, queries=6):
 @pytest.mark.parametrize("mode", ["regular", "invalid"])
 def test_candidate_cache_basic_config_covers_non_k5_batches(groups, queries, mode):
     _check_candidate_cache(
-        mode, True, groups=groups, queries=queries, width=8192, capacity=4096
+        mode, groups=groups, queries=queries, width=8192, capacity=4096
     )

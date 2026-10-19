@@ -7,300 +7,103 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.deepseek_v41.index_selection.decode import (
+from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout
+from vllm_torchtpu.kernels.deepseek_v41.index_selection.persistent_scores import (
     grouped_decode_scores,
 )
 
 
-@pytest.mark.cpu_test
-@pytest.mark.parametrize("banks", [1, 2])
-@pytest.mark.parametrize("prefetch", [False, True])
-@pytest.mark.parametrize("fuse_mask", [False, True])
-@pytest.mark.parametrize("score_window", [128, 32768])
+def _reference_scores(q, weights, pool, pages, lengths):
+    requests, queries = q.shape[:2]
+    records = (pages[..., None] + jnp.arange(128)).reshape(requests, -1)
+    keys = index_key_layout.gather_records(pool, records)
+    logits = jnp.einsum("rqhd,rkd->rqhk", q, keys, preferred_element_type=jnp.float32)
+    expected = (jnp.maximum(logits, 0) * weights[..., None]).sum(2)
+    valid = (jnp.arange(records.shape[1]) < lengths[..., None]) & jnp.repeat(
+        pages >= 0, 128, axis=1
+    )[:, None]
+    return jnp.where(valid, expected, -jnp.inf).reshape(requests * queries, -1)
+
+
+@pytest.mark.parametrize("requests", [3, 4, 7])
+@pytest.mark.parametrize("block_size", [0, 8])
 def test_grouped_decode_scores_preserve_requests_and_causal_lengths(
-    banks, prefetch, fuse_mask, score_window
+    requests, block_size
 ):
+    if jax.default_backend() != "tpu":
+        pytest.skip("Persistent DMA scoring requires TPU")
     rng = np.random.default_rng(47)
-    requests, queries, heads, width, page = 3, 6, 4, 256, 16
+    queries, heads, width = 6, 32, 512
     keys = jnp.asarray(rng.normal(size=(requests * width, 128)), jnp.bfloat16)
-    words = jax.lax.bitcast_convert_type(keys.reshape(-1, 64, 2), jnp.int32)
-    words = words.reshape(-1, 128)
-    pool = (words[:176], words[176:]) if banks == 2 else words
-    order = rng.permutation(requests * width // page).reshape(requests, -1)
-    pages = order.astype(np.int32) * page
-    pages[0, 3] = -1
+    encoded = index_key_layout.encode_records(keys)
+    words = (encoded[::2] | (encoded[1::2] << 16)).astype(jnp.int32)
+    pool = (words[:128], words[128:])
+    order = rng.permutation(requests * width // 128).reshape(requests, -1)
+    pages = jnp.asarray(order * 128, jnp.int32).at[0, 3].set(-1)
     q = jnp.asarray(rng.normal(size=(requests, queries, heads, 128)), jnp.bfloat16)
-    weights = jnp.asarray(rng.normal(size=(requests, queries, heads, 1)), jnp.float32)
-    lengths = jnp.array(
-        [[256, 255, 128, 73, 0, 5], [0] * 6, [3, 64, 129, 230, 254, 256]], jnp.int32
+    weights = jnp.asarray(rng.normal(size=(requests, queries, heads)), jnp.float32)
+    lengths = jnp.asarray(
+        np.resize(np.array([[512, 511, 128, 73, 0, 5], [0] * 6]), (requests, queries)),
+        jnp.int32,
     )
     result = grouped_decode_scores(
-        q,
-        weights,
-        pool,
-        jnp.asarray(pages),
-        lengths,
-        page_records=page,
-        key_tile=64,
-        prefetch=prefetch,
-        interpret=True,
-        fuse_mask=fuse_mask,
-        score_window=score_window,
-    ).reshape(requests, queries, width)
-    logical = keys.reshape(-1, page, 128)[order].reshape(requests, width, 128)
-    logical = jnp.concatenate((logical[..., ::2], logical[..., 1::2]), axis=-1)
-    logits = jnp.einsum(
-        "rqhd,rkd->rqhk", q, logical, preferred_element_type=jnp.float32
+        q, weights, pool, pages, lengths, page_records=128, block_size=block_size
     )
-    expected = (jnp.maximum(logits, 0) * weights).sum(2)
-    valid = (jnp.arange(width)[None, None] < lengths[:, :, None]) & jnp.repeat(
-        jnp.asarray(pages >= 0), page, axis=1
-    )[:, None]
-    expected = jnp.where(valid, expected, -jnp.inf)
-    np.testing.assert_allclose(result, expected, rtol=1e-5, atol=3e-5)
+    expected = _reference_scores(q, weights, pool, pages, lengths)
+    if block_size:
+        result, block_scores = result
+        np.testing.assert_allclose(
+            block_scores,
+            expected.reshape(requests * queries, width // 8, 8).max(-1),
+            rtol=1e-4,
+            atol=1e-4,
+        )
+    assert result.shape == (requests * queries, width)
+    np.testing.assert_allclose(result, expected, rtol=1e-4, atol=1e-4)
 
 
 @pytest.mark.cpu_test
-def test_grouped_decode_scores_reject_incompatible_query_weights():
+@pytest.mark.parametrize("weight_shape", [(1, 5, 32), (1, 6, 32, 1)])
+def test_grouped_decode_scores_reject_incompatible_query_weights(weight_shape):
     with pytest.raises(ValueError, match="request-major"):
         grouped_decode_scores(
-            jnp.zeros((1, 6, 4, 128), jnp.bfloat16),
-            jnp.zeros((1, 5, 4, 1), jnp.float32),
-            jnp.zeros((128, 128), jnp.int32),
-            jnp.zeros((1, 16), jnp.int32),
+            jnp.zeros((1, 6, 32, 128), jnp.bfloat16),
+            jnp.zeros(weight_shape, jnp.float32),
+            (jnp.zeros((64, 128), jnp.int32),) * 2,
+            jnp.zeros((1, 2), jnp.int32),
             jnp.zeros((1, 6), jnp.int32),
-            page_records=16,
-            key_tile=64,
-            interpret=True,
+            page_records=128,
         )
 
 
-@pytest.mark.parametrize("fuse_mask", [False, True])
-def test_grouped_decode_page_table_beyond_128_entries(fuse_mask):
+def test_grouped_decode_page_table_beyond_128_entries():
     if jax.default_backend() != "tpu":
         pytest.skip("TPU SMEM lowering")
-    requests, queries, width, page = 3, 6, 4096, 16
-    values = jnp.arange(requests * width, dtype=jnp.float32).astype(jnp.bfloat16)
+    requests, queries, width, page = 3, 6, 32768, 128
+    values = (jnp.arange(requests * width) % 37 - 18).astype(jnp.bfloat16)
     keys = jnp.broadcast_to(values[:, None], (requests * width, 128))
-    words = jax.lax.bitcast_convert_type(keys.reshape(-1, 64, 2), jnp.int32)
-    pool = words.reshape(-1, 128)
+    encoded = index_key_layout.encode_records(keys)
+    words = (encoded[::2] | (encoded[1::2] << 16)).astype(jnp.int32)
+    pool = (words[:2048], words[2048:])
     pages = (
         jnp.arange(requests * width // page, dtype=jnp.int32).reshape(requests, -1)
         * page
     )
     result = grouped_decode_scores(
-        jnp.ones((requests, queries, 1, 128), jnp.bfloat16),
-        jnp.ones((requests, queries, 1, 1), jnp.float32),
+        jnp.ones((requests, queries, 32, 128), jnp.bfloat16),
+        jnp.ones((requests, queries, 32), jnp.float32),
         pool,
         pages,
         jnp.full((requests, queries), width, jnp.int32),
-        page_records=page,
-        key_tile=256,
-        fuse_mask=fuse_mask,
+        page_records=128,
+        block_size=0,
     ).reshape(requests, queries, width)
     expected = jnp.broadcast_to(
-        values.reshape(requests, 1, width).astype(jnp.float32) * 128, result.shape
+        jnp.maximum(values.reshape(requests, 1, width).astype(jnp.float32), 0)
+        * (128 * 32),
+        result.shape,
     )
     np.testing.assert_array_equal(result, expected)
-
-
-def _paged_decode_inputs(seed, requests, queries, heads, width, page, banks):
-    """Random paged decode inputs with ragged/zero lengths and invalid pages."""
-    rng = np.random.default_rng(seed)
-    records = requests * width
-    keys = rng.normal(size=(records, 128)).astype(np.float32)
-    words = jax.lax.bitcast_convert_type(
-        jnp.asarray(keys, jnp.bfloat16).reshape(-1, 64, 2), jnp.int32
-    ).reshape(-1, 128)
-    split = (records // 2 // 3) // (page // 2) * (page // 2)
-    pool = (words[:split], words[split:]) if banks == 2 else words
-    order = rng.permutation(records // page).reshape(requests, -1)
-    pages = order.astype(np.int32) * page
-    pages[rng.random(pages.shape) < 0.05] = -1
-    lengths = rng.integers(0, width + 1, size=(requests, queries)).astype(np.int32)
-    lengths[0] = width
-    lengths[-1, 0] = 0
-    if requests > 2:
-        lengths[1] = 0
-        lengths[2] = rng.integers(0, min(width, 300), size=queries)
-    q = jnp.asarray(rng.normal(size=(requests, queries, heads, 128)), jnp.bfloat16)
-    weights = jnp.asarray(rng.normal(size=(requests, queries, heads, 1)), jnp.float32)
-    return q, weights, pool, jnp.asarray(pages), jnp.asarray(lengths)
-
-
-def _assert_2d_matches_legacy(
-    seed, requests, queries, heads, width, page, key_tile, banks, **options
-):
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection.decode import (
-        flat_request_group,
-    )
-
-    q, weights, pool, pages, lengths = _paged_decode_inputs(
-        seed, requests, queries, heads, width, page, banks
-    )
-    group = options.pop("request_group", None) or flat_request_group(requests, queries)
-    assert group
-    out_window = options.pop("out_window", 0)
-    kwargs = dict(page_records=page, key_tile=key_tile, **options)
-    legacy = grouped_decode_scores(q, weights, pool, pages, lengths, **kwargs)
-    flat = grouped_decode_scores(
-        q,
-        weights,
-        pool,
-        pages,
-        lengths,
-        request_group=group,
-        out_window=out_window,
-        **kwargs,
-    )
-    assert flat.shape == legacy.shape == (requests * queries, width)
-    assert flat.dtype == legacy.dtype
-    # Bitwise, including -inf masking and signed zeros.
-    np.testing.assert_array_equal(
-        np.asarray(flat).view(np.uint32), np.asarray(legacy).view(np.uint32)
-    )
-
-
-@pytest.mark.cpu_test
-@pytest.mark.parametrize(
-    "requests,queries,group",
-    [(4, 6, None), (8, 6, None), (8, 6, 8), (8, 4, None), (8, 3, None), (2, 8, 1)],
-)
-@pytest.mark.parametrize("banks", [1, 2])
-@pytest.mark.parametrize("fuse_mask", [False, True])
-@pytest.mark.parametrize("score_window,out_window", [(32768, 0), (32768, 128)])
-def test_grouped_decode_scores_2d_out_is_bitwise_legacy(
-    requests, queries, group, banks, fuse_mask, score_window, out_window
-):
-    _assert_2d_matches_legacy(
-        11,
-        requests,
-        queries,
-        4,
-        512,
-        16,
-        64,
-        banks,
-        request_group=group,
-        out_window=out_window,
-        prefetch=True,
-        interpret=True,
-        fuse_mask=fuse_mask,
-        score_window=score_window,
-    )
-
-
-@pytest.mark.cpu_test
-@pytest.mark.parametrize("halfplane", [False, True])
-@pytest.mark.parametrize("banks", [1, 2])
-def test_grouped_decode_scores_2d_out_halfplane(halfplane, banks):
-    # The 2D request-major path keeps the halfplane Index-K.
-    _assert_2d_matches_legacy(
-        13,
-        8,
-        6,
-        4,
-        512,
-        16,
-        64,
-        banks,
-        prefetch=True,
-        interpret=True,
-        fuse_mask=True,
-        halfplane=halfplane,
-    )
-
-
-@pytest.mark.cpu_test
-@pytest.mark.parametrize("prefetch", [False, True])
-def test_grouped_decode_scores_2d_out_serving_heads_and_tiles(prefetch):
-    # Serving head/query/tile geometry with a reduced width (CPU interpret).
-    _assert_2d_matches_legacy(
-        5,
-        16,
-        6,
-        32,
-        8192,
-        256,
-        4096,
-        2,
-        prefetch=prefetch,
-        interpret=True,
-        fuse_mask=True,
-        score_window=131072,
-    )
-
-
-@pytest.mark.cpu_test
-def test_grouped_decode_scores_2d_out_rejects_unaligned_groups():
-    q, weights, pool, pages, lengths = _paged_decode_inputs(0, 6, 6, 4, 256, 16, 1)
-    with pytest.raises(ValueError, match="8-row"):
-        grouped_decode_scores(
-            q,
-            weights,
-            pool,
-            pages,
-            lengths,
-            page_records=16,
-            key_tile=64,
-            interpret=True,
-            request_group=2,
-        )
-
-
-@pytest.mark.skipif(
-    "jax.default_backend() != 'tpu'", reason="Production widths are TPU-sized"
-)
-@pytest.mark.parametrize("requests,width", [(16, 131072), (12, 65536)])
-@pytest.mark.parametrize("out_window", [0, 32768])
-def test_grouped_decode_scores_2d_out_production_shapes(requests, width, out_window):
-    _assert_2d_matches_legacy(
-        3,
-        requests,
-        6,
-        32,
-        width,
-        256,
-        4096,
-        2,
-        out_window=out_window,
-        fuse_mask=True,
-        score_window=131072,
-    )
-
-
-@pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="SparseCore top-k")
-@pytest.mark.parametrize("requests,width", [(16, 131072), (12, 65536)])
-@pytest.mark.parametrize("candidate_count", [0, 128])
-def test_decode_indexer_2d_out_selection_is_identical(
-    monkeypatch, requests, width, candidate_count
-):
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection import decode
-
-    q, weights, pool, pages, lengths = _paged_decode_inputs(
-        9, requests, 6, 32, width, 256, 2
-    )
-    kwargs = dict(
-        page_records=256,
-        key_tile=4096,
-        request_tile=requests,
-        candidate_count=candidate_count,
-        candidate_block_size=128,
-    )
-
-    def run(enabled):
-        if enabled == "0":
-            monkeypatch.setattr(decode, "flat_request_group", lambda *args: 0)
-        else:
-            monkeypatch.undo()
-        decode.decode_indexer.clear_cache()
-        return jax.tree.map(
-            np.asarray,
-            decode.decode_indexer(q, weights, pool, pages, lengths, **kwargs),
-        )
-
-    legacy, flat = run("0"), run("1")
-    jax.tree.map(np.testing.assert_array_equal, flat, legacy)
 
 
 @pytest.mark.cpu_test
@@ -310,14 +113,14 @@ def test_candidate_union_membership_overflow_and_invalid_pages():
         union_record_starts,
     )
 
-    candidates = jnp.array([[[2, 0, 2, -1], [1, 2, 9, -1]]], jnp.int32)
-    meta = union_metadata(candidates, logical_blocks=4, capacity_blocks=4)
-    np.testing.assert_array_equal(meta.ids, [[0, 1, 2, -1]])
+    candidate_block_ids = jnp.array([[[2, 0, 2, -1], [1, 2, 9, -1]]], jnp.int32)
+    meta = union_metadata(candidate_block_ids, logical_blocks=4, capacity_blocks=4)
+    np.testing.assert_array_equal(meta.union_block_ids, [[0, 1, 2, -1]])
     np.testing.assert_array_equal(meta.membership, [[1, 2, 3, 0]])
-    np.testing.assert_array_equal(meta.actual_count, [3])
+    np.testing.assert_array_equal(meta.union_block_count, [3])
     np.testing.assert_array_equal(meta.overflow, [False])
-    truncated = union_metadata(candidates, logical_blocks=4, capacity_blocks=2)
-    np.testing.assert_array_equal(truncated.actual_count, [3])
+    truncated = union_metadata(candidate_block_ids, logical_blocks=4, capacity_blocks=2)
+    np.testing.assert_array_equal(truncated.union_block_count, [3])
     np.testing.assert_array_equal(truncated.overflow, [True])
     records = jnp.arange(32, dtype=jnp.int32)[None].at[:, 8:16].set(-1)
     records = records.at[:, 16:24].set(64 + jnp.arange(8))
@@ -343,16 +146,18 @@ def test_long_candidate_union_preserves_membership_and_overflow(
 
     rng = np.random.default_rng(927)
     domain = np.array([-1, logical_blocks, 0, 1, logical_blocks - 1, 17001, 32768])
-    candidates = rng.choice(domain, size=(3, queries, 17)).astype(np.int32)
-    candidates[0, :, :3] = logical_blocks - 1  # Duplicate within each query.
-    candidates[1] = -1
-    candidates[2] = rng.integers(0, logical_blocks, (queries, 17), dtype=np.int32)
+    candidate_block_ids = rng.choice(domain, size=(3, queries, 17)).astype(np.int32)
+    candidate_block_ids[0, :, :3] = logical_blocks - 1  # Duplicate within each query.
+    candidate_block_ids[1] = -1
+    candidate_block_ids[2] = rng.integers(
+        0, logical_blocks, (queries, 17), dtype=np.int32
+    )
     result = jax.jit(
         lambda x: union_metadata(
             x, logical_blocks=logical_blocks, capacity_blocks=capacity
         )
-    )(jnp.asarray(candidates))
-    for request, rows in enumerate(candidates):
+    )(jnp.asarray(candidate_block_ids))
+    for request, rows in enumerate(candidate_block_ids):
         expected = {}
         for query, ids in enumerate(rows):
             for block in ids:
@@ -360,13 +165,13 @@ def test_long_candidate_union_preserves_membership_and_overflow(
                     expected[int(block)] = expected.get(int(block), 0) | (1 << query)
         ids = sorted(expected)[:capacity]
         np.testing.assert_array_equal(
-            result.ids[request], ids + [-1] * (capacity - len(ids))
+            result.union_block_ids[request], ids + [-1] * (capacity - len(ids))
         )
         np.testing.assert_array_equal(
             result.membership[request],
             [expected[i] for i in ids] + [0] * (capacity - len(ids)),
         )
-        assert int(result.actual_count[request]) == len(expected)
+        assert int(result.union_block_count[request]) == len(expected)
         assert bool(result.overflow[request]) == (len(expected) > capacity)
 
 
@@ -390,12 +195,16 @@ def test_candidate_scores_match_independent_per_head_reference(
     keys = unpack_candidate_words(words.reshape(requests, -1, 128), interpret=True)
     expected_keys = jnp.concatenate((native[..., ::2], native[..., 1::2]), axis=-1)
     np.testing.assert_array_equal(keys, expected_keys)
-    candidates = rng.integers(-2, 18, size=(requests, queries, 12), dtype=np.int32)
+    candidate_block_ids = rng.integers(
+        -2, 18, size=(requests, queries, 12), dtype=np.int32
+    )
     meta = union_metadata(
-        jnp.asarray(candidates), logical_blocks=16, capacity_blocks=16
+        jnp.asarray(candidate_block_ids), logical_blocks=16, capacity_blocks=16
     )
     # A dense key cache whose slots correspond to the compact logical IDs.
-    slots = np.maximum(np.asarray(meta.ids), 0)[..., None] * 8 + np.arange(8)
+    slots = np.maximum(np.asarray(meta.union_block_ids), 0)[..., None] * 8 + np.arange(
+        8
+    )
     gathered = expected_keys[jnp.arange(requests)[:, None], slots.reshape(requests, -1)]
     if packed:
         native_gathered = native[
@@ -414,7 +223,7 @@ def test_candidate_scores_match_independent_per_head_reference(
         q,
         weights,
         score_keys,
-        meta.ids,
+        meta.union_block_ids,
         meta.membership,
         lengths,
         block_size=8,
@@ -428,11 +237,11 @@ def test_candidate_scores_match_independent_per_head_reference(
     for r in range(requests):
         for query in range(queries):
             for slot in range(width):
-                block = int(meta.ids[r, slot // 8])
+                block = int(meta.union_block_ids[r, slot // 8])
                 logical = block * 8 + slot % 8
                 if (
                     block < 0
-                    or block not in candidates[r, query]
+                    or block not in candidate_block_ids[r, query]
                     or logical >= lengths[r, query]
                 ):
                     expected[r, query, slot] = -np.inf
@@ -474,13 +283,13 @@ def test_sparse_candidate_union_exact(queries, logical_blocks, capacity):
                     expected[int(block)] = expected.get(int(block), 0) | (1 << query)
         ids = sorted(expected)[:capacity]
         np.testing.assert_array_equal(
-            result.ids[request], ids + [-1] * (capacity - len(ids))
+            result.union_block_ids[request], ids + [-1] * (capacity - len(ids))
         )
         np.testing.assert_array_equal(
             result.membership[request],
             [expected[i] for i in ids] + [0] * (capacity - len(ids)),
         )
-        assert int(result.actual_count[request]) == len(expected)
+        assert int(result.union_block_count[request]) == len(expected)
         assert bool(result.overflow[request]) == (len(expected) > capacity)
 
 
@@ -531,11 +340,13 @@ def _candidate_skip_inputs(seed, requests=4, width=256):
     bits = layout.encode_records(native.reshape(-1, 128))
     halfplane = (bits[::2] | (bits[1::2] << 16)).astype(jnp.int32)
     halfplane = halfplane.reshape(requests, -1, 128)
-    candidates = rng.integers(-2, 10, size=(requests, queries, 5), dtype=np.int32)
-    candidates[1] = -1  # Empty union: every tile is skipped.
-    candidates[-1, :, 0] = 31  # Union reaches the last tile.
+    candidate_block_ids = rng.integers(
+        -2, 10, size=(requests, queries, 5), dtype=np.int32
+    )
+    candidate_block_ids[1] = -1  # Empty union: every tile is skipped.
+    candidate_block_ids[-1, :, 0] = 31  # Union reaches the last tile.
     meta = union_metadata(
-        jnp.asarray(candidates), logical_blocks=40, capacity_blocks=width // 8
+        jnp.asarray(candidate_block_ids), logical_blocks=40, capacity_blocks=width // 8
     )
     q = jnp.asarray(rng.normal(size=(requests, queries, heads, 128)), jnp.bfloat16)
     weights = jnp.asarray(rng.normal(size=(requests, queries, heads)), jnp.float32)
@@ -548,7 +359,7 @@ def _candidate_skip_inputs(seed, requests=4, width=256):
         ),
         (True, True): halfplane,
     }
-    return q, weights, keys, meta.ids, meta.membership, lengths
+    return q, weights, keys, meta.union_block_ids, meta.membership, lengths
 
 
 @pytest.mark.cpu_test
@@ -756,3 +567,60 @@ def test_candidate_indexer_basic_layout_preserves_unaligned_tiles(monkeypatch):
     reference = _run_candidate_indexer(monkeypatch, inputs, False, False)
     actual = _run_candidate_indexer(monkeypatch, inputs, False, True, flat=8)
     np.testing.assert_array_equal(actual, reference)
+
+
+@pytest.mark.parametrize("block_size", [0, 8])
+@pytest.mark.parametrize(
+    "requests,queries", [(3, 6), (7, 6), (9, 1), (3, 4), (9, 5), (3, 8), (3, 12)]
+)
+@pytest.mark.parametrize("key_tile,empty", [(4096, False), (6144, False), (6144, True)])
+def test_persistent_scores_write_flat_rows_with_ragged_lengths(
+    block_size, requests, queries, key_tile, empty
+):
+    if jax.default_backend() != "tpu":
+        pytest.skip("Persistent DMA scoring requires TPU")
+    from vllm_torchtpu.kernels.deepseek_v41.index_selection import persistent_scores
+
+    rng = np.random.default_rng(949)
+    heads, width = 32, 4096
+    keys = jnp.asarray(rng.integers(-2, 3, (requests * width, 128)), jnp.bfloat16)
+    encoded = index_key_layout.encode_records(keys)
+    words = (encoded[::2] | (encoded[1::2] << 16)).astype(jnp.int32)
+    pool = (words[:2048], words[2048:])
+    pages = (
+        jnp.arange(requests * width // 128, dtype=jnp.int32).reshape(requests, -1) * 128
+    )
+    pages = pages.at[0, 2].set(-1)
+    lengths = jnp.asarray(
+        np.resize(
+            np.array([0, 1, 255, 1023, 4095, 4096], np.int32), (requests, queries)
+        )
+    )
+    lengths = lengths.at[1].set(0)
+    if empty:
+        lengths = jnp.zeros_like(lengths)
+    q = jnp.asarray(rng.integers(-2, 3, (requests, queries, heads, 128)), jnp.bfloat16)
+    weights = jnp.asarray(rng.integers(-2, 3, (requests, queries, heads)), jnp.float32)
+    actual = persistent_scores._grouped_decode_scores(
+        q,
+        weights,
+        pool,
+        pages,
+        lengths,
+        page_records=128,
+        key_tile=key_tile,
+        # Exercise the production compute fragment and head reduction across
+        # ragged batches, output boundaries and several query counts.
+        compute_tile=1024,
+        head_group=32,
+        block_size=block_size,
+    )
+    expected = _reference_scores(q, weights, pool, pages, lengths)
+    reference = (
+        (expected, expected.reshape(requests * queries, width // 8, 8).max(-1))
+        if block_size
+        else expected
+    )
+    for output, expected in zip(jax.tree.leaves(actual), jax.tree.leaves(reference)):
+        assert output.ndim == 2
+        np.testing.assert_array_equal(output, expected)

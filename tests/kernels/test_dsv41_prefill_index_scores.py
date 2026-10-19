@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.deepseek_v41 import indexer
+from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout, indexer
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.scores import (
     prefill_index_scores,
 )
@@ -66,8 +66,8 @@ def test_prefill_scores(layout, limit, coalesce, record_mask):
     rng = np.random.default_rng(71)
     tokens, heads, width, page = 16, 4, 256, 16
     keys = jnp.asarray(rng.normal(size=(width, 128)), jnp.bfloat16)
-    words = jax.lax.bitcast_convert_type(keys.reshape(width, 64, 2), jnp.int32)
-    words = words.reshape(width // 2, 128)
+    encoded = index_key_layout.encode_records(keys)
+    words = (encoded[::2] | (encoded[1::2] << 16)).astype(jnp.int32)
     # This boundary lies in the middle of a 64-key DMA tile.
     pool = (words[:48], words[48:]) if layout == "bank_boundary" else words
     order = np.arange(width // page, dtype=np.int32)
@@ -79,7 +79,7 @@ def test_prefill_scores(layout, limit, coalesce, record_mask):
     records[0, -page:] = -1
     records[0, 7:10] = -1  # Partial-page holes must also become -inf.
     q = jnp.asarray(rng.normal(size=(tokens, heads, 128)), jnp.bfloat16)
-    w = jnp.asarray(rng.normal(size=(tokens, heads, 1)), jnp.float32)
+    w = jnp.asarray(rng.normal(size=(tokens, heads)), jnp.float32)
     actual = prefill_index_scores(
         q,
         w,
@@ -96,7 +96,7 @@ def test_prefill_scores(layout, limit, coalesce, record_mask):
     reordered = keys.reshape(width // page, page, 128)[order].reshape(width, 128)
     split = jnp.concatenate((reordered[:, ::2], reordered[:, 1::2]), axis=-1)
     logits = jnp.einsum("thd,kd->thk", q, split, preferred_element_type=jnp.float32)
-    expected = (jnp.maximum(logits, 0) * w).sum(1)
+    expected = (jnp.maximum(logits, 0) * w[..., None]).sum(1)
     lengths = np.maximum(0, limit - np.arange(tokens))
     valid = (np.arange(width)[None] < lengths[:, None]) & np.repeat(
         pages >= 0, page, axis=1
@@ -118,14 +118,14 @@ def test_prefill_score_windows(limit, record_mask):
     rng = np.random.default_rng(82)
     width, page = 131072, 128
     keys = jnp.asarray(rng.normal(size=(width, 128)), jnp.bfloat16)
-    words = jax.lax.bitcast_convert_type(keys.reshape(width, 64, 2), jnp.int32)
-    words = words.reshape(width // 2, 128)
+    encoded = index_key_layout.encode_records(keys)
+    words = (encoded[::2] | (encoded[1::2] << 16)).astype(jnp.int32)
     order = rng.permutation(width // page)
     pages = jnp.asarray((order * page)[None], jnp.int32)
     records = (order[:, None] * page + np.arange(page)).reshape(1, width)
     records[0, [17, 65535, 65539, width - 1]] = -1
     q = jnp.asarray(rng.normal(size=(1, 1, 128)), jnp.bfloat16)
-    weights = jnp.ones((1, 1, 1), jnp.float32)
+    weights = jnp.ones((1, 1), jnp.float32)
     actual = prefill_index_scores(
         q,
         weights,
@@ -162,7 +162,7 @@ def test_prefill_rejects_invalid_record_mask(shape, dtype):
     with pytest.raises(ValueError, match="Records must be int32"):
         prefill_index_scores(
             jnp.zeros((8, 4, 128), jnp.bfloat16),
-            jnp.ones((8, 4, 1), jnp.float32),
+            jnp.ones((8, 4), jnp.float32),
             jnp.zeros((128, 128), jnp.int32),
             jnp.zeros((1, 16), jnp.int32),
             jnp.array([256], jnp.int32),

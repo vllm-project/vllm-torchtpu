@@ -58,19 +58,22 @@ def test_build_indexer_inputs_and_write_index_keys_cpu():
     assert inp["q_part_t"].shape == (16, 8, 128)
     assert inp["lengths_part_t"][0].item() == 8  # underfull first row when num_seqs > 1
 
-    # Verify write_index_keys on CPU matches repeated calls deterministically.
+    # Check each written key and every untouched sibling halfplane independently.
     pool = jnp.asarray(inp["pool_t"].numpy())
     wrec = jnp.asarray(inp["write_records_t"].numpy())
     wkeys = jnp.asarray(inp["write_keys_t"].float().numpy(), jnp.bfloat16)
     updated1 = write_index_keys(pool, wrec, wkeys)
-    updated2 = write_index_keys(pool, wrec, wkeys)
-    rep = common.compare_tensors(
-        torch.from_numpy(np.asarray(updated1).copy()),
-        torch.from_numpy(np.asarray(updated2).copy()),
-        common.EXACT,
-    )
-    assert rep["ok"], rep
-    assert rep["bitwise_equal"]
+    actual = np.asarray(updated1).view(np.uint32)
+    expected = np.asarray(pool).view(np.uint32).copy()
+    bits = np.asarray(wkeys.view(jnp.uint16)).astype(np.uint32)
+    split = np.concatenate((bits[:, ::2], bits[:, 1::2]), axis=1)
+    for record, key in zip(np.asarray(wrec), split):
+        if record < 0:
+            continue
+        shift = np.uint32(16 * (record % 2))
+        mask = np.uint32(65535) << shift
+        expected[record // 2] = (expected[record // 2] & ~mask) | (key << shift)
+    np.testing.assert_array_equal(actual, expected)
 
 
 def test_visible_top_k_signed_zero_and_lengths_mask_cpu():

@@ -9,12 +9,7 @@ Target modules and diff lines:
      * Bitwise equivalence against gather_cache_values(split=True)
 2. vllm_torchtpu.models.vllm.deepseek_v41.v2.attention
    - _index_page_records (lines 389-410):
-     * Not PagedCacheRows instance -> 0
-     * dtype != torch.bfloat16 (e.g. fp8, fp32, None) -> 0
-     * row_bytes % record_bytes != 0 -> 0
-     * (per_page * record_bytes) % row_bytes != 0 -> 0
-     * row_offset % per_row != 0 -> 0
-     * page_stride % per_row != 0 -> 0
+     * Non-index owners are rejected
      * Valid qualifying layout -> per_page
    - DeepseekV41Attention._select_paged_indices (lines 1351-1490):
      * split=True (ranks > 1, part = (count + ranks - 1) // ranks, padding = ranks)
@@ -33,7 +28,7 @@ Target modules and diff lines:
      * requests is not None and tokens <= records.shape[0] (decode take)
      * requests is not None and tokens > records.shape[0] (prefill row_step)
      * requests is None
-     * pages=True (gather_cache_page_values branch)
+     * pages=True (native packed page gather branch)
      * pages=False: page_records is None
      * pages=False: tile % page_records != 0
      * Numerical equivalence of pages=True vs pages=False
@@ -46,7 +41,6 @@ Target modules and diff lines:
 """
 
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import jax
 import jax.numpy as jnp
@@ -70,7 +64,7 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.attention_kernels import (
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
     ROW_WORDS,
-    PagedCacheRows,
+    IndexCacheRows,
     gather_cache_page_values,
     gather_cache_values,
 )
@@ -142,57 +136,10 @@ class TestGatherCachePageValues:
 class TestIndexPageRecords:
     """Coverage for v2/attention.py _index_page_records."""
 
-    def test_not_paged_cache_rows_returns_zero(self):
-        """Non-PagedCacheRows object returns 0."""
+    def test_non_index_cache_returns_zero(self):
+        """Non-index owners have no index pages."""
         assert _index_page_records(None) == 0
         assert _index_page_records(torch.zeros(10, 10)) == 0
-
-    def test_non_bf16_dtype_returns_zero(self):
-        """Dtype other than torch.bfloat16 returns 0."""
-        raw = torch.zeros((64, ROW_WORDS), dtype=torch.int32)
-        layout_fp32 = ((4, 16, 64), torch.float32, 32 * 64 * 4, 0)
-        cache_fp32 = PagedCacheRows(raw, layout_fp32)
-        assert _index_page_records(cache_fp32) == 0
-
-        # Mock PagedCacheRows with FP8 dtype
-        mock_fp8 = MagicMock(spec=PagedCacheRows)
-        mock_fp8.dtype = torch.float8_e4m3fn
-        assert _index_page_records(mock_fp8) == 0
-
-    def test_row_bytes_not_divisible_by_record_bytes_returns_zero(self):
-        """row_bytes % record_bytes != 0 returns 0."""
-        raw = torch.zeros((64, ROW_WORDS), dtype=torch.int32)
-        # dim = 512, BF16 -> record_bytes = 1024; ROW_BYTES = 512; 512 % 1024 != 0
-        layout = ((4, 16, 512), torch.bfloat16, 32 * 1024, 0)
-        cache = PagedCacheRows(raw, layout)
-        assert _index_page_records(cache) == 0
-
-    def test_page_record_bytes_not_divisible_by_row_bytes_returns_zero(self):
-        """(per_page * record_bytes) % row_bytes != 0 returns 0."""
-        raw = torch.zeros((64, ROW_WORDS), dtype=torch.int32)
-        # dim = 128 -> record_bytes = 256; ROW_BYTES = 512;
-        # per_page = 3 -> 768 % 512 != 0
-        layout = ((4, 3, 128), torch.bfloat16, 32 * 256, 0)
-        cache = PagedCacheRows(raw, layout)
-        assert _index_page_records(cache) == 0
-
-    def test_row_offset_not_aligned_returns_zero(self):
-        """index_cache.row_offset % per_row != 0 returns 0."""
-        raw = torch.zeros((64, ROW_WORDS), dtype=torch.int32)
-        # dim = 128 -> record_bytes = 256 -> per_row = 2
-        # offset = 1 record -> offset % 2 == 1 != 0
-        layout = ((4, 16, 128), torch.bfloat16, 32 * 256, 1 * 256)
-        cache = PagedCacheRows(raw, layout)
-        assert _index_page_records(cache) == 0
-
-    def test_page_stride_not_aligned_returns_zero(self):
-        """index_cache.page_stride % per_row != 0 returns 0."""
-        raw = torch.zeros((64, ROW_WORDS), dtype=torch.int32)
-        # dim = 128 -> record_bytes = 256 -> per_row = 2
-        # stride = 33 records -> stride % 2 == 1 != 0
-        layout = ((4, 16, 128), torch.bfloat16, 33 * 256, 0)
-        cache = PagedCacheRows(raw, layout)
-        assert _index_page_records(cache) == 0
 
     def test_valid_qualifying_layout_returns_per_page(self):
         """Properly aligned BF16 layout returns per_page."""
@@ -200,7 +147,7 @@ class TestIndexPageRecords:
         # dim = 128 -> record_bytes = 256 -> per_row = 2
         # per_page = 16, stride = 32, offset = 16 -> all % 2 == 0
         layout = ((4, 16, 128), torch.bfloat16, 32 * 256, 16 * 256)
-        cache = PagedCacheRows(raw, layout)
+        cache = IndexCacheRows(raw, layout)
         assert _index_page_records(cache) == 16
 
     def test_2bank_lo_rows_alignment(self):
@@ -208,11 +155,11 @@ class TestIndexPageRecords:
         raw_lo_aligned = torch.zeros((32, ROW_WORDS), dtype=torch.int32)
         raw_hi = torch.zeros((32, ROW_WORDS), dtype=torch.int32)
         layout = ((4, 16, 128), torch.bfloat16, 32 * 256, 0)
-        cache_aligned = PagedCacheRows((raw_lo_aligned, raw_hi), layout)
+        cache_aligned = IndexCacheRows((raw_lo_aligned, raw_hi), layout)
         assert _index_page_records(cache_aligned) == 16
 
         raw_lo_unaligned = torch.zeros((5, ROW_WORDS), dtype=torch.int32)
-        cache_unaligned = PagedCacheRows((raw_lo_unaligned, raw_hi), layout)
+        cache_unaligned = IndexCacheRows((raw_lo_unaligned, raw_hi), layout)
         assert _index_page_records(cache_unaligned) == 0
 
 
@@ -256,6 +203,8 @@ class TestAttentionKernelsDecodeIndexer:
 
     def test_paged_index_scores_pages_vs_unpaged_equivalence(self):
         """paged_index_scores_jax with pages=True vs pages=False match."""
+        from vllm_torchtpu.kernels.deepseek_v41 import index_key_layout
+
         rng = np.random.default_rng(200)
         heads, dim = 2, 128
         tokens, width = 4, 1024
@@ -264,12 +213,15 @@ class TestAttentionKernelsDecodeIndexer:
         pool = jnp.asarray(
             rng.integers(-(2**31), 2**31, (256, ROW_WORDS)), dtype=jnp.int32
         ) & jnp.int32(0x3FFF3FFF)
-        records = rng.integers(0, 256 * 2, (tokens, width)).astype(np.int32)
-        # Align records to contiguous page blocks of 32
-        for r in range(tokens):
-            for p in range(0, width, page_records):
-                base = int(records[r, p] // 2 * 2)
-                records[r, p : p + page_records] = base + np.arange(page_records)
+        pool_records = pool.shape[0] * index_key_layout.SLOTS
+        pages = rng.integers(
+            0, pool_records // page_records, (tokens, width // page_records)
+        )
+        records = (
+            (pages[..., None] * page_records + np.arange(page_records))
+            .reshape(tokens, width)
+            .astype(np.int32)
+        )
         records[:, -10:] = -1  # invalid tail
         records = jnp.asarray(records)
 
@@ -691,10 +643,9 @@ class TestAttentionSelectPagedIndicesDecode:
 
         monkeypatch.setattr(v2_attn, "paged_indexer", mock_paged_indexer)
 
-        # Mock PagedCacheRows with qualifying layout (per_page = 16)
         raw = torch.zeros((64, ROW_WORDS), dtype=torch.int32)
         layout = ((4, 16, 128), torch.bfloat16, 32 * 256, 16 * 256)
-        index_cache_mock = PagedCacheRows(raw, layout)
+        index_cache_mock = IndexCacheRows(raw, layout)
 
         qr = torch.zeros(count, 128)
         positions = torch.arange(count, dtype=torch.int32)
@@ -928,11 +879,11 @@ class TestAttentionSelectPagedIndicesDecode:
             assert sel2.shape == (count, 4)
             assert call_count == 2
 
-            # Call 3: 2-bank PagedCacheRows returning (lo, hi) tuple
+            # Call 3: split Index-K owner returns both banks.
             raw_lo = torch.zeros((32, ROW_WORDS), dtype=torch.int32)
             raw_hi = torch.zeros((32, ROW_WORDS), dtype=torch.int32)
             layout = ((4, 16, 128), torch.bfloat16, 32 * 256, 0)
-            index_cache_2b = PagedCacheRows((raw_lo, raw_hi), layout)
+            index_cache_2b = IndexCacheRows((raw_lo, raw_hi), layout)
             monkeypatch.setattr(
                 v2_attn,
                 "paged_indexer",
@@ -976,26 +927,8 @@ def test_candidate_envelope_keeps_token_rows_dynamic():
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize(
-    "groups,width,layout,capacity,packed",
-    [
-        (2, 98304, "ordinary", 49152, False),
-        (48, 98816, "halfplane", 49152, True),
-        (48, 98816, "ordinary", 49152, False),
-        (24, 98816, "halfplane", 49152, True),
-        (48, 98304, "halfplane", 49152, True),
-        (8, 65536, "halfplane", 32768, True),
-        (2, 1048576, "halfplane", 49152, True),
-    ],
-)
-def test_candidate_cache_reuses_only_within_stage_and_source_version(
-    monkeypatch, groups, width, layout, capacity, packed
-):
-    """Eligible halfplane shapes share packed keys only within a source stage."""
-    from vllm_torchtpu.kernels.deepseek_v41.index_selection import tuned_block_sizes
-
-    monkeypatch.setattr(tuned_block_sizes, "CANDIDATE_KEY_CAPACITY", capacity)
-    count = groups * 6
+def test_candidate_cache_reuses_only_within_stage_and_source_version(monkeypatch):
+    """Four reindexes share keys; publication, source and new stage invalidate."""
     attn = TestAttentionSelectPagedIndicesDecode()._setup_mock_attn(
         monkeypatch, ranks=1
     )
@@ -1003,24 +936,20 @@ def test_candidate_cache_reuses_only_within_stage_and_source_version(
     attn.compress_ratio = 1
     attn.candidate_block_size = 8
     attn.candidate_source_layer = 20
-    attn.candidate_block_buffer = torch.zeros((count, 2048), dtype=torch.int32)
+    attn.candidate_block_buffer = torch.zeros((12, 2048), dtype=torch.int32)
     attn.indexer.k_cache = SimpleNamespace(prefix="source-a")
-    cache = SimpleNamespace(
-        raw=torch.zeros((128, 128), dtype=torch.int32), index_key_layout=layout
-    )
-    q = torch.zeros((count, 32, 128), dtype=torch.bfloat16)
-    positions = torch.arange(count, dtype=torch.int32)
-    records = torch.arange(groups * width, dtype=torch.int32).reshape(groups, -1)
-    requests = torch.arange(groups, dtype=torch.int32).repeat_interleave(6)
-    weights = torch.ones((count, 32))
-    lengths = torch.full((count, 1), width, dtype=torch.int32)
-    swa_valid = torch.ones(count, dtype=torch.bool)
+    cache = SimpleNamespace(raw=torch.zeros((128, 128), dtype=torch.int32))
+    q = torch.zeros((12, 32, 128), dtype=torch.bfloat16)
+    positions = torch.arange(12, dtype=torch.int32)
+    records = torch.arange(2 * 98304, dtype=torch.int32).reshape(2, -1)
+    requests = torch.arange(2, dtype=torch.int32).repeat_interleave(6)
+    weights = torch.ones((12, 32))
+    lengths = torch.full((12, 1), 98304, dtype=torch.int32)
+    swa_valid = torch.ones(12, dtype=torch.bool)
     prepared = []
     used = []
 
     def prepare(cache, records, candidates, requests, lengths, **kwargs):
-        assert kwargs["packed"] is packed
-        assert kwargs["capacity"] == capacity
         result = object()
         prepared.append((result, requests.clone()))
         return result
@@ -1038,10 +967,10 @@ def test_candidate_cache_reuses_only_within_stage_and_source_version(
         **kwargs,
     ):
         used.append(prepared)
-        return torch.zeros((count, 512), dtype=torch.int32)
+        return torch.zeros((12, 512), dtype=torch.int32)
 
     def old(q, cache, records, weights, lengths, candidates, *args, **kwargs):
-        return cache.raw, torch.zeros((count, 512), dtype=torch.int32), candidates + 1
+        return cache.raw, torch.zeros((12, 512), dtype=torch.int32), candidates + 1
 
     monkeypatch.setattr(v2_attn, "_index_page_records", lambda cache: 128)
     monkeypatch.setattr(v2_attn, "prepare_candidate_cache", prepare)
@@ -1074,3 +1003,4 @@ def test_candidate_cache_reuses_only_within_stage_and_source_version(
         run(reordered)
         assert len(prepared) == 5
         torch.testing.assert_close(prepared[-1][1], reordered)
+    assert len(used) == 8

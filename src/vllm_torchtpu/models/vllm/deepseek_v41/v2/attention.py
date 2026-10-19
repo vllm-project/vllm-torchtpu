@@ -32,10 +32,9 @@ from .attention_kernels import (
     sparse_fp8_attention_qo,
 )
 from .cache import (
-    ROW_BYTES,
+    IndexCacheRows,
     NativeCacheView,
     PagedCacheRows,
-    index_key_layout,
     write_cache,
 )
 from .candidate_cache import prepare_candidate_cache, select_candidate_cache
@@ -367,26 +366,34 @@ class SWACache(NativeCacheView, DeepseekV4SWACache):
 
 class IndexerCache(NativeCacheView, upstream.DeepseekV4IndexerCache):
     def __init__(self, *args, **kwargs):
-        self._tpu_index_key_layout = index_key_layout()
-        logger.info_once("V4.1 Index-K cache layout: %s", self._tpu_index_key_layout)
         config = get_current_vllm_config()
-        if self._tpu_index_key_layout == "halfplane":
-            if getattr(config, "kv_transfer_config", None) is not None:
-                raise ValueError(
-                    "Halfplane Index-K does not support external KV transfer"
-                )
-            if getattr(config.cache_config, "kv_offloading_size", 0):
-                raise ValueError(
-                    "Halfplane Index-K does not support external KV offload"
-                )
-        # The first TPU path stores rounded values in BF16; ownership and
-        # compression ratio still come from upstream. Packed storage follows
-        # when the corresponding TPU kernel is connected.
+        if getattr(config, "kv_transfer_config", None) is not None:
+            raise ValueError("Halfplane Index-K does not support external KV transfer")
+        if getattr(config.cache_config, "kv_offloading_size", 0):
+            raise ValueError("Halfplane Index-K does not support external KV offload")
         kwargs["head_dim"] = (
             get_current_vllm_config().model_config.hf_config.index_head_dim
         )
         kwargs["dtype"] = torch.bfloat16
         super().__init__(*args, **kwargs)
+
+    @property
+    def kv_cache(self):
+        return IndexCacheRows(self._tpu_raw_cache, self._tpu_cache_layout)
+
+    @kv_cache.setter
+    def kv_cache(self, cache):
+        self._bound_cache = cache
+
+    def bind_kv_cache(
+        self, cache, *, raw_cache=None, layout=None, rope_pool=None, scale_pool=None
+    ):
+        if raw_cache is None or layout is None:
+            raise ValueError("Index-K requires an explicit native owner/layout")
+        if rope_pool is not None or scale_pool is not None:
+            raise ValueError("Index-K owners cannot have RoPE or scale companions")
+        IndexCacheRows(raw_cache, layout)
+        super().bind_kv_cache(cache, raw_cache=raw_cache, layout=layout)
 
     def get_attn_backend(self):
         return AttentionBackend
@@ -428,33 +435,13 @@ def _row_slots(cache, block_table, requests, logical):
 
 
 def _index_page_records(index_cache):
-    """Records per page when page gathers are exact for `_request_row_slots`.
-
-    `PagedCacheRows.row_indices` keeps each page's records contiguous; the
-    page gather additionally needs every page to start a pool word row and
-    to cover whole word rows (`gather_cache_page_values`). Returns 0 when a
-    layout does not qualify (the per-record gather is then used).
-    """
-    if (
-        not isinstance(index_cache, PagedCacheRows)
-        or getattr(index_cache, "dtype", None) != torch.bfloat16
-    ):
+    """Records per page, or zero when the physical layout breaks page alignment."""
+    if not isinstance(index_cache, IndexCacheRows):
         return 0
-    row_bytes = ROW_BYTES
     per_page = index_cache.shape[1]
-    record_bytes = index_cache.row_bytes
-    if row_bytes % record_bytes or (per_page * record_bytes) % row_bytes:
+    if index_cache.row_offset % per_page or index_cache.page_stride % per_page:
         return 0
-    per_row = row_bytes // record_bytes
-    page_words = per_page // per_row
-    if (
-        index_cache.row_offset % per_row
-        or index_cache.page_stride % per_row
-        or (
-            getattr(index_cache, "raw_hi", None) is not None
-            and index_cache.raw.shape[0] % page_words
-        )
-    ):
+    if index_cache.raw_hi is not None and index_cache.bank_records % per_page:
         return 0
     return per_page
 
@@ -1719,14 +1706,11 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
             and stage_cache is not None
             else None
         )
+
         if capacity is not None:
             assert stage_cache is not None
-            # A stage has immutable request membership. Re-entering the stage
-            # rebuilds this graph-local cache, including reordered scheduler rows.
-            # Publication and index-K writes explicitly version their sources.
             cache_key = (
                 "candidate_index_keys",
-                getattr(index_cache, "index_key_layout", "ordinary"),
                 indexer.k_cache.prefix,
                 stage_cache.get(("candidate_index_version", indexer.k_cache.prefix), 0),
                 self.candidate_source_layer,
@@ -1745,11 +1729,6 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     lengths_part,
                     block_size=self.candidate_block_size,
                     capacity=capacity,
-                    # Query rows stay dynamic; JAX checks request grouping and overflow.
-                    packed=(
-                        getattr(index_cache, "index_key_layout", "ordinary")
-                        == "halfplane"
-                    ),
                 )
                 stage_cache[cache_key] = prepared
             return select_candidate_cache(

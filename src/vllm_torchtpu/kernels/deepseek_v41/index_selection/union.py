@@ -15,20 +15,20 @@ from jax.experimental.pallas import tpu_sc as plsc
 
 @functools.partial(jax.jit, static_argnames=("logical_blocks", "capacity"))
 def sparse_union_metadata(
-    candidates: jax.Array, logical_blocks: int, capacity: int
+    candidate_block_ids: jax.Array, logical_blocks: int, capacity: int
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """Build sorted IDs and query bits; retain the full count on overflow.
 
     Each subcore accumulates query-local histograms in VMEM, then streams
     their membership masks in ID order without an HBM scatter or sort.
     """
-    requests, queries, candidates_per_query = candidates.shape
+    requests, queries, candidates_per_query = candidate_block_ids.shape
     info = plsc.get_sparse_core_info()
     lanes = info.num_lanes
     histogram_width = pl.cdiv(logical_blocks, 128) * 128
     output_width = pl.cdiv(capacity, 128) * 128
     if (
-        candidates.dtype != jnp.int32
+        candidate_block_ids.dtype != jnp.int32
         or candidates_per_query % 128
         or not 1 <= queries <= 8
         or min(requests, candidates_per_query, logical_blocks, capacity) < 1
@@ -136,5 +136,5 @@ def sparse_union_metadata(
             ).wait()
             pltpu.async_copy(counts, count_out.at[row], sem).wait()
 
-    ids, bits, count = kernel(candidates)
+    ids, bits, count = kernel(candidate_block_ids)
     return ids[:, :capacity], bits[:, :capacity], count[:, 0], count[:, 0] > capacity
