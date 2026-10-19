@@ -163,7 +163,7 @@ class SrptPrefillScheduler(AsyncScheduler):
 
     def _long_prefill_threshold(self, num_eligible_reqs: int) -> int:
         # Mirrors the long_prefill_token_threshold computation inline in
-        # Scheduler.schedule() (vLLM v0.31.0, scheduler.py ~L611-626). Re-sync
+        # Scheduler.schedule() (vLLM v0.32.0, scheduler.py ~L640-655). Re-sync
         # on vLLM upgrades.
         lptt = (
             self.scheduler_config.long_prefill_token_threshold
@@ -184,7 +184,7 @@ class SrptPrefillScheduler(AsyncScheduler):
         and the budget it leaves for WAITING.
 
         Mirrors the per-request ``num_new_tokens`` math inline in that pass
-        (vLLM v0.31.0, scheduler.py ~L628-722); re-sync on vLLM upgrades.
+        (vLLM v0.32.0, scheduler.py ~L657-751); re-sync on vLLM upgrades.
         Encoder, Mamba-alignment and KV-allocation limits are not modelled, so
         a misestimate only makes a hold miss, which the backoff absorbs.
         """
@@ -361,7 +361,7 @@ class SrptPrefillScheduler(AsyncScheduler):
             # allocate_slots() adds the watermark when others are scheduled.
             needed += self.kv_cache_manager.watermark_blocks
         reserved = (
-            self._inflight_prefill_reserved_blocks() + self._spec_decode_step_blocks()
+            self._inflight_prefill_reserved_blocks() + self._spec_decode_step_blocks
         )
         free = self.kv_cache_manager.block_pool.get_num_free_blocks()
         return free - reserved >= needed
