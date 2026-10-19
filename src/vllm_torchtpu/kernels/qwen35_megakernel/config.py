@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import dataclasses
+import os
 
 import jax
 import jax._src.state.discharge as _discharge
@@ -503,7 +504,28 @@ ARPIPE_ON = True
 ARPIPE_OFF_B = (20, 24, 32)
 ARPIPE_H1_ON = True
 AR0S_ON = True
-FUSED_WIDE_NBD = {32: 12, 40: 12, 48: 12, 56: 11, 64: 9, 80: 8, 96: 5, 112: 2}
+# Dense ring depth of the fused verify buckets: the deepest ring that fits the 62 MiB scoped
+# VMEM limit (44 / 52 / 60 / 68 / 76: compile-searched on v7x-8, DCP=4).
+FUSED_WIDE_NBD = {
+    32: 12, 40: 12, 44: 12, 48: 12, 52: 11, 56: 11, 60: 10, 64: 9, 68: 9, 72: 8, 76: 8,
+    80: 8, 96: 5, 112: 2,
+}
+# Fused verify buckets of 72..112 rows (18..28 sequences at K=3), each ONE kernel (see
+# vllm_adapter._MAX_SINGLE_KERNEL_B) instead of a 2-microbatch split that re-streams every hit
+# expert's weights per microbatch. They use the flat reduce-scatter + all-gather all-reduce
+# (hier=0, rsag): its send / recv / gather buffers take half the VMEM of hier=2's (10.5 MiB at
+# 112 rows), which buys back dense-ring depth under the 62 MiB scoped limit. Value: the dense
+# ring depth (nbd) that fits. Microbench ms (v7x-8, DCP=4, ctx 80K; rsag vs hier=2 at its
+# deepest fitting ring): 72: 16.64 vs 16.98, 76: 17.39 vs 17.59, 80: 17.63 vs 18.25,
+# 84: 19.59 vs 19.53, 88: 19.97 vs 20.24, 96: 21.07 vs 21.51, 104: 23.86 vs 24.01,
+# 112: 24.35 vs 25.22 (68 rows and below: no gain, keep hier=2). Ported from the final tree
+# (6fc248fae, 236115c9c); VLLM_TPU_QWEN35_MK_RSAG_WIDE=0 turns the override off.
+FUSED_WIDE_RSAG_NBD = {72: 11, 76: 10, 80: 10, 84: 9, 88: 9, 96: 8, 104: 6, 112: 6}
+RSAG_WIDE_ON = os.environ.get("VLLM_TPU_QWEN35_MK_RSAG_WIDE", "1") != "0"
+# EP expert ring refills with static banks and one layer-dispatch walk per macro-step
+# (moe_block.experts_piped_ep). Bit-exact; microbench -1.5% at 64 / 80 rows, -6% at 96 / 112
+# (final tree e25fc0d38). VLLM_TPU_QWEN35_MK_EP_FAST_REFILL=0 turns it off.
+EP_FAST_REFILL = os.environ.get("VLLM_TPU_QWEN35_MK_EP_FAST_REFILL", "1") != "0"
 # Wide step (mb_rows > 0): dense ring slots, gathered rows per routed-expert tile, and the row
 # count above which the all-rows MoE buffers no longer fit VMEM beside the microbatch buffers.
 WIDE_NBD = 8
@@ -577,6 +599,8 @@ def default_tiles(c: MKConfig) -> Tiles:
         t = dataclasses.replace(t, hier=0)
     if c.T > 1 and c.paged_kv and c.fused_pool_io and c.B in FUSED_WIDE_NBD:
         t = dataclasses.replace(t, nbd=FUSED_WIDE_NBD[c.B])
+    if RSAG_WIDE_ON and c.T > 1 and c.paged_kv and c.fused_pool_io and c.B in FUSED_WIDE_RSAG_NBD:
+        t = dataclasses.replace(t, hier=0, rsag=True, nbd=FUSED_WIDE_RSAG_NBD[c.B])
     if c.NGDN == 0:
         t = dataclasses.replace(t, nbd=14)
     return t

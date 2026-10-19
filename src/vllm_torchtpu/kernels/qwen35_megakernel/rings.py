@@ -650,6 +650,43 @@ class ExpertWeightRing:
         def _():
             self.ecopy("e2", r2.at[w, td - T13], bank).start()
 
+    def slot_of(self, i):
+        """Source slot (EP: expert row within this rank's weights) of hit-list entry i, as
+        _unit_meta derives it (i is clamped to the list; callers gate on i < n_hit)."""
+        ctx = self.ctx
+        c, scr, ER, me = ctx.c, ctx.scr, ctx.ER, ctx.me
+        lst = scr["wlist"] if ctx.ECOPY else scr["elist"]
+        ic = jnp.minimum(i, lst.shape[0] - 1)
+        if ctx.ECOPY:
+            if getattr(ctx, "PRIM_NOW_K", False):
+                return jnp.where(ic < scr["st"][5], scr["elist"][ic] - me * ER, scr["wlist"][ic])
+            return scr["wlist"][ic]
+        e = scr["elist"][ic]
+        return e if c.moe_tp else e - me * ER
+
+    def refill_static(self, l, items, gate):
+        """Issue ring refills [(w, t, bank, gate_i)] (tile t of source slot w into a static
+        bank) in ONE layer-dispatch walk, skipped entirely unless `gate` holds."""
+        ctx = self.ctx
+        W, T13 = ctx.W, ctx.T13
+
+        def arm(r13, r2):
+            for w, t, bank, g in items:
+                def go(w=w, t=t, bank=bank):
+                    if t < T13:
+                        self.ecopy("e13", r13.at[w, t], bank).start()
+                    else:
+                        self.ecopy("e2", r2.at[w, t - T13], bank).start()
+
+                if g is None:
+                    go()
+                else:
+                    pl.when(g)(go)
+
+        @pl.when(gate)
+        def _():
+            bswitch(l, [lambda a=a, b=b: arm(a, b) for a, b in zip(W["e13"], W["e2"])])
+
     def egive_group(self, items, l):
         """items: [(u, t)] consumed units; refills u + NBE (gated on < st) in ONE walk."""
         ctx = self.ctx

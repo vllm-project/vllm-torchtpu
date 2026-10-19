@@ -268,10 +268,15 @@ class PagedAttentionBlock:
             GA = 2
         else:
             GA = 0
+        # GDEF holds all n_ai att_in tiles at once (dtake of every tile before the first
+        # refill), so the ring must have a slot per tile: with NBD < n_ai the wait for tile
+        # g0 + NBD would block on a bank whose refill is only issued after its use (deadlock,
+        # e.g. the fused B=96 / 112 verify buckets at nbd=5 / 2).
         GDEF = bool(
             ctx.ATT_GDEFER
             and QV
             and GA >= 2
+            and n_ai <= NBD
             and HD % 128 == 0
             and c.NAI == koff_g + 2 * HD
             and "dense" not in skip

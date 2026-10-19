@@ -103,7 +103,15 @@ _DEFAULT_WIDE_VERIFY_BUCKETS_800 = (
     160, 192, 224, 256, 320, 384, 448, 512, 640, 768, 800,
 )
 _MAX_WIDE_VERIFY_ROWS = 800
-_MAX_SINGLE_KERNEL_B = 80
+# Largest verify bucket built as ONE Pallas call; wider buckets run as microbatch splits
+# (each microbatch re-streams every hit expert's weights) or, at wide_min_rows and above, as
+# the wide step. Fused verify buckets 84..112 fit the 62 MiB scoped VMEM limit as one call with
+# the flat reduce-scatter + all-gather all-reduce and a shallower dense ring
+# (FUSED_WIDE_RSAG_NBD in config.py); final-tree microbench (v7x-8, DCP=4, ctx 80K) 8-10%
+# faster than the split at 84..96 rows. Needs the attention_block GDEF n_ai <= NBD guard.
+# Ported from the final tree (6fc248fae). `VLLM_TPU_QWEN35_MK_MAX_SINGLE_B=80` restores the
+# previous single-call cap.
+_MAX_SINGLE_KERNEL_B = int(os.environ.get("VLLM_TPU_QWEN35_MK_MAX_SINGLE_B", "112"))
 _SPLIT_BASE_B = 80
 
 

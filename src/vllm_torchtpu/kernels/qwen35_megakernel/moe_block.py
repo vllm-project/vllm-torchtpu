@@ -17,6 +17,7 @@ from .config import (
     rnd,
     topk_rows_on_lanes,
 )
+from . import config as _cfg
 from .context import MKBuildContext
 
 
@@ -1161,12 +1162,27 @@ class MoEBlock:
             mid0 = rnd(rnd(jax.nn.silu(rnd(h0[:, :IR]))) * rnd(h0[:, IR:]))
             xb2[:, :IR] = mid0.astype(BF16)
 
+            # EP_FAST_REFILL: with one expert per ring (NBE == TE) unit u = i * TE + t sits in
+            # the static bank t, so the steady-state refills of iteration i are expert i + 1's
+            # w2 tiles and expert i + 2's w13 tiles into known banks: two slot lookups and two
+            # bounds checks per expert and ONE layer-dispatch walk per macro-step, instead of a
+            # per-tile unit decode (div / rem / SMEM list loads, bounds check) and walk. Same
+            # DMAs into the same banks, issued after the macro-step's 3 tile matmuls.
+            FAST = bool(
+                getattr(_cfg, "EP_FAST_REFILL", False) and ctx.NBE == TE and not c.stack_e
+            )
+
             def body_ep(i, _):
                 e = scr["elist"][i]
                 s_cur = i % NSS
                 s_nxt = (i + 1) % NSS
                 base_w2 = i * TE + T13
                 base_nxt13 = (i + 1) * TE
+                if FAST:
+                    w_n1 = self.rings.slot_of(i + 1)
+                    w_n2 = self.rings.slot_of(i + 2)
+                    g_n1 = i + 1 < n_hit
+                    g_n2 = i + 2 < n_hit
 
                 if not DIRECT0:
                     acc[:, :H] = jnp.zeros((MB, H), F32)
@@ -1191,7 +1207,9 @@ class MoEBlock:
                     else:
                         acc[:, :H] += mm2
                         acc13[:, :BN] += mm13_0
-                    if c.B <= 40:
+                    if FAST:
+                        pass
+                    elif c.B <= 40:
                         egive_group([(u2, T13 + s_step), (u13_0, t0)], l)
                     else:
                         egive(u2, l, T13 + s_step)
@@ -1200,7 +1218,22 @@ class MoEBlock:
                     w13_1 = etake("e13", u13_1)
                     k13_1 = t1 * TK13
                     acc13[:, :BN] += mm(xb[:, k13_1 : k13_1 + TK13], w13_1[...])
-                    egive(u13_1, l, t1)
+                    if FAST:
+                        self.rings.refill_static(
+                            l,
+                            [
+                                (w_n1, T13 + s_step, T13 + s_step, None),
+                                (w_n2, t0, t0, g_n2),
+                                (w_n2, t1, t1, g_n2),
+                            ],
+                            g_n1,
+                        )
+                        if t0 == 0:
+                            pl.when(g_n2)(
+                                lambda: self.rings._es_start(i + 2, w_n2, l)
+                            )
+                    else:
+                        egive(u13_1, l, t1)
 
                 wcol = jnp.sum(
                     jnp.where(lane_e8 == e, scr["wn"][...], 0.0), axis=1, keepdims=True
