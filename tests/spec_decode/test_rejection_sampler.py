@@ -526,6 +526,45 @@ def test_rejection_sampler_random_all_accepted_uses_bonus(device):
     assert torch.equal(output, expected)
 
 
+def test_rejection_sampler_random_skip_topk_topp_matches_full_path(device):
+    """apply_topk_topp=False is the identity when top_k == 0 and top_p == 1."""
+    sampler = RejectionSampler()
+    torch.manual_seed(0)
+    draft_token_ids = torch.tensor([1, 2, 3, 0], dtype=torch.int32, device=device)
+    num_draft_tokens = torch.tensor([2, 2], dtype=torch.int32, device=device)
+    target_logits = torch.randn((4, 8), device=device) * 3
+    bonus_token_ids = torch.tensor([4, 5], dtype=torch.int32, device=device)
+    segment_ids = torch.tensor([0, 0, 1, 1], dtype=torch.int64, device=device)
+    group_indices = torch.tensor([0, 1, 0, 1], dtype=torch.int64, device=device)
+    temperatures = torch.ones((4, 1), dtype=torch.float32, device=device)
+    top_k = torch.zeros((4, 1), dtype=torch.int32, device=device)
+    top_p = torch.ones((4, 1), dtype=torch.float32, device=device)
+    accept_u = torch.tensor([0.3, 0.6, 0.2, 0.9], dtype=torch.float32, device=device)
+    recover_u = torch.rand_like(target_logits)
+
+    outputs = []
+    for apply_topk_topp in (True, False):
+        outputs.append(
+            sampler(
+                draft_token_ids=draft_token_ids,
+                num_draft_tokens=num_draft_tokens,
+                target_logits=target_logits,
+                bonus_token_ids=bonus_token_ids,
+                segment_ids=segment_ids,
+                group_indices=group_indices,
+                max_draft_tokens=2,
+                temperatures=temperatures,
+                top_k=top_k,
+                top_p=top_p,
+                accept_u=accept_u,
+                recover_u=recover_u,
+                do_sampling=True,
+                apply_topk_topp=apply_topk_topp,
+            )
+        )
+    assert torch.equal(outputs[0], outputs[1])
+
+
 @pytest.mark.parametrize("padding_token_id", [-1, 0])
 def test_rejection_sampler_random_ignores_padded_draft_slots(device, padding_token_id):
     """Ignore static-shape padding beyond the declared draft length."""
