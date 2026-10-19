@@ -13,6 +13,13 @@
 /.buildkite/ @QiliangCui @theminghuang
 /.github/ @QiliangCui @theminghuang
 
+# Release tooling: vllm-torchtpu-release runs main's copy with the Docker Hub
+# token and PyPI publishing rights (.buildkite/release/README.md).
+/.buildkite/release/ @QiliangCui @CienetStingLin @theminghuang @charlesli640
+/.buildkite/scripts/publish_wheel.sh @QiliangCui @CienetStingLin @theminghuang @charlesli640
+/.buildkite/scripts/wheel_utils.py @QiliangCui @CienetStingLin @theminghuang @charlesli640
+/.buildkite/scripts/publish_nightly_images.sh @QiliangCui @CienetStingLin @theminghuang @charlesli640
+
 # Documentation
 /docs/ @bvrockwell @RobMulla @qizzzh @maxwillzq @Nanfang-Li
 /README.md @bvrockwell @RobMulla @qizzzh @Nanfang-Li
