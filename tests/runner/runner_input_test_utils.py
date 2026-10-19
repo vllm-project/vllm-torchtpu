@@ -145,6 +145,9 @@ def _make_runner(
     # Affine checkpoint addressing (no per-checkpoint blocks) in these tests.
     runner._mamba_ckpt_window = 1
     runner._unified_kv_layout = False
+    # No GDN internal prefill checkpoints in these layout tests.
+    runner._prefill_ckpt_units = None
+    runner._prefill_ckpt_zero_offsets = {}
     # Default to layer-major KV cache (None bundle) for PCP integration layout tests.
     runner._kv_cache_bundle = None
     # Bind the real seed-copy collector; an empty copy plan makes it a no-op

@@ -279,7 +279,9 @@ class TestVllmGatedDeltaNetAttention:
         )
         op_args = fake_jax_op.call_args.args
         assert op_args[4] is pool
-        assert op_args[-1] is weight_scale
+        assert op_args[13] is weight_scale
+        # No prefill checkpoint operands were given.
+        assert op_args[14:] == (None, None)
         # Optional bias/scale must not shift the runtime pool donation index.
         assert [arg for arg in op_args if arg is not None][4] is pool
         fake_pool, fake_output, fake_z = fake_jax_op.register_fake.call_args.args[0](
@@ -563,7 +565,8 @@ class TestVllmGatedDeltaNetAttention:
             gdn_impl = attn._build_pooled_gdn_op()
 
         # Mirrors the operand order at the forward's call site, ending with
-        # slot_read_offsets and the per-checkpoint block indices.
+        # slot_read_offsets, the per-checkpoint block indices and the prefill
+        # checkpoint offsets and block ids.
         operands = (
             torch.zeros((2, 64)),  # mixed_qkv
             torch.zeros((2, 64)),  # b
@@ -579,6 +582,8 @@ class TestVllmGatedDeltaNetAttention:
             torch.zeros(2, dtype=torch.int32),  # seq_lens
             torch.zeros(2, dtype=torch.int32),  # slot_read_offsets
             torch.zeros((2, 5), dtype=torch.int32),  # ckpt_indices
+            torch.zeros(2, dtype=torch.int32),  # prefill_ckpt_offsets
+            torch.full((2,), -1, dtype=torch.int32),  # prefill_ckpt_indices
         )
         gdn_impl(*operands)
 
@@ -816,6 +821,8 @@ class TestVllmGatedDeltaNetAttention:
             PartitionSpec(),
             PartitionSpec(),
             PartitionSpec("tp"),
+            PartitionSpec(),
+            PartitionSpec(),
         )
         assert pooled_specs["output_partition_specs"] == (
             PartitionSpec(("tp", "pcp")),
@@ -874,6 +881,7 @@ class TestVllmGatedDeltaNetAttention:
         # speculative decoding is active.
         mock_attn_metadata.mamba_request_distribution = None
         mock_attn_metadata.mamba_slot_read_offsets = None
+        mock_attn_metadata.mamba_prefill_ckpt_offsets = None
         mock_fc.attn_metadata = {"test_layer": mock_attn_metadata}
         mock_get_forward_context.return_value = mock_fc
 
@@ -973,6 +981,7 @@ class TestVllmGatedDeltaNetAttention:
         # speculative decoding is active.
         mock_attn_metadata.mamba_request_distribution = None
         mock_attn_metadata.mamba_slot_read_offsets = None
+        mock_attn_metadata.mamba_prefill_ckpt_offsets = None
         mock_fc.attn_metadata = {"test_layer": mock_attn_metadata}
         mock_get_forward_context.return_value = mock_fc
 
@@ -1057,6 +1066,7 @@ class TestVllmGatedDeltaNetAttention:
         # speculative decoding is active.
         mock_attn_metadata.mamba_request_distribution = None
         mock_attn_metadata.mamba_slot_read_offsets = None
+        mock_attn_metadata.mamba_prefill_ckpt_offsets = None
         mock_fc.attn_metadata = {"test_layer": mock_attn_metadata}
         mock_get_forward_context.return_value = mock_fc
 
@@ -1133,6 +1143,7 @@ class TestVllmGatedDeltaNetAttention:
         # PCP prefill does not consume non-PCP verify rollback offsets.
         mock_attn_metadata.mamba_request_distribution = None
         mock_attn_metadata.mamba_slot_read_offsets = None
+        mock_attn_metadata.mamba_prefill_ckpt_offsets = None
         mock_fc.attn_metadata = {"test_layer": mock_attn_metadata}
         mock_get_forward_context.return_value = mock_fc
 
@@ -1228,6 +1239,7 @@ class TestVllmGatedDeltaNetAttention:
             request_distribution=torch.zeros(3),
             mamba_request_distribution=None,
             mamba_slot_read_offsets=None,
+            mamba_prefill_ckpt_offsets=None,
         )
         mock_get_forward_context.return_value = SimpleNamespace(
             attn_metadata={"test_layer": metadata}
@@ -1307,6 +1319,8 @@ class TestVllmGatedDeltaNetAttention:
         metadata.sequence_layout_protocol = "pcp_streaming"
         metadata.query_start_loc = torch.tensor([0, 4], dtype=torch.int32)
         metadata.request_distribution = torch.zeros(3, dtype=torch.int32)
+        metadata.mamba_prefill_ckpt_offsets = None
+        metadata.mamba_prefill_ckpt_indices = None
         mock_get_forward_context.return_value = SimpleNamespace(
             attn_metadata={"test_layer": metadata}
         )
@@ -1338,7 +1352,8 @@ class TestVllmGatedDeltaNetAttention:
         assert core_args[11] is metadata.query_start_loc
         assert core_args[12] is metadata.request_distribution
         assert core_args[13] is metadata.seq_lens
-        assert len(core_args) == 14
+        assert core_args[14:] == (None, None)
+        assert len(core_args) == 16
         assert torch.equal(attn.norm.call_args.args[0], fused_output)
         assert attn.norm.call_args.args[1] is fused_z
         assert torch.all(output == 5)
@@ -1395,6 +1410,7 @@ class TestVllmGatedDeltaNetAttention:
         # speculative decoding is active.
         mock_attn_metadata.mamba_request_distribution = None
         mock_attn_metadata.mamba_slot_read_offsets = None
+        mock_attn_metadata.mamba_prefill_ckpt_offsets = None
         mock_fc.attn_metadata = {"test_layer": mock_attn_metadata}
         mock_get_forward_context.return_value = mock_fc
 
@@ -1465,6 +1481,7 @@ class TestVllmGatedDeltaNetAttention:
         # speculative decoding is active.
         mock_attn_metadata.mamba_request_distribution = None
         mock_attn_metadata.mamba_slot_read_offsets = None
+        mock_attn_metadata.mamba_prefill_ckpt_offsets = None
         mock_fc.attn_metadata = {"test_layer": mock_attn_metadata}
         mock_get_forward_context.return_value = mock_fc
 
@@ -1537,7 +1554,9 @@ def test_pcp_streaming_is_off_without_a_vllm_config():
 _BM_LAYOUT = BlockMajorPoolLayout(
     num_blocks=4, num_pools=3, split=4, pool_index_by_layer={}
 )
-_BM_POOL_INDEX = 2
+# Pool index 1 maps -1 to -2, so the -1 checkpoint ids below depend on the
+# re-mask after the remap.
+_BM_POOL_INDEX = 1
 
 
 @pytest.mark.parametrize("block_major", [True, False])
@@ -1554,9 +1573,10 @@ def test_fused_pooled_pcp_forward_remaps_state_ids_for_the_block_major_pool(
     captured = {}
 
     def fake_pooled_pcp_op(
-        hidden, _w, _s, _b, _a, _pool, _cw, _cb, _a_log, _dt, state_indices, *_rest
+        hidden, _w, _s, _b, _a, _pool, _cw, _cb, _a_log, _dt, state_indices, *rest
     ):
         captured["state_indices"] = state_indices
+        captured["prefill_ckpt"] = rest[3:]
         out = torch.zeros(hidden.shape[0], 64, 128)
         return out, out
 
@@ -1568,21 +1588,30 @@ def test_fused_pooled_pcp_forward_remaps_state_ids_for_the_block_major_pool(
         gdn_attention_op, "is_pcp_streaming_attention_metadata", lambda _m: True
     )
     state_indices = torch.tensor([0, 1, 3], dtype=torch.int32)
+    ckpt_offsets = torch.tensor([0, 3072, 0], dtype=torch.int32)
+    ckpt_ids = torch.tensor([-1, 2, -1], dtype=torch.int32)
     metadata = SimpleNamespace(
         mamba_state_indices=state_indices,
         query_start_loc=torch.tensor([0, 1, 2, 3], dtype=torch.int32),
         request_distribution=torch.tensor([3, 0, 0], dtype=torch.int32),
         seq_lens=torch.ones(3, dtype=torch.int32),
+        mamba_prefill_ckpt_offsets=ckpt_offsets,
+        mamba_prefill_ckpt_indices=ckpt_ids,
     )
 
     attn._forward_fused_pooled_pcp(torch.zeros(3, 8), torch.zeros(4, 12, 2), metadata)
 
     passed = captured["state_indices"]
+    passed_offsets, passed_ids = captured["prefill_ckpt"]
+    assert passed_offsets is ckpt_offsets
     if block_major:
         expected = flat_manager_ids(state_indices, _BM_POOL_INDEX, 3)
-        assert passed.tolist() == expected.tolist() == [2, 5, 11]
+        assert passed.tolist() == expected.tolist() == [1, 4, 10]
+        # Checkpoint ids take the same remap; "none" stays -1.
+        assert passed_ids.tolist() == [-1, 7, -1]
     else:
         assert passed is state_indices
+        assert passed_ids is ckpt_ids
 
 
 @pytest.mark.parametrize(
@@ -1625,3 +1654,212 @@ def test_pooled_op_block_major_folds_the_pool_and_restores_its_shape(
     assert re.fullmatch(rf"pallas::gdn_attention_pooled{suffix}_\d+", captured["name"])
     assert captured["kernel_pool_shape"] == kernel_pool_shape
     assert tuple(new_pool.shape) == tuple(pool.shape)
+
+
+# --- internal prefill checkpoints ---------------------------------------------
+
+
+def _ckpt_vllm_config(
+    *,
+    pcp_size: int = 8,
+    mamba_cache_mode: str | None = "align",
+    dcp_size: int = 1,
+    architecture: str = "Qwen3_5MoeForCausalLM",
+    prefix_match_unit: int | None = None,
+):
+    config = _vllm_config(pcp_size=pcp_size)
+    config.cache_config.mamba_cache_mode = mamba_cache_mode
+    config.cache_config.prefix_match_unit = prefix_match_unit
+    config.cache_config.mamba_block_size = 384
+    config.parallel_config.decode_context_parallel_size = dcp_size
+    config.model_config = SimpleNamespace(architecture=architecture)
+    return config
+
+
+def _spec_attn():
+    attn = _qwen35_397b_gdn_attn("language_model.model.layers.0.linear_attn")
+    attn.get_state_dtype = lambda: (torch.bfloat16, torch.float32)
+    return attn
+
+
+@pytest.fixture
+def ckpt_env(monkeypatch):
+    monkeypatch.delenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", raising=False)
+    return monkeypatch
+
+
+@pytest.mark.parametrize("pcp_size", [1, 8])
+def test_spec_declares_one_prefill_checkpoint_block_in_align_mode(ckpt_env, pcp_size):
+    spec = _spec_attn().get_kv_cache_spec(_ckpt_vllm_config(pcp_size=pcp_size))
+    plain = _spec_attn().get_kv_cache_spec(
+        _ckpt_vllm_config(pcp_size=pcp_size, mamba_cache_mode="none")
+    )
+
+    assert isinstance(spec, MambaSpec)
+    assert spec.num_prefill_checkpoint_blocks == 1
+    assert spec.prefill_checkpoint_alignment == 1
+    # Only the two checkpoint fields change; the PCP-local state shapes stay.
+    assert spec.shapes == plain.shapes
+    assert spec.page_size_bytes == plain.page_size_bytes
+
+
+@pytest.mark.parametrize(
+    "env, config_kwargs",
+    [
+        ({}, {"mamba_cache_mode": "none"}),
+        ({}, {"mamba_cache_mode": "all"}),
+        ({}, {"dcp_size": 2}),
+        ({"TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL": "0"}, {}),
+        ({}, {"architecture": "LlamaForCausalLM"}),
+        # A hash block finer than the 3072-token logical Mamba block.
+        ({}, {"prefix_match_unit": 1024}),
+    ],
+)
+def test_spec_declares_no_prefill_checkpoint_block_when_gated_off(
+    ckpt_env, env, config_kwargs
+):
+    for name, value in env.items():
+        ckpt_env.setenv(name, value)
+    spec = _spec_attn().get_kv_cache_spec(_ckpt_vllm_config(**config_kwargs))
+
+    assert isinstance(spec, MambaSpec)
+    assert spec.num_prefill_checkpoint_blocks == 0
+    assert spec.prefill_checkpoint_alignment is None
+
+
+def _pooled_forward_attn(kv_cache):
+    attn = VllmGatedDeltaNetAttention.__new__(VllmGatedDeltaNetAttention)
+    attn.num_spec = 0
+    attn.head_v_dim = 16
+    attn.num_v_heads = 4
+    attn.tp_size = 1
+    attn.prefix = "test_layer"
+    attn._pcp_streaming_configured = False
+    attn.conv1d = SimpleNamespace(weight=torch.randn(1), bias=None)
+    attn.A_log = torch.randn(1)
+    attn.dt_bias = torch.randn(1)
+    attn.kv_cache = kv_cache
+    attn.gdn_op = MagicMock(return_value=torch.zeros(2, 4, 16))
+    attn.gdn_pooled_op = MagicMock(return_value=torch.zeros(2, 4, 16))
+    attn.in_proj_qkv = MagicMock(return_value=(torch.randn(2, 96), None))
+    attn.in_proj_z = MagicMock(return_value=(torch.randn(2, 64), None))
+    attn.in_proj_ba = MagicMock(return_value=(torch.randn(2, 32), None))
+    attn._apply_output_projection = lambda out, _z, _num_tokens: out
+    return attn
+
+
+def _pooled_metadata(offsets, ids):
+    return SimpleNamespace(
+        seq_lens=torch.tensor([8191, 1], dtype=torch.int32),
+        block_tables=torch.zeros(8, dtype=torch.int32),
+        mamba_state_indices=torch.tensor([3, 1], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 1, 2], dtype=torch.int32),
+        request_distribution=torch.tensor([0, 0, 2], dtype=torch.int32),
+        mamba_request_distribution=None,
+        mamba_slot_read_offsets=None,
+        mamba_ckpt_indices=None,
+        mamba_prefill_ckpt_offsets=offsets,
+        mamba_prefill_ckpt_indices=ids,
+        sequence_layout_kind=SequenceLayoutKind.ALL.value,
+        sequence_layout_protocol="default",
+    )
+
+
+@pytest.mark.parametrize("block_major", [False, True])
+@patch("vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_forward_context")
+def test_pooled_forward_passes_prefill_checkpoint_operands(
+    mock_get_forward_context, block_major
+):
+    attn = _pooled_forward_attn((torch.zeros(4, 12, 2),))
+    if block_major:
+        attn._bm_kernel = True
+        attn.set_block_major_pool(_BM_POOL_INDEX, _BM_LAYOUT)
+    offsets = torch.tensor([3072, 0], dtype=torch.int32)
+    ids = torch.tensor([2, -1], dtype=torch.int32)
+    metadata = _pooled_metadata(offsets, ids)
+    mock_get_forward_context.return_value = SimpleNamespace(
+        attn_metadata={"test_layer": metadata}
+    )
+
+    attn.forward(torch.randn(2, 64))
+
+    attn.gdn_op.assert_not_called()
+    args = attn.gdn_pooled_op.call_args.args
+    assert len(args) == 16
+    assert args[14] is offsets
+    if block_major:
+        # The same remap as the state ids (block * 3 + 1); -1 stays -1.
+        assert args[8].tolist() == [10, 4]
+        assert args[15].tolist() == [7, -1]
+    else:
+        assert args[15] is ids
+
+
+@patch("vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_forward_context")
+def test_pooled_forward_without_checkpoints_passes_none(mock_get_forward_context):
+    attn = _pooled_forward_attn((torch.zeros(4, 12, 2),))
+    mock_get_forward_context.return_value = SimpleNamespace(
+        attn_metadata={"test_layer": _pooled_metadata(None, None)}
+    )
+
+    attn.forward(torch.randn(2, 64))
+
+    args = attn.gdn_pooled_op.call_args.args
+    assert args[14:] == (None, None)
+
+
+@patch("vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_forward_context")
+def test_split_pool_forward_rejects_prefill_checkpoints(mock_get_forward_context):
+    attn = _pooled_forward_attn((torch.zeros(4, 3, 8), torch.zeros(4, 2, 2, 2)))
+    metadata = _pooled_metadata(
+        torch.tensor([3072, 0], dtype=torch.int32),
+        torch.tensor([2, -1], dtype=torch.int32),
+    )
+    mock_get_forward_context.return_value = SimpleNamespace(
+        attn_metadata={"test_layer": metadata}
+    )
+
+    with pytest.raises(AssertionError, match="unified KV pool"):
+        attn.forward(torch.randn(2, 64))
+    attn.gdn_op.assert_not_called()
+
+
+def test_pooled_op_threads_prefill_checkpoint_operands_to_the_core(
+    cpu_vllm_config_context,
+):
+    attn = _qwen35_397b_gdn_attn("language_model.model.layers.0.linear_attn")
+    captured = {}
+
+    def fake_jax_op(name, wrapped_fn, **_kwargs):
+        captured["wrapped_fn"] = wrapped_fn
+        return MagicMock()
+
+    def fake_core(mixed_qkv, _b, _a, pool, *args, **_kwargs):
+        captured["core_args"] = args
+        return pool, mixed_qkv
+
+    with (
+        set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+        patch(
+            "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.pallas.jax_op",
+            side_effect=fake_jax_op,
+        ),
+        patch(
+            "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
+            "gdn_attention_pooled_core_tpu",
+            side_effect=fake_core,
+        ),
+    ):
+        attn._build_pooled_gdn_op()
+        offsets, ids = MagicMock(), MagicMock()
+        captured["wrapped_fn"](
+            *([MagicMock()] * 3),
+            torch.zeros(4, 12, 2, 3),
+            *([MagicMock()] * 10),
+            offsets,
+            ids,
+        )
+
+    # conv_weight .. ckpt_indices, then the two checkpoint operands.
+    assert captured["core_args"][-2] is offsets
+    assert captured["core_args"][-1] is ids

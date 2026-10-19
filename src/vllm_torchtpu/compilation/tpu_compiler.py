@@ -233,7 +233,8 @@ _TPU_COMPILE_ENV_IGNORED = {
     "VLLM_TPU_DEBUG_PCP_LAYOUT",
     "VLLM_TPU_OFFLOAD_SAVE_RETRIES",
     "VLLM_TPU_OFFLOAD_WAIT_TIMEOUT_S",
-    # Scheduler prefix-cache hit length only.
+    # Affects only scheduler prefix-cache hit length and runtime GDN checkpoint
+    # offsets.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP",
     "TORCH_TPU_TIER3_COMPILATION_CACHE_ROOT",
     # Only changes LIBTPU_INIT_ARGS, which is hashed on its own.

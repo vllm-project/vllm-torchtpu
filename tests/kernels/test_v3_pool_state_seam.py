@@ -18,6 +18,7 @@ The remaining classes execute Pallas kernels and run on TPU (same gating
 as test_pool_adapters.py).
 """
 
+import dataclasses
 import pathlib
 
 import jax
@@ -593,6 +594,283 @@ class TestPooledSpecWindows:
                 rtol=2e-2,
                 atol=2e-2,
                 err_msg=f"step {step_num}",
+            )
+
+
+def _mgr_bytes(pool, mgr):
+    """Raw bytes of manager block `mgr` (all of its kernel blocks)."""
+    return np.asarray(pool[mgr * SPLIT : (mgr + 1) * SPLIT].view(jnp.int16))
+
+
+def _rows(inputs, start, end):
+    """`inputs` restricted to batch rows [start, end)."""
+    return inputs | {k: inputs[k][start:end] for k in ("qkv", "b", "a")}
+
+
+@pytest.mark.tpu_test
+class TestPooledPrefillCheckpoint:
+    """Verifies that internal prefill checkpoints match a standalone prefix prefill."""
+
+    NUM_MGR = 12
+
+    @staticmethod
+    def _run(
+        pool,
+        plan,
+        inputs,
+        qsl,
+        seq_lens,
+        state_indices,
+        distribution,
+        ckpt=None,
+        **kernel_kwargs,
+    ):
+        extra = dict(kernel_kwargs)
+        if ckpt is not None:
+            extra |= dict(
+                prefill_ckpt_offsets=jnp.asarray(ckpt[0], dtype=jnp.int32),
+                prefill_ckpt_indices=jnp.asarray(ckpt[1], dtype=jnp.int32),
+            )
+        return wrapper.fused_conv1d_gdn(
+            conv_state=None,
+            recurrent_state=None,
+            state_source=jnp.copy(pool),
+            state_plan=plan,
+            query_start_loc=jnp.asarray(qsl, dtype=jnp.int32),
+            seq_lens=jnp.asarray(seq_lens, dtype=jnp.int32),
+            state_indices=jnp.asarray(state_indices, dtype=jnp.int32),
+            distribution=jnp.asarray(distribution, dtype=jnp.int32),
+            **inputs,
+            **extra,
+        )
+
+    def _fresh_prefix(
+        self, pool, plan, inputs, start, num_tokens, block, **kernel_kwargs
+    ):
+        """A fresh prefill of rows [start, start + num_tokens) into `block`."""
+        return self._run(
+            pool,
+            plan,
+            _rows(inputs, start, start + num_tokens),
+            qsl=[0, num_tokens],
+            seq_lens=[num_tokens],
+            state_indices=[block],
+            distribution=[0, 1, 1],
+            **kernel_kwargs,
+        )
+
+    @pytest.mark.parametrize("whole_block_dma", [False, True], ids=["rows", "whole"])
+    def test_checkpoint_matches_two_call_split(self, whole_block_dma):
+        length, offset, state_block, ckpt_block = 192, 128, 2, 5
+        pool = _garbage_pool(50, self.NUM_MGR)
+        plan = dataclasses.replace(_plan(pool), whole_block_dma=whole_block_dma)
+        inputs = _rand_inputs(51, length)
+        one_shot = dict(
+            qsl=[0, length],
+            seq_lens=[length],
+            state_indices=[state_block],
+            distribution=[0, 1, 1],
+        )
+
+        pool_ckpt, out_ckpt = self._run(
+            pool, plan, inputs, **one_shot, ckpt=([offset], [ckpt_block])
+        )
+        pool_plain, out_plain = self._run(pool, plan, inputs, **one_shot)
+        pool_split, _ = self._fresh_prefix(pool, plan, inputs, 0, offset, ckpt_block)
+
+        ckpt_idx = jnp.array([ckpt_block], dtype=jnp.int32)
+        ssm_ckpt, conv_ckpt = _read_states(pool_ckpt, ckpt_idx)
+        ssm_split, conv_split = _read_states(pool_split, ckpt_idx)
+        np.testing.assert_array_equal(
+            np.asarray(conv_ckpt, dtype=np.float32),
+            np.asarray(conv_split, dtype=np.float32),
+        )
+        np.testing.assert_array_equal(np.asarray(ssm_ckpt), np.asarray(ssm_split))
+        np.testing.assert_array_equal(
+            _mgr_bytes(pool_ckpt, ckpt_block), _mgr_bytes(pool_split, ckpt_block)
+        )
+
+        # The export leaves the computation alone: outputs and every other
+        # block match the run without a checkpoint.
+        np.testing.assert_array_equal(np.asarray(out_ckpt), np.asarray(out_plain))
+        for mgr in range(self.NUM_MGR):
+            if mgr != ckpt_block:
+                np.testing.assert_array_equal(
+                    _mgr_bytes(pool_ckpt, mgr),
+                    _mgr_bytes(pool_plain, mgr),
+                    f"block {mgr}",
+                )
+
+    @pytest.mark.parametrize(
+        "mixed_tile_size, length, offset",
+        [
+            # The largest dynamic tile: the checkpoint row is mid-tile on
+            # the 128-row grid of the request. Each offset is above the tile
+            # size, so the reference prefill runs the same tile size.
+            (128, 320, 192),
+            (128, 384, 320),
+            # Offsets off the grid of the default and of a smaller tile.
+            (64, 192, 100),
+            (32, 160, 40),
+        ],
+    )
+    def test_checkpoint_off_the_tile_grid_matches_two_call_split(
+        self, mixed_tile_size, length, offset
+    ):
+        """Off-grid checkpoint offsets split the tile schedule at the checkpoint
+        row, matching a standalone prefix prefill byte for byte while keeping
+        full-sequence outputs within numerical tolerance."""
+        state_block, ckpt_block = 2, 5
+        pool = _garbage_pool(57, self.NUM_MGR)
+        plan = _plan(pool)
+        inputs = _rand_inputs(58, length)
+        one_shot = dict(
+            qsl=[0, length],
+            seq_lens=[length],
+            state_indices=[state_block],
+            distribution=[0, 1, 1],
+            mixed_tile_size=mixed_tile_size,
+        )
+
+        pool_ckpt, out_ckpt = self._run(
+            pool, plan, inputs, **one_shot, ckpt=([offset], [ckpt_block])
+        )
+        pool_plain, out_plain = self._run(pool, plan, inputs, **one_shot)
+        pool_split, _ = self._fresh_prefix(
+            pool,
+            plan,
+            inputs,
+            0,
+            offset,
+            ckpt_block,
+            mixed_tile_size=mixed_tile_size,
+        )
+
+        np.testing.assert_array_equal(
+            _mgr_bytes(pool_ckpt, ckpt_block), _mgr_bytes(pool_split, ckpt_block)
+        )
+        # The checkpoint is not the final state, so the comparison above
+        # cannot pass by reading the wrong block.
+        ckpt_ssm, _ = _read_states(pool_ckpt, jnp.array([ckpt_block]))
+        final_ssm, final_conv = _read_states(pool_ckpt, jnp.array([state_block]))
+        assert not np.allclose(np.asarray(ckpt_ssm), np.asarray(final_ssm), atol=1e-2)
+
+        tol = dict(rtol=1e-2, atol=1e-2)
+        np.testing.assert_allclose(np.asarray(out_ckpt), np.asarray(out_plain), **tol)
+        plain_ssm, plain_conv = _read_states(pool_plain, jnp.array([state_block]))
+        np.testing.assert_allclose(np.asarray(final_ssm), np.asarray(plain_ssm), **tol)
+        np.testing.assert_allclose(
+            np.asarray(final_conv, dtype=np.float32),
+            np.asarray(plain_conv, dtype=np.float32),
+            rtol=2e-2,
+            atol=2e-2,
+        )
+        for mgr in range(self.NUM_MGR):
+            if mgr not in (state_block, ckpt_block):
+                np.testing.assert_array_equal(
+                    _mgr_bytes(pool_ckpt, mgr),
+                    _mgr_bytes(pool_plain, mgr),
+                    f"block {mgr}",
+                )
+
+    def test_resume_from_checkpoint_continues_the_sequence(self):
+        """A prefix-cache hit on the checkpoint resumes like a real split."""
+        length, offset, state_block, ckpt_block, split_block = 256, 192, 3, 7, 9
+        pool = _garbage_pool(52, self.NUM_MGR)
+        plan = _plan(pool)
+        inputs = _rand_inputs(53, length)
+        tail = dict(
+            qsl=[0, length - offset],
+            seq_lens=[length],
+            distribution=[0, 1, 1],
+        )
+
+        pool_ckpt, _ = self._run(
+            pool,
+            plan,
+            inputs,
+            qsl=[0, length],
+            seq_lens=[length],
+            state_indices=[state_block],
+            distribution=[0, 1, 1],
+            ckpt=([offset], [ckpt_block]),
+        )
+        _, out_resumed = self._run(
+            pool_ckpt,
+            plan,
+            _rows(inputs, offset, length),
+            state_indices=[ckpt_block],
+            **tail,
+        )
+
+        pool_split, _ = self._fresh_prefix(pool, plan, inputs, 0, offset, split_block)
+        _, out_split = self._run(
+            pool_split,
+            plan,
+            _rows(inputs, offset, length),
+            state_indices=[split_block],
+            **tail,
+        )
+        np.testing.assert_array_equal(np.asarray(out_resumed), np.asarray(out_split))
+
+    def test_mixed_batch_writes_only_requested_blocks(self):
+        """Verifies checkpoint export in a mixed batch where a continuation's
+        pipelined state copy-in overlaps the previous row's final-state copy-out."""
+        query_lens = [1, 1, 192, 128, 256, 64, 0]
+        seq_lens = [9, 9, 192, 200, 256, 300, 0]
+        state_indices = [1, 2, 3, 4, 5, 10, 0]
+        # Row 3 names a block with offset 0 and the padded row 6 carries a
+        # stale request: neither may write.
+        offsets = [0, 0, 64, 0, 192, 0, 64]
+        indices = [-1, -1, 6, 7, 8, -1, 9]
+        distribution = [2, 6, 6]
+        qsl = np.concatenate([[0], np.cumsum(query_lens)]).tolist()
+
+        resumed = jnp.array([1, 2, 4, 10], dtype=jnp.int32)
+        keys = iter(jax.random.split(jax.random.key(54), 2))
+        pool = _write_states(
+            _garbage_pool(55, self.NUM_MGR),
+            jax.random.normal(next(keys), (4, N_V, D_K, D_V)),
+            jax.random.normal(next(keys), (4, KERNEL_SIZE - 1, DIM)).astype(
+                jnp.bfloat16
+            ),
+            resumed,
+        )
+        plan = _plan(pool)
+        inputs = _rand_inputs(56, qsl[-1])
+        batch = dict(
+            qsl=qsl,
+            seq_lens=seq_lens,
+            state_indices=state_indices,
+            distribution=distribution,
+        )
+
+        pool_ckpt, out_ckpt = self._run(
+            pool, plan, inputs, **batch, ckpt=(offsets, indices)
+        )
+        pool_plain, out_plain = self._run(pool, plan, inputs, **batch)
+
+        np.testing.assert_array_equal(np.asarray(out_ckpt), np.asarray(out_plain))
+        for mgr in range(self.NUM_MGR):
+            if mgr not in (6, 8):
+                np.testing.assert_array_equal(
+                    _mgr_bytes(pool_ckpt, mgr),
+                    _mgr_bytes(pool_plain, mgr),
+                    f"block {mgr}",
+                )
+        for mgr in (0, 7, 9, 11):
+            np.testing.assert_array_equal(
+                _mgr_bytes(pool_ckpt, mgr), _mgr_bytes(pool, mgr), f"block {mgr}"
+            )
+
+        for row, ckpt_block in ((2, 6), (4, 8)):
+            pool_split, _ = self._fresh_prefix(
+                pool, plan, inputs, qsl[row], offsets[row], ckpt_block
+            )
+            np.testing.assert_array_equal(
+                _mgr_bytes(pool_ckpt, ckpt_block),
+                _mgr_bytes(pool_split, ckpt_block),
+                f"row {row}",
             )
 
 

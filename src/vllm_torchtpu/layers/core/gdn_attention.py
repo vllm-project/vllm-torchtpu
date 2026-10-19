@@ -860,6 +860,8 @@ def run_jax_gdn_attention_pooled_local(
     seq_lens: jnp.ndarray,
     read_offsets: jnp.ndarray | None = None,
     ckpt_indices: jnp.ndarray | None = None,
+    prefill_ckpt_offsets: jnp.ndarray | None = None,
+    prefill_ckpt_indices: jnp.ndarray | None = None,
     *,
     n_kq: int,
     n_v: int,
@@ -921,6 +923,8 @@ def run_jax_gdn_attention_pooled_local(
         state_source=recurrent_state,
         state_plan=plan,
         num_spec_tokens=num_spec_tokens,
+        prefill_ckpt_offsets=prefill_ckpt_offsets,
+        prefill_ckpt_indices=prefill_ckpt_indices,
     )
     return recurrent_state, output
 
@@ -950,6 +954,8 @@ def run_jax_gdn_attention_pooled(
     mesh: jax.sharding.Mesh,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
+    prefill_ckpt_offsets: jnp.ndarray | None = None,
+    prefill_ckpt_indices: jnp.ndarray | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
 
@@ -982,6 +988,10 @@ def run_jax_gdn_attention_pooled(
         d_v: Dimension of value.
         kernel_size: Convolution kernel size.
         mesh: The device mesh for distributed computation.
+        prefill_ckpt_offsets: Optional (max_reqs,) int32 internal prefill
+          checkpoint query offsets (0 for none).
+        prefill_ckpt_indices: Optional (max_reqs,) int32 destination block IDs
+          for prefill checkpoints (-1 for none).
 
     Returns:
         A tuple containing:
@@ -1003,18 +1013,40 @@ def run_jax_gdn_attention_pooled(
         P(None),  # distribution
         P(None),  # seq_lens
     )
+    # Optional per-sequence operands follow seq_lens positionally, replicated
+    # like the other per-sequence inputs.
+    extra_args: tuple = ()
     if slot_read_offsets is not None:
-        # Per-sequence read offsets (see below), replicated like the other
-        # per-sequence inputs.
+        # `slot_read_offsets` is the per-slot offset buffer indexed by manager
+        # block id: `slot_read_offsets[block]` holds `num_accepted - 1` for
+        # the request whose state block is `block`. Index it by
+        # `state_indices` (each sequence's state block) to get the
+        # per-sequence read offsets the kernel expects (shape (num_seqs,));
+        # it then reads each request's initial state from checkpoint
+        # `read_offsets[s]` of block `state_indices[s]`. Both operands are
+        # replicated, so gather here, outside the shard_map (mirrors
+        # run_jax_gdn_attention).
+        extra_args = extra_args + (slot_read_offsets[state_indices],)
         in_specs = in_specs + (P(None),)
     if ckpt_indices is not None:
-        # `(num_seqs, num_spec_tokens + 1)` block id per checkpoint,
-        # replicated like the other per-sequence inputs.
+        # `(num_seqs, num_spec_tokens + 1)` block id per checkpoint. Already
+        # per-sequence (row s names sequence s's checkpoint blocks), so it
+        # needs no gather by state_indices.
         assert slot_read_offsets is not None, (
             "ckpt_indices selects a checkpoint per sequence, which needs "
             "slot_read_offsets to say which one"
         )
+        extra_args = extra_args + (ckpt_indices,)
         in_specs = in_specs + (P(None, None),)
+    if prefill_ckpt_offsets is not None:
+        assert prefill_ckpt_indices is not None
+        # Pad absent spec-decode operands with None to preserve positional order
+        # in run_jax_gdn_attention_pooled_local.
+        while len(extra_args) < 2:
+            extra_args = extra_args + (None,)
+            in_specs = in_specs + (None,)
+        extra_args = extra_args + (prefill_ckpt_offsets, prefill_ckpt_indices)
+        in_specs = in_specs + (P(None), P(None))
 
     out_specs = (
         pool_spec,  # new_recurrent_state (attention-shaped pool)
@@ -1042,22 +1074,6 @@ def run_jax_gdn_attention_pooled(
         check_vma=False,
     )
 
-    # `slot_read_offsets` is the per-slot offset buffer indexed by manager
-    # block id: `slot_read_offsets[block]` holds `num_accepted - 1` for the
-    # request whose state block is `block`. Index it by `state_indices`
-    # (each sequence's state block) to get the per-sequence read offsets
-    # the kernel expects (shape (num_seqs,)); it then reads each request's
-    # initial state from checkpoint `read_offsets[s]` of block
-    # `state_indices[s]`. Both operands are replicated, so gather here,
-    # outside the shard_map (mirrors run_jax_gdn_attention).
-    if slot_read_offsets is not None:
-        extra_args = (slot_read_offsets[state_indices],)
-    else:
-        extra_args = ()
-    if ckpt_indices is not None:
-        # Already per-sequence (row s names sequence s's checkpoint blocks),
-        # so it needs no gather by state_indices.
-        extra_args = extra_args + (ckpt_indices,)
     outputs = mapped_fn(
         j_mixed_qkv,
         j_b,
@@ -1102,8 +1118,16 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
     interleave_size: int,
     mesh: jax.sharding.Mesh,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
+    prefill_ckpt_offsets: jnp.ndarray | None = None,
+    prefill_ckpt_indices: jnp.ndarray | None = None,
 ) -> tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
-    """Fused QKVZ projection, PCP exchange, and GDN over the unified pool."""
+    """Fused QKVZ projection, PCP exchange, and GDN over the unified pool.
+
+    prefill_ckpt_offsets (global logical query tokens) and prefill_ckpt_indices
+    come together or not at all; every PCP rank writes its head shard of the
+    checkpoint into its own pool.
+    """
+    assert (prefill_ckpt_offsets is None) == (prefill_ckpt_indices is None)
     pcp_axis = "pcp"
     if pcp_axis not in mesh.axis_names:
         raise NotImplementedError("GDN pooled PCP prefill requires a pcp mesh axis.")
@@ -1122,6 +1146,7 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
     replicated_spec = P()
     tp_parameter_spec = P(tp_axis) if tp_axis is not None else replicated_spec
     pool_spec = P(pcp_tp_state_axis)
+    prefill_ckpt_spec = replicated_spec if prefill_ckpt_offsets is not None else None
     in_specs = (
         token_spec,  # hidden states
         tp_parameter_spec,  # QKVZ weight
@@ -1137,6 +1162,8 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
         replicated_spec,  # state_indices
         replicated_spec,  # distribution
         replicated_spec,  # seq_lens
+        prefill_ckpt_spec,  # prefill checkpoint offsets
+        prefill_ckpt_spec,  # prefill checkpoint block ids
     )
     output_spec = P(pcp_axis, tp_axis, None)
     out_specs = (pool_spec, output_spec, output_spec)
@@ -1156,6 +1183,8 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
         state_indices_,
         distribution_,
         seq_lens_,
+        prefill_ckpt_offsets_,
+        prefill_ckpt_indices_,
     ):
         # BA is small enough to exchange outside the fused kernel. Restore it
         # to request-major order before the GDN schedule consumes it.
@@ -1257,6 +1286,8 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
             mesh_axis_names=tuple(mesh.axis_names),
             pcp_axis_name=pcp_axis,
             state_plan=state_plan,
+            prefill_ckpt_offsets=prefill_ckpt_offsets_,
+            prefill_ckpt_indices=prefill_ckpt_indices_,
         )
 
     mapped_fn = jax.shard_map(
@@ -1281,6 +1312,8 @@ def run_jax_gdn_attention_pooled_pcp_prefill_projection(
         state_indices,
         distribution,
         seq_lens,
+        prefill_ckpt_offsets,
+        prefill_ckpt_indices,
     )
 
 

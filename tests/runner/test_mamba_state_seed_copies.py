@@ -36,6 +36,7 @@ import pytest
 import torch
 
 import vllm_torchtpu.runner.tpu_runner as runner_mod
+from vllm_torchtpu.gdn_pool_layout import PrefillCheckpointUnits
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
 BLOCK_SIZE = 256
@@ -946,3 +947,111 @@ def test_async_state_seed_keeps_actual_crossing_when_all_drafts_accepted():
     _collect(fake, _sched({"a": 4}))
     assert fake._mamba_state_pos["a"] == 1
     assert _real_pairs(fake._pending_mamba_state_copies[0]) == [(8, 6)]
+
+
+# --- internal prefill checkpoints -------------------------------------------
+#
+# A step that ends at seq_len has its prefill checkpoint block at column
+# cdiv(seq_len, B) - 2, one before the state column. It lies strictly between
+# the seed source (the previous state column) and destination (the new one),
+# so no seed copy reads or writes it in the step that exports it. The tables
+# below are the worker's append-only rows that the pinned MambaManager
+# produces (and the relocated ones with vLLM #59759, which moves a spec block
+# into the checkpoint column), scaled from B = 3072 to B = BLOCK_SIZE.
+
+_B = BLOCK_SIZE
+
+
+def _ckpt_units(drop_eagle_block):
+    return PrefillCheckpointUnits(
+        hash_block_size=_B,
+        mamba_block_size=_B,
+        alignment=64,
+        drop_eagle_block=drop_eagle_block,
+    )
+
+
+def _ckpt_block(units, row, computed, scheduled):
+    """The block the step's prefill checkpoint is exported into, or None."""
+    offsets = np.zeros(1, dtype=np.int32)
+    units.fill_offsets(offsets, np.array([computed + scheduled]), np.array([scheduled]))
+    if offsets[0] == 0:
+        return None
+    return row[(computed + scheduled - 1) // _B - 1]
+
+
+# (steps, drop_eagle_block): each step is (computed, scheduled, worker row
+# after the step's allocation, expected seed pairs, expect a checkpoint).
+_CKPT_LAYOUTS = {
+    # 8191 tokens in one chunk with MTP: [null, ckpt, state, spec]; the next
+    # verify step crosses from the state into the spec column.
+    "one_chunk_mtp": (
+        [
+            (0, 2 * _B + 255, [0, 4, 5, 6], [], True),
+            (2 * _B + 255, 2, [0, 4, 5, 6], [(5, 6)], False),
+        ],
+        True,
+    ),
+    # 22000 tokens as [15360, 22000] with MTP, with #59759: chunk 2 relocates
+    # chunk 1's spec block 8 into its checkpoint column 6.
+    "two_chunks_mtp_relocated": (
+        [
+            (0, 5 * _B, [0, 0, 0, 6, 7, 8], [], True),
+            (5 * _B, 2 * _B + 41, [0, 0, 0, 6, 7, 8, 8, 11, 12], [(7, 11)], True),
+        ],
+        True,
+    ),
+    # The same prompt on the pinned manager (no relocation).
+    "two_chunks_mtp_pinned": (
+        [
+            (0, 5 * _B, [0, 0, 0, 6, 7, 8], [], True),
+            (5 * _B, 2 * _B + 41, [0, 0, 0, 6, 7, 8, 11, 12, 13], [(7, 12)], True),
+        ],
+        True,
+    ),
+    # 19456 tokens as [15360, 19456] without MTP: checkpoint at column 5.
+    "two_chunks_no_mtp": (
+        [
+            (0, 5 * _B, [0, 0, 0, 6, 7], [], True),
+            (5 * _B, _B + 85, [0, 0, 0, 6, 7, 9, 10], [(7, 10)], True),
+        ],
+        False,
+    ),
+}
+
+
+@pytest.mark.parametrize("window", [1, 2])
+@pytest.mark.parametrize("layout", sorted(_CKPT_LAYOUTS))
+def test_prefill_checkpoint_block_is_never_a_seed_copy_operand(layout, window):
+    steps, drop_eagle_block = _CKPT_LAYOUTS[layout]
+    units = _ckpt_units(drop_eagle_block)
+    fake, _ = _make_self(
+        ["a"],
+        [0],
+        [[[0]]],
+        num_cols=12,
+        ckpt_window=window,
+        # Prefill steps leave every read offset at 0.
+        read_offsets=(
+            torch.zeros(NUM_BLOCKS, dtype=torch.int32) if window > 1 else None
+        ),
+    )
+    table = fake.input_batch.block_table[1].get_cpu_tensor()
+    for computed, scheduled, row, expected_pairs, expect_ckpt in steps:
+        fake.input_batch.num_computed_tokens_cpu[0] = computed
+        table[0, : len(row)] = torch.tensor(row, dtype=torch.int32)
+        fake._pending_mamba_state_copies = []
+
+        _collect(fake, _sched({"a": scheduled}))
+
+        pairs = [
+            pair
+            for staged in fake._pending_mamba_state_copies
+            for pair in _real_pairs(staged)
+        ]
+        assert pairs == expected_pairs
+        ckpt = _ckpt_block(units, row, computed, scheduled)
+        assert (ckpt is not None) == expect_ckpt
+        if ckpt is not None:
+            assert ckpt != 0
+            assert all(ckpt not in pair for pair in pairs)

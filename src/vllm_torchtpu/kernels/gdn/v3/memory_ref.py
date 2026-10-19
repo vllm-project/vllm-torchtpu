@@ -90,6 +90,11 @@ class MetadataRef:
     # speculative decoding, where the only checkpoint is the slot's own
     # state block (`s_idx_to_state_indices`).
     s_idx_to_ckpt_indices: Any = None
+    # Internal prefill checkpoint (PER_SEQ with external state source only).
+    # Exports the carry state after batch row s_idx_to_prefill_ckpt_row[s] - 1
+    # (-1 if none) into pool block s_idx_to_prefill_ckpt_index[s].
+    s_idx_to_prefill_ckpt_row: Any = None
+    s_idx_to_prefill_ckpt_index: Any = None
 
     @classmethod
     def create(
@@ -105,6 +110,8 @@ class MetadataRef:
         s_idx_to_state_indices: jax.Array,
         s_idx_to_read_offset: jax.Array,
         s_idx_to_ckpt_indices: jax.Array | None = None,
+        s_idx_to_prefill_ckpt_row: jax.Array | None = None,
+        s_idx_to_prefill_ckpt_index: jax.Array | None = None,
     ):
         # NOTE: First dim does not matter when it comes to calculating stride.
         shape = (1, cfgs.seq_tile_size)
@@ -119,10 +126,43 @@ class MetadataRef:
             s_idx_to_state_indices=s_idx_to_state_indices,
             s_idx_to_read_offset=s_idx_to_read_offset,
             s_idx_to_ckpt_indices=s_idx_to_ckpt_indices,
+            s_idx_to_prefill_ckpt_row=s_idx_to_prefill_ckpt_row,
+            s_idx_to_prefill_ckpt_index=s_idx_to_prefill_ckpt_index,
         )
+
+    def is_prefill_ckpt_tile(self, p_id, idx) -> jax.Array:
+        """Returns whether tile (p_id, idx) ends at its prefill checkpoint row.
+
+        The -1 sentinel never matches: tile_end >= 0.
+        """
+        assert self.s_idx_to_prefill_ckpt_row is not None
+        s_idx = self.p_id_to_s_idx[p_id, idx]
+        tile_end = self.p_id_to_r_base[p_id, idx] + self.p_id_to_r_size[p_id, idx]
+        return tile_end == self.s_idx_to_prefill_ckpt_row[s_idx]
 
     def __len__(self) -> int:
         return len(jax.tree_util.tree_leaves(self))
+
+
+def external_region_slice(
+    src_ref: jax.Ref,
+    region: config.StateRegion,
+    *,
+    stride: int,
+    whole_block_dma: bool,
+    state_idx,
+    nblocks,
+) -> jax.Ref:
+    """Returns the external pool slice for a single state block's region.
+
+    Each state_idx spans stride consecutive source blocks; the slice covers
+    nblocks starting at offset region.kb0, and selects rows
+    [row0, row0 + nrows) unless whole_block_dma is enabled.
+    """
+    base = state_idx * stride + region.kb0
+    if whole_block_dma or (region.row0 == 0 and region.nrows == src_ref.shape[1]):
+        return src_ref.at[pl.ds(base, nblocks)]
+    return src_ref.at[pl.ds(base, nblocks), pl.ds(region.row0, region.nrows)]
 
 
 @dataclasses.dataclass(frozen=True, kw_only=True)
@@ -399,14 +439,14 @@ class ExternalStateInBufferedRef(StateInBufferedRef):
 
     def _region_slice(self, src_ref: jax.Ref, state_idx, nblocks):
         assert self.cfg.state_plan is not None
-        base = state_idx * self.stride + self.region.kb0
-        if self.cfg.state_plan.whole_block_dma or (
-            self.region.row0 == 0 and self.region.nrows == src_ref.shape[1]
-        ):
-            return src_ref.at[pl.ds(base, nblocks)]
-        return src_ref.at[
-            pl.ds(base, nblocks), pl.ds(self.region.row0, self.region.nrows)
-        ]
+        return external_region_slice(
+            src_ref,
+            self.region,
+            stride=self.stride,
+            whole_block_dma=self.cfg.state_plan.whole_block_dma,
+            state_idx=state_idx,
+            nblocks=nblocks,
+        )
 
     def copy_in(self, src_ref: jax.Ref, grid_indices: tuple[int | jax.Array]):
         assert self.sem_recvs is not None
@@ -504,14 +544,14 @@ class ExternalStateOutBufferedRef(StateOutBufferedRef):
 
     def _region_slice(self, src_ref: jax.Ref, state_idx, nblocks):
         assert self.cfg.state_plan is not None
-        base = state_idx * self.stride + self.region.kb0
-        if self.cfg.state_plan.whole_block_dma or (
-            self.region.row0 == 0 and self.region.nrows == src_ref.shape[1]
-        ):
-            return src_ref.at[pl.ds(base, nblocks)]
-        return src_ref.at[
-            pl.ds(base, nblocks), pl.ds(self.region.row0, self.region.nrows)
-        ]
+        return external_region_slice(
+            src_ref,
+            self.region,
+            stride=self.stride,
+            whole_block_dma=self.cfg.state_plan.whole_block_dma,
+            state_idx=state_idx,
+            nblocks=nblocks,
+        )
 
     def _unit(self) -> int:
         return self.region.nblocks

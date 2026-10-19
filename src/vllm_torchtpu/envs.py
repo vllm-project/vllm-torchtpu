@@ -1037,8 +1037,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # How many times an offload save whose transfer failed is retried.
     "VLLM_TPU_OFFLOAD_SAVE_RETRIES": env_int("VLLM_TPU_OFFLOAD_SAVE_RETRIES", 1),
-    # Scheduler: keep the trailing prefix-cache block that EAGLE/MTP normally
-    # drops (controls vLLM's disable_eagle_block_drop). Host-only.
+    # Keep the trailing prefix-cache block that EAGLE/MTP normally drops
+    # (sets SpeculativeConfig.disable_eagle_block_drop). Host-only.
     "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP": env_bool(
         "VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", default=False
     ),

@@ -344,3 +344,132 @@ class TestProductionShapeDenseVsUnifiedPool:
             f"{MAX_POOLED_OVER_DENSE}); the pooled state seam may be decoding "
             "the source layout once per tile again"
         )
+
+
+# Internal prefill checkpoint at the same geometry: a fresh 4096-token prefill
+# that checkpoints after 3072 tokens (the logical Mamba block under PP4xPCP8)
+# into a second manager block.
+CKPT_OFFSET = 3072
+CKPT_STATE_BLOCK = 1
+CKPT_BLOCK = 2
+CKPT_NUM_MGR = 3  # null slot, the request's state block, its checkpoint block
+CKPT_POOL_SHAPE = (
+    (CKPT_NUM_MGR * BENCH_SPLIT, BENCH_KBS) + BENCH_PAYLOAD + (BENCH_LANES,)
+)
+
+
+def _checkpoint_plan():
+    return pool_adapters.v3_state_source(
+        jax.ShapeDtypeStruct(CKPT_POOL_SHAPE, jnp.int8),
+        split=BENCH_SPLIT,
+        ssm_ntok=BENCH_SSM_NTOK,
+        conv_tok0=BENCH_CONV_TOK0,
+        conv_ntok=BENCH_CONV_NTOK,
+        conv_dim=BENCH_DIM,
+        n_v=BENCH_N_V,
+        d_k=BENCH_D_K,
+        d_v=BENCH_D_V,
+        kernel_size=BENCH_KERNEL_SIZE,
+    )
+
+
+def _fresh_prefill(pool, qkv, b, a, weights, *, state_block, ckpt):
+    num_tokens = qkv.shape[0]
+    extra = {}
+    if ckpt:
+        extra = dict(
+            prefill_ckpt_offsets=jnp.array([CKPT_OFFSET], dtype=jnp.int32),
+            prefill_ckpt_indices=jnp.array([CKPT_BLOCK], dtype=jnp.int32),
+        )
+    args = _benchmark_common_args(qkv, b, a, *weights) | dict(
+        query_start_loc=jnp.array([0, num_tokens], dtype=jnp.int32),
+        state_indices=jnp.array([state_block], dtype=jnp.int32),
+        seq_lens=jnp.array([num_tokens], dtype=jnp.int32),
+    )
+    return wrapper.fused_conv1d_gdn(
+        conv_state=None,
+        recurrent_state=None,
+        state_source=pool,
+        state_plan=_checkpoint_plan(),
+        **args,
+        **extra,
+    )
+
+
+@functools.partial(jax.jit, donate_argnums=(0,), static_argnames=("ckpt",))
+def _checkpoint_prefill_five(pool, qkv, b, a, *weights, ckpt):
+    def step(state_pool, _):
+        return _fresh_prefill(
+            state_pool, qkv, b, a, weights, state_block=CKPT_STATE_BLOCK, ckpt=ckpt
+        )
+
+    return jax.lax.scan(step, pool, xs=None, length=BENCH_ITERATIONS)
+
+
+@functools.partial(jax.jit, donate_argnums=(0,))
+def _first_chunk(pool, qkv, b, a, *weights):
+    return _fresh_prefill(
+        pool,
+        qkv[:CKPT_OFFSET],
+        b[:CKPT_OFFSET],
+        a[:CKPT_OFFSET],
+        weights,
+        state_block=CKPT_BLOCK,
+        ckpt=False,
+    )
+
+
+def _manager_block(pool, mgr):
+    return np.asarray(pool[mgr * BENCH_SPLIT : (mgr + 1) * BENCH_SPLIT])
+
+
+class TestProductionShapePrefillCheckpoint:
+    """Checkpoint contents at production geometry.
+
+    The checkpoint block must hold the bytes a real 3072-token first chunk
+    writes as its final state, and the outputs and every other block must
+    match the same prefill without a checkpoint.
+    """
+
+    def test_checkpoint_matches_first_chunk(self):
+        keys = iter(jax.random.split(jax.random.key(20261015), 7))
+
+        def normal(shape, scale):
+            value = jax.random.normal(next(keys), shape, dtype=jnp.bfloat16)
+            return value * jnp.asarray(scale, dtype=jnp.bfloat16)
+
+        qkv = normal((BENCH_NUM_TOKENS, BENCH_DIM), 0.05)
+        b = normal((BENCH_NUM_TOKENS, BENCH_N_V), 0.05)
+        a = normal((BENCH_NUM_TOKENS, BENCH_N_V), 0.05)
+        conv_weight = normal((BENCH_DIM, 1, BENCH_KERNEL_SIZE), 0.02)
+        conv_bias = normal((BENCH_DIM,), 0.01)
+        a_log = normal((BENCH_N_V,), 0.02).astype(jnp.float32)
+        dt_bias = normal((BENCH_N_V,), 0.02).astype(jnp.float32) - 2.0
+        shared_args = (qkv, b, a, conv_weight, conv_bias, a_log, dt_bias)
+        pool = jnp.zeros(CKPT_POOL_SHAPE, dtype=jnp.int8)
+
+        def make_args():
+            return (jnp.copy(pool).block_until_ready(), *shared_args)
+
+        def plain(*args):
+            return _checkpoint_prefill_five(*args, ckpt=False)
+
+        def with_ckpt(*args):
+            return _checkpoint_prefill_five(*args, ckpt=True)
+
+        pool_plain, out_plain = _block_until_ready(plain(*make_args()))
+        pool_ckpt, out_ckpt = _block_until_ready(with_ckpt(*make_args()))
+        pool_split, _ = _block_until_ready(_first_chunk(*make_args()))
+
+        np.testing.assert_array_equal(np.asarray(out_ckpt), np.asarray(out_plain))
+        for mgr in range(CKPT_NUM_MGR):
+            if mgr != CKPT_BLOCK:
+                np.testing.assert_array_equal(
+                    _manager_block(pool_ckpt, mgr),
+                    _manager_block(pool_plain, mgr),
+                    f"block {mgr}",
+                )
+        np.testing.assert_array_equal(
+            _manager_block(pool_ckpt, CKPT_BLOCK),
+            _manager_block(pool_split, CKPT_BLOCK),
+        )

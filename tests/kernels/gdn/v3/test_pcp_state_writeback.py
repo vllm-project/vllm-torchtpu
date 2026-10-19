@@ -17,7 +17,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.gdn.v3 import config, pcp_wrapper
+from vllm_torchtpu.kernels.gdn.v3 import config, metadata, pcp_wrapper
 
 
 def _region(*, kb0: int, nblocks: int, row0: int, nrows: int) -> config.StateRegion:
@@ -128,3 +128,55 @@ def test_hnd_compact_state_writeback_rejects_unsafe_page_plans(
 
     with pytest.raises(NotImplementedError, match=message):
         pcp_wrapper._validate_compact_state_writeback_plan(plan)
+
+
+def test_prefill_ckpt_requests_mask_rows_without_a_checkpoint_to_sentinels():
+    offsets = jnp.asarray([0, 128, 64, 192, 64, 3072], dtype=jnp.int32)
+    indices = jnp.asarray([5, 6, -1, 7, 8, 9], dtype=jnp.int32)
+    # Query lengths 100, 300, 300, 192, 0, 0: the last two rows are empty.
+    query_start_loc = jnp.asarray([0, 100, 400, 700, 892, 892, 892], jnp.int32)
+
+    masked_offsets, masked_indices = metadata.mask_prefill_ckpt_requests(
+        offsets, indices, query_start_loc[1:] - query_start_loc[:-1]
+    )
+
+    # Only row 1 has 0 < offset < query_len and a block id.
+    np.testing.assert_array_equal(np.asarray(masked_offsets), [0, 128, 0, 0, 0, 0])
+    np.testing.assert_array_equal(np.asarray(masked_indices), [-1, 6, -1, -1, -1, -1])
+
+
+@pytest.mark.parametrize("whole_block_dma", [False, True])
+def test_prefill_ckpt_scatter_skips_sentinel_rows(whole_block_dma):
+    pool = jnp.arange(6 * 4 * 2, dtype=jnp.float32).reshape(6, 4, 2)
+    region = _region(kb0=1, nblocks=1, row0=0 if whole_block_dma else 2, nrows=2)
+    if whole_block_dma:
+        updates = jnp.stack(
+            [jnp.full((1, 4, 2), 100 + row, pool.dtype) for row in range(3)]
+        )
+    else:
+        updates = jnp.stack(
+            [jnp.full((1, 2, 2), 100 + row, pool.dtype) for row in range(3)]
+        )
+    query_start_loc = jnp.asarray([0, 200, 500, 800], dtype=jnp.int32)
+    _, indices = metadata.mask_prefill_ckpt_requests(
+        jnp.asarray([0, 128, 192], dtype=jnp.int32),
+        jnp.asarray([0, 2, -1], dtype=jnp.int32),
+        query_start_loc[1:] - query_start_loc[:-1],
+    )
+
+    actual = pcp_wrapper._scatter_compact_state_updates(
+        pool,
+        updates,
+        indices,
+        query_start_loc,
+        jnp.asarray(3, dtype=jnp.int32),
+        state_stride=2,
+        region=region,
+        whole_block_dma=whole_block_dma,
+    )
+
+    # Row 0 has no checkpoint, so the null block 0 stays untouched, and row 2
+    # names no block. Only row 1 writes block 2, at source block 2 * 2 + 1.
+    rows = slice(None) if whole_block_dma else slice(2, 4)
+    expected = pool.at[5, rows].set(101)
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))

@@ -156,8 +156,10 @@ def _select_committed_mamba_blocks(
 ) -> list[int]:
     """Select each Mamba group's last committed state checkpoint.
 
-    The final ``K`` entries are speculative, so the committed checkpoint is
-    the ``-(K + 1)`` entry for a group with speculative depth ``K``.
+    The final K entries are speculative, so the committed prompt-end state sits
+    at -(K + 1) for speculative depth K. Any internal prefill checkpoint block
+    reserved by the step sits earlier at -(K + 2) and is excluded because it
+    stores an intermediate prefix state rather than the prompt-end state.
     """
     required_blocks = num_speculative_blocks + 1
     committed_blocks: list[int] = []

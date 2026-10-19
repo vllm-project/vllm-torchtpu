@@ -12,15 +12,19 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import dataclasses
 from types import SimpleNamespace
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import vllm.envs as vllm_envs
+from jax.experimental import pallas as pl
 from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 
+from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 from vllm_torchtpu.kernels import pool_adapters
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
@@ -30,9 +34,12 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
     pcp_local_token_counts as _pcp_local_token_counts,
 )
 from vllm_torchtpu.kernels.gdn.head_geometry import derive_gdn_head_geometry
+from vllm_torchtpu.kernels.gdn.v3 import pcp_wrapper as gdn_v3_pcp_wrapper
+from vllm_torchtpu.kernels.gdn.v3 import vmem_ldst
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
 from vllm_torchtpu.kernels.quantized_matmul import util as quantized_matmul_util
 from vllm_torchtpu.layers.core.gdn_attention import (
+    _build_v3_pool_state_plan,
     _derive_pcp_ragged_exchange_descriptors,
     _derive_pcp_rank_major_reorder_indices,
     _exchange_pcp_token_shards_for_head_shards,
@@ -791,7 +798,11 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
         # Independent dense dequantized-weight reference, not the kernel's
         # block accumulation loop or its scale-normalization helper.
         projected_qkvz = (
-            (x_q.astype(jnp.float32) @ (qkvz_weight.astype(jnp.float32) * full_scale).T)
+            jnp.matmul(
+                x_q.astype(jnp.float32),
+                (qkvz_weight.astype(jnp.float32) * full_scale).T,
+                precision=jax.lax.Precision.HIGHEST,
+            )
             * x_scale
         ).astype(jnp.bfloat16)
     mixed_qkv = projected_qkvz[:, :qkv_dim]
@@ -1027,3 +1038,582 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
         rtol=tolerance,
         atol=tolerance,
     )
+
+
+@dataclasses.dataclass(frozen=True)
+class _PrefillCkptPoolConfig:
+    """Head counts, PCP chunk, pool and state layout of a checkpoint case."""
+
+    n_kq: int
+    n_v: int
+    interleave_size: int
+    pool_block_tokens: int
+    # One kernel block (page) of a rank's pool, without the block dim.
+    page_shape: tuple[int, ...]
+    recurrent_state_dtype: jnp.dtype
+    kv_cache_layout: str
+    qk_pair_layout: bool
+
+
+_PREFILL_CKPT_NHD_POOL = _PrefillCkptPoolConfig(
+    n_kq=4,
+    n_v=4,
+    interleave_size=64,
+    pool_block_tokens=512,
+    page_shape=(256, 1, 4, 128),
+    recurrent_state_dtype=jnp.float32,
+    kv_cache_layout="NHD",
+    qk_pair_layout=False,
+)
+# Matches the prefill engine pool layout of qwen38-disagg-fp8-correctness
+# (interleave_size=128, block_size=384, fp8 HND pages, bfloat16 SSM state,
+# TPU_GDN_CONV_QK_PAIR_LAYOUT=1). Scales Qwen3.5-397B's PCP8 head count
+# (16 KQ, 64 V) down to PCP2 (4 KQ, 16 V) so each rank still holds 2 KQ and
+# 8 V heads (one physical Z tile).
+_PREFILL_CKPT_PRODUCTION_POOL = _PrefillCkptPoolConfig(
+    n_kq=4,
+    n_v=16,
+    interleave_size=128,
+    pool_block_tokens=384,
+    page_shape=(8, 64, 4, 128),
+    recurrent_state_dtype=jnp.bfloat16,
+    kv_cache_layout="HND",
+    qk_pair_layout=True,
+)
+
+
+def _region_tile_shape(plan, region, pool_shape):
+    """One block's `region` tile, as the GDN kernels copy it, in pool dtype."""
+    if plan.whole_block_dma:
+        return (region.nblocks, *pool_shape[1:])
+    return (region.nblocks, region.nrows, *pool_shape[2:])
+
+
+def _region_tile_index(plan, region, block_ids):
+    """Pages and page rows of each block's `region` tile in a rank's pool.
+
+    Mirrors `memory_ref.external_region_slice`: whole pages with
+    `whole_block_dma`, rows `[row0, row0 + nrows)` of each page otherwise.
+    """
+    pages = (
+        np.asarray(block_ids)[:, None] * plan.stride
+        + region.kb0
+        + np.arange(region.nblocks)
+    )
+    if plan.whole_block_dma:
+        return pages, slice(None)
+    return pages, slice(region.row0, region.row0 + region.nrows)
+
+
+def _leading_block_spec(block_shape):
+    """Block spec that steps over the leading dim, one grid index per block."""
+    zeros = (0,) * (len(block_shape) - 1)
+    return pl.BlockSpec(block_shape, lambda i: (i, *zeros))
+
+
+def _write_region_states(pool, plan, region, block_ids, states, pcp_size):
+    """Encodes rank-major states into `region` of each rank's pool shard.
+
+    `states` stacks every rank's FP32 states in the shape the GDN kernels
+    store, through the encoder they use, `vmem_ldst.store_state_region`.
+    """
+    tile_shape = _region_tile_shape(plan, region, pool.shape)
+
+    def encode(state_ref, tile_ref):
+        vmem_ldst.store_state_region(tile_ref.at[0], region, state_ref[0])
+
+    tiles = pl.pallas_call(
+        encode,
+        grid=(states.shape[0],),
+        in_specs=[_leading_block_spec((1, *states.shape[1:]))],
+        out_specs=_leading_block_spec((1, *tile_shape)),
+        out_shape=jax.ShapeDtypeStruct((states.shape[0], *tile_shape), pool.dtype),
+    )(states)
+    local_pools = np.array(pool).view(np.uint8).reshape(pcp_size, -1, *pool.shape[1:])
+    pages, rows = _region_tile_index(plan, region, block_ids)
+    local_pools[:, pages, rows] = (
+        np.asarray(tiles).view(np.uint8).reshape(pcp_size, len(block_ids), *tile_shape)
+    )
+    return jax.device_put(
+        local_pools.reshape(pool.shape).view(pool.dtype), pool.sharding
+    )
+
+
+def _read_region_states(pool, plan, region, block_ids, state_shape, pcp_size):
+    """Decodes rank-major FP32 states from `region` of each rank's pool shard.
+
+    `vmem_ldst.load_state_region` is the decoder the GDN kernels load their
+    incoming states with.
+    """
+    tile_shape = _region_tile_shape(plan, region, pool.shape)
+    local_pools = np.asarray(pool).view(np.uint8).reshape(pcp_size, -1, *pool.shape[1:])
+    pages, rows = _region_tile_index(plan, region, block_ids)
+    tiles = local_pools[:, pages, rows].reshape(-1, *tile_shape).view(pool.dtype)
+
+    def decode(tile_ref, state_ref):
+        state_ref[0] = vmem_ldst.load_state_region(
+            tile_ref.at[0], region, state_shape
+        ).astype(jnp.float32)
+
+    states = pl.pallas_call(
+        decode,
+        grid=(tiles.shape[0],),
+        in_specs=[_leading_block_spec((1, *tile_shape))],
+        out_specs=_leading_block_spec((1, *state_shape)),
+        out_shape=jax.ShapeDtypeStruct((tiles.shape[0], *state_shape), jnp.float32),
+    )(jnp.asarray(tiles))
+    return np.asarray(states)
+
+
+@pytest.mark.parametrize(
+    ("lengths", "ckpt_offsets", "request_absolute_starts", "pool_config"),
+    [
+        # Request starts are multiples of 64, so each checkpoint row ends a
+        # tile and the export follows that tile.
+        pytest.param(
+            (192, 256, 40),
+            (128, 192, 0),
+            None,
+            _PREFILL_CKPT_NHD_POOL,
+            id="aligned-query-start",
+        ),
+        # Request 1 starts at row 100. Its checkpoint row 292 falls inside
+        # the tile [256, 320), which is preceded by a shadow tile of 36 rows.
+        pytest.param(
+            (100, 300, 40),
+            (64, 192, 0),
+            None,
+            _PREFILL_CKPT_NHD_POOL,
+            id="unaligned-query-start",
+        ),
+        # Requests 1 and 2 continue earlier chunks and read their incoming
+        # state from the pool. Request 1 exports after the tile ending at row
+        # 384 and request 2 starts two tiles later, on the same pipeline slot.
+        pytest.param(
+            (192, 256, 40),
+            (128, 192, 0),
+            (0, 6144, 7),
+            _PREFILL_CKPT_NHD_POOL,
+            id="aligned-continuations",
+        ),
+        # Request 1 continues an earlier chunk and checkpoints on a shadow
+        # tile before its last tile [256, 320). Request 2 continues another
+        # chunk and starts right after it, on the shadow's pipeline slot.
+        pytest.param(
+            (100, 220, 60),
+            (64, 192, 0),
+            (0, 3072, 5),
+            _PREFILL_CKPT_NHD_POOL,
+            id="unaligned-continuations",
+        ),
+        # Production layout cases. PCP chunks are 128 rows per rank, and
+        # tiles are 64 rows from the start of a request's part of a chunk.
+        # Request 0 checkpoints at the end of its first tile [0, 64). Request
+        # 1 starts at row 100, so its tiles start at rows 100, 128, 192, 256
+        # and so on; its checkpoint row 292 falls inside the tile [256, 320),
+        # which a shadow tile of 36 rows precedes.
+        pytest.param(
+            (100, 300, 40),
+            (64, 192, 0),
+            None,
+            _PREFILL_CKPT_PRODUCTION_POOL,
+            id="production-unaligned-query-start",
+        ),
+        # Every request continues an earlier chunk. Request 0 checkpoints at
+        # row 16 inside its first tile, so its shadow tile and the real tile
+        # both load the incoming state. Request 1 checkpoints on the shadow
+        # tile [256, 292) as above.
+        pytest.param(
+            (100, 300, 40),
+            (16, 192, 0),
+            (2048, 3072, 5),
+            _PREFILL_CKPT_PRODUCTION_POOL,
+            id="production-unaligned-continuations",
+        ),
+        # Request 0 checkpoints at the end of its first tile [0, 64). Request 1
+        # starts at row 100 and checkpoints at row 116 inside its first tile
+        # [100, 128), so the shadow tile [100, 116) immediately follows request
+        # 0's last tile, exercising back-to-back state copy-out and copy-in.
+        pytest.param(
+            (100, 300, 40),
+            (64, 16, 0),
+            (2048, 3072, 5),
+            _PREFILL_CKPT_PRODUCTION_POOL,
+            id="production-first-tile-shadow-after-request",
+        ),
+    ],
+)
+def test_pooled_pcp_prefill_fused_projection_writes_prefill_checkpoint(
+    lengths, ckpt_offsets, request_absolute_starts, pool_config, monkeypatch
+):
+    """The checkpoint block matches a reference run truncated at the row."""
+    pcp_size = 2
+    n_kq = pool_config.n_kq
+    n_v = pool_config.n_v
+    hidden_size = 2048
+    interleave_size = pool_config.interleave_size
+    pool_block_tokens = pool_config.pool_block_tokens
+    recurrent_state_dtype = pool_config.recurrent_state_dtype
+    monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", pool_config.kv_cache_layout)
+    monkeypatch.setenv(
+        "TPU_GDN_CONV_QK_PAIR_LAYOUT", str(int(pool_config.qk_pair_layout))
+    )
+    vllm_envs.disable_envs_cache()
+
+    lengths = np.asarray(lengths, dtype=np.int32)
+    ckpt_offsets = np.asarray(ckpt_offsets, dtype=np.int32)
+    request_absolute_starts = (
+        np.zeros_like(lengths)
+        if request_absolute_starts is None
+        else np.asarray(request_absolute_starts, dtype=np.int32)
+    )
+    is_continuation = request_absolute_starts > 0
+    num_seqs = len(lengths)
+    d_k = 128
+    d_v = 128
+    kernel_size = 4
+    num_tokens = int(lengths.sum())
+    state_indices = jnp.arange(1, num_seqs + 1, dtype=jnp.int32)
+    ckpt_indices = jnp.arange(num_seqs + 1, 2 * num_seqs + 1, dtype=jnp.int32)
+    num_blocks = 2 * num_seqs + 1
+    qkv_dim = 2 * n_kq * d_k + n_v * d_v
+    qkvz_dim = qkv_dim + n_v * d_v
+
+    geometry = derive_gdn_head_geometry(n_kq, n_v, pcp_size)
+    local_key_dim = geometry.local_num_kq_heads * d_k
+    local_value_dim = geometry.local_num_v_heads * d_v
+    local_conv_dim = geometry.local_conv_dim(d_k, d_v)
+    # The state shapes the GDN kernels store and load.
+    conv_state_shape = (kernel_size - 1, 1, local_conv_dim)
+    recurrent_state_shape = (geometry.local_num_v_heads, d_k, d_v)
+    page_tokens = pool_adapters._pool_geometry(
+        jax.ShapeDtypeStruct((1, *pool_config.page_shape), jnp.float8_e4m3fn)
+    )[0]
+    pool_split = pool_block_tokens // page_tokens
+    local_pool_shape = (num_blocks * pool_split, *pool_config.page_shape)
+    global_pool_shape = (pcp_size * local_pool_shape[0], *local_pool_shape[1:])
+    # The plan the pooled PCP caller builds for each rank under these settings:
+    # whole-page DMA under HND, the QK pair conv row order, and a uint32 view
+    # of a BF16 SSM state.
+    state_plan = _build_v3_pool_state_plan(
+        jax.ShapeDtypeStruct(local_pool_shape, jnp.float8_e4m3fn),
+        conv_dim=local_conv_dim,
+        n_v=geometry.local_num_v_heads,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+        pool_block_tokens=pool_block_tokens,
+        qk_pair_layout=tpu_envs.TPU_GDN_CONV_QK_PAIR_LAYOUT,
+        recurrent_state_dtype=recurrent_state_dtype,
+    )
+    assert state_plan.stride == pool_split
+    assert state_plan.whole_block_dma == (pool_config.kv_cache_layout == "HND")
+    assert (state_plan.conv.rows_perm is not None) == pool_config.qk_pair_layout
+    assert state_plan.conv.view_dtype == jnp.bfloat16
+    assert state_plan.recurrent.view_dtype == (
+        jnp.uint32 if recurrent_state_dtype == jnp.bfloat16 else jnp.float32
+    )
+    _require_tpu_devices(
+        pcp_size,
+        f"GDN PCP numerical test requires {pcp_size} TPU devices.",
+    )
+
+    keys = jax.random.split(jax.random.key(0), 10)
+    hidden = jax.random.normal(keys[0], (num_tokens, hidden_size), dtype=jnp.bfloat16)
+    qkvz_weight = (
+        0.02 * jax.random.normal(keys[7], (qkvz_dim, hidden_size), dtype=jnp.float32)
+    ).astype(jnp.bfloat16)
+    projected_qkvz = jnp.matmul(
+        hidden, qkvz_weight.T, preferred_element_type=jnp.float32
+    ).astype(jnp.bfloat16)
+    mixed_qkv = projected_qkvz[:, :qkv_dim]
+    b = jax.random.normal(keys[1], (num_tokens, n_v), dtype=jnp.bfloat16)
+    a = jax.random.normal(keys[2], (num_tokens, n_v), dtype=jnp.bfloat16)
+    conv_weight = jax.random.normal(
+        keys[3], (qkv_dim, 1, kernel_size), dtype=jnp.bfloat16
+    )
+    conv_bias = jax.random.normal(keys[4], (qkv_dim,), dtype=jnp.bfloat16)
+    # A slow decay keeps the incoming state visible in the checkpoints and
+    # final states of the continued requests, not only in their first outputs.
+    A_log = jax.random.normal(keys[5], (n_v,), dtype=jnp.float32) - 4.0
+    dt_bias = jax.random.normal(keys[6], (n_v,), dtype=jnp.float32)
+    # Every state block starts nonzero; only the continued requests read it.
+    initial_conv = 0.5 * jax.random.normal(
+        keys[8], (num_seqs, kernel_size - 1, qkv_dim), dtype=jnp.float32
+    ).astype(jnp.bfloat16)
+    # The pool stores the SSM state in its cache dtype, so the reference
+    # starts from the same rounded values.
+    initial_recurrent = (
+        (0.1 * jax.random.normal(keys[9], (num_seqs, n_v, d_k, d_v), dtype=jnp.float32))
+        .astype(recurrent_state_dtype)
+        .astype(jnp.float32)
+    )
+    query_start_loc = _query_start_loc_from_lengths(lengths)
+    distribution = jnp.asarray((0, num_seqs, num_seqs), dtype=jnp.int32)
+    seq_lens = jnp.asarray(request_absolute_starts + lengths, dtype=jnp.int32)
+
+    def non_pcp_reference(seqs, ends, conv, recurrent):
+        """Final states and outputs of the given requests over [start, end)."""
+        starts = np.asarray(query_start_loc)[seqs]
+        rows = np.concatenate([np.arange(s, e) for s, e in zip(starts, ends)])
+        ref_lengths = np.asarray(ends - starts, np.int32)
+        num_ref_seqs = len(seqs)
+        (conv, recurrent), output = gdn_v3_wrapper.fused_conv1d_gdn(
+            mixed_qkv[rows],
+            b[rows],
+            a[rows],
+            jnp.concatenate((jnp.zeros_like(conv[:1]), conv)),
+            jnp.concatenate((jnp.zeros_like(recurrent[:1]), recurrent)),
+            conv_weight,
+            conv_bias,
+            A_log,
+            dt_bias,
+            _query_start_loc_from_lengths(ref_lengths),
+            jnp.arange(1, num_ref_seqs + 1, dtype=jnp.int32),
+            jnp.asarray((0, num_ref_seqs, num_ref_seqs), dtype=jnp.int32),
+            jnp.asarray(request_absolute_starts[seqs] + ref_lengths),
+            n_kq=n_kq,
+            n_v=n_v,
+            d_k=d_k,
+            d_v=d_v,
+            kernel_size=kernel_size,
+        )
+        return np.asarray(conv)[1:], np.asarray(recurrent)[1:], np.asarray(output)
+
+    all_seqs = np.arange(num_seqs)
+    seq_ends = np.asarray(query_start_loc)[1:]
+    ckpt_rows = np.nonzero(ckpt_offsets)[0]
+    ckpt_ends = np.asarray(query_start_loc)[ckpt_rows] + ckpt_offsets[ckpt_rows]
+    ref_conv, ref_recurrent, ref_output = non_pcp_reference(
+        all_seqs, seq_ends, initial_conv, initial_recurrent
+    )
+    ckpt_conv, ckpt_recurrent, _ = non_pcp_reference(
+        ckpt_rows, ckpt_ends, initial_conv[ckpt_rows], initial_recurrent[ckpt_rows]
+    )
+
+    tolerance = 2e-2
+    if np.any(is_continuation):
+        # The incoming state must be observable, or reading the wrong one
+        # would pass the comparisons below.
+        _, fresh_recurrent, fresh_output = non_pcp_reference(
+            all_seqs,
+            seq_ends,
+            jnp.zeros_like(initial_conv),
+            jnp.zeros_like(initial_recurrent),
+        )
+        continued_rows = np.repeat(is_continuation, lengths)
+        assert not np.allclose(
+            fresh_output.reshape(num_tokens, -1)[continued_rows],
+            ref_output.reshape(num_tokens, -1)[continued_rows],
+            atol=tolerance,
+        )
+        assert not np.allclose(
+            fresh_recurrent[is_continuation],
+            ref_recurrent[is_continuation],
+            atol=tolerance,
+        )
+        continued_ckpt = is_continuation[ckpt_rows]
+        _, fresh_ckpt_recurrent, _ = non_pcp_reference(
+            ckpt_rows[continued_ckpt],
+            ckpt_ends[continued_ckpt],
+            jnp.zeros_like(initial_conv[ckpt_rows[continued_ckpt]]),
+            jnp.zeros_like(initial_recurrent[ckpt_rows[continued_ckpt]]),
+        )
+        assert not np.allclose(
+            fresh_ckpt_recurrent, ckpt_recurrent[continued_ckpt], atol=tolerance
+        )
+
+    token_owner_starts = np.asarray(query_start_loc)[:-1]
+    local_required_tokens = int(
+        _pcp_local_token_counts(
+            lengths,
+            pcp_size,
+            interleave_size,
+            token_owner_start_offsets_per_req=token_owner_starts,
+        ).max()
+    )
+    projection_token_block = 2 * interleave_size
+    local_padded_tokens = max(
+        8 * projection_token_block,
+        (local_required_tokens + projection_token_block - 1)
+        // projection_token_block
+        * projection_token_block,
+    )
+    padded_num_tokens = local_padded_tokens * pcp_size
+    token_order, _ = _build_pcp_rank_major_token_order(
+        lengths,
+        pcp_size,
+        interleave_size,
+        padded_num_tokens,
+        token_owner_start_offsets_per_req=token_owner_starts,
+    )
+    valid = token_order >= 0
+    valid_rows = np.where(valid)[0]
+    source_rows = token_order[valid]
+
+    def pack_tokens(tensor):
+        padded = jnp.pad(tensor, ((0, padded_num_tokens - num_tokens), (0, 0)))
+        return jnp.zeros_like(padded).at[valid_rows].set(padded[source_rows])
+
+    mesh = Mesh(np.asarray(jax.devices()[:pcp_size]), ("pcp",))
+
+    def shard_tokens(tensor):
+        return jax.device_put(tensor, NamedSharding(mesh, P("pcp", None)))
+
+    def replicate(tensor):
+        return jax.device_put(tensor, NamedSharding(mesh, P()))
+
+    def rank_local_reference(conv, recurrent):
+        """Stacks each rank's conv channels and recurrent heads, rank-major."""
+        q, k, v = np.split(np.asarray(conv), [n_kq * d_k, 2 * n_kq * d_k], -1)
+        conv_by_rank = []
+        for rank in range(pcp_size):
+            kq_start = geometry.kq_shard_index(rank) * local_key_dim
+            v_start = rank * local_value_dim
+            conv_by_rank.append(
+                np.concatenate(
+                    (
+                        q[..., kq_start : kq_start + local_key_dim],
+                        k[..., kq_start : kq_start + local_key_dim],
+                        v[..., v_start : v_start + local_value_dim],
+                    ),
+                    axis=-1,
+                )
+            )
+        return (
+            np.concatenate(conv_by_rank),
+            np.concatenate(np.split(np.asarray(recurrent), pcp_size, axis=1)),
+        )
+
+    def write_states(pool, block_ids, conv, recurrent):
+        """Writes rank-major states into each rank's shard of the pool."""
+        for region, states, state_shape in (
+            (state_plan.conv, conv, conv_state_shape),
+            (state_plan.recurrent, recurrent, recurrent_state_shape),
+        ):
+            pool = _write_region_states(
+                pool,
+                state_plan,
+                region,
+                block_ids,
+                jnp.asarray(states, dtype=jnp.float32).reshape(-1, *state_shape),
+                pcp_size,
+            )
+        return pool
+
+    def read_states(pool, block_ids):
+        conv = _read_region_states(
+            pool, state_plan, state_plan.conv, block_ids, conv_state_shape, pcp_size
+        )
+        recurrent = _read_region_states(
+            pool,
+            state_plan,
+            state_plan.recurrent,
+            block_ids,
+            recurrent_state_shape,
+            pcp_size,
+        )
+        return conv.reshape(-1, kernel_size - 1, local_conv_dim), recurrent
+
+    # Every pool byte starts as finite, nonzero garbage, so a stray write of
+    # any value shows in the comparison of untouched bytes at the end.
+    garbage = np.random.default_rng(0).integers(
+        1, 0x7F, size=global_pool_shape, dtype=np.uint8
+    )
+    pool = jax.device_put(
+        garbage.view(jnp.float8_e4m3fn), NamedSharding(mesh, P("pcp"))
+    )
+    pool = write_states(
+        pool, state_indices, *rank_local_reference(initial_conv, initial_recurrent)
+    )
+    pool_before = np.asarray(pool).view(np.uint8).reshape(pcp_size, *local_pool_shape)
+
+    captured_plans = []
+    fused_kernel = gdn_v3_pcp_wrapper.fused_qkvz_projection_pcp_gdn
+
+    def record_state_plan(*args, **kwargs):
+        captured_plans.append(kwargs["state_plan"])
+        return fused_kernel(*args, **kwargs)
+
+    monkeypatch.setattr(
+        gdn_v3_pcp_wrapper, "fused_qkvz_projection_pcp_gdn", record_state_plan
+    )
+    new_pool, pcp_output, _ = run_jax_gdn_attention_pooled_pcp_prefill_projection(
+        shard_tokens(pack_tokens(hidden)),
+        replicate(qkvz_weight),
+        None,
+        shard_tokens(pack_tokens(b)),
+        shard_tokens(pack_tokens(a)),
+        pool,
+        replicate(conv_weight),
+        replicate(conv_bias),
+        replicate(A_log),
+        replicate(dt_bias),
+        replicate(state_indices),
+        replicate(query_start_loc),
+        replicate(distribution),
+        replicate(seq_lens),
+        n_kq=n_kq,
+        n_v=n_v,
+        d_k=d_k,
+        d_v=d_v,
+        kernel_size=kernel_size,
+        pool_block_tokens=pool_block_tokens,
+        pcp_size=pcp_size,
+        interleave_size=interleave_size,
+        mesh=mesh,
+        recurrent_state_dtype=recurrent_state_dtype,
+        prefill_ckpt_offsets=replicate(jnp.asarray(ckpt_offsets)),
+        prefill_ckpt_indices=replicate(ckpt_indices),
+    )
+    assert set(captured_plans) == {state_plan}
+
+    # A shadow tile must leave the real tile's output and carry untouched,
+    # and an export must leave the next request's incoming state untouched.
+    packed = np.asarray(pcp_output).reshape(padded_num_tokens, -1)
+    restored = np.zeros_like(packed)
+    restored[token_order[valid]] = packed[valid]
+    np.testing.assert_allclose(
+        restored[:num_tokens],
+        ref_output.reshape(num_tokens, -1),
+        rtol=tolerance,
+        atol=tolerance,
+    )
+
+    final_conv, final_recurrent = read_states(new_pool, state_indices)
+    expected_conv, expected_recurrent = rank_local_reference(ref_conv, ref_recurrent)
+    np.testing.assert_allclose(
+        final_conv, expected_conv, rtol=tolerance, atol=tolerance
+    )
+    np.testing.assert_allclose(
+        final_recurrent, expected_recurrent, rtol=tolerance, atol=tolerance
+    )
+
+    ckpt_conv_actual, ckpt_recurrent_actual = read_states(
+        new_pool, ckpt_indices[ckpt_rows]
+    )
+    expected_conv, expected_recurrent = rank_local_reference(ckpt_conv, ckpt_recurrent)
+    np.testing.assert_allclose(
+        ckpt_conv_actual, expected_conv, rtol=tolerance, atol=tolerance
+    )
+    np.testing.assert_allclose(
+        ckpt_recurrent_actual, expected_recurrent, rtol=tolerance, atol=tolerance
+    )
+    # The checkpoint differs from the final state, so the comparison above
+    # cannot pass by reading the wrong block.
+    assert not np.allclose(ckpt_recurrent, ref_recurrent[ckpt_rows], atol=tolerance)
+
+    # Verify that only the conv and recurrent regions of active state and
+    # checkpoint blocks were modified; all other pool pages and rows must
+    # retain their initial sentinel bytes.
+    written = np.zeros(local_pool_shape[:2], dtype=bool)
+    written_blocks = np.concatenate(
+        (np.asarray(state_indices), np.asarray(ckpt_indices)[ckpt_rows])
+    )
+    for region in (state_plan.conv, state_plan.recurrent):
+        pages, rows = _region_tile_index(state_plan, region, written_blocks)
+        written[pages.reshape(-1), rows] = True
+    pool_after = (
+        np.asarray(new_pool).view(np.uint8).reshape(pcp_size, *local_pool_shape)
+    )
+    np.testing.assert_array_equal(pool_after[:, ~written], pool_before[:, ~written])

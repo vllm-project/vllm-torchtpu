@@ -271,3 +271,13 @@ class GDNConfig:
             carry_conv_scratch_ref=carry_conv_scratch,
             carry_recurrent_scratch_ref=carry_recurrent_scratch,
         )
+
+    def get_prefill_ckpt_scratch_shape_dict(self) -> dict[str, Any]:
+        """Dedicated DMA semaphores for conv and recurrent checkpoint exports.
+
+        Separate from the pipeline's state-copy semaphores so inline checkpoint
+        waits do not interfere with pipelined state DMAs.
+        """
+        assert self.mode == GDNMode.PER_SEQ
+        assert self.state_plan is not None
+        return dict(prefill_ckpt_sems=pltpu.SemaphoreType.DMA((2,)))

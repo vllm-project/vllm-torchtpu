@@ -1,102 +1,87 @@
 # SPDX-License-Identifier: Apache-2.0
+import subprocess
+import sys
 from types import SimpleNamespace
 
-import vllm.v1.core.sched.scheduler as scheduler_module
-from vllm.v1.core.kv_cache_coordinator import SpecGroup
-from vllm.v1.core.sched.scheduler import Scheduler
+import numpy as np
+import pytest
+from mamba_manager_test_utils import Geometry, make_kv_cache_manager, make_request
 
 from vllm_torchtpu.core import eagle_block_drop
-
-BLOCK = 1152
-
-
-def _split_scheduler(use_eagle: bool):
-    return SimpleNamespace(
-        use_eagle=use_eagle,
-        use_eagle_block_drop=use_eagle,
-        block_size=BLOCK,
-        cache_config=SimpleNamespace(block_size=BLOCK),
-        max_num_scheduled_tokens=16384,
-        scheduler_config=SimpleNamespace(long_prefill_token_threshold=0),
-        hash_block_size=BLOCK,
-        mamba_has_prefill_checkpoint_blocks=False,
-        mamba_partial_cache_hit=False,
-        mamba_shared_prefix_checkpoint=False,
-    )
+from vllm_torchtpu.gdn_pool_layout import PrefillCheckpointUnits
 
 
-def _request(prompt: int, computed: int = 0):
-    return SimpleNamespace(
-        num_computed_tokens=computed,
-        num_prompt_tokens=prompt,
-        num_tokens=prompt,
-        shared_prefix_boundary=0,
-    )
+class _SpeculativeConfig:
+    """The two SpeculativeConfig members the eagle block-drop bit involves."""
+
+    def __init__(self, use_eagle: bool = True):
+        self.use_eagle = use_eagle
+        self.disable_eagle_block_drop = False
+
+    def use_eagle_block_drop(self) -> bool:
+        return self.use_eagle and not self.disable_eagle_block_drop
 
 
-def _install(monkeypatch, fake_init=None):
+def test_override_writes_the_speculative_config_once(monkeypatch):
     monkeypatch.setenv("VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", "1")
-    monkeypatch.setattr(
-        Scheduler, "__init__", fake_init or (lambda self, *a, **k: None)
+    config = SimpleNamespace(speculative_config=_SpeculativeConfig())
+    eagle_block_drop.apply_eagle_block_drop_override(config)
+    assert config.speculative_config.disable_eagle_block_drop is True
+    assert config.speculative_config.use_eagle_block_drop() is False
+    # Idempotent: check_and_update_config may run more than once.
+    eagle_block_drop.apply_eagle_block_drop_override(config)
+    assert config.speculative_config.disable_eagle_block_drop is True
+
+
+@pytest.mark.parametrize(
+    ("disable", "speculative"), [("0", True), ("", True), ("1", False)]
+)
+def test_override_leaves_the_config_alone_without_env_or_spec_decode(
+    monkeypatch, disable, speculative
+):
+    if disable:
+        monkeypatch.setenv("VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", disable)
+    else:
+        monkeypatch.delenv("VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", raising=False)
+    speculative_config = _SpeculativeConfig() if speculative else None
+    config = SimpleNamespace(speculative_config=speculative_config)
+    eagle_block_drop.apply_eagle_block_drop_override(config)
+    if speculative:
+        assert config.speculative_config.disable_eagle_block_drop is False
+    else:
+        assert config.speculative_config is None
+
+
+@pytest.mark.parametrize(("disable", "position"), [("0", 3072), ("1", 6144)])
+def test_config_places_worker_and_manager_checkpoint_at_the_same_position(
+    monkeypatch, disable, position
+):
+    monkeypatch.setenv("VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", disable)
+    config = SimpleNamespace(speculative_config=_SpeculativeConfig())
+    eagle_block_drop.apply_eagle_block_drop_override(config)
+    drop = config.speculative_config.use_eagle_block_drop()
+    geometry = Geometry(3072, 3072, 1, drop, 16384, 0)
+    manager = make_kv_cache_manager(geometry)
+    request = make_request("r", list(range(8191)), 3072)
+    assert manager.allocate_slots(request, 8191) is not None
+    mamba = manager.coordinator.single_type_managers[1]
+    assert mamba._checkpoints["r"] == (position, 1)
+    units = PrefillCheckpointUnits(
+        hash_block_size=3072,
+        mamba_block_size=3072,
+        alignment=64,
+        drop_eagle_block=drop,
     )
-    monkeypatch.setattr(
-        Scheduler, "_mamba_block_aligned_split", Scheduler._mamba_block_aligned_split
+    offsets = np.zeros(1, dtype=np.int32)
+    units.fill_offsets(offsets, np.array([8191]), np.array([8191]))
+    assert offsets.tolist() == [position]
+
+
+def test_platform_discovery_imports_config_without_a_cycle():
+    result = subprocess.run(
+        [sys.executable, "-c", "import vllm.engine.arg_utils"],
+        capture_output=True,
+        text=True,
+        timeout=120,
     )
-    eagle_block_drop.patch_disable_eagle_block_drop()
-
-
-def test_split_back_off_matches_upstream_without_patch():
-    split = Scheduler._mamba_block_aligned_split
-    # Upstream: with EAGLE the chunk stops one block before the last boundary.
-    assert split(_split_scheduler(True), _request(10_000), 16384) == 8 * BLOCK - 1152
-    assert split(_split_scheduler(False), _request(10_000), 16384) == 8 * BLOCK
-
-
-def test_patched_split_skips_eagle_back_off(monkeypatch):
-    _install(monkeypatch)
-    sched = _split_scheduler(True)
-    assert Scheduler._mamba_block_aligned_split(sched, _request(10_000), 16384) == (
-        8 * BLOCK
-    )
-    assert sched.use_eagle is True
-
-
-def test_patched_init_builds_manager_without_eagle(monkeypatch):
-    seen = {}
-
-    def fake_manager(**kwargs):
-        seen.update(kwargs)
-        groups = [SpecGroup("full", [0], object, True)]
-        return SimpleNamespace(
-            use_eagle=kwargs["use_eagle"],
-            coordinator=SimpleNamespace(
-                eagle_group_ids={0},
-                single_type_managers=[SimpleNamespace(use_eagle=True)],
-                attention_groups=groups,
-            ),
-        )
-
-    def fake_init(self):
-        self.use_eagle = True
-        self.block_size = BLOCK
-        self.kv_cache_manager = scheduler_module.KVCacheManager(use_eagle=True)
-
-    monkeypatch.setattr(scheduler_module, "KVCacheManager", fake_manager)
-    _install(monkeypatch, fake_init)
-    sched = Scheduler.__new__(Scheduler)
-    Scheduler.__init__(sched)
-    assert seen["use_eagle"] is False
-    assert scheduler_module.KVCacheManager is fake_manager  # restored
-    coordinator = sched.kv_cache_manager.coordinator
-    assert coordinator.eagle_group_ids == set()
-    assert not coordinator.single_type_managers[0].use_eagle
-    assert not coordinator.attention_groups[0].use_eagle
-    assert sched.use_eagle is True
-    assert sched.use_eagle_block_drop is False
-
-
-def test_patch_is_noop_when_disabled(monkeypatch):
-    monkeypatch.setenv("VLLM_TPU_DISABLE_EAGLE_BLOCK_DROP", "0")
-    before = (Scheduler.__init__, Scheduler._mamba_block_aligned_split)
-    eagle_block_drop.patch_disable_eagle_block_drop()
-    assert (Scheduler.__init__, Scheduler._mamba_block_aligned_split) == before
+    assert result.returncode == 0, result.stderr

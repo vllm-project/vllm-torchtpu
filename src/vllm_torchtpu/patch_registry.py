@@ -90,7 +90,7 @@ PATCHES = (
     Patch("vllm_torchtpu:_patch_vllm_block_pool_lifo_free", _ACTIVE),
     Patch("vllm_torchtpu:_patch_vllm_same_step_prefix_hits", _ENGINE),
     Patch(
-        "vllm_torchtpu.core.eagle_block_drop:patch_disable_eagle_block_drop",
+        "vllm_torchtpu.core.mamba_manager_patches:patch_mamba_checkpoint_hashes",
         _ENGINE,
     ),
     Patch("vllm_torchtpu:_patch_vllm_kimi_kda_layer_counts", _ACTIVE),

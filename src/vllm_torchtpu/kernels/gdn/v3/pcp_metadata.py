@@ -26,7 +26,15 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from vllm_torchtpu.kernels.gdn.v3 import config, memory_ref
+from vllm_torchtpu.kernels.gdn.v3 import config, memory_ref, metadata
+
+# Per-tile internal prefill checkpoint action (tile_ckpt_mode).
+PREFILL_CKPT_NONE = 0
+# Tile ends at the checkpoint row: export the carry after computing the tile.
+PREFILL_CKPT_EXPORT = 1
+# Truncated prefix of the next tile ending at the checkpoint row: backup carry,
+# compute, export checkpoint, then restore carry for the real tile.
+PREFILL_CKPT_SHADOW = 2
 
 
 @jax.tree_util.register_dataclass
@@ -43,6 +51,13 @@ class PcpStageMetadata:
 
     Tile arrays use the active prefix ``[:metadata.num_tiles]`` and map GDN
     compute tiles back to their communication stage.
+
+    When internal prefill checkpoints are requested, tile_ckpt_mode holds one
+    PREFILL_CKPT_* action per tile; otherwise it is None. A shadow tile
+    repeats the start of the tile that follows it (same stage, slot row and
+    query row) but ends at the checkpoint row; it is never a stage's last
+    tile, so the stage's output ships only after the real tile overwrote the
+    shadow's rows.
     """
 
     num_stages: jax.Array
@@ -61,6 +76,7 @@ class PcpStageMetadata:
     projection_catchup_count: jax.Array
     projection_work_offset: jax.Array
     projection_work_offset_end: jax.Array
+    tile_ckpt_mode: jax.Array | None = None
 
 
 @jax.tree_util.register_dataclass
@@ -86,6 +102,7 @@ class _BuilderState:
     tile_num_tokens: jax.Array
     tile_is_first: jax.Array
     tile_is_last: jax.Array
+    tile_ckpt_mode: jax.Array | None = None
 
 
 def _rank_token_count_before(
@@ -109,6 +126,7 @@ def _schedule_capacities(
     max_num_seqs: int,
     pcp_size: int,
     comm_chunk_size: int,
+    prefill_checkpoints: bool = False,
 ) -> tuple[int, int]:
     """Return safe static storage capacities for stages and split tiles."""
     stage_size = pcp_size * comm_chunk_size
@@ -120,6 +138,8 @@ def _schedule_capacities(
     # valid even in small test geometries where one communication chunk is
     # smaller than one GDN tile.
     max_tiles = pl.cdiv(cfg.batch_size, cfg.tile_size) + pcp_size * max_stages
+    if prefill_checkpoints:
+        max_tiles += max_num_seqs
     return max_stages, max_tiles
 
 
@@ -136,12 +156,17 @@ def compute_pcp_stage_metadata(
     projection_token_block_size: int,
     num_qkv_out_blocks: int,
     num_projection_out_blocks: int,
+    prefill_ckpt_offsets: jax.Array | None = None,
 ) -> tuple[memory_ref.MetadataRef, PcpStageMetadata]:
     """Build PCP metadata from the current public request metadata.
 
     Query ownership follows the batch-flat request-major coordinate from
     ``query_start_loc[:-1]``. Request state and convolution semantics remain
     independent and use absolute starts reconstructed from ``seq_lens``.
+
+    prefill_ckpt_offsets ([max_num_seqs], 0 for none) specifies per-request
+    query offsets for internal prefill checkpoints and populates
+    PcpStageMetadata.tile_ckpt_mode.
     """
     if seq_lens.size != state_indices.size:
         raise ValueError("state_indices and seq_lens must have equal size.")
@@ -163,6 +188,7 @@ def compute_pcp_stage_metadata(
         projection_token_block_size=projection_token_block_size,
         num_qkv_out_blocks=num_qkv_out_blocks,
         num_projection_out_blocks=num_projection_out_blocks,
+        prefill_ckpt_offsets=prefill_ckpt_offsets,
     )
 
 
@@ -180,6 +206,7 @@ def _compute_pcp_stage_metadata_from_coordinates(
     projection_token_block_size: int,
     num_qkv_out_blocks: int,
     num_projection_out_blocks: int,
+    prefill_ckpt_offsets: jax.Array | None = None,
 ) -> tuple[memory_ref.MetadataRef, PcpStageMetadata]:
     """Build live PCP stages and GDN tiles from independent coordinates.
 
@@ -192,6 +219,11 @@ def _compute_pcp_stage_metadata_from_coordinates(
     The output shapes depend only on the compile bucket.  All loops stop at
     ``end_seq`` and at each request's real final token; the active stage and
     tile counts therefore never include padded request slots or padded tokens.
+
+    Because tiles step from each rank slot's start rather than the request
+    start, a checkpoint row R can fall mid-tile. When R falls strictly inside a
+    tile, a shadow tile covering [tile_start, R) is inserted immediately before
+    that tile, shifting subsequent tile indices by 1.
     """
     if pcp_size <= 1:
         raise ValueError("PCP stage metadata requires pcp_size > 1.")
@@ -213,12 +245,16 @@ def _compute_pcp_stage_metadata_from_coordinates(
         raise ValueError(
             "request_absolute_starts and state_indices must have equal size."
         )
+    has_prefill_ckpt = prefill_ckpt_offsets is not None
+    if prefill_ckpt_offsets is not None and prefill_ckpt_offsets.size != max_num_seqs:
+        raise ValueError("prefill_ckpt_offsets and state_indices must have equal size.")
 
     max_stages, max_tiles = _schedule_capacities(
         cfg,
         max_num_seqs=max_num_seqs,
         pcp_size=pcp_size,
         comm_chunk_size=comm_chunk_size,
+        prefill_checkpoints=has_prefill_ckpt,
     )
     int_dtype = jnp.int32
     ranks = jnp.arange(pcp_size, dtype=int_dtype)
@@ -228,6 +264,8 @@ def _compute_pcp_stage_metadata_from_coordinates(
     state_indices = state_indices.astype(int_dtype)
     start_seq = start_seq.astype(int_dtype)
     end_seq = end_seq.astype(int_dtype)
+    if prefill_ckpt_offsets is not None:
+        prefill_ckpt_offsets = prefill_ckpt_offsets.astype(int_dtype)
     round_size = pcp_size * comm_chunk_size
 
     initial = _BuilderState(
@@ -251,6 +289,11 @@ def _compute_pcp_stage_metadata_from_coordinates(
         tile_num_tokens=jnp.zeros((max_tiles,), dtype=int_dtype),
         tile_is_first=jnp.zeros((max_tiles,), dtype=jnp.bool_),
         tile_is_last=jnp.zeros((max_tiles,), dtype=jnp.bool_),
+        tile_ckpt_mode=(
+            jnp.full((max_tiles,), PREFILL_CKPT_NONE, dtype=int_dtype)
+            if has_prefill_ckpt
+            else None
+        ),
     )
 
     def _requests_pending(state: _BuilderState) -> jax.Array:
@@ -263,6 +306,15 @@ def _compute_pcp_stage_metadata_from_coordinates(
         query_len = query_end - query_begin
         token_owner_begin = token_owner_starts[req]
         token_owner_end = token_owner_begin + query_len
+        # Batch-flat checkpoint row R (-1 if none).
+        ckpt_row = -1
+        if prefill_ckpt_offsets is not None:
+            ckpt_offset = prefill_ckpt_offsets[req]
+            ckpt_row = jnp.where(
+                metadata.prefill_ckpt_offset_is_valid(ckpt_offset, query_len),
+                query_begin + ckpt_offset,
+                -1,
+            )
 
         rank_counts = _rank_token_count_before(
             token_owner_end,
@@ -313,9 +365,16 @@ def _compute_pcp_stage_metadata_from_coordinates(
             rank_recv = inner_state.rank_recv_start.at[stage].set(recv_starts)
             first_tile = inner_state.first_tile.at[stage].set(tile_begin)
 
-            def _emit_rank_tiles(source_rank, rank_state):
+            def _set_tile(
+                tile_arrays,
+                tile,
+                source_physical_row,
+                source_offset,
+                query_row,
+                real_size,
+                mode=None,
+            ):
                 (
-                    tile_cursor,
                     tile_stage,
                     tile_row,
                     tile_req,
@@ -323,74 +382,128 @@ def _compute_pcp_stage_metadata_from_coordinates(
                     tile_size,
                     tile_first,
                     tile_last,
-                ) = rank_state
+                ) = tile_arrays
+                return (
+                    tile_stage.at[tile].set(stage, mode=mode),
+                    tile_row.at[tile].set(
+                        source_physical_row + source_offset, mode=mode
+                    ),
+                    tile_req.at[tile].set(req, mode=mode),
+                    tile_query.at[tile].set(query_row, mode=mode),
+                    tile_size.at[tile].set(real_size, mode=mode),
+                    tile_first.at[tile].set(query_row == query_begin, mode=mode),
+                    tile_last.at[tile].set(
+                        query_row + real_size == query_end, mode=mode
+                    ),
+                )
+
+            def _emit_rank_tiles(source_rank, rank_state):
+                tile_cursor, tile_arrays, tile_ckpt_mode = rank_state
                 source_rows = valid_rows[source_rank]
                 source_num_tiles = pl.cdiv(source_rows, cfg.tile_size)
                 source_physical_row = source_rank * comm_chunk_size
                 source_query_row = stage_query_begin + dense_starts[source_rank]
 
-                def _emit_tile(tile_in_rank, tile_state):
-                    (
-                        tile_stage,
-                        tile_row,
-                        tile_req,
-                        tile_query,
-                        tile_size,
-                        tile_first,
-                        tile_last,
-                    ) = tile_state
+                ckpt_tile_in_rank = shadow_shift = 0
+                if tile_ckpt_mode is not None:
+                    slot_holds_ckpt = jnp.logical_and(
+                        source_query_row < ckpt_row,
+                        ckpt_row <= source_query_row + source_rows,
+                    )
+                    ckpt_tile_in_rank = (
+                        ckpt_row - 1 - source_query_row
+                    ) // cfg.tile_size
+                    ckpt_source_offset = ckpt_tile_in_rank * cfg.tile_size
+                    ckpt_query_row = source_query_row + ckpt_source_offset
+                    ckpt_tile_end = source_query_row + jnp.minimum(
+                        ckpt_source_offset + cfg.tile_size, source_rows
+                    )
+                    ends_at_ckpt = ckpt_tile_end == ckpt_row
+                    needs_shadow = jnp.logical_and(
+                        slot_holds_ckpt, jnp.logical_not(ends_at_ckpt)
+                    )
+                    needs_export = jnp.logical_and(slot_holds_ckpt, ends_at_ckpt)
+                    shadow_shift = needs_shadow.astype(int_dtype)
+                    # Insert the shadow tile at ckpt_tile; _emit_tile shifts
+                    # subsequent tiles by +1 so the real tile follows right
+                    # after. Out-of-range max_tiles indices are dropped by
+                    # mode="drop" when no shadow or export is needed.
+                    ckpt_tile = tile_cursor + ckpt_tile_in_rank
+                    shadow_tile = jnp.where(needs_shadow, ckpt_tile, max_tiles)
+                    export_tile = jnp.where(needs_export, ckpt_tile, max_tiles)
+                    tile_arrays = _set_tile(
+                        tile_arrays,
+                        shadow_tile,
+                        source_physical_row,
+                        ckpt_source_offset,
+                        ckpt_query_row,
+                        ckpt_row - ckpt_query_row,
+                        mode="drop",
+                    )
+                    tile_ckpt_mode = (
+                        tile_ckpt_mode.at[shadow_tile]
+                        .set(PREFILL_CKPT_SHADOW, mode="drop")
+                        .at[export_tile]
+                        .set(PREFILL_CKPT_EXPORT, mode="drop")
+                    )
+
+                def _emit_tile(tile_in_rank, tile_arrays):
                     tile = tile_cursor + tile_in_rank
+                    if has_prefill_ckpt:
+                        tile += jnp.where(
+                            tile_in_rank >= ckpt_tile_in_rank, shadow_shift, 0
+                        )
                     source_offset = tile_in_rank * cfg.tile_size
                     real_size = jnp.minimum(source_rows - source_offset, cfg.tile_size)
                     query_row = source_query_row + source_offset
-                    return (
-                        tile_stage.at[tile].set(stage),
-                        tile_row.at[tile].set(source_physical_row + source_offset),
-                        tile_req.at[tile].set(req),
-                        tile_query.at[tile].set(query_row),
-                        tile_size.at[tile].set(real_size),
-                        tile_first.at[tile].set(query_row == query_begin),
-                        tile_last.at[tile].set(query_row + real_size == query_end),
+                    return _set_tile(
+                        tile_arrays,
+                        tile,
+                        source_physical_row,
+                        source_offset,
+                        query_row,
+                        real_size,
                     )
 
                 tile_arrays = jax.lax.fori_loop(
                     0,
                     source_num_tiles,
                     _emit_tile,
-                    (
-                        tile_stage,
-                        tile_row,
-                        tile_req,
-                        tile_query,
-                        tile_size,
-                        tile_first,
-                        tile_last,
-                    ),
+                    tile_arrays,
                 )
-                return (tile_cursor + source_num_tiles, *tile_arrays)
+                next_tile_cursor = tile_cursor + source_num_tiles
+                if has_prefill_ckpt:
+                    next_tile_cursor += shadow_shift
+                return next_tile_cursor, tile_arrays, tile_ckpt_mode
 
             (
                 tile_end,
-                tile_stage,
-                tile_row,
-                tile_req,
-                tile_query,
-                tile_size,
-                tile_first,
-                tile_last,
+                (
+                    tile_stage,
+                    tile_row,
+                    tile_req,
+                    tile_query,
+                    tile_size,
+                    tile_first,
+                    tile_last,
+                ),
+                tile_ckpt_mode,
             ) = jax.lax.fori_loop(
                 0,
                 pcp_size,
                 _emit_rank_tiles,
                 (
                     tile_begin,
-                    inner_state.tile_stage,
-                    inner_state.tile_row_in_stage,
-                    inner_state.tile_request_id,
-                    inner_state.tile_query_row_start,
-                    inner_state.tile_num_tokens,
-                    inner_state.tile_is_first,
-                    inner_state.tile_is_last,
+                    (
+                        inner_state.tile_stage,
+                        inner_state.tile_row_in_stage,
+                        inner_state.tile_request_id,
+                        inner_state.tile_query_row_start,
+                        inner_state.tile_num_tokens,
+                        inner_state.tile_is_first,
+                        inner_state.tile_is_last,
+                    ),
+                    inner_state.tile_ckpt_mode,
                 ),
             )
             num_stage_tiles = tile_end - tile_begin
@@ -420,6 +533,7 @@ def _compute_pcp_stage_metadata_from_coordinates(
                 tile_num_tokens=tile_size,
                 tile_is_first=tile_first,
                 tile_is_last=tile_last,
+                tile_ckpt_mode=tile_ckpt_mode,
             )
             return window + round_size, consumed + valid_rows, next_state
 
@@ -559,5 +673,6 @@ def _compute_pcp_stage_metadata_from_coordinates(
         projection_catchup_count=projection_catchup_count,
         projection_work_offset=projection_work_offset,
         projection_work_offset_end=projection_work_offset_end,
+        tile_ckpt_mode=result.tile_ckpt_mode,
     )
     return gdn_metadata, stage_metadata

@@ -68,6 +68,8 @@ def attention_block_table_width(
         "mamba_slot_read_offsets",
         "mamba_ckpt_indices",
         "mamba_request_distribution",
+        "mamba_prefill_ckpt_offsets",
+        "mamba_prefill_ckpt_indices",
     ],
     meta_fields=[
         "sequence_layout_kind",
@@ -119,6 +121,13 @@ class AttentionMetadata:
     # the first two groups. None unless the model has mamba layers and spec
     # decoding is enabled.
     mamba_request_distribution: jax.Array | torch.Tensor | None = None
+    # (max_num_seqs,) int32: per-request internal prefill checkpoint offset in
+    # logical query tokens (0 if none). None when prefill checkpoints are off.
+    mamba_prefill_ckpt_offsets: jax.Array | torch.Tensor | None = None
+    # (max_num_seqs,) int32: this mamba group's block for the internal prefill
+    # checkpoint (-1 if none). Present iff the group declares prefill
+    # checkpoint blocks and mamba_prefill_ckpt_offsets is set.
+    mamba_prefill_ckpt_indices: jax.Array | torch.Tensor | None = None
     sequence_layout_kind: str = SequenceLayoutKind.ALL.value
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
     sequence_layout_version: int = 1
@@ -158,6 +167,9 @@ class AttentionMetadataBuilderContext:
     # emits no `mamba_ckpt_indices`.
     mamba_ckpt_window: int = 1
     mamba_request_distribution: torch.Tensor | None = None
+    # Device int32 (target_num_reqs,); populated on main-model steps and dummy
+    # runs when GDN layers declare prefill checkpoint blocks.
+    mamba_prefill_ckpt_offsets: torch.Tensor | None = None
     # Unified pool + spec decode only: the runner seeds this with an empty
     # list and each mamba group's builder appends the per-request state
     # block ids it derived from its block table, so the post-sampling
@@ -181,9 +193,46 @@ class AttentionMetadataBuilderContext:
     # means each build() uploads its own table (standalone builds, tests).
     staged_block_tables: dict | None = None
     # Per-chunk batched unified-pool mamba indices: kv_cache_group_id ->
-    # (state_indices, ckpt_indices | None) from the single
-    # `_staged_walk_products_compiled` program; None -> per-group fallback.
+    # (state_indices, ckpt_indices | None, prefill_ckpt_indices | None) from
+    # the single `_staged_walk_products_compiled` program; None -> per-group
+    # fallback.
     staged_mamba_products: dict | None = None
+
+
+def _gather_prefill_ckpt_ids(
+    table: torch.Tensor,
+    state_cols: torch.Tensor,
+    offsets: torch.Tensor,
+    num_speculative_blocks: int,
+) -> torch.Tensor:
+    """Gathers each row's prefill checkpoint block ID, or -1 if unreserved.
+
+    When reserved, the checkpoint block sits at column state_col - 1 (where
+    state_col = (seq_len - 1) // B). A row is masked to -1 when:
+    - offsets == 0 (which also masks padded rows with stale seq_lens) or
+      state_col == 0.
+    - The column holds the null block (0), meaning MambaManager did not
+      reserve a checkpoint on this step (e.g. non-final chunks under
+      prefix_cache_retention_interval=0 in vLLM #59175).
+    - The block ID at state_col - 1 also appears in
+      [state_col, state_col + num_speculative_blocks]. Because the worker's
+      block table is append-only, a speculative block that MambaManager
+      relocated from state_col - 1 into the new state/speculative tail still
+      lingers at its old column in the worker table.
+    """
+    num_cols = table.shape[1]
+    cols = state_cols - 1
+    has_ckpt = (offsets > 0) & (cols >= 0)
+    safe = torch.where(has_ckpt, cols, torch.zeros_like(cols))
+    ids = torch.gather(table, 1, safe.unsqueeze(1)).squeeze(1)
+    tail_cols = state_cols.unsqueeze(1) + torch.arange(
+        num_speculative_blocks + 1, device=table.device, dtype=state_cols.dtype
+    ).unsqueeze(0)
+    in_row = tail_cols < num_cols
+    tail = torch.gather(table, 1, torch.where(in_row, tail_cols, num_cols - 1))
+    moved = ((tail == ids.unsqueeze(1)) & in_row).any(dim=1)
+    reserved = has_ckpt & (ids != 0) & ~moved
+    return torch.where(reserved, ids, torch.full_like(ids, -1))
 
 
 def _staged_walk_products(
@@ -192,6 +241,7 @@ def _staged_walk_products(
     table_geom: tuple,
     mamba_geom: tuple,
     ckpt_window: int,
+    prefill_ckpt_offsets: torch.Tensor | None = None,
 ) -> tuple:
     """Splits the staged flat block-table buffer into per-group tables and
     derives unified-pool mamba state and checkpoint indices."""
@@ -200,9 +250,10 @@ def _staged_walk_products(
         outs.append(staged_dev[off : off + n * t].clone())
     states = []
     ckpts = []
+    prefill_ckpts = []
     if mamba_geom:
         active = seq_lens > 0
-        for ti, t, bs in mamba_geom:
+        for ti, t, bs, prefill_ckpt_spec_blocks in mamba_geom:
             off, n, _ = table_geom[ti]
             tbl = staged_dev[off : off + n * t].view(n, t)
             state_offsets = torch.clamp((seq_lens - 1) // bs, min=0, max=t - 1).to(
@@ -217,7 +268,19 @@ def _staged_walk_products(
                 in_row = (ckpt_offsets < t) & active.unsqueeze(1)
                 safe = torch.where(in_row, ckpt_offsets, torch.zeros_like(ckpt_offsets))
                 ckpts.append(torch.gather(tbl, 1, safe) * in_row)
-    return tuple(outs) + tuple(states) + tuple(ckpts)
+            if (
+                prefill_ckpt_offsets is not None
+                and prefill_ckpt_spec_blocks is not None
+            ):
+                prefill_ckpts.append(
+                    _gather_prefill_ckpt_ids(
+                        tbl,
+                        state_offsets,
+                        prefill_ckpt_offsets,
+                        prefill_ckpt_spec_blocks,
+                    )
+                )
+    return tuple(outs) + tuple(states) + tuple(ckpts) + tuple(prefill_ckpts)
 
 
 @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
@@ -227,19 +290,29 @@ def _staged_walk_products_compiled(
     table_geom: tuple,
     mamba_geom: tuple,
     ckpt_window: int,
+    prefill_ckpt_offsets: torch.Tensor | None = None,
 ) -> tuple:
-    """One device program for everything the metadata walk consumes:
-    per-group block-table splits (graph outputs are distinct buffers, so no
-    per-group eager clone) plus the unified-pool mamba state/checkpoint
-    gathers. `table_geom` is `((offset, num_reqs, num_blocks), ...)` in walk
-    order; `mamba_geom` is `((table_geom_index, num_blocks, block_size),
-    ...)`; both are static per padding bucket. Returns `tables... +
-    states... + (ckpts... if ckpt_window > 1)`. Issued for every staged walk
-    (dummy runs included) so warmup and lockstep ranks dispatch the same
-    program sequence.
+    """Fused device program for per-group block-table splits and unified-pool
+    mamba state/checkpoint gathers.
+
+    - table_geom: ((offset, num_reqs, num_blocks), ...) in walk order.
+    - mamba_geom: ((table_geom_index, num_blocks, block_size,
+      prefill_ckpt_spec_blocks), ...), where prefill_ckpt_spec_blocks is the
+      group's speculative block count when it declares prefill checkpoints and
+      None otherwise. Both geoms are static per padding bucket.
+    - Returns: tables + states + (ckpts if ckpt_window > 1) + (prefill_ckpts
+      for declaring groups if prefill_ckpt_offsets is given).
+
+    Issued for every staged walk, dummy runs included, so warmup and lockstep
+    ranks dispatch the same program sequence.
     """
     return _staged_walk_products(
-        staged_dev, seq_lens, table_geom, mamba_geom, ckpt_window
+        staged_dev,
+        seq_lens,
+        table_geom,
+        mamba_geom,
+        ckpt_window,
+        prefill_ckpt_offsets,
     )
 
 
@@ -260,6 +333,15 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             except Exception:
                 cp_world_size = 1
             self.target_block_size *= cp_world_size
+        # Store num_speculative_blocks for groups declaring prefill checkpoints
+        # (None otherwise) so _gather_prefill_ckpt_ids knows how many trailing
+        # speculative columns to scan for relocated blocks.
+        self.prefill_ckpt_spec_blocks: int | None = (
+            kv_cache_spec.num_speculative_blocks
+            if self.is_mamba_group and kv_cache_spec.num_prefill_checkpoint_blocks > 0
+            else None
+        )
+        self.has_prefill_ckpt_blocks = self.prefill_ckpt_spec_blocks is not None
         # Only mamba/GDN layers consume physical state slot ids; attention
         # groups leave AttentionMetadata.mamba_state_indices None.
 
@@ -401,6 +483,7 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             input_positions = runner.position_ids
 
         mamba_ckpt_indices = None
+        mamba_prefill_ckpt_indices = None
         if not self.is_mamba_group:
             mamba_state_indices = None
         elif ctx.mamba_state_indices is not None:
@@ -423,7 +506,11 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             if staged_products is not None:
                 # Derived in the single `_staged_walk_products_compiled`
                 # program alongside the staged tables.
-                mamba_state_indices, mamba_ckpt_indices = staged_products
+                (
+                    mamba_state_indices,
+                    mamba_ckpt_indices,
+                    mamba_prefill_ckpt_indices,
+                ) = staged_products
             else:
                 block_tables_2d = block_tables_dev.reshape(
                     target_num_reqs, target_num_blocks
@@ -449,6 +536,16 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                         dim=1,
                         index=ckpt_index,
                     ) * cast(torch.Tensor, ckpt_in_row)
+                if (
+                    ctx.mamba_prefill_ckpt_offsets is not None
+                    and self.prefill_ckpt_spec_blocks is not None
+                ):
+                    mamba_prefill_ckpt_indices = _gather_prefill_ckpt_ids(
+                        block_tables_2d,
+                        state_index.squeeze(1),
+                        ctx.mamba_prefill_ckpt_offsets,
+                        self.prefill_ckpt_spec_blocks,
+                    )
             if ctx.unified_mamba_state_indices is not None:
                 # Spec decode: expose this group's state blocks for the
                 # post-sampling read-offset scatter.
@@ -462,6 +559,13 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         else:
             mamba_slot_read_offsets = None
             mamba_request_distribution = None
+        mamba_prefill_ckpt_offsets = (
+            ctx.mamba_prefill_ckpt_offsets if self.has_prefill_ckpt_blocks else None
+        )
+        if mamba_prefill_ckpt_offsets is not None:
+            assert mamba_prefill_ckpt_indices is not None, (
+                "Prefill checkpoints need the unified KV pool."
+            )
 
         return AttentionMetadata(
             input_positions=input_positions,
@@ -473,6 +577,8 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_slot_read_offsets=mamba_slot_read_offsets,
             mamba_ckpt_indices=mamba_ckpt_indices,
             mamba_request_distribution=mamba_request_distribution,
+            mamba_prefill_ckpt_offsets=mamba_prefill_ckpt_offsets,
+            mamba_prefill_ckpt_indices=mamba_prefill_ckpt_indices,
             sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
             sequence_layout_protocol=(ctx.sequence_layout_descriptor.protocol),
             sequence_layout_version=ctx.sequence_layout_descriptor.version,
@@ -554,12 +660,19 @@ def stage_block_table_uploads(
     # (ctx.mamba_state_indices) wins, otherwise the unified layout derives
     # per-group indices — which is what this precompute batches.
     unified_mamba = ctx.mamba_state_indices is None and runner._unified_kv_layout
-    mamba_geom: list[tuple[int, int, int]] = []
+    mamba_geom: list[tuple[int, int, int, int | None]] = []
     mamba_entry_indices: list[int] = []
     if unified_mamba:
         for i, builder in enumerate(entry_builders):
             if builder.is_mamba_group:
-                mamba_geom.append((i, table_geom[i][2], builder.target_block_size))
+                mamba_geom.append(
+                    (
+                        i,
+                        table_geom[i][2],
+                        builder.target_block_size,
+                        builder.prefill_ckpt_spec_blocks,
+                    )
+                )
                 mamba_entry_indices.append(i)
 
     if len(entries) == 1 and not mamba_geom:
@@ -571,22 +684,19 @@ def stage_block_table_uploads(
         ctx.staged_block_tables = {gid: staged_dev[:length]}
         return
 
-    if staged_dev.device.type == "tpu":
-        products = _staged_walk_products_compiled(
-            staged_dev,
-            ctx.seq_lens,
-            tuple(table_geom),
-            tuple(mamba_geom),
-            ctx.mamba_ckpt_window,
-        )
-    else:
-        products = _staged_walk_products(
-            staged_dev,
-            ctx.seq_lens,
-            tuple(table_geom),
-            tuple(mamba_geom),
-            ctx.mamba_ckpt_window,
-        )
+    walk = (
+        _staged_walk_products_compiled
+        if staged_dev.device.type == "tpu"
+        else _staged_walk_products
+    )
+    products = walk(
+        staged_dev,
+        ctx.seq_lens,
+        tuple(table_geom),
+        tuple(mamba_geom),
+        ctx.mamba_ckpt_window,
+        ctx.mamba_prefill_ckpt_offsets,
+    )
 
     n_tables = len(entries)
     n_mamba = len(mamba_geom)
@@ -595,9 +705,24 @@ def stage_block_table_uploads(
     }
     if n_mamba:
         states = products[n_tables : n_tables + n_mamba]
-        has_ckpt = ctx.mamba_ckpt_window > 1
-        ckpts = products[n_tables + n_mamba :] if has_ckpt else (None,) * n_mamba
-        ctx.staged_mamba_products = {
-            entries[ei][0]: (states[j], ckpts[j] if has_ckpt else None)
-            for j, ei in enumerate(mamba_entry_indices)
-        }
+        rest = products[n_tables + n_mamba :]
+        if ctx.mamba_ckpt_window > 1:
+            ckpts = rest[:n_mamba]
+            rest = rest[n_mamba:]
+        else:
+            ckpts = (None,) * n_mamba
+        # Prefill checkpoint ids follow, one per group that declares them.
+        prefill_ckpts = iter(rest)
+        ctx.staged_mamba_products = {}
+        for j, ei in enumerate(mamba_entry_indices):
+            prefill_ckpt = (
+                next(prefill_ckpts)
+                if ctx.mamba_prefill_ckpt_offsets is not None
+                and mamba_geom[j][3] is not None
+                else None
+            )
+            ctx.staged_mamba_products[entries[ei][0]] = (
+                states[j],
+                ckpts[j],
+                prefill_ckpt,
+            )
