@@ -640,3 +640,76 @@ def test_wan_self_attention_patch_falls_back_on_f32():
 
     apply_omni_model_specific_patches()
     assert WanSelfAttention()(torch.ones(1, 3, 8)) == "native"
+
+
+def test_tpu_flash_attention_key_padding_route(monkeypatch):
+    """Prefix key-padded calls (MiniMax-H3 [real, pad] packing) take Pallas."""
+    from types import SimpleNamespace
+
+    mock_op = MagicMock(side_effect=lambda q, k, v, scale: q.clone())
+    kv_len_op = MagicMock(side_effect=lambda q, k, v, kv_len, scale: q.clone())
+    monkeypatch.setattr(
+        "vllm_torchtpu.omni.attention._flash_attention_op", lambda: mock_op
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.omni.attention._flash_attention_kv_len_op", lambda: kv_len_op
+    )
+    sdpa_calls = []
+
+    def fake_sdpa(self, query, key, value, attn_metadata=None):
+        sdpa_calls.append(attn_metadata)
+        return query.clone()
+
+    monkeypatch.setattr(TpuSDPAImpl, "forward", fake_sdpa)
+    mock_warn = MagicMock()
+    monkeypatch.setattr("vllm_torchtpu.omni.attention.logger.warning_once", mock_warn)
+
+    q = torch.randn(1, 16, 6, 16, dtype=torch.bfloat16)
+    k = torch.randn(1, 16, 6, 16, dtype=torch.bfloat16)
+    v = torch.randn(1, 16, 6, 16, dtype=torch.bfloat16)
+    impl = TpuFlashAttentionImpl(num_heads=6, head_size=16, softmax_scale=0.25)
+    # minimax_h3_transformer.py:603-622: arange(S)[None] < used plus the
+    # valid_kv_length contract.
+    mask = torch.arange(16)[None] < 11
+    extra = {"valid_kv_length": 11, "cu_seqlens_k": torch.tensor([0, 11, 16])}
+    meta = SimpleNamespace(attn_mask=mask, extra=extra)
+
+    out = impl.forward(q, k, v, attn_metadata=meta)
+    assert out.shape == q.shape
+    kv_len_op.assert_called_once()
+    query, key, value, kv_len, scale = kv_len_op.call_args.args
+    assert query is q and key is k and value is v and scale == 0.25
+    assert kv_len.dtype == torch.int32 and kv_len.tolist() == [11]
+    mock_op.assert_not_called()
+    mock_warn.assert_not_called()
+    assert sdpa_calls == []
+
+    # Unmasked calls keep the plain kernel.
+    impl.forward(q, k, v)
+    mock_op.assert_called_once()
+
+    # Calls outside the contract keep the SDPA fallback.
+    causal = TpuFlashAttentionImpl(
+        num_heads=6, head_size=16, softmax_scale=0.25, causal=True
+    )
+    bad_metadata = [
+        SimpleNamespace(attn_mask=mask),
+        SimpleNamespace(attn_mask=mask, extra={}),
+        SimpleNamespace(attn_mask=mask[:, None, None], extra=extra),
+        SimpleNamespace(attn_mask=mask.float(), extra=extra),
+        SimpleNamespace(attn_mask=mask[:, :15], extra=extra),
+        SimpleNamespace(attn_mask=mask, extra={"valid_kv_length": True}),
+        SimpleNamespace(attn_mask=mask, extra={"valid_kv_length": 0}),
+        SimpleNamespace(attn_mask=mask, extra={"valid_kv_length": 17}),
+        SimpleNamespace(attn_mask=mask, extra={"valid_kv_length": 11.0}),
+    ]
+    fallbacks = [(impl, q, k, v, case) for case in bad_metadata] + [
+        (causal, q, k, v, meta),
+        (impl, q.float(), k.float(), v.float(), meta),
+    ]
+    for index, (attn, query, key, value, case) in enumerate(fallbacks):
+        attn.forward(query, key, value, attn_metadata=case)
+        assert len(sdpa_calls) == index + 1, index
+        assert sdpa_calls[-1] is case
+    kv_len_op.assert_called_once()
+    mock_op.assert_called_once()

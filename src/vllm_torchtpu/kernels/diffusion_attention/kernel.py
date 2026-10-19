@@ -23,6 +23,9 @@
 #   stay at least 13 log2 units above the f32 flush threshold.
 # - Set _splash_vmem_limit_bytes() to 1x physical VMEM and check
 #   head_dim % spec.num_lanes.
+# - Optional kv_len (a scalar-prefetched count of leading real keys per batch
+#   row) masks padding keys in-kernel, and fixed_m_operands() takes the
+#   matching key mask (key_valid) so its bound covers the real keys only.
 # ruff: noqa: E741
 
 """Custom Pallas flash attention kernel for TPU.
@@ -97,7 +100,12 @@ def max_row_norm_per_head(x: jax.Array, *, seq_axis: int = 2) -> jax.Array:
 
 
 def fixed_m_operands(
-    query_scaled: jax.Array, key: jax.Array, *, gate: float, seq_axis: int = 2
+    query_scaled: jax.Array,
+    key: jax.Array,
+    *,
+    gate: float,
+    seq_axis: int = 2,
+    key_valid: jax.Array | None = None,
 ) -> jax.Array:
     """Builds the ``(2, heads)`` fixed-m scalar-prefetch operand.
 
@@ -114,14 +122,28 @@ def fixed_m_operands(
         gate: eligibility bound; heads above it fall back to online
             softmax in-kernel.
         seq_axis: sequence axis, per ``max_row_norm_per_head``.
+        key_valid: optional boolean mask of the real keys, broadcastable to
+            ``key`` (size 1 on the head and dim axes). The key mean and the
+            centred key norms are then taken over the real keys only, which
+            are the keys a ``kv_len`` kernel call attends to.
 
     Returns:
         Row 0 = integral CS bound (the kernel's m), row 1 = flag.
     """
     k32 = key.astype(jnp.float32)
-    k_mean = k32.mean(axis=seq_axis, keepdims=True)
+    if key_valid is None:
+        k_mean = k32.mean(axis=seq_axis, keepdims=True)
+        k_cent = k32 - k_mean
+    else:
+        # Padding keys get no weight in-kernel, so centre on the real keys'
+        # mean. The gate needs max_j(q_i . (k_j - mean)) >= 0, and over the
+        # real keys that holds only for their own mean.
+        weight = key_valid.astype(jnp.float32)
+        count = jnp.maximum(weight.sum(axis=seq_axis, keepdims=True), 1.0)
+        k_mean = (k32 * weight).sum(axis=seq_axis, keepdims=True) / count
+        k_cent = (k32 - k_mean) * weight
     qn_max = max_row_norm_per_head(query_scaled, seq_axis=seq_axis)
-    kn_cent_max = max_row_norm_per_head(k32 - k_mean, seq_axis=seq_axis)
+    kn_cent_max = max_row_norm_per_head(k_cent, seq_axis=seq_axis)
     kn_mean_norm = jnp.sqrt((k_mean**2).sum(axis=-1)).max(axis=(0, seq_axis))
     # GQA: each query head takes the norms of the kv head it attends to.
     rep = qn_max.shape[0] // kn_cent_max.shape[0]
@@ -180,10 +202,7 @@ class BlockSizes:
 # pylint: disable=too-many-statements
 def _flash_attention_kernel(
     mk_ref: Any,  # (2, num_heads) f32 prefetch: [0]=ceil(CS bound), [1]=flag
-    q_ref: Any,  # (bq, head_dim_qk) bf16
-    k_ref: Any,  # (bkv, head_dim_qk) bf16
-    v_ref: Any,  # (bkv, head_dim_v) bf16
-    *refs: Any,  # (m, l, o) cross-j scratch, real outputs
+    *refs: Any,  # [kv_len prefetch], q, k, v, (m, l, o) scratch, real outputs
     mask_value: float,
     grid_width: int,
     bkv: int,
@@ -192,6 +211,7 @@ def _flash_attention_kernel(
     kv_seq_len: int,
     use_fixed_m: bool,
     score_scale: float,
+    has_kv_len: bool = False,
 ) -> None:
     """Hybrid fixed-m / online-softmax flash attention over one (h, i) tile.
 
@@ -199,12 +219,23 @@ def _flash_attention_kernel(
     onto the fixed-m fast path (``m`` = integral CS bound, no reduce_max /
     alpha-rescale); outliers keep online softmax. Matmuls: bf16 x bf16, f32
     accumulate. Scores are ``score_scale * (q . k)`` in f32.
+
+    With ``has_kv_len``, a second scalar prefetch ``(1,)`` int32 holds the
+    number of leading real keys; scores of later keys are replaced by
+    ``mask_value`` before the exp2, on the fixed-m and online paths alike.
     """
     float32 = jnp.float32
     # Pallas passes inputs then outputs positionally. The first three
     # "outputs" are the cross-j (m, l, o) scratch, declared as outputs with
     # constant index maps so they persist across the j sweep; the rest are
     # the real outputs.
+    if has_kv_len:
+        kv_len_ref, q_ref, k_ref, v_ref, *refs = refs
+    else:
+        kv_len_ref = None
+        q_ref, k_ref, v_ref, *refs = refs
+    # q_ref (bq, head_dim_qk), k_ref (bkv, head_dim_qk), v_ref (bkv,
+    # head_dim_v), all bf16.
     m_scratch_ref, l_scratch_ref, o_scratch_ref, *out_refs = refs
     _, rem = divmod(head_dim_v, NUM_SUBLANES)
     if rem != 0:
@@ -248,20 +279,32 @@ def _flash_attention_kernel(
         else:
             m_scratch_ref[...] = jnp.full_like(m_scratch_ref, mask_value)
 
-    def _update(slice_k, fixed: bool):
-        """One KV sub-block update; ``fixed`` selects the softmax variant."""
+    def _update(slice_k, fixed: bool, kv_start):
+        """One KV sub-block update; ``fixed`` selects the softmax variant.
+
+        ``kv_start`` is the absolute position of the sub-block's first key.
+        """
         q = q_ref[...]  # (bq, head_dim) bf16
         k_chunk = k_ref[slice_k, :]  # (bkv_compute, head_dim) bf16
         v_chunk = v_ref[slice_k, :]  # (bkv_compute, head_dim_v) bf16
         # QK matmul: bf16 x bf16 -> f32 accumulate, (bkv_compute, bq).
         qk = lax.dot_general(k_chunk, q, NT_DIM_NUMBERS, preferred_element_type=float32)
+        key_valid = None
+        if kv_len_ref is not None:
+            # Keys run down the sublanes of the (keys, queries) score tile.
+            key_pos = kv_start + lax.broadcasted_iota(jnp.int32, qk.shape, 0)
+            key_valid = key_pos < kv_len_ref[0]
 
         if fixed:
             # Fixed m is a per-head constant: no reduce_max and no alpha
             # rescale — plain accumulate at scale 2^-m. Read it from scalar
             # prefetch, not m_scratch: the scratch tile is (NUM_SUBLANES, bq)
             # f32 and only row 0 carries information.
-            s_curr = _exp2(qk * score_scale - (mk_ref[0, h] - FIXED_M_RECENTER))
+            if key_valid is None:
+                s_curr = _exp2(qk * score_scale - (mk_ref[0, h] - FIXED_M_RECENTER))
+            else:
+                logits = jnp.where(key_valid, qk * score_scale, mask_value)
+                s_curr = _exp2(logits - (mk_ref[0, h] - FIXED_M_RECENTER))
             s_cast = s_curr.astype(jnp.bfloat16)
             # l comes from an f32 VPU reduce, not the textbook "append a ones
             # row to V and read l out of the PV matmul": s never leaves VREGs,
@@ -280,6 +323,8 @@ def _flash_attention_kernel(
 
         # Online softmax update (all f32).
         qk = qk * score_scale
+        if key_valid is not None:
+            qk = jnp.where(key_valid, qk, mask_value)
         m_prev, l_prev = m_scratch_ref[...], l_scratch_ref[...]
         m_curr = qk.max(axis=0)[None, :]
         m_next = jnp.maximum(m_prev, m_curr)
@@ -299,7 +344,8 @@ def _flash_attention_kernel(
 
     def _compute_body(fixed: bool):
         def compute_body(kv_compute_index, _):
-            _update(pl.ds(kv_compute_index * bkv_compute, bkv_compute), fixed)
+            start = kv_compute_index * bkv_compute
+            _update(pl.ds(start, bkv_compute), fixed, j * bkv + start)
 
         return compute_body
 
@@ -308,7 +354,8 @@ def _flash_attention_kernel(
     def last_compute_body(kv_compute_index):
         # Final partial sub-block when kv_seq_len % bkv_compute != 0.
         slice_len = kv_seq_len % bkv_compute
-        _update(pl.ds(kv_compute_index * bkv_compute, slice_len), False)
+        start = kv_compute_index * bkv_compute
+        _update(pl.ds(start, slice_len), False, j * bkv + start)
 
     assert bkv % bkv_compute == 0
 
@@ -376,6 +423,7 @@ def _splash_attention_forward(
     kv_seq_len: int | None = None,
     use_fixed_m: bool = False,
     column_heads: tuple[int, int] | None = None,
+    kv_len: jax.Array | None = None,
 ):
     """Runs the fused splash kernel over ``(heads, seq, dim)`` q/k/v.
 
@@ -394,6 +442,8 @@ def _splash_attention_forward(
         column_heads: ``(num_heads, num_kv_heads)`` when q/k/v are
             ``(seq, heads * dim)`` instead: each head is a lane-aligned
             column block, DMA'd in place with no transposes.
+        kv_len: optional ``(1,)`` int32 count of leading real keys, passed
+            as a second scalar prefetch; later keys are masked in-kernel.
 
     Returns:
         The normalized output ``(num_heads, head_dim_v, seq_q)`` in
@@ -480,9 +530,10 @@ def _splash_attention_forward(
             kv_seq_len=actual_kv_seq_len,
             use_fixed_m=use_fixed_m,
             score_scale=score_scale,
+            has_kv_len=kv_len is not None,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=1,
+            num_scalar_prefetch=1 if kv_len is None else 2,
             in_specs=in_specs,
             out_specs=out_specs,
             grid=grid,
@@ -493,7 +544,7 @@ def _splash_attention_forward(
             vmem_limit_bytes=_splash_vmem_limit_bytes(),
         ),
         out_shape=out_shapes,
-    )(mk, q, k, v)
+    )(*((mk,) if kv_len is None else (mk, kv_len)), q, k, v)
     return all_out[first_out]
 
 
@@ -535,6 +586,7 @@ def flash_attention_bshd(
     *,
     scale: float | None,
     use_fixed_m: bool = True,
+    kv_len: jax.Array | None = None,
 ) -> jax.Array:
     """Device-local custom splash attention, normalized.
 
@@ -548,6 +600,14 @@ def flash_attention_bshd(
         block. ``key`` is passed uncentred; ``fixed_m_operands`` splits
         ``k = (k - mean(k)) + mean(k)`` in f32 to bound raw-key scores
         against ``FIXED_M_SAFE_BOUND`` without a second bf16 rounding.
+      kv_len: Optional ``(B,)`` integer count of leading real keys per batch
+        row, for key padding whose real keys are a prefix (MiniMax-H3's
+        ``[real, pad]`` packing). Keys at positions ``>= kv_len[b]`` get no
+        weight. Every query row, padding rows included, attends over the
+        real keys only, as PyTorch SDPA does with the equivalent
+        ``(B, seq_kv)`` boolean key mask. Must lie in ``[1, seq_kv]``. It is
+        a device value, so shapes and the compiled kernel do not depend on
+        it.
 
     Returns:
       ``(B, seq_q, heads, dim)`` in ``query``'s dtype.
@@ -577,11 +637,18 @@ def flash_attention_bshd(
     k = key.astype(jnp.bfloat16)
     v = value.astype(jnp.bfloat16)
     if use_fixed_m:
+        key_valid = None
+        if kv_len is not None:
+            key_valid = (
+                jnp.arange(kv_orig_len, dtype=jnp.int32)[None, :]
+                < kv_len.astype(jnp.int32).reshape(-1, 1)
+            )[:, :, None, None]
         mk_arr = fixed_m_operands(
             q.astype(jnp.float32) * score_scale,
             k,
             gate=FIXED_M_SAFE_BOUND,
             seq_axis=1,
+            key_valid=key_valid,
         )
     else:
         mk_arr = jnp.zeros((2, 1), jnp.float32)  # unused placeholder
@@ -600,7 +667,7 @@ def flash_attention_bshd(
         column_heads = None
         q, k, v = (jnp.swapaxes(x, 1, 2) for x in (q, k, v))
 
-    def _kernel_3d(q_3d, k_3d, v_3d):
+    def _kernel_3d(q_3d, k_3d, v_3d, kv_len_row=None):
         # mk_arr is closed over, so it stays unmapped under the vmap —
         # matching the kernel's (2, heads) prefetch operand.
         return _splash_attention_forward(
@@ -614,8 +681,21 @@ def flash_attention_bshd(
             kv_seq_len=kv_orig_len,
             use_fixed_m=use_fixed_m,
             column_heads=column_heads,
+            kv_len=kv_len_row,
         )
 
-    out = jax.vmap(_kernel_3d, in_axes=(0, 0, 0), out_axes=0)(q, k, v)
+    if kv_len is None:
+        out = jax.vmap(_kernel_3d, in_axes=(0, 0, 0), out_axes=0)(q, k, v)
+    else:
+        # One call per batch row (MiniMax-H3 packs a single row): each row's
+        # kv_len is its own scalar prefetch, so the prefetch operand needs
+        # no batching rule.
+        kv_len_rows = kv_len.astype(jnp.int32).reshape(-1)
+        out = jnp.stack(
+            [
+                _kernel_3d(q[b], k[b], v[b], kv_len_rows[b : b + 1])
+                for b in range(q.shape[0])
+            ]
+        )
     # Output is (B, heads, dim, seq) — transpose back to (B, seq, heads, dim).
     return out.transpose(0, 3, 1, 2).astype(query.dtype)
