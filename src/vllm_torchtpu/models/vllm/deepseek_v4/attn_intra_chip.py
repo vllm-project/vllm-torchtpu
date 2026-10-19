@@ -13,23 +13,39 @@
 # limitations under the License.
 """Intra-chip TP for DSv4 attention weights, with KV and attention kept DP.
 
-Under DP=16/TP=1 every core holds all of `wq_b`, `wo_a` and `wo_b`, roughly
-285 MB per layer. `VllmDeepseekV4MLAAttentionIntraChip` splits those three
-across the two cores of a chip: each core keeps half the heads of `wq_b` and
-half the o-groups of `wo_a`/`wo_b`. vLLM still sees DP=16/TP=1, so the
-scheduler, router, KV pool and the sparse-attention kernels are unchanged and
-run over all 128 heads for this rank's own sequences.
+`VllmDeepseekV4MLAAttentionIntraChip` splits wq_b, wo_a, and wo_b across the two
+chiplets within a chip, only applicable for chips like Ironwood that have two
+chiplets per chip. Each chiplet keeps half the heads of `wq_b` and half the
+o-groups of `wo_a`/`wo_b`.
+To address the weights being sharded, during runtime the chiplets exchange their
+activations back and forth via manually inserted collectives.
 
-Per layer, inside the chip pair (tokens are padded to the same bucket on every
-DP rank, so shapes match):
-  1. all-gather `qr` -> q for my 64 heads over both cores' tokens
-  2. swap halves -> q for all 128 heads over my tokens; attention runs locally
-  3. swap halves back -> o for my 64 heads over both cores' tokens
-  4. fused inverse-RoPE + `wo_a` on my 8 groups, `wo_b` on my 8192 rows
-  5. reduce-scatter -> my tokens' full output
+T0 and T1 are the tokens of chiplet 0 and chiplet 1. Specifically, each chiplet
+does the following:
+  1. All-gather `qr` with the neighboring chiplet.
+     Chiplet 0 has [T0, T1] and Chiplet 1 has [T0, T1]
+  2. Run WQ_B projection on gathered values.
+     Now each chiplet has q for half of the heads, for both chiplets' tokens.
+     Chiplet 0 has [T0_(0-63h), T1_(0-63h)] and Chiplet 1 has
+     [T0_(64-127h), T1_(64-127h)].
+  3. Swap the tokens post the projection.
+     Chiplet 0 has [T0_(0-127h)] and Chiplet 1 has [T1_(0-127h)]
+  4. Perform attention operations for the layer, doing (QK_T)V to get output.
+  5. Swap the attention output, as `wo_a`/`wo_b` only contain some of the heads.
+     Gather positions, since each chiplet applies inverse RoPE to both chiplets'
+     tokens.
+     Before Swap: Chiplet 0 has [Out0_(0-127h)], Chiplet 1 has [Out1_(0-127h)]
+     After Swap: Chiplet 0 has [Out0_(0-63h), Out1_(0-63h)],
+     Chiplet 1 has [Out0_(64-127h), Out1_(64-127h)]
+  6. Each chiplet performs fused inverse-RoPE + `wo_a` on 8 groups.
+     Chiplet 0 has [Out0_(0-7g), Out1_(0-7g)],
+     Chiplet 1 has [Out0_(8-15g), Out1_(8-15g)]
+     Then each chiplet does `wo_b` projection, resulting in partials.
+     Chiplet 0 has [Out0_P0, Out1_P0], Chiplet 1 has [Out0_P1, Out1_P1]
+  7. Each chiplet performs reduce-scatter to get final output.
+     Chiplet 0 has [Out0_P0 + Out0_P1], Chiplet 1 has [Out1_P0 + Out1_P1]
 
-Every collective is issued here, over the chip-pair group; none are left to
-the compiler. Experimental: `DeepseekV4DecoderLayer` uses this class when
+Experimental: `DeepseekV4DecoderLayer` uses this class when
 TPU_DSV4_ATTN_INTRA_CHIP_TP=1.
 """
 
@@ -44,68 +60,22 @@ from vllm_torchtpu.models.vllm.deepseek_v4.attention import VllmDeepseekV4MLAAtt
 
 logger = init_logger(__name__)
 
-_group: parallel_state.GroupCoordinator | None = None
 
+def _chip_pair_group() -> parallel_state.GroupCoordinator:
+    """The intra-chip group, which must exist and pair exactly two cores."""
+    from vllm_torchtpu.distributed.intra_chip import get_intra_chip_group
 
-def _pair_groups() -> list[list[int]]:
-    """Global ranks grouped by physical chip, from each rank's device id."""
-    from vllm_torchtpu.distributed.chip_topology import get_chip_topology
-    from vllm_torchtpu.distributed.mesh_utils import (
-        _collect_rank_to_device_id,
-        _get_current_global_rank,
-        _get_tpu_global_device_id,
-    )
-
-    world = parallel_state.get_world_group()
-    rank_to_device = _collect_rank_to_device_id(
-        world, _get_current_global_rank(), _get_tpu_global_device_id()
-    )
-    topology = None
-    try:
-        topology = get_chip_topology()
-    except Exception as error:  # noqa: BLE001 - optional capability probe
-        logger.warning("ATTN_INTRA_CHIP_TP: chip topology unavailable: %s", error)
-    if topology is not None and all(
-        any(d in chip for chip in topology.chips) for d in rank_to_device.values()
-    ):
-        chip_of_device = {d: i for i, chip in enumerate(topology.chips) for d in chip}
-        source = "coords"
-    else:
-        # tpu7x numbers a chip's two TensorCores 2k and 2k+1.
-        chip_of_device = {d: d // 2 for d in rank_to_device.values()}
-        source = "device_id // 2"
-    by_chip: dict[int, list[int]] = {}
-    for rank, device in rank_to_device.items():
-        by_chip.setdefault(chip_of_device[device], []).append(rank)
-    groups = [sorted(by_chip[c]) for c in sorted(by_chip)]
-    logger.info(
-        "ATTN_INTRA_CHIP_TP: chip pairs from %s: %s (rank->device %s)",
-        source,
-        groups,
-        dict(sorted(rank_to_device.items())),
-    )
-    if any(len(g) != 2 for g in groups):
-        raise RuntimeError(f"ATTN_INTRA_CHIP_TP needs 2 cores per chip, got {groups}")
-    return groups
-
-
-def get_chip_pair_group() -> parallel_state.GroupCoordinator:
-    """The GroupCoordinator over this rank's chip pair. Collective on first call."""
-    global _group
-    if _group is None:
-        import torch.distributed as dist
-
-        world = parallel_state.get_world_group()
-        _group = parallel_state.init_model_parallel_group(
-            _pair_groups(),
-            world.local_rank,
-            dist.get_backend(world.device_group),
-            group_name="attn_intra_chip",
+    group = get_intra_chip_group()
+    if group is None or group.world_size != 2:
+        raise RuntimeError(
+            "TPU_DSV4_ATTN_INTRA_CHIP_TP needs a 2-core intra-chip group, got "
+            f"{None if group is None else group.world_size}; see the intra-chip "
+            "grouping warning above"
         )
-    return _group
+    return group
 
 
-def _use_my_slice(layer: torch.nn.Module, rank: int, size: int) -> None:
+def _load_current_chiplet_slice(layer: torch.nn.Module, rank: int, size: int) -> None:
     """Make `layer` load slice `rank` of `size` from the full checkpoint tensors.
 
     vLLM's loaders slice by `tp_rank`/`tp_size`, kept on the layer (unquantized
@@ -119,7 +89,7 @@ def _use_my_slice(layer: torch.nn.Module, rank: int, size: int) -> None:
             param.tp_rank, param.tp_size = rank, size
 
 
-def _swap_with_peer(group, mine: torch.Tensor, theirs: torch.Tensor):
+def _swap_with_peer_chiplet(group, mine: torch.Tensor, theirs: torch.Tensor):
     """Send `theirs` to the peer core; return what the peer sent us.
 
     A 2-rank all-gather that keeps the peer's half.
@@ -142,7 +112,7 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
                 f"got {tp_size}"
             )
         super().__init__(vllm_config, prefix, *args, **kwargs)
-        group = get_chip_pair_group()
+        group = _chip_pair_group()
         rank, size = group.rank_in_group, group.world_size
         quant_config = vllm_config.quant_config
         # Rebuilt half-size; the replicated ones from the base are dropped.
@@ -168,8 +138,9 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
         )
         self.wo_a.is_bmm = True
         self.wo_a.bmm_batch_size = self.n_groups // size
-        # RowParallelLinear takes no tp_rank/tp_size, so it is built at my
-        # half of the input rows with TP off and pointed at its slice below.
+        # RowParallelLinear takes no tp_rank/tp_size, so it is built at current
+        # chiplet's half of the input rows with TP off and pointed at its slice
+        # below.
         self.wo_b = RowParallelLinear(
             self.n_groups * self.o_lora_rank // size,
             self.hidden_size,
@@ -181,7 +152,7 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
             disable_tp=True,
         )
         for layer in (self.wq_b, self.wo_a, self.wo_b):
-            _use_my_slice(layer, rank, size)
+            _load_current_chiplet_slice(layer, rank, size)
         object.__setattr__(self, "_chip_pair", group)
         logger.info_once(
             "ATTN_INTRA_CHIP_TP: wq_b/wo_a/wo_b sharded across the chip pair"
@@ -202,11 +173,9 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
         group = self._chip_pair
         rank = group.rank_in_group
         num_tokens = qr.shape[0]
-        # q for my heads over [core0 tokens; core1 tokens].
         q_half = self.wq_b(group.all_gather(qr.contiguous(), dim=0))
         q_half = q_half.view(2, num_tokens, -1)
-        # My tokens with my heads stay; my tokens with the peer's heads arrive.
-        peer = _swap_with_peer(group, q_half[rank], q_half[1 - rank])
+        peer = _swap_with_peer_chiplet(group, q_half[rank], q_half[1 - rank])
         pieces = [q_half[rank], peer] if rank == 0 else [peer, q_half[rank]]
         q = torch.cat(pieces, dim=-1).view(
             num_tokens, self.mla_attn.n_local_heads, self.mla_attn.head_dim
@@ -236,8 +205,7 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
         num_tokens = o.shape[0]
         half = self.n_local_heads // 2
         o = o.reshape(num_tokens, 2, half, self.head_dim)
-        # Peer's tokens with my heads arrive; my tokens with my heads stay.
-        peer = _swap_with_peer(group, o[:, rank], o[:, 1 - rank])
+        peer = _swap_with_peer_chiplet(group, o[:, rank], o[:, 1 - rank])
         pieces = [o[:, rank], peer] if rank == 0 else [peer, o[:, rank]]
         o_half = torch.cat(pieces, dim=0).contiguous()
         positions_all = group.all_gather(

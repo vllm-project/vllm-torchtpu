@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """CPU check of DSv4 attention intra-chip TP against an unsharded reference.
 
 Two threads stand in for the two cores of a chip, joined by a fake chip-pair
@@ -19,8 +31,13 @@ _MODULE = (
     / "src/vllm_torchtpu/models/vllm/deepseek_v4/attn_intra_chip.py"
 )
 
-# tokens, heads, head_dim, q_lora, groups, o_lora, hidden
-T, H, D, R, G, OL, HID = 3, 16, 8, 6, 4, 5, 7
+NUM_TOKENS = 3
+NUM_HEADS = 16
+HEAD_DIM = 8
+Q_LORA_RANK = 6
+NUM_GROUPS = 4
+O_LORA_RANK = 5
+HIDDEN_SIZE = 7
 
 
 class _FakeBaseAttention:
@@ -71,6 +88,8 @@ def _load_module(monkeypatch):
 class _PairGroup:
     """Both threads exchange through a shared buffer behind a barrier."""
 
+    # GroupCoordinator.world_size for one chip's group: its two cores,
+    # independent of how many DP ranks the job has.
     world_size = 2
 
     def __init__(self, shared, rank):
@@ -94,18 +113,24 @@ class _PairGroup:
 def test_matches_unsharded_reference(monkeypatch):
     aic = _load_module(monkeypatch)
     torch.manual_seed(0)
-    wq = torch.randn(R, H * D)
-    wa = torch.randn(G, (H // G) * D, OL)
-    wb = torch.randn(G * OL, HID)
+    wq = torch.randn(Q_LORA_RANK, NUM_HEADS * HEAD_DIM)
+    wa = torch.randn(NUM_GROUPS, (NUM_HEADS // NUM_GROUPS) * HEAD_DIM, O_LORA_RANK)
+    wb = torch.randn(NUM_GROUPS * O_LORA_RANK, HIDDEN_SIZE)
     pos_scale = torch.randn(1000)
 
     def attn(q, pos):  # mixes all heads of a token, like real attention needs
         return q * pos_scale[pos][:, None, None] + q.sum(1, keepdim=True)
 
     def reference(qr, pos):
-        o = attn((qr @ wq).view(-1, H, D), pos)
-        o = o.reshape(-1, G, (H // G) * D) * pos_scale[pos][:, None, None]
-        return torch.einsum("tgk,gko->tgo", o, wa).reshape(-1, G * OL) @ wb
+        o = attn((qr @ wq).view(-1, NUM_HEADS, HEAD_DIM), pos)
+        o = (
+            o.reshape(-1, NUM_GROUPS, (NUM_HEADS // NUM_GROUPS) * HEAD_DIM)
+            * pos_scale[pos][:, None, None]
+        )
+        return (
+            torch.einsum("tgk,gko->tgo", o, wa).reshape(-1, NUM_GROUPS * O_LORA_RANK)
+            @ wb
+        )
 
     cls = aic.VllmDeepseekV4MLAAttentionIntraChip
 
@@ -114,14 +139,19 @@ def test_matches_unsharded_reference(monkeypatch):
     def make(rank):
         layer = object.__new__(cls)
         object.__setattr__(layer, "_chip_pair", _PairGroup(shared, rank))
-        heads = slice(rank * H // 2 * D, (rank + 1) * H // 2 * D)
-        groups = slice(rank * G // 2, (rank + 1) * G // 2)
-        rows = slice(rank * G // 2 * OL, (rank + 1) * G // 2 * OL)
+        heads = slice(
+            rank * NUM_HEADS // 2 * HEAD_DIM, (rank + 1) * NUM_HEADS // 2 * HEAD_DIM
+        )
+        groups = slice(rank * NUM_GROUPS // 2, (rank + 1) * NUM_GROUPS // 2)
+        rows = slice(
+            rank * NUM_GROUPS // 2 * O_LORA_RANK,
+            (rank + 1) * NUM_GROUPS // 2 * O_LORA_RANK,
+        )
         layer.wq_b = lambda x: x @ wq[:, heads]
         layer.mla_attn = types.SimpleNamespace(
-            n_local_heads=H, head_dim=D, compressor=None
+            n_local_heads=NUM_HEADS, head_dim=HEAD_DIM, compressor=None
         )
-        layer.n_local_heads, layer.head_dim = H, D
+        layer.n_local_heads, layer.head_dim = NUM_HEADS, HEAD_DIM
         layer.indexer = None
         layer.qnorm_rope = lambda q, p: q
         layer.kv_rope = lambda kv, p: kv
@@ -129,15 +159,16 @@ def test_matches_unsharded_reference(monkeypatch):
         layer.rotary_emb = types.SimpleNamespace(cos_sin_cache=None)
         layer.o_proj_op = lambda o, p, c, w, s: torch.einsum(
             "tgk,gko->tgo",
-            o.reshape(-1, G // 2, (H // G) * D) * pos_scale[p][:, None, None],
+            o.reshape(-1, NUM_GROUPS // 2, (NUM_HEADS // NUM_GROUPS) * HEAD_DIM)
+            * pos_scale[p][:, None, None],
             wa[groups],
-        ).reshape(-1, G // 2 * OL)
+        ).reshape(-1, NUM_GROUPS // 2 * O_LORA_RANK)
         layer.wo_b = lambda z: z @ wb[rows]
         layer.wo_a = types.SimpleNamespace(weight=None, weight_scale=None)
         return layer
 
-    qr = [torch.randn(T, R) for _ in range(2)]
-    pos = [torch.randint(0, 1000, (T,)) for _ in range(2)]
+    qr = [torch.randn(NUM_TOKENS, Q_LORA_RANK) for _ in range(2)]
+    pos = [torch.randint(0, 1000, (NUM_TOKENS,)) for _ in range(2)]
     out = [None, None]
     errors = []
 
@@ -167,17 +198,17 @@ def test_process_weights_sees_half_counts(monkeypatch):
     aic = _load_module(monkeypatch)
     layer = object.__new__(aic.VllmDeepseekV4MLAAttentionIntraChip)
     object.__setattr__(layer, "_chip_pair", types.SimpleNamespace(world_size=2))
-    layer.n_local_heads, layer.n_local_groups = H, G
+    layer.n_local_heads, layer.n_local_groups = NUM_HEADS, NUM_GROUPS
     layer.process_weights_after_loading(torch.bfloat16)
-    assert layer.seen_counts == (H // 2, G // 2)
-    assert (layer.n_local_heads, layer.n_local_groups) == (H, G)
+    assert layer.seen_counts == (NUM_HEADS // 2, NUM_GROUPS // 2)
+    assert (layer.n_local_heads, layer.n_local_groups) == (NUM_HEADS, NUM_GROUPS)
 
 
-def test_use_my_slice_points_layer_and_params(monkeypatch):
+def test_load_current_chiplet_slice_points_layer_and_params(monkeypatch):
     aic = _load_module(monkeypatch)
     layer = torch.nn.Linear(4, 4)
     layer.weight.tp_rank, layer.weight.tp_size = 0, 1  # like a vLLM block-fp8 param
-    aic._use_my_slice(layer, 1, 2)
+    aic._load_current_chiplet_slice(layer, 1, 2)
     assert (layer.tp_rank, layer.tp_size) == (1, 2)
     assert (layer.weight.tp_rank, layer.weight.tp_size) == (1, 2)
     assert not hasattr(layer.bias, "tp_rank")
