@@ -97,6 +97,13 @@ benchmarking = [
 # vLLM-Omni optional dependency
 omni = [
     "vllm-omni==0.31.0rc1",
+    # vllm-omni pulls torchaudio through s3tokenizer. The PyPI torchaudio is a
+    # CUDA build that fails to load libcudart, and transformers imports
+    # torchaudio whenever it is installed, so every vLLM import would fail.
+    # Take the CPU build instead (see [tool.uv.sources]). 2.11.0 is the newest
+    # torchaudio release; it declares no torch requirement and imports against
+    # torch 2.13.0.
+    "torchaudio==2.11.0",
 ]
 
 [project.entry-points."vllm.platform_plugins"]
@@ -296,3 +303,4 @@ explicit = true
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
 torchvision = { index = "pytorch-cpu" }
+torchaudio = { index = "pytorch-cpu" }
