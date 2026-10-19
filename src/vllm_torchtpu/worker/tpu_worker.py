@@ -448,16 +448,18 @@ class TPUWorker(WorkerBase):
         tpu_platform = cast(TpuPlatform, current_platform)
         dist_backend = tpu_platform.get_worker_distributed_backend(dist_world_size)
 
-        # Gloo CPU groups default to a 30 min timeout. Under model-store
-        # contention a rank can still be streaming weights after 30 min while
-        # its peers wait in a CPU collective (prefill: _draft_load_barrier;
-        # decode: the all_gather_object in mesh_utils._collect_rank_to_device_id
-        # during build_ep_mesh, j-6faea618 / j-e1887a0c), and the waiters die
-        # with "Timed out waiting 1800000ms". Default every CPU collective to
-        # 3 h (TPU_DIST_CPU_TIMEOUT_S), matching the bench's SERVER_WAIT_S.
-        cpu_timeout_s = float(os.environ.get("TPU_DIST_CPU_TIMEOUT_S", "10800"))
-        if getattr(self.parallel_config, "cpu_distributed_timeout_seconds", None) is None:
-            self.parallel_config.cpu_distributed_timeout_seconds = int(cpu_timeout_s)
+        # Gloo CPU groups wait 30 min by default. Under model-store contention
+        # a rank can still be streaming weights after that while its peers sit
+        # in a CPU collective (the draft load barrier on prefill, the
+        # all_gather_object of build_ep_mesh on decode), and the waiters die
+        # with "Timed out waiting 1800000ms". TPU_DIST_CPU_TIMEOUT_S sets the
+        # timeout of every CPU collective instead.
+        cpu_timeout_s = envs.TPU_DIST_CPU_TIMEOUT_S
+        init_kwargs: dict[str, Any] = {}
+        if cpu_timeout_s is not None:
+            if self.parallel_config.cpu_distributed_timeout_seconds is None:
+                self.parallel_config.cpu_distributed_timeout_seconds = cpu_timeout_s
+            init_kwargs["timeout"] = datetime.timedelta(seconds=cpu_timeout_s)
         with set_current_vllm_config(self.vllm_config):
             init_distributed_environment(
                 world_size=init_world,
@@ -465,7 +467,7 @@ class TPUWorker(WorkerBase):
                 local_rank=local_rank_for_init,
                 distributed_init_method=dist_init_method,
                 backend=dist_backend,
-                timeout=datetime.timedelta(seconds=cpu_timeout_s),
+                **init_kwargs,
             )
         # The PCP group keeps its natural rank order. Reordering it used to be
         # how the ring was chosen, on the understanding that the ring followed
