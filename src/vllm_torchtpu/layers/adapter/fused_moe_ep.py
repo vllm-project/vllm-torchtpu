@@ -67,10 +67,23 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
-# The tile height the kernel slabs rows into, and the unit its ragged stride
+# The tile heights the kernel slabs rows into, and the unit its ragged stride
 # rounds to. The kernel's routing tables are built against this value, so it
-# is not free to change here alone.
+# is chosen once per op (MOE_FUSED_EP_V2_TILE_M) and passed through, not
+# changed here alone.
 _TILE_M = 128
+_TILE_M_CHOICES = (128, 256)
+
+
+def _tile_m() -> int:
+    """The tile height MOE_FUSED_EP_V2_TILE_M asks for, refused by name."""
+    tile_m = envs.MOE_FUSED_EP_V2_TILE_M
+    if tile_m not in _TILE_M_CHOICES:
+        raise ValueError(
+            f"MOE_FUSED_EP_V2_TILE_M={tile_m} is not one of {_TILE_M_CHOICES}"
+        )
+    return tile_m
+
 
 # SMEM used by the resident routing tables and Mosaic's scalar working set,
 # excluding the two fixed token-gather windows. Measured by subtracting the
@@ -176,6 +189,7 @@ def _build_op(
     has_hash_ids=False,
     *,
     token_replica_groups=None,
+    tile_m=_TILE_M,
 ):
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
@@ -193,6 +207,7 @@ def _build_op(
         routed_scaling_factor,
         has_hash_ids,
         token_replica_groups,
+        tile_m,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -223,7 +238,7 @@ def _build_op(
             topk=topk,
             renormalize=renormalize,
             mesh=mesh,
-            capacity=_TILE_M,
+            capacity=tile_m,
             block=None,
             ragged_stride=None,
             weight_format=WeightFormat(weight_format),
@@ -544,7 +559,8 @@ def prebuild_fused_moe_ep(
         return None
     ep = mesh.shape[EP_AXIS_NAME]
 
-    gather_bytes = token_gather_smem_bytes(_TILE_M)
+    tile_m = _tile_m()
+    gather_bytes = token_gather_smem_bytes(tile_m)
     needed_smem = _SMEM_OVERHEAD_BYTES + gather_bytes
     smem = _smem_capacity_bytes()
     if needed_smem > smem:
@@ -655,6 +671,7 @@ def prebuild_fused_moe_ep(
         routed_scale,
         has_hash_ids,
         token_replica_groups=token_replica_groups,
+        tile_m=tile_m,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
@@ -667,7 +684,7 @@ def prebuild_fused_moe_ep(
         ep,
         pcp,
         topk,
-        _TILE_M,
+        tile_m,
         sharded_plan,
         weight_format,
         rhs_qb,

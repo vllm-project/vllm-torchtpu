@@ -1006,6 +1006,59 @@ def test_fp4_agrees_across_every_weight_schedule(at_prefetch_depth):
 
 
 # --------------------------------------------------------------------------- #
+# Tile height 256.
+#
+# Above 128 rows a tile's output scales take more than one 128-lane row of the
+# scale mirror (host.mirror_rows_per_tile), which every commit, push and drain
+# count has to carry. 512 tokens give a small enough slab that the height
+# ladder is built (rungs 64/128/192/256: a partial row, one whole row, one and a
+# half rows, a full tile); 2048 tokens put ~256 rows on each expert, so visits
+# run more than one 256-row tile and the scales cross run boundaries.
+# --------------------------------------------------------------------------- #
+
+
+@pytest.mark.parametrize("tokens", [512, 2048])
+def test_fp4_tile_256_matches_tile_128_and_the_reference(tokens):
+    mesh = _mesh()
+    weights, scales, decoded = _make_fp4_weights(
+        mesh,
+        50,
+        hidden=STREAM["hidden"],
+        inter=STREAM["inter"],
+        e_total=STREAM["e_total"],
+        rhs_qb=STREAM_QB,
+    )
+    x, gating = _make_inputs(
+        mesh, 51, tokens=tokens, hidden=STREAM["hidden"], e_total=STREAM["e_total"]
+    )
+    common = dict(
+        topk=STREAM["topk"],
+        renormalize=True,
+        mesh=mesh,
+        weight_format=WeightFormat.FP4,
+        rhs_qb=STREAM_QB,
+        sharded_plan=True,
+    )
+    outs = {
+        c: np.asarray(
+            fused_ep_moe_v2(x, *weights, *scales, gating, capacity=c, **common)
+        )
+        for c in (CAPACITY, 256)
+    }
+    ref = _dense_reference(mesh, x, *decoded, None, None, gating, topk=STREAM["topk"])
+    for c, out in outs.items():
+        assert np.isfinite(out.astype(np.float32)).all(), f"tile {c}"
+        error = _relative_l2(out, ref)
+        worst = _worst_token_relative_l2(out, ref)
+        print(f"FP4 tile {c} tokens {tokens} relative_l2={error} worst_token={worst}")
+        assert error < FP8_RELATIVE_BOUND, f"tile {c}: relative L2 {error}"
+        assert worst < FP8_TOKEN_BOUND, f"tile {c}: worst token {worst}"
+    # Every row's FFN, wire quantization and combine are row-local, so the
+    # tile height changes only which rows share a matmul.
+    np.testing.assert_array_equal(outs[256], outs[CAPACITY])
+
+
+# --------------------------------------------------------------------------- #
 # The row-padded flat fp4 scale operand.
 #
 # A 3-D f32 [E, K / qb, N] table is stored by torch_tpu with the block axis

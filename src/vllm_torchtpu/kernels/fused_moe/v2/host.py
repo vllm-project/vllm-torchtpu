@@ -168,14 +168,22 @@ OUT_PARITIES = 2
 # k-block to fp8, an integer contraction chunk to bf16 -- is double-
 # buffered, so the next chunk widens while the current one feeds the MXU.
 WIDENED_BLOCK_BUFFERS = 2
+# Output columns the four-bit FFN contracts at a time. The kernel widens a
+# k-block one such column chunk at a time, so this, not the full matmul
+# width, is the widened block the VMEM accounting below has to hold.
+FP4_OUTPUT_CHUNK = 256
 # The wire's scale mirror carries one f32 per row and is indexed by the
-# TILE the row was computed in: one 128-lane SUBLANE of the mirror holds a
-# whole tile's scales, and a run's scales are the sublanes of the tiles it
-# spans. Mosaic refuses a DMA slice whose offset is not tile-aligned, so a
-# transport can only address a mirror one sublane at a time however the
-# array is shaped or typed -- 512 bytes either way. The only question is how
-# many scales share those bytes: `tile_m` of them here, ROWBLK of them for a
-# [blocks, ROWBLK] mirror.
+# TILE the row was computed in: a tile's scales are one sublane-group of the
+# mirror, and a run's scales are the groups of the tiles it spans. Mosaic
+# refuses a DMA slice whose offset is not tile-aligned. A mirror row of 128
+# f32 is one lane tile, so it is contiguous in HBM and any row offset is a
+# legal DMA start; a wider row is split across lane tiles under the (8, 128)
+# tiling and only offsets on a multiple of 8 rows are legal. So the mirror
+# is kept 128 lanes wide: a tile owns `mirror_rows_per_tile(tile_m)`
+# consecutive rows, one for tile_m <= 128 and tile_m / 128 above it. The
+# flat order is unchanged -- position p is still row p // lanes, lane
+# p % lanes -- so the combine reads it the same way at every tile height.
+MIRROR_LANES = 128
 
 
 def align_up(v, m):
@@ -201,6 +209,22 @@ def mirror_run_tiles(run_start, run_rows, tile_m):
         jnp.right_shift(last, shift) - jnp.right_shift(run_start, shift) + 1,
         0,
     )
+
+
+def mirror_rows_per_tile(tile_m):
+    """Rows of the 128-lane scale mirror one tile's scales take.
+
+    One where a tile has at most MIRROR_LANES rows, so the mirror is
+    [tiles, tile_m] exactly as before; tile_m / MIRROR_LANES above that,
+    which keeps every row a single lane tile and so every row offset a legal
+    DMA start.
+    """
+    if tile_m > MIRROR_LANES and tile_m % MIRROR_LANES:
+        raise ValueError(
+            f"a tile of {tile_m} rows does not split into whole "
+            f"{MIRROR_LANES}-lane scale-mirror rows"
+        )
+    return max(1, tile_m // MIRROR_LANES)
 
 
 def contrib_mirror_rows(rows_alloc, g_local, tile_m):
@@ -1487,7 +1511,15 @@ def vmem_scratch_arrays(
             (OUT_PARITIES, tile_m, lane_blocks, HIDDEN_LANE_BLOCK),
             form.wire_dtype,
         ),
-        ("oscl_vm", (OUT_PARITIES, 1, capacity), jnp.float32),
+        (
+            "oscl_vm",
+            (
+                OUT_PARITIES,
+                mirror_rows_per_tile(capacity),
+                capacity // mirror_rows_per_tile(capacity),
+            ),
+            jnp.float32,
+        ),
     ]
 
 
@@ -1507,7 +1539,8 @@ def vmem_tile_body_arrays(
     A format whose weights reach the matrix unit through a widening adds one
     widened contraction chunk, double-buffered; the two matmuls widen in
     turn and never overlap, so the peak is the wider of the two. Four-bit
-    weights widen a scale block to fp8, integer weights a fixed contraction
+    weights widen a scale block to fp8 one FP4_OUTPUT_CHUNK of output
+    columns at a time, integer weights a fixed contraction
     chunk to bf16.
 
     The row staging a tile reads is a view of lhs_vm, not a second array,
@@ -1542,7 +1575,11 @@ def vmem_tile_body_arrays(
         arrays.append(
             (
                 "widened_weight_block",
-                (WIDENED_BLOCK_BUFFERS, rhs_qb, max(2 * inter, hidden)),
+                (
+                    WIDENED_BLOCK_BUFFERS,
+                    rhs_qb,
+                    min(FP4_OUTPUT_CHUNK, max(2 * inter, hidden)),
+                ),
                 FP8,
             )
         )

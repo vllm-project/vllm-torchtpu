@@ -114,6 +114,7 @@ def _armed():
         patch.object(envs, "MOE_FUSED_EP_ENABLE_W4A8", True),
         patch.object(envs, "MOE_FUSED_EP_KERNEL_MIN_TOKENS", 1024),
         patch.object(envs, "MOE_FUSED_EP_V2_SHARDED_PLAN", False),
+        patch.object(envs, "MOE_FUSED_EP_V2_TILE_M", 128),
     ):
         yield
 
@@ -219,6 +220,56 @@ def test_sharded_plan_flag_reaches_the_built_op():
             == "op"
         )
     assert seen and seen[0][_SHARDED_PLAN_ARG] is True
+
+
+@pytest.mark.parametrize("tile_m", [128, 256])
+def test_tile_height_reaches_the_built_op(tile_m):
+    seen = []
+    with patch.object(envs, "MOE_FUSED_EP_V2_TILE_M", tile_m):
+        assert (
+            _prebuild(
+                _layer(), build_op=lambda *args, **kwargs: seen.append(kwargs) or "op"
+            )
+            == "op"
+        )
+    assert seen and seen[0]["tile_m"] == tile_m
+
+
+def test_tile_height_outside_the_supported_set_is_refused():
+    with (
+        patch.object(envs, "MOE_FUSED_EP_V2_TILE_M", 192),
+        pytest.raises(ValueError, match="MOE_FUSED_EP_V2_TILE_M=192"),
+    ):
+        _prebuild(_layer())
+
+
+def test_tile_height_is_part_of_the_op_cache_and_kernel_call(monkeypatch):
+    """Two heights get two ops, and each calls the kernel at its own height:
+    the routing tables are built against the height, so serving one height's
+    op at the other would be a wrong answer."""
+    from unittest.mock import Mock
+
+    from vllm_torchtpu.kernels.fused_moe import v2
+
+    monkeypatch.setattr(bridge, "_OPS", {})
+    closures = []
+
+    def build(name, fn, **kwargs):
+        closures.append(fn)
+        return Mock()
+
+    monkeypatch.setattr(bridge, "jax_op", build)
+    kernel = Mock(side_effect=lambda x, *args, **kwargs: x)
+    monkeypatch.setattr(v2, "fused_ep_moe_v2", kernel)
+    args = (None, 2, True, "silu", None, False)
+    a = bridge._build_op(*args, tile_m=128)
+    assert bridge._build_op(*args, tile_m=128) is a
+    assert bridge._build_op(*args, tile_m=256) is not a
+    x = jnp.ones((8, 8), dtype=jnp.bfloat16)
+    operands = (x, None, None, None, None, jnp.zeros((8, 4)), jnp.zeros((1, 1)))
+    for closure in closures:
+        closure(*operands)
+    assert [c.kwargs["capacity"] for c in kernel.call_args_list] == [128, 256]
 
 
 def test_mesh_expert_order_is_closed_into_the_built_op():
