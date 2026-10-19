@@ -19,7 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../../" && pwd)"
 
 # The branch decides the tags. main pushes nightly-YYYYMMDD and moves latest.
-# release/X.Y.Z pushes YYYYMMDD-X.Y.Z and moves X.Y.Z, so a release nightly
+# releases/vX.Y.Z pushes YYYYMMDD-X.Y.Z and moves X.Y.Z, so a release nightly
 # never touches latest. The Buildkite pipeline runs this script from whichever
 # branch its schedule names, so a release branch cut from main after this
 # change needs only a new schedule, not a code change.
@@ -30,18 +30,18 @@ case "${BRANCH}" in
     DATE_TAG="nightly-${DATE}"
     LATEST_TAG="latest"
     ;;
-  release/*)
-    VERSION="${BRANCH#release/}"
-    # Starting with a digit keeps it from colliding with latest or nightly-*.
-    if [[ ! "${VERSION}" =~ ^[0-9][A-Za-z0-9_.-]*$ ]]; then
-      echo "ERROR: branch '${BRANCH}' does not name a version usable as an image tag; expected release/X.Y.Z." >&2
+  releases/*)
+    VERSION="${BRANCH#releases/}"
+    # Starting with a v+digit keeps it from colliding with latest or nightly-*.
+    if [[ ! "${VERSION}" =~ ^v[0-9][A-Za-z0-9_.-]*$ ]]; then
+      echo "ERROR: branch '${BRANCH}' does not name a version usable as an image tag; expected releases/vX.Y.Z." >&2
       exit 1
     fi
     DATE_TAG="${DATE}-${VERSION}"
     LATEST_TAG="${VERSION}"
     ;;
   *)
-    echo "ERROR: nightly images are published from main or release/X.Y.Z, not '${BRANCH}'." >&2
+    echo "ERROR: nightly images are published from main or releases/vX.Y.Z, not '${BRANCH}'." >&2
     exit 1
     ;;
 esac
