@@ -391,3 +391,131 @@ def test_apply_installs_timestep_table_patch(monkeypatch):
     patched = cls.forward_kwargs
     assert not minimax_h3.apply_minimax_h3_patches()
     assert cls.forward_kwargs is patched
+
+
+# -----------------------------------------------------------------------------
+# (c) per-request RoPE table
+# -----------------------------------------------------------------------------
+
+
+class _FakeRopeModel:
+    def __init__(self):
+        self.calls = []
+
+    def prepare_rope_table(self, img_position_ids, *, seq_len):
+        self.calls.append((img_position_ids, seq_len))
+        return torch.full((seq_len, 6), float(len(self.calls)))
+
+
+class _FakeBranch:
+    seq_len = 5
+
+    def __init__(self):
+        self.static_kwargs = {"img_position_ids": torch.zeros(1, 5, 3)}
+
+    def prepare_rope_table(self, model):
+        """denoise_loop.py:166-180."""
+        prepare = getattr(model, "prepare_rope_table", None)
+        if not callable(prepare):
+            return
+        self.static_kwargs["rope_table"] = prepare(
+            self.static_kwargs["img_position_ids"], seq_len=self.seq_len
+        )
+
+
+def _fake_loop_modules(monkeypatch):
+    module = types.ModuleType(minimax_h3.DENOISE_LOOP_MODULE)
+    seen = []
+
+    def minimax_h3_denoise_loop(*, model, positive, device, sigmas_video=(1.0, 0.0)):
+        """Upstream loop: the model sees static_kwargs at every step."""
+        for _ in range(len(sigmas_video) - 1):
+            seen.append(positive.static_kwargs.get("rope_table"))
+        return "rows"
+
+    module.minimax_h3_denoise_loop = minimax_h3_denoise_loop
+    pipeline = types.ModuleType(minimax_h3.PIPELINE_MODULE)
+    pipeline.minimax_h3_denoise_loop = minimax_h3_denoise_loop
+    unrelated = types.ModuleType("vllm_omni.fake_unrelated")
+    unrelated.minimax_h3_denoise_loop = "unrelated"
+    for loaded in (module, pipeline, unrelated):
+        _install(monkeypatch, loaded)
+    return module, pipeline, unrelated, seen
+
+
+def test_rope_table_prepared_once_per_run_on_tpu(monkeypatch):
+    module, pipeline, unrelated, seen = _fake_loop_modules(monkeypatch)
+    original = module.minimax_h3_denoise_loop
+    assert minimax_h3.patch_denoise_loop_rope_table()
+    wrapper = module.minimax_h3_denoise_loop
+    assert wrapper is not original and wrapper.__wrapped__ is original
+    assert module._tpu_orig_minimax_h3_denoise_loop is original
+    assert pipeline.minimax_h3_denoise_loop is wrapper
+    assert unrelated.minimax_h3_denoise_loop == "unrelated"
+
+    # TPU: one table per denoise run, reused by every step.
+    model, branch = _FakeRopeModel(), _FakeBranch()
+    sigmas = (1.0, 0.75, 0.5, 0.0)
+    out = pipeline.minimax_h3_denoise_loop(
+        model=model, positive=branch, device=_TPU_DEVICE, sigmas_video=sigmas
+    )
+    assert out == "rows"
+    assert len(model.calls) == 1
+    assert model.calls[0][1] == branch.seq_len
+    table = branch.static_kwargs["rope_table"]
+    assert seen == [table, table, table]
+    # The next run (e.g. a refine pass) rebuilds it, like the NPU path.
+    pipeline.minimax_h3_denoise_loop(
+        model=model, positive=branch, device="tpu:0", sigmas_video=sigmas
+    )
+    assert len(model.calls) == 2
+
+    # Other devices stay on the per-forward reference path.
+    seen.clear()
+    model, branch = _FakeRopeModel(), _FakeBranch()
+    pipeline.minimax_h3_denoise_loop(
+        model=model, positive=branch, device=torch.device("cpu"), sigmas_video=sigmas
+    )
+    assert model.calls == [] and "rope_table" not in branch.static_kwargs
+    assert seen == [None, None, None]
+
+
+def test_rope_table_patch_idempotent_and_noop(monkeypatch):
+    module, pipeline, _, _ = _fake_loop_modules(monkeypatch)
+    assert minimax_h3.patch_denoise_loop_rope_table()
+    wrapper = module.minimax_h3_denoise_loop
+    assert not minimax_h3.patch_denoise_loop_rope_table()
+    assert module.minimax_h3_denoise_loop is wrapper
+    assert pipeline.minimax_h3_denoise_loop is wrapper
+
+    # A module that bound the original later is rebound, without re-wrapping.
+    late = types.ModuleType("vllm_omni.fake_late_loop_importer")
+    late.minimax_h3_denoise_loop = module._tpu_orig_minimax_h3_denoise_loop
+    _install(monkeypatch, late)
+    assert minimax_h3.patch_denoise_loop_rope_table()
+    assert late.minimax_h3_denoise_loop is wrapper
+
+    monkeypatch.setitem(sys.modules, minimax_h3.DENOISE_LOOP_MODULE, None)
+    assert minimax_h3.patch_denoise_loop_rope_table() is False
+    not_a_function = types.ModuleType(minimax_h3.DENOISE_LOOP_MODULE)
+    not_a_function.minimax_h3_denoise_loop = object()
+    _install(monkeypatch, not_a_function)
+    assert minimax_h3.patch_denoise_loop_rope_table() is False
+
+
+def test_apply_installs_rope_table_patch(monkeypatch):
+    pipeline = _fake_pipeline(monkeypatch)
+    module = types.ModuleType(minimax_h3.DENOISE_LOOP_MODULE)
+
+    def minimax_h3_denoise_loop(*, model, positive, device):
+        return "rows"
+
+    module.minimax_h3_denoise_loop = minimax_h3_denoise_loop
+    pipeline.minimax_h3_denoise_loop = minimax_h3_denoise_loop
+    _install(monkeypatch, module)
+    assert minimax_h3.apply_minimax_h3_patches()
+    wrapper = module.minimax_h3_denoise_loop
+    assert wrapper.__wrapped__ is minimax_h3_denoise_loop
+    assert pipeline.minimax_h3_denoise_loop is wrapper
+    assert not minimax_h3.apply_minimax_h3_patches()
+    assert module.minimax_h3_denoise_loop is wrapper

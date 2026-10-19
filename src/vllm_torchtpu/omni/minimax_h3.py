@@ -7,7 +7,8 @@ The patches fall into two groups, in file order:
   the video VAE device context and the Triton-only indexed-modulation
   kernels, none of which run on torch_tpu as written upstream.
 - Denoise performance: keep every DiT step on one set of shapes and keep
-  host syncs out of the denoise loop (AdaLN cache, timestep table).
+  host syncs out of the denoise loop (AdaLN cache, timestep table, RoPE
+  table).
 
 Each patch carries its rationale in a comment block at its entry point.
 Patches only touch modules that are already loaded, do nothing without
@@ -16,6 +17,7 @@ nothing.
 """
 
 import functools
+import inspect
 import pickle
 import sys
 import types
@@ -1030,6 +1032,92 @@ def patch_denoise_branch_timestep_rows() -> bool:
     return True
 
 
+# -----------------------------------------------------------------------------
+# Denoise loop: per-request RoPE table.
+# -----------------------------------------------------------------------------
+
+
+def _rebind_vllm_omni_importers(name: str, original: Any, replacement: Any) -> bool:
+    """Rebind ``name`` in every loaded ``vllm_omni.*`` module holding ``original``."""
+    changed = False
+    for loaded_name, loaded in list(sys.modules.items()):
+        if not loaded_name.startswith("vllm_omni.") or loaded is None:
+            continue
+        if getattr(loaded, "__dict__", {}).get(name) is original:
+            setattr(loaded, name, replacement)
+            changed = True
+    return changed
+
+
+def patch_denoise_loop_rope_table() -> bool:
+    # -------------------------------------------------------------------------
+    # Upstream vLLM-Omni Root Cause Tracking:
+    # Upstream: MiniMaxH3DiTModel.forward rebuilds the [S, 96] bf16 RoPE
+    # table (rope frequencies of the packed position ids, then cos/sin) on
+    # every call unless the caller passes static_kwargs["rope_table"]
+    # (minimax_h3_transformer.py:1777-1789 at vllm-omni e1d77a3).
+    # minimax_h3_denoise_loop builds that table once per denoise run with
+    # MiniMaxH3DenoiseBranch.prepare_rope_table, but only on NPU
+    # (denoise_loop.py:349-353; CUDA and CPU stay on the reference path of
+    # the H100 accuracy suite).
+    #
+    # Problem on TPU: every step program repeats the position-frequency and
+    # cos/sin work over S rows.
+    #
+    # Fix: on TPU the table is built once per request before the loop, as on
+    # NPU. prepare_rope_table runs the same ops on the same inputs
+    # (img_position_ids.narrow -> self.rope -> _build_rope_table,
+    # minimax_h3_transformer.py:1469-1484), and the forward validates the
+    # prepared table's shape, device and dtype (:1790-1794).
+    #
+    # REMOVAL / FIX CONDITION:
+    # Remove once upstream prepares the branch RoPE table on every platform
+    # (or on TPU) in minimax_h3_denoise_loop.
+    # -------------------------------------------------------------------------
+    module = _loaded_module(DENOISE_LOOP_MODULE)
+    if module is None:
+        logger.debug(
+            "Skipping MiniMax-H3 RoPE table TPU patch: %s is not loaded.",
+            DENOISE_LOOP_MODULE,
+        )
+        return False
+    marker = "_tpu_orig_minimax_h3_denoise_loop"
+    original = getattr(module, marker, None)
+    changed = False
+    if original is None:
+        original = getattr(module, "minimax_h3_denoise_loop", None)
+        if not inspect.isfunction(original):
+            return False
+
+        @functools.wraps(original)
+        def minimax_h3_denoise_loop(*args: Any, **kwargs: Any) -> Any:
+            # Upstream's signature is keyword-only.
+            positive = kwargs.get("positive")
+            model = kwargs.get("model")
+            if (
+                positive is not None
+                and model is not None
+                and _is_tpu(kwargs.get("device"))
+            ):
+                positive.prepare_rope_table(model)
+            return original(*args, **kwargs)
+
+        setattr(module, marker, original)
+        module.minimax_h3_denoise_loop = minimax_h3_denoise_loop
+        changed = True
+    wrapper = module.minimax_h3_denoise_loop
+    # pipeline_minimax_h3 binds the loop by name at import (:119-121).
+    changed = (
+        _rebind_vllm_omni_importers("minimax_h3_denoise_loop", original, wrapper)
+        or changed
+    )
+    if changed:
+        logger.info(
+            "Applied TPU patch: MiniMax-H3 RoPE table built once per denoise run."
+        )
+    return changed
+
+
 def apply_minimax_h3_patches() -> bool:
     """Patch the MiniMax-H3 pipeline module if it is already loaded.
 
@@ -1051,4 +1139,5 @@ def apply_minimax_h3_patches() -> bool:
     patched = patch_video_vae_device_module(pipeline) or patched
     patched = patch_indexed_modulation() or patched
     patched = patch_adaln_projection_cache() or patched
-    return patch_denoise_branch_timestep_rows() or patched
+    patched = patch_denoise_branch_timestep_rows() or patched
+    return patch_denoise_loop_rope_table() or patched
