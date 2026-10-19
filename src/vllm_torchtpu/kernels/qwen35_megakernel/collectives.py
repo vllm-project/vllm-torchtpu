@@ -390,13 +390,13 @@ class PallasAllReduce:
             blocks.append(jnp.zeros((PR - B * HPC, HC2), F32))
         return jnp.concatenate(blocks, axis=0)
 
-    def ar0_spec(self, lslot, first):
+    def ar0_spec(self, lslot, first, slot=0):
         """AR0S producer spec for dmatmul(split=...): pre() before the out projection's
-        chunks, then half a chunks + hook_a, then half b chunks + hook_b."""
+        chunks, then half a chunks + hook_a, then half b chunks + hook_b. slot: the all-reduce
+        buffer slot (0 in the single-microbatch kernel; the wide step alternates)."""
         ctx = self.ctx
         HIER, HC2 = ctx.HIER, ctx.HC2
         scr, me, sc = ctx.scr, ctx.me, ctx.sc
-        slot = 0
         send, recv = scr["send"], scr["recv"]
         c_idx = lax.rem(me, 2)
 

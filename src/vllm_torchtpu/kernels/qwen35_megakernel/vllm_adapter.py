@@ -348,14 +348,27 @@ def parse_mk_fused_pool_io_min_b_hi(env_val: str | None = None) -> int:
 def parse_mk_wide_mb(env_val: str | None = None) -> int:
     """`VLLM_TPU_QWEN35_MK_WIDE_MB` (default 0 = off): rows per microbatch of the wide step.
     Set (32 is the value with device parity against the per-microbatch calls), a verify bucket
-    of 80 < B <= WIDE_MAX_ROWS rows runs as one kernel call whose MoE phase streams each hit
-    expert once for all rows (`MKConfig.mb_rows`); wider buckets keep the split plan of 80-row
-    calls."""
+    of max(80, WIDE_MIN_ROWS) < B <= WIDE_MAX_ROWS rows runs as one kernel call whose MoE phase
+    streams each hit expert once for all rows (`MKConfig.mb_rows`); the other buckets above 80
+    rows keep the split plan of 80-row calls."""
     if env_val is None:
         v = envs.VLLM_TPU_QWEN35_MK_WIDE_MB
     else:
         v = int(env_val.strip() or "0")
     _need(v == 0 or (16 <= v <= 80 and v % 4 == 0), f"VLLM_TPU_QWEN35_MK_WIDE_MB={v}")
+    return v
+
+
+def parse_mk_wide_min_rows(env_val: str | None = None) -> int:
+    """`VLLM_TPU_QWEN35_MK_WIDE_MIN_ROWS` (default 160): the smallest verify bucket the wide
+    step applies to. On real routing the wide step is 4-5% slower than the split plan at 96 rows
+    and within 2% at 128, and only wins from 160 rows on (-4% at 160, -15% at 192 on recorded
+    routing), where the split plan streams each expert three times or more."""
+    if env_val is None:
+        v = envs.VLLM_TPU_QWEN35_MK_WIDE_MIN_ROWS
+    else:
+        v = int(env_val.strip() or "0")
+    _need(v >= 0, f"VLLM_TPU_QWEN35_MK_WIDE_MIN_ROWS={v}")
     return v
 
 
@@ -1801,6 +1814,7 @@ class Qwen35Megakernel:
         self.fused_pool_io_max_b = parse_mk_fused_pool_io_max_b()
         self.fused_pool_io_min_b_hi = parse_mk_fused_pool_io_min_b_hi()
         self.wide_mb = parse_mk_wide_mb()
+        self.wide_min_rows = parse_mk_wide_min_rows()
         self._hlo_checked = False
         self.zero_copy = parse_mk_zero_copy() if zero_copy is None else bool(zero_copy)
         self._runner_ref: Any = runner
@@ -2146,10 +2160,12 @@ class Qwen35Megakernel:
                 self._merge_steps.clear()
         single_keys = [(T, b) for T, b in keys if b <= _MAX_SINGLE_KERNEL_B]
         split_keys = [(T, b) for T, b in keys if b > _MAX_SINGLE_KERNEL_B]
-        # wide step: one call over all rows up to WIDE_MAX_ROWS (only verify buckets, T > 1)
+        # wide step: one call over all rows of a verify bucket (T > 1) of wide_min_rows to
+        # WIDE_MAX_ROWS rows
         wide_keys = [
             (T, b) for T, b in split_keys
-            if self.wide_mb and T > 1 and b <= WIDE_MAX_ROWS and b % self.wide_mb % T == 0
+            if self.wide_mb and T > 1 and self.wide_min_rows <= b <= WIDE_MAX_ROWS
+            and b % self.wide_mb % T == 0
         ]
         split_keys = [k for k in split_keys if k not in wide_keys]
         for T, b in single_keys + wide_keys:

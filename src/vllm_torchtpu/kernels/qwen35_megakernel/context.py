@@ -83,11 +83,12 @@ from .config import (
 # scatter-add as a transposed-LHS dot_general (else an explicit transpose then a plain matmul).
 WIDE_DYN_ROW = True
 WIDE_SCATTER_TN = True
-# All-reduce buffer slots of a wide step: 2 keeps the mixer (slot 0) and MoE (slot 1) payload
-# buffers apart as in the single-microbatch kernel; 1 shares them (every all-reduce waits for the
-# previous one's sends before rewriting them, and the cross-chip round couples all peers, so a
-# peer cannot start the next all-reduce before this one's payload was read).
-WIDE_AR_SLOTS = 1
+# All-reduce buffer slots of a wide step. Consecutive all-reduces alternate slots: a chip that
+# receives the last round-1 payload of all-reduce n later than another chip (the sender issues
+# its three copies in order) is still reading ag_recv when the earlier chip's round-1 payload of
+# all-reduce n + 1 lands, so that payload must go to the other slot. One slot is only safe when
+# compute separates consecutive all-reduces, which the MoE all-reduces of the microbatches lack.
+WIDE_AR_SLOTS = 2
 # GatedDeltaNet input-state prefetch slots of a wide step's microbatch, and whether the routed
 # expert tile reuses the idle microbatch buffers xb / xb2 / acc (else its own scratch).
 WIDE_NGI = 1
@@ -684,7 +685,7 @@ class MKBuildContext:
         self.MB_GDN, self.MB_ATT = MB_GDN, MB_ATT
         self.WIDE_DYN_ROW = WIDE_DYN_ROW
         self.WIDE_SCATTER_TN = WIDE_SCATTER_TN
-        self.N_AR_SLOTS, self.AR1_SLOT = NSL, NSL - 1  # the MoE all-reduce's slot
+        self.N_AR_SLOTS = NSL
         self.WIDE_TILE_REUSE = WIDE_TILE_REUSE
         self.WIDE_SCATTER = WIDE_SCATTER
         self.BLIVE = c_wide.B  # live rows of the wide step (the rest of the tail is padding)

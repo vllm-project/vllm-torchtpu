@@ -373,6 +373,13 @@ def kernel_wide(ctx: MKBuildContext, refs):
     def rows(m):
         return pl.ds(pl.multiple_of(m * B, B), B)
 
+    def ar_slot(seq):
+        """Buffer slot of the step's seq-th all-reduce (2 * N_MB per layer: the mixer ones,
+        then the MoE ones), and whether it is the slot's first use (no sends to wait for)."""
+        if ctx.N_AR_SLOTS == 1:
+            return 0, seq == 0
+        return lax.rem(seq, 2), seq < 2
+
     # ------------------------------ layer loop ------------------------------
     def layer(l, carry):
         slot = l % 2
@@ -412,27 +419,27 @@ def kernel_wide(ctx: MKBuildContext, refs):
             with sc("norm_in"):
                 scr["res"][...] = res_all[rows(m)].astype(F32)
                 scr["xb"][...] = rms_zc(scr["res"][...], sm(slot, "in_norm")).astype(BF16)
-            first = jnp.logical_and(l == 0, m == 0)
+            ars, first = ar_slot(l * (2 * N_MB) + m)
             g0 = base_l + m * per_mb
 
             def att_branch():
                 att_blk.init_worklist()
                 att_blk.init_rope()
                 if ctx.AR0S and ctx.comm:
-                    att_blk.attention(l, slot, g0, ar0=allreduce_blk.ar0_spec(slot, first))
-                    allreduce_blk.ar0_finish(0, first)
+                    att_blk.attention(l, slot, g0, ar0=allreduce_blk.ar0_spec(slot, first, ars))
+                    allreduce_blk.ar0_finish(ars, first)
                     return
                 allreduce_blk.add_residual(
-                    allreduce_blk.allreduce(0, att_blk.attention(l, slot, g0), first)
+                    allreduce_blk.allreduce(ars, att_blk.attention(l, slot, g0), first)
                 )
 
             def gdn_branch():
                 if ctx.AR0S and ctx.comm:
-                    gdn_blk.gdn(l, slot, g0, ar0=allreduce_blk.ar0_spec(slot, first))
-                    allreduce_blk.ar0_finish(0, first)
+                    gdn_blk.gdn(l, slot, g0, ar0=allreduce_blk.ar0_spec(slot, first, ars))
+                    allreduce_blk.ar0_finish(ars, first)
                     return
                 allreduce_blk.add_residual(
-                    allreduce_blk.allreduce(0, gdn_blk.gdn(l, slot, g0), first)
+                    allreduce_blk.allreduce(ars, gdn_blk.gdn(l, slot, g0), first)
                 )
 
             if AE == 1:
@@ -448,10 +455,8 @@ def kernel_wide(ctx: MKBuildContext, refs):
         moe_blk.moe_wide(l, slot, base_l + N_MB * per_mb)
 
         def moe_ar(m, carry_m):
-            # the slot's first use: with one slot set the mixer all-reduces used it already, and
-            # their sends must be waited for before the payload buffers are rewritten
-            first = jnp.logical_and(l == 0, m == 0) if ctx.N_AR_SLOTS == 2 else jnp.bool_(False)
-            tot = allreduce_blk.allreduce(ctx.AR1_SLOT, part_all[rows(m)], first)
+            ars, first = ar_slot(l * (2 * N_MB) + N_MB + m)
+            tot = allreduce_blk.allreduce(ars, part_all[rows(m)], first)
             with sc("ar_res"):
                 res_all[rows(m)] = rnd(res_all[rows(m)].astype(F32) + tot[0:B]).astype(BF16)
             return carry_m

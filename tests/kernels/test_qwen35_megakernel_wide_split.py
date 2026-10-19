@@ -188,9 +188,10 @@ def test_split_step_slices_rows_per_microbatch_and_chains_pools(monkeypatch):
 def test_wide_mb_routes_mid_buckets_to_one_call(monkeypatch):
     """With VLLM_TPU_QWEN35_MK_WIDE_MB set, verify buckets up to WIDE_MAX_ROWS build as one
     wide call (mb_rows forwarded) and wider ones keep the split plan."""
-    mk = bare_mk(monkeypatch, buckets=(4,), verify_buckets=(64, 192, 256, 800))
+    mk = bare_mk(monkeypatch, buckets=(4,), verify_buckets=(64, 96, 192, 256, 800))
     mk._runner_token_paddings = ()
     mk.wide_mb = 64
+    mk.wide_min_rows = 160
     seen = {}
 
     def fake_single(b, tokens_per_seq=1, out_pad_rows=None, mb_rows=0):
@@ -205,7 +206,9 @@ def test_wide_mb_routes_mid_buckets_to_one_call(monkeypatch):
     mk._build_split_bucket_op = fake_split
     mk._build_all_buckets()
     assert seen == {(1, 4): 0, (4, 64): 0, (4, 192): 64, (4, 256): 64}, seen
+    assert mk._bucket_steps[(4, 96)] == ("split", 96)  # below the row floor
     assert mk._bucket_steps[(4, 800)] == ("split", 800)
     assert VA.parse_mk_wide_mb("0") == 0 and VA.parse_mk_wide_mb("64") == 64
+    assert VA.parse_mk_wide_min_rows("0") == 0 and VA.parse_mk_wide_min_rows("160") == 160
     with pytest.raises(Exception):
         VA.parse_mk_wide_mb("100")

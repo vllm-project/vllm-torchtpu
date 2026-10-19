@@ -92,14 +92,14 @@ ROUTING_DIR = os.environ.get("P3_MK_ROUTING_DIR", "/workspace/tmp/p4-item2-routi
 # routing (b<B>, count_b<B>, count_b<B>_m<i>, plan_b<B> in the routing file) is one independent
 # draw per microbatch, so a microbatch hits as many experts as a served 80-row call and the union
 # over the bucket is the recorded union of the whole batch (make_wide_routing.py).
-WIDE_CASES = {"r48": 192, "r64": 256, "r128": 512, "r200": 800}
+WIDE_CASES = {"r24": 96, "r32": 128, "r48": 192, "r64": 256, "r128": 512, "r200": 800}
 MK_SPLIT_BASE = 80
 # A2: one wide call over the same rows (MKConfig.mb_rows microbatches inside the kernel, the
 # MoE phase once over all rows); the w<n> case pairs with the r<n> split case on the same rows
 WIDE_MB = int(os.environ.get("P3_MK_WIDE_MB", "64"))
 # w16: one microbatch (n_mb 1); w8 (32 rows) pairs with the regular 32-row call for a
 # two-microbatch step with P3_MK_WIDE_MB=16 (same rows, same routing union)
-A2_CASES = {"w8": 32, "w16": 64, "w24": 96, "w48": 192, "w64": 256, "w128": 512}
+A2_CASES = {"w8": 32, "w16": 64, "w24": 96, "w32": 128, "w48": 192, "w64": 256, "w128": 512}
 # placement -> (expert slots per rank, forced routing built for it by make_bench_routing.py)
 PLACEMENTS = {
     "c32": (68, os.path.join(ROUTING_DIR, "routing_c32.npz")),
@@ -179,16 +179,20 @@ CASES.update({k: ((B, 0),) for k, B in A2_CASES.items()})
 CASES.update({
     "r20b": ((64, 0), (16, 16)),
     "r24b": ((32, 0), (32, 8), (32, 16)),
+    "r32b": ((64, 0), (64, 16)),
     "r48b": ((64, 0), (64, 16), (64, 32)),
     "r64b": ((64, 0), (64, 16), (64, 32), (64, 48)),
 })
 # w24 (96 rows) has no routing bucket of its own: both legs read rows 0..95 of the 192-row one
-CASE_RKEY_EXTRA = {"r20b": None, "r24b": 192, "w24": 192, "r48b": 192, "r64b": 256}
+# r24 / r32 (96 / 128 rows, the cap 24 / 32 verify buckets) have no routing bucket of their own
+# either: both plans read the first rows of the 192-row one
+CASE_RKEY_EXTRA = {"r20b": None, "r24b": 192, "w24": 192, "r32b": 192, "w32": 192, "r48b": 192, "r64b": 256,
+                   "r24": 192, "r32": 192}
 # case -> routing bucket of the whole case (None: each call uses its own b<rows> routing)
 CASE_RKEY = {k: WIDE_CASES.get(k) for k in CASES}
 CASE_RKEY.update(CASE_RKEY_EXTRA)
 _PAIRS = (("w8", "b32"), ("w16", "b64"), ("w48", "r48"), ("w64", "r64"),
-          ("b80", "r20b"), ("w48", "r48b"), ("w64", "r64b"), ("w24", "r24b"),
+          ("b80", "r20b"), ("w48", "r48b"), ("w64", "r64b"), ("w24", "r24b"), ("w32", "r32b"),
           # split plan against split plan (both legs the regular kernel; they pick different copy
           # holders for the same rows): the leg-to-leg floor when redundant copies are in use
           ("r48b", "r48"), ("r64b", "r64"))
@@ -227,6 +231,13 @@ VARIANTS = {
     # the KV stream in its own ring instead of the expert pool slots
     "nokve": (frozenset(), 0, {"kv_ering": False}, {}),
     "nopair": (frozenset(), 0, {"pair_kv": False}, {}),
+    # ablation combos with the scoped VMEM limit at 63 MiB (a 4-layer stack at mb 64 needs 270 KiB over 62)
+    "base_v63": (frozenset(), 0, {"vmem_mib": 63}, {}),
+    "no_ar_v63": (frozenset({"ar"}), 0, {"vmem_mib": 63}, {}),
+    "no_attn_gdn": (frozenset({"attn", "gdn"}), 0, {"vmem_mib": 63}, {}),
+    "no_attn_gdn_kv": (frozenset({"attn", "gdn", "kv"}), 0, {"vmem_mib": 63}, {}),
+    "no_attn_gdn_ar": (frozenset({"attn", "gdn", "ar"}), 0, {"vmem_mib": 63}, {}),
+    "no_dense_v63": (frozenset({"dense"}), 0, {"vmem_mib": 63}, {}),
 }
 
 
@@ -456,7 +467,7 @@ class _World:
 
     def fresh_pools(self, seed: int = 99):
         f = _filler(self.mesh, self.pool_shape, FP8, "bytes")
-        return tuple(f(_key(seed, a)) for a in range(C.FULL.NATT))
+        return tuple(f(_key(seed, a)) for a in range(_cfg(32).NATT))
 
     def _smalls(self, lay, s_width, shape, dt, no_copies: bool | None = None):
         if no_copies is None:
@@ -930,6 +941,14 @@ def test_parity_wide(world, wide, split, variant):
         "rows": [b for b, _ in CASES[split]],
         "hidden_close_by_mb": [round(x, 4) for x in by_mb],
         "hidden_close_by_16rows": [round(float(close[:, r0:r0 + 16].mean()), 4) for r0 in range(0, nrow, 16)],
+        # per rank (the stacked shards): close fraction and mean abs diff of the worst 16-row block
+        "hidden_close_by_rank_worst16": [
+            round(float(min(close[r, r0:r0 + 16].mean() for r0 in range(0, nrow, 16))), 4)
+            for r in range(close.shape[0])],
+        "hidden_mean_abs_diff_by_rank_rows0_16": [
+            round(float(np.abs(h_w - h_s)[r, 0:16].mean()), 5) for r in range(close.shape[0])],
+        "hidden_mean_abs_diff_by_rank_rows16_32": [
+            round(float(np.abs(h_w - h_s)[r, 16:32].mean()), 5) for r in range(close.shape[0])],
         "hidden_max_abs_diff_by_16rows": [round(float(np.abs(h_w - h_s)[:, r0:r0 + 16].max()), 4) for r0 in range(0, nrow, 16)],
         "hidden_mean_abs_diff_by_row_first32": [round(float(np.abs(h_w - h_s)[:, r].mean()), 5) for r in range(min(32, nrow))],
         "hidden_ref_mean_abs_first32": [round(float(np.abs(h_s)[:, r].mean()), 4) for r in range(min(32, nrow))],
