@@ -741,6 +741,47 @@ def _patch_vllm_offloading_config_build() -> None:
     logger.info("Applied TPU patch: PCP-aware OffloadingConfig build.")
 
 
+def _patch_vllm_offload_all_ranks_kv_bytes() -> None:
+    """Record every worker's KV bytes per block where the per-worker configs
+    pass by.
+
+    The engine core turns the per-worker KV cache configs into the scheduler's
+    config and keeps only that one; each worker is handed the whole list and
+    keeps its own entry. The Raiden offloading spec sizes the host capacity
+    from the bytes behind one block on all ranks, which under pipeline
+    parallelism differ between stages, so both places record the sum first.
+    """
+    from vllm.v1.engine import core as engine_core_module
+    from vllm.v1.worker.worker_base import WorkerWrapperBase
+
+    from vllm_torchtpu.offload.raiden_store import record_all_ranks_kv_bytes_per_block
+
+    marker = "_tpu_all_ranks_kv_bytes_patch"
+    original_generate = engine_core_module.generate_scheduler_kv_cache_config
+    if not original_generate.__dict__.get(marker, False):
+
+        def generate_scheduler_kv_cache_config_tpu(kv_cache_configs):
+            record_all_ranks_kv_bytes_per_block(kv_cache_configs)
+            return original_generate(kv_cache_configs)
+
+        generate_scheduler_kv_cache_config_tpu.__dict__[marker] = True
+        engine_core_module.generate_scheduler_kv_cache_config = (
+            generate_scheduler_kv_cache_config_tpu
+        )
+
+    original_initialize = WorkerWrapperBase.initialize_from_config
+    if not original_initialize.__dict__.get(marker, False):
+
+        def initialize_from_config_tpu(self, kv_cache_configs):
+            record_all_ranks_kv_bytes_per_block(kv_cache_configs)
+            return original_initialize(self, kv_cache_configs)
+
+        initialize_from_config_tpu.__dict__[marker] = True
+        WorkerWrapperBase.initialize_from_config = initialize_from_config_tpu
+
+    logger.info("Applied TPU patch: all-ranks KV bytes per block for offloading.")
+
+
 def _patch_vllm_kimi_kda_layer_counts() -> None:
     """Patch ModelConfig.get_num_layers_by_block_type to report accurate counts
     for Kimi models with KDA using linear_attn_config (e.g. Kimi-K3).

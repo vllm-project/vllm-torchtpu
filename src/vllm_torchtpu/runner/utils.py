@@ -432,7 +432,7 @@ def relayout_rope_caches(model: torch.nn.Module):
         if not isinstance(module, RotaryEmbeddingBase):
             continue
         # The buffers on a rotary module that are indexed by position.
-        caches = [
+        caches: list[tuple[str, Any]] = [
             (buf_name, getattr(module, buf_name, None))
             for buf_name in ("cos_sin_cache", "cos_sin_cache_bf16")
         ]
@@ -463,7 +463,7 @@ def relayout_hash_tables(model: torch.nn.Module):
         # The attributes under which one hash-routing table is reachable;
         # the same tensor object is bound to all of them.
         for attr in ("tid2eid", "hash_indices_table"):
-            table = getattr(module, attr, None)
+            table: torch.Tensor | None = getattr(module, attr, None)
             if not isinstance(table, torch.Tensor) or id(table) in seen:
                 continue
             seen.add(id(table))

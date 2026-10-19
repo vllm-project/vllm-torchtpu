@@ -13,7 +13,7 @@
 # limitations under the License.
 import abc
 import dataclasses
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -172,8 +172,10 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
         # src_ref: (kv_cache_hbm, new_kv_hbm, schedule_ref, page_indices_ref)
         is_no_op, block_idx = _step_guard(step, total_steps)
         kv_cache_hbm, new_kv_hbm, schedule_ref, page_indices_ref = self.src_ref
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
         sem = self.sem_recvs.at[slot]
-        vmem_dst_lane = self.window_ref.at[slot]
+        vmem_dst_lane = cast(jax.Ref, self.window_ref.at[slot])
         num_lanes = pltpu.get_tpu_info().num_lanes
         for b in range(self.cfgs.batch_size):
             for i in range(self.cfgs.bkv_p_cache):
@@ -214,8 +216,10 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
     ):
         is_no_op, block_idx = _step_guard(step, total_steps)
         kv_out_ref, _, schedule_ref, page_indices_ref = self.dst_ref
+        assert self.sem_sends is not None
+        assert self.window_ref is not None
         sem = self.sem_sends.at[slot]
-        vmem_src_lane = self.window_ref.at[slot]
+        vmem_src_lane = cast(jax.Ref, self.window_ref.at[slot])
         num_lanes = pltpu.get_tpu_info().num_lanes
         for b in range(self.cfgs.batch_size):
             do_writeback = schedule_ref.do_writeback[block_idx, b] == 1
@@ -245,11 +249,13 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
     ):
         is_no_op, block_idx = _step_guard(step, total_steps)
         _, _, schedule_ref, _ = self.src_ref
+        assert self.sem_recvs is not None
         sem = self.sem_recvs.at[slot]
         wait_lanes = schedule_ref.total_wait_kv_in[block_idx]
         wait_lanes = jnp.where(is_no_op, 0, wait_lanes)
 
-        vmem_dst = self.window_ref.at[slot]
+        assert self.window_ref is not None
+        vmem_dst: Any = self.window_ref.at[slot]
         vmem_u32 = vmem_dst.bitcast(jnp.uint32)
         flat_dst = vmem_u32.reshape((-1, 128))
         # (batch_size, num_kv_heads * 2, kv_head_dim // packing, packing, page_size)
@@ -267,11 +273,13 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
     ):
         is_no_op, block_idx = _step_guard(step, total_steps)
         _, _, schedule_ref, _ = self.dst_ref
+        assert self.sem_sends is not None
         sem = self.sem_sends.at[slot]
         wait_lanes = schedule_ref.total_wait_kv_out[block_idx]
         wait_lanes = jnp.where(is_no_op, 0, wait_lanes)
 
-        vmem_src = self.window_ref.at[slot]
+        assert self.window_ref is not None
+        vmem_src: Any = self.window_ref.at[slot]
         vmem_u32 = vmem_src.bitcast(jnp.uint32)
         flat_src = vmem_u32.reshape((-1, 128))
         pltpu.make_async_copy(
@@ -320,8 +328,12 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         # src_ref: (kv_cache_hbm, new_kv_hbm, schedule_ref, page_indices_ref)
         is_no_op, block_idx = _step_guard(step, total_steps)
         kv_cache_hbm, new_kv_hbm, schedule_ref, page_indices_ref = self.src_ref
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
         sem = self.sem_recvs.at[slot]
-        vmem_dst = self.window_ref.at[slot, :, :, : self.cfgs.kv_hbm_stride]
+        vmem_dst = cast(
+            jax.Ref, self.window_ref.at[slot, :, :, : self.cfgs.kv_hbm_stride]
+        )
         # kv_cache_hbm: (num_pages, num_kv_heads * 2, kv_head_dim // packing,
         #     packing, page_size)
         # kv_cache_hbm_flat: (num_pages * num_kv_heads * 2, kv_head_dim // packing,
@@ -362,9 +374,13 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
     ):
         is_no_op, block_idx = _step_guard(step, total_steps)
         kv_out_ref, _, schedule_ref, page_indices_ref = self.dst_ref
+        assert self.sem_sends is not None
+        assert self.window_ref is not None
         sem = self.sem_sends.at[slot]
         kv_out_ref_flat = kv_out_ref.reshape(-1, *kv_out_ref.shape[2:])
-        vmem_src = self.window_ref.at[slot, :, :, : self.cfgs.kv_hbm_stride]
+        vmem_src = cast(
+            jax.Ref, self.window_ref.at[slot, :, :, : self.cfgs.kv_hbm_stride]
+        )
 
         for b in range(self.cfgs.batch_size):
             do_writeback = schedule_ref.do_writeback[block_idx, b] == 1
@@ -395,11 +411,13 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
     ):
         is_no_op, block_idx = _step_guard(step, total_steps)
         _, _, schedule_ref, _ = self.src_ref
+        assert self.sem_recvs is not None
         sem = self.sem_recvs.at[slot]
         wait_lanes = schedule_ref.total_wait_kv_in[block_idx]
         wait_lanes = jnp.where(is_no_op, 0, wait_lanes)
 
-        vmem_dst = self.window_ref.at[slot]
+        assert self.window_ref is not None
+        vmem_dst: Any = self.window_ref.at[slot]
         vmem_u32 = vmem_dst.bitcast(jnp.uint32)
         flat_dst = vmem_u32.reshape((-1, 128))
         pltpu.make_async_copy(
@@ -416,11 +434,13 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
     ):
         is_no_op, block_idx = _step_guard(step, total_steps)
         _, _, schedule_ref, _ = self.dst_ref
+        assert self.sem_sends is not None
         sem = self.sem_sends.at[slot]
         wait_lanes = schedule_ref.total_wait_kv_out[block_idx]
         wait_lanes = jnp.where(is_no_op, 0, wait_lanes)
 
-        vmem_src = self.window_ref.at[slot]
+        assert self.window_ref is not None
+        vmem_src: Any = self.window_ref.at[slot]
         vmem_u32 = vmem_src.bitcast(jnp.uint32)
         flat_src = vmem_u32.reshape((-1, 128))
         pltpu.make_async_copy(
@@ -469,8 +489,10 @@ class BatchingORef(_BypassRef):
         # dst_ref: (o_hbm, schedule_ref)
         is_no_op, block_idx = _step_guard(step, total_steps)
         o_hbm, schedule_ref = self.dst_ref
+        assert self.sem_sends is not None
+        assert self.window_ref is not None
         sem = self.sem_sends.at[slot]
-        vmem_src = self.window_ref.at[slot]
+        vmem_src = cast(jax.Ref, self.window_ref.at[slot])
 
         # is_last_k stride: batch size
         for b in range(self.cfgs.batch_size):
@@ -494,6 +516,7 @@ class BatchingORef(_BypassRef):
         # dst_ref: (o_hbm, schedule_ref)
         is_no_op, block_idx = _step_guard(step, total_steps)
         o_hbm, schedule_ref = self.dst_ref
+        assert self.sem_sends is not None
         sem = self.sem_sends.at[slot]
         wait_lanes = schedule_ref.total_wait_o_out[block_idx]
         wait_lanes = jnp.where(is_no_op, 0, wait_lanes)
@@ -547,8 +570,10 @@ class BatchingLSERef(_BypassRef):
         # dst_ref: (lse_hbm, schedule_ref)
         is_no_op, block_idx = _step_guard(step, total_steps)
         lse_hbm, schedule_ref = self.dst_ref
+        assert self.sem_sends is not None
+        assert self.window_ref is not None
         sem = self.sem_sends.at[slot]
-        vmem_src = self.window_ref.at[slot]
+        vmem_src = cast(jax.Ref, self.window_ref.at[slot])
 
         for b in range(self.cfgs.batch_size):
             is_last_k = schedule_ref.is_last_k[block_idx, b] == 1
@@ -570,6 +595,7 @@ class BatchingLSERef(_BypassRef):
     ):
         is_no_op, block_idx = _step_guard(step, total_steps)
         lse_hbm, schedule_ref = self.dst_ref
+        assert self.sem_sends is not None
         sem = self.sem_sends.at[slot]
         wait_lanes = schedule_ref.total_wait_lse_out[block_idx]
         wait_lanes = jnp.where(is_no_op, 0, wait_lanes)
@@ -623,8 +649,10 @@ class BatchingQRef(_BypassRef):
         # src_ref: (q_hbm, schedule_ref)
         is_no_op, block_idx = _step_guard(step, total_steps)
         q_hbm, schedule_ref = self.src_ref
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
         sem = self.sem_recvs.at[slot]
-        vmem_dst = self.window_ref.at[slot]
+        vmem_dst = cast(jax.Ref, self.window_ref.at[slot])
 
         for b in range(self.cfgs.batch_size):
             q_src, q_sz = schedule_ref.get_dma_q(block_idx, b)
@@ -643,8 +671,10 @@ class BatchingQRef(_BypassRef):
     ):
         is_no_op, block_idx = _step_guard(step, total_steps)
         _, schedule_ref = self.src_ref
+        assert self.sem_recvs is not None
+        assert self.window_ref is not None
         sem = self.sem_recvs.at[slot]
-        vmem_dst = self.window_ref.at[slot]
+        vmem_dst: Any = self.window_ref.at[slot]
         wait_lanes = schedule_ref.total_wait_q_in[block_idx]
         wait_lanes = jnp.where(is_no_op, 0, wait_lanes)
 

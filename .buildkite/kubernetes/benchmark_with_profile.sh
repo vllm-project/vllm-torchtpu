@@ -17,21 +17,18 @@
 #
 #   benchmark_with_profile.sh <config> [run_eval_flow args...]
 #
-# Profiling used to be a second step against a separate `<config>-profile`,
-# until #1061 folded it into the same server: the config now carries
-# CAPTURE_PROFILE and PROFILE_GCS_BASE, and one run produces both the
-# benchmark numbers and the traces. That change rewrote pipeline_perf.yml and
-# deleted the -profile configs; this is the same shape for the pods.
+# The config carries CAPTURE_PROFILE and PROFILE_GCS_BASE, so one run against
+# one server produces both the benchmark numbers and the traces.
 #
-# The upload cannot be a second command the way it is on an agent. The traces
-# are written in the pod, and the pod is deleted when the step's command
-# returns - so the copy to GCS has to happen before that, here.
+# The upload cannot be a second command. The traces are written in the pod,
+# and the pod is deleted when the step's command returns - so the copy to GCS
+# has to happen before that, here.
 set -uo pipefail
 
 CONFIG=${1:?usage: benchmark_with_profile.sh <config> [run_eval_flow args...]}
 shift
 
-# Mon/Wed/Fri, as on bare metal: profiling costs about +11% TTFT, so a nightly
+# Mon/Wed/Fri: profiling costs about +11% TTFT, so a nightly
 # that captured every run would report a benchmark it had slowed down. A step
 # that sets CAPTURE_PROFILE itself wins, which is how a one-off build asks for
 # traces on a Tuesday.

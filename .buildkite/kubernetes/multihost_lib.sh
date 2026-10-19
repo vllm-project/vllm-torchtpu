@@ -115,7 +115,7 @@ publish_results() {
 # mp_serve_args: fill SERVE_ARGS, the `vllm serve` arguments every host of an
 # mp slice shares, from the benchmark config the caller has sourced over its
 # own defaults, plus DP_LOCAL, NUM_HOSTS, DP_ADDRESS and DP_RPC_PORT. The
-# config's variables mean what run_benchmarks.sh makes of them on bare metal.
+# config's variables mean what run_benchmarks.sh makes of them.
 mp_serve_args() {
   if [ "$((DP_LOCAL * NUM_HOSTS))" -ne "$DATA_PARALLELISM" ]; then
     echo "ERROR: DP_LOCAL ($DP_LOCAL) x NUM_HOSTS ($NUM_HOSTS) != DATA_PARALLELISM ($DATA_PARALLELISM)" >&2

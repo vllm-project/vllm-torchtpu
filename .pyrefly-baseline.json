@@ -82,41 +82,6 @@
     },
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `TPUConnectorScheduler` has no attribute `_stage3_fa_group_index`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `TPUConnectorScheduler` has no attribute `_stage3_transfer_groups`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `TPUConnectorScheduler` has no attribute `_stage3_mamba_group_indices`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `TPUConnectorScheduler` has no attribute `_stage3_mamba_num_speculative_blocks`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `TPUConnectorWorker` has no attribute `named_kv_caches`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `kv_caches`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `layer_view`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
       "name": "unsupported-operation",
       "concise_description": "Cannot set item in `dict[str, LoadMeta]`"
     },
@@ -129,56 +94,11 @@
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
       "name": "unsupported-operation",
       "concise_description": "Cannot set item in `dict[str, LoadMeta]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Any | None` is not assignable to parameter `manifest` with type `PoolManifest` in function `vllm_torchtpu.distributed.kv_transfer.raiden.seq_on_lane.sol_fa_geometry_from_manifest`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `binding`"
     },
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
       "name": "unbound-name",
       "concise_description": "`payload` may be uninitialized"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Any | None` is not assignable to parameter `manifest` with type `PoolManifest` in function `vllm_torchtpu.distributed.kv_transfer.raiden.seq_on_lane.sol_fa_geometry_from_manifest`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `pools`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "not-iterable",
-      "concise_description": "Type `None` is not iterable"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `Any | None` is not assignable to parameter `manifest` with type `PoolManifest` in function `vllm_torchtpu.distributed.kv_transfer.raiden.seq_on_lane.sol_fa_geometry_from_manifest`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | None` is not assignable to parameter `x` with type `Buffer | SupportsIndex | SupportsInt | SupportsTrunc | str` in function `int.__new__`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "bad-index",
-      "concise_description": "Cannot index into `int`"
-    },
-    {
-      "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `int | list[int]` is not assignable to parameter `x` with type `Buffer | SupportsIndex | SupportsInt | SupportsTrunc | str` in function `int.__new__`"
     },
     {
       "path": "src/vllm_torchtpu/distributed/kv_transfer/tpu_connector_stats.py",
@@ -402,36 +322,6 @@
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "unsupported-operation",
-      "concise_description": "`None` is not subscriptable"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `tuple[Unknown, Unknown, Unknown, Unknown, Unknown, Unknown, Unknown, Unknown] | tuple[Unknown, *tuple[Unknown, ...]] | None` is not assignable to parameter `input_partition_specs` with type `Sequence[Unknown]` in function `vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter.pcp_streaming_jax_op`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `tuple[Unknown, Unknown, int | None, Unknown] | tuple[Unknown, Unknown, Unknown]` is not assignable to declared return type `tuple[int, ...]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "bad-return",
-      "concise_description": "Returned type `tuple[Unknown, Unknown, int | None, Unknown] | tuple[Unknown, Unknown, Unknown]` is not assignable to declared return type `tuple[int, ...]`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `list[Unknown] | tuple[Unknown, Unknown]` is not assignable to parameter `kv_cache` with type `tuple[Unknown, Unknown]` in function `sparse_mla_impl`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/adapter/attention.py",
       "name": "bad-return",
       "concise_description": "Function declared to return `tuple[Unknown, Unknown]` but is missing an explicit `return`"
     },
@@ -469,11 +359,6 @@
       "path": "src/vllm_torchtpu/layers/core/fused_moe_gmm.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `vmem_capacity_bytes`"
-    },
-    {
-      "path": "src/vllm_torchtpu/layers/core/sequence_layout.py",
-      "name": "unsupported-delete",
-      "concise_description": "Invalid target for `del`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
@@ -542,16 +427,6 @@
     },
     {
       "path": "src/vllm_torchtpu/platforms/tpu_platform.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `fastapi`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_platform.py",
-      "name": "missing-import",
-      "concise_description": "Cannot find module `fastapi.responses`"
-    },
-    {
-      "path": "src/vllm_torchtpu/platforms/tpu_platform.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `ModuleType` has no attribute `build_app`"
     },
@@ -574,31 +449,6 @@
       "path": "src/vllm_torchtpu/runner/utils.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `ndim`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/utils.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `shape`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/utils.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `ndim`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/utils.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `data`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/utils.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `data`"
-    },
-    {
-      "path": "src/vllm_torchtpu/runner/utils.py",
-      "name": "missing-attribute",
-      "concise_description": "Object of class `NoneType` has no attribute `shape`"
     },
     {
       "path": "src/vllm_torchtpu/spec_decode/eagle3.py",

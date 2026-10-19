@@ -156,6 +156,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     # Startup, diagnostics, and orchestration only; these do not affect the
     # compiled model or custom-kernel lowering.
     "DP_SCHED_ENABLED",
+    "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS",
     "PYTHON_TRACER_LEVEL",
     "RAY_USAGE_STATS_ENABLED",
     "TPU_NAME",
@@ -849,6 +850,7 @@ class TpuCompilerAdaptor(CompilerInterface):
         # recompile path in `load`, not this one.
         handle = None
         if caching and entry is not None:
+            assert self.cache_dir is not None
             save_path = os.path.join(self.cache_dir, key)
             if self._save_handle(
                 key, save_path, entry, graph, was_wrapped, fingerprint

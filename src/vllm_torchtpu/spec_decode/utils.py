@@ -25,6 +25,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
 )
+from vllm.model_executor.models.utils import PPMissingLayer
 
 from vllm_torchtpu.layers.core.sequence_layout import (
     AllSequenceLayoutPlanner,
@@ -36,6 +37,8 @@ from vllm_torchtpu.utils import synchronize_tensors
 logger = init_logger(__name__)
 
 if TYPE_CHECKING:
+    from vllm.model_executor.models.interfaces import SupportsMultiModal
+
     from vllm_torchtpu.layers.core.attention_metadata import (
         AttentionMetadataBuilderContext,
     )
@@ -222,7 +225,7 @@ def maybe_share_embeddings(
     force_share: bool = False,
 ) -> None:
     target_lm = (
-        target_model.get_language_model()
+        cast("SupportsMultiModal", target_model).get_language_model()
         if hasattr(target_model, "get_language_model")
         else target_model
     )
@@ -232,6 +235,24 @@ def maybe_share_embeddings(
         if target_lm_model is not None
         else None
     )
+
+    if isinstance(target_embed, PPMissingLayer):
+        # DeepseekV2-style targets build embed_tokens only on the first PP stage, so
+        # the draft on the last stage keeps its own checkpoint-loaded embedding.
+        draft_embed = getattr(getattr(draft_model, "model", None), "embed_tokens", None)
+        needs_target = force_share or not getattr(
+            draft_model, "has_own_embed_tokens", True
+        )
+        if draft_embed is None or needs_target:
+            raise RuntimeError(
+                "The target's embed_tokens is not on this pipeline stage and the "
+                "draft has no loaded embed_tokens of its own"
+            )
+        logger.info(
+            "Target embed_tokens is not on this pipeline stage; the draft "
+            "keeps its own embed_tokens."
+        )
+        return
 
     if force_share:
         share_embed = True
@@ -349,7 +370,7 @@ def maybe_share_lm_head(
     materialize_if_mismatched: bool = True,
 ) -> None:
     target_lm = (
-        target_model.get_language_model()
+        cast("SupportsMultiModal", target_model).get_language_model()
         if hasattr(target_model, "get_language_model")
         else target_model
     )

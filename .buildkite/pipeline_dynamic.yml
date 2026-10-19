@@ -22,8 +22,8 @@
 # branch (a commit on main with branch main, say): the checkout fetches the
 # branch and refuses a commit that is not on it. Nothing is pushed for the
 # build. A tool that builds its own image names it in the build's meta-data as
-# CI_IMAGE_TAG, which scripts/run_in_docker.sh and kubernetes/common.sh read,
-# so the uploaded steps need no build step.
+# CI_IMAGE_TAG, which kubernetes/common.sh reads, so the uploaded steps need
+# no build step.
 #
 # What the passed YAML must be: one YAML document whose top-level key is
 # `steps:` (no leading `---`, no top-level `priority:`, not a bare list, not
@@ -46,9 +46,11 @@
 #   STEPS=$(base64 <<'EOT' | tr -d '\n'
 #   steps:
 #     - label: "my step"
-#       agents: { queue: tpu_v7x_2_queue }
+#       agents: { queue: kube }
+#       plugins: [ { kubernetes: { podTemplate: tpu-launcher } } ]
+#       env: { SHAPE: tpu7x-standard-1t/1x1x1 }
 #       commands:
-#         - .buildkite/scripts/run_in_docker.sh python3 -c "import vllm_torchtpu"
+#         - .buildkite/kubernetes/run.sh python3 -c "import vllm_torchtpu"
 #   EOT
 #   )
 #   curl -X POST -H "Authorization: Bearer $BUILDKITE_API_TOKEN" \

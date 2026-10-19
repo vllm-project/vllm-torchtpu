@@ -17,10 +17,11 @@ import threading
 import time
 import weakref
 from collections import defaultdict, deque
-from typing import Any
+from typing import Any, cast
 
 import ray
 import vllm.envs as envs
+from ray.actor import ActorHandle
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from vllm.distributed.device_communicators.shm_broadcast import MessageQueue
 from vllm.platforms import current_platform
@@ -52,7 +53,9 @@ def get_tpu_bundles_for_indices(
 ) -> list[tuple[int, str, str]]:
     """Return bundle metadata for the specified bundle indices."""
     if bundle_to_node_id is None:
-        bundle_to_node_id = get_bundles_sorted_by_node(placement_group)
+        bundle_to_node_id = cast(
+            list[tuple[int, str, str]], get_bundles_sorted_by_node(placement_group)
+        )
     bundle_map = {b[0]: b for b in bundle_to_node_id}
     try:
         return [bundle_map[idx] for idx in bundle_indices]
@@ -322,7 +325,7 @@ class RayDistributedExecutorV2(RayExecutorV2):
             )
 
             handle = RayWorkerHandle(
-                actor=actor,
+                actor=cast(ActorHandle, actor),
                 rank=bundle["rank"],
                 local_rank=-1,  # Set in Step 7 after TPU ID discovery
                 node_id=bundle["node_id"],

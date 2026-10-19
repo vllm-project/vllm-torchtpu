@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, Union, cast
 
 import ray
 import vllm.envs as envs
+from ray.actor import ActorHandle
 from ray.util.placement_group import PlacementGroup
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 from vllm.platforms import current_platform
@@ -304,7 +305,9 @@ class RayDistributedExecutor(RayDistributedExecutorV1):
                 scheduling_strategy=scheduling_strategy,
                 **ray_remote_kwargs,
             )(RayWorkerWrapper).remote(rpc_rank=rank)
-            worker_metadata.append(RayWorkerMetaData(worker=worker, created_rank=rank))
+            worker_metadata.append(
+                RayWorkerMetaData(worker=cast(ActorHandle, worker), created_rank=rank)
+            )
 
         worker_ips = ray.get(
             [

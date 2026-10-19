@@ -199,8 +199,7 @@ run_lm_eval() {
     # our task definitions, not from the model: local-chat-completions leaves
     # the chat template to the server and fingerprints requests with an empty
     # tokenizer name. So they are cached per combination in the shared cache,
-    # $HF_HOME/hub (a gcsfuse bucket on kube, the host's model cache on bare
-    # metal), for every config and later run. lm-eval's own cache key leaves
+    # $HF_HOME/hub (a gcsfuse bucket on kube), for every config and later run. lm-eval's own cache key leaves
     # out --limit, --gen_kwargs and the task YAML contents, so the directory
     # name carries all of it.
     local request_spec=() skip_next=0 arg

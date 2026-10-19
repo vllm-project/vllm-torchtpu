@@ -183,6 +183,8 @@ Tests requiring physical TPU hardware run in Buildkite CI.
   gh pr edit <PR_NUMBER> --add-label ready
   ```
 
+* **New commits**: On a PR from a branch in this repository, every push runs TPU CI again while the label is on. On a PR from a fork, TPU CI runs only when the label is added: each push, including a rebase or a merge of `main`, takes it off, and a code owner adds it again after looking at the new commits.
+
 * **On-call fixes**: A PR that fixes a broken main or nightly build can also take the `oncall-fix` label. Its TPU jobs then run ahead of every other build, including builds of `main`. Adding the label starts a new build and cancels the queued one. Use it only for on-call fixes.
 
 ---

@@ -97,6 +97,14 @@ def test_settles_when_the_awaited_step_is_the_newest():
     assert [c[0] for c in executor.calls] == ["pp_push", "pp_settle", "pp_settle"]
 
 
+def test_two_stages_settle_without_pushes():
+    executor = _Executor()
+    wave = pp_push._WaveState(stages=2)
+    assert _futures(executor, wave, 1)[0].result() == 1
+    assert [c[0] for c in executor.calls] == ["pp_settle"]
+    assert not wave.open
+
+
 def test_the_future_forwards_to_the_executors_future():
     executor = _Executor()
     wave = pp_push._WaveState(stages=2)
@@ -283,9 +291,9 @@ def test_each_executor_pushes_for_its_own_pipeline_size(monkeypatch, queue):
     two = _install_on_fake_executor(monkeypatch, stages=2)
     four = type(two)(stages=4)
     pp_push.patch_executor_for_pp_wave(four.vllm_config)
-    # two stages: every launch pairs on its own, so neither push nor settle
+    # two stages: launches pair directly without pushes, but the burst still settles
     assert two.execute_model(_step(16, 1)) == ("forward", 1)
-    assert two.calls == []
+    assert [c[0] for c in two.calls] == ["pp_settle"]
     # four stages: the same lone step settles as well
     assert four.execute_model(_step(16, 1)) == ("forward", 1)
     assert [c[0] for c in four.calls] == ["pp_settle"]

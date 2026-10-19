@@ -18,10 +18,8 @@
 #   mp_multihost_entry.sh <config_name> [run_eval_flow args...]
 #
 # Every host runs this with the same arguments and decides its own role from
-# JOB_COMPLETION_INDEX; nothing outside the pods orchestrates them. This is the
-# `mp` half of what run_multihost.sh dispatches on bare metal, where the head
-# ssh's to the other VM and starts a container - there is no second VM to reach
-# here, so each pod starts its own half.
+# JOB_COMPLETION_INDEX; nothing outside the pods orchestrates them. Each pod starts its
+# own half.
 #
 # vLLM's own multi-node DP is the mechanism: one `vllm serve` per host, all
 # naming the same --data-parallel-address, the secondary hosts --headless with
@@ -59,12 +57,11 @@ PORT="${PORT:-8000}"
 DP_RPC_PORT="${DP_RPC_PORT:-29500}"
 
 # An address, not a name: index 0 *binds* a TCPStore here, and every host is
-# handed the same value - the head's - exactly as on bare metal.
+# handed the same value - the head's.
 DP_ADDRESS="$(resolve "$HEAD_HOST" 300)" || exit 1
 echo "--- host ${INDEX}/${NUM_HOSTS}: data-parallel address ${DP_ADDRESS}"
 
-# The defaults run_multihost_mp.sh applies before sourcing, so a config written
-# for that path behaves the same here.
+# Defaults for what a config may leave unset, applied before sourcing it.
 MODEL_URI="${MODEL_URI:-}"
 TENSOR_PARALLELISM=1
 DATA_PARALLELISM=1

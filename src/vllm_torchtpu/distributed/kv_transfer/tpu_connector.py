@@ -813,16 +813,15 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         if role == KVConnectorRole.SCHEDULER:
             self.connector_scheduler = scheduler_cls(vllm_config)
             if use_raiden and _use_raiden_stage3_transport():
-                self.connector_scheduler._stage3_fa_group_index = (
-                    self._stage3_fa_group_index
+                raiden_scheduler = cast(
+                    TPURaidenConnectorScheduler, self.connector_scheduler
                 )
-                self.connector_scheduler._stage3_transfer_groups = (
-                    self._stage3_transfer_groups
-                )
-                self.connector_scheduler._stage3_mamba_group_indices = (
+                raiden_scheduler._stage3_fa_group_index = self._stage3_fa_group_index
+                raiden_scheduler._stage3_transfer_groups = self._stage3_transfer_groups
+                raiden_scheduler._stage3_mamba_group_indices = (
                     self._stage3_mamba_group_indices
                 )
-                self.connector_scheduler._stage3_mamba_num_speculative_blocks = (
+                raiden_scheduler._stage3_mamba_num_speculative_blocks = (
                     stage3_mamba_num_speculative_blocks
                 )
             self.connector_worker = None
@@ -969,7 +968,9 @@ class TPUConnector(KVConnectorBase_V1, SupportsHMA):
         canonical pool manifest.
         """
         if self.use_raiden and self.connector_worker is not None:
-            self.connector_worker.named_kv_caches = kv_caches
+            cast(
+                TPURaidenConnectorWorker, self.connector_worker
+            ).named_kv_caches = kv_caches
 
     def register_runner(self, runner: TPUModelRunner) -> None:
         assert self.connector_worker is not None
@@ -1041,6 +1042,7 @@ class TPURaidenConnector(TPUConnector):
 class TPUConnectorScheduler:
     def __init__(self, vllm_config: "VllmConfig"):
         self.vllm_config = vllm_config
+        assert vllm_config.kv_transfer_config is not None
         self.config = vllm_config.kv_transfer_config
         self.is_producer = self.config.is_kv_producer
 
@@ -1218,12 +1220,13 @@ class TPUConnectorScheduler:
                   because TPU pulls KV cache in a blocking way.
 
         """
-        if not self._admit_kv_transfer_params(
-            request
-        ) or request.kv_transfer_params.get("_remote_kv_processed"):
+        if not self._admit_kv_transfer_params(request) or cast(
+            dict[str, Any], request.kv_transfer_params
+        ).get("_remote_kv_processed"):
             return 0, False
 
         assert num_computed_tokens % self.block_size == 0
+        assert request.prompt_token_ids is not None
         # Rounding must match request_finished()'s remote_block_ids computation.
         rounded_num_prompt_tokens = round_down(
             len(request.prompt_token_ids), self.block_size
@@ -1242,6 +1245,7 @@ class TPUConnectorScheduler:
             return
 
         params = request.kv_transfer_params
+        assert params is not None
         if num_external_tokens > 0:
             local_block_ids = blocks.get_block_ids()[0]
             # D must pull the whole prefill blocks regardless of partial
@@ -1350,10 +1354,12 @@ class TPUConnectorWorker(ZmqShmKvConnectorBase):
         self, slot_idx: int, num_blocks: int, block_ids: list[int]
     ) -> tuple[list, list, int]:
         indices = torch.tensor(block_ids, dtype=torch.int64, device=self.device)
+        assert self.runner is not None
         kv_caches = self.runner.kv_caches
         tpu_tensors: list = []
         cpu_tensors: list = []
         d2h_total_bytes = 0
+        assert self._coord_pool is not None
         for layer_idx, cache in enumerate(kv_caches):
             src_shard = torch.index_select(cache, 0, indices)
             dest_view = self._coord_pool.layer_view(
@@ -1412,6 +1418,7 @@ class TPUConnectorWorker(ZmqShmKvConnectorBase):
         dest_blocks_dev = torch.tensor(
             local_blocks, dtype=torch.int32, device=self.device
         )
+        assert self.device is not None
         prebuilt = kv_scatter.prepare_scatter_args(dest_blocks_dev, self.device)
         return kv_scatter.multi_layer_scatter_into(
             device_shards, kv_caches, dest_blocks_dev, prebuilt_args=prebuilt
@@ -1435,6 +1442,7 @@ class TPUConnectorWorker(ZmqShmKvConnectorBase):
             )
             return
         trailing = tuple(self.shape[1:]) if len(self.shape) > 1 else (128,)
+        assert self.device is not None
         ok = kv_scatter.smoke_test_multi_layer_scatter(
             device=self.device,
             num_layers=2,
@@ -1682,9 +1690,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         request: "Request",
         num_computed_tokens: int,
     ) -> tuple[int, bool]:
-        if not self._admit_kv_transfer_params(
-            request
-        ) or request.kv_transfer_params.get("_remote_kv_processed"):
+        if not self._admit_kv_transfer_params(request) or cast(
+            dict[str, Any], request.kv_transfer_params
+        ).get("_remote_kv_processed"):
             return 0, False
 
         assert num_computed_tokens % self.block_size == 0
@@ -1694,12 +1702,14 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             # num_computed_tokens is the transfer extent: in the deployed
             # proxy's one-token-prefill flow this can be prompt_tokens - 1.
             # Do not replace it with prompt length here.
+            assert request.kv_transfer_params is not None
             transfer_tokens = request.kv_transfer_params["num_tokens"]
             count = max(transfer_tokens - num_computed_tokens, 0)
             if count > 0 and dist_utils.get_raiden_inline_load():
                 return count, False
             return count, count > 0
 
+        assert request.prompt_token_ids is not None
         rounded_num_prompt_tokens = round_down(
             len(request.prompt_token_ids), self.block_size
         )
@@ -1732,6 +1742,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             return
 
         params = request.kv_transfer_params
+        assert params is not None
         if num_external_tokens > 0:
             # D must pull the WHOLE prefill payload: P publishes it under one
             # uuid with no partial-pull, so load into every allocated block.
@@ -2569,12 +2580,13 @@ class TPURaidenConnectorWorker:
 
     def __init__(self, vllm_config: VllmConfig):
         self.vllm_config = vllm_config
+        assert vllm_config.kv_transfer_config is not None
         self.config = vllm_config.kv_transfer_config
         self.is_producer = self.config.is_kv_producer
         self._stage3_kimi = _is_kimi(vllm_config)
         self.runner: TPUModelRunner | None = None
         self.node_id = dist_utils.get_node_id()
-        self.tp_rank = get_tensor_model_parallel_rank()
+        self.tp_rank: int = get_tensor_model_parallel_rank()
         self.tp_size = get_tensor_model_parallel_world_size()
         self.dp_rank: int = (
             vllm_config.parallel_config.data_parallel_rank
@@ -2833,6 +2845,7 @@ class TPURaidenConnectorWorker:
                 "Raiden pool admission requires "
                 "register_kv_caches() before register_runner()"
             )
+        assert runner.kv_cache_config is not None
         kv_cache_groups = tuple(runner.kv_cache_config.kv_cache_groups or ())
         raw_tensors = tuple(runner.kv_cache_raw_tensors or ())
 
@@ -3217,6 +3230,7 @@ class TPURaidenConnectorWorker:
                 "Raiden pool admission requires "
                 "register_kv_caches() before register_runner()"
             )
+        assert runner.kv_cache_config is not None
         kv_cache_groups = tuple(runner.kv_cache_config.kv_cache_groups or ())
         raw_tensors = tuple(runner.kv_cache_raw_tensors or ())
 
@@ -4252,6 +4266,7 @@ class TPURaidenConnectorWorker:
                     sol_fa_geometry_from_manifest,
                 )
 
+                assert self._raiden_manifest is not None
                 fa_registration = lower_fa_spans_sol(
                     num_tokens=num_tokens,
                     transfer_rank=lowering_rank,
@@ -5028,6 +5043,7 @@ class TPURaidenConnectorWorker:
             sol_gdn_conv_lane_bytes,
         )
 
+        assert self._raiden_manifest is not None
         aliased_raw = self._raiden_manifest.binding == BINDING_ALIASED_RAW
         if aliased_raw and not self._stage3_kimi:
             # Raw transfers move physical bytes; admit only the fingerprinted
@@ -5493,6 +5509,7 @@ class TPURaidenConnectorWorker:
                     )
                 if tp_group is not None:
                     outcome = tp_group.broadcast_object(outcome, src=0)
+                assert outcome is not None
                 status, submit_ms, error_text, skip_tokens, fa_skip_bytes = outcome
                 if status == "failed":
                     # FA D5 lookup and local validation fail before receiver
@@ -5629,6 +5646,7 @@ class TPURaidenConnectorWorker:
             )
             if skip_tokens % (int(self.vllm_config.cache_config.block_size) * dcp_size):
                 raise ValueError("DCP prefix must cover whole scheduler blocks")
+            assert self._raiden_manifest is not None
             return sol_fa_skip_bytes(
                 skip_tokens // dcp_size,
                 geometry=sol_fa_geometry_from_manifest(self._raiden_manifest),
@@ -6091,7 +6109,7 @@ class TPURaidenConnectorWorker:
                     states[req_id] = "uncertain"
                 elif req_id in self._stage3_controller_accepted:
                     states[req_id] = "accepted"
-        states = get_tp_group().broadcast_object(states, src=0)
+        states = cast(dict[str, str], get_tp_group().broadcast_object(states, src=0))
         for req_id, state in states.items():
             self._stage3_tp_submits.remove(req_id)
             if self.tp_rank == 0:
@@ -6787,7 +6805,7 @@ class TPURaidenConnectorWorker:
                 # controller: the reshard coordinator submits transfer
                 # programs over the persistent channel this creates.
                 dispatch_address = _reshard_dispatch_address(self.dp_rank)
-                self._wait_for_address_ready(dispatch_address, timeout_s=30.0)
+                self._wait_for_address_ready(dispatch_address, timeout_s=300.0)
                 manager_kwargs.update(
                     raiden_worker_port=0,
                     raiden_controller_address=dispatch_address,
@@ -6862,18 +6880,31 @@ class TPURaidenConnectorWorker:
             # the same counterpart node. Otherwise, fetch everything from the one node.
             node_idx = self.node_id if len(req_meta.remote_host) > 1 else 0
             host = req_meta.remote_host[node_idx]
-            base_port = int(req_meta.remote_port[node_idx])
+            base_port = int(cast(list[int], req_meta.remote_port)[node_idx])
             # Per-node bases already carry the node offset (each entry is that
             # node's first-rank control port), so dial with the node-local rank.
             ranks_per_node = max(1, self.tp_size // len(req_meta.remote_host))
             local_rank = self.tp_rank - node_idx * ranks_per_node
             return f"{host}:{self._rank_control_port(base_port, rank=local_rank)}"
         host = req_meta.remote_host
-        base_port = int(req_meta.remote_port)
+        base_port = int(cast(int, req_meta.remote_port))
         return f"{host}:{self._rank_control_port(base_port)}"
 
     def _max_request_blocks(self) -> int:
-        block_size = self.vllm_config.cache_config.block_size
+        # Block ids address rank-local attention pages. PCP/DCP partition
+        # the same context axis, so one logical page spans all CP ranks.
+        # Their supported configurations use at most one of PCP/DCP > 1.
+        parallel = self.vllm_config.parallel_config
+        pcp_size = parallel.prefill_context_parallel_size
+        dcp_size = parallel.decode_context_parallel_size
+        if pcp_size > 1 and dcp_size > 1:
+            raise ValueError(
+                "Raiden staging capacity does not support PCP and DCP both > 1 "
+                f"(prefill_context_parallel_size={pcp_size}, "
+                f"decode_context_parallel_size={dcp_size})."
+            )
+        cp_size = max(pcp_size, dcp_size)
+        block_size = self.vllm_config.cache_config.block_size * cp_size
         max_model_len = self.vllm_config.model_config.max_model_len
         return max(1, (max_model_len + block_size - 1) // block_size)
 

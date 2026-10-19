@@ -2,15 +2,30 @@ name: Ready Label
 
 # TPU CI (buildkite/vllm-torchtpu-ci/pr) only runs on PRs labeled `ready`.
 # Without the label nothing in Buildkite says why that status never arrives,
-# so this check fails until a code owner or maintainer adds it. It reads only
-# the event payload, with no checkout and no token, so it also works on fork
-# PRs.
+# so this check fails until a code owner or maintainer adds it.
+#
+# A PR from a fork builds only at the moment `ready` is added, never on a push:
+# the Buildkite filter says so, because Buildkite starts a push's build before
+# any workflow can react to the push. So a push to a fork's PR takes the label
+# off here, and a code owner adds it again after looking at the new commits.
+# That includes a rebase or a merge of main, either of which can carry changes
+# of its own. A PR from a branch in this repo keeps building on every push.
+#
+# pull_request_target, not pull_request: taking the label off needs a write
+# token, and the check has to run on a first-time contributor's fork PR, whose
+# `pull_request` runs wait for a maintainer to approve them. It runs this file
+# from the base branch and never checks out the PR, so no PR code runs with that
+# token. Keep it that way: no actions/checkout, and event fields only through
+# env. A label change made with GITHUB_TOKEN starts no workflow run, which is
+# why the job that takes the label off is also the check.
 
 on:
-  pull_request:
+  pull_request_target:
     types: [opened, synchronize, reopened, labeled, unlabeled]
 
-permissions: {}
+permissions:
+  # Take the label off.
+  pull-requests: write
 
 concurrency:
   group: ready-label-${{ github.event.pull_request.number }}
@@ -23,8 +38,24 @@ jobs:
     steps:
       - name: Require the ready label
         env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          # Empty when the fork has been deleted, which counts as a fork.
+          HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          ACTION: ${{ github.event.action }}
           HAS_READY: ${{ contains(github.event.pull_request.labels.*.name, 'ready') }}
         run: |
+          if [[ "${ACTION}" == "synchronize" && "${HAS_READY}" == "true" &&
+                "${HEAD_REPO}" != "${REPO}" ]]; then
+            if gh api -X DELETE "repos/${REPO}/issues/${PR_NUMBER}/labels/ready" > /dev/null; then
+              echo "Took the 'ready' label off."
+            else
+              echo "::warning::Could not take the 'ready' label off; it may already be gone."
+            fi
+            echo "::error::New commits on a fork's PR run TPU CI only after a code owner or maintainer adds the 'ready' label again."
+            exit 1
+          fi
           if [[ "${HAS_READY}" == "true" ]]; then
             echo "Found the 'ready' label."
             exit 0

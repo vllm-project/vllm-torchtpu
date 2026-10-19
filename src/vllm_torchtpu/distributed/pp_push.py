@@ -115,10 +115,10 @@ class _WaveState:
         lacks, counting the pushes as later steps for the waits that
         follow. With lazy pushes the engine core sends the pushes, and a
         wait settles."""
-        # With one or two stages every launch pairs on its own: stage 1's
-        # launch before forward m is stage 0's launch after it.
-        if not self.open or self.stages <= 2:
+        if not self.open:
             return
+        # With two stages the launches pair without pushes; the settle still
+        # goes out and issues stage 0's queued hand-off.
         if self.lazy or real_step == self.real_steps:
             self.settle(executor)
             return

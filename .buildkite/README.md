@@ -1,15 +1,16 @@
 # Buildkite pipelines
 
-`pipeline_tests.yml` runs unmarked unit tests in `tests/` on `cpu_64_core` by
-default and runs tests marked `tpu_test` (or `multichip`) on the TPU queues.
-PR steps exclude `nightly` tests; nightly steps include them. Both use the CI
-image built by `pipeline_build.yml`.
-The CPU steps set `CPU_ONLY=1` to run Docker without privileged mode or device
-mounts and select the JAX CPU backend. Host model caches and test results
-use `$HOME/.cache/vllm-torchtpu-ci` on CPU agents and `/mnt/disks/persist`
-on TPU agents.
+CI runs on the Kueue fleet: `bootstrap.sh` uploads the `pipeline_<lane>.yml`
+lanes (`tests`, `integration`, `perf`, `verify`), and every step runs in a pod
+through `.buildkite/kubernetes/run.sh`.
 
-`pipeline_perf.yml` (`pipeline_perf_kube.yml` on kube) holds the perf/eval
+`pipeline_tests.yml` runs unmarked unit tests in `tests/` in CPU pods and
+tests marked `tpu_test` (or `multichip`) on TPU v7x slices (1x1x1 and 2x2x1).
+PR steps exclude `nightly` tests; nightly steps include them. Both use the CI
+image built by `pipeline_build.yml`. The CPU steps set `JAX_PLATFORMS=cpu` so
+JAX does not look for a TPU.
+
+`pipeline_perf.yml` holds the perf/eval
 steps. Post-merge builds do not run them, and PR builds run them only when the
 PR has the `run-perf-eval` label; adding that label to a PR that already has
 `ready` starts a build that includes them. The 02:00 PT nightly runs

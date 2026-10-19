@@ -2,6 +2,8 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 # Ensure environment overrides are applied before any other imports,
 # especially torch_tpu which might read them at import time.
+import functools
+
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import bisect
@@ -16,7 +18,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Concatenate, cast
 
 # TODO: Remove this after jax dependency is removed
 import jax
@@ -55,6 +57,7 @@ from vllm.model_executor.layers.rotary_embedding.mrope_interleaved import (
     MRotaryEmbeddingInterleaved,
 )
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
@@ -110,6 +113,7 @@ from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
 )
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
+    AttentionMetadataBuilder,
     AttentionMetadataBuilderContext,
     attention_block_table_width,
     stage_block_table_uploads,
@@ -174,6 +178,7 @@ from vllm_torchtpu.tracing.utils import (
 from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
 
 if TYPE_CHECKING:
+    from vllm.model_executor.models.interfaces import SupportsPP
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
 
@@ -365,6 +370,23 @@ def _substitute_placeholder_token(
 logger = init_logger(__name__)
 
 
+def _pp_step[**P, R](
+    method: Callable[Concatenate[Any, P], R],
+) -> Callable[Concatenate[Any, P], R]:
+    """Brackets a runner call that traces device ops with the pipeline wave's
+    step."""
+
+    @functools.wraps(method)
+    def wrapper(self: Any, *args: P.args, **kwargs: P.kwargs) -> R:
+        wave = self._pp_wave
+        if wave is None:
+            return method(self, *args, **kwargs)
+        with wave.step():
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 def _spec_warmup_all_token_ids(
     req_ids: list[str], num_computed_tokens: list[int]
 ) -> dict[str, list[int]]:
@@ -544,6 +566,8 @@ class TPUModelRunner(GPUModelRunner):
     # pyrefly: ignore[bad-override-mutable-attribute]
     input_ids: torch.Tensor
     empty_slot_mappings: dict[int, torch.Tensor]
+    # Default for a runner built without __init__.
+    _pp_wave: PPWave | None = None
 
     @property
     def _async_drafter(self) -> DFlashProposer | Eagle3Proposer:
@@ -1004,7 +1028,7 @@ class TPUModelRunner(GPUModelRunner):
 
         # Hand-off wave over ICI; built in capture_model, where every stage
         # reaches the same point.
-        self._pp_wave: PPWave | None = None
+        self._pp_wave = None
         # A sparse model's shared top-k index table, when this stage's layers
         # cannot all recompute it; set at load time under a pipeline.
         self._pp_topk_buffer: torch.Tensor | None = None
@@ -1572,7 +1596,9 @@ class TPUModelRunner(GPUModelRunner):
         per_layer_attn_metadata: dict[str, AttentionMetadata] = {}
         for group_list in self.attn_groups:
             for group in group_list:
-                built = group.metadata_builders[0].build(
+                built = cast(
+                    AttentionMetadataBuilder, group.metadata_builders[0]
+                ).build(
                     common_prefix_len=0,
                     common_attn_metadata=common,
                 )
@@ -1614,14 +1640,16 @@ class TPUModelRunner(GPUModelRunner):
                 ctx,
                 num_reqs_padded,
                 gids={
-                    group.metadata_builders[0].kv_cache_group_id
+                    cast(
+                        AttentionMetadataBuilder, group.metadata_builders[0]
+                    ).kv_cache_group_id
                     for group, _ in selected_groups
                 },
             )
         common = SimpleNamespace(num_reqs=num_reqs_padded)
         metadata: dict[str, AttentionMetadata] = {}
         for group, selected in selected_groups:
-            built = group.metadata_builders[0].build(
+            built = cast(AttentionMetadataBuilder, group.metadata_builders[0]).build(
                 common_prefix_len=0,
                 common_attn_metadata=common,
             )
@@ -3636,6 +3664,7 @@ class TPUModelRunner(GPUModelRunner):
         )
 
     @torch.no_grad()
+    @_pp_step
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -4163,7 +4192,7 @@ class TPUModelRunner(GPUModelRunner):
             seq_lens_cpu=seq_lens_cpu,
             device=self.device,
         )
-        pooler_output = self.model.pooler(
+        pooler_output = cast(VllmModelForPooling, self.model).pooler(
             hidden_states=unpadded_hidden_states,
             pooling_metadata=pooling_metadata,
         )
@@ -4497,6 +4526,7 @@ class TPUModelRunner(GPUModelRunner):
             topk_candidates=topk_candidates,
         )
 
+    @_pp_step
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
@@ -5365,6 +5395,7 @@ class TPUModelRunner(GPUModelRunner):
         self._attention_kernels_initialized = True
 
     @torch.no_grad()
+    @_pp_step
     def _dummy_run(
         self,
         num_tokens: int,
@@ -5754,8 +5785,13 @@ class TPUModelRunner(GPUModelRunner):
             or self._pp_chunk_granularity is not None
         ):
             return
+        # The scheduler clips a prefill chunk at a mamba block boundary under
+        # this same condition, so a granule that is not a whole block would
+        # clip a lone prompt's first chunk to nothing.
         block_aligned = (
-            self._has_mamba_state and self.cache_config.mamba_cache_mode == "align"
+            self.kv_cache_config is not None
+            and self.kv_cache_config.has_mamba_layers
+            and self.cache_config.mamba_cache_mode == "align"
         )
         granularity = chunk_granularity(
             self.cache_config.block_size, self.max_num_tokens, block_aligned
@@ -7518,8 +7554,10 @@ class TPUModelRunner(GPUModelRunner):
         """Buffers shaped like this stage's input from the previous stage:
         zeros, uninitialized, or random values."""
         if self._pp_intermediate_template is None:
-            probe = self.model.make_empty_intermediate_tensors(
-                batch_size=1, dtype=self.model_config.dtype, device=self.device
+            probe = cast("SupportsPP", self.model).make_empty_intermediate_tensors(
+                batch_size=1,
+                dtype=cast(torch.dtype, self.model_config.dtype),
+                device=self.device,
             )
             template = {
                 key: (tuple(tensor.shape[1:]), tensor.dtype)

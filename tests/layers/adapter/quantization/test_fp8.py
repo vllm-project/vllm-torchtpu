@@ -347,13 +347,13 @@ def test_fp8_routed_experts_tp_shard_loading(monkeypatch, tp_size, full_inter):
         (16, 1024, [64, 64]),  # Qwen3.5-397B shared geometry: shard 64.
         (8, 768, [32, 32]),  # Shard 96: the smallest block still allowed.
         (2, 512, [128, 128]),  # Shard 256: whole blocks, nothing to refine.
-        (16, 640, None),  # Shard 40: gcd 8 < 32, refused.
+        (16, 640, [8, 8]),  # Lossless load-time refinement for shard 40.
     ],
 )
 def test_fp8_routed_experts_block_refine(
     monkeypatch, tp_size, full_inter, expected_block
 ):
-    """Sub-block shards use upstream's refine: blocks under 32 are refused."""
+    """Sub-block shards retain the checkpoint scales before runtime padding."""
     from types import SimpleNamespace
 
     from vllm.config import set_current_vllm_config
@@ -750,6 +750,186 @@ class TestFp8LinearSubBlockTP:
             torch.testing.assert_close(
                 layer.weight_scale_inv.data[2], v_s[kv_group // 2]
             )
+
+
+def _make_fp8_experts(monkeypatch, block_size, shard_size, *, tp_size=2, tp_rank=1):
+    from types import SimpleNamespace
+
+    from vllm.config import set_current_vllm_config
+    from vllm.model_executor.layers.fused_moe import RoutedExperts
+    from vllm.model_executor.layers.fused_moe.config import (
+        FusedMoEConfig,
+        FusedMoEParallelConfig,
+        MoEActivation,
+        RoutingMethodType,
+    )
+    from vllm.model_executor.layers.fused_moe.expert_map_manager import ExpertMapManager
+
+    parallel = FusedMoEParallelConfig(
+        tp_size=tp_size,
+        pcp_size=1,
+        dp_size=1,
+        ep_size=1,
+        tp_rank=tp_rank,
+        pcp_rank=0,
+        dp_rank=0,
+        ep_rank=0,
+        sp_size=1,
+        use_ep=False,
+        all2all_backend="allgather_reducescatter",
+        enable_eplb=False,
+    )
+    config = FusedMoEConfig(
+        num_experts=2,
+        experts_per_token=1,
+        hidden_dim=256,
+        intermediate_size=tp_size * shard_size,
+        num_local_experts=2,
+        num_logical_experts=2,
+        activation=MoEActivation.SILU,
+        device=torch.device("cpu"),
+        routing_method=RoutingMethodType.Renormalize,
+        moe_parallel_config=parallel,
+        in_dtype=torch.bfloat16,
+    )
+    expert_map = ExpertMapManager(
+        max_num_batched_tokens=16,
+        top_k=1,
+        global_num_experts=2,
+        num_redundant_experts=0,
+        num_expert_group=None,
+        moe_parallel_config=parallel,
+        placement_strategy="linear",
+        enable_eplb=False,
+    )
+    monkeypatch.setattr(
+        "vllm.model_executor.layers.quantization.fp8."
+        "get_tensor_model_parallel_world_size",
+        lambda: tp_size,
+    )
+    monkeypatch.setattr(
+        "vllm.distributed.get_tensor_model_parallel_world_size",
+        lambda: tp_size,
+    )
+    quant = VllmFp8Config(
+        is_checkpoint_fp8_serialized=True,
+        activation_scheme="dynamic",
+        weight_block_size=block_size,
+    )
+    quant.vllm_config = SimpleNamespace(
+        parallel_config=SimpleNamespace(enable_expert_parallel=False),
+        model_config=SimpleNamespace(hf_config=SimpleNamespace(expert_dtype="fp8")),
+    )
+    with set_current_vllm_config(quant.vllm_config):
+        layer = RoutedExperts(
+            layer_name="model.layers.0.mlp.experts",
+            params_dtype=torch.bfloat16,
+            moe_config=config,
+            quant_config=quant,
+            expert_map_manager=expert_map,
+        )
+
+    return layer
+
+
+@pytest.mark.cpu_test
+def test_fp8_tp_rejects_partial_checkpoint_block(monkeypatch):
+    # A whole I=800 checkpoint has a partial scale block. Refining its ceil
+    # scale grid then evenly slicing it would silently misassign TP scales.
+    with pytest.raises(ValueError, match="checkpoint dimensions"):
+        _make_fp8_experts(monkeypatch, [128, 128], 100, tp_size=8, tp_rank=0)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "intermediate,tp_size",
+    [(512, 2), (384, 2), (640, 1), (640, 2), (640, 4), (640, 8), (768, 3), (800, 1)],
+)
+def test_fp8_tp_shards_reconstruct_checkpoint(monkeypatch, intermediate, tp_size):
+    """Every rank must load all its scale blocks, including split block edges."""
+    from vllm_torchtpu.layers.adapter.quantization.fp8 import (
+        _process_fp8_moe_weights,
+        _quantize_and_format_single_moe_weight,
+    )
+    from vllm_torchtpu.layers.core.quantization import dequantize_tensor
+
+    local = intermediate // tp_size
+    full = torch.arange(intermediate * 256).reshape(intermediate, 256)
+    full = (full % 7 - 3).to(torch.float8_e4m3fn)
+    # Powers of two keep dequantization exact and expose wrong block ownership.
+    scales = 2.0 ** (torch.arange((intermediate + 127) // 128 * 2).reshape(-1, 2) % 5)
+    expected = (
+        full.float()
+        * scales.repeat_interleave(128, 0).repeat_interleave(128, 1)[:intermediate]
+    )
+    gates, downs = [], []
+    for rank in range(tp_size):
+        layer = _make_fp8_experts(
+            monkeypatch, [128, 128], local, tp_size=tp_size, tp_rank=rank
+        )
+        for name, weight, scale in (
+            ("gate", full, scales),
+            ("up", full, scales),
+            ("down", full.t().contiguous(), scales.t().contiguous()),
+        ):
+            list(
+                layer.load_weights(
+                    iter(
+                        [
+                            (f"0.{name}_proj.weight", weight),
+                            (f"0.{name}_proj.weight_scale_inv", scale),
+                        ]
+                    )
+                )
+            )
+        gate = dequantize_tensor(
+            layer.w13_weight[:1], layer.w13_weight_scale_inv[:1], axis=(1, 2)
+        )[0]
+        down = dequantize_tensor(
+            layer.w2_weight[:1], layer.w2_weight_scale_inv[:1], axis=(1, 2)
+        )[0]
+        padded = layer.w2_weight.shape[-1]
+        torch.testing.assert_close(
+            gate[padded : padded + local],
+            expected[rank * local : (rank + 1) * local],
+            rtol=0,
+            atol=0,
+        )
+        gates.append(gate[:local])
+        downs.append(down[:, :local])
+        # Observe the FP32 tensor before runtime requantization; this also checks
+        # no rank-dependent padding mask discards real neurons after loading.
+        observed = {}
+
+        def capture(w, *, name, observed=observed, **kwargs):
+            observed[name] = w[0].clone()
+            return _quantize_and_format_single_moe_weight(w, name=name, **kwargs)
+
+        with monkeypatch.context() as patch:
+            patch.setattr(
+                "vllm_torchtpu.layers.adapter.quantization.fp8._quantize_and_format_single_moe_weight",
+                capture,
+            )
+            _process_fp8_moe_weights(
+                layer,
+                weight_block_size=tuple(layer.quant_method.moe_block_shape),
+                activation="silu",
+            )
+        torch.testing.assert_close(observed["w13"][:local], gates[-1], rtol=0, atol=0)
+        torch.testing.assert_close(observed["w2"][:, :local], downs[-1], rtol=0, atol=0)
+        runtime = _process_fp8_moe_weights(
+            layer,
+            weight_block_size=tuple(layer.quant_method.moe_block_shape),
+            activation="silu",
+        )
+        aligned = (local + 127) // 128 * 128
+        assert runtime[0].shape == (2, 256, 2 * aligned)
+        assert runtime[2].shape == (2, aligned, 256)
+        assert torch.count_nonzero(runtime[0][0, :, local:aligned].float()) == 0
+        assert torch.count_nonzero(runtime[0][0, :, aligned + local :].float()) == 0
+        assert torch.count_nonzero(runtime[2][0, local:].float()) == 0
+    torch.testing.assert_close(torch.cat(gates), expected, rtol=0, atol=0)
+    torch.testing.assert_close(torch.cat(downs, dim=1), expected.t(), rtol=0, atol=0)
 
 
 class FakeQuant:

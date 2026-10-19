@@ -670,6 +670,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             distribution,
             **kwargs,
         ):
+            # pyrefly: ignore[unsupported-delete]
             del (
                 weights,
                 k_packed,

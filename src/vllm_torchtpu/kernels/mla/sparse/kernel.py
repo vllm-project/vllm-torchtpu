@@ -632,6 +632,7 @@ def _attention_kernel(
         else:
             _async_copy(src=bq_vmem_ref, dst=bq_vmem_ref, sem=sem, wait=True)
             if split_q:
+                assert bq_pe_x2_ref is not None
                 bq_pe_vmem_ref = bq_pe_x2_ref.at[bq_sem_idx, :]
                 _async_copy(src=bq_pe_vmem_ref, dst=bq_pe_vmem_ref, sem=sem, wait=True)
 

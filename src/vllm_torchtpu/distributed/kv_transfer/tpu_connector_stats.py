@@ -15,9 +15,10 @@
 
 import copy
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import numpy as np
+from prometheus_client import Counter, Gauge, Histogram
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.v1.metrics import (
     KVConnectorPromMetrics,
@@ -420,7 +421,7 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             ],
         ):
             for list_item in transfer_stats_data.get(list_item_key, []):
-                prom_obj[engine_idx].observe(list_item)
+                cast(Histogram, prom_obj[engine_idx]).observe(list_item)
 
         for counter_obj, counter_item_key in zip(
             [
@@ -429,7 +430,7 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             ["num_failed_transfers"],
         ):
             for list_item in transfer_stats_data.get(counter_item_key, []):
-                counter_obj[engine_idx].inc(list_item)
+                cast(Counter, counter_obj[engine_idx]).inc(list_item)
 
         for gauge_obj, gauge_item_key in zip(
             [
@@ -442,7 +443,7 @@ class TpuKVConnectorPromMetrics(KVConnectorPromMetrics):
             ],
         ):
             for list_item in transfer_stats_data.get(gauge_item_key, []):
-                gauge_obj[engine_idx].set(list_item)
+                cast(Gauge, gauge_obj[engine_idx]).set(list_item)
 
         # Dynamic metric observations
         base_labels = (

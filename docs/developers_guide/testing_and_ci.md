@@ -1,6 +1,6 @@
 # Testing & CI Guide
 
-`vllm-torchtpu` runs continuous integration on Buildkite (`.buildkite/pipeline_tests.yml`) across CPU agents (`cpu_64_core`), 2-chip TPU agents (`tpu_v7x_2_queue`), and 8-chip TPU agents (`tpu_v7x_8_queue`).
+`vllm-torchtpu` runs continuous integration on Buildkite (`.buildkite/pipeline_tests.yml`), with each step in a Kubernetes pod: CPU pods for unmarked tests and TPU v7x slices (1x1x1 and 2x2x1) for `tpu_test` and `multichip` tests.
 
 ---
 
@@ -69,16 +69,16 @@ pytest tests_omni/ -sv --timeout=1200 -m "not nightly and omni"
 
 ## Pytest Markers Reference
 
-Every test in `tests/` and `tests_omni/` is routed to the appropriate CI queue using the markers registered in `[tool.pytest.ini_options]` in `pyproject.toml`:
+Every test in `tests/` and `tests_omni/` is routed to the appropriate CI hardware using the markers registered in `[tool.pytest.ini_options]` in `pyproject.toml`:
 
-| Marker | Hardware / CI Queue | Description |
+| Marker | CI hardware (kube pod) | Description |
 | :--- | :--- | :--- |
-| *(unmarked)* | `cpu_64_core` (`CPU_ONLY=1`) | Fast unit tests that do not require physical TPU devices. |
-| `@pytest.mark.tpu_test` | `tpu_v7x_2_queue` (Single-host TPU agent) | Tests that require physical TPU hardware (`torch.device("tpu")`). |
-| `@pytest.mark.multichip` | `tpu_v7x_8_queue` (8-chip TPU agent) | Tests that require more than 2 TPU chips (e.g., TP/EP/DP collectives). |
-| `@pytest.mark.spawns_tpu_workers` | Multi-device TPU agent | Tests that spawn a `torch.distributed.run` worker group spanning the TPU slice; ordered by `tests/conftest.py` to run before any in-process TPU test in the same `pytest` session. |
+| *(unmarked)* | CPU pod (`JAX_PLATFORMS=cpu`) | Fast unit tests that do not require physical TPU devices. |
+| `@pytest.mark.tpu_test` | TPU v7x 1x1x1 (1 chip) | Tests that require physical TPU hardware (`torch.device("tpu")`). |
+| `@pytest.mark.multichip` | TPU v7x 2x2x1 (4 chips) | Tests that require more than 2 TPU chips (e.g., TP/EP/DP collectives). |
+| `@pytest.mark.spawns_tpu_workers` | Multi-chip TPU slice | Tests that spawn a `torch.distributed.run` worker group spanning the TPU slice; ordered by `tests/conftest.py` to run before any in-process TPU test in the same `pytest` session. |
 | `@pytest.mark.nightly` | Nightly CI workflow (`NIGHTLY=1`) | Long-running or full-checkpoint tests excluded from per-PR CI gates. Must still be combined with `tpu_test` or `multichip` if TPU hardware is required. |
-| `@pytest.mark.omni` | `tpu_v7x_2_queue` (`-omni` image) | Tests that run `vllm-omni` multimodal and diffusion models (`tests_omni/`). |
+| `@pytest.mark.omni` | TPU v7x 1x1x1 (`-omni` image) | Tests that run `vllm-omni` multimodal and diffusion models (`tests_omni/`). |
 
 ---
 

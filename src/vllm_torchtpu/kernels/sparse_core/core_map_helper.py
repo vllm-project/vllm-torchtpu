@@ -11,31 +11,25 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Run single-mesh SparseCore kernels through ``core_map``.
+"""Run single-mesh SparseCore kernels through ``pl.kernel``.
 
-``pl.kernel`` now dispatches to ``mpmd_map``; ``kernel`` here bypasses that
-and calls ``core_map`` directly on the given mesh. Near drop-in for
-``pl.kernel`` -- note ``out_shape`` becomes ``out_type`` and ``scratch_shapes``
-(list) becomes ``scratch_types`` (dict).
+Delegates directly to ``pl.kernel`` (``mpmd_map`` with explicit ``out_type``)
+wrapped in ``@jax.jit`` rather than pre-allocating output buffers via
+``lax.empty`` + ``jax_core.new_ref`` + ``core_map``.
+
+Pre-allocating output refs via ``lax.empty`` emits zero-operand
+``stablehlo.custom_call @AllocateBuffer()`` ops with ``has_side_effect = false``
+and aliases kernel outputs to those inputs via ``output_operand_aliases``. When
+``torch_tpu`` inlines custom-kernel functions across chunks/layers and runs
+``mlir::createCSEPass()``, all identical ``AllocateBuffer`` ops are merged into
+a single shared SSA value, forcing XLA ``CopyInsertion`` to insert hundreds of
+HBM-to-HBM ``copy(%empty)`` operations per step. Passing ``out_type`` directly
+to ``pl.kernel`` produces pure ``tpu_custom_call`` outputs with zero
+``AllocateBuffer`` calls.
 """
 
-from typing import cast
-
-from jax._src import api, lax, tree_util
-from jax._src import core as jax_core
-from jax._src.pallas import core as pl_core
-
-
-def _empty_out_ref(out_type):
-    # Mirrors internal `pl.kernel` logic; may need updating on JAX bumps.
-    aval = cast(jax_core.ShapedArray, pl_core._convert_out_shape_to_aval(out_type))
-    memory_space = (
-        None
-        if isinstance(aval.memory_space, jax_core.MemorySpace)
-        else aval.memory_space
-    )
-    value = lax.empty(aval.shape, aval.dtype, out_sharding=aval.sharding)
-    return jax_core.new_ref(value, memory_space=memory_space)
+from jax._src import api
+from jax.experimental import pallas as pl
 
 
 def kernel(
@@ -51,22 +45,13 @@ def kernel(
     name=None,
     metadata=None,
 ):
-    """Near drop-in for ``pl.kernel`` that lowers via ``core_map``.
-
-    Differs in that ``out_shape`` is renamed to ``out_type`` and
-    ``scratch_shapes`` (list) is renamed to ``scratch_types`` (dict).
-    """
-    single_output = not isinstance(out_type, (tuple, list))
-    out_types = (out_type,) if single_output else out_type
-
-    @api.jit
-    def run(*operands):
-        arg_refs = tree_util.tree_map(jax_core.new_ref, operands)
-        out_refs = tree_util.tree_map(_empty_out_ref, out_types)
-
-        @pl_core.core_map(
-            mesh,
-            scratch_shapes=scratch_types,
+    """JIT-wrapped ``pl.kernel`` for single-mesh SparseCore kernels."""
+    return api.jit(
+        pl.kernel(
+            body,
+            out_type=out_type,
+            mesh=mesh,
+            scratch_types=scratch_types,
             compiler_params=compiler_params,
             interpret=interpret,
             cost_estimate=cost_estimate,
@@ -74,10 +59,4 @@ def kernel(
             name=name,
             metadata=metadata,
         )
-        def _(*scratch_refs, **scratch_kwrefs):
-            return body(*arg_refs, *out_refs, *scratch_refs, **scratch_kwrefs)
-
-        outs = tree_util.tree_map(lambda ref: ref[...], out_refs)
-        return outs[0] if single_output else outs
-
-    return run
+    )
