@@ -8,7 +8,7 @@ The patches fall into two groups, in file order:
   kernels, none of which run on torch_tpu as written upstream.
 - Denoise performance: keep every DiT step on one set of shapes and keep
   host syncs out of the denoise loop (AdaLN cache, timestep table, RoPE
-  table).
+  table, finite checks, row gathers and scatters).
 
 Each patch carries its rationale in a comment block at its entry point.
 Patches only touch modules that are already loaded, do nothing without
@@ -16,7 +16,9 @@ vLLM-Omni or the MiniMax-H3 pipeline, and applying them twice changes
 nothing.
 """
 
+import contextlib
 import functools
+import hashlib
 import inspect
 import pickle
 import sys
@@ -933,7 +935,7 @@ def patch_adaln_projection_cache() -> bool:
 
 
 # -----------------------------------------------------------------------------
-# Denoise loop: fixed-width timestep table.
+# Denoise loop: fixed-width pad for the timestep table.
 # -----------------------------------------------------------------------------
 
 DENOISE_LOOP_MODULE = "vllm_omni.diffusion.models.minimax_h3.denoise_loop"
@@ -967,6 +969,253 @@ def pad_unique_timesteps(unique_timesteps: torch.Tensor, rows: int) -> torch.Ten
     return padded.to(unique_timesteps.device)
 
 
+# -----------------------------------------------------------------------------
+# Denoise loop: shared sync-free helpers (source pins, stream flush, deferred
+# checks), the host timestep table and its forward_kwargs patch.
+# -----------------------------------------------------------------------------
+
+SCHEDULER_MODULE = (
+    "vllm_omni.diffusion.models.minimax_h3.scheduling_minimax_h3_euler_ancestral"
+)
+
+# sha256 of inspect.getsource() of the vLLM-Omni e1d77a3 functions that the
+# TPU paths below re-implement. A function with any other source keeps its
+# upstream implementation, host syncs included, and logs a warning.
+_SHA_LOOP = "dd782edbd769ab7c729a323d50bffa4f1e36f17ef461ad6c9b2b8d499ef45e7f"
+_SHA_FWD_KW = "2bbefee104576679a2434913c7a6db95dc2f9418e20799dab44284f349a2222b"
+_SHA_FILL_TS = "fdc969aba9c658a435ea40012a41f818fde4785f398a61893b015119d319d02e"
+_SHA_FINITE = "759c5d1fc2af7ec655847a4ae7e74833cd093d92026438a63b3a609efa030e1e"
+_SHA_UNIT_TS = "0d18f1abd26700e7f0cefc2f4010d481b88349a59d0bbd9532b7ee0ef76f800c"
+_UPSTREAM_SOURCE_SHA256 = {
+    "denoise_loop.minimax_h3_denoise_loop": _SHA_LOOP,
+    "denoise_loop.MiniMaxH3DenoiseBranch.forward_kwargs": _SHA_FWD_KW,
+    "denoise_loop.MiniMaxH3DenoiseBranch.fill_timesteps": _SHA_FILL_TS,
+    "scheduling_minimax_h3_euler_ancestral._require_finite_tensor": _SHA_FINITE,
+    "scheduling_minimax_h3_euler_ancestral._validate_unit_timestep": _SHA_UNIT_TS,
+}
+# Process globals: the diffusion worker runs the denoise loop single-threaded.
+_SOURCE_MATCHES: dict[tuple[Any, str], bool] = {}
+
+
+def _source_sha256(func: Any) -> str | None:
+    try:
+        source = inspect.getsource(func)
+    except (OSError, TypeError):
+        return None
+    return hashlib.sha256(source.encode()).hexdigest()
+
+
+def upstream_source_matches(func: Any, key: str) -> bool:
+    """Whether ``func`` has the vLLM-Omni e1d77a3 source pinned under ``key``.
+
+    Checked once per function object; a mismatch logs one warning and the
+    caller keeps the upstream implementation.
+    """
+    expected = _UPSTREAM_SOURCE_SHA256[key]
+    cache_key = (func, expected)
+    matches = _SOURCE_MATCHES.get(cache_key)
+    if matches is None:
+        matches = _source_sha256(func) == expected
+        _SOURCE_MATCHES[cache_key] = matches
+        if not matches:
+            logger.warning(
+                "MiniMax-H3 TPU patch: %s differs from the vLLM-Omni e1d77a3 "
+                "source its TPU copy mirrors; using the upstream implementation "
+                "(with its per-step host syncs).",
+                key,
+            )
+    return matches
+
+
+@functools.cache
+def _synchronize_tensors() -> Callable[..., None]:
+    from vllm_torchtpu.utils import synchronize_tensors
+
+    return synchronize_tensors
+
+
+def _flush_stream(device: Any) -> None:
+    """Start materializing every deferred torch_tpu op, without waiting.
+
+    Called where upstream pays a blocking host sync (a boolean-mask index, a
+    finite-check ``.item()``). A torch_tpu sync materializes the whole
+    stream, so flushing at the same point cuts the same traced programs,
+    hits the same compiled executables and gives the same numerics, but the
+    host keeps queuing work instead of waiting. No-op off torch_tpu. It does
+    not use ``_is_tpu``, so tests that force the TPU dispatch stay on CPU.
+    """
+    device = getattr(device, "device", device)
+    if isinstance(device, str):
+        kind = device.split(":", 1)[0]
+    else:
+        kind = getattr(device, "type", None)
+    if kind == "tpu":
+        _synchronize_tensors()(wait=False)
+
+
+class _DeferredChecks:
+    """Device-side results of upstream's finite / range checks for one run."""
+
+    def __init__(self) -> None:
+        self._checks: list[tuple[str, torch.Tensor, bool]] = []
+
+    def record(self, message: str, flag: torch.Tensor, *, fails_if: bool) -> None:
+        self._checks.append((message, flag, fails_if))
+
+    def raise_first_failure(self) -> None:
+        """One host read for the whole run; raise upstream's first error."""
+        if not self._checks:
+            return
+        flags = torch.stack([flag for _, flag, _ in self._checks]).cpu().tolist()
+        for (message, _, fails_if), flag in zip(self._checks, flags, strict=True):
+            if bool(flag) == fails_if:
+                raise ValueError(message)
+
+
+_DEFERRED_CHECK_SCOPES: list[_DeferredChecks] = []
+
+
+def _active_deferred_checks() -> _DeferredChecks | None:
+    return _DEFERRED_CHECK_SCOPES[-1] if _DEFERRED_CHECK_SCOPES else None
+
+
+def _branch_timestep_plan(
+    branch: Any,
+) -> tuple[torch.Tensor, tuple[int, ...], dict[tuple[int, ...], torch.Tensor]]:
+    """Row groups of the branch's packed timestep table, built once on CPU.
+
+    Group ids follow fill_timesteps' write order (denoise_loop.py:235-265 at
+    vllm-omni e1d77a3), later writes winning as there: 0 = fill (text and
+    padding rows, t_video), 1 = video target, 2 = video condition, 3 = audio
+    target, 4 = audio reference. Returns the ``[seq_len]`` int64 group ids,
+    the groups present, and the branch's cache of uploaded inverse indices.
+    """
+    plan = branch.__dict__.get("_tpu_timestep_plan")
+    if plan is None:
+        groups = torch.zeros(branch.seq_len, dtype=torch.long)
+        img_pos = branch.img_pos.cpu()
+        audio_pos = branch.audio_pos.cpu()
+        update = branch.update_mask.cpu()
+        audio_update = branch.audio_update_mask.cpu()
+        for group, positions in (
+            (1, img_pos[update]),
+            (2, img_pos[~update]),
+            (3, audio_pos[audio_update]),
+            (4, audio_pos[~audio_update]),
+        ):
+            groups[positions] = group
+        plan = (groups, tuple(torch.unique(groups).tolist()), {})
+        branch._tpu_timestep_plan = plan
+    return plan
+
+
+def host_timestep_table(
+    branch: Any,
+    *,
+    t_video: float,
+    t_audio: float,
+    imgvid_cond_timestep: float,
+    audio_ref_cond_timestep: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Upstream's ``torch.unique(timesteps, sorted=True, return_inverse=True)``.
+
+    Computed on the host from the step's Python floats and the branch's row
+    groups. The float32 group values are the ones fill_timesteps writes, so
+    the sorted unique values and int64 inverse indices equal torch.unique's.
+    Returns the CPU table padded to H3_UNIQUE_TIMESTEP_ROWS and the inverse
+    indices on the branch device. The inverse indices are uploaded once per
+    distinct group order and reused by later steps.
+    """
+    groups, present, inverse_by_order = _branch_timestep_plan(branch)
+    locked = branch.locked_audio_rows is not None
+    values = (
+        float(t_video),
+        float(t_video),
+        float(imgvid_cond_timestep),
+        1.0 if locked else float(t_audio),
+        float(audio_ref_cond_timestep),
+    )
+    unique, order = torch.unique(
+        torch.tensor([values[group] for group in present], dtype=torch.float32),
+        sorted=True,
+        return_inverse=True,
+    )
+    key = tuple(order.tolist())
+    inverse = inverse_by_order.get(key)
+    if inverse is None:
+        # A host-to-device copy is a fresh device buffer, not a traced
+        # constant, so every step's DiT program takes the same inputs.
+        lut = torch.zeros(5, dtype=torch.int64)
+        lut[list(present)] = order
+        inverse = lut[groups].to(branch.device)
+        inverse_by_order[key] = inverse
+    return pad_unique_timesteps(unique, H3_UNIQUE_TIMESTEP_ROWS), inverse
+
+
+_HOST_TABLE_KWARGS = frozenset(
+    (
+        "video_rows",
+        "audio_rows",
+        "t_video",
+        "t_audio",
+        "imgvid_cond_timestep",
+        "audio_ref_cond_timestep",
+    )
+)
+_EDIT_TIMESTEP_KWARGS = frozenset(("video_target_timesteps", "audio_target_timesteps"))
+
+# Packed rows (branch.seq_len) from which forward_kwargs keeps upstream's
+# table instead of the host one; see patch_denoise_branch_timestep_rows.
+_HOST_TABLE_MAX_SEQ_LEN = 36_000
+
+
+def _without_latent_edits(args: tuple[Any, ...], kwargs: dict[str, Any]) -> bool:
+    """Whether a forward_kwargs call is a plain step without latent edits."""
+    if args or not kwargs.keys() >= _HOST_TABLE_KWARGS:
+        return False
+    if kwargs.keys() - _HOST_TABLE_KWARGS - _EDIT_TIMESTEP_KWARGS:
+        return False
+    return all(kwargs.get(name) is None for name in _EDIT_TIMESTEP_KWARGS)
+
+
+def _forward_kwargs_host_table(
+    branch: Any,
+    *,
+    video_rows: torch.Tensor,
+    audio_rows: torch.Tensor,
+    t_video: float,
+    t_audio: float,
+    imgvid_cond_timestep: float,
+    audio_ref_cond_timestep: float,
+) -> dict[str, Any]:
+    """MiniMaxH3DenoiseBranch.forward_kwargs (denoise_loop.py:182-215 at
+    vllm-omni e1d77a3).
+
+    Same x / audio_x ops as upstream; the timestep table comes from
+    host_timestep_table instead of fill_timesteps + torch.unique.
+    """
+    x = branch.x_base.clone()
+    x[0].index_copy_(0, branch.img_pos_dev, video_rows)
+    audio_x = branch.audio_x_base.clone()
+    audio_x[0].index_copy_(0, branch.audio_pos_dev, audio_rows)
+    # Upstream's first fill_timesteps boolean index syncs here (:255).
+    _flush_stream(branch.device)
+    unique_timesteps, inverse_indices = host_timestep_table(
+        branch,
+        t_video=t_video,
+        t_audio=t_audio,
+        imgvid_cond_timestep=imgvid_cond_timestep,
+        audio_ref_cond_timestep=audio_ref_cond_timestep,
+    )
+    return {
+        **branch.static_kwargs,
+        "x": x,
+        "audio_x": audio_x,
+        "unique_timesteps": unique_timesteps.to(branch.device),
+        "inverse_indices": inverse_indices,
+    }
+
+
 def patch_denoise_branch_timestep_rows() -> bool:
     # -------------------------------------------------------------------------
     # Upstream vLLM-Omni Root Cause Tracking:
@@ -981,22 +1230,57 @@ def patch_denoise_branch_timestep_rows() -> bool:
     # output [3M, 5376] (minimax_h3_transformer.py:898-906, :1709, :1815) and
     # the final layer's [M, 2 x 5376] depend on M.
     #
-    # Problem on TPU: torch_tpu compiles every DiT program once per M. On
-    # v7x-8 the first request compiled the whole DiT again at step 2: 8.4 s /
-    # 10 s / 12 s for step 2 against 0.27 / 0.5 / 1.3 s warm steps
+    # Problem on TPU, shapes: torch_tpu compiles every DiT program once per
+    # M. On v7x-8 the first request compiled the whole DiT again at step 2:
+    # 8.4 s / 10 s / 12 s for step 2 against 0.27 / 0.5 / 1.3 s warm steps
     # (256x256x4s / 480x480x4s / 768x768x5s).
     #
-    # Fix: on TPU the table is padded to H3_UNIQUE_TIMESTEP_ROWS rows with
-    # its last value (the internal JAX port's fixed_num_unique), so every
-    # step of every task without latent edits runs one set of shapes. The
-    # padded rows only go through row-independent ops (time embedder, AdaLN
-    # linears) and are never gathered: inverse_indices and the
+    # Problem on TPU, syncs: torch.unique (a dynamic output shape), the four
+    # boolean-mask indexes in fill_timesteps (positions[update_mask] /
+    # positions[~update_mask], denoise_loop.py:255, :265) and the pad's
+    # .cpu() are six blocking host syncs per step, each draining the device
+    # before the host can queue the step's DiT forward.
+    #
+    # Fix, shapes: on TPU the table is padded to H3_UNIQUE_TIMESTEP_ROWS rows
+    # with its last value (the internal JAX port's fixed_num_unique), so
+    # every step of every task without latent edits runs one set of shapes.
+    # The padded rows only go through row-independent ops (time embedder,
+    # AdaLN linears) and are never gathered: inverse_indices and the
     # combined_indices derived from them are unchanged. Wider tables (edit
     # schedules) and other devices keep the upstream table.
     #
+    # Fix, syncs: without latent edits (video_target_timesteps and
+    # audio_target_timesteps None) and below _HOST_TABLE_MAX_SEQ_LEN packed
+    # rows, host_timestep_table computes the table on the host. The branch's
+    # row groups are built once from its CPU masks; each step maps them to
+    # the float32 values fill_timesteps writes, so the sorted unique values
+    # and int64 inverse indices equal torch.unique's
+    # (tests/omni/test_minimax_h3_sync.py checks t2va, fl2va, ref2va and
+    # locked audio rows at every step of 8-step schedules). Both reach the
+    # device as host-to-device copies, i.e. fresh buffers rather than traced
+    # constants, so every step runs the same DiT program. One non-blocking
+    # stream flush after x / audio_x keeps the program boundary of the first
+    # sync it replaces. The x / audio_x ops are copied from upstream, so the
+    # copy is pinned to the e1d77a3 sources of forward_kwargs and
+    # fill_timesteps.
+    #
+    # Fix, sequence length: the host table only pays off on short sequences.
+    # Warm s/step with / without it (v7x-8, TP8, 8 steps, frames bit-identical
+    # either way): 256x256, 2,432 rows: 0.093 / 0.102; 768x768x5s, 21,760
+    # rows: 0.750 / 0.751; 768x768x7s, 30,592 rows: 1.151 / 1.155;
+    # 768x768x10s, 42,304 rows: 1.936 / 1.787, i.e. 148 ms/step (8%) slower
+    # with it. Skipping the flush (1.943) or uploading fresh inverse indices
+    # every step (1.929) does not recover it; the cause is not known. Longer
+    # packed sequences therefore keep upstream's fill_timesteps +
+    # torch.unique (and its syncs) and only get the pad.
+    # _HOST_TABLE_MAX_SEQ_LEN sits between the 7 s and 10 s shapes;
+    # branch.seq_len is a Python int, so the check costs no sync.
+    #
     # REMOVAL / FIX CONDITION:
-    # Remove once upstream gives the timestep table a fixed width or
-    # torch_tpu reuses one compiled program across M.
+    # Remove the pad once upstream gives the timestep table a fixed width or
+    # torch_tpu reuses one compiled program across M. Remove the host table
+    # once upstream builds the table without device syncs; revisit the
+    # length cut-off if the long-sequence slowdown is root-caused.
     # -------------------------------------------------------------------------
     module = _loaded_module(DENOISE_LOOP_MODULE)
     cls = getattr(module, "MiniMaxH3DenoiseBranch", None)
@@ -1014,6 +1298,21 @@ def patch_denoise_branch_timestep_rows() -> bool:
 
     @functools.wraps(original)
     def forward_kwargs(self: Any, *args: Any, **kwargs: Any) -> dict[str, Any]:
+        if (
+            _without_latent_edits(args, kwargs)
+            and _is_tpu(getattr(self, "device", None))
+            and upstream_source_matches(
+                original, "denoise_loop.MiniMaxH3DenoiseBranch.forward_kwargs"
+            )
+            and upstream_source_matches(
+                getattr(cls, "fill_timesteps", None),
+                "denoise_loop.MiniMaxH3DenoiseBranch.fill_timesteps",
+            )
+            and self.seq_len < _HOST_TABLE_MAX_SEQ_LEN
+        ):
+            return _forward_kwargs_host_table(
+                self, **{name: kwargs[name] for name in _HOST_TABLE_KWARGS}
+            )
         result = original(self, *args, **kwargs)
         unique_timesteps = result.get("unique_timesteps")
         if isinstance(unique_timesteps, torch.Tensor) and _is_tpu(unique_timesteps):
@@ -1026,8 +1325,10 @@ def patch_denoise_branch_timestep_rows() -> bool:
     cls._tpu_orig_forward_kwargs = original
     cls.forward_kwargs = forward_kwargs
     logger.info(
-        "Applied TPU patch: MiniMax-H3 timestep table padded to %d rows.",
+        "Applied TPU patch: MiniMax-H3 timestep table padded to %d rows and "
+        "built on the host below %d packed rows.",
         H3_UNIQUE_TIMESTEP_ROWS,
+        _HOST_TABLE_MAX_SEQ_LEN,
     )
     return True
 
@@ -1068,7 +1369,9 @@ def patch_denoise_loop_rope_table() -> bool:
     # NPU. prepare_rope_table runs the same ops on the same inputs
     # (img_position_ids.narrow -> self.rope -> _build_rope_table,
     # minimax_h3_transformer.py:1469-1484), and the forward validates the
-    # prepared table's shape, device and dtype (:1790-1794).
+    # prepared table's shape, device and dtype (:1790-1794). The same
+    # wrapper also sends TPU calls without latent edits to
+    # minimax_h3_denoise_loop_tpu (see the block there).
     #
     # REMOVAL / FIX CONDITION:
     # Remove once upstream prepares the branch RoPE table on every platform
@@ -1094,12 +1397,13 @@ def patch_denoise_loop_rope_table() -> bool:
             # Upstream's signature is keyword-only.
             positive = kwargs.get("positive")
             model = kwargs.get("model")
-            if (
-                positive is not None
-                and model is not None
-                and _is_tpu(kwargs.get("device"))
-            ):
+            on_tpu = _is_tpu(kwargs.get("device"))
+            if positive is not None and model is not None and on_tpu:
                 positive.prepare_rope_table(model)
+            if on_tpu and not args:
+                arguments = _tpu_denoise_loop_arguments(original, kwargs)
+                if arguments is not None:
+                    return minimax_h3_denoise_loop_tpu(module, **arguments)
             return original(*args, **kwargs)
 
         setattr(module, marker, original)
@@ -1113,9 +1417,373 @@ def patch_denoise_loop_rope_table() -> bool:
     )
     if changed:
         logger.info(
-            "Applied TPU patch: MiniMax-H3 RoPE table built once per denoise run."
+            "Applied TPU patch: MiniMax-H3 RoPE table built once per denoise run, "
+            "denoise steps without host syncs."
         )
     return changed
+
+
+# -----------------------------------------------------------------------------
+# Denoise loop: deferred finite checks and the sync-free TPU loop.
+# -----------------------------------------------------------------------------
+
+
+def _deferred_require_finite_tensor(
+    original: Callable[[torch.Tensor, str], None],
+) -> Callable[[torch.Tensor, str], None]:
+    @functools.wraps(original)
+    def _require_finite_tensor(tensor: torch.Tensor, name: str) -> None:
+        checks = _active_deferred_checks()
+        if checks is None or not _is_tpu(tensor):
+            return original(tensor, name)
+        # scheduling_minimax_h3_euler_ancestral.py:10-12.
+        checks.record(
+            f"{name} must be finite", torch.isfinite(tensor).all(), fails_if=False
+        )
+        _flush_stream(tensor.device)
+        return None
+
+    return _require_finite_tensor
+
+
+def _deferred_validate_unit_timestep(
+    original: Callable[[torch.Tensor, str], None],
+) -> Callable[[torch.Tensor, str], None]:
+    @functools.wraps(original)
+    def _validate_unit_timestep(timestep: torch.Tensor, name: str) -> None:
+        checks = _active_deferred_checks()
+        if (
+            checks is None
+            or not isinstance(timestep, torch.Tensor)
+            or not _is_tpu(timestep)
+        ):
+            return original(timestep, name)
+        # scheduling_minimax_h3_euler_ancestral.py:15-23.
+        if not torch.is_floating_point(timestep):
+            raise ValueError(f"{name} must be a floating point tensor")
+        checks.record(
+            f"{name} must be finite", torch.isfinite(timestep).all(), fails_if=False
+        )
+        _flush_stream(timestep.device)
+        out_of_range = (timestep < 0) | (timestep > 1)
+        checks.record(f"{name} must be in [0, 1]", out_of_range.any(), fails_if=True)
+        _flush_stream(timestep.device)
+        return None
+
+    return _validate_unit_timestep
+
+
+_DEFERRED_VALIDATORS = (
+    (
+        "_require_finite_tensor",
+        _deferred_require_finite_tensor,
+        "scheduling_minimax_h3_euler_ancestral._require_finite_tensor",
+    ),
+    (
+        "_validate_unit_timestep",
+        _deferred_validate_unit_timestep,
+        "scheduling_minimax_h3_euler_ancestral._validate_unit_timestep",
+    ),
+)
+
+
+def patch_scheduler_finite_checks() -> bool:
+    # -------------------------------------------------------------------------
+    # Upstream vLLM-Omni Root Cause Tracking:
+    # Upstream: minimax_h3_rf_v_to_x0 and minimax_h3_euler_eta0_step validate
+    # every tensor they touch with _require_finite_tensor /
+    # _validate_unit_timestep, i.e. bool(torch.isfinite(t).all().item()) and
+    # bool(out_of_range.any().item())
+    # (scheduling_minimax_h3_euler_ancestral.py:10-23, called from :60-68 and
+    # :85-101 at vllm-omni e1d77a3). minimax_h3_denoise_loop runs both per
+    # stream per step (denoise_loop.py:420-449): 8 .item() reads per stream,
+    # 16 per step.
+    #
+    # Problem on TPU: under torch_tpu eager DEFER_AND_FUSE each .item() is a
+    # blocking sync, so the host waits for the device 16 times per step
+    # before it can queue the next step.
+    #
+    # Fix: inside minimax_h3_denoise_loop_tpu, and only there, a check on a
+    # TPU tensor records its device-side result and starts a non-blocking
+    # stream flush in place of the sync (same program boundaries). The loop
+    # reads all results once after its last step and raises upstream's
+    # ValueError for the first failed check, in upstream's order and with
+    # upstream's message. The error now surfaces after the loop instead of
+    # in the failing step. Calls outside that loop, and on other devices,
+    # run upstream's checks. The checks are re-implemented, so they are
+    # pinned to their e1d77a3 sources; vllm_omni modules that imported them
+    # by name are rebound.
+    #
+    # REMOVAL / FIX CONDITION:
+    # Remove once upstream validates the denoise state without per-tensor host
+    # reads (e.g. one fused device flag per step or run), or torch_tpu can read
+    # a scalar without draining the stream.
+    # -------------------------------------------------------------------------
+    module = _loaded_module(SCHEDULER_MODULE)
+    if module is None:
+        logger.debug(
+            "Skipping MiniMax-H3 deferred finite check TPU patch: %s is not loaded.",
+            SCHEDULER_MODULE,
+        )
+        return False
+    changed = False
+    for name, deferred, key in _DEFERRED_VALIDATORS:
+        marker = f"_tpu_orig_{name}"
+        original = getattr(module, marker, None)
+        if original is None:
+            original = getattr(module, name, None)
+            if not inspect.isfunction(original):
+                continue
+            if not upstream_source_matches(original, key):
+                continue
+            setattr(module, marker, original)
+            setattr(module, name, deferred(original))
+            changed = True
+        changed = (
+            _rebind_vllm_omni_importers(name, original, getattr(module, name))
+            or changed
+        )
+    if changed:
+        logger.info(
+            "Applied TPU patch: MiniMax-H3 denoise finite checks read once per run."
+        )
+    return changed
+
+
+def _tpu_denoise_loop_arguments(
+    original: Callable[..., Any], kwargs: dict[str, Any]
+) -> dict[str, Any] | None:
+    """Bound arguments if minimax_h3_denoise_loop_tpu covers this call."""
+    if not upstream_source_matches(original, "denoise_loop.minimax_h3_denoise_loop"):
+        return None
+    try:
+        bound = inspect.signature(original).bind(**kwargs)
+    except TypeError:
+        return None
+    bound.apply_defaults()
+    arguments = dict(bound.arguments)
+    if (
+        arguments.get("video_edit") is not None
+        or arguments.get("audio_edit") is not None
+        or arguments.get("sampler") not in (None, "euler", "res_multistep")
+    ):
+        return None
+    return arguments
+
+
+def _branch_row_indices(
+    positive: Any, device: Any
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Indices of the update / condition rows of one branch, uploaded once.
+
+    ``(video target, video condition, audio target, audio reference)`` rows,
+    from the branch's CPU masks, so a step indexes rows without a nonzero.
+    """
+    cached = positive.__dict__.get("_tpu_row_indices")
+    if cached is None or cached[0] != str(device):
+        update = positive.update_mask.cpu()
+        audio_update = positive.audio_update_mask.cpu()
+        indices = tuple(
+            torch.nonzero(mask).flatten().to(device)
+            for mask in (update, ~update, audio_update, ~audio_update)
+        )
+        cached = (str(device), indices)
+        positive._tpu_row_indices = cached
+    return cached[1]
+
+
+def minimax_h3_denoise_loop_tpu(
+    module: types.ModuleType,
+    *,
+    model: Any,
+    positive: Any,
+    initial_video_rows: torch.Tensor,
+    initial_audio_rows: torch.Tensor,
+    keyframe_cond_rows: torch.Tensor | None,
+    audio_ref_rows: torch.Tensor | None,
+    video_edit: Any,
+    audio_edit: Any,
+    sigmas_video: list[float],
+    sigmas_audio: list[float],
+    device: torch.device,
+    imgvid_cond_noise_aug_for_inference: float,
+    audio_cond_noise_aug_for_inference: float,
+    on_step: Callable[[int, torch.Tensor, torch.Tensor], None] | None,
+    step_profiler: Callable[[int], contextlib.AbstractContextManager] | None,
+    sampler: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    # -------------------------------------------------------------------------
+    # Upstream vLLM-Omni Root Cause Tracking:
+    # Upstream: after the DiT forward, minimax_h3_denoise_loop gathers and
+    # scatters the target and condition rows with boolean masks:
+    # v.float()[update], rows[update] (x2 per stream), rows[update] = new and
+    # rows[~update] = anchor (denoise_loop.py:416-453 at vllm-omni e1d77a3).
+    #
+    # Problem on TPU: each boolean index runs a nonzero with a data-dependent
+    # output shape, i.e. a blocking device sync: 8 per step for t2va, 9-10
+    # with condition anchors. Together with the 16 finite-check reads
+    # (patch_scheduler_finite_checks) and the 6 timestep-table syncs
+    # (patch_denoise_branch_timestep_rows), the host waited for the device
+    # about 30 times per step before it could queue more work; a warm step
+    # took 0.136 s on v7x-8 (256x256x4s, TP8).
+    #
+    # Fix: a copy of upstream's loop body for TPU without latent edits
+    # (euler and res_multistep). The masks become index tensors once per
+    # request (_branch_row_indices), and the gathers / scatters use
+    # index_select / index_put_, which read and write exactly the same rows
+    # (index_put_ is what a boolean setitem dispatches to after its nonzero).
+    # Every removed sync is replaced by _flush_stream at the same point, so
+    # torch_tpu cuts and compiles the same programs and the output is
+    # bit-identical, but the host no longer waits. The finite checks are
+    # read once after the loop. Helpers are looked up on the upstream module
+    # at call time. res_multistep keeps the inline isfinite() syncs of
+    # H3SampleSolver.step (sampling.py:71-78). The copy is pinned to the
+    # e1d77a3 source of minimax_h3_denoise_loop; any other source, latent
+    # edits, other samplers and other devices run upstream's loop.
+    #
+    # REMOVAL / FIX CONDITION:
+    # Remove once upstream's denoise loop indexes rows with precomputed
+    # indices and validates without per-step host reads, or torch_tpu runs
+    # boolean-mask indexing with a host-known mask without a device sync.
+    # -------------------------------------------------------------------------
+    if len(sigmas_video) != len(sigmas_audio):
+        raise ValueError("video/audio sigma schedules must have equal length")
+    if len(sigmas_video) < 2:
+        raise ValueError("sigma schedules need at least 2 entries")
+    if module.current_omni_platform.is_npu():
+        positive.prepare_rope_table(model)
+    video_rows, audio_rows, cond_anchor, audio_anchor = (
+        module.minimax_h3_prepare_denoise_rows(
+            positive=positive,
+            initial_video_rows=initial_video_rows,
+            initial_audio_rows=initial_audio_rows,
+            keyframe_cond_rows=keyframe_cond_rows,
+            audio_ref_rows=audio_ref_rows,
+            device=device,
+        )
+    )
+    update = positive.update_mask_dev
+    audio_update = positive.audio_update_mask_dev
+    update_idx, cond_idx, audio_update_idx, audio_ref_idx = _branch_row_indices(
+        positive, device
+    )
+
+    video_solver = module.create_h3_sample_solver(sampler, sigmas_video)
+    audio_solver = module.create_h3_sample_solver(sampler, sigmas_audio)
+    num_steps = len(sigmas_video) - 1
+    checks = _DeferredChecks()
+    _DEFERRED_CHECK_SCOPES.append(checks)
+    try:
+        for step in range(num_steps):
+            module.check_request_cancellation()
+            step_cm = (
+                step_profiler(step)
+                if step_profiler is not None
+                else contextlib.nullcontext()
+            )
+            with step_cm:
+                s_v = sigmas_video[step]
+                s_a = sigmas_audio[step]
+                module.minimax_h3_publish_denoise_progress(step, s_v, num_steps)
+                t_v, t_a = 1.0 - s_v, 1.0 - s_a
+                imgvid_cond_t = max(t_v, float(imgvid_cond_noise_aug_for_inference))
+                audio_ref_cond_t = max(t_a, float(audio_cond_noise_aug_for_inference))
+
+                # Without an edit these return (rows, None).
+                model_video_rows, video_target_timesteps = (
+                    module.minimax_h3_prepare_edit_rows(
+                        video_rows, update, None, t_v, imgvid_cond_t, sigma=s_v
+                    )
+                )
+                model_audio_rows, audio_target_timesteps = (
+                    module.minimax_h3_prepare_edit_rows(
+                        audio_rows, audio_update, None, t_a, audio_ref_cond_t, sigma=s_a
+                    )
+                )
+
+                fk = positive.forward_kwargs(
+                    video_rows=model_video_rows,
+                    audio_rows=model_audio_rows,
+                    t_video=t_v,
+                    t_audio=t_a,
+                    imgvid_cond_timestep=imgvid_cond_t,
+                    audio_ref_cond_timestep=audio_ref_cond_t,
+                    video_target_timesteps=video_target_timesteps,
+                    audio_target_timesteps=audio_target_timesteps,
+                )
+                with torch.inference_mode():
+                    v_video, v_audio = model(**fk)
+                # Each _flush_stream below stands where upstream syncs. A flush
+                # materializes every live pending tensor, so the locals keep
+                # upstream's lifetimes: v_video / v_audio stay referenced, the
+                # float copies only until they are gathered.
+                v_video_float = v_video.float()
+                _flush_stream(device)  # :416 v.float()[update]
+                mv_video_t = v_video_float.index_select(0, update_idx)
+                del v_video_float
+                v_audio_float = v_audio.float()
+                _flush_stream(device)  # :417 v.float()[audio_update]
+                mv_audio_t = v_audio_float.index_select(0, audio_update_idx)
+                del v_audio_float
+
+                _flush_stream(device)  # :421 video_rows[update]
+                x0_video = module.minimax_h3_rf_v_to_x0(
+                    video_rows.index_select(0, update_idx),
+                    mv_video_t,
+                    torch.tensor(t_v, dtype=torch.float32, device=device),
+                )
+                _flush_stream(device)  # :431 video_rows[update]
+                new_target = video_solver.step(
+                    video_rows.index_select(0, update_idx), x0_video, step
+                )
+                video_rows = video_rows.clone()
+                _flush_stream(device)  # :433 video_rows[update] = new_target
+                video_rows.index_put_((update_idx,), new_target)
+                if cond_anchor is not None:
+                    _flush_stream(device)  # :435 video_rows[~update] = anchor
+                    video_rows.index_put_((cond_idx,), cond_anchor)
+
+                _flush_stream(device)  # :439 audio_rows[audio_update]
+                x0_audio = module.minimax_h3_rf_v_to_x0(
+                    audio_rows.index_select(0, audio_update_idx),
+                    mv_audio_t,
+                    torch.tensor(t_a, dtype=torch.float32, device=device),
+                )
+                _flush_stream(device)  # :449 audio_rows[audio_update]
+                new_audio = audio_solver.step(
+                    audio_rows.index_select(0, audio_update_idx), x0_audio, step
+                )
+                audio_rows = audio_rows.clone()
+                _flush_stream(device)  # :451 audio_rows[audio_update] = ...
+                audio_rows.index_put_(
+                    (audio_update_idx,),
+                    new_audio
+                    if positive.locked_audio_rows is None
+                    else positive.locked_audio_rows,
+                )
+                if audio_anchor is not None:
+                    _flush_stream(device)  # :453 audio_rows[~audio_update] = ...
+                    audio_rows.index_put_((audio_ref_idx,), audio_anchor)
+                if on_step is not None:
+                    on_step(step, video_rows, audio_rows)
+                module.check_request_cancellation(synchronize=True)
+    except Exception:
+        # An earlier failed deferred check wins over whatever was raised
+        # later (an inline H3SampleSolver.step check, a request abort, a
+        # device error); otherwise re-raise the original exception.
+        try:
+            checks.raise_first_failure()
+        except ValueError:
+            raise
+        except Exception:  # noqa: S110
+            pass
+        raise
+    finally:
+        _DEFERRED_CHECK_SCOPES.remove(checks)
+    checks.raise_first_failure()
+
+    module.minimax_h3_publish_denoise_progress(None, None, None)
+    return video_rows, audio_rows
 
 
 def apply_minimax_h3_patches() -> bool:
@@ -1140,4 +1808,5 @@ def apply_minimax_h3_patches() -> bool:
     patched = patch_indexed_modulation() or patched
     patched = patch_adaln_projection_cache() or patched
     patched = patch_denoise_branch_timestep_rows() or patched
+    patched = patch_scheduler_finite_checks() or patched
     return patch_denoise_loop_rope_table() or patched
