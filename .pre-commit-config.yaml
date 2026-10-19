@@ -1,3 +1,16 @@
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 default_install_hook_types:
   - pre-commit
   - commit-msg
@@ -95,17 +108,20 @@ repos:
     additional_dependencies: [ruff==0.14.0]
     always_run: true
     pass_filenames: false
-  - id: check-license-header
-    name: Python files carry the Apache 2.0 license header
-    # Either form counts: the full Apache text or the one-line SPDX tag. It
-    # must sit in the comment block at the top of the file, after an optional
-    # shebang. `\A\Z` matches an empty file, so a bare __init__.py passes.
-    entry: '\A\Z|\A(#![^\n]*\n)?(#[^\n]*\n|\n)*?#[^\n]*(Licensed under the Apache License|SPDX-License-Identifier: Apache-2\.0)'
-    language: pygrep
-    args: [--negate, --multiline]
-    types: [python]
-    # protoc writes this file; see scripts/update_xplane_proto.sh.
-    exclude: ^src/vllm_torchtpu/tools/xplane_pb2\.py$
+  - id: check-license-headers
+    name: Source files carry the full Apache 2.0 license header
+    # The open-source release scanner fails a source file without the full
+    # Apache 2.0 header text, and an SPDX-License-Identifier tag makes it
+    # ignore that text even when present, so the tag is not an alternative.
+    # Covers shell, YAML and proto as well as Python. `--fix` inserts the
+    # header, drops the tag, and keeps a copyright notice the file already
+    # carries, so upstream-derived files keep their attribution. Empty files
+    # pass, so a bare __init__.py does.
+    # `script`, not `system`, for the same reason as check-env-reads.
+    entry: tools/check_license_headers.py
+    args: [--fix]
+    language: script
+    types: [text]
   - id: check-filenames
     name: Check for spaces in all filenames
     entry: bash

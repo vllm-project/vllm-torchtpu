@@ -74,4 +74,20 @@ if grep -q ValidateProtobufRuntimeVersion "$GENERATED"; then
     exit 1
 fi
 
+# protoc writes no license banner, and the bindings are derived from the
+# upstream schema, so carry the .proto's own banner over (the pre-commit
+# license-header hook requires one). It goes below the coding cookie protoc
+# puts on line 1, which PEP 263 only honours on the first two lines.
+banner="$(sed -n '/^\/\/ Copyright/,/^\/\/ limitations under the License\./p' "$PROTO_PATH" | sed 's#^//#\##')"
+cookie_lines=0
+if head -n 1 "$GENERATED" | grep -q '^# -\*- coding'; then
+    cookie_lines=1
+fi
+{
+    head -n "$cookie_lines" "$GENERATED"
+    printf '%s\n' "$banner"
+    tail -n +"$((cookie_lines + 1))" "$GENERATED"
+} >"$GENERATED.tmp"
+mv "$GENERATED.tmp" "$GENERATED"
+
 echo "Wrote src/vllm_torchtpu/tools/xplane_pb2.py (no runtime floor)"
