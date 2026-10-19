@@ -124,4 +124,4 @@ Example using the helper script with build arguments:
   -t prod:latest
 ```
 
-<!-- Fork CI probe: test PR for the ready-label gate. Do not merge. -->
+<!-- Fork CI probe: test PR for the ready-label gate. Do not merge (second commit). -->
