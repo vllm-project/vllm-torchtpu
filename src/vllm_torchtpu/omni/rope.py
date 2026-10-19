@@ -145,3 +145,73 @@ def wan_self_attention_fused(
     out = attn.attn(query, key, value, attn_metadata)
     out = out.flatten(2, 3).type_as(query)
     return attn.dropout(attn.to_out(out))
+
+
+@run_once
+def _minimax_h3_qk_norm_rope_op():
+    """Builds the torch custom op for MiniMax-H3's per-head variant (once)."""
+
+    def minimax_h3_qk_norm_rope(
+        qkv: jax.Array,
+        wq: jax.Array,
+        wk: jax.Array,
+        cos: jax.Array,
+        sin: jax.Array,
+        eps: float,
+        head_dim: int,
+        rotary_dim: int,
+        block_rows: int,
+    ) -> tuple[jax.Array, jax.Array]:
+        return qk_norm_rope(
+            qkv,
+            wq,
+            wk,
+            cos,
+            sin,
+            eps=eps,
+            head_dim=head_dim,
+            block_rows=block_rows,
+            per_head_norm=True,
+            half_split_rotary_dim=rotary_dim,
+        )
+
+    op = pallas.jax_op("pallas::minimax_h3_qk_norm_rope", minimax_h3_qk_norm_rope)
+
+    def fake(qkv, wq, wk, cos, sin, eps, head_dim, rotary_dim, block_rows):
+        shape = (qkv.shape[0], qkv.shape[1] // 3)
+        return qkv.new_empty(shape), qkv.new_empty(shape)
+
+    op.register_fake(fake)
+    return op
+
+
+# Rows per grid step: at most _H3_MAX_BLOCK_ROWS, and at most ~1 MiB per bf16
+# q (or k) block so the double-buffered q/k in/out blocks fit VMEM for any
+# local head count (7 x 128 lanes under TP8, 56 x 128 at TP1).
+_H3_MAX_BLOCK_ROWS = 512
+_H3_BLOCK_BYTES = 1 << 20
+
+
+def minimax_h3_qk_norm_rope(
+    qkv: torch.Tensor,
+    q_weight: torch.Tensor,
+    k_weight: torch.Tensor,
+    cos: torch.Tensor,
+    sin: torch.Tensor,
+    eps: float,
+    head_dim: int,
+    rotary_dim: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Per-head q/k RMSNorm + half-split partial RoPE of a ``[T, 3C]`` qkv.
+
+    ``cos``/``sin`` are the ``(T, head_dim)`` tables of
+    ``vllm_torchtpu.omni.minimax_h3.h3_rope_tables``; returns ``(T, C)``
+    ``q`` and ``k``.
+    """
+    row_bytes = qkv.shape[1] // 3 * qkv.element_size()
+    block_rows = min(
+        _H3_MAX_BLOCK_ROWS, max(16, _H3_BLOCK_BYTES // row_bytes // 16 * 16)
+    )
+    return _minimax_h3_qk_norm_rope_op()(
+        qkv, q_weight, k_weight, cos, sin, eps, head_dim, rotary_dim, block_rows
+    )

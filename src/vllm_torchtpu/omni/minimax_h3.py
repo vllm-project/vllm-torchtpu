@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """TPU patches for the vLLM-Omni MiniMax-H3 pipeline.
 
-The patches fall into two groups, in file order:
+The patches fall into three groups, in file order:
 
 - Correctness: the pipeline's hand-rolled broadcasts and object collectives,
   the video VAE device context and the Triton-only indexed-modulation
@@ -9,6 +9,7 @@ The patches fall into two groups, in file order:
 - Denoise performance: keep every DiT step on one set of shapes and keep
   host syncs out of the denoise loop (AdaLN cache, timestep table, RoPE
   table, finite checks, row gathers and scatters).
+- DiT kernels: fused q/k RMSNorm + RoPE kernel.
 
 Each patch carries its rationale in a comment block at its entry point.
 Patches only touch modules that are already loaded, do nothing without
@@ -23,6 +24,7 @@ import inspect
 import pickle
 import sys
 import types
+import weakref
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -1786,6 +1788,212 @@ def minimax_h3_denoise_loop_tpu(
     return video_rows, audio_rows
 
 
+# -----------------------------------------------------------------------------
+# DiT self-attention: fused per-head q/k RMSNorm + half-split partial RoPE.
+# -----------------------------------------------------------------------------
+
+TRANSFORMER_MODULE = "vllm_omni.diffusion.models.minimax_h3.minimax_h3_transformer"
+# Geometry of upstream's fused half-split contract (fused_qk_norm_rope.py:40-41).
+H3_QK_HEAD_DIM = 128
+H3_QK_ROTARY_DIM = 96
+# MiniMaxH3Attention.forward keyword arguments besides rope_table
+# (minimax_h3_transformer.py:655-668 at vllm-omni e1d77a3).
+_H3_ATTENTION_FORWARD_KWARGS = frozenset(
+    {
+        "cu_seqlens",
+        "max_seqlen",
+        "packed_total",
+        "num_requests",
+        "sp_seq_lens",
+        "video_layout",
+        "vsa_prefix_segments",
+        "vdn_window",
+    }
+)
+# [weakref to the last rope_table, its (cos, sin) head-width tables].
+_H3_ROPE_TABLES: list[Any] = [None, None]
+
+
+def h3_rope_tables(
+    rope_table: torch.Tensor, head_dim: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``[T, R]`` ``[cos | sin]`` -> ``(T, head_dim)`` rotation tables.
+
+    Returns ``[c, c, 1...]`` and ``[s, s, 0...]`` (``c``/``s`` of width
+    ``R / 2``), the tables of the half-split kernel's
+    ``y * cos + (y @ P) * sin``. The last pair is cached by ``rope_table``
+    identity. A denoise run passes one table object to every block and
+    step, so they are built once per run.
+    """
+    ref, tables = _H3_ROPE_TABLES
+    if ref is not None and ref() is rope_table and tables[0].shape[-1] == head_dim:
+        return tables
+    half = rope_table.shape[-1] // 2
+    rows, pad = rope_table.shape[0], head_dim - 2 * half
+    cos, sin = rope_table[:, :half], rope_table[:, half : 2 * half]
+    tables = (
+        torch.cat((cos, cos, cos.new_ones(rows, pad)), dim=-1),
+        torch.cat((sin, sin, sin.new_zeros(rows, pad)), dim=-1),
+    )
+
+    def _clear_cache(w: Any) -> None:
+        if _H3_ROPE_TABLES and _H3_ROPE_TABLES[0] is w:
+            _H3_ROPE_TABLES[:] = [None, None]
+
+    _H3_ROPE_TABLES[:] = [weakref.ref(rope_table, _clear_cache), tables]
+    return tables
+
+
+def h3_fused_qk_norm_rope_supported(
+    attn: Any, x: torch.Tensor, rope_table: Any, kwargs: dict[str, Any]
+) -> bool:
+    """Whether a MiniMaxH3Attention call fits the fused TPU kernel."""
+    if not isinstance(rope_table, torch.Tensor) or kwargs.get("vdn_window") is not None:
+        return False
+    if not set(kwargs) <= _H3_ATTENTION_FORWARD_KWARGS or not {
+        "cu_seqlens",
+        "max_seqlen",
+    } <= set(kwargs):
+        return False
+    if (
+        getattr(attn, "vdn", None) is not None
+        or getattr(attn, "to_gate_compress", None) is not None
+    ):
+        return False
+    if not (_is_tpu(x) and _is_tpu(rope_table)):
+        return False
+    if x.dtype != torch.bfloat16 or x.dim() != 2 or x.shape[0] == 0:
+        return False
+    if (
+        getattr(attn, "head_dim", None) != H3_QK_HEAD_DIM
+        or getattr(attn, "rot_dim", None) != H3_QK_ROTARY_DIM
+        or getattr(attn, "num_kv_heads", None) != getattr(attn, "num_heads", None)
+    ):
+        return False
+    if rope_table.dtype != torch.bfloat16 or tuple(rope_table.shape) != (
+        x.shape[0],
+        H3_QK_ROTARY_DIM,
+    ):
+        return False
+    if not getattr(getattr(attn, "rope", None), "is_neox_style", True):
+        return False
+    for norm in (getattr(attn, "q_norm", None), getattr(attn, "k_norm", None)):
+        weight = getattr(norm, "weight", None)
+        # A bf16 weight keeps upstream's q/k in bf16 (an fp32 one promotes them).
+        if (
+            not isinstance(weight, torch.Tensor)
+            or tuple(weight.shape) != (H3_QK_HEAD_DIM,)
+            or weight.dtype != torch.bfloat16
+        ):
+            return False
+    return isinstance(getattr(attn.q_norm, "variance_epsilon", None), float)
+
+
+def _fused_h3_qk_norm_rope(*args: Any) -> tuple[torch.Tensor, torch.Tensor]:
+    # torch_tpu and JAX are imported only on the TPU path.
+    from vllm_torchtpu.omni.rope import minimax_h3_qk_norm_rope
+
+    return minimax_h3_qk_norm_rope(*args)
+
+
+def patch_attention_fused_qk_norm_rope() -> bool:
+    # -------------------------------------------------------------------------
+    # Upstream vLLM-Omni Root Cause Tracking:
+    # Upstream: MiniMaxH3Attention.forward normalizes and rotates q/k of
+    # every DiT block with fused_qk_norm_rope(q, k, q_norm.weight,
+    # k_norm.weight, rope_table, eps) (minimax_h3_transformer.py:692-703 at
+    # vllm-omni e1d77a3), q/k being [T, heads, 128] column views of the
+    # qkv_proj output. Its fused paths are CUDA Triton (fused_qk_norm_rope.py
+    # :108-168, f32 math, one rounding) and Ascend (:369-386). Every other
+    # device takes _eager_qk_norm_rope (:301-320, via :685-696 and
+    # :551-562): F.rms_norm per head on each of q and k, then
+    # _apply_rope_table (:50-103), which slices lanes [0:48), [48:96) and
+    # [96:128) of every head, rotates in bf16 and concatenates the three
+    # pieces back.
+    #
+    # Problem on TPU: that is separate XLA passes over q and k with 48-lane
+    # slices and a concat that do not align to the 128-lane vregs. One call
+    # on v7x with 7 local heads x 128 takes 0.55 / 0.68 / 1.33 ms against
+    # 0.10 / 0.10 / 0.13 ms for the fused kernel at S = 2304 / 7168 / 20480.
+    #
+    # Fix: on TPU, for bf16 inputs on upstream's fused geometry (head_dim
+    # 128, rotary 96, NeoX half-split, no VDN branch or VSA gate), the
+    # forward passes the [T, 3 x heads x 128] qkv_proj output to one Pallas
+    # kernel (kernels/diffusion_attention/qk_norm_rope.py, per_head_norm and
+    # half_split_rotary_dim=96) that reads q/k once and writes them once:
+    # f32 statistics per head, one bf16 rounding of the normalized value, an
+    # f32 rotate through an exact +-1 permutation on the MXU and one final
+    # rounding. This is the Triton kernel's order, so the result is not
+    # bit-identical to the bf16 eager chain. The [T, 128] rotation tables
+    # are built once per rope_table (h3_rope_tables). The rest of the
+    # forward is upstream's, statement by statement. Token-refiner calls
+    # (rope_table=None) and every other input keep the upstream forward.
+    #
+    # REMOVAL / FIX CONDITION:
+    # Remove once vLLM-Omni's fused_qk_norm_rope gains a TPU (or
+    # out-of-tree dispatch) path, or XLA fuses the per-head RMSNorm and
+    # the partial half-split rotation into one pass at HBM bandwidth.
+    # -------------------------------------------------------------------------
+    module = _loaded_module(TRANSFORMER_MODULE)
+    cls = getattr(module, "MiniMaxH3Attention", None)
+    if not isinstance(cls, type):
+        logger.debug(
+            "Skipping MiniMax-H3 fused q/k norm + RoPE TPU patch: %s is not loaded.",
+            TRANSFORMER_MODULE,
+        )
+        return False
+    if "_tpu_orig_forward" in cls.__dict__:
+        return False
+    original = cls.forward
+
+    @functools.wraps(original)
+    def forward(
+        self: Any, x: torch.Tensor, *, rope_table: Any, **kwargs: Any
+    ) -> torch.Tensor:
+        if not h3_fused_qk_norm_rope_supported(self, x, rope_table, kwargs):
+            return original(self, x, rope_table=rope_table, **kwargs)
+        total = x.shape[0]
+        qkv, _ = self.qkv_proj(x)
+        q_size = self.num_heads * self.head_dim
+        cos, sin = h3_rope_tables(rope_table, self.head_dim)
+        q, k = _fused_h3_qk_norm_rope(
+            qkv,
+            self.q_norm.weight,
+            self.k_norm.weight,
+            cos,
+            sin,
+            self.q_norm.variance_epsilon,
+            self.head_dim,
+            self.rot_dim,
+        )
+        heads = (total, self.num_heads, self.head_dim)
+        v = qkv[:, 2 * q_size :].view(heads)
+        packed_total = kwargs.get("packed_total")
+        out = self._run_packed_attention(
+            q.view(heads),
+            k.view(heads),
+            v,
+            cu_seqlens=kwargs["cu_seqlens"],
+            max_seqlen=kwargs["max_seqlen"],
+            packed_total=packed_total if packed_total is not None else total,
+            num_requests=kwargs.get("num_requests", 1),
+            video_layout=kwargs.get("video_layout"),
+            vsa_prefix_segments=kwargs.get("vsa_prefix_segments", ()),
+            gate_compress=None,
+            vdn_window=None,
+        )
+        out = out.reshape(total, q_size)
+        out, _ = self.out_proj(out)
+        return out
+
+    cls._tpu_orig_forward = original
+    cls.forward = forward
+    logger.info(
+        "Applied TPU patch: MiniMax-H3 fused per-head q/k RMSNorm + RoPE kernel."
+    )
+    return True
+
+
 def apply_minimax_h3_patches() -> bool:
     """Patch the MiniMax-H3 pipeline module if it is already loaded.
 
@@ -1809,4 +2017,5 @@ def apply_minimax_h3_patches() -> bool:
     patched = patch_adaln_projection_cache() or patched
     patched = patch_denoise_branch_timestep_rows() or patched
     patched = patch_scheduler_finite_checks() or patched
+    patched = patch_attention_fused_qk_norm_rope() or patched
     return patch_denoise_loop_rope_table() or patched
