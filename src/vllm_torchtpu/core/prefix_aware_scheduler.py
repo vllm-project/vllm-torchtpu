@@ -210,6 +210,7 @@ class PrefixAwareScheduler(AsyncScheduler):
     #     (_reserve_prefill_lookahead returns 0, the loop breaks);
     #   * a new load is refused once N requests are held (in
     #     ``_inflight_prefills`` and not RUNNING), and must otherwise fit in
+    #     the free blocks minus the stock async-load reservation minus
     #     (_inflight_prefill_reserved_blocks).
     # Below the cap the loop is unchanged. When a slot frees, the stock loop
     # drains ``kv_holding_waiting`` first, so the oldest KV-ready prefetched
@@ -337,6 +338,9 @@ class PrefixAwareScheduler(AsyncScheduler):
 
     # ------------------------------------------------------------------
     #
+    # ``_promote_warmest`` moves one request per queue to the head. With the
+    # scheduler admits from it, so every admission of the step follows the
+    # order. The key is the request's estimated uncached prompt tokens
     # (prompt minus local HBM hit minus a loadable external hit) minus
     # large prompt can be overtaken. Requests that already hold computed
     # tokens or were preempted go first, and requests whose uncached tokens
@@ -383,6 +387,7 @@ class PrefixAwareScheduler(AsyncScheduler):
             ext_warmth = 0
         uncached = max(num_tokens - local_warmth - ext_warmth, 0)
         arrival = float(getattr(request, "arrival_time", now) or now)
+        aged = uncached - rate * max(0.0, now - arrival)
         started = (
             getattr(request, "num_preemptions", 0) > 0
             or getattr(request, "num_computed_tokens", 0) > 0
@@ -409,6 +414,7 @@ class PrefixAwareScheduler(AsyncScheduler):
             free_blocks_for_ext = max(0, free_blocks - reserved)
         now = time.time()
         keys = [
+            self._paw_sort_key(r, now, free_blocks, free_blocks_for_ext) for r in window
         ]
         order = sorted(range(len(window)), key=lambda i: (keys[i], i))
         self._paw_sort_steps += 1
@@ -559,6 +565,10 @@ class PrefixAwareScheduler(AsyncScheduler):
         return cached
 
     def _inflight_prefill_reserved_blocks(self) -> int:
+        if (
+            getattr(self, "_kv_prefetch_in_waiting", False)
+            and self._kv_prefetch_at_cap()
+        ):
             # The stock loop calls this only for an async load, right before
             # allocating it. At the cap that load is a prefetch.
             if self._kv_prefetch_num_held() >= self._kv_prefetch_n:
@@ -840,6 +850,10 @@ class PrefixAwareScheduler(AsyncScheduler):
         num_computed_tokens: int,
         num_new_tokens: int,
     ) -> int:
+        if (
+            getattr(self, "_kv_prefetch_in_waiting", False)
+            and self._kv_prefetch_at_cap()
+        ):
             # KV prefetch: this waiting request would join ``running`` without
             # an async load, past the cap. 0 stops the stock waiting loop.
             return 0

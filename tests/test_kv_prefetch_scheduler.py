@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU_SCHED_KV_PREFETCH_WAITING on a real vLLM v0.31.0 scheduler loop.
+"""TPU_SCHED_KV_PREFETCH_WAITING on the real vLLM scheduler loop.
 
 These tests build a real PrefixAwareScheduler (stock Scheduler.schedule(),
 KVCacheManager and block pool) as a PD consumer whose connector loads every
@@ -21,6 +21,7 @@ update_state_after_alloc runs; its KV "arrives" when a step's output reports
 it in finished_recving.
 """
 
+import contextlib
 import json
 import random
 
@@ -98,22 +99,15 @@ class _PrefetchTestConnector(KVConnectorBase_V1, SupportsHMA):
 
 
 _CONNECTOR = "KvPrefetchTestConnector"
-try:
+# A second import of this module finds the name registered.
+with contextlib.suppress(ValueError):
     KVConnectorFactory.register_connector(
         _CONNECTOR, __name__, _PrefetchTestConnector.__name__
     )
-except ValueError:
-    pass  # already registered by an earlier import of this module
 
 
 @pytest.fixture(autouse=True)
 def _decode_env(monkeypatch):
-    # The decode-side async-load reservation (PrefixAwareScheduler
-    # ._decode_inflight_reserved_blocks) with small, explicit numbers.
-    monkeypatch.setenv("TPU_SCHED_DECODE_MAX_STAGE3_INFLIGHT", "16")
-    monkeypatch.setenv("TPU_SCHED_DECODE_STAGE3_OVERPROVISION", "32")
-    monkeypatch.setenv("TPU_SCHED_DECODE_RESERVED_BLOCKS", "8")
-    monkeypatch.setenv("TPU_SCHED_DECODE_RESERVED_BLOCKS_PER_SEQ", "1")
     monkeypatch.setenv("TPU_SCHED_KV_PREFETCH_RESERVE_BLOCKS", "8")
     monkeypatch.delenv("TPU_SCHED_KV_PREFETCH_WAITING", raising=False)
 
@@ -153,7 +147,10 @@ def _make_sched(tmp_path, monkeypatch, prefetch=0, num_blocks=2000, role="kv_con
             is_encoder_decoder=False,
         ),
         model_config=ModelConfig(
-            model=_model_dir(tmp_path), dtype="float16", seed=42, skip_tokenizer_init=True
+            model=_model_dir(tmp_path),
+            dtype="float16",
+            seed=42,
+            skip_tokenizer_init=True,
         ),
         cache_config=CacheConfig(
             block_size=BLOCK, gpu_memory_utilization=0.9, enable_prefix_caching=True
@@ -402,9 +399,9 @@ def test_abort_of_prefetched_requests_frees_blocks(tmp_path, monkeypatch):
 
 
 def test_prefetch_respects_free_blocks_and_reserve(tmp_path, monkeypatch):
-    # 4 running x 5 blocks (4 prompt + 1 decode) = 20 used. Async-load
-    # reservation: max(8, 1 x (running + inflight)) = 8. With 50 blocks
-    # (49 usable): 29 free - 8 reserved - prefetch reserve must fit 4 blocks.
+    # 4 running x 5 blocks (4 prompt + 1 decode) = 20 used. The stock
+    # async-load reservation is 0 once every running prefill has finished.
+    # With 50 blocks (49 usable): 29 free - prefetch reserve must fit 4 blocks.
     monkeypatch.setenv("TPU_SCHED_KV_PREFETCH_RESERVE_BLOCKS", "64")
     eng = _Engine(_make_sched(tmp_path, monkeypatch, prefetch=2, num_blocks=50))
     running = eng.fill_running()
