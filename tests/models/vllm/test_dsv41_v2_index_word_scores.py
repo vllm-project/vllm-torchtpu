@@ -162,9 +162,9 @@ def test_paged_index_scores_grouped_decode_requests(tokens, requests, expected_g
 
     orig_score = ak._score_word_rows
 
-    def _spy(q_in, w_in, words_in):
+    def _spy(q_in, w_in, words_in, *, halfplane=False):
         observed_groups.append(words_in.shape[0])
-        return orig_score(q_in, w_in, words_in)
+        return orig_score(q_in, w_in, words_in, halfplane=halfplane)
 
     with mock.patch.object(ak, "_score_word_rows", side_effect=_spy):
         grouped = np.asarray(
@@ -234,9 +234,7 @@ def test_lane_dense_page_rows_match_iota(rows):
     np.testing.assert_array_equal(_lane_dense_page_rows(starts, rows), expected)
 
 
-@pytest.mark.parametrize("onehot", ["0", "1"])
-def test_gather_cache_page_words_page_rows_switch(monkeypatch, onehot):
-    monkeypatch.setenv("TPU_DEEPSEEK_V41_PAGE_ROWS_ONEHOT", onehot)
+def test_gather_cache_page_words_lane_dense_rows():
     rng = np.random.default_rng(5)
     cache = _words(rng, (1024, ROW_WORDS))
     # 128 pages of 8 rows: 1024 gathered rows, eligible for the lane-dense path.

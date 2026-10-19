@@ -14,7 +14,6 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v41 import indexer
 from vllm_torchtpu.kernels.deepseek_v41.index_selection import scores, streaming_topk
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.tuned_block_sizes import (
@@ -64,49 +63,6 @@ def supports_decode(
     )
 
 
-def _request_kernel(
-    pages,
-    limits,
-    query_limits,
-    q,
-    weights,
-    pool,
-    out,
-    words,
-    *scratch,
-    page_records,
-    tile,
-    coalesce,
-    prefetch,
-    profile_stages,
-    fuse_mask,
-    halfplane=False,
-):
-    request = pl.program_id(0)
-    # Keep the scalar-prefetch address space flat: a 2D SMEM row subview
-    # misaddresses long page tables after the first 128 columns on TPU.
-    page_count = pages.shape[0] // limits.shape[0]
-    scores._kernel(
-        pages.at[pl.ds(request * page_count, page_count)],
-        limits.at[pl.ds(request, 1)],
-        q,
-        weights,
-        pool,
-        None,
-        out.at[:, 0, :],
-        words,
-        *scratch,
-        page_records=page_records,
-        tile=tile,
-        coalesce=coalesce,
-        prefetch=prefetch,
-        profile_stages=profile_stages,
-        row_lengths=query_limits if fuse_mask else None,
-        row_offset=request * q.shape[0],
-        halfplane=halfplane,
-    )
-
-
 def _flat_request_kernel(
     pages,
     limits,
@@ -126,12 +82,14 @@ def _flat_request_kernel(
     fuse_mask,
     halfplane=False,
 ):
-    """`_request_kernel` for `group` requests sharing one 2D out block.
+    """Score `group` requests into a 2D block or a singleton-axis basic layout.
 
     Request r owns rows r*Q..r*Q+Q-1; each is scored exactly as in the
     per-request kernel (same dot shapes and order), so results are bitwise equal.
     """
     queries = q.shape[0] // group
+    if out.ndim == 3:
+        out = out.at[:, 0, :]
     page_count = pages.shape[0] // limits.shape[0]
     out[...] = jnp.full(out.shape, -jnp.inf, jnp.float32)
     for r in range(group):
@@ -250,7 +208,8 @@ def grouped_decode_scores(
         )
     result = pl.pallas_call(
         functools.partial(
-            _request_kernel,
+            _flat_request_kernel,
+            group=1,
             page_records=page_records,
             tile=key_tile,
             coalesce=True,
@@ -478,11 +437,7 @@ def decode_indexer(
     # Score whole requests into an 8-row-aligned 2D request-major block: the
     # legacy (requests * queries, 1, width) output takes a T(1,128) HBM tiling
     # that XLA relayouts (copies) before streaming top-k. Read at trace time.
-    request_group_2d = (
-        flat_request_group(request_tile, queries)
-        if envs.TPU_DEEPSEEK_V41_INDEX_SCORES_2D
-        else 0
-    )
+    request_group_2d = flat_request_group(request_tile, queries)
 
     def prepare(i):
         return jax.tree.map(

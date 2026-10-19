@@ -93,12 +93,11 @@ CANDIDATE_KEY_TILES: dict[tuple[str, tuple[int, ...], int, int, bool, bool], int
 # 40K overflowed in 12/48 profiled rank-steps. The 48K bucket covers the
 # captured maximum of 5138 blocks with headroom, at 576 MiB per 48 requests.
 CANDIDATE_KEY_CAPACITY = 49152
-# Generalize the measured 8192/48 configuration without increasing its score
-# buffer or per-request dot-product footprint. These defaults are heuristics;
-# only exact table entries have measured performance evidence.
-DEFAULT_CANDIDATE_KEY_TILE = 8192
-DEFAULT_CANDIDATE_REQUEST_TILE = 48
-CANDIDATE_SCORE_ELEMENTS = DEFAULT_CANDIDATE_REQUEST_TILE * 6 * CANDIDATE_KEY_CAPACITY
+# Basic config for table misses: bounded groups and a smaller MXU key tile.
+# Keep the score-buffer budget below the measured 48 x 6 x 48K configuration.
+DEFAULT_CANDIDATE_KEY_TILE = 4096
+DEFAULT_CANDIDATE_REQUEST_TILE = 16
+CANDIDATE_SCORE_ELEMENTS = 48 * 6 * CANDIDATE_KEY_CAPACITY
 
 
 def get_candidate_key_tile(
@@ -109,21 +108,13 @@ def get_candidate_key_tile(
     packed: bool,
     halfplane: bool = False,
 ) -> int:
-    """Prefer measured tiles, then use an aligned default for related workloads."""
+    """Prefer measured tiles, then use the aligned basic configuration."""
     if capacity < 1:
         raise ValueError("candidate capacity must be positive")
     key = (device_kind, query_shape, capacity, k, packed, packed and halfplane)
     tile = CANDIDATE_KEY_TILES.get(key)
     if tile is None:
-        related = (
-            device_kind == "TPU7x"
-            and not packed
-            and k == 512
-            and len(query_shape) == 4
-            and 1 <= query_shape[1] <= 6
-            and query_shape[2:] == (32, 128)
-        )
-        tile = math.gcd(DEFAULT_CANDIDATE_KEY_TILE if related else 4096, capacity)
+        tile = math.gcd(DEFAULT_CANDIDATE_KEY_TILE, capacity)
         logger.warning_once(
             "[candidate_indexer] No tuned key_tile for %s; using %d", key, tile
         )
@@ -140,21 +131,9 @@ def get_candidate_request_tile(key: CandidateTuningKey) -> int:
         raise ValueError("candidate queries and capacity must be positive")
     tile = CANDIDATE_REQUEST_TILES.get(key)
     if tile is None:
-        related = (
-            key.device_kind == "TPU7x"
-            and not key.packed
-            and 1 <= key.queries <= 6
-            and key.heads == 32
-            and key.key_tile <= DEFAULT_CANDIDATE_KEY_TILE
-            and key.k == 512
-        )
-        limit = (
-            min(
-                DEFAULT_CANDIDATE_REQUEST_TILE,
-                max(1, CANDIDATE_SCORE_ELEMENTS // (key.queries * key.capacity)),
-            )
-            if related
-            else 16
+        limit = min(
+            DEFAULT_CANDIDATE_REQUEST_TILE,
+            max(1, CANDIDATE_SCORE_ELEMENTS // (key.queries * key.capacity)),
         )
         tile = next(
             n for n in range(min(limit, key.requests), 0, -1) if key.requests % n == 0
@@ -165,3 +144,14 @@ def get_candidate_request_tile(key: CandidateTuningKey) -> int:
     if type(tile) is not int or tile < 1 or key.requests % tile:
         raise ValueError(f"Invalid candidate request_tile={tile} for {key}")
     return tile
+
+
+def get_candidate_score_group(requests: int, queries: int) -> int:
+    """Keep the measured eight-request layout; use one request if unaligned.
+
+    The basic config never pads queries or keys. A singleton major output axis
+    handles batches which cannot fill an eight-row 2D score block.
+    """
+    if requests < 1 or not 1 <= queries <= 8:
+        raise ValueError("candidate scoring requires requests > 0 and 1..8 queries")
+    return 8 if requests % 8 == 0 else 1

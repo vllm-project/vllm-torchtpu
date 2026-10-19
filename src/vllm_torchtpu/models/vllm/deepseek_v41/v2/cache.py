@@ -2,14 +2,12 @@
 
 import math
 from dataclasses import dataclass, field
-from functools import lru_cache
 from typing import Any, Protocol, cast
 
 import jax
 import torch
 from vllm.v1.worker.utils import allocate_kv_cache as allocate_upstream_kv_cache
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.pallas_shapes import get_kernel_mesh
 from vllm_torchtpu.kernels.deepseek_v4.csa_cache_layout import ROW_WORDS
 
@@ -629,10 +627,9 @@ class PagedCacheRows:
             self.rope_hi.copy_(_write_values_op(self.rope_hi, rec_hi, rope))
 
 
-@lru_cache(maxsize=1)
 def index_key_layout() -> str:
-    """Index cache format is fixed for the process; changing it needs a restart."""
-    return envs.TPU_DEEPSEEK_V41_INDEX_KEY_LAYOUT
+    """Production index pools use the halfplane word layout."""
+    return "halfplane"
 
 
 class NativeCacheView:
@@ -964,12 +961,7 @@ def gather_cache_page_words(
     # A single-row index gather stays on SparseCore; vmap(dynamic_slice)
     # lowers to a windowed gather that measured ~25x slower on TPU7x.
     total = starts.size * rows
-    if (
-        envs.TPU_DEEPSEEK_V41_PAGE_ROWS_ONEHOT
-        and 1 < rows <= 128
-        and 128 % rows == 0
-        and total % 1024 == 0
-    ):
+    if 1 < rows <= 128 and 128 % rows == 0 and total % 1024 == 0:
         indices = _lane_dense_page_rows(starts, rows)
     else:
         indices = (
@@ -1067,10 +1059,9 @@ def encode_fp8_kv(latent: jax.Array) -> tuple[jax.Array, jax.Array]:
 
 
 def initialize_cache_ops():
-    if envs.TPU_DEEPSEEK_V41_ATTENTION != "native":
-        from .csa2_adapter import initialize_csa2_ops
+    from .csa2_adapter import initialize_csa2_ops
 
-        initialize_csa2_ops()
+    initialize_csa2_ops()
     global _read_values_op, _read_values_2bank_op, _write_op, _write_values_op
     global _encode_fp8_op, _write_values_after_op
     global _write_index_values_op, _write_index_values_after_op

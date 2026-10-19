@@ -11,7 +11,6 @@ import jax
 import jax.numpy as jnp
 import torch
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.pallas_shapes import get_kernel_mesh
 from vllm_torchtpu.kernels.deepseek_v41 import (
     index_word_scores,
@@ -3570,7 +3569,7 @@ def paged_indexer(
     # Resolve the comparison selector in the torch-to-JAX wrapper and pass it
     # explicitly: compiled JAX functions must not read environment state.
     if prefill_mode is None:
-        prefill_mode = envs.TPU_DEEPSEEK_V41_PREFILL_INDEXER
+        prefill_mode = "streaming"
     assert _indexer_op is not None
     if batch_max is None:
         batch_max = lengths.max()

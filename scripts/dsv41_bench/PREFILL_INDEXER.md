@@ -1,10 +1,9 @@
 # Chunked prefill indexer
 
 DeepSeek V4.1 v2 defaults to resident-query scoring and full-row SparseCore
-streaming top-k (`TPU_DEEPSEEK_V41_PREFILL_INDEXER=streaming`). Set the selector
-to `baseline` before server startup to compare with the epic implementation.
-The baseline escape hatch is retained during rollout and can be removed after
-default-path qualification.
+streaming top-k. Production routing is derived from shapes and live metadata.
+The explicit `prefill_mode` argument is only retained for standalone kernel A/B;
+there is no server environment selector.
 
 The new route handles a single live request in a 2048-query bucket with 32
 heads, head dimension 128, BF16 queries, packed int32 index cache, and top-k
@@ -32,7 +31,7 @@ claim that every decode compilation graph is identical.
 
 The benchmark launcher does not enable this route. It is enabled by the
 runtime default. For A/B runs, use distinct output/cache directories per mode;
-set the selector before startup and compile each mode separately.
+compare source revisions and compile each revision separately.
 
 ## Kernel A/B
 

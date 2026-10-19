@@ -749,20 +749,10 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 f"admitted layout: {reason}"
             )
             register_score_bias_buffer(layer)
-            # The kernel's row-padded flat scales avoid per-step relayouts.
-            # Clone alone retains higher-rank storage in the pinned runtime;
-            # materialize the static scale buffers before registration.
-            row_padded = envs.TPU_DEEPSEEK_V41_MOE_SCALE_ROW_PADDED
-            if row_padded:
-                w13_scale = _row_padded_flat_block_scale(layer.w13_weight_scale)
-                w2_scale = _row_padded_flat_block_scale(layer.w2_weight_scale)
-            else:
-                w13_scale = materialize_static_scale(
-                    layer.w13_weight_scale.squeeze(2).clone()
-                )
-                w2_scale = materialize_static_scale(
-                    layer.w2_weight_scale.squeeze(2).clone()
-                )
+            # Row-padded scales avoid per-step relayouts; the helper also
+            # materializes their storage under the pinned runtime.
+            w13_scale = _row_padded_flat_block_scale(layer.w13_weight_scale)
+            w2_scale = _row_padded_flat_block_scale(layer.w2_weight_scale)
             layer.register_buffer(
                 "_tpu_fused_w13_scale",
                 w13_scale,
@@ -774,9 +764,9 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 persistent=False,
             )
             logger.info_once(
-                "DeepSeek-V4 MXFP4 fused EP W4A8 enabled: block-%d%s",
+                "DeepSeek-V4 MXFP4 fused EP W4A8 enabled: block-%d, "
+                "row-padded flat scales",
                 REQUANTIZED_BLOCK_SIZE,
-                ", row-padded flat scales" if row_padded else "",
             )
 
     def _forward_monolithic_tpu(

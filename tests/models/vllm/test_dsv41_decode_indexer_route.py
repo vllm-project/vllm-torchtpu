@@ -92,7 +92,7 @@ def test_decode_route(monkeypatch, width, mode):
     np.testing.assert_array_equal(published, 3 if mode == "publish" else candidates)
 
 
-@pytest.mark.skipif(jax.default_backend() != "tpu", reason="TPU decode pipeline")
+@pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="TPU decode pipeline")
 @pytest.mark.parametrize("width", [49408, 98816])
 @pytest.mark.parametrize("candidate_count", [0, 2048])
 def test_decode_route_tpu_matches_existing(monkeypatch, width, candidate_count):
@@ -141,7 +141,7 @@ def test_decode_route_tpu_matches_existing(monkeypatch, width, candidate_count):
     np.testing.assert_array_equal(np.sort(candidate[1]), np.sort(baseline[1]))
 
 
-@pytest.mark.skipif(jax.default_backend() != "tpu", reason="TPU candidate pipeline")
+@pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="TPU candidate pipeline")
 @pytest.mark.parametrize(
     "mode",
     [
@@ -160,7 +160,7 @@ def test_candidate_cache_matches_existing_with_fallback(mode, packed):
     _check_candidate_cache(mode, packed, groups=2, width=8192, capacity=4096)
 
 
-@pytest.mark.skipif(jax.default_backend() != "tpu", reason="TPU candidate pipeline")
+@pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="TPU candidate pipeline")
 @pytest.mark.parametrize(
     "groups,mode",
     [
@@ -176,21 +176,20 @@ def test_long_candidate_cache_matches_existing(groups, mode):
     _check_candidate_cache(mode, False, groups=groups, width=1048576, capacity=49152)
 
 
-def _check_candidate_cache(mode, packed, *, groups, width, capacity):
+def _check_candidate_cache(mode, packed, *, groups, width, capacity, queries=6):
     from vllm_torchtpu.models.vllm.deepseek_v41.v2.candidate_cache import (
         prepare_candidate_cache_jax,
         select_candidate_cache_jax,
     )
 
     rng = np.random.default_rng(104)
-    queries = 6
     rows = groups * queries
     if mode == "ragged_rows":
         rows += 1
     keys = jnp.asarray(rng.normal(size=(groups * width, 128)), jnp.bfloat16)
     words = jax.lax.bitcast_convert_type(keys.reshape(-1, 64, 2), jnp.int32)
     words = words.reshape(-1, 128)
-    pool = (words[:4096], words[4096:])
+    pool = (words[:4096], words[4096:]) if groups > 1 else words
     pages = rng.permutation(groups * width // 128).reshape(groups, -1) * 128
     records = jnp.asarray(
         (pages[..., None] + np.arange(128)).reshape(groups, width), jnp.int32
@@ -208,7 +207,9 @@ def _check_candidate_cache(mode, packed, *, groups, width, capacity):
         jnp.arange(candidate_count, dtype=jnp.int32) + offset,
         (rows, candidate_count),
     )
-    lengths = jnp.full((rows,), width - 3, jnp.int32).at[-1].set(0)
+    lengths = jnp.full((rows,), width - 3, jnp.int32)
+    if rows > 1:
+        lengths = lengths.at[-1].set(0)
     requests = jnp.repeat(jnp.arange(groups, dtype=jnp.int32), queries)
     if mode == "ragged_rows":
         requests = jnp.concatenate((requests, jnp.array([1], jnp.int32)))
@@ -223,7 +224,7 @@ def _check_candidate_cache(mode, packed, *, groups, width, capacity):
     elif mode == "invalid":
         candidates = candidates.at[:, :4].set(jnp.array([-1, width // 8, 8, 8]))
         candidates = candidates.at[0].set(-1)
-        lengths = lengths.at[1].set(519)
+        lengths = lengths.at[min(1, rows - 1)].set(519)
     batch_max = lengths.max().reshape(1)
     prepare = jax.jit(prepare_candidate_cache_jax, static_argnums=(5, 6, 7))
     dense, ids, bits, actual, usable = prepare(
@@ -248,7 +249,7 @@ def _check_candidate_cache(mode, packed, *, groups, width, capacity):
         usable,
         8,
         128,
-        min(groups, 2),
+        None,
     )
     expected, _ = ak.paged_indexer_jax(
         q,
@@ -267,3 +268,12 @@ def _check_candidate_cache(mode, packed, *, groups, width, capacity):
         128,
     )
     np.testing.assert_array_equal(np.asarray(result), np.asarray(expected))
+
+
+@pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="TPU candidate pipeline")
+@pytest.mark.parametrize("groups,queries", [(1, 1), (3, 2), (4, 3), (7, 5), (8, 8)])
+@pytest.mark.parametrize("mode", ["regular", "invalid"])
+def test_candidate_cache_basic_config_covers_non_k5_batches(groups, queries, mode):
+    _check_candidate_cache(
+        mode, True, groups=groups, queries=queries, width=8192, capacity=4096
+    )

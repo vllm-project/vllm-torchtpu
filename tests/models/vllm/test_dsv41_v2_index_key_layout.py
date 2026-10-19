@@ -90,19 +90,11 @@ def test_eager_native_index_cache_uses_tagged_interpretation():
     assert view.kv_cache.index_key_layout == "halfplane"
 
 
-def test_index_layout_is_process_lifetime_static(monkeypatch):
+def test_index_layout_is_halfplane_independent_of_retired_env(monkeypatch):
     from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import index_key_layout
 
-    index_key_layout.cache_clear()
-    try:
-        monkeypatch.delenv("TPU_DEEPSEEK_V41_INDEX_KEY_LAYOUT", raising=False)
-        assert index_key_layout() == "halfplane"
-        monkeypatch.setenv("TPU_DEEPSEEK_V41_INDEX_KEY_LAYOUT", "ordinary")
-        assert index_key_layout() == "halfplane"
-        index_key_layout.cache_clear()
-        assert index_key_layout() == "ordinary"
-    finally:
-        index_key_layout.cache_clear()
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_INDEX_KEY_LAYOUT", "ordinary")
+    assert index_key_layout() == "halfplane"
 
 
 def test_halfplane_refuses_unversioned_external_kv_transfer(monkeypatch):
@@ -177,7 +169,6 @@ def test_model_startup_registers_real_jax_ops_on_cpu(monkeypatch):
         set_vllm_model_wrapper_context,
     )
 
-    monkeypatch.setenv("TPU_DEEPSEEK_V41_ATTENTION", "auto")
     mesh = Mesh(np.asarray(jax.devices("cpu")[:1]), ("registration",))
     with set_vllm_model_wrapper_context(mesh=mesh):
         # The former callback must fail TorchTPU's real registration verifier.
@@ -258,8 +249,8 @@ def test_halfplane_writer_normalizes_long_slots_at_jax_boundary(
     assert len(observed) == (2 if two_banks else 1)
 
 
-@pytest.mark.parametrize("rows", [384, 2048])
-def test_packed_candidate_fake_shape_and_non_q6_fallback(monkeypatch, rows):
+@pytest.mark.parametrize("rows", [384, 432, 2048])
+def test_packed_candidate_shape_and_route_bounds(monkeypatch, rows):
     import jax
     import jax.numpy as jnp
     import numpy as np
@@ -311,8 +302,11 @@ def test_packed_candidate_fake_shape_and_non_q6_fallback(monkeypatch, rows):
         calls.append(q.shape[0])
         return jnp.full((q.shape[0], 512), -1, jnp.int32), args[4]
 
-    def cached(*args, **kwargs):
-        raise AssertionError("Non-Q6 compilation buckets must retain the fallback")
+    cached_calls = []
+
+    def cached(q, *args, **kwargs):
+        cached_calls.append(q.shape[:2])
+        return jnp.full((q.shape[0] * q.shape[1], 512), -1, jnp.int32)
 
     monkeypatch.setattr(attention_kernels, "paged_indexer_jax", fallback)
     monkeypatch.setattr(candidate_cache.candidate, "candidate_indexer", cached)
@@ -347,3 +341,6 @@ def test_packed_candidate_fake_shape_and_non_q6_fallback(monkeypatch, rows):
     )
     assert selected.shape == (rows, 512)
     assert calls == [rows]
+    # Both cond branches trace for Q8; unsupported Q9 and ragged buckets
+    # must bypass candidate scoring entirely.
+    assert cached_calls == ([(48, 8)] if rows == 384 else [])

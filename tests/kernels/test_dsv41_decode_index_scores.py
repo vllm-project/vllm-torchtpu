@@ -249,7 +249,7 @@ def test_grouped_decode_scores_2d_out_rejects_unaligned_groups():
 
 
 @pytest.mark.skipif(
-    jax.default_backend() != "tpu", reason="Production widths are TPU-sized"
+    "jax.default_backend() != 'tpu'", reason="Production widths are TPU-sized"
 )
 @pytest.mark.parametrize("requests,width", [(16, 131072), (12, 65536)])
 @pytest.mark.parametrize("out_window", [0, 32768])
@@ -269,7 +269,7 @@ def test_grouped_decode_scores_2d_out_production_shapes(requests, width, out_win
     )
 
 
-@pytest.mark.skipif(jax.default_backend() != "tpu", reason="SparseCore top-k")
+@pytest.mark.skipif("jax.default_backend() != 'tpu'", reason="SparseCore top-k")
 @pytest.mark.parametrize("requests,width", [(16, 131072), (12, 65536)])
 @pytest.mark.parametrize("candidate_count", [0, 128])
 def test_decode_indexer_2d_out_selection_is_identical(
@@ -289,8 +289,10 @@ def test_decode_indexer_2d_out_selection_is_identical(
     )
 
     def run(enabled):
-        # Read at trace time: drop the other setting's trace.
-        monkeypatch.setenv("TPU_DEEPSEEK_V41_INDEX_SCORES_2D", enabled)
+        if enabled == "0":
+            monkeypatch.setattr(decode, "flat_request_group", lambda *args: 0)
+        else:
+            monkeypatch.undo()
         decode.decode_indexer.clear_cache()
         return jax.tree.map(
             np.asarray,
@@ -371,7 +373,10 @@ def test_long_candidate_union_preserves_membership_and_overflow(
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("seed", [71, 72])
 @pytest.mark.parametrize("packed", [False, True])
-def test_candidate_scores_match_independent_per_head_reference(seed, packed):
+@pytest.mark.parametrize("requests,queries", [(1, 1), (2, 6), (3, 3), (7, 5), (8, 8)])
+def test_candidate_scores_match_independent_per_head_reference(
+    seed, packed, requests, queries
+):
     from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
         candidate_scores,
         union_metadata,
@@ -379,7 +384,7 @@ def test_candidate_scores_match_independent_per_head_reference(seed, packed):
     )
 
     rng = np.random.default_rng(seed)
-    requests, queries, heads, width = 2, 6, 4, 128
+    heads, width = 4, 128
     native = jnp.asarray(rng.normal(size=(requests, width, 128)), jnp.bfloat16)
     words = jax.lax.bitcast_convert_type(native.reshape(requests, -1, 64, 2), jnp.int32)
     keys = unpack_candidate_words(words.reshape(requests, -1, 128), interpret=True)
@@ -403,7 +408,8 @@ def test_candidate_scores_match_independent_per_head_reference(seed, packed):
         score_keys = gathered
     q = jnp.asarray(rng.normal(size=(requests, queries, heads, 128)), jnp.bfloat16)
     weights = jnp.asarray(rng.normal(size=(requests, queries, heads)), jnp.float32)
-    lengths = jnp.array([[128, 127, 43, 9, 0, 2], [0, 1, 8, 77, 93, 128]], jnp.int32)
+    lengths = jnp.asarray(rng.integers(0, width + 1, (requests, queries)), jnp.int32)
+    lengths = lengths.at[-1, -1].set(0)
     scores = candidate_scores(
         q,
         weights,
@@ -596,22 +602,23 @@ def _reference_select(scores, lengths, k, *args):
 def _run_candidate_indexer(
     monkeypatch, inputs, halfplane, overlap, request_tile=2, flat=0, skip=False
 ):
-    import functools
-
     from vllm_torchtpu.kernels.deepseek_v41.index_selection import candidate
 
     with monkeypatch.context() as patch:
-        for name in ("candidate_scores", "candidate_scores_flat"):
-            if hasattr(candidate, name):
-                patch.setattr(
-                    candidate,
-                    name,
-                    functools.partial(getattr(candidate, name), interpret=True),
-                )
+        scorer = candidate.candidate_scores_flat
+
+        def score(*args, **kwargs):
+            kwargs.update(interpret=True, skip=skip)
+            return scorer(*args, **kwargs)
+
+        patch.setattr(candidate, "candidate_scores_flat", score)
         patch.setattr(candidate.decode, "_select", _reference_select)
-        patch.setenv("TPU_DEEPSEEK_V41_CANDIDATE_FLAT", str(flat))
-        patch.setenv("TPU_DEEPSEEK_V41_CANDIDATE_SKIP", str(int(skip)))
-        # Switches are read at trace time; drop traces from other settings.
+        patch.setattr(
+            candidate.tuned_block_sizes,
+            "get_candidate_score_group",
+            lambda requests, queries: flat if flat and requests % flat == 0 else 1,
+        )
+        # The benchmark-only overrides are static; drop prior traces.
         jax.clear_caches()
         result = candidate.candidate_indexer(
             *inputs,
@@ -654,7 +661,7 @@ def test_candidate_indexer_skip_is_identical(monkeypatch, packed, halfplane, ove
 @pytest.mark.parametrize("halfplane", [False, True])
 @pytest.mark.parametrize("skip", [False, True])
 # Eight-request groups take 2-D [G, W] records; four-request groups [G, 1, W].
-@pytest.mark.parametrize("group_tile", [4, 8])
+@pytest.mark.parametrize("group_tile", [1, 4, 8])
 def test_candidate_scores_flat_matches_grouped(packed, halfplane, skip, group_tile):
     from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import (
         candidate_scores,
@@ -742,7 +749,7 @@ def test_candidate_indexer_flat_is_identical(
 
 
 @pytest.mark.cpu_test
-def test_candidate_indexer_flat_falls_back_for_unaligned_tiles(monkeypatch):
+def test_candidate_indexer_basic_layout_preserves_unaligned_tiles(monkeypatch):
     # Two six-query requests per tile cannot fill 8-row flat blocks of 8.
     q, weights, keys, ids, membership, lengths = _candidate_skip_inputs(87)
     inputs = (q, weights, keys[False, False], ids, membership, lengths)

@@ -10,17 +10,9 @@ if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CED: bool = False
     TPU_DEEPSEEK_V41_ENGRAM_SPLIT: bool = False
     TPU_DEEPSEEK_V41_IMPL: str = "v1"
-    TPU_DEEPSEEK_V41_ATTENTION: str = "auto"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
     TPU_DEEPSEEK_V41_SP: bool = False
     TPU_DEEPSEEK_V41_LOCAL_Q: bool = False
-    TPU_DEEPSEEK_V41_PREFILL_INDEXER: str = "streaming"
-    TPU_DEEPSEEK_V41_INDEX_KEY_LAYOUT: str = "halfplane"
-    TPU_DEEPSEEK_V41_MOE_SCALE_ROW_PADDED: bool = True
-    TPU_DEEPSEEK_V41_PAGE_ROWS_ONEHOT: bool = True
-    TPU_DEEPSEEK_V41_INDEX_SCORES_2D: bool = True
-    TPU_DEEPSEEK_V41_CANDIDATE_FLAT: int = 8
-    TPU_DEEPSEEK_V41_CANDIDATE_SKIP: bool = True
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
@@ -371,11 +363,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # CED encoder as two graphs split at the last host-offloaded Engram layer:
     # that layer's host lookup, DP exchange and H2D upload overlap the head.
     "TPU_DEEPSEEK_V41_ENGRAM_SPLIT": env_bool("TPU_DEEPSEEK_V41_ENGRAM_SPLIT"),
-    # Default to full-row FP8 + paged SWA on supported v2 configurations.
-    # Use native to retain the original KV quantization (restart required).
-    "TPU_DEEPSEEK_V41_ATTENTION": env_with_choices(
-        "TPU_DEEPSEEK_V41_ATTENTION", "auto", ["auto", "native", "csa2_paged"]
-    ),
     # Opt in to upstream V4.1 sequence parallelism (token-sharded mHC, norms,
     # Engram and MoE; reduce-scatter/all-gather around attention) at DP1.
     # Upstream enables it only with DP>1 or MegaMoE.
@@ -384,18 +371,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (models/vllm/deepseek_v41/v2: FP8 main KV + RoPE companion pool).
     "TPU_DEEPSEEK_V41_IMPL": env_with_choices(
         "TPU_DEEPSEEK_V41_IMPL", "v1", ["v1", "v2"]
-    ),
-    # Index-K storage is fixed at startup; ordinary is an explicit fallback.
-    "TPU_DEEPSEEK_V41_INDEX_KEY_LAYOUT": env_with_choices(
-        "TPU_DEEPSEEK_V41_INDEX_KEY_LAYOUT", "halfplane", ["ordinary", "halfplane"]
-    ),
-    # Prefill defaults to resident-Q scoring + streaming TopK (8K/8K).
-    # Keep baseline as an A/B escape hatch while qualifying the new route.
-    # Eligibility is limited to single-request 2K chunks without candidate modes.
-    "TPU_DEEPSEEK_V41_PREFILL_INDEXER": env_with_choices(
-        "TPU_DEEPSEEK_V41_PREFILL_INDEXER",
-        "streaming",
-        ["baseline", "streaming"],
     ),
     # Offload V4.1 Engram embedding tables (23.60 GiB/rank at TP8, 188.83 GiB
     # total) to Host DRAM so TPU HBM remains available for KV cache and decode.
@@ -408,37 +383,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # o_group on that shard, shrinking both attention all_to_alls.
     # Costs replicated wq_b/wo_a HBM per rank.
     "TPU_DEEPSEEK_V41_LOCAL_Q": env_bool("TPU_DEEPSEEK_V41_LOCAL_Q", default=False),
-    # Register the fused EP MXFP4 block-scale tables as row-padded flat 2-D
-    # [E * align_up(K/block, 8), N] buffers: one layout, so the kernel's
-    # [E, rows, N] view is a bitcast instead of a per-layer relayout copy.
-    "TPU_DEEPSEEK_V41_MOE_SCALE_ROW_PADDED": env_bool(
-        "TPU_DEEPSEEK_V41_MOE_SCALE_ROW_PADDED", default=True
-    ),
-    # Build whole-page gather row indices lane-dense with an exact 0/1 matmul
-    # instead of a [pages, rows] iota whose padded minor dim needs a relayout.
-    # Read at trace time.
-    "TPU_DEEPSEEK_V41_PAGE_ROWS_ONEHOT": env_bool(
-        "TPU_DEEPSEEK_V41_PAGE_ROWS_ONEHOT", default=True
-    ),
-    # Decode index scores: write whole requests into 8-row-aligned 2D
-    # request-major [requests * queries, width] blocks, avoiding the legacy
-    # output's T(1,128) tiling and its XLA relayout before top-k. Read at
-    # trace time; results are bitwise identical.
-    "TPU_DEEPSEEK_V41_INDEX_SCORES_2D": env_bool(
-        "TPU_DEEPSEEK_V41_INDEX_SCORES_2D", default=True
-    ),
-    # Candidate (union) index scores: requests per grid step of the flat
-    # request-major kernel (8 gives 48-row blocks with 2-D records). 0 uses the
-    # grouped kernel; groups that do not divide the request tile into 8-row
-    # blocks fall back to it. Read at trace time.
-    "TPU_DEEPSEEK_V41_CANDIDATE_FLAT": env_nonnegative_int(
-        "TPU_DEEPSEEK_V41_CANDIDATE_FLAT", 8
-    ),
-    # Candidate index scores: skip key tiles past each compacted union (their
-    # DMA and compute) and limit top-k to the union. Exact. Read at trace time.
-    "TPU_DEEPSEEK_V41_CANDIDATE_SKIP": env_bool(
-        "TPU_DEEPSEEK_V41_CANDIDATE_SKIP", default=True
-    ),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # Keep the staged block tables on device between steps and upload only

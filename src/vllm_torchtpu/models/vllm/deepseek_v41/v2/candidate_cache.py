@@ -48,9 +48,7 @@ def prepare_candidate_cache_jax(
     groups = records.shape[0]
     key_shape = (groups, capacity // 2 if packed else capacity, 128)
     key_dtype = jnp.int32 if packed else jnp.bfloat16
-    if (groups <= 1 and records.shape[1] <= 131072) or candidates.shape[
-        0
-    ] != groups * 6:
+    if candidates.shape[0] % groups or not 1 <= candidates.shape[0] // groups <= 8:
         # These shapes are concrete in JAX lowering, unlike Dynamo token rows.
         return (
             jnp.zeros(key_shape, key_dtype),
@@ -171,7 +169,7 @@ def select_candidate_cache_jax(
             halfplane=halfplane,
         )[0]
 
-    if (groups <= 1 and records.shape[1] <= 131072) or q.shape[0] != groups * 6:
+    if q.shape[0] % groups or not 1 <= queries <= 8:
         return fallback()
 
     # Preserve the old batch-wide short-context bypass. The fallback retains

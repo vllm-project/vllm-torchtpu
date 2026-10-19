@@ -63,9 +63,9 @@ def test_decode_tuning_rejects_empty_batch():
         ("TPU7x", (48, 6, 32, 128), 49152, 512, False, 8192),
         ("TPU7x", (48, 6, 32, 128), 49152, 512, True, 4096),
         ("other", (48, 6, 32, 128), 49152, 512, False, 4096),
-        ("TPU7x", (48, 5, 32, 128), 49152, 512, False, 8192),
-        ("TPU7x", (24, 6, 32, 128), 49152, 512, False, 8192),
-        ("TPU7x", (48, 6, 32, 128), 40960, 512, False, 8192),
+        ("TPU7x", (48, 5, 32, 128), 49152, 512, False, 4096),
+        ("TPU7x", (24, 6, 32, 128), 49152, 512, False, 4096),
+        ("TPU7x", (48, 6, 32, 128), 40960, 512, False, 4096),
         ("TPU7x", (24, 6, 32, 128), 12288, 512, False, 4096),
         ("TPU7x", (24, 6, 32, 128), 6144, 512, False, 2048),
         ("TPU7x", (48, 12, 32, 128), 49152, 512, False, 4096),
@@ -89,11 +89,11 @@ def test_candidate_c384_key_tile_retains_full_request_group():
 @pytest.mark.parametrize(
     "requests,queries,capacity,expected",
     [
-        (24, 6, 49152, 24),
-        (64, 6, 49152, 32),
-        (96, 6, 49152, 48),
-        (48, 6, 98304, 24),
-        (48, 3, 98304, 48),
+        (24, 6, 49152, 12),
+        (64, 6, 49152, 16),
+        (96, 6, 49152, 16),
+        (48, 6, 98304, 16),
+        (48, 3, 98304, 16),
         (7, 6, 49152, 7),
     ],
 )
@@ -121,15 +121,16 @@ def test_candidate_exact_tuning_precedes_default(monkeypatch):
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("key_tile,expected", [(None, 8192), (4096, 4096)])
-@pytest.mark.parametrize("requests,request_tile", [(48, 48), (24, 24), (64, 32)])
+@pytest.mark.parametrize("requests,request_tile", [(48, 48), (24, 12), (64, 16)])
 @pytest.mark.parametrize("halfplane", [False, True])
-@pytest.mark.parametrize("flat", [0, 8])
 def test_candidate_indexer_default_dispatch_uses_measured_tiles(
-    monkeypatch, key_tile, expected, requests, request_tile, halfplane, flat
+    monkeypatch, key_tile, expected, requests, request_tile, halfplane
 ):
     from vllm_torchtpu.kernels.deepseek_v41.index_selection import candidate
 
     calls = []
+    if requests != 48 and key_tile is None:
+        expected = 4096
     expected_halfplane = halfplane
 
     def score(
@@ -150,18 +151,17 @@ def test_candidate_indexer_default_dispatch_uses_measured_tiles(
         return jnp.zeros((*q.shape[:2], ids.shape[1] * block_size), jnp.float32)
 
     def score_flat(*args, group_tile, **kwargs):
-        assert group_tile == flat
+        assert group_tile == (8 if request_tile % 8 == 0 else 1)
         return score(*args, **kwargs).reshape(-1, args[3].shape[1] * 8)
 
-    # The switch is read at trace time: drop traces of the other setting.
-    monkeypatch.setenv("TPU_DEEPSEEK_V41_CANDIDATE_FLAT", str(flat))
+    # Each case must resolve the production configuration before tracing.
     candidate.candidate_indexer.clear_cache()
     monkeypatch.setattr(jax, "devices", lambda: [Mock(device_kind="TPU7x")])
     monkeypatch.setattr(candidate, "candidate_scores", score)
     monkeypatch.setattr(
         candidate,
         "candidate_scores_flat",
-        score_flat if flat else Mock(side_effect=AssertionError("flat")),
+        score_flat,
     )
     monkeypatch.setattr(
         candidate.decode,
@@ -205,19 +205,15 @@ def test_packed_candidate_tuning_distinguishes_halfplane(
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize("flat", [0, 8])
-@pytest.mark.parametrize("skip", [False, True])
 @pytest.mark.parametrize(
     "halfplane,expected_key,expected_request", [(False, 4096, 16), (True, 8192, 48)]
 )
 def test_packed_candidate_default_dispatch_preserves_measured_group(
-    monkeypatch, halfplane, expected_key, expected_request, flat, skip
+    monkeypatch, halfplane, expected_key, expected_request
 ):
     from vllm_torchtpu.kernels.deepseek_v41.index_selection import candidate
 
-    monkeypatch.setenv("TPU_DEEPSEEK_V41_CANDIDATE_FLAT", str(flat))
-    monkeypatch.setenv("TPU_DEEPSEEK_V41_CANDIDATE_SKIP", str(int(skip)))
-    expected_skip = skip
+    expected_skip = True
     calls = []
     monkeypatch.setattr(tuning, "logger", Mock())
     monkeypatch.setattr(jax, "devices", lambda: [Mock(device_kind="TPU7x")])
@@ -238,9 +234,9 @@ def test_packed_candidate_default_dispatch_preserves_measured_group(
     ):
         assert keys.dtype == jnp.int32
         assert skip is expected_skip
-        assert group_tile == (flat or None)
+        assert group_tile == 8
         calls.append((q.shape[0], key_tile))
-        rows = (q.shape[0] * q.shape[1],) if flat else q.shape[:2]
+        rows = (q.shape[0] * q.shape[1],)
         return jnp.zeros((*rows, ids.shape[1] * block_size), jnp.float32)
 
     candidate.candidate_indexer.clear_cache()
@@ -267,3 +263,14 @@ def test_packed_candidate_default_dispatch_preserves_measured_group(
     )
     assert result.shape == (288, 512)
     assert calls and all(x == (expected_request, expected_key) for x in calls)
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("requests", [1, 2, 3, 4, 7, 8, 16, 24, 48, 64, 97])
+@pytest.mark.parametrize("queries", [1, 2, 3, 5, 6, 7, 8])
+def test_candidate_basic_group_covers_whole_requests_without_padding(requests, queries):
+    group = tuning.get_candidate_score_group(requests, queries)
+    assert requests % group == 0
+    assert group == 1 or group * queries % 8 == 0
+    if requests == 48 and queries == 6:
+        assert group == 8
