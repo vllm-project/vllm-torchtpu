@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-| <a href="docs/README.md"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://discuss.vllm.ai/c/hardware-support/google-tpu-support/27"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> (#sig-tpu) |
+| <a href="https://vllm-torchtpu.readthedocs.io/en/latest/"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://discuss.vllm.ai/c/hardware-support/google-tpu-support/27"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> (#sig-tpu) |
 </p>
 
 ---
@@ -34,7 +34,7 @@ The goal is simple: **the same vLLM you already use — same CLI, same OpenAI-co
 | **TPU v7x (Ironwood)** | Recommended — validated in CI on every pull request and nightly |
 | TPU v6e / v5e / v5p | Experimental — not covered by CI |
 
-See [Cloud TPU Setup](docs/getting_started/tpu_setup.md) for project setup, quota, and provisioning commands.
+See [Cloud TPU Setup](https://vllm-torchtpu.readthedocs.io/en/latest/getting_started/tpu_setup/) for project setup, quota, and provisioning commands.
 
 <br>
 
@@ -50,7 +50,7 @@ pip install \
   vllm-torchtpu
 ```
 
-For `uv`, editable source installs, cross-repo development against a local `vllm` checkout, and Docker images, see the full [Installation guide](docs/getting_started/installation.md) and [Docker guide](docs/getting_started/docker.md).
+For `uv`, editable source installs, cross-repo development against a local `vllm` checkout, and Docker images, see the full [Installation guide](https://vllm-torchtpu.readthedocs.io/en/latest/getting_started/installation/) and [Docker guide](https://vllm-torchtpu.readthedocs.io/en/latest/getting_started/docker/).
 
 ### Serve a model
 
@@ -85,9 +85,9 @@ curl http://localhost:8000/v1/chat/completions \
 ```
 
 > [!TIP]
-> The first startup compiles TPU graphs for the configured shapes and can take several minutes. Set `VLLM_XLA_CACHE_PATH` to persist compiled artifacts across restarts — see [Compilation & Warmup Cache](docs/user_guide/compilation_cache.md).
+> The first startup compiles TPU graphs for the configured shapes and can take several minutes. Set `VLLM_XLA_CACHE_PATH` to persist compiled artifacts across restarts — see [Compilation & Warmup Cache](https://vllm-torchtpu.readthedocs.io/en/latest/user_guide/compilation_cache/).
 
-The [Quickstart](docs/getting_started/quickstart.md) covers offline batch inference with `vllm.LLM`, multi-device serving with TP/EP, and multimodal examples.
+The [Quickstart](https://vllm-torchtpu.readthedocs.io/en/latest/getting_started/quickstart/) covers offline batch inference with `vllm.LLM`, multi-device serving with TP/EP, and multimodal examples.
 
 <br>
 
@@ -95,18 +95,18 @@ The [Quickstart](docs/getting_started/quickstart.md) covers offline batch infere
 
 `vllm-torchtpu` can serve most PyTorch models supported by vLLM, with first-class TPU kernel, quantization, and parallelism support for Qwen3 / Qwen3.5, DeepSeek-V3 / R1 / V4, Kimi-K2.5 / K3, GLM-5, Llama 3 / 4, GPT-OSS, Gemma 3 / 4, Mixtral, Qwen-VL and Gemma VL families, and diffusion models via `vllm-omni`.
 
-- **[Supported Models & Features](docs/user_guide/supported_models.md)** — validated model families, feature status, and quantization formats.
+- **[Supported Models & Features](https://vllm-torchtpu.readthedocs.io/en/latest/user_guide/supported_models/)** — validated model families, feature status, and quantization formats.
 - **[Nightly support matrices](support_matrices/nightly/)** — TPU v7x unit, correctness, and benchmark status, updated automatically from nightly CI.
 
 <br>
 
 ## Recipes and deployment
 
-- [TPU v7x (Ironwood) serving recipes](docs/deployment/v7x_recipes.md)
-- [TPU v6e (Trillium) serving recipes](docs/deployment/v6e_recipes.md)
-- [Kubernetes deployment](docs/deployment/kubernetes.md)
-- [Multi-host serving](docs/user_guide/multihost.md) · [Parallelism & scaling](docs/user_guide/parallelism.md) · [Disaggregated serving (P/D)](docs/user_guide/disaggregated_serving.md)
-- [Quantization](docs/user_guide/quantization.md) · [Speculative decoding](docs/user_guide/speculative_decoding.md)
+- [TPU v7x (Ironwood) serving recipes](https://vllm-torchtpu.readthedocs.io/en/latest/deployment/v7x_recipes/)
+- [TPU v6e (Trillium) serving recipes](https://vllm-torchtpu.readthedocs.io/en/latest/deployment/v6e_recipes/)
+- [Kubernetes deployment](https://vllm-torchtpu.readthedocs.io/en/latest/deployment/kubernetes/)
+- [Multi-host serving](https://vllm-torchtpu.readthedocs.io/en/latest/user_guide/multihost/) · [Parallelism & scaling](https://vllm-torchtpu.readthedocs.io/en/latest/user_guide/parallelism/) · [Disaggregated serving (P/D)](https://vllm-torchtpu.readthedocs.io/en/latest/user_guide/disaggregated_serving/)
+- [Quantization](https://vllm-torchtpu.readthedocs.io/en/latest/user_guide/quantization/) · [Speculative decoding](https://vllm-torchtpu.readthedocs.io/en/latest/user_guide/speculative_decoding/)
 
 <br>
 
@@ -118,7 +118,7 @@ We welcome contributions of all kinds — bug reports, model and feature request
 - **👀 Review pull requests:** help us keep quality high by reviewing [open PRs](https://github.com/vllm-project/vllm-torchtpu/pulls).
 - **💻 Write code:** start with the **[Contributing Guide](CONTRIBUTING.md)**, which covers environment setup, DCO sign-off, the `ready`-label CI gate, and the PR lifecycle. [Good first issues](https://github.com/vllm-project/vllm-torchtpu/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are a great place to begin.
 
-Developer references: [Testing & CI](docs/developers_guide/testing_and_ci.md) · [Profiling](docs/developers_guide/profiling/index.md) · [Benchmarking](docs/developers_guide/benchmarking.md) · [Coding guidance](docs/developers_guide/coding_guidance.md) · [Optimization best practices](docs/developers_guide/optimization_best_practices.md)
+Developer references: [Testing & CI](https://vllm-torchtpu.readthedocs.io/en/latest/developers_guide/testing_and_ci/) · [Profiling](https://vllm-torchtpu.readthedocs.io/en/latest/developers_guide/profiling/) · [Benchmarking](https://vllm-torchtpu.readthedocs.io/en/latest/developers_guide/benchmarking/) · [Coding guidance](https://vllm-torchtpu.readthedocs.io/en/latest/developers_guide/coding_guidance/) · [Optimization best practices](https://vllm-torchtpu.readthedocs.io/en/latest/developers_guide/optimization_best_practices/)
 
 <br>
 
