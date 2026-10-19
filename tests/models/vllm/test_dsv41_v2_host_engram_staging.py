@@ -1127,6 +1127,8 @@ class TestDeepseekV41ForCausalLMInit:
             )
 
             vllm_config = SimpleNamespace(
+                additional_config={},
+                engram_config=None,
                 parallel_config=SimpleNamespace(
                     pipeline_parallel_size=1,
                     data_parallel_size=1,
@@ -1158,6 +1160,8 @@ class TestDeepseekV41ForCausalLMInit:
             )
 
             vllm_config = SimpleNamespace(
+                additional_config={},
+                engram_config=None,
                 parallel_config=SimpleNamespace(
                     pipeline_parallel_size=1,
                     data_parallel_size=1,

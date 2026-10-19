@@ -5,7 +5,7 @@ from dataclasses import dataclass, replace
 import torch
 from vllm.distributed import get_dp_group
 
-from vllm_torchtpu import envs
+from ..config import DeepseekV41Config, ExecutionMode
 
 
 def prefix_replay_enabled(vllm_config) -> bool:
@@ -18,7 +18,7 @@ def prefix_replay_enabled(vllm_config) -> bool:
     cache_config = getattr(vllm_config, "cache_config", None)
     parallel_config = getattr(vllm_config, "parallel_config", None)
     return bool(
-        envs.TPU_DEEPSEEK_V41_CED
+        (DeepseekV41Config.from_vllm_config(vllm_config).execution == ExecutionMode.CED)
         and getattr(cache_config, "enable_prefix_caching", False)
         and getattr(cache_config, "swa_bounded_replay", False)
         and getattr(parallel_config, "prefill_context_parallel_size", 1) == 1

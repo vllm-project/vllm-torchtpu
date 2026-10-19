@@ -587,6 +587,8 @@ def test_uses_fp8_rope_companion_architectures():
     """Verify uses_fp8_rope_companion covers all architecture and dtype branches."""
     # Architecture matches with fp8 cache
     cfg_match = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["DeepseekV41ForCausalLM"])
         ),
@@ -596,6 +598,8 @@ def test_uses_fp8_rope_companion_architectures():
 
     # Architecture matches but cache_dtype is not fp8
     cfg_non_fp8 = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["DeepseekV41ForCausalLM"])
         ),
@@ -605,6 +609,8 @@ def test_uses_fp8_rope_companion_architectures():
 
     # Architecture does not match
     cfg_diff = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
         ),
@@ -614,6 +620,8 @@ def test_uses_fp8_rope_companion_architectures():
 
     # Architectures is empty
     cfg_empty = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         model_config=SimpleNamespace(hf_config=SimpleNamespace(architectures=[])),
         cache_config=SimpleNamespace(cache_dtype="fp8"),
     )
@@ -621,6 +629,8 @@ def test_uses_fp8_rope_companion_architectures():
 
     # Architectures is None (exercises `or []` branch)
     cfg_none = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         model_config=SimpleNamespace(hf_config=SimpleNamespace(architectures=None)),
         cache_config=SimpleNamespace(cache_dtype="fp8"),
     )
@@ -630,6 +640,8 @@ def test_uses_fp8_rope_companion_architectures():
 def test_reserve_rope_companion_capping():
     """Verify reserve_rope_companion non-V41 bypass and 16 GiB cap."""
     cfg_non_v41 = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["LlamaForCausalLM"])
         ),
@@ -638,6 +650,8 @@ def test_reserve_rope_companion_capping():
     assert reserve_rope_companion(cfg_non_v41, 20 << 30) == 20 << 30
 
     cfg_v41 = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["DeepseekV41ForCausalLM"])
         ),

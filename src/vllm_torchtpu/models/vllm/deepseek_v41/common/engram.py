@@ -23,6 +23,7 @@ from vllm_torchtpu.layers.adapter.upstream_bindings import (
 )
 from vllm_torchtpu.model_loader_patches import register_row_slice
 
+from ..config import engram_cpu_offload
 from .host_exchange import PendingRowExchange, start_exchange_rows
 
 
@@ -383,11 +384,14 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         # Upstream's own `cpu_offload` means a pinned table read through UVA
         # (CUDA only) and it resets the attribute in `__init__`; keep it False
         # and track the TPU host table separately.
-        self.host_offload = (
-            bool(envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD)
-            if cpu_offload is None
-            else bool(cpu_offload)
-        )
+        if cpu_offload is None:
+            config = get_current_vllm_config_or_none()
+            cpu_offload = (
+                engram_cpu_offload(config)
+                if config is not None
+                else envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD
+            )
+        self.host_offload = bool(cpu_offload)
         # Co-located DP replicas map one host table from /dev/shm and each
         # looks up only its own tokens, so heads stay TP-sharded only.
         self.tpu_dp_shared_memory = bool(dp_shared_memory)

@@ -576,6 +576,8 @@ def _make_dspark_vllm_config(
         else None
     )
     return SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         speculative_config=SimpleNamespace(
             method="dspark",
             num_speculative_tokens=num_speculative_tokens,
@@ -589,6 +591,8 @@ def _make_dspark_vllm_config(
 
 def _patch_dspark_env(monkeypatch: pytest.MonkeyPatch):
     fake_cur_cfg = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         model_config=SimpleNamespace(
             max_logprobs=20, logits_processor_pattern=None, head_dtype=None
         ),
@@ -1195,6 +1199,8 @@ def test_v2_model_dspark_coverage(monkeypatch: pytest.MonkeyPatch):
     model_obj.end_layer = 4
     model_obj.config = SimpleNamespace(hidden_size=4)
     vllm_cfg_no_spec = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         speculative_config=None,
         parallel_config=SimpleNamespace(tensor_parallel_size=1),
         compilation_config=SimpleNamespace(compile_sizes=[]),
@@ -1208,6 +1214,8 @@ def test_v2_model_dspark_coverage(monkeypatch: pytest.MonkeyPatch):
 
     # mtp preserves buffer
     vllm_cfg_mtp = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         speculative_config=SimpleNamespace(method="mtp"),
         parallel_config=SimpleNamespace(tensor_parallel_size=1),
         compilation_config=SimpleNamespace(compile_sizes=[]),
@@ -1226,6 +1234,8 @@ def test_v2_model_dspark_coverage(monkeypatch: pytest.MonkeyPatch):
     causal_obj = object.__new__(v2_model.DeepseekV41ForCausalLM)
     causal_obj.config = SimpleNamespace(expert_dtype="fp4")
     base_cfg = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         parallel_config=SimpleNamespace(pipeline_parallel_size=1, data_parallel_size=1),
         scheduler_config=SimpleNamespace(async_scheduling=False),
         model_config=SimpleNamespace(hf_config=SimpleNamespace()),

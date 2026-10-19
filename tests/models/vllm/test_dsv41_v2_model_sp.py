@@ -12,6 +12,7 @@ import pytest
 import torch
 from vllm.compilation.decorators import CompilationMode
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.models.vllm.deepseek_v41.common import mhc as v2_mhc
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import model as v2_model
 
@@ -87,7 +88,7 @@ def test_mhc_flat_pre_sums_kernel_execution():
     ("upstream_sp", "env_sp", "pp", "ep", "tp", "expected"),
     [
         (True, False, 1, False, 1, True),
-        (False, True, 1, True, 4, True),
+        (False, True, 1, True, 4, False),
         (False, False, 1, True, 4, False),
         (False, True, 2, True, 4, False),
         (False, True, 1, False, 4, False),
@@ -106,13 +107,15 @@ def test_use_sequence_parallel(
     monkeypatch.setattr(
         v2_model, "_upstream_use_sequence_parallel", lambda _: upstream_sp
     )
-    monkeypatch.setattr(v2_model.envs, "TPU_DEEPSEEK_V41_SP", env_sp)
+    monkeypatch.setenv("TPU_DEEPSEEK_V41_SP", str(int(env_sp)))
     vllm_config = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         parallel_config=SimpleNamespace(
             pipeline_parallel_size=pp,
             enable_expert_parallel=ep,
             tensor_parallel_size=tp,
-        )
+        ),
     )
     assert v2_model._use_sequence_parallel(vllm_config) is expected
 
@@ -126,9 +129,11 @@ def test_decoder_layer_init_branching(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(v2_model.upstream.DeepseekV4DecoderLayer, "__init__", fake_init)
     monkeypatch.setattr(v2_model.upstream, "_use_sequence_parallel", lambda _: True)
-    monkeypatch.setattr(v2_model.envs, "TPU_DEEPSEEK_V41_CED", True)
+    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_CED", True)
 
     vllm_config = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         model_config=SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=4)),
         cache_config=SimpleNamespace(enable_prefix_caching=False),
     )
@@ -911,6 +916,8 @@ def test_model_init_validation_and_ced_setup(monkeypatch: pytest.MonkeyPatch):
     # 1. SP validation: compile_sizes < 2 * tp
     monkeypatch.setattr(v2_model, "_use_sequence_parallel", lambda _: True)
     vllm_cfg = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         parallel_config=SimpleNamespace(
             tensor_parallel_size=4, prefill_context_parallel_size=1
         ),
@@ -926,7 +933,7 @@ def test_model_init_validation_and_ced_setup(monkeypatch: pytest.MonkeyPatch):
     # 2. CED with prefix caching -> warning and disables CED
     vllm_cfg.compilation_config.compile_sizes = [16]
     vllm_cfg.cache_config.enable_prefix_caching = True
-    monkeypatch.setattr(v2_model.envs, "TPU_DEEPSEEK_V41_CED", True)
+    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_CED", True)
     m = v2_model.DeepseekV41Model(vllm_config=vllm_cfg)
     assert m._ced_enabled is False
 
@@ -1007,6 +1014,8 @@ def test_deepseek_v41_causal_lm(monkeypatch: pytest.MonkeyPatch):
     )
 
     vllm_cfg = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         parallel_config=SimpleNamespace(pipeline_parallel_size=1, data_parallel_size=1),
         speculative_config=None,
         scheduler_config=SimpleNamespace(async_scheduling=True),
@@ -1069,9 +1078,6 @@ def test_select_engram_split_layer(monkeypatch: pytest.MonkeyPatch):
         + [layer(None)] * 3,
     )
     select = v2_model.DeepseekV41Model._select_engram_split_layer
-    monkeypatch.setattr(v2_model.envs, "TPU_DEEPSEEK_V41_ENGRAM_SPLIT", False)
-    assert select(model) is None
-    monkeypatch.setattr(v2_model.envs, "TPU_DEEPSEEK_V41_ENGRAM_SPLIT", True)
     # The last host-offloaded Engram layer before the CED boundary.
     assert select(model) == 4
     # Sequence parallel shards encoder rows only at TP > 1.

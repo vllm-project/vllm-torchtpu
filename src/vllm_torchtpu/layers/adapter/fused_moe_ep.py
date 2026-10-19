@@ -42,6 +42,7 @@ even at decode. The 35B proxy predicts the opposite (TPOT +3.9%), which is the
 usual story for anything that scales with hidden size.
 """
 
+from enum import StrEnum
 from typing import Any
 
 import jax
@@ -66,6 +67,12 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+class FusedEPPolicy(StrEnum):
+    LEGACY = "legacy"
+    REQUIRED = "required"
+
 
 # The tile height the kernel slabs rows into, and the unit its ragged stride
 # rounds to. The kernel's routing tables are built against this value, so it
@@ -482,6 +489,7 @@ def prebuild_fused_moe_ep(
     rhs_qb=None,
     weights=None,
     supplies_hash_ids=False,
+    policy: FusedEPPolicy = FusedEPPolicy.LEGACY,
 ) -> Any | None:
     """Resolve the mesh and build the fused-EP op for one layer.
 
@@ -507,10 +515,11 @@ def prebuild_fused_moe_ep(
     The caller must validate the actual prepared tensors before installing
     them; the built op closes over configuration, never these tensors.
     """
-    if not envs.USE_MOE_FUSED_EP_KERNEL:
-        return None
-    if weight_format == "fp4" and not envs.MOE_FUSED_EP_ENABLE_W4A8:
-        return None
+    if policy == FusedEPPolicy.LEGACY:
+        if not envs.USE_MOE_FUSED_EP_KERNEL:
+            return None
+        if weight_format == "fp4" and not envs.MOE_FUSED_EP_ENABLE_W4A8:
+            return None
 
     # The experts have to actually be expert-parallel. vLLM builds an EP group
     # for every MoE model whether or not `--enable-expert-parallel` was passed
@@ -594,7 +603,10 @@ def prebuild_fused_moe_ep(
     # the threshold never builds the op at all; one above it uses the kernel
     # for every step, decode included.
     max_node_tokens = _max_node_tokens(ep, pcp)
-    if max_node_tokens < envs.MOE_FUSED_EP_KERNEL_MIN_TOKENS:
+    if (
+        policy == FusedEPPolicy.LEGACY
+        and max_node_tokens < envs.MOE_FUSED_EP_KERNEL_MIN_TOKENS
+    ):
         logger.info_once(
             "Fused EP MoE not engaged: the largest node-wide batch is %d "
             "tokens, below MOE_FUSED_EP_KERNEL_MIN_TOKENS=%d.",
@@ -635,7 +647,7 @@ def prebuild_fused_moe_ep(
         logger.warning_once("Fused EP MoE not engaged: %s", reason)
         return None
 
-    sharded_plan = envs.MOE_FUSED_EP_V2_SHARDED_PLAN
+    sharded_plan = policy == FusedEPPolicy.REQUIRED or envs.MOE_FUSED_EP_V2_SHARDED_PLAN
     token_replica_groups = ep_token_replica_groups(
         is_sequence_parallel=layer.moe_config.moe_parallel_config.is_sequence_parallel
     )

@@ -6,6 +6,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.models.vllm.deepseek_v41.common import engram as v2_engram
 
 
@@ -74,9 +75,11 @@ def test_ced_decoder_layer_disables_sequence_parallel_past_boundary(monkeypatch)
         v2_model.upstream.DeepseekV4DecoderLayer, "__init__", fake_super_init
     )
     monkeypatch.setattr(v2_model.upstream, "_use_sequence_parallel", lambda _: True)
-    monkeypatch.setattr(v2_model.envs, "TPU_DEEPSEEK_V41_CED", True)
+    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_CED", True)
 
     vllm_config = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         model_config=SimpleNamespace(hf_config=SimpleNamespace(num_hidden_layers=4)),
         cache_config=SimpleNamespace(enable_prefix_caching=False),
     )

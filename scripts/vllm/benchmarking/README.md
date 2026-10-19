@@ -137,7 +137,7 @@ entry of that config, writing `<results-dir>/decode/sweep.md`:
 
 ```bash
 ./scripts/vllm/benchmarking/run_decode_benchmark.sh \
-  --config deepseek-v41-flash-tp8-ep-100k-decode --results-dir <DIR>
+  --config <model-config> --results-dir <DIR>
 ```
 
 ### DP8 cached-extend and steady DSpark decode CI

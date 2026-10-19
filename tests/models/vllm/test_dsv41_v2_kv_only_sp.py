@@ -25,7 +25,6 @@ import torch
 from jax.sharding import Mesh
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention as v2_attn
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import PagedCacheRows
@@ -99,7 +98,6 @@ def _setup_mock_attn(
     attn.wq_b = SimpleNamespace(weight=wq, weight_scale=torch.ones(512))
     attn.wo_a = SimpleNamespace(weight=wo, weight_scale=torch.ones(1024))
 
-    monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_LOCAL_Q", True)
     monkeypatch.setattr(
         v2_attn, "get_tensor_model_parallel_world_size", lambda: tp_size
     )
@@ -572,11 +570,11 @@ class TestInitLocalQWeightsCedDecoderAndCompressRatio:
         assert hasattr(attn, "_wo_a_full_scale")
         assert attn._local_q_attn is True
 
-    def test_env_flag_disabled_skips_allocation(self, monkeypatch: pytest.MonkeyPatch):
+    def test_non_token_parallel_skips_allocation(self, monkeypatch: pytest.MonkeyPatch):
         attn = _setup_mock_attn(
             monkeypatch, ced_decoder=False, fp8_kv=True, compress_ratio=4
         )
-        monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_LOCAL_Q", False)
+        attn._token_parallel_attn = False
         v2_attn.DeepseekV41Attention._init_local_q_weights(attn)
         assert not hasattr(attn, "_wq_b_full")
 

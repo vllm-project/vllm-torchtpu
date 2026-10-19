@@ -116,6 +116,8 @@ def test_replayed_marks_only_the_hit_window():
 def test_prefix_replay_enabled(monkeypatch, ced, caching, bounded, pcp, expected):
     monkeypatch.setattr(envs, "TPU_DEEPSEEK_V41_CED", ced, raising=False)
     config = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         cache_config=SimpleNamespace(
             enable_prefix_caching=caching, swa_bounded_replay=bounded
         ),

@@ -33,85 +33,56 @@ steps:
         tests/scripts/test_dsv41_check_summary.py
         tests/scripts/test_dsv41_decode_worker_capture.py
         tests/scripts/test_dsv41_decode_accounting.py
+        tests/scripts/test_dsv41_serve_recipe.py
         -q --junitxml=/perf_eval_results/dsv41-benchmark-cpu.xml
+    artifact_paths:
+      - "perf_eval_results/**/*"
+
+  - label: "DeepSeek-V4.1 index configuration: CPU contracts"
+    key: "dsv41_kernel_config_cpu"
+    depends_on: "build_docker"
+    timeout_in_minutes: 15
+    agents:
+      queue: "cpu_64_core"
+    env:
+      CPU_ONLY: "1"
+    commands:
+      - >-
+        bash .buildkite/scripts/run_in_docker.sh
+        python -m pytest
+        tests/models/vllm/test_dsv41_config.py
+        tests/models/vllm/test_dsv41_v2_model_full.py
+        tests/models/vllm/test_dsv41_v2_model_sp.py
+        tests/models/vllm/test_dsv41_v2_local_q.py
+        tests/models/vllm/test_dsv41_v2_prefix_replay.py
+        tests/layers/adapter/test_fused_moe_ep.py
+        tests/kernels/test_dsv41_decode_tuning.py
+        tests/kernels/test_dsv41_decode_index_scores.py
+        tests/models/vllm/test_dsv41_decode_indexer_route.py
+        -q --junitxml=/perf_eval_results/dsv41-kernel-config.xml
     artifact_paths:
       - "perf_eval_results/**/*"
 
   - group: "DeepSeek-V4.1-Flash on TPU"
     depends_on: "build_docker"
     steps:
-      - label: "DeepSeek-V4.1-Flash: smoke + GSM8K (TPU v7x-8)"
-        key: "dsv41_flash_tp8_ep_gsm8k"
-        # ~475 GiB of weights streamed from GCS plus compile before the first
-        # request; the eval itself is a few minutes.
+      - label: "DeepSeek-V4.1-Flash: DP8 full-forward smoke + GSM8K"
+        key: "dsv41_flash_dp8_ep_gsm8k"
         timeout_in_minutes: 180
         agents:
           queue: "tpu_v7x_8_queue"
         env:
+          CONTAINER_SHM_SIZE: "256g"
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
         commands:
-          # The checkpoint does not fit a tpu7x-8 agent's disk, so it is not
-          # staged with stage_model_snapshot.sh. A gs:// MODEL_URI makes
-          # run_benchmarks.sh serve with --load-format runai_streamer, which
-          # needs storage.buckets.get on the bucket as well as object reads
-          # (see the glm52-fp4-offload step on main). The CI agent SAs hold
-          # roles/storage.bucketViewer and roles/storage.objectViewer on
-          # gs://wdhongtw-hf-flat, a flat copy of the HF repo at revision
-          # 2cba9e4.
-          #
-          # The config's benchmark (2 prompts, 128 in / 16 out) is the smoke
-          # test; GSM8K (first 100 examples) is gated against
-          # baselines/eval/deepseek-v41-flash-tp8-ep.gsm8k.baseline.json.
-          #
-          # The sizes below replace the config's 1M-context defaults with the
-          # launch verified on CDK (GSM8K 196/200), which also keeps compile
-          # to two graph sizes. GSM8K prompts fit well within 4096 tokens.
           - >-
             bash .buildkite/scripts/run_in_docker.sh
             env MODEL_URI=gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
-            EXTRA_SERVE_ARGS=--language-model-only
-            MAX_MODEL_LEN=4096
-            MAX_NUM_BATCHED_TOKENS=128
-            DEEPSEEK_V41_COMPILE_SIZES='[8,128]'
-            GPU_MEMORY_UTILIZATION=0.75
-            TPU_DEEPSEEK_V41_CED=0
             bash ./scripts/vllm/benchmarking/run_eval_flow.sh
-            --config deepseek-v41-flash-tp8-ep
-            --run-lm-eval
-            --results-dir /perf_eval_results/deepseek-v41-flash-tp8-ep
-        artifact_paths:
-          - "perf_eval_results/**/*"
-
-      - label: "DeepSeek-V4.1-Flash: 100k decode benchmark (TPU v7x-8)"
-        key: "dsv41_flash_tp8_ep_100k_decode"
-        # Same weight streaming and startup as the GSM8K step, then ~10 min of
-        # measurement: a warmup and one round at each of C4, C8 and C16.
-        timeout_in_minutes: 180
-        agents:
-          queue: "tpu_v7x_8_queue"
-        env:
-          TPU_ACCELERATOR_TYPE: "tpu7x"
-          VLLM_ENGINE_READY_TIMEOUT_S: "7200"
-        commands:
-          # Weights stream from gs://wdhongtw-hf-flat as in the GSM8K step.
-          #
-          # Each request has a distinct 100k-token prompt and decodes 2048
-          # tokens; throughput and TPOT are measured over the interval where
-          # all requests decode together (see bench_decode_sliding_window.py).
-          # The step fails only on a failed request or a round without a valid
-          # measurement window; the numbers are published as artifacts
-          # (decode/sweep.md and decode/*/summary.md) and not yet gated.
-          # Before #1608 the config ran with BF16 KV (kv-cache-dtype auto);
-          # it runs with FP8 KV since, so compare only runs after that change.
-          # Throughput also depends on the CI agent pool.
-          - >-
-            bash .buildkite/scripts/run_in_docker.sh
-            env MODEL_URI=gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
-            EXTRA_SERVE_ARGS=--language-model-only
-            bash ./scripts/vllm/benchmarking/run_decode_benchmark.sh
-            --config deepseek-v41-flash-tp8-ep-100k-decode
-            --results-dir /perf_eval_results/deepseek-v41-flash-tp8-ep-100k-decode
+            --config deepseek-v41-flash-dp8-ep
+            --run-lm-eval --skip-perf-check
+            --results-dir /perf_eval_results/deepseek-v41-flash-dp8-ep
         artifact_paths:
           - "perf_eval_results/**/*"
 
@@ -128,12 +99,12 @@ steps:
         agents:
           queue: "tpu_v7x_8_queue"
         env:
+          CONTAINER_SHM_SIZE: "256g"
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
         commands:
           - >-
             bash .buildkite/scripts/run_in_docker.sh
-            env TPU_DEEPSEEK_V41_INDEX_KEY_LAYOUT=halfplane
             bash .buildkite/scripts/run_dsv41_dp8_benchmark.sh
             decode
             gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash
@@ -154,12 +125,12 @@ steps:
         agents:
           queue: "tpu_v7x_8_queue"
         env:
+          CONTAINER_SHM_SIZE: "256g"
           TPU_ACCELERATOR_TYPE: "tpu7x"
           VLLM_ENGINE_READY_TIMEOUT_S: "7200"
         commands:
           - >-
             bash .buildkite/scripts/run_in_docker.sh
-            env TPU_DEEPSEEK_V41_INDEX_KEY_LAYOUT=halfplane
             bash .buildkite/scripts/run_dsv41_dp8_benchmark.sh
             encoder_extend
             gs://wdhongtw-hf-flat/deepseek-ai/DeepSeek-V4.1-Flash

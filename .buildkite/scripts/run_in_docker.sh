@@ -131,7 +131,7 @@ if [[ "${CPU_ONLY:-0}" == "1" ]]; then
 fi
 
 echo "--- Running command in Docker container"
-docker run --rm --name "${CONTAINER_NAME}" "${DEVICE_ARGS[@]}" --net=host --shm-size=64g \
+docker run --rm --name "${CONTAINER_NAME}" "${DEVICE_ARGS[@]}" --net=host --shm-size="${CONTAINER_SHM_SIZE:-64g}" \
   -w /root/torchtpu-vllm \
   -v "${HOST_CACHE_ROOT}/models:/local_hf_cache" \
   -v "${HOST_CACHE_ROOT}/perf_eval_results:/perf_eval_results" \

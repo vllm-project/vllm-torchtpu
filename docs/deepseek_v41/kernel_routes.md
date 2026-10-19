@@ -47,10 +47,12 @@ production route:
 | `INDEX_SCORES_2D` | Derived from request/query alignment |
 | `CANDIDATE_FLAT` | Eight-request measured group or one-request basic config |
 | `CANDIDATE_SKIP` | Skip empty union tails |
+| `SP` | Upstream topology policy; no TP-only opt-in |
+| `LOCAL_Q` | Actual token-parallel attention and supported weights |
+| `ENGRAM_SPLIT` | Host Engram placement and unsharded encoder rows |
 
-CED, Engram offload/split, sequence parallelism and MoE admission options remain
-separate deployment capabilities. Their contracts are not replaced by score
-tuning. Native attention for unsupported CSA2 inputs, pure SWA, two-bank cache
+CED and host placement remain explicit choices in the
+[serving policy](README.md#serving-configuration). Native attention for unsupported CSA2 inputs, pure SWA, two-bank cache
 addressing, short-context all-indices selection and candidate overflow handling
 are functional paths, not redundant implementations.
 

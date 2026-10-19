@@ -1,5 +1,7 @@
 """V4.1 model bindings for the shared DeepSeek V4 TPU quantization path."""
 
+from typing import TYPE_CHECKING
+
 from vllm.distributed.parallel_state import get_ep_group
 from vllm.model_executor.layers.quantization import register_quantization_config
 from vllm.models.deepseek_v4.nvidia import model as v4_upstream
@@ -11,10 +13,32 @@ from vllm_torchtpu.layers.adapter.quantization.deepseek_v4_fp8 import (
 from vllm_torchtpu.layers.adapter.upstream_bindings import device_hooks
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import DeepseekV4MLP
 
+if TYPE_CHECKING:
+    from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
+
+    from .mxfp4 import VllmDeepseekV4Mxfp4MoEMethod
+
 
 @register_quantization_config("tpu-deepseek_v41_fp8")
 class VllmDeepseekV41Fp8Config(VllmDeepseekV4Fp8Config):
     """Use V4 weight preparation, activation quantization and MoE dispatch."""
+
+    def create_mxfp4_moe_method(
+        self, moe_config: "FusedMoEConfig"
+    ) -> "VllmDeepseekV4Mxfp4MoEMethod":
+        from vllm.config import get_current_vllm_config
+
+        from vllm_torchtpu.models.vllm.deepseek_v41.config import (
+            DeepseekV41Config,
+            MoEBackend,
+        )
+
+        from .mxfp4 import VllmDeepseekV4Mxfp4MoEMethod
+
+        policy = DeepseekV41Config.from_vllm_config(get_current_vllm_config())
+        return VllmDeepseekV4Mxfp4MoEMethod(
+            moe_config, fused_ep=policy.moe == MoEBackend.FUSED_EP_W4A8
+        )
 
     @classmethod
     def get_name(cls):

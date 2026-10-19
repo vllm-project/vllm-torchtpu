@@ -608,6 +608,8 @@ def _make_dspark_vllm_config(
         else None
     )
     return SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         speculative_config=SimpleNamespace(
             method="dspark",
             num_speculative_tokens=num_speculative_tokens,
@@ -621,6 +623,8 @@ def _make_dspark_vllm_config(
 
 def _patch_dspark_env(monkeypatch: pytest.MonkeyPatch):
     fake_cur_cfg = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         model_config=SimpleNamespace(
             max_logprobs=20, logits_processor_pattern=None, head_dtype=None
         ),

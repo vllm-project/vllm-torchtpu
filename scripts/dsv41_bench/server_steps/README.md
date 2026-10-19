@@ -123,7 +123,8 @@ persistent compilation caches disabled and no profile: prefill runs one warmup
 plus five formal rounds; decode runs one warmup plus one formal round.
 They already avoid a second server start,
 so skipping the diagnostic prefill warmup does not speed up these CI cases.
-The TP8 GSM8K and 100K decode cases use other scripts and are unaffected.
+The quality lane uses `deepseek-v41-flash-dp8-ep` with full forward and
+the inherited GSM8K accuracy floor. TP8 serving recipes have been removed.
 
 The same lane runs these CPU regressions on PRs as well as branch builds; the
 expensive DP8 benchmarks remain branch-only:

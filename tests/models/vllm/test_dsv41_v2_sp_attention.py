@@ -35,6 +35,8 @@ def test_ced_config_combinations(monkeypatch, caplog):
 
     # 1. CED=1 and prefix caching disabled -> ced_enabled=True
     cfg1 = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         cache_config=SimpleNamespace(enable_prefix_caching=False),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(num_hidden_layers=40),
@@ -46,6 +48,8 @@ def test_ced_config_combinations(monkeypatch, caplog):
 
     # 2. CED=1 and prefix caching enabled with warn_prefix_caching=True
     cfg2 = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         cache_config=SimpleNamespace(enable_prefix_caching=True),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(num_hidden_layers=30),
@@ -59,6 +63,8 @@ def test_ced_config_combinations(monkeypatch, caplog):
 
     # 2b. With SWA bounded replay, CED keeps running alongside prefix caching.
     cfg2b = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         cache_config=SimpleNamespace(
             enable_prefix_caching=True, swa_bounded_replay=True
         ),
@@ -83,6 +89,8 @@ def test_ced_config_combinations(monkeypatch, caplog):
 
     # 5. model_config is None, fallback_config provided
     cfg5 = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         cache_config=None,
         model_config=None,
     )
@@ -109,6 +117,8 @@ def test_decoder_layer_init_and_sp_binding(monkeypatch):
     # 1. layer_idx >= ced_boundary and ced_enabled=True -> uses device_hooks
     monkeypatch.setattr(v2_model.upstream, "extract_layer_index", lambda p: 25)
     vllm_cfg = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         cache_config=SimpleNamespace(enable_prefix_caching=False),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(num_hidden_layers=40),
@@ -247,6 +257,8 @@ def test_model_init_ced_compile_sizes_and_parallel_config(monkeypatch):
 
     # 1. compile_sizes filters ints, CP size != 1 raises NotImplementedError
     vllm_cfg_invalid_cp = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         cache_config=SimpleNamespace(enable_prefix_caching=False),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(num_hidden_layers=10),
@@ -262,6 +274,8 @@ def test_model_init_ced_compile_sizes_and_parallel_config(monkeypatch):
 
     # 2. compile_sizes None, prefill_context_parallel_size == 1 succeeds
     vllm_cfg_valid = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         cache_config=SimpleNamespace(enable_prefix_caching=False),
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(num_hidden_layers=10),
@@ -342,6 +356,8 @@ def test_attention_init_executes_prepare_fn(monkeypatch):
     monkeypatch.setattr(v2_attn, "get_tensor_model_parallel_world_size", lambda: 1)
 
     vllm_cfg = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(to_dict=lambda: {"index_topk": 2048}),
             max_model_len=4096,

@@ -8,11 +8,8 @@ from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     TPU_DEEPSEEK_V41_CED: bool = False
-    TPU_DEEPSEEK_V41_ENGRAM_SPLIT: bool = False
-    TPU_DEEPSEEK_V41_IMPL: str = "v1"
+    TPU_DEEPSEEK_V41_IMPL: str = "v2"
     TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD: bool = False
-    TPU_DEEPSEEK_V41_SP: bool = False
-    TPU_DEEPSEEK_V41_LOCAL_Q: bool = False
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
@@ -360,17 +357,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Decoder SWA bounded replay is approximate. Keep full-forward as the
     # default/reference until matched model-quality and performance validation.
     "TPU_DEEPSEEK_V41_CED": env_bool("TPU_DEEPSEEK_V41_CED"),
-    # CED encoder as two graphs split at the last host-offloaded Engram layer:
-    # that layer's host lookup, DP exchange and H2D upload overlap the head.
-    "TPU_DEEPSEEK_V41_ENGRAM_SPLIT": env_bool("TPU_DEEPSEEK_V41_ENGRAM_SPLIT"),
-    # Opt in to upstream V4.1 sequence parallelism (token-sharded mHC, norms,
-    # Engram and MoE; reduce-scatter/all-gather around attention) at DP1.
-    # Upstream enables it only with DP>1 or MegaMoE.
-    "TPU_DEEPSEEK_V41_SP": env_bool("TPU_DEEPSEEK_V41_SP"),
-    # V4.1 implementation: "v1" (models/vllm/deepseek_v41/v1) or "v2"
-    # (models/vllm/deepseek_v41/v2: FP8 main KV + RoPE companion pool).
+    # Deprecated aliases, resolved by the DSV41 serving-policy verifier.
+    # Serving supports v2; v1 remains only as a standalone reference.
     "TPU_DEEPSEEK_V41_IMPL": env_with_choices(
-        "TPU_DEEPSEEK_V41_IMPL", "v1", ["v1", "v2"]
+        "TPU_DEEPSEEK_V41_IMPL", "v2", ["v1", "v2"]
     ),
     # Offload V4.1 Engram embedding tables (23.60 GiB/rank at TP8, 188.83 GiB
     # total) to Host DRAM so TPU HBM remains available for KV cache and decode.
@@ -378,11 +368,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD": env_bool(
         "TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", default=False
     ),
-    # Under V4.1 SP token-parallel FP8 attention, project q only for this
-    # rank's token shard with an all-gathered wq_b and run wo_a for every
-    # o_group on that shard, shrinking both attention all_to_alls.
-    # Costs replicated wq_b/wo_a HBM per rank.
-    "TPU_DEEPSEEK_V41_LOCAL_Q": env_bool("TPU_DEEPSEEK_V41_LOCAL_Q", default=False),
     # Opt in to K3 TP32/EP32 sequence-parallel prefill.
     "TPU_K3_SP_PREFILL": env_bool("TPU_K3_SP_PREFILL", default=False),
     # Keep the staged block tables on device between steps and upload only

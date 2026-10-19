@@ -15,6 +15,7 @@
 import torch
 from vllm.model_executor.layers import linear as vllm_linear
 from vllm.model_executor.layers.fused_moe import RoutedExperts
+from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
 from vllm.model_executor.layers.quantization import (
     QuantizationMethods,
     register_quantization_config,
@@ -101,8 +102,13 @@ class VllmDeepseekV4Fp8Config(DeepseekV4FP8Config, VllmQuantConfig):
                     raise NotImplementedError("NVFP4 is not supported yet.")
 
                 moe_config = self.get_moe_config(layer)
-                return VllmDeepseekV4Mxfp4MoEMethod(moe_config)
+                return self.create_mxfp4_moe_method(moe_config)
             else:
                 return VllmFp8MoEMethodTPU(self, self.get_moe_config(layer))
 
         return None
+
+    def create_mxfp4_moe_method(
+        self, moe_config: FusedMoEConfig
+    ) -> VllmDeepseekV4Mxfp4MoEMethod:
+        return VllmDeepseekV4Mxfp4MoEMethod(moe_config)

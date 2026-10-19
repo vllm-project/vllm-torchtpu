@@ -34,6 +34,18 @@ trap cleanup EXIT
 
 uv pip freeze --system > "$results/pip-freeze.txt"
 
+# Each pytest process releases the TPU before the serving process starts.
+if [[ "$scenario" == decode ]]; then
+  python -m pytest -q tests/kernels/test_dsv41_decode_index_scores.py \
+    -k 'production_shapes or selection_is_identical' \
+    --junitxml="$results/kernel-scores.xml"
+  python -m pytest -q tests/models/vllm/test_dsv41_decode_indexer_route.py \
+    -k 'candidate_cache_matches_existing_with_fallback or basic_config or long_candidate_cache' \
+    --junitxml="$results/kernel-routes.xml"
+  python -m pytest -q tests/kernels/fused_moe/test_fused_ep_moe_v2.py \
+    -k row_padded_flat_scales --junitxml="$results/kernel-scales.xml"
+fi
+
 # Input preparation uses the mount; serving streams weights from the GCS URI.
 model_path="${model_uri#gs://}"
 bucket="${model_path%%/*}"

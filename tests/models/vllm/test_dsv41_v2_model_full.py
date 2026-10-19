@@ -119,6 +119,8 @@ def _mock_vllm_config(
     scheduler_config = SimpleNamespace(async_scheduling=async_scheduling)
     kernel_config = SimpleNamespace(moe_backend="none")
     return SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         model_config=model_config,
         cache_config=cache_config,
         parallel_config=parallel_config,
@@ -268,7 +270,9 @@ class TestCedConfig:
             assert boundary == 20
 
         # 5. fallback_config when model_config is None
-        cfg_no_model = SimpleNamespace(cache_config=None)
+        cfg_no_model = SimpleNamespace(
+            additional_config={}, engram_config=None, cache_config=None
+        )
         fallback = SimpleNamespace(num_hidden_layers=30)
         with patch("vllm_torchtpu.envs.TPU_DEEPSEEK_V41_CED", False):
             enabled, boundary = _ced_config(
@@ -374,7 +378,7 @@ class TestUseSequenceParallel:
             "expected",
         ),
         [
-            (False, True, 1, True, 4, True),
+            (False, True, 1, True, 4, False),
             (False, False, 1, True, 4, False),
             (False, True, 2, True, 4, False),
             (False, True, 1, False, 4, False),
@@ -396,7 +400,7 @@ class TestUseSequenceParallel:
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model._upstream_use_sequence_parallel",
                 return_value=upstream_sp,
             ),
-            patch("vllm_torchtpu.envs.TPU_DEEPSEEK_V41_SP", tpu_sp),
+            patch.dict(os.environ, {"TPU_DEEPSEEK_V41_SP": str(int(tpu_sp))}),
         ):
             assert _use_sequence_parallel(cfg) is expected
 
@@ -1507,7 +1511,7 @@ class TestModelInitAndWeights:
             ),
             pytest.raises(
                 ValueError,
-                match="TPU_DEEPSEEK_V41_SP needs every token bucket >= 2 \\* TP",
+                match="Sequence parallelism needs every token bucket >= 2 \\* TP",
             ),
         ):
             DeepseekV41Model(vllm_config=cfg_sp_err)
@@ -1928,6 +1932,8 @@ def test_dp_embeddings_materialized_before_stage(monkeypatch, dp_size, supplied)
         return inputs_embeds
 
     owner = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         parallel_config=SimpleNamespace(data_parallel_size=dp_size),
         embed_input_ids=lookup,
         _has_cpu_offloaded_engram=lambda: False,

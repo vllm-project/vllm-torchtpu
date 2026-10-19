@@ -12,7 +12,6 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.forward_context import override_forward_context
 from vllm.models.deepseek_v41.nvidia import model as upstream
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v41.deepseek_v41_mhc_op import (
     initialize_shifted_mhc,
 )
@@ -29,6 +28,7 @@ from ..common.mhc import (
     pre,
     shifted_post_pre,
 )
+from ..config import DeepseekV41Config, ExecutionMode, engram_cpu_offload
 from .attention import (
     DeepseekV41Attention,
     _block_table,
@@ -58,7 +58,9 @@ def _ced_config(
 ) -> tuple[bool, int]:
     cache_config = getattr(vllm_config, "cache_config", None)
     enable_prefix_caching = bool(getattr(cache_config, "enable_prefix_caching", False))
-    ced_enabled = bool(envs.TPU_DEEPSEEK_V41_CED)
+    ced_enabled = (
+        DeepseekV41Config.from_vllm_config(vllm_config).execution == ExecutionMode.CED
+    )
     if ced_enabled and enable_prefix_caching and not prefix_replay_enabled(vllm_config):
         if warn_prefix_caching:
             logger.warning(
@@ -122,16 +124,8 @@ _upstream_use_sequence_parallel = upstream._use_sequence_parallel
 
 
 def _use_sequence_parallel(vllm_config) -> bool:
-    """Upstream gate, plus an opt-in TP+EP sequence-parallel path at DP1."""
-    if _upstream_use_sequence_parallel(vllm_config):
-        return True
-    parallel = vllm_config.parallel_config
-    return bool(
-        envs.TPU_DEEPSEEK_V41_SP
-        and parallel.pipeline_parallel_size == 1
-        and parallel.enable_expert_parallel
-        and parallel.tensor_parallel_size > 1
-    )
+    """Use upstream's topology-derived sequence parallelism."""
+    return _upstream_use_sequence_parallel(vllm_config)
 
 
 class _StageBase(torch.nn.Module):
@@ -300,7 +294,7 @@ def _stage_engram_layers(layers, gathered_hashes: torch.Tensor) -> None:
 
 class DeepseekV41Model(upstream.DeepseekV4Model):
     # Encoder layer whose host Engram staging overlaps the encoder head on
-    # device (TPU_DEEPSEEK_V41_ENGRAM_SPLIT); None runs one encoder graph.
+    # device; derived from host placement. None runs one encoder graph.
     _engram_split_layer: int | None = None
     _deferred_engram_hashes: torch.Tensor | None = None
 
@@ -732,8 +726,6 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
 
     def _select_engram_split_layer(self) -> int | None:
         """The last host-offloaded Engram encoder layer, when splitting applies."""
-        if not envs.TPU_DEEPSEEK_V41_ENGRAM_SPLIT:
-            return None
         if self.use_sequence_parallel and self._tp_size > 1:
             # SP at TP1 (DP replicas) keeps every row on the rank.
             logger.warning("Engram split encoder needs unsharded encoder rows; off")
@@ -1000,7 +992,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 # core at warmup ([USER] fatal error); >= 2 tokens per rank
                 # serves correctly. Root cause not yet isolated.
                 raise ValueError(
-                    "TPU_DEEPSEEK_V41_SP needs every token bucket >= 2 * TP "
+                    "Sequence parallelism needs every token bucket >= 2 * TP "
                     f"({2 * tp_size}); got {too_small}. Set "
                     "--compilation-config '{\"compile_sizes\": [...]}' accordingly."
                 )
@@ -1123,7 +1115,7 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
             if (
                 parallel.tensor_parallel_size != 1
                 or not parallel.enable_expert_parallel
-                or not envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD
+                or not engram_cpu_offload(vllm_config)
             ):
                 raise NotImplementedError(
                     "V4.1 TPU DP requires TP1, EP and Engram CPU offload"
@@ -1153,7 +1145,7 @@ class DeepseekV41ForCausalLM(upstream.DeepseekV41LLMForCausalLM):
             from .async_fence import install_lookback_fence
 
             install_lookback_fence()
-        if envs.TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD:
+        if engram_cpu_offload(vllm_config):
             # Host-DRAM Engram tables: hash on the host from the runner's host
             # inputs instead of copying device hashes back every step.
             install_host_engram_inputs()

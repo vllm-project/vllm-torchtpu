@@ -20,7 +20,6 @@ from vllm.models.deepseek_v41 import attention as upstream
 from vllm.models.deepseek_v41 import compressor as compressor_upstream
 from vllm.v1.attention.backends.mla.sparse_swa import DeepseekV4SWACache
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.candidate import cache_capacity
 from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
 
@@ -1554,7 +1553,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
         """
         tp_size = get_tensor_model_parallel_world_size()
         if (
-            not envs.TPU_DEEPSEEK_V41_LOCAL_Q
+            not self._token_parallel_attn
             or tp_size <= 1
             or getattr(self, "_ced_decoder", False)
             or not (self._fp8_kv and self.compress_ratio)
@@ -1746,7 +1745,7 @@ class DeepseekV41Attention(NativeCacheView, upstream.DeepseekV4Attention):
                     lengths_part,
                     block_size=self.candidate_block_size,
                     capacity=capacity,
-                    # Query rows stay dynamic; JAX checks Q6 and fallback.
+                    # Query rows stay dynamic; JAX checks request grouping and overflow.
                     packed=(
                         getattr(index_cache, "index_key_layout", "ordinary")
                         == "halfplane"

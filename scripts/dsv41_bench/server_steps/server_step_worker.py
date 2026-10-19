@@ -415,7 +415,7 @@ class ServerStepWorker:
         if not _INSTALLED:
             for cls, stage in [
                 (DeepseekV41EncoderStage, "encoder"),
-                # A split encoder (TPU_DEEPSEEK_V41_ENGRAM_SPLIT) opens each
+                # A split encoder (derived from host Engram placement) opens each
                 # forward with its head stage; the tail adds no host rows.
                 (DeepseekV41EncoderHeadStage, "encoder"),
                 (DeepseekV41DecoderStage, "decoder"),

@@ -1,7 +1,6 @@
 """100% diff line and branch coverage tests for local_q attention op.
 
 Targets:
-- src/vllm_torchtpu/envs.py (TPU_DEEPSEEK_V41_LOCAL_Q)
 - src/vllm_torchtpu/models/vllm/deepseek_v41/v2/attention.py (lines 255-268, 430,
   525-529, 565-571, 789, 796, 934-942, 1186-1215, 1243, 1258, 1260-1304, 1544)
 - src/vllm_torchtpu/models/vllm/deepseek_v41/v2/attention_kernels.py (lines 20, 838,
@@ -22,7 +21,6 @@ import torch
 from jax.sharding import Mesh
 from torch._subclasses.fake_tensor import FakeTensorMode
 
-from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention as v2_attn
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels
@@ -30,38 +28,6 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import PagedCacheRows
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     set_vllm_model_wrapper_context,
 )
-
-
-# ==============================================================================
-# Part 1: envs.py (TPU_DEEPSEEK_V41_LOCAL_Q)
-# ==============================================================================
-class TestEnvsLocalQ:
-    """Verify TPU_DEEPSEEK_V41_LOCAL_Q default and parsing behavior."""
-
-    def test_default_value(self, monkeypatch: pytest.MonkeyPatch):
-        monkeypatch.delenv("TPU_DEEPSEEK_V41_LOCAL_Q", raising=False)
-        resolver = envs.environment_variables["TPU_DEEPSEEK_V41_LOCAL_Q"]
-        assert resolver() is False
-
-    @pytest.mark.parametrize(
-        ("val_str", "expected_bool"),
-        [
-            ("1", True),
-            ("true", True),
-            ("True", True),
-            ("TRUE", True),
-            ("0", False),
-            ("false", False),
-            ("False", False),
-            ("FALSE", False),
-        ],
-    )
-    def test_parsing_values(
-        self, monkeypatch: pytest.MonkeyPatch, val_str: str, expected_bool: bool
-    ):
-        monkeypatch.setenv("TPU_DEEPSEEK_V41_LOCAL_Q", val_str)
-        resolver = envs.environment_variables["TPU_DEEPSEEK_V41_LOCAL_Q"]
-        assert resolver() is expected_bool
 
 
 # ==============================================================================
@@ -82,7 +48,6 @@ def _stub_attn(
     groups: int = 1,
     fp8_kv: bool = True,
 ):
-    monkeypatch.setattr(v2_attn.envs, "TPU_DEEPSEEK_V41_LOCAL_Q", enabled)
     monkeypatch.setattr(v2_attn, "get_tensor_model_parallel_world_size", lambda: tp)
     monkeypatch.setattr(v2_attn, "tensor_model_parallel_all_gather", _fake_all_gather)
 
@@ -92,7 +57,7 @@ def _stub_attn(
     attn.compress_ratio = compress_ratio
     attn.n_local_groups = groups
     attn._local_q_attn = False
-    attn._token_parallel_attn = True
+    attn._token_parallel_attn = enabled
 
     gen = torch.Generator().manual_seed(42)
     wq = torch.randn(16, 8, generator=gen).to(torch.float8_e4m3fn)

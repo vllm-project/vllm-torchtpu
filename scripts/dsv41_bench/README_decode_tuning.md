@@ -103,7 +103,8 @@ profile does not quantify a physical TC/SC overlap percentage.
 ## Candidate-filtered reindex
 
 The candidate route shares request-union index keys within one decoder stage.
-Its initial envelope is six queries per request, H32/D128, 2048 candidate
+Its serving envelope accepts regular request-major groups of 1–8 queries,
+H32/D128, 2048 candidate
 blocks of eight records, FP8 KV, TP1, and record widths above 49152 and at most
 131072. It gathers at most 6144 union blocks per request and unpacks native
 words once into BF16. Each reindex applies its own query membership and causal
@@ -116,8 +117,8 @@ noncanonical active request mapping falls back without dropping candidates.
 of allocating the separate BF16 unpack output. The scorer unpacks each key
 tile in VMEM. Both representations store two bytes per key element; packed
 mode reduces preparation temporaries rather than halving the persistent cache.
-Serving currently uses BF16. Packed mode has a distinct tuning key and uses
-the bounded default until calibrated.
+Serving uses packed halfplane keys. Packed mode has a distinct tuning key;
+measured entries take precedence and misses use a bounded basic config.
 
 The candidate pipeline uses the same whole-request prepare/score/select/write
 helper as full-context decode, with an independent tuning table. On TPU7x,

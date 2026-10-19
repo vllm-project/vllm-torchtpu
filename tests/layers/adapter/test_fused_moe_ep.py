@@ -1076,3 +1076,54 @@ def test_pcp_size_reads_the_layer_parallel_config():
     assert bridge._pcp_size(layer) == 1
     layer.moe_config.moe_parallel_config.pcp_size = 4
     assert bridge._pcp_size(layer) == 4
+
+
+def test_explicit_policy_ignores_legacy_enable_and_token_threshold():
+    observed = []
+
+    def build(*args, **kwargs):
+        observed.append(args[_SHARDED_PLAN_ARG])
+        return "op"
+
+    with patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", False):
+        assert (
+            _prebuild(
+                _layer(),
+                node_tokens=1,
+                build_op=build,
+                policy=bridge.FusedEPPolicy.REQUIRED,
+            )
+            == "op"
+        )
+    assert observed == [True]
+
+
+def test_explicit_policy_keeps_hardware_and_placement_checks():
+    assert (
+        _prebuild(_layer(), smem_bytes=0, policy=bridge.FusedEPPolicy.REQUIRED) is None
+    )
+    assert (
+        _prebuild(_layer(global_num_experts=9), policy=bridge.FusedEPPolicy.REQUIRED)
+        is None
+    )
+
+
+@pytest.mark.parametrize("required", [False, True])
+def test_mxfp4_explicit_backend_never_silently_changes_to_gmm(required):
+    from vllm_torchtpu.layers.adapter.quantization.mxfp4 import (
+        VllmDeepseekV4Mxfp4MoEMethod,
+    )
+
+    method = object.__new__(VllmDeepseekV4Mxfp4MoEMethod)
+    method.fused_ep = required
+    layer = _layer(renormalize=True)
+    w13 = torch.empty((4, 512, 1024), device="meta")
+    w2 = torch.empty((4, 512, 512), device="meta")
+    with patch.object(bridge, "prebuild_fused_moe_ep", return_value=None) as build:
+        if required:
+            with pytest.raises(ValueError, match="unsupported for this layer"):
+                method._prebuild_w4a8(layer, "silu", w13, w2, 512)
+            assert build.call_args.kwargs["policy"] == bridge.FusedEPPolicy.REQUIRED
+        else:
+            assert method._prebuild_w4a8(layer, "silu", w13, w2, 512) is None
+            build.assert_not_called()

@@ -292,6 +292,8 @@ def test_reserve_rope_companion_caps_at_sparsecore_16gib_limit():
     )
 
     cfg = SimpleNamespace(
+        additional_config={},
+        engram_config=None,
         model_config=SimpleNamespace(
             hf_config=SimpleNamespace(architectures=["DeepseekV41ForCausalLM"])
         ),

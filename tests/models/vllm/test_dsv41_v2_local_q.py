@@ -1,4 +1,4 @@
-"""token-local q projection (`TPU_DEEPSEEK_V41_LOCAL_Q`) CPU contracts."""
+"""token-local q projection CPU contracts."""
 
 from types import SimpleNamespace
 from typing import Any
@@ -19,7 +19,6 @@ def _fake_all_gather(tensor, dim):
 
 
 def _stub(monkeypatch, *, enabled=True, tp=TP, compress_ratio=4, groups=1):
-    monkeypatch.setattr(v2_attn.envs, "TPU_DEEPSEEK_V41_LOCAL_Q", enabled)
     monkeypatch.setattr(v2_attn, "get_tensor_model_parallel_world_size", lambda: tp)
     monkeypatch.setattr(v2_attn, "tensor_model_parallel_all_gather", _fake_all_gather)
     attn = object.__new__(v2_attn.DeepseekV41Attention)
@@ -28,7 +27,7 @@ def _stub(monkeypatch, *, enabled=True, tp=TP, compress_ratio=4, groups=1):
     attn.compress_ratio = compress_ratio
     attn.n_local_groups = groups
     attn._local_q_attn = False
-    attn._token_parallel_attn = True
+    attn._token_parallel_attn = enabled
     gen = torch.Generator().manual_seed(0)
     wq = torch.randn(16, 8, generator=gen).to(torch.float8_e4m3fn)  # (k, n_local)
     wo = torch.randn(32, 4, generator=gen).to(torch.float8_e4m3fn)  # (D_g, R)
