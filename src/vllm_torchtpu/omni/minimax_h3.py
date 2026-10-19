@@ -9,7 +9,8 @@ The patches fall into three groups, in file order:
 - Denoise performance: keep every DiT step on one set of shapes and keep
   host syncs out of the denoise loop (AdaLN cache, timestep table, RoPE
   table, finite checks, row gathers and scatters).
-- DiT kernels: fused q/k RMSNorm + RoPE kernel.
+- DiT kernels and parallelism: fused q/k RMSNorm + RoPE kernel and Ulysses
+  sequence parallelism with TP.
 
 Each patch carries its rationale in a comment block at its entry point.
 Patches only touch modules that are already loaded, do nothing without
@@ -1823,7 +1824,9 @@ def h3_rope_tables(
     ``R / 2``), the tables of the half-split kernel's
     ``y * cos + (y @ P) * sin``. The last pair is cached by ``rope_table``
     identity. A denoise run passes one table object to every block and
-    step, so they are built once per run.
+    step, so they are built once per run. Under Ulysses each forward gets a
+    fresh sp_prepare shard, so the cache misses once per step (two
+    ``[S/U, 128]`` cats shared by all blocks).
     """
     ref, tables = _H3_ROPE_TABLES
     if ref is not None and ref() is rope_table and tables[0].shape[-1] == head_dim:
@@ -1994,6 +1997,102 @@ def patch_attention_fused_qk_norm_rope() -> bool:
     return True
 
 
+# -----------------------------------------------------------------------------
+# DiT under Ulysses sequence parallelism.
+# -----------------------------------------------------------------------------
+
+SP_PARALLEL_STATE_MODULE = "vllm_omni.diffusion.distributed.parallel_state"
+
+
+def sequence_parallel_world_size() -> int:
+    """vLLM-Omni's sequence-parallel world size, 1 when SP is not set up.
+
+    Only reads ``parallel_state`` if it is already loaded. Its
+    ``get_sp_group()`` asserts when the SP group is not initialized, which
+    counts as no sequence parallelism.
+    """
+    module = _loaded_module(SP_PARALLEL_STATE_MODULE)
+    getter = getattr(module, "get_sequence_parallel_world_size", None)
+    if getter is None:
+        return 1
+    try:
+        return int(getter())
+    except AssertionError:
+        return 1
+
+
+def patch_ulysses_full_span_embed() -> bool:
+    # -------------------------------------------------------------------------
+    # Upstream vLLM-Omni Root Cause Tracking:
+    # Upstream: with strict Ulysses SP (ulysses_degree U > 1),
+    # MiniMaxH3DiTModel._rope_local_span (minimax_h3_transformer.py:1457-1467
+    # at vllm-omni e1d77a3) returns this rank's 1/U slice of the packed rows
+    # (_sequence_parallel_local_span, :260-303). _embed then keeps only the
+    # local rows of each modality through boolean position masks (:1648-1667)
+    # and runs audio_patch_proj, a ColumnParallelLinear with
+    # gather_output=True (:1363-1371, called at :1675), whose output is
+    # all-gathered over the TP group.
+    #
+    # Problem on TPU: rows are packed as [text, video, audio, refs]. At every
+    # shape we run (S_padded 2432 / 7616 / 21760 / 42304 at 256x4s / 480x4s
+    # / 768x5s / 768x10s, text 18 rows, audio 356-810 rows) with U = 2 or 4,
+    # SP rank 0 holds no audio rows and every other rank holds no text rows.
+    # On rank 0 that all_gather has a zero-size operand, which XLA rejects at
+    # compile time:
+    #   distributed.all_gather_into_tensor: error: dimension size of operand
+    #   at 'all_gather_dim' cannot be zero
+    # (TP4 x U2, 256x4s); the rank dies and its peers wait in their next
+    # collective.
+    #
+    # Fix: falling back to the full span only when a modality has no local
+    # rows would take the full span at every shape above anyway, so on TPU
+    # with U > 1 _rope_local_span returns (0, seq_len). That is the plan
+    # upstream itself takes when Ulysses is not strict or seq_len % U != 0
+    # (:271-298). _embed and final_layer then run on all S rows on every
+    # rank, sp_prepare shards hidden / rope / combined over U, and sp_gather
+    # moves the [S, H] hidden state instead of the [S / U, 128] compact
+    # logits. Estimated cost (not measured): ~15 / ~28 GFLOPs of extra embed
+    # and final-layer work and a 123.5 / 243 MB instead of 9.8 / 19.3 MB
+    # sp_gather per step, under 0.3% / 0.2% of a TP2 x U4 768x5s / 768x10s
+    # step (0.5848 / 1.4088 s on the tree before the sync-free loop and fused
+    # qk-norm kernel). With all three landed, TP2 x U4 768x5s / 768x10s runs
+    # at 0.526 / 1.351 s/step against 0.755 / 1.792 s/step at TP8 x U1. At
+    # U == 1, on CPU / CUDA, and when SP is not set up, the upstream method
+    # runs.
+    #
+    # REMOVAL / FIX CONDITION:
+    # Remove once upstream _embed handles a rank whose local span holds no
+    # rows of a modality (skips that projection or feeds it a non-empty
+    # padded row set), or torch_tpu lowers a zero-size all_gather operand.
+    # -------------------------------------------------------------------------
+    module = _loaded_module(TRANSFORMER_MODULE)
+    cls = getattr(module, "MiniMaxH3DiTModel", None)
+    if not isinstance(cls, type):
+        logger.debug(
+            "Skipping MiniMax-H3 Ulysses full-span embed TPU patch: %s is not loaded.",
+            TRANSFORMER_MODULE,
+        )
+        return False
+    if "_tpu_orig_rope_local_span" in cls.__dict__:
+        return False
+    original = getattr(cls, "_rope_local_span", None)
+    if not callable(original):
+        return False
+
+    @functools.wraps(original)
+    def _rope_local_span(self: Any, seq_len: int) -> tuple[int, int]:
+        if sequence_parallel_world_size() > 1 and _is_tpu(
+            next(self.parameters(), None)
+        ):
+            return 0, seq_len
+        return original(self, seq_len)
+
+    cls._tpu_orig_rope_local_span = original
+    cls._rope_local_span = _rope_local_span
+    logger.info("Applied TPU patch: MiniMax-H3 full-span DiT embed under Ulysses SP.")
+    return True
+
+
 def apply_minimax_h3_patches() -> bool:
     """Patch the MiniMax-H3 pipeline module if it is already loaded.
 
@@ -2018,4 +2117,5 @@ def apply_minimax_h3_patches() -> bool:
     patched = patch_denoise_branch_timestep_rows() or patched
     patched = patch_scheduler_finite_checks() or patched
     patched = patch_attention_fused_qk_norm_rope() or patched
+    patched = patch_ulysses_full_span_embed() or patched
     return patch_denoise_loop_rope_table() or patched
