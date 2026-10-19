@@ -52,6 +52,7 @@ from vllm_torchtpu.logger import init_logger
 from . import megakernel as K
 from . import pool_io
 from .vllm_adapter import (
+    megakernel_dcp_size,
     _build_tp_rank_mesh,
     _get_routed_experts,
     _need,
@@ -217,6 +218,7 @@ class Qwen35MtpMegakernel:
         self.tp_size = get_tensor_model_parallel_world_size()
         _need(self.tp_size in (8, 16), f"tp_size={self.tp_size} must be 8 or 16")
         _need(get_pp_group().world_size == 1, "pipeline parallelism")
+        self.dcp_size = megakernel_dcp_size(runner.vllm_config, self.tp_size)
 
         base_cfg = dataclasses.replace(
             K.FULL_EP,
@@ -227,6 +229,7 @@ class Qwen35MtpMegakernel:
             stack_e=False,
             e_slots=0,
             paged_kv=True,
+            dcp=self.dcp_size,
         )
         attn = layer.self_attn.attn
         for name in ("_k_scale_float", "_v_scale_float"):

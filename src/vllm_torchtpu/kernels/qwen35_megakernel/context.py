@@ -225,7 +225,12 @@ class MKBuildContext:
         # sequence-split attention: row b's KV block t is streamed by group rank (t + b) % G (TS=G)
         SPLIT = tiles.split and G > 1
         assert not SPLIT or G & (G - 1) == 0  # groups are aligned rank blocks: peers are me ^ off
-        TS = G if SPLIT else 1
+        # DCP: the group's dcp shards each hold 1 / dcp of the pages, so the split runs over the
+        # G // dcp ranks of one shard (every local item is this rank's at dcp == G); the merge
+        # over the G partials is the same
+        DCP = c.dcp
+        assert DCP == 1 or SPLIT, "dcp > 1 needs the sequence-split attention (its merge)"
+        TS = (G // DCP) if SPLIT else 1
         QR = rup(G * nh, 8) if SPLIT else 8  # query rows per sequence row in the KV loop
         # verify (T > 1): the KV rows are the NS sequences; each KV block is scored for the T * QR
         # query rows of its sequence (token t's heads in rows t * QR ..). T = 1: NS = B, TQ = QR.
@@ -629,7 +634,7 @@ class MKBuildContext:
         self.NACC, self.NY, self.KX2, self.NMIX = NACC, NY, KX2, NMIX
         self.typed = typed
         self.N_MOE, self.LAZY_ATT, self.LAZY_MOE = N_MOE, LAZY_ATT, LAZY_MOE
-        self.SPLIT, self.TS, self.QR = SPLIT, TS, QR
+        self.SPLIT, self.TS, self.QR, self.DCP = SPLIT, TS, QR, DCP
         self.T, self.NS, self.VER, self.TQ = T, NS, VER, TQ
         self.SUB, self.PW, self.eff_ctx, self.max_nb, self.NWL = SUB, PW, eff_ctx, max_nb, NWL
         self.FUSED, self.WIDE, self.GCH = FUSED, WIDE, GCH
@@ -773,6 +778,8 @@ class MKBuildContext:
         self.scr: dict[str, Any] = {}
         self.me: Any = None
         self.gi: Any = None
+        self.dr: Any = None  # DCP rank in the KV-head group (gi % dcp)
+        self.gs: Any = None  # split rank among the ranks holding the same shard (gi // dcp)
         self.arp_c: Any = None
         self.lane_e8: Any = None
         self.lane128: Any = None
@@ -838,6 +845,8 @@ class MKBuildContext:
         self.ST_all = dict(self.ST)
         self.me = lax.axis_index("tp").astype(I32)
         self.gi = lax.rem(self.me, self.G) if self.SPLIT else jnp.int32(0)
+        self.dr = lax.rem(self.gi, self.DCP) if self.DCP > 1 else jnp.int32(0)
+        self.gs = lax.div(self.gi, self.DCP) if self.DCP > 1 else self.gi
         self.arp_c = (
             (jnp.int32(0) if self.HIER == 1 else lax.rem(self.me, 2))
             if self.ARP

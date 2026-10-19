@@ -1,4 +1,7 @@
+# SPDX-License-Identifier: Apache-2.0
 """GDN and KV pool DMA managers for the Qwen3.5 decode megakernel."""
+
+import functools
 
 from jax import lax
 from jax.experimental import pallas as pl
@@ -380,6 +383,14 @@ class KVPoolDMA:
             return ctx.pos_ref[s * ctx.T] >= 0
         return jnp.bool_(True)
 
+    def kv_page_col(self, p):
+        """(this rank holds it, page-table column) of the kernel page of token position p."""
+        ctx = self.ctx
+        lp = lax.div(p, ctx.c.page_size)
+        if ctx.DCP == 1:
+            return jnp.bool_(True), lp
+        return lax.rem(lp, ctx.DCP) == ctx.dr, lax.div(lp, ctx.DCP)
+
     def seq_same_page(self, s):
         ctx = self.ctx
         c, T, pos_ref = ctx.c, ctx.T, ctx.pos_ref
@@ -445,11 +456,13 @@ class KVPoolDMA:
             act_s = self.is_seq_active(s)
             same_s = self.seq_same_page(s)
             do_rd = jnp.logical_and(act_s, same_s)
+            if ctx.DCP > 1:  # the T tokens of one page have one owner
+                do_rd = jnp.logical_and(do_rd, self.kv_page_col(pos_ref[s * T])[0])
             rd_pend[s] = jnp.where(do_rd, 1, 0).astype(I32)
 
             @pl.when(do_rd)
             def _(s=s):
-                lp0 = lax.div(pos_ref[s * T], c.page_size)
+                _, lp0 = self.kv_page_col(pos_ref[s * T])
                 kp0 = jnp.clip(pt_ref[s, lp0], 0, c.num_pages - 1)
 
                 def issue_rd(r):
@@ -520,7 +533,7 @@ class KVPoolDMA:
                 else:
                     k_view[...] = k_cur
                     v_view[...] = v_cur
-                lp0 = lax.div(pos_ref[b0], c.page_size)
+                _, lp0 = self.kv_page_col(pos_ref[b0])
                 kp0 = jnp.clip(pt_ref[s, lp0], 0, c.num_pages - 1)
 
                 def issue_wr(r):
@@ -537,56 +550,75 @@ class KVPoolDMA:
                     b0 = s * T
                     for t in range(T):
                         p_t = pos_ref[b0 + t]
-                        lp_t = lax.div(p_t, c.page_size)
-                        ln_t = lax.rem(p_t, c.page_size)
-                        kp_t = jnp.clip(pt_ref[s, lp_t], 0, c.num_pages - 1)
-
-                        def rd_one(r, kp_t=kp_t):
-                            pltpu.make_async_copy(
-                                r.at[kp_t], kv_scat.at[s], rd_sem.at[s]
-                            ).start()
-
-                        bswitch(a, [lambda r=r: rd_one(r) for r in raw_refs])
-                        # lane rotate (jnp.roll semantics) column b0+t onto lane
-                        # ln_t while the page read is in flight
-                        sh_t = lax.rem(
-                            ln_t + (c.page_size - (b0 + t) % c.page_size), c.page_size
-                        )
-                        mask_ln = lane_iota_kv == ln_t
-                        k_col = pltpu.roll(k_cols, sh_t, 1)
-                        v_col = pltpu.roll(v_cols, sh_t, 1)
-                        self.wait_kv_rd(s)
-                        if typed:
-                            k_cur = pltpu.bitcast(kv_scat[s, 0], I32).reshape(
-                                64, c.page_size
-                            )
-                            v_cur = pltpu.bitcast(kv_scat[s, 1], I32).reshape(
-                                64, c.page_size
-                            )
-                            k_cur = jnp.where(mask_ln, k_col, k_cur)
-                            v_cur = jnp.where(mask_ln, v_col, v_cur)
-                            kv_scat[s, 0] = pltpu.bitcast(
-                                k_cur.reshape(64, 1, c.page_size), FP8
-                            )
-                            kv_scat[s, 1] = pltpu.bitcast(
-                                v_cur.reshape(64, 1, c.page_size), FP8
+                        own_t, lp_t = self.kv_page_col(p_t)
+                        if ctx.DCP > 1:
+                            pl.when(own_t)(
+                                functools.partial(
+                                    self._rmw_token, a, s, t, p_t, lp_t, k_cols, v_cols, lane_iota_kv
+                                )
                             )
                         else:
-                            k_view = (
-                                kv_scat.at[s, 0].bitcast(I32).reshape(64, c.page_size)
-                            )
-                            v_view = (
-                                kv_scat.at[s, 1].bitcast(I32).reshape(64, c.page_size)
-                            )
-                            k_view[...] = jnp.where(mask_ln, k_col, k_view[...])
-                            v_view[...] = jnp.where(mask_ln, v_col, v_view[...])
+                            self._rmw_token(a, s, t, p_t, lp_t, k_cols, v_cols, lane_iota_kv)
 
-                        def wr_one(r, kp_t=kp_t):
-                            pltpu.make_async_copy(
-                                kv_scat.at[s], r.at[kp_t], wr_sem.at[s]
-                            ).start()
+    def _rmw_token(self, a, s, t, p_t, lp_t, k_cols, v_cols, lane_iota_kv):
+        """Read-modify-write of new token t (position p_t) of sequence s into the page at
+        page-table column lp_t."""
+        ctx = self.ctx
+        c, scr, ST, pos_ref, raw_refs = ctx.c, ctx.scr, ctx.ST, ctx.pos_ref, ctx.raw_refs
+        T, typed = ctx.T, ctx.typed
+        pt_ref = ST["page_table"]
+        kv_scat = scr["kv_scat_page"]
+        rd_sem, wr_sem = scr["kv_rd_sem"], scr["kv_wr_sem"]
+        b0 = s * T
+        ln_t = lax.rem(p_t, c.page_size)
+        kp_t = jnp.clip(pt_ref[s, lp_t], 0, c.num_pages - 1)
 
-                        bswitch(a, [lambda r=r: wr_one(r) for r in raw_refs])
-                        pltpu.make_async_copy(
-                            kv_scat.at[s], raw_refs[0].at[0], wr_sem.at[s]
-                        ).wait()
+        def rd_one(r, kp_t=kp_t):
+            pltpu.make_async_copy(
+                r.at[kp_t], kv_scat.at[s], rd_sem.at[s]
+            ).start()
+
+        bswitch(a, [lambda r=r: rd_one(r) for r in raw_refs])
+        # lane rotate (jnp.roll semantics) column b0+t onto lane
+        # ln_t while the page read is in flight
+        sh_t = lax.rem(
+            ln_t + (c.page_size - (b0 + t) % c.page_size), c.page_size
+        )
+        mask_ln = lane_iota_kv == ln_t
+        k_col = pltpu.roll(k_cols, sh_t, 1)
+        v_col = pltpu.roll(v_cols, sh_t, 1)
+        self.wait_kv_rd(s)
+        if typed:
+            k_cur = pltpu.bitcast(kv_scat[s, 0], I32).reshape(
+                64, c.page_size
+            )
+            v_cur = pltpu.bitcast(kv_scat[s, 1], I32).reshape(
+                64, c.page_size
+            )
+            k_cur = jnp.where(mask_ln, k_col, k_cur)
+            v_cur = jnp.where(mask_ln, v_col, v_cur)
+            kv_scat[s, 0] = pltpu.bitcast(
+                k_cur.reshape(64, 1, c.page_size), FP8
+            )
+            kv_scat[s, 1] = pltpu.bitcast(
+                v_cur.reshape(64, 1, c.page_size), FP8
+            )
+        else:
+            k_view = (
+                kv_scat.at[s, 0].bitcast(I32).reshape(64, c.page_size)
+            )
+            v_view = (
+                kv_scat.at[s, 1].bitcast(I32).reshape(64, c.page_size)
+            )
+            k_view[...] = jnp.where(mask_ln, k_col, k_view[...])
+            v_view[...] = jnp.where(mask_ln, v_col, v_view[...])
+
+        def wr_one(r, kp_t=kp_t):
+            pltpu.make_async_copy(
+                kv_scat.at[s], r.at[kp_t], wr_sem.at[s]
+            ).start()
+
+        bswitch(a, [lambda r=r: wr_one(r) for r in raw_refs])
+        pltpu.make_async_copy(
+            kv_scat.at[s], raw_refs[0].at[0], wr_sem.at[s]
+        ).wait()

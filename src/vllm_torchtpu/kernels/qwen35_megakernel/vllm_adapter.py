@@ -143,6 +143,26 @@ def _need(cond: bool, msg: str) -> None:
         raise ValueError(f"Qwen3.5 megakernel: {msg}")
 
 
+def megakernel_dcp_size(vllm_config: Any, tp_size: int) -> int:
+    """The decode context parallel size the megakernel runs at, checked against its KV groups.
+
+    vLLM builds DCP groups as contiguous runs of `dcp` ranks inside TP and gives rank r the KV
+    head `r // (tp / num_kv_heads)`, so the kernel's G = tp / NKV ranks per head split into
+    G / dcp shards of dcp ranks and the DCP rank is `tp_rank % dcp` (`distributed/dcp.py`
+    checks the alignment). The pool per rank holds the rank-local kernel pages (global page p
+    of a sequence on DCP rank p % dcp at column p // dcp) and the block table is the
+    rank-local one, which is what the kernel's `MKConfig.dcp` reads.
+    """
+    dcp = int(vllm_config.parallel_config.decode_context_parallel_size)
+    ranks_per_head = tp_size // K.FULL.NKV
+    _need(
+        dcp >= 1 and ranks_per_head % dcp == 0,
+        f"decode_context_parallel_size={dcp} must divide the {ranks_per_head} ranks per KV "
+        f"head at tp_size={tp_size}",
+    )
+    return dcp
+
+
 def _build_tp_rank_mesh(tp_size: int) -> jax.sharding.Mesh:
     """Build a 1D `'tp'` JAX Mesh whose partition index `me` equals `tp_rank`.
 
@@ -1799,6 +1819,7 @@ class Qwen35Megakernel:
             self.tp_size in (8, 16),
             f"tp_size={self.tp_size} must be 8 or 16",
         )
+        self.dcp_size = megakernel_dcp_size(runner.vllm_config, self.tp_size)
 
         if mesh is None:
             mesh = _build_tp_rank_mesh(self.tp_size)
@@ -2010,6 +2031,7 @@ class Qwen35Megakernel:
             max_pages_per_seq=self.max_pages_per_seq,
             paged_kv=True,
             gdn_stride_pages=gdn_stride,
+            dcp=self.dcp_size,
         )
 
         runner_token_paddings = tuple(
@@ -3219,7 +3241,11 @@ class Qwen35Megakernel:
                                 if do_sentinel:
                                     do_sentinel = False
                                     sentinel_checked = True
-                                    kv_ok = not torch.equal(
+                                    # the sentinel token (position 0, page 0) is written by
+                                    # the DCP rank owning page 0 only; the other shards hold
+                                    # no copy of it
+                                    kv_owner = self.tp_rank % self.dcp_size == 0
+                                    kv_ok = not kv_owner or not torch.equal(
                                         self.raw_pools[0][0]
                                         .view(torch.uint8)
                                         .cpu(),

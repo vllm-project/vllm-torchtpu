@@ -92,7 +92,12 @@ PLACEMENTS = {
 }
 PLACEMENT = os.environ.get("P3_MK_PLACEMENT", "c32")
 MODE = os.environ.get("P3_MK_MODE", "ep")  # ep: routed experts EP over the ranks; tp: TP-sliced
-OUT = os.environ.get("MK_BENCH_OUT") or common.run_dir("mk_step", f"{MODE}")
+# decode context parallelism inside the kernel (MKConfig.dcp): the G = R / 2 ranks of a KV-head
+# group hold DCP page-interleaved shards; the bench's page tables are rank-local either way
+DCP = int(os.environ.get("MK_BENCH_DCP", "1"))
+OUT = os.environ.get("MK_BENCH_OUT") or common.run_dir(
+    "mk_step", MODE if DCP == 1 else f"{MODE}-dcp{DCP}"
+)
 REF_SRC = os.environ.get(
     "MK_BENCH_REF_SRC",
     "/workspace/tmp/agentx-p1/s0-tree/src/vllm_torchtpu/kernels/qwen35_megakernel",
@@ -197,7 +202,7 @@ def _tpu_mesh():
     return Mesh(np.array(devs[:R]), ("tp",))
 
 
-def _cfg(b: int, e_slots: int = E_SLOTS) -> C.MKConfig:
+def _cfg(b: int, e_slots: int = E_SLOTS, dcp: int = DCP) -> C.MKConfig:
     # tp mode: the routed experts are TP-sliced (moe_tp=True), every rank holds all experts,
     # and e_slots / forced routing counts do not apply (the placement table is EP specific).
     return dataclasses.replace(
@@ -214,6 +219,7 @@ def _cfg(b: int, e_slots: int = E_SLOTS) -> C.MKConfig:
         max_pages_per_seq=MAXP,
         gdn_stride_pages=GDN_STRIDE,
         ctx=MAXP * 128,
+        dcp=dcp,
     )
 
 
@@ -348,8 +354,8 @@ class _World:
             _global(self.mesh, np.tile(rb, (R, 1, 1))),
         )
 
-    def step_fn(self, mod, b: int, skip, scopes: int, tile_over=None, patch=None):
-        c = _cfg(b, self.e_slots)
+    def step_fn(self, mod, b: int, skip, scopes: int, tile_over=None, patch=None, dcp=DCP):
+        c = _cfg(b, self.e_slots, dcp)
         tiles = mod.config.default_tiles(c)
         if tile_over:
             tiles = dataclasses.replace(tiles, **tile_over)
@@ -428,7 +434,7 @@ def _record(row):
                                          devices=True))
         else:
             _ENV["id"] = f"process{jax.process_index()}"
-    row = {"environment_id": _ENV["id"], "mode": MODE, "R": R,
+    row = {"environment_id": _ENV["id"], "mode": MODE, "R": R, "dcp": DCP,
            "process": jax.process_index(), "process_count": jax.process_count(), **row}
     if lead:
         with open(os.path.join(OUT, "results.jsonl"), "a") as f:
@@ -740,3 +746,182 @@ def test_parity_ab(world, pair, case):
     _record(row)
     for h in h_a + h_b:
         assert np.isfinite(h).all()
+
+
+# ---------------------------------------------------------------------------------------------
+# DCP parity: this tree at dcp = DCP against this tree at dcp 1 on the same logical KV
+# ---------------------------------------------------------------------------------------------
+
+
+def _kv_page_bytes(a: int, g: int, pages: np.ndarray) -> np.ndarray:
+    """Deterministic fp8 bytes (|x| < 2, no NaN) of global KV pages `pages` of sequence g in
+    pool a: [len(pages), 2, 64, 4, 128] uint8, the same on every rank of a KV-head group."""
+    n = 2 * 64 * 4 * 128
+    key = (np.asarray(pages, np.uint32) + np.uint32(g * PSEQ + a * NSEQ_MAX * PSEQ)).astype(np.uint32)
+    x = (key[:, None] * np.uint32(2654435761)) + (np.arange(n, dtype=np.uint32) * np.uint32(40503))
+    x = (x ^ (x >> np.uint32(13))) * np.uint32(2246822519)
+    b = ((x >> np.uint32(24)) & np.uint32(0x3F)) | ((x >> np.uint32(8)) & np.uint32(0x80))
+    return b.astype(np.uint8).reshape(len(pages), 2, 64, 4, 128)
+
+
+def _set_pages_per_rank(pool, idx, vals):
+    """pool[r * NUM_PAGES + idx[r]] = vals[r] on every rank, in place (donated)."""
+    mesh = _WORLD[0].mesh
+    fn = jax.jit(
+        jax.shard_map(
+            lambda p, i, v: p.at[i[0]].set(v[0]),
+            mesh=mesh,
+            in_specs=(P("tp"), P("tp"), P("tp")),
+            out_specs=P("tp"),
+            check_vma=False,
+        ),
+        donate_argnums=(0,),
+    )
+    return fn(pool, _global(mesh, idx[:, None]), _global(mesh, vals[:, None]))
+
+
+def _dcp_parity_pools(world, case, dcp: int, seed: int = 5):
+    """Fresh pools whose KV pages of `case`'s sequences are group-consistent at dcp 1 (every rank
+    of a KV-head group holds the same page bytes) and, at dcp > 1, re-laid out so that rank r's
+    local column j of sequence g holds global page dcp * j + r % dcp. GatedDeltaNet pages keep
+    the per-rank seed content, the same in both layouts."""
+    G = _cfg(32).G
+    seqs = sorted({s0 + s for b, s0 in CASES[case] for s in range(b // T)})
+    pools = list(world.fresh_pools(seed=seed))
+    cols, vals = [], []
+    for r in range(R):
+        dr = r % dcp
+        c_r, v_r = [], []
+        for g in seqs:
+            npg = -(-(int(world.ctx[g]) + T) // 128)
+            if dcp == 1:
+                gp = np.arange(npg)
+                col = gp
+            else:
+                col = np.arange(-(-npg // dcp))
+                gp = dcp * col + dr
+                keep = gp < npg
+                col, gp = col[keep], gp[keep]
+            c_r.append(1 + g * PSEQ + col)
+            v_r.append((g, gp))
+        cols.append(np.concatenate(c_r))
+        vals.append(v_r)
+    n = min(len(c) for c in cols)
+    idx = np.stack([c[:n] for c in cols]).astype(np.int32)
+    for a in range(len(pools)):
+        va = np.stack([
+            np.concatenate([_kv_page_bytes(a, g, gp) for g, gp in vals[r]])[:n] for r in range(R)
+        ])
+        pools[a] = _set_pages_per_rank(
+            pools[a], idx, jax.lax.bitcast_convert_type(jnp.asarray(va), FP8)
+        )
+    jax.block_until_ready(pools)
+    return tuple(pools)
+
+
+def _new_token_lanes(world, case, dcp: int, pools):
+    """[(rank, page, lane)] -> bytes of every new token's KV column on the ranks holding it."""
+    out = {}
+    for b, s0 in CASES[case]:
+        for s in range(b // T):
+            g = s0 + s
+            for t in range(T):
+                p = int(world.ctx[g]) + t
+                gp, ln = p // 128, p % 128
+                for r in range(R):
+                    if r % dcp != gp % dcp:
+                        continue
+                    out[(r, g, p)] = (1 + g * PSEQ + gp // dcp, ln)
+    pages = np.array(sorted({v[0] for v in out.values()}))
+    taken = [_take_pages(pool, pages) for pool in pools]  # [ranks, pages, 2, 64, 4, 128]
+    res = {}
+    for (r, g, p), (page, ln) in out.items():
+        j = int(np.searchsorted(pages, page))
+        res[(r, g, p)] = np.stack([tk[r, j, :, :, :, ln] for tk in taken])
+    return res
+
+
+def _bf16_ulp(x):
+    """One bf16 ulp at |x| (7 fraction bits)."""
+    a = max(float(x), 2.0 ** -100)
+    return float(np.exp2(np.floor(np.log2(a)) - 7))
+
+
+def _state_stats(a, b):
+    """GatedDeltaNet state a against reference b: the relative mean difference and the largest
+    difference in bf16 ulps of the reference's largest magnitude. The states are sums rounded
+    to bf16, so two reduction or merge orders differ by absolute noise at the scale of the
+    largest entries (one bf16 step at most, item1), not per element."""
+    d = np.abs(a - b)
+    ref_max = float(np.abs(b).max())
+    return {
+        "max_abs_diff": float(d.max()),
+        "ref_max_abs": ref_max,
+        "max_diff_ulps_of_ref_max": float(d.max() / _bf16_ulp(ref_max)),
+        "rel_mean_diff": float(d.mean() / max(float(np.abs(b).mean()), 1e-30)),
+    }
+
+
+DCP_PARITY_TILES = {
+    "def": {},
+    "f32": {"hier": 0, "rsag": False},
+}
+
+
+@pytest.mark.parametrize("case", ["b4", "b32"])
+@pytest.mark.parametrize("ar", _subset("MK_BENCH_DCP_PARITY_AR", DCP_PARITY_TILES))
+def test_parity_dcp(world, case, ar):
+    """dcp = DCP against dcp 1 (this tree, same tiles, same forced routing, same copy slots) on
+    the same logical KV: the hidden output of every call, the GatedDeltaNet checkpoints and the
+    new tokens' KV columns on the ranks that hold them. `ar` picks the all-reduce (def: the
+    tree's tiles; f32: the one-shot push, the most exact all-reduce the kernel has)."""
+    if DCP == 1:
+        pytest.skip("MK_BENCH_DCP=1: nothing to compare")
+    over = DCP_PARITY_TILES[ar]
+    world.pools = None
+    outs = {}
+    for dcp in (1, DCP):
+        c = _cfg(32, world.e_slots, dcp)
+        _, gdn_pages = _written_pages(world, case)
+        pools = _dcp_parity_pools(world, case, dcp)
+        hids = []
+        for b, s0 in CASES[case]:
+            fn, _ = world.step_fn(_THIS, b, frozenset(), 0, over or None, dcp=dcp)
+            pos, hid_in, pt, ck, ro, rb = world.inputs(b, s0)
+            hid, pools = fn(pos, hid_in, world.weights, pools, pt, ck, ro, rb)
+            hids.append(np.stack(_local_rows(hid, b)))
+        g_idx = gdn_pages[:, None] + np.arange(c.gdn_pages)[None, :]
+        gdn = np.stack([_take_pages(p, g_idx) for p in pools])
+        lanes = _new_token_lanes(world, case, dcp, pools)
+        outs[dcp] = (hids, gdn, lanes)
+        del pools
+    world.pools = world.fresh_pools()
+    (h1, g1, l1), (hd, gd, ld) = outs[1], outs[DCP]
+    kv1 = np.stack([l1[k] for k in sorted(ld)])
+    kvd = np.stack([ld[k] for k in sorted(ld)])
+    hid_stats = [_diff_stats(a, b) for a, b in zip(hd, h1)]
+    rec_stats, conv_stats = _state_stats(_rec(gd), _rec(g1)), _state_stats(_conv(gd), _conv(g1))
+    row = {
+        "label": "parity_dcp",
+        "case": case,
+        "dcp": DCP,
+        "ar": ar,
+        "hidden": hid_stats,
+        "kv_bytes_identical_frac": float(np.mean(kvd == kv1)),
+        "kv_max_abs_diff": float(np.abs(_kvf(kvd) - _kvf(kv1)).max()),
+        "gdn_bytes_identical_frac": float(np.mean(gd == g1)),
+        "rec": rec_stats,
+        "conv": conv_stats,
+        "n_new_token_columns": int(len(ld)),
+    }
+    _record(row)
+    for a, b in zip(hd, h1):
+        assert np.isfinite(a).all() and np.isfinite(b).all()
+    for st in hid_stats:
+        assert st["over_2e-2_band_frac"] <= 2e-3, st
+    np.testing.assert_allclose(_kvf(kvd), _kvf(kv1), atol=0.25, rtol=0.13)
+    # the GatedDeltaNet states carry a recurring 0.2549 max abs difference in every comparison
+    # of two reduction orders on record (item1 hier0 vs hier3, item2 parity_wide, this one),
+    # with a relative mean difference of a few 1e-3: the mean is the gate, the max is recorded
+    for st in (rec_stats, conv_stats):
+        assert st["rel_mean_diff"] <= 1e-2, st

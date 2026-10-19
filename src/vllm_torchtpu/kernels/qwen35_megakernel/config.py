@@ -215,6 +215,11 @@ class MKConfig:
     # and GatedDeltaNet phases per microbatch and the MoE phase once over all rows, so each hit
     # expert's weights stream once per layer per step. 0: one microbatch of B rows.
     mb_rows: int = 0
+    # Decode context parallelism: the dcp ranks of a KV-head group hold one shard of the pool
+    # each. Global kernel page p of a sequence sits on DCP rank p % dcp at page-table column
+    # p // dcp (vLLM's DCP layout, the batched RPA kernel's and Raiden's tp{T}dcp{D}_decode rule);
+    # the page table is the rank-local one. 1: the pool is replicated over the group.
+    dcp: int = 1
 
     @property
     def wide(self) -> bool:
@@ -363,6 +368,8 @@ class MKConfig:
         assert self.e_slots == 0 or self.e_slots >= (self.E if self.moe_tp else self.ER)
         if self.paged_kv:
             assert self.page_size == 128 and self.num_pages >= 1 and self.max_pages_per_seq >= 1
+        assert self.dcp >= 1 and self.G % self.dcp == 0, (self.dcp, self.G)
+        assert self.dcp == 1 or self.paged_kv, "dcp > 1 shards the paged pool"
         for n in (self.H, self.QKV, self.Z, self.KD, self.VD, self.HD, self.IR, self.ISR):
             assert n % 128 == 0, n
 

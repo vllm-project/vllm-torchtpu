@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Full and paged flash-decode attention block for the Qwen3.5 decode megakernel."""
 
 import jax
@@ -55,16 +56,29 @@ class PagedAttentionBlock:
         for d in descs:
             d.wait_send()
 
+    def kv_len(self, plen):
+        """This rank's cached tokens of a sequence of plen tokens: all of them at dcp 1, else
+        those of the kernel pages p with p % dcp == dr (the batched RPA's cp_local_cache_len)."""
+        ctx = self.ctx
+        if ctx.DCP == 1:
+            return plen
+        ps = ctx.c.page_size
+        sp = ctx.DCP * ps
+        full = lax.div(plen, sp) * ps
+        rem = jnp.clip(lax.rem(plen, sp) - ctx.dr * ps, 0, ps)
+        return full + rem
+
     def init_worklist(self):
         """Populate this rank's KV work items in the step prologue."""
         ctx = self.ctx
         c, scr, ST, pos_ref = ctx.c, ctx.scr, ctx.ST, ctx.pos_ref
         NS, T, BLK, max_nb = ctx.NS, ctx.T, ctx.BLK, ctx.max_nb
-        SPLIT, TS, gi = ctx.SPLIT, ctx.TS, ctx.gi
+        SPLIT, TS, gs = ctx.SPLIT, ctx.TS, ctx.gs
         n = jnp.int32(0)
         for b in range(NS):
-            nb = jnp.minimum(jnp.maximum((pos_ref[b * T] + BLK - 1) // BLK, 0), max_nb)
-            t0 = lax.rem(gi + (TS - b % TS), TS) if SPLIT else jnp.int32(0)
+            plen = self.kv_len(pos_ref[b * T])
+            nb = jnp.minimum(jnp.maximum((plen + BLK - 1) // BLK, 0), max_nb)
+            t0 = lax.rem(gs + (TS - b % TS), TS) if SPLIT else jnp.int32(0)
             cnt = jnp.maximum(nb - t0 + TS - 1, 0) // TS
 
             def put(j, carry, b=b, t0=t0, n=n):
@@ -569,7 +583,7 @@ class PagedAttentionBlock:
                 row b's online-softmax state."""
                 s = i % KR
                 b, t = scr["wl_b"][i], scr["wl_t"][i]
-                plen = pos_ref[b * T] if VER else pos_ref[b]
+                plen = self.kv_len(pos_ref[b * T] if VER else pos_ref[b])
                 qrows = scr["qb"][b]
                 if c.paged_kv:
                     if interpret:

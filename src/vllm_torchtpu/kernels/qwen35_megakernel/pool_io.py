@@ -1,3 +1,4 @@
+# SPDX-License-Identifier: Apache-2.0
 """Unified block pool (`raw[0..14]`) gather and scatter kernels for `qwen3_5_moe`.
 
 In `vllm-torchtpu`, Qwen3.5-397B-A17B stores both full-attention FP8 KV pages and GatedDeltaNet
@@ -498,6 +499,7 @@ def scatter_pool_states(
     *,
     interpret=False,
     conv_partial=False,
+    dcp_axis=None,
 ):
     """In-place scatter of new FP8 KV tokens and per-token GDN states into `raw_pools`.
 
@@ -523,6 +525,10 @@ def scatter_pool_states(
         (`None` when `c.att_every == 1`).
       active_seqs: optional `(c.NS,) int32` mask (non-zero for active sequences; defaults to 1s).
       interpret: run Pallas in CPU interpret mode.
+      dcp_axis: the shard_map axis name, required when `c.dcp > 1`: the kernel takes its DCP
+        rank from `lax.axis_index` (Mosaic lowers it from the device id; in the shard_map body
+        the same query lowers to an XLA partition id, which the engine's SPMD-partitioned
+        program rejects), and a token lands only on the rank owning its kernel page.
 
     Returns:
       Updated `raw_pools` (`c.NATT`-tuple, aliased in place to input `raw_pools`).
@@ -621,6 +627,9 @@ def scatter_pool_states(
         scratch["k_cols_buf"] = pltpu.VMEM((c.NATT, 64, c.page_size), I32)
         scratch["v_cols_buf"] = pltpu.VMEM((c.NATT, 64, c.page_size), I32)
     s_names = list(scratch)
+    has_dcp = c.dcp > 1
+    if has_dcp:
+        assert dcp_axis is not None, "dcp > 1 needs the shard_map axis name"
     n_smem = 2 + int(has_gdn) + int(act_mode == "ref")
     n_hbm = 4 if has_gdn else 2
 
@@ -638,6 +647,7 @@ def scatter_pool_states(
         pos_ref, pt_ref = smem_refs[:2]
         ckpt_ref = smem_refs[2] if has_gdn else None
         act_ref = smem_refs[-1] if act_mode == "ref" else None
+        dcp_rank = lax.rem(lax.axis_index(dcp_axis).astype(I32), c.dcp) if has_dcp else None
         knew_ref, vnew_ref, conv_ref, rec_ref = (
             refs[c.NATT + n_smem : c.NATT + n_smem + n_hbm] + (None, None)
         )[:4]
@@ -915,10 +925,22 @@ def scatter_pool_states(
                 k_cols_buf[g] = batch_to_i32_cols(knew_buf[g])
                 v_cols_buf[g] = batch_to_i32_cols(vnew_buf[g])
 
+        def page_col(lp_global):
+            """(this rank holds it, page-table column) of global kernel page lp_global."""
+            if not has_dcp:
+                return jnp.bool_(True), lp_global
+            return lax.rem(lp_global, c.dcp) == dcp_rank, lax.div(lp_global, c.dcp)
+
         # 1. Double-buffered scatter of B new KV tokens across all c.NATT attention layers
         def scatter_single_token_across_att(s_idx, b_idx):
             p = pos_ref[b_idx]
-            lp = lax.div(p, c.page_size)
+            own, lp = page_col(lax.div(p, c.page_size))
+            if has_dcp:
+                pl.when(own)(lambda: _scatter_token(s_idx, b_idx, p, lp))
+            else:
+                _scatter_token(s_idx, b_idx, p, lp)
+
+        def _scatter_token(s_idx, b_idx, p, lp):
             ln = lax.rem(p, c.page_size)
             kp = pt_ref[s_idx, lp]
             mask_ln = lane_iota == ln
@@ -998,9 +1020,13 @@ def scatter_pool_states(
                             same_page, lax.div(pos_ref[b0 + t], c.page_size) == lp0
                         )
 
+                    own0, lp0_col = page_col(lp0)
+                    if has_dcp:  # the T tokens of one page have one owner
+                        same_page = jnp.logical_and(same_page, own0)
+
                     @pl.when(same_page)
                     def _():
-                        kp = pt_ref[s, lp0]
+                        kp = pt_ref[s, lp0_col]
                         ln_list = [lax.rem(pos_ref[b0 + t], c.page_size) for t in range(T)]
                         mask_ln_list = [lane_iota == ln_list[t] for t in range(T)]
                         # lane rotate (jnp.roll semantics) column b0+t onto lane ln_list[t]
@@ -1485,6 +1511,7 @@ def make_flat_pooled_step(
             active_seqs="from_ckpt",
             interpret=interpret,
             conv_partial=use_gpr,
+            dcp_axis=mesh.axis_names[0],
         )
         if out_rows > 0 and hid.shape[0] > out_rows:
             hid = hid[:out_rows]
@@ -1579,6 +1606,7 @@ def make_flat_attn_step(
             None,
             active_seqs,
             interpret=interpret,
+            dcp_axis=mesh.axis_names[0],
         )
         return (hid, *raw_out)
 
@@ -1724,6 +1752,7 @@ def make_pooled_step(
             ckpt_indices,
             active_seqs,
             interpret=interpret,
+            dcp_axis=mesh.axis_names[0],
         )
         if raw_6d:
             raw_out = tuple(jnp.expand_dims(r, 0) for r in raw_out)
@@ -1973,4 +2002,3 @@ def states_to_pool(c: MKConfig, St, page_table, ckpt_indices, read_offsets=None)
 
         raw_list.append(jnp.asarray(pool_g.reshape(c.R * c.num_pages, 2, 64, 4, c.page_size)))
     return tuple(raw_list)
-
