@@ -64,7 +64,15 @@ def apply_omni_tpu_patches() -> None:
 @run_once
 def apply_omni_model_specific_patches() -> None:
     """Apply model-specific runtime patches."""
+    _patch_diffusion_ipc_cpu_pack()
+    _patch_qwen_image_rope_txt_freqs_clone()
+    _patch_wan_pair_swap_rope()
+    _patch_wan_ffn_gelu_fence()
+    _patch_diffusion_startup_warmup_sync()
+    _patch_wan_fused_qk_norm_rope()
 
+
+def _patch_diffusion_ipc_cpu_pack() -> None:
     # -------------------------------------------------------------------------
     # Upstream torch_tpu Root Cause Tracking:
     # 1. Pickling a device tensor aborts process: In torch_tpu, calling
@@ -91,12 +99,6 @@ def apply_omni_model_specific_patches() -> None:
 
     ipc._pack_tensor_if_large = _safe_pack_tensor_if_large
     logger.info("Applied TPU patch: safe CPU serialization for diffusion IPC tensors.")
-
-    _patch_qwen_image_rope_txt_freqs_clone()
-    _patch_wan_pair_swap_rope()
-    _patch_wan_ffn_gelu_fence()
-    _patch_diffusion_startup_warmup_sync()
-    _patch_wan_fused_qk_norm_rope()
 
 
 def _patch_qwen_image_rope_txt_freqs_clone() -> None:

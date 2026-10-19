@@ -399,72 +399,31 @@ def test_qwen_image_rope_txt_freqs_clone(rope_cls_name):
 
 
 def test_safe_pack_tensor_if_large():
-    from unittest.mock import MagicMock
-
     from vllm_omni.diffusion import ipc
 
-    from vllm_torchtpu.omni.patches import apply_omni_model_specific_patches
-
-    # Provide an original pack function to mock_omni's ipc
-    def _orig_mock(
-        tensor, d2h_stream=None, created=None, *, enable_registered_shm=False
-    ):
-        return {
-            "device": getattr(tensor, "device", None).type
-            if hasattr(tensor, "device")
-            else "unknown",
-            "d2h_stream": d2h_stream,
-            "created": created,
-            "registered": enable_registered_shm,
-        }
-
-    orig_mock = MagicMock(side_effect=_orig_mock)
-    ipc._pack_tensor_if_large = orig_mock
+    orig_pack = MagicMock()
+    ipc._pack_tensor_if_large = orig_pack
 
     apply_omni_model_specific_patches.cache_clear()
     apply_omni_model_specific_patches()
 
-    class MockDeviceTensor:
-        def __init__(self, device_type="tpu"):
-            self.device = MagicMock()
-            self.device.type = device_type
-            self.cpu_called = False
+    cpu_tensor = torch.empty(1, device="cpu")
+    tpu_tensor = MagicMock()
+    tpu_tensor.cpu.return_value = cpu_tensor
+    created = []
 
-        def cpu(self):
-            self.cpu_called = True
-
-            class Res:
-                device = MagicMock()
-                device.type = "cpu"
-
-            return Res()
-
-    t = MockDeviceTensor("tpu")
-    created_list = []
     res = ipc._pack_tensor_if_large(
-        t, d2h_stream="s", created=created_list, enable_registered_shm=True
+        tpu_tensor, "stream", created, enable_registered_shm=True
     )
-    assert t.cpu_called is True
-    assert res == {
-        "device": "cpu",
-        "d2h_stream": "s",
-        "created": created_list,
-        "registered": True,
-    }
-    assert res["created"] is created_list
 
-    t2 = MockDeviceTensor("tpu")
-    res2 = ipc._pack_tensor_if_large(t2)
-    assert t2.cpu_called is True
-    assert res2 == {
-        "device": "cpu",
-        "d2h_stream": None,
-        "created": None,
-        "registered": False,
-    }
+    tpu_tensor.cpu.assert_called_once_with()
+    orig_pack.assert_called_once_with(
+        cpu_tensor, "stream", created, enable_registered_shm=True
+    )
+    assert res is orig_pack.return_value
 
 
-def test_omni_tpu_patches_configuration(monkeypatch):
+def test_omni_tpu_patches_configuration():
     # Call the undecorated body so the run-once cache is left alone, and
     # restore the process-global state it edits (env var).
     orig = torch.nn.functional.interpolate
