@@ -6876,6 +6876,14 @@ class TPURaidenConnectorWorker:
         self, kv_caches: list[Any], *, num_slots: int | None = None
     ) -> "KVCacheManager":
         max_blocks = self._max_request_blocks()
+        # Under DCP a rank holds 1/dcp of every request's tokens, so a request
+        # spans at most ceil(max_model_len / (block_size * dcp)) of its blocks.
+        # Sizing for the whole request reserved dcp x the host memory per
+        # storage: at 1M tokens and DCP16 a full-mirror GLM storage covered
+        # 4096 blocks instead of its ~2,100-block pool (~27 GB more per rank).
+        dcp = int(self.vllm_config.parallel_config.decode_context_parallel_size or 1)
+        if dcp > 1:
+            max_blocks = max(1, -(-max_blocks // dcp))
         if num_slots is None:
             num_slots = self._num_raiden_slots(max_blocks)
         stage3_enabled = self._raiden_stage3_enabled()
