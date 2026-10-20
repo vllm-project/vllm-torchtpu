@@ -532,6 +532,12 @@ class VllmDeepseekV4MLAAttention(
         """Apply scaling RoPE to decoupled key states."""
         return self.kv_rope_op(kv, positions, self.mla_attn.rotary_emb.cos_sin_cache)
 
+    def _project_q(self, qr: torch.Tensor) -> torch.Tensor:
+        """Project the q latent to query heads: [num_tokens, heads, head_dim]."""
+        return self.wq_b(qr).view(
+            qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim
+        )
+
     def attention_impl(
         self,
         hidden_states: torch.Tensor,
@@ -542,9 +548,7 @@ class VllmDeepseekV4MLAAttention(
         out: torch.Tensor | None,
     ) -> torch.Tensor:
         """Execute indexing, state compression, and kernel attention dispatch."""
-        q = self.wq_b(qr).view(
-            qr.shape[0], self.mla_attn.n_local_heads, self.mla_attn.head_dim
-        )
+        q = self._project_q(qr)
         q = self.qnorm_rope(q, positions)
         kv = self.kv_rope(kv, positions)
 

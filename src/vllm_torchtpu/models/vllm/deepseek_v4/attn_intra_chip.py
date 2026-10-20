@@ -118,6 +118,23 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
                 "TPU_DSV4_ATTN_INTRA_CHIP_TP requires tensor parallel size 1, "
                 f"got {tp_size}"
             )
+        # Every layer exchanges activations with the peer core, so both cores
+        # must run each forward together at the same padded token count. The
+        # runner keeps DP ranks in that lockstep only under expert parallel
+        # (TPUModelRunner._dp_lockstep_enabled); otherwise each rank pads to its
+        # own bucket, an idle one may skip the forward, and the exchange hangs
+        # or pairs tensors from different steps.
+        from vllm_torchtpu.utils import get_dp_size
+
+        parallel_config = vllm_config.parallel_config
+        if not (
+            get_dp_size(parallel_config) > 1 and parallel_config.enable_expert_parallel
+        ):
+            raise RuntimeError(
+                "TPU_DSV4_ATTN_INTRA_CHIP_TP requires DP lockstep (data parallel "
+                "size > 1 with expert parallel), so both cores of a chip run every "
+                "forward at the same token count"
+            )
         super().__init__(vllm_config, prefix, *args, **kwargs)
         group = _chip_pair_group()
         rank, size = group.rank_in_group, group.world_size
@@ -178,35 +195,24 @@ class VllmDeepseekV4MLAAttentionIntraChip(VllmDeepseekV4MLAAttention):
         finally:
             self.n_local_heads, self.n_local_groups = heads, groups
 
-    def attention_impl(self, hidden_states, qr, kv, indexer_weights, positions, out):
+    def _project_q(self, qr: torch.Tensor) -> torch.Tensor:
+        # Each core projects both cores' tokens onto its half of the heads, then
+        # the cores swap so each holds all heads for its own tokens.
         group = self._chip_pair
         rank = group.rank_in_group
         num_tokens = qr.shape[0]
-        q_half = self.wq_b(group.all_gather(qr.contiguous(), dim=0))
-        q_half = q_half.view(2, num_tokens, -1)
+        qr_pair = group.all_gather(qr.contiguous(), dim=0)
+        if qr_pair.shape[0] != 2 * num_tokens:
+            raise RuntimeError(
+                f"Chip pair gathered {qr_pair.shape[0]} qr rows, expected "
+                f"2 x {num_tokens}; both cores must run at the same token count"
+            )
+        q_half = self.wq_b(qr_pair).view(2, num_tokens, -1)
         peer = _swap_with_peer_chiplet(group, q_half[rank], q_half[1 - rank])
         pieces = [q_half[rank], peer] if rank == 0 else [peer, q_half[rank]]
-        q = torch.cat(pieces, dim=-1).view(
+        return torch.cat(pieces, dim=-1).view(
             num_tokens, self.mla_attn.n_local_heads, self.mla_attn.head_dim
         )
-        q = self.qnorm_rope(q, positions)
-        kv = self.kv_rope(kv, positions)
-
-        topk_indices = None
-        compressor = getattr(self.mla_attn, "compressor", None)
-        if self.indexer is not None:
-            indexer_emb = getattr(
-                self.mla_attn,
-                "indexer_rotary_emb",
-                getattr(self.mla_attn, "rotary_emb", None),
-            )
-            topk_indices = self.indexer(
-                hidden_states, qr, indexer_weights, positions, indexer_emb
-            )
-        if compressor is not None:
-            compressor(hidden_states, positions, self.mla_attn.rotary_emb)
-
-        return self.forward_mqa(q, kv, positions, None, topk_indices=topk_indices)
 
     def _o_proj(self, o, positions):
         group = self._chip_pair

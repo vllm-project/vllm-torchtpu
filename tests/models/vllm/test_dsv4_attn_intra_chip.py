@@ -24,6 +24,7 @@ import sys
 import threading
 import types
 
+import pytest
 import torch
 
 _MODULE = (
@@ -149,13 +150,9 @@ def test_matches_unsharded_reference(monkeypatch):
         )
         layer.wq_b = lambda x: x @ wq[:, heads]
         layer.mla_attn = types.SimpleNamespace(
-            n_local_heads=NUM_HEADS, head_dim=HEAD_DIM, compressor=None
+            n_local_heads=NUM_HEADS, head_dim=HEAD_DIM
         )
         layer.n_local_heads, layer.head_dim = NUM_HEADS, HEAD_DIM
-        layer.indexer = None
-        layer.qnorm_rope = lambda q, p: q
-        layer.kv_rope = lambda kv, p: kv
-        layer.forward_mqa = lambda q, kv, p, _, topk_indices=None: attn(q, p)
         layer.rotary_emb = types.SimpleNamespace(cos_sin_cache=None)
         layer.o_proj_op = lambda o, p, c, w, s: torch.einsum(
             "tgk,gko->tgo",
@@ -175,7 +172,8 @@ def test_matches_unsharded_reference(monkeypatch):
     def run(rank):
         try:
             layer = make(rank)
-            o = layer.attention_impl(None, qr[rank], None, None, pos[rank], None)
+            # The base attention_impl runs attention between these two hooks.
+            o = attn(layer._project_q(qr[rank]), pos[rank])
             out[rank] = layer._o_proj(o, pos[rank])
         except BaseException as error:  # noqa: BLE001 - surfaced below
             errors.append(error)
@@ -192,6 +190,41 @@ def test_matches_unsharded_reference(monkeypatch):
         torch.testing.assert_close(
             out[rank], reference(qr[rank], pos[rank]), rtol=1e-4, atol=1e-4
         )
+
+
+class _PastLockstepGuard(Exception):
+    pass
+
+
+@pytest.mark.parametrize(
+    "dp_size,expert_parallel,allowed",
+    [(16, True, True), (1, True, False), (16, False, False), (1, False, False)],
+    ids=["dp16-ep", "dp1", "no-ep", "dp1-no-ep"],
+)
+def test_requires_dp_lockstep(monkeypatch, dp_size, expert_parallel, allowed):
+    """Without DP lockstep the chip pair can run different steps; refuse to build."""
+    aic = _load_module(monkeypatch)
+    aic.parallel_state.get_tensor_model_parallel_world_size = lambda: 1
+    utils = types.ModuleType("vllm_torchtpu.utils")
+    utils.get_dp_size = lambda parallel_config: parallel_config.data_parallel_size
+    monkeypatch.setitem(sys.modules, "vllm_torchtpu.utils", utils)
+
+    def past_guard():
+        raise _PastLockstepGuard
+
+    monkeypatch.setattr(aic, "_chip_pair_group", past_guard)
+    vllm_config = types.SimpleNamespace(
+        parallel_config=types.SimpleNamespace(
+            data_parallel_size=dp_size, enable_expert_parallel=expert_parallel
+        )
+    )
+    expected = (
+        pytest.raises(_PastLockstepGuard)
+        if allowed
+        else pytest.raises(RuntimeError, match="DP lockstep")
+    )
+    with expected:
+        aic.VllmDeepseekV4MLAAttentionIntraChip(vllm_config)
 
 
 def test_process_weights_sees_half_counts(monkeypatch):
