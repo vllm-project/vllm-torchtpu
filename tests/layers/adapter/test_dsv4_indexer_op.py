@@ -14,12 +14,14 @@
 
 from types import SimpleNamespace
 
+import jax.numpy as jnp
 import pytest
 import torch
 from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (
     VllmDeepseekV4IndexerCache,
+    _indexer_jax,
 )
 
 
@@ -40,6 +42,31 @@ def test_indexer_cache_spec_is_raw_uint8(block_size, expected_ratio):
     assert spec.dtype == torch.uint8
     assert spec.block_size == block_size
     assert spec.num_kv_heads == 1
-    # 128 record bytes + 1 scale byte, rounded to the 128-byte lane.
-    assert spec.head_size == 256
+    # 32 fp8 sublane groups + 1 scale group = 33 * 4 = 132 bytes per token.
+    assert spec.head_size == 132
     assert spec.tokens_per_state == expected_ratio
+
+
+def test_indexer_refuses_a_cache_of_the_other_layout():
+    """The indexer raises if the cache does not have the 33 SEQ_ALONG_LANE rows.
+
+    Without this check it would read the key bytes in the wrong order and
+    pick top-k from meaningless scores, with no error.
+    """
+    zeros = jnp.zeros((1,), jnp.int32)
+    with pytest.raises(ValueError, match="SEQ_ALONG_LANE layout"):
+        _indexer_jax(
+            jnp.zeros((1, 1, 128), jnp.bfloat16),
+            zeros,
+            jnp.zeros((1, 64), jnp.float32),
+            jnp.zeros((1, 1), jnp.float32),
+            jnp.zeros((1, 64, 4, 256), jnp.uint8),
+            zeros,
+            zeros,
+            jnp.zeros((2,), jnp.int32),
+            jnp.zeros((3,), jnp.int32),
+            k=1,
+            compression_ratio=4,
+            softmax_scale=1.0,
+            n_head=1,
+        )

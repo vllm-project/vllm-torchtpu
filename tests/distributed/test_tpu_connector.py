@@ -6236,11 +6236,11 @@ def test_dsv4_pool_plan_binds_each_tag_to_its_groups_page_geometry():
     ] == [
         ("dsv4.csa.nope.g0", 0, 1024, 131072, 512),
         ("dsv4.csa.rope.g0", 0, 1024, 32768, 512),
-        ("dsv4.idx.g1", 1, 1024, 65536, 1024),
+        ("dsv4.idx.g1", 1, 1024, 33792, 1024),
         ("dsv4.hca.g2", 2, 256, 262144, 512),
         ("dsv4.swa.g3", 3, 128, 131072, 512),
         ("dsv4.state.csa.g4", 4, 1024, 131072, 512),
-        ("dsv4.state.idx.g5", 5, 1024, 65536, 1024),
+        ("dsv4.state.idx.g5", 5, 1024, 33792, 1024),
         ("dsv4.state.hca.g6", 6, 256, 131072, 512),
     ]
     # Trim geometry lives on the groups instead, one entry per block table the

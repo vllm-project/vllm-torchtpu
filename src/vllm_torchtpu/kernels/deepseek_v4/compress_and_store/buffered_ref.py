@@ -210,6 +210,10 @@ class OutputRef(_BufferedRef):
         tile_n = self.cfgs.tile_sizes.tile_n
         global_idx = pid * tile_n
 
+        if self.cfgs.dims.seq_along_lane:
+            # The body staged the records in VMEM (`stage_sal_columns`); the
+            # cache is written once, after the pipeline.
+            return
         if self.cfgs.dims.mode == config.Mode.CSA_INDEXER:
             cache_ref, kv_slot_mapping_ref, is_first_mask_ref = dest_ref
 
@@ -262,6 +266,8 @@ class OutputRef(_BufferedRef):
 
         is_indexer = self.cfgs.dims.mode == config.Mode.CSA_INDEXER
 
+        if self.cfgs.dims.seq_along_lane:
+            return
         if is_indexer:
             _, kv_slot_mapping_ref, is_first_mask_ref = dest_ref
 
@@ -477,9 +483,10 @@ def create_allocs_and_specs(
         index_map=lambda i: (i, 0, 0, 0),
     )
     is_indexer = cfgs.dims.mode == config.Mode.CSA_INDEXER
-    buffer_type = (
-        pltpu.BufferType.INPUT_OUTPUT if is_indexer else pltpu.BufferType.OUTPUT
-    )
+    # The HEAD_ALONG_SUBLANE indexer read-modify-writes the cache's 4-token
+    # rows; SEQ_ALONG_LANE stages its records in VMEM instead (see kernel_fn).
+    rmw = is_indexer and not cfgs.dims.seq_along_lane
+    buffer_type = pltpu.BufferType.INPUT_OUTPUT if rmw else pltpu.BufferType.OUTPUT
     output_alloc = OutputRef.create(
         spec=output_spec,
         dtype_or_type=jnp.uint8,
@@ -488,7 +495,7 @@ def create_allocs_and_specs(
         use_lookahead=False,
         cfgs=cfgs,
     )
-    if is_indexer:
+    if is_indexer and not cfgs.dims.seq_along_lane:
         output_args = (cache_ref, kv_slot_mapping_ref, is_first_mask_ref)
     else:
         output_args = (cache_ref, kv_slot_mapping_ref)

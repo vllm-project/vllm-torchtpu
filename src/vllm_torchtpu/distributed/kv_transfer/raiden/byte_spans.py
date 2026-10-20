@@ -634,7 +634,14 @@ def lower_dsv4_row_spans(
             f"{num_tokens} tokens at {page_tokens} per page"
         )
     tail_tokens = num_tokens - (num_pages - 1) * page_tokens
-    tail_rows = -(-tail_tokens * rows_per_page // page_tokens)
+    # The SAL indexer cache puts tokens along the lane axis and spreads each
+    # token's head-dim + scale across all 33 rows, so a partial page still
+    # needs every row.
+    tail_rows = (
+        rows_per_page
+        if tag.startswith("dsv4.idx")
+        else -(-tail_tokens * rows_per_page // page_tokens)
+    )
     tail_bytes = tail_rows * row_bytes
     spans = tuple(
         PoolByteSpan(

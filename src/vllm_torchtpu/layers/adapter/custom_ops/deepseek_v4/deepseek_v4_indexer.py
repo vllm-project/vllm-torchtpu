@@ -28,8 +28,15 @@ from vllm.models.deepseek_v4.attention import DeepseekV4Indexer, DeepseekV4Index
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
+    config as compressor_config,
+)
 from vllm_torchtpu.kernels.deepseek_v4.rope import rope_quant
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    KVLayout,
+    get_kv_cache_shape,
+    streamindex_topk,
+)
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     VllmDeepseekCompressor,
 )
@@ -37,7 +44,6 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_pallas_op_mesh,
 )
-from vllm_torchtpu.utils import align_to
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
@@ -70,6 +76,12 @@ def _indexer_jax(
         # Profiling-shape trace: the kernel is skipped. Unused inputs stay in
         # the compiled signature because torch_tpu jits with keep_unused=True.
         return jnp.zeros((q.shape[0], k), dtype=jnp.int32)
+    if cache_kv.shape[1] != compressor_config.SAL_SUBLANE_GROUPS:
+        raise ValueError(
+            f"DeepSeek-V4 indexer cache {cache_kv.shape} does not match the "
+            "SEQ_ALONG_LANE layout "
+            f"(expected {compressor_config.SAL_SUBLANE_GROUPS} rows)."
+        )
 
     def _indexer_local(
         q,
@@ -108,6 +120,7 @@ def _indexer_jax(
             num_queries_per_block=(1, 128, 128),
             decode_req_batch_size=4,
             chunk_tokens=envs.TPU_STREAMIDX_CHUNK_TOKENS,
+            kv_layout=KVLayout.SEQ_ALONG_LANE,
         )
 
     return _indexer_local(
@@ -128,10 +141,16 @@ class VllmDeepseekV4IndexerCache(DeepseekV4IndexerCache):
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         block_size = self.cache_config.block_size
+        _, sublane_groups, packing, _ = get_kv_cache_shape(
+            1,
+            compressor_config.SAL_PAGE_SIZE,
+            128,
+            KVLayout.SEQ_ALONG_LANE,
+        )
         return MLAAttentionSpec(
             block_size=block_size,
             num_kv_heads=1,
-            head_size=align_to(128 + 1, 128),
+            head_size=sublane_groups * packing,
             dtype=torch.uint8,
             tokens_per_state=min(self.compress_ratio, block_size),
             alignment=None,

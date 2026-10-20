@@ -25,6 +25,13 @@ from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
     compute,
     config,
 )
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import kv_cache_append
+
+# SEQ_ALONG_LANE store: `_write_runs` processes destination cache tiles in
+# batches ("waves") of up to `_SAL_MAX_WAVE` tiles at a time -- issuing async
+# HBM->VMEM reads into a `_SAL_MAX_WAVE`-slot VMEM buffer (`rmw_ref`), patching
+# the staged lanes in VMEM, and DMAing the batch back to HBM.
+_SAL_MAX_WAVE = 128
 
 
 def inner_kernel(
@@ -38,6 +45,7 @@ def inner_kernel(
     kv_slot_mapping_ref,
     is_first_mask_ref,
     is_first_mask_rope_ref,
+    records_t_ref=None,
     *,
     cfgs: config.Configs,
 ):
@@ -141,7 +149,15 @@ def inner_kernel(
                 nope_width_bytes=cfgs.record_bytes,
                 last_dim_size=cfgs.last_dim_size,
             )
-        if cfgs.dims.mode == config.Mode.CSA_INDEXER:
+        if cfgs.dims.seq_along_lane:
+            # Stage the records as lanes of a cache-shaped VMEM array; the
+            # cache is written from it once the pipeline is done (kernel_fn).
+            compute.stage_sal_columns(
+                records_t_ref,
+                jnp.stack([nope_val_padded[n].flatten() for n in range(tile_n)]),
+                global_idx,
+            )
+        elif cfgs.dims.mode == config.Mode.CSA_INDEXER:
             kv_slots = []
             for i in range(tile_n):
                 kv_slots.append(kv_slot_mapping_ref[global_idx + i])
@@ -209,10 +225,25 @@ def kernel_fn(
     _out_cache_ref,
     _out_rope_cache_ref,
     window_scratch_ref,
-    *,
+    *sal_scratch,
     cfgs: config.Configs,
 ):
-    """Pallas kernel entry point."""
+    """Pallas kernel entry point.
+
+    `sal_scratch` is only used when the indexer cache is SEQ_ALONG_LANE. It is
+    then `(records_t, run_src, run_dst, rmw, sems)`, and the cache is written
+    in two phases:
+
+    1. During the pipeline, each grid step copies its records into
+       `records_t`, a VMEM buffer laid out like the cache.
+    2. After the pipeline, one pass copies `records_t` into the cache, one
+       128-lane tile at a time.
+
+    The write can't happen inside the pipeline. One 128-lane tile holds tokens
+    from many grid steps, so each step would have to read the tile, update it
+    and write it back, while the pipeline may already be prefetching that same
+    tile for a later step. The two would race.
+    """
     grid_size = grid_size_ref[...]
     allocs, in_specs, pipeline_args = buffered_ref.create_allocs_and_specs(
         cfgs=cfgs,
@@ -226,6 +257,7 @@ def kernel_fn(
         is_first_mask_ref=is_first_mask_ref,
         is_first_mask_rope_ref=is_first_mask_rope_ref,
     )
+    records_t_ref = sal_scratch[0] if cfgs.dims.seq_along_lane else None
 
     pipeline_func = pltpu.emit_pipeline(
         body=functools.partial(inner_kernel, cfgs=cfgs),
@@ -245,11 +277,37 @@ def kernel_fn(
                 kv_slot_mapping_ref,
                 is_first_mask_ref,
                 is_first_mask_rope_ref,
-            ),
+            )
+            + ((records_t_ref,) if records_t_ref is not None else ()),
             allocations=allocations,
         )
 
     _run()
+
+    if cfgs.dims.seq_along_lane:
+        _, run_src_ref, run_dst_ref, rmw_ref, sems = sal_scratch
+        ops = kv_cache_append._SalTiles(
+            records_t_ref, _out_cache_ref, rmw_ref, config.SAL_PAGE_SIZE
+        )
+        # Only the grid's tokens were staged; kv slot -1 marks the rest.
+        num_tokens = jnp.minimum(grid_size * cfgs.tile_sizes.tile_n, cfgs.dims.size_n)
+        num_runs = kv_cache_append._find_runs(
+            ops,
+            kv_slot_mapping_ref,
+            run_src_ref,
+            run_dst_ref,
+            num_rows=_out_cache_ref.shape[0] * config.SAL_PAGE_SIZE,
+            num_tokens=num_tokens,
+        )
+        kv_cache_append._write_runs(
+            ops,
+            num_runs,
+            run_src_ref,
+            run_dst_ref,
+            sems.at[0],
+            sems.at[1],
+            wave=rmw_ref.shape[0],
+        )
 
 
 def _select_mode(head_dim: int, overlap: bool) -> config.Mode:
@@ -309,6 +367,7 @@ def compute_is_first_mask(kv_slot_mapping, tile_n, pack_factor=4):
         "rms_eps",
         "interpret",
         "name",
+        "seq_along_lane",
     ),
     donate_argnames=("cache", "rope_cache"),
 )
@@ -331,8 +390,17 @@ def compress_norm_rope_store(
     rms_eps: float = 1e-6,
     interpret: bool = False,
     name: str = "compress_norm_rope_store",
+    seq_along_lane: bool = False,
 ) -> tuple[jax.Array, jax.Array | None]:
-    """Compresses, normalizes, applies RoPE and stores to cache."""
+    """Compresses, normalizes, applies RoPE and stores to cache.
+
+    With `seq_along_lane` (CSA indexer only), `cache` is the SEQ_ALONG_LANE
+    `[num_pages, SAL_SUBLANE_GROUPS, SLOT_PACK, SAL_PAGE_SIZE]` =
+    `[num_pages, 33, 4, 256]` array (32 fp8 sublane groups + 1 scale group,
+    4 bytes per group, 256 compressed tokens per page). Its f32 state is read
+    through the same `(rows, 4, 256)` view as always; the records are staged in
+    VMEM as cache lanes and stored after the pipeline (see `kernel_fn`).
+    """
     assert block_table.ndim == 1
     assert block_table.shape[0] % block_table_stride == 0
 
@@ -355,7 +423,13 @@ def compress_norm_rope_store(
         rope_head_dim=rope_head_dim,
         compress_ratio=compress_ratio,
         quant_block=quant_block,
+        seq_along_lane=seq_along_lane,
     )
+    if seq_along_lane and cache.shape[-1] != config.SAL_PAGE_SIZE:
+        raise ValueError(
+            f"SEQ_ALONG_LANE indexer cache {cache.shape} must have "
+            f"{config.SAL_PAGE_SIZE} token lanes per page."
+        )
 
     if cfgs.dims.mode in (config.Mode.CSA, config.Mode.CSA_INDEXER):
         assert cfgs.tile_sizes.tile_n % 4 == 0, (
@@ -374,17 +448,22 @@ def compress_norm_rope_store(
     max_idx = jnp.max(jnp.where(valid, indices, -1))
     grid_size = jnp.where(max_idx >= 0, pl.cdiv(max_idx + 1, cfgs.tile_sizes.tile_n), 0)
 
-    is_first_mask = compute_is_first_mask(
-        kv_slot_mapping,
-        cfgs.tile_sizes.tile_n,
-        pack_factor=cfgs.tokens_in_second_minor,
-    )
-    is_first_mask_rope = compute_is_first_mask(
-        kv_slot_mapping,
-        cfgs.tile_sizes.tile_n,
-        # TODO: this is confusing, should probably find a better name for it
-        pack_factor=cfgs.hbm_pack,
-    )
+    if seq_along_lane:
+        # Unread under SAL (no row merging, no RoPE cache); keep SMEM for the
+        # final store's run tables instead.
+        is_first_mask = is_first_mask_rope = jnp.zeros((1,), jnp.bool_)
+    else:
+        is_first_mask = compute_is_first_mask(
+            kv_slot_mapping,
+            cfgs.tile_sizes.tile_n,
+            pack_factor=cfgs.tokens_in_second_minor,
+        )
+        is_first_mask_rope = compute_is_first_mask(
+            kv_slot_mapping,
+            cfgs.tile_sizes.tile_n,
+            # TODO: this is confusing, should probably find a better name for it
+            pack_factor=cfgs.hbm_pack,
+        )
     # Look up each token's state pages here so the kernel keeps only those
     # entries in SMEM; the full block table does not fit at long context lengths.
     pages_per_token = cfgs.pages_to_buffer_per_token
@@ -440,11 +519,27 @@ def compress_norm_rope_store(
         cfgs.dims.has_rope, cfgs.dims.has_rope_cache, len(scalar_prefetch)
     )
 
+    scratch_shapes = [pltpu.VMEM(cfgs.window_shape(), jnp.float32)]
+    if seq_along_lane:
+        # See kernel_fn: staged records, the run tables of the final store
+        # (one slot per token + a sentinel), its read-modify-write tiles.
+        wave = max(1, min(num_tokens, _SAL_MAX_WAVE))
+        scratch_shapes += [
+            pltpu.VMEM(cfgs.records_t_shape(), jnp.uint8),
+            pltpu.SMEM((num_tokens + 1,), jnp.int32),
+            pltpu.SMEM((num_tokens + 1,), jnp.int32),
+            pltpu.VMEM(
+                (wave, config.SAL_SUBLANE_GROUPS, config.SLOT_PACK, config.LANE),
+                jnp.uint8,
+            ),
+            pltpu.SemaphoreType.DMA((2,)),
+        ]
+
     grid_spec = pltpu.PrefetchScalarGridSpec(
         num_scalar_prefetch=len(scalar_prefetch),
         in_specs=in_specs,
         out_specs=out_specs,
-        scratch_shapes=[pltpu.VMEM(cfgs.window_shape(), jnp.float32)],
+        scratch_shapes=scratch_shapes,
     )
 
     out_cache, out_rope_cache = pl.pallas_call(

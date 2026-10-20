@@ -1417,6 +1417,7 @@ def build_glm_mla_pool_manifest(
 DSV4_STATE_CACHE_SUFFIX = ".compressor.state_cache"
 DSV4_INDEXER_CACHE_SUFFIX = ".indexer.k_cache"
 DSV4_CSA_COMPRESS_RATIO = 4
+DSV4_IDX_SAL_ROWS = 33
 
 _DSV4_STATE_TAG_BY_KV_TAG = {
     TAG_DSV4_CSA_NOPE: TAG_DSV4_STATE_CSA,
@@ -1621,7 +1622,7 @@ def _dsv4_check_role_rows(
     if kv_tag == TAG_DSV4_CSA_NOPE:
         expected = {"nope": tokens, "rope": tokens // DSV4_CSA_COMPRESS_RATIO}
     elif kv_tag == TAG_DSV4_IDX:
-        expected = {"k_cache": tokens // DSV4_CSA_COMPRESS_RATIO}
+        expected = {"k_cache": DSV4_IDX_SAL_ROWS}
     else:
         expected = {"latents": tokens * 2}
     for (role, rows), array in zip(expected.items(), arrays):
