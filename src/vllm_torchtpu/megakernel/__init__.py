@@ -11,9 +11,9 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Exception types and shared numeric/normalization primitives for `megakernel`."""
+"""Exception types, numeric primitives, and VMEM pool aliasing for `megakernel`."""
 
-from . import errors, ops
+from . import errors, ops, pool_alias
 from .errors import MegakernelConfigError, MegakernelLayoutError
 from .ops import rup
 
@@ -22,5 +22,6 @@ __all__ = [
     "MegakernelLayoutError",
     "errors",
     "ops",
+    "pool_alias",
     "rup",
 ]
