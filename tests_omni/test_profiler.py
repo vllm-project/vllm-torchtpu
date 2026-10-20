@@ -42,16 +42,6 @@ def _profiler_config(tmp_path, with_stack=False):
     )
 
 
-def _run_root(wrapper):
-    """XSpace run root shared by all ranks, set by _start()."""
-    return wrapper._capture_state.run_root
-
-
-def _canonical_ts(wrapper):
-    """Canonical capture timestamp this rank resolved in _start()."""
-    return wrapper._capture_state.canonical_ts
-
-
 @pytest.fixture
 def tpu_profiler(monkeypatch, tmp_path):
     """Stubs torch.profiler and the TPU profiler config for the wrapper tests.
@@ -168,8 +158,8 @@ def test_tpu_omni_profiler_shared_run_root(tmp_path, tpu_profiler):
     w1._start()
     w2._start()
 
-    run_root = _run_root(w1)
-    assert run_root == _run_root(w2), (
+    run_root = w1._capture_state.run_root
+    assert run_root == w2._capture_state.run_root, (
         "workers with the same trace filename must share one run root so "
         "their ranks merge into one capture"
     )
@@ -229,7 +219,7 @@ def test_tpu_omni_profiler_canonical_ts_sync(tmp_path, tpu_profiler, monkeypatch
     monkeypatch.setattr("torch.distributed.get_rank", lambda: 1)
     w1._start()
 
-    ts0, ts1 = _canonical_ts(w0), _canonical_ts(w1)
+    ts0, ts1 = w0._capture_state.canonical_ts, w1._capture_state.canonical_ts
     assert ts0 == ts1, (
         "both ranks of one run must resolve the same canonical ts so their "
         f"XSpaces land in one plugins/profile/<ts> dir, got {ts0} vs {ts1}"
