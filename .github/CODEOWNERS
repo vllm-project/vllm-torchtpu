@@ -24,6 +24,10 @@
 /src/vllm_torchtpu/kernels/experimental/batched_rpa/ @kwang3939 @a1yssan13
 /src/vllm_torchtpu/kernels/gdn/v3/ @brianseung-google @mhhuang-machine
 
+# Megakernel library (framework-free JAX/Pallas)
+/src/vllm_torchtpu/megakernel/ @caojx-google @weinan1997 @hhb
+/tests/megakernel/ @caojx-google @weinan1997 @hhb
+
 # Model layers
 /src/vllm_torchtpu/layers/ @kyuyeunk @qizzzh
 
