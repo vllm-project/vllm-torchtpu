@@ -38,7 +38,6 @@ PR/nightly tests.
 
 import copy
 import dataclasses
-import importlib
 
 import pytest
 import torch
@@ -77,6 +76,9 @@ from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.layers.rope import RotaryEmbeddingWan
 from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     load_wan_weights_with_optional_gate,
+)
+from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import (
+    WanS2VTransformer3DModel,
 )
 from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
     WanRotaryPosEmbed,
@@ -615,25 +617,16 @@ class TestWanFreshTimestepPatch:
     """The patched Wan forward gets a flushed copy of the timestep view."""
 
     @pytest.mark.parametrize(
-        ("module_name", "cls_name"),
-        [
-            ("wan2_2_transformer", "WanTransformer3DModel"),
-            ("wan2_2_vace_transformer", "WanVACETransformer3DModel"),
-            ("wan2_2_s2v_transformer", "WanS2VTransformer3DModel"),
-        ],
+        "cls",
+        [WanTransformer3DModel, WanVACETransformer3DModel, WanS2VTransformer3DModel],
         ids=["wan", "vace", "s2v"],
     )
     def test_forward_gets_flushed_copy_of_timestep_view(
-        self, monkeypatch: pytest.MonkeyPatch, module_name: str, cls_name: str
+        self, monkeypatch: pytest.MonkeyPatch, cls: type
     ) -> None:
         """Keyword only: the wrapper names timestep, and the pipelines call
         forward by keyword."""
         from vllm_torchtpu.omni import patches
-
-        cls = getattr(
-            importlib.import_module(f"vllm_omni.diffusion.models.wan2_2.{module_name}"),
-            cls_name,
-        )
 
         calls = []
         monkeypatch.setattr(
