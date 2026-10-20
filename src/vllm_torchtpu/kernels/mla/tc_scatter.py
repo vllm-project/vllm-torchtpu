@@ -65,6 +65,12 @@ def supports(
         return False
     if rope_spec.layout is not KVCacheLayout.SPARSECORE:
         return False
+    # Packed rope (eight tokens per row) keeps the SparseCore writer: through
+    # the full DCP step on TPU this kernel left one token's rope bytes
+    # different from the padded cache's (test_dcp_packed_rope_matches_padded),
+    # which the interpreter does not reproduce.
+    if rope_spec.packed_rope:
+        return False
     # A nope token must be exactly one cache row, and a rope row a whole
     # number of rope tokens.
     nope_words = nope_spec.token_bytes // WORD_BYTES
