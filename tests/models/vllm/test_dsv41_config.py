@@ -30,7 +30,9 @@ def config(**policy):
         additional_config={"deepseek_v41": policy, "unrelated": 17},
         engram_config=SimpleNamespace(cpu_offload=True),
         parallel_config=SimpleNamespace(
-            enable_expert_parallel=True, prefill_context_parallel_size=1
+            enable_expert_parallel=True,
+            prefill_context_parallel_size=1,
+            tensor_parallel_size=1,
         ),
         kernel_config=SimpleNamespace(moe_backend="auto"),
         model_config=SimpleNamespace(hf_config=SimpleNamespace(expert_dtype="fp4")),
@@ -42,32 +44,45 @@ def config(**policy):
 
 @pytest.mark.parametrize("execution", ["full", "ced"])
 @pytest.mark.parametrize("moe", ["gmm", "fused_ep_w4a8"])
-def test_policy_round_trips_to_worker_and_config_hash_input(execution, moe):
-    cfg = config(execution=execution, moe=moe)
+@pytest.mark.parametrize("csa_precision", ["bf16", "fp8"])
+def test_policy_round_trips_to_worker_and_config_hash_input(
+    execution, moe, csa_precision
+):
+    cfg = config(execution=execution, moe=moe, csa_precision=csa_precision)
     verify_and_update_config(cfg)
     before = json.dumps(cfg.additional_config, sort_keys=True)
     worker = copy.deepcopy(cfg)
     verify_and_update_config(worker)
     assert json.dumps(worker.additional_config, sort_keys=True) == before
     assert DeepseekV41Config.from_vllm_config(worker) == DeepseekV41Config.parse(
-        dict(execution=execution, moe=moe)
+        dict(execution=execution, moe=moe, csa_precision=csa_precision)
     )
     assert worker.additional_config["unrelated"] == 17
 
 
 @pytest.mark.parametrize(
     "policy",
-    [{"moe": "adaptive"}, {"tile": 48}, {"execution": True}, {"engram": "gpu"}],
+    [
+        {"moe": "adaptive"},
+        {"tile": 48},
+        {"execution": True},
+        {"engram": "gpu"},
+        {"csa_precision": "fp4"},
+    ],
 )
 def test_rejects_unknown_or_mistyped_options(policy):
     with pytest.raises((ValueError, TypeError)):
         verify_and_update_config(config(**policy))
 
 
-def test_defaults_are_explicit_and_do_not_enable_approximation():
+def test_defaults_are_explicit_and_select_fp8_csa():
     cfg = config()
     verify_and_update_config(cfg)
-    assert cfg.additional_config["deepseek_v41"] == {"execution": "full", "moe": "gmm"}
+    assert cfg.additional_config["deepseek_v41"] == {
+        "execution": "full",
+        "moe": "gmm",
+        "csa_precision": "fp8",
+    }
 
 
 def test_legacy_values_are_frozen_before_worker_env_changes(monkeypatch):
@@ -77,6 +92,7 @@ def test_legacy_values_are_frozen_before_worker_env_changes(monkeypatch):
     verify_and_update_config(cfg)
     monkeypatch.delenv("TPU_DEEPSEEK_V41_CED")
     assert DeepseekV41Config.from_vllm_config(cfg).execution == ExecutionMode.CED
+    assert DeepseekV41Config.from_vllm_config(cfg).csa_precision == "fp8"
 
 
 def test_conflicting_legacy_env_is_rejected(monkeypatch):
@@ -117,6 +133,13 @@ def test_ced_requires_bounded_prefix_replay():
     cfg = config(execution="ced")
     cfg.cache_config.swa_bounded_replay = False
     with pytest.raises(ValueError, match="swa-bounded-replay"):
+        verify_and_update_config(cfg)
+
+
+def test_fp8_csa_requires_tp1():
+    cfg = config(csa_precision="fp8")
+    cfg.parallel_config.tensor_parallel_size = 2
+    with pytest.raises(ValueError, match="tensor-parallel-size=1"):
         verify_and_update_config(cfg)
 
 

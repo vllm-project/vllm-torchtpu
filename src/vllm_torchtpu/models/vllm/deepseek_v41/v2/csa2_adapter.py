@@ -21,6 +21,10 @@ from vllm_torchtpu.kernels.deepseek_v41.csa2_metadata import (
 from vllm_torchtpu.kernels.deepseek_v41.csa2_pipeline import csa2_pipeline
 from vllm_torchtpu.kernels.deepseek_v41.tuned_block_sizes import csa2_gather_chunk_size
 from vllm_torchtpu.kernels.mla.paged_swa import swa_word_pages, write_swa_word_pool
+from vllm_torchtpu.models.vllm.deepseek_v41.config import (
+    CSAPrecision,
+    DeepseekV41Config,
+)
 
 if TYPE_CHECKING:
     from .cache import PagedCacheRows
@@ -93,6 +97,8 @@ def _attend(
     scale: float,
     non_causal: bool,
     bq: int,
+    *,
+    fp8: bool = False,
 ) -> jax.Array:
     return csa2(
         q,
@@ -109,6 +115,7 @@ def _attend(
         compress_ratio=ratio,
         scale=scale,
         bq=bq,
+        fp8=fp8,
     )
 
 
@@ -135,6 +142,8 @@ def _gather_attend(
     scale: float,
     non_causal: bool,
     bq: int,
+    *,
+    fp8: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     records, counts = prepare_main_records(
         selected, pages, main_starts, page_size=main_page_size
@@ -156,6 +165,7 @@ def _gather_attend(
         bq=bq,
         scale=scale,
         compress_ratio=ratio,
+        fp8=fp8,
     )
     return output, words, scales, counts
 
@@ -208,11 +218,11 @@ def _manual_bridge(function, mesh, tensor_args, out_specs):
     from jax.sharding import PartitionSpec as P
 
     @functools.wraps(function)
-    def call(*args):
+    def call(*args, **kwargs):
         # Scalars are static trailing arguments. Optional banks remain part of
         # the array pytree, matching the native attention bridge contract.
         return jax.shard_map(
-            lambda *arrays: function(*arrays, *args[tensor_args:]),
+            lambda *arrays: function(*arrays, *args[tensor_args:], **kwargs),
             mesh=mesh,
             in_specs=(P(),) * tensor_args,
             out_specs=out_specs,
@@ -227,6 +237,7 @@ def initialize_csa2_ops() -> None:
         return
     from jax.sharding import PartitionSpec as P
     from torch_tpu._internal import pallas
+    from vllm.config import get_current_vllm_config
 
     from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
         get_pallas_op_mesh,
@@ -234,6 +245,8 @@ def initialize_csa2_ops() -> None:
     )
 
     mesh = get_vllm_model_wrapper_context().mesh
+    policy = DeepseekV41Config.from_vllm_config(get_current_vllm_config())
+    fp8 = policy.csa_precision == CSAPrecision.FP8
     definitions = (
         ("metadata", _metadata, (P(),) * 4 + (None,) * 4, _fake_metadata),
         (
@@ -262,13 +275,13 @@ def initialize_csa2_ops() -> None:
         ),
         (
             "attend",
-            _attend,
+            functools.partial(_attend, fp8=fp8),
             (P(),) * 12 + (None,) * 5,
             lambda q, *_: torch.empty_like(q),
         ),
         (
             "gather_attend",
-            _gather_attend,
+            functools.partial(_gather_attend, fp8=fp8),
             (P(),) * 16 + (None,) * 6,
             _fake_gather_attend,
         ),

@@ -10,7 +10,7 @@ they are no longer a selectable serving backend.
 Keep topology, KV dtype, scheduling, compilation buckets and speculation in
 vLLM's standard arguments. Engram placement uses the existing typed
 `--engram-config`; TPU performs host lookups rather than CUDA UVA accesses.
-Two TPU-specific decisions use vLLM's OOT config transport:
+TPU-specific choices use vLLM's OOT config transport:
 
 ```bash
 --engram-config '{"cpu_offload":true}' \
@@ -29,6 +29,7 @@ enum has no TPU fused-EP entry. Leave `--moe-backend=auto` for this model.
 | --- | --- | --- |
 | `deepseek_v41.execution` | `full`, `ced` | `full` |
 | `deepseek_v41.moe` | `gmm`, `fused_ep_w4a8` | `gmm` |
+| `deepseek_v41.csa_precision` | `bf16`, `fp8` | `fp8` |
 | `engram_config.cpu_offload` | `false`, `true` | `false` (legacy TPU default) |
 
 `fused_ep_w4a8` explicitly selects FP4 weights with FP8 activations; selecting
@@ -38,6 +39,14 @@ height tuning. The old enable flags and deployment token threshold cannot
 silently move it to GMM. Unsupported weight/mesh/hardware contracts stop loading
 with an error; the generic `gmm` choice remains available. Other models retain
 their existing MoE admission behavior.
+
+The default `csa_precision=fp8` enables FP8 QK and PV in TP1 CSA2 attention. Packed FP8 KV
+is unpacked without BF16 dequantization. Queries are quantized per head; QK
+results are multiplied by the query and KV scales. The KV scale is absorbed
+into probabilities before per-head FP8 quantization for PV. SWA stays BF16,
+and softmax and accumulators stay FP32. This adds Q/P rounding error; select
+`csa_precision=bf16` for the quality reference or tensor parallel sizes above one.
+The cache format is unchanged.
 
 `ced` deliberately approximates decoder SWA state and is not numerically
 equivalent to a full decoder pass for long prompts. It processes all encoder

@@ -117,6 +117,7 @@ def main() -> None:
     )
     parser.add_argument("--rounds", type=int)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--csa-precision", choices=("bf16", "fp8"), default="fp8")
     args = parser.parse_args()
     if args.rounds is None:
         args.rounds = 1 if args.scenario == "decode" else 5
@@ -189,6 +190,16 @@ def main() -> None:
         "server_step_worker.ServerStepWorker",
         "--compilation-config",
         json.dumps({"compile_sizes": buckets}),
+        "--additional-config",
+        json.dumps(
+            {
+                "deepseek_v41": {
+                    "execution": "ced",
+                    "moe": "fused_ep_w4a8",
+                    "csa_precision": args.csa_precision,
+                }
+            }
+        ),
     ]
     if args.profile:
         server_command += [

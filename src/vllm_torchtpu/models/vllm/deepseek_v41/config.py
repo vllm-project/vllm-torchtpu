@@ -26,19 +26,26 @@ class MoEBackend(StrEnum):
     FUSED_EP_W4A8 = "fused_ep_w4a8"
 
 
+class CSAPrecision(StrEnum):
+    BF16 = "bf16"
+    FP8 = "fp8"
+
+
 @dataclass(frozen=True)
 class DeepseekV41Config:
     execution: ExecutionMode = ExecutionMode.FULL
     moe: MoEBackend = MoEBackend.GMM
+    csa_precision: CSAPrecision = CSAPrecision.FP8
 
     @classmethod
     def parse(cls, value: dict) -> "DeepseekV41Config":
-        unknown = value.keys() - {"execution", "moe"}
+        unknown = value.keys() - {"execution", "moe", "csa_precision"}
         if unknown:
             raise ValueError(f"Unknown deepseek_v41 config fields: {sorted(unknown)}")
         return cls(
             execution=ExecutionMode(value.get("execution", "full")),
             moe=MoEBackend(value.get("moe", "gmm")),
+            csa_precision=CSAPrecision(value.get("csa_precision", "fp8")),
         )
 
     @classmethod
@@ -154,6 +161,8 @@ def verify_and_update_config(config: "VllmConfig") -> None:
             "deprecated; use --engram-config instead"
         )
     parallel = config.parallel_config
+    if policy.csa_precision == CSAPrecision.FP8 and parallel.tensor_parallel_size != 1:
+        raise ValueError("FP8 CSA2 requires tensor-parallel-size=1")
     if envs.TPU_DEEPSEEK_V41_IMPL != "v2":
         raise ValueError("DSV41 serving uses v2; remove TPU_DEEPSEEK_V41_IMPL")
     if config.kernel_config.moe_backend != "auto":

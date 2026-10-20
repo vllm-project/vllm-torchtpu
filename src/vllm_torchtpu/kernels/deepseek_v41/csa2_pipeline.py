@@ -11,7 +11,7 @@ from vllm_torchtpu.kernels.deepseek_v41.csa2_cache import gather_csa2_kv_sc
 
 
 @functools.partial(
-    jax.jit, static_argnames=("chunk_size", "bq", "scale", "compress_ratio")
+    jax.jit, static_argnames=("chunk_size", "bq", "scale", "compress_ratio", "fp8")
 )
 def csa2_pipeline(
     q: jax.Array,
@@ -31,6 +31,7 @@ def csa2_pipeline(
     bq: int,
     scale: float,
     compress_ratio: int,
+    fp8: bool = False,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Return attention and contiguous gathered KV for subsequent layer reuse.
 
@@ -89,6 +90,7 @@ def csa2_pipeline(
             scale=scale,
             compress_ratio=compress_ratio,
             bq=bq,
+            fp8=fp8,
         )
         if following is not None:
             current = following

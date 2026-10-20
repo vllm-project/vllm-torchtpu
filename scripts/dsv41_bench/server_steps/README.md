@@ -88,6 +88,12 @@ For native GCS weight streaming, also set `MODEL_URI=gs://bucket/model-prefix`.
 The target and DSpark models use that URI; `MODEL_PATH` remains the local
 checkpoint metadata and tokenizer path. CI sets both paths and omits `--profile`.
 
+For a matched CSA precision comparison, run the same frozen inputs and source
+twice with `--csa-precision bf16` and `--csa-precision fp8`, using separate output
+directories. The default is FP8. FP8 changes Q/P rounding inside CSA2 while
+keeping SWA in BF16; compare accepted-token throughput as well as the fixed
+acceptance-rate estimate, because speculative acceptance can change.
+
 `run.py` starts the server, waits for HTTP health readiness,
 runs a separate warmup and five formal rounds, optionally collects a separate
 profile wave, and stops its server process group. The startup timeout defaults

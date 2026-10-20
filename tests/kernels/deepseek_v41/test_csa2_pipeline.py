@@ -23,8 +23,9 @@ def sparsecore_device():
 
 @pytest.mark.parametrize("banked", [False, True])
 @pytest.mark.parametrize("non_causal", [False, True])
+@pytest.mark.parametrize("fp8", [False, True])
 def test_chunked_attention_preserves_requests_and_reusable_kv(
-    sparsecore_device, banked, non_causal
+    sparsecore_device, banked, non_causal, fp8
 ):
     # Three requests straddle chunk boundaries, with empty requests interleaved
     # and a final chunk containing only padding. Noncausal windows include KV
@@ -77,7 +78,7 @@ def test_chunked_attention_preserves_requests_and_reusable_kv(
         axis=1,
     )
     sink = jnp.linspace(-1, 1, heads, dtype=jnp.float32)
-    kwargs = dict(scale=512**-0.5, compress_ratio=2, bq=6)
+    kwargs = dict(scale=512**-0.5, compress_ratio=2, bq=6, fp8=fp8)
 
     def attend(query, selected_words, selected_scales, offset=0):
         end = offset + query.shape[0]

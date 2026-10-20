@@ -51,6 +51,7 @@ steps:
         bash .buildkite/scripts/run_in_docker.sh
         python -m pytest
         tests/models/vllm/test_dsv41_config.py
+        tests/models/vllm/test_csa2_chunk_cache.py
         tests/models/vllm/test_dsv41_v2_model_full.py
         tests/models/vllm/test_dsv41_v2_model_sp.py
         tests/models/vllm/test_dsv41_v2_local_q.py
@@ -66,6 +67,21 @@ steps:
   - group: "DeepSeek-V4.1-Flash on TPU"
     depends_on: "build_docker"
     steps:
+      - label: "DeepSeek-V4.1 CSA2 precision and gather pipeline"
+        key: "dsv41_csa2_precision"
+        timeout_in_minutes: 30
+        agents:
+          queue: "tpu_v7x_2_queue"
+        commands:
+          - >-
+            bash .buildkite/scripts/run_in_docker.sh
+            python -m pytest
+            tests/kernels/deepseek_v41/test_csa2_accumulators.py
+            tests/kernels/deepseek_v41/test_csa2_pipeline.py
+            -q --junitxml=/perf_eval_results/dsv41-csa2.xml
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
       - label: "DeepSeek-V4.1-Flash: DP8 full-forward smoke + GSM8K"
         key: "dsv41_flash_dp8_ep_gsm8k"
         timeout_in_minutes: 180

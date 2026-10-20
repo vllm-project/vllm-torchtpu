@@ -23,8 +23,10 @@ prefetch across request boundaries during the current group's computation. Each 
 has independent DMA semaphores; only Q, packed KV, scales and RoPE are doubled.
 The BF16 KV workspace and output buffers are reused after their consumers finish.
 
-CSA dequantizes KV to BF16 once for QK/PV reuse. All GEMMs use BF16 operands
-and FP32 accumulators, softmax uses FP32, and probabilities are stored in BF16.
+CSA optionally keeps KV in FP8 for QK/PV. Q is quantized per head; KV scales
+multiply QK logits and are absorbed into P before per-head FP8 quantization.
+SWA stays BF16, and accumulators and softmax stay FP32. BF16 CSA remains the
+default for callers that require the original attention precision.
 Each QK launches before the preceding Q's softmax. CSA PV starts as soon as
 its P is ready; SWA PV reuses its RHS for two Qs. Both PV results stay in
 independent MRB regions while the next tile runs softmax. QK uses two slots,
@@ -48,6 +50,13 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 
+def _quantize_rows(values: jax.Array) -> tuple[jax.Array, jax.Array]:
+    limit = float(jnp.finfo(jnp.float8_e4m3fn).max)
+    scale = jnp.max(jnp.abs(values), axis=-1, keepdims=True) / limit
+    scale = jnp.where(scale > 0, scale, 1.0)
+    return jnp.clip(values / scale, -limit, limit).astype(jnp.float8_e4m3fn), scale
+
+
 def main_kernel(
     starts_ref: Any,
     positions_ref: Any,
@@ -63,7 +72,10 @@ def main_kernel(
     q_buffer_ref: Any,
     main_fp8_buffer_ref: Any,
     main_scale_buffer_ref: Any,
-    main_bf16_ref: Any,
+    main_values_ref: Any,
+    main_q_ref: Any,
+    q_scale_ref: Any,
+    p_scale_ref: Any,
     swa_first_ref: Any,
     swa_shared_ref: Any,
     swa_cache_ids: Any,
@@ -81,6 +93,7 @@ def main_kernel(
     compress_ratio: int,
     bq: int,
     interpret: bool,
+    fp8: bool,
     swa_metadata_ref: Any = None,
     swa_bounds_ref: Any = None,
 ) -> None:
@@ -90,7 +103,8 @@ def main_kernel(
     swa_kv_hbm_ref = swa_banks[0]
     request_limit = starts_ref.shape[0] - 1
     num_heads = q_hbm_ref.shape[1]
-    mxu_heads = pl.cdiv(num_heads, 16) * 16
+    head_alignment = 32 if fp8 else 16
+    mxu_heads = pl.cdiv(num_heads, head_alignment) * head_alignment
     mrb_stride = mxu_heads // 4
     window_size = 128
     sink_dma = pltpu.make_async_copy(sink_hbm_ref, sink_ref, dma_sem.at[0])
@@ -405,13 +419,12 @@ def main_kernel(
                     start_block_dma(wanted + 1)
                     swa_prefetched_id[0] = wanted + 1
 
-        def dequant(i):
+        def prepare_main(i):
             # Byte g of each word holds feature g * 128 + lane.
             words_ref = main_fp8_ref.at[i].bitcast(jnp.uint32).reshape(512, 128)
             for row in range(0, 512, 128):
                 rows = pl.ds(row, 128)
                 words = words_ref[rows, :]
-                scales = main_scale_ref[i, 0, rows][:, None]
                 for group in range(4):
                     if interpret:
                         # unpack_elementwise has no CPU lowering.
@@ -425,10 +438,18 @@ def main_kernel(
                         )
                     values = lax.bitcast_convert_type(
                         bits.astype(jnp.uint8), jnp.float8_e4m3fn
-                    ).astype(jnp.float32)
-                    main_bf16_ref[i, rows, pl.ds(group * 128, 128)] = (
-                        values * scales
-                    ).astype(jnp.bfloat16)
+                    )
+                    if not fp8:
+                        values = (
+                            values.astype(jnp.float32)
+                            * main_scale_ref[i, 0, rows][:, None]
+                        ).astype(jnp.bfloat16)
+                    main_values_ref[i, rows, pl.ds(group * 128, 128)] = values
+            if fp8:
+                query = q_ref[i].astype(jnp.float32)
+                q8, q_scale = _quantize_rows(query)
+                main_q_ref[i] = q8
+                q_scale_ref[i] = jnp.broadcast_to(q_scale, (num_heads, 128))
 
         transfer_group(request_index, t0, bank, wait=True)
 
@@ -501,12 +522,15 @@ def main_kernel(
                     for mxu in range(2):
                         ns = pl.ds(mxu * 256, 256)
                         rhs = (
-                            main_bf16_ref[i, ks, ns] if pv else main_bf16_ref[i, ns, ks]
+                            main_values_ref[i, ks, ns]
+                            if pv
+                            else main_values_ref[i, ns, ks]
                         )
                         pltpu.matmul_push_rhs(
                             rhs, staging_register=0, mxu_index=mxu, transpose=not pv
                         )
-                        lhs = main_p_ref[i, :, ks] if pv else q_ref[i, :, ks]
+                        query_ref = main_q_ref if fp8 else q_ref
+                        lhs = main_p_ref[i, :, ks] if pv else query_ref[i, :, ks]
                         lhs = jnp.pad(lhs, ((0, mxu_heads - num_heads), (0, 0)))
                         pltpu.matmul_acc_lhs(
                             accumulator(mxu, addr), lhs, load_staged_rhs=0
@@ -514,24 +538,32 @@ def main_kernel(
 
             def csa_pop(i, addr, *, pv):
                 if interpret:
-                    lhs = main_p_ref[i] if pv else q_ref[i]
-                    rhs = main_bf16_ref[i] if pv else main_bf16_ref[i].T
-                    return jnp.dot(lhs, rhs, preferred_element_type=jnp.float32)
-                return jnp.concatenate(
-                    tuple(
-                        pltpu.matmul_pop(accumulator(mxu, addr))[:num_heads]
-                        for mxu in range(2)
-                    ),
-                    axis=1,
-                )
+                    query_ref = main_q_ref if fp8 else q_ref
+                    lhs = main_p_ref[i] if pv else query_ref[i]
+                    rhs = main_values_ref[i] if pv else main_values_ref[i].T
+                    result = jnp.dot(lhs, rhs, preferred_element_type=jnp.float32)
+                else:
+                    result = jnp.concatenate(
+                        tuple(
+                            pltpu.matmul_pop(accumulator(mxu, addr))[:num_heads]
+                            for mxu in range(2)
+                        ),
+                        axis=1,
+                    )
+                if fp8:
+                    if pv:
+                        result *= p_scale_ref[i, :, :1]
+                    else:
+                        result *= q_scale_ref[i, :, :1] * main_scale_ref[i]
+                return result
 
-            dequant(0)
+            prepare_main(0)
             if not interpret:
                 csa_launch(0, 0, pv=False)
 
             def softmax(i, addr, *, has_next=True):
                 if has_next:
-                    dequant(i + 1)
+                    prepare_main(i + 1)
                 if not interpret and has_next:
                     csa_launch(i + 1, mrb_stride - addr, pv=False)
                 main_logits = csa_pop(i, addr, pv=False) * scale
@@ -569,9 +601,16 @@ def main_kernel(
                 denominator = jnp.exp(sink - maximum) + jnp.sum(
                     exponentials, axis=1, keepdims=True
                 )
-                probabilities = (exponentials / denominator).astype(jnp.bfloat16)
-                main_p_ref[i] = probabilities[:, :512]
-                swa_p_ref[i] = probabilities[:, 512:]
+                probabilities = exponentials / denominator
+                if fp8:
+                    # Per-key KV scales belong inside the PV contraction.
+                    weighted = probabilities[:, :512] * main_scale_ref[i]
+                    p8, p_scale = _quantize_rows(weighted)
+                    main_p_ref[i] = p8
+                    p_scale_ref[i] = jnp.broadcast_to(p_scale, (num_heads, 128))
+                else:
+                    main_p_ref[i] = probabilities[:, :512].astype(jnp.bfloat16)
+                swa_p_ref[i] = probabilities[:, 512:].astype(jnp.bfloat16)
 
             # Each 256-wide FP32 MRB has 256 addresses, four rows per address.
             if 10 * mrb_stride <= 256:
@@ -861,7 +900,7 @@ def _bounded_paged_main_kernel(
 
 
 @functools.partial(
-    jax.jit, static_argnames=("scale", "compress_ratio", "bq", "interpret")
+    jax.jit, static_argnames=("scale", "compress_ratio", "bq", "interpret", "fp8")
 )
 def csa2(
     q: jax.Array,
@@ -877,6 +916,7 @@ def csa2(
     compress_ratio: int = 2,
     bq: int = 6,
     interpret: bool = False,
+    fp8: bool = False,
     main_lengths: jax.Array | None = None,
     swa_metadata: jax.Array | None = None,
     swa_bounds: jax.Array | None = None,
@@ -906,6 +946,8 @@ def csa2(
         with sin signs (+, -), giving inverse rotation (x*c+y*s, y*c-x*s).
       main_lengths: Optional INT32 [T] compacted valid-prefix counts in [0,512].
         When supplied, these are authoritative, including shared-cache replay.
+      fp8: Quantize Q and scale-weighted P per head for FP8 CSA QK/PV.
+        This adds rounding error; False retains BF16 attention computation.
       swa_metadata: Optional INT32 [B_max, 2 + page_columns]. If supplied,
         swa_kv is BF16 [pages, page_size, 512], or INT32
         [pages, 2, page_size, 128]. In word plane p, low/high BF16 halves
@@ -1037,6 +1079,7 @@ def csa2(
             compress_ratio=compress_ratio,
             bq=bq,
             interpret=interpret,
+            fp8=fp8,
         ),
         out_shape=jax.ShapeDtypeStruct(q.shape, jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
@@ -1055,7 +1098,10 @@ def csa2(
                 pltpu.VMEM((2, bq, num_heads, 512), jnp.bfloat16),
                 pltpu.VMEM((2, bq, *main_shape[1:]), main_dtype),
                 pltpu.VMEM((2, bq, 1, 512), jnp.float32),
-                pltpu.VMEM((bq, 512, 512), jnp.bfloat16),
+                pltpu.VMEM((bq, 512, 512), jnp.float8_e4m3fn if fp8 else jnp.bfloat16),
+                pltpu.VMEM((bq, num_heads, 512), jnp.float8_e4m3fn) if fp8 else None,
+                pltpu.VMEM((bq, num_heads, 128), jnp.float32) if fp8 else None,
+                pltpu.VMEM((bq, num_heads, 128), jnp.float32) if fp8 else None,
                 pltpu.VMEM(
                     (2, 128, 128) if swa_word_pages else (128, 512),
                     jnp.int32 if swa_word_pages else jnp.bfloat16,
@@ -1066,7 +1112,9 @@ def csa2(
                 pltpu.SMEM((1,), jnp.int32),
                 pltpu.VMEM((2, bq, 2, 128), jnp.float32),
                 pltpu.VMEM((bq, num_heads, shared_window_size), jnp.float32),
-                pltpu.VMEM((bq, num_heads, 512), jnp.bfloat16),
+                pltpu.VMEM(
+                    (bq, num_heads, 512), jnp.float8_e4m3fn if fp8 else jnp.bfloat16
+                ),
                 pltpu.VMEM((bq, num_heads, shared_window_size), jnp.bfloat16),
                 pltpu.VMEM((bq, num_heads, 512), jnp.bfloat16),
                 pltpu.VMEM(

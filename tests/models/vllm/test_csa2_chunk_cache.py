@@ -1,11 +1,43 @@
 # SPDX-License-Identifier: Apache-2.0
 """Serving reuses the pipeline's gathered KV with one attention launch per layer."""
 
+import functools
+import inspect
+
+import jax
+import jax.numpy as jnp
+import numpy as np
 import pytest
 import torch
+from jax.sharding import Mesh
+from jax.sharding import PartitionSpec as P
 
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels, csa2_adapter
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import PagedCacheRows
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("fp8", [False, True])
+def test_bridge_accepts_normalized_static_keywords(fp8):
+    """Pallas signature normalization supplies a partial's keyword defaults."""
+
+    def quantize(values: jax.Array, multiplier: float, *, fp8: bool = False):
+        values = values * multiplier
+        return values.astype(jnp.float8_e4m3fn) if fp8 else values
+
+    with jax.default_device(jax.devices("cpu")[0]):
+        mesh = Mesh(np.array(jax.devices("cpu")[:1]), ("x",))
+        bridge = csa2_adapter._manual_bridge(
+            functools.partial(quantize, fp8=fp8), mesh, 1, P()
+        )
+        values = jnp.arange(8, dtype=jnp.float32)
+        normalized = inspect.signature(bridge).bind(values, 2.0)
+        normalized.apply_defaults()
+        result = jax.jit(bridge, static_argnums=(1,), static_argnames=("fp8",))(
+            *normalized.args, **normalized.kwargs
+        )
+        assert result.dtype == (jnp.float8_e4m3fn if fp8 else jnp.float32)
+        np.testing.assert_array_equal(result.astype(jnp.float32), values * 2)
 
 
 @pytest.mark.cpu_test

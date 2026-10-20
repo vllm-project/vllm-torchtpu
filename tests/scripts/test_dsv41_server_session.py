@@ -25,8 +25,9 @@ pytestmark = pytest.mark.cpu_test
 )
 @pytest.mark.parametrize("profile", ["disabled", "passed", "failed"])
 @pytest.mark.parametrize("model_uri", [None, "gs://test-bucket/checkpoint"])
+@pytest.mark.parametrize("csa_precision", [None, "bf16", "fp8"])
 def test_ci_launch_and_optional_profile_share_one_server(
-    tmp_path, monkeypatch, scenario, rounds, buckets, profile, model_uri
+    tmp_path, monkeypatch, scenario, rounds, buckets, profile, model_uri, csa_precision
 ):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "config.json").write_text("{}")
@@ -51,6 +52,7 @@ def test_ci_launch_and_optional_profile_share_one_server(
             "results",
             "--startup-timeout",
             "7200",
+            *(["--csa-precision", csa_precision] if csa_precision else []),
             *(["--profile"] if profile != "disabled" else []),
         ],
     )
@@ -118,6 +120,13 @@ def test_ci_launch_and_optional_profile_share_one_server(
     command = starts[0]
     assert json.loads(command[command.index("--compilation-config") + 1]) == {
         "compile_sizes": buckets
+    }
+    assert json.loads(command[command.index("--additional-config") + 1]) == {
+        "deepseek_v41": {
+            "execution": "ced",
+            "moe": "fused_ep_w4a8",
+            "csa_precision": csa_precision or "fp8",
+        }
     }
     assert clients[0][clients[0].index("--rounds") + 1] == str(rounds)
     assert len(audits) == 1 and len(audits[0]) == rounds
