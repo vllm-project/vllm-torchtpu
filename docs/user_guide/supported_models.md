@@ -7,6 +7,8 @@ This page has two sections:
 - [Validated Models](#validated-models) — Models running on TPU, which checkpoints are tested, and in which way.
 - [Feature Support](#feature-support) — Supported features, how to turn them on, and which models they have been validated with.
 
+Both tables describe what is supported **today**. For planned models and features, see the [Roadmap](../roadmap.md).
+
 Validation levels used in both tables:
 
 | Level | Meaning |

@@ -7,22 +7,26 @@
 # Analysis includes full history from tpu_commons, tpu_inference, and vllm-torchtpu paths.
 
 # Default owners for everything in the repo (fallback)
-* @qizzzh @angelayi @colin2328 @QiliangCui @caojx-google @Nanfang-Li @yinlin09
+* @qizzzh @angelayi @colin2328 @QiliangCui @caojx-google @Nanfang-Li @yinlin09 @mrjunwan-lang
 
 # CI/CD and Build Configuration
 /.buildkite/ @QiliangCui @theminghuang
 /.github/ @QiliangCui @theminghuang
 
 # Documentation
-/docs/ @bvrockwell @RobMulla @qizzzh @maxwillzq
-/README.md @bvrockwell @RobMulla @qizzzh
-/CONTRIBUTING.md @bvrockwell @RobMulla @qizzzh
-/mkdocs.yml @bvrockwell @RobMulla @qizzzh
+/docs/ @bvrockwell @RobMulla @qizzzh @maxwillzq @Nanfang-Li
+/README.md @bvrockwell @RobMulla @qizzzh @Nanfang-Li
+/CONTRIBUTING.md @bvrockwell @RobMulla @qizzzh @Nanfang-Li
+/mkdocs.yml @bvrockwell @RobMulla @qizzzh @Nanfang-Li
 
 # Kernel Implementations
 /src/vllm_torchtpu/kernels/ @kyuyeunk @qizzzh
 /src/vllm_torchtpu/kernels/experimental/batched_rpa/ @kwang3939 @a1yssan13
 /src/vllm_torchtpu/kernels/gdn/v3/ @brianseung-google @mhhuang-machine
+
+# Megakernel library (framework-free JAX/Pallas)
+/src/vllm_torchtpu/megakernel/ @caojx-google @weinan1997 @hhb
+/tests/megakernel/ @caojx-google @weinan1997 @hhb
 
 # Model layers
 /src/vllm_torchtpu/layers/ @kyuyeunk @qizzzh
@@ -35,6 +39,9 @@
 
 # Platform Support
 /src/vllm_torchtpu/platforms/ @sixiang-google @mrjunwan-lang @Lumosis
+
+# Distributed Support
+/src/vllm_torchtpu/distributed/ @sixiang-google @mrjunwan-lang @harutmov
 
 # Structured Decoding
 /src/vllm_torchtpu/structured_decoding/ @maxwillzq @silkyarora

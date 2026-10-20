@@ -507,6 +507,37 @@ def _worker_entry(connection):
         )
 
 
+def test_release_free_host_heap_prefers_tcmalloc(monkeypatch):
+    from vllm_torchtpu.worker import tpu_worker
+
+    calls = []
+
+    class FakeProcess:
+        def MallocExtension_ReleaseFreeMemory(self):  # noqa: N802
+            calls.append("tcmalloc")
+
+        def malloc_trim(self, pad):
+            calls.append("glibc")
+
+    monkeypatch.setattr(tpu_worker.ctypes, "CDLL", lambda name: FakeProcess())
+    tpu_worker._release_free_host_heap()
+    assert calls == ["tcmalloc"]
+
+
+def test_release_free_host_heap_falls_back_to_malloc_trim(monkeypatch):
+    from vllm_torchtpu.worker import tpu_worker
+
+    calls = []
+
+    class FakeProcess:
+        def malloc_trim(self, pad):
+            calls.append(pad)
+
+    monkeypatch.setattr(tpu_worker.ctypes, "CDLL", lambda name: FakeProcess())
+    tpu_worker._release_free_host_heap()
+    assert calls == [0]
+
+
 if __name__ == "__mp_main__":
     # The constructor is the boundary preceding executor and TPU initialization.
     EngineCoreProc.__init__ = _engine_init

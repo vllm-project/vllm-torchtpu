@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """TPU compiler adaptor for vLLM's VLLM_COMPILE mode.
 
 This module implements the CompilerInterface for TPU, enabling
@@ -149,6 +161,13 @@ def _deserialize_entry(entry: Any) -> Callable[..., Any]:
         deserialize_bundled_cache_entry,
     )
 
+    # `deserialize_bundled_cache_entry` deep-copies `entry` so the runnable can
+    # be serialized again. `CompiledArtifact` has no `__deepcopy__`, so the copy
+    # goes through `__reduce__` and loads a second PJRT executable per graph.
+    # vllm-torchtpu never re-serializes a replayed runnable, so return `entry`
+    # itself from `__deepcopy__` and reuse the loaded executable.
+    with contextlib.suppress(AttributeError, TypeError):
+        entry.__deepcopy__ = lambda _memo: entry
     return deserialize_bundled_cache_entry(entry)
 
 
