@@ -1670,6 +1670,47 @@ def _patch_dflash_bypass_v2_runner_check() -> None:
     logger.info("Applied TPU patch: bypass DFlash V2 runner check on TPU.")
 
 
+def _patch_dflash_drafting_slot_budget() -> None:
+    """Stop charging DFlash/DSpark drafting slots against the token budget.
+
+    vLLM's scheduler charges every scheduled request
+    ``SpeculativeConfig.max_num_new_slots_for_drafting`` tokens (K for DFlash,
+    K - 1 for DSpark) against ``max_num_batched_tokens``, for drafters that
+    append those slots to the target's tokens in one forward. The TPU
+    DFlashProposer drafts ``num_reqs * block_size`` tokens in a separate
+    forward, so the charge only takes tokens away from prefill; return 0 for
+    these methods. Other methods keep the upstream value.
+
+    Without the charge, a request scheduled fewer than ``block_size`` tokens
+    still drafts a full block, so a step's draft can outgrow the largest
+    target bucket; ``DFlashProposer._draft_token_paddings`` covers that.
+    """
+    # TODO: let the platform declare the per-request drafting slots upstream
+    # instead of overriding the SpeculativeConfig property here.
+    from functools import wraps
+
+    from vllm.config.speculative import SpeculativeConfig
+
+    upstream = SpeculativeConfig.__dict__["max_num_new_slots_for_drafting"]
+    assert isinstance(upstream, property) and upstream.fget is not None
+    if getattr(upstream.fget, "_tpu_drafting_slots_patch", False):
+        return
+    upstream_fget = upstream.fget
+
+    @wraps(upstream_fget)
+    def max_num_new_slots_for_drafting(self) -> int:
+        # Methods tpu_runner serves with DFlashProposer or its DSpark subclass.
+        if self.method in ("dflash", "dspark"):
+            return 0
+        return upstream_fget(self)
+
+    setattr(max_num_new_slots_for_drafting, "_tpu_drafting_slots_patch", True)  # noqa: B010
+    SpeculativeConfig.max_num_new_slots_for_drafting = property(
+        max_num_new_slots_for_drafting
+    )
+    logger.info("Applied TPU patch: DFlash/DSpark drafting slots are not charged.")
+
+
 def _patch_vllm_config_triton_tpu() -> None:
     """Bypass V2 model runner Triton check on TPU.
 

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import inspect
 from types import SimpleNamespace
 from unittest import mock
 
@@ -19,9 +20,30 @@ import numpy as np
 import pytest
 import torch
 import torch._dynamo
+from vllm import SamplingParams
+from vllm.config import (
+    CacheConfig,
+    DeviceConfig,
+    ModelConfig,
+    ParallelConfig,
+    SchedulerConfig,
+    SpeculativeConfig,
+    VllmConfig,
+)
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.core.single_type_kv_cache_manager import register_all_kvcache_specs
+from vllm.v1.kv_cache_interface import (
+    FullAttentionSpec,
+    KVCacheConfig,
+    KVCacheGroupSpec,
+)
+from vllm.v1.request import Request
+from vllm.v1.structured_output import StructuredOutputManager
 
+from vllm_torchtpu import _patch_dflash_drafting_slot_budget
 from vllm_torchtpu.layers.adapter import token_padding
 from vllm_torchtpu.layers.adapter.token_padding import TokenPaddingState
+from vllm_torchtpu.platforms.tpu_platform import _get_token_paddings
 from vllm_torchtpu.runner.tpu_runner_async_output import INVALID_TOKEN_ID
 from vllm_torchtpu.spec_decode import dflash as dflash_module
 from vllm_torchtpu.spec_decode import utils as spec_decode_utils
@@ -216,6 +238,174 @@ def test_precompile_warms_draft_only_buckets():
     # runs at the draft-only bucket past it.
     assert kv_sizes == [16, 32, 64]
     assert draft_sizes == [16, 32, 64, 128]
+
+
+# Matches _make_precompile_proposer (K=7, block_size 8).
+NUM_SPEC_TOKENS = 7
+
+
+def _spec_config(method: str, parallel_drafting: bool = True) -> SpeculativeConfig:
+    """A real SpeculativeConfig for ``method`` without loading a drafter."""
+    spec = SpeculativeConfig(
+        model="ngram",
+        num_speculative_tokens=NUM_SPEC_TOKENS,
+        prompt_lookup_max=3,
+        prompt_lookup_min=1,
+    )
+    spec.method = method
+    spec.parallel_drafting = parallel_drafting
+    return spec
+
+
+@pytest.fixture
+def install_slot_patch(monkeypatch):
+    # Platform activation in earlier tests may have installed the patch
+    # already, so unwrap to upstream's getter. Teardown restores the property
+    # the test found.
+    prop = SpeculativeConfig.__dict__["max_num_new_slots_for_drafting"]
+    monkeypatch.setattr(
+        SpeculativeConfig,
+        "max_num_new_slots_for_drafting",
+        property(inspect.unwrap(prop.fget)),
+    )
+    return _patch_dflash_drafting_slot_budget
+
+
+def _build_scheduler(max_num_batched_tokens: int, method: str) -> Scheduler:
+    kv_block_size = 16
+    vllm_config = VllmConfig(
+        scheduler_config=SchedulerConfig(
+            max_num_seqs=8,
+            max_num_batched_tokens=max_num_batched_tokens,
+            max_model_len=2048,
+            enable_chunked_prefill=True,
+            is_encoder_decoder=False,
+        ),
+        model_config=ModelConfig(
+            model="facebook/opt-125m", dtype="float16", seed=42, max_model_len=2048
+        ),
+        cache_config=CacheConfig(
+            block_size=kv_block_size,
+            gpu_memory_utilization=0.9,
+            cache_dtype="auto",
+            enable_prefix_caching=False,
+        ),
+        parallel_config=ParallelConfig(),
+        device_config=DeviceConfig(device="cpu"),
+    )
+    num_blocks = 32
+    vllm_config.cache_config.num_gpu_blocks = num_blocks
+    register_all_kvcache_specs(vllm_config)
+    kv_cache_config = KVCacheConfig(
+        num_blocks=num_blocks,
+        kv_cache_tensors=[],
+        kv_cache_groups=[
+            KVCacheGroupSpec(
+                ["layer0"],
+                FullAttentionSpec(
+                    block_size=kv_block_size,
+                    num_kv_heads=1,
+                    head_size=64,
+                    dtype=torch.float16,
+                ),
+            )
+        ],
+    )
+    scheduler = Scheduler(
+        vllm_config=vllm_config,
+        kv_cache_config=kv_cache_config,
+        structured_output_manager=StructuredOutputManager(vllm_config),
+        block_size=kv_block_size,
+    )
+    # Scheduler.schedule() reads the drafting slots from the config every step.
+    scheduler.vllm_config.speculative_config = _spec_config(method)
+    return scheduler
+
+
+def _add_request(scheduler: Scheduler, request_id: str, num_prompt_tokens: int):
+    params = SamplingParams(max_tokens=8, ignore_eos=True)
+    params.update_from_generation_config({}, 2)
+    scheduler.add_request(
+        Request(request_id, list(range(num_prompt_tokens)), params, None)
+    )
+
+
+@pytest.mark.parametrize(
+    ("method", "parallel_drafting", "upstream_slots", "tpu_slots"),
+    [
+        ("dflash", True, NUM_SPEC_TOKENS, 0),
+        ("dspark", True, NUM_SPEC_TOKENS - 1, 0),
+        # Methods without a TPU block drafter keep upstream's charge.
+        ("eagle3", True, NUM_SPEC_TOKENS - 1, NUM_SPEC_TOKENS - 1),
+        ("draft_model", True, NUM_SPEC_TOKENS, NUM_SPEC_TOKENS),
+        ("draft_model", False, 1, 1),
+        ("ngram", False, 0, 0),
+    ],
+)
+def test_only_tpu_block_drafters_stop_charging_slots(
+    install_slot_patch, method, parallel_drafting, upstream_slots, tpu_slots
+):
+    spec = _spec_config(method, parallel_drafting)
+    assert spec.max_num_new_slots_for_drafting == upstream_slots
+    install_slot_patch()
+    assert spec.max_num_new_slots_for_drafting == tpu_slots
+
+
+def test_slot_patch_installs_once(install_slot_patch):
+    install_slot_patch()
+    installed = SpeculativeConfig.__dict__["max_num_new_slots_for_drafting"]
+    install_slot_patch()
+    assert SpeculativeConfig.__dict__["max_num_new_slots_for_drafting"] is installed
+
+
+@pytest.mark.parametrize(
+    ("method", "expected_prefill"),
+    [
+        # TPU block drafter: its K - 1 drafting slots go to prefill.
+        ("dspark", 40),
+        # PARD has no TPU block drafter and keeps its K-slot charge.
+        ("draft_model", 40 - NUM_SPEC_TOKENS),
+    ],
+)
+def test_tpu_block_drafter_slots_go_to_prefill(
+    install_slot_patch, method, expected_prefill
+):
+    install_slot_patch()
+    scheduler = _build_scheduler(max_num_batched_tokens=40, method=method)
+    _add_request(scheduler, "prefill", 96)
+
+    assert scheduler.schedule().num_scheduled_tokens == {"prefill": expected_prefill}
+
+
+def test_uncharged_draft_stays_in_precompiled_buckets(install_slot_patch):
+    """Without the charge a step's draft outgrows the token budget.
+
+    Each scheduled request drafts a full block however few tokens it was
+    scheduled, so short requests plus one cut off by the budget draft more
+    tokens than max_num_batched_tokens. DFlash must still pad that draft to a
+    bucket precompile warmed.
+    """
+    install_slot_patch()
+    budget = 40
+    scheduler = _build_scheduler(max_num_batched_tokens=budget, method="dflash")
+    for i in range(6):
+        _add_request(scheduler, f"short{i}", 5)
+    _add_request(scheduler, "long", 96)
+
+    scheduled = scheduler.schedule().num_scheduled_tokens
+    # The budget ends partway through "long".
+    assert scheduled["long"] == budget - 6 * 5
+    proposer = _make_precompile_proposer(
+        _get_token_paddings(16, budget),
+        num_reqs_max_model_len=scheduler.vllm_config.scheduler_config.max_num_seqs,
+    )
+    draft_tokens = len(scheduled) * proposer.block_size
+    assert draft_tokens > max(proposer.runner.num_tokens_paddings)
+
+    proposer.precompile()
+
+    _, draft_sizes = _precompiled_sizes(proposer)
+    assert proposer._get_padded_len(draft_tokens) in draft_sizes
 
 
 @pytest.mark.tpu_test
