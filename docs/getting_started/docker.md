@@ -2,61 +2,66 @@
 
 This folder contains the Dockerfile used to build the main image variants for vllm-torchtpu.
 
-## Pre-built Nightly Images
+## Pre-built Images on Docker Hub
 
-Pre-built Docker images are automatically built nightly and hosted on Google Artifact Registry. You can pull them using standard `docker pull` commands after authenticating.
+Official pre-built `vllm-torchtpu` Docker images are publicly available on Docker Hub at [`vllm/vllm-torchtpu`](https://hub.docker.com/r/vllm/vllm-torchtpu/tags). No registry authentication is required.
 
-### Authentication
+| Docker Hub Tag | Dockerfile Stage | Installed Dependencies | Intended Use |
+| :--- | :--- | :--- | :--- |
+| `vllm/vllm-torchtpu:latest`<br>`vllm/vllm-torchtpu:vX.Y.Z` | `--target prod` | Runtime only (`--group vllm` + `vllm-torchtpu`) | Production serving and inference |
+| `vllm/vllm-torchtpu:nightly`<br>`vllm/vllm-torchtpu:nightly-YYYYMMDD-<commit>-<vllm>` | `--target dev` | Runtime + test & benchmark tools (`--group vllm --group test --extra benchmarking`, editable install) | Local development, running `pytest`, type checking, and benchmarking |
 
-To access the images, you must first configure Docker to authenticate with Google Artifact Registry:
+> [!NOTE]
+> Release images (`:latest`, `:vX.Y.Z`) are built from `--target prod` and do **not** include test or benchmarking dependencies. For development, testing, or running `tools/typecheck_full.sh`, use `vllm/vllm-torchtpu:nightly` (`--target dev`). The intermediate `--target ci` base stage (which does not install `vllm-torchtpu` itself) is not published to Docker Hub; build it locally with `./docker/build_image.sh --target ci` if needed.
 
-```bash
-gcloud auth configure-docker us-central1-docker.pkg.dev
-```
+### Release Images (`--target prod`)
 
-### Pulling Images
+Release images are built from the `--target prod` Dockerfile stage and contain a standard runtime installation of `vllm` and `vllm-torchtpu`.
 
-You can pull the following pre-built nightly image targets using the `:latest` tag for the most recent build:
-
-* **CI Image** (`ci:latest` equivalent):
-
-  ```bash
-  docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/vllm-torchtpu-ci:latest
-  ```
-
-* **Developer Image** (`dev:latest` equivalent):
+* **Latest Stable Release** (`:latest`):
 
   ```bash
-  docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/vllm-torchtpu-dev:latest
+  docker pull vllm/vllm-torchtpu:latest
   ```
 
-* **Production Image** (`prod:latest` equivalent):
+* **Pinned Version Release** (`:vX.Y.Z`, e.g., `v0.29.0`):
 
   ```bash
-  docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/vllm-torchtpu-prod:latest
+  docker pull vllm/vllm-torchtpu:v0.29.0
   ```
 
-#### Date-Specific Tags
+### Nightly Images (`--target dev`)
 
-To pull an image for a specific build date, use the `nightly-YYYYMMDD` tag format:
+Nightly images are built automatically every night from the `main` branch (`--target dev` stage, which includes the repository source, `--group test` dependencies, and `--extra benchmarking` tools):
+
+* **Latest Nightly Build** (`:nightly`):
+
+  ```bash
+  docker pull vllm/vllm-torchtpu:nightly
+  ```
+
+* **Date- and Commit-Pinned Nightly Tags** (`:nightly-YYYYMMDD-<commit>-<vllm-version>`):
+
+  ```bash
+  docker pull vllm/vllm-torchtpu:nightly-20261019-88534b8-v0.31.0
+  ```
+
+Browse all available release and nightly tags at [`https://hub.docker.com/r/vllm/vllm-torchtpu/tags`](https://hub.docker.com/r/vllm/vllm-torchtpu/tags).
+
+### Running the Container on a Cloud TPU VM
+
+Include `--privileged`, `--net=host`, and `--shm-size 150gb` so the container can access the `/dev/vfio/*` TPU devices and shared host memory:
 
 ```bash
-docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/vllm-torchtpu-<target>:nightly-YYYYMMDD
-```
-
-For example, to pull the Developer Image from May 23, 2026:
-
-```bash
-docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/vllm-torchtpu-dev:nightly-20260523
-```
-
-#### Release Branch Tags
-
-Each scheduled `release/X.Y.Z` branch is also built nightly, into the same image names. `X.Y.Z` points at the most recent build of the branch head, and `YYYYMMDD-X.Y.Z` pins one day's build. `latest` and `nightly-YYYYMMDD` always come from `main`.
-
-```bash
-docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/vllm-torchtpu-<target>:0.0.1
-docker pull us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/vllm-torchtpu-<target>:20260930-0.0.1
+sudo docker run -it --rm \
+  --name $USER-vllm \
+  --privileged \
+  --net=host \
+  -v /dev/shm:/dev/shm \
+  --shm-size 150gb \
+  -p 8000:8000 \
+  --entrypoint /bin/bash \
+  vllm/vllm-torchtpu:latest
 ```
 
 ## Image targets

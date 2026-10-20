@@ -42,12 +42,18 @@ See [Cloud TPU Setup](https://vllm-torchtpu.readthedocs.io/en/latest/getting_sta
 
 ### Install
 
-`vllm-torchtpu` requires **Python 3.12** on a Cloud TPU VM. Install the plugin and a matching vLLM with a single command:
+`vllm-torchtpu` requires **Python 3.12** on a Cloud TPU VM. Install [`vllm-torchtpu` from PyPI](https://pypi.org/project/vllm-torchtpu/) and a matching vLLM with a single command:
 
 ```bash
 pip install \
   --extra-index-url https://download.pytorch.org/whl/cpu \
   vllm-torchtpu
+```
+
+Or pull the pre-built container from [Docker Hub (`vllm/vllm-torchtpu`)](https://hub.docker.com/r/vllm/vllm-torchtpu/tags):
+
+```bash
+docker pull vllm/vllm-torchtpu:latest
 ```
 
 For `uv`, editable source installs, cross-repo development against a local `vllm` checkout, and Docker images, see the full [Installation guide](https://vllm-torchtpu.readthedocs.io/en/latest/getting_started/installation/) and [Docker guide](https://vllm-torchtpu.readthedocs.io/en/latest/getting_started/docker/).
@@ -63,16 +69,6 @@ vllm serve meta-llama/Llama-3.2-1B-Instruct \
 ```
 
 Then send a request:
-
-A stage may instead span a prefill context-parallel group
-(`--prefill-context-parallel-size`), which splits each chunk's attention over
-the stage's cores; MoE models then need `--enable-expert-parallel`. This needs
-a torch_tpu that compiles a stage's kernels and collectives for the stage's
-devices only (the 2026-09-28 build of google-pytorch/torch_tpu#4387); on a
-torch_tpu that builds world-size meshes only, the platform refuses such stages.
-A two-core stage must not be the two cores of one chip: set
-`VLLM_TPU_DEVICE_ORDER` to the device each local rank binds, e.g.
-`0,2,1,3,4,6,5,7` for four stages of two cores on one host.
 
 ```bash
 curl http://localhost:8000/v1/chat/completions \
