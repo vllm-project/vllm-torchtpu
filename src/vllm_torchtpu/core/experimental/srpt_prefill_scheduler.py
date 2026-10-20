@@ -25,7 +25,12 @@ scheduler:
   request upstream admits next (the first admissible request in
   ``kv_holding_waiting``, then ``waiting``) to fit in the remaining budget,
   when that request has fewer uncached tokens and free KV blocks cover the
-  kept requests plus it, so a hold does not cause preemption.
+  kept requests plus it, so a hold does not cause preemption;
+* with ``VLLM_TPU_SRPT_ASYNC_KV_OVERLAP=1``, when admitting that request would
+  start an asynchronous KV connector load (``load_kv_async``), which takes no
+  step budget, holds nothing for it and instead trims the last running prefill
+  chunk just enough to leave one token of budget, so upstream reaches the
+  request and starts its load in the same step as the running chunks.
 
 Held chunks keep their KV blocks; ``max_num_running_reqs`` and
 ``max_num_active_reqs`` are lowered by the number held during the step so
@@ -60,6 +65,7 @@ from vllm_torchtpu.logger import init_logger
 logger = init_logger(__name__)
 
 _MAX_BACKOFF_SHIFT = 6
+_OVERLAP_LOG_EVERY = 1000
 
 
 class SrptPrefillScheduler(AsyncScheduler):
@@ -74,15 +80,24 @@ class SrptPrefillScheduler(AsyncScheduler):
         self._stalled_steps: dict[str, int] = {}
         # Target request id -> (failed holds, first step a hold may retry).
         self._hold_backoff: dict[str, tuple[int, int]] = {}
+        self.async_kv_overlap = envs.VLLM_TPU_SRPT_ASYNC_KV_OVERLAP
+        # Request id -> most tokens its chunk may get in this step's RUNNING pass.
+        self._token_caps: dict[str, int] = {}
+        self._overlap_target: Request | None = None
+        self._overlap_steps = 0
+        self._overlap_loads_started = 0
         logger.info(
-            "SrptPrefillScheduler active (max_consecutive_holds=%d)",
+            "SrptPrefillScheduler active (max_consecutive_holds=%d, "
+            "async_kv_overlap=%s)",
             self.max_consecutive_holds,
+            self.async_kv_overlap,
         )
 
     def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
         held: list[Request] = []
         target = None
         prefilling: list[Request] = []
+        self._overlap_target = None
         if not throttle_prefills and self.policy == SchedulingPolicy.FCFS:
             self._prune_hold_state()
             self._order_running()
@@ -96,6 +111,7 @@ class SrptPrefillScheduler(AsyncScheduler):
         try:
             output = super().schedule(throttle_prefills)
         finally:
+            self._token_caps.clear()
             self.max_num_running_reqs += len(held)
             self.max_num_active_reqs += len(held)
             self.running.extend(held)
@@ -116,7 +132,33 @@ class SrptPrefillScheduler(AsyncScheduler):
                 )
         if target is not None:
             self._record_hold_outcome(target)
+        if self._overlap_target is not None:
+            self._log_overlap(self._overlap_target)
         return output
+
+    def _log_overlap(self, target: Request) -> None:
+        self._overlap_steps += 1
+        if target.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+            self._overlap_loads_started += 1
+        if self._overlap_steps % _OVERLAP_LOG_EVERY == 0:
+            logger.info(
+                "SrptPrefillScheduler async KV overlap: steps=%d loads_started=%d",
+                self._overlap_steps,
+                self._overlap_loads_started,
+            )
+
+    def _reserve_prefill_lookahead(
+        self, request: Request, num_computed_tokens: int, num_new_tokens: int
+    ) -> int:
+        # Scheduler.schedule() calls this on every request it is about to
+        # schedule, after its other token limits, so it is where a cap set
+        # for this step applies.
+        cap = self._token_caps.get(request.request_id)
+        if cap is not None:
+            num_new_tokens = min(num_new_tokens, cap)
+        return super()._reserve_prefill_lookahead(
+            request, num_computed_tokens, num_new_tokens
+        )
 
     @staticmethod
     def _remaining(request: Request) -> int:
@@ -246,6 +288,46 @@ class SrptPrefillScheduler(AsyncScheduler):
         blocks, num_hit_tokens, _, _ = self._get_local_prefix_cache_hit(request)
         return blocks, num_hit_tokens
 
+    def _starts_async_kv_load(self, request: Request, num_local: int) -> bool:
+        """Whether admitting ``request`` with ``num_local`` locally cached
+        tokens would start an asynchronous KV connector load.
+
+        Mirrors the connector lookup in Scheduler.schedule()'s WAITING pass
+        (vLLM v0.31.0, scheduler.py ~L940-994); re-sync on vLLM upgrades. It is
+        only asked about the request upstream admits next, which upstream asks
+        about itself when it reaches it in this step.
+        """
+        if (
+            self.connector is None
+            or request.num_computed_tokens > 0
+            or request.skip_reading_prefix_cache
+        ):
+            return False
+        partial_tail = num_local % self.block_size
+        ext_tokens, load_kv_async = self.connector.get_num_new_matched_tokens(
+            request, num_local - partial_tail
+        )
+        # None means the connector is still looking up the request.
+        if not ext_tokens or not load_kv_async:
+            return False
+        if self.prefix_replay_tokens:
+            ext_tokens -= ext_tokens % self.block_size
+        return ext_tokens > partial_tail
+
+    def _leave_one_token(self, alloc: dict[str, int], left: int) -> bool:
+        """Cap the last planned prefill chunk so the RUNNING pass leaves at
+        least one token of budget for the WAITING pass. Returns False if no
+        prefill chunk can give up enough tokens."""
+        deficit = 1 - left
+        if deficit <= 0:
+            return True
+        for r in reversed(self.running):
+            n = alloc.get(r.request_id, 0)
+            if r.is_prefill_chunk and n > deficit:
+                self._token_caps[r.request_id] = n - deficit
+                return True
+        return False
+
     def _select_chunks_to_hold(self) -> tuple[list[Request], Request | None]:
         """Return ``(chunks_to_hold, target_waiting_request)``."""
         if not any(r.is_prefill_chunk for r in self.running):
@@ -263,8 +345,14 @@ class SrptPrefillScheduler(AsyncScheduler):
             return [], None
 
         hit_blocks, hit_tokens = self._prefix_hit(target)
-        target_remaining = max(target.num_tokens - hit_tokens, 1)
         _, num_waiting = self.get_request_counts()
+        if self.async_kv_overlap and self._starts_async_kv_load(target, hit_tokens):
+            lptt = self._long_prefill_threshold(len(self.running) + num_waiting)
+            alloc, left = self._plan_running(self.running, lptt)
+            if self._leave_one_token(alloc, left):
+                self._overlap_target = target
+                return [], target
+        target_remaining = max(target.num_tokens - hit_tokens, 1)
         kept = list(self.running)
         held: list[Request] = []
         while True:

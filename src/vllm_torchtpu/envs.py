@@ -191,6 +191,7 @@ if TYPE_CHECKING:
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
+    VLLM_TPU_SRPT_ASYNC_KV_OVERLAP: bool = False
 
 
 def env_with_choices(
@@ -1126,6 +1127,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS": env_nonnegative_int(
         "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", 8
     ),
+    # SrptPrefillScheduler: when the next waiting request would start an
+    # asynchronous KV connector load, leave it one token of step budget instead
+    # of holding running prefill chunks, so the load starts alongside them.
+    "VLLM_TPU_SRPT_ASYNC_KV_OVERLAP": env_bool("VLLM_TPU_SRPT_ASYNC_KV_OVERLAP", False),
 }
 
 

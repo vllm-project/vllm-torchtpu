@@ -176,6 +176,7 @@ _TPU_COMPILE_ENV_IGNORED = {
     # compiled model or custom-kernel lowering.
     "DP_SCHED_ENABLED",
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS",
+    "VLLM_TPU_SRPT_ASYNC_KV_OVERLAP",
     "PYTHON_TRACER_LEVEL",
     "RAY_USAGE_STATS_ENABLED",
     "TPU_NAME",

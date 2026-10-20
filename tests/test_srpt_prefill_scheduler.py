@@ -504,16 +504,103 @@ def test_prefill_crowded_out_by_shorter_running_prefill_is_promoted(
     assert scheduler.schedule().num_scheduled_tokens == {"mid": 8, "long": 8}
 
 
-def test_max_consecutive_holds_env_var_and_compile_cache(
-    shared_model_config, monkeypatch
-):
+def test_env_vars_are_read_and_skip_the_compile_cache(shared_model_config, monkeypatch):
     monkeypatch.setenv("VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", "16")
+    monkeypatch.setenv("VLLM_TPU_SRPT_ASYNC_KV_OVERLAP", "1")
     scheduler, _ = _build_real_scheduler(shared_model_config)
     assert scheduler.max_consecutive_holds == 16
-    assert (
-        "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS" in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+    assert scheduler.async_kv_overlap is True
+    for name in (
+        "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS",
+        "VLLM_TPU_SRPT_ASYNC_KV_OVERLAP",
+    ):
+        assert name in tpu_compiler._TPU_COMPILE_ENV_IGNORED
+        assert name not in tpu_compiler._tpu_compile_env_factors()
+
+
+class _FakeConnector:
+    """KV connector stand-in whose lookup returns a fixed hit for one request."""
+
+    supports_divergent_local_hybrid_hits = False
+
+    def __init__(self, request_id: str, ext_tokens: int | None, load_async: bool):
+        self._request_id = request_id
+        self._ext_tokens = ext_tokens
+        self._load_async = load_async
+
+    def get_num_new_matched_tokens(self, request, num_computed_tokens):
+        if request.request_id != self._request_id:
+            return 0, False
+        return self._ext_tokens, self._load_async
+
+    def update_state_after_alloc(self, request, blocks, num_external_tokens):
+        pass
+
+    def has_pending_block_frees(self) -> bool:
+        return False
+
+    def build_connector_meta(self, scheduler_output):
+        return None
+
+
+def _overlap_scheduler(shared_model_config, monkeypatch, overlap: bool, **kwargs):
+    monkeypatch.setenv("VLLM_TPU_SRPT_ASYNC_KV_OVERLAP", "1" if overlap else "0")
+    return _build_real_scheduler(
+        shared_model_config, num_blocks=64, max_num_batched_tokens=32, **kwargs
     )
-    assert (
-        "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS"
-        not in tpu_compiler._tpu_compile_env_factors()
-    )
+
+
+@pytest.mark.parametrize(
+    ("overlap", "expected_tokens", "expected_status"),
+    [
+        # Default: `long` takes the whole budget; the load waits a step.
+        (False, {"long": 32}, RequestStatus.WAITING),
+        # Overlap: `long` gives up one token and the load starts alongside it.
+        (True, {"long": 31}, RequestStatus.WAITING_FOR_REMOTE_KVS),
+    ],
+)
+def test_async_kv_load_starts_alongside_running_prefill(
+    shared_model_config, monkeypatch, overlap, expected_tokens, expected_status
+):
+    scheduler, hasher = _overlap_scheduler(shared_model_config, monkeypatch, overlap)
+    _running_long_prefill(scheduler, hasher, num_tokens=128)
+    req_async = _make_real_request("async_hit", 96, hasher, seed=2)
+    scheduler.add_request(req_async)
+    scheduler.connector = _FakeConnector("async_hit", 80, load_async=True)
+
+    assert scheduler.schedule().num_scheduled_tokens == expected_tokens
+    assert req_async.status == expected_status
+
+
+@pytest.mark.parametrize(
+    ("ext_tokens", "load_async"),
+    [
+        (80, False),  # Synchronous load: upstream needs budget for it.
+        (None, True),  # Connector still looking up the request.
+        (0, True),  # No external hit.
+    ],
+)
+def test_async_kv_overlap_only_for_async_loads(
+    shared_model_config, monkeypatch, ext_tokens, load_async
+):
+    scheduler, hasher = _overlap_scheduler(shared_model_config, monkeypatch, True)
+    _running_long_prefill(scheduler, hasher, num_tokens=128)
+    scheduler.add_request(_make_real_request("wait", 96, hasher, seed=2))
+    scheduler.connector = _FakeConnector("wait", ext_tokens, load_async)
+
+    # Nothing is trimmed; `wait` (96 uncached) is not shorter than `long`.
+    assert scheduler.schedule().num_scheduled_tokens == {"long": 32}
+
+
+def test_async_kv_overlap_replaces_hold_for_async_load(
+    shared_model_config, monkeypatch
+):
+    scheduler, hasher = _overlap_scheduler(shared_model_config, monkeypatch, True)
+    _running_long_prefill(scheduler, hasher, num_tokens=128)
+    req_async = _make_real_request("async_hit", 16, hasher, seed=2)
+    scheduler.add_request(req_async)
+    scheduler.connector = _FakeConnector("async_hit", 16, load_async=True)
+
+    # Without overlap, `async_hit` (16 uncached < 96 left) would hold `long`.
+    assert scheduler.schedule().num_scheduled_tokens == {"long": 31}
+    assert req_async.status == RequestStatus.WAITING_FOR_REMOTE_KVS
