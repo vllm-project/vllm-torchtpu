@@ -20,6 +20,7 @@ from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
+from PIL import Image
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 from vllm_omni.outputs import OmniRequestOutput
 
@@ -236,8 +237,6 @@ def build_wan_golden_request(
         "negative_prompt": GOLDEN_NEGATIVE_PROMPT,
     }
     if config.uses_image:
-        from PIL import Image
-
         input_image = Image.open(_get_ref_image_path(config)).convert("RGB")
         inputs["multi_modal_data"] = {"image": input_image}
 
