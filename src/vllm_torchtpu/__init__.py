@@ -1253,6 +1253,47 @@ def _is_raiden_glm_dcp_identity_producer(kv_transfer_config) -> bool:
     )
 
 
+def _patch_raiden_identity_keeps_cp_interleave() -> None:
+    """Keep the configured DCP interleave under the GLM DCP identity transfer.
+
+    The pinned vLLM sets cp_kv_cache_interleave_size to the block size for any
+    KV connector (#50611, for NIXL's block-level transfers); upstream later
+    scoped that to NixlConnector and an unset interleave (#54803, #55531). The
+    identity transfer ships whole pages from producer rank k to consumer rank
+    k, so it works at any interleave both legs share, which every load checks.
+    """
+    if not (envs.use_raiden_glm_admission() and envs.TPU_RAIDEN_GLM_DCP_IDENTITY):
+        return
+    from functools import wraps
+
+    from vllm.config import VllmConfig
+
+    if VllmConfig.__dict__.get("_tpu_raiden_keep_interleave_patch", False):
+        return
+    original = VllmConfig.adjust_dcp_kv_cache_interleave_size
+
+    @wraps(original)
+    def adjust_dcp_kv_cache_interleave_size(self, kv_cache_config) -> None:
+        transfer = self.kv_transfer_config
+        if transfer is None or transfer.kv_connector != "TPURaidenConnector":
+            return original(self, kv_cache_config)
+        parallel = self.parallel_config
+        if parallel.decode_context_parallel_size <= 1:
+            return
+        # The deprecated dcp_kv_cache_interleave_size still wins, as upstream.
+        if parallel.dcp_kv_cache_interleave_size > 1 and (
+            parallel.cp_kv_cache_interleave_size
+            != parallel.dcp_kv_cache_interleave_size
+        ):
+            parallel.cp_kv_cache_interleave_size = parallel.dcp_kv_cache_interleave_size
+
+    VllmConfig.adjust_dcp_kv_cache_interleave_size = adjust_dcp_kv_cache_interleave_size
+    VllmConfig._tpu_raiden_keep_interleave_patch = True
+    logger.info(
+        "Applied TPU patch: Raiden GLM DCP identity keeps cp_kv_cache_interleave_size."
+    )
+
+
 def _dcp_fine_prefix_match_unit(kv_cache_config, vllm_config) -> int | None:
     """Return the fine prefix-hit unit for a single-group DCP model, or None.
 
