@@ -1122,6 +1122,7 @@ def test_split_encoder_stages_tail_engram_after_head_dispatch(monkeypatch):
     model = SimpleNamespace(
         encoder_head_stage=head,
         encoder_tail_stage=tail,
+        _engram_first_split_layer=None,
         _engram_prepared_outside_stage=True,
         _stage_deferred_engram=lambda: order.append("stage tail engram"),
     )
@@ -1130,3 +1131,181 @@ def test_split_encoder_stages_tail_engram_after_head_dispatch(monkeypatch):
     )
     assert out == "encoded"
     assert order == ["head", "dispatch", "stage tail engram", "tail"]
+
+
+@pytest.mark.parametrize("rows", [1, 5, 288, 2048])
+def test_early_split_preserves_delayed_carry(monkeypatch, rows):
+    monkeypatch.setattr(
+        v2_model.upstream,
+        "get_pp_group",
+        lambda: SimpleNamespace(is_first_rank=True, is_last_rank=True),
+    )
+    monkeypatch.setattr(
+        v2_model.upstream, "is_forward_context_available", lambda: False
+    )
+    model = object.__new__(v2_model.DeepseekV41Model)
+    torch.nn.Module.__init__(model)
+    model.start_layer, model.end_layer, model._ced_boundary = 0, 4, 3
+    model._engram_split_layer = 2
+    model.use_sequence_parallel = False
+    model.use_native_mega_moe = False
+    model.aux_hidden_state_layers = ()
+    model._engram_prepared_outside_stage = True
+    model._prepare_engram = lambda *args, **kwargs: (None, None)
+
+    class CarryLayer(torch.nn.Module):
+        def __init__(self, index):
+            super().__init__()
+            self.index = index
+            self.attn_norm = torch.nn.Identity()
+            self.attn = SimpleNamespace(write_encoder_global_kv=lambda *a, **kw: None)
+
+        def forward(
+            self,
+            hidden,
+            positions,
+            ids,
+            pre_mix,
+            post_mix,
+            res_mix,
+            residual,
+            hashes,
+            mask,
+            capture_previous_aux=False,
+        ):
+            if residual is None:
+                residual = hidden[:, None, :].expand(-1, 2, -1)
+            else:
+                residual = v2_model.post(hidden, residual, post_mix, res_mix)
+            if self.index in (1, 2):
+                residual = residual + ids[:, None, None] / (11 + self.index)
+            pre_mix = torch.sigmoid(residual.mean(-1))
+            hidden = torch.tanh(v2_model.collapse(residual, pre_mix))
+            post_mix = torch.full_like(pre_mix[..., None], 0.3)
+            res_mix = torch.eye(2)[None].expand(hidden.shape[0], -1, -1) * 0.7
+            return hidden, residual, post_mix, res_mix, pre_mix, None
+
+    model.layers = torch.nn.ModuleList(CarryLayer(i) for i in range(4))
+    ids, positions = torch.arange(rows), torch.arange(rows)
+    embeds = torch.arange(rows * 4).reshape(rows, 4).float() / 13
+
+    def run(first_split):
+        model._engram_first_split_layer = first_split
+        carry = model._forward_stage(ids, positions, None, embeds, stage="encoder_head")
+        if first_split is not None:
+            carry = model._forward_stage(
+                ids,
+                positions,
+                None,
+                carry[0],
+                encoder_carry=carry[1:4],
+                encoder_pre_mix=carry[4],
+                stage="encoder_middle",
+            )
+        return model._forward_stage(
+            ids,
+            positions,
+            None,
+            carry[0],
+            encoder_carry=carry[1:4],
+            encoder_pre_mix=carry[4],
+            stage="encoder_tail",
+        )
+
+    expected = run(None)
+    actual = run(1)
+    for value, reference in zip(actual, expected, strict=True):
+        torch.testing.assert_close(value, reference, rtol=0, atol=0)
+
+
+@pytest.mark.parametrize(
+    ("tail_split", "host_layers", "expected"),
+    [
+        (None, (1, 4), None),
+        (4, (1, 4), 1),
+        (4, (0, 1, 4), None),
+        (4, (4,), None),
+        (4, (2, 4), 2),
+    ],
+)
+def test_first_engram_split_follows_host_placement(tail_split, host_layers, expected):
+    model = SimpleNamespace(
+        start_layer=0,
+        _engram_split_layer=tail_split,
+        layers=[
+            SimpleNamespace(
+                engram=SimpleNamespace(embed_tokens=SimpleNamespace(host_offload=True))
+                if i in host_layers
+                else None
+            )
+            for i in range(5)
+        ],
+    )
+    assert v2_model.DeepseekV41Model._select_engram_first_split_layer(model) == expected
+
+
+def test_early_split_stages_only_middle_layers_once(monkeypatch):
+    hashes = torch.ones(2, 2, 1, dtype=torch.int64)
+    observed = []
+    monkeypatch.setattr(
+        v2_model,
+        "_stage_engram_layers",
+        lambda layers, gathered: observed.append((list(layers), gathered)),
+    )
+    model = SimpleNamespace(
+        layers=list(range(5)),
+        _engram_first_split_layer=1,
+        _engram_split_layer=4,
+        _early_engram_hashes=hashes,
+    )
+    v2_model.DeepseekV41Model._stage_early_engram(model)
+    v2_model.DeepseekV41Model._stage_early_engram(model)
+    assert model._early_engram_hashes is None
+    assert len(observed) == 1
+    assert observed[0][0] == [1, 2, 3]
+    assert observed[0][1] is hashes
+
+
+def test_early_split_enqueues_before_host_lookup(monkeypatch):
+    class TpuTensor(torch.Tensor):
+        @property
+        def device(self):
+            return SimpleNamespace(type="tpu")
+
+    order = []
+    carry = tuple(torch.ones(2, 4).as_subclass(TpuTensor) for _ in range(5))
+
+    def stage(name):
+        def call(*args):
+            order.append(name)
+            return [carry]
+
+        return call
+
+    def enqueue(tensors, wait):
+        assert wait is False
+        assert all(a is b for a, b in zip(tensors, carry, strict=True))
+        order.append("enqueue")
+
+    monkeypatch.setattr(v2_model, "synchronize_tensors", enqueue)
+    model = SimpleNamespace(
+        _engram_first_split_layer=1,
+        _engram_prepared_outside_stage=True,
+        encoder_head_stage=stage("l0"),
+        encoder_middle_stage=stage("middle"),
+        encoder_tail_stage=stage("tail"),
+        _stage_early_engram=lambda: order.append("l1 lookup"),
+        _stage_deferred_engram=lambda: order.append("l14 lookup"),
+    )
+    v2_model.DeepseekV41Model._forward_split_encoder(
+        model, torch.arange(2), torch.arange(2), None, None, None
+    )
+    assert order == [
+        "l0",
+        "enqueue",
+        "l1 lookup",
+        "middle",
+        "enqueue",
+        "l14 lookup",
+        "tail",
+    ]
