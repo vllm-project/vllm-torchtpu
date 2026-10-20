@@ -103,6 +103,7 @@ if TYPE_CHECKING:
     TPU_ENABLE_GDN_DYNAMIC_TILING: bool = False
     TPU_GDN_PREFILL_CHECKPOINT: bool = True
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
+    TPU_RPA_PREFILL_BLOCKS: str = ""
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
     TPU_MOE_TOPK_WEIGHTS_FLOAT32: bool = False
@@ -833,6 +834,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Skip padded tokens from MoE, otherwise they will route like
     # real tokens and activate experts whose output is thrown away.
     "TPU_MOE_SKIP_PADDED_TOKENS": env_bool("TPU_MOE_SKIP_PADDED_TOKENS"),
+    # "bq,bq_c,bkv,batch": replaces the batched RPA prefill/mixed tile sizes that
+    # calculate_block_sizes picks (empty: the heuristic). See wrapper.prefill_block_override.
+    "TPU_RPA_PREFILL_BLOCKS": lambda: os.getenv("TPU_RPA_PREFILL_BLOCKS", ""),
     # Hierarchical MoE parallelism: expert-parallel between chips,
     # tensor-parallel between the two chiplets of a chip. Off by
     # default; it helps only at low concurrency, where the MoE is

@@ -17,6 +17,7 @@ Validates tensor shapes, selects tuned block sizes, builds DMA schedule tables,
 and invokes the Pallas Batched RPA kernel.
 """
 
+import math
 import re
 from typing import cast
 
@@ -543,9 +544,49 @@ def calculate_block_sizes(
     prefill_batch_size = 2
 
     decode_block_sizes = find_best_block_sizes(decode_batch_size, decode_query_size)
-    prefill_block_sizes = find_best_block_sizes(prefill_batch_size)
+    prefill_block_sizes = prefill_block_override(
+        find_best_block_sizes(prefill_batch_size), serve_cfgs, mxu_column_size
+    )
 
     return decode_block_sizes, prefill_block_sizes
+
+
+def prefill_block_override(
+    default: configs.BlockSizes,
+    serve_cfgs: configs.ServingConfigs,
+    mxu_column_size: int,
+) -> configs.BlockSizes:
+    """Applies TPU_RPA_PREFILL_BLOCKS ("bq,bq_c,bkv,batch") to the prefill tiles.
+
+    The heuristic grows bq and bkv together, so with many q heads per KV head
+    (32 q / 2 KV heads on a PP=8 stage) VMEM stops both at 256 and every
+    256-key block pays a full accumulator rescale. A 1024-key block with a
+    small q sub-chunk (256,32,1024,1) fits and runs the prefill kernel ~20%
+    faster at 87K context (rpa_prefill_bench.py, j-10897a30). Every caller of
+    calculate_block_sizes (the kernel, build_rpa_schedules and the schedule
+    shapes) sees the same tiles. bq is clamped to the aligned token count as
+    the heuristic does, and bq_c to a divisor of bq. Empty: the heuristic.
+    """
+    raw = (envs.TPU_RPA_PREFILL_BLOCKS or "").strip()
+    if not raw:
+        return default
+    try:
+        bq, bq_c, bkv, batch = (int(x) for x in raw.split(","))
+    except ValueError as e:
+        raise ValueError(
+            f"TPU_RPA_PREFILL_BLOCKS must be 'bq,bq_c,bkv,batch'; got {raw!r}"
+        ) from e
+    if min(bq, bq_c, bkv, batch) <= 0 or bkv % serve_cfgs.page_size:
+        raise ValueError(
+            f"TPU_RPA_PREFILL_BLOCKS={raw!r}: sizes must be positive and bkv a "
+            f"multiple of the page size {serve_cfgs.page_size}"
+        )
+    max_useful_bq_sz = max(
+        mxu_column_size, utils.align_to(serve_cfgs.total_q_tokens, mxu_column_size)
+    )
+    bq = min(bq, max_useful_bq_sz)
+    bq_c = math.gcd(bq, min(bq_c, bq))
+    return configs.BlockSizes(bq_sz=bq, bq_c_sz=bq_c, bkv_sz=bkv, batch_size=batch)
 
 
 @jax.jit(
