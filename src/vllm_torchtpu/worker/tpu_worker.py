@@ -71,10 +71,12 @@ def _configure_tpu_process_env(
 def _release_free_host_heap() -> None:
     """Return free allocator pages from model loading and compilation to the OS."""
     process = ctypes.CDLL(None)
-    if hasattr(process, "MallocExtension_ReleaseFreeMemory"):  # tcmalloc
+    if hasattr(process, "MallocExtension_ReleaseFreeMemory"):
         process.MallocExtension_ReleaseFreeMemory()
-    elif hasattr(process, "malloc_trim"):  # glibc
+        logger.info("Released free host heap via tcmalloc.")
+    elif hasattr(process, "malloc_trim"):
         process.malloc_trim(0)
+        logger.info("Released free host heap via glibc malloc_trim.")
 
 
 class TPUWorker(WorkerBase):
