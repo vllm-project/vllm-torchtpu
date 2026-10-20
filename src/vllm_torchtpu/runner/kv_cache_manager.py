@@ -138,7 +138,7 @@ def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
 
 
 def packed_rope_page_size_bytes(
-    attn_module: AttentionLayerBase, block_size: int, kv_cache_dtype: torch.dtype
+    attn_module: MLAAttention, block_size: int, kv_cache_dtype: torch.dtype
 ) -> int | None:
     """A sparse MLA layer's page bytes under `TPU_SPARSE_MLA_PACKED_ROPE`.
 
