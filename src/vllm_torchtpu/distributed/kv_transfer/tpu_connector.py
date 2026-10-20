@@ -688,6 +688,25 @@ def _use_raiden_glm_admission() -> bool:
     return tpu_envs.use_raiden_glm_admission()
 
 
+def _raiden_glm_dcp_identity() -> bool:
+    """GLM TP/DCP producer -> TP/DCP decode, each rank shipping its own pages."""
+    return _use_raiden_glm_admission() and bool(tpu_envs.TPU_RAIDEN_GLM_DCP_IDENTITY)
+
+
+def _glm_indexer_seq_along_lane(vllm_config: VllmConfig) -> bool:
+    """Whether the GLM indexer K cache was allocated SEQ_ALONG_LANE, which
+    only the DCP identity transfer admits."""
+    if not _raiden_glm_dcp_identity():
+        return False
+    from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+        KVLayout,
+        indexer_kv_layout,
+    )
+
+    block_size = int(vllm_config.cache_config.block_size)
+    return indexer_kv_layout(block_size) == KVLayout.SEQ_ALONG_LANE
+
+
 def _use_raiden_dsv4_admission() -> bool:
     return bool(
         tpu_envs.TPU_USE_RAIDEN_KV_CACHE_MANAGER and tpu_envs.TPU_RAIDEN_DSV4_ADMISSION
@@ -1642,6 +1661,25 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                     f"engine tp={tp_size}, dcp={dcp_size}, "
                     f"interleave={interleave_size}"
                 )
+            # A DCP identity producer ships its rank k pages to rank k: both
+            # peers must run that mode over the same token shards.
+            src_dcp_size = _as_int(params.get("src_dcp_size"))
+            if _raiden_glm_dcp_identity() != (src_dcp_size is not None) or (
+                src_dcp_size is not None
+                and (
+                    src_dcp_size != dcp_size
+                    or _as_int(params.get("src_interleave_size")) != interleave_size
+                )
+            ):
+                return (
+                    "Stage-3 GLM DCP identity needs TPU_RAIDEN_GLM_DCP_IDENTITY "
+                    "on both peers and the producer's DCP/interleave to match "
+                    f"this engine: src_dcp_size={params.get('src_dcp_size')!r}, "
+                    "src_interleave_size="
+                    f"{params.get('src_interleave_size')!r}; engine "
+                    f"dcp={dcp_size}, interleave={interleave_size}, "
+                    f"identity={_raiden_glm_dcp_identity()}"
+                )
         bound_req_id = self._stage3_active_source_req_ids.get(source_req_id)
         if bound_req_id is not None and bound_req_id != request.request_id:
             return (
@@ -2318,15 +2356,22 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             else self.block_size
         )
 
+        # A DCP identity producer's scheduler block spans its DCP ranks' pages.
+        block_cp_size = pcp_size * (
+            int(parallel_config.decode_context_parallel_size or 1)
+            if _raiden_glm_dcp_identity()
+            else 1
+        )
+
         def _normalize(ids: Sequence[int], page_tokens: int) -> tuple[int, ...] | None:
             normalized = self._stage3_normalize_producer_blocks(
                 ids,
                 num_tokens=num_tokens,
                 page_tokens=page_tokens,
-                pcp_size=pcp_size,
+                pcp_size=block_cp_size,
             )
             if normalized is None:
-                scheduler_block_tokens = page_tokens * pcp_size
+                scheduler_block_tokens = page_tokens * block_cp_size
                 expected = (
                     num_tokens + scheduler_block_tokens - 1
                 ) // scheduler_block_tokens
@@ -2340,7 +2385,7 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                     expected,
                     num_tokens,
                     page_tokens,
-                    pcp_size,
+                    block_cp_size,
                 )
             return normalized
 
@@ -2512,6 +2557,12 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
         if _use_raiden_glm_admission() and params["dst_dcp_size"] > 1:
             params["dst_interleave_size"] = _raiden_dst_interleave_tokens(
                 self.vllm_config
+            )
+        if _raiden_glm_dcp_identity():
+            # The decode checks it holds the same token shards per rank.
+            params["src_dcp_size"] = int(parallel_config.decode_context_parallel_size)
+            params["src_interleave_size"] = int(
+                parallel_config.cp_kv_cache_interleave_size
             )
         self._stage3_finished_sends[request.request_id] = (
             uuid,
@@ -3029,6 +3080,7 @@ class TPURaidenConnectorWorker:
             raw_tensors=raw_tensors,
             block_size_tokens=int(self.vllm_config.cache_config.block_size),
             per_layer_tags=_use_per_layer_pool_tags(),
+            indexer_seq_along_lane=_glm_indexer_seq_along_lane(self.vllm_config),
         )
         rpm.verify_storage_binding(
             manifest=manifest,
@@ -3112,10 +3164,31 @@ class TPURaidenConnectorWorker:
                     f"tensor_parallel_size={tp_size}, "
                     f"data_parallel_size={dp_size}"
                 )
+            if _raiden_glm_dcp_identity():
+                return self._glm_dcp_identity_producer_topology()
+            # A DCP producer holds a token shard, not a replica: only the
+            # identity lowering knows which tokens its pages hold.
+            if int(parallel_config.decode_context_parallel_size or 1) > 1:
+                raise ValueError(
+                    f"{supported}; a DCP producer needs "
+                    "TPU_RAIDEN_GLM_DCP_IDENTITY, got "
+                    "decode_context_parallel_size="
+                    f"{parallel_config.decode_context_parallel_size}"
+                )
             if _raiden_dst_dcp_size(self.vllm_config) > 1:
                 self._validate_glm_dcp_destination(supported)
             return f"tp{tp_size}_prefill"
         dcp_size = int(parallel_config.decode_context_parallel_size or 1)
+        if _raiden_glm_dcp_identity() and not (
+            tp_size > 1 and dcp_size == tp_size and dp_size == 1
+        ):
+            raise ValueError(
+                "TPU_RAIDEN_GLM_DCP_IDENTITY needs a decode with "
+                "tensor_parallel_size == decode_context_parallel_size > 1, "
+                f"got tensor_parallel_size={tp_size}, "
+                f"decode_context_parallel_size={dcp_size}, "
+                f"data_parallel_size={dp_size}"
+            )
         if tp_size > 1 and dcp_size == tp_size and dp_size == 1:
             # Every TP worker holds one DCP shard of the token positions, so
             # it must be the DCP rank its producer spans are routed to.
@@ -3135,6 +3208,51 @@ class TPURaidenConnectorWorker:
                 f"data_parallel_size={dp_size}"
             )
         return f"dp{dp_size}_decode"
+
+    def _glm_dcp_identity_producer_topology(self) -> str:
+        """Validates a TPU_RAIDEN_GLM_DCP_IDENTITY producer.
+
+        Its TP workers are its DCP ranks, and the destination runs the same DCP
+        size and interleave over as many shards, so producer rank k holds
+        exactly the tokens of destination rank k. Equal page sizes are checked
+        by the layout fingerprint, which carries page_tokens.
+        """
+        parallel_config = self.vllm_config.parallel_config
+        tp_size = int(self.tp_size)
+        dcp_size = int(parallel_config.decode_context_parallel_size or 1)
+        interleave = int(parallel_config.cp_kv_cache_interleave_size)
+        if _engine_is_pipeline(self.vllm_config) or not (1 < tp_size == dcp_size):
+            raise ValueError(
+                "TPU_RAIDEN_GLM_DCP_IDENTITY needs a producer with "
+                "tensor_parallel_size == decode_context_parallel_size > 1 and "
+                "no pipeline parallelism, got pipeline_parallel_size="
+                f"{_pipeline_parallel_size(self.vllm_config)}, "
+                f"tensor_parallel_size={tp_size}, "
+                f"decode_context_parallel_size={dcp_size}"
+            )
+        dst_dcp_size = _raiden_dst_dcp_size(self.vllm_config)
+        dst_interleave = _raiden_dst_interleave_tokens(self.vllm_config)
+        if (
+            dst_dcp_size != dcp_size
+            or _raiden_dst_shards() != dcp_size
+            or dst_interleave != interleave
+        ):
+            raise ValueError(
+                "TPU_RAIDEN_GLM_DCP_IDENTITY needs the destination's DCP size, "
+                "shard count and interleave to equal the producer's: "
+                f"destination_decode_context_parallel_size={dst_dcp_size}, "
+                f"TPU_RAIDEN_DST_SHARDS={_raiden_dst_shards()}, "
+                f"destination_cp_kv_cache_interleave_size={dst_interleave}; "
+                f"producer dcp={dcp_size}, interleave={interleave}"
+            )
+        from vllm_torchtpu.distributed.dcp import get_dcp_rank
+
+        if get_dcp_rank() != self.tp_rank:
+            raise ValueError(
+                "Raiden GLM DCP identity requires dcp_rank == tp_rank: "
+                f"dcp_rank={get_dcp_rank()}, tp_rank={self.tp_rank}"
+            )
+        return f"tp{tp_size}dcp{dcp_size}_prefill"
 
     def _validate_glm_dcp_destination(self, supported: str) -> None:
         dst_dcp_size = _raiden_dst_dcp_size(self.vllm_config)
@@ -3342,18 +3460,20 @@ class TPURaidenConnectorWorker:
 
     @staticmethod
     def _measure_raiden_glm_layout(
-        manifest: Any, page_tokens: int
+        manifest: Any, page_tokens: int, indexer_seq_along_lane: bool = False
     ) -> tuple[str, dict[str, Any]]:
         from vllm_torchtpu.distributed.kv_transfer.raiden.layout_fingerprint import (
             measured_glm_layout_fingerprint,
         )
 
         # Pipeline stage may hold no indexer layer, so the indexer class stays out of
-        # the fingerprint on both sides.
+        # the fingerprint on both sides. A DCP identity peer holds every layer, and
+        # its indexer layout (packed rows or SEQ_ALONG_LANE) must match.
         return measured_glm_layout_fingerprint(
             manifest,
             page_tokens=page_tokens,
-            hash_indexer=not _use_per_layer_pool_tags(),
+            hash_indexer=not _use_per_layer_pool_tags() or _raiden_glm_dcp_identity(),
+            indexer_seq_along_lane=indexer_seq_along_lane,
         )
 
     def _measure_stage3_layout(self, manifest: Any) -> tuple[str, dict[str, Any], int]:
@@ -3395,7 +3515,9 @@ class TPURaidenConnectorWorker:
         if _use_raiden_glm_admission():
             page_tokens = int(self.vllm_config.cache_config.block_size)
             fingerprint, payload = self._measure_raiden_glm_layout(
-                manifest, page_tokens
+                manifest,
+                page_tokens,
+                indexer_seq_along_lane=_glm_indexer_seq_along_lane(self.vllm_config),
             )
             return fingerprint, payload, page_tokens
         if _raiden_seq_on_lane_layout():
@@ -4431,6 +4553,7 @@ class TPURaidenConnectorWorker:
         one complete source fragment for each KDA state group.
         """
         from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
+            lower_glm_dcp_identity_spans,
             lower_glm_dcp_row_spans,
             lower_glm_row_spans,
         )
@@ -4441,6 +4564,9 @@ class TPURaidenConnectorWorker:
         parallelism = self._raiden_transfer_parallelism()
         transfer_rank = self._local_raiden_transfer_rank()
         self._maybe_delay_stage3_registration_for_test(metadata)
+        # A DCP identity producer's transfer rank is its DCP rank (admission
+        # checks dcp_rank == tp_rank) and it ships its own pages whole.
+        dcp_identity = _raiden_glm_dcp_identity()
 
         now = time.time()
         expired_terminal_req_ids = [
@@ -4460,8 +4586,8 @@ class TPURaidenConnectorWorker:
         pipeline = _engine_is_pipeline(self.vllm_config)
         lowering_parallelism = 1 if pipeline else parallelism
         lowering_rank = 0 if pipeline else transfer_rank
-        # A DCP destination (admitted for pipeline producers only) shards
-        # each page's tokens over its ranks.
+        # A DCP destination (admitted for pipeline producers and DCP identity
+        # producers) shards each page's tokens over its ranks.
         dst_dcp_size = (
             _raiden_dst_dcp_size(self.vllm_config) if _use_raiden_glm_admission() else 1
         )
@@ -4482,7 +4608,20 @@ class TPURaidenConnectorWorker:
                 int(block_id) for block_id in req_meta.local_block_ids
             )
             transfer_tags = ("fa",) if self._stage3_kimi else list(tag_geometry)
-            if dst_dcp_size > 1:
+            if dcp_identity:
+                pool_spans = [
+                    lower_glm_dcp_identity_spans(
+                        tag=tag,
+                        num_tokens=num_tokens,
+                        page_tokens=page_tokens,
+                        dcp_size=dst_dcp_size,
+                        dcp_rank=transfer_rank,
+                        live_bytes_per_block=tag_geometry[tag][0],
+                        block_ids=list(scheduler_ids),
+                    )
+                    for tag in transfer_tags
+                ]
+            elif dst_dcp_size > 1:
                 pool_spans = [
                     lower_glm_dcp_row_spans(
                         tag=tag,

@@ -412,6 +412,7 @@ class TpuPlatform(Platform):
         "TPU_DCP_INDEXER_HIST_MERGE",
         "TPU_USE_RAIDEN_KV_CACHE_MANAGER",
         "TPU_RAIDEN_GLM_ADMISSION",
+        "TPU_RAIDEN_GLM_DCP_IDENTITY",
         "TPU_KV_RESHARD_TRANSPORT",
     ]
 

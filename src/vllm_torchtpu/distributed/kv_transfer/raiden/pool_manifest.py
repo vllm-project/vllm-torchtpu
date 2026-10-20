@@ -1244,6 +1244,7 @@ def build_glm_mla_pool_manifest(
     raw_tensors: Sequence[Any],
     block_size_tokens: int,
     per_layer_tags: bool = False,
+    indexer_seq_along_lane: bool = False,
 ) -> PoolManifest:
     """Builds the Pool Manifest for GLM MLA models.
 
@@ -1256,6 +1257,12 @@ def build_glm_mla_pool_manifest(
     ``per_layer_tags`` appends the layer index to every tag (``mla.nope.l3``)
     so a pipeline stage, which holds only some layers, sends each layer's
     cache to the same layer on the destination.
+
+    ``indexer_seq_along_lane`` admits the indexer K cache in its
+    SEQ_ALONG_LANE layout ([blocks, head_dim // 4 + 1, 4, block_size], one
+    token per lane). A token range is no byte range there, so the page is
+    declared as a single unit, which only whole-page transfers
+    (TPU_RAIDEN_GLM_DCP_IDENTITY) can use.
     """
     if block_size_tokens <= 0:
         raise ManifestError("block_size_tokens must be positive")
@@ -1325,12 +1332,20 @@ def build_glm_mla_pool_manifest(
                 f"num_blocks {num_blocks}"
             )
         live_stride = nbytes // num_blocks
+        seq_along_lane = indexer_seq_along_lane and class_tag(tag) == TAG_DSA_IDX
         if class_tag(tag) == TAG_MLA_NOPE:
             # One packed row per token in the nope layout.
             if rows != block_size_tokens:
                 raise ManifestError(
                     f"cache {layer_name} nope rows {rows} do not match the "
                     f"KV block size {block_size_tokens}"
+                )
+        elif seq_along_lane:
+            # One token per lane: the page width is the KV block size.
+            if width != block_size_tokens:
+                raise ManifestError(
+                    f"cache {layer_name} SEQ_ALONG_LANE width {width} does not "
+                    f"match the KV block size {block_size_tokens}"
                 )
         elif rows * tokens_per_row != block_size_tokens:
             raise ManifestError(
@@ -1361,7 +1376,9 @@ def build_glm_mla_pool_manifest(
                 block_stride_bytes=live_stride,
                 num_blocks=num_blocks,
                 regions=_glm_row_region(
-                    class_tag(tag), row_bytes=row_bytes, num_rows=rows
+                    class_tag(tag),
+                    row_bytes=live_stride if seq_along_lane else row_bytes,
+                    num_rows=1 if seq_along_lane else rows,
                 ),
                 dtype_tag=dtype_tag,
             )

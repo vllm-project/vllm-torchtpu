@@ -97,6 +97,7 @@ if TYPE_CHECKING:
     TPU_RAIDEN_QWEN35_ADMISSION: bool = False
     TPU_RAIDEN_KIMIK3_ADMISSION: bool = False
     TPU_RAIDEN_GLM_ADMISSION: bool = False
+    TPU_RAIDEN_GLM_DCP_IDENTITY: bool = False
     TPU_RAIDEN_DSV4_ADMISSION: bool = False
     TPU_KV_RESHARD_TRANSPORT: str = "zmq"
     TPU_RAIDEN_CONTROLLER_ADDRESS: str = ""
@@ -1209,6 +1210,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # must set it identically.
     "TPU_RAIDEN_POOL_TAGS_PER_LAYER": env_bool("TPU_RAIDEN_POOL_TAGS_PER_LAYER"),
     "TPU_RAIDEN_GLM_ADMISSION": env_bool("TPU_RAIDEN_GLM_ADMISSION"),
+    # GLM Stage-3 from a TP/DCP producer to a TP/DCP decode with the same TP =
+    # DCP size, interleave and block size: each producer rank ships its whole
+    # pages to the decode rank with the same index. Both peers must set it.
+    # Whole pages need no packed-row geometry, so the indexer K cache may keep
+    # its SEQ_ALONG_LANE layout under Raiden GLM admission.
+    "TPU_RAIDEN_GLM_DCP_IDENTITY": env_bool("TPU_RAIDEN_GLM_DCP_IDENTITY"),
     # DeepSeek-V4 admits several attention KV cache groups at once: CSA,
     # indexer, HCA, SWA and the compressor states. Every other model here has
     # exactly one.
