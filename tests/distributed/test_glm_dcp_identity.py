@@ -456,3 +456,74 @@ def test_decode_requires_matching_identity_producer(identity, overrides, accepte
         assert error is None
     else:
         assert "DCP identity" in error
+
+
+# ---------------------------------------------------------------------------
+# The pinned vLLM's P/D interleave override.
+# ---------------------------------------------------------------------------
+
+
+def _interleave_config(connector, *, interleave=4, dcp=16, dcp_interleave=1):
+    return SimpleNamespace(
+        kv_transfer_config=SimpleNamespace(kv_connector=connector),
+        parallel_config=SimpleNamespace(
+            decode_context_parallel_size=dcp,
+            cp_kv_cache_interleave_size=interleave,
+            dcp_kv_cache_interleave_size=dcp_interleave,
+        ),
+    )
+
+
+def _kv_cache_config(block_size=256):
+    spec = SimpleNamespace(block_size=block_size)
+    return SimpleNamespace(kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)])
+
+
+def _unpatched_interleave_adjust(monkeypatch):
+    """Start from vLLM's method; monkeypatch restores both after the test."""
+    from vllm.config import VllmConfig
+
+    monkeypatch.setattr(
+        VllmConfig,
+        "adjust_dcp_kv_cache_interleave_size",
+        VllmConfig.adjust_dcp_kv_cache_interleave_size,
+    )
+    monkeypatch.setattr(
+        VllmConfig, "_tpu_raiden_keep_interleave_patch", False, raising=False
+    )
+    return VllmConfig
+
+
+@pytest.mark.parametrize(
+    ("identity", "connector", "expected"),
+    [
+        (True, "TPURaidenConnector", 4),
+        # Other connectors keep vLLM's block-size alignment.
+        (True, "NixlConnector", 256),
+        # Without the identity transfer nothing is patched.
+        (False, "TPURaidenConnector", 256),
+    ],
+)
+def test_identity_keeps_configured_interleave(
+    monkeypatch, identity, connector, expected
+):
+    import vllm_torchtpu
+
+    config_cls = _unpatched_interleave_adjust(monkeypatch)
+    _raiden_glm_env(monkeypatch, identity)
+    vllm_torchtpu._patch_raiden_identity_keeps_cp_interleave()
+    config = _interleave_config(connector)
+    config_cls.adjust_dcp_kv_cache_interleave_size(config, _kv_cache_config())
+    assert config.parallel_config.cp_kv_cache_interleave_size == expected
+
+
+def test_identity_interleave_patch_keeps_deprecated_dcp_override(monkeypatch):
+    import vllm_torchtpu
+
+    config_cls = _unpatched_interleave_adjust(monkeypatch)
+    _raiden_glm_env(monkeypatch, identity=True)
+    vllm_torchtpu._patch_raiden_identity_keeps_cp_interleave()
+    vllm_torchtpu._patch_raiden_identity_keeps_cp_interleave()  # idempotent
+    config = _interleave_config("TPURaidenConnector", dcp_interleave=64)
+    config_cls.adjust_dcp_kv_cache_interleave_size(config, _kv_cache_config())
+    assert config.parallel_config.cp_kv_cache_interleave_size == 64
