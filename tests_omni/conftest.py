@@ -205,19 +205,6 @@ def omni_runner(
     yield _omni_runner_manager.get_or_create(request.param)
 
 
-@pytest.fixture(scope="function")
-def omni_runner_function(
-    request: pytest.FixtureRequest,
-) -> Generator[OmniRunner, None, None]:
-    """Function-scoped :class:`OmniRunner` torn down after each test."""
-    model, stage_cfg, extra = _parse_omni_runner_param(request.param)
-    with (
-        omni_fixture_lock,
-        OmniRunner(model, deploy_config=stage_cfg, **extra) as runner,
-    ):
-        yield runner
-
-
 @pytest.fixture(autouse=True)
 def _sync_tpu(request: pytest.FixtureRequest) -> Generator[None, None, None]:
     """Flush deferred torch_tpu ops between in-process TPU tests."""
