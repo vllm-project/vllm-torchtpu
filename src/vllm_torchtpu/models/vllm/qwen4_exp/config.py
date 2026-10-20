@@ -23,13 +23,6 @@ if TYPE_CHECKING:
     from vllm.config import VllmConfig
 
 
-# transformers relabels the checkpoint's full_attention layers on load:
-# qwen_sparse_attention before v5.18, indexed_attention from v5.18 on. TPU runs
-# them as dense attention; TPUQwen4ExpConfig bounds max_model_len so that this
-# matches QSA.
-QSA_LAYER_TYPES = ("qwen_sparse_attention", "indexed_attention")
-
-
 class TPUQwen4ExpConfig(Qwen4ExpForCausalLMConfig):
     """Upstream Qwen4Exp checks, plus the features the TPU model lacks yet."""
 
@@ -53,8 +46,13 @@ class TPUQwen4ExpConfig(Qwen4ExpForCausalLMConfig):
                 f"To run without PLE for bring-up, pass --hf-overrides "
                 f"'{override}'; outputs then differ from the released model."
             )
+        # transformers (>=5.18, see pyproject.toml) labels the checkpoint's
+        # full_attention (QSA) layers indexed_attention. TPU runs them as
+        # dense attention, which matches QSA within the max_model_len bound
+        # below.
         unsupported_layer_types = sorted(
-            set(text_config.layer_types or ()) - {"linear_attention", *QSA_LAYER_TYPES}
+            set(text_config.layer_types or ())
+            - {"linear_attention", "indexed_attention"}
         )
         if unsupported_layer_types:
             raise NotImplementedError(

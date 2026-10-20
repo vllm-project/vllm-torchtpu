@@ -19,10 +19,11 @@ The TPU attention metadata copies block-table rows straight into the kernels'
 page tables, so those rows must hold kernel block ids.
 
 vLLM 0.31 did that split inside ``BlockTable`` (``kernel_block_size``).
-vLLM 0.32 (vllm-project/vllm#57169) removed it: ``BlockTable`` now holds
-manager ids, and the GPU runner maps them per attention group while it builds
-metadata. The TPU runner builds its own metadata, so ``KernelBlockTable``
-keeps the 0.31 behavior for the groups that split.
+vLLM 0.32 removed it (https://github.com/vllm-project/vllm/pull/57169):
+``BlockTable`` now holds manager ids, and the GPU runner maps them per
+attention group while it builds metadata. The TPU runner builds its own
+metadata, so ``KernelBlockTable`` keeps the 0.31 behavior for the groups that
+split.
 """
 
 from __future__ import annotations

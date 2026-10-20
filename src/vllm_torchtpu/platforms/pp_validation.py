@@ -36,8 +36,12 @@ def _torch_tpu_builds_stage_meshes() -> bool:
 
 
 # The `layer_types` spellings vLLM counts as full-attention layers
-# (`_ATTENTION_LAYER_TYPES` in vllm/config/model.py). transformers v5.18 renamed
-# deepseek_sparse_attention and qwen_sparse_attention to indexed_attention.
+# (`_ATTENTION_LAYER_TYPES`,
+# https://github.com/vllm-project/vllm/blob/v0.32.0/vllm/config/model.py#L111).
+# transformers v5.18 renamed deepseek_sparse_attention and
+# qwen_sparse_attention to indexed_attention
+# (https://github.com/huggingface/transformers/pull/48974); vLLM keeps all
+# three spellings, and so does this list.
 _FULL_ATTENTION_LAYER_TYPES = [
     "full_attention",
     "indexed_attention",

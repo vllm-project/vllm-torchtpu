@@ -186,15 +186,6 @@ def test_config_accepts_qsa_within_indexer_budget() -> None:
     TPUQwen4ExpConfig.verify_and_update_config(vllm_config)
 
 
-@pytest.mark.parametrize("layer_type", ["qwen_sparse_attention", "indexed_attention"])
-def test_config_accepts_both_qsa_layer_spellings(layer_type: str) -> None:
-    text_config = _text_config(**_QSA)
-    # Set after construction: transformers v5.18 renamed qwen_sparse_attention
-    # to indexed_attention, and each version validates only its own spelling.
-    text_config.layer_types = ["linear_attention", layer_type]
-    TPUQwen4ExpConfig.verify_and_update_config(_vllm_config_for_checks(text_config))
-
-
 def test_config_rejects_unknown_layer_type() -> None:
     text_config = _text_config()
     text_config.layer_types = ["linear_attention", "sliding_attention"]

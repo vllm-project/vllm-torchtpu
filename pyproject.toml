@@ -46,12 +46,17 @@ dependencies = [
     # Imported directly by src/vllm_torchtpu/models/vllm/qwen3_vl_patch.py and
     # qwen4_exp/, so declared here rather than leaned on as a vLLM transitive.
     #
-    # The floor matches vLLM 0.32.0, which (like qwen4_exp/) takes
-    # Qwen4ExpTextConfig from transformers. No upper bound in base
-    # dependencies, so upstream vLLM HEAD canary builds
+    # qwen4_exp/ takes Qwen4ExpTextConfig from transformers, which relabels the
+    # checkpoint's full_attention layers on load:
+    # * before v5.18: qwen_sparse_attention
+    # * from v5.18 on: indexed_attention
+    #   (https://github.com/huggingface/transformers/pull/48974)
+    # qwen4_exp/ accepts only indexed_attention, hence the floor. vLLM 0.32.0
+    # and vllm-omni 0.32.0rc1 both take transformers>=5.16.1,<5.20.0. No upper
+    # bound in base dependencies, so upstream vLLM HEAD canary builds
     # (vllm-torchtpu-integration) can resolve. Monitored for potential
     # structured-output spec-decode divergence (#1093) on transformers>=5.17.
-    "transformers>=5.16.1",
+    "transformers>=5.18.0",
     # Required for N-gram speculative decoding
     # vLLM only lists it in its per-platform requirements/*.txt files (cuda.txt,
     # cpu.txt, ...) except tpu.txt, so it's missing

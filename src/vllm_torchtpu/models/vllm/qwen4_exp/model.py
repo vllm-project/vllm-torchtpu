@@ -60,7 +60,6 @@ from vllm.models.qwen4_exp.common.hyperconnection import (
     HyperConnectionConfig,
 )
 
-from vllm_torchtpu.models.vllm.qwen4_exp.config import QSA_LAYER_TYPES
 from vllm_torchtpu.models.vllm.qwen4_exp.ple import Qwen4ExpPLELayer
 
 
@@ -117,7 +116,8 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
             )
-        elif self.layer_type in QSA_LAYER_TYPES:
+        elif self.layer_type == "indexed_attention":
+            # The checkpoint's full_attention (QSA) layers; see config.py.
             # TODO(QSA): add the indexer and attend over the selected blocks.
             self.self_attn = Qwen3NextAttention(
                 layer_config,
