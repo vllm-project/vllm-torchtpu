@@ -1,7 +1,21 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Ensure environment overrides are applied before any other imports,
 # especially torch_tpu which might read them at import time.
+import functools
+
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
 import bisect
@@ -16,7 +30,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass, field
 from importlib import metadata as importlib_metadata
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Concatenate, cast
 
 # TODO: Remove this after jax dependency is removed
 import jax
@@ -55,6 +69,7 @@ from vllm.model_executor.layers.rotary_embedding.mrope_interleaved import (
     MRotaryEmbeddingInterleaved,
 )
 from vllm.model_executor.model_loader import get_model_loader
+from vllm.model_executor.models.interfaces_base import VllmModelForPooling
 from vllm.multimodal.utils import group_and_batch_mm_kwargs
 from vllm.sequence import IntermediateTensors
 from vllm.utils.math_utils import cdiv
@@ -110,6 +125,7 @@ from vllm_torchtpu.layers.adapter.sample.top_k_top_p import (
 )
 from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
+    AttentionMetadataBuilder,
     AttentionMetadataBuilderContext,
     attention_block_table_width,
     stage_block_table_uploads,
@@ -174,6 +190,7 @@ from vllm_torchtpu.tracing.utils import (
 from vllm_torchtpu.utils import synchronize_device, synchronize_tensors
 
 if TYPE_CHECKING:
+    from vllm.model_executor.models.interfaces import SupportsPP
     from vllm.v1.core.sched.output import GrammarOutput, SchedulerOutput
 
 
@@ -365,6 +382,23 @@ def _substitute_placeholder_token(
 logger = init_logger(__name__)
 
 
+def _pp_step[**P, R](
+    method: Callable[Concatenate[Any, P], R],
+) -> Callable[Concatenate[Any, P], R]:
+    """Brackets a runner call that traces device ops with the pipeline wave's
+    step."""
+
+    @functools.wraps(method)
+    def wrapper(self: Any, *args: P.args, **kwargs: P.kwargs) -> R:
+        wave = self._pp_wave
+        if wave is None:
+            return method(self, *args, **kwargs)
+        with wave.step():
+            return method(self, *args, **kwargs)
+
+    return wrapper
+
+
 def _spec_warmup_all_token_ids(
     req_ids: list[str], num_computed_tokens: list[int]
 ) -> dict[str, list[int]]:
@@ -544,6 +578,8 @@ class TPUModelRunner(GPUModelRunner):
     # pyrefly: ignore[bad-override-mutable-attribute]
     input_ids: torch.Tensor
     empty_slot_mappings: dict[int, torch.Tensor]
+    # Default for a runner built without __init__.
+    _pp_wave: PPWave | None = None
 
     @property
     def _async_drafter(self) -> DFlashProposer | Eagle3Proposer:
@@ -1004,7 +1040,7 @@ class TPUModelRunner(GPUModelRunner):
 
         # Hand-off wave over ICI; built in capture_model, where every stage
         # reaches the same point.
-        self._pp_wave: PPWave | None = None
+        self._pp_wave = None
         # A sparse model's shared top-k index table, when this stage's layers
         # cannot all recompute it; set at load time under a pipeline.
         self._pp_topk_buffer: torch.Tensor | None = None
@@ -1597,7 +1633,9 @@ class TPUModelRunner(GPUModelRunner):
         per_layer_attn_metadata: dict[str, AttentionMetadata] = {}
         for group_list in self.attn_groups:
             for group in group_list:
-                built = group.metadata_builders[0].build(
+                built = cast(
+                    AttentionMetadataBuilder, group.metadata_builders[0]
+                ).build(
                     common_prefix_len=0,
                     common_attn_metadata=common,
                 )
@@ -1639,14 +1677,16 @@ class TPUModelRunner(GPUModelRunner):
                 ctx,
                 num_reqs_padded,
                 gids={
-                    group.metadata_builders[0].kv_cache_group_id
+                    cast(
+                        AttentionMetadataBuilder, group.metadata_builders[0]
+                    ).kv_cache_group_id
                     for group, _ in selected_groups
                 },
             )
         common = SimpleNamespace(num_reqs=num_reqs_padded)
         metadata: dict[str, AttentionMetadata] = {}
         for group, selected in selected_groups:
-            built = group.metadata_builders[0].build(
+            built = cast(AttentionMetadataBuilder, group.metadata_builders[0]).build(
                 common_prefix_len=0,
                 common_attn_metadata=common,
             )
@@ -3672,6 +3712,7 @@ class TPUModelRunner(GPUModelRunner):
         )
 
     @torch.no_grad()
+    @_pp_step
     def execute_model(
         self,
         scheduler_output: "SchedulerOutput",
@@ -4199,7 +4240,7 @@ class TPUModelRunner(GPUModelRunner):
             seq_lens_cpu=seq_lens_cpu,
             device=self.device,
         )
-        pooler_output = self.model.pooler(
+        pooler_output = cast(VllmModelForPooling, self.model).pooler(
             hidden_states=unpadded_hidden_states,
             pooling_metadata=pooling_metadata,
         )
@@ -4487,6 +4528,7 @@ class TPUModelRunner(GPUModelRunner):
                     req_top_p,
                     all_greedy=False,
                     topk_candidates=topk_candidates,
+                    apply_topk_topp=self._sampler_applies_topk_topp(),
                 ).view(-1)
         accept_u = None
         assert self.rejection_sampler is not None
@@ -4531,8 +4573,10 @@ class TPUModelRunner(GPUModelRunner):
             recover_u=recover_u,
             do_sampling=True,
             topk_candidates=topk_candidates,
+            apply_topk_topp=self._sampler_applies_topk_topp(),
         )
 
+    @_pp_step
     def sample_tokens(
         self, grammar_output: "GrammarOutput | None"
     ) -> ModelRunnerOutput | AsyncTPUModelRunnerOutput:
@@ -4682,6 +4726,7 @@ class TPUModelRunner(GPUModelRunner):
                                 topk_candidates=self._sampler_topk_candidates(
                                     cur_start_idx, cur_end_idx, grammar_output
                                 ),
+                                apply_topk_topp=self._sampler_applies_topk_topp(),
                             )
                     assert self.speculative_config is not None
                     padded = torch.full(
@@ -4750,6 +4795,7 @@ class TPUModelRunner(GPUModelRunner):
                             topk_candidates=self._sampler_topk_candidates(
                                 cur_start_idx, cur_end_idx, grammar_output
                             ),
+                            apply_topk_topp=self._sampler_applies_topk_topp(),
                         )
                 # NOTE (NickLucche) Use the original logits (before any penalties or
                 # temperature scaling) for the top-k logprobs. We can't enforce it
@@ -5401,6 +5447,7 @@ class TPUModelRunner(GPUModelRunner):
         self._attention_kernels_initialized = True
 
     @torch.no_grad()
+    @_pp_step
     def _dummy_run(
         self,
         num_tokens: int,
@@ -5790,8 +5837,13 @@ class TPUModelRunner(GPUModelRunner):
             or self._pp_chunk_granularity is not None
         ):
             return
+        # The scheduler clips a prefill chunk at a mamba block boundary under
+        # this same condition, so a granule that is not a whole block would
+        # clip a lone prompt's first chunk to nothing.
         block_aligned = (
-            self._has_mamba_state and self.cache_config.mamba_cache_mode == "align"
+            self.kv_cache_config is not None
+            and self.kv_cache_config.has_mamba_layers
+            and self.cache_config.mamba_cache_mode == "align"
         )
         granularity = chunk_granularity(
             self.cache_config.block_size, self.max_num_tokens, block_aligned
@@ -6042,10 +6094,15 @@ class TPUModelRunner(GPUModelRunner):
                 dummy_top_p = torch.ones((num_reqs, 1), dtype=torch.float32).to(
                     self.device
                 )
-                variants = [(False, 0), (True, 0)]
+                # (all_greedy, topk_candidates, apply_topk_topp): under
+                # speculative decoding the random path has a no-top-k/top-p
+                # graph next to the full one (_sampler_applies_topk_topp).
+                variants = [(False, 0, True), (True, 0, True)]
+                if self.speculative_config is not None:
+                    variants.insert(1, (False, 0, False))
                 if blocks := self._topk_candidate_blocks():
-                    variants.append((False, blocks))
-                for all_greedy, topk_candidates in variants:
+                    variants.append((False, blocks, True))
+                for all_greedy, topk_candidates, apply_topk_topp in variants:
                     out = self.sample_from_logits_func(
                         dummy_logits,
                         dummy_temperatures,
@@ -6054,6 +6111,7 @@ class TPUModelRunner(GPUModelRunner):
                         dummy_top_p,
                         all_greedy=all_greedy,
                         topk_candidates=topk_candidates,
+                        apply_topk_topp=apply_topk_topp,
                     )
                     synchronize_tensors(out)
                 logger.info("  -- num_seqs: %d", num_reqs)
@@ -6277,6 +6335,24 @@ class TPUModelRunner(GPUModelRunner):
                         accept_u=warm_accept_u,
                         recover_u=warm_recover_u,
                         do_sampling=True,
+                    )
+                    synchronize_tensors(out)
+                    # Same path without top-k/top-p (no request sets them).
+                    out = self.rejection_sampler(
+                        draft_token_ids=draft_token_ids,
+                        num_draft_tokens=draft_lengths,
+                        target_logits=target_logits_ng,
+                        bonus_token_ids=bonus_token_ids,
+                        segment_ids=segment_ids,
+                        group_indices=group_indices,
+                        max_draft_tokens=k,
+                        temperatures=warm_temps,
+                        top_k=warm_top_k,
+                        top_p=warm_top_p,
+                        accept_u=warm_accept_u,
+                        recover_u=warm_recover_u,
+                        do_sampling=True,
+                        apply_topk_topp=False,
                     )
                     synchronize_tensors(out)
                     if blocks := self._topk_candidate_blocks():
@@ -7554,8 +7630,10 @@ class TPUModelRunner(GPUModelRunner):
         """Buffers shaped like this stage's input from the previous stage:
         zeros, uninitialized, or random values."""
         if self._pp_intermediate_template is None:
-            probe = self.model.make_empty_intermediate_tensors(
-                batch_size=1, dtype=self.model_config.dtype, device=self.device
+            probe = cast("SupportsPP", self.model).make_empty_intermediate_tensors(
+                batch_size=1,
+                dtype=cast(torch.dtype, self.model_config.dtype),
+                device=self.device,
             )
             template = {
                 key: (tuple(tensor.shape[1:]), tensor.dtype)
@@ -7705,6 +7783,23 @@ class TPUModelRunner(GPUModelRunner):
             return 0
         return num_blocks
 
+    def _sampler_applies_topk_topp(self) -> bool:
+        """False when speculative decoding is on and no running request sets
+        top-k or top-p.
+
+        `apply_top_k_top_p` runs two 31-step bisections over the whole
+        vocabulary per row (7.5 ms for 512 verify rows on Flash) and is the
+        identity for top_k == 0 and top_p == 1.0, the vLLM defaults; vLLM's
+        GPU sampler skips it in the same case, keyed on the same
+        `InputBatch.no_top_k` / `no_top_p`. The samplers skip it on a
+        separate compiled graph that the precompiles warm next to the full
+        one. Without speculative decoding the sampler keeps its single
+        full-path graph.
+        """
+        if self.speculative_config is None:
+            return True
+        return not (self.input_batch.no_top_k and self.input_batch.no_top_p)
+
     def _sampler_topk_candidates(
         self,
         cur_start_idx: int,
@@ -7834,6 +7929,7 @@ class TPUModelRunner(GPUModelRunner):
         top_p: torch.Tensor,
         all_greedy: bool = False,
         topk_candidates: int = 0,
+        apply_topk_topp: bool = True,
     ) -> torch.Tensor:
         """
         Sample with xla-friendly function. This function is to be traced
@@ -7843,7 +7939,14 @@ class TPUModelRunner(GPUModelRunner):
             return torch.argmax(logits, dim=-1, keepdim=True)
         is_greedy = temperatures <= SAMPLING_EPS
         scaled_logits = self._apply_temperature(logits, temperatures)
-        masked_logits = apply_top_k_top_p(scaled_logits, top_k, top_p, topk_candidates)
+        if apply_topk_topp:
+            masked_logits = apply_top_k_top_p(
+                scaled_logits, top_k, top_p, topk_candidates
+            )
+        else:
+            # No request sets top-k/top-p: skip the two 31-step vocabulary
+            # bisections (separate graph, warmed in the precompile).
+            masked_logits = scaled_logits
         u_clamped = torch.clamp(
             u, min=torch.finfo(u.dtype).tiny, max=1.0 - torch.finfo(u.dtype).eps
         )

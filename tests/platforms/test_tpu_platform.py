@@ -731,6 +731,40 @@ class TestTpuPlatform:
 
         assert vllm_config.scheduler_config.disable_chunked_mm_input is False
 
+    @pytest.mark.parametrize(
+        ("initial_cls", "expected_cls"),
+        [
+            (None, "vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"),
+            (
+                "vllm_torchtpu.core.experimental.srpt_prefill_scheduler.SrptPrefillScheduler",
+                "vllm_torchtpu.core.experimental.srpt_prefill_scheduler.SrptPrefillScheduler",
+            ),
+        ],
+    )
+    @patch("vllm_torchtpu.patch_registry.apply")
+    @patch(
+        "vllm_torchtpu.platforms.tpu_platform.TpuPlatform._prepare_singlehost_tpu_env"
+    )
+    def test_dp_sched_respects_custom_scheduler_cls(
+        self,
+        mock_prepare_env,
+        mock_apply_patches,
+        vllm_config,
+        monkeypatch,
+        initial_cls,
+        expected_cls,
+    ):
+        monkeypatch.setattr(tpu_platform.envs, "DP_SCHED_ENABLED", True)
+        vllm_config.cache_config.block_size = 16
+        vllm_config.parallel_config.data_parallel_size = 2
+        vllm_config.parallel_config.data_parallel_size_local = 2
+        vllm_config.parallel_config.data_parallel_master_ip = ""
+        vllm_config.scheduler_config.scheduler_cls = initial_cls
+
+        TpuPlatform.check_and_update_config(vllm_config)
+
+        assert vllm_config.scheduler_config.scheduler_cls == expected_cls
+
     def test_get_tpu_multihost_topology(self, monkeypatch):
         # Test env override via TORCH_TPU_TOPOLOGY
         monkeypatch.setenv("TORCH_TPU_TOPOLOGY", "4,4,1")

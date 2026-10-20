@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Engine-side part of the pipeline hand-off.
 
 Stages pass activations along with collective launches that all stages issue
@@ -115,10 +127,10 @@ class _WaveState:
         lacks, counting the pushes as later steps for the waits that
         follow. With lazy pushes the engine core sends the pushes, and a
         wait settles."""
-        # With one or two stages every launch pairs on its own: stage 1's
-        # launch before forward m is stage 0's launch after it.
-        if not self.open or self.stages <= 2:
+        if not self.open:
             return
+        # With two stages the launches pair without pushes; the settle still
+        # goes out and issues stage 0's queued hand-off.
         if self.lazy or real_step == self.real_steps:
             self.settle(executor)
             return

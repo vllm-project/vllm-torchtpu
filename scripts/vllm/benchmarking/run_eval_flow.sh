@@ -1,4 +1,18 @@
 #!/bin/bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Full evaluation flow script: supports manual and CI execution
 set -euo pipefail
 
@@ -199,8 +213,7 @@ run_lm_eval() {
     # our task definitions, not from the model: local-chat-completions leaves
     # the chat template to the server and fingerprints requests with an empty
     # tokenizer name. So they are cached per combination in the shared cache,
-    # $HF_HOME/hub (a gcsfuse bucket on kube, the host's model cache on bare
-    # metal), for every config and later run. lm-eval's own cache key leaves
+    # $HF_HOME/hub (a gcsfuse bucket on kube), for every config and later run. lm-eval's own cache key leaves
     # out --limit, --gen_kwargs and the task YAML contents, so the directory
     # name carries all of it.
     local request_spec=() skip_next=0 arg

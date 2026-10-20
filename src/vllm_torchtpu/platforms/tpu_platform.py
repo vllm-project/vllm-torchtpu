@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 # Ensure environment overrides are applied before any other imports,
 # especially torch_tpu which might read them at import time.
@@ -1017,15 +1029,16 @@ class TpuPlatform(Platform):
 
         if envs.DP_SCHED_ENABLED and parallel_config.data_parallel_size > 1:
             dp_sched_cls = "vllm_torchtpu.core.tpu_scheduler.TpuDpScheduler"
-            if scheduler_config.scheduler_cls != dp_sched_cls:
-                assert scheduler_config.scheduler_cls is None, (
-                    "Cannot have DP_SCHED_ENABLED enabled and also a custom "
-                    "scheduler being provided."
-                )
+            if scheduler_config.scheduler_cls is None:
                 scheduler_config.scheduler_cls = dp_sched_cls
                 logger.info(
                     "Enabled TpuDpScheduler (DP_SCHED_ENABLED=1) for DP=%d.",
                     parallel_config.data_parallel_size,
+                )
+            elif scheduler_config.scheduler_cls != dp_sched_cls:
+                logger.warning(
+                    "DP scheduler is off: scheduler %s is configured.",
+                    scheduler_config.scheduler_cls,
                 )
 
         kv_transfer_config = vllm_config.kv_transfer_config
@@ -1261,14 +1274,14 @@ def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
     scheduler_config = vllm_config.scheduler_config
     if not envs.TPU_PP_DYNAMIC_CHUNKS:
         return
-    if envs.DP_SCHED_ENABLED and vllm_config.parallel_config.data_parallel_size > 1:
-        logger.warning("Pipeline chunk sizing is off: the DP scheduler is enabled.")
-        return
     if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS):
         logger.warning(
             "Pipeline chunk sizing is off: scheduler %s is configured.",
             scheduler_config.scheduler_cls,
         )
+        return
+    if envs.DP_SCHED_ENABLED and vllm_config.parallel_config.data_parallel_size > 1:
+        logger.warning("Pipeline chunk sizing is off: the DP scheduler is enabled.")
         return
     if not scheduler_config.enable_chunked_prefill:
         logger.warning("Pipeline chunk sizing is off: chunked prefill is disabled.")

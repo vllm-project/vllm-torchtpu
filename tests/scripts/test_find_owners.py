@@ -122,8 +122,8 @@ def test_pattern_without_owners_un_owns_the_path():
 
 
 def test_codeowners_override_is_read_instead_of_the_checkout():
-    # The approval gate uses this to enforce the base branch's ownership while
-    # running the PR's copy of the resolver.
+    # --codeowners: check a PR against another copy of CODEOWNERS, such as
+    # the base branch's, while running this checkout's resolver.
     with tempfile.TemporaryDirectory() as d:
         override = pathlib.Path(d) / "CODEOWNERS"
         override.write_text("/docs/ @alice\n")

@@ -22,7 +22,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
 source "${SCRIPT_DIR}/configs/pipeline_config.sh"
 
-# Echoes the build's bare-metal job priority and its Kueue priority class (empty
+# Echoes the build's Buildkite job priority and its Kueue priority class (empty
 # for none), in that order.
 determine_job_priority() {
   local priority=""
@@ -128,17 +128,6 @@ if [[ -n "${FILES_CHANGED}" ]]; then
   fi
 fi
 
-# Decided before anything is uploaded, and exported so the pipeline files can
-# interpolate ${CI_FLEET}; see ci_fleet.sh.
-echo "--- :kubernetes: Choosing bare metal or kube"
-# shellcheck source=/dev/null
-source "${SCRIPT_DIR}/ci_fleet.sh"
-resolve_ci_fleet
-if [[ "${CI_FLEET}" == "kube" ]]; then
-  buildkite-agent annotate --style info --context ci-fleet \
-    "Runs on the kube fleet (${CI_FLEET_REASON})."
-fi
-
 echo "--- Starting Buildkite Bootstrap"
 
 # Resolve and Publish Version Metadata
@@ -167,10 +156,20 @@ if [[ "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
   upload_with_priority .buildkite/pipeline_promote.yml "$JOB_PRIORITY"
 fi
 
+# Release branch builds (releases/v<version>, e.g. releases/v0.29.0; see
+# RELEASE_BRANCH_REGEX in configs/pipeline_config.sh) also build and publish
+# vllm-torchtpu-core and the combined vllm-torchtpu wheel. PR builds never
+# release. Uploaded before the CI lanes so Buildkite places it after them; its
+# block step waits until the whole CI run has passed.
+if [[ "${BUILDKITE_BRANCH:-}" =~ ${RELEASE_BRANCH_REGEX} \
+      && "${BUILDKITE_PULL_REQUEST:-false}" == "false" ]]; then
+  echo "Release branch ${BUILDKITE_BRANCH}: uploading release fragment"
+  upload_with_priority .buildkite/pipeline_release_pypi.yml "$JOB_PRIORITY"
+fi
+
 # The suite's lanes, in upload order. Lane <lane> is
-# .buildkite/pipeline_<lane>.yml on bare metal and pipeline_<lane>_kube.yml on
-# kube; no other file is uploaded as a lane. CI_LANES picks a subset - a
-# scheduled pipeline names its own lane. Without it a build runs every lane but
+# .buildkite/pipeline_<lane>.yml; no other file is uploaded as a lane. CI_LANES
+# picks a subset - a scheduled pipeline names its own lane. Without it a build runs every lane but
 # perf, which has scheduled builds of its own; nightly builds still run perf,
 # and so does the integration pipeline, whose LKG promotion waits on two perf
 # steps. A PR whose change needs perf/eval coverage asks for it with the
@@ -195,16 +194,12 @@ for lane in ${lanes}; do
     exit 1
   fi
 done
-suffix=""
-if [[ "${CI_FLEET}" == "kube" ]]; then
-  suffix="_kube"
-fi
 missing=()
 for lane in ${ALL_LANES}; do
   if [[ " ${lanes} " != *" ${lane} "* ]]; then
     continue
   fi
-  file=".buildkite/pipeline_${lane}${suffix}.yml"
+  file=".buildkite/pipeline_${lane}.yml"
   if [[ ! -f "${file}" ]]; then
     missing+=("${file}")
     continue
@@ -213,14 +208,14 @@ for lane in ${ALL_LANES}; do
   upload_with_priority "${file}" "$JOB_PRIORITY"
 done
 if [[ ${#missing[@]} -gt 0 ]]; then
-  # A lane asked for by name has to exist; the whole suite on a target that
-  # lacks a lane runs the rest and says what it left out.
+  # A lane asked for by name has to exist; the whole suite runs the lanes it
+  # has and says what it left out.
   if [[ -n "${CI_LANES:-}" ]]; then
     echo "ERROR: CI_LANES asks for ${missing[*]}, which does not exist" >&2
     exit 1
   fi
-  buildkite-agent annotate --style warning --context ci-fleet-gaps \
-    "Not run on ${CI_FLEET}: no ${missing[*]} yet."
+  buildkite-agent annotate --style warning --context lane-gaps \
+    "Not run: no ${missing[*]} yet."
 fi
 
 # pipeline_build.yml skips the -omni image build when this is non-empty.

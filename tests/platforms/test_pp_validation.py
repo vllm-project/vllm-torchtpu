@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
 from types import SimpleNamespace
 
@@ -40,6 +52,21 @@ RAIDEN = SimpleNamespace(kv_connector="TPURaidenConnector", is_kv_producer=True)
 RAIDEN_CONSUMER = SimpleNamespace(
     kv_connector="TPURaidenConnector", is_kv_producer=False
 )
+OFFLOAD = SimpleNamespace(
+    kv_connector="TPURaidenOffloadingConnector", is_kv_producer=True
+)
+
+
+def _multi(*children):
+    return SimpleNamespace(
+        kv_connector="TPUMultiConnector",
+        is_kv_producer=True,
+        kv_connector_extra_config={
+            "connectors": [{"kv_connector": name} for name in children]
+        },
+    )
+
+
 # Qwen3.5-0.8B: 24 layers, full attention on every fourth.
 HYBRID_24 = ["full_attention" if i % 4 == 3 else "linear_attention" for i in range(24)]
 
@@ -100,6 +127,36 @@ def test_rejects_kv_transfer_connectors_other_than_raiden():
 
 def test_accepts_the_raiden_connector():
     validate_pipeline_parallel_config(_config(pp=2, kv_transfer=RAIDEN))
+
+
+def test_accepts_the_raiden_offloading_connector():
+    validate_pipeline_parallel_config(_config(pp=2, kv_transfer=OFFLOAD))
+
+
+def test_accepts_a_multi_connector_of_raiden_connectors():
+    validate_pipeline_parallel_config(
+        _config(
+            pp=2,
+            kv_transfer=_multi("TPURaidenConnector", "TPURaidenOffloadingConnector"),
+        )
+    )
+
+
+def test_rejects_a_multi_connector_with_another_child():
+    with pytest.raises(NotImplementedError, match="TPUConnectorHMA"):
+        validate_pipeline_parallel_config(
+            _config(pp=2, kv_transfer=_multi("TPURaidenConnector", "TPUConnectorHMA"))
+        )
+
+
+def test_offloading_rejects_a_stage_of_linear_attention_layers_only(monkeypatch):
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    with pytest.raises(
+        NotImplementedError, match=r"stage 0 holds layers 0-2, linear_attention only"
+    ):
+        validate_pipeline_parallel_config(
+            _config(pp=8, kv_transfer=OFFLOAD, layer_types=HYBRID_24)
+        )
 
 
 def test_raiden_rejects_a_stage_of_linear_attention_layers_only(monkeypatch):
@@ -177,6 +234,10 @@ def test_rejects_other_kv_transfer_with_context_parallel_stages(stage_meshes):
 
 def test_raiden_accepts_context_parallel_stages(stage_meshes):
     validate_pipeline_parallel_config(_config(pp=4, pcp=2, kv_transfer=RAIDEN))
+
+
+def test_offloading_accepts_context_parallel_stages(stage_meshes):
+    validate_pipeline_parallel_config(_config(pp=4, pcp=2, kv_transfer=OFFLOAD))
 
 
 def test_rejects_the_legacy_ray_executor(monkeypatch):

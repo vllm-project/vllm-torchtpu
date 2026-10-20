@@ -35,7 +35,7 @@ dependencies = [
     # torch==2.13.0 above; a mismatched pair fails at operator-registration time,
     # not at install time.
     "torchvision==0.28.0",
-    "torch-tpu==0.2.0rc1",
+    "torch_tpu==0.2.0",
     # High-bandwidth PJRT raw-transfer / KV-cache DMA engine backing the
     # raiden KV connector (disaggregated serving) and host KV offload; the
     # import name is `tpu_sync`. The wheel bundles one extension per
@@ -225,10 +225,10 @@ project-includes = ["src"]
 preset = "default"
 baseline = ".pyrefly-baseline.json"
 
-# Entries match on file, error kind, and message text. A baselined error keeps
-# matching when lines move, and a new error of the same kind next to it is
-# still reported. The baseline can hide only an exact repeat of a recorded
-# message in the same file.
+# Entries match on file, error kind, and message text, so a baselined error
+# keeps matching when lines move. pyrefly lets one entry cover every repeat of
+# its message in a file; both checks run through tools/check_pyrefly_baseline.py,
+# which also requires one entry per error.
 baseline-matching-mode = "concise-description"
 baseline-format = "minimal"
 
@@ -248,6 +248,7 @@ python-version = "3.12"
 ignore-missing-imports = [
     "compressed_tensors", "compressed_tensors.*",
     "einops", "einops.*",
+    "fastapi", "fastapi.*",
     "google.protobuf", "google.protobuf.*",
     "jax", "jax.*",
     "jaxlib", "jaxlib.*",
@@ -255,6 +256,7 @@ ignore-missing-imports = [
     "packaging", "packaging.*",
     "pathwaysutils", "pathwaysutils.*",
     "portpicker", "portpicker.*",
+    "prometheus_client", "prometheus_client.*",
     "ray", "ray.*",
     "requests", "requests.*",
     "sympy", "sympy.*",
@@ -282,15 +284,15 @@ include = ["vllm_torchtpu*"]
 
 [tool.setuptools_scm]
 
-[tool.uv]
-keyring-provider = "subprocess"
-
+# Default PyPI serves Linux x86_64 wheels of torch and torchvision built with
+# CUDA, which pulls gigabytes of unnecessary nvidia-* runtime dependencies onto
+# TPU hosts. Pin them to the official PyTorch CPU index while resolving all
+# other packages (including torch-tpu, libtpu, and tpu-sync-torch) from PyPI.
 [[tool.uv.index]]
-name = "torch-tpu-registry"
-# torch-tpu-release-virtual-registry is a virtual registry that combines the PyTorch CPU index, Torch TPU index,
-# and the PyPI index. It priortizes package installs as such: PyTorch CPU index > Torch TPU index > PyPI index.
-url = "https://us-python.pkg.dev/ml-oss-artifacts-published/torch-tpu-release-virtual-registry/simple/"
+name = "pytorch-cpu"
+url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
 [tool.uv.sources]
-torch-tpu = { index = "torch-tpu-registry" }
+torch = { index = "pytorch-cpu" }
+torchvision = { index = "pytorch-cpu" }

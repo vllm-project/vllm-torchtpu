@@ -132,6 +132,53 @@ class NativeScGatherTest(absltest.TestCase):
                     np.asarray(gathered_rope)[:groups], expected_rope[:groups]
                 )
 
+    def test_exported_mlir_has_no_allocate_buffer(self):
+        """Ensure native-SC gather lowers without AllocateBuffer custom calls.
+
+        When torch_tpu inlines custom-kernel functions across chunks/layers and
+        runs mlir::createCSEPass(), zero-operand AllocateBuffer ops with
+        has_side_effect=false get CSE-merged into a single buffer, causing XLA
+        CopyInsertion to materialize hundreds of HBM-to-HBM copy(%empty) ops.
+        """
+        from unittest import mock
+
+        from jax._src import tpu_info as src_tpu_info
+        from jax._src.pallas.mosaic import tpu_info
+        from jax.experimental import pallas as pl
+        from jax.experimental.pallas import tpu as pltpu
+
+        info = src_tpu_info.get_tpu_info_for_chip(src_tpu_info.ChipVersion.TPU_7X, 1)
+        nope = jax.ShapeDtypeStruct((1024, 128), jnp.uint32)
+        rope = jax.ShapeDtypeStruct((256, 128), jnp.uint32)
+        idx = jax.ShapeDtypeStruct((256, 2048), jnp.int32)
+        live = jax.ShapeDtypeStruct((), jnp.int32)
+
+        def fn(n, r, i, live_idx):
+            return native_sc_gather.dsa_gather_native_sc(
+                n,
+                r,
+                i,
+                out_size=256 * 2048,
+                atoms_per_batch=16,
+                num_live_indices=live_idx,
+                live_multiple=16 * 512,
+            )
+
+        with (
+            mock.patch.object(src_tpu_info, "get_tpu_info", return_value=info),
+            mock.patch.object(src_tpu_info, "is_tpu_device", return_value=True),
+            mock.patch.object(tpu_info, "get_tpu_info", return_value=info),
+            mock.patch.object(tpu_info, "is_tpu_device", return_value=True),
+            mock.patch.object(pltpu, "get_tpu_info", return_value=info),
+            pl.pallas_export_experimental(dynamic_shapes=False),
+        ):
+            exported = jax.export.export(jax.jit(fn), platforms=["tpu"])(
+                nope, rope, idx, live
+            )
+            mlir_str = str(exported.mlir_module())
+
+        self.assertNotIn("AllocateBuffer", mlir_str)
+
 
 if __name__ == "__main__":
     absltest.main()

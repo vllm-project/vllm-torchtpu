@@ -1,4 +1,18 @@
 #!/usr/bin/env bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # Type-check src/ with third-party packages resolved.
 #
 # Runs inside the CI image, where torch, jax and vllm are installed, so calls
@@ -9,12 +23,11 @@
 # arguments are passed through, so `--update-baseline` regenerates it.
 #
 # Outside a container the script reruns itself inside the nightly build of
-# the image Buildkite uses (the Dockerfile's `dev` target), because other local
-# package versions report different errors. It pulls the nightly on every run
-# so the check never uses a stale one; the pull downloads only when a newer
-# build exists, and removes the copy it replaces unless something else still
-# uses it. That needs Docker and
-# `gcloud auth configure-docker us-central1-docker.pkg.dev`. Set
+# the image Buildkite uses (the Dockerfile's `dev` target, published to Docker
+# Hub as `vllm/vllm-torchtpu:nightly`), because other local package versions
+# report different errors. It pulls the nightly on every run so the check never
+# uses a stale one; the pull downloads only when a newer build exists, and
+# removes the copy it replaces unless something else still uses it. Set
 # TYPECHECK_IMAGE to check against a different image; it is pulled only when
 # it is not present locally. Set TYPECHECK_IN_PLACE=1 to skip Docker in an
 # environment that already has the CI image's packages.
@@ -27,14 +40,12 @@ if [[ -z "${TYPECHECK_IN_PLACE:-}" && ! -f /.dockerenv && ! -f /run/.containeren
     echo "tools/typecheck_full.sh runs in the CI image and needs Docker." >&2
     exit 1
   fi
-  nightly="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/vllm-torchtpu-dev:latest"
+  nightly="vllm/vllm-torchtpu:nightly"
   image="${TYPECHECK_IMAGE:-${nightly}}"
   old_id="$(docker image inspect --format '{{.Id}}' "${image}" 2>/dev/null || true)"
   if [[ "${image}" == "${nightly}" || -z "${old_id}" ]]; then
     if ! docker pull --platform linux/amd64 "${image}" >&2; then
-      echo "Could not pull ${image}. For an authentication error, run:" \
-        "gcloud auth configure-docker us-central1-docker.pkg.dev." \
-        "Without access to the registry, build the image locally:" \
+      echo "Could not pull ${image}. To build the image locally instead," \
         "see docs/developers_guide/type_checking.md." >&2
       exit 1
     fi
@@ -65,10 +76,20 @@ uv pip install --system --quiet pyrefly==1.3.0
 site_packages="$(python3 -c 'import sysconfig; print(sysconfig.get_paths()["purelib"])')"
 
 status=0
-pyrefly check \
-  --site-package-path "${site_packages}" \
-  --baseline .pyrefly-baseline-full.json \
-  "$@" || status=$?
+if [[ " $* " == *" --update-baseline "* ]]; then
+  pyrefly check \
+    --site-package-path "${site_packages}" \
+    --baseline .pyrefly-baseline-full.json \
+    "$@" || status=$?
+else
+  # pyrefly's own baseline check lets a listed message repeat any number of
+  # times in a file; the script also compares the counts.
+  python3 tools/check_pyrefly_baseline.py \
+    --baseline .pyrefly-baseline-full.json \
+    --update-command "bash tools/typecheck_full.sh --update-baseline" \
+    --site-package-path "${site_packages}" \
+    "$@" || status=$?
+fi
 
 # As root in a container, `--update-baseline` writes the file as root; give it
 # the owner of the checkout.

@@ -21,10 +21,8 @@
 # each is its own replicatedJob on 2x2x1, the same shaping the 1P1D benchmark
 # uses, rather than the one-slice shaping of ray-multihost-slice.yaml.
 #
-# Each role addresses the other by pod name and itself by the downward API,
-# which is the whole of the difference from the bare-metal job: there an
-# orchestrator discovers both VMs from GCP metadata and ssh's to the second to
-# start GPC_ROLE=worker. The test script is the one the VMs run, unchanged.
+# Each role addresses the other by pod name and itself by the downward API, so
+# the test script needs no orchestration of its own.
 #
 # ${WORKLOAD_NAME} and ${IMAGE} are substituted before submission, so a literal
 # dollar is $$. Every container is named `workload`: the launcher forwards step
@@ -141,11 +139,10 @@ spec:
                 args:
                   - |
                     set -euo pipefail
-                    # Beside the test rather than in a container of its own.
-                    # On bare metal the registry is separate only to get a
-                    # wildcard bind past Docker's bridge; a pod has one
-                    # routable address and no such problem, and the
-                    # single-host GPC test already starts it this way.
+                    # Beside the test rather than in a container of its own:
+                    # a pod has one routable address, so the registry needs
+                    # no network of its own, and the single-host GPC test
+                    # already starts it this way.
                     global_registry_server --port="$${REGISTRY_PORT}" &
                     exec bash .buildkite/kubernetes/single_host_engine.sh \
                       bash ./scripts/vllm/integration/run_qwen35_gpc_correctness.sh

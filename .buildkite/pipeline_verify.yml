@@ -1,4 +1,4 @@
-# Copyright 2025 Google LLC
+# Copyright 2026 Google LLC
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -12,38 +12,40 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+# The verify lane on the Kueue fleet: the steps in models/*.yml, uploaded with
+# each TPU generation's pod shapes by upload_models_and_features.sh, their
+# record steps, and the nightly report. The report runs on the cpu queue,
+# whose agents hold the GitHub App credentials its pushes use, and pushes
+# nothing until the kube nightly's schedule sets KUBE_OWNS_NIGHTLY=1.
+
 x-run-condition: &run-on-nightly-or-tag
   if: build.env("NIGHTLY") == "1" || build.tag =~ /^v?[0-9]+(\.[a-zA-Z0-9]+)*([a-zA-Z]+[0-9]*)?$/
 
 steps:
-   - label: "Upload Tests for Models & Features"
-     <<: *run-on-nightly-or-tag
-     agents:
-       queue: cpu
-     commands:
-       - bash .buildkite/scripts/upload_models_and_features.sh
+  - label: "Upload Tests for Models & Features"
+    <<: *run-on-nightly-or-tag
+    agents:
+      queue: cpu
+    commands:
+      - bash .buildkite/scripts/upload_models_and_features.sh
 
-   - label: "Support matrices and verified commit"
-     <<: *run-on-nightly-or-tag
-     key: "nightly_report"
-     # The suites the matrices are built from, and the nightly tests-lane steps a
-     # verified commit pair also needs passed. It runs whatever their outcome.
-     depends_on:
-       - "v6e-group"
-       - "v7x-group"
-       - "typecheck_full"
-       - "unit_tests_cpu_nightly"
-       - "unit_tests_general_nightly"
-       - "unit_tests_multichip_nightly"
-       - "unit_tests_spec_decode_nightly"
-       - "unit_tests_spec_decode_multichip_nightly"
-       - "unit_tests_omni_nightly"
-     allow_dependency_failure: true
-     agents:
-       queue: cpu
-     env:
-       # Bootstrap's choice of fleet, which can come from the commit message
-       # rather than the build's env.
-       CI_FLEET: "${CI_FLEET:-bare}"
-     commands:
-       - bash .buildkite/scripts/nightly_report.sh
+  - label: "Support matrices and verified commit"
+    <<: *run-on-nightly-or-tag
+    key: "nightly_report"
+    # The suites the matrices are built from, and the nightly tests-lane steps a
+    # verified commit pair also needs passed. It runs whatever their outcome.
+    depends_on:
+      - "v6e-group"
+      - "v7x-group"
+      - "typecheck_full"
+      - "unit_tests_cpu_nightly"
+      - "unit_tests_general_nightly"
+      - "unit_tests_multichip_nightly"
+      - "unit_tests_spec_decode_nightly"
+      - "unit_tests_spec_decode_multichip_nightly"
+      - "unit_tests_omni_nightly"
+    allow_dependency_failure: true
+    agents:
+      queue: cpu
+    commands:
+      - bash .buildkite/scripts/nightly_report.sh

@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Utility functions and classes for TPU runners."""
 
 import datetime
@@ -432,7 +444,7 @@ def relayout_rope_caches(model: torch.nn.Module):
         if not isinstance(module, RotaryEmbeddingBase):
             continue
         # The buffers on a rotary module that are indexed by position.
-        caches = [
+        caches: list[tuple[str, Any]] = [
             (buf_name, getattr(module, buf_name, None))
             for buf_name in ("cos_sin_cache", "cos_sin_cache_bf16")
         ]
@@ -463,7 +475,7 @@ def relayout_hash_tables(model: torch.nn.Module):
         # The attributes under which one hash-routing table is reachable;
         # the same tensor object is bound to all of them.
         for attr in ("tid2eid", "hash_indices_table"):
-            table = getattr(module, attr, None)
+            table: torch.Tensor | None = getattr(module, attr, None)
             if not isinstance(table, torch.Tensor) or id(table) in seen:
                 continue
             seen.add(id(table))

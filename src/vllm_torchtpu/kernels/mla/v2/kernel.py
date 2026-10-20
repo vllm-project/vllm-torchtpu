@@ -77,7 +77,7 @@ def get_dtype_bitwidth(dtype):
     return jax.dtypes.itemsize_bits(dtype)
 
 
-def get_dtype_packing(dtype):
+def get_dtype_packing(dtype) -> int:
     bits = get_dtype_bitwidth(dtype)
     return 32 // bits
 
@@ -89,7 +89,7 @@ def get_kv_cache_shape(
     kv_dtype,
     kv_packing: int | None = None,
     transpose_kv_cache: bool = False,
-):
+) -> tuple[int, ...]:
     if transpose_kv_cache:
         assert page_size % 128 == 0
         return (

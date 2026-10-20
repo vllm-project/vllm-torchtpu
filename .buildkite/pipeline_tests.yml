@@ -12,47 +12,82 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-x-unit-test-defaults: &unit_test_defaults
+# The unit test suite on the Kueue fleet; bootstrap.sh uploads it with the image
+# build from pipeline_build.yml.
+#
+# The `tests` plugin runs on the agent and exports BUILDKITE_TEST_ENGINE_*;
+# bktec runs in the pod, and run.sh forwards that configuration across - see
+# common.sh for what happens to the credentials.
+
+# Carries the launcher and the service account that may submit a workload.
+# Repeated per step rather than merged in, because a step's `plugins:` is a list
+# and a YAML merge key replaces it wholesale.
+x-kube-plugin: &kube_plugin
+  kubernetes:
+    podTemplate: tpu-launcher
+
+x-tpu-step-defaults: &tpu_step
+  depends_on: "build_docker"
+  # Covers queueing too: the agent pod starts at once and waits inside the
+  # step, so this is the launcher's whole budget, not a test's length.
+  timeout_in_minutes: 1440
+  agents:
+    queue: "kube"
   commands:
-    - bash .buildkite/scripts/run_in_docker.sh bktec run || [ $? -eq 5 ]
+    # Exit 5 is pytest's "no tests collected", which a shard can legitimately
+    # reach once the marker filter has emptied it. Tolerated inside the pod
+    # because the launcher reports a workload as 0 or 1, so a 5 never survives
+    # to be compared out here.
+    - .buildkite/kubernetes/run.sh bash -c 'bktec run || [ $$? -eq 5 ]'
 
 x-cpu-unit-test-defaults: &cpu_unit_test_defaults
   depends_on: "build_docker"
-  commands:
-    - bash .buildkite/scripts/run_in_docker.sh bktec run
+  # The fleet's cpu queue: a pod with no chip on an autoscaled CPU node, through
+  # the same launcher as the TPU steps.
+  timeout_in_minutes: 120
   agents:
-    queue: "cpu_64_core"
+    queue: "kube"
+  # Plain bktec: these steps set fail-on-no-tests, so an
+  # empty collection is a failure here rather than a shard emptied by a marker.
+  commands:
+    - .buildkite/kubernetes/run.sh bktec run
   env:
-    CPU_ONLY: "1"
+    SHAPE: "cpu"
+    # Without it JAX looks for a TPU.
+    JAX_PLATFORMS: "cpu"
 
 x-tests-plugin-defaults: &tests_plugin_defaults
-  # Resolved relative to the Buildkite org running the build.
   suite-slug: tpu-ci
   test-runner: pytest
   test-file-pattern: "tests/**/{test_*,*_test}.py"
   install-client: false
   oidc-lifetime: 7200
 
+# Overridable to run on idle v6e, but only to prove the plumbing reaches a
+# chip: several hundred kernel tests call pytest.fail rather than skip there,
+# so a v6e run is red for reasons that say nothing about this lane.
+x-shape-single: &shape_single "${KUBE_SHAPE_SINGLE:-tpu7x-standard-1t/1x1x1}"
+x-shape-multi: &shape_multi "${KUBE_SHAPE_MULTI:-tpu7x-standard-4t/2x2x1}"
+
 steps:
+  # pyrefly in the CI image against .pyrefly-baseline-full.json.
+  # The pod already runs that image, but typecheck_full.sh decides it is
+  # outside a container by looking for /.dockerenv, which a pod does not have,
+  # and would try to start Docker.
   - label: "Type Check - Full Environment"
     key: "typecheck_full"
-    depends_on: "build_docker"
-    agents:
-      queue: "cpu"
-    env:
-      CPU_ONLY: "1"
+    <<: *cpu_unit_test_defaults
+    plugins:
+      - *kube_plugin
     commands:
-      # Runs pyrefly inside the CI image, where torch, jax and vllm resolve,
-      # against .pyrefly-baseline-full.json. The pre-commit hook checks the
-      # same code with those packages unresolved and cannot see errors at
-      # that boundary.
-      - bash .buildkite/scripts/run_in_docker.sh bash tools/typecheck_full.sh
+      - .buildkite/kubernetes/run.sh env TYPECHECK_IN_PLACE=1 bash tools/typecheck_full.sh
 
   - label: "Unit Tests - CPU (PR)"
     key: "unit_tests_cpu_pr"
     <<: *cpu_unit_test_defaults
     if: 'build.env("NIGHTLY") != "1"'
     plugins:
+      - *kube_plugin
       - tests#v1.0.0:
           <<: *tests_plugin_defaults
           test-file-pattern: "tests/**/{test_*,*_test}.py"
@@ -64,6 +99,7 @@ steps:
     <<: *cpu_unit_test_defaults
     if: 'build.env("NIGHTLY") == "1"'
     plugins:
+      - *kube_plugin
       - tests#v1.0.0:
           <<: *tests_plugin_defaults
           test-file-pattern: "tests/**/{test_*,*_test}.py"
@@ -71,25 +107,22 @@ steps:
           test-cmd: "pytest -sv --timeout=600 -m 'not tpu_test and not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
   - group: "Unit Tests on TPU"
-    depends_on: "build_docker"
     steps:
-      # test_speculative_decoding.py gets its own PR steps, mirroring the
-      # nightly pair below, so spec-decode results are visible as their own
-      # step rather than buried in the general run and so the suite runs on
-      # its own agents instead of serializing behind everything else. The
-      # general steps exclude the file to avoid running it twice.
+      # test_speculative_decoding.py gets steps of its own so it runs on its
+      # own chips rather than serializing behind everything else; the general
+      # steps exclude the file so it is not run twice.
       #
-      # bktec splits General by file, not by example, so a file that shares
-      # one engine across its tests (module-scoped fixtures, the Qwen2.5-VL
-      # engines in test_multi_modal_inference.py) starts it in one shard only.
+      # Split by file, not by example, so a file that shares one engine
+      # across its tests starts it in one shard only.
       - label: "Unit Tests - General (PR)"
         key: "unit_tests_general_pr"
-        <<: *unit_test_defaults
+        <<: *tpu_step
         if: 'build.env("NIGHTLY") != "1"'
         parallelism: 3
-        agents:
-          queue: "tpu_v7x_2_queue"
+        env:
+          SHAPE: *shape_single
         plugins:
+          - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
@@ -97,37 +130,34 @@ steps:
 
       - label: "Unit Tests - Multichip (PR)"
         key: "unit_tests_multichip_pr"
-        <<: *unit_test_defaults
+        <<: *tpu_step
         if: 'build.env("NIGHTLY") != "1"'
-        agents:
-          queue: "tpu_v7x_8_queue"
+        env:
+          SHAPE: *shape_multi
         plugins:
+          - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
               test-cmd: "pytest -sv --timeout=600 -m 'not nightly and multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
-      # Representative correctness cases run on PRs; the full parameter
-      # matrix and acceptance-rate tests run nightly. Split by example because
-      # the suite is a single file. bktec balances using recorded test durations.
+      # Representative correctness cases run on PRs; the full parameter matrix
+      # and acceptance-rate tests run nightly. Split by example because the
+      # suite is a single file.
       - label: "Unit Tests - Speculative Decoding (PR)"
         key: "unit_tests_spec_decode_pr"
-        <<: *unit_test_defaults
+        <<: *tpu_step
         if: 'build.env("NIGHTLY") != "1"'
         parallelism: 3
         env:
-          # bktec enumerates the examples to split with a plain
-          # `pytest --collect-only`, which does not see the `-m` filter in
-          # test-cmd. Without this the nightly-only cases would be handed
-          # to the splitter carrying their (long) nightly timings and then
-          # deselected at run time, so a shard could be planned full and
-          # actually run almost nothing. PYTEST_ADDOPTS applies to collection
-          # as well as to the run, which keeps the split over what PR
-          # actually executes. run_in_docker.sh forwards it into the container.
+          SHAPE: *shape_single
+          # bktec splits over a plain `pytest --collect-only`, which does not
+          # see the `-m` filter in test-cmd, so without this the nightly-only
+          # cases are planned into shards carrying their long timings and then
+          # deselected at run time. PYTEST_ADDOPTS applies to collection too.
           PYTEST_ADDOPTS: "-m 'not nightly and not multichip'"
-        agents:
-          queue: "tpu_v7x_2_queue"
         plugins:
+          - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
               split-by-example: true
@@ -136,34 +166,39 @@ steps:
 
       - label: "Unit Tests - Speculative Decoding Multichip (PR)"
         key: "unit_tests_spec_decode_multichip_pr"
-        <<: *unit_test_defaults
+        <<: *tpu_step
         if: 'build.env("NIGHTLY") != "1"'
-        agents:
-          queue: "tpu_v7x_8_queue"
-        artifact_paths:
-          - "perf_eval_results/**/*"
+        env:
+          SHAPE: *shape_multi
         plugins:
+          - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
               test-file-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
               test-cmd: "pytest -sv --timeout=3600 -m 'not nightly and multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
-      # Omni multimodal and diffusion models on TPU.
+      # Omni multimodal and diffusion models, on the -omni image. The FLUX and
+      # Qwen tests compare against golden files under $HF_HOME/golden. Bare
+      # metal stages it onto the host before the container starts; here only
+      # $HF_HOME/hub is the shared cache, so the pod stages it with the same
+      # script. The weights come through the shared cache, downloaded by the
+      # first run that needs them, except the nightly-only Qwen snapshots,
+      # which the nightly step stages.
       - label: "Unit Tests - Omni (PR)"
         key: "unit_tests_omni_pr"
-        <<: *unit_test_defaults
+        <<: *tpu_step
         depends_on: "build_docker_omni"
         if: 'build.env("NIGHTLY") != "1"'
-        commands:
-          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--black-forest-labs--FLUX.1-schnell/"
-          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--Qwen--Qwen-Image-Edit/"
-          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/golden/ /mnt/disks/persist/models"
-          - "bash .buildkite/scripts/run_in_docker.sh bktec run"
         env:
+          SHAPE: *shape_single
           DOCKER_IMAGE_SUFFIX: "-omni"
-        agents:
-          queue: "tpu_v7x_2_queue"
+        commands:
+          - &omni_test |
+            .buildkite/kubernetes/run.sh bash -c '
+              bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/golden/ "$$HF_HOME" &&
+              bktec run'
         plugins:
+          - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
               test-file-pattern: "tests_omni/**/{test_*,*_test}.py"
@@ -172,32 +207,40 @@ steps:
 
       - label: "Unit Tests - Speculative Decoding (Nightly)"
         key: "unit_tests_spec_decode_nightly"
-        <<: *unit_test_defaults
+        <<: *tpu_step
         if: 'build.env("NIGHTLY") == "1"'
         parallelism: 3
         env:
+          SHAPE: *shape_single
           PYTEST_ADDOPTS: "-m 'not multichip'"
-        agents:
-          queue: "tpu_v7x_2_queue"
         plugins:
+          - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
               split-by-example: true
               test-file-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
               test-cmd: "pytest -sv --timeout=600 -m 'not multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
-      # The data-parallel MTP tests in the same file need DP*TP chips, which
-      # the 2-chip spec-decode queue above cannot provide (they self-skip
-      # there). This step is the only place they get enough chips to run.
+      # The data-parallel MTP tests in the same file need DP*TP chips and
+      # self-skip on the one-chip shape above, so this step is the only place
+      # they run.
       - label: "Unit Tests - Speculative Decoding Multichip (Nightly)"
         key: "unit_tests_spec_decode_multichip_nightly"
-        <<: *unit_test_defaults
+        <<: *tpu_step
         if: 'build.env("NIGHTLY") == "1"'
-        agents:
-          queue: "tpu_v7x_8_queue"
-        artifact_paths:
-          - "perf_eval_results/**/*"
+        env:
+          SHAPE: *shape_multi
+          # The DSv4 DSpark tests compile DeepSeek-V4 on eight ranks, and the
+          # saved artifacts reach ~70 GB within minutes. On the pod's ephemeral
+          # storage that gets the pod evicted, and the Job reruns the whole file
+          # until the launcher's deadline. The caches go to the compilation
+          # bucket, as in the DSv4 manifests, and the inductor scratch to shm.
+          VLLM_CACHE_ROOT: "/cache/jax/vllm"
+          VLLM_XLA_CACHE_PATH: "/cache/jax/xla"
+          TMPDIR: "/dev/shm"
+          RAY_TMPDIR: "/tmp"
         plugins:
+          - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
               test-file-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
@@ -205,11 +248,12 @@ steps:
 
       - label: "Unit Tests - General (Nightly)"
         key: "unit_tests_general_nightly"
-        <<: *unit_test_defaults
+        <<: *tpu_step
         if: 'build.env("NIGHTLY") == "1"'
-        agents:
-          queue: "tpu_v7x_2_queue"
+        env:
+          SHAPE: *shape_single
         plugins:
+          - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
@@ -217,37 +261,39 @@ steps:
 
       - label: "Unit Tests - Multichip (Nightly)"
         key: "unit_tests_multichip_nightly"
-        <<: *unit_test_defaults
+        <<: *tpu_step
         if: 'build.env("NIGHTLY") == "1"'
-        agents:
-          queue: "tpu_v7x_8_queue"
+        env:
+          SHAPE: *shape_multi
         plugins:
+          - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
               test-file-exclude-pattern: "tests/entrypoints/llm/test_speculative_decoding.py"
               test-cmd: "pytest -sv --timeout=600 -m 'multichip' --junit-xml={{resultPath}} {{testExamples}}"
 
-      # Omni multimodal and diffusion models on TPU.
       - label: "Unit Tests - Omni (Nightly)"
         key: "unit_tests_omni_nightly"
-        <<: *unit_test_defaults
+        <<: *tpu_step
         depends_on: "build_docker_omni"
         if: 'build.env("NIGHTLY") == "1"'
-        commands:
-          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--black-forest-labs--FLUX.1-schnell/"
-          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--Qwen--Qwen-Image-Edit/"
-          # Loaded only by the nightly Qwen test, at the revisions pinned in MODEL_REVISIONS
-          # (tests_omni/models/qwen_image/test_qwen_image_nightly.py). Stage each snapshot
-          # at its pinned revision, or the test downloads it from the Hub (~58 GB each).
-          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--Qwen--Qwen-Image-Edit-2511/"
-          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--Qwen--Qwen-Image/"
-          - "bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/golden/ /mnt/disks/persist/models"
-          - "bash .buildkite/scripts/run_in_docker.sh bktec run"
         env:
+          SHAPE: *shape_single
           DOCKER_IMAGE_SUFFIX: "-omni"
-        agents:
-          queue: "tpu_v7x_2_queue"
+        commands:
+          # The nightly Qwen test also loads Qwen-Image-Edit-2511 and Qwen-Image
+          # at the revisions pinned in MODEL_REVISIONS
+          # (tests_omni/models/qwen_image/test_qwen_image_nightly.py). Stage them
+          # into the shared cache from the bucket, so a cold
+          # cache does not download ~58 GB each from the Hub inside the test.
+          - |
+            .buildkite/kubernetes/run.sh bash -c '
+              bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/golden/ "$$HF_HOME" &&
+              bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--Qwen--Qwen-Image-Edit-2511/ "$$HF_HOME/hub" &&
+              bash .buildkite/scripts/stage_model_snapshot.sh gs://tpu-commons-ci/models--Qwen--Qwen-Image/ "$$HF_HOME/hub" &&
+              bktec run'
         plugins:
+          - *kube_plugin
           - tests#v1.0.0:
               <<: *tests_plugin_defaults
               test-file-pattern: "tests_omni/**/{test_*,*_test}.py"

@@ -17,8 +17,8 @@
 # the launcher's --env flags in `env_args`.
 
 # Must name the tag setup_docker_env.sh pushes, so ask it rather than rebuild
-# the name: it publishes what it pushed as CI_IMAGE_TAG, which is what every
-# bare-metal consumer already reads. Composing the tag here means this file has
+# the name: it publishes what it pushed as CI_IMAGE_TAG, which every
+# consumer reads. Composing the tag here means this file has
 # to track every change to the scheme, and it did not - the tag carries the vLLM
 # commit as well as ours, for registry isolation, so a bare commit SHA names an
 # image that was never pushed. Nothing catches that: the build is green, and it
@@ -26,7 +26,7 @@
 # to sit idle.
 #
 # A step on another variant of the image - the -omni build - names it with
-# DOCKER_IMAGE_SUFFIX, as run_in_docker.sh reads it on bare metal. A step may
+# DOCKER_IMAGE_SUFFIX. A step may
 # also name its own image, which the disagg lane does - it builds one of its
 # own rather than using the CI image.
 if [[ -z "${WORKLOAD_IMAGE:-}" ]]; then
@@ -70,7 +70,6 @@ export K3_FLEET_CACHES
 export FORCE_COLOR="1"
 export TQDM_MININTERVAL="30"
 export SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU_CORE="0.0.0"
-export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME="oauth2accesstoken"
 export UV_NO_CACHE="1"
 
 # Which fleet a benchmark row came from: two fleets write the same BigQuery
@@ -86,16 +85,17 @@ FORWARD=(
   # cpu on the cpu queue; unset on a TPU host, where JAX finds the chips.
   JAX_PLATFORMS
   FORCE_COLOR TQDM_MININTERVAL SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU_CORE
-  UV_INDEX_TORCH_TPU_REGISTRY_USERNAME UV_NO_CACHE
+  UV_NO_CACHE
   CI_RUNNER SKIP_SPANNER_UPLOAD
   BENCHMARK_WARMUP_RUNS RUN_CODE_EVAL RUN_LM_EVAL RUN_TYPE MODEL_PATH MODEL_URI
   EVAL_SOFT_FAIL
   # Lets a one-off build force an xprof capture; unset leaves the day rule in
   # benchmark_with_profile.sh to decide.
   CAPTURE_PROFILE
-  # run_in_docker.sh turns CONTAINER_TMPDIR into these two. A DSv4 compile
-  # writes ~40 GB of inductor cache per host and a capture run ~30 GB of temp
-  # JSON, which is an evicted pod if it lands on ephemeral storage.
+  # Scratch, which steps needing more than the pod's disk point at /dev/shm. A
+  # DSv4 compile writes ~40 GB of inductor cache per host and a capture run
+  # ~30 GB of temp JSON, which is an evicted pod if it lands on ephemeral
+  # storage.
   TMPDIR RAY_TMPDIR
   # vLLM's compile caches default to ~/.cache/vllm, on the pod's ephemeral
   # storage. A step that compiles a large model points them at /cache/jax.
@@ -108,7 +108,7 @@ FORWARD=(
   # The P/D benchmark loads its results into BigQuery when this is set.
   BQ_UPLOAD
   # Carries the -m filter into bktec's collection step; see the sharded steps
-  # in pipeline_tests_kube.yml.
+  # in pipeline_tests.yml.
   PYTEST_ADDOPTS
   # Unset on purpose: naming an unset variable is how the launcher is asked to
   # supply it from its env_secrets registry. HF_TOKEN is not here - every pod

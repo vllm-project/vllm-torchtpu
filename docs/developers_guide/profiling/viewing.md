@@ -60,8 +60,8 @@ rank at a time.
 
 ## Combining a run into a single file
 
-Some consumers take exactly one file rather than a directory — Google-internal
-XProf's offline upload, or a bug attachment. `merge_xplane` combines a session's
+Some consumers take exactly one file rather than a directory — such as an
+offline XProf upload or a bug attachment. `merge_xplane` combines a session's
 per-rank `.xplane.pb` captures into one XSpace:
 
 ```bash

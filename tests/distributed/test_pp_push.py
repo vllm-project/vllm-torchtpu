@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from concurrent.futures import Future
 from types import SimpleNamespace
 
@@ -95,6 +107,14 @@ def test_settles_when_the_awaited_step_is_the_newest():
     assert wave.open
     assert third.result() == 4
     assert [c[0] for c in executor.calls] == ["pp_push", "pp_settle", "pp_settle"]
+
+
+def test_two_stages_settle_without_pushes():
+    executor = _Executor()
+    wave = pp_push._WaveState(stages=2)
+    assert _futures(executor, wave, 1)[0].result() == 1
+    assert [c[0] for c in executor.calls] == ["pp_settle"]
+    assert not wave.open
 
 
 def test_the_future_forwards_to_the_executors_future():
@@ -283,9 +303,9 @@ def test_each_executor_pushes_for_its_own_pipeline_size(monkeypatch, queue):
     two = _install_on_fake_executor(monkeypatch, stages=2)
     four = type(two)(stages=4)
     pp_push.patch_executor_for_pp_wave(four.vllm_config)
-    # two stages: every launch pairs on its own, so neither push nor settle
+    # two stages: launches pair directly without pushes, but the burst still settles
     assert two.execute_model(_step(16, 1)) == ("forward", 1)
-    assert two.calls == []
+    assert [c[0] for c in two.calls] == ["pp_settle"]
     # four stages: the same lone step settles as well
     assert four.execute_model(_step(16, 1)) == ("forward", 1)
     assert [c[0] for c in four.calls] == ["pp_settle"]

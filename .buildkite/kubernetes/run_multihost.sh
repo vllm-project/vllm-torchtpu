@@ -21,8 +21,7 @@
 # The first form runs one workload across the hosts of a v7x slice, through the
 # generic slice manifest for the backend. ray, the default, forms a Ray cluster
 # and runs the given command on its head. mp uses vLLM's own multi-node data
-# parallelism instead and takes a benchmark config rather than a command - the
-# same split, and the same flag, as the bare-metal script of this name.
+# parallelism instead and takes a benchmark config rather than a command.
 #
 # --topology is the v7x slice shape; either manifest takes it and the host
 # count derived from it. It has no default, so every step says which slice it

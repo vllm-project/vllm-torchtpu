@@ -64,6 +64,7 @@ def _fake_runner(method, is_async, verify, propose, fence=False):
     )
     async_source = ([torch.tensor([7, 8])], {0: 0}, None, {"r0": 1})
     runner = SimpleNamespace(
+        _pp_wave=None,
         execute_model_state=SimpleNamespace(
             scheduler_output=scheduler_output,
             draft_chunks=[],

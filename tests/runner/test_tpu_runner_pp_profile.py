@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Timed prefill-shaped dummy runs behind the pipeline chunk scheduler."""
 
 import contextlib
@@ -136,7 +148,7 @@ def test_plain_dummy_run_keeps_the_decode_shape_and_returns_nothing(monkeypatch)
     assert seen["input_ids"].abs().sum() == 0
 
 
-def _bucket_runner(paddings, block_size, mamba_state, mode, pp=8, cls=None, pcp=1):
+def _bucket_runner(paddings, block_size, mamba_layers, mode, pp=8, cls=None, pcp=1):
     from vllm_torchtpu.core.pp_chunk_scheduler import SCHEDULER_CLS
 
     runner = MagicMock(spec=TPUModelRunner)
@@ -148,7 +160,7 @@ def _bucket_runner(paddings, block_size, mamba_state, mode, pp=8, cls=None, pcp=
     runner.max_num_blocks_per_req = 16
     runner._pp_chunk_granularity = None
     runner.drafter = None
-    runner._has_mamba_state = mamba_state
+    runner.kv_cache_config = SimpleNamespace(has_mamba_layers=mamba_layers)
     runner.cache_config = SimpleNamespace(block_size=block_size, mamba_cache_mode=mode)
     runner.vllm_config = SimpleNamespace(
         parallel_config=SimpleNamespace(pipeline_parallel_size=pp),
@@ -174,6 +186,21 @@ def test_chunk_buckets_follow_the_final_block_when_aligned():
     # Idempotent.
     runner._add_pipeline_chunk_buckets()
     assert runner.num_tokens_paddings.count(4352) == 1
+
+
+def test_chunk_buckets_follow_the_block_without_a_mamba_slot_pool():
+    # Under the unified block pool the runner keeps no mamba slot pool, but
+    # the scheduler still clips chunks at mamba block boundaries.
+    runner = _bucket_runner([16, 4096, 8192, 16384], 2176, True, "align")
+    runner._has_mamba_state = False
+    runner._add_pipeline_chunk_buckets()
+    assert runner._pp_chunk_granularity == 2176
+
+
+def test_chunk_buckets_use_an_eighth_step_without_mamba_layers():
+    runner = _bucket_runner([16, 4096, 8192, 16384], 2176, False, "align")
+    runner._add_pipeline_chunk_buckets()
+    assert runner._pp_chunk_granularity == 2048
 
 
 def test_chunk_buckets_use_an_eighth_step_without_alignment():

@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Static checks for pipeline parallelism on TPU."""
 
 from typing import Any
@@ -24,6 +36,28 @@ def _torch_tpu_builds_stage_meshes() -> bool:
 
 
 _FULL_ATTENTION_LAYER_TYPES = ["full_attention", "deepseek_sparse_attention"]
+
+# KV transfer connectors that register each stage's own layers: the
+# disaggregation connector with the stage's peer, the offloading connector
+# with the offload controller.
+_RAIDEN_CONNECTORS = ("TPURaidenConnector", "TPURaidenOffloadingConnector")
+
+
+def _kv_connector_names(kv_transfer_config: Any) -> list[str]:
+    """The connector a config names, or the children of a TPUMultiConnector."""
+    name = kv_transfer_config.kv_connector
+    if name != "TPUMultiConnector":
+        return [name]
+    extra = getattr(kv_transfer_config, "kv_connector_extra_config", None) or {}
+    return [child["kv_connector"] for child in extra.get("connectors", [])]
+
+
+def _non_raiden_connectors(kv_transfer_config: Any) -> list[str]:
+    return [
+        name
+        for name in _kv_connector_names(kv_transfer_config)
+        if name not in _RAIDEN_CONNECTORS
+    ]
 
 
 def _stage_without_full_attention(vllm_config: Any) -> str | None:
@@ -90,11 +124,11 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
     elif (
         parallel_config.prefill_context_parallel_size > 1
         and vllm_config.kv_transfer_config is not None
-        and vllm_config.kv_transfer_config.kv_connector != "TPURaidenConnector"
+        and _non_raiden_connectors(vllm_config.kv_transfer_config)
     ):
         # These connectors pair a stage with its peer through one pool per
         # device; a context-parallel stage spreads a request over several.
-        # The raiden connector lowers each PCP worker's chunks of the
+        # The raiden connectors lower each PCP worker's chunks of the
         # stage's layers.
         unsupported = "KV transfer connectors with context-parallel stages"
     elif vllm_config.scheduler_config.async_scheduling:
@@ -120,21 +154,23 @@ def validate_pipeline_parallel_config(vllm_config: Any) -> None:
             " Use method=mtp with num_speculative_tokens=1 on an engine whose "
             "kv_transfer_config has kv_role kv_producer."
         )
-    elif (
-        vllm_config.kv_transfer_config is not None
-        and vllm_config.kv_transfer_config.kv_connector != "TPURaidenConnector"
+    elif vllm_config.kv_transfer_config is not None and (
+        others := _non_raiden_connectors(vllm_config.kv_transfer_config)
     ):
-        # The raiden connector transfers each stage's own layers; the
+        # The raiden connectors transfer each stage's own layers; the
         # other connectors assume every worker holds every layer.
-        unsupported = "KV transfer connectors other than TPURaidenConnector"
+        unsupported = (
+            "KV transfer connectors other than TPURaidenConnector and "
+            f"TPURaidenOffloadingConnector ({', '.join(others)})"
+        )
     elif vllm_config.kv_transfer_config is not None and (
         stage := _stage_without_full_attention(vllm_config)
     ):
-        # The raiden connector pairs a stage with its peer through the
+        # The raiden connectors register a stage's pools through the
         # measured layout of a full-attention KV pool, so a stage made of
         # linear-attention layers alone has nothing to register.
         unsupported = (
-            f"TPURaidenConnector with a stage holding no full-attention layer ({stage})"
+            f"a raiden connector with a stage holding no full-attention layer ({stage})"
         )
         remedy = (
             " Choose a pipeline size or VLLM_PP_LAYER_PARTITION that "

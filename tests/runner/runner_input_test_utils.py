@@ -72,6 +72,7 @@ def _make_runner(
     runner._mtp_prefill_only = mtp_enabled and pcp_size > 1
     runner._pp_is_first = True
     runner._pp_is_last = True
+    runner._pp_wave = None
     runner.scheduler_config = SimpleNamespace(async_scheduling=False)
     runner.parallel_config = SimpleNamespace(
         prefill_context_parallel_size=pcp_size,
