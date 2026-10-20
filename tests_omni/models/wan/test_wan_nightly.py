@@ -23,8 +23,6 @@ Full model family integration and numerical correctness tests for nightly builds
 2. Obtains and verifies golden answers and structural metric signatures:
    - MAE, SSIM, and mean shift relative to CPU fp32 golden
    - High-frequency energy and motion ratios
-   - Temporal consistency ($4k+1$ frames)
-3. All executions run in-memory without disk leaks.
 """
 
 import pytest
@@ -74,10 +72,8 @@ def test_wan_full_model_matrix_and_golden_answers_tpu(
 
     Verifies:
     1. Model initialization and TPU engine execution.
-    2. Correct video temporal frame structure (4k + 1).
-    3. Correct spatial resolution (H x W divisible by VAE scale factor 16).
-    4. Matches the CPU fp32 golden video within the per-config limits.
-    5. High-frequency energy and motion ratios.
+    2. Matches the CPU fp32 golden video within the per-config limits.
+    3. High-frequency energy and motion ratios.
     """
     inputs, sampling_params = build_wan_golden_request(config)
     outputs = list(omni_runner.generate(inputs, sampling_params))
