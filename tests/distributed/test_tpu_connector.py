@@ -6206,6 +6206,112 @@ def test_glm_admission_topology_rejects_unsupported_shapes(
 
 
 # ---------------------------------------------------------------------------
+# GLM-5.2 DCP producer -> DCP decode: each rank ships its own pages whole.
+# ---------------------------------------------------------------------------
+
+
+def _glm_dcp_config(cfg, *, dst_interleave=4):
+    cfg.parallel_config.decode_context_parallel_size = 16
+    cfg.parallel_config.cp_kv_cache_interleave_size = 4
+    cfg.kv_transfer_config.kv_connector_extra_config = {
+        "destination_decode_context_parallel_size": 16,
+        "destination_cp_kv_cache_interleave_size": dst_interleave,
+    }
+
+
+def _glm_dcp_worker(*, dst_interleave=4):
+    worker = _make_raiden_worker(tp_rank=3, tp_size=16, block_size=256)
+    _glm_dcp_config(worker.vllm_config, dst_interleave=dst_interleave)
+    return worker
+
+
+def test_glm_admission_topology_admits_dcp_producer_of_same_geometry():
+    with (
+        patch(f"{_MOD}._raiden_dst_shards", return_value=16),
+        patch("vllm_torchtpu.distributed.dcp.get_dcp_rank", return_value=3),
+    ):
+        topology = _glm_dcp_worker()._raiden_glm_admission_topology()
+        with pytest.raises(ValueError, match="TP size and interleave to equal"):
+            _glm_dcp_worker(dst_interleave=256)._raiden_glm_admission_topology()
+
+    assert topology == "tp16dcp16_prefill"
+
+
+def test_glm_dcp_producer_publishes_whole_scheduler_blocks():
+    producer = _make_raiden_scheduler(is_producer=True, block_size=256, tp_size=16)
+    _glm_dcp_config(producer.vllm_config)
+    req = SimpleNamespace(
+        request_id="dcp",
+        num_prompt_tokens=10_000,
+        num_computed_tokens=10_000,
+        status=RequestStatus.FINISHED_LENGTH_CAPPED,
+        kv_transfer_params=None,
+    )
+    with (
+        patch(f"{_MOD}._use_raiden_stage3_transport", return_value=True),
+        patch(f"{_MOD}._use_raiden_glm_admission", return_value=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS", "p:27000"),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_ENGINE_ID", "producer"),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 16),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_MAX_TRANSFER_TOKENS", None),
+        patch(f"{_MOD}._raiden_dst_shards", return_value=16),
+    ):
+        # 9999 transfer tokens over 256-token pages at DCP16: three 4096-token
+        # scheduler blocks.
+        delay, params = producer.request_finished(req, [100, 101, 102])
+
+    assert delay
+    assert params["num_tokens"] == 9999
+    assert producer.reqs_to_send["dcp"].local_block_ids == [100, 101, 102]
+
+
+# The producer's own DCP size fixes its pages; the destination's, equal by
+# admission (bypassed at 8), does not.
+@pytest.mark.parametrize("dst_dcp", [16, 8])
+def test_glm_dcp_producer_registers_its_pages_whole_to_its_dcp_rank(dst_dcp):
+    worker = _glm_dcp_worker()
+    extra = worker.vllm_config.kv_transfer_config.kv_connector_extra_config
+    extra["destination_decode_context_parallel_size"] = dst_dcp
+    geometry = {
+        "mla.nope": (256 * 512, 512),
+        "mla.rope": (64 * 512, 512),
+        "dsa.idx": (64 * 1024, 1024),
+    }
+    worker._stage3_row_geometry = geometry
+    facade = _FakeRaidenControllerFacade()
+    worker._raiden_controller_facade = facade
+    worker._raiden_controller_address = "localhost:27000"
+    worker._raiden_work_unit = SimpleNamespace(job_name="prefill", rank=3)
+    meta = TPUConnectorMetadata()
+    meta.reqs_to_send["request"] = SimpleNamespace(
+        uuid=123, local_block_ids=[40, 7, 19], num_tokens=9999, expiration_time=1e20
+    )
+
+    with (
+        patch(f"{_MOD}._use_raiden_glm_admission", return_value=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 16),
+        patch(f"{_MOD}._raiden_dst_shards", return_value=16),
+    ):
+        worker._register_stage3_request_row_spans(meta)
+
+    (call,) = facade.register_request_blocks_calls
+    assert call["block_ids"] == [40, 7, 19]
+    assert [registration.tag for registration in call["pool_spans"]] == list(geometry)
+    for registration in call["pool_spans"]:
+        live = geometry[registration.tag][0]
+        assert [
+            (
+                span.src_block_ordinal,
+                span.src_offset_bytes,
+                span.dst_offset_bytes,
+                span.size_bytes,
+                span.dst_unit_ordinal,
+            )
+            for span in registration.spans
+        ] == [(page, 0, page * live, live, 3) for page in range(3)]
+
+
+# ---------------------------------------------------------------------------
 # DeepSeek-V4 worker plan and per-group span registration
 # ---------------------------------------------------------------------------
 

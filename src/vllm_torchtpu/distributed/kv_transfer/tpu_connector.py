@@ -2343,30 +2343,31 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             if group_block_ids
             else self.block_size
         )
+        cp_size = pcp_size * int(parallel_config.decode_context_parallel_size)
 
         def _normalize(ids: Sequence[int], page_tokens: int) -> tuple[int, ...] | None:
             normalized = self._stage3_normalize_producer_blocks(
                 ids,
                 num_tokens=num_tokens,
                 page_tokens=page_tokens,
-                pcp_size=pcp_size,
+                pcp_size=cp_size,
             )
             if normalized is None:
-                scheduler_block_tokens = page_tokens * pcp_size
+                scheduler_block_tokens = page_tokens * cp_size
                 expected = (
                     num_tokens + scheduler_block_tokens - 1
                 ) // scheduler_block_tokens
                 logger.error(
-                    "Stage-3 producer block IDs must cover every PCP scheduler "
+                    "Stage-3 producer block IDs must cover every scheduler "
                     "block, including the partial tail: req_id=%s blocks=%d, "
-                    "expected=%d, num_tokens=%d, page_tokens=%d, pcp_size=%d; "
+                    "expected=%d, num_tokens=%d, page_tokens=%d, cp_size=%d; "
                     "skipping the transfer",
                     request.request_id,
                     len(tuple(ids)),
                     expected,
                     num_tokens,
                     page_tokens,
-                    pcp_size,
+                    cp_size,
                 )
             return normalized
 
@@ -3140,14 +3141,15 @@ class TPURaidenConnectorWorker:
             )
 
     def _raiden_glm_admission_topology(self) -> str:
-        """Validates the one supported topology. Anything else fails closed here."""
+        """Validates the supported topologies. Anything else fails closed here."""
         parallel_config = self.vllm_config.parallel_config
         pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
         tp_size = int(self.tp_size)
         dp_size = int(parallel_config.data_parallel_size or 1)
         supported = (
             "Raiden GLM admission supports prefill tp{N}/dp1 -> decode tp1/dp{M}, "
-            "and prefill pp{N}/tp1 -> decode tp{M}/dcp{M}/dp1"
+            "prefill pp{N}/tp1 -> decode tp{M}/dcp{M}/dp1, and prefill "
+            "tp{N}/dcp{N}/dp1 -> decode tp{N}/dcp{N}/dp1 at the same interleave"
         )
         if pcp_size != 1:
             raise ValueError(
@@ -3160,6 +3162,8 @@ class TPURaidenConnectorWorker:
                     f"tensor_parallel_size={tp_size}, "
                     f"data_parallel_size={dp_size}"
                 )
+            if int(parallel_config.decode_context_parallel_size) > 1:
+                return self._glm_dcp_producer_topology(supported)
             if _raiden_dst_dcp_size(self.vllm_config) > 1:
                 self._validate_glm_dcp_destination(supported)
             return f"tp{tp_size}_prefill"
@@ -3183,6 +3187,45 @@ class TPURaidenConnectorWorker:
                 f"data_parallel_size={dp_size}"
             )
         return f"dp{dp_size}_decode"
+
+    def _glm_dcp_producer_topology(self, supported: str) -> str:
+        """Validates a DCP producer, which holds a token shard per rank."""
+        parallel_config = self.vllm_config.parallel_config
+        tp_size = int(self.tp_size)
+        dcp_size = int(parallel_config.decode_context_parallel_size)
+        interleave = int(parallel_config.cp_kv_cache_interleave_size)
+        if _engine_is_pipeline(self.vllm_config) or tp_size != dcp_size:
+            raise ValueError(
+                f"{supported}; a DCP producer needs tensor_parallel_size == "
+                "decode_context_parallel_size and no pipeline parallelism, got "
+                f"pipeline_parallel_size={_pipeline_parallel_size(self.vllm_config)}, "
+                f"tensor_parallel_size={tp_size}, "
+                f"decode_context_parallel_size={dcp_size}"
+            )
+        dst_dcp_size = _raiden_dst_dcp_size(self.vllm_config)
+        dst_shards = _raiden_dst_shards()
+        dst_interleave = _raiden_dst_interleave_tokens(self.vllm_config)
+        if (
+            dst_dcp_size != dcp_size
+            or dst_shards != dcp_size
+            or dst_interleave != interleave
+        ):
+            raise ValueError(
+                f"{supported}; a DCP producer needs the destination's DCP size, "
+                "TP size and interleave to equal its own: set "
+                f"destination_decode_context_parallel_size={dcp_size}, "
+                f"TPU_RAIDEN_DST_SHARDS={dcp_size} and "
+                f"destination_cp_kv_cache_interleave_size={interleave}, got "
+                f"{dst_dcp_size}, {dst_shards} and {dst_interleave}"
+            )
+        from vllm_torchtpu.distributed.dcp import get_dcp_rank
+
+        if get_dcp_rank() != self.tp_rank:
+            raise ValueError(
+                "Raiden GLM DCP producer requires dcp_rank == tp_rank: "
+                f"dcp_rank={get_dcp_rank()}, tp_rank={self.tp_rank}"
+            )
+        return f"tp{tp_size}dcp{dcp_size}_prefill"
 
     def _validate_glm_dcp_destination(self, supported: str) -> None:
         dst_dcp_size = _raiden_dst_dcp_size(self.vllm_config)
@@ -4481,6 +4524,7 @@ class TPURaidenConnectorWorker:
         one complete source fragment for each KDA state group.
         """
         from vllm_torchtpu.distributed.kv_transfer.raiden.byte_spans import (
+            lower_glm_dcp_identity_spans,
             lower_glm_dcp_row_spans,
             lower_glm_row_spans,
         )
@@ -4510,7 +4554,7 @@ class TPURaidenConnectorWorker:
         pipeline = _engine_is_pipeline(self.vllm_config)
         lowering_parallelism = 1 if pipeline else parallelism
         lowering_rank = 0 if pipeline else transfer_rank
-        # A DCP destination (admitted for pipeline producers only) shards
+        # A DCP destination (admitted for pipeline and DCP producers) shards
         # each page's tokens over its ranks.
         dst_dcp_size = (
             _raiden_dst_dcp_size(self.vllm_config) if _use_raiden_glm_admission() else 1
@@ -4518,6 +4562,13 @@ class TPURaidenConnectorWorker:
         dst_interleave_tokens = (
             _raiden_dst_interleave_tokens(self.vllm_config) if dst_dcp_size > 1 else 0
         )
+        # A DCP producer lowers its own pages: its DCP size fixes the scheduler
+        # block (page_tokens * dcp) its block ids cover. Admission requires the
+        # destination's DCP size to equal it.
+        src_dcp_size = int(
+            self.vllm_config.parallel_config.decode_context_parallel_size
+        )
+        dcp_source = _use_raiden_glm_admission() and src_dcp_size > 1
         for req_id, req_meta in metadata.reqs_to_send.items():
             uuid = int(req_meta.uuid)
             num_tokens = int(req_meta.num_tokens or 0)
@@ -4532,7 +4583,20 @@ class TPURaidenConnectorWorker:
                 int(block_id) for block_id in req_meta.local_block_ids
             )
             transfer_tags = ("fa",) if self._stage3_kimi else list(tag_geometry)
-            if dst_dcp_size > 1:
+            if dcp_source:
+                pool_spans = [
+                    lower_glm_dcp_identity_spans(
+                        tag=tag,
+                        num_tokens=num_tokens,
+                        page_tokens=page_tokens,
+                        dcp_size=src_dcp_size,
+                        dcp_rank=transfer_rank,
+                        live_bytes_per_block=tag_geometry[tag][0],
+                        block_ids=list(scheduler_ids),
+                    )
+                    for tag in transfer_tags
+                ]
+            elif dst_dcp_size > 1:
                 pool_spans = [
                     lower_glm_dcp_row_spans(
                         tag=tag,

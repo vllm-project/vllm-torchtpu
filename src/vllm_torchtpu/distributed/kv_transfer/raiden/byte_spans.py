@@ -593,6 +593,66 @@ def lower_glm_dcp_row_spans(
     )
 
 
+def lower_glm_dcp_identity_spans(
+    *,
+    tag: str,
+    num_tokens: int,
+    page_tokens: int,
+    dcp_size: int,
+    dcp_rank: int,
+    live_bytes_per_block: int,
+    block_ids: Sequence[int],
+) -> PoolSpanRegistration:
+    """Lower one DCP rank's GLM cache to the same DCP rank of the destination.
+
+    Producer and destination run the same DCP size, interleave and page size,
+    so rank k holds the same tokens of every scheduler block on both sides and
+    each page ships whole to the same page slot. Unlike lower_glm_row_spans,
+    which trims the tail, the last page ships whole too: its slots past the
+    rank's local token count (the whole page on a rank that owns no token of
+    the tail block) carry stale bytes from the page's previous occupant. That
+    is safe because the consumer reads no slot past its local token count and
+    decode overwrites those slots as it appends.
+    """
+    if not tag:
+        raise ValueError("pool tag must not be empty")
+    if num_tokens <= 0:
+        raise ValueError("num_tokens must be positive")
+    if page_tokens <= 0 or live_bytes_per_block <= 0:
+        raise ValueError("page_tokens and live_bytes_per_block must be positive")
+    if dcp_size <= 1 or not 0 <= dcp_rank < dcp_size:
+        raise ValueError(
+            "dcp_rank must be in [0, dcp_size) with dcp_size > 1, got "
+            f"dcp_rank={dcp_rank}, dcp_size={dcp_size}"
+        )
+    scheduler_block_tokens = page_tokens * dcp_size
+    num_pages = (num_tokens + scheduler_block_tokens - 1) // scheduler_block_tokens
+    if len(block_ids) != num_pages:
+        raise ValueError(
+            "block_ids must cover the complete request scheduler block set: "
+            f"got {len(block_ids)}, expected {num_pages} for {num_tokens} "
+            f"tokens at {page_tokens} per page and DCP {dcp_size}"
+        )
+    spans = tuple(
+        PoolByteSpan(
+            src_block_ordinal=page,
+            src_offset_bytes=0,
+            dst_block_index=0,
+            dst_offset_bytes=page * live_bytes_per_block,
+            size_bytes=live_bytes_per_block,
+            dst_unit_ordinal=dcp_rank,
+        )
+        for page in range(num_pages)
+    )
+    return PoolSpanRegistration(
+        tag=tag,
+        block_ids=tuple(int(block_id) for block_id in block_ids),
+        spans=spans,
+        declared_bytes=num_pages * live_bytes_per_block,
+        dst_space_version=1,
+    )
+
+
 def lower_dsv4_row_spans(
     *,
     tag: str,
