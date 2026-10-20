@@ -53,10 +53,11 @@ def test_deepseek_v4_model_registration():
     assert model_cls is DeepseekV4ForCausalLM
 
 
-def test_weight_loader_drops_mtp_after_mapping_and_keeps_plain_weights():
+def test_weight_loader_drops_mtp_after_mapping_and_keeps_plain_weights(dist_ctx):
     model = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
     nn.Module.__init__(model)
     model.model = nn.Module()
+    model.model.start_layer = model.model.end_layer = 0
     model.model.embed_tokens = nn.Embedding(2, 3)
     model.model.mtp_adapter = nn.Linear(3, 2, bias=False)
     model.lm_head = nn.Linear(3, 2, bias=False)
@@ -93,6 +94,28 @@ def test_weight_loader_drops_mtp_after_mapping_and_keeps_plain_weights():
         model.load_weights([("not_in_model.weight", head)])
 
 
+def test_reload_refreshes_first_layer_broadcast_weights_in_place(dist_ctx):
+    model = DeepseekV4ForCausalLM.__new__(DeepseekV4ForCausalLM)
+    nn.Module.__init__(model)
+    model.model = nn.Module()
+    model.model.start_layer, model.model.end_layer = 0, 1
+    layer = model_mod.DeepseekV4DecoderLayer.__new__(model_mod.DeepseekV4DecoderLayer)
+    nn.Module.__init__(layer)
+    layer.hc_mult, layer.hidden_size = 4, 128
+    layer.hc_attn_fn = nn.Parameter(torch.zeros(24, 512), requires_grad=False)
+    layer.register_buffer("hc_attn_fn_broadcast", None, persistent=False)
+    model.model.layers = nn.ModuleList([layer])
+    name = "model.layers.0.hc_attn_fn"
+    first = torch.arange(24 * 512, dtype=torch.float32).reshape(24, 512)
+    assert model.load_weights([(name, first)]) == {name}
+    broadcast = layer.hc_attn_fn_broadcast
+    torch.testing.assert_close(broadcast, first.reshape(24, 4, 128).sum(1))
+    second = first.flip(0) * 0.25
+    assert model.load_weights([(name, second)]) == {name}
+    assert layer.hc_attn_fn_broadcast is broadcast
+    torch.testing.assert_close(broadcast, second.reshape(24, 4, 128).sum(1))
+
+
 # --------------------------------------------------------------------------
 # Aux hidden-state capture (target-side input for eagle-family drafts)
 # --------------------------------------------------------------------------
@@ -111,14 +134,17 @@ class _StubDecoderLayer(nn.Module):
         self, vllm_config, prefix="", topk_indices_buffer=None, aux_stream_list=None
     ):
         super().__init__()
-        del vllm_config, topk_indices_buffer, aux_stream_list
+        del topk_indices_buffer, aux_stream_list
         self.idx = int(prefix.rsplit(".", 1)[-1])
+        self.hc_mult = vllm_config.model_config.hf_config.hc_mult
         self.outputs: list[tuple[torch.Tensor, ...]] = []
 
     def forward(
         self, x, positions, input_ids=None, post_mix=None, res_mix=None, residual=None
     ):
         del positions, input_ids, post_mix, res_mix, residual
+        if x.ndim == 2:
+            x = x.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         residual = x
         x = x * (self.idx + 2) + 1.0
         post_mix = torch.full_like(x, 0.5 * (self.idx + 1))

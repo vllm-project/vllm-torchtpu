@@ -19,7 +19,7 @@ pre as a single kernel.
 """
 
 import functools
-from typing import Any, NamedTuple
+from typing import Any, NamedTuple, cast
 
 import jax
 import torch
@@ -28,6 +28,7 @@ from torch_tpu._internal import pallas
 
 from vllm_torchtpu.kernels.deepseek_v4.mhc import (
     fused_post_pre_kernel,
+    norm_quant_kernel,
     post_kernel,
     pre_kernel,
 )
@@ -269,7 +270,7 @@ def _mhc_fused_post_pre_op(
 
 
 class MHCOps(NamedTuple):
-    """The three registered mHC ops for one set of gate constants.
+    """Registered mHC ops for one set of gate constants.
 
     ``pre`` and ``post`` match vLLM's ``mhc_pre_torch`` / ``mhc_post_torch``
     contracts; ``fused`` is the seam op, equivalent to ``post`` followed by
@@ -286,9 +287,14 @@ class MHCOps(NamedTuple):
         computed from it.
     """
 
+    # Norm/quant ops retain BF16 output for the other attention consumers.
     pre: Any
     fused: Any
     post: Any
+    pre_norm_quant: Any = None
+    fused_norm_quant: Any = None
+    fused_norm: Any = None
+    broadcast_pre_norm_quant: Any = None
 
 
 def get_mhc_ops(
@@ -306,6 +312,18 @@ def get_mhc_ops(
     the returned ops and invoke them directly, keeping the op lookup out of
     the traced graph entirely.
     """
+    from vllm_torchtpu.layers.adapter.linear_common import (
+        get_prequantized_bf16_matmul_op,
+    )
+
+    get_prequantized_bf16_matmul_op()
+    constants = (
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+    )
     return MHCOps(
         pre=_mhc_pre_op(
             rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
@@ -314,4 +332,180 @@ def get_mhc_ops(
             rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
         ),
         post=get_mhc_post_op(),
+        pre_norm_quant=_mhc_norm_quant_op(constants, fused=False),
+        fused_norm_quant=_mhc_norm_quant_op(constants, fused=True),
+        fused_norm=_mhc_fused_norm_op(constants),
+        broadcast_pre_norm_quant=_mhc_broadcast_pre_norm_quant_op(constants),
     )
+
+
+def _mhc_pre_norm_quant_jax(
+    residual: jax.Array,
+    fn: jax.Array,
+    scale: jax.Array,
+    base: jax.Array,
+    weight: jax.Array,
+    *,
+    constants: norm_quant_kernel.GateConstants,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    post, comb, y, quant = norm_quant_kernel.mhc_pre_norm_quant(
+        residual,
+        fn,
+        scale,
+        base,
+        weight,
+        constants=constants,
+        norm_eps=constants[0],
+        quant_dtype=jax.numpy.float8_e4m3fn,
+    )
+    return post, comb, y, quant[0], quant[1]
+
+
+def _mhc_broadcast_pre_norm_quant_jax(
+    x: jax.Array,
+    fn: jax.Array,
+    scale: jax.Array,
+    base: jax.Array,
+    weight: jax.Array,
+    *,
+    constants: norm_quant_kernel.GateConstants,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    residual, post, comb, y, quant = norm_quant_kernel.mhc_broadcast_pre_norm_quant(
+        x, fn, scale, base, weight, constants=constants, norm_eps=constants[0]
+    )
+    return residual, post, comb, y, quant[0], quant[1]
+
+
+def _fake_broadcast_pre_norm_quant(x, fn, scale, base, weight):
+    residual = torch.empty((x.shape[0], 4, x.shape[1]), dtype=x.dtype, device=x.device)
+    return residual, *_fake_pre_norm_quant(residual, fn, scale, base, weight)
+
+
+def _mhc_broadcast_pre_norm_quant_op(constants: norm_quant_kernel.GateConstants):
+    name = "pallas::mhc_broadcast_pre_norm_quant" + _gate_suffix(*constants)
+    op = _mhc_op_cache.get(name)
+    if op is None:
+        op = pallas.jax_op(
+            name,
+            functools.partial(_mhc_broadcast_pre_norm_quant_jax, constants=constants),
+            mesh=get_pallas_op_mesh(),
+            input_partition_specs=cast(tuple[tuple[str, ...], ...], (P(),) * 5),
+        )
+        op.register_fake(_fake_broadcast_pre_norm_quant)
+        _mhc_op_cache[name] = op
+    return op
+
+
+def _mhc_fused_norm_quant_jax(
+    x: jax.Array,
+    residual: jax.Array,
+    post: jax.Array,
+    comb: jax.Array,
+    fn: jax.Array,
+    scale: jax.Array,
+    base: jax.Array,
+    weight: jax.Array,
+    *,
+    constants: norm_quant_kernel.GateConstants,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    residual, post, comb, y, quant = norm_quant_kernel.mhc_fused_post_pre_norm_quant(
+        x,
+        residual,
+        post,
+        comb,
+        fn,
+        scale,
+        base,
+        weight,
+        constants=constants,
+        norm_eps=constants[0],
+        quant_dtype=jax.numpy.float8_e4m3fn,
+    )
+    return residual, post, comb, y, quant[0], quant[1]
+
+
+def _fake_pre_norm_quant(residual, fn, scale, base, weight):
+    post, comb, y = _fake_pre_outputs(residual)
+    return (
+        post,
+        comb,
+        y,
+        torch.empty_like(y, dtype=torch.float8_e4m3fn),
+        torch.empty((*y.shape[:-1], 1), dtype=torch.float32, device=y.device),
+    )
+
+
+def _fake_fused_norm_quant(x, residual, post, comb, fn, scale, base, weight):
+    return (
+        torch.empty_like(residual),
+        *_fake_pre_norm_quant(residual, fn, scale, base, weight),
+    )
+
+
+def _mhc_norm_quant_op(constants: norm_quant_kernel.GateConstants, *, fused: bool):
+    suffix = _gate_suffix(*constants)
+    name = "pallas::mhc_" + ("fused" if fused else "pre") + "_norm_quant" + suffix
+    op = _mhc_op_cache.get(name)
+    if op is None:
+        mesh = get_pallas_op_mesh()
+        op = pallas.jax_op(
+            name,
+            functools.partial(
+                _mhc_fused_norm_quant_jax if fused else _mhc_pre_norm_quant_jax,
+                constants=constants,
+            ),
+            mesh=mesh,
+            input_partition_specs=cast(
+                tuple[tuple[str, ...], ...], (P(),) * (8 if fused else 5)
+            ),
+        )
+        op.register_fake(_fake_fused_norm_quant if fused else _fake_pre_norm_quant)
+        _mhc_op_cache[name] = op
+    return op
+
+
+def _mhc_fused_norm_jax(
+    x: jax.Array,
+    residual: jax.Array,
+    post: jax.Array,
+    comb: jax.Array,
+    fn: jax.Array,
+    scale: jax.Array,
+    base: jax.Array,
+    weight: jax.Array,
+    *,
+    constants: norm_quant_kernel.GateConstants,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    residual, post, comb, y, _ = norm_quant_kernel.mhc_fused_post_pre_norm_quant(
+        x,
+        residual,
+        post,
+        comb,
+        fn,
+        scale,
+        base,
+        weight,
+        constants=constants,
+        norm_eps=constants[0],
+        quant_dtype=None,
+    )
+    return residual, post, comb, y
+
+
+def _fake_fused_norm(x, residual, post, comb, fn, scale, base, weight):
+    return torch.empty_like(residual), *_fake_pre_outputs(residual)
+
+
+def _mhc_fused_norm_op(constants: norm_quant_kernel.GateConstants):
+    name = "pallas::mhc_fused_norm" + _gate_suffix(*constants)
+    op = _mhc_op_cache.get(name)
+    if op is None:
+        op = pallas.jax_op(
+            name,
+            functools.partial(_mhc_fused_norm_jax, constants=constants),
+            mesh=get_pallas_op_mesh(),
+            input_partition_specs=cast(tuple[tuple[str, ...], ...], (P(),) * 8),
+        )
+        op.register_fake(_fake_fused_norm)
+        _mhc_op_cache[name] = op
+    return op

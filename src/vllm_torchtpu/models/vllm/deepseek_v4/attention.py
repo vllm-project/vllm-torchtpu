@@ -34,6 +34,11 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    get_prequantized_bf16_matmul_op,
+)
+from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.attention_layer_base import AttentionBackend
@@ -453,10 +458,32 @@ class VllmDeepseekV4MLAAttention(
         _pallas_op_cache[op_name] = attn_jax_op
         return attn_jax_op, built_from_real_caches
 
+    @property
+    def supports_prequantized_input(self) -> bool:
+        linear = self.fused_wqa_wkv
+        return (
+            isinstance(linear.quant_method, VllmFp8LinearMethodTPU)
+            and linear.tp_size == 1
+            and linear.weight.dtype == torch.float8_e4m3fn
+            and cast(torch.Tensor, linear.weight_scale).ndim == 1
+            and linear.bias is None
+            and not getattr(linear, KEEP_VLLM_LAYOUT_ATTR, False)
+        )
+
     def attn_gemm(
-        self, hidden_states: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        quantized_input: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+        if quantized_input is None:
+            qr_kv, _ = self.fused_wqa_wkv(hidden_states)
+        else:
+            assert self.supports_prequantized_input
+            qr_kv = get_prequantized_bf16_matmul_op()(
+                *quantized_input,
+                self.fused_wqa_wkv.weight,
+                self.fused_wqa_wkv.weight_scale,
+            )
 
         if self.indexer is not None:
             indexer_weights, _ = self.indexer.weights_proj(hidden_states)
@@ -869,12 +896,14 @@ class VllmDeepseekV4MLAAttention(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
+        *,
+        quantized_input: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
         """Forward pass for DeepSeek-V4 attention layer."""
         if positions.ndim > 1:
             positions = positions.flatten()
 
-        qr_kv, indexer_weights = self.attn_gemm(hidden_states)
+        qr_kv, indexer_weights = self.attn_gemm(hidden_states, quantized_input)
 
         qr, kv = qr_kv.split(
             [self.mla_attn.q_lora_rank, self.mla_attn.head_dim], dim=-1

@@ -49,6 +49,9 @@ from vllm.model_executor.models.utils import (
 from vllm.model_executor.offloader import NoopOffloader, set_offloader
 from vllm.sequence import IntermediateTensors
 
+from vllm_torchtpu.kernels.deepseek_v4.mhc.norm_quant_kernel import (
+    supports_mhc_norm_quant,
+)
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     VllmDeepseekCompressor,  # noqa: E501
 )
@@ -61,12 +64,17 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.deepseek_v4.attention import VllmDeepseekV4MLAAttention
 from vllm_torchtpu.models.vllm.deepseek_v4.layers import mhc_collapse_head
 from vllm_torchtpu.models.vllm.deepseek_v4.moe import DeepseekV4MoE
+from vllm_torchtpu.models.vllm.deepseek_v4.stable_graph_inputs import (
+    stable_weight_inputs,
+)
 
 logger = init_logger(__name__)
 
 
 class DeepseekV4DecoderLayer(nn.Module):
     """Single transformer decoder layer for DeepSeek-V4 with MHC residual stream."""
+
+    hc_attn_fn_broadcast: torch.Tensor | None
 
     def __init__(
         self,
@@ -104,6 +112,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             torch.empty(mix_hc, hc_dim, dtype=torch.float32),
             requires_grad=False,
         )
+        self.register_buffer("hc_attn_fn_broadcast", None, persistent=False)
         self.hc_ffn_fn = nn.Parameter(
             torch.empty(mix_hc, hc_dim, dtype=torch.float32),
             requires_grad=False,
@@ -175,11 +184,82 @@ class DeepseekV4DecoderLayer(nn.Module):
         still owes. The chain is opened by the layer-0 attention pre, which
         has no preceding post, and closed by the caller.
         """
-        if residual is None:
-            # Chain start: a standalone pre, nothing to fuse it with.
-            residual = x
-            x, post_mix, res_mix = self.hc_pre(
-                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+        if self.hc_attn_fn_broadcast is not None:
+            x = stable_weight_inputs(x, self.hc_attn_fn, self.hc_attn_fn_broadcast)
+        fuse_input_quant = (
+            supports_mhc_norm_quant(x.shape[0], self.hc_mult, self.hidden_size)
+            and x.dtype == torch.bfloat16
+            and self.hc_sinkhorn_iters >= 1
+            and self.attn.supports_prequantized_input
+        )
+        quantized_input = None
+        if residual is None and x.ndim == 2:
+            if fuse_input_quant and self.hc_attn_fn_broadcast is not None:
+                residual, post_mix, res_mix, x, x_q, x_scale = (
+                    self.mhc_ops.broadcast_pre_norm_quant(
+                        x,
+                        self.hc_attn_fn_broadcast,
+                        self.hc_attn_scale,
+                        self.hc_attn_base,
+                        self.attn_norm.weight,
+                    )
+                )
+                quantized_input = (x_q, x_scale)
+            else:
+                x = x.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+        if fuse_input_quant and quantized_input is None:
+            if residual is None:
+                residual = x
+                post_mix, res_mix, x, x_q, x_scale = self.mhc_ops.pre_norm_quant(
+                    x,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                    self.attn_norm.weight,
+                )
+            else:
+                residual, post_mix, res_mix, x, x_q, x_scale = (
+                    self.mhc_ops.fused_norm_quant(
+                        x,
+                        residual,
+                        post_mix,
+                        res_mix,
+                        self.hc_attn_fn,
+                        self.hc_attn_scale,
+                        self.hc_attn_base,
+                        self.attn_norm.weight,
+                    )
+                )
+            quantized_input = (x_q, x_scale)
+        elif not fuse_input_quant:
+            if residual is None:
+                residual = x
+                x, post_mix, res_mix = self.hc_pre(
+                    x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+                )
+            else:
+                residual, post_mix, res_mix, x = self.mhc_ops.fused(
+                    x,
+                    residual,
+                    post_mix,
+                    res_mix,
+                    self.hc_attn_fn,
+                    self.hc_attn_scale,
+                    self.hc_attn_base,
+                )
+            x = self.attn_norm(x)
+        x = self.attn(positions, x, quantized_input=quantized_input)
+
+        if fuse_input_quant:
+            residual, post_mix, res_mix, x = self.mhc_ops.fused_norm(
+                x,
+                residual,
+                post_mix,
+                res_mix,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                self.ffn_norm.weight,
             )
         else:
             residual, post_mix, res_mix, x = self.mhc_ops.fused(
@@ -187,24 +267,11 @@ class DeepseekV4DecoderLayer(nn.Module):
                 residual,
                 post_mix,
                 res_mix,
-                self.hc_attn_fn,
-                self.hc_attn_scale,
-                self.hc_attn_base,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
             )
-
-        x = self.attn_norm(x)
-        x = self.attn(positions, x)
-
-        residual, post_mix, res_mix, x = self.mhc_ops.fused(
-            x,
-            residual,
-            post_mix,
-            res_mix,
-            self.hc_ffn_fn,
-            self.hc_ffn_scale,
-            self.hc_ffn_base,
-        )
-        x = self.ffn_norm(x)
+            x = self.ffn_norm(x)
         x = self.ffn(x, input_ids)
         return x, residual, post_mix, res_mix
 
@@ -427,7 +494,8 @@ class DeepseekV4Model(nn.Module):
                 hidden_states = inputs_embeds
             else:
                 hidden_states = self.embed_input_ids(input_ids)
-            hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
+            if self.start_layer == self.end_layer:
+                hidden_states = hidden_states.unsqueeze(-2).repeat(1, self.hc_mult, 1)
         else:
             assert intermediate_tensors is not None
             hidden_states = typing.cast(
@@ -730,6 +798,27 @@ class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
         for module in self.modules():
             if isinstance(module, VllmDeepseekCompressor):
                 module.transpose_wkv_wgate()
+
+        if (
+            get_pp_group().is_first_rank
+            and self.model.start_layer < self.model.end_layer
+        ):
+            layer = self.model.layers[self.model.start_layer]
+            if isinstance(layer, DeepseekV4DecoderLayer) and supports_mhc_norm_quant(
+                1, layer.hc_mult, layer.hidden_size
+            ):
+                # Same broadcast identity as vLLM NVIDIA model.py's
+                # finalize_mhc_broadcast_weights (c75cb63); the TPU kernel
+                # retains the BF16 collapse boundary before RMSNorm.
+                broadcast = (
+                    layer.hc_attn_fn.detach()
+                    .view(-1, layer.hc_mult, layer.hidden_size)
+                    .sum(dim=1)
+                )
+                if layer.hc_attn_fn_broadcast is None:
+                    layer.hc_attn_fn_broadcast = broadcast
+                else:
+                    layer.hc_attn_fn_broadcast.copy_(broadcast)
 
         return loaded_params
 

@@ -25,20 +25,58 @@ from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
 
 def _post_kernel(x_ref, res_ref, post_ref, comb_ref, out_ref, *, hc_mult, hidden_size):
     """One token block of the unrolled stream recombine."""
+    native_streams = res_ref.shape == (hc_mult, hidden_size)
     x = x_ref[...].astype(jnp.float32)  # (tb, hidden)
     post = post_ref[...]  # (tb, hc_mult) f32
     comb = comb_ref[...]  # (tb, hc_mult * hc_mult) f32, row-major (i, j)
 
     streams = [
-        res_ref[:, i * hidden_size : (i + 1) * hidden_size].astype(jnp.float32)
+        (
+            res_ref[i : i + 1, :]
+            if native_streams
+            else res_ref[:, i * hidden_size : (i + 1) * hidden_size]
+        ).astype(jnp.float32)
         for i in range(hc_mult)
     ]
     for j in range(hc_mult):
-        acc = post[:, j : j + 1] * x
+        post_j = post[j : j + 1, :] if native_streams else post[:, j : j + 1]
+        acc = post_j * x
         for i in range(hc_mult):
             k = i * hc_mult + j
-            acc = acc + comb[:, k : k + 1] * streams[i]
-        out_ref[:, j * hidden_size : (j + 1) * hidden_size] = acc.astype(out_ref.dtype)
+            comb_ij = (
+                comb[i : i + 1, j : j + 1] if native_streams else comb[:, k : k + 1]
+            )
+            acc = acc + comb_ij * streams[i]
+        if native_streams:
+            out_ref[j : j + 1, :] = acc.astype(out_ref.dtype)
+        else:
+            out_ref[:, j * hidden_size : (j + 1) * hidden_size] = acc.astype(
+                out_ref.dtype
+            )
+
+
+def _single_token_post(x, residual, post, comb, vmem_limit_bytes):
+    h = residual.shape[-1]
+    arrays = (
+        x.reshape(1, h),
+        residual.reshape(4, h),
+        post.reshape(4, 1),
+        comb.reshape(4, 4),
+    )
+
+    def spec(shape):
+        return pl.BlockSpec(shape, lambda: (0, 0))
+
+    result = pl.pallas_call(
+        functools.partial(_post_kernel, hc_mult=4, hidden_size=h),
+        grid=(),
+        in_specs=[spec(a.shape) for a in arrays],
+        out_specs=spec((4, h)),
+        out_shape=jax.ShapeDtypeStruct((4, h), jnp.bfloat16),
+        compiler_params=pltpu.CompilerParams(vmem_limit_bytes=vmem_limit_bytes),
+        name="mhc_post_single_token",
+    )(*arrays)
+    return result.reshape(residual.shape)
 
 
 @functools.partial(jax.jit, static_argnames=("token_block_size", "vmem_limit_bytes"))
@@ -78,6 +116,14 @@ def mhc_post_2d(
     post2d = post_layer_mix.reshape(-1, hc_mult)
     comb2d = comb_res_mix.reshape(-1, hc_mult * hc_mult)
     num_tokens = res2d.shape[0]
+    if num_tokens == 1 and hc_mult == 4 and hidden_size % 128 == 0:
+        return _single_token_post(
+            x2d,
+            res2d.reshape(1, 4, hidden_size),
+            post_layer_mix,
+            comb_res_mix,
+            vmem_limit_bytes,
+        ).reshape(res2d.shape)
 
     def _vmem_need(tb: int) -> int:
         # Double-buffered bf16 in/out blocks (x + old streams + new
@@ -147,6 +193,16 @@ def mhc_post(
 
     outer_shape = residual.shape[:-2]
     hc_mult, hidden_size = residual.shape[-2:]
+    if x.size == hidden_size and hc_mult == 4 and hidden_size % 128 == 0:
+        assert post_layer_mix.dtype == jnp.float32
+        assert comb_res_mix.dtype == jnp.float32
+        return _single_token_post(
+            x.astype(jnp.bfloat16),
+            residual,
+            post_layer_mix,
+            comb_res_mix,
+            vmem_limit_bytes,
+        )
 
     out2d = mhc_post_2d(
         x.reshape(-1, hidden_size),

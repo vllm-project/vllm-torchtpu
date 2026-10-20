@@ -590,5 +590,371 @@ class MhcPrePallasTpuTest(parameterized.TestCase):
         )
 
 
+@pytest.mark.tpu_test
+class MhcGenericGatesTest(parameterized.TestCase):
+    """Generic gates retain FP32 normalization for one or multiple tokens."""
+
+    def setUp(self):
+        super().setUp()
+        if jax.default_backend() != "tpu":
+            self.skipTest("Pallas TPU kernel needs TPU hardware")
+
+    @parameterized.product(
+        num_tokens=[1, 8],
+        repeats=[1, 2, 20],
+        amplitude=[0.0, 1.0, 100.0],
+    )
+    def test_matches_independent_normalization(self, num_tokens, repeats, amplitude):
+        rng = np.random.default_rng(713)
+        mixes = rng.normal(size=(num_tokens, 24)).astype(np.float32) * amplitude
+        squares = rng.uniform(8192, 32768, size=(num_tokens, 1)).astype(np.float32)
+        scale = np.array([0.3, 0.5, 0.7], dtype=np.float32)
+        base = rng.normal(size=24).astype(np.float32) * amplitude
+        normalized = mixes.astype(np.float64) / np.sqrt(squares / 16384 + RMS_EPS)
+        pre = 1 / (1 + np.exp(-(normalized[:, :4] * scale[0] + base[:4])))
+        post = 1 / (1 + np.exp(-(normalized[:, 4:8] * scale[1] + base[4:8])))
+        logits = (normalized[:, 8:] * scale[2] + base[8:]).reshape(-1, 4, 4)
+        comb = np.exp(logits - logits.max(axis=-1, keepdims=True))
+        comb = comb / comb.sum(axis=-1, keepdims=True) + HC_SINKHORN_EPS
+        comb = comb / (comb.sum(axis=-2, keepdims=True) + HC_SINKHORN_EPS)
+        for _ in range(repeats - 1):
+            comb = comb / (comb.sum(axis=-1, keepdims=True) + HC_SINKHORN_EPS)
+            comb = comb / (comb.sum(axis=-2, keepdims=True) + HC_SINKHORN_EPS)
+
+        def call(m, q, c, b):
+            return utils.mhc_pre_gates(
+                m,
+                q,
+                4,
+                4096,
+                c,
+                b,
+                RMS_EPS,
+                HC_PRE_EPS,
+                HC_SINKHORN_EPS,
+                HC_POST_MULT_VALUE,
+                repeats,
+            )
+
+        compiled = (
+            jax.jit(call)
+            .lower(
+                jnp.asarray(mixes),
+                jnp.asarray(squares),
+                jnp.asarray(scale),
+                jnp.asarray(base),
+            )
+            .compile()
+        )
+        got = compiled(mixes, squares, scale, base)
+        expected = (pre + HC_PRE_EPS, post * HC_POST_MULT_VALUE, comb)
+        for actual, wanted in zip(got, expected):
+            self.assertEqual(actual.dtype, jnp.float32)
+            np.testing.assert_allclose(actual, wanted, rtol=1e-5, atol=1e-6)
+        self.assertNotIn("mhc_sinkhorn_fp32_single_token", compiled.as_text())
+
+
+@pytest.mark.tpu_test
+class MhcSingleTokenNoPaddingTest(parameterized.TestCase):
+    @parameterized.product(repeats=[1, 2, 20], hidden_size=[256, 4096])
+    def test_seam_avoids_hbm_token_padding(self, repeats, hidden_size):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import fused_post_pre_kernel
+
+        args = list(_fused_args(np.random.default_rng(711), 1, hidden_size))
+        args[-1] = repeats
+        constants = args[-5:]
+        compiled = (
+            jax.jit(lambda *a: fused_post_pre_kernel.mhc_fused_post_pre(*a, *constants))
+            .lower(*args[:-5])
+            .compile()
+        )
+        actual = compiled(*args[:-5])
+        expected = _ref_mhc_fused_post_pre(*args)
+        for got, want in zip(actual, expected):
+            rtol, atol = (
+                (BF16_RTOL, BF16_ATOL)
+                if got.dtype == jnp.bfloat16
+                else (FUSED_SMALL_H_RTOL, FUSED_F32_ATOL)
+            )
+            np.testing.assert_allclose(_to_np(got), _to_np(want), rtol=rtol, atol=atol)
+        self.assertNotIn("bf16[16,", compiled.as_text())
+
+
+@pytest.mark.tpu_test
+class MhcWeightSplitPlacementTest(parameterized.TestCase):
+    @parameterized.product(
+        num_tokens=[1, 8], hidden_size=[256, 4096], path=["pre", "fused"]
+    )
+    def test_single_token_consumes_fp32_weights_directly(
+        self, num_tokens, hidden_size, path
+    ):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import (
+            fused_post_pre_kernel,
+            pre_kernel,
+        )
+
+        args = _fused_args(np.random.default_rng(823), num_tokens, hidden_size)
+        if path == "pre":
+            inputs = (args[1], args[4], args[5], args[6])
+            constants = args[-5:]
+            operation = pre_kernel.mhc_pre
+            expected = _ref_mhc_pre(*inputs, *constants)
+        else:
+            inputs = args[:-5]
+            constants = args[-5:]
+            operation = fused_post_pre_kernel.mhc_fused_post_pre
+            expected = _ref_mhc_fused_post_pre(*args)
+        compiled = (
+            jax.jit(lambda *a: operation(*a, *constants)).lower(*inputs).compile()
+        )
+        actual = compiled(*inputs)
+        for got, want in zip(actual, expected):
+            rtol, atol = (
+                (BF16_RTOL, BF16_ATOL)
+                if got.dtype == jnp.bfloat16
+                else (FUSED_SMALL_H_RTOL, FUSED_F32_ATOL)
+            )
+            np.testing.assert_allclose(_to_np(got), _to_np(want), rtol=rtol, atol=atol)
+        # Decode passes original FP32 weights to Pallas; batched execution
+        # reuses the external split across token blocks.
+        fp32_weight = f"f32[24,{4 * hidden_size}]"
+        direct = any(
+            "custom-call(" in line and fp32_weight in line
+            for line in compiled.as_text().splitlines()
+        )
+        self.assertEqual(direct, num_tokens == 1)
+        # Decode now completes gates in the projection kernel.
+        has_separate_sinkhorn = "mhc_sinkhorn_fp32_single_token" in compiled.as_text()
+        if num_tokens == 1:
+            self.assertFalse(has_separate_sinkhorn)
+
+
+@pytest.mark.tpu_test
+class MHCNormQuantTest(parameterized.TestCase):
+    """Check the fused boundary against stored BF16 mHC output and Torch norm."""
+
+    @parameterized.product(
+        hidden_size=[256, 4096, 7168, 16384],
+        fused=[False, True],
+        norm_dtype=[jnp.bfloat16, jnp.float32],
+    )
+    def test_norm_quant_preserves_residual_and_gates(
+        self, hidden_size, fused, norm_dtype
+    ):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import (
+            fused_post_pre_kernel,
+            norm_quant_kernel,
+            pre_kernel,
+        )
+        from vllm_torchtpu.kernels.quantized_matmul.util import quantize_tensor
+
+        rng = np.random.default_rng(913)
+        residual, fn, scale, base = _make_pre_inputs(rng, 1, hidden_size)
+        residual = jnp.asarray(residual, jnp.bfloat16)
+        fn, scale, base = (jnp.asarray(v, jnp.float32) for v in (fn, scale, base))
+        weight = jnp.asarray(rng.normal(1.0, 0.1, size=hidden_size), dtype=norm_dtype)
+        constants = (RMS_EPS, HC_PRE_EPS, HC_SINKHORN_EPS, HC_POST_MULT_VALUE, 20)
+        if fused:
+            x = jnp.asarray(rng.normal(size=(1, hidden_size)), jnp.bfloat16)
+            post = jnp.ones((1, 4, 1), jnp.float32)
+            comb = jnp.eye(4, dtype=jnp.float32)[None]
+            args = (x, residual, post, comb, fn, scale, base)
+            baseline = fused_post_pre_kernel.mhc_fused_post_pre(*args, *constants)
+            got = norm_quant_kernel.mhc_fused_post_pre_norm_quant(
+                *args,
+                weight,
+                constants=constants,
+                norm_eps=RMS_EPS,
+                quant_dtype=jnp.float8_e4m3fn,
+            )
+        else:
+            args = (residual, fn, scale, base)
+            baseline = pre_kernel.mhc_pre(*args, *constants)
+            got = norm_quant_kernel.mhc_pre_norm_quant(
+                *args,
+                weight,
+                constants=constants,
+                norm_eps=RMS_EPS,
+                quant_dtype=jnp.float8_e4m3fn,
+            )
+        for ref, value in zip(baseline[:-1], got[:-2]):
+            np.testing.assert_array_equal(_to_np(ref), _to_np(value))
+        raw = torch.from_numpy(_to_np(baseline[-1])).to(torch.bfloat16)
+        wt = torch.from_numpy(_to_np(weight)).to(
+            torch.bfloat16 if norm_dtype == jnp.bfloat16 else torch.float32
+        )
+        xf = raw.float()
+        normalized = (
+            xf * torch.rsqrt(xf.square().mean(-1, keepdim=True) + RMS_EPS)
+        ).to(wt.dtype)
+        expected = (normalized * wt).to(raw.dtype).float().numpy()
+        np.testing.assert_allclose(
+            _to_np(got[-2]), expected, rtol=BF16_RTOL, atol=BF16_ATOL
+        )
+        q, qs = quantize_tensor(got[-2], jnp.float8_e4m3fn)
+        np.testing.assert_array_equal(_to_np(got[-1][0]), _to_np(q))
+        np.testing.assert_array_equal(_to_np(got[-1][1]), _to_np(qs))
+
+        if fused:
+            norm_only = norm_quant_kernel.mhc_fused_post_pre_norm_quant(
+                *args,
+                weight,
+                constants=constants,
+                norm_eps=RMS_EPS,
+                quant_dtype=None,
+            )
+            self.assertEmpty(norm_only[-1])
+            for ref, value in zip(got[:-1], norm_only[:-1]):
+                np.testing.assert_array_equal(_to_np(ref), _to_np(value))
+
+        from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
+        from vllm_torchtpu.layers.adapter.linear_common import (
+            _prequantized_bf16_matmul_jax,
+        )
+
+        w = jnp.asarray(rng.normal(size=(hidden_size, 128)), jnp.float8_e4m3fn)
+        ws = jnp.ones((128,), jnp.float32)
+        projected = _prequantized_bf16_matmul_jax(got[-1][0], got[-1][1], w, ws)
+        reference = xla_quantized_matmul(got[-2], w, ws)
+        np.testing.assert_array_equal(_to_np(projected), _to_np(reference))
+
+    @parameterized.parameters(
+        (1, 4, 4096, True), (8, 4, 4096, False), (1, 2, 4096, False), (1, 4, 257, False)
+    )
+    def test_supported_shapes(self, tokens, streams, hidden, expected):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc.norm_quant_kernel import (
+            supports_mhc_norm_quant,
+        )
+
+        self.assertEqual(supports_mhc_norm_quant(tokens, streams, hidden), expected)
+
+    def test_zero_input_has_unit_quant_scale(self):
+        from vllm_torchtpu.kernels.deepseek_v4.mhc import norm_quant_kernel
+
+        h = 256
+        post, comb, y, (q, scale) = norm_quant_kernel.mhc_pre_norm_quant(
+            jnp.zeros((1, 4, h), jnp.bfloat16),
+            jnp.zeros((24, 4 * h), jnp.float32),
+            jnp.ones((3,), jnp.float32),
+            jnp.zeros((24,), jnp.float32),
+            jnp.ones((h,), jnp.bfloat16),
+            constants=(RMS_EPS, HC_PRE_EPS, HC_SINKHORN_EPS, HC_POST_MULT_VALUE, 20),
+            norm_eps=RMS_EPS,
+            quant_dtype=jnp.float8_e4m3fn,
+        )
+        np.testing.assert_array_equal(_to_np(y), 0)
+        np.testing.assert_array_equal(_to_np(q), 0)
+        np.testing.assert_array_equal(_to_np(scale), 1)
+        self.assertTrue(np.isfinite(_to_np(post)).all())
+        self.assertTrue(np.isfinite(_to_np(comb)).all())
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("hidden_size", [128, 4096])
+@pytest.mark.parametrize("flat", [False, True])
+def test_single_token_post_matches_batched_recombination(hidden_size, flat):
+    """Stream layout changes must preserve nontrivial post/comb coefficients."""
+    from vllm_torchtpu.kernels.deepseek_v4.mhc import post_kernel
+
+    rng = np.random.default_rng(1210)
+    h = hidden_size
+    x = jnp.asarray(rng.normal(size=(2, h)), jnp.bfloat16)
+    residual = jnp.asarray(rng.normal(size=(2, 4, h)), jnp.bfloat16)
+    post = jnp.asarray(rng.uniform(0, 2, size=(2, 4, 1)), jnp.float32)
+    comb = jax.nn.softmax(jnp.asarray(rng.normal(size=(2, 4, 4)), jnp.float32), axis=-1)
+    expected = post_kernel.mhc_post(x, residual, post, comb)[:1]
+    if flat:
+        actual = post_kernel.mhc_post_2d(
+            x[:1], residual[:1].reshape(1, 4 * h), post[:1], comb[:1]
+        ).reshape(1, 4, h)
+    else:
+        actual = post_kernel.mhc_post(x[:1], residual[:1], post[:1], comb[:1])
+    np.testing.assert_array_equal(_to_np(actual), _to_np(expected))
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("hidden_size", [256, 4096])
+@pytest.mark.parametrize("repeats", [1, 20])
+@pytest.mark.parametrize("norm_dtype", [jnp.bfloat16, jnp.float32])
+def test_broadcast_pre_matches_repeated_streams(hidden_size, repeats, norm_dtype):
+    from vllm_torchtpu.kernels.deepseek_v4.mhc import norm_quant_kernel
+    from vllm_torchtpu.kernels.quantized_matmul.util import quantize_tensor
+
+    rng = np.random.default_rng(1012)
+    h = hidden_size
+    x = jnp.asarray(rng.normal(size=(1, h)), jnp.bfloat16)
+    fn = jnp.asarray(rng.normal(0, 0.01, size=(24, 4 * h)), jnp.float32)
+    scale = jnp.array([0.3, 0.5, 0.7], jnp.float32)
+    base = jnp.asarray(rng.normal(size=24), jnp.float32)
+    weight = jnp.asarray(rng.normal(1, 0.1, size=h), norm_dtype)
+    constants = (RMS_EPS, HC_PRE_EPS, HC_SINKHORN_EPS, HC_POST_MULT_VALUE, repeats)
+    residual = jnp.broadcast_to(x[:, None, :], (1, 4, h))
+    expected = norm_quant_kernel.mhc_pre_norm_quant(
+        residual, fn, scale, base, weight, constants=constants, norm_eps=RMS_EPS
+    )
+    actual_residual, *actual = norm_quant_kernel.mhc_broadcast_pre_norm_quant(
+        x,
+        fn.reshape(24, 4, h).sum(axis=1),
+        scale,
+        base,
+        weight,
+        constants=constants,
+        norm_eps=RMS_EPS,
+    )
+    np.testing.assert_array_equal(_to_np(actual_residual), _to_np(residual))
+    for got, want in zip(actual[:2], expected[:2]):
+        np.testing.assert_allclose(_to_np(got), _to_np(want), rtol=1e-5, atol=1e-6)
+    np.testing.assert_allclose(
+        _to_np(actual[2]), _to_np(expected[2]), rtol=BF16_RTOL, atol=BF16_ATOL
+    )
+    q, qs = quantize_tensor(actual[2], jnp.float8_e4m3fn)
+    np.testing.assert_array_equal(_to_np(actual[3][0]), _to_np(q))
+    np.testing.assert_array_equal(_to_np(actual[3][1]), _to_np(qs))
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("repeats", [1, 2, 7, 20])
+@pytest.mark.parametrize("logit_scale", [0.0, 0.01, 1.0, 20.0])
+@pytest.mark.parametrize("eps", [1e-6, 1e-3])
+def test_fused_sinkhorn_preserves_fp32_reduction_tree(repeats, logit_scale, eps):
+    """Register layout changes must preserve both four-value reduction trees."""
+    from jax.experimental import pallas as pl
+
+    from vllm_torchtpu.kernels.deepseek_v4.mhc.sinkhorn_kernel import (
+        single_token_post_comb,
+    )
+
+    def kernel(base_ref, logits_ref, output_ref, reference_ref):
+        _, comb = single_token_post_comb(
+            jnp.zeros((1, 24), jnp.float32),
+            jnp.ones((1, 3), jnp.float32),
+            base_ref[...],
+            eps,
+            HC_POST_MULT_VALUE,
+            repeats,
+        )
+        output_ref[...] = comb
+        # Matrix-axis reference, independent of the fused lane-replicated layout.
+        value = jax.nn.softmax(logits_ref[...], axis=-1) + eps
+        value = value / (jnp.sum(value, axis=0, keepdims=True) + eps)
+
+        def normalize(_, matrix):
+            matrix = matrix / (jnp.sum(matrix, axis=1, keepdims=True) + eps)
+            return matrix / (jnp.sum(matrix, axis=0, keepdims=True) + eps)
+
+        reference_ref[...] = jax.lax.fori_loop(0, repeats - 1, normalize, value)
+
+    shape = jax.ShapeDtypeStruct((4, 4), jnp.float32)
+    fused = pl.pallas_call(kernel, out_shape=(shape, shape))
+    for seed in (913, 1210):
+        rng = np.random.default_rng(seed)
+        logits = jnp.asarray(rng.normal(size=(1, 4, 4)) * logit_scale, jnp.float32)
+        base = jnp.concatenate(
+            [jnp.zeros((1, 8), jnp.float32), logits.reshape(1, 16)], axis=1
+        )
+        actual, expected = fused(base, logits[0])
+        np.testing.assert_array_equal(_to_np(actual), _to_np(expected))
+
+
 if __name__ == "__main__":
     absltest.main()
