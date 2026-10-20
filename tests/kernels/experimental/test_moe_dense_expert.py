@@ -13,11 +13,11 @@ from vllm_torchtpu.layers.core import fused_moe_gmm as wrapper
 pytestmark = pytest.mark.tpu_test
 
 
-@pytest.fixture(scope="module")
-def tensors():
+@pytest.fixture(scope="module", params=[512, 640])
+def tensors(request):
     if jax.default_backend() != "tpu":
         pytest.skip("requires TPU")
-    m, h, i, e = 16, 512, 512, 4
+    m, h, i, e = 16, 512, request.param, 4
     rng = np.random.default_rng(27)
     x = jnp.asarray(rng.normal(size=(m, h)), jnp.bfloat16)
     w1 = jnp.asarray(rng.integers(-8, 9, size=(e, h, 2 * i)), jnp.float8_e4m3fn)

@@ -30,7 +30,7 @@ def _select_expert_buffers(m, h, i, experts, vmem_capacity_bytes):
     # Hidden input/output, quantized hidden, and FP32 output accumulator.
     fixed_bytes = m * h * (2 + 2 + 1 + 4)
     # BF16 activation, FP8 activation, and the two BF16 quantization scales.
-    fixed_bytes += m * i * (2 + 1) + (h // 512 + i // 512) * m * 128 * 2
+    fixed_bytes += m * i * (2 + 1) + (h // 512 + pl.cdiv(i, 512)) * m * 128 * 2
     fixed_bytes += m * pl.cdiv(experts, 128) * 128 * 4
     budget = vmem_capacity_bytes * 4 // 5
     return max(1, min(_MAX_EXPERT_BUFFERS, (budget - fixed_bytes) // expert_bytes))
@@ -57,7 +57,7 @@ def can_use_dense_expert(
     e, i, out = w2.shape
     if min(m, h, i, e) <= 0:
         return False
-    if m % 16 or h % 512 or i % 512:
+    if m % 16 or h % 512 or i % 128:
         return False
     if out != h or w1.shape != (e, h, 2 * i):
         return False
@@ -80,10 +80,13 @@ def _quantize(x, q_ref, scale_ref):
     # Keep K blocks first so each scale read is a contiguous [tokens, 128]
     # plane; placing K between tokens and lanes causes expensive relayouts.
     for k in range(0, x.shape[1], 512):
-        block = x[:, k : k + 512]
+        # The last intermediate block may be shorter than 512. Quantize
+        # only its real elements, matching GMM's zero-padded tail scale.
+        width = min(512, x.shape[1] - k)
+        block = x[:, k : k + width]
         scale = jnp.max(jnp.abs(block), axis=1, keepdims=True) / 448.0
         inv = jnp.where(scale == 0, 0, 1 / scale)
-        q_ref[:, k : k + 512] = (block * inv).astype(jnp.float8_e4m3fn)
+        q_ref[:, k : k + width] = (block * inv).astype(jnp.float8_e4m3fn)
         scale_ref[k // 512, :, :] = jnp.broadcast_to(scale, (x.shape[0], 128))
 
 
@@ -150,9 +153,10 @@ def _kernel(
         for n in range(0, h, 256):
             acc = jnp.zeros((m, 256), jnp.bfloat16)
             for k in range(0, i, 512):
+                width = min(512, i - k)
                 part = jnp.matmul(
-                    aq_ref[:, k : k + 512],
-                    w2_ref[k : k + 512, n : n + 256],
+                    aq_ref[:, k : k + width],
+                    w2_ref[k : k + width, n : n + 256],
                     preferred_element_type=jnp.float32,
                 ).astype(jnp.bfloat16)
                 asc = asc_ref[k // 512, :, :]
@@ -273,7 +277,7 @@ def dense_expert_moe(hidden, w1, w2, s1, s2, topk_weights, local_ids):
                 pltpu.VMEM((h // 512, m, 128), jnp.bfloat16),
                 pltpu.VMEM((m, i), jnp.bfloat16),
                 pltpu.VMEM((m, i), jnp.float8_e4m3fn),
-                pltpu.VMEM((i // 512, m, 128), jnp.bfloat16),
+                pltpu.VMEM((pl.cdiv(i, 512), m, 128), jnp.bfloat16),
                 pltpu.VMEM((m, h), jnp.float32),
                 pltpu.SMEM((experts,), jnp.int32),
                 pltpu.SemaphoreType.DMA((num_buffers, 4)),

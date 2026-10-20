@@ -59,6 +59,8 @@ def _shapes(m, h, i, e):
     "shape",
     [
         (272, 512, 512, 4),
+        (64, 2560, 640, 64),
+        (16, 512, 128, 2),
         (16, 1536, 1536, 2),
         (16, 512, 512, 129),
         (1024, 8192, 4096, 512),
@@ -83,7 +85,7 @@ def test_aligned_shapes_have_no_resource_admission_cap(shape, skip_padded_tokens
     [
         (15, 512, 512, 4),
         (16, 768, 512, 4),
-        (16, 512, 768, 4),
+        (16, 512, 704, 4),
         (0, 512, 512, 4),
         (16, 0, 512, 4),
         (16, 512, 0, 4),
@@ -139,7 +141,15 @@ def _reference_expert(x, w1, w2, s1, s2):
 
 
 @pytest.mark.parametrize(
-    "shape", [(272, 512, 512, 2), (16, 1536, 1536, 2), (16, 512, 512, 129)]
+    "shape",
+    [
+        (272, 512, 512, 2),
+        (16, 1536, 1536, 2),
+        (16, 512, 512, 129),
+        (16, 512, 128, 2),
+        (16, 512, 640, 2),
+        (16, 512, 768, 2),
+    ],
 )
 def test_expanded_shapes_match_routed_reference(shape, monkeypatch):
     if jax.default_backend() != "cpu":
