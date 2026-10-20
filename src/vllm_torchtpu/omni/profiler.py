@@ -36,7 +36,7 @@ Enable it the usual Omni way (``profiler_config={"profiler": "torch",
 
 import dataclasses
 import os
-from typing import Any
+from typing import Any, NamedTuple
 
 import torch
 from torch_tpu._internal.profiler import TpuProfilerConfig
@@ -47,6 +47,17 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.tracing.options import resolve_profile_dir_and_opts
 
 logger = init_logger(__name__)
+
+
+class _CaptureState(NamedTuple):
+    """What _start() hands to _stop() for the per-rank merge."""
+
+    capture_dir: str
+    run_root: str
+    canonical_ts: str
+    rank: int
+    world_size: int
+    session_key: str
 
 
 class TpuOmniTorchProfilerWrapper(OmniTorchProfilerWrapper):
@@ -70,7 +81,7 @@ class TpuOmniTorchProfilerWrapper(OmniTorchProfilerWrapper):
         )
         super().__init__(profiler_config, worker_name, local_rank, activities)
         self._profile_session_index = 0
-        self._capture_state: tuple[str, str, str, int, int, str] | None = None
+        self._capture_state: _CaptureState | None = None
 
     def _get_default_activities(self) -> list[Any]:
         # "TPU" is a placeholder: Omni's activity map has no TPU key, so the real
@@ -138,13 +149,13 @@ class TpuOmniTorchProfilerWrapper(OmniTorchProfilerWrapper):
                 experimental_options=advanced_opts,
             ),
         )
-        self._capture_state = (
-            capture_dir,
-            run_root,
-            canonical_ts,
-            rank,
-            world_size,
-            session_key,
+        self._capture_state = _CaptureState(
+            capture_dir=capture_dir,
+            run_root=run_root,
+            canonical_ts=canonical_ts,
+            rank=rank,
+            world_size=world_size,
+            session_key=session_key,
         )
 
         super()._start()
@@ -153,22 +164,17 @@ class TpuOmniTorchProfilerWrapper(OmniTorchProfilerWrapper):
         try:
             super()._stop()
         finally:
-            if self._capture_state is not None:
-                (
-                    capture_dir,
-                    run_root,
-                    canonical_ts,
-                    rank,
-                    world_size,
-                    session_key,
-                ) = self._capture_state
+            state = self._capture_state
+            if state is not None:
                 profiler_trace.merge_rank_capture(
-                    capture_dir,
-                    run_root,
-                    canonical_ts,
-                    rank,
-                    world_size=world_size,
+                    state.capture_dir,
+                    state.run_root,
+                    state.canonical_ts,
+                    state.rank,
+                    world_size=state.world_size,
                 )
-                if rank == 0:
-                    profiler_trace.clear_canonical_ts_marker(run_root, session_key)
+                if state.rank == 0:
+                    profiler_trace.clear_canonical_ts_marker(
+                        state.run_root, state.session_key
+                    )
                 self._capture_state = None
