@@ -20,13 +20,6 @@ itself: apply_omni_tpu_patches() when the platform is constructed, and
 apply_omni_model_specific_patches() at attention backend selection
 (get_diffusion_attn_backend_cls). Tracked in #1862 for unification with
 patch_registry.py.
-
-Deferred graph execution (DEFER_AND_FUSE) is active in diffusion workers
-when helpers such as synchronize_tensors() run. Diffusion workers build a
-VllmConfig, so TpuPlatform.check_and_update_config runs the
-platform_activation patches, including _configure_torchtpu_eager_mode() in
-platforms/tpu_platform.py, which selects DEFER_AND_FUSE unless
-TPU_KERNEL_ITER_MODE is set.
 """
 
 from functools import cache as run_once
