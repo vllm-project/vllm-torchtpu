@@ -94,9 +94,11 @@ benchmarking = [
     "runai-model-streamer[gcs]>=0.17",
 ]
 
-# vLLM-Omni optional dependency
+# vLLM-Omni optional dependency. vllm-omni keeps major.minor aligned with vLLM.
+# 0.32.0rc1 is not on PyPI yet; until it is, add the `omni-git` dependency
+# group below, which supplies it from its git tag.
 omni = [
-    "vllm-omni==0.31.0rc1",
+    "vllm-omni==0.32.0rc1",
     # vllm-omni pulls torchaudio through s3tokenizer. The PyPI torchaudio is a
     # CUDA build that fails to load libcudart, and transformers imports
     # torchaudio whenever it is installed, so every vLLM import would fail.
@@ -130,6 +132,13 @@ vllm = [
     # Note: we **intentionally** build vllm from source, see README.
     # Keep vllm_test_utils on the same upstream tag below.
     "vllm @ git+https://github.com/vllm-project/vllm.git@v0.32.0",
+]
+
+# Source for the `omni` extra's vllm-omni==0.32.0rc1 while that release is not
+# on PyPI: install `--extra omni --group omni-git`. Drop this group, and the
+# flag, once it is.
+omni-git = [
+    "vllm-omni @ git+https://github.com/vllm-project/vllm-omni.git@v0.32.0rc1",
 ]
 
 # Required for running tests
