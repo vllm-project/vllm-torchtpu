@@ -4,6 +4,7 @@
 # especially torch_tpu which might read them at import time.
 import vllm_torchtpu.env_override  # noqa: F401  # isort: skip
 
+import ctypes
 import os
 import time
 from typing import Any, cast
@@ -12,6 +13,7 @@ from urllib.parse import urlparse
 import torch
 import torch.profiler
 import torch_tpu  # noqa: F401
+from torch.compiler._cache import CacheArtifactManager
 from torch_tpu._internal.profiler import TpuProfilerConfig
 from vllm.config import VllmConfig, set_current_vllm_config
 from vllm.distributed.kv_transfer import (
@@ -65,6 +67,17 @@ def _configure_tpu_process_env(
         os.environ["WORLD_SIZE"] = str(world_size)
     else:
         os.environ.pop("WORLD_SIZE", None)
+
+
+def _release_free_host_heap() -> None:
+    """Return free allocator pages from model loading and compilation to the OS."""
+    process = ctypes.CDLL(None)
+    if hasattr(process, "MallocExtension_ReleaseFreeMemory"):
+        process.MallocExtension_ReleaseFreeMemory()
+        logger.info("Released free host heap via tcmalloc.")
+    elif hasattr(process, "malloc_trim"):
+        process.malloc_trim(0)
+        logger.info("Released free host heap via glibc malloc_trim.")
 
 
 class TPUWorker(WorkerBase):
@@ -768,11 +781,15 @@ class TPUWorker(WorkerBase):
         compilation_time = time.perf_counter() - start
         self.compilation_config.compilation_time = compilation_time
         set_torch_threads_for_runtime()
+        # torch records every compile artifact for save_cache_artifacts(), which
+        # vLLM never calls; drop the record so its memory can be freed.
+        CacheArtifactManager.clear()
         # The warmed worker holds a large static heap (model, compiled
         # executables, KV bookkeeping); freezing it keeps a gen-2 collection
         # from scanning those objects mid-step.
         freeze_gc_heap()
         maybe_attach_gc_debug_callback()
+        _release_free_host_heap()
         from vllm_torchtpu.runner.compile_watch import (
             install_post_warmup_compile_log,
         )
