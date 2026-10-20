@@ -88,9 +88,10 @@ class DSparkProposer(DFlashProposer):
             )
         if spec.draft_sample_method == "probabilistic":
             # Drafts stay argmax. Upstream samples drafts only under standard
-            # rejection and verifies them against the draft probability; the TPU rejection
-            # sampler treats every draft as one-hot, which is exact for argmax
-            # drafts only. Under synthetic rejection upstream drafts argmax too.
+            # rejection and verifies them against the draft probability; the
+            # TPU rejection sampler treats every draft as one-hot, which is
+            # exact for argmax drafts only. Under synthetic rejection upstream
+            # drafts argmax too.
             if spec.rejection_sample_method != "synthetic":
                 raise ValueError(
                     "DSpark on TPU does not support draft_sample_method="
