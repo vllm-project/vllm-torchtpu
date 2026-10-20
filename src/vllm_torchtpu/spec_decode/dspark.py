@@ -27,8 +27,12 @@ FIRST prediction position and every slot predicts the NEXT token — versus
 DFlash's 1 + K (anchor is bonus only). Speculators-format checkpoints set
 ``sample_from_anchor=False`` and keep the DFlash layout.
 
-PoC scope: greedy draft sampling only (argmax + d2t remap); probabilistic
-Gumbel-coupled sampling is not implemented.
+The query block follows ``num_speculative_tokens`` (K), not the block length
+the checkpoint was trained at, as in upstream DSparkSpeculator. Drafts are
+always the argmax (+ d2t remap): ``draft_sample_method="probabilistic"`` is
+accepted under synthetic rejection, where upstream drafts argmax as well, and
+refused under standard rejection, where upstream samples and the TPU rejection
+sampler has no draft-probability path.
 """
 
 from __future__ import annotations
@@ -61,29 +65,55 @@ class DSparkProposer(DFlashProposer):
         # Same key/default as upstream DSparkSpeculator: dense checkpoints
         # omit it (-> True); the speculators converter writes it explicitly.
         self.sample_from_anchor = bool(hf_dict.get("sample_from_anchor", True))
-        block = hf_dict.get("dspark_block_size") or hf_dict.get("block_size")
+        # Like upstream DSparkSpeculator, the query block follows K, not the
+        # block length the checkpoint was trained at.
+        trained_block = hf_dict.get("dspark_block_size") or hf_dict.get("block_size")
         K = self.speculative_config.num_speculative_tokens
-        if block is not None and int(block) != K:
-            raise ValueError(
-                f"num_speculative_tokens={K} does not match the DSpark "
-                f"checkpoint's block size {block}; the block/Markov-head "
-                "machinery is trained for exactly that block length."
+        if trained_block is not None and int(trained_block) != K:
+            logger.warning(
+                "DSpark: num_speculative_tokens=%d differs from the checkpoint's "
+                "trained block size %s; drafting a block of %d.",
+                K,
+                trained_block,
+                K,
             )
-        # vLLM 0.29 drafting options this proposer does not implement yet.
+        # Upstream drafting options this proposer does not implement.
         spec = self.speculative_config
-        if (
-            spec.draft_sample_method != "greedy"
-            or spec.enable_adaptive_verification
-            or spec.dspark_draft_topk is not None
-        ):
+        if spec.enable_adaptive_verification or spec.dspark_draft_topk is not None:
+            raise ValueError(
+                "DSpark on TPU does not support enable_adaptive_verification="
+                f"{spec.enable_adaptive_verification}, dspark_draft_topk="
+                f"{spec.dspark_draft_topk}; only drafting of a fixed block is "
+                "implemented."
+            )
+        if spec.draft_sample_method == "probabilistic":
+            # Drafts stay argmax. Upstream samples drafts only under standard
+            # rejection and verifies them against the draft probability; the TPU rejection
+            # sampler treats every draft as one-hot, which is exact for argmax
+            # drafts only. Under synthetic rejection upstream drafts argmax too.
+            if spec.rejection_sample_method != "synthetic":
+                raise ValueError(
+                    "DSpark on TPU does not support draft_sample_method="
+                    "'probabilistic' with rejection_sample_method="
+                    f"{spec.rejection_sample_method!r}: drafts are argmax and "
+                    "the rejection sampler has no draft-probability path. Use "
+                    "rejection_sample_method='synthetic' or greedy drafting."
+                )
+            logger.warning(
+                "DSpark on TPU drafts with argmax; draft_sample_method="
+                "'probabilistic' has no effect under synthetic rejection."
+            )
+        elif spec.draft_sample_method != "greedy":
             raise ValueError(
                 "DSpark on TPU does not support draft_sample_method="
-                f"{spec.draft_sample_method!r}, enable_adaptive_verification="
-                f"{spec.enable_adaptive_verification}, dspark_draft_topk="
-                f"{spec.dspark_draft_topk}; only greedy drafting of a fixed "
-                "block is implemented."
+                f"{spec.draft_sample_method!r}."
             )
-        logger.info("DSpark: sample_from_anchor=%s, K=%d.", self.sample_from_anchor, K)
+        logger.info(
+            "DSpark: sample_from_anchor=%s, K=%d (checkpoint block %s).",
+            self.sample_from_anchor,
+            K,
+            trained_block,
+        )
 
     # A reduced-vocab DSpark checkpoint carries its own lm_head
     # ([draft_vocab, hidden] plus a d2t remap) and possibly its own

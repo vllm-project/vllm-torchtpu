@@ -37,6 +37,7 @@ def _make_proposer(hf_dict, num_speculative_tokens=4, **spec_fields):
     # The vLLM 0.29 drafting fields at their defaults; tests override them.
     fields = dict(
         draft_sample_method="greedy",
+        rejection_sample_method="standard",
         enable_adaptive_verification=False,
         dspark_draft_topk=None,
     )
@@ -103,7 +104,6 @@ def test_bonus_anchor_keeps_dflash_layout():
 @pytest.mark.parametrize(
     "field,value",
     [
-        ("draft_sample_method", "probabilistic"),
         ("enable_adaptive_verification", True),
         ("dspark_draft_topk", 8),
     ],
@@ -120,16 +120,30 @@ def test_rejects_unsupported_drafting_options(field, value):
         )
 
 
-def test_block_size_guard():
-    with pytest.raises(ValueError, match="block size"):
+def test_k_need_not_match_checkpoint_block():
+    # Upstream DSparkSpeculator drafts any K from a checkpoint trained at one
+    # block length; the query block follows K.
+    p = _make_proposer(
+        {"dspark_noise_token_id": 7, "dspark_block_size": 5, **_LAYER_IDS},
+        num_speculative_tokens=6,
+    )
+    assert p.block_size == 6
+
+
+def test_probabilistic_drafting_only_under_synthetic_rejection():
+    hf = {"dspark_noise_token_id": 7, "dspark_block_size": 4, **_LAYER_IDS}
+    # Standard rejection would verify sampled drafts against a draft
+    # probability the TPU sampler does not have.
+    with pytest.raises(ValueError, match="synthetic"):
         _make_proposer(
-            {
-                "dspark_noise_token_id": 7,
-                "dspark_block_size": 7,
-                **_LAYER_IDS,
-            },
-            num_speculative_tokens=4,
+            hf, draft_sample_method="probabilistic", rejection_sample_method="standard"
         )
+    # Synthetic rejection never reads the draft distribution; the flag is
+    # accepted and drafting stays argmax (what upstream does there too).
+    p = _make_proposer(
+        hf, draft_sample_method="probabilistic", rejection_sample_method="synthetic"
+    )
+    assert p.block_size == 4
 
 
 def test_missing_noise_token():
