@@ -21,15 +21,22 @@ are masked to disjoint ranges. MXU RHS loading performs the K transposes.
 One program traverses requests; two SWA staging blocks and the next Q/KV bank
 prefetch across request boundaries during the current group's computation. Each bank
 has independent DMA semaphores; only Q, packed KV, scales and RoPE are doubled.
-The BF16 KV workspace and output buffers are reused after their consumers finish.
+The BF16 KV workspace is reused after its consumers finish.
 
-CSA dequantizes KV to BF16 once for QK/PV reuse. All GEMMs use BF16 operands
-and FP32 accumulators, softmax uses FP32, and probabilities are stored in BF16.
-Each QK launches before the preceding Q's softmax. CSA PV starts as soon as
-its P is ready; SWA PV reuses its RHS for two Qs. Both PV results stay in
-independent MRB regions while the next tile runs softmax. QK uses two slots,
-and each PV branch uses four. When ten slots exceed MRB capacity, one-Q tiles
-use six slots instead. Startup, odd/even tails and final pops are explicit.
+CSA converts FP8 KV to BF16 once for QK/PV reuse; the per-row scale is
+applied to the FP32 logits and to P instead of to every KV element. All GEMMs
+use BF16 operands and FP32 accumulators, softmax uses FP32, and probabilities
+are stored in BF16. Each QK launches before the preceding Q's softmax. One PV
+accumulates the 512 CSA and 256 SWA keys and starts as soon as its P is ready;
+it stays in its own MRB region while the next tile runs softmax. QK uses two
+slots and PV four. Startup, odd/even tails and final pops are explicit. Full
+groups use a statically unrolled schedule that interleaves k Qs per step, so
+the softmax reduction latency of one Q overlaps the others' work; they write
+back with one DMA into a double-buffered output that drains during the next
+group; the step's Qs share each SWA PV RHS load. SWA QK splits the feature
+dimension across the two MXUs and adds the halves. The softmax shift is a BF16
+lane reduction of the row maximum: any shift within the FP32 exp range gives
+the same normalized probabilities.
 CPU interpret uses ordinary dots to check the math; it does not emulate the
 asynchronous MXU protocol.
 
@@ -46,6 +53,9 @@ import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
+
+# Full groups interleave this many Qs per step (first that fits).
+INTERLEAVE = (6, 3, 2)
 
 
 def main_kernel(
@@ -88,10 +98,52 @@ def main_kernel(
         swa_kv_hbm_ref if isinstance(swa_kv_hbm_ref, tuple) else (swa_kv_hbm_ref,)
     )
     swa_kv_hbm_ref = swa_banks[0]
+    # Output buffers alternate by group; a group's writes drain during the next.
+    output_buffers = output_ref
+
+    def output_semaphore(bank):
+        return jnp.where(bank == 0, 2 + 8 * bq, 4 + 9 * bq)
+
+    def drain_outputs(group_t0, group_count, group_bank):
+        buffers = output_buffers.at[group_bank]
+        semaphore = output_semaphore(group_bank)
+        queries = group_count
+        if interleave:
+            # Interleaved full groups write back with one DMA.
+            @pl.when(group_count == bq)
+            def drain_group():
+                pltpu.make_async_copy(
+                    buffers,
+                    output_hbm_ref.at[pl.ds(group_t0, bq)],
+                    dma_sem.at[semaphore],
+                ).wait()
+
+            queries = jnp.where(group_count == bq, 0, group_count)
+
+        @pl.loop(0, queries)
+        def drain_queries(i):
+            pltpu.make_async_copy(
+                buffers.at[i],
+                output_hbm_ref.at[group_t0 + i],
+                dma_sem.at[semaphore + i],
+            ).wait()
+
     request_limit = starts_ref.shape[0] - 1
     num_heads = q_hbm_ref.shape[1]
     mxu_heads = pl.cdiv(num_heads, 16) * 16
     mrb_stride = mxu_heads // 4
+    # Full groups interleave k Qs per step (first k whose slots fit the MRB).
+    interleave = next(
+        (
+            k
+            for k in INTERLEAVE
+            if not interpret
+            and bq > 2
+            and bq % k == 0
+            and 2 * k * min(bq // k, 2) * mrb_stride <= 256
+        ),
+        0,
+    )
     window_size = 128
     sink_dma = pltpu.make_async_copy(sink_hbm_ref, sink_ref, dma_sem.at[0])
     sink_dma.start()
@@ -121,26 +173,11 @@ def main_kernel(
 
         return start, end, first_query_position, anchor
 
-    def block_dmas(wanted, request_index, destination, semaphore):
-        start, end, first_query_position, anchor = request_info(request_index)
-        if swa_metadata_ref is None:
-            source_q = jnp.minimum(
-                end - 1,
-                start
-                + jnp.maximum(0, anchor + wanted * 128 + 127 - first_query_position),
-            )
-            return (
-                (
-                    pltpu.make_async_copy(
-                        swa_kv_hbm_ref.at[source_q], destination, semaphore
-                    ),
-                    jnp.bool_(True),
-                ),
-            )
+    def start_paged_block(wanted, request_index, destination, semaphore):
+        _, _, _, anchor = request_info(request_index)
         word_pages = swa_kv_hbm_ref.dtype == jnp.int32
         page_size = swa_kv_hbm_ref.shape[2 if word_pages else 1]
         rows_per_copy = min(page_size, 64 if swa_bounds_ref is not None else 128)
-        copies = []
         for offset in range(0, 128, rows_per_copy):
             position = anchor + wanted * 128 + offset
             column = (position - swa_metadata_ref[request_index, 0]) // page_size
@@ -149,60 +186,54 @@ def main_kernel(
             page = jnp.where(
                 (column >= 0) & (column < swa_metadata_ref.shape[1] - 2), page, 0
             )
-            for bank, source in enumerate(swa_banks):
-                if len(swa_banks) == 1:
-                    own, local_page = jnp.bool_(True), page
-                else:
-                    split = swa_banks[0].shape[0]
-                    own = page >= split if bank else page < split
-                    local_page = page - split if bank else page
-                    # Construct only legal views, even for the skipped bank.
-                    local_page = jnp.where(own, local_page, 0)
+            rows = pl.ds(position % page_size, rows_per_copy)
+            target = pl.ds(offset, rows_per_copy)
+
+            def copy(source, local_page, *, rows=rows, target=target):
+                # Both word planes of a page row range move in one strided copy.
                 if word_pages:
-                    for plane in range(2):
-                        copies.append(
-                            (
-                                pltpu.make_async_copy(
-                                    source.at[
-                                        local_page,
-                                        plane,
-                                        pl.ds(position % page_size, rows_per_copy),
-                                        :,
-                                    ],
-                                    destination.at[
-                                        plane, pl.ds(offset, rows_per_copy), :
-                                    ],
-                                    semaphore,
-                                ),
-                                own,
-                            )
-                        )
+                    view = source.at[local_page, :, rows, :]
+                    window = destination.at[:, target, :]
                 else:
-                    copies.append(
-                        (
-                            pltpu.make_async_copy(
-                                source.at[
-                                    local_page,
-                                    pl.ds(position % page_size, rows_per_copy),
-                                    :,
-                                ],
-                                destination.at[pl.ds(offset, rows_per_copy), :],
-                                semaphore,
-                            ),
-                            own,
-                        )
-                    )
-        return tuple(copies)
+                    view = source.at[local_page, rows, :]
+                    window = destination.at[target, :]
+                pltpu.make_async_copy(view, window, semaphore).start()
+
+            if len(swa_banks) == 1:
+                copy(swa_banks[0], page)
+            else:
+                split = swa_banks[0].shape[0]
+                high = page >= split
+
+                @pl.when(high)
+                def copy_high(*, copy=copy, page=page, split=split):
+                    copy(swa_banks[1], page - split)
+
+                @pl.when(jnp.logical_not(high))
+                def copy_low(*, copy=copy, page=page):
+                    copy(swa_banks[0], page)
 
     def transfer_block(wanted, request_index, destination, semaphore, *, wait=False):
-        for copy, own in block_dmas(wanted, request_index, destination, semaphore):
-
-            @pl.when(own)
-            def transfer(*, copy=copy):
-                if wait:
-                    copy.wait()
-                else:
-                    copy.start()
+        if swa_metadata_ref is not None:
+            if wait:
+                # DMA semaphores count bytes: every row range of the block is
+                # copied exactly once, so one block-sized wait covers them all.
+                pltpu.make_async_copy(destination, destination, semaphore).wait()
+            else:
+                start_paged_block(wanted, request_index, destination, semaphore)
+            return
+        start, end, first_query_position, anchor = request_info(request_index)
+        source_q = jnp.minimum(
+            end - 1,
+            start + jnp.maximum(0, anchor + wanted * 128 + 127 - first_query_position),
+        )
+        copy = pltpu.make_async_copy(
+            swa_kv_hbm_ref.at[source_q], destination, semaphore
+        )
+        if wait:
+            copy.wait()
+        else:
+            copy.start()
 
     def request_window(request_index, *, wait=False):
         for offset in range(2):
@@ -286,7 +317,9 @@ def main_kernel(
         transfer_group(first_request, first_t0, 0)
 
     def process_group(state):
-        request_index, t0, bank = state
+        request_index, t0, bank, previous_t0, previous_count = state
+        output_ref = output_buffers.at[bank]
+        output_sem = output_semaphore(bank)
         start, end, first_query_position, anchor = request_info(request_index)
 
         def start_block_dma(wanted):
@@ -406,12 +439,11 @@ def main_kernel(
                     swa_prefetched_id[0] = wanted + 1
 
         def dequant(i):
-            # Byte g of each word holds feature g * 128 + lane.
+            # Byte g of each word holds feature g * 128 + lane. Unscaled.
             words_ref = main_fp8_ref.at[i].bitcast(jnp.uint32).reshape(512, 128)
             for row in range(0, 512, 128):
                 rows = pl.ds(row, 128)
                 words = words_ref[rows, :]
-                scales = main_scale_ref[i, 0, rows][:, None]
                 for group in range(4):
                     if interpret:
                         # unpack_elementwise has no CPU lowering.
@@ -423,12 +455,12 @@ def main_kernel(
                             packed_dtype=jnp.uint8,
                             unpacked_dtype=jnp.uint32,
                         )
-                    values = lax.bitcast_convert_type(
-                        bits.astype(jnp.uint8), jnp.float8_e4m3fn
-                    ).astype(jnp.float32)
+                    # FP8 values are exact in BF16; scales apply to logits and P.
                     main_bf16_ref[i, rows, pl.ds(group * 128, 128)] = (
-                        values * scales
-                    ).astype(jnp.bfloat16)
+                        lax.bitcast_convert_type(
+                            bits.astype(jnp.uint8), jnp.float8_e4m3fn
+                        ).astype(jnp.bfloat16)
+                    )
 
         transfer_group(request_index, t0, bank, wait=True)
 
@@ -447,6 +479,39 @@ def main_kernel(
                 swa_shared_ref[...].T,
                 preferred_element_type=jnp.float32,
             ).reshape(bq, num_heads, 256)
+        elif bq * mrb_stride <= 256:
+            # MXU k owns feature half k for every head; one RHS load per MXU.
+            def compute_swa_qk_split(*accumulators):
+                for k in range(2):
+                    ks = pl.ds(k * 256, 256)
+                    pltpu.matmul_push_rhs(
+                        swa_shared_ref[:, ks],
+                        staging_register=0,
+                        mxu_index=k,
+                        transpose=True,
+                    )
+                    for i in range(bq):
+                        lhs = q_ref[i, :, ks]
+                        lhs = jnp.pad(lhs, ((0, mxu_heads - num_heads), (0, 0)))
+                        pltpu.matmul_acc_lhs(
+                            accumulators[k * bq + i],
+                            lhs,
+                            load_staged_rhs=0 if i == 0 else None,
+                        )
+                for i in range(bq):
+                    swa_score_ref[i] = (
+                        pltpu.matmul_pop(accumulators[i])[:num_heads]
+                        + pltpu.matmul_pop(accumulators[bq + i])[:num_heads]
+                    )
+
+            pl.run_scoped(
+                compute_swa_qk_split,
+                *(
+                    pltpu.ACC(mxu)((mxu_heads, 256), jnp.float32)
+                    for mxu in range(2)
+                    for _ in range(bq)
+                ),
+            )
         else:
             # Split legal head domains; a sub-16-row head tail is indivisible.
             first_heads = min(num_heads, ((num_heads + 16) // 32) * 16)
@@ -489,24 +554,30 @@ def main_kernel(
                 ),
             )
 
-        accumulator_slots = 10 if 10 * mrb_stride <= 256 else 6
+        # Tiles: QK two slots, fused CSA+SWA PV four (6 * 32 <= 256). Full
+        # groups interleave k Qs: QK and PV each use k slots per in-flight
+        # step (two steps when the group has more than one).
+        accumulator_slots = max(6, 2 * interleave * min(bq // max(interleave, 1), 2))
 
         def compute_main(*accumulators):
             def accumulator(mxu, address):
                 return accumulators[mxu * accumulator_slots + address // mrb_stride]
 
-            def csa_launch(i, addr, *, pv):
-                for k in range(2):
+            def csa_launch(i, addr, *, pv, csa_only=False):
+                # PV accumulates CSA keys 0:256, 256:512, then the 256 SWA keys.
+                for k in range(3 if pv and not csa_only else 2):
                     ks = pl.ds(k * 256, 256)
                     for mxu in range(2):
                         ns = pl.ds(mxu * 256, 256)
-                        rhs = (
-                            main_bf16_ref[i, ks, ns] if pv else main_bf16_ref[i, ns, ks]
-                        )
+                        if not pv:
+                            rhs, lhs = main_bf16_ref[i, ns, ks], q_ref[i, :, ks]
+                        elif k < 2:
+                            rhs, lhs = main_bf16_ref[i, ks, ns], main_p_ref[i, :, ks]
+                        else:
+                            rhs, lhs = swa_shared_ref[:, ns], swa_p_ref[i]
                         pltpu.matmul_push_rhs(
                             rhs, staging_register=0, mxu_index=mxu, transpose=not pv
                         )
-                        lhs = main_p_ref[i, :, ks] if pv else q_ref[i, :, ks]
                         lhs = jnp.pad(lhs, ((0, mxu_heads - num_heads), (0, 0)))
                         pltpu.matmul_acc_lhs(
                             accumulator(mxu, addr), lhs, load_staged_rhs=0
@@ -516,7 +587,14 @@ def main_kernel(
                 if interpret:
                     lhs = main_p_ref[i] if pv else q_ref[i]
                     rhs = main_bf16_ref[i] if pv else main_bf16_ref[i].T
-                    return jnp.dot(lhs, rhs, preferred_element_type=jnp.float32)
+                    result = jnp.dot(lhs, rhs, preferred_element_type=jnp.float32)
+                    if pv:
+                        result += jnp.dot(
+                            swa_p_ref[i],
+                            swa_shared_ref[...],
+                            preferred_element_type=jnp.float32,
+                        )
+                    return result
                 return jnp.concatenate(
                     tuple(
                         pltpu.matmul_pop(accumulator(mxu, addr))[:num_heads]
@@ -534,7 +612,8 @@ def main_kernel(
                     dequant(i + 1)
                 if not interpret and has_next:
                     csa_launch(i + 1, mrb_stride - addr, pv=False)
-                main_logits = csa_pop(i, addr, pv=False) * scale
+                row_scale = main_scale_ref[i, 0, :][None, :]
+                main_logits = csa_pop(i, addr, pv=False) * (row_scale * scale)
                 main_count = main_lengths_ref[t0 + i]
                 main_logits = jnp.where(
                     jnp.arange(512)[None, :] < main_count, main_logits, -jnp.inf
@@ -564,225 +643,185 @@ def main_kernel(
                 )
                 # Keep both branches in one FP32 softmax tile; round only P.
                 logits = jnp.concatenate((main_logits, swa_logits), axis=1)
-                maximum = jnp.maximum(sink, jnp.max(logits, axis=1, keepdims=True))
+                # Any shift within the FP32 exp range of the row maximum gives
+                # the same normalized result; a BF16 lane reduction suffices.
+                folded = logits[:, :128]
+                for lane in range(128, logits.shape[1], 128):
+                    folded = jnp.maximum(folded, logits[:, lane : lane + 128])
+                maximum = jnp.maximum(
+                    sink,
+                    jnp.max(folded.astype(jnp.bfloat16), axis=1, keepdims=True).astype(
+                        jnp.float32
+                    ),
+                )
                 exponentials = jnp.exp(logits - maximum)
                 denominator = jnp.exp(sink - maximum) + jnp.sum(
                     exponentials, axis=1, keepdims=True
                 )
-                probabilities = (exponentials / denominator).astype(jnp.bfloat16)
-                main_p_ref[i] = probabilities[:, :512]
-                swa_p_ref[i] = probabilities[:, 512:]
+                probabilities = exponentials / denominator
+                # P carries the per-row KV scale into the unscaled BF16 V.
+                main_p_ref[i] = (probabilities[:, :512] * row_scale).astype(
+                    jnp.bfloat16
+                )
+                swa_p_ref[i] = probabilities[:, 512:].astype(jnp.bfloat16)
 
-            # Each 256-wide FP32 MRB has 256 addresses, four rows per address.
-            if 10 * mrb_stride <= 256:
-
-                def launch_tile(first, slot, *, size=2, has_next=True):
-                    for row in range(size):
-                        softmax(
-                            first + row,
-                            row * mrb_stride,
-                            has_next=row + 1 < size or has_next,
-                        )
-                        if not interpret:
-                            csa_launch(
-                                first + row, (2 + 2 * slot + row) * mrb_stride, pv=True
-                            )
+            def launch_tile(first, slot, *, size=2, has_next=True):
+                for row in range(size):
+                    softmax(
+                        first + row,
+                        row * mrb_stride,
+                        has_next=row + 1 < size or has_next,
+                    )
                     if not interpret:
+                        csa_launch(
+                            first + row, (2 + 2 * slot + row) * mrb_stride, pv=True
+                        )
+
+            def finish_output(i, address, *, dma=True):
+                output = csa_pop(i, address, pv=True)
+                tail = output[:, 384:]
+                partner = jnp.where(
+                    (jnp.arange(128) % 2 == 0)[None, :],
+                    pltpu.roll(tail, 127, axis=1),
+                    pltpu.roll(tail, 1, axis=1),
+                )
+                rotated = (
+                    tail * rope_ref[i, 0][None, :] + partner * rope_ref[i, 1][None, :]
+                )
+                output_ref[i, :, :384] = output[:, :384].astype(jnp.bfloat16)
+                output_ref[i, :, 384:] = rotated.astype(jnp.bfloat16)
+                if dma:
+                    pltpu.make_async_copy(
+                        output_ref.at[i],
+                        output_hbm_ref.at[t0 + i],
+                        dma_sem.at[output_sem + i],
+                    ).start()
+
+            def finish_tile(first, slot, *, size=2):
+                for row in range(size):
+                    finish_output(first + row, (2 + 2 * slot + row) * mrb_stride)
+
+            def advance_tile(first, slot, *, size=2, has_next=True):
+                launch_tile(first, slot, size=size, has_next=has_next)
+                finish_tile(first - 2, 1 - slot)
+
+            @pl.when(count == 1)
+            def one():
+                launch_tile(0, 0, size=1, has_next=False)
+                finish_tile(0, 0, size=1)
+
+            @pl.when(count == 2)
+            def two():
+                launch_tile(0, 0, has_next=False)
+                finish_tile(0, 0)
+
+            if interleave:
+                # Full groups: k Qs per step. Their softmax chains are
+                # independent, so reduction latency of one overlaps the other's
+                # VPU/EUP work. QK runs one step ahead in slots k*(step%2)+r;
+                # PV uses 2k+k*(step%2)+r and finishes one step behind. Static
+                # indices expose the disjoint per-Q VMEM slots to the scheduler.
+                k = interleave
+                steps = bq // k
+                pv_base = k * min(steps, 2)
+
+                @pl.when(count == bq)
+                def full_group():
+                    for r in range(1, k):
+                        dequant(r)
+                        csa_launch(r, r * mrb_stride, pv=False)
+                    for step in range(steps):
+                        base = k * step
+                        if step + 1 < steps:
+                            for r in range(k):
+                                dequant(base + k + r)
+                            for r in range(k):
+                                csa_launch(
+                                    base + k + r,
+                                    (k * ((step + 1) % 2) + r) * mrb_stride,
+                                    pv=False,
+                                )
+                        for r in range(k):
+                            softmax(
+                                base + r,
+                                (k * (step % 2) + r) * mrb_stride,
+                                has_next=False,
+                            )
+                        for r in range(k):
+                            csa_launch(
+                                base + r,
+                                (pv_base + k * (step % 2) + r) * mrb_stride,
+                                pv=True,
+                                csa_only=True,
+                            )
+                        # The step's Qs share one SWA RHS load per MXU; each
+                        # accumulates into its own PV.
                         for mxu in range(2):
                             pltpu.matmul_push_rhs(
                                 swa_shared_ref[:, pl.ds(mxu * 256, 256)],
                                 staging_register=0,
                                 mxu_index=mxu,
                             )
-                            for row in range(size):
-                                lhs = jnp.pad(
-                                    swa_p_ref[first + row],
-                                    ((0, mxu_heads - num_heads), (0, 0)),
-                                )
+                            for r in range(k):
                                 pltpu.matmul_acc_lhs(
-                                    accumulator(mxu, (6 + 2 * slot + row) * mrb_stride),
-                                    lhs,
-                                    load_staged_rhs=0 if row == 0 else None,
+                                    accumulator(
+                                        mxu,
+                                        (pv_base + k * (step % 2) + r) * mrb_stride,
+                                    ),
+                                    jnp.pad(
+                                        swa_p_ref[base + r],
+                                        ((0, mxu_heads - num_heads), (0, 0)),
+                                    ),
+                                    load_staged_rhs=0 if r == 0 else None,
                                 )
-
-                def finish_tile_output(i, slot, row):
-                    main_output = csa_pop(i, (2 + 2 * slot + row) * mrb_stride, pv=True)
-                    if interpret:
-                        swa_output = jnp.dot(
-                            swa_p_ref[i],
-                            swa_shared_ref[...],
-                            preferred_element_type=jnp.float32,
+                        if step:
+                            for r in range(k):
+                                finish_output(
+                                    base - k + r,
+                                    (pv_base + k * ((step - 1) % 2) + r) * mrb_stride,
+                                    dma=False,
+                                )
+                    for r in range(k):
+                        finish_output(
+                            bq - k + r,
+                            (pv_base + k * ((steps - 1) % 2) + r) * mrb_stride,
+                            dma=False,
                         )
-                    else:
-                        swa_output = jnp.concatenate(
-                            tuple(
-                                pltpu.matmul_pop(
-                                    accumulator(mxu, (6 + 2 * slot + row) * mrb_stride)
-                                )[:num_heads]
-                                for mxu in range(2)
-                            ),
-                            axis=1,
-                        )
-                    output = main_output + swa_output
-                    tail = output[:, 384:]
-                    partner = jnp.where(
-                        (jnp.arange(128) % 2 == 0)[None, :],
-                        pltpu.roll(tail, 127, axis=1),
-                        pltpu.roll(tail, 1, axis=1),
-                    )
-                    rotated = (
-                        tail * rope_ref[i, 0][None, :]
-                        + partner * rope_ref[i, 1][None, :]
-                    )
-                    output_ref[i, :, :384] = output[:, :384].astype(jnp.bfloat16)
-                    output_ref[i, :, 384:] = rotated.astype(jnp.bfloat16)
                     pltpu.make_async_copy(
-                        output_ref.at[i],
-                        output_hbm_ref.at[t0 + i],
-                        dma_sem.at[2 + 8 * bq + i],
+                        output_ref,
+                        output_hbm_ref.at[pl.ds(t0, bq)],
+                        dma_sem.at[output_sem],
                     ).start()
 
-                def finish_tile(first, slot, *, size=2):
-                    for row in range(size):
-                        finish_tile_output(first + row, slot, row)
+            @pl.when((count > 2) & ((count != bq) if interleave else True))
+            def tiled_pipeline():
+                full_tiles = (count - 1) // 2
+                launch_tile(0, 0)
 
-                def advance_tile(first, slot, *, size=2, has_next=True):
-                    launch_tile(first, slot, size=size, has_next=has_next)
-                    finish_tile(first - 2, 1 - slot)
+                @pl.loop(0, (full_tiles - 1) // 2)
+                def tile_pairs(pair):
+                    advance_tile(4 * pair + 2, 1)
+                    advance_tile(4 * pair + 4, 0)
 
-                @pl.when(count == 1)
-                def one():
-                    launch_tile(0, 0, size=1, has_next=False)
-                    finish_tile(0, 0, size=1)
-
-                @pl.when(count == 2)
-                def two():
-                    launch_tile(0, 0, has_next=False)
-                    finish_tile(0, 0)
-
-                @pl.when(count > 2)
-                def tiled_pipeline():
-                    full_tiles = (count - 1) // 2
-                    launch_tile(0, 0)
-
-                    @pl.loop(0, (full_tiles - 1) // 2)
-                    def tile_pairs(pair):
-                        advance_tile(4 * pair + 2, 1)
-                        advance_tile(4 * pair + 4, 0)
-
-                    def tail(slot):
-                        @pl.when(count % 2 == 0)
-                        def even():
-                            advance_tile(2 * full_tiles, slot, has_next=False)
-                            finish_tile(2 * full_tiles, slot)
-
-                        @pl.when(count % 2 != 0)
-                        def odd():
-                            advance_tile(2 * full_tiles, slot, size=1, has_next=False)
-                            finish_tile(2 * full_tiles, slot, size=1)
-
-                    @pl.when(full_tiles % 2 == 0)
-                    def even_full():
-                        advance_tile(2 * (full_tiles - 1), 1)
-                        tail(0)
-
-                    @pl.when(full_tiles % 2 != 0)
-                    def odd_full():
-                        tail(1)
-
-            else:
-
-                def pv_launch(i, slot):
-                    if interpret:
-                        return
-                    # Keep QK, CSA PV and SWA PV in disjoint MRB ranges. Each side
-                    # owns N=256, so H<=128 needs at most 6*32 of 256 addresses.
-                    csa_launch(i, (2 + slot) * mrb_stride, pv=True)
-                    for mxu in range(2):
-                        pltpu.matmul_push_rhs(
-                            swa_shared_ref[:, pl.ds(mxu * 256, 256)],
-                            staging_register=0,
-                            mxu_index=mxu,
-                        )
-                        lhs = jnp.pad(
-                            swa_p_ref[i], ((0, mxu_heads - num_heads), (0, 0))
-                        )
-                        pltpu.matmul_acc_lhs(
-                            accumulator(mxu, (4 + slot) * mrb_stride),
-                            lhs,
-                            load_staged_rhs=0,
-                        )
-
-                def finish_output(i, slot):
-                    main_output = csa_pop(i, (2 + slot) * mrb_stride, pv=True)
-                    if interpret:
-                        swa_output = jnp.dot(
-                            swa_p_ref[i],
-                            swa_shared_ref[...],
-                            preferred_element_type=jnp.float32,
-                        )
-                    else:
-                        swa_output = jnp.concatenate(
-                            tuple(
-                                pltpu.matmul_pop(
-                                    accumulator(mxu, (4 + slot) * mrb_stride)
-                                )[:num_heads]
-                                for mxu in range(2)
-                            ),
-                            axis=1,
-                        )
-                    output = main_output + swa_output
-                    tail = output[:, 384:]
-                    partner = jnp.where(
-                        (jnp.arange(128) % 2 == 0)[None, :],
-                        pltpu.roll(tail, 127, axis=1),
-                        pltpu.roll(tail, 1, axis=1),
-                    )
-                    rotated = (
-                        tail * rope_ref[i, 0][None, :]
-                        + partner * rope_ref[i, 1][None, :]
-                    )
-                    output_ref[i, :, :384] = output[:, :384].astype(jnp.bfloat16)
-                    output_ref[i, :, 384:] = rotated.astype(jnp.bfloat16)
-                    pltpu.make_async_copy(
-                        output_ref.at[i],
-                        output_hbm_ref.at[t0 + i],
-                        dma_sem.at[2 + 8 * bq + i],
-                    ).start()
-
-                def advance(i, slot, *, has_next=True):
-                    softmax(i, slot * mrb_stride, has_next=has_next)
-                    pv_launch(i, slot)
-                    # The previous P@V remains in its own MRB while the current Q
-                    # runs softmax. Output DMA uses a distinct per-Q buffer.
-                    finish_output(i - 1, 1 - slot)
-
-                @pl.when(count == 1)
-                def single_query():
-                    softmax(0, 0, has_next=False)
-                    pv_launch(0, 0)
-                    finish_output(0, 0)
-
-                @pl.when(count > 1)
-                def query_pipeline():
-                    softmax(0, 0)
-                    pv_launch(0, 0)
-
-                    @pl.loop(0, (count - 2) // 2)
-                    def pairs(pair):
-                        advance(2 * pair + 1, 1)
-                        advance(2 * pair + 2, 0)
-
+                def tail(slot):
                     @pl.when(count % 2 == 0)
-                    def even_tail():
-                        advance(count - 1, 1, has_next=False)
-                        finish_output(count - 1, 1)
+                    def even():
+                        advance_tile(2 * full_tiles, slot, has_next=False)
+                        finish_tile(2 * full_tiles, slot)
 
                     @pl.when(count % 2 != 0)
-                    def odd_tail():
-                        advance(count - 2, 1)
-                        advance(count - 1, 0, has_next=False)
-                        finish_output(count - 1, 0)
+                    def odd():
+                        advance_tile(2 * full_tiles, slot, size=1, has_next=False)
+                        finish_tile(2 * full_tiles, slot, size=1)
+
+                @pl.when(full_tiles % 2 == 0)
+                def even_full():
+                    advance_tile(2 * (full_tiles - 1), 1)
+                    tail(0)
+
+                @pl.when(full_tiles % 2 != 0)
+                def odd_full():
+                    tail(1)
 
         if interpret:
             compute_main()
@@ -796,24 +835,23 @@ def main_kernel(
                 ),
             )
 
-        @pl.loop(0, count)
-        def wait_output(i):
-            pltpu.make_async_copy(
-                output_ref.at[i], output_hbm_ref.at[t0 + i], dma_sem.at[2 + 8 * bq + i]
-            ).wait()
+        # The previous group's writes overlapped this group's compute.
+        drain_outputs(previous_t0, previous_count, 1 - bank)
 
         @pl.when((next_request != request_index) & (swa_prefetched_id[0] >= 0))
         def drain_request_prefetch():
             wait_block_dma(swa_prefetched_id[0])
             swa_prefetched_id[0] = -1
 
-        return next_request, next_t0, 1 - bank
+        return next_request, next_t0, 1 - bank, t0, count
 
-    lax.while_loop(
+    final = lax.while_loop(
         lambda state: state[0] < request_limit,
         process_group,
-        (first_request, first_t0, jnp.int32(0)),
+        (first_request, first_t0, jnp.int32(0), jnp.int32(0), jnp.int32(0)),
     )
+    drain_outputs(final[3], final[4], 1 - final[2])
+    output_ref = output_buffers.at[0]
 
     def clear_padding():
         end = starts_ref[request_limit]
@@ -1068,12 +1106,12 @@ def csa2(
                 pltpu.VMEM((bq, num_heads, shared_window_size), jnp.float32),
                 pltpu.VMEM((bq, num_heads, 512), jnp.bfloat16),
                 pltpu.VMEM((bq, num_heads, shared_window_size), jnp.bfloat16),
-                pltpu.VMEM((bq, num_heads, 512), jnp.bfloat16),
+                pltpu.VMEM((2, bq, num_heads, 512), jnp.bfloat16),
                 pltpu.VMEM(
                     (2, 2, 128, 128) if swa_word_pages else (2, 128, 512),
                     jnp.int32 if swa_word_pages else jnp.bfloat16,
                 ),
-                pltpu.SemaphoreType.DMA((4 + 9 * bq,)),
+                pltpu.SemaphoreType.DMA((4 + 10 * bq,)),
             ),
         ),
         compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
