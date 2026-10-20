@@ -1270,9 +1270,13 @@ class TPUModelRunner(GPUModelRunner):
     def _init_speculative_decoding(self) -> None:
         self.drafter = None
         self.rejection_sampler = None
-        # DeepSeek-V4's attention and indexer ops give verify windows of
-        # exactly 1 + K tokens a static query-length pass over the request
-        # distribution's middle segment (see _reorder_batch_for_rpa).
+        # The request distribution's middle segment means what the attention
+        # op reading it says: DeepSeek-V4's attention and indexer ops take it
+        # as verify windows of exactly 1 + K tokens and score them in one
+        # static query-length pass, while the ragged-paged-attention kernels
+        # read it as the prefill-only bucket. So only models whose ops
+        # implement that pass get a static verify length
+        # (see _reorder_batch_for_rpa and _build_attention_metadata).
         hf_config = getattr(getattr(self, "model_config", None), "hf_config", None)
         self._static_verify_q_len: int | None = (
             self.speculative_config.num_speculative_tokens + 1
@@ -1539,8 +1543,8 @@ class TPUModelRunner(GPUModelRunner):
         attention keeps its 1-token decode front segment, while the GDN
         kernel's windowed mode covers the first two segments contiguously
         (see `AttentionMetadata.mamba_request_distribution`). With a static
-        verify length (DeepSeek-V4), the windows of exactly that length lead
-        the verify segment and `_num_static_verify_reqs` counts them.
+        verify length, the windows of exactly that length lead the verify
+        segment and `_num_static_verify_reqs` counts them.
 
         Returns:
             (num_decode, num_windowed): the number of 1-token decode requests
@@ -3293,7 +3297,8 @@ class TPUModelRunner(GPUModelRunner):
             # mixed mode.
             chunk_num_decode = max(0, min(rpa_num_decode_reqs - start_index, num_reqs))
             # [decode_end, static-q verify end, mixed_end]; the middle
-            # segment is empty unless DeepSeek-V4 verify windows are present.
+            # segment is empty unless static-q verify windows are present
+            # (see _init_speculative_decoding).
             chunk_static_verify_end = max(
                 chunk_num_decode,
                 min(
