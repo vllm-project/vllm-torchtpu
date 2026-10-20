@@ -154,6 +154,11 @@ PATCHES = (
         "vllm_torchtpu.models.vllm.qwen3_next_patch:maybe_patch_qwen3_next",
         ("platform_activation", "model_load"),
     ),
+    Patch(
+        "vllm_torchtpu.models.vllm.qwen3_5_patch:maybe_patch_qwen3_5_attn_moe_overlap",
+        ("platform_activation", "model_load"),
+        model_config=True,
+    ),
 )
 
 _applied: set[str] = set()
