@@ -23,12 +23,11 @@
 # arguments are passed through, so `--update-baseline` regenerates it.
 #
 # Outside a container the script reruns itself inside the nightly build of
-# the image Buildkite uses (the Dockerfile's `dev` target), because other local
-# package versions report different errors. It pulls the nightly on every run
-# so the check never uses a stale one; the pull downloads only when a newer
-# build exists, and removes the copy it replaces unless something else still
-# uses it. That needs Docker and
-# `gcloud auth configure-docker us-central1-docker.pkg.dev`. Set
+# the image Buildkite uses (the Dockerfile's `dev` target, published to Docker
+# Hub as `vllm/vllm-torchtpu:nightly`), because other local package versions
+# report different errors. It pulls the nightly on every run so the check never
+# uses a stale one; the pull downloads only when a newer build exists, and
+# removes the copy it replaces unless something else still uses it. Set
 # TYPECHECK_IMAGE to check against a different image; it is pulled only when
 # it is not present locally. Set TYPECHECK_IN_PLACE=1 to skip Docker in an
 # environment that already has the CI image's packages.
@@ -41,14 +40,12 @@ if [[ -z "${TYPECHECK_IN_PLACE:-}" && ! -f /.dockerenv && ! -f /run/.containeren
     echo "tools/typecheck_full.sh runs in the CI image and needs Docker." >&2
     exit 1
   fi
-  nightly="us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu/vllm-torchtpu-dev:latest"
+  nightly="vllm/vllm-torchtpu:nightly"
   image="${TYPECHECK_IMAGE:-${nightly}}"
   old_id="$(docker image inspect --format '{{.Id}}' "${image}" 2>/dev/null || true)"
   if [[ "${image}" == "${nightly}" || -z "${old_id}" ]]; then
     if ! docker pull --platform linux/amd64 "${image}" >&2; then
-      echo "Could not pull ${image}. For an authentication error, run:" \
-        "gcloud auth configure-docker us-central1-docker.pkg.dev." \
-        "Without access to the registry, build the image locally:" \
+      echo "Could not pull ${image}. To build the image locally instead," \
         "see docs/developers_guide/type_checking.md." >&2
       exit 1
     fi

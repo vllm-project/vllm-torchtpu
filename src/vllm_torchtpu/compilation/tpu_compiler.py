@@ -161,6 +161,13 @@ def _deserialize_entry(entry: Any) -> Callable[..., Any]:
         deserialize_bundled_cache_entry,
     )
 
+    # `deserialize_bundled_cache_entry` deep-copies `entry` so the runnable can
+    # be serialized again. `CompiledArtifact` has no `__deepcopy__`, so the copy
+    # goes through `__reduce__` and loads a second PJRT executable per graph.
+    # vllm-torchtpu never re-serializes a replayed runnable, so return `entry`
+    # itself from `__deepcopy__` and reuse the loaded executable.
+    with contextlib.suppress(AttributeError, TypeError):
+        entry.__deepcopy__ = lambda _memo: entry
     return deserialize_bundled_cache_entry(entry)
 
 

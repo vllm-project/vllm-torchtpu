@@ -12,7 +12,7 @@ Choose your preferred installation method below:
   <div class="cg-row">
     <div class="cg-label">1. Installation Method</div>
     <div class="cg-options">
-      <button type="button" class="cg-btn active" data-group="method" data-val="uv_pip" aria-pressed="true">uv sync (Recommended)</button>
+      <button type="button" class="cg-btn active" data-group="method" data-val="uv_pip" aria-pressed="true">PyPI Wheel (Recommended)</button>
       <button type="button" class="cg-btn" data-group="method" data-val="source" aria-pressed="false">Editable Source Install</button>
       <button type="button" class="cg-btn" data-group="method" data-val="docker" aria-pressed="false">Docker Container</button>
     </div>
@@ -20,8 +20,8 @@ Choose your preferred installation method below:
   <div class="cg-row" id="docker-image-group" style="display: none;">
     <div class="cg-label">2. Container Type</div>
     <div class="cg-options">
-      <button type="button" class="cg-btn active" data-group="docker_img" data-val="latest" aria-pressed="true">Base TPU Dev Image</button>
-      <button type="button" class="cg-btn" data-group="docker_img" data-val="nightly" aria-pressed="false">Build from Dockerfile</button>
+      <button type="button" class="cg-btn active" data-group="docker_img" data-val="latest" aria-pressed="true">Release Image (:latest)</button>
+      <button type="button" class="cg-btn" data-group="docker_img" data-val="nightly" aria-pressed="false">Nightly Image (:nightly)</button>
     </div>
   </div>
   <div class="cg-output-container">
@@ -71,9 +71,9 @@ Choose your preferred installation method below:
 
 ---
 
-## Option 1: Install from PyPI (`vllm-torchtpu`)
+## Option 1: Install from PyPI ([`vllm-torchtpu`](https://pypi.org/project/vllm-torchtpu/))
 
-For standard usage without modifying source code, install the pre-built `vllm-torchtpu` package directly from PyPI (this automatically installs both `vllm` and `vllm-torchtpu-core`):
+For standard usage without modifying source code, install the pre-built [`vllm-torchtpu`](https://pypi.org/project/vllm-torchtpu/) package directly from PyPI (this automatically installs both `vllm` and [`vllm-torchtpu-core`](https://pypi.org/project/vllm-torchtpu-core/)):
 
 ### Using `uv` (Recommended)
 

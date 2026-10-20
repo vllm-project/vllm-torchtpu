@@ -29,13 +29,15 @@ bash tools/typecheck_full.sh
 ```
 
 Other package versions report different errors, so `tools/typecheck_full.sh`
-reruns itself inside the nightly `vllm-torchtpu-dev` image when started outside
-a container. It needs Docker, read access to the image's Artifact Registry
-project (`cloud-ullm-inference-ci-cd`) and a one-time
-`gcloud auth configure-docker us-central1-docker.pkg.dev`, but no TPU.
+reruns itself inside the nightly [`vllm/vllm-torchtpu:nightly`](https://hub.docker.com/r/vllm/vllm-torchtpu/tags)
+image (built from the `--target dev` stage, which includes `--group test`
+dependencies; do not use `:latest`, which is built from `--target prod` without
+test dependencies) when started outside a container. It needs Docker, but no
+TPU.
 
-Without access to that registry, build the same image locally and point the
-script at it:
+To check against a locally built image instead (for example, when your PR
+changes dependencies), build the `dev` target locally and point the script at
+it:
 
 ```bash
 ./docker/build_image.sh --target dev -t vllm-torchtpu-dev-local
@@ -58,12 +60,12 @@ it:
 - Dependencies without a pinned version can resolve to a newer release in a
   later build.
 
-If Buildkite's check fails but the local run passes, rerun locally in the
-exact image Buildkite used. The ":docker: Build and Push CI Image" step
-prints its tag:
+If Buildkite's check fails but the local run passes, build the `dev` image
+locally from your branch or point `TYPECHECK_IMAGE` at a specific nightly tag
+from [Docker Hub](https://hub.docker.com/r/vllm/vllm-torchtpu/tags):
 
 ```bash
-TYPECHECK_IMAGE=us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu:<commit>-<vllm-ref> \
+TYPECHECK_IMAGE=vllm/vllm-torchtpu:nightly-<YYYYMMDD>-<commit>-<vllm-ref> \
   bash tools/typecheck_full.sh
 ```
 

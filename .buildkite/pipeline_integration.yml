@@ -132,6 +132,21 @@ steps:
         commands:
           - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_qwen35_block_major_disagg_offload.sh
 
+      # Nightly only: pipeline parallelism behind a P/D boot that dominates
+      # the step.
+      - label: "Integration: Nightly qwen35-pp4-disagg-offload"
+        key: "integration_nightly_qwen35_pp4_disagg_offload"
+        if: 'build.env("NIGHTLY") == "1"'
+        env:
+          SHAPE: *shape_8_core
+          TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: "1"
+          RUN_ROOT: "perf_eval_results/qwen35_pp4_disagg_offload_ci"
+        <<: *integration_step
+        plugins:
+          - *kube_plugin
+        commands:
+          - .buildkite/kubernetes/run.sh bash ./scripts/vllm/integration/run_qwen35_pp_disagg_offload.sh
+
       - label: "Integration: compilation-cache-e2e"
         key: "integration_compilation_cache_e2e"
         env:
