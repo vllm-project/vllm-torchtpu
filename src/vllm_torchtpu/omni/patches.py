@@ -34,7 +34,7 @@ def _optimization_barrier_op() -> Any:
 
 @run_once
 def apply_omni_tpu_patches() -> None:
-    """Extend async output timeout and patch TPU unsupported ops."""
+    """Extend the async output timeout for TPU compilation and execution."""
 
     # -------------------------------------------------------------------------
     # Upstream torch_tpu Root Cause Tracking:
@@ -60,46 +60,19 @@ def apply_omni_tpu_patches() -> None:
     os.environ.setdefault("VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT", "1800.0")
     logger.info("Applied TPU patch: extended VLLM_OMNI_ASYNC_OUTPUT_TIMEOUT to 1800s.")
 
-    # -------------------------------------------------------------------------
-    # Upstream torch_tpu Root Cause Tracking:
-    # Missing aten::upsample_linear1d.out operator in torch_tpu.
-    # Calling torch.nn.functional.interpolate(..., mode="linear") on 3D tensors
-    # fails with:
-    #   RuntimeError: operator 'aten::upsample_linear1d.out' is not implemented for TPU
-    # Used in temporal/audio diffusion alignment (Wan 2.2 S2V, LongCat, audio vocoders).
-    #
-    # UPSTREAM STATUS & REMOVAL CONDITION:
-    # Fixed upstream in torch_tpu commit a0b184ed27d
-    # ("Implement aten::upsample_linear1d.out", Sep 14, 2026). This CPU fallback patch
-    # can be deleted once vllm-torchtpu bumps to a torch_tpu development wheel
-    # >= 0.1.1.dev20260914 containing that commit.
-    # -------------------------------------------------------------------------
-    orig_interpolate = torch.nn.functional.interpolate
-
-    def _safe_interpolate(
-        input: torch.Tensor,
-        size: Any = None,
-        scale_factor: Any = None,
-        mode: str = "nearest",
-        *args: Any,
-        **kwargs: Any,
-    ) -> torch.Tensor:
-        if input.device.type == "tpu" and mode == "linear":
-            return orig_interpolate(
-                input.cpu(), size, scale_factor, mode, *args, **kwargs
-            ).to(input.device)
-        return orig_interpolate(input, size, scale_factor, mode, *args, **kwargs)
-
-    torch.nn.functional.interpolate = _safe_interpolate
-    logger.info(
-        "Applied TPU patch: safe torch.nn.functional.interpolate for 1D linear TPU ops."
-    )
-
 
 @run_once
 def apply_omni_model_specific_patches() -> None:
     """Apply model-specific runtime patches."""
+    _patch_diffusion_ipc_cpu_pack()
+    _patch_qwen_image_rope_txt_freqs_clone()
+    _patch_wan_pair_swap_rope()
+    _patch_wan_ffn_gelu_fence()
+    _patch_diffusion_startup_warmup_sync()
+    _patch_wan_fused_qk_norm_rope()
 
+
+def _patch_diffusion_ipc_cpu_pack() -> None:
     # -------------------------------------------------------------------------
     # Upstream torch_tpu Root Cause Tracking:
     # 1. Pickling a device tensor aborts process: In torch_tpu, calling
@@ -121,50 +94,11 @@ def apply_omni_model_specific_patches() -> None:
 
     orig_pack_tensor = ipc._pack_tensor_if_large
 
-    def _safe_pack_tensor_if_large(
-        val: torch.Tensor,
-        d2h_stream: Any = None,
-    ) -> Any:
-        return orig_pack_tensor(val.cpu(), d2h_stream=d2h_stream)
+    def _safe_pack_tensor_if_large(val: torch.Tensor, *args: Any, **kwargs: Any) -> Any:
+        return orig_pack_tensor(val.cpu(), *args, **kwargs)
 
     ipc._pack_tensor_if_large = _safe_pack_tensor_if_large
     logger.info("Applied TPU patch: safe CPU serialization for diffusion IPC tensors.")
-
-    # -------------------------------------------------------------------------
-    # Upstream torch_tpu Root Cause Tracking:
-    # In LTX-2, LTXRuntime._decode_output produces a (video, audio) tuple. Audio
-    # tensors are sub-threshold (<1MB) and returned directly in the output object,
-    # bypassing SHM packing. If audio remains on TPU, unpickling in the orchestrator
-    # triggers PJRT re-initialization and /tmp/libtpu_lockfile collision, while
-    # pickling in the worker risks tensor_to_buffer.cc ABSL_CHECK aborts.
-    # Moving video and audio to CPU prevents device tensors entering the IPC stream.
-    #
-    # REMOVAL / FIX CONDITION:
-    # Can be removed once torch_tpu provides safe cross-process device tensor
-    # serialization, or once vllm_omni universally ensures all diffusion output
-    # payloads are moved to host CPU before IPC serialization.
-    # -------------------------------------------------------------------------
-    from vllm_omni.diffusion.models.ltx2 import ltx2_runtime
-
-    orig_decode_output = ltx2_runtime.LTXRuntime._decode_output
-
-    def _safe_decode_output(self: Any, *args: Any, **kwargs: Any):
-        res = orig_decode_output(self, *args, **kwargs)
-        video, audio = res.output
-        res.output = (
-            video.cpu() if isinstance(video, torch.Tensor) else video,
-            audio.cpu() if isinstance(audio, torch.Tensor) else audio,
-        )
-        return res
-
-    ltx2_runtime.LTXRuntime._decode_output = _safe_decode_output
-    logger.info("Applied TPU patch: safe LTX-2 CPU decode output.")
-
-    _patch_qwen_image_rope_txt_freqs_clone()
-    _patch_wan_pair_swap_rope()
-    _patch_wan_ffn_gelu_fence()
-    _patch_diffusion_startup_warmup_sync()
-    _patch_wan_fused_qk_norm_rope()
 
 
 def _patch_qwen_image_rope_txt_freqs_clone() -> None:
