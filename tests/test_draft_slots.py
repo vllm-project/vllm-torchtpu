@@ -11,7 +11,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import contextlib
 import inspect
+from types import SimpleNamespace
+from unittest import mock
 
 import pytest
 import torch
@@ -36,6 +39,8 @@ from vllm.v1.request import Request
 from vllm.v1.structured_output import StructuredOutputManager
 
 from vllm_torchtpu.core import draft_slots
+from vllm_torchtpu.platforms.tpu_platform import _get_token_paddings
+from vllm_torchtpu.spec_decode.dflash import DFlashProposer
 
 K = 6
 BLOCK_SIZE = 16
@@ -155,6 +160,58 @@ def test_tpu_block_drafter_slots_go_to_prefill(install_patch, method, expected_p
     scheduler.add_request(Request("prefill", list(range(96)), params, None))
 
     assert scheduler.schedule().num_scheduled_tokens == {"prefill": expected_prefill}
+
+
+def test_uncharged_draft_stays_in_precompiled_buckets(install_patch):
+    """Without the charge a step's draft outgrows the token budget.
+
+    Each scheduled request drafts a full block however few tokens it was
+    scheduled, so short requests plus one cut off by the budget draft more
+    tokens than max_num_batched_tokens. DFlash must still pad that draft to a
+    bucket precompile warmed.
+    """
+    install_patch()
+    budget = 40
+    scheduler = build_scheduler(max_num_batched_tokens=budget)
+    spec = spec_config("dflash", True)
+    scheduler.vllm_config.speculative_config = spec
+    params = SamplingParams(max_tokens=8, ignore_eos=True)
+    params.update_from_generation_config({}, 2)
+    for i in range(6):
+        scheduler.add_request(Request(f"short{i}", list(range(5)), params, None))
+    scheduler.add_request(Request("long", list(range(96)), params, None))
+
+    scheduled = scheduler.schedule().num_scheduled_tokens
+    # The budget ends partway through "long".
+    assert scheduled["long"] == budget - 6 * 5
+    block_size = K + 1
+    draft_tokens = len(scheduled) * block_size
+    assert draft_tokens > budget
+
+    max_num_seqs = scheduler.vllm_config.scheduler_config.max_num_seqs
+    proposer = object.__new__(DFlashProposer)
+    proposer.speculative_config = spec
+    proposer.draft_model = object()
+    proposer.runner = SimpleNamespace(
+        num_tokens_paddings=_get_token_paddings(16, budget),
+        num_reqs_max_model_len=max_num_seqs,
+        num_reqs_most_model_len=None,
+        most_model_len=None,
+        max_num_blocks_per_req=4,
+        _precompile_timed=lambda _: contextlib.nullcontext(),
+    )
+    proposer._dummy_precompute_and_update_kv_cache = mock.MagicMock()
+    proposer._dummy_draft_forward = mock.MagicMock()
+    assert proposer.block_size == block_size
+
+    proposer.precompile()
+
+    warmed = {
+        call.kwargs["num_tokens"]
+        for call in proposer._dummy_draft_forward.call_args_list
+    }
+    assert draft_tokens > max(proposer.runner.num_tokens_paddings)
+    assert proposer._get_padded_len(draft_tokens) in warmed
 
 
 def test_patch_installs_once(install_patch):

@@ -5245,8 +5245,16 @@ class TPUModelRunner(GPUModelRunner):
             for module in self.model.modules()
         )
         if envs.TPU_MOE_SKIP_PADDED_TOKENS or uses_mxfp4_moe:
+            max_padded_tokens = self.max_num_tokens
+            if isinstance(self.drafter, DFlashProposer):
+                # A DFlash draft forward can outgrow the largest target
+                # bucket (DFlashProposer._draft_token_paddings); it never
+                # exceeds a block per request.
+                max_padded_tokens = max(
+                    max_padded_tokens, self.max_num_reqs * self.drafter.block_size
+                )
             self._token_padding_state = token_padding.TokenPaddingState.create(
-                self.max_num_tokens, self.device
+                max_padded_tokens, self.device
             )
             token_padding.set_padding_state(self._token_padding_state)
 

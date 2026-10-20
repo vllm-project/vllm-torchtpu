@@ -127,7 +127,10 @@ def test_propose_empty_batch():
     assert proposer.propose([], [], None, None) == []
 
 
-def test_precompile_skips_sub_block_draft_forward():
+def _make_precompile_proposer(
+    num_tokens_paddings: list[int], num_reqs_max_model_len: int
+) -> DFlashProposer:
+    """A K=7 (block_size 8) proposer whose precompile records the shapes."""
     proposer = _make_proposer(draft_tp=8, target_tp=8)
     proposer.speculative_config.num_speculative_tokens = 7
     proposer.draft_model = SimpleNamespace(
@@ -137,11 +140,11 @@ def test_precompile_skips_sub_block_draft_forward():
         )
     )
     proposer.runner = SimpleNamespace(
-        num_reqs_max_model_len=8,
+        num_reqs_max_model_len=num_reqs_max_model_len,
         num_reqs_most_model_len=None,
         most_model_len=None,
         max_num_blocks_per_req=4,
-        num_tokens_paddings=[1, 8, 16, 512],
+        num_tokens_paddings=num_tokens_paddings,
         _precompile_timed=mock.MagicMock(
             return_value=mock.MagicMock(
                 __enter__=mock.MagicMock(return_value=None),
@@ -151,19 +154,68 @@ def test_precompile_skips_sub_block_draft_forward():
     )
     proposer._dummy_precompute_and_update_kv_cache = mock.MagicMock()
     proposer._dummy_draft_forward = mock.MagicMock()
+    return proposer
+
+
+def _precompiled_sizes(proposer: DFlashProposer) -> tuple[list[int], list[int]]:
+    """(KV-update sizes, draft-forward sizes) precompile warmed."""
+    return (
+        [
+            call.kwargs["num_tokens"]
+            for call in proposer._dummy_precompute_and_update_kv_cache.call_args_list
+        ],
+        [
+            call.kwargs["num_tokens"]
+            for call in proposer._dummy_draft_forward.call_args_list
+        ],
+    )
+
+
+def test_precompile_skips_sub_block_draft_forward():
+    proposer = _make_precompile_proposer([1, 8, 16, 512], num_reqs_max_model_len=8)
 
     proposer.precompile()
 
-    assert [
-        call.kwargs["num_tokens"]
-        for call in proposer._dummy_precompute_and_update_kv_cache.call_args_list
-    ] == [1, 8, 16, 512]
+    kv_sizes, draft_sizes = _precompiled_sizes(proposer)
+    assert kv_sizes == [1, 8, 16, 512]
     # 1 is skipped (sub-block); 512 stays: _get_padded_len rounds the
     # 8-req * 8-token upper bound (64) up to the next runner bucket.
-    assert [
-        call.kwargs["num_tokens"]
-        for call in proposer._dummy_draft_forward.call_args_list
-    ] == [8, 16, 512]
+    assert draft_sizes == [8, 16, 512]
+
+
+@pytest.mark.parametrize(
+    ("num_tokens_paddings", "num_reqs_max_model_len", "draft_paddings"),
+    [
+        # A full chunk fits the target's buckets: nothing is added.
+        ([16, 32, 64], 4, [16, 32, 64]),
+        # 16 reqs * 8 tokens outgrows the largest target bucket.
+        ([16, 32, 64], 16, [16, 32, 64, 128]),
+        # Doubling stops at the bound, as the target's buckets stop at the
+        # token budget.
+        ([16, 32, 40], 7, [16, 32, 40, 56]),
+        ([16, 32], 32, [16, 32, 64, 128, 256]),
+    ],
+)
+def test_draft_buckets_cover_a_full_chunk(
+    num_tokens_paddings, num_reqs_max_model_len, draft_paddings
+):
+    proposer = _make_precompile_proposer(num_tokens_paddings, num_reqs_max_model_len)
+
+    assert proposer._draft_token_paddings() == draft_paddings
+    with pytest.raises(RuntimeError, match="exceeds the largest draft bucket"):
+        proposer._get_padded_len(draft_paddings[-1] + 1)
+
+
+def test_precompile_warms_draft_only_buckets():
+    proposer = _make_precompile_proposer([16, 32, 64], num_reqs_max_model_len=16)
+
+    proposer.precompile()
+
+    kv_sizes, draft_sizes = _precompiled_sizes(proposer)
+    # The KV-update pass runs at the target's bucket; only the draft forward
+    # runs at the draft-only bucket past it.
+    assert kv_sizes == [16, 32, 64]
+    assert draft_sizes == [16, 32, 64, 128]
 
 
 @pytest.mark.tpu_test
@@ -368,6 +420,8 @@ def test_prepare_dflash_inputs(device):
         device=device,
         num_tokens_paddings=[8, 16, 32],
         max_num_reqs=8,
+        num_reqs_max_model_len=8,
+        num_reqs_most_model_len=None,
         _dp_lockstep_enabled=lambda: False,
     )
     chunk = _make_chunk(
@@ -656,6 +710,8 @@ def test_prepare_dflash_inputs_dp_lockstep(device):
         _dp_lockstep_enabled=lambda: True,
         _dp_step_max_reqs=4,
         max_num_reqs=8,
+        num_reqs_max_model_len=8,
+        num_reqs_most_model_len=None,
     )
     chunk = _make_chunk(
         num_reqs=1,

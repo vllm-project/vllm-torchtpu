@@ -27,6 +27,12 @@ On TPU the charge only takes prefill tokens out of each step, so for these
 methods the property returns 0. The scheduled-token cap, and with it the
 largest target bucket, stays ``max_num_batched_tokens``. Other methods keep
 the upstream value.
+
+The charge was also what kept ``num_reqs * block_size`` within
+``max_num_batched_tokens``: without it, a request scheduled fewer than
+``block_size`` tokens still drafts a full block. The proposer pads the draft
+forward to its own buckets, which extend past the target's to a full chunk
+of requests (``DFlashProposer._draft_token_paddings``).
 """
 
 from functools import wraps
