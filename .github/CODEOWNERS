@@ -40,9 +40,6 @@
 # Platform Support
 /src/vllm_torchtpu/platforms/ @sixiang-google @mrjunwan-lang @Lumosis
 
-# Distributed Support
-/src/vllm_torchtpu/distributed/ @sixiang-google @mrjunwan-lang @harutmov
-
 # Structured Decoding
 /src/vllm_torchtpu/structured_decoding/ @maxwillzq @silkyarora
 
