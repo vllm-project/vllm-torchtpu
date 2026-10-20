@@ -133,6 +133,51 @@ _SAVE_RETRIES = envs.VLLM_TPU_OFFLOAD_SAVE_RETRIES
 
 _DEFAULT_CONTROLLER_PORT = 51515
 
+# Host bytes behind one offloaded block, summed over every worker rank, as
+# recorded from the per-worker KV cache configs before the offloading spec is
+# built (see ``_patch_vllm_offload_all_ranks_kv_bytes``). None until recorded.
+_all_ranks_kv_bytes_per_block: int | None = None
+
+
+def _worker_kv_bytes_per_block(kv_cache_config: Any) -> int:
+    """One worker's bytes per block, as vLLM's ``build_offloading_config``
+    derives ``worker_kv_bytes_per_block`` from that worker's config."""
+    from vllm.distributed.kv_transfer.kv_connector.v1.offloading.config import (
+        _group_kv_bytes_per_block,
+        get_offloading_group_ids,
+    )
+
+    if kv_cache_config.num_blocks <= 0:
+        return 0
+    if (
+        kv_cache_config.hisparse_host_num_blocks is None
+        and kv_cache_config.kv_cache_tensors
+    ):
+        return kv_cache_config.kv_cache_tensors[0].size // kv_cache_config.num_blocks
+    return sum(
+        _group_kv_bytes_per_block(kv_cache_config.kv_cache_groups[group_id])
+        for group_id in get_offloading_group_ids(kv_cache_config)
+    )
+
+
+def record_all_ranks_kv_bytes_per_block(kv_cache_configs: Sequence[Any]) -> int:
+    """Sum the per-worker bytes per block over all workers and remember it.
+
+    Every process that builds the offloading spec (the engine core and each
+    worker) sees the same list, so each computes the same host capacity.
+    Under pipeline parallelism the stages hold different layers, and the sum
+    over the per-worker configs is what one worker's figure times the world
+    size cannot give.
+    """
+    global _all_ranks_kv_bytes_per_block
+    total = sum(_worker_kv_bytes_per_block(cfg) for cfg in kv_cache_configs)
+    _all_ranks_kv_bytes_per_block = total
+    return total
+
+
+def all_ranks_kv_bytes_per_block() -> int | None:
+    return _all_ranks_kv_bytes_per_block
+
 
 def iter_leaf_kv_cache_specs(kv_cache_spec):
     """Yield the per-layer specs behind a KV cache group spec."""
@@ -2233,7 +2278,21 @@ class TPURaidenStoreOffloadingSpec(OffloadingSpec):
 
         # Calculate host block capacity from total bytes per logical block across
         # all worker ranks, sizing both manager and worker pools consistently.
-        bytes_per_block_all_ranks = config.worker_kv_bytes_per_block * self.world_size
+        # The recorded sum over the per-worker configs covers pipeline stages
+        # that hold different layers; without it, every rank holds the same
+        # bytes only on a single stage.
+        bytes_per_block_all_ranks = all_ranks_kv_bytes_per_block()
+        if bytes_per_block_all_ranks is None:
+            if parallel.pp_size > 1:
+                raise ValueError(
+                    "TPURaidenOffloadingConnector: the per-worker KV bytes per "
+                    "block were not recorded before the spec was built, so the "
+                    "host capacity cannot be sized for pipeline stages holding "
+                    "different layers"
+                )
+            bytes_per_block_all_ranks = (
+                config.worker_kv_bytes_per_block * self.world_size
+            )
         assert bytes_per_block_all_ranks > 0
         self.offload_logical_blocks_capacity = int(
             int(cpu_bytes_to_use) // bytes_per_block_all_ranks

@@ -1,4 +1,17 @@
 #!/bin/bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 set -e
 
 usage() {
@@ -91,27 +104,6 @@ fi
 
 echo "vLLM Commit Hash: $VLLM_COMMIT_HASH"
 
-if [ -z "${ACCESS_TOKEN:-}" ]; then
-  if command -v gcloud >/dev/null 2>&1; then
-    ACCESS_TOKEN="$(gcloud auth print-access-token)"
-    export ACCESS_TOKEN
-  elif command -v curl >/dev/null 2>&1; then
-    METADATA_TOKEN_JSON="$(curl -sf -H "Metadata-Flavor: Google" \
-      "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" \
-      || true)"
-    ACCESS_TOKEN="$(printf '%s' "${METADATA_TOKEN_JSON}" | \
-      sed -nE 's/.*"access_token"[[:space:]]*:[[:space:]]*"([^"]+)".*/\1/p')"
-    if [ -n "${ACCESS_TOKEN}" ]; then
-      export ACCESS_TOKEN
-    fi
-  fi
-fi
-
-if [ -z "${ACCESS_TOKEN:-}" ]; then
-  echo "Missing ACCESS_TOKEN and gcloud is unavailable. Private registry authentication will fail."
-  exit 1
-fi
-
 # The staged directory is removed only when this script created it. The EXIT
 # trap also runs after the INT and TERM handlers, so an interrupted or failed
 # docker build leaves nothing behind.
@@ -160,10 +152,6 @@ DOCKER_ARGS=(
   --build-arg VLLM_SOURCE="${VLLM_SOURCE}" \
   --build-arg VLLM_COMMIT_HASH="${VLLM_COMMIT_HASH}" \
 )
-
-if [ -n "${ACCESS_TOKEN:-}" ]; then
-  DOCKER_ARGS+=(--secret "id=gcloud_token,env=ACCESS_TOKEN")
-fi
 
 # Run docker build
 DOCKER_BUILDKIT=1 docker build "${DOCKER_ARGS[@]}" "${REPO_ROOT}"

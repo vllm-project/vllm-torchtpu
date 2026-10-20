@@ -55,7 +55,8 @@ import os
 import struct
 import threading
 import time
-from collections.abc import Generator
+import typing
+from collections.abc import Callable, Generator
 from concurrent.futures import ThreadPoolExecutor
 
 import torch
@@ -686,7 +687,9 @@ def patch_default_model_loader_page_cache() -> None:
         return
 
     original_prepare_weights = dl.DefaultModelLoader._prepare_weights
-    original_load_weights = dl.DefaultModelLoader.load_weights
+    original_load_weights = typing.cast(
+        Callable[..., None], dl.DefaultModelLoader.load_weights
+    )
 
     def _prepare_weights(self, *args, **kwargs):
         res = original_prepare_weights(self, *args, **kwargs)

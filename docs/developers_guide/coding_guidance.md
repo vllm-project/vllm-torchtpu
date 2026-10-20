@@ -62,7 +62,11 @@ Two meta-principles organize this document set:
   [Type checking](type_checking.md)); code must pass both
   checks.
 - **R-1.6** Every new file carries the Apache 2.0 license header (copy from a
-  sibling file).
+  sibling file, or run `tools/check_license_headers.py --fix <file>`). The
+  full header text is required, and no `SPDX-License-Identifier` tag: the
+  release scanner reads the tag instead of the header text. A file ported
+  from upstream keeps its `SPDX-FileCopyrightText` notice above the license
+  text. The pre-commit hook enforces this.
 - **R-1.7** No `print` in library code — use `vllm_torchtpu.logger.init_logger`.
   Log lines are self-contained and AI-debuggable: tag the subsystem, include
   the relevant shapes/values, and name the failure mode. A reader with only

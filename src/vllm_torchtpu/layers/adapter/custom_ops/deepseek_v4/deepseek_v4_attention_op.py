@@ -226,6 +226,11 @@ def _attention_csa(
         gather_and_attention_chunk_size = 32
         attention_kernel_batch_size = 8
 
+    # First use of the top-k after the SWA pass: the indexer's SparseCore
+    # top-k then completes behind the q projection and SWA, which do not need
+    # it, instead of stalling the TensorCore before them.
+    extra, swa_output = jax.lax.optimization_barrier((extra, swa_output))
+
     output = sparse_ragged_paged_attention(
         q=q,
         cache_kv_nope=main_cache_kv,

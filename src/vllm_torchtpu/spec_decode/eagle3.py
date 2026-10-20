@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import contextlib
@@ -636,6 +648,7 @@ class Eagle3Proposer:
         if len(seq_lens_set) != 1:
             return None
         (seq_lens,) = seq_lens_set.values()
+        assert self._mtp_fused_loop is not None
         self._draft_md_cache.pop(id(chunk), None)
 
         num_tokens = input_ids.shape[0]
@@ -1373,7 +1386,9 @@ class Eagle3Proposer:
                     # sit above a chunk's kernel_num_reqs; the rows past the
                     # chunk's requests are zeros either way.
                     rejected_dev_per_chunk.append(
-                        _maybe_pad_dim0(nr[:knr], knr) if nr is not None else None
+                        _maybe_pad_dim0(cast(torch.Tensor, nr)[:knr], knr)
+                        if nr is not None
+                        else None
                     )
                 elif nr is not None and np.any(nr):
                     padded_nr = np.zeros(knr, dtype=np.int32)

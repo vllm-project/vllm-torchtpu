@@ -306,7 +306,7 @@ def gather_from_page_buffer(
     kv_window_u8,
     score_window_u8,
     *,
-    global_idx: int,
+    global_idx: jax.Array,
     num_tokens: int,
     window: int,
     block_size: int,

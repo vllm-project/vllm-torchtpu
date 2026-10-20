@@ -156,6 +156,17 @@ if [[ "${BUILDKITE_PIPELINE_SLUG:-}" == "${INTEGRATION_SLUG}" ]]; then
   upload_with_priority .buildkite/pipeline_promote.yml "$JOB_PRIORITY"
 fi
 
+# Release branch builds (releases/v<version>, e.g. releases/v0.29.0; see
+# RELEASE_BRANCH_REGEX in configs/pipeline_config.sh) also build and publish
+# vllm-torchtpu-core and the combined vllm-torchtpu wheel. PR builds never
+# release. Uploaded before the CI lanes so Buildkite places it after them; its
+# block step waits until the whole CI run has passed.
+if [[ "${BUILDKITE_BRANCH:-}" =~ ${RELEASE_BRANCH_REGEX} \
+      && "${BUILDKITE_PULL_REQUEST:-false}" == "false" ]]; then
+  echo "Release branch ${BUILDKITE_BRANCH}: uploading release fragment"
+  upload_with_priority .buildkite/pipeline_release_pypi.yml "$JOB_PRIORITY"
+fi
+
 # The suite's lanes, in upload order. Lane <lane> is
 # .buildkite/pipeline_<lane>.yml; no other file is uploaded as a lane. CI_LANES
 # picks a subset - a scheduled pipeline names its own lane. Without it a build runs every lane but

@@ -50,6 +50,8 @@ vLLM TorchTPU is the integration of **TorchTPU** and **vLLM**. It is a vLLM plat
 
     [:octicons-arrow-right-24: Testing & CI](developers_guide/testing_and_ci.md)
 
+    [:octicons-arrow-right-24: Roadmap](roadmap.md)
+
 - :material-lightbulb-on-outline:{ .lg .middle } __I Want to Learn More__
 
     Learn the architecture, run benchmarks, and profile TPU kernels.
@@ -66,4 +68,4 @@ vLLM TorchTPU is the integration of **TorchTPU** and **vLLM**. It is a vLLM plat
 
 ## Contribute
 
-We're always looking for ways to partner with the community to accelerate vLLM TorchTPU development. If you're interested in contributing, check out the [Contributing guide](developers_guide/contributing.md) and [Issues](https://github.com/vllm-project/vllm-torchtpu/issues) to start.
+We're always looking for ways to partner with the community to accelerate vLLM TorchTPU development. If you're interested in contributing, check out the [Contributing guide](developers_guide/contributing.md), the [Roadmap](roadmap.md) for what's planned next, and [Issues](https://github.com/vllm-project/vllm-torchtpu/issues) to start.

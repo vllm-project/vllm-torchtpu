@@ -233,7 +233,7 @@ def compressor_forward(
     query_start_loc: jax.Array,  # [num_reqs + 1] int
     kv_block_table: jax.Array,  # [num_reqs * max_kv_blocks] int
     cache: jax.Array,  # [num_pages, page_size, 4, 128] u8 / CSA [..., 128] i32
-    rope_cache: jax.Array,  # CSA [num_pages, page_size // 4, 128] int32
+    rope_cache: jax.Array | None,  # CSA [num_pages, page_size // 4, 128] int32
     distribution: jax.Array,  # i32[3]
     state_block_size: int,
     head_dim: int,
@@ -242,7 +242,7 @@ def compressor_forward(
     rms_eps: float,
     quant_block: int,
     state_cache: jax.Array | None = None,  # [num_pages, state_page_size, 4, 128] uint8
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array | None, jax.Array]:
     """Projects, saves state, then compresses and stores the boundary records."""
     num_tokens = positions.shape[0]
     num_reqs = query_start_loc.shape[0] - 1
