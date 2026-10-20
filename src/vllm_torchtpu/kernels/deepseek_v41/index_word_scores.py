@@ -40,11 +40,11 @@ def unpack_word_rows(words, keys_ref):
     keys_ref[pl.ds(0, rows, stride=SLOTS), :] = words
     keys_ref[pl.ds(1, rows, stride=SLOTS), :] = pltpu.roll(words, half, 1)
     words = keys_ref[...]
-    lo, hi = _bf16(words << 16), _bf16(words & jnp.int32(-65536))
+    lo, hi = words << 16, words & jnp.int32(-65536)
     first = jax.lax.broadcasted_iota(jnp.int32, words.shape, 1) < half
     # Lanes [0, 64) of lo (even elements), then the same lanes of hi (odd
     # elements), i.e. q's split element order.
-    return jnp.where(first, lo, pltpu.roll(hi, half, 1))
+    return _bf16(jnp.where(first, lo, pltpu.roll(hi, half, 1)))
 
 
 def _kernel(q_ref, w_ref, words_ref, out_ref, *scratch, halfplane=False):
