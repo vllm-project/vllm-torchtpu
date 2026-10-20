@@ -11,6 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import inspect
+
 import pytest
 import torch
 from vllm import SamplingParams
@@ -54,11 +56,14 @@ def spec_config(method: str, parallel_drafting: bool) -> SpeculativeConfig:
 
 @pytest.fixture
 def install_patch(monkeypatch):
-    # Snapshot upstream's property so teardown restores it.
+    # Platform activation in earlier tests may have installed the patch
+    # already, so unwrap to upstream's getter. Teardown restores the property
+    # the test found.
+    prop = SpeculativeConfig.__dict__["max_num_new_slots_for_drafting"]
     monkeypatch.setattr(
         SpeculativeConfig,
         "max_num_new_slots_for_drafting",
-        SpeculativeConfig.__dict__["max_num_new_slots_for_drafting"],
+        property(inspect.unwrap(prop.fget)),
     )
     return draft_slots.patch_drafting_slot_budget
 
