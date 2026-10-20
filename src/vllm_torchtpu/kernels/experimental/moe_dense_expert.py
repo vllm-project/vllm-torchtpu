@@ -1,5 +1,16 @@
 # Copyright 2026 Google LLC
-# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Experimental small-batch FP8 MoE without token permutation.
 
 Each nonempty local expert is visited once. Its two weights are DMA'd once,
@@ -67,26 +78,28 @@ def can_use_dense_expert(
         or w2.dtype != jnp.float8_e4m3fn
     ):
         return False
-    return (
+    if not (
         s1.shape == (e, 1, 1, 2 * i)
         and s2.shape == (e, 1, 1, h)
         and s1.dtype == jnp.float32
         and s2.dtype == jnp.float32
-    )
+    ):
+        return False
+    # Per-channel GMM quantizes activations only with native FP8 support and
+    # a scale block at least one MXU column wide, for both contracting axes.
+    tpu_info = pltpu.get_tpu_info()
+    return tpu_info.fp8_ops_per_second > 0 and min(h, i) >= tpu_info.mxu_column_size
 
 
 def _quantize(x, q_ref, scale_ref):
-    """Same BF16 scale/inverse and 512-wide FP8 quantization as gmm_v2."""
+    """Quantize activations to FP8 in up-to-512-wide blocks with BF16 scales."""
     # Keep K blocks first so each scale read is a contiguous [tokens, 128]
     # plane; placing K between tokens and lanes causes expensive relayouts.
     for k in range(0, x.shape[1], 512):
-        # The last intermediate block may be shorter than 512. Quantize
-        # only its real elements, matching GMM's zero-padded tail scale.
-        width = min(512, x.shape[1] - k)
-        block = x[:, k : k + width]
+        block = x[:, k : k + 512]
         scale = jnp.max(jnp.abs(block), axis=1, keepdims=True) / 448.0
         inv = jnp.where(scale == 0, 0, 1 / scale)
-        q_ref[:, k : k + width] = (block * inv).astype(jnp.float8_e4m3fn)
+        q_ref[:, k : k + 512] = (block * inv).astype(jnp.float8_e4m3fn)
         scale_ref[k // 512, :, :] = jnp.broadcast_to(scale, (x.shape[0], 128))
 
 
@@ -153,10 +166,9 @@ def _kernel(
         for n in range(0, h, 256):
             acc = jnp.zeros((m, 256), jnp.bfloat16)
             for k in range(0, i, 512):
-                width = min(512, i - k)
                 part = jnp.matmul(
-                    aq_ref[:, k : k + width],
-                    w2_ref[k : k + width, n : n + 256],
+                    aq_ref[:, k : k + 512],
+                    w2_ref[k : k + 512, n : n + 256],
                     preferred_element_type=jnp.float32,
                 ).astype(jnp.bfloat16)
                 asc = asc_ref[k // 512, :, :]
