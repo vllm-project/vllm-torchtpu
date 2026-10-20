@@ -285,8 +285,22 @@ def main_kernel(
         request_window(first_request)
         transfer_group(first_request, first_t0, 0)
 
+    def wait_output(t0, i):
+        pltpu.make_async_copy(
+            output_ref.at[i],
+            output_hbm_ref.at[t0 + i],
+            dma_sem.at[2 + 8 * bq + i],
+        ).wait()
+
     def process_group(state):
-        request_index, t0, bank = state
+        request_index, t0, bank, previous_t0, previous_count = state
+
+        def wait_previous_output(i):
+            # Reuse each output slot only after its previous HBM write finishes.
+            @pl.when(i < previous_count)
+            def wait():
+                wait_output(previous_t0, i)
+
         start, end, first_query_position, anchor = request_info(request_index)
 
         def start_block_dma(wanted):
@@ -529,7 +543,7 @@ def main_kernel(
             if not interpret:
                 csa_launch(0, 0, pv=False)
 
-            def softmax(i, addr, *, has_next=True):
+            def prepare_logits(i, addr, *, has_next=True):
                 if has_next:
                     dequant(i + 1)
                 if not interpret and has_next:
@@ -543,7 +557,7 @@ def main_kernel(
                 key_positions = jnp.concatenate(
                     (swa_cache_bases[0] + lanes, swa_cache_bases[1] + lanes)
                 )
-                # Concatenate integer boundaries before constructing the boolean mask.
+                # Concatenate integer boundaries before constructing the mask.
                 unique = key_positions >= jnp.concatenate(
                     tuple(
                         jnp.full((128,), anchor + swa_cache_ids[slot] * 128, jnp.int32)
@@ -560,16 +574,26 @@ def main_kernel(
                 if swa_metadata_ref is not None:
                     swa_valid &= key_positions >= swa_metadata_ref[request_index, 1]
                 swa_logits = jnp.where(
-                    (swa_valid & unique)[None, :], swa_score_ref[i] * scale, -jnp.inf
+                    (swa_valid & unique)[None, :],
+                    swa_score_ref[i] * scale,
+                    -jnp.inf,
                 )
-                # Keep both branches in one FP32 softmax tile; round only P.
-                logits = jnp.concatenate((main_logits, swa_logits), axis=1)
-                maximum = jnp.maximum(sink, jnp.max(logits, axis=1, keepdims=True))
+                return jnp.concatenate((main_logits, swa_logits), axis=1)
+
+            def normalize_logits(logits):
+                tile_sink = jnp.concatenate(
+                    (sink,) * (logits.shape[0] // num_heads), axis=0
+                )
+                maximum = jnp.maximum(tile_sink, jnp.max(logits, axis=1, keepdims=True))
                 exponentials = jnp.exp(logits - maximum)
-                denominator = jnp.exp(sink - maximum) + jnp.sum(
+                denominator = jnp.exp(tile_sink - maximum) + jnp.sum(
                     exponentials, axis=1, keepdims=True
                 )
-                probabilities = (exponentials / denominator).astype(jnp.bfloat16)
+                return (exponentials / denominator).astype(jnp.bfloat16)
+
+            def softmax(i, addr, *, has_next=True):
+                logits = prepare_logits(i, addr, has_next=has_next)
+                probabilities = normalize_logits(logits)
                 main_p_ref[i] = probabilities[:, :512]
                 swa_p_ref[i] = probabilities[:, 512:]
 
@@ -577,12 +601,24 @@ def main_kernel(
             if 10 * mrb_stride <= 256:
 
                 def launch_tile(first, slot, *, size=2, has_next=True):
+                    # Independent query rows share one normalization to expose
+                    # more work while cross-lane reductions are in flight.
+                    logits = jnp.concatenate(
+                        tuple(
+                            prepare_logits(
+                                first + row,
+                                row * mrb_stride,
+                                has_next=row + 1 < size or has_next,
+                            )
+                            for row in range(size)
+                        ),
+                        axis=0,
+                    )
+                    probabilities = normalize_logits(logits)
                     for row in range(size):
-                        softmax(
-                            first + row,
-                            row * mrb_stride,
-                            has_next=row + 1 < size or has_next,
-                        )
+                        query_p = probabilities[row * num_heads : (row + 1) * num_heads]
+                        main_p_ref[first + row] = query_p[:, :512]
+                        swa_p_ref[first + row] = query_p[:, 512:]
                         if not interpret:
                             csa_launch(
                                 first + row, (2 + 2 * slot + row) * mrb_stride, pv=True
@@ -623,6 +659,7 @@ def main_kernel(
                             ),
                             axis=1,
                         )
+                    wait_previous_output(i)
                     output = main_output + swa_output
                     tail = output[:, 384:]
                     partner = jnp.where(
@@ -731,6 +768,7 @@ def main_kernel(
                             ),
                             axis=1,
                         )
+                    wait_previous_output(i)
                     output = main_output + swa_output
                     tail = output[:, 384:]
                     partner = jnp.where(
@@ -796,24 +834,27 @@ def main_kernel(
                 ),
             )
 
-        @pl.loop(0, count)
-        def wait_output(i):
-            pltpu.make_async_copy(
-                output_ref.at[i], output_hbm_ref.at[t0 + i], dma_sem.at[2 + 8 * bq + i]
-            ).wait()
+        # A shorter group leaves some previous output slots unused.
+        @pl.loop(count, previous_count)
+        def drain_previous_output(i):
+            wait_output(previous_t0, i)
 
         @pl.when((next_request != request_index) & (swa_prefetched_id[0] >= 0))
         def drain_request_prefetch():
             wait_block_dma(swa_prefetched_id[0])
             swa_prefetched_id[0] = -1
 
-        return next_request, next_t0, 1 - bank
+        return next_request, next_t0, 1 - bank, t0, count
 
-    lax.while_loop(
+    _, _, _, last_t0, last_count = lax.while_loop(
         lambda state: state[0] < request_limit,
         process_group,
-        (first_request, first_t0, jnp.int32(0)),
+        (first_request, first_t0, jnp.int32(0), jnp.int32(0), jnp.int32(0)),
     )
+
+    @pl.loop(0, last_count)
+    def drain_output(i):
+        wait_output(last_t0, i)
 
     def clear_padding():
         end = starts_ref[request_limit]
