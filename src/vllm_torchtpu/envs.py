@@ -100,6 +100,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
+    TPU_DSV4_ATTN_INTRA_CHIP_TP: bool = False
     TPU_TOKEN_BUCKET_EXTRA: list[int] = []
     TPU_TOKEN_BUCKET_LINEAR: bool = False
     TPU_PP_DYNAMIC_CHUNKS: bool = True
@@ -769,6 +770,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # time at TP=32; halving the bytes each core reads costs two on-package
     # all-gathers per layer. Independent of TPU_MOE_HIERARCHICAL_EP.
     "TPU_LATENT_PROJ_INTRA_CHIP_TP": env_bool("TPU_LATENT_PROJ_INTRA_CHIP_TP"),
+    # Experimental: shard DSv4 attention wq_b/wo_a/wo_b across a chip's two
+    # cores while KV and attention stay DP (deepseek_v4/attn_intra_chip.py).
+    "TPU_DSV4_ATTN_INTRA_CHIP_TP": env_bool("TPU_DSV4_ATTN_INTRA_CHIP_TP"),
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
     "TPU_ROPE_CACHE_TRUNCATE": env_bool("TPU_ROPE_CACHE_TRUNCATE"),
