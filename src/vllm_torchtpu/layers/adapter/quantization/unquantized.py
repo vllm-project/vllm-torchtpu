@@ -71,7 +71,7 @@ from vllm_torchtpu.layers.adapter.quantization.configs import (
 )
 from vllm_torchtpu.layers.core.quant_methods import UNQUANTIZED, get_tpu_quant_method
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.utils import synchronize_tensors
+from vllm_torchtpu.utils import fresh_buffer, synchronize_tensors
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.adapter.quantization.configs import (
@@ -110,7 +110,7 @@ class VllmUnquantizedLinearMethod(UnquantizedLinearMethod):
         if weight.dim() != 2:
             # Not a plain dense weight; leave the stock behaviour alone.
             return
-        weight = weight.transpose(0, 1).contiguous()
+        weight = fresh_buffer(weight.transpose(0, 1))
         replace_parameter(
             layer, "weight", torch.nn.Parameter(weight, requires_grad=False)
         )
@@ -268,8 +268,8 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
             w3_weight = w13_weight[:, 1::2, :]
             w13_weight = torch.cat([w1_weight, w3_weight], dim=1)
 
-        w13_weight = w13_weight.transpose(1, 2).contiguous()
-        w2_weight = w2_weight.transpose(1, 2).contiguous()
+        w13_weight = w13_weight.transpose(1, 2)
+        w2_weight = w2_weight.transpose(1, 2)
 
         # Pad each w13 half (gate, up) to a multiple of 128 so the fused GMM
         # kernel's sub-view of the up half lands on a tile boundary.
@@ -279,11 +279,14 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
             pad = w13_weight.new_zeros((*w13_weight.shape[:-1], aligned_half - half))
             w13_weight = torch.cat(
                 [w13_weight[..., :half], pad, w13_weight[..., half:], pad], dim=-1
-            ).contiguous()
+            )
             pad2 = w2_weight.new_zeros(
                 (w2_weight.shape[0], aligned_half - half, w2_weight.shape[2])
             )
-            w2_weight = torch.cat([w2_weight, pad2], dim=1).contiguous()
+            w2_weight = torch.cat([w2_weight, pad2], dim=1)
+
+        w13_weight = fresh_buffer(w13_weight)
+        w2_weight = fresh_buffer(w2_weight)
 
         layer.w13_weight = torch.nn.Parameter(w13_weight, requires_grad=False)
         layer.w2_weight = torch.nn.Parameter(w2_weight, requires_grad=False)
@@ -305,11 +308,11 @@ class VllmUnquantizedFusedMoEMethod(TpuMoEActivationMixin, UnquantizedFusedMoEMe
                 ).contiguous()
 
             layer.w13_bias = torch.nn.Parameter(
-                w13_bias.unsqueeze(1).to(torch.float32),
+                fresh_buffer(w13_bias.unsqueeze(1).to(torch.float32)),
                 requires_grad=False,
             )
             layer.w2_bias = torch.nn.Parameter(
-                w2_bias.unsqueeze(1).to(torch.float32),
+                fresh_buffer(w2_bias.unsqueeze(1).to(torch.float32)),
                 requires_grad=False,
             )
 
