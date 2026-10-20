@@ -17,6 +17,7 @@ Validates tensor shapes, selects tuned block sizes, builds DMA schedule tables,
 and invokes the Pallas Batched RPA kernel.
 """
 
+import math
 from typing import cast
 
 import jax
@@ -577,6 +578,21 @@ def calculate_block_sizes(
     prefill_block_sizes = find_best_block_sizes(prefill_batch_size)
 
     return decode_block_sizes, prefill_block_sizes
+
+
+    default: configs.BlockSizes,
+    serve_cfgs: configs.ServingConfigs,
+    mxu_column_size: int,
+) -> configs.BlockSizes:
+
+    """
+        return default
+    max_useful_bq_sz = max(
+        mxu_column_size, utils.align_to(serve_cfgs.total_q_tokens, mxu_column_size)
+    )
+    bq = min(bq, max_useful_bq_sz)
+    bq_c = math.gcd(bq, min(bq_c, bq))
+    return configs.BlockSizes(bq_sz=bq, bq_c_sz=bq_c, bkv_sz=bkv, batch_size=batch)
 
 
 @jax.jit(
