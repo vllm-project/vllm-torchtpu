@@ -45,6 +45,8 @@
 #   K3_PD_NUM_PREFILL, K3_PD_NUM_DECODE  engines per role (xPyD); default 1.
 #                   Replica 0's head is <name>-<role>-0-0.<name>, replica r's
 #                   <name>-<role><r>-0-0.<name> (one replicated job per engine)
+#   K3_PD_PREFILL_POLICY, K3_PD_DECODE_POLICY  router policy per role; default
+#                   consistent_hash for both
 # The config states the cases and labels: AGENTX_CONC_LIST, AGENTX_MODEL_PREFIX,
 #   AGENTX_PRECISION, and optionally AGENTX_POST_EVAL_SUITES,
 #   AGENTX_EVAL_JOB_SUITES, AGENTX_PROXY,
@@ -275,18 +277,18 @@ log "starting the $CFG_PROXY proxy on port $PROXY_PORT"
 if [ "$CFG_PROXY" = router ]; then
     # The request timeout covers a full decode; retries off so a failed hop
     # fails the request instead of prefilling it twice.
-    # 1P1D keeps consistent_hash. xPyD: cache_aware on the prefills keeps a
-    # conversation's turns on one prefill; round robin on the decodes.
+    # consistent_hash keys on aiperf's x-correlation-id, so a conversation's
+    # turns stay on one prefill and one decode. K3_PD_PREFILL_POLICY and
+    # K3_PD_DECODE_POLICY override it per role.
     _router_args=()
     for _h in "${PREFILL_HOSTS[@]}"; do _router_args+=(--prefill "http://${_h}:${PORT}"); done
     for _h in "${DECODE_HOSTS[@]}"; do _router_args+=(--decode "http://${_h}:${PORT}"); done
-    if [ "$NUM_PREFILL" = 1 ] && [ "$NUM_DECODE" = 1 ]; then
-        _router_args+=(--policy consistent_hash)
-    else
+    _router_args+=(--policy consistent_hash)
+    if [ -n "${K3_PD_PREFILL_POLICY:-}${K3_PD_DECODE_POLICY:-}" ]; then
         vllm-router --help 2>&1 | grep -E -- '--(prefill|decode)-policy' \
             || { log "FATAL: vllm-router has no --prefill-policy/--decode-policy"; exit 2; }
-        _router_args+=(--prefill-policy "${K3_PD_PREFILL_POLICY:-cache_aware}"
-            --decode-policy "${K3_PD_DECODE_POLICY:-round_robin}")
+        _router_args+=(${K3_PD_PREFILL_POLICY:+--prefill-policy "$K3_PD_PREFILL_POLICY"}
+            ${K3_PD_DECODE_POLICY:+--decode-policy "$K3_PD_DECODE_POLICY"})
     fi
     log "router: ${_router_args[*]}"
     vllm-router --host 0.0.0.0 --port "$PROXY_PORT" \
