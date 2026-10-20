@@ -285,6 +285,12 @@ class TpuPipelineChunkScheduler(Scheduler):
             if request.request_id not in self._seeded:
                 self._account(num_new_tokens, start)
             return num_new_tokens
+        # A waiting request with one prompt token left after its prefix hit
+        # arrives padded to 1 + num_spec_tokens rows of a verify step. A
+        # pipeline runs MTP over the prompt only and never verifies
+        # (TPUModelRunner._prefill_only_mtp), so the chunk ends at the last
+        # prompt token and the base scheduler drops the padding.
+        num_new_tokens = min(num_new_tokens, request.num_tokens - start)
         granularity = self._granularity
         if granularity is not None and num_new_tokens > 0:
             cap = self._chunk_cap(start, num_new_tokens, granularity)
