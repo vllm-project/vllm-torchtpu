@@ -19,6 +19,9 @@ import jax.numpy as jnp
 import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.config as config
 import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.kernel as compress_kernel
 import vllm_torchtpu.kernels.deepseek_v4.compress_and_store.proj_and_save_state as proj_kernel  # noqa: E501
+from vllm_torchtpu.kernels.deepseek_v4.compress_and_store.tuned_block_sizes import (
+    COMPACT_BOUNDARY_BATCHES,
+)
 
 
 def block_table_row_stride(block_table: jax.Array, num_reqs: int) -> int:
@@ -40,6 +43,7 @@ def derive_metadata(
     overlap: bool,
     cos_sin_cache: jax.Array | None,
     state_cache: jax.Array | None = None,
+    token_to_req_indices: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Derives token_to_req_indices, slot_mapping_slots, and kv_slot_mapping.
 
@@ -70,6 +74,8 @@ def derive_metadata(
       cos_sin_cache: [max_pos, rope_head_dim] or None. RoPE cos/sin cache.
       state_cache: [num_pages, state_page_size, 4, lanes] uint8, or None when the
         state shares ``cache``'s buffer. Only its shape is read here.
+      token_to_req_indices: Optional exact request mapping supplied by a
+        specialized caller; other paths retain the ragged repeat mapping.
     Returns:
       token_to_req_indices: [num_tokens]. Request index for each token.
       slot_mapping_slots: [num_tokens]. Physical row index in the state cache.
@@ -108,11 +114,23 @@ def derive_metadata(
     )
 
     # 2. Map tokens to request indices (Handles Ragged Batch)
-    query_lens = jnp.diff(query_start_loc)
     batch_size = query_start_loc.shape[0] - 1
-    token_to_req_indices = jnp.repeat(
-        jnp.arange(batch_size), query_lens, total_repeat_length=num_tokens
-    )
+    if token_to_req_indices is None:
+        if (num_tokens, batch_size, compress_ratio) in COMPACT_BOUNDARY_BATCHES:
+            # Match repeat's first nonempty request and final-request fill.
+            token_to_req_indices = (
+                jnp.minimum(jnp.sum(query_start_loc[1:] <= 0), batch_size - 1)
+                .astype(jnp.int32)
+                .reshape(1)
+            )
+        else:
+            query_lens = jnp.diff(query_start_loc)
+            token_to_req_indices = jnp.repeat(
+                jnp.arange(batch_size), query_lens, total_repeat_length=num_tokens
+            )
+    else:
+        assert token_to_req_indices.shape == positions.shape
+        assert token_to_req_indices.dtype == jnp.int32
     req = token_to_req_indices
 
     block_table_stride = block_table_row_stride(block_table, batch_size)
@@ -166,10 +184,22 @@ def prepare_boundary_batch(
 
     Layout: [ decode_packed (0..K-1) | pad (K..K_aligned-1) |
     prefill_row_tiled (K_aligned..) | pad ]
+    A single token only needs one padded row.
     """
     num_tokens = positions.shape[0]
     max_prefill_boundary = num_tokens // compress_ratio + 1 + num_reqs
     packed_size = num_tokens + max_prefill_boundary
+
+    if (num_tokens, num_reqs, compress_ratio) in COMPACT_BOUNDARY_BATCHES:
+        # A single boundary always occupies slot zero for decode and prefill.
+        output_size = rope_pack
+        keep = (jnp.arange(output_size) == 0) & is_boundary[0]
+        keep &= kv_slot_mapping[0] >= 0
+        return (
+            jnp.where(keep, positions[0], 0),
+            jnp.where(keep, token_to_req_indices[0], 0),
+            jnp.where(keep, kv_slot_mapping[0], -1),
+        )
 
     # 1. Get packing indices for all boundary tokens
     safe, valid = _get_packing_indices(is_boundary, packed_size)

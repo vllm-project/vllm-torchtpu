@@ -22,6 +22,9 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
+from vllm_torchtpu.kernels.deepseek_v4.compress_and_store.tuned_block_sizes import (
+    PROJECTION_OUTPUT_TILES,
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -120,6 +123,7 @@ def kernel(
     cfgs: Configs,
 ):
     """Inner kernel executing matmul, APE addition, and paged writes."""
+    single_token = hidden_states.shape[0] == 1
     tile_m = cfgs.tile_sizes.tile_m
     tile_n = cfgs.tile_sizes.tile_n
     last_dim = acc_ref.shape[-1]
@@ -180,6 +184,10 @@ def kernel(
 
         def _matmul():
             lhs = tiled_hidden_states_ref[...]
+            if single_token:
+                # Invalid output rows are masked by slot_mapping. Broadcast in
+                # VMEM to retain the original MXU tile without an HBM pad.
+                lhs = jnp.broadcast_to(lhs, (tile_n, cfgs.tile_sizes.tile_k))
             rhs = tiled_wgate_ref[...]
             prod = lax.dot_general(
                 lhs,
@@ -190,7 +198,11 @@ def kernel(
             return prod
 
         def _add_ape():
-            tile_positions = tiled_positions_ref[...]
+            tile_positions = (
+                jnp.full((tile_n,), positions[0], jnp.int32)
+                if single_token
+                else tiled_positions_ref[...]
+            )
             ape_rows = tile_positions % cfgs.dims.compress_ratio
             ape_val = ape[...].astype(jnp.float32)
             # Gather Path: doesn't work for compiler reasons?
@@ -208,7 +220,17 @@ def kernel(
             existing_acc = load_from_acc_ref(
                 acc_ref.at[buf_idx, ...], dtype=jnp.float32
             )
-            new_acc = existing_acc + ape_selected  # (tile_n, state_width)
+            if tile_m == cfgs.dims.size_m:
+                # A joint KV/gate tile must add APE only to its gate half.
+                new_acc = jnp.concatenate(
+                    (
+                        existing_acc[:, :state_width],
+                        existing_acc[:, state_width:] + ape_selected,
+                    ),
+                    axis=1,
+                )
+            else:
+                new_acc = existing_acc + ape_selected
             store_to_acc_ref(acc_ref.at[buf_idx], new_acc)
 
         def process(copy_dma: bool, add_ape: bool):
@@ -224,8 +246,8 @@ def kernel(
             # 2. Launch DMA for the PREVIOUS tile
             if copy_dma:
                 prev_tile_idx = tile_idx - 1
-                prev_n_idx = prev_tile_idx >> 1
-                prev_m_idx = prev_tile_idx & 1
+                prev_n_idx = prev_tile_idx // cfgs.num_m
+                prev_m_idx = prev_tile_idx % cfgs.num_m
                 prev_buf_idx = 1 - buf_idx
                 _dma_copy_out(prev_n_idx, prev_m_idx, prev_buf_idx)
 
@@ -249,7 +271,7 @@ def kernel(
         # Select and execute
         num_k = cfgs.num_k
         is_last_k = k_idx == (num_k - 1)
-        is_score = m_idx * tile_m >= state_width
+        is_score = (tile_m == cfgs.dims.size_m) | (m_idx * tile_m >= state_width)
 
         copy_dma = (k_idx == 0) & (tile_idx > 0)
         add_ape = is_last_k & is_score
@@ -280,7 +302,7 @@ def kernel(
         memory_space=pltpu.VMEM,
     )
     hidden_states_spec = pl.BlockSpec(
-        (cfgs.tile_sizes.tile_n, cfgs.tile_sizes.tile_k),
+        (1 if single_token else cfgs.tile_sizes.tile_n, cfgs.tile_sizes.tile_k),
         lambda n, m, k: (n, k),
         memory_space=pltpu.VMEM,
     )
@@ -296,14 +318,14 @@ def kernel(
         in_specs=(
             wkv_spec,
             hidden_states_spec,
-            positions_spec,
+            None if single_token else positions_spec,
         ),
     )
 
     pipeline_fn(
         wkv_wgate,
         hidden_states,
-        positions,
+        None if single_token else positions,
     )
 
     # Epilogue: launch DMA for the last tile and wait for all outstanding DMAs
@@ -369,7 +391,10 @@ def proj_and_save_state(
     token_page_size = cache.shape[1]
 
     state_width = state_dim // 2
-    tile_m = state_width
+    tile_m = PROJECTION_OUTPUT_TILES.get(
+        (num_tokens, hidden_size, state_dim, compress_ratio),
+        state_dim if num_tokens == 1 else state_width,
+    )
     tile_k = _select_tile_k(hidden_size)
 
     # The token dimension must be an exact multiple of `tile_n`.
@@ -429,5 +454,5 @@ def proj_and_save_state(
             disable_bounds_checks=True,
         ),
         interpret=interpret,
-        name="proj_and_save_state",
+        name=f"proj_and_save_state_m{tile_m}",
     )(slot_mapping, positions, hidden_states, wkv_wgate, ape, cache)

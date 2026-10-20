@@ -25,6 +25,7 @@ from jax._src import test_util as jtu
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
     compress_store_ref,
+    compressor_v1,
     config,
 )
 from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
@@ -35,6 +36,31 @@ from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
 )
 
 pytestmark = pytest.mark.tpu_test
+
+
+@pytest.mark.parametrize("is_decode", [False, True])
+@pytest.mark.parametrize("is_boundary", [False, True])
+@pytest.mark.parametrize("slot", [-1, 0, 513])
+@pytest.mark.parametrize("request_index", [0, 255])
+def test_single_boundary_uses_one_row(is_decode, is_boundary, slot, request_index):
+    """One token needs one padded row, including empty and prefill batches."""
+    result = jax.jit(
+        lambda p, r, k, b, d: compressor_v1.prepare_boundary_batch(
+            p, r, k, b, d, compress_ratio=4, num_reqs=256
+        )
+    )(
+        jnp.array([65535], jnp.int32),
+        jnp.array([request_index], jnp.int32),
+        jnp.array([slot], jnp.int32),
+        jnp.array([is_boundary]),
+        jnp.array([is_decode]),
+    )
+    valid = is_boundary and slot >= 0
+    for actual, value, padding in zip(result, [65535, request_index, slot], [0, 0, -1]):
+        expected = np.full(4, padding, np.int32)
+        if valid:
+            expected[0] = value
+        np.testing.assert_array_equal(np.asarray(actual), expected)
 
 
 def generate_kv_slot_mapping(
