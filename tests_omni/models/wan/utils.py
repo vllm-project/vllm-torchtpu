@@ -60,7 +60,7 @@ class WanTestConfig:
 
         model_dir = Path(model_dir_str)
         if not model_dir.exists():
-            return self.hf_id
+            raise FileNotFoundError(f"{env_var}={model_dir_str} does not exist")
 
         return str(model_dir.resolve())
 
