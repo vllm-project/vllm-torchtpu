@@ -136,6 +136,11 @@ _SPARSE_MLA_DCP_OUTPUT_PARTITION_SPECS = (
     # Matching log-sum-exps, `-inf` where this rank owns nothing.
     P(DCP_AXIS_NAME),  # partial lse
 )
+_SPARSE_MLA_DCP_CHUNK_MERGE_OUTPUT_PARTITION_SPECS = (
+    P(DCP_AXIS_NAME),  # updated nope cache
+    P(DCP_AXIS_NAME),  # updated rope cache
+    P(DCP_AXIS_NAME),  # merged & head-scattered attention output
+)
 
 # Note: TPU can fp8 as storage dtype but doesn't support converting from uint8
 # from to fp32 directly. That's why it has a dtype mapping different from GPU
@@ -2354,6 +2359,116 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
 
         return sparse_mla_dcp_impl
 
+    def _build_sparse_mla_dcp_chunk_merge_op(
+        self, layer: Any, dcp_size: int, interleave_size: int
+    ):
+        """DCP sparse MLA op with in-kernel per-chunk LSE all-gather + BF16 reduce-scatter."""
+        from vllm_torchtpu.layers.core.attention_interface import (
+            sparse_mla_attention_dcp,
+        )
+
+        mesh = self._dcp_mesh
+        assert mesh is not None
+
+        k_scale = None
+        if layer.kv_cache_quantized_dtype is not None:
+            _, k_scale, _ = self._get_kv_scales(layer)
+
+        def sparse_mla_attention_core_tpu_dcp_chunk_merge(
+            kv_cache_nope: jax.Array,
+            kv_cache_rope: jax.Array,
+            ql_nope: jax.Array,
+            q_pe: jax.Array,
+            kv_c_normed: jax.Array,
+            k_pe: jax.Array,
+            local_topk_indices: jax.Array,
+            seq_lens: jax.Array,
+            block_tables: jax.Array,
+            query_start_loc: jax.Array,
+            request_distribution: jax.Array,
+        ) -> tuple[jax.Array, jax.Array, jax.Array]:
+            nope_spec, rope_spec = layer.mla_kv_spec
+            return sparse_mla_attention_dcp(
+                ql_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                kv_cache_nope,
+                kv_cache_rope,
+                local_topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+                mesh,
+                nope_spec,
+                rope_spec,
+                sm_scale=layer.scale,
+                k_scale=k_scale,
+                dcp_size=dcp_size,
+                interleave_size=interleave_size,
+                fuse_dcp_chunk_merge=True,
+            )
+
+        op_name = f"pallas::sparse_mla_attention_dcp_chunk_merge_{layer.layer_name.replace('.', '_')}"
+        sparse_mla_chunk_merge_jax_op = pcp_streaming_jax_op(
+            op_name,
+            sparse_mla_attention_core_tpu_dcp_chunk_merge,
+            donate_argnums=(0, 1),
+            mesh=mesh,
+            input_partition_specs=_SPARSE_MLA_DCP_INPUT_PARTITION_SPECS,
+            output_partition_specs=_SPARSE_MLA_DCP_CHUNK_MERGE_OUTPUT_PARTITION_SPECS,
+        )
+
+        def _fake_sparse_mla_dcp_chunk_merge(
+            kv_cache_nope, kv_cache_rope, ql_nope, *rest, **kwargs
+        ):
+            del rest, kwargs
+            out_shape = (
+                ql_nope.shape[0],
+                ql_nope.shape[1] // dcp_size,
+                ql_nope.shape[2],
+            )
+            return (
+                torch.empty_like(kv_cache_nope),
+                torch.empty_like(kv_cache_rope),
+                ql_nope.new_empty(out_shape),
+            )
+
+        sparse_mla_chunk_merge_jax_op.register_fake(_fake_sparse_mla_dcp_chunk_merge)
+
+        def sparse_mla_dcp_chunk_merge_impl(
+            kv_cache: tuple[torch.Tensor, torch.Tensor],
+            ql_nope: torch.Tensor,
+            q_pe: torch.Tensor,
+            kv_c_normed: torch.Tensor,
+            k_pe: torch.Tensor,
+            local_topk_indices: torch.Tensor,
+            seq_lens: torch.Tensor,
+            block_tables: torch.Tensor,
+            query_start_loc: torch.Tensor,
+            request_distribution: torch.Tensor,
+        ) -> torch.Tensor:
+            nope_cache, rope_cache = kv_cache
+            new_nope, new_rope, outputs = sparse_mla_chunk_merge_jax_op(
+                nope_cache,
+                rope_cache,
+                ql_nope,
+                q_pe,
+                kv_c_normed,
+                k_pe,
+                local_topk_indices,
+                seq_lens,
+                block_tables,
+                query_start_loc,
+                request_distribution,
+            )
+            nope_cache.copy_(new_nope)
+            rope_cache.copy_(new_rope)
+            return outputs
+
+        return sparse_mla_dcp_chunk_merge_impl
+
     def forward(
         self,
         layer: Any,
@@ -2472,34 +2587,63 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                 # `topk_indices` here is not global positions: the DCP indexer
                 # already resolved each token's global top-k into this rank's
                 # own local cache indices, `-1` where it owns nothing.
-                partial, lse = layer.sparse_mla_dcp_op(
-                    kv_cache,
-                    ql_nope_dcp,
-                    q_pe_dcp,
-                    kv_c_normed_flat,
-                    k_pe_flat,
-                    topk_indices,
-                    attn_metadata.seq_lens,
-                    attn_metadata.block_tables,
-                    attn_metadata.query_start_loc,
-                    attn_metadata.request_distribution,
-                )
-                # The scatter undoes the head all-gather above.
-                #
-                # Only the backbone may use the all-to-all merge. The merge
-                # picks it by comparing the token count to
-                # TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS at trace time, and only
-                # the backbone is traced multiple times, once per bucket
-                # group (`_precompile_backbone`). The MTP drafter (model_tag
-                # "eagle_head") is traced once for every bucket: the
-                # comparison would pin its graph to the first size, and the
-                # large buckets fail with ShapeSpecializationError. So the
-                # drafter keeps the reduce-scatter, as with the flag off.
-                outputs = merge_lse_partials_scatter_heads(
-                    partial,
-                    lse,
-                    is_backbone=vllm_compilation_backends.model_tag == "backbone",
-                )
+                is_backbone = vllm_compilation_backends.model_tag == "backbone"
+                if (
+                    envs.TPU_SPARSE_MLA_DCP_CHUNK_AG_RS
+                    and is_backbone
+                    and ql_nope_dcp.shape[0]
+                    >= envs.TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_MIN_TOKENS
+                ):
+                    if (
+                        not hasattr(layer, "sparse_mla_dcp_chunk_merge_op")
+                        or layer.sparse_mla_dcp_chunk_merge_op is None
+                    ):
+                        layer.sparse_mla_dcp_chunk_merge_op = (
+                            self._build_sparse_mla_dcp_chunk_merge_op(
+                                layer, self.dcp_size, self.dcp_interleave_size
+                            )
+                        )
+                    outputs = layer.sparse_mla_dcp_chunk_merge_op(
+                        kv_cache,
+                        ql_nope_dcp,
+                        q_pe_dcp,
+                        kv_c_normed_flat,
+                        k_pe_flat,
+                        topk_indices,
+                        attn_metadata.seq_lens,
+                        attn_metadata.block_tables,
+                        attn_metadata.query_start_loc,
+                        attn_metadata.request_distribution,
+                    )
+                else:
+                    partial, lse = layer.sparse_mla_dcp_op(
+                        kv_cache,
+                        ql_nope_dcp,
+                        q_pe_dcp,
+                        kv_c_normed_flat,
+                        k_pe_flat,
+                        topk_indices,
+                        attn_metadata.seq_lens,
+                        attn_metadata.block_tables,
+                        attn_metadata.query_start_loc,
+                        attn_metadata.request_distribution,
+                    )
+                    # The scatter undoes the head all-gather above.
+                    #
+                    # Only the backbone may use the all-to-all merge. The merge
+                    # picks it by comparing the token count to
+                    # TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS at trace time, and only
+                    # the backbone is traced multiple times, once per bucket
+                    # group (`_precompile_backbone`). The MTP drafter (model_tag
+                    # "eagle_head") is traced once for every bucket: the
+                    # comparison would pin its graph to the first size, and the
+                    # large buckets fail with ShapeSpecializationError. So the
+                    # drafter keeps the reduce-scatter, as with the flag off.
+                    outputs = merge_lse_partials_scatter_heads(
+                        partial,
+                        lse,
+                        is_backbone=is_backbone,
+                    )
             else:
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:
                     layer.sparse_mla_op = self._build_sparse_mla_op(layer)

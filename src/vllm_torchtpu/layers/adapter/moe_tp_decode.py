@@ -97,6 +97,13 @@ class _OpStatics:
     activation: str
     use_sparse_core: bool
     onehot_threshold: int
+    # When TPU_TOKEN_MICROBATCHES >= 2, place an optimization_barrier between
+    # `routed` and `shared` prior to `shared + routed * routed_scale` so
+    # TpuOutputFusion does not fuse `routed` into `shared_experts.down_proj`,
+    # allowing `shared_experts.down_proj` to execute on TensorCore while
+    # SparseCore EP combine (`sc_ragged_gather_reduce_v2`) is in flight.
+    barrier_shared: bool = False
+    min_barrier_tokens: int = 1024
 
 
 @dataclasses.dataclass(frozen=True)
@@ -283,6 +290,8 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
         activation=qm._tpu_activation_str,
         use_sparse_core=envs.USE_MOE_SPARSE_CORE,
         onehot_threshold=resolve_onehot_permute_threshold(),
+        barrier_shared=bool(envs.TPU_TOKEN_MICROBATCHES >= 2),
+        min_barrier_tokens=int(envs.TPU_MICROBATCH_MIN_TOKENS),
     )
     return _Admitted(shared=shared, rows=rows, hidden=hidden, statics=statics)
 
@@ -322,6 +331,8 @@ def _tp_chain(x, scores, bias, is_pad, w13, w2, s13, s2, sw13, ss13, sw2, ss2, s
     fs = sw2.shape[0]
     act = jax.nn.silu(gate_up[:, :fs].astype(jnp.float32)).astype(x.dtype)
     shared = xla_quantized_matmul(act * gate_up[:, fs:], sw2, ss2)
+    if st.barrier_shared and x.shape[0] >= st.min_barrier_tokens:
+        routed, shared = lax.optimization_barrier((routed, shared))
     return shared + routed * st.routed_scale
 
 

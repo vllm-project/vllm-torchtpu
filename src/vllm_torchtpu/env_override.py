@@ -220,6 +220,7 @@ if _sc_offload_bytes is not None:
     for _flag_name in (
         "--xla_tpu_sparse_core_all_reduce_offload_min_size_in_bytes",
         "--xla_tpu_sparse_core_all_gather_offload_min_size_in_bytes",
+        "--xla_tpu_sparse_core_reduce_scatter_offload_min_size_in_bytes",
     ):
         if not _user_has_flag(_flag_name):
             _libtpu_extra_args.append(f"{_flag_name}={_sc_offload_bytes}")

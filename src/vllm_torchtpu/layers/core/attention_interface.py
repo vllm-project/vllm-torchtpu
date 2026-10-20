@@ -1078,7 +1078,11 @@ def sparse_mla_attention_dcp(
     dcp_size: int,
     interleave_size: int,
     dcp_axis_name: str = streamindex_topk.DCP_AXIS_NAME,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    fuse_dcp_chunk_merge: bool = False,
+) -> (
+    tuple[jax.Array, jax.Array, jax.Array, jax.Array]
+    | tuple[jax.Array, jax.Array, jax.Array]
+):
     """Sparse MLA attention over a DCP position-sharded latent cache.
 
     Args:
@@ -1152,10 +1156,18 @@ def sparse_mla_attention_dcp(
         P(None),  # request_distribution
     )
     out_specs = (
-        P(dcp_axis_name),  # nope cache shard
-        P(dcp_axis_name),  # rope cache shard
-        P(dcp_axis_name, None, None),  # partial output
-        P(dcp_axis_name, None),  # partial lse
+        (
+            P(dcp_axis_name),  # nope cache shard
+            P(dcp_axis_name),  # rope cache shard
+            P(dcp_axis_name, None, None),  # merged head-scattered output
+        )
+        if fuse_dcp_chunk_merge
+        else (
+            P(dcp_axis_name),  # nope cache shard
+            P(dcp_axis_name),  # rope cache shard
+            P(dcp_axis_name, None, None),  # partial output
+            P(dcp_axis_name, None),  # partial lse
+        )
     )
     dequant_scale = float(k_scale) if k_scale is not None else 1.0
     # One cache_layout below governs both caches, so they must agree.
@@ -1227,6 +1239,31 @@ def sparse_mla_attention_dcp(
         # Virtual page ordinal -> physical block in this rank's own shard, the
         # same resolution the scatter above and `streamindex_topk_dcp` use.
         local_block_tables = jnp.mod(block_tables_, jnp.int32(nope_spec.num_pages))
+        if fuse_dcp_chunk_merge:
+            merged_output = sparse_mla_kernel.sparse_ragged_paged_attention(
+                q,
+                kv_cache_nope,
+                kv_cache_rope,
+                topk_idx,
+                local_block_tables,
+                query_start_loc_,
+                request_distribution_,
+                sm_scale=sm_scale or 1.0,
+                k_scale=dequant_scale,
+                return_lse=True,
+                cache_layout=cache_layout,
+                topk_cap=topk_cap,
+                dcp_chunk_merge_axis=dcp_axis_name,
+                dcp_chunk_merge_bf16_rs=envs.TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_BF16,
+                dcp_chunk_merge_barrier=envs.TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_BARRIER,
+                dcp_chunk_merge_max_groups=envs.TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_MAX_GROUPS,
+                owns_mask=owns,
+                out_head_dim=ql_nope.shape[-1],
+                **chunk_kwargs,
+                **split_kwargs,
+            )
+            return (kv_cache_nope, kv_cache_rope, merged_output)
+
         output, lse = sparse_mla_kernel.sparse_ragged_paged_attention(
             q,
             kv_cache_nope,

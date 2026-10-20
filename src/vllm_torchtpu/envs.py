@@ -191,6 +191,10 @@ if TYPE_CHECKING:
     VLLM_TPU_STATIC_POOLER: bool = True
     VLLM_TPU_POOLING_KV_CACHE_TOKENS: int = -1
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
+    TPU_TOKEN_MICROBATCHES: int = 1
+    TPU_MICROBATCH_MIN_TOKENS: int = 1024
+    TPU_DCP_RS_BF16: bool = False
+    TPU_DCP_MERGE_CHUNKED: int = 4
 
 
 def env_with_choices(
@@ -1125,6 +1129,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # copies it automatically to DP/Ray engine-core actors.
     "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS": env_nonnegative_int(
         "VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS", 8
+    ),
+    "TPU_TOKEN_MICROBATCHES": env_int("TPU_TOKEN_MICROBATCHES", 1),
+    "TPU_MICROBATCH_MIN_TOKENS": env_int("TPU_MICROBATCH_MIN_TOKENS", 1024),
+    "TPU_DCP_RS_BF16": env_bool("TPU_DCP_RS_BF16", False),
+    "TPU_DCP_MERGE_CHUNKED": env_int("TPU_DCP_MERGE_CHUNKED", 4),
+    "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS": env_bool(
+        "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS", default=False
+    ),
+    "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_MIN_TOKENS": env_int(
+        "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_MIN_TOKENS", 512
+    ),
+    "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_MAX_GROUPS": env_int(
+        "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_MAX_GROUPS", 2
+    ),
+    "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_BF16": env_bool(
+        "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_BF16", default=True
+    ),
+    "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_BARRIER": env_bool(
+        "TPU_SPARSE_MLA_DCP_CHUNK_AG_RS_BARRIER", default=True
     ),
 }
 

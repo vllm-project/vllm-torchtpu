@@ -1065,10 +1065,17 @@ class VllmTPUMLAAttention(MLAAttention):
 
         dcp_size = getattr(impl, "dcp_size", 1)
         self.sparse_mla_dcp_op = None
+        self.sparse_mla_dcp_chunk_merge_op = None
         if dcp_size > 1:
             self.sparse_mla_dcp_op = impl._build_sparse_mla_dcp_op(
                 self, dcp_size, impl.dcp_interleave_size
             )
+            if envs.TPU_SPARSE_MLA_DCP_CHUNK_AG_RS:
+                self.sparse_mla_dcp_chunk_merge_op = (
+                    impl._build_sparse_mla_dcp_chunk_merge_op(
+                        self, dcp_size, impl.dcp_interleave_size
+                    )
+                )
 
     def forward(
         self,

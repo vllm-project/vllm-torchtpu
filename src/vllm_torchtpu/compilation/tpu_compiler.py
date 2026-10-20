@@ -288,12 +288,14 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/distributed/pcp.py",
     # Same reason: dcp.py owns the DCP kernels' mesh shape and device order.
     "vllm_torchtpu/distributed/dcp.py",
+    "vllm_torchtpu/distributed/dcp_comm.py",
     "vllm_torchtpu/distributed/pallas_shapes.py",
     "vllm_torchtpu/layers/adapter/linear_common.py",
     "vllm_torchtpu/layers/adapter/router_topk.py",
     "vllm_torchtpu/layers/adapter/quantization",
     "vllm_torchtpu/layers/adapter/vision_attention.py",
     "vllm_torchtpu/models/vllm/deepseek_v4/attention.py",
+    "vllm_torchtpu/models/vllm/glm52_microbatch_patch.py",
     # `get_pallas_op_mesh` decides whether the DSv4 Pallas ops are built with
     # the wrapper mesh or with none, like `build_ep_mesh` above.
     "vllm_torchtpu/models/vllm/vllm_model_wrapper_context.py",
@@ -492,6 +494,45 @@ def _single_size(compile_range: Range) -> int | None:
     return compile_range.start if compile_range.is_single_size() else None
 
 
+def _inline_int_placeholders(
+    graph: fx.GraphModule, example_inputs: list[Any]
+) -> bool:
+    """Substitute concrete ``int`` inputs for every use of their placeholder.
+
+    vLLM traces the backbone with the token count as a ``SymInt`` placeholder
+    (``s72``) and, for each static bucket, ``create_concrete_args`` hands us a
+    plain ``int`` for it alongside FakeTensors of concrete shape. aot_autograd
+    then undoes that for the scalar alone: ``process_inputs`` re-wraps every
+    ``int`` input as a fresh backed ``SymInt`` whenever the fake mode has a
+    ShapeEnv -- which it must, for the artifact cache to work. Any op whose
+    shape is derived from that scalar rather than from a tensor (the microbatch
+    split ``hidden_states[: s72 // 2]`` and factory ops like
+    ``cos.new_ones(t, d - rope_dim)`` downstream of it) therefore reaches the
+    eager FX interpreter with a symbolic size and fails with
+    "SymIntArrayRef expected to contain only concrete integers".
+
+    Replacing the uses -- not the placeholder itself, which stays so the
+    runnable's calling convention and :func:`shape_variants.graph_signature`
+    are unchanged -- makes the scalar a literal before aot_autograd looks at
+    it. Bools (an ``int`` subclass) and SymInts are left alone.
+    """
+    placeholders = graph.graph.find_nodes(op="placeholder")
+    modified = False
+    for node, arg in zip(placeholders, example_inputs, strict=False):
+        if type(arg) is not int or not node.users:
+            continue
+        for user in list(node.users):
+            user.args = fx.map_arg(user.args, lambda n, a=arg, nd=node: a if n is nd else n)
+            user.kwargs = fx.map_arg(
+                user.kwargs, lambda n, a=arg, nd=node: a if n is nd else n
+            )
+        modified = True
+    if modified:
+        graph.graph.lint()
+        graph.recompile()
+    return modified
+
+
 class TpuCompilerAdaptor(CompilerInterface):
     """CompilerInterface implementation for TPU.
 
@@ -559,6 +600,10 @@ class TpuCompilerAdaptor(CompilerInterface):
         )
         if fake_mode is not None and fake_mode.shape_env is None:
             fake_mode.shape_env = ShapeEnv()
+        # That ShapeEnv is also what makes aot_autograd re-symbolize the
+        # bucket's int inputs; bake them into the graph first so no shape
+        # can be derived from the symbol (see _inline_int_placeholders).
+        _inline_int_placeholders(graph, example_inputs)
         tracing_ctx = (
             torch._guards.TracingContext(fake_mode) if fake_mode is not None else None
         )
