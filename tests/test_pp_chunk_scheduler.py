@@ -652,3 +652,12 @@ def test_a_finished_connector_request_is_pinned():
     with patch.object(Scheduler, "_connector_finished", return_value=(False, None)):
         scheduler._connector_finished(request)
     assert retention.calls == [("pin", ("c",))]
+
+
+def test_a_padded_last_prompt_token_is_cut_back_to_the_prompt_end():
+    scheduler = _scheduler(cost=_model())
+    request = _request(0, 2 * 2176 + 1)
+    got = scheduler._mamba_block_aligned_split(
+        request, 2, num_new_local_computed_tokens=2 * 2176
+    )
+    assert got == 1
