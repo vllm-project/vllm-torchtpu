@@ -153,7 +153,7 @@ VLLM_TARGET_DEVICE=empty pip install -e . --group vllm \
 
 ## Option 3: Install `vllm` and `vllm-torchtpu-core` Separately (Cross-Repo Development)
 
-Follow these steps when developing or debugging both `vllm` and `vllm-torchtpu-core` in separate local checkouts (or installing `vllm-torchtpu-core` without `--group vllm`). Currently, `vllm==0.31.0` is supported.
+Follow these steps when developing or debugging both `vllm` and `vllm-torchtpu-core` in separate local checkouts (or installing `vllm-torchtpu-core` without `--group vllm`). Currently, `vllm==0.32.0` is supported.
 
 ### Using `uv` (Recommended)
 
@@ -163,7 +163,7 @@ source ~/uv_venv/bin/activate
 export UV_TORCH_BACKEND=cpu
 
 # 1. Clone and install vLLM in editable mode (with common dependencies)
-git clone --depth 1 --branch v0.31.0 https://github.com/vllm-project/vllm.git ~/vllm
+git clone --depth 1 --branch v0.32.0 https://github.com/vllm-project/vllm.git ~/vllm
 VLLM_TARGET_DEVICE="empty" uv pip install -e ~/vllm
 
 # 2. Clone and install vllm-torchtpu-core only (without --group vllm)
@@ -181,7 +181,7 @@ source ~/pip_venv/bin/activate
 pip install --upgrade pip
 
 # 1. Clone and install vLLM in editable mode (with common dependencies)
-git clone --depth 1 --branch v0.31.0 https://github.com/vllm-project/vllm.git ~/vllm
+git clone --depth 1 --branch v0.32.0 https://github.com/vllm-project/vllm.git ~/vllm
 VLLM_TARGET_DEVICE="empty" pip install \
   --extra-index-url https://download.pytorch.org/whl/cpu \
   -e ~/vllm
@@ -204,10 +204,11 @@ pip install \
 
 | Flag | Purpose |
 | :--- | :--- |
-| `--group vllm` | Installs pinned upstream `vllm` (`v0.31.0`) from source. |
+| `--group vllm` | Installs pinned upstream `vllm` (`v0.32.0`) from source. |
 | `--group test` | Installs `pytest`, `pytest-mock`, `pytest-cov`, `parameterized`, and `vllm_test_utils`. |
 | `--extra benchmarking` | Installs `lm-eval`, `evalscope`, `datasets`, and `runai-model-streamer[gcs]`. |
 | `--extra omni` | Installs `vllm-omni` for multimodal diffusion models (e.g., FLUX, Wan2.2). |
+| `--group omni-git` | Installs `vllm-omni` 0.32.0rc1 from its git tag for `--extra omni`, until that release is on PyPI. |
 
 ---
 

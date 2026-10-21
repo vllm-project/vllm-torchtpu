@@ -26,6 +26,7 @@ from typing import cast
 
 import torch
 from torch import nn
+from transformers import Qwen3NextConfig, Qwen4ExpTextConfig
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -58,7 +59,6 @@ from vllm.models.qwen4_exp.common.hyperconnection import (
     GatedResidual,
     HyperConnectionConfig,
 )
-from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
 
 from vllm_torchtpu.models.vllm.qwen4_exp.ple import Qwen4ExpPLELayer
 
@@ -94,28 +94,33 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
         # ple_layer_ids is one-indexed; each PLE layer's hash layout follows
         # its rank among them.
+        ple_layer_ids = config.ple_layer_ids or []
         self.ple = (
             Qwen4ExpPLELayer(
                 config,
-                sorted(set(config.ple_layer_ids)).index(layer_index + 1),
+                sorted(set(ple_layer_ids)).index(layer_index + 1),
                 vllm_config.quant_config,
                 prefix=f"{prefix}.ple",
             )
-            if layer_index + 1 in config.ple_layer_ids
+            if layer_index + 1 in ple_layer_ids
             else None
         )
 
+        # The Qwen3-Next layers read only fields the Qwen4Exp text config also
+        # has; the transformers class just does not subclass Qwen3NextConfig.
+        layer_config = cast(Qwen3NextConfig, config)
         if self.layer_type == "linear_attention":
             self.linear_attn = QwenGatedDeltaNetAttention(
-                config,
+                layer_config,
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.linear_attn",
                 gqa_interleaved_layout=False,
             )
-        elif self.layer_type == "full_attention":
+        elif self.layer_type == "indexed_attention":
+            # The checkpoint's full_attention (QSA) layers; see config.py.
             # TODO(QSA): add the indexer and attend over the selected blocks.
             self.self_attn = Qwen3NextAttention(
-                config,
+                layer_config,
                 model_config=vllm_config.model_config,
                 cache_config=vllm_config.cache_config,
                 quant_config=vllm_config.quant_config,

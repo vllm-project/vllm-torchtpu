@@ -225,6 +225,10 @@ def test_attention_constructs_tpu_swa_cache(monkeypatch, request, compress_ratio
     config.model_config = SimpleNamespace(
         hf_config=hf_config, dtype=torch.bfloat16, max_model_len=256
     )
+    # VllmConfig resolves this only when built with a model config; 5 is its
+    # value for this max_model_len. The compress_ratio=4 indexer sizes its
+    # prefill buffer from it.
+    config.attention_config.sparse_mla_prefill_workspace_factor = 5
     config.cache_config = CacheConfig(block_size=1024, cache_dtype="fp8_e4m3")
     config.scheduler_config = SchedulerConfig(
         max_model_len=256,

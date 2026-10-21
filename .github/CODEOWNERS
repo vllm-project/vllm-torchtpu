@@ -45,7 +45,8 @@
 /tests/kernels/deepseek_v4/ @kyuyeunk @qizzzh @gxd3 @patemotter @gpolovets1
 
 # Platform Support
-/src/vllm_torchtpu/platforms/ @sixiang-google @mrjunwan-lang @Lumosis
+/src/vllm_torchtpu/platforms/ @sixiang-google @mrjunwan-lang @Lumosis @yinlin09 @benliangw
+/tests/platforms/ @sixiang-google @mrjunwan-lang @Lumosis @yinlin09 @benliangw
 
 # Structured Decoding
 /src/vllm_torchtpu/structured_decoding/ @maxwillzq @silkyarora

@@ -903,12 +903,12 @@
     {
       "path": "src/vllm_torchtpu/layers/adapter/custom_ops/mla_attention_op.py",
       "name": "bad-assignment",
-      "concise_description": "`(config: Unknown) -> type[TPUDummyMLAPrefillBackend]` is not assignable to attribute `get_mla_prefill_backend` with type `(vllm_config: VllmConfig) -> type[MLAPrefillBackend]`"
+      "concise_description": "`(config: Unknown) -> type[TPUDummyMLAPrefillBackend]` is not assignable to attribute `get_mla_prefill_backend` with type `(vllm_config: VllmConfig | None) -> type[MLAPrefillBackend]`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/custom_ops/mla_attention_op.py",
       "name": "bad-assignment",
-      "concise_description": "`(config: Unknown) -> type[TPUDummyMLAPrefillBackend]` is not assignable to attribute `get_mla_prefill_backend` with type `(vllm_config: VllmConfig) -> type[MLAPrefillBackend]`"
+      "concise_description": "`(config: Unknown) -> type[TPUDummyMLAPrefillBackend]` is not assignable to attribute `get_mla_prefill_backend` with type `(vllm_config: VllmConfig | None) -> type[MLAPrefillBackend]`"
     },
     {
       "path": "src/vllm_torchtpu/layers/adapter/custom_ops/mla_attention_op.py",
@@ -1129,11 +1129,6 @@
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
       "name": "not-callable",
       "concise_description": "Expected a callable, got `None`"
-    },
-    {
-      "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `KimiK3VisionConfig` is not assignable to parameter `config` with type `KimiK25VisionConfig` in function `vllm.model_executor.models.kimi_k25_vit.KimiK25MultiModalProjector.__init__`"
     },
     {
       "path": "src/vllm_torchtpu/models/vllm/kimi_k3/model.py",

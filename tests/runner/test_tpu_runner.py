@@ -125,6 +125,14 @@ def test_spec_warmup_request_counts_blocks_in_block_table_units(
     assert len(block_ids) <= spec.max_num_blocks_per_req(config, 40960)
 
 
+class _BlockTables(list):
+    """A list of block tables with `MultiGroupBlockTable.block_tables`."""
+
+    @property
+    def block_tables(self):
+        return self
+
+
 def _smem_runner(dcp_size=8, kernel_page_size=384, most_model_len=65536):
     spec = FullAttentionSpec(
         block_size=384, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
@@ -135,6 +143,7 @@ def _smem_runner(dcp_size=8, kernel_page_size=384, most_model_len=65536):
     split = 384 // kernel_page_size
     pages = spec.max_num_blocks_per_req(config, 1048576) * split
     table = SimpleNamespace(
+        block_size=384,
         max_num_blocks_per_req=pages,
         blocks_per_kv_block=split,
         get_cpu_tensor=lambda: torch.zeros((64, pages), dtype=torch.int32),
@@ -146,7 +155,7 @@ def _smem_runner(dcp_size=8, kernel_page_size=384, most_model_len=65536):
         block_size=384,
         max_num_blocks_per_req=pages,
         most_model_len=most_model_len,
-        input_batch=SimpleNamespace(block_table=[table]),
+        input_batch=SimpleNamespace(block_table=_BlockTables([table])),
         kv_cache_config=SimpleNamespace(
             kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
         ),
@@ -231,13 +240,15 @@ def test_smem_caps_follow_widest_attention_group():
 def test_smem_caps_refresh_after_placeholder_table_rebuild(monkeypatch):
     runner = _smem_runner(most_model_len=None)
     final_table = runner.input_batch.block_table[0]
-    runner.input_batch.block_table[0] = SimpleNamespace(max_num_blocks_per_req=2731)
+    runner.input_batch.block_table[0] = SimpleNamespace(
+        block_size=384, max_num_blocks_per_req=2731
+    )
     runner.max_num_blocks_per_req = 2731
     runner.block_table_cpu = torch.zeros((64, 2731), dtype=torch.int32)
     runner._refresh_smem_request_caps()
     assert runner.num_reqs_max_model_len == 47
 
-    def rebuild(_self, _config, _sizes):
+    def rebuild(_self, _config):
         runner.input_batch.block_table[0] = final_table
 
     monkeypatch.setattr(GPUModelRunner, "may_reinitialize_input_batch", rebuild)
@@ -254,6 +265,13 @@ def test_smem_caps_refresh_after_placeholder_table_rebuild(monkeypatch):
     assert real_runner.max_num_blocks_per_req == 342
     assert real_runner.block_table_cpu.shape == (64, 342)
     assert real_runner.num_reqs_most_model_len is None
+
+
+def test_may_reinitialize_input_batch_requires_kernel_block_sizes():
+    # Without them, split groups would hand manager block ids to the kernels.
+    runner = object.__new__(TPUModelRunner)
+    with pytest.raises(ValueError, match="kernel_block_sizes is required"):
+        TPUModelRunner.may_reinitialize_input_batch(runner, SimpleNamespace())
 
 
 def test_suspend_kv_transfer_group_restores_agent_after_failure():
