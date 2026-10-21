@@ -22,6 +22,7 @@ from vllm.v1.kv_cache_interface import (
     MambaSpec,
     SlidingWindowSpec,
 )
+from vllm.v1.kv_cache_layout import KVCacheLayout
 
 from vllm_torchtpu import _patch_vllm_hybrid_pcp_block_sizes
 
@@ -34,6 +35,8 @@ def _config(
             block_size=512,
             enable_prefix_caching=enable_prefix_caching,
             prefix_match_unit=None,
+            # PallasAttentionBackend's default layout.
+            get_resolved_kv_cache_layout=lambda: KVCacheLayout.LBNHC,
         ),
         parallel_config=SimpleNamespace(
             decode_context_parallel_size=1,

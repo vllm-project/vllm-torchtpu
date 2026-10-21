@@ -174,12 +174,14 @@ FROM dev AS omni
 RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
 
 # --group vllm keeps vLLM's source pin in this resolution, so vllm-omni cannot
-# replace it with a PyPI vllm.
+# replace it with a PyPI vllm. --group omni-git supplies the omni extra's
+# vllm-omni from its git tag until the release is on PyPI (see pyproject.toml).
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system \
       -r pyproject.toml \
       --group vllm \
-      --extra omni
+      --extra omni \
+      --group omni-git
 
 
 # Variant 5: Production/Full Image (Production/Minimal Variant)
