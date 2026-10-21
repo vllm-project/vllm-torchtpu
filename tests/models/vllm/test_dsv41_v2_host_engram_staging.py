@@ -10,6 +10,7 @@ Covers all lines and branches in:
 from __future__ import annotations
 
 import types
+from contextlib import nullcontext
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
@@ -40,6 +41,7 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram import (
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import (
     DeepseekV41Model,
+    _EngramPrefetch,
 )
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
@@ -1010,6 +1012,47 @@ class TestModelEngramPreparation:
             )
             assert hashes is not None
 
+    @pytest.mark.parametrize("changed", [False, True])
+    def test_prefetch_hit_reuses_hashes_and_miss_prepares_actual_inputs(self, changed):
+        model = self._create_mock_model()
+        model._prepared_upload_enabled = True
+        host = HostEngramInputs(
+            torch.tensor([1, 2], dtype=torch.int32),
+            torch.tensor([0, 1]),
+            torch.tensor([0, 2]),
+            torch.tensor([[10, 11, 12, 13]], dtype=torch.int32),
+            all_prompt=True,
+        )
+        metadata = SimpleNamespace(
+            seq_lens=torch.tensor([2]), query_start_loc=host.query_start_loc
+        )
+        context = SimpleNamespace(
+            attn_metadata={"swa_0": metadata},
+            additional_kwargs={HOST_ENGRAM_KEY: host},
+        )
+        namespace = "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream"
+        with (
+            patch(namespace + ".is_forward_context_available", return_value=True),
+            patch(namespace + ".get_forward_context", return_value=context),
+            patch(namespace + ".gather_engram_hashes", side_effect=lambda h, **kw: h),
+        ):
+            expected, _ = model._prepare_engram(
+                host.input_ids, host.positions, host.lookback_token_ids
+            )
+            predicted = host.snapshot(2, 1, 2)
+            if changed:
+                predicted.input_ids[0] += 1
+            model._engram_prefetch = _EngramPrefetch(predicted, expected, {})
+            with patch.object(
+                model.engram_hash, "hash_on_host", wraps=model.engram_hash.hash_on_host
+            ) as hash_call:
+                actual, _ = model._prepare_engram(
+                    host.input_ids, host.positions, host.lookback_token_ids
+                )
+            assert hash_call.call_count == int(changed)
+            assert torch.equal(actual, expected)
+            assert model._engram_prefetch is None
+
     def test_prepare_engram_host_and_device_dispatch(self):
         model = self._create_mock_model(cpu_offload=True, use_slot_cache=True)
         pos = torch.tensor([0, 1], dtype=torch.int64)
@@ -1089,6 +1132,31 @@ class TestModelEngramPreparation:
             hashes, mask = model._prepare_engram(ids, pos, lookback, stage="full")
             mock_dev_hash.assert_called_once()
             assert hashes.shape == (2, 2, 8)
+
+    def test_incomplete_prefill_records_encoder_output_before_zero_result(self):
+        model = self._create_mock_model(cpu_offload=False, ced_enabled=True)
+        model._ced_boundary = 1
+        encoded = (torch.ones(2, 64), torch.ones(2, 64))
+        model.encoder_stage = MagicMock(return_value=encoded)
+        model._record_engram_consumers = MagicMock()
+        context = SimpleNamespace(
+            attn_metadata={"swa_0": SimpleNamespace(seq_lens=torch.tensor([2]))},
+            additional_kwargs={},
+            dp_metadata=None,
+        )
+        namespace = "vllm_torchtpu.models.vllm.deepseek_v41.v2.model"
+        with (
+            patch(namespace + ".upstream.get_forward_context", return_value=context),
+            patch(namespace + ".replace", return_value=context),
+            patch(namespace + ".override_forward_context", return_value=nullcontext()),
+            patch(
+                namespace + ".plan_decoder_replay",
+                return_value=SimpleNamespace(padded_num_tokens=0),
+            ),
+        ):
+            result = model._forward_impl(torch.tensor([1, 2]), torch.tensor([0, 1]))
+        assert torch.count_nonzero(result) == 0
+        model._record_engram_consumers.assert_called_once_with(0, 1, encoded)
 
     def test_forward_offload_engram_lifecycle_and_mega_moe(self):
         model = self._create_mock_model(cpu_offload=True, ced_enabled=False)

@@ -42,22 +42,31 @@ def config(**policy):
 
 @pytest.mark.parametrize("execution", ["full", "ced"])
 @pytest.mark.parametrize("moe", ["gmm", "fused_ep_w4a8"])
-def test_policy_round_trips_to_worker_and_config_hash_input(execution, moe):
-    cfg = config(execution=execution, moe=moe)
+@pytest.mark.parametrize("engram_upload", ["copy", "prepared_dma"])
+def test_policy_round_trips_to_worker_and_config_hash_input(
+    execution, moe, engram_upload
+):
+    cfg = config(execution=execution, moe=moe, engram_upload=engram_upload)
     verify_and_update_config(cfg)
     before = json.dumps(cfg.additional_config, sort_keys=True)
     worker = copy.deepcopy(cfg)
     verify_and_update_config(worker)
     assert json.dumps(worker.additional_config, sort_keys=True) == before
     assert DeepseekV41Config.from_vllm_config(worker) == DeepseekV41Config.parse(
-        dict(execution=execution, moe=moe)
+        dict(execution=execution, moe=moe, engram_upload=engram_upload)
     )
     assert worker.additional_config["unrelated"] == 17
 
 
 @pytest.mark.parametrize(
     "policy",
-    [{"moe": "adaptive"}, {"tile": 48}, {"execution": True}, {"engram": "gpu"}],
+    [
+        {"moe": "adaptive"},
+        {"tile": 48},
+        {"execution": True},
+        {"engram": "gpu"},
+        {"engram_upload": "auto"},
+    ],
 )
 def test_rejects_unknown_or_mistyped_options(policy):
     with pytest.raises((ValueError, TypeError)):
@@ -67,7 +76,11 @@ def test_rejects_unknown_or_mistyped_options(policy):
 def test_defaults_are_explicit_and_do_not_enable_approximation():
     cfg = config()
     verify_and_update_config(cfg)
-    assert cfg.additional_config["deepseek_v41"] == {"execution": "full", "moe": "gmm"}
+    assert cfg.additional_config["deepseek_v41"] == {
+        "execution": "full",
+        "moe": "gmm",
+        "engram_upload": "copy",
+    }
 
 
 def test_legacy_values_are_frozen_before_worker_env_changes(monkeypatch):
@@ -143,3 +156,10 @@ def test_legacy_engram_conflict_is_rejected(monkeypatch):
     monkeypatch.setenv("TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD", "0")
     with pytest.raises(ValueError, match="conflicts with --engram-config"):
         verify_and_update_config(config())
+
+
+def test_prepared_upload_requires_host_offload():
+    cfg = config(engram_upload="prepared_dma")
+    cfg.engram_config.cpu_offload = False
+    with pytest.raises(ValueError, match="requires --engram-config"):
+        verify_and_update_config(cfg)

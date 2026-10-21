@@ -26,19 +26,26 @@ class MoEBackend(StrEnum):
     FUSED_EP_W4A8 = "fused_ep_w4a8"
 
 
+class EngramUpload(StrEnum):
+    COPY = "copy"
+    PREPARED_DMA = "prepared_dma"
+
+
 @dataclass(frozen=True)
 class DeepseekV41Config:
     execution: ExecutionMode = ExecutionMode.FULL
     moe: MoEBackend = MoEBackend.GMM
+    engram_upload: EngramUpload = EngramUpload.COPY
 
     @classmethod
     def parse(cls, value: dict) -> "DeepseekV41Config":
-        unknown = value.keys() - {"execution", "moe"}
+        unknown = value.keys() - {"execution", "moe", "engram_upload"}
         if unknown:
             raise ValueError(f"Unknown deepseek_v41 config fields: {sorted(unknown)}")
         return cls(
             execution=ExecutionMode(value.get("execution", "full")),
             moe=MoEBackend(value.get("moe", "gmm")),
+            engram_upload=EngramUpload(value.get("engram_upload", "copy")),
         )
 
     @classmethod
@@ -153,6 +160,11 @@ def verify_and_update_config(config: "VllmConfig") -> None:
             "[DSV41] TPU_DEEPSEEK_V41_ENGRAM_CPU_OFFLOAD is "
             "deprecated; use --engram-config instead"
         )
+    if (
+        policy.engram_upload == EngramUpload.PREPARED_DMA
+        and not config.engram_config.cpu_offload
+    ):
+        raise ValueError("prepared_dma requires --engram-config cpu_offload=true")
     parallel = config.parallel_config
     if envs.TPU_DEEPSEEK_V41_IMPL != "v2":
         raise ValueError("DSV41 serving uses v2; remove TPU_DEEPSEEK_V41_IMPL")

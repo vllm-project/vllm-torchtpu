@@ -84,6 +84,10 @@ python scripts/dsv41_bench/server_steps/run.py \
   --rounds 5 --profile
 ```
 
+Add `--engram-upload prepared_dma` to test the experimental fixed-buffer Engram
+upload. The default is `copy`. The selected mode is recorded in `manifest.json`
+and the resolved serving policy log. Workload sizes and timing remain unchanged.
+
 For native GCS weight streaming, also set `MODEL_URI=gs://bucket/model-prefix`.
 The target and DSpark models use that URI; `MODEL_PATH` remains the local
 checkpoint metadata and tokenizer path. CI sets both paths and omits `--profile`.

@@ -117,6 +117,9 @@ def main() -> None:
     )
     parser.add_argument("--rounds", type=int)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument(
+        "--engram-upload", choices=["copy", "prepared_dma"], default="copy"
+    )
     args = parser.parse_args()
     if args.rounds is None:
         args.rounds = 1 if args.scenario == "decode" else 5
@@ -190,6 +193,18 @@ def main() -> None:
         "--compilation-config",
         json.dumps({"compile_sizes": buckets}),
     ]
+    server_command += [
+        "--additional-config",
+        json.dumps(
+            {
+                "deepseek_v41": {
+                    "execution": "ced",
+                    "moe": "fused_ep_w4a8",
+                    "engram_upload": args.engram_upload,
+                }
+            }
+        ),
+    ]
     if args.profile:
         server_command += [
             "--profiler-config",
@@ -202,6 +217,7 @@ def main() -> None:
         ]
     manifest = {
         "scenario": args.scenario,
+        "engram_upload": args.engram_upload,
         "compile_sizes": buckets,
         "cache_mode": "disabled",
         "serialization": "enabled",
@@ -217,6 +233,7 @@ def main() -> None:
     model = Path(env["MODEL_PATH"])
     identity = {
         "scenario": args.scenario,
+        "engram_upload": args.engram_upload,
         "compile_sizes": buckets,
         "packages": manifest["packages"],
         "torchtpu": source_identity(

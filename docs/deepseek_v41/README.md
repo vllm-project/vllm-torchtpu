@@ -29,7 +29,22 @@ enum has no TPU fused-EP entry. Leave `--moe-backend=auto` for this model.
 | --- | --- | --- |
 | `deepseek_v41.execution` | `full`, `ced` | `full` |
 | `deepseek_v41.moe` | `gmm`, `fused_ep_w4a8` | `gmm` |
+| `deepseek_v41.engram_upload` | `copy`, `prepared_dma` | `copy` |
 | `engram_config.cpu_offload` | `false`, `true` | `false` (legacy TPU default) |
+
+`prepared_dma` requires host Engram offload. It keeps two validated host/device
+buffer pairs per layer and token bucket. Local gathers write directly into DMA
+host storage. Uploads start asynchronously; each consumer waits for its upload,
+and slot reuse waits only for its previous upload and consumer graph outputs.
+This doubles prepared staging capacity per bucket; there is no device-wide fence.
+
+Pure prompt batches with local tables can prefetch the next same-size chunk
+after dispatching the current forward. Reuse requires exact matches of token
+IDs, positions, query boundaries, and lookback IDs. Changed scheduling and a
+shorter final chunk use normal preparation. Prefetch never issues speculative
+DP collectives. Decode keeps preparation within the current step; it does not
+predict future accepted tokens. Measure serving throughput before selecting
+this experimental mode.
 
 `fused_ep_w4a8` explicitly selects FP4 weights with FP8 activations; selecting
 it is a numeric choice, not a layout optimization. It requires EP and supported
