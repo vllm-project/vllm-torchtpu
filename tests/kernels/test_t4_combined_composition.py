@@ -345,21 +345,29 @@ def test_sparse_mla_dcp_op_schema(q_rope, rank):
 
 @pytest.mark.parametrize("qb", [False, True])
 @pytest.mark.parametrize("rank", [False, True])
-def test_indexer_dcp_op_schema(qb, rank):
-    """The indexer DCP op for each (q_b overlap, rank operand) variant
-    registers with exactly 8 + 3 * qb + rank operands."""
+@pytest.mark.parametrize("small_ag", [False, True])
+def test_indexer_dcp_op_schema(qb, rank, small_ag):
+    """The indexer DCP op for each (q_b overlap, rank operand, small
+    all-gather) variant registers with exactly 8 + 3 * qb + rank operands,
+    plus the lane operand TPU_DCP_INDEXER_SMALL_AG adds after the rank."""
     import torch
 
+    from vllm_torchtpu import envs
     from vllm_torchtpu.layers.adapter.custom_ops import mla_attention_op as mop
 
-    name = f"t4c_idx_{int(qb)}{int(rank)}"
+    name = f"t4c_idx_{int(qb)}{int(rank)}{int(small_ag)}"
     stub = mock.Mock(topk_tokens=2048)
     stub.k_cache.prefix = name
-    env = {"TPU_DCP_RANK_OPERAND": "1"} if rank else {}
+    env = {"TPU_DCP_INDEXER_SMALL_AG": "1" if small_ag else "0"}
+    if rank:
+        env["TPU_DCP_RANK_OPERAND"] = "1"
     with (
         mock.patch.dict(os.environ, env),
         mock.patch.object(
             mop, "dcp_rank_operand", return_value=torch.zeros(1, dtype=torch.int32)
+        ),
+        mock.patch.object(
+            mop, "dcp_lane_operand", return_value=torch.zeros(1, dtype=torch.int32)
         ),
     ):
         if not rank:
@@ -368,4 +376,5 @@ def test_indexer_dcp_op_schema(qb, rank):
     op = f"streamidx_topk_dcp_{name}" + ("_qb" if qb else "")
     schema = getattr(torch.ops.pallas, op).default._schema
     print(schema)
-    assert len(schema.arguments) == 8 + 3 * int(qb) + int(rank), schema
+    lane = rank and small_ag and envs.TPU_SC_TOPK_DCP_MERGE_FLAT
+    assert len(schema.arguments) == 8 + 3 * int(qb) + int(rank) + int(lane), schema
