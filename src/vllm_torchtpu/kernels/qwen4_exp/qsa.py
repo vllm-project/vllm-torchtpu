@@ -128,18 +128,24 @@ def _indexer_updates(
     req, logical, valid = _token_metadata(count, starts, context, slots)
     safe_slots = jnp.maximum(slots, 0)
     ratio = compress_ratio
+    # Every allocated ring row holds history: position p lives in lane
+    # p % rows. Keeping the newest `rows` (>= ratio) positions rather than
+    # only `ratio` lets speculative verification reject tokens without
+    # evicting the accepted members of the partial compression group that
+    # the next step re-reads (see config.max_qsa_speculative_tokens).
+    rows = ring.shape[1]
     group_start = logical // ratio * ratio
     members = group_start[:, None] + jnp.arange(ratio)[None]
     chunk_indices = starts[req, None] + members - context[req, None]
     current = raw[jnp.clip(chunk_indices, 0, count - 1)]
-    previous = ring[safe_slots[req, None], members % ratio]
+    previous = ring[safe_slots[req, None], members % rows]
     previous = jnp.where((context[req] > 0)[:, None, None], previous, 0)
     joined = jnp.where(
         (chunk_indices >= starts[req, None])[..., None], current, previous
     )
     pooled = bf16(jnp.mean(joined.astype(jnp.float32), axis=1))
     first_index = starts[req] + group_start - context[req]
-    old_position = tags[safe_slots[req], group_start % ratio, 0]
+    old_position = tags[safe_slots[req], group_start % rows, 0]
     first_position = jnp.where(
         first_index >= starts[req],
         positions[jnp.clip(first_index, 0, count - 1)],
@@ -156,14 +162,14 @@ def _indexer_updates(
     # Exactly one scatter per request/lane: no duplicate-index last-writer race.
     lengths = starts[1:] - starts[:-1]
     end = context + lengths
-    lanes = jnp.arange(ring.shape[1])[None]
-    last = end[:, None] - 1 - ((end[:, None] - 1 - lanes) % ratio)
+    lanes = jnp.arange(rows)[None]
+    last = end[:, None] - 1 - ((end[:, None] - 1 - lanes) % rows)
     local = starts[:-1, None] + last - context[:, None]
     old_ring = ring[safe_slots]
     old_tags = tags[safe_slots]
     old_ring = jnp.where((context > 0)[:, None, None], old_ring, 0)
     old_tags = jnp.where((context > 0)[:, None, None], old_tags, -1)
-    new_lane = (lanes < ratio) & (last >= context[:, None]) & (last < end[:, None])
+    new_lane = (last >= context[:, None]) & (last < end[:, None])
     rr = jnp.where(new_lane[..., None], raw[jnp.clip(local, 0, count - 1)], old_ring)
     pp = positions[jnp.clip(local, 0, count - 1)]
     tag_pairs = jnp.stack([pp, jnp.zeros_like(pp)], -1)

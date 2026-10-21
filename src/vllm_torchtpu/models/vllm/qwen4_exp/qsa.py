@@ -269,7 +269,9 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         self.max_selected_tokens = self.token_topk + self.compress_ratio - 1
         self.block_size = QSA_BLOCK_SIZE
         # Eight-row alignment is the current TPU allocation policy, not the
-        # logical compression ratio. Only compress_ratio lanes hold history.
+        # logical compression ratio. Every row holds history (position p in
+        # lane p % ring_size), which keeps speculative rejections from
+        # evicting accepted members of the partial compression group.
         self.ring_size = (self.compress_ratio + 7) // 8 * 8
         kv_size = min(tp_size, self.total_num_kv_heads)
         kv_rank = tp_rank // max(tp_size // self.total_num_kv_heads, 1)
