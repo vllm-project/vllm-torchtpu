@@ -49,33 +49,36 @@ def test_min_tokens_never_takes_the_drafter(monkeypatch, tokens):
 
 
 def test_retain_buffers_reads_each_buffer_in_warmup_only(monkeypatch):
+    """Off TPU (the TPU path lifts through `_keep_input`, which reads
+    nothing), each buffer is read once, by one-element index, never
+    reshaped (a flattened read relayouts the whole weight)."""
     import torch
 
     from vllm_torchtpu.compilation import shape_variants
 
+    class Buffer:
+        """A buffer stand-in recording how it is read (no reshape method)."""
+
+        def __init__(self, t):
+            self.t, self.reads = t, []
+
+        def dim(self):
+            return self.t.dim()
+
+        def __getitem__(self, idx):
+            self.reads.append(idx)
+            return self.t[idx]
+
     out = torch.ones(4, 8, dtype=torch.bfloat16)
-    w = torch.full((2, 3, 5), 2.0)
-    scale = torch.full((1,), 0.5)
+    w = Buffer(torch.full((2, 3, 5), 2.0))
+    scale = Buffer(torch.full((1,), 0.5))
 
     monkeypatch.setattr(shape_variants, "in_warmup", lambda: False)
     assert attention._retain_buffers(out, w, scale, None) is out
-
-    reads = []
-    real_getitem = torch.Tensor.__getitem__
-
-    def getitem(self, idx):
-        if self is w or self is scale:
-            # One element by index; no flattening (a relayout of the weight).
-            assert idx == (0,) * self.dim(), idx
-            reads.append(self)
-        return real_getitem(self, idx)
-
-    def no_reshape(self, *shape):
-        raise AssertionError("a retained buffer must not be reshaped")
+    assert w.reads == [] and scale.reads == []
 
     monkeypatch.setattr(shape_variants, "in_warmup", lambda: True)
-    monkeypatch.setattr(torch.Tensor, "__getitem__", getitem)
-    monkeypatch.setattr(torch.Tensor, "reshape", no_reshape)
     got = attention._retain_buffers(out, w, scale, None)
     assert torch.equal(got, out)
-    assert reads == [w, scale]
+    assert w.reads == [(0, 0, 0)]
+    assert scale.reads == [(0,)]
