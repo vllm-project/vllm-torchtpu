@@ -131,21 +131,41 @@ def _uv_before_merge_applies(num_tokens: int, is_backbone: bool) -> bool:
     return is_backbone and num_tokens > envs.bucket_gate_edge(min_tokens)
 
 
+def _keep_input_fn(a: jax.Array, b: jax.Array) -> jax.Array:
+    del b
+    return a
+
+
+def _keep_input_fake(a: torch.Tensor, b: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(a)
+
+
+# Registered at import: Dynamo cannot trace a lock-guarded registration.
+_keep_input = pallas.jax_op("pallas::keep_input", _keep_input_fn)
+_keep_input.register_fake(_keep_input_fake)
+
+
 def _retain_buffers(out: torch.Tensor, *buffers: torch.Tensor | None) -> torch.Tensor:
-    """`out` plus a zero read from each buffer, on the token-count branch that
-    does not use them: the backbone warmup hands a bucket over only between
-    traces that lift the same buffers (as `cp_mla_attention._retain_rank`). A
-    dead read would be eliminated, so the zero rides on `out`. One element by
-    index, not `reshape(-1)[0]`: flattening a tiled weight makes XLA relayout
-    all of it (the 8 MiB W_UV_dcp_qrep: ~11 us per layer, ~0.9 ms per decode
-    step over 78 layers, j-911bd7a9). The warmup-compiled graph is the one that
-    serves, so the read runs every step."""
+    """`out` unchanged, with each buffer lifted into the trace, on the
+    token-count branch that does not use them: the backbone warmup hands a
+    bucket over only between traces that lift the same buffers (as
+    `cp_mla_attention._retain_rank`). On TPU the buffer goes through an op
+    that ignores it (`_keep_input`, as #1935 trial 6's VSPACE did): no data is
+    read, so XLA drops the use. Any read of the buffer costs every serving
+    step, because the warmup-compiled graph is the one that serves: a
+    `reshape(-1)[0]` relayouted the whole 8 MiB W_UV_dcp_qrep (~0.93 ms per
+    decode step, j-911bd7a9) and even a one-element index read left
+    ~0.3 ms per decode step (c4 TPOT p50 3.42 vs 3.11 ms, j-91ab828f)."""
     from vllm_torchtpu.compilation import shape_variants
 
     if not shape_variants.in_warmup():
         return out
     for buf in buffers:
-        if buf is not None:
+        if buf is None:
+            continue
+        if out.device.type == "tpu":
+            out = _keep_input(out.contiguous(), buf)
+        else:
             value = buf[(0,) * buf.dim()].to(out.dtype)
             out = out + (value - value)
     return out
