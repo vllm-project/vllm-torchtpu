@@ -1110,7 +1110,6 @@ class KVCacheManager:
             kernel_block_sizes = prepare_kernel_block_sizes(
                 kv_cache_config, self.runner.attn_groups
             )
-        self.runner._kernel_block_sizes = kernel_block_sizes
         kernel_block_size_by_gid = build_kernel_block_size_by_group_id(
             kv_cache_config=kv_cache_config,
             kernel_block_sizes=kernel_block_sizes,

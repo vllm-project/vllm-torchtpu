@@ -7535,16 +7535,13 @@ class TPUModelRunner(GPUModelRunner):
 
         Groups whose kernel block is smaller than their manager block get a
         `KernelBlockTable`, so the block tables hold the kernel block ids TPU
-        attention reads. `kernel_block_sizes` defaults to the ones
-        `KVCacheManager` prepared.
+        attention reads. `kernel_block_sizes` is required; its `None` default
+        only matches the vLLM 0.32 base signature.
         """
-        super().may_reinitialize_input_batch(kv_cache_config)
         if kernel_block_sizes is None:
-            kernel_block_sizes = getattr(self, "_kernel_block_sizes", None)
-        if kernel_block_sizes is not None:
-            install_kernel_block_tables(
-                self.input_batch.block_table, kernel_block_sizes
-            )
+            raise ValueError("kernel_block_sizes is required on TPU")
+        super().may_reinitialize_input_batch(kv_cache_config)
+        install_kernel_block_tables(self.input_batch.block_table, kernel_block_sizes)
         if self.input_batch.block_table:
             self.max_num_blocks_per_req = self.input_batch.block_table[
                 0
