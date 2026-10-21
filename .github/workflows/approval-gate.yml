@@ -1,0 +1,159 @@
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+name: Approval Gate
+
+# Publishes the `CODEOWNERS Approval` check: every area a PR touches has an
+# approval from one of its owners in .github/CODEOWNERS (as it stands on the
+# base branch), the author's own approval never counts, and an area owned by
+# nobody but the author accepts any approval. Once the `main` and release
+# rulesets require this check in place of "require review from code
+# owners", GitHub stops pinning automatically requested owners and the
+# Reviewer Balancer can withdraw the other owners' requests. The verdict is
+# the same either way; only the enforcer differs. `scripts/find_owners.py
+# --gate` is the whole policy. There is no override: an emergency merge goes
+# through the rulesets' bypass, which GitHub records.
+#
+# Who may post the check. A ruleset ties a required check to the app that
+# posts it, and every GITHUB_TOKEN check run comes from the same app (GitHub
+# Actions), so a check posted with GITHUB_TOKEN could be forged by any
+# workflow on any branch of this repository. This check is therefore posted
+# with a token of a dedicated GitHub App, whose private key is a secret of
+# the `approval-gate` environment, and that environment admits only `main`
+# and `releases/**`. The rulesets pin that app's id. A job on a PR ref
+# cannot open the environment, so it cannot mint the token.
+#
+# Which copy of this file runs. pull_request_target and `workflow_dispatch
+# --ref main` run this file and the script from the base branch, and never
+# check out the PR, so no PR code runs with the app token (keep it that
+# way: the checkout below is pinned to the base commit, event fields are
+# read only through env). pull_request_review runs the PR's own copy of the
+# workflows, so that event does not publish: it only dispatches a `--ref
+# main` run for its PR (a review on a fork's PR cannot even do that; the
+# sweep below covers it within ten minutes).
+#
+# Every run is a complete re-judge, and every run for one PR -- event or
+# dispatched -- shares that PR's concurrency group, where a newer run
+# cancels an older one. The sweep never publishes itself, so no run can
+# overwrite a fresher verdict with a staler one.
+#
+# Rollout. Until the `APPROVAL_GATE_ENFORCE` repository variable is `true`,
+# a missing approval publishes as neutral: the check is advisory while it
+# is watched on live PRs. Set the variable in the same step that makes the
+# check required.
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, ready_for_review]
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+    inputs:
+      pr:
+        description: PR number to re-judge
+        required: true
+
+permissions:
+  contents: read
+  # The review event and the sweep dispatch runs; the check itself is posted
+  # with the app token, not GITHUB_TOKEN.
+  actions: write
+
+concurrency:
+  group: approval-gate-${{ github.event.pull_request.number || inputs.pr || 'sweep' }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: Run Approval Gate
+    if: >-
+      github.repository == 'vllm-project/vllm-torchtpu' &&
+      (github.event_name == 'pull_request_target' || github.event_name == 'workflow_dispatch') &&
+      (github.event.pull_request == null || github.event.pull_request.draft == false)
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    # Holds the app's private key; admits only main and releases/**.
+    environment: approval-gate
+    steps:
+      # The base commit, never the PR head: the script is policy. CODEOWNERS
+      # itself is read from the base branch through the API by the script.
+      - name: Check out the base branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.base.sha || github.sha }}
+          sparse-checkout: |
+            scripts/find_owners.py
+          sparse-checkout-cone-mode: false
+
+      - name: Mint the app token
+        id: app
+        uses: actions/create-github-app-token@v1
+        with:
+          app-id: ${{ vars.APPROVAL_GATE_APP_ID }}
+          private-key: ${{ secrets.APPROVAL_GATE_APP_PRIVATE_KEY }}
+
+      - name: Judge this PR
+        env:
+          GH_TOKEN: ${{ steps.app.outputs.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number || inputs.pr }}
+          ENFORCE: ${{ vars.APPROVAL_GATE_ENFORCE == 'true' && '--enforce' || '' }}
+        run: |
+          # shellcheck disable=SC2086  # ENFORCE is one optional flag or empty.
+          python3 scripts/find_owners.py \
+            --pr "${PR_NUMBER}" --repo "${REPO}" \
+            --gate --publish-check --no-color ${ENFORCE}
+
+  on-review:
+    name: Re-judge after a review
+    # The PR's own copy of this file runs here, so it must not publish.
+    # Only PRs from this repository have a token that can dispatch.
+    if: >-
+      github.repository == 'vllm-project/vllm-torchtpu' &&
+      github.event_name == 'pull_request_review' &&
+      github.event.pull_request.draft == false &&
+      github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - name: Dispatch a run from main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh workflow run approval-gate.yml --repo "${REPO}" --ref main -f "pr=${PR_NUMBER}"
+
+  sweep:
+    name: Re-judge PRs with recent activity
+    if: >-
+      github.repository == 'vllm-project/vllm-torchtpu' &&
+      github.event_name == 'schedule'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      # Dispatch rather than judge here: a dispatched run joins its PR's
+      # concurrency group, so it can never overwrite a fresher verdict from
+      # an event run. Runs started with GITHUB_TOKEN do not trigger further
+      # workflows, with workflow_dispatch as the documented exception.
+      - name: Dispatch one run per PR
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          since=$(date -u -d '-30 minutes' +%Y-%m-%dT%H:%M:%SZ)
+          for pr in $(gh pr list --repo "${REPO}" --state open --limit 200 \
+                        --search "draft:false updated:>=${since}" \
+                        --json number --jq '.[].number'); do
+            gh workflow run approval-gate.yml --repo "${REPO}" --ref main -f "pr=${pr}" ||
+              echo "::warning::Could not dispatch a run for PR #${pr}; it is re-judged on its next event."
+          done

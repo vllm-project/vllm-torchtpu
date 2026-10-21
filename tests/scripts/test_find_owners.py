@@ -472,3 +472,87 @@ def test_pinned_requests_are_reported_not_claimed(monkeypatch):
     ((_, body),) = gh.written
     assert "Withdrew the other code-owner requests: `p`." in body
     assert "GitHub kept the requests of `q`, `s`" in body
+
+
+# --------------------------------------------------------------------------
+# approval gate
+# --------------------------------------------------------------------------
+def _review(login, state, commit="head"):
+    return {"user": {"login": login}, "state": state, "commit_id": commit}
+
+
+def _verdict(groups, reviews, author="author", strict=False):
+    return find_owners.gate_verdict(groups, author, reviews, "head", strict)
+
+
+def test_gate_passes_when_an_owner_of_each_area_approved():
+    groups = _groups({"/a/": ["@alice", "@bob"], "/b/": ["@carol"]})
+    verdict = _verdict(
+        groups, [_review("Bob", "APPROVED"), _review("carol", "APPROVED")]
+    )
+    assert verdict["ok"]
+    assert [a["approved_by"] for a in verdict["areas"]] == [["Bob"], ["carol"]]
+
+
+def test_gate_fails_on_an_area_nobody_owning_it_approved():
+    groups = _groups({"/a/": ["@alice"], "/b/": ["@carol"]})
+    verdict = _verdict(
+        groups, [_review("carol", "APPROVED"), _review("dave", "APPROVED")]
+    )
+    assert not verdict["ok"]
+    assert [a["ok"] for a in verdict["areas"]] == [False, True]
+
+
+def test_gate_ignores_self_approval_but_accepts_anyone_for_a_self_owned_area():
+    groups = _groups({"/mine/": ["@author"], "/a/": ["@author", "@bob"]})
+    # /mine/ has nobody but the author, so dave's approval satisfies it;
+    # /a/ still has bob to ask, so dave does not count there.
+    verdict = _verdict(
+        groups, [_review("author", "APPROVED"), _review("dave", "APPROVED")]
+    )
+    by_pattern = {a["pattern"]: a for a in verdict["areas"]}
+    assert by_pattern["/mine/"]["sole_owner"] and by_pattern["/mine/"]["ok"]
+    assert not by_pattern["/a/"]["ok"]
+
+
+def test_gate_takes_each_reviewers_latest_decisive_review():
+    groups = _groups({"/a/": ["@bob"]})
+    approve_then_block = [
+        _review("bob", "APPROVED"),
+        _review("bob", "CHANGES_REQUESTED"),
+    ]
+    assert not _verdict(groups, approve_then_block)["ok"]
+    approve_then_comment = [_review("bob", "APPROVED"), _review("bob", "COMMENTED")]
+    assert _verdict(groups, approve_then_comment)["ok"]
+    dismissed = [_review("bob", "APPROVED"), _review("bob", "DISMISSED")]
+    assert not _verdict(groups, dismissed)["ok"]
+
+
+def test_gate_counts_a_stale_approval_unless_strict_and_reports_it():
+    groups = _groups({"/a/": ["@bob"]})
+    reviews = [_review("bob", "APPROVED", commit="older")]
+    lenient = _verdict(groups, reviews)
+    assert lenient["ok"] and lenient["areas"][0]["stale"] == ["bob"]
+    assert not _verdict(groups, reviews, strict=True)["ok"]
+
+
+def test_gate_summary_names_the_missing_owners_and_is_green_when_complete():
+    groups = _groups({"/a/": ["@alice", "@bob"], "/b/": ["@carol"]})
+    conclusion, title, summary = find_owners.gate_summary(
+        _verdict(groups, [_review("carol", "APPROVED")])
+    )
+    assert conclusion == "neutral"  # advisory until the rulesets require it
+    assert title == "Missing approval for 1 of 2 area(s)"
+    assert "`/a/` — needs an approval from @alice, @bob" in summary
+    assert "| `/b/` | ✅ @carol |" in summary
+    assert "Advisory" in summary
+    enforced, _, enforced_summary = find_owners.gate_summary(
+        _verdict(groups, [_review("carol", "APPROVED")]), enforce=True
+    )
+    assert enforced == "failure" and "Advisory" not in enforced_summary
+
+    conclusion, title, _ = find_owners.gate_summary(
+        _verdict(groups, [_review("alice", "APPROVED"), _review("carol", "APPROVED")])
+    )
+    assert (conclusion, title) == ("success", "All 2 area(s) approved")
+    assert find_owners.gate_summary({"areas": [], "ok": True})[0] == "success"

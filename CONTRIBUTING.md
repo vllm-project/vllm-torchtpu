@@ -168,9 +168,9 @@ Tests requiring physical TPU hardware run in Buildkite CI.
 When opening a pull request, please select the appropriate category prefix from the PR template (`[Bugfix]`, `[Core]`, `[Kernel]`, `[Model]`, `[Frontend]`, `[CI/Build]`, `[Doc]`, `[Misc]`) and complete the description and test plan checklists.
 
 ### Reviewer Routing
-GitHub automatically requests reviews from the owners in `.github/CODEOWNERS` of the files a PR changes, and a PR needs an approval from a code owner of each area it touches before it can merge.
+GitHub automatically requests reviews from the owners in `.github/CODEOWNERS` of the files a PR changes. A PR needs an approval from a code owner of each area it touches before it can merge; the `CODEOWNERS Approval` check (the Approval Gate workflow, `scripts/find_owners.py --gate`) judges that against the base branch's CODEOWNERS and is required by the branch rulesets. The author's own approval never counts, and an area owned by nobody but the author accepts any approval. There is no override label; an emergency merge goes through the rulesets' bypass.
 
-Because GitHub asks *every* owner of every area, the Reviewer Balancer workflow then trims a new PR to one owner per area: the owner with the fewest open review requests in the repository. It withdraws the other pending code-owner requests of those areas and leaves a comment saying whom it picked and why. While a branch ruleset requires review from code owners, GitHub keeps automatically requested owners and the comment says so instead. Any owner of an area may still approve it, you may request anyone else by hand, and the `no-reviewer-balance` label opts a PR out. To see the picks for your branch before opening a PR, run `scripts/find_owners.py --balance`.
+Because GitHub asks *every* owner of every area, the Reviewer Balancer workflow then trims a new PR to one owner per area: the owner with the fewest open review requests in the repository. It withdraws the other pending code-owner requests of those areas and leaves a comment saying whom it picked and why. Any owner of an area may still approve it, you may request anyone else by hand, and the `no-reviewer-balance` label opts a PR out. To see the picks for your branch before opening a PR, run `scripts/find_owners.py --balance`.
 
 ---
 

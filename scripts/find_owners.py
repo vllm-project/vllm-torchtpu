@@ -36,11 +36,15 @@ Typical use, from anywhere inside the repo:
 
     # What the Reviewer Balancer workflow runs on a new PR
     scripts/find_owners.py --pr 123 --balance --request --prune --comment
+
+    # Does PR 123 have an owner's approval for every area it touches?
+    scripts/find_owners.py --pr 123 --gate
 """
 
 from __future__ import annotations
 
 import argparse
+import base64
 import contextlib
 import hashlib
 import json
@@ -799,6 +803,234 @@ def balance_pr(
     return result
 
 
+# --------------------------------------------------------------------------
+# approval gate: one owner approval per area, published as a check run
+# --------------------------------------------------------------------------
+# The policy the Approval Gate workflow enforces in place of the ruleset's
+# "require review from code owners": every area a PR touches needs an
+# approval from one of its owners. Keeping it in a check rather than the
+# ruleset is what lets the balancer withdraw the other owners' requests,
+# which GitHub pins while the ruleset owns the rule.
+GATE_CHECK_NAME = "CODEOWNERS Approval"
+
+
+def fetch_codeowners(repo: str, ref: str) -> str:
+    """CODEOWNERS as it stands on `ref`, which for a PR must be the base
+    branch: a PR cannot grant itself ownership of what it changes."""
+    ok, out = run_checked(
+        [
+            "gh",
+            "api",
+            f"repos/{repo}/contents/.github/CODEOWNERS?ref={ref}",
+            "--jq",
+            ".content",
+        ]
+    )
+    if not ok:
+        if "404" in out or "Not Found" in out:
+            return ""
+        die(f"could not read CODEOWNERS from {ref}: {out}")
+    return base64.b64decode(out).decode("utf-8")
+
+
+def latest_decisive_reviews(reviews: list[dict]) -> dict[str, dict]:
+    """login key -> that user's latest review that was not a plain comment.
+
+    Reviews arrive oldest first. COMMENTED is skipped: on GitHub it does not
+    replace an earlier approval either. DISMISSED and CHANGES_REQUESTED do.
+    """
+    latest: dict[str, dict] = {}
+    for review in reviews:
+        user = review.get("user") or {}
+        if review.get("state") == "COMMENTED" or not user.get("login"):
+            continue
+        latest[handle_key(user["login"])] = review
+    return latest
+
+
+def gate_verdict(
+    groups: dict,
+    author: str | None,
+    reviews: list[dict],
+    head_sha: str,
+    strict: bool = False,
+) -> dict:
+    """Which touched areas carry an approval from one of their owners.
+
+    A self-approval never counts. An area owned only by the author accepts
+    any approval rather than deadlocking the PR. An approval on an older
+    commit is counted unless `strict`, and reported as stale either way.
+    """
+    approvals: dict[str, dict] = {}
+    for key, review in latest_decisive_reviews(reviews).items():
+        if review.get("state") != "APPROVED" or key == handle_key(author or ""):
+            continue
+        approvals[key] = {
+            "login": review["user"]["login"],
+            "stale": review.get("commit_id") != head_sha,
+        }
+
+    areas = []
+    for pattern in sorted(groups):
+        group = groups[pattern]
+        eligible = eligible_owners(group["owners"], author)
+        sole_owner = not eligible
+        candidates = (
+            list(approvals) if sole_owner else [handle_key(o) for o in eligible]
+        )
+        matched = [approvals[c] for c in candidates if c in approvals]
+        accepted = [a for a in matched if not (strict and a["stale"])]
+        areas.append(
+            {
+                "pattern": pattern,
+                "owners": [o.lstrip("@") for o in eligible],
+                "files": list(group["files"]),
+                "sole_owner": sole_owner,
+                "approved_by": [a["login"] for a in accepted],
+                "stale": [a["login"] for a in matched if a["stale"]],
+                "ok": bool(accepted),
+            }
+        )
+    return {"areas": areas, "ok": all(a["ok"] for a in areas)}
+
+
+def gate_summary(verdict: dict, enforce: bool = False) -> tuple[str, str, str]:
+    """(conclusion, title, markdown summary) for the check run.
+
+    Until the rulesets require this check, a missing approval publishes as
+    `neutral` (grey, advisory) rather than `failure`: a red X on every PR
+    for the whole window between opening and review would only teach people
+    to ignore it. `enforce` switches that to `failure`.
+    """
+    areas = verdict["areas"]
+    if not areas:
+        return (
+            "success",
+            "Nothing to gate",
+            "No CODEOWNERS rule matches the files in this PR.",
+        )
+    rows = ["| Area | Approved by | Owners | Files |", "| --- | --- | --- | --- |"]
+    blocked = []
+    stale_notes = []
+    for area in areas:
+        wanted = (
+            "anyone"
+            if area["sole_owner"]
+            else ", ".join(f"@{o}" for o in area["owners"])
+        )
+        approved = (
+            "✅ " + ", ".join(f"@{a}" for a in area["approved_by"])
+            if area["ok"]
+            else "❌"
+        )
+        rows.append(
+            f"| `{area['pattern']}` | {approved} | {wanted} | {len(area['files'])} |"
+        )
+        if area["stale"]:
+            stale_notes.append(
+                f"`{area['pattern']}`: approval from "
+                + ", ".join(f"@{a}" for a in area["stale"])
+                + " predates the current head commit"
+            )
+        if not area["ok"]:
+            blocked.append(
+                f"`{area['pattern']}` — you are its only owner, so any approval will do"
+                if area["sole_owner"]
+                else f"`{area['pattern']}` — needs an approval from {wanted}"
+            )
+    table = "\n".join(rows)
+    notes = ""
+    if stale_notes:
+        notes = (
+            "\n\n**Stale approvals** (counted, but predating the current head):\n\n- "
+        )
+        notes += "\n- ".join(stale_notes)
+    if blocked:
+        title = f"Missing approval for {len(blocked)} of {len(areas)} area(s)"
+        summary = (
+            "Every area a PR touches needs an approval from one of its owners.\n\n- "
+            + "\n- ".join(blocked)
+            + f"\n\n{table}{notes}"
+        )
+        if not enforce:
+            summary += "\n\n_Advisory: this check is not yet required to merge._"
+        return ("failure" if enforce else "neutral"), title, summary
+    return "success", f"All {len(areas)} area(s) approved", f"{table}{notes}"
+
+
+def publish_check(
+    repo: str, head_sha: str, conclusion: str, title: str, summary: str
+) -> None:
+    """Create or update the gate's check run on a commit, in place, so one
+    commit never carries two verdicts."""
+    check_name = GATE_CHECK_NAME.replace(" ", "%20")
+    listing = f"repos/{repo}/commits/{head_sha}/check-runs?check_name={check_name}"
+    ok, out = run_checked(
+        ["gh", "api", f"{listing}&per_page=1", "--jq", ".check_runs[0].id // empty"]
+    )
+    if not ok:
+        die(f"could not list check runs on {head_sha[:8]}: {out}")
+    body = {
+        "name": GATE_CHECK_NAME,
+        "head_sha": head_sha,
+        "status": "completed",
+        "conclusion": conclusion,
+        "output": {"title": title, "summary": summary},
+    }
+    if out:
+        cmd = ["gh", "api", "--method", "PATCH", f"repos/{repo}/check-runs/{out}"]
+    else:
+        cmd = ["gh", "api", "--method", "POST", f"repos/{repo}/check-runs"]
+    ok, out = run_checked(cmd + ["--input", "-"], stdin=json.dumps(body))
+    if not ok:
+        die(f"could not publish the {GATE_CHECK_NAME} check: {out}")
+
+
+def gate_pr(
+    pr: str,
+    repo: str,
+    style: Style,
+    *,
+    publish: bool,
+    strict: bool,
+    enforce: bool,
+) -> dict:
+    """Judge one PR against the CODEOWNERS of its base branch."""
+    fields = "{head: .head.sha, base: .base.ref, draft: .draft, author: .user.login}"
+    ok, out = run_checked(["gh", "api", f"repos/{repo}/pulls/{pr}", "--jq", fields])
+    if not ok:
+        die(f"could not read PR #{pr}: {out}")
+    head = json.loads(out)
+    files, _ = pr_files(pr, repo)
+    rules = parse_codeowners(fetch_codeowners(repo, head["base"]))
+    groups, _unowned = group_by_rule(files, rules)
+
+    ok, out = run_checked(
+        ["gh", "api", f"repos/{repo}/pulls/{pr}/reviews", "--paginate", "--jq", ".[]"]
+    )
+    if not ok:
+        die(f"could not read the reviews of PR #{pr}: {out}")
+    reviews = [json.loads(line) for line in out.splitlines() if line.strip()]
+    verdict = gate_verdict(groups, head["author"], reviews, head["head"], strict)
+    conclusion, title, summary = gate_summary(verdict, enforce)
+
+    print(style.bold(f"{GATE_CHECK_NAME}: {conclusion} — {title}"))
+    for area in verdict["areas"]:
+        mark = style.green("ok") if area["ok"] else style.yellow("missing")
+        who = ", ".join(area["approved_by"]) or "-"
+        print(f"  {area['pattern']}  {mark}  {who}")
+    if publish:
+        publish_check(repo, head["head"], conclusion, title, summary)
+        print(style.dim(f"published on {head['head'][:8]}"))
+    return {
+        "pr": pr,
+        "head": head["head"],
+        "conclusion": conclusion,
+        "title": title,
+        "verdict": verdict,
+    }
+
+
 class Style:
     def __init__(self, enabled: bool):
         self.enabled = enabled
@@ -965,18 +1197,62 @@ def main() -> None:
         help="with --pr --balance: keep one comment on the PR explaining the "
         "picks (the Reviewer Balancer workflow sets this)",
     )
+    parser.add_argument(
+        "--gate",
+        action="store_true",
+        help="with --pr: report whether every touched area has an approval "
+        "from one of its owners, judged against the base branch's CODEOWNERS",
+    )
+    parser.add_argument(
+        "--publish-check",
+        action="store_true",
+        help=f"with --gate: publish the verdict as the '{GATE_CHECK_NAME}' "
+        "check run on the PR's head commit (the Approval Gate workflow sets this)",
+    )
+    parser.add_argument(
+        "--enforce",
+        action="store_true",
+        help="with --gate: publish a missing approval as failure rather than the "
+        "advisory neutral (set once the rulesets require the check)",
+    )
+    parser.add_argument(
+        "--strict-stale",
+        action="store_true",
+        help="with --gate: count an approval only if it is on the current head "
+        "commit (GitHub's 'dismiss stale reviews')",
+    )
     parser.add_argument("--json", action="store_true", help="print JSON output")
     parser.add_argument("--no-color", action="store_true", help="disable color")
     args = parser.parse_args()
 
     if (args.prune or args.comment) and not (args.pr and args.balance):
         parser.error("--prune and --comment need --pr and --balance")
+    if (args.gate or args.publish_check or args.strict_stale) and not args.pr:
+        parser.error("--gate needs --pr")
+    if (args.publish_check or args.strict_stale or args.enforce) and not args.gate:
+        parser.error("--publish-check, --strict-stale and --enforce need --gate")
 
     color = sys.stdout.isatty() and not args.no_color and not os.environ.get("NO_COLOR")
     style = Style(color)
 
     # With --json the human report goes to stderr, so stdout stays parseable.
     report_to = contextlib.redirect_stdout(sys.stderr) if args.json else nullcontext()
+
+    if args.gate:
+        # Reads CODEOWNERS from the PR's base branch itself, so it needs no
+        # checkout and no --codeowners.
+        with report_to:
+            result = gate_pr(
+                str(args.pr),
+                resolve_repo(args.repo),
+                style,
+                publish=args.publish_check,
+                strict=args.strict_stale,
+                enforce=args.enforce,
+            )
+        if args.json:
+            print(json.dumps(result, indent=2))
+        return
 
     root = repo_root()
     rules, codeowners_path = load_rules(root, args.codeowners)
