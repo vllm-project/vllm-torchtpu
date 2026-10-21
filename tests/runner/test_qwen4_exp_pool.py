@@ -100,6 +100,7 @@ def test_pool_initialize_builds_mamba_plan_from_materialized_layers(monkeypatch,
         layer_to_raw={"gdn": raw, "gdn.alias": raw, "ple": raw},
     )
     cache.allocate = lambda: None
+    cache.hbm_sizing = False
     monkeypatch.setattr(pooled_cache, "AttentionMetadataBuilder", lambda *a, **kw: None)
 
     transfer_caches = cache.initialize(config)
@@ -210,6 +211,8 @@ def test_pool_warmup_tables_match_native_ring_padding():
         query_start_loc=torch.tensor([0] + [128] * 8, dtype=torch.int32, device="cpu"),
         seq_lens=torch.tensor([128] + [0] * 7, dtype=torch.int32, device="cpu"),
     )
+    # Exactly the pages the profiling scratch pool is sized to.
+    cache.pages = cache.dummy_pages([128], active_rows=1)
     warmup = cache.dummy_metadata(metadata, active_rows=1)
     for gid, group in enumerate(cache.groups):
         item = warmup[group.layer_names[0]]

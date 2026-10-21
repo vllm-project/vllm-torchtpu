@@ -128,6 +128,18 @@ class Qwen4ExpAdapter:
         assert self.cache is not None
         return self.cache.initialize(config)
 
+    def kv_cache_memory_budget(self) -> int | None:
+        """Bytes to report for the KV cache after profiling, or None.
+
+        The unified pool under HBM sizing reports its own budget; every
+        other configuration keeps the worker's default accounting.
+        """
+        cache = self.cache
+        if not self.pooled or cache is None:
+            return None
+        pooled = cast("Qwen4ExpPooledCache", cache)
+        return pooled.memory_budget() if pooled.hbm_sizing else None
+
     def begin_step(self):
         # Exactly one immutable H2D snapshot after runner request reordering.
         # Row numbers in this store are unrelated to state slots/page IDs.
@@ -250,10 +262,24 @@ class Qwen4ExpAdapter:
             "S1 dummy calls require no live requests"
         )
         assert self.cache is not None
-        self.cache.allocate()
         lengths = dummy_query_lengths(
             num_tokens, num_reqs, runner.scheduler_config.max_num_seqs
         )
+        if self.pooled:
+            # Before the KV cache is planned this sizes the profiling
+            # scratch pool to exactly what the dummy forward addresses.
+            seq_lens = [
+                q + (profile_prefix or 0) * (i == 0) for i, q in enumerate(lengths)
+            ]
+            pooled = cast("Qwen4ExpPooledCache", self.cache)
+            pooled.allocate(
+                max(
+                    pooled.dummy_pages(seq_lens, sum(q > 0 for q in lengths)),
+                    1 + sum(math.ceil(n / self.block_size) for n in seq_lens),
+                )
+            )
+        else:
+            self.cache.allocate()
         starts_cpu = torch.tensor(
             [0] + lengths, dtype=torch.int32, device="cpu"
         ).cumsum(0, dtype=torch.int32)

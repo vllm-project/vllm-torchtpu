@@ -175,6 +175,87 @@ def native_cache_capacity(cfg, specs=None):
     return pages
 
 
+# Default reserve beside the pool (and its graph-time copies) for
+# activations and the program regions of every compiled bucket. The
+# 8192-token profiling forward needs ~1.3 GiB of non-pool temporaries; with
+# one graph copy this plans ~36.6 GiB on v7x, the 36 GiB pool already
+# serving AgentX.
+POOL_HEADROOM_BYTES = 6 * 1024**3
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name, "").strip()
+    return int(value) if value else default
+
+
+def hbm_pool_sizing(cfg) -> bool:
+    """Size the unified pool from profiled HBM instead of a static formula.
+
+    The default for the unified pool. ``QWEN4_EXP_POOL_SIZING=static``
+    restores ``native_cache_capacity``; PD keeps it (both sides must agree
+    on the pool before profiling), and so does an explicit
+    ``--num-gpu-blocks-override``.
+    """
+    return (
+        use_unified_pool()
+        and getattr(cfg, "kv_transfer_config", None) is None
+        and getattr(cfg.cache_config, "num_gpu_blocks_override", None) is None
+        and os.environ.get("QWEN4_EXP_POOL_SIZING", "hbm").strip().lower() != "static"
+    )
+
+
+def pool_graph_copies() -> int:
+    """Extra pool-sized buffers a compiled forward holds, by default one.
+
+    The pooled ops update the pool in place inside the graph, but the
+    compiled program does not alias its pool input to its output: AOT
+    autograd applies graph-input mutations after the program
+    (``keep_inference_input_mutations=False``), so the program writes a
+    fresh pool-sized buffer. The 40 GiB-pool profiling compile failed on
+    exactly that: 96.89 GiB = 15.6 GiB resident + the 40 GiB pool input +
+    a 40 GiB temporary holding every pool value. ``0`` once the pool is
+    donated.
+    """
+    return max(0, _env_int("QWEN4_EXP_POOL_GRAPH_COPIES", 1))
+
+
+def pool_headroom_bytes() -> int:
+    return max(0, _env_int("QWEN4_EXP_POOL_HEADROOM_BYTES", POOL_HEADROOM_BYTES))
+
+
+def pooled_pool_blocks(
+    bytes_per_block: int,
+    *,
+    cap_available: int,
+    physical_available: int,
+    min_blocks: int,
+) -> int:
+    """Unified pool blocks that fit the measured HBM.
+
+    ``cap_available``: bytes free under ``gpu_memory_utilization`` with no
+    pool allocated; ``physical_available``: bytes free on the device. The
+    pool plus the headroom must fit the former; the pool, its graph-time
+    copies and the headroom the latter. ``QWEN4_EXP_MAX_POOL_BYTES`` caps
+    the pool when set (no cap by default).
+    """
+    headroom = pool_headroom_bytes()
+    budget = min(
+        cap_available - headroom,
+        (physical_available - headroom) // (1 + pool_graph_copies()),
+    )
+    cap = _env_int("QWEN4_EXP_MAX_POOL_BYTES", 0)
+    if cap > 0:
+        budget = min(budget, cap)
+    blocks = max(0, budget) // bytes_per_block
+    if blocks < min_blocks:
+        raise ValueError(
+            f"Qwen4Exp unified pool fits {blocks} blocks in the measured HBM "
+            f"(cap_available={cap_available}, physical={physical_available}, "
+            f"headroom={headroom}, graph copies={pool_graph_copies()}), fewer "
+            f"than the {min_blocks} one max_model_len request needs; lower "
+            "max_model_len or the headroom"
+        )
+    return blocks
 def normalize_text_config(t) -> None:
     """Restore the checkpoint's spelling of the text config fields.
 
@@ -235,6 +316,10 @@ class TPUQwen4ExpConfig(VerifyAndUpdateConfig):
                 else None
             )
             vllm_config.cache_config.mamba_page_size_padded = layout.page_bytes
+            if hbm_pool_sizing(vllm_config):
+                # Workers report the pool budget after profiling
+                # (Qwen4ExpPooledCache.memory_budget); vLLM plans the blocks.
+                return
             pages = native_cache_capacity(vllm_config, specs)
         else:
             pages = native_cache_capacity(vllm_config)
