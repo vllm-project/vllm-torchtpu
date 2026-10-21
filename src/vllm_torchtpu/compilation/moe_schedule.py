@@ -5,9 +5,11 @@ Graph-only protobuf fields follow openxla/xla's xla/service/hlo.proto.
 Unknown fields (including layouts and backend configs) round-trip unchanged.
 """
 
+import hashlib
 import heapq
 import json
 import threading
+from pathlib import Path
 from typing import Any
 
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
@@ -271,7 +273,16 @@ def rewrite_moe_schedule(blob: bytes) -> bytes | None:
                     )
         if comp_changed:
             _sort(comp, sequence, priorities)
-    return module.SerializeToString() if changed else None
+    result = module.SerializeToString() if changed else None
+    # Temporary CI diagnosis: capture the actual full serving graph.
+    output = Path("/perf_eval_results")
+    if result is not None and output.is_dir():
+        output = output / "moe-hlo"
+        output.mkdir(exist_ok=True)
+        name = hashlib.sha256(blob).hexdigest()
+        (output / f"{name}.before.pb").write_bytes(blob)
+        (output / f"{name}.after.pb").write_bytes(result)
+    return result
 
 
 _install_lock = threading.Lock()
