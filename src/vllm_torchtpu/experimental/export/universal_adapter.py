@@ -76,6 +76,24 @@ def _extract_hf_field(hf_config: Any, *keys: str, default: Any = None) -> Any:
     return default
 
 
+def _min_smem_page_size(
+    parallel_cfg: Any, max_num_seqs: int, max_model_len: int
+) -> int:
+    """Smallest power-of-two page size whose block table fits half of SMEM.
+
+    Mirrors `get_tpu_min_page_size`, which serving applies to the block size
+    once the model is loaded; the exporter builds its config before that, so
+    it takes the already-resolved values rather than a full `VllmConfig`.
+    """
+    if int(getattr(parallel_cfg, "prefill_context_parallel_size", 1) or 1) > 1:
+        return 1
+    max_pages_per_req = 1024 * 1024 // 2 // max_num_seqs // 4
+    dcp = int(getattr(parallel_cfg, "decode_context_parallel_size", 1) or 1)
+    local_max_model_len = -(-max_model_len // dcp)
+    min_page = -(-local_max_model_len // max_pages_per_req)
+    return 1 << (min_page - 1).bit_length()
+
+
 def build_export_config_from_vllm(
     vllm_config: Any,
     *,
@@ -168,6 +186,9 @@ def build_export_config_from_vllm(
     max_model_len = int(
         getattr(model_cfg, "max_model_len", None)
         or _extract_hf_field(hf_cfg, "max_position_embeddings", default=2048)
+    )
+    block_size = max(
+        block_size, _min_smem_page_size(parallel_cfg, max_num_seqs, max_model_len)
     )
 
     raw_eos = _extract_hf_field(hf_cfg, "eos_token_id", default=151645)

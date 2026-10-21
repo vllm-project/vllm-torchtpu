@@ -32,6 +32,7 @@ from vllm_torchtpu.experimental.export import (
     exporter,
     sampling,
     tpu_lowering,
+    universal_adapter,
     validator,
     weight_mapper,
 )
@@ -394,7 +395,7 @@ def test_universal_adapter_1d_and_2d_mrope_export_and_cli(tmp_path) -> None:
         hidden_size=32,
         num_layers=2,
         mrope_section=[4, 6, 6],
-    )
+    ).to(torch.bfloat16)
     vllm_cfg = SimpleNamespace(
         model_config=SimpleNamespace(
             model=str(hf_dir),
@@ -417,8 +418,14 @@ def test_universal_adapter_1d_and_2d_mrope_export_and_cli(tmp_path) -> None:
             tensor_parallel_size=2,
             data_parallel_size=1,
             pipeline_parallel_size=1,
+            use_sequence_parallel_moe=False,
+            is_moe_model=False,
         ),
-        compilation_config=SimpleNamespace(compile_sizes=[8, 16]),
+        compilation_config=SimpleNamespace(
+            compile_sizes=[8, 16],
+            fast_moe_cold_start=False,
+            static_forward_context={},
+        ),
     )
 
     out_dir = str(tmp_path / "exported_mrope")
@@ -458,3 +465,22 @@ def test_universal_adapter_1d_and_2d_mrope_export_and_cli(tmp_path) -> None:
     assert wjson["mesh"] == {"mesh_shape": [1, 2], "axis_names": ["dp", "tp"]}
     assert wjson["lm_head.weight"]["sharding"] == ["tp", None]
     assert wjson["lm_head.weight"]["sources"][0]["path"] == "model.safetensors"
+
+
+def test_build_export_config_raises_block_size_to_fit_smem() -> None:
+    def cfg(max_num_seqs: int, max_model_len: int, block_size: int = 16) -> Any:
+        return SimpleNamespace(
+            model_config=SimpleNamespace(
+                model="m", dtype="bfloat16", max_model_len=max_model_len
+            ),
+            cache_config=SimpleNamespace(block_size=block_size),
+            scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
+        )
+
+    build = universal_adapter.build_export_config_from_vllm
+    # 128 seqs x 40960 tokens at page 16 is a 1.25 MiB block table.
+    assert build(cfg(128, 40960)).block_size == 64
+    assert build(cfg(256, 40960)).block_size == 128
+    assert build(cfg(8, 128, block_size=8)).block_size == 8
+    big = build(cfg(128, 40960))
+    assert big.max_num_pages * 4 <= 1024 * 1024 // 2
