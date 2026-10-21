@@ -636,9 +636,6 @@ class TestWanFreshTimestepPatch:
                 (hidden_states, timestep, kwargs)
             ),
         )
-        # apply_omni_model_specific_patches() may already have patched the
-        # class in this session; reset the flag so this test can re-wrap.
-        monkeypatch.setattr(cls, patches._FRESH_TIMESTEP_PATCHED, False, raising=False)
         synced = []
         monkeypatch.setattr(
             "vllm_torchtpu.utils.synchronize_tensors",

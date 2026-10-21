@@ -290,9 +290,10 @@ def _patch_wan_fresh_timestep() -> None:
     #   a tiny copy graph sees the view.
     # Effect (v7x, 480x832x81, 8 cores): first 12-step request 53.0 s -> 26.9 s
     #   (warm: 15.3 s); output is bit-identical.
-    # Scope: WanTransformer3DModel (T2V, I2V, TI2V, both A14B experts), VACE
-    #   (overrides forward) and S2V (separate class). The numbers above are
-    #   T2V; VACE and S2V are covered but not measured on TPU.
+    # Scope: WanTransformer3DModel (T2V, I2V, TI2V, both A14B experts),
+    #   WanVACETransformer3DModel (overrides forward) and
+    #   WanS2VTransformer3DModel (separate class). The numbers above are T2V;
+    #   the VACE and S2V classes are covered but not measured on TPU.
     # TODO: remove once torch_tpu passes view offsets as runtime inputs.
     from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import (
         WanS2VTransformer3DModel,
@@ -310,16 +311,20 @@ def _patch_wan_fresh_timestep() -> None:
         WanS2VTransformer3DModel,
     ):
         _wrap_fresh_timestep(cls)
-    logger.info("Applied TPU patch: fresh timestep buffer for Wan, VACE and S2V.")
+    logger.info(
+        "Applied TPU patch: fresh timestep buffer for WanTransformer3DModel, "
+        "WanVACETransformer3DModel and WanS2VTransformer3DModel."
+    )
 
 
 _FRESH_TIMESTEP_PATCHED = "_tpu_fresh_timestep_patched"
 
 
 def _wrap_fresh_timestep(cls: type) -> None:
-    # cls.__dict__, not hasattr: VACE inherits attributes from
-    # WanTransformer3DModel.
-    if cls.__dict__.get(_FRESH_TIMESTEP_PATCHED):
+    # The flag lives on the forward function, not the class:
+    # WanVACETransformer3DModel subclasses WanTransformer3DModel but has its
+    # own forward, which still needs the wrapper.
+    if getattr(cls.forward, _FRESH_TIMESTEP_PATCHED, False):
         return
     forward = cls.forward
 
@@ -333,5 +338,5 @@ def _wrap_fresh_timestep(cls: type) -> None:
             synchronize_tensors(timestep, wait=False)
         return forward(self, hidden_states, timestep, *args, **kwargs)
 
+    setattr(_fresh_timestep_forward, _FRESH_TIMESTEP_PATCHED, True)
     cls.forward = _fresh_timestep_forward
-    setattr(cls, _FRESH_TIMESTEP_PATCHED, True)
