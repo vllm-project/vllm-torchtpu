@@ -27,8 +27,12 @@ threaded stand-in for the exchange; this pins what only hardware can answer:
      fails when every chunk is weighted with its neighbour row's lse.
   5. Collapsing the chunked merge's per-chunk lse gathers into one
      (`TPU_DCP_MERGE_CHUNKED_LSE_AG`) returns the per-chunk-gather merge bit
-     for bit, eager and compiled, and the same check fails when the collapsed
-     gather's rows are shifted by one.
+     for bit eager; compiled, where XLA lays out the reduce-scatter operand of
+     its torch weighting in another order than the per-chunk merge's Pallas
+     kernel writes (and the SparseCore reduce-scatter's f32 sum order follows
+     that layout), it meets the per-chunk merge's own bar (one bf16 ulp of the
+     f64 reference, or no less exact than it compiled the same way). The same
+     check fails when the collapsed gather's rows are shifted by one.
   6. Packing the lse bits into the partial's all-to-all
      (`TPU_DCP_LSE_MERGE_A2A_PACK`) returns the two-exchange a2a merge bit for
      bit eager; compiled, where the merge fusion sees the received partial in
@@ -122,7 +126,7 @@ RS_BF16_ARMS = {
 RS_BF16_MAX_ULP = {1: 7.0, 2: 1.5}
 # Arms that must return today's merge: same per-row arithmetic, other schedule.
 CHUNK_ARMS = ("chunk2", "chunk4", "chunk8", "chunk8_ag1")
-# Collapsed lse gathers (`TPU_DCP_MERGE_CHUNKED_LSE_AG`): bitwise chunk8.
+# Collapsed lse gathers (`TPU_DCP_MERGE_CHUNKED_LSE_AG`): bitwise chunk8 eager.
 LSE_AG_ARMS = ("chunk8_ag1",)
 # lse packed into the partial's exchange (`TPU_DCP_LSE_MERGE_A2A_PACK`): bitwise a2a.
 PACK_ARMS = ("a2a_pack",)
@@ -983,7 +987,13 @@ def assert_merge_results(results: list[dict]) -> None:
         for arm in LSE_AG_ARMS:
             for how in ("eager", "compiled"):
                 c = check[f"{arm}/{how}"]
-                assert c.get("bitwise_vs_chunk8") is True, (r["rank"], arm, how, c)
+                if how == "eager":
+                    assert c.get("bitwise_vs_chunk8") is True, (r["rank"], arm, how, c)
+                chunk8 = check[f"chunk8/{how}"]
+                assert c["within_1ulp"] or (
+                    c["frac_over_1ulp"] <= chunk8["frac_over_1ulp"]
+                    and c["max_abs_err"] <= chunk8["max_abs_err"]
+                ), (r["rank"], arm, how, chunk8, c)
                 ctl = check[f"control_misaligned/{arm}/{how}"]
                 assert "error" not in ctl, (r["rank"], arm, how, ctl)
                 assert not ctl["within_1ulp"], (
