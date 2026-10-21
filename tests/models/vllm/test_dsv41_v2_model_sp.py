@@ -285,7 +285,10 @@ def test_prepare_engram_full_path(monkeypatch: pytest.MonkeyPatch):
         def __call__(self, *args: Any) -> torch.Tensor:
             return torch.ones((4, 3, 1), dtype=torch.int32)
 
-    model = SimpleNamespace(
+    class _FakeModel(SimpleNamespace):
+        _stage_engram_layers = v2_model.DeepseekV41Model._stage_engram_layers
+
+    model = _FakeModel(
         engram_hash=_FakeEngramHash(),
         engram_swa_prefix="swa",
         engram_dp_shared_memory=False,
@@ -363,21 +366,12 @@ def test_prepare_engram_full_path(monkeypatch: pytest.MonkeyPatch):
     )
     assert h_dict is not None
 
-    # 7. gathered_hashes on TPU/non-cpu converted to cpu
-    class _FakeTpuHashes(torch.Tensor):
-        @property
-        def device(self):
-            return SimpleNamespace(type="tpu")
-
-        def to(self, device):
-            return torch.zeros((4, 3, 1), dtype=torch.int32)
-
+    # 7. Use the CPU collective result and skip layers without Engram.
+    gathered_hashes = torch.arange(12, dtype=torch.int32).view(4, 3, 1)
     monkeypatch.setattr(
         v2_model.upstream,
         "gather_engram_hashes",
-        lambda h, dp_shared_memory: torch.zeros(
-            (4, 3, 1), dtype=torch.int32
-        ).as_subclass(_FakeTpuHashes),
+        lambda h, dp_shared_memory: gathered_hashes,
     )
     model.layers.append(SimpleNamespace(engram=None))
     model.end_layer = len(model.layers)
@@ -385,6 +379,7 @@ def test_prepare_engram_full_path(monkeypatch: pytest.MonkeyPatch):
         model, ids, pos, lookback, skip_lookup=False
     )
     assert h_cpu is not None
+    torch.testing.assert_close(prepared_embeddings[-1], gathered_hashes[:, 0])
 
     # 8. engram_dp_shared_memory=True when ensure_cache() is False
     model.engram_hash.ensure_cache = lambda: False

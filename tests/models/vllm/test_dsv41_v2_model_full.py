@@ -755,11 +755,11 @@ class TestModelEngramMethods:
             assert hashes is not None
             model.engram_hash.dummy_hashes.assert_called_once()
 
-        # 5. gathered_hashes on non-CPU device with cpu_offload transfers to CPU
+        # 5. The host collective already returns CPU hashes; do not copy again.
         model.engram_hash.ensure_cache.return_value = True
-        device_tensor = MagicMock()
-        device_tensor.device.type = "cuda"
-        device_tensor.to.return_value = torch.zeros((2, 4, 1))
+        gathered_hashes = torch.zeros((2, 4, 1), dtype=torch.int32)
+        prepared = model.layers[0].engram.prepare_embeddings
+        prepared.reset_mock()
         with (
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.is_forward_context_available",
@@ -779,13 +779,20 @@ class TestModelEngramMethods:
             ),
             patch(
                 "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.gather_engram_hashes",
-                return_value=device_tensor,
+                return_value=gathered_hashes,
             ),
+            patch.object(
+                gathered_hashes, "to", wraps=gathered_hashes.to
+            ) as gathered_to,
         ):
             model._prepare_engram(
                 input_ids, pos, torch.tensor([[10, 11]]), stage="full"
             )
-            device_tensor.to.assert_called_once_with("cpu")
+            gathered_to.assert_not_called()
+            prepared.assert_called_once()
+            torch.testing.assert_close(
+                prepared.call_args.args[0], gathered_hashes[:, 0]
+            )
 
         # 6. host is not None calls hash_on_host (line 270) and layer with no
         # engram (branch 303->301)
