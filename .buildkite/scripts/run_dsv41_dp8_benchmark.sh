@@ -42,6 +42,8 @@ if [[ "$scenario" == decode ]]; then
   python -m pytest -q tests/models/vllm/test_dsv41_decode_indexer_route.py \
     -k 'decode_route_tpu_matches_existing or candidate_cache_matches_existing_with_fallback or basic_config or long_candidate_cache' \
     --junitxml="$results/kernel-routes.xml"
+  python -m pytest -q tests/kernels/fused_moe/test_preprocess_scatter.py \
+    --junitxml="$results/kernel-preprocess-scatter.xml"
   python -m pytest -q tests/kernels/fused_moe/test_fused_ep_moe_v2.py \
     -k row_padded_flat_scales --junitxml="$results/kernel-scales.xml"
 fi

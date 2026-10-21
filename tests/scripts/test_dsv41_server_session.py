@@ -78,6 +78,9 @@ def test_ci_launch_and_optional_profile_share_one_server(
         assert env["USE_PHASED_PROFILER"] == "0"
         assert env["TP"] == "1" and env["DP"] == "8"
         assert env["CHUNK"] == "2048"
+        assert env["MOE_FUSED_EP_PREPROCESS_BACKEND"] == (
+            "topology" if scenario == "decode" else "native"
+        )
         assert env["VLLM_DISABLE_COMPILE_CACHE"] == "1"
         assert env["JAX_ENABLE_COMPILATION_CACHE"] == "false"
         assert env["TORCHINDUCTOR_FORCE_DISABLE_CACHES"] == "1"

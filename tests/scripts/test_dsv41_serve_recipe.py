@@ -13,7 +13,8 @@ ROOT = Path(__file__).resolve().parents[2]
 pytestmark = pytest.mark.cpu_test
 
 
-def test_cached_recipe_selects_policy_without_kernel_env(tmp_path):
+@pytest.mark.parametrize("preprocess_backend", [None, "topology"])
+def test_cached_recipe_selects_policy_without_kernel_env(tmp_path, preprocess_backend):
     vllm = tmp_path / "vllm"
     vllm.write_text(
         "#!/usr/bin/env python3\nimport json,os,sys\n"
@@ -25,6 +26,8 @@ def test_cached_recipe_selects_policy_without_kernel_env(tmp_path):
         for k, v in os.environ.items()
         if not k.startswith(("TPU_DEEPSEEK_V41_", "MOE_", "USE_MOE_"))
     }
+    if preprocess_backend is not None:
+        env["MOE_FUSED_EP_PREPROCESS_BACKEND"] = preprocess_backend
     env["PATH"] = str(tmp_path) + os.pathsep + env["PATH"]
     result = subprocess.run(
         [
@@ -46,9 +49,20 @@ def test_cached_recipe_selects_policy_without_kernel_env(tmp_path):
         "deepseek_v41": {"execution": "ced", "moe": "fused_ep_w4a8"}
     }
     assert json.loads(argv[argv.index("--engram-config") + 1]) == {"cpu_offload": True}
-    assert not any(
-        k.startswith(("TPU_DEEPSEEK_V41_", "MOE_", "USE_MOE_")) for k in output["env"]
+    kernel_env = {
+        k: v
+        for k, v in output["env"].items()
+        if k.startswith(("TPU_DEEPSEEK_V41_", "MOE_", "USE_MOE_"))
+    }
+    assert kernel_env == (
+        {}
+        if preprocess_backend is None
+        else {"MOE_FUSED_EP_PREPROCESS_BACKEND": "topology"}
     )
+    assert (
+        "--xla_mosaic_unsafe_allow_multicore_remote_dma=true"
+        in output["env"]["LIBTPU_INIT_ARGS"]
+    ) == (preprocess_backend == "topology")
     assert json.loads(argv[-1])["compile_sizes"] == [24, 128, 256, 2048]
 
 

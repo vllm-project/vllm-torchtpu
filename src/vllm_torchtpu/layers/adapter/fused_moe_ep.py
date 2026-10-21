@@ -186,9 +186,13 @@ def _build_op(
     logical_intermediate_size: int | None = None,
 ):
     """The op for this closure, built once per distinct closure and reused."""
+    from vllm_torchtpu.compilation.moe_preprocessing import prepare_moe_preprocessing
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
 
+    preprocess_topology = prepare_moe_preprocessing(mesh)
+
     key = (
+        preprocess_topology,
         topk,
         renormalize,
         activation,
@@ -232,6 +236,7 @@ def _build_op(
             topk=topk,
             renormalize=renormalize,
             mesh=mesh,
+            preprocess_topology=preprocess_topology,
             capacity=_TILE_M,
             block=None,
             ragged_stride=None,

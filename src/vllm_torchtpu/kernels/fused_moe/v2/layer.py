@@ -60,6 +60,7 @@ from vllm_torchtpu.kernels.fused_moe.v2.kernel import (
     combine_step_tokens,
     rowquant_fp8,
 )
+from vllm_torchtpu.kernels.fused_moe.v2.preprocessing import PreprocessTopology
 from vllm_torchtpu.kernels.fused_moe.v2.router_ops import pallas_select
 from vllm_torchtpu.kernels.fused_moe.v2.token_parallel import (
     TokenReplicaLayout,
@@ -282,6 +283,7 @@ def fused_ep_moe_v2(
     stage="fused",
     routed=None,
     gather_positions=None,
+    preprocess_topology: PreprocessTopology | None = None,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -716,11 +718,23 @@ def fused_ep_moe_v2(
         # smaller shape, so it is taken only where the routing plan in front
         # of the collective is longer than the scatters behind it. Same bits
         # either way; only the queue moves.
-        if t_local >= AGQ_MIN_LOCAL_TOKENS:
+        if not use_split_sc and t_local >= AGQ_MIN_LOCAL_TOKENS:
             slab_row, q_g = lax.optimization_barrier((slab_row, q_g))
-        token_gather = shard_token_gather(
-            routing, me, shard_stride=ragged_stride, rows=slab_row
-        )
+        merged_scale_bits = None
+        if use_split_sc:
+            from vllm_torchtpu.kernels.fused_moe.v2.scatter import scatter_pair
+
+            token_gather, merged_scale_bits = scatter_pair(
+                slab_row,
+                jnp.repeat(cast(jax.Array, scale_bits_g), topk),
+                ragged_stride,
+                act_scale_slab_rows(ragged_stride) * HIDDEN_LANE_BLOCK,
+                topk,
+            )
+        else:
+            token_gather = shard_token_gather(
+                routing, me, shard_stride=ragged_stride, rows=slab_row
+            )
         if gather_positions is not None:
             # The rows were gathered in another order than the mesh's, so
             # token t -- row t % t_local of shard t // t_local -- sits in the
@@ -755,9 +769,13 @@ def fused_ep_moe_v2(
             scale_bits = jnp.repeat(cast(jax.Array, scale_bits_g), topk)
             scale_rows = act_scale_slab_rows(ragged_stride)
             scale_slab = lax.bitcast_convert_type(
-                jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
-                .at[slab_row]
-                .add(scale_bits, mode="drop"),
+                merged_scale_bits
+                if merged_scale_bits is not None
+                else (
+                    jnp.zeros((scale_rows * HIDDEN_LANE_BLOCK,), jnp.int32)
+                    .at[slab_row]
+                    .add(scale_bits, mode="drop")
+                ),
                 jnp.float32,
             ).reshape(scale_rows, HIDDEN_LANE_BLOCK)
         else:
@@ -833,19 +851,58 @@ def fused_ep_moe_v2(
         combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
         return token_layout.restore(combined, ax)
 
+    from vllm_torchtpu.kernels.fused_moe.v2.preprocessing import (
+        supports_activation_gather,
+    )
+    from vllm_torchtpu.kernels.fused_moe.v2.scatter import can_scatter_pair
+
+    use_split_sc = (
+        preprocess_topology is not None
+        and stage == "fused"
+        and weight_format == WeightFormat.FP4
+        and supports_activation_gather(t_local * hidden)
+        and can_scatter_pair(
+            T * topk,
+            ragged_stride,
+            act_scale_slab_rows(ragged_stride) * HIDDEN_LANE_BLOCK,
+        )
+    )
+
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """One shard's half of the layer: route, dispatch, kernel, combine."""
         w1s_l, w2s_l, gate_l, hash_l, score_bias_l, bias_it = unpack_operands(
             scales_gating_biases
         )
         gate_l, hash_l, q_l, row_scale_l = quantize_local(x_l, rank_l, gate_l, hash_l)
-        q_g = lax.all_gather(q_l, ax, axis=0, tiled=True)
-        topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
-            gate_l, hash_l, score_bias_l, row_scale_l
-        )
-        exchange = lax.all_gather(packed, ax, axis=0, tiled=True).reshape(
-            ep, layout[-1]
-        )
+        if use_split_sc:
+            from jax.experimental.compute_on import compute_on
+
+            from vllm_torchtpu.kernels.fused_moe.v2.topology_all_gather import (
+                all_gather,
+            )
+
+            q_g = all_gather(
+                q_l, ax, (preprocess_topology.masks, preprocess_topology.wire_map)
+            )
+            with jax.named_scope("moe_early_ag_route"):
+                topk_weights, packed, local_blocks, block_hist, row_routes = (
+                    select_local(gate_l, hash_l, score_bias_l, row_scale_l)
+                )
+            with jax.named_scope("moe_metadata_ag"):
+                exchange = compute_on(
+                    lambda p: lax.all_gather(p, ax, axis=0, tiled=True),
+                    compute_type="tpu_sparsecore",
+                    out_memory_spaces=jax.memory.Space.Device,
+                    compiler_options={"sparse_core_config": {"core_ids": [0]}},
+                )(packed).reshape(ep, layout[-1])
+        else:
+            q_g = lax.all_gather(q_l, ax, axis=0, tiled=True)
+            topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
+                gate_l, hash_l, score_bias_l, row_scale_l
+            )
+            exchange = lax.all_gather(packed, ax, axis=0, tiled=True).reshape(
+                ep, layout[-1]
+            )
         return compute_local(
             q_g,
             exchange,

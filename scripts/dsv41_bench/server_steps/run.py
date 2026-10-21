@@ -160,6 +160,7 @@ def main() -> None:
     )
     env["KV_BYTES"] = "auto"
     decode = args.scenario == "decode"
+    env["MOE_FUSED_EP_PREPROCESS_BACKEND"] = "topology" if decode else "native"
     # Steady target verification is exactly local_concurrency * (K + 1) rows;
     # padding it to 384 runs every layer on 25% padding rows.
     verify_rows = DECODE_SCENARIO.local_concurrency * (

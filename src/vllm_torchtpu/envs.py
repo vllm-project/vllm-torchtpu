@@ -13,6 +13,7 @@ if TYPE_CHECKING:
     TPU_K3_SP_PREFILL: bool = False
     TPU_INCREMENTAL_BLOCK_TABLE_UPLOAD: bool = True
     TPU_VERIFY_INCREMENTAL_BLOCK_TABLE: bool = False
+    LIBTPU_INIT_ARGS: str = ""
     JAX_PLATFORMS: str = ""
     TPU_ACCELERATOR_TYPE: str | None = None
     TPU_NAME: str | None = None
@@ -76,6 +77,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
+    MOE_FUSED_EP_PREPROCESS_BACKEND: str = "native"
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE: int = 0
     TPU_LATENT_PROJ_INTRA_CHIP_TP: bool = False
@@ -354,6 +356,7 @@ def env_positive_int_or_none(env_name: str) -> Callable[[], int | None]:
 
 
 environment_variables: dict[str, Callable[[], Any]] = {
+    "LIBTPU_INIT_ARGS": env_str("LIBTPU_INIT_ARGS", ""),
     # Decoder SWA bounded replay is approximate. Keep full-forward as the
     # default/reference until matched model-quality and performance validation.
     "TPU_DEEPSEEK_V41_CED": env_bool("TPU_DEEPSEEK_V41_CED"),
@@ -665,6 +668,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Build each rank's two consumed routing-plan slices instead of
     # replicating the full T * topk * experts plan arithmetic on every rank.
+    # Migration selector: remove after topology preprocessing is validated
+    # across the supported serving shape/topology matrix and becomes default.
+    "MOE_FUSED_EP_PREPROCESS_BACKEND": env_with_choices(
+        "MOE_FUSED_EP_PREPROCESS_BACKEND", "native", ["native", "topology"]
+    ),
     "MOE_FUSED_EP_V2_SHARDED_PLAN": env_bool("MOE_FUSED_EP_V2_SHARDED_PLAN"),
     # How many copies of the FFN body fused EP MoE v2 emits, standing in for
     # kernel.HEIGHT_RUNGS. A tile runs the shortest of them that covers its
