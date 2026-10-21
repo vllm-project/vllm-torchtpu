@@ -45,6 +45,7 @@
 #   K3_PD_NUM_PREFILL, K3_PD_NUM_DECODE  engines per role (xPyD); default 1.
 #                   Replica 0's head is <name>-<role>-0-0.<name>, replica r's
 #                   <name>-<role><r>-0-0.<name> (one replicated job per engine)
+#   K3_PD_ROUTER_EXTRA  extra vllm-router flags (word-split)
 #   K3_PD_PREFILL_POLICY, K3_PD_DECODE_POLICY  router policy per role; default
 #                   consistent_hash for both
 # The config states the cases and labels: AGENTX_CONC_LIST, AGENTX_MODEL_PREFIX,
@@ -290,6 +291,9 @@ if [ "$CFG_PROXY" = router ]; then
         _router_args+=(${K3_PD_PREFILL_POLICY:+--prefill-policy "$K3_PD_PREFILL_POLICY"}
             ${K3_PD_DECODE_POLICY:+--decode-policy "$K3_PD_DECODE_POLICY"})
     fi
+    # Extra router flags, e.g. cache_aware's --balance-abs-threshold.
+    # shellcheck disable=SC2206
+    [ -z "${K3_PD_ROUTER_EXTRA:-}" ] || _router_args+=(${K3_PD_ROUTER_EXTRA})
     log "router: ${_router_args[*]}"
     vllm-router --host 0.0.0.0 --port "$PROXY_PORT" \
         --vllm-pd-disaggregation \
