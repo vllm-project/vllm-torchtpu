@@ -28,6 +28,7 @@ installed lazily and idempotently on first call to `view()`.
 import dataclasses
 import math
 
+import jax.numpy as jnp
 from jax import tree_util
 from jax._src.lib import tpu
 from jax._src.lib.mlir import ir
@@ -53,13 +54,13 @@ def _lower(ref, transform, aval, block_shape):
     bits = aval.dtype.itemsize * 8
     packing = 32 // bits
     rows = 8 * packing
-    columns = transform.shape[-1] // 128
+    columns = (transform.shape[-1] + 127) // 128
     strides = [columns, 1]
-    minor_dimension = transform.shape[-2]
+    # Only the two minor dims are tiled: leading dims advance by their full size.
+    extent = (transform.shape[-2] + rows - 1) // rows
     for dimension in reversed(transform.shape[:-2]):
-        minor_tiles = (minor_dimension + rows - 1) // rows
-        strides.insert(0, strides[0] * minor_tiles)
-        minor_dimension = dimension
+        strides.insert(0, strides[0] * extent)
+        extent = dimension
     inner = f"({packing},1)" if packing > 1 else ""
     layout = ir.Attribute.parse(
         f"#tpu.tiled<({rows},128){inner},[{','.join(map(str, strides))}]>"
@@ -92,20 +93,32 @@ def _install() -> None:
 
 
 def storage_size(shape, dtype):
-    """Bytes occupied by `(8, 128)`-tiled layout (rounding second-minor dim)."""
+    """Bytes occupied by `(8, 128)`-tiled layout (rounding up the two minor dims)."""
     bits = dtype.itemsize * 8
     packing = 32 // bits
     rows = 8 * packing
     row_tiles = (shape[-2] + rows - 1) // rows
-    return math.prod(shape[:-2]) * row_tiles * (shape[-1] // 128) * 4096
+    lane_tiles = (shape[-1] + 127) // 128
+    return math.prod(shape[:-2]) * row_tiles * lane_tiles * 4096
 
 
 def view(ref, shape, dtype):
     """Return a `shape`/`dtype` view aliasing `ref`'s physical tiled storage.
 
+    `ref` must start on a tile boundary and hold exactly the view's bytes, and the
+    view's tiled layout must not pad (padding would address storage past `ref`).
     The returned view must be fully overwritten before it is read.
     """
+    shape, dtype = tuple(shape), jnp.dtype(dtype)
+    nbytes = math.prod(shape) * dtype.itemsize
+    if storage_size(shape, dtype) != nbytes:
+        raise ValueError(
+            f"pool_alias.view{shape} {dtype.name} pads to "
+            f"{storage_size(shape, dtype)} bytes but aliases only {nbytes}; pad "
+            f"shape[-2] to a multiple of {32 // dtype.itemsize} and shape[-1] to a "
+            "multiple of 128"
+        )
     _install()
     ref = ref.bitcast(dtype)
     # pyrefly: ignore[bad-argument-count]
-    return types.TransformedRef(ref.ref, (*ref.transforms, Reinterpret(tuple(shape))))
+    return types.TransformedRef(ref.ref, (*ref.transforms, Reinterpret(shape)))

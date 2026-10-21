@@ -17,6 +17,10 @@ from __future__ import annotations
 
 import jax
 import jax.numpy as jnp
+import pytest
+from jax import export
+from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu.megakernel import pool_alias
 from vllm_torchtpu.megakernel.ops import BF16, F32, FP8
@@ -27,6 +31,7 @@ def test_pool_alias_storage_size():
     assert pool_alias.storage_size((128, 256), jnp.dtype(FP8)) == 128 * 256 * 1
     assert pool_alias.storage_size((128, 256), jnp.dtype(BF16)) == 128 * 256 * 2
     assert pool_alias.storage_size((1, 256), jnp.dtype(F32)) == 8 * 256 * 4
+    assert pool_alias.storage_size((8, 192), jnp.dtype(F32)) == 8 * 256 * 4
 
 
 def test_pool_alias_reinterpret_mosaic_lowering(monkeypatch):
@@ -58,6 +63,8 @@ def test_pool_alias_reinterpret_mosaic_lowering(monkeypatch):
         (FP8, (64, 256), "#tpu.tiled<(32,128)(4,1),[2,1]>"),
         (BF16, (2, 16, 256), "#tpu.tiled<(16,128)(2,1),[2,2,1]>"),
         (BF16, (2, 32, 256), "#tpu.tiled<(16,128)(2,1),[4,2,1]>"),
+        (BF16, (2, 3, 16, 256), "#tpu.tiled<(16,128)(2,1),[6,2,2,1]>"),
+        (F32, (2, 2, 8, 128), "#tpu.tiled<(8,128),[2,1,1,1]>"),
     ]
     for dtype, target_shape, expected_layout in cases:
         nbytes = pool_alias.storage_size(target_shape, jnp.dtype(dtype))
@@ -171,3 +178,71 @@ def test_pool_alias_hook_chains_to_hook_installed_after_import(monkeypatch):
             assert out_shape == target_shape
             assert "tpu.reinterpret_cast" in str(func_op)
     assert calls == [other]
+
+
+@pytest.mark.parametrize(
+    "pool_shape,shape,dtype",
+    [
+        ((8, 128), (16, 64), F32),  # minor dim < 128: zero lane-tile stride
+        ((12, 128), (8, 192), F32),  # minor dim not a multiple of 128
+        ((16, 128), (2, 4, 256), F32),  # padded rows: 16 KiB view, 8 KiB slice
+        ((16, 128), (2, 8, 128), BF16),  # bf16 tiles are 16 rows
+    ],
+)
+def test_pool_alias_view_rejects_untileable_shapes(pool_shape, shape, dtype):
+    """Element counts match, but the tiled view would alias storage past the slice."""
+
+    def kernel(o_ref, pool_ref):
+        del o_ref
+        pool_alias.view(pool_ref, shape, dtype)
+
+    call = pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct((8, 128), F32),
+        scratch_shapes=[pltpu.VMEM(pool_shape, dtype)],
+        interpret=True,
+    )
+    with pytest.raises(ValueError, match="pads to"):
+        jax.make_jaxpr(call)()
+
+
+def test_pool_alias_view_reaches_hook_in_tpu_pallas_lowering(monkeypatch):
+    """A TPU `pallas_call` using `view()` lowers `Reinterpret` through the hook.
+
+    Cross-lowers for TPU on CPU via `jax.export`, so a JAX change to
+    `_transform_ref` dispatch that bypasses `_reshape_memref` fails here instead of
+    silently lowering to `tpu.memref_reshape`. libtpu layout legality is not checked.
+    """
+    from jax._src.lib.mlir import ir
+    from jax._src.pallas.mosaic import lowering
+
+    pool_alias._install()
+    chained = lowering._reshape_memref
+    layouts = []
+
+    def spy(ref, transform, aval, block_shape):
+        out = chained(ref, transform, aval, block_shape)
+        if isinstance(transform, pool_alias.Reinterpret):
+            alias = out[0].owner.operands[0]
+            layouts.append(str(ir.MemRefType(alias.type).layout))
+        return out
+
+    monkeypatch.setattr(lowering, "_reshape_memref", spy)
+    shape = (2, 32, 128)
+
+    def kernel(x_ref, o_ref, pool_ref, sem):
+        v = pool_alias.view(pool_ref, shape, BF16)
+        for src, dst in ((x_ref, v), (v, o_ref)):
+            cp = pltpu.make_async_copy(src, dst, sem)
+            cp.start()
+            cp.wait()
+
+    call = pl.pallas_call(
+        kernel,
+        out_shape=jax.ShapeDtypeStruct(shape, BF16),
+        in_specs=[pl.BlockSpec(memory_space=pltpu.HBM)],
+        out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+        scratch_shapes=[pltpu.VMEM((128, 128), FP8), pltpu.SemaphoreType.DMA(())],
+    )
+    export.export(jax.jit(call), platforms=["tpu"])(jax.ShapeDtypeStruct(shape, BF16))
+    assert layouts and set(layouts) == {"#tpu.tiled<(16,128)(2,1),[2,1,1]>"}
