@@ -192,19 +192,31 @@ class _Stage3TransferGroup:
 
 
 def _stage3_slot_block(block_ids: Sequence[int], *, group_label: str) -> list[int]:
-    """The single state block of a ring-buffer group, validated."""
+    """The single state block of a ring-buffer group, validated.
+
+    The contract is exactly one block per request: `CircularBufferSpec`
+    allocates one slot block for the request's whole life. A table with more
+    entries means the allocator's contract changed (for example a
+    speculative-decoding slot); keeping only the first block would ship part
+    of the state, so the table is rejected rather than trimmed.
+    """
     ids = [int(block_id) for block_id in block_ids]
     if not ids:
         raise ValueError(
             f"Stage-3 ring-buffer state group {group_label} has no block: "
             "the allocator must hand each request exactly one state slot"
         )
+    if len(ids) != 1:
+        raise ValueError(
+            f"Stage-3 ring-buffer state group {group_label} must have exactly "
+            f"one state block, got {len(ids)}: ids={ids}"
+        )
     if ids[0] == _STAGE3_NULL_BLOCK_ID:
         raise ValueError(
             f"Stage-3 ring-buffer state group {group_label} points at the null "
             f"block: ids={ids}"
         )
-    return ids[:1]
+    return ids
 
 
 # vLLM reserves block 0 as the null block and points every freed sliding-window
@@ -1588,13 +1600,24 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             return "Stage-3 source transfer parallelism must be a positive integer"
         tp_size = int(self.vllm_config.parallel_config.tensor_parallel_size)
         dcp_size = int(self.vllm_config.parallel_config.decode_context_parallel_size)
-        if (
-            not _uses_tp_stage3_source(self.vllm_config)
-            and not _use_raiden_dsv4_admission()
-            and (
-                _as_int(params.get("dst_tp_size")) != tp_size
-                or _as_int(params.get("dst_dcp_size")) != dcp_size
-            )
+        if _use_raiden_dsv4_admission():
+            # DSv4 admission transfers whole requests rank-for-rank: the
+            # producer registers one transfer rank per TP rank
+            # (src_parallelism == its TP size) and never stripes pages, so
+            # the consumer must present the same number of ranks. The layout
+            # fingerprint catches a differing page layout later; this catches
+            # a differing rank count before any pull is attempted, and the
+            # request falls back to a local prefill with a logged reason.
+            if src_parallelism != tp_size or dcp_size != 1:
+                return (
+                    "Stage-3 DSv4 admission requires the producer's TP size "
+                    f"(src_parallelism={src_parallelism}) to equal the "
+                    f"consumer's TP size ({tp_size}) with DCP 1 "
+                    f"(decode_context_parallel_size={dcp_size})"
+                )
+        elif not _uses_tp_stage3_source(self.vllm_config) and (
+            _as_int(params.get("dst_tp_size")) != tp_size
+            or _as_int(params.get("dst_dcp_size")) != dcp_size
         ):
             return (
                 "Stage-3 metadata requires explicit matching destination "
@@ -2184,7 +2207,9 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
 
         normalized_block_ids = _normalize(block_ids, primary_page_tokens)
         if normalized_block_ids is None:
-            return False, {}
+            return self._stage3_skip_send(
+                request, "primary block table does not cover the transfer prefix"
+            )
         normalized_group_block_ids: list[list[int]] | None = None
         if group_block_ids is not None:
             if len(group_block_ids) != len(self._stage3_transfer_groups):
@@ -2207,12 +2232,18 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                             request.request_id,
                             exc,
                         )
-                        return False, {}
+                        return self._stage3_skip_send(
+                            request, f"ring-buffer state group: {exc}"
+                        )
                     normalized_group_block_ids.append(slot_ids)
                     continue
                 normalized = _normalize(ids, group.page_tokens)
                 if normalized is None:
-                    return False, {}
+                    return self._stage3_skip_send(
+                        request,
+                        f"cache group g{group.cache_group_index} block table "
+                        "does not cover the transfer prefix",
+                    )
                 normalized_group_block_ids.append(list(normalized))
 
         if normalized_group_block_ids is not None:
@@ -2242,7 +2273,11 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
                     num_tokens,
                     recycled,
                 )
-                return False, {}
+                return self._stage3_skip_send(
+                    request,
+                    "sliding-window pages inside the transfer prefix were "
+                    f"recycled: {recycled}",
+                )
 
         producer_dp_rank = (
             self.vllm_config.parallel_config.data_parallel_rank
@@ -2370,6 +2405,34 @@ class TPURaidenConnectorScheduler(TPUConnectorScheduler):
             controller_address,
         )
         return True, params
+
+    def _stage3_skip_send(
+        self, request: "Request", reason: str
+    ) -> tuple[bool, dict[str, Any]]:
+        """Declines to publish one finished request's KV.
+
+        The decode replica then prefills the request itself, so the service
+        keeps answering; the cost is a silent latency regression unless it is
+        counted. Every skip therefore logs one `raiden_stage3_send_skipped`
+        event with the running total, which is what a dashboard or an alert
+        should watch (`grep -c raiden_stage3_send_skipped`).
+        """
+        self._stage3_skipped_sends = int(getattr(self, "_stage3_skipped_sends", 0)) + 1
+        logger.warning(
+            "%s",
+            json.dumps(
+                {
+                    "event": "raiden_stage3_send_skipped",
+                    "req_id": request.request_id,
+                    "num_prompt_tokens": int(request.num_prompt_tokens),
+                    "num_computed_tokens": int(request.num_computed_tokens),
+                    "reason": reason,
+                    "total_skipped": self._stage3_skipped_sends,
+                },
+                sort_keys=True,
+            ),
+        )
+        return False, {}
 
     def _queue_stage3_dsv4_debug_digest(
         self, request: "Request", group_block_ids: list[list[int]]
@@ -3177,14 +3240,16 @@ class TPURaidenConnectorWorker:
         """Supports DP attention (tp1/dp{N}) and TP-replicated KV (tp{N}/dp1)."""
         parallel_config = self.vllm_config.parallel_config
         pcp_size = int(parallel_config.prefill_context_parallel_size or 1)
+        dcp_size = int(parallel_config.decode_context_parallel_size or 1)
         tp_size = int(self.tp_size)
         dp_size = int(parallel_config.data_parallel_size or 1)
-        if pcp_size != 1 or (tp_size > 1 and dp_size > 1):
+        if pcp_size != 1 or dcp_size != 1 or (tp_size > 1 and dp_size > 1):
             raise ValueError(
                 "Raiden DSv4 admission supports tp1/dp{N} or tp{N}/dp1 only "
-                f"(pcp1); got tensor_parallel_size={tp_size}, "
+                f"(pcp1, dcp1); got tensor_parallel_size={tp_size}, "
                 f"data_parallel_size={dp_size}, "
-                f"prefill_context_parallel_size={pcp_size}"
+                f"prefill_context_parallel_size={pcp_size}, "
+                f"decode_context_parallel_size={dcp_size}"
             )
         role = "prefill" if self.is_producer else "decode"
         if tp_size > 1:
@@ -4364,6 +4429,36 @@ class TPURaidenConnectorWorker:
             }
             logger.info("%s", json.dumps(event, sort_keys=True))
 
+    def _stage3_dsv4_receive_plan(
+        self, req_meta: Any, num_tokens: int, destination_req_id: str
+    ) -> tuple[list[str], list[int], list[int]]:
+        """The consumer's `(transfer_tags, dst_blocks, dst_counts)` for one
+        DSv4 load.
+
+        Each DSv4 tag replays over its own cache group's still-live pages
+        rather than one shared block list; disjoint block IDs are the only
+        thing separating the caches that alias one array. Both consumer
+        paths (inline load and controller submit) build the plan here so
+        they cannot drift apart.
+        """
+        group_blocks = self._stage3_dsv4_group_blocks(req_meta, num_tokens)
+        if self._stage3_dsv4_debug_enabled():
+            if not hasattr(self, "_stage3_dsv4_debug_loads"):
+                self._stage3_dsv4_debug_loads = {}
+            self._stage3_dsv4_debug_loads[destination_req_id] = (
+                req_meta,
+                int(num_tokens),
+            )
+        transfer_tags: list[str] = []
+        dst_blocks: list[int] = []
+        dst_counts: list[int] = []
+        for pool in self._stage3_dsv4_plan:
+            pages = group_blocks[pool.plan_position].pages
+            transfer_tags.append(pool.tag)
+            dst_blocks.extend(pages)
+            dst_counts.append(len(pages))
+        return transfer_tags, dst_blocks, dst_counts
+
     def _stage3_dsv4_group_blocks(
         self, req_meta: Any, num_tokens: int
     ) -> list[_Stage3Dsv4GroupPages]:
@@ -5509,24 +5604,9 @@ class TPURaidenConnectorWorker:
             # tag = group 0 uploads first). Each tag replays over the
             # same destination pages.
             if _use_raiden_dsv4_admission():
-                # Each DSv4 tag replays over its own group's pages rather than
-                # one shared list. Disjoint block IDs are the only thing
-                # separating the caches that alias one array.
-                group_blocks = self._stage3_dsv4_group_blocks(
-                    req_meta, pending.num_tokens
+                transfer_tags, dst_blocks, dst_counts = self._stage3_dsv4_receive_plan(
+                    req_meta, pending.num_tokens, destination_req_id
                 )
-                if self._stage3_dsv4_debug_enabled():
-                    if not hasattr(self, "_stage3_dsv4_debug_loads"):
-                        self._stage3_dsv4_debug_loads = {}
-                    self._stage3_dsv4_debug_loads[destination_req_id] = (req_meta, int(pending.num_tokens))
-                transfer_tags = []
-                dst_blocks = []
-                dst_counts = []
-                for pool in self._stage3_dsv4_plan:
-                    pages = group_blocks[pool.plan_position].pages
-                    transfer_tags.append(pool.tag)
-                    dst_blocks.extend(pages)
-                    dst_counts.append(len(pages))
             else:
                 if _use_raiden_glm_admission():
                     transfer_tags = list(self._stage3_row_geometry)
@@ -6037,19 +6117,9 @@ class TPURaidenConnectorWorker:
             # tag = group 0 uploads first). Each tag replays over the
             # same destination pages.
             if _use_raiden_dsv4_admission():
-                group_blocks = self._stage3_dsv4_group_blocks(req_meta, num_tokens)
-                if self._stage3_dsv4_debug_enabled():
-                    if not hasattr(self, "_stage3_dsv4_debug_loads"):
-                        self._stage3_dsv4_debug_loads = {}
-                    self._stage3_dsv4_debug_loads[destination_req_id] = (req_meta, int(num_tokens))
-                transfer_tags = []
-                dst_blocks = []
-                dst_counts = []
-                for pool in self._stage3_dsv4_plan:
-                    pages = group_blocks[pool.plan_position].pages
-                    transfer_tags.append(pool.tag)
-                    dst_blocks.extend(pages)
-                    dst_counts.append(len(pages))
+                transfer_tags, dst_blocks, dst_counts = self._stage3_dsv4_receive_plan(
+                    req_meta, num_tokens, destination_req_id
+                )
             else:
                 transfer_tags = (
                     list(self._stage3_row_geometry)

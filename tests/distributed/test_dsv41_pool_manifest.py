@@ -229,11 +229,39 @@ def test_ring_groups_are_slot_groups_in_the_transfer_plan():
     assert plan[0].window_tokens == 128
 
 
-@pytest.mark.parametrize("ids", [[], [0]])
-def test_slot_block_rejects_missing_or_null_blocks(ids):
+@pytest.mark.parametrize("ids", [[], [0], [17, 18], [0, 17]])
+def test_slot_block_rejects_missing_null_or_multiple_blocks(ids):
+    """A ring-buffer group hands over exactly one live block; anything else
+    is an allocator-contract change that must fail loudly, not be trimmed."""
     with pytest.raises(ValueError):
         tpu_connector._stage3_slot_block(ids, group_label="g2")
 
 
-def test_slot_block_keeps_the_first_block_only():
-    assert tpu_connector._stage3_slot_block([17, 18], group_label="g2") == [17]
+def test_slot_block_accepts_exactly_one_block():
+    assert tpu_connector._stage3_slot_block([17], group_label="g2") == [17]
+
+
+def test_dsv4_receive_plan_follows_the_pool_plan_order():
+    """Both consumer paths build the receive plan from one helper: tags in
+    plan order, each tag's destination pages = its group's live pages."""
+    worker = tpu_connector.TPURaidenConnectorWorker.__new__(
+        tpu_connector.TPURaidenConnectorWorker
+    )
+    worker._stage3_dsv4_transfer_groups = (
+        tpu_connector._Stage3TransferGroup(cache_group_index=0, page_tokens=32,
+                                           window_tokens=128),
+        tpu_connector._Stage3TransferGroup(cache_group_index=1, page_tokens=8,
+                                           slot=True),
+    )
+    worker._stage3_dsv4_plan = (
+        types.SimpleNamespace(tag="dsv4.swa.p0.g0", plan_position=0),
+        types.SimpleNamespace(tag="dsv4.swa.p1.g0", plan_position=0),
+        types.SimpleNamespace(tag="dsv4.state.csa.g1", plan_position=1),
+    )
+    # 160 tokens, window 128: the first page (tokens 0..31) is behind the
+    # window and already the null block.
+    req_meta = types.SimpleNamespace(group_block_ids=[[0, 11, 12, 13, 14], [7]])
+    tags, blocks, counts = worker._stage3_dsv4_receive_plan(req_meta, 160, "r1")
+    assert tags == ["dsv4.swa.p0.g0", "dsv4.swa.p1.g0", "dsv4.state.csa.g1"]
+    assert blocks == [11, 12, 13, 14, 11, 12, 13, 14, 7]
+    assert counts == [4, 4, 1]
