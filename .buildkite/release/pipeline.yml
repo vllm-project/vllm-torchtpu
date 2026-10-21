@@ -16,10 +16,9 @@
 # the TPU Release Buildkite cluster, on the release-vllm-torchtpu queue, whose
 # agent alone can read the Docker Hub token and mint PyPI tokens.
 #
-# The pipeline's settings upload this file from main whatever branch a build is
-# on, and every step runs main's release tooling against the build's own
-# checkout. A release branch only supplies the code being released, so it never
-# needs release tooling ported to it. README.md has the how-to.
+# The pipeline's settings upload this file from the build's own checkout, for
+# builds of main and releases/v* only, so a release branch runs the release
+# tooling it was cut with. README.md has the how-to.
 #
 #   main (scheduled)    nightly images: ci/dev/prod to GAR, dev to Docker Hub
 #   releases/vX.Y.Z     a release: build the images and wheels once, check them,
@@ -42,8 +41,6 @@ steps:
       - bash .buildkite/scripts/publish_nightly_images.sh
 
   # --- A release ------------------------------------------------------------
-  # Each command step starts by unpacking main's release tooling, pinned to the
-  # commit this file was uploaded from, into $RELEASE_TOOLS.
 
   - label: ":clipboard: Preflight: version, CI, PyPI"
     key: preflight
@@ -51,13 +48,7 @@ steps:
     agents:
       queue: release-vllm-torchtpu
     commands:
-      - &tools |
-        T="$$(buildkite-agent meta-data get release-tools-commit)"
-        git fetch -q origin "$$T"
-        RELEASE_TOOLS="$$(mktemp -d)"
-        git archive "$$T" .buildkite/release .buildkite/scripts | tar -x -C "$$RELEASE_TOOLS"
-        export RELEASE_TOOLS="$$RELEASE_TOOLS/.buildkite"
-      - bash "$$RELEASE_TOOLS/release/preflight.sh"
+      - bash .buildkite/release/preflight.sh
 
   - label: ":docker: Build and stage the images"
     key: build_images
@@ -67,11 +58,8 @@ steps:
       queue: release-vllm-torchtpu
     timeout_in_minutes: 180
     commands:
-      - *tools
-      - bash "$$RELEASE_TOOLS/release/build_images.sh"
+      - bash .buildkite/release/build_images.sh
 
-  # The wheels are built by the release checkout's own scripts, which belong
-  # to the code being released; publish_wheel.sh, later, is main's.
   - label: ":package: Build the vllm-torchtpu-core wheel"
     key: build_core_wheel
     depends_on: preflight
@@ -105,8 +93,7 @@ steps:
     agents:
       queue: release-vllm-torchtpu
     commands:
-      - *tools
-      - bash "$$RELEASE_TOOLS/release/check_wheels.sh"
+      - bash .buildkite/release/check_wheels.sh
 
   - label: ":pipeline: Plan the approval and publish"
     key: plan_publish
@@ -117,5 +104,4 @@ steps:
     agents:
       queue: release-vllm-torchtpu
     commands:
-      - *tools
-      - python3 "$$RELEASE_TOOLS/release/plan_publish.py" | buildkite-agent pipeline upload --no-interpolation
+      - python3 .buildkite/release/plan_publish.py | buildkite-agent pipeline upload --no-interpolation

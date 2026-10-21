@@ -17,18 +17,16 @@
 # GAR as <version> and <date>-<version>. Nothing goes to Docker Hub here: the
 # publish step copies the staged prod image there by digest, so users get the
 # exact bytes this build made.
-#
-# The images are built with the release checkout's own docker/build_image.sh,
-# which belongs to the code being released.
 set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
-source "${RELEASE_TOOLS}/release/lib.sh"
+source "${SCRIPT_DIR}/lib.sh"
 
 VERSION="$(release_version)"
 DATE="$(date -u +%Y%m%d)"
 
 echo "--- Cleaning up old Docker images and cache"
-bash "${RELEASE_TOOLS}/scripts/cleanup_docker.sh"
+bash "${SCRIPT_DIR}/../scripts/cleanup_docker.sh"
 
 ROWS=""
 for target in ci dev prod; do

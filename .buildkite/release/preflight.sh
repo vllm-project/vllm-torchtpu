@@ -23,8 +23,9 @@
 #             (ci_gate.py). RELEASE_SKIP_CI_GATE=1 skips it, with a warning.
 #   PyPI      neither vllm-torchtpu-core nor vllm-torchtpu has this version yet.
 set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
-source "${RELEASE_TOOLS}/release/lib.sh"
+source "${SCRIPT_DIR}/lib.sh"
 
 echo "--- :label: Release version"
 if [[ -n "${RELEASE_VERSION:-}" ]]; then
@@ -47,7 +48,7 @@ if [[ "${RELEASE_SKIP_CI_GATE:-0}" == "1" ]]; then
     buildkite-agent annotate --style warning --context release-ci-gate \
         "CI gate skipped (RELEASE_SKIP_CI_GATE=1): nothing checked that ${BUILDKITE_COMMIT:0:12} passed CI."
 else
-    CI_URL="$(python3 "${RELEASE_TOOLS}/release/ci_gate.py" "${BUILDKITE_COMMIT}" | tail -n 1)"
+    CI_URL="$(python3 "${SCRIPT_DIR}/ci_gate.py" "${BUILDKITE_COMMIT}" | tail -n 1)"
     CI_LINE="passed: ${CI_URL}"
 fi
 

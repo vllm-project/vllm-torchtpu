@@ -20,8 +20,8 @@ Runs once the images are staged and the wheels are checked: the approval
 block, the Docker Hub and PyPI publishes, and the check that what users get is
 what was built. Uploaded rather than written into pipeline.yml so the approval
 prompt can name the exact version and prod digest, and so the team restriction
-is added only when it is set. --no-interpolation keeps the $VAR references in
-the commands for the shell that runs them.
+is added only when it is set. --no-interpolation: nothing in it is for
+Buildkite to interpolate.
 
 Optional build env:
   RELEASE_APPROVER_TEAMS=a,b   Buildkite team slugs allowed to approve
@@ -43,18 +43,6 @@ def meta(key):
 
 
 QUEUE = {"queue": os.environ.get("RELEASE_QUEUE", "release-vllm-torchtpu")}
-# Every command step runs main's release tooling, pinned to the commit the
-# pipeline was uploaded from (pipeline.yml has the same block).
-TOOLS = "\n".join(
-    [
-        'T="$(buildkite-agent meta-data get release-tools-commit)"',
-        'git fetch -q origin "$T"',
-        'RELEASE_TOOLS="$(mktemp -d)"',
-        'git archive "$T" .buildkite/release .buildkite/scripts'
-        ' | tar -x -C "$RELEASE_TOOLS"',
-        'export RELEASE_TOOLS="$RELEASE_TOOLS/.buildkite"',
-    ]
-)
 
 
 def command_step(label, key, depends_on, commands, **extra):
@@ -63,7 +51,7 @@ def command_step(label, key, depends_on, commands, **extra):
         "key": key,
         "depends_on": depends_on,
         "agents": QUEUE,
-        "commands": [TOOLS] + commands,
+        "commands": commands,
     }
     step.update(extra)
     return step
@@ -126,7 +114,7 @@ def main():
             ":docker: Publish the prod image to Docker Hub",
             "publish_images",
             ["approve_publish"],
-            ['bash "$RELEASE_TOOLS/release/publish_images.sh"'],
+            ["bash .buildkite/release/publish_images.sh"],
             secrets=["DOCKERHUB_TOKEN_VLLM_TORCHTPU"],
             concurrency=1,
             concurrency_group="vllm-torchtpu-dockerhub-publish",
@@ -137,7 +125,7 @@ def main():
             ":package: Publish vllm-torchtpu-core to PyPI",
             "publish_core",
             ["approve_publish"],
-            ['bash "$RELEASE_TOOLS/scripts/publish_wheel.sh" core'],
+            ["bash .buildkite/scripts/publish_wheel.sh core"],
             env={"PUBLISH_PYPI": "vllm-torchtpu-core"},
             concurrency=1,
             concurrency_group="vllm-torchtpu-core-publish",
@@ -150,7 +138,7 @@ def main():
             ":package: Publish vllm-torchtpu to PyPI",
             "publish_vllm_torchtpu",
             ["publish_core"],
-            ['bash "$RELEASE_TOOLS/scripts/publish_wheel.sh" vllm-torchtpu'],
+            ["bash .buildkite/scripts/publish_wheel.sh vllm-torchtpu"],
             env={"PUBLISH_PYPI": "vllm-torchtpu"},
             concurrency=1,
             concurrency_group="vllm-torchtpu-publish",
@@ -161,7 +149,7 @@ def main():
             ":white_check_mark: Check what users get",
             "verify_published",
             ["publish_images", "publish_vllm_torchtpu"],
-            ['bash "$RELEASE_TOOLS/release/verify_published.sh"'],
+            ["bash .buildkite/release/verify_published.sh"],
         )
     )
 

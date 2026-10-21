@@ -18,8 +18,9 @@
 #                (it can't while the repository is private, which is a warning)
 #   PyPI         vllm-torchtpu==<version> resolves from pypi.org alone
 set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
-source "${RELEASE_TOOLS}/release/lib.sh"
+source "${SCRIPT_DIR}/lib.sh"
 
 VERSION="$(release_version)"
 PROD="$(buildkite-agent meta-data get release-image-prod)"

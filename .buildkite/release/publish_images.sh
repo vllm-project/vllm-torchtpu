@@ -17,8 +17,9 @@
 # approver chose to. A copy by digest, never a rebuild: what users pull is what
 # this build staged.
 set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
-source "${RELEASE_TOOLS}/release/lib.sh"
+source "${SCRIPT_DIR}/lib.sh"
 
 VERSION="$(release_version)"
 PROD="$(buildkite-agent meta-data get release-image-prod)"

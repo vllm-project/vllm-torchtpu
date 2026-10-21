@@ -7,10 +7,11 @@ on the `release-vllm-torchtpu` queue. That queue's VM runs as its own service
 account (`ci-release`), refuses jobs from any other pipeline, and is the only
 agent that can read the Docker Hub token or mint a PyPI token. No CI agent can.
 
-The pipeline's settings upload [`pipeline.yml`](pipeline.yml) **from main**,
-whatever branch a build is on, and every step runs main's tooling (this
-directory and `.buildkite/scripts`) against the build's checkout. A release
-branch supplies only the code being released.
+The pipeline's settings upload [`pipeline.yml`](pipeline.yml) from the build's
+own checkout, and only for builds of `main` and `releases/v*`. A release branch
+runs the release tooling (this directory and `.buildkite/scripts`) it was cut
+with; a tooling fix a release needs goes to main and is cherry-picked to the
+branch, or committed to the branch directly for one-off debugging.
 
 ## Cut a release
 
@@ -24,7 +25,7 @@ branch supplies only the code being released.
      steps), and checks PyPI doesn't have the version yet;
    - **builds once**: the ci, dev and prod images, staged in GAR as
      `vllm-torchtpu-<target>:<version>` and `:<date>-<version>`, and both
-     wheels (with the release checkout's own build scripts);
+     wheels;
    - **checks**: the wheels resolve together from pypi.org for CPython 3.12
      on x86_64 Linux.
 4. **Approve** the publish block. It asks whether to move `latest` (never for a
@@ -62,14 +63,11 @@ images to GAR and the dev image to Docker Hub as `nightly`.
 
   ```yaml
   steps:
-    - label: ":pipeline: Upload the release pipeline from main"
+    - label: ":pipeline: Upload the release pipeline"
+      branches: "main releases/v*"
       agents:
         queue: release-vllm-torchtpu
-      command: |
-        git fetch -q origin main
-        tools="$$(git rev-parse FETCH_HEAD)"
-        buildkite-agent meta-data set release-tools-commit "$$tools"
-        git show "$$tools:.buildkite/release/pipeline.yml" | buildkite-agent pipeline upload
+      command: buildkite-agent pipeline upload .buildkite/release/pipeline.yml
   ```
 
 ## One-time setup outside this repo

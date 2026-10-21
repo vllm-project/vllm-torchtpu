@@ -19,8 +19,9 @@
 # the platform the wheels support (CPython 3.12, x86_64 Linux, glibc >= 2.31,
 # the floor torch-tpu and tpu-sync-torch set).
 set -euo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=/dev/null
-source "${RELEASE_TOOLS}/release/lib.sh"
+source "${SCRIPT_DIR}/lib.sh"
 
 VERSION="$(release_version)"
 WORK="$(mktemp -d)"
