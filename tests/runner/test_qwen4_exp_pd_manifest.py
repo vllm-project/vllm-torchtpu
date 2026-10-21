@@ -60,7 +60,8 @@ def live_pool(tp=1, device="cpu", num_blocks=64, ssm="bfloat16"):
 
 @pytest.mark.parametrize("tp", [1, 2, 4, 8])
 @pytest.mark.parametrize("ssm", ["bfloat16", "float32"])
-def test_full_pages_keep_all_owners_and_group_specific_aliases(tp, ssm):
+def test_full_pages_keep_all_owners_and_group_specific_aliases(monkeypatch, tp, ssm):
+    monkeypatch.setenv("QWEN4_EXP_PACK_COMPRESSED_K", "0")
     config, materialized = live_pool(tp, ssm=ssm)
     manifest = build_transfer_manifest(config, materialized)
     assert len(manifest.pools) == len(materialized.kv_caches)
@@ -113,3 +114,19 @@ def test_reject_wrong_page_capacity():
     config.num_blocks += 1
     with pytest.raises((ManifestError, AssertionError)):
         build_transfer_manifest(config, materialized)
+
+
+@pytest.mark.parametrize("tp", [1, 8])
+def test_packed_compressed_keys_transfer_whole_owner_pages(monkeypatch, tp):
+    """Packed members ride their owner group's whole pages; nothing is lost."""
+    monkeypatch.setenv("QWEN4_EXP_PACK_COMPRESSED_K", "1")
+    config, materialized = live_pool(tp)
+    manifest = build_transfer_manifest(config, materialized)
+    names = {p.layer_name for p in manifest.pools}
+    attention = sorted(n for n in names if n.endswith(".self_attn"))
+    owners = sorted(n for n in names if n.endswith(".compressed_k"))
+    assert 1 <= len(owners) < len(attention)
+    assert names == set(materialized.kv_caches)
+    for pool in manifest.pools:
+        if pool.layer_name in owners:
+            assert pool.regions[0].extent_end_bytes == pool.block_stride_bytes

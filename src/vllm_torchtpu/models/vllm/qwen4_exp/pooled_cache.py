@@ -32,7 +32,7 @@ from .config import (
     pooled_pool_blocks,
 )
 from .pd import TransferGroup, build_transfer_groups
-from .pool_layout import pooled_cache_specs
+from .pool_layout import check_packed_compressed_groups, pooled_cache_specs
 from .qsa import Qwen4ExpPooledQSABackend
 
 
@@ -53,6 +53,7 @@ class Qwen4ExpPooledCache:
         self.runner, self.model = runner, model
         self.layout, self.specs = pooled_cache_specs(runner.vllm_config)
         self.groups = get_kv_cache_groups(runner.vllm_config, self.specs)
+        check_packed_compressed_groups(self.layout, self.groups)
         self.block_bytes = _get_kv_cache_bytes_per_block(self.groups)
         self.hbm_sizing = hbm_pool_sizing(runner.vllm_config)
         # Pages of the current pool; for static sizing, the fixed capacity.
@@ -243,13 +244,7 @@ class Qwen4ExpPooledCache:
             if layer.layer_type == "linear_attention":
                 layer.linear_attn.kv_cache = tuple(caches[prefix + ".linear_attn"])
             else:
-                main = caches[prefix + ".self_attn"]
-                assert (
-                    main
-                    is caches[prefix + ".self_attn.compressed_k"]
-                    is caches[prefix + ".self_attn.raw_ring"]
-                ), "QSA cache groups must share one native carrier"
-                layer.self_attn.bind_pool(main)
+                self._bind_qsa(layer.self_attn, prefix + ".self_attn", caches)
             if layer.ple is not None:
                 layer.ple.bind_pool(caches[prefix + ".ple"][0])
         self.bind_draft()
@@ -283,13 +278,15 @@ class Qwen4ExpPooledCache:
             attention = context.get(prefix + ".self_attn")
             if attention is None:
                 continue
-            main = caches[prefix + ".self_attn"]
-            assert (
-                main
-                is caches[prefix + ".self_attn.compressed_k"]
-                is caches[prefix + ".self_attn.raw_ring"]
-            ), "QSA cache groups must share one native carrier"
-            attention.bind_pool(main)
+            self._bind_qsa(attention, prefix + ".self_attn", caches)
+
+    def _bind_qsa(self, attention, name, caches) -> None:
+        owner = self.layout.compressed_owner(name)
+        main = caches[name]
+        assert main is caches[owner[0]] is caches[name + ".raw_ring"], (
+            "QSA cache groups must share one native carrier"
+        )
+        attention.bind_pool(main, owner)
 
     def initialize(self, config) -> dict[str, LayerKVCache]:
         if self.hbm_sizing and not self.final:

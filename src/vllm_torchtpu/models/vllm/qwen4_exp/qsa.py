@@ -331,6 +331,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         with torch.device(device or "cpu"):
             set_default_quant_scales(self, register_buffer=True)
         self.cache_owners: tuple[torch.Tensor, ...] = ()
+        self.compressed_cache_name = prefix + ".compressed_k"
         self._loaded = set()
         self._op = partial(
             build_qsa_op(),
@@ -343,14 +344,24 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
     def get_attn_backend(self):
         return Qwen4ExpPooledQSABackend if self.pooled else Qwen4ExpQSABackend
 
-    def bind_pool(self, pool):
+    def bind_pool(self, pool, compressed_owner: tuple[str, int] | None = None):
+        """Bind the unified pool.
+
+        ``compressed_owner`` names the cache group whose block table addresses
+        this layer's compressed keys and the layer's slot in that group's
+        pages (``Qwen4ExpPoolLayout.compressed_owner``); by default the layer
+        owns ``<prefix>.compressed_k`` alone.
+        """
         from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import build_pooled_qsa_op
 
+        name, slot = compressed_owner or (self.prefix + ".compressed_k", 0)
         self.cache_owners = (pool,)
-        self._op = partial(
-            build_pooled_qsa_op(),
-            **self._op.keywords,
-        )
+        self.compressed_cache_name = name
+        keywords = dict(self._op.keywords)
+        keywords.pop("compressed_slot", None)
+        if slot:
+            keywords["compressed_slot"] = slot
+        self._op = partial(build_pooled_qsa_op(), **keywords)
 
     def get_kv_cache_spec(self, vllm_config):
         return get_qsa_cache_specs(self.config, self.tp_size, self.cache_dtype)[0]
@@ -495,7 +506,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                     torch.Tensor, per_layer[self.prefix].block_tables
                 ),
                 compressed_block_table=cast(
-                    torch.Tensor, per_layer[self.prefix + ".compressed_k"].block_tables
+                    torch.Tensor, per_layer[self.compressed_cache_name].block_tables
                 ),
             )
         output, selected = self._op(

@@ -31,6 +31,7 @@ def clean_env(monkeypatch):
         "QWEN4_EXP_POOL_GRAPH_COPIES",
         "QWEN4_EXP_POOL_HEADROOM_BYTES",
         "QWEN4_EXP_MAX_POOL_BYTES",
+        "QWEN4_EXP_PACK_COMPRESSED_K",
     ):
         monkeypatch.delenv(name, raising=False)
 
@@ -95,9 +96,11 @@ def test_hbm_sizing_is_default_and_has_static_escape_hatches(monkeypatch):
 
 class _Attention:
     cache_owners = ()
+    compressed_owner = None
 
-    def bind_pool(self, pool):
+    def bind_pool(self, pool, compressed_owner=None):
         self.cache_owners = (pool,)
+        self.compressed_owner = compressed_owner
 
 
 def _model(text):
@@ -227,3 +230,40 @@ def test_static_sizing_keeps_the_fixed_pool(monkeypatch):
         cache.runner.vllm_config, cache.specs
     )
     assert cache.pages > 0
+
+
+def test_packed_pool_plans_fewer_groups_and_binds_every_slot(monkeypatch):
+    """Profiling scratch and planned pools bind packed owners and slots."""
+    cache, runner, model = _cache(monkeypatch)
+    unpacked_groups = len(cache.groups)
+    monkeypatch.setenv("QWEN4_EXP_PACK_COMPRESSED_K", "1")
+    cache, runner, model = _cache(monkeypatch)
+    attention = {
+        f"model.layers.{i}.self_attn": layer.self_attn
+        for i, layer in enumerate(model.model.layers)
+        if hasattr(layer, "self_attn")
+    }
+    slots = cache.layout.compressed_slots
+    assert len(cache.groups) == unpacked_groups - len(attention) + -(
+        -len(attention) // slots
+    )
+    assert cache.block_bytes == cache.layout.page_bytes
+    _budget(monkeypatch, used=10 * GiB)
+    cache.allocate(16)
+    planned = get_kv_cache_config_from_groups(
+        runner.vllm_config, cache.groups, 64 * cache.block_bytes
+    )
+    planned.kv_cache_layout = runner.cache_config.kv_cache_layout
+    for config in (None, planned):
+        if config is not None:
+            cache.initialize(config)
+        pool = cache.materialized.raw_tensors[0]
+        owners = {}
+        for name, layer in attention.items():
+            assert layer.cache_owners[0] is pool
+            assert layer.compressed_owner == cache.layout.compressed_owner(name)
+            owner, slot = layer.compressed_owner
+            assert owner in cache.materialized.kv_caches
+            owners.setdefault(owner, []).append(slot)
+        assert all(s == list(range(len(s))) for s in owners.values())
+        assert max(map(len, owners.values())) == min(slots, len(attention))

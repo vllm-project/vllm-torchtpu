@@ -2,6 +2,7 @@
 """Native pool allocation, prefix alignment and state ownership contracts."""
 
 import math
+from dataclasses import replace
 from types import SimpleNamespace as NS
 
 import pytest
@@ -126,11 +127,13 @@ def test_pool_initialize_builds_mamba_plan_from_materialized_layers(monkeypatch,
 @pytest.mark.parametrize("kv", ["bfloat16", "fp8_e4m3"])
 @pytest.mark.parametrize("ssm", ["bfloat16", "float32"])
 @pytest.mark.parametrize("prefix", [False, True])
+@pytest.mark.parametrize("pack", [False, True])
 def test_native_pool_preserves_prefix_alignment_and_qsa_owner_aliases(
-    tp, kv, ssm, prefix
+    monkeypatch, tp, kv, ssm, prefix, pack
 ):
     from vllm.v1.kv_cache_interface import MambaSpec
 
+    monkeypatch.setenv("QWEN4_EXP_PACK_COMPRESSED_K", "1" if pack else "0")
     cfg = pool_config(tp, kv, ssm)
     cfg.cache_config.enable_prefix_caching = prefix
     cfg.cache_config.mamba_cache_mode = "align" if prefix else "none"
@@ -158,12 +161,11 @@ def test_native_pool_preserves_prefix_alignment_and_qsa_owner_aliases(
             assert spec.block_size == cfg.cache_config.mamba_block_size
     for name in specs:
         if name.endswith(".self_attn"):
+            owner, _ = layout.compressed_owner(name)
             assert (
-                placements[name]
-                == placements[name + ".compressed_k"]
-                == placements[name + ".raw_ring"]
+                placements[name] == placements[owner] == placements[name + ".raw_ring"]
             )
-            assert specs[name].block_size == specs[name + ".compressed_k"].block_size
+            assert specs[name].block_size == specs[owner].block_size
 
 
 def test_ple_geometry_can_determine_the_pool_page():
@@ -229,7 +231,8 @@ def test_pool_warmup_tables_match_native_ring_padding():
 
 
 @pytest.mark.parametrize("symbolic", [False, True])
-def test_pooled_ops_register_and_dispatch_without_allocating_a_device(symbolic):
+@pytest.mark.parametrize("slot", [0, 3])
+def test_pooled_ops_register_and_dispatch_without_allocating_a_device(symbolic, slot):
     """Direct JAX tests miss schema/fake dispatch failures during model boot."""
     from torch._subclasses.fake_tensor import FakeTensorMode
     from torch.fx.experimental.symbolic_shapes import ShapeEnv
@@ -282,6 +285,7 @@ def test_pooled_ops_register_and_dispatch_without_allocating_a_device(symbolic):
             token_topk=2048,
             norm_eps=1e-6,
             rotary_dim=64,
+            **({"compressed_slot": slot} if slot else {}),
         )
         if symbolic:
             # len(FakeTensor) concretizes the batch and breaks vLLM's host
@@ -291,3 +295,133 @@ def test_pooled_ops_register_and_dispatch_without_allocating_a_device(symbolic):
         assert output.shape == (8, 6144)
         assert selected.shape == (8, 2051)
         assert selected.dtype == torch.int32
+
+
+def packed_config(monkeypatch, pack, *, spec_tokens=3, tp=8):
+    monkeypatch.setenv("QWEN4_EXP_PACK_COMPRESSED_K", "1" if pack else "0")
+    cfg = pool_config(tp)
+    cfg.model_config.hf_text_config.mtp_num_hidden_layers = 1
+    cfg.speculative_config = NS(
+        num_speculative_tokens=spec_tokens,
+        method="mtp",
+        use_eagle=lambda: True,
+        use_eagle_block_drop=lambda: True,
+    )
+    return cfg
+
+
+def test_packed_compressed_keys_share_owner_pages_including_mtp(monkeypatch):
+    from vllm.v1.kv_cache_interface import MLAAttentionSpec
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import (
+        check_packed_compressed_groups,
+    )
+
+    unpacked_layout, unpacked = pooled_cache_specs(packed_config(monkeypatch, False))
+    cfg = packed_config(monkeypatch, True)
+    layout, specs = pooled_cache_specs(cfg)
+    attention = [n for n in unpacked if n.endswith(".self_attn")]
+    assert attention[-1].startswith("mtp.layers.")
+    slots = layout.page_bytes // (
+        layout.main_kernel_pages * layout.compressed_kernel_bytes
+    )
+    assert layout.compressed_slots == slots == 8
+    assert unpacked_layout.compressed_slots == 1
+    assert unpacked_layout.compressed_owners == ()
+    # Consecutive layers fill a page's slots in order; the draft's included.
+    for index, name in enumerate(attention):
+        owner = attention[index // slots * slots] + ".compressed_k"
+        assert layout.compressed_owner(name) == (owner, index % slots)
+        assert unpacked_layout.compressed_owner(name) == (name + ".compressed_k", 0)
+    owners = [n for n in specs if n.endswith(".compressed_k")]
+    assert owners == [
+        attention[i] + ".compressed_k" for i in range(0, len(attention), slots)
+    ]
+    # Only the members other than owners disappear; every other spec is equal.
+    assert set(unpacked) - set(specs) == {n + ".compressed_k" for n in attention} - set(
+        owners
+    )
+    assert all(specs[n] == unpacked[n] for n in specs)
+    assert all(isinstance(specs[n], MLAAttentionSpec) for n in owners)
+    # Other than the layout's packing fields, the geometry is unchanged.
+    assert replace(layout, compressed_slots=1, compressed_owners=()) == (
+        unpacked_layout
+    )
+    cfg.cache_config.block_size = layout.block_size
+    cfg.cache_config.mamba_block_size = layout.block_size
+    groups = get_kv_cache_groups(cfg, specs)
+    check_packed_compressed_groups(layout, groups)
+    token_groups = [
+        g for g in groups if g.layer_names[0].endswith((".self_attn", ".compressed_k"))
+    ]
+    assert len(token_groups) == len(attention) + -(-len(attention) // slots)
+    with pytest.raises(ValueError, match="one scheduler group per owner"):
+        check_packed_compressed_groups(
+            layout, [NS(layer_names=owners[:2])] + list(groups)
+        )
+
+
+def test_unpacked_specs_are_unchanged_by_default(monkeypatch):
+    monkeypatch.delenv("QWEN4_EXP_PACK_COMPRESSED_K", raising=False)
+    default = pooled_cache_specs(pool_config(8))
+    monkeypatch.setenv("QWEN4_EXP_PACK_COMPRESSED_K", "0")
+    assert pooled_cache_specs(pool_config(8)) == default
+    assert default[0].compressed_owners == ()
+
+
+def test_packed_pool_binds_every_qsa_layer_to_its_owner_slot(monkeypatch):
+    from vllm_torchtpu.models.vllm.qwen4_exp.pooled_cache import Qwen4ExpPooledCache
+
+    cfg = packed_config(monkeypatch, True)
+    layout, specs = pooled_cache_specs(cfg)
+    cfg.cache_config.block_size = cfg.cache_config.mamba_block_size = layout.block_size
+    cache = object.__new__(Qwen4ExpPooledCache)
+    cache.layout = layout
+    carrier = object()
+    caches = {name: carrier for name in specs}
+    bound = {}
+
+    class Attention:
+        def __init__(self, name):
+            self.name = name
+
+        def bind_pool(self, pool, owner):
+            assert pool is carrier
+            bound[self.name] = owner
+
+    for name in specs:
+        if name.endswith(".self_attn"):
+            cache._bind_qsa(Attention(name), name, caches)
+    assert bound == {
+        name: layout.compressed_owner(name)
+        for name in specs
+        if name.endswith(".self_attn")
+    }
+    assert sorted({slot for _, slot in bound.values()}) == list(range(8))
+
+
+def test_qsa_bind_pool_threads_owner_table_and_static_slot():
+    from functools import partial
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.qsa import Qwen4ExpQSA
+
+    attention = object.__new__(Qwen4ExpQSA)
+    torch.nn.Module.__init__(attention)
+    attention.prefix = "model.layers.7.self_attn"
+
+    def op(*args, **kwargs):
+        return kwargs
+
+    attention._op = partial(op, compress_ratio=4)
+    pool = torch.zeros(1)
+    attention.bind_pool(pool, ("model.layers.3.self_attn.compressed_k", 1))
+    assert attention.cache_owners == (pool,)
+    assert attention.compressed_cache_name == "model.layers.3.self_attn.compressed_k"
+    assert attention._op.keywords == dict(compress_ratio=4, compressed_slot=1)
+    # Rebinding (profiling scratch -> planned pool) replaces the slot, and slot
+    # zero / unpacked pools pass no extra static argument at all.
+    attention.bind_pool(pool, ("model.layers.3.self_attn.compressed_k", 0))
+    assert attention._op.keywords == dict(compress_ratio=4)
+    attention.bind_pool(pool)
+    assert attention.compressed_cache_name == "model.layers.7.self_attn.compressed_k"
+    assert attention._op.keywords == dict(compress_ratio=4)

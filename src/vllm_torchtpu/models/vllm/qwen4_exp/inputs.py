@@ -116,9 +116,22 @@ class Qwen4ExpAdapter:
             for prefix in mtp_layer_prefixes(self.runner.vllm_config):
                 attention = prefix + ".self_attn"
                 if attention in names:
-                    names.update({attention + ".compressed_k", attention + ".raw_ring"})
+                    names.update(
+                        {self._compressed_owner(attention), attention + ".raw_ring"}
+                    )
         if self.pooled and self.cache is not None:
             cast("Qwen4ExpPooledCache", self.cache).bind_draft()
+
+    def _compressed_owner(self, attention: str) -> str:
+        """Cache group name addressing a QSA layer's compressed keys.
+
+        Packed pools (``QWEN4_EXP_PACK_COMPRESSED_K``) store the MTP draft's
+        keys in a group shared with target layers.
+        """
+        layout = getattr(self.cache, "layout", None) if self.pooled else None
+        if layout is None:
+            return attention + ".compressed_k"
+        return layout.compressed_owner(attention)[0]
 
     def get_kv_cache_spec(self):
         assert self.cache is not None
@@ -235,8 +248,8 @@ class Qwen4ExpAdapter:
                 snapshot, history, context, starts
             )
         tables = []
-        for role in ("self_attn", "self_attn.compressed_k"):
-            name = f"{self.attention_prefix}.{role}"
+        attention = f"{self.attention_prefix}.self_attn"
+        for name in (attention, self._compressed_owner(attention)):
             # Metadata uses the genuine native group table, never state slots.
             table = snapshot.attention_metadata[name].block_tables.reshape(rows, -1)
             tables.append(table)

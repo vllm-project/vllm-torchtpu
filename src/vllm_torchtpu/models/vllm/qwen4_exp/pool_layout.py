@@ -7,7 +7,8 @@ No allocation or device initialization takes place here.
 """
 
 import math
-from dataclasses import dataclass, replace
+import os
+from dataclasses import dataclass, field, replace
 
 import torch
 from vllm.v1.kv_cache_interface import (
@@ -25,6 +26,18 @@ from .qsa import QSA_BLOCK_SIZE
 # Explicit physical format shared by this model's page planner and GDN ops.
 POOLED_GDN_CONV_STATE_DTYPE = torch.float32
 
+PACK_COMPRESSED_K_ENV = "QWEN4_EXP_PACK_COMPRESSED_K"
+
+
+def pack_compressed_k_enabled() -> bool:
+    """Whether several QSA layers' compressed keys share one pool page.
+
+    Off by default. ``QWEN4_EXP_PACK_COMPRESSED_K=1`` packs; see
+    ``pooled_cache_specs``.
+    """
+    value = os.environ.get(PACK_COMPRESSED_K_ENV, "0").strip().lower()
+    return value in ("1", "true", "yes", "on")
+
 
 @dataclass(frozen=True)
 class Qwen4ExpPoolLayout:
@@ -37,6 +50,18 @@ class Qwen4ExpPoolLayout:
     compressed_kernel_rows: int
     compressed_kernel_bytes: int
     compressed_width: int
+    # Layers whose compressed keys share one pool page (1 = unpacked).
+    compressed_slots: int = 1
+    # (QSA attention prefix, compressed-key cache owner name, page slot);
+    # empty when unpacked, where every layer owns ``<prefix>.compressed_k``.
+    compressed_owners: tuple[tuple[str, str, int], ...] = field(default=())
+
+    def compressed_owner(self, attention_prefix: str) -> tuple[str, int]:
+        """Cache owner name and in-page slot of a QSA layer's compressed keys."""
+        for prefix, owner, slot in self.compressed_owners:
+            if prefix == attention_prefix:
+                return owner, slot
+        return attention_prefix + ".compressed_k", 0
 
     @property
     def main_kernel_pages(self):
@@ -54,6 +79,14 @@ def pooled_cache_specs(cfg):
     would multiply prefix-match alignment by the compression ratio. Instead,
     main and compressed pages cover the same token interval; compressed pages
     have unused tail bytes. Raw rings retain their non-cacheable lifecycle.
+
+    With ``QWEN4_EXP_PACK_COMPRESSED_K=1`` those tail bytes hold other
+    layers' compressed keys instead: consecutive QSA layers (the MTP draft's
+    included) form one scheduler group named after its first member, whose
+    page stores member ``s`` at kernel pages
+    ``[s * main_kernel_pages, (s + 1) * main_kernel_pages)``. Each member
+    still covers exactly the group's token interval, so prefix alignment,
+    hashing and eviction are unchanged; only the page count per token drops.
     """
     specs = native_cache_specs(cfg)
     text = cfg.model_config.hf_text_config
@@ -87,6 +120,23 @@ def pooled_cache_specs(cfg):
     compressed_bytes = compressed_rows * compressed_width * 2
     if page_bytes % compressed_bytes:
         raise ValueError("Qwen4Exp pool page must contain whole BF16 indexer pages")
+    # A layer's compressed keys for one manager page fill only
+    # ``main_kernel_pages`` kernel pages; the rest of the pool page is free.
+    packed_slots = page_bytes // (block_size // QSA_BLOCK_SIZE * compressed_bytes)
+    compressed_names = [name for name in specs if name.endswith(".compressed_k")]
+    owners: list[tuple[str, str, int]] = []
+    if pack_compressed_k_enabled() and packed_slots > 1:
+        # Consecutive QSA layers (the MTP draft's last) share one owner
+        # group; one block table and one page lifetime cover all of them,
+        # since compressed keys of every layer track the same token span.
+        for start in range(0, len(compressed_names), packed_slots):
+            chunk = compressed_names[start : start + packed_slots]
+            owners.extend(
+                (name.removesuffix(".compressed_k"), chunk[0], slot)
+                for slot, name in enumerate(chunk)
+            )
+    else:
+        packed_slots = 1
     layout = Qwen4ExpPoolLayout(
         block_size=block_size,
         page_bytes=page_bytes,
@@ -97,7 +147,13 @@ def pooled_cache_specs(cfg):
         compressed_kernel_rows=compressed_rows,
         compressed_kernel_bytes=compressed_bytes,
         compressed_width=compressed_width,
+        compressed_slots=packed_slots,
+        compressed_owners=tuple(owners),
     )
+    # Members other than their group's owner get no scheduler group.
+    packed_away = {prefix + ".compressed_k" for prefix, owner, _ in owners} - {
+        owner for _, owner, _ in owners
+    }
     pooled: dict[str, KVCacheSpec] = {}
     # Upstream uses one persistent Mamba state block per request without APC.
     # Its logical span is max_model_len, while the physical state still fits
@@ -107,6 +163,8 @@ def pooled_cache_specs(cfg):
         block_size if mamba_mode == "align" else cfg.model_config.max_model_len
     )
     for name, spec in specs.items():
+        if name in packed_away:
+            continue
         if isinstance(spec, MambaSpec):
             dtypes = (
                 (POOLED_GDN_CONV_STATE_DTYPE, spec.dtypes[1])
@@ -133,3 +191,19 @@ def pooled_cache_specs(cfg):
                 page_size_padded=page_bytes,
             )
     return layout, pooled
+
+
+def check_packed_compressed_groups(layout: Qwen4ExpPoolLayout, groups) -> None:
+    """Each packed compressed-key owner needs a block table of its own.
+
+    Members address slots of their owner's pages, so two owners sharing one
+    group (one block ID per token span) would overwrite each other's slots.
+    """
+    owners = {owner for _, owner, _ in layout.compressed_owners}
+    for group in groups:
+        names = set(group.layer_names)
+        if names & owners and len(names) != 1:
+            raise ValueError(
+                "Qwen4Exp packed compressed keys need one scheduler group per "
+                f"owner, got {sorted(names)}; unset QWEN4_EXP_PACK_COMPRESSED_K"
+            )
