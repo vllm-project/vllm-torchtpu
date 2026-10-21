@@ -5,7 +5,8 @@ images, and each release's Docker image and two wheels (`vllm-torchtpu-core`
 and the combined `vllm-torchtpu`). It runs only in the **TPU Release** cluster,
 on the `release-vllm-torchtpu` queue. That queue's VM runs as its own service
 account (`ci-release`), refuses jobs from any other pipeline, and is the only
-agent that can read the Docker Hub token or mint a PyPI token. No CI agent can.
+agent that can read the Docker Hub token or mint a PyPI token. Once the
+cut-over below is done, no CI agent can.
 
 The pipeline's settings upload [`pipeline.yml`](pipeline.yml) from the build's
 own checkout, and only for builds of `main` and `releases/v*`. A release branch
@@ -80,3 +81,20 @@ images to GAR and the dev image to Docker Hub as `nightly`.
 - PyPI: a Google Trusted Publisher for
   `ci-release@cloud-ullm-inference-ci-cd.iam.gserviceaccount.com` on both
   `vllm-torchtpu-core` and `vllm-torchtpu`.
+
+## Cut-over from vllm-torchtpu-nightly-image
+
+Until this is done both pipelines run, and the old one can still publish a
+release and holds a Docker Hub token in the CI cluster. Both nightly steps
+push the same tags (`nightly-YYYYMMDD` and `latest` in GAR, `nightly` on
+Docker Hub), so while both are scheduled on `main` the tags point at
+whichever finished last. To compare them, give the new pipeline's schedule
+scratch targets (`NIGHTLY_REGISTRY`, `DOCKERHUB_REPO`) or schedule only one.
+
+1. Add the `main` nightly schedule to vllm-torchtpu-release.
+2. Once its nightlies match the old pipeline's, disable the old pipeline's
+   `main` schedule. Its `glm-agentx` schedule can stay: that branch has its
+   own copy of the nightly script, which pushes to GAR only.
+3. Remove the `approve_release` block and the release arm from
+   `pipeline_nightly_image.yml` and `scripts/publish_nightly_images.sh`.
+4. Delete the Docker Hub token from the CI cluster.
