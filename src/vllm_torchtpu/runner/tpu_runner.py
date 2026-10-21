@@ -4258,6 +4258,50 @@ class TPUModelRunner(GPUModelRunner):
             device="cpu",
         )
 
+    def _strip_prefill_only_padding(self, scheduler_output: "SchedulerOutput") -> int:
+        """Drop draft-placeholder rows that vLLM padded onto a final prompt token (prefill-only MTP).
+
+        Applies only to a request whose placeholders are all -1 and whose step would cross the prompt by
+        exactly those rows. Returns how many requests were trimmed.
+        """
+        spec = getattr(scheduler_output, "scheduled_spec_decode_tokens", None)
+        if not spec:
+            return 0
+        info: dict[str, tuple[int, int | None]] = {}
+        for nrd in getattr(scheduler_output, "scheduled_new_reqs", None) or ():
+            prompt_ids = getattr(nrd, "prompt_token_ids", None)
+            info[nrd.req_id] = (
+                int(nrd.num_computed_tokens),
+                len(prompt_ids) if prompt_ids is not None else None,
+            )
+        cached = getattr(scheduler_output, "scheduled_cached_reqs", None)
+        if cached is not None:
+            for req_id, computed in zip(
+                getattr(cached, "req_ids", ()) or (), getattr(cached, "num_computed_tokens", ()) or ()
+            ):
+                idx = self.input_batch.req_id_to_index.get(req_id)
+                prompt = int(self.input_batch.num_prompt_tokens[idx]) if idx is not None else None
+                info[req_id] = (int(computed), prompt)
+        trimmed = 0
+        for req_id, drafts in list(spec.items()):
+            if not drafts or any(int(t) != -1 for t in drafts):
+                continue
+            n = scheduler_output.num_scheduled_tokens.get(req_id)
+            computed, prompt = info.get(req_id, (None, None))
+            if n is None or computed is None or prompt is None:
+                continue
+            if computed + n > prompt and computed + n - len(drafts) <= prompt:
+                scheduler_output.num_scheduled_tokens[req_id] = n - len(drafts)
+                scheduler_output.total_num_scheduled_tokens -= len(drafts)
+                del spec[req_id]
+                trimmed += 1
+                logger.warning_once(
+                    "Prefill-only MTP: dropped %d draft-placeholder row(s) padded onto the final prompt "
+                    "token of request %s (num_computed_tokens=%d, num_prompt_tokens=%d).",
+                    len(drafts), req_id, computed, prompt,
+                )
+        return trimmed
+
     @torch.no_grad()
     def execute_model(
         self,
@@ -4273,6 +4317,8 @@ class TPUModelRunner(GPUModelRunner):
             # Before anything reads the step layout, the DP token sync
             # included: the rest of the step runs on the trimmed copy.
             scheduler_output = self._adaptive_verification.trim(scheduler_output)
+        if self._mtp_prefill_only:
+            self._strip_prefill_only_padding(scheduler_output)
         # Update cached state
         self._update_states(scheduler_output)
         if self.scheduler_config.async_scheduling:
