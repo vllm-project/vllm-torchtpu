@@ -71,7 +71,7 @@ def _indexer_jax(
     compression_ratio: int,
     softmax_scale: float,
     n_head: int,
-    verify_q_len: int | None,
+    verify_q_len: int | None = None,
 ) -> jax.Array:
     if cache_kv.shape[0] == 0:
         # Profiling-shape trace: the kernel is skipped. Unused inputs stay in
