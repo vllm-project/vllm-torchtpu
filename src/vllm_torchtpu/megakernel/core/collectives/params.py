@@ -35,7 +35,10 @@ class CommParams:
     - `HIER == 1`: 2-stage 8-rank pair-reduce + 4-way all-gather (`R == 8`);
       the 4-way round pushes to the peers `me ^ off` for `off` in `HIER1_PEERS`.
     - `HIER == 2`: 3-stage 8-rank half-column pair-reduce + 4-way all-gather +
-      pair all-gather (`R == 8`, requires `HC2 % 128 == 0`).
+      pair all-gather (`R == 8`, requires `HC2 % 128 == 0`). With `HX` the
+      4-way all-gather of the half-sum becomes a 4-chip reduce-scatter (round
+      1) + all-gather (round 3) of its quarters: half the bytes off chip, one
+      more round, the same sums in the same order.
     - `HIER == 3`: `N_HIER3 = log2(R)`-round recursive halving/doubling butterfly,
       accepted for any power-of-two `R >= 2`.
     """
@@ -62,6 +65,9 @@ class CommParams:
     # `HIER == 1` cross-chip peer offsets (`tiles.hier1_peers`): one core on each
     # of the other three chips of the 2x2x1 mesh (core `me ^ off`).
     HIER1_PEERS: tuple[int, ...] = (2, 4, 6)
+    # `HIER == 2` with the 4-chip RS + AG of the half-sum (`tiles.hx`; needs
+    # `R == 8` and `(HC2 // 4) % 128 == 0`, else off).
+    HX: bool = False
 
 
 def _check_hier1_peers(peers: tuple[int, ...]) -> None:
@@ -130,9 +136,12 @@ def comm_params(
     HIER1_PEERS = tuple(int(off) for off in tiles.hier1_peers)
     if HIER == 1:
         _check_hier1_peers(HIER1_PEERS)
+    HX = bool(tiles.hx) and HIER == 2 and R == 8 and (HC2 // 4) % 128 == 0
     AR_ROUNDS = (
         tuple(range(N_HIER3))
         if HIER == 3
+        else (0, 1, 2, 3)
+        if HX
         else ((0, 1, 2) if HIER == 2 else ((0, 1) if (RSAG or HIER == 1) else (0,)))
     )
     AR_PEERS = 1 if HIER == 3 else (3 if HIER in (1, 2) else max(R - 1, 1))
@@ -155,6 +164,7 @@ def comm_params(
         AR_PEERS=AR_PEERS,
         N_HIER3=N_HIER3,
         HIER1_PEERS=HIER1_PEERS,
+        HX=HX,
     )
 
 

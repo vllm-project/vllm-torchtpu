@@ -11,7 +11,8 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Opt-in all-reduce schedule options of `AllReduceRing` (`Tiles.hier1_peers`).
+"""Opt-in all-reduce schedule options of `AllReduceRing` (`Tiles.hier1_peers`,
+`Tiles.hx`).
 
 Each option is checked two ways: the 8-rank interpret-mode all-reduce is
 bit-identical to the default schedule (the option moves data, it does not
@@ -39,6 +40,7 @@ from jax.experimental.pallas import tpu as pltpu
 from jax.sharding import Mesh
 from jax.sharding import PartitionSpec as P
 
+from tests.megakernel.core.test_stream_schedule import prim_counts
 from vllm_torchtpu.megakernel.core import AllReduceRing, collectives
 from vllm_torchtpu.megakernel.core.collectives import ring as ring_mod
 from vllm_torchtpu.megakernel.core.errors import MegakernelConfigError
@@ -82,11 +84,13 @@ def _ring_outputs(
     H: int = 1024,
     B: int = 4,
     seed: int = 0,
+    counts: bool = False,
 ) -> tuple[np.ndarray, np.ndarray, collectives.CommParams]:
     """Run 2 layers x 2 alternating slots of `allreduce` + `add_residual`.
 
     Returns the per-rank residual rows `[R, B, H]` (f32), the float64 host sum
-    of the four reductions `[B, H]`, and the `CommParams` used.
+    of the four reductions `[B, H]`, and the `CommParams` used. With `counts`,
+    returns the step's primitive histogram (`prim_counts`) instead of the rows.
     """
     devs = jax.devices("cpu")
     assert len(devs) >= R, f"Expected >= {R} CPU devices, found {len(devs)}"
@@ -145,6 +149,8 @@ def _ring_outputs(
     spikes = jax.random.bernoulli(kt, 0.05, (R, ex.MB, H)).astype(F32) * 8.0
     x0 = (x0 + spikes).astype(BF16).astype(F32)
     x1 = (x1 - spikes).astype(BF16).astype(F32)
+    if counts:
+        return prim_counts(step, x0, x1), None, cp
     out = np.asarray(step(x0, x1), dtype=np.float32)[:, :B]
     x0_64 = np.asarray(x0[:, :B], dtype=np.float64)
     x1_64 = np.asarray(x1[:, :B], dtype=np.float64)
@@ -242,8 +248,76 @@ def test_hier1_peers_bit_identical_to_default():
     _check_hier1_peers_bit_identical()
 
 
+# ---------------------------------------------------------------------------
+# hx
+# ---------------------------------------------------------------------------
+# (war, H, B): unfolded payload with HC2 = 512 (quarter 128 lanes), and folded
+# with PC = 2048, HC2 = 1024 (quarter 256 lanes).
+_HX_CASES = ((1, 1024, 4, 0), (1, 1024, 3, 17), (1, 1024, 16, 5), (0, 4096, 4, 42))
+
+
+def _check_hx_bit_identical() -> None:
+    for war, H, B, seed in _HX_CASES:
+        base_t = dataclasses.replace(_TINY_TILES, hier=2, war=war)
+        hx_t = dataclasses.replace(base_t, hx=True)
+        base, host, cp0 = _ring_outputs(base_t, H=H, B=B, seed=seed)
+        alt, _, cp1 = _ring_outputs(hx_t, H=H, B=B, seed=seed)
+        assert (cp0.HX, cp1.HX) == (False, True), (war, H)
+        np.testing.assert_array_equal(alt, base)
+        _assert_close_to_host_sum(alt, host)
+
+
+def _check_hx_structure() -> None:
+    """hx adds round 3: per all-reduce 3 more remote copies (5 -> 8), and the
+    same number of semaphore waits per copy."""
+    base_t = dataclasses.replace(_TINY_TILES, hier=2)
+    c0, _, cp0 = _ring_outputs(base_t, counts=True)
+    c1, _, cp1 = _ring_outputs(dataclasses.replace(base_t, hx=True), counts=True)
+    assert cp0.AR_ROUNDS == (0, 1, 2) and cp1.AR_ROUNDS == (0, 1, 2, 3)
+    n_ar = 4  # 2 layers x 2 slots
+    assert c1["dma_start"] - c0["dma_start"] == 3 * n_ar, (c0, c1)
+    assert c1["dma_wait"] > c0["dma_wait"]
+    assert c1["dot_general"] == c0["dot_general"]
+
+
+def test_hx_gate_and_rounds():
+    """hx engages only on hier=2 at R=8 with quarters of 128 lanes."""
+
+    def cp_for(**kw: Any) -> collectives.CommParams:
+        tiles = dataclasses.replace(_TINY_TILES, **kw)
+        ex = ExecSpec(B=4, T=1, R=8, ctx=128, tiles=tiles, interpret=True)
+        return collectives.comm_params(ex, tiles, H=1024)
+
+    on = cp_for(hier=2, hx=True)
+    assert on.HX and on.AR_ROUNDS == (0, 1, 2, 3)
+    assert collectives.ring_scratch(on)["ar_ssem"].shape == (4, 2, 3)
+    assert not cp_for(hier=2).HX
+    assert not cp_for(hier=1, hx=True).HX
+    tiles = dataclasses.replace(_TINY_TILES, hier=2, hx=True)
+    ex = ExecSpec(B=4, T=1, R=8, ctx=128, tiles=tiles, interpret=True)
+    narrow = collectives.comm_params(ex, tiles, H=512)  # HC2 = 256: quarter 64
+    assert not narrow.HX and narrow.AR_ROUNDS == (0, 1, 2)
+
+
+def test_hx_bit_identical_to_hier2():
+    """hx: the same quarter sums in the same chip order, so identical outputs."""
+    if len(jax.devices("cpu")) < 8:
+        _spawn_with_cpu_devices(8, "hx")
+        return
+    _check_hx_bit_identical()
+
+
+def test_hx_adds_the_all_gather_round():
+    if len(jax.devices("cpu")) < 8:
+        _spawn_with_cpu_devices(8, "hx_structure")
+        return
+    _check_hx_structure()
+
+
 _CHECKS = {
     "hier1_peers": _check_hier1_peers_bit_identical,
+    "hx": _check_hx_bit_identical,
+    "hx_structure": _check_hx_structure,
 }
 
 if __name__ == "__main__":

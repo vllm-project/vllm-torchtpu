@@ -64,6 +64,34 @@ class AllReduceRing:
                     device_id_type=pl.DeviceIdType.MESH,
                 )
             ]
+        if HIER == 2 and cp.HX and rnd_i in (1, 3):
+            # hx: round 1 sends quarter q of this core's half-sum to the core of
+            # chip q (4-chip RS); round 3 sends this chip's summed quarter to the
+            # other three (4-chip AG), into the same lanes of their s2_send.
+            q_w = cp.HC2 // 4
+            chip = me // 2
+            out = []
+            for i, off in enumerate((2, 4, 6)):
+                peer = me ^ off
+                if rnd_i == 1:
+                    lo = pl.multiple_of((peer // 2) * q_w, q_w)
+                    src = scr["ag_send"].at[slot, :, pl.ds(lo, q_w)]
+                    dst = scr["ag_recv"].at[slot, chip, :, pl.ds(0, q_w)]
+                else:
+                    lo = pl.multiple_of(chip * q_w, q_w)
+                    src = scr["s2_send"].at[slot, :, pl.ds(lo, q_w)]
+                    dst = scr["s2_send"].at[slot, :, pl.ds(lo, q_w)]
+                out.append(
+                    pltpu.make_async_remote_copy(
+                        src_ref=src,
+                        dst_ref=dst,
+                        send_sem=scr["ar_ssem"].at[rnd_i, slot, i],
+                        recv_sem=scr["ar_rsem"].at[rnd_i, slot, i],
+                        device_id=(peer,),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    )
+                )
+            return out
         if HIER in (1, 2):
             c_idx = lax.rem(me, 2)
             if rnd_i == 0:
@@ -186,20 +214,41 @@ class AllReduceRing:
                 return recv[last, slot, 0].astype(F32) + recv[last, slot, 1].astype(F32)
         if HIER in (1, 2):
             ag_send, ag_recv = scr["ag_send"], scr["ag_recv"]
+            HX = HIER == 2 and cp.HX
+            if HX:
+                q_w = HC2 // 4
+                q_lo = pl.multiple_of((me // 2) * q_w, q_w)
             with sc("ar_sum"):
                 ag_send[slot] = (
                     recv[slot, 0].astype(F32) + recv[slot, 1].astype(F32)
                 ).astype(BF16)
-                ag_recv[slot, me // 2] = ag_send[slot]
+                if HX:  # this chip's own quarter of the half-sum
+                    ag_recv[slot, me // 2, :, 0:q_w] = ag_send[
+                        slot, :, pl.ds(q_lo, q_w)
+                    ]
+                else:
+                    ag_recv[slot, me // 2] = ag_send[slot]
             with sc("ar_comm"):
                 self.ar_round(slot, 1)
             if HIER == 1:
                 with sc("ar_sum"):
                     return jnp.sum(ag_recv[slot].astype(F32), axis=0)
             s2_send, s2_recv = scr["s2_send"], scr["s2_recv"]
-            with sc("ar_sum"):
-                s2_send[slot] = jnp.sum(ag_recv[slot].astype(F32), axis=0).astype(BF16)
-                s2_recv[slot, c_idx] = s2_send[slot]
+            if HX:
+                with sc("ar_sum"):  # this chip's quarter over the 4 chips, in order
+                    s2_send[slot, :, pl.ds(q_lo, q_w)] = jnp.sum(
+                        ag_recv[slot, :, :, 0:q_w].astype(F32), axis=0
+                    ).astype(BF16)
+                with sc("ar_comm"):
+                    self.ar_round(slot, 3)
+                with sc("ar_sum"):
+                    s2_recv[slot, c_idx] = s2_send[slot]
+            else:
+                with sc("ar_sum"):
+                    s2_send[slot] = jnp.sum(ag_recv[slot].astype(F32), axis=0).astype(
+                        BF16
+                    )
+                    s2_recv[slot, c_idx] = s2_send[slot]
             with sc("ar_comm"):
                 self.ar_round(slot, 2)
             with sc("ar_sum"):
