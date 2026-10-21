@@ -555,3 +555,20 @@ def test_draft_loads_every_checkpoint_mtp_tensor(monkeypatch):
                 if name != "mtp.pre_fc_norm_hidden.weight"
             )
         )
+
+
+def test_draft_drops_token_count_dependent_hc_tiles():
+    from vllm_torchtpu.models.vllm.qwen4_exp.mtp import draft_additional_config
+
+    target = {
+        "qwen4_exp": {
+            "engram_config": {"cpu_offload": True},
+            "hc_prefill_full_tile": 128,
+            "hc_prefill_norm_tile": 128,
+            "hc_prefill_up_tile": 128,
+        },
+        "other": 1,
+    }
+    draft = draft_additional_config(target)
+    assert draft == {"qwen4_exp": {"engram_config": {"cpu_offload": True}}, "other": 1}
+    assert target["qwen4_exp"]["hc_prefill_full_tile"] == 128

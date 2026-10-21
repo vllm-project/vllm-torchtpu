@@ -84,6 +84,24 @@ def draft_quant_config(quant_config, first_layer):
     return config
 
 
+def draft_additional_config(additional_config):
+    """The target's additional_config without the HC prefill tile options.
+
+    The tiled HC kernels are chosen by `tokens >= tile and tokens % tile == 0`
+    while tracing. The backbone is re-traced per token-bucket group, but the
+    draft is traced once and its graph serves every bucket, so a draft traced
+    at fewer than `tile` tokens cannot serve a larger bucket
+    (ShapeSpecializationError) and vice versa. The draft's HC therefore keeps
+    the untiled path at every token count.
+    """
+    qwen = {
+        k: v
+        for k, v in additional_config.get("qwen4_exp", {}).items()
+        if not k.startswith("hc_prefill_")
+    }
+    return {**additional_config, "qwen4_exp": qwen}
+
+
 def mtp_checkpoint_name(name):
     """Draft parameter name for a checkpoint tensor; None for target tensors.
 
@@ -205,6 +223,7 @@ class Qwen4ExpMTP(nn.Module):
         cfg.quant_config = draft_quant_config(
             vllm_config.quant_config, t.num_hidden_layers
         )
+        cfg.additional_config = draft_additional_config(vllm_config.additional_config)
         self.config = t
         self.model = Qwen4ExpMultiTokenPredictor(cfg, prefixes)
         self.lm_head = ParallelLMHead(t.vocab_size, t.hidden_size, prefix="lm_head")
