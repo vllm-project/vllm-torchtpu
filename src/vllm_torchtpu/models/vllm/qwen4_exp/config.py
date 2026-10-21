@@ -205,18 +205,17 @@ def hbm_pool_sizing(cfg) -> bool:
 
 
 def pool_graph_copies() -> int:
-    """Extra pool-sized buffers a compiled forward holds, by default one.
+    """Extra pool-sized buffers to reserve per compiled forward; none by default.
 
-    The pooled ops update the pool in place inside the graph, but the
-    compiled program does not alias its pool input to its output: AOT
-    autograd applies graph-input mutations after the program
-    (``keep_inference_input_mutations=False``), so the program writes a
-    fresh pool-sized buffer. The 40 GiB-pool profiling compile failed on
-    exactly that: 96.89 GiB = 15.6 GiB resident + the 40 GiB pool input +
-    a 40 GiB temporary holding every pool value. ``0`` once the pool is
-    donated.
+    The pooled ops donate the pool and write it back with ``copy_``, so the
+    compiled forward aliases its pool input to its output and holds a single
+    pool. A conditional that returns the pool breaks that aliasing: QSA once
+    routed mixed and prefill buckets through a ``lax.cond`` carrying it, and
+    each of those programs needed a second full pool (the 40 GiB-pool profile
+    needed 96.89 GiB = 15.6 GiB resident + 40 + 40). Set
+    ``QWEN4_EXP_POOL_GRAPH_COPIES=1`` to reserve such a copy again.
     """
-    return max(0, _env_int("QWEN4_EXP_POOL_GRAPH_COPIES", 1))
+    return max(0, _env_int("QWEN4_EXP_POOL_GRAPH_COPIES", 0))
 
 
 def pool_headroom_bytes() -> int:

@@ -35,7 +35,7 @@ def clean_env(monkeypatch):
         monkeypatch.delenv(name, raising=False)
 
 
-def test_pool_reserves_one_graph_copy_and_headroom_by_default():
+def test_pool_reserves_headroom_but_no_graph_copy_by_default():
     # Measured after an 8192-token profile on v7x: 15.9 GiB resident.
     blocks = qconfig.pooled_pool_blocks(
         PAGE,
@@ -43,15 +43,25 @@ def test_pool_reserves_one_graph_copy_and_headroom_by_default():
         physical_available=int(94.74 * GiB) - int(15.9 * GiB),
         min_blocks=1,
     )
-    assert blocks == (int(94.74 * GiB) - int(15.9 * GiB) - 6 * GiB) // 2 // PAGE
+    assert blocks == (int(87.16 * GiB) - int(15.9 * GiB) - 6 * GiB) // PAGE
 
 
-def test_without_graph_copies_the_utilization_cap_binds(monkeypatch):
-    monkeypatch.setenv("QWEN4_EXP_POOL_GRAPH_COPIES", "0")
+def test_without_graph_copies_the_utilization_cap_binds():
     blocks = qconfig.pooled_pool_blocks(
         PAGE, cap_available=70 * GiB, physical_available=78 * GiB, min_blocks=1
     )
     assert blocks == 64 * GiB // PAGE
+
+
+def test_a_reserved_graph_copy_halves_the_physical_budget(monkeypatch):
+    monkeypatch.setenv("QWEN4_EXP_POOL_GRAPH_COPIES", "1")
+    blocks = qconfig.pooled_pool_blocks(
+        PAGE,
+        cap_available=int(87.16 * GiB) - int(15.9 * GiB),
+        physical_available=int(94.74 * GiB) - int(15.9 * GiB),
+        min_blocks=1,
+    )
+    assert blocks == (int(94.74 * GiB) - int(15.9 * GiB) - 6 * GiB) // 2 // PAGE
 
 
 def test_max_pool_bytes_still_caps(monkeypatch):
@@ -172,7 +182,8 @@ def test_profile_on_scratch_then_planned_pool(monkeypatch):
     budget = cache.memory_budget()
     scratch_bytes = 16 * cache.block_bytes
     physical = 90 * GiB + scratch_bytes
-    expected_blocks = min(80 * GiB + scratch_bytes - 6 * GiB, (physical - 6 * GiB) // 2)
+    # No graph-time pool copy by default: the utilization cap binds.
+    expected_blocks = min(80 * GiB + scratch_bytes - 6 * GiB, physical - 6 * GiB)
     assert budget == expected_blocks // cache.block_bytes * cache.block_bytes
 
     # The engine plans from that budget; initialize swaps in the planned pool.
@@ -195,6 +206,7 @@ def test_profile_on_scratch_then_planned_pool(monkeypatch):
 
 
 def test_planned_pool_refuses_what_its_graph_copies_cannot_fit(monkeypatch):
+    monkeypatch.setenv("QWEN4_EXP_POOL_GRAPH_COPIES", "1")
     cache, runner, _ = _cache(monkeypatch)
     _budget(monkeypatch, used=10 * GiB)
     cache.allocate(4)
