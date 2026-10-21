@@ -135,6 +135,17 @@ def _streamidx_block_sizes(
 
 _INDEXER_KV_CACHE_FALLBACK_LOGGED: set[tuple[str, str]] = set()
 _INDEXER_KV_CACHE_INFO_LOGGED: set[tuple[str, str, str, tuple[int, ...]]] = set()
+# StreamIndex `scheduling_group_slot`s, one per indexer op in construction order
+# (the same on every rank). Each layer calls the same jitted kernel with the same
+# shapes, so without a slot every layer after the first reuses the first one's
+# cached trace -- and its chunked-pipeline scheduling group ids.
+_STREAMIDX_SCHEDULING_SLOTS: dict[str, int] = {}
+
+
+def _streamidx_scheduling_slot(op_name: str) -> int:
+    return _STREAMIDX_SCHEDULING_SLOTS.setdefault(
+        op_name, len(_STREAMIDX_SCHEDULING_SLOTS)
+    )
 
 
 def _warn_indexer_kv_cache_fallback_once(mode: str, reason: str) -> None:
@@ -520,6 +531,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         skip_empty_decode = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE
         skip_empty_decode_chunked = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED
         mixed_bkvp = envs.TPU_STREAMIDX_MIXED_KV_PAGES
+        op_name = f"pallas::streamidx_topk_{self.k_cache.prefix.replace('.', '_')}"
+        scheduling_group_slot = _streamidx_scheduling_slot(op_name)
 
         def _streamidx_topk_jax(
             q_bytes: jax.Array,  # uint8 view of fp8 q [num_tokens, H, D]
@@ -594,10 +607,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 enable_early_exit=STREAMIDX_ENABLE_EARLY_EXIT,
                 kv_layout=kv_layout,
                 chunk_tokens=chunk_tokens,
+                scheduling_group_slot=scheduling_group_slot,
             )
             return cache_kv, topk_indices
 
-        op_name = f"pallas::streamidx_topk_{self.k_cache.prefix.replace('.', '_')}"
         jax_op = pallas.jax_op(op_name, _streamidx_topk_jax, donate_argnums=(2,))
 
         def _fake(q_bytes, weights, cache_kv, *args, **kwargs):
@@ -654,6 +667,10 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         skip_empty_decode = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE
         skip_empty_decode_chunked = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED
         mixed_bkvp = envs.TPU_STREAMIDX_MIXED_KV_PAGES
+        op_name = f"pallas::streamidx_topk_dcp_{self.k_cache.prefix.replace('.', '_')}"
+        if qb_overlap:
+            op_name += "_qb"
+        scheduling_group_slot = _streamidx_scheduling_slot(op_name)
         global_group = None
         if envs.TPU_IDX_TOPK_SCHED_GROUPS:
             global_group = register_indexer_layer(self.k_cache.prefix)
@@ -731,6 +748,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 global_scheduling_group_id=global_group,
                 dcp_rank_ids=rank_ids_arg,
                 **overlap,
+                scheduling_group_slot=scheduling_group_slot,
             )
             if qb_overlap:
                 local_topk, q_out = out
@@ -849,9 +867,6 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
 
         replicated = jax.sharding.PartitionSpec()
         sharded = jax.sharding.PartitionSpec(DCP_AXIS_NAME)
-        op_name = f"pallas::streamidx_topk_dcp_{self.k_cache.prefix.replace('.', '_')}"
-        if qb_overlap:
-            op_name += "_qb"
         # Reuses the PCP export wrapper verbatim: nothing in it is PCP-specific
         # once the mesh and the specs are arguments, and the reason it exists --
         # `jax_placeholders` specializing the dynamic token dim while scaling

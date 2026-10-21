@@ -1065,6 +1065,7 @@ def _effective_row_lengths(
         "return_scores",
         "skip_empty_decode",
         "skip_empty_decode_chunked",
+        "scheduling_group_slot",
     ),
 )
 def streamindex_topk(
@@ -1096,6 +1097,7 @@ def streamindex_topk(
     skip_empty_decode: bool = False,
     skip_empty_decode_chunked: bool = False,
     final_sc_tie: tuple = (),
+    scheduling_group_slot: int | None = None,
 ) -> jax.Array | tuple[Any, ...]:  # (out, [scores,] [tied])
     """StreamIndex Top-K retrieval.
 
@@ -1174,6 +1176,14 @@ def streamindex_topk(
         the SparseCore operand keeps its layout (a barrier on the whole
         buffer costs two relayout copies of it). Values are untouched. Needs
         `enable_early_exit=False`.
+      scheduling_group_slot: names this call site (e.g. the layer index) for
+        the chunked pipeline's XLA scheduling group ids: slot `s` owns its own
+        fixed block (`config.slot_scheduling_group_ids`), so calls with
+        different slots never share a group even when the second call reuses
+        the first one's trace from `jax.jit`'s cache. Every call that may land
+        in the same compiled program must pass a distinct slot. None draws the
+        ids from the per-program counter, which is only safe when each call
+        traces anew.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions
@@ -1563,7 +1573,11 @@ def streamindex_topk(
         # Ids count from 1, so the 0 is never a real group: a single chunk has no
         # pair to annotate and takes the `None` branch below both times.
         group_base = 0
-        if num_chunks > 1:
+        if num_chunks > 1 and scheduling_group_slot is not None:
+            group_base = config.slot_scheduling_group_ids(
+                scheduling_group_slot, num_chunks - 1
+            )
+        elif num_chunks > 1:
             group_base = config.reserve_scheduling_group_ids(num_chunks - 1)
 
         chunk_starts = (
@@ -1724,6 +1738,7 @@ def streamindex_topk(
         "overlap_fn",
         "merge_overlap_fn",
         "overlap_pin_max_tokens",
+        "scheduling_group_slot",
     ),
 )
 def streamindex_topk_dcp(
@@ -1757,6 +1772,7 @@ def streamindex_topk_dcp(
     overlap_args: tuple = (),
     merge_overlap_fn=None,
     overlap_pin_max_tokens: int | None = None,
+    scheduling_group_slot: int | None = None,
 ) -> jax.Array | tuple[jax.Array, Any]:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -1853,6 +1869,7 @@ def streamindex_topk_dcp(
       overlap_pin_max_tokens: pin only buckets of at most this many tokens
         (the decode buckets, whose TensorCore idles on the SparseCore calls);
         larger ones run the work unpinned. None pins every bucket.
+      scheduling_group_slot: forwarded to `streamindex_topk`; see there.
 
     Returns:
       With `overlap_fn`, a pair `(local_topk, overlap_out)`. Otherwise:
@@ -1946,6 +1963,7 @@ def streamindex_topk_dcp(
             skip_empty_decode=skip_empty_decode,
             skip_empty_decode_chunked=skip_empty_decode_chunked,
             final_sc_tie=tuple(ov_args[:1]) if pin else (),
+            scheduling_group_slot=scheduling_group_slot,
         )
         if pin:
             idxs, scores, tied = local
