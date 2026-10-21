@@ -155,6 +155,7 @@ class Qwen4ExpPooledCache:
         GDN and PLE would turn profiling into destructive cross-owner writes.
         """
         rows = metadata.seq_lens.shape[0]
+        seq_lens_cpu = metadata.seq_lens.to("cpu")
         result = {}
         next_page = 1
         for group in self.groups:
@@ -173,7 +174,12 @@ class Qwen4ExpPooledCache:
             )
             table = torch.zeros((rows, columns), dtype=torch.int32, device="cpu")
             for row in range(active_rows):
-                owned = 1 if ring else columns
+                req_blocks = max(
+                    1,
+                    (int(seq_lens_cpu[row]) + spec.block_size - 1)
+                    // spec.block_size,
+                )
+                owned = 1 if (ring or state) else min(columns, req_blocks)
                 table[row, :owned] = torch.arange(
                     next_page, next_page + owned, dtype=torch.int32, device="cpu"
                 )

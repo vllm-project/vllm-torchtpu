@@ -14,6 +14,7 @@
 """Single admission boundary for the FP8, text-only TPU S1 implementation."""
 
 import math
+import os
 
 import torch
 from vllm.model_executor.models.config import (
@@ -105,7 +106,10 @@ def native_cache_specs(cfg) -> dict[str, KVCacheSpec]:
 
 def native_cache_capacity(cfg, specs=None):
     """Size scheduler block IDs with the same upstream planner used at runtime."""
-    from vllm.v1.core.kv_cache_utils import get_kv_cache_groups
+    from vllm.v1.core.kv_cache_utils import (
+        _get_kv_cache_bytes_per_block,
+        get_kv_cache_groups,
+    )
 
     groups = get_kv_cache_groups(
         cfg, native_cache_specs(cfg) if specs is None else specs
@@ -115,7 +119,16 @@ def native_cache_capacity(cfg, specs=None):
         for group in groups
     )
     # One null block is reserved by the scheduler's pool.
-    return 1 + cfg.scheduler_config.max_num_seqs * blocks_per_request
+    pages = 1 + cfg.scheduler_config.max_num_seqs * blocks_per_request
+    bytes_per_block = _get_kv_cache_bytes_per_block(groups)
+    max_pool_bytes = int(
+        os.environ.get("QWEN4_EXP_MAX_POOL_BYTES", str(48 * 1024**3))
+    )
+    if bytes_per_block > 0 and max_pool_bytes > 0:
+        max_pages = max_pool_bytes // bytes_per_block
+        if max_pages > 1:
+            pages = min(pages, max_pages)
+    return pages
 
 
 def normalize_text_config(t) -> None:
