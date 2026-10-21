@@ -236,6 +236,7 @@ def test_manifest_preserves_lifecycle_dependencies():
         "_patch_vllm_abort_on_preemption",
         "_patch_vllm_raiden_pd_completion",
         "_patch_vllm_same_step_prefix_hits",
+        "patch_mamba_checkpoint_retention",
         "_patch_vllm_merge_multimodal_embeddings",
     ]
     assert stages["platform_activation"] == (
