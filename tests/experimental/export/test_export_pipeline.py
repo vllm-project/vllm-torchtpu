@@ -484,3 +484,32 @@ def test_build_export_config_raises_block_size_to_fit_smem() -> None:
     assert build(cfg(8, 128, block_size=8)).block_size == 8
     big = build(cfg(128, 40960))
     assert big.max_num_pages * 4 <= 1024 * 1024 // 2
+
+
+def test_module_derived_gate_up_sources_beat_name_heuristic() -> None:
+    # Qwen3-0.6B: gate_up_proj is stored `[in=1024, 2*inter=6144]`, so the
+    # shape-only rule would mistake it for `[2*half, in]` and skip the transpose.
+    tensor_to_file = {
+        "model.layers.0.mlp.gate_proj.weight": "model.safetensors",
+        "model.layers.0.mlp.up_proj.weight": "model.safetensors",
+    }
+    module_sources = [
+        {
+            "path": "",
+            "source_tensor": f"model.layers.0.mlp.{sub}.weight",
+            "source_shape": [3072, 1024],
+            "transpose": [1, 0],
+            "dst_slices": [{"dim": 1, "start": start, "length": 3072}],
+        }
+        for sub, start in (("gate_proj", 0), ("up_proj", 3072))
+    ]
+    sources = weight_mapper.expand_or_resolve_weight_sources(
+        "model.layers.0.mlp.gate_up_proj.weight",
+        {"shape": [1024, 6144], "sources": module_sources},
+        tensor_to_file,
+        "model.safetensors",
+    )
+    assert [s["source_shape"] for s in sources] == [[3072, 1024], [3072, 1024]]
+    assert all(s["transpose"] == [1, 0] for s in sources)
+    assert [s["dst_slices"][0]["start"] for s in sources] == [0, 3072]
+    assert all(s["path"] == "model.safetensors" for s in sources)

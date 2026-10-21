@@ -534,6 +534,29 @@ def expand_or_resolve_weight_sources(
     """Expands composite/packed target weights or resolves 1-to-1 weight sources."""
     shape = [int(d) for d in w_spec.get("shape", []) if isinstance(d, int)]
 
+    # 0. Sources derived from the live module layout are authoritative. The
+    # name-based rules below guess the packed orientation from the target shape
+    # alone, which is ambiguous (e.g. gate_up_proj `[in, 2*inter]` with
+    # `in < 2*inter` looks like `[2*half, in]`).
+    existing_sources = w_spec.get("sources")
+    if isinstance(existing_sources, list) and existing_sources:
+        resolved_sources: list[dict[str, Any]] = []
+        for src in existing_sources:
+            if not isinstance(src, dict):
+                continue
+            entry = dict(src)
+            raw = str(entry.get("source_tensor") or w_name)
+            st_name, path = resolve_source_tensor_and_path(
+                raw, tensor_to_file, default_path
+            )
+            entry["source_tensor"] = st_name
+            entry["path"] = path
+            if "source_shape" not in entry and shape:
+                entry["source_shape"] = shape
+            resolved_sources.append(entry)
+        if resolved_sources:
+            return resolved_sources
+
     # 1. GDN Attention: in_proj_qkvz.weight [20480, hidden_dim]
     if ".linear_attn.in_proj_qkvz.weight" in w_name and len(shape) == 2:
         in_dim = shape[1]
@@ -661,27 +684,7 @@ def expand_or_resolve_weight_sources(
             if matched_all and sources:
                 return sources
 
-    # 6. Fallback: if w_spec already has sources, resolve each source_tensor
-    existing_sources = w_spec.get("sources")
-    if isinstance(existing_sources, list) and existing_sources:
-        resolved_sources: list[dict[str, Any]] = []
-        for src in existing_sources:
-            if not isinstance(src, dict):
-                continue
-            entry = dict(src)
-            raw = str(entry.get("source_tensor") or w_name)
-            st_name, path = resolve_source_tensor_and_path(
-                raw, tensor_to_file, default_path
-            )
-            entry["source_tensor"] = st_name
-            entry["path"] = path
-            if "source_shape" not in entry and shape:
-                entry["source_shape"] = shape
-            resolved_sources.append(entry)
-        if resolved_sources:
-            return resolved_sources
-
-    # 7. Single 1-to-1 default resolution
+    # 6. Single 1-to-1 default resolution
     st_name, path = resolve_source_tensor_and_path(w_name, tensor_to_file, default_path)
     return [
         {
