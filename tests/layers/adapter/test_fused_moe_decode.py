@@ -32,6 +32,23 @@ from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
 H = 8
 
 
+def test_arm_runner_models_without_drafter(monkeypatch):
+    class Runner:
+        model = torch.nn.Linear(1, 1)
+        drafter = None
+
+        @property
+        def _async_drafter(self):
+            raise AssertionError("no async drafter")
+
+    armed = []
+    monkeypatch.setattr(
+        bridge, "arm_fused_moe_decode", lambda m, label: armed.append(label) or 1
+    )
+    assert bridge.arm_runner_models(Runner()) == 1
+    assert armed == ["target model"]
+
+
 def test_max_tokens_env(monkeypatch):
     monkeypatch.delenv("FUSED_MOE_DECODE_KERNEL", raising=False)
     monkeypatch.delenv("FUSED_MOE_DECODE_KERNEL_MAX_TOKENS", raising=False)
