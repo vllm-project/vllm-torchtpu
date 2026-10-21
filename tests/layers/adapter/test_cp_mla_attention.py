@@ -965,11 +965,13 @@ def test_chunked_merge_is_bitwise_the_unchunked_merge(dcp_size, chunks, monkeypa
 def test_positive_control_misaligned_chunk_weights_are_caught(monkeypatch):
     """The checks above must fail when a chunk is weighted with lse rows that
     are not its own (lse shifted by one row inside every chunk)."""
-    real = cp_mla.cp_lse_ag_out_rs
+    real = cp_mla._weighted_reduce_scatter
     monkeypatch.setattr(
         cp_mla,
-        "cp_lse_ag_out_rs",
-        lambda o, lse, g, **kw: real(o, torch.roll(lse, 1, dims=0), g, **kw),
+        "_weighted_reduce_scatter",
+        lambda o, lse, lses, g, *a, **kw: real(
+            o, torch.roll(lse, 1, dims=0), torch.roll(lses, 1, dims=1), g, *a, **kw
+        ),
     )
     outputs, lses = _hard_partials(np.random.default_rng(37), 4, tokens=32)
     got = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_MERGE_CHUNKED=4)
@@ -991,7 +993,8 @@ def test_collapsed_lse_gather_is_bitwise_the_chunked_merge(
         cp_mla, "_gather_lse", lambda x, g: calls.append(x.shape[0]) or real(x, g)
     )
     today = _rs_merge_whole(outputs, lses, monkeypatch, TPU_DCP_MERGE_CHUNKED=chunks)
-    assert calls == []
+    assert len(calls) == chunks * dcp_size  # one gather per chunk
+    calls.clear()
     got = _rs_merge_whole(
         outputs,
         lses,
@@ -1192,10 +1195,10 @@ def test_positive_control_wrong_weight_exceeds_the_bf16_bound(
     heavily (its own lse raised by log 1.25, the merged lse left alone)."""
     real = cp_mla._weighted_reduce_scatter
 
-    def wrong(output, lse_f32, lses, group, rs_dtype=None):
+    def wrong(output, lse_f32, lses, group, rs_dtype=None, start=0):
         if group.rank_in_group == 1:
             lse_f32 = lse_f32 + math.log(1.25)
-        return real(output, lse_f32, lses, group)
+        return real(output, lse_f32, lses, group, start=start)
 
     monkeypatch.setattr(cp_mla, "_weighted_reduce_scatter", wrong)
     outputs, lses = _spread_partials(np.random.default_rng(59), 16, 1024, 1, 16, 4.0)

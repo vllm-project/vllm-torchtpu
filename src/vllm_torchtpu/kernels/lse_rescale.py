@@ -21,6 +21,8 @@ that: XLA lowers them to the same fusion and copy. This kernel weights every
 head and stores it head-major in the same pass.
 """
 
+import math
+
 import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
@@ -44,20 +46,24 @@ def lse_rescale_head_major(
     lse: jax.Array,
     merged_lse: jax.Array,
     out_dtype: str,
+    start: int = 0,
 ) -> jax.Array:
-    """`out[h, t] = output[t, h] * exp(lse[t, h] - merged_lse[t, h])` in
-    `out_dtype`, and 0 where that weight is 0.
+    """`out[h, t] = output[start + t, h] * exp(lse[t, h] - merged_lse[t, h])`
+    in `out_dtype`, and 0 where that weight is 0.
 
     Args:
-      output: `[T, H, D]`, a rank's partial attention output.
-      lse: `[T, H]` f32, its log-sum-exp.
+      output: `[N, H, D]`, a rank's partial attention output.
+      lse: `[T, H]` f32, the log-sum-exp of rows `start : start + T`.
       merged_lse: `[T, H]` f32, the log-sum-exp over every rank.
       out_dtype: dtype name of the result.
+      start: first row of `output` to merge. The kernel reads the rows in
+        place: a sliced operand would cost XLA a copy of it.
 
     Returns:
       `[H, T, D]` in `out_dtype`.
     """
-    tokens, heads, dim = output.shape
+    tokens = lse.shape[0]
+    _, heads, dim = output.shape
     dtype = jnp.dtype(out_dtype)
     info = pltpu.get_tpu_info()
     # Two buffers each of the input and output blocks fill half of VMEM.
@@ -65,13 +71,16 @@ def lse_rescale_head_major(
     tile = info.num_sublanes * 4 // min(output.dtype.itemsize, dtype.itemsize)
     block = max(tile, info.vmem_capacity_bytes // 4 // row_bytes // tile * tile)
     block = min(block, tokens)
+    if start % block:
+        block = math.gcd(block, start)
+    offset = start // block
     return pl.pallas_call(
         _kernel,
         grid=(pl.cdiv(tokens, block),),
         in_specs=[
             pl.BlockSpec((block, heads), lambda i: (i, 0)),
             pl.BlockSpec((block, heads), lambda i: (i, 0)),
-            pl.BlockSpec((block, heads, dim), lambda i: (i, 0, 0)),
+            pl.BlockSpec((block, heads, dim), lambda i: (i + offset, 0, 0)),
         ],
         out_specs=pl.BlockSpec((heads, block, dim), lambda i: (0, i, 0)),
         out_shape=jax.ShapeDtypeStruct((heads, tokens, dim), dtype),

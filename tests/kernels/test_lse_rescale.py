@@ -53,3 +53,20 @@ def test_matches_reference(tokens, heads, dim, out_dtype):
     # Mosaic's exp and XLA's differ by an ulp; bf16 can round either way.
     rtol = 1e-2 if out_dtype == "bfloat16" else 1e-5
     np.testing.assert_allclose(got, want, rtol=rtol, atol=1e-6)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("out_dtype", ["bfloat16", "float32"])
+@pytest.mark.parametrize("tokens,start", [(128, 0), (128, 256), (512, 512), (136, 136)])
+def test_start_reads_its_rows_in_place(tokens, start, out_dtype):
+    """Rows `start : start + tokens` of a larger partial, as a chunk of the
+    token-chunked merge reads them."""
+    output, lse, merged = _partial(start + 2 * tokens, 64, 512)
+    rows = slice(start, start + tokens)
+    got = lse_rescale_head_major(output, lse[rows], merged[rows], out_dtype, start)
+    want = _reference(output[rows], lse[rows], merged[rows], out_dtype)
+    assert got.shape == (64, tokens, 512)
+    rtol = 1e-2 if out_dtype == "bfloat16" else 1e-5
+    np.testing.assert_allclose(
+        np.asarray(got, np.float32), np.asarray(want, np.float32), rtol=rtol, atol=1e-6
+    )

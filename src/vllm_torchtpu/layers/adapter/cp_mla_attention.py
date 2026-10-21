@@ -41,7 +41,11 @@ import torch
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group
-from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
+from vllm_torchtpu.distributed.dcp_comm import (
+    _lse_rescale_head_major,
+    cp_lse_ag_out_rs,
+    weighted_reduce_scatter_head_major,
+)
 
 
 def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
@@ -237,26 +241,17 @@ def _merge_chunked(
     step = output.shape[0] // chunks
     if _lse_gathered_once(output.shape[0]):
         return _merge_chunked_lse_gathered(output, lse, group, chunks, rs_dtype)
-    if envs.TPU_DCP_MERGE_RS_BF16:
-        # `cp_lse_ag_out_rs` op for op, except the scatter-sum's wire dtype.
-        lse_f32 = lse.to(torch.float32)
-        pieces = [
-            _weighted_reduce_scatter(
-                output[c * step : (c + 1) * step],
-                lse_f32[c * step : (c + 1) * step],
-                _gather_lse(lse_f32[c * step : (c + 1) * step], group),
-                group,
-                rs_dtype,
-            )
-            for c in range(chunks)
-        ]
-        return torch.cat(pieces, dim=0)
+    # `cp_lse_ag_out_rs` per chunk, op for op, except the scatter-sum's wire
+    # dtype (TPU_DCP_MERGE_RS_BF16).
+    lse_f32 = lse.to(torch.float32)
     pieces = [
-        cp_lse_ag_out_rs(
-            output[c * step : (c + 1) * step],
-            lse[c * step : (c + 1) * step],
+        _weighted_reduce_scatter(
+            output,
+            lse_f32[c * step : (c + 1) * step],
+            _gather_lse(lse_f32[c * step : (c + 1) * step], group),
             group,
-            rs_dtype=rs_dtype,
+            rs_dtype,
+            start=c * step,
         )
         for c in range(chunks)
     ]
@@ -282,10 +277,29 @@ def _weighted_reduce_scatter(
     lses: torch.Tensor,
     group: Any,
     rs_dtype: torch.dtype | None = None,
+    start: int = 0,
 ) -> torch.Tensor:
-    """`cp_lse_ag_out_rs` after its lse gather, op for op: `lses` is
-    `[world, T, H]` for exactly `output`'s `T` rows."""
+    """`cp_lse_ag_out_rs` after its lse gather, op for op, on `output`'s `T`
+    rows from `start`: `lses` is `[world, T, H]` for exactly those rows."""
     merged_lse = torch.logsumexp(lses, dim=0)
+    mode = envs.TPU_DCP_MERGE_RS_BF16
+    if output.device.type == "tpu":
+        if mode == 2:
+            # Head-major `[H, T, V]` is already destination-major: head
+            # block `d` goes to rank `d` without a transposing copy.
+            weighted = _lse_rescale_head_major(
+                output, lse_f32, merged_lse, "bfloat16", start
+            )
+            world = int(group.world_size)
+            heads, tokens, vdim = weighted.shape
+            send = weighted.reshape(world, heads // world, tokens, vdim)
+            recv = _all_to_all(send, group).to(torch.float32).sum(dim=0)
+            return recv.transpose(0, 1).to(output.dtype)
+        wire_dtype = torch.bfloat16 if mode == 1 else rs_dtype
+        return weighted_reduce_scatter_head_major(
+            output, lse_f32, merged_lse, group, wire_dtype, start
+        ).to(output.dtype)
+    output = output[start : start + lse_f32.shape[0]]
     # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
     weight = torch.exp(lse_f32 - merged_lse).unsqueeze(-1)
     weighted = output.to(torch.float32) * weight
@@ -346,11 +360,12 @@ def _merge_chunked_lse_gathered(
     gathered = _gather_lse(lse_f32, group)
     pieces = [
         _weighted_reduce_scatter(
-            output[c * step : (c + 1) * step],
+            output,
             lse_f32[c * step : (c + 1) * step],
             gathered[:, c * step : (c + 1) * step],
             group,
             rs_dtype,
+            start=c * step,
         )
         for c in range(chunks)
     ]

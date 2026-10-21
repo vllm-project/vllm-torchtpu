@@ -661,12 +661,14 @@ def _check(rank, world, group, cp_mla):
 
     # Positive control for the chunked merge: every chunk weighted with its
     # neighbour row's lse. The same check must now fail.
-    real_rs = cp_mla.cp_lse_ag_out_rs
+    real_rs = cp_mla._weighted_reduce_scatter
 
-    def misaligned_rs(o, lse, g, **kwargs):  # kwargs: rs_dtype (#1808)
-        return real_rs(o, torch.roll(lse, 1, 0), g, **kwargs)
+    def misaligned_rs(o, lse, lses_g, g, *args, **kwargs):  # + rs_dtype, start
+        return real_rs(
+            o, torch.roll(lse, 1, 0), torch.roll(lses_g, 1, 1), g, *args, **kwargs
+        )
 
-    cp_mla.cp_lse_ag_out_rs = misaligned_rs
+    cp_mla._weighted_reduce_scatter = misaligned_rs
     try:
         _set_arm(cp_mla, "chunk4")
         for how in ("eager", "compiled"):
@@ -678,7 +680,7 @@ def _check(rank, world, group, cp_mla):
                 traceback.print_exc()
                 report[f"control_misaligned/chunk4/{how}"] = {"error": repr(exc)[:400]}
     finally:
-        cp_mla.cp_lse_ag_out_rs = real_rs
+        cp_mla._weighted_reduce_scatter = real_rs
 
     # Positive control for the collapsed gathers: the gathered lse rows
     # shifted by one, so every chunk is weighted with a neighbour's lse.
