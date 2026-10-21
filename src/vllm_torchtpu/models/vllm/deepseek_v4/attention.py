@@ -55,6 +55,7 @@ from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor 
 )
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (
     VllmDeepseekV4Indexer,
+    static_verify_q_len,
 )
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
@@ -373,10 +374,7 @@ class VllmDeepseekV4MLAAttention(
         # query-length pass; the runner places them in the request
         # distribution's middle segment. Draft layers need it too: their
         # context-KV insert runs on the target's verify metadata.
-        spec_config = vllm_config.speculative_config
-        verify_q_len = (
-            spec_config.num_speculative_tokens + 1 if spec_config is not None else None
-        )
+        verify_q_len = static_verify_q_len(vllm_config)
 
         wrapped_fn = functools.partial(
             _attention_csa if is_csa else _attention_hca,

@@ -111,6 +111,9 @@ from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
     PallasAttentionBackendImpl,
 )
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (
+    static_verify_q_len,
+)
 from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
     copy_mamba_state_blocks,
     copy_mamba_state_rows,
@@ -1270,20 +1273,13 @@ class TPUModelRunner(GPUModelRunner):
     def _init_speculative_decoding(self) -> None:
         self.drafter = None
         self.rejection_sampler = None
-        # The request distribution's middle segment means what the attention
-        # op reading it says: DeepSeek-V4's attention and indexer ops take it
-        # as verify windows of exactly 1 + K tokens and score them in one
-        # static query-length pass, while the ragged-paged-attention kernels
-        # read it as the prefill-only bucket. So only models whose ops
-        # implement that pass get a static verify length
-        # (see _reorder_batch_for_rpa and _build_attention_metadata).
-        hf_config = getattr(getattr(self, "model_config", None), "hf_config", None)
-        self._static_verify_q_len: int | None = (
-            self.speculative_config.num_speculative_tokens + 1
-            if self.speculative_config
-            and getattr(hf_config, "model_type", None) == "deepseek_v4"
-            else None
-        )
+        # Full speculative verify windows (1 + K tokens) lead the verify
+        # segment and their count goes into request_distribution[1]
+        # (_reorder_batch_for_rpa, _build_attention_metadata). The length
+        # comes from the one helper the DSv4 attention and indexer ops use
+        # too, since only ops that implement the static query-length pass may
+        # see rows in that segment; see static_verify_q_len for why.
+        self._static_verify_q_len: int | None = static_verify_q_len(self.vllm_config)
         self._num_static_verify_reqs = 0
         # Drafting and verification happen where sampling happens, on the
         # last pipeline stage; the other stages keep the config for the KV

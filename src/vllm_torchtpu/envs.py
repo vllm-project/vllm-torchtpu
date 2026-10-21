@@ -113,6 +113,7 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_BIGGEST_FIRST: bool = False
     TPU_PRECOMPILE_PEER_REPLAY: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
+    TPU_SPEC_STATIC_VERIFY: bool = True
     TPU_DCP_INDEXER_A2A_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = None
@@ -818,6 +819,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_STREAMIDX_CHUNK_TOKENS": env_positive_int_or_none(
         "TPU_STREAMIDX_CHUNK_TOKENS"
     ),
+    # Score full speculative verify windows (1 + K tokens) in the attention
+    # kernels' static query-length pass instead of the mixed pass. Only takes
+    # effect for models whose ops implement that pass (DeepSeek-V4); 0 keeps
+    # every verify window on the mixed pass.
+    "TPU_SPEC_STATIC_VERIFY": env_bool("TPU_SPEC_STATIC_VERIFY", default=True),
     # Merge the DCP indexer candidates with an all-to-all over the token axis
     # instead of an all-gather over the candidate axis. Same result.
     "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=False),
