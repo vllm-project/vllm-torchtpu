@@ -259,12 +259,18 @@ def write_main_cache(
     )
 
 
-def write_compressed(pool, keys, complete, req, logical, starts, context, table, ratio):
+def write_compressed(
+    pool, keys, complete, req, logical, starts, context, table, ratio, slot=0
+):
     """One writer per BF16 pair, preserving the other half of partial pairs.
 
     An FP8 carrier packs two BF16 rows in one 32-bit sublane. Writing a lone
     BF16 row needs a read/modify/write; the last completion in each pair owns
     that write and includes both new rows when both completed this step.
+
+    ``slot`` selects this layer's region of a page shared by packed layers:
+    each layer's keys for one manager page occupy ``pool.shape[1] // (2 *
+    ratio)`` consecutive pairs (see ``pool_layout.pooled_cache_specs``).
     """
     packing = 4 if pool.dtype == jnp.float8_e4m3fn else 2
     width = pool.shape[-1]
@@ -276,6 +282,12 @@ def write_compressed(pool, keys, complete, req, logical, starts, context, table,
     pair = table[req, logical // pool.shape[1]] * pairs_per_page + (
         logical % pool.shape[1]
     ) // (2 * ratio)
+    if slot:
+        layer_pairs = pool.shape[1] // (2 * ratio)
+        assert (slot + 1) * layer_pairs <= pairs_per_page, (
+            "packed compressed-key slot exceeds its pool page"
+        )
+        pair = pair + slot * layer_pairs
     first_end = (group // 2 * 2 + 1) * ratio - 1
     local = (
         starts[req, None]
@@ -485,8 +497,13 @@ def select_blocks(
     *,
     ratio,
     block_topk,
+    slot=0,
 ):
-    """Read BF16 key tiles directly from the carrier, without a cache conversion."""
+    """Read BF16 key tiles directly from the carrier, without a cache conversion.
+
+    ``slot`` selects this layer's kernel pages in a packed page, as in
+    ``write_compressed``.
+    """
     width = pool.shape[-1]
     rows = 128 // ratio
     packing = 4 if pool.dtype == jnp.float8_e4m3fn else 2
@@ -495,11 +512,16 @@ def select_blocks(
     )
     logical_pages = pool.shape[1] // 128
     cache = pool.reshape(-1, rows // 2, packing, width)
+    assert not slot or (slot + 1) * logical_pages <= physical_pages, (
+        "packed compressed-key slot exceeds its pool page"
+    )
 
     def expand_pages(pages):
-        return (pages[..., None] * physical_pages + jnp.arange(logical_pages)).reshape(
-            -1
-        )
+        scaled = pages[..., None] * physical_pages
+        first = jnp.arange(logical_pages)
+        if slot:
+            first = first + slot * logical_pages
+        return (scaled + first).reshape(-1)
 
     def select_chunk(q, lens, pages):
         batch = len(q)
@@ -605,6 +627,7 @@ def pooled_qsa_step(
     rotary_dim: int,
     k_scale: float = 1.0,
     v_scale: float = 1.0,
+    compressed_slot: int = 0,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     # Keep the Runner's flat group tables at the Torch boundary. Static JAX
     # shapes reconstruct their per-request rows inside the operator.
@@ -660,6 +683,7 @@ def pooled_qsa_step(
         context,
         compressed_table,
         compress_ratio,
+        compressed_slot,
     )
     ids = jnp.where(active, ring_ids, 0)
     pool = write_ring_and_tags(
@@ -676,6 +700,7 @@ def pooled_qsa_step(
         context,
         ratio=compress_ratio,
         block_topk=token_topk // compress_ratio,
+        slot=compressed_slot,
     )
     output, pool = qsa_attention(
         q,

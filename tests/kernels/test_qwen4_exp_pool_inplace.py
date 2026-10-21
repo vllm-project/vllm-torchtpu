@@ -126,11 +126,8 @@ def _pool_results_of_control_flow(module, pool_type):
     return hits
 
 
-@pytest.mark.parametrize("tokens", [8, 16])
-def test_pooled_step_threads_pool_without_conditional(tokens):
-    """Lower the real pooled QSA step for TPU (no device needed) on a mixed
-    bucket, wider than the request count, and check that no conditional
-    returns the pool."""
+def _lower_pooled_step(tokens, **extra):
+    """Lower the real pooled QSA step for TPU (no device needed)."""
     from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import pooled_qsa_step
 
     requests = 3
@@ -165,14 +162,23 @@ def test_pooled_step_threads_pool_without_conditional(tokens):
         rotary_dim=64,
         k_scale=0.375,
         v_scale=2.5,
+        **extra,
     )
     step = jax.jit(
         pooled_qsa_step, donate_argnums=(10,), static_argnames=tuple(options)
     )
     device = AbstractDevice(device_kind="TPU7x", num_cores=1, platform="tpu")
     with jax.sharding.use_abstract_mesh(AbstractMesh((), (), abstract_device=device)):
-        lowered = step.trace(*args, **options).lower(lowering_platforms=("tpu",))
-    module = lowered.compiler_ir("stablehlo")
+        return step.trace(*args, **options).lower(lowering_platforms=("tpu",))
+
+
+@pytest.mark.parametrize("tokens", [8, 16])
+@pytest.mark.parametrize("slot", [None, 7])
+def test_pooled_step_threads_pool_without_conditional(tokens, slot):
+    """A mixed bucket, wider than the request count: no conditional returns
+    the pool, including for a packed compressed-key slot."""
+    extra = {} if slot is None else {"compressed_slot": slot}
+    module = _lower_pooled_step(tokens, **extra).compiler_ir("stablehlo")
     pool_type = "tensor<12x1664x1x4x256xf8E4M3FN>"
     main = next(
         op
@@ -183,3 +189,11 @@ def test_pooled_step_threads_pool_without_conditional(tokens):
     # Sanity: the pool is a program result, so the check below sees its type.
     assert pool_type in str(main.operation.attributes["function_type"])
     assert _pool_results_of_control_flow(module, pool_type) == []
+
+
+def test_unpacked_pooled_step_lowers_identically_with_slot_zero():
+    """Packing support must leave the unpacked program bit-identical."""
+    assert (
+        _lower_pooled_step(16).as_text()
+        == _lower_pooled_step(16, compressed_slot=0).as_text()
+    )

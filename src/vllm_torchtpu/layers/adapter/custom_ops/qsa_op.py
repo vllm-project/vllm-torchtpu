@@ -146,6 +146,7 @@ def build_pooled_qsa_op():
         rotary_dim,
         k_scale=1.0,
         v_scale=1.0,
+        compressed_slot=0,
     ):
         return (
             torch.empty_like(pool),
