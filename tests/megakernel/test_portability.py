@@ -22,6 +22,41 @@ from pathlib import Path
 from vllm_torchtpu import megakernel
 
 
+def _derive_required_modules(
+    root: Path, py_files: list[Path], rel_paths: set[str]
+) -> set[str]:
+    """Derive required modules from package directories and relative imports."""
+    required = {
+        "__init__.py"
+        if p.parent == root
+        else f"{p.parent.relative_to(root).as_posix()}/__init__.py"
+        for p in py_files
+    }
+    for path in py_files:
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.ImportFrom) and node.level >= 1:
+                base = path.parent
+                for _ in range(node.level - 1):
+                    base = base.parent
+                if not base.is_relative_to(root):
+                    continue
+                targets = (
+                    [node.module.replace(".", "/")]
+                    if node.module
+                    else (
+                        [alias.name for alias in node.names]
+                        if path.name == "__init__.py" and node.level == 1
+                        else []
+                    )
+                )
+                for target in targets:
+                    rel_t = (base / target).relative_to(root).as_posix()
+                    pkg_init = f"{rel_t}/__init__.py"
+                    required.add(pkg_init if pkg_init in rel_paths else f"{rel_t}.py")
+    return required
+
+
 def test_megakernel_portability_ast_guard():
     """Enforce relative internal imports, 0 vllm/torch deps, and jax._src allowlist.
 
@@ -39,12 +74,8 @@ def test_megakernel_portability_ast_guard():
 
     py_files = sorted(pkg_root.rglob("*.py"))
     rel_paths = {p.relative_to(pkg_root).as_posix() for p in py_files}
-    required_modules = {
-        "__init__.py",
-        "errors.py",
-        "ops.py",
-        "pool_alias.py",
-    }
+    required_modules = _derive_required_modules(pkg_root, py_files, rel_paths)
+    assert len(required_modules) > 1
     assert required_modules <= rel_paths, required_modules - rel_paths
 
     for path in py_files:
