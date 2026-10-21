@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import os
 from collections.abc import Mapping, Sequence
 from typing import Any
 
@@ -94,6 +95,30 @@ def _min_smem_page_size(
     return 1 << (min_page - 1).bit_length()
 
 
+def resolve_hf_checkpoint_dir(model: str | None) -> str | None:
+    """Returns the local checkpoint directory for a path or a cached Hub repo id.
+
+    The companion files (`config.json`, `tokenizer.json`, `generation_config.json`)
+    and the safetensors metadata are read from this directory, so a repo id that is
+    not in the local Hub cache is an error rather than a silently thinner artifact.
+    """
+    if not model or os.path.isdir(model):
+        return model
+    from transformers.utils import cached_file
+
+    hint = (
+        f"--model {model!r} is neither a local directory nor a repo in the "
+        "HuggingFace cache; download it first or pass the checkpoint directory"
+    )
+    try:
+        config_path = cached_file(model, "config.json", local_files_only=True)
+    except OSError as e:
+        raise FileNotFoundError(hint) from e
+    if config_path is None:
+        raise FileNotFoundError(hint)
+    return os.path.dirname(config_path)
+
+
 def build_export_config_from_vllm(
     vllm_config: Any,
     *,
@@ -116,7 +141,9 @@ def build_export_config_from_vllm(
         or getattr(model_cfg, "model", None)
         or _extract_hf_field(hf_cfg, "_name_or_path", "model_type", default="model")
     )
-    resolved_hf_dir = hf_checkpoint_dir or getattr(model_cfg, "model", None)
+    resolved_hf_dir = resolve_hf_checkpoint_dir(
+        hf_checkpoint_dir or getattr(model_cfg, "model", None)
+    )
 
     tp_size = int(getattr(parallel_cfg, "tensor_parallel_size", 1) or 1)
     dp_size = int(getattr(parallel_cfg, "data_parallel_size", 1) or 1)

@@ -19,10 +19,12 @@ import json
 import os
 import struct
 from collections.abc import Mapping, Sequence
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 from unittest import mock
 
+import pytest
 import torch
 import torch.nn as nn
 
@@ -468,11 +470,11 @@ def test_universal_adapter_1d_and_2d_mrope_export_and_cli(tmp_path) -> None:
     assert wjson["hf_checkpoint_path"] == os.path.abspath(hf_dir)
 
 
-def test_build_export_config_raises_block_size_to_fit_smem() -> None:
+def test_build_export_config_raises_block_size_to_fit_smem(tmp_path: Path) -> None:
     def cfg(max_num_seqs: int, max_model_len: int, block_size: int = 16) -> Any:
         return SimpleNamespace(
             model_config=SimpleNamespace(
-                model="m", dtype="bfloat16", max_model_len=max_model_len
+                model=str(tmp_path), dtype="bfloat16", max_model_len=max_model_len
             ),
             cache_config=SimpleNamespace(block_size=block_size),
             scheduler_config=SimpleNamespace(max_num_seqs=max_num_seqs),
@@ -556,3 +558,22 @@ def test_generation_config_is_not_declared_when_the_checkpoint_has_none(
 
     assert "generation_config" not in serving_config
     assert not (out_dir / "generation_config.json").exists()
+
+
+def test_resolve_hf_checkpoint_dir_uses_cached_hub_snapshot(tmp_path: Path) -> None:
+    snapshot = tmp_path / "snapshots" / "main"
+    snapshot.mkdir(parents=True)
+
+    def fake_cached_file(repo: str, filename: str, **kwargs: Any) -> str:
+        assert kwargs["local_files_only"] is True
+        if repo != "org/tiny":
+            raise OSError(f"{repo} is not cached")
+        return str(snapshot / filename)
+
+    resolve = universal_adapter.resolve_hf_checkpoint_dir
+    assert resolve(str(tmp_path)) == str(tmp_path)
+    assert resolve(None) is None
+    with mock.patch("transformers.utils.cached_file", fake_cached_file):
+        assert resolve("org/tiny") == str(snapshot)
+        with pytest.raises(FileNotFoundError, match="org/missing"):
+            resolve("org/missing")
