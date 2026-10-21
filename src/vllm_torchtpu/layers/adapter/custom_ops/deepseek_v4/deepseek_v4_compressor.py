@@ -72,6 +72,7 @@ def _run_compressor(
     overlap: bool,
     rms_eps: float,
     quant_block: int,
+    seq_along_lane: bool = False,
 ) -> tuple[jax.Array, jax.Array | None, jax.Array | None]:
     """Shared body of the three op variants, for CSA compressor, HCA compressor,
     and CSA indexer compressor respectively."""
@@ -95,6 +96,7 @@ def _run_compressor(
         overlap=overlap,
         rms_eps=rms_eps,
         quant_block=quant_block,
+        seq_along_lane=seq_along_lane,
     )
 
 
@@ -220,7 +222,7 @@ def _compressor_jax_indexer(
     rms_eps: float,
     quant_block: int,
 ) -> jax.Array:
-    """Lightning indexer: one array holds the records and the state."""
+    """Lightning indexer: one array holds the SEQ_ALONG_LANE records and state."""
     if cache.shape[0] == 0:
         return cache
     new_cache, _, _ = _run_compressor(
@@ -243,6 +245,7 @@ def _compressor_jax_indexer(
         overlap=overlap,
         rms_eps=rms_eps,
         quant_block=quant_block,
+        seq_along_lane=True,
     )
     return new_cache
 
@@ -303,6 +306,7 @@ class VllmCompressorStateCache(CompressorStateCache):
                 kv_cache_block_size,
                 compress_ratio=self.compress_ratio,
                 head_dim=self.head_dim,
+                indexer_seq_along_lane=True,
             )
             if block_size <= 0:
                 raise ValueError(

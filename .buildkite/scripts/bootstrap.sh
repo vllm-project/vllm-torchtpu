@@ -74,6 +74,16 @@ if [[ "$JOB_PRIORITY" == "$PRIORITY_ONCALL_FIX" ]]; then
   buildkite-agent annotate --style warning --context oncall-fix \
     "Runs at on-call priority (\`oncall-fix\` label): ahead of every other build, including main."
 fi
+# One concurrency group per author for the TPU steps of their PR builds; see
+# PR_TPU_JOBS_PER_AUTHOR. Keyed on the commit author's email, which every
+# webhook build carries: the Buildkite creator is missing whenever the GitHub
+# account is not linked to a Buildkite user.
+if [[ "${BUILDKITE_PULL_REQUEST:-false}" != "false" && -n "${BUILDKITE_PULL_REQUEST:-}" ]]; then
+  pr_author="${BUILDKITE_BUILD_AUTHOR_EMAIL:-${BUILDKITE_BUILD_CREATOR_EMAIL:-}}"
+  if [[ -n "$pr_author" ]]; then
+    export PR_TPU_CONCURRENCY_GROUP="tpu-pr/${pr_author,,}"
+  fi
+fi
 
 # --- Check for explicit skip-ci or non-code/documentation-only changes ---
 echo "--- :git: Checking if CI build should be skipped"
