@@ -139,6 +139,7 @@ def pcp_kv_gather_fields(
     assert plan.hidden_restore_idx is not None
     assert plan.ws_req is not None and plan.ws_vpage is not None
     assert plan.local_ws_page_offset is not None
+    assert plan.rep_seq_lens is not None
     max_reqs = int(plan.local_ws_page_offset.shape[0])
     window = rep_window_size(max_reqs, plan.dcp_size)
     n = plan.rep_num_reqs

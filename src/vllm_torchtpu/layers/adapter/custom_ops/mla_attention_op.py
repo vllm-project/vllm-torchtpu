@@ -1018,7 +1018,8 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         pcp = md.pcp_metadata
         assert pcp is not None
         assert self.topk_op_dcp is not None
-        rep_rd = pcp.rep_request_distribution
+        # The runner uploads the PCP fields as torch tensors.
+        rep_rd = cast(torch.Tensor, pcp.rep_request_distribution)
         decode_topk = self.topk_op_dcp(
             kvg.take_decode_rows(q_bytes, md),
             kvg.take_decode_rows(weights, md),
@@ -1030,7 +1031,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
             torch.stack([rep_rd[0], rep_rd[0], rep_rd[2]]),
         )
 
-        rd = md.request_distribution
+        rd = cast(torch.Tensor, md.request_distribution)
         prefill_topk = self.topk_op_pcp_prefill(
             kv_cache,
             q_bytes,
