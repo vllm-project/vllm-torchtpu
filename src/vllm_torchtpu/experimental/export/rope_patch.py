@@ -53,7 +53,7 @@ def is_in_graph_rope_eligible(module: nn.Module) -> bool:
             RotaryEmbeddingBase,
         )
 
-        cls = type(module)
+        cls: Any = type(module)
         if (
             isinstance(module, RotaryEmbedding)
             and cls.forward_native is RotaryEmbedding.forward_native
@@ -274,20 +274,22 @@ def patch_in_graph_rotary_embedding(model: nn.Module) -> int:
     for _, module in model.named_modules():
         if not is_in_graph_rope_eligible(module):
             continue
-        cache: Any = getattr(module, "cos_sin_cache", None)
+        # Eligible modules carry RoPE attributes nn.Module's typing cannot see.
+        rope: Any = module
+        cache: Any = getattr(rope, "cos_sin_cache", None)
         cache_dtype = cache.dtype if isinstance(cache, torch.Tensor) else torch.float32
-        inv_freq_tensor = module._compute_inv_freq(module.base).detach().float().cpu()
-        module._in_graph_rope_inv_freq = tuple(inv_freq_tensor.tolist())
-        module._in_graph_rope_cache_dtype = cache_dtype
-        module._in_graph_rope_dim_modalities = compute_mrope_dim_modalities(module)
-        bound = types.MethodType(_in_graph_rope_forward, module)
-        module.forward_native = bound
-        module._forward_method = bound
+        inv_freq_tensor = rope._compute_inv_freq(rope.base).detach().float().cpu()
+        rope._in_graph_rope_inv_freq = tuple(inv_freq_tensor.tolist())
+        rope._in_graph_rope_cache_dtype = cache_dtype
+        rope._in_graph_rope_dim_modalities = compute_mrope_dim_modalities(rope)
+        bound = types.MethodType(_in_graph_rope_forward, rope)
+        rope.forward_native = bound
+        rope._forward_method = bound
         if (
-            type(module).__name__ == "MRotaryEmbeddingInterleaved"
-            or getattr(module, "mrope_dim", None) is not None
+            type(rope).__name__ == "MRotaryEmbeddingInterleaved"
+            or getattr(rope, "mrope_dim", None) is not None
         ):
-            module.forward = bound
+            rope.forward = bound
         for buf_name in ("cos_sin_cache", "cos_sin_cache_bf16"):
             if hasattr(module, "_buffers"):
                 module._buffers.pop(buf_name, None)

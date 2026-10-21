@@ -42,13 +42,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         from vllm.engine.arg_utils import EngineArgs
         from vllm.utils.argparse_utils import FlexibleArgumentParser
 
-        parser: argparse.ArgumentParser = FlexibleArgumentParser(
+        flexible_parser = FlexibleArgumentParser(
             prog="python -m vllm_torchtpu.experimental.export",
             description=(
                 "Export a vLLM model to a standardized StableHLO serving directory."
             ),
         )
-        parser = EngineArgs.add_cli_args(parser)
+        parser: argparse.ArgumentParser = EngineArgs.add_cli_args(flexible_parser)
     except Exception:
         parser = argparse.ArgumentParser(
             prog="python -m vllm_torchtpu.experimental.export",

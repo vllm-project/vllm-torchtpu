@@ -328,7 +328,9 @@ def load_dummy_vllm_model(vllm_config: Any) -> nn.Module:
                 )
 
             loader = get_model_loader(vllm_config.load_config)
-            model = loader.load_model(
+            # `@instrument` on `load_model` hides its signature from type checkers.
+            load_model: Any = loader.load_model
+            model: nn.Module = load_model(
                 vllm_config=vllm_config,
                 model_config=vllm_config.model_config,
             )
@@ -544,7 +546,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             mamba_request_distribution=extra_controls.get("mamba_request_distribution"),
         )
 
-        backbone = getattr(self._model, "model", self._model)
+        backbone: Any = getattr(self._model, "model", self._model)
         call_weights: dict[str, Any] = {}
         if backbone is not self._model:
             prefix = "model."
@@ -617,18 +619,19 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         if self._vllm_config is not None:
             from vllm.forward_context import set_forward_context
 
+            mesh = getattr(self._model, "_export_tpu_mesh", None)
             with contextlib.ExitStack() as stack:
-                with contextlib.suppress(Exception):
-                    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (  # noqa: E501
-                        set_vllm_model_wrapper_context,
-                    )
-
-                    stack.enter_context(
-                        set_vllm_model_wrapper_context(
-                            mesh=getattr(self._model, "_export_tpu_mesh", None),
-                            vllm_config=self._vllm_config,
+                if mesh is not None:
+                    with contextlib.suppress(Exception):
+                        from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (  # noqa: E501
+                            set_vllm_model_wrapper_context,
                         )
-                    )
+
+                        stack.enter_context(
+                            set_vllm_model_wrapper_context(
+                                mesh=mesh, vllm_config=self._vllm_config
+                            )
+                        )
                 stack.enter_context(
                     set_forward_context(
                         attn_metadata, self._vllm_config, num_tokens=num_tokens
