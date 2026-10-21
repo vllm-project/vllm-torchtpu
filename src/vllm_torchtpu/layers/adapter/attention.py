@@ -149,6 +149,11 @@ TPU_STR_DTYPE_TO_TORCH_DTYPE = {
     "fp8_ds_mla": torch.uint8,
     "int8": torch.int8,
     "uint8": torch.uint8,
+    # TurboQuant packs K+V into opaque per-slot bytes (see turboquant_attention).
+    "turboquant_k8v4": torch.uint8,
+    "turboquant_4bit_nc": torch.uint8,
+    "turboquant_k3v4_nc": torch.uint8,
+    "turboquant_3bit_nc": torch.uint8,
 }
 
 

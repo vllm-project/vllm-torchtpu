@@ -69,7 +69,15 @@ else:
     SamplingParams = None
     SamplingType = None
 
+from vllm_torchtpu.gdn_pool_layout import (
+    TURBOQUANT_KV_CACHE_DTYPES as _TURBOQUANT_KV_CACHE_DTYPES,
+)
+from vllm_torchtpu.gdn_pool_layout import (
+    is_turboquant_kv_cache_dtype as _is_turboquant_cache_dtype,
+)
+
 logger = init_logger(__name__)
+
 
 # Every map below is keyed on the number of devices in the slice, which is
 # what world_size counts and what the slice builder sizes its worker address
@@ -579,11 +587,17 @@ class TpuPlatform(Platform):
 
         if attn_selector_config.use_mla:
             selected_backend = AttentionBackendEnum.FLASH_ATTN_MLA
+        elif _is_turboquant_cache_dtype(attn_selector_config.kv_cache_dtype):
+            # Registers the TPU class under AttentionBackendEnum.TURBOQUANT.
+            import vllm_torchtpu.layers.adapter.turboquant_attention  # noqa: F401
+
+            selected_backend = AttentionBackendEnum.TURBOQUANT
 
         supported_backends = [
             AttentionBackendEnum.FLASH_ATTN,
             AttentionBackendEnum.CUSTOM,
             AttentionBackendEnum.FLASH_ATTN_MLA,
+            AttentionBackendEnum.TURBOQUANT,
         ]
         if selected_backend not in supported_backends:
             logger.info(
@@ -681,6 +695,13 @@ class TpuPlatform(Platform):
             "platform_activation", model_config=vllm_config.model_config
         )
         _register_tpu_kv_connectors()
+
+        if _is_turboquant_cache_dtype(vllm_config.cache_config.cache_dtype):
+            from vllm_torchtpu.layers.adapter.turboquant_attention import (
+                check_turboquant_config,
+            )
+
+            check_turboquant_config(vllm_config)
 
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(
@@ -1120,7 +1141,10 @@ class TpuPlatform(Platform):
                 )
             else:
                 is_hybrid = vllm_config.model_config.is_hybrid
-                if not is_hybrid and not cache_config.user_specified_block_size:
+                is_tq = _is_turboquant_cache_dtype(cache_config.cache_dtype)
+                if (
+                    not is_hybrid or is_tq
+                ) and not cache_config.user_specified_block_size:
                     default = backend_cls.get_page_size(vllm_config)
                     cache_config.block_size = (  # type: ignore[assignment]
                         backend_cls.get_preferred_block_size(default)
@@ -1184,7 +1208,9 @@ class TpuPlatform(Platform):
         cls, kv_cache_dtype: str, _model_config: ModelConfig
     ) -> bool:
         supported = {"auto", "bfloat16", "fp8", "fp8_e4m3", "fp8_e5m2"}
-        return kv_cache_dtype in supported
+        return (
+            kv_cache_dtype in supported or kv_cache_dtype in _TURBOQUANT_KV_CACHE_DTYPES
+        )
 
     @classmethod
     def use_sync_weight_loader(cls) -> bool:

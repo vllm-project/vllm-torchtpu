@@ -14,7 +14,27 @@
 
 import pytest
 
-from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
+from vllm_torchtpu.gdn_pool_layout import (
+    derive_pooled_gdn_state_layout,
+    unified_kv_layout_enabled_for_architecture,
+)
+
+
+@pytest.mark.parametrize(
+    "cache_dtype",
+    [
+        "turboquant_k8v4",
+        "turboquant_4bit_nc",
+        "turboquant_k3v4_nc",
+        "turboquant_3bit_nc",
+    ],
+)
+def test_turboquant_disables_unified_kv_layout(cache_dtype: str):
+    assert unified_kv_layout_enabled_for_architecture("Qwen3_5ForConditionalGeneration")
+    assert not unified_kv_layout_enabled_for_architecture(
+        "Qwen3_5ForConditionalGeneration",
+        cache_dtype=cache_dtype,
+    )
 
 
 @pytest.mark.parametrize(
