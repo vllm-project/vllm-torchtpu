@@ -658,7 +658,8 @@ def arm_runner_models(model_runner: Any) -> int:
     # isinstance assert, which raises (not AttributeError, so getattr's default
     # does not catch it) without a DFlash/Eagle3 drafter: no spec decoding, or
     # n-gram. Every model-backed TPU proposer keeps its module in draft_model.
-    draft = getattr(getattr(model_runner, "drafter", None), "draft_model", None)
+    drafter = getattr(model_runner, "drafter", None)
+    draft = getattr(drafter, "draft_model", None) or getattr(drafter, "model", None)
     if isinstance(draft, torch.nn.Module) and draft is not model_runner.model:
         armed += arm_fused_moe_decode(draft, "draft model")
     return armed
