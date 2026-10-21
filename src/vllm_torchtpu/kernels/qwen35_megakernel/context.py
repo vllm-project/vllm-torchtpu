@@ -292,6 +292,7 @@ class MKBuildContext:
         HIER = tiles.hier if R > 1 else 0
         N_HIER3 = max(1, R.bit_length() - 1)
         RSAG = tiles.rsag and R > 1 and HIER == 0
+        HR = bool(getattr(tiles, "hr", 0)) and RSAG and R == 8
         WAR = (
             (WIDE or MR * H <= PR * PC or (RSAG and (PC // R) % 128 != 0))
             if tiles.war < 0
@@ -304,6 +305,7 @@ class MKBuildContext:
         assert not RSAG or CW % 128 == 0
         assert HIER in (0, 1, 2, 3) and (HIER == 0 or R == 8 or (HIER == 3 and R >= 2))
         assert HIER != 2 or HC2 % 128 == 0
+        HX = bool(getattr(tiles, "hx", 0)) and HIER == 2 and R == 8 and (HC2 // 4) % 128 == 0
         ARP_COMMON = bool(
             B not in self.ARPIPE_OFF_B
             and FUSED
@@ -333,12 +335,14 @@ class MKBuildContext:
             tuple(range(N_HIER3))
             if HIER == 3
             else (
-                (0, 1, 2)
+                (0, 1, 2, 3)
+                if HX
+                else (0, 1, 2)
                 if (HIER == 2 or ARP_H1)
-                else ((0, 1) if (RSAG or HIER == 1) else (0,))
+                else ((0, 1, 2, 3) if HR else (0, 1) if (RSAG or HIER == 1) else (0,))
             )
         )
-        AR_PEERS = 1 if HIER == 3 else (3 if HIER in (1, 2) else max(R - 1, 1))
+        AR_PEERS = 1 if HIER == 3 else (3 if (HIER in (1, 2) or HR) else max(R - 1, 1))
         ARP_TK = tk["lin_in"]
         ARPIPE = bool(self.ARPIPE_ON and ARP_COMMON and (HIER == 2 or ARP_H1))
         ARP_HPT = HC2 // ARP_TK if ARPIPE else 0
@@ -515,7 +519,10 @@ class MKBuildContext:
                 "ub": pltpu.VMEM((NS, rup(T, 8), QKV), F32),  # [s, t]: token t's conv output
                 "rin_sem": pltpu.SemaphoreType.DMA((NS,)),  # recurrent state in, per sequence
             })
-        if RSAG:  # round 2: this rank's chunk sum, and the chunk sums gathered from every rank
+        if HR:  # this rank's chunk sum; the 4 chips' partials of this rank's chunk
+            scratch["ag_send"] = pltpu.VMEM((NSL, AR_R, CW), BF16)
+            scratch["ag_recv"] = pltpu.VMEM((NSL, 4, AR_R, CW), BF16)
+        elif RSAG:  # round 2: this rank's chunk sum, and the chunk sums gathered from every rank
             scratch["ag_send"] = pltpu.VMEM((NSL, AR_R, CW), BF16)
             scratch["ag_recv"] = pltpu.VMEM((NSL, R, AR_R, CW), BF16)
         elif HIER == 1:
@@ -653,6 +660,7 @@ class MKBuildContext:
         self.ckpt_is_3d, self.roff_is_2d = ckpt_is_3d, roff_is_2d
         self.K_ckpt, self.ckpt_t_off = K_ckpt, ckpt_t_off
         self.HIER, self.N_HIER3, self.RSAG, self.WAR = HIER, N_HIER3, RSAG, WAR
+        self.HR, self.HX = HR, HX
         self.AR_R, self.AR_C, self.CW, self.HC2 = AR_R, AR_C, CW, HC2
         self.AR_ROUNDS, self.AR_PEERS = AR_ROUNDS, AR_PEERS
         self.ARP_COMMON, self.ARP_H1 = ARP_COMMON, ARP_H1

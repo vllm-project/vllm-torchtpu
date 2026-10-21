@@ -416,6 +416,16 @@ class Tiles:
     # 0: flat R-1 peer rounds (one-shot or rsag); 1: on-chip push + 4-chip push; 2: on-chip
     # reduce-scatter + 4-chip push + on-chip all-gather; 3: log2(R)-step butterfly (off = 1, 2, ...).
     hier: int = 0
+    # hierarchical reduce-scatter + all-gather for the flat rsag buckets (hier == 0, rsag, R = 8 on
+    # 2x2x1): on-chip RS of half the lane chunks, 4-chip RS of one chunk, 4-chip AG, on-chip AG.
+    # Each core sends 0.75 x payload to other chips instead of rsag's 1.5 x (remote writes run at
+    # ~53 GB/s per core whatever the peer count, j-9406c8ab), in the same VMEM. Rounds the
+    # chip-partial sums to bf16 (as hier=2 does), so it is not bit-identical to flat rsag.
+    hr: int = 0
+    # hier=2 with its 4-chip push (each core sends its half-sum to 3 chips: 1.5 x payload off-chip)
+    # replaced by a 4-chip reduce-scatter + all-gather of that half (0.75 x payload): one more
+    # round, same sums in the same order (bit-identical to hier=2).
+    hx: int = 0
     # unfolded [MR, H] all-reduce payload (-1: auto when WIDE or MR * H <= PR * PC; 0: folded
     # [PR, PC]; 1: unfolded [MR, H])
     war: int = -1
@@ -522,6 +532,13 @@ FUSED_WIDE_NBD = {
 # (6fc248fae, 236115c9c); VLLM_TPU_QWEN35_MK_RSAG_WIDE=0 turns the override off.
 FUSED_WIDE_RSAG_NBD = {72: 11, 76: 10, 80: 10, 84: 9, 88: 9, 96: 8, 104: 6, 112: 6}
 RSAG_WIDE_ON = os.environ.get("VLLM_TPU_QWEN35_MK_RSAG_WIDE", "1") != "0"
+# Hierarchical rsag (Tiles.hr) for every rsag bucket on R = 8: VLLM_TPU_QWEN35_MK_HRSAG=1.
+HRSAG_ON = os.environ.get("VLLM_TPU_QWEN35_MK_HRSAG", "1") == "1"
+# 4-chip RS + AG inside hier=2 (Tiles.hx) on R = 8: VLLM_TPU_QWEN35_MK_HX=1.
+HX_ON = os.environ.get("VLLM_TPU_QWEN35_MK_HX", "1") == "1"
+# hx pays from ~48 rows (j-dfcd1c82, MK step p50: 64 rows -4.9%, 48 -2.8%, 32 0%, 24 +2.7%,
+# 16 +5.7%: the extra round's latency outweighs the halved bytes on small payloads).
+HX_MIN_ROWS = int(os.environ.get("VLLM_TPU_QWEN35_MK_HX_MIN_ROWS", "48"))
 # EP expert ring refills with static banks and one layer-dispatch walk per macro-step
 # (moe_block.experts_piped_ep). Bit-exact; microbench -1.5% at 64 / 80 rows, -6% at 96 / 112
 # (final tree e25fc0d38). VLLM_TPU_QWEN35_MK_EP_FAST_REFILL=0 turns it off.
@@ -601,6 +618,10 @@ def default_tiles(c: MKConfig) -> Tiles:
         t = dataclasses.replace(t, nbd=FUSED_WIDE_NBD[c.B])
     if RSAG_WIDE_ON and c.T > 1 and c.paged_kv and c.fused_pool_io and c.B in FUSED_WIDE_RSAG_NBD:
         t = dataclasses.replace(t, hier=0, rsag=True, nbd=FUSED_WIDE_RSAG_NBD[c.B])
+    if HRSAG_ON and c.R == 8 and t.rsag and t.hier == 0:
+        t = dataclasses.replace(t, hr=1)
+    if HX_ON and c.R == 8 and t.hier == 2 and c.B >= HX_MIN_ROWS:
+        t = dataclasses.replace(t, hx=1)
     if c.NGDN == 0:
         t = dataclasses.replace(t, nbd=14)
     return t

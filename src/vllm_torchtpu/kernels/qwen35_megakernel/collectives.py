@@ -50,6 +50,33 @@ class PallasAllReduce:
                     device_id_type=pl.DeviceIdType.MESH,
                 )
             ]
+        if HIER == 2 and ctx.HX and rnd_i in (1, 3):
+            # hx: round 1 = 4-chip RS (quarter q of this core's half-sum to the core of chip q),
+            # round 3 = 4-chip AG (this chip's quarter of the half, summed, to the 3 others)
+            q_w = HC2 // 4
+            chip = me // 2
+            out = []
+            for i, off in enumerate((2, 4, 6)):
+                peer = me ^ off
+                if rnd_i == 1:
+                    lo = pl.multiple_of((peer // 2) * q_w, q_w)
+                    src = scr["ag_send"].at[slot, :, pl.ds(lo, q_w)]
+                    dst = scr["ag_recv"].at[slot, chip, :, pl.ds(0, q_w)]
+                else:
+                    lo = pl.multiple_of(chip * q_w, q_w)
+                    src = scr["s2_send"].at[slot, :, pl.ds(lo, q_w)]
+                    dst = scr["s2_send"].at[slot, :, pl.ds(lo, q_w)]
+                out.append(
+                    pltpu.make_async_remote_copy(
+                        src_ref=src,
+                        dst_ref=dst,
+                        send_sem=scr["ar_ssem"].at[rnd_i, slot, i],
+                        recv_sem=scr["ar_rsem"].at[rnd_i, slot, i],
+                        device_id=(peer,),
+                        device_id_type=pl.DeviceIdType.MESH,
+                    )
+                )
+            return out
         if HIER in (1, 2):
             c_idx = lax.rem(me, 2)
             if rnd_i == 0:
@@ -93,6 +120,48 @@ class PallasAllReduce:
                 )
                 for i, off in peers
             ]
+        if ctx.HR:
+            # hierarchical rsag: rank r owns lane chunk 4 * (r % 2) + r // 2, so the chunks of one
+            # core parity are contiguous ([4c, 4c + 4)). Round 0: the twin core's 4 chunks to it;
+            # 1: this rank's chip-partial of each same-parity peer's chunk to that peer; 2: this
+            # rank's chunk sum to the 3 same-parity peers; 3: the 4 chunk sums of this parity to
+            # the twin core.
+            c_idx = lax.rem(me, 2)
+            chip = me // 2
+            mesh = pl.DeviceIdType.MESH
+            if rnd_i in (0, 3):
+                q = 1 - c_idx if rnd_i == 0 else c_idx
+                blk = scr["send" if rnd_i == 0 else "recv"].at[slot, pl.ds(4 * q, 4)]
+                return [
+                    pltpu.make_async_remote_copy(
+                        src_ref=blk,
+                        dst_ref=scr["recv"].at[slot, pl.ds(4 * q, 4)],
+                        send_sem=scr["ar_ssem"].at[rnd_i, slot, 0],
+                        recv_sem=scr["ar_rsem"].at[rnd_i, slot, 0],
+                        device_id=(me ^ 1,),
+                        device_id_type=mesh,
+                    )
+                ]
+            out = []
+            for i, off in enumerate((2, 4, 6)):
+                peer = me ^ off
+                if rnd_i == 1:
+                    src = scr["send"].at[slot, 4 * c_idx + peer // 2]
+                    dst = scr["ag_recv"].at[slot, chip]
+                else:
+                    src = scr["ag_send"].at[slot]
+                    dst = scr["recv"].at[slot, 4 * c_idx + chip]
+                out.append(
+                    pltpu.make_async_remote_copy(
+                        src_ref=src,
+                        dst_ref=dst,
+                        send_sem=scr["ar_ssem"].at[rnd_i, slot, i],
+                        recv_sem=scr["ar_rsem"].at[rnd_i, slot, i],
+                        device_id=(peer,),
+                        device_id_type=mesh,
+                    )
+                )
+            return out
         if RSAG and rnd_i == 0:  # lane chunk p of this rank's partial -> rank p
             src, dst = (lambda off: scr["send"].at[slot, me ^ off]), scr["recv"].at[slot, me]
         elif RSAG:  # this rank's chunk sum -> every peer
@@ -194,7 +263,8 @@ class PallasAllReduce:
                 elif RSAG:
                     for j in range(R):
                         send[slot, j] = val[:, j * CW : (j + 1) * CW].astype(BF16)
-                    recv[slot, me] = send[slot, me]
+                    if not ctx.HR:
+                        recv[slot, me] = send[slot, me]
                 else:
                     send[slot] = val.astype(BF16)
                     recv[slot, me] = send[slot]
@@ -222,11 +292,17 @@ class PallasAllReduce:
                 )
         if HIER in (1, 2):
             ag_send, ag_recv = scr["ag_send"], scr["ag_recv"]
+            HX = HIER == 2 and ctx.HX
+            q_w = HC2 // 4
+            q_lo = pl.multiple_of((me // 2) * q_w, q_w)
             with sc("ar_sum"):
                 ag_send[slot] = (
                     recv[slot, 0].astype(F32) + recv[slot, 1].astype(F32)
                 ).astype(BF16)
-                ag_recv[slot, me // 2] = ag_send[slot]
+                if HX:
+                    ag_recv[slot, me // 2, :, 0:q_w] = ag_send[slot, :, pl.ds(q_lo, q_w)]
+                else:
+                    ag_recv[slot, me // 2] = ag_send[slot]
             if HIER == 1 and defer:
                 assert ctx.ARP and slot == 1
                 with sc("ar_comm"):
@@ -248,10 +324,21 @@ class PallasAllReduce:
                 with sc("ar_sum"):
                     return jnp.sum(ag_recv[slot].astype(F32), axis=0)
             s2_send, s2_recv = scr["s2_send"], scr["s2_recv"]
-            with sc("ar_sum"):
-                s2_send[slot] = jnp.sum(ag_recv[slot].astype(F32), axis=0).astype(BF16)
-                if not defer:
-                    s2_recv[slot, c_idx] = s2_send[slot]
+            if HX:
+                with sc("ar_sum"):  # this chip's quarter of the half, over the 4 chips in order
+                    s2_send[slot, :, pl.ds(q_lo, q_w)] = jnp.sum(
+                        ag_recv[slot, :, :, 0:q_w].astype(F32), axis=0
+                    ).astype(BF16)
+                with sc("ar_comm"):
+                    self.ar_round(slot, 3)
+                with sc("ar_sum"):
+                    if not defer:
+                        s2_recv[slot, c_idx] = s2_send[slot]
+            else:
+                with sc("ar_sum"):
+                    s2_send[slot] = jnp.sum(ag_recv[slot].astype(F32), axis=0).astype(BF16)
+                    if not defer:
+                        s2_recv[slot, c_idx] = s2_send[slot]
             if defer:
                 assert HIER == 2 and ctx.ARP
                 with sc("ar_comm"):
@@ -269,6 +356,29 @@ class PallasAllReduce:
         if not RSAG:
             with sc("ar_sum"):
                 return jnp.sum(recv[slot].astype(F32), axis=0)
+        if ctx.HR:
+            ag_send, ag_recv = scr["ag_send"], scr["ag_recv"]
+            chip = me // 2
+            with sc("ar_sum"):  # chip-partials of this parity's 4 chunks (bf16, as hier=2)
+                for k in range(4):
+                    j = 4 * c_idx + k
+                    send[slot, j] = (
+                        send[slot, j].astype(F32) + recv[slot, j].astype(F32)
+                    ).astype(BF16)
+            with sc("ar_comm"):
+                self.ar_round(slot, 1, fill=fill)
+            with sc("ar_sum"):  # this rank's chunk over the 4 chips, in chip order
+                ag_recv[slot, chip] = send[slot, 4 * c_idx + chip]
+                tot = ag_recv[slot, 0].astype(F32)
+                for k in range(1, 4):
+                    tot = tot + ag_recv[slot, k].astype(F32)
+                ag_send[slot] = tot.astype(BF16)
+                recv[slot, 4 * c_idx + chip] = ag_send[slot]
+            with sc("ar_comm"):
+                self.ar_round(slot, 2)
+                self.ar_round(slot, 3)
+            with sc("ar_sum"):
+                return jnp.concatenate([recv[slot, j] for j in range(R)], axis=-1).astype(F32)
         ag_send, ag_recv = scr["ag_send"], scr["ag_recv"]
         with sc("ar_sum"):
             ag_send[slot] = jnp.sum(recv[slot].astype(F32), axis=0).astype(BF16)
