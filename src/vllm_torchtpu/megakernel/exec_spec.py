@@ -25,9 +25,13 @@ from __future__ import annotations
 import dataclasses
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
-from typing import Any, Literal, TypeVar
+from typing import TYPE_CHECKING, Any, Literal, TypeVar
 
+from .errors import MegakernelConfigError
 from .ops import rup
+
+if TYPE_CHECKING:
+    from .profiles.default import ChipBudget
 
 NumericsClass = Literal["exact", "approx"]
 _T = TypeVar("_T")
@@ -50,7 +54,7 @@ def register_tunables(name: str, cls: type) -> None:
     if not (dataclasses.is_dataclass(cls) and cls.__dataclass_params__.frozen):  # type: ignore[attr-defined]
         raise TypeError(f"{cls.__name__} must be a frozen dataclass")
     fields = {f.name for f in dataclasses.fields(cls)}
-    numerics = dict(getattr(cls, "NUMERICS", {}))
+    numerics = dict(cls.NUMERICS)  # type: ignore[attr-defined]
     if set(numerics) != fields:
         raise TypeError(
             f"{cls.__name__}.NUMERICS must cover exactly its fields: missing "
@@ -91,49 +95,55 @@ class BlockOptionsMap(Mapping[str, Any]):
     block at its defaults compare equal however they were built.
     """
 
-    __slots__ = ("_items",)
+    __slots__ = ("_map",)
     # Owner and fix hint shown in error messages.
     _WHAT = "DebugOptions.blocks"
     _HINT = ""
 
     def __init__(self, items: Mapping[str, Any] | None = None) -> None:
-        pairs = []
-        for name, val in dict(items or {}).items():
-            if not dataclasses.is_dataclass(val) or isinstance(val, type):
+        src = dict(items or {})
+        entries: dict[str, Any] = {}
+        for name in sorted(src):
+            val = src[name]
+            if not (
+                dataclasses.is_dataclass(val)
+                and not isinstance(val, type)
+                and val.__dataclass_params__.frozen  # type: ignore[attr-defined]
+            ):
                 raise TypeError(
-                    f"{self._WHAT}[{name!r}] must be a dataclass instance, got "
-                    f"{type(val).__name__}{self._HINT}"
+                    f"{self._WHAT}[{name!r}] must be a frozen dataclass instance, "
+                    f"got {type(val).__name__}{self._HINT}"
                 )
             self._check(name, val)
             if val != type(val)():
-                pairs.append((name, val))
-        self._items: tuple[tuple[str, Any], ...] = tuple(sorted(pairs))
+                entries[name] = val
+        # Sorted insertion order keeps iteration, repr and hash canonical.
+        self._map = entries
 
     def _check(self, name: str, val: Any) -> None:
-        """Hook: raise `TypeError` if `val` is not a valid entry for `name`."""
+        """Hook: raise if `val` is not a valid entry for `name`."""
 
     def __getitem__(self, key: str) -> Any:
-        for name, val in self._items:
-            if name == key:
-                return val
-        raise KeyError(key)
+        return self._map[key]
 
     def __iter__(self) -> Iterator[str]:
-        return iter(name for name, _ in self._items)
+        return iter(self._map)
 
     def __len__(self) -> int:
-        return len(self._items)
+        return len(self._map)
 
     def __hash__(self) -> int:
-        return hash(self._items)
+        # Not cached: a hash pickled with the map would be stale in another
+        # process (str hashes are salted per process).
+        return hash(tuple(self._map.items()))
 
     def __eq__(self, other: object) -> bool:
         if isinstance(other, BlockOptionsMap):
-            return self._items == other._items
-        return isinstance(other, Mapping) and dict(self._items) == dict(other)
+            return self._map == other._map
+        return isinstance(other, Mapping) and self._map == dict(other)
 
     def __repr__(self) -> str:
-        return f"{type(self).__name__}({dict(self._items)!r})"
+        return f"{type(self).__name__}({self._map!r})"
 
 
 class TunablesMap(BlockOptionsMap):
@@ -145,8 +155,9 @@ class TunablesMap(BlockOptionsMap):
     _HINT = " (use Tiles.with_blocks for field dicts)"
 
     def _check(self, name: str, val: Any) -> None:
-        cls = _TUNABLES.get(name)
-        if cls is not None and not isinstance(val, cls):
+        # An unregistered (e.g. misspelled) block name raises `KeyError`.
+        cls = tunables_class(name)
+        if not isinstance(val, cls):
             raise TypeError(
                 f"Tiles.blocks[{name!r}] must be a {cls.__name__}, got "
                 f"{type(val).__name__}{self._HINT}"
@@ -156,6 +167,26 @@ class TunablesMap(BlockOptionsMap):
 # ---------------------------------------------------------------------------
 # Tiles
 # ---------------------------------------------------------------------------
+# Bytes of one VMEM tile ((8, 128) 32-bit words); `bank` / `ebank` ring slots
+# must start on tile boundaries.
+_VMEM_TILE_BYTES = 8 * 128 * 4
+# Allowed values of the enumerated core fields and lower bounds of the counts.
+# A zero budget is allowed: `build_scratch` then reports the overflow itself.
+_TILE_CHOICES: dict[str, tuple[int, ...]] = {
+    "hier": (0, 1, 2, 3),
+    "war": (-1, 0, 1),
+    "mb8": (0, 1, 2),
+}
+_TILE_MINIMUMS: dict[str, int] = {
+    "nbd": 1,
+    "nbe": 1,
+    "vmem_mib": 0,
+    "smem_mib": 0,
+    "wide_rows": 0,
+    "dmm_unroll": 0,
+}
+
+
 @dataclass(frozen=True)
 class Tiles:
     """Core execution tiling, ring depths, budgets and collectives.
@@ -192,13 +223,40 @@ class Tiles:
     def __post_init__(self) -> None:
         if not isinstance(self.blocks, TunablesMap):
             object.__setattr__(self, "blocks", TunablesMap(self.blocks))
+        bad = [
+            f"{k}={getattr(self, k)} (one of {v})"
+            for k, v in _TILE_CHOICES.items()
+            if getattr(self, k) not in v
+        ]
+        bad += [
+            f"{k}={getattr(self, k)} (minimum {v})"
+            for k, v in _TILE_MINIMUMS.items()
+            if getattr(self, k) < v
+        ]
+        bad += [
+            f"{k}={getattr(self, k)} (a positive multiple of {_VMEM_TILE_BYTES})"
+            for k in ("bank", "ebank")
+            if getattr(self, k) <= 0 or getattr(self, k) % _VMEM_TILE_BYTES
+        ]
+        if bad:
+            raise MegakernelConfigError(f"invalid Tiles: {', '.join(bad)}")
 
     def block(self, name: str, cls: type[_T] | None = None) -> _T:
-        """Tunables of block `name` (class defaults when unset)."""
+        """Tunables of block `name` (class defaults when unset).
+
+        Raises `KeyError` for an unregistered block and `TypeError` if the
+        stored tunables are not a `cls`.
+        """
+        want: type = tunables_class(name) if cls is None else cls
         val = self.blocks.get(name)
-        if val is not None:
-            return val
-        return (cls if cls is not None else tunables_class(name))()
+        if val is None:
+            return want()
+        if not isinstance(val, want):
+            raise TypeError(
+                f"Tiles.blocks[{name!r}] is a {type(val).__name__}, not a "
+                f"{want.__name__}"
+            )
+        return val
 
     def with_blocks(self, updates: Mapping[str, Any]) -> Tiles:
         """Copy with block tunables replaced: `{block name: {field: value}}`.
@@ -250,16 +308,17 @@ def tile_numerics() -> dict[str, NumericsClass]:
     return out
 
 
-def default_tiles(B: int, **kw: Any) -> Tiles:
+def default_tiles(B: int, *, R: int = 8, chip: ChipBudget | None = None) -> Tiles:
     """Model-agnostic default tiles (`profiles/default.py:default_tiles`).
 
     Used when `ExecSpec.tiles` is `None`; ring depths may be refined at build
-    time to fit the VMEM budget. Extra keyword arguments are forwarded to
-    `profiles.default.default_tiles`.
+    time to fit the VMEM budget. `chip` defaults to
+    `profiles.default.DEFAULT_CHIP`.
     """
+    from .profiles.default import DEFAULT_CHIP
     from .profiles.default import default_tiles as _rule
 
-    return _rule(B, **kw)
+    return _rule(B, R=R, chip=DEFAULT_CHIP if chip is None else chip)
 
 
 @dataclass(frozen=True)
@@ -274,6 +333,14 @@ class DebugOptions:
     blocks: Mapping[str, Any] = BlockOptionsMap()
 
     def __post_init__(self) -> None:
+        # Canonical and hashable however `skip` was given (a str would split
+        # into characters).
+        if isinstance(self.skip, str):
+            raise TypeError(
+                f"DebugOptions.skip takes a collection of phase names, not the "
+                f"str {self.skip!r}"
+            )
+        object.__setattr__(self, "skip", frozenset(self.skip))
         if not isinstance(self.blocks, BlockOptionsMap):
             object.__setattr__(self, "blocks", BlockOptionsMap(self.blocks))
 
@@ -307,6 +374,20 @@ class ExecSpec:
             and cx == type(cx)()
         ):
             object.__setattr__(self, "cache", None)
+        bad = [
+            f"{k}={getattr(self, k)}"
+            for k in ("B", "T", "R", "ctx")
+            if getattr(self, k) < 1
+        ]
+        if bad:
+            raise MegakernelConfigError(
+                f"ExecSpec needs B, T, R and ctx >= 1, got {', '.join(bad)}"
+            )
+        if self.B % self.T:
+            raise MegakernelConfigError(
+                f"ExecSpec.B={self.B} must be a multiple of T={self.T} "
+                "(B = NS * T active rows)"
+            )
 
     @property
     def resolved_tiles(self) -> Tiles:
@@ -319,7 +400,6 @@ class ExecSpec:
 
     @property
     def NS(self) -> int:
-        assert self.B % self.T == 0, (self.B, self.T)
         return self.B // self.T
 
     @property
@@ -345,7 +425,7 @@ class ExecSpec:
 
     @property
     def skip(self) -> frozenset[str]:
-        return frozenset(self.debug.skip)
+        return self.debug.skip
 
     @property
     def scopes(self) -> int | bool:

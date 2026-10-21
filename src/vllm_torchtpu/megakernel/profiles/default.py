@@ -23,8 +23,8 @@ refined at build time to fit the VMEM budget when `ExecSpec.tiles` is left
 megakernel is validated on) and never queries devices: profiles evaluate it at
 import time, before any JAX backend may be initialized. When unset tiles are
 fitted at build time, the budgets come from `chip_budget()`: the `ChipBudget`
-of the first JAX device's `device_kind`, or v7x for any kind not in
-`CHIP_BUDGETS` (including CPU interpret runs).
+of the first JAX device's `device_kind`, or v7x on a non-TPU backend (CPU
+interpret runs); a TPU whose kind is not in `CHIP_BUDGETS` raises.
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ from dataclasses import dataclass
 
 import jax
 
+from ..errors import MegakernelConfigError
 from ..exec_spec import Tiles
 
 
@@ -54,18 +55,33 @@ CHIP_BUDGETS: dict[str, ChipBudget] = {"TPU7x": TPU_V7X}
 
 
 @functools.cache
+def _first_device() -> jax.Device:
+    return jax.devices()[0]
+
+
 def _first_device_kind() -> str:
-    return jax.devices()[0].device_kind
+    return _first_device().device_kind
 
 
 def chip_budget(device_kind: str | None = None) -> ChipBudget:
-    """Budget of `device_kind` (default: the first JAX device's), else v7x.
+    """Budget of `device_kind` (default: the first JAX device's).
 
     Without `device_kind` this initializes the JAX backend; call it only where
-    the kernel is about to be built.
+    the kernel is about to be built. A non-TPU backend (CPU interpret runs)
+    gets `DEFAULT_CHIP`. Raises `MegakernelConfigError` for a kind not in
+    `CHIP_BUDGETS` instead of sizing an unvalidated chip as v7x.
     """
     kind = _first_device_kind() if device_kind is None else device_kind
-    return CHIP_BUDGETS.get(kind, DEFAULT_CHIP)
+    budget = CHIP_BUDGETS.get(kind)
+    if budget is not None:
+        return budget
+    if device_kind is None and _first_device().platform != "tpu":
+        return DEFAULT_CHIP
+    raise MegakernelConfigError(
+        f"no megakernel chip budget for device kind {kind!r} (known: "
+        f"{sorted(CHIP_BUDGETS)}); add its ChipBudget to CHIP_BUDGETS or pass "
+        "explicit tiles"
+    )
 
 
 def default_tiles(

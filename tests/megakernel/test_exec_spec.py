@@ -25,7 +25,8 @@ from pathlib import Path
 import pytest
 
 from vllm_torchtpu.megakernel import exec_spec
-from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
+from vllm_torchtpu.megakernel.errors import MegakernelConfigError
+from vllm_torchtpu.megakernel.exec_spec import DebugOptions, ExecSpec, Tiles
 from vllm_torchtpu.megakernel.profiles import default as default_profile
 from vllm_torchtpu.megakernel.profiles.default import (
     DEFAULT_CHIP,
@@ -100,8 +101,8 @@ def test_tiles_block_tunables_are_canonical_and_hashable():
         t.with_blocks({"no_such_block": {"x": 1}})
 
 
-def test_exec_spec_imports_only_ops_and_profiles():
-    """`exec_spec.py` depends only on Python stdlib, `ops`, and `profiles`."""
+def test_exec_spec_imports_only_errors_ops_and_profiles():
+    """`exec_spec.py` depends only on Python stdlib, `errors`, `ops`, `profiles`."""
     path = Path(exec_spec.__file__)
     tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
     for node in ast.walk(tree):
@@ -115,11 +116,16 @@ def test_exec_spec_imports_only_ops_and_profiles():
             else:
                 assert node.level == 1
                 roots = [mod.split(".")[0]] if mod else [a.name for a in node.names]
-                assert set(roots) <= {"ops", "profiles"}, roots
+                assert set(roots) <= {"errors", "ops", "profiles"}, roots
 
 
 @dataclasses.dataclass(frozen=True)
 class _OtherOptions:
+    width: int = 128
+
+
+@dataclasses.dataclass
+class _MutableOptions:
     width: int = 128
 
 
@@ -138,39 +144,112 @@ def test_block_maps_check_entry_types():
     )
     with pytest.raises(TypeError, match="DebugOptions.blocks"):
         exec_spec.DebugOptions(blocks={_TEST_BLOCK: {"width": 256}})
+    # A mutable dataclass would make `ExecSpec` unhashable.
+    with pytest.raises(TypeError, match="frozen"):
+        exec_spec.DebugOptions(blocks={_TEST_BLOCK: _MutableOptions(width=256)})
+
+
+def test_tiles_reject_unregistered_block_names():
+    """A misspelled block name raises instead of leaving that block at defaults."""
+    typo = f"{_TEST_BLOCK}_typo"
+    with pytest.raises(KeyError, match="no tunables registered"):
+        Tiles(blocks={typo: _TestTunables(width=256)})
+    with pytest.raises(KeyError, match="no tunables registered"):
+        Tiles().with_blocks({typo: _TestTunables(width=256)})
+    t = Tiles(blocks={_TEST_BLOCK: _TestTunables(width=256)})
+    with pytest.raises(TypeError, match="_OtherOptions"):
+        t.block(_TEST_BLOCK, _OtherOptions)
 
 
 def test_default_tile_rule_is_model_agnostic():
     """One tile set for every bucket, rank count and TP flag; chip budgets."""
     ref = default_tiles(1)
+    # The rule is the `Tiles` field defaults, whose budgets are the default chip's.
+    assert ref == Tiles()
     assert ref.hier == 0  # flat-ring all-reduce, no topology-specific mode
     assert (ref.vmem_mib, ref.smem_mib) == (
         DEFAULT_CHIP.vmem_mib,
         DEFAULT_CHIP.smem_mib,
     )
     for R in (1, 2, 4, 8, 16):
-        for moe_tp in (False, True):
-            for B in range(1, 65):
-                assert exec_spec.default_tiles(B, moe_tp=moe_tp, R=R) == ref
+        for B in range(1, 65):
+            assert exec_spec.default_tiles(B, R=R) == ref
+            for moe_tp in (False, True):
+                assert default_tiles(B, moe_tp=moe_tp, R=R) == ref
     small = ChipBudget(name="small", vmem_mib=16, smem_mib=1)
     assert default_tiles(8, chip=small).vmem_mib == 16
+    assert exec_spec.default_tiles(8, chip=small).vmem_mib == 16
 
 
-def test_chip_budget_follows_device_kind_with_v7x_fallback(monkeypatch):
+def test_chip_budget_follows_device_kind_and_rejects_unknown_tpus(monkeypatch):
     assert chip_budget("TPU7x") is TPU_V7X
-    assert chip_budget("TPU v5 lite") is DEFAULT_CHIP is TPU_V7X
-    assert chip_budget() is DEFAULT_CHIP  # CPU interpret runs: the v7x fallback
+    with pytest.raises(MegakernelConfigError, match="TPU v6 lite"):
+        chip_budget("TPU v6 lite")
+
+    def first_device(platform: str, device_kind: str) -> None:
+        dev = types.SimpleNamespace(platform=platform, device_kind=device_kind)
+        monkeypatch.setattr(default_profile, "_first_device", lambda: dev)
+
+    first_device("cpu", "cpu")
+    assert chip_budget() is DEFAULT_CHIP  # CPU interpret runs: the v7x default
+    first_device("tpu", "TPU7x")
+    assert chip_budget() is TPU_V7X
+    first_device("tpu", "TPU v6 lite")
+    with pytest.raises(MegakernelConfigError, match="CHIP_BUDGETS"):
+        chip_budget()
     small = ChipBudget(name="small", vmem_mib=16, smem_mib=1)
-    monkeypatch.setitem(
-        default_profile.CHIP_BUDGETS, default_profile._first_device_kind(), small
-    )
+    monkeypatch.setitem(default_profile.CHIP_BUDGETS, "TPU v6 lite", small)
     assert chip_budget() is small
     # The tile rule itself never queries devices (profiles run it at import).
     assert default_tiles(8) == default_tiles(8, chip=DEFAULT_CHIP)
 
 
-def test_resolved_tiles_agree_with_resolve_tiles_for_tp_geometry():
-    g_tp = types.SimpleNamespace(moe_tp=True)
+def test_resolved_tiles_use_the_default_rule_only_when_unset():
     for B in (4, 8, 16, 32, 64):
-        ex = ExecSpec(B=B, R=8)
-        assert ex.resolved_tiles == ex.resolve_tiles(g_tp) == ex.resolve_tiles()
+        assert ExecSpec(B=B, R=8).resolved_tiles == default_tiles(B, R=8)
+    t = Tiles(nbd=6)
+    assert ExecSpec(tiles=t).resolved_tiles is t
+    assert ExecSpec(tiles=t).resolve_tiles() is t
+
+
+def test_debug_skip_is_canonical_and_hashable():
+    a = ExecSpec(debug=DebugOptions(skip={"kv"}))
+    b = ExecSpec(debug=DebugOptions(skip=frozenset({"kv"})))
+    assert a.skip == frozenset({"kv"}) and a == b and hash(a) == hash(b)
+    with pytest.raises(TypeError, match="collection of phase names"):
+        DebugOptions(skip="kv")
+
+
+@pytest.mark.parametrize(
+    "kw", [{"B": 6, "T": 4}, {"B": 0}, {"T": 0}, {"R": 0}, {"ctx": 0}]
+)
+def test_exec_spec_rejects_invalid_shapes(kw):
+    with pytest.raises(MegakernelConfigError):
+        ExecSpec(**kw)
+
+
+@pytest.mark.parametrize(
+    "kw",
+    [
+        {"hier": 4},
+        {"war": 2},
+        {"mb8": 3},
+        {"nbd": 0},
+        {"nbe": 0},
+        {"vmem_mib": -1},
+        {"smem_mib": -1},
+        {"wide_rows": -1},
+        {"dmm_unroll": -1},
+        {"bank": 0},
+        # Not a whole number of 4 KiB VMEM tiles: ring slot 1 would start
+        # mid-tile.
+        {"bank": (2 << 20) + 128},
+        {"ebank": 3000},
+    ],
+)
+def test_tiles_reject_out_of_range_fields(kw):
+    (name,) = kw
+    with pytest.raises(MegakernelConfigError, match=f"{name}="):
+        Tiles(**kw)
+    with pytest.raises(MegakernelConfigError, match=f"{name}="):
+        dataclasses.replace(Tiles(), **kw)
