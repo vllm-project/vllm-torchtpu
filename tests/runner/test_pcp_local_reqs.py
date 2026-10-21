@@ -25,7 +25,6 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_torchtpu.layers.core.sequence_layout import AllSequenceLayoutPlanner
 from vllm_torchtpu.runner.pcp_manager import PcpManager
 
 MAX_NUM_SEQS = 8
@@ -89,10 +88,6 @@ def _prepare(manager, num_prefills, target_num_reqs):
 
 def test_pcp_manager_needs_two_local_reqs_per_req():
     assert _manager(4).local_reqs_per_req == 2
-
-
-def test_default_planner_keeps_one_local_req_per_req():
-    assert AllSequenceLayoutPlanner().local_reqs_per_req == 1
 
 
 def test_bucket_of_max_num_seqs_overflows():

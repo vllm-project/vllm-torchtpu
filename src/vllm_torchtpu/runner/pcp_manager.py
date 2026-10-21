@@ -86,6 +86,17 @@ class PcpKvGatherPlan(SequenceLayoutPlan):
     ws_vpage: np.ndarray | None = None
     local_ws_page_offset: np.ndarray | None = None
     ws_used_pages: int = 0
+    # This rank's local row of each request-major token, -1 if another rank
+    # holds it. Decodes are on every rank, after the split prefills.
+    request_major_to_local: np.ndarray | None = None
+
+    def local_index_for_request_major_token(
+        self, request_major_index: int
+    ) -> int | None:
+        if self.request_major_to_local is None:
+            return super().local_index_for_request_major_token(request_major_index)
+        local = int(self.request_major_to_local[int(request_major_index)])
+        return None if local < 0 else local
 
 
 def rep_window_size(max_reqs: int, dcp_size: int) -> int:
@@ -351,6 +362,17 @@ class PcpManager:
         # own local request; a decode is one.
         return 2
 
+    def num_reqs_in_chunk(self, is_prefilling: Any, capacity: int) -> int:
+        """A split prefill counts as 2 local requests, a decode as 1."""
+        # TODO(weiyulin): Remove once the head and tail chunks share one
+        # page table row.
+        num_local = 0
+        for i, prefilling in enumerate(is_prefilling):
+            num_local += self.local_reqs_per_req if prefilling else 1
+            if num_local > capacity:
+                return max(i, 1)
+        return len(is_prefilling)
+
     def reserve_host_token_capacity(
         self, runner: Any, required_num_tokens: int
     ) -> None:
@@ -429,7 +451,11 @@ class PcpManager:
         local_seq_lens[:] = 0
         local_block_rows = np.empty(local_num_reqs, dtype=np.int64)
         num_split = plan.num_split_segments(self.pcp_rank)
+        request_major_to_local = np.full(num_tokens, -1, dtype=np.int32)
         for i, seg in enumerate(segments):
+            request_major_to_local[seg.global_start : seg.global_stop] = np.arange(
+                seg.local_start, seg.local_stop, dtype=np.int32
+            )
             local_qsl[i + 1] = seg.local_stop
             start_pos = int(num_computed[seg.req_idx]) + (
                 seg.global_start - int(global_qsl[seg.req_idx])
@@ -529,6 +555,7 @@ class PcpManager:
             ws_vpage=np.asarray(ws.ws_vpage, dtype=np.int32),
             local_ws_page_offset=local_ws_off,
             ws_used_pages=ws.num_used_pages,
+            request_major_to_local=request_major_to_local,
         )
 
     def prepare_dummy(

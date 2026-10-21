@@ -497,6 +497,32 @@ MIN_NUM_SEQS = 8
 SAMPLING_EPS = 1e-5
 
 
+def _compute_num_reqs_in_chunk(
+    runner: Any, start_index: int, num_reqs: int, capacity: int
+) -> int:
+    """Number of requests in the chunk starting at `start_index`.
+
+    A step's `num_reqs` requests may not fit one forward, so the runner runs
+    them in chunks.
+
+    start_index: first request of this chunk.
+    num_reqs: requests in the step.
+    capacity: requests the attention metadata holds per forward.
+    """
+    pcp_manager = getattr(runner, "pcp_manager", None)
+    if pcp_manager is None:
+        return min(capacity, num_reqs - start_index)
+    else:
+        # pcp manager splits a prefill request into head tail chunks, which means
+        # num_reqs - start_index is not the local chunks number.
+        rows = slice(start_index, num_reqs)
+        is_prefilling = (
+            runner.input_batch.num_computed_tokens_cpu[rows]
+            < runner.input_batch.num_prompt_tokens[rows]
+        )
+        return pcp_manager.num_reqs_in_chunk(is_prefilling, capacity)
+
+
 def _validate_libtpu_version() -> None:
     """Validate libtpu opportunistically if it is present."""
     libtpu_version = importlib_metadata.version("libtpu")
@@ -3067,22 +3093,15 @@ class TPUModelRunner(GPUModelRunner):
                 use_max_model_len = True
             num_scheduled_tokens_per_req.append(num_tokens)
         if use_max_model_len:
-            if len(num_scheduled_tokens_per_req) > self.num_reqs_max_model_len:
-                num_scheduled_tokens_per_req = num_scheduled_tokens_per_req[
-                    : self.num_reqs_max_model_len
-                ]
-                end_index = start_index + self.num_reqs_max_model_len
-            else:
-                end_index = num_reqs
+            chunk_capacity = self.num_reqs_max_model_len
         else:
             assert self.num_reqs_most_model_len is not None
-            if len(num_scheduled_tokens_per_req) > self.num_reqs_most_model_len:
-                num_scheduled_tokens_per_req = num_scheduled_tokens_per_req[
-                    : self.num_reqs_most_model_len
-                ]
-                end_index = start_index + self.num_reqs_most_model_len
-            else:
-                end_index = num_reqs
+            chunk_capacity = self.num_reqs_most_model_len
+        chunk_num_reqs = _compute_num_reqs_in_chunk(
+            self, start_index, num_reqs, chunk_capacity
+        )
+        num_scheduled_tokens_per_req = num_scheduled_tokens_per_req[:chunk_num_reqs]
+        end_index = start_index + chunk_num_reqs
         max_num_scheduled_tokens_all_reqs = max(num_scheduled_tokens_per_req)
         num_scheduled_tokens_per_req = np.array(
             num_scheduled_tokens_per_req, dtype=np.int32
@@ -3701,7 +3720,9 @@ class TPUModelRunner(GPUModelRunner):
             else:
                 assert self.num_reqs_most_model_len is not None
                 chunk_reqs = self.num_reqs_most_model_len
-            this_chunk_reqs = min(chunk_reqs, num_reqs - start_index)
+            this_chunk_reqs = _compute_num_reqs_in_chunk(
+                self, start_index, num_reqs, chunk_reqs
+            )
             max_chunk_reqs = max(max_chunk_reqs, this_chunk_reqs)
             start_index += this_chunk_reqs
             num_chunks += 1
@@ -4183,6 +4204,9 @@ class TPUModelRunner(GPUModelRunner):
                 continue
             if self._pp_wave is not None:
                 self._pp_wave.end_forward(None, num_tokens_padded)
+            # The last stage returns the final hidden states, not
+            # IntermediateTensors.
+            hidden_states = cast(torch.Tensor, hidden_states)
 
             planner = self.get_pcp_planner()
             layout_plan = self._last_sequence_layout_plan
