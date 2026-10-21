@@ -204,6 +204,21 @@ class StepCostModel:
             token_pairs + token_squares / 2
         )
 
+    def effective_tokens(self, tokens: int, prefix: int) -> float:
+        """Linear-equivalent token cost of ``tokens`` new tokens behind
+        ``prefix`` cached tokens under the stage's attention slope."""
+        if tokens <= 0:
+            return 0.0
+        top = self.buckets[-1]
+        linear_per_tok = self.linear_ms[top] / top if top > 0 else 0.0
+        if linear_per_tok <= 0.0 or self.attn_ms_per_token_pair <= 0.0:
+            return float(tokens)
+        attn_pairs = float(tokens) * max(prefix, 0) + float(tokens) * tokens / 2.0
+        return (
+            float(tokens)
+            + (self.attn_ms_per_token_pair / linear_per_tok) * attn_pairs
+        )
+
     def chunk(
         self,
         prefix: int,
@@ -213,11 +228,14 @@ class StepCostModel:
         step_squares: float,
         step_limit: int | None = None,
         step_schedule: int = 0,
+        target_ms: float | None = None,
     ) -> int:
         """Largest chunk of a request with ``prefix`` computed tokens and
         ``remaining`` tokens to prefill that keeps a step already holding
         ``step_tokens`` tokens (``step_pairs`` chunk*prefix products and
-        ``step_squares`` squared chunk lengths) within the target. A chunk
+        ``step_squares`` squared chunk lengths) within the target (or
+        ``target_ms`` when a slower step in flight raises the lockstep wave
+        ceiling). A chunk
         that does not finish the request leaves the step total on a granule
         multiple and is at least a quarter of a step when the step has the
         room, since a run of tiny steps costs more than the balance it buys;
@@ -227,6 +245,9 @@ class StepCostModel:
         fits."""
         best = 0
         attn = self.attn_ms_per_token_pair
+        budget_ms = (
+            self.target_ms if target_ms is None else max(self.target_ms, target_ms)
+        )
         floor = min(remaining, self.buckets[-1] // 4)
         for bucket in self.buckets:
             if step_limit is not None and bucket > step_limit:
@@ -234,7 +255,7 @@ class StepCostModel:
             room = bucket - step_tokens
             if room <= 0:
                 continue
-            spare = self.target_ms - self.step_ms(bucket, step_pairs, step_squares)
+            spare = budget_ms - self.step_ms(bucket, step_pairs, step_squares)
             if spare < 0:
                 continue
             fit = min(remaining, room)

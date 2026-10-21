@@ -672,3 +672,30 @@ def test_a_padded_last_prompt_token_is_cut_back_to_the_prompt_end():
         request, 2, num_new_local_computed_tokens=2 * 2176
     )
     assert got == 1
+
+
+def test_chunk_sizing_uses_live_lockstep_wave_ceiling():
+    scheduler = _scheduler(cost=_model())
+    # Without in-flight steps above target_ms, 16K behind 16K clips to 12288.
+    assert scheduler._mamba_block_aligned_split(_request(16384, 65536), 16384) == 12288
+    # When an in-flight step in the wave already takes 260 ms, the next step
+    # can fill to 16384 without slowing the lockstep wave.
+    scheduler = _scheduler(cost=_model())
+    scheduler._inflight_ms = [260.0]
+    assert scheduler._mamba_block_aligned_split(_request(16384, 65536), 16384) == 16384
+
+
+def test_running_srpf_orders_by_quadratic_effective_cost():
+    model = _model()
+    # r_deep has fewer raw remaining tokens (3800) than r_shallow (4096),
+    # but r_deep is behind a 160K prefix so its quadratic prefill cost is
+    # much higher than r_shallow at prefix 0.
+    r_deep = _request(163840, 163840 + 3800, "deep")
+    r_shallow = _request(0, 4096, "shallow")
+    scheduler = _scheduler(cost=model, running=[r_deep, r_shallow])
+    scheduler._srpf_running = True
+    scheduler._paw_aging_tok_per_s = 0.0
+    scheduler._paw_max_wait_s = 0.0
+    with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+        scheduler.schedule()
+    assert [r.request_id for r in scheduler.running] == ["shallow", "deep"]

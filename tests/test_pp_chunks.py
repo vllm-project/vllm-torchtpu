@@ -258,3 +258,21 @@ def test_fit_keeps_the_schedule_capacity():
 def test_describe_names_target_buckets_and_granularity():
     text = _model().describe()
     assert "16384:" in text and "target" in text and "granularity 4096" in text
+
+
+def test_effective_tokens_scales_by_quadratic_attention_slope():
+    model = _model()
+    assert model.effective_tokens(0, 16384) == 0.0
+    cold = model.effective_tokens(4096, 0)
+    warm = model.effective_tokens(4096, 131072)
+    assert cold > 4096
+    assert warm > 2.0 * cold
+
+
+def test_chunk_accepts_wave_ceiling_target_ms():
+    model = _model()
+    # Default target clips 16K behind 16K to 12288.
+    assert model.chunk(16384, 16384, 0, 0.0, 0.0) == 12288
+    # When an in-flight step in the lockstep wave already lasts 260 ms,
+    # the full 16K chunk fits within the wave ceiling.
+    assert model.chunk(16384, 16384, 0, 0.0, 0.0, target_ms=260.0) == 16384

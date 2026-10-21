@@ -1549,7 +1549,8 @@ def _configure_pipeline_chunks(vllm_config: VllmConfig) -> None:
     if envs.DP_SCHED_ENABLED and vllm_config.parallel_config.data_parallel_size > 1:
         logger.warning("Pipeline chunk sizing is off: the DP scheduler is enabled.")
         return
-    if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS):
+    paw_cls = "vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler"
+    if scheduler_config.scheduler_cls not in (None, SCHEDULER_CLS, paw_cls):
         logger.warning(
             "Pipeline chunk sizing is off: scheduler %s is configured.",
             scheduler_config.scheduler_cls,

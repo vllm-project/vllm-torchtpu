@@ -214,3 +214,51 @@ def test_inflight_metric_keeps_prefill_router_behaviour() -> None:
     rank, _ = r.route(r.hashes("p" * 4096))
     assert rank == 1
     r.done(rank)
+
+
+def test_quad_attn_cost_model_balances_cold_and_preserves_sticky() -> None:
+    r = _PrefixAffinityRouter(
+        n=2, chunk=1024, slack=1, quad_attn_coeff=1.23e-5, token_slack=32768.0
+    )
+    # Rank 0 gets one massive 120K-token cold conversation; rank 1 gets two
+    # short 2K-token cold requests. Even though rank 0 has fewer requests in
+    # flight (1 vs 2), its quadratic effective token backlog is much larger,
+    # so the next cold request goes to rank 1.
+    long_text = "L" * (120 * 1024)
+    r0, _ = r.route(r.hashes(long_text), prompt_tokens=120000, req_id="long0")
+    assert r0 == 0
+    r1a, _ = r.route(r.hashes("s1-" * 1024), prompt_tokens=2000, req_id="short1a")
+    assert r1a == 1
+    r1b, _ = r.route(r.hashes("s2-" * 1024), prompt_tokens=2000, req_id="short1b")
+    assert r1b == 1
+    assert r.inflight == [1, 2]
+    assert r.inflight_eff_tokens[0] > r.inflight_eff_tokens[1]
+    next_cold, sticky = r.route(
+        r.hashes("s3-" * 1024), prompt_tokens=4000, req_id="short1c"
+    )
+    assert not sticky and next_cold == 1
+    # Complete all in-flight requests and verify effective token accounting resets.
+    r.done(0, req_id="long0")
+    r.done(1, req_id="short1a")
+    r.done(1, req_id="short1b")
+    r.done(1, req_id="short1c")
+    assert r.inflight_eff_tokens == [0.0, 0.0]
+
+    # Now rank 0 has 3 small requests in flight (beyond request slack=1 vs
+    # rank 1's 0 in flight), and a 124K-token continuation of long_text (120K
+    # cached on rank 0, 4K new) arrives. Re-prefilling 124K cold on rank 1
+    # costs ~218K effective tokens, whereas queuing the 4K warm delta on rank 0
+    # costs ~10K effective tokens on top of rank 0's small backlog -> stays sticky!
+    for i in range(3):
+        rk, _ = r.route(
+            r.hashes(f"small-{i}-" * 512), prompt_tokens=2000, req_id=f"sm{i}"
+        )
+        if rk != 0:
+            r.done(rk, req_id=f"sm{i}")
+            r.inflight[0] += 1
+            r.inflight_eff_tokens[0] += r.effective_tokens(2000, 0)
+    cont_rank, cont_sticky = r.route(
+        r.hashes(long_text + "N" * 4096), prompt_tokens=124000, req_id="cont"
+    )
+    assert cont_sticky and cont_rank == 0
+    assert r.sticky_quad_saved == 1

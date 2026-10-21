@@ -59,6 +59,8 @@ class _PrefixAffinityRouter:
         max_sessions: int = 0,
         saturated_inflight: int = 0,
         load_metric: str = "inflight",
+        quad_attn_coeff: float = 0.0,
+        token_slack: float = 0.0,
     ) -> None:
         if load_metric not in ("inflight", "running"):
             raise ValueError(
@@ -71,13 +73,19 @@ class _PrefixAffinityRouter:
         self.slack = slack
         self.max_sessions = max(0, max_sessions)
         self.saturated_inflight = max(0, saturated_inflight)
+        self.quad_attn_coeff = max(0.0, float(quad_attn_coeff))
+        self.token_slack = max(0.0, float(token_slack))
         self._lock = threading.Lock()
         self.owners: dict[bytes, int] = {}
         self.inflight = [0] * n
+        self.inflight_eff_tokens: list[float] = [0.0] * n
+        self._req_eff_tokens: dict[str, float] = {}
+        self._anon_eff_tokens: list[list[float]] = [[] for _ in range(n)]
         self.running = [0] * n
         self.placed = [0] * n
         self.sticky = 0
         self.sticky_saturated = 0
+        self.sticky_quad_saved = 0
         self.cold = 0
         # Residency model: digest -> conversation id, conversation id -> rank
         # holding its KV (None once evicted), and per rank an LRU of resident
@@ -88,6 +96,15 @@ class _PrefixAffinityRouter:
         self.evicted = 0
         self.rerouted = 0
         self._next_session = 0
+
+    def effective_tokens(self, uncached_tokens: int, cached_tokens: int = 0) -> float:
+        """Quadratic FLOPs-equivalent prefill token cost of ``uncached_tokens``
+        behind ``cached_tokens`` of resident prefix."""
+        u = max(0, int(uncached_tokens))
+        if u <= 0:
+            return 0.0
+        p = max(0, int(cached_tokens))
+        return float(u) + self.quad_attn_coeff * float(u) * (float(p) + float(u) / 2.0)
 
     @staticmethod
     def extract_text(body: dict[str, Any]) -> str:
@@ -122,7 +139,12 @@ class _PrefixAffinityRouter:
             out.append(h.digest())
         return out
 
-    def route(self, hs: list[bytes]) -> tuple[int, bool]:
+    def route(
+        self,
+        hs: list[bytes],
+        prompt_tokens: int = 0,
+        req_id: str | None = None,
+    ) -> tuple[int, bool]:
         with self._lock:
             best_rank: int | None = None
             matched = 0
@@ -150,18 +172,45 @@ class _PrefixAffinityRouter:
                 self.saturated_inflight > 0
                 and min(self.inflight) >= self.saturated_inflight
             )
-            if known and (saturated or load[best_rank] <= lo + self.slack):
+            est_tokens = (
+                prompt_tokens
+                if prompt_tokens > 0
+                else (max(1, int(len(hs) * self.chunk / 3.4)) if hs else 0)
+            )
+            use_quad = self.quad_attn_coeff > 0.0 and est_tokens > 0
+            cold_eff = self.effective_tokens(est_tokens, 0) if use_quad else 0.0
+            sticky_eff = cold_eff
+            quad_prefers_sticky = False
+            if known and use_quad and best_rank is not None:
+                frac = min(1.0, matched / max(len(hs), 1))
+                cached_toks = int(est_tokens * frac)
+                uncached_toks = max(1, est_tokens - cached_toks)
+                sticky_eff = self.effective_tokens(uncached_toks, cached_toks)
+                min_eff = min(self.inflight_eff_tokens)
+                quad_prefers_sticky = (
+                    self.inflight_eff_tokens[best_rank] + sticky_eff
+                    <= min_eff + cold_eff + self.token_slack
+                )
+            if known and (
+                saturated
+                or load[best_rank] <= lo + self.slack
+                or quad_prefers_sticky
+            ):
                 rank = best_rank
                 is_sticky = True
+                req_eff = sticky_eff
                 self.sticky += 1
                 if saturated and load[best_rank] > lo + self.slack:
                     self.sticky_saturated += 1
+                elif quad_prefers_sticky and load[best_rank] > lo + self.slack:
+                    self.sticky_quad_saved += 1
             else:
                 if self.max_sessions > 0:
                     rank = min(
                         range(self.n),
                         key=lambda r: (
                             len(self.resident[r]),
+                            self.inflight_eff_tokens[r] if use_quad else 0.0,
                             load[r],
                             self.inflight[r],
                             self.placed[r],
@@ -171,9 +220,16 @@ class _PrefixAffinityRouter:
                 else:
                     rank = min(
                         range(self.n),
-                        key=lambda r: (load[r], self.inflight[r], self.placed[r], r),
+                        key=lambda r: (
+                            self.inflight_eff_tokens[r] if use_quad else 0.0,
+                            load[r],
+                            self.inflight[r],
+                            self.placed[r],
+                            r,
+                        ),
                     )
                 is_sticky = False
+                req_eff = cold_eff
                 self.cold += 1
             if sid is None:
                 sid = self._next_session
@@ -183,6 +239,12 @@ class _PrefixAffinityRouter:
                 self.session_of[d] = sid
             self._touch_session(sid, rank)
             self.inflight[rank] += 1
+            if use_quad:
+                self.inflight_eff_tokens[rank] += req_eff
+                if req_id is not None:
+                    self._req_eff_tokens[req_id] = req_eff
+                else:
+                    self._anon_eff_tokens[rank].append(req_eff)
             self.placed[rank] += 1
             total = self.sticky + self.cold
             if total % 64 == 0:
@@ -190,8 +252,11 @@ class _PrefixAffinityRouter:
                     f"PERF PROXY prefix_router | total={total} "
                     f"sticky={self.sticky} ({100.0 * self.sticky / total:.1f}%) "
                     f"sticky_saturated={self.sticky_saturated} "
+                    f"sticky_quad_saved={self.sticky_quad_saved} "
                     f"cold={self.cold} rerouted={self.rerouted} placed={self.placed} "
-                    f"inflight={self.inflight} unique_chunks={len(self.owners)} "
+                    f"inflight={self.inflight} "
+                    f"inflight_eff_tokens={[int(x) for x in self.inflight_eff_tokens]} "
+                    f"unique_chunks={len(self.owners)} "
                     f"resident={[len(r) for r in self.resident]} "
                     f"evicted={self.evicted} sessions={self._next_session} "
                     f"running={self.running} load_metric={self.load_metric}",
@@ -219,9 +284,24 @@ class _PrefixAffinityRouter:
         with self._lock:
             self.running[rank] += 1
 
-    def done(self, rank: int, was_running: bool = False) -> None:
+    def done(
+        self, rank: int, was_running: bool = False, req_id: str | None = None
+    ) -> None:
         with self._lock:
             self.inflight[rank] = max(0, self.inflight[rank] - 1)
+            if req_id is not None and req_id in self._req_eff_tokens:
+                eff = self._req_eff_tokens.pop(req_id)
+                self.inflight_eff_tokens[rank] = max(
+                    0.0, self.inflight_eff_tokens[rank] - eff
+                )
+            elif self._anon_eff_tokens[rank]:
+                eff = self._anon_eff_tokens[rank].pop(0)
+                self.inflight_eff_tokens[rank] = max(
+                    0.0, self.inflight_eff_tokens[rank] - eff
+                )
+            if self.inflight[rank] == 0:
+                self.inflight_eff_tokens[rank] = 0.0
+                self._anon_eff_tokens[rank].clear()
             if was_running:
                 self.running[rank] = max(0, self.running[rank] - 1)
 
@@ -230,10 +310,12 @@ class _PrefixAffinityRouter:
             return {
                 "placed": list(self.placed),
                 "inflight": list(self.inflight),
+                "inflight_eff_tokens": list(self.inflight_eff_tokens),
                 "running": list(self.running),
                 "load_metric": self.load_metric,
                 "sticky": self.sticky,
                 "sticky_saturated": self.sticky_saturated,
+                "sticky_quad_saved": self.sticky_quad_saved,
                 "cold": self.cold,
                 "rerouted": self.rerouted,
                 "unique_chunks": len(self.owners),
@@ -631,6 +713,8 @@ async def lifespan(app: FastAPI):
             slack=_env_int("PROXY_PREFIX_HASH_SLACK", 8),
             max_sessions=_env_int("PROXY_PREFILL_MAX_SESSIONS", 0),
             saturated_inflight=_env_int("PROXY_PREFIX_HASH_SATURATED_INFLIGHT", 0),
+            quad_attn_coeff=_env_float("PROXY_PREFILL_QUAD_ATTN_COEFF", 1.23e-5),
+            token_slack=_env_float("PROXY_PREFIX_HASH_TOKEN_SLACK", 32768.0),
         )
     else:
         app.state.prefill_router = None
@@ -1039,7 +1123,9 @@ async def _handle_completions(api: str, request: Request):
                 await admit_decode(admit_point)
 
             if router is not None:
-                prefill_idx, prefill_sticky = router.route(hs)
+                prefill_idx, prefill_sticky = router.route(
+                    hs, prompt_tokens=prompt_est, req_id=request_id
+                )
                 prefill_client_info = request.app.state.prefill_clients[prefill_idx]
             else:
                 prefill_client_info = get_next_client(request.app, "prefill")
@@ -1085,7 +1171,7 @@ async def _handle_completions(api: str, request: Request):
                 )
             finally:
                 if router is not None and prefill_idx is not None:
-                    router.done(prefill_idx)
+                    router.done(prefill_idx, req_id=request_id)
 
             t_prefill_recv = time.time()
             t_prefill_recv_perf = time.perf_counter()

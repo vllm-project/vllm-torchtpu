@@ -31,6 +31,7 @@ time budget has clipped it.
 """
 
 import math
+import time
 from typing import Any, cast
 
 from vllm.v1.core.sched.scheduler import Scheduler
@@ -39,6 +40,16 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.core import single_step_prefill
 from vllm_torchtpu.core.hybrid_retention import HybridStateRetention
 from vllm_torchtpu.core.pp_chunks import StepCostModel
+from vllm_torchtpu.core.prefix_aware_scheduler import (
+    _TIER_FREE_BLOCK_FIT,
+    _TIER_NORMAL,
+    _TIER_PREEMPTED,
+    PrefixAwareScheduler,
+    _is_decoding,
+    _read_paw_aging_knobs,
+    _wait_seconds,
+    trim_resend_token_ids,
+)
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -61,6 +72,29 @@ def _prefill_end(request: Any) -> int:
 
 
 class TpuPipelineChunkScheduler(Scheduler):
+    _MEMO_LOG_CAP = PrefixAwareScheduler._MEMO_LOG_CAP
+    _PAW_SORT_LOG_INTERVAL_S = PrefixAwareScheduler._PAW_SORT_LOG_INTERVAL_S
+    WINDOW = PrefixAwareScheduler.WINDOW
+    _enable_memo_xstep = PrefixAwareScheduler._enable_memo_xstep
+    _memo_trim_log = PrefixAwareScheduler._memo_trim_log
+    _memo_still_exact = PrefixAwareScheduler._memo_still_exact
+    _memo_get = PrefixAwareScheduler._memo_get
+    _memo_compute = PrefixAwareScheduler._memo_compute
+    _get_prefix_cache_epoch = PrefixAwareScheduler._get_prefix_cache_epoch
+    _get_block_size = PrefixAwareScheduler._get_block_size
+    _get_num_free_blocks = PrefixAwareScheduler._get_num_free_blocks
+    _prefix_warmth = PrefixAwareScheduler._prefix_warmth
+    _external_warmth = PrefixAwareScheduler._external_warmth
+    _get_paw_aging_knobs = PrefixAwareScheduler._get_paw_aging_knobs
+    _now = PrefixAwareScheduler._now
+    _init_paw_sort = PrefixAwareScheduler._init_paw_sort
+    _sort_waiting_queue = PrefixAwareScheduler._sort_waiting_queue
+    _select_waiting_queue_for_scheduling = (
+        PrefixAwareScheduler._select_waiting_queue_for_scheduling
+    )
+    _promote_warmest = PrefixAwareScheduler._promote_warmest
+    _maybe_pack_prompt_ids = PrefixAwareScheduler._maybe_pack_prompt_ids
+
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
         self._cost: StepCostModel | None = None
@@ -81,11 +115,21 @@ class TpuPipelineChunkScheduler(Scheduler):
         self._inflight_ms: list[float] = []
         self._clips = 0
         self._waits = 0
+        self._paw_n = 0
+        self._paw_cold_tokens = 0
+        self._paw_prompt_tokens = 0
+        self._paw_scoring_broken = False
         kv_transfer_config = self.vllm_config.kv_transfer_config
+        self._is_kv_producer = (
+            kv_transfer_config is not None
+            and kv_transfer_config.kv_role == "kv_producer"
+        )
         self._is_kv_consumer = (
             kv_transfer_config is not None
             and kv_transfer_config.kv_role != "kv_producer"
         )
+        self._srpf_running: bool = bool(envs.TPU_SCHED_SRPF_RUNNING)
+        self._paw_aging_tok_per_s, self._paw_max_wait_s = _read_paw_aging_knobs()
         # The MambaManager class patches go in before HybridStateRetention
         # binds its per-instance hooks; both read the align split flag as
         # the base scheduler set it.
@@ -110,12 +154,215 @@ class TpuPipelineChunkScheduler(Scheduler):
             retention = HybridStateRetention(self.kv_cache_manager)
             if retention.enabled:
                 self._retention = retention
+        self._enable_memo_xstep()
+        self._init_paw_sort()
+        self._promote_waiting = True
         logger.info(
             "Pipeline chunk scheduler: waiting for the step cost model "
-            "(hybrid_state_retention=%s, single_step_prefill=%s)",
+            "(hybrid_state_retention=%s, single_step_prefill=%s, "
+            "paw_sort=%s, srpf_running=%s, memo_xstep=%s)",
             self._retention is not None,
             self._single_step,
+            self._paw_sort,
+            self._srpf_running,
+            getattr(self, "_memo_xstep", False),
         )
+
+    def _quad_cost(self, tokens: int, prefix: int) -> float:
+        """Quadratic FLOPs-equivalent token cost under the step cost model."""
+        if self._cost is not None:
+            return self._cost.effective_tokens(tokens, prefix)
+        return float(max(tokens, 0))
+
+    def _aged_prefill_key(self, request: Any, now: float) -> float:
+        """Quadratic SRPF key of a running prefill: remaining effective tokens
+        minus TPU_SCHED_PAW_AGING_TOK_PER_S x seconds since arrival."""
+        rem = max(_prefill_end(request) - request.num_computed_tokens, 0)
+        eff = self._quad_cost(rem, request.num_computed_tokens)
+        rate, _ = self._get_paw_aging_knobs()
+        if rate <= 0:
+            return eff
+        return eff - rate * _wait_seconds(request, now)
+
+    def _paw_sort_key(
+        self,
+        request: Any,
+        now: float,
+        free_blocks: int | None,
+        free_blocks_for_ext: int | None,
+    ) -> tuple[int, int, float, float]:
+        """Sort key for TPU_SCHED_PAW_SORT_WAITING using quadratic effective
+        token cost; lower is admitted first."""
+        local_warmth = self._prefix_warmth(request)
+        num_tokens = int(request.num_tokens)
+        hbm_cold_tokens = max(num_tokens - local_warmth, 0)
+        block_size = self._get_block_size()
+        fits_hbm = (
+            free_blocks is None
+            or math.ceil(hbm_cold_tokens / block_size) <= free_blocks
+        )
+        ext_warmth = self._external_warmth(request, local_warmth)
+        if ext_warmth > 0 and not (
+            fits_hbm
+            and (
+                free_blocks_for_ext is None
+                or math.ceil(ext_warmth / block_size) <= free_blocks_for_ext
+            )
+        ):
+            ext_warmth = 0
+        warmth = local_warmth + ext_warmth
+        uncached = max(num_tokens - warmth, 0)
+        eff_uncached = self._quad_cost(uncached, warmth)
+        arrival = float(getattr(request, "arrival_time", now) or now)
+        rate, _ = self._get_paw_aging_knobs()
+        aged = eff_uncached - rate * max(0.0, now - arrival)
+        started = (
+            getattr(request, "num_preemptions", 0) > 0
+            or getattr(request, "num_computed_tokens", 0) > 0
+        )
+        return (0 if fits_hbm else 1, 0 if started else 1, aged, arrival)
+
+    def _rank_and_warmth(
+        self,
+        request: Any,
+        free_blocks_for_fit: int | None = None,
+        now: float | None = None,
+    ) -> tuple[tuple[int, float, float], int]:
+        """Return (sort_key, warmth) using quadratic effective token cost."""
+        local_warmth = self._prefix_warmth(request)
+        hbm_cold_tokens = max(request.num_tokens - local_warmth, 0)
+        hbm_eff_cost = self._quad_cost(hbm_cold_tokens, local_warmth)
+        rate, _ = self._get_paw_aging_knobs()
+        aging = 0.0
+        if rate > 0:
+            aging = rate * _wait_seconds(
+                request, time.time() if now is None else now
+            )
+        if getattr(self, "_is_kv_consumer", False):
+            tier = _TIER_PREEMPTED if request.num_preemptions > 0 else _TIER_NORMAL
+            return (tier, hbm_eff_cost - aging, request.arrival_time), local_warmth
+        if (
+            free_blocks_for_fit is not None
+            and local_warmth > 0
+            and math.ceil(hbm_cold_tokens / self._get_block_size())
+            <= free_blocks_for_fit
+        ):
+            return (
+                (
+                    _TIER_FREE_BLOCK_FIT,
+                    hbm_eff_cost - aging,
+                    request.arrival_time,
+                ),
+                local_warmth,
+            )
+        if request.num_preemptions > 0:
+            return (
+                (_TIER_PREEMPTED, hbm_eff_cost - aging, request.arrival_time),
+                local_warmth,
+            )
+        if local_warmth > 0:
+            return (
+                (_TIER_NORMAL, hbm_eff_cost - aging, request.arrival_time),
+                local_warmth,
+            )
+        ext_warmth = self._external_warmth(request, 0)
+        if ext_warmth > 0:
+            ext_cold_tokens = max(request.num_tokens - ext_warmth, 0)
+            ext_eff_cost = self._quad_cost(ext_cold_tokens, ext_warmth)
+            return (
+                (_TIER_NORMAL + 1, ext_eff_cost - aging, request.arrival_time),
+                ext_warmth,
+            )
+        return (
+            (_TIER_NORMAL + 2, hbm_eff_cost - aging, request.arrival_time),
+            0,
+        )
+
+    def _make_cached_request_data(self, *args, **kwargs):
+        cached = super()._make_cached_request_data(*args, **kwargs)
+        if getattr(self, "_trim_resend", None) is None:
+            self._trim_resend = True
+        if self._trim_resend and getattr(cached, "all_token_ids", None):
+            try:
+                trim_resend_token_ids(cached)
+            except Exception:
+                logger.exception(
+                    "Pipeline chunk scheduler: all_token_ids trim failed; disabling it."
+                )
+                self._trim_resend = False
+        return cached
+
+    def _get_local_prefix_cache_hit(
+        self, request: Any
+    ) -> tuple[object, int, int, bool]:
+        connector = getattr(self, "connector", None)
+        if connector is None or not connector.supports_divergent_local_hybrid_hits:
+            kvm = self.kv_cache_manager
+            epoch = self._get_prefix_cache_epoch()
+            if (
+                epoch is not None
+                and not (
+                    getattr(kvm, "enable_kv_cache_events", False)
+                    and getattr(request, "kv_cache_report_mode", "incremental")
+                    == "full"
+                )
+                and kvm.prefix_cache_lookup_enabled(request)
+            ):
+                max_len = request.num_tokens - 1
+                cached = self._memo_get(request, epoch, max_len)
+                if cached is not None:
+                    hit = cached[2]
+                    if len(hit) == 3:
+                        computed_blocks, num_new_computed_tokens, num_uncached = hit
+                    else:
+                        computed_blocks, num_new_computed_tokens = hit
+                        num_uncached = 0
+                    if isinstance(computed_blocks, tuple):
+                        computed_blocks = tuple(list(b) for b in computed_blocks)
+                    shared_prefix_boundary = (
+                        num_new_computed_tokens + num_uncached if num_uncached else 0
+                    )
+                    blocks = kvm.create_kv_cache_blocks(computed_blocks)
+                    request._tpu_local_hit_tokens = num_new_computed_tokens
+                    return (
+                        blocks,
+                        num_new_computed_tokens,
+                        shared_prefix_boundary,
+                        False,
+                    )
+        blocks, num_local, shared_prefix_boundary, hit_diverged = (
+            super()._get_local_prefix_cache_hit(request)
+        )
+        if hit_diverged and hasattr(connector, "resolve_divergent_local_hit_tokens"):
+            kvm = self.kv_cache_manager
+            reconciled_blocks, num_reconciled, reconciled_boundary = (
+                kvm.get_computed_blocks(request)
+            )
+            block_size = self._get_block_size()
+            target_local = connector.resolve_divergent_local_hit_tokens(
+                request, num_local, num_reconciled, block_size
+            )
+            if target_local is None:
+                request._tpu_local_hit_tokens = num_reconciled
+                return (
+                    reconciled_blocks,
+                    num_reconciled,
+                    reconciled_boundary,
+                    False,
+                )
+            if target_local <= 0:
+                request._tpu_local_hit_tokens = 0
+                return (
+                    kvm.empty_kv_cache_blocks,
+                    0,
+                    reconciled_boundary,
+                    False,
+                )
+            if target_local < num_local:
+                blocks = kvm.truncate_computed_blocks(blocks, target_local)
+                num_local = target_local
+        request._tpu_local_hit_tokens = num_local
+        return blocks, num_local, shared_prefix_boundary, hit_diverged
 
     def install_cost_model(self, model: StepCostModel) -> None:
         self._cost = model
@@ -195,6 +442,34 @@ class TpuPipelineChunkScheduler(Scheduler):
                 self._retention.begin_step()
         if self._single_step:
             single_step_prefill.begin_step(self.kv_cache_manager)
+        if getattr(self, "_memo_xstep", False):
+            self._memo_trim_log()
+        now_wall = time.time()
+        self._step_wall_time = now_wall
+        if getattr(self, "_srpf_running", False) and len(self.running) > 1:
+            decoding = [r for r in self.running if _is_decoding(r)]
+            prefilling = [r for r in self.running if not _is_decoding(r)]
+            if len(prefilling) > 1:
+                prefilling.sort(key=lambda r: self._aged_prefill_key(r, now_wall))
+            if prefilling and (decoding or len(prefilling) > 1):
+                self.running[:] = decoding + prefilling
+        if getattr(self, "_paw_sort", False):
+            try:
+                self._sort_waiting_queue()
+            except Exception:
+                logger.exception(
+                    "Pipeline chunk scheduler: waiting-queue sort failed; disabling "
+                    "TPU_SCHED_PAW_SORT_WAITING."
+                )
+                self._paw_sort = False
+        if getattr(self, "_promote_waiting", False):
+            try:
+                self._select_waiting_queue_for_scheduling()
+            except Exception:
+                logger.exception(
+                    "Pipeline chunk scheduler: warmest promotion failed; disabling it."
+                )
+                self._promote_waiting = False
         self._step_tokens = 0
         self._step_pairs = 0.0
         self._step_squares = 0.0
@@ -211,7 +486,12 @@ class TpuPipelineChunkScheduler(Scheduler):
             if computed >= _prefill_end(request) and request.num_tokens > computed:
                 self._account(1, computed)
                 self._seeded.add(request.request_id)
-        output = super().schedule(throttle_prefills)
+        try:
+            output = super().schedule(throttle_prefills)
+        finally:
+            self._step_wall_time = None
+        if getattr(output, "scheduled_new_reqs", None):
+            self._maybe_pack_prompt_ids(output)
         if self._single_step:
             cuts = single_step_prefill.confirmed_cuts(
                 self.kv_cache_manager, output.num_scheduled_tokens
@@ -244,6 +524,17 @@ class TpuPipelineChunkScheduler(Scheduler):
         bucket = next((b for b in buckets if b >= total), buckets[-1])
         return self._cost.step_ms(bucket, pairs, squares)
 
+    def _waiting_warmth(self, request: Any) -> int:
+        computed = int(getattr(request, "num_computed_tokens", 0) or 0)
+        if computed > 0:
+            return computed
+        kvm = getattr(self, "kv_cache_manager", None)
+        if not getattr(kvm, "enable_caching", False):
+            return 0
+        local_warmth = self._prefix_warmth(request)
+        ext_warmth = self._external_warmth(request, local_warmth)
+        return max(0, min(local_warmth + ext_warmth, _prefill_end(request)))
+
     def _pending_step_limit(self) -> int | None:
         """The bucket a step is held to: the prefill work still to schedule
         spread over up to as many steps as the pipeline has stages, rounded
@@ -258,10 +549,16 @@ class TpuPipelineChunkScheduler(Scheduler):
         if self._cost is None:
             return None
         pending = 0
+        pending_pairs = 0.0
         for request in self.running:
-            pending += max(_prefill_end(request) - request.num_computed_tokens, 0)
+            rem = max(_prefill_end(request) - request.num_computed_tokens, 0)
+            pending += rem
+            pending_pairs += float(rem) * request.num_computed_tokens
         for request in self.waiting:
-            pending += max(_prefill_end(request) - request.num_computed_tokens, 0)
+            warmth = self._waiting_warmth(request)
+            rem = max(_prefill_end(request) - warmth, 0)
+            pending += rem
+            pending_pairs += float(rem) * warmth
         if pending == 0:
             return None
         granularity = self._cost.granularity
@@ -275,7 +572,8 @@ class TpuPipelineChunkScheduler(Scheduler):
             # The last of the work leaves the pipeline a stage count minus
             # one steps after its step enters.
             steps = -(-pending // share) + self._pp_size - 1
-            step_ms = self._cost.step_ms(bucket, 0.0, float(share) * share)
+            share_pairs = pending_pairs * (min(share, pending) / pending)
+            step_ms = self._cost.step_ms(bucket, share_pairs, float(share) * share)
             done_ms = 0.0
             for step in range(steps):
                 # The step launched k steps ago is still in the pipeline
@@ -311,6 +609,10 @@ class TpuPipelineChunkScheduler(Scheduler):
         # prompt token and the base scheduler drops the padding.
         num_new_tokens = min(num_new_tokens, request.num_tokens - start)
         if self._cost is not None and num_new_tokens > 0:
+            live = self._inflight_ms[: max(self._pp_size - 1, 0)]
+            target_ms = (
+                max(self._cost.target_ms, *live) if live else self._cost.target_ms
+            )
             cap = self._cost.chunk(
                 start,
                 num_new_tokens,
@@ -319,6 +621,7 @@ class TpuPipelineChunkScheduler(Scheduler):
                 self._step_squares,
                 self._step_limit,
                 self._step_schedule,
+                target_ms=target_ms,
             )
             if cap == 0 and self._step_prefill_tokens == 0:
                 # The first prefill chunk of a step always advances.

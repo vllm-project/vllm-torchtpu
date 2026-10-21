@@ -42,6 +42,13 @@ def test_pipeline_gets_the_chunk_scheduler_and_the_engine_hook(monkeypatch):
     hook = _configure(config)
     assert config.scheduler_config.scheduler_cls == SCHEDULER_CLS
     hook.assert_called_once_with(config)
+    # PrefixAwareScheduler on a pipeline is also upgraded to the chunk scheduler.
+    config_paw = _config(
+        cls="vllm_torchtpu.core.prefix_aware_scheduler.PrefixAwareScheduler"
+    )
+    hook_paw = _configure(config_paw)
+    assert config_paw.scheduler_config.scheduler_cls == SCHEDULER_CLS
+    hook_paw.assert_called_once_with(config_paw)
 
 
 @pytest.mark.parametrize(
