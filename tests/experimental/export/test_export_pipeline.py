@@ -514,3 +514,45 @@ def test_module_derived_gate_up_sources_beat_name_heuristic() -> None:
     assert all(s["transpose"] == [1, 0] for s in sources)
     assert [s["dst_slices"][0]["start"] for s in sources] == [0, 3072]
     assert all(s["path"] == "model.safetensors" for s in sources)
+
+
+def test_companion_files_are_copied_and_declared_in_serving_config(tmp_path) -> None:
+    hf_dir = tmp_path / "hf_ckpt"
+    hf_dir.mkdir()
+    (hf_dir / "config.json").write_text(json.dumps({"eos_token_id": 2}))
+    (hf_dir / "tokenizer.json").write_text(json.dumps({"version": "1.0"}))
+    (hf_dir / "generation_config.json").write_text(
+        json.dumps({"eos_token_id": [2, 0], "do_sample": False})
+    )
+    out_dir = tmp_path / "artifact"
+    out_dir.mkdir()
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny", vocab_size=64, hf_checkpoint_dir=str(hf_dir)
+    )
+
+    serving_config = exporter._emit_model_companion_files(cfg, str(out_dir))
+
+    assert serving_config["tokenizer_config"] == {
+        "source": {"TokenizerPath": {"path": "tokenizer.json"}}
+    }
+    assert serving_config["generation_config"] == {"path": "generation_config.json"}
+    for name in ("config.json", "tokenizer.json", "generation_config.json"):
+        assert (out_dir / name).read_text() == (hf_dir / name).read_text()
+
+
+def test_generation_config_is_not_declared_when_the_checkpoint_has_none(
+    tmp_path,
+) -> None:
+    hf_dir = tmp_path / "hf_ckpt"
+    hf_dir.mkdir()
+    (hf_dir / "config.json").write_text(json.dumps({"eos_token_id": 2}))
+    out_dir = tmp_path / "artifact"
+    out_dir.mkdir()
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny", vocab_size=64, hf_checkpoint_dir=str(hf_dir)
+    )
+
+    serving_config = exporter._emit_model_companion_files(cfg, str(out_dir))
+
+    assert "generation_config" not in serving_config
+    assert not (out_dir / "generation_config.json").exists()
