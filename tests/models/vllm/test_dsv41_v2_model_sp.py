@@ -1107,6 +1107,18 @@ def test_split_encoder_stages_tail_engram_after_head_dispatch(monkeypatch):
         order.append("head")
         return carry
 
+    def middle(ids, positions, *got):
+        assert all(a is b for a, b in zip(got, carry, strict=True))
+        order.append("middle")
+        return carry
+
+    hashes = object()
+
+    def stage_engram(start, end, gathered):
+        assert gathered is hashes
+        assert (start, end) in ((1, 14), (14, 20))
+        order.append((start, end))
+
     def dispatch(tensors, wait):
         assert wait is False
         assert all(a is b for a, b in zip(tensors, carry, strict=True))
@@ -1121,16 +1133,28 @@ def test_split_encoder_stages_tail_engram_after_head_dispatch(monkeypatch):
     monkeypatch.setattr(v2_model, "synchronize_tensors", dispatch)
     model = SimpleNamespace(
         encoder_head_stage=head,
+        encoder_middle_stage=middle,
         encoder_tail_stage=tail,
-        _engram_first_split_layer=None,
+        _engram_first_split_layer=1,
+        _engram_split_layer=14,
+        _ced_boundary=20,
         _engram_prepared_outside_stage=True,
-        _stage_deferred_engram=lambda: order.append("stage tail engram"),
+        _gathered_engram_hashes=hashes,
+        _stage_engram_layers=stage_engram,
     )
     out = v2_model.DeepseekV41Model._forward_split_encoder(
         model, torch.arange(4), torch.arange(4), None, None, None
     )
     assert out == "encoded"
-    assert order == ["head", "dispatch", "stage tail engram", "tail"]
+    assert order == [
+        "head",
+        "dispatch",
+        (1, 14),
+        "middle",
+        "dispatch",
+        (14, 20),
+        "tail",
+    ]
 
 
 @pytest.mark.parametrize("rows", [1, 5, 288, 2048])
@@ -1244,28 +1268,6 @@ def test_first_engram_split_follows_host_placement(tail_split, host_layers, expe
     assert v2_model.DeepseekV41Model._select_engram_first_split_layer(model) == expected
 
 
-def test_early_split_stages_only_middle_layers_once(monkeypatch):
-    hashes = torch.ones(2, 2, 1, dtype=torch.int64)
-    observed = []
-    monkeypatch.setattr(
-        v2_model,
-        "_stage_engram_layers",
-        lambda layers, gathered: observed.append((list(layers), gathered)),
-    )
-    model = SimpleNamespace(
-        layers=list(range(5)),
-        _engram_first_split_layer=1,
-        _engram_split_layer=4,
-        _early_engram_hashes=hashes,
-    )
-    v2_model.DeepseekV41Model._stage_early_engram(model)
-    v2_model.DeepseekV41Model._stage_early_engram(model)
-    assert model._early_engram_hashes is None
-    assert len(observed) == 1
-    assert observed[0][0] == [1, 2, 3]
-    assert observed[0][1] is hashes
-
-
 def test_early_split_enqueues_before_host_lookup(monkeypatch):
     class TpuTensor(torch.Tensor):
         @property
@@ -1278,7 +1280,7 @@ def test_early_split_enqueues_before_host_lookup(monkeypatch):
     def stage(name):
         def call(*args):
             order.append(name)
-            return [carry]
+            return carry
 
         return call
 
@@ -1288,14 +1290,24 @@ def test_early_split_enqueues_before_host_lookup(monkeypatch):
         order.append("enqueue")
 
     monkeypatch.setattr(v2_model, "synchronize_tensors", enqueue)
+
+    hashes = object()
+
+    def stage_engram(start, end, gathered):
+        assert gathered is hashes
+        assert (start, end) in ((1, 14), (14, 20))
+        order.append("l1 lookup" if start == 1 else "l14 lookup")
+
     model = SimpleNamespace(
         _engram_first_split_layer=1,
+        _engram_split_layer=14,
+        _ced_boundary=20,
         _engram_prepared_outside_stage=True,
         encoder_head_stage=stage("l0"),
         encoder_middle_stage=stage("middle"),
         encoder_tail_stage=stage("tail"),
-        _stage_early_engram=lambda: order.append("l1 lookup"),
-        _stage_deferred_engram=lambda: order.append("l14 lookup"),
+        _gathered_engram_hashes=hashes,
+        _stage_engram_layers=stage_engram,
     )
     v2_model.DeepseekV41Model._forward_split_encoder(
         model, torch.arange(2), torch.arange(2), None, None, None

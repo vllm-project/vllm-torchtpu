@@ -5,6 +5,7 @@
 from dataclasses import replace
 from functools import partial
 from itertools import islice
+from typing import cast
 
 import torch
 from vllm.compilation.backends import set_model_tag
@@ -302,36 +303,12 @@ class DeepseekV41DecoderStage(_StageBase):
         )
 
 
-def _stage_engram_layers(layers, gathered_hashes: torch.Tensor) -> None:
-    """Look up and upload the Engram rows of ``layers`` before their graph."""
-    pending = []
-    for layer in layers:
-        engram = getattr(layer, "engram", None)
-        if isinstance(engram, Engram) and engram.embed_tokens.host_offload:
-            pending.append(
-                (
-                    engram,
-                    engram.start_prepare_embeddings(
-                        gathered_hashes[:, engram.layer_hash_index]
-                    ),
-                )
-            )
-        elif engram is not None:
-            engram.prepare_embeddings(gathered_hashes[:, engram.layer_hash_index])
-    # Issue collectives in layer order on every rank. Later tables' lookups
-    # overlap earlier exchanges, and their exchanges overlap earlier uploads.
-    # All buffers are ready before graph dispatch.
-    for engram, staging in pending:
-        engram.finish_prepare_embeddings(staging)
-
-
 class DeepseekV41Model(upstream.DeepseekV4Model):
     # Encoder layer whose host Engram staging overlaps the encoder head on
     # device; derived from host placement. None runs one encoder graph.
     _engram_split_layer: int | None = None
     _engram_first_split_layer: int | None = None
-    _early_engram_hashes: torch.Tensor | None = None
-    _deferred_engram_hashes: torch.Tensor | None = None
+    _gathered_engram_hashes: torch.Tensor | None = None
 
     def _has_cpu_offloaded_engram(self) -> bool:
         for layer in islice(self.layers, self.start_layer, self.end_layer):
@@ -454,8 +431,6 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     dp_shared_memory=self.engram_dp_shared_memory,
                     gather_fn=upstream.gather_engram_hashes,
                 )
-                if self._has_cpu_offloaded_engram():
-                    gathered_hashes = gathered_hashes.to("cpu")
                 end_layer = (
                     getattr(self, "_ced_boundary", self.end_layer)
                     if stage == "encoder"
@@ -463,43 +438,28 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 )
                 split = getattr(self, "_engram_split_layer", None)
                 if stage == "encoder" and split is not None:
-                    # The encoder head runs on device while the host stages
-                    # the tail's tables (`_stage_deferred_engram`).
-                    self._deferred_engram_hashes = gathered_hashes
+                    # Stage later segments after their preceding graphs
+                    # have been enqueued.
+                    self._gathered_engram_hashes = gathered_hashes
                     first_split = self._engram_first_split_layer
-                    if first_split is not None:
-                        self._early_engram_hashes = gathered_hashes
                     end_layer = first_split if first_split is not None else split
-                _stage_engram_layers(
-                    islice(self.layers, self.start_layer, end_layer), gathered_hashes
-                )
+                self._stage_engram_layers(self.start_layer, end_layer, gathered_hashes)
         return engram_hashes, engram_mask
 
-    def _stage_early_engram(self) -> None:
-        gathered_hashes = self._early_engram_hashes
-        self._early_engram_hashes = None
+    def _stage_engram_layers(
+        self,
+        start_layer: int,
+        end_layer: int,
+        gathered_hashes: torch.Tensor | None,
+    ) -> None:
+        """Prepare each Engram in the segment before its graph is dispatched."""
         if gathered_hashes is not None:
-            assert self._engram_first_split_layer is not None
-            assert self._engram_split_layer is not None
-            _stage_engram_layers(
-                islice(
-                    self.layers,
-                    self._engram_first_split_layer,
-                    self._engram_split_layer,
-                ),
-                gathered_hashes,
-            )
-
-    def _stage_deferred_engram(self) -> None:
-        """Stage the encoder tail's Engram tables after the head is enqueued."""
-        gathered_hashes = self._deferred_engram_hashes
-        self._deferred_engram_hashes = None
-        if gathered_hashes is not None:
-            assert self._engram_split_layer is not None
-            _stage_engram_layers(
-                islice(self.layers, self._engram_split_layer, self._ced_boundary),
-                gathered_hashes,
-            )
+            for layer in islice(self.layers, start_layer, end_layer):
+                engram = getattr(layer, "engram", None)
+                if engram is not None:
+                    engram.prepare_embeddings(
+                        gathered_hashes[:, engram.layer_hash_index]
+                    )
 
     def forward(
         self,
@@ -523,6 +483,28 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             # Enqueue the lookup without blocking CPU Engram preparation behind
             # the previous chunk. The compiled stage consumes its device buffer.
             synchronize_tensors((inputs_embeds,), wait=False)
+        context = first = encoder_context = None
+        if self._ced_enabled:
+            context = upstream.get_forward_context()
+            metadata = context.attn_metadata
+            first = (
+                next(iter(metadata.values())) if isinstance(metadata, dict) else None
+            )
+            # Upload these CPU-only bounds before Engram's blocking hash D2H.
+            requests = first.seq_lens.shape[0] if first is not None else 1
+            hits = tuple(getattr(first, "replay_starts_cpu", None) or ())[:requests]
+            window_starts = torch.tensor(
+                hits + (0,) * (requests - len(hits)),
+                dtype=positions.dtype,
+                device=positions.device,
+            )
+            encoder_context = replace(
+                context,
+                additional_kwargs={
+                    **context.additional_kwargs,
+                    "deepseek_v41_window_starts": window_starts,
+                },
+            )
         offload_engram = self._has_cpu_offloaded_engram()
         if offload_engram:
             input_ids_prep = (
@@ -548,29 +530,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     inputs_embeds,
                     lookback_token_ids,
                 )
-            context = upstream.get_forward_context()
+            assert context is not None and encoder_context is not None
             metadata = context.attn_metadata
-            first = (
-                next(iter(metadata.values())) if isinstance(metadata, dict) else None
-            )
-            # SWA bounded replay: the encoder reads no SWA row below a prefix
-            # hit's replay start and leaves cached KV of replayed tokens. The
-            # input exists in every CED step so the compiled graph does not
-            # depend on whether prefix caching is on.
-            requests = first.seq_lens.shape[0] if first is not None else 1
-            hits = tuple(getattr(first, "replay_starts_cpu", None) or ())[:requests]
-            window_starts = torch.tensor(
-                hits + (0,) * (requests - len(hits)),
-                dtype=positions.dtype,
-                device=positions.device,
-            )
-            encoder_context = replace(
-                context,
-                additional_kwargs={
-                    **context.additional_kwargs,
-                    "deepseek_v41_window_starts": window_starts,
-                },
-            )
             with override_forward_context(encoder_context):
                 if getattr(self, "_engram_split_layer", None) is None:
                     encoded = self.encoder_stage(
@@ -590,8 +551,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     )
         finally:
             self._engram_prepared_outside_stage = False
-            self._early_engram_hashes = None
-            self._deferred_engram_hashes = None
+            self._gathered_engram_hashes = None
         # Match the runner's convention for compiled backends that wrap the
         # model result in a single-element output list.
         if isinstance(encoded, (list, tuple)) and len(encoded) == 1:
@@ -746,6 +706,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         lookback_token_ids,
     ):
         """Enqueue each encoder segment before staging the next Engram layer."""
+        first_split = cast(int, self._engram_first_split_layer)
+        split = cast(int, self._engram_split_layer)
         carry = self.encoder_head_stage(
             input_ids,
             positions,
@@ -753,22 +715,14 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             inputs_embeds,
             lookback_token_ids,
         )
-        if isinstance(carry, (list, tuple)) and len(carry) == 1:
-            carry = carry[0]
-        if carry[0].device.type == "tpu":
-            # Enqueue the head before blocking on host lookups and Gloo.
-            synchronize_tensors(carry, wait=False)
-        if self._engram_first_split_layer is not None:
-            if self._engram_prepared_outside_stage:
-                self._stage_early_engram()
-            carry = self.encoder_middle_stage(input_ids, positions, *carry)
-            if isinstance(carry, (list, tuple)) and len(carry) == 1:
-                carry = carry[0]
-            if carry[0].device.type == "tpu":
-                synchronize_tensors(carry, wait=False)
+        synchronize_tensors(carry, wait=False)
+        self._stage_engram_layers(first_split, split, self._gathered_engram_hashes)
+        carry = self.encoder_middle_stage(input_ids, positions, *carry)
+        synchronize_tensors(carry, wait=False)
         hidden, residual, post_mix, res_mix, pre_mix = carry
-        if self._engram_prepared_outside_stage:
-            self._stage_deferred_engram()
+        self._stage_engram_layers(
+            split, self._ced_boundary, self._gathered_engram_hashes
+        )
         return self.encoder_tail_stage(
             input_ids,
             positions,
@@ -1125,23 +1079,31 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             self._tp_size = vllm_config.parallel_config.tensor_parallel_size
             self._engram_split_layer = self._select_engram_split_layer()
             self._engram_first_split_layer = self._select_engram_first_split_layer()
+            if self._engram_first_split_layer is None:
+                self._engram_split_layer = None
             if self._engram_split_layer is not None:
-                if self._engram_first_split_layer is not None:
-                    with set_model_tag("v41_encoder_middle"):
-                        self.encoder_middle_stage = DeepseekV41EncoderMiddleStage(
-                            owner=self,
-                            vllm_config=vllm_config,
-                            prefix=f"{prefix}.encoder_middle_stage",
-                            compile_tag="v41_encoder_middle",
-                        )
-                    self.encoder_middle_stage._compile_prefix = "v41_encoder_middle"
-                    logger.info(
-                        "Engram early split: head [%d, %d), middle [%d, %d)",
-                        self.start_layer,
-                        self._engram_first_split_layer,
-                        self._engram_first_split_layer,
-                        self._engram_split_layer,
+                assert self._engram_first_split_layer is not None
+                assert (
+                    self.start_layer
+                    < self._engram_first_split_layer
+                    < self._engram_split_layer
+                    < self._ced_boundary
+                )
+                with set_model_tag("v41_encoder_middle"):
+                    self.encoder_middle_stage = DeepseekV41EncoderMiddleStage(
+                        owner=self,
+                        vllm_config=vllm_config,
+                        prefix=f"{prefix}.encoder_middle_stage",
+                        compile_tag="v41_encoder_middle",
                     )
+                self.encoder_middle_stage._compile_prefix = "v41_encoder_middle"
+                logger.info(
+                    "Engram early split: head [%d, %d), middle [%d, %d)",
+                    self.start_layer,
+                    self._engram_first_split_layer,
+                    self._engram_first_split_layer,
+                    self._engram_split_layer,
+                )
                 with set_model_tag("v41_encoder_head"):
                     self.encoder_head_stage = DeepseekV41EncoderHeadStage(
                         owner=self,

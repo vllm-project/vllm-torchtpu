@@ -459,8 +459,7 @@ def test_engram_prepare_embeddings_branching(monkeypatch: pytest.MonkeyPatch):
 
     engram = make_engram(cpu_offload=True)
 
-    # Case A: Partial tokens -> only the word-alignment padding tail of the
-    # active slice is reset to the sentinel; stale tail rows stay untouched.
+    # Case A: Lookup writes raw and scale into adjacent views of the packed buffer.
     engram._host_packed_buf.fill_(99)
     engram._host_scale.fill_(99)
     engram.prepare_embeddings(torch.zeros(5, cols, dtype=torch.int32))
@@ -468,7 +467,12 @@ def test_engram_prepare_embeddings_branching(monkeypatch: pytest.MonkeyPatch):
     assert torch.all(engram._host_packed_buf[280:] == 99)
     assert torch.all(engram._host_scale[:5] == v2_engram._UNIT_SCALE + 2)
     assert torch.all(engram._host_scale_buf[30:40] == v2_engram._INVALID_SCALE)
-    assert torch.all(engram._host_scale_buf[40:48] == 99)
+    assert engram._host_scale_buf.numel() == 40
+    assert engram._host_scale.shape == (5, cols, dim // block)
+    assert (
+        engram._host_scale_buf.data_ptr()
+        == engram._host_packed_buf.data_ptr() + 5 * cols * dim
+    )
     staged_5 = engram._staged_tensors(5)
     assert torch.equal(staged_5[:60], engram._host_raw[:5].view(-1).view(torch.int32))
     assert torch.equal(staged_5[60:], engram._host_scale_buf[:40].view(torch.int32))
@@ -477,12 +481,35 @@ def test_engram_prepare_embeddings_branching(monkeypatch: pytest.MonkeyPatch):
         rows, torch.full((5, cols, dim), 4.0, dtype=torch.bfloat16)
     )
 
-    # Case B: Exact tokens -> no tail reset.
+    # Case B: Exact capacity, then smaller and empty calls must relocate scales.
     engram.prepare_embeddings(torch.zeros(max_tokens, cols, dtype=torch.int32))
     torch.testing.assert_close(
         Engram._ready_rows(engram, max_tokens),
         torch.full((max_tokens, cols, dim), 4.0, dtype=torch.bfloat16),
     )
+    for tokens in (1, 0, 3, 5):
+        engram.prepare_embeddings(torch.zeros(tokens, cols, dtype=torch.int32))
+        torch.testing.assert_close(
+            Engram._ready_rows(engram, tokens),
+            torch.full((tokens, cols, dim), 4.0, dtype=torch.bfloat16),
+        )
+        raw_bytes = tokens * cols * dim
+        scale_bytes = tokens * cols * (dim // block)
+        scale_capacity = tokens * ((cols * (dim // block) + 3) // 4) * 4
+        expected = torch.cat(
+            (
+                torch.full((raw_bytes,), one_fp8, dtype=torch.uint8),
+                torch.full(
+                    (scale_bytes,), v2_engram._UNIT_SCALE + 2, dtype=torch.uint8
+                ),
+                torch.full(
+                    (scale_capacity - scale_bytes,),
+                    v2_engram._INVALID_SCALE,
+                    dtype=torch.uint8,
+                ),
+            )
+        )
+        assert torch.equal(engram._staged_tensors(tokens), expected.view(torch.int32))
 
     # Case C/D: Exceeding max_tokens, or no offload staging -> upstream path.
     fallback_calls = []

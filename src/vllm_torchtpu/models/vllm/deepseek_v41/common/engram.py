@@ -8,7 +8,6 @@ its SWA cache module differs, the cache lifetime in ``ensure_cache``.
 import mmap
 import tempfile
 from contextlib import ExitStack
-from dataclasses import dataclass
 from types import SimpleNamespace
 
 import numpy as np
@@ -24,13 +23,8 @@ from vllm_torchtpu.layers.adapter.upstream_bindings import (
 from vllm_torchtpu.model_loader_patches import register_row_slice
 
 from ..config import engram_cpu_offload
-from .host_exchange import PendingRowExchange, start_exchange_rows
-
-
-@dataclass
-class HostEngramStaging:
-    num_tokens: int
-    exchange: PendingRowExchange | None = None
+from .host_exchange import start_exchange_rows
+from .host_gather import gather_weight_scale
 
 
 class NgramHashState(upstream.NgramHashState):
@@ -481,40 +475,50 @@ class ParallelEngramEmbedding(upstream.ParallelEngramEmbedding):
         left as gathered (masking them too cost ~11 ms per 8192-token step on
         the host). ``dequant_fp8_rows`` maps sentinel blocks to +0,
         exactly the zero rows that ``lookup`` writes for them.
+        Unsharded shared tables require in-range hash IDs.
         """
         weight, scales = self._storage()
-        work_device = weight.device
-        if indices.device != work_device:
-            indices = indices.to(work_device)
-        heads_cache = getattr(self, "_gather_heads_cache", None)
-        if heads_cache is None or heads_cache[0].device != work_device:
-            heads = (
-                torch.arange(self.part_n_hash_cols, device=work_device)
-                + self.head_start
+        if self.tpu_dp_shared_memory and self.tp_size == 1:
+            rows = indices
+            valid = None
+        else:
+            work_device = weight.device
+            heads_cache = getattr(self, "_gather_heads_cache", None)
+            if heads_cache is None or heads_cache[0].device != work_device:
+                heads = (
+                    torch.arange(self.part_n_hash_cols, device=work_device)
+                    + self.head_start
+                )
+                heads_cache = (
+                    heads.clamp(max=self.n_hash_cols - 1),
+                    (heads < self.n_hash_cols)[None, :],
+                )
+                self._gather_heads_cache = heads_cache
+            heads_clamped, heads_valid = heads_cache
+            selected = indices[:, heads_clamped].long()
+            valid = (
+                heads_valid
+                & (selected >= self.vocab_start_idx)
+                & (selected < self.vocab_end_idx)
             )
-            heads_cache = (
-                heads.clamp(max=self.n_hash_cols - 1),
-                (heads < self.n_hash_cols)[None, :],
+            rows = (selected - self.vocab_start_idx).clamp(
+                min=0, max=self.part_num_embeddings - 1
             )
-            self._gather_heads_cache = heads_cache
-        heads_clamped, heads_valid = heads_cache
-        selected = indices[:, heads_clamped].long()
-        valid = (
-            heads_valid
-            & (selected >= self.vocab_start_idx)
-            & (selected < self.vocab_end_idx)
-        )
-        rows = (selected - self.vocab_start_idx).clamp(
-            min=0, max=self.part_num_embeddings - 1
-        )
-        flat = rows.flatten()
-        torch.index_select(
-            weight.view(torch.uint8), 0, flat, out=raw_out.view(-1, self.dim)
-        )
-        torch.index_select(
-            scales, 0, flat, out=scale_out.view(-1, self.dim // self.block_size)
-        )
-        if not bool(valid.all()):
+        raw_rows = raw_out.view(-1, self.dim)
+        scale_rows = scale_out.view(-1, self.dim // self.block_size)
+        if weight.device.type == "cpu":
+            gather_weight_scale(
+                weight.view(torch.uint8),
+                scales,
+                rows,
+                raw_rows,
+                scale_rows,
+            )
+        else:
+            flat = rows.flatten()
+            torch.index_select(weight.view(torch.uint8), 0, flat, out=raw_rows)
+            torch.index_select(scales, 0, flat, out=scale_rows)
+        if valid is not None and not bool(valid.all()):
             scale_out.masked_fill_(~valid[:, :, None], _INVALID_SCALE)
 
 
@@ -635,12 +639,10 @@ class Engram(upstream.Engram):
                 : max_tokens * raw_words_per_tok * 4
             ].view(max_tokens, cols, head_dim)
             scale_bytes = max_tokens * cols * blocks
-            self._host_scale_buf = torch.full(
-                (max_tokens * scale_words_per_tok * 4,),
-                _INVALID_SCALE,
-                dtype=torch.uint8,
-                device="cpu",
-            )
+            self._host_scale_buf = self._host_packed_buf[
+                max_tokens * raw_words_per_tok * 4 :
+            ]
+            self._host_scale_buf.fill_(_INVALID_SCALE)
             self._host_scale = self._host_scale_buf[:scale_bytes].view(
                 max_tokens, cols, blocks
             )
@@ -681,18 +683,26 @@ class Engram(upstream.Engram):
         return view
 
     def prepare_embeddings(self, hash_ids: torch.Tensor) -> None:
+        """Look up rows, redistribute local tokens, and upload packed data."""
         if self._staged_raw is None:
             super().prepare_embeddings(hash_ids)
             return
-        self.finish_prepare_embeddings(self.start_prepare_embeddings(hash_ids))
-
-    def start_prepare_embeddings(self, hash_ids: torch.Tensor) -> HostEngramStaging:
-        """Look up host rows and enqueue redistribution without waiting."""
-        assert self._staged_raw is not None
         dp_size = self.embed_tokens.dp_size
         num_tokens, remainder = divmod(hash_ids.shape[0], dp_size)
         if remainder or num_tokens > self._host_raw.shape[0]:
             raise ValueError("Engram hashes exceed the configured DP staging slots")
+        _, cols, head_dim = self._host_raw.shape
+        blocks = self._host_scale.shape[-1]
+        raw_words = num_tokens * ((cols * head_dim) // 4)
+        scale_bytes = num_tokens * cols * blocks
+        scale_words = num_tokens * (-(-(cols * blocks) // 4))
+        # Scale rows follow this call's raw prefix, not the maximum-capacity raw region.
+        self._host_scale_buf = self._host_packed_buf[
+            raw_words * 4 : (raw_words + scale_words) * 4
+        ]
+        self._host_scale = self._host_scale_buf[:scale_bytes].view(
+            num_tokens, cols, blocks
+        )
         if dp_size > 1:
             # Lookup and redistribution stay on CPU. A device all-gather
             # here would materialize DP copies of every replica's rows.
@@ -711,25 +721,13 @@ class Engram(upstream.Engram):
             group = upstream.get_engram_dp_group()
             assert group is not None and group.world_size == dp_size
             exchange = start_exchange_rows(raw, scales, group.cpu_group, dp_size)
-            return HostEngramStaging(num_tokens, exchange)
+            raw, scales = exchange.wait()
+            self._host_raw[:num_tokens].copy_(raw)
+            self._host_scale[:num_tokens].copy_(scales)
         else:
             self.embed_tokens.gather_raw(
                 hash_ids, self._host_raw[:num_tokens], self._host_scale[:num_tokens]
             )
-        return HostEngramStaging(num_tokens)
-
-    def finish_prepare_embeddings(self, staging: HostEngramStaging) -> None:
-        """Wait for local token rows and upload them before their consumer graph."""
-        num_tokens = staging.num_tokens
-        if staging.exchange is not None:
-            raw, scales = staging.exchange.wait()
-            self._host_raw[:num_tokens].copy_(raw)
-            self._host_scale[:num_tokens].copy_(scales)
-        _, cols, head_dim = self._host_raw.shape
-        blocks = self._host_scale.shape[-1]
-        raw_words = num_tokens * ((cols * head_dim) // 4)
-        scale_bytes = num_tokens * cols * blocks
-        scale_words = num_tokens * (-(-(cols * blocks) // 4))
         if scale_words * 4 > scale_bytes:
             self._host_scale_buf[scale_bytes : scale_words * 4].fill_(_INVALID_SCALE)
         # On TorchTPU, `copy_()` into a slice/view of a materialized device
@@ -741,9 +739,6 @@ class Engram(upstream.Engram):
         # exposing a 2-D `[num_tokens, words_per_tok]` dynamic-dim0 view to
         # `torch.compile` (`create_concrete_args`).
         host_words = self._host_packed_buf.view(torch.int32)
-        host_words[raw_words : raw_words + scale_words].copy_(
-            self._host_scale_buf[: scale_words * 4].view(torch.int32)
-        )
         staged = self._staged_tensors(num_tokens)
         staged.copy_(host_words[: raw_words + scale_words])
         self._active_raw = self._staged_views(num_tokens)

@@ -18,6 +18,37 @@ _DIM = 32
 _BLOCK = 16
 
 
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("index_dtype", [torch.int32, torch.int64])
+def test_shared_gather_preserves_hash_slice(monkeypatch, index_dtype):
+    weight, scales = _table(sum(_HEAD_SIZES))
+    indices = torch.tensor(
+        [[[0, 8, 16, 24], [1, 9, 17, 25]], [[2, 10, 18, 26], [3, 11, 19, 27]]],
+        dtype=index_dtype,
+    )[:, 1, :]
+    raw_out = torch.empty((2, 4, _DIM), dtype=torch.uint8)
+    scale_out = torch.empty((2, 4, _DIM // _BLOCK), dtype=torch.uint8)
+    embedding = SimpleNamespace(
+        tpu_dp_shared_memory=True,
+        tp_size=1,
+        dim=_DIM,
+        block_size=_BLOCK,
+        _storage=lambda: (weight, scales),
+    )
+    gather = common_engram.gather_weight_scale
+
+    def checked_gather(weight, scales, rows, raw_out, scale_out):
+        assert rows is indices
+        gather(weight, scales, rows, raw_out, scale_out)
+
+    monkeypatch.setattr(common_engram, "gather_weight_scale", checked_gather)
+    common_engram.ParallelEngramEmbedding.gather_raw(
+        embedding, indices, raw_out, scale_out
+    )
+    assert torch.equal(raw_out, weight.view(torch.uint8)[indices.long()])
+    assert torch.equal(scale_out, scales[indices.long()])
+
+
 def _group(rank: int, ranks: list[int], cpu_group) -> SimpleNamespace:
     def broadcast_object(obj=None):
         objects = [obj]
@@ -137,9 +168,7 @@ def _worker(
                 assert torch.equal(gathered, ids)
             else:
                 assert gathered.shape[0] == local_size * max(local_counts)
-            pending = engram.start_prepare_embeddings(gathered)
-            assert (pending.exchange is None) is shared_memory
-            engram.finish_prepare_embeddings(pending)
+            engram.prepare_embeddings(gathered)
             actual = engram._ready_rows(ids.shape[0])
             expected = common_engram.dequant_fp8_rows(
                 weight.view(torch.uint8)[ids.long()], scales[ids.long()], _BLOCK

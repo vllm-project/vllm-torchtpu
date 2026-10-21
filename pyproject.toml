@@ -208,6 +208,7 @@ ignore-missing-imports = [
     "jax", "jax.*",
     "jaxlib", "jaxlib.*",
     "numpy", "numpy.*",
+    "numba", "numba.*",
     "packaging", "packaging.*",
     "pathwaysutils", "pathwaysutils.*",
     "portpicker", "portpicker.*",

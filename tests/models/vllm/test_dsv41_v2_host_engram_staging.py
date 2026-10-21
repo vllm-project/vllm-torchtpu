@@ -609,15 +609,15 @@ class TestEngramModuleStagingAndEmbed:
         with patch.object(v2_engram.upstream.Engram, "_init_staging"):
             engram._init_staging(max_tokens=16, head_dim=32)
 
-        # 1. Fast path: num_tokens <= max_tokens (and tail reset)
+        # 1. Fast path: scales share the packed buffer after active raw rows.
         hash_ids = torch.zeros((8, 2), dtype=torch.int32)
         engram.prepare_embeddings(hash_ids)
         engram.embed_tokens.gather_raw.assert_called_once()
-        if hasattr(v2_engram, "_INVALID_SCALE"):
-            assert torch.all(engram._host_scale[8:] == v2_engram._INVALID_SCALE)
-        else:
-            assert torch.all(engram._host_raw[8:] == 0)
-            assert torch.all(engram._host_scale[8:] == _UNIT_SCALE)
+        assert engram._host_scale.shape == (8, 2, 2)
+        assert (
+            engram._host_scale.data_ptr()
+            == engram._host_packed_buf.data_ptr() + 8 * 2 * 32
+        )
 
         # 1b. Fast path with exact capacity (skips tail zeroing branch)
         hash_ids_exact = torch.zeros((16, 2), dtype=torch.int32)

@@ -935,9 +935,80 @@ class TestModelForward:
     def test_forward_non_ced_path(self) -> None:
         model = self._create_model(ced_enabled=False)
         model.full_stage = MagicMock(return_value=torch.zeros((4, 64)))
-        res = model.forward(torch.tensor([1, 2, 3, 4]), torch.tensor([0, 1, 2, 3]))
+        ids, positions = torch.tensor([1, 2, 3, 4]), torch.tensor([0, 1, 2, 3])
+        with patch(
+            "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.torch.tensor"
+        ) as upload:
+            res = model.forward(ids, positions)
+        upload.assert_not_called()
         assert res.shape == (4, 64)
         model.full_stage.assert_called_once()
+
+    @pytest.mark.parametrize(
+        ("hits", "expected"),
+        [
+            (None, [0, 0, 0]),
+            ((), [0, 0, 0]),
+            ((128,), [128, 0, 0]),
+            ((128, 256, 0), [128, 256, 0]),
+            ((128, 256, 0, 512), [128, 256, 0]),
+        ],
+    )
+    def test_window_starts_upload_precedes_engram_preparation(
+        self, hits: tuple[int, ...] | None, expected: list[int]
+    ) -> None:
+        model = self._create_model(cpu_offload=True)
+        ids = torch.tensor([1, 2, 3], dtype=torch.int32)
+        positions = torch.tensor([128, 256, 0], dtype=torch.int32)
+        hidden, pre_mix = torch.zeros((3, 64)), torch.ones((3, 4))
+        metadata = SimpleNamespace(
+            seq_lens=torch.ones(3),
+            query_start_loc=torch.tensor([0, 1, 2, 3]),
+            replay_starts_cpu=hits,
+        )
+        context = _FakeForwardCtx(
+            attn_metadata={"layer_0": metadata}, additional_kwargs={"existing": 7}
+        )
+        order = MagicMock()
+        model._prepare_engram = order.prepare
+        model.encoder_stage = order.encoder
+        model.encoder_stage.return_value = hidden, pre_mix
+        model.decoder_stage = MagicMock(return_value=hidden)
+        with (
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.torch.tensor",
+                wraps=torch.tensor,
+            ) as upload,
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.upstream.get_forward_context",
+                return_value=context,
+            ),
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.override_forward_context"
+            ) as override,
+            patch(
+                "vllm_torchtpu.models.vllm.deepseek_v41.v2.model.plan_decoder_replay",
+                return_value=None,
+            ),
+        ):
+            order.attach_mock(upload, "upload")
+            result = model.forward(ids, positions)
+
+        assert [call[0] for call in order.mock_calls] == [
+            "upload",
+            "prepare",
+            "encoder",
+        ]
+        upload.assert_called_once_with(
+            tuple(expected), dtype=positions.dtype, device=positions.device
+        )
+        encoder_context = override.call_args_list[0].args[0]
+        starts = encoder_context.additional_kwargs["deepseek_v41_window_starts"]
+        assert starts.tolist() == expected
+        assert encoder_context.additional_kwargs["existing"] == 7
+        assert context.additional_kwargs == {"existing": 7}
+        assert result is hidden
+        assert not model._engram_prepared_outside_stage
 
     def test_forward_offload_engram_mega_moe_int64(self) -> None:
         model = self._create_model(

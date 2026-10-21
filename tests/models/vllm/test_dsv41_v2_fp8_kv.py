@@ -215,8 +215,8 @@ def test_parallel_engram_embedding_cpu_offload_and_row_slice(monkeypatch):
     assert torch.equal(out_dev, out_cpu)
 
     # Also exercise Engram._init_staging + Engram.prepare_embeddings: the host
-    # gathers raw FP8/scale bytes (invalid rows and the stale tail only get the
-    # sentinel scale; raw bytes stay stale, here FP8 NaN 0x7F) and _ready_rows
+    # gathers raw FP8/scale bytes (invalid rows get the sentinel scale;
+    # invalid raw bytes may contain FP8 NaN 0x7F) and _ready_rows
     # unpacks the int32 staging and dequantizes it, bitwise equal to the
     # host-dequant lookup.
     from vllm_torchtpu.models.vllm.deepseek_v41.v2.engram import _INVALID_SCALE
@@ -228,14 +228,15 @@ def test_parallel_engram_embedding_cpu_offload_and_row_slice(monkeypatch):
     assert engram_stub._staged_raw is not None
     engram_stub._host_packed_buf.fill_(0x7F)
     engram_stub._host_scale.fill_(200)
+    packed_bytes = indices.shape[0] * emb_cpu.part_n_hash_cols * (dim + dim // 32)
+    untouched_tail = engram_stub._host_packed_buf[packed_bytes:].clone()
     engram_stub.prepare_embeddings(indices)
     got = engram_stub._ready_rows(indices.shape[0])
     assert torch.equal(got.view(torch.int16), out_cpu.view(torch.int16))
     assert engram_stub._active_raw.shape[0] == indices.shape[0]
     assert torch.all(engram_stub._host_scale[2, 1] == _INVALID_SCALE)
-    assert torch.all(engram_stub._host_scale[indices.shape[0] :] == 200)
-    packed_bytes = engram_stub._staged_tensors(indices.shape[0]).numel() * 4
-    assert torch.all(engram_stub._host_packed_buf[packed_bytes:] == 0x7F)
+    assert engram_stub._host_scale.shape[0] == indices.shape[0]
+    assert torch.equal(engram_stub._host_packed_buf[packed_bytes:], untouched_tail)
 
 
 def test_dequant_fp8_rows_matches_exp2_lookup_bitwise():
