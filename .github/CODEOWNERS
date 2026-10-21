@@ -7,7 +7,7 @@
 # Analysis includes full history from tpu_commons, tpu_inference, and vllm-torchtpu paths.
 
 # Default owners for everything in the repo (fallback)
-* @qizzzh @angelayi @colin2328 @QiliangCui @caojx-google @Nanfang-Li @yinlin09 @mrjunwan-lang
+* @qizzzh @angelayi @colin2328 @QiliangCui @caojx-google @Nanfang-Li @yinlin09 @mrjunwan-lang @maxwillzq
 
 # CI/CD and Build Configuration
 /.buildkite/ @QiliangCui @theminghuang
@@ -45,7 +45,8 @@
 /tests/kernels/deepseek_v4/ @kyuyeunk @qizzzh @gxd3 @patemotter @gpolovets1
 
 # Platform Support
-/src/vllm_torchtpu/platforms/ @sixiang-google @mrjunwan-lang @Lumosis
+/src/vllm_torchtpu/platforms/ @sixiang-google @mrjunwan-lang @Lumosis @yinlin09 @benliangw
+/tests/platforms/ @sixiang-google @mrjunwan-lang @Lumosis @yinlin09 @benliangw
 
 # Structured Decoding
 /src/vllm_torchtpu/structured_decoding/ @maxwillzq @silkyarora
