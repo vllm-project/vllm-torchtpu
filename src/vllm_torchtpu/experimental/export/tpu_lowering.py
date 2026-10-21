@@ -230,7 +230,7 @@ def lower_torch_callable_to_mlir(
 def lower_abstract_params_mlir(
     param_items: Sequence[tuple[str, api.ShapeDtypeStruct]],
 ) -> str:
-    """Lowers `abstract_params.mlir` identity function `f(x) -> x` with `donate_argnums`."""
+    """Lowers the `abstract_params.mlir` identity `f(x) -> x` with `donate_argnums`."""
     specs = [spec for _, spec in param_items]
     donate_argnums = tuple(range(len(specs)))
     return lower_torch_callable_to_mlir(

@@ -41,7 +41,7 @@ def read_safetensors_header(file_path: str | Path) -> dict[str, Any]:
 def read_hf_safetensors_metadata(
     hf_dir: str | Path | None,
 ) -> tuple[dict[str, str], str]:
-    """Inspects a HuggingFace checkpoint directory for Safetensors tensor-to-file mappings.
+    """Maps each Safetensors tensor in a HuggingFace checkpoint dir to its file.
 
     Reads `model.safetensors.index.json` if present, or scans `.safetensors` file
     headers (reading only the 8-byte length prefix + JSON header, loading zero
@@ -487,7 +487,7 @@ def _expand_equal_two_way_sources(
     tensor_to_file: dict[str, str],
     default_path: str,
 ) -> list[dict[str, Any]]:
-    """Builds 2-way concatenated weight sources for `[in_dim, 2*half]` or `[2*half, in_dim]`."""
+    """Builds 2-way concat weight sources for `[in, 2*half]` or `[2*half, in]`."""
     if shape[0] >= shape[1]:
         in_dim = shape[0]
         half = shape[1] // 2

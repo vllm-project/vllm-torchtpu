@@ -294,11 +294,11 @@ def load_dummy_vllm_model(vllm_config: Any) -> nn.Module:
         mesh = _create_single_device_tpu_mesh()
         with contextlib.ExitStack() as stack:
             with contextlib.suppress(Exception):
-                from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
-                    set_vllm_model_wrapper_context,
-                )
                 from vllm_torchtpu.layers.adapter.quantization import (
                     get_tpu_quantization_config,
+                )
+                from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+                    set_vllm_model_wrapper_context,
                 )
 
                 vllm_config.quant_config = get_tpu_quantization_config(vllm_config)
@@ -396,7 +396,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         return self._export_config
 
     def abstract_params(self) -> Mapping[str, api.ShapeDtypeStruct]:
-        """Builds abstract parameter specs by traversing `self.model.named_parameters()`."""
+        """Builds abstract parameter specs from `self.model.named_parameters()`."""
         params: dict[str, api.ShapeDtypeStruct] = {}
         tp_size = self._export_config.tensor_parallel_size
         named_params = list(self._model.named_parameters())

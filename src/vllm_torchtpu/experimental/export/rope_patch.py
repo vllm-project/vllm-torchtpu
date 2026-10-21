@@ -30,7 +30,7 @@ import torch.nn as nn
 
 
 def is_in_graph_rope_eligible(module: nn.Module) -> bool:
-    """Returns True if `module`'s cos/sin values depend only on `positions` and `inv_freq`.
+    """Returns True if `module`'s cos/sin depend only on `positions` and `inv_freq`.
 
     Holds for:
     - `RotaryEmbedding` and subclasses overriding only `_compute_inv_freq`
@@ -79,7 +79,7 @@ def is_in_graph_rope_eligible(module: nn.Module) -> bool:
 
 
 def compute_mrope_dim_modalities(module: nn.Module) -> tuple[int, ...] | None:
-    """Returns per-frequency modality index in `{0, 1, 2}` for 2-D `[3, N]` M-RoPE positions."""
+    """Returns the per-frequency modality `{0, 1, 2}` for `[3, N]` M-RoPE positions."""
     half = int(getattr(module, "rotary_dim", 0)) // 2
     if half <= 0:
         return None
@@ -162,7 +162,7 @@ def _select_mrope_positions(
     pos_2d: torch.Tensor,
     dim_modalities: tuple[int, ...],
 ) -> torch.Tensor:
-    """Selects per-frequency positions `[N, D/2]` from `pos_2d[3, N]` via pure HLO ops."""
+    """Selects per-frequency positions `[N, D/2]` from `pos_2d[3, N]` in pure HLO."""
     half = len(dim_modalities)
     dev = pos_2d.device
     ch = torch.arange(half, dtype=torch.int32, device=dev).unsqueeze(0)
@@ -189,7 +189,7 @@ def _in_graph_cos_sin(
     base: float | None = None,
     rotary_dim: int | None = None,
 ) -> torch.Tensor:
-    """Returns `[cos | sin]` rows in `dtype` for 1-D `[N]` or 2-D `[N, D/2]` positions."""
+    """Returns `[cos | sin]` rows in `dtype` for `[N]` or `[N, D/2]` positions."""
     inv = _build_device_vector_f32(
         inv_freq,
         pos_for_freq.device,
@@ -211,7 +211,7 @@ def _in_graph_rope_forward(
     key: torch.Tensor | None = None,
     offsets: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor | None]:
-    """Pure in-graph `RotaryEmbedding` / `MRotaryEmbedding` forward without `cos_sin_cache`."""
+    """In-graph `RotaryEmbedding` / `MRotaryEmbedding` forward, no `cos_sin_cache`."""
     if offsets is not None:
         positions = positions + offsets
 

@@ -44,7 +44,7 @@ def _mock_lower_torch_callable_to_mlir(
     donate_argnums: Sequence[int] = (),
     module_name: str | None = None,
 ) -> str:
-    """CPU unit test helper that traces `fn` on CPU tensors and emits matching StableHLO MLIR."""
+    """Test helper: traces `fn` on CPU tensors and emits matching StableHLO MLIR."""
     del module_name
     donated_set = {int(i) for i in donate_argnums}
     cpu_args = [

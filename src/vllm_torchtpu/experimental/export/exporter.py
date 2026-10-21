@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""AOT model exporter lowering ExportableModel and ExportableTextOnlyLLM to StableHLO."""
+"""AOT exporter lowering ExportableModel / ExportableTextOnlyLLM to StableHLO."""
 
 from __future__ import annotations
 
@@ -104,7 +104,7 @@ def _export_abstract_params(
     *,
     subdir: str = "subgraphs",
 ) -> tuple[dict[str, Any], dict[str, int]]:
-    """Lowers `abstract_params.mlir` identity function `f(x) -> x` with `donate_argnums`."""
+    """Lowers the `abstract_params.mlir` identity `f(x) -> x` with `donate_argnums`."""
     param_items = [
         (
             name,
@@ -422,7 +422,7 @@ def _emit_declarative_weight_json(
     dp_size: int,
     tp_size: int,
 ) -> None:
-    """Emits `serving_checkpoint/weight.json` from HF metadata without loading tensor bytes."""
+    """Emits `serving_checkpoint/weight.json` from HF metadata; loads no tensors."""
     cfg = model.export_config
     ckpt_dir = os.path.join(output_dir, "serving_checkpoint")
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -478,7 +478,7 @@ def _emit_declarative_weight_json(
 def _emit_model_companion_files(
     cfg: api.TextOnlyLLMExportConfig, output_dir: str
 ) -> dict[str, Any]:
-    """Emits `config.json`, optional `tokenizer.json`, and returns `serving_config` block."""
+    """Emits `config.json` and `tokenizer.json`; returns the `serving_config` block."""
     src_config_copied = False
     if cfg.hf_checkpoint_dir and os.path.isdir(cfg.hf_checkpoint_dir):
         src_cfg = os.path.join(cfg.hf_checkpoint_dir, "config.json")
@@ -561,7 +561,7 @@ def export(
     Args:
         model: The model to export.
         output_dir: Artifact directory; created if missing.
-        subdir: Subdirectory under `output_dir` for `.mlir` files (default `'subgraphs'`).
+        subdir: Subdirectory of `output_dir` for `.mlir` files (default `'subgraphs'`).
         emit_weight_json: When True, emits declarative `serving_checkpoint/weight.json`
             from HF metadata without loading tensor data.
     """

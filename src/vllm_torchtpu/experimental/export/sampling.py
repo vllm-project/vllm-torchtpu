@@ -133,7 +133,7 @@ def dispatch_sample_tokens(
     history: torch.Tensor | None = None,
     output_start: torch.Tensor | None = None,
 ) -> torch.Tensor:
-    """Dispatches `logits` to `greedy_tokens`, `stochastic_tokens`, or `penalized_tokens`."""
+    """Dispatches `logits` to the greedy, stochastic or penalized sampler."""
     if temperature is None:
         return greedy_tokens(logits)
     rows = int(logits.shape[0])
