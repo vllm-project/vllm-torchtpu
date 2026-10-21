@@ -111,6 +111,9 @@ from vllm_torchtpu.layers.adapter.attention import (
     PallasAttentionBackend,
     PallasAttentionBackendImpl,
 )
+from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_indexer import (
+    static_verify_q_len,
+)
 from vllm_torchtpu.layers.adapter.custom_ops.mamba_state_copy_op import (
     copy_mamba_state_blocks,
     copy_mamba_state_rows,
@@ -1271,6 +1274,14 @@ class TPUModelRunner(GPUModelRunner):
     def _init_speculative_decoding(self) -> None:
         self.drafter = None
         self.rejection_sampler = None
+        # Full speculative verify windows (1 + K tokens) lead the verify
+        # segment and their count goes into request_distribution[1]
+        # (_reorder_batch_for_rpa, _build_attention_metadata). The length
+        # comes from the one helper the DSv4 attention and indexer ops use
+        # too, since only ops that implement the static query-length pass may
+        # see rows in that segment; see static_verify_q_len for why.
+        self._static_verify_q_len: int | None = static_verify_q_len(self.vllm_config)
+        self._num_static_verify_reqs = 0
         # Drafting and verification happen where sampling happens, on the
         # last pipeline stage; the other stages keep the config for the KV
         # cache spec and the scheduler, and nothing else.
@@ -1528,7 +1539,9 @@ class TPUModelRunner(GPUModelRunner):
         [1-token decodes][spec verify windows][prefill/mixed]. Ragged paged
         attention keeps its 1-token decode front segment, while the GDN
         kernel's windowed mode covers the first two segments contiguously
-        (see `AttentionMetadata.mamba_request_distribution`).
+        (see `AttentionMetadata.mamba_request_distribution`). With a static
+        verify length, the windows of exactly that length lead the verify
+        segment and `_num_static_verify_reqs` counts them.
 
         Returns:
             (num_decode, num_windowed): the number of 1-token decode requests
@@ -1550,34 +1563,46 @@ class TPUModelRunner(GPUModelRunner):
                 return 1
             return 2
 
-        def partition(start: int, end: int, bound: int) -> int:
-            """Two-pointer partition of [start, end]: requests with
-            segment <= bound before the rest. Returns the first index of the
-            second part."""
+        def partition(start: int, end: int, first) -> int:
+            """Two-pointer partition of [start, end]: requests for which
+            `first(req_id)` holds before the rest. Returns the first index of
+            the second part."""
             i, j = start, end
             while i < j:
                 i_req_id = self.input_batch.req_ids[i]
                 j_req_id = self.input_batch.req_ids[j]
                 assert i_req_id is not None
                 assert j_req_id is not None
-                if segment(i_req_id) <= bound:
+                if first(i_req_id):
                     i += 1
-                elif segment(j_req_id) > bound:
+                elif not first(j_req_id):
                     j -= 1
                 else:
                     self.input_batch.swap_states(i, j)
                     i += 1
                     j -= 1
-            if i == j and segment(self.input_batch.req_ids[i]) <= bound:
+            if i == j and first(self.input_batch.req_ids[i]):
                 i += 1
             return i
 
         # Pass 1: 1-token decode requests to the front.
-        num_decode = partition(0, num_reqs - 1, 0)
+        num_decode = partition(0, num_reqs - 1, lambda r: segment(r) == 0)
         # Pass 2: speculative verify windows before prefill/mixed requests.
         num_windowed = num_decode
         if spec_decode_tokens and num_decode < num_reqs:
-            num_windowed = partition(num_decode, num_reqs - 1, 1)
+            num_windowed = partition(
+                num_decode, num_reqs - 1, lambda r: segment(r) <= 1
+            )
+        # Pass 3: full-length verify windows first within the verify segment.
+        self._num_static_verify_reqs = 0
+        q_len = getattr(self, "_static_verify_q_len", None)
+        if q_len is not None and num_decode < num_windowed:
+            num_full = partition(
+                num_decode,
+                num_windowed - 1,
+                lambda r: scheduler_output.num_scheduled_tokens[r] == q_len,
+            )
+            self._num_static_verify_reqs = num_full - num_decode
         mla_dispatch.maybe_order_prefills_by_kv_len(
             self, num_decode, num_reqs, scheduler_output, spec_decode_tokens
         )
@@ -3268,9 +3293,21 @@ class TPUModelRunner(GPUModelRunner):
             # no dedicated prefill-only bucket, and all remaining requests in
             # mixed mode.
             chunk_num_decode = max(0, min(rpa_num_decode_reqs - start_index, num_reqs))
+            # [decode_end, static-q verify end, mixed_end]; the middle
+            # segment is empty unless static-q verify windows are present
+            # (see _init_speculative_decoding).
+            chunk_static_verify_end = max(
+                chunk_num_decode,
+                min(
+                    num_decode_reqs
+                    + getattr(self, "_num_static_verify_reqs", 0)
+                    - start_index,
+                    num_reqs,
+                ),
+            )
             if self.mamba_slot_read_offsets is None:
                 self._request_distribution_cpu[0] = chunk_num_decode
-                self._request_distribution_cpu[1] = chunk_num_decode
+                self._request_distribution_cpu[1] = chunk_static_verify_end
                 self._request_distribution_cpu[2] = num_reqs
                 request_distribution = self._request_distribution_cpu.to(
                     self.device, non_blocking=True

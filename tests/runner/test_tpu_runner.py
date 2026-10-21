@@ -580,13 +580,19 @@ def test_prefill_only_mtp_follows_context_or_pipeline_parallelism(
 
 
 def test_only_the_last_pipeline_stage_hosts_a_drafter():
-    last = SimpleNamespace(speculative_config=_spec(), _pp_is_last=True)
-    middle = SimpleNamespace(speculative_config=_spec(), _pp_is_last=False)
+    spec = _spec()
+    # A non-DSv4 model: the static verify length stays None either way.
+    vllm_config = SimpleNamespace(speculative_config=spec, model_config=None)
+    last = SimpleNamespace(speculative_config=spec, _pp_is_last=True)
+    middle = SimpleNamespace(
+        speculative_config=spec, _pp_is_last=False, vllm_config=vllm_config
+    )
     assert TPUModelRunner._is_async_drafter.fget(last) is True
     assert TPUModelRunner._is_async_drafter.fget(middle) is False
 
     TPUModelRunner._init_speculative_decoding(middle)
     assert middle.drafter is None and middle.rejection_sampler is None
+    assert middle._static_verify_q_len is None
 
 
 def test_dp_idle_pairing_replays_the_draft_only_where_a_drafter_lives():
@@ -1721,6 +1727,33 @@ class TestReorderBatchForRpa:
         assert num_windowed == 2
         assert set(runner.input_batch.req_ids[:2]) == {"vr", "vr2"}
         assert runner.input_batch.req_ids[2] == "pf"
+
+    def test_static_verify_windows_lead_verify_segment(self):
+        """With a static verify length (DeepSeek-V4, 1 + K), full-length
+        windows lead the verify segment and are counted; a short window
+        (fewer drafts scheduled) stays behind them."""
+        runner = self._make_runner()
+        runner._static_verify_q_len = 4
+        self._batch(runner, ["pf", "short", "dc", "full", "full2"])
+        sched = self._sched(
+            {"pf": 16, "short": 2, "dc": 1, "full": 4, "full2": 4},
+            spec_reqs=("short", "full", "full2"),
+        )
+        num_decode, num_windowed = runner._reorder_batch_for_rpa(sched)
+        assert (num_decode, num_windowed) == (1, 4)
+        assert runner._num_static_verify_reqs == 2
+        ids = runner.input_batch.req_ids
+        assert ids[0] == "dc"
+        assert set(ids[1:3]) == {"full", "full2"}
+        assert ids[3] == "short"
+        assert ids[4] == "pf"
+
+    def test_no_static_verify_without_static_length(self):
+        runner = self._make_runner()
+        self._batch(runner, ["vr", "dc"])
+        sched = self._sched({"vr": 4, "dc": 1}, spec_reqs=("vr",))
+        assert runner._reorder_batch_for_rpa(sched) == (1, 2)
+        assert runner._num_static_verify_reqs == 0
 
     def test_masked_dense_orders_by_kv_length(self):
         runner = self._make_runner(groups_requests=True)

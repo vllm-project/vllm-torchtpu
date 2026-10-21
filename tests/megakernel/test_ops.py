@@ -15,7 +15,9 @@
 
 from __future__ import annotations
 
+import jax
 import jax.numpy as jnp
+import numpy as np
 
 from vllm_torchtpu.megakernel.ops import (
     BF16,
@@ -60,3 +62,42 @@ def test_ops_primitives():
     assert sm.dtype == BF16
     val = bswitch(jnp.int32(2), [lambda i=i: jnp.int32(i * 10) for i in range(4)])
     assert int(val) == 20
+
+
+def test_fp32_intermediate_precision_rope_and_swiglu():
+    """Verify `rope_partial` and `silu_mul` avoid multi-stage BF16 truncation drift."""
+    rng = jax.random.PRNGKey(1234)
+    k1, k2, k3, k4 = jax.random.split(rng, 4)
+    x = jax.random.normal(k1, (16, 256), dtype=F32)
+    cos = jax.random.normal(k2, (16, 32), dtype=F32)
+    sin = jax.random.normal(k3, (16, 32), dtype=F32)
+    up = jax.random.normal(k4, (16, 256), dtype=F32)
+
+    out_rope = rope_partial(x, cos, sin, 64)
+    assert out_rope.dtype == F32
+
+    x1_64 = np.asarray(x[:, :32], dtype=np.float64)
+    x2_64 = np.asarray(x[:, 32:64], dtype=np.float64)
+    cos_64 = np.asarray(cos, dtype=np.float64)
+    sin_64 = np.asarray(sin, dtype=np.float64)
+    ref_rot = np.concatenate(
+        [x1_64 * cos_64 - x2_64 * sin_64, x2_64 * cos_64 + x1_64 * sin_64],
+        axis=-1,
+    )
+    err_fp32 = np.max(np.abs(np.asarray(out_rope[:, :64], dtype=np.float64) - ref_rot))
+    x1, x2 = x[:, :32], x[:, 32:64]
+    legacy_rot = jnp.concatenate(
+        [rnd(rnd(x1 * cos) - rnd(x2 * sin)), rnd(rnd(x2 * cos) + rnd(x1 * sin))],
+        axis=-1,
+    )
+    err_legacy = np.max(np.abs(np.asarray(legacy_rot, dtype=np.float64) - ref_rot))
+    assert err_fp32 < 1e-6
+    assert err_fp32 * 100.0 < err_legacy
+
+    out_swiglu = silu_mul(x, up)
+    assert out_swiglu.dtype == BF16
+    expected_swiglu = (jax.nn.silu(x) * up).astype(BF16)
+    np.testing.assert_array_equal(
+        np.asarray(out_swiglu).view(np.uint16),
+        np.asarray(expected_swiglu).view(np.uint16),
+    )
