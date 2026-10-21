@@ -183,10 +183,17 @@ def lower_torch_callable_to_mlir(
     from torch_tpu._internal import execution_mode
     from torch_tpu._internal.compile import tpu_torch_compile
 
+    # Newer torch_tpu releases dropped the leading underscore from this member.
+    eager_mode = (
+        getattr(
+            execution_mode.EagerMode,
+            "INTERNAL_COMPILE_FX_GRAPH",
+            None,
+        )
+        or execution_mode.EagerMode._INTERNAL_COMPILE_FX_GRAPH
+    )
     with (
-        execution_mode.set_eager_mode(
-            execution_mode.EagerMode._INTERNAL_COMPILE_FX_GRAPH
-        ),
+        execution_mode.set_eager_mode(eager_mode),
         mock.patch.object(torch.compiler, "is_compiling", return_value=True),
         torch.no_grad(),
     ):
