@@ -62,4 +62,9 @@ class Qwen4ExpGatedDeltaNetAttention(VllmGatedDeltaNetAttention):
         seq_lens: jax.Array,
         mesh: jax.sharding.Mesh,
     ) -> jax.Array | Conv1DInput:
-        return prepare_gdn_input(mixed_qkv, seq_lens.shape[0], mesh)
+        # Speculative verify windows hold up to num_spec + 1 tokens per
+        # request; keep them on the ordinary windowed-input layout, as the
+        # shared GDN operator runs them for every other hybrid model.
+        return prepare_gdn_input(
+            mixed_qkv, seq_lens.shape[0] * (self.num_spec + 1), mesh
+        )

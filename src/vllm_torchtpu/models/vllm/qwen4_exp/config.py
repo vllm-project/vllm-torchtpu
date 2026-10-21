@@ -34,6 +34,43 @@ def use_unified_pool() -> bool:
     return unified_kv_layout_enabled_for_architecture("Qwen4ExpForCausalLM")
 
 
+def num_speculative_tokens(cfg) -> int:
+    """Draft tokens verified per step; 0 when speculative decoding is off."""
+    spec = getattr(cfg, "speculative_config", None)
+    return 0 if spec is None else int(spec.num_speculative_tokens)
+
+
+def mtp_layer_prefixes(cfg) -> list[str]:
+    """Module prefixes of the checkpoint MTP layers the draft model owns.
+
+    Like upstream, MTP layer ``i`` is numbered after the target's layers so its
+    cache and forward-context names never collide with a target layer.
+    """
+    if num_speculative_tokens(cfg) == 0:
+        return []
+    t = cfg.model_config.hf_text_config
+    count = int(getattr(t, "mtp_num_hidden_layers", 0) or 0)
+    return [f"mtp.layers.{t.num_hidden_layers + i}" for i in range(count)]
+
+
+def qsa_ring_rows(t) -> int:
+    """Raw indexer-key rows each request owns (TPU eight-row alignment)."""
+    return (int(t.indexer_compress_ratio) + 7) // 8 * 8
+
+
+def max_qsa_speculative_tokens(t) -> int:
+    """Largest verify window whose rejected tokens cannot evict ring history.
+
+    The raw ring holds the newest ``rows`` positions modulo ``rows``. After a
+    step that wrote ``[c, c + k + 1)`` and accepted at least one token, the
+    next step re-reads the partial compression group before its new context
+    ``c' >= c + 1``, i.e. positions ``>= c' - ratio + 1``. Every position
+    written since lies below ``c' + k``, so no lane aliases while
+    ``rows >= k + ratio - 1``.
+    """
+    return qsa_ring_rows(t) - int(t.indexer_compress_ratio) + 1
+
+
 def gdn_cache_spec(cfg):
     """Match the existing TPU GDN adapter's private-cache contract."""
     from vllm.model_executor.layers.mamba.mamba_utils import (
@@ -65,6 +102,8 @@ def gdn_cache_spec(cfg):
         # FP32; SSM storage follows the resolved upstream cache configuration.
         dtypes=(torch.float32, ssm_dtype),
         mamba_type=MambaAttentionBackendEnum.GDN_ATTN,
+        # Rollback keeps one whole-state checkpoint block per verify position.
+        num_speculative_blocks=num_speculative_tokens(cfg),
     )
 
 
@@ -81,18 +120,19 @@ def native_cache_specs(cfg) -> dict[str, KVCacheSpec]:
         t, cfg.parallel_config.tensor_parallel_size, cfg.cache_config.cache_dtype
     )
     specs: dict[str, KVCacheSpec] = {}
+
+    def add_qsa(prefix):
+        specs[prefix + ".self_attn"] = main
+        specs.update(
+            {prefix + ".self_attn." + role: spec for role, spec in auxiliary.items()}
+        )
+
     for index, layer_type in enumerate(t.layer_types):
         prefix = f"model.layers.{index}"
         if layer_type == "linear_attention":
             specs[prefix + ".linear_attn"] = gdn_cache_spec(cfg)
         else:
-            specs[prefix + ".self_attn"] = main
-            specs.update(
-                {
-                    prefix + ".self_attn." + role: spec
-                    for role, spec in auxiliary.items()
-                }
-            )
+            add_qsa(prefix)
         if index + 1 in t.ple_layer_ids:
             specs[prefix + ".ple"] = MambaSpec(
                 block_size=cfg.model_config.max_model_len,
@@ -100,7 +140,13 @@ def native_cache_specs(cfg) -> dict[str, KVCacheSpec]:
                 dtypes=(torch.bfloat16,),
                 tp_replicated=True,
                 mamba_type=MambaAttentionBackendEnum.SHORT_CONV,
+                # PLE conv history checkpoints per verify position, like GDN.
+                num_speculative_blocks=num_speculative_tokens(cfg),
             )
+    # The MTP draft's full-attention QSA layers own ordinary request pages in
+    # the same native pool (main KV, compressed keys and raw ring).
+    for prefix in mtp_layer_prefixes(cfg):
+        add_qsa(prefix)
     return specs
 
 
@@ -121,9 +167,7 @@ def native_cache_capacity(cfg, specs=None):
     # One null block is reserved by the scheduler's pool.
     pages = 1 + cfg.scheduler_config.max_num_seqs * blocks_per_request
     bytes_per_block = _get_kv_cache_bytes_per_block(groups)
-    max_pool_bytes = int(
-        os.environ.get("QWEN4_EXP_MAX_POOL_BYTES", str(48 * 1024**3))
-    )
+    max_pool_bytes = int(os.environ.get("QWEN4_EXP_MAX_POOL_BYTES", str(48 * 1024**3)))
     if bytes_per_block > 0 and max_pool_bytes > 0:
         max_pages = max_pool_bytes // bytes_per_block
         if max_pages > 1:
@@ -407,14 +451,15 @@ def validate_config(cfg):
     if (
         (c.enable_prefix_caching and not pooled)
         or s.disable_hybrid_kv_cache_manager
-        or cfg.speculative_config is not None
         or cfg.lora_config is not None
         or c.kv_cache_memory_bytes is not None
     ):
         raise ValueError(
             "Qwen4Exp TPU requires profiled hybrid caches, APC only with unified pool, "
-            "and no MTP/LoRA"
+            "and no LoRA"
         )
+    if cfg.speculative_config is not None:
+        validate_mtp_config(cfg)
     transfer = cfg.kv_transfer_config
     if transfer is not None:
         connector_module = "vllm_torchtpu.models.vllm.qwen4_exp.pd_connector"
@@ -500,3 +545,52 @@ def validate_config(cfg):
                 f"including loader allowance; only {available} bytes available. "
                 "Use dp_shared_memory or embedding_across_dp to avoid DP replicas."
             )
+
+
+def validate_mtp_config(cfg):
+    """Admit only the checkpoint's native MTP draft on the unified pool.
+
+    GDN and PLE roll back rejected drafts by selecting a per-position state
+    checkpoint block, which only the unified pool allocates; the compact
+    (non-pooled) cache has no checkpoint slots. The draft shares the target's
+    TP layout (embeddings, LM head and QSA head sharding).
+    """
+    spec = cfg.speculative_config
+    t = cfg.model_config.hf_text_config
+    p = cfg.parallel_config
+    k = int(spec.num_speculative_tokens or 0)
+    draft_tp = getattr(spec, "draft_tensor_parallel_size", None)
+    mtp = getattr(t, "mtp", None) or {}
+    mtp_types = list(mtp.get("layer_types", ["full_attention"]))
+    if spec.method != "mtp":
+        raise ValueError(
+            f"Qwen4Exp TPU speculative decoding supports only method='mtp', "
+            f"got {spec.method!r}"
+        )
+    if not use_unified_pool():
+        raise ValueError("Qwen4Exp MTP requires the unified block pool")
+    if int(getattr(t, "mtp_num_hidden_layers", 0) or 0) != 1 or mtp_types != [
+        "full_attention"
+    ]:
+        raise ValueError(
+            "Qwen4Exp TPU MTP requires exactly one full-attention MTP layer"
+        )
+    if getattr(t, "mtp_use_dedicated_embeddings", False):
+        raise ValueError("Qwen4Exp TPU MTP shares the target embeddings and LM head")
+    if not 1 <= k <= max_qsa_speculative_tokens(t):
+        raise ValueError(
+            "Qwen4Exp MTP num_speculative_tokens must be in "
+            f"[1, {max_qsa_speculative_tokens(t)}] so rejected drafts cannot "
+            "evict QSA raw-ring history"
+        )
+    if draft_tp not in (None, p.tensor_parallel_size):
+        raise ValueError(
+            "Qwen4Exp MTP requires draft_tensor_parallel_size equal to the "
+            "target tensor_parallel_size"
+        )
+    if p.data_parallel_size != 1:
+        raise ValueError("Qwen4Exp TPU MTP currently requires data_parallel_size=1")
+    if cfg.kv_transfer_config is not None:
+        raise ValueError("Qwen4Exp PD requires MTP off")
+    if getattr(cfg.cache_config, "mamba_cache_mode", "none") not in ("none", "align"):
+        raise ValueError("Qwen4Exp MTP requires mamba_cache_mode 'none' or 'align'")

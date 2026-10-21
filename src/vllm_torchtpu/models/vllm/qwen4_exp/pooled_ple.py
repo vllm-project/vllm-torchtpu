@@ -12,6 +12,7 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_torchtpu.layers.adapter.custom_ops.ple_op import (
     build_pooled_short_conv_op,
+    build_pooled_speculative_short_conv_op,
     build_short_conv_op,
 )
 
@@ -62,6 +63,7 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         self._loaded: set[str] = set()
         self._finalized = False
         self._conv: Callable[..., torch.Tensor] | None = None
+        self._speculative_conv: Callable[..., torch.Tensor] | None = None
 
     @property
     def storage(self) -> ResidentPLETable:
@@ -105,6 +107,10 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
     def bind_pool(self, pool: torch.Tensor) -> None:
         self.cache_owners = (pool,)
         self._conv = build_pooled_short_conv_op(self.conv_dilation, self.conv_state_len)
+        # Registered before Dynamo traces forward, like the ordinary op.
+        self._speculative_conv = build_pooled_speculative_short_conv_op(
+            self.conv_dilation, self.conv_state_len
+        )
 
     def _lookup_ids(
         self, inputs: PLEInputs, valid_tokens: torch.Tensor
@@ -143,7 +149,10 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         has_initial_states: torch.Tensor,
         valid_tokens: torch.Tensor,
         raw_embeddings: torch.Tensor | None = None,
+        speculative: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
+        """``speculative`` is (read_ids, ckpt_ids, windowed) on the unified pool
+        with speculative decoding; see ``pooled_short_conv_speculative``."""
         assert self._finalized and self._conv is not None
         assert len(self.cache_owners) == 1
         if self.cpu_offload:
@@ -159,14 +168,29 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
             raw = self.storage.lookup_raw(self._lookup_ids(inputs, valid_tokens))
         raw = self.parallel.combine(raw, hidden_states.shape[0])
         gated = self.gated_values(hidden_states, self.storage.decode(raw))
-        conv = self._conv(
-            self.norm_conv(gated),
-            self.conv1d.weight[:, 0],
-            self.cache_owners[0],
-            inputs.query_start_loc,
-            state_indices,
-            has_initial_states,
-        )
+        if speculative is None:
+            conv = self._conv(
+                self.norm_conv(gated),
+                self.conv1d.weight[:, 0],
+                self.cache_owners[0],
+                inputs.query_start_loc,
+                state_indices,
+                has_initial_states,
+            )
+        else:
+            assert self._speculative_conv is not None, "bind the pool first"
+            read_ids, ckpt_ids, windowed = speculative
+            conv = self._speculative_conv(
+                self.norm_conv(gated),
+                self.conv1d.weight[:, 0],
+                self.cache_owners[0],
+                inputs.query_start_loc,
+                state_indices,
+                has_initial_states,
+                read_ids,
+                ckpt_ids,
+                windowed,
+            )
         if state_indices.shape[0] == 0:
             return torch.zeros_like(hidden_states)
         request, _ = token_requests(inputs.query_start_loc, hidden_states.shape[0])

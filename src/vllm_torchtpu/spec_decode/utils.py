@@ -95,8 +95,9 @@ class DraftChunkInputs:
     num_reqs: int
     # Per-layer aux hidden states from the target forward; each is
     # [padded_chunk_tokens, aux_hidden]. Only consumed when the draft
-    # checkpoint wants them.
-    aux_hidden_states: list[torch.Tensor]
+    # checkpoint wants them. A target returning one extra tensor for its MTP
+    # draft (Qwen4Exp's multi-stream hidden state) stores that tensor here.
+    aux_hidden_states: list[torch.Tensor] | torch.Tensor
     # Production supplies the exact chunk-local plan. Dummy/default consumers
     # share this immutable ALL-layout no-op plan and PCP callers override it.
     sequence_layout_plan: SequenceLayoutPlan = _DEFAULT_DRAFT_SEQUENCE_LAYOUT_PLAN

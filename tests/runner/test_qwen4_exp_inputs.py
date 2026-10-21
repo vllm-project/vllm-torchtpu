@@ -81,6 +81,7 @@ def test_reordered_history_slots_and_group_tables_are_independent(
         hc_count=1,
         embed_tokens=Mock(return_value=hidden),
         hyper_connection_mixer=NS(mix=lambda hidden: (hidden, None)),
+        emit_mtp_hidden=False,
     )
     Qwen4ExpBackbone.forward(
         backbone, device_ids, torch.zeros_like(device_ids), **actual

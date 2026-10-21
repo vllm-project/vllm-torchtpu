@@ -98,3 +98,92 @@ def pooled_short_conv(
     )
     pool = write_region(pool, updated.reshape(len(ids), -1), jnp.where(active, ids, 0))
     return pool, output
+
+
+def speculative_history_windows(
+    x: jax.Array,
+    history: jax.Array,
+    starts: jax.Array,
+    initial: jax.Array,
+    window: int,
+) -> jax.Array:
+    """Each request's history after its first ``window`` chunk tokens.
+
+    Entry ``[r, t]`` holds the ``state_len`` inputs ending at chunk token
+    ``t`` of request ``r`` (oldest first), reading positions before the chunk
+    from ``history`` (zero without initial state), exactly the window
+    ``short_conv`` would carry had the chunk ended at token ``t``.
+    """
+    token_count = x.shape[0]
+    state_len = history.shape[1]
+    steps = jnp.arange(window, dtype=jnp.int32)[:, None]
+    # [window, state_len] chunk-relative source positions.
+    positions = steps + 1 - state_len + jnp.arange(state_len, dtype=jnp.int32)[None]
+    past = history[:, jnp.clip(positions + state_len, 0, state_len - 1)]
+    past = jnp.where(initial[:, None, None, None], past, 0)
+    current = x[
+        jnp.clip(
+            starts[:-1, None, None].astype(jnp.int32) + positions[None],
+            0,
+            max(token_count - 1, 0),
+        )
+    ]
+    return jnp.where((positions >= 0)[None, ..., None], current, past.astype(x.dtype))
+
+
+def pooled_short_conv_speculative(
+    x: jax.Array,
+    weight: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    ids: jax.Array,
+    initial: jax.Array,
+    read_ids: jax.Array,
+    ckpt_ids: jax.Array,
+    windowed: jax.Array,
+    *,
+    dilation: int,
+    state_len: int,
+) -> tuple[jax.Array, jax.Array]:
+    """PLE history with per-position checkpoints for speculative verification.
+
+    Mirrors the pooled GDN state contract. ``read_ids`` is each request's
+    checkpoint of its last accepted token (``ckpt_ids[r, read_offset]``).
+    Windowed requests (decodes and verify windows, the runner's leading
+    segment) write the history after chunk token ``t`` to ``ckpt_ids[r, t]``,
+    so the next step resumes from whichever token was accepted last. Other
+    requests (prefill/mixed) write their final history to ``ckpt_ids[r, 0]``,
+    which is where a read offset of zero points.
+    """
+    channels = x.shape[-1]
+    count, window = ckpt_ids.shape
+    history = read_region(
+        pool, read_ids, elements=state_len * channels, dtype=jnp.bfloat16
+    ).reshape(count, state_len, channels)
+    lengths = starts[1:] - starts[:-1]
+    active = (ids > 0) & (lengths > 0)
+    slots = jnp.where(active, jnp.arange(count, dtype=jnp.int32), -1)
+    output, final = short_conv(
+        x,
+        weight,
+        history,
+        starts,
+        slots,
+        initial,
+        dilation=dilation,
+        request_owned_history=True,
+    )
+    per_token = speculative_history_windows(x, history, starts, initial, window)
+    steps = jnp.arange(window, dtype=jnp.int32)[None]
+    # Non-windowed requests keep only their final history, in checkpoint 0.
+    values = jnp.where(
+        windowed[:, None, None, None],
+        per_token,
+        jnp.broadcast_to(final[:, None], per_token.shape),
+    )
+    write = active[:, None] & jnp.where(
+        windowed[:, None], steps < lengths[:, None], steps == 0
+    )
+    targets = jnp.where(write, ckpt_ids, 0).reshape(-1)
+    pool = write_region(pool, values.reshape(count * window, -1), targets)
+    return pool, output

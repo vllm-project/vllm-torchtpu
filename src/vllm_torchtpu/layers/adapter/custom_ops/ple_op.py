@@ -12,7 +12,10 @@ from vllm_torchtpu.kernels.qwen4_exp.ple import (
     resident_lookup_raw,
     short_conv,
 )
-from vllm_torchtpu.kernels.qwen4_exp.pool import pooled_short_conv
+from vllm_torchtpu.kernels.qwen4_exp.pool import (
+    pooled_short_conv,
+    pooled_short_conv_speculative,
+)
 
 
 @functools.cache
@@ -94,6 +97,32 @@ def build_pooled_short_conv_op(dilation, state_len):
 
     def run(x, weight, pool, starts, ids, initial):
         updated, output = op(x, weight, pool, starts, ids, initial)
+        pool.copy_(updated)
+        return output
+
+    return run
+
+
+@functools.cache
+def build_pooled_speculative_short_conv_op(dilation, state_len):
+    """Pooled PLE history with per-verify-position checkpoint blocks."""
+    fn = functools.partial(
+        pooled_short_conv_speculative, dilation=dilation, state_len=state_len
+    )
+    op = pallas.jax_op(
+        f"qwen4_exp::pooled_spec_short_conv_{dilation}_{state_len}",
+        fn,
+        donate_argnums=(2,),
+    )
+
+    @op.register_fake
+    def fake(x, weight, pool, starts, ids, initial, read_ids, ckpt_ids, windowed):
+        return torch.empty_like(pool), torch.empty_like(x)
+
+    def run(x, weight, pool, starts, ids, initial, read_ids, ckpt_ids, windowed):
+        updated, output = op(
+            x, weight, pool, starts, ids, initial, read_ids, ckpt_ids, windowed
+        )
         pool.copy_(updated)
         return output
 

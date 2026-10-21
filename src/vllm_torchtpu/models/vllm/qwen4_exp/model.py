@@ -41,7 +41,7 @@ from vllm.v1.kv_cache_interface import MambaSpec
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
-from .config import gdn_cache_spec, use_unified_pool
+from .config import gdn_cache_spec, num_speculative_tokens, use_unified_pool
 from .gdn import Qwen4ExpGatedDeltaNetAttention
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .parallel import PLEParallel
@@ -64,6 +64,89 @@ def _parameter_storage_key(parameter):
     )
 
 
+def moe_weights_mapper():
+    """Checkpoint shared-expert projections into the packed TPU module."""
+    return WeightsMapper(
+        orig_to_new_stacked={
+            "shared_expert.gate_proj": ("shared_expert.gate_up_proj", 0),
+            "shared_expert.up_proj": ("shared_expert.gate_up_proj", 1),
+        }
+    )
+
+
+def verify_moe_checkpoint(mlp, prefix, source, moe_mapper, label):
+    """Every locally owned routed expert and each shared-expert shard loaded.
+
+    ``prefix`` is the MoE block's name in ``source`` (the set of mapped
+    checkpoint tensor names), ending with ``.mlp.``.
+    """
+    experts = mlp.experts.routed_experts
+    required = {
+        prefix + weight_name + field
+        for _, weight_name, expert_id, _ in experts.get_expert_mapping()
+        if experts._map_global_expert_id_to_local_expert_id(expert_id) >= 0
+        for field in ("weight", "weight_scale_inv")
+    }
+    required.update(
+        prefix + name
+        for name in (
+            "gate.weight",
+            "shared_expert_gate.weight",
+            "shared_expert.gate_proj.weight",
+            "shared_expert.up_proj.weight",
+            "shared_expert.down_proj.weight",
+        )
+    )
+    if required - source:
+        raise ValueError(
+            f"Incomplete {label} expert checkpoint: {len(required - source)} missing"
+        )
+    for checkpoint_projection, (
+        projection,
+        _,
+    ) in moe_mapper.orig_to_new_stacked.items():
+        required_shards = {}
+        for field, parameter in mlp.get_submodule(projection).named_parameters(
+            recurse=False
+        ):
+            aliases = required_shards.setdefault(
+                _parameter_storage_key(parameter), set()
+            )
+            aliases.add(prefix + checkpoint_projection + "." + field)
+        missing_shards = [
+            sorted(aliases)
+            for aliases in required_shards.values()
+            if aliases.isdisjoint(source)
+        ]
+        if missing_shards:
+            raise ValueError(f"Incomplete {label} shared checkpoint: {missing_shards}")
+
+
+def ple_speculative_state(metadata):
+    """PLE checkpoint addressing from its own Mamba group's metadata.
+
+    None without speculative decoding. Otherwise (read_ids, ckpt_ids,
+    windowed): each request resumes from the checkpoint its slot's read
+    offset selects (the last accepted token), writes one checkpoint per
+    window position when it is in the runner's leading windowed segment
+    (decodes and verify windows) and its final history to checkpoint 0
+    otherwise; the same contract the pooled GDN kernel follows.
+    """
+    ckpt = metadata.mamba_ckpt_indices
+    if ckpt is None:
+        return None
+    state = cast(torch.Tensor, metadata.mamba_state_indices)
+    offsets = cast(torch.Tensor, metadata.mamba_slot_read_offsets)
+    distribution = cast(torch.Tensor, metadata.mamba_request_distribution)
+    assert offsets is not None and distribution is not None
+    ckpt = cast(torch.Tensor, ckpt).to(torch.int32)
+    offset = offsets[state.long()].to(torch.int64).clamp(0, ckpt.shape[1] - 1)
+    read_ids = torch.gather(ckpt, 1, offset[:, None]).squeeze(1)
+    rows = torch.arange(ckpt.shape[0], device=ckpt.device)
+    windowed = rows < distribution[0].to(rows.dtype)
+    return read_ids, ckpt, windowed
+
+
 def hc_config(config):
     return HyperConnectionConfig(
         hc_count=config.hc_count,
@@ -76,16 +159,20 @@ def hc_config(config):
 
 
 class Qwen4ExpDecoderLayer(nn.Module):
-    def __init__(self, cfg, index, prefix):
+    def __init__(self, cfg, index, prefix, *, layer_type=None):
+        """``layer_type`` overrides the checkpoint's per-index type; the MTP
+        draft builds its full-attention layer past the target's layer count.
+        """
         super().__init__()
         t = cfg.model_config.hf_text_config
         tp = get_tp_group()
         engram = cfg.additional_config.get("qwen4_exp", {}).get("engram_config", {})
+        has_ple = index < t.num_hidden_layers and index + 1 in t.ple_layer_ids
         shared = (
             shared_ple_options(
                 cfg.model_config, prefix + ".ple", tp.rank_in_group, tp.world_size
             )
-            if index + 1 in t.ple_layer_ids and engram.get("dp_shared_memory", False)
+            if has_ple and engram.get("dp_shared_memory", False)
             else None
         )
         if shared is not None:
@@ -113,12 +200,12 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 cpu_offload=engram.get("cpu_offload", False),
                 shared=shared,
             )
-            if index + 1 in t.ple_layer_ids
+            if has_ple
             else None
         )
         if self.ple is not None and engram.get("cpu_offload", False):
             cfg.compilation_config.static_forward_context[prefix + ".ple"] = self.ple
-        self.layer_type = t.layer_types[index]
+        self.layer_type = layer_type or t.layer_types[index]
         if self.layer_type == "linear_attention":
             self.linear_attn = Qwen4ExpGatedDeltaNetAttention(
                 t,
@@ -180,12 +267,15 @@ class Qwen4ExpDecoderLayer(nn.Module):
     ):
         if self.ple is not None:
             ple_slots = state_slots
+            speculative = None
             if self.pooled:
                 per_layer = cast(
                     dict[str, AttentionMetadata], get_forward_context().attn_metadata
                 )
-                ple_slots = per_layer[self.ple.prefix].mamba_state_indices
+                ple_metadata = per_layer[self.ple.prefix]
+                ple_slots = ple_metadata.mamba_state_indices
                 assert ple_slots is not None
+                speculative = ple_speculative_state(ple_metadata)
             hidden = hidden + self.ple.forward_with_history(
                 hidden,
                 PLEInputs(input_ids, query_start_loc, ngram_context),
@@ -193,6 +283,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 context_lens > 0,
                 query_start_loc[-1:],
                 ple_raw_embeddings,
+                speculative,
             )
         block, residual = self.attn_hyper_connection.mix(hidden)
         if self.layer_type == "linear_attention":
@@ -230,6 +321,9 @@ class Qwen4ExpBackbone(nn.Module):
         self.prefix = "model"
         t = cfg.model_config.hf_text_config
         self.hc_count = t.hc_count
+        # The MTP draft consumes the pre-final-mixer multi-stream hidden state
+        # [T, hc_count * H]; it is returned as the second (aux) output.
+        self.emit_mtp_hidden = num_speculative_tokens(cfg) > 0
         self.embed_tokens = VocabParallelEmbedding(t.vocab_size, t.hidden_size)
         self.layers = nn.ModuleList(
             [
@@ -316,7 +410,10 @@ class Qwen4ExpBackbone(nn.Module):
                 compressed_block_table,
                 ple_raw_embeddings,
             )
-        return self.hyper_connection_mixer.mix(hidden)[0]
+        mixed = self.hyper_connection_mixer.mix(hidden)[0]
+        if self.emit_mtp_hidden:
+            return mixed, hidden
+        return mixed
 
 
 class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
@@ -419,12 +516,7 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             weights = identity.observe(weights)
         parameters = dict(self.named_parameters())
         loaded, source = set(), set()
-        moe_mapper = WeightsMapper(
-            orig_to_new_stacked={
-                "shared_expert.gate_proj": ("shared_expert.gate_up_proj", 0),
-                "shared_expert.up_proj": ("shared_expert.gate_up_proj", 1),
-            }
-        )
+        moe_mapper = moe_weights_mapper()
         layers = cast(Sequence[Qwen4ExpDecoderLayer], self.model.layers)
         moe_loaders = [AutoWeightsLoader(layer.mlp) for layer in layers]
         # Exactly the Qwen3.5 checkpoint projection mapping. HC remains
@@ -474,50 +566,9 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
             loader(param, weight)
             loaded.add(name)
         for i, layer in enumerate(layers):
-            prefix = f"model.layers.{i}.mlp."
-            experts = layer.mlp.experts.routed_experts
-            required = {
-                prefix + weight_name + field
-                for _, weight_name, expert_id, _ in experts.get_expert_mapping()
-                if experts._map_global_expert_id_to_local_expert_id(expert_id) >= 0
-                for field in ("weight", "weight_scale_inv")
-            }
-            required.update(
-                prefix + name
-                for name in (
-                    "gate.weight",
-                    "shared_expert_gate.weight",
-                    "shared_expert.gate_proj.weight",
-                    "shared_expert.up_proj.weight",
-                    "shared_expert.down_proj.weight",
-                )
+            verify_moe_checkpoint(
+                layer.mlp, f"model.layers.{i}.mlp.", source, moe_mapper, f"layer{i}"
             )
-            if required - source:
-                raise ValueError(
-                    f"Incomplete layer{i} expert checkpoint: "
-                    f"{len(required - source)} missing"
-                )
-            for checkpoint_projection, (
-                projection,
-                _,
-            ) in moe_mapper.orig_to_new_stacked.items():
-                required_shards = {}
-                for field, parameter in layer.mlp.get_submodule(
-                    projection
-                ).named_parameters(recurse=False):
-                    aliases = required_shards.setdefault(
-                        _parameter_storage_key(parameter), set()
-                    )
-                    aliases.add(prefix + checkpoint_projection + "." + field)
-                missing_shards = [
-                    sorted(aliases)
-                    for aliases in required_shards.values()
-                    if aliases.isdisjoint(source)
-                ]
-                if missing_shards:
-                    raise ValueError(
-                        f"Incomplete layer{i} shared checkpoint: {missing_shards}"
-                    )
             if layer.ple is not None:
                 layer.ple.finalize_weights()
             if layer.layer_type == "full_attention":

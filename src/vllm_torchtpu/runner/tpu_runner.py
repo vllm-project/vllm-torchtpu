@@ -5851,6 +5851,10 @@ class TPUModelRunner(GPUModelRunner):
         # share the target's embeddings / LM head (if the draft requires it).
         if self._is_async_drafter:
             self._async_drafter.load_model(self.model)
+            # A model-owned cache binds and names the draft's own layers.
+            bind_draft = getattr(self.model_adapter, "bind_draft", None)
+            if bind_draft is not None:
+                bind_draft(self.drafter)
             # The draft reuses the target's Pallas ops (cached by op name),
             # which were traced against the target's relayouted tables. Its
             # own rope caches and hash tables need the same layout, or the

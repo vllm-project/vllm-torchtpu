@@ -20,7 +20,7 @@ from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilde
 from vllm_torchtpu.utils import compute_hbm_budget, synchronize_tensors
 
 from .cache import TEMP_HEADROOM, logger
-from .config import native_cache_capacity
+from .config import mtp_layer_prefixes, native_cache_capacity, num_speculative_tokens
 from .pd import TransferGroup, build_transfer_groups
 from .pool_layout import pooled_cache_specs
 from .qsa import Qwen4ExpPooledQSABackend
@@ -98,6 +98,7 @@ class Qwen4ExpPooledCache:
                 layer.self_attn.bind_pool(main)
             if layer.ple is not None:
                 layer.ple.bind_pool(caches[prefix + ".ple"][0])
+        self.bind_draft()
         synchronize_tensors(self.materialized.raw_tensors)
         self.native_config = config
         logger.info(
@@ -109,6 +110,29 @@ class Qwen4ExpPooledCache:
             len(self.materialized.raw_tensors),
             required,
         )
+
+    def bind_draft(self) -> None:
+        """Bind the MTP draft's QSA layers once both they and the pool exist.
+
+        The draft registers its attention in the shared static forward
+        context; a draft that loads after allocation binds when it is
+        attached (``Qwen4ExpAdapter.bind_draft``).
+        """
+        if self.materialized is None:
+            return
+        caches = self.materialized.kv_caches
+        context = self.runner.vllm_config.compilation_config.static_forward_context
+        for prefix in mtp_layer_prefixes(self.runner.vllm_config):
+            attention = context.get(prefix + ".self_attn")
+            if attention is None:
+                continue
+            main = caches[prefix + ".self_attn"]
+            assert (
+                main
+                is caches[prefix + ".self_attn.compressed_k"]
+                is caches[prefix + ".self_attn.raw_ring"]
+            ), "QSA cache groups must share one native carrier"
+            attention.bind_pool(main)
 
     def initialize(self, config) -> dict[str, LayerKVCache]:
         self.allocate()
@@ -143,6 +167,13 @@ class Qwen4ExpPooledCache:
         runner._build_mamba_copy_plan(
             config, materialized.layer_to_raw, materialized.bm_pool_layout
         )
+        if num_speculative_tokens(runner.vllm_config) and config.has_mamba_layers:
+            # Per-block read offsets (num_accepted - 1 of the last verify):
+            # GDN and PLE resume from that checkpoint block, which is how
+            # rejected drafts roll back. Mirrors the generic unified pool.
+            runner.mamba_slot_read_offsets = torch.zeros(
+                config.num_blocks, dtype=torch.int32
+            ).to(runner.device)
         runner._precompile_mamba_state_seed_copies()
         if not runner.enforce_eager:
             runner._precompile_substitute_placeholder_token()
@@ -158,12 +189,27 @@ class Qwen4ExpPooledCache:
         seq_lens_cpu = metadata.seq_lens.to("cpu")
         result = {}
         next_page = 1
+        # Speculative decoding: state groups own one checkpoint block per
+        # verify position. The compiled forward keeps no guards, so profiling
+        # must trace the same checkpoint/read-offset branches serving takes.
+        window = num_speculative_tokens(self.runner.vllm_config) + 1
+        read_offsets = None
+        if window > 1:
+            read_offsets = torch.zeros(
+                self.pages, dtype=torch.int32, device=self.runner.device
+            )
+            # Serving stages both distributions as views of one [6] tensor
+            # (TPUModelRunner._combined_request_distribution_cpu); keep the
+            # traced inputs' aliasing identical.
+            combined = torch.cat([metadata.request_distribution] * 2)
+            metadata = replace(metadata, request_distribution=combined[0:3])
+            mamba_distribution = combined[3:6]
         for group in self.groups:
             spec = group.kv_cache_spec
             state = isinstance(spec, MambaSpec)
             ring = isinstance(spec, CircularBufferSpec)
             columns = (
-                1
+                window
                 if state
                 else get_block_table_width(
                     spec.max_num_blocks_per_req(
@@ -176,10 +222,9 @@ class Qwen4ExpPooledCache:
             for row in range(active_rows):
                 req_blocks = max(
                     1,
-                    (int(seq_lens_cpu[row]) + spec.block_size - 1)
-                    // spec.block_size,
+                    (int(seq_lens_cpu[row]) + spec.block_size - 1) // spec.block_size,
                 )
-                owned = 1 if (ring or state) else min(columns, req_blocks)
+                owned = 1 if ring else window if state else min(columns, req_blocks)
                 table[row, :owned] = torch.arange(
                     next_page, next_page + owned, dtype=torch.int32, device="cpu"
                 )
@@ -190,6 +235,16 @@ class Qwen4ExpPooledCache:
                 block_tables=table.reshape(-1),
                 mamba_state_indices=table[:, 0] if state else None,
             )
+            if state and read_offsets is not None:
+                # Serving derives state and checkpoint indices as separate
+                # tensors; do not trace them as views of one base.
+                item = replace(
+                    item,
+                    mamba_state_indices=table[:, 0].clone(),
+                    mamba_slot_read_offsets=read_offsets,
+                    mamba_ckpt_indices=table.clone(),
+                    mamba_request_distribution=mamba_distribution,
+                )
             result.update({name: item for name in group.layer_names})
         assert next_page <= self.pages, "dummy owner pages exceed the planned pool"
         return result

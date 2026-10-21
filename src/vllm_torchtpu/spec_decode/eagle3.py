@@ -1284,7 +1284,7 @@ class Eagle3Proposer:
                         )
                 else:
                     # MTP: does not use combine_hidden_states
-                    target_hidden_states = chunk.hidden_states
+                    target_hidden_states = self._mtp_target_hidden_states(chunk)
 
             (input_ids, positions, last_token_indices, num_rejected) = (
                 self._prepare_draft_inputs(
@@ -2175,6 +2175,30 @@ class Eagle3Proposer:
             )
         return hidden_size
 
+    def _mtp_target_hidden_states(self, chunk: DraftChunkInputs) -> torch.Tensor:
+        """The target hidden state draft step 0 consumes.
+
+        Ordinarily the target's sampled hidden state. A draft declaring
+        `uses_target_aux_hidden_states` (Qwen4Exp: the pre-final-mixer
+        multi-stream state) reads the target's second output instead, which
+        `forward_model` captured as the chunk's aux hidden state.
+        """
+        if not getattr(self.draft_model, "uses_target_aux_hidden_states", False):
+            return chunk.hidden_states
+        aux = chunk.aux_hidden_states
+        if not isinstance(aux, torch.Tensor):
+            raise RuntimeError(
+                "The MTP draft consumes the target's second hidden output, but "
+                "the target forward returned none for this chunk."
+            )
+        return aux
+
+    def _draft_target_hidden_size(self) -> int:
+        """Width of draft step 0's target hidden input and of the loop carry."""
+        assert self.draft_model is not None
+        width = getattr(self.draft_model, "target_hidden_size", None)
+        return int(width) if width is not None else self._draft_hidden_size()
+
     def _draft_uses_aux_hidden_state(self) -> bool:
         """Whether this draft checkpoint feeds combine_hidden_states the
         concatenation of several target aux hidden-state layers.
@@ -2373,7 +2397,7 @@ class Eagle3Proposer:
             else token_positions
         )
         target_hidden_states = torch.zeros(
-            (bucket, self._draft_hidden_size()),
+            (bucket, self._draft_target_hidden_size()),
             dtype=runner._hidden_states_dtype,
             device=runner.device,
         )
@@ -2451,7 +2475,7 @@ class Eagle3Proposer:
                 device=runner.device,
             ),
             loop_hidden=torch.zeros(
-                (p, draft_hidden), dtype=dtype, device=runner.device
+                (p, self._draft_target_hidden_size()), dtype=dtype, device=runner.device
             ),
             # Loop-step metadata mirrors propose()'s per-chunk loop tensors.
             loop_query_start_loc=torch.from_numpy(

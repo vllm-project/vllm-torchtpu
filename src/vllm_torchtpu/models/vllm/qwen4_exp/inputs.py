@@ -16,7 +16,7 @@ from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
 from vllm_torchtpu.utils import synchronize_tensors
 
 from .cache import Qwen4ExpCache
-from .config import use_unified_pool
+from .config import mtp_layer_prefixes, num_speculative_tokens, use_unified_pool
 
 if TYPE_CHECKING:
     from .pooled_cache import Qwen4ExpPooledCache
@@ -30,6 +30,40 @@ def ngram_context_from_store(
     )
     gathered = token_store[row_indices[:, None], columns.clamp(min=0)]
     return torch.where(columns >= 0, gathered.to(torch.int64), eos_token_id)
+
+
+def merge_recent_ngram_context(
+    history, recent_tokens, recent_context, recent_lengths, previous_rows, context
+):
+    """Replace host-store context tokens the previous step saw on device only.
+
+    With async scheduling and speculative decoding, the drafts a step accepts
+    reach the host token store only after the following step has prepared its
+    inputs, so the store holds placeholders at positions ``(c, c + accepted]``
+    of the previous chunk ``c``. ``recent_tokens[r]`` is that previous chunk's
+    n-gram context followed by its first chunk tokens (as verified on
+    device), ``recent_context[r]`` its context length and ``recent_lengths[r]``
+    how many chunk tokens it holds. Context positions inside that span read
+    it; all others keep the host value.
+
+    ``previous_rows[i]`` is current row ``i``'s row in the previous step's
+    record, or -1 when the request did not run in the previous step.
+    """
+    width = history.shape[1]
+    rows = previous_rows.clamp(min=0)
+    tokens = recent_tokens[rows]
+    base = recent_context[rows]
+    columns = torch.arange(width, device=history.device, dtype=torch.int64)
+    positions = context[:, None] - width + columns[None]
+    index = positions - base[:, None] + width
+    usable = (
+        (previous_rows >= 0)[:, None]
+        & (positions >= 0)
+        & (index >= 0)
+        & (index < width + recent_lengths[rows][:, None])
+    )
+    gathered = torch.gather(tokens, 1, index.clamp(0, tokens.shape[1] - 1))
+    return torch.where(usable, gathered, history)
 
 
 def dummy_query_lengths(num_tokens, num_reqs, max_active):
@@ -50,6 +84,16 @@ class Qwen4ExpAdapter:
         )
         self.cache: Qwen4ExpCache | Qwen4ExpPooledCache | None = None
         self.token_store = None
+        # Speculative decoding: each step's verified chunk tokens and n-gram
+        # context, kept on device for the next step's n-gram history (see
+        # merge_recent_ngram_context). Rows are batch rows of that step.
+        spec = num_speculative_tokens(getattr(runner, "vllm_config", None))
+        self.spec_window = spec + 1 if spec else 0
+        # Two records: the previous step's (read) and this step's (written),
+        # so a later chunk of this step never reads this step's rows.
+        self._recent: list[tuple[torch.Tensor, torch.Tensor, torch.Tensor]] = []
+        self._previous_rows: dict[str, int] = {}
+        self._current_rows: dict[str, int] = {}
 
     def bind_model(self, model):
         if self.pooled:
@@ -58,6 +102,23 @@ class Qwen4ExpAdapter:
             self.cache = Qwen4ExpPooledCache(self.runner, model)
         else:
             self.cache = Qwen4ExpCache(self.runner, model)
+
+    def bind_draft(self, drafter):
+        """Attach the MTP proposer once the draft model has loaded.
+
+        The draft's QSA layer reads its compressed-key and raw-ring group
+        metadata by name, so the proposer must carry those entries (in step
+        0's target metadata and through its loop-step rebuilds); it only
+        discovers the main attention name on its own.
+        """
+        names = getattr(drafter, "_draft_attn_layer_names", None)
+        if names is not None:
+            for prefix in mtp_layer_prefixes(self.runner.vllm_config):
+                attention = prefix + ".self_attn"
+                if attention in names:
+                    names.update({attention + ".compressed_k", attention + ".raw_ring"})
+        if self.pooled and self.cache is not None:
+            cast("Qwen4ExpPooledCache", self.cache).bind_draft()
 
     def get_kv_cache_spec(self):
         assert self.cache is not None
@@ -74,7 +135,63 @@ class Qwen4ExpAdapter:
         self.token_store = batch.token_ids_cpu_tensor.to(
             self.runner.device, non_blocking=True
         )
+        if self.spec_window:
+            self._previous_rows, self._current_rows = self._current_rows, {}
+            self._recent.reverse()
         return self.token_store
+
+    def _recent_buffers(self, device):
+        """(previous step's record, this step's record)."""
+        if not self._recent:
+            # One spare row absorbs the writes of padded batch rows.
+            rows = self.runner.max_num_reqs + 1
+            width = self.config.ngram_size - 1 + self.spec_window
+            self._recent = [
+                (
+                    torch.zeros((rows, width), dtype=torch.int64, device=device),
+                    torch.zeros(rows, dtype=torch.int64, device=device),
+                    torch.zeros(rows, dtype=torch.int64, device=device),
+                )
+                for _ in range(2)
+            ]
+        return self._recent[0], self._recent[1]
+
+    def _speculative_ngram_context(self, snapshot, history, context, starts):
+        """Correct and record n-gram context across speculative steps."""
+        runner = self.runner
+        rows = starts.shape[0] - 1
+        req_ids = runner.input_batch.req_ids
+        previous_np = torch.full((rows,), -1, dtype=torch.int64)
+        for i in range(snapshot.num_requests):
+            req_id = req_ids[snapshot.row_start + i]
+            previous_np[i] = self._previous_rows.get(req_id, -1)
+            self._current_rows[req_id] = snapshot.row_start + i
+        previous, current = self._recent_buffers(runner.device)
+        history = merge_recent_ngram_context(
+            history,
+            *previous,
+            previous_np.to(runner.device, non_blocking=True),
+            context,
+        )
+        tokens, recent_context, lengths = current
+        # Record this chunk for the next step: corrected context, then its
+        # first spec_window tokens (all a verify window can accept).
+        ids = snapshot.input_ids.to(torch.int64)
+        offsets = torch.arange(self.spec_window, device=ids.device)
+        chunk = ids[
+            (starts[:-1, None].to(torch.int64) + offsets).clamp(0, ids.shape[0] - 1)
+        ]
+        live = torch.arange(rows, device=ids.device) < snapshot.num_requests
+        target = torch.where(
+            live,
+            torch.arange(rows, device=ids.device) + snapshot.row_start,
+            tokens.shape[0] - 1,
+        )
+        lengths_now = (starts[1:] - starts[:-1]).to(torch.int64)
+        tokens.index_copy_(0, target, torch.cat([history, chunk], dim=1))
+        recent_context.index_copy_(0, target, context)
+        lengths.index_copy_(0, target, lengths_now.clamp(max=self.spec_window))
+        return history
 
     def prepare_inputs(self, snapshot):
         runner = self.runner
@@ -101,6 +218,10 @@ class Qwen4ExpAdapter:
             self.config.eos_token_id,
             self.config.ngram_size,
         )
+        if self.spec_window:
+            history = self._speculative_ngram_context(
+                snapshot, history, context, starts
+            )
         tables = []
         for role in ("self_attn", "self_attn.compressed_k"):
             name = f"{self.attention_prefix}.{role}"
