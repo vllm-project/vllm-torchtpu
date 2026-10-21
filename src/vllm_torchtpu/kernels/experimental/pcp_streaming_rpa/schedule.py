@@ -13,7 +13,9 @@
 # limitations under the License.
 """Runtime schedules for PCP streaming prefill RPA."""
 
+import jax.numpy as jnp
 import numpy as np
+from jax import lax
 
 
 class RuntimeScheduleField:
@@ -63,8 +65,6 @@ def query_row_positions(
     offset within an interleave, even when a request starts mid-interleave.
     History changes absolute positions, but does not change this offset.
     """
-    from jax import lax
-
     # All local coordinates are nonnegative. Truncating division avoids the
     # signed floor/mod corrections in the per-page Pallas causal mask.
     offset = lax.rem(q_hbm_offset, interleave_size)
@@ -89,8 +89,6 @@ def _validate_page_interleave_size(
 
 
 def _reshape_metadata_page_indices_jax(page_indices, max_num_seqs: int):
-    import jax.numpy as jnp
-
     if max_num_seqs <= 0:
         raise ValueError("metadata must contain at least one sequence slot.")
     if page_indices.ndim == 1:
@@ -130,8 +128,6 @@ def build_pcp_streaming_schedule_inputs_from_metadata_jax(
     remain request-absolute. The result is always the compact tile plan consumed
     by the production Pallas kernels; there is no dense schedule fallback.
     """
-    import jax.numpy as jnp
-
     global_bucket_tokens = int(global_bucket_tokens)
     local_kv_cache_num_blocks = int(local_kv_cache_num_blocks)
     page_size = int(page_size)
