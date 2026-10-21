@@ -160,14 +160,42 @@ def gather_cos_sin(
     )(positions, cos_sin_cache)
 
 
-def _rope_heads(x: jax.Array, cos_sin: jax.Array, *, head_dim: int) -> jax.Array:
-    """apply RoPE to the last rope dim of head dim of ``x``."""
+def _rope_heads(
+    x: jax.Array,
+    cos_sin: jax.Array,
+    *,
+    head_dim: int,
+    heads_per_group: int,
+) -> jax.Array:
+    """Applies RoPE to the trailing ``LANE`` lanes of each head of a flat ``x``.
+
+    ``x`` is the flat ``(rows, heads_per_group * head_dim)`` view rather than
+    the 3D one. Because ``head_dim`` and ``lo`` are both multiples of ``LANE``,
+    every slice boundary below falls on a 128-lane register tile, so the
+    concatenate is just a lane-tile relabel. Reshaping after the RoPE instead
+    forces the compiler to rebuild a 3D value and relayout it.
+
+    Args:
+        x: Flat ``(rows, heads_per_group * head_dim)`` activations.
+        cos_sin: ``(rows, 2 * LANE)`` cosine half followed by sine half.
+        head_dim: Per-head width; must be a multiple of ``LANE``.
+        heads_per_group: Number of heads packed along the last axis of ``x``.
+
+    Returns:
+        The roped flat ``(rows, heads_per_group * head_dim)`` value.
+    """
     cos = cos_sin[:, :LANE]
     sin = cos_sin[:, LANE:]
     lo = head_dim - LANE
-    tail = x[:, :, lo:].astype(jnp.float32)
-    roped = tail * cos[:, None, :] + _rotate_gptj(tail) * sin[:, None, :]
-    return jnp.concatenate([x[:, :, :lo], roped.astype(x.dtype)], axis=-1)
+    pieces = []
+    for h in range(heads_per_group):
+        base = h * head_dim
+        if lo:
+            pieces.append(x[:, base : base + lo])
+        tail = x[:, base + lo : base + head_dim].astype(jnp.float32)
+        roped = tail * cos + _rotate_gptj(tail) * sin
+        pieces.append(roped.astype(x.dtype))
+    return jnp.concatenate(pieces, axis=-1)
 
 
 def _kernel(
@@ -193,8 +221,12 @@ def _kernel(
         # Subchunk the tile to allow more Instruction level parallelism
         # opportunities to be exploited by the LLO compiler.
         rows = slice(s * sub_t, (s + 1) * sub_t)
-        x = _rope_heads(x_ref[rows], cos_sin[rows], head_dim=head_dim)
-        x = x.reshape(sub_t, -1)
+        x = _rope_heads(
+            x_ref[rows].reshape(sub_t, -1),
+            cos_sin[rows],
+            head_dim=head_dim,
+            heads_per_group=x_ref.shape[1],
+        )
         inv = None
         if quantize_activations:
             amax = jnp.max(jnp.abs(x), axis=1, keepdims=True)
