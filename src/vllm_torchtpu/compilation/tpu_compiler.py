@@ -312,6 +312,8 @@ _RUNTIME_CACHE_KEY_PATHS = (
     "vllm_torchtpu/layers/adapter/moe_tp_decode.py",
     # The HBM-streaming LM head op.
     "vllm_torchtpu/layers/adapter/lm_head_hbm.py",
+    # The V-space DCP merge operand op (TPU_DCP_MERGE_VSPACE_FUSED).
+    "vllm_torchtpu/layers/adapter/dcp_vspace.py",
     # Still listed: on this base `pp_shift.py` is a second caller, so the
     # module stays even though the fused EP op no longer needs it.
     "vllm_torchtpu/distributed/sharded_jax_op.py",

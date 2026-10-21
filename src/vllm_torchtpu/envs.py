@@ -18,6 +18,7 @@ if TYPE_CHECKING:
     TPU_DCP_MLA_SMALL_CHUNK_BATCH: int = 4
     TPU_DCP_MLA_UV_BEFORE_MERGE: bool = False
     TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS: int = 0
+    TPU_DCP_MERGE_VSPACE_FUSED: bool = False
     TPU_MLA_SPARSE_SPLIT_Q: bool = True
     TPU_DCP_LSE_MERGE_A2A_PACK: bool = False
     TPU_DCP_LSE_MERGE_A2A_REAL_ROWS: bool = False
@@ -783,6 +784,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS": env_nonnegative_int(
         "TPU_DCP_MLA_UV_BEFORE_MERGE_MIN_TOKENS", 0
     ),
+    # With TPU_DCP_MLA_UV_BEFORE_MERGE: on the buckets that take the chunked
+    # reduce-scatter merge, build its operand in V space in one computation
+    # (#1935 trial 6's TPU_DCP_MERGE_VSPACE: head-batched W_UV matmul, weight,
+    # mask, one rounding; layers/adapter/dcp_vspace.py) instead of a pre-merge
+    # projection followed by the latent merge path. GLM-5.2 AgentX c4 TP16 x
+    # DCP8: P90 TTFT -10..-12% (the separate W_UV bmm, concat and relayouts
+    # cost ~36 ms per 4096-token step).
+    "TPU_DCP_MERGE_VSPACE_FUSED": env_bool("TPU_DCP_MERGE_VSPACE_FUSED"),
     # Sparse MLA split q (`sparse_ragged_paged_attention(q_pe=...)`): hand
     # q_nope and q_pe to the kernel as separate operands. The kernel joins
     # them in VMEM and its output aliases q_nope (512 wide), instead of the

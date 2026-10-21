@@ -43,6 +43,10 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group
 from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
 
+if envs.TPU_DCP_MERGE_VSPACE_FUSED:
+    # Registers the fused V-space operand ops at import, never in a trace.
+    from vllm_torchtpu.layers.adapter import dcp_vspace  # noqa: F401
+
 
 def all_gather_heads(q: torch.Tensor) -> torch.Tensor:
     """Widen a rank's query head slice to the whole DCP group's heads.
@@ -200,6 +204,50 @@ def merge_lse_partials_scatter_heads(
     return _retain_rank(cp_lse_ag_out_rs(output, lse, group, rs_dtype=rs_dtype))
 
 
+def vspace_fused_applies(num_tokens: int, is_backbone: bool) -> bool:
+    """TPU_DCP_MERGE_VSPACE_FUSED: whether this step's merge is
+    the chunked reduce-scatter merge with the heads-major weighted operand,
+    so the operand can be built in V space by `dcp_vspace` (#1935 trial 6's
+    TPU_DCP_MERGE_VSPACE). Fixed at trace time; every comparison here is one
+    `merge_lse_partials_scatter_heads` already makes for the same bucket. The
+    MTP drafter never takes it."""
+    if not envs.TPU_DCP_MERGE_VSPACE_FUSED or not is_backbone:
+        return False
+    if envs.TPU_DCP_MERGE_RS_BF16 == 2:
+        return False
+    group = get_dcp_group()
+    if group is None or int(group.world_size) == 1:
+        return False
+    if (
+        envs.TPU_DCP_LSE_MERGE_A2A
+        and num_tokens <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
+    ):
+        return False
+    return _merge_chunks(num_tokens) > 1
+
+
+def merge_lse_partials_scatter_heads_vspace(
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    w_uv: torch.Tensor,
+    w_uv_scale: torch.Tensor | None,
+    wire_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """`merge_lse_partials_scatter_heads` on a bucket `vspace_fused_applies`
+    takes, merging in V space: every chunk projects this rank's latent
+    partial `[T, H, C]` through W_UV `[H, C, V]` for all `H` heads, weights it
+    and reduce-scatters the V-wide result. Returns `[T, H / world, V]`, this
+    rank's heads already through W_UV."""
+    group = get_dcp_group()
+    narrow = envs.TPU_DCP_RS_OUT_PRECISION
+    rs_dtype = (wire_dtype or output.dtype) if narrow else None
+    chunks = _merge_chunks(output.shape[0])
+    merged = _merge_chunked(
+        output, lse, group, chunks, rs_dtype=rs_dtype, vspace=(w_uv, w_uv_scale)
+    )
+    return _retain_rank(merged)
+
+
 def _merge_chunks(num_tokens: int) -> int:
     """How many token chunks `TPU_DCP_MERGE_CHUNKED` splits this bucket's
     merge into: 1 (unsplit) unless the bucket reaches
@@ -231,9 +279,11 @@ def _merge_chunked(
     group: Any,
     chunks: int,
     rs_dtype: torch.dtype | None = None,
+    vspace: tuple[torch.Tensor, torch.Tensor | None] | None = None,
 ) -> torch.Tensor:
     """The reduce-scatter merge (`cp_lse_ag_out_rs`) over `chunks`
-    independent token chunks.
+    independent token chunks. `vspace` (TPU_DCP_MERGE_VSPACE_FUSED):
+    `(W_UV, scale)` over every head; the result is `[T, H / world, V]`.
 
     Every token's merge depends on its own row alone (the lse all-gather,
     logsumexp, weight and reduce-scatter sum all run per token), so splitting
@@ -246,8 +296,10 @@ def _merge_chunked(
     """
     step = output.shape[0] // chunks
     if _lse_gathered_once(output.shape[0]):
-        return _merge_chunked_lse_gathered(output, lse, group, chunks, rs_dtype)
-    if envs.TPU_DCP_MERGE_RS_BF16 or envs.TPU_DCP_MERGE_WEIGHTED_HM:
+        return _merge_chunked_lse_gathered(
+            output, lse, group, chunks, rs_dtype, vspace=vspace
+        )
+    if envs.TPU_DCP_MERGE_RS_BF16 or envs.TPU_DCP_MERGE_WEIGHTED_HM or vspace:
         # `cp_lse_ag_out_rs` op for op, except the scatter-sum's wire dtype
         # (RS_BF16) and/or the heads-major operand (WEIGHTED_HM).
         lse_f32 = lse.to(torch.float32)
@@ -260,6 +312,7 @@ def _merge_chunked(
                     _gather_lse(lse_f32[c * step : (c + 1) * step], group),
                     group,
                     rs_dtype,
+                    vspace=vspace,
                 )
             )
         return torch.cat(pieces, dim=0)
@@ -294,10 +347,15 @@ def _weighted_reduce_scatter(
     lses: torch.Tensor,
     group: Any,
     rs_dtype: torch.dtype | None = None,
+    vspace: tuple[torch.Tensor, torch.Tensor | None] | None = None,
 ) -> torch.Tensor:
     """`cp_lse_ag_out_rs` after its lse gather, op for op: `lses` is
-    `[world, T, H]` for exactly `output`'s `T` rows."""
+    `[world, T, H]` for exactly `output`'s `T` rows. `vspace`
+    (TPU_DCP_MERGE_VSPACE_FUSED): the operand is built in V space."""
     merged_lse = torch.logsumexp(lses, dim=0)
+    if vspace is not None:
+        weight = torch.exp(lse_f32 - merged_lse)
+        return _weighted_reduce_scatter_vspace(output, weight, vspace, group, rs_dtype)
     # The heads-major operand feeds the f32 or the bf16 (RS_BF16=1)
     # reduce-scatter; RS_BF16=2's all-to-all keeps the tokens-major operand.
     if (
@@ -346,6 +404,39 @@ def _scatter_sum(
     return group.reduce_scatter(weighted.contiguous(), dim=1)
 
 
+def _weighted_reduce_scatter_vspace(
+    output: torch.Tensor,
+    weight: torch.Tensor,
+    vspace: tuple[torch.Tensor, torch.Tensor | None],
+    group: Any,
+    rs_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """`[T, H, C]` partial, f32 `[T, H]` weights, `(W_UV [H, C, V], scale)`
+    -> this rank's `[T, H / world, V]`: the sum over ranks of
+    `where(w > 0, (o_h @ W_UV_h) * w, 0)`, reduce-scattered over heads, with
+    the operand built heads-major in one computation (TPU_DCP_MERGE_VSPACE_FUSED).
+    Wire dtype as `_weighted_reduce_scatter_heads_major`'s."""
+    w_uv, w_uv_scale = vspace
+    wire = torch.bfloat16 if envs.TPU_DCP_MERGE_RS_BF16 == 1 else rs_dtype
+    wire = wire or torch.float32
+    if output.device.type == "tpu":
+        from vllm_torchtpu.layers.adapter.dcp_vspace import vspace_weighted_heads_major
+
+        x = vspace_weighted_heads_major(output, weight, w_uv, w_uv_scale, wire)
+    else:
+        # The same arithmetic in torch (host tests): o's dtype operands, f32
+        # accumulation, the weight on the f32 product, one rounding.
+        v = torch.bmm(
+            output.transpose(0, 1).to(torch.float32),
+            w_uv.to(output.dtype).to(torch.float32),
+        )
+        if w_uv_scale is not None:
+            v = v * w_uv_scale.to(torch.float32).reshape(v.shape[0], 1, -1)
+        w = weight.to(torch.float32).transpose(0, 1).unsqueeze(-1)
+        x = torch.where(w > 0, v * w, torch.zeros_like(v)).to(wire)
+    return group.reduce_scatter(x.contiguous(), dim=0).transpose(0, 1).to(output.dtype)
+
+
 def _weighted_reduce_scatter_heads_major(
     output: torch.Tensor,
     lse_f32: torch.Tensor,
@@ -385,6 +476,7 @@ def _merge_chunked_lse_gathered(
     group: Any,
     chunks: int,
     rs_dtype: torch.dtype | None = None,
+    vspace: tuple[torch.Tensor, torch.Tensor | None] | None = None,
 ) -> torch.Tensor:
     """`_merge_chunked` with one lse all-gather for every chunk
     (`TPU_DCP_MERGE_CHUNKED_LSE_AG`).
@@ -422,6 +514,7 @@ def _merge_chunked_lse_gathered(
                 rows[c],
                 group,
                 rs_dtype,
+                vspace=vspace,
             )
         )
     return torch.cat(pieces, dim=0)

@@ -3041,22 +3041,38 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     # drafter keeps the reduce-scatter, as with the flag off.
                     is_backbone = vllm_compilation_backends.model_tag == "backbone"
                     wire_dtype = partial.dtype
-                    if uv_first:
-                        # A narrowed merge rounds to the wire dtype anyway.
-                        narrow = envs.TPU_DCP_RS_OUT_PRECISION and is_backbone
-                        partial = project_uv_heads(
-                            partial,
-                            layer.W_UV_dcp_qrep,
-                            layer.W_UV_dcp_qrep_scale,
-                            out_dtype=wire_dtype if narrow else torch.float32,
+                    if uv_first and _cp_mla_attention.vspace_fused_applies(
+                        partial.shape[0], is_backbone
+                    ):
+                        # Experimental TPU_DCP_MERGE_VSPACE_FUSED: the chunked
+                        # merge builds its operand in V space (no pre-merge
+                        # projection); same W_UV buffers as uv_first.
+                        outputs = (
+                            _cp_mla_attention.merge_lse_partials_scatter_heads_vspace(
+                                partial,
+                                lse,
+                                layer.W_UV_dcp_qrep,
+                                layer.W_UV_dcp_qrep_scale,
+                                wire_dtype=wire_dtype,
+                            )
                         )
-                    outputs = merge_lse_partials_scatter_heads(
-                        partial,
-                        lse,
-                        is_backbone=is_backbone,
-                        wire_dtype=wire_dtype,
-                        query_start_loc=attn_metadata.query_start_loc,
-                    )
+                    else:
+                        if uv_first:
+                            # A narrowed merge rounds to the wire dtype anyway.
+                            narrow = envs.TPU_DCP_RS_OUT_PRECISION and is_backbone
+                            partial = project_uv_heads(
+                                partial,
+                                layer.W_UV_dcp_qrep,
+                                layer.W_UV_dcp_qrep_scale,
+                                out_dtype=wire_dtype if narrow else torch.float32,
+                            )
+                        outputs = merge_lse_partials_scatter_heads(
+                            partial,
+                            lse,
+                            is_backbone=is_backbone,
+                            wire_dtype=wire_dtype,
+                            query_start_loc=attn_metadata.query_start_loc,
+                        )
             else:
                 if not hasattr(layer, "sparse_mla_op") or layer.sparse_mla_op is None:
                     layer.sparse_mla_op = self._build_sparse_mla_op(layer)
