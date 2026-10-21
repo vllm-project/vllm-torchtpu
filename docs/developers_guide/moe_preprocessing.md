@@ -35,7 +35,12 @@ metadata communication plus scatter to SC0, using immutable core assignments.
 It adds control edges from activation submission to independent routing work,
 and places the two independent FP4 weight-scale layout copies between metadata
 submission and completion. It does not make routing depend on activation
-communication completion.
+communication completion. Before advancing activation submission, it orders
+preceding multi-SC offload completions (in the original computation order)
+before that submission unless already implied by dependencies. This prevents
+independent work that needs both SCs from straddling the split-SC region.
+Cycle checks still apply. This boundary can reduce overlap with unrelated SC
+work; it does not serialize activation communication with MoE routing/scatter.
 
 TorchTPU can drop outer `compute_on` scopes and placement options while retaining
 Pallas kernel names. The transformation recognizes both representations.
@@ -71,3 +76,29 @@ whole-layer benchmark, including routing and the shared MLP. They do not replace
 full vLLM serving validation through the production adapter. Decode CI provides
 that integration check. Revalidate final HLO, correctness and performance after
 changing runtime versions, shapes, physical topology, or compilation settings.
+
+### Full serving graph scheduling regression
+
+Decode CI build 5652 captured the complete failing graph: 6,967 entry
+instructions and 20 MoEs, using the compiler versions above. The original
+callback added 380 early-submission control edges. There were no scale-copy
+edges in this graph because the scale operands were parameters.
+
+Local PRE_SCHEDULER replay reproduced the CI scheduler failure exactly
+(5,391 of 6,967 instructions scheduled). Keeping only SC placement compiled
+successfully. The HLO dependency graph and initial scheduler graph were both
+acyclic; acyclicity alone did not establish schedulability with SC resources.
+An independent earlier `candidate_union_metadata_sc` offload used both SCs.
+Ordering its completion before activation submission allowed scheduling to
+finish without removing any early-submission edges. The production rule uses
+resource assignments, computation order and reachability, not this operator's
+name or a layer index. The resulting graph added one completion boundary and
+passed full backend AOT. Final HLO retained SC1 activation and SC0
+metadata/scatter for all 20 MoEs, with activation argument submission before
+metadata argument submission and scatter submission before activation completion.
+The captured 3,038- and 5,499-instruction graphs also passed scheduler replay.
+
+Full-graph AOT validates compilation and final ordering, not serving latency or
+numerical correctness. The additional SC completion boundary requires fresh
+decode CI and runtime profiling before claiming the whole-layer speedup above
+for serving.

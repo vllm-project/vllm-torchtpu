@@ -5,11 +5,9 @@ Graph-only protobuf fields follow openxla/xla's xla/service/hlo.proto.
 Unknown fields (including layouts and backend configs) round-trip unchanged.
 """
 
-import hashlib
 import heapq
 import json
 import threading
-from pathlib import Path
 from typing import Any
 
 from google.protobuf import descriptor_pb2, descriptor_pool, message_factory
@@ -196,6 +194,21 @@ def rewrite_moe_schedule(blob: bytes) -> bytes | None:
                 sequence.instruction_ids if sequence is not None else list(by_id)
             )
         }
+        # Order preceding multi-SC completions before advancing an AG.
+        # Independent offloads otherwise can straddle the split-SC submissions
+        # and stall libtpu's resource-aware scheduler in a full serving graph.
+        instruction_positions = {n: i for i, n in enumerate(by_id)}
+        multicore_done = []
+        for node in comp.instructions:
+            if node.opcode != "async-done" or len(node.operand_ids) != 1:
+                continue
+            start = by_id[node.operand_ids[0]]
+            if start.opcode != "async-start":
+                continue
+            config = json.loads(start.backend_config or "{}")
+            cores = config.get("sparse_core_config", {}).get("core_ids", [])
+            if len(cores) > 1:
+                multicore_done.append(node)
         priorities: dict[int, int] = {}
         comp_changed = False
 
@@ -242,9 +255,17 @@ def rewrite_moe_schedule(blob: bytes) -> bytes | None:
             for node, core_id in ((activation, 1), (metadata_start, 0), (scatter, 0)):
                 if node is not None and _pin_sparse_core(node, core_id):
                     comp_changed = changed = True
+            activation_deps = _ancestors(activation, by_id)
+            for done in multicore_done:
+                if (
+                    instruction_positions[done.id]
+                    < instruction_positions[activation.id]
+                    and done.id not in activation_deps
+                ):
+                    edge(done, activation)
+            activation_deps = _ancestors(activation, by_id)
             # Only this metadata producer's router nodes; prior layers and
             # activation input producers cannot be placed behind submission.
-            activation_deps = _ancestors(activation, by_id)
             for n in _ancestors(metadata_start, by_id):
                 node = by_id[n]
                 if (
@@ -273,16 +294,7 @@ def rewrite_moe_schedule(blob: bytes) -> bytes | None:
                     )
         if comp_changed:
             _sort(comp, sequence, priorities)
-    result = module.SerializeToString() if changed else None
-    # Temporary CI diagnosis: capture the actual full serving graph.
-    output = Path("/perf_eval_results")
-    if result is not None and output.is_dir():
-        output = output / "moe-hlo"
-        output.mkdir(exist_ok=True)
-        name = hashlib.sha256(blob).hexdigest()
-        (output / f"{name}.before.pb").write_bytes(blob)
-        (output / f"{name}.after.pb").write_bytes(result)
-    return result
+    return module.SerializeToString() if changed else None
 
 
 _install_lock = threading.Lock()
