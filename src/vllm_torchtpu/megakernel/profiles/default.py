@@ -22,9 +22,9 @@ refined at build time to fit the VMEM budget when `ExecSpec.tiles` is left
 `default_tiles` sizes for `chip` (default: TPU v7x, the only chip the
 megakernel is validated on) and never queries devices: profiles evaluate it at
 import time, before any JAX backend may be initialized. When unset tiles are
-fitted at build time, the budgets come from `chip_budget()`: the `ChipBudget`
-of the first JAX device's `device_kind`, or v7x for any kind not in
-`CHIP_BUDGETS` (including CPU interpret runs).
+fitted at build time, the budgets come from `chip_budget()`: `CHIP_BUDGETS[kind]`
+for a supported TPU, `MegakernelConfigError` for an unsupported TPU kind, or
+`DEFAULT_CHIP` for non-TPU kinds (including CPU interpret runs).
 """
 
 from __future__ import annotations
@@ -34,6 +34,7 @@ from dataclasses import dataclass
 
 import jax
 
+from ..errors import MegakernelConfigError
 from ..exec_spec import Tiles
 
 
@@ -59,13 +60,23 @@ def _first_device_kind() -> str:
 
 
 def chip_budget(device_kind: str | None = None) -> ChipBudget:
-    """Budget of `device_kind` (default: the first JAX device's), else v7x.
+    """Budget of `device_kind` (default: the first JAX device's).
 
+    Returns `CHIP_BUDGETS[kind]` if known; raises `MegakernelConfigError` if
+    `kind` is a TPU kind (`kind.startswith("TPU")`) not in `CHIP_BUDGETS`;
+    otherwise (CPU interpret or any non-TPU device) returns `DEFAULT_CHIP`.
     Without `device_kind` this initializes the JAX backend; call it only where
     the kernel is about to be built.
     """
     kind = _first_device_kind() if device_kind is None else device_kind
-    return CHIP_BUDGETS.get(kind, DEFAULT_CHIP)
+    if kind in CHIP_BUDGETS:
+        return CHIP_BUDGETS[kind]
+    if kind.startswith("TPU"):
+        supported = ", ".join(sorted(CHIP_BUDGETS))
+        raise MegakernelConfigError(
+            f"Unsupported TPU device_kind {kind!r}; supported TPU kinds: {supported}"
+        )
+    return DEFAULT_CHIP
 
 
 def default_tiles(

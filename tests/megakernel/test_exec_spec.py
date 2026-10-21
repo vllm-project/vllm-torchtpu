@@ -25,6 +25,7 @@ from pathlib import Path
 import pytest
 
 from vllm_torchtpu.megakernel import exec_spec
+from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.megakernel.profiles import default as default_profile
 from vllm_torchtpu.megakernel.profiles.default import (
@@ -123,6 +124,11 @@ class _OtherOptions:
     width: int = 128
 
 
+@dataclasses.dataclass
+class _MutableOptions:
+    width: int = 128
+
+
 def test_block_maps_check_entry_types():
     """`Tiles.blocks` takes only the block's registered `Tunables` class;
     `DebugOptions.blocks` any frozen dataclass, both canonical."""
@@ -138,6 +144,21 @@ def test_block_maps_check_entry_types():
     )
     with pytest.raises(TypeError, match="DebugOptions.blocks"):
         exec_spec.DebugOptions(blocks={_TEST_BLOCK: {"width": 256}})
+    # A mutable dataclass would make `ExecSpec` unhashable.
+    with pytest.raises(TypeError, match="frozen"):
+        exec_spec.DebugOptions(blocks={_TEST_BLOCK: _MutableOptions(width=256)})
+
+
+def test_tiles_reject_unregistered_block_names():
+    """A misspelled block name raises instead of leaving that block at defaults."""
+    typo = f"{_TEST_BLOCK}_typo"
+    with pytest.raises(KeyError, match="no tunables registered"):
+        Tiles(blocks={typo: _TestTunables(width=256)})
+    with pytest.raises(KeyError, match="no tunables registered"):
+        Tiles().with_blocks({typo: _TestTunables(width=256)})
+    t = Tiles(blocks={_TEST_BLOCK: _TestTunables(width=256)})
+    with pytest.raises(TypeError, match="_OtherOptions"):
+        t.block(_TEST_BLOCK, _OtherOptions)
 
 
 def test_default_tile_rule_is_model_agnostic():
@@ -156,9 +177,11 @@ def test_default_tile_rule_is_model_agnostic():
     assert default_tiles(8, chip=small).vmem_mib == 16
 
 
-def test_chip_budget_follows_device_kind_with_v7x_fallback(monkeypatch):
+def test_chip_budget_follows_device_kind_and_rejects_unsupported_tpu(monkeypatch):
     assert chip_budget("TPU7x") is TPU_V7X
-    assert chip_budget("TPU v5 lite") is DEFAULT_CHIP is TPU_V7X
+    with pytest.raises(MegakernelConfigError, match="TPU v5 lite.*TPU7x"):
+        chip_budget("TPU v5 lite")
+    assert chip_budget("cpu") is DEFAULT_CHIP
     assert chip_budget() is DEFAULT_CHIP  # CPU interpret runs: the v7x fallback
     small = ChipBudget(name="small", vmem_mib=16, smem_mib=1)
     monkeypatch.setitem(
