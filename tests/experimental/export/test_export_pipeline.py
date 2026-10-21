@@ -465,6 +465,7 @@ def test_universal_adapter_1d_and_2d_mrope_export_and_cli(tmp_path) -> None:
     assert wjson["mesh"] == {"mesh_shape": [1, 2], "axis_names": ["dp", "tp"]}
     assert wjson["lm_head.weight"]["sharding"] == ["tp", None]
     assert wjson["lm_head.weight"]["sources"][0]["path"] == "model.safetensors"
+    assert wjson["hf_checkpoint_path"] == os.path.abspath(hf_dir)
 
 
 def test_build_export_config_raises_block_size_to_fit_smem() -> None:

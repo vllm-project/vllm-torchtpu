@@ -441,6 +441,10 @@ def _emit_declarative_weight_json(
             "axis_names": ["dp", "tp"],
         }
     }
+    # Source paths are relative to the checkpoint; record where it lives so a
+    # runtime can find the safetensors files without being told.
+    if cfg.hf_checkpoint_dir and os.path.isdir(cfg.hf_checkpoint_dir):
+        weight_map["hf_checkpoint_path"] = os.path.abspath(cfg.hf_checkpoint_dir)
     for name, spec in params_map.items():
         slot_idx = weight_slots[name]
         shape_list = [int(d) for d in spec.shape]
