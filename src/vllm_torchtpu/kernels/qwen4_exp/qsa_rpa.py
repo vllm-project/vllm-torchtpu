@@ -230,47 +230,46 @@ def qsa_attention(
 
     count = decode_prefix(starts)
     capacity = len(starts) - 1
-
-    def split(_):
-        decode_lengths = jnp.where(jnp.arange(capacity) < count, lengths[:capacity], 0)
-        decoded, owner = rpa_attention(
-            query[:capacity],
-            gate[:capacity],
-            blocks[:capacity],
-            decode_lengths,
-            table[:capacity],
-            cache,
-            **options,
-        )
-        # Keep bucket shapes fixed while removing the decode prefix on device.
-        rows = jnp.arange(len(query))
-        ids = jnp.minimum(rows + count, len(query) - 1)
-        prefill_lengths = jnp.where(rows < starts[-1] - count, lengths[ids], 0)
-        prefilled, owner = _prefill_attention(
-            query[ids],
-            gate[ids],
-            blocks[ids],
-            prefill_lengths,
-            table[ids],
-            owner,
-            jnp.maximum(starts - count, 0),
-            **options,
-        )
-        output = jnp.where(
-            (rows < count)[:, None, None],
-            decoded[jnp.minimum(rows, capacity - 1)],
-            prefilled[jnp.maximum(rows - count, 0)],
-        )
-        return jnp.where((lengths > 0)[:, None, None], output, 0), owner
-
-    return jax.lax.cond(
-        (count > 0) & (count < starts[-1]),
-        split,
-        lambda _: _prefill_attention(
-            query, gate, blocks, lengths, table, cache, starts, **options
-        ),
-        None,
+    # Mixed steps run a decode prefix on RPA and the rest on prefill; other
+    # steps run every row on prefill. Pick the route by masking the inputs,
+    # not with lax.cond: a conditional that returns the cache makes XLA copy
+    # it, which for the unified pool is a second full pool in HBM. RPA then
+    # runs on every step, on zero-length rows when unused, and the cache
+    # threads through both kernels exactly once.
+    mixed = (count > 0) & (count < starts[-1])
+    prefix = jnp.where(mixed, count, 0)
+    decode_lengths = jnp.where(jnp.arange(capacity) < prefix, lengths[:capacity], 0)
+    decoded, cache = rpa_attention(
+        query[:capacity],
+        gate[:capacity],
+        blocks[:capacity],
+        decode_lengths,
+        table[:capacity],
+        cache,
+        **options,
     )
+    # Keep bucket shapes fixed while removing the decode prefix on device.
+    rows = jnp.arange(len(query))
+    ids = jnp.minimum(rows + prefix, len(query) - 1)
+    prefill_lengths = jnp.where(
+        mixed, jnp.where(rows < starts[-1] - prefix, lengths[ids], 0), lengths
+    )
+    prefilled, cache = _prefill_attention(
+        query[ids],
+        gate[ids],
+        blocks[ids],
+        prefill_lengths,
+        table[ids],
+        cache,
+        jnp.maximum(starts - prefix, 0),
+        **options,
+    )
+    output = jnp.where(
+        (rows < prefix)[:, None, None],
+        decoded[jnp.minimum(rows, capacity - 1)],
+        prefilled[jnp.maximum(rows - prefix, 0)],
+    )
+    return jnp.where((lengths > 0)[:, None, None], output, 0), cache
 
 
 def qsa_step(
