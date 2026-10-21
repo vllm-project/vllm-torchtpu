@@ -562,13 +562,19 @@ def test_prefill_only_mtp_follows_context_or_pipeline_parallelism(
 
 
 def test_only_the_last_pipeline_stage_hosts_a_drafter():
-    last = SimpleNamespace(speculative_config=_spec(), _pp_is_last=True)
-    middle = SimpleNamespace(speculative_config=_spec(), _pp_is_last=False)
+    spec = _spec()
+    # A non-DSv4 model: the static verify length stays None either way.
+    vllm_config = SimpleNamespace(speculative_config=spec, model_config=None)
+    last = SimpleNamespace(speculative_config=spec, _pp_is_last=True)
+    middle = SimpleNamespace(
+        speculative_config=spec, _pp_is_last=False, vllm_config=vllm_config
+    )
     assert TPUModelRunner._is_async_drafter.fget(last) is True
     assert TPUModelRunner._is_async_drafter.fget(middle) is False
 
     TPUModelRunner._init_speculative_decoding(middle)
     assert middle.drafter is None and middle.rejection_sampler is None
+    assert middle._static_verify_q_len is None
 
 
 def test_dp_idle_pairing_replays_the_draft_only_where_a_drafter_lives():
