@@ -482,7 +482,11 @@ def _emit_declarative_weight_json(
 def _emit_model_companion_files(
     cfg: api.TextOnlyLLMExportConfig, output_dir: str
 ) -> dict[str, Any]:
-    """Emits `config.json` and `tokenizer.json`; returns the `serving_config` block."""
+    """Copies companion files into the artifact and returns the `serving_config` block.
+
+    `config.json` is always written. `tokenizer.json` and `generation_config.json` are
+    copied when the checkpoint has them and declared in `serving_config` by path.
+    """
     src_config_copied = False
     if cfg.hf_checkpoint_dir and os.path.isdir(cfg.hf_checkpoint_dir):
         src_cfg = os.path.join(cfg.hf_checkpoint_dir, "config.json")
@@ -549,6 +553,13 @@ def _emit_model_companion_files(
         serving_config["tokenizer_config"] = {
             "source": {"TokenizerPath": {"path": "tokenizer.json"}}
         }
+
+    if cfg.hf_checkpoint_dir and os.path.isdir(cfg.hf_checkpoint_dir):
+        src_gen = os.path.join(cfg.hf_checkpoint_dir, "generation_config.json")
+        if os.path.isfile(src_gen):
+            dst_gen = os.path.join(output_dir, "generation_config.json")
+            shutil.copyfile(src_gen, dst_gen)
+            serving_config["generation_config"] = {"path": "generation_config.json"}
 
     return serving_config
 
