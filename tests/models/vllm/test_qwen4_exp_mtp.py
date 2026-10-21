@@ -427,3 +427,131 @@ def test_ngram_context_reads_device_verified_tokens():
         )
         assert merged[0].tolist() == expected
         assert merged[1].tolist() == [2, 3]  # no previous record: host value
+
+
+@pytest.mark.usefixtures("cpu_vllm_config")
+def test_draft_loads_every_checkpoint_mtp_tensor(monkeypatch):
+    """Real decoder layer/QSA/HC modules; only the MoE block is stubbed."""
+    from torch import nn
+    from vllm.config import CompilationMode
+
+    from tests.models.vllm.qwen4_exp_test_utils import q4exp_text_config
+    from vllm_torchtpu.models.vllm.qwen4_exp import model, mtp
+
+    text = q4exp_text_config(
+        hidden_size=16,
+        hc_count=4,
+        hc_lowrank=4,
+        vocab_size=32,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        head_dim=32,
+        indexer_n_heads=1,
+        indexer_head_dim=16,
+        num_hidden_layers=2,
+        layer_types=["linear_attention", "full_attention"],
+        mtp_num_hidden_layers=1,
+    )
+
+    class MoE(nn.Module):
+        def __init__(self, vllm_config, prefix):
+            super().__init__()
+            self.prefix = prefix
+
+    loaded_moe = []
+
+    class Loader:
+        def __init__(self, module):
+            self.module = module
+
+        def load_weights(self, weights, mapper):
+            names = [name for name, _ in weights]
+            loaded_moe.extend(f"{self.module.prefix}.{name}" for name in names)
+            return set()
+
+    monkeypatch.setattr(model, "Qwen3NextSparseMoeBlock", MoE)
+    monkeypatch.setattr(
+        model, "get_tp_group", lambda: NS(rank_in_group=0, world_size=1)
+    )
+    monkeypatch.setattr(mtp, "AutoWeightsLoader", Loader)
+    monkeypatch.setattr(mtp, "verify_moe_checkpoint", lambda *args: None)
+    monkeypatch.setattr(mtp, "VocabParallelEmbedding", nn.Embedding)
+    monkeypatch.setattr(mtp, "ParallelLMHead", lambda v, h, prefix: nn.Embedding(v, h))
+    monkeypatch.setattr(mtp, "LogitsProcessor", lambda vocab: nn.Identity())
+    for module in ("parameter", "layers.linear"):
+        for name, value in (
+            ("get_tensor_model_parallel_rank", 0),
+            ("get_tensor_model_parallel_world_size", 1),
+        ):
+            monkeypatch.setattr(
+                f"vllm.model_executor.{module}.{name}",
+                lambda value=value: value,
+                raising=False,
+            )
+    context = {}
+    cfg = NS(
+        model_config=NS(hf_text_config=text, max_model_len=256),
+        cache_config=NS(cache_dtype="auto"),
+        device_config=NS(device="cpu"),
+        compilation_config=NS(
+            mode=CompilationMode.NONE, static_forward_context=context
+        ),
+        additional_config={},
+        quant_config=NS(ignored_layers=["mtp.layers.0.mlp.gate"]),
+        speculative_config=spec_config(3),
+    )
+    monkeypatch.setattr(model, "use_unified_pool", lambda: True)
+    with torch.device("cpu"):
+        draft = mtp.Qwen4ExpMTP(vllm_config=cfg, prefix="")
+    attention = draft.model.layers[0].self_attn
+    assert context["mtp.layers.2.self_attn"] is attention
+    assert attention.prefix == "mtp.layers.2.self_attn"
+    assert draft.model.layers[0].ple is None
+    assert draft.model.layers[0].layer_type == "full_attention"
+
+    parameters = dict(draft.named_parameters())
+    qsa_shapes = {
+        "q_proj.weight": (2 * 4 * 32, 16),
+        "k_proj.weight": (32, 16),
+        "v_proj.weight": (32, 16),
+        "o_proj.weight": (16, 4 * 32),
+        "q_norm.weight": (32,),
+        "k_norm.weight": (32,),
+        "indexer.index_qk_proj.weight": (2 * 16, 16),
+        "indexer.q_layernorm.weight": (16,),
+        "indexer.k_layernorm.weight": (16,),
+    }
+
+    def tensor(name):
+        relative = name.removeprefix("mtp.layers.0.self_attn.")
+        if relative in qsa_shapes:
+            shape = qsa_shapes[relative]
+        elif ".mlp." in name:
+            shape = (1,)
+        else:
+            shape = parameters[mtp.mtp_checkpoint_name(name)].shape
+        return torch.randn(shape).to(torch.bfloat16)
+
+    checkpoint = [
+        ("model.language_model.embed_tokens.weight", torch.zeros(32, 16)),
+        ("lm_head.weight", torch.zeros(32, 16)),
+        ("model.language_model.layers.1.mlp.gate.weight", torch.zeros(1)),
+    ] + [(name, tensor(name)) for name in CHECKPOINT_MTP_TENSORS]
+    draft.load_weights(iter(checkpoint))
+    assert sorted(loaded_moe) == sorted(
+        "mtp.layers.2.mlp." + name.removeprefix("mtp.layers.0.mlp.")
+        for name in CHECKPOINT_MTP_TENSORS
+        if ".mlp." in name
+    )
+    torch.testing.assert_close(
+        draft.model.fc_hidden.weight,
+        dict(checkpoint)["mtp.fc_hidden.weight"],
+    )
+    with pytest.raises(ValueError, match="Incomplete Qwen4Exp MTP checkpoint"):
+        draft.load_weights(
+            iter(
+                (name, tensor(name))
+                for name in CHECKPOINT_MTP_TENSORS
+                if name != "mtp.pre_fc_norm_hidden.weight"
+            )
+        )

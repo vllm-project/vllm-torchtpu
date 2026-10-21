@@ -385,3 +385,71 @@ def test_qsa_block_sparse_matches_exact_mask_with_partial_tail_and_nan(
         rtol=0.05,
         atol=0.03,
     )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.parametrize("channels", [128, 10240])
+def test_pooled_ple_speculative_checkpoints(channels):
+    """Verify windows write one history per position; prefill rows write
+    their final history to checkpoint 0; idle rows and other pages are kept."""
+    from vllm_torchtpu.kernels.qwen4_exp.pool import (
+        pooled_short_conv_speculative,
+        speculative_history_windows,
+    )
+
+    rng = np.random.default_rng(49)
+    pool = jnp.zeros((16, 1664, 1, 2, 256), jnp.bfloat16)
+    # Row 0: verify window of 4 resuming from checkpoint 2 (block 4).
+    # Row 1: idle. Row 2: 5-token prefill without history.
+    ids = jnp.array([2, 0, 9], jnp.int32)
+    ckpt = jnp.array([[2, 3, 4, 5], [0, 0, 0, 0], [9, 10, 11, 12]], jnp.int32)
+    read_ids = jnp.array([4, 0, 9], jnp.int32)
+    windowed = jnp.array([True, False, False])
+    starts = jnp.array([0, 4, 4, 9], jnp.int32)
+    initial = jnp.array([True, False, False])
+    history = jnp.asarray(rng.normal(size=(3, 9, channels)), jnp.bfloat16)
+    pool = jax.jit(write_region, donate_argnums=(0,))(
+        pool, history.reshape(3, -1), read_ids
+    )
+    before = np.asarray(pool).view(np.uint8).copy()
+    x = jnp.asarray(rng.normal(size=(12, channels)), jnp.bfloat16)
+    weight = jnp.asarray(rng.normal(size=(channels, 4)), jnp.bfloat16)
+    resumed = history.at[2].set(0)
+    expected, final = short_conv(
+        x,
+        weight,
+        resumed,
+        starts,
+        jnp.array([0, -1, 2], jnp.int32),
+        initial,
+        dilation=3,
+    )
+    run = jax.jit(
+        pooled_short_conv_speculative,
+        donate_argnums=(2,),
+        static_argnames=("dilation", "state_len"),
+    )
+    pool, actual = run(
+        x,
+        weight,
+        pool,
+        starts,
+        ids,
+        initial,
+        read_ids,
+        ckpt,
+        windowed,
+        dilation=3,
+        state_len=9,
+    )
+    np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+    windows = speculative_history_windows(x, resumed, starts, initial, 4)
+    read = jax.jit(read_region, static_argnames=("elements", "dtype"))
+    restored = read(
+        pool, jnp.array([2, 3, 4, 5, 9]), elements=9 * channels, dtype=jnp.bfloat16
+    ).reshape(5, 9, channels)
+    np.testing.assert_array_equal(np.asarray(restored[:4]), np.asarray(windows[0]))
+    np.testing.assert_array_equal(np.asarray(restored[4]), np.asarray(final[2]))
+    after = np.asarray(pool).view(np.uint8)
+    untouched = [0, 1, 6, 7, 8, 10, 11, 12, 13, 14, 15]
+    np.testing.assert_array_equal(after[untouched], before[untouched])
