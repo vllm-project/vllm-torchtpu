@@ -8,6 +8,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
 from vllm_torchtpu.kernels.qwen4_exp.decode_indexer import decode_query_chunk_size
 from vllm_torchtpu.kernels.qwen4_exp.indexer_components import qsa_indexing
@@ -649,6 +650,67 @@ def write_compressed(
     return view.reshape(pool.shape)
 
 
+def _request_window(t0, size, starts, context):
+    """The requests owning flat tokens ``[t0, t0 + size)``, as a ragged batch.
+
+    Returns ``(ids, seq_lens, cu_q_lens, distribution)`` over ``size`` request
+    rows. Nonempty requests overlapping the window come first in token order;
+    each owns at least one window token, so ``size`` rows always suffice. A
+    request cut by the window keeps only its window tokens, and its sequence
+    length drops by the tokens cut from its end, so every kept token keeps
+    its absolute position. Filler rows are empty and never scheduled.
+    """
+    num_requests = len(context)
+    begins, ends = starts[:-1], starts[1:]
+    overlap = (ends > begins) & (begins < t0 + size) & (ends > t0)
+    (ids,) = jnp.nonzero(overlap, size=size, fill_value=num_requests)
+    real = ids < num_requests
+    ids = jnp.minimum(ids, num_requests - 1)
+    window_end = jnp.minimum(ends[ids], t0 + size)
+    hi = jnp.where(real, window_end - t0, 0)
+    hi = jnp.where(real, hi, jnp.max(hi))
+    cu_q_lens = jnp.concatenate([jnp.zeros((1,), jnp.int32), hi.astype(jnp.int32)])
+    seq_lens = jnp.where(real, context[ids] + window_end - begins[ids], 0)
+    num_decodes = decode_prefix(cu_q_lens)
+    num_seqs = jnp.sum(real.astype(jnp.int32))
+    distribution = jnp.stack([num_decodes, num_decodes, num_seqs]).astype(jnp.int32)
+    return ids, seq_lens.astype(jnp.int32), cu_q_lens, distribution
+
+
+def _select_shared_stream(query, starts, context, table, *, chunk_size, score):
+    """Decode/verify selection with one KV stream per request.
+
+    The per-token decode path scores every query token as its own one-token
+    sequence, so the K+1 verify tokens of a request each re-stream its whole
+    compressed-key history. Here every ``chunk_size``-token window is scored as
+    a ragged batch of its requests: one-token requests keep the batched decode
+    pass, longer ones share one stream per query block. ``score`` returns
+    ``[window, block_topk]`` selections for one window.
+    """
+    if len(query) <= chunk_size:
+        return score(
+            query, *_shared_stream_operands(0, len(query), starts, context, table)
+        )
+    padding = (-len(query)) % chunk_size
+    q = jnp.pad(query, ((0, padding),) + ((0, 0),) * (query.ndim - 1))
+    windows = q.reshape(-1, chunk_size, *q.shape[1:])
+    t0s = jnp.arange(len(windows), dtype=jnp.int32) * chunk_size
+
+    def window(carry, inputs):
+        q, t0 = inputs
+        return carry, score(
+            q, *_shared_stream_operands(t0, chunk_size, starts, context, table)
+        )
+
+    _, selected = jax.lax.scan(window, None, (windows, t0s))
+    return selected.reshape(-1, selected.shape[-1])[: len(query)]
+
+
+def _shared_stream_operands(t0, size, starts, context, table):
+    ids, seq_lens, cu_q_lens, distribution = _request_window(t0, size, starts, context)
+    return seq_lens, table[ids], cu_q_lens, distribution
+
+
 def select_blocks(
     query,
     pool,
@@ -748,6 +810,39 @@ def select_blocks(
 
     pages_per_query = table.shape[1] * logical_pages
     chunk_size = min(len(query), decode_query_chunk_size(pages_per_query))
+    query_block = envs.VLLM_TPU_QSA_DECODE_QUERY_BLOCK
+    if query_block:
+        kv_block = envs.VLLM_TPU_QSA_DECODE_KV_BLOCK
+        if kv_block < rows or kv_block % 128 or kv_block % rows:
+            raise ValueError(
+                "VLLM_TPU_QSA_DECODE_KV_BLOCK must be a positive multiple of 128 "
+                f"and of {rows} compressed keys per page, got {kv_block}"
+            )
+        return _select_shared_stream(
+            query,
+            starts,
+            context,
+            table,
+            chunk_size=chunk_size,
+            score=lambda q, seq_lens, pages, cu, distribution: streamindex_topk(
+                jnp.pad(q, ((0, 0), (0, 0), (0, width - q.shape[-1])))
+                if pool.dtype == jnp.bfloat16
+                else q,
+                jnp.full(q.shape[:2], q.shape[-1] ** -0.5, jnp.float32),
+                cache,
+                seq_lens,
+                expand_pages(pages),
+                cu,
+                distribution,
+                k=block_topk,
+                compression_ratio=ratio,
+                num_kv_pages_per_block=(256 // rows,) + (kv_block // rows,) * 2,
+                num_queries_per_block=(1, query_block, query_block),
+                decode_req_batch_size=8 if len(q) >= 8 else 4,
+                enable_early_exit=True,
+                components=qsa_indexing(ratio - 1, per_token_scores=True),
+            ),
+        )
     if len(query) <= chunk_size:
         return select_chunk(query, lengths, table[req])
 

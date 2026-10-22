@@ -58,7 +58,12 @@ class QSAIndexSchedule:
             raise ValueError("causal position offset must be in [0, compression_ratio)")
 
     def positions(self, positions: jax.Array) -> jax.Array:
-        return positions - self.causal_position_offset
+        # StreamIndex now counts only the groups complete at a position,
+        # (pos + 1) // ratio (#2457). That is exactly what the offset of
+        # ratio - 1 produced on the old pos // ratio + 1 rule, so the offset is
+        # validated but no longer applied; applying it would hide one more
+        # complete group from every prefill row.
+        return positions
 
     def visible_lengths(self, lengths: jax.Array) -> jax.Array:
         return jnp.maximum(lengths, 0)
@@ -77,7 +82,9 @@ class QSAIndexSchedule:
         )
 
 
-def qsa_indexing(causal_position_offset: int = 0) -> StreamIndexComponents:
+def qsa_indexing(
+    causal_position_offset: int = 0, per_token_scores: bool = False
+) -> StreamIndexComponents:
     return StreamIndexComponents(
-        BF16KeyReader(), QSAIndexSchedule(causal_position_offset)
+        BF16KeyReader(), QSAIndexSchedule(causal_position_offset), per_token_scores
     )
