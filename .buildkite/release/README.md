@@ -17,7 +17,8 @@ branch, or committed to the branch directly for one-off debugging.
 ## Cut a release
 
 1. Get a full CI run of the release commit: a **vllm-torchtpu-ci** build of
-   `releases/vX.Y.Z` with `NIGHTLY=1`. It has to pass; the release checks.
+   `releases/vX.Y.Z` with `NIGHTLY=1` (or a PR with the `run-full-ci` label).
+   It has to pass; the release checks.
 2. Start a **New Build** of **vllm-torchtpu-release** on `releases/vX.Y.Z`, at
    that commit. For a pre-release set `RELEASE_VERSION=vX.Y.Zrc1`.
 3. The build then, without anyone's help:
