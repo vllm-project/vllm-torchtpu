@@ -37,11 +37,27 @@ from vllm.distributed.device_communicators.base_device_communicator import (
 )
 from vllm.distributed.parallel_state import get_dp_group, get_ep_group, get_tp_group
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.adapter import sequence_parallel, small_all_reduce_op
 
 
 class TpuNullAll2AllManager(All2AllManagerBase):
     """Probe-only stub; TPU EP dispatch/combine never goes through it."""
+
+
+def _packs_router_gather(
+    hidden_states: torch.Tensor, router_logits: torch.Tensor
+) -> bool:
+    """Whether a replicated DP dispatch gathers hidden rows and router logits
+    as one packed all-gather (TPU_DP_PACKED_ROUTER_GATHER, same dtype, 2D,
+    same rows)."""
+    return (
+        envs.TPU_DP_PACKED_ROUTER_GATHER
+        and hidden_states.dtype == router_logits.dtype
+        and hidden_states.dim() == 2
+        and router_logits.dim() == 2
+        and hidden_states.shape[0] == router_logits.shape[0]
+    )
 
 
 class TpuDeviceCommunicator(DeviceCommunicatorBase):
@@ -86,6 +102,15 @@ class TpuDeviceCommunicator(DeviceCommunicatorBase):
             dp_group = self._replicated_dp_group(is_sequence_parallel)
             if dp_group is None:
                 return hidden_states, router_logits
+            if _packs_router_gather(hidden_states, router_logits):
+                # One DP all-gather instead of two (each is latency-bound at
+                # decode sizes): pack the logits after the hidden columns and
+                # split the gathered rows. The values are unchanged.
+                width = hidden_states.shape[-1]
+                packed = dp_group.all_gather(
+                    torch.cat([hidden_states, router_logits], dim=-1), dim=0
+                )
+                return packed[:, :width], packed[:, width:]
             hidden_states = dp_group.all_gather(hidden_states, dim=0)
             router_logits = dp_group.all_gather(router_logits, dim=0)
             return hidden_states, router_logits
