@@ -674,6 +674,20 @@ def _default_pre_mix(residual: torch.Tensor, dtype: torch.dtype) -> torch.Tensor
     return torch.zeros_like(residual[:, :, 0], dtype=dtype) + first_stream
 
 
+def _quantized_value(value, moe_fp8):
+    if not moe_fp8:
+        return ()
+    amax = value.float().abs().amax(dim=-1, keepdim=True)
+    scale = amax / 448.0
+    usable = torch.isfinite(scale) & (scale > 0)
+    scale = torch.where(usable, scale, 0.0)
+    reciprocal = torch.where(usable, 1.0 / torch.where(usable, scale, 1.0), 0.0).to(
+        value.dtype
+    )
+    quantized = torch.where(usable, value * reciprocal, 0.0)
+    return quantized.to(torch.float8_e4m3fn), scale
+
+
 def pre(
     residual,
     fn,
@@ -688,6 +702,8 @@ def pre(
     x=None,
     norm_weight=None,
     norm_eps=1e-6,
+    *,
+    moe_fp8=False,
 ):
     if residual.device.type == "tpu":
         if pre_mix is None:
@@ -721,7 +737,8 @@ def pre(
         )
     if norm_weight is not None:
         value = rms_norm(value, norm_weight, norm_eps)
-    return post, comb, value, next_pre
+    quantized = _quantized_value(value, moe_fp8)
+    return post, comb, value, next_pre, *quantized
 
 
 def shifted_post_pre(
@@ -745,6 +762,7 @@ def shifted_post_pre(
     stream=None,
     reduce_results=False,
     fuse_rms: bool = False,
+    moe_fp8: bool = False,
 ):
     if stream is not None:
         raise ValueError("TPU mHC does not use CUDA streams")
@@ -755,7 +773,7 @@ def shifted_post_pre(
             pre_mix = _default_pre_mix(residual, hc_scale.dtype)
         if fuse_rms and norm_weight is not None:
             op = get_shifted_post_pre_rms_op()
-            flat_new, post_mix, comb_mix, value, next_pre = op(
+            outputs = op(
                 x,
                 residual.flatten(1),
                 post_layer_mix,
@@ -771,7 +789,9 @@ def shifted_post_pre(
                 hc_post_mult_value,
                 sinkhorn_repeat,
                 norm_eps,
+                moe_fp8,
             )
+            flat_new, post_mix, comb_mix, value, next_pre, *quantized = outputs
             residual = flat_new.view_as(residual)
         else:
             residual, post_mix, comb_mix, value, next_pre = delayed_post_pre(
@@ -791,25 +811,24 @@ def shifted_post_pre(
             )
             if norm_weight is not None:
                 value = rms_norm(value, norm_weight, norm_eps)
+            quantized = _quantized_value(value, moe_fp8)
         aux = residual.mean(1) if capture_aux else x.new_empty(0, x.shape[-1])
-        return residual, post_mix, comb_mix, value, next_pre, aux
+        return residual, post_mix, comb_mix, value, next_pre, aux, *quantized
     residual = post(x, residual, post_layer_mix, comb_res_mix)
     aux = residual.mean(1) if capture_aux else x.new_empty(0, x.shape[-1])
-    return (
+    post_mix, comb_mix, value, next_pre, *quantized = pre(
         residual,
-        *pre(
-            residual,
-            fn,
-            hc_scale,
-            hc_base,
-            rms_eps,
-            hc_pre_eps,
-            hc_sinkhorn_eps,
-            hc_post_mult_value,
-            sinkhorn_repeat,
-            pre_mix=pre_mix,
-            norm_weight=norm_weight,
-            norm_eps=norm_eps,
-        ),
-        aux,
+        fn,
+        hc_scale,
+        hc_base,
+        rms_eps,
+        hc_pre_eps,
+        hc_sinkhorn_eps,
+        hc_post_mult_value,
+        sinkhorn_repeat,
+        pre_mix=pre_mix,
+        norm_weight=norm_weight,
+        norm_eps=norm_eps,
+        moe_fp8=moe_fp8,
     )
+    return residual, post_mix, comb_mix, value, next_pre, aux, *quantized

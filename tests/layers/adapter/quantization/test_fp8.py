@@ -25,11 +25,18 @@ Run on TPU (when available):
     pytest tests/layers/adapter/quantization/test_fp8.py -v --use-tpu
 """
 
+import jax
 import jax.numpy as jnp
+import numpy as np
 import pytest
 import torch
 
-from vllm_torchtpu.layers.adapter.linear_common import _quantized_matmul_jax
+from vllm_torchtpu.layers.adapter.linear_common import (
+    KEEP_VLLM_LAYOUT_ATTR,
+    _quantized_matmul_jax,
+    _quantized_matmul_prequantized_jax,
+    quantized_matmul_prequantized,
+)
 from vllm_torchtpu.layers.adapter.quantization.fp8 import (
     VllmFp8Config,
     VllmFp8LinearMethodTPU,
@@ -117,9 +124,8 @@ def test_fp8_routed_experts_checkpoint_allocation(
         enable_eplb=False,
     )
     monkeypatch.setattr(
-        "vllm.model_executor.layers.quantization.fp8."
-        "get_tensor_model_parallel_world_size",
-        lambda: 2,
+        "vllm.distributed.parallel_state.get_tp_group",
+        lambda: SimpleNamespace(world_size=2, rank_in_group=1),
     )
     quant_cls = VllmFp8Config
     if deepseek_v4:
@@ -537,6 +543,172 @@ class TestFp8LinearRuntimeQuant:
 
         with pytest.raises(ValueError, match="divisible by block scale count"):
             _quantized_matmul_jax(x, w_q, w_scale)
+
+
+class TestFp8PrequantizedLinear:
+    @pytest.mark.cpu_test
+    @pytest.mark.parametrize("output_dtype", [jnp.bfloat16, jnp.float16, jnp.float32])
+    def test_jax_consumes_fp8_operands_and_row_scales(self, output_dtype):
+        x_q = jnp.asarray(
+            [[0, 0, 0, 0], [1, -2, 3, 4], [4, 3, -2, 1], [1, 2, 4, -3]],
+            dtype=jnp.float8_e4m3fn,
+        )
+        x_scale = jnp.asarray([[1], [0], [0.125], [2]], dtype=jnp.float32)
+        w_q = jnp.asarray(
+            [[1, 2, -1], [2, -1, 3], [4, 1, 2], [-2, 3, 1]],
+            dtype=jnp.float8_e4m3fn,
+        )
+        w_scale = jnp.asarray([0.5, 2, 0.25], dtype=jnp.float32)
+
+        def apply(x, xs, w, ws):
+            return _quantized_matmul_prequantized_jax(
+                x, xs, w, ws, output_dtype=output_dtype
+            )
+
+        actual = jax.jit(apply)(x_q, x_scale, w_q, w_scale)
+        expected = (
+            (x_q.astype(jnp.float32) @ w_q.astype(jnp.float32))
+            * x_scale
+            * w_scale[None, :]
+        ).astype(output_dtype)
+        assert actual.dtype == output_dtype
+        np.testing.assert_array_equal(
+            actual.astype(jnp.float32), expected.astype(jnp.float32)
+        )
+        # Both the all-zero activation row and the zero-scale row stay zero.
+        np.testing.assert_array_equal(actual[:2].astype(jnp.float32), np.zeros((2, 3)))
+
+    @pytest.mark.cpu_test
+    @pytest.mark.parametrize(
+        "output_dtype", [torch.bfloat16, torch.float16, torch.float32]
+    )
+    def test_fake_preserves_original_output_dtype(self, output_dtype):
+        from torch._subclasses.fake_tensor import FakeTensorMode
+
+        with FakeTensorMode():
+            actual = quantized_matmul_prequantized(
+                torch.empty(2, 3, 4, dtype=torch.float8_e4m3fn),
+                torch.empty(2, 3, 1, dtype=torch.float32),
+                torch.empty(4, 5, dtype=torch.float8_e4m3fn),
+                torch.empty(5, dtype=torch.float32),
+                output_dtype=output_dtype,
+            )
+        assert actual.shape == (2, 3, 5)
+        assert actual.dtype == output_dtype
+
+    @pytest.mark.cpu_test
+    @pytest.mark.parametrize(
+        "argument,shape,dtype,message",
+        [
+            ("x_q", (), torch.float8_e4m3fn, "Expected activations"),
+            ("x_q", (2, 5), torch.float8_e4m3fn, "hidden dim"),
+            ("x_q", (2, 4), torch.bfloat16, "float8_e4m3fn"),
+            ("x_scale", (2,), torch.float32, "Activation scales"),
+            ("x_scale", (1, 1), torch.float32, "Activation scales"),
+            ("x_scale", (2, 4), torch.float32, "Activation scales"),
+            ("x_scale", (2, 1), torch.bfloat16, "float32"),
+            ("w_q", (1, 4, 3), torch.float8_e4m3fn, "Expected activations"),
+            ("w_q", (4, 3), torch.int8, "float8_e4m3fn"),
+            ("w_scale", (1, 1, 1, 3), torch.float32, "Weight scales"),
+            ("w_scale", (2,), torch.float32, "Weight scales"),
+            ("w_scale", (3,), torch.bfloat16, "float32"),
+        ],
+    )
+    def test_rejects_incompatible_input(self, argument, shape, dtype, message):
+        args = {
+            "x_q": torch.empty(2, 4, dtype=torch.float8_e4m3fn),
+            "x_scale": torch.empty(2, 1, dtype=torch.float32),
+            "w_q": torch.empty(4, 3, dtype=torch.float8_e4m3fn),
+            "w_scale": torch.empty(3, dtype=torch.float32),
+        }
+        args[argument] = torch.empty(shape, dtype=dtype)
+        with pytest.raises(ValueError, match=message):
+            quantized_matmul_prequantized(**args, output_dtype=torch.bfloat16)
+
+    @pytest.mark.cpu_test
+    def test_rejects_fp8_output_dtype(self):
+        with pytest.raises(ValueError, match="output_dtype"):
+            quantized_matmul_prequantized(
+                torch.empty(2, 4, dtype=torch.float8_e4m3fn),
+                torch.empty(2, 1),
+                torch.empty(4, 3, dtype=torch.float8_e4m3fn),
+                torch.empty(3),
+                output_dtype=torch.float8_e4m3fn,
+            )
+
+    @pytest.mark.cpu_test
+    @pytest.mark.parametrize("keep_layout", [False, True])
+    @pytest.mark.parametrize(
+        "weight_dtype,scale_shape,scale_dtype,supported",
+        [
+            (torch.float8_e4m3fn, (3,), torch.float32, True),
+            (torch.float8_e4m3fn, (1, 1, 1, 3), torch.float32, False),
+            (torch.float8_e4m3fn, (4,), torch.float32, False),
+            (torch.float8_e4m3fn, (3,), torch.bfloat16, False),
+            (torch.int8, (3,), torch.float32, False),
+            (torch.float8_e5m2, (3,), torch.float32, False),
+        ],
+    )
+    def test_capability_checks_runtime_format(
+        self, keep_layout, weight_dtype, scale_shape, scale_dtype, supported
+    ):
+        layer = torch.nn.Module()
+        layer.weight = torch.nn.Parameter(
+            torch.empty((3, 4) if keep_layout else (4, 3), dtype=weight_dtype),
+            requires_grad=False,
+        )
+        layer.weight_scale = torch.nn.Parameter(
+            torch.empty(scale_shape, dtype=scale_dtype), requires_grad=False
+        )
+        setattr(layer, KEEP_VLLM_LAYOUT_ATTR, keep_layout)
+        method = VllmFp8LinearMethodTPU(FakeQuant(weight_block_size=None))
+        assert method.supports_prequantized_input(layer) is supported
+        if not supported:
+            with pytest.raises(ValueError, match="per-output-channel"):
+                method.apply_prequantized(
+                    layer,
+                    torch.empty(2, 4, dtype=torch.float8_e4m3fn),
+                    torch.empty(2, 1),
+                    output_dtype=torch.bfloat16,
+                )
+
+    @pytest.mark.parametrize("keep_layout", [False, True])
+    @pytest.mark.parametrize("with_bias", [False, True])
+    @pytest.mark.parametrize(
+        "output_dtype", [torch.bfloat16, torch.float16, torch.float32]
+    )
+    def test_apply_prequantized(self, device, keep_layout, with_bias, output_dtype):
+        if device.type != "tpu":
+            pytest.skip("Pallas quantized matmul bridge requires TPU.")
+        x = (torch.arange(4 * 128).reshape(2, 2, 128) % 7 - 3).float()
+        x[0, 0] = 0
+        weight = (torch.arange(128 * 64).reshape(128, 64) % 5 - 2).float()
+        x_scale = torch.tensor([1, 0, 0.125, 2]).reshape(2, 2, 1)
+        w_scale = (torch.arange(64) % 4 + 1).float() / 4
+        bias = torch.arange(64).to(output_dtype) / 8 if with_bias else None
+        expected = ((x @ weight) * x_scale * w_scale).to(output_dtype)
+        if bias is not None:
+            expected = expected + bias
+
+        layer = torch.nn.Module()
+        stored_weight = weight.T.contiguous() if keep_layout else weight
+        layer.weight = torch.nn.Parameter(
+            stored_weight.to(device=device, dtype=torch.float8_e4m3fn),
+            requires_grad=False,
+        )
+        layer.weight_scale = torch.nn.Parameter(w_scale.to(device), requires_grad=False)
+        setattr(layer, KEEP_VLLM_LAYOUT_ATTR, keep_layout)
+        method = VllmFp8LinearMethodTPU(FakeQuant(weight_block_size=None))
+        actual = method.apply_prequantized(
+            layer,
+            x.to(device=device, dtype=torch.float8_e4m3fn),
+            x_scale.to(device),
+            output_dtype=output_dtype,
+            bias=bias.to(device) if bias is not None else None,
+        )
+        assert actual.shape == (2, 2, 64)
+        assert actual.dtype == output_dtype
+        torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
 
 
 class TestFp8WeightTranspose:

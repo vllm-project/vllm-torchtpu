@@ -15,13 +15,14 @@
 
 Every refusal in `prebuild_fused_moe_ep` is a claim that a configuration would
 be served WRONG rather than merely slowly, so each one needs a test that says
-it still refuses. None of this needs a TPU: the refusals are decided before any
-op is built, and the one path that does build stops at `_build_op`.
+it still refuses. No TPU is needed: admission uses distributed lookup stubs,
+and the padding regressions run the real kernel's host-side build.
 """
 
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -86,11 +87,17 @@ def _prebuild(
     """Call prebuild with the distributed lookups stubbed out.
 
     `build_ep_mesh` does an `all_gather_object` over the EP group, so it is
-    replaced by a two-way mesh stub. Everything under test decides before the
-    op would be built, and `_build_op` is stubbed so the one accepting case
-    does not need a device.
+    replaced by a two-way mesh stub. By default `_build_op` is also stubbed;
+    tests can pass the real builder to exercise its closures without registering
+    a torch op.
     """
-    mesh = SimpleNamespace(shape={bridge.EP_AXIS_NAME: _STUB_EP}) if has_mesh else None
+    mesh = (
+        SimpleNamespace(
+            shape={bridge.EP_AXIS_NAME: _STUB_EP}, axis_names=(bridge.EP_AXIS_NAME,)
+        )
+        if has_mesh
+        else None
+    )
     build_op = build_op or (lambda *_args, **_kwargs: "op")
     with (
         patch.object(bridge, "build_ep_mesh", return_value=mesh),
@@ -145,25 +152,17 @@ def test_native_replica_groups_reach_prebuilt_op():
         ("sqrtsoftplus", True, 0.75),
     ],
 )
-def test_replica_groups_are_part_of_op_cache_and_kernel_call(
+def test_routing_and_activation_contracts_separate_op_cache(
     monkeypatch, sharded_plan, scoring_fn, has_bias, scale
 ):
     from unittest.mock import Mock
 
-    from vllm_torchtpu.kernels.fused_moe import v2
-
     monkeypatch.setattr(bridge, "_OPS", {})
-    closures = []
 
     def build(name, fn, **kwargs):
-        closures.append(fn)
         return Mock()
 
-    # This branch builds the fused EP op with Torchtpu's native
-    # jax_op; the local shim it used to go through is gone.
     monkeypatch.setattr(bridge, "jax_op", build)
-    kernel = Mock(side_effect=lambda x, *args, **kwargs: x)
-    monkeypatch.setattr(v2, "fused_ep_moe_v2", kernel)
     groups = ((0, 1),)
     args = (None, 2, True, "silu", None, sharded_plan)
     options = dict(
@@ -180,33 +179,10 @@ def test_replica_groups_are_part_of_op_cache_and_kernel_call(
         dict(scoring_fn="sigmoid" if scoring_fn == "softmax" else "softmax"),
         dict(has_score_bias=not has_bias),
         dict(routed_scaling_factor=scale + 1.0),
+        dict(logical_intermediate_size=256),
+        dict(prequantized=True),
     ):
         assert bridge._build_op(*args, **(options | changed)) is not replicated
-    assert len(closures) == 5
-    x = jnp.ones((8, 8), dtype=jnp.bfloat16)
-    bias = jnp.arange(4, dtype=jnp.bfloat16)
-    operands = (
-        x,
-        None,
-        None,
-        None,
-        None,
-        jnp.zeros((8, 4)),
-        jnp.zeros((1, 1), dtype=jnp.int32),
-    )
-    if has_bias:
-        operands += (bias,)
-    assert closures[0](*operands) is x
-    forwarded = kernel.call_args.kwargs
-    assert forwarded["token_replica_groups"] == groups
-    assert forwarded["scoring_fn"] == scoring_fn
-    assert forwarded["routed_scaling_factor"] == scale
-    assert forwarded["sharded_plan"] is sharded_plan
-    if has_bias:
-        np.testing.assert_array_equal(forwarded["score_bias"], bias)
-        assert forwarded["score_bias"].dtype == jnp.float32
-    else:
-        assert "score_bias" not in forwarded
 
 
 def test_sharded_plan_flag_reaches_the_built_op():
@@ -579,6 +555,124 @@ def _fp4_layer(block=512, hidden=512, inter=512):
     layer.w2_weight_scale = torch.ones(1, inter // block, 1, hidden)
     del layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
     return layer
+
+
+@pytest.mark.parametrize("routing", ["topk", "score_bias", "hash"])
+@pytest.mark.parametrize("logical_inter", [256, 128], ids=["padded", "invalid-padding"])
+def test_prebuilt_activation_variants_share_real_padding_plan(
+    monkeypatch, routing, logical_inter
+):
+    """Run both closures through real layer validation and kernel planning.
+
+    Only torch registration, distributed discovery and the TPU device record
+    are replaced. Stop after the host build, before any TPU execution: the
+    padded case must reuse the actual padded kernel, not the full-width one,
+    and both activation variants must reject an unaligned logical width.
+    """
+    from vllm_torchtpu.kernels.fused_moe.v2 import host, kernel
+    from vllm_torchtpu.kernels.fused_moe.v2 import layer as kernel_layer
+
+    monkeypatch.setattr(bridge, "_OPS", {})
+    monkeypatch.setattr(bridge, "_PREQUANTIZED_OPS", {})
+    monkeypatch.setattr(kernel, "_BUILD_CACHE", {})
+    chip = SimpleNamespace(
+        num_lanes=128,
+        generation=host.MIN_GENERATION,
+        vmem_capacity_bytes=128 * 2**20,
+        get_sublane_tiling=lambda dtype: 32 // jnp.dtype(dtype).itemsize,
+    )
+    monkeypatch.setattr(host.pltpu, "get_tpu_info", lambda: chip)
+
+    def register(_name, fn, **_kwargs):
+        fn.register_fake = lambda _fake: None
+        return fn
+
+    monkeypatch.setattr(bridge, "jax_op", register)
+    layer = _fp4_layer()
+    layer.scoring_func = "sqrtsoftplus"
+    layer.routed_scaling_factor = 2.5
+    extra = ()
+    if routing == "score_bias":
+        layer.e_score_correction_bias = torch.zeros(2)
+        extra = (jnp.zeros(2, dtype=jnp.bfloat16),)
+    elif routing == "hash":
+        layer.hash_indices_table = torch.tensor([[0, 1]], dtype=torch.int32)
+        extra = (jnp.zeros((512, 2), dtype=jnp.int32),)
+
+    options = dict(
+        weight_format="fp4",
+        rhs_qb=512,
+        supplies_hash_ids=routing == "hash",
+        logical_intermediate_size=logical_inter,
+        policy=bridge.FusedEPPolicy.REQUIRED,
+        replica_groups=((0, 1),),
+        ep_order=(1, 0),
+        build_op=bridge._build_op,
+    )
+    op = _prebuild(layer, **options)
+    assert op is not None
+    prequantized = bridge._PREQUANTIZED_OPS[op]
+    assert prequantized is not op
+    assert _prebuild(layer, **options) is op
+    assert bridge._PREQUANTIZED_OPS[op] is prequantized
+
+    expected = None
+    if logical_inter == 256:
+        # TP2 divides each rank's 256 rows into 128 owned rows, so the
+        # real layer plans for 256 rows over EP2, not all 512 input rows.
+        plan = dict(
+            g_local=1,
+            capacity=128,
+            hidden=512,
+            inter=512,
+            ep=2,
+            ragged_rows_alloc=host.ragged_stride_bound(256, 2, 2, 128),
+            weight_format=host.WeightFormat.FP4,
+            rhs_qb=512,
+            act_fn="silu",
+            has_w1_bias=False,
+            has_w2_bias=False,
+            pad_scale_rows=False,
+        )
+        expected = kernel.build_fused_ep_moe_kernel(
+            **plan, logical_intermediate_size=256
+        )
+        assert (
+            kernel.build_fused_ep_moe_kernel(**plan, logical_intermediate_size=None)
+            is not expected
+        )
+
+    class HostPlanBuilt(Exception):
+        pass
+
+    def stop_after_host_build(**kwargs):
+        built = kernel.build_fused_ep_moe_kernel(**kwargs)
+        raise HostPlanBuilt(built)
+
+    monkeypatch.setattr(
+        kernel_layer, "build_fused_ep_moe_kernel", stop_after_host_build
+    )
+    operands = (
+        jax.ShapeDtypeStruct((512, 512), jnp.bfloat16),
+        jax.ShapeDtypeStruct((2, 512, 1024), jnp.float4_e2m1fn),
+        jax.ShapeDtypeStruct((2, 512, 512), jnp.float4_e2m1fn),
+        jax.ShapeDtypeStruct((2, 1, 1024), jnp.float32),
+        jax.ShapeDtypeStruct((2, 1, 512), jnp.float32),
+        jnp.zeros((512, 2), dtype=jnp.bfloat16),
+        jax.ShapeDtypeStruct((2, 1), jnp.int32),
+    ) + extra
+    quantized = (
+        jax.ShapeDtypeStruct((512, 512), jnp.float8_e4m3fn),
+        jax.ShapeDtypeStruct((512, 1), jnp.float32),
+    )
+    for variant, args in ((op, operands), (prequantized, operands + quantized)):
+        if expected is None:
+            with pytest.raises(ValueError, match="positive 256-aligned logical size"):
+                variant(*args)
+        else:
+            with pytest.raises(HostPlanBuilt) as built:
+                variant(*args)
+            assert built.value.args[0] is expected
 
 
 @pytest.mark.parametrize("setting,enabled", [(None, False), ("0", False), ("1", True)])
@@ -1079,23 +1173,14 @@ def test_pcp_size_reads_the_layer_parallel_config():
 
 
 def test_explicit_policy_ignores_legacy_enable_and_token_threshold():
-    observed = []
-
-    def build(*args, **kwargs):
-        observed.append(args[_SHARDED_PLAN_ARG])
-        return "op"
-
     with patch.object(envs, "USE_MOE_FUSED_EP_KERNEL", False):
-        assert (
-            _prebuild(
-                _layer(),
-                node_tokens=1,
-                build_op=build,
-                policy=bridge.FusedEPPolicy.REQUIRED,
-            )
-            == "op"
+        op = _prebuild(
+            _layer(),
+            node_tokens=1,
+            policy=bridge.FusedEPPolicy.REQUIRED,
         )
-    assert observed == [True]
+    owner = SimpleNamespace(**{bridge.FUSED_MOE_EP_OP_ATTR: op})
+    assert bridge.fused_moe_ep_supported(owner)
 
 
 def test_explicit_policy_keeps_hardware_and_placement_checks():

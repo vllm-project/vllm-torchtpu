@@ -3,7 +3,6 @@
 """Upstream V4.1 model assembly with TPU device operations."""
 
 from dataclasses import replace
-from functools import partial
 from itertools import islice
 from typing import cast
 
@@ -49,7 +48,7 @@ from .host_engram import (
     gather_host_engram_hashes,
     install_host_engram_inputs,
 )
-from .ops import bind_device_ops, compact_rope_caches, device_hooks
+from .ops import compact_rope_caches, device_hooks
 
 logger = init_logger(__name__)
 
@@ -99,6 +98,10 @@ def _mean_hc_streams(hidden_states: torch.Tensor) -> torch.Tensor:
 
 
 class DeepseekV41DecoderLayer(upstream.DeepseekV4DecoderLayer):
+    # Device hooks construct the TPU subclasses during upstream assembly.
+    attn: DeepseekV41Attention  # pyrefly: ignore[bad-override-mutable-attribute]
+    ffn: DeepseekV41MoE  # pyrefly: ignore[bad-override-mutable-attribute]
+
     def __init__(self, vllm_config, prefix: str = "", **kwargs) -> None:
         layer_idx = upstream.extract_layer_index(prefix)
         ced_enabled, ced_boundary = _ced_config(vllm_config)
@@ -112,13 +115,142 @@ class DeepseekV41DecoderLayer(upstream.DeepseekV4DecoderLayer):
                 getattr(self, "use_sequence_parallel", False)
             )
 
-    forward = bind_device_ops(
-        upstream.DeepseekV4DecoderLayer.forward,
-        mhc_pre_delayed_tilelang=pre,
-        mhc_post_tilelang=post,
-        mhc_shifted_post_pre=partial(shifted_post_pre, fuse_rms=True),
-        sp_all_gather=lambda x: x,
-    )
+    # Adapted from vLLM v0.31.1rc0 DeepseekV4DecoderLayer.forward: upstream's
+    # six-result mHC / BF16-only FFN seam cannot carry explicit FP8 operands.
+    # Keep delayed pre-mix, Engram and aux ordering; TPU attention owns its SP
+    # gather and TPU has no CUDA mHC overlap stream. The FFN boundary adds
+    # exactly q/scale to the six-result contract only when moe_fp8 is enabled.
+    def forward(
+        self,
+        x,
+        positions,
+        input_ids,
+        pre_mix=None,
+        post_mix=None,
+        res_mix=None,
+        residual=None,
+        engram_hashes=None,
+        engram_mask=None,
+        *,
+        capture_previous_aux=False,
+        mega_gate_metadata=None,
+    ):
+        previous_aux = None
+        if residual is None:
+            broadcast = x.dim() == 2
+            if broadcast:
+                assert self.hc_attn_fn_broadcast is not None
+                residual = x.unsqueeze(1).expand(-1, self.hc_mult, -1).contiguous()
+            else:
+                residual = x
+            outputs = pre(
+                residual,
+                self.hc_attn_fn_broadcast if broadcast else self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.hc_eps,
+                self.hc_post_alpha,
+                self.hc_sinkhorn_iters,
+                pre_mix=None if broadcast else pre_mix,
+                x=x if broadcast else None,
+                norm_weight=self.attn_norm.weight,
+                norm_eps=self.attn_norm.variance_epsilon,
+            )
+            post_mix, res_mix, x, attn_pre = outputs
+        elif self.engram is not None and engram_hashes is not None:
+            if self.fuse_mhc_all_reduce:
+                x = upstream.tensor_model_parallel_all_reduce(x)
+            previous_post = post(x, residual, post_mix, res_mix)
+            if capture_previous_aux:
+                previous_aux = previous_post.mean(dim=1)
+            residual = self.engram(
+                previous_post,
+                engram_hashes[:, self.engram.layer_hash_index],
+                engram_mask,
+            )
+            outputs = pre(
+                residual,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.hc_eps,
+                self.hc_post_alpha,
+                self.hc_sinkhorn_iters,
+                pre_mix=pre_mix,
+                norm_weight=self.attn_norm.weight,
+                norm_eps=self.attn_norm.variance_epsilon,
+            )
+            post_mix, res_mix, x, attn_pre = outputs
+        else:
+            outputs = shifted_post_pre(
+                x,
+                residual,
+                post_mix,
+                res_mix,
+                self.hc_attn_fn,
+                self.hc_attn_scale,
+                self.hc_attn_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+                self.hc_eps,
+                self.hc_post_alpha,
+                self.hc_sinkhorn_iters,
+                pre_mix=pre_mix,
+                norm_weight=self.attn_norm.weight,
+                norm_eps=self.attn_norm.variance_epsilon,
+                capture_aux=capture_previous_aux,
+                reduce_results=self.fuse_mhc_all_reduce,
+                fuse_rms=True,
+            )
+            residual, post_mix, res_mix, x, attn_pre, aux = outputs
+            if capture_previous_aux:
+                previous_aux = aux
+        x = self.attn(positions, x, None)
+        if self.use_sequence_parallel and self.attn.gemm_rs is None:
+            x = upstream.sp_reduce_scatter(x)
+
+        moe_fp8 = self.ffn.supports_fp8_hidden_input()
+        outputs = shifted_post_pre(
+            x,
+            residual,
+            post_mix,
+            res_mix,
+            self.hc_ffn_fn,
+            self.hc_ffn_scale,
+            self.hc_ffn_base,
+            self.rms_norm_eps,
+            self.hc_eps,
+            self.hc_eps,
+            self.hc_post_alpha,
+            self.hc_sinkhorn_iters,
+            pre_mix=attn_pre,
+            norm_weight=self.ffn_norm.weight,
+            norm_eps=self.ffn_norm.variance_epsilon,
+            reduce_results=self.fuse_mhc_all_reduce,
+            fuse_rms=True,
+            moe_fp8=moe_fp8,
+        )
+        if moe_fp8:
+            residual, post_mix, res_mix, x, ffn_pre, _, moe_q, moe_scale = outputs
+        else:
+            residual, post_mix, res_mix, x, ffn_pre, _ = outputs
+            moe_q, moe_scale = None, None
+        assert x is not None
+        if self.fuse_mhc_all_reduce and self.ffn.defers_finalize(x.shape[0]):
+            x = self.ffn.forward_unfinalized(x, input_ids)
+        else:
+            x = self.ffn(
+                x,
+                input_ids,
+                mega_gate_metadata,
+                hidden_states_q=moe_q,
+                hidden_states_scale=moe_scale,
+            )
+        return x, residual, post_mix, res_mix, ffn_pre, previous_aux
 
 
 _upstream_use_sequence_parallel = upstream._use_sequence_parallel

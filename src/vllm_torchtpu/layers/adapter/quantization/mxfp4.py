@@ -807,6 +807,9 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
         x: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        *,
+        hidden_states_q: torch.Tensor | None = None,
+        hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         from vllm_torchtpu.layers.adapter.fused_moe_ep import (
             fused_moe_ep,
@@ -831,5 +834,9 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 router_logits,
                 score_bias_operand(layer),
                 hash_topk_ids_operand(layer, input_ids),
+                hidden_states_q=hidden_states_q,
+                hidden_states_scale=hidden_states_scale,
             )
+        if hidden_states_q is not None or hidden_states_scale is not None:
+            raise ValueError("prequantized inputs require the fused EP MoE path")
         return super()._forward_monolithic_tpu(layer, x, router_logits, input_ids)

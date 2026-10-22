@@ -145,6 +145,111 @@ def quantized_matmul(
     return out_2d.reshape(orig_out_shape)
 
 
+def _quantized_matmul_prequantized_jax(
+    x_q: jax.Array,
+    x_scale: jax.Array,
+    w_q: jax.Array,
+    w_scale: jax.Array,
+    *,
+    output_dtype: jnp.dtype,
+) -> jax.Array:
+    """Contract supplied 2-D FP8 operands without quantizing either operand."""
+    out = jax.lax.dot_general(
+        x_q,
+        w_q,
+        dimension_numbers=(((1,), (0,)), ((), ())),
+        preferred_element_type=jnp.float32,
+    )
+    return (out * x_scale * w_scale[None, :]).astype(output_dtype)
+
+
+_prequantized_output_dtypes = {
+    torch.bfloat16: jnp.bfloat16,
+    torch.float16: jnp.float16,
+    torch.float32: jnp.float32,
+}
+_quantized_matmul_prequantized_ops: dict[torch.dtype, Callable] = {}
+_quantized_matmul_prequantized_op_lock = Lock()
+
+
+def _get_quantized_matmul_prequantized_op(output_dtype: torch.dtype) -> Callable:
+    op = _quantized_matmul_prequantized_ops.get(output_dtype)
+    if op is not None:
+        return op
+
+    with _quantized_matmul_prequantized_op_lock:
+        op = _quantized_matmul_prequantized_ops.get(output_dtype)
+        if op is not None:
+            return op
+
+        # Capture dtype as static metadata, not as a tensor operand. One
+        # registration per dtype also gives fake tracing the exact output dtype.
+        jax_dtype = _prequantized_output_dtypes[output_dtype]
+
+        def kernel(
+            x_q: jax.Array,
+            x_scale: jax.Array,
+            w_q: jax.Array,
+            w_scale: jax.Array,
+        ) -> jax.Array:
+            return _quantized_matmul_prequantized_jax(
+                x_q, x_scale, w_q, w_scale, output_dtype=jax_dtype
+            )
+
+        op = pallas.jax_op(
+            f"pallas::quantized_matmul_prequantized_{jax_dtype.__name__}", kernel
+        )
+
+        def fake(x_q, x_scale, w_q, w_scale):
+            del x_scale, w_scale
+            return torch.empty(
+                x_q.shape[0], w_q.shape[1], dtype=output_dtype, device=x_q.device
+            )
+
+        op.register_fake(fake)
+        _quantized_matmul_prequantized_ops[output_dtype] = op
+        return op
+
+
+def quantized_matmul_prequantized(
+    x_q: torch.Tensor,
+    x_scale: torch.Tensor,
+    w_q: torch.Tensor,
+    w_scale: torch.Tensor,
+    *,
+    output_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Reuse FP8 activations and FP32 row scales for a dense linear.
+
+    Inputs are e4m3fn ``x_q[..., K]`` and canonical ``w_q[K, N]``, with
+    FP32 scales ``x_scale[..., 1]`` and ``w_scale[N]``. Accumulation and
+    scaling use FP32 before casting to the original floating output dtype.
+    Blockwise scales and dynamic activation quantization are not supported.
+    """
+    if output_dtype not in _prequantized_output_dtypes:
+        raise ValueError("output_dtype must be bfloat16, float16, or float32.")
+    if x_q.dtype != torch.float8_e4m3fn or w_q.dtype != torch.float8_e4m3fn:
+        raise ValueError("Prequantized activations and weights must be float8_e4m3fn.")
+    if x_scale.dtype != torch.float32 or w_scale.dtype != torch.float32:
+        raise ValueError("Prequantized activation and weight scales must be float32.")
+    if x_q.ndim < 1 or w_q.ndim != 2:
+        raise ValueError("Expected activations [..., K] and weights [K, N].")
+    if x_q.shape[-1] != w_q.shape[0]:
+        raise ValueError(
+            f"Input hidden dim {x_q.shape[-1]} must match weight hidden dim "
+            f"{w_q.shape[0]}."
+        )
+    if x_scale.shape != (*x_q.shape[:-1], 1):
+        raise ValueError("Activation scales must have shape [..., 1] matching x_q.")
+    if w_scale.shape != (w_q.shape[1],):
+        raise ValueError("Weight scales must have shape [N] matching w_q.")
+
+    out = _get_quantized_matmul_prequantized_op(output_dtype)(
+        x_q.reshape(-1, x_q.shape[-1]), x_scale.reshape(-1, 1), w_q, w_scale
+    )
+    return out.reshape(*x_q.shape[:-1], w_q.shape[1])
+
+
 def _quantized_matmul_fp4_jax(
     x: jax.Array, w_q: jax.Array, w_s: jax.Array
 ) -> jax.Array:

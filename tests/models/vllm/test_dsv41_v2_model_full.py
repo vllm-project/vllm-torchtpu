@@ -350,9 +350,6 @@ class TestDeepseekV41DecoderLayer:
             layer.__init__(cfg, prefix="model.layers.0")
             assert not hasattr(layer, "attn")
 
-    def test_decoder_layer_forward_binding(self) -> None:
-        assert callable(DeepseekV41DecoderLayer.forward)
-
 
 # ==============================================================================
 # 4. Tests for _use_sequence_parallel

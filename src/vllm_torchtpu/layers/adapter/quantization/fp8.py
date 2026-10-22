@@ -31,10 +31,11 @@ The checkpoint stores FP8 weights with either block scales or tensor/channel
 scales. At load time we dequantize those weights to float32, then requantize
 them into the runtime FP8 layout consumed by the Pallas matmul bridge in
 `vllm_torchtpu/layers/adapter/linear_common.py`. Activations are quantized
-dynamically inside the bridge. By default the bridge dispatches to a pure-JAX
-`dot_general`-based per-channel FP8 matmul (`xla_quantized_matmul`); setting
-ENABLE_QUANTIZED_MATMUL_KERNEL=1 together with REQUANTIZE_BLOCK_SIZE selects
-the blockwise Pallas kernel path instead.
+dynamically inside the bridge unless a caller explicitly supplies compatible
+FP8 activations and FP32 row scales through `apply_prequantized`. By default
+the bridge dispatches to a pure-JAX `dot_general`-based per-channel FP8 matmul
+(`xla_quantized_matmul`); setting ENABLE_QUANTIZED_MATMUL_KERNEL=1 together
+with REQUANTIZE_BLOCK_SIZE selects the blockwise Pallas kernel path instead.
 """
 
 from __future__ import annotations
@@ -79,6 +80,7 @@ from vllm_torchtpu.layers.adapter.linear_common import (
     KEEP_VLLM_LAYOUT_ATTR,
     WEIGHT_FLIPPED_ATTR,
     quantized_matmul,
+    quantized_matmul_prequantized,
 )
 from vllm_torchtpu.layers.adapter.pipelined_fused_moe import (
     enable_pipelined_collective_and_compute,
@@ -1064,6 +1066,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         x: torch.Tensor,
         router_logits: torch.Tensor,
         input_ids: torch.Tensor | None = None,
+        *,
+        hidden_states_q: torch.Tensor | None = None,
+        hidden_states_scale: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Forward pass using TPU-native GMM kernel with FP8 weights."""
         layer = cast("TpuRoutedExperts", layer)
@@ -1113,6 +1118,8 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 layer.w2_weight_scale_inv,
                 router_logits,
                 score_bias_operand(layer),
+                hidden_states_q=hidden_states_q,
+                hidden_states_scale=hidden_states_scale,
             )
         # Step 1: Routing
         # Quantization-independent routing decision (simulation override ->
@@ -1440,6 +1447,48 @@ class VllmFp8LinearMethodTPU(Fp8LinearMethod):
             # takes the canonical (k, n), so flip the view for the contraction.
             weight = weight.transpose(0, 1)
         out = quantized_matmul(x, weight, layer.weight_scale)
+        if bias is not None:
+            out = out + bias
+        return out
+
+    def supports_prequantized_input(self, layer: torch.nn.Module) -> bool:
+        """Whether runtime weights accept e4m3fn inputs with FP32 row scales."""
+        weight = getattr(layer, "weight", None)
+        scale = getattr(layer, "weight_scale", None)
+        if (
+            weight is None
+            or scale is None
+            or weight.ndim != 2
+            or weight.dtype != torch.float8_e4m3fn
+            or scale.ndim != 1
+            or scale.dtype != torch.float32
+        ):
+            return False
+        out_axis = 0 if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False) else 1
+        return scale.shape == (weight.shape[out_axis],)
+
+    def apply_prequantized(
+        self,
+        layer: torch.nn.Module,
+        x_q: torch.Tensor,
+        x_scale: torch.Tensor,
+        *,
+        output_dtype: torch.dtype,
+        bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Apply per-channel FP8 weights without re-quantizing routed inputs."""
+        if not self.supports_prequantized_input(layer):
+            raise ValueError(
+                "Prequantized input requires e4m3fn weights and FP32 "
+                "per-output-channel weight scales."
+            )
+        layer = cast("TpuLinear", layer)
+        weight = layer.weight
+        if getattr(layer, KEEP_VLLM_LAYOUT_ATTR, False):
+            weight = weight.transpose(0, 1)
+        out = quantized_matmul_prequantized(
+            x_q, x_scale, weight, layer.weight_scale, output_dtype=output_dtype
+        )
         if bias is not None:
             out = out + bias
         return out

@@ -282,6 +282,8 @@ def fused_ep_moe_v2(
     stage="fused",
     routed=None,
     gather_positions=None,
+    hidden_states_q=None,
+    hidden_states_scale=None,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -304,6 +306,10 @@ def fused_ep_moe_v2(
     quantized to fp8 only where the format's matmuls take fp8 rows: an
     unquantized weight gets unquantized activations, with no quantize and
     dequantize pair inserted around a model that never asked for one.
+
+    hidden_states_q and hidden_states_scale optionally supply e4m3fn
+    [tokens, hidden] rows and f32 [tokens, 1] scales, sharded like x.
+    Supplying both skips input row quantization.
 
     w1_bias [experts, 1, 2 * inter] and w2_bias [experts, 1, hidden] are
     optional and independent. The gate and up halves are added to the first
@@ -549,7 +555,23 @@ def fused_ep_moe_v2(
         score_bias_l = next(operands) if has_score_bias else None
         return w1s_l, w2s_l, gate_l, hash_l, score_bias_l, operands
 
-    def quantize_local(x_l, rank_l, gate_l, hash_l):
+    has_prequantized = hidden_states_q is not None
+    if has_prequantized != (hidden_states_scale is not None):
+        raise ValueError("hidden_states_q and hidden_states_scale must be paired")
+    if has_prequantized:
+        assert hidden_states_q is not None and hidden_states_scale is not None
+        if not form.quantized_activations:
+            raise ValueError("prequantized inputs require quantized activations")
+        if hidden_states_q.shape != x.shape:
+            raise ValueError("hidden_states_q must have the same shape as x")
+        if hidden_states_scale.shape != (x.shape[0], 1):
+            raise ValueError("hidden_states_scale must have shape [tokens, 1]")
+        if hidden_states_q.dtype != jnp.float8_e4m3fn:
+            raise ValueError("hidden_states_q must use float8_e4m3fn")
+        if hidden_states_scale.dtype != jnp.float32:
+            raise ValueError("hidden_states_scale must use float32")
+
+    def quantize_local(x_l, rank_l, gate_l, hash_l, activation_it):
         """Split this shard's rows out of a replica group and quantize them.
 
         Returns the split gate and hash ids, the wire rows [t_local, lane
@@ -563,12 +585,19 @@ def fused_ep_moe_v2(
         gate_l = token_layout.split(gate_l, me, fill_value=-jnp.inf)
         if hash_l is not None:
             hash_l = token_layout.split(hash_l, me)
-        if len(token_layout.groups[0]) > 1 and form.quantized_activations:
+        if (
+            len(token_layout.groups[0]) > 1
+            and form.quantized_activations
+            and not has_prequantized
+        ):
             # Slicing fused into rowquant changes BF16 rounding on TPU.
             # Keep this boundary only for quantized replicated inputs.
             x_l = lax.optimization_barrier(x_l)
         rows_bf16 = x_l.astype(jnp.bfloat16)
-        if form.quantized_activations:
+        if has_prequantized:
+            q_l = token_layout.split(next(activation_it), me)
+            row_scale_l = token_layout.split(next(activation_it), me)
+        elif form.quantized_activations:
             q_l, row_scale_l = rowquant_fp8(rows_bf16)
         else:
             # The rows go on the wire as they arrived. There is no scale to
@@ -838,7 +867,9 @@ def fused_ep_moe_v2(
         w1s_l, w2s_l, gate_l, hash_l, score_bias_l, bias_it = unpack_operands(
             scales_gating_biases
         )
-        gate_l, hash_l, q_l, row_scale_l = quantize_local(x_l, rank_l, gate_l, hash_l)
+        gate_l, hash_l, q_l, row_scale_l = quantize_local(
+            x_l, rank_l, gate_l, hash_l, bias_it
+        )
         q_g = lax.all_gather(q_l, ax, axis=0, tiled=True)
         topk_weights, packed, local_blocks, block_hist, row_routes = select_local(
             gate_l, hash_l, score_bias_l, row_scale_l
@@ -865,8 +896,12 @@ def fused_ep_moe_v2(
     def route_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
         """stage="route": the wire rows, router weights and payload."""
         del w1_l, w2_l
-        _, _, gate_l, hash_l, score_bias_l, _ = unpack_operands(scales_gating_biases)
-        gate_l, hash_l, q_l, row_scale_l = quantize_local(x_l, rank_l, gate_l, hash_l)
+        _, _, gate_l, hash_l, score_bias_l, activation_it = unpack_operands(
+            scales_gating_biases
+        )
+        gate_l, hash_l, q_l, row_scale_l = quantize_local(
+            x_l, rank_l, gate_l, hash_l, activation_it
+        )
         topk_weights, packed, *_ = select_local(
             gate_l, hash_l, score_bias_l, row_scale_l
         )
@@ -880,6 +915,9 @@ def fused_ep_moe_v2(
         """stage="compute": the layer from route's outputs, rows gathered."""
         *scales_gating_biases, q_g, topk_weights, packed = scales_gating_biases_routed
         w1s_l, w2s_l, _, _, _, bias_it = unpack_operands(scales_gating_biases)
+        if has_prequantized:
+            next(bias_it)
+            next(bias_it)
         # Every block of q_g carries route's padding rows; drop them so token
         # t sits at row t of the mesh-order layout the kernel indexes.
         q_g = q_g.reshape(ep, t_wire, *q_g.shape[1:])[:, :t_local].reshape(
@@ -936,9 +974,11 @@ def fused_ep_moe_v2(
     # silently bias the wrong ones.
     score_bias_args = (score_bias,) if has_score_bias else ()
     hash_args = (hash_topk_ids,) if has_hash_ids else ()
+    activation_args = (hidden_states_q, hidden_states_scale) if has_prequantized else ()
     in_specs = (
         (P(ax),) * (5 + len(scale_args) + len(hash_args))
         + (P(),) * len(score_bias_args)
+        + (P(ax),) * len(activation_args)
         + (P(ax),) * len(bias_args)
     )
     args = (
@@ -947,6 +987,7 @@ def fused_ep_moe_v2(
         + (gating,)
         + hash_args
         + score_bias_args
+        + activation_args
         + bias_args
     )
     if routed is not None:
@@ -985,6 +1026,7 @@ def fused_ep_moe_v2(
         has_score_bias and cast(jax.Array, score_bias).dtype,
         has_hash_ids and hash_topk_ids.dtype,
         float(routed_scaling_factor),
+        has_prequantized,
         stage,
         gather_positions,
         logical_intermediate_size,

@@ -93,3 +93,35 @@ class DeepseekV4MLP(nn.Module):
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
+
+    def supports_prequantized_input(self) -> bool:
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
+
+        method = self.gate_up_proj.quant_method
+        return (
+            isinstance(method, VllmFp8LinearMethodTPU)
+            and not self.gate_up_proj.gather_output
+            and method.supports_prequantized_input(self.gate_up_proj)
+        )
+
+    def forward_prequantized(
+        self,
+        x_q: torch.Tensor,
+        x_scale: torch.Tensor,
+        *,
+        output_dtype: torch.dtype,
+    ) -> torch.Tensor:
+        """Reuse input quantization only for gate/up; down keeps its own input."""
+        from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8LinearMethodTPU
+
+        method = self.gate_up_proj.quant_method
+        if not isinstance(method, VllmFp8LinearMethodTPU) or not (
+            self.supports_prequantized_input()
+        ):
+            raise ValueError("shared gate/up does not support prequantized FP8 input")
+        gate_up = method.apply_prequantized(
+            self.gate_up_proj, x_q, x_scale, output_dtype=output_dtype
+        )
+        x = self.act_fn(gate_up)
+        x, _ = self.down_proj(x)
+        return x

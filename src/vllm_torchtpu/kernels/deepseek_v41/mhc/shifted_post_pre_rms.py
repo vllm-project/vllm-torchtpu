@@ -65,7 +65,8 @@ def shifted_post_pre_rms(
     constrain_activations_to_hbm: bool = True,
     norm_weight: jax.Array | None = None,
     norm_eps: float = 1e-06,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    moe_fp8: bool = False,
+) -> tuple:
     """Update residuals and collapse with incoming pre; predict gates separately.
 
     TPU7x: M=4, D=5120, positive local T divisible by 32.
@@ -75,8 +76,9 @@ def shifted_post_pre_rms(
 
     Returns:
         (residual [T,M*D], next_post [T,M,1], next_comb [T,M,M],
-        value [T,D], next_pre [T,M]). Value includes RMSNorm when
-        norm_weight [D] is supplied. Other keyword arguments are JIT-static.
+        value [T,D], next_pre [T,M]), followed by the MoE FP8 pair
+        (FP8 [T,D], FP32 scale [T,1]) when enabled.
+        Quantization consumes the rounded BF16 RMS output. Flags are JIT-static.
     """
     t, d = x.shape
     token_tile = 128 if t % 128 == 0 else 96 if t % 96 == 0 else 32
@@ -111,6 +113,11 @@ def shifted_post_pre_rms(
     if norm_weight is not None:
         assert norm_weight.shape == (d,)
         assert norm_weight.dtype in (jnp.bfloat16, jnp.float32)
+    quant_dtypes = (jnp.float8_e4m3fn, jnp.float32) if moe_fp8 else ()
+    quant_shapes = tuple(
+        (tile, d if i % 2 == 0 else 1) for i in range(len(quant_dtypes))
+    )
+    output_count = 2 + len(quant_dtypes)
 
     def kernel(
         xh,
@@ -122,10 +129,12 @@ def shifted_post_pre_rms(
         norm_refs,
         yh,
         vh,
+        quant_h,
         mh,
         sh,
         output_y,
         output_v,
+        output_quant,
         output_sems,
         input_x,
         input_residual,
@@ -248,14 +257,18 @@ def shifted_post_pre_rms(
         def output_copy(tile_index, component):
             slot = tile_index % output_buffers
             rows = pl.ds(tile_index * tile, tile)
-            source = (output_y, output_v)[component]
-            target = (yh, vh)[component]
+            sources = (output_y, output_v) + output_quant
+            targets = (yh, vh) + quant_h
             return pltpu.make_async_copy(
-                source.at[slot], target.at[rows, :], output_sems.at[slot, component]
+                sources[component].at[slot],
+                targets[component].at[rows, :],
+                output_sems.at[slot, component],
             )
 
         def output_copies(tile_index):
-            return tuple(output_copy(tile_index, component) for component in range(2))
+            return tuple(
+                output_copy(tile_index, component) for component in range(output_count)
+            )
 
         def run_tile(tile_index, xr, rr, yr, vr):
             previous_projected = projection_buf[...]
@@ -324,6 +337,8 @@ def shifted_post_pre_rms(
                         eps=norm_eps,
                     )
             if early_output:
+                # Keep the baseline BF16 drain before projection; quantization
+                # only reads these buffers while their output DMAs are live.
                 output_copy(tile_index, 0).start()
                 output_copy(tile_index, 1).start()
             prepare(
@@ -340,6 +355,28 @@ def shifted_post_pre_rms(
             )
             store_projection(previous_projected, jnp.maximum(tile_index - 1, 0))
             store_vector(sbuf[...].T, sh, tile_index * tile)
+            if moe_fp8:
+                for ri in range(tile // group):
+                    r = pl.ds(ri * group, group)
+                    values = vr[r, :]
+                    amax = jnp.max(
+                        jnp.abs(values.astype(jnp.float32)), axis=1, keepdims=True
+                    )
+                    moe_scale = amax / 448.0
+                    valid = (moe_scale > 0) & jnp.isfinite(moe_scale)
+                    moe_scale = jnp.where(valid, moe_scale, 0.0)
+                    reciprocal = jnp.where(
+                        valid, 1.0 / jnp.where(valid, moe_scale, 1.0), 0.0
+                    ).astype(jnp.bfloat16)
+                    moe_q = jnp.where(valid, values * reciprocal, 0).astype(
+                        jnp.float8_e4m3fn
+                    )
+                    quant_slot = tile_index % output_buffers
+                    output_quant[0][quant_slot, r, :] = moe_q
+                    output_quant[1][quant_slot, r, :] = moe_scale
+            if early_output:
+                for component in range(2, output_count):
+                    output_copy(tile_index, component).start()
 
         for index in range(input_buffers):
             for copy in input_copies(index):
@@ -397,17 +434,29 @@ def shifted_post_pre_rms(
     else:
         gate_spec = pl.BlockSpec(memory_space=pltpu.VMEM)
         gate_scratch_shapes = ()
-    residual, value, mix_values, square = pl.pallas_call(
+    residual, value, quantized, mix_values, square = pl.pallas_call(
         kernel,
         in_specs=[hbm, hbm, gate_spec, gate_spec, gate_spec, hbm]
         + [tuple(pl.BlockSpec(memory_space=pltpu.HBM) for _ in norm_args)],
-        out_specs=[hbm, hbm] + [pl.BlockSpec(memory_space=pltpu.VMEM)] * 2,
-        out_shape=[jax.ShapeDtypeStruct((t, k), flat.dtype) for k in (width, d)]
+        out_specs=[hbm, hbm, (hbm,) * len(quant_dtypes)]
+        + [pl.BlockSpec(memory_space=pltpu.VMEM)] * 2,
+        out_shape=[
+            jax.ShapeDtypeStruct((t, width), flat.dtype),
+            jax.ShapeDtypeStruct((t, d), flat.dtype),
+            tuple(
+                jax.ShapeDtypeStruct((t, d if i % 2 == 0 else 1), dtype)
+                for i, dtype in enumerate(quant_dtypes)
+            ),
+        ]
         + [jax.ShapeDtypeStruct((k, gate_tokens), jnp.float32) for k in (mixes, 1)],
         scratch_shapes=[
             pltpu.VMEM((output_buffers, tile, width), jnp.bfloat16),
             pltpu.VMEM((output_buffers, tile, d), jnp.bfloat16),
-            pltpu.SemaphoreType.DMA((output_buffers, 2)),
+            tuple(
+                pltpu.VMEM((output_buffers, *shape), dtype)
+                for shape, dtype in zip(quant_shapes, quant_dtypes)
+            ),
+            pltpu.SemaphoreType.DMA((output_buffers, output_count)),
             pltpu.VMEM((input_buffers, tile, d), jnp.bfloat16),
             pltpu.VMEM((input_buffers, tile, width), jnp.bfloat16),
             pltpu.SemaphoreType.DMA((input_buffers, 2)),
@@ -453,7 +502,14 @@ def shifted_post_pre_rms(
         hc_post_mult_value=hc_post_mult_value,
         sinkhorn_repeat=sinkhorn_repeat,
     )
-    return (residual, new_post[:t, :, None], new_comb[:t], value, new_pre[:t])
+    return (
+        residual,
+        new_post[:t, :, None],
+        new_comb[:t],
+        value,
+        new_pre[:t],
+        *quantized,
+    )
 
 
 def _rms_norm_inplace(value_ref, weight_ref, square, *, columns: int, eps: float):

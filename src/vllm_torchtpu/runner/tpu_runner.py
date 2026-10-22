@@ -5044,13 +5044,21 @@ class TPUModelRunner(GPUModelRunner):
         from vllm_torchtpu.layers.adapter.linear_common import (
             _get_quantized_matmul_fp4_op,
             _get_quantized_matmul_op,
+            _get_quantized_matmul_prequantized_op,
         )
+        from vllm_torchtpu.models.vllm.deepseek_v4.layers import DeepseekV4MLP
 
         with set_current_vllm_config(self.vllm_config):
             # Pre-warm FP8 quantized-matmul lock; Dynamo can't trace Lock.
             _get_quantized_matmul_op()
             # Same for the NVFP4 W4A16 matmul op.
             _get_quantized_matmul_fp4_op()
+            if any(
+                isinstance(module, DeepseekV4MLP)
+                and module.supports_prequantized_input()
+                for module in self.model.modules()
+            ):
+                _get_quantized_matmul_prequantized_op(self.model_config.dtype)
 
     def _initialize_attention_kernels(self, force: bool = False) -> None:
         """Pre-build Pallas RPA and custom attention kernels before torch.compile."""
@@ -6876,11 +6884,6 @@ class TPUModelRunner(GPUModelRunner):
     ) -> None:
         from vllm.compilation.wrapper import reset_compile_wrapper
 
-        from vllm_torchtpu.layers.adapter.linear_common import (
-            _get_quantized_matmul_fp4_op,
-            _get_quantized_matmul_op,
-        )
-
         # set_current_vllm_config is required for the post-reset compile
         # path: reset_compile_wrapper restores the wrapper's original
         # forward code, so the next trace re-instantiates CustomOps that
@@ -6889,11 +6892,7 @@ class TPUModelRunner(GPUModelRunner):
         saved_cache = (cc.cache_dir, cc.local_cache_dir)
         saved_sizes = cc.compile_sizes
         with set_current_vllm_config(self.vllm_config):
-            self._initialize_attention_kernels()
-            # Pre-warm FP8 quantized-matmul lock; Dynamo can't trace Lock.
-            _get_quantized_matmul_op()
-            # Same for the NVFP4 W4A16 matmul op.
-            _get_quantized_matmul_fp4_op()
+            self._initialize_pallas_kernels()
 
             # Compile backbone here so XLA materializes the FP8 activation
             # slab; vLLM's post-probe sees the real HBM. Cache writes are
