@@ -348,15 +348,18 @@ def _patch_ltx2_vocoder_cpu_init() -> None:
     # TODO: Remove once torch_tpu implements kaiser_window or vLLM-Omni builds
     # the vocoder on CPU.
     #
-    # DiffusersPipelineLoader._init_from_load_format constructs the pipeline
-    # under a `with torch.device("tpu:N"):` context. LTX-2.3 and LTX-2.5 use
-    # Diffusers LTX2VocoderWithBWE (`act_fn="snakebeta"`, `antialias=True`),
-    # whose __init__ builds AntiAliasAct1d -> UpSample1d -> kaiser_sinc_filter1d
-    # and calls torch.kaiser_window(...) on the active default device before
-    # weights are loaded, failing on TPU with `DispatchStub: missing kernel for
-    # tpu`. Constructing the vocoder on CPU (matching text_encoder and
-    # latent_upsampler in ltx2_components.py) builds the filter buffers on the
-    # host before _place_aux_components moves the module to pipeline.device.
+    # Problem: DiffusersPipelineLoader._init_from_load_format constructs the
+    #   pipeline under a `with torch.device("tpu:N"):` context. LTX-2.3 and
+    #   LTX-2.5 use Diffusers LTX2VocoderWithBWE (`act_fn="snakebeta"`,
+    #   `antialias=True`), whose __init__ builds AntiAliasAct1d -> UpSample1d
+    #   -> kaiser_sinc_filter1d and calls torch.kaiser_window(...) on the
+    #   active default device before weights are loaded, failing on TPU with
+    #   `DispatchStub: missing kernel for tpu`.
+    # Fix: Constructing the vocoder on CPU (matching text_encoder and
+    #   latent_upsampler in ltx2_components.py) builds the filter buffers on
+    #   the host before _place_aux_components moves the module to
+    #   pipeline.device.
+    # Effect: LTX-2.3 loads on TPU.
     # -------------------------------------------------------------------------
     from vllm_omni.diffusion.models.ltx2 import ltx2_components
 
