@@ -213,6 +213,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_MAX_CONSECUTIVE_HOLDS: int = 8
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
+    TPU_DP_PACKED_ROUTER_GATHER: bool = False
 
 
 def env_with_choices(
@@ -1303,6 +1304,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # tile).
     "VLLM_TPU_SRPT_ATTN_TILE_TOKENS": env_nonnegative_int(
         "VLLM_TPU_SRPT_ATTN_TILE_TOKENS", 32
+    ),
+    # A replicated sequence-parallel MoE step under DP>1 gathers the hidden rows
+    # and the router logits in one DP all-gather (packed along the last dim)
+    # instead of two. Lossless: the split returns the same values.
+    "TPU_DP_PACKED_ROUTER_GATHER": env_bool(
+        "TPU_DP_PACKED_ROUTER_GATHER", default=False
     ),
 }
 
