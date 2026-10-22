@@ -157,6 +157,7 @@ def test_dispatch_and_combine_with_replicated_sequence_parallel_rows(
     # passes through and combine all-reduces over EP.
     ep_group = Mock(world_size=8)
     monkeypatch.setattr(comm, "get_ep_group", lambda: ep_group)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: Mock(world_size=1))
     monkeypatch.setattr(comm.sequence_parallel, "_ACTIVE", False)
     tensors = [torch.tensor([[i, i + 1]]) for i in range(count)]
     ep_group.all_reduce.return_value = torch.tensor([[11, 12]])
@@ -168,6 +169,50 @@ def test_dispatch_and_combine_with_replicated_sequence_parallel_rows(
     else:
         assert all(actual is expected for actual, expected in zip(result, tensors))
         ep_group.all_reduce.assert_not_called()
+    ep_group.all_gather.assert_not_called()
+    ep_group.reduce_scatter.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "method,count", [("dispatch", 3), ("dispatch_router_logits", 2), ("combine", 1)]
+)
+def test_replicated_sequence_parallel_rows_under_data_parallelism(
+    monkeypatch, communicator, method, count
+):
+    # DP4 x TP2: a step below the row threshold holds only this engine's rows
+    # (replicated over its TP pair). Dispatch must gather the other engines'
+    # rows over DP, and combine must return this engine's rows summed over
+    # every EP rank: DP reduce-scatter, then TP all-reduce. An EP all-reduce
+    # would add other engines' rows into this engine's.
+    ep_group = Mock(world_size=8)
+    dp_group = Mock(world_size=4)
+    tp_group = Mock(world_size=2)
+    monkeypatch.setattr(comm, "get_ep_group", lambda: ep_group)
+    monkeypatch.setattr(comm, "get_dp_group", lambda: dp_group)
+    monkeypatch.setattr(comm, "get_tp_group", lambda: tp_group)
+    monkeypatch.setattr(comm.sequence_parallel, "_ACTIVE", False)
+    monkeypatch.setattr(
+        comm.small_all_reduce_op, "dp_combine_or", lambda x, fallback: fallback(x)
+    )
+    tensors = [torch.tensor([[i, i + 1]]) for i in range(count)]
+    dp_group.all_gather.side_effect = lambda x, dim: torch.cat([x, x + 10], dim=dim)
+    dp_group.reduce_scatter.return_value = torch.tensor([[11, 12]])
+    tp_group.all_reduce.return_value = torch.tensor([[22, 24]])
+
+    result = getattr(communicator, method)(*tensors, is_sequence_parallel=True)
+    if method == "combine":
+        dp_group.reduce_scatter.assert_called_once_with(tensors[0], dim=0)
+        tp_group.all_reduce.assert_called_once_with(dp_group.reduce_scatter.return_value)
+        assert result is tp_group.all_reduce.return_value
+        dp_group.all_gather.assert_not_called()
+    else:
+        assert len(result) == count
+        for actual, expected in zip(result, tensors):
+            torch.testing.assert_close(actual, torch.cat([expected, expected + 10]))
+        assert dp_group.all_gather.call_count == count
+        dp_group.reduce_scatter.assert_not_called()
+        tp_group.all_reduce.assert_not_called()
+    ep_group.all_reduce.assert_not_called()
     ep_group.all_gather.assert_not_called()
     ep_group.reduce_scatter.assert_not_called()
 
