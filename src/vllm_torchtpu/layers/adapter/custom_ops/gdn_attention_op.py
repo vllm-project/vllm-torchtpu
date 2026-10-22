@@ -14,6 +14,7 @@
 
 import dataclasses
 import functools
+import inspect
 import itertools
 from collections.abc import Callable
 from typing import TYPE_CHECKING, Any, Protocol, cast
@@ -53,6 +54,7 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
     GdnHeadGeometry,
     derive_gdn_head_geometry,
 )
+from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
 from vllm_torchtpu.layers.adapter.gdn_linear import (
     GdnColumnParallelLinear,
     GdnInterleavedColumnParallelLinear,
@@ -179,7 +181,7 @@ def gdn_attention_core_tpu(
 
 
 def gdn_attention_pooled_core_tpu(
-    mixed_qkv: jax.Array,
+    mixed_qkv: jax.Array | Conv1DInput,
     b: jax.Array,
     a: jax.Array,
     recurrent_state: jax.Array,
@@ -714,7 +716,26 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
 
         return gdn_impl
 
+    @staticmethod
+    def _prepare_pooled_gdn_input(
+        mixed_qkv: jax.Array,
+        seq_lens: jax.Array,
+        mesh: jax.sharding.Mesh,
+    ) -> jax.Array | Conv1DInput:
+        """Stateless trace-time hook; overrides must also be static methods.
+
+        Use only the operands and mesh. Instance-dependent preparation needs
+        an explicit immutable configuration in the shared operator key.
+        """
+        return mixed_qkv
+
     def _build_pooled_gdn_op(self, *, block_major: bool = False):
+        preparation = inspect.getattr_static(type(self), "_prepare_pooled_gdn_input")
+        if not isinstance(preparation, staticmethod):
+            raise TypeError(
+                "_prepare_pooled_gdn_input must be a stateless staticmethod"
+            )
+        prepare_input = preparation.__func__
         vllm_context = get_vllm_model_wrapper_context()
         local_num_v_heads = self.num_v_heads // self.tp_size
         vllm_config = cast(VllmConfig, vllm_context.vllm_config)
@@ -755,8 +776,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             # pool adapters index flat kernel blocks along dim 0; both reshapes
             # compile to zero-copy bitcasts on the donated buffer.
             pool = kernel_view(recurrent_state) if block_major else recurrent_state
+            prepared_qkv = prepare_input(mixed_qkv, seq_lens, mesh)
             result = gdn_attention_pooled_core_tpu(
-                mixed_qkv,
+                prepared_qkv,
                 b,
                 a,
                 pool,
@@ -811,6 +833,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         gdn_jax_op = _get_shared_gdn_op(
             "gdn_attention_pooled_bm" if block_major else "gdn_attention_pooled",
             (
+                prepare_input,
                 id(mesh),
                 id(vllm_config),
                 n_kq,

@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import gc
 import re
+import weakref
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
 
@@ -1709,3 +1711,150 @@ def test_state_dtype_rejects_unsupported_formats(dtype):
         match="Unsupported state dtype for TPU GDN.*expected float32 or bfloat16",
     ):
         gdn_attention_op._to_jax_state_dtype(dtype)
+
+
+@pytest.mark.parametrize(
+    "ssm_cache_dtype,ssm_dtype", [("bfloat16", jnp.bfloat16), ("float32", jnp.float32)]
+)
+def test_pooled_input_preparation_separates_cached_ops(
+    cpu_vllm_config_context, ssm_cache_dtype, ssm_dtype
+):
+    from vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op import (
+        VllmGatedDeltaNetAttention,
+    )
+
+    class PreparedAttention(VllmGatedDeltaNetAttention):
+        @staticmethod
+        def _prepare_pooled_gdn_input(mixed_qkv, seq_lens, mesh):
+            return mixed_qkv + 1
+
+    captured = []
+
+    def build(name, function, **kwargs):
+        captured.append((name, function))
+        return MagicMock()
+
+    with (
+        patch.dict(gdn_attention_op._shared_gdn_ops, {}, clear=True),
+        set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+        patch.object(gdn_attention_op.pallas, "jax_op", side_effect=build),
+    ):
+        for index, cls in enumerate(
+            (VllmGatedDeltaNetAttention, PreparedAttention, PreparedAttention)
+        ):
+            attn = _qwen35_397b_gdn_attn(f"model.layers.{index}.linear_attn")
+            attn.__class__ = cls
+            attn.cache_config.mamba_ssm_cache_dtype = ssm_cache_dtype
+            attn._build_pooled_gdn_op()
+
+    assert len(captured) == 2
+    assert captured[0][0] != captured[1][0]
+    operands = [torch.zeros((1, 1)) for _ in range(12)]
+    operands[5] = None
+    for index, (_, function) in enumerate(captured):
+        with patch.object(
+            gdn_attention_op,
+            "gdn_attention_pooled_core_tpu",
+            return_value=(operands[3], operands[0]),
+        ) as dispatch:
+            function(*operands)
+        torch.testing.assert_close(dispatch.call_args.args[0], operands[0] + index)
+        if index == 0:
+            assert dispatch.call_args.args[0] is operands[0]
+        expected_conv = jnp.bfloat16
+        assert dispatch.call_args.kwargs["conv_state_dtype"] == jnp.dtype(expected_conv)
+        assert dispatch.call_args.kwargs["recurrent_state_dtype"] == jnp.dtype(
+            ssm_dtype
+        )
+
+
+@pytest.mark.parametrize(
+    "ssm_cache_dtype,ssm_dtype", [("bfloat16", jnp.bfloat16), ("float32", jnp.float32)]
+)
+def test_pooled_pcp_wrapper_forwards_state_formats(
+    cpu_vllm_config_context, ssm_cache_dtype, ssm_dtype
+):
+    attn = _qwen35_397b_gdn_attn("model.layers.0.linear_attn")
+    attn.cache_config.mamba_ssm_cache_dtype = ssm_cache_dtype
+    with (
+        set_vllm_model_wrapper_context(
+            mesh=_mesh(), vllm_config=_vllm_config(pcp_size=2)
+        ),
+        patch.object(gdn_attention_op, "get_pcp_world_size", return_value=2),
+        patch.object(
+            gdn_attention_op,
+            "get_or_create_pcp_mesh",
+            return_value=SimpleNamespace(shape={"pcp": 2, "tp": 1}),
+        ),
+        patch.object(
+            gdn_attention_op.pallas, "jax_op", return_value=MagicMock()
+        ) as build,
+    ):
+        attn._build_pooled_pcp_gdn_op()
+    function = build.call_args.args[1]
+    operands = [torch.zeros((1, 1)) for _ in range(14)]
+    operands[6] = None
+    operands[13] = None
+    with patch.object(
+        gdn_attention_op,
+        "run_jax_gdn_attention_pooled_pcp_prefill_projection",
+        return_value=(operands[4], operands[0], operands[0]),
+    ) as dispatch:
+        function(*operands)
+    expected_conv = jnp.bfloat16
+    assert dispatch.call_args.kwargs["conv_state_dtype"] == jnp.dtype(expected_conv)
+    assert dispatch.call_args.kwargs["recurrent_state_dtype"] == jnp.dtype(ssm_dtype)
+
+
+def test_shared_pooled_op_does_not_retain_first_layer(cpu_vllm_config_context):
+    # Real production class/configurations; only the device boundary is mocked.
+    captured = []
+
+    def build(name, function, **kwargs):
+        captured.append(function)
+        return MagicMock()
+
+    with (
+        patch.dict(gdn_attention_op._shared_gdn_ops, {}, clear=True),
+        set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+        patch.object(gdn_attention_op.pallas, "jax_op", side_effect=build),
+    ):
+        first = _qwen35_397b_gdn_attn("model.layers.0.linear_attn")
+        torch.nn.Module.__init__(first)
+        first._build_pooled_gdn_op()
+        ref = weakref.ref(first)
+        second = _qwen35_397b_gdn_attn("model.layers.1.linear_attn")
+        second._build_pooled_gdn_op()
+        assert len(captured) == 1
+        different = _qwen38_gdn_attn("model.layers.2.linear_attn")
+        different._build_pooled_gdn_op()
+        assert len(captured) == 2
+        del first
+        gc.collect()
+        assert ref() is None
+        operands = [torch.zeros((1, 1)) for _ in range(12)]
+        operands[5] = None
+        for function in captured:
+            with patch.object(
+                gdn_attention_op,
+                "gdn_attention_pooled_core_tpu",
+                return_value=(operands[3], operands[0]),
+            ) as dispatch:
+                function(*operands)
+            assert dispatch.call_args.args[0] is operands[0]
+
+
+def test_pooled_preparation_rejects_instance_method(cpu_vllm_config_context):
+    class InstancePreparation(VllmGatedDeltaNetAttention):
+        def _prepare_pooled_gdn_input(self, mixed_qkv, seq_lens, mesh):
+            return mixed_qkv
+
+    layer = _qwen35_397b_gdn_attn("model.layers.0.linear_attn")
+    layer.__class__ = InstancePreparation
+    with (
+        set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+        patch.object(gdn_attention_op.pallas, "jax_op") as build,
+        pytest.raises(TypeError, match="stateless staticmethod"),
+    ):
+        layer._build_pooled_gdn_op()
+    build.assert_not_called()
