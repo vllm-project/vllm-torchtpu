@@ -14,21 +14,53 @@
 """Torch custom-op boundaries for sparse attention and its native pool."""
 
 import functools
-from collections.abc import Callable
+import hashlib
 
 import torch
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import pooled_qsa_step
-from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import qsa_step
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import TopKBackend
+from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
+    compact_pooled_qsa_step,
+)
+
+_backend_keys: dict[str, TopKBackend] = {}
+
+
+def _op_name(kind: str, backend: TopKBackend | None, backend_key: str | None) -> str:
+    if backend is None:
+        if backend_key is not None:
+            raise ValueError("A backend key requires an explicit topk_backend")
+        return f"qwen4_exp::{kind}"
+    if not isinstance(backend_key, str) or not backend_key:
+        raise ValueError("Explicit topk_backend requires a stable topk_backend_key")
+    previous = _backend_keys.setdefault(backend_key, backend)
+    if previous != backend:
+        raise ValueError("topk_backend_key already identifies a different backend")
+    suffix = hashlib.sha256(backend_key.encode("utf-8")).hexdigest()
+    return f"qwen4_exp::{kind}_{suffix}"
+
+
+def build_compact_pooled_qsa_op(
+    *, topk_backend: TopKBackend | None = None, topk_backend_key: str | None = None
+):
+    """Bind a selector under a stable persisted-graph identity.
+
+    Explicit keys must identify the implementation/version and all static
+    configuration, consistently across processes. Different backends must not
+    reuse a key. The default selector retains its legacy operator name.
+    """
+    return _build_compact_pooled_qsa_op(topk_backend, topk_backend_key)
 
 
 @functools.cache
-def build_qsa_op() -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
+def _build_compact_pooled_qsa_op(
+    topk_backend: TopKBackend | None, topk_backend_key: str | None
+):
     op = pallas.jax_op(
-        "qwen4_exp::qsa",
-        qsa_step,
-        donate_argnums=(10, 11, 12, 13),
+        _op_name("compact_pooled_qsa", topk_backend, topk_backend_key),
+        functools.partial(compact_pooled_qsa_step, topk_backend=topk_backend),
+        donate_argnums=(10, 11),
     )
 
     @op.register_fake
@@ -43,110 +75,8 @@ def build_qsa_op() -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
         nik,
         positions,
         trig,
-        packed_kv,
-        compressed,
-        ring,
-        tags,
-        starts,
-        context,
-        slots,
-        main_table,
-        compressed_table,
-        compress_ratio,
-        token_topk,
-        norm_eps,
-        rotary_dim,
-        k_scale=1.0,
-        v_scale=1.0,
-    ):
-        return (
-            *(torch.empty_like(x) for x in (packed_kv, compressed, ring, tags)),
-            qgate.new_empty((qgate.shape[0], qgate.shape[-1] // 2)),
-            positions.new_empty(
-                (qgate.shape[0], token_topk + compress_ratio - 1), dtype=torch.int32
-            ),
-        )
-
-    def run(
-        qgate,
-        key,
-        value,
-        index_qk,
-        nq,
-        nk,
-        niq,
-        nik,
-        positions,
-        trig,
-        packed_kv,
-        compressed,
-        ring,
-        tags,
-        starts,
-        context,
-        slots,
-        main_table,
-        compressed_table,
-        compress_ratio,
-        token_topk,
-        norm_eps,
-        rotary_dim,
-        k_scale=1.0,
-        v_scale=1.0,
-    ):
-        packed, c, r, p, output, selected = op(
-            qgate,
-            key,
-            value,
-            index_qk,
-            nq,
-            nk,
-            niq,
-            nik,
-            positions.to(torch.int32),
-            trig,
-            packed_kv,
-            compressed,
-            ring,
-            tags,
-            starts.to(torch.int32),
-            context.to(torch.int32),
-            slots.to(torch.int32),
-            main_table.to(torch.int32),
-            compressed_table.to(torch.int32),
-            compress_ratio,
-            token_topk,
-            norm_eps,
-            rotary_dim,
-            k_scale,
-            v_scale,
-        )
-        for owner, updated in zip(
-            (packed_kv, compressed, ring, tags), (packed, c, r, p)
-        ):
-            owner.copy_(updated)
-        return output, selected
-
-    return run
-
-
-@functools.cache
-def build_pooled_qsa_op():
-    op = pallas.jax_op("qwen4_exp::pooled_qsa", pooled_qsa_step, donate_argnums=(10,))
-
-    @op.register_fake
-    def fake(
-        qgate,
-        key,
-        value,
-        index_qk,
-        nq,
-        nk,
-        niq,
-        nik,
-        positions,
-        trig,
         pool,
+        index_pool,
         starts,
         context,
         ring_ids,
@@ -161,6 +91,7 @@ def build_pooled_qsa_op():
     ):
         return (
             torch.empty_like(pool),
+            torch.empty_like(index_pool),
             qgate.new_empty((qgate.shape[0], qgate.shape[-1] // 2)),
             positions.new_empty(
                 (qgate.shape[0], token_topk + compress_ratio - 1), dtype=torch.int32
@@ -169,10 +100,11 @@ def build_pooled_qsa_op():
 
     def run(*args, **kwargs):
         args = list(args)
-        for index in (8, 11, 12, 13, 14, 15):
+        for index in (8, 12, 13, 14, 15, 16):
             args[index] = args[index].to(torch.int32)
-        updated, output, blocks = op(*args, **kwargs)
+        updated, index_updated, output, blocks = op(*args, **kwargs)
         args[10].copy_(updated)
+        args[11].copy_(index_updated)
         return output, blocks
 
     return run
