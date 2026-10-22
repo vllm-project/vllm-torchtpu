@@ -35,8 +35,6 @@ well within the 1800s CI Nightly per-test timeout):
   (``video_sha256 = 0e9bc093...``, ``audio_sha256 = 382ac716...``).
 """
 
-import hashlib
-import time
 from collections.abc import Callable
 
 import numpy as np
@@ -50,7 +48,6 @@ from tests_omni.models.ltx2.utils import (
     build_ltx2_request,
     extract_ltx2_outputs,
     get_ltx2_model,
-    record,
 )
 
 pytestmark = [
@@ -76,42 +73,16 @@ def test_ltx2_t2v_smoke_tpu(
     record_property: Callable[[str, object], None],
 ) -> None:
     """Verify LTX-2 T2V output shapes, dtypes, and non-degeneracy on TPU v7x."""
-    t0 = time.perf_counter()
     raw_outputs = list(omni_runner.generate(LTX2_PROMPT, build_ltx2_request(seed=42)))
-    req_elapsed_s = time.perf_counter() - t0
 
     out = extract_ltx2_outputs(raw_outputs)
 
     video_f32 = out.video.astype(np.float32)
     frame_stds = video_f32.std(axis=(1, 2, 3))
     min_frame_std = float(frame_stds.min())
-    mean_frame_std = float(frame_stds.mean())
     temporal_diff_mean = float(np.abs(np.diff(video_f32, axis=0)).mean())
 
     audio_rms = float(np.sqrt(np.mean(out.audio**2)))
-    audio_max_abs = float(np.max(np.abs(out.audio)))
-    channel_diff_max = float(np.max(np.abs(out.audio[0] - out.audio[1])))
-
-    video_sha256 = hashlib.sha256(out.video.tobytes()).hexdigest()
-    audio_sha256 = hashlib.sha256(out.audio.tobytes()).hexdigest()
-
-    record(
-        record_property,
-        "t2v-smoke",
-        req_elapsed_s=round(req_elapsed_s, 3),
-        video_shape=list(out.video.shape),
-        audio_shape=list(out.audio.shape),
-        sample_rate=out.sample_rate,
-        fps=out.fps,
-        min_frame_std=min_frame_std,
-        mean_frame_std=mean_frame_std,
-        temporal_diff_mean=temporal_diff_mean,
-        audio_rms=audio_rms,
-        audio_max_abs=audio_max_abs,
-        channel_diff_max=channel_diff_max,
-        video_sha256=video_sha256,
-        audio_sha256=audio_sha256,
-    )
 
     assert min_frame_std >= VIDEO_MIN_FRAME_STD_FLOOR, (
         f"Video min frame std {min_frame_std:.3f} < {VIDEO_MIN_FRAME_STD_FLOOR}"
@@ -134,39 +105,14 @@ def test_ltx2_seed_determinism_tpu(
     record_property: Callable[[str, object], None],
 ) -> None:
     """Verify identical seeds produce bitwise-equal video and audio on TPU v7x."""
-    t0 = time.perf_counter()
     out_42_a = extract_ltx2_outputs(
         list(omni_runner.generate(LTX2_PROMPT, build_ltx2_request(seed=42)))
     )
-    t1 = time.perf_counter()
     out_42_b = extract_ltx2_outputs(
         list(omni_runner.generate(LTX2_PROMPT, build_ltx2_request(seed=42)))
     )
-    t2 = time.perf_counter()
     out_43 = extract_ltx2_outputs(
         list(omni_runner.generate(LTX2_PROMPT, build_ltx2_request(seed=43)))
-    )
-    t3 = time.perf_counter()
-
-    video_42_a_sha = hashlib.sha256(out_42_a.video.tobytes()).hexdigest()
-    video_42_b_sha = hashlib.sha256(out_42_b.video.tobytes()).hexdigest()
-    video_43_sha = hashlib.sha256(out_43.video.tobytes()).hexdigest()
-    audio_42_a_sha = hashlib.sha256(out_42_a.audio.tobytes()).hexdigest()
-    audio_42_b_sha = hashlib.sha256(out_42_b.audio.tobytes()).hexdigest()
-    audio_43_sha = hashlib.sha256(out_43.audio.tobytes()).hexdigest()
-
-    record(
-        record_property,
-        "seed-determinism",
-        run1_s=round(t1 - t0, 3),
-        run2_s=round(t2 - t1, 3),
-        run3_seed43_s=round(t3 - t2, 3),
-        video_42_a_sha256=video_42_a_sha,
-        video_42_b_sha256=video_42_b_sha,
-        video_43_sha256=video_43_sha,
-        audio_42_a_sha256=audio_42_a_sha,
-        audio_42_b_sha256=audio_42_b_sha,
-        audio_43_sha256=audio_43_sha,
     )
 
     np.testing.assert_array_equal(
