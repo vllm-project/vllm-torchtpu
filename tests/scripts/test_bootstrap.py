@@ -91,15 +91,9 @@ def run_bootstrap(
             check=True,
         )
         calls_file = tmp_path / "calls.log"
-        calls = (
-            calls_file.read_text().splitlines() if calls_file.exists() else []
-        )
-        uploads = [
-            p.read_text() for p in sorted(tmp_path.glob("upload_*.yml"))
-        ]
-        dry_runs = [
-            p.read_text() for p in sorted(tmp_path.glob("dry_run_*.yml"))
-        ]
+        calls = calls_file.read_text().splitlines() if calls_file.exists() else []
+        uploads = [p.read_text() for p in sorted(tmp_path.glob("upload_*.yml"))]
+        dry_runs = [p.read_text() for p in sorted(tmp_path.glob("dry_run_*.yml"))]
         return (
             calls,
             uploads,
