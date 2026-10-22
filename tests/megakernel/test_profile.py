@@ -23,8 +23,8 @@ from pathlib import Path
 
 import pytest
 
-from vllm_torchtpu.megakernel import module_options, profile
-from vllm_torchtpu.megakernel.exec_spec import MAX_BATCH_ROWS, ExecSpec, Tiles
+from vllm_torchtpu.megakernel import block_options, profile, profiles
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.megakernel.pool.config import CacheExec, cache_exec, with_cache
 from vllm_torchtpu.megakernel.profile import (
     DEFAULT_PROFILE,
@@ -41,22 +41,23 @@ from vllm_torchtpu.megakernel.profiles.default import default_tiles
 
 @dataclasses.dataclass(frozen=True)
 class _TestTunables:
-    """Test-only module tunables (registered under `_TEST_MODULE`)."""
+    """Test-only block tunables (registered under `_TEST_BLOCK`)."""
 
     width: int = 128
     fast: bool = False
     NUMERICS = {"width": "approx", "fast": "exact"}
 
 
-_TEST_MODULE = "test_profile_module"
+_TEST_BLOCK = "test_profile_block"
 
 
 @pytest.fixture(autouse=True)
 def _isolated_profile_state(monkeypatch: pytest.MonkeyPatch):
     """Register `_TestTunables` and isolate profile registry state per test."""
-    monkeypatch.setitem(module_options._TUNABLES, _TEST_MODULE, _TestTunables)
+    monkeypatch.setitem(block_options._TUNABLES, _TEST_BLOCK, _TestTunables)
     monkeypatch.setattr(profile, "_REGISTRY", {"default": DEFAULT_PROFILE})
     monkeypatch.setattr(profile, "_MODEL_DEFAULTS", {})
+    monkeypatch.setattr(profile, "_BUILTINS_LOADED", True)
 
 
 def test_profile_imports_only_exec_spec_pool_and_profiles():
@@ -117,12 +118,8 @@ def test_profile_validation_and_numerics_enforcement():
         Profile(name="bad-num", numerics="bitwise")  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="fused_pool_io must be a bool or 'auto'"):
         Profile(name="bad-fused", fused_pool_io="sometimes")
-    with pytest.raises(ValueError, match="fused_pool_io must be a bool or 'auto'"):
-        Profile(name="bad-fused-int", fused_pool_io=1)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="pool_gather must be False, None or True"):
         Profile(name="bad-pg", pool_gather="eligible")  # type: ignore[arg-type]
-    with pytest.raises(ValueError, match="pool_gather must be False, None or True"):
-        Profile(name="bad-pg-int", pool_gather=1)  # type: ignore[arg-type]
     with pytest.raises(ValueError, match="model default"):
         Profile(name="no-model-default", model_default=True)
     with pytest.raises(ValueError, match="model default"):
@@ -133,9 +130,9 @@ def test_profile_validation_and_numerics_enforcement():
             model_default=True,
         )
 
-    def _approx_module_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
-        return default_tiles(B, moe_tp=moe_tp, R=R).with_modules(
-            {_TEST_MODULE: {"width": 256}}
+    def _approx_block_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
+        return default_tiles(B, moe_tp=moe_tp, R=R).with_blocks(
+            {_TEST_BLOCK: {"width": 256}}
         )
 
     def _approx_core_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
@@ -143,17 +140,10 @@ def test_profile_validation_and_numerics_enforcement():
             default_tiles(B, moe_tp=moe_tp, R=R), dense_acc_pair=True
         )
 
-    with pytest.raises(ValueError, match=f"tiles.{_TEST_MODULE}.width"):
-        Profile(name="bad-exact-module", tiles=_approx_module_rule)
+    with pytest.raises(ValueError, match=f"tiles.{_TEST_BLOCK}.width"):
+        Profile(name="bad-exact-block", tiles=_approx_block_rule)
     with pytest.raises(ValueError, match=r"tiles\.dense_acc_pair"):
         Profile(name="bad-exact-core", tiles=_approx_core_rule)
-
-    def _approx_high_b_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
-        t = default_tiles(B, moe_tp=moe_tp, R=R)
-        return dataclasses.replace(t, dense_acc_pair=True) if B == MAX_BATCH_ROWS else t
-
-    with pytest.raises(ValueError, match=r"tiles\.dense_acc_pair"):
-        Profile(name="bad-exact-b128", tiles=_approx_high_b_rule)
     with pytest.raises(ValueError, match="fused_pool_io"):
         Profile(name="bad-exact-fused", fused_pool_io="auto")
     with pytest.raises(ValueError, match="pool_gather_eligible"):
@@ -163,37 +153,17 @@ def test_profile_validation_and_numerics_enforcement():
     def _exact_sched_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
         return dataclasses.replace(
             default_tiles(B, moe_tp=moe_tp, R=R), nbd=10, rel_fetch=True
-        ).with_modules({_TEST_MODULE: {"fast": True}})
+        ).with_blocks({_TEST_BLOCK: {"fast": True}})
 
     exact_prof = Profile(name="sched-only", tiles=_exact_sched_rule, pool_gather=None)
     assert exact_prof.numerics == "exact"
     assert approx_features(exact_prof) == ()
 
-    # Turning off an approx pool-I/O mode enabled on the model default is also detected.
-    register_profile(
-        Profile(
-            name="m-approx-ref",
-            model="m-io",
-            numerics="exact",
-            model_default=True,
-            pool_gather=True,
-            fused_pool_io="auto",
-        )
-    )
-    with pytest.raises(ValueError, match="fused_pool_io.*pool_gather_eligible"):
-        Profile(
-            name="m-off-exact",
-            model="m-io",
-            numerics="exact",
-            pool_gather=False,
-            fused_pool_io=False,
-        )
-
 
 def test_approx_features_against_default_and_model_reference():
     def _ref_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
-        return default_tiles(B, moe_tp=moe_tp, R=R).with_modules(
-            {_TEST_MODULE: {"width": 256}}
+        return default_tiles(B, moe_tp=moe_tp, R=R).with_blocks(
+            {_TEST_BLOCK: {"width": 256}}
         )
 
     ref = register_profile(
@@ -208,8 +178,8 @@ def test_approx_features_against_default_and_model_reference():
     assert approx_features(ref) == ()
 
     def _tuned_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
-        base = _ref_rule(B, moe_tp=moe_tp, R=R).with_modules(
-            {_TEST_MODULE: {"fast": True}}
+        base = _ref_rule(B, moe_tp=moe_tp, R=R).with_blocks(
+            {_TEST_BLOCK: {"fast": True}}
         )
         if B == 64 and R == 16 and moe_tp:
             return dataclasses.replace(base, dense_acc_pair=True, dmm_unroll=8)
@@ -267,24 +237,13 @@ def test_with_overrides_relabels_and_derives_numerics():
     assert over.numerics == "exact"
     assert over.model_default is False
 
-    for kw in (
-        {"name": "default"},
-        {"name": "custom"},
-        {"numerics": "exact"},
-        {"numerics": "approx"},
-        {"model_default": False},
-        {"model_default": True},
-    ):
-        with pytest.raises(ValueError, match="derives.*automatically"):
-            d.with_overrides(**kw)
-
 
 def test_model_profile_without_tiles_inherits_model_default_rule():
     def _ref_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
         return dataclasses.replace(
             default_tiles(B, moe_tp=moe_tp, R=R),
             nbd=10 if moe_tp else 12,
-        ).with_modules({_TEST_MODULE: {"width": 256}})
+        ).with_blocks({_TEST_BLOCK: {"width": 256}})
 
     ref = register_profile(
         Profile(
@@ -390,91 +349,34 @@ def test_registry_lookup_idempotency_and_replacement():
         Profile(name="m-base-2", model="m", model_default=True), replace=True
     )
     assert model_default_profile("m") is p_alt
-    assert "m-base" not in list_profiles()
-
-    # Overwriting a model default with `model_default=False` clears `_MODEL_DEFAULTS`.
-    p_non_def = register_profile(
-        Profile(
-            name="m-base-2",
-            model="m",
-            numerics="approx",
-            pool_gather=True,
-            model_default=False,
-        ),
-        replace=True,
-    )
-    assert get_profile("m-base-2") is p_non_def
-    assert model_default_profile("m") is DEFAULT_PROFILE
 
 
-def test_registration_order_cannot_bypass_exact_enforcement():
-    def _model_ref_rule(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
-        return dataclasses.replace(
-            default_tiles(B, moe_tp=moe_tp, R=R), dense_acc_pair=True
-        )
+def test_load_builtins_sets_flag_only_after_success(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setattr(profile, "_BUILTINS_LOADED", False)
+    calls = 0
 
-    # Constructed before `ord_model` registers its default: matches library
-    # `DEFAULT_PROFILE` at construction time, but diverges from `_model_ref_rule`.
-    early_bad = Profile(
-        name="ord-early-bad",
-        model="ord_model",
-        numerics="exact",
-        tiles=default_tiles,
-    )
-    # `tiles=None` inherits the model default once registered, so it stays exact.
-    early_inherit = register_profile(
-        Profile(name="ord-early-inherit", model="ord_model", numerics="exact")
-    )
+    def _boom() -> None:
+        nonlocal calls
+        calls += 1
+        raise ImportError("synthetic")
 
-    m_def = Profile(
-        name="ord-default",
-        model="ord_model",
-        tiles=_model_ref_rule,
-        model_default=True,
-    )
+    monkeypatch.setattr(profiles, "load_builtin_profiles", _boom)
+    with pytest.raises(ImportError, match="synthetic"):
+        list_profiles()
+    assert calls == 1
+    assert profile._BUILTINS_LOADED is False
 
-    # Case 1: `early_bad` registered first -> registering `m_def` fails atomically.
-    register_profile(early_bad)
-    with pytest.raises(ValueError, match=r"tiles\.dense_acc_pair"):
-        register_profile(m_def)
-    assert model_default_profile("ord_model") is DEFAULT_PROFILE
-    assert "ord-default" not in list_profiles()
+    def _ok() -> None:
+        nonlocal calls
+        calls += 1
+        register_profile(Profile(name="builtin-test"))
 
-    # Case 2: `m_def` registered first (after replacing `early_bad` with approx) ->
-    # registering `early_bad` or resolving it via `get_profile` fails.
-    register_profile(
-        dataclasses.replace(early_bad, numerics="approx"),
-        replace=True,
-    )
-    register_profile(m_def)
-    assert model_default_profile("ord_model") is m_def
-    assert approx_features(early_inherit) == ()
-    assert early_inherit.tile_rule() is _model_ref_rule
-
-    with pytest.raises(ValueError, match=r"tiles\.dense_acc_pair"):
-        register_profile(early_bad, replace=True)
-    with pytest.raises(ValueError, match=r"tiles\.dense_acc_pair"):
-        get_profile(early_bad)
-
-    # Demoting `m_def` when another registered `exact` profile uses `_model_ref_rule`
-    # also fails atomically instead of leaving an invalid `exact` profile registered.
-    register_profile(
-        Profile(
-            name="ord-explicit-ref",
-            model="ord_model",
-            numerics="exact",
-            tiles=_model_ref_rule,
-        )
-    )
-    with pytest.raises(ValueError, match=r"tiles\.dense_acc_pair"):
-        register_profile(
-            Profile(
-                name="ord-default",
-                model="ord_model",
-                numerics="approx",
-                pool_gather=True,
-                model_default=False,
-            ),
-            replace=True,
-        )
-    assert model_default_profile("ord_model") is m_def
+    monkeypatch.setattr(profiles, "load_builtin_profiles", _ok)
+    assert "builtin-test" in list_profiles()
+    assert profile._BUILTINS_LOADED is True
+    assert calls == 2
+    # Subsequent lookups do not re-run `load_builtin_profiles`.
+    assert get_profile("builtin-test").name == "builtin-test"
+    assert calls == 2

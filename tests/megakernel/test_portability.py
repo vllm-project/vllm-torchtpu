@@ -22,10 +22,6 @@ from pathlib import Path
 from vllm_torchtpu import megakernel
 
 
-def _ln(node: ast.AST) -> int:
-    return int(getattr(node, "lineno", 0))
-
-
 def _derive_required_modules(
     root: Path, py_files: list[Path], rel_paths: set[str]
 ) -> set[str]:
@@ -61,9 +57,6 @@ def _derive_required_modules(
     return required
 
 
-_LAZY_IMPORTERS = frozenset({"__init__.py", "dma/__init__.py", "runtime/__init__.py"})
-
-
 def test_megakernel_portability_ast_guard():
     """Enforce relative internal imports, 0 vllm/torch deps, and jax._src allowlist.
 
@@ -71,11 +64,11 @@ def test_megakernel_portability_ast_guard():
     - Zero imports from `vllm`, `vllm_torchtpu`, or `torch`.
     - All absolute (`level == 0`) imports come strictly from Python stdlib, `jax`,
       or `numpy` (enforcing relative imports for all internal modules).
-    - Private `jax._src.*` imports are restricted to `{"dma/pool_alias.py"}`.
+    - Private `jax._src.*` imports are restricted to `{"pool_alias.py"}`.
     - Dynamic import calls (`__import__`, `import_module`) are forbidden.
     """
     pkg_root = Path(megakernel.__file__).resolve().parent
-    jax_src_allowlist = {"dma/pool_alias.py"}
+    jax_src_allowlist = {"pool_alias.py"}
     forbidden_roots = {"vllm", "vllm_torchtpu", "torch"}
     allowed_external_roots = sys.stdlib_module_names | {"jax", "numpy"}
 
@@ -96,12 +89,8 @@ def test_megakernel_portability_ast_guard():
                     if isinstance(func, ast.Name)
                     else (func.attr if isinstance(func, ast.Attribute) else None)
                 )
-                # The lazy (PEP 562) package namespaces import their own
-                # submodules by name.
-                if rel in _LAZY_IMPORTERS and func_name == "import_module":
-                    continue
                 assert func_name not in {"__import__", "import_module"}, (
-                    f"{rel}:{_ln(node)} calls dynamic import '{func_name}'; "
+                    f"{rel}:{node.lineno} calls dynamic import '{func_name}'; "
                     "use static relative imports within megakernel/."
                 )
                 continue
@@ -123,44 +112,99 @@ def test_megakernel_portability_ast_guard():
             if rel not in facade_allowlist and not rel.startswith("models/"):
                 for mod in modules:
                     assert mod != "models" and not mod.startswith("models."), (
-                        f"{rel}:{_ln(node)} imports '{mod}'; core megakernel "
+                        f"{rel}:{node.lineno} imports '{mod}'; core megakernel "
                         "modules must be model-agnostic and never import models/."
                     )
                 if not modules:
                     assert "models" not in imported_names, (
-                        f"{rel}:{_ln(node)} imports 'models'; core megakernel "
+                        f"{rel}:{node.lineno} imports 'models'; core megakernel "
                         "modules must be model-agnostic and never import models/."
                     )
 
             for mod in modules:
                 root = mod.split(".")[0]
                 assert root not in forbidden_roots, (
-                    f"{rel}:{_ln(node)} imports forbidden module '{mod}'; "
+                    f"{rel}:{node.lineno} imports forbidden module '{mod}'; "
                     "use relative imports and keep 0 vllm/torch dependencies."
                 )
                 if level == 0:
                     assert root in allowed_external_roots, (
-                        f"{rel}:{_ln(node)} uses non-relative or disallowed import "
+                        f"{rel}:{node.lineno} uses non-relative or disallowed import "
                         f"'{mod}'; internal megakernel imports must be relative and "
                         "external imports must be Python stdlib, jax, or numpy."
                     )
                 if mod == "jax._src" or mod.startswith("jax._src."):
                     assert rel in jax_src_allowlist, (
-                        f"{rel}:{_ln(node)} imports private JAX API '{mod}', "
+                        f"{rel}:{node.lineno} imports private JAX API '{mod}', "
                         f"which is restricted to allowlist {sorted(jax_src_allowlist)}."
                     )
 
 
-def _assert_package_is_framework_free(pkg: str) -> None:
-    """`megakernel/<pkg>/` imports only stdlib, jax, numpy and core spec modules."""
-    pkg_root = Path(megakernel.__file__).resolve().parent / pkg
-    py_files = sorted(pkg_root.rglob("*.py"))
-    rel_paths = {p.relative_to(pkg_root).as_posix() for p in py_files}
-    required_modules = _derive_required_modules(pkg_root, py_files, rel_paths)
-    assert len(required_modules) > 1
-    assert required_modules <= rel_paths, required_modules - rel_paths
+def test_blocks_do_not_import_experimental_code():
+    """Blocks reach fused pool I/O only via the core `fused_io_hook` module.
+
+    No module under `blocks/` may import `experimental/` (or the fused helpers)
+    at any level, so GQA / GDN can land without the experimental code.
+    """
+    blocks_root = Path(megakernel.__file__).resolve().parent / "blocks"
+    py_files = sorted(blocks_root.rglob("*.py"))
+    rel_paths = {p.relative_to(blocks_root).as_posix() for p in py_files}
+    expected_block_files = {
+        "__init__.py",
+        "norm.py",
+        "gqa/__init__.py",
+        "gqa/block.py",
+        "gqa/decls.py",
+        "gqa/kv.py",
+        "gqa/reference.py",
+        "gdn/__init__.py",
+        "gdn/block.py",
+        "gdn/decls.py",
+        "gdn/states.py",
+        "gdn/reference.py",
+        "moe/__init__.py",
+        "moe/block.py",
+        "moe/decls.py",
+        "moe/reference.py",
+    }
+    assert expected_block_files <= rel_paths, expected_block_files - rel_paths
+    for path in py_files:
+        rel = path.relative_to(blocks_root).as_posix()
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            # Only the library's own modules matter (relative imports or
+            # `vllm_torchtpu.*`); third-party `jax.experimental` is fine.
+            names: list[str] = []
+            if isinstance(node, ast.Import):
+                names = [
+                    a.name for a in node.names if a.name.startswith("vllm_torchtpu")
+                ]
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                if node.level > 0 or mod.startswith("vllm_torchtpu"):
+                    names = [mod] + [a.name for a in node.names]
+            for name in names:
+                assert "experimental" not in name and "fused_pool_io" not in name, (
+                    f"blocks/{rel}:{node.lineno} imports '{name}'; blocks "
+                    "must reach fused pool I/O through fused_io_hook"
+                )
+
+
+def test_pool_package_is_framework_free():
+    """`megakernel/pool/` imports only stdlib, jax, numpy and core spec modules.
+
+    The generic pool package must not depend on `models/` (no per-model code),
+    nor on blocks, the kernel builder or the cache pipes; its only internal
+    dependencies are `ops`, `errors`, `spec`, `exec_spec` and its own modules.
+    """
+    pool_root = Path(megakernel.__file__).resolve().parent / "pool"
+    py_files = sorted(pool_root.rglob("*.py"))
+    rel_paths = {p.relative_to(pool_root).as_posix() for p in py_files}
+    required_pool_modules = _derive_required_modules(pool_root, py_files, rel_paths)
+    assert len(required_pool_modules) > 1
+    assert required_pool_modules <= rel_paths, required_pool_modules - rel_paths
     allowed_external_roots = sys.stdlib_module_names | {"jax", "numpy"}
-    allowed_core = {"ops", "errors", "spec", "module", "decls", "exec_spec"}
+    allowed_core = {"ops", "errors", "spec", "decls", "exec_spec"}
     for path in py_files:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
         for node in ast.walk(tree):
@@ -168,35 +212,24 @@ def _assert_package_is_framework_free(pkg: str) -> None:
                 for alias in node.names:
                     root = alias.name.split(".")[0]
                     assert root in allowed_external_roots, (
-                        f"{pkg}/{path.name}:{_ln(node)} imports '{alias.name}'"
+                        f"pool/{path.name}:{node.lineno} imports '{alias.name}'"
                     )
             elif isinstance(node, ast.ImportFrom):
                 mod = node.module or ""
                 if node.level == 0:
                     assert mod.split(".")[0] in allowed_external_roots, (
-                        f"{pkg}/{path.name}:{_ln(node)} imports '{mod}'"
+                        f"pool/{path.name}:{node.lineno} imports '{mod}'"
                     )
                 elif node.level == 2:
                     names = [mod] if mod else [a.name for a in node.names]
                     for name in names:
                         assert name.split(".")[0] in allowed_core, (
-                            f"{pkg}/{path.name}:{_ln(node)} imports '..{name}'; "
-                            f"{pkg}/ may only use {sorted(allowed_core)} from core "
-                            "(never models/, modules/, kernel or cache)"
+                            f"pool/{path.name}:{node.lineno} imports '..{name}'; "
+                            f"pool/ may only use {sorted(allowed_core)} from core "
+                            "(never models/, blocks/, kernel or cache)"
                         )
                 else:
                     assert node.level == 1, (
-                        f"{pkg}/{path.name}:{_ln(node)} relative import level "
+                        f"pool/{path.name}:{node.lineno} relative import level "
                         f"{node.level} leaves the megakernel package"
                     )
-
-
-def test_pool_package_is_framework_free():
-    """`megakernel/pool/` imports only stdlib, jax, numpy and core spec modules.
-
-    The generic pool package must not depend on `models/` (no per-model code),
-    nor on modules, the kernel builder or the cache pipes; its only internal
-    dependencies are `ops`, `errors`, `spec`, `module`, `decls`, `exec_spec`
-    and its own modules.
-    """
-    _assert_package_is_framework_free("pool")

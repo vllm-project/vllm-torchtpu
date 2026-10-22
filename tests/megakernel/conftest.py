@@ -11,44 +11,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Pytest configuration and shared fixtures for the TPU megakernel test suite.
-
-Megakernel multi-rank CPU interpret tests require 8 virtual XLA host devices
-(`--xla_force_host_platform_device_count=8`), whereas other suites in the
-repository (such as `tests/experimental/export/test_checkpoint.py`) assume a
-single host CPU device per process. To avoid polluting the global XLA host
-device count when collected alongside non-megakernel tests in a shared pytest
-session:
-- Direct invocations targeting only `tests/megakernel*` configure `XLA_FLAGS`
-  in `pytest_configure` before JAX initializes its CPU backend and run in-process.
-- Mixed invocations leave the parent process's `XLA_FLAGS` untouched and
-  transparently stream each `tests/megakernel*` module through an isolated
-  8-CPU-device subprocess whenever the parent process has fewer than 8 CPU
-  devices.
-"""
+"""Shared test fixtures and fake blocks for the TPU megakernel test suite."""
 
 from __future__ import annotations
 
-import io
-import json
+import contextlib
+import dataclasses
 import os
-import subprocess
-import sys
-import tempfile
-from pathlib import Path
-from typing import Any
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any, ClassVar
 
-import pytest
-
-from tests.megakernel.megakernel_fakes import TINY_TILES
-from vllm_torchtpu.megakernel.exec_spec import ExecSpec
-
-_PLUGIN_NAME = "vllm_megakernel_cpu_xla"
-_ENV_ACTIVE = "_VLLM_MK_SUBPROC_ACTIVE"
-_ENV_NODEIDS = "_VLLM_MK_SUBPROC_NODEIDS"
-_ENV_STREAM_FD = "_VLLM_MK_SUBPROC_FD"
-
-_MK_XLA_FLAGS = (
+_xla_flags = os.environ.get("XLA_FLAGS", "")
+for _flag_prefix, _flag in (
     (
         "--xla_force_host_platform_device_count",
         "--xla_force_host_platform_device_count=8",
@@ -57,340 +32,397 @@ _MK_XLA_FLAGS = (
         "--xla_llvm_disable_expensive_passes",
         "--xla_llvm_disable_expensive_passes=true",
     ),
+):
+    if _flag_prefix not in _xla_flags:
+        _xla_flags = f"{_xla_flags} {_flag}".strip()
+os.environ["XLA_FLAGS"] = _xla_flags
+
+import pytest  # noqa: E402
+from jax.experimental.pallas import tpu as pltpu  # noqa: E402
+
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles  # noqa: E402
+from vllm_torchtpu.megakernel.ops import BF16, F32, FP8, rmsnorm  # noqa: E402
+from vllm_torchtpu.megakernel.spec import (  # noqa: E402
+    Block,
+    LayerType,
+    ModelSpec,
+    ScratchReq,
+    SmallField,
+    StateDecl,
+    SwitchSlot,
+    WeightDecl,
 )
 
-
-def _with_mk_xla_flags(raw_flags: str) -> str:
-    flags = raw_flags
-    for prefix, flag in _MK_XLA_FLAGS:
-        if prefix not in flags:
-            flags = f"{flags} {flag}".strip()
-    return flags
+# Small banks and rings for CPU interpret unit tests of tiny geometries.
+TINY_TILES = Tiles(bank=128 << 10, nbd=10, nbe=6, ebank=256 << 10, vmem_mib=32)
 
 
-def _mk_roots() -> tuple[Path, ...]:
-    tests_dir = Path(__file__).resolve().parent.parent
-    return (
-        (tests_dir / "megakernel").resolve(),
-        (tests_dir / "megakernel_runtime").resolve(),
-    )
-
-
-def _is_mk_path(path: Path) -> bool:
-    resolved = path.resolve()
-    return any(resolved == root or root in resolved.parents for root in _mk_roots())
-
-
-def _xla_cpu_initialized() -> bool:
-    xb = sys.modules.get("jax._src.xla_bridge")
-    if xb is None:
-        return False
-    backends = getattr(xb, "_backends", None)
-    return isinstance(backends, dict) and "cpu" in backends
-
-
-def _targets_only_megakernel(config: pytest.Config) -> bool:
-    if not config.args:
-        return False
-    cwd = Path(str(config.invocation_params.dir)).resolve()
-    for raw in config.args:
-        path_part = raw.split("::", 1)[0]
-        if not path_part or not _is_mk_path(cwd / path_part):
-            return False
-    return True
-
-
-def _serialize_report(report: pytest.TestReport) -> dict[str, Any]:
-    longrepr: Any
-    if report.longrepr is None:
-        longrepr = None
-    elif isinstance(report.longrepr, tuple) and len(report.longrepr) == 3:
-        longrepr = [
-            str(report.longrepr[0]),
-            int(report.longrepr[1]),
-            str(report.longrepr[2]),
-        ]
-    else:
-        longrepr = report.longreprtext
-    data: dict[str, Any] = {
-        "when": report.when,
-        "outcome": report.outcome,
-        "longrepr": longrepr,
-        "duration": report.duration,
-        "sections": [[str(k), str(v)] for k, v in report.sections],
-    }
-    if hasattr(report, "wasxfail"):
-        data["wasxfail"] = str(report.wasxfail)
-    return data
-
-
-def _deserialize_report(item: pytest.Item, raw: dict[str, Any]) -> pytest.TestReport:
-    lr_raw = raw["longrepr"]
-    longrepr: None | tuple[str, int, str] | str
-    if lr_raw is None:
-        longrepr = None
-    elif isinstance(lr_raw, list) and len(lr_raw) == 3:
-        longrepr = (str(lr_raw[0]), int(lr_raw[1]), str(lr_raw[2]))
-    else:
-        longrepr = str(lr_raw)
-    rep = pytest.TestReport(
-        nodeid=item.nodeid,
-        location=item.location,
-        keywords=item.keywords,
-        outcome=raw["outcome"],
-        longrepr=longrepr,
-        when=raw["when"],
-        sections=[(str(s[0]), str(s[1])) for s in raw.get("sections", ())],
-        duration=float(raw.get("duration", 0.0)),
-    )
-    if "wasxfail" in raw:
-        rep.wasxfail = raw["wasxfail"]  # type: ignore[attr-defined]
-    return rep
-
-
-class _ChildStreamPlugin:
-    def __init__(self, nodeids_file: str, stream_fd: int) -> None:
-        with open(nodeids_file, encoding="utf-8") as f:
-            self._wanted: list[str] = json.load(f)
-        self._wanted_set = set(self._wanted)
-        self._stream = os.fdopen(stream_fd, "w", encoding="utf-8", buffering=1)
-        self._pending: dict[str, list[dict[str, Any]]] = {}
-
-    def pytest_collection_modifyitems(
-        self, config: pytest.Config, items: list[pytest.Item]
-    ) -> None:
-        by_id: dict[str, list[pytest.Item]] = {}
-        for it in items:
-            if it.nodeid in self._wanted_set:
-                by_id.setdefault(it.nodeid, []).append(it)
-        ordered: list[pytest.Item] = []
-        for nid in self._wanted:
-            bucket = by_id.get(nid)
-            if bucket:
-                ordered.append(bucket.pop(0))
-        items[:] = ordered
-
-    def pytest_runtest_logreport(self, report: pytest.TestReport) -> None:
-        self._pending.setdefault(report.nodeid, []).append(_serialize_report(report))
-
-    def pytest_runtest_logfinish(
-        self, nodeid: str, location: tuple[str, int | None, str]
-    ) -> None:
-        payload = {
-            "nodeid": nodeid,
-            "reports": self._pending.pop(nodeid, []),
-        }
-        self._stream.write(json.dumps(payload) + "\n")
-        self._stream.flush()
-
-    def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
-        self._stream.close()
-
-
-class _ModuleRunner:
-    def __init__(
-        self,
-        proc: subprocess.Popen[bytes],
-        reader: io.TextIOWrapper,
-        log_path: Path,
-        nodeids_path: Path,
-        remaining: int,
-    ) -> None:
-        self.proc = proc
-        self.reader = reader
-        self.log_path = log_path
-        self.nodeids_path = nodeids_path
-        self.remaining = remaining
-        self.buffered: dict[str, list[dict[str, Any]]] = {}
-
-    def next_reports(self, nodeid: str) -> list[dict[str, Any]] | None:
-        if nodeid in self.buffered:
-            return self.buffered.pop(nodeid)
-        while True:
-            line = self.reader.readline()
-            if not line:
-                return None
-            msg = json.loads(line)
-            if msg["nodeid"] == nodeid:
-                return msg["reports"]
-            self.buffered[msg["nodeid"]] = msg["reports"]
-
-    def close(self, *, terminate: bool = False) -> tuple[int, str]:
-        try:
-            self.reader.close()
-        finally:
-            if terminate and self.proc.poll() is None:
-                self.proc.terminate()
-                try:
-                    self.proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self.proc.kill()
-            try:
-                rc = self.proc.wait(timeout=30)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
-                rc = self.proc.wait()
-            out = (
-                self.log_path.read_text(encoding="utf-8", errors="replace")
-                if self.log_path.is_file()
-                else ""
-            )
-            self.log_path.unlink(missing_ok=True)
-            self.nodeids_path.unlink(missing_ok=True)
-        return rc, out
-
-
-class _ParentIsolationPlugin:
-    def __init__(self) -> None:
-        self._has_8_cpu: bool | None = None
-        self._runners: dict[Path, _ModuleRunner] = {}
-
-    def _check_inproc_8_cpu(self) -> bool:
-        if self._has_8_cpu is None:
-            import jax
-
-            self._has_8_cpu = len(jax.devices("cpu")) >= 8
-        return self._has_8_cpu
-
-    def _get_or_start_runner(self, item: pytest.Item, mod_path: Path) -> _ModuleRunner:
-        runner = self._runners.get(mod_path)
-        if runner is not None:
-            return runner
-        session_items = item.session.items
-        try:
-            start = session_items.index(item)
-        except ValueError:
-            start = 0
-        wanted = [
-            it.nodeid
-            for it in session_items[start:]
-            if Path(it.path).resolve() == mod_path
-        ]
-        fd_tmp, nodeids_str = tempfile.mkstemp(prefix="mk_nodeids_", suffix=".json")
-        with os.fdopen(fd_tmp, "w", encoding="utf-8") as f:
-            json.dump(wanted, f)
-        r_fd, w_fd = os.pipe()
-        fd_log, log_str = tempfile.mkstemp(prefix="mk_subproc_", suffix=".log")
-        env = dict(os.environ)
-        env["XLA_FLAGS"] = _with_mk_xla_flags(env.get("XLA_FLAGS", ""))
-        env[_ENV_ACTIVE] = "1"
-        env[_ENV_NODEIDS] = nodeids_str
-        env[_ENV_STREAM_FD] = str(w_fd)
-        cmd = [
-            sys.executable,
-            "-m",
-            "pytest",
-            f"--rootdir={item.config.rootpath}",
-            "--tb=short",
-            "-q",
-        ]
-        confcutdir = getattr(item.config.option, "confcutdir", None)
-        if confcutdir:
-            cmd.append(f"--confcutdir={confcutdir}")
-        cmd.append(str(mod_path))
-        try:
-            proc = subprocess.Popen(
-                cmd,
-                cwd=str(item.config.invocation_params.dir),
-                env=env,
-                stdout=fd_log,
-                stderr=subprocess.STDOUT,
-                pass_fds=(w_fd,),
-            )
-        finally:
-            os.close(w_fd)
-            os.close(fd_log)
-        reader = os.fdopen(r_fd, "r", encoding="utf-8")
-        runner = _ModuleRunner(
-            proc=proc,
-            reader=reader,
-            log_path=Path(log_str),
-            nodeids_path=Path(nodeids_str),
-            remaining=len(wanted),
-        )
-        self._runners[mod_path] = runner
-        return runner
-
-    def pytest_runtest_protocol(
-        self, item: pytest.Item, nextitem: pytest.Item | None
-    ) -> bool | None:
-        mod_path = Path(item.path).resolve()
-        if not _is_mk_path(mod_path):
-            return None
-        if self._check_inproc_8_cpu():
-            return None
-
-        runner = self._get_or_start_runner(item, mod_path)
-        ihook = item.ihook
-        ihook.pytest_runtest_logstart(nodeid=item.nodeid, location=item.location)
-        try:
-            raw_reports = runner.next_reports(item.nodeid)
-        except BaseException:
-            self._runners.pop(mod_path, None)
-            runner.close(terminate=True)
-            raise
-        runner.remaining -= 1
-        rc = 0
-        crash_out = ""
-        if raw_reports is None or runner.remaining <= 0:
-            self._runners.pop(mod_path, None)
-            rc, crash_out = runner.close(terminate=raw_reports is None)
-
-        if raw_reports:
-            for raw in raw_reports:
-                ihook.pytest_runtest_logreport(report=_deserialize_report(item, raw))
-        else:
-            msg = (
-                f"Megakernel 8-CPU-device subprocess exited early (rc={rc}) "
-                f"before reporting {item.nodeid}:\n{crash_out[-4000:]}"
-            )
-            for when, outcome, lr in (
-                ("setup", "passed", None),
-                ("call", "failed", msg),
-                ("teardown", "passed", None),
-            ):
-                ihook.pytest_runtest_logreport(
-                    report=pytest.TestReport(
-                        nodeid=item.nodeid,
-                        location=item.location,
-                        keywords=item.keywords,
-                        outcome=outcome,  # type: ignore[arg-type]
-                        longrepr=lr,
-                        when=when,  # type: ignore[arg-type]
-                    )
-                )
-        ihook.pytest_runtest_logfinish(nodeid=item.nodeid, location=item.location)
-        return True
-
-    def pytest_sessionfinish(self, session: pytest.Session, exitstatus: int) -> None:
-        for mod_path in list(self._runners):
-            self._runners.pop(mod_path).close(terminate=True)
-
-
-def register_megakernel_cpu_plugin(config: pytest.Config) -> None:
+def pytest_configure(config: Any) -> None:
     config.addinivalue_line(
         "markers", "slow: multi-rank or large-batch CPU interpret tests"
     )
     config.addinivalue_line("markers", "golden: bit-exact golden hash regression tests")
-    if config.pluginmanager.has_plugin(_PLUGIN_NAME):
-        return
-    if os.environ.get(_ENV_ACTIVE) == "1":
-        config.pluginmanager.register(
-            _ChildStreamPlugin(
-                os.environ[_ENV_NODEIDS], int(os.environ[_ENV_STREAM_FD])
+
+
+@dataclass(frozen=True)
+class FakeGeometry:
+    """Compact model geometry for fast CPU unit tests."""
+
+    L: int = 4
+    att_every: int = 1
+    H: int = 256
+    NH: int = 2
+    NKV: int = 2
+    HD: int = 128
+    ROT: int = 32
+    KH: int = 2
+    VH: int = 2
+    KD: int = 128
+    VD: int = 128
+    E: int = 128
+    TOPK: int = 2
+    I: int = 256  # noqa: E741
+    IS: int = 256
+    moe_tp: bool = False
+    e_slots: int = 0
+    eps: float = 1e-6
+    gdn_l2_eps: float = 1e-6
+    theta: float = 10_000_000.0
+    zero_centered_norm: bool = True
+
+
+@dataclass(frozen=True)
+class FakeMixerTunables:
+    """Block-owned knobs of `FakeMixerBlock` (no core `Tiles` field needed)."""
+
+    kv_blk: int = 256
+    nkv: int = 3
+
+    NUMERICS: ClassVar[dict[str, str]] = {"kv_blk": "approx", "nkv": "exact"}
+
+
+class FakeMixerBlock(Block):
+    """Fake attention-style mixer block for testing declarative planning and VMEM."""
+
+    name = "fake_gqa"
+    reduction = "allreduce"
+    input_norm = "in_norm"
+    Tunables = FakeMixerTunables
+
+    def weights(self, g: FakeGeometry, ex: ExecSpec) -> list[WeightDecl]:
+        nh = g.NH // ex.R
+        nai = (2 * nh + 2) * g.HD
+        return [
+            WeightDecl("att_in", K=g.H, N=nai, dtype=FP8, stream_ring="static"),
+            WeightDecl("att_out", K=nh * g.HD, N=g.H, dtype=FP8, stream_ring="static"),
+        ]
+
+    def smalls(self, g: FakeGeometry, ex: ExecSpec) -> list[SmallField]:
+        nh = g.NH // ex.R
+        nai = (2 * nh + 2) * g.HD
+        return [
+            SmallField("in_norm", g.H),
+            SmallField("in_s", nai),
+            SmallField("out_s", g.H),
+            SmallField("qn", g.HD),
+            SmallField("kn", g.HD),
+        ]
+
+    def states(self, g: FakeGeometry, ex: ExecSpec) -> list[StateDecl]:
+        return [
+            StateDecl("kc", (ex.NS, ex.ctx, g.HD), BF16, access="r"),
+            StateDecl("vc", (ex.NS, ex.ctx, g.HD), BF16, access="r"),
+        ]
+
+    def outputs(self, g: FakeGeometry, ex: ExecSpec) -> list[StateDecl]:
+        return [
+            StateDecl("knew", (ex.MR, g.HD), F32, access="w"),
+            StateDecl("vnew", (ex.MR, g.HD), F32, access="w"),
+        ]
+
+    def shared_widths(self, g: FakeGeometry, ex: ExecSpec) -> dict[str, int]:
+        nh = g.NH // ex.R
+        nai = (2 * nh + 2) * g.HD
+        return {
+            "acc": max(nai, g.H),
+            "ybuf": nai,
+            "xb2": nh * g.HD,
+            "mix": nh * g.HD,
+        }
+
+    def scratch(self, g: FakeGeometry, ex: ExecSpec, plan: Any) -> list[ScratchReq]:
+        t = self.tunables(ex)
+        return [
+            ScratchReq(
+                "kbuf", pltpu.VMEM((t.nkv, t.kv_blk, g.HD), BF16), phase="persistent"
             ),
-            _PLUGIN_NAME,
+            ScratchReq(
+                "vbuf", pltpu.VMEM((t.nkv, t.kv_blk, g.HD), BF16), phase="persistent"
+            ),
+            ScratchReq(
+                "branch_tmp", pltpu.VMEM((ex.MR, g.HD), F32), phase="branch:gqa"
+            ),
+        ]
+
+
+class FakeAltMixerBlock(Block):
+    """Fake linear-attention mixer block for testing multi-branch `SwitchSlot`."""
+
+    name = "fake_gdn"
+    reduction = "allreduce"
+    input_norm = "in_norm"
+
+    def weights(self, g: FakeGeometry, ex: ExecSpec) -> list[WeightDecl]:
+        kh = g.KH // ex.R
+        vh = g.VH // ex.R
+        qkv = 2 * kh * g.KD + vh * g.VD
+        z = vh * g.VD
+        nli = qkv + z + 128
+        return [
+            WeightDecl("lin_in", K=g.H, N=nli, dtype=FP8, stream_ring="static"),
+            WeightDecl("lin_out", K=z, N=g.H, dtype=FP8, stream_ring="static"),
+        ]
+
+    def smalls(self, g: FakeGeometry, ex: ExecSpec) -> list[SmallField]:
+        kh = g.KH // ex.R
+        vh = g.VH // ex.R
+        qkv = 2 * kh * g.KD + vh * g.VD
+        z = vh * g.VD
+        nli = qkv + z + 128
+        return [
+            SmallField("in_norm", g.H),
+            SmallField("in_s", nli),
+            SmallField("out_s", g.H),
+            SmallField("conv", 4 * qkv),
+            SmallField("gnorm", g.VD),
+        ]
+
+    def states(self, g: FakeGeometry, ex: ExecSpec) -> list[StateDecl]:
+        vh = g.VH // ex.R
+        return [
+            StateDecl("rec", (ex.NS * vh, g.KD, g.VD), BF16, access="rw"),
+        ]
+
+    def outputs(self, g: FakeGeometry, ex: ExecSpec) -> list[StateDecl]:
+        vh = g.VH // ex.R
+        return [
+            StateDecl("rec", (ex.B * vh, g.KD, g.VD), BF16, access="w"),
+        ]
+
+    def shared_widths(self, g: FakeGeometry, ex: ExecSpec) -> dict[str, int]:
+        kh = g.KH // ex.R
+        vh = g.VH // ex.R
+        qkv = 2 * kh * g.KD + vh * g.VD
+        z = vh * g.VD
+        nli = qkv + z + 128
+        return {
+            "acc": max(nli, g.H),
+            "ybuf": nli,
+            "xb2": z,
+            "mix": z,
+        }
+
+    def scratch(self, g: FakeGeometry, ex: ExecSpec, plan: Any) -> list[ScratchReq]:
+        vh = g.VH // ex.R
+        return [
+            ScratchReq("sbuf", pltpu.VMEM((vh, g.KD, g.VD), F32), phase="persistent"),
+            ScratchReq(
+                "branch_tmp", pltpu.VMEM((ex.MR * 2, g.VD), F32), phase="branch:gdn"
+            ),
+        ]
+
+
+class FakeFFNBlock(Block):
+    """Fake MoE FFN block for testing declarative planning and VMEM."""
+
+    name = "fake_moe"
+    reduction = "allreduce"
+    input_norm = "post_norm"
+
+    def weights(self, g: FakeGeometry, ex: ExecSpec) -> list[WeightDecl]:
+        isr = g.IS // ex.R
+        ir = g.I // ex.R if g.moe_tp else g.I
+        er = g.E // ex.R
+        ew = g.e_slots if g.e_slots > 0 else (g.E if g.moe_tp else er)
+        lay = "stacked" if ex.stack_e else "per_layer"
+        return [
+            WeightDecl("router", K=g.H, N=g.E, dtype=BF16, stream_ring="static"),
+            WeightDecl("sh13", K=g.H, N=2 * isr, dtype=FP8, stream_ring="static"),
+            WeightDecl("sh2", K=isr, N=g.H, dtype=FP8, stream_ring="static"),
+            WeightDecl(
+                "e13",
+                K=g.H,
+                N=2 * ir,
+                dtype=FP8,
+                stream_ring="dynamic",
+                layout=lay,
+                lead_dims=(ew,),
+            ),
+            WeightDecl(
+                "e2",
+                K=ir,
+                N=g.H,
+                dtype=FP8,
+                stream_ring="dynamic",
+                layout=lay,
+                lead_dims=(ew,),
+            ),
+            WeightDecl(
+                "es", K=1, N=2 * ir + g.H, dtype=F32, stream_ring="hbm", lead_dims=(ew,)
+            ),
+        ]
+
+    def smalls(self, g: FakeGeometry, ex: ExecSpec) -> list[SmallField]:
+        isr = g.IS // ex.R
+        er = g.E // ex.R
+        fields = [
+            SmallField("post_norm", g.H),
+            SmallField("sh13_s", 2 * isr),
+            SmallField("sh2_s", g.H),
+            SmallField("sh_gate", g.H),
+        ]
+        if not g.moe_tp and g.e_slots > er:
+            fields.append(SmallField("ecopy", g.E))
+        return fields
+
+    def shared_widths(self, g: FakeGeometry, ex: ExecSpec) -> dict[str, int]:
+        isr = g.IS // ex.R
+        ir = g.I // ex.R if g.moe_tp else g.I
+        return {
+            "acc": max(g.H, g.E, 2 * isr, 2 * ir),
+            "xb2": max(isr, ir),
+        }
+
+    def scratch(self, g: FakeGeometry, ex: ExecSpec, plan: Any) -> dict[str, Any]:
+        ir = g.I // ex.R if g.moe_tp else g.I
+        t = ex.resolved_tiles
+        te = plan.nt["e13"] + plan.nt["e2"]
+        nss = 3 + (t.nbe - 1) // te
+        return {
+            "wn": pltpu.VMEM((ex.MR, g.E), F32),
+            "es": pltpu.VMEM((nss, 1, 2 * ir + g.H), F32),
+        }
+
+
+def make_fake_model_spec(
+    *,
+    L: int = 4,
+    att_every: int = 1,
+    H: int = 256,
+    moe_tp: bool = False,
+    e_slots: int = 0,
+) -> ModelSpec:
+    """Create a `ModelSpec` built from fake mixer and FFN blocks."""
+    g = FakeGeometry(L=L, att_every=att_every, H=H, moe_tp=moe_tp, e_slots=e_slots)
+    gqa = FakeMixerBlock()
+    moe = FakeFFNBlock()
+    if att_every == 1:
+        mixer: Block | SwitchSlot = SwitchSlot(
+            "mixer", branches=(gqa,), branch_counts=(1,)
         )
-        return
-    if _targets_only_megakernel(config) and not _xla_cpu_initialized():
-        os.environ["XLA_FLAGS"] = _with_mk_xla_flags(os.environ.get("XLA_FLAGS", ""))
-    config.pluginmanager.register(_ParentIsolationPlugin(), _PLUGIN_NAME)
-
-
-def pytest_configure(config: pytest.Config) -> None:
-    register_megakernel_cpu_plugin(config)
+    else:
+        gdn = FakeAltMixerBlock()
+        mixer = SwitchSlot(
+            "mixer", branches=(gdn, gqa), branch_counts=(att_every - 1, 1)
+        )
+    return ModelSpec(
+        name="fake_model",
+        config=g,
+        layer_type=LayerType("fake_layer", slots=(mixer, moe)),
+    )
 
 
 @pytest.fixture
 def fake_ex() -> ExecSpec:
     return ExecSpec(B=4, T=1, R=2, ctx=256, tiles=TINY_TILES, interpret=True)
+
+
+@dataclass
+class MiniCtx:
+    """Minimal kernel execution context for testing block `emit` in Pallas."""
+
+    g: FakeGeometry
+    ex: ExecSpec
+    core_plan: Any
+    pos_ref: Any
+    W: dict[str, Any]
+    ST: dict[str, Any]
+    O: dict[str, Any]  # noqa: E741
+    scr: dict[str, Any]
+    me: Any
+    stream: Any
+    comm: Any
+    extra: dict[str, Any] = dataclasses.field(default_factory=dict)
+    skip: frozenset[str] = frozenset()
+    sc: Any = lambda *_: contextlib.nullcontext()
+    norm_x: Any = None
+
+    def block_params(self, name: str) -> Any:
+        return self.core_plan.block(name)
+
+    def sm(self, slot: Any, name: str, width: int | None = None) -> Any:
+        o, w = self.core_plan.stream.lay[name]
+        n = w if width is None else width
+        return self.scr["sm"][slot, :, o : o + n]
+
+    def apply_input_norm(self, norm_field: str | None, slot: Any) -> None:
+        if norm_field is None:
+            self.norm_x = None
+            return
+        x = rmsnorm(
+            self.scr["res"][...],
+            self.sm(slot, norm_field),
+            self.g.eps,
+            zero_centered=bool(self.g.zero_centered_norm),
+        )
+        self.scr["xb"][...] = x.astype(BF16)
+        self.norm_x = x
+
+
+def with_tile_fields(t: Any, fields: Mapping[str, Any]) -> Any:
+    """`t` with knobs replaced: core `field` keys and `<block>.<field>` keys."""
+    core = {k: v for k, v in fields.items() if "." not in k}
+    blocks: dict[str, dict[str, Any]] = {}
+    for k, v in fields.items():
+        if "." in k:
+            block, field = k.split(".", 1)
+            blocks.setdefault(block, {})[field] = v
+    return dataclasses.replace(t, **core).with_blocks(blocks)
+
+
+def tile_field(t: Any, key: str) -> Any:
+    """Value of knob `key` (`field` or `<block>.<field>`) in tiles `t`."""
+    if "." not in key:
+        return getattr(t, key)
+    block, field = key.split(".", 1)
+    return getattr(t.block(block), field)
+
+
+# Exact-class knobs (core `field` or `<block>.<field>`): (id, knob, value off the
+# model default, (T, B), extra knobs).
+EXACT_FLIPS: list[tuple[str, str, Any, tuple[int, int], dict[str, Any]]] = [
+    ("nbd", "nbd", 8, (2, 4), {}),
+    ("nkv", "gqa.nkv", 4, (2, 4), {}),
+    ("lazy", "lazy", False, (2, 4), {}),
+    ("pair_kv", "gqa.pair_kv", True, (2, 4), {}),
+    ("kv_ering", "gqa.kv_ering", True, (2, 4), {}),
+    ("gqa_qv", "gqa.gqa_qv", True, (2, 4), {}),
+    ("rel_fetch", "rel_fetch", True, (2, 4), {}),
+    ("bounds_checks", "bounds_checks", True, (2, 4), {}),
+    ("vmem_mib", "vmem_mib", 48, (2, 4), {}),
+    ("smem_mib", "smem_mib", 2, (2, 4), {}),
+    ("moe_group_rows", "moe.moe_group_rows", 0, (2, 4), {"moe.moe_unroll": True}),
+    # PIPE_EP path: I=512 with a 64 KiB expert bank gives T13 = 2 * T2.
+    (
+        "moe_group_rows-pipe_ep",
+        "moe.moe_group_rows",
+        0,
+        (2, 4),
+        {"moe.pipe_ep": True, "ebank": 64 << 10, "nbe": 6, "geom_kw": {"I": 512}},
+    ),
+    # WIDE verify bucket (chunked GDN states): gdn_bufs only acts here.
+    ("gdn_bufs-wide", "gdn.gdn_bufs", 2, (4, 24), {}),
+    ("pair_kv-wide", "gqa.pair_kv", True, (4, 24), {}),
+    ("kv_ering-wide", "gqa.kv_ering", True, (4, 24), {}),
+    ("gqa_qv-wide", "gqa.gqa_qv", True, (4, 24), {}),
+]

@@ -61,7 +61,6 @@ class ScatterGeom:
     n_hbm: int
     s_names: tuple[str, ...]
     n_pairs: int
-    pt_cols: int = 0
     vh: int = 0
     KD: int = 0
     VD: int = 0

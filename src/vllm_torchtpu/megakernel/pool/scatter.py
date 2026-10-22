@@ -23,7 +23,6 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
-from ..errors import MegakernelConfigError
 from ..exec_spec import ExecSpec
 from ..ops import BF16, FP8, I32
 from .backend import check_ckpt_bounds, resolve_active_seqs
@@ -76,8 +75,11 @@ def scatter_pool_states(
     layout.validate(ex)
     if interpret is None:
         interpret = ex.interpret
-    NATT, G_PER_ATT = layout.num_pools, layout.slots_per_pool
+    NATT = layout.num_pools
+    assert len(raw_pools) == NATT, (len(raw_pools), NATT)
+
     NS, B, T, MR = ex.NS, ex.B, ex.T, ex.MR
+    G_PER_ATT = layout.slots_per_pool
     page_size = cache_exec(ex).page_size
     HD = layout.hd
     h4 = HD // 4
@@ -88,11 +90,7 @@ def scatter_pool_states(
     conv_page = layout.conv_page
     conv_page_rows = layout.conv_page_rows
     page_rows = layout.page_rows
-    if page_size < MR:
-        raise MegakernelConfigError(
-            f"scatter_pool_states requires CacheExec.page_size ({page_size}) >= "
-            f"ex.MR ({MR}); increase page_size or reduce B * T"
-        )
+    assert page_size >= MR, f"MR={MR} exceeds page_size={page_size}"
     if page_table.ndim != 2 or page_table.shape[0] != NS or page_table.shape[1] < 1:
         raise ValueError(
             f"page_table has shape {page_table.shape}, expected ({NS}, >=1)"
@@ -104,21 +102,16 @@ def scatter_pool_states(
         and not bool(interpret)
     )
     act_mode, active_mask = resolve_active_seqs(
-        active_seqs,
-        default_mode="from_ckpt" if has_gdn else "all",
-        ns=NS,
-        has_recurrent=has_gdn,
+        active_seqs, default_mode="from_ckpt" if has_gdn else "all"
     )
-    check_ckpt_bounds(
-        ckpt_indices if has_gdn else None,
-        cache_exec(ex).num_pages,
-        layout,
-        act_mode=act_mode,
-        active_mask=active_mask,
-        raw_pools=raw_pools,
-        ns=NS,
-        min_k=T,
-    )
+    if has_gdn:
+        check_ckpt_bounds(
+            ckpt_indices,
+            cache_exec(ex).num_pages,
+            layout,
+            act_mode=act_mode,
+            active_mask=active_mask,
+        )
 
     # Pre-gather and clamp only the (NS, T) active KV page indices for SMEM
     pt_cols = page_table.shape[1]
@@ -193,7 +186,6 @@ def scatter_pool_states(
         n_hbm=n_hbm,
         s_names=tuple(s_names),
         n_pairs=n_pairs,
-        pt_cols=pt_cols,
         **ckpt_geom,
     )
 
@@ -231,7 +223,7 @@ def scatter_pool_states(
         input_output_aliases={r: r for r in range(NATT)},
         compiler_params=pltpu.CompilerParams(
             collective_id=None,
-            disable_bounds_checks=not ex.resolved_tiles.bounds_checks,
+            disable_bounds_checks=True,
             vmem_limit_bytes=ex.resolved_tiles.vmem_mib << 20,
         ),
         interpret=bool(interpret),

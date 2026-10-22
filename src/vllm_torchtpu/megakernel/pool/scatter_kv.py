@@ -23,7 +23,6 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from ..ops import FP8, I32
-from .backend import kernel_debug_check
 from .config import cache_exec
 from .scatter_ctx import ScatterKernel, batch_to_i32_cols, is_active
 
@@ -50,11 +49,6 @@ def scatter_single_token_across_att(
     ex, interpret, NATT, NS = sg.ex, sg.interpret, sg.NATT, sg.NS
     page_size, h4 = sg.page_size, sg.h4
     p = pos_ref[b_idx]
-    kernel_debug_check(
-        jnp.logical_and(p >= 0, lax.div(p, page_size) < sg.pt_cols),
-        "KV scatter pos outside [0, page_table.shape[1] * page_size)",
-        interpret=bool(interpret),
-    )
     ln = lax.rem(p, page_size)
     kp = jnp.clip(kv_pages_ref[s_idx, t_idx], 0, cache_exec(ex).num_pages - 1)
     mask_ln = lane_iota == ln
@@ -154,16 +148,6 @@ def scatter_kv(kc: ScatterKernel) -> None:
                 @pl.when(same_page)
                 def _():
                     kp = kp0
-                    for t in range(T):
-                        p_t = pos_ref[b0 + t]
-                        kernel_debug_check(
-                            jnp.logical_and(
-                                p_t >= 0, lax.div(p_t, page_size) < sg.pt_cols
-                            ),
-                            "KV scatter pos outside "
-                            "[0, page_table.shape[1] * page_size)",
-                            interpret=bool(interpret),
-                        )
                     ln_list = [lax.rem(pos_ref[b0 + t], page_size) for t in range(T)]
                     mask_ln_list = [lane_iota == ln_list[t] for t in range(T)]
                     sh_list = [

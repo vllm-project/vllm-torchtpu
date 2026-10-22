@@ -1,0 +1,269 @@
+{
+ "_meta": {
+  "cpu": "Intel(R) Xeon(R) CPU @ 2.20GHz (x86_64)",
+  "gpr_resolved": true,
+  "jax": "0.11.2",
+  "jaxlib": "0.11.2",
+  "numpy": "2.5.4",
+  "python": "3.12.3"
+ },
+ "c30_fused_t1_b4": {
+  "gpr": false,
+  "hid": "17846c5f2f476bd4cb0b0565",
+  "pools": [
+   "f0167371b098398af1c17b02"
+  ]
+ },
+ "c30_fused_t4_b24": {
+  "gpr": false,
+  "hid": "3aa277923e6509927b71db09",
+  "pools": [
+   "7ecc9b5e4b10b0acd9c55069"
+  ]
+ },
+ "c30_fused_t4_b8": {
+  "gpr": false,
+  "hid": "8505ee7c84b34e5bbcf4787a",
+  "pools": [
+   "235272836e7df8ddc770629b"
+  ]
+ },
+ "c30_t1_b4": {
+  "gpr": false,
+  "hid": "17846c5f2f476bd4cb0b0565",
+  "pools": [
+   "f0167371b098398af1c17b02"
+  ]
+ },
+ "c30_t1_b4_prod": {
+  "gpr": false,
+  "hid": "17846c5f2f476bd4cb0b0565",
+  "pools": [
+   "f0167371b098398af1c17b02"
+  ]
+ },
+ "c30_t1_b8_eplb": {
+  "gpr": false,
+  "hid": "18b951a7e7f599e16919f766",
+  "pools": [
+   "02b23feaae162aa0270a2055"
+  ]
+ },
+ "c30_t1_b8_moetp": {
+  "gpr": false,
+  "hid": "5664405042274ba90ebae2ec",
+  "pools": [
+   "aa7b5f8f88fbccc5d923cbad"
+  ]
+ },
+ "c30_t4_b16": {
+  "gpr": false,
+  "hid": "5cfafddcf388e920ba9cb00b",
+  "pools": [
+   "38de4e9062a9c7cc44098256"
+  ]
+ },
+ "c30_t4_b24": {
+  "gpr": true,
+  "hid": "dfdd515665e120501032d1f6",
+  "pools": [
+   "f7a9c99dc99ca16c9f0d1eef"
+  ]
+ },
+ "c30_t4_b40": {
+  "gpr": true,
+  "hid": "893056e9824c4d70ecb84a87",
+  "pools": [
+   "3bac669f1769f838316f7592"
+  ]
+ },
+ "c30_t4_b48": {
+  "gpr": true,
+  "hid": "0d2eace2aa47ac39559d624e",
+  "pools": [
+   "334312405ea4b3e95b53585c"
+  ]
+ },
+ "c30_t4_b8": {
+  "gpr": false,
+  "hid": "b284ca3379bea3406247a5a6",
+  "pools": [
+   "73501d57f2b7ae0dafa49e72"
+  ]
+ },
+ "def_t1_b20_wide": {
+  "gpr": false,
+  "hid": "ce8837be40415bdc1c6074ca",
+  "pools": [
+   "f84f0a98ad24eb83c760aa1e"
+  ]
+ },
+ "def_t1_b4_prod": {
+  "gpr": false,
+  "hid": "17846c5f2f476bd4cb0b0565",
+  "pools": [
+   "f0167371b098398af1c17b02"
+  ]
+ },
+ "def_t1_b8": {
+  "gpr": false,
+  "hid": "7adda4c93a955194e1a8522c",
+  "pools": [
+   "de4284fb212b290f0217d68e"
+  ]
+ },
+ "def_t1_b8_eplb": {
+  "gpr": false,
+  "hid": "6b71a69aecde2e6c981cf4cd",
+  "pools": [
+   "c5581b616692289702588b4a"
+  ]
+ },
+ "def_t1_b8_moetp": {
+  "gpr": false,
+  "hid": "e87a835120d166cd76c8b278",
+  "pools": [
+   "875ad638dd5886c9c70d0e79"
+  ]
+ },
+ "def_t2_b4": {
+  "gpr": false,
+  "hid": "a27a391d8fde6ffc0db39d58",
+  "pools": [
+   "ee371f12a4939cc7c180ac6c"
+  ]
+ },
+ "def_t2_b4_stacke": {
+  "gpr": false,
+  "hid": "a27a391d8fde6ffc0db39d58",
+  "pools": [
+   "ee371f12a4939cc7c180ac6c"
+  ]
+ },
+ "def_t4_b16": {
+  "gpr": false,
+  "hid": "693de657ec779d764ec0473b",
+  "pools": [
+   "ff3839b5076b762abeeb1c97"
+  ]
+ },
+ "def_t4_b24_gch": {
+  "gpr": false,
+  "hid": "165bf7e5c5da4355488a2208",
+  "pools": [
+   "91f61be1afa3844ba4c7a695"
+  ]
+ },
+ "def_t4_b24_gpr": {
+  "gpr": true,
+  "hid": "165bf7e5c5da4355488a2208",
+  "pools": [
+   "91f61be1afa3844ba4c7a695"
+  ]
+ },
+ "def_t4_b48": {
+  "gpr": false,
+  "hid": "5460b18773ef852203e8633a",
+  "pools": [
+   "7da0b88029b99b9feb4e1e92"
+  ]
+ },
+ "ref_tiny_t1_att_only": {
+  "_meta": {
+   "cpu": "AMD EPYC 7B12 (x86_64)",
+   "jax": "0.11.2",
+   "jaxlib": "0.11.2",
+   "numpy": "2.5.4",
+   "python": "3.12.15"
+  },
+  "out": "bfloat16:[2, 1024]:284a497a842d6b2ca7d5403faafcb771f488027763ef45250f8592344e407d2c",
+  "states": {
+   "kc": "bfloat16:[2, 2, 2, 64, 256]:782ebf2d2b686f66e2343a15832ed805feec1817842c76d512d5fc6e6dd65e47",
+   "vc": "bfloat16:[2, 2, 2, 64, 256]:ace7286b0790cae50a5a02a2f4132ac1ae783d9a583b7a20e53d77903a43d157"
+  }
+ },
+ "ref_tiny_t1_ep_eplb72": {
+  "_meta": {
+   "cpu": "AMD EPYC 7B12 (x86_64)",
+   "jax": "0.11.2",
+   "jaxlib": "0.11.2",
+   "numpy": "2.5.4",
+   "python": "3.12.15"
+  },
+  "out": "bfloat16:[2, 1024]:7950530f46ce1f72393b0df824f118ca1a00d8f8c34498b1153a593b0a6ce510",
+  "states": {
+   "conv": "float32:[2, 3, 8, 2048]:fe4dbf6c848ebec62b9516ceec6e6bf3a8ef12a7982845a61437e0f7d9ba5704",
+   "kc": "bfloat16:[2, 1, 2, 64, 256]:baae5ec5939c5a5d28b4752ca4795a8d579ea537fec1e35c4151ac2f70324444",
+   "rec": "bfloat16:[2, 3, 16, 128, 128]:08b5d31e41214b78a047107a9755213be4dd879953df934d92a6e8687c21a6e6",
+   "vc": "bfloat16:[2, 1, 2, 64, 256]:9a3083b7d3ea3861c593cc664b51d530af37d76d8937a9e5df68751aadb3bfda"
+  }
+ },
+ "ref_tiny_t1_rope_fp32": {
+  "_meta": {
+   "cpu": "AMD EPYC 7B12 (x86_64)",
+   "jax": "0.11.2",
+   "jaxlib": "0.11.2",
+   "numpy": "2.5.4",
+   "python": "3.12.15"
+  },
+  "out": "bfloat16:[2, 1024]:23e25cbb355d5418ad9a39469de6decceb5b4a9ac8d5dad8097fdf859b4329d4",
+  "states": {
+   "conv": "float32:[2, 3, 8, 2048]:f8f776dc391c760979cfb907ed9d784ef7918bbb764704067c8bca5853d9c237",
+   "kc": "bfloat16:[2, 1, 2, 64, 256]:edb5d85ed4e00680a530a034ebba0004f51611b06cda5e99e08ec3e6c44ea9f5",
+   "rec": "bfloat16:[2, 3, 16, 128, 128]:b476e3c9ce21f3e4244bed190122ca7d1fd89b537d455312a8f59ceb04178d50",
+   "vc": "bfloat16:[2, 1, 2, 64, 256]:addc413fad0a824ccc72927c8b4ae7fc05149332355ecc785c39d40e7d7b38a0"
+  }
+ },
+ "ref_tiny_t1_tp": {
+  "_meta": {
+   "cpu": "AMD EPYC 7B12 (x86_64)",
+   "jax": "0.11.2",
+   "jaxlib": "0.11.2",
+   "numpy": "2.5.4",
+   "python": "3.12.15"
+  },
+  "out": "bfloat16:[2, 1024]:299976605a579b3ecc232b21919d3a823ae5fc64f05c3c81bdd1d1d9a6d64002",
+  "states": {
+   "conv": "float32:[2, 3, 8, 2048]:ed8042df49712336d228e2e7338fbaf5a5b06e80c5a6e6c581f43fdcfd5f7180",
+   "kc": "bfloat16:[2, 1, 2, 64, 256]:ea260af0c4938ae0e51e9bc4321fd2f092db8f409a44bc632b974391f49fe78f",
+   "rec": "bfloat16:[2, 3, 16, 128, 128]:b9753df5d1d22f2eaa0314d386889afc178870dacf071cda055b7d4e9f7ec6ba",
+   "vc": "bfloat16:[2, 1, 2, 64, 256]:1526e91866cb7251ff4ab95b06346e15c22c02c2e6861f0fcfba48d022c8b3bb"
+  }
+ },
+ "ref_tiny_t2_paged_pool": {
+  "_meta": {
+   "cpu": "AMD EPYC 7B12 (x86_64)",
+   "jax": "0.11.2",
+   "jaxlib": "0.11.2",
+   "numpy": "2.5.4",
+   "python": "3.12.15"
+  },
+  "out": "bfloat16:[4, 1024]:61cfe090d26da3febe1e30009748181a4a8010ec724b80d838f4398d73982e68",
+  "states": {
+   "conv": "float32:[2, 3, 2, 8, 2048]:e68bfb76864ea119da048cbb097605f7989ca95a61fbe9082228071675655b2b",
+   "conv_ckpt": "float32:[2, 3, 2, 8, 2048]:261adad201aef863da138e3d4a51324d1eeafb7a5652cd3e9279a149b994e150",
+   "kc": "bfloat16:[2, 1, 2, 128, 256]:7882391d8dcbbbda0b0606eb992f655ffbc8e1ab3b3ef6e0a324507e9a61cb6c",
+   "rec": "bfloat16:[2, 3, 16, 128, 128]:90611fa23f846e165b466e969b56bc81b98135a2e74a8f9b5512c3d70f9a4baa",
+   "rec_ckpt": "bfloat16:[2, 3, 32, 128, 128]:1b330a44661cffbbeecf9b7f55a49a981bb1e559959bdacb000eefcf97b61729",
+   "vc": "bfloat16:[2, 1, 2, 128, 256]:e170a66dee619eccc04398a9d03cedab6c0cde55565591d808fbdd21086e4a29"
+  }
+ },
+ "ref_tiny_t2_tp": {
+  "_meta": {
+   "cpu": "AMD EPYC 7B12 (x86_64)",
+   "jax": "0.11.2",
+   "jaxlib": "0.11.2",
+   "numpy": "2.5.4",
+   "python": "3.12.15"
+  },
+  "out": "bfloat16:[4, 1024]:696469354400b46b5c5d56f3ee854fe249d109e0ad8891482594dd907d15c9e0",
+  "states": {
+   "conv": "float32:[2, 3, 2, 8, 2048]:a8b3d33bab2d7eba0051e006a5ef79b8f3acd9a81f5bc9097d49ebfc8258d601",
+   "conv_ckpt": "float32:[2, 3, 2, 8, 2048]:178bf65854082ca39a24cf8a49d98423e41844405687cd7fe3661f5ebda8f0d9",
+   "kc": "bfloat16:[2, 1, 2, 64, 256]:1900b7198926013371650970cf00d8bb37d31a6f9ad5018a5e600696cc13da9e",
+   "rec": "bfloat16:[2, 3, 16, 128, 128]:852c99b2afb57e6f1a13053fea8e7a05ae93f34e4dd4a9a92345c6a427c4cd52",
+   "rec_ckpt": "bfloat16:[2, 3, 32, 128, 128]:041a0722260a57398eb740c30f84b09b90a5fa25f13e3532ecb2d9f42463fee6",
+   "vc": "bfloat16:[2, 1, 2, 64, 256]:85f3c59e4eee641e07b54557eebdd96c6b21c0286f30ed199cca890cbea142ed"
+  }
+ }
+}

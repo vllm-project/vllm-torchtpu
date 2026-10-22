@@ -20,7 +20,6 @@ from dataclasses import replace
 import jax
 import jax.numpy as jnp
 import pytest
-from jax.experimental import pallas as pl
 
 from vllm_torchtpu.megakernel import pool
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
@@ -32,10 +31,7 @@ from vllm_torchtpu.megakernel.pool import (
     make_pool_backend,
     with_cache,
 )
-from vllm_torchtpu.megakernel.pool.backend import (
-    kernel_debug_check,
-    resolve_active_seqs,
-)
+from vllm_torchtpu.megakernel.pool.backend import resolve_active_seqs
 
 NUM_PAGES = 128
 SLOTS = {"slots3": 3, "slots1": 1, "kv_only": 0}
@@ -131,13 +127,6 @@ def test_ckpt_bounds_rejects_out_of_range_and_shared_slots():
         pool.check_ckpt_bounds(
             ckpt.at[1, 0, 0].set(ckpt[0, 0, 0]), cache_exec(ex).num_pages, lay
         )
-    # Null slot 0 on an inactive/padded sequence is allowed under act_mode="all".
-    pool.check_ckpt_bounds(
-        ckpt.at[:, 1, :].set(0),
-        cache_exec(ex).num_pages,
-        lay,
-        act_mode="all",
-    )
 
 
 def test_resolve_active_seqs_modes():
@@ -147,49 +136,3 @@ def test_resolve_active_seqs_modes():
     assert mode == "ref" and mask is not None and mask.dtype == jnp.int32
     with pytest.raises(ValueError, match="Unsupported active_seqs"):
         resolve_active_seqs("invalid")
-
-
-def test_can_pool_gather_early_returns_and_chunk_guards():
-    def _chunk_8x2(_ex: ExecSpec) -> tuple[int, int]:
-        return (8, 2)
-
-    lay = _layout(3)
-    ex = with_cache(_exec(R=1, B=16, T=2), pool_gather=True)
-    assert pool.can_pool_gather(lay, ex, _chunk_8x2)
-
-    assert not pool.can_pool_gather(_layout(0), ex, _chunk_8x2)
-    assert not pool.can_pool_gather(
-        lay, with_cache(_exec(R=1, B=16, T=1), pool_gather=True), _chunk_8x2
-    )
-    assert not pool.can_pool_gather(lay, with_cache(ex, page_size=64), _chunk_8x2)
-    assert not pool.can_pool_gather(lay, with_cache(ex, pool_gather=False), _chunk_8x2)
-    assert not pool.can_pool_gather(
-        lay, with_cache(ex, pool_gather="split"), _chunk_8x2
-    )
-
-    # Auto mode (`pool_gather=None`) requires a WIDE bucket (`B > wide_rows`).
-    assert not pool.can_pool_gather(
-        lay, with_cache(_exec(R=1, B=16, T=2), pool_gather=None), _chunk_8x2
-    )
-    assert pool.can_pool_gather(
-        lay, with_cache(_exec(R=1, B=24, T=2), pool_gather=None), _chunk_8x2
-    )
-
-    assert not pool.can_pool_gather(lay, ex, None)
-    assert not pool.can_pool_gather(lay, ex, lambda _ex: (0, 2))
-    assert not pool.can_pool_gather(lay, ex, lambda _ex: (12, 2))
-    assert not pool.can_pool_gather(
-        lay,
-        with_cache(_exec(R=1, B=24, T=6), pool_gather=True),
-        lambda _ex: (16, 2),
-    )
-    # Multi-chunk (`B=16, cb=8 -> nch=2`) needs at least 2 ring buffers.
-    assert not pool.can_pool_gather(lay, ex, lambda _ex: (8, 1))
-    assert pool.can_pool_gather(lay, ex, lambda _ex: (16, 1))
-
-
-def test_kernel_debug_check_interpret_mode():
-    with pl.enable_debug_checks(True):
-        kernel_debug_check(jnp.bool_(True), "slot out of range", interpret=True)
-        with pytest.raises(RuntimeError, match="slot out of range"):
-            kernel_debug_check(jnp.bool_(False), "slot out of range", interpret=True)

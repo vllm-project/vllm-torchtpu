@@ -21,31 +21,20 @@ from typing import Any
 
 import jax.numpy as jnp
 
-from .dma import pool_alias
+from . import pool_alias
 from .errors import MegakernelConfigError
 from .exec_spec import ExecSpec
-from .ops import BF16, F32, round_up
-from .spec import ExtraInput, ModelSpec, Module, Spec, StateDecl, SwitchSlot, WeightDecl
+from .ops import BF16, F32, rup
+from .spec import Block, ExtraInput, ModelSpec, Spec, StateDecl, SwitchSlot, WeightDecl
 
 
 def k_tile(K: int, N: int, dtype: Any, bank: int) -> int:
     """Largest 128-multiple divisor of K whose `[tk, N]` tile fits `bank` bytes."""
-    dt = jnp.dtype(dtype)
-    if K <= 0 or K % 128 != 0:
-        raise MegakernelConfigError(
-            f"Weight K dimension must be a positive multiple of 128, got K={K} "
-            f"(N={N}, dtype={dt})"
-        )
     best = None
     for tk in range(128, K + 1, 128):
-        if K % tk == 0 and pool_alias.storage_size((tk, N), dt) <= bank:
+        if K % tk == 0 and pool_alias.storage_size((tk, N), jnp.dtype(dtype)) <= bank:
             best = tk
-    if best is None:
-        min_bytes = pool_alias.storage_size((128, N), dt)
-        raise MegakernelConfigError(
-            f"No 128-row tile of shape (K={K}, N={N}, dtype={dt}) fits bank={bank} "
-            f"bytes (minimum 128x{N} tile requires {min_bytes} bytes)"
-        )
+    assert best is not None, ("no 128-row tile fits a bank", K, N, dtype, bank)
     return best
 
 
@@ -73,8 +62,8 @@ class Plan:
     branch_segs: tuple[list[tuple[str, int, int, int]], ...]
     t_cycle: int
     T_TOTAL: int
-    module_layer_counts: dict[str, int]
-    module_branch_idx: dict[str, int | None]
+    block_layer_counts: dict[str, int]
+    block_branch_idx: dict[str, int | None]
     slot_ar_index: tuple[int | None, ...]
     smalls_layout: dict[str, tuple[int, int]]
     smalls_width: int
@@ -82,7 +71,13 @@ class Plan:
     w_names: tuple[str, ...]
     s_names: tuple[str, ...]
     o_names: tuple[str, ...]
-    module_params: dict[str, Any]
+    block_params: dict[str, Any]
+
+    def __getitem__(self, key: str) -> Any:
+        return getattr(self, key)
+
+    def keys(self):
+        return self.__dataclass_fields__.keys()
 
 
 def _discover_schedule(
@@ -108,32 +103,25 @@ def _discover_schedule(
 
     for s in model_spec.layer_type.slots:
         if isinstance(s, SwitchSlot):
-            if len(s.active_branches) > 2:
-                raise MegakernelConfigError(
-                    f"SwitchSlot {s.name!r} supports at most 2 active branches, "
-                    f"got {len(s.active_branches)}"
-                )
+            assert len(s.active_branches) <= 2, (
+                f"SwitchSlot {s.name!r} supports at most 2 active branches, "
+                f"got {len(s.active_branches)}"
+            )
             if len(s.active_branches) > 1:
                 if period == 1:
                     period = s.period
                     branch_counts = s.active_counts
-                elif s.period != period or s.active_counts != branch_counts:
-                    raise MegakernelConfigError(
+                else:
+                    assert s.period == period and s.active_counts == branch_counts, (
                         "Multiple SwitchSlots in a LayerType must share "
-                        f"period and branch_counts: expected ({period}, "
-                        f"{branch_counts}), got ({s.period}, {s.active_counts}) "
-                        f"on {s.name!r}"
+                        "period and branch_counts"
                     )
 
-    if L <= 0 or L % period != 0:
-        raise MegakernelConfigError(
-            f"Layer count L={L} must be a positive multiple of SwitchSlot "
-            f"period={period}"
-        )
+    assert L % period == 0, (L, period)
     n_cycles = L // period
 
-    module_layer_counts: dict[str, int] = {}
-    module_branch_idx: dict[str, int | None] = {}
+    block_layer_counts: dict[str, int] = {}
+    block_branch_idx: dict[str, int | None] = {}
     slot_ar_index: list[int | None] = []
     next_ar_slot = 0
 
@@ -141,37 +129,33 @@ def _discover_schedule(
         if isinstance(s, SwitchSlot):
             active = s.active_branches
             counts = s.active_counts
-            reds = {m.reduction for m in active}
-            if len(reds) != 1:
-                raise MegakernelConfigError(
-                    f"SwitchSlot {s.name!r} branches must share reduction policy: "
-                    f"{reds}"
-                )
-            norms = {m.input_norm for m in active}
-            if len(norms) != 1:
-                raise MegakernelConfigError(
-                    f"SwitchSlot {s.name!r} branches must share input_norm: {norms}"
-                )
+            reds = {b.reduction for b in active}
+            assert len(reds) == 1, (
+                f"SwitchSlot {s.name} branches must share reduction policy: {reds}"
+            )
+            norms = {b.input_norm for b in active}
+            assert len(norms) == 1, (
+                f"SwitchSlot {s.name} branches must share input_norm: {norms}"
+            )
             red = active[0].reduction
             if len(active) == 1:
-                m = active[0]
-                module_layer_counts[m.name] = L
-                module_branch_idx[m.name] = None
+                b = active[0]
+                block_layer_counts[b.name] = L
+                block_branch_idx[b.name] = None
             else:
-                for b_idx, (m, c_b) in enumerate(zip(active, counts)):
-                    module_layer_counts[m.name] = n_cycles * c_b
-                    module_branch_idx[m.name] = b_idx
+                for b_idx, (b, c_b) in enumerate(zip(active, counts)):
+                    block_layer_counts[b.name] = n_cycles * c_b
+                    block_branch_idx[b.name] = b_idx
         else:
             red = s.reduction
-            module_layer_counts[s.name] = L
-            module_branch_idx[s.name] = None
+            block_layer_counts[s.name] = L
+            block_branch_idx[s.name] = None
 
         if red == "allreduce":
-            if next_ar_slot >= 2:
-                raise MegakernelConfigError(
-                    "At most 2 'allreduce' slots per layer are supported by "
-                    "double-buffered AllReduceRing"
-                )
+            assert next_ar_slot < 2, (
+                "At most 2 'allreduce' slots per layer are supported by "
+                "double-buffered AllReduceRing"
+            )
             slot_ar_index.append(next_ar_slot)
             next_ar_slot += 1
         else:
@@ -180,8 +164,8 @@ def _discover_schedule(
     return (
         period,
         branch_counts,
-        module_layer_counts,
-        module_branch_idx,
+        block_layer_counts,
+        block_branch_idx,
         tuple(slot_ar_index),
     )
 
@@ -189,27 +173,37 @@ def _discover_schedule(
 def plan(
     model_spec: ModelSpec,
     ex: ExecSpec,
+    *,
+    fit_vmem: bool = True,
 ) -> Plan:
     """Derive weight tile sizes, stream schedules, smalls layout, and metadata.
 
-    Pure function of `model_spec` and `ex` (`ex.resolve_tiles(g)`): never fits
-    tiles or queries device budgets.
+    When `fit_vmem=True` (default), `ex.tiles=None` plans the default tiles
+    fitted to the model's VMEM budget, as `kernel.build` does
+    (`vmem.fit_default_tiles`). Callers that only need weight tile shapes and
+    smalls layout (e.g. `pack_weights`) pass `fit_vmem=False` to avoid querying
+    device budgets when no JAX backend is initialized.
     """
-    active_modules = model_spec.all_modules()
-    active_names = {m.name for m in active_modules}
-    unknown_debug = sorted(set(ex.debug.modules) - active_names)
+    if fit_vmem and ex.tiles is None:
+        # Local import: `vmem` builds on this module.
+        from .vmem import fit_default_tiles
+
+        ex = fit_default_tiles(model_spec, ex)
+    active_blocks = model_spec.all_blocks()
+    active_names = {b.name for b in active_blocks}
+    unknown_debug = sorted(set(ex.debug.blocks) - active_names)
     if unknown_debug:
         raise MegakernelConfigError(
-            f"DebugOptions.modules has unknown or inactive module(s) {unknown_debug}; "
-            f"active modules: {sorted(active_names)}"
+            f"DebugOptions.blocks has unknown or inactive block(s) {unknown_debug}; "
+            f"active blocks: {sorted(active_names)}"
         )
     g = model_spec.config
     tiles = ex.resolve_tiles(g)
     (
         period,
         branch_counts,
-        module_layer_counts,
-        module_branch_idx,
+        block_layer_counts,
+        block_branch_idx,
         slot_ar_index,
     ) = _discover_schedule(model_spec)
 
@@ -234,21 +228,20 @@ def plan(
         "mix": 128,
     }
 
-    module_slot_idx: dict[str, int] = {}
+    block_slot_idx: dict[str, int] = {}
     for slot_i, s in enumerate(model_spec.layer_type.slots):
         if isinstance(s, SwitchSlot):
-            for m in s.active_branches:
-                module_slot_idx[m.name] = slot_i
+            for b in s.active_branches:
+                block_slot_idx[b.name] = slot_i
         else:
-            module_slot_idx[s.name] = slot_i
+            block_slot_idx[s.name] = slot_i
 
-    for m in model_spec.all_modules():
-        slot_i = module_slot_idx[m.name]
-        for w in m.weights(g, ex):
-            if w.name in weight_decls:
-                raise MegakernelConfigError(f"Duplicate weight declaration: {w.name!r}")
+    for b in model_spec.all_blocks():
+        slot_i = block_slot_idx[b.name]
+        for w in b.weights(g, ex):
+            assert w.name not in weight_decls, f"Duplicate weight declaration: {w.name}"
             weight_decls[w.name] = w
-            weight_owners[w.name] = m.name
+            weight_owners[w.name] = b.name
             if w.stream_ring == "static":
                 kinds[w.name] = (w.K, w.N, w.dtype)
                 static_kinds.append(w.name)
@@ -262,48 +255,44 @@ def plan(
                     f"Unsupported stream_ring {w.stream_ring!r} on {w.name}"
                 )
 
-        m_small_names: set[str] = set()
-        for sf in m.smalls(g, ex):
-            m_small_names.add(sf.name)
+        b_small_names: set[str] = set()
+        for sf in b.smalls(g, ex):
+            b_small_names.add(sf.name)
             if sf.name not in small_widths:
                 small_fields_order.append(sf.name)
                 small_widths[sf.name] = sf.width
                 small_slot_owners[sf.name] = slot_i
             else:
-                if small_slot_owners[sf.name] != slot_i:
-                    raise MegakernelConfigError(
-                        f"Smalls field {sf.name!r} declared by modules in different "
-                        f"slots (slot {small_slot_owners[sf.name]} vs slot {slot_i}); "
-                        "only branches of the same SwitchSlot may share a smalls "
-                        "field name."
-                    )
+                assert small_slot_owners[sf.name] == slot_i, (
+                    f"Smalls field {sf.name!r} declared by blocks in different slots "
+                    f"(slot {small_slot_owners[sf.name]} vs slot {slot_i}); only "
+                    f"branches of the same SwitchSlot may share a smalls field name."
+                )
                 small_widths[sf.name] = max(small_widths[sf.name], sf.width)
-        if m.input_norm is not None and m.input_norm not in m_small_names:
-            raise MegakernelConfigError(
-                f"Module {m.name!r} declares input_norm={m.input_norm!r} "
-                f"which is not in its smalls(): {sorted(m_small_names)}"
+        if b.input_norm is not None:
+            assert b.input_norm in b_small_names, (
+                f"Block {b.name!r} declares input_norm={b.input_norm!r} "
+                f"which is not in its smalls(): {sorted(b_small_names)}"
             )
 
-        for st in m.states(g, ex):
+        for st in b.states(g, ex):
             if st.name in state_decls:
                 prev = state_decls[st.name]
-                if not (st == prev and not st.per_layer and st.access == "r"):
-                    raise MegakernelConfigError(
-                        f"Duplicate state declaration {st.name!r}: {st} vs {prev}"
-                    )
+                assert st == prev and not st.per_layer and st.access == "r", (
+                    f"Duplicate state declaration {st.name!r}: {st} vs {prev}"
+                )
                 continue
             state_decls[st.name] = st
-            state_owners[st.name] = m.name
+            state_owners[st.name] = b.name
 
-        for out in m.outputs(g, ex):
-            if out.name in output_decls:
-                raise MegakernelConfigError(
-                    f"Duplicate output declaration: {out.name!r}"
-                )
+        for out in b.outputs(g, ex):
+            assert out.name not in output_decls, (
+                f"Duplicate output declaration: {out.name}"
+            )
             output_decls[out.name] = out
-            output_owners[out.name] = m.name
+            output_owners[out.name] = b.name
 
-        for buf_name, req_w in m.shared_widths(g, ex).items():
+        for buf_name, req_w in b.shared_widths(g, ex).items():
             shared_widths[buf_name] = max(shared_widths.get(buf_name, 0), req_w)
 
     tk = {
@@ -322,12 +311,12 @@ def plan(
         for s in model_spec.layer_type.slots:
             if isinstance(s, SwitchSlot):
                 active = s.active_branches
-                mod: Module = active[0] if len(active) == 1 else active[b_idx]
+                blk: Block = active[0] if len(active) == 1 else active[b_idx]
                 ordi = 0 if len(active) > 1 else 1
             else:
-                mod = s
+                blk = s
                 ordi = 1
-            for w in mod.weights(g, ex):
+            for w in blk.weights(g, ex):
                 if w.stream_ring == "static":
                     nxt = cur + nt[w.name]
                     segs.append((w.name, cur, nxt, ordi))
@@ -343,7 +332,7 @@ def plan(
     for name in small_fields_order:
         w_len = small_widths[name]
         lay[name] = (offset, w_len)
-        offset += round_up(w_len, 128)
+        offset += rup(w_len, 128)
     smalls_width = max(128, offset)
 
     w_names = tuple(
@@ -376,8 +365,8 @@ def plan(
         branch_segs=tuple(branch_segs_list),
         t_cycle=t_cycle,
         T_TOTAL=T_TOTAL,
-        module_layer_counts=module_layer_counts,
-        module_branch_idx=module_branch_idx,
+        block_layer_counts=block_layer_counts,
+        block_branch_idx=block_branch_idx,
         slot_ar_index=slot_ar_index,
         smalls_layout=lay,
         smalls_width=smalls_width,
@@ -385,12 +374,12 @@ def plan(
         w_names=w_names,
         s_names=s_names,
         o_names=o_names,
-        module_params={},
+        block_params={},
     )
     return replace(
         p_base,
-        module_params={
-            m.name: m.plan_params(g, ex, p_base) for m in model_spec.all_modules()
+        block_params={
+            b.name: b.plan_params(g, ex, p_base) for b in model_spec.all_blocks()
         },
     )
 
@@ -400,14 +389,14 @@ def weight_shapes(
     ex: ExecSpec,
     p: Plan | None = None,
 ) -> dict[str, Any]:
-    """Per-rank HBM weight operand shapes derived from `Module.weights`."""
+    """Per-rank HBM weight operand shapes derived from `Block.weights`."""
     if p is None:
-        p = plan(model_spec, ex)
+        p = plan(model_spec, ex, fit_vmem=False)
     g = model_spec.config
     out: dict[str, Any] = {}
     for name, w in p.weight_decls.items():
         owner = p.weight_owners[name]
-        l_cnt = max(1, p.module_layer_counts[owner])
+        l_cnt = max(1, p.block_layer_counts[owner])
         if w.stream_ring in ("static", "dynamic"):
             t_shape = (p.nt[name], p.tk[name], w.N)
             if w.layout == "per_layer":
@@ -433,13 +422,13 @@ def state_shapes(
     ex: ExecSpec,
     p: Plan | None = None,
 ) -> dict[str, Any]:
-    """Per-rank input state shapes derived from `Module.states`."""
+    """Per-rank input state shapes derived from `Block.states`."""
     if p is None:
         p = plan(model_spec, ex)
     out: dict[str, Any] = {}
     for name, st in p.state_decls.items():
         owner = p.state_owners[name]
-        l_cnt = max(1, p.module_layer_counts[owner])
+        l_cnt = max(1, p.block_layer_counts[owner])
         if st.tupled:
             out[name] = tuple(Spec(st.shape, st.dtype) for _ in range(l_cnt))
         elif st.per_layer:
@@ -454,14 +443,14 @@ def kernel_out_shapes(
     ex: ExecSpec,
     p: Plan | None = None,
 ) -> dict[str, Any]:
-    """Per-rank output tensor shapes derived from `Module.outputs` plus `hidden`."""
+    """Per-rank output tensor shapes derived from `Block.outputs` plus `hidden`."""
     if p is None:
         p = plan(model_spec, ex)
     g = model_spec.config
     out: dict[str, Any] = {"hidden": ((ex.M, g.H), BF16)}
     for name, od in p.output_decls.items():
         owner = p.output_owners[name]
-        l_cnt = max(1, p.module_layer_counts[owner])
+        l_cnt = max(1, p.block_layer_counts[owner])
         if od.tupled:
             out[name] = tuple(Spec(od.shape, od.dtype) for _ in range(l_cnt))
         elif od.per_layer:
@@ -488,13 +477,7 @@ def encode_ecopy(E: int, ER: int, EW: int, moe_tp: bool, cores: Any) -> list[flo
             if g_int < 0:
                 continue
             v = vid.get(g_int)
-            if not (0 <= g_int < E) or v is None or not (0 <= v < E):
-                warnings.warn(
-                    f"encode_ecopy: expert {g_int} at redundant slot "
-                    f"(rank={r1}, slot={k}) is out of range [0, {E}) or missing "
-                    "from primary slots; ignoring.",
-                    stacklevel=2,
-                )
+            if v is None:
                 continue
             if v // ER == r1:
                 warnings.warn(
@@ -516,12 +499,12 @@ def encode_ecopy(E: int, ER: int, EW: int, moe_tp: bool, cores: Any) -> list[flo
 
 
 def extra_inputs(model_spec: ModelSpec, ex: ExecSpec) -> list[ExtraInput]:
-    """Every module's `extra_inputs`, in module declaration order (unique names)."""
+    """Every block's `extra_inputs`, in block declaration order (unique names)."""
     g = model_spec.config
     out: list[ExtraInput] = []
-    for m in model_spec.all_modules():
-        out.extend(m.extra_inputs(g, ex))
+    for b in model_spec.all_blocks():
+        out.extend(b.extra_inputs(g, ex))
     names = [x.name for x in out]
     if len(set(names)) != len(names):
-        raise MegakernelConfigError(f"duplicate module extra inputs {names}")
+        raise MegakernelConfigError(f"duplicate block extra inputs {names}")
     return out

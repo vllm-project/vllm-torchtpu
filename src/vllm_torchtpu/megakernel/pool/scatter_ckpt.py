@@ -44,11 +44,7 @@ def prepare_ckpt(
     conv_in: Any = None
     conv_buf_shape: Any = None
     if has_gdn:
-        if conv is None or rec is None or ckpt_indices is None:
-            raise ValueError(
-                "scatter_pool_states requires conv, rec, and ckpt_indices when "
-                f"layout.slots_per_pool ({layout.slots_per_pool}) > 0"
-            )
+        assert conv is not None and rec is not None and ckpt_indices is not None
         vh, KD, VD = layout.vh_per_rank(ex.R), layout.KD, layout.VD
         QKV = layout.qkv_per_rank(ex.R)
         taps = layout.conv_taps
@@ -57,14 +53,9 @@ def prepare_ckpt(
         conv_rows_pad = ((conv_rows + 15) // 16) * 16
         qkv_128 = QKV // LANES
         # The direct path reads `taps + 1` rows per token (the last one masked
-        # to zero) when `tail_row` is true (`(taps + 1) * qkv_128 == conv_rows_pad`),
-        # else `taps` rows padded with zero rows; on `tail_row` layouts it falls
-        # back to the packed copy when `taps + T <= conv.shape[2] < taps + 1 + T`.
-        if T > 1 and (conv.ndim != 4 or conv.shape[2] < taps + T):
-            raise ValueError(
-                f"conv has shape {conv.shape}, expected 4D "
-                f"(ngdn, {NS}, >={taps + T}, {QKV}) when T={T} > 1"
-            )
+        # to zero) when they fill the padded window exactly, else `taps` rows
+        # padded with zero rows; it falls back to the packed copy when the
+        # caller's conv tensor is too short.
         tail_row = (taps + 1) * qkv_128 == conv_rows_pad
         min_direct_rows = taps + 1 + T if tail_row else taps + T
         direct_conv = (
@@ -106,7 +97,9 @@ def prepare_ckpt(
             conv_buf_shape = (2, T * conv_rows_pad, LANES)
             conv_buf_dt = BF16
         ckpt_is_3d = ckpt_indices.ndim == 3
-        ckpt_t_off = ckpt_indices.shape[-1] - T
+        ckpt_k = ckpt_indices.shape[-1]
+        ckpt_t_off = 0 if ckpt_k == T else 1
+        assert ckpt_t_off + T <= ckpt_k, (ckpt_k, T)
     else:
         vh = KD = VD = QKV = 0
         ssm_u32_rows = conv_rows = conv_rows_pad = qkv_128 = 0

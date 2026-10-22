@@ -21,8 +21,6 @@ import jax
 import jax.numpy as jnp
 from jax import lax
 
-from ..errors import MegakernelConfigError
-
 BF16 = jnp.bfloat16
 F32 = jnp.float32
 I32 = jnp.int32
@@ -30,21 +28,12 @@ U32 = jnp.uint32
 FP8 = jnp.float8_e4m3fn
 
 
-def round_up(n: int, k: int) -> int:
+def rup(n: int, k: int) -> int:
     """Round `n` up to the next multiple of `k`."""
     return (n + k - 1) // k * k
 
 
-def col_chunk(width: int, cap: int = 1024) -> int:
-    """Largest multiple of 128 dividing `width` that is `<= cap`."""
-    if width <= 0 or width % 128 != 0:
-        raise ValueError(f"width={width} must be a positive multiple of 128")
-    if cap < 128:
-        raise MegakernelConfigError(f"cap={cap} must be >= 128")
-    return max(c for c in range(128, min(cap, width) + 1, 128) if width % c == 0)
-
-
-def round_bf16(x: jax.Array) -> jax.Array:
+def rnd(x: jax.Array) -> jax.Array:
     """Round float32 tensor through bfloat16 back to float32.
 
     Used throughout normalization, rotary embedding, and activation helpers to
@@ -78,7 +67,7 @@ def rmsnorm(
     """RMSNorm in float32 with BF16 rounding (`1.0 + w` if `zero_centered`)."""
     v = x * lax.rsqrt(jnp.mean(x * x, axis=-1, keepdims=True) + eps)
     scale = (1.0 + w) if zero_centered else w
-    return round_bf16(v * scale)
+    return rnd(v * scale)
 
 
 def rms_zc(x: jax.Array, w: jax.Array, eps: float = 1e-6) -> jax.Array:
@@ -97,15 +86,15 @@ def rope_partial(
     """Partial rotary positional embedding on the leading `rot_dim` columns.
 
     When `round_intermediates` is `True` (default), intermediate products and
-    sums are rounded through bfloat16 (`round_bf16`) to mirror the op-by-op bfloat16
+    sums are rounded through bfloat16 (`rnd`) to mirror the op-by-op bfloat16
     rounding of the reference rotary embedding. When `False`, intermediate
     products and sums stay in float32.
     """
     half = rot_dim // 2
     x1, x2, rest = x[:, :half], x[:, half:rot_dim], x[:, rot_dim:]
     if round_intermediates:
-        y1 = round_bf16(round_bf16(x1 * cos) - round_bf16(x2 * sin))
-        y2 = round_bf16(round_bf16(x2 * cos) + round_bf16(x1 * sin))
+        y1 = rnd(rnd(x1 * cos) - rnd(x2 * sin))
+        y2 = rnd(rnd(x2 * cos) + rnd(x1 * sin))
     else:
         y1 = x1 * cos - x2 * sin
         y2 = x2 * cos + x1 * sin
@@ -121,12 +110,12 @@ def silu_mul(
     """SwiGLU activation `silu(gate) * up` rounded to BF16.
 
     When `round_intermediates` is `True` (default), `silu(gate)` is rounded
-    through bfloat16 (`round_bf16`) before multiplying by `up` to mirror the op-by-op
+    through bfloat16 (`rnd`) before multiplying by `up` to mirror the op-by-op
     bfloat16 rounding of `F.silu(gate) * up` evaluated on bfloat16 tensors.
     When `False`, the product is accumulated in float32 before casting to BF16.
     Standalone/reference helper; MoE kernels emit their SwiGLU activation inline.
     """
-    act = round_bf16(jax.nn.silu(gate)) if round_intermediates else jax.nn.silu(gate)
+    act = rnd(jax.nn.silu(gate)) if round_intermediates else jax.nn.silu(gate)
     return (act * up).astype(BF16)
 
 
