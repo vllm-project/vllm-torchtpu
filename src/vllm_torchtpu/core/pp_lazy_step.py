@@ -52,6 +52,15 @@ the engine reads a reply only once it has arrived, which needs the last
 stage on another host than the engine (a remote reader of its reply ring),
 and the hand-off times come from the last stage's replies, which needs
 every stage to drain the slice before each hand-off.
+
+With a KV connector every worker answers each step call and the engine
+merges the answers, so such a call is read once every worker's reply has
+arrived: a remote ring shows it on its socket, a ring on the engine's host
+in its shared memory. Every step without tokens then carries the
+connector's metadata and goes to the workers, as in vLLM's loop, so they
+keep reporting finished transfers. Prefill-only MTP, the one speculative
+method a pipeline admits, schedules no draft tokens, so its steps need
+nothing more from the loop.
 """
 
 import dataclasses
@@ -93,6 +102,8 @@ def _carries_state(scheduler_output: Any) -> bool:
     """Whether a step without tokens changes the workers' state: finished
     or preempted requests, freed encoder outputs, or anything else the
     scheduler set."""
+    if scheduler_output.kv_connector_metadata is not None:
+        return True
     if scheduler_output.scheduled_cached_reqs.req_ids:
         return True
     return any(
@@ -104,6 +115,16 @@ def _carries_state(scheduler_output: Any) -> bool:
 
 def _banded(value: float, estimate: float) -> float:
     return min(max(value, estimate / _MEASURE_BAND), estimate * _MEASURE_BAND)
+
+
+def _reply_ready(ring: Any) -> bool:
+    """Whether a worker's reply waits unread on its ring: a message on the
+    socket of a remote ring, a written block this reader has not read on a
+    ring in shared memory."""
+    if ring._is_remote_reader:
+        return bool(ring.remote_socket.poll(0))
+    with ring.buffer.get_metadata(ring.current_idx) as metadata:
+        return bool(metadata[0]) and not metadata[ring.local_reader_rank + 1]
 
 
 @dataclasses.dataclass
@@ -201,9 +222,8 @@ class LazyPushStepper:
         read = False
         while queue:
             future = queue[-1]
-            if getattr(future, "_tpu_last_stage_reply", False) and not self.socket.poll(
-                0
-            ):
+            rings = getattr(future, "_tpu_reply_rings", None)
+            if rings is not None and not all(_reply_ready(ring) for ring in rings):
                 break
             queue.pop()
             future._wait_for_response()
@@ -376,8 +396,8 @@ class LazyPushStepper:
 
 def _patch_collective_rpc() -> None:
     """Have every lazy-push executor settle before a call that is not part
-    of a step, and mark the futures of step calls, whose replies come from
-    the last stage alone."""
+    of a step, and mark the futures of step calls with the rings they read:
+    the last stage's alone, or every worker's with an output aggregator."""
     from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 
     if getattr(MultiprocExecutor, "_tpu_pp_lazy_patch", False):
@@ -393,7 +413,14 @@ def _patch_collective_rpc() -> None:
             state.settle(self)
         result = orig(self, method, *args, **kwargs)
         if step_call and isinstance(result, Future):
-            cast(Any, result)._tpu_last_stage_reply = True
+            rings = self.response_mqs
+            if not (
+                kwargs.get("kv_output_aggregator") or kwargs.get("ec_output_aggregator")
+            ):
+                rank = kwargs.get("unique_reply_rank")
+                if rank is not None:
+                    rings = (rings[rank],)
+            cast(Any, result)._tpu_reply_rings = tuple(rings)
         return result
 
     MultiprocExecutor.collective_rpc = collective_rpc
@@ -404,6 +431,8 @@ def _lazy_push_blocker(core: Any, vllm_config: Any) -> str | None:
     """Why this engine core keeps vLLM's step loop, None if it need not."""
     from vllm.v1.executor.multiproc_executor import MultiprocExecutor
 
+    from vllm_torchtpu.platforms.pp_validation import prefill_only_mtp
+
     executor = core.model_executor
     parallel_config = vllm_config.parallel_config
     if parallel_config.data_parallel_size > 1:
@@ -412,24 +441,18 @@ def _lazy_push_blocker(core: Any, vllm_config: Any) -> str | None:
         return "fault tolerance"
     if core.is_pooling_model:
         return "a pooling model"
-    if vllm_config.speculative_config is not None:
-        return "speculative decoding"
-    if (
-        vllm_config.kv_transfer_config is not None
-        or vllm_config.ec_transfer_config is not None
-    ):
-        return "a KV or encoder cache connector"
+    if vllm_config.speculative_config is not None and not prefill_only_mtp(vllm_config):
+        return "speculative decoding other than prefill-only MTP"
+    if vllm_config.ec_transfer_config is not None:
+        return "an encoder cache connector"
     if core.async_scheduling or core.batch_queue is None:
         return "async scheduling or no batch queue"
     if not isinstance(executor, MultiprocExecutor) or not getattr(
         MultiprocExecutor, "_tpu_pp_wave_patch", False
     ):
         return "an executor without the pipeline push"
-    if (
-        executor.kv_output_aggregator is not None
-        or executor.ec_output_aggregator is not None
-    ):
-        return "an output aggregator"
+    if executor.ec_output_aggregator is not None:
+        return "an encoder cache output aggregator"
     if not executor.response_mqs[executor.output_rank]._is_remote_reader:
         return "the last stage on the engine's host"
     if not all(executor.collective_rpc("pp_drains_before_handoff")):

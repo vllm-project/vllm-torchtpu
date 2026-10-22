@@ -17,7 +17,10 @@ from types import SimpleNamespace
 import pytest
 
 from vllm_torchtpu.platforms import pp_validation
-from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
+from vllm_torchtpu.platforms.pp_validation import (
+    prefill_only_mtp,
+    validate_pipeline_parallel_config,
+)
 
 
 def _config(
@@ -94,6 +97,21 @@ MTP_K1 = SimpleNamespace(method="mtp", num_speculative_tokens=1)
 def test_accepts_prefill_only_mtp_k1_on_a_kv_producer():
     validate_pipeline_parallel_config(
         _config(pp=2, speculative=MTP_K1, kv_transfer=RAIDEN, layer_types=HYBRID_24)
+    )
+
+
+def test_prefill_only_mtp_is_one_mtp_token_on_a_kv_producer():
+    assert prefill_only_mtp(_config(speculative=MTP_K1, kv_transfer=RAIDEN))
+    assert not prefill_only_mtp(_config())
+    assert not prefill_only_mtp(_config(speculative=MTP_K1))
+    assert not prefill_only_mtp(
+        _config(speculative=MTP_K1, kv_transfer=RAIDEN_CONSUMER)
+    )
+    assert not prefill_only_mtp(
+        _config(
+            speculative=SimpleNamespace(method="mtp", num_speculative_tokens=2),
+            kv_transfer=RAIDEN,
+        )
     )
 
 

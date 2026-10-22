@@ -67,7 +67,7 @@ def _output(tokens, **fields):
 
 
 class _Socket:
-    """The engine's end of the last stage's reply ring."""
+    """The engine's end of a remote worker's reply ring."""
 
     def __init__(self):
         self.arrived = 0
@@ -78,9 +78,44 @@ class _Socket:
         return self.arrived
 
 
+class _Remote:
+    """A worker's reply ring the engine reads over a socket."""
+
+    _is_remote_reader = True
+
+    def __init__(self):
+        self.remote_socket = _Socket()
+
+    @property
+    def arrived(self):
+        return self.remote_socket.arrived
+
+    @arrived.setter
+    def arrived(self, value):
+        self.remote_socket.arrived = value
+
+
+class _Local:
+    """A worker's reply ring on the engine's host, read from shared memory."""
+
+    _is_remote_reader = False
+    current_idx = 0
+    local_reader_rank = 0
+
+    def __init__(self):
+        self.arrived = 0
+        self.buffer = self
+
+    @contextlib.contextmanager
+    def get_metadata(self, idx):
+        # the written flag, then one read flag per local reader
+        yield [1 if self.arrived > 0 else 0, 0]
+
+
 def _executor(monkeypatch, stages=4):
     """A MultiprocExecutor stand-in with the push and the lazy-push patches;
-    replies are read from the last stage's socket in call order."""
+    replies are read in call order from the rings a call is answered on:
+    the last stage's, or every worker's with an output aggregator."""
     from vllm.v1.executor import multiproc_executor
 
     class _Reply(Future):
@@ -92,14 +127,16 @@ def _executor(monkeypatch, stages=4):
             executor.futures_queue.appendleft(self)
 
         def _wait_for_response(self):
-            socket = self.executor.socket
-            if socket.arrived <= 0:
+            executor = self.executor
+            rings = getattr(self, "_tpu_reply_rings", None) or (
+                executor.response_mqs[executor.output_rank],
+            )
+            if any(ring.arrived <= 0 for ring in rings):
                 self.set_exception(TimeoutError(self.method))
                 return
-            socket.arrived -= 1
-            self.set_result(
-                self.executor.replies.get(self.method, (self.method, self.arg))
-            )
+            for ring in rings:
+                ring.arrived -= 1
+            self.set_result(executor.replies.get(self.method, (self.method, self.arg)))
 
         def result(self, timeout=None):
             while not self.done():
@@ -114,12 +151,9 @@ def _executor(monkeypatch, stages=4):
             self.vllm_config = _config(stages)
             self.output_rank = stages - 1
             self.futures_queue = deque()
-            self.socket = _Socket()
-            self.response_mqs = {
-                self.output_rank: SimpleNamespace(
-                    remote_socket=self.socket, _is_remote_reader=True
-                )
-            }
+            # stage 0 shares the engine's host; the other stages are remote
+            self.response_mqs = [_Local()] + [_Remote() for _ in range(stages - 1)]
+            self.socket = self.response_mqs[self.output_rank].remote_socket
             self.calls = []
             self.replies = {"pp_drains_before_handoff": [True] * stages}
 
@@ -131,6 +165,8 @@ def _executor(monkeypatch, stages=4):
             kwargs=None,
             non_block=False,
             unique_reply_rank=None,
+            kv_output_aggregator=None,
+            ec_output_aggregator=None,
         ):
             self.calls.append(method)
             future = _Reply(self, method, args[0] if args else None)
@@ -142,6 +178,7 @@ def _executor(monkeypatch, stages=4):
                 args=(scheduler_output,),
                 non_block=non_block,
                 unique_reply_rank=self.output_rank,
+                kv_output_aggregator=self.kv_output_aggregator,
             )
 
         def sample_tokens(self, grammar_output, non_block=False):
@@ -150,6 +187,7 @@ def _executor(monkeypatch, stages=4):
                 args=(grammar_output,),
                 non_block=non_block,
                 unique_reply_rank=self.output_rank,
+                kv_output_aggregator=self.kv_output_aggregator,
             )
 
     monkeypatch.setattr(multiproc_executor, "MultiprocExecutor", _Executor)
@@ -223,6 +261,8 @@ def test_only_steps_that_change_worker_state_carry_it():
     assert pp_lazy_step._carries_state(_output(0, finished_req_ids={"r"}))
     assert pp_lazy_step._carries_state(_output(0, preempted_req_ids={"r"}))
     assert pp_lazy_step._carries_state(_output(0, free_encoder_mm_hashes=["h"]))
+    # a connector attaches its metadata to every step
+    assert pp_lazy_step._carries_state(_output(0, kv_connector_metadata=object()))
 
 
 def test_empty_steps_are_dropped_unless_something_needs_them(monkeypatch, clock):
@@ -387,10 +427,10 @@ def test_other_calls_settle_the_burst_first(monkeypatch, clock):
     assert executor.calls == ["execute_model", "sample_tokens", "pp_settle", "profile"]
     assert not stepper.wave.open
     # step calls are answered by the last stage alone
+    last = (executor.response_mqs[executor.output_rank],)
     assert [
-        getattr(f, "_tpu_last_stage_reply", False)
-        for f in reversed(executor.futures_queue)
-    ] == [True, True, True, False]
+        getattr(f, "_tpu_reply_rings", None) for f in reversed(executor.futures_queue)
+    ] == [last, last, last, None]
     executor.collective_rpc("profile", non_block=True)
     assert executor.calls[-2:] == ["profile", "profile"]
     # every reply read in call order, the step processed
@@ -421,7 +461,51 @@ def test_executors_without_lazy_pushes_call_through(monkeypatch):
     pp_push.wave_state(executor).open = True
     future = executor.collective_rpc("profile", non_block=True)
     assert executor.calls == ["profile"]
-    assert not getattr(future, "_tpu_last_stage_reply", False)
+    assert getattr(future, "_tpu_reply_rings", None) is None
+
+
+def test_reply_ready_reads_sockets_and_shared_memory():
+    remote, local = _Remote(), _Local()
+    assert not pp_lazy_step._reply_ready(remote)
+    assert not pp_lazy_step._reply_ready(local)
+    remote.arrived = local.arrived = 1
+    assert pp_lazy_step._reply_ready(remote)
+    assert pp_lazy_step._reply_ready(local)
+    assert remote.remote_socket.polls == [0, 0]
+
+
+def test_connector_step_replies_are_read_once_every_worker_answered(monkeypatch, clock):
+    stepper, executor, scheduler = _stepper(monkeypatch, _output(4096))
+    executor.kv_output_aggregator = object()
+    assert stepper.step() == (None, True)
+    assert executor.calls == ["execute_model", "sample_tokens"]
+    every = tuple(executor.response_mqs)
+    assert [f._tpu_reply_rings for f in reversed(executor.futures_queue)] == [
+        every,
+        every,
+    ]
+    # the last stage answered both calls; stage 0, on the engine's host, has not
+    executor.socket.arrived = 2
+    assert stepper.step() == (None, True)
+    assert len(executor.futures_queue) == 2 and len(stepper.in_flight) == 1
+    # once every worker has answered, the replies are read and the step processed
+    for ring in executor.response_mqs[:-1]:
+        ring.arrived = 2
+    scheduler.idle = True
+    assert stepper.step()[0] is not None
+    assert not stepper.in_flight and all(r.arrived == 0 for r in executor.response_mqs)
+    # the settle that follows is answered by the last stage alone
+    assert executor.calls[-1] == "pp_settle"
+    (settle,) = executor.futures_queue
+    assert settle._tpu_reply_rings == (executor.response_mqs[executor.output_rank],)
+
+
+def test_empty_steps_with_connector_metadata_reach_the_workers(monkeypatch, clock):
+    stepper, executor, scheduler = _stepper(
+        monkeypatch, _output(0, kv_connector_metadata=object())
+    )
+    assert stepper.step() == (None, False)
+    assert executor.calls == ["execute_model"] and stepper.dropped == 0
 
 
 def test_a_step_past_the_timeout_raises(monkeypatch, clock):
@@ -583,15 +667,32 @@ def test_lazy_push_is_off_in_setups_it_does_not_cover(monkeypatch):
     config.parallel_config.enable_fault_tolerance = True
     assert blocker(core, config) == "fault tolerance"
     assert blocker(core_with(is_pooling_model=True), _config()) == "a pooling model"
+    eagle = SimpleNamespace(method="eagle3", num_speculative_tokens=1)
     assert (
-        blocker(core, config_with(speculative_config=object()))
-        == "speculative decoding"
+        blocker(core, config_with(speculative_config=eagle))
+        == "speculative decoding other than prefill-only MTP"
     )
-    for name in ("kv_transfer_config", "ec_transfer_config"):
-        assert (
-            blocker(core, config_with(**{name: object()}))
-            == "a KV or encoder cache connector"
-        )
+    # a KV connector and prefill-only MTP on its producer are admitted, with
+    # the connector's output aggregator
+    producer = SimpleNamespace(is_kv_producer=True)
+    mtp = SimpleNamespace(method="mtp", num_speculative_tokens=1)
+    executor.kv_output_aggregator = object()
+    executor.socket.arrived = 1
+    assert blocker(core, config_with(kv_transfer_config=producer)) is None
+    executor.socket.arrived = 1
+    assert (
+        blocker(core, config_with(kv_transfer_config=producer, speculative_config=mtp))
+        is None
+    )
+    assert (
+        blocker(core, config_with(speculative_config=mtp))
+        == "speculative decoding other than prefill-only MTP"
+    )
+    executor.kv_output_aggregator = None
+    assert (
+        blocker(core, config_with(ec_transfer_config=object()))
+        == "an encoder cache connector"
+    )
     for changes in ({"async_scheduling": True}, {"batch_queue": None}):
         assert (
             blocker(core_with(**changes), _config())
@@ -601,9 +702,9 @@ def test_lazy_push_is_off_in_setups_it_does_not_cover(monkeypatch):
         blocker(core_with(model_executor=SimpleNamespace()), _config())
         == "an executor without the pipeline push"
     )
-    executor.kv_output_aggregator = object()
-    assert blocker(core, _config()) == "an output aggregator"
-    executor.kv_output_aggregator = None
+    executor.ec_output_aggregator = object()
+    assert blocker(core, _config()) == "an encoder cache output aggregator"
+    executor.ec_output_aggregator = None
     executor.response_mqs[executor.output_rank]._is_remote_reader = False
     assert blocker(core, _config()) == "the last stage on the engine's host"
     executor.response_mqs[executor.output_rank]._is_remote_reader = True
