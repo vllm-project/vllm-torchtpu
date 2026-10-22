@@ -13,6 +13,11 @@ from vllm_torchtpu.kernels.experimental.batched_rpa import utils
 from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import PAIRED_PAGE_VMEM_MIB
 from vllm_torchtpu.kernels.qwen4_exp.rounding import bf16
 
+# Extra query blocks of the intermediate block-aligned prefill layout, for
+# steps whose aligned requests overflow the token bucket by a few blocks
+# (several prefill chunks). Larger overflows take the worst-case layout.
+SPARE_QUERY_BLOCKS = 4
+
 
 def _compact_active(active):
     """Indices of true entries along the last axis, zero filled.
@@ -534,14 +539,29 @@ def block_sparse_gqa_attention(
             **offset,
         )
 
-    def run_with_padding(_):
-        padded = ((real + query_block - 1) // query_block) * query_block
-        offsets = jnp.concatenate((jnp.zeros((1,), jnp.int32), jnp.cumsum(padded)))
-        max_tokens = (
-            (len(query) + (query_block - 1) * (len(starts) - 1) + query_block - 1)
-            // query_block
-            * query_block
-        )
+    padded = ((real + query_block - 1) // query_block) * query_block
+    offsets = jnp.concatenate((jnp.zeros((1,), jnp.int32), jnp.cumsum(padded)))
+    # Each request starts on a query-block boundary, so a block never spans
+    # two requests (the kernel shares one page-table row and one KV tile list
+    # per block). In the worst case every request wastes query_block - 1 rows.
+    worst_tokens = (
+        (len(query) + (query_block - 1) * (len(starts) - 1) + query_block - 1)
+        // query_block
+        * query_block
+    )
+    # Usually the block-aligned layout still fits the step's own token
+    # bucket: a single prefill chunk wastes < query_block rows, and empty
+    # rows of the bucket absorb that. A few more blocks cover a few chunks.
+    # Padding to the worst case would double an 8192-token step.
+    bucket_tokens = (len(query) + query_block - 1) // query_block * query_block
+    sizes = sorted(
+        {
+            min(bucket_tokens + extra * query_block, worst_tokens)
+            for extra in (0, SPARE_QUERY_BLOCKS, worst_tokens)
+        }
+    )
+
+    def run_with_padding(max_tokens):
         req = jnp.searchsorted(starts[1:], jnp.arange(len(query)), side="right")
         req = jnp.minimum(req, len(real) - 1)
         positions = jnp.arange(len(query)) - starts[req]
@@ -569,17 +589,16 @@ def block_sparse_gqa_attention(
         )
         return output[jnp.minimum(slots, max_tokens - 1)]
 
-    # Both lax.cond branches are traced. A statically unaligned total cannot
+    # All lax.switch branches are traced. A statically unaligned total cannot
     # enter run_aligned, whose core rejects its shape before execution.
-    if len(query) % query_block:
-        output = run_with_padding(None)
-    else:
-        output = lax.cond(
-            jnp.all(real % query_block == 0),
-            run_aligned,
-            run_with_padding,
-            None,
-        )
+    branches = [functools.partial(lambda n, _: run_with_padding(n), n) for n in sizes]
+    route = jnp.sum(offsets[-1] > jnp.asarray(sizes[:-1], jnp.int32))
+    if len(query) % query_block == 0:
+        branches.insert(0, run_aligned)
+        route = jnp.where(jnp.all(real % query_block == 0), 0, route + 1)
+    output = (
+        branches[0](None) if len(branches) == 1 else lax.switch(route, branches, None)
+    )
     output = bf16(
         bf16(output).astype(jnp.float32)
         * bf16(jax.nn.sigmoid(gate.astype(jnp.float32))).astype(jnp.float32)

@@ -13,7 +13,9 @@ import pytest
 from jax._src.mesh import AbstractDevice, AbstractMesh
 
 from vllm_torchtpu.kernels.qwen4_exp import qsa_rpa
-from vllm_torchtpu.kernels.qwen4_exp.request_types import decode_prefix
+from vllm_torchtpu.kernels.qwen4_exp.request_types import (
+    short_request_prefix_tokens,
+)
 
 _OPTIONS = dict(kv_heads=1, ratio=4, k_scale=1.0, v_scale=1.0)
 
@@ -33,9 +35,9 @@ def _fake_prefill(q, gate, blocks, lengths, table, cache, starts, **_):
 
 
 def _reference(query, gate, blocks, lengths, table, cache, starts):
-    """The routing qsa_attention had before, with its lax.cond on the cache."""
-    count = decode_prefix(starts)
+    """qsa_attention's routing written with a lax.cond on the cache."""
     capacity = len(starts) - 1
+    count = short_request_prefix_tokens(starts, capacity)
 
     def split(_):
         decode_lengths = jnp.where(jnp.arange(capacity) < count, lengths[:capacity], 0)
@@ -69,18 +71,20 @@ def _reference(query, gate, blocks, lengths, table, cache, starts):
     def prefill(_):
         return _fake_prefill(query, gate, blocks, lengths, table, cache, starts)
 
-    return jax.lax.cond((count > 0) & (count < starts[-1]), split, prefill, None)
+    return jax.lax.cond(count > 0, split, prefill, None)
 
 
 @pytest.mark.parametrize(
     "starts",
     [
         [0, 1, 2, 6, 6],  # decode prefix, then a prefill
-        [0, 3, 4, 5, 6],  # prefill first: no decode prefix
-        [0, 2, 5, 7, 8],  # prefill only
+        [0, 3, 4, 5, 6],  # short requests while they fit the RPA rows
+        [0, 2, 5, 7, 8],  # a short request, then the rest past capacity
         [0, 1, 2, 3, 4],  # every request decodes, bucket wider than capacity
         [0, 0, 0, 0, 0],  # empty step
         [0, 1, 1, 1, 1],  # one decode, idle rows
+        [0, 5, 6, 7, 8],  # the first request overflows the RPA rows: no prefix
+        [0, 4, 8, 8, 8],  # verify rows of 4 beyond capacity after the first
     ],
 )
 def test_masked_routing_matches_conditional_routing(monkeypatch, starts):

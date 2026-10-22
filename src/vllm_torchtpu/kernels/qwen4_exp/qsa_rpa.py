@@ -19,7 +19,9 @@ from vllm_torchtpu.kernels.qwen4_exp.qsa import (
     produce,
     quantize_kv,
 )
-from vllm_torchtpu.kernels.qwen4_exp.request_types import decode_prefix
+from vllm_torchtpu.kernels.qwen4_exp.request_types import (
+    short_request_prefix_tokens,
+)
 
 
 def pack_rows(key, value, *, fp8, k_scale=1.0, v_scale=1.0):
@@ -269,16 +271,14 @@ def qsa_attention(
     if len(query) <= (len(starts) - 1) * max_query_len:
         return rpa_attention(query, gate, blocks, lengths, table, cache, **options)
 
-    count = decode_prefix(starts)
     capacity = len(starts) - 1
-    # Mixed steps run a decode prefix on RPA and the rest on prefill; other
-    # steps run every row on prefill. Pick the route by masking the inputs,
-    # not with lax.cond: a conditional that returns the cache makes XLA copy
-    # it, which for the unified pool is a second full pool in HBM. RPA then
-    # runs on every step, on zero-length rows when unused, and the cache
-    # threads through both kernels exactly once.
-    mixed = (count > 0) & (count < starts[-1])
-    prefix = jnp.where(mixed, count, 0)
+    # Steps with a short-request prefix run its tokens on RPA and the rest on
+    # prefill; other steps run every row on prefill. Pick the route by masking
+    # the inputs, not with lax.cond: a conditional that returns the cache
+    # makes XLA copy it, which for the unified pool is a second full pool in
+    # HBM. RPA then runs on every step, on zero-length rows when unused, and
+    # the cache threads through both kernels exactly once.
+    prefix = short_request_prefix_tokens(starts, capacity)
     decode_lengths = jnp.where(jnp.arange(capacity) < prefix, lengths[:capacity], 0)
     decoded, cache = rpa_attention(
         query[:capacity],
@@ -292,9 +292,7 @@ def qsa_attention(
     # Keep bucket shapes fixed while removing the decode prefix on device.
     rows = jnp.arange(len(query))
     ids = jnp.minimum(rows + prefix, len(query) - 1)
-    prefill_lengths = jnp.where(
-        mixed, jnp.where(rows < starts[-1] - prefix, lengths[ids], 0), lengths
-    )
+    prefill_lengths = jnp.where(rows < starts[-1] - prefix, lengths[ids], 0)
     prefilled, cache = _prefill_attention(
         query[ids],
         gate[ids],
