@@ -24,11 +24,13 @@ from vllm.v1.kv_cache_interface import CircularBufferSpec, MambaSpec
 from vllm.v1.worker.block_table import get_block_table_width
 from vllm.v1.worker.utils import AttentionGroup
 
+from vllm_torchtpu.kv_cache_materializer import LayerKVCache
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadataBuilder
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.utils import compute_hbm_budget, synchronize_tensors
 
 from .config import native_cache_capacity, require_unified_pool
+from .pd import TransferGroup, build_transfer_groups
 from .pool_allocation import materialize_pool, validate_pool_tiling
 from .pool_layout import pooled_cache_specs
 from .qsa import Qwen4ExpPooledQSABackend
@@ -48,6 +50,12 @@ class Qwen4ExpPooledCache:
 
     def get_specs(self):
         return self.specs
+
+    def get_transfer_groups(self) -> tuple[TransferGroup, ...]:
+        """Use the bound scheduler plan, including auxiliary and state groups."""
+        if self.materialized is None:
+            raise ValueError("Initialize Qwen caches before describing PD ownership")
+        return build_transfer_groups(self.native_config.kv_cache_groups)
 
     def allocate(self):
         if self.materialized is not None:
@@ -124,7 +132,7 @@ class Qwen4ExpPooledCache:
             required,
         )
 
-    def initialize(self, config):
+    def initialize(self, config) -> dict[str, LayerKVCache]:
         self.allocate()
         assert config == self.native_config, (
             "Qwen4Exp native pool plan changed after profiling"
@@ -180,6 +188,7 @@ class Qwen4ExpPooledCache:
         runner._precompile_mamba_state_seed_copies()
         if not runner.enforce_eager:
             runner._precompile_substitute_placeholder_token()
+        return materialized.kv_caches
 
     def dummy_metadata(self, metadata, active_rows):
         """Disjoint owner pages even before runner cache initialization.

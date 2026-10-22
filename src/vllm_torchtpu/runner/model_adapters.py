@@ -23,6 +23,8 @@ from typing import Any, Protocol
 
 import torch
 
+from vllm_torchtpu.kv_cache_materializer import LayerKVCache
+
 
 @dataclass(frozen=True)
 class ModelInputSnapshot:
@@ -47,7 +49,7 @@ class ModelAdapter(Protocol):
 
     def get_kv_cache_spec(self) -> dict[str, Any]: ...
 
-    def initialize_kv_cache(self, config): ...
+    def initialize_kv_cache(self, config) -> dict[str, LayerKVCache] | None: ...
 
 
 def select_model_adapter(runner) -> ModelAdapter | None:
