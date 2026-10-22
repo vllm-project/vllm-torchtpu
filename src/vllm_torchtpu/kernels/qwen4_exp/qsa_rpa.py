@@ -24,15 +24,8 @@ import functools
 import jax
 import jax.numpy as jnp
 
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import (
-    TopKBackend,
-)
-from vllm_torchtpu.kernels.qwen4_exp.decode_indexer import select_decode_blocks
 from vllm_torchtpu.kernels.qwen4_exp.qsa import (
-    _token_metadata,
-    _update_indexer,
     bf16,
-    produce,
     quantize_kv,
 )
 from vllm_torchtpu.kernels.sparse_gqa_decode.batching import (
@@ -247,104 +240,6 @@ def qsa_attention(
     )
 
 
-def qsa_step(
-    qgate: jax.Array,
-    key: jax.Array,
-    value: jax.Array,
-    index_qk: jax.Array,
-    nq: jax.Array,
-    nk: jax.Array,
-    niq: jax.Array,
-    nik: jax.Array,
-    positions: jax.Array,
-    trig: jax.Array,
-    cache: jax.Array,
-    compressed: jax.Array,
-    ring: jax.Array,
-    tags: jax.Array,
-    starts: jax.Array,
-    context: jax.Array,
-    slots: jax.Array,
-    main_table: jax.Array,
-    compressed_table: jax.Array,
-    compress_ratio: int,
-    token_topk: int,
-    norm_eps: float,
-    rotary_dim: int,
-    k_scale: float = 1.0,
-    v_scale: float = 1.0,
-    *,
-    topk_backend: TopKBackend | None = None,
-) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
-    if len(qgate) == 0:
-        return (
-            cache,
-            compressed,
-            ring,
-            tags,
-            jnp.empty((0, qgate.shape[1] // 2), jnp.bfloat16),
-            jnp.empty((0, token_topk + compress_ratio - 1), jnp.int32),
-        )
-    q, k, v, gate, iq, raw = produce(
-        qgate, key, value, index_qk, nq, nk, niq, positions, trig, norm_eps, rotary_dim
-    )
-    fp8 = cache.dtype == jnp.float8_e4m3fn
-    req, logical, valid = _token_metadata(len(q), starts, context, slots)
-    page = jnp.where(valid, main_table[req, logical // cache.shape[1]], cache.shape[0])
-    cache = cache.at[page, logical % cache.shape[1]].set(
-        pack_rows(k, v, fp8=fp8, k_scale=k_scale, v_scale=v_scale), mode="drop"
-    )
-    compressed, ring, tags = _update_indexer(
-        raw,
-        positions,
-        compressed,
-        ring,
-        tags,
-        nik,
-        trig,
-        starts,
-        context,
-        slots,
-        compressed_table,
-        compress_ratio,
-        norm_eps,
-        rotary_dim,
-    )
-
-    # Query-specific sparse pages: prefill queries of the same request can
-    # select different groups and have different causal lengths.
-    lengths = jnp.where(valid, logical + 1, 0).astype(jnp.int32)
-    blocks = select_decode_blocks(
-        iq,
-        compressed,
-        lengths,
-        compressed_table,
-        req,
-        compress_ratio=compress_ratio,
-        block_topk=token_topk // compress_ratio,
-        starts=starts,
-        context=context,
-        topk_backend=topk_backend,
-    )
-    # Keep the persistent owner in RPA's native dtype. Full-cache uint8/FP8
-    # bitcast-converts lower to HBM reads/writes even when layouts match.
-    output, cache = qsa_attention(
-        q,
-        gate,
-        blocks,
-        lengths,
-        main_table[req],
-        cache,
-        starts,
-        kv_heads=k.shape[1],
-        ratio=compress_ratio,
-        k_scale=k_scale if fp8 else 1.0,
-        v_scale=v_scale if fp8 else 1.0,
-    )
-    selected = selected_tokens(blocks, lengths, token_topk, compress_ratio)
-    return cache, compressed, ring, tags, output.reshape(len(q), -1), selected
-
-
 def selected_tokens(blocks, lengths, token_topk, compress_ratio):
     selected = jnp.where(
         blocks[..., None] >= 0,
@@ -353,14 +248,13 @@ def selected_tokens(blocks, lengths, token_topk, compress_ratio):
     ).reshape(len(blocks), token_topk)
     selected = jnp.pad(selected, ((0, 0), (0, compress_ratio - 1)), constant_values=-1)
     count = jnp.minimum(lengths // compress_ratio, blocks.shape[1])
-    for tail in range(compress_ratio - 1):
-        token = lengths // compress_ratio * compress_ratio + tail
-        selected = selected.at[
-            jnp.arange(len(blocks)), count * compress_ratio + tail
-        ].set(jnp.where(token < lengths, token, -1))
-    return selected
-
-
-# Bind the protocol object outside the Torch schema: jax_op accepts only POD
-# static arguments. Factories may bind a different immutable backend with partial.
-qsa_step = functools.partial(qsa_step, topk_backend=None)
+    start = count * compress_ratio
+    # Preserve scatter's negative-index normalization as well as idle rows.
+    start = jnp.where(start < 0, start + selected.shape[1], start)
+    tail = jnp.arange(selected.shape[1])[None, :] - start[:, None]
+    token = (lengths // compress_ratio * compress_ratio)[:, None] + tail
+    return jnp.where(
+        (tail >= 0) & (tail < compress_ratio - 1),
+        jnp.where(token < lengths[:, None], token, -1),
+        selected,
+    )

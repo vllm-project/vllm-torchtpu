@@ -22,7 +22,6 @@ from torch_tpu._internal import pallas
 from vllm_torchtpu.kernels.qwen4_exp.ple import (
     decode_embeddings,
     resident_lookup_raw,
-    short_conv,
 )
 from vllm_torchtpu.kernels.qwen4_exp.pool import pooled_short_conv
 
@@ -60,35 +59,6 @@ def build_decode_op():
         return torch.empty_like(raw_embeddings, dtype=torch.bfloat16)
 
     return op
-
-
-@functools.cache
-def build_short_conv_op(dilation: int):
-    def fn(
-        x: jax.Array,
-        weight: jax.Array,
-        history: jax.Array,
-        starts: jax.Array,
-        slots: jax.Array,
-        initial: jax.Array,
-    ) -> tuple[jax.Array, jax.Array]:
-        output, updated = short_conv(
-            x, weight, history, starts, slots, initial, dilation=dilation
-        )
-        return updated, output
-
-    op = pallas.jax_op(f"qwen4_exp::ple_short_conv_{dilation}", fn, donate_argnums=(2,))
-
-    @op.register_fake
-    def fake(x, weight, history, starts, slots, initial):
-        return torch.empty_like(history), torch.empty_like(x)
-
-    def run(x, weight, history, starts, slots, initial):
-        updated, output = op(x, weight, history, starts, slots, initial)
-        history.copy_(updated)
-        return output
-
-    return run
 
 
 @functools.cache

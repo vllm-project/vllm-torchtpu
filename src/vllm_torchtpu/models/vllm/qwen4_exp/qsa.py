@@ -14,7 +14,7 @@
 """Model-local QSA, BF16 checkpoint loading and explicit typed cache binding."""
 
 import math
-from collections.abc import Iterable, Sequence
+from collections.abc import Iterable
 from dataclasses import dataclass, replace
 from functools import partial
 from typing import cast
@@ -22,6 +22,7 @@ from typing import cast
 import torch
 from torch import nn
 from vllm.distributed import tensor_model_parallel_all_reduce
+from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention.attention import set_default_quant_scales
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm
@@ -29,7 +30,7 @@ from vllm.model_executor.layers.linear import ColumnParallelLinear, ReplicatedLi
 from vllm.model_executor.layers.rotary_embedding import RotaryEmbedding
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.utils.torch_utils import set_default_torch_dtype
-from vllm.v1.attention.backend import AttentionBackend, MultipleOf
+from vllm.v1.attention.backend import MultipleOf
 from vllm.v1.kv_cache_interface import (
     CircularBufferSpec,
     FullAttentionSpec,
@@ -38,7 +39,12 @@ from vllm.v1.kv_cache_interface import (
     get_kv_quant_mode,
 )
 
-from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import build_qsa_op
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk.topk_backend import TopKBackend
+from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import build_compact_pooled_qsa_op
+from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
+
+from .config import require_unified_pool
 
 
 @dataclass(frozen=True)
@@ -47,8 +53,9 @@ class QSAMetadata:
 
     ``context_lens`` is the logical length BEFORE this chunk, independent of
     the RoPE ``positions`` argument.
-    Padded requests use state_slots=-1 and
-    repeated query offsets. Stable slots are neither batch rows nor page IDs.
+    Padded requests use state_slots=-1 and repeated query offsets. Forward
+    binds native ring IDs from per-layer metadata; both stores use the main
+    logical block table.
     Admission establishes <=8192 tokens/step and context within the model
     position capacity. RoPE covers [0, max_model_len). All real/scratch cache
     owners must be bound before forward.
@@ -125,47 +132,30 @@ def get_qsa_cache_specs(config, tp_size, cache_dtype):
     return main, auxiliary
 
 
-class Qwen4ExpQSABackend(AttentionBackend):
-    supported_dtypes = [torch.bfloat16]
-    supported_kv_cache_dtypes = ["auto", "bfloat16", "fp8", "fp8_e4m3"]
+class Qwen4ExpPooledQSABackend(PallasAttentionBackend):
+    """Native pool geometry; QSA maps manager pages to 4-token RPA pages."""
 
     @staticmethod
     def get_name():
-        return "QWEN4_EXP_TPU_QSA"
-
-    @staticmethod
-    def get_impl_cls():
-        raise NotImplementedError("QSA is constructed by its model-owned layer")
-
-    @staticmethod
-    def get_builder_cls():
-        # The model adapter enriches common group metadata with stable slots
-        # and the *other group's* block table before constructing QSAMetadata.
-        from vllm_torchtpu.layers.core.attention_metadata import (
-            AttentionMetadataBuilder,
-        )
-
-        return AttentionMetadataBuilder
+        return "QWEN4_EXP_TPU_POOLED_QSA"
 
     @staticmethod
     def get_supported_kernel_block_sizes(
         kv_cache_spec: KVCacheSpec | None = None,
     ) -> list[MultipleOf | int]:
-        return [QSA_BLOCK_SIZE]
+        return [MultipleOf(QSA_BLOCK_SIZE)]
 
     @staticmethod
     def get_min_page_size(vllm_config):
-        return QSA_BLOCK_SIZE
+        from .pool_layout import pooled_cache_specs
+
+        return pooled_cache_specs(vllm_config)[0].block_size
 
     @classmethod
-    def is_sparse(cls):
-        return True
+    def supported_kv_cache_layouts(cls):
+        from vllm.v1.kv_cache_interface import KVCacheLayout
 
-    @staticmethod
-    def get_kv_cache_shape(
-        num_blocks, block_size, num_kv_heads, head_size, cache_dtype_str="auto"
-    ):
-        return (2, num_blocks, block_size, num_kv_heads, head_size)
+        return (KVCacheLayout.BLHNC,)
 
 
 class _Indexer(nn.Module):
@@ -210,7 +200,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
     """Config-derived gated attention with a fully replicated MQA indexer.
 
     Checkpoint names are relative to ``...self_attn.``. No quant_config enters
-    these BF16 projections. Typed cache tensors stay owned by Task4's manager;
+    these BF16 projections. Both cache stores stay owned by the native allocator;
     the custom op donates state then copy_ makes writes visible to that owner.
     Profiling/capture uses explicitly bound scratch owners and shared metadata.
     """
@@ -229,6 +219,8 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         device=None,
         cache_dtype: str = "auto",
         prefix: str = "",
+        topk_backend: TopKBackend | None = None,
+        topk_backend_key: str | None = None,
     ):
         super().__init__()
         if tp_size <= 0:
@@ -236,6 +228,9 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         if not 0 <= tp_rank < tp_size:
             raise ValueError("QSA requires an in-range TP rank")
         self.tp_rank, self.tp_size, self.prefix = tp_rank, tp_size, prefix
+        require_unified_pool()
+        self.topk_backend = topk_backend
+        self.topk_backend_key = topk_backend_key
         self.fp8_kv = cache_dtype in ("fp8", "fp8_e4m3")
         self.cache_dtype = cache_dtype
         self.config = config
@@ -275,10 +270,6 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         self.compress_ratio = int(config.indexer_compress_ratio)
         self.token_topk = int(config.indexer_budget)
         self.max_selected_tokens = self.token_topk + self.compress_ratio - 1
-        self.block_size = QSA_BLOCK_SIZE
-        # Eight-row alignment is the current TPU allocation policy, not the
-        # logical compression ratio. Only compress_ratio lanes hold history.
-        self.ring_size = (self.compress_ratio + 7) // 8 * 8
         kv_size = min(tp_size, self.total_num_kv_heads)
         kv_rank = tp_rank // max(tp_size // self.total_num_kv_heads, 1)
         with torch.device(device or "cpu"), set_default_torch_dtype(torch.bfloat16):
@@ -339,7 +330,9 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         self.cache_owners: tuple[torch.Tensor, ...] = ()
         self._loaded = set()
         self._op = partial(
-            build_qsa_op(),
+            build_compact_pooled_qsa_op(
+                topk_backend=self.topk_backend, topk_backend_key=self.topk_backend_key
+            ),
             compress_ratio=self.compress_ratio,
             token_topk=self.token_topk,
             norm_eps=float(self.q_norm.variance_epsilon),
@@ -347,64 +340,13 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         )
 
     def get_attn_backend(self):
-        return Qwen4ExpQSABackend
+        return Qwen4ExpPooledQSABackend
+
+    def bind_pool(self, main_pool, index_pool):
+        self.cache_owners = (main_pool, index_pool)
 
     def get_kv_cache_spec(self, vllm_config):
         return get_qsa_cache_specs(self.config, self.tp_size, self.cache_dtype)[0]
-
-    def get_auxiliary_cache_specs(self):
-        return get_qsa_cache_specs(self.config, self.tp_size, self.cache_dtype)[1]
-
-    def get_cache_owner_layouts(self, pages, slots):
-        """Typed owner order shared by allocation, binding and the custom op."""
-        auxiliary = (
-            (
-                "compressed_k",
-                (
-                    pages,
-                    self.block_size // self.compress_ratio,
-                    1,
-                    (self.index_head_dim + 127) // 128 * 128,
-                ),
-                torch.bfloat16,
-                0,
-            ),
-            (
-                "raw_ring",
-                (slots, self.ring_size, self.index_head_dim),
-                torch.bfloat16,
-                0,
-            ),
-            # Native low/high bit planes retain the int64 payload width.
-            ("rope_tags", (slots, self.ring_size, 2), torch.int32, -1),
-        )
-        packing = 4 if self.fp8_kv else 2
-        return (
-            (
-                "head_packed_kv",
-                (
-                    pages,
-                    self.block_size,
-                    (2 * self.num_kv_heads + packing - 1) // packing,
-                    packing,
-                    (self.head_dim + 127) // 128 * 128,
-                ),
-                torch.float8_e4m3fn if self.fp8_kv else torch.bfloat16,
-                0,
-            ),
-            *auxiliary,
-        )
-
-    def bind_cache_owners(self, kv_cache: Sequence[torch.Tensor]) -> None:
-        if len(kv_cache) != 4:
-            raise ValueError("QSA requires main KV, compressed K, ring and tags")
-        layouts = self.get_cache_owner_layouts(
-            kv_cache[0].shape[0], kv_cache[2].shape[0]
-        )
-        for owner, (role, shape, dtype, _) in zip(kv_cache, layouts):
-            if owner.shape != shape or owner.dtype != dtype:
-                raise ValueError(f"QSA {role} requires shape={shape}, dtype={dtype}")
-        self.cache_owners = tuple(kv_cache)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         parameters = dict(self.named_parameters())
@@ -477,8 +419,22 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             raise ValueError(f"Missing QSA checkpoint tensors: {sorted(missing)}")
 
     def forward_with_indices(self, hidden, positions, metadata: QSAMetadata):
-        assert len(self.cache_owners) == 4, (
-            "Task4 must bind real or profiling scratch QSA owners"
+        assert len(self.cache_owners) == 2, (
+            "Bind main and index pools before QSA execution"
+        )
+        per_layer = cast(
+            dict[str, AttentionMetadata], get_forward_context().attn_metadata
+        )
+        metadata = replace(
+            metadata,
+            state_slots=cast(
+                torch.Tensor, per_layer[self.prefix + ".raw_ring"].block_tables
+            ),
+            main_block_table=cast(torch.Tensor, per_layer[self.prefix].block_tables),
+            compressed_block_table=cast(
+                torch.Tensor,
+                per_layer[self.prefix].block_tables,
+            ),
         )
         output, selected = self._op(
             self.q_proj(hidden),

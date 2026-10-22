@@ -75,4 +75,11 @@ class ModelAdapter(Protocol):
 
 
 def select_model_adapter(runner) -> ModelAdapter | None:
+    if runner.model_config.architecture in (
+        "Qwen4ExpForCausalLM",
+        "Qwen4ExpForConditionalGeneration",
+    ):
+        from vllm_torchtpu.models.vllm.qwen4_exp.inputs import Qwen4ExpAdapter
+
+        return Qwen4ExpAdapter(runner)
     return None

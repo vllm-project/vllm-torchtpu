@@ -131,8 +131,9 @@ def test_pooled_ple_matches_private_state_and_preserves_other_pages(dtype, chann
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("fp8", [False, True])
 def test_pooled_qsa_continuation_across_manager_page_and_partial_pairs(fp8):
-    from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import pooled_qsa_step
-    from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import qsa_step
+    import qwen4_exp_qsa_reference as reference_math
+
+    from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import compact_pooled_qsa_step
 
     rng = np.random.default_rng(8192)
 
@@ -142,7 +143,10 @@ def test_pooled_qsa_continuation_across_manager_page_and_partial_pairs(fp8):
     packing = 4 if fp8 else 2
     carrier = jnp.float8_e4m3fn if fp8 else jnp.bfloat16
     pool = jnp.zeros((12, 1664, 4 // packing, packing, 256), carrier)
+    index_pool = jnp.zeros((12, 208, 1, 2, 128), jnp.bfloat16)
     native = pool.reshape(-1, 128, *pool.shape[2:]).copy()
+    main_k = jnp.zeros((12 * 13, 128, 2, 256), jnp.bfloat16)
+    main_v = jnp.zeros_like(main_k)
     compressed = jnp.zeros((12 * 13, 32, 1, 128), jnp.bfloat16)
     ring = rand((3, 8, 128))
     tags = jnp.zeros((3, 8, 2), jnp.int32)
@@ -153,13 +157,14 @@ def test_pooled_qsa_continuation_across_manager_page_and_partial_pairs(fp8):
         )
     ring_ids = jnp.array([3, 6, 0], jnp.int32)
     write = jax.jit(write_region, donate_argnums=(0,), static_argnames=("tok0",))
-    pool = write(pool, ring.reshape(3, -1), ring_ids)
-    token_bytes = np.prod(pool.shape[2:]) * pool.dtype.itemsize
+    index_pool = write(index_pool, ring.reshape(3, -1), ring_ids)
+    token_bytes = np.prod(index_pool.shape[2:]) * index_pool.dtype.itemsize
     tag_start = 8 * 128 * 2 // token_bytes
-    pool = write(pool, tags.reshape(3, -1), ring_ids, tok0=tag_start)
+    index_pool = write(index_pool, tags.reshape(3, -1), ring_ids, tok0=tag_start)
     before = np.asarray(pool).view(np.uint8).copy()
+    before_index = np.asarray(index_pool).view(np.uint8).copy()
     main = jnp.array([[2, 7], [5, 9], [0, 0]], jnp.int32)
-    comp = jnp.array([[1, 8], [4, 10], [0, 0]], jnp.int32)
+    comp = main
 
     def expand(t):
         return (t[..., None] * 13 + jnp.arange(13)).reshape(3, -1)
@@ -179,9 +184,28 @@ def test_pooled_qsa_continuation_across_manager_page_and_partial_pairs(fp8):
         k_scale=0.375,
         v_scale=2.5,
     )
-    run = jax.jit(pooled_qsa_step, donate_argnums=(10,), static_argnames=tuple(options))
+    run = jax.jit(
+        compact_pooled_qsa_step, donate_argnums=(10, 11), static_argnames=tuple(options)
+    )
+    reference_options = {
+        name: options[name] for name in ("compress_ratio", "token_topk", "norm_eps")
+    }
+    if fp8:
+        reference_options.update(k_scale=0.375, v_scale=2.5)
+        reference_state = (
+            reference_math.pack_fp8_kv(
+                reference_math.quantize_kv(main_k, 0.375),
+                reference_math.quantize_kv(main_v, 2.5),
+            ),
+            compressed,
+            ring,
+            tags,
+        )
+    else:
+        reference_state = (main_k, main_v, compressed, ring, tags)
     reference = jax.jit(
-        qsa_step, donate_argnums=(10, 11, 12, 13), static_argnames=tuple(options)
+        reference_math.qsa_step_fp8 if fp8 else reference_math.qsa_step,
+        static_argnames=tuple(reference_options),
     )
     for step in range(3):
         positions = jnp.concatenate(
@@ -203,22 +227,31 @@ def test_pooled_qsa_continuation_across_manager_page_and_partial_pairs(fp8):
             positions,
             trig,
         )
-        native, compressed, ring, tags, wanted, selected = reference(
-            *args,
-            native,
-            compressed,
-            ring,
-            tags,
+        expected = reference(
+            *args[:9],
+            trig[:, :64].reshape(len(trig), 2, 32),
+            *reference_state,
             starts,
             context,
             slots,
             expand(main),
             expand(comp),
-            **options,
+            **reference_options,
         )
-        pool, actual, blocks = run(
+        reference_state = expected[:-2]
+        compressed, ring, tags = reference_state[-3:]
+        wanted, selected = expected[-2:]
+        if fp8:
+            ek, ev = reference_math.unpack_fp8_kv(expected[0])
+        else:
+            ek, ev = expected[:2]
+        native = np.stack((np.asarray(ek), np.asarray(ev)), axis=-2).reshape(
+            native.shape
+        )
+        pool, index_pool, actual, blocks = run(
             *args,
             pool,
+            index_pool,
             starts,
             context,
             # Native ring rows cover one block, padded to 128 / ratio columns.
@@ -239,29 +272,41 @@ def test_pooled_qsa_continuation_across_manager_page_and_partial_pairs(fp8):
             np.asarray(pool)[[2, 5, 7, 9]].view(np.uint8), expected_main.view(np.uint8)
         )
         read = jax.jit(read_region, static_argnames=("elements", "dtype", "tok0"))
-        restored_ring = read(pool, ring_ids, elements=8 * 128, dtype=jnp.bfloat16)
+        restored_ring = read(index_pool, ring_ids, elements=8 * 128, dtype=jnp.bfloat16)
         np.testing.assert_array_equal(
             np.asarray(restored_ring)[:2], np.asarray(ring).reshape(3, -1)[:2]
         )
         restored_tags = read(
-            pool, ring_ids, elements=8 * 2, dtype=jnp.int32, tok0=tag_start
+            index_pool, ring_ids, elements=8 * 2, dtype=jnp.int32, tok0=tag_start
         )
         np.testing.assert_array_equal(
             np.asarray(restored_tags)[:2], np.asarray(tags).reshape(3, -1)[:2]
         )
-        # The compressed pool region pads the lane width to 256; compare
-        # every stored BF16 key, not just the subset selected by attention.
-        compressed_ids = jnp.array([1, 8, 4, 10], jnp.int32)
+        # Compare every compact BF16 key, not just those selected by attention.
+        compressed_ids = jnp.array([2, 7, 5, 9], jnp.int32)
         restored_keys = read(
-            pool, compressed_ids, elements=416 * 256, dtype=jnp.bfloat16
-        ).reshape(4, 416, 256)
-        private_keys = np.asarray(compressed).reshape(12, 416, 128)[[1, 8, 4, 10]]
+            index_pool, compressed_ids, elements=416 * 128, dtype=jnp.bfloat16
+        ).reshape(4, 416, 128)
+        private_keys = np.asarray(compressed).reshape(12, 416, 128)[[2, 7, 5, 9]]
         np.testing.assert_array_equal(
             np.asarray(restored_keys)[..., :128], private_keys
         )
-        np.testing.assert_array_equal(np.asarray(restored_keys)[..., 128:], 0)
+        assert index_pool.dtype == jnp.bfloat16
+        assert index_pool.nbytes < pool.nbytes
         np.testing.assert_array_equal(
-            np.asarray(pool)[[0, 11]].view(np.uint8), before[[0, 11]]
+            np.sort(np.asarray(blocks)), np.sort(np.asarray(selected))
+        )
+        np.testing.assert_array_equal(
+            np.asarray(index_pool)[[0, 11]].view(np.uint8), before_index[[0, 11]]
+        )
+        untouched_main = [0, 1, 3, 4, 6, 8, 10, 11]
+        untouched_index = [0, 1, 4, 8, 10, 11]
+        np.testing.assert_array_equal(
+            np.asarray(pool)[untouched_main].view(np.uint8), before[untouched_main]
+        )
+        np.testing.assert_array_equal(
+            np.asarray(index_pool)[untouched_index].view(np.uint8),
+            before_index[untouched_index],
         )
         context = context + jnp.array([3, 4, 0], jnp.int32)
 

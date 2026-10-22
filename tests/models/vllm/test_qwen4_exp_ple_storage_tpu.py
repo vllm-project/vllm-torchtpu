@@ -154,8 +154,17 @@ def test_native_ple_history_matches_common_layer_on_tpu(
     adapted.finalize_weights()
     history = torch.zeros(4, reference.conv_state_len, 256, dtype=torch.bfloat16)
     history[1].fill_(4)
-    device_history = history.to("tpu")
-    adapted.bind_history(device_history)
+    from tests.models.vllm.qwen4_exp_test_utils import (
+        decode_pool_history,
+        encode_pool_history,
+    )
+
+    carrier = torch.float8_e4m3fn if fp8 else torch.bfloat16
+    pool = encode_pool_history(
+        torch.zeros((4, 128, 1, 4 if fp8 else 2, 128), dtype=carrier), history
+    )
+    device_pool = pool.to("tpu")
+    adapted.bind_pool(device_pool)
     run = torch.compile(
         adapted.forward_with_history,
         backend=tpu_compile.TpuBackend(),
@@ -200,7 +209,7 @@ def test_native_ple_history_matches_common_layer_on_tpu(
                 starts[-1:].to("tpu"),
                 raw,
             )
-            sync.synchronize([actual, device_history], wait=True)
+            sync.synchronize([actual, device_pool], wait=True)
             actual_cpu = actual.cpu()
             valid = int(starts[-1])
             assert bool(torch.isfinite(actual_cpu).all())
@@ -213,7 +222,17 @@ def test_native_ple_history_matches_common_layer_on_tpu(
                 if slot > 0:
                     history[slot] = updated[i]
             torch.testing.assert_close(
-                device_history.cpu(), history, rtol=0.02, atol=0.002
+                decode_pool_history(device_pool.cpu(), history.shape),
+                history,
+                rtol=0.02,
+                atol=0.002,
+            )
+
+            torch.testing.assert_close(
+                device_pool.cpu().view(torch.uint8)[[0, 3]],
+                pool.view(torch.uint8)[[0, 3]],
+                rtol=0,
+                atol=0,
             )
 
     if isinstance(adapted.storage, HostPLETable):

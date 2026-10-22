@@ -144,6 +144,7 @@ def select_index_blocks(
     block_topk,
     topk_backend: TopKBackend | None = None,
     scheduling_group_namespace: int | None = None,
+    vmem_limit_bytes: int | None = None,
 ):
     """Share ragged query-block reuse and bounded per-query scoring schedules.
 
@@ -154,6 +155,9 @@ def select_index_blocks(
     mode classifier, safety requirement or proven profitability boundary.
     Per-request starts/context and per-query causal lengths are authoritative.
     """
+    resource_options = (
+        {} if vmem_limit_bytes is None else {"vmem_limit_bytes": vmem_limit_bytes}
+    )
     if topk_backend is None:
         topk_backend = SparseCoreTopK()
     page_size = cache.shape[1] * 2
@@ -185,6 +189,7 @@ def select_index_blocks(
             components=qsa_indexing(ratio - 1),
             topk_backend=topk_backend,
             scheduling_group_namespace=scheduling_group_namespace,
+            **resource_options,
         )
 
     batch = len(query)
@@ -209,6 +214,7 @@ def select_index_blocks(
             components=qsa_indexing(),
             topk_backend=topk_backend,
             scheduling_group_namespace=scheduling_group_namespace,
+            **resource_options,
         )
 
     if batch <= chunk_size:
