@@ -29,6 +29,10 @@ exactly the region, so one grid step moves only the region's bytes;
 unaligned ranges decompose into aligned gcd-sized chunks. Scatters alias
 the pool in place (`input_output_aliases`); the unwritten complement is
 preserved via the HBM alias, with no read-modify-write.
+
+``interpret=True`` on the region helpers runs the Pallas kernels in
+interpret mode (CPU unit tests); the typed views keep Mosaic's
+``ref.bitcast`` semantics there.
 """
 
 import math
@@ -88,6 +92,7 @@ def gather_region(
     out_dtype,
     out_lanes: int | None = None,
     split: int = 1,
+    interpret: bool = False,
 ):
     """Per-request typed read of a pool token-range.
 
@@ -120,6 +125,7 @@ def gather_region(
                 nblocks=ntok // kernel_bs,
                 out_dtype=out_dtype,
                 out_lanes=out_lanes,
+                interpret=interpret,
             )
         kb, local0 = divmod(tok0, kernel_bs)
         if local0 + ntok > kernel_bs:
@@ -134,6 +140,7 @@ def gather_region(
             ntok=ntok,
             out_dtype=out_dtype,
             out_lanes=out_lanes,
+            interpret=interpret,
         )
 
     na = state_indices.shape[0]
@@ -183,6 +190,7 @@ def gather_region(
             out_specs=pl.BlockSpec((1, out_rows, o_lanes), lambda p, s: (p, 0, 0)),
         ),
         out_shape=jax.ShapeDtypeStruct((na * chunks, out_rows, o_lanes), out_dtype),
+        interpret=interpret,
     )(state_indices, pool).reshape(na, chunks * out_rows, o_lanes)
 
 
@@ -195,6 +203,7 @@ def _gather_window(
     nblocks: int,
     out_dtype,
     out_lanes: int | None = None,
+    interpret: bool = False,
 ):
     """Typed read of `nblocks` whole kernel blocks inside each request's
     manager block, one grid step and ONE DMA window per request.
@@ -246,10 +255,20 @@ def _gather_window(
             ),
         ),
         out_shape=jax.ShapeDtypeStruct((na, nblocks * rows_pb, o_lanes), out_dtype),
+        interpret=interpret,
     )(mgr_indices, pool)
 
 
-def _scatter_window(pool, vals, mgr_indices, *, split: int, kb0: int, nblocks: int):
+def _scatter_window(
+    pool,
+    vals,
+    mgr_indices,
+    *,
+    split: int,
+    kb0: int,
+    nblocks: int,
+    interpret: bool = False,
+):
     """Typed write of `nblocks` whole kernel blocks inside each request's
     manager block (in place), one grid step per request; vals is the
     gather shape. The aliased output window covers the whole
@@ -310,10 +329,20 @@ def _scatter_window(pool, vals, mgr_indices, *, split: int, kb0: int, nblocks: i
         ),
         out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
         input_output_aliases={2: 0},
+        interpret=interpret,
     )(mgr_indices, vals, pool)
 
 
-def scatter_region(pool, vals, state_indices, *, tok0: int, ntok: int, split: int = 1):
+def scatter_region(
+    pool,
+    vals,
+    state_indices,
+    *,
+    tok0: int,
+    ntok: int,
+    split: int = 1,
+    interpret: bool = False,
+):
     """Per-request typed write of a pool token-range (in place); mirrors
     ``gather_region`` including the ``split`` manager-range routing.
 
@@ -332,6 +361,7 @@ def scatter_region(pool, vals, state_indices, *, tok0: int, ntok: int, split: in
                 split=split,
                 kb0=tok0 // kernel_bs,
                 nblocks=ntok // kernel_bs,
+                interpret=interpret,
             )
         kb, local0 = divmod(tok0, kernel_bs)
         if local0 + ntok > kernel_bs:
@@ -340,7 +370,12 @@ def scatter_region(pool, vals, state_indices, *, tok0: int, ntok: int, split: in
                 f"tok0={tok0} ntok={ntok} kernel_block={kernel_bs}"
             )
         return scatter_region(
-            pool, vals, state_indices * split + kb, tok0=local0, ntok=ntok
+            pool,
+            vals,
+            state_indices * split + kb,
+            tok0=local0,
+            ntok=ntok,
+            interpret=interpret,
         )
 
     na = state_indices.shape[0]
@@ -394,6 +429,7 @@ def scatter_region(pool, vals, state_indices, *, tok0: int, ntok: int, split: in
         ),
         out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
         input_output_aliases={2: 0},
+        interpret=interpret,
     )(state_indices, vals.reshape(na * chunks, v_rows, v_lanes), pool)
 
 
