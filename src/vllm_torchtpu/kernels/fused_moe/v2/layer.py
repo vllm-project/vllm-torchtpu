@@ -282,6 +282,8 @@ def fused_ep_moe_v2(
     stage="fused",
     routed=None,
     gather_positions=None,
+    shared_weights=None,
+    shared_swiglu_limit=None,
 ):
     """Run one MoE layer through the fused expert-parallel kernel.
 
@@ -386,6 +388,15 @@ def fused_ep_moe_v2(
         )
     if (w1_scale is None) != (w2_scale is None):
         raise ValueError("both weight scales are supplied together or neither is")
+    if shared_weights is not None and (w1_bias is not None or w2_bias is not None):
+        raise ValueError("Shared MLP integration requires routed weights without bias")
+    if shared_weights is not None and stage != "fused":
+        raise ValueError("Shared MLP integration requires stage='fused'")
+    if shared_weights is not None and len(shared_weights) != 4:
+        raise ValueError(
+            "Shared weights must contain gate/up weights and scales, "
+            "then down weights and scales"
+        )
     T, hidden = x.shape
     e_total = w1.shape[0]
     inter = w1.shape[2] // 2
@@ -672,6 +683,7 @@ def fused_ep_moe_v2(
         w2s_l,
         bias_it,
         out_dtype,
+        shared_output=None,
     ):
         """Plan, kernel and combine over the gathered rows and payload."""
         me = rank_l[0, 0]
@@ -787,6 +799,8 @@ def fused_ep_moe_v2(
         # HBM->SMEM DMA at the head of the kernel, and the prefetch also has to
         # fit in 1 MB of SMEM.
         kernel_tables = (*block_tables[:3], block_tables[5], row_tables[0])
+        if shared_output is not None:
+            q_g, shared_output = lax.optimization_barrier((q_g, shared_output))
         arrivals, arrival_scales = kfn(
             kernel_tables,
             token_gather,
@@ -831,6 +845,10 @@ def fused_ep_moe_v2(
         # A row that routed nowhere read arrival rows nobody wrote; its weight is
         # zero, but zero times an unwritten NaN is not.
         combined = jnp.where(row_routes, combined, jnp.zeros_like(combined))
+        if shared_output is not None:
+            combined = (
+                combined.astype(jnp.float32) + shared_output.astype(jnp.float32)
+            ).astype(out_dtype)
         return token_layout.restore(combined, ax)
 
     def local_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
@@ -846,6 +864,16 @@ def fused_ep_moe_v2(
         exchange = lax.all_gather(packed, ax, axis=0, tiled=True).reshape(
             ep, layout[-1]
         )
+        shared_output = None
+        if shared_weights is not None:
+            from vllm_torchtpu.kernels.fused_moe.v2.shared_mlp import fused_shared_mlp
+
+            shared_l = tuple(bias_it)
+            shared_output = fused_shared_mlp(
+                token_layout.split(x_l, rank_l[0, 0]),
+                *shared_l,
+                swiglu_limit=shared_swiglu_limit,
+            )
         return compute_local(
             q_g,
             exchange,
@@ -860,6 +888,7 @@ def fused_ep_moe_v2(
             w2s_l,
             bias_it,
             x_l.dtype,
+            shared_output,
         )
 
     def route_fn(x_l, rank_l, w1_l, w2_l, *scales_gating_biases):
@@ -952,6 +981,9 @@ def fused_ep_moe_v2(
     if routed is not None:
         args += tuple(routed)
         in_specs += (P(ax),) * len(routed)
+    if shared_weights is not None:
+        args += tuple(shared_weights)
+        in_specs += (P(),) * 4
     NS = jax.sharding.NamedSharding
     args = tuple(jax.device_put(a, NS(mesh, sp)) for a, sp in zip(args, in_specs))
     # local_fn closes over config-static values only -- the per-call data
