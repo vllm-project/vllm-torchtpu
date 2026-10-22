@@ -153,3 +153,81 @@ def test_derived_regions_and_capacity_independent_peer_encoding(
         assert payload["schema"] == "qwen4-dual-carrier-page-layout-v2"
         fingerprints.append(fingerprint)
     assert fingerprints[0] == fingerprints[1]
+
+
+@pytest.mark.parametrize("extra_pages", [0, 1, 2])
+def test_actual_dual_carriers_follow_owner_tables_and_preserve_other_bytes(extra_pages):
+    from vllm_torchtpu.models.vllm.qwen4_exp.pd import build_transfer_groups
+    from vllm_torchtpu.models.vllm.qwen4_exp.pd_connector import QwenPagePlan
+
+    config, live = live_pool(
+        tp=8,
+        num_blocks=32,
+        num_hidden_layers=3,
+        layer_types=["full_attention", "linear_attention", "linear_attention"],
+    )
+    manifest = build_transfer_manifest(config, live)
+    groups = build_transfer_groups(config.kv_cache_groups)
+    plan = QwenPagePlan(groups, manifest)
+    tokens = (
+        next(
+            g.block_size
+            for g in groups
+            if any(n.endswith(".self_attn") for n in g.layer_names)
+        )
+        * extra_pages
+        + 1
+    )
+    tables, cursor = [], 1
+    for group in groups:
+        count = group.page_count(tokens)
+        tables.append(list(range(cursor, cursor + count)))
+        cursor += count
+    assert cursor < config.num_blocks // 2
+    source = [
+        torch.arange(raw.nbytes, dtype=torch.int32).to(torch.uint8)
+        for raw in live.raw_tensors
+    ]
+    actual = [torch.full_like(x, 211) for x in source]
+    expected = [x.clone() for x in actual]
+    # Independent oracle: enumerate actual model bindings from scheduler owners,
+    # adding compressed keys to the main table, never to the ring table.
+    for group, pages in zip(groups, tables):
+        for owner in group.layer_names:
+            names = [owner]
+            if owner.endswith(".self_attn"):
+                names.append(owner + ".compressed_k")
+            for name in names:
+                raw = live.kv_caches[name]
+                raw = raw[0] if isinstance(raw, list) else raw
+                index = next(i for i, x in enumerate(live.raw_tensors) if x is raw)
+                stride = raw[0].nbytes
+                for page in pages:
+                    dest = config.num_blocks - page
+                    expected[index][dest * stride : (dest + 1) * stride] = source[
+                        index
+                    ][page * stride : (page + 1) * stride]
+    pages = plan.request_pages(tables, tokens)
+    for pool, gid in plan.pool_groups():
+        stride = pool.block_stride_bytes
+        for page in pages[gid]:
+            dest = config.num_blocks - page
+            actual[pool.storage_index][dest * stride : (dest + 1) * stride] = source[
+                pool.storage_index
+            ][page * stride : (page + 1) * stride]
+    for got, want in zip(actual, expected):
+        torch.testing.assert_close(got, want, rtol=0, atol=0)
+    # Same physical index page cannot be assigned to ring and main sidecar.
+    main_gid = next(
+        g.group_index
+        for g in groups
+        if any(n.endswith(".self_attn") for n in g.layer_names)
+    )
+    ring_gid = next(
+        g.group_index
+        for g in groups
+        if any(n.endswith(".raw_ring") for n in g.layer_names)
+    )
+    tables[ring_gid] = tables[main_gid][:1]
+    with pytest.raises(ValueError, match="overlap"):
+        plan.request_pages(tables, tokens)
