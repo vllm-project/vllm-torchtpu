@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import math
+from functools import partial
 from types import SimpleNamespace
 
 import pytest
@@ -23,7 +24,12 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 from transformers import Qwen4ExpTextConfig
-from vllm.config import CompilationMode
+from vllm.config import (
+    CompilationMode,
+    DeviceConfig,
+    VllmConfig,
+    set_current_vllm_config,
+)
 from vllm.model_executor import parameter as vllm_parameter
 from vllm.model_executor.layers import linear as vllm_linear
 from vllm.model_executor.layers import vocab_parallel_embedding as vpe
@@ -37,6 +43,7 @@ from vllm.models.qwen4_exp.common.ngram_embedding import (
     Qwen4ExpPLEEmbeddingMethod,
     Qwen4ExpPLEFp8EmbeddingMethod,
 )
+from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
 
 import vllm_torchtpu.models.vllm.qwen4_exp.model as qwen4_model
 from vllm_torchtpu.gdn_pool_layout import QWEN_GDN_ARCHITECTURES
@@ -48,6 +55,7 @@ from vllm_torchtpu.models.vllm.qwen4_exp.ple import (
     PLEInputs,
     Qwen4ExpNGramEmbedding,
     Qwen4ExpPLELayer,
+    Qwen4ExpPLETable,
     head_vocab_sizes,
     layer_multipliers,
     ngram_ids,
@@ -76,6 +84,11 @@ def _cpu_model_tests(monkeypatch):
         monkeypatch.setattr(torch.accelerator, "is_available", lambda: False)
         monkeypatch.setattr(torch.accelerator, "current_device_index", lambda: 0)
         monkeypatch.setattr(torch.accelerator, "device_count", lambda: 0)
+
+    config = VllmConfig(device_config=DeviceConfig(device="cpu"))
+    resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
+    with set_current_vllm_config(config):
+        yield
 
 
 def _text_config(**overrides) -> Qwen4ExpTextConfig:
@@ -1012,3 +1025,430 @@ def test_ple_layer_rejects_kernel_size_one(monkeypatch) -> None:
     config = _text_config(**{**_PLE, "ple_conv_kernel_size": 1})
     with pytest.raises(NotImplementedError, match="ple_conv_kernel_size"):
         Qwen4ExpPLELayer(config, 0, None, prefix="model.layers.0.ple")
+
+
+def test_ple_storage_factory_allocates_once_and_reuses_shard_loader(monkeypatch):
+    _set_tp(monkeypatch, 0, 1)
+    allocations = []
+
+    class RecordingTable(Qwen4ExpPLETable):
+        def allocate_embedding_weight(self, rows, width, dtype):
+            allocations.append((rows, width, dtype))
+            return torch.zeros(rows, width, dtype=dtype)
+
+    ple = Qwen4ExpPLELayer(
+        _text_config(**_PLE),
+        0,
+        None,
+        prefix="model.layers.1.ple",
+        table_factory=RecordingTable,
+    )
+    table = ple.ple_embedding.ngram_embedding
+    assert isinstance(table, RecordingTable)
+    assert allocations == [(_TABLE_ROWS, _HEAD_DIM, torch.float32)]
+    rows = torch.arange(_TABLE_ROWS * _HEAD_DIM).reshape(_TABLE_ROWS, _HEAD_DIM).float()
+    ple.ple_embedding.load_weights(
+        (f"ngram_embedding.shard_{i}.weight", shard)
+        for i, shard in enumerate(rows.split(22))
+    )
+    ids = torch.tensor([[0, 21, 22, 63]])
+    assert torch.equal(table(ids), rows[ids])
+
+
+def test_ple_explicit_group_controls_sharding_and_reduction(monkeypatch):
+    _set_tp(monkeypatch, 0, 1)
+
+    class Group:
+        rank_in_group = 1
+        world_size = 2
+
+        def all_reduce(self, rows):
+            self.seen = rows.clone()
+            return rows + 1
+
+    group = Group()
+    table = Qwen4ExpPLETable(
+        _TABLE_ROWS,
+        _HEAD_DIM,
+        embedding_method=Qwen4ExpPLEEmbeddingMethod.from_quant_config(None, "ple"),
+        padding_size=16,
+        prefix="ple",
+        parallel_group=group,
+    )
+    rows = torch.arange(_TABLE_ROWS * _HEAD_DIM).reshape(_TABLE_ROWS, _HEAD_DIM).float()
+    table.weight_loader(table.weight, rows, checkpoint_start=0)
+    assert table.weight.shape == (32, _HEAD_DIM)
+    ids = torch.tensor([[0, 31, 32, 63]])
+    expected = rows[ids].masked_fill((ids < 32).unsqueeze(-1), 0)
+    assert torch.equal(table(ids), expected + 1)
+    assert torch.equal(group.seen, expected)
+
+
+@pytest.mark.parametrize("storage", ["resident", "host", "shared"])
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+def test_ple_storage_reuses_common_checkpoint_loader(
+    monkeypatch, tmp_path, storage, fp8
+):
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.ple_storage import (
+        HostPLETable,
+        ResidentPLETable,
+        SharedPLEOptions,
+    )
+
+    _set_tp(monkeypatch, 0, 1)
+    if storage == "resident":
+        factory = ResidentPLETable
+    else:
+        options = (
+            SharedPLEOptions(tmp_path, "fixture", {"checkpoint": "small"}, 1)
+            if storage == "shared"
+            else None
+        )
+        factory = partial(HostPLETable, shared=options)
+    dtype = torch.float8_e4m3fn if fp8 else torch.bfloat16
+    config = _text_config(**_PLE, ple_embedding_dtype="float8_e4m3fn" if fp8 else None)
+    with set_default_torch_dtype(torch.bfloat16):
+        embedding = Qwen4ExpNGramEmbedding(
+            config, _PLE["ple_embed_dim"], 0, None, "ple", table_factory=factory
+        )
+    table = embedding.ngram_embedding
+    checkpoint = (
+        (torch.arange(_TABLE_ROWS * _HEAD_DIM).float() % 8)
+        .reshape(_TABLE_ROWS, _HEAD_DIM)
+        .to(dtype)
+    )
+    try:
+        assert table.weight.is_meta == (storage == "shared")
+        if storage != "resident":
+            assert not isinstance(table, ResidentPLETable)
+            assert not hasattr(table, "local_rows")
+            assert not hasattr(table, "lookup_raw")
+            assert "table" not in dict(table.named_buffers())
+            with pytest.raises(NotImplementedError, match="host lookup boundary"):
+                table(torch.tensor([0]))
+        weights = [
+            (f"ngram_embedding.shard_{i}.weight", shard)
+            for i, shard in enumerate(checkpoint.split(22))
+        ]
+        if fp8:
+            weights.append(("ngram_embedding.weight_scale", torch.tensor([0.25])))
+        embedding.load_weights(weights)
+        visited = []
+        weight = table.weight
+
+        def visit(tensor):
+            visited.append(tensor)
+            return tensor
+
+        table._apply(visit)
+        assert table.weight is weight
+        assert all(tensor is not weight for tensor in visited)
+        table.finalize_weights()
+        table.finalize_weights()
+        if storage == "resident":
+            assert table.weight.numel() == 0
+            assert torch.equal(
+                table.table.reshape(_TABLE_ROWS, _HEAD_DIM).view(dtype).float(),
+                checkpoint.float(),
+            )
+        else:
+            ids = torch.tensor([[0, 22, 63, -1], [64, 31, 32, 1]])
+            raw = table.lookup_host(ids).reshape(*ids.shape, _HEAD_DIM)
+            expected = checkpoint[ids.clamp(0, 63)].float()
+            expected[(ids < 0) | (ids >= 64)] = 0
+            assert torch.equal(raw.view(dtype).float(), expected)
+        with pytest.raises(ValueError, match="finalized"):
+            embedding.load_weights(weights[:1])
+    finally:
+        if isinstance(table, HostPLETable):
+            table.close()
+    assert not list(tmp_path.iterdir())
+
+
+def test_ple_storage_rejects_missing_and_duplicate_rows(monkeypatch):
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.ple_storage import ResidentPLETable
+
+    _set_tp(monkeypatch, 0, 1)
+    with set_default_torch_dtype(torch.bfloat16):
+        embedding = Qwen4ExpNGramEmbedding(
+            _text_config(**_PLE),
+            _PLE["ple_embed_dim"],
+            0,
+            None,
+            "ple",
+            table_factory=ResidentPLETable,
+        )
+    shard = ("ngram_embedding.shard_0.weight", torch.ones(22, 4, dtype=torch.bfloat16))
+    embedding.load_weights([shard])
+    with pytest.raises(ValueError, match="Duplicate"):
+        embedding.load_weights([shard])
+    with pytest.raises(ValueError, match="Missing"):
+        embedding.ngram_embedding.finalize_weights()
+
+
+@pytest.mark.parametrize("storage", ["resident", "host", "shared"])
+def test_ple_native_adapter_reuses_common_math_and_checkpoint(
+    monkeypatch, tmp_path, storage
+):
+    """CPU adapter contract; only device lookup/conv bridges are dense doubles."""
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import ple_offload, ple_storage, pooled_ple
+    from vllm_torchtpu.models.vllm.qwen4_exp.parallel import PLEParallel
+    from vllm_torchtpu.models.vllm.qwen4_exp.ple import dilated_short_conv
+
+    _set_tp(monkeypatch, 0, 1)
+
+    class Group:
+        rank_in_group = 0
+        world_size = 1
+
+        def all_reduce(self, rows):
+            return rows
+
+    group = Group()
+    parallel = PLEParallel(group, group, embedding_across_dp=False)
+
+    def raw_lookup(start, rows, width):
+        def run(table, ids):
+            result = table.reshape(rows, width)[ids.clamp(0, rows - 1)].clone()
+            result[(ids < 0) | (ids >= rows)] = 0
+            return result.flatten(-2)
+
+        return run
+
+    monkeypatch.setattr(ple_storage, "build_raw_lookup_op", raw_lookup)
+    monkeypatch.setattr(
+        ple_storage,
+        "build_decode_op",
+        lambda: lambda raw, scale: raw.view(torch.bfloat16),
+    )
+
+    def conv_bridge(dilation):
+        def run(x, weight, history, starts, slots, initial):
+            request, chunk = token_requests(starts, x.shape[0])
+            windows = torch.where(
+                initial[:, None, None], history[slots.clamp_min(0)], 0
+            )
+            output, updated = dilated_short_conv(
+                x, weight, dilation, windows, starts, request, chunk
+            )
+            for i, slot in enumerate(slots.tolist()):
+                if slot > 0 and starts[i + 1] > starts[i]:
+                    history[slot] = updated[i]
+            return F.silu(output)
+
+        return run
+
+    monkeypatch.setattr(pooled_ple, "build_short_conv_op", conv_bridge)
+    shared = (
+        ple_storage.SharedPLEOptions(tmp_path, "layer", {"checkpoint": "fixture"}, 1)
+        if storage == "shared"
+        else None
+    )
+    with set_default_torch_dtype(torch.bfloat16):
+        reference = Qwen4ExpPLELayer(_text_config(**_PLE), 0, None, "ple")
+        _randomize_ple(reference)
+        adapted = pooled_ple.Qwen4ExpPooledPLE(
+            _text_config(**_PLE),
+            0,
+            None,
+            "ple",
+            parallel=parallel,
+            table_group=group,
+            cpu_offload=storage != "resident",
+            shared=shared,
+        )
+    weights = dict(reference.state_dict())
+    full_table = weights.pop("ple_embedding.ngram_embedding.weight")
+    for i, rows in enumerate(full_table.split(22)):
+        weights[f"ple_embedding.ngram_embedding.shard_{i}.weight"] = rows
+    loader_type = pooled_ple.AutoWeightsLoader
+    constructions = []
+
+    def loader(module):
+        instance = loader_type(module)
+        constructions.append(instance)
+        return instance
+
+    monkeypatch.setattr(pooled_ple, "AutoWeightsLoader", loader)
+    keys = set(adapted.state_dict())
+    assert adapted._checkpoint_loader is None
+    for name, value in weights.items():
+        adapted.load_checkpoint(iter([(name, value)]))
+        assert len(constructions) == 1
+        assert constructions[0].ignore_unexpected_suffixes == [".bias"]
+    assert set(adapted.state_dict()) == keys
+    assert adapted._loaded == set(dict(adapted.named_parameters())) | {
+        "ple_embedding.layer_multipliers",
+        "ple_embedding.ngram_heads_offsets",
+        "ple_embedding.ngram_heads_vocab_sizes",
+    }
+    adapted.finalize_weights()
+    assert adapted._checkpoint_loader is None
+    monkeypatch.setattr(
+        ple_offload,
+        "get_forward_context",
+        lambda: SimpleNamespace(no_compile_layers={"ple": adapted}),
+    )
+    history = torch.zeros(
+        4, reference.conv_state_len, HC * HIDDEN, dtype=torch.bfloat16
+    )
+    history[1].fill_(4)  # A reused slot must ignore stale history on first prefill.
+    adapted.bind_history(history)
+    contexts = torch.full((3, 2), _PLE["eos_token_id"], dtype=torch.int64)
+    expected_history = history.clone()
+    generator = torch.Generator(device="cpu").manual_seed(314)
+    with torch.no_grad():
+        for ids, starts, slots, initial in (
+            ([3, 4, 5, 6, 7, 0], [0, 3, 5, 5], [1, 2, -1], [False, False, False]),
+            ([8, 9, 0], [0, 1, 2, 2], [2, 1, -1], [True, True, False]),
+        ):
+            ids, starts, slots = map(torch.tensor, (ids, starts, slots))
+            initial = torch.tensor(initial)
+            inputs = PLEInputs(ids, starts, contexts)
+            hidden = torch.randn(len(ids), HC * HIDDEN, generator=generator).to(
+                torch.bfloat16
+            )
+            windows = torch.where(
+                initial[:, None, None], expected_history[slots.clamp_min(0)], 0
+            )
+            expected, next_windows = reference(hidden, inputs, windows)
+            valid = starts[-1]
+            raw = (
+                adapted.lookup_for_model(inputs, valid) if adapted.cpu_offload else None
+            )
+            actual = adapted.forward_with_history(
+                hidden, inputs, slots, initial, valid, raw
+            )
+            torch.testing.assert_close(actual[:valid], expected[:valid], rtol=0, atol=0)
+            assert torch.count_nonzero(actual[valid:]) == 0
+            for i, slot in enumerate(slots.tolist()):
+                if slot > 0:
+                    expected_history[slot] = next_windows[i]
+            torch.testing.assert_close(history, expected_history, rtol=0, atol=0)
+    if isinstance(adapted.storage, ple_storage.HostPLETable):
+        adapted.storage.close()
+
+
+@pytest.mark.parametrize("host", [False, True], ids=["resident", "host"])
+@pytest.mark.parametrize("fp8", [False, True], ids=["bf16", "fp8"])
+@pytest.mark.parametrize("num_tokens", [0, 5], ids=["zero_tokens", "padding_only"])
+@pytest.mark.parametrize("across_dp", [False, True], ids=["local", "dp_peer"])
+def test_ple_zero_requests_keep_owner_collectives(
+    monkeypatch, host, fp8, num_tokens, across_dp
+):
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import ple_offload, pooled_ple
+    from vllm_torchtpu.models.vllm.qwen4_exp.parallel import PLEParallel
+
+    _set_tp(monkeypatch, 0, 1)
+    calls = []
+
+    def forbidden(*args, **kwargs):
+        raise AssertionError("empty local requests must not hash/decode/convolve")
+
+    class Group:
+        rank_in_group = 0
+
+        def __init__(self, name, size):
+            self.name, self.world_size = name, size
+
+        def all_gather(self, ids, dim):
+            calls.append("gather")
+            assert ids.shape == (num_tokens, 4) and bool((ids == -1).all())
+            # Peer rows must still be served by the local table owner.
+            return torch.cat((ids, torch.zeros_like(ids)), dim=dim)
+
+        def all_reduce(self, rows):
+            calls.append(self.name)
+            return rows
+
+    tp, dp = Group("tp", 1), Group("dp", 2 if across_dp else 1)
+    parallel = PLEParallel(tp, dp, embedding_across_dp=across_dp)
+    config = _text_config(
+        **dict(_PLE, ple_embedding_dtype="float8_e4m3fn" if fp8 else None)
+    )
+    with set_default_torch_dtype(torch.bfloat16):
+        layer = pooled_ple.Qwen4ExpPooledPLE(
+            config,
+            0,
+            None,
+            "ple",
+            parallel=parallel,
+            table_group=Group("table", parallel.world_size),
+            cpu_offload=host,
+        )
+    # No weights are read on the empty branch except peer raw rows. Check that
+    # ownership work explicitly; normal loaded-layer math is tested above.
+    layer._finalized = True
+    layer._conv = forbidden
+    history = torch.full((2, *layer.state_shape), 7, dtype=torch.bfloat16)
+    layer.cache_owners = (history,)
+    before = history.clone()
+    monkeypatch.setattr(layer, "gated_values", forbidden)
+    monkeypatch.setattr(layer.storage, "decode", forbidden)
+    width = layer.storage.embedding_dim * 4
+    carrier = torch.int8 if fp8 else torch.int16
+
+    def lookup(ids):
+        calls.append("lookup")
+        assert across_dp and ids.shape == (2 * num_tokens, 4)
+        assert bool((ids[:num_tokens] == -1).all())
+        assert bool((ids[num_tokens:] == 0).all())
+        return (ids[:, :1] == 0).expand(-1, width).to(carrier).clone()
+
+    if host:
+        monkeypatch.setattr(layer.storage, "lookup_host", lookup)
+        monkeypatch.setattr(
+            ple_offload,
+            "get_forward_context",
+            lambda: SimpleNamespace(no_compile_layers={"ple": layer}),
+        )
+    else:
+        monkeypatch.setattr(layer.storage, "lookup_raw", lookup)
+    inputs = PLEInputs(
+        torch.zeros(num_tokens, dtype=torch.int32),
+        torch.tensor([0], dtype=torch.int32),
+        torch.empty(0, 2, dtype=torch.int32),
+    )
+    gathered = layer._lookup_ids(inputs, torch.tensor(0))
+    assert gathered.shape == (dp.world_size * num_tokens, 4)
+    assert bool((gathered[:num_tokens] == -1).all())
+    calls.clear()
+    monkeypatch.setattr(layer.ple_embedding, "compute_ids", forbidden)
+    hidden = torch.full((num_tokens, HC * HIDDEN), 3, dtype=torch.bfloat16)
+    raw = layer.lookup_for_model(inputs, torch.tensor(0)) if host else None
+    if host:
+        assert raw.shape == (dp.world_size, num_tokens, width) and raw.dtype == carrier
+    result = layer.forward_with_history(
+        hidden,
+        inputs,
+        torch.empty(0, dtype=torch.int32),
+        torch.empty(0, dtype=torch.bool),
+        torch.tensor(0),
+        raw,
+    )
+    assert result.shape == hidden.shape and result.dtype == hidden.dtype
+    assert bool((result == 0).all())
+    assert layer.cache_owners[0] is history and torch.equal(history, before)
+    assert calls == (["gather", "lookup", "dp", "tp"] if across_dp else ["tp"])
+    if not across_dp:
+        compiled = torch.compile(
+            layer.forward_with_history, backend="eager", fullgraph=True
+        )
+        actual = compiled(
+            hidden,
+            inputs,
+            torch.empty(0, dtype=torch.int32),
+            torch.empty(0, dtype=torch.bool),
+            torch.tensor(0),
+            raw,
+        )
+        torch.testing.assert_close(actual, result, rtol=0, atol=0)
+        assert torch.equal(history, before)
