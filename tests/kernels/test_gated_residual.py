@@ -13,18 +13,99 @@
 # limitations under the License.
 """FP32 scalar gates must retain their precision between BF16 boundaries."""
 
+import dataclasses
+
+import jax
+import jax.numpy as jnp
 import pytest
 import torch
+from torch._subclasses.fake_tensor import FakeTensorMode
 
+from vllm_torchtpu.kernels.qwen4_exp import gated_residual
+from vllm_torchtpu.kernels.qwen4_exp.hc_resources import HcHardware
 from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import build_gated_residual_op
 
 
 @pytest.mark.parametrize(
-    "branches,hidden,tile", [(0, 128, 128), (4, 129, 128), (4, 128, 0)]
+    "branches,hidden,tile",
+    [
+        (0, 128, 128),
+        (-1, 128, 128),
+        (4, 0, 128),
+        (4, 129, 128),
+        (4, 128, 0),
+        (4, 128, -1),
+    ],
 )
 def test_invalid_geometry(branches, hidden, tile):
     with pytest.raises(ValueError):
         build_gated_residual_op(branches, hidden, tile)
+
+
+_RESIDUAL_LAYOUT = HcHardware("7x", 64 << 20, 128, 16, 8, 256)
+
+
+@pytest.mark.parametrize("tile", [16, 32, 64])
+def test_small_tile_factory_and_abstract_admission(monkeypatch, tile):
+    """Exercise the CPU factory contract, not TPU lowering or numerics."""
+    calls = []
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("CPU factory attempted hardware discovery")
+
+    def pallas_boundary(kernel, **kwargs):
+        calls.append(kwargs)
+        return lambda residual, block, gates: residual
+
+    monkeypatch.setattr(gated_residual.pltpu, "get_tpu_info", forbidden)
+    monkeypatch.setattr(gated_residual.pl, "pallas_call", pallas_boundary)
+    op = build_gated_residual_op(4, 128, tile, _RESIDUAL_LAYOUT)
+    assert not calls
+    with FakeTensorMode():
+        residual = torch.empty(2 * tile, 512, dtype=torch.bfloat16)
+        block = torch.empty(2 * tile, 128, dtype=torch.bfloat16)
+        gates = torch.empty(2 * tile, 4, dtype=torch.float32)
+        output = op(residual, block, gates)
+        assert output.shape == residual.shape
+        assert output.dtype == residual.dtype
+        assert output.device == residual.device
+    assert not calls
+    shapes = (
+        jax.ShapeDtypeStruct((2 * tile, 512), jnp.bfloat16),
+        jax.ShapeDtypeStruct((2 * tile, 128), jnp.bfloat16),
+        jax.ShapeDtypeStruct((2 * tile, 4), jnp.float32),
+    )
+    result = jax.eval_shape(
+        gated_residual.gated_residual_fn(4, 128, tile, _RESIDUAL_LAYOUT), *shapes
+    )
+    assert result.shape == shapes[0].shape and result.dtype == shapes[0].dtype
+    assert len(calls) == 1
+    assert calls[0]["grid"] == (2,)
+    assert calls[0]["out_shape"].shape == shapes[0].shape
+
+
+@pytest.mark.parametrize(
+    "tile,layout",
+    [
+        (8, _RESIDUAL_LAYOUT),
+        (64, dataclasses.replace(_RESIDUAL_LAYOUT, lanes=64)),
+        (64, dataclasses.replace(_RESIDUAL_LAYOUT, vmem_bytes=1)),
+    ],
+    ids=["sublane-packing", "unsupported-lanes", "vmem-budget"],
+)
+def test_small_tile_keeps_layout_and_resource_guards(monkeypatch, tile, layout):
+    def forbidden(*args, **kwargs):
+        pytest.fail("Invalid layout reached hardware discovery or Pallas")
+
+    monkeypatch.setattr(gated_residual.pltpu, "get_tpu_info", forbidden)
+    monkeypatch.setattr(gated_residual.pl, "pallas_call", forbidden)
+    shapes = (
+        jax.ShapeDtypeStruct((2 * tile, 512), jnp.bfloat16),
+        jax.ShapeDtypeStruct((2 * tile, 128), jnp.bfloat16),
+        jax.ShapeDtypeStruct((2 * tile, 4), jnp.float32),
+    )
+    with pytest.raises(ValueError, match="packing and VMEM"):
+        jax.eval_shape(gated_residual.gated_residual_fn(4, 128, tile, layout), *shapes)
 
 
 TPU = pytest.mark.tpu_test
