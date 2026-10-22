@@ -355,7 +355,7 @@ if [ "$SKIP_BENCHMARK" = "1" ]; then
   BENCH_ARGS+=(--dry-run)
 fi
 
-./scripts/vllm/benchmarking/run_benchmarks.sh "${BENCH_ARGS[@]}"
+NUM_PROMPTS=2048 ./scripts/vllm/benchmarking/run_benchmarks.sh "${BENCH_ARGS[@]}"
 
 # Read model name from config
 MODEL=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["model"])' "$RESULTS_DIR/config.json")
