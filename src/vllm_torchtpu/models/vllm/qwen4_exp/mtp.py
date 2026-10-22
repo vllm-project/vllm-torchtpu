@@ -213,14 +213,20 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         return self.hyper_connection_mixer.mix(hidden)[0], hidden
 
 
-@support_torch_compile(
-    dynamic_arg_dims={
-        "input_ids": 0,
-        "positions": 0,
-        "hidden_states": 0,
-        "draft_rows": 0,
-    }
-)
+# Only the token dimension is dynamic. `draft_rows` (draft step 0's per-request
+# rows) must stay static: vLLM compiles one trace per token bucket by setting
+# every symbol of the trace to the bucket size (create_concrete_args), so a
+# dynamic draft_rows dim was compiled at the bucket size (s64[256] at bucket
+# 256) and failed against the request-sized rows a step passes. The proposer
+# always passes it at the chunk's fixed request capacity instead.
+QWEN4_EXP_MTP_DYNAMIC_ARG_DIMS = {
+    "input_ids": 0,
+    "positions": 0,
+    "hidden_states": 0,
+}
+
+
+@support_torch_compile(dynamic_arg_dims=QWEN4_EXP_MTP_DYNAMIC_ARG_DIMS)
 class Qwen4ExpMTP(nn.Module):
     """Draft returning (LM-head input [T, H], next-step hidden [T, hc*H])."""
 

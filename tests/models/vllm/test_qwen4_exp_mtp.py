@@ -679,3 +679,71 @@ def test_draft_rows_match_all_token_step_at_those_rows(monkeypatch):
     torch.testing.assert_close(row_multi[:3], multi[picked], rtol=0, atol=0)
     torch.testing.assert_close(row_sample[:3], sample[picked], rtol=0, atol=0)
     assert torch.isfinite(row_multi[3].float()).all()
+
+
+def _draft_rows_trace_inputs(dims, *, tokens, rows, buckets):
+    """Trace a draft-step-0-shaped forward as support_torch_compile does
+    (dims marked dynamic, dynamic=False, guards dropped) and return each
+    bucket's concrete placeholder shapes, built the way vLLM's piecewise
+    backend builds them (create_concrete_args)."""
+    import torch._dynamo
+    from vllm.compilation.piecewise_backend import create_concrete_args
+
+    def step0(input_ids, positions, hidden_states, draft_rows):
+        hidden = hidden_states + (input_ids + positions)[:, None].to(hidden_states)
+        picked = hidden[draft_rows.clamp_min(0)]
+        return torch.where((draft_rows >= 0)[:, None], picked, 0)
+
+    graphs = []
+
+    def backend(gm, example_inputs):
+        graphs.append(gm)
+        return gm.forward
+
+    args = {
+        "input_ids": torch.zeros(tokens, dtype=torch.int64),
+        "positions": torch.zeros(tokens, dtype=torch.int64),
+        "hidden_states": torch.zeros(tokens, 8),
+        "draft_rows": torch.full((rows,), -1, dtype=torch.int64),
+    }
+    for name, dim in dims.items():
+        torch._dynamo.mark_dynamic(args[name], dim)
+    torch._dynamo.reset()
+    torch.compile(step0, backend=backend, fullgraph=True, dynamic=False)(**args)
+    (graph,) = graphs
+    shapes = {}
+    for size in buckets:
+        concrete = [
+            tuple(a.shape)
+            for a in create_concrete_args(graph, size)
+            if isinstance(a, torch.Tensor)
+        ]
+        shapes[size] = concrete
+    return shapes
+
+
+def test_draft_rows_static_across_token_buckets():
+    """vLLM compiles the draft once per token bucket by setting every trace
+    symbol to the bucket size. draft_rows must therefore not be dynamic, or
+    bucket 256's program expects s64[256] rows while a step passes the
+    request-sized ones (RuntimeProgramInputMismatch on TPU)."""
+    from vllm_torchtpu.models.vllm.qwen4_exp import mtp
+
+    assert "draft_rows" not in mtp.QWEN4_EXP_MTP_DYNAMIC_ARG_DIMS
+    # Trace at tokens == rows: the worst case, duck sizing would share a
+    # symbol between the two if draft_rows were dynamic.
+    shapes = _draft_rows_trace_inputs(
+        mtp.QWEN4_EXP_MTP_DYNAMIC_ARG_DIMS, tokens=32, rows=32, buckets=(64, 256)
+    )
+    for size, concrete in shapes.items():
+        assert (size,) in concrete  # input_ids / positions follow the bucket
+        assert (size, 8) in concrete
+        assert concrete[-1] == (32,)  # draft_rows stays at its fixed length
+    # The pre-fix dims reproduce the failure: draft_rows takes the bucket size.
+    broken = _draft_rows_trace_inputs(
+        {**mtp.QWEN4_EXP_MTP_DYNAMIC_ARG_DIMS, "draft_rows": 0},
+        tokens=64,
+        rows=32,
+        buckets=(256,),
+    )
+    assert broken[256][-1] == (256,)

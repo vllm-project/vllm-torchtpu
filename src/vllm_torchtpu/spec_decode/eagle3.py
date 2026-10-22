@@ -372,18 +372,47 @@ class Eagle3Proposer:
                 "freezes; the combination is unvalidated."
             )
 
-    def _padded_draft_rows(self, last_token_indices: torch.Tensor) -> torch.Tensor:
-        """Draft step 0's row selection at a fixed length of max_num_reqs.
+    def _draft_rows_len(self, chunk: DraftChunkInputs) -> int:
+        """Draft step 0's fixed `draft_rows` length: the chunk's request
+        capacity, the length of the seq_lens its attention metadata carries.
 
-        The draft's compiled program is picked by the step's token bucket, but
-        the padded request count p varies within a bucket; a `draft_rows` of
-        length p therefore mismatched the traced program
-        (RuntimeProgramInputMismatch). Pad with -1 (no row) to max_num_reqs.
+        Qwen4ExpMTP keeps `draft_rows` static (not in its dynamic_arg_dims),
+        so every token bucket's compiled program takes it at this one length.
+        Matching the metadata's request rows keeps pooled_qsa_rows on its
+        row-wise decode path (len(rows) <= len(context)).
         """
-        pad = self.runner.max_num_reqs - last_token_indices.shape[0]
-        if pad <= 0:
-            return last_token_indices
-        return torch.nn.functional.pad(last_token_indices, (0, pad), value=-1)
+        runner = self.runner
+        if chunk.attn_ctx.use_max_model_len:
+            capacity = runner.num_reqs_max_model_len
+        else:
+            capacity = runner.num_reqs_most_model_len
+        assert capacity is not None
+        return int(capacity)
+
+    def _padded_draft_rows(
+        self, last_token_indices: torch.Tensor, num_rows: int
+    ) -> torch.Tensor:
+        """Draft step 0's row selection at the fixed length `num_rows`.
+
+        The draft's compiled program is picked by the step's token bucket
+        alone, while the padded request count p varies within a bucket, so
+        `draft_rows` must not follow p (RuntimeProgramInputMismatch). The
+        first chunk.num_reqs <= num_rows entries are real; past them
+        last_token_indices holds filler, so truncate or pad with -1 (no row).
+        """
+        rows = last_token_indices[:num_rows]
+        pad = num_rows - rows.shape[0]
+        if pad > 0:
+            rows = torch.nn.functional.pad(rows, (0, pad), value=-1)
+        return rows
+
+    @staticmethod
+    def _fit_draft_rows_output(out: torch.Tensor, rows: int) -> torch.Tensor:
+        """The draft's [num_rows, ...] row output resized to the p carry rows
+        (rows past the chunk's real requests are padding either way)."""
+        if out.shape[0] >= rows:
+            return out[:rows]
+        return torch.nn.functional.pad(out, (0, 0, 0, rows - out.shape[0]))
 
     def _resolve_draft_rows(self) -> bool:
         """Whether draft step 0 runs at each request's last token only.
@@ -1377,15 +1406,18 @@ class Eagle3Proposer:
                 num_rejected_np=rejected_np_per_chunk[ci],
                 num_tokens_padded=input_ids.shape[0],
                 draft_rows=(
-                    self._padded_draft_rows(last_token_indices)
+                    self._padded_draft_rows(
+                        last_token_indices, self._draft_rows_len(chunk)
+                    )
                     if self._draft_rows
                     else None
                 ),
             )
             if self._draft_rows:
-                # Drop the rows padded up to max_num_reqs (see _padded_draft_rows).
+                # Back from the fixed draft_rows length to the p carry rows.
                 rows = last_token_indices.shape[0]
-                last_hidden, hidden = last_hidden[:rows], hidden[:rows]
+                last_hidden = self._fit_draft_rows_output(last_hidden, rows)
+                hidden = self._fit_draft_rows_output(hidden, rows)
             # [p, h] / [p] carries + first-pass draft token, computed in compiled
             # regions (the three gathers, then lm-head+argmax) so torch-tpu's
             # eager DEFER_AND_FUSE path can't fuse them into per-context programs.
