@@ -7,6 +7,9 @@ import os
 from types import SimpleNamespace
 
 import pytest
+from vllm.transformers_utils.configs.deepseek_v41 import (
+    DeepseekV41Config as HFDeepseekV41Config,
+)
 
 from vllm_torchtpu.models.vllm.deepseek_v41.config import (
     DeepseekV41Config,
@@ -20,6 +23,9 @@ pytestmark = pytest.mark.cpu_test
 
 @pytest.fixture(autouse=True)
 def clean_env(monkeypatch):
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "get_device_name", lambda *_: "TPU v7")
     for name in os.environ:
         if name.startswith(("TPU_DEEPSEEK_V41_", "MOE_", "USE_MOE_")):
             monkeypatch.delenv(name)
@@ -30,10 +36,29 @@ def config(**policy):
         additional_config={"deepseek_v41": policy, "unrelated": 17},
         engram_config=SimpleNamespace(cpu_offload=True),
         parallel_config=SimpleNamespace(
-            enable_expert_parallel=True, prefill_context_parallel_size=1
+            enable_expert_parallel=True,
+            prefill_context_parallel_size=1,
+            enable_eplb=False,
+            expert_placement_strategy="linear",
+            enable_ep_weight_filter=True,
+            tensor_parallel_size=1,
+            data_parallel_size=8,
+            pipeline_parallel_size=1,
         ),
+        load_config=SimpleNamespace(load_format="runai_streamer"),
         kernel_config=SimpleNamespace(moe_backend="auto"),
-        model_config=SimpleNamespace(hf_config=SimpleNamespace(expert_dtype="fp4")),
+        model_config=SimpleNamespace(
+            hf_config=HFDeepseekV41Config(
+                text_config={
+                    "num_hidden_layers": 40,
+                    "n_routed_experts": 4,
+                    "hidden_size": 5120,
+                    "moe_intermediate_size": 2304,
+                    "num_experts_per_tok": 6,
+                },
+                quantization_config={"expert_dtype": "fp4"},
+            )
+        ),
         cache_config=SimpleNamespace(
             enable_prefix_caching=True, swa_bounded_replay=True
         ),
@@ -50,7 +75,7 @@ def test_policy_round_trips_to_worker_and_config_hash_input(execution, moe):
     verify_and_update_config(worker)
     assert json.dumps(worker.additional_config, sort_keys=True) == before
     assert DeepseekV41Config.from_vllm_config(worker) == DeepseekV41Config.parse(
-        dict(execution=execution, moe=moe)
+        dict(execution=execution, moe=moe, expert_permutations={})
     )
     assert worker.additional_config["unrelated"] == 17
 
@@ -67,7 +92,102 @@ def test_rejects_unknown_or_mistyped_options(policy):
 def test_defaults_are_explicit_and_do_not_enable_approximation():
     cfg = config()
     verify_and_update_config(cfg)
-    assert cfg.additional_config["deepseek_v41"] == {"execution": "full", "moe": "gmm"}
+    assert cfg.additional_config["deepseek_v41"] == {
+        "execution": "full",
+        "moe": "gmm",
+        "expert_permutations": {},
+    }
+
+
+def test_calibrated_placement_is_default_and_frozen_for_worker_copies():
+    cfg = config(moe="fused_ep_w4a8")
+    cfg.model_config.hf_config.n_routed_experts = 384
+    assert "num_hash_layers" not in cfg.model_config.hf_config.to_dict()
+    verify_and_update_config(cfg)
+    resolved = cfg.additional_config["deepseek_v41"]["expert_permutations"]
+    assert len(resolved) == 30
+    assert all(sorted(ids) == list(range(384)) for ids in resolved.values())
+    assert not {"0", "1", "40"}.intersection(resolved)
+    serialized = json.dumps(cfg.additional_config, sort_keys=True)
+    worker = copy.deepcopy(cfg)
+    worker.parallel_config.data_parallel_size = 1
+    worker.additional_config = json.loads(serialized)
+    verify_and_update_config(worker)
+    assert json.dumps(worker.additional_config, sort_keys=True) == serialized
+
+
+@pytest.mark.parametrize("disabled", [None, {}])
+def test_explicit_empty_placement_disables_default(disabled):
+    cfg = config(moe="fused_ep_w4a8", expert_permutations=disabled)
+    cfg.model_config.hf_config.n_routed_experts = 384
+    verify_and_update_config(cfg)
+    assert cfg.additional_config["deepseek_v41"]["expert_permutations"] == {}
+    verify_and_update_config(cfg)
+    assert cfg.additional_config["deepseek_v41"]["expert_permutations"] == {}
+
+
+@pytest.mark.parametrize(
+    "owner,field,value",
+    [
+        ("parallel_config", "data_parallel_size", 4),
+        ("parallel_config", "enable_eplb", True),
+        ("parallel_config", "expert_placement_strategy", "round_robin"),
+        ("parallel_config", "enable_ep_weight_filter", False),
+        ("load_config", "load_format", "safetensors"),
+    ],
+)
+def test_automatic_placement_keeps_unsupported_layouts_native(owner, field, value):
+    cfg = config(moe="fused_ep_w4a8")
+    cfg.model_config.hf_config.n_routed_experts = 384
+    setattr(getattr(cfg, owner), field, value)
+    verify_and_update_config(cfg)
+    assert cfg.additional_config["deepseek_v41"]["expert_permutations"] == {}
+
+
+def test_legacy_fused_policy_resolves_default_once(monkeypatch):
+    cfg = config()
+    cfg.model_config.hf_config.n_routed_experts = 384
+    del cfg.additional_config["deepseek_v41"]
+    monkeypatch.setenv("USE_MOE_FUSED_EP_KERNEL", "1")
+    monkeypatch.setenv("MOE_FUSED_EP_ENABLE_W4A8", "1")
+    verify_and_update_config(cfg)
+    assert len(cfg.additional_config["deepseek_v41"]["expert_permutations"]) == 30
+
+
+def test_expert_permutation_values_survive_worker_serialization():
+    cfg = config(moe="fused_ep_w4a8", expert_permutations={"8": [2, 0, 3, 1]})
+    verify_and_update_config(cfg)
+    serialized = json.dumps(cfg.additional_config)
+    worker = copy.deepcopy(cfg)
+    worker.additional_config = json.loads(serialized)
+    verify_and_update_config(worker)
+    assert worker.additional_config == cfg.additional_config
+    worker.additional_config["deepseek_v41"]["expert_permutations"]["8"] = [1, 0, 3, 2]
+    assert json.dumps(worker.additional_config) != serialized
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("moe", "gmm"),
+        ("enable_eplb", True),
+        ("expert_placement_strategy", "round_robin"),
+        ("enable_ep_weight_filter", False),
+        ("load_format", "safetensors"),
+        ("expert_permutations", {"40": [2, 0, 3, 1]}),
+        ("expert_permutations", {"8": [1, 0]}),
+    ],
+)
+def test_expert_permutations_refuse_incompatible_loads(field, value):
+    cfg = config(moe="fused_ep_w4a8", expert_permutations={"8": [2, 0, 3, 1]})
+    if field in ("moe", "expert_permutations"):
+        cfg.additional_config["deepseek_v41"][field] = value
+    elif field == "load_format":
+        cfg.load_config.load_format = value
+    else:
+        setattr(cfg.parallel_config, field, value)
+    with pytest.raises(ValueError, match="[Ee]xpert permutation"):
+        verify_and_update_config(cfg)
 
 
 def test_legacy_values_are_frozen_before_worker_env_changes(monkeypatch):

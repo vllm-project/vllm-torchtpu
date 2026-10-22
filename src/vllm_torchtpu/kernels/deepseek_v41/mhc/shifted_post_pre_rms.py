@@ -12,6 +12,8 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from .tuned_block_sizes import normalized_value_in_vmem
+
 
 class PostPreTuning(NamedTuple):
     token_tile: int
@@ -107,6 +109,13 @@ def shifted_post_pre_rms(
     assert scale.shape == (3,) and base.shape == (mixes,)
     assert scale.dtype == base.dtype == jnp.float32
     gate_input_mode = GateInputMode(gate_input_mode)
+    value_in_vmem = (
+        norm_weight is not None
+        and norm_weight.dtype == jnp.bfloat16
+        and gate_input_mode == GateInputMode.HBM
+        and normalized_value_in_vmem(t, m, d)
+    )
+    output_components = 1 if value_in_vmem else 2
     norm_args = () if norm_weight is None else (norm_weight,)
     if norm_weight is not None:
         assert norm_weight.shape == (d,)
@@ -255,7 +264,10 @@ def shifted_post_pre_rms(
             )
 
         def output_copies(tile_index):
-            return tuple(output_copy(tile_index, component) for component in range(2))
+            return tuple(
+                output_copy(tile_index, component)
+                for component in range(output_components)
+            )
 
         def run_tile(tile_index, xr, rr, yr, vr):
             previous_projected = projection_buf[...]
@@ -323,9 +335,11 @@ def shifted_post_pre_rms(
                         columns=columns,
                         eps=norm_eps,
                     )
+            if value_in_vmem:
+                vh[pl.ds(tile_index * tile, tile), :] = vr[...]
             if early_output:
-                output_copy(tile_index, 0).start()
-                output_copy(tile_index, 1).start()
+                for copy in output_copies(tile_index):
+                    copy.start()
             prepare(
                 jnp.minimum(tile_index + 1, num_tiles - 1),
                 (tile_index + 1) % 2,
@@ -401,13 +415,14 @@ def shifted_post_pre_rms(
         kernel,
         in_specs=[hbm, hbm, gate_spec, gate_spec, gate_spec, hbm]
         + [tuple(pl.BlockSpec(memory_space=pltpu.HBM) for _ in norm_args)],
-        out_specs=[hbm, hbm] + [pl.BlockSpec(memory_space=pltpu.VMEM)] * 2,
+        out_specs=[hbm, pl.BlockSpec(memory_space=pltpu.VMEM) if value_in_vmem else hbm]
+        + [pl.BlockSpec(memory_space=pltpu.VMEM)] * 2,
         out_shape=[jax.ShapeDtypeStruct((t, k), flat.dtype) for k in (width, d)]
         + [jax.ShapeDtypeStruct((k, gate_tokens), jnp.float32) for k in (mixes, 1)],
         scratch_shapes=[
             pltpu.VMEM((output_buffers, tile, width), jnp.bfloat16),
             pltpu.VMEM((output_buffers, tile, d), jnp.bfloat16),
-            pltpu.SemaphoreType.DMA((output_buffers, 2)),
+            pltpu.SemaphoreType.DMA((output_buffers, output_components)),
             pltpu.VMEM((input_buffers, tile, d), jnp.bfloat16),
             pltpu.VMEM((input_buffers, tile, width), jnp.bfloat16),
             pltpu.SemaphoreType.DMA((input_buffers, 2)),

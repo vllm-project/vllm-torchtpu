@@ -43,7 +43,7 @@ usual story for anything that scales with hidden size.
 """
 
 from enum import StrEnum
-from typing import Any
+from typing import Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -184,6 +184,7 @@ def _build_op(
     *,
     token_replica_groups=None,
     logical_intermediate_size: int | None = None,
+    has_expert_id_map: bool = False,
 ):
     """The op for this closure, built once per distinct closure and reused."""
     from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
@@ -202,6 +203,7 @@ def _build_op(
         has_hash_ids,
         token_replica_groups,
         logical_intermediate_size,
+        has_expert_id_map,
     )
     cached = _OPS.get(key)
     if cached is not None:
@@ -221,29 +223,32 @@ def _build_op(
         # bf16 gate output -- which is what the model's gate matmul produces --
         # fails inside the kernel on a dtype mismatch. Widen at the boundary;
         # softmax runs in f32 on this path anyway.
-        return fused_ep_moe_v2(
-            x,
-            w1,
-            w2,
-            w1_scale,
-            w2_scale,
-            gating.astype(jnp.float32),
-            rank=rank,
-            topk=topk,
-            renormalize=renormalize,
-            mesh=mesh,
-            capacity=_TILE_M,
-            block=None,
-            ragged_stride=None,
-            weight_format=WeightFormat(weight_format),
-            rhs_qb=rhs_qb,
-            act_fn=activation,
-            mesh_ep_ranks=mesh_expert_order,
-            sharded_plan=sharded_plan,
-            token_replica_groups=token_replica_groups,
-            logical_intermediate_size=logical_intermediate_size,
-            **bias_kw,
-            **routing_kw,
+        return cast(
+            jax.Array,
+            fused_ep_moe_v2(
+                x,
+                w1,
+                w2,
+                w1_scale,
+                w2_scale,
+                gating.astype(jnp.float32),
+                rank=rank,
+                topk=topk,
+                renormalize=renormalize,
+                mesh=mesh,
+                capacity=_TILE_M,
+                block=None,
+                ragged_stride=None,
+                weight_format=WeightFormat(weight_format),
+                rhs_qb=rhs_qb,
+                act_fn=activation,
+                mesh_ep_ranks=mesh_expert_order,
+                sharded_plan=sharded_plan,
+                token_replica_groups=token_replica_groups,
+                logical_intermediate_size=logical_intermediate_size,
+                **bias_kw,
+                **routing_kw,
+            ),
         )
 
     # Every operand is annotated jax.Array: torch_tpu infers static argnums
@@ -301,20 +306,40 @@ def _build_op(
             hash_topk_ids=hash_ids.astype(jnp.int32),
         )
 
+    def moe_with_score_bias_and_map(
+        x: jax.Array,
+        w1: jax.Array,
+        w2: jax.Array,
+        w1_scale: jax.Array,
+        w2_scale: jax.Array,
+        gating: jax.Array,
+        rank: jax.Array,
+        score_bias: jax.Array,
+        expert_id_map: jax.Array,
+    ) -> jax.Array:
+        return call(
+            x,
+            w1,
+            w2,
+            w1_scale,
+            w2_scale,
+            gating,
+            rank,
+            score_bias=score_bias.astype(jnp.float32),
+            expert_id_map=expert_id_map.astype(jnp.int32),
+        )
+
     assert not (has_score_bias and has_hash_ids)
+    if has_expert_id_map and (not has_score_bias or has_hash_ids):
+        raise ValueError("Expert permutations require score-biased top-k routing")
     spec = PartitionSpec(EP_AXIS_NAME)
-    # The score-correction bias is indexed by GLOBAL expert id and read by
-    # every shard for its own tokens, so it is replicated where the other
-    # The score-correction bias is indexed by GLOBAL expert id and read by
-    # every shard for its own tokens, so it is replicated where the other
-    # seven are sharded on axis 0. The spec tuple goes straight to shard_map,
-    # so a heterogeneous tuple is what it wants; the bias is NOT closed over
-    # as a constant because it differs per layer and `_OPS` would then key one
-    # exported program per MoE layer.
+    # Bias and expert map use global logical IDs, so every shard reads the
+    # same values. Operands let layers share an export despite distinct maps.
     input_specs = (
         (spec,) * 7
         + ((PartitionSpec(),) if has_score_bias else ())
         + ((spec,) if has_hash_ids else ())
+        + ((PartitionSpec(),) if has_expert_id_map else ())
     )
     # Stock jax_op. It used to size its outputs from the export's avals, where
     # a shard_map result is recorded as replicated, so this rank's 2048 rows
@@ -322,18 +347,22 @@ def _build_op(
     # JaxCallable with that one line replaced, was the way around it. Torchtpu
     # takes output_partition_specs itself now, which is the same information
     # without a copy of anyone's source.
-    if has_score_bias:
+    if has_expert_id_map:
+        fn = moe_with_score_bias_and_map
+    elif has_score_bias:
         fn = moe_with_score_bias
     elif has_hash_ids:
         fn = moe_with_hash_ids
     else:
         fn = moe
+    # The pinned bridge accepts PartitionSpec, but annotates nested tuples.
+    # pyrefly: ignore[no-matching-overload]
     op = jax_op(
         name,
         fn,
         mesh=mesh,
-        # x, w1, w2, w1_scale, w2_scale, gating, rank [, score_bias | hash_ids]
-        # -- and the single output is sharded on axis 0 like x.
+        # Seven sharded operands, optional bias/hash IDs, then optional map.
+        # The single output is sharded on axis 0 like x.
         input_partition_specs=input_specs,
         output_partition_specs=spec,
     )
@@ -359,6 +388,7 @@ def fused_moe_ep(
     router_logits: torch.Tensor,
     score_bias: torch.Tensor | None = None,
     hash_ids: torch.Tensor | None = None,
+    expert_id_map: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run one MoE layer through the fused EP kernel.
 
@@ -386,7 +416,7 @@ def fused_moe_ep(
             _squeeze_channel_scale_checked(w1_scale),
             _squeeze_channel_scale_checked(w2_scale),
         )
-    extra = tuple(t for t in (score_bias, hash_ids) if t is not None)
+    extra = tuple(t for t in (score_bias, hash_ids, expert_id_map) if t is not None)
     return op(hidden_states, w1, w2, *scales, router_logits, _RANK_BUFFER, *extra)
 
 
@@ -659,6 +689,16 @@ def prebuild_fused_moe_ep(
     )
     scoring_fn, has_score_bias, routed_scale = _routing_config(layer)
     has_hash_ids = getattr(layer, "hash_indices_table", None) is not None
+    has_expert_id_map = getattr(layer, "_tpu_expert_permutation", None) is not None
+    if has_expert_id_map and (
+        policy != FusedEPPolicy.REQUIRED
+        or weight_format != "fp4"
+        or not has_score_bias
+        or has_hash_ids
+    ):
+        raise ValueError(
+            "Expert permutations require native FP4 score-biased top-k routing"
+        )
     op = _build_op(
         mesh,
         topk,
@@ -674,6 +714,7 @@ def prebuild_fused_moe_ep(
         has_hash_ids,
         token_replica_groups=token_replica_groups,
         logical_intermediate_size=logical_intermediate_size,
+        has_expert_id_map=has_expert_id_map,
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "

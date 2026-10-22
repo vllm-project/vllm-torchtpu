@@ -136,6 +136,40 @@ def test_native_replica_groups_reach_prebuilt_op():
     assert seen[0]["token_replica_groups"] == groups
 
 
+def test_expert_map_is_replicated_operand_and_separates_op_cache(monkeypatch):
+    from unittest.mock import Mock
+
+    from jax.sharding import PartitionSpec
+
+    from vllm_torchtpu.kernels.fused_moe import v2
+
+    monkeypatch.setattr(bridge, "_OPS", {})
+    built = []
+
+    def build(name, fn, **kwargs):
+        built.append((fn, kwargs))
+        return Mock()
+
+    monkeypatch.setattr(bridge, "jax_op", build)
+    kernel = Mock(side_effect=lambda x, *args, **kwargs: x)
+    monkeypatch.setattr(v2, "fused_ep_moe_v2", kernel)
+    args = (None, 2, True, "silu", None, True)
+    options = dict(weight_format="fp4", rhs_qb=512, has_score_bias=True)
+    baseline = bridge._build_op(*args, **options)
+    mapped = bridge._build_op(*args, **options, has_expert_id_map=True)
+    assert baseline is not mapped
+    assert bridge._build_op(*args, **options, has_expert_id_map=True) is mapped
+    fn, specs = built[-1]
+    assert len(specs["input_partition_specs"]) == 9
+    assert specs["input_partition_specs"][-1] == PartitionSpec()
+    value = jnp.zeros((2, 8), jnp.bfloat16)
+    permutation = jnp.array([2, 0, 3, 1], dtype=jnp.int32)
+    fn(*([value] * 7), jnp.zeros((4,), jnp.float32), permutation)
+    np.testing.assert_array_equal(kernel.call_args.kwargs["expert_id_map"], permutation)
+    with pytest.raises(ValueError, match="score-biased"):
+        bridge._build_op(*args, has_expert_id_map=True)
+
+
 @pytest.mark.parametrize("sharded_plan", [False, True])
 @pytest.mark.parametrize(
     "scoring_fn,has_bias,scale",

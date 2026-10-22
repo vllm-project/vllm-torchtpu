@@ -183,6 +183,7 @@ def main():
     parser.add_argument("--banks", type=int, choices=[1, 2], default=2)
     parser.add_argument("--distribution", choices=["random", "ties"], default="random")
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument("--dump-hlo", action="store_true")
     parser.add_argument(
         "--variants", type=Path, help="JSON mapping names to decode kwargs"
     )
@@ -278,6 +279,7 @@ def main():
                 overlap = mode.startswith("overlap")
                 tile = int(mode.removeprefix("overlap").removeprefix("serial"))
             score_options = options.pop("score_config", None)
+            automatic = tile is None
             if score_options is not None and tile is None:
                 parser.error("score_config overrides require an explicit request_tile")
             score_config = (
@@ -288,7 +290,7 @@ def main():
                 else tuned_block_sizes.PersistentScoreConfig(**score_options)
             )
             if tile is None:
-                tile = tuned_block_sizes.get_decode_request_tile(
+                config = tuned_block_sizes.get_decode_block_sizes(
                     tuned_block_sizes.DecodeTuningKey(
                         jax.devices()[0].device_kind,
                         args.queries,
@@ -300,6 +302,8 @@ def main():
                     ),
                     args.requests,
                 )
+                tile = config.request_tile
+                score_config = config.score_config
             tile = min(tile, args.requests)
             effective_configs[mode] = dict(
                 request_tile=tile,
@@ -309,14 +313,16 @@ def main():
             )
             fn = functools.partial(
                 candidate,
-                tile=tile,
+                tile=None if automatic else tile,
                 overlap=overlap,
-                score_config=score_config,
+                score_config=None if automatic else score_config,
                 **options,
             )
         t = time.perf_counter()
         executable = jax.jit(fn).lower(*inputs).compile()
         compilation[mode] = time.perf_counter() - t
+        if args.dump_hlo:
+            (args.out / f"{mode}.hlo.txt").write_text(executable.as_text())
         result = jax.block_until_ready(executable(*inputs))
         outputs[mode] = np.asarray(result)
         np.testing.assert_array_equal(outputs[mode][checks], expected)

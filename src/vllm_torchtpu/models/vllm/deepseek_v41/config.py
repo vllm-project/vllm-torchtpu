@@ -3,12 +3,17 @@
 """Typed DSV41 serving policy at vLLM's out-of-tree configuration boundary."""
 
 import os
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from enum import StrEnum
 from typing import TYPE_CHECKING
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.vllm.deepseek_v41.expert_placement import (
+    ExpertPermutations,
+    parse_expert_permutations,
+    validate_expert_topology,
+)
 
 if TYPE_CHECKING:
     from vllm.config import VllmConfig
@@ -30,15 +35,22 @@ class MoEBackend(StrEnum):
 class DeepseekV41Config:
     execution: ExecutionMode = ExecutionMode.FULL
     moe: MoEBackend = MoEBackend.GMM
+    # Omitted means automatic placement; an explicit null/empty map disables it.
+    expert_permutations: ExpertPermutations | None = None
 
     @classmethod
     def parse(cls, value: dict) -> "DeepseekV41Config":
-        unknown = value.keys() - {"execution", "moe"}
+        unknown = value.keys() - {"execution", "moe", "expert_permutations"}
         if unknown:
             raise ValueError(f"Unknown deepseek_v41 config fields: {sorted(unknown)}")
         return cls(
             execution=ExecutionMode(value.get("execution", "full")),
             moe=MoEBackend(value.get("moe", "gmm")),
+            expert_permutations=(
+                parse_expert_permutations(value["expert_permutations"]) or {}
+                if "expert_permutations" in value
+                else None
+            ),
         )
 
     @classmethod
@@ -69,8 +81,40 @@ class DeepseekV41Config:
     def publish(self, config: "VllmConfig") -> None:
         # Canonical defaults participate in vLLM's config hash and worker copies.
         assert isinstance(config.additional_config, dict)
-        config.additional_config["deepseek_v41"] = asdict(self)
-        logger.info("[DSV41] resolved serving policy: %s", asdict(self))
+        resolved = asdict(self)
+        assert self.expert_permutations is not None, "Resolve placement before publish"
+        config.additional_config["deepseek_v41"] = resolved
+        summary = dict(resolved)
+        if self.expert_permutations:
+            summary["expert_permutations"] = sorted(self.expert_permutations, key=int)
+        logger.info("[DSV41] resolved serving policy: %s", summary)
+
+
+def _automatic_expert_permutations(config: "VllmConfig") -> ExpertPermutations:
+    from vllm.platforms import current_platform
+
+    from vllm_torchtpu.models.vllm.deepseek_v41.tuned_expert_placement import (
+        ExpertPlacementKey,
+        default_expert_permutations,
+    )
+
+    assert config.model_config is not None
+    hf = config.model_config.hf_config
+    parallel = config.parallel_config
+    return default_expert_permutations(
+        ExpertPlacementKey(
+            current_platform.get_device_name(),
+            hf.num_hidden_layers,
+            hf.n_routed_experts,
+            hf.hidden_size,
+            hf.moe_intermediate_size,
+            hf.num_experts_per_tok,
+            parallel.tensor_parallel_size,
+            parallel.data_parallel_size,
+            parallel.prefill_context_parallel_size,
+            parallel.pipeline_parallel_size,
+        ),
+    )
 
 
 def validate_environment(policy: DeepseekV41Config) -> None:
@@ -167,6 +211,39 @@ def verify_and_update_config(config: "VllmConfig") -> None:
         assert config.model_config is not None
         if config.model_config.hf_config.expert_dtype != "fp4":
             raise ValueError("fused_ep_w4a8 requires FP4 expert weights")
+    if policy.expert_permutations is None:
+        eligible = (
+            policy.moe == MoEBackend.FUSED_EP_W4A8
+            and not parallel.enable_eplb
+            and parallel.expert_placement_strategy == "linear"
+            and config.load_config.load_format == "runai_streamer"
+            and parallel.enable_ep_weight_filter
+        )
+        policy = replace(
+            policy,
+            expert_permutations=(
+                _automatic_expert_permutations(config) if eligible else {}
+            ),
+        )
+    if policy.expert_permutations:
+        if policy.moe != MoEBackend.FUSED_EP_W4A8:
+            raise ValueError("Expert permutations require fused_ep_w4a8")
+        if parallel.enable_eplb or parallel.expert_placement_strategy != "linear":
+            raise ValueError("Expert permutations require linear EP without EPLB")
+        if (
+            config.load_config.load_format != "runai_streamer"
+            or not parallel.enable_ep_weight_filter
+        ):
+            raise ValueError(
+                "Expert permutations require EP-filtered runai_streamer loading"
+            )
+        assert config.model_config is not None
+        hf = config.model_config.hf_config
+        validate_expert_topology(
+            policy.expert_permutations,
+            layers=hf.num_hidden_layers,
+            experts=hf.n_routed_experts,
+        )
     if policy.execution == ExecutionMode.CED:
         if parallel.prefill_context_parallel_size != 1:
             raise ValueError("CED requires prefill-context-parallel-size=1")

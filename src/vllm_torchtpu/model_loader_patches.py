@@ -246,6 +246,7 @@ def _sharded_runai_weights_iterator(
     use_tqdm_on_load: bool,
     *,
     weight_filter: Callable[[str], bool] | None = None,
+    weight_name_mapper: Callable[[str], str] | None = None,
 ) -> Generator[tuple[str, torch.Tensor], None, None]:
     """Stream only this rank's tensors from the safetensors files.
 
@@ -255,7 +256,9 @@ def _sharded_runai_weights_iterator(
     contiguous runs. Tensors with a registered row slice are fetched as
     just those rows. An optional model-provided weight filter excludes unused
     checkpoint tensors before fetch. The skipped bytes are never requested
-    from storage.
+    from storage. An expert permutation maps names for EP ownership and the
+    yielded loader destination; source offsets and model filtering stay in
+    checkpoint order.
     """
     import runai_model_streamer.safetensors_streamer.safetensors_pytorch as sp
     from runai_model_streamer.file_streamer import FileChunks
@@ -306,7 +309,12 @@ def _sharded_runai_weights_iterator(
                     skipped_model_bytes += size
                     if size:
                         _flush(path)
-                elif _should_skip(tensor_meta.name, local_expert_ids):
+                elif _should_skip(
+                    weight_name_mapper(tensor_meta.name)
+                    if weight_name_mapper is not None
+                    else tensor_meta.name,
+                    local_expert_ids,
+                ):
                     skipped += 1
                     skipped_bytes += size
                     # A zero-byte skip leaves the byte stream contiguous, so
@@ -404,7 +412,9 @@ def _sharded_runai_weights_iterator(
                 # create_torch_tensor returns torch.empty for zero-element
                 # metadata without touching the buffer.
                 yield (
-                    tensor_meta.name,
+                    weight_name_mapper(tensor_meta.name)
+                    if weight_name_mapper is not None
+                    else tensor_meta.name,
                     sp.create_torch_tensor(memoryview(b""), tensor_meta),
                 )
                 progress.update(1)
@@ -413,7 +423,9 @@ def _sharded_runai_weights_iterator(
             ):
                 tensor_meta = tensors_by_request[request_id][chunk_index]
                 yield (
-                    tensor_meta.name,
+                    weight_name_mapper(tensor_meta.name)
+                    if weight_name_mapper is not None
+                    else tensor_meta.name,
                     sp.create_torch_tensor(buffer, tensor_meta).clone(),
                 )
                 progress.update(1)
@@ -448,6 +460,25 @@ def patch_runai_sharded_expert_streaming() -> None:
         *,
         weight_filter: Callable[[str], bool] | None = None,
     ):
+        from vllm.config import get_current_vllm_config
+
+        from vllm_torchtpu.models.vllm.deepseek_v41.expert_placement import (
+            parse_expert_permutations,
+            remap_checkpoint_expert,
+        )
+
+        additional = getattr(get_current_vllm_config(), "additional_config", {})
+        policy = (
+            additional.get("deepseek_v41") if isinstance(additional, dict) else None
+        )
+        permutations = parse_expert_permutations(
+            policy.get("expert_permutations") if isinstance(policy, dict) else None
+        )
+        name_mapper = (
+            (lambda name: remap_checkpoint_expert(name, permutations))
+            if permutations
+            else None
+        )
         try:
             local_expert_ids = _compute_local_expert_ids()
         except AttributeError:
@@ -465,6 +496,10 @@ def patch_runai_sharded_expert_streaming() -> None:
             )
             local_expert_ids = None
         if local_expert_ids is None:
+            if name_mapper is not None:
+                raise RuntimeError(
+                    "Expert permutations cannot fall back to unfiltered loading"
+                )
             return original_get_iterator(self, model_or_path, revision)
         if getattr(self, "_is_distributed", False):
             # Per-rank fetch plans differ, so the streamer's cross-rank
@@ -481,6 +516,7 @@ def patch_runai_sharded_expert_streaming() -> None:
             local_expert_ids,
             self.load_config.use_tqdm_on_load,
             weight_filter=weight_filter,
+            weight_name_mapper=name_mapper,
         )
 
     def load_weights(self, model: torch.nn.Module, model_config: ModelConfig) -> None:

@@ -52,11 +52,31 @@ class DeepseekV41MoE(DeepseekV4MoE):
         if vllm_config.kernel_config.moe_backend in v4_upstream.MEGA_MOE_BACKENDS:
             raise NotImplementedError("V4.1 TPU requires the native V4 MoE backend")
         factory = v4_upstream.FusedMoEFactory
+        from vllm_torchtpu.models.vllm.deepseek_v41.config import DeepseekV41Config
+        from vllm_torchtpu.models.vllm.deepseek_v41.expert_placement import (
+            permutation_for_module,
+        )
+
+        policy = DeepseekV41Config.from_vllm_config(vllm_config)
 
         def v4_factory(**options):
             # Match the native TPU V4 model's scaling and shared-expert combine.
             options["apply_routed_scale_to_output"] = True
-            return factory(**options)
+            experts = factory(**options)
+            permutation = (
+                permutation_for_module(options["prefix"], policy.expert_permutations)
+                if policy.expert_permutations
+                else None
+            )
+            if permutation is not None:
+                if options.get("hash_indices_table") is not None:
+                    raise ValueError("Expert permutations cannot use hash routing")
+                if len(permutation) != options["num_experts"]:
+                    raise ValueError(
+                        "Expert permutation does not match the routed layer"
+                    )
+                experts.routed_experts._tpu_expert_permutation = permutation
+            return experts
 
         with device_hooks(
             v4_upstream,

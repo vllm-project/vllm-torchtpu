@@ -135,25 +135,34 @@ class TestDeepseekV41Quant:
         ):
             DeepseekV41MoE(vllm_config_mega)
 
+    @pytest.mark.parametrize("permuted", [False, True])
     def test_deepseek_v41_moe_init_device_hooks(
-        self, monkeypatch: pytest.MonkeyPatch
+        self, monkeypatch: pytest.MonkeyPatch, permuted: bool
     ) -> None:
         """Test DeepseekV41MoE.__init__ with device_hooks and factory."""
         vllm_config = SimpleNamespace(
+            additional_config={
+                "deepseek_v41": {
+                    "expert_permutations": {"8": [1, 0]} if permuted else None
+                }
+            },
             parallel_config=SimpleNamespace(enable_eplb=False),
             kernel_config=SimpleNamespace(moe_backend="native"),
         )
         called_options: dict[str, object] = {}
+        experts = SimpleNamespace(routed_experts=SimpleNamespace())
 
         def mock_factory(**options):
             called_options.update(options)
-            return Mock()
+            return experts
 
         monkeypatch.setattr(v4_upstream, "FusedMoEFactory", mock_factory)
 
         def mock_super_init(self, cfg, *args, **kwargs):
             # Inside the with device_hooks context!
-            v4_upstream.FusedMoEFactory(routed_scaling=2.0)
+            v4_upstream.FusedMoEFactory(
+                routed_scaling=2.0, num_experts=2, prefix="model.layers.8.ffn.experts"
+            )
 
         monkeypatch.setattr(dsv41_quant.DeepseekV4MoE, "__init__", mock_super_init)
 
@@ -161,6 +170,9 @@ class TestDeepseekV41Quant:
         _ = DeepseekV41MoE(vllm_config, 1, 2, kw="test")
         assert called_options["apply_routed_scale_to_output"] is True
         assert called_options["routed_scaling"] == 2.0
+        assert getattr(experts.routed_experts, "_tpu_expert_permutation", None) == (
+            (1, 0) if permuted else None
+        )
 
     def test_deepseek_v41_moe_forward_branches(
         self, monkeypatch: pytest.MonkeyPatch
@@ -177,7 +189,8 @@ class TestDeepseekV41Quant:
 
         super_forward_calls: list[tuple[torch.Tensor, torch.Tensor | None]] = []
 
-        def mock_super_forward(self, hidden, input_ids=None):
+        def mock_super_forward(self, hidden, input_ids=None, mega_gate_metadata=None):
+            assert mega_gate_metadata is None
             super_forward_calls.append((hidden, input_ids))
             return hidden * 2
 
