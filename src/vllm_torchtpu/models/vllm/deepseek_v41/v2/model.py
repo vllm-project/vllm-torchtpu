@@ -483,28 +483,6 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             # Enqueue the lookup without blocking CPU Engram preparation behind
             # the previous chunk. The compiled stage consumes its device buffer.
             synchronize_tensors((inputs_embeds,), wait=False)
-        context = first = encoder_context = None
-        if self._ced_enabled:
-            context = upstream.get_forward_context()
-            metadata = context.attn_metadata
-            first = (
-                next(iter(metadata.values())) if isinstance(metadata, dict) else None
-            )
-            # Upload these CPU-only bounds before Engram's blocking hash D2H.
-            requests = first.seq_lens.shape[0] if first is not None else 1
-            hits = tuple(getattr(first, "replay_starts_cpu", None) or ())[:requests]
-            window_starts = torch.tensor(
-                hits + (0,) * (requests - len(hits)),
-                dtype=positions.dtype,
-                device=positions.device,
-            )
-            encoder_context = replace(
-                context,
-                additional_kwargs={
-                    **context.additional_kwargs,
-                    "deepseek_v41_window_starts": window_starts,
-                },
-            )
         offload_engram = self._has_cpu_offloaded_engram()
         if offload_engram:
             input_ids_prep = (
@@ -530,8 +508,26 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     inputs_embeds,
                     lookback_token_ids,
                 )
-            assert context is not None and encoder_context is not None
+            context = upstream.get_forward_context()
             metadata = context.attn_metadata
+            first = (
+                next(iter(metadata.values())) if isinstance(metadata, dict) else None
+            )
+            # Keep the window bounds upload after Engram's blocking hash D2H.
+            requests = first.seq_lens.shape[0] if first is not None else 1
+            hits = tuple(getattr(first, "replay_starts_cpu", None) or ())[:requests]
+            window_starts = torch.tensor(
+                hits + (0,) * (requests - len(hits)),
+                dtype=positions.dtype,
+                device=positions.device,
+            )
+            encoder_context = replace(
+                context,
+                additional_kwargs={
+                    **context.additional_kwargs,
+                    "deepseek_v41_window_starts": window_starts,
+                },
+            )
             with override_forward_context(encoder_context):
                 if getattr(self, "_engram_split_layer", None) is None:
                     encoded = self.encoder_stage(
