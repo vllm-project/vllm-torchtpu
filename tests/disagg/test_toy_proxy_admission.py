@@ -262,3 +262,62 @@ def test_quad_attn_cost_model_balances_cold_and_preserves_sticky() -> None:
     )
     assert cont_sticky and cont_rank == 0
     assert r.sticky_quad_saved == 1
+
+
+def test_decode_step_cost_model_dualpath_and_overflow_routing() -> None:
+    dscm = _m._DecodeStepCostModel(mk_ceiling=20.0)
+    r = _PrefixAffinityRouter(
+        n=2,
+        chunk=1024,
+        slack=2,
+        load_metric="running",
+        decode_cost_model=dscm,
+    )
+    # Rank 0 runs 5 huge 180K-token sequences (900K active KV tokens);
+    # Rank 1 runs 6 short 10K-token sequences (60K active KV tokens).
+    # Even though Rank 0 has fewer running requests (5 vs 6), its active KV
+    # bandwidth load is 15x higher, so a new cold request is routed to Rank 1.
+    for i in range(5):
+        r.running[0] += 1
+        r.running_tokens[0] += 180000
+    for i in range(6):
+        r.running[1] += 1
+        r.running_tokens[1] += 10000
+    cold_rank, sticky = r.route(
+        r.hashes("cold-req-" * 512), prompt_tokens=32000, req_id="c1"
+    )
+    assert not sticky and cold_rank == 1
+    r.start_running(cold_rank, req_id="c1", tokens=32000)
+    assert r.running_tokens[1] == 92000
+    r.done(cold_rank, was_running=True, req_id="c1")
+    assert r.running_tokens[1] == 60000
+
+    # Warm prefix on Rank 1 stays sticky even when Rank 1 has 3 more running
+    # requests than Rank 0 (beyond raw slack=2), because both are below
+    # mk_ceiling=20 and the Raiden pull savings + lower KV token load win.
+    r.running = [4, 7]
+    r.running_tokens = [400000, 400000]
+    warm_text = "warm-conv-" * 4000
+    w_rank0, _ = r.route(r.hashes(warm_text), prompt_tokens=100000, req_id="w0")
+    r.start_running(w_rank0, req_id="w0", tokens=100000)
+    r.done(w_rank0, was_running=True, req_id="w0")
+    r.running[w_rank0] = 7
+    r.running[1 - w_rank0] = 4
+    r.running_tokens = [400000, 400000]
+    w_rank1, w_sticky = r.route(
+        r.hashes(warm_text + "delta" * 512), prompt_tokens=104000, req_id="w1"
+    )
+    assert w_sticky and w_rank1 == w_rank0
+    r.done(w_rank1, was_running=False, req_id="w1")
+
+    # Once w_rank0 overflows mk_ceiling=20 while the other rank has free slots,
+    # queue_wait_ms + tight overflow slack spill to the uncongested rank.
+    r.running[w_rank0] = 24
+    r.running[1 - w_rank0] = 12
+    r.running_tokens[w_rank0] = 2400000
+    r.running_tokens[1 - w_rank0] = 1200000
+    spill_rank, spill_sticky = r.route(
+        r.hashes(warm_text + "delta2" * 512), prompt_tokens=108000, req_id="w2"
+    )
+    assert not spill_sticky and spill_rank == (1 - w_rank0)
+    r.done(spill_rank, was_running=False, req_id="w2")

@@ -7,6 +7,7 @@ import codecs
 import hashlib
 import itertools
 import logging
+import math
 import os
 import threading
 import time
@@ -21,6 +22,152 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
+
+
+class _DecodeStepCostModel:
+    """Hardware-calibrated Decode step latency & DualPath marginal cost model.
+
+    Models each Decode pod d's step latency across both hardware dimensions of
+    TPU v7x Megakernel execution (Qwen3.5-397B-A17B, TP8xEP8xDCP4, MTP=3):
+      1. Active batch size b_d = min(active_reqs_d, mk_ceiling), quantized to
+         compiled Megakernel verify buckets.
+      2. Active running KV token sum Sigma_L_d = running_tokens_d scanned from
+         HBM across all full-attention layers every decode step.
+
+    Per-step latency (ms):
+        T_step(b_d, Sigma_L_d) = base_step_ms
+                                 + mk_seq_ms * bucket(b_d)
+                                 + kv_token_ms * Sigma_L_d
+
+    DualPath marginal step cost (ms) of adding a request with L_req tokens:
+        dC_step(d, L_req) = interactivity_steps * (
+            T_step(b_d', Sigma_L_d + L_req)
+            + b_d * (mk_seq_ms * (b_d' - b_d) + kv_token_ms * L_req)
+        )
+    where the cross-term (kv_token_ms * Sigma_L_d + b_d * kv_token_ms * L_req)
+    routes long-context requests to low-concurrency, low-KV-bandwidth pods and
+    packs short-context requests onto complementary pods.
+    """
+
+    def __init__(
+        self,
+        mk_ceiling: float = 112.0,
+        base_step_ms: float = 5.2,
+        mk_seq_ms: float = 0.18,
+        kv_token_ms: float = 1.8e-6,
+        bucket_step: float = 2.0,
+        interactivity_steps: float = 45.0,
+        queue_drain_steps: float = 120.0,
+        raiden_pull_tok_per_ms: float = 280.0,
+        sticky_cost_slack_ms: float = 60.0,
+    ) -> None:
+        self.mk_ceiling = max(1.0, float(mk_ceiling))
+        self.base_step_ms = max(0.1, float(base_step_ms))
+        self.mk_seq_ms = max(0.0, float(mk_seq_ms))
+        self.kv_token_ms = max(0.0, float(kv_token_ms))
+        self.bucket_step = max(1.0, float(bucket_step))
+        self.interactivity_steps = max(1.0, float(interactivity_steps))
+        self.queue_drain_steps = max(1.0, float(queue_drain_steps))
+        self.raiden_pull_tok_per_ms = max(1.0, float(raiden_pull_tok_per_ms))
+        self.sticky_cost_slack_ms = max(0.0, float(sticky_cost_slack_ms))
+
+    @classmethod
+    def from_env(cls, mk_ceiling: float | None = None) -> "_DecodeStepCostModel":
+        default_ceiling = (
+            float(mk_ceiling)
+            if mk_ceiling is not None and mk_ceiling > 0
+            else _env_float(
+                "PROXY_DECODE_MK_CEILING",
+                _env_float("MAX_NUM_SEQS_DECODE", 112.0),
+            )
+        )
+        return cls(
+            mk_ceiling=default_ceiling,
+            base_step_ms=_env_float("PROXY_DECODE_STEP_BASE_MS", 5.2),
+            mk_seq_ms=_env_float("PROXY_DECODE_STEP_MK_SEQ_MS", 0.18),
+            kv_token_ms=_env_float("PROXY_DECODE_STEP_KV_TOK_MS", 1.8e-6),
+            bucket_step=_env_float("PROXY_DECODE_STEP_BUCKET_STEP", 2.0),
+            interactivity_steps=_env_float(
+                "PROXY_DECODE_COST_INTERACTIVITY_STEPS", 45.0
+            ),
+            queue_drain_steps=_env_float("PROXY_DECODE_COST_QUEUE_DRAIN_STEPS", 120.0),
+            raiden_pull_tok_per_ms=_env_float(
+                "PROXY_DECODE_RAIDEN_PULL_TOK_PER_MS", 280.0
+            ),
+            sticky_cost_slack_ms=_env_float(
+                "PROXY_DECODE_STICKY_COST_SLACK_MS", 60.0
+            ),
+        )
+
+    def mk_bucket(self, b: float) -> float:
+        b_clamped = max(0.0, min(float(b), self.mk_ceiling))
+        if b_clamped <= 4.0 or self.bucket_step <= 1.0:
+            return b_clamped
+        q = math.ceil(b_clamped / self.bucket_step) * self.bucket_step
+        return min(self.mk_ceiling, float(q))
+
+    def step_latency_ms(self, active_reqs: float, running_tokens: float) -> float:
+        b = max(0.0, min(float(active_reqs), self.mk_ceiling))
+        toks = max(0.0, float(running_tokens))
+        return (
+            self.base_step_ms
+            + self.mk_seq_ms * self.mk_bucket(b)
+            + self.kv_token_ms * toks
+        )
+
+    def marginal_step_cost_ms(
+        self, active_reqs: float, running_tokens: float, req_tokens: int
+    ) -> float:
+        b = max(0.0, min(float(active_reqs), self.mk_ceiling))
+        b_next = max(1.0, min(float(active_reqs) + 1.0, self.mk_ceiling))
+        toks = max(0.0, float(running_tokens))
+        l_req = max(0.0, float(req_tokens))
+        t_new = self.step_latency_ms(b_next, toks + l_req)
+        externality = b * (
+            self.mk_seq_ms * (b_next - b) + self.kv_token_ms * l_req
+        )
+        return self.interactivity_steps * (t_new + externality)
+
+    def queue_wait_ms(self, active_reqs: float, running_tokens: float) -> float:
+        if float(active_reqs) < self.mk_ceiling:
+            return 0.0
+        overflow = float(active_reqs) - self.mk_ceiling + 1.0
+        t_ceil = self.step_latency_ms(self.mk_ceiling, running_tokens)
+        return overflow * (self.queue_drain_steps / self.mk_ceiling) * t_ceil
+
+    def pull_cost_ms(self, uncached_tokens: int) -> float:
+        return max(0.0, float(uncached_tokens)) / self.raiden_pull_tok_per_ms
+
+    def total_cost_ms(
+        self,
+        active_reqs: float,
+        running_tokens: float,
+        req_tokens: int,
+        cached_tokens: int = 0,
+    ) -> float:
+        uncached = max(0, int(req_tokens) - max(0, int(cached_tokens)))
+        return (
+            self.marginal_step_cost_ms(active_reqs, running_tokens, req_tokens)
+            + self.queue_wait_ms(active_reqs, running_tokens)
+            + self.pull_cost_ms(uncached)
+        )
+
+    def allows_sticky(
+        self,
+        owner_reqs: float,
+        min_reqs: float,
+        owner_cost_ms: float,
+        min_cost_ms: float,
+        configured_slack: int,
+    ) -> bool:
+        cap_slack = max(1, int(round(0.20 * self.mk_ceiling)))
+        if float(owner_reqs) < self.mk_ceiling:
+            eff_slack = max(max(0, configured_slack), cap_slack)
+        else:
+            eff_slack = min(max(1, configured_slack), cap_slack)
+        if float(owner_reqs) > float(min_reqs) + eff_slack:
+            return False
+        return float(owner_cost_ms) <= float(min_cost_ms) + self.sticky_cost_slack_ms
 
 
 class _PrefixAffinityRouter:
@@ -61,6 +208,8 @@ class _PrefixAffinityRouter:
         load_metric: str = "inflight",
         quad_attn_coeff: float = 0.0,
         token_slack: float = 0.0,
+        decode_cost_model: _DecodeStepCostModel | None = None,
+        hbm_max_chunks: int = 58000,
     ) -> None:
         if load_metric not in ("inflight", "running"):
             raise ValueError(
@@ -75,6 +224,8 @@ class _PrefixAffinityRouter:
         self.saturated_inflight = max(0, saturated_inflight)
         self.quad_attn_coeff = max(0.0, float(quad_attn_coeff))
         self.token_slack = max(0.0, float(token_slack))
+        self.decode_cost_model = decode_cost_model
+        self.hbm_max_chunks = max(0, int(hbm_max_chunks))
         self._lock = threading.Lock()
         self.owners: dict[bytes, int] = {}
         self.inflight = [0] * n
@@ -82,6 +233,14 @@ class _PrefixAffinityRouter:
         self._req_eff_tokens: dict[str, float] = {}
         self._anon_eff_tokens: list[list[float]] = [[] for _ in range(n)]
         self.running = [0] * n
+        self.running_tokens: list[int] = [0] * n
+        self.inflight_decode_tokens: list[int] = [0] * n
+        self._req_decode_tokens: dict[str, list[Any]] = {}
+        self._pending_run_tokens: list[list[int]] = [[] for _ in range(n)]
+        self._anon_run_tokens: list[list[int]] = [[] for _ in range(n)]
+        self.pod_hbm_lru: list[OrderedDict[bytes, None]] = [
+            OrderedDict() for _ in range(n)
+        ]
         self.placed = [0] * n
         self.sticky = 0
         self.sticky_saturated = 0
@@ -96,6 +255,30 @@ class _PrefixAffinityRouter:
         self.evicted = 0
         self.rerouted = 0
         self._next_session = 0
+
+    def _match_pod_hbm(self, rank: int, hs: list[bytes]) -> int:
+        if not hs or self.hbm_max_chunks <= 0:
+            return 0
+        hbm = self.pod_hbm_lru[rank]
+        hits = 0
+        for d in hs:
+            if d in hbm:
+                hits += 1
+            else:
+                break
+        return hits
+
+    def _record_pod_hbm(self, rank: int, hs: list[bytes]) -> None:
+        if not hs or self.hbm_max_chunks <= 0:
+            return
+        hbm = self.pod_hbm_lru[rank]
+        for d in hs:
+            if d in hbm:
+                hbm.move_to_end(d)
+            else:
+                hbm[d] = None
+                if len(hbm) > self.hbm_max_chunks:
+                    hbm.popitem(last=False)
 
     def effective_tokens(self, uncached_tokens: int, cached_tokens: int = 0) -> float:
         """Quadratic FLOPs-equivalent prefill token cost of ``uncached_tokens``
@@ -177,60 +360,127 @@ class _PrefixAffinityRouter:
                 if prompt_tokens > 0
                 else (max(1, int(len(hs) * self.chunk / 3.4)) if hs else 0)
             )
-            use_quad = self.quad_attn_coeff > 0.0 and est_tokens > 0
-            cold_eff = self.effective_tokens(est_tokens, 0) if use_quad else 0.0
-            sticky_eff = cold_eff
-            quad_prefers_sticky = False
-            if known and use_quad and best_rank is not None:
-                frac = min(1.0, matched / max(len(hs), 1))
-                cached_toks = int(est_tokens * frac)
-                uncached_toks = max(1, est_tokens - cached_toks)
-                sticky_eff = self.effective_tokens(uncached_toks, cached_toks)
-                min_eff = min(self.inflight_eff_tokens)
-                quad_prefers_sticky = (
-                    self.inflight_eff_tokens[best_rank] + sticky_eff
-                    <= min_eff + cold_eff + self.token_slack
-                )
-            if known and (
-                saturated
-                or load[best_rank] <= lo + self.slack
-                or quad_prefers_sticky
-            ):
-                rank = best_rank
-                is_sticky = True
-                req_eff = sticky_eff
-                self.sticky += 1
-                if saturated and load[best_rank] > lo + self.slack:
-                    self.sticky_saturated += 1
-                elif quad_prefers_sticky and load[best_rank] > lo + self.slack:
-                    self.sticky_quad_saved += 1
-            else:
-                if self.max_sessions > 0:
-                    rank = min(
-                        range(self.n),
-                        key=lambda r: (
-                            len(self.resident[r]),
-                            self.inflight_eff_tokens[r] if use_quad else 0.0,
-                            load[r],
-                            self.inflight[r],
-                            self.placed[r],
-                            r,
-                        ),
+            use_dscm = self.decode_cost_model is not None and (est_tokens > 0 or bool(hs))
+            if use_dscm and self.decode_cost_model is not None:
+                req_toks = max(64, est_tokens if est_tokens > 0 else 4096)
+                active_reqs = [float(load[r]) for r in range(self.n)]
+                active_toks = [
+                    float(
+                        self.running_tokens[r]
+                        if self.load_metric == "running" and self.running_tokens[r] > 0
+                        else self.inflight_decode_tokens[r]
                     )
+                    for r in range(self.n)
+                ]
+                cached_toks_per_pod = [0] * self.n
+                for r in range(self.n):
+                    hits_r = self._match_pod_hbm(r, hs)
+                    if r == best_rank and matched > hits_r:
+                        hits_r = matched
+                    frac_r = min(1.0, hits_r / max(len(hs), 1)) if hs else 0.0
+                    cached_toks_per_pod[r] = int(req_toks * frac_r)
+                cost_ms = [
+                    self.decode_cost_model.total_cost_ms(
+                        active_reqs=active_reqs[r],
+                        running_tokens=active_toks[r],
+                        req_tokens=req_toks,
+                        cached_tokens=cached_toks_per_pod[r],
+                    )
+                    for r in range(self.n)
+                ]
+                min_cost_ms = min(cost_ms)
+                dscm_prefers_sticky = (
+                    known
+                    and best_rank is not None
+                    and self.decode_cost_model.allows_sticky(
+                        owner_reqs=active_reqs[best_rank],
+                        min_reqs=float(lo),
+                        owner_cost_ms=cost_ms[best_rank],
+                        min_cost_ms=min_cost_ms,
+                        configured_slack=self.slack,
+                    )
+                )
+                if known and best_rank is not None and (saturated or dscm_prefers_sticky):
+                    rank = best_rank
+                    is_sticky = True
+                    req_eff = 0.0
+                    self.sticky += 1
+                    if saturated and load[best_rank] > lo + self.slack:
+                        self.sticky_saturated += 1
+                    elif dscm_prefers_sticky and load[best_rank] > lo + self.slack:
+                        self.sticky_quad_saved += 1
                 else:
                     rank = min(
                         range(self.n),
                         key=lambda r: (
-                            self.inflight_eff_tokens[r] if use_quad else 0.0,
+                            len(self.resident[r]) if self.max_sessions > 0 else 0,
+                            round(cost_ms[r], 2),
                             load[r],
+                            active_toks[r],
                             self.inflight[r],
                             self.placed[r],
                             r,
                         ),
                     )
-                is_sticky = False
-                req_eff = cold_eff
-                self.cold += 1
+                    is_sticky = False
+                    req_eff = 0.0
+                    self.cold += 1
+                use_quad = False
+            else:
+                use_quad = self.quad_attn_coeff > 0.0 and est_tokens > 0
+                cold_eff = self.effective_tokens(est_tokens, 0) if use_quad else 0.0
+                sticky_eff = cold_eff
+                quad_prefers_sticky = False
+                if known and use_quad and best_rank is not None:
+                    frac = min(1.0, matched / max(len(hs), 1))
+                    cached_toks = int(est_tokens * frac)
+                    uncached_toks = max(1, est_tokens - cached_toks)
+                    sticky_eff = self.effective_tokens(uncached_toks, cached_toks)
+                    min_eff = min(self.inflight_eff_tokens)
+                    quad_prefers_sticky = (
+                        self.inflight_eff_tokens[best_rank] + sticky_eff
+                        <= min_eff + cold_eff + self.token_slack
+                    )
+                if known and (
+                    saturated
+                    or load[best_rank] <= lo + self.slack
+                    or quad_prefers_sticky
+                ):
+                    rank = best_rank
+                    is_sticky = True
+                    req_eff = sticky_eff
+                    self.sticky += 1
+                    if saturated and load[best_rank] > lo + self.slack:
+                        self.sticky_saturated += 1
+                    elif quad_prefers_sticky and load[best_rank] > lo + self.slack:
+                        self.sticky_quad_saved += 1
+                else:
+                    if self.max_sessions > 0:
+                        rank = min(
+                            range(self.n),
+                            key=lambda r: (
+                                len(self.resident[r]),
+                                self.inflight_eff_tokens[r] if use_quad else 0.0,
+                                load[r],
+                                self.inflight[r],
+                                self.placed[r],
+                                r,
+                            ),
+                        )
+                    else:
+                        rank = min(
+                            range(self.n),
+                            key=lambda r: (
+                                self.inflight_eff_tokens[r] if use_quad else 0.0,
+                                load[r],
+                                self.inflight[r],
+                                self.placed[r],
+                                r,
+                            ),
+                        )
+                    is_sticky = False
+                    req_eff = cold_eff
+                    self.cold += 1
             if sid is None:
                 sid = self._next_session
                 self._next_session += 1
@@ -238,7 +488,14 @@ class _PrefixAffinityRouter:
                 self.owners[d] = rank
                 self.session_of[d] = sid
             self._touch_session(sid, rank)
+            self._record_pod_hbm(rank, hs)
             self.inflight[rank] += 1
+            if est_tokens > 0:
+                self.inflight_decode_tokens[rank] += est_tokens
+                if req_id is not None:
+                    self._req_decode_tokens[req_id] = [est_tokens, False]
+                else:
+                    self._pending_run_tokens[rank].append(est_tokens)
             if use_quad:
                 self.inflight_eff_tokens[rank] += req_eff
                 if req_id is not None:
@@ -256,6 +513,7 @@ class _PrefixAffinityRouter:
                     f"cold={self.cold} rerouted={self.rerouted} placed={self.placed} "
                     f"inflight={self.inflight} "
                     f"inflight_eff_tokens={[int(x) for x in self.inflight_eff_tokens]} "
+                    f"running_tokens={self.running_tokens} "
                     f"unique_chunks={len(self.owners)} "
                     f"resident={[len(r) for r in self.resident]} "
                     f"evicted={self.evicted} sessions={self._next_session} "
@@ -279,10 +537,29 @@ class _PrefixAffinityRouter:
                 self.session_rank[old_sid] = None
                 self.evicted += 1
 
-    def start_running(self, rank: int) -> None:
+    def start_running(
+        self, rank: int, req_id: str | None = None, tokens: int = 0
+    ) -> None:
         """Counts a request routed to ``rank`` as running there."""
         with self._lock:
             self.running[rank] += 1
+            if req_id is not None and req_id in self._req_decode_tokens:
+                entry = self._req_decode_tokens[req_id]
+                if tokens > 0 and tokens != entry[0]:
+                    self.inflight_decode_tokens[rank] = max(
+                        0, self.inflight_decode_tokens[rank] + (tokens - entry[0])
+                    )
+                    entry[0] = tokens
+                if not entry[1]:
+                    entry[1] = True
+                    self.running_tokens[rank] += entry[0]
+            elif tokens > 0:
+                self.running_tokens[rank] += tokens
+                self._anon_run_tokens[rank].append(tokens)
+            elif self._pending_run_tokens[rank]:
+                tok = self._pending_run_tokens[rank].pop(0)
+                self.running_tokens[rank] += tok
+                self._anon_run_tokens[rank].append(tok)
 
     def done(
         self, rank: int, was_running: bool = False, req_id: str | None = None
@@ -302,8 +579,32 @@ class _PrefixAffinityRouter:
             if self.inflight[rank] == 0:
                 self.inflight_eff_tokens[rank] = 0.0
                 self._anon_eff_tokens[rank].clear()
+            if req_id is not None and req_id in self._req_decode_tokens:
+                tok, is_run = self._req_decode_tokens.pop(req_id)
+                self.inflight_decode_tokens[rank] = max(
+                    0, self.inflight_decode_tokens[rank] - tok
+                )
+                if is_run or was_running:
+                    self.running_tokens[rank] = max(0, self.running_tokens[rank] - tok)
+            elif was_running and self._anon_run_tokens[rank]:
+                tok = self._anon_run_tokens[rank].pop(0)
+                self.inflight_decode_tokens[rank] = max(
+                    0, self.inflight_decode_tokens[rank] - tok
+                )
+                self.running_tokens[rank] = max(0, self.running_tokens[rank] - tok)
+            elif self._pending_run_tokens[rank]:
+                tok = self._pending_run_tokens[rank].pop(0)
+                self.inflight_decode_tokens[rank] = max(
+                    0, self.inflight_decode_tokens[rank] - tok
+                )
             if was_running:
                 self.running[rank] = max(0, self.running[rank] - 1)
+            if self.running[rank] == 0:
+                self.running_tokens[rank] = 0
+                self._anon_run_tokens[rank].clear()
+            if self.inflight[rank] == 0:
+                self.inflight_decode_tokens[rank] = 0
+                self._pending_run_tokens[rank].clear()
 
     def stats(self) -> dict[str, Any]:
         with self._lock:
@@ -311,7 +612,9 @@ class _PrefixAffinityRouter:
                 "placed": list(self.placed),
                 "inflight": list(self.inflight),
                 "inflight_eff_tokens": list(self.inflight_eff_tokens),
+                "inflight_decode_tokens": list(self.inflight_decode_tokens),
                 "running": list(self.running),
+                "running_tokens": list(self.running_tokens),
                 "load_metric": self.load_metric,
                 "sticky": self.sticky,
                 "sticky_saturated": self.sticky_saturated,
@@ -705,7 +1008,10 @@ async def lifespan(app: FastAPI):
     # per prefill leg (0 = off; ~54 for a 397B leg without a host tier, ~240
     # with one) and PROXY_PREFIX_HASH_SATURATED_INFLIGHT, the per-leg in-flight
     # count above which the sticky slack no longer applies (0 = off).
-    if len(app.state.prefill_clients) > 1 and routing_mode == "prefix_hash":
+    if len(app.state.prefill_clients) > 1 and routing_mode in (
+        "prefix_hash",
+        "llmd",
+    ):
         app.state.prefill_router = _PrefixAffinityRouter(
             n=len(app.state.prefill_clients),
             chunk=_env_int("PROXY_PREFIX_HASH_CHUNK", 1024),
@@ -733,13 +1039,26 @@ async def lifespan(app: FastAPI):
             f"got {decode_load_metric!r}"
         )
     decode_slack_default = 2 if decode_load_metric == "running" else 8
-    if len(app.state.decode_clients) > 1 and decode_routing == "prefix_hash":
+    if len(app.state.decode_clients) > 1 and decode_routing in (
+        "prefix_hash",
+        "llmd",
+    ):
+        decode_mk_ceiling = _env_float(
+            "PROXY_DECODE_MK_CEILING",
+            _env_float("MAX_NUM_SEQS_DECODE", 112.0),
+        )
+        decode_cost_model = (
+            _DecodeStepCostModel.from_env(mk_ceiling=decode_mk_ceiling)
+            if _env_int("PROXY_DECODE_STEP_COST_MODEL", 1) != 0
+            else None
+        )
         app.state.decode_router = _PrefixAffinityRouter(
             n=len(app.state.decode_clients),
             chunk=_env_int("PROXY_PREFIX_HASH_CHUNK", 1024),
             min_frac=_env_float("PROXY_PREFIX_HASH_MIN_FRAC", 0.5),
             slack=_env_int("PROXY_DECODE_HASH_SLACK", decode_slack_default),
             load_metric=decode_load_metric,
+            decode_cost_model=decode_cost_model,
         )
     else:
         app.state.decode_router = None
@@ -757,8 +1076,11 @@ async def lifespan(app: FastAPI):
     # the real prompt length, so only decode-side work counts against it.
     decode_cap = _env_int("PROXY_DECODE_MAX_INFLIGHT", 0)
     decode_cap_tokens = _env_int("PROXY_DECODE_MAX_INFLIGHT_TOKENS", 0)
+    default_admit_point = (
+        "after_prefill" if app.state.decode_router is not None else "before_prefill"
+    )
     admit_point = (
-        os.getenv("PROXY_DECODE_ADMIT_POINT", "before_prefill").strip().lower()
+        os.getenv("PROXY_DECODE_ADMIT_POINT", default_admit_point).strip().lower()
     )
     if admit_point not in ("before_prefill", "after_prefill"):
         raise ValueError(
@@ -1038,26 +1360,28 @@ async def _handle_completions(api: str, request: Request):
         if router is not None or decode_router is not None:
             hasher = router if router is not None else decode_router
             hs = hasher.hashes(hasher.extract_text(req_data))
-        # The decode leg is chosen before the prefill hop so that the
-        # admission slot is taken while the request holds no KV. A
-        # conversation keeps its decode leg, so a later turn hits that leg's
-        # own prefix cache and pulls only the new tokens' KV from the prefill.
-        if decode_router is not None:
-            decode_idx, _ = decode_router.route(hs)
-        else:
-            decode_idx = next(request.app.state.decode_iterator)
-        decode_client_info = request.app.state.decode_clients[decode_idx]
         state = request.app.state
-        decode_budget: _AdmissionBudget = state.decode_budgets[decode_idx]
         admit_point: str = state.decode_admit_point
         prompt_est = _estimate_prompt_tokens(
             _PrefixAffinityRouter.extract_text(req_data), state.bytes_per_token
         )
         output_est = _expected_output_tokens(req_data, state.output_tokens_est)
+        actual_prompt_tokens = prompt_est
         # The budget a request holds, in tokens, on each leg; corrected once the
         # prefill response reports the real prompt length.
         decode_tokens = prompt_est + output_est
         pending_tokens = prompt_est
+        decode_client_info: dict | None = None
+        decode_budget: _AdmissionBudget | None = None
+        if admit_point == "before_prefill":
+            if decode_router is not None:
+                decode_idx, _ = decode_router.route(
+                    hs, prompt_tokens=prompt_est, req_id=request_id
+                )
+            else:
+                decode_idx = next(request.app.state.decode_iterator)
+            decode_client_info = request.app.state.decode_clients[decode_idx]
+            decode_budget = state.decode_budgets[decode_idx]
         decode_held = False
         pending_held = False
         pending_budget: _AdmissionBudget | None = None
@@ -1071,10 +1395,12 @@ async def _handle_completions(api: str, request: Request):
             if decode_released:
                 return
             decode_released = True
-            if decode_held:
+            if decode_held and decode_budget is not None:
                 await decode_budget.release(decode_tokens)
-            if decode_router is not None:
-                decode_router.done(decode_idx, was_running=decode_running)
+            if decode_router is not None and decode_idx is not None:
+                decode_router.done(
+                    decode_idx, was_running=decode_running, req_id=request_id
+                )
 
         async def release_pending(reason: str) -> None:
             nonlocal pending_released
@@ -1095,14 +1421,19 @@ async def _handle_completions(api: str, request: Request):
 
         async def admit_decode(point: str) -> None:
             nonlocal decode_held
-            if not decode_budget.enabled:
+            if decode_budget is None or not decode_budget.enabled:
                 return
             wait_ms = await decode_budget.acquire(decode_tokens)
             decode_held = True
             _PROXY_LATENCY.record("decode_admit", wait_ms)
+            decode_id = (
+                decode_client_info.get("id", decode_idx)
+                if decode_client_info is not None
+                else decode_idx
+            )
             print(
                 f"PERF PROXY decode_admit req_id={request_id} "
-                f"decode_id={decode_client_info.get('id', decode_idx)} "
+                f"decode_id={decode_id} "
                 f"point={point} tokens={decode_tokens} "
                 f"wait_ms={wait_ms:.2f} ts={time.time():.6f}",
                 flush=True,
@@ -1196,10 +1527,11 @@ async def _handle_completions(api: str, request: Request):
                 flush=True,
             )
             if prompt_tokens is not None:
+                actual_prompt_tokens = prompt_tokens
                 if pending_held and pending_budget is not None:
                     await pending_budget.adjust(prompt_tokens - pending_tokens)
                 pending_tokens = prompt_tokens
-                if decode_held:
+                if decode_held and decode_budget is not None:
                     await decode_budget.adjust(prompt_tokens - prompt_est)
                 decode_tokens = prompt_tokens + output_est
 
@@ -1207,7 +1539,22 @@ async def _handle_completions(api: str, request: Request):
                 req_data["kv_transfer_params"] = kv_transfer_params
 
             if admit_point == "after_prefill":
+                if decode_router is not None:
+                    decode_idx, _ = decode_router.route(
+                        hs, prompt_tokens=actual_prompt_tokens, req_id=request_id
+                    )
+                else:
+                    decode_idx = next(request.app.state.decode_iterator)
+                decode_client_info = request.app.state.decode_clients[decode_idx]
+                decode_budget = state.decode_budgets[decode_idx]
                 await admit_decode(admit_point)
+                if decode_router is not None:
+                    decode_router.start_running(
+                        decode_idx,
+                        req_id=request_id,
+                        tokens=actual_prompt_tokens,
+                    )
+                    decode_running = True
 
             logger.debug("Using %s %s", prefill_client_info, decode_client_info)
 
@@ -1215,8 +1562,12 @@ async def _handle_completions(api: str, request: Request):
             async def generate_stream():
                 nonlocal decode_running
                 try:
-                    if decode_router is not None:
-                        decode_router.start_running(decode_idx)
+                    if decode_router is not None and not decode_running:
+                        decode_router.start_running(
+                            decode_idx,
+                            req_id=request_id,
+                            tokens=actual_prompt_tokens,
+                        )
                         decode_running = True
                     t_decode_send = time.time()
                     t_decode_send_perf = time.perf_counter()
