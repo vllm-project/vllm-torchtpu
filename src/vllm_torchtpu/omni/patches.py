@@ -203,24 +203,26 @@ def _patch_wan_ffn_gelu_fence() -> None:
     logger.info("Applied TPU patch: fusion fence after Wan FFN GELU.")
 
 
-# TODO: Remove once vLLM-Omni creates the D2H stream of
-# WorkerProc._async_output_loop (vllm_omni/diffusion/worker/diffusion_worker.py)
-# on the current device index instead of
-# torch.device(torch.accelerator.current_accelerator().type, self.gpu_id).
 def _patch_diffusion_worker_d2h_stream() -> None:
-    """Create the diffusion worker's D2H side stream on the selected device.
-
-    ``WorkerProc._async_output_loop`` creates its D2H stream on device index
-    ``self.gpu_id``. On TPU, ``OmniTpuPlatform.set_device`` selects device
-    index 0 in every worker process, so a worker with ``gpu_id >= 1`` would
-    ask for a stream on a device index that its process did not select.
-
-    The loop runs with a proxy as ``self`` whose ``gpu_id`` is the current
-    device index. The proxy is in place for the whole lifetime of the output
-    thread, not only while the stream is created. Only attribute reads and
-    writes are forwarded to the worker, so identity or type checks on ``self``
-    inside the loop would see the proxy; the upstream loop does not do any.
-    """
+    # -------------------------------------------------------------------------
+    # TODO: Remove once vLLM-Omni creates the D2H stream of
+    # WorkerProc._async_output_loop (vllm_omni/diffusion/worker/diffusion_worker.py)
+    # on the current device index instead of
+    # torch.device(torch.accelerator.current_accelerator().type, self.gpu_id).
+    #
+    # Problem: WorkerProc._async_output_loop creates its D2H stream on device
+    #   index self.gpu_id. On TPU, OmniTpuPlatform.set_device selects device
+    #   index 0 in every worker process, so a worker with gpu_id >= 1 asks for
+    #   a stream on a device index that its process did not select.
+    # Fix: run the loop with a proxy as self whose gpu_id is the current
+    #   device index; other attribute reads and writes go to the worker.
+    # Effect: the output thread of a worker with gpu_id >= 1 gets its stream
+    #   instead of failing at startup.
+    # Scope: the proxy is live for the whole output-thread lifetime, not only
+    #   while the stream is created. Only attribute reads/writes are
+    #   forwarded, so identity/type checks on self inside the loop would see
+    #   the proxy (the upstream loop does none).
+    # -------------------------------------------------------------------------
     from vllm_omni.diffusion.worker.diffusion_worker import WorkerProc
 
     if hasattr(WorkerProc, "_tpu_orig_async_output_loop"):
