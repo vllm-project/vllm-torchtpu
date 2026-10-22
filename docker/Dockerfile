@@ -73,6 +73,8 @@ ENV UV_TORCH_BACKEND=cpu
 # Install all dependencies from pyproject.toml.
 # vLLM comes from the `vllm` dependency group (see pyproject.toml).
 RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,from=wheels,target=/wheels \
+    --mount=type=bind,source=wheels,target=/workspace/vllm-torchtpu/wheels \
     uv pip install --system \
       -r pyproject.toml \
       --group vllm
@@ -125,6 +127,8 @@ FROM ci AS dev
 # --group vllm keeps vLLM (already installed in base) in this resolution, so
 # the test/benchmarking deps cannot move shared packages outside vLLM's pins.
 RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,from=wheels,target=/wheels \
+    --mount=type=bind,source=wheels,target=/workspace/vllm-torchtpu/wheels \
     uv pip install --system \
       -r pyproject.toml \
       --group vllm \
@@ -144,6 +148,7 @@ RUN if [ -n "$VLLM_COMMIT_HASH" ]; then \
 # Scoped to the vllm-torchtpu-core dist: the unscoped SETUPTOOLS_SCM_PRETEND_VERSION
 # also applies to any other scm-versioned package built in this step.
 RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,from=wheels,target=/wheels \
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU_CORE=0.0.0 \
     uv pip install --system --no-deps -e .
 
@@ -177,6 +182,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2
 # replace it with a PyPI vllm. --group omni-git supplies the omni extra's
 # vllm-omni from its git tag until the release is on PyPI (see pyproject.toml).
 RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,from=wheels,target=/wheels \
     uv pip install --system \
       -r pyproject.toml \
       --group vllm \
@@ -201,6 +207,7 @@ RUN if [ -n "$VLLM_COMMIT_HASH" ]; then \
 
 # Use --no-deps to preserve layer caching since dependencies were already resolved and installed in base.
 RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=bind,from=wheels,target=/wheels \
     SETUPTOOLS_SCM_PRETEND_VERSION_FOR_VLLM_TORCHTPU_CORE=0.0.0 \
     uv pip install --system --no-deps .
 

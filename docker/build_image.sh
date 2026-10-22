@@ -43,6 +43,7 @@ IMAGE_TAG="vllm-torchtpu-local"
 VLLM_SOURCE=""
 VLLM_COMMIT_HASH=""
 TARGET="prod"
+WHEELS_DIR="${WHEELS_DIR:-/tmp/wheels}"
 
 # Parse arguments
 while [[ $# -gt 0 ]]; do
@@ -57,6 +58,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     -c|--vllm-commit-hash)
       VLLM_COMMIT_HASH="$2"
+      shift 2
+      ;;
+    -w|--wheels-dir)
+      WHEELS_DIR="$2"
       shift 2
       ;;
     --target)
@@ -144,11 +149,13 @@ else
 fi
 
 echo "Build Target: $TARGET"
+echo "Wheels Dir: $WHEELS_DIR"
 DOCKER_ARGS=(
   --progress=plain \
   -f "${SCRIPT_DIR}/Dockerfile" \
   -t "${IMAGE_TAG}" \
   --target "${TARGET}" \
+  --build-context wheels="${WHEELS_DIR}" \
   --build-arg VLLM_SOURCE="${VLLM_SOURCE}" \
   --build-arg VLLM_COMMIT_HASH="${VLLM_COMMIT_HASH}" \
 )

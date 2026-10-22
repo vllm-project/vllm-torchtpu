@@ -72,9 +72,15 @@ if [[ "${TORCHTPU_NIGHTLY:-0}" != "1" && "${CI_IMAGE_REBUILD:-0}" != "1" ]] \
 fi
 
 if [[ "${TORCHTPU_NIGHTLY:-0}" != "1" ]]; then
+  WHEELS_DIR="/tmp/wheels"
+  rm -rf "${WHEELS_DIR}" && mkdir -p "${WHEELS_DIR}"
+  echo "--- Copying wheels from gs://wdhongtw-ci-wheels/ to ${WHEELS_DIR}"
+  gcloud storage cp "gs://wdhongtw-ci-wheels/*.whl" "${WHEELS_DIR}/"
+  ls -lh "${WHEELS_DIR}"
+
   echo "--- Building Docker Image: ${BASE_IMAGE_TAG} (target: ${TARGET})"
   # Run build_image.sh and pass VLLM_COMMIT_HASH directly as a build argument
-  ./docker/build_image.sh --target "${TARGET}" -t "${BASE_IMAGE_TAG}" -c "${VLLM_COMMIT_HASH}"
+  ./docker/build_image.sh --target "${TARGET}" -t "${BASE_IMAGE_TAG}" -c "${VLLM_COMMIT_HASH}" -w "${WHEELS_DIR}"
 
   # Publish image tag metadata for downstream test steps
   buildkite-agent meta-data set "CI_IMAGE_TAG${IMAGE_SUFFIX:-}" "${BASE_IMAGE_TAG}"

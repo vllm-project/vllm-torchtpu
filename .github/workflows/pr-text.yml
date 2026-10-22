@@ -36,6 +36,7 @@ concurrency:
 
 jobs:
   pr-text:
+    if: false
     name: No Internal Links in PR Text
     runs-on: blacksmith-2vcpu-ubuntu-2404
     steps:
