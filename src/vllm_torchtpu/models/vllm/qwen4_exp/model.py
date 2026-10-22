@@ -15,14 +15,14 @@
 
 Follows the layer structure of upstream vllm/models/qwen4_exp/nvidia/model.py;
 upstream enables Qwen4Exp only on CUDA and ROCm. Hyper-connections use the
-upstream torch implementation in qwen4_exp.common; the sublayers reuse the GDN,
+local TPU precision implementation; the sublayers reuse the GDN,
 gated attention and sparse MoE layers that Qwen3.5 runs on TPU.
 """
 
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import cast
+from typing import Any, cast
 
 import torch
 from torch import nn
@@ -55,11 +55,11 @@ from vllm.model_executor.models.utils import (
     extract_layer_index,
     maybe_prefix,
 )
-from vllm.models.qwen4_exp.common.hyperconnection import (
+
+from vllm_torchtpu.models.vllm.qwen4_exp.hyperconnection import (
     GatedResidual,
     HyperConnectionConfig,
 )
-
 from vllm_torchtpu.models.vllm.qwen4_exp.ple import Qwen4ExpPLELayer
 
 
@@ -131,8 +131,24 @@ class Qwen4ExpDecoderLayer(nn.Module):
 
         self.mlp = Qwen3NextSparseMoeBlock(vllm_config, prefix=f"{prefix}.mlp")
         hc_config = _hc_config(vllm_config)
-        self.attn_hyper_connection = GatedResidual(hc_config)
-        self.mlp_hyper_connection = GatedResidual(hc_config)
+        additional_config = vllm_config.additional_config
+        hc_options: dict[str, Any] = (
+            additional_config.get("qwen4_exp", {})
+            if isinstance(additional_config, dict)
+            else {}
+        )
+        hc_full_tile = hc_options.get("hc_prefill_full_tile", "auto")
+        hc_combine_tile = hc_options.get("hc_prefill_combine_tile")
+        self.attn_hyper_connection = GatedResidual(
+            hc_config,
+            prefill_full_tile=hc_full_tile,
+            prefill_combine_tile=hc_combine_tile,
+        )
+        self.mlp_hyper_connection = GatedResidual(
+            hc_config,
+            prefill_full_tile=hc_full_tile,
+            prefill_combine_tile=hc_combine_tile,
+        )
 
     def forward(
         self, positions: torch.Tensor, hidden_states: torch.Tensor
@@ -182,8 +198,17 @@ class Qwen4ExpModel(nn.Module):
         )
         # Reduces the hc_count streams to the single stream fed to lm_head.
         # It only mixes, so it has no block_inject_weight.
+        additional_config = vllm_config.additional_config
+        hc_options: dict[str, Any] = (
+            additional_config.get("qwen4_exp", {})
+            if isinstance(additional_config, dict)
+            else {}
+        )
         self.hyper_connection_mixer = GatedResidual(
-            _hc_config(vllm_config), use_combine=False
+            _hc_config(vllm_config),
+            use_combine=False,
+            prefill_full_tile=hc_options.get("hc_prefill_full_tile", "auto"),
+            prefill_combine_tile=hc_options.get("hc_prefill_combine_tile"),
         )
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
