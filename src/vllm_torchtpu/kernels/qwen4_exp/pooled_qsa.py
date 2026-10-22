@@ -866,7 +866,7 @@ def select_blocks(
     return selected.reshape(-1, block_topk)[: len(query)]
 
 
-def pooled_qsa_step(
+def _pooled_qsa(
     qgate: jax.Array,
     key: jax.Array,
     value: jax.Array,
@@ -892,6 +892,7 @@ def pooled_qsa_step(
     compressed_slot: int = 0,
     main_slot: int = -1,
     max_query_len: int = 1,
+    rows: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """One QSA layer over the unified pool.
 
@@ -961,6 +962,15 @@ def pooled_qsa_step(
         pool, ring.reshape(len(ids), -1), tags.reshape(len(ids), -1), ids
     )
     lengths = jnp.where(valid, logical + 1, 0).astype(jnp.int32)
+    # Attend only the requested rows; every token above still wrote its KV,
+    # compressed key and ring state. Up to one row per request slot, the
+    # rows take the row-wise decode indexer and RPA.
+    keep = None if rows is None else rows >= 0
+    picked = None if rows is None else jnp.clip(rows, 0, len(q) - 1)
+    if rows is not None and len(rows) <= len(context):
+        q, gate, iq, req = q[picked], gate[picked], iq[picked], req[picked]
+        lengths = jnp.where(keep, lengths[picked], 0)
+        keep = picked = None
     blocks = select_blocks(
         iq,
         pool,
@@ -989,8 +999,137 @@ def pooled_qsa_step(
         **({"kv_head_offset": main_slot} if main_slot > 0 else {}),
         max_query_len=max_query_len,
     )
-    return (
+    output = output.reshape(len(q), -1)
+    selected = selected_tokens(blocks, lengths, token_topk, compress_ratio)
+    if picked is not None:
+        # More rows than the decode path holds: attend every token, then pick.
+        output = jnp.where(keep[:, None], output[picked], 0)
+        selected = jnp.where(keep[:, None], selected[picked], -1)
+    return pool, output, selected
+
+
+def pooled_qsa_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """One QSA layer over the unified pool.
+
+    ``main_slot`` >= 0 selects this layer's KV head pair in main KV pages
+    shared by two layers (``pool_layout.pooled_cache_specs``); the default -1
+    keeps the layer's whole-row pages.
+    """
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
         pool,
-        output.reshape(len(q), -1),
-        selected_tokens(blocks, lengths, token_topk, compress_ratio),
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+    )
+
+
+def pooled_qsa_rows_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    rows: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_step`` that attends only token ``rows`` (-1: none).
+
+    Every token's KV, compressed key and ring state is written as in
+    ``pooled_qsa_step``; the output and selected tokens cover ``rows`` only.
+    An MTP draft's first step needs attention only at each request's last
+    token, while later draft steps read the whole step's cache entries.
+    """
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        rows=rows,
     )

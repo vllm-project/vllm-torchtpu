@@ -281,6 +281,9 @@ class Eagle3Proposer:
         # load_model; None means the per-step loop.
         self._mtp_fused_loop: torch.nn.Module | None = None
         self._mtp_fused_loop_warm = False
+        # Draft step 0 evaluated at each request's last token only
+        # (VLLM_TPU_MTP_DRAFT_ROWS). Resolved in load_model.
+        self._draft_rows = False
 
     @property
     def advance_draft_positions(self) -> bool:
@@ -352,6 +355,7 @@ class Eagle3Proposer:
         if self._share_mtp_indices:
             self._build_mtp_loop_model()
         self._build_mtp_fused_loop()
+        self._draft_rows = self._resolve_draft_rows()
 
         # IndexShare assumes the draft owns its KV cache and advances
         # positions once per step; cross-model KV sharing freezes them and
@@ -367,6 +371,42 @@ class Eagle3Proposer:
                 "advance per draft step, which cross-model KV sharing "
                 "freezes; the combination is unvalidated."
             )
+
+    def _resolve_draft_rows(self) -> bool:
+        """Whether draft step 0 runs at each request's last token only.
+
+        Step 0 consumes every token of the target's step, but only the rows
+        at `last_token_indices` feed a draft token and the loop carries; the
+        rest exist to write the draft layer's KV and indexer caches, which
+        later draft steps read. A draft declaring `supports_draft_rows`
+        writes those caches for all tokens and evaluates the layer at the
+        given rows. Excluded: IndexShare (its saved top-k rows are per
+        token), context parallelism (rows are rank-local) and EP-DP lockstep
+        (padding chunks replay full-width step-0 collectives).
+        """
+        if not envs.VLLM_TPU_MTP_DRAFT_ROWS:
+            return False
+        if self.speculative_config.method != "mtp" or not getattr(
+            self.draft_model, "supports_draft_rows", False
+        ):
+            logger.warning_once(
+                "VLLM_TPU_MTP_DRAFT_ROWS is set but this draft does not "
+                "support row-selected step 0; ignoring it."
+            )
+            return False
+        runner = self.runner
+        if (
+            self._share_mtp_indices
+            or getattr(runner, "_pcp_enabled", False)
+            or runner._dp_lockstep_enabled()
+        ):
+            logger.warning_once(
+                "VLLM_TPU_MTP_DRAFT_ROWS is unsupported with IndexShare, "
+                "context parallelism or EP-DP lockstep; ignoring it."
+            )
+            return False
+        logger.info("MTP draft step 0 runs at each request's last token only.")
+        return True
 
     def _validate_mtp_layer_count(self) -> None:
         """One nextn layer only: the proposer's per-step wiring assumes it.
@@ -1156,6 +1196,15 @@ class Eagle3Proposer:
 
     @_static_shape_args
     @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def _draft_gather_positions(
+        self, positions: torch.Tensor, indices: torch.Tensor
+    ) -> torch.Tensor:
+        # The position carry of _draft_gather_carries, for a row-selected
+        # step 0 whose hidden outputs are already per request.
+        return torch.index_select(positions, positions.ndim - 1, indices)
+
+    @_static_shape_args
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
     def _draft_combine_hidden_states(
         self, aux0: torch.Tensor, aux1: torch.Tensor, aux2: torch.Tensor
     ) -> torch.Tensor:
@@ -1314,6 +1363,7 @@ class Eagle3Proposer:
                 seq_lens_delta=0,
                 num_rejected_np=rejected_np_per_chunk[ci],
                 num_tokens_padded=input_ids.shape[0],
+                draft_rows=last_token_indices if self._draft_rows else None,
             )
             # [p, h] / [p] carries + first-pass draft token, computed in compiled
             # regions (the three gathers, then lm-head+argmax) so torch-tpu's
@@ -1326,11 +1376,18 @@ class Eagle3Proposer:
                 saved_topk_per_chunk.append(
                     self._mtp_compact_and_save(safe_gather_indices)
                 )
-            hidden_carry, positions_carry, last_hidden_carry = (
-                self._draft_gather_carries(
-                    hidden, positions, last_hidden, safe_gather_indices
+            if self._draft_rows:
+                # The draft already returned one row per last token.
+                hidden_carry, last_hidden_carry = hidden, last_hidden
+                positions_carry = self._draft_gather_positions(
+                    positions, safe_gather_indices
                 )
-            )
+            else:
+                hidden_carry, positions_carry, last_hidden_carry = (
+                    self._draft_gather_carries(
+                        hidden, positions, last_hidden, safe_gather_indices
+                    )
+                )
             last_hidden_carry = (
                 chunk.sequence_layout_plan.aggregate_request_aligned_tensor(
                     last_hidden_carry, owner_mask
@@ -2086,6 +2143,7 @@ class Eagle3Proposer:
         num_rejected_dev: torch.Tensor | None = None,
         loop_query_start_loc: torch.Tensor | None = None,
         loop_request_distribution: torch.Tensor | None = None,
+        draft_rows: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         attn_metadata = self._build_draft_attn_metadata(
             chunk=chunk,
@@ -2107,6 +2165,8 @@ class Eagle3Proposer:
         }
         if self.speculative_config.method == "mtp":
             kwargs["spec_step_idx"] = step_idx
+        if draft_rows is not None:
+            kwargs["draft_rows"] = draft_rows
 
         model = self._draft_model_for_step(step_idx)
         with (

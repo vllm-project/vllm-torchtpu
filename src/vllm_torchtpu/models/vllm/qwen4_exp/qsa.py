@@ -365,7 +365,10 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         (``Qwen4ExpPoolLayout.main_owner``); by default the layer owns whole
         rows of ``<prefix>`` pages.
         """
-        from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import build_pooled_qsa_op
+        from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
+            build_pooled_qsa_op,
+            build_pooled_qsa_rows_op,
+        )
 
         name, slot = compressed_owner or (self.prefix + ".compressed_k", 0)
         main_name, main_slot = main_owner or (self.prefix, -1)
@@ -383,6 +386,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         if main_slot >= 0:
             keywords["main_slot"] = main_slot
         self._op = partial(build_pooled_qsa_op(), **keywords)
+        self._rows_op = partial(build_pooled_qsa_rows_op(), **keywords)
 
     def get_kv_cache_spec(self, vllm_config):
         return get_qsa_cache_specs(self.config, self.tp_size, self.cache_dtype)[0]
@@ -510,7 +514,15 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         if missing:
             raise ValueError(f"Missing QSA checkpoint tensors: {sorted(missing)}")
 
-    def forward_with_indices(self, hidden, positions, metadata: QSAMetadata):
+    def forward_with_indices(
+        self, hidden, positions, metadata: QSAMetadata, rows=None
+    ):
+        """Attention output and selected tokens.
+
+        ``rows`` (int, -1 for none) limits both to those token rows; the
+        caches are still written for every token. Pooled QSA attends only
+        the rows; the dedicated-cache path attends all tokens and picks.
+        """
         assert len(self.cache_owners) == (1 if self.pooled else 4), (
             "Task4 must bind real or profiling scratch QSA owners"
         )
@@ -530,7 +542,9 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                     torch.Tensor, per_layer[self.compressed_cache_name].block_tables
                 ),
             )
-        output, selected = self._op(
+        pick_rows = rows is not None and not self.pooled
+        op = self._op if rows is None or pick_rows else self._rows_op
+        output, selected = op(
             self.q_proj(hidden),
             self.k_proj(hidden),
             self.v_proj(hidden),
@@ -547,12 +561,18 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             metadata.state_slots,
             metadata.main_block_table,
             metadata.compressed_block_table,
+            *(() if rows is None or pick_rows else (rows,)),
             **(
                 {"k_scale": self._k_scale_float, "v_scale": self._v_scale_float}
                 if self.fp8_kv
                 else {}
             ),
         )
+        if pick_rows:
+            keep = (rows >= 0)[:, None]
+            picked = rows.clamp_min(0)
+            output = torch.where(keep, output[picked], 0)
+            selected = torch.where(keep, selected[picked], -1)
         output = self.o_proj(output)
         if self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output)

@@ -170,7 +170,9 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         hidden = hidden.reshape(tokens, self.hc_count, self.hidden_size)
         return (hidden + embeds.unsqueeze(1)).reshape(tokens, -1)
 
-    def forward(self, input_ids, positions, hidden_states, inputs_embeds, step):
+    def forward(
+        self, input_ids, positions, hidden_states, inputs_embeds, step, rows=None
+    ):
         hidden = self.fuse_inputs(input_ids, hidden_states, inputs_embeds)
         layer = cast(Qwen4ExpDecoderLayer, self.layers[step % len(self.layers)])
         metadata = cast(
@@ -182,6 +184,18 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
         # length before this chunk. Loop steps advance seq_lens in place.
         context = (seq_lens - (starts[1:] - starts[:-1])).to(torch.int64)
         tables = cast(torch.Tensor, metadata.block_tables)
+        if rows is not None:
+            hidden = layer.forward_rows(
+                hidden,
+                positions.to(torch.int64),
+                rows.to(torch.int64),
+                starts,
+                torch.zeros_like(seq_lens, dtype=torch.int32),
+                context,
+                tables,
+                tables,
+            )
+            return self.hyper_connection_mixer.mix(hidden)[0], hidden
         hidden = layer(
             hidden,
             positions.to(torch.int64),
@@ -200,7 +214,12 @@ class Qwen4ExpMultiTokenPredictor(nn.Module):
 
 
 @support_torch_compile(
-    dynamic_arg_dims={"input_ids": 0, "positions": 0, "hidden_states": 0}
+    dynamic_arg_dims={
+        "input_ids": 0,
+        "positions": 0,
+        "hidden_states": 0,
+        "draft_rows": 0,
+    }
 )
 class Qwen4ExpMTP(nn.Module):
     """Draft returning (LM-head input [T, H], next-step hidden [T, hc*H])."""
@@ -210,6 +229,10 @@ class Qwen4ExpMTP(nn.Module):
     uses_target_aux_hidden_states = True
     has_own_embed_tokens = False
     has_own_lm_head = False
+    # Draft step 0 may pass `draft_rows` (each request's last token): the
+    # draft then writes its QSA caches for every token but evaluates the
+    # layer, and returns both outputs, at those rows only.
+    supports_draft_rows = True
     # Identical to the target's: vLLM writes this onto the shared quant config.
     packed_modules_mapping = Qwen4ExpForCausalLM.packed_modules_mapping
 
@@ -242,11 +265,17 @@ class Qwen4ExpMTP(nn.Module):
         intermediate_tensors=None,
         inputs_embeds=None,
         spec_step_idx: int = 0,
+        draft_rows: torch.Tensor | None = None,
     ):
         if intermediate_tensors is not None:
             raise NotImplementedError("Qwen4Exp MTP runs whole on one stage")
         return self.model(
-            input_ids, positions, hidden_states, inputs_embeds, spec_step_idx
+            input_ids,
+            positions,
+            hidden_states,
+            inputs_embeds,
+            spec_step_idx,
+            draft_rows,
         )
 
     def compute_logits(self, hidden_states, spec_step_idx: int = 0):

@@ -7,7 +7,10 @@ from collections.abc import Callable
 import torch
 from torch_tpu._internal import pallas
 
-from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import pooled_qsa_step
+from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import (
+    pooled_qsa_rows_step,
+    pooled_qsa_step,
+)
 from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import qsa_step
 
 
@@ -161,6 +164,61 @@ def build_pooled_qsa_op():
     def run(*args, **kwargs):
         args = list(args)
         for index in (8, 11, 12, 13, 14, 15):
+            args[index] = args[index].to(torch.int32)
+        updated, output, blocks = op(*args, **kwargs)
+        args[10].copy_(updated)
+        return output, blocks
+
+    return run
+
+
+@functools.cache
+def build_pooled_qsa_rows_op() -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
+    """``build_pooled_qsa_op`` attending only the trailing ``rows`` operand."""
+    op = pallas.jax_op(
+        "qwen4_exp::pooled_qsa_rows", pooled_qsa_rows_step, donate_argnums=(10,)
+    )
+
+    @op.register_fake
+    def fake(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        rows,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale=1.0,
+        v_scale=1.0,
+        compressed_slot=0,
+        main_slot=-1,
+        max_query_len=1,
+    ):
+        return (
+            torch.empty_like(pool),
+            qgate.new_empty((rows.shape[0], qgate.shape[-1] // 2)),
+            positions.new_empty(
+                (rows.shape[0], token_topk + compress_ratio - 1), dtype=torch.int32
+            ),
+        )
+
+    def run(*args, **kwargs):
+        args = list(args)
+        for index in (8, 11, 12, 13, 14, 15, 16):
             args[index] = args[index].to(torch.int32)
         updated, output, blocks = op(*args, **kwargs)
         args[10].copy_(updated)

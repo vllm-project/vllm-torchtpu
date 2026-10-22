@@ -312,6 +312,47 @@ class Qwen4ExpDecoderLayer(nn.Module):
         block = torch.where(valid_tokens[:, None], block, 0)
         return self.mlp_hyper_connection.combine(self.mlp(block), residual)
 
+    def forward_rows(
+        self,
+        hidden,
+        positions,
+        rows,
+        query_start_loc,
+        state_slots,
+        context_lens,
+        main_block_table,
+        compressed_block_table,
+    ):
+        """``forward`` evaluated at token ``rows`` only (-1: an empty row).
+
+        Attention still writes its caches for every token. Everything else
+        in the layer is row-wise, so the attention output, both
+        hyper-connection combines and the MoE run on the selected rows.
+        Returns [len(rows), hc*H].
+        """
+        if self.ple is not None or self.layer_type == "linear_attention":
+            raise NotImplementedError("Row selection needs a QSA layer without PLE")
+        block, (hyper_input, normed) = self.attn_hyper_connection.mix(hidden)
+        block = self.self_attn.forward_with_indices(
+            block,
+            positions,
+            QSAMetadata(
+                query_start_loc,
+                context_lens,
+                state_slots,
+                main_block_table,
+                compressed_block_table,
+            ),
+            rows=rows,
+        )[0]
+        picked = rows.clamp_min(0)
+        hidden = self.attn_hyper_connection.combine(
+            block, (hyper_input[picked], normed[picked])
+        )
+        block, residual = self.mlp_hyper_connection.mix(hidden)
+        block = torch.where((rows >= 0)[:, None], block, 0)
+        return self.mlp_hyper_connection.combine(self.mlp(block), residual)
+
 
 @support_torch_compile(
     dynamic_arg_dims={

@@ -572,3 +572,110 @@ def test_draft_drops_token_count_dependent_hc_tiles():
     draft = draft_additional_config(target)
     assert draft == {"qwen4_exp": {"engram_config": {"cpu_offload": True}}, "other": 1}
     assert target["qwen4_exp"]["hc_prefill_full_tile"] == 128
+
+
+@pytest.mark.usefixtures("cpu_vllm_config")
+def test_draft_rows_match_all_token_step_at_those_rows(monkeypatch):
+    """Row-selected step 0 equals the all-token step at the selected rows.
+
+    Real decoder layer and hyper-connections; the MoE and the QSA attention
+    are row-wise stand-ins. The stand-in attention also checks that the
+    rows step still hands every token to QSA (its cache writes).
+    """
+    from torch import nn
+    from vllm.config import CompilationMode
+
+    from tests.models.vllm.qwen4_exp_test_utils import q4exp_text_config
+    from vllm_torchtpu.models.vllm.qwen4_exp import model, mtp
+
+    text = q4exp_text_config(
+        hidden_size=16,
+        hc_count=4,
+        hc_lowrank=4,
+        vocab_size=32,
+        num_attention_heads=4,
+        num_key_value_heads=1,
+        head_dim=32,
+        indexer_n_heads=1,
+        indexer_head_dim=16,
+        num_hidden_layers=2,
+        layer_types=["linear_attention", "full_attention"],
+        mtp_num_hidden_layers=1,
+    )
+
+    class MoE(nn.Module):
+        def __init__(self, vllm_config, prefix):
+            super().__init__()
+            self.prefix = prefix
+
+        def forward(self, x):
+            return torch.tanh(x.float() * 1.5).to(x.dtype)
+
+    monkeypatch.setattr(model, "Qwen3NextSparseMoeBlock", MoE)
+    monkeypatch.setattr(
+        model, "get_tp_group", lambda: NS(rank_in_group=0, world_size=1)
+    )
+    monkeypatch.setattr(mtp, "VocabParallelEmbedding", nn.Embedding)
+    monkeypatch.setattr(mtp, "ParallelLMHead", lambda v, h, prefix: nn.Embedding(v, h))
+    monkeypatch.setattr(mtp, "LogitsProcessor", lambda vocab: nn.Identity())
+    for module in ("parameter", "layers.linear"):
+        for name, value in (
+            ("get_tensor_model_parallel_rank", 0),
+            ("get_tensor_model_parallel_world_size", 1),
+        ):
+            monkeypatch.setattr(
+                f"vllm.model_executor.{module}.{name}",
+                lambda value=value: value,
+                raising=False,
+            )
+    cfg = NS(
+        model_config=NS(hf_text_config=text, max_model_len=256),
+        cache_config=NS(cache_dtype="auto"),
+        device_config=NS(device="cpu"),
+        compilation_config=NS(mode=CompilationMode.NONE, static_forward_context={}),
+        additional_config={},
+        quant_config=None,
+        speculative_config=spec_config(3),
+    )
+    monkeypatch.setattr(model, "use_unified_pool", lambda: True)
+    torch.manual_seed(0)
+    with torch.device("cpu"):
+        draft = mtp.Qwen4ExpMTP(vllm_config=cfg, prefix="")
+    draft = draft.to(torch.bfloat16)
+    for p in draft.parameters():
+        p.data.normal_(0, 0.2)
+    attention = draft.model.layers[0].self_attn
+    attended = []
+
+    def forward_with_indices(hidden, positions, metadata, rows=None):
+        attended.append((len(hidden), None if rows is None else rows.tolist()))
+        output = torch.sin(hidden.float() * 3 + positions[:, None].float() / 7)
+        output = output.to(hidden.dtype)
+        if rows is not None:
+            keep = (rows >= 0)[:, None]
+            output = torch.where(keep, output[rows.clamp_min(0)], 0)
+        return output, None
+
+    monkeypatch.setattr(attention, "forward_with_indices", forward_with_indices)
+    metadata = NS(
+        query_start_loc=torch.tensor([0, 3, 7, 7]),
+        seq_lens=torch.tensor([12, 9, 0]),
+        block_tables=torch.zeros(3, dtype=torch.int32),
+    )
+    monkeypatch.setattr(
+        mtp,
+        "get_forward_context",
+        lambda: NS(attn_metadata={"mtp.layers.2.self_attn": metadata}),
+    )
+    ids = torch.tensor([3, 5, 7, 1, 2, 9, 4, 0])
+    positions = torch.tensor([9, 10, 11, 5, 6, 7, 8, 0])
+    target = torch.randn(8, 64).to(torch.bfloat16)
+    sample, multi = draft(ids, positions, target)
+    rows = torch.tensor([2, 6, 6, -1])
+    row_sample, row_multi = draft(ids, positions, target, draft_rows=rows)
+    assert attended == [(8, None), (8, [2, 6, 6, -1])]
+    assert row_sample.shape == (4, 16) and row_multi.shape == (4, 64)
+    picked = rows.clamp_min(0)[:3]
+    torch.testing.assert_close(row_multi[:3], multi[picked], rtol=0, atol=0)
+    torch.testing.assert_close(row_sample[:3], sample[picked], rtol=0, atol=0)
+    assert torch.isfinite(row_multi[3].float()).all()
