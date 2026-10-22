@@ -150,6 +150,29 @@ class TestVllmGatedDeltaNetAttention:
         assert plan.conv.view_dtype == jnp.bfloat16
         assert plan.whole_block_dma is True
 
+    @pytest.mark.parametrize("conv_dtype", [jnp.float32, jnp.dtype(jnp.float32)])
+    def test_seq_on_lane_fp32_conv_state_plan(self, monkeypatch, conv_dtype):
+        monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+        from vllm_torchtpu.layers.core.gdn_attention import _build_v3_pool_state_plan
+
+        pool = jnp.zeros((10, 2, 128, 2, 128), dtype=jnp.bfloat16)
+        plan = _build_v3_pool_state_plan(
+            pool,
+            conv_dim=1536,
+            n_v=8,
+            d_k=128,
+            d_v=128,
+            kernel_size=4,
+            pool_block_tokens=4352,
+            qk_pair_layout=False,
+            conv_state_dtype=conv_dtype,
+        )
+        assert plan.conv.view_dtype == jnp.float32
+        assert plan.recurrent.view_dtype == jnp.float32
+        token_bytes = 2 * 128 * 2 * 2
+        assert plan.conv.nrows * token_bytes >= 3 * 1536 * 4
+        assert plan.whole_block_dma is True
+
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op."
         "run_jax_gdn_attention_pcp_tp_prefill"
@@ -212,6 +235,7 @@ class TestVllmGatedDeltaNetAttention:
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_or_create_pcp_mesh"
     )
+    @pytest.mark.parametrize("conv_dtype", [torch.bfloat16, torch.float32])
     def test_pooled_pcp_impl_uses_donation_and_copy_writeback(
         self,
         mock_get_pcp_mesh,
@@ -221,8 +245,11 @@ class TestVllmGatedDeltaNetAttention:
         projection_dtype,
         interleaved,
         cpu_vllm_config_context,
+        conv_dtype,
     ):
         attn = _qwen35_397b_gdn_attn("copy_test_layer")
+        if conv_dtype != torch.bfloat16:
+            attn._pooled_conv_state_dtype = conv_dtype
         attn.gqa_interleaved_layout = interleaved
         attn.cache_config.mamba_ssm_cache_dtype = ssm_cache_dtype
         mock_get_pcp_mesh.return_value = SimpleNamespace(shape={"pcp": 8, "tp": 1})
@@ -276,6 +303,9 @@ class TestVllmGatedDeltaNetAttention:
         assert mock_pcp_jax_op.call_args.kwargs["donate_argnums"] == (4,)
         assert mock_run.call_args.kwargs["recurrent_state_dtype"] == jnp.dtype(
             expected_dtype
+        )
+        assert mock_run.call_args.kwargs["conv_state_dtype"] == jnp.dtype(
+            jnp.float32 if conv_dtype == torch.float32 else jnp.bfloat16
         )
         op_args = fake_jax_op.call_args.args
         assert op_args[4] is pool
@@ -1625,3 +1655,75 @@ def test_pooled_op_block_major_folds_the_pool_and_restores_its_shape(
     assert re.fullmatch(rf"pallas::gdn_attention_pooled{suffix}_\d+", captured["name"])
     assert captured["kernel_pool_shape"] == kernel_pool_shape
     assert tuple(new_pool.shape) == tuple(pool.shape)
+
+
+@pytest.mark.parametrize("conv_dtype", [torch.bfloat16, torch.float32])
+def test_pooled_conv_format_is_declared_without_changing_ssm_dtype(conv_dtype):
+    attn = _qwen35_397b_gdn_attn("model.layers.0.linear_attn")
+    attn._pooled_conv_state_dtype = conv_dtype
+    with patch.object(
+        gdn_attention_op,
+        "unified_kv_layout_enabled_for_architecture",
+        return_value=True,
+    ):
+        assert attn.get_state_dtype() == (conv_dtype, torch.float32)
+
+
+@pytest.mark.parametrize(
+    "ssm_cache_dtype,ssm_dtype", [("bfloat16", jnp.bfloat16), ("float32", jnp.float32)]
+)
+def test_pooled_conv_formats_share_ops_only_with_matching_physical_format(
+    cpu_vllm_config_context,
+    ssm_cache_dtype,
+    ssm_dtype,
+):
+    captured = []
+
+    def build(name, function, **kwargs):
+        captured.append((name, function))
+        return MagicMock()
+
+    with (
+        patch.dict(gdn_attention_op._shared_gdn_ops, {}, clear=True),
+        set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+        patch.object(gdn_attention_op.pallas, "jax_op", side_effect=build),
+    ):
+        for index, dtype in enumerate(
+            (torch.bfloat16, torch.bfloat16, torch.float32, torch.float32)
+        ):
+            attn = _qwen35_397b_gdn_attn(f"model.layers.{index}.linear_attn")
+            attn._pooled_conv_state_dtype = dtype
+            attn.cache_config.mamba_ssm_cache_dtype = ssm_cache_dtype
+            attn._build_pooled_gdn_op()
+
+    assert len(captured) == 2
+    assert captured[0][0] != captured[1][0]
+    operands = [torch.zeros((1, 1)) for _ in range(12)]
+    operands[5] = None
+    for (_, function), dtype in zip(captured, (jnp.bfloat16, jnp.float32)):
+        with patch.object(
+            gdn_attention_op,
+            "gdn_attention_pooled_core_tpu",
+            return_value=(operands[3], operands[0]),
+        ) as dispatch:
+            function(*operands)
+        assert dispatch.call_args.kwargs["conv_state_dtype"] == jnp.dtype(dtype)
+        assert dispatch.call_args.kwargs["recurrent_state_dtype"] == jnp.dtype(
+            ssm_dtype
+        )
+
+
+@pytest.mark.parametrize(
+    "dtype,expected", [(torch.bfloat16, jnp.bfloat16), (torch.float32, jnp.float32)]
+)
+def test_state_dtype_conversion(dtype, expected):
+    assert gdn_attention_op._to_jax_state_dtype(dtype) == jnp.dtype(expected)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.int32])
+def test_state_dtype_rejects_unsupported_formats(dtype):
+    with pytest.raises(
+        ValueError,
+        match="Unsupported state dtype for TPU GDN.*expected float32 or bfloat16",
+    ):
+        gdn_attention_op._to_jax_state_dtype(dtype)

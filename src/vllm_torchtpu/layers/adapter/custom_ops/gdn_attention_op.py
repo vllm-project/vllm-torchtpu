@@ -46,7 +46,6 @@ from vllm_torchtpu.distributed.pcp import (
     get_pcp_world_size,
 )
 from vllm_torchtpu.gdn_pool_layout import (
-    DEFAULT_POOLED_GDN_CONV_STATE_DTYPE,
     unified_kv_layout_enabled_for_architecture,
 )
 from vllm_torchtpu.kernels.gdn.head_geometry import (
@@ -92,14 +91,13 @@ if TYPE_CHECKING:
         mamba_state_indices: torch.Tensor | None
 
 
-def _to_jax_ssm_state_dtype(dtype: torch.dtype) -> jnp.dtype:
+def _to_jax_state_dtype(dtype: torch.dtype) -> jnp.dtype:
     if dtype == torch.float32:
         return jnp.dtype(jnp.float32)
     if dtype == torch.bfloat16:
         return jnp.dtype(jnp.bfloat16)
     raise ValueError(
-        f"Unsupported mamba_ssm_cache_dtype for TPU GDN: "
-        f"{dtype}; expected float32 or bfloat16"
+        f"Unsupported state dtype for TPU GDN: {dtype}; expected float32 or bfloat16"
     )
 
 
@@ -198,6 +196,7 @@ def gdn_attention_pooled_core_tpu(
     kernel_size: int,
     pool_block_tokens: int,
     recurrent_state_dtype: jnp.dtype,
+    conv_state_dtype: jnp.dtype = jnp.bfloat16,
     num_spec_tokens: int = 0,
 ) -> tuple[jax.Array, jax.Array]:
     return run_jax_gdn_attention_pooled(
@@ -222,6 +221,7 @@ def gdn_attention_pooled_core_tpu(
         kernel_size=kernel_size,
         pool_block_tokens=pool_block_tokens,
         recurrent_state_dtype=recurrent_state_dtype,
+        conv_state_dtype=conv_state_dtype,
         mesh=mesh,
         num_spec_tokens=num_spec_tokens,
     )
@@ -367,13 +367,18 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
     # with `(pool_index, layout)` once bound by `set_block_major_pool()`.
     # Class-level defaults support test/mock instances constructed without `__init__`.
     _bm_kernel: bool = False
+    _pooled_conv_state_dtype: torch.dtype = torch.bfloat16
     _bm_region: tuple[int, BlockMajorPoolLayout] | None = None
 
     # Narrowed to the layer that _create_conv1d installs.
     # pyrefly: ignore[bad-override-mutable-attribute]
     conv1d: GdnColumnParallelLinear
 
-    def __init__(self, *args, **kwargs):
+    def __init__(
+        self, *args, pooled_conv_state_dtype: torch.dtype = torch.bfloat16, **kwargs
+    ):
+        _to_jax_state_dtype(pooled_conv_state_dtype)
+        self._pooled_conv_state_dtype = pooled_conv_state_dtype
         super().__init__(*args, **kwargs)
         self._create_conv1d()
         # `_require_pcp_projection_parameters` hands this weight straight to
@@ -507,13 +512,11 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             # Declare exactly what the pool physically stores. vLLM sizes the
             # mamba page from the dtype declared HERE and asserts the padded
             # page covers it, while the block-slot derivation budgets the page
-            # from DEFAULT_POOLED_GDN_CONV_STATE_DTYPE. Declaring anything
+            # from the same explicit conv state dtype. Declaring anything
             # wider is not conservative, it is a contradiction: the two
             # disagreed once and every hybrid GDN engine failed to start on
             # that assert.
-            conv_state_dtype = getattr(
-                torch, DEFAULT_POOLED_GDN_CONV_STATE_DTYPE.split(".")[1]
-            )
+            conv_state_dtype = self._pooled_conv_state_dtype
         else:
             # TODO: Support bf16 conv state.
             # Per-layer cache: unlike the pool, the declared dtype IS the
@@ -717,7 +720,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         d_k = self.head_k_dim
         d_v = self.head_v_dim
         kernel_size = self.conv_kernel_size
-        recurrent_state_dtype = _to_jax_ssm_state_dtype(self.get_state_dtype()[1])
+        recurrent_state_dtype = _to_jax_state_dtype(self.get_state_dtype()[1])
+        conv_state_dtype = _to_jax_state_dtype(self._pooled_conv_state_dtype)
         # Speculative decoding: verify windows run in the GDN kernel's SPEC
         # mode with one state checkpoint per window position kept inside
         # the request's state block; rejected drafts are rolled back by
@@ -776,6 +780,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 # full-attention layer would ever see the adjusted value.
                 pool_block_tokens=vllm_config.cache_config.block_size,
                 recurrent_state_dtype=recurrent_state_dtype,
+                conv_state_dtype=conv_state_dtype,
                 num_spec_tokens=num_spec_tokens,
             )
             if not block_major:
@@ -810,6 +815,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 d_v,
                 kernel_size,
                 recurrent_state_dtype,
+                conv_state_dtype,
                 num_spec_tokens,
             ),
             build_op,
@@ -887,7 +893,8 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         d_k = self.head_k_dim
         d_v = self.head_v_dim
         kernel_size = self.conv_kernel_size
-        recurrent_state_dtype = _to_jax_ssm_state_dtype(self.get_state_dtype()[1])
+        recurrent_state_dtype = _to_jax_state_dtype(self.get_state_dtype()[1])
+        conv_state_dtype = _to_jax_state_dtype(self._pooled_conv_state_dtype)
 
         def wrapped_fn(
             hidden_states: jax.Array,
@@ -931,6 +938,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 pcp_size=pcp_size,
                 interleave_size=interleave_size,
                 recurrent_state_dtype=recurrent_state_dtype,
+                conv_state_dtype=conv_state_dtype,
             )
             if not block_major:
                 return result

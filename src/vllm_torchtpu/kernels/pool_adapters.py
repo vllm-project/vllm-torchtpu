@@ -490,6 +490,7 @@ def v3_state_source(
     kernel_size: int,
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     qk_pair_layout: bool = False,
+    conv_state_dtype: jnp.dtype = jnp.bfloat16,
 ) -> gdn_v3_config.StateSourcePlan:
     """Static copy-plan letting the fused GDN V3 kernel stream the mamba
     state regions directly between this pool and its double-buffered
@@ -500,7 +501,7 @@ def v3_state_source(
     window (one contiguous DMA per slot), viewed in the configured storage
     dtype. FP32 uses a ``d_v``-wide typed view; BF16 preserves the raw pool
     ref's full minormost width. The Conv region is ``conv_ntok`` token rows
-    inside a single kernel block, viewed as BF16 with the tail rows
+    inside a single kernel block, viewed in ``conv_state_dtype`` with the tail rows
     zero-padded.
     Arguments mirror the region geometry computed by the pooled GDN
     caller; ``pool`` contributes only its shape and dtype.
@@ -583,8 +584,11 @@ def v3_state_source(
     # The kernel regroups conv rows into (kernel_size - 1, conv_dim) via
     # 128-aligned lane concat, which needs whole rows per conv row.
     assert conv_dim % lanes == 0, (conv_dim, lanes)
+    conv_dtype = jnp.dtype(conv_state_dtype)
+    if conv_dtype not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32)):
+        raise ValueError(f"unsupported pooled conv state dtype: {conv_dtype}")
     conv_rows = (kernel_size - 1) * conv_dim // lanes
-    assert conv_rows * 2 * lanes <= conv_ntok * tok_bytes, (
+    assert conv_rows * conv_dtype.itemsize * lanes <= conv_ntok * tok_bytes, (
         conv_rows,
         conv_ntok,
         tok_bytes,
@@ -599,7 +603,7 @@ def v3_state_source(
         nblocks=1,
         row0=row0,
         nrows=conv_ntok,
-        view_dtype=jnp.dtype(jnp.bfloat16),
+        view_dtype=conv_dtype,
         lane_split=1,
         rows_used=conv_rows,
         rows_perm=conv_rows_perm,

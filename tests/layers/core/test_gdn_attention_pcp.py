@@ -84,6 +84,7 @@ _GDN_PCP_FUSED_PROJECTION_CASES = (
         (0, 17, 32),
         (5, 41, 9),
         jnp.float32,
+        jnp.bfloat16,
         1280,
         id="gqa-multiple-groups-per-shard",
     ),
@@ -96,6 +97,7 @@ _GDN_PCP_FUSED_PROJECTION_CASES = (
         (0, 64),
         None,
         jnp.float32,
+        jnp.bfloat16,
         1024,
         id="qwen38-kq-replication-pcp8-spmd",
     ),
@@ -108,11 +110,22 @@ _GDN_PCP_FUSED_PROJECTION_CASES = (
         (0, 1024),
         None,
         jnp.float32,
+        jnp.bfloat16,
         1024,
         id="multi-stage-fresh",
     ),
     pytest.param(
-        2, 4, 4, 2048, (64, 64), (0, 64), None, jnp.float32, 512, id="batch-flat-fresh"
+        2,
+        4,
+        4,
+        2048,
+        (64, 64),
+        (0, 64),
+        None,
+        jnp.float32,
+        jnp.bfloat16,
+        512,
+        id="batch-flat-fresh",
     ),
     pytest.param(
         2,
@@ -123,6 +136,7 @@ _GDN_PCP_FUSED_PROJECTION_CASES = (
         (0, 17, 32),
         (5, 41, 9),
         jnp.float32,
+        jnp.bfloat16,
         512,
         id="batch-flat-owner-with-history",
     ),
@@ -135,8 +149,22 @@ _GDN_PCP_FUSED_PROJECTION_CASES = (
         (0, 17, 32),
         (5, 41, 9),
         jnp.bfloat16,
+        jnp.bfloat16,
         512,
         id="batch-flat-owner-with-history-bf16-ssm-cache",
+    ),
+    pytest.param(
+        2,
+        4,
+        4,
+        2048,
+        (17, 15, 32),
+        (0, 17, 32),
+        (5, 41, 9),
+        jnp.bfloat16,
+        jnp.float32,
+        512,
+        id="batch-flat-owner-with-history-fp32-conv-bf16-ssm-cache",
     ),
 )
 
@@ -441,7 +469,9 @@ def _require_tpu_devices(min_count, reason):
     ),
     _GDN_PCP_NUMERICAL_CASES,
 )
-@pytest.mark.parametrize("state_layout", ("split", "unified_pool"))
+@pytest.mark.parametrize(
+    "state_layout", ("split", "unified_pool", "unified_pool_fp32_conv_bf16_ssm")
+)
 def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
     pcp_size,
     lengths,
@@ -478,6 +508,9 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
     num_blocks = len(lengths) + 1
     dim = 2 * n_kq * d_k + n_v * d_v
     qkv_split_sizes = [n_kq * d_k, n_kq * d_k, n_v * d_v]
+    fp32_conv = state_layout == "unified_pool_fp32_conv_bf16_ssm"
+    conv_dtype = jnp.float32 if fp32_conv else jnp.bfloat16
+    ssm_dtype = jnp.bfloat16 if fp32_conv else jnp.float32
 
     rng = jax.random.key(0)
     keys = jax.random.split(rng, 9)
@@ -495,8 +528,8 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
             * 0.01
         )
     else:
-        conv_state0 = jnp.zeros((num_blocks, kernel_size - 1, dim), dtype=jnp.bfloat16)
-        rec_state0 = jnp.zeros((num_blocks, n_v, d_k, d_v), dtype=jnp.float32)
+        conv_state0 = jnp.zeros((num_blocks, kernel_size - 1, dim), dtype=conv_dtype)
+        rec_state0 = jnp.zeros((num_blocks, n_v, d_k, d_v), dtype=ssm_dtype)
     conv_weight0 = jax.random.normal(keys[3], (dim, 1, kernel_size), dtype=jnp.bfloat16)
     conv_bias0 = jax.random.normal(keys[4], (dim,), dtype=jnp.bfloat16)
     A_log0 = jax.random.normal(keys[5], (n_v,), dtype=jnp.float32)
@@ -636,12 +669,18 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
             128,
         )
         global_pool_shape = (pcp_size * local_pool_shape[0], *local_pool_shape[1:])
+        state_kwargs = (
+            {"conv_state_dtype": conv_dtype, "recurrent_state_dtype": ssm_dtype}
+            if fp32_conv
+            else {}
+        )
         pcp_pool, pcp_output = run_jax_gdn_attention_pooled_pcp_prefill(
             *common_pcp_args,
             recurrent_state=shard_pool(
                 jnp.zeros(global_pool_shape, dtype=jnp.float8_e4m3fn)
             ),
             pool_block_tokens=pool_block_tokens,
+            **state_kwargs,
             **common_pcp_kwargs,
         )
 
@@ -666,6 +705,56 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
         )
     else:
         assert np.any(np.array(pcp_pool).view(np.uint8))
+        if fp32_conv:
+            local_n_v = n_v // pcp_size
+            local_dim = dim // pcp_size
+            layout = derive_pooled_gdn_state_layout(
+                ssm_bytes=local_n_v * d_k * d_v * jnp.dtype(ssm_dtype).itemsize,
+                conv_bytes=(kernel_size - 1)
+                * local_dim
+                * jnp.dtype(conv_dtype).itemsize,
+                token_bytes=4 * 128,
+            )
+
+            def read_states(local_pool):
+                conv = pool_adapters.gather_region(
+                    local_pool,
+                    state_indices,
+                    tok0=layout.ssm_tokens,
+                    ntok=layout.conv_tokens,
+                    split=pool_split,
+                    out_dtype=conv_dtype,
+                ).reshape(len(lengths), -1)[:, : (kernel_size - 1) * local_dim]
+                rec = pool_adapters.gather_region(
+                    local_pool,
+                    state_indices,
+                    tok0=0,
+                    ntok=layout.ssm_tokens,
+                    split=pool_split,
+                    out_dtype=ssm_dtype,
+                ).reshape(len(lengths), local_n_v, d_k, d_v)
+                return conv.reshape(len(lengths), kernel_size - 1, local_dim), rec
+
+            conv, rec = jax.shard_map(
+                read_states,
+                mesh=mesh,
+                in_specs=P("pcp"),
+                out_specs=(P(None, None, "pcp"), P(None, "pcp", None, None)),
+                check_vma=False,
+            )(pcp_pool)
+            conv = inverse_reorder_for_sharding(conv, qkv_split_sizes, pcp_size, -1)
+            np.testing.assert_allclose(
+                np.asarray(conv, np.float32),
+                np.asarray(ref_conv[1:], np.float32),
+                rtol=5e-2,
+                atol=5e-2,
+            )
+            np.testing.assert_allclose(
+                np.asarray(rec, np.float32),
+                np.asarray(ref_rec[1:], np.float32),
+                rtol=5e-2,
+                atol=5e-2,
+            )
 
 
 @pytest.mark.parametrize(
@@ -688,6 +777,7 @@ def test_pcp_prefill_matches_non_pcp_baseline_with_raw_qkv_layout(
         "token_owner_starts",
         "request_absolute_starts",
         "recurrent_state_dtype",
+        "conv_state_dtype",
         "pool_block_tokens",
     ),
     _GDN_PCP_FUSED_PROJECTION_CASES,
@@ -701,6 +791,7 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
     token_owner_starts,
     request_absolute_starts,
     recurrent_state_dtype,
+    conv_state_dtype,
     pool_block_tokens,
     projection_dtype,
     weight_scheme,
@@ -798,8 +889,12 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
     ref_z = projected_qkvz[:, qkv_dim:]
     b = jax.random.normal(keys[1], (num_tokens, n_v), dtype=jnp.bfloat16)
     a = jax.random.normal(keys[2], (num_tokens, n_v), dtype=jnp.bfloat16)
-    conv_state = jnp.zeros((num_blocks, kernel_size - 1, qkv_dim), dtype=jnp.bfloat16)
-    recurrent_state = jnp.zeros((num_blocks, n_v, d_k, d_v), dtype=jnp.float32)
+    conv_state = jnp.zeros(
+        (num_blocks, kernel_size - 1, qkv_dim), dtype=conv_state_dtype
+    )
+    recurrent_state = jnp.zeros(
+        (num_blocks, n_v, d_k, d_v), dtype=recurrent_state_dtype
+    )
     conv_weight = jax.random.normal(
         keys[3], (qkv_dim, 1, kernel_size), dtype=jnp.bfloat16
     )
@@ -897,6 +992,11 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
         NamedSharding(mesh, P("pcp")),
     )
 
+    conv_kwargs = (
+        {}
+        if conv_state_dtype == jnp.bfloat16
+        else {"conv_state_dtype": conv_state_dtype}
+    )
     new_pool, pcp_output, pcp_z = run_jax_gdn_attention_pooled_pcp_prefill_projection(
         shard_tokens(packed_hidden),
         replicate(qkvz_weight),
@@ -922,6 +1022,7 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
         interleave_size=interleave_size,
         mesh=mesh,
         recurrent_state_dtype=recurrent_state_dtype,
+        **conv_kwargs,
     )
 
     def restore_request_order(tensor):
@@ -945,7 +1046,9 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
     local_conv_dim = geometry.local_conv_dim(d_k, d_v)
     layout = derive_pooled_gdn_state_layout(
         ssm_bytes=local_n_v * d_k * d_v * jnp.dtype(recurrent_state_dtype).itemsize,
-        conv_bytes=(kernel_size - 1) * local_conv_dim * 2,
+        conv_bytes=(kernel_size - 1)
+        * local_conv_dim
+        * jnp.dtype(conv_state_dtype).itemsize,
         token_bytes=int(np.prod(local_pool_shape[2:])),
     )
 
@@ -955,7 +1058,7 @@ def test_pooled_pcp_prefill_fused_projection_matches_non_pcp_baseline(
             state_indices,
             tok0=layout.ssm_tokens,
             ntok=layout.conv_tokens,
-            out_dtype=jnp.bfloat16,
+            out_dtype=conv_state_dtype,
             split=pool_split,
         )
         conv = conv.reshape(len(lengths), -1)[:, : (kernel_size - 1) * local_conv_dim]
