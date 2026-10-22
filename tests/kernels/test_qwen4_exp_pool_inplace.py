@@ -107,6 +107,32 @@ def test_masked_routing_matches_conditional_routing(monkeypatch, starts):
     np.testing.assert_array_equal(np.asarray(owner), np.asarray(cache))
 
 
+@pytest.mark.parametrize("max_query_len, want_rpa", [(1, False), (2, True), (4, True)])
+def test_mtp_verify_steps_stay_on_rpa(monkeypatch, max_query_len, want_rpa):
+    """8 verify tokens over 4 request rows (2 per request) is a decode step
+    under MTP: every token must run on RPA as its own row, not on prefill."""
+    monkeypatch.setattr(qsa_rpa, "rpa_attention", _fake_rpa)
+    monkeypatch.setattr(qsa_rpa, "_prefill_attention", _fake_prefill)
+    rng = np.random.default_rng(7)
+    tokens = 8
+    starts = jnp.asarray([0, 2, 4, 6, 8], jnp.int32)
+    query = jnp.asarray(rng.normal(size=(tokens, 2, 16)), jnp.float32)
+    gate = jnp.asarray(rng.normal(size=(tokens, 2, 16)), jnp.float32)
+    blocks = jnp.asarray(rng.integers(-1, 9, size=(tokens, 3)), jnp.int32)
+    lengths = jnp.asarray(rng.integers(1, 99, tokens), jnp.int32)
+    table = jnp.asarray(rng.integers(0, 50, size=(tokens, 2)), jnp.int32)
+    cache = jnp.asarray(rng.normal(size=(5, 4)), jnp.float32)
+
+    static = tuple(_OPTIONS) + ("max_query_len",)
+    run = jax.jit(qsa_rpa.qsa_attention, static_argnames=static)
+    output, _ = run(
+        query, gate, blocks, lengths, table, cache, starts,
+        max_query_len=max_query_len, **_OPTIONS,
+    )
+    rpa, _ = _fake_rpa(query, gate, blocks, lengths, table, cache)
+    assert np.allclose(np.asarray(output), np.asarray(rpa), rtol=1e-5) == want_rpa
+
+
 def _pool_results_of_control_flow(module, pool_type):
     """Names of case/if ops in `module` with a result typed like the pool."""
     hits = []

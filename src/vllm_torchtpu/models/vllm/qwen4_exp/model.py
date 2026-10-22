@@ -229,6 +229,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
                 cache_dtype=cfg.cache_config.cache_dtype,
                 prefix=prefix + ".self_attn",
                 pooled=use_unified_pool(),
+                max_query_len=num_speculative_tokens(cfg) + 1,
             )
             cfg.compilation_config.static_forward_context[prefix + ".self_attn"] = (
                 self.self_attn

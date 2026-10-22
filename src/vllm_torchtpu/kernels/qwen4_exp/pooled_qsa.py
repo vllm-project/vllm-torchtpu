@@ -661,8 +661,12 @@ def select_blocks(
     ratio,
     block_topk,
     slot=0,
+    max_query_len=1,
 ):
     """Read BF16 key tiles directly from the carrier, without a cache conversion.
+
+    ``max_query_len`` routes as in ``qsa_attention``: steps with at most that
+    many tokens per request row use the per-token decode indexer.
 
     ``slot`` selects this layer's kernel pages in a packed page, as in
     ``write_compressed``.
@@ -711,7 +715,7 @@ def select_blocks(
             components=qsa_indexing(),
         )
 
-    if len(query) > len(context):
+    if len(query) > len(context) * max_query_len:
         # Present prefill as its native ragged request batch. The previous path
         # treated every query as a one-token decode sequence, so every row
         # reloaded the same KV history and ran an M=1 score matmul. BQ128 reuses
@@ -792,6 +796,7 @@ def pooled_qsa_step(
     v_scale: float = 1.0,
     compressed_slot: int = 0,
     main_slot: int = -1,
+    max_query_len: int = 1,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """One QSA layer over the unified pool.
 
@@ -872,6 +877,7 @@ def pooled_qsa_step(
         ratio=compress_ratio,
         block_topk=token_topk // compress_ratio,
         slot=compressed_slot,
+        max_query_len=max_query_len,
     )
     output, pool = qsa_attention(
         q,
@@ -886,6 +892,7 @@ def pooled_qsa_step(
         k_scale=k_scale if fp8 else 1.0,
         v_scale=v_scale if fp8 else 1.0,
         **({"kv_head_offset": main_slot} if main_slot > 0 else {}),
+        max_query_len=max_query_len,
     )
     return (
         pool,

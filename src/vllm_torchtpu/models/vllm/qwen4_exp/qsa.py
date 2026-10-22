@@ -247,12 +247,16 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         cache_dtype: str = "auto",
         prefix: str = "",
         pooled: bool = False,
+        max_query_len: int = 1,
     ):
         super().__init__()
         if not 0 <= tp_rank < tp_size:
             raise ValueError("QSA requires an in-range TP rank")
         self.tp_rank, self.tp_size, self.prefix = tp_rank, tp_size, prefix
         self.pooled = pooled
+        # Tokens a decoding request carries per step (num_speculative_tokens
+        # + 1): the pooled op routes steps within it to the decode kernels.
+        self.max_query_len = max_query_len
         self.fp8_kv = cache_dtype in ("fp8", "fp8_e4m3")
         self.cache_dtype = cache_dtype
         self.config = config
@@ -371,6 +375,9 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         keywords = dict(self._op.keywords)
         keywords.pop("compressed_slot", None)
         keywords.pop("main_slot", None)
+        keywords.pop("max_query_len", None)
+        if self.max_query_len > 1:
+            keywords["max_query_len"] = self.max_query_len
         if slot:
             keywords["compressed_slot"] = slot
         if main_slot >= 0:

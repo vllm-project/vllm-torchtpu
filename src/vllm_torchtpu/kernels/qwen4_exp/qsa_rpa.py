@@ -250,8 +250,15 @@ def qsa_attention(
     k_scale=1.0,
     v_scale=1.0,
     kv_head_offset=0,
+    max_query_len=1,
 ):
     """Route a decode prefix to unchanged RPA and the remaining rows to prefill.
+
+    ``max_query_len`` is the most tokens a decoding request carries in one step
+    (``num_speculative_tokens + 1`` under MTP). A step with at most that many
+    tokens per request row is a decode/verify step and runs every token on RPA
+    as its own causal row; comparing tokens with request rows alone sent every
+    MTP verify step with more than ``rows / (K + 1)`` requests to prefill.
 
     ``kv_head_offset`` reads this layer's KV heads after that many other heads
     of each cache row (the second layer of a paired main KV page).
@@ -259,7 +266,7 @@ def qsa_attention(
     options = dict(kv_heads=kv_heads, ratio=ratio, k_scale=k_scale, v_scale=v_scale)
     if kv_head_offset:
         options["kv_head_offset"] = kv_head_offset
-    if len(query) <= len(starts) - 1:
+    if len(query) <= (len(starts) - 1) * max_query_len:
         return rpa_attention(query, gate, blocks, lengths, table, cache, **options)
 
     count = decode_prefix(starts)
