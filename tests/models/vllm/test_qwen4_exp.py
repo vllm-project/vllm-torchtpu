@@ -917,8 +917,11 @@ def test_ple_native_adapter_reuses_common_math_and_checkpoint(
         lambda: lambda raw, scale: raw.view(torch.bfloat16),
     )
 
-    def conv_bridge(dilation):
-        def run(x, weight, history, starts, slots, initial):
+    def conv_bridge(dilation, state_len):
+        def run(x, weight, pool, starts, slots, initial):
+            history = pool.reshape(pool.shape[0], -1)[
+                :, : state_len * x.shape[-1]
+            ].view(pool.shape[0], state_len, x.shape[-1])
             request, chunk = token_requests(starts, x.shape[0])
             windows = torch.where(
                 initial[:, None, None], history[slots.clamp_min(0)], 0
@@ -933,7 +936,7 @@ def test_ple_native_adapter_reuses_common_math_and_checkpoint(
 
         return run
 
-    monkeypatch.setattr(pooled_ple, "build_short_conv_op", conv_bridge)
+    monkeypatch.setattr(pooled_ple, "build_pooled_short_conv_op", conv_bridge)
     shared = (
         ple_storage.SharedPLEOptions(tmp_path, "layer", {"checkpoint": "fixture"}, 1)
         if storage == "shared"
@@ -988,7 +991,12 @@ def test_ple_native_adapter_reuses_common_math_and_checkpoint(
         4, reference.conv_state_len, HC * HIDDEN, dtype=torch.bfloat16
     )
     history[1].fill_(4)  # A reused slot must ignore stale history on first prefill.
-    adapted.bind_history(history)
+    pool = torch.zeros((4, 128, 1, 2, 128), dtype=torch.bfloat16)
+    flat = pool.reshape(4, -1)
+    flat[:, : history[0].numel()] = history.reshape(4, -1)
+    history = flat[:, : history[0].numel()].view_as(history)
+    untouched = flat[:, history[0].numel() :].clone()
+    adapted.bind_pool(pool)
     contexts = torch.full((3, 2), _PLE["eos_token_id"], dtype=torch.int64)
     expected_history = history.clone()
     generator = torch.Generator(device="cpu").manual_seed(314)
@@ -1020,8 +1028,71 @@ def test_ple_native_adapter_reuses_common_math_and_checkpoint(
                 if slot > 0:
                     expected_history[slot] = next_windows[i]
             torch.testing.assert_close(history, expected_history, rtol=0, atol=0)
+            torch.testing.assert_close(
+                flat[:, history[0].numel() :], untouched, rtol=0, atol=0
+            )
     if isinstance(adapted.storage, ple_storage.HostPLETable):
         adapted.storage.close()
+
+
+def test_decoder_consumes_typed_shared_options(monkeypatch, tmp_path):
+    from vllm.utils.torch_utils import set_default_torch_dtype
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import model as qwen4_model
+    from vllm_torchtpu.models.vllm.qwen4_exp import ple_host
+    from vllm_torchtpu.models.vllm.qwen4_exp.ple_storage import HostPLETable
+
+    _set_tp(monkeypatch, 0, 1)
+    group = SimpleNamespace(rank_in_group=0, world_size=1)
+    for name in ("get_tp_group", "get_dp_group"):
+        monkeypatch.setattr(qwen4_model, name, lambda: group)
+    monkeypatch.setattr(
+        qwen4_model, "Qwen4ExpGatedDeltaNetAttention", lambda *a, **kw: nn.Identity()
+    )
+    monkeypatch.setattr(
+        qwen4_model, "Qwen3NextSparseMoeBlock", lambda **kw: nn.Identity()
+    )
+    monkeypatch.setattr(qwen4_model, "GatedResidual", lambda *a, **kw: nn.Identity())
+    monkeypatch.setattr(ple_host.tempfile, "gettempdir", lambda: str(tmp_path))
+    options = []
+
+    def shared(*args):
+        result = ple_host.shared_ple_options(*args)
+        options.append(result)
+        return result
+
+    monkeypatch.setattr(qwen4_model, "shared_ple_options", shared)
+    cfg = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=_text_config(**dict(_PLE, ple_layer_ids=[1])),
+            _qwen4_exp_ple_host_launch=dict(instance="typed-fixture", participants=1),
+        ),
+        quant_config=None,
+        compilation_config=SimpleNamespace(static_forward_context={}),
+        additional_config={
+            "qwen4_exp": {
+                "engram_config": dict(
+                    cpu_offload=True,
+                    dp_shared_memory=True,
+                )
+            }
+        },
+    )
+    with set_default_torch_dtype(torch.bfloat16):
+        layer = qwen4_model.Qwen4ExpDecoderLayer(cfg, 0, "model.layers.0")
+    try:
+        table = layer.ple.storage
+        assert isinstance(table, HostPLETable)
+        assert isinstance(options[0], ple_host.SharedPLEOptions)
+        assert table._shared_options is options[0]
+        assert options[0].participants == 1
+        assert options[0].key == "typed-fixture/model.layers.0.ple/tp0"
+        assert (
+            cfg.compilation_config.static_forward_context["model.layers.0.ple"]
+            is layer.ple
+        )
+    finally:
+        layer.ple.storage.close()
 
 
 @pytest.mark.parametrize("host", [False, True], ids=["resident", "host"])
