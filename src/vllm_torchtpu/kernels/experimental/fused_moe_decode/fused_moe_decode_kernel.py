@@ -31,7 +31,9 @@ per block in blocked mode). Both matmuls are FP8 x FP8; each 512-column block's
 partial is scaled and summed in FP32, into an FP32 VMEM accumulator.
 Router top-k stays with the caller.
 
-Derived from moe_dense_expert.py, which targets i % 512 == 0 (EP layouts).
+Derived from moe_dense_expert.py, which admits 128-aligned intermediate widths
+at least the hardware MXU column width, including TP slices, when native FP8
+support and the remaining admission requirements hold.
 """
 
 import functools

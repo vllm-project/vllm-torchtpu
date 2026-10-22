@@ -14,10 +14,10 @@ pytestmark = pytest.mark.tpu_test
 
 
 @pytest.fixture(scope="module")
-def tensors():
+def tensors(request):
     if jax.default_backend() != "tpu":
         pytest.skip("requires TPU")
-    m, h, i, e = 16, 512, 512, 4
+    m, h, i, e = 16, 512, getattr(request, "param", 512), 4
     rng = np.random.default_rng(27)
     x = jnp.asarray(rng.normal(size=(m, h)), jnp.bfloat16)
     w1 = jnp.asarray(rng.integers(-8, 9, size=(e, h, 2 * i)), jnp.float8_e4m3fn)
@@ -27,16 +27,23 @@ def tensors():
     return x, w1, w2, s1, s2
 
 
-@pytest.mark.parametrize(
-    "case", ["mixed", "single", "three", "empty", "zero", "duplicate"]
-)
-@pytest.mark.parametrize("num_buffers", [1, 2, 3])
-def test_same_entrypoint_and_ep_mask(tensors, monkeypatch, case, num_buffers):
+def _check_entrypoint_and_ep_mask(tensors, monkeypatch, case, num_buffers=None):
     # Exercise each DMA schedule, including wraparound and short pipelines,
     # without requiring a different physical TPU for every capacity.
-    monkeypatch.setattr(kernel, "_select_expert_buffers", lambda *args: num_buffers)
-    kernel.dense_expert_moe.clear_cache()
     x, w1, w2, s1, s2 = tensors
+    info = kernel.pltpu.get_tpu_info()
+    if (
+        info.fp8_ops_per_second == 0
+        or min(x.shape[1], w2.shape[1]) < info.mxu_column_size
+    ):
+        pytest.skip("requires the native FP8 activation regime")
+    if num_buffers is None:
+        num_buffers = kernel._select_expert_buffers(
+            *x.shape, w2.shape[1], len(w2), info.vmem_capacity_bytes
+        )
+    else:
+        monkeypatch.setattr(kernel, "_select_expert_buffers", lambda *args: num_buffers)
+    kernel.dense_expert_moe.clear_cache()
     ids = np.tile(np.array([[64, 65, 63, 68]], np.int32), (16, 1))
     ids[8:, :2] = [66, 67]
     weights = np.tile(np.array([[0.125, 0.25, 0.375, 0.25]], np.float32), (16, 1))
@@ -89,6 +96,18 @@ def test_same_entrypoint_and_ep_mask(tensors, monkeypatch, case, num_buffers):
         kernel.dense_expert_moe.clear_cache()
 
 
+@pytest.mark.parametrize("tensors", [512, 640], indirect=True)
+@pytest.mark.parametrize("case", ["mixed", "single", "three", "duplicate"])
+@pytest.mark.parametrize("num_buffers", [1, 2, 3])
+def test_same_entrypoint_and_ep_mask(tensors, monkeypatch, case, num_buffers):
+    _check_entrypoint_and_ep_mask(tensors, monkeypatch, case, num_buffers)
+
+
+@pytest.mark.parametrize("case", ["empty", "zero"])
+def test_no_local_work_returns_zero(tensors, monkeypatch, case):
+    _check_entrypoint_and_ep_mask(tensors, monkeypatch, case)
+
+
 @pytest.mark.parametrize(
     "unsupported", ["unaligned_tokens", "bias", "activation", "scale", "bf16_weights"]
 )
@@ -98,7 +117,7 @@ def test_unsupported_inputs_keep_standard_path(tensors, monkeypatch, unsupported
     if unsupported == "unaligned_tokens":
         x = x[:15]
     elif unsupported == "bias":
-        b1 = jnp.zeros((4, 1, 1024), jnp.float32)
+        b1 = jnp.zeros((w1.shape[0], 1, w1.shape[2]), jnp.float32)
     elif unsupported == "activation":
         activation = "gelu"
     elif unsupported == "scale":
@@ -149,7 +168,9 @@ def test_unaligned_entrypoint_falls_back(tensors, monkeypatch):
 
 
 @pytest.mark.parametrize("m", [1024, 1040])
-def test_qwen_threshold_boundary_matches_gmm(tensors, monkeypatch, m):
+def test_qwen_threshold_boundary_matches_gmm(monkeypatch, m):
+    if jax.default_backend() != "tpu":
+        pytest.skip("requires TPU")
     # Qwen's real H/I also checks that the largest enabled bucket compiles.
     rng = np.random.default_rng(20260922)
     h, i, e = 4096, 1024, 4
@@ -170,13 +191,106 @@ def test_qwen_threshold_boundary_matches_gmm(tensors, monkeypatch, m):
     try:
         actual = np.asarray(wrapper.fused_moe_func(*args, **kwargs), dtype=np.float32)
         hlo = wrapper.fused_moe_func.lower(*args, **kwargs).as_text()
-        assert ("dense_expert_moe-e_" in hlo) == (m <= 1024)
+        admitted = kernel.can_use_dense_expert(
+            x,
+            w1,
+            w2,
+            s1,
+            s2,
+            None,
+            None,
+            activation="silu",
+            rhs_quant_dtype=None,
+            skip_padded_tokens=False,
+        )
+        assert ("dense_expert_moe-e_" in hlo) == (m <= 1024 and admitted)
         assert np.isfinite(actual).all()
-        if m > 1024:
+        if m > 1024 or not admitted:
             np.testing.assert_array_equal(actual, expected)
         else:
             relative_l2 = np.linalg.norm(actual - expected) / np.linalg.norm(expected)
             assert relative_l2 < 0.008, relative_l2
+    finally:
+        wrapper.fused_moe_func.clear_cache()
+        kernel.dense_expert_moe.clear_cache()
+
+
+@pytest.mark.parametrize("tensors", [128, 256, 640], indirect=True)
+def test_width_admission_and_default_budget_match_gmm(
+    tensors, monkeypatch, record_property
+):
+    x, w1, w2, s1, s2 = tensors
+    ids = jnp.asarray(np.tile([0, 1, 2, 3], (len(x), 1)), jnp.int32)
+    weights = jnp.full(ids.shape, 0.25, jnp.bfloat16)
+    args = (x, w1, w2, s1, s2, None, None, weights, ids)
+    options = dict(topk=4, use_sparse_core=False)
+    admitted = kernel.can_use_dense_expert(
+        x,
+        w1,
+        w2,
+        s1,
+        s2,
+        None,
+        None,
+        activation="silu",
+        rhs_quant_dtype=None,
+        skip_padded_tokens=False,
+    )
+    monkeypatch.setattr(wrapper, "_DENSE_EXPERT_THRESHOLD", 0)
+    wrapper.fused_moe_func.clear_cache()
+    expected = np.asarray(wrapper.fused_moe_func(*args, **options), dtype=np.float32)
+    monkeypatch.setattr(wrapper, "_DENSE_EXPERT_THRESHOLD", 1024)
+    wrapper.fused_moe_func.clear_cache()
+    try:
+        actual = np.asarray(wrapper.fused_moe_func(*args, **options), dtype=np.float32)
+        hlo = wrapper.fused_moe_func.lower(*args, **options).as_text()
+        assert ("dense_expert_moe-e_" in hlo) == admitted
+        assert np.isfinite(actual).all()
+        record_property("dense_admitted", admitted)
+        if admitted:
+            buffers = kernel._select_expert_buffers(
+                *x.shape,
+                w2.shape[1],
+                len(w2),
+                kernel.pltpu.get_tpu_info().vmem_capacity_bytes,
+            )
+            assert f"buffers_{buffers}" in hlo
+            error = np.linalg.norm(actual - expected) / np.linalg.norm(expected)
+            record_property("relative_l2", float(error))
+            record_property("default_buffers", buffers)
+            assert error < 0.008, error
+        else:
+            np.testing.assert_array_equal(actual, expected)
+            record_property("fallback_bit_exact", True)
+    finally:
+        wrapper.fused_moe_func.clear_cache()
+        kernel.dense_expert_moe.clear_cache()
+
+
+def test_nonfinite_expert_does_not_contaminate_unrouted_tokens(tensors, monkeypatch):
+    x, w1, w2, s1, s2 = tensors
+    if kernel.pltpu.get_tpu_info().fp8_ops_per_second == 0:
+        pytest.skip("requires native FP8 matmul")
+    w1 = w1.at[3].set(jnp.nan)
+    ids = jnp.where(jnp.arange(len(x))[:, None] < 8, 0, 3).astype(jnp.int32)
+    weights = jnp.ones(ids.shape, jnp.bfloat16)
+    args = (x, w1, w2, s1, s2, None, None, weights, ids)
+    options = dict(topk=1, use_sparse_core=False)
+    monkeypatch.setattr(wrapper, "_DENSE_EXPERT_THRESHOLD", 0)
+    wrapper.fused_moe_func.clear_cache()
+    expected = np.asarray(wrapper.fused_moe_func(*args, **options), dtype=np.float32)
+    monkeypatch.setattr(wrapper, "_DENSE_EXPERT_THRESHOLD", 1024)
+    wrapper.fused_moe_func.clear_cache()
+    try:
+        actual = np.asarray(wrapper.fused_moe_func(*args, **options), dtype=np.float32)
+        assert (
+            "dense_expert_moe-e_"
+            in wrapper.fused_moe_func.lower(*args, **options).as_text()
+        )
+        assert np.isfinite(actual[:8]).all()
+        assert np.isnan(actual[8:]).all()
+        error = np.linalg.norm(actual[:8] - expected[:8]) / np.linalg.norm(expected[:8])
+        assert error < 0.008, error
     finally:
         wrapper.fused_moe_func.clear_cache()
         kernel.dense_expert_moe.clear_cache()

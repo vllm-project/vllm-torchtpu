@@ -30,7 +30,7 @@ def _select_expert_buffers(m, h, i, experts, vmem_capacity_bytes):
     # Hidden input/output, quantized hidden, and FP32 output accumulator.
     fixed_bytes = m * h * (2 + 2 + 1 + 4)
     # BF16 activation, FP8 activation, and the two BF16 quantization scales.
-    fixed_bytes += m * i * (2 + 1) + (h // 512 + i // 512) * m * 128 * 2
+    fixed_bytes += m * i * (2 + 1) + (h // 512 + pl.cdiv(i, 512)) * m * 128 * 2
     fixed_bytes += m * pl.cdiv(experts, 128) * 128 * 4
     budget = vmem_capacity_bytes * 4 // 5
     return max(1, min(_MAX_EXPERT_BUFFERS, (budget - fixed_bytes) // expert_bytes))
@@ -57,7 +57,7 @@ def can_use_dense_expert(
     e, i, out = w2.shape
     if min(m, h, i, e) <= 0:
         return False
-    if m % 16 or h % 512 or i % 512:
+    if m % 16 or h % 512 or i % 128:
         return False
     if out != h or w1.shape != (e, h, 2 * i):
         return False
@@ -67,16 +67,21 @@ def can_use_dense_expert(
         or w2.dtype != jnp.float8_e4m3fn
     ):
         return False
-    return (
+    if not (
         s1.shape == (e, 1, 1, 2 * i)
         and s2.shape == (e, 1, 1, h)
         and s1.dtype == jnp.float32
         and s2.dtype == jnp.float32
-    )
+    ):
+        return False
+    # Per-channel GMM quantizes activations only with native FP8 support and
+    # a scale block at least one MXU column wide, for both contracting axes.
+    tpu_info = pltpu.get_tpu_info()
+    return tpu_info.fp8_ops_per_second > 0 and min(h, i) >= tpu_info.mxu_column_size
 
 
 def _quantize(x, q_ref, scale_ref):
-    """Same BF16 scale/inverse and 512-wide FP8 quantization as gmm_v2."""
+    """Quantize activations to FP8 in up-to-512-wide blocks with BF16 scales."""
     # Keep K blocks first so each scale read is a contiguous [tokens, 128]
     # plane; placing K between tokens and lanes causes expensive relayouts.
     for k in range(0, x.shape[1], 512):
@@ -273,7 +278,7 @@ def dense_expert_moe(hidden, w1, w2, s1, s2, topk_weights, local_ids):
                 pltpu.VMEM((h // 512, m, 128), jnp.bfloat16),
                 pltpu.VMEM((m, i), jnp.bfloat16),
                 pltpu.VMEM((m, i), jnp.float8_e4m3fn),
-                pltpu.VMEM((i // 512, m, 128), jnp.bfloat16),
+                pltpu.VMEM((pl.cdiv(i, 512), m, 128), jnp.bfloat16),
                 pltpu.VMEM((m, h), jnp.float32),
                 pltpu.SMEM((experts,), jnp.int32),
                 pltpu.SemaphoreType.DMA((num_buffers, 4)),
