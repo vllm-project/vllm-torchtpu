@@ -20,7 +20,7 @@ from vllm.v1.kv_cache_interface import (
 
 from vllm_torchtpu.gdn_pool_layout import derive_pooled_gdn_state_layout
 
-from .config import native_cache_specs
+from .config import mtp_layer_prefixes, native_cache_specs
 from .qsa import QSA_BLOCK_SIZE
 
 # Explicit physical format shared by this model's page planner and GDN ops.
@@ -36,6 +36,19 @@ def pack_compressed_k_enabled() -> bool:
     ``pooled_cache_specs``.
     """
     value = os.environ.get(PACK_COMPRESSED_K_ENV, "0").strip().lower()
+    return value in ("1", "true", "yes", "on")
+
+
+PACK_MAIN_KV_ENV = "QWEN4_EXP_PACK_MAIN_KV"
+
+
+def pack_main_kv_enabled() -> bool:
+    """Whether two QSA layers' main KV heads share one pool page.
+
+    Off by default. ``QWEN4_EXP_PACK_MAIN_KV=1`` pairs; see
+    ``pooled_cache_specs``.
+    """
+    value = os.environ.get(PACK_MAIN_KV_ENV, "0").strip().lower()
     return value in ("1", "true", "yes", "on")
 
 
@@ -55,6 +68,9 @@ class Qwen4ExpPoolLayout:
     # (QSA attention prefix, compressed-key cache owner name, page slot);
     # empty when unpacked, where every layer owns ``<prefix>.compressed_k``.
     compressed_owners: tuple[tuple[str, str, int], ...] = field(default=())
+    # (QSA attention prefix, main KV cache owner name, head-pair slot) of
+    # layers sharing main KV pages; empty when every layer owns its pages.
+    main_owners: tuple[tuple[str, str, int], ...] = field(default=())
 
     def compressed_owner(self, attention_prefix: str) -> tuple[str, int]:
         """Cache owner name and in-page slot of a QSA layer's compressed keys."""
@@ -62,6 +78,16 @@ class Qwen4ExpPoolLayout:
             if prefix == attention_prefix:
                 return owner, slot
         return attention_prefix + ".compressed_k", 0
+
+    def main_owner(self, attention_prefix: str) -> tuple[str, int]:
+        """Cache owner name and head-pair slot of a QSA layer's main KV.
+
+        Slot -1: the layer owns whole rows of its own pages.
+        """
+        for prefix, owner, slot in self.main_owners:
+            if prefix == attention_prefix:
+                return owner, slot
+        return attention_prefix, -1
 
     @property
     def main_kernel_pages(self):
@@ -87,6 +113,13 @@ def pooled_cache_specs(cfg):
     ``[s * main_kernel_pages, (s + 1) * main_kernel_pages)``. Each member
     still covers exactly the group's token interval, so prefix alignment,
     hashing and eviction are unchanged; only the page count per token drops.
+
+    ``QWEN4_EXP_PACK_MAIN_KV=1`` likewise pairs main KV pages. With one FP8
+    KV head per device a token row has four head slots, K and V fill two.
+    Consecutive target QSA layers pair up: the group is named after the
+    first, member ``s`` stores K and V at head slots ``2s`` and ``2s + 1``.
+    MTP draft layers keep pages of their own (the proposer addresses its
+    layer's group by name), as does an odd last target layer.
     """
     specs = native_cache_specs(cfg)
     text = cfg.model_config.hf_text_config
@@ -137,6 +170,26 @@ def pooled_cache_specs(cfg):
             )
     else:
         packed_slots = 1
+    main_owners: list[tuple[str, str, int]] = []
+    if pack_main_kv_enabled():
+        packing = 4 if main.dtype == torch.float8_e4m3fn else 2
+        if main.num_kv_heads != 1 or packing * main.num_head_slots != 4:
+            raise ValueError(
+                f"{PACK_MAIN_KV_ENV}=1 pairs layers in the two padding head "
+                "slots of an FP8 main KV row, which needs one KV head per "
+                f"device and --kv-cache-dtype fp8; got {main.num_kv_heads} "
+                f"heads of {main.dtype}"
+            )
+        draft = {prefix + ".self_attn" for prefix in mtp_layer_prefixes(cfg)}
+        targets = [
+            name for name in specs if name.endswith(".self_attn") and name not in draft
+        ]
+        for start in range(0, len(targets) - 1, 2):
+            owner = targets[start]
+            main_owners.extend(
+                (name, owner, slot)
+                for slot, name in enumerate(targets[start : start + 2])
+            )
     layout = Qwen4ExpPoolLayout(
         block_size=block_size,
         page_bytes=page_bytes,
@@ -149,11 +202,13 @@ def pooled_cache_specs(cfg):
         compressed_width=compressed_width,
         compressed_slots=packed_slots,
         compressed_owners=tuple(owners),
+        main_owners=tuple(main_owners),
     )
     # Members other than their group's owner get no scheduler group.
     packed_away = {prefix + ".compressed_k" for prefix, owner, _ in owners} - {
         owner for _, owner, _ in owners
     }
+    packed_away |= {name for name, owner, _ in main_owners if name != owner}
     pooled: dict[str, KVCacheSpec] = {}
     # Upstream uses one persistent Mamba state block per request without APC.
     # Its logical span is max_model_len, while the physical state still fits
@@ -194,16 +249,23 @@ def pooled_cache_specs(cfg):
 
 
 def check_packed_compressed_groups(layout: Qwen4ExpPoolLayout, groups) -> None:
-    """Each packed compressed-key owner needs a block table of its own.
+    """Each packed compressed-key or main KV owner needs a block table of its own.
 
     Members address slots of their owner's pages, so two owners sharing one
     group (one block ID per token span) would overwrite each other's slots.
     """
-    owners = {owner for _, owner, _ in layout.compressed_owners}
-    for group in groups:
-        names = set(group.layer_names)
-        if names & owners and len(names) != 1:
-            raise ValueError(
-                "Qwen4Exp packed compressed keys need one scheduler group per "
-                f"owner, got {sorted(names)}; unset QWEN4_EXP_PACK_COMPRESSED_K"
-            )
+    for kind, owners, env in (
+        (
+            "compressed keys",
+            {owner for _, owner, _ in layout.compressed_owners},
+            PACK_COMPRESSED_K_ENV,
+        ),
+        ("main KV", {owner for _, owner, _ in layout.main_owners}, PACK_MAIN_KV_ENV),
+    ):
+        for group in groups:
+            names = set(group.layer_names)
+            if names & owners and len(names) != 1:
+                raise ValueError(
+                    f"Qwen4Exp packed {kind} need one scheduler group per "
+                    f"owner, got {sorted(names)}; unset {env}"
+                )

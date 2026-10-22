@@ -332,6 +332,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             set_default_quant_scales(self, register_buffer=True)
         self.cache_owners: tuple[torch.Tensor, ...] = ()
         self.compressed_cache_name = prefix + ".compressed_k"
+        self.main_cache_name = prefix
         self._loaded = set()
         self._op = partial(
             build_qsa_op(),
@@ -344,23 +345,36 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
     def get_attn_backend(self):
         return Qwen4ExpPooledQSABackend if self.pooled else Qwen4ExpQSABackend
 
-    def bind_pool(self, pool, compressed_owner: tuple[str, int] | None = None):
+    def bind_pool(
+        self,
+        pool,
+        compressed_owner: tuple[str, int] | None = None,
+        main_owner: tuple[str, int] | None = None,
+    ):
         """Bind the unified pool.
 
         ``compressed_owner`` names the cache group whose block table addresses
         this layer's compressed keys and the layer's slot in that group's
         pages (``Qwen4ExpPoolLayout.compressed_owner``); by default the layer
-        owns ``<prefix>.compressed_k`` alone.
+        owns ``<prefix>.compressed_k`` alone. ``main_owner`` likewise names
+        the group of paired main KV pages and the layer's head-pair slot
+        (``Qwen4ExpPoolLayout.main_owner``); by default the layer owns whole
+        rows of ``<prefix>`` pages.
         """
         from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import build_pooled_qsa_op
 
         name, slot = compressed_owner or (self.prefix + ".compressed_k", 0)
+        main_name, main_slot = main_owner or (self.prefix, -1)
         self.cache_owners = (pool,)
         self.compressed_cache_name = name
+        self.main_cache_name = main_name
         keywords = dict(self._op.keywords)
         keywords.pop("compressed_slot", None)
+        keywords.pop("main_slot", None)
         if slot:
             keywords["compressed_slot"] = slot
+        if main_slot >= 0:
+            keywords["main_slot"] = main_slot
         self._op = partial(build_pooled_qsa_op(), **keywords)
 
     def get_kv_cache_spec(self, vllm_config):
@@ -503,7 +517,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
                     torch.Tensor, per_layer[self.prefix + ".raw_ring"].block_tables
                 ),
                 main_block_table=cast(
-                    torch.Tensor, per_layer[self.prefix].block_tables
+                    torch.Tensor, per_layer[self.main_cache_name].block_tables
                 ),
                 compressed_block_table=cast(
                     torch.Tensor, per_layer[self.compressed_cache_name].block_tables

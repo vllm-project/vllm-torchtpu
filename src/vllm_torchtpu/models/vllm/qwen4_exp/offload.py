@@ -2,9 +2,10 @@
 """Host-DRAM prefix-cache offload geometry for the Qwen4Exp unified pool.
 
 The unified pool is one raw tensor of ``num_blocks`` uniform pages. Every
-cache group -- QSA main KV (FP8 head-packed), compressed keys (BF16, one
-layer per page or several packed), the raw rings, and the GDN/PLE align
-checkpoints -- owns whole pages of it, addressed by scheduler block ID. A
+cache group -- QSA main KV (FP8 head-packed, one layer or a layer pair per
+page), compressed keys (BF16, one layer per page or several packed), the
+raw rings, and the GDN/PLE align checkpoints -- owns whole pages of it,
+addressed by scheduler block ID. A
 (group, block) offload key therefore names exactly one page, and moving that
 page as opaque bytes restores the group's data bit for bit, whatever its
 dtype or logical shape: there is no per-group geometry to agree on.

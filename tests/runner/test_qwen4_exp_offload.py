@@ -39,6 +39,7 @@ NUM_BLOCKS = 24
 def pooled(monkeypatch):
     monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "1")
     monkeypatch.delenv("QWEN4_EXP_PACK_COMPRESSED_K", raising=False)
+    monkeypatch.delenv("QWEN4_EXP_PACK_MAIN_KV", raising=False)
 
 
 def offload_transfer(**extra):
@@ -153,10 +154,12 @@ def test_pd_still_rejects_mtp_and_other_connectors():
 # -- pool geometry --------------------------------------------------------------
 
 
-def qwen_pool(monkeypatch, packed=False, num_blocks=NUM_BLOCKS):
+def qwen_pool(monkeypatch, packed=False, num_blocks=NUM_BLOCKS, paired=False):
     """Native (worker) and scheduler KV cache configs of the TP8 MTP pool."""
     if packed:
         monkeypatch.setenv("QWEN4_EXP_PACK_COMPRESSED_K", "1")
+    if paired:
+        monkeypatch.setenv("QWEN4_EXP_PACK_MAIN_KV", "1")
     # FP32 SSM state (the checkpoint default) gives the 512-token page.
     cfg = pool_config(tp=8, kv="fp8_e4m3", ssm="float32")
     cfg.model_config.hf_text_config.mtp_num_hidden_layers = 1
@@ -187,6 +190,25 @@ def test_pool_rows_are_whole_carrier_pages(monkeypatch, packed):
     # The offload spec resolves the same rows through the model hook.
     vllm_config = NS(model_config=NS(architecture=ARCH))
     assert raiden_store.resolve_kernel_geometry(vllm_config, native) == geometry
+
+
+def test_paired_main_kv_pool_rows_are_whole_carrier_pages(monkeypatch):
+    """Paired main KV pages move whole, both layers' head slots included."""
+    _, layout, native, _ = qwen_pool(monkeypatch, packed=True, paired=True)
+    assert len(layout.main_owners) == 12
+    main = [
+        g.layer_names
+        for g in native.kv_cache_groups
+        if g.layer_names[0].endswith(".self_attn")
+    ]
+    # Six target pairs and the MTP draft's own pages.
+    assert len(main) == 7 and [layout.main_owners[0][1]] in main
+    assert offload_pool_geometry(None, native) == (
+        layout.block_size,
+        (layout.block_size, 1, 4, 256),
+        torch.float8_e4m3fn,
+        layout.block_size,
+    )
 
 
 def test_pool_geometry_rejects_mixed_pages(monkeypatch):

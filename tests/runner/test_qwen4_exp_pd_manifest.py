@@ -130,3 +130,18 @@ def test_packed_compressed_keys_transfer_whole_owner_pages(monkeypatch, tp):
     for pool in manifest.pools:
         if pool.layer_name in owners:
             assert pool.regions[0].extent_end_bytes == pool.block_stride_bytes
+
+
+def test_paired_main_kv_transfers_whole_owner_pages(monkeypatch):
+    """Paired layers ride their owner group's whole pages; nothing is lost."""
+    monkeypatch.setenv("QWEN4_EXP_PACK_COMPRESSED_K", "0")
+    monkeypatch.setenv("QWEN4_EXP_PACK_MAIN_KV", "1")
+    config, materialized = live_pool(8)
+    manifest = build_transfer_manifest(config, materialized)
+    names = {p.layer_name for p in manifest.pools}
+    main = sorted(n for n in names if n.endswith(".self_attn"))
+    compressed = sorted(n for n in names if n.endswith(".compressed_k"))
+    assert len(main) * 2 == len(compressed)
+    assert names == set(materialized.kv_caches)
+    for pool in manifest.pools:
+        assert pool.regions[0].extent_end_bytes == pool.block_stride_bytes

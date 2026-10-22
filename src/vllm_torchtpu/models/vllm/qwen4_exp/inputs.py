@@ -133,6 +133,17 @@ class Qwen4ExpAdapter:
             return attention + ".compressed_k"
         return layout.compressed_owner(attention)[0]
 
+    def _main_owner(self, attention: str) -> str:
+        """Cache group name addressing a QSA layer's main KV.
+
+        Paired pools (``QWEN4_EXP_PACK_MAIN_KV``) store a layer's main KV in
+        the group of the first layer of its pair.
+        """
+        layout = getattr(self.cache, "layout", None) if self.pooled else None
+        if layout is None:
+            return attention
+        return layout.main_owner(attention)[0]
+
     def get_kv_cache_spec(self):
         assert self.cache is not None
         return self.cache.get_specs()
@@ -249,7 +260,7 @@ class Qwen4ExpAdapter:
             )
         tables = []
         attention = f"{self.attention_prefix}.self_attn"
-        for name in (attention, self._compressed_owner(attention)):
+        for name in (self._main_owner(attention), self._compressed_owner(attention)):
             # Metadata uses the genuine native group table, never state slots.
             table = snapshot.attention_metadata[name].block_tables.reshape(rows, -1)
             tables.append(table)

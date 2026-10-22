@@ -425,3 +425,147 @@ def test_qsa_bind_pool_threads_owner_table_and_static_slot():
     attention.bind_pool(pool)
     assert attention.compressed_cache_name == "model.layers.7.self_attn.compressed_k"
     assert attention._op.keywords == dict(compress_ratio=4)
+
+
+def paired_config(monkeypatch, *, compressed=False, tp=8, kv="fp8_e4m3"):
+    cfg = packed_config(monkeypatch, compressed, tp=tp)
+    cfg.cache_config.cache_dtype = kv
+    monkeypatch.setenv("QWEN4_EXP_PACK_MAIN_KV", "1")
+    return cfg
+
+
+@pytest.mark.parametrize("compressed", [False, True])
+def test_paired_main_kv_pairs_target_layers_and_keeps_mtp_pages(
+    monkeypatch, compressed
+):
+    from vllm.v1.kv_cache_interface import FullAttentionSpec
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import (
+        check_packed_compressed_groups,
+    )
+
+    monkeypatch.setenv("QWEN4_EXP_PACK_MAIN_KV", "0")
+    unpaired_layout, unpaired = pooled_cache_specs(
+        packed_config(monkeypatch, compressed)
+    )
+    cfg = paired_config(monkeypatch, compressed=compressed)
+    layout, specs = pooled_cache_specs(cfg)
+    attention = [n for n in unpaired if n.endswith(".self_attn")]
+    targets = [n for n in attention if n.startswith("model.layers.")]
+    assert attention == targets + ["mtp.layers.48.self_attn"]
+    assert len(targets) % 2 == 0
+    assert unpaired_layout.main_owners == ()
+    # Consecutive target layers pair up; the draft keeps whole rows.
+    for index, name in enumerate(targets):
+        assert layout.main_owner(name) == (targets[index // 2 * 2], index % 2)
+    assert layout.main_owner(attention[-1]) == (attention[-1], -1)
+    assert unpaired_layout.main_owner(targets[1]) == (targets[1], -1)
+    owners = [n for n in specs if n.endswith(".self_attn")]
+    assert owners == targets[::2] + attention[-1:]
+    assert set(unpaired) - set(specs) == set(targets[1::2])
+    assert all(specs[n] == unpaired[n] for n in specs)
+    assert all(isinstance(specs[n], FullAttentionSpec) for n in owners)
+    assert replace(layout, main_owners=()) == unpaired_layout
+    cfg.cache_config.block_size = layout.block_size
+    cfg.cache_config.mamba_block_size = layout.block_size
+    groups = get_kv_cache_groups(cfg, specs)
+    check_packed_compressed_groups(layout, groups)
+    main_groups = [g for g in groups if g.layer_names[0].endswith(".self_attn")]
+    assert [g.layer_names for g in main_groups] == [[n] for n in owners]
+    with pytest.raises(ValueError, match="main KV need one scheduler group"):
+        check_packed_compressed_groups(
+            layout, [NS(layer_names=owners[:2])] + list(groups)
+        )
+
+
+def test_paired_main_kv_halves_token_pages_with_packed_compressed_keys(monkeypatch):
+    """TP8 + MTP: 13 main + 2 compressed pages per span become 7 + 2."""
+    monkeypatch.setenv("QWEN4_EXP_PACK_MAIN_KV", "0")
+    _, before = pooled_cache_specs(packed_config(monkeypatch, True))
+    _, after = pooled_cache_specs(paired_config(monkeypatch, compressed=True))
+
+    def token_pages(specs):
+        return sum(n.endswith((".self_attn", ".compressed_k")) for n in specs)
+
+    attention = sum(n.endswith(".self_attn") for n in before)
+    assert token_pages(before) - token_pages(after) == attention // 2
+
+
+@pytest.mark.parametrize("tp,kv", [(1, "fp8_e4m3"), (8, "bfloat16"), (8, "auto")])
+def test_paired_main_kv_needs_free_fp8_head_slots(monkeypatch, tp, kv):
+    with pytest.raises(ValueError, match="QWEN4_EXP_PACK_MAIN_KV=1"):
+        pooled_cache_specs(paired_config(monkeypatch, tp=tp, kv=kv))
+
+
+def test_unpaired_specs_are_unchanged_by_default(monkeypatch):
+    monkeypatch.delenv("QWEN4_EXP_PACK_MAIN_KV", raising=False)
+    default = pooled_cache_specs(pool_config(8))
+    monkeypatch.setenv("QWEN4_EXP_PACK_MAIN_KV", "0")
+    assert pooled_cache_specs(pool_config(8)) == default
+    assert default[0].main_owners == ()
+
+
+def test_paired_pool_binds_main_owner_only_for_paired_layers(monkeypatch):
+    from vllm_torchtpu.models.vllm.qwen4_exp.pooled_cache import Qwen4ExpPooledCache
+
+    monkeypatch.setenv("QWEN4_EXP_PACK_MAIN_KV", "0")
+    _, unpaired = pooled_cache_specs(packed_config(monkeypatch, True))
+    cfg = paired_config(monkeypatch, compressed=True)
+    layout, specs = pooled_cache_specs(cfg)
+    cache = object.__new__(Qwen4ExpPooledCache)
+    cache.layout = layout
+    carrier = object()
+    caches = {name: carrier for name in specs}
+    bound = {}
+
+    class Attention:
+        def __init__(self, name):
+            self.name = name
+
+        def bind_pool(self, pool, owner, **main):
+            assert pool is carrier
+            bound[self.name] = (owner, main)
+
+    attention = [n for n in unpaired if n.endswith(".self_attn")]
+    for name in attention:
+        cache._bind_qsa(Attention(name), name, caches)
+    for name in attention:
+        owner, main = bound[name]
+        assert owner == layout.compressed_owner(name)
+        paired = layout.main_owner(name)
+        assert main == ({} if paired[1] < 0 else {"main_owner": paired})
+    assert sum(bool(main) for _, main in bound.values()) == len(attention) - 1
+    with pytest.raises(KeyError):
+        caches.pop(attention[0])
+        cache._bind_qsa(Attention(attention[1]), attention[1], caches)
+
+
+def test_qsa_bind_pool_threads_main_owner_table_and_slot():
+    from functools import partial
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.qsa import Qwen4ExpQSA
+
+    attention = object.__new__(Qwen4ExpQSA)
+    torch.nn.Module.__init__(attention)
+    attention.prefix = "model.layers.7.self_attn"
+
+    def op(*args, **kwargs):
+        return kwargs
+
+    attention._op = partial(op, compress_ratio=4)
+    pool = torch.zeros(1)
+    attention.bind_pool(
+        pool,
+        ("model.layers.3.self_attn.compressed_k", 1),
+        main_owner=("model.layers.3.self_attn", 1),
+    )
+    assert attention.main_cache_name == "model.layers.3.self_attn"
+    assert attention._op.keywords == dict(
+        compress_ratio=4, compressed_slot=1, main_slot=1
+    )
+    # Rebinding without pairing restores the layer's own pages and program.
+    attention.bind_pool(pool)
+    assert attention.main_cache_name == attention.prefix
+    assert attention._op.keywords == dict(compress_ratio=4)
+    attention.bind_pool(pool, main_owner=("model.layers.7.self_attn", 0))
+    assert attention._op.keywords == dict(compress_ratio=4, main_slot=0)

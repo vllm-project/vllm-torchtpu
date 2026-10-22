@@ -282,11 +282,15 @@ class Qwen4ExpPooledCache:
 
     def _bind_qsa(self, attention, name, caches) -> None:
         owner = self.layout.compressed_owner(name)
-        main = caches[name]
+        main_owner = self.layout.main_owner(name)
+        main = caches[main_owner[0]]
         assert main is caches[owner[0]] is caches[name + ".raw_ring"], (
             "QSA cache groups must share one native carrier"
         )
-        attention.bind_pool(main, owner)
+        if main_owner[1] < 0:
+            attention.bind_pool(main, owner)
+        else:
+            attention.bind_pool(main, owner, main_owner=main_owner)
 
     def initialize(self, config) -> dict[str, LayerKVCache]:
         if self.hbm_sizing and not self.final:
