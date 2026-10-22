@@ -28,18 +28,23 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import HasInnerState, IsHybrid
+from vllm.model_executor.models.interfaces import (
+    HasInnerState,
+    IsHybrid,
+)
 from vllm.model_executor.models.qwen3_next import Qwen3NextSparseMoeBlock
 from vllm.model_executor.models.utils import AutoWeightsLoader, WeightsMapper
 from vllm.model_executor.parameter import BasevLLMParameter
 from vllm.v1.kv_cache_interface import MambaSpec
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
 from .config import gdn_cache_spec, require_unified_pool
 from .gdn import Qwen4ExpGatedDeltaNetAttention
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .parallel import PLEParallel
+from .pd_identity import LoadedWeightIdentity
 from .ple import PLEInputs
 from .ple_geometry import ple_state_shape
 from .ple_host import shared_ple_options
@@ -298,6 +303,10 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
     def __init__(self, *, vllm_config, prefix=""):
         super().__init__()
+        self._pd_weight_identity_enabled = vllm_config.kv_transfer_config is not None
+        self.pd_loaded_weight_identity: str | None = None
+        self.pd_loaded_ple_identity: str | None = None
+        self.pd_gdn_qk_pair_layout = envs.TPU_GDN_CONV_QK_PAIR_LAYOUT
         self.config = vllm_config.model_config.hf_text_config
         self.model = Qwen4ExpBackbone(vllm_config)
         self.lm_head = ParallelLMHead(
@@ -374,6 +383,11 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         return {kind: functions[kind] for kind in mamba_types}
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        self.pd_loaded_weight_identity = None
+        self.pd_loaded_ple_identity = None
+        identity = LoadedWeightIdentity() if self._pd_weight_identity_enabled else None
+        if identity is not None:
+            weights = identity.observe(weights)
         parameters = dict(self.named_parameters())
         loaded, source = set(), set()
         moe_mapper = WeightsMapper(
@@ -502,4 +516,7 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
         }
         if missing:
             raise ValueError(f"Incomplete Qwen4Exp checkpoint: {sorted(missing)}")
+        if identity is not None:
+            self.pd_loaded_weight_identity = identity.finish()
+            self.pd_loaded_ple_identity = identity.finish(name_fragment=".ple.")
         return set(dict(self.named_parameters()))

@@ -111,15 +111,17 @@ def test_pool_initialize_builds_mamba_plan_from_materialized_layers(monkeypatch,
         for g in groups
     ]
     cache.materialized = MaterializedKVCache(
-        kv_caches={},
+        kv_caches={"gdn": [raw], "gdn.alias": [raw], "ple": [raw]},
         raw_tensors=[raw],
         layer_to_raw={"gdn": raw, "gdn.alias": raw, "ple": raw},
     )
     cache.allocate = lambda: None
     monkeypatch.setattr(pooled_cache, "AttentionMetadataBuilder", lambda *a, **kw: None)
 
-    cache.initialize(config)
+    transfer_caches = cache.initialize(config)
 
+    assert transfer_caches is cache.materialized.kv_caches
+    assert all(tensors[0] is raw for tensors in transfer_caches.values())
     assert runner.bm_pool_layout is None
     assert runner.kv_cache_raw_tensors[0] is raw
     if mode == "align":
