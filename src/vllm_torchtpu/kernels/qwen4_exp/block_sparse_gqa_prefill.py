@@ -14,6 +14,31 @@ from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import PAIRED_PAGE_VMEM_MIB
 from vllm_torchtpu.kernels.qwen4_exp.rounding import bf16
 
 
+def _compact_active(active):
+    """Indices of true entries along the last axis, zero filled.
+
+    Equivalent to ``jnp.nonzero(row, size=row.shape[-1], fill_value=0)[0]``
+    per row. ``jnp.nonzero`` lowers to a scatter-add with heavily repeated
+    indices (a bincount of the running count), which XLA:TPU expands into a
+    TensorCore sort over every mask element. A prefix sum gives each true
+    entry its output slot directly; false entries target distinct
+    out-of-range slots, so the scatter has unique indices and needs no sort.
+    """
+    size = active.shape[-1]
+    lanes = jnp.arange(size, dtype=jnp.int32)
+    slots = jnp.cumsum(active, axis=-1, dtype=jnp.int32) - 1
+    slots = jnp.where(active, slots, size + lanes)
+    compact = jnp.zeros((*active.shape[:-1], size + size), jnp.int32)
+    if active.ndim == 1:
+        compact = compact.at[slots].set(lanes, unique_indices=True)
+    else:
+        rows = jnp.arange(active.shape[0], dtype=jnp.int32)[:, None]
+        compact = compact.at[rows, slots].set(
+            jnp.broadcast_to(lanes, active.shape), unique_indices=True
+        )
+    return compact[..., :size]
+
+
 def _kernel(
     table_ref,
     active_tiles_ref,
@@ -374,9 +399,7 @@ def block_sparse_gqa_prefill(
             block_bits.transpose(0, 2, 1),
             ((0, 0), (0, 0), (0, native_query_width - query_block)),
         )
-        active_tiles = jax.vmap(
-            lambda row: jnp.nonzero(row, size=num_kv_tiles, fill_value=0)[0]
-        )(active).astype(jnp.int32)
+        active_tiles = _compact_active(active)
         active_counts = jnp.sum(active, axis=1, dtype=jnp.int32)
         table = page_table.reshape(nblocks, query_block, -1)[:, 0]
 
@@ -624,9 +647,7 @@ def _prepare_metadata_bounded(
         else:
             active = jnp.any(bits[:, :num_kv_tiles] != 0, axis=0)
         native_bits = jnp.pad(bits.T, ((0, 0), (0, native_query_width - query_block)))
-        tiles = jnp.nonzero(active, size=num_kv_tiles, fill_value=0)[0].astype(
-            jnp.int32
-        )
+        tiles = _compact_active(active)
         count = jnp.sum(active, dtype=jnp.int32)
         return tiles, count, native_bits
 
