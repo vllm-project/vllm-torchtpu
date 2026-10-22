@@ -242,6 +242,14 @@ def _plan_steps(pcp, steps, block_table):
         plan0 = ranks[0].plan
         global_qsl = np.concatenate([[0], np.cumsum(q_lens)])
         req_of = np.searchsorted(global_qsl, np.arange(sum(q_lens)), side="right") - 1
+        # Request-major token of every gathered row (rank-major), -1 for
+        # padding.
+        local_padded = plan0.local_padded_num_tokens
+        packed_to_request = np.full(pcp * local_padded, -1, dtype=np.int64)
+        for p, rank in enumerate(ranks):
+            local_rows = rank.plan.request_major_to_local
+            g = np.flatnonzero(local_rows >= 0)
+            packed_to_request[p * local_padded + local_rows[g]] = g
         row_tokens = [
             None
             if g < 0
@@ -249,7 +257,7 @@ def _plan_steps(pcp, steps, block_table):
                 int(req_of[g]),
                 num_computed[req_of[g]] + g - int(global_qsl[req_of[g]]),
             )
-            for g in plan0._packed_to_request_major_token_indices.tolist()
+            for g in packed_to_request.tolist()
         ]
         split_tables = np.zeros((LOCAL_REQS, BLOCKS_PER_REQ), np.int32)
         split_tables[: len(plan0.split_block_rows)] = block_table[
