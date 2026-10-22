@@ -35,7 +35,12 @@ dependencies = [
     # torch==2.13.0 above; a mismatched pair fails at operator-registration time,
     # not at install time.
     "torchvision==0.28.0",
-    "torch_tpu==0.2.0",
+    # Nightly build: its Pallas meshes span a pipeline stage's own process
+    # group, which stages of several devices (PP x PCP) need; 0.2.0 accepts
+    # world-size meshes only. The next build (dev20261017050722) lost the
+    # eager add for float8 tensors, which weight loading uses. Served by the
+    # torch-tpu registry (see [tool.uv.sources]), not PyPI.
+    "torch_tpu==0.2.1.dev20261017000154",
     # High-bandwidth PJRT raw-transfer / KV-cache DMA engine backing the
     # raiden KV connector (disaggregated serving) and host KV offload; the
     # import name is `tpu_sync`. The wheel bundles one extension per
@@ -309,13 +314,23 @@ include = ["vllm_torchtpu*"]
 # Default PyPI serves Linux x86_64 wheels of torch and torchvision built with
 # CUDA, which pulls gigabytes of unnecessary nvidia-* runtime dependencies onto
 # TPU hosts. Pin them to the official PyTorch CPU index while resolving all
-# other packages (including torch-tpu, libtpu, and tpu-sync-torch) from PyPI.
+# other packages (including libtpu and tpu-sync-torch) from PyPI. torch-tpu
+# nightlies come from the torch-tpu registry, which needs a Google Cloud
+# access token (UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken and
+# UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD=<token>, as docker/Dockerfile.override
+# sets them).
 [[tool.uv.index]]
 name = "pytorch-cpu"
 url = "https://download.pytorch.org/whl/cpu"
 explicit = true
 
+[[tool.uv.index]]
+name = "torch-tpu-registry"
+url = "https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple"
+explicit = true
+
 [tool.uv.sources]
 torch = { index = "pytorch-cpu" }
+torch_tpu = { index = "torch-tpu-registry" }
 torchvision = { index = "pytorch-cpu" }
 torchaudio = { index = "pytorch-cpu" }

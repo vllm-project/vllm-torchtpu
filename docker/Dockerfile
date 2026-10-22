@@ -72,7 +72,15 @@ ENV UV_TORCH_BACKEND=cpu
 
 # Install all dependencies from pyproject.toml.
 # vLLM comes from the `vllm` dependency group (see pyproject.toml).
+# torch-tpu resolves from its registry, which takes the Google Cloud access
+# token passed as the `gcloud_token` build secret (docker/build_image.sh).
 RUN --mount=type=cache,target=/root/.cache/uv \
+    --mount=type=secret,id=gcloud_token \
+    set -eu; \
+    if [ -f /run/secrets/gcloud_token ]; then \
+      export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken; \
+      export UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD="$(cat /run/secrets/gcloud_token)"; \
+    fi; \
     uv pip install --system \
       -r pyproject.toml \
       --group vllm

@@ -144,6 +144,17 @@ else
 fi
 
 echo "Build Target: $TARGET"
+# torch-tpu resolves from its registry (pyproject.toml); the build takes a
+# Google Cloud access token as the `gcloud_token` secret: ACCESS_TOKEN, else
+# the VM's service account, else gcloud.
+if [ -z "${ACCESS_TOKEN:-}" ] && command -v curl >/dev/null 2>&1; then
+  ACCESS_TOKEN="$(curl -sf -H 'Metadata-Flavor: Google' \
+    'http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token' 2>/dev/null |
+    sed -n 's/.*"access_token" *: *"\([^"]*\)".*/\1/p')"
+fi
+if [ -z "${ACCESS_TOKEN:-}" ] && command -v gcloud >/dev/null 2>&1; then
+  ACCESS_TOKEN="$(gcloud auth print-access-token 2>/dev/null || true)"
+fi
 DOCKER_ARGS=(
   --progress=plain \
   -f "${SCRIPT_DIR}/Dockerfile" \
@@ -152,6 +163,12 @@ DOCKER_ARGS=(
   --build-arg VLLM_SOURCE="${VLLM_SOURCE}" \
   --build-arg VLLM_COMMIT_HASH="${VLLM_COMMIT_HASH}" \
 )
+if [ -n "${ACCESS_TOKEN:-}" ]; then
+  export ACCESS_TOKEN
+  DOCKER_ARGS+=(--secret "id=gcloud_token,env=ACCESS_TOKEN")
+else
+  echo "WARNING: no Google Cloud access token; torch-tpu will not resolve from its registry" >&2
+fi
 
 # Run docker build
 DOCKER_BUILDKIT=1 docker build "${DOCKER_ARGS[@]}" "${REPO_ROOT}"

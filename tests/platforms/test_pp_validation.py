@@ -16,7 +16,6 @@ from types import SimpleNamespace
 
 import pytest
 
-from vllm_torchtpu.platforms import pp_validation
 from vllm_torchtpu.platforms.pp_validation import validate_pipeline_parallel_config
 
 
@@ -194,49 +193,37 @@ def test_rejects_tensor_parallel_stages():
         validate_pipeline_parallel_config(_config(pp=2, tp=4))
 
 
-@pytest.fixture
-def stage_meshes(monkeypatch):
-    """A torch_tpu that builds meshes over a stage's process group."""
-    monkeypatch.setattr(pp_validation, "_torch_tpu_builds_stage_meshes", lambda: True)
+@pytest.mark.parametrize("pcp", [2, 4, 8])
+def test_accepts_context_parallel_stages(pcp):
+    validate_pipeline_parallel_config(_config(pp=4, pcp=pcp))
+    validate_pipeline_parallel_config(_config(pp=2, pcp=pcp, kv_transfer=RAIDEN))
+    validate_pipeline_parallel_config(_config(pp=4, pcp=pcp, kv_transfer=OFFLOAD))
 
 
-def test_accepts_context_parallel_stages(stage_meshes):
-    validate_pipeline_parallel_config(_config(pp=4, pcp=2))
+def test_accepts_context_parallel_stages_with_prefill_only_mtp():
+    validate_pipeline_parallel_config(
+        _config(
+            pp=4, pcp=8, speculative=MTP_K1, kv_transfer=RAIDEN, layer_types=HYBRID_24
+        )
+    )
 
 
-def test_rejects_context_parallel_stages_on_world_size_meshes(monkeypatch):
-    monkeypatch.setattr(pp_validation, "_torch_tpu_builds_stage_meshes", lambda: False)
-    with pytest.raises(NotImplementedError, match="stages of several devices"):
-        validate_pipeline_parallel_config(_config(pp=4, pcp=2, kv_transfer=RAIDEN))
-
-
-def test_rejects_expert_parallel_stages_on_world_size_meshes(monkeypatch):
-    monkeypatch.setattr(pp_validation, "_torch_tpu_builds_stage_meshes", lambda: False)
-    with pytest.raises(NotImplementedError, match="stages of several devices"):
-        validate_pipeline_parallel_config(_config(pp=4, dp=2, ep=True))
-
-
-def test_pipeline_stages_of_one_device_skip_the_torch_tpu_check(monkeypatch):
-    def unexpected():
-        raise AssertionError("probed torch_tpu for a stage of one device")
-
-    monkeypatch.setattr(pp_validation, "_torch_tpu_builds_stage_meshes", unexpected)
-    validate_pipeline_parallel_config(_config(pp=8))
-    validate_pipeline_parallel_config(_config(pp=4, dp=2))
+def test_accepts_expert_parallel_stages_across_data_parallel_ranks():
+    validate_pipeline_parallel_config(_config(pp=4, dp=2, ep=True))
     validate_pipeline_parallel_config(_config(pp=8, ep=True))
 
 
-def test_rejects_other_kv_transfer_with_context_parallel_stages(stage_meshes):
+def test_rejects_other_kv_transfer_with_context_parallel_stages():
     other = SimpleNamespace(kv_connector="TPUConnectorHMA")
     with pytest.raises(NotImplementedError, match="context-parallel stages"):
         validate_pipeline_parallel_config(_config(pp=4, pcp=2, kv_transfer=other))
 
 
-def test_raiden_accepts_context_parallel_stages(stage_meshes):
+def test_raiden_accepts_context_parallel_stages():
     validate_pipeline_parallel_config(_config(pp=4, pcp=2, kv_transfer=RAIDEN))
 
 
-def test_offloading_accepts_context_parallel_stages(stage_meshes):
+def test_offloading_accepts_context_parallel_stages():
     validate_pipeline_parallel_config(_config(pp=4, pcp=2, kv_transfer=OFFLOAD))
 
 
