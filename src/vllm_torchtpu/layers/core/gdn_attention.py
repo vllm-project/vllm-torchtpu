@@ -33,6 +33,7 @@ from vllm_torchtpu.kernels.gdn.head_geometry import (
     derive_gdn_head_geometry,
 )
 from vllm_torchtpu.kernels.gdn.v3 import wrapper as gdn_v3_wrapper
+from vllm_torchtpu.kernels.gdn.v3.input_layout import Conv1DInput
 from vllm_torchtpu.utils import get_mesh_shape_product
 
 _GDN_TP_AXIS_NAME = "tp"
@@ -810,7 +811,7 @@ def _as_logical_block_pool(
 
 
 def run_jax_gdn_attention_pooled_local(
-    mixed_qkv: jnp.ndarray,
+    mixed_qkv: jnp.ndarray | Conv1DInput,
     b: jnp.ndarray,
     a: jnp.ndarray,
     recurrent_state: jnp.ndarray,
@@ -874,7 +875,7 @@ def run_jax_gdn_attention_pooled_local(
 
 
 def run_jax_gdn_attention_pooled(
-    j_mixed_qkv: jnp.ndarray,
+    j_mixed_qkv: jnp.ndarray | Conv1DInput,
     j_b: jnp.ndarray,
     j_a: jnp.ndarray,
     recurrent_state: jnp.ndarray,
@@ -938,7 +939,11 @@ def run_jax_gdn_attention_pooled(
     """
     pool_spec = P(*([None] * recurrent_state.ndim))  # attention-shaped pool
     in_specs = (
-        P(None, "model"),  # j_mixed_qkv
+        (
+            jax.tree.map(lambda _: P(None, None, "model"), j_mixed_qkv)
+            if isinstance(j_mixed_qkv, Conv1DInput)
+            else P(None, "model")
+        ),  # j_mixed_qkv
         P(None, "model"),  # j_b
         P(None, "model"),  # j_a
         pool_spec,  # recurrent_state (attention-shaped pool)
