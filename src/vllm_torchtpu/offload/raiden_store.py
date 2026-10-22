@@ -224,6 +224,27 @@ def has_multi_shapes_kv_caches(vllm_config: VllmConfig) -> bool:
     )
 
 
+def resolve_model_owned_pool_geometry(
+    vllm_config: VllmConfig, kv_cache_config: KVCacheConfig
+) -> tuple[int, tuple[int, ...], object, int] | None:
+    """Geometry a model-owned unified pool declares for itself, or None.
+
+    Some models own a unified pool whose groups share one page size but not
+    one attention geometry (Qwen4Exp: QSA main KV, compressed keys, raw
+    rings, GDN and PLE state). Each (group, block) key still names exactly
+    one page, so the model describes the pool's carrier rows and every
+    group's page moves as opaque bytes.
+    """
+    from vllm_torchtpu.models.vllm.qwen4_exp.offload import (
+        is_qwen4_exp,
+        offload_pool_geometry,
+    )
+
+    if is_qwen4_exp(vllm_config):
+        return offload_pool_geometry(vllm_config, kv_cache_config)
+    return None
+
+
 class RaidenLoadStoreSpec(LoadStoreSpec):
     """Offload-side specification describing the ordered keys for a job.
 
@@ -1695,6 +1716,9 @@ def resolve_kernel_geometry(
     Shared between the scheduler (capacity sizing, sub-hash factor) and worker ranks
     (device view reconstruction) to guarantee exact geometry parity.
     """
+    model_geometry = resolve_model_owned_pool_geometry(vllm_config, kv_cache_config)
+    if model_geometry is not None:
+        return model_geometry
     if has_multi_shapes_kv_caches(vllm_config):
         return _resolve_multi_shapes_kv_geometry(kv_cache_config)
     spec0, kernel_block_size, per_block_shape = resolve_attention_geometry(

@@ -28,6 +28,25 @@ from vllm_torchtpu.gdn_pool_layout import unified_kv_layout_enabled_for_architec
 
 from .ple_host import host_available_memory
 
+# Model-owned prefill/decode disaggregation (see pd_connector.py).
+PD_CONNECTOR = "Qwen4ExpRaidenConnector"
+PD_CONNECTOR_MODULE = "vllm_torchtpu.models.vllm.qwen4_exp.pd_connector"
+# Host-DRAM prefix-cache offload through the shared Raiden store.
+OFFLOAD_CONNECTOR = "TPURaidenOffloadingConnector"
+OFFLOAD_CONNECTOR_MODULE = "vllm_torchtpu.offload.raiden_connector"
+
+
+def pd_transfer_enabled(cfg) -> bool:
+    """Whether this engine is one side of a Qwen4Exp PD pair."""
+    transfer = getattr(cfg, "kv_transfer_config", None)
+    return getattr(transfer, "kv_connector", None) == PD_CONNECTOR
+
+
+def host_offload_enabled(cfg) -> bool:
+    """Whether prefix-cache pages are offloaded to host DRAM (Raiden store)."""
+    transfer = getattr(cfg, "kv_transfer_config", None)
+    return getattr(transfer, "kv_connector", None) == OFFLOAD_CONNECTOR
+
 
 def use_unified_pool() -> bool:
     """Use the shared architecture policy, including an explicit global override."""
@@ -194,11 +213,15 @@ def hbm_pool_sizing(cfg) -> bool:
     The default for the unified pool. ``QWEN4_EXP_POOL_SIZING=static``
     restores ``native_cache_capacity``; PD keeps it (both sides must agree
     on the pool before profiling), and so does an explicit
-    ``--num-gpu-blocks-override``.
+    ``--num-gpu-blocks-override``. Host offload sizes from HBM like a plain
+    server: its host capacity follows the planned pool, not the reverse.
     """
     return (
         use_unified_pool()
-        and getattr(cfg, "kv_transfer_config", None) is None
+        and (
+            getattr(cfg, "kv_transfer_config", None) is None
+            or host_offload_enabled(cfg)
+        )
         and getattr(cfg.cache_config, "num_gpu_blocks_override", None) is None
         and os.environ.get("QWEN4_EXP_POOL_SIZING", "hbm").strip().lower() != "static"
     )
@@ -545,12 +568,14 @@ def validate_config(cfg):
     if cfg.speculative_config is not None:
         validate_mtp_config(cfg)
     transfer = cfg.kv_transfer_config
-    if transfer is not None:
-        connector_module = "vllm_torchtpu.models.vllm.qwen4_exp.pd_connector"
+    if host_offload_enabled(cfg):
+        validate_host_offload_config(cfg)
+    elif transfer is not None:
+        connector_module = PD_CONNECTOR_MODULE
         if (
             (p.tensor_parallel_size, p.data_parallel_size) != (1, 8)
             or not p.enable_expert_parallel
-            or transfer.kv_connector != "Qwen4ExpRaidenConnector"
+            or transfer.kv_connector != PD_CONNECTOR
             or transfer.kv_connector_module_path not in (None, connector_module)
             or transfer.kv_role not in ("kv_producer", "kv_consumer")
             or not pooled
@@ -631,6 +656,53 @@ def validate_config(cfg):
             )
 
 
+def validate_host_offload_config(cfg):
+    """Admit host-DRAM prefix-cache offload (TPURaidenOffloadingConnector).
+
+    The connector moves whole unified-pool pages, one per (cache group,
+    block), as raw bytes: main KV, compressed keys (packed or not) and the
+    GDN/PLE align checkpoints round-trip unchanged whatever their dtype or
+    shape (see ``offload.offload_pool_geometry``). That needs the unified
+    pool, prefix caching with align-mode Mamba checkpoints (a host hit, like
+    an HBM hit, resumes from the state saved at a block boundary, where the
+    per-request QSA raw ring holds no history yet) and both store and load
+    roles on one engine.
+    """
+    c, p = cfg.cache_config, cfg.parallel_config
+    transfer = cfg.kv_transfer_config
+    extra = transfer.kv_connector_extra_config or {}
+    if (
+        transfer.kv_connector_module_path not in (None, OFFLOAD_CONNECTOR_MODULE)
+        or transfer.kv_role != "kv_both"
+        or not use_unified_pool()
+        or not c.enable_prefix_caching
+        or c.mamba_cache_mode != "align"
+        or p.pipeline_parallel_size != 1
+    ):
+        raise ValueError(
+            "Qwen4Exp host KV offload requires "
+            f"{OFFLOAD_CONNECTOR} from {OFFLOAD_CONNECTOR_MODULE} with "
+            "kv_role='kv_both', the unified pool, prefix caching, "
+            "mamba_cache_mode='align' and PP1"
+        )
+    cpu_bytes = extra.get("cpu_bytes_to_use")
+    try:
+        cpu_bytes = int(cpu_bytes)
+    except (TypeError, ValueError):
+        cpu_bytes = 0
+    if cpu_bytes <= 0:
+        raise ValueError(
+            "Qwen4Exp host KV offload requires a positive "
+            "kv_connector_extra_config.cpu_bytes_to_use (host bytes summed "
+            "over all workers of the engine)"
+        )
+    if extra.get("blocks_per_chunk") not in (None, 1) or "block_size" in extra:
+        raise ValueError(
+            "Qwen4Exp host KV offload stores one pool page per scheduler block; "
+            "leave blocks_per_chunk/block_size unset"
+        )
+
+
 def validate_mtp_config(cfg):
     """Admit only the checkpoint's native MTP draft on the unified pool.
 
@@ -674,7 +746,7 @@ def validate_mtp_config(cfg):
         )
     if p.data_parallel_size != 1:
         raise ValueError("Qwen4Exp TPU MTP currently requires data_parallel_size=1")
-    if cfg.kv_transfer_config is not None:
+    if pd_transfer_enabled(cfg):
         raise ValueError("Qwen4Exp PD requires MTP off")
     if getattr(cfg.cache_config, "mamba_cache_mode", "none") not in ("none", "align"):
         raise ValueError("Qwen4Exp MTP requires mamba_cache_mode 'none' or 'align'")

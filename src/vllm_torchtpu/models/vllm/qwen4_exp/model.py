@@ -41,7 +41,12 @@ from vllm.v1.kv_cache_interface import MambaSpec
 from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
 
-from .config import gdn_cache_spec, num_speculative_tokens, use_unified_pool
+from .config import (
+    gdn_cache_spec,
+    num_speculative_tokens,
+    pd_transfer_enabled,
+    use_unified_pool,
+)
 from .gdn import Qwen4ExpGatedDeltaNetAttention
 from .hyperconnection import GatedResidual, HyperConnectionConfig
 from .parallel import PLEParallel
@@ -429,7 +434,8 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
 
     def __init__(self, *, vllm_config, prefix=""):
         super().__init__()
-        self._pd_weight_identity_enabled = vllm_config.kv_transfer_config is not None
+        # Only PD peers compare weight fingerprints; host offload stays local.
+        self._pd_weight_identity_enabled = pd_transfer_enabled(vllm_config)
         self.pd_loaded_weight_identity: str | None = None
         self.pd_loaded_ple_identity: str | None = None
         self.pd_gdn_qk_pair_layout = envs.TPU_GDN_CONV_QK_PAIR_LAYOUT
