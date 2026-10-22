@@ -480,7 +480,10 @@ def test_patch_falls_back_when_filter_inactive():
     class FakeLoader:
         _get_weights_iterator = original
 
-    with patch.object(rsl, "RunaiModelStreamerLoader", FakeLoader):
+    with (
+        patch.object(rsl, "RunaiModelStreamerLoader", FakeLoader),
+        patch("vllm.config.get_current_vllm_config", return_value=SimpleNamespace()),
+    ):
         mlp.patch_runai_sharded_expert_streaming()
         patched_once = FakeLoader._get_weights_iterator
         mlp.patch_runai_sharded_expert_streaming()  # idempotent
@@ -514,6 +517,7 @@ def test_patch_passes_model_filter_for_each_load(with_filter, override):
     weights = iter(())
     with (
         patch.object(rsl, "RunaiModelStreamerLoader", FakeLoader),
+        patch("vllm.config.get_current_vllm_config", return_value=SimpleNamespace()),
         patch.object(mlp, "_compute_local_expert_ids", return_value={0}),
         patch.object(
             mlp, "_sharded_runai_weights_iterator", return_value=weights
@@ -530,12 +534,87 @@ def test_patch_passes_model_filter_for_each_load(with_filter, override):
             {0},
             False,
             weight_filter=getattr(model, "should_load_weight", None),
+            weight_name_mapper=None,
         )
         model.load_weights.assert_called_once_with(weights)
 
         # Reusing this loader for another model must not retain the callback.
         loader.load_weights(SimpleNamespace(load_weights=MagicMock()), config)
         assert stream.call_args.kwargs["weight_filter"] is None
+
+
+def test_permuted_loader_cannot_fall_back_to_original_ownership():
+    from vllm.model_executor.model_loader import runai_streamer_loader as rsl
+
+    from vllm_torchtpu import model_loader_patches as mlp
+
+    original = MagicMock()
+
+    class FakeLoader:
+        _get_weights_iterator = original
+
+    config = SimpleNamespace(
+        additional_config={"deepseek_v41": {"expert_permutations": {"0": [1, 0]}}}
+    )
+    with (
+        patch.object(rsl, "RunaiModelStreamerLoader", FakeLoader),
+        patch("vllm.config.get_current_vllm_config", return_value=config),
+        patch.object(mlp, "_compute_local_expert_ids", return_value=None),
+    ):
+        mlp.patch_runai_sharded_expert_streaming()
+        with pytest.raises(RuntimeError, match="cannot fall back"):
+            FakeLoader()._get_weights_iterator("unused", None)
+    original.assert_not_called()
+
+
+@pytest.mark.parametrize("physical", [0, 1])
+def test_permuted_stream_fetches_original_bytes_for_physical_destination(physical):
+    pytest.importorskip("runai_model_streamer")
+    import runai_model_streamer.safetensors_streamer.safetensors_pytorch as sp
+    import torch
+    from runai_model_streamer.safetensors_streamer import safetensors_streamer
+
+    from vllm_torchtpu.models.vllm.deepseek_v41.expert_placement import (
+        remap_checkpoint_expert,
+    )
+
+    names = [f"layers.0.ffn.experts.{i}.w1.weight" for i in range(2)]
+    meta = _fake_file_meta(100, [(name, 4) for name in names])
+    source = 1 - physical
+    data = bytes([source + 10]) * 4
+    streamer = MagicMock()
+    streamer.__enter__.return_value = streamer
+    streamer.file_streamer = streamer
+    streamer.get_chunks.return_value = iter([(0, 0, memoryview(data))])
+    model_filter = MagicMock(return_value=True)
+
+    def decode(buffer, tensor_meta):
+        assert tensor_meta.name == names[source]
+        return torch.tensor(list(buffer), dtype=torch.uint8)
+
+    with (
+        patch.object(
+            safetensors_streamer, "SafetensorsStreamer", return_value=streamer
+        ),
+        patch.object(sp.SafetensorsMetadata, "from_files", return_value=[meta]),
+        patch.object(sp, "create_torch_tensor", side_effect=decode),
+    ):
+        result = list(
+            _sharded_runai_weights_iterator(
+                ["checkpoint.safetensors"],
+                {physical},
+                False,
+                weight_filter=model_filter,
+                weight_name_mapper=lambda name: remap_checkpoint_expert(
+                    name, {"0": (1, 0)}
+                ),
+            )
+        )
+    assert [item.args[0] for item in model_filter.call_args_list] == names
+    assert len(result) == 1 and result[0][0] == names[physical]
+    assert result[0][1].tolist() == list(data)
+    requests = streamer.stream_files.call_args.args[0]
+    assert [(r.offsets, r.sizes) for r in requests] == [([100 + source * 4], [4])]
 
 
 def test_model_filter_preserves_original_checkpoint_names():

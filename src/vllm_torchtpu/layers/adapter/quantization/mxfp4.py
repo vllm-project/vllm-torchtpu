@@ -781,6 +781,13 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 f"admitted layout: {reason}"
             )
             register_score_bias_buffer(layer)
+            permutation = getattr(layer, "_tpu_expert_permutation", None)
+            if permutation is not None:
+                layer.register_buffer(
+                    "_tpu_fused_expert_id_map",
+                    torch.tensor(permutation, dtype=torch.int32, device=device),
+                    persistent=False,
+                )
             # Row-padded scales avoid per-step relayouts; the helper also
             # materializes their storage under the pinned runtime.
             w13_scale = _row_padded_flat_block_scale(layer.w13_weight_scale)
@@ -831,5 +838,6 @@ class VllmDeepseekV4Mxfp4MoEMethod(VllmMxfp4MoEMethod):
                 router_logits,
                 score_bias_operand(layer),
                 hash_topk_ids_operand(layer, input_ids),
+                expert_id_map=getattr(layer, "_tpu_fused_expert_id_map", None),
             )
         return super()._forward_monolithic_tpu(layer, x, router_logits, input_ids)

@@ -30,7 +30,7 @@ from vllm_torchtpu import envs
 
 # The layout constants this kernel is built against, and the host module
 # whose accounting decides what it may declare.
-from vllm_torchtpu.kernels.fused_moe.v2 import host
+from vllm_torchtpu.kernels.fused_moe.v2 import host, tuned_block_sizes
 from vllm_torchtpu.kernels.fused_moe.v2.host import (
     FP4,
     FP8,
@@ -64,7 +64,7 @@ FP4_OUTPUT_CHUNK = 256
 # which is why this is a handful of heights and not one per ROWBLK -- and the
 # top rung is always tile_m, so a full tile is unchanged. Overridable per
 # process by MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE, read at BUILD time.
-HEIGHT_RUNGS = 4
+HEIGHT_RUNGS = tuned_block_sizes.DEFAULT_HEIGHT_RUNGS
 # DMA priority the weight refills take, so that they stay off the in-order
 # queue the token gather issues on.
 WEIGHT_DMA_PRIORITY = 1
@@ -139,7 +139,14 @@ def _apply_act(gate, up, act_fn):
     )
 
 
-def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
+def tile_height_rungs(
+    tile_m,
+    rows_alloc,
+    g_local,
+    ep,
+    *,
+    tuning_key: tuned_block_sizes.HeightTuningKey | None = None,
+):
     """The ascending static tile heights a build emits, ending at tile_m.
 
     Equally spaced so that a tail tile's rounding-up waste is bounded by one
@@ -156,14 +163,17 @@ def tile_height_rungs(tile_m, rows_alloc, g_local, ep):
     what a shard's `g_local` experts actually expect to hold.
 
     """
-    rungs = envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE or HEIGHT_RUNGS
+    if rows_alloc > ep * g_local * tile_m:
+        return (tile_m,)
+    rungs = envs.MOE_FUSED_EP_V2_HEIGHT_RUNGS_OVERRIDE
+    if not rungs:
+        rungs = (
+            tuned_block_sizes.get_fp4_height_rungs(tuning_key)
+            if tuning_key is not None
+            else HEIGHT_RUNGS
+        )
     step = tile_m // rungs
-    if (
-        rungs < 2
-        or step % ROWBLK
-        or step * rungs != tile_m
-        or rows_alloc > ep * g_local * tile_m
-    ):
+    if rungs < 2 or step % ROWBLK or step * rungs != tile_m:
         return (tile_m,)
     return tuple(range(step, tile_m + 1, step))
 
@@ -809,7 +819,27 @@ def _build_fused_ep_moe_kernel(
     # kernel converts between them with a shift.
     tile_block_shift = host.pow2_shift(tile_blocks, "tile_m // ROWBLK")
     tile_shift = host.pow2_shift(tile_m, "tile_m")
-    height_rungs = tile_height_rungs(tile_m, ragged_rows_alloc, g_local, ep)
+    height_tuning_key = (
+        tuned_block_sizes.HeightTuningKey(
+            generation=pltpu.get_tpu_info().generation,
+            hidden=hidden,
+            inter=inter,
+            rhs_qb=rhs_qb,
+            tile_m=tile_m,
+            g_local=g_local,
+            ep=ep,
+            rows_alloc=ragged_rows_alloc,
+            act_fn=act_fn,
+            logical_intermediate_size=logical_intermediate_size,
+            has_bias=has_w1_bias or has_w2_bias,
+            padded_scales=pad_scale_rows,
+        )
+        if rhs_packed4
+        else None
+    )
+    height_rungs = tile_height_rungs(
+        tile_m, ragged_rows_alloc, g_local, ep, tuning_key=height_tuning_key
+    )
     # The contribution slab exists for one reason: to give the push an HBM
     # source. A tile is computed into `out_vm`, copied to `contrib_hbm`, then
     # read straight back out of it by the push that ships it -- two local

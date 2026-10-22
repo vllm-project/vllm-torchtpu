@@ -4,6 +4,7 @@
 import math
 from dataclasses import dataclass, replace
 
+from vllm_torchtpu.kernels.deepseek_v41.index_key_layout import DIM
 from vllm_torchtpu.logger import init_logger
 
 # At Bq=128, a 32K-key FP32 output window occupies 16 MiB. Mosaic double
@@ -44,8 +45,8 @@ PERSISTENT_SCORE_CONFIGS: dict[tuple[int, ...], PersistentScoreConfig] = {
 }
 
 
-# Decode tables are calibrated with decode_indexer's default score/top-k options.
-# Request tiles bound per-group buffers; total batch size is not a lookup key.
+# Component defaults use decode_indexer's default score/top-k options.
+# Joint batch-specific measurements take precedence through get_decode_block_sizes.
 logger = init_logger(__name__)
 DEFAULT_DECODE_REQUEST_TILE = 16
 
@@ -94,6 +95,42 @@ def get_decode_request_tile(key: DecodeTuningKey, requests: int) -> int:
     if type(tile) is not int or tile < 1:
         raise ValueError(f"Invalid decode request_tile={tile} for {key}")
     return min(tile, requests)
+
+
+@dataclass(frozen=True)
+class DecodeBlockSizes:
+    request_tile: int
+    score_config: PersistentScoreConfig
+
+
+# R48, JAX 0.11.2 / libtpu 0.0.50: three request groups and two 32K key
+# windows reduce group boundaries, scorer scratch and unrolled code.
+# Seeds 1021-1024 cover lengths 49408/65536 and shuffled pages. This joint
+# choice regresses the R17 tail case, so preserve existing defaults elsewhere.
+DECODE_BATCH_BLOCK_SIZES: dict[tuple[DecodeTuningKey, int], DecodeBlockSizes] = {
+    (DecodeTuningKey("TPU7x", 6, 32, 65536, 128, 512, 2), 48): DecodeBlockSizes(
+        16, PersistentScoreConfig(32768, 1024, 32)
+    ),
+}
+
+
+def get_decode_block_sizes(key: DecodeTuningKey, requests: int) -> DecodeBlockSizes:
+    """Resolve a measured complete batch or retain the component defaults."""
+    config = DECODE_BATCH_BLOCK_SIZES.get((key, requests))
+    if config is not None:
+        return config
+    logger.warning_once(
+        "[decode_indexer] No batch tuning for %s, requests=%d; "
+        "using component defaults",
+        key,
+        requests,
+    )
+    return DecodeBlockSizes(
+        get_decode_request_tile(key, requests),
+        get_persistent_score_config(
+            (key.queries, key.heads, DIM, key.score_capacity, key.banks)
+        ),
+    )
 
 
 @dataclass(frozen=True)

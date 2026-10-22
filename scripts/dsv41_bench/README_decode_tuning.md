@@ -1,16 +1,23 @@
 # Decode request-tile tuning
 
-`decode_indexer(..., request_tile=None)` selects a static entry from
-`index_selection/tuned_block_sizes.py`. The lookup key includes device kind,
-per-device request count, queries per request, heads, score capacity, page size,
-key tile, top-k count and cache bank count. It does not read dynamic lengths
-back to the host. Tables are calibrated with the default score/top-k options.
-Pass an explicit `request_tile` when ablating other kernel parameters.
+`decode_indexer(..., request_tile=None)` resolves the request and scorer tiles
+together from `index_selection/tuned_block_sizes.py`. The batch lookup includes
+device kind, per-device request count, queries per request, heads, score capacity,
+page size, top-k count and cache bank count. It does not read dynamic lengths
+back to the host. Pass an explicit `request_tile` with a `score_config` override
+when ablating scorer parameters.
 
-On a miss, the fallback is 16, or the largest divisor of the request count below
-16. A warning includes the complete missing key. Explicit tiles must divide the
-request count; the kernel does not pad requests. No runtime tuning or JSON file
-loading occurs in the inference path.
+A batch-table miss retains the component defaults and logs the missing key.
+The request component uses its measured entry when present, otherwise at most
+16 requests per group. A final partial group handles non-divisible request
+counts. No runtime tuning or JSON file loading occurs in the inference path.
+
+The JAX 0.11.2 / libtpu 0.0.50 batch entry for TPU7x, 48 requests, six
+queries, 32 heads, capacity 65536, page size 128, top-k 512 and two banks
+uses request tile 16 and scorer tiles `(32768, 1024, 32)`. Other batch
+shapes retain the component defaults. See
+[the measured decode results](README_decode_35ms.md) for serving evidence,
+memory costs and the remaining gap to the target.
 
 Run the standalone benchmark in a TPU environment:
 

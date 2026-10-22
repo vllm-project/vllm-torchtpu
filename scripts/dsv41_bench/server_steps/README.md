@@ -107,6 +107,11 @@ No cache directory or GCS cache mount is needed. The launcher no longer accepts
 `--cache-dir` or `--cache-mode`; use a separate cache experiment for reuse tests.
 
 Profiles are enabled only by `--profile` and written directly under `--out/profile`.
+Compiler communication experiments can set `--all-gather-offload-min-bytes`;
+the launcher records the value in `manifest.json` and applies it before libtpu
+initializes. Its default is zero, matching the existing serving configuration.
+For example, `--all-gather-offload-min-bytes 1048576` keeps all-gathers smaller
+than 1 MiB off SparseCore. This is an explicit experiment, not a tuned default.
 No `ARTIFACT_LOCAL_DIR` or shared scratch directory is required. Do not enable compiler
 dumps during timed startup, and never pool profiled and unprofiled rounds.
 
@@ -135,6 +140,26 @@ python -m pytest --confcutdir=tests/scripts \
   tests/scripts/test_dsv41_decode_worker_capture.py \
   tests/scripts/test_dsv41_decode_accounting.py -q
 ```
+
+## Frozen GSM8K quality comparison
+
+Against an already running server, evaluate the same frozen JSONL dataset and
+sample seed in both configurations:
+
+```bash
+python scripts/dsv41_bench/server_steps/eval_gsm8k.py \
+  --dataset /tmp/gsm8k-test.jsonl --out /tmp/quality-baseline \
+  --samples 256 --concurrency 32 --repeats 2 --seed 0 --max-tokens 2048
+```
+
+This protocol uses zero-shot chat, temperature zero and disabled thinking; it
+is not the few-shot leaderboard protocol. Each run records the dataset hash,
+selected original indices, request hash and every raw response. A strict final
+`####` numeric answer is compared after decimal normalization. Format failures,
+truncated generations and HTTP failures are reported explicitly. Failed requests
+remain in the sample denominator and cause a nonzero exit status. Use a fresh
+output directory and inspect per-question differences and repeated-run stability
+before drawing a quality conclusion. This command does not measure throughput.
 
 ## Timing and audit contract
 

@@ -204,6 +204,7 @@ def test_moe_init_success_wraps_factory(monkeypatch):
     )
 
     vllm_config = SimpleNamespace(
+        additional_config={"deepseek_v41": {}},
         parallel_config=SimpleNamespace(enable_eplb=False),
         kernel_config=SimpleNamespace(moe_backend="native"),
     )

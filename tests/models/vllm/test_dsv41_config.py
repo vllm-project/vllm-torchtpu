@@ -30,10 +30,19 @@ def config(**policy):
         additional_config={"deepseek_v41": policy, "unrelated": 17},
         engram_config=SimpleNamespace(cpu_offload=True),
         parallel_config=SimpleNamespace(
-            enable_expert_parallel=True, prefill_context_parallel_size=1
+            enable_expert_parallel=True,
+            prefill_context_parallel_size=1,
+            enable_eplb=False,
+            expert_placement_strategy="linear",
+            enable_ep_weight_filter=True,
         ),
+        load_config=SimpleNamespace(load_format="runai_streamer"),
         kernel_config=SimpleNamespace(moe_backend="auto"),
-        model_config=SimpleNamespace(hf_config=SimpleNamespace(expert_dtype="fp4")),
+        model_config=SimpleNamespace(
+            hf_config=SimpleNamespace(
+                expert_dtype="fp4", num_hidden_layers=40, n_routed_experts=4
+            )
+        ),
         cache_config=SimpleNamespace(
             enable_prefix_caching=True, swa_bounded_replay=True
         ),
@@ -68,6 +77,42 @@ def test_defaults_are_explicit_and_do_not_enable_approximation():
     cfg = config()
     verify_and_update_config(cfg)
     assert cfg.additional_config["deepseek_v41"] == {"execution": "full", "moe": "gmm"}
+
+
+def test_expert_permutation_values_survive_worker_serialization():
+    cfg = config(moe="fused_ep_w4a8", expert_permutations={"8": [2, 0, 3, 1]})
+    verify_and_update_config(cfg)
+    serialized = json.dumps(cfg.additional_config)
+    worker = copy.deepcopy(cfg)
+    worker.additional_config = json.loads(serialized)
+    verify_and_update_config(worker)
+    assert worker.additional_config == cfg.additional_config
+    worker.additional_config["deepseek_v41"]["expert_permutations"]["8"] = [1, 0, 3, 2]
+    assert json.dumps(worker.additional_config) != serialized
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("moe", "gmm"),
+        ("enable_eplb", True),
+        ("expert_placement_strategy", "round_robin"),
+        ("enable_ep_weight_filter", False),
+        ("load_format", "safetensors"),
+        ("expert_permutations", {"40": [2, 0, 3, 1]}),
+        ("expert_permutations", {"8": [1, 0]}),
+    ],
+)
+def test_expert_permutations_refuse_incompatible_loads(field, value):
+    cfg = config(moe="fused_ep_w4a8", expert_permutations={"8": [2, 0, 3, 1]})
+    if field in ("moe", "expert_permutations"):
+        cfg.additional_config["deepseek_v41"][field] = value
+    elif field == "load_format":
+        cfg.load_config.load_format = value
+    else:
+        setattr(cfg.parallel_config, field, value)
+    with pytest.raises(ValueError, match="[Ee]xpert permutation"):
+        verify_and_update_config(cfg)
 
 
 def test_legacy_values_are_frozen_before_worker_env_changes(monkeypatch):

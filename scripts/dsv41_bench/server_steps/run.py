@@ -117,7 +117,20 @@ def main() -> None:
     )
     parser.add_argument("--rounds", type=int)
     parser.add_argument("--profile", action="store_true")
+    parser.add_argument(
+        "--all-gather-offload-min-bytes",
+        type=int,
+        default=0,
+        help="SparseCore all-gather size threshold; recorded for compiler A/Bs",
+    )
+    parser.add_argument(
+        "--expert-permutations",
+        type=Path,
+        help="JSON logical-to-physical expert maps for an explicit placement probe",
+    )
     args = parser.parse_args()
+    if args.all_gather_offload_min_bytes < 0:
+        parser.error("The all-gather offload threshold must be nonnegative")
     if args.rounds is None:
         args.rounds = 1 if args.scenario == "decode" else 5
     if args.rounds < 1:
@@ -141,6 +154,7 @@ def main() -> None:
 
     here = Path(__file__).resolve().parent
     env = os.environ.copy()
+    env["DSV41_BENCH_ALL_GATHER_MIN_BYTES"] = str(args.all_gather_offload_min_bytes)
     compiler_scratch = tempfile.TemporaryDirectory(prefix="dsv41-compiler-")
     env["VLLM_CACHE_ROOT"] = compiler_scratch.name
     # Do not inherit persistent cache paths from the task or the host.
@@ -190,6 +204,28 @@ def main() -> None:
         "--compilation-config",
         json.dumps({"compile_sizes": buckets}),
     ]
+    permutation_sha256 = None
+    if args.expert_permutations is not None:
+        from vllm_torchtpu.models.vllm.deepseek_v41.expert_placement import (
+            parse_expert_permutations,
+        )
+
+        source = args.expert_permutations.read_bytes()
+        permutations = parse_expert_permutations(json.loads(source))
+        permutation_sha256 = hashlib.sha256(source).hexdigest()
+        (args.out / "expert-permutations.json").write_bytes(source)
+        server_command += [
+            "--additional-config",
+            json.dumps(
+                {
+                    "deepseek_v41": {
+                        "execution": "ced",
+                        "moe": "fused_ep_w4a8",
+                        "expert_permutations": permutations,
+                    }
+                }
+            ),
+        ]
     if args.profile:
         server_command += [
             "--profiler-config",
@@ -211,6 +247,8 @@ def main() -> None:
             for name in ["torch", "torch-tpu", "jax", "jaxlib", "libtpu"]
         },
         "startup_scope": "server launch through HTTP health readiness",
+        "expert_permutations_sha256": permutation_sha256,
+        "all_gather_offload_min_bytes": args.all_gather_offload_min_bytes,
     }
     import vllm
 

@@ -25,6 +25,10 @@ from vllm_torchtpu.kernels.deepseek_v4.rope import (
     _cos_sin_lanes,
     _rotate_gptj,
 )
+from vllm_torchtpu.kernels.deepseek_v4.tuned_block_sizes import (
+    WoATuningKey,
+    get_wo_a_sub_t,
+)
 from vllm_torchtpu.layers.core.quantization import FP8_E4M3_MAX
 
 DEFAULT_VMEM_LIMIT_BYTES = 100 * 1024 * 1024
@@ -286,9 +290,24 @@ def wo_a_projection(
         tile_r = lora_rank
     if tile_t is None:
         tile_t = _largest_divisor(num_tokens, cap=1024)
+    assert tile_r is not None
     if sub_t is None:
         # 128 is chosen based on large batch size (t) microbenchmarks
-        sub_t = _largest_divisor(tile_t, cap=128)
+        sub_t = get_wo_a_sub_t(
+            WoATuningKey(
+                jax.devices()[0].device_kind,
+                x.shape,
+                wo_a.shape,
+                str(x.dtype),
+                str(wo_a.dtype),
+                str(wo_a_scale.dtype),
+                tile_t,
+                tile_r,
+                cos_sin is not None,
+                quantize_activations,
+            ),
+            _largest_divisor(tile_t, cap=128),
+        )
     assert lora_rank % tile_r == 0
     assert num_tokens % tile_t == 0
     assert tile_t % sub_t == 0

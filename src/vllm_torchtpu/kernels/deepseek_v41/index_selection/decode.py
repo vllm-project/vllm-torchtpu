@@ -23,7 +23,7 @@ from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
 from vllm_torchtpu.kernels.deepseek_v41.index_selection.tuned_block_sizes import (
     DecodeTuningKey,
     PersistentScoreConfig,
-    get_decode_request_tile,
+    get_decode_block_sizes,
     get_persistent_score_config,
 )
 
@@ -137,7 +137,7 @@ def decode_indexer(
         raise NotImplementedError("Persistent decode requires two packed cache banks")
     fused_blocks = candidate_count > 0 and candidate_block_size == 8
     if request_tile is None:
-        request_tile = get_decode_request_tile(
+        config = get_decode_block_sizes(
             DecodeTuningKey(
                 device_kind=jax.devices()[0].device_kind,
                 queries=queries,
@@ -149,6 +149,8 @@ def decode_indexer(
             ),
             requests,
         )
+        request_tile = config.request_tile
+        score_config = config.score_config
     elif type(request_tile) is not int or request_tile < 1:
         raise ValueError("request_tile must be a positive integer")
     request_tile = min(request_tile, requests)

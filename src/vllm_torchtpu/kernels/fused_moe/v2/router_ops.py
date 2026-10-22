@@ -33,12 +33,13 @@ from jax.experimental import pallas as pl
 NEG = -3.0e38  # below any real softmax score (>=0); avoids inf
 
 
-def _select_kernel(x_ref, w_ref, i_ref, *, topk, n, v_ref=None):
+def _select_kernel(x_ref, w_ref, i_ref, *, topk, n, v_ref=None, map_ref=None):
     """One block of rows: take the top `topk` by repeated max-and-mask."""
     # NaN is flushed to the sentinel so every row has a maximum some
     # column equals; an all-NaN row selects expert 0 with weight NEG.
     x = jnp.where(jnp.isnan(x_ref[...]), NEG, x_ref[...])  # [R, n] f32
     v = None if v_ref is None else v_ref[...]
+    physical_ids = None if map_ref is None else map_ref[...]
     iota = jax.lax.broadcasted_iota(jnp.int32, x.shape, 1)
     for j in range(topk):
         m = jnp.max(x, axis=1, keepdims=True)  # [R,1] rowmax
@@ -52,7 +53,13 @@ def _select_kernel(x_ref, w_ref, i_ref, *, topk, n, v_ref=None):
         w_ref[:, j] = (
             m[:, 0] if v is None else jnp.sum(jnp.where(picked, v, 0.0), axis=1)
         )
-        i_ref[:, j] = idx.astype(jnp.int32)
+        # Select and break ties in logical order. The existing one-hot mask
+        # reads the physical ID without a separate post-selector HBM gather.
+        i_ref[:, j] = (
+            idx.astype(jnp.int32)
+            if physical_ids is None
+            else jnp.sum(jnp.where(picked, physical_ids, 0), axis=1)
+        )
         x = jnp.where(picked, NEG, x)
 
 
@@ -66,7 +73,28 @@ def _select_kernel_split(x_ref, v_ref, w_ref, i_ref, *, topk, n):
     _select_kernel(x_ref, w_ref, i_ref, topk=topk, n=n, v_ref=v_ref)
 
 
-def pallas_select(scores, topk=10, block_rows=256, weight_scores=None, interpret=False):
+def _select_kernel_mapped(
+    x_ref, v_ref, map_ref, w_ref, i_ref, *, topk, n, separate_weights
+):
+    _select_kernel(
+        x_ref,
+        w_ref,
+        i_ref,
+        topk=topk,
+        n=n,
+        v_ref=v_ref if separate_weights else None,
+        map_ref=map_ref,
+    )
+
+
+def pallas_select(
+    scores,
+    topk=10,
+    block_rows=256,
+    weight_scores=None,
+    interpret=False,
+    expert_id_map=None,
+):
     """Top-k over [R, N] scores -> (weights f32, indices i32) [R, topk].
 
     With `weight_scores=None`, return the selected scores as weights.
@@ -76,6 +104,10 @@ def pallas_select(scores, topk=10, block_rows=256, weight_scores=None, interpret
     unbiased weights from `weight_scores=raw_scores`. Here `raw_scores` are
     the scores after the scoring function, before adding the bias.
     Normalization and routed scaling are applied by the caller.
+
+    `expert_id_map` is an optional validated logical-to-physical permutation
+    of [0, N). It changes only emitted indices; selection, ties and weights
+    retain logical expert order. The map is replicated across row blocks.
 
     `interpret` runs the kernel body on the host, which is what lets the
     selection rule be tested without a chip; it does not gate Mosaic
@@ -100,6 +132,20 @@ def pallas_select(scores, topk=10, block_rows=256, weight_scores=None, interpret
     )
     kernel = _select_kernel if weight_scores is None else _select_kernel_split
     operands = (scores,) if weight_scores is None else (scores, weight_scores)
+    if expert_id_map is not None:
+        if expert_id_map.shape != (N,) or not jnp.issubdtype(
+            expert_id_map.dtype, jnp.integer
+        ):
+            raise ValueError("expert_id_map must contain one integer per expert")
+        kernel = functools.partial(
+            _select_kernel_mapped, separate_weights=weight_scores is not None
+        )
+        bs = (in_spec, in_spec, pl.BlockSpec((1, N), lambda i: (0, 0)))
+        operands = (
+            scores,
+            scores if weight_scores is None else weight_scores,
+            expert_id_map.astype(jnp.int32)[None, :],
+        )
     return pl.pallas_call(
         functools.partial(kernel, topk=topk, n=N),
         grid=grid,
