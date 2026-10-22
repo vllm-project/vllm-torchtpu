@@ -100,6 +100,7 @@ if TYPE_CHECKING:
     TPU_GDN_PREFILL_CHECKPOINT: bool = True
     VLLM_TPU_QSA_DECODE_QUERY_BLOCK: int = 0
     VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
+    VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -521,6 +522,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of 128). Only read when VLLM_TPU_QSA_DECODE_QUERY_BLOCK > 0.
     "VLLM_TPU_QSA_DECODE_KV_BLOCK": env_nonnegative_int(
         "VLLM_TPU_QSA_DECODE_KV_BLOCK", 1024
+    ),
+    # Qwen4-exp QSA decode/verify attention: run the decode rows (and the
+    # decode prefix of mixed steps) on the fused sparse GQA decode kernel
+    # (kernels/sparse_gqa_decode) instead of batched RPA. Inputs outside the
+    # kernel's static envelope (non-TPU7x, unsupported shapes) still use RPA.
+    "VLLM_TPU_QSA_FUSED_SPARSE_DECODE": env_bool(
+        "VLLM_TPU_QSA_FUSED_SPARSE_DECODE", default=False
     ),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4

@@ -3,7 +3,8 @@
 
 Scheduler pages remain intact. Selected compression groups become virtual RPA
 pages by a view; the returned cache is threaded through donation, never dropped.
-Prefill reuses KV tiles through block-sparse attention; decode uses batched RPA.
+Prefill reuses KV tiles through block-sparse attention; decode uses batched RPA,
+or the fused sparse GQA decode kernel under VLLM_TPU_QSA_FUSED_SPARSE_DECODE.
 """
 
 import functools
@@ -11,6 +12,7 @@ import functools
 import jax
 import jax.numpy as jnp
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.qwen4_exp.decode_indexer import select_decode_blocks
 from vllm_torchtpu.kernels.qwen4_exp.qsa import (
     _token_metadata,
@@ -195,6 +197,97 @@ def rpa_attention(
     return output.reshape(-1, *q.shape[1:])[: len(q)], cache
 
 
+def fused_sparse_decode(
+    q,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    *,
+    kv_heads,
+    ratio,
+    k_scale=1.0,
+    v_scale=1.0,
+    kv_head_offset=0,
+):
+    """``rpa_attention`` on the fused sparse GQA decode kernel, or None.
+
+    Same contract as ``rpa_attention``: one query row per token, gated output
+    (the kernel applies the sigmoid gate before its output DMA, so callers
+    must not gate again), zero rows for zero lengths, and the cache returned
+    unchanged through donation. Returns None when the inputs fall outside the
+    kernel's static envelope (non-TPU7x, unsupported shapes or dtypes) so the
+    caller can fall back to RPA.
+
+    ``kv_head_offset`` follows ``rpa_attention``: the kernel reads a row's
+    leading heads, so the cache presents ``kv_head_offset + kv_heads`` heads
+    and zero queries/gates attend the heads ahead of this layer's.
+    """
+    from vllm_torchtpu.kernels import sparse_gqa_decode
+    from vllm_torchtpu.kernels.sparse_gqa_decode import decode
+
+    if kv_heads <= 0 or kv_head_offset < 0 or q.shape[1] % kv_heads:
+        return None
+    skipped_heads = kv_head_offset * (q.shape[1] // kv_heads)
+    if skipped_heads:
+        pad = ((0, 0), (skipped_heads, 0), (0, 0))
+        q, gate = jnp.pad(q, pad), jnp.pad(gate, pad)
+    options = dict(
+        kv_heads=kv_heads + kv_head_offset,
+        ratio=ratio,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    launch = sparse_gqa_decode.plan_decode(
+        q, gate, blocks, lengths, table, cache, **options
+    )
+    if launch is None:
+        return None
+    out, cache = decode.execute_decode(
+        q,
+        gate,
+        blocks,
+        lengths,
+        table,
+        cache,
+        launch=launch,
+        k_scale=k_scale,
+        v_scale=v_scale,
+    )
+    return (out[:, skipped_heads:] if skipped_heads else out), cache
+
+
+def decode_attention(
+    q,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    *,
+    kv_heads,
+    ratio,
+    k_scale=1.0,
+    v_scale=1.0,
+    kv_head_offset=0,
+    fused=None,
+):
+    """Per-row decode attention: fused sparse decode when enabled, else RPA.
+
+    ``fused`` defaults to ``VLLM_TPU_QSA_FUSED_SPARSE_DECODE`` (read at trace
+    time). Ineligible inputs fall back to RPA.
+    """
+    options = dict(kv_heads=kv_heads, ratio=ratio, k_scale=k_scale, v_scale=v_scale)
+    if kv_head_offset:
+        options["kv_head_offset"] = kv_head_offset
+    if envs.VLLM_TPU_QSA_FUSED_SPARSE_DECODE if fused is None else fused:
+        result = fused_sparse_decode(q, gate, blocks, lengths, table, cache, **options)
+        if result is not None:
+            return result
+    return rpa_attention(q, gate, blocks, lengths, table, cache, **options)
+
+
 def _prefill_attention(
     query,
     gate,
@@ -254,7 +347,10 @@ def qsa_attention(
     kv_head_offset=0,
     max_query_len=1,
 ):
-    """Route a decode prefix to unchanged RPA and the remaining rows to prefill.
+    """Route a decode prefix to per-row decode and the remaining rows to prefill.
+
+    Decode rows run on batched RPA, or on the fused sparse GQA decode kernel
+    when ``VLLM_TPU_QSA_FUSED_SPARSE_DECODE`` is set and the inputs qualify.
 
     ``max_query_len`` is the most tokens a decoding request carries in one step
     (``num_speculative_tokens + 1`` under MTP). A step with at most that many
@@ -269,7 +365,7 @@ def qsa_attention(
     if kv_head_offset:
         options["kv_head_offset"] = kv_head_offset
     if len(query) <= (len(starts) - 1) * max_query_len:
-        return rpa_attention(query, gate, blocks, lengths, table, cache, **options)
+        return decode_attention(query, gate, blocks, lengths, table, cache, **options)
 
     # RPA rows: one per request row, times the tokens a verify request holds.
     capacity = min(len(query), (len(starts) - 1) * max_query_len)
@@ -281,7 +377,7 @@ def qsa_attention(
     # the cache threads through both kernels exactly once.
     prefix = short_request_prefix_tokens(starts, capacity)
     decode_lengths = jnp.where(jnp.arange(capacity) < prefix, lengths[:capacity], 0)
-    decoded, cache = rpa_attention(
+    decoded, cache = decode_attention(
         query[:capacity],
         gate[:capacity],
         blocks[:capacity],
