@@ -30,6 +30,7 @@ This lives outside eagle3.py because that module uses postponed annotations,
 which ``support_torch_compile`` cannot read.
 """
 
+import inspect
 from typing import Any, Protocol
 
 import torch
@@ -113,7 +114,12 @@ def build_mtp_fused_loop(
     """Compile `_MtpFusedLoop` with the draft's own dynamic dims (Qwen3.5's
     MTP marks positions -1, DeepSeek's 0), so both programs specialise the
     token dimension the same way."""
-    cls = support_torch_compile(dynamic_arg_dims=dict(dynamic_arg_dims))(
+    # Keep only the draft dims the loop's forward takes: a draft-only
+    # argument (e.g. Qwen4ExpMTP's `draft_rows`) makes support_torch_compile
+    # reject the loop, which then silently falls back to per-step dispatch.
+    loop_args = inspect.signature(_MtpFusedLoop.forward).parameters
+    dims = {k: v for k, v in dict(dynamic_arg_dims).items() if k in loop_args}
+    cls = support_torch_compile(dynamic_arg_dims=dims)(
         type("MtpFusedLoop", (_MtpFusedLoop,), {})
     )
     return cls(vllm_config=vllm_config, prefix=prefix, mtp=mtp, num_steps=num_steps)
