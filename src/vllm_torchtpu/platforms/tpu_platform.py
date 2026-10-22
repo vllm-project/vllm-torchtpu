@@ -351,9 +351,8 @@ def _register_tpu_kv_connectors() -> None:
     exception in the AsyncLLM output handler, causing HTTP 500 errors on
     subsequent requests.
 
-    Invoked from check_and_update_config() in every process that builds a VllmConfig
-    (including the API server). Defers imports lazily until connector names
-    are accessed.
+    Applied at platform, engine-core and worker startup, including spawned
+    workers that receive an existing VllmConfig. Connector imports remain lazy.
     """
     global _tpu_kv_connectors_registered
     if _tpu_kv_connectors_registered:
@@ -364,6 +363,10 @@ def _register_tpu_kv_connectors() -> None:
 
     for name, module_path in (
         ("TPURaidenConnector", "vllm_torchtpu.distributed.kv_transfer.tpu_connector"),
+        (
+            "Qwen4ExpRaidenConnector",
+            "vllm_torchtpu.models.vllm.qwen4_exp.pd_connector",
+        ),
         (
             "TPUMultiConnector",
             "vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector",
@@ -677,8 +680,6 @@ class TpuPlatform(Platform):
         patch_registry.apply(
             "platform_activation", model_config=vllm_config.model_config
         )
-        _register_tpu_kv_connectors()
-
         if vllm_envs.VLLM_TPU_USING_PATHWAYS:
             raise NotImplementedError(
                 "Pathways is not supported by vllm-torchtpu. "
@@ -1049,6 +1050,7 @@ class TpuPlatform(Platform):
                 "DecodeBenchConnector",
                 "TPUConnector",
                 "TPURaidenConnector",
+                "Qwen4ExpRaidenConnector",
                 "TPUMultiConnector",
                 "TPURaidenOffloadingConnector",
             }

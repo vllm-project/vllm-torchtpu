@@ -531,6 +531,8 @@ class TestTpuPlatform:
     def test_check_and_update_config_accepts_tpu_disagg_connectors(
         self, mock_prepare_env, mock_apply_patches, vllm_config, connector_name
     ):
+        # This test mocks lifecycle callbacks and checks config validation only.
+        tpu_platform._register_tpu_kv_connectors()
         vllm_config.kv_transfer_config = KVTransferConfig(
             kv_connector=connector_name, kv_role="kv_both"
         )
@@ -671,6 +673,8 @@ class TestTpuPlatform:
         pool_env,
         expect_error,
     ):
+        # This test mocks lifecycle callbacks and checks the pool requirement.
+        tpu_platform._register_tpu_kv_connectors()
         vllm_config.model_config.is_hybrid = is_hybrid
         vllm_config.cache_config.block_size = 256
         vllm_config.cache_config.cache_dtype = "auto"
@@ -909,6 +913,7 @@ def test_config_hook_registers_tpu_kv_connectors_by_name():
 
     for name in (
         "TPURaidenConnector",
+        "Qwen4ExpRaidenConnector",
         "TPUMultiConnector",
         "TPURaidenOffloadingConnector",
     ):

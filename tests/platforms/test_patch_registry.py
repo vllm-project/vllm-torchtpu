@@ -225,6 +225,7 @@ def test_manifest_preserves_lifecycle_dependencies():
     }
     assert stages["import"] == ["_patch_jax_pallas_fori_lowering"]
     assert stages["engine_core"] == [
+        "_register_tpu_kv_connectors",
         "_patch_vllm_hybrid_pcp_block_sizes",
         "_patch_vllm_dcp_fine_prefix_hits",
         "_patch_vllm_mamba_split_scheduler_block_size",
@@ -250,6 +251,32 @@ def test_manifest_preserves_lifecycle_dependencies():
         assert names.index("_patch_vllm_force_v1_runner_tpu") < names.index(
             "_patch_vllm_config_triton_tpu"
         )
+
+
+@pytest.mark.parametrize("stage", ["engine_core", "worker_init"])
+def test_fresh_process_registers_connectors_without_config_construction(stage):
+    import os
+    import subprocess
+
+    env = dict(os.environ, TORCH_DEVICE_BACKEND_AUTOLOAD="0", JAX_PLATFORMS="cpu")
+    code = f"""
+from vllm_torchtpu import patch_registry
+from vllm.distributed.kv_transfer.kv_connector.factory import KVConnectorFactory
+assert 'TPURaidenConnector' not in KVConnectorFactory._registry
+patch_registry.apply({stage!r})
+patch_registry.apply({stage!r})
+for name in ('TPURaidenConnector', 'TPUMultiConnector',
+             'TPURaidenOffloadingConnector'):
+    assert KVConnectorFactory.get_connector_class_by_name(name).__name__ == name
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=90,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def test_plugin_import_sets_environment_before_jax():
