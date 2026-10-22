@@ -372,6 +372,19 @@ class Eagle3Proposer:
                 "freezes; the combination is unvalidated."
             )
 
+    def _padded_draft_rows(self, last_token_indices: torch.Tensor) -> torch.Tensor:
+        """Draft step 0's row selection at a fixed length of max_num_reqs.
+
+        The draft's compiled program is picked by the step's token bucket, but
+        the padded request count p varies within a bucket; a `draft_rows` of
+        length p therefore mismatched the traced program
+        (RuntimeProgramInputMismatch). Pad with -1 (no row) to max_num_reqs.
+        """
+        pad = self.runner.max_num_reqs - last_token_indices.shape[0]
+        if pad <= 0:
+            return last_token_indices
+        return torch.nn.functional.pad(last_token_indices, (0, pad), value=-1)
+
     def _resolve_draft_rows(self) -> bool:
         """Whether draft step 0 runs at each request's last token only.
 
@@ -1363,8 +1376,16 @@ class Eagle3Proposer:
                 seq_lens_delta=0,
                 num_rejected_np=rejected_np_per_chunk[ci],
                 num_tokens_padded=input_ids.shape[0],
-                draft_rows=last_token_indices if self._draft_rows else None,
+                draft_rows=(
+                    self._padded_draft_rows(last_token_indices)
+                    if self._draft_rows
+                    else None
+                ),
             )
+            if self._draft_rows:
+                # Drop the rows padded up to max_num_reqs (see _padded_draft_rows).
+                rows = last_token_indices.shape[0]
+                last_hidden, hidden = last_hidden[:rows], hidden[:rows]
             # [p, h] / [p] carries + first-pass draft token, computed in compiled
             # regions (the three gathers, then lm-head+argmax) so torch-tpu's
             # eager DEFER_AND_FUSE path can't fuse them into per-context programs.

@@ -1065,8 +1065,11 @@ def test_propose_with_draft_rows_uses_row_outputs_as_carries():
         calls.append((step_idx, draft_rows, positions.clone()))
         n = input_ids.shape[0] if draft_rows is None else len(draft_rows)
         if step_idx == 0:
-            assert n == 4
-            value = torch.tensor([11.0, 22.0, 0.0, 0.0], device=device)
+            # Padded to max_num_reqs with -1 so the traced program's shape
+            # does not depend on the padded request count.
+            assert n == 16
+            value = torch.zeros(16, device=device)
+            value[:2] = torch.tensor([11.0, 22.0], device=device)
         else:
             value = torch.full((n,), 5.0 + step_idx, device=device)
         hidden = value[:, None].expand(n, hidden_size).contiguous()
@@ -1080,7 +1083,8 @@ def test_propose_with_draft_rows_uses_row_outputs_as_carries():
         scheduler_output=SimpleNamespace(num_scheduled_tokens={}),
     )
     assert drafts == [[11, 6], [22, 6]]
-    assert calls[0][0] == 0 and torch.equal(calls[0][1], last)
+    assert calls[0][0] == 0 and torch.equal(calls[0][1][:4], last)
+    assert (calls[0][1][4:] == -1).all()
     # The loop step starts from the gathered step-0 positions, plus one.
     assert calls[1][1] is None
     assert calls[1][2][:2].tolist() == [103, 107]
