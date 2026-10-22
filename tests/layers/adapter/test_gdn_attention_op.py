@@ -1969,7 +1969,10 @@ def test_qwen_decoder_constructs_real_static_preparation_layer(
     )
     monkeypatch.setattr(VllmGatedDeltaNetAttention, "_create_conv1d", lambda self: None)
     monkeypatch.setattr(VllmGatedDeltaNetAttention, "_build_gdn_op", lambda self: None)
-    monkeypatch.setattr(model, "_hc_config", lambda cfg: object())
+    monkeypatch.setattr(
+        model, "get_tp_group", lambda: SimpleNamespace(rank_in_group=0, world_size=1)
+    )
+    monkeypatch.setattr(model, "hc_config", lambda cfg: object())
     monkeypatch.setattr(model, "GatedResidual", lambda *a, **kw: torch.nn.Identity())
     monkeypatch.setattr(
         model, "Qwen3NextSparseMoeBlock", lambda *a, **kw: torch.nn.Identity()
@@ -1997,7 +2000,7 @@ def test_qwen_decoder_constructs_real_static_preparation_layer(
         set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=kernel_config),
         patch.object(gdn_attention_op.pallas, "jax_op", side_effect=register),
     ):
-        layer = model.Qwen4ExpDecoderLayer(cfg, "model.layers.0")
+        layer = model.Qwen4ExpDecoderLayer(cfg, 0, "model.layers.0")
     attention = layer.linear_attn
     assert type(attention) is gdn.Qwen4ExpGatedDeltaNetAttention
     assert attention._bm_kernel

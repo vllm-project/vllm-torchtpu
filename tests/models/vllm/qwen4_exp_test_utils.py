@@ -67,51 +67,51 @@ _TEXT_CONFIG = {
         "linear_attention",
         "linear_attention",
         "linear_attention",
-        "full_attention",
+        "indexed_attention",
         "linear_attention",
         "linear_attention",
         "linear_attention",
-        "full_attention",
+        "indexed_attention",
         "linear_attention",
         "linear_attention",
         "linear_attention",
-        "full_attention",
+        "indexed_attention",
         "linear_attention",
         "linear_attention",
         "linear_attention",
-        "full_attention",
+        "indexed_attention",
         "linear_attention",
         "linear_attention",
         "linear_attention",
-        "full_attention",
+        "indexed_attention",
         "linear_attention",
         "linear_attention",
         "linear_attention",
-        "full_attention",
+        "indexed_attention",
         "linear_attention",
         "linear_attention",
         "linear_attention",
-        "full_attention",
+        "indexed_attention",
         "linear_attention",
         "linear_attention",
         "linear_attention",
-        "full_attention",
+        "indexed_attention",
         "linear_attention",
         "linear_attention",
         "linear_attention",
-        "full_attention",
+        "indexed_attention",
         "linear_attention",
         "linear_attention",
         "linear_attention",
-        "full_attention",
+        "indexed_attention",
         "linear_attention",
         "linear_attention",
         "linear_attention",
-        "full_attention",
+        "indexed_attention",
         "linear_attention",
         "linear_attention",
         "linear_attention",
-        "full_attention",
+        "indexed_attention",
     ],
     "attention_bias": False,
 }
@@ -121,3 +121,91 @@ def q4exp_text_config(**overrides):
     values = deepcopy(_TEXT_CONFIG)
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def qsa_test_pools(model, pages):
+    """Actual dual-store shapes from the configured native pool plan."""
+    import math
+
+    import torch
+    from vllm.config.cache import CacheConfig
+
+    from vllm_torchtpu.models.vllm.qwen4_exp.pool_layout import pooled_cache_specs
+
+    cfg = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_text_config=model.config, dtype=torch.bfloat16, max_model_len=8192
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=model.tp_size),
+        cache_config=CacheConfig(
+            block_size=128,
+            cache_dtype=model.cache_dtype,
+            enable_prefix_caching=False,
+            mamba_cache_mode="none",
+        ),
+    )
+    layout, _ = pooled_cache_specs(cfg)
+    packing = 4 if model.fp8_kv else 2
+    main = torch.zeros(
+        (
+            pages,
+            layout.block_size,
+            math.ceil(2 * model.num_kv_heads / packing),
+            packing,
+            math.ceil(model.head_dim / 128) * 128,
+        ),
+        dtype=torch.float8_e4m3fn if model.fp8_kv else torch.bfloat16,
+    )
+    index = torch.zeros(
+        (pages, layout.index_rows // 2, 1, 2, layout.compressed_width),
+        dtype=torch.bfloat16,
+    )
+    return (main, index), layout
+
+
+def qsa_forward_context(monkeypatch, model, metadata):
+    from vllm_torchtpu.models.vllm.qwen4_exp import qsa
+
+    main = SimpleNamespace(block_tables=metadata.main_block_table)
+    ring = SimpleNamespace(block_tables=metadata.state_slots)
+    monkeypatch.setattr(
+        qsa,
+        "get_forward_context",
+        lambda: SimpleNamespace(
+            attn_metadata={model.prefix: main, model.prefix + ".raw_ring": ring}
+        ),
+    )
+
+
+def encode_pool_history(pool, history):
+    """Independent CPU Mosaic packing for a BF16 history prefix in either carrier."""
+    import torch
+
+    assert pool.device.type == history.device.type == "cpu"
+    count, width = pool.shape[0], pool.shape[-1]
+    rows = (history[0].numel() + width - 1) // width
+    padded = torch.zeros((count, rows * width), dtype=torch.bfloat16)
+    padded[:, : history[0].numel()] = history.reshape(count, -1)
+    if pool.dtype == torch.bfloat16:
+        pool.reshape(count, -1)[:, : rows * width] = padded
+    else:
+        assert pool.dtype == torch.float8_e4m3fn
+        bits = padded.view(torch.uint16).to(torch.int32).reshape(count, rows, width)
+        planes = torch.stack((bits & 255, bits >> 8), dim=-2).to(torch.uint8)
+        pool.view(torch.uint8).reshape(count, -1, 2, width)[:, :rows] = planes
+    return pool
+
+
+def decode_pool_history(pool, shape):
+    """Read BF16 lane words without calling production region readers."""
+    import torch
+
+    count, width = pool.shape[0], pool.shape[-1]
+    if pool.dtype == torch.bfloat16:
+        values = pool.reshape(count, -1)
+    else:
+        assert pool.dtype == torch.float8_e4m3fn
+        planes = pool.view(torch.uint8).reshape(count, -1, 2, width).to(torch.int32)
+        words = (planes[:, :, 0] | (planes[:, :, 1] << 8)).to(torch.uint16)
+        values = words.view(torch.bfloat16).reshape(count, -1)
+    return values[:, : shape[1] * shape[2]].reshape(shape)

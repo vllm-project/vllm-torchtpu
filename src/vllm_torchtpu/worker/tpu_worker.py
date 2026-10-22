@@ -50,6 +50,7 @@ from vllm_torchtpu import envs, profiler_trace, utils
 from vllm_torchtpu.distributed.pcp_rank_order import pcp_topology_order
 from vllm_torchtpu.layers.adapter.attention import TPU_STR_DTYPE_TO_TORCH_DTYPE
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.parallel_requirements import requires_dp_collectives
 from vllm_torchtpu.runner.tpu_pooling import compute_pooling_kv_cache_cap_bytes
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 from vllm_torchtpu.worker.runai_repull import ensure_runai_aux_files
@@ -206,12 +207,14 @@ class TPUWorker(WorkerBase):
         pc = self.parallel_config
         dp_size = utils.get_dp_size(pc)
         pcp_size = pc.prefill_context_parallel_size
+        dp_collectives = requires_dp_collectives(self.vllm_config)
         binding = get_tpu_worker_binding(
             pc,
             self.rank,
             self.local_rank,
             env=os.environ,
             use_spawned_pcp_local_rank=True,
+            dp_collectives=dp_collectives,
         )
         # Slice-global rank: unique per worker process across DP replicas and
         # TP/PP ranks, which is what trace filenames must be keyed on. Set
@@ -223,9 +226,9 @@ class TPUWorker(WorkerBase):
             per_engine_world = pc.world_size
             dp_rank = binding.dp_rank
 
-            # TorchTPU uses independent per-engine tpu_dist worlds unless EP
-            # needs a unified DP*TP world for expert collectives.
-            if pc.enable_expert_parallel:
+            # Cross-DP model collectives (EP or resident PLE) need one
+            # unified world; independent replicas retain isolated worlds.
+            if dp_collectives:
                 pc.data_parallel_size = dp_size
                 pc.data_parallel_rank = dp_rank
                 if pc.data_parallel_rank_local is None:
@@ -247,7 +250,7 @@ class TPUWorker(WorkerBase):
             os.environ["MASTER_ADDR"] = str(master_addr)
             os.environ["MASTER_PORT"] = str(master_port)
 
-            if pc.enable_expert_parallel:
+            if dp_collectives:
                 # Setting data_parallel_size above puts
                 # init_distributed_environment() on its DP path, where it
                 # discards the rank and the init method it was handed and

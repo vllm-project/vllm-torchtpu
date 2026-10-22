@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""QSA over one donated pool, with independent group-native block tables."""
+"""QSA over donated main and BF16 index pools with shared logical block IDs."""
 
 import functools
 import math
@@ -280,7 +280,19 @@ def _compressed_rows(ratio):
     return 128 // ratio
 
 
-def write_compressed(pool, keys, complete, req, logical, starts, context, table, ratio):
+def write_compressed(
+    pool,
+    keys,
+    complete,
+    req,
+    logical,
+    starts,
+    context,
+    table,
+    ratio,
+    *,
+    logical_block_size=None,
+):
     """One writer per BF16 pair, preserving the other half of partial pairs.
 
     An FP8 carrier packs two BF16 rows in one 32-bit sublane. Writing a lone
@@ -297,8 +309,9 @@ def write_compressed(pool, keys, complete, req, logical, starts, context, table,
     group = logical // ratio
     end = context[req] + starts[req + 1] - starts[req]
     write = complete & ((group % 2 == 1) | (logical + ratio >= end))
-    pair = table[req, logical // pool.shape[1]] * pairs_per_page + (
-        logical % pool.shape[1]
+    block_size = pool.shape[1] if logical_block_size is None else logical_block_size
+    pair = table[req, logical // block_size] * pairs_per_page + (
+        logical % block_size
     ) // (2 * ratio)
     first_end = (group // 2 * 2 + 1) * ratio - 1
     local = (
@@ -514,6 +527,8 @@ def select_blocks(
     ratio,
     block_topk,
     topk_backend: TopKBackend | None = None,
+    logical_block_size=None,
+    vmem_limit_bytes=None,
 ):
     """Read BF16 key tiles directly from the carrier, without a cache conversion."""
     width = pool.shape[-1]
@@ -522,8 +537,13 @@ def select_blocks(
     physical_pages = (
         math.prod(pool.shape[1:]) * pool.dtype.itemsize // (rows * width * 2)
     )
-    logical_pages = pool.shape[1] // 128
+    logical_pages = (
+        pool.shape[1] if logical_block_size is None else logical_block_size
+    ) // 128
     cache = pool.reshape(-1, rows // 2, packing, width)
+    resource_options = (
+        {} if vmem_limit_bytes is None else {"vmem_limit_bytes": vmem_limit_bytes}
+    )
 
     def expand_pages(pages):
         return (pages[..., None] * physical_pages + jnp.arange(logical_pages)).reshape(
@@ -541,10 +561,11 @@ def select_blocks(
         ratio=ratio,
         block_topk=block_topk,
         topk_backend=topk_backend,
+        **resource_options,
     )
 
 
-def pooled_qsa_step(
+def compact_pooled_qsa_step(
     qgate: jax.Array,
     key: jax.Array,
     value: jax.Array,
@@ -556,6 +577,7 @@ def pooled_qsa_step(
     positions: jax.Array,
     trig: jax.Array,
     pool: jax.Array,
+    index_pool: jax.Array,
     starts: jax.Array,
     context: jax.Array,
     ring_ids: jax.Array,
@@ -569,7 +591,16 @@ def pooled_qsa_step(
     v_scale: float = 1.0,
     *,
     topk_backend: TopKBackend | None = None,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    # Keep the persisted custom-op parameter name while naming its main owner.
+    main_pool = pool
+    if len(qgate) == 0:
+        return (
+            main_pool,
+            index_pool,
+            jnp.empty((0, qgate.shape[1] // 2), jnp.bfloat16),
+            jnp.empty((0, token_topk + compress_ratio - 1), jnp.int32),
+        )
     # Keep the Runner's flat group tables at the Torch boundary. Static JAX
     # shapes reconstruct their per-request rows inside the operator.
     main_table = main_table.reshape(len(context), -1)
@@ -586,20 +617,24 @@ def pooled_qsa_step(
     active = starts[1:] > starts[:-1]
     slots = jnp.where(active, jnp.arange(len(ring_ids), dtype=jnp.int32), -1)
     req, logical, valid = _token_metadata(len(q), starts, context, slots)
-    page = jnp.where(valid, main_table[req, logical // pool.shape[1]], len(pool))
-    fp8 = pool.dtype == jnp.float8_e4m3fn
-    pool = write_main_cache(
-        pool,
+    page = jnp.where(
+        valid, main_table[req, logical // main_pool.shape[1]], len(main_pool)
+    )
+    fp8 = main_pool.dtype == jnp.float8_e4m3fn
+    main_pool = write_main_cache(
+        main_pool,
         pack_rows(k, v, fp8=fp8, k_scale=k_scale, v_scale=v_scale),
         page,
         logical,
         valid,
     )
+    # Retain the write dependency across the two owners.
+    main_pool, index_pool = jax.lax.optimization_barrier((main_pool, index_pool))
     # The persistent ring/tag ABI pads request rows to eight logical lanes;
     # VMEM padding of those typed views is independently handled by lowering.
     ring_rows = (compress_ratio + 7) // 8 * 8
     ring_elements = ring_rows * raw.shape[-1]
-    ring, tags = read_ring_and_tags(pool, ring_ids, ring_elements, ring_rows * 2)
+    ring, tags = read_ring_and_tags(index_pool, ring_ids, ring_elements, ring_rows * 2)
     ring = ring.reshape(len(ring_ids), ring_rows, -1)
     tags = tags.reshape(len(ring_ids), ring_rows, 2)
     completed, complete, req, logical, ring, tags = _indexer_updates(
@@ -616,8 +651,8 @@ def pooled_qsa_step(
         norm_eps,
         rotary_dim,
     )
-    pool = write_compressed(
-        pool,
+    index_pool = write_compressed(
+        index_pool,
         completed,
         complete,
         req,
@@ -626,15 +661,16 @@ def pooled_qsa_step(
         context,
         compressed_table,
         compress_ratio,
+        logical_block_size=main_pool.shape[1],
     )
     ids = jnp.where(active, ring_ids, 0)
-    pool = write_ring_and_tags(
-        pool, ring.reshape(len(ids), -1), tags.reshape(len(ids), -1), ids
+    index_pool = write_ring_and_tags(
+        index_pool, ring.reshape(len(ids), -1), tags.reshape(len(ids), -1), ids
     )
     lengths = jnp.where(valid, logical + 1, 0).astype(jnp.int32)
     blocks = select_blocks(
         iq,
-        pool,
+        index_pool,
         lengths,
         compressed_table,
         req,
@@ -643,27 +679,30 @@ def pooled_qsa_step(
         ratio=compress_ratio,
         block_topk=token_topk // compress_ratio,
         topk_backend=topk_backend,
+        logical_block_size=main_pool.shape[1],
+        vmem_limit_bytes=pltpu.get_tpu_info().vmem_capacity_bytes,
     )
-    output, pool = qsa_attention(
+    output, main_pool = qsa_attention(
         q,
         gate,
         blocks,
         lengths,
         main_table[req],
-        pool,
+        main_pool,
         starts,
         kv_heads=k.shape[1],
         ratio=compress_ratio,
         k_scale=k_scale if fp8 else 1.0,
         v_scale=v_scale if fp8 else 1.0,
     )
-    return (
-        pool,
+    result = (
+        main_pool,
         output.reshape(len(q), -1),
         selected_tokens(blocks, lengths, token_topk, compress_ratio),
     )
 
+    return main_pool, index_pool, *result[1:]
 
-# Bind the protocol object outside the Torch schema: jax_op accepts only POD
-# static arguments. Factories may bind a different immutable backend with partial.
-pooled_qsa_step = functools.partial(pooled_qsa_step, topk_backend=None)
+
+# Keep the protocol object outside the POD-only Torch custom-op schema.
+compact_pooled_qsa_step = functools.partial(compact_pooled_qsa_step, topk_backend=None)
