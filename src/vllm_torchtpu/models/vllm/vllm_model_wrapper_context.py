@@ -24,6 +24,7 @@ class VllmModelWrapperContext:
     # TODO need discussion, ullm use this context to manager kv_caches
     # while vllm binds the KV cache to the attention layer
     mesh: Mesh
+    is_prefill: bool = False
     kv_caches: list[torch.Tensor] | None = None
     layer_name_to_kvcache_index: dict[str, int] | None = None
     vllm_config: object | None = None
@@ -75,12 +76,14 @@ def set_vllm_model_wrapper_context(
     layer_name_to_kvcache_index: dict[str, int] | None = None,
     vllm_config: object | None = None,
     kv_cache_bundle: torch.Tensor | None = None,
+    is_prefill: bool = False,
 ):
     global _vllm_model_wrapper_context
     prev_context = _vllm_model_wrapper_context
     _vllm_model_wrapper_context = VllmModelWrapperContext(
         kv_caches=kv_caches,
         mesh=mesh,
+        is_prefill=is_prefill,
         layer_name_to_kvcache_index=layer_name_to_kvcache_index,
         vllm_config=vllm_config,
         kv_cache_bundle=kv_cache_bundle,

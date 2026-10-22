@@ -145,12 +145,13 @@ def test_native_replica_groups_reach_prebuilt_op():
         ("sqrtsoftplus", True, 0.75),
     ],
 )
+@pytest.mark.parametrize("tile_m", [128, 256])
 def test_replica_groups_are_part_of_op_cache_and_kernel_call(
-    monkeypatch, sharded_plan, scoring_fn, has_bias, scale
+    monkeypatch, sharded_plan, scoring_fn, has_bias, scale, tile_m
 ):
     from unittest.mock import Mock
 
-    from vllm_torchtpu.kernels.fused_moe import v2
+    from vllm_torchtpu.kernels.fused_moe import v2, v2_prefill
 
     monkeypatch.setattr(bridge, "_OPS", {})
     closures = []
@@ -163,7 +164,7 @@ def test_replica_groups_are_part_of_op_cache_and_kernel_call(
     # jax_op; the local shim it used to go through is gone.
     monkeypatch.setattr(bridge, "jax_op", build)
     kernel = Mock(side_effect=lambda x, *args, **kwargs: x)
-    monkeypatch.setattr(v2, "fused_ep_moe_v2", kernel)
+    monkeypatch.setattr(v2_prefill if tile_m == 256 else v2, "fused_ep_moe_v2", kernel)
     groups = ((0, 1),)
     args = (None, 2, True, "silu", None, sharded_plan)
     options = dict(
@@ -171,18 +172,22 @@ def test_replica_groups_are_part_of_op_cache_and_kernel_call(
         has_score_bias=has_bias,
         routed_scaling_factor=scale,
         token_replica_groups=groups,
+        logical_intermediate_size=2304,
+        tile_m=tile_m,
     )
     replicated = bridge._build_op(*args, **options)
     assert bridge._build_op(*args, **options) is replicated
     # Every independent routing setting and the TP membership separate caches.
     for changed in (
         dict(token_replica_groups=((0,), (1,))),
+        dict(logical_intermediate_size=None),
+        dict(tile_m=256 if tile_m == 128 else 128),
         dict(scoring_fn="sigmoid" if scoring_fn == "softmax" else "softmax"),
         dict(has_score_bias=not has_bias),
         dict(routed_scaling_factor=scale + 1.0),
     ):
         assert bridge._build_op(*args, **(options | changed)) is not replicated
-    assert len(closures) == 5
+    assert len(closures) == 7
     x = jnp.ones((8, 8), dtype=jnp.bfloat16)
     bias = jnp.arange(4, dtype=jnp.bfloat16)
     operands = (
@@ -198,6 +203,8 @@ def test_replica_groups_are_part_of_op_cache_and_kernel_call(
         operands += (bias,)
     assert closures[0](*operands) is x
     forwarded = kernel.call_args.kwargs
+    assert forwarded["capacity"] == tile_m
+    assert forwarded["logical_intermediate_size"] == 2304
     assert forwarded["token_replica_groups"] == groups
     assert forwarded["scoring_fn"] == scoring_fn
     assert forwarded["routed_scaling_factor"] == scale
@@ -314,9 +321,11 @@ def test_qwen_4096_bucket_is_not_refused_by_smem():
     assert _prebuild(layer, topk=10, node_tokens=32768) == "op"
 
 
-def test_fixed_smem_working_set_is_still_checked():
+@pytest.mark.parametrize("tile_m,expected_bytes", [(128, 2048), (256, 3072)])
+def test_fixed_smem_working_set_is_still_checked(monkeypatch, tile_m, expected_bytes):
+    monkeypatch.setattr(bridge, "_TILE_M", tile_m)
     gather_bytes = token_gather_smem_bytes(bridge._TILE_M)
-    assert gather_bytes == 2048
+    assert gather_bytes == expected_bytes
     needed = bridge._SMEM_OVERHEAD_BYTES + gather_bytes
     assert _prebuild(_layer(), smem_bytes=needed) == "op"
     assert _prebuild(_layer(), smem_bytes=needed - 1) is None
@@ -1127,3 +1136,74 @@ def test_mxfp4_explicit_backend_never_silently_changes_to_gmm(required):
         else:
             assert method._prebuild_w4a8(layer, "silu", w13, w2, 512) is None
             build.assert_not_called()
+
+
+def test_phase_dispatch_uses_prebuilt_capacity_ops(monkeypatch):
+    from unittest.mock import Mock
+
+    from vllm_torchtpu.kernels.fused_moe import v2, v2_prefill
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        set_vllm_model_wrapper_context,
+    )
+
+    monkeypatch.setattr(bridge, "_OPS", {})
+    built = []
+
+    def build(name, fn, **kwargs):
+        built.append(name)
+        op = Mock(side_effect=fn)
+        return op
+
+    monkeypatch.setattr(bridge, "jax_op", build)
+    decode = Mock(side_effect=lambda x, *args, **kwargs: x)
+    prefill = Mock(side_effect=lambda x, *args, **kwargs: x)
+    monkeypatch.setattr(v2, "fused_ep_moe_v2", decode)
+    monkeypatch.setattr(v2_prefill, "fused_ep_moe_v2", prefill)
+    op = bridge._build_op(None, 2, True, "silu", None, False)
+    assert bridge._build_op(None, 2, True, "silu", None, False) is op
+    assert len(built) == len(set(built)) == 2
+    x = jnp.zeros((2048, 8), jnp.bfloat16)
+    operands = (x, None, None, None, None, jnp.zeros((2048, 4)), None)
+    for is_prefill, capacity in [(False, 128), (True, 256), (False, 128)]:
+        with set_vllm_model_wrapper_context(mesh=None, is_prefill=is_prefill):
+            assert op(*operands) is x
+        kernel = prefill if is_prefill else decode
+        assert kernel.call_args.kwargs["capacity"] == capacity
+    assert decode.call_count == 2
+    assert prefill.call_count == 1
+    assert len(built) == 2  # No mesh or op creation in the traced dispatch.
+
+
+def test_phase_dispatch_is_guarded_in_compiled_forward(monkeypatch):
+    from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+        set_vllm_model_wrapper_context,
+    )
+
+    monkeypatch.setattr(bridge, "_OPS", {})
+    built = []
+
+    def build(name, fn, **kwargs):
+        value = 128 if not built else 256
+        built.append(name)
+
+        def op(x):
+            return x + value
+
+        op.register_fake = lambda fake: None
+        return op
+
+    monkeypatch.setattr(bridge, "jax_op", build)
+    dispatch = bridge._build_op(None, 2, True, "silu", None, False)
+    graphs = []
+
+    def backend(graph, inputs):
+        graphs.append(graph)
+        return graph.forward
+
+    compiled = torch.compile(dispatch, backend=backend, fullgraph=True)
+    x = torch.zeros(2)
+    for phase, value in [(False, 128), (True, 256), (False, 128)]:
+        with set_vllm_model_wrapper_context(mesh=None, is_prefill=phase):
+            torch.testing.assert_close(compiled(x), x + value)
+    assert len(built) == 2
+    assert len(graphs) == 2

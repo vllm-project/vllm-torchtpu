@@ -747,6 +747,7 @@ class TPUModelRunner(GPUModelRunner):
         self._dp_step_max_reqs: int = 0
         self._draft_proposals_needed: bool = True
         self._dp_step_has_encoder_inputs = False
+        self._step_has_prefill = False
         self.check_recompilation = vllm_envs.VLLM_XLA_CHECK_RECOMPILATION
         self.use_spmd = vllm_envs.VLLM_XLA_USE_SPMD
 
@@ -3520,6 +3521,18 @@ class TPUModelRunner(GPUModelRunner):
                 return True
         return False
 
+    def _has_prefill_tokens(self, scheduler_output: "SchedulerOutput") -> bool:
+        """Include prompt work even for a one-token tail; spec verify is decode."""
+        for req_id, count in scheduler_output.num_scheduled_tokens.items():
+            if count <= 0:
+                continue
+            index = self.input_batch.req_id_to_index[req_id]
+            if int(self.input_batch.num_computed_tokens_cpu[index]) < int(
+                self.input_batch.num_prompt_tokens[index]
+            ):
+                return True
+        return False
+
     def _dp_coordinated_step(
         self,
         local_num_tokens: int,
@@ -3527,9 +3540,11 @@ class TPUModelRunner(GPUModelRunner):
         local_num_reqs: int = 0,
         has_encoder_inputs: bool = False,
         needs_draft_proposals: bool = True,
+        has_prefill: bool = False,
     ) -> "tuple[int | None, int]":
         """Return the DP-wide padded token bucket and forward chunk count."""
         self._draft_proposals_needed = needs_draft_proposals
+        self._step_has_prefill = has_prefill
         if not self._dp_lockstep_enabled():
             return None, local_num_chunks
         from vllm.distributed.parallel_state import get_dp_group
@@ -3545,6 +3560,7 @@ class TPUModelRunner(GPUModelRunner):
                 int(local_num_reqs),
                 int(has_encoder_inputs),
                 int(needs_draft_proposals),
+                int(has_prefill),
             ],
             dtype=torch.int64,
             device="cpu",
@@ -3560,6 +3576,7 @@ class TPUModelRunner(GPUModelRunner):
         self._dp_step_max_reqs = int(t[2].item())
         self._dp_step_has_encoder_inputs = bool(t[3].item())
         self._draft_proposals_needed = bool(t[4].item())
+        self._step_has_prefill = bool(t[5].item())
         return bucket, int(t[1].item())
 
     def _execute_dp_mm_encoder(
@@ -3617,6 +3634,7 @@ class TPUModelRunner(GPUModelRunner):
             self.max_num_blocks_per_req,
             use_max_model_len=True,
             dp_lockstep=True,
+            is_prefill=self._step_has_prefill,
         )
 
     def _run_dp_idle_pairing(self, bucket: int, num_chunks: int) -> None:
@@ -3703,6 +3721,7 @@ class TPUModelRunner(GPUModelRunner):
             local_num_reqs=local_max_chunk_reqs,
             has_encoder_inputs=bool(scheduler_output.scheduled_encoder_inputs),
             needs_draft_proposals=self._needs_draft_proposals(scheduler_output),
+            has_prefill=self._has_prefill_tokens(scheduler_output),
         )
         self._dp_step_num_chunks = target_num_chunks
 
@@ -3946,6 +3965,7 @@ class TPUModelRunner(GPUModelRunner):
                     mesh=self.mesh,
                     vllm_config=self.vllm_config,
                     kv_cache_bundle=self._kv_cache_bundle,
+                    is_prefill=self._step_has_prefill,
                 ),
                 self._stage_timing.stage("main_forward"),
             ):
@@ -5199,6 +5219,7 @@ class TPUModelRunner(GPUModelRunner):
         dp_lockstep: bool = False,
         profile_prefix: int | None = None,
         through_handoff: bool = False,
+        is_prefill: bool = False,
     ) -> float | None:
         """Run the forward at one bucket shape.
 
@@ -5391,6 +5412,7 @@ class TPUModelRunner(GPUModelRunner):
                 mesh=self.mesh,
                 vllm_config=self.vllm_config,
                 kv_cache_bundle=self._kv_cache_bundle,
+                is_prefill=profiling or is_prefill,
             ),
         ):
             if self.supports_mm_inputs and self._pp_is_first:

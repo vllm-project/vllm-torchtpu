@@ -131,8 +131,8 @@ def test_dp_draft_decision_includes_ready_peers_and_idle_ranks(peer_needs_draft)
     )
 
     def reduce(tensor, **kwargs):
-        assert tensor.tolist() == [0, 0, 0, 0, 0]
-        tensor.copy_(torch.tensor([2048, 2, 1, 0, int(peer_needs_draft)]))
+        assert tensor.tolist() == [0, 0, 0, 0, 0, 0]
+        tensor.copy_(torch.tensor([2048, 2, 1, 0, int(peer_needs_draft), 0]))
 
     with (
         patch("vllm.distributed.parallel_state.get_dp_group") as group,
@@ -2723,3 +2723,76 @@ def test_bucketed_drafts_preserve_real_request_offsets_across_chunks(verify):
     assert source[indices[1]].tolist() == [8, 22, 22]
     assert rejected.tolist() == ([2, 0, 0, 0, 0, 0] if verify else [0] * 6)
     assert counts == ({0: 2} if verify else {0: 0, 1: 0})
+
+
+@pytest.mark.parametrize(
+    "computed,prompt,scheduled,want",
+    [
+        (0, 100, 32, True),
+        (99, 100, 1, True),
+        (100, 100, 1, False),
+        (100, 100, 5, False),
+        (120, 100, 5, False),
+        (0, 100, 0, False),
+    ],
+)
+def test_moe_phase_tracks_prompt_work_not_query_width(
+    computed, prompt, scheduled, want
+):
+    runner = SimpleNamespace(
+        input_batch=SimpleNamespace(
+            req_id_to_index={"r": 0},
+            num_computed_tokens_cpu=[computed],
+            num_prompt_tokens=[prompt],
+        )
+    )
+    output = SimpleNamespace(num_scheduled_tokens={"r": scheduled})
+    assert TPUModelRunner._has_prefill_tokens(runner, output) is want
+    output.num_scheduled_tokens = {}
+    assert not TPUModelRunner._has_prefill_tokens(runner, output)
+
+
+@pytest.mark.parametrize("local,peer", [(False, True), (True, False), (False, False)])
+def test_moe_phase_is_dp_wide_in_existing_collective(local, peer):
+    runner = SimpleNamespace(
+        _dp_lockstep_enabled=lambda: True,
+        num_tokens_paddings=[128, 2048],
+    )
+
+    def reduce(tensor, **kwargs):
+        assert tensor.numel() == 6
+        assert bool(tensor[5].item()) is local
+        tensor[0] = 2048
+        tensor[1] = 1
+        tensor[5] = int(local or peer)
+
+    with (
+        patch("vllm.distributed.parallel_state.get_dp_group") as group,
+        patch.object(torch.distributed, "all_reduce", side_effect=reduce) as collective,
+    ):
+        group.return_value.cpu_group = "cpu-group"
+        TPUModelRunner._dp_coordinated_step(runner, 0, 0, has_prefill=local)
+    assert runner._step_has_prefill is (local or peer)
+    collective.assert_called_once()
+
+
+def test_moe_phase_without_dp_uses_local_prompt_state():
+    runner = SimpleNamespace(_dp_lockstep_enabled=lambda: False)
+    TPUModelRunner._dp_coordinated_step(runner, 32, 1, has_prefill=True)
+    assert runner._step_has_prefill
+    TPUModelRunner._dp_coordinated_step(runner, 5, 1, has_prefill=False)
+    assert not runner._step_has_prefill
+
+
+@pytest.mark.parametrize("phase", [False, True])
+def test_idle_moe_rank_uses_coordinated_phase(phase):
+    dummy = MagicMock()
+    runner = SimpleNamespace(
+        _step_has_prefill=phase,
+        num_reqs_max_model_len=8,
+        max_num_blocks_per_req=16,
+        _dummy_run=dummy,
+    )
+    TPUModelRunner._run_dp_dummy_chunk(runner, 2048)
+    assert dummy.call_args.kwargs["is_prefill"] is phase
+    assert dummy.call_args.kwargs["dp_lockstep"] is True

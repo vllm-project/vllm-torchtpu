@@ -65,6 +65,9 @@ from vllm_torchtpu.kernels.fused_moe.v2.host import (
     token_gather_smem_bytes,
 )
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+    get_vllm_model_wrapper_context,
+)
 
 logger = init_logger(__name__)
 
@@ -74,20 +77,18 @@ class FusedEPPolicy(StrEnum):
     REQUIRED = "required"
 
 
-# The tile height the kernel slabs rows into, and the unit its ragged stride
-# rounds to. The kernel's routing tables are built against this value, so it
-# is not free to change here alone.
-_TILE_M = 128
+# Prefill uses the larger tile; admission budgets the larger of both paths.
+# The runner synchronizes the phase across DP before the collective op runs.
+_TILE_M = 256
+_DECODE_TILE_M = 128
 
 # SMEM used by the resident routing tables and Mosaic's scalar working set,
 # excluding the two fixed token-gather windows. Measured by subtracting the
 # former full token-gather scalar-prefetch table at the allocation boundary.
 _SMEM_OVERHEAD_BYTES = 236 * 1024
 
-# One op for every shape: `fused_ep_moe_v2` derives its routing block and ragged
-# stride from the operands when they are not given, so nothing here has to vary
-# with the token count -- which is what keeps the token count out of the traced
-# graph.
+# Each phase has a prebuilt op; routing block/stride are derived from shape.
+# Phase selection is a host boolean, never a device-token-count heuristic.
 FUSED_MOE_EP_OP_NAME = "pallas::fused_moe_ep"
 
 # Ops are built at weight-load time and the compiled forward may only look them
@@ -184,9 +185,12 @@ def _build_op(
     *,
     token_replica_groups=None,
     logical_intermediate_size: int | None = None,
+    tile_m: int | None = None,
 ):
     """The op for this closure, built once per distinct closure and reused."""
-    from vllm_torchtpu.kernels.fused_moe.v2 import WeightFormat, fused_ep_moe_v2
+    from vllm_torchtpu.kernels.fused_moe import v2, v2_prefill
+
+    implementation = v2_prefill if tile_m == _TILE_M else v2
 
     key = (
         topk,
@@ -202,10 +206,40 @@ def _build_op(
         has_hash_ids,
         token_replica_groups,
         logical_intermediate_size,
+        tile_m,
     )
     cached = _OPS.get(key)
     if cached is not None:
         return cached
+
+    if tile_m is None:
+        options = dict(
+            token_replica_groups=token_replica_groups,
+            logical_intermediate_size=logical_intermediate_size,
+        )
+        operands = (
+            mesh,
+            topk,
+            renormalize,
+            activation,
+            mesh_expert_order,
+            sharded_plan,
+            weight_format,
+            rhs_qb,
+            scoring_fn,
+            has_score_bias,
+            routed_scaling_factor,
+            has_hash_ids,
+        )
+        decode = _build_op(*operands, **options, tile_m=_DECODE_TILE_M)
+        prefill = _build_op(*operands, **options, tile_m=_TILE_M)
+
+        def dispatch(*args):
+            op = prefill if get_vllm_model_wrapper_context().is_prefill else decode
+            return op(*args)
+
+        _OPS[key] = dispatch
+        return dispatch
 
     # Each distinct closure gets its own torch op name: two `CustomOpDef`s
     # registered under one qualname do not raise, they silently share a
@@ -221,7 +255,7 @@ def _build_op(
         # bf16 gate output -- which is what the model's gate matmul produces --
         # fails inside the kernel on a dtype mismatch. Widen at the boundary;
         # softmax runs in f32 on this path anyway.
-        return fused_ep_moe_v2(
+        return implementation.fused_ep_moe_v2(
             x,
             w1,
             w2,
@@ -232,10 +266,10 @@ def _build_op(
             topk=topk,
             renormalize=renormalize,
             mesh=mesh,
-            capacity=_TILE_M,
+            capacity=tile_m,
             block=None,
             ragged_stride=None,
-            weight_format=WeightFormat(weight_format),
+            weight_format=implementation.WeightFormat(weight_format),
             rhs_qb=rhs_qb,
             act_fn=activation,
             mesh_ep_ranks=mesh_expert_order,
@@ -677,7 +711,8 @@ def prebuild_fused_moe_ep(
     )
     logger.info_once(
         "Fused EP MoE armed | hidden=%d inter=%d local_experts=%d ep=%d "
-        "pcp=%d topk=%d capacity=%d sharded_plan=%s format=%s rhs_qb=%s "
+        "pcp=%d topk=%d prefill_capacity=%d decode_capacity=%d "
+        "sharded_plan=%s format=%s rhs_qb=%s "
         "act=%s scoring=%s score_bias=%s hash_routing=%s routed_scale=%s "
         "token_replica_groups=%s",
         hidden,
@@ -687,6 +722,7 @@ def prebuild_fused_moe_ep(
         pcp,
         topk,
         _TILE_M,
+        _DECODE_TILE_M,
         sharded_plan,
         weight_format,
         rhs_qb,
