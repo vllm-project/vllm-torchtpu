@@ -22,6 +22,9 @@ apply_omni_model_specific_patches() at attention backend selection
 patch_registry.py.
 """
 
+import contextvars
+import functools
+import os
 from functools import cache as run_once
 from typing import Any
 
@@ -31,14 +34,320 @@ from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
 
+# Opt-in DiT torch.compile with the torch_tpu "tpu" dynamo backend:
+# "0" (default, eager), "regional" (each repeated block) or "full" (whole DiT).
+OMNI_COMPILE_ENV = "VLLM_TORCHTPU_OMNI_COMPILE"
+OMNI_COMPILE_MODES = ("0", "regional", "full")
+# Opt-in: run each regionally compiled block as one torch_tpu SPMD-safe region,
+# so its sequence-parallel collectives stay inside the compiled program.
+OMNI_COMPILE_SPMD_SAFE_ENV = "VLLM_TORCHTPU_OMNI_COMPILE_SPMD_SAFE"
+SPMD_SAFE_CACHE_TAG = "spmd-safe-regions-v1"
+# DiTs whose repeated blocks issue the same TPU ops and collectives, in the
+# same order and with the same shapes, on every sequence-parallel rank.
+_SPMD_SAFE_DIT_CLASSES = frozenset({"WanTransformer3DModel"})
 
-@run_once
-def _optimization_barrier_op() -> Any:
-    from vllm_torchtpu.layers.adapter.custom_ops.optimization_barrier_op import (
-        optimization_barrier_op,
+
+def omni_compile_mode() -> str:
+    """The VLLM_TORCHTPU_OMNI_COMPILE mode: "0", "regional" or "full"."""
+    mode = os.environ.get(OMNI_COMPILE_ENV, "0").strip().lower() or "0"
+    if mode not in OMNI_COMPILE_MODES:
+        raise ValueError(
+            f"{OMNI_COMPILE_ENV}={mode!r} is not one of {OMNI_COMPILE_MODES}."
+        )
+    return mode
+
+
+def omni_compile_spmd_safe() -> bool:
+    return os.environ.get(OMNI_COMPILE_SPMD_SAFE_ENV, "0").strip() == "1"
+
+
+def set_compile_cache_tag(tag: str, prefix: str | None = None) -> None:
+    """Add ``tag`` to torch.compiler.config.cache_key_tag ('|'-joined).
+
+    Idempotent. With ``prefix``, entries starting with it are replaced, so a
+    second call with updated inputs keeps one entry per kind.
+    """
+    import torch.compiler.config as compiler_config
+
+    existing = [t for t in str(compiler_config.cache_key_tag or "").split("|") if t]
+    if prefix is not None:
+        existing = [t for t in existing if t == tag or not t.startswith(prefix)]
+    if tag not in existing:
+        existing.append(tag)
+    compiler_config.cache_key_tag = "|".join(existing)
+
+
+# The DiffusionModelRunner whose load_model is running in this context.
+_dit_compile_runner: contextvars.ContextVar[Any] = contextvars.ContextVar(
+    "vllm_torchtpu_dit_compile_runner", default=None
+)
+
+
+def dit_compile_gate_open() -> bool:
+    """Whether OmniTpuPlatform.supports_torch_inductor() reports True.
+
+    vLLM-Omni uses supports_torch_inductor() as its DiT compile gate
+    (DiffusionModelRunner.load_model), but VoxCPM2 and the Qwen3-TTS code
+    predictor also read it and then torch.compile with Inductor, which TPU
+    cannot run. The gate is therefore open only while a DiffusionModelRunner
+    loads a pipeline that takes the generic _compile_transformer path (which
+    _patch_dit_compile routes to the "tpu" backend), and only with
+    VLLM_TORCHTPU_OMNI_COMPILE set.
+    """
+    runner = _dit_compile_runner.get()
+    pipeline = getattr(runner, "pipeline", None) if runner is not None else None
+    if pipeline is None:
+        return False
+    if omni_compile_mode() == "0":
+        return False
+    if hasattr(pipeline, "setup_compile"):
+        # Pipeline-specific setup_compile() compiles with Inductor options.
+        logger.warning_once(
+            "%s is set, but %s compiles through its own setup_compile(); "
+            "keeping it eager on TPU.",
+            OMNI_COMPILE_ENV,
+            type(pipeline).__name__,
+        )
+        return False
+    return True
+
+
+def _patch_dit_compile() -> None:
+    # -------------------------------------------------------------------------
+    # Opt-in (VLLM_TORCHTPU_OMNI_COMPILE=regional|full, Omni enforce_eager=False).
+    #
+    # DiffusionModelRunner._compile_transformer builds its torch.compile kwargs
+    # locally with no backend (Inductor) and dynamic=od_config.
+    # diffusion_compile_dynamic (default True). The torch_tpu dynamo backend
+    # "tpu" compiles static shapes only, so on TPU the DiT is compiled with
+    # backend="tpu", dynamic=False instead. load_model is wrapped to scope
+    # dit_compile_gate_open() (OmniTpuPlatform.supports_torch_inductor) to the
+    # DiT compile decision.
+    # -------------------------------------------------------------------------
+    from vllm_omni.diffusion.worker.diffusion_model_runner import (
+        DiffusionModelRunner,
     )
 
-    return optimization_barrier_op()
+    if hasattr(DiffusionModelRunner, "_tpu_orig_compile_transformer"):
+        return
+    DiffusionModelRunner._tpu_orig_compile_transformer = (
+        DiffusionModelRunner._compile_transformer
+    )
+    orig_load_model = DiffusionModelRunner.load_model
+    DiffusionModelRunner._tpu_orig_load_model = orig_load_model
+
+    @functools.wraps(orig_load_model)
+    def _load_model(self: Any, *args: Any, **kwargs: Any) -> Any:
+        token = _dit_compile_runner.set(self)
+        try:
+            return orig_load_model(self, *args, **kwargs)
+        finally:
+            _dit_compile_runner.reset(token)
+
+    def _compile_transformer(self: Any, attr_name: str) -> None:
+        tpu_compile_transformer(self, attr_name)
+
+    DiffusionModelRunner.load_model = _load_model
+    DiffusionModelRunner._compile_transformer = _compile_transformer
+    logger.info(
+        "Applied TPU patch: DiT torch.compile with backend='tpu' (%s=%s).",
+        OMNI_COMPILE_ENV,
+        omni_compile_mode(),
+    )
+
+
+def tpu_compile_transformer(runner: Any, attr_name: str) -> None:
+    """DiffusionModelRunner._compile_transformer for the torch_tpu backend."""
+    from vllm_omni.diffusion.worker.diffusion_model_runner import regionally_compile
+
+    model = getattr(runner.pipeline, attr_name, None)
+    if model is None:
+        return
+    mode = omni_compile_mode()
+    if mode == "0":
+        return
+    upstream_granularity = getattr(
+        runner.od_config, "diffusion_compile_granularity", mode
+    )
+    if upstream_granularity != mode:
+        logger.info(
+            "%s=%s overrides diffusion_compile_granularity=%s on TPU.",
+            OMNI_COMPILE_ENV,
+            mode,
+            upstream_granularity,
+        )
+    _register_tpu_dynamo_backend()
+    _build_dit_ops_eagerly()
+    # The torch_tpu backend compiles static shapes only (dynamic=False).
+    compile_kwargs: dict[str, Any] = {"backend": "tpu", "dynamic": False}
+    spmd_regions: list[tuple[torch.nn.Module, str, bool, Any]] = []
+    try:
+        if mode == "full":
+            if omni_compile_spmd_safe():
+                logger.warning_once(
+                    "%s=1 applies to regional compile only; ignored for %s=full.",
+                    OMNI_COMPILE_SPMD_SAFE_ENV,
+                    OMNI_COMPILE_ENV,
+                )
+            model.compile(**compile_kwargs)
+            compiled_model = model
+        else:
+            spmd_regions = _wrap_spmd_safe_regions(model)
+            compiled_model = regionally_compile(model, **compile_kwargs)
+            _feed_offset0_inputs(spmd_regions)
+        setattr(runner.pipeline, attr_name, compiled_model)
+    except Exception as e:
+        _unwrap_regions(spmd_regions)
+        logger.warning(
+            "TPU %s torch.compile setup for %s failed: %s. Continuing with the "
+            "uncompiled model.",
+            mode,
+            attr_name,
+            e,
+        )
+        return
+    logger.info(
+        "Model runner: %s configured for lazy %s torch.compile (backend='tpu', "
+        "dynamic=False, spmd_safe regions=%d).",
+        attr_name,
+        mode,
+        len(spmd_regions),
+    )
+
+
+def _register_tpu_dynamo_backend() -> None:
+    try:
+        # Registers the "tpu" dynamo backend (torch_tpu/_internal/compile).
+        import torch_tpu._internal.compile  # noqa: F401
+    except ImportError as e:
+        logger.warning("Could not import torch_tpu._internal.compile: %s", e)
+
+
+def _build_dit_ops_eagerly() -> None:
+    # Build the Pallas custom ops the DiT patches call before the first
+    # compiled forward: building one while Dynamo traces is a graph break.
+    from vllm_torchtpu.omni.rope import _qk_norm_rope_op
+
+    for build in (_optimization_barrier_op, _qk_norm_rope_op):
+        try:
+            build()
+        except Exception as e:
+            logger.warning("Could not prebuild %s: %s", build.__name__, e)
+
+
+def _region_forward_attr(block: torch.nn.Module) -> str:
+    # regionally_compile compiles _omni_original_forward when a HookRegistry
+    # wraps forward, else forward.
+    if getattr(block, "_omni_original_forward", None) is not None:
+        return "_omni_original_forward"
+    return "forward"
+
+
+def _wrap_spmd_safe_regions(
+    model: torch.nn.Module,
+) -> list[tuple[torch.nn.Module, str, bool, Any]]:
+    """Wrap each repeated block's forward in torch_tpu's spmd_safe.
+
+    Returns (block, attribute, had instance attribute, original) entries.
+    """
+    if not omni_compile_spmd_safe():
+        return []
+    model_cls = type(model).__name__
+    if model_cls not in _SPMD_SAFE_DIT_CLASSES:
+        logger.warning_once(
+            "%s=1 is ignored for %s: only %s are allow-listed.",
+            OMNI_COMPILE_SPMD_SAFE_ENV,
+            model_cls,
+            sorted(_SPMD_SAFE_DIT_CLASSES),
+        )
+        return []
+    repeated_blocks = set(getattr(model, "_repeated_blocks", None) or ())
+    if not repeated_blocks:
+        return []
+    from torch_tpu._internal.distributed.spmd_util import spmd_safe
+
+    # The region annotation is not part of the compile cache key; keep
+    # persisted executables of the two region policies apart.
+    set_compile_cache_tag(SPMD_SAFE_CACHE_TAG)
+    wrapped = []
+    for _, block in model.named_modules():
+        if type(block).__name__ not in repeated_blocks:
+            continue
+        attr = _region_forward_attr(block)
+        had_instance_attr = attr in block.__dict__
+        orig = getattr(block, attr)
+        _set_region_forward(block, attr, spmd_safe(orig))
+        wrapped.append((block, attr, had_instance_attr, orig))
+    return wrapped
+
+
+def _set_region_forward(block: torch.nn.Module, attr: str, fn: Any) -> None:
+    old = getattr(block, attr)
+    setattr(block, attr, fn)
+    if attr != "_omni_original_forward":
+        return
+    # Hooks such as MagCache keep their own reference to the original
+    # callable; regionally_compile retargets those that match it.
+    registry = getattr(block, "_hook_registry", None)
+    for hook in getattr(registry, "_hooks", {}).values():
+        fn_ref = getattr(hook, "fn_ref", None)
+        if fn_ref is not None and fn_ref.original_forward is old:
+            fn_ref.original_forward = fn
+
+
+def _unwrap_regions(regions: list[tuple[torch.nn.Module, str, bool, Any]]) -> None:
+    for block, attr, had_instance_attr, orig in regions:
+        if had_instance_attr:
+            _set_region_forward(block, attr, orig)
+        else:
+            block.__dict__.pop(attr, None)
+
+
+def _offset0(x: Any) -> Any:
+    if isinstance(x, torch.Tensor) and x.storage_offset() != 0:
+        return x.clone(memory_format=torch.contiguous_format)
+    return x
+
+
+def _offset0_inputs(fn: Any) -> Any:
+    """Call ``fn`` with tensors that start at storage offset 0.
+
+    vLLM-Omni's sequence-parallel split hook hands Wan rank-dependent
+    ``Tensor.chunk`` views (storage offset ``rank * shard numel`` on ranks
+    1..sp-1), and torch_tpu keys compiled executables on input storage
+    offsets. Fresh copies let every rank run the same block program.
+    """
+    from torch.utils import _pytree
+
+    @functools.wraps(fn)
+    def wrapper(*args: Any, **kwargs: Any) -> Any:
+        args, kwargs = _pytree.tree_map(_offset0, (args, kwargs))
+        return fn(*args, **kwargs)
+
+    return wrapper
+
+
+def _feed_offset0_inputs(regions: list[tuple[torch.nn.Module, str, bool, Any]]) -> None:
+    # Outside the compiled callable: Dynamo guards on the caller's tensors.
+    for block, attr, _, _ in regions:
+        _set_region_forward(block, attr, _offset0_inputs(getattr(block, attr)))
+
+
+_optimization_barrier: Any = None
+
+
+def _optimization_barrier_op() -> Any:
+    # Not functools.cache: Dynamo ignores that wrapper and re-traces the op
+    # builder inside compiled DiT forwards (a graph break). After the first
+    # eager call, Dynamo reads the built op from this global.
+    global _optimization_barrier
+    if _optimization_barrier is None:
+        from vllm_torchtpu.layers.adapter.custom_ops.optimization_barrier_op import (
+            optimization_barrier_op,
+        )
+
+        _optimization_barrier = optimization_barrier_op()
+    return _optimization_barrier
 
 
 @run_once

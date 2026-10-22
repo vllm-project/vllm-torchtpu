@@ -21,10 +21,103 @@ from vllm.logger import init_logger
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
 from vllm_torchtpu.env_override import set_libtpu_flag_default
-from vllm_torchtpu.omni.patches import apply_omni_tpu_patches
+from vllm_torchtpu.omni.patches import (
+    _patch_dit_compile,
+    apply_omni_tpu_patches,
+    dit_compile_gate_open,
+    omni_compile_mode,
+    set_compile_cache_tag,
+)
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 logger = init_logger(__name__)
+
+# Flags read when torch_tpu compiles a graph; persisted executables built
+# under other values are stale.
+_COMPILER_FLAG_ENVS = (
+    "LIBTPU_INIT_ARGS",
+    "XLA_FLAGS",
+    "TORCH_TPU_INTERNAL_XLA_OPTIONS",
+    # Where torch_tpu splits graphs at collectives.
+    "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
+)
+_COMPILER_DISTS = ("torch_tpu", "libtpu", "jax", "jaxlib")
+_RANK_ASSIGNMENT_TAG = "tpu-rank-assignment-v1:"
+_PALLAS_SOURCES_TAG = "tpu-pallas-sources-v1:"
+_COMPILER_FLAGS_TAG = "tpu-compiler-v2:"
+
+
+def _pallas_source_files() -> list[str]:
+    """Sources of the Pallas kernels and custom ops the DiT forward calls."""
+    import glob
+
+    pkg = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    files = glob.glob(os.path.join(pkg, "kernels", "diffusion_attention", "*.py"))
+    files += [
+        os.path.join(pkg, "omni", "rope.py"),
+        os.path.join(pkg, "omni", "attention.py"),
+        os.path.join(
+            pkg, "layers", "adapter", "custom_ops", "optimization_barrier_op.py"
+        ),
+    ]
+    return sorted(set(files))
+
+
+def _pallas_sources_tag() -> str:
+    import hashlib
+
+    pkg = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    digest = hashlib.sha256()
+    for path in _pallas_source_files():
+        digest.update(os.path.relpath(path, pkg).encode() + b"\0")
+        with open(path, "rb") as f:
+            digest.update(f.read())
+        digest.update(b"\0")
+    return _PALLAS_SOURCES_TAG + digest.hexdigest()
+
+
+def _rank_assignment_tag(world_size: int) -> str:
+    import hashlib
+
+    assignment: list[int] = []
+    rank = os.environ.get("RANK", "")
+    try:
+        import torch.distributed as dist
+        from torch_tpu._internal.distributed.device_mesh import get_device_assignment
+
+        assignment = list(get_device_assignment())
+        if dist.is_initialized():
+            rank = str(dist.get_rank())
+    except Exception as e:  # torch_tpu without device_mesh, or no PjRt yet
+        logger.debug("No torch_tpu device assignment for the cache key: %s", e)
+    fields = [
+        str(world_size),
+        rank,
+        os.environ.get("LOCAL_RANK", ""),
+        os.environ.get("TPU_VISIBLE_CHIPS", ""),
+        os.environ.get("TPU_PROCESS_BOUNDS", ""),
+        os.environ.get("TPU_CHIPS_PER_PROCESS_BOUNDS", ""),
+        ",".join(str(d) for d in assignment),
+    ]
+    digest = hashlib.sha256("\0".join(fields).encode()).hexdigest()[:16]
+    return f"{_RANK_ASSIGNMENT_TAG}{world_size}:{digest}"
+
+
+def _compiler_flags_tag() -> str:
+    import hashlib
+    from importlib import metadata
+
+    def version(dist: str) -> str:
+        try:
+            return metadata.version(dist)
+        except metadata.PackageNotFoundError:
+            return ""
+
+    fields = [os.environ.get(name, "") for name in _COMPILER_FLAG_ENVS]
+    fields += [version(dist) for dist in _COMPILER_DISTS]
+    fields += [hardware.get_tpu_device_name(), os.environ.get("TORCH_TPU_TOPOLOGY", "")]
+    digest = hashlib.sha256("\0".join(fields).encode()).hexdigest()[:16]
+    return _COMPILER_FLAGS_TAG + digest
 
 
 class OmniTpuPlatform(OmniPlatform, TpuPlatform):
@@ -76,7 +169,11 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
 
     @classmethod
     def supports_torch_inductor(cls) -> bool:
-        return False
+        # vLLM-Omni's DiT compile gate. Open only with VLLM_TORCHTPU_OMNI_COMPILE
+        # set and only for DiffusionModelRunner's generic DiT compile, which
+        # patches route to the torch_tpu "tpu" backend (see
+        # patches.dit_compile_gate_open for the other callers kept off).
+        return dit_compile_gate_open()
 
     @classmethod
     def supports_diffusion_dense_flash_attention(cls) -> bool:
@@ -120,6 +217,33 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         torch.accelerator.set_device_index(0)
         _ = torch.empty(1, device=torch.device("tpu"))
         torch.accelerator.synchronize()
+        if omni_compile_mode() != "0":
+            # The diffusion worker calls set_device before load_model.
+            _patch_dit_compile()
+            cls.configure_diffusion_compile_cache(world_size)
+
+    @classmethod
+    def configure_diffusion_compile_cache(cls, world_size: int | None = None) -> None:
+        """Scope the persistent torch.compile cache key of this worker.
+
+        torch_tpu persists XLA executables in AOTAutogradCache, whose key sees
+        neither the device assignment behind collectives, the opaque Pallas
+        kernel sources, nor the XLA/libtpu flags: a stale hit can hang (a
+        multi-rank launch loading single-rank executables) or ignore new
+        flags. Only with VLLM_TORCHTPU_OMNI_COMPILE set; idempotent, and a
+        later call (set_device runs again after distributed init) replaces
+        each entry with its updated value.
+        """
+        if omni_compile_mode() == "0":
+            return
+        if world_size is None:
+            world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
+        if world_size > 1:
+            set_compile_cache_tag(
+                _rank_assignment_tag(world_size), prefix=_RANK_ASSIGNMENT_TAG
+            )
+        set_compile_cache_tag(_pallas_sources_tag(), prefix=_PALLAS_SOURCES_TAG)
+        set_compile_cache_tag(_compiler_flags_tag(), prefix=_COMPILER_FLAGS_TAG)
 
     @staticmethod
     def _offload_dense_all_to_all() -> None:

@@ -100,10 +100,12 @@ class TpuFlashAttentionImpl(TpuSDPAImpl):
             reason = f"query.dtype={query.dtype} (requires torch.bfloat16)"
         else:
             return False
-        logger.warning_once(
-            "TpuFlashAttentionImpl falling back to PyTorch SDPA (%s).",
-            reason,
-        )
+        # Logging inside a compiled DiT forward is a graph break.
+        if not torch.compiler.is_compiling():
+            logger.warning_once(
+                "TpuFlashAttentionImpl falling back to PyTorch SDPA (%s).",
+                reason,
+            )
         return True
 
     def forward(

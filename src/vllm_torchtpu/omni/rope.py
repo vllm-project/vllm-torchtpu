@@ -33,7 +33,7 @@ tokens) this cuts ~7 ms per transformer layer (80.8 -> 73.9 ms).
 """
 
 import functools
-from functools import cache as run_once
+from typing import Any
 
 import jax
 import torch
@@ -139,10 +139,23 @@ def apply_split_rotary_half_swap(
     return out.to(x.dtype)
 
 
-@run_once
-def _qk_norm_rope_op():
-    """Builds the torch custom op wrapping the fused Pallas kernel (once)."""
+_qk_norm_rope: Any = None
 
+
+def _qk_norm_rope_op():
+    """Builds the torch custom op wrapping the fused Pallas kernel (once).
+
+    Not functools.cache: Dynamo ignores that wrapper and re-traces the op
+    builder inside compiled DiT forwards (a graph break). After the first
+    eager call, Dynamo reads the built op from this global.
+    """
+    global _qk_norm_rope
+    if _qk_norm_rope is None:
+        _qk_norm_rope = _build_qk_norm_rope_op()
+    return _qk_norm_rope
+
+
+def _build_qk_norm_rope_op():
     def wan_qk_norm_rope(
         qkv: jax.Array,
         wq: jax.Array,
