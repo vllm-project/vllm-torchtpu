@@ -271,7 +271,8 @@ def qsa_attention(
     if len(query) <= (len(starts) - 1) * max_query_len:
         return rpa_attention(query, gate, blocks, lengths, table, cache, **options)
 
-    capacity = len(starts) - 1
+    # RPA rows: one per request row, times the tokens a verify request holds.
+    capacity = min(len(query), (len(starts) - 1) * max_query_len)
     # Steps with a short-request prefix run its tokens on RPA and the rest on
     # prefill; other steps run every row on prefill. Pick the route by masking
     # the inputs, not with lax.cond: a conditional that returns the cache
