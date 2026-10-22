@@ -69,6 +69,19 @@ EXEMPT_PATHS = {
 #                           value, and it is a CPython knob, not one of ours.
 #   omni/platform.py        os.environ["MASTER_PORT"] (exported per worker by
 #                           vLLM-Omni's DiffusionWorker) must raise when unset.
+#   omni/platform.py        compile-cache key hashes runtime/compiler flags:
+#                           - LIBTPU_INIT_ARGS: libtpu compiler flags set by
+#                             env_override.py or the operator before PjRt init.
+#                           - XLA_FLAGS: XLA compiler flags consumed by PJRT.
+#                           - TORCH_TPU_INTERNAL_XLA_OPTIONS: internal XLA
+#                             options written by env_override.py for torch_tpu.
+#                           - TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS:
+#                             torch_tpu collective graph-split flag written by
+#                             env_override.py.
+#                           - TPU_CHIPS_PER_PROCESS_BOUNDS: per-process TPU mesh
+#                             shape set by tpu_platform.py or the TPU runtime.
+#                           - TPU_PROCESS_BOUNDS: multi-host TPU process grid
+#                             set by tpu_platform.py or the TPU runtime.
 #   model_loader_patches.py RUNAI_STREAMER_PROCESS_GROUP_SIZE is exported by
 #                           the Run:AI streamer's first host-rank discovery in
 #                           the process; unset means that has not run yet.
@@ -82,6 +95,7 @@ EXEMPT_PATHS = {
 # read fails this hook with a message pointing here, which is the moment to
 # decide whether it belongs in envs.py instead.
 BOOTSTRAP_VARS = {
+    "LIBTPU_INIT_ARGS",
     "LOCAL_RANK",
     "LOCAL_WORLD_SIZE",
     "MASTER_PORT",
@@ -91,12 +105,17 @@ BOOTSTRAP_VARS = {
     "TORCH_TPU_DP_MASTER_ADDR",
     "TORCH_TPU_DP_MASTER_PORT",
     "TORCH_TPU_DP_SIZE",
+    "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
+    "TORCH_TPU_INTERNAL_XLA_OPTIONS",
     "TORCH_TPU_SLICEBUILDER_ADDRESSES",
     "TORCH_TPU_TOPOLOGY",
     "TORCH_TPU_XPROF_SESSION_ID",
+    "TPU_CHIPS_PER_PROCESS_BOUNDS",
     "TPU_NUM_HOSTS",
+    "TPU_PROCESS_BOUNDS",
     "TPU_VISIBLE_CHIPS",
     "WORLD_SIZE",
+    "XLA_FLAGS",
 }
 
 

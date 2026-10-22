@@ -157,9 +157,9 @@ def _pipeline(model, dit_modules=("transformer",)):
 def test_compile_mode_parsing(monkeypatch):
     monkeypatch.delenv(patches.OMNI_COMPILE_ENV, raising=False)
     assert patches.omni_compile_mode() == "0"
-    for mode in ("0", "regional", "full", " Regional "):
+    for mode in ("0", "regional", "full", "Regional", "FULL"):
         monkeypatch.setenv(patches.OMNI_COMPILE_ENV, mode)
-        assert patches.omni_compile_mode() == mode.strip().lower()
+        assert patches.omni_compile_mode() == mode.lower()
     monkeypatch.setenv(patches.OMNI_COMPILE_ENV, "inductor")
     with pytest.raises(ValueError, match="VLLM_TORCHTPU_OMNI_COMPILE"):
         patches.omni_compile_mode()

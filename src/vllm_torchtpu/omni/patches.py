@@ -30,6 +30,7 @@ from typing import Any
 
 import torch
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -49,16 +50,11 @@ _SPMD_SAFE_DIT_CLASSES = frozenset({"WanTransformer3DModel"})
 
 def omni_compile_mode() -> str:
     """The VLLM_TORCHTPU_OMNI_COMPILE mode: "0", "regional" or "full"."""
-    mode = os.environ.get(OMNI_COMPILE_ENV, "0").strip().lower() or "0"
-    if mode not in OMNI_COMPILE_MODES:
-        raise ValueError(
-            f"{OMNI_COMPILE_ENV}={mode!r} is not one of {OMNI_COMPILE_MODES}."
-        )
-    return mode
+    return (envs.VLLM_TORCHTPU_OMNI_COMPILE or "0").lower()
 
 
 def omni_compile_spmd_safe() -> bool:
-    return os.environ.get(OMNI_COMPILE_SPMD_SAFE_ENV, "0").strip() == "1"
+    return envs.VLLM_TORCHTPU_OMNI_COMPILE_SPMD_SAFE
 
 
 def set_compile_cache_tag(tag: str, prefix: str | None = None) -> None:

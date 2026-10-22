@@ -20,27 +20,18 @@ from torch_tpu._internal.utils import hardware
 from vllm.logger import init_logger
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.env_override import set_libtpu_flag_default
 from vllm_torchtpu.omni.patches import (
     _patch_dit_compile,
     apply_omni_tpu_patches,
     dit_compile_gate_open,
-    omni_compile_mode,
     set_compile_cache_tag,
 )
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
 logger = init_logger(__name__)
 
-# Flags read when torch_tpu compiles a graph; persisted executables built
-# under other values are stale.
-_COMPILER_FLAG_ENVS = (
-    "LIBTPU_INIT_ARGS",
-    "XLA_FLAGS",
-    "TORCH_TPU_INTERNAL_XLA_OPTIONS",
-    # Where torch_tpu splits graphs at collectives.
-    "TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS",
-)
 _COMPILER_DISTS = ("torch_tpu", "libtpu", "jax", "jaxlib")
 _RANK_ASSIGNMENT_TAG = "tpu-rank-assignment-v1:"
 _PALLAS_SOURCES_TAG = "tpu-pallas-sources-v1:"
@@ -113,7 +104,15 @@ def _compiler_flags_tag() -> str:
         except metadata.PackageNotFoundError:
             return ""
 
-    fields = [os.environ.get(name, "") for name in _COMPILER_FLAG_ENVS]
+    # Flags read when torch_tpu compiles a graph; persisted executables built
+    # under other values are stale.
+    fields = [
+        os.environ.get("LIBTPU_INIT_ARGS", ""),
+        os.environ.get("XLA_FLAGS", ""),
+        os.environ.get("TORCH_TPU_INTERNAL_XLA_OPTIONS", ""),
+        # Where torch_tpu splits graphs at collectives.
+        os.environ.get("TORCH_TPU_INTERNAL_MATERIALIZE_COLLECTIVE_TENSORS", ""),
+    ]
     fields += [version(dist) for dist in _COMPILER_DISTS]
     fields += [hardware.get_tpu_device_name(), os.environ.get("TORCH_TPU_TOPOLOGY", "")]
     digest = hashlib.sha256("\0".join(fields).encode()).hexdigest()[:16]
@@ -217,7 +216,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         torch.accelerator.set_device_index(0)
         _ = torch.empty(1, device=torch.device("tpu"))
         torch.accelerator.synchronize()
-        if omni_compile_mode() != "0":
+        if (envs.VLLM_TORCHTPU_OMNI_COMPILE or "0").lower() != "0":
             # The diffusion worker calls set_device before load_model.
             _patch_dit_compile()
             cls.configure_diffusion_compile_cache(world_size)
@@ -230,11 +229,13 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         neither the device assignment behind collectives, the opaque Pallas
         kernel sources, nor the XLA/libtpu flags: a stale hit can hang (a
         multi-rank launch loading single-rank executables) or ignore new
-        flags. Only with VLLM_TORCHTPU_OMNI_COMPILE set; idempotent, and a
-        later call (set_device runs again after distributed init) replaces
-        each entry with its updated value.
+        flags. Only with VLLM_TORCHTPU_OMNI_COMPILE set; idempotent. When
+        called from ``set_device`` before distributed init, the rank tag
+        encodes ``world_size`` and ``RANK`` (if set), which still separates
+        single-rank from multi-rank executables; a later call replaces each
+        entry with its updated value.
         """
-        if omni_compile_mode() == "0":
+        if (envs.VLLM_TORCHTPU_OMNI_COMPILE or "0").lower() == "0":
             return
         if world_size is None:
             world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
