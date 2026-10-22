@@ -348,29 +348,31 @@ def _patch_ltx2_split_rope() -> None:
     # TODO: Remove this patch once vLLM-Omni's LTX-2 split RoPE rotates q and
     # k in their (B, T, H * D) layout instead of reshaping them per head.
     #
-    # LTX2AudioVideoRotaryPosEmbed builds split-RoPE tables as (B, H, T, D/2),
-    # so apply_split_rotary_emb transposes every (B, T, H * D) q and k to
-    # (B, H, T, D) and back in each attention layer. Here the rope module
-    # returns the tables in the layout of q and k, (B, 1, T, H * D) with the
-    # sign of each half folded into sin (split_rope_natural_tables), and
-    # apply_split_rotary_emb rotates such tables elementwise. T stays at dim
-    # 2, where the split-RoPE sequence-parallel plan shards the tables.
-    # LTX2AudioVideoAttnProcessor._slice_rope_for_tp slices 4-D tables by
-    # heads on dim 1 and so passes these through whole; the rotation takes
-    # the lanes of the local heads instead. Interleaved RoPE and
-    # (B, H, T, D/2) tables keep using the original functions.
-    #
-    # The LTX-2 pipeline builds the RoPE coords once per request and passes
-    # the same tensor at every denoising step. Each rope module keeps the
-    # tables of its last split-RoPE call, keyed on the coords tensor
-    # (identity and version counter), device and out_dtype, and returns them
-    # without running the original forward while the key matches. They stay
-    # alive until a call with another key replaces them. Inference tensors
-    # have no version counter, so in-place edits of coords made in inference
-    # mode are not seen; vLLM-Omni does not edit coords after building them.
-    # The cross-attention ropes get a new slice of coords at every step and
-    # rebuild their tables. synchronize_tensors materializes the cached
-    # tables on the device once.
+    # Problem: LTX2AudioVideoRotaryPosEmbed builds split-RoPE tables as
+    #   (B, H, T, D/2), so apply_split_rotary_emb transposes every (B, T, H * D)
+    #   q and k to (B, H, T, D) and back in each attention layer. The pipeline
+    #   passes the same coords tensor at every denoising step, and the rope
+    #   modules rebuild the tables each time.
+    # Fix: the rope module returns the tables in the layout of q and k,
+    #   (B, 1, T, H * D) with the sign of each half folded into sin
+    #   (split_rope_natural_tables), and apply_split_rotary_emb rotates them
+    #   elementwise. Each rope module keeps the tables of its last split-RoPE
+    #   call and returns them while the key matches, until a call with
+    #   another key replaces them.
+    # Effect: LTX-2 T2V 704x1280x121 on TPU v7x: 0.770 -> 0.482 s/step.
+    # Scope:
+    #   - T stays at dim 2, where the split-RoPE SP plan shards the tables.
+    #   - TP: _slice_rope_for_tp slices 4-D tables by heads on dim 1 and so
+    #     passes these (B, 1, T, H * D) tables through whole; the rotation
+    #     takes the lanes of the local heads.
+    #   - Cache key: coords tensor (identity and version counter), device and
+    #     out_dtype. Inference tensors have no version counter, so in-place
+    #     edits of coords in inference mode are not seen (vLLM-Omni does not
+    #     edit coords after building them).
+    #   - Cross-attention ropes get a new coords slice each step and rebuild.
+    #   - Interleaved RoPE and (B, H, T, D/2) tables use the original
+    #     functions.
+    #   - synchronize_tensors materializes the cached tables once.
     # -------------------------------------------------------------------------
     from vllm_omni.diffusion.models.ltx2 import ltx2_transformer
 
