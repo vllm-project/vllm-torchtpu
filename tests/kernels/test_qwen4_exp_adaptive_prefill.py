@@ -26,17 +26,29 @@ from vllm_torchtpu.kernels.qwen4_exp import (
     prefill_tiles,
     qsa_rpa,
 )
+from vllm_torchtpu.kernels.sparse_gqa_decode import decode
 from vllm_torchtpu.kernels.sparse_gqa_prefill import adaptive
 
 
 @pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize(
-    "case", ["supported", "decode", "slots", "scale", "page", "cache", "hardware"]
+    "case",
+    [
+        "supported",
+        "decode",
+        "slots",
+        "tail",
+        "padded",
+        "scale",
+        "page",
+        "cache",
+        "hardware",
+    ],
 )
 def test_qwen_dispatch_preserves_existing_paths(monkeypatch, fp8, case):
     dtype = jnp.float8_e4m3fn if fp8 else jnp.bfloat16
     packing = 4 if fp8 else 2
-    tokens = 1 if case == "decode" else 256
+    tokens = 1 if case == "decode" else 8448 if case == "tail" else 256
     page = 128 if case == "page" else 1664
     pages = 20000 if case == "cache" else 79
     shapes = [
@@ -46,7 +58,7 @@ def test_qwen_dispatch_preserves_existing_paths(monkeypatch, fp8, case):
         ((tokens,), jnp.int32),
         ((tokens, 79), jnp.int32),
         ((pages, page, 4 // packing, packing, 256), dtype),
-        (((3,) if case == "slots" else (2,)), jnp.int32),
+        (((9,) if case == "padded" else (3,) if case == "slots" else (2,)), jnp.int32),
     ]
     args = tuple(jax.ShapeDtypeStruct(shape, dtype) for shape, dtype in shapes)
     info = pltpu.get_tpu_info_for_chip(
@@ -72,12 +84,17 @@ def test_qwen_dispatch_preserves_existing_paths(monkeypatch, fp8, case):
         functools.partial(capture, "prefill"),
     )
     monkeypatch.setattr(qsa_rpa, "rpa_attention", functools.partial(capture, "decode"))
+    monkeypatch.setattr(
+        decode,
+        "execute_decode",
+        functools.partial(capture, "fused_decode"),
+    )
     scale = 2.0 if case == "scale" else 1.0
     output, cache = qsa_rpa.qsa_attention(*args, kv_heads=2, ratio=4, v_scale=scale)
     expected = (
         "adaptive"
-        if case in ("supported", "slots")
-        else "decode"
+        if case in ("supported", "slots", "tail", "padded")
+        else "fused_decode"
         if case == "decode"
         else "prefill"
     )
@@ -91,10 +108,12 @@ def test_qwen_dispatch_preserves_existing_paths(monkeypatch, fp8, case):
 
 @pytest.mark.tpu_test
 @pytest.mark.parametrize("fp8", [False, True])
-def test_qwen_adaptive_entry_masks_padding_and_matches_paired_prefill(fp8):
+@pytest.mark.parametrize("ragged_tail", [False, True])
+def test_qwen_adaptive_entry_masks_padding_and_matches_paired_prefill(fp8, ragged_tail):
     if pltpu.get_tpu_info().chip_version != pltpu.ChipVersion.TPU_7X:
         pytest.skip("Adaptive SparseCore schedule is measured on TPU7x")
-    tokens, context, page = 256, 131072, 1664
+    tokens, context = (8448, 16384) if ragged_tail else (256, 131072)
+    page = 1664
     pages = (context + page - 1) // page
     dtype = jnp.float8_e4m3fn if fp8 else jnp.bfloat16
     packing = 4 if fp8 else 2
@@ -105,9 +124,10 @@ def test_qwen_adaptive_entry_masks_padding_and_matches_paired_prefill(fp8):
     blocks = np.stack([rng.choice(n // 4, 512, replace=False) for n in lengths]).astype(
         np.int32
     )
-    lengths[[0, 31, 255]] = 0
-    blocks[[0, 31, 255]] = -1
-    gate = gate.at[jnp.array([0, 31, 255])].set(jnp.nan)
+    inactive = [31, tokens - 3, tokens - 2, tokens - 1] if ragged_tail else [0, 31, 255]
+    lengths[inactive] = 0
+    blocks[inactive] = -1
+    gate = gate.at[jnp.array(inactive)].set(jnp.nan)
     permutation = rng.permutation(pages).astype(np.int32)
     table = jnp.broadcast_to(jnp.asarray(permutation), (tokens, pages))
     shape = (pages, page, 4 // packing, packing, 256)
@@ -123,14 +143,17 @@ def test_qwen_adaptive_entry_masks_padding_and_matches_paired_prefill(fp8):
         jnp.asarray(lengths),
         table,
         cache,
-        jnp.array([0, tokens], jnp.int32),
+        jnp.array([0, 1] + [tokens - 3] * 7 if ragged_tail else [0, tokens], jnp.int32),
     )
     compiled = (
         jax.jit(functools.partial(qsa_rpa.qsa_attention, kv_heads=2, ratio=4))
         .lower(*args)
         .compile()
     )
-    assert "sc_compact_grouped_prefill" in compiled.as_text()
+    hlo = compiled.as_text()
+    assert "fused_qsa_decode" not in hlo
+    if not ragged_tail:
+        assert "sc_compact_grouped_prefill" in hlo
     output, returned = compiled(*args)
     reference, _ = jax.jit(
         functools.partial(
