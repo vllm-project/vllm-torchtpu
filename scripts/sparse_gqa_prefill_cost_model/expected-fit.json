@@ -1,0 +1,1012 @@
+{
+  "bf16": {
+    "tc": {
+      "coefficients_ms": [
+        0.25000650408450037,
+        8.991181022104898e-05,
+        4.814218452898145e-08,
+        0.004999265026206821
+      ],
+      "mean_relative_error": 0.02780111776186305,
+      "max_relative_error": 0.09187061384931017,
+      "cases": [
+        {
+          "tokens": 256,
+          "context": 8192,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 0.4254990490153432,
+          "estimated_ms": 0.4345779314423528
+        },
+        {
+          "tokens": 256,
+          "context": 8192,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 0.32680004369467497,
+          "estimated_ms": 0.3195948358395959
+        },
+        {
+          "tokens": 256,
+          "context": 8192,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 0.4249829798936844,
+          "estimated_ms": 0.4345779314423528
+        },
+        {
+          "tokens": 256,
+          "context": 65536,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 1.5368479653261602,
+          "estimated_ms": 1.5607233897232633
+        },
+        {
+          "tokens": 256,
+          "context": 65536,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 0.325943052303046,
+          "estimated_ms": 0.3259049282501786
+        },
+        {
+          "tokens": 256,
+          "context": 65536,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 1.390280551277101,
+          "estimated_ms": 1.4157447039632656
+        },
+        {
+          "tokens": 256,
+          "context": 262144,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 5.336796981282532,
+          "estimated_ms": 5.419089207081849
+        },
+        {
+          "tokens": 256,
+          "context": 262144,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 0.3422059817239642,
+          "estimated_ms": 0.3448352054819266
+        },
+        {
+          "tokens": 256,
+          "context": 262144,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 2.3230229853652418,
+          "estimated_ms": 2.3645382760694824
+        },
+        {
+          "tokens": 2048,
+          "context": 8192,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 1.6009084647521377,
+          "estimated_ms": 1.5865985022135292
+        },
+        {
+          "tokens": 2048,
+          "context": 8192,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 0.8764200028963387,
+          "estimated_ms": 0.8067131581252651
+        },
+        {
+          "tokens": 2048,
+          "context": 8192,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 1.4483875129371881,
+          "estimated_ms": 1.4466190814797382
+        },
+        {
+          "tokens": 2048,
+          "context": 65536,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 10.421411949209869,
+          "estimated_ms": 10.595762168460812
+        },
+        {
+          "tokens": 2048,
+          "context": 65536,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 0.8938585524447262,
+          "estimated_ms": 0.8571938974099262
+        },
+        {
+          "tokens": 2048,
+          "context": 65536,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 9.202993474900723,
+          "estimated_ms": 9.375941502066349
+        },
+        {
+          "tokens": 2048,
+          "context": 262144,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 40.80524301389232,
+          "estimated_ms": 41.462688707329505
+        },
+        {
+          "tokens": 2048,
+          "context": 262144,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 0.9895635303109884,
+          "estimated_ms": 1.00863611526391
+        },
+        {
+          "tokens": 2048,
+          "context": 262144,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 17.107886029407382,
+          "estimated_ms": 17.406225401222283
+        },
+        {
+          "tokens": 8192,
+          "context": 8192,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 3.9259439799934626,
+          "estimated_ms": 3.676656726537196
+        },
+        {
+          "tokens": 8192,
+          "context": 8192,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 2.3854514583945274,
+          "estimated_ms": 2.2968595793041136
+        },
+        {
+          "tokens": 8192,
+          "context": 8192,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 3.930773469619453,
+          "estimated_ms": 3.676656726537196
+        },
+        {
+          "tokens": 8192,
+          "context": 65536,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 39.16208998998627,
+          "estimated_ms": 39.713311391526325
+        },
+        {
+          "tokens": 8192,
+          "context": 65536,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 2.9497515643015504,
+          "estimated_ms": 2.678756077386204
+        },
+        {
+          "tokens": 8192,
+          "context": 65536,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 33.18652353482321,
+          "estimated_ms": 33.71419336007814
+        },
+        {
+          "tokens": 8192,
+          "context": 262144,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 160.80380254425108,
+          "estimated_ms": 163.18101754700106
+        },
+        {
+          "tokens": 8192,
+          "context": 262144,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 3.2481374801136553,
+          "estimated_ms": 3.2845249488021393
+        },
+        {
+          "tokens": 8192,
+          "context": 262144,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 67.45507597224787,
+          "estimated_ms": 68.5549291309584
+        },
+        {
+          "tokens": 8192,
+          "context": 8192,
+          "pattern": "short",
+          "active": 64,
+          "actual_ms": 0.9783835266716778,
+          "estimated_ms": 1.0420440577262018
+        },
+        {
+          "tokens": 8192,
+          "context": 8192,
+          "pattern": "short",
+          "active": 1024,
+          "actual_ms": 1.0323000024072826,
+          "estimated_ms": 1.087037442962063
+        },
+        {
+          "tokens": 8192,
+          "context": 8192,
+          "pattern": "short",
+          "active": 4096,
+          "actual_ms": 1.6199855017475784,
+          "estimated_ms": 1.5769654155303314
+        }
+      ]
+    },
+    "sc": {
+      "coefficients_ms": [
+        0.19743081215678976,
+        0.005833960374709633,
+        0.002476169547627867
+      ],
+      "mean_relative_error": 0.008409224914683489,
+      "max_relative_error": 0.01808148547291786,
+      "cases": [
+        {
+          "tokens": 256,
+          "context": 8192,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 2.3728859960101545,
+          "estimated_ms": 2.4040614977992814
+        },
+        {
+          "tokens": 256,
+          "context": 8192,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 2.4062860175035894,
+          "estimated_ms": 2.4040614977992814
+        },
+        {
+          "tokens": 256,
+          "context": 8192,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 2.4207724491134286,
+          "estimated_ms": 2.4040614977992814
+        },
+        {
+          "tokens": 256,
+          "context": 65536,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 2.367500914260745,
+          "estimated_ms": 2.4040614977992814
+        },
+        {
+          "tokens": 256,
+          "context": 65536,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 2.4038655101321638,
+          "estimated_ms": 2.4040614977992814
+        },
+        {
+          "tokens": 256,
+          "context": 65536,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 2.423487021587789,
+          "estimated_ms": 2.4040614977992814
+        },
+        {
+          "tokens": 256,
+          "context": 262144,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 2.388305962085724,
+          "estimated_ms": 2.4040614977992814
+        },
+        {
+          "tokens": 256,
+          "context": 262144,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 2.4184214998967946,
+          "estimated_ms": 2.4040614977992814
+        },
+        {
+          "tokens": 256,
+          "context": 262144,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 2.43723695166409,
+          "estimated_ms": 2.4040614977992814
+        },
+        {
+          "tokens": 2048,
+          "context": 8192,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 17.593949509318918,
+          "estimated_ms": 17.850476297296723
+        },
+        {
+          "tokens": 2048,
+          "context": 8192,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 17.93725701281801,
+          "estimated_ms": 17.850476297296723
+        },
+        {
+          "tokens": 2048,
+          "context": 8192,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 18.027577025350183,
+          "estimated_ms": 17.850476297296723
+        },
+        {
+          "tokens": 2048,
+          "context": 65536,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 17.533445556182414,
+          "estimated_ms": 17.850476297296723
+        },
+        {
+          "tokens": 2048,
+          "context": 65536,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 17.817255517002195,
+          "estimated_ms": 17.850476297296723
+        },
+        {
+          "tokens": 2048,
+          "context": 65536,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 18.006464990321547,
+          "estimated_ms": 17.850476297296723
+        },
+        {
+          "tokens": 2048,
+          "context": 262144,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 17.72810349939391,
+          "estimated_ms": 17.850476297296723
+        },
+        {
+          "tokens": 2048,
+          "context": 262144,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 18.076183449011296,
+          "estimated_ms": 17.850476297296723
+        },
+        {
+          "tokens": 2048,
+          "context": 262144,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 18.085694522596896,
+          "estimated_ms": 17.850476297296723
+        },
+        {
+          "tokens": 8192,
+          "context": 8192,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 67.14841804932803,
+          "estimated_ms": 67.95706543384922
+        },
+        {
+          "tokens": 8192,
+          "context": 8192,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 68.18607950117439,
+          "estimated_ms": 67.95706543384922
+        },
+        {
+          "tokens": 8192,
+          "context": 8192,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 67.1620384673588,
+          "estimated_ms": 67.95706543384922
+        },
+        {
+          "tokens": 8192,
+          "context": 65536,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 69.67689451994374,
+          "estimated_ms": 70.80961275271653
+        },
+        {
+          "tokens": 8192,
+          "context": 65536,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 70.99856599234045,
+          "estimated_ms": 70.80961275271653
+        },
+        {
+          "tokens": 8192,
+          "context": 65536,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 71.46452245069668,
+          "estimated_ms": 70.80961275271653
+        },
+        {
+          "tokens": 8192,
+          "context": 262144,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 70.25888055795804,
+          "estimated_ms": 70.80961275271653
+        },
+        {
+          "tokens": 8192,
+          "context": 262144,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 71.52786798542365,
+          "estimated_ms": 70.80961275271653
+        },
+        {
+          "tokens": 8192,
+          "context": 262144,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 71.904705488123,
+          "estimated_ms": 70.80961275271653
+        },
+        {
+          "tokens": 8192,
+          "context": 8192,
+          "pattern": "short",
+          "active": 64,
+          "actual_ms": 50.53197644883767,
+          "estimated_ms": 50.52483181854904
+        },
+        {
+          "tokens": 8192,
+          "context": 8192,
+          "pattern": "short",
+          "active": 1024,
+          "actual_ms": 51.05876596644521,
+          "estimated_ms": 51.00025637169359
+        },
+        {
+          "tokens": 8192,
+          "context": 8192,
+          "pattern": "short",
+          "active": 4096,
+          "actual_ms": 57.91080842027441,
+          "estimated_ms": 57.81467496676548
+        }
+      ]
+    }
+  },
+  "fp8": {
+    "tc": {
+      "coefficients_ms": [
+        0.2491017824685177,
+        8.889156791776907e-05,
+        4.724934780077619e-08,
+        0.005145153550878911
+      ],
+      "mean_relative_error": 0.02587358032754272,
+      "max_relative_error": 0.08973538851057522,
+      "cases": [
+        {
+          "tokens": 256,
+          "context": 8192,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 0.43124001240357757,
+          "estimated_ms": 0.43805120411232756
+        },
+        {
+          "tokens": 256,
+          "context": 8192,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 0.32232952071353793,
+          "estimated_ms": 0.3197126724421126
+        },
+        {
+          "tokens": 256,
+          "context": 8192,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 0.42770750587806106,
+          "estimated_ms": 0.43805120411232756
+        },
+        {
+          "tokens": 256,
+          "context": 65536,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 1.5759040252305567,
+          "estimated_ms": 1.5967586660241468
+        },
+        {
+          "tokens": 256,
+          "context": 65536,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 0.3277250216342509,
+          "estimated_ms": 0.32590573895705593
+        },
+        {
+          "tokens": 256,
+          "context": 65536,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 1.3900434714742005,
+          "estimated_ms": 1.411533138192506
+        },
+        {
+          "tokens": 256,
+          "context": 262144,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 5.491018469911069,
+          "estimated_ms": 5.56681579264398
+        },
+        {
+          "tokens": 256,
+          "context": 262144,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 0.34305552253499627,
+          "estimated_ms": 0.34448493850188594
+        },
+        {
+          "tokens": 256,
+          "context": 262144,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 2.38924752920866,
+          "estimated_ms": 2.428272126607845
+        },
+        {
+          "tokens": 2048,
+          "context": 8192,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 1.6350260120816529,
+          "estimated_ms": 1.616632856194387
+        },
+        {
+          "tokens": 2048,
+          "context": 8192,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 0.8848590077832341,
+          "estimated_ms": 0.813988902257277
+        },
+        {
+          "tokens": 2048,
+          "context": 8192,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 1.471041003242135,
+          "estimated_ms": 1.4725685567697775
+        },
+        {
+          "tokens": 2048,
+          "context": 65536,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 10.713785013649613,
+          "estimated_ms": 10.88629255148894
+        },
+        {
+          "tokens": 2048,
+          "context": 65536,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 0.9001385187730193,
+          "estimated_ms": 0.8635334343768237
+        },
+        {
+          "tokens": 2048,
+          "context": 65536,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 9.135700995102525,
+          "estimated_ms": 9.301585257818237
+        },
+        {
+          "tokens": 2048,
+          "context": 262144,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 41.99854005128145,
+          "estimated_ms": 42.64674956444761
+        },
+        {
+          "tokens": 2048,
+          "context": 262144,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 0.9942510514520109,
+          "estimated_ms": 1.0121670307354638
+        },
+        {
+          "tokens": 2048,
+          "context": 262144,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 17.06899399869144,
+          "estimated_ms": 17.353174708326883
+        },
+        {
+          "tokens": 8192,
+          "context": 8192,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 3.9737019687891006,
+          "estimated_ms": 3.7434871138344934
+        },
+        {
+          "tokens": 8192,
+          "context": 8192,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 2.4017324903979897,
+          "estimated_ms": 2.323424733791914
+        },
+        {
+          "tokens": 8192,
+          "context": 8192,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 3.974452964030206,
+          "estimated_ms": 3.7434871138344934
+        },
+        {
+          "tokens": 8192,
+          "context": 65536,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 40.27571005281061,
+          "estimated_ms": 40.82212589501271
+        },
+        {
+          "tokens": 8192,
+          "context": 65536,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 2.97367200255394,
+          "estimated_ms": 2.706828390101742
+        },
+        {
+          "tokens": 8192,
+          "context": 65536,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 33.78445346606895,
+          "estimated_ms": 34.318651806701766
+        },
+        {
+          "tokens": 8192,
+          "context": 262144,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 165.33097898354754,
+          "estimated_ms": 167.86395394684737
+        },
+        {
+          "tokens": 8192,
+          "context": 262144,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 3.2584144501015544,
+          "estimated_ms": 3.301362775536302
+        },
+        {
+          "tokens": 8192,
+          "context": 262144,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 67.19815649557859,
+          "estimated_ms": 68.33610365864574
+        },
+        {
+          "tokens": 8192,
+          "context": 8192,
+          "pattern": "short",
+          "active": 64,
+          "actual_ms": 0.9729650337249041,
+          "estimated_ms": 1.0319911925213074
+        },
+        {
+          "tokens": 8192,
+          "context": 8192,
+          "pattern": "short",
+          "active": 1024,
+          "actual_ms": 1.0300229187123477,
+          "estimated_ms": 1.0782975744792178
+        },
+        {
+          "tokens": 8192,
+          "context": 8192,
+          "pattern": "short",
+          "active": 4096,
+          "actual_ms": 1.6171599854715168,
+          "estimated_ms": 1.582522622465351
+        }
+      ]
+    },
+    "sc": {
+      "coefficients_ms": [
+        0.19896896616666457,
+        0.0032255933216442456,
+        0.0038026017010685054
+      ],
+      "mean_relative_error": 0.004740190273589578,
+      "max_relative_error": 0.010455232757719058,
+      "cases": [
+        {
+          "tokens": 256,
+          "context": 8192,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 2.1058900165371597,
+          "estimated_ms": 2.119870146415321
+        },
+        {
+          "tokens": 256,
+          "context": 8192,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 2.1209545666351914,
+          "estimated_ms": 2.119870146415321
+        },
+        {
+          "tokens": 256,
+          "context": 8192,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 2.1420190460048616,
+          "estimated_ms": 2.119870146415321
+        },
+        {
+          "tokens": 256,
+          "context": 65536,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 2.1053190575912595,
+          "estimated_ms": 2.119870146415321
+        },
+        {
+          "tokens": 256,
+          "context": 65536,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 2.116831950843334,
+          "estimated_ms": 2.119870146415321
+        },
+        {
+          "tokens": 256,
+          "context": 65536,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 2.127683022990823,
+          "estimated_ms": 2.119870146415321
+        },
+        {
+          "tokens": 256,
+          "context": 262144,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 2.10629595676437,
+          "estimated_ms": 2.119870146415321
+        },
+        {
+          "tokens": 256,
+          "context": 262144,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 2.1218154579401016,
+          "estimated_ms": 2.119870146415321
+        },
+        {
+          "tokens": 256,
+          "context": 262144,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 2.131779969204217,
+          "estimated_ms": 2.119870146415321
+        },
+        {
+          "tokens": 2048,
+          "context": 8192,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 15.475046471692622,
+          "estimated_ms": 15.566178408155917
+        },
+        {
+          "tokens": 2048,
+          "context": 8192,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 15.592063020449132,
+          "estimated_ms": 15.566178408155917
+        },
+        {
+          "tokens": 2048,
+          "context": 8192,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 15.715818968601525,
+          "estimated_ms": 15.566178408155917
+        },
+        {
+          "tokens": 2048,
+          "context": 65536,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 15.436532557941973,
+          "estimated_ms": 15.566178408155917
+        },
+        {
+          "tokens": 2048,
+          "context": 65536,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 15.612264047376812,
+          "estimated_ms": 15.566178408155917
+        },
+        {
+          "tokens": 2048,
+          "context": 65536,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 15.730645973235369,
+          "estimated_ms": 15.566178408155917
+        },
+        {
+          "tokens": 2048,
+          "context": 262144,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 15.43579250574112,
+          "estimated_ms": 15.566178408155917
+        },
+        {
+          "tokens": 2048,
+          "context": 262144,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 15.577716461848468,
+          "estimated_ms": 15.566178408155917
+        },
+        {
+          "tokens": 2048,
+          "context": 262144,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 15.634453971870244,
+          "estimated_ms": 15.566178408155917
+        },
+        {
+          "tokens": 8192,
+          "context": 8192,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 57.05167102860287,
+          "estimated_ms": 57.28720957449275
+        },
+        {
+          "tokens": 8192,
+          "context": 8192,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 57.399989978875965,
+          "estimated_ms": 57.28720957449275
+        },
+        {
+          "tokens": 8192,
+          "context": 8192,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 57.04119196161628,
+          "estimated_ms": 57.28720957449275
+        },
+        {
+          "tokens": 8192,
+          "context": 65536,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 61.133348499424756,
+          "estimated_ms": 61.66780673412367
+        },
+        {
+          "tokens": 8192,
+          "context": 65536,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 61.818895454052836,
+          "estimated_ms": 61.66780673412367
+        },
+        {
+          "tokens": 8192,
+          "context": 65536,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 62.02694907551631,
+          "estimated_ms": 61.66780673412367
+        },
+        {
+          "tokens": 8192,
+          "context": 262144,
+          "pattern": "uniform",
+          "active": null,
+          "actual_ms": 61.14212452666834,
+          "estimated_ms": 61.66780673412367
+        },
+        {
+          "tokens": 8192,
+          "context": 262144,
+          "pattern": "recent",
+          "active": null,
+          "actual_ms": 61.73629395198077,
+          "estimated_ms": 61.66780673412367
+        },
+        {
+          "tokens": 8192,
+          "context": 262144,
+          "pattern": "shared",
+          "active": null,
+          "actual_ms": 62.127099954523146,
+          "estimated_ms": 61.66780673412367
+        },
+        {
+          "tokens": 8192,
+          "context": 8192,
+          "pattern": "short",
+          "active": 64,
+          "actual_ms": 30.496643506921828,
+          "estimated_ms": 30.516893598970473
+        },
+        {
+          "tokens": 8192,
+          "context": 8192,
+          "pattern": "short",
+          "active": 1024,
+          "actual_ms": 31.255820067599416,
+          "estimated_ms": 31.246993125575628
+        },
+        {
+          "tokens": 8192,
+          "context": 8192,
+          "pattern": "short",
+          "active": 4096,
+          "actual_ms": 41.7906625661999,
+          "estimated_ms": 41.711753006916155
+        }
+      ]
+    }
+  }
+}
