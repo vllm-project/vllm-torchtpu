@@ -501,3 +501,74 @@ def test_execute_local_chunks_oversized_video_into_compiled_budgets(compile_mock
     assert mgr.graph_hits == 3
     assert mgr.graph_misses == 0
     model.encoder_eager_forward.assert_not_called()
+
+
+def test_mm_encoder_manager_use_dp_logic(compile_mock):
+    model = Mock()
+    model.get_encoder_cudagraph_config.return_value = SimpleNamespace(
+        capture_axes=(),
+        padding_logics={},
+        paths={
+            "default": SimpleNamespace(min_token_budget=None, allow_zero_tokens=False)
+        },
+    )
+    model.prepare_encoder_cudagraph_capture_inputs.return_value = SimpleNamespace(
+        values={}
+    )
+
+    # 1. mm_encoder_tp_mode == "data" and tp_size > 1 -> use_dp == True
+    config_dp = SimpleNamespace(
+        model_config=SimpleNamespace(
+            dtype=torch.float32,
+            multimodal_config=SimpleNamespace(
+                get_limit_per_prompt=lambda _: 0, mm_encoder_tp_mode="data"
+            ),
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+        compilation_config=SimpleNamespace(
+            cudagraph_mm_encoder=True,
+            encoder_cudagraph_token_budgets=[8],
+            encoder_cudagraph_max_vision_items_per_batch=2,
+            encoder_cudagraph_max_frames_per_batch=0,
+        ),
+    )
+    mgr_dp = mm.MMEncoderManager(config_dp, torch.device("cpu"), model)
+    assert mgr_dp.use_dp is True
+
+    # 2. mm_encoder_tp_mode == "weights" and tp_size > 1 -> use_dp == False
+    config_weights = SimpleNamespace(
+        model_config=SimpleNamespace(
+            dtype=torch.float32,
+            multimodal_config=SimpleNamespace(
+                get_limit_per_prompt=lambda _: 0, mm_encoder_tp_mode="weights"
+            ),
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=2),
+        compilation_config=SimpleNamespace(
+            cudagraph_mm_encoder=True,
+            encoder_cudagraph_token_budgets=[8],
+            encoder_cudagraph_max_vision_items_per_batch=2,
+            encoder_cudagraph_max_frames_per_batch=0,
+        ),
+    )
+    mgr_weights = mm.MMEncoderManager(config_weights, torch.device("cpu"), model)
+    assert mgr_weights.use_dp is False
+
+    # 3. mm_encoder_tp_mode == "data" and tp_size == 1 -> use_dp == False
+    config_tp1 = SimpleNamespace(
+        model_config=SimpleNamespace(
+            dtype=torch.float32,
+            multimodal_config=SimpleNamespace(
+                get_limit_per_prompt=lambda _: 0, mm_encoder_tp_mode="data"
+            ),
+        ),
+        parallel_config=SimpleNamespace(tensor_parallel_size=1),
+        compilation_config=SimpleNamespace(
+            cudagraph_mm_encoder=True,
+            encoder_cudagraph_token_budgets=[8],
+            encoder_cudagraph_max_vision_items_per_batch=2,
+            encoder_cudagraph_max_frames_per_batch=0,
+        ),
+    )
+    mgr_tp1 = mm.MMEncoderManager(config_tp1, torch.device("cpu"), model)
+    assert mgr_tp1.use_dp is False

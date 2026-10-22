@@ -286,6 +286,11 @@ run_mm_eval() {
 
     echo "Running evalscope for task: $task (limit=$mm_limit/subset, eval-batch-size=$mm_batch_size)..."
     rm -rf "$mm_workdir"
+    local should_profile="${CAPTURE_PROFILE:-0}"
+    if [ "$should_profile" = "1" ]; then
+        echo "Arming profiler for multimodal eval ($task)..."
+        curl -s -X POST "http://$HOST:$PORT/start_profile" || true
+    fi
     TORCH_DEVICE_BACKEND_AUTOLOAD=0 evalscope eval \
         --model "$MODEL" \
         --eval-type openai_api \
@@ -296,6 +301,10 @@ run_mm_eval() {
         --eval-batch-size "$mm_batch_size" \
         --no-timestamp \
         --work-dir "$mm_workdir"
+    if [ "$should_profile" = "1" ]; then
+        echo "Disarming profiler for multimodal eval ($task)..."
+        curl -s -X POST "http://$HOST:$PORT/stop_profile" || true
+    fi
 
     local report_json
     report_json=$(find "$mm_workdir" -path "*/reports/*/${task}.json" | head -1)
@@ -365,6 +374,7 @@ EXTRA_LM_EVAL_MODEL_ARGS=$(python3 -c 'import json, sys; print(json.load(open(sy
 LM_EVAL_GEN_KWARGS=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("lm_eval_gen_kwargs", ""))' "$RESULTS_DIR/config.json")
 EVAL_TOLERANCE=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["eval_tolerance"])' "$RESULTS_DIR/config.json")
 PERF_TOLERANCE=$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("perf_tolerance", 0.05))' "$RESULTS_DIR/config.json")
+CAPTURE_PROFILE="${CAPTURE_PROFILE:-$(python3 -c 'import json, sys; print(json.load(open(sys.argv[1])).get("capture_profile", 0))' "$RESULTS_DIR/config.json")}"
 
 fail=0
 

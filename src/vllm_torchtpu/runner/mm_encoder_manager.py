@@ -370,6 +370,23 @@ class MMEncoderManager(EncoderCudaGraphManager):
             )
         return local_outputs
 
+    def _dp_gather(
+        self,
+        local_outputs: list[torch.Tensor],
+        per_item_out_tokens: list[int],
+        image_rank_assignment: list[int],
+        images_per_rank: list[int],
+        max_output_tokens_per_rank: int,
+    ) -> list[torch.Tensor]:
+        """Gather encoder outputs across TP ranks using TPU-safe synchronization."""
+        return self._gather_dp_outputs(
+            local_outputs,
+            per_item_out_tokens,
+            image_rank_assignment,
+            images_per_rank,
+            max_output_tokens_per_rank,
+        )
+
     def _gather_dp_outputs(
         self,
         local_outputs: list[torch.Tensor],
