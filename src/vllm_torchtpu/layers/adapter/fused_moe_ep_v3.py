@@ -53,6 +53,8 @@ PyTorch/XLA custom-op adapter bridging vLLM FusedMoE layers to the Pallas Fused
 EP v3 pipeline.
 """
 
+import dataclasses
+import json
 from typing import Any
 
 import jax
@@ -133,6 +135,35 @@ def mask_padded_rows(
     return x, gating
 
 
+def apply_config_overrides(config: Config, overrides: str) -> Config:
+    """`config` with the fields of the JSON object `overrides` replaced
+    (TPU_MOE_FUSED_EP_V3_CONFIG). Empty: `config` unchanged. An unknown
+    field or a value the Config refuses raises, so a typo cannot silently
+    run the defaults."""
+    if not overrides:
+        return config
+    fields = json.loads(overrides)
+    if not isinstance(fields, dict):
+        raise ValueError(
+            f"TPU_MOE_FUSED_EP_V3_CONFIG={overrides!r}: a JSON object of Config fields"
+        )
+    known = {f.name for f in dataclasses.fields(Config)}
+    unknown = sorted(set(fields) - known)
+    if unknown:
+        raise ValueError(f"TPU_MOE_FUSED_EP_V3_CONFIG: unknown Config fields {unknown}")
+    if "row_scale_dtype" in fields:
+        fields["row_scale_dtype"] = jnp.dtype(fields["row_scale_dtype"]).type
+    return dataclasses.replace(config, **fields)
+
+
+def tile_rows() -> int:
+    """The FFN tile height: TPU_MOE_FUSED_EP_V3_TILE_ROWS (default TILE_ROWS)."""
+    rows = int(envs.TPU_MOE_FUSED_EP_V3_TILE_ROWS or TILE_ROWS)
+    if rows <= 0 or rows % 8:
+        raise ValueError(f"TPU_MOE_FUSED_EP_V3_TILE_ROWS={rows}: a positive multiple of 8")
+    return rows
+
+
 def served_config(
     *, hidden: int, inter: int, experts_per_shard: int, top_k: int
 ) -> Config:
@@ -141,6 +172,7 @@ def served_config(
     config = Config.for_shape(
         hidden=hidden, inter=inter, experts_per_shard=experts_per_shard, top_k=top_k
     )
+    config = apply_config_overrides(config, envs.TPU_MOE_FUSED_EP_V3_CONFIG)
     logger.info_once(
         "Fused EP MoE (latest kernel) settings for hidden=%d inter=%d "
         "experts_per_shard=%d top_k=%d: tile_rows=%d weight_format=%s "
@@ -152,7 +184,7 @@ def served_config(
         inter,
         experts_per_shard,
         top_k,
-        TILE_ROWS,
+        tile_rows(),
         WEIGHT_FORMAT,
         config.token_rows,
         config.intermediate,
@@ -216,7 +248,7 @@ def run_moe_v3(
             top_k=topk,
             renormalize=renormalize,
             mesh=mesh,
-            tile_rows=TILE_ROWS,
+            tile_rows=tile_rows(),
             weight_format=WEIGHT_FORMAT,
             activation=activation,
             drop_nan_rows=drop_nan_rows,
