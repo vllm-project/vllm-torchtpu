@@ -126,7 +126,7 @@ def _pool_results_of_control_flow(module, pool_type):
     return hits
 
 
-def _lower_pooled_step(tokens, **extra):
+def _lower_pooled_step(tokens, kv_heads=2, q_heads=24, **extra):
     """Lower the real pooled QSA step for TPU (no device needed)."""
     from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import pooled_qsa_step
 
@@ -138,9 +138,9 @@ def _lower_pooled_step(tokens, **extra):
 
     pool = jnp.zeros((12, 1664, 1, 4, 256), jnp.float8_e4m3fn)
     args = (
-        rand((tokens, 24 * 256 * 2)),
-        rand((tokens, 2 * 256)),
-        rand((tokens, 2 * 256)),
+        rand((tokens, q_heads * 256 * 2)),
+        rand((tokens, kv_heads * 256)),
+        rand((tokens, kv_heads * 256)),
         rand((tokens, 5 * 128)),
         rand((256,)),
         rand((256,)),
@@ -196,4 +196,26 @@ def test_unpacked_pooled_step_lowers_identically_with_slot_zero():
     assert (
         _lower_pooled_step(16).as_text()
         == _lower_pooled_step(16, compressed_slot=0).as_text()
+    )
+
+
+@pytest.mark.parametrize("tokens", [8, 128])
+@pytest.mark.parametrize("main_slot", [0, 1])
+def test_paired_main_kv_step_threads_pool_without_conditional(tokens, main_slot):
+    """Paired main KV slots (gather/scatter and tiled writers, head-offset
+    attention) thread the pool through without a conditional result.
+
+    The lowered geometry has one KV head per device, as at TP8."""
+    module = _lower_pooled_step(
+        tokens, kv_heads=1, q_heads=3, main_slot=main_slot
+    ).compiler_ir("stablehlo")
+    pool_type = "tensor<12x1664x1x4x256xf8E4M3FN>"
+    assert _pool_results_of_control_flow(module, pool_type) == []
+
+
+def test_unpaired_pooled_step_lowers_identically_with_default_main_slot():
+    """Paired main KV support must leave the unpaired program bit-identical."""
+    assert (
+        _lower_pooled_step(16).as_text()
+        == _lower_pooled_step(16, main_slot=-1).as_text()
     )

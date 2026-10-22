@@ -79,6 +79,7 @@ def _rpa_attention_batch(
     bkv_size=256,
     k_scale=1.0,
     v_scale=1.0,
+    kv_head_offset=0,
 ):
     from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 
@@ -92,7 +93,17 @@ def _rpa_attention_batch(
         ((0, 0), (0, 0), (0, cache.shape[-1] - q.shape[-1])),
     )
     virtual_cache = cache.reshape(-1, ratio, *cache.shape[2:])
-    dummy_k = jnp.zeros((q.shape[0], kv_heads, query.shape[-1]), cache.dtype)
+    # Paired pages store a second layer's KV head after the first. RPA reads
+    # a row's leading heads; the cache then presents kv_head_offset + kv_heads
+    # heads and zero queries attend the heads ahead of this layer's.
+    skipped_heads = kv_head_offset * (q.shape[1] // kv_heads)
+    if kv_head_offset:
+        if (kv_head_offset + kv_heads) * 2 > cache.shape[2] * cache.shape[3]:
+            raise ValueError("KV head offset exceeds the cache row's head slots")
+        query = jnp.pad(query, ((0, 0), (skipped_heads, 0), (0, 0)))
+    dummy_k = jnp.zeros(
+        (q.shape[0], kv_heads + kv_head_offset, query.shape[-1]), cache.dtype
+    )
     decode = configs.BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=bkv_size, batch_size=8)
     prefill = configs.BlockSizes(bq_sz=1, bq_c_sz=1, bkv_sz=bkv_size, batch_size=1)
     out, next_cache = wrapper.ragged_paged_attention(
@@ -115,6 +126,8 @@ def _rpa_attention_batch(
         prefill_block_sizes=prefill,
     )
     out = out[jnp.minimum(cu_q_lens[:-1], len(q) - 1), :, : q.shape[-1]]
+    if kv_head_offset:
+        out = out[:, skipped_heads:]
     out = bf16(
         bf16(out).astype(jnp.float32)
         * bf16(jax.nn.sigmoid(gate.astype(jnp.float32))).astype(jnp.float32)
@@ -132,7 +145,18 @@ def rpa_query_batch_size(page_columns):
 
 
 def rpa_attention(
-    q, gate, blocks, lengths, table, cache, *, kv_heads, ratio, k_scale=1.0, v_scale=1.0
+    q,
+    gate,
+    blocks,
+    lengths,
+    table,
+    cache,
+    *,
+    kv_heads,
+    ratio,
+    k_scale=1.0,
+    v_scale=1.0,
+    kv_head_offset=0,
 ):
     batch_size = rpa_query_batch_size(blocks.shape[1] + 1)
     attend = functools.partial(
@@ -141,6 +165,7 @@ def rpa_attention(
         ratio=ratio,
         k_scale=k_scale,
         v_scale=v_scale,
+        **({"kv_head_offset": kv_head_offset} if kv_head_offset else {}),
     )
     if len(q) <= batch_size:
         return attend(q, gate, blocks, lengths, table, cache)
@@ -181,6 +206,7 @@ def _prefill_attention(
     ratio,
     k_scale=1.0,
     v_scale=1.0,
+    kv_head_offset=0,
 ):
     from vllm_torchtpu.kernels.qwen4_exp.block_sparse_gqa_prefill import (
         block_sparse_gqa_attention,
@@ -206,6 +232,7 @@ def _prefill_attention(
         kv_tile=kv_tile,
         k_scale=k_scale,
         v_scale=v_scale,
+        **({"kv_head_offset": kv_head_offset} if kv_head_offset else {}),
     )
 
 
@@ -222,9 +249,16 @@ def qsa_attention(
     ratio,
     k_scale=1.0,
     v_scale=1.0,
+    kv_head_offset=0,
 ):
-    """Route a decode prefix to unchanged RPA and the remaining rows to prefill."""
+    """Route a decode prefix to unchanged RPA and the remaining rows to prefill.
+
+    ``kv_head_offset`` reads this layer's KV heads after that many other heads
+    of each cache row (the second layer of a paired main KV page).
+    """
     options = dict(kv_heads=kv_heads, ratio=ratio, k_scale=k_scale, v_scale=v_scale)
+    if kv_head_offset:
+        options["kv_head_offset"] = kv_head_offset
     if len(query) <= len(starts) - 1:
         return rpa_attention(query, gate, blocks, lengths, table, cache, **options)
 

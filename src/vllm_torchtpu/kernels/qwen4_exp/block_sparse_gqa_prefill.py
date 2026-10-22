@@ -44,6 +44,7 @@ def _kernel(
     query_block: int,
     k_scale: float,
     v_scale: float,
+    kv_head_offset: int = 0,
 ):
     block = pl.program_id(0)
     # The model produces BF16 queries.  A BF16 call boundary can avoid a large
@@ -146,7 +147,7 @@ def _kernel(
         written = logical + lax.broadcasted_iota(
             jnp.int32, (kv_tile, head_dim), 0
         ) < jnp.max(lengths_ref[:, 0])
-        key_values = split_kv(kv_ref)[:kv_heads]
+        key_values = split_kv(kv_ref)[kv_head_offset : kv_head_offset + kv_heads]
         for query_tile_index in range(num_query_tiles):
             start = query_tile_index * query_tile
             tile_visible = visible[start : start + query_tile]
@@ -258,6 +259,7 @@ def _kernel(
         "k_scale",
         "v_scale",
         "bf16_io",
+        "kv_head_offset",
     ),
 )
 def block_sparse_gqa_prefill(
@@ -274,8 +276,13 @@ def block_sparse_gqa_prefill(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
     bf16_io: bool = False,
+    kv_head_offset: int = 0,
 ):
-    """Run exact selected-group attention with query-block KV reuse."""
+    """Run exact selected-group attention with query-block KV reuse.
+
+    ``kv_head_offset`` skips that many KV heads of each cache row: a paired
+    main KV page stores a second layer's head after the first layer's.
+    """
     tokens, query_heads, head_dim = query.shape
     pages, physical_page_size, head_axis, packing, cache_dim = cache.shape
     if tokens % query_block or query_block % 8:
@@ -299,6 +306,10 @@ def block_sparse_gqa_prefill(
         )
     if query_heads % kv_heads or cache_dim < head_dim:
         raise ValueError("QSA query and KV geometry is inconsistent")
+    if kv_head_offset and (
+        kv_head_offset < 0 or (kv_head_offset + kv_heads) * 2 > head_axis * packing
+    ):
+        raise ValueError("KV head offset exceeds the cache row's head slots")
     original_head_dim = head_dim
     query = jnp.pad(query, ((0, 0), (0, 0), (0, cache_dim - head_dim)))
     head_dim = cache_dim
@@ -391,6 +402,7 @@ def block_sparse_gqa_prefill(
             query_block=query_block,
             k_scale=k_scale,
             v_scale=v_scale,
+            **({"kv_head_offset": kv_head_offset} if kv_head_offset else {}),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
@@ -476,9 +488,11 @@ def block_sparse_gqa_attention(
     v_scale: float = 1.0,
     query_block: int = 32,
     kv_tile: int = 128,
+    kv_head_offset: int = 0,
 ):
     """Align requests, share KV tiles, then restore the original token order."""
     real = starts[1:] - starts[:-1]
+    offset = {"kv_head_offset": kv_head_offset} if kv_head_offset else {}
 
     def run_aligned(_):
         return block_sparse_gqa_prefill(
@@ -494,6 +508,7 @@ def block_sparse_gqa_attention(
             k_scale=k_scale,
             v_scale=v_scale,
             bf16_io=True,
+            **offset,
         )
 
     def run_with_padding(_):
@@ -527,6 +542,7 @@ def block_sparse_gqa_attention(
             k_scale=k_scale,
             v_scale=v_scale,
             bf16_io=True,
+            **offset,
         )
         return output[jnp.minimum(slots, max_tokens - 1)]
 

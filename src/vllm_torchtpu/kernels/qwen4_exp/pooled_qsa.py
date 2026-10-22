@@ -120,14 +120,177 @@ def _write_main_cache_universal(pool, rows, page, logical, valid):
     )
 
 
+def main_slot_rows(rows: jax.Array, slot: int) -> jax.Array:
+    """Move ``pack_rows`` output (K, V, 0, 0) to head slot ``slot``'s pair."""
+    return jnp.roll(rows, 2 * slot, axis=-2) if slot else rows
+
+
+def _main_slot_keep_mask(slot: int) -> int:
+    # The kernels unpack an FP8 32-bit word low byte first: slot s of a
+    # paired page owns bytes 2s (K) and 2s + 1 (V); see
+    # ``batched_rpa.utils.convert_to_target_bitwidth``.
+    return ~(0xFFFF << (16 * slot)) & 0xFFFFFFFF
+
+
+def _write_main_cache_paired(pool, rows, page, logical, valid, slot):
+    """Write one layer's K/V head pair, preserving the partner layer's pair.
+
+    Paired main KV pages (``QWEN4_EXP_PACK_MAIN_KV``) hold two layers' single
+    KV heads: layer slot ``s`` stores K and V at head slots ``2s`` and
+    ``2s + 1`` of every token row. FP8 packs a lane's four head slots into
+    one 32-bit word, below DMA granularity, so each written row is read,
+    merged word-wise and written back. Reads of one 128-row tile complete
+    before any of its writes, and tiles run in order, so a token written
+    twice in one step keeps its last value while the partner bytes never
+    change.
+    """
+    packing = pool.shape[-2]
+    if (
+        pool.dtype != jnp.float8_e4m3fn
+        or pool.shape[2] != 1
+        or rows.shape[1:] != pool.shape[2:]
+        or not 0 <= slot < packing // 2
+    ):
+        raise ValueError("Paired main KV needs one FP8 head-slot row per token")
+    rows = main_slot_rows(rows, slot)
+    offsets = logical % pool.shape[1]
+    tile = 128
+    if len(rows) % tile or pool.shape[1] % tile:
+        # Small steps: a gather of the touched rows feeds the in-place scatter.
+        mine = (jnp.arange(packing) // 2 == slot)[:, None]
+        old = pool[jnp.minimum(page, len(pool) - 1), offsets]
+        merged = jnp.where(mine, rows, old)
+        return pool.at[page, offsets].set(merged, mode="drop")
+
+    keep = _main_slot_keep_mask(slot)
+    width = pool.shape[-1]
+    pp, oo, vv = (
+        page.reshape(-1, tile),
+        offsets.reshape(-1, tile),
+        valid.reshape(-1, tile).astype(jnp.bool_),
+    )
+    bulk = (
+        jnp.all(vv, axis=1)
+        & jnp.all(pp == pp[:, :1], axis=1)
+        & jnp.all(oo == oo[:, :1] + jnp.arange(tile, dtype=offsets.dtype), axis=1)
+    )
+    conflict = (
+        (pp[:, :, None] == pp[:, None, :])
+        & (oo[:, :, None] == oo[:, None, :])
+        & vv[:, :, None]
+        & vv[:, None, :]
+        & ~jnp.eye(tile, dtype=jnp.bool_)[None]
+    )
+    unique = ~jnp.any(conflict, axis=(1, 2))
+
+    def kernel(
+        pages_ref,
+        offsets_ref,
+        valid_ref,
+        bulk_ref,
+        unique_ref,
+        source_ref,
+        _old_ref,
+        target_ref,
+        buffer_ref,
+        semaphore,
+    ):
+        program = pl.program_id(0)
+        first = program * tile
+
+        def merge():
+            old = buffer_ref.bitcast(jnp.uint32).reshape(-1, width)
+            new = source_ref.bitcast(jnp.uint32).reshape(-1, width)
+            old[...] = (old[...] & jnp.uint32(keep)) | new[...]
+
+        def row_copy(lane, read):
+            row = first + lane
+            stored = target_ref.at[pages_ref[row], pl.ds(offsets_ref[row], 1)]
+            staged = buffer_ref.at[pl.ds(lane, 1)]
+            source, target = (stored, staged) if read else (staged, stored)
+            return pltpu.make_async_copy(source, target, semaphore)
+
+        def each_valid(action):
+            for lane in range(tile):
+
+                @pl.when(valid_ref[first + lane] != 0)
+                def run(*, lane=lane):
+                    action(lane)
+
+        @pl.when(bulk_ref[program] != 0)
+        def store_tile():
+            stored = target_ref.at[pages_ref[first], pl.ds(offsets_ref[first], tile)]
+            pltpu.async_copy(stored, buffer_ref, semaphore).wait()
+            merge()
+            pltpu.async_copy(buffer_ref, stored, semaphore).wait()
+
+        @pl.when(bulk_ref[program] == 0)
+        def store_edges():
+            each_valid(lambda lane: row_copy(lane, True).start())
+            each_valid(lambda lane: row_copy(lane, True).wait())
+            merge()
+
+            @pl.when(unique_ref[program] != 0)
+            def store_unique():
+                each_valid(lambda lane: row_copy(lane, False).start())
+                each_valid(lambda lane: row_copy(lane, False).wait())
+
+            @pl.when(unique_ref[program] == 0)
+            def store_ordered():
+                def store(lane):
+                    copy = row_copy(lane, False)
+                    copy.start()
+                    copy.wait()
+
+                each_valid(store)
+
+    return pl.pallas_call(
+        kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=5,
+            grid=(len(rows) // tile,),
+            in_specs=[
+                pl.BlockSpec(
+                    (tile, *rows.shape[1:]),
+                    lambda program, *_: (program,) + (0,) * (rows.ndim - 1),
+                ),
+                pl.BlockSpec(memory_space=pltpu.HBM),
+            ],
+            out_specs=pl.BlockSpec(memory_space=pltpu.HBM),
+            scratch_shapes=[
+                pltpu.VMEM((tile, *rows.shape[1:]), pool.dtype),
+                pltpu.SemaphoreType.DMA,
+            ],
+        ),
+        out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),
+        input_output_aliases={6: 0},
+        name="qwen4_exp_main_kv_paired_slot_scatter",
+    )(
+        page.astype(jnp.int32),
+        offsets.astype(jnp.int32),
+        valid.astype(jnp.int32),
+        bulk.astype(jnp.int32),
+        unique.astype(jnp.int32),
+        rows,
+        pool,
+    )
+
+
 def write_main_cache(
     pool: jax.Array,
     rows: jax.Array,
     page: jax.Array,
     logical: jax.Array,
     valid: jax.Array,
+    slot: int | None = None,
 ) -> jax.Array:
-    """Batch independent row DMAs while preserving duplicate write order."""
+    """Batch independent row DMAs while preserving duplicate write order.
+
+    ``slot`` (paired main KV pages only) writes this layer's head pair of
+    each row and keeps the other's; ``None`` writes whole rows.
+    """
+    if slot is not None:
+        return _write_main_cache_paired(pool, rows, page, logical, valid, slot)
     tile = 128
     batch = get_main_kv_dma_batch(pool, rows)
     if batch == 1:
@@ -628,7 +791,14 @@ def pooled_qsa_step(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
     compressed_slot: int = 0,
+    main_slot: int = -1,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """One QSA layer over the unified pool.
+
+    ``main_slot`` >= 0 selects this layer's KV head pair in main KV pages
+    shared by two layers (``pool_layout.pooled_cache_specs``); the default -1
+    keeps the layer's whole-row pages.
+    """
     # Keep the Runner's flat group tables at the Torch boundary. Static JAX
     # shapes reconstruct their per-request rows inside the operator.
     main_table = main_table.reshape(len(context), -1)
@@ -653,6 +823,7 @@ def pooled_qsa_step(
         page,
         logical,
         valid,
+        **({"slot": main_slot} if main_slot >= 0 else {}),
     )
     ring_rows = math.ceil(compress_ratio / 8) * 8
     ring_elements = ring_rows * raw.shape[-1]
@@ -714,6 +885,7 @@ def pooled_qsa_step(
         ratio=compress_ratio,
         k_scale=k_scale if fp8 else 1.0,
         v_scale=v_scale if fp8 else 1.0,
+        **({"kv_head_offset": main_slot} if main_slot > 0 else {}),
     )
     return (
         pool,
