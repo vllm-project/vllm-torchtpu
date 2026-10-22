@@ -16,6 +16,7 @@
 import pytest
 
 from tests.models.vllm.test_qwen4_exp_parallel import config
+from vllm_torchtpu import envs
 from vllm_torchtpu.models.vllm.qwen4_exp.config import (
     require_unified_pool,
     validate_config,
@@ -226,3 +227,79 @@ def test_qwen4_pool_opt_out_fails_before_adapter_construction(monkeypatch):
     monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "0")
     with pytest.raises(ValueError, match="requires the dual-storage pool"):
         Qwen4ExpAdapter(None)
+
+
+@pytest.mark.parametrize("role", ["kv_producer", "kv_consumer"])
+@pytest.mark.parametrize("ssm_dtype", ["bfloat16", "float32"])
+def test_pd_admits_only_model_owned_fp8_dp8(monkeypatch, role, ssm_dtype):
+    from types import SimpleNamespace
+
+    # Override even a materialized lazy env attribute, then restore its absence.
+    monkeypatch.setitem(vars(envs), "TPU_KV_RESHARD_TRANSPORT", "raiden")
+    cfg = config()
+    cfg.cache_config.cache_dtype = "fp8"
+    cfg.cache_config.mamba_ssm_cache_dtype = ssm_dtype
+    cfg.kv_transfer_config = SimpleNamespace(
+        kv_connector="Qwen4ExpRaidenConnector",
+        kv_connector_module_path=None,
+        kv_role=role,
+    )
+    validate_config(cfg)
+    for transport in ("", "zmq"):
+        with monkeypatch.context() as patch:
+            patch.setitem(vars(envs), "TPU_KV_RESHARD_TRANSPORT", transport)
+            with pytest.raises(ValueError, match="model-owned Raiden connector"):
+                validate_config(cfg)
+    for admission in ("QWEN35", "KIMIK3", "GLM", "DSV4"):
+        with monkeypatch.context() as patch:
+            patch.setitem(vars(envs), f"TPU_RAIDEN_{admission}_ADMISSION", True)
+            with pytest.raises(ValueError, match="model-owned Raiden connector"):
+                validate_config(cfg)
+    for section, field, value in [
+        ("parallel_config", "tensor_parallel_size", 2),
+        ("parallel_config", "data_parallel_size", 4),
+        ("parallel_config", "pipeline_parallel_size", 2),
+        ("parallel_config", "prefill_context_parallel_size", 2),
+        ("parallel_config", "decode_context_parallel_size", 2),
+        ("parallel_config", "enable_expert_parallel", False),
+        ("cache_config", "cache_dtype", "auto"),
+        ("cache_config", "mamba_ssm_cache_dtype", "float16"),
+        ("cache_config", "enable_prefix_caching", True),
+        ("kv_transfer_config", "kv_role", "kv_both"),
+        ("kv_transfer_config", "kv_connector", "TPURaidenConnector"),
+        ("kv_transfer_config", "kv_connector_module_path", "other.module"),
+    ]:
+        target = getattr(cfg, section)
+        original = getattr(target, field)
+        setattr(target, field, value)
+        with pytest.raises(ValueError):
+            validate_config(cfg)
+        setattr(target, field, original)
+
+    monkeypatch.setattr(
+        "vllm_torchtpu.models.vllm.qwen4_exp.config.host_available_memory",
+        lambda: 1 << 60,
+    )
+    for offload, shared, across in [
+        (False, False, True),
+        (True, False, True),
+        (True, True, False),
+    ]:
+        cfg.additional_config = {
+            "qwen4_exp": {
+                "engram_config": {
+                    "cpu_offload": offload,
+                    "dp_shared_memory": shared,
+                    "embedding_across_dp": across,
+                }
+            }
+        }
+        validate_config(cfg)
+
+    cfg.speculative_config = SimpleNamespace()
+    with pytest.raises(ValueError, match="MTP"):
+        validate_config(cfg)
+    cfg.speculative_config = None
+    monkeypatch.setenv("TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL", "0")
+    with pytest.raises(ValueError, match="requires the dual-storage pool"):
+        validate_config(cfg)
