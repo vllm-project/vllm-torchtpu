@@ -243,6 +243,20 @@ def _staged_walk_products_compiled(
     )
 
 
+def stage_h2d_upload(runner: Any, host: torch.Tensor) -> torch.Tensor:
+    """`host.to(runner.device, non_blocking=True)`, keeping `host` alive until
+    the runner's next input-staging fence has been synchronized.
+
+    TorchTPU reads the CPU source asynchronously without holding a reference
+    to it, so a per-call buffer would otherwise be freed (and its memory
+    reused) while the transfer is still in flight. The runner moves `host`
+    from `_unfenced_h2d_sources` to `_fenced_h2d_sources` when it records the
+    fence and drops it once that fence has been waited on.
+    """
+    runner._unfenced_h2d_sources.append(host)
+    return host.to(runner.device, non_blocking=True)
+
+
 class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
     """Single shared metadata builder for every TPU attention group."""
 
@@ -262,13 +276,6 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             self.target_block_size *= cp_world_size
         # Only mamba/GDN layers consume physical state slot ids; attention
         # groups leave AttentionMetadata.mamba_state_indices None.
-
-        block_table_obj = runner.input_batch.block_table[self.kv_cache_group_id]
-        self.block_tables_cpu = torch.zeros(
-            (runner.max_num_reqs, block_table_obj.max_num_blocks_per_req),
-            dtype=torch.int32,
-            device="cpu",
-        )
 
     def _mamba_row_plan(
         self, ctx: AttentionMetadataBuilderContext, target_num_blocks: int
@@ -387,17 +394,18 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             ).to(runner.device)
             input_positions = ctx.position_ids_override
         else:
-            block_tables = self.block_tables_cpu[:target_num_reqs, :target_num_blocks]
-            block_tables.zero_()
+            # Per-call buffer: a later chunk or draft walk must not overwrite a
+            # table whose upload is still in flight (see `stage_h2d_upload`).
+            block_tables = torch.zeros(
+                (target_num_reqs, target_num_blocks), dtype=torch.int32
+            )
             source_block_tables = block_table_obj.get_cpu_tensor()
             block_tables[: ctx.num_reqs, :target_num_blocks] = source_block_tables[
                 ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
             ]
             # Flatten on CPU before H2D to avoid device-side
             # as_strided/reshape materialization on every decode step.
-            block_tables_dev = block_tables.reshape(-1).to(
-                runner.device, non_blocking=True
-            )
+            block_tables_dev = stage_h2d_upload(runner, block_tables.reshape(-1))
             input_positions = runner.position_ids
 
         mamba_ckpt_indices = None
@@ -487,12 +495,12 @@ def stage_block_table_uploads(
 ) -> None:
     """One batched H2D transfer for every block table a walk will build.
 
-    Packs all participating groups' rows into one owned CPU buffer, transfers
-    once, and hands each group's build() a flat view of its region via
-    `ctx.staged_block_tables` (instead of one small per-group H2D per build).
-    `gids` limits staging to a subset of groups; None stages every group.
-    Dummy runs stage the same layout zero-filled so warmup dispatches the
-    program sequence serving will. Views die with the per-chunk context.
+    Packs all participating groups' rows into one CPU buffer owned by this
+    walk, transfers once, and hands each group's build() a flat view of its
+    region via `ctx.staged_block_tables` (instead of one small per-group H2D
+    per build). `gids` limits staging to a subset of groups; None stages every
+    group. Dummy runs stage the same layout zero-filled so warmup dispatches
+    the program sequence serving will. Views die with the per-chunk context.
     """
     if not runner.attn_groups:
         # Pre-initialization dummy runs build metadata before the KV cache
@@ -517,9 +525,9 @@ def stage_block_table_uploads(
         return
 
     total = sum(num_reqs_padded * tnb for _, _, tnb in entries)
-    # TorchTPU borrows the CPU source until async H2D completes. Each walk
-    # owns its upload buffer: a later chunk/MTP step must not clear or refill
-    # an earlier transfer's source. TorchTPU retains this tensor until done.
+    # Per-walk buffer: TorchTPU reads the CPU source until the async H2D
+    # drains, so a later chunk or draft walk must not refill a shared scratch
+    # (see `stage_h2d_upload`).
     flat = torch.zeros((total,), dtype=torch.int32, device="cpu", pin_memory=PIN_MEMORY)
 
     if ctx.position_ids_override is None:
@@ -533,9 +541,9 @@ def stage_block_table_uploads(
                 ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
             ]
             offset += num_reqs_padded * target_num_blocks
-    # Dummy runs keep the zeroed scratch: same staged layout, null blocks.
+    # Dummy runs keep the zeroed buffer: same staged layout, null blocks.
 
-    staged_dev = flat.to(runner.device, non_blocking=True)
+    staged_dev = stage_h2d_upload(runner, flat)
 
     # One compiled program splits the staged tensor into per-group tables
     # and derives every unified-pool mamba group's state/checkpoint indices

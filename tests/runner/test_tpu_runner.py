@@ -52,6 +52,7 @@ from vllm_torchtpu.layers.core.attention_metadata import (
     AttentionMetadata,
     AttentionMetadataBuilder,
     AttentionMetadataBuilderContext,
+    stage_h2d_upload,
 )
 from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 from vllm_torchtpu.runner import tpu_runner
@@ -1627,7 +1628,7 @@ class TestCompactMambaSlotPool:
         # Slots per request: 1 without spec decode, num_spec + 1 with it.
         runner._mamba_slot_stride = slot_stride
         runner._mamba_offset_seeded = set()
-        runner.mamba_state_indices_cpu = torch.zeros(max_num_reqs, dtype=torch.int32)
+        runner._unfenced_h2d_sources = []
         runner.input_batch = MagicMock()
         # Bind the real methods.
         runner._init_mamba_slot_pool = TPUModelRunner._init_mamba_slot_pool.__get__(
@@ -1738,14 +1739,13 @@ class TestCompactMambaSlotPool:
 
     def test_chunked_build_allocates_all(self):
         """Two chunks in one step: each chunk allocates its own requests; all
-        get distinct slots."""
+        get distinct slots, uploaded from distinct host buffers."""
         runner = self._make_runner(max_num_reqs=4, mamba_num_blocks=5)
         runner._init_mamba_slot_pool(5)
         self._set_batch(runner, ["a", "b", "c", "d"])
 
-        # clone: the result aliases a reused staging buffer (no copy on CPU).
-        idx_chunk0 = runner._build_mamba_state_indices(0, 2, 4).clone()
-        idx_chunk1 = runner._build_mamba_state_indices(2, 2, 4).clone()
+        idx_chunk0 = runner._build_mamba_state_indices(0, 2, 4)
+        idx_chunk1 = runner._build_mamba_state_indices(2, 2, 4)
         slots = {
             int(idx_chunk0[0]),
             int(idx_chunk0[1]),
@@ -1753,6 +1753,11 @@ class TestCompactMambaSlotPool:
             int(idx_chunk1[1]),
         }
         assert slots == {1, 2, 3, 4}
+        # No shared staging buffer: the second chunk must not overwrite the
+        # first chunk's in-flight upload, and both stay alive until the fence.
+        assert idx_chunk0.data_ptr() != idx_chunk1.data_ptr()
+        assert runner._unfenced_h2d_sources[0] is idx_chunk0
+        assert runner._unfenced_h2d_sources[1] is idx_chunk1
 
     def test_spec_decode_stride_allocates_group_bases(self):
         """With speculative decoding each request owns a group of `stride`
@@ -2632,7 +2637,11 @@ class TestInputStagingFence:
         monkeypatch.setattr(
             torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
         )
-        runner = SimpleNamespace(_input_staging_fence=None)
+        runner = SimpleNamespace(
+            _input_staging_fence=None,
+            _unfenced_h2d_sources=[],
+            _fenced_h2d_sources=[],
+        )
         TPUModelRunner._record_input_staging_fence(runner)
         fence = runner._input_staging_fence
         assert fence is _FakeTpuEvent.instances[-1]
@@ -2650,6 +2659,136 @@ class TestInputStagingFence:
         runner = SimpleNamespace(_input_staging_fence=None)
         TPUModelRunner._wait_input_staging_fence(runner)
         assert runner._input_staging_fence is None
+
+    def test_staged_h2d_sources_live_until_their_fence_is_waited(self, monkeypatch):
+        """A host source uploaded before a record is released by the wait on
+        that fence; one uploaded after it (a draft walk) must survive that wait
+        and only go with the next fence cycle."""
+        monkeypatch.setattr(
+            torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+        )
+        runner = SimpleNamespace(
+            device=torch.device("cpu"),
+            _input_staging_fence=None,
+            _unfenced_h2d_sources=[],
+            _fenced_h2d_sources=[],
+        )
+        target = stage_h2d_upload(runner, torch.zeros(4, dtype=torch.int32))
+        TPUModelRunner._record_input_staging_fence(runner)
+        draft = stage_h2d_upload(runner, torch.ones(4, dtype=torch.int32))
+        assert runner._fenced_h2d_sources[0] is target
+        assert runner._unfenced_h2d_sources[0] is draft
+
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert runner._fenced_h2d_sources == []
+        assert runner._unfenced_h2d_sources[0] is draft
+
+        TPUModelRunner._record_input_staging_fence(runner)
+        TPUModelRunner._wait_input_staging_fence(runner)
+        assert runner._fenced_h2d_sources == []
+        assert runner._unfenced_h2d_sources == []
+
+    def test_dummy_run_fences_its_uploads_before_the_forward(self, monkeypatch):
+        """Warmup and idle-DP dummy runs stage block tables too: each run must
+        release the previous run's host sources and fence its own before the
+        forward, so repeated runs neither accumulate buffers nor make the next
+        wait block on a dummy forward."""
+        _FakeTpuEvent.instances.clear()
+        monkeypatch.setattr(
+            torch, "tpu", SimpleNamespace(Event=_FakeTpuEvent), raising=False
+        )
+        monkeypatch.setattr(tpu_runner, "synchronize_tensors", lambda *a, **kw: None)
+        for name in ("set_forward_context", "set_vllm_model_wrapper_context"):
+            monkeypatch.setattr(
+                tpu_runner, name, lambda *a, **kw: contextlib.nullcontext()
+            )
+        from vllm_torchtpu.layers.core.sequence_layout import (
+            DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
+        )
+
+        def forward_model(**kw):
+            # The fence must already cover this run's uploads.
+            assert runner._input_staging_fence is _FakeTpuEvent.instances[-1]
+            assert runner._unfenced_h2d_sources == []
+            return torch.zeros((4, 8), dtype=torch.float32), None
+
+        runner = SimpleNamespace(
+            device=torch.device("cpu"),
+            max_model_len=64,
+            max_num_tokens=64,
+            max_num_reqs=4,
+            max_num_blocks_per_req=4,
+            most_model_len=None,
+            block_size=16,
+            uses_mrope=False,
+            supports_mm_inputs=False,
+            _pp_is_first=True,
+            _pp_wave=None,
+            _pp_topk_buffer=None,
+            _kv_cache_bundle=None,
+            lora_config=None,
+            vllm_config=MagicMock(),
+            mesh=MagicMock(),
+            kv_cache_config=SimpleNamespace(kv_cache_groups=[]),
+            _has_mamba_state=False,
+            mamba_slot_read_offsets=None,
+            _mamba_ckpt_window=1,
+            _unified_kv_layout=False,
+            empty_slot_mappings={},
+            position_ids=torch.zeros(64, dtype=torch.int32),
+            _input_staging_fence=None,
+            _unfenced_h2d_sources=[],
+            _fenced_h2d_sources=[],
+            _token_padding_state=None,
+            sequence_layout_planner=SimpleNamespace(
+                prepare_dummy=lambda **kw: SimpleNamespace(
+                    descriptor=DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR
+                )
+            ),
+            maybe_select_dummy_loras=lambda *a, **kw: contextlib.nullcontext(),
+            _dp_num_tokens_across_dp=lambda n: None,
+            forward_model=forward_model,
+            compute_selected_logits=lambda out, idx: out,
+        )
+        for name in (
+            "_build_attention_metadata",
+            "_record_input_staging_fence",
+            "_wait_input_staging_fence",
+        ):
+            setattr(runner, name, getattr(TPUModelRunner, name).__get__(runner))
+        bt = MagicMock()
+        bt.max_num_blocks_per_req = 4
+        bt.get_cpu_tensor.return_value = torch.zeros((4, 4), dtype=torch.int32)
+        runner.input_batch = SimpleNamespace(block_table=[bt])
+        builder = AttentionMetadataBuilder(
+            kv_cache_spec=FullAttentionSpec(
+                block_size=16,
+                num_kv_heads=2,
+                head_size=128,
+                dtype=torch.bfloat16,
+                page_size_padded=16384,
+            ),
+            layer_names=["attn.0"],
+            vllm_config=MagicMock(),
+            device=runner.device,
+            runner=runner,
+            kv_cache_group_id=0,
+        )
+        group = MagicMock()
+        group.metadata_builders = [builder]
+        group.layer_names = ["attn.0"]
+        runner.attn_groups = [[group]]
+
+        for dp_lockstep in (False, True, False):
+            TPUModelRunner._dummy_run(
+                runner, num_tokens=16, num_reqs=4, num_blocks=4, dp_lockstep=dp_lockstep
+            )
+            # Only this run's staged table is still held, by its own fence.
+            assert runner._unfenced_h2d_sources == []
+            assert len(runner._fenced_h2d_sources) == 1
+            assert runner._input_staging_fence is _FakeTpuEvent.instances[-1]
+        assert len(_FakeTpuEvent.instances) == 3
+        assert all(fence.synchronized == 1 for fence in _FakeTpuEvent.instances[:-1])
 
 
 class TestAsyncSpecDecodeTokenAccounting:
