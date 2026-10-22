@@ -14,7 +14,9 @@
 """Mocked static resource boundaries; these are not cross-chip hardware tests."""
 
 from dataclasses import replace
+from types import SimpleNamespace
 
+import jax
 import pytest
 
 from vllm_torchtpu.kernels.qwen4_exp.hc_resources import (
@@ -76,3 +78,96 @@ def test_residual_alignment_is_dtype_derived(tile):
     assert supports_residual(3, 128, tile, different_layout) is (tile % 32 == 0)
     assert not supports_residual(3, 128, tile + 1, hardware())
     assert not supports_residual(3, 128, tile, None)
+
+
+@pytest.fixture
+def initialized_tpu_metadata(monkeypatch):
+    import torch
+    from jax._src import tpu_info
+
+    monkeypatch.setattr(
+        torch, "tpu", SimpleNamespace(is_initialized=lambda: True), raising=False
+    )
+    tpu_info.get_tpu_info.cache_clear()
+    yield tpu_info
+    tpu_info.get_tpu_info.cache_clear()
+
+
+@pytest.mark.parametrize("registered", [False, True])
+def test_hardware_discovery_before_worker_initialization(monkeypatch, registered):
+    import torch
+
+    from vllm_torchtpu.kernels.qwen4_exp import vllm_adapter as adapter
+
+    if registered:
+        monkeypatch.setattr(
+            torch, "tpu", SimpleNamespace(is_initialized=lambda: False), raising=False
+        )
+    else:
+        monkeypatch.delattr(torch, "tpu", raising=False)
+
+    def forbidden():
+        raise AssertionError("Uninitialized workers must not query a device")
+
+    monkeypatch.setattr(adapter.pltpu, "get_tpu_info", forbidden)
+    monkeypatch.setattr(jax, "devices", forbidden)
+    assert adapter.current_hc_hardware() is None
+
+
+def test_initialized_unknown_device_keeps_torch_fallback(
+    monkeypatch, initialized_tpu_metadata
+):
+    from jax._src import xla_bridge
+
+    from vllm_torchtpu.kernels.qwen4_exp import vllm_adapter as adapter
+
+    was_initialized = xla_bridge.backends_are_initialized()
+    monkeypatch.setattr(
+        initialized_tpu_metadata, "get_device_kind", lambda: "HC unknown device fixture"
+    )
+    # The real pinned JAX function raises its unsupported-device ValueError.
+    assert adapter.current_hc_hardware() is None
+    assert xla_bridge.backends_are_initialized() == was_initialized
+
+
+def test_initialized_known_device_preserves_facts_and_admission(
+    monkeypatch, initialized_tpu_metadata
+):
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.kernels.qwen4_exp import vllm_adapter as adapter
+
+    monkeypatch.setattr(initialized_tpu_metadata, "get_device_kind", lambda: "TPU7x")
+    monkeypatch.setattr(initialized_tpu_metadata, "get_num_device_cores", lambda: 1)
+    expected = HcHardware.from_tpu_info(
+        pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    )
+    actual = adapter.current_hc_hardware()
+    assert actual == expected
+    assert actual == HcHardware("7x", 64 << 20, 128, 16, 8, 256)
+    assert supports_full_mix(4, 2560, 320, 256, actual)
+    assert not supports_full_mix(4, 2560, 320, 512, actual)
+    assert supports_residual(3, 128, 16, actual)
+    assert not supports_residual(3, 128, 8, actual)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        RuntimeError("backend unavailable"),
+        ValueError("invalid layout"),
+        ValueError("Unsupported TPU chip version: fixture"),
+    ],
+)
+def test_hardware_discovery_propagates_other_errors(
+    monkeypatch, initialized_tpu_metadata, error
+):
+    from vllm_torchtpu.kernels.qwen4_exp import vllm_adapter as adapter
+
+    def fail():
+        raise error
+
+    monkeypatch.setattr(adapter.pltpu, "get_tpu_info", fail)
+    with pytest.raises(type(error)) as caught:
+        adapter.current_hc_hardware()
+    assert caught.value is error
