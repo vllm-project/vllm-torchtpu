@@ -305,19 +305,14 @@ def init_export_distributed_environment(vllm_config: Any) -> None:
     """Joins the process group the export launcher set up for this rank.
 
     The launcher (`cli.main`) starts one worker per tensor-parallel rank and sets
-    `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR` and `MASTER_PORT`; a
-    single-device export is the one-worker case.
+    `RANK`, `LOCAL_RANK`, `MASTER_ADDR` and `MASTER_PORT`; a single-device export
+    is the one-worker case.
     """
     from vllm.distributed import init_distributed_environment
 
     from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
 
-    world_size = int(os.environ["WORLD_SIZE"])
-    tp_size = vllm_config.parallel_config.tensor_parallel_size
-    if world_size != tp_size:
-        raise ValueError(
-            f"WORLD_SIZE={world_size} does not match tensor_parallel_size={tp_size}"
-        )
+    world_size = vllm_config.parallel_config.tensor_parallel_size
     init_distributed_environment(
         world_size=world_size,
         rank=int(os.environ["RANK"]),

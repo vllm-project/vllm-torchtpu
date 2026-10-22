@@ -16,7 +16,6 @@
 from __future__ import annotations
 
 import argparse
-import json
 import os
 import shutil
 import subprocess
@@ -24,6 +23,8 @@ import sys
 import tempfile
 from collections.abc import Sequence
 from typing import Any
+
+import portpicker
 
 from vllm_torchtpu.experimental.export import (
     api,
@@ -223,43 +224,24 @@ def run_export_from_args(
     return exportable.export_config
 
 
-# Printed by a short-lived helper process, so the launcher never opens the TPU.
-_LAUNCH_ENV_SCRIPT = """
-import json, os, sys
-import torch
-from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
-before = dict(os.environ)
-torch.tpu.distributed.set_tpu_launch_env()
-env = {k: v for k, v in os.environ.items() if before.get(k) != v}
-env["TORCH_TPU_TOPOLOGY"] = TpuPlatform._get_tpu_topology(int(sys.argv[1]))
-print(json.dumps(env))
-"""
-
-
 def _worker_env(tp_size: int) -> dict[str, str]:
-    """Environment shared by the workers of a `tp_size`-device export."""
-    out = subprocess.run(
-        [sys.executable, "-c", _LAUNCH_ENV_SCRIPT, str(tp_size)],
-        check=True,
-        capture_output=True,
-        text=True,
-    ).stdout
-    launch = json.loads(out.strip().splitlines()[-1])
-    addresses = launch["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")
-    if len(addresses) < tp_size:
-        raise ValueError(
-            f"tensor_parallel_size={tp_size} needs {tp_size} TPU devices, the "
-            f"slice has {len(addresses)}"
-        )
-    env = dict(os.environ)
-    env.update({k: str(v) for k, v in launch.items()})
-    env.update(
-        {
-            "TORCH_TPU_SLICEBUILDER_ADDRESSES": ",".join(addresses[:tp_size]),
-            "WORLD_SIZE": str(tp_size),
-        }
-    )
-    return env
+    """Environment shared by the workers of a `tp_size`-device export.
+
+    Prepared the way vLLM's single-host serving prepares its workers; a single
+    device skips the distributed TPU bootstrap.
+    """
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    saved = dict(os.environ)
+    try:
+        os.environ["WORLD_SIZE"] = str(tp_size)
+        os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+        os.environ.setdefault("MASTER_PORT", str(portpicker.pick_unused_port()))
+        TpuPlatform._prepare_singlehost_tpu_env(tp_size)
+        return dict(os.environ)
+    finally:
+        os.environ.clear()
+        os.environ.update(saved)
 
 
 def _launch_workers(argv: Sequence[str], tp_size: int, output_dir: str) -> None:

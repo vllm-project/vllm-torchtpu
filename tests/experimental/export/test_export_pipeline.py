@@ -760,25 +760,38 @@ def test_compute_logits_returns_the_vocabulary_without_padding() -> None:
     assert torch.equal(logits, torch.matmul(hidden, lm_head.T)[:, :10])
 
 
-def test_worker_env_takes_the_first_tp_devices_of_the_slice() -> None:
-    launch = {
-        "TORCH_TPU_SLICEBUILDER_ADDRESSES": "h:8070,h:8071,h:8072,h:8073",
-        "TORCH_TPU_TOPOLOGY": "1,1,1,2",
-        "WORLD_SIZE": "8",
-        "MASTER_ADDR": "h",
-    }
-    done = SimpleNamespace(stdout="log line\n" + json.dumps(launch) + "\n")
-    with mock.patch.object(cli.subprocess, "run", return_value=done):
-        env = cli._worker_env(2)
-    assert env["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == "h:8070,h:8071"
-    assert env["TORCH_TPU_TOPOLOGY"] == "1,1,1,2"
-    assert env["WORLD_SIZE"] == "2"
-    assert env["MASTER_ADDR"] == "h"
-    with (
-        mock.patch.object(cli.subprocess, "run", return_value=done),
-        pytest.raises(ValueError, match="needs 8 TPU devices"),
+@pytest.fixture
+def clean_launch_env(monkeypatch: pytest.MonkeyPatch) -> None:
+    for key in (
+        "WORLD_SIZE",
+        "MASTER_ADDR",
+        "MASTER_PORT",
+        "TORCH_TPU_SLICEBUILDER_ADDRESSES",
+        "TORCH_TPU_TOPOLOGY",
     ):
-        cli._worker_env(8)
+        monkeypatch.delenv(key, raising=False)
+
+
+@pytest.mark.usefixtures("clean_launch_env")
+def test_worker_env_bootstraps_a_tp_slice() -> None:
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    before = dict(os.environ)
+    with mock.patch.object(TpuPlatform, "_get_tpu_topology", return_value="1,1,1,2"):
+        env = cli._worker_env(2)
+    assert env["WORLD_SIZE"] == "2"
+    assert env["TORCH_TPU_TOPOLOGY"] == "1,1,1,2"
+    assert len(env["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")) == 2
+    assert env["MASTER_ADDR"] and env["MASTER_PORT"]
+    assert dict(os.environ) == before
+
+
+@pytest.mark.usefixtures("clean_launch_env")
+def test_worker_env_single_device_skips_the_tpu_bootstrap() -> None:
+    env = cli._worker_env(1)
+    assert "WORLD_SIZE" not in env
+    assert "TORCH_TPU_TOPOLOGY" not in env
+    assert env["MASTER_ADDR"] and env["MASTER_PORT"]
 
 
 class _FakeWorker:
