@@ -217,6 +217,7 @@ if TYPE_CHECKING:
     VLLM_TPU_SRPT_ATTN_WORK_CAP: int = 0
     VLLM_TPU_SRPT_ATTN_TILE_TOKENS: int = 32
     VLLM_TPU_MEGAKERNEL: str = ""
+    TPU_DP_PACKED_ROUTER_GATHER: bool = False
 
 
 def env_with_choices(
@@ -1332,6 +1333,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Enable and configure the fused Pallas megakernel ("1"/"true" for defaults,
     # "ep"/"tp" for mode, or "mode=tp,buckets=8:16:32,verify_buckets=4:8:16,ab=1").
     "VLLM_TPU_MEGAKERNEL": env_str("VLLM_TPU_MEGAKERNEL", ""),
+    # A replicated sequence-parallel MoE step under DP>1 gathers the hidden rows
+    # and the router logits in one DP all-gather (packed along the last dim)
+    # instead of two. Lossless: the split returns the same values.
+    "TPU_DP_PACKED_ROUTER_GATHER": env_bool(
+        "TPU_DP_PACKED_ROUTER_GATHER", default=False
+    ),
 }
 
 
