@@ -30,6 +30,7 @@ a single-stage engine: the retention stops are applied to a chunk after the
 time budget has clipped it.
 """
 
+from itertools import islice
 import math
 import time
 from typing import Any, cast
@@ -89,11 +90,15 @@ class TpuPipelineChunkScheduler(Scheduler):
     _now = PrefixAwareScheduler._now
     _init_paw_sort = PrefixAwareScheduler._init_paw_sort
     _sort_waiting_queue = PrefixAwareScheduler._sort_waiting_queue
-    _select_waiting_queue_for_scheduling = (
-        PrefixAwareScheduler._select_waiting_queue_for_scheduling
-    )
     _promote_warmest = PrefixAwareScheduler._promote_warmest
     _maybe_pack_prompt_ids = PrefixAwareScheduler._maybe_pack_prompt_ids
+
+    def _select_waiting_queue_for_scheduling(self):
+        if getattr(self, "_in_super_schedule", False):
+            return getattr(self, "kv_holding_waiting", None) or getattr(
+                self, "waiting", None
+            )
+        return PrefixAwareScheduler._select_waiting_queue_for_scheduling(self)
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
@@ -486,9 +491,18 @@ class TpuPipelineChunkScheduler(Scheduler):
             if computed >= _prefill_end(request) and request.num_tokens > computed:
                 self._account(1, computed)
                 self._seeded.add(request.request_id)
+        if self._cost is not None and not throttle_prefills:
+            try:
+                self._pack_complementary_step()
+            except Exception:
+                logger.exception(
+                    "Pipeline chunk scheduler: complementary step packing failed."
+                )
+        self._in_super_schedule = True
         try:
             output = super().schedule(throttle_prefills)
         finally:
+            self._in_super_schedule = False
             self._step_wall_time = None
         if getattr(output, "scheduled_new_reqs", None):
             self._maybe_pack_prompt_ids(output)
@@ -534,6 +548,295 @@ class TpuPipelineChunkScheduler(Scheduler):
         local_warmth = self._prefix_warmth(request)
         ext_warmth = self._external_warmth(request, local_warmth)
         return max(0, min(local_warmth + ext_warmth, _prefill_end(request)))
+
+    def _pack_complementary_step(self) -> None:
+        """Orders running and waiting prefill requests so that when an
+        attention-heavy warm chunk clips below the step's token bucket, a
+        complementary low-prefix or cold request fills the remaining token
+        room within ``target_ms``."""
+        cost = self._cost
+        if cost is None:
+            return
+        limit = (
+            self._step_limit if self._step_limit is not None else cost.buckets[-1]
+        )
+        live = self._inflight_ms[: max(self._pp_size - 1, 0)]
+        target_ms = max(cost.target_ms, *live) if live else cost.target_ms
+        sim_tokens = self._step_tokens
+        sim_pairs = self._step_pairs
+        sim_squares = self._step_squares
+        sim_schedule = self._step_schedule
+        sim_prefill = 0
+        attn_clipped = False
+
+        def _advance(c: int, prefix: int, rem: int, max_room: int) -> None:
+            nonlocal sim_tokens, sim_pairs, sim_squares, sim_schedule
+            nonlocal sim_prefill, attn_clipped
+            sim_tokens += c
+            sim_pairs += float(c) * prefix
+            sim_squares += float(c) * c
+            sim_schedule += cost.pairs(c, prefix)
+            sim_prefill += c
+            if 0 < c < min(rem, max_room):
+                attn_clipped = True
+
+        def _lead_chunk(prefix: int, rem: int) -> tuple[int, int]:
+            req_tokens = min(rem, limit - sim_tokens)
+            max_room = cost.chunk(
+                0,
+                req_tokens,
+                sim_tokens,
+                sim_pairs,
+                sim_squares,
+                self._step_limit,
+                sim_schedule,
+                target_ms=target_ms,
+            )
+            c = (
+                max_room
+                if prefix == 0
+                else cost.chunk(
+                    prefix,
+                    req_tokens,
+                    sim_tokens,
+                    sim_pairs,
+                    sim_squares,
+                    self._step_limit,
+                    sim_schedule,
+                    target_ms=target_ms,
+                )
+            )
+            if c == 0:
+                c = min(req_tokens, cost.granularity)
+                max_room = max(max_room, c)
+            return c, max_room
+
+        non_prefill = [
+            r for r in self.running if r.num_computed_tokens >= _prefill_end(r)
+        ]
+        prefilling = [
+            r for r in self.running if r.num_computed_tokens < _prefill_end(r)
+        ]
+        if len(prefilling) == 1 and sim_tokens < limit:
+            r = prefilling[0]
+            prefix = r.num_computed_tokens
+            rem = _prefill_end(r) - prefix
+            c, max_room = _lead_chunk(prefix, rem)
+            _advance(c, prefix, rem, max_room)
+        elif len(prefilling) > 1 and sim_tokens < limit:
+            remaining = list(prefilling)
+            packed = []
+            while remaining and sim_tokens < limit:
+                if sim_prefill == 0:
+                    r = remaining.pop(0)
+                    prefix = r.num_computed_tokens
+                    rem = _prefill_end(r) - prefix
+                    c, max_room = _lead_chunk(prefix, rem)
+                    packed.append(r)
+                    _advance(c, prefix, rem, max_room)
+                    continue
+                max_step_room = cost.chunk(
+                    0,
+                    limit - sim_tokens,
+                    sim_tokens,
+                    sim_pairs,
+                    sim_squares,
+                    self._step_limit,
+                    sim_schedule,
+                    target_ms=target_ms,
+                )
+                if max_step_room <= 0:
+                    break
+                best_pos = -1
+                best_c = 0
+                best_rank: tuple[int, int, int] | None = None
+                for pos, r in enumerate(remaining):
+                    prefix = r.num_computed_tokens
+                    rem = _prefill_end(r) - prefix
+                    req_tokens = min(rem, limit - sim_tokens)
+                    c = (
+                        max_step_room
+                        if prefix == 0 and rem >= limit - sim_tokens
+                        else cost.chunk(
+                            prefix,
+                            req_tokens,
+                            sim_tokens,
+                            sim_pairs,
+                            sim_squares,
+                            self._step_limit,
+                            sim_schedule,
+                            target_ms=target_ms,
+                        )
+                    )
+                    if c <= 0:
+                        continue
+                    if not attn_clipped:
+                        best_pos, best_c = pos, c
+                        break
+                    rank = (
+                        (1, 0, -pos)
+                        if c >= min(rem, max_step_room)
+                        else (0, c // cost.granularity, -pos)
+                    )
+                    if best_rank is None or rank > best_rank:
+                        best_pos, best_c, best_rank = pos, c, rank
+                if best_pos < 0:
+                    break
+                r = remaining.pop(best_pos)
+                prefix = r.num_computed_tokens
+                rem = _prefill_end(r) - prefix
+                packed.append(r)
+                _advance(best_c, prefix, rem, max_step_room)
+            if packed:
+                new_running = non_prefill + packed + remaining
+                if new_running != self.running:
+                    self.running[:] = new_running
+
+        kv_holding = getattr(self, "kv_holding_waiting", None)
+        if kv_holding and sim_tokens < limit:
+            for r in kv_holding:
+                if sim_tokens >= limit:
+                    break
+                prefix = self._waiting_warmth(r)
+                rem = max(_prefill_end(r) - prefix, 0)
+                if rem <= 0:
+                    continue
+                if sim_prefill == 0:
+                    c, max_room = _lead_chunk(prefix, rem)
+                else:
+                    max_room = cost.chunk(
+                        0,
+                        limit - sim_tokens,
+                        sim_tokens,
+                        sim_pairs,
+                        sim_squares,
+                        self._step_limit,
+                        sim_schedule,
+                        target_ms=target_ms,
+                    )
+                    if max_room <= 0:
+                        break
+                    c = cost.chunk(
+                        prefix,
+                        min(rem, limit - sim_tokens),
+                        sim_tokens,
+                        sim_pairs,
+                        sim_squares,
+                        self._step_limit,
+                        sim_schedule,
+                        target_ms=target_ms,
+                    )
+                if c > 0:
+                    _advance(c, prefix, rem, max_room)
+
+        queue = getattr(self, "waiting", None)
+        if not queue or len(queue) < 2 or sim_tokens >= limit:
+            return
+        win_cap = (
+            getattr(self, "_paw_sort_window", self.WINDOW)
+            if getattr(self, "_paw_sort", False)
+            else self.WINDOW
+        )
+        window = list(islice(queue, max(win_cap, 2)))
+        free_blocks = (
+            None
+            if getattr(self, "_is_kv_consumer", False)
+            else self._get_num_free_blocks()
+        )
+        block_size = self._get_block_size()
+        reserve_full = bool(getattr(self, "scheduler_reserve_full_isl", False))
+        infos: list[tuple[int, int]] = []
+        for r in window:
+            prefix = self._waiting_warmth(r)
+            rem = max(_prefill_end(r) - prefix, 0)
+            if rem == 0:
+                rem = max(int(getattr(r, "num_tokens", 0) or 0) - prefix, 0)
+            infos.append((prefix, rem))
+
+        remaining_idx = list(range(len(window)))
+        packed_idx: list[int] = []
+        while remaining_idx and sim_tokens < limit:
+            if sim_prefill == 0:
+                idx = remaining_idx.pop(0)
+                prefix, rem = infos[idx]
+                packed_idx.append(idx)
+                if rem <= 0:
+                    continue
+                c, max_room = _lead_chunk(prefix, rem)
+                _advance(c, prefix, rem, max_room)
+                if free_blocks is not None:
+                    free_blocks = max(0, free_blocks - math.ceil(c / block_size))
+                continue
+            max_step_room = cost.chunk(
+                0,
+                limit - sim_tokens,
+                sim_tokens,
+                sim_pairs,
+                sim_squares,
+                self._step_limit,
+                sim_schedule,
+                target_ms=target_ms,
+            )
+            if max_step_room <= 0:
+                break
+            best_pos = -1
+            best_c = 0
+            best_rank = None
+            for pos, idx in enumerate(remaining_idx):
+                prefix, rem = infos[idx]
+                if rem <= 0:
+                    continue
+                req_tokens = min(rem, limit - sim_tokens)
+                c = (
+                    max_step_room
+                    if prefix == 0 and rem >= limit - sim_tokens
+                    else cost.chunk(
+                        prefix,
+                        req_tokens,
+                        sim_tokens,
+                        sim_pairs,
+                        sim_squares,
+                        self._step_limit,
+                        sim_schedule,
+                        target_ms=target_ms,
+                    )
+                )
+                if c <= 0:
+                    continue
+                if free_blocks is not None:
+                    needed = math.ceil((rem if reserve_full else c) / block_size)
+                    if needed > free_blocks:
+                        continue
+                if not attn_clipped:
+                    best_pos, best_c = pos, c
+                    break
+                rank = (
+                    (1, 0, -pos)
+                    if c >= min(rem, max_step_room)
+                    else (0, c // cost.granularity, -pos)
+                )
+                if best_rank is None or rank > best_rank:
+                    best_pos, best_c, best_rank = pos, c, rank
+            if best_pos < 0:
+                break
+            idx = remaining_idx.pop(best_pos)
+            prefix, rem = infos[idx]
+            packed_idx.append(idx)
+            _advance(best_c, prefix, rem, max_step_room)
+            if free_blocks is not None:
+                free_blocks = max(
+                    0, free_blocks - math.ceil(best_c / block_size)
+                )
+        order = packed_idx + remaining_idx
+        if order != list(range(len(window))):
+            if hasattr(queue, "pop_request") and hasattr(
+                queue, "prepend_requests"
+            ):
+                for _ in window:
+                    queue.pop_request()
+                queue.prepend_requests([window[i] for i in reversed(order)])
+            else:
+                queue[: len(window)] = [window[i] for i in order]
 
     def _pending_step_limit(self) -> int | None:
         """The bucket a step is held to: the prefill work still to schedule

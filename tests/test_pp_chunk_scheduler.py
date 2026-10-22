@@ -699,3 +699,41 @@ def test_running_srpf_orders_by_quadratic_effective_cost():
     with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
         scheduler.schedule()
     assert [r.request_id for r in scheduler.running] == ["shallow", "deep"]
+
+
+def test_complementary_step_packing_pairs_warm_and_cold_chunks():
+    model = _model()
+    prefix = 112 * 1024
+    # Two warm requests behind 112K prefix (each clips to 4096) and one cold
+    # request (0 prefix, 65536 tokens). After warm_1 takes 4096 tokens, warm_2
+    # cannot fit in the same step without blowing target_ms, so cold_1 is
+    # promoted into the 2nd slot to fill 8192 complementary tokens while
+    # warm_2 stays next for the following step.
+    w1 = _request(prefix, prefix + 16384, "warm1")
+    w2 = _request(prefix, prefix + 16384, "warm2")
+    cold = _request(0, 65536, "cold")
+    scheduler = _scheduler(cost=model, waiting=[w1, w2, cold])
+    scheduler.WINDOW = 16
+    with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+        scheduler.schedule()
+    assert [r.request_id for r in scheduler.waiting] == ["warm1", "cold", "warm2"]
+    assert scheduler._mamba_block_aligned_split(scheduler.waiting[0], 16384) == 4096
+    assert scheduler._mamba_block_aligned_split(scheduler.waiting[1], 12288) == 8192
+    assert scheduler._mamba_block_aligned_split(scheduler.waiting[2], 4096) == 0
+    assert scheduler._step_tokens == 12288
+
+
+def test_complementary_step_packing_across_running_and_waiting():
+    model = _model()
+    prefix = 112 * 1024
+    # Running warm_1 clips at 4096; waiting has [warm_2, cold]. Because warm_1
+    # already clipped on attention in running, cold is promoted to the head of
+    # waiting so super().schedule()'s waiting loop does not break on warm_2.
+    w1 = _request(prefix, prefix + 16384, "warm1")
+    w2 = _request(prefix, prefix + 16384, "warm2")
+    cold = _request(0, 65536, "cold")
+    scheduler = _scheduler(cost=model, running=[w1], waiting=[w2, cold])
+    scheduler.WINDOW = 16
+    with patch.object(Scheduler, "schedule", return_value=_EMPTY_STEP):
+        scheduler.schedule()
+    assert [r.request_id for r in scheduler.waiting] == ["cold", "warm2"]

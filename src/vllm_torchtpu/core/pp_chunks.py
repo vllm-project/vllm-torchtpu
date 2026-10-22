@@ -264,7 +264,7 @@ class StepCostModel:
                 fit = min(
                     fit, int(-prefix + math.sqrt(prefix * prefix + 2 * spare / attn))
                 )
-            if fit < remaining:
+            if fit < remaining and step_squares <= step_tokens:
                 fit = min(max(fit, floor), room)
             if fit < remaining:
                 total = step_tokens + fit

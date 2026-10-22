@@ -276,3 +276,26 @@ def test_chunk_accepts_wave_ceiling_target_ms():
     # When an in-flight step in the lockstep wave already lasts 260 ms,
     # the full 16K chunk fits within the wave ceiling.
     assert model.chunk(16384, 16384, 0, 0.0, 0.0, target_ms=260.0) == 16384
+
+
+def test_complementary_cold_chunk_packs_beside_attention_clipped_warm_chunk():
+    model = _model()
+    prefix = 112 * 1024
+    # A warm request behind 112K prefix clips to 4096 tokens.
+    warm_chunk = model.chunk(prefix, 16384, 0, 0.0, 0.0)
+    assert warm_chunk == 4096
+    pairs = float(warm_chunk) * prefix
+    squares = float(warm_chunk) ** 2
+    # A second deep-prefix warm request would exceed target_ms and is not
+    # forced up to the quarter-step floor when the step already holds a chunk.
+    assert model.chunk(prefix, 16384, warm_chunk, pairs, squares) == 0
+    # A complementary cold request (prefix=0) packs 8192 tokens into the
+    # remaining linear room of the 12288 bucket within target_ms.
+    cold_chunk = model.chunk(0, 16384, warm_chunk, pairs, squares)
+    assert cold_chunk == 8192
+    assert (
+        model.step_ms(
+            warm_chunk + cold_chunk, pairs, squares + float(cold_chunk) ** 2
+        )
+        <= model.target_ms
+    )
