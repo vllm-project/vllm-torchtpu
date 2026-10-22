@@ -156,7 +156,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         "--num-blocks",
         type=int,
         default=None,
-        help="Override number of paged KV cache blocks per layer.",
+        help=(
+            "Override number of paged KV cache blocks per layer. Defaults to the "
+            "blocks that fit in --kv-cache-memory-bytes, or else in HBM at "
+            "--gpu-memory-utilization."
+        ),
     )
     # Internal: marks a worker process started by `main`.
     parser.add_argument("--export-worker", action="store_true", help=argparse.SUPPRESS)
@@ -190,8 +194,11 @@ def run_export_from_args(
     """Executes the AOT model export given parsed CLI arguments."""
     if vllm_config is None and model is None:
         vllm_config = create_vllm_config_from_args(args)
+    if vllm_config is not None:
+        universal_adapter.check_supported_parallelism(vllm_config.parallel_config)
     # Load before building the export config: loading finalizes the KV block size.
-    if model is None:
+    loaded_on_device = model is None
+    if loaded_on_device:
         model = universal_adapter.load_dummy_vllm_model(vllm_config)
 
     token_buckets = _parse_int_list(getattr(args, "token_buckets", None))
@@ -222,6 +229,16 @@ def run_export_from_args(
             export_config=export_cfg,
             vllm_config=vllm_config,
         )
+        cache_cfg = vllm_config.cache_config
+        kv_cache_memory_bytes = getattr(cache_cfg, "kv_cache_memory_bytes", None)
+        if (
+            (loaded_on_device or kv_cache_memory_bytes)
+            and num_blocks_override is None
+            and cache_cfg.num_gpu_blocks_override is None
+        ):
+            exportable.fit_num_blocks_to_hbm(
+                cache_cfg.gpu_memory_utilization, kv_cache_memory_bytes
+            )
 
     exporter.export(exportable, args.output_dir)
     return exportable.export_config
@@ -290,6 +307,8 @@ def main(argv: Sequence[str] | None = None) -> int:
     """
     argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(argv)
+    # Reject before starting workers, each of which would load the model first.
+    universal_adapter.check_supported_parallelism(args)
     if args.export_worker:
         run_export_from_args(args)
         return 0

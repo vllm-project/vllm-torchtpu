@@ -507,6 +507,69 @@ def test_build_export_config_raises_block_size_to_fit_smem(tmp_path: Path) -> No
     assert big.max_num_pages * 4 <= 1024 * 1024 // 2
 
 
+def _adapter_without_model(cfg: api.TextOnlyLLMExportConfig) -> Any:
+    adapter = object.__new__(universal_adapter.UniversalVllmExportableLLM)
+    adapter._export_config = cfg
+    adapter._vllm_config = None
+    adapter._model = nn.Module()
+    return adapter
+
+
+def test_fit_num_blocks_to_hbm_fills_the_budget_with_exported_kv_blocks() -> None:
+    from vllm_torchtpu import utils
+
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny",
+        num_layers=2,
+        num_kv_heads=4,
+        head_dim=128,
+        block_size=128,
+        num_blocks=512,
+    )
+    adapter = _adapter_without_model(cfg)
+    # Two layers of [block, block_size, kv_heads * 2, head_dim] bf16 states.
+    block_bytes = 2 * 128 * 4 * 2 * 128 * 2
+    budget = utils.HbmBudget(
+        total_limit=100 * block_bytes,
+        total_used=20 * block_bytes,
+        cap=90 * block_bytes,
+        available=70 * block_bytes + 7,
+    )
+    with mock.patch.object(utils, "compute_hbm_budget", return_value=budget) as hbm:
+        assert adapter.fit_num_blocks_to_hbm(0.9, devices=["tpu:0"]) == 70
+    assert hbm.call_args.args == (["tpu:0"], 0.9)
+    assert adapter.export_config.num_blocks == 70
+    assert adapter.abstract_states()[0].shape[0] == 70
+
+
+def test_fit_num_blocks_to_hbm_uses_kv_cache_memory_bytes_without_the_device() -> None:
+    from vllm_torchtpu import utils
+
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny", num_layers=2, num_kv_heads=4, head_dim=128, block_size=128
+    )
+    adapter = _adapter_without_model(cfg)
+    block_bytes = 2 * 128 * 4 * 2 * 128 * 2
+    with mock.patch.object(utils, "compute_hbm_budget") as hbm:
+        assert adapter.fit_num_blocks_to_hbm(0.9, 33 * block_bytes + 1) == 33
+    hbm.assert_not_called()
+    assert adapter.export_config.num_blocks == 33
+
+
+def test_fit_num_blocks_to_hbm_rejects_a_budget_without_room_for_a_block() -> None:
+    from vllm_torchtpu import utils
+
+    adapter = _adapter_without_model(
+        api.TextOnlyLLMExportConfig(model_name="tiny", num_layers=1)
+    )
+    budget = utils.HbmBudget(total_limit=100, total_used=95, cap=90, available=-5)
+    with (
+        mock.patch.object(utils, "compute_hbm_budget", return_value=budget),
+        pytest.raises(ValueError, match="gpu-memory-utilization"),
+    ):
+        adapter.fit_num_blocks_to_hbm(0.9, devices=["tpu:0"])
+
+
 def test_module_derived_gate_up_sources_beat_name_heuristic() -> None:
     # Qwen3-0.6B: gate_up_proj is stored `[in=1024, 2*inter=6144]`, so the
     # shape-only rule would mistake it for `[2*half, in]` and skip the transpose.
@@ -812,6 +875,18 @@ class _FakeWorker:
 
     def poll(self) -> int:
         return self._code
+
+
+def test_main_rejects_data_parallelism_before_starting_workers(
+    tmp_path: Path,
+) -> None:
+    argv = ["--model", "m", "--output-dir", str(tmp_path), "--data-parallel-size", "8"]
+    with (
+        mock.patch.object(cli, "_launch_workers") as launch,
+        pytest.raises(NotImplementedError, match="dp=8 pp=1"),
+    ):
+        cli.main(argv)
+    launch.assert_not_called()
 
 
 def test_launch_workers_keeps_rank0_output(tmp_path: Path) -> None:
