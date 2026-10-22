@@ -348,16 +348,17 @@ def _patch_sdpa_fallback_dispatch() -> None:
     # TODO: Remove once vLLM-Omni's AttentionImpl.forward dispatches
     # out-of-tree platforms instead of raising NotImplementedError.
     #
-    # Attention builds `sdpa_fallback` from vLLM-Omni's SDPAImpl, whatever
-    # the selected backend. AttentionImpl.forward picks forward_cuda/_npu/...
-    # from the platform and raises NotImplementedError on TPU, so every
-    # sdpa_fallback call fails there. LTX-2's _LTX2ParallelAttention sends
-    # masked calls to it: with sequence parallelism the audio latents are
-    # padded to a multiple of the SP size, so audio self-attention and
-    # audio-to-video cross-attention carry a key-padding mask. SANA-Video,
-    # LingBot-Video and SenseNova-U1 also call sdpa_fallback.
-    # TpuSDPAImpl.forward runs SDPAImpl._forward_impl with broadcast key
-    # masks, as forward_cuda does.
+    # Problem: Attention builds `sdpa_fallback` from vLLM-Omni's SDPAImpl,
+    #   whatever the selected backend. AttentionImpl.forward picks
+    #   forward_cuda/_npu/... from the platform and raises NotImplementedError
+    #   on TPU, so every sdpa_fallback call fails there.
+    # Fix: SDPAImpl.forward is replaced by TpuSDPAImpl.forward, which runs
+    #   SDPAImpl._forward_impl with broadcast key masks, as forward_cuda does.
+    # Effect: LTX-2's _LTX2ParallelAttention sends masked calls to
+    #   sdpa_fallback: with sequence parallelism the audio latents are padded
+    #   to a multiple of the SP size, so audio self-attention and
+    #   audio-to-video cross-attention carry a key-padding mask. SANA-Video,
+    #   LingBot-Video and SenseNova-U1 also call sdpa_fallback.
     # -------------------------------------------------------------------------
     from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
 
