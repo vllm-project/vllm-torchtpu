@@ -137,6 +137,29 @@ def generate_max_steps(
     return max_steps_ub
 
 
+def _check_smem_budget(
+    max_steps: int,
+    num_seqs: int,
+    pages_per_seq: int,
+    page_size: int,
+    cp_size: int,
+) -> None:
+    """Fail with the knob to turn, not an opaque XLA smem OOM at compile time."""
+    try:
+        smem_max_steps = generate_max_steps(num_seqs, pages_per_seq)
+    except ValueError:
+        # No TPU in context, so there is no smem budget to enforce.
+        return
+    if max_steps <= smem_max_steps:
+        return
+    raise ValueError(
+        f"StreamIndex top-k needs max_steps={max_steps} but smem holds "
+        f"{smem_max_steps} at pages_per_seq={pages_per_seq} "
+        f"(page_size={page_size}, cp_size={cp_size}, num_seqs={num_seqs}). "
+        f"Raise --block-size to cut pages_per_seq."
+    )
+
+
 def compute_batched_seq_metadata(
     seq_lens: jax.Array,
     cu_q_lens: jax.Array,
@@ -179,7 +202,8 @@ def compute_batched_seq_metadata(
         max_q_len_ub = next_power_of_2(max_num_tokens)
         total_max_bq = max(1, pl.cdiv(max_q_len_ub, bq_sz)) + max_seq_tiles
 
-    max_kv_pages_per_block = max(1, bkv_sz // page_size) if bkv_sz >= page_size else 1
+    # bkv_sz is always bkv_p * page_size, so this division is exact.
+    max_kv_pages_per_block = max(1, bkv_sz // page_size)
     max_bkv = max(1, pl.cdiv(pages_per_seq, max_kv_pages_per_block))
 
     if chunked:
@@ -188,17 +212,41 @@ def compute_batched_seq_metadata(
         # once for the head of the next. That is one extra block per tile the
         # chunk touches, and it touches at most max_seq_tiles tiles, or at most
         # chunk_tokens of them since a touched tile owns at least one token.
+        bq_span = seq_batch_size * bq_sz
         per_chunk_bq = min(
             total_max_bq,
-            pl.cdiv(chunk_tokens, seq_batch_size * bq_sz)
-            + min(max_seq_tiles, chunk_tokens),
+            pl.cdiv(chunk_tokens, bq_span) + min(max_seq_tiles, chunk_tokens),
         )
-        req_max_steps = num_chunks * per_chunk_bq * max_bkv
+        # Chunks and sequence tiles are two interval partitions of one token
+        # axis, so they overlap in num_chunks + max_seq_tiles - 1 pairs. That is
+        # the total seam count; charging one seam per tile per chunk, as
+        # num_chunks * per_chunk_bq does, overcounts it by up to num_chunks.
+        # Each of the num_chunks - 1 seams splits at most one unchunked bq block,
+        # so total_max_bq + num_chunks - 1 also holds; it is the tight one for
+        # static_q_len passes, whose block count does not grow with tokens. It
+        # trusts static_q_len, which streamindex_topk enforces for MTP batches.
+        # Overlapping chunks share tokens and break the partition, so they keep
+        # the per-chunk bound alone.
+        total_bq_ub = num_chunks * per_chunk_bq
+        starts = [s for s in chunk_starts if s is not None]
+        if len(starts) == num_chunks and all(
+            b - a >= chunk_tokens for a, b in zip(starts, starts[1:])
+        ):
+            total_bq_ub = min(
+                total_bq_ub,
+                total_max_bq + num_chunks - 1,
+                max(1, pl.cdiv(next_power_of_2(max_num_tokens), bq_span))
+                + num_chunks
+                + max_seq_tiles
+                - 1,
+            )
+        req_max_steps = total_bq_ub * max_bkv
     else:
         req_max_steps = total_max_bq * max_bkv
     req_max_steps = pl.cdiv(req_max_steps, 1024) * 1024
 
     max_steps = max(1024, req_max_steps)
+    _check_smem_budget(max_steps, max_num_seqs, pages_per_seq, page_size, cp_size)
 
     is_empty_pass = jnp.greater_equal(start_seq_idx, end_seq_idx)
 

@@ -1293,6 +1293,7 @@ def _effective_row_lengths(
         "decode_pack",
         "decode_page_major",
         "shared_meta",
+        "mixed_short_block",
     ),
 )
 def streamindex_topk(
@@ -1327,6 +1328,7 @@ def streamindex_topk(
     decode_pack: bool = False,
     decode_page_major: bool | None = None,
     shared_meta: bool = False,
+    mixed_short_block: tuple[int, int] | None = None,
 ) -> jax.Array | tuple[jax.Array, ...]:
     """StreamIndex Top-K retrieval.
 
@@ -1422,6 +1424,18 @@ def streamindex_topk(
         built inside the branch that runs them, so a step with no q_len-1
         sequence (every step under MTP) builds none. Same operands bit for
         bit, so the same result.
+      mixed_short_block: `(bq, bkv_p)` for a second MIXED pass over the
+        leading MIXED sequences whose q_len is at most `bq` -- the decode
+        requests under MTP (q_len gamma + 1), which the scheduler places first.
+        Without it they share the MIXED pass's query block, which in a large
+        bucket is 128 rows: a q_len-4 request then scores 124 padding rows.
+        The split point is computed at runtime from `cu_q_lens`; the short
+        pass runs first (with `decode_pack`, the packed body when `bq` is 4),
+        the regular MIXED pass covers the rest, both into the same aliased
+        scores buffer. Chunked calls drop it statically from chunks that
+        start at or past `max_num_seqs * bq` tokens. Indices match the single
+        pass except on near ties: bq <= 16 reduces heads in f32, the blocked
+        bq >= 32 body over bf16-rounded relu(q.k). None (default) = one pass.
 
     Returns:
       Top-K indices (rank-local when `cp_size > 1`, global compressed positions
@@ -1490,6 +1504,30 @@ def streamindex_topk(
 
     max_num_seqs = seq_lens.shape[0]
 
+    # distribution[0] is sized for attention's decode stage, which takes
+    # (gamma+1)-token verify requests once reorder_batch_threshold > 1. These
+    # decode passes are static_q_len=1, so keep only the leading one-token
+    # requests here; the mixed pass takes the rest.
+    q_lens = cu_q_lens[1:] - cu_q_lens[:-1]
+    one_token = (q_lens == 1) & (jnp.arange(max_num_seqs) < distribution[1])
+    num_one_token = jnp.sum(jnp.cumprod(one_token.astype(jnp.int32)))
+    distribution = jnp.stack(
+        [jnp.minimum(distribution[0], num_one_token), num_one_token, distribution[2]]
+    ).astype(jnp.int32)
+    if mixed_short_block is not None:
+        # End of the leading MIXED sequences with q_len <= bq: one query block
+        # each in the short pass. Sequences before distribution[1] (the q_len-1
+        # DECODE ones) count as short so the prefix starts there.
+        seq_ids = jnp.arange(max_num_seqs)
+        short = ((q_lens <= mixed_short_block[0]) | (seq_ids < distribution[1])) & (
+            seq_ids < distribution[2]
+        )
+        mixed_split = jnp.clip(
+            jnp.sum(jnp.cumprod(short.astype(jnp.int32))),
+            distribution[1],
+            distribution[2],
+        ).astype(jnp.int32)
+
     original_dtype = q.dtype
     actual_head_dim = q.shape[-1]
 
@@ -1517,7 +1555,14 @@ def streamindex_topk(
         page_size = page_size_per_kv_packing * kv_packing
     pages_per_seq = page_indices.shape[0] // max_num_seqs
 
-    for bkv_p in num_kv_pages_per_blocks:
+    # Every pass writes whole KV blocks into one shared scores row, so the row
+    # must hold the last block of every pass, the short MIXED pass included:
+    # a narrower row lets that block's tail spill into the next token's row.
+    all_kv_pages_per_block = (
+        *num_kv_pages_per_blocks,
+        *(() if mixed_short_block is None else (mixed_short_block[1],)),
+    )
+    for bkv_p in all_kv_pages_per_block:
         bkv_sz = page_size * bkv_p
         if bkv_sz % 128 != 0:
             raise ValueError(
@@ -1526,7 +1571,7 @@ def streamindex_topk(
 
     num_sublanes_total = max(
         align_to(pages_per_seq, bkv_p) * page_size // 128
-        for bkv_p in num_kv_pages_per_blocks
+        for bkv_p in all_kv_pages_per_block
     )
 
     def _block_sizes(num_queries_per_block, bkv_p, static_q_len):
@@ -1697,6 +1742,25 @@ def streamindex_topk(
 
     def _pass_specs(decode_batch_end):
         """`run_scores_kernel` kwargs for the passes over the batch."""
+        short_mixed = ()
+        mixed_start = distribution[1]
+        if mixed_short_block is not None:
+            # Every sequence here has q_len <= bq: static_q_len = bq is a true
+            # one-block-per-sequence bound, which keeps the schedule (and its
+            # SMEM) at decode size instead of cdiv(max_num_tokens, bq).
+            short_mixed = (
+                dict(
+                    num_kv_pages_per_block=mixed_short_block[1],
+                    num_queries_per_block=mixed_short_block[0],
+                    buffer_count=buffer_counts[2],
+                    start_seq_idx=distribution[1],
+                    end_seq_idx=mixed_split,
+                    static_q_len=mixed_short_block[0],
+                    seq_batch_size=1,
+                    case=MlaCase.MIXED,
+                ),
+            )
+            mixed_start = mixed_split
         decode_cfg = dict(
             num_kv_pages_per_block=num_kv_pages_per_blocks[0],
             num_queries_per_block=num_queries_per_blocks[0],
@@ -1725,11 +1789,12 @@ def streamindex_topk(
                 seq_batch_size=1,
                 **decode_cfg,
             ),
+            *short_mixed,
             dict(
                 num_kv_pages_per_block=num_kv_pages_per_blocks[2],
                 num_queries_per_block=num_queries_per_blocks[2],
                 buffer_count=buffer_counts[2],
-                start_seq_idx=distribution[1],
+                start_seq_idx=mixed_start,
                 end_seq_idx=distribution[2],
                 static_q_len=None,
                 seq_batch_size=1,
@@ -1892,6 +1957,21 @@ def streamindex_topk(
                 out_dtype=out_dtype,
                 scheduling_group_id=tc_group,
             )
+            if (
+                mixed_short_block is not None
+                and num_chunks > 1
+                and m * chunk_len >= max_num_seqs * mixed_short_block[0]
+            ):
+                # The short MIXED rows are at most max_num_seqs * bq tokens
+                # from the start (q_len <= bq each, after q_len-1 decodes).
+                chunk_passes = tuple(
+                    p
+                    for p in chunk_passes
+                    if not (
+                        p[0]["case"] == MlaCase.MIXED
+                        and p[0]["static_q_len"] is not None
+                    )
+                )
             mixed_only = tuple(p for p in chunk_passes if p[0]["case"] == MlaCase.MIXED)
             if (
                 skip_empty_decode_chunked
@@ -2033,6 +2113,7 @@ SMALL_AG_MAX_TOKENS = 8
         "small_all_gather",
         "decode_pack",
         "shared_meta",
+        "mixed_short_block",
     ),
 )
 def streamindex_topk_dcp(
@@ -2071,6 +2152,7 @@ def streamindex_topk_dcp(
     small_all_gather: bool | None = None,
     decode_pack: bool = False,
     shared_meta: bool = False,
+    mixed_short_block: tuple[int, int] | None = None,
 ) -> jax.Array | tuple[jax.Array, Any]:
     """Exact global top-k over a DCP-sharded KV cache, delivered rank-local.
 
@@ -2143,6 +2225,7 @@ def streamindex_topk_dcp(
       skip_empty_decode_chunked: forwarded to `streamindex_topk`; see there.
       decode_pack: forwarded to `streamindex_topk`; see there. Same result.
       shared_meta: forwarded to `streamindex_topk`; see there. Same result.
+      mixed_short_block: forwarded to `streamindex_topk`; see there.
       global_scheduling_group_id: XLA scheduling group of the cross-rank
         SparseCore merge (stage 2), which the layer's independent TensorCore
         work joins from outside this op (`TPU_IDX_TOPK_SCHED_GROUPS`). None =
@@ -2323,6 +2406,7 @@ def streamindex_topk_dcp(
             final_sc_tie=tuple(ov_args[:1]) if pin else (),
             decode_pack=decode_pack,
             shared_meta=shared_meta,
+            mixed_short_block=mixed_short_block,
         )
         if pin:
             idxs, scores, tied = local

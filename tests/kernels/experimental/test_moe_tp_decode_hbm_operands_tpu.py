@@ -39,8 +39,14 @@ def _staged(hlo: str) -> int:
     )
 
 
-@pytest.mark.parametrize("rows, n_valid", [(16, 4), (16, 16), (32, 12)])
-def test_hbm_operands_bitwise(rows, n_valid):
+# fs: the shared expert's columns per rank (None: 2048 / n). At 128 rows the
+# 8-rank slice (fs 256) does not fit the VMEM plan, so that case takes GLM-5.2's
+# served TP16 slice (fs 128).
+@pytest.mark.parametrize(
+    "rows, n_valid, fs",
+    [(16, 4, None), (16, 16, None), (32, 12, None), (64, 57, None), (128, 117, 128)],
+)
+def test_hbm_operands_bitwise(rows, n_valid, fs):
     import test_moe_tp_decode_kernel as base
     from jax.sharding import Mesh, NamedSharding
     from jax.sharding import PartitionSpec as P
@@ -51,7 +57,7 @@ def test_hbm_operands_bitwise(rows, n_valid):
         pytest.skip("needs a TPU host (8 or 16 cores)")
     devices = jax.devices()
     n = len(devices)
-    c = dict(h=6144, e=256, i=2048 // n, fs=2048 // n, topk=8)
+    c = dict(h=6144, e=256, i=2048 // n, fs=fs or 2048 // n, topk=8)
     mesh = Mesh(np.asarray(devices), ("d",))
     keys = jax.random.split(jax.random.key(1), n + 3)
     ranks = [base._rank_weights(keys[r], c) for r in range(n)]

@@ -85,6 +85,7 @@ from vllm_torchtpu.layers.adapter.cp_mla_attention import (
     all_gather_heads,
     all_gather_q_nope_pe_heads,
     merge_lse_partials_scatter_heads,
+    project_uv_heads,
 )
 from vllm_torchtpu.layers.core.attention_interface import (
     attention,
@@ -1910,10 +1911,26 @@ class PallasMLAttentionBackend(AttentionBackend):
         """The (nope, rope) specs for one sparse-MLA layer."""
         rope_dim = PallasMLAttentionBackend._DS_MLA_ROPE_HEAD_DIM
         kv_packing = get_dtype_packing(_resolve_kv_cache_dtype(cache_dtype_str))
+        nope_layout = KVCacheLayout(envs.TPU_SPARSE_MLA_NOPE_LAYOUT)
+        rope_layout = KVCacheLayout(envs.TPU_SPARSE_MLA_ROPE_LAYOUT)
+        packed_rope = envs.TPU_SPARSE_MLA_PACKED_ROPE
+        if packed_rope and (
+            nope_layout is not KVCacheLayout.SPARSECORE
+            or rope_layout is not KVCacheLayout.SPARSECORE
+        ):
+            # Only the native SparseCore gather reads packed rope rows; the
+            # TensorCore dsa_gather and masked-dense paths assume one padded
+            # 128-byte row per token.
+            raise ValueError(
+                "TPU_SPARSE_MLA_PACKED_ROPE=1 requires "
+                "TPU_SPARSE_MLA_NOPE_LAYOUT=sparsecore and "
+                "TPU_SPARSE_MLA_ROPE_LAYOUT=sparsecore, got "
+                f"{nope_layout.value} and {rope_layout.value}"
+            )
         return (
             SparseMLAKVCacheSpec.create(
                 KVCacheType.NOPE,
-                KVCacheLayout(envs.TPU_SPARSE_MLA_NOPE_LAYOUT),
+                nope_layout,
                 num_blocks,
                 block_size,
                 head_size - rope_dim,
@@ -1921,13 +1938,31 @@ class PallasMLAttentionBackend(AttentionBackend):
             ),
             SparseMLAKVCacheSpec.create(
                 KVCacheType.ROPE,
-                KVCacheLayout(envs.TPU_SPARSE_MLA_ROPE_LAYOUT),
+                rope_layout,
                 num_blocks,
                 block_size,
                 rope_dim,
                 kv_packing,
+                packed_rope=packed_rope,
             ),
         )
+
+    @staticmethod
+    def get_sparse_kv_cache_page_size_bytes(
+        block_size: int,
+        head_size: int,
+        cache_dtype_str: str | torch.dtype = "auto",
+    ) -> int:
+        """Bytes per block of one sparse-MLA layer's (nope, rope) caches.
+
+        Equal to `get_kv_cache_page_size_bytes` (one 128-lane-padded latent
+        row per token) unless `TPU_SPARSE_MLA_PACKED_ROPE` drops the rope
+        padding.
+        """
+        specs = PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            1, block_size, head_size, cache_dtype_str
+        )
+        return sum(math.prod(spec.shape) * spec.torch_dtype.itemsize for spec in specs)
 
     @staticmethod
     def get_kv_cache_page_size_bytes(
@@ -2917,6 +2952,21 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             w_uk_t_src = layer.W_UK_T
             w_uk_t_scale = getattr(layer, "W_UK_T_scale", None)
         attn_heads = layer.num_heads * (self.dcp_size if use_qrep else 1)
+        # TPU_DCP_MLA_UV_BEFORE_MERGE: W_UV runs before the DCP merge, so the
+        # merge carries v_head_dim. Not in the MTP drafter under
+        # TPU_MTP_DCP_MERGE_SIZED: the drafter's projected partial stays f32,
+        # and the sized merge only takes a 2-byte partial, so it would silently
+        # fall back to the f32 reduce-scatter. Taken on the plain dcp_op path
+        # only (below); the send-layout / fused small-a2a paths carry the
+        # latent and apply W_UV after their merge as before.
+        uv_first = (
+            use_qrep
+            and getattr(layer, "W_UV_dcp_qrep", None) is not None
+            and (
+                not envs.TPU_MTP_DCP_MERGE_SIZED
+                or vllm_compilation_backends.model_tag == "backbone"
+            )
+        )
         pe_dim = q_pe.shape[-1] if q_rope_table else layer.qk_rope_head_dim
 
         # Evaluate projection matrices directly across input precision
@@ -3087,7 +3137,48 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
                     # large buckets fail with ShapeSpecializationError. So the
                     # drafter keeps the reduce-scatter, as with the flag off.
                     w_uv_vspace = getattr(layer, "W_UV_dcp_vspace", None)
-                    if w_uv_vspace is not None and use_qrep:
+                    # A chunked-merge bucket that V space covers takes V space
+                    # over UV_BEFORE_MERGE: the projection fused into each
+                    # merge chunk, where W_UV first writes heads-major and the
+                    # weighted merge relayouts it twice per chunk (GLM-5.2
+                    # DCP16 4096-token step: 541 us of merge ops per layer).
+                    vspace_wins = (
+                        w_uv_vspace is not None
+                        and use_qrep
+                        and _cp_mla_attention.vspace_merge_applies(
+                            partial.shape[0], is_backbone
+                        )
+                    )
+                    if uv_first and not vspace_wins:
+                        # TPU_DCP_MLA_UV_BEFORE_MERGE (upstream #1931 + its
+                        # follow-ups): project every partial through the DCP
+                        # group's W_UV, then merge [T, H, v_head_dim]. A
+                        # narrowed merge rounds to the wire dtype anyway, so
+                        # the backbone projects straight into it. Yields to
+                        # TPU_DCP_MERGE_VSPACE on the buckets V space covers.
+                        wire_dtype = partial.dtype
+                        narrow = envs.TPU_DCP_RS_OUT_PRECISION and is_backbone
+                        partial = project_uv_heads(
+                            partial,
+                            layer.W_UV_dcp_qrep,
+                            layer.W_UV_dcp_qrep_scale,
+                            out_dtype=wire_dtype if narrow else torch.float32,
+                        )
+                        outputs = merge_lse_partials_scatter_heads(
+                            partial,
+                            lse,
+                            is_backbone=is_backbone,
+                            query_start_loc=attn_metadata.query_start_loc,
+                            wire_dtype=wire_dtype,
+                        )
+                        # Buckets of the same range that keep the latent lift
+                        # the local W_UV; lift it here too, unread
+                        # (`_retain_buffers`).
+                        outputs = _retain_buffers(
+                            outputs, layer.W_UV, getattr(layer, "W_UV_scale", None)
+                        )
+                        projected = True
+                    elif w_uv_vspace is not None and use_qrep:
                         # The decode buckets' trace lifts the local W_UV;
                         # lift it here too, unread (`_retain_buffers`).
                         w_uv_vspace = _retain_buffers(
@@ -3169,6 +3260,13 @@ class PallasMLAttentionBackendImpl(MLAAttentionImpl):
             # gathered W_UV; lift it here too, unread (`_retain_buffers`).
             w_uv_src = _retain_buffers(
                 w_uv_src, vspace_w, getattr(layer, "W_UV_dcp_vspace_scale", None)
+            )
+        qrep_w = getattr(layer, "W_UV_dcp_qrep", None)
+        if use_qrep and qrep_w is not None and qrep_w is not vspace_w:
+            # TPU_DCP_MLA_UV_BEFORE_MERGE: the plain-path buckets' trace lifts
+            # the gathered W_UV; lift it here too, unread.
+            w_uv_src = _retain_buffers(
+                w_uv_src, qrep_w, getattr(layer, "W_UV_dcp_qrep_scale", None)
             )
         w_uv = (
             w_uv_src.to(outputs_t.dtype)

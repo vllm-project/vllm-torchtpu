@@ -46,6 +46,9 @@ ROPE_PACKING = 4
 QUADS_PER_ATOM = 16
 OCCURRENCES_PER_ATOM = QUADS_PER_ATOM * ROPE_PACKING
 ROPE_WORDS = 32  # one rope token on the SparseCore view of the rope cache
+# One rope token under packed rope (`TPU_SPARSE_MLA_PACKED_ROPE`): its 64 fp8
+# bytes alone, eight tokens per 128-word cache row instead of four.
+PACKED_ROPE_WORDS = 16
 # `write_rows` (the write phase's one operand), u32[3 * T, 128]: row blocks.
 WRITE_NOPE_PART, WRITE_ROPE_PART, WRITE_DST_PART, WRITE_PARTS = 0, 1, 2, 3
 
@@ -87,6 +90,25 @@ def live_atom_of(step: Any, starts: list[Any], row_atoms: int) -> Any:
     return step + shift
 
 
+def transpose_quad(data: list[Any]) -> list[Any]:
+    """Four tokens' banded words -> four bands of token-interleaved words.
+
+    In: `data[t]` word `w` byte `b` is token `t`'s byte `b * n + w` (the
+    `pack_tokens` banding, `n` words per token: 32 padded, 16 packed). Out:
+    `data[b]` word `w` byte `t` is that same byte, which bitcasts to the
+    four-token uint8 tile the TensorCore consumer reads. Pure jnp, so tests
+    run it on CPU too.
+    """
+    data = list(data)
+    low_16 = jnp.uint32(0x0000FFFF)
+    low_byte_each_half = jnp.uint32(0x00FF00FF)
+    data[0], data[2] = _delta_swap(data[0], data[2], 16, low_16)
+    data[1], data[3] = _delta_swap(data[1], data[3], 16, low_16)
+    data[0], data[1] = _delta_swap(data[0], data[1], 8, low_byte_each_half)
+    data[2], data[3] = _delta_swap(data[2], data[3], 8, low_byte_each_half)
+    return data
+
+
 def _kernel(
     nope_hbm_ref: Any,
     rope_hbm_ref: Any,
@@ -111,6 +133,7 @@ def _kernel(
     write_scratch: tuple[Any, ...] | None = None,
     write_tokens: int = 0,
     write_fault: str | None = None,
+    rope_words: int = ROPE_WORDS,
     row_atoms_hbm_ref: Any = None,
     row_atoms: int = 0,
     rows_per_batch: int = 1,
@@ -201,17 +224,25 @@ def _kernel(
                     input_stream = logical_rank // NUM_LANES
                     input_lane = logical_rank % NUM_LANES
                     data.append(
-                        rope_inputs[input_stream][pl.ds(input_lane, 1), pl.ds(0, 32)]
+                        rope_inputs[input_stream][
+                            pl.ds(input_lane, 1), pl.ds(0, rope_words)
+                        ]
                     )
 
-                low_16 = jnp.uint32(0x0000FFFF)
-                low_byte_each_half = jnp.uint32(0x00FF00FF)
-                data[0], data[2] = _delta_swap(data[0], data[2], 16, low_16)
-                data[1], data[3] = _delta_swap(data[1], data[3], 16, low_16)
-                data[0], data[1] = _delta_swap(data[0], data[1], 8, low_byte_each_half)
-                data[2], data[3] = _delta_swap(data[2], data[3], 8, low_byte_each_half)
+                data = transpose_quad(data)
                 for band in range(ROPE_PACKING):
-                    rope_output[pl.ds(row, 1), pl.ds(band * 32, 32)] = data[band]
+                    rope_output[pl.ds(row, 1), pl.ds(band * rope_words, rope_words)] = (
+                        data[band]
+                    )
+                # Packed rope fills only the first ROPE_PACKING * rope_words
+                # lanes; zero the rest, which the consumer reads as the
+                # (zero-padded) rope tail, as the padded cache stores it.
+                # Garbage there could decode to fp8 NaN, and NaN * 0 poisons
+                # the score against q's zero pad.
+                for band in range(ROPE_PACKING, 128 // rope_words):
+                    rope_output[pl.ds(row, 1), pl.ds(band * rope_words, rope_words)] = (
+                        jnp.zeros((1, rope_words), jnp.uint32)
+                    )
 
             if wait_mode == "overlap_rope":
                 for copy in nope_copies:
@@ -226,7 +257,7 @@ def _kernel(
         )
         rope_specs = tuple(
             pl.BlockSpec(
-                (pl.Indirect(NUM_LANES), 32),
+                (pl.Indirect(NUM_LANES), rope_words),
                 lambda atom, stream=stream: (values(atom_of(atom), stream), 0),
             )
             for stream in range(ROPE_PACKING)
@@ -364,12 +395,13 @@ def _write_phase(
     cross-core fence is needed.
 
     On a SparseCore view a rope token is its own 32-word row (the gather's
-    `rope_cache.reshape(-1, 32)`), so unlike the TensorCore writer there is no
-    read-modify-write of the shared 512 B row.
+    `rope_cache.reshape(-1, 32)`; 16 words under packed rope), so unlike the
+    TensorCore writer there is no read-modify-write of the shared 512 B row.
 
     Everything arrives in one operand, `write_rows` u32[3 * tokens, 128] (see
     `pack_write_rows`): row `t` the packed nope token, row `tokens + t` the
-    packed rope token in words [0, 32), row `2 * tokens + t` `dst + 1`
+    packed rope token in words [0, 32) ([0, 16) under packed rope: the width
+    of `rope_cache_ref`'s rows), row `2 * tokens + t` `dst + 1`
     broadcast (0 = skip: padding, or a row another DCP rank owns). One operand
     because every TensorCore-produced SparseCore operand costs the producer
     ~0.6 us at decode sizes (twin j-488b9087 / j-44074daf: one such op per
@@ -381,6 +413,9 @@ def _write_phase(
     (rows_src,) = write_refs
     dst_vmem, dst_sem, write_sem = write_scratch
     num_rows = nope_cache_ref.shape[0]
+    # One rope token per row of the SparseCore rope view (ROPE_WORDS, or
+    # PACKED_ROPE_WORDS under packed rope).
+    rope_words = rope_cache_ref.shape[-1]
     single_writer = fault == "no_fence"
     rounds = num_tokens if single_writer else pl.cdiv(num_tokens, NUM_SUBCORES)
     copies = []
@@ -414,7 +449,7 @@ def _write_phase(
         )
         rope_cp = pltpu.make_async_copy(
             rows_src.at[
-                pl.ds(WRITE_ROPE_PART * num_tokens + token, 1), pl.ds(0, ROPE_WORDS)
+                pl.ds(WRITE_ROPE_PART * num_tokens + token, 1), pl.ds(0, rope_words)
             ],
             rope_cache_ref.at[pl.ds(row, 1)],
             write_sem.at[1 if single_writer else 2 * k + 1],
@@ -453,7 +488,8 @@ def pack_write_rows(
 
     `dst_rows` i32[T] (negative = skip), `nope_rows` u32[T, 128] and
     `rope_rows` u32[T, 32 or 128] (token in words [0, 32), rest zero), packed
-    for the SparseCore cache (`kv_cache_utils.pack_tokens`). Tokens are padded
+    for the SparseCore cache (`kv_cache_utils.pack_tokens`). Under packed rope
+    the token is 16 words: u32[T, 16 or 128], words [0, 16). Tokens are padded
     to `Tp`, a whole number of subcore rounds (16); padding rows are skipped.
     """
     t = dst_rows.shape[0]
@@ -461,12 +497,11 @@ def pack_write_rows(
         raise ValueError(f"kv_write takes 1..{2 * NUM_SUBCORES} tokens")
     if nope_rows.shape != (t, 128) or nope_rows.dtype != jnp.uint32:
         raise ValueError(f"nope_rows must be uint32[{t}, 128]")
-    if rope_rows.shape not in ((t, ROPE_WORDS), (t, 128)) or (
-        rope_rows.dtype != jnp.uint32
-    ):
-        raise ValueError(f"rope_rows must be uint32[{t}, 32 or 128]")
+    rope_widths = ((t, PACKED_ROPE_WORDS), (t, ROPE_WORDS), (t, 128))
+    if rope_rows.shape not in rope_widths or rope_rows.dtype != jnp.uint32:
+        raise ValueError(f"rope_rows must be uint32[{t}, 16, 32 or 128]")
     if rope_rows.shape[1] != 128:
-        rope_rows = jnp.pad(rope_rows, ((0, 0), (0, 128 - ROPE_WORDS)))
+        rope_rows = jnp.pad(rope_rows, ((0, 0), (0, 128 - rope_rows.shape[1])))
     tp = pl.cdiv(t, NUM_SUBCORES) * NUM_SUBCORES
     enc = jnp.where(dst_rows >= 0, dst_rows + 1, 0).astype(jnp.uint32)
     parts = [nope_rows, rope_rows, jnp.broadcast_to(enc[:, None], (t, 128))]
@@ -519,6 +554,7 @@ def live_vec_geometry(out_size: int, atoms_per_batch: int) -> tuple[int, ...]:
         "linear_indices",
         "live_vec_offset",
         "write_fault",
+        "packed_rope",
     ),
 )
 def dsa_gather_native_sc(
@@ -537,6 +573,7 @@ def dsa_gather_native_sc(
     live_vec_offset: int | None = None,
     kv_write: jax.Array | tuple[jax.Array, jax.Array, jax.Array] | None = None,
     write_fault: str | None = None,
+    packed_rope: bool = False,
     row_live_atoms: jax.Array | None = None,
 ) -> tuple[jax.Array, ...]:
     """Gather explicit native-SC ``uint32`` NOPE and ROPE cache rows.
@@ -572,15 +609,21 @@ def dsa_gather_native_sc(
 
     ``kv_write`` (TPU_MLA_KV_WRITE_IN_GATHER) = ``(dst_rows, nope_rows,
     rope_rows)``: i32[T] flattened cache rows (`page * page_size + slot`,
-    negative = skip), u32[T, 128] and u32[T, 32 or 128] tokens already packed
-    for the SparseCore cache (`kv_cache_utils.pack_tokens`; a 128-wide rope
-    operand carries the token in words [0, 32) and avoids a relayout), or
+    negative = skip), u32[T, 128] and u32[T, 32 or 128] (16 or 128 under
+    ``packed_rope``) tokens already packed for the SparseCore cache
+    (`kv_cache_utils.pack_tokens`; a 128-wide rope operand carries the token
+    in words [0, 32), or [0, 16), and avoids a relayout), or
     those three already in the kernel's one-operand form, `pack_write_rows`'s
     u32[3 * Tp, 128] (what the serving path hands over: one TensorCore
     producer). They are written into
     both caches in place before anything is gathered, and the call then also
     returns the updated ``(nope_cache, rope_cache)``. Bytes identical to
     `scatter.scatter` / `tc_scatter.scatter_caches` with the same rows.
+
+    ``packed_rope`` reads (and ``kv_write`` writes) a ROPE cache whose tokens
+    own 16-word eighths of a row (`SparseMLAKVCacheSpec.packed_rope`) instead
+    of 32-word quarters. The gathered output is the same: the rope lanes past
+    each token's 64 bytes are zeroed, exactly as the padded cache stores them.
 
     ``row_live_atoms`` (traced i32[query], optional) gathers only the first
     ``row_live_atoms[i]`` 64-slot atoms of index row ``i``; the other atoms'
@@ -623,8 +666,14 @@ def dsa_gather_native_sc(
     scratch_types = {"sem_ref": pltpu.SemaphoreType.DMA((ROPE_PACKING,))}
     if write_fault not in WRITE_FAULTS:
         raise ValueError(f"unknown {write_fault=}")
+    rope_words = PACKED_ROPE_WORDS if packed_rope else ROPE_WORDS
     nope_rows_view = nope_cache.reshape(-1, 128)
-    rope_rows_view = rope_cache.reshape(-1, 32)
+    rope_rows_view = rope_cache.reshape(-1, rope_words)
+    if packed_rope and rope_rows_view.shape[0] != nope_rows_view.shape[0]:
+        raise ValueError(
+            f"packed rope cache holds {rope_rows_view.shape[0]} tokens, the NOPE "
+            f"cache {nope_rows_view.shape[0]}"
+        )
     write_tokens = 0
     if kv_write is not None:
         # The caches become refs the kernel writes in place (as
@@ -701,6 +750,14 @@ def dsa_gather_native_sc(
     )
     num_base = len(operands)  # nope, rope, indices[, live_vec]
     if kv_write is not None:
+        if not isinstance(kv_write, jax.Array) and kv_write[2].shape[-1] not in (
+            rope_words,
+            128,
+        ):
+            raise ValueError(
+                f"kv_write rope rows are {kv_write[2].shape[-1]} words; this rope "
+                f"cache takes {rope_words}-word tokens (or 128-lane rows)"
+            )
         write_rows = (
             kv_write if isinstance(kv_write, jax.Array) else pack_write_rows(*kv_write)
         )
@@ -737,6 +794,7 @@ def dsa_gather_native_sc(
         linear_indices=linear_indices,
         write_tokens=write_tokens,
         write_fault=write_fault,
+        rope_words=rope_words,
         **row_kwargs,
     )
 
@@ -775,6 +833,7 @@ def dsa_gather_native_sc(
             f"{'pipe' if serve_pipelined else 'nopipe'}{'_live' if live else ''}"
             f"{'_kvw' if kv_write is not None else ''}"
             f"{'_rowlive' if row_kwargs else ''}"
+            f"{'_packedrope' if packed_rope else ''}"
         ),
     )(*operands)
     if kv_write is None:

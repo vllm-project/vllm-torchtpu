@@ -279,15 +279,23 @@ class _A2AGroup:
         return recv
 
 
-def _a2a_merge_whole(outputs, lses, monkeypatch, wrong_destination=False):
+def _a2a_merge_whole(
+    outputs, lses, monkeypatch, wrong_destination=False, send_dtype=None, sent=None
+):
     """Every rank's all-to-all merge, run in lockstep, reassembled over heads."""
-    monkeypatch.setattr(cp_mla, "_all_to_all", lambda x, group: group.all_to_all(x))
+
+    def exchange(x, group):
+        if sent is not None:
+            sent.append(x.dtype)
+        return group.all_to_all(x)
+
+    monkeypatch.setattr(cp_mla, "_all_to_all", exchange)
     world = outputs.shape[0]
     hub = _ExchangeHub(world, wrong_destination)
 
     def run(rank):
         return cp_mla.merge_lse_partials_all_to_all(
-            outputs[rank], lses[rank], _A2AGroup(hub, rank)
+            outputs[rank], lses[rank], _A2AGroup(hub, rank), send_dtype=send_dtype
         )
 
     with concurrent.futures.ThreadPoolExecutor(world) as pool:
@@ -1222,7 +1230,7 @@ def test_send_layout_min_tokens_gates_small_buckets(min_tokens, want, monkeypatc
         TPU_DCP_LSE_MERGE_A2A=True,
         TPU_DCP_LSE_MERGE_A2A_PACK=True,
         TPU_DCP_LSE_MERGE_A2A_REAL_ROWS=True,
-        TPU_DCP_MLA_SPLIT_Q_LSE=True,
+        TPU_MLA_SPARSE_SPLIT_Q=True,
         TPU_DCP_MLA_MASK_IN_KERNEL=True,
         TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS=64,
         TPU_DCP_MLA_SEND_LAYOUT_MIN_TOKENS=min_tokens,
@@ -1681,3 +1689,159 @@ def test_rs_out_precision_leaves_a2a_and_chunked_buckets_alone(
         outputs, lses, monkeypatch, TPU_DCP_RS_OUT_PRECISION=False, **env
     )
     assert torch.equal(on, off)
+
+
+# ===================================================================== #
+# TPU_DCP_MLA_UV_BEFORE_MERGE (upstream #1931 + follow-ups; ported from
+# glm-agentx c012143c0, 9bce74594, 118d6e3bd, 77059cca3)
+# ===================================================================== #
+
+
+@pytest.mark.parametrize("dcp_size", [2, 4, 8, 16])
+def test_projecting_before_the_merge_matches_projecting_after(dcp_size, monkeypatch):
+    """W_UV is linear per head and the merge weights are per (token, head), so
+    merging the projected partials is the projected merge."""
+    rng = np.random.default_rng(20261009)
+    outputs, lses = _partials(rng, dcp_size, empty=((0, 1), (dcp_size - 1, 5)))
+    heads, vdim = outputs.shape[2], outputs.shape[3]
+    w_uv = torch.from_numpy(rng.standard_normal((heads, vdim, 8)).astype(np.float32))
+    projected = torch.stack(
+        [cp_mla.project_uv_heads(outputs[r], w_uv, None) for r in range(dcp_size)]
+    )
+    assert projected.dtype == torch.float32
+
+    got = _merge_whole(projected, lses, monkeypatch).numpy()
+    want = np.einsum(
+        "thv,hvd->thd",
+        _reference_merge(outputs, lses),
+        w_uv.numpy().astype(np.float64),
+    )
+    np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-5)
+
+
+@pytest.mark.parametrize(
+    "rs_bf16, is_backbone, want",
+    [
+        (True, True, torch.bfloat16),
+        (True, False, torch.float32),
+        (False, True, torch.float32),
+    ],
+)
+def test_a_projected_partial_crosses_in_the_wire_dtype(
+    rs_bf16, is_backbone, want, monkeypatch
+):
+    """A W_UV-projected partial is f32, but the backbone's bf16 reduce-scatter
+    must stay bf16: the caller names the wire dtype. The drafter stays f32."""
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_RS_OUT_PRECISION", rs_bf16)
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A", False)
+    outputs, lses = _partials(np.random.default_rng(12), 4)
+    group = _FakeGroup(outputs, lses, 0)
+    seen = []
+    inner = group.reduce_scatter
+
+    def spy(tensor, dim=-1):
+        seen.append(tensor.dtype)
+        return inner(tensor, dim)
+
+    group.reduce_scatter = spy
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: group)
+    got = cp_mla.merge_lse_partials_scatter_heads(
+        outputs[0], lses[0], is_backbone=is_backbone, wire_dtype=torch.bfloat16
+    )
+    assert seen == [want]
+    assert got.dtype == torch.float32
+
+
+def test_a_narrow_projection_is_the_f32_projection_rounded_once():
+    """bf16 out is one rounding of the exact projection, not a bf16 dot of
+    rounded operands; the scaled path still projects in f32 first."""
+    rng = np.random.default_rng(23)
+    partial = torch.from_numpy(rng.standard_normal((5, 4, 64)).astype(np.float32))
+    partial = partial.to(torch.bfloat16)
+    w_uv = torch.from_numpy(
+        (rng.standard_normal((4, 64, 16)) / 8).astype(np.float32)
+    ).to(torch.bfloat16)
+    exact = cp_mla.project_uv_heads(partial, w_uv, None)
+    narrow = cp_mla.project_uv_heads(partial, w_uv, None, out_dtype=torch.bfloat16)
+    assert exact.dtype == torch.float32 and narrow.dtype == torch.bfloat16
+    exact64 = exact.double().numpy()
+    err = np.abs(narrow.double().numpy() - exact64)
+    assert (err <= 2.0**-8 * np.abs(exact64) + 1e-6).all()
+
+    scale = torch.from_numpy(rng.uniform(0.5, 2.0, (4, 1, 16)).astype(np.float32))
+    scaled = cp_mla.project_uv_heads(partial, w_uv, scale, out_dtype=torch.bfloat16)
+    assert scaled.dtype == torch.bfloat16
+    torch.testing.assert_close(
+        scaled, cp_mla.project_uv_heads(partial, w_uv, scale).to(torch.bfloat16)
+    )
+
+
+def test_projection_applies_the_per_head_output_scale():
+    rng = np.random.default_rng(11)
+    partial = torch.from_numpy(rng.standard_normal((3, 4, 16)).astype(np.float32))
+    w_uv = torch.from_numpy(rng.standard_normal((4, 16, 8)).astype(np.float32))
+    scale = torch.from_numpy(rng.uniform(0.5, 2.0, (4, 1, 8)).astype(np.float32))
+    np.testing.assert_allclose(
+        cp_mla.project_uv_heads(partial, w_uv, scale).numpy(),
+        cp_mla.project_uv_heads(partial, w_uv * scale, None).numpy(),
+        rtol=1e-5,
+        atol=1e-5,
+    )
+
+
+@pytest.mark.parametrize(
+    "rs_bf16, is_backbone, want",
+    [
+        (True, True, torch.bfloat16),
+        (False, True, None),
+    ],
+)
+def test_the_all_to_all_takes_the_wire_dtype(rs_bf16, is_backbone, want, monkeypatch):
+    """With the all-to-all on, a W_UV-projected f32 partial crosses in the
+    attention dtype exactly when the reduce-scatter would."""
+    seen = []
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_LSE_MERGE_A2A", True)
+    monkeypatch.setattr(cp_mla.envs, "TPU_DCP_RS_OUT_PRECISION", rs_bf16)
+    monkeypatch.setattr(
+        cp_mla,
+        "merge_lse_partials_all_to_all",
+        lambda o, lse, g, send_dtype=None, **kw: seen.append(send_dtype) or o[:, :2],
+    )
+    outputs, lses = _partials(np.random.default_rng(21), 2, tokens=8, vdim=4)
+    monkeypatch.setattr(cp_mla, "get_dcp_group", lambda: _FakeGroup(outputs, lses, 0))
+    cp_mla.merge_lse_partials_scatter_heads(
+        outputs[0], lses[0], is_backbone=is_backbone, wire_dtype=torch.bfloat16
+    )
+    assert seen == [want]
+
+
+@pytest.mark.parametrize("dcp_size", [2, 4, 8, 16])
+def test_a_projected_all_to_all_merge_in_bf16_matches_the_reference(
+    dcp_size, monkeypatch
+):
+    """bf16 on the wire rounds each projected partial once, so the merge stays
+    within half a bf16 ulp of the largest term; f32 on the wire stays exact."""
+    rng = np.random.default_rng(20261015)
+    outputs, lses = _hard_partials(rng, dcp_size, vdim=32)
+    heads = outputs.shape[2]
+    w_uv = torch.from_numpy(
+        (rng.standard_normal((heads, 32, 16)) / 32**0.5).astype(np.float32)
+    )
+    projected = torch.stack(
+        [cp_mla.project_uv_heads(outputs[r], w_uv, None) for r in range(dcp_size)]
+    )
+    reference = _reference_merge(projected.double(), lses)
+    term_max = projected.double().abs().amax(dim=0).numpy()
+
+    sent = []
+    got = _a2a_merge_whole(
+        projected, lses, monkeypatch, send_dtype=torch.bfloat16, sent=sent
+    )
+    assert got.dtype == torch.float32
+    assert set(sent) == {torch.bfloat16, torch.float32}  # partial bf16, lse f32
+    err = np.abs(got.double().numpy() - reference)
+    assert (err <= 2.0**-8 * term_max + 1e-6).all()
+    assert (got[3] == 0).all()
+
+    exact = _a2a_merge_whole(projected, lses, monkeypatch)
+    np.testing.assert_allclose(exact.double().numpy(), reference, rtol=1e-5, atol=1e-5)

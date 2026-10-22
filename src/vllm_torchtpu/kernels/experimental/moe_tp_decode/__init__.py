@@ -6,7 +6,10 @@ all_reduce.py)."""
 
 from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
 from vllm_torchtpu.kernels.experimental.moe_tp_decode.kernel import (
+    MAX_ROWS,
+    MIN_ROWS,
     ROW_BUCKETS,
+    admits_rows,
     can_use_moe_tp_decode,
     exact_in_bf16,
     kernel_name,
@@ -14,7 +17,10 @@ from vllm_torchtpu.kernels.experimental.moe_tp_decode.kernel import (
 )
 
 __all__ = [
+    "MAX_ROWS",
+    "MIN_ROWS",
     "ROW_BUCKETS",
+    "admits_rows",
     "all_reduce",
     "can_use_moe_tp_decode",
     "exact_in_bf16",

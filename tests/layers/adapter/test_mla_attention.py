@@ -1790,3 +1790,272 @@ def test_indexer_kv_layout_and_op_resolution_raiden_glm_admission(monkeypatch, c
     )
     with pytest.raises(ValueError, match="Raiden GLM admission"):
         mla_attention_op._resolve_indexer_kv_cache_mode(cache_has, k_packed, mode="sal")
+
+
+# TPU_DCP_MLA_UV_BEFORE_MERGE (ported from glm-agentx c012143c0, 77059cca3, c573f380a)
+
+
+def test_mla_forward_qrep_applies_w_uv_before_the_merge(monkeypatch):
+    """With the group's W_UV built, the merge receives f32 partials already
+    projected to v_head_dim, and the local W_UV is not applied again."""
+    dcp_size, local_heads, num_tokens = 2, 16, 4
+    impl, layer, inputs, _ = _make_impl_and_layer()
+    impl.dcp_size = dcp_size
+    group_heads = local_heads * dcp_size
+
+    torch.manual_seed(2)
+    layer.W_UK_T_dcp_qrep = torch.randn(group_heads, 128, 512) * 0.05
+    layer.W_UK_T_dcp_qrep_scale = None
+    layer.W_UV_dcp_qrep = torch.randn(group_heads, 512, 128) * 0.05
+    layer.W_UV_dcp_qrep_scale = None
+    layer.W_UV = None  # must not be touched
+    partial = torch.randn(num_tokens, group_heads, 512)
+    lse = torch.zeros(num_tokens, group_heads)
+    layer.sparse_mla_dcp_op = MagicMock(return_value=(partial, lse))
+    inputs["kv_cache"] = tuple(
+        torch.zeros(spec.shape, dtype=spec.torch_dtype)
+        for spec in PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            2, 8, 576, torch.float8_e4m3fn
+        )
+    )
+    merged_inputs = []
+    merge_kwargs = []
+
+    def _merge(out, _lse, **kw):
+        merged_inputs.append(out)
+        merge_kwargs.append(kw)
+        return out[:, :local_heads, :]
+
+    monkeypatch.setattr(attention_adapter, "merge_lse_partials_scatter_heads", _merge)
+
+    got = impl.forward(
+        layer=layer,
+        **inputs,
+        topk_indices=torch.zeros((num_tokens, 8), dtype=torch.int32),
+        q_dcp_replicated=(
+            torch.randn(num_tokens, group_heads, 128),
+            torch.randn(num_tokens, group_heads, 64),
+        ),
+    )
+
+    (seen,) = merged_inputs
+    assert seen.dtype == torch.float32
+    # The merge is told the attention dtype, so a bf16 wire stays bf16.
+    assert merge_kwargs[0]["wire_dtype"] == partial.dtype
+    projected = torch.bmm(partial.transpose(0, 1), layer.W_UV_dcp_qrep).transpose(0, 1)
+    torch.testing.assert_close(seen, projected)
+    torch.testing.assert_close(
+        got,
+        projected[:, :local_heads].to(got.dtype).reshape(num_tokens, -1),
+    )
+
+
+@pytest.mark.parametrize(
+    "model_tag, rs_bf16, want",
+    [
+        ("backbone", True, torch.bfloat16),
+        ("backbone", False, torch.float32),
+        ("eagle_head", True, torch.float32),
+    ],
+)
+def test_mla_forward_qrep_projects_into_the_wire_dtype(
+    model_tag, rs_bf16, want, monkeypatch
+):
+    """A bf16 partial is projected straight to bf16 when the merge narrows
+    anyway (backbone, TPU_DCP_RS_OUT_PRECISION); otherwise it stays f32."""
+    dcp_size, local_heads, num_tokens = 2, 16, 4
+    impl, layer, inputs, _ = _make_impl_and_layer()
+    impl.dcp_size = dcp_size
+    group_heads = local_heads * dcp_size
+
+    torch.manual_seed(3)
+    layer.W_UK_T_dcp_qrep = torch.randn(group_heads, 128, 512) * 0.05
+    layer.W_UK_T_dcp_qrep_scale = None
+    layer.W_UV_dcp_qrep = (torch.randn(group_heads, 512, 128) * 0.05).to(torch.bfloat16)
+    layer.W_UV_dcp_qrep_scale = None
+    layer.W_UV = None
+    partial = torch.randn(num_tokens, group_heads, 512).to(torch.bfloat16)
+    lse = torch.zeros(num_tokens, group_heads)
+    layer.sparse_mla_dcp_op = MagicMock(return_value=(partial, lse))
+    inputs["kv_cache"] = tuple(
+        torch.zeros(spec.shape, dtype=spec.torch_dtype)
+        for spec in PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            2, 8, 576, torch.float8_e4m3fn
+        )
+    )
+    monkeypatch.setattr(attention_adapter.envs, "TPU_DCP_RS_OUT_PRECISION", rs_bf16)
+    # The drafter projects first only without the sized merge (on by default
+    # on highconc/t7, off on glm-agentx where this test comes from).
+    monkeypatch.setattr(attention_adapter.envs, "TPU_MTP_DCP_MERGE_SIZED", False)
+    monkeypatch.setattr(
+        attention_adapter.vllm_compilation_backends, "model_tag", model_tag
+    )
+    seen = []
+    monkeypatch.setattr(
+        attention_adapter,
+        "merge_lse_partials_scatter_heads",
+        lambda out, _lse, **kw: seen.append((out, kw)) or out[:, :local_heads, :],
+    )
+
+    impl.forward(
+        layer=layer,
+        **inputs,
+        topk_indices=torch.zeros((num_tokens, 8), dtype=torch.int32),
+        q_dcp_replicated=(
+            torch.randn(num_tokens, group_heads, 128),
+            torch.randn(num_tokens, group_heads, 64),
+        ),
+    )
+
+    ((out, kw),) = seen
+    assert out.dtype == want
+    assert kw["is_backbone"] == (model_tag == "backbone")
+    assert kw["wire_dtype"] == torch.bfloat16
+
+
+@pytest.mark.parametrize(
+    "model_tag, sized, uv_first",
+    [
+        ("eagle_head", True, False),  # the drafter keeps its sized merge
+        ("backbone", True, True),
+        ("eagle_head", False, True),
+    ],
+)
+def test_mla_forward_drafter_skips_w_uv_first_under_the_sized_merge(
+    model_tag, sized, uv_first, monkeypatch
+):
+    """Under TPU_MTP_DCP_MERGE_SIZED the MTP drafter merges the kernel's bf16
+    partial (kv_lora_rank wide), which the sized merge takes, and applies its
+    local W_UV after the merge; the backbone still projects first."""
+    dcp_size, local_heads, num_tokens = 2, 16, 4
+    impl, layer, inputs, _ = _make_impl_and_layer()
+    impl.dcp_size = dcp_size
+    group_heads = local_heads * dcp_size
+
+    torch.manual_seed(4)
+    layer.W_UK_T_dcp_qrep = torch.randn(group_heads, 128, 512) * 0.05
+    layer.W_UK_T_dcp_qrep_scale = None
+    layer.W_UV_dcp_qrep = (torch.randn(group_heads, 512, 128) * 0.05).to(torch.bfloat16)
+    layer.W_UV_dcp_qrep_scale = None
+    layer.W_UV = layer.W_UV_dcp_qrep[:local_heads].clone()
+    partial = torch.randn(num_tokens, group_heads, 512).to(torch.bfloat16)
+    lse = torch.zeros(num_tokens, group_heads)
+    layer.sparse_mla_dcp_op = MagicMock(return_value=(partial, lse))
+    inputs["kv_cache"] = tuple(
+        torch.zeros(spec.shape, dtype=spec.torch_dtype)
+        for spec in PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            2, 8, 576, torch.float8_e4m3fn
+        )
+    )
+    monkeypatch.setattr(attention_adapter.envs, "TPU_MTP_DCP_MERGE_SIZED", sized)
+    monkeypatch.setattr(attention_adapter.envs, "TPU_DCP_RS_OUT_PRECISION", True)
+    monkeypatch.setattr(
+        attention_adapter.vllm_compilation_backends, "model_tag", model_tag
+    )
+    seen = []
+    monkeypatch.setattr(
+        attention_adapter,
+        "merge_lse_partials_scatter_heads",
+        lambda out, _lse, **kw: seen.append(out) or out[:, :local_heads, :],
+    )
+
+    got = impl.forward(
+        layer=layer,
+        **inputs,
+        topk_indices=torch.zeros((num_tokens, 8), dtype=torch.int32),
+        q_dcp_replicated=(
+            torch.randn(num_tokens, group_heads, 128),
+            torch.randn(num_tokens, group_heads, 64),
+        ),
+    )
+
+    (out,) = seen
+    if uv_first:
+        assert out.shape[-1] == 128  # projected to v_head_dim before the merge
+    else:
+        # The kernel's bf16 partial, as the sized merge needs it ...
+        assert out.dtype == torch.bfloat16 and out.shape[-1] == 512
+        torch.testing.assert_close(out, partial)
+        # ... and the local W_UV after the merge.
+        want = torch.bmm(partial[:, :local_heads].transpose(0, 1), layer.W_UV)
+        torch.testing.assert_close(
+            got.float(),
+            want.transpose(0, 1).reshape(num_tokens, -1).to(got.dtype).float(),
+        )
+
+
+@pytest.mark.parametrize("vspace_applies", [True, False])
+def test_mla_forward_vspace_bucket_takes_vspace_over_w_uv_first(
+    vspace_applies, monkeypatch
+):
+    """On a bucket TPU_DCP_MERGE_VSPACE covers, the chunked V-space merge
+    (W_UV fused per chunk) runs instead of UV_BEFORE_MERGE's heads-major
+    projection + merge; every other bucket still projects first."""
+    dcp_size, local_heads, num_tokens = 2, 16, 4
+    impl, layer, inputs, _ = _make_impl_and_layer()
+    impl.dcp_size = dcp_size
+    group_heads = local_heads * dcp_size
+
+    torch.manual_seed(5)
+    layer.W_UK_T_dcp_qrep = torch.randn(group_heads, 128, 512) * 0.05
+    layer.W_UK_T_dcp_qrep_scale = None
+    layer.W_UV_dcp_qrep = torch.randn(group_heads, 512, 128) * 0.05
+    layer.W_UV_dcp_qrep_scale = None
+    layer.W_UV_dcp_vspace = layer.W_UV_dcp_qrep
+    layer.W_UV_dcp_vspace_scale = None
+    layer.W_UV = layer.W_UV_dcp_qrep[:local_heads].clone()
+    partial = torch.randn(num_tokens, group_heads, 512)
+    lse = torch.zeros(num_tokens, group_heads)
+    layer.sparse_mla_dcp_op = MagicMock(return_value=(partial, lse))
+    inputs["kv_cache"] = tuple(
+        torch.zeros(spec.shape, dtype=spec.torch_dtype)
+        for spec in PallasMLAttentionBackend.get_sparse_kv_cache_specs(
+            2, 8, 576, torch.float8_e4m3fn
+        )
+    )
+    monkeypatch.setattr(
+        attention_adapter.vllm_compilation_backends, "model_tag", "backbone"
+    )
+    monkeypatch.setattr(
+        attention_adapter._cp_mla_attention,
+        "vspace_merge_applies",
+        lambda n, is_backbone: vspace_applies,
+    )
+    calls = []
+
+    def _vspace(out, _lse, w_uv, w_scale, **kw):
+        calls.append("vspace")
+        merged = torch.bmm(out.transpose(0, 1), w_uv).transpose(0, 1)
+        return merged[:, :local_heads, :], True
+
+    monkeypatch.setattr(
+        attention_adapter._cp_mla_attention,
+        "merge_lse_partials_scatter_heads_vspace",
+        _vspace,
+    )
+    monkeypatch.setattr(
+        attention_adapter,
+        "merge_lse_partials_scatter_heads",
+        lambda out, _lse, **kw: calls.append(("plain", out.shape[-1]))
+        or out[:, :local_heads, :],
+    )
+
+    got = impl.forward(
+        layer=layer,
+        **inputs,
+        topk_indices=torch.zeros((num_tokens, 8), dtype=torch.int32),
+        q_dcp_replicated=(
+            torch.randn(num_tokens, group_heads, 128),
+            torch.randn(num_tokens, group_heads, 64),
+        ),
+    )
+
+    projected = torch.bmm(partial.transpose(0, 1), layer.W_UV_dcp_qrep).transpose(0, 1)
+    if vspace_applies:
+        assert calls == ["vspace"]
+    else:
+        assert calls == [("plain", 128)]  # projected to v_head_dim first
+    torch.testing.assert_close(
+        got.float(),
+        projected[:, :local_heads].to(got.dtype).reshape(num_tokens, -1).float(),
+    )

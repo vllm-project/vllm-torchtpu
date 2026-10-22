@@ -715,6 +715,39 @@ def _ee_assert_full_rows(actual, q_lens, seq_lens, k):
         )
 
 
+def test_streamindex_topk_verify_requests_counted_as_decode():
+    """MTP verify requests counted in distribution[0] select like mixed ones.
+
+    With reorder_batch_threshold > 1 the runner counts (gamma+1)-token verify
+    requests as decode. The decode passes are static_q_len=1, so the kernel
+    must keep those requests out of them; the result has to match the batch
+    declared with only its one-token requests as decode.
+    """
+    q_lens = (1, 1, 1) + (4,) * 9
+    seq_lens = tuple(512 + 384 * i for i in range(len(q_lens)))
+    k = 128
+    inputs = _ee_inputs(q_lens, seq_lens, seed=5)
+    np.testing.assert_array_equal(inputs["distribution"], [3, 3, 12])
+
+    def run(distribution):
+        args = {name: jnp.asarray(value) for name, value in inputs.items()}
+        args["distribution"] = jnp.asarray(distribution, jnp.int32)
+        return np.asarray(
+            streamindex_topk(
+                **args,
+                k=k,
+                compression_ratio=1,
+                num_kv_pages_per_block=_EE_BKV_P,
+                num_queries_per_block=(1, _EE_BQ_SZ, _EE_BQ_SZ),
+            )
+        )
+
+    as_decode = run([12, 12, 12])
+    as_mixed = run([3, 3, 12])
+    _ee_assert_full_rows(as_mixed, q_lens, seq_lens, k)
+    _ee_assert_same_selection(as_decode, as_mixed)
+
+
 def test_streamindex_topk_early_exit_all_short():
     """Whole batch under k: the global fast path answers on its own."""
     q_lens, seq_lens, k = (1, 1, 1), (64, 96, 128), 512
@@ -1649,6 +1682,155 @@ def test_shared_meta_is_bitwise(T_list, S_list, cp_size, cp_rank, bkv_p, chunk):
     np.testing.assert_array_equal(
         np.array(on_scores).view(np.int32), np.array(off_scores).view(np.int32),
         err_msg="shared_meta changed scores")
+
+
+# fmt: off
+@pytest.mark.parametrize(
+    "T_list,S_list,chunk,cp_size,cp_rank",
+    [
+        # The served mixed step: MTP decodes (q_len 4) then one prefill chunk.
+        # Chunked at 64, max_num_seqs * 4 = 28 < 64: only chunk 0 keeps the
+        # short pass.
+        pytest.param((4,) * 6 + (232,), (9001, 2052, 260, 5003, 777, 4100, 3021),
+                     64, 1, 0, id="mtp_mixed_chunked"),
+        # q_len-1 decodes first (DECODE passes), a q_len-2 short request, then
+        # the prefill: the short prefix starts at distribution[1].
+        pytest.param((1, 1, 4, 4, 4, 2, 4, 236),
+                     (5000, 777, 9001, 260, 3021, 4100, 2052, 7000),
+                     64, 1, 0, id="decodes_then_short_then_prefill"),
+        # Short rows past chunk 0, a seam inside a decode request (chunk 16,
+        # 8 x 4 rows): chunks 0-2 keep the short pass (2 runs empty), 3-7 drop.
+        pytest.param((4,) * 7 + (2,) + (98,),
+                     (9001, 2052, 260, 5003, 777, 4100, 3021, 600, 8000),
+                     16, 1, 0, id="short_rows_past_chunk0"),
+        pytest.param((4,) * 4 + (60,), (9001, 2052, 260, 5003, 3021), None, 1, 0,
+                     id="unchunked"),
+        pytest.param((4, 4, 4, 116), (8 * 9000 + 3, 8 * 2047 + 1, 260, 8 * 1000),
+                     64, 8, 3, id="dcp8_rank3_chunked"),
+        # No short request: the short pass is empty, result bit-identical.
+        pytest.param((40, 88), (5003, 9001), 64, 1, 0, id="prefill_only"),
+    ],
+)
+# fmt: on
+def test_mixed_short_split_matches_single_pass(T_list, S_list, chunk, cp_size,
+                                               cp_rank):
+    """TPU_STREAMIDX_MIXED_DECODE_SPLIT against the single 128-row MIXED pass.
+
+    Rows outside the short prefix must be bit-identical (same kernel). Short
+    rows are judged against a float64 oracle rather than the single pass: the
+    short pass reduces heads in f32 (bq 4), the 128-row pass over bf16-rounded
+    relu(q.k), so on dense random scores the two selections legitimately
+    differ near the k-th score; the split must be as close to the oracle as
+    the single pass, per position and in how far below the k-th score it
+    selects. 40 pages per sequence with a 16-page short block also guards the
+    scores row width (48 pages for that pass, 40 for the others: a row sized
+    for 40 let the short pass's last block overwrite the next row's first
+    2048 scores). The swap count against the single pass is printed. Positive
+    control: the
+    packed bq 4 kernel is in the HLO with the flag (once per chunk that can
+    hold short rows) and absent without it.
+    """
+    B = len(T_list)
+    page_size, H_I, D, k = 256, 32, 128, 512
+    inputs = _chunk_inputs(T_list, _fragmented_pages(B, 40), page_size, H_I, D)
+    kwargs = _chunk_call_kwargs(
+        inputs, T_list, S_list, k, 1, (1, 128, 128), (2, 2, 4), _SAL, chunk,
+        return_scores=True,
+    )
+    kwargs["q"] = kwargs["q"].astype(jnp.float8_e4m3fn)
+    kwargs["distribution"] = jnp.array(kwargs["distribution"], jnp.int32)
+    kwargs.update(skip_empty_decode=chunk is None,
+                  skip_empty_decode_chunked=chunk is not None,
+                  decode_pack=True, shared_meta=True)
+    if cp_size > 1:
+        kwargs.update(cp_size=cp_size, cp_rank=cp_rank, interleave_size=4)
+    split = dict(mixed_short_block=(4, 16))
+
+    name = "StreamIdxTC-m-bq_4-bkvp_16-sal-pk-pm"
+    big = "StreamIdxTC-m-bq_128-bkvp_4-sal"
+    off_hlo = streamindex_topk.lower(**kwargs).as_text()
+    on_hlo = streamindex_topk.lower(**kwargs, **split).as_text()
+    assert name not in off_hlo, "single pass already ran the short kernel"
+    n_tok = sum(T_list)
+    num_chunks = 1 if chunk is None else n_tok // chunk
+    # Chunk 0 sits behind the skip-empty cond, whose two branches both hold
+    # the MIXED passes, so it counts twice; every other chunk once.
+    want = sum(1 for m in range(num_chunks) if chunk is None or m * chunk < B * 4)
+    per_launch, rem = divmod(off_hlo.count(big), num_chunks + 1)
+    assert per_launch and not rem, "unexpected bq 128 launch census"
+    assert on_hlo.count(big) == off_hlo.count(big), "split dropped a bq 128 pass"
+    assert on_hlo.count(name) == per_launch * (want + 1), (
+        f"short kernel launches {on_hlo.count(name) / per_launch - 1:g},"
+        f" want {want} chunks")
+
+    off_idx, off_scores = (np.array(a) for a in streamindex_topk(**kwargs))
+    on_idx, on_scores = (np.array(a) for a in streamindex_topk(**kwargs, **split))
+    assert (off_idx[:n_tok] >= 0).any(), "vacuous: no index selected"
+    # Scores come back as raw f32 bits (what the SparseCore top-k compares).
+    on_f, off_f = (x.view(np.float32) if x.dtype == np.int32 else x
+                   for x in (on_scores, off_scores))
+
+    q_lens = np.array(T_list)
+    num_one = 0
+    while num_one < B and q_lens[num_one] == 1:
+        num_one += 1
+    n_short = num_one
+    while n_short < B and q_lens[n_short] <= 4:
+        n_short += 1
+    lo, hi = int(np.sum(q_lens[:num_one])), int(np.sum(q_lens[:n_short]))
+    rest = np.r_[0:lo, hi:n_tok]
+    np.testing.assert_array_equal(
+        on_idx[rest], off_idx[rest], err_msg="split changed non-short rows")
+    np.testing.assert_array_equal(
+        on_scores[rest].view(np.int32), off_scores[rest].view(np.int32),
+        err_msg="split changed non-short row scores")
+
+    if cp_size > 1:
+        # Rank-local positions; the global check lives in the DCP multichip
+        # test. Here: same selection size per row, and finite scores.
+        for t in range(lo, hi):
+            assert (on_idx[t] >= 0).sum() == (off_idx[t] >= 0).sum(), t
+        return
+
+    # Short rows against a float64 oracle over the values the kernel reads
+    # (fp8 q, f32 weights, dequantized fp8 keys), both passes judged the same
+    # way, relative to the row's k-th oracle score: the per-position score
+    # error (a misaligned or overwritten row is off by tens of percent; a
+    # sorted-list compare would not see it) and how far below the k-th oracle
+    # score the selection reaches. Neither pass is exact on TPU (up to a few
+    # percent on these random rows, with negative weights), so the split must
+    # be no worse than the single pass it replaces, within 1%.
+    q64 = np.array(kwargs["q"].astype(jnp.float32), np.float64)
+    w64 = inputs.weights.astype(np.float64)
+    cu = np.concatenate([[0], np.cumsum(T_list)])
+    pages = _fragmented_pages(B, 40)
+    report = []
+    for t in range(lo, hi):
+        b_seq = int(np.searchsorted(cu[1:], t, side="right"))
+        S = S_list[b_seq]
+        vis = S - T_list[b_seq] + (t - cu[b_seq]) + 1
+        kv = np.concatenate([inputs.dequantized_kv[p][:, 0] for p in pages[b_seq]])
+        kv = kv[:vis].astype(np.float64)
+        ref = (np.maximum(q64[t] @ kv.T, 0.0) * w64[t][:, None]).sum(0)
+        kth = np.sort(ref)[::-1][min(k, vis) - 1]
+        scale = max(1.0, abs(kth))
+        judged = {}
+        for tag, idx, sc in (("split", on_idx[t], on_f[t]),
+                             ("single", off_idx[t], off_f[t])):
+            sel = idx[idx >= 0]
+            assert len(sel) == min(k, vis), f"{tag} row {t}: {len(sel)} selected"
+            assert len(set(sel.tolist())) == len(sel), f"{tag} row {t}: dupes"
+            err = np.abs(sc[: len(sel)].astype(np.float64) - ref[sel]).max() / scale
+            worst = (kth - ref[sel].min()) / scale
+            judged[tag] = (err, worst)
+        (e_on, w_on), (e_off, w_off) = judged["split"], judged["single"]
+        swaps = len(set(on_idx[t].tolist()) ^ set(off_idx[t].tolist()))
+        report.append(f"t{t}: err {e_on:.3f}/{e_off:.3f} below-kth "
+                      f"{w_on:+.3f}/{w_off:+.3f} swaps {swaps}")
+        assert e_on <= 1.5 * e_off + 1e-2, f"split row {t} scores: {report[-1]}"
+        assert w_on <= 1.5 * max(w_off, 0.0) + 1e-2, (
+            f"split row {t} selection: {report[-1]}")
+    print("[mixed_short_split] split/single:", "; ".join(report))
 
 
 def main(argv):

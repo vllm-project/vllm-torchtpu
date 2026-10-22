@@ -157,6 +157,35 @@ def _streamidx_block_sizes(
     )
 
 
+def _streamidx_mixed_short_block(
+    num_tokens: int,
+    small_bucket_bq: int | None,
+    small_bucket_bkvp: int | None,
+    small_bucket_tokens: int,
+    decode_pack: bool,
+    split: bool,
+) -> tuple[int, int] | None:
+    """`streamindex_topk(mixed_short_block=...)` for a token bucket, or None.
+
+    TPU_STREAMIDX_MIXED_DECODE_SPLIT: a bucket above `small_bucket_tokens`
+    (the other side of `_streamidx_block_sizes`'s one `T > cap` gate, not a
+    new edge) runs its MIXED pass with a 128-row query block, so in a mixed
+    step every q_len gamma + 1 decode request scores 124 padding rows. Those
+    leading requests get the block sizes the largest small bucket uses (bq 4
+    packed under TPU_STREAMIDX_DECODE_PACK) in a pass of their own.
+    """
+    if not split or small_bucket_bq is None or num_tokens <= small_bucket_tokens:
+        return None
+    kv_pages, q_block = _streamidx_block_sizes(
+        small_bucket_tokens,
+        small_bucket_bq,
+        small_bucket_bkvp,
+        small_bucket_tokens,
+        decode_pack=decode_pack,
+    )
+    return q_block[2], kv_pages[2]
+
+
 _INDEXER_KV_CACHE_FALLBACK_LOGGED: set[tuple[str, str]] = set()
 _INDEXER_KV_CACHE_INFO_LOGGED: set[tuple[str, str, str, tuple[int, ...]]] = set()
 
@@ -583,6 +612,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         skip_empty_decode_chunked = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED
         mixed_bkvp = envs.TPU_STREAMIDX_MIXED_KV_PAGES
         decode_pack = envs.TPU_STREAMIDX_DECODE_PACK
+        mixed_decode_split = envs.TPU_STREAMIDX_MIXED_DECODE_SPLIT
         shared_meta = self._shared_meta
 
         def _streamidx_topk_jax(
@@ -665,6 +695,14 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 chunk_tokens=chunk_tokens,
                 decode_pack=decode_pack,
                 shared_meta=shared_meta,
+                mixed_short_block=_streamidx_mixed_short_block(
+                    q.shape[0],
+                    small_bucket_bq,
+                    small_bucket_bkvp,
+                    small_bucket_tokens,
+                    decode_pack,
+                    mixed_decode_split,
+                ),
             )
             return cache_kv, topk_indices
 
@@ -694,6 +732,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 skip_empty_decode_chunked,
                 mixed_bkvp,
                 decode_pack,
+                mixed_decode_split,
                 shared_meta,
                 kv_cache_mode,
             ),
@@ -746,6 +785,7 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
         skip_empty_decode_chunked = envs.TPU_STREAMIDX_SKIP_EMPTY_DECODE_CHUNKED
         mixed_bkvp = envs.TPU_STREAMIDX_MIXED_KV_PAGES
         decode_pack = envs.TPU_STREAMIDX_DECODE_PACK
+        mixed_decode_split = envs.TPU_STREAMIDX_MIXED_DECODE_SPLIT
         shared_meta = self._shared_meta
         global_group = None
         if envs.TPU_IDX_TOPK_SCHED_GROUPS:
@@ -857,6 +897,14 @@ class VllmTPUSparseAttnIndexer(SparseAttnIndexer):
                 small_all_gather=small_ag,
                 decode_pack=decode_pack,
                 shared_meta=shared_meta,
+                mixed_short_block=_streamidx_mixed_short_block(
+                    q.shape[0],
+                    small_bucket_bq,
+                    small_bucket_bkvp,
+                    small_bucket_tokens,
+                    decode_pack,
+                    mixed_decode_split,
+                ),
                 **overlap,
             )
             if qb_overlap:
@@ -1794,6 +1842,8 @@ class VllmTPUMLAAttention(MLAAttention):
         # gathering q every step -- that trade is the point of qrep.
         self.W_UK_T_dcp_qrep = None
         self.W_UK_T_dcp_qrep_scale = None
+        self.W_UV_dcp_qrep = None
+        self.W_UV_dcp_qrep_scale = None
         if self.dcp_q_replicate:
             dcp_group = get_dcp_group()
             if dcp_group is None or int(dcp_group.world_size) <= 1:
@@ -1808,6 +1858,16 @@ class VllmTPUMLAAttention(MLAAttention):
                 self.W_UK_T_dcp_qrep_scale = fresh_buffer(
                     dcp_group.all_gather(self.W_UK_T_scale.contiguous(), dim=0)
                 )
+            # The group's W_UV too, so W_UV can run before the merge
+            # (TPU_DCP_MLA_UV_BEFORE_MERGE).
+            if envs.TPU_DCP_MLA_UV_BEFORE_MERGE:
+                self.W_UV_dcp_qrep = fresh_buffer(
+                    dcp_group.all_gather(self.W_UV.contiguous(), dim=0)
+                )
+                if hasattr(self, "W_UV_scale"):
+                    self.W_UV_dcp_qrep_scale = fresh_buffer(
+                        dcp_group.all_gather(self.W_UV_scale.contiguous(), dim=0)
+                    )
 
         # TPU_MLA_ABSORB_TOKEN_MAJOR: register the absorb ops here, outside
         # Dynamo (building one takes a lock).
@@ -1823,7 +1883,15 @@ class VllmTPUMLAAttention(MLAAttention):
         # W_UK_T_dcp_qrep). Sparse DCP layers only -- the merge's only user.
         self.W_UV_dcp_vspace = None
         self.W_UV_dcp_vspace_scale = None
-        if envs.TPU_DCP_MERGE_VSPACE and self.dcp_q_replicate:
+        if (
+            envs.TPU_DCP_MERGE_VSPACE
+            and self.dcp_q_replicate
+            and self.W_UV_dcp_qrep is not None
+        ):
+            # TPU_DCP_MLA_UV_BEFORE_MERGE gathered the same buffer already.
+            self.W_UV_dcp_vspace = self.W_UV_dcp_qrep
+            self.W_UV_dcp_vspace_scale = self.W_UV_dcp_qrep_scale
+        elif envs.TPU_DCP_MERGE_VSPACE and self.dcp_q_replicate:
             dcp_group = get_dcp_group()
             assert dcp_group is not None
             self.W_UV_dcp_vspace = fresh_buffer(
@@ -1847,16 +1915,20 @@ class VllmTPUMLAAttention(MLAAttention):
             tensors = [self.W_UK_T, self.W_UV]
             if hasattr(self, "W_UK_T_scale"):
                 tensors.extend([self.W_UK_T_scale, self.W_UV_scale])
-            tensors.extend(
-                t
-                for t in (
-                    self.W_UK_T_dcp_qrep,
-                    self.W_UK_T_dcp_qrep_scale,
-                    self.W_UV_dcp_vspace,
-                    self.W_UV_dcp_vspace_scale,
-                )
-                if t is not None
+            extra = (
+                self.W_UK_T_dcp_qrep,
+                self.W_UK_T_dcp_qrep_scale,
+                self.W_UV_dcp_qrep,
+                self.W_UV_dcp_qrep_scale,
+                self.W_UV_dcp_vspace,
+                self.W_UV_dcp_vspace_scale,
             )
+            # The vspace buffers may alias the qrep ones; synchronize each once.
+            seen: set[int] = set()
+            for t in extra:
+                if t is not None and id(t) not in seen:
+                    seen.add(id(t))
+                    tensors.append(t)
             synchronize_tensors(tensors)
 
         impl = cast(PallasMLAttentionBackendImpl, self.impl)
@@ -2045,14 +2117,14 @@ class VllmTPUMultiHeadLatentAttentionWrapper(MultiHeadLatentAttentionWrapper):
         if self.decode_prologue and not envs.is_set("TPU_MLA_DECODE_PROLOGUE"):
             # On by default; a q head or q layout the kernel prologue cannot
             # take keeps the torch-side q rope unless the env was set.
-            self.decode_prologue = envs.TPU_DCP_MLA_SPLIT_Q_LSE and (
+            self.decode_prologue = envs.TPU_MLA_SPARSE_SPLIT_Q and (
                 self.qk_nope_head_dim,
                 self.qk_rope_head_dim,
             ) == (192, 64)
         if self.decode_prologue:
-            if not envs.TPU_DCP_MLA_SPLIT_Q_LSE:
+            if not envs.TPU_MLA_SPARSE_SPLIT_Q:
                 raise NotImplementedError(
-                    "TPU_MLA_DECODE_PROLOGUE needs TPU_DCP_MLA_SPLIT_Q_LSE"
+                    "TPU_MLA_DECODE_PROLOGUE needs TPU_MLA_SPARSE_SPLIT_Q"
                 )
             if (self.qk_nope_head_dim, self.qk_rope_head_dim) != (192, 64):
                 raise NotImplementedError(

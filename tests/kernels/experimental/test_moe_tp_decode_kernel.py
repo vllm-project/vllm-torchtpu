@@ -45,13 +45,14 @@ SMALL_EP = dict(h=2048, e=16, i=256, fs=128, topk=4, ep=4)
 # GLM-5.2-FP8 at EP 4 x TP 4 (TPU_MOE_EP_TP_SIZE=4 on 16 ranks): 64 experts
 # per rank at I = 2048 / 4 = 512.
 GLM52_EP4TP4 = dict(h=6144, e=256, i=512, fs=128, topk=8, ep=4)
-EP_CASES = ((16, 16), (32, 12), (64, 33), (16, 0))
+EP_CASES = ((16, 16), (32, 12), (64, 33), (128, 65), (16, 0))
 # (rows, n_valid) called directly: zero and full for 16 rows; fold, trim and
 # full for 32; fold (8, the most rows that fold), trim (16) and full with
-# padding (33, the fewest tokens only this bucket serves) for 64. Zero and
-# unpadded full run the same code at every row count, so 64 rows skip them
-# (the worker runs under a timeout); arming's all-reduce self-test runs both
-# at 64 rows on the device. The 16-row fold path runs through the adapter's
+# padding (33, the fewest tokens only this bucket serves) for 64; full with
+# padding (65, likewise) for 128. Zero and unpadded full run the same code at
+# every row count, so 64 and 128 rows skip them (the worker runs under a
+# timeout); arming's all-reduce self-test runs both at 64 and 128 rows on the
+# device. The 16-row fold path runs through the adapter's
 # op body (BODY_CASE), which derives n_valid from a padding mask.
 CASES = (
     (16, 0),
@@ -62,13 +63,15 @@ CASES = (
     (64, 8),
     (64, 16),
     (64, 33),
+    (128, 65),
 )
 BODY_CASE = (16, 7)
 # fast=True (TPU_MOE_TP_DECODE_FAST) on the plain-TP path (one ring item per
 # expert): bitwise against fast=False.
 FAST_CASES = ((16, 0), (16, 16), (32, 12))
-# A token count the kernel does not admit: the op body's psum path.
-CHAIN_ROWS = 128
+# A token count the kernel does not admit (above MAX_ROWS): the op body's psum
+# path.
+CHAIN_ROWS = 256
 # Kernel vs an f32 reference with dequantized weights and unquantized
 # activations, i.e. the kernel's FP8 activations and bf16 roundings: measured
 # rel-L2 0.044 to 0.046 and cos >= 0.9989 on these inputs.
@@ -108,7 +111,8 @@ def _glm52_ep_shapes(rows, ep=4):
 
 
 @pytest.mark.parametrize(
-    "rows, admitted", [(16, True), (32, True), (64, True), (48, False)]
+    "rows, admitted",
+    [(16, True), (32, True), (64, True), (128, True), (48, False), (256, False)],
 )
 def test_admits_an_expert_range_at_glm52_ep4_tp4_shapes(monkeypatch, rows, admitted):
     monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
@@ -132,12 +136,53 @@ def test_expert_range_kernel_name(monkeypatch):
 
 @pytest.mark.parametrize(
     "rows, admitted",
-    [(16, True), (32, True), (64, True), (8, False), (48, False), (128, False)],
+    [
+        (16, True),
+        (32, True),
+        (64, True),
+        (128, True),
+        (8, False),
+        (48, False),
+        (96, False),
+        (256, False),
+    ],
 )
 def test_admits_the_decode_buckets_at_glm52_shapes(monkeypatch, rows, admitted):
     monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
     shapes = _glm52_shapes(rows)
     assert kernel.can_use_moe_tp_decode(*shapes, topk=8, n_ranks=N_RANKS) is admitted
+
+
+@pytest.mark.parametrize("rows, admitted", [(64, True), (128, True), (256, False)])
+def test_admits_the_decode_buckets_at_glm52_ep16_shapes(monkeypatch, rows, admitted):
+    # The served high-concurrency layout: EP16 (TPU_MOE_EP_TP_SIZE=1), 16 whole
+    # experts per rank at I = 2048, routed over all 256.
+    monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
+    c = GLM52_EP4TP4
+    shapes = _shapes(rows, c["h"], 16, 2048, c["fs"], score_experts=c["e"])
+    assert kernel.can_use_moe_tp_decode(*shapes, topk=8, n_ranks=N_RANKS) is admitted
+
+
+def test_row_buckets_are_the_powers_of_two_up_to_the_cap():
+    # One gate, `MIN_ROWS <= m <= MAX_ROWS` over powers of two: no other row
+    # count is admitted, and ROW_BUCKETS lists exactly the admitted ones.
+    assert kernel.ROW_BUCKETS == (16, 32, 64, 128)
+    assert [m for m in range(1, 1025) if kernel.admits_rows(m)] == [16, 32, 64, 128]
+
+
+def test_vmem_plan_at_glm52_tp16(monkeypatch):
+    # The ring depth is the same at every admitted row count; 128 rows fits
+    # the 48 MiB cap (75 % of 64 MiB), 256 rows does not.
+    monkeypatch.setattr(pltpu, "get_tpu_info", _tpu7x)
+    info = _tpu7x()
+    h, e, i, fs = (GLM52_TP16[k] for k in ("h", "e", "i", "fs"))
+    mib = {}
+    for m in (16, 32, 64, 128, 256):
+        spec = all_reduce.make_spec(N_RANKS, m, h)
+        plan = kernel_impl._vmem_plan(m, h, i, e, fs, info, spec)
+        mib[m] = None if plan is None else round(plan[1] / 2**20, 1)
+    assert mib == {16: 25.2, 32: 27.9, 64: 33.7, 128: 45.2, 256: None}, mib
+    assert kernel_impl._NUM_BUFFERS == 6
 
 
 @pytest.mark.parametrize(
@@ -177,6 +222,12 @@ def test_row_paths_at_glm52_shapes(monkeypatch):
     ]
     assert all_reduce.selftest_row_counts(all_reduce.make_spec(16, 64, h)) == [
         64,
+        5,
+        16,
+        0,
+    ]
+    assert all_reduce.selftest_row_counts(all_reduce.make_spec(16, 128, h)) == [
+        128,
         5,
         16,
         0,

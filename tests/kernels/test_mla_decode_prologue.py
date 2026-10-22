@@ -269,7 +269,7 @@ INTERLEAVE = 4
 PAGES_PER_RANK = 24
 PAGES_PER_SEQ = 2  # virtual pages of PAGE_SIZE * dcp positions
 PROD_ENV = {
-    "TPU_DCP_MLA_SPLIT_Q_LSE": "1",
+    "TPU_MLA_SPARSE_SPLIT_Q": "1",
     "TPU_DCP_MLA_MASK_IN_KERNEL": "1",
     "TPU_DCP_MLA_FUSED_PREP": "1",
     "TPU_DCP_MLA_TOPK_CAP": "512",

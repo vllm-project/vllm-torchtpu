@@ -13,6 +13,8 @@
 # limitations under the License.
 """Tests for batch_tile_idx, bq_idx, and bkv_idx metadata (GDN v3 style)."""
 
+from unittest import mock
+
 import jax.numpy as jnp
 import numpy as np
 import pytest
@@ -489,10 +491,439 @@ class ChunkedMetadataTest(parameterized.TestCase):
         self.assertGreaterEqual(int(num_steps.sum()), 1)
         self.assertLessEqual(int(num_steps.sum()), meta_.bq_idx.shape[0])
 
+    @parameterized.named_parameters(
+        ("mns16_4096", 16, 4096),
+        ("mns32_4096", 32, 4096),
+        ("mns64_2048", 64, 2048),
+    )
+    def test_decode_chunk_sweep_fits_smem(self, max_num_seqs, max_num_tokens):
+        """The schedule is sized by the pass's work, not chunks x the pass.
+
+        Served shape (GLM-5.2 TP16 x DCP8): the single-sequence decode pass,
+        bq 1, 256-token chunks, 512 pages per seq at 2 pages per kv block.
+        Charging every chunk the whole pass made three s32[131072] arrays at
+        mns 32 x 4096 (and mns 64 x 2048), past the 1 MiB of SMEM the kernel
+        prefetches them into, and the server died compiling that bucket.
+        """
+        q_len, chunk_tokens = 1, 256
+        cu_q_lens = np.arange(max_num_seqs + 1) * q_len
+        starts = tuple(range(0, max_num_tokens, chunk_tokens))
+        meta_ = metadata.compute_metadata(
+            seq_lens=jnp.full((max_num_seqs,), 512 * 64, dtype=jnp.int32),
+            cu_q_lens=jnp.array(cu_q_lens, dtype=jnp.int32),
+            start_seq_idx=0,
+            end_seq_idx=max_num_seqs,
+            bq_sz=1,
+            bkv_sz=2 * 64,
+            pages_per_seq=512,
+            page_size=64,
+            max_num_tokens=max_num_tokens,
+            static_q_len=q_len,
+            seq_batch_size=1,
+            chunk_token_start=starts,
+            chunk_tokens=chunk_tokens,
+        )
+        max_steps = meta_.bq_idx.shape[0]
+        # Three s32 schedule arrays next to page_indices (mns x 512 s32).
+        smem = 3 * 4 * max_steps + 4 * max_num_seqs * 512
+        self.assertLessEqual(smem, 512 * 1024)
+        self.assertLessEqual(int(np.sum(np.array(meta_.num_steps))), max_steps)
+
+    def test_long_context_schedule_fits_in_smem(self):
+        """The DCP=2 / 1M cell that filled smem to the byte at 81920 steps.
+
+        Eight sequences of 512K local kv over 256-byte pages is
+        pages_per_seq=2048, so max_bkv is 1024 and the old per-chunk bound
+        asked for 8 * 10 * 1024 steps. Three int32 arrays of that length plus
+        the page table come to exactly 1 MiB, which is all of smem.
+        """
+        num_seqs = 8
+        pages_per_seq = 2048
+        meta_ = metadata.compute_metadata(
+            seq_lens=jnp.full((num_seqs,), 512 * 1024, dtype=jnp.int32),
+            cu_q_lens=jnp.arange(num_seqs + 1, dtype=jnp.int32) * 256,
+            start_seq_idx=0,
+            end_seq_idx=num_seqs,
+            bq_sz=128,
+            bkv_sz=512,
+            pages_per_seq=pages_per_seq,
+            page_size=256,
+            max_num_tokens=2048,
+            static_q_len=None,
+            seq_batch_size=1,
+            chunk_token_start=tuple(range(0, 2048, 256)),
+            chunk_tokens=256,
+        )
+        max_steps = meta_.bq_idx.shape[0]
+        self.assertGreaterEqual(max_steps, int(np.array(meta_.num_steps).sum()))
+        self.assertLess(max_steps, 81920)
+        smem_bytes = 3 * max_steps * 4 + num_seqs * pages_per_seq * 4
+        self.assertLess(smem_bytes, 1024 * 1024)
+
+    @parameterized.named_parameters(
+        ("one_chunk", (0,), 1024),
+        ("even_cuts", (0, 256, 512, 768), 256),
+        ("uneven_cuts", (0, 100, 600), 512),
+        ("more_chunks_than_tiles", tuple(range(0, 1024, 128)), 128),
+    )
+    def test_schedule_never_outruns_its_arrays(self, starts, chunk_tokens):
+        """The bound is load-bearing: num_steps is not clamped to max_steps."""
+        ragged = jnp.array((0, 100, 512, 1000, 1024), dtype=jnp.int32)
+        for seq_batch_size in (1, 2):
+            meta_ = self._chunk_meta(
+                starts,
+                chunk_tokens=chunk_tokens,
+                cu_q_lens=ragged,
+                seq_batch_size=seq_batch_size,
+            )
+            self.assertLessEqual(
+                int(np.array(meta_.num_steps).sum()), meta_.bq_idx.shape[0]
+            )
+
     def test_empty_pass_returns_a_zero_per_chunk(self):
         """The empty branch has to agree with the schedule branch on shape."""
         meta_ = self._chunk_meta((0, 256, 512), start_seq_idx=0, end_seq_idx=0)
         np.testing.assert_array_equal(np.array(meta_.num_steps), [0, 0, 0])
+
+
+class RaggedScheduleBoundTest(parameterized.TestCase):
+    """`max_steps` against ragged chunked schedules, with the slack taken out.
+
+    `max_steps` is rounded up to a multiple of 1024 and floored at 1024, so a
+    config with a handful of kv blocks always fits whatever the bound says.
+    Here every sequence fills all of its pages and a kv block is one page, so
+    every segment has exactly MAX_BKV = 1024 kv blocks: `max_steps` is then the
+    bq-block bound times 1024 with no rounding, and `sum(num_steps)` is the bq
+    blocks the schedule really uses times 1024. An undercount of a single bq
+    block anywhere fails.
+
+    None of this builds a kernel, so it is a CPU test. The smem check is
+    stubbed out: these caps are sized to test the arithmetic, not to fit smem,
+    and on a TPU host it would refuse the larger ones.
+    """
+
+    PAGE_SIZE = 16
+    PAGES_PER_SEQ = 1024
+    MAX_BKV = 1024  # bkv_sz == PAGE_SIZE, so one kv block per page.
+
+    def setUp(self):
+        super().setUp()
+        patcher = mock.patch.object(metadata, "_check_smem_budget")
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _meta(
+        self,
+        cu_q_lens,
+        starts,
+        chunk_tokens,
+        bq_sz,
+        seq_batch_size=1,
+        max_num_tokens=None,
+        start_seq_idx=0,
+        end_seq_idx=None,
+        static_q_len=None,
+    ):
+        num_seqs = len(cu_q_lens) - 1
+        return metadata.compute_metadata(
+            seq_lens=jnp.full(
+                (num_seqs,), self.PAGES_PER_SEQ * self.PAGE_SIZE, dtype=jnp.int32
+            ),
+            cu_q_lens=jnp.array(cu_q_lens, dtype=jnp.int32),
+            start_seq_idx=start_seq_idx,
+            end_seq_idx=num_seqs if end_seq_idx is None else end_seq_idx,
+            bq_sz=bq_sz,
+            bkv_sz=self.PAGE_SIZE,
+            pages_per_seq=self.PAGES_PER_SEQ,
+            page_size=self.PAGE_SIZE,
+            max_num_tokens=max_num_tokens or int(cu_q_lens[-1]),
+            static_q_len=static_q_len,
+            seq_batch_size=seq_batch_size,
+            chunk_token_start=tuple(starts),
+            chunk_tokens=chunk_tokens,
+        )
+
+    def _expected_num_steps(
+        self,
+        cu_q_lens,
+        starts,
+        chunk_tokens,
+        bq_sz,
+        seq_batch_size=1,
+        start_seq_idx=0,
+        end_seq_idx=None,
+    ):
+        """Steps per chunk from the definition, in numpy.
+
+        A tile is `seq_batch_size` consecutive sequences, live when its first
+        sequence is in `[start_seq_idx, end_seq_idx)`. Chunk `m` gives it the
+        tokens `[start, start + chunk_tokens) & [tile_start, tile_end)`, in bq
+        blocks `seq_batch_size * bq_sz` tokens wide, each paired with all
+        MAX_BKV kv blocks.
+        """
+        cu = np.array(cu_q_lens)
+        num_seqs = len(cu) - 1
+        end_seq_idx = num_seqs if end_seq_idx is None else end_seq_idx
+        span = seq_batch_size * bq_sz
+        out = []
+        for start in starts:
+            bq_blocks = 0
+            for first in range(0, num_seqs, seq_batch_size):
+                if not start_seq_idx <= first < end_seq_idx:
+                    continue
+                tok_lo = cu[first]
+                tok_hi = cu[min(first + seq_batch_size, num_seqs)]
+                lo = np.clip(start, tok_lo, tok_hi)
+                hi = np.clip(start + chunk_tokens, tok_lo, tok_hi)
+                bq_blocks += -(-(hi - lo) // span)
+            out.append(int(bq_blocks) * self.MAX_BKV)
+        return out
+
+    def _assert_fits(self, meta_, expected):
+        num_steps = np.array(meta_.num_steps)
+        np.testing.assert_array_equal(num_steps, expected)
+        self.assertLessEqual(int(num_steps.sum()), meta_.bq_idx.shape[0])
+        return int(num_steps.sum()) / meta_.bq_idx.shape[0]
+
+    def test_ragged_sweep_matches_definition_and_fits(self):
+        """Random ragged batches, chunked the way `streamindex_topk` chunks.
+
+        That is `range(0, max_num_tokens, chunk_tokens)`: disjoint chunks that
+        tile the token axis, which is the premise the seam count rests on.
+        """
+        rng = np.random.default_rng(0)
+        tightest = 0.0
+        for case in range(40):
+            seq_batch_size = int(rng.choice([1, 2, 4]))
+            num_seqs = seq_batch_size * int(rng.choice([1, 2, 3, 5]))
+            max_num_tokens = int(rng.choice([16, 64, 256]))
+            bq_sz = int(rng.choice([1, 4, 8, 32]))
+            chunk_tokens = int(
+                rng.choice([c for c in (1, 4, 16, 64) if c <= max_num_tokens])
+            )
+            # Real tokens may stop short of the padded bucket.
+            used_tokens = int(rng.choice([max_num_tokens, max_num_tokens - 3]))
+            if rng.random() < 0.5:
+                cuts = rng.choice(np.arange(1, used_tokens), num_seqs - 1)
+            else:
+                # Mostly 0/1-token sequences around one long one.
+                cuts = np.cumsum(rng.choice([0, 1, 1, 2], num_seqs - 1))
+            cu = np.concatenate([[0], np.sort(cuts), [used_tokens]])
+            cu = np.minimum(cu, used_tokens).astype(np.int32).tolist()
+            starts = range(0, max_num_tokens, chunk_tokens)
+            args = (cu, starts, chunk_tokens, bq_sz, seq_batch_size)
+            with self.subTest(case=case, args=args):
+                meta_ = self._meta(*args, max_num_tokens=max_num_tokens)
+                tightest = max(
+                    tightest, self._assert_fits(meta_, self._expected_num_steps(*args))
+                )
+        # A sweep that never comes near the bound would pass any bound.
+        self.assertGreater(tightest, 0.9)
+
+    def test_bound_is_one_bq_row_from_tight(self):
+        """The bound's slack on this batch is exactly one row of kv blocks.
+
+        Every (chunk, tile) pair here is a partial bq block, and the pair count
+        is num_chunks + max_seq_tiles - 1. The bound cannot do better than one
+        block short: the partial blocks' remainders sum to at least one span.
+        So an off-by-one in the seam count fails this test.
+        """
+        meta_ = self._meta((0, 2, 3, 12, 16), range(0, 16, 4), 4, 8, 2)
+        used = int(np.array(meta_.num_steps).sum())
+        self.assertEqual(meta_.bq_idx.shape[0] - used, self.MAX_BKV)
+
+    @parameterized.named_parameters(
+        # (cu_q_lens, chunk_tokens, bq_sz, seq_batch_size, max_num_tokens)
+        ("zero_len_seqs_between_cuts", (0, 5, 5, 5, 11, 11, 16), 4, 2, 1, 16),
+        ("decode_like_one_token_each", tuple(range(17)), 4, 8, 1, 16),
+        ("one_long_many_tiny", (0, 1, 2, 3, 4, 5, 6, 64), 8, 4, 1, 64),
+        ("tokens_stop_short_of_bucket", (0, 3, 9, 20, 29), 8, 4, 1, 64),
+        ("non_pow2_bucket", (0, 7, 19, 33, 48), 16, 8, 1, 48),
+        ("one_token_chunks", (0, 1, 3, 6, 10, 16), 1, 4, 1, 16),
+        ("tile_of_four_straddles_cuts", (0, 1, 2, 9, 10, 18, 25, 31, 32), 8, 2, 4, 32),
+        ("chunks_wider_than_bq_span", (0, 13, 14, 50, 64), 32, 4, 2, 64),
+    )
+    def test_adversarial_ragged_batches_fit(
+        self, cu_q_lens, chunk_tokens, bq_sz, seq_batch_size, max_num_tokens
+    ):
+        args = (
+            cu_q_lens,
+            range(0, max_num_tokens, chunk_tokens),
+            chunk_tokens,
+            bq_sz,
+            seq_batch_size,
+        )
+        self._assert_fits(
+            self._meta(*args, max_num_tokens=max_num_tokens),
+            self._expected_num_steps(*args),
+        )
+
+    @parameterized.named_parameters(
+        # A MIXED pass runs after the decode sequences: tiles below start skip.
+        ("mixed_pass_after_decode", 3, None),
+        ("pass_ending_early", 0, 4),
+        ("middle_slice", 2, 5),
+    )
+    def test_partial_pass_over_ragged_batch_fits(self, start_seq_idx, end_seq_idx):
+        cu = (0, 1, 2, 3, 9, 17, 18, 30, 32)
+        args = (cu, range(0, 32, 8), 8, 4, 1)
+        kw = dict(start_seq_idx=start_seq_idx, end_seq_idx=end_seq_idx)
+        self._assert_fits(
+            self._meta(*args, **kw), self._expected_num_steps(*args, **kw)
+        )
+
+    def test_long_context_ragged_batch_fits(self):
+        """The DCP=2 / 1M cell's shape (2048 tokens in 256-token chunks), ragged.
+
+        MAX_BKV = 1024 matches that cell's max_bkv, and the cuts fall inside bq
+        blocks rather than on them.
+        """
+        cu = (0, 1, 130, 300, 301, 777, 1100, 1500, 2048)
+        args = (cu, range(0, 2048, 256), 256, 128, 1)
+        self._assert_fits(self._meta(*args), self._expected_num_steps(*args))
+
+    @parameterized.named_parameters(
+        # `compute_metadata` takes any tuple of starts; these chunks overlap.
+        ("pr_uneven_cuts_shape", (0, 100, 600), 512, (0, 100, 512, 1000, 1024), 64),
+        ("dense_overlap", (17, 22, 33, 38, 66, 121), 64, (0, 115, 128), 1),
+        ("overlap_past_tokens", (0, 80, 120), 128, (0, 65, 77, 128), 8),
+    )
+    def test_overlapping_chunks_fit(self, starts, chunk_tokens, cu_q_lens, bq_sz):
+        """Overlapping chunks share tokens, so seams are no longer C + S - 1.
+
+        Each chunk still owes at most `per_chunk_bq` blocks, which is what the
+        `num_chunks * per_chunk_bq` term covers; the global term does not.
+        """
+        args = (cu_q_lens, starts, chunk_tokens, bq_sz, 1)
+        self._assert_fits(
+            self._meta(*args, max_num_tokens=cu_q_lens[-1]),
+            self._expected_num_steps(*args),
+        )
+
+    @parameterized.product(chunk_tokens=(2, 6, 12), seq_batch_size=(1, 4))
+    def test_decode_pass_with_seams_inside_tiles(self, chunk_tokens, seq_batch_size):
+        """static_q_len=1 is bounded by total_max_bq + num_chunks - 1.
+
+        64 one-token sequences under chunks narrower than a tile, so seams land
+        inside tiles; every seam must cost at most one extra bq block.
+        """
+        cu_q_lens = list(range(65))
+        starts = range(0, 96, chunk_tokens)
+        args = (cu_q_lens, starts, chunk_tokens, 1, seq_batch_size)
+        self._assert_fits(
+            self._meta(*args, max_num_tokens=96, static_q_len=1),
+            self._expected_num_steps(*args),
+        )
+
+
+class ServingShapeSmemTest(parameterized.TestCase):
+    """GLM-5.2 AgentX at concurrency 32, --max-num-seqs=64, against v7x smem.
+
+    1M context over 256-token pages at DCP=16 is 256 pages per sequence. The
+    three passes are the ones `streamindex_topk` runs with the indexer's
+    `num_queries_per_block=(1, 128, 128)`, `num_kv_pages_per_block=(2, 2, 2)`
+    and `decode_req_batch_size=4`, chunked by TPU_STREAMIDX_CHUNK_TOKENS=256.
+    `get_tpu_info` is pinned to v7x so the real smem check runs on CPU too.
+    """
+
+    NUM_SEQS = 64
+    PAGES_PER_SEQ = 256
+    PAGE_SIZE = 256
+    CHUNK_TOKENS = 256
+    SMEM_BYTES = 1024 * 1024
+
+    def setUp(self):
+        super().setUp()
+        v7x = mock.Mock(smem_capacity_bytes=self.SMEM_BYTES, num_lanes=128)
+        patcher = mock.patch.object(metadata.pltpu, "get_tpu_info", return_value=v7x)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def _passes(self, num_decode, num_total):
+        decode_end = num_decode // 4 * 4
+        return (
+            ("decode", 0, decode_end, dict(bq_sz=1, static_q_len=1, seq_batch_size=4)),
+            ("decode_rem", decode_end, num_decode, dict(bq_sz=1, static_q_len=1)),
+            ("mixed", num_decode, num_total, dict(bq_sz=128, static_q_len=None)),
+        )
+
+    @parameterized.named_parameters(
+        ("all_decode", 32, 0),
+        ("decode_tail", 31, 0),
+        ("decode_and_prefill", 31, 1),
+    )
+    def test_every_token_bucket_compiles_within_smem(self, num_decode, num_prefill):
+        num_total = num_decode + num_prefill
+        for max_num_tokens in [2**i for i in range(5, 13)]:
+            q_lens = [1] * num_decode
+            q_lens += [max_num_tokens - num_decode] * num_prefill
+            q_lens += [0] * (self.NUM_SEQS - num_total)
+            cu_q_lens = np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int32)
+            if max_num_tokens % self.CHUNK_TOKENS:
+                starts, chunk_tokens = (None,), max_num_tokens
+            else:
+                starts = tuple(range(0, max_num_tokens, self.CHUNK_TOKENS))
+                chunk_tokens = self.CHUNK_TOKENS
+            for name, start, end, block in self._passes(num_decode, num_total):
+                with self.subTest(tokens=max_num_tokens, pass_=name):
+                    meta_ = metadata.compute_metadata(
+                        seq_lens=jnp.full((self.NUM_SEQS,), 500_000, jnp.int32),
+                        cu_q_lens=jnp.array(cu_q_lens),
+                        start_seq_idx=start,
+                        end_seq_idx=end,
+                        bkv_sz=2 * self.PAGE_SIZE,
+                        pages_per_seq=self.PAGES_PER_SEQ,
+                        page_size=self.PAGE_SIZE,
+                        max_num_tokens=max_num_tokens,
+                        chunk_token_start=starts,
+                        chunk_tokens=chunk_tokens,
+                        cp_size=16,
+                        interleave_c=4,
+                        **block,
+                    )
+                    max_steps = meta_.bq_idx.shape[0]
+                    used = int(np.array(meta_.num_steps).sum())
+                    self.assertLessEqual(used, max_steps)
+                    page_table = self.NUM_SEQS * self.PAGES_PER_SEQ * 4
+                    self.assertLess(3 * max_steps * 4 + page_table, self.SMEM_BYTES)
+
+
+class SmemBudgetCheckTest(absltest.TestCase):
+    """`_check_smem_budget`: raise rather than clamp; skip with no TPU."""
+
+    def _meta(self):
+        return metadata.compute_metadata(
+            seq_lens=jnp.full((4,), 4096, dtype=jnp.int32),
+            cu_q_lens=jnp.array((0, 100, 512, 1000, 1024), dtype=jnp.int32),
+            start_seq_idx=0,
+            end_seq_idx=4,
+            bq_sz=64,
+            bkv_sz=128,
+            pages_per_seq=64,
+            page_size=64,
+            max_num_tokens=1024,
+            static_q_len=None,
+            seq_batch_size=1,
+            chunk_token_start=(0, 256, 512, 768),
+            chunk_tokens=256,
+        )
+
+    def test_over_budget_raises_with_the_knob(self):
+        with (
+            mock.patch.object(metadata, "generate_max_steps", return_value=512),
+            self.assertRaisesRegex(ValueError, "--block-size"),
+        ):
+            self._meta()
+
+    def test_at_budget_passes(self):
+        with mock.patch.object(metadata, "generate_max_steps", return_value=1024):
+            self.assertEqual(self._meta().bq_idx.shape[0], 1024)
+
+    def test_no_tpu_skips(self):
+        with mock.patch.object(
+            metadata, "generate_max_steps", side_effect=ValueError("no TPU")
+        ):
+            self.assertEqual(self._meta().bq_idx.shape[0], 1024)
 
 
 if __name__ == "__main__":

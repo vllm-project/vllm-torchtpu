@@ -68,7 +68,14 @@ from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
 
 FP8 = jnp.float8_e4m3fn
 FP8_MAX = float(jnp.finfo(FP8).max)
-ROW_BUCKETS = (16, 32, 64)
+# Row counts the kernel serves: the powers of two m with MIN_ROWS <= m <= MAX_ROWS
+# (admits_rows). Above MAX_ROWS the VMEM plan does not fit (256 rows at GLM-5.2
+# TP16 asks ~68 MiB of a 48 MiB cap); 128 rows asks ~45 MiB at the same ring.
+MIN_ROWS = 16
+MAX_ROWS = 128
+ROW_BUCKETS = tuple(
+    1 << k for k in range(MIN_ROWS.bit_length() - 1, MAX_ROWS.bit_length())
+)
 # router_topk's clamp floor, above the finfo.min that masks a pick.
 ROUTER_NEG = -3.0e38
 # _route_fast: routing keys are positive normal f32 bit patterns from here.
@@ -90,6 +97,11 @@ _N_CHUNK = 512
 _NUM_BUFFERS = 6
 # Intermediate columns per ring item (one MXU-wide gate and up chunk).
 _I_CHUNK = 128
+
+
+def admits_rows(m: int) -> bool:
+    """MIN_ROWS <= m <= MAX_ROWS, m a power of two (the ROW_BUCKETS)."""
+    return MIN_ROWS <= m <= MAX_ROWS and m & (m - 1) == 0
 
 
 def exact_in_bf16(value: float) -> bool:
@@ -203,7 +215,7 @@ def can_use_moe_tp_decode(
     m, h = x.shape
     experts, i, out = w2.shape
     num_experts, shared_inter = scores.shape[1], shared_w2.shape[0]
-    if m not in ROW_BUCKETS or scores.shape != (m, num_experts):
+    if not admits_rows(m) or scores.shape != (m, num_experts):
         return False
     # This rank's experts are a linear block of the router's num_experts
     # (experts == num_experts under plain TP).

@@ -80,11 +80,36 @@ def all_gather_q_nope_pe_heads(
     )
 
 
+def project_uv_heads(
+    partial: torch.Tensor,
+    w_uv: torch.Tensor,
+    w_uv_scale: torch.Tensor | None,
+    out_dtype: torch.dtype = torch.float32,
+) -> torch.Tensor:
+    """`[T, N, kv_lora_rank]` partial -> `[T, N, v_head_dim]` in `out_dtype`,
+    head n by W_UV[n] (TPU_DCP_MLA_UV_BEFORE_MERGE).
+
+    W_UV is linear and the merge weights are per (token, head), so projecting
+    each partial before the merge gives the same result as projecting after.
+    """
+    if out_dtype != torch.float32 and w_uv_scale is None:
+        # One MXU pass that writes the narrow dtype directly.
+        out = torch.bmm(partial.transpose(0, 1), w_uv.to(partial.dtype))
+        return out.transpose(0, 1).to(out_dtype)
+    # f32 operands make bmm return f32 (out_dtype is ignored on TPU). bf16/fp8
+    # convert exactly, so XLA still runs one bf16 MXU pass.
+    out = torch.bmm(partial.transpose(0, 1).to(torch.float32), w_uv.to(torch.float32))
+    if w_uv_scale is not None:
+        out = out * w_uv_scale.to(torch.float32)
+    return out.transpose(0, 1).to(out_dtype)
+
+
 def merge_lse_partials_scatter_heads(
     output: torch.Tensor,
     lse: torch.Tensor,
     is_backbone: bool = True,
     query_start_loc: torch.Tensor | None = None,
+    wire_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Combine this rank's partial attention output with its peers'.
 
@@ -123,6 +148,10 @@ def merge_lse_partials_scatter_heads(
         the real token count (so its last entry is that count). With
         TPU_DCP_LSE_MERGE_A2A_REAL_ROWS the packed all-to-all sends only the
         real tokens' rows; None keeps every padded row.
+      wire_dtype: the attention dtype a W_UV-projected f32 partial
+        (TPU_DCP_MLA_UV_BEFORE_MERGE) crosses in where the merge narrows
+        (backbone with TPU_DCP_RS_OUT_PRECISION: the all-to-all and the
+        unchunked reduce-scatter); None keeps `output.dtype`.
 
     Returns:
       `[num_tokens, tp_local_num_heads, kv_lora_rank]` in `output.dtype` --
@@ -139,13 +168,19 @@ def merge_lse_partials_scatter_heads(
     # bucket; comparing its token count would pin that graph to the first
     # size traced. `is_backbone` is checked before the token count, so the
     # drafter never compares it.
+    # A W_UV-projected f32 partial still crosses in the attention dtype.
+    narrow = envs.TPU_DCP_RS_OUT_PRECISION and is_backbone
     if (
         envs.TPU_DCP_LSE_MERGE_A2A
         and is_backbone
         and output.shape[0] <= envs.TPU_DCP_LSE_MERGE_A2A_MAX_TOKENS
     ):
         return merge_lse_partials_all_to_all(
-            output, lse, group, query_start_loc=query_start_loc
+            output,
+            lse,
+            group,
+            send_dtype=wire_dtype if narrow else None,
+            query_start_loc=query_start_loc,
         )
 
     # The drafter cannot compare the token count in torch, but JAX exports
@@ -166,8 +201,9 @@ def merge_lse_partials_scatter_heads(
     # Unchunked reduce-scatter buckets (above the a2a cap, below the chunk
     # gate): TPU_DCP_RS_OUT_PRECISION sends the weighted terms in the
     # output's dtype (bf16), as TPU_DCP_MERGE_RS_BF16=1 does for the chunked
-    # buckets. Backbone only; the drafter keeps f32 (upstream #1808).
-    rs_dtype = output.dtype if envs.TPU_DCP_RS_OUT_PRECISION and is_backbone else None
+    # buckets. Backbone only; the drafter keeps f32 (upstream #1808). A
+    # W_UV-projected f32 partial crosses in `wire_dtype` (upstream #1931).
+    rs_dtype = (wire_dtype or output.dtype) if narrow else None
     if rs_dtype is None:
         return _retain_rank(cp_lse_ag_out_rs(output, lse, group))
     return _retain_rank(cp_lse_ag_out_rs(output, lse, group, rs_dtype=rs_dtype))
@@ -546,18 +582,22 @@ def merge_lse_partials_all_to_all(
     output: torch.Tensor,
     lse: torch.Tensor,
     group: Any,
+    send_dtype: torch.dtype | None = None,
     query_start_loc: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Same result as the reduce-scatter merge, via all-to-all.
 
     Each rank sends head block `d` of its partial and lse to rank `d`, then
     merges its own heads locally in f32. Faster for small token counts.
+    `send_dtype` is the dtype the partial crosses in; None keeps its own.
     """
     world = int(group.world_size)
     num_tokens, num_heads, vdim = output.shape
     local = num_heads // world
     # Destination-major: [world, T, local, V] and [world, T, local].
     o_send = output.reshape(num_tokens, world, local, vdim).transpose(0, 1)
+    if send_dtype is not None:
+        o_send = o_send.to(send_dtype)
     l_send = lse.to(torch.float32).reshape(num_tokens, world, local).transpose(0, 1)
     if envs.TPU_DCP_LSE_MERGE_A2A_PACK and output.element_size() == 2:
         real_tokens = None
@@ -654,7 +694,7 @@ def send_layout_applies(
         and envs.TPU_DCP_LSE_MERGE_A2A
         and envs.TPU_DCP_LSE_MERGE_A2A_PACK
         and envs.TPU_DCP_LSE_MERGE_A2A_REAL_ROWS
-        and envs.TPU_DCP_MLA_SPLIT_Q_LSE
+        and envs.TPU_MLA_SPARSE_SPLIT_Q
         and envs.TPU_DCP_MLA_MASK_IN_KERNEL
         and is_backbone
         and dtype == torch.bfloat16

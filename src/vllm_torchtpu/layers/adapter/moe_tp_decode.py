@@ -4,7 +4,8 @@
 
 Under MoE tensor parallelism vLLM runs the shared expert, scales and adds the
 routed output, and all-reduces the sum over the TP group. For an armed layer
-one torch op does all of it: at the token counts the kernel admits (16, 32 and 64)
+one torch op does all of it: at the token counts the kernel admits (16, 32, 64
+and 128)
 one Pallas call per rank covers routing, the shared expert, the routed experts
 and the all-reduce; every other count runs the usual TP path (router top-k,
 fused_moe_func, the shared expert's linears) and a psum in the same exported
@@ -61,7 +62,7 @@ from vllm_torchtpu.distributed.ep_mesh import (
 )
 from vllm_torchtpu.kernels import router_gemm_hbm
 from vllm_torchtpu.kernels.experimental import moe_tp_decode as kernel
-from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce
+from vllm_torchtpu.kernels.experimental.moe_tp_decode import all_reduce, kernel_1763
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 from vllm_torchtpu.kernels.router_topk import select as router_select
 from vllm_torchtpu.kernels.router_topk import select_bias as router_select_bias
@@ -188,6 +189,10 @@ class _OpStatics:
     prefill_min_tokens: int | None = None
     # TPU_MOE_TP_DECODE_FAST: the kernel's fast schedule (same output bits).
     fast: bool = False
+    # TPU_MOE_TP_DECODE_GMM_QUANT: run upstream #1763's merged kernel
+    # (kernel_1763: routed experts quantize x per 512 columns as gmm_v2) in
+    # place of kernel.py; fast / hbm_operands do not apply to it.
+    gmm_quant: bool = False
     # TPU_MOE_TP_DECODE_HBM_OPERANDS: the kernel's 8 weight operands constrained
     # to HBM (it DMAs them itself; no XLA VMEM staging copy). Same bits.
     hbm_operands: bool = False
@@ -373,10 +378,11 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
         layer.w2_weight_scale_inv,
         *shared,
     )
+    impl = kernel_1763 if envs.TPU_MOE_TP_DECODE_GMM_QUANT else kernel
     rows = tuple(
         m
         for m in kernel.ROW_BUCKETS
-        if kernel.can_use_moe_tp_decode(
+        if impl.can_use_moe_tp_decode(
             jax.ShapeDtypeStruct((m, hidden), jnp.bfloat16),
             jax.ShapeDtypeStruct((m, experts), jnp.float32),
             *(_sds(t) for t in weights),
@@ -400,6 +406,7 @@ def _admit(runner, n_ranks: int) -> _Admitted | str:
         # The prefill kernel's weight ring holds whole experts: TP experts only.
         prefill_min_tokens=None if par.use_ep else prefill_min_tokens(),
         fast=bool(envs.TPU_MOE_TP_DECODE_FAST),
+        gmm_quant=bool(envs.TPU_MOE_TP_DECODE_GMM_QUANT),
     )
     return _Admitted(
         shared=shared,
@@ -491,6 +498,30 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
         n_valid = n - jnp.sum(is_pad.astype(jnp.int32))
         weights = (w13, w2, s13, s2, sw13, ss13, sw2, ss2)
         m = kernel.ROW_BUCKETS[0]
+        impl = kernel_1763 if statics.gmm_quant else kernel
+
+        def fused(xk, sk):
+            # TPU_MOE_TP_DECODE_GMM_QUANT: upstream #1763's merged kernel,
+            # which has no fast schedule or HBM-operand option.
+            extra = (
+                {}
+                if statics.gmm_quant
+                else dict(fast=statics.fast, hbm_operands=statics.hbm_operands)
+            )
+            return impl.moe_tp_decode(
+                xk,
+                sk,
+                bias,
+                n_valid,
+                rank.reshape(()),
+                *weights,
+                e0.reshape(()),
+                routed_scale=statics.routed_scale,
+                topk=statics.topk,
+                n_ranks=n_ranks,
+                **extra,
+            )
+
         if n < m:
             # A decode bucket below the kernel's smallest row bucket
             # (TPU_TOKEN_BUCKET_EXTRA=4,8): run the kernel on `m` rows, the
@@ -500,40 +531,14 @@ def _op_body(statics: _OpStatics, n_ranks: int, axis: str):
             # bucket's; the plain-XLA fallback below costs far more.
             xp = jnp.pad(x, ((0, m - n), (0, 0)))
             sp = jnp.pad(scores, ((0, m - n), (0, 0)))
-            if kernel.can_use_moe_tp_decode(
+            if impl.can_use_moe_tp_decode(
                 xp, sp, bias, *weights, topk=statics.topk, n_ranks=n_ranks
             ):
-                return kernel.moe_tp_decode(
-                    xp,
-                    sp,
-                    bias,
-                    n_valid,
-                    rank.reshape(()),
-                    *weights,
-                    e0.reshape(()),
-                    routed_scale=statics.routed_scale,
-                    topk=statics.topk,
-                    n_ranks=n_ranks,
-                    fast=statics.fast,
-                    hbm_operands=statics.hbm_operands,
-                )[:n]
-        if kernel.can_use_moe_tp_decode(
+                return fused(xp, sp)[:n]
+        if impl.can_use_moe_tp_decode(
             x, scores, bias, *weights, topk=statics.topk, n_ranks=n_ranks
         ):
-            return kernel.moe_tp_decode(
-                x,
-                scores,
-                bias,
-                n_valid,
-                rank.reshape(()),
-                *weights,
-                e0.reshape(()),
-                routed_scale=statics.routed_scale,
-                topk=statics.topk,
-                n_ranks=n_ranks,
-                fast=statics.fast,
-                hbm_operands=statics.hbm_operands,
-            )
+            return fused(x, scores)
         if statics.prefill_min_tokens is not None and n >= statics.prefill_min_tokens:
             # Prefill-sized steps: the fused MoE prefill kernel (shared +
             # routed_scale * routed, combine and all-reduce over `axis`) on

@@ -90,7 +90,13 @@ def _stub_config(
             decode_context_parallel_size=dcp,
             prefill_context_parallel_size=pcp,
         ),
-        kv_transfer_config=object() if connector else None,
+        kv_transfer_config=(
+            SimpleNamespace(kv_connector=connector)
+            if isinstance(connector, str)
+            else object()
+            if connector
+            else None
+        ),
     )
 
 
@@ -110,6 +116,13 @@ def test_resolve_gated_to_single_group_dcp():
     ):
         assert _resolve(mla, config) == (LOGICAL_BLOCK, LOGICAL_BLOCK)
     assert _resolve(mla, _stub_config(dcp=1)) == (BLOCK_SIZE, BLOCK_SIZE)
+    # CPU offloading connectors keep the fine unit; P/D connectors do not.
+    for name in ("TPURaidenOffloadingConnector", "OffloadingConnector"):
+        assert _resolve(mla, _stub_config(connector=name)) == (LOGICAL_BLOCK, UNIT)
+    assert _resolve(mla, _stub_config(connector="NixlConnector")) == (
+        LOGICAL_BLOCK,
+        LOGICAL_BLOCK,
+    )
     swa = SlidingWindowSpec(
         block_size=BLOCK_SIZE,
         num_kv_heads=1,

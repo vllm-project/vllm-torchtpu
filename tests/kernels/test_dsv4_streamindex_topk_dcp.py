@@ -954,3 +954,75 @@ def test_lane_operand_is_kept_on_every_bucket(q_len):
 
     exp = jax.export.export(jax.jit(fn))(*args, ids, lanes)
     assert len(exp.module_kept_var_idx) == len(args) + 2
+
+
+@pytest.mark.multichip
+@pytest.mark.parametrize("dcp_size", [2, 8])
+@pytest.mark.parametrize("chunk_tokens", [None, 64])
+def test_dcp_mixed_short_split(dcp_size, chunk_tokens):
+    """TPU_STREAMIDX_MIXED_DECODE_SPLIT under DCP: a mixed step (q_len 4/2
+    decodes, then a prefill chunk) with the short pass reassembles the
+    unsharded top-k of the same split call exactly, and leaves every row
+    outside the short prefix bit-identical to the single-pass DCP call."""
+    _need_devices(dcp_size)
+    rec, args, kwargs = _dcp_case(dcp_size, 31)
+    q, weights, shards = args[0], args[1], args[2]
+    q_lens = (4, 4, 4, 4, 4, 2, Q_LEN - 22)
+    seq_lens = (KV_LEN, KV_LEN - 1000, 9000, 20000, KV_LEN - 7, 5000, KV_LEN)
+    B = len(q_lens)
+    vpages = KV_LEN // (PAGE_SIZE * dcp_size)
+    cu = np.concatenate([[0], np.cumsum(q_lens)]).astype(np.int32)
+    meta = (
+        jnp.array(seq_lens, jnp.int32),
+        jnp.tile(jnp.arange(vpages, dtype=jnp.int32), B),
+        jnp.array(cu),
+        jnp.array([0, 0, B], jnp.int32),
+    )
+    dargs = (q, weights, shards, *meta)
+    kwargs["chunk_tokens"] = chunk_tokens
+    split = dict(mixed_short_block=(4, 2))
+
+    hlo_off = streamindex_topk_dcp.lower(*dargs, **kwargs).as_text()
+    hlo_on = streamindex_topk_dcp.lower(*dargs, **kwargs, **split).as_text()
+    assert "StreamIdxTC-m-bq_4-" in hlo_on, "short pass not built"
+    assert "StreamIdxTC-m-bq_4-" not in hlo_off
+
+    off = np.asarray(streamindex_topk_dcp(*dargs, **kwargs)).reshape(dcp_size, Q_LEN, K)
+    on = np.asarray(streamindex_topk_dcp(*dargs, **kwargs, **split)).reshape(
+        dcp_size, Q_LEN, K
+    )
+    np.testing.assert_array_equal(on[:, 22:], off[:, 22:])
+
+    pages = KV_LEN // PAGE_SIZE
+    reference = np.asarray(
+        streamindex_topk(
+            q,
+            weights,
+            rec.reshape(pages, PAGE_SIZE // 4, 4, WIDTH),
+            meta[0],
+            jnp.tile(jnp.arange(pages, dtype=jnp.int32), B),
+            meta[2],
+            meta[3],
+            k=K,
+            compression_ratio=1,
+            num_kv_pages_per_block=2,
+            num_queries_per_block=128,
+            **split,
+        )
+    )
+    for t in range(Q_LEN):
+        got = set()
+        for r in range(dcp_size):
+            row = on[r, t]
+            for local in row[row >= 0].tolist():
+                got.add(int(cp_local_to_global(local, r, dcp_size, 1)))
+        want = set(reference[t][reference[t] >= 0].tolist())
+        assert got == want, (
+            f"token {t}: {len(want - got)} missing, {len(got - want)} spurious"
+        )
+    # The short rows must also select (nearly) what the single pass selects;
+    # only bf16-vs-f32 near ties may swap.
+    for r in range(dcp_size):
+        for t in range(22):
+            a, b = set(on[r, t].tolist()), set(off[r, t].tolist())
+            assert len(a ^ b) <= 0.02 * K, f"rank {r} row {t}: {len(a ^ b)} swaps"

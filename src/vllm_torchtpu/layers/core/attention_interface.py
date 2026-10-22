@@ -941,6 +941,7 @@ def sparse_mla_attention(
         )
     cache_layout = nope_spec.layout.value
     chunk_kwargs = sparse_mla_chunk_kwargs()
+    packed_rope_kwargs = {"packed_rope": True} if rope_spec.packed_rope else {}
 
     def _sparse_mla_ragged_paged_attention(
         ql_nope,
@@ -999,6 +1000,7 @@ def sparse_mla_attention(
             k_scale=dequant_scale,
             cache_layout=cache_layout,
             **chunk_kwargs,
+            **packed_rope_kwargs,
         )
 
         lkv_dim = ql_nope.shape[-1]
@@ -1084,7 +1086,8 @@ def _pack_lane_dense(values: jax.Array, token_bytes: int) -> jax.Array:
     cache word). Built from lane slices of the 1-byte values, so XLA emits one
     lane-dense fusion; `pack_tokens`' [T, 4, band] reshape costs ~0.6 us of
     relayout per layer at decode sizes. Rows narrower than 128 words (rope:
-    32) are zero-padded to 128 lanes; the gather writes only the token's words.
+    32, or 16 under packed rope) are zero-padded to 128 lanes; the gather
+    writes only the token's words.
     """
     u8 = jax.lax.bitcast_convert_type(values, jnp.uint8)
     band = token_bytes // kv_cache_utils.WORD_BYTES
@@ -1139,10 +1142,16 @@ def kv_write_in_gather_supported(
 
     The fused-prep capped gather must run (SparseCore caches, a top-k wider
     than the cap `dcp_mla_topk_cap` resolves at this DCP size), a nope token
-    must be one 128-word row and a rope token one 32-word SparseCore row, and
-    the step at most 32 tokens (two subcore rounds; `FUSED_PREP_MAX_TOKENS`).
+    must be one 128-word row and a rope token one 32-word SparseCore row (16
+    words under packed rope), and the step at most 32 tokens (two subcore
+    rounds; `FUSED_PREP_MAX_TOKENS`).
     """
     topk_cap = dcp_mla_topk_cap(dcp_size)
+    rope_words = (
+        native_sc_gather.PACKED_ROPE_WORDS
+        if rope_spec.packed_rope
+        else native_sc_gather.ROPE_WORDS
+    )
     return (
         0 < num_tokens <= sparse_mla_kernel.FUSED_PREP_MAX_TOKENS
         and bool(topk_cap)
@@ -1151,8 +1160,8 @@ def kv_write_in_gather_supported(
         and rope_spec.layout is kv_cache_utils.KVCacheLayout.SPARSECORE
         and nope_spec.token_bytes // kv_cache_utils.WORD_BYTES == 128
         and nope_spec.shape[-1] == 128
-        and rope_spec.token_bytes // kv_cache_utils.WORD_BYTES == 32
-        and rope_spec.shape[-1] % 32 == 0
+        and rope_spec.token_bytes // kv_cache_utils.WORD_BYTES == rope_words
+        and rope_spec.shape[-1] % rope_words == 0
     )
 
 
@@ -1240,7 +1249,7 @@ def sparse_mla_attention_dcp(
         q head view `[num_tokens, num_heads, 256]` and this the per-token f32
         `[num_tokens, 2, 128]` rope table (`sparse_ragged_paged_attention`):
         the kernel ropes q_pe in VMEM, and on decode buckets also owns the lse
-        sentinel. Requires TPU_DCP_MLA_SPLIT_Q_LSE.
+        sentinel. Requires TPU_MLA_SPARSE_SPLIT_Q.
       kv_write_fault: test-only positive controls for
         TPU_MLA_KV_WRITE_IN_GATHER: `"wrong_owner"` (rows addressed as the
         next DCP rank's) or one of `native_sc_gather.WRITE_FAULTS`.
@@ -1331,8 +1340,8 @@ def sparse_mla_attention_dcp(
     )
     q_rope = q_rope_table is not None
     if q_rope:
-        if not envs.TPU_DCP_MLA_SPLIT_Q_LSE:
-            raise ValueError("q_rope_table requires TPU_DCP_MLA_SPLIT_Q_LSE")
+        if not envs.TPU_MLA_SPARSE_SPLIT_Q:
+            raise ValueError("q_rope_table requires TPU_MLA_SPARSE_SPLIT_Q")
         in_specs = in_specs + (P(None, None, None),)  # q_rope_table
     out_specs = (
         P(dcp_axis_name),  # nope cache shard
@@ -1376,6 +1385,7 @@ def sparse_mla_attention_dcp(
             f"got {nope_spec.layout.value} and {rope_spec.layout.value}"
         )
     cache_layout = nope_spec.layout.value
+    packed_rope_kwargs = {"packed_rope": True} if rope_spec.packed_rope else {}
 
     def _local(
         ql_nope,
@@ -1490,7 +1500,7 @@ def sparse_mla_attention_dcp(
 
         # Split q / lane-dense lse: the kernel joins q_nope and q_pe in VMEM
         # (no padded [T, H, 640] concat) and exports f32[T, H] lse directly.
-        split_q_lse = envs.TPU_DCP_MLA_SPLIT_Q_LSE
+        split_q_lse = envs.TPU_MLA_SPARSE_SPLIT_Q
         if split_q_lse:
             q, split_kwargs = ql_nope, {"q_pe": q_pe, "lse_lane_dense": True}
             if q_rope:
@@ -1618,6 +1628,7 @@ def sparse_mla_attention_dcp(
             out_pieces_gather_first=envs.TPU_DCP_MLA_MERGE_PIECES >= 3,
             **chunk_kwargs,
             **split_kwargs,
+            **packed_rope_kwargs,
         )
         output, lse = attn[:2]
         if kv_write is not None:

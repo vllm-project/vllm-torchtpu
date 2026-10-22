@@ -123,6 +123,23 @@ def is_cache_for_ds_v4(attn_module: AttentionLayerBase) -> bool:
     )
 
 
+def packed_rope_page_size_bytes(
+    attn_module: AttentionLayerBase, block_size: int, kv_cache_dtype: torch.dtype
+) -> int | None:
+    """A sparse MLA layer's page bytes under `TPU_SPARSE_MLA_PACKED_ROPE`.
+
+    None when the flag is off or the layer is not sparse, so the caller keeps
+    the padded `PallasMLAttentionBackend.get_kv_cache_page_size_bytes`.
+    """
+    if not envs.TPU_SPARSE_MLA_PACKED_ROPE or not getattr(
+        attn_module, "use_sparse", False
+    ):
+        return None
+    return PallasMLAttentionBackend.get_sparse_kv_cache_page_size_bytes(
+        block_size, attn_module.head_size, kv_cache_dtype
+    )
+
+
 def check_kv_caches_cover_block_ids(
     kv_caches: dict[str, torch.Tensor],
     kv_cache_tensors: Iterable[KVCacheTensor],
@@ -228,6 +245,9 @@ class KVCacheManager:
         # DSv4 layers whose specs must reach vLLM verbatim; see
         # `is_cache_for_ds_v4`.
         ds_v4_layers: set[str] = set()
+        # Sparse MLA layers sized for packed rope, which the normalizer's
+        # padded MLA page formula does not model.
+        packed_rope_layers: set[str] = set()
         for layer_name, attn_module in layers.items():
             # Linear Attention path
             if isinstance(attn_module, MambaBase):
@@ -338,6 +358,28 @@ class KVCacheManager:
             elif isinstance(attn_module, MLAAttention):
                 if layer_name in kv_cache_spec:
                     continue
+                packed_page_size = (
+                    None
+                    if self.runner._hybrid_uniform_page_size_bytes is not None
+                    else packed_rope_page_size_bytes(
+                        attn_module, block_size, self.runner.kv_cache_dtype
+                    )
+                )
+                if packed_page_size is not None:
+                    # Published as `customize_spec` would, but from the
+                    # (nope, rope) arrays actually allocated.
+                    kv_cache_spec[layer_name] = MLAAttentionSpec(
+                        block_size=block_size,
+                        num_kv_heads=1,
+                        head_size=attn_module.head_size,
+                        dtype=self.runner.kv_cache_dtype,
+                        cache_dtype_str=cache_dtype_str,
+                        page_size_padded=packed_page_size,
+                        num_head_slots=1,
+                        state_content_bytes=packed_page_size // block_size,
+                    )
+                    packed_rope_layers.add(layer_name)
+                    continue
                 page_size_padded = (
                     self.runner._hybrid_uniform_page_size_bytes
                     if self.runner._hybrid_uniform_page_size_bytes is not None
@@ -405,7 +447,7 @@ class KVCacheManager:
             kv_cache_spec,
             self.runner.kv_cache_dtype,
             enable_unified_kv_layout=self.runner._unified_kv_layout,
-            exempt_layers=ds_v4_layers,
+            exempt_layers=ds_v4_layers | packed_rope_layers,
             attention_backend=backend_cls,
         )
         if (
@@ -648,7 +690,10 @@ class KVCacheManager:
                 )
             elif isinstance(m, MLAAttention):
                 attn_page_sizes.add(
-                    PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
+                    packed_rope_page_size_bytes(
+                        m, block_size, self.runner.kv_cache_dtype
+                    )
+                    or PallasMLAttentionBackend.get_kv_cache_page_size_bytes(
                         block_size,
                         1,
                         m.head_size,

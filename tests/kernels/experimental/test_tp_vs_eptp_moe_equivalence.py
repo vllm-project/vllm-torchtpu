@@ -31,6 +31,7 @@ A RESULT json line carries every number. (No timings: a host-timed loop of an
 measures the layers.)
 """
 
+import dataclasses
 import json
 import math
 import os
@@ -57,7 +58,10 @@ EP = 4
 TP_IN_EP = N // EP
 NB = I_FULL // BLK
 F8 = jnp.float8_e4m3fn
-DECODE = [(4, 4), (8, 7), (16, 13), (32, 27), (64, 57)]
+DECODE = [(4, 4), (8, 7), (16, 13), (32, 27), (64, 57), (128, 117)]
+# Row counts at which each arm's kernel is also checked against the psum path
+# it replaced (_tp_chain + lax.psum, the same op body's fallback).
+VS_CHAIN = (64, 128)
 PREFILL = [(4096, 4000)]
 REF_ROWS = 256
 TOL = {"rel_l2": 0.06, "worst_row": 0.08, "tp_vs_ep": 0.06}
@@ -271,6 +275,23 @@ def _run_all():
             )
         )
 
+    def chain_program(statics):
+        # The op body's fallback at any token count: this rank's partial from
+        # the usual path, psummed (what an unadmitted bucket runs).
+        def body(x, scores, b, pad_mask, *rest):
+            *w, _rank, e0 = rest
+            is_pad = pad_mask[: x.shape[0]]
+            partial = adapter._tp_chain(
+                x, scores, b, is_pad, *w, statics, e0.reshape(())
+            )
+            return lax.psum(partial, "d")
+
+        return jax.jit(
+            jax.shard_map(
+                body, mesh=mesh, in_specs=specs, out_specs=P("d"), check_vma=False
+            )
+        )
+
     def operands(rows, n_valid, w):
         stacked, rank, e0 = w
         x, scores = layer.inputs(rows)
@@ -305,6 +326,10 @@ def _run_all():
     w_tp, w_ep, w_bad = weights("tp"), weights("ep"), weights("tp_bad_slice")
     res = {"tol": TOL, "cases": {}, "controls": {}}
     prog_tp, prog_ep, prog_bs = program(st_tp), program(st_ep), program(st_tp_bad_scale)
+    chain_tp, chain_ep = chain_program(st_tp), chain_program(st_ep)
+    # TPU_MOE_TP_DECODE_FAST (served on): the same output bits.
+    fast_tp = program(dataclasses.replace(st_tp, fast=True))
+    fast_ep = program(dataclasses.replace(st_ep, fast=True))
     for rows, n_valid in DECODE + PREFILL:
         ops_tp, x, scores = operands(rows, n_valid, w_tp)
         ops_ep, _, _ = operands(rows, n_valid, w_ep)
@@ -342,6 +367,30 @@ def _run_all():
             "kernels_ep": kernels_in(prog_ep, ops_ep),
             "seconds": round(time.monotonic() - t0, 1),
         }
+        if rows in VS_CHAIN:
+            # Fused kernel vs the unfused path on the same rows (valid rows;
+            # the psum path runs the shared expert on padded rows).
+            for arm, prog, ops, out in (
+                ("tp", chain_tp, ops_tp, out_tp),
+                ("ep", chain_ep, ops_ep, out_ep),
+            ):
+                fast_prog = fast_tp if arm == "tp" else fast_ep
+                fast_out, _ = run(fast_prog, ops, rows)
+                case[f"{arm}_fast_bitwise"] = bool(
+                    np.array_equal(fast_out.view(np.uint32), out.view(np.uint32))
+                )
+                ref, same = run(prog, ops, rows)
+                got = out[0, :n_valid]
+                want_c = ref[0, :n_valid]
+                case[f"{arm}_kernel_vs_chain"] = dict(
+                    _metrics(got.astype(np.float64), want_c.astype(np.float64)),
+                    bitwise=bool(
+                        np.array_equal(got.view(np.uint32), want_c.view(np.uint32))
+                    ),
+                    chain_ranks_identical=same,
+                    chain_vs_ref=_metrics(ref[0, idx].astype(np.float64), want),
+                    chain_kernels=kernels_in(prog, ops),
+                )
         res["cases"][str(rows)] = case
         print("CASE", rows, json.dumps(case), flush=True)
         if rows in (16, 4096):
@@ -354,8 +403,52 @@ def _run_all():
             res["controls"][f"rank3_wrong_tp_slice@{rows}"] = _metrics(
                 bad[0, idx].astype(np.float64), want
             )
+    res["selftest"] = _selftest_all_buckets(mesh)
     print("RESULT " + json.dumps(res), flush=True)
     return res
+
+
+def _selftest_all_buckets(mesh):
+    """Arming's all-reduce self-test (all_reduce.standalone over every row path
+    of selftest_row_counts) at every ROW_BUCKETS entry, on the real ranks:
+    {"rows": [failing n_valid, ...]}."""
+    from vllm_torchtpu.kernels.experimental.moe_tp_decode import (
+        ROW_BUCKETS,
+        all_reduce,
+    )
+
+    per = NamedSharding(mesh, P("d"))
+    rank = jax.device_put(jnp.arange(N, dtype=jnp.int32).reshape(N, 1), per)
+    out = {}
+    for m in ROW_BUCKETS:
+        spec = all_reduce.make_spec(N, m, H)
+        call = all_reduce.standalone(spec)
+
+        def body(x, r, nv, call=call):
+            meta = jnp.stack([nv.reshape(()), r.reshape(())]).astype(jnp.int32)
+            return call(meta, x)
+
+        prog = jax.jit(
+            jax.shard_map(
+                body,
+                mesh=mesh,
+                in_specs=(P("d"), P("d"), P()),
+                out_specs=P("d"),
+                check_vma=False,
+            )
+        )
+        x = all_reduce.selftest_inputs(spec)
+        xs = jax.device_put(jnp.asarray(x.reshape(N * m, -1), jnp.bfloat16), per)
+        bad = []
+        for nv in all_reduce.selftest_row_counts(spec):
+            got = np.asarray(
+                jax.block_until_ready(prog(xs, rank, jnp.asarray([nv], jnp.int32)))
+            ).astype(np.float32)
+            got = got.reshape(N, m, -1)
+            if not all(all_reduce.selftest_ok(spec, x, got[r], nv) for r in range(N)):
+                bad.append(nv)
+        out[str(m)] = {"row_counts": all_reduce.selftest_row_counts(spec), "bad": bad}
+    return out
 
 
 @pytest.fixture(scope="module")
@@ -383,6 +476,32 @@ def test_the_tp_arm_runs_its_kernels(result, rows):
         assert k["fused_moe_prefill"] > 0 and k["moe_tp_decode"] == 0, k
     else:
         assert k["moe_tp_decode"] > 0 and k["fused_moe_prefill"] == 0, k
+
+
+@pytest.mark.parametrize("rows", [r for r, _ in DECODE])
+def test_the_ep_arm_runs_its_kernel_at_decode_buckets(result, rows):
+    # Every decode bucket up to the kernel's MAX_ROWS (128) runs the
+    # expert-range kernel, none falls back to the psum path.
+    k = result["cases"][str(rows)]["kernels_ep"]
+    assert k["moe_tp_decode"] > 0, k
+
+
+@pytest.mark.parametrize("rows", VS_CHAIN)
+def test_kernel_matches_the_psum_path_it_replaces(result, rows):
+    c = result["cases"][str(rows)]
+    for arm in ("tp", "ep"):
+        v = c[f"{arm}_kernel_vs_chain"]
+        assert c[f"{arm}_fast_bitwise"], arm
+        assert v["chain_kernels"]["moe_tp_decode"] == 0, v
+        assert v["chain_ranks_identical"], v
+        assert _passes(v["chain_vs_ref"]), v
+        assert v["rel_l2"] <= TOL["tp_vs_ep"], v
+
+
+def test_all_reduce_selftest_at_every_bucket(result):
+    st = result["selftest"]
+    assert "128" in st, st
+    assert all(not v["bad"] for v in st.values()), st
 
 
 def test_fault_controls_fail_the_gate(result):

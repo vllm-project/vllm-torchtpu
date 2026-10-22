@@ -665,3 +665,24 @@ def test_streamidx_shared_meta_is_off_for_the_mtp_indexer(monkeypatch, flag):
         )
         is flag
     )
+
+
+def test_streamidx_mixed_short_block():
+    """TPU_STREAMIDX_MIXED_DECODE_SPLIT: only buckets above the small-bucket cap
+    (the same `T > cap` edge), with the largest small bucket's MIXED sizes."""
+    from vllm_torchtpu.layers.adapter.custom_ops.mla_attention_op import (
+        _streamidx_mixed_short_block,
+    )
+
+    # (num_tokens, bq, bkvp, cap, decode_pack, split)
+    assert _streamidx_mixed_short_block(4096, 4, None, 256, True, True) == (4, 16)
+    assert _streamidx_mixed_short_block(512, 4, None, 256, True, True) == (4, 16)
+    assert _streamidx_mixed_short_block(4096, 4, None, 8, True, True) == (4, 32)
+    assert _streamidx_mixed_short_block(4096, 4, 32, 256, True, True) == (4, 32)
+    assert _streamidx_mixed_short_block(4096, 4, None, 64, False, True) == (4, 8)
+    # At or below the cap the bucket already runs bq 4: no second pass.
+    assert _streamidx_mixed_short_block(256, 4, None, 256, True, True) is None
+    assert _streamidx_mixed_short_block(64, 4, None, 256, True, True) is None
+    # Kill switch, and no small-bucket bq.
+    assert _streamidx_mixed_short_block(4096, 4, None, 256, True, False) is None
+    assert _streamidx_mixed_short_block(4096, None, None, 256, True, True) is None

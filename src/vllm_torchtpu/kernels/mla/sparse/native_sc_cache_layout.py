@@ -25,6 +25,9 @@ import numpy as np
 NOPE_SUBROWS = 4
 LANE_BYTES = 128
 ROPE_WORDS = LANE_BYTES // np.dtype(np.uint32).itemsize
+# Packed rope (`TPU_SPARSE_MLA_PACKED_ROPE`): the 64 fp8 bytes alone.
+PACKED_ROPE_BYTES = 64
+PACKED_ROPE_WORDS = PACKED_ROPE_BYTES // np.dtype(np.uint32).itemsize
 
 
 def _require_u8(name: str, value: np.ndarray, suffix: tuple[int, ...]) -> np.ndarray:
@@ -97,6 +100,28 @@ def unpack_rope_banded(rope_i32: np.ndarray) -> np.ndarray:
         banded.swapaxes(-2, -1).reshape(
             *rope_i32.shape[:-2], groups, NOPE_SUBROWS, LANE_BYTES
         )
+    )
+
+
+def pack_rope_packed(rope_u8: np.ndarray) -> np.ndarray:
+    """Pack ``[..., token, 64] u8`` as eight-token ``[..., token / 8, 128] u32``.
+
+    ``word[token, w].byte[band] = rope_u8[token, 16 * band + w]``: token ``t``
+    owns words ``[16 t, 16 t + 16)`` of the flat cache, so an SC gather reads
+    exactly 64 bytes per selected token.
+    """
+    rope_u8 = _require_u8("rope_u8", rope_u8, (PACKED_ROPE_BYTES,))
+    tokens = rope_u8.shape[-2]
+    tokens_per_row = LANE_BYTES // PACKED_ROPE_WORDS
+    if tokens % tokens_per_row:
+        raise ValueError(f"{tokens} tokens do not fill {tokens_per_row}-token rows")
+    banded = np.ascontiguousarray(
+        rope_u8.reshape(*rope_u8.shape[:-1], NOPE_SUBROWS, PACKED_ROPE_WORDS).swapaxes(
+            -2, -1
+        )
+    )
+    return banded.view(np.uint32).reshape(
+        *rope_u8.shape[:-2], tokens // tokens_per_row, LANE_BYTES
     )
 
 
