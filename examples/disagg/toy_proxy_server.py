@@ -4,12 +4,14 @@
 import argparse
 import asyncio
 import codecs
+import hashlib
 import itertools
 import logging
 import os
 import threading
 import time
 import uuid
+from collections import OrderedDict
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -19,6 +21,333 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.DEBUG)
+
+
+class _PrefixAffinityRouter:
+    """Prefix-hash sticky router across multiple prefill servers (e.g., 2P1D).
+
+    Computes cumulative 8-byte blake2b digests over fixed-size prompt byte
+    chunks and routes multi-turn conversation extensions to the prefill server
+    that already holds their cached KV + GDN blocks, falling back to least
+    in-flight load balancing on cold conversations or when a prefill server's
+    in-flight queue exceeds ``min(inflight) + slack``.
+
+    With ``max_sessions`` > 0 the router also models each server's KV cache as
+    an LRU of that many conversations (a 397B prefill leg holds about 54
+    contexts of 92k tokens without a host tier, about 240 with one). A cold
+    conversation goes to the server with the fewest resident conversations,
+    and a conversation whose modelled residency was evicted is routed as cold
+    again, so the chunk owners never point at KV that the server has dropped.
+    With ``saturated_inflight`` > 0 the slack check is skipped while every
+    server has at least that many requests in flight: a cold placement there
+    costs a full re-prefill, which is worse than queueing behind the owner.
+
+    ``load_metric`` picks the per-server load that the slack check and the
+    non-sticky placement compare: ``inflight`` counts requests from route()
+    to done(), ``running`` counts only those between start_running() and
+    done(). A decode leg uses ``running``: its batch is the requests it is
+    decoding, while a request still in the prefill hop holds no decode slot.
+    Ties fall back to the in-flight count, then to the number placed.
+    """
+
+    def __init__(
+        self,
+        n: int,
+        chunk: int = 1024,
+        min_frac: float = 0.5,
+        slack: int = 8,
+        max_sessions: int = 0,
+        saturated_inflight: int = 0,
+        load_metric: str = "inflight",
+    ) -> None:
+        if load_metric not in ("inflight", "running"):
+            raise ValueError(
+                f"load_metric must be inflight or running, got {load_metric!r}"
+            )
+        self.n = n
+        self.load_metric = load_metric
+        self.chunk = max(64, chunk)
+        self.min_frac = min_frac
+        self.slack = slack
+        self.max_sessions = max(0, max_sessions)
+        self.saturated_inflight = max(0, saturated_inflight)
+        self._lock = threading.Lock()
+        self.owners: dict[bytes, int] = {}
+        self.inflight = [0] * n
+        self.running = [0] * n
+        self.placed = [0] * n
+        self.sticky = 0
+        self.sticky_saturated = 0
+        self.cold = 0
+        # Residency model: digest -> conversation id, conversation id -> rank
+        # holding its KV (None once evicted), and per rank an LRU of resident
+        # conversation ids.
+        self.session_of: dict[bytes, int] = {}
+        self.session_rank: dict[int, int | None] = {}
+        self.resident: list[OrderedDict[int, float]] = [OrderedDict() for _ in range(n)]
+        self.evicted = 0
+        self.rerouted = 0
+        self._next_session = 0
+
+    @staticmethod
+    def extract_text(body: dict[str, Any]) -> str:
+        if msgs := body.get("messages"):
+            parts: list[str] = []
+            for m in msgs:
+                if not isinstance(m, dict):
+                    continue
+                role = m.get("role", "")
+                c = m.get("content", "")
+                if isinstance(c, str):
+                    parts.append(f"{role}:{c}")
+                elif isinstance(c, list):
+                    sub = "".join(p.get("text", "") for p in c if isinstance(p, dict))
+                    parts.append(f"{role}:{sub}")
+            return "\n".join(parts)
+        p = body.get("prompt", "")
+        if isinstance(p, str):
+            return p
+        if isinstance(p, list):
+            if p and isinstance(p[0], int):
+                return ",".join(map(str, p))
+            return "\n".join(str(x) for x in p)
+        return ""
+
+    def hashes(self, text: str) -> list[bytes]:
+        raw = text.encode("utf-8", errors="ignore")
+        out: list[bytes] = []
+        h = hashlib.blake2b(digest_size=8)
+        for i in range(0, len(raw) - self.chunk + 1, self.chunk):
+            h.update(raw[i : i + self.chunk])
+            out.append(h.digest())
+        return out
+
+    def route(self, hs: list[bytes]) -> tuple[int, bool]:
+        with self._lock:
+            best_rank: int | None = None
+            matched = 0
+            sid: int | None = None
+            for i in range(len(hs) - 1, -1, -1):
+                owner = self.owners.get(hs[i])
+                if owner is not None:
+                    best_rank = owner
+                    matched = i + 1
+                    sid = self.session_of.get(hs[i])
+                    break
+            known = best_rank is not None and hs and matched >= len(hs) * self.min_frac
+            # The owner only counts while the conversation is still resident
+            # in the modelled cache of that server.
+            if (
+                self.max_sessions > 0
+                and known
+                and (sid is None or self.session_rank.get(sid) != best_rank)
+            ):
+                known = False
+                self.rerouted += 1
+            load = self.running if self.load_metric == "running" else self.inflight
+            lo = min(load)
+            saturated = (
+                self.saturated_inflight > 0
+                and min(self.inflight) >= self.saturated_inflight
+            )
+            if known and (saturated or load[best_rank] <= lo + self.slack):
+                rank = best_rank
+                is_sticky = True
+                self.sticky += 1
+                if saturated and load[best_rank] > lo + self.slack:
+                    self.sticky_saturated += 1
+            else:
+                if self.max_sessions > 0:
+                    rank = min(
+                        range(self.n),
+                        key=lambda r: (
+                            len(self.resident[r]),
+                            load[r],
+                            self.inflight[r],
+                            self.placed[r],
+                            r,
+                        ),
+                    )
+                else:
+                    rank = min(
+                        range(self.n),
+                        key=lambda r: (load[r], self.inflight[r], self.placed[r], r),
+                    )
+                is_sticky = False
+                self.cold += 1
+            if sid is None:
+                sid = self._next_session
+                self._next_session += 1
+            for d in hs:
+                self.owners[d] = rank
+                self.session_of[d] = sid
+            self._touch_session(sid, rank)
+            self.inflight[rank] += 1
+            self.placed[rank] += 1
+            total = self.sticky + self.cold
+            if total % 64 == 0:
+                print(
+                    f"PERF PROXY prefix_router | total={total} "
+                    f"sticky={self.sticky} ({100.0 * self.sticky / total:.1f}%) "
+                    f"sticky_saturated={self.sticky_saturated} "
+                    f"cold={self.cold} rerouted={self.rerouted} placed={self.placed} "
+                    f"inflight={self.inflight} unique_chunks={len(self.owners)} "
+                    f"resident={[len(r) for r in self.resident]} "
+                    f"evicted={self.evicted} sessions={self._next_session} "
+                    f"running={self.running} load_metric={self.load_metric}",
+                    flush=True,
+                )
+            return rank, is_sticky
+
+    def _touch_session(self, sid: int, rank: int) -> None:
+        """Moves the conversation to rank's LRU head, evicting past max_sessions."""
+        prev = self.session_rank.get(sid)
+        if prev is not None and prev != rank:
+            self.resident[prev].pop(sid, None)
+        self.session_rank[sid] = rank
+        lru = self.resident[rank]
+        lru[sid] = time.monotonic()
+        lru.move_to_end(sid)
+        if self.max_sessions > 0:
+            while len(lru) > self.max_sessions:
+                old_sid, _ = lru.popitem(last=False)
+                self.session_rank[old_sid] = None
+                self.evicted += 1
+
+    def start_running(self, rank: int) -> None:
+        """Counts a request routed to ``rank`` as running there."""
+        with self._lock:
+            self.running[rank] += 1
+
+    def done(self, rank: int, was_running: bool = False) -> None:
+        with self._lock:
+            self.inflight[rank] = max(0, self.inflight[rank] - 1)
+            if was_running:
+                self.running[rank] = max(0, self.running[rank] - 1)
+
+    def stats(self) -> dict[str, Any]:
+        with self._lock:
+            return {
+                "placed": list(self.placed),
+                "inflight": list(self.inflight),
+                "running": list(self.running),
+                "load_metric": self.load_metric,
+                "sticky": self.sticky,
+                "sticky_saturated": self.sticky_saturated,
+                "cold": self.cold,
+                "rerouted": self.rerouted,
+                "unique_chunks": len(self.owners),
+                "sessions": self._next_session,
+                "resident": [len(r) for r in self.resident],
+                "evicted": self.evicted,
+            }
+
+
+class _AdmissionBudget:
+    """Bounds the requests one backend leg holds, by count and by tokens.
+
+    A request takes ``n_tokens`` of the budget when admitted and gives them
+    back when released; ``adjust`` corrects an estimate once the real prompt
+    length is known. Either limit at 0 is unlimited. A request larger than the
+    whole token budget is admitted only when the leg is empty, so a single
+    long context never deadlocks the leg.
+    """
+
+    def __init__(self, name: str, max_count: int, max_tokens: int) -> None:
+        self.name = name
+        self.max_count = max(0, max_count)
+        self.max_tokens = max(0, max_tokens)
+        self.count = 0
+        self.tokens = 0
+        self.waiting = 0
+        self.admitted = 0
+        self._cond = asyncio.Condition()
+
+    @property
+    def enabled(self) -> bool:
+        return self.max_count > 0 or self.max_tokens > 0
+
+    def _fits(self, n_tokens: int) -> bool:
+        if self.max_count > 0 and self.count >= self.max_count:
+            return False
+        if self.max_tokens > 0 and self.count > 0:
+            return self.tokens + n_tokens <= self.max_tokens
+        return True
+
+    async def acquire(self, n_tokens: int) -> float:
+        """Waits for room, takes it, and returns the wait in milliseconds."""
+        t0 = time.perf_counter()
+        async with self._cond:
+            self.waiting += 1
+            try:
+                await self._cond.wait_for(lambda: self._fits(n_tokens))
+            finally:
+                self.waiting -= 1
+            self.count += 1
+            self.tokens += n_tokens
+            self.admitted += 1
+        return (time.perf_counter() - t0) * 1000.0
+
+    async def release(self, n_tokens: int) -> None:
+        async with self._cond:
+            self.count = max(0, self.count - 1)
+            self.tokens = max(0, self.tokens - n_tokens)
+            self._cond.notify_all()
+
+    async def adjust(self, delta_tokens: int) -> None:
+        if delta_tokens == 0:
+            return
+        async with self._cond:
+            self.tokens = max(0, self.tokens + delta_tokens)
+            if delta_tokens < 0:
+                self._cond.notify_all()
+
+    def describe(self) -> str:
+        return (
+            f"{self.name} inflight={self.count} tokens={self.tokens} "
+            f"waiting={self.waiting} admitted={self.admitted}"
+        )
+
+    def stats(self) -> dict[str, Any]:
+        return {
+            "max_count": self.max_count,
+            "max_tokens": self.max_tokens,
+            "inflight": self.count,
+            "tokens": self.tokens,
+            "waiting": self.waiting,
+            "admitted": self.admitted,
+        }
+
+
+def _estimate_prompt_tokens(text: str, bytes_per_token: float) -> int:
+    """Pre-prefill prompt length estimate from the request bytes."""
+    raw = len(text.encode("utf-8", errors="ignore"))
+    return max(1, int(raw / max(0.5, bytes_per_token)))
+
+
+def _expected_output_tokens(req_data: dict, default: int) -> int:
+    for key in ("max_completion_tokens", "max_tokens"):
+        v = req_data.get(key)
+        if isinstance(v, int) and v > 0:
+            return min(v, default) if default > 0 else v
+    return max(1, default)
+
+
+def _prompt_tokens_from_prefill(
+    response_json: dict, kv_transfer_params: Any
+) -> int | None:
+    """The real prompt length once prefill has run: usage first, then the
+    connector's num_tokens (the prompt minus the last token)."""
+    usage = response_json.get("usage") if isinstance(response_json, dict) else None
+    if isinstance(usage, dict):
+        v = usage.get("prompt_tokens")
+        if isinstance(v, int) and v > 0:
+            return v
+    if isinstance(kv_transfer_params, dict):
+        v = kv_transfer_params.get("num_tokens")
+        if isinstance(v, int) and v > 0:
+            return v + 1
+    return None
 
 
 class _ProxyLatencyTracker:
@@ -171,8 +500,8 @@ async def _post_with_retries(
 
 
 def _render_endpoint_for_api(api: str) -> str | None:
-    if api == "/v1/completions":
-        return "/v1/completions/render"
+    # Upstream vLLM does not expose a /render endpoint; tokenization occurs
+    # directly within the prefill engine.
     return None
 
 
@@ -289,10 +618,117 @@ async def lifespan(app: FastAPI):
     # Initialize round-robin iterators
     app.state.prefill_iterator = itertools.cycle(range(len(app.state.prefill_clients)))
     app.state.decode_iterator = itertools.cycle(range(len(app.state.decode_clients)))
+    routing_mode = os.getenv("PROXY_PREFILL_ROUTING", "prefix_hash").strip().lower()
+    # Residency-aware prefill routing: PROXY_PREFILL_MAX_SESSIONS conversations
+    # per prefill leg (0 = off; ~54 for a 397B leg without a host tier, ~240
+    # with one) and PROXY_PREFIX_HASH_SATURATED_INFLIGHT, the per-leg in-flight
+    # count above which the sticky slack no longer applies (0 = off).
+    if len(app.state.prefill_clients) > 1 and routing_mode == "prefix_hash":
+        app.state.prefill_router = _PrefixAffinityRouter(
+            n=len(app.state.prefill_clients),
+            chunk=_env_int("PROXY_PREFIX_HASH_CHUNK", 1024),
+            min_frac=_env_float("PROXY_PREFIX_HASH_MIN_FRAC", 0.5),
+            slack=_env_int("PROXY_PREFIX_HASH_SLACK", 8),
+            max_sessions=_env_int("PROXY_PREFILL_MAX_SESSIONS", 0),
+            saturated_inflight=_env_int("PROXY_PREFIX_HASH_SATURATED_INFLIGHT", 0),
+        )
+    else:
+        app.state.prefill_router = None
+    decode_routing = os.getenv("PROXY_DECODE_ROUTING", "round_robin").strip().lower()
+    # Decode prefix routing keeps a conversation on its leg while that leg runs
+    # at most PROXY_DECODE_HASH_SLACK more requests than the least-loaded leg,
+    # and otherwise picks the leg with the fewest running requests.
+    # PROXY_DECODE_LOAD_METRIC=inflight counts requests from routing to stream
+    # end instead (prefill hop included), with a default slack of 8.
+    decode_load_metric = (
+        os.getenv("PROXY_DECODE_LOAD_METRIC", "running").strip().lower()
+    )
+    if decode_load_metric not in ("running", "inflight"):
+        raise ValueError(
+            "PROXY_DECODE_LOAD_METRIC must be running or inflight, "
+            f"got {decode_load_metric!r}"
+        )
+    decode_slack_default = 2 if decode_load_metric == "running" else 8
+    if len(app.state.decode_clients) > 1 and decode_routing == "prefix_hash":
+        app.state.decode_router = _PrefixAffinityRouter(
+            n=len(app.state.decode_clients),
+            chunk=_env_int("PROXY_PREFIX_HASH_CHUNK", 1024),
+            min_frac=_env_float("PROXY_PREFIX_HASH_MIN_FRAC", 0.5),
+            slack=_env_int("PROXY_DECODE_HASH_SLACK", decode_slack_default),
+            load_metric=decode_load_metric,
+        )
+    else:
+        app.state.decode_router = None
+    # Admission per decode leg, so the contexts a decode leg holds (running
+    # plus arriving KV) stay within its KV cache; above the cap, requests wait
+    # here holding no KV anywhere. Without it a burst fills the decode KV,
+    # vLLM preempts and recomputes whole ~90k-token contexts on the decode
+    # leg, and E2E explodes. PROXY_DECODE_MAX_INFLIGHT counts requests,
+    # PROXY_DECODE_MAX_INFLIGHT_TOKENS counts prompt plus expected output
+    # tokens (contexts differ 3x in length, so the token budget tracks the KV
+    # the leg actually holds); both 0 = unlimited, both set = both apply.
+    # PROXY_DECODE_ADMIT_POINT=before_prefill takes the budget before the
+    # prefill hop with a byte-based prompt estimate (corrected after prefill);
+    # after_prefill takes it between the prefill hop and the decode hop with
+    # the real prompt length, so only decode-side work counts against it.
+    decode_cap = _env_int("PROXY_DECODE_MAX_INFLIGHT", 0)
+    decode_cap_tokens = _env_int("PROXY_DECODE_MAX_INFLIGHT_TOKENS", 0)
+    admit_point = (
+        os.getenv("PROXY_DECODE_ADMIT_POINT", "before_prefill").strip().lower()
+    )
+    if admit_point not in ("before_prefill", "after_prefill"):
+        raise ValueError(
+            "PROXY_DECODE_ADMIT_POINT must be before_prefill or after_prefill, "
+            f"got {admit_point!r}"
+        )
+    app.state.decode_admit_point = admit_point
+    app.state.decode_budgets = [
+        _AdmissionBudget(f"decode[{i}]", decode_cap, decode_cap_tokens)
+        for i in range(len(app.state.decode_clients))
+    ]
+    # Bound on the requests a prefill leg has in prefill or has finished
+    # prefilling that no decode leg has pulled yet (the producer keeps their KV
+    # pinned through the Stage-3 request registration until the pull or the
+    # TPU_P2P_WAIT_PULL_TIMEOUT expiry). Taken before the prefill hop with
+    # the estimate, corrected after prefill, released at the decode's first
+    # chunk; a request that waits for decode admission therefore holds a
+    # pending slot, and once the pending set is full the queue forms here,
+    # before prefill, instead of in the prefill leg's KV pool.
+    pending_cap = _env_int("PROXY_PREFILL_PENDING_MAX", 0)
+    pending_cap_tokens = _env_int("PROXY_PREFILL_PENDING_MAX_TOKENS", 0)
+    app.state.prefill_pending = [
+        _AdmissionBudget(f"prefill[{i}]", pending_cap, pending_cap_tokens)
+        for i in range(len(app.state.prefill_clients))
+    ]
+    # Prompt bytes per token of the AgentX trace: bytes / 4.0 came out at 0.84x
+    # the real prompt_tokens (p10 to p90), bytes / 3.4 matches.
+    app.state.bytes_per_token = _env_float("PROXY_TOKEN_BYTES_EST", 3.4)
+    app.state.output_tokens_est = _env_int("PROXY_DECODE_OUTPUT_TOKENS_EST", 1024)
 
+    saturated_inflight = _env_int("PROXY_PREFIX_HASH_SATURATED_INFLIGHT", 0)
     print(
         f"Initialized {len(app.state.prefill_clients)} prefill clients "
-        f"and {len(app.state.decode_clients)} decode clients."
+        f"(routing={'prefix_hash' if app.state.prefill_router else 'round_robin'}"
+        f" max_sessions={_env_int('PROXY_PREFILL_MAX_SESSIONS', 0) or 'unlimited'}"
+        f" saturated_inflight={saturated_inflight or 'off'}"
+        f" pending_max={pending_cap or 'unlimited'}"
+        f" pending_max_tokens={pending_cap_tokens or 'unlimited'}) "
+        f"and {len(app.state.decode_clients)} decode clients.",
+        flush=True,
+    )
+    decode_router = app.state.decode_router
+    decode_route_desc = (
+        f"prefix_hash load_metric={decode_router.load_metric} "
+        f"slack={decode_router.slack}"
+        if decode_router
+        else "round_robin"
+    )
+    print(
+        f"Decode routing={decode_route_desc} "
+        f"max_inflight_per_decode={decode_cap or 'unlimited'} "
+        f"max_inflight_tokens_per_decode={decode_cap_tokens or 'unlimited'} "
+        f"admit_point={admit_point}",
+        flush=True,
     )
 
     yield
@@ -505,94 +941,245 @@ async def _handle_completions(api: str, request: Request):
             flush=True,
         )
 
-        # Get the next prefill client in round-robin fashion
-        prefill_client_info = get_next_client(request.app, "prefill")
-        render_endpoint = _render_endpoint_for_api(api)
-        if render_endpoint is not None:
-            render_response = await render_completion_prompt(
-                prefill_client_info, render_endpoint, req_data, request_id, forwarded
-            )
-            req_data = _replace_prompt_with_rendered_token_ids(
-                req_data, render_response.json()
-            )
-
-        # Send request to prefill service
-        t_prefill_send = time.time()
-        t_prefill_send_perf = time.perf_counter()
-        print(
-            f"PERF PROXY prefill_send req_id={request_id} ts={t_prefill_send:.6f}",
-            flush=True,
+        router: _PrefixAffinityRouter | None = getattr(
+            request.app.state, "prefill_router", None
         )
-        response = await send_request_to_prefill(
-            prefill_client_info, api, req_data, request_id, forwarded
+        decode_router: _PrefixAffinityRouter | None = getattr(
+            request.app.state, "decode_router", None
         )
-        t_prefill_recv = time.time()
-        t_prefill_recv_perf = time.perf_counter()
-        prefill_ms = (t_prefill_recv_perf - t_prefill_send_perf) * 1000.0
-        _PROXY_LATENCY.record("prefill", prefill_ms)
-        _PROXY_LATENCY.record(
-            "prefill_from_req", (t_prefill_recv_perf - t_request_recv_perf) * 1000.0
+        prefill_idx: int | None = None
+        prefill_sticky = False
+        decode_idx: int | None = None
+        hs: list[bytes] = []
+        if router is not None or decode_router is not None:
+            hasher = router if router is not None else decode_router
+            hs = hasher.hashes(hasher.extract_text(req_data))
+        # The decode leg is chosen before the prefill hop so that the
+        # admission slot is taken while the request holds no KV. A
+        # conversation keeps its decode leg, so a later turn hits that leg's
+        # own prefix cache and pulls only the new tokens' KV from the prefill.
+        if decode_router is not None:
+            decode_idx, _ = decode_router.route(hs)
+        else:
+            decode_idx = next(request.app.state.decode_iterator)
+        decode_client_info = request.app.state.decode_clients[decode_idx]
+        state = request.app.state
+        decode_budget: _AdmissionBudget = state.decode_budgets[decode_idx]
+        admit_point: str = state.decode_admit_point
+        prompt_est = _estimate_prompt_tokens(
+            _PrefixAffinityRouter.extract_text(req_data), state.bytes_per_token
         )
+        output_est = _expected_output_tokens(req_data, state.output_tokens_est)
+        # The budget a request holds, in tokens, on each leg; corrected once the
+        # prefill response reports the real prompt length.
+        decode_tokens = prompt_est + output_est
+        pending_tokens = prompt_est
+        decode_held = False
+        pending_held = False
+        pending_budget: _AdmissionBudget | None = None
+        decode_released = False
+        decode_running = False
+        pending_released = False
+        t_prefill_recv_perf: float | None = None
 
-        # Extract the needed fields
-        response_json = response.json()
-        kv_transfer_params = response_json.get("kv_transfer_params", {})
-        kv_uuid = kv_transfer_params.get("uuid") if kv_transfer_params else None
-        kv_uuid_log = f" kv_uuid={kv_uuid}" if kv_uuid is not None else ""
-        print(
-            f"PERF PROXY prefill_recv req_id={request_id} ts={t_prefill_recv:.6f} "
-            f"dur_ms={prefill_ms:.2f}{kv_uuid_log}",
-            flush=True,
-        )
+        async def release_decode() -> None:
+            nonlocal decode_released
+            if decode_released:
+                return
+            decode_released = True
+            if decode_held:
+                await decode_budget.release(decode_tokens)
+            if decode_router is not None:
+                decode_router.done(decode_idx, was_running=decode_running)
 
-        if kv_transfer_params:
-            req_data["kv_transfer_params"] = kv_transfer_params
-
-        # Get the next decode client in round-robin fashion
-        decode_client_info = get_next_client(request.app, "decode")
-
-        logger.debug("Using %s %s", prefill_client_info, decode_client_info)
-
-        # Stream response from decode service
-        async def generate_stream():
-            t_decode_send = time.time()
-            t_decode_send_perf = time.perf_counter()
-            print(
-                f"PERF PROXY decode_send req_id={request_id} "
-                f"ts={t_decode_send:.6f}{kv_uuid_log}",
-                flush=True,
-            )
-            first = True
-            async for chunk in stream_from_decode(
-                decode_client_info, api, req_data, request_id, forwarded
-            ):
-                if first:
-                    t_first = time.time()
-                    t_first_perf = time.perf_counter()
-                    decode_first_ms = (t_first_perf - t_decode_send_perf) * 1000.0
-                    ttft_ms = (t_first_perf - t_request_recv_perf) * 1000.0
-                    _PROXY_LATENCY.record("decode_first", decode_first_ms)
-                    _PROXY_LATENCY.record("ttft", ttft_ms)
+        async def release_pending(reason: str) -> None:
+            nonlocal pending_released
+            if pending_released:
+                return
+            pending_released = True
+            if pending_held and pending_budget is not None:
+                await pending_budget.release(pending_tokens)
+                if t_prefill_recv_perf is not None:
+                    pending_ms = (time.perf_counter() - t_prefill_recv_perf) * 1000.0
+                    _PROXY_LATENCY.record("prefill_pending", pending_ms)
                     print(
-                        f"PERF PROXY first_chunk req_id={request_id} "
-                        f"ts={t_first:.6f} "
-                        f"dur_from_decode_send_ms={decode_first_ms:.2f} "
-                        f"ttft_ms={ttft_ms:.2f}{kv_uuid_log}",
+                        f"PERF PROXY prefill_pending_done req_id={request_id} "
+                        f"prefill_id={prefill_idx} reason={reason} "
+                        f"pending_ms={pending_ms:.2f} ts={time.time():.6f}",
                         flush=True,
                     )
-                    first = False
-                yield chunk
 
-        # text/event-stream when the caller asked for a stream, which is what
-        # the decode instance is actually sending back. Declared as
-        # application/json, a client parses each SSE frame - "data: {...}" prefix
-        # and all - as one JSON document, and every request fails; aiperf's
-        # agentic replay does exactly that, while the non-streaming callers this
-        # proxy had until now (check_completions.py, lm_eval) never noticed.
-        media_type = (
-            "text/event-stream" if req_data.get("stream") else "application/json"
-        )
-        return StreamingResponse(generate_stream(), media_type=media_type)
+        async def admit_decode(point: str) -> None:
+            nonlocal decode_held
+            if not decode_budget.enabled:
+                return
+            wait_ms = await decode_budget.acquire(decode_tokens)
+            decode_held = True
+            _PROXY_LATENCY.record("decode_admit", wait_ms)
+            print(
+                f"PERF PROXY decode_admit req_id={request_id} "
+                f"decode_id={decode_client_info.get('id', decode_idx)} "
+                f"point={point} tokens={decode_tokens} "
+                f"wait_ms={wait_ms:.2f} ts={time.time():.6f}",
+                flush=True,
+            )
+            if decode_budget.admitted % 64 == 0:
+                print(
+                    "PERF PROXY admission | "
+                    + " | ".join(b.describe() for b in state.decode_budgets)
+                    + " | "
+                    + " | ".join(b.describe() for b in state.prefill_pending),
+                    flush=True,
+                )
+
+        try:
+            # Inside the try: a client that disconnects while this waits for
+            # admission still returns its decode router slot.
+            if admit_point == "before_prefill":
+                await admit_decode(admit_point)
+
+            if router is not None:
+                prefill_idx, prefill_sticky = router.route(hs)
+                prefill_client_info = request.app.state.prefill_clients[prefill_idx]
+            else:
+                prefill_client_info = get_next_client(request.app, "prefill")
+                prefill_idx = int(prefill_client_info.get("id", 0))
+            pending_budget = state.prefill_pending[prefill_idx]
+            if pending_budget.enabled:
+                wait_ms = await pending_budget.acquire(pending_tokens)
+                pending_held = True
+                _PROXY_LATENCY.record("prefill_pending_admit", wait_ms)
+                print(
+                    f"PERF PROXY prefill_pending_admit req_id={request_id} "
+                    f"prefill_id={prefill_idx} tokens={pending_tokens} "
+                    f"wait_ms={wait_ms:.2f} ts={time.time():.6f}",
+                    flush=True,
+                )
+
+            try:
+                render_endpoint = _render_endpoint_for_api(api)
+                if render_endpoint is not None:
+                    render_response = await render_completion_prompt(
+                        prefill_client_info,
+                        render_endpoint,
+                        req_data,
+                        request_id,
+                        forwarded,
+                    )
+                    req_data = _replace_prompt_with_rendered_token_ids(
+                        req_data, render_response.json()
+                    )
+
+                # Send request to prefill service
+                t_prefill_send = time.time()
+                t_prefill_send_perf = time.perf_counter()
+                print(
+                    f"PERF PROXY prefill_send req_id={request_id} "
+                    f"prefill_id={prefill_client_info.get('id', 0)} "
+                    f"sticky={int(prefill_sticky)} "
+                    f"ts={t_prefill_send:.6f}",
+                    flush=True,
+                )
+                response = await send_request_to_prefill(
+                    prefill_client_info, api, req_data, request_id, forwarded
+                )
+            finally:
+                if router is not None and prefill_idx is not None:
+                    router.done(prefill_idx)
+
+            t_prefill_recv = time.time()
+            t_prefill_recv_perf = time.perf_counter()
+            prefill_ms = (t_prefill_recv_perf - t_prefill_send_perf) * 1000.0
+            _PROXY_LATENCY.record("prefill", prefill_ms)
+            _PROXY_LATENCY.record(
+                "prefill_from_req", (t_prefill_recv_perf - t_request_recv_perf) * 1000.0
+            )
+
+            # Extract the needed fields
+            response_json = response.json()
+            kv_transfer_params = response_json.get("kv_transfer_params", {})
+            kv_uuid = kv_transfer_params.get("uuid") if kv_transfer_params else None
+            kv_uuid_log = f" kv_uuid={kv_uuid}" if kv_uuid is not None else ""
+            prompt_tokens = _prompt_tokens_from_prefill(
+                response_json, kv_transfer_params
+            )
+            print(
+                f"PERF PROXY prefill_recv req_id={request_id} ts={t_prefill_recv:.6f} "
+                f"dur_ms={prefill_ms:.2f} prompt_tokens={prompt_tokens} "
+                f"prompt_est={prompt_est}{kv_uuid_log}",
+                flush=True,
+            )
+            if prompt_tokens is not None:
+                if pending_held and pending_budget is not None:
+                    await pending_budget.adjust(prompt_tokens - pending_tokens)
+                pending_tokens = prompt_tokens
+                if decode_held:
+                    await decode_budget.adjust(prompt_tokens - prompt_est)
+                decode_tokens = prompt_tokens + output_est
+
+            if kv_transfer_params:
+                req_data["kv_transfer_params"] = kv_transfer_params
+
+            if admit_point == "after_prefill":
+                await admit_decode(admit_point)
+
+            logger.debug("Using %s %s", prefill_client_info, decode_client_info)
+
+            # Stream response from decode service
+            async def generate_stream():
+                nonlocal decode_running
+                try:
+                    if decode_router is not None:
+                        decode_router.start_running(decode_idx)
+                        decode_running = True
+                    t_decode_send = time.time()
+                    t_decode_send_perf = time.perf_counter()
+                    print(
+                        f"PERF PROXY decode_send req_id={request_id} "
+                        f"ts={t_decode_send:.6f}{kv_uuid_log}",
+                        flush=True,
+                    )
+                    first = True
+                    async for chunk in stream_from_decode(
+                        decode_client_info, api, req_data, request_id, forwarded
+                    ):
+                        if first:
+                            t_first = time.time()
+                            t_first_perf = time.perf_counter()
+                            decode_first_ms = (
+                                t_first_perf - t_decode_send_perf
+                            ) * 1000.0
+                            ttft_ms = (t_first_perf - t_request_recv_perf) * 1000.0
+                            _PROXY_LATENCY.record("decode_first", decode_first_ms)
+                            _PROXY_LATENCY.record("ttft", ttft_ms)
+                            print(
+                                f"PERF PROXY first_chunk req_id={request_id} "
+                                f"ts={t_first:.6f} "
+                                f"dur_from_decode_send_ms={decode_first_ms:.2f} "
+                                f"ttft_ms={ttft_ms:.2f}{kv_uuid_log}",
+                                flush=True,
+                            )
+                            first = False
+                            await release_pending("first_chunk")
+                        yield chunk
+                finally:
+                    await release_pending("stream_end")
+                    await release_decode()
+
+            # text/event-stream when the caller asked for a stream, which is what
+            # the decode instance is actually sending back. Declared as
+            # application/json, a client parses each SSE frame - "data: {...}" prefix
+            # and all - as one JSON document, and every request fails; aiperf's
+            # agentic replay does exactly that, while the non-streaming callers this
+            # proxy had until now (check_completions.py, lm_eval) never noticed.
+            media_type = (
+                "text/event-stream" if req_data.get("stream") else "application/json"
+            )
+            return StreamingResponse(generate_stream(), media_type=media_type)
+        except BaseException:
+            await release_pending("error")
+            await release_decode()
+            raise
 
     except Exception as e:
         import sys
@@ -632,11 +1219,26 @@ async def models():
 @app.get("/healthcheck")
 async def healthcheck():
     """Simple endpoint to check if the server is running."""
-    return {
+    router: _PrefixAffinityRouter | None = getattr(app.state, "prefill_router", None)
+    res: dict[str, Any] = {
         "status": "ok",
         "prefill_instances": len(app.state.prefill_clients),
         "decode_instances": len(app.state.decode_clients),
     }
+    if router is not None:
+        res["prefill_router"] = router.stats()
+    decode_router: _PrefixAffinityRouter | None = getattr(
+        app.state, "decode_router", None
+    )
+    if decode_router is not None:
+        res["decode_router"] = decode_router.stats()
+    budgets = getattr(app.state, "decode_budgets", None)
+    if budgets:
+        res["decode_admission"] = [b.stats() for b in budgets]
+    pending = getattr(app.state, "prefill_pending", None)
+    if pending:
+        res["prefill_pending"] = [b.stats() for b in pending]
+    return res
 
 
 if __name__ == "__main__":
@@ -645,4 +1247,17 @@ if __name__ == "__main__":
 
     import uvicorn
 
-    uvicorn.run(app, host=global_args.host, port=global_args.port)
+    # The benchmark client (aiohttp) reuses its connections to this proxy; with
+    # uvicorn's default timeout_keep_alive of 5 s the server closes an idle
+    # connection while the client is writing the next request body on it, which
+    # surfaces as "ClientOSError: Can not write request body" or
+    # ServerDisconnectedError on the client (2 to 4 requests per hour in the
+    # AgentX replay). PROXY_KEEPALIVE_S=5 restores the default.
+    limit_concurrency = _env_int("PROXY_UVICORN_LIMIT_CONCURRENCY", 0)
+    uvicorn.run(
+        app,
+        host=global_args.host,
+        port=global_args.port,
+        timeout_keep_alive=_env_int("PROXY_KEEPALIVE_S", 300),
+        limit_concurrency=limit_concurrency if limit_concurrency > 0 else None,
+    )
