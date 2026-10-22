@@ -3139,7 +3139,8 @@ def kda_chunk(q, k, v, gate, beta, state, *, sub_block=_KDA_SUB_BLOCK, invert=No
 # ---------------------------------------------------------------------------
 
 
-def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query_scale=1.0):
+def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query_scale=1.0,
+                    sp_axis=None):
     """MLA Q/K/V projections for a token window (per-rank layout).
 
     ``hidden``: [T, hidden] BF16. Returns (query [T,3,256] times
@@ -3151,7 +3152,16 @@ def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query
     every rank.
     """
     tokens = hidden.shape[0]
-    query_latent = _dot(hidden, weights.query_down_projection)
+    if sp_axis is None:
+        rows, local = tokens, hidden
+    else:
+        # The low-rank projections are not head-split: each rank projects one
+        # contiguous 1/32 of the window and the results are all-gathered.
+        rows = tokens // jax.lax.psum(1, sp_axis)
+        local = jax.lax.dynamic_slice_in_dim(
+            hidden, jax.lax.axis_index(sp_axis) * rows, rows
+        )
+    query_latent = _dot(local, weights.query_down_projection)
     query_latent = (
         query_latent
         * jax.lax.rsqrt(
@@ -3159,12 +3169,18 @@ def mla_projections(hidden, weights, *, epsilon=1e-5, return_latent=False, query
         )
         * weights.query_normalization
     ).astype(jnp.bfloat16)
+    compressed = _dot(local, weights.key_value_down_projection).astype(
+        jnp.bfloat16
+    )
+    if sp_axis is not None:
+        width = query_latent.shape[1]
+        both = jax.lax.all_gather(
+            jnp.concatenate((query_latent, compressed), axis=1), sp_axis, tiled=True
+        )
+        query_latent, compressed = both[:, :width], both[:, width:]
     query = (_dot(query_latent, weights.query_up_projection) * query_scale).astype(jnp.bfloat16)
     query = query.reshape(tokens, _HEADS, 256)
 
-    compressed = _dot(hidden, weights.key_value_down_projection).astype(
-        jnp.bfloat16
-    )
     kv_latent = compressed[:, :512].astype(jnp.float32)
     kv_latent = (
         kv_latent
@@ -4818,7 +4834,8 @@ def make_mla_attention_layer_sp_ring(mesh, *, seq_len, segments, prefix_capacity
             *(local_weights[name] for name in _PROJECTION_NAMES)
         )
         query, new_key, new_value, output_gate, latent = mla_projections(
-            full_hidden, projections, return_latent=True, query_scale=SCALE_LOG2)
+            full_hidden, projections, return_latent=True, query_scale=SCALE_LOG2,
+            sp_axis="k3_sp")
         tokens = query.shape[0]
         real = (jnp.arange(tokens) < length.reshape(()))[None, :, None]
         new_key = jnp.where(real, new_key.transpose(1, 0, 2), 0)
