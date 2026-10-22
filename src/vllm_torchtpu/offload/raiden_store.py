@@ -397,6 +397,11 @@ class RaidenOffloadingManager(OffloadingManager):
         self._hash_to_admission: dict[bytes, Admission] = {}
         self._finished: list[FinishedJob] = []
 
+        # Cleared by lazy offload (disable_request_stores): blocks are then
+        # stored only on their way out of HBM, and the request path offers
+        # nothing.
+        self._request_stores_enabled = True
+
     # -- sub-hash / block-id expansion ----------------------------------
 
     def _sub_hashes(self, key: OffloadKey) -> list[bytes]:
@@ -589,8 +594,13 @@ class RaidenOffloadingManager(OffloadingManager):
         # hashes past the first host-pool miss without the host pool having
         # been asked about them, so the pool may still hold the same hash,
         # pinned by an in-flight job, and a release would drop that job's pin.
+        #
+        # The scheduler touches a request's keys prefix first. Released in
+        # that order, the prefix would end up least recent, so the LRU would
+        # drop a conversation's head first and strand the rest (a hit needs
+        # the prefix). Releasing the tail first leaves the prefix most recent.
         skip = (self._block_status.REMOTE, self._block_status.SHARED_STORAGE)
-        for key in keys:
+        for key in reversed(list(keys)):
             sub_hashes = self._sub_hashes(key)
             held = [
                 sub_hash
@@ -680,7 +690,35 @@ class RaidenOffloadingManager(OffloadingManager):
         self._pending_remote_slices.update(remote_slices)
         return RaidenLoadStoreSpec(keys)
 
+    def disable_request_stores(self) -> None:
+        """Lazy offload: store blocks only on their way out of HBM.
+
+        The scheduler then admits stores through `prepare_evicting_store`
+        alone, and `prepare_store` (the request path) offers nothing.
+        """
+        self._request_stores_enabled = False
+
     def prepare_store(self, keys, req_context: ReqContext) -> PrepareStoreOutput | None:
+        if not self._request_stores_enabled:
+            # An empty answer, not None (which counts as an allocation
+            # failure): the scheduler advances past these chunks exactly as
+            # it does for chunks already stored.
+            return PrepareStoreOutput(
+                keys_to_store=[],
+                store_spec=RaidenLoadStoreSpec([]),
+                evicted_keys=[],
+            )
+        return self._admit_store_keys(keys)
+
+    def prepare_evicting_store(self, keys) -> PrepareStoreOutput | None:
+        """Admit stores for HBM blocks the allocator is about to evict.
+
+        The lazy-offload counterpart of `prepare_store`, answered the same
+        way: a key already resident or in flight is skipped.
+        """
+        return self._admit_store_keys(keys)
+
+    def _admit_store_keys(self, keys) -> PrepareStoreOutput | None:
         # The Raiden directory is the sole authority on what is stored: probe
         # it per key, so a key whose entries were displaced from the LRU is
         # re-offered here on its next appearance. A key is skipped only when

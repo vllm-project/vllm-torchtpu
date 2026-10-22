@@ -1242,14 +1242,65 @@ def _patch_vllm_offload_fine_prefix_alignment() -> None:
     )
 
 
+# Children a TPUMultiConnector may pair with the Raiden P/D connector without
+# changing what the DCP identity patches assume: the Raiden CPU offload tier
+# copies whole rank-local pages (any interleave) and takes its tokens_per_hash
+# from the runtime resolve (_patch_vllm_offloading_config_build).
+_RAIDEN_IDENTITY_COMPANIONS = frozenset({"TPURaidenOffloadingConnector"})
+
+
+def _raiden_children(kv_transfer_config) -> list[dict] | None:
+    """The children of a TPUMultiConnector made of Raiden connectors only.
+
+    Returns [] for a plain TPURaidenConnector config and None for anything
+    else (another connector, or a multi-connector with a foreign child)."""
+    if kv_transfer_config.kv_connector == "TPURaidenConnector":
+        return []
+    if kv_transfer_config.kv_connector != "TPUMultiConnector":
+        return None
+    children = (kv_transfer_config.kv_connector_extra_config or {}).get(
+        "connectors"
+    ) or []
+    raiden = [c for c in children if c.get("kv_connector") == "TPURaidenConnector"]
+    if len(raiden) != 1 or not all(
+        c.get("kv_connector") in _RAIDEN_IDENTITY_COMPANIONS
+        for c in children
+        if c is not raiden[0]
+    ):
+        return None
+    return list(children)
+
+
 def _is_raiden_glm_dcp_identity_producer(kv_transfer_config) -> bool:
-    """A TPURaidenConnector producer under TPU_RAIDEN_GLM_DCP_IDENTITY."""
+    """A TPURaidenConnector producer under TPU_RAIDEN_GLM_DCP_IDENTITY, alone or
+    as the single P/D child of a TPUMultiConnector next to Raiden offload tiers."""
+    if not (envs.use_raiden_glm_admission() and envs.TPU_RAIDEN_GLM_DCP_IDENTITY):
+        return False
+    children = _raiden_children(kv_transfer_config)
+    if children is None:
+        return False
+    if not children:
+        return bool(
+            kv_transfer_config.is_kv_producer and not kv_transfer_config.is_kv_consumer
+        )
+    (raiden,) = [c for c in children if c.get("kv_connector") == "TPURaidenConnector"]
+    return raiden.get("kv_role") == "kv_producer"
+
+
+def _fine_prefix_hashes_safe(kv_transfer_config) -> bool:
+    """Whether this connector config tolerates sub-block (fine) block hashes.
+
+    The Raiden GLM DCP identity producer reads none, and under the identity
+    transfer a Raiden CPU offload tier takes its tokens_per_hash from this same
+    resolve (_patch_vllm_offloading_config_build). A TPUMultiConnector child is
+    resolved against its own config (the child's), so the offload child must
+    reach the same answer as the engine, which sees the parent."""
+    if _is_raiden_glm_dcp_identity_producer(kv_transfer_config):
+        return True
     return bool(
         envs.use_raiden_glm_admission()
         and envs.TPU_RAIDEN_GLM_DCP_IDENTITY
-        and kv_transfer_config.kv_connector == "TPURaidenConnector"
-        and kv_transfer_config.is_kv_producer
-        and not kv_transfer_config.is_kv_consumer
+        and kv_transfer_config.kv_connector in _RAIDEN_IDENTITY_COMPANIONS
     )
 
 
@@ -1275,7 +1326,7 @@ def _patch_raiden_identity_keeps_cp_interleave() -> None:
     @wraps(original)
     def adjust_dcp_kv_cache_interleave_size(self, kv_cache_config) -> None:
         transfer = self.kv_transfer_config
-        if transfer is None or transfer.kv_connector != "TPURaidenConnector":
+        if transfer is None or _raiden_children(transfer) is None:
             return original(self, kv_cache_config)
         parallel = self.parallel_config
         if parallel.decode_context_parallel_size <= 1:
@@ -1324,11 +1375,13 @@ def _dcp_fine_prefix_match_unit(kv_cache_config, vllm_config) -> int | None:
         or dcp <= 1
         or parallel_config.prefill_context_parallel_size != 1
         # P/D connectors consume block hashes at block granularity. CPU
-        # offloading connectors and a Raiden GLM DCP identity producer do not.
+        # offloading connectors do not, nor does a Raiden GLM DCP identity
+        # producer (it ships whole pages) with a Raiden offload tier next to it
+        # (keyed by the runtime hash size).
         or (
             vllm_config.kv_transfer_config is not None
             and not _is_offloading_connector(vllm_config.kv_transfer_config)
-            and not _is_raiden_glm_dcp_identity_producer(vllm_config.kv_transfer_config)
+            and not _fine_prefix_hashes_safe(vllm_config.kv_transfer_config)
         )
         or len(groups) != 1
     ):

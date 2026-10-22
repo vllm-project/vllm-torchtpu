@@ -38,6 +38,14 @@ physical TPU hardware or native C++ wheels:
    - Settings: extra-config and env sources, and the fail-fast checks.
    - Plumbing: BackendConfigs reach the store and every worker, and nothing
      new is passed while the tier is off.
+
+5. Lazy Offload:
+   - Eviction-queue scan: only whole cached blocks within the window are
+     stored, under the key a later request looks up; the request path offers
+     nothing.
+   - Job lifecycle without a request: fence, launch, completion echo, and the
+     memory-reuse flush (cancel before launch, drain after).
+   - Touch order: a request's keys are released tail first.
 """
 
 import enum
@@ -3331,6 +3339,397 @@ class TestStoragePlumbing(unittest.TestCase):
         plain, tiered = self.manager_kwargs
         self.assertNotIn("backend_configs", plain)
         self.assertEqual(tiered["backend_configs"], [cfg])
+
+
+class TestLazyOffload(unittest.TestCase):
+    """Lazy offload against the real upstream scheduler state machine: the
+    scan of a real free-block queue, and full store-job lifecycles through
+    the stock build_connector_meta / update_connector_output."""
+
+    TPC = 4  # tokens per chunk = tokens per block (blocks_per_chunk=1)
+    NUM_WORKERS = 2
+
+    def _config(self, tokens_per_chunk=TPC, hashes_per_chunk=1, blocks_per_chunk=1):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            GroupOffloadConfig,
+            SchedulerOffloadConfig,
+        )
+
+        return SchedulerOffloadConfig(
+            kv_group_configs=(
+                GroupOffloadConfig(
+                    group_idx=0,
+                    tokens_per_block=tokens_per_chunk,
+                    tokens_per_chunk=tokens_per_chunk,
+                    hashes_per_chunk=hashes_per_chunk,
+                    kv_event_group_spec=MagicMock(),
+                    sliding_window_size_in_chunks=None,
+                ),
+            ),
+            blocks_per_chunk=blocks_per_chunk,
+            tokens_per_hash=tokens_per_chunk // hashes_per_chunk,
+            num_workers=self.NUM_WORKERS,
+            offload_prompt_only=False,
+            supports_partial_tail=False,
+        )
+
+    def _make(self, num_blocks=8, window=4, config=None):
+        """A lazy scheduler over a real free queue of `num_blocks` blocks
+        (block 0 is the null block, as in vLLM's BlockPool)."""
+        from vllm.v1.core.kv_cache_utils import FreeKVCacheBlockQueue, KVCacheBlock
+
+        from vllm_torchtpu.offload.raiden_connector import (
+            TPURaidenOffloadingScheduler,
+            _LazyOffload,
+        )
+
+        self.store = FakeKVCacheStore()
+        self.manager = make_manager(self.store, num_blocks=64)
+        self.manager.disable_request_stores()
+        sched = object.__new__(TPURaidenOffloadingScheduler)
+        sched.config = config or self._config()
+        sched.manager = self.manager
+        sched._raiden_manager = self.manager
+        sched._fence_pending = {}
+        sched._req_status = {}
+        sched._jobs = {}
+        sched._job_counter = 0
+        sched._stale_job_threshold = 0
+        sched._block_id_to_pending_jobs = {}
+        sched._current_batch_allocated_block_ids = set()
+        sched._current_batch_jobs_to_flush = set()
+        sched._current_batch_load_jobs = {}
+        sched._chunks_being_loaded = set()
+        sched._sliding_window_groups = ()
+        sched._connector_stats = MagicMock()
+        sched._events_tracker = MagicMock()
+        sched._lazy = _LazyOffload(
+            window_blocks=window,
+            chunk_tokens={0: sched.config.kv_group_configs[0].tokens_per_chunk},
+        )
+        self.blocks = [KVCacheBlock(block_id=i) for i in range(num_blocks)]
+        self.blocks[0].is_null = True
+        self.queue = FreeKVCacheBlockQueue(self.blocks[1:])
+        sched.bind_gpu_block_pool(
+            SimpleNamespace(free_block_queue=self.queue, blocks=self.blocks)
+        )
+        return sched
+
+    def _cache(self, block_id, name, num_tokens):
+        """Give a free block a cached hash, as BlockPool does."""
+        from vllm.v1.core.kv_cache_utils import make_block_hash_with_group_id
+
+        self.blocks[block_id].set_block_hash(
+            make_block_hash_with_group_id(name, 0), num_tokens=num_tokens
+        )
+
+    def _okey(self, name):
+        from vllm.v1.kv_offload.base import make_offload_key
+
+        return make_offload_key(name, 0)
+
+    def _allocate(self, sched, block_id):
+        """The allocator takes a free block this step."""
+        self.queue.remove(self.blocks[block_id])
+        self.blocks[block_id].ref_cnt = 1
+        sched._current_batch_allocated_block_ids.add(block_id)
+
+    def _step(self, sched):
+        from vllm.v1.core.sched.output import SchedulerOutput
+
+        return sched.build_connector_meta(SchedulerOutput.make_empty())
+
+    def _worker_output(self, fenced=(), completed=()):
+        from vllm.v1.outputs import KVConnectorOutput
+
+        from vllm_torchtpu.offload.raiden_connector import (
+            RaidenOffloadingWorkerMetadata,
+        )
+
+        return KVConnectorOutput(
+            kv_connector_worker_meta=RaidenOffloadingWorkerMetadata(
+                completed_jobs={jid: self.NUM_WORKERS for jid in completed},
+                fenced_jobs={jid: self.NUM_WORKERS for jid in fenced},
+            )
+        )
+
+    def test_scan_stores_whole_cached_blocks_in_window_only(self):
+        sched = self._make(num_blocks=8, window=4)
+        # Free queue (eviction order): 1 uncached, 2 whole, 3 partial (a fine
+        # prefix entry ending inside the block), 4 whole, 5 whole but past
+        # the 4-block window.
+        self._cache(2, b"h2", 2 * self.TPC)
+        self._cache(3, b"h3", 2 * self.TPC + 1)
+        self._cache(4, b"h4", 3 * self.TPC)
+        self._cache(5, b"h5", 4 * self.TPC)
+
+        meta = self._step(sched)
+
+        parked = {
+            tuple(p.device_block_ids): p.keys for p in sched._fence_pending.values()
+        }
+        self.assertEqual(parked, {(2,): [self._okey(b"h2")], (4,): [self._okey(b"h4")]})
+        self.assertEqual(meta.fence_job_ids, set(sched._fence_pending))
+        self.assertEqual(set(sched._block_id_to_pending_jobs), {2, 4})
+        self.assertEqual(sched._lazy.stats["stored"], 2)
+        # Nothing reaches the store before every rank fences.
+        self.assertEqual(self.store.calls_named("insert"), [])
+
+        # A second scan parks nothing new: both blocks have a job pending.
+        self._step(sched)
+        self.assertEqual(len(sched._fence_pending), 2)
+
+    def test_scan_skips_blocks_the_tier_already_holds(self):
+        sched = self._make()
+        self._cache(1, b"h1", self.TPC)
+        self._cache(2, b"h2", 2 * self.TPC)
+        seed_host_entries(self.store, self._okey(b"h1"))
+
+        self._step(sched)
+
+        (parked,) = sched._fence_pending.values()
+        self.assertEqual(parked.device_block_ids, [2])
+
+    def test_lazy_key_is_the_key_a_request_looks_up(self):
+        # A block hashes at the scheduler block size, offload keys at
+        # hashes_per_chunk hashes per chunk; both must name the same prefix.
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            RequestOffloadState,
+        )
+        from vllm.v1.core.kv_cache_utils import BlockHashListWithBlockSize
+        from vllm.v1.kv_offload.base import RequestOffloadingContext
+
+        tokens_per_hash, scale = 1, 4
+        config = self._config(tokens_per_chunk=scale, hashes_per_chunk=scale)
+        sched = self._make(num_blocks=8, window=8, config=config)
+        request_hashes = [b"r%03d" % i for i in range(3 * scale)]
+        block_hashes = BlockHashListWithBlockSize(
+            request_hashes, tokens_per_hash, scale * tokens_per_hash
+        )
+        for i in range(3):
+            self._cache(i + 1, block_hashes[i], (i + 1) * scale)
+
+        self._step(sched)
+
+        req = SimpleNamespace(
+            request_id="r1", block_hashes=request_hashes, kv_transfer_params=None
+        )
+        state = RequestOffloadState(
+            config=config,
+            req=req,
+            req_context=_ctx("r1"),
+            offloading_context=RequestOffloadingContext(),
+        )
+        state.update_offload_keys()
+        stored = {
+            p.device_block_ids[0]: p.keys[0] for p in sched._fence_pending.values()
+        }
+        self.assertEqual(
+            [stored[block_id] for block_id in (1, 2, 3)],
+            list(state.group_states[0].offload_keys),
+        )
+
+    def test_request_path_offers_nothing(self):
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            RequestOffloadState,
+        )
+        from vllm.v1.kv_offload.base import RequestOffloadingContext
+        from vllm.v1.request import RequestStatus
+
+        sched = self._make()
+        out = self.manager.prepare_store([_key(0)], _ctx())
+        # Empty, not None: None would count as an allocation failure.
+        self.assertIsNotNone(out)
+        self.assertEqual(out.keys_to_store, [])
+        self.assertNotIn(_key(0), self.manager._inflight_store_keys)
+
+        # A finished request with two computed blocks: the stock path builds
+        # no store job and moves its cursor past both chunks.
+        req = _FakeFinishedRequest("r1", 8, 7, RequestStatus.FINISHED_STOPPED)
+        state = RequestOffloadState(
+            config=sched.config,
+            req=req,
+            req_context=_ctx("r1"),
+            offloading_context=RequestOffloadingContext(),
+        )
+        state.group_states[0].offload_keys.extend([_key(0), _key(1)])
+        state.group_states[0].block_ids.extend([1, 2])
+        sched._req_status["r1"] = state
+        jobs = sched._build_store_jobs(
+            SimpleNamespace(num_scheduled_tokens={}, finished_req_ids={"r1"})
+        )
+        self.assertEqual(jobs, {})
+        self.assertEqual(state.group_states[0].next_stored_chunk_idx, 2)
+
+        # The eviction path still admits the key.
+        out = self.manager.prepare_evicting_store([_key(0)])
+        self.assertEqual(out.keys_to_store, [_key(0)])
+
+    def test_store_lifecycle_without_a_request(self):
+        sched = self._make()
+        self._cache(1, b"h1", self.TPC)
+        self._step(sched)
+        (job_id,) = sched._fence_pending
+
+        # Every rank fences: the store is admitted and launched.
+        sched.update_connector_output(self._worker_output(fenced=[job_id]))
+        self.assertTrue(self.manager.is_job_launched(job_id))
+        self.store.complete_save(sub_hashes(self._okey(b"h1")))
+
+        # The finished save is echoed to the workers.
+        meta = self._step(sched)
+        self.assertIn(job_id, meta.finished_store_job_ids)
+
+        # Their echo retires the job; the stock path, which looks every job's
+        # request up, never sees it.
+        sched.update_connector_output(self._worker_output(completed=[job_id]))
+        self.assertNotIn(job_id, sched._jobs)
+        self.assertNotIn(job_id, sched._lazy.jobs)
+        self.assertEqual(sched._block_id_to_pending_jobs, {})
+
+        # The block is now in the tier: the next scan leaves it alone.
+        self._step(sched)
+        self.assertEqual(sched._fence_pending, {})
+        self.assertEqual(sched._lazy.stats["stored"], 1)
+
+    def test_reused_block_cancels_store_before_launch(self):
+        sched = self._make()
+        self._cache(1, b"h1", self.TPC)
+        self._step(sched)
+        (job_id,) = sched._fence_pending
+
+        self._allocate(sched, 1)
+        meta = self._step(sched)
+
+        self.assertIn(job_id, meta.finished_store_job_ids)
+        self.assertEqual(sched._fence_pending, {})
+        self.assertEqual(self.store.calls_named("insert"), [])
+        self.assertEqual(sched._lazy.stats["cancelled"], 1)
+        # The key can be offered again.
+        self.assertNotIn(self._okey(b"h1"), self.manager._inflight_store_keys)
+        # Late fence acks are ignored, the echo retires the job.
+        sched.update_connector_output(self._worker_output(fenced=[job_id]))
+        self.assertEqual(self.store.calls_named("insert"), [])
+        sched.update_connector_output(self._worker_output(completed=[job_id]))
+        self.assertEqual(sched._jobs, {})
+        self.assertEqual(sched._block_id_to_pending_jobs, {})
+
+    def test_reused_block_drains_store_in_flight(self):
+        sched = self._make()
+        self._cache(1, b"h1", self.TPC)
+        self._step(sched)
+        (job_id,) = sched._fence_pending
+        sched.update_connector_output(self._worker_output(fenced=[job_id]))
+        self.assertTrue(self.manager.is_job_launched(job_id))
+
+        # The DMA lands while the scheduler drains it, before the block is
+        # handed to its new owner.
+        self.store.complete_save(sub_hashes(self._okey(b"h1")))
+        self._allocate(sched, 1)
+        meta = self._step(sched)
+
+        self.assertIn(job_id, meta.finished_store_job_ids)
+        self.assertFalse(self.manager.is_job_launched(job_id))
+        self.assertEqual(sched._lazy.stats["drained"], 1)
+
+    def test_failed_store_is_not_retried_from_the_window(self):
+        sched = self._make()
+        self._cache(1, b"h1", self.TPC)
+        self._step(sched)
+        (job_id,) = sched._fence_pending
+        self.store.fail_save = True
+        sched.update_connector_output(self._worker_output(fenced=[job_id]))
+
+        meta = self._step(sched)
+
+        self.assertIn(job_id, meta.finished_store_job_ids)
+        self.assertEqual(sched._lazy.stats["failed"], 1)
+        self.assertIn(self._okey(b"h1"), sched._lazy.failed_keys)
+        sched.update_connector_output(self._worker_output(completed=[job_id]))
+        # The block still waits in the window; it is not offered again.
+        self._step(sched)
+        self.assertEqual(sched._fence_pending, {})
+
+    def test_other_jobs_pass_through_to_the_stock_path(self):
+        sched = self._make()
+        self._cache(1, b"h1", self.TPC)
+        self._step(sched)
+        (job_id,) = sched._fence_pending
+        meta = self._worker_output(completed=[job_id]).kv_connector_worker_meta
+        meta.completed_jobs[99] = 1
+        output = self._worker_output()
+        output.kv_connector_worker_meta = meta
+
+        passed = sched._complete_lazy_jobs(output, meta)
+
+        self.assertEqual(passed.kv_connector_worker_meta.completed_jobs, {99: 1})
+        self.assertNotIn(job_id, sched._jobs)
+        # The caller's metadata is left as it was.
+        self.assertEqual(meta.completed_jobs, {job_id: self.NUM_WORKERS, 99: 1})
+
+    def test_init_checks_the_block_layout(self):
+        from vllm_torchtpu.offload.raiden_connector import (
+            TPURaidenOffloadingScheduler,
+        )
+
+        def init(tokens_per_chunk=4096, blocks_per_chunk=1, window=32):
+            sched = object.__new__(TPURaidenOffloadingScheduler)
+            sched.config = self._config(
+                tokens_per_chunk=tokens_per_chunk, blocks_per_chunk=blocks_per_chunk
+            )
+            manager = make_manager(FakeKVCacheStore())
+            sched._raiden_manager = manager
+            lazy = sched._init_lazy_offload(
+                SimpleNamespace(extra_config={"lazy_window_blocks": window}),
+                SimpleNamespace(
+                    parallel_config=SimpleNamespace(
+                        decode_context_parallel_size=16,
+                        prefill_context_parallel_size=1,
+                    )
+                ),
+                SimpleNamespace(
+                    kv_cache_groups=[
+                        SimpleNamespace(kv_cache_spec=SimpleNamespace(block_size=256))
+                    ]
+                ),
+            )
+            return lazy, manager
+
+        # DCP16 pages of 256 tokens: one 4096-token chunk per scheduler block.
+        lazy, manager = init()
+        self.assertEqual(lazy.window_blocks, 32)
+        self.assertEqual(lazy.chunk_tokens, {0: 4096})
+        self.assertEqual(manager.prepare_store([_key(0)], _ctx()).keys_to_store, [])
+        # A chunk of the rank-local page (DCP left out) is not one block.
+        with self.assertRaises(ValueError):
+            init(tokens_per_chunk=256)
+        with self.assertRaises(ValueError):
+            init(tokens_per_chunk=2048, blocks_per_chunk=2)
+        with self.assertRaises(ValueError):
+            init(window=0)
+
+    def test_connector_binds_the_pool_to_its_scheduler(self):
+        from vllm_torchtpu.offload.raiden_connector import (
+            TPURaidenOffloadingConnector,
+        )
+
+        connector = object.__new__(TPURaidenOffloadingConnector)
+        connector.connector_scheduler = MagicMock()
+        pool = object()
+        connector.bind_gpu_block_pool(pool)
+        connector.connector_scheduler.bind_gpu_block_pool.assert_called_once_with(pool)
+
+    def test_touch_releases_tail_first(self):
+        manager = make_manager(FakeKVCacheStore())
+        store = manager._store
+        for n in range(3):
+            seed_host_entries(store, _key(n))
+        manager.touch([_key(0), _key(1), _key(2)], _ctx())
+        released = [call.args[0] for call in store.calls_named("release")]
+        # The prefix is released last, so it ends up most recently used.
+        self.assertEqual(
+            released, [sub_hashes(_key(2)), sub_hashes(_key(1)), sub_hashes(_key(0))]
+        )
 
 
 if __name__ == "__main__":
