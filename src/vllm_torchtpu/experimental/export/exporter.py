@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 from collections.abc import Mapping
 from typing import Any
@@ -75,8 +76,9 @@ def _weight_input_entry(
     slot: int,
     tp_size: int,
     buffer_donor: bool,
+    constant: bool = False,
 ) -> dict[str, Any]:
-    """Returns the `metadata.json` input entry for a weight argument."""
+    """Returns the `metadata.json` input entry for a weight or constant argument."""
     shape = [int(d) for d in spec.shape]
     return {
         "arg_index": arg_index,
@@ -84,13 +86,15 @@ def _weight_input_entry(
         "name": name,
         "shape": shape,
         "dtype": tpu_lowering.dtype_name(spec.dtype),
-        "sharding": weight_mapper.infer_weight_sharding(
+        "sharding": None
+        if constant
+        else weight_mapper.infer_weight_sharding(
             name,
             shape,
             explicit_sharding=getattr(spec, "sharding", None),
             tp_size_hint=tp_size,
         ),
-        "argument_type": "weight",
+        "argument_type": "constant" if constant else "weight",
         "is_weight": True,
         "weight_name": name,
         "buffer_donor": buffer_donor,
@@ -102,6 +106,7 @@ def _export_abstract_params(
     output_dir: str,
     tp_size: int,
     *,
+    constants: frozenset[str] = frozenset(),
     subdir: str = "subgraphs",
 ) -> tuple[dict[str, Any], dict[str, int]]:
     """Lowers the `abstract_params.mlir` identity `f(x) -> x` with `donate_argnums`."""
@@ -137,6 +142,7 @@ def _export_abstract_params(
             slot=weight_slots[name],
             tp_size=tp_size,
             buffer_donor=True,
+            constant=name in constants,
         )
         inputs_meta.append(inp_entry)
         outputs_meta.append(
@@ -147,7 +153,7 @@ def _export_abstract_params(
                 "shape": inp_entry["shape"],
                 "dtype": inp_entry["dtype"],
                 "sharding": inp_entry["sharding"],
-                "argument_type": "weight",
+                "argument_type": inp_entry["argument_type"],
                 "buffer_donor": False,
             }
         )
@@ -160,12 +166,104 @@ def _export_abstract_params(
     return spec_dict, weight_slots
 
 
+def _lm_head_name(params_map: Mapping[str, Any]) -> str:
+    """The weight `compute_logits` projects with (tied embeddings fall back)."""
+    for cand in ("lm_head.weight", "model.embed_tokens.weight"):
+        if cand in params_map:
+            return cand
+    return next(iter(params_map))
+
+
+def _norm_params(params_map: Mapping[str, Any]) -> dict[str, api.ShapeDtypeStruct]:
+    return {
+        n: api.ShapeDtypeStruct(
+            shape=tuple(int(d) for d in s.shape),
+            dtype=tpu_lowering.dtype_name(s.dtype),
+            sharding=getattr(s, "sharding", None),
+        )
+        for n, s in params_map.items()
+    }
+
+
+def _state_specs(model: api.ExportableTextOnlyLLM) -> list[api.ShapeDtypeStruct]:
+    """Per-layer KV cache specs, from the model when it reports them."""
+    cfg = model.export_config
+    abstract_states_fn = getattr(model, "abstract_states", None)
+    if not callable(abstract_states_fn):
+        default_kv_shape = (
+            cfg.num_blocks,
+            cfg.block_size,
+            cfg.num_kv_heads * 2,
+            cfg.head_dim,
+        )
+        act_dtype_str = tpu_lowering.dtype_name(cfg.dtype)
+        return [
+            api.ShapeDtypeStruct(default_kv_shape, act_dtype_str)
+            for _ in range(cfg.num_layers)
+        ]
+    raw_states = list(abstract_states_fn())
+    if len(raw_states) != cfg.num_layers:
+        raise ValueError(
+            f"{type(model).__name__}.abstract_states() returned "
+            f"{len(raw_states)} state specs, expected cfg.num_layers == "
+            f"{cfg.num_layers}"
+        )
+    return [
+        api.ShapeDtypeStruct(
+            shape=tuple(int(d) for d in s.shape),
+            dtype=tpu_lowering.dtype_name(s.dtype),
+        )
+        for s in raw_states
+    ]
+
+
+def _main_args_read(mlir_text: str) -> set[int]:
+    """Indices of the `@main` arguments that its body reads."""
+    header = re.search(r"func\.func public @main\((.*)\)[^\n]*\{\n", mlir_text)
+    if header is None:
+        raise ValueError("MLIR module has no public @main")
+    num_args = len(re.findall(r"%arg\d+:", header.group(1)))
+    depth, end = 1, header.end()
+    while depth and end < len(mlir_text):
+        depth += {"{": 1, "}": -1}.get(mlir_text[end], 0)
+        end += 1
+    body = mlir_text[header.end() : end]
+    return {k for k in range(num_args) if re.search(rf"%arg{k}\b", body)}
+
+
+def _params_read_by_forward(
+    model: api.ExportableTextOnlyLLM, params_map: Mapping[str, Any]
+) -> dict[str, Any]:
+    """Drops the forward weights that the forward graph never reads.
+
+    Candidates include buffers that only some configurations use (vocabulary
+    shard bounds are read only under tensor parallelism), so the smallest forward
+    bucket is lowered once with every candidate and unread ones are removed.
+    """
+    cfg = model.export_config
+    lm_head_name = _lm_head_name(params_map)
+    names = [n for n in params_map if n != lm_head_name]
+    bucket = min(cfg.token_buckets)
+    mlir_text = tpu_lowering.lower_torch_forward_to_mlir(
+        model,
+        user_inputs=_user_inputs(cfg, bucket),
+        forward_names=names,
+        params_map=_norm_params(params_map),
+        state_specs=_state_specs(model),
+        bucket_size=bucket,
+    )
+    read = _main_args_read(mlir_text)
+    kept = {n for i, n in enumerate(names) if _NUM_USER_INPUTS + i in read}
+    return {n: s for n, s in params_map.items() if n == lm_head_name or n in kept}
+
+
 def _export_text_only_llm_functions(
     model: api.ExportableTextOnlyLLM,
     params_map: Mapping[str, Any],
     weight_slots: Mapping[str, int],
     output_dir: str,
     *,
+    constants: frozenset[str] = frozenset(),
     subdir: str = "subgraphs",
 ) -> dict[str, dict[str, Any]]:
     """Lowers `forward`, `compute_logits`, and the samplers across all buckets."""
@@ -175,18 +273,8 @@ def _export_text_only_llm_functions(
     target_dir = os.path.join(output_dir, subdir) if subdir else output_dir
     os.makedirs(target_dir, exist_ok=True)
 
-    forward_names = [n for n in params_map if n != "lm_head.weight"]
-    if not forward_names:
-        forward_names = list(params_map.keys())
-    lm_head_name = (
-        "lm_head.weight"
-        if "lm_head.weight" in params_map
-        else (
-            "model.embed_tokens.weight"
-            if "model.embed_tokens.weight" in params_map
-            else next(iter(params_map.keys()))
-        )
-    )
+    lm_head_name = _lm_head_name(params_map)
+    forward_names = [n for n in params_map if n != lm_head_name] or list(params_map)
     lm_head_spec = params_map[lm_head_name]
     lm_head_entry = _weight_input_entry(
         lm_head_name,
@@ -196,46 +284,12 @@ def _export_text_only_llm_functions(
         tp_size=cfg.tensor_parallel_size,
         buffer_donor=False,
     )
-
-    default_kv_shape = (
-        cfg.num_blocks,
-        cfg.block_size,
-        cfg.num_kv_heads * 2,
-        cfg.head_dim,
-    )
-    abstract_states_fn = getattr(model, "abstract_states", None)
-    if callable(abstract_states_fn):
-        raw_states = list(abstract_states_fn())
-        if len(raw_states) != cfg.num_layers:
-            raise ValueError(
-                f"{type(model).__name__}.abstract_states() returned "
-                f"{len(raw_states)} state specs, expected cfg.num_layers == "
-                f"{cfg.num_layers}"
-            )
-        state_specs = [
-            api.ShapeDtypeStruct(
-                shape=tuple(int(d) for d in s.shape),
-                dtype=tpu_lowering.dtype_name(s.dtype),
-            )
-            for s in raw_states
-        ]
-    else:
-        state_specs = [
-            api.ShapeDtypeStruct(default_kv_shape, act_dtype_str)
-            for _ in range(cfg.num_layers)
-        ]
+    state_specs = _state_specs(model)
 
     num_fwd_weights = len(forward_names)
     state_start = _NUM_USER_INPUTS + num_fwd_weights
 
-    norm_params = {
-        n: api.ShapeDtypeStruct(
-            shape=tuple(int(d) for d in s.shape),
-            dtype=tpu_lowering.dtype_name(s.dtype),
-            sharding=getattr(s, "sharding", None),
-        )
-        for n, s in params_map.items()
-    }
+    norm_params = _norm_params(params_map)
 
     forward_variants: dict[str, Any] = {}
     for b_idx, bucket_size in enumerate(cfg.token_buckets):
@@ -277,6 +331,7 @@ def _export_text_only_llm_functions(
                     slot=weight_slots[w_name],
                     tp_size=cfg.tensor_parallel_size,
                     buffer_donor=False,
+                    constant=w_name in constants,
                 )
             )
         for s_i, s_spec in enumerate(state_specs):
@@ -421,8 +476,15 @@ def _emit_declarative_weight_json(
     output_dir: str,
     dp_size: int,
     tp_size: int,
+    *,
+    constants: frozenset[str] = frozenset(),
 ) -> None:
-    """Emits `serving_checkpoint/weight.json` from HF metadata; loads no tensors."""
+    """Emits `serving_checkpoint/weight.json` from HF metadata; loads no tensors.
+
+    Weights point at checkpoint tensors (`sources`, with the checkpoint's full
+    `source_shape`); constants carry their per-rank values (`axis_values`).
+    Gathering those values is collective, so every rank runs this.
+    """
     cfg = model.export_config
     ckpt_dir = os.path.join(output_dir, "serving_checkpoint")
     os.makedirs(ckpt_dir, exist_ok=True)
@@ -433,6 +495,9 @@ def _emit_declarative_weight_json(
         hf_meta, default_st = weight_mapper.read_hf_safetensors_metadata(
             cfg.hf_checkpoint_dir
         )
+    checkpoint_shapes = weight_mapper.read_hf_safetensors_shapes(
+        cfg.hf_checkpoint_dir, hf_meta
+    )
     torch_model = getattr(model, "model", None)
 
     weight_map: dict[str, Any] = {
@@ -449,6 +514,17 @@ def _emit_declarative_weight_json(
         slot_idx = weight_slots[name]
         shape_list = [int(d) for d in spec.shape]
         dt_str = tpu_lowering.dtype_name(spec.dtype)
+        if name in constants:
+            weight_map[name] = {
+                "index": slot_idx,
+                "shape": shape_list,
+                "dtype": tpu_lowering.dtype_spec(dt_str).weight_json_name,
+                "axis_values": {
+                    "axis": "tp",
+                    "values": model.constant_axis_values(name),  # type: ignore[attr-defined]
+                },
+            }
+            continue
         sharding_val = weight_mapper.infer_weight_sharding(
             name,
             shape_list,
@@ -467,6 +543,10 @@ def _emit_declarative_weight_json(
             dict(hf_meta),
             default_st,
         )
+        for src in resolved_sources:
+            full_shape = checkpoint_shapes.get(src.get("source_tensor", ""))
+            if full_shape is not None:
+                src["source_shape"] = full_shape
         weight_map[name] = {
             "index": slot_idx,
             "shape": shape_list,
@@ -574,12 +654,16 @@ def export(
     tp_size = cfg.tensor_parallel_size
     dp_size = int(getattr(cfg, "data_parallel_size", 1) or 1)
     pp_size = int(getattr(cfg, "pipeline_parallel_size", 1) or 1)
-    params_map = model.abstract_params()
+    params_map = _params_read_by_forward(model, model.abstract_params())
+    constant_names_fn = getattr(model, "constant_names", None)
+    constants = frozenset(
+        constant_names_fn() if callable(constant_names_fn) else ()
+    ) & frozenset(params_map)
 
     os.makedirs(output_dir, exist_ok=True)
 
     abs_spec, weight_slots = _export_abstract_params(
-        params_map, output_dir, tp_size=tp_size, subdir=subdir
+        params_map, output_dir, tp_size=tp_size, constants=constants, subdir=subdir
     )
 
     functions_dict: dict[str, dict[str, Any]] = {
@@ -589,7 +673,7 @@ def export(
     }
 
     llm_funcs = _export_text_only_llm_functions(
-        model, params_map, weight_slots, output_dir, subdir=subdir
+        model, params_map, weight_slots, output_dir, constants=constants, subdir=subdir
     )
     functions_dict.update(llm_funcs)
     serving_config = _emit_model_companion_files(cfg, output_dir)
@@ -641,4 +725,5 @@ def export(
             output_dir,
             dp_size,
             tp_size,
+            constants=constants,
         )

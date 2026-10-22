@@ -19,7 +19,7 @@ import contextlib
 import json
 import re
 import struct
-from collections.abc import Collection, Sequence
+from collections.abc import Collection, Mapping, Sequence
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +36,23 @@ def read_safetensors_header(file_path: str | Path) -> dict[str, Any]:
     if not isinstance(header, dict):
         raise ValueError(f"Safetensors header is not a JSON object: {file_path}")
     return {k: v for k, v in header.items() if k != "__metadata__"}
+
+
+def read_hf_safetensors_shapes(
+    hf_dir: str | Path | None, tensor_to_file: Mapping[str, str]
+) -> dict[str, list[int]]:
+    """Full shape of every checkpoint tensor, read from the safetensors headers."""
+    if not hf_dir or not tensor_to_file:
+        return {}
+    shapes: dict[str, list[int]] = {}
+    for file_name in sorted(set(tensor_to_file.values())):
+        path = Path(hf_dir) / file_name
+        if not path.is_file():
+            continue
+        for tensor, info in read_safetensors_header(path).items():
+            if isinstance(info, dict) and "shape" in info:
+                shapes[tensor] = [int(d) for d in info["shape"]]
+    return shapes
 
 
 def read_hf_safetensors_metadata(

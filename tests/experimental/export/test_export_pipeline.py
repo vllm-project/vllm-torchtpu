@@ -77,7 +77,11 @@ def _mock_lower_torch_callable_to_mlir(
         arg_strs.append(f"%arg{i}: {_fmt(s.shape, s.dtype)}{attr}")
     out_strs = [_fmt(tuple(int(d) for d in t.shape), t.dtype) for t in out_tensors]
     ret_sig = f"({', '.join(out_strs)})" if len(out_strs) != 1 else out_strs[0]
-    body_lines: list[str] = []
+    # Read every argument, as a traced graph reads every input it uses.
+    body_lines: list[str] = [
+        f'    %r{i} = "stablehlo.optimization_barrier"(%arg{i}) : ({t}) -> {t}'
+        for i, t in enumerate(_fmt(s.shape, s.dtype) for s in arg_specs)
+    ]
     ret_vals: list[str] = []
     for i, t_str in enumerate(out_strs):
         body_lines.append(f"    %c{i} = stablehlo.constant dense<0> : {t_str}")
@@ -343,6 +347,21 @@ def test_end_to_end_export_declarative_weights_only(tmp_path) -> None:
     )
 
 
+@pytest.fixture
+def single_rank_tp_group() -> Any:
+    """A one-rank tensor-parallel group: gathering over it returns the input.
+
+    This is what vLLM's all-gather does at world size 1, without needing a TPU
+    process group on the CPU test host.
+    """
+    with mock.patch(
+        "vllm.distributed.tensor_model_parallel_all_gather",
+        lambda x, dim=-1: x,
+    ):
+        yield
+
+
+@pytest.mark.usefixtures("single_rank_tp_group")
 def test_universal_adapter_1d_and_2d_mrope_export_and_cli(tmp_path) -> None:
     hf_dir = tmp_path / "hf_ckpt"
     hf_dir.mkdir()
@@ -560,13 +579,8 @@ def test_generation_config_is_not_declared_when_the_checkpoint_has_none(
     assert not (out_dir / "generation_config.json").exists()
 
 
-@pytest.mark.parametrize(
-    ("tp", "dp", "pp"), [(2, 1, 1), (4, 1, 1), (1, 2, 1), (1, 1, 2)]
-)
-def test_build_export_config_rejects_multi_device_parallelism(
-    tmp_path: Path, tp: int, dp: int, pp: int
-) -> None:
-    vllm_cfg = SimpleNamespace(
+def _parallel_vllm_cfg(tmp_path: Path, tp: int, dp: int, pp: int) -> Any:
+    return SimpleNamespace(
         model_config=SimpleNamespace(
             model=str(tmp_path), dtype="bfloat16", max_model_len=128
         ),
@@ -578,8 +592,85 @@ def test_build_export_config_rejects_multi_device_parallelism(
             pipeline_parallel_size=pp,
         ),
     )
-    with pytest.raises(NotImplementedError, match=f"tp={tp} dp={dp} pp={pp}"):
-        universal_adapter.build_export_config_from_vllm(vllm_cfg)
+
+
+@pytest.mark.parametrize(("dp", "pp"), [(2, 1), (1, 2)])
+def test_build_export_config_rejects_data_and_pipeline_parallelism(
+    tmp_path: Path, dp: int, pp: int
+) -> None:
+    with pytest.raises(NotImplementedError, match=f"dp={dp} pp={pp}"):
+        universal_adapter.build_export_config_from_vllm(
+            _parallel_vllm_cfg(tmp_path, 1, dp, pp)
+        )
+
+
+@pytest.mark.parametrize("tp", [1, 2, 4])
+def test_build_export_config_spans_one_partition_per_tp_rank(
+    tmp_path: Path, tp: int
+) -> None:
+    cfg = universal_adapter.build_export_config_from_vllm(
+        _parallel_vllm_cfg(tmp_path, tp, 1, 1)
+    )
+    assert (cfg.num_replicas, cfg.num_partitions) == (1, tp)
+    assert cfg.tensor_parallel_size == tp
+    assert cfg.use_spmd_partitioning is True
+
+
+def test_main_args_read_finds_the_arguments_main_reads() -> None:
+    args = ", ".join(f"%arg{i}: tensor<i64>" for i in range(11))
+    mlir = "\n".join(
+        [
+            "module {",
+            f"  func.func public @main({args}) -> tensor<i64> {{",
+            "    %0 = stablehlo.add %arg2, %arg10 : tensor<i64>",
+            "    return %0 : tensor<i64>",
+            "  }",
+            "  func.func private @helper(%arg1: tensor<i64>) -> tensor<i64> {",
+            "    return %arg1 : tensor<i64>",
+            "  }",
+            "}",
+        ]
+    )
+    # %arg10 does not count as %arg1, and @helper's own %arg1 is not @main's.
+    assert exporter._main_args_read(mlir) == {2, 10}
+
+
+def test_params_read_by_forward_drops_unread_forward_weights() -> None:
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny", vocab_size=64, token_buckets=(8, 16), num_layers=1
+    )
+    params = {
+        "model.embed_tokens.weight": api.ShapeDtypeStruct((64, 8), "bf16"),
+        "model.embed_tokens.org_vocab_start_index": api.ShapeDtypeStruct((), "i64"),
+        "model.norm.weight": api.ShapeDtypeStruct((8,), "bf16"),
+        "lm_head.weight": api.ShapeDtypeStruct((64, 8), "bf16"),
+    }
+    model = SimpleNamespace(
+        export_config=cfg,
+        abstract_states=lambda: [api.ShapeDtypeStruct((4, 8, 2, 2, 4), "bf16")],
+    )
+    num_user = len(exporter._user_inputs(cfg, 8))
+
+    def fake_lower(_model: Any, *, forward_names: Sequence[str], **_: Any) -> str:
+        assert "lm_head.weight" not in forward_names
+        read = [
+            num_user + forward_names.index(n)
+            for n in ("model.embed_tokens.weight", "model.norm.weight")
+        ]
+        args = ", ".join(f"%arg{i}: tensor<i32>" for i in range(num_user + 4))
+        uses = "\n".join(
+            f"    %u{i} = stablehlo.abs %arg{i} : tensor<i32>" for i in read
+        )
+        header = f"  func.func public @main({args}) -> () {{"
+        return "\n".join(["module {", header, uses, "  }", "}", ""])
+
+    with mock.patch.object(tpu_lowering, "lower_torch_forward_to_mlir", fake_lower):
+        kept = exporter._params_read_by_forward(model, params)
+    assert list(kept) == [
+        "model.embed_tokens.weight",
+        "model.norm.weight",
+        "lm_head.weight",
+    ]
 
 
 def test_resolve_hf_checkpoint_dir_uses_cached_hub_snapshot(tmp_path: Path) -> None:
@@ -599,3 +690,138 @@ def test_resolve_hf_checkpoint_dir_uses_cached_hub_snapshot(tmp_path: Path) -> N
         assert resolve("org/tiny") == str(snapshot)
         with pytest.raises(FileNotFoundError, match="org/missing"):
             resolve("org/missing")
+
+
+def test_weight_json_declares_constants_and_full_source_shapes(tmp_path: Path) -> None:
+    hf_dir = tmp_path / "hf"
+    hf_dir.mkdir()
+    header = {
+        "model.embed_tokens.weight": {
+            "dtype": "BF16",
+            "shape": [64, 8],
+            "data_offsets": [0, 1024],
+        }
+    }
+    hb = json.dumps(header).encode("utf-8")
+    with open(hf_dir / "model.safetensors", "wb") as f:
+        f.write(struct.pack("<Q", len(hb)))
+        f.write(hb)
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny", vocab_size=64, hf_checkpoint_dir=str(hf_dir)
+    )
+    # Rank-local shapes of a tensor-parallel size 2 export.
+    params = {
+        "model.embed_tokens.weight": api.ShapeDtypeStruct(
+            (32, 8), "bf16", sharding=["tp", None]
+        ),
+        "model.embed_tokens.org_vocab_start_index": api.ShapeDtypeStruct((), "i64"),
+    }
+    model = SimpleNamespace(
+        export_config=cfg,
+        model=None,
+        constant_axis_values=lambda name: [0, 32],
+    )
+    out_dir = tmp_path / "artifact"
+    exporter._emit_declarative_weight_json(
+        model,
+        params,
+        {"model.embed_tokens.weight": 6, "model.embed_tokens.org_vocab_start_index": 7},
+        str(out_dir),
+        1,
+        2,
+        constants=frozenset({"model.embed_tokens.org_vocab_start_index"}),
+    )
+
+    wjson = json.loads((out_dir / "serving_checkpoint" / "weight.json").read_text())
+    embed = wjson["model.embed_tokens.weight"]
+    assert embed["shape"] == [32, 8]
+    assert embed["sources"][0]["source_shape"] == [64, 8]
+    assert wjson["model.embed_tokens.org_vocab_start_index"] == {
+        "index": 7,
+        "shape": [],
+        "dtype": "int64",
+        "axis_values": {"axis": "tp", "values": [0, 32]},
+    }
+
+
+@pytest.mark.usefixtures("single_rank_tp_group")
+def test_compute_logits_returns_the_vocabulary_without_padding() -> None:
+    # The lm_head shard carries 2 padding rows past the 10-token vocabulary.
+    exportable = SimpleNamespace(
+        _export_config=SimpleNamespace(vocab_size=10),
+        _local_logits=lambda h, w: torch.matmul(h, w.T),
+    )
+    hidden = torch.ones(3, 4)
+    lm_head = torch.arange(48.0).reshape(12, 4)
+    logits = universal_adapter.UniversalVllmExportableLLM.compute_logits(
+        exportable, hidden, lm_head
+    )
+    assert logits.shape == (3, 10)
+    assert torch.equal(logits, torch.matmul(hidden, lm_head.T)[:, :10])
+
+
+def test_worker_env_takes_the_first_tp_devices_of_the_slice() -> None:
+    launch = {
+        "TORCH_TPU_SLICEBUILDER_ADDRESSES": "h:8070,h:8071,h:8072,h:8073",
+        "TORCH_TPU_TOPOLOGY": "1,1,1,2",
+        "WORLD_SIZE": "8",
+        "MASTER_ADDR": "h",
+    }
+    done = SimpleNamespace(stdout="log line\n" + json.dumps(launch) + "\n")
+    with mock.patch.object(cli.subprocess, "run", return_value=done):
+        env = cli._worker_env(2)
+    assert env["TORCH_TPU_SLICEBUILDER_ADDRESSES"] == "h:8070,h:8071"
+    assert env["TORCH_TPU_TOPOLOGY"] == "1,1,1,2"
+    assert env["WORLD_SIZE"] == "2"
+    assert env["MASTER_ADDR"] == "h"
+    with (
+        mock.patch.object(cli.subprocess, "run", return_value=done),
+        pytest.raises(ValueError, match="needs 8 TPU devices"),
+    ):
+        cli._worker_env(8)
+
+
+class _FakeWorker:
+    """Stands in for a worker process: writes a file named after its rank."""
+
+    fail_ranks: tuple[int, ...] = ()
+
+    def __init__(self, cmd: Sequence[str], env: Mapping[str, str]) -> None:
+        rank = int(env["RANK"])
+        assert cmd[-1] == "--export-worker"
+        out_dir = Path(cmd[cmd.index("--output-dir", len(cmd) - 4) + 1])
+        out_dir.mkdir(parents=True)
+        (out_dir / "metadata.json").write_text(json.dumps({"rank": rank}))
+        self._code = 1 if rank in self.fail_ranks else 0
+
+    def wait(self) -> int:
+        return self._code
+
+    def poll(self) -> int:
+        return self._code
+
+
+def test_launch_workers_keeps_rank0_output(tmp_path: Path) -> None:
+    out_dir = tmp_path / "out"
+    with (
+        mock.patch.object(cli, "_worker_env", lambda tp: {}),
+        mock.patch.object(cli.subprocess, "Popen", _FakeWorker),
+    ):
+        cli._launch_workers(["--model", "m"], 4, str(out_dir))
+    assert json.loads((out_dir / "metadata.json").read_text()) == {"rank": 0}
+    assert not list(tmp_path.glob(".export_ranks_*"))
+
+
+def test_launch_workers_fails_when_a_worker_fails(tmp_path: Path) -> None:
+    class Failing(_FakeWorker):
+        fail_ranks = (1,)
+
+    out_dir = tmp_path / "out"
+    with (
+        mock.patch.object(cli, "_worker_env", lambda tp: {}),
+        mock.patch.object(cli.subprocess, "Popen", Failing),
+        pytest.raises(RuntimeError, match=r"ranks \[1\] failed"),
+    ):
+        cli._launch_workers(["--model", "m"], 2, str(out_dir))
+    assert not out_dir.exists()
+    assert not list(tmp_path.glob(".export_ranks_*"))

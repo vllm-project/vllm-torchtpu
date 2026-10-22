@@ -148,13 +148,10 @@ def build_export_config_from_vllm(
     tp_size = int(getattr(parallel_cfg, "tensor_parallel_size", 1) or 1)
     dp_size = int(getattr(parallel_cfg, "data_parallel_size", 1) or 1)
     pp_size = int(getattr(parallel_cfg, "pipeline_parallel_size", 1) or 1)
-    # The model is built and traced on one device (`ensure_model_parallel_initialized
-    # (1, 1)` below), so the graphs are always single-device programs. Stamping a
-    # larger mesh on them would describe per-device shards the graphs do not have.
-    if (tp_size, dp_size, pp_size) != (1, 1, 1):
+    if (dp_size, pp_size) != (1, 1):
         raise NotImplementedError(
-            "export supports only tensor/data/pipeline parallel size 1, got "
-            f"tp={tp_size} dp={dp_size} pp={pp_size}"
+            f"export supports only data/pipeline parallel size 1, got "
+            f"dp={dp_size} pp={pp_size}"
         )
 
     if target_tpu is None:
@@ -265,7 +262,7 @@ def build_export_config_from_vllm(
         target_tpu=str(target_tpu),
         num_replicas=1,
         num_partitions=tp_size,
-        use_spmd_partitioning=tp_size > 1,
+        use_spmd_partitioning=True,
         data_parallel_size=dp_size,
         pipeline_parallel_size=pp_size,
         vocab_size=vocab_size,
@@ -304,15 +301,38 @@ def _create_single_device_tpu_mesh() -> Any:
     return None
 
 
+def init_export_distributed_environment(vllm_config: Any) -> None:
+    """Joins the process group the export launcher set up for this rank.
+
+    The launcher (`cli.main`) starts one worker per tensor-parallel rank and sets
+    `RANK`, `LOCAL_RANK`, `WORLD_SIZE`, `MASTER_ADDR` and `MASTER_PORT`; a
+    single-device export is the one-worker case.
+    """
+    from vllm.distributed import init_distributed_environment
+
+    from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+
+    world_size = int(os.environ["WORLD_SIZE"])
+    tp_size = vllm_config.parallel_config.tensor_parallel_size
+    if world_size != tp_size:
+        raise ValueError(
+            f"WORLD_SIZE={world_size} does not match tensor_parallel_size={tp_size}"
+        )
+    init_distributed_environment(
+        world_size=world_size,
+        rank=int(os.environ["RANK"]),
+        local_rank=int(os.environ["LOCAL_RANK"]),
+        distributed_init_method="env://",
+        backend=TpuPlatform.get_worker_distributed_backend(world_size),
+    )
+
+
 def load_dummy_vllm_model(vllm_config: Any) -> nn.Module:
     """Loads a vLLM model with `load_format='dummy'` on TPU (zero disk weight IO)."""
-    import socket
-
     import torch.distributed as dist
     from vllm.config import set_current_vllm_config
     from vllm.distributed import (
         ensure_model_parallel_initialized,
-        init_distributed_environment,
         model_parallel_is_initialized,
     )
     from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
@@ -325,18 +345,11 @@ def load_dummy_vllm_model(vllm_config: Any) -> nn.Module:
 
     with set_current_vllm_config(vllm_config):
         if not dist.is_initialized():
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-                sock.bind(("127.0.0.1", 0))
-                port = sock.getsockname()[1]
-            init_distributed_environment(
-                world_size=1,
-                rank=0,
-                local_rank=0,
-                distributed_init_method=f"tcp://127.0.0.1:{port}",
-                backend="gloo",
-            )
+            init_export_distributed_environment(vllm_config)
         if not model_parallel_is_initialized():
-            ensure_model_parallel_initialized(1, 1)
+            ensure_model_parallel_initialized(
+                vllm_config.parallel_config.tensor_parallel_size, 1
+            )
 
         mesh = _create_single_device_tpu_mesh()
         with contextlib.ExitStack() as stack:
@@ -375,6 +388,10 @@ def load_dummy_vllm_model(vllm_config: Any) -> nn.Module:
 
             model._export_tpu_mesh = mesh  # type: ignore[attr-defined]
             return model
+
+
+# Constants are written inline into weight.json, so only small buffers qualify.
+_MAX_CONSTANT_ELEMENTS = 4096
 
 
 class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
@@ -445,7 +462,12 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         return self._export_config
 
     def abstract_params(self) -> Mapping[str, api.ShapeDtypeStruct]:
-        """Builds abstract parameter specs from `self.model.named_parameters()`."""
+        """Builds abstract specs for the model's parameters and buffers.
+
+        Buffers are constants: not in the checkpoint, their per-rank values come
+        from `constant_axis_values`. The exporter keeps only the tensors that a
+        subgraph actually reads.
+        """
         params: dict[str, api.ShapeDtypeStruct] = {}
         tp_size = self._export_config.tensor_parallel_size
         named_params = list(self._model.named_parameters())
@@ -467,6 +489,15 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 sharding=sharding,
             )
 
+        for name, buf in self._model.named_buffers():
+            params.setdefault(
+                name,
+                api.ShapeDtypeStruct(
+                    shape=tuple(int(d) for d in buf.shape),
+                    dtype=tpu_lowering.dtype_name(buf.dtype),
+                ),
+            )
+
         # Ensure lm_head.weight is present even when tied to embed_tokens.weight
         if "lm_head.weight" not in params:
             for cand in (
@@ -483,6 +514,31 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                     )
                     break
         return params
+
+    def constant_names(self) -> set[str]:
+        """Names in `abstract_params()` that are buffers rather than parameters."""
+        params = {name for name, _ in self._model.named_parameters()}
+        return {name for name, _ in self._model.named_buffers() if name not in params}
+
+    def constant_axis_values(self, name: str) -> list[Any]:
+        """Values of buffer `name` on every tensor-parallel rank, in rank order.
+
+        Collective: every rank must call it for the same names in the same order.
+        """
+        from vllm.distributed import get_tp_group
+
+        buf = dict(self._model.named_buffers())[name]
+        if buf.numel() > _MAX_CONSTANT_ELEMENTS:
+            raise ValueError(
+                f"buffer {name} has {buf.numel()} elements; constants are declared "
+                f"inline in weight.json and are limited to {_MAX_CONSTANT_ELEMENTS}"
+            )
+        local = buf.detach().cpu().flatten().tolist()
+        value = local[0] if buf.dim() == 0 else local
+        group = get_tp_group()
+        values: list[Any] = [None] * group.world_size
+        torch.distributed.all_gather_object(values, value, group=group.cpu_group)
+        return values
 
     def _attention_layers(self) -> list[Any]:
         """Returns the ordered attention layers of the wrapped model."""
@@ -579,10 +635,12 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             for k, v in weights.items():
                 if k.startswith(prefix):
                     call_weights[k[len(prefix) :]] = v
-                elif k != "lm_head.weight":
+                elif not k.startswith("lm_head."):
                     call_weights[k] = v
         else:
-            call_weights = {k: v for k, v in weights.items() if k != "lm_head.weight"}
+            call_weights = {
+                k: v for k, v in weights.items() if not k.startswith("lm_head.")
+            }
 
         attn_layers = self._attention_layers()
         working_kvs = list(kv_caches)
@@ -671,7 +729,21 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         hidden_states: torch.Tensor,
         lm_head_weight: torch.Tensor,
     ) -> torch.Tensor:
-        """Projects `hidden_states[R, hidden_size]` to `logits[R, vocab_size]`."""
+        """Projects `hidden_states[R, hidden_size]` to `logits[R, vocab_size]`.
+
+        Each rank holds one vocabulary shard of `lm_head_weight`; the shards are
+        gathered and the vocabulary padding dropped, so every rank returns the full
+        vocabulary (at tensor parallel size 1 the gather returns its input).
+        """
+        from vllm.distributed import tensor_model_parallel_all_gather
+
+        local = self._local_logits(hidden_states, lm_head_weight)
+        gathered = tensor_model_parallel_all_gather(local, dim=-1)
+        return gathered[..., : self._export_config.vocab_size]
+
+    def _local_logits(
+        self, hidden_states: torch.Tensor, lm_head_weight: torch.Tensor
+    ) -> torch.Tensor:
         lm_head_mod = getattr(self._model, "lm_head", None)
         if isinstance(lm_head_mod, nn.Module) and hasattr(lm_head_mod, "weight"):
             with contextlib.suppress(Exception):

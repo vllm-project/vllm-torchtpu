@@ -16,6 +16,12 @@
 from __future__ import annotations
 
 import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
 from collections.abc import Sequence
 from typing import Any
 
@@ -151,6 +157,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Override number of paged KV cache blocks per layer.",
     )
+    # Internal: marks a worker process started by `main`.
+    parser.add_argument("--export-worker", action="store_true", help=argparse.SUPPRESS)
     return parser
 
 
@@ -215,8 +223,91 @@ def run_export_from_args(
     return exportable.export_config
 
 
+# Printed by a short-lived helper process, so the launcher never opens the TPU.
+_LAUNCH_ENV_SCRIPT = """
+import json, os, sys
+import torch
+from vllm_torchtpu.platforms.tpu_platform import TpuPlatform
+before = dict(os.environ)
+torch.tpu.distributed.set_tpu_launch_env()
+env = {k: v for k, v in os.environ.items() if before.get(k) != v}
+env["TORCH_TPU_TOPOLOGY"] = TpuPlatform._get_tpu_topology(int(sys.argv[1]))
+print(json.dumps(env))
+"""
+
+
+def _worker_env(tp_size: int) -> dict[str, str]:
+    """Environment shared by the workers of a `tp_size`-device export."""
+    out = subprocess.run(
+        [sys.executable, "-c", _LAUNCH_ENV_SCRIPT, str(tp_size)],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    launch = json.loads(out.strip().splitlines()[-1])
+    addresses = launch["TORCH_TPU_SLICEBUILDER_ADDRESSES"].split(",")
+    if len(addresses) < tp_size:
+        raise ValueError(
+            f"tensor_parallel_size={tp_size} needs {tp_size} TPU devices, the "
+            f"slice has {len(addresses)}"
+        )
+    env = dict(os.environ)
+    env.update({k: str(v) for k, v in launch.items()})
+    env.update(
+        {
+            "TORCH_TPU_SLICEBUILDER_ADDRESSES": ",".join(addresses[:tp_size]),
+            "WORLD_SIZE": str(tp_size),
+        }
+    )
+    return env
+
+
+def _launch_workers(argv: Sequence[str], tp_size: int, output_dir: str) -> None:
+    """Runs one export worker per tensor-parallel rank and keeps rank 0's output.
+
+    Every rank traces the same per-device programs (collectives need all of
+    them); rank 0's artifact is copied to `output_dir`.
+    """
+    env = _worker_env(tp_size)
+    rank_root = tempfile.mkdtemp(
+        prefix=".export_ranks_", dir=os.path.dirname(os.path.abspath(output_dir))
+    )
+    procs = []
+    try:
+        for rank in range(tp_size):
+            rank_env = dict(env, RANK=str(rank), LOCAL_RANK=str(rank))
+            rank_dir = os.path.join(rank_root, f"rank{rank}")
+            procs.append(
+                subprocess.Popen(
+                    [sys.executable, "-m", "vllm_torchtpu.experimental.export"]
+                    + [*argv, "--output-dir", rank_dir, "--export-worker"],
+                    env=rank_env,
+                )
+            )
+        failed = [r for r, proc in enumerate(procs) if proc.wait() != 0]
+        if failed:
+            raise RuntimeError(f"export workers for ranks {failed} failed")
+        shutil.copytree(
+            os.path.join(rank_root, "rank0"), output_dir, dirs_exist_ok=True
+        )
+    finally:
+        for proc in procs:
+            if proc.poll() is None:
+                proc.kill()
+        shutil.rmtree(rank_root, ignore_errors=True)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    """CLI entrypoint for `python -m vllm_torchtpu.experimental.export`."""
+    """CLI entrypoint for `python -m vllm_torchtpu.experimental.export`.
+
+    Starts one worker process per tensor-parallel rank (one for a single-device
+    export); each worker runs `run_export_from_args`.
+    """
+    argv = list(sys.argv[1:] if argv is None else argv)
     args = parse_args(argv)
-    run_export_from_args(args)
+    if args.export_worker:
+        run_export_from_args(args)
+        return 0
+    tp_size = int(getattr(args, "tensor_parallel_size", 1) or 1)
+    _launch_workers(argv, tp_size, args.output_dir)
     return 0
