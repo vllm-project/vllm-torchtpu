@@ -286,6 +286,41 @@ def test_decode_eligibility_rejects_invalid_contracts(monkeypatch, fp8, case):
             qsa_decode_attention(*args, kv_heads=2, k_scale=scale)
 
 
+@pytest.mark.parametrize("supported", [False, True])
+def test_qsa_decode_dispatch_preserves_rpa_fallback(monkeypatch, supported):
+    from vllm_torchtpu.kernels.qwen4_exp import qsa_rpa
+
+    monkeypatch.setattr(
+        pltpu,
+        "get_tpu_info",
+        lambda: pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1),
+    )
+    args = _specs()
+    if not supported:
+        args[0] = jax.ShapeDtypeStruct((8, 25, 256), jnp.bfloat16)
+        args[1] = args[0]
+    used = []
+
+    def fused(*inputs, **options):
+        used.append("fused")
+        return inputs[0], inputs[5]
+
+    def baseline(*inputs, **options):
+        used.append("rpa")
+        return inputs[0], inputs[5]
+
+    from vllm_torchtpu.kernels.sparse_gqa_decode import decode
+
+    monkeypatch.setattr(decode, "execute_decode", fused)
+    monkeypatch.setattr(qsa_rpa, "rpa_attention", baseline)
+    out, cache = qsa_rpa.qsa_attention(
+        *args, jax.ShapeDtypeStruct((9,), jnp.int32), kv_heads=2, ratio=4
+    )
+    assert used == (["fused"] if supported else ["rpa"])
+    assert out is args[0]
+    assert cache is args[5]
+
+
 @pytest.mark.parametrize("fp8", [False, True])
 @pytest.mark.parametrize(
     "batch,page,columns",

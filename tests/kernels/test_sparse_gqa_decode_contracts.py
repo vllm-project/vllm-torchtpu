@@ -15,7 +15,12 @@
 
 import dataclasses
 import functools
+import hashlib
 import math
+import runpy
+import sys
+import types
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -33,6 +38,28 @@ from vllm_torchtpu.kernels.sparse_gqa_decode.planning import (
     resource_usage,
 )
 from vllm_torchtpu.kernels.sparse_gqa_decode.tuned_block_sizes import DecodePolicy
+
+
+def test_benchmark_provenance_records_late_loaded_sources(monkeypatch, tmp_path):
+    from vllm_torchtpu.kernels.qwen4_exp import qsa_rpa
+
+    script = (
+        Path(qsa_rpa.__file__).parents[4] / "scripts/benchmark_sparse_gqa_decode.py"
+    )
+    provenance = runpy.run_path(str(script))["provenance"]
+    before = provenance([])
+    source = tmp_path / "late_kernel.py"
+    source.write_text("# controlled late-loaded source\n")
+    name = "vllm_torchtpu.kernels.sparse_gqa_decode._late_probe"
+    module = types.ModuleType(name)
+    module.__file__ = str(source)
+    monkeypatch.setitem(sys.modules, name, module)
+    after = provenance([])
+    assert name not in before["loaded_sources"]
+    assert after["loaded_sources"][name] == dict(
+        path=str(source.resolve()),
+        sha256=hashlib.sha256(source.read_bytes()).hexdigest(),
+    )
 
 
 def test_protocol_field_growth_fails_closed(monkeypatch):
@@ -85,6 +112,36 @@ def test_resource_bytes_and_boundary_are_independent_of_policy_names(monkeypatch
             info, vmem_capacity_bytes=math.ceil(usage.vmem_estimate_bytes / 0.8) - 1
         )
     )
+
+
+def test_planned_routing_reuses_plan_and_actual_small_chunk(monkeypatch):
+    import vllm_torchtpu.kernels.sparse_gqa_decode as public
+    from vllm_torchtpu.kernels.qwen4_exp import qsa_rpa
+    from vllm_torchtpu.kernels.sparse_gqa_decode import decode
+
+    info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+    monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+    args = _specs()
+    calls = []
+    real_plan = public.plan_decode
+
+    def counted(*a, **kw):
+        result = real_plan(*a, **kw)
+        calls.append(result)
+        return result
+
+    def execute(*a, launch, **kw):
+        assert launch is calls[0]
+        smaller = launch.config_for_batch(3)
+        assert smaller.serve.num_seqs == 3 and smaller.serve.num_page_indices == 3 * 513
+        return a[0], a[5]
+
+    monkeypatch.setattr(public, "plan_decode", counted)
+    monkeypatch.setattr(decode, "execute_decode", execute)
+    qsa_rpa.qsa_attention(
+        *args, jax.ShapeDtypeStruct((9,), jnp.int32), kv_heads=2, ratio=4
+    )
+    assert len(calls) == 1
 
 
 def test_policy_static_identity_and_layout_constraints(monkeypatch):
