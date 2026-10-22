@@ -130,8 +130,20 @@ def rowwise_attention(monkeypatch):
         return pool.at[11, 1].set(jnp.sum(ring).astype(pool.dtype))
 
     def select_blocks(query, pool, lengths, table, req, starts, context, **kw):
+        # The per-token indexer reads each row's request from `req` and its
+        # causal length from `lengths`; the shared-stream one derives both
+        # from the ragged batch `starts`/`context`. Any disagreement between
+        # the two descriptions shifts the stand-in's blocks.
         score = jnp.sum(query.astype(jnp.float32), axis=(1, 2)) > 0
-        base = lengths // kw["ratio"] + 7 * req + score.astype(jnp.int32)
+        token = jnp.arange(len(query), dtype=jnp.int32)
+        owner = jnp.searchsorted(starts[1:], token, side="right")
+        owner = jnp.minimum(owner, len(context) - 1)
+        derived = context[owner] + token - starts[owner] + 1
+        mismatch = (derived != lengths).astype(jnp.int32) * 100 + (
+            table[owner, 0] != table[req, 0]
+        ).astype(jnp.int32) * 200
+        base = lengths // kw["ratio"] + 7 * table[req, 0] + score.astype(jnp.int32)
+        base = base + mismatch
         blocks = base[:, None] + jnp.arange(kw["block_topk"], dtype=jnp.int32)
         return jnp.where((lengths > 0)[:, None], blocks % 509, -1)
 
@@ -177,6 +189,27 @@ def test_rows_step_writes_same_pool_and_picks_rows(
     np.testing.assert_array_equal(np.asarray(selected), want_selected)
     # Traced once per program: full step first, then the rows step.
     assert rowwise_attention == [8, attended]
+
+
+# Three verify windows (K=2) of different lengths filling all request slots.
+VERIFY_STARTS, VERIFY_CONTEXT = [0, 3, 6, 8], [1661, 1000, 1663]
+
+
+@pytest.mark.parametrize("rows", [[2, 5, 7], [2, 5, -1]])
+def test_rows_present_their_own_decode_batch(rowwise_attention, rows):
+    """Row i is request i's last token, not token i of the step.
+
+    Regression: the rows kept the step's token-level starts/context, which
+    the shared-stream indexer (VLLM_TPU_QSA_DECODE_QUERY_BLOCK) uses to map
+    query rows to requests. Row 1 then scored as request 0's second token,
+    so drafts of every request but the first collapsed under concurrency.
+    """
+    out, want, selected, want_selected = _run_both(
+        False, VERIFY_STARTS, VERIFY_CONTEXT, rows
+    )
+    np.testing.assert_array_equal(np.asarray(selected), want_selected)
+    np.testing.assert_array_equal(out, want)
+    assert rowwise_attention == [8, 3]
 
 
 @pytest.mark.tpu_test

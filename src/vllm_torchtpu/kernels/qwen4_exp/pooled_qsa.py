@@ -970,6 +970,15 @@ def _pooled_qsa(
     if rows is not None and len(rows) <= len(context):
         q, gate, iq, req = q[picked], gate[picked], iq[picked], req[picked]
         lengths = jnp.where(keep, lengths[picked], 0)
+        # Present the rows as their own decode batch: row i is a one-token
+        # request with its own tables and causal length. The shared-stream
+        # indexer (VLLM_TPU_QSA_DECODE_QUERY_BLOCK) maps query rows to
+        # requests through starts/context, not req/lengths; the step's token
+        # layout would hand row i the i-th token of the step's first requests.
+        main_table, compressed_table = main_table[req], compressed_table[req]
+        req = jnp.arange(len(rows), dtype=jnp.int32)
+        starts = jnp.arange(len(rows) + 1, dtype=jnp.int32)
+        context = jnp.maximum(lengths - 1, 0)
         keep = picked = None
     blocks = select_blocks(
         iq,
