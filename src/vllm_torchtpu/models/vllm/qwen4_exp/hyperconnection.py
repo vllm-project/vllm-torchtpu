@@ -9,6 +9,9 @@ import torch
 import torch.nn.functional as F
 from vllm.models.qwen4_exp.common import hyperconnection as common_hc
 
+from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.qwen4_exp.hc_decode import decode_token_tile
+
 GroupedGemmaRMSNorm = common_hc.GroupedGemmaRMSNorm
 HyperConnectionBase = common_hc.HyperConnectionBase
 HyperConnectionConfig = common_hc.HyperConnectionConfig
@@ -73,6 +76,29 @@ class GatedResidual(common_hc.GatedResidual):
                 self.hc_norm.variance_epsilon,
                 prefill_norm_tile,
             )
+        self._decode_mix_op = None
+        self._decode_combine_mix_op = None
+        if (
+            envs.TPU_QWEN4_HC_DECODE_FUSED
+            and self.config.hc_per_branch_norm
+            and self.hidden_size % 128 == 0
+            and hasattr(self, "input_mix_weight_down")
+        ):
+            from vllm_torchtpu.kernels.qwen4_exp.vllm_adapter import (
+                build_decode_combine_mix_op,
+                build_decode_mix_op,
+            )
+
+            inject = hasattr(self, "block_inject_weight")
+            eps = self.hc_norm.variance_epsilon
+            self._decode_mix_op = build_decode_mix_op(
+                self.hc_count, self.hidden_size, eps, inject
+            )
+            if inject:
+                # Used by the preceding HC's combine_mix (attn -> mlp).
+                self._decode_combine_mix_op = build_decode_combine_mix_op(
+                    self.hc_count, self.hidden_size, eps
+                )
         if prefill_up_tile and hasattr(self, "input_mix_weight_up"):
             # Register before Dynamo traces forward; registration itself uses
             # Python inspect and cannot execute inside a compiled graph.
@@ -111,10 +137,40 @@ class GatedResidual(common_hc.GatedResidual):
         output = torch.cat(normalized, dim=-1)
         return (output * (1.0 + self.hc_norm.weight.float())).to(hyper_input.dtype)
 
+    def _decode_weights(self):
+        weights = (
+            self.hc_norm.weight,
+            self.input_mix_weight_down.weight,
+            self.input_mix_weight_up.weight,
+        )
+        if hasattr(self, "block_inject_weight"):
+            weights += (self.block_inject_weight.weight,)
+        return weights
+
+    def _decode_fused(self, hyper_input) -> bool:
+        """TPU_QWEN4_HC_DECODE_FUSED: one Pallas call for <= 512 BF16 rows."""
+        return (
+            self._decode_mix_op is not None
+            and hyper_input.dim() == 2
+            and decode_token_tile(hyper_input.shape[0]) is not None
+            and hyper_input.dtype == torch.bfloat16
+            and all(w.dtype == torch.bfloat16 for w in self._decode_weights())
+        )
+
     def mix(self, hyper_input):
+        """Returns ``mixed, (hyper_input, normed)``. On the fused decode path
+        the second residual is instead the combine's [T, hc] FP32 injection
+        gate (computed from the same normalized input); ``combine`` accepts
+        either form."""
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         if not hasattr(self, "input_mix_weight_down"):
             raise RuntimeError("mix was disabled for this hyper-connection")
+        if self._decode_fused(hyper_input):
+            out = self._decode_mix_op(hyper_input, *self._decode_weights())
+            if hasattr(self, "block_inject_weight"):
+                mixed, injection = out
+                return mixed, (hyper_input, injection)
+            return out, (hyper_input, None)
         if (
             self._prefill_full_op is not None
             and hyper_input.shape[0] >= 2 * self.prefill_full_tile
@@ -169,8 +225,12 @@ class GatedResidual(common_hc.GatedResidual):
         assert hyper_input.shape[-1] == self.hc_count * self.hidden_size
         assert block_output.shape[-1] == self.hidden_size
 
-        injection = F.linear(hyper_input_normed, self.block_inject_weight.weight)
-        injection = 2.0 * torch.sigmoid(injection.float() / self.hc_count)
+        if hyper_input_normed.shape[-1] == self.hc_count:
+            # The fused decode mix already produced the injection gate.
+            injection = hyper_input_normed
+        else:
+            injection = F.linear(hyper_input_normed, self.block_inject_weight.weight)
+            injection = 2.0 * torch.sigmoid(injection.float() / self.hc_count)
         if (
             self._prefill_combine_op is not None
             and hyper_input.shape[0] >= 2 * self.prefill_full_tile
@@ -195,6 +255,28 @@ class GatedResidual(common_hc.GatedResidual):
             dim=-1,
         )
         return output.to(hyper_input.dtype)
+
+    def combine_mix(self, block_output, residuals, next_hc):
+        """``next_hc.mix(self.combine(block_output, residuals))``.
+
+        After a fused decode mix, this combine runs as the prologue of
+        ``next_hc``'s fused mix (one Pallas call; the combined hyper input is
+        written once and returned as the next residual).
+        """
+        hyper_input, gate = residuals
+        if (
+            next_hc._decode_combine_mix_op is not None
+            and gate is not None
+            and gate.shape[-1] == self.hc_count
+            and gate.dtype == torch.float32
+            and block_output.dtype == torch.bfloat16
+            and next_hc._decode_fused(hyper_input)
+        ):
+            mixed, injection, combined = next_hc._decode_combine_mix_op(
+                hyper_input, block_output, gate, *next_hc._decode_weights()
+            )
+            return mixed, (combined, injection)
+        return next_hc.mix(self.combine(block_output, residuals))
 
 
 __all__ = [

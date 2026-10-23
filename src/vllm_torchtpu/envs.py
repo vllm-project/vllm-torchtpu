@@ -73,6 +73,7 @@ if TYPE_CHECKING:
     USE_MOE_SPARSE_CORE: bool = True
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
+    TPU_QWEN4_HC_DECODE_FUSED: bool = False
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
@@ -825,6 +826,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # T/tp tokens, and the next layer all-gathers. Qwen3.5 MoE with
     # EP and TP > 1 only.
     "TPU_MOE_SEQUENCE_PARALLEL": env_bool("TPU_MOE_SEQUENCE_PARALLEL", default=False),
+    # qwen4_exp: run each hyper-connection mix (per-branch norm, low-rank
+    # gate, branch mean and the combine's injection gate) at <= 512 tokens as
+    # one Pallas call, with the attn combine fused ahead of the mlp mix.
+    "TPU_QWEN4_HC_DECODE_FUSED": env_bool("TPU_QWEN4_HC_DECODE_FUSED"),
     # Select the blockwise owner-output kernel after the outer one-hot MoE
     # threshold has selected the TensorCore path. "off" keeps the dense
     # one-hot combine; "on" enables the kernel for every shape that passes

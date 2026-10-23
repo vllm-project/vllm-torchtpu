@@ -306,8 +306,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
                     compressed_block_table,
                 ),
             )
-        hidden = self.attn_hyper_connection.combine(block, residual)
-        block, residual = self.mlp_hyper_connection.mix(hidden)
+        block, residual = self.attn_hyper_connection.combine_mix(
+            block, residual, self.mlp_hyper_connection
+        )
         # GDN may leave padded rows unwritten; MoE dispatch requires finite inputs.
         block = torch.where(valid_tokens[:, None], block, 0)
         return self.mlp_hyper_connection.combine(self.mlp(block), residual)
@@ -346,10 +347,9 @@ class Qwen4ExpDecoderLayer(nn.Module):
             rows=rows,
         )[0]
         picked = rows.clamp_min(0)
-        hidden = self.attn_hyper_connection.combine(
-            block, (hyper_input[picked], normed[picked])
+        block, residual = self.attn_hyper_connection.combine_mix(
+            block, (hyper_input[picked], normed[picked]), self.mlp_hyper_connection
         )
-        block, residual = self.mlp_hyper_connection.mix(hidden)
         block = torch.where((rows >= 0)[:, None], block, 0)
         return self.mlp_hyper_connection.combine(self.mlp(block), residual)
 
