@@ -264,6 +264,12 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE: bool = False
     VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS: int = 33554432
+    TPU_SCHED_PREFILL_SRPT: bool = False
+    TPU_SCHED_PREFILL_SRPT_MAX_HOLD_STEPS: int = 0
+    TPU_SCHED_DECODE_INTERLEAVE_STEPS: int = 0
+    TPU_SCHED_DECODE_INTERLEAVE_ADAPTIVE: bool = False
+    TPU_SCHED_DECODE_FINISH_TOKENS: int = 0
+    TPU_SCHED_DECODE_FINISH_MAX_STEPS: int = 32
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     VLLM_TPU_MTP_FUSED_INDEXSHARE: bool = True
@@ -1820,6 +1826,32 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Token budget of that cache (~12 B/token: id pointers plus piece text).
     "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS": env_int(
         "VLLM_TPU_SEGMENT_TOKENIZE_CACHE_TOKENS", 33554432
+    ),
+    # Scheduler (core/prefill_srpt.py): shortest-remaining-prefill-first across
+    # in-progress prefills and waiting requests; a long running prefill is held
+    # back for a step while a shorter one goes in. Off by default.
+    "TPU_SCHED_PREFILL_SRPT": env_bool("TPU_SCHED_PREFILL_SRPT", False),
+    # ... stop holding one prefill after this many consecutive held steps
+    # (0 = no limit).
+    "TPU_SCHED_PREFILL_SRPT_MAX_HOLD_STEPS": env_int(
+        "TPU_SCHED_PREFILL_SRPT_MAX_HOLD_STEPS", 0
+    ),
+    # Scheduler (core/decode_interleave.py): after a step that ran prefill
+    # tokens alongside decodes, run this many decode-only steps (prefill
+    # deferred) while decodes are running. 0 = off.
+    "TPU_SCHED_DECODE_INTERLEAVE_STEPS": env_int(
+        "TPU_SCHED_DECODE_INTERLEAVE_STEPS", 0
+    ),
+    # ... scale those steps by the previous step's prefill tokens / budget.
+    "TPU_SCHED_DECODE_INTERLEAVE_ADAPTIVE": env_bool(
+        "TPU_SCHED_DECODE_INTERLEAVE_ADAPTIVE", False
+    ),
+    # Run decode-only steps while a running decode is within this many tokens
+    # of its max_tokens (ignore_eos workloads). 0 = off.
+    "TPU_SCHED_DECODE_FINISH_TOKENS": env_int("TPU_SCHED_DECODE_FINISH_TOKENS", 0),
+    # ... at most this many such steps in a row before one step with prefill.
+    "TPU_SCHED_DECODE_FINISH_MAX_STEPS": env_int(
+        "TPU_SCHED_DECODE_FINISH_MAX_STEPS", 32
     ),
     # Run an MTP draft's loop steps 1..K-1 as one compiled program
     # (spec_decode/mtp_fused_loop.py). Off by default: one program per step.
