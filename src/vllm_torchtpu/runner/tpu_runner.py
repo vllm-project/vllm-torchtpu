@@ -8735,10 +8735,18 @@ class TPUModelRunner(GPUModelRunner):
         model_kwargs=None,
     ):
         if self._megakernel is not None:
+            extra = (
+                {"model_kwargs": model_kwargs}
+                if getattr(self._megakernel, "takes_model_kwargs", False)
+                else {}
+            )
             hit, out = self._megakernel.try_forward(
-                self, input_ids, positions, inputs_embeds, intermediate_tensors
+                self, input_ids, positions, inputs_embeds, intermediate_tensors, **extra
             )
             if hit:
+                # A driver may return (hidden_states, aux_hidden_states).
+                if isinstance(out, tuple) and len(out) == 2:
+                    return out
                 return out, None
 
         # @support_torch_compile annotations will be put on the vLLM model if it

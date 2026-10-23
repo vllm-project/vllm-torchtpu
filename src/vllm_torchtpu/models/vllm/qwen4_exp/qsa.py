@@ -523,6 +523,18 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         caches are still written for every token. Pooled QSA attends only
         the rows; the dedicated-cache path attends all tokens and picks.
         """
+        output, selected = self.attend_with_indices(hidden, positions, metadata, rows)
+        output = self.o_proj(output)
+        if self.tp_size > 1:
+            output = tensor_model_parallel_all_reduce(output)
+        return output, selected
+
+    def attend(self, hidden, positions, metadata: QSAMetadata):
+        """Gated attention output before ``o_proj`` (this rank's heads)."""
+        return self.attend_with_indices(hidden, positions, metadata)[0]
+
+    def attend_with_indices(self, hidden, positions, metadata: QSAMetadata, rows=None):
+        """``forward_with_indices`` without the output projection and all-reduce."""
         assert len(self.cache_owners) == (1 if self.pooled else 4), (
             "Task4 must bind real or profiling scratch QSA owners"
         )
@@ -573,9 +585,6 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             picked = rows.clamp_min(0)
             output = torch.where(keep, output[picked], 0)
             selected = torch.where(keep, selected[picked], -1)
-        output = self.o_proj(output)
-        if self.tp_size > 1:
-            output = tensor_model_parallel_all_reduce(output)
         return output, selected
 
     def forward(self, hidden, positions, metadata: QSAMetadata):
