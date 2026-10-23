@@ -20,6 +20,7 @@ import stat
 import subprocess
 import tempfile
 import unittest
+from unittest import mock
 
 import yaml
 
@@ -53,6 +54,29 @@ fi
 exec /usr/bin/git "$@"
 """
 
+_STUB_LANE_YAML = """steps:
+  - label: "Stub step"
+    if: 'build.env("NIGHTLY") == "1"'
+    command: "true"
+"""
+
+_STUB_BUILD_YAML = """steps:
+  - label: "Stub build"
+    command: "true"
+"""
+
+
+def _prepare_cwd(tmp_path: pathlib.Path) -> pathlib.Path:
+    """Use _REPO_ROOT when pipeline YAMLs are present; else stage stubs."""
+    if (_REPO_ROOT / ".buildkite" / "pipeline_build.yml").exists():
+        return _REPO_ROOT
+    bk_dir = tmp_path / "work" / ".buildkite"
+    bk_dir.mkdir(parents=True)
+    for lane in ("verify", "perf", "integration", "tests"):
+        (bk_dir / f"pipeline_{lane}.yml").write_text(_STUB_LANE_YAML)
+    (bk_dir / "pipeline_build.yml").write_text(_STUB_BUILD_YAML)
+    return tmp_path / "work"
+
 
 def run_bootstrap(
     **env: str,
@@ -84,7 +108,7 @@ def run_bootstrap(
         }
         proc = subprocess.run(
             ["bash", str(_BOOTSTRAP)],
-            cwd=_REPO_ROOT,
+            cwd=_prepare_cwd(tmp_path),
             env=run_env,
             capture_output=True,
             text=True,
@@ -197,6 +221,20 @@ class TestBootstrap(unittest.TestCase):
         self.assertFalse(any("--context full-ci" in c for c in calls))
         for content in uploads:
             self.assertTrue(content.startswith("priority: 1\n"))
+            self.assertNotIn('build.env("NIGHTLY")', content)
+
+    def test_fallback_when_pipeline_yamls_missing_from_repo_root(self) -> None:
+        with (
+            tempfile.TemporaryDirectory() as empty_root,
+            mock.patch(f"{__name__}._REPO_ROOT", pathlib.Path(empty_root)),
+        ):
+            calls, uploads, _, _ = run_bootstrap(
+                BUILDKITE_PULL_REQUEST="123",
+                BUILDKITE_PULL_REQUEST_LABELS="ready,run-full-ci",
+            )
+        self.assertEqual(len(uploads), 5)
+        self.assertTrue(any("--context full-ci" in c for c in calls))
+        for content in uploads:
             self.assertNotIn('build.env("NIGHTLY")', content)
 
 
