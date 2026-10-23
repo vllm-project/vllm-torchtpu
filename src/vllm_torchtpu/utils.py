@@ -35,6 +35,11 @@ _megacore = False
 logger = init_logger(__name__)
 
 
+def torch_dtype_from_name(dtype_name: str) -> torch.dtype:
+    """Resolve a Torch dtype name, optionally prefixed with ``torch.``."""
+    return getattr(torch, dtype_name.removeprefix("torch."))
+
+
 def align_to(unpadded_dim, pad_multiple):
     return (unpadded_dim + pad_multiple - 1) // pad_multiple * pad_multiple
 

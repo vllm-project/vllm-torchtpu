@@ -235,7 +235,6 @@ class TestVllmGatedDeltaNetAttention:
     @patch(
         "vllm_torchtpu.layers.adapter.custom_ops.gdn_attention_op.get_or_create_pcp_mesh"
     )
-    @pytest.mark.parametrize("conv_dtype", [torch.bfloat16, torch.float32])
     def test_pooled_pcp_impl_uses_donation_and_copy_writeback(
         self,
         mock_get_pcp_mesh,
@@ -245,11 +244,8 @@ class TestVllmGatedDeltaNetAttention:
         projection_dtype,
         interleaved,
         cpu_vllm_config_context,
-        conv_dtype,
     ):
         attn = _qwen35_397b_gdn_attn("copy_test_layer")
-        if conv_dtype != torch.bfloat16:
-            attn._pooled_conv_state_dtype = conv_dtype
         attn.gqa_interleaved_layout = interleaved
         attn.cache_config.mamba_ssm_cache_dtype = ssm_cache_dtype
         mock_get_pcp_mesh.return_value = SimpleNamespace(shape={"pcp": 8, "tp": 1})
@@ -304,9 +300,7 @@ class TestVllmGatedDeltaNetAttention:
         assert mock_run.call_args.kwargs["recurrent_state_dtype"] == jnp.dtype(
             expected_dtype
         )
-        assert mock_run.call_args.kwargs["conv_state_dtype"] == jnp.dtype(
-            jnp.float32 if conv_dtype == torch.float32 else jnp.bfloat16
-        )
+        assert mock_run.call_args.kwargs["conv_state_dtype"] == jnp.dtype(jnp.bfloat16)
         op_args = fake_jax_op.call_args.args
         assert op_args[4] is pool
         assert op_args[-1] is weight_scale
@@ -1657,26 +1651,19 @@ def test_pooled_op_block_major_folds_the_pool_and_restores_its_shape(
     assert tuple(new_pool.shape) == tuple(pool.shape)
 
 
-@pytest.mark.parametrize("conv_dtype", [torch.bfloat16, torch.float32])
-def test_pooled_conv_format_is_declared_without_changing_ssm_dtype(conv_dtype):
+@pytest.mark.parametrize("ssm_dtype", ["bfloat16", "float32"])
+def test_pooled_conv_is_bf16_without_changing_ssm_dtype(ssm_dtype):
     attn = _qwen35_397b_gdn_attn("model.layers.0.linear_attn")
-    attn._pooled_conv_state_dtype = conv_dtype
+    attn.cache_config.mamba_ssm_cache_dtype = ssm_dtype
     with patch.object(
         gdn_attention_op,
         "unified_kv_layout_enabled_for_architecture",
         return_value=True,
     ):
-        assert attn.get_state_dtype() == (conv_dtype, torch.float32)
+        assert attn.get_state_dtype() == (torch.bfloat16, getattr(torch, ssm_dtype))
 
 
-@pytest.mark.parametrize(
-    "ssm_cache_dtype,ssm_dtype", [("bfloat16", jnp.bfloat16), ("float32", jnp.float32)]
-)
-def test_pooled_conv_formats_share_ops_only_with_matching_physical_format(
-    cpu_vllm_config_context,
-    ssm_cache_dtype,
-    ssm_dtype,
-):
+def test_pooled_ops_share_bf16_conv_and_separate_ssm_precision(cpu_vllm_config_context):
     captured = []
 
     def build(name, function, **kwargs):
@@ -1688,12 +1675,9 @@ def test_pooled_conv_formats_share_ops_only_with_matching_physical_format(
         set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
         patch.object(gdn_attention_op.pallas, "jax_op", side_effect=build),
     ):
-        for index, dtype in enumerate(
-            (torch.bfloat16, torch.bfloat16, torch.float32, torch.float32)
-        ):
+        for index, dtype in enumerate(("bfloat16", "bfloat16", "float32", "float32")):
             attn = _qwen35_397b_gdn_attn(f"model.layers.{index}.linear_attn")
-            attn._pooled_conv_state_dtype = dtype
-            attn.cache_config.mamba_ssm_cache_dtype = ssm_cache_dtype
+            attn.cache_config.mamba_ssm_cache_dtype = dtype
             attn._build_pooled_gdn_op()
 
     assert len(captured) == 2
@@ -1707,10 +1691,8 @@ def test_pooled_conv_formats_share_ops_only_with_matching_physical_format(
             return_value=(operands[3], operands[0]),
         ) as dispatch:
             function(*operands)
-        assert dispatch.call_args.kwargs["conv_state_dtype"] == jnp.dtype(dtype)
-        assert dispatch.call_args.kwargs["recurrent_state_dtype"] == jnp.dtype(
-            ssm_dtype
-        )
+        assert dispatch.call_args.kwargs["conv_state_dtype"] == jnp.dtype(jnp.bfloat16)
+        assert dispatch.call_args.kwargs["recurrent_state_dtype"] == jnp.dtype(dtype)
 
 
 @pytest.mark.parametrize(
