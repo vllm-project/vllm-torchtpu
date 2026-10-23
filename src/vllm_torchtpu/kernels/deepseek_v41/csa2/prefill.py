@@ -461,6 +461,8 @@ def csa2_prefill(
         block,
         bank,
     ):
+        # Buffered lookahead evaluates index maps beyond the final grid tile.
+        tile = jnp.minimum(tile, tiles_ref.shape[0] - 1)
         request = jnp.minimum(tiles_ref[tile, 0], batch - 1)
         _, left, right, anchor = swa_window(
             tile,
@@ -501,6 +503,7 @@ def csa2_prefill(
     )
 
     def query_map(tile, tiles_ref, *_):
+        tile = jnp.minimum(tile, tiles_ref.shape[0] - 1)
         return jnp.minimum(tiles_ref[tile, 1], tokens - bq), 0, 0
 
     def query_spec(shape):
