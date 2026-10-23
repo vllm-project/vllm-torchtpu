@@ -237,12 +237,14 @@ def export_samplers(
         dtype: str,
         argument_type: str,
     ) -> dict[str, Any]:
+        # Every device samples the same, replicated logits.
         return {
             "arg_index": arg_index,
             "index": arg_index,
             "name": name,
             "shape": list(shape),
             "dtype": dtype,
+            "sharding": [None] * len(shape),
             "argument_type": argument_type,
             "is_weight": False,
             "weight_name": "",
