@@ -45,12 +45,14 @@ QUERY = "qsa_q"
 GATE = "qsa_gate"
 PAGES = "qsa_pages"
 KV_LEN = "qsa_kvlen"
+OFFSET = "qsa_off"  # [1] int32: this layer's head pair in the packed rows
+SCALES = "qsa_scales"  # [2] f32: FP8 K and V scales
 MICRO = 4  # tokens per micro-page (the compression ratio)
 TILE = 256  # tokens per ring slot
 SLOTS = 8  # ring slots: SLOTS - 1 tiles in flight ahead of the one being read
 
 
-def _unpack_kv(slot_ref: Any, off: int, interpret: bool) -> tuple[jax.Array, jax.Array]:
+def _unpack_kv(slot_ref: Any, off: Any, interpret: bool) -> tuple[jax.Array, jax.Array]:
     """FP8 K / V `[TILE, 256]` of head pair `off` from a `[TILE, 1, 4, 256]` slot.
 
     Four pack rows form one 32-bit word per lane, row `c` in byte `c`; K and V of
@@ -62,8 +64,9 @@ def _unpack_kv(slot_ref: Any, off: int, interpret: bool) -> tuple[jax.Array, jax
     else:
         words = slot_ref.bitcast(jnp.uint32).reshape(-1, slot_ref.shape[-1])[...]
 
-    def byte(c: int) -> jax.Array:
-        b = ((words >> (8 * c)) & 0xFF).astype(jnp.uint16).astype(jnp.uint8)
+    def byte(c: Any) -> jax.Array:
+        sh = (8 * c).astype(jnp.uint32) if hasattr(c, "astype") else 8 * c
+        b = ((words >> sh) & 0xFF).astype(jnp.uint16).astype(jnp.uint8)
         return pltpu.bitcast(b, jnp.float8_e4m3fn)
 
     return byte(2 * off), byte(2 * off + 1)
@@ -82,9 +85,9 @@ def attend_row(
     kv_len: Any,
     q: jax.Array,
     gate: jax.Array,
-    off: int,
-    scale_k: float,
-    scale_v: float,
+    off: Any,
+    scale_k: Any,
+    scale_v: Any,
     sm_scale: float,
     interpret: bool,
     fold: bool = False,
@@ -171,6 +174,7 @@ def attend_row(
 
     qf = q.astype(F32) * (scale_k * sm_scale if fold else 1.0)
     k_mul, v_mul, s_mul = (1.0, 1.0, 1.0) if fold else (scale_k, scale_v, sm_scale)
+    static = lambda x: isinstance(x, (int, float))  # noqa: E731
 
     def tile(t: Any, carry: Any) -> Any:
         m, l, acc = carry
@@ -194,10 +198,10 @@ def attend_row(
             k8, v8 = _unpack_kv(ring.at[s], off, interpret)
         tok = t * TILE + jax.lax.broadcasted_iota(I32, (1, TILE), 1)
         valid = tok < length
-        key = k8.astype(F32) * k_mul if k_mul != 1.0 else k8.astype(F32)
+        key = k8.astype(F32) if static(k_mul) and k_mul == 1.0 else k8.astype(F32) * k_mul
         # A column iota, not `valid.reshape`: Mosaic has no i1 shape cast.
         tok_col = t * TILE + jax.lax.broadcasted_iota(I32, (TILE, 1), 0)
-        vf = v8.astype(F32) * v_mul if v_mul != 1.0 else v8.astype(F32)
+        vf = v8.astype(F32) if static(v_mul) and v_mul == 1.0 else v8.astype(F32) * v_mul
         value = jnp.where(tok_col < length, vf, 0.0)
         if ablate == "matmul":
             score = jnp.zeros((nh, TILE), F32)
@@ -205,7 +209,7 @@ def attend_row(
             score = jax.lax.dot_general(
                 qf, key, (((1,), (1,)), ((), ())), preferred_element_type=F32
             )
-            if s_mul != 1.0:
+            if not (static(s_mul) and s_mul == 1.0):
                 score = score * s_mul
         score = jnp.where(valid, score, -jnp.inf)
         m_new = jnp.maximum(m, jnp.max(score, axis=-1, keepdims=True))
@@ -249,9 +253,6 @@ class QSASparseAttnBlock(QSAOutBlock):
         self,
         *,
         budget: int = 512,
-        kv_head_offset: int = 0,
-        scale_k: float = 1.0,
-        scale_v: float = 1.0,
         fold: bool = False,
         ablate: str = "",
         slots: int = SLOTS,
@@ -260,8 +261,6 @@ class QSASparseAttnBlock(QSAOutBlock):
         super().__init__(prefix=prefix)
         self.fold, self.ablate, self.slots = fold, ablate, slots
         self.budget = budget
-        self.off = kv_head_offset
-        self.scale_k, self.scale_v = scale_k, scale_v
 
     def extra_inputs(self, g: Any, ex: ExecSpec) -> list[ExtraInput]:
         nh = g.NH // ex.R
@@ -271,6 +270,8 @@ class QSASparseAttnBlock(QSAOutBlock):
             ExtraInput(GATE, "hbm", (ex.M, nh, g.HD), BF16),
             ExtraInput(PAGES, "smem", (ex.M, self.budget + 1), I32),
             ExtraInput(KV_LEN, "smem", (ex.M,), I32),
+            ExtraInput(OFFSET, "smem", (1,), I32),
+            ExtraInput(SCALES, "smem", (2,), F32),
         ]
 
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> list[ScratchReq]:
@@ -314,9 +315,9 @@ class QSASparseAttnBlock(QSAOutBlock):
                 kv_len=ctx.extra[KV_LEN],
                 q=scr["qa_q"][r],
                 gate=scr["qa_g"][r],
-                off=self.off,
-                scale_k=self.scale_k,
-                scale_v=self.scale_v,
+                off=ctx.extra[OFFSET][0],
+                scale_k=ctx.extra[SCALES][0],
+                scale_v=ctx.extra[SCALES][1],
                 sm_scale=g.HD**-0.5,
                 interpret=ex.interpret,
                 fold=self.fold,
@@ -345,9 +346,9 @@ def reference_rows(
     pages: jax.Array,
     kv_len: jax.Array,
     *,
-    off: int,
-    scale_k: float,
-    scale_v: float,
+    off: Any,
+    scale_k: Any,
+    scale_v: Any,
     sm_scale: float,
 ) -> jax.Array:
     """Pure-JAX oracle, the stock `fused_kernel.decode_kernel` semantics per row.

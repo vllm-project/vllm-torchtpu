@@ -173,16 +173,18 @@ def run(
             jnp.asarray(rng.permutation(npages * 32)[: ex.M * 513].reshape(ex.M, 513), jnp.int32), rep
         )
         kvlen_q = jax.device_put(jnp.asarray([2051] * B + [0] * (ex.M - B), jnp.int32), rep)
+        off_q = jax.device_put(jnp.asarray([0], jnp.int32), rep)
+        scl_q = jax.device_put(jnp.asarray([1.0, 1.0], jnp.float32), rep)
         arms = (("s8", dict(slots=8)), ("s16", dict(slots=16)), ("s8_no_dma", dict(slots=8, ablate="dma")))
         for label, opts in arms:
             spec_q = qwen38.segment_spec(
-                g, R, L=L, qsa_attn=dict(budget=512, kv_head_offset=0, **opts)
+                g, R, L=L, qsa_attn=dict(budget=512, **opts)
             )
             fn_q, _, _, _ = make_flat_segment_step(mesh, spec_q, ex_q)
             us = _slope(
                 lambda h, p_, *a, fn_q=fn_q: fn_q(p_, h, *a)[0],
                 hid_m,
-                (pos, pool_q, q_q, g_q, pages_q, kvlen_q, *flat, *st),
+                (pos, pool_q, q_q, g_q, pages_q, kvlen_q, off_q, scl_q, *flat, *st),
                 chains,
             )
             out["attn_us" + ("_" + label if label else "")] = round(us - t_kernel, 1)

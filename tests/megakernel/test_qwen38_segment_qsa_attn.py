@@ -71,7 +71,7 @@ def test_segment_with_in_kernel_qsa_attention_matches_reference():
     inp.attn = attn
     ref, _ = segment_reference(G, ex, inp.x, inp.hc, inp.w_l, inp.st_l, inp.attn, inp.o_proj, L=L)
 
-    spec = qwen38.segment_spec(G, R, L=L, qsa_attn=dict(budget=BUDGET, kv_head_offset=OFF))
+    spec = qwen38.segment_spec(G, R, L=L, qsa_attn=dict(budget=BUDGET))
     w_mk, states, _ = pack_segment(qwen38.segment_spec(G, R, L=L), G, ex, inp)
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
     pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(mesh, ex, inp.pos, inp.x, w_mk, states)
@@ -82,9 +82,11 @@ def test_segment_with_in_kernel_qsa_attention_matches_reference():
         jax.device_put(kernel.fold(gate), tp),
         jax.device_put(pages, rep),
         jax.device_put(kv_len, rep),
+        jax.device_put(jnp.asarray([OFF], jnp.int32), rep),
+        jax.device_put(jnp.asarray([1.0, 1.0], F32), rep),
     )
     assert [x.name for x in kernel.extra_inputs(spec, ex)] == [
-        "qsa_pool", "qsa_q", "qsa_gate", "qsa_pages", "qsa_kvlen"
+        "qsa_pool", "qsa_q", "qsa_gate", "qsa_pages", "qsa_kvlen", "qsa_off", "qsa_scales"
     ]
     step, _ = kernel.make_step(mesh, spec, ex)
     _, outs = step(pos_mk, hid_mk, w_mk, st_mk, *extras)

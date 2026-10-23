@@ -544,10 +544,16 @@ class Qwen4ExpBackbone(nn.Module):
             main_block_table,
             compressed_block_table,
         )
+        # Small buckets run the QSA sparse attention inside the segment kernel:
+        # the stock op then stops after the indexer (`select_for_kernel`).
+        in_kernel = int(hidden.shape[0]) <= getattr(segment_call, "attention_rows", 0)
         for s, i in enumerate(qsa_layers):
             layer = layers[i]
             block, _ = layer.attn_hyper_connection.mix(hidden)
-            attention = layer.self_attn.attend(block, positions64, metadata)
+            if in_kernel:
+                attention = layer.self_attn.select_for_kernel(block, positions64, metadata)
+            else:
+                attention = layer.self_attn.attend(block, positions64, metadata)
             hidden = segment_call(s, hidden, attention)
         mixed = self.hyper_connection_mixer.mix(hidden)[0]
         if self.emit_mtp_hidden:

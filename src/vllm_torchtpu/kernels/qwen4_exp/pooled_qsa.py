@@ -21,6 +21,7 @@ from vllm_torchtpu.kernels.qwen4_exp.qsa_rpa import (
     pack_rows,
     qsa_attention,
     selected_tokens,
+    virtual_page_metadata,
 )
 from vllm_torchtpu.kernels.qwen4_exp.qsa_state import (
     read_ring_and_tags,
@@ -914,8 +915,14 @@ def _pooled_qsa(
     main_slot: int = -1,
     max_query_len: int = 1,
     rows: jax.Array | None = None,
-) -> tuple[jax.Array, jax.Array, jax.Array]:
+    select_only: bool = False,
+) -> tuple[jax.Array, ...]:
     """One QSA layer over the unified pool.
+
+    ``select_only``: stop after the indexer and return ``(pool, q, gate, pages,
+    kv_lens)`` for an attention computed elsewhere (the Qwen3.8 segment
+    megakernel): ``q`` / ``gate`` ``[T, heads, D]`` BF16 and the virtual
+    micro-page ids / visible lengths of ``virtual_page_metadata``.
 
     ``main_slot`` >= 0 selects this layer's KV head pair in main KV pages
     shared by two layers (``pool_layout.pooled_cache_specs``); the default -1
@@ -1020,6 +1027,19 @@ def _pooled_qsa(
         from vllm_torchtpu.kernels.qwen4_exp import topk_stats
 
         topk_stats.record(blocks, lengths, starts, envs.VLLM_TPU_QSA_TOPK_STATS)
+    if select_only:
+        assert rows is None, "select_only covers the all-token decode/verify path"
+        pages, kv_lens, _, _ = virtual_page_metadata(
+            blocks, lengths, main_table[req], ratio=compress_ratio, page_size=pool.shape[1]
+        )
+        heads = q.shape[1]
+        return (
+            pool,
+            q.astype(jnp.bfloat16),
+            gate.reshape(len(q), heads, -1).astype(jnp.bfloat16),
+            pages.astype(jnp.int32),
+            kv_lens.astype(jnp.int32),
+        )
     output, pool = qsa_attention(
         q,
         gate,
@@ -1103,6 +1123,71 @@ def pooled_qsa_step(
         compressed_slot,
         main_slot,
         max_query_len=max_query_len,
+    )
+
+
+def pooled_qsa_select_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, ...]:
+    """``pooled_qsa_step`` up to the indexer: ``(pool, q, gate, pages, kv_lens)``.
+
+    One QSA layer over the unified pool.
+
+    ``main_slot`` >= 0 selects this layer's KV head pair in main KV pages
+    shared by two layers (``pool_layout.pooled_cache_specs``); the default -1
+    keeps the layer's whole-row pages.
+    """
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        select_only=True,
     )
 
 

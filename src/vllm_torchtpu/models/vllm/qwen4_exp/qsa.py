@@ -387,6 +387,11 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             keywords["main_slot"] = main_slot
         self._op = partial(build_pooled_qsa_op(), **keywords)
         self._rows_op = partial(build_pooled_qsa_rows_op(), **keywords)
+        # Built on first use (`select_for_kernel`): default serving never
+        # registers the select op.
+        self._select_keywords = keywords
+        self._select_op = None
+        self.main_slot = max(main_slot, 0)
 
     def get_kv_cache_spec(self, vllm_config):
         return get_qsa_cache_specs(self.config, self.tp_size, self.cache_dtype)[0]
@@ -586,6 +591,59 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             output = torch.where(keep, output[picked], 0)
             selected = torch.where(keep, selected[picked], -1)
         return output, selected
+
+    def select_for_kernel(self, hidden, positions, metadata: QSAMetadata):
+        """Cache writes and the indexer only; the attention runs in the Qwen3.8
+        segment megakernel (``QSASparseAttnBlock``). Returns its extra inputs:
+        ``[pool, q, gate, pages, kv_lens, head-pair offset, (k, v) scales]``."""
+        assert self.pooled, "in-kernel QSA attention reads the unified pool"
+        per_layer = cast(dict[str, AttentionMetadata], get_forward_context().attn_metadata)
+        metadata = replace(
+            metadata,
+            state_slots=cast(torch.Tensor, per_layer[self.prefix + ".raw_ring"].block_tables),
+            main_block_table=cast(torch.Tensor, per_layer[self.main_cache_name].block_tables),
+            compressed_block_table=cast(
+                torch.Tensor, per_layer[self.compressed_cache_name].block_tables
+            ),
+        )
+        scales = (
+            {"k_scale": self._k_scale_float, "v_scale": self._v_scale_float}
+            if self.fp8_kv
+            else {}
+        )
+        if self._select_op is None:
+            from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
+                build_pooled_qsa_select_op,
+            )
+
+            self._select_op = partial(build_pooled_qsa_select_op(), **self._select_keywords)
+        q, gate, pages, kv_lens = self._select_op(
+            self.q_proj(hidden),
+            self.k_proj(hidden),
+            self.v_proj(hidden),
+            self.indexer.index_qk_proj(hidden),
+            self.q_norm.weight,
+            self.k_norm.weight,
+            self.indexer.q_layernorm.weight,
+            self.indexer.k_layernorm.weight,
+            positions,
+            self.rope_cache,
+            *self.cache_owners,
+            metadata.query_start_loc,
+            metadata.context_lens,
+            metadata.state_slots,
+            metadata.main_block_table,
+            metadata.compressed_block_table,
+            **scales,
+        )
+        dev = hidden.device
+        offset = torch.full((1,), self.main_slot, dtype=torch.int32, device=dev)
+        kv_scales = torch.tensor(
+            [scales.get("k_scale", 1.0), scales.get("v_scale", 1.0)],
+            dtype=torch.float32,
+            device=dev,
+        )
+        return [self.cache_owners[0], q, gate, pages, kv_lens, offset, kv_scales]
 
     def forward(self, hidden, positions, metadata: QSAMetadata):
         return self.forward_with_indices(hidden, positions, metadata)[0]
