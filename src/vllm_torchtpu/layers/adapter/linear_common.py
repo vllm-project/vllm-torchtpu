@@ -43,6 +43,10 @@ KEEP_VLLM_LAYOUT_ATTR = "_tpu_keep_vllm_weight_layout"
 # back and silently corrupt the values.
 WEIGHT_FLIPPED_ATTR = "_tpu_weight_flipped"
 
+# TPU_DCP_MLA_OPROJ_ALL_REDUCE: set on a row-parallel FP8 linear whose rows the
+# FP8 loader also gathers over the DCP group (`weight_dcp`, `weight_scale_dcp`).
+DCP_ROWS_ATTR = "_tpu_dcp_rows"
+
 # TPU_FP8_LINEAR_PALLAS: set on a linear layer whose decode rows go to the
 # weight-streaming kernel; the value is the layer's output width. A layer whose
 # width is not a lane multiple also carries a zero-padded K-major copy of its

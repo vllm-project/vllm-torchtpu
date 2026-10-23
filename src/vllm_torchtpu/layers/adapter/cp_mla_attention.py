@@ -38,10 +38,13 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import torch
+from torch_tpu._internal import pallas
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.distributed.dcp import get_dcp_group
 from vllm_torchtpu.distributed.dcp_comm import cp_lse_ag_out_rs
+from vllm_torchtpu.kernels.lse_rescale import lse_rescale_quantize
+from vllm_torchtpu.layers.core.quantization import quantize_tensor
 
 if envs.TPU_DCP_MERGE_VSPACE_FUSED:
     # Registers the fused V-space operand ops at import, never in a trace.
@@ -307,12 +310,13 @@ def _merge_chunked(
         for c in range(chunks):
             pieces.append(
                 _weighted_reduce_scatter(
-                    output[c * step : (c + 1) * step],
+                    output,
                     lse_f32[c * step : (c + 1) * step],
                     _gather_lse(lse_f32[c * step : (c + 1) * step], group),
                     group,
                     rs_dtype,
                     vspace=vspace,
+                    start=c * step,
                 )
             )
         return torch.cat(pieces, dim=0)
@@ -348,25 +352,30 @@ def _weighted_reduce_scatter(
     group: Any,
     rs_dtype: torch.dtype | None = None,
     vspace: tuple[torch.Tensor, torch.Tensor | None] | None = None,
+    start: int = 0,
 ) -> torch.Tensor:
-    """`cp_lse_ag_out_rs` after its lse gather, op for op: `lses` is
-    `[world, T, H]` for exactly `output`'s `T` rows. `vspace`
-    (TPU_DCP_MERGE_VSPACE_FUSED): the operand is built in V space."""
+    """`cp_lse_ag_out_rs` after its lse gather, op for op, on `output`'s rows
+    `start : start + T`: `lses` is `[world, T, H]` for exactly those rows.
+    `vspace` (TPU_DCP_MERGE_VSPACE_FUSED): the operand is built in V space."""
     merged_lse = torch.logsumexp(lses, dim=0)
-    if vspace is not None:
-        weight = torch.exp(lse_f32 - merged_lse)
-        return _weighted_reduce_scatter_vspace(output, weight, vspace, group, rs_dtype)
+    rows = lse_f32.shape[0]
     # The heads-major operand feeds the f32 or the bf16 (RS_BF16=1)
     # reduce-scatter; RS_BF16=2's all-to-all keeps the tokens-major operand.
+    # Its kernel reads the chunk's rows in place.
     if (
         envs.TPU_DCP_MERGE_WEIGHTED_HM
+        and vspace is None
         and envs.TPU_DCP_MERGE_RS_BF16 != 2
-        and output.shape[0] * max(int(envs.TPU_DCP_MERGE_CHUNKED), 1)
+        and rows * max(int(envs.TPU_DCP_MERGE_CHUNKED), 1)
         > envs.bucket_gate_edge(envs.TPU_DCP_MERGE_WEIGHTED_HM_MIN_TOKENS)
     ):
         return _weighted_reduce_scatter_heads_major(
-            output, lse_f32, merged_lse, group, rs_dtype
+            output, lse_f32, merged_lse, group, rs_dtype, start
         )
+    output = output[start : start + rows]
+    if vspace is not None:
+        weight = torch.exp(lse_f32 - merged_lse)
+        return _weighted_reduce_scatter_vspace(output, weight, vspace, group, rs_dtype)
     # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
     weight = torch.exp(lse_f32 - merged_lse).unsqueeze(-1)
     weighted = output.to(torch.float32) * weight
@@ -443,12 +452,14 @@ def _weighted_reduce_scatter_heads_major(
     merged_lse: torch.Tensor,
     group: Any,
     rs_dtype: torch.dtype | None = None,
+    start: int = 0,
 ) -> torch.Tensor:
     """`_weighted_reduce_scatter`'s weight multiply and reduce-scatter with the
     operand built heads-major (`TPU_DCP_MERGE_WEIGHTED_HM`) by the same
     Pallas kernel `cp_lse_ag_out_rs` uses (`kernels/lse_rescale.py`), so no
     relayout copy -- TensorCore or SparseCore data-format -- sits between the
-    weights and the reduce-scatter.
+    weights and the reduce-scatter. It reads `output`'s rows
+    `start : start + T` in place.
 
     The wire dtype is `cp_lse_ag_out_rs`'s: `rs_dtype`
     (TPU_DCP_RS_OUT_PRECISION), else f32; `TPU_DCP_MERGE_RS_BF16=1` makes it
@@ -460,10 +471,10 @@ def _weighted_reduce_scatter_heads_major(
         from vllm_torchtpu.distributed.dcp_comm import _lse_rescale_head_major
 
         name = str(wire or torch.float32).removeprefix("torch.")
-        x = _lse_rescale_head_major(output, lse_f32, merged_lse, name)
+        x = _lse_rescale_head_major(output, lse_f32, merged_lse, name, start)
     else:
         w = torch.exp(lse_f32 - merged_lse).transpose(0, 1).unsqueeze(-1)
-        x = output.transpose(0, 1).to(torch.float32) * w
+        x = output[start : start + w.shape[1]].transpose(0, 1).to(torch.float32) * w
         x = torch.where(w > 0, x, torch.zeros_like(x))
         if wire is not None:
             x = x.to(wire)
@@ -509,15 +520,69 @@ def _merge_chunked_lse_gathered(
     for c in range(chunks):
         pieces.append(
             _weighted_reduce_scatter(
-                output[c * step : (c + 1) * step],
+                output,
                 lse_f32[c * step : (c + 1) * step],
                 rows[c],
                 group,
                 rs_dtype,
                 vspace=vspace,
+                start=c * step,
             )
         )
     return torch.cat(pieces, dim=0)
+
+
+def _fake_lse_rescale_quantize(
+    output: torch.Tensor,
+    lse: torch.Tensor,
+    merged_lse: torch.Tensor,
+    start: int,
+    out_dtype: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    heads, _, dim = output.shape
+    rows = lse.shape[0]
+    return (
+        output.new_empty((rows, heads * dim), dtype=getattr(torch, out_dtype)),
+        output.new_empty((rows, 1), dtype=torch.float32),
+    )
+
+
+# Registered at import: Dynamo cannot trace a lock-guarded registration.
+_lse_rescale_quantize = pallas.jax_op(
+    "pallas::lse_rescale_quantize", lse_rescale_quantize
+)
+_lse_rescale_quantize.register_fake(_fake_lse_rescale_quantize)
+
+
+def weight_lse_partials(
+    output: torch.Tensor, lse: torch.Tensor, quant_dtype: torch.dtype, chunk: int
+) -> list[tuple[torch.Tensor, torch.Tensor]]:
+    """`merge_lse_partials_scatter_heads` without the reduce-scatter: this
+    rank's `[T, H, V]` partial for every head, scaled by its share of the
+    exact merge and quantized per token for o_proj. Per chunk of `chunk`
+    tokens (the last one shorter), `q` `[rows, H * V]` in `quant_dtype` and
+    its `scale` `[rows, 1]` f32. The caller sums the ranks
+    (TPU_DCP_MLA_OPROJ_ALL_REDUCE: in o_proj's all-reduce)."""
+    group = get_dcp_group()
+    assert group is not None
+    lse = lse.to(torch.float32)
+    lses = group.all_gather(lse.unsqueeze(0).contiguous(), dim=0)
+    pieces = zip(lse.split(chunk), torch.logsumexp(lses, dim=0).split(chunk))
+    if output.device.type == "tpu":
+        # Head-major, as `project_uv_heads`' batched matmul writes it.
+        head_major = output.transpose(0, 1)
+        dtype = str(quant_dtype).removeprefix("torch.")
+        return [
+            _lse_rescale_quantize(head_major, own, merged, c * chunk, dtype)
+            for c, (own, merged) in enumerate(pieces)
+        ]
+    out = []
+    for x, (own, merged) in zip(output.split(chunk), pieces):
+        # where, not *: a zero-weight partial may be NaN (NaN * 0 = NaN).
+        weight = torch.exp(own - merged).unsqueeze(-1)
+        weighted = torch.where(weight > 0, x.to(torch.float32) * weight, 0.0)
+        out.append(quantize_tensor(weighted.flatten(1), quant_dtype))
+    return out
 
 
 def _all_to_all(x: torch.Tensor, group: Any) -> torch.Tensor:

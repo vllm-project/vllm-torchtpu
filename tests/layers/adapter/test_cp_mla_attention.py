@@ -340,6 +340,33 @@ def test_a_token_no_rank_owns_is_zero_not_nan(monkeypatch):
     np.testing.assert_array_equal(got[7], np.zeros_like(got[7]))
 
 
+@pytest.mark.parametrize("chunk", [3, 8])
+@pytest.mark.parametrize("dcp_size", [2, 8])
+def test_unscattered_terms_sum_to_the_merge(dcp_size, chunk, monkeypatch):
+    """TPU_DCP_MLA_OPROJ_ALL_REDUCE: o_proj's all-reduce sums these terms."""
+    rng = np.random.default_rng(20261017)
+    outputs, lses = _partials(rng, dcp_size, empty=[(0, 1)])
+    outputs[0, 1] = float("nan")  # a zero-weight partial must not leak
+    total = torch.zeros(())
+    for rank in range(dcp_size):
+        group = _FakeGroup(outputs, lses, rank)
+        monkeypatch.setattr(cp_mla, "get_dcp_group", lambda g=group: g)
+        pieces = cp_mla.weight_lse_partials(
+            outputs[rank], lses[rank], torch.float8_e4m3fn, chunk
+        )
+        assert [q.shape[0] for q, _ in pieces] == [
+            len(c) for c in torch.arange(outputs.shape[1]).split(chunk)
+        ]
+        terms = torch.cat([q.float() * scale for q, scale in pieces])
+        total = total + terms.view(outputs.shape[1:])
+    want = _reference_merge(outputs.nan_to_num(0.0), lses)
+    # Each term rounds to FP8 against its token's max, and e4m3 keeps 3
+    # mantissa bits: half an ulp is 1/16 of a value.
+    peak = outputs.nan_to_num(0.0).abs().amax(dim=(0, 2, 3)).numpy()
+    bound = np.broadcast_to(dcp_size * peak[:, None, None] / 16, want.shape)
+    np.testing.assert_array_less(np.abs(total.numpy() - want), bound)
+
+
 class _HeadGatherGroup:
     """Serves only `all_gather(dim=1)`, from a stack of per-rank head slices."""
 
@@ -1059,7 +1086,8 @@ def test_weighted_heads_major_is_bitwise_the_chunked_merge(
     monkeypatch.setattr(
         cp_mla,
         "_weighted_reduce_scatter_heads_major",
-        lambda o, *rest: calls.append(o.shape[0]) or real(o, *rest),
+        lambda o, lse_f32, *rest: calls.append(lse_f32.shape[0])
+        or real(o, lse_f32, *rest),
     )
     got = _rs_merge_whole(
         outputs, lses, monkeypatch, TPU_DCP_MERGE_WEIGHTED_HM=True, **on
@@ -1074,7 +1102,8 @@ def test_positive_control_reshaped_heads_major_operand_is_caught(monkeypatch):
     """The check above must fail when the heads-major operand is a reshape of
     the tokens-major one instead of a transpose."""
 
-    def _reshaped(o, lse_f32, merged_lse, g, rs_dtype=None):
+    def _reshaped(o, lse_f32, merged_lse, g, rs_dtype=None, start=0):
+        o = o[start : start + lse_f32.shape[0]]
         t, h, d = o.shape
         w = torch.exp(lse_f32 - merged_lse)
         w_hm = w.reshape(h, t).unsqueeze(-1)
@@ -1375,7 +1404,8 @@ def test_weighted_heads_major_bf16_wire_is_bitwise_the_bf16_wire_merge(
     monkeypatch.setattr(
         cp_mla,
         "_weighted_reduce_scatter_heads_major",
-        lambda o, *rest: calls.append(o.shape[0]) or real(o, *rest),
+        lambda o, lse_f32, *rest: calls.append(lse_f32.shape[0])
+        or real(o, lse_f32, *rest),
     )
     got = _rs_merge_whole(
         outputs,

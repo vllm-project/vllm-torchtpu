@@ -28,9 +28,10 @@ def _fake_lse_rescale_head_major(
     lse: torch.Tensor,
     merged_lse: torch.Tensor,
     out_dtype: str,
+    start: int = 0,
 ) -> torch.Tensor:
-    tokens, heads, dim = output.shape
-    return output.new_empty((heads, tokens, dim), dtype=getattr(torch, out_dtype))
+    _, heads, dim = output.shape
+    return output.new_empty((heads, lse.shape[0], dim), dtype=getattr(torch, out_dtype))
 
 
 # Registered at import: Dynamo cannot trace a lock-guarded registration.
