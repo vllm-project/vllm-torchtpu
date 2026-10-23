@@ -265,6 +265,30 @@ class Qwen38Segments(nn.Module):
         return res
 
 
+class MtpTail(nn.Module):
+    """The MTP draft layer after attention (o_proj, both HCs, MoE) as one tail-kernel call.
+
+    Reuses the main model's `(1, False)` segment kind, so no second torch op is
+    registered; owns the draft layer's packed operands as buffers.
+    """
+
+    def __init__(self, draft: Any, g: Any, mesh: Any, kind: _SegmentKind, buckets: tuple[int, ...]):
+        super().__init__()
+        object.__setattr__(self, "kind", kind)
+        self.buckets = buckets
+        R = mesh.size
+        ex = ExecSpec(R=R, B=buckets[0], T=T_VERIFY, ctx=128, tiles=segment_tiles(buckets[0]))
+        ops = pack_segment_operands(draft, g, -1, qwen38.segment_spec(g, R, L=1), ex, layer_ids=[0])
+        self.n_w = len(ops)
+        for i, t in enumerate(ops):
+            self.register_buffer(f"w_{i}", t, persistent=False)
+
+    def forward(self, hidden: torch.Tensor, attention: torch.Tensor) -> torch.Tensor:
+        w = [getattr(self, f"w_{i}") for i in range(self.n_w)]
+        (res,) = self.kind.op(hidden, attention, w, [])
+        return res
+
+
 class Qwen38SegmentDriver:
     """Routes uniform verify steps to `Qwen4ExpSegmentModel`."""
 
@@ -279,6 +303,7 @@ class Qwen38SegmentDriver:
         self.check_left = 0
         self.shadow = None
         self.stats: dict[str, int] = {}
+        self.mtp = False
 
     @classmethod
     def maybe_create(cls, runner: Any) -> Qwen38SegmentDriver | None:
@@ -300,6 +325,7 @@ class Qwen38SegmentDriver:
             return None
         drv = cls(runner, _parse_buckets(raw), head=_parse_flag(raw, "head", True))
         drv.check_left = _parse_check(raw)
+        drv.mtp = _parse_flag(raw, "mtp", False)
         logger.info(
             "Qwen3.8 segment megakernel enabled, verify buckets %s, shadow checks %d",
             drv.buckets,
@@ -337,6 +363,8 @@ class Qwen38SegmentDriver:
                 backbone=runner.model.model,
                 segments=self.segments,
             )
+        if self.mtp:
+            self._attach_mtp_tail(runner)
         if self.check_left > 0:
             shadow_seg = Qwen38Segments(
                 runner.model,
@@ -354,6 +382,30 @@ class Qwen38SegmentDriver:
                     backbone=runner.model.model,
                     segments=shadow_seg,
                 )
+
+    def _attach_mtp_tail(self, runner: Any) -> None:
+        """Route the MTP draft layer's post-attention half to the tail kernel.
+
+        Must run before the draft's first trace; the draft keeps its stock
+        layer for rows counts outside the buckets and whenever this fails.
+        """
+        from vllm_torchtpu.models.vllm.qwen4_exp.mtp import Qwen4ExpMTP
+
+        draft = getattr(getattr(runner, "drafter", None), "draft_model", None)
+        if not isinstance(draft, Qwen4ExpMTP):
+            logger.warning("Qwen3.8 MTP tail: no Qwen4ExpMTP draft model (%s)", type(draft))
+            return
+        o_proj = draft.model.layers[0].self_attn.o_proj.weight
+        if self.g.NH // self.mesh.size * self.g.HD not in tuple(o_proj.shape):
+            logger.warning("Qwen3.8 MTP tail: draft o_proj %s is not TP-sharded like the target", tuple(o_proj.shape))
+            return
+        try:
+            tail = MtpTail(draft, self.g, self.mesh, self.segments.kinds[(1, False)], self.buckets)
+        except Exception:
+            logger.exception("Qwen3.8 MTP tail: packing failed; draft stays stock")
+            return
+        draft.model.mk_tail = tail
+        logger.info("Qwen3.8 MTP draft tail kernel attached, rows buckets %s", self.buckets)
 
     def _shadow_step(self, runner: Any, input_ids: Any, positions: Any, kw: dict) -> Any:
         """Run the kernel program (no GDN writes) then the stock model; log, return stock."""
