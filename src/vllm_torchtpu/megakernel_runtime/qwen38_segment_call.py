@@ -45,7 +45,7 @@ def segment_tiles(B: int, hier: int | None = None) -> Tiles:
     Ring depths shrink with the bucket so the 64-row scratch fits VMEM; the
     bank sizes (hence every weight's tiling) are the same for all buckets.
     """
-    nbe, nbd = (12, 10) if B <= 16 else ((6, 10) if B <= 32 else (3, 6))
+    nbe, nbd = (12, 10) if B <= 16 else ((6, 10) if B <= 32 else (3, 4))
     h = 1 if hier is None else hier
     return Tiles(ebank=2 << 20, nbe=nbe, nbd=nbd, vmem_mib=62, hier=h).with_blocks(
         {"moe": {"pipe_ep": True, "moe_unroll": True}}

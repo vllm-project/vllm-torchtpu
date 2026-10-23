@@ -58,19 +58,20 @@ class _LayerView:
         return self.ref.at[rest] if rest else self.ref
 
 
-def _typed_f32(block_ref: Any, interpret: bool) -> Any:
-    """Whole `[rows, 1, 4, lanes]` FP8 scratch ref -> `(rows, lanes)` f32 values.
+def _typed_f32(block_ref: Any, interpret: bool, lanes: int) -> Any:
+    """Whole `[rows, 1, 4, 256]` FP8 scratch ref -> f32 values `(-1, lanes)`, row-major.
 
     4 consecutive pack rows form one 32-bit word per lane. On TPU this is the
-    ref bitcast the model's GDN kernel uses (`kernels/typed_ldst.py`); the
-    Pallas TPU interpreter has no ref bitcast, so interpret mode bitcasts the
-    loaded bytes, which groups the same rows.
+    ref bitcast + lane split the model's GDN kernel uses
+    (`kernels/typed_ldst.py`); the Pallas TPU interpreter has no ref bitcast,
+    so interpret mode bitcasts the loaded bytes, which groups the same rows.
     """
     if interpret:
         raw = block_ref[...]
-        return pltpu.bitcast(raw.reshape(-1, raw.shape[-1]), jnp.float32)
+        words = pltpu.bitcast(raw.reshape(-1, raw.shape[-1]), jnp.float32)
+        return words.reshape(-1, lanes)
     view = block_ref.bitcast(jnp.float32)
-    return view.reshape(-1, view.shape[-1])[...]
+    return view.reshape(-1, lanes)[...]
 
 
 class Qwen38PoolGDN(Qwen38GDN):
@@ -142,14 +143,20 @@ class Qwen38PoolGDN(Qwen38GDN):
             for c in pending:
                 c.wait()
             keep = ctx.extra[HAS_STATE][o, s] != 0
+            # 128-lane rows: the state's row-major order, so only the leading
+            # dimension is split (lane-changing reshapes do not lower).
             ssm = jnp.concatenate(
-                [_typed_f32(scr[f"pg_raw{buf}{j}"], interp) for j in range(SSM_BLOCKS)],
+                [_typed_f32(scr[f"pg_raw{buf}{j}"], interp, VD) for j in range(SSM_BLOCKS)],
                 axis=0,
-            ).reshape(vh, KD, VD)
+            )[: vh * KD].reshape(vh, KD, VD)
             scr["pg_rec"][s * vh : (s + 1) * vh] = jnp.where(keep, ssm, 0.0).astype(BF16)
-            conv = _typed_f32(scr[f"pg_craw{buf}"], interp).reshape(-1)[: 3 * QKV]
-            conv = conv.reshape(3, QKV)
-            scr["pg_conv"][s, 0:3, :] = jnp.where(keep, conv, 0.0)
+            crow = _typed_f32(scr[f"pg_craw{buf}"], interp, 256)  # [16, 256]
+            per = QKV // 256
+            for r in range(3):
+                for c in range(per):
+                    scr["pg_conv"][s, r : r + 1, c * 256 : (c + 1) * 256] = jnp.where(
+                        keep, crow[r * per + c : r * per + c + 1], 0.0
+                    )
             if s + 1 < NS:
                 pending = nxt
 
