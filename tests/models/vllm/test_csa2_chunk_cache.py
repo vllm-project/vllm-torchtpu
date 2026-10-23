@@ -94,10 +94,12 @@ def test_native_swa_allocation_budgets_overlaid_groups_and_binds_pages(
 
 @pytest.mark.cpu_test
 @pytest.mark.parametrize("tokens", [1, 513])
-def test_chunk_cache_reuse_and_stage_invalidation(monkeypatch, tokens):
+@pytest.mark.parametrize("decoder", [False, True])
+def test_chunk_cache_reuse_and_stage_invalidation(monkeypatch, tokens, decoder):
     gathered, consumed = [], []
 
     def gather(query, raw, high, scales, high_scales, selected, *args):
+        assert args[-1] is decoder
         gathered.append(selected)
         return (
             query * 2,
@@ -107,7 +109,8 @@ def test_chunk_cache_reuse_and_stage_invalidation(monkeypatch, tokens):
         )
 
     def attend(query, words, scales, raw, high, starts, *args):
-        consumed.append((words, scales, starts, args[-1]))
+        assert args[-1] is decoder
+        consumed.append((words, scales, starts, args[-2]))
         return query * 2
 
     monkeypatch.setattr(
@@ -142,6 +145,7 @@ def test_chunk_cache_reuse_and_stage_invalidation(monkeypatch, tokens):
             2,
             512**-0.5,
             False,
+            decoder=decoder,
         )
 
     with attention_kernels.gathered_kv_cache_scope():

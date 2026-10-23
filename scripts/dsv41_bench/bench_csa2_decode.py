@@ -131,7 +131,7 @@ def main() -> None:
     parser.add_argument("--profile-steps", type=int, default=30)
     args = parser.parse_args()
     root = Path(__file__).resolve().parents[2]
-    source = root / "src/vllm_torchtpu/kernels/deepseek_v41/csa2_decode.py"
+    source = root / "src/vllm_torchtpu/kernels/deepseek_v41/csa2/decode.py"
     spec = importlib.util.spec_from_file_location("decode_benchmark_kernel", source)
     assert spec is not None and spec.loader is not None
     module = importlib.util.module_from_spec(spec)

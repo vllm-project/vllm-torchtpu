@@ -7,7 +7,11 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.deepseek_v41.csa2_prefill import _tile_plan, csa2_prefill
+from vllm_torchtpu.kernels.deepseek_v41.csa2.prefill import (
+    build_query_tiles,
+    csa2_prefill,
+)
+from vllm_torchtpu.kernels.deepseek_v41.csa2.reference import prefill_reference
 
 
 @pytest.mark.cpu_test
@@ -17,7 +21,7 @@ def test_tile_plan_covers_each_output_once(bq):
     for lengths in ([0, 0, 0], [1, 0, 17, 0, 5], rng.integers(0, 35, 13)):
         starts = np.r_[0, np.cumsum(lengths)].astype(np.int32)
         tokens = int(starts[-1]) + 3
-        tiles, count = _tile_plan(jnp.asarray(starts), tokens, bq)
+        tiles, count = build_query_tiles(jnp.asarray(starts), tokens, bq)
         tiles = np.asarray(tiles)[: int(count)]
         coverage = np.zeros(tokens, np.int32)
         boundaries = np.r_[starts, tokens]
@@ -136,8 +140,10 @@ def numpy_reference(args, kwargs):
 def test_prefill_visibility_and_tail_rows(bq, banked, non_causal, heads):
     args, kwargs = prefill_inputs(banked, non_causal, heads)
     # CPU validates reference math; TPU exercises the buffered kernel itself.
-    actual = csa2_prefill(
-        *args, **kwargs, bq=bq, interpret=jax.default_backend() != "tpu"
+    actual = (
+        csa2_prefill(*args, **kwargs, bq=bq)
+        if jax.default_backend() == "tpu"
+        else prefill_reference(*args, **kwargs)
     )
     np.testing.assert_allclose(
         np.asarray(actual, np.float32),
@@ -185,8 +191,10 @@ def test_single_request_direct_output_preserves_padding(non_causal, valid_tokens
         main_lengths=padded(kwargs["main_lengths"]),
         swa_bounds=kwargs["swa_bounds"][1:2] if non_causal else None,
     )
-    actual = csa2_prefill(
-        *args, **kwargs, bq=16, interpret=jax.default_backend() != "tpu"
+    actual = (
+        csa2_prefill(*args, **kwargs, bq=16)
+        if jax.default_backend() == "tpu"
+        else prefill_reference(*args, **kwargs)
     )
     np.testing.assert_allclose(
         np.asarray(actual, np.float32),

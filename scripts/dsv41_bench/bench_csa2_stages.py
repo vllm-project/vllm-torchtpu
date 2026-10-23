@@ -1,0 +1,217 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+"""Matched CSA2 attention A/B for encoder prefill, decoder prefill and decode.
+
+Encoder/decoder identify DSV41 layer stages, independently of the mask. These
+isolated causal cases exclude SparseCore gather, KV publication and projection.
+Use the serving harness separately to establish actual framework routing and
+end-to-end effects. Baseline is the generic CSA2 file exported from the PR base.
+"""
+
+import argparse
+import hashlib
+import importlib.metadata
+import importlib.util
+import json
+import time
+from pathlib import Path
+
+import jax
+import numpy as np
+from bench_csa2_long import compile_variant, load_kernels, make_inputs, prefill_call
+from bench_csa2_long import reference as reference_output
+
+
+def events_from_trace(directory: Path) -> list[dict]:
+    events = []
+    for path in directory.rglob("*.xplane.pb"):
+        for plane in jax.profiler.ProfileData.from_file(str(path)).planes:
+            if not plane.name.startswith("/device:TPU:") or "SparseCore" in plane.name:
+                continue
+            for line in plane.lines:
+                for event in line.events:
+                    module = line.name == "XLA Modules" and "jit_run" in event.name
+                    operation = event.name.partition(" = ")[0]
+                    kernel = (
+                        line.name == "XLA Ops"
+                        and " custom-call(" in event.name
+                        and "csa2" in operation
+                    )
+                    if module or kernel:
+                        events.append(
+                            dict(
+                                kind="module" if module else "kernel",
+                                name=event.name,
+                                plane=plane.name,
+                                duration_us=event.duration_ns / 1000,
+                            )
+                        )
+    return events
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--out", required=True, type=Path)
+    parser.add_argument("--baseline", required=True, type=Path)
+    parser.add_argument("--prefill-tokens", nargs="+", type=int, default=[128, 2048])
+    parser.add_argument("--page-size", type=int, default=64)
+    args = parser.parse_args()
+    if args.page_size != 64:
+        parser.error("the input fixture currently requires page size 64")
+    root = Path(__file__).resolve().parents[2]
+    prefill, decode = load_kernels(root)
+    spec = importlib.util.spec_from_file_location("csa2_baseline", args.baseline)
+    assert spec is not None and spec.loader is not None
+    baseline = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(baseline)
+    versions = {p: importlib.metadata.version(p) for p in ("jax", "jaxlib", "libtpu")}
+    assert versions == dict(jax="0.11.2", jaxlib="0.11.2", libtpu="0.0.50")
+    args.out.mkdir(parents=True, exist_ok=True)
+    device = jax.devices("tpu")[0]
+    sources = list((root / "src/vllm_torchtpu/kernels/deepseek_v41/csa2").glob("*.py"))
+    sources += [args.baseline, Path(__file__)]
+    (args.out / "runtime.json").write_text(
+        json.dumps(
+            dict(
+                versions=versions,
+                device=str(device),
+                device_kind=device.device_kind,
+                source_sha256={
+                    p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sources
+                },
+                timing_basis="Single device; kernel and complete XLA module events",
+                layer_stage_basis="Model encoder/decoder layers, not mask semantics",
+            ),
+            indent=2,
+        )
+    )
+    cases = [
+        (stage, 1, tokens)
+        for tokens in args.prefill_tokens
+        for stage in ("prefill_encoder", "prefill_decoder")
+    ] + [("decode", 48, 6)]
+    for stage, batch, num_tokens in cases:
+        host = make_inputs(batch, num_tokens, 64)
+        selected = sorted(
+            {
+                seq * num_tokens + offset
+                for seq in {0, batch - 1}
+                for offset in {
+                    0,
+                    min(7, num_tokens - 1),
+                    min(8, num_tokens - 1),
+                    num_tokens - 1,
+                }
+            }
+        )
+        expected = reference_output(host, num_tokens, selected)
+        with jax.default_device(device):
+            inputs = jax.device_put(host, device)
+            jax.block_until_ready(inputs)
+
+            def baseline_call(data, num_tokens=num_tokens):
+                return prefill_call(baseline.csa2, data, num_tokens)
+
+            def candidate_call(data, num_tokens=num_tokens, stage=stage):
+                if stage == "prefill_encoder":
+                    return prefill_call(prefill, data, num_tokens)
+                return decode(
+                    **data,
+                    num_tokens=num_tokens,
+                    decoder_prefill=stage == "prefill_decoder",
+                )
+
+            variants = []
+            for variant, call in (
+                ("baseline", baseline_call),
+                ("candidate", candidate_call),
+            ):
+                print(
+                    json.dumps(
+                        dict(
+                            stage=stage,
+                            tokens=num_tokens,
+                            variant=variant,
+                            action="compile",
+                        )
+                    ),
+                    flush=True,
+                )
+                start = time.perf_counter()
+                compiled = compile_variant(call, inputs)
+                compile_seconds = time.perf_counter() - start
+                output = np.asarray(compiled(inputs).block_until_ready()).astype(
+                    np.float32
+                )
+                assert np.isfinite(output).all()
+                actual = output[selected]
+                np.testing.assert_allclose(actual, expected, atol=3e-3, rtol=3e-2)
+                correctness = dict(
+                    checked_tokens=len(selected),
+                    max_absolute_error=float(np.max(np.abs(actual - expected))),
+                    relative_l2=float(
+                        np.linalg.norm(actual - expected) / np.linalg.norm(expected)
+                    ),
+                )
+                variants.append((variant, compiled, compile_seconds, correctness))
+                del output
+            for repeat in range(2):
+                for variant, compiled, compile_seconds, correctness in (
+                    variants if repeat == 0 else reversed(variants)
+                ):
+                    for _ in range(20):
+                        compiled(inputs).block_until_ready()
+                    host_times = []
+                    for _ in range(3):
+                        start = time.perf_counter()
+                        for _ in range(30):
+                            result = compiled(inputs)
+                        result.block_until_ready()
+                        host_times.append((time.perf_counter() - start) * 1e6 / 30)
+                    directory = (
+                        args.out / f"{stage}-b{batch}-q{num_tokens}-{variant}-{repeat}"
+                    )
+                    with jax.profiler.trace(
+                        str(directory / "xprof"), create_perfetto_link=False
+                    ):
+                        for _ in range(30):
+                            result = compiled(inputs)
+                        result.block_until_ready()
+                    events = events_from_trace(directory)
+                    (directory / "events.json").write_text(json.dumps(events, indent=2))
+                    samples = {
+                        kind: [e["duration_us"] for e in events if e["kind"] == kind]
+                        for kind in ("module", "kernel")
+                    }
+                    assert all(len(values) == 30 for values in samples.values()), (
+                        samples
+                    )
+                    metric = dict(
+                        variant=variant,
+                        stage=stage,
+                        repeat=repeat,
+                        batch_size=batch,
+                        num_tokens=num_tokens,
+                        tokens=batch * num_tokens,
+                        heads=64,
+                        page_size=args.page_size,
+                        main_rows=512,
+                        latency_ms=float(np.median(samples["module"])) / 1000,
+                        kernel_median_us=float(np.median(samples["kernel"])),
+                        module_median_us=float(np.median(samples["module"])),
+                        module_p10_us=float(np.percentile(samples["module"], 10)),
+                        module_p90_us=float(np.percentile(samples["module"], 90)),
+                        host_queued_mean_us=float(np.mean(host_times)),
+                        device_event_count=30,
+                        compile_seconds=compile_seconds,
+                        correctness=correctness,
+                    )
+                    with (args.out / "metrics.jsonl").open("a") as file:
+                        file.write(json.dumps(metric) + "\n")
+                    print(json.dumps(metric), flush=True)
+            del variants, inputs
+            jax.clear_caches()
+
+
+if __name__ == "__main__":
+    main()
