@@ -253,6 +253,12 @@ def build_scratch(
     )
     AR_R = MR if WAR else PR
     AR_C = H if WAR else PC
+    # No slot reduces through the core all-reduce (every block reduces itself,
+    # `slot_ar_index` all None): its buffers are never touched, so size them at
+    # one tile instead of [MR, H] (Qwen3.8's HC wrappers own h-wide rings).
+    core_ar = any(i is not None for i in p.slot_ar_index)
+    if not core_ar:
+        AR_R, AR_C = min(AR_R, 8), 128 * max(R, 2)
     CW = AR_C // R
     HC2 = AR_C // 2
     N_HIER3 = max(1, R.bit_length() - 1)
@@ -284,7 +290,9 @@ def build_scratch(
         "xb2": pltpu.VMEM((MB, KX2), BF16),
         "acc": pltpu.VMEM((MB, NACC), F32),
         "ybuf": pltpu.VMEM((MB, NY), F32),
-        "part": pltpu.VMEM((MB, H), F32),
+        # Blocks that remap `part` to their own buffer (`owns_part`) never read
+        # the core one; when every slot does, keep it at one tile.
+        "part": pltpu.VMEM((8, 128) if _all_own_part(model_spec) else (MB, H), F32),
         "mix": pltpu.VMEM((MB, NMIX), F32),
         "send": pltpu.VMEM(
             (N_HIER3, 2, AR_R, AR_C)
@@ -532,3 +540,11 @@ def fit_default_tiles(model_spec: ModelSpec, ex: ExecSpec) -> ExecSpec:
                 f"{need:.2f} MiB with ring depths nbd={t.nbd}, nbe={t.nbe}; "
                 "pass explicit tiles or a named profile"
             )
+
+
+def _all_own_part(model_spec: Any) -> bool:
+    """Every slot block (each SwitchSlot branch too) sets `owns_part = True`."""
+    blocks = []
+    for slot in model_spec.layer_type.slots:
+        blocks.extend(getattr(slot, "branches", None) or (slot,))
+    return bool(blocks) and all(getattr(b, "owns_part", False) for b in blocks)

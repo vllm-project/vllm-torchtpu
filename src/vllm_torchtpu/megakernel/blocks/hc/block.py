@@ -63,6 +63,9 @@ class HCSublayer(Block):
 
     name = "hc_sublayer"
     reduction = "custom"
+    # The inner block's `part` is remapped to `hc_part` (see `emit`); the core
+    # `part` buffer is never read through this block.
+    owns_part = True
     input_norm = None
 
     def __init__(
