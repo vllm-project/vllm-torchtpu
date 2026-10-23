@@ -32,6 +32,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.sequence_layout import (
     DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
     DEFAULT_SEQUENCE_LAYOUT_PROTOCOL,
@@ -615,8 +616,6 @@ def stage_block_table_uploads(
             offset += num_reqs_padded * target_num_blocks
     # Dummy runs keep the zeroed buffer: same staged layout, null blocks.
 
-    staged_dev = stage_h2d_upload(runner, flat)
-
     # One compiled program splits the staged tensor into per-group tables
     # and derives every unified-pool mamba group's state/checkpoint indices
     # (replaces one micro-program per group per step).
@@ -625,6 +624,30 @@ def stage_block_table_uploads(
     for _, _, target_num_blocks in entries:
         table_geom.append((offset, num_reqs_padded, target_num_blocks))
         offset += num_reqs_padded * target_num_blocks
+
+    # In steady decode the tables change only when a request crosses a block,
+    # so most steps would re-upload the same few MB (59 groups x requests x
+    # row width for Qwen4Exp) and the walk program would wait on it. Reuse the
+    # previous upload when geometry and contents match; the device copy is
+    # read-only (every consumer gets the walk program's outputs).
+    prev = runner.__dict__.get("_block_table_stage_prev")
+    if (
+        envs.VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE
+        and prev is not None
+        and prev[0] == table_geom
+        and torch.equal(prev[1], flat)
+    ):
+        staged_dev = prev[2]
+        # Nothing was uploaded from `flat`: hand a recycled buffer straight back.
+        if id(flat) in runner._registered_h2d_sources:
+            key = (flat.numel(), flat.dtype)
+            free = runner._free_h2d_sources.pop(key, None) or []
+            free.append(flat)
+            runner._free_h2d_sources[key] = free
+    else:
+        staged_dev = stage_h2d_upload(runner, flat)
+        if envs.VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE:
+            runner._block_table_stage_prev = (table_geom, flat.clone(), staged_dev)
 
     # Mirror of build()'s branch order: the compact path
     # (ctx.mamba_state_indices) wins, otherwise the unified layout derives

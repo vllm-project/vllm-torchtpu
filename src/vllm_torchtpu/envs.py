@@ -192,6 +192,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     VLLM_TPU_FUSED_ASYNC_DRAFT_SEED: bool = True
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
+    VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE: bool = True
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
@@ -1138,6 +1139,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (tpu_runner.py _update_read_offsets_impl).
     "VLLM_TPU_FUSED_READ_OFFSET_UPDATE": env_bool(
         "VLLM_TPU_FUSED_READ_OFFSET_UPDATE", default=True
+    ),
+    # Metadata walk: reuse the previous step's staged block-table upload when
+    # its geometry and contents are unchanged (layers/core/attention_metadata.py
+    # stage_block_table_uploads).
+    "VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE": env_bool(
+        "VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE", default=True
     ),
     # Non-greedy sampling filters the vocab to this many 128-logit blocks,
     # ranked by block max, before running top-k (and any subsequent top-p).
