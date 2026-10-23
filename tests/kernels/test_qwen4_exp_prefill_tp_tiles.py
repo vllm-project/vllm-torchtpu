@@ -30,8 +30,10 @@ def interpret(monkeypatch):
 
 
 @pytest.mark.parametrize("query_heads", [3, 6, 12, 24])
-@pytest.mark.parametrize("page_size", [128, 1664])
+@pytest.mark.parametrize("page_size", [128, 512, 1664])
 def test_tp_shard_tiles_are_paired(monkeypatch, query_heads, page_size):
+    if query_heads == 24 and page_size == 512:
+        pytest.skip("Q24/KV2 is tuned for the 128 and 1664 page layouts")
     info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
     monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
     kv_heads = 2 if query_heads == 24 else 1
@@ -59,6 +61,7 @@ def test_tp_shard_tiles_are_paired(monkeypatch, query_heads, page_size):
         (3, 512, 256, 512),  # two bitset parts, one 512-row subtile
         (3, 512, 512, 512),  # four selection words per KV tile
         (6, 512, 1024, 128),  # eight words, four subtiles
+        (3, 512, 1024, 256),  # TP8 serving tiles
         (3, 512, 256, 256),  # two subtiles
         (3, 256, 256, None),
         (6, 512, 128, 256),  # unpaired, two parts and subtiles
@@ -70,7 +73,9 @@ def test_single_kv_head_matches_dense(
     interpret, query_heads, query_block, kv_tile, query_tile, kv_head_offset
 ):
     rng = np.random.default_rng(query_heads * 100 + query_block + kv_head_offset)
-    ratio, page_size, pages, dim = 4, 128, 12, 256
+    # KV1024 tiles span two serving-sized 512-token pages.
+    ratio, dim = 4, 256
+    page_size, pages = (512, 4) if kv_tile == 1024 else (128, 12)
     tokens = 1024
     # Two requests: a 600-token prefill on a 700-token context and a short
     # one, padded to the query block by the attention wrapper.
