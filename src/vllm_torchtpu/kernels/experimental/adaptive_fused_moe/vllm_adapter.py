@@ -47,6 +47,7 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.host import (
 )
 from vllm_torchtpu.layers.adapter import moe_routing
 from vllm_torchtpu.logger import init_logger
+from vllm_torchtpu.utils import fresh_buffer
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe import RoutedExperts
@@ -277,6 +278,41 @@ def _squeeze_channel_scale_checked(scale: torch.Tensor) -> torch.Tensor:
     while s.ndim > 2 and s.shape[1] == 1:
         s = s.squeeze(1)
     return s
+
+
+CHANNEL_SCALE_2D_ATTRS = ("w13_channel_scale_2d", "w2_channel_scale_2d")
+
+
+def cache_channel_scales_2d(
+    layer: torch.nn.Module, w1_scale: torch.Tensor, w2_scale: torch.Tensor
+) -> bool:
+    """Back the per-channel kernel scales with `[E, N]` buffers of their own.
+
+    The GMM layout keeps the scales as `[E, 1, 1, N]`, whose singleton
+    second-minor axis gives them a (1, 128)-tiled device layout. The kernel
+    takes `[E, N]` in (8, 128) tiles, so squeezing in the hot path makes XLA
+    relayout both scales of every MoE layer on every forward. The load-time
+    copies are registered as non-persistent buffers so the compiled graph takes
+    them as inputs. The 4-D scales stay for every other consumer.
+    """
+    if not envs.MOE_ADAPTIVE_2D_CHANNEL_SCALES:
+        return False
+    scales = [_squeeze_channel_scale_checked(s) for s in (w1_scale, w2_scale)]
+    if any(s.ndim != 2 for s in scales):
+        return False
+    for name, s in zip(CHANNEL_SCALE_2D_ATTRS, scales):
+        layer.register_buffer(name, fresh_buffer(s), persistent=False)
+    return True
+
+
+def runtime_channel_scales(
+    layer: torch.nn.Module, w1_scale: torch.Tensor, w2_scale: torch.Tensor
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """The scales to hand `run_adaptive_fused_moe`: cached `[E, N]` if any."""
+    w1_2d, w2_2d = (getattr(layer, name, None) for name in CHANNEL_SCALE_2D_ATTRS)
+    if w1_2d is None or w2_2d is None:
+        return w1_scale, w2_scale
+    return w1_2d, w2_2d
 
 
 def _mesh_expert_order(ep: int) -> tuple[int, ...] | None:
