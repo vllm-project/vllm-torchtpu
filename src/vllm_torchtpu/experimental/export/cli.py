@@ -338,9 +338,9 @@ def _launch_workers(
         )
         shutil.rmtree(data_dir, ignore_errors=True)
         worker_flags += [checkpoint.DATA_DIR_FLAG, data_dir]
-    rank_root = tempfile.mkdtemp(
-        prefix=".export_ranks_", dir=os.path.dirname(os.path.abspath(output_dir))
-    )
+    parent_dir = os.path.dirname(os.path.abspath(output_dir))
+    os.makedirs(parent_dir, exist_ok=True)
+    rank_root = tempfile.mkdtemp(prefix=".export_ranks_", dir=parent_dir)
     procs = []
     try:
         for rank in range(tp_size):
