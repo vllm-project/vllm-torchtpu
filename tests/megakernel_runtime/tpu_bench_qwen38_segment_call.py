@@ -155,7 +155,38 @@ def run(
         lambda h, p_, at, *a: fn(p_, h, at, *a)[0], hid_m, (pos, att_m, *flat, *st), chains
     )
     out["kernel_us"] = t_kernel
+    if QSA_ATTN:
+        # Same segment with the QSA sparse attention in-kernel: every live row
+        # attends the full 2051-token budget from a shuffled paged FP8 pool.
+        spec_q = qwen38.segment_spec(g, R, L=L, qsa_attn=dict(budget=512, kv_head_offset=0))
+        ex_q = ExecSpec(R=R, B=B, T=T_VERIFY, ctx=128, tiles=segment_tiles(B, rings=rings))
+        fn_q, _, _, _ = make_flat_segment_step(mesh, spec_q, ex_q)
+        assert fn_q.extra_names == ("qsa_pool", "qsa_q", "qsa_gate", "qsa_pages", "qsa_kvlen")
+        nh, npages = g.NH // R, 1024
+        rng = np.random.default_rng(B)
+        pool_q = jax.device_put(
+            jax.random.normal(jax.random.PRNGKey(3), (R * npages, 128, 1, 4, 256), jnp.float32).astype(
+                jnp.float8_e4m3fn
+            ),
+            tp,
+        )
+        q_q = jax.device_put(jax.random.normal(jax.random.PRNGKey(4), (R * ex.M, nh, g.HD), jnp.bfloat16), tp)
+        g_q = jax.device_put(jax.random.normal(jax.random.PRNGKey(5), (R * ex.M, nh, g.HD), jnp.bfloat16), tp)
+        pages_q = jax.device_put(
+            jnp.asarray(rng.permutation(npages * 32)[: ex.M * 513].reshape(ex.M, 513), jnp.int32), rep
+        )
+        kvlen_q = jax.device_put(jnp.asarray([2051] * B + [0] * (ex.M - B), jnp.int32), rep)
+        out["kernel_qsa_attn_us"] = _slope(
+            lambda h, p_, *a: fn_q(p_, h, *a)[0],
+            hid_m,
+            (pos, pool_q, q_q, g_q, pages_q, kvlen_q, *flat, *st),
+            chains,
+        )
+        out["in_kernel_attention_us"] = round(out["kernel_qsa_attn_us"] - t_kernel, 1)
     return out
+
+
+QSA_ATTN = False
 
 
 def main() -> None:
@@ -165,7 +196,10 @@ def main() -> None:
     ap.add_argument("--chains", type=int, nargs="+", default=[8, 32])
     ap.add_argument("--rings", nargs="*", default=[], help="nbe:nbd overrides to sweep")
     ap.add_argument("--kernel-only", action="store_true", help="time the bare kernel only")
+    ap.add_argument("--qsa-attn", action="store_true", help="also time the in-kernel QSA attention variant")
     a = ap.parse_args()
+    global QSA_ATTN
+    QSA_ATTN = a.qsa_attn
     sweep = [tuple(int(v) for v in r.split(":")) for r in a.rings] or [None]
     for L, B, rings in ((L, B, r) for L in a.layers for B in a.rows for r in sweep):
         if True:
