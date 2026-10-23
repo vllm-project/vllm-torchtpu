@@ -20,6 +20,7 @@ from typing import Any, NamedTuple, cast
 
 import jax
 import torch
+from vllm.utils.torch_utils import STR_DTYPE_TO_TORCH_DTYPE
 from jax._src import dtypes
 from jax.sharding import Mesh
 from vllm import utils
@@ -33,6 +34,11 @@ TPU_SECOND_LAST_MINOR = 8
 
 _megacore = False
 logger = init_logger(__name__)
+
+
+def torch_dtype_from_name(dtype_name: str) -> torch.dtype:
+    """Resolve a Torch dtype name, optionally prefixed with ``torch.``."""
+    return STR_DTYPE_TO_TORCH_DTYPE[dtype_name.removeprefix("torch.")]
 
 
 def align_to(unpadded_dim, pad_multiple):
