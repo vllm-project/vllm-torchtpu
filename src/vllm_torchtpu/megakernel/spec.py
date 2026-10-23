@@ -13,36 +13,33 @@
 # limitations under the License.
 """Declarative model specification for the megakernel.
 
-Weights, states, extra inputs, smalls and scratch requests that blocks declare,
-the `Block` interface, and how blocks compose into layers and a `ModelSpec`.
-Parameter/cache/binding declaration primitives live in `decls` and are
-re-exported here. Execution config (`ExecSpec`, `Tiles`, tunables) lives in
-`exec_spec`.
+Weights, states, extra inputs, smalls and scratch requests that modules declare,
+and how modules compose into layers and a `ModelSpec`. The `Module` base class
+lives in `module`, parameter/cache/binding declaration primitives live in
+`decls`, and both are re-exported here. Execution config (`ExecSpec`, `Tiles`,
+tunables) lives in `exec_spec`.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from typing import Any, Literal
 
 from .decls import (  # noqa: F401
     REQUIRED,
-    BlockBinding,
     FrozenDict,
     HFParamDecl,
     KVCacheDecl,
+    ModuleBinding,
     ParamTransform,
     RecurrentCacheDecl,
-    ResolvedBlockGeometry,
+    ResolvedModuleGeometry,
     VLLMAlias,
     _resolve_field_spec,
     combined_hf_param_shapes,
     validate_rename_and_transforms,
 )
-
-if TYPE_CHECKING:
-    from .exec_spec import ExecSpec
+from .module import Module
 
 
 @dataclass(frozen=True)
@@ -55,10 +52,10 @@ class Spec:
 
 @dataclass(frozen=True)
 class WeightDecl:
-    """Declarative specification for a block weight tensor.
+    """Declarative specification for a module weight tensor.
 
     The leading layer count and layer-to-index map are derived from the
-    slot/branch in `ModelSpec.layer_type` where the owning `Block` appears.
+    slot/branch in `ModelSpec.layer_type` where the owning `Module` appears.
     """
 
     name: str
@@ -67,7 +64,9 @@ class WeightDecl:
     dtype: Any
     stream_ring: Literal["static", "dynamic", "hbm"] = "static"
     layout: Literal["stacked", "per_layer"] = "stacked"
-    lead_dims: tuple[int, ...] = ()  # Extra per-layer leading dims (e.g. `(EW,)`)
+    lead_dims: tuple[
+        int, ...
+    ] = ()  # Extra per-layer leading dims (e.g. `(EW,)` for experts)
 
 
 @dataclass(frozen=True)
@@ -75,7 +74,7 @@ class StateDecl:
     """Declarative specification for a state, cache, or per-layer output tensor.
 
     `shape` is the per-layer, per-rank shape; when `per_layer=True`, the full
-    state shape is prefixed with the owning block's active layer count.
+    state shape is prefixed with the owning module's active layer count.
     """
 
     name: str
@@ -89,10 +88,10 @@ class StateDecl:
 
 @dataclass(frozen=True)
 class ExtraInput:
-    """Positional input after the states, declared by a block.
+    """Positional input after the states, declared by a module.
 
     Used for optional debug inputs (e.g. externally forced routing). Passed in
-    block declaration order after the state inputs and exposed to the block as
+    module declaration order after the state inputs and exposed to the module as
     `ctx.extra[name]`. HBM inputs are sharded across ranks,
     SMEM inputs replicated and counted against the SMEM budget.
     """
@@ -113,221 +112,11 @@ class SmallField:
 
 @dataclass(frozen=True)
 class ScratchReq:
-    """VMEM / SMEM / Semaphore buffer request declared by a Block or Core."""
+    """VMEM / SMEM / Semaphore buffer request declared by a Module or Core."""
 
     name: str
     spec: Any  # pltpu.VMEM, pltpu.SMEM, or pltpu.SemaphoreType.DMA
     phase: str = "persistent"  # "persistent" or phase tag for non-overlapping overlay
-
-
-class Block:
-    """Composable megakernel building block (attention, recurrent, FFN, etc.).
-
-    A block with its own knobs sets `Tunables` to a frozen dataclass (fields
-    with defaults plus a `NUMERICS` class attribute); defining the subclass
-    registers it under `name`, and the block reads its values with
-    `self.tunables(ex)`. Debug-only flags go in a separate frozen dataclass
-    `Debug`, read with `self.debug_flags(ex)` from `ExecSpec.debug.blocks`.
-    """
-
-    name: str = "block"
-    reduction: Literal["allreduce", "none", "custom"] = "allreduce"
-    input_norm: str | None = None
-    Tunables: ClassVar[type | None] = None
-    Debug: ClassVar[type | None] = None
-    GEOMETRY_FIELDS: ClassVar[dict[str, tuple[str, Any]]] = {}
-    FIELD_ALIASES: ClassVar[dict[str, str]] = {}
-    GEOMETRY_METHODS: ClassVar[dict[str, Any]] = {}
-    OPTIONS: ClassVar[dict[str, Any]] = {}
-    PARAM_NAMES: ClassVar[frozenset[str]] = frozenset()
-    geometry: Any = None
-    prefix: str = ""
-    options: Mapping[str, Any] = FrozenDict()
-
-    def __init_subclass__(cls, **kwargs: Any) -> None:
-        super().__init_subclass__(**kwargs)
-        if cls.Tunables is not None and (
-            "Tunables" in cls.__dict__ or "name" in cls.__dict__
-        ):
-            from .exec_spec import register_tunables
-
-            register_tunables(cls.name, cls.Tunables)
-        if cls.Debug is not None and (
-            "Debug" in cls.__dict__ or "name" in cls.__dict__
-        ):
-            from .exec_spec import register_debug
-
-            register_debug(cls.name, cls.Debug)
-
-    def tunables(self, ex: ExecSpec) -> Any:
-        assert self.Tunables is not None, f"block {self.name!r} declares no Tunables"
-        return ex.resolved_tiles.block(self.name, self.Tunables)
-
-    def debug_flags(self, ex: ExecSpec) -> Any:
-        assert self.Debug is not None, f"block {self.name!r} declares no Debug"
-        val = ex.debug.blocks.get(self.name)
-        if val is None:
-            return self.Debug()
-        if not isinstance(val, self.Debug):
-            raise TypeError(
-                f"DebugOptions.blocks[{self.name!r}] must be a "
-                f"{self.Debug.__name__}, got {type(val).__name__}"
-            )
-        return val
-
-    def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:
-        return []
-
-    def states(self, g: Any, ex: ExecSpec) -> list[StateDecl]:
-        return []
-
-    def outputs(self, g: Any, ex: ExecSpec) -> list[StateDecl]:
-        return []
-
-    def extra_inputs(self, g: Any, ex: ExecSpec) -> list[ExtraInput]:
-        return []
-
-    def smalls(self, g: Any, ex: ExecSpec) -> list[SmallField]:
-        return []
-
-    def shared_widths(self, g: Any, ex: ExecSpec) -> dict[str, int]:
-        return {}
-
-    def plan_params(self, g: Any, ex: ExecSpec, plan: Any) -> Any:
-        return None
-
-    def scratch(
-        self, g: Any, ex: ExecSpec, plan: Any
-    ) -> dict[str, Any] | list[ScratchReq]:
-        return {}
-
-    def prologue(self, ctx: Any) -> None:
-        """Executed once before the inter-rank barrier and main layer loop."""
-
-    def init_buffers(self, ctx: Any) -> None:
-        """Executed once after the inter-rank barrier and before the main layer loop."""
-
-    def on_layer_start(self, ctx: Any, lyr: Any, slot: Any) -> None:
-        """Executed at the start of layer `lyr` alongside `smalls` double-buffering."""
-
-    def emit(self, ctx: Any, l: Any, slot: Any) -> Any:  # noqa: E741
-        raise NotImplementedError
-
-    def epilogue(self, ctx: Any) -> None:
-        """Executed once after the main layer loop."""
-
-    def host_update_states(
-        self,
-        g: Any,
-        ex: ExecSpec,
-        pos: Any,
-        states: dict[str, Any],
-        raw_outputs: dict[str, Any],
-    ) -> dict[str, Any]:
-        return {}
-
-    @classmethod
-    def _validate_options(cls, options: Mapping[str, Any]) -> None:
-        """Hook for subclasses to reject unsupported option values."""
-
-    @classmethod
-    def bind(cls, prefix: str = "", **hf_fields_or_options: Any) -> BlockBinding:
-        """Bind this block class to a checkpoint `prefix` and HF config fields."""
-        if not cls.GEOMETRY_FIELDS and not cls.OPTIONS:
-            raise NotImplementedError(f"{cls.__name__}.bind is not implemented")
-        rename = dict(hf_fields_or_options.pop("rename", {}) or {})
-        transforms = dict(hf_fields_or_options.pop("transforms", {}) or {})
-        fields = {
-            k: default_hf_key for k, (default_hf_key, _) in cls.GEOMETRY_FIELDS.items()
-        }
-        options = dict(cls.OPTIONS)
-        explicit_fields: set[str] = set()
-        for k, v in hf_fields_or_options.items():
-            canon = cls.FIELD_ALIASES.get(k, k)
-            if canon in cls.GEOMETRY_FIELDS:
-                fields[canon] = v
-                explicit_fields.add(canon)
-            elif k in cls.OPTIONS:
-                options[k] = v
-            else:
-                known = sorted(
-                    set(cls.GEOMETRY_FIELDS)
-                    | set(cls.FIELD_ALIASES)
-                    | set(cls.OPTIONS)
-                    | {"rename", "transforms"}
-                )
-                raise ValueError(
-                    f"{cls.__name__}.bind got unknown field or option {k!r}; "
-                    f"supported: {known}"
-                )
-        cls._validate_options(options)
-        validate_rename_and_transforms(
-            cls, rename, transforms, param_name_override=options.get("param_name")
-        )
-        return BlockBinding(
-            block_cls=cls,
-            prefix=prefix,
-            fields=fields,
-            options=options,
-            rename=rename,
-            transforms=transforms,
-            explicit_fields=frozenset(explicit_fields),
-        )
-
-    @classmethod
-    def _resolve_binding(
-        cls, binding: BlockBinding, hf_config: Any
-    ) -> ResolvedBlockGeometry:
-        cls._validate_options(binding.options)
-        validate_rename_and_transforms(
-            cls,
-            binding.rename,
-            binding.transforms,
-            param_name_override=binding.options.get("param_name"),
-        )
-        values: dict[str, Any] = {}
-        for canon, (default_hf_key, fallback_default) in cls.GEOMETRY_FIELDS.items():
-            spec_val = binding.fields.get(canon, default_hf_key)
-            aliases = tuple(a for a, t in cls.FIELD_ALIASES.items() if t == canon)
-            values[canon] = _resolve_field_spec(
-                hf_config,
-                canon,
-                spec_val,
-                fallback_default,
-                aliases,
-                explicit=canon in binding.explicit_fields,
-            )
-        return ResolvedBlockGeometry(
-            block_cls=cls,
-            prefix=binding.prefix,
-            values=values,
-            options=binding.options,
-            rename=binding.rename,
-            transforms=binding.transforms,
-        )
-
-    @classmethod
-    def _from_resolved(cls, resolved: ResolvedBlockGeometry) -> Block:
-        ctor: Any = cls
-        return ctor(geometry=resolved, prefix=resolved.prefix, **dict(resolved.options))
-
-    def _require_geometry(self, g: Any = None) -> Any:
-        geom = g if g is not None else self.geometry
-        if geom is None:
-            raise ValueError(
-                f"{type(self).__name__} requires a resolved geometry "
-                "(pass `geometry=...` or `g=...`, or call via `bind(...).resolve(cfg)`)"
-            )
-        return geom
-
-    def hf_params(self, prefix: str | None = None, g: Any = None) -> list[HFParamDecl]:
-        raise NotImplementedError(f"{type(self).__name__}.hf_params is not implemented")
-
-    def cache_decl(self, g: Any = None) -> KVCacheDecl | RecurrentCacheDecl | None:
-        return None
-
-    def reference(self, *args: Any, **kwargs: Any) -> Any:
-        raise NotImplementedError(f"{type(self).__name__}.reference is not implemented")
 
 
 @dataclass(frozen=True)
@@ -339,13 +128,16 @@ class SwitchSlot:
     """
 
     name: str
-    branches: tuple[Block, ...]
+    branches: tuple[Module, ...]
     branch_counts: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if not self.branch_counts:
             object.__setattr__(self, "branch_counts", (1,) * len(self.branches))
-        assert len(self.branches) == len(self.branch_counts)
+        assert len(self.branches) == len(self.branch_counts), (
+            self.branches,
+            self.branch_counts,
+        )
         assert all(c >= 0 for c in self.branch_counts) and sum(self.branch_counts) > 0
 
     @property
@@ -353,12 +145,12 @@ class SwitchSlot:
         return sum(self.branch_counts)
 
     @property
-    def active_pairs(self) -> tuple[tuple[Block, int], ...]:
+    def active_pairs(self) -> tuple[tuple[Module, int], ...]:
         """Return `(branch, count)` pairs with `count > 0`."""
         return tuple((b, c) for b, c in zip(self.branches, self.branch_counts) if c > 0)
 
     @property
-    def active_branches(self) -> tuple[Block, ...]:
+    def active_branches(self) -> tuple[Module, ...]:
         return tuple(b for b, _ in self.active_pairs)
 
     @property
@@ -371,7 +163,7 @@ class LayerType:
     """Sequence of slots executed in a single transformer layer."""
 
     name: str
-    slots: tuple[Block | SwitchSlot, ...]
+    slots: tuple[Module | SwitchSlot, ...]
 
 
 @dataclass(frozen=True)
@@ -385,13 +177,19 @@ class ModelSpec:
     # models without a page-based cache.
     cache_backend: Any = None
 
-    def all_blocks(self) -> list[Block]:
-        """Return unique active blocks in deterministic declaration order."""
-        seen: set[str] = set()
-        out: list[Block] = []
+    def all_modules(self) -> list[Module]:
+        """Return unique active modules in deterministic declaration order."""
+        seen: dict[str, Module] = {}
+        out: list[Module] = []
         for s in self.layer_type.slots:
             for b in s.active_branches if isinstance(s, SwitchSlot) else (s,):
-                if b.name not in seen:
-                    seen.add(b.name)
+                prev = seen.get(b.name)
+                if prev is None:
+                    seen[b.name] = b
                     out.append(b)
+                elif prev != b:
+                    raise ValueError(
+                        f"ModelSpec {self.name!r} has distinct modules sharing "
+                        f"name {b.name!r}: {prev!r} vs {b!r}"
+                    )
         return out
