@@ -295,6 +295,77 @@ class CorrectnessTest(parameterized.TestCase):
         print(f"Max Diff Out: {np.max(diff_out)}")
         np.testing.assert_allclose(out_base, out_agent, rtol=0.1, atol=0.1)
 
+    def test_static_verify_segment(self):
+        """Verify windows of a fixed length (1 + K) in the distribution's
+        middle segment run the static query-length pass and must equal the
+        same step with the windows in the mixed segment (and the reference)."""
+        rng = np.random.default_rng(4321)
+        num_heads, head_dim, page_size = 64, 512, 16
+        verify_q_len = 7
+        q_lens = np.array([1] * 4 + [verify_q_len] * 4 + [3, 9, 2, 12], np.int32)
+        batch_size = len(q_lens)
+        new_kv_lens = jnp.array(q_lens)
+        cu_q_lens = jnp.concatenate(
+            [jnp.array([0]), jnp.cumulative_sum(new_kv_lens, dtype=jnp.int32)]
+        )
+        kv_lens = new_kv_lens + gen_random_int(rng, (batch_size,), 30, 200)
+        total_tokens = int(jnp.sum(new_kv_lens))
+        q = gen_random(rng, (total_tokens, num_heads, head_dim), jnp.bfloat16)
+        kv_lens_to_attend = []
+        for i in range(batch_size):
+            for t in range(q_lens[i]):
+                kv_lens_to_attend.append(int(kv_lens[i]) - q_lens[i] + t + 1)
+        kv_lens_to_attend = jnp.array(kv_lens_to_attend, dtype=jnp.int32)
+        pages_per_seq = cdiv(500, page_size)
+        page_indices = jnp.arange(batch_size * pages_per_seq, dtype=jnp.int32)
+        cache_kv_base, kernel_cache = create_cache(
+            rng, batch_size * pages_per_seq, page_size, head_dim, jnp.bfloat16
+        )
+        attention_sinks = generate_attention_sinks(rng, num_heads)
+        swa_accumution = gen_random(
+            rng, (total_tokens, num_heads, head_dim), jnp.bfloat16
+        )
+        swa_l = gen_random(rng, (total_tokens, num_heads), dtype=jnp.float32)
+        swa_m = gen_random(rng, (total_tokens, num_heads), dtype=jnp.float32)
+
+        def run(distribution):
+            return mla.mla_ragged_paged_attention(
+                q,
+                kernel_cache,
+                kv_lens,
+                kv_lens_to_attend,
+                page_indices,
+                cu_q_lens,
+                jnp.array(distribution, dtype=jnp.int32),
+                attention_sinks,
+                swa_accumution,
+                swa_l,
+                swa_m,
+                sm_scale=1.0,
+                num_kv_pages_per_block=2,
+                num_queries_per_block=(1, 16, 16),
+                chunk_prefill_size=verify_q_len,
+            )
+
+        mixed = run([4, 4, batch_size])
+        static = run([4, 8, batch_size])
+        np.testing.assert_array_equal(np.asarray(mixed), np.asarray(static))
+        ref = ref_implementation(
+            q,
+            cache_kv_base,
+            kv_lens,
+            kv_lens_to_attend,
+            page_indices,
+            cu_q_lens,
+            jnp.array([4, 8, batch_size], dtype=jnp.int32),
+            attention_sinks,
+            swa_accumution,
+            swa_l,
+            swa_m,
+            sm_scale=1.0,
+        )
+        np.testing.assert_allclose(ref, static, rtol=0.1, atol=0.1)
+
 
 if __name__ == "__main__":
     absltest.main()

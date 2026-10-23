@@ -66,3 +66,86 @@ def test_torch_seed_skipped_by_default(monkeypatch):
 def test_explicit_torch_seed_passed_through(monkeypatch):
     calls = _run(monkeypatch, torch_random_seed=7)
     assert calls["kwargs"]["torch_random_seed"] == 7
+
+
+def _install_fake_vllm(monkeypatch):
+    vllm_mod = types.ModuleType("vllm")
+    vllm_mod.__path__ = []
+    entrypoints_mod = types.ModuleType("vllm.entrypoints")
+    entrypoints_mod.__path__ = []
+    vllm_mod.entrypoints = entrypoints_mod
+
+    renderers_mod = types.ModuleType("vllm.renderers")
+    renderers_mod.__path__ = []
+    renderers_chat_utils = types.ModuleType("vllm.renderers.chat_utils")
+    renderers_mod.chat_utils = renderers_chat_utils
+    hf_mod = types.ModuleType("vllm.renderers.hf")
+
+    def resolve_chat_template(
+        tokenizer, chat_template=None, tools=None, *, model_config=None
+    ):
+        return ("upstream_resolve_chat_template", tokenizer, chat_template)
+
+    hf_mod.resolve_chat_template = resolve_chat_template
+    renderers_mod.hf = hf_mod
+    vllm_mod.renderers = renderers_mod
+
+    engine_mod = types.ModuleType("vllm.engine")
+    engine_mod.__path__ = []
+    arg_utils_mod = types.ModuleType("vllm.engine.arg_utils")
+
+    class FakeEngineArgs:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+    arg_utils_mod.EngineArgs = FakeEngineArgs
+    engine_mod.arg_utils = arg_utils_mod
+    vllm_mod.engine = engine_mod
+
+    monkeypatch.setitem(sys.modules, "vllm", vllm_mod)
+    monkeypatch.setitem(sys.modules, "vllm.entrypoints", entrypoints_mod)
+    monkeypatch.delitem(sys.modules, "vllm.entrypoints.chat_utils", raising=False)
+    monkeypatch.setitem(sys.modules, "vllm.renderers", renderers_mod)
+    monkeypatch.setitem(sys.modules, "vllm.renderers.chat_utils", renderers_chat_utils)
+    monkeypatch.setitem(sys.modules, "vllm.renderers.hf", hf_mod)
+    monkeypatch.setitem(sys.modules, "vllm.engine", engine_mod)
+    monkeypatch.setitem(sys.modules, "vllm.engine.arg_utils", arg_utils_mod)
+    return entrypoints_mod, renderers_chat_utils, resolve_chat_template, FakeEngineArgs
+
+
+def _install_fake_lm_eval_vllm(monkeypatch):
+    lm_eval_mod = types.ModuleType("lm_eval")
+    lm_eval_mod.__path__ = []
+    models_mod = types.ModuleType("lm_eval.models")
+    models_mod.__path__ = []
+    causallms_mod = types.ModuleType("lm_eval.models.vllm_causallms")
+
+    class FakeVLLM:
+        @staticmethod
+        def create_from_arg_string(model_args, additional_config):
+            from vllm.entrypoints.chat_utils import resolve_hf_chat_template
+
+            return {
+                "model_args": model_args,
+                "additional_config": additional_config,
+                "resolve_hf_chat_template": resolve_hf_chat_template,
+            }
+
+    causallms_mod.VLLM = FakeVLLM
+    monkeypatch.setitem(sys.modules, "lm_eval", lm_eval_mod)
+    monkeypatch.setitem(sys.modules, "lm_eval.models", models_mod)
+    monkeypatch.setitem(sys.modules, "lm_eval.models.vllm_causallms", causallms_mod)
+
+
+def test_create_vllm_model_wires_upstream_chat_utils_and_engine_args(monkeypatch):
+    entrypoints_mod, renderers_chat_utils, resolve_chat_template, engine_args_cls = (
+        _install_fake_vllm(monkeypatch)
+    )
+    _install_fake_lm_eval_vllm(monkeypatch)
+
+    result = lm_eval_accuracy._create_vllm_model("pretrained=m", "auto", None, None)
+
+    assert sys.modules["vllm.entrypoints.chat_utils"] is renderers_chat_utils
+    assert entrypoints_mod.chat_utils is renderers_chat_utils
+    assert result["resolve_hf_chat_template"] is resolve_chat_template
+    assert engine_args_cls(model="m", swap_space=4).kwargs == {"model": "m"}

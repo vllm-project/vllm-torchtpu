@@ -15,6 +15,7 @@
 
 import argparse
 import json
+import sys
 from typing import Any
 
 
@@ -24,51 +25,28 @@ def _create_vllm_model(
     max_batch_size: int | None,
     device: str | None,
 ):
-    try:
-        import vllm.entrypoints.chat_utils as chat_utils
+    # lm-eval 0.5.0.dev1 imports `from vllm.entrypoints.chat_utils import
+    # resolve_hf_chat_template` and passes `swap_space` to EngineArgs.
+    # Point it at the vLLM 0.32.0 locations (`vllm.renderers.chat_utils` and
+    # `vllm.renderers.hf.resolve_chat_template`) and drop `swap_space`.
+    import vllm.entrypoints as vllm_entrypoints
+    import vllm.renderers.chat_utils as chat_utils
+    from vllm.engine.arg_utils import EngineArgs
+    from vllm.renderers.hf import resolve_chat_template
 
-        if not hasattr(chat_utils, "resolve_hf_chat_template"):
+    chat_utils.resolve_hf_chat_template = resolve_chat_template
+    sys.modules["vllm.entrypoints.chat_utils"] = chat_utils
+    vllm_entrypoints.chat_utils = chat_utils
 
-            def resolve_hf_chat_template(tokenizer=None, chat_template=None, **kwargs):
-                if hasattr(tokenizer, "chat_template") and getattr(
-                    tokenizer, "chat_template", None
-                ):
-                    return tokenizer.chat_template
-                if chat_template is not None:
-                    return chat_template
-                if hasattr(chat_utils, "load_chat_template"):
-                    try:
-                        return chat_utils.load_chat_template(
-                            tokenizer, chat_template=chat_template
-                        )
-                    except Exception:  # noqa: S110
-                        pass
-                return getattr(tokenizer, "chat_template", chat_template)
+    if not getattr(EngineArgs, "_swap_space_patched", False):
+        orig_init = EngineArgs.__init__
 
-            chat_utils.resolve_hf_chat_template = resolve_hf_chat_template
-    except Exception:  # noqa: S110
-        pass
+        def patched_init(self, *args, **kwargs):
+            kwargs.pop("swap_space", None)
+            return orig_init(self, *args, **kwargs)
 
-    try:
-        from vllm.engine.arg_utils import EngineArgs
-
-        if not getattr(EngineArgs, "_swap_space_patched", False):
-            orig_init = EngineArgs.__init__
-
-            def patched_init(self, *args, **kwargs):
-                if "swap_space" in kwargs:
-                    swap_space = kwargs.pop("swap_space")
-                    fields = getattr(EngineArgs, "__dataclass_fields__", {})
-                    if "swap_space_bytes" in fields:
-                        kwargs["swap_space_bytes"] = int(
-                            swap_space * 1024 * 1024 * 1024
-                        )
-                return orig_init(self, *args, **kwargs)
-
-            EngineArgs.__init__ = patched_init
-            EngineArgs._swap_space_patched = True
-    except Exception:  # noqa: S110
-        pass
+        EngineArgs.__init__ = patched_init
+        EngineArgs._swap_space_patched = True
 
     from lm_eval.models.vllm_causallms import VLLM
 

@@ -148,6 +148,8 @@ TPU_KV_SHM_POOL_GB="${TPU_KV_SHM_POOL_GB:-8}"
 TPU_RAIDEN_TRANSFER_PARALLELISM="${TPU_RAIDEN_TRANSFER_PARALLELISM:-$((PREFILL_PCP * PREFILL_TP))}"
 TPU_RAIDEN_DST_SHARDS="${TPU_RAIDEN_DST_SHARDS:-}"
 VLLM_KV_CACHE_LAYOUT="${VLLM_KV_CACHE_LAYOUT:-}"
+# Prefill-only; decode keeps the default MoE path.
+PREFILL_MOE_FUSED_EP_KERNEL_IMPL="${PREFILL_MOE_FUSED_EP_KERNEL_IMPL:-}"
 RESTART_EXISTING="${RESTART_EXISTING:-1}"
 STARTUP_TIMEOUT_S="${STARTUP_TIMEOUT_S:-900}"
 LOAD_FORMAT="${LOAD_FORMAT:-}"
@@ -389,6 +391,7 @@ ASYNC_SCHEDULING=${ASYNC_SCHEDULING}
 TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL}
 TPU_RAIDEN_DST_SHARDS=${TPU_RAIDEN_DST_SHARDS}
 VLLM_KV_CACHE_LAYOUT=${VLLM_KV_CACHE_LAYOUT}
+PREFILL_MOE_FUSED_EP_KERNEL_IMPL=${PREFILL_MOE_FUSED_EP_KERNEL_IMPL}
 EOF
 
 # ---------------------------------------------------------------------------
@@ -436,7 +439,11 @@ fi
 joined_common_env=$(IFS='; '; echo "${common_env_exports[*]}")
 
 if [[ "${ROLE}" == "prefill" || "${ROLE}" == "all" ]]; then
-  prefill_cmd="${joined_common_env}; export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; export TPU_RAIDEN_JOB_NAME=prefill; export TPU_RAIDEN_ENGINE_ID='prefill-engine-${RUN_ID}'; export TPU_RAIDEN_RESHARD_IMPL=store; export TPU_RAIDEN_ADVERTISE_HOST='${PREFILL_ADVERTISE_HOST}'; export TPU_RAIDEN_RESHARD_PORT_BASE='${PREFILL_CTRL_PORT}'; export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE='$((PREFILL_CTRL_PORT + 100))'; export TPU_KV_TRANSFER_PORT=${PREFILL_TPU_KV_TRANSFER_PORT}; export TORCH_TPU_SLICEBUILDER_ADDRESSES='${prefill_sb_addresses}'; $(printf '%q' "${PYTHON_BIN}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
+  prefill_moe_env=""
+  if [[ -n "${PREFILL_MOE_FUSED_EP_KERNEL_IMPL}" ]]; then
+    prefill_moe_env="export MOE_FUSED_EP_KERNEL_IMPL=${PREFILL_MOE_FUSED_EP_KERNEL_IMPL}; "
+  fi
+  prefill_cmd="${joined_common_env}; ${prefill_moe_env}export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; export TPU_RAIDEN_JOB_NAME=prefill; export TPU_RAIDEN_ENGINE_ID='prefill-engine-${RUN_ID}'; export TPU_RAIDEN_RESHARD_IMPL=store; export TPU_RAIDEN_ADVERTISE_HOST='${PREFILL_ADVERTISE_HOST}'; export TPU_RAIDEN_RESHARD_PORT_BASE='${PREFILL_CTRL_PORT}'; export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE='$((PREFILL_CTRL_PORT + 100))'; export TPU_KV_TRANSFER_PORT=${PREFILL_TPU_KV_TRANSFER_PORT}; export TORCH_TPU_SLICEBUILDER_ADDRESSES='${prefill_sb_addresses}'; $(printf '%q' "${PYTHON_BIN}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
   printf '%s\n' "${prefill_cmd}" >"${RUN_DIR}/prefill_cmd.sh"
   echo "--- Starting prefill server (PCP=${PREFILL_PCP}, PORT=${PREFILL_PORT})"
   setsid bash -lc "${prefill_cmd}" >"${RUN_DIR}/logs/prefill.log" 2>&1 &
