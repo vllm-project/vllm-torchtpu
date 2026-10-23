@@ -81,9 +81,9 @@ class RunnerStageTiming:
             pending = self._pending[0]
             if not pending.end_recorded or not pending.end.query():
                 break
+            self._pending.popleft()
             # TPU events report host completion timestamps in milliseconds,
             # independent of when this runner drains the completed samples.
             seconds = pending.start.elapsed_time(pending.end) / 1000
-            self._pending.popleft()
             device.append((self._rank, pending.stage, seconds))
         return cpu, device
