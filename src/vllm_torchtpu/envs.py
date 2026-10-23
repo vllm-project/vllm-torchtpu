@@ -198,6 +198,7 @@ if TYPE_CHECKING:
     VLLM_TPU_STAGE_TIMING_ONLY_WITH_SINK: bool = False
     VLLM_TPU_STAGED_WALK_CLASS_GATHER: bool = False
     VLLM_TPU_WARMED_SUBSTITUTE_SOURCE: bool = False
+    VLLM_TPU_PROPOSE_DEVICE_CONSTANTS: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
     VLLM_TPU_STATIC_POOLER: bool = True
@@ -1172,6 +1173,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Async substitution: pad next_tokens to a precompiled source length.
     "VLLM_TPU_WARMED_SUBSTITUTE_SOURCE": env_bool(
         "VLLM_TPU_WARMED_SUBSTITUTE_SOURCE", default=False
+    ),
+    # MTP propose: upload per-request-count constants once and reuse them.
+    "VLLM_TPU_PROPOSE_DEVICE_CONSTANTS": env_bool(
+        "VLLM_TPU_PROPOSE_DEVICE_CONSTANTS", default=False
     ),
     # Non-greedy sampling filters the vocab to this many 128-logit blocks,
     # ranked by block max, before running top-k (and any subsequent top-p).
