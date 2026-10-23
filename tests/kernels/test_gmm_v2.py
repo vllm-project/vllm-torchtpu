@@ -25,7 +25,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from jax.experimental import topologies
 
+from vllm_torchtpu.kernels.megablox import gmm_v2 as gmm_mod
 from vllm_torchtpu.kernels.megablox.gmm_v2 import (
     TileSizes,
     apply_act_fn,
@@ -462,3 +464,57 @@ def test_gmm_v2_int4_packed_matches_reference():
 
     assert actual.shape == (batch_size, out_size)
     _assert_allclose(actual, expected, atol=3e-1, rtol=3e-1)
+
+
+def test_calculate_tiling_512_groups_ep1_prefill_chunk() -> None:
+    """Verify gmm_v2 tiling caps bucket expansion on 512-expert EP=1 prefill."""
+    topo = topologies.get_topology_desc(topology_name="tpu7x_2x2x1", platform="tpu")
+    mesh = jax.sharding.Mesh(topo.devices, ("x",))
+    vmem_bytes = 64 * 1024 * 1024
+    expected_ep1 = (256, 128)
+    expected_ep8 = (512, 128)
+    with jax.sharding.set_mesh(mesh):
+        lhs_cfgs = gmm_mod.InputConfigs(
+            quant_dtype=jnp.float8_e4m3fn,
+            quant_block_size=512,
+            dtype=jnp.bfloat16,
+        )
+        rhs_cfgs = gmm_mod.InputConfigs(
+            quant_dtype=jnp.float8_e4m3fn,
+            quant_block_size=128,
+            dtype=jnp.float8_e4m3fn,
+            has_scale=True,
+        )
+        dims_ep1 = gmm_mod.Dimensions(
+            size_m=20480,
+            size_k=4096,
+            size_n=2048,
+            size_group=512,
+            size_lhs_group=512,
+            size_lhs_sublane=8,
+        )
+        tiling_ep1 = gmm_mod.calculate_tiling(
+            dims_ep1,
+            lhs_cfgs,
+            rhs_cfgs,
+            vmem_limit_bytes=vmem_bytes,
+            fuse_act="silu",
+        )
+        assert (tiling_ep1.tile_m, tiling_ep1.bucket_base) == expected_ep1
+
+        dims_ep8 = gmm_mod.Dimensions(
+            size_m=20480,
+            size_k=4096,
+            size_n=2048,
+            size_group=64,
+            size_lhs_group=64,
+            size_lhs_sublane=8,
+        )
+        tiling_ep8 = gmm_mod.calculate_tiling(
+            dims_ep8,
+            lhs_cfgs,
+            rhs_cfgs,
+            vmem_limit_bytes=vmem_bytes,
+            fuse_act="silu",
+        )
+        assert (tiling_ep8.tile_m, tiling_ep8.bucket_base) == expected_ep8
