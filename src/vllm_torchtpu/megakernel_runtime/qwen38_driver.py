@@ -160,19 +160,21 @@ class Qwen38Segments(nn.Module):
         self.g = g
         self.mesh = mesh
         self.buckets = buckets
-        self.layers = model.model.layers
+        # A plain list, not a submodule: the model's layers stay owned by the model.
+        self.layers = list(model.model.layers)
         self.n_seg = g.L // g.att_every
         self.head_groups = head_groups(model, g) if head else []
         self.kinds: dict[tuple[int, bool], _SegmentKind] = {}
         if shared is not None:
             # A shadow view: same operands, GDN checkpoints not written.
             self.n_w, self.n_hw = shared.n_w, shared.n_hw
-            for name, buf in shared.named_buffers():
+            for name, buf in shared.named_buffers(recurse=False):
                 self.register_buffer(name, buf, persistent=False)
-            self._shared = shared
+            # Plain reference (not a submodule), like `layers`.
+            object.__setattr__(self, "_shared", shared)
             self.pool = self.layout = None
             return
-        self._shared = None
+        object.__setattr__(self, "_shared", None)
         R = mesh.size
         self.n_w: list[int] = []
         for s in range(self.n_seg):
