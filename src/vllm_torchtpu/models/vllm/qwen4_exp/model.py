@@ -319,9 +319,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
             valid_tokens = sp.shard(valid_tokens[:, None])[:, 0]
         block = torch.where(valid_tokens[:, None], block, 0)
         if sequence_parallel:
-            # The EP kernel takes replicated rows and returns them reduced;
-            # keep this rank's rows.
-            moe = sp.shard(self.mlp(sp.gather(block, num_tokens)))
+            moe = self._sequence_parallel_moe(block, num_tokens)
         else:
             moe = self.mlp(block)
         return self.mlp_hyper_connection.combine(moe, residual)
@@ -363,6 +361,47 @@ class Qwen4ExpDecoderLayer(nn.Module):
             speculative,
             sequence_parallel=sequence_parallel,
         )
+
+    def _sequence_parallel_moe(self, block, num_tokens):
+        """The MoE block's output at this rank's rows of a sharded step.
+
+        With a token-sharded adaptive EP op (QWEN4_EXP_PREFILL_SP_MOE=1) the
+        routed experts take this rank's rows directly and the TP-sliced
+        shared expert's partial sum is reduce-scattered: the same terms
+        MoERunner adds, (all-reduced shared) + (routed). Otherwise the block
+        runs on the gathered rows (its EP kernel takes replicated rows and
+        returns them reduced) and this rank keeps its rows.
+        """
+        mlp = self.mlp
+        routed = getattr(getattr(mlp, "experts", None), "routed_experts", None)
+        method = getattr(routed, "quant_method", None)
+        if (
+            not envs.QWEN4_EXP_PREFILL_SP_MOE
+            or getattr(method, "_adaptive_fused_moe_op_sp", None) is None
+            or getattr(mlp, "shared_expert", None) is None
+            or getattr(mlp, "replicate_shared_expert", True)
+        ):
+            return sp.shard(mlp(sp.gather(block, num_tokens)))
+        from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
+            vllm_adapter as adaptive_moe,
+        )
+
+        router_logits, _ = mlp.gate(block)
+        w1_scale, w2_scale = adaptive_moe.runtime_channel_scales(
+            routed, routed.w13_weight_scale_inv, routed.w2_weight_scale_inv
+        )
+        output = adaptive_moe.run_adaptive_fused_moe(
+            method,
+            block,
+            routed.w13_weight,
+            routed.w2_weight,
+            w1_scale,
+            w2_scale,
+            router_logits,
+            attr="_adaptive_fused_moe_op_sp",
+        )
+        shared = sp.reduce(mlp.shared_expert(sp.gather(block, num_tokens)), True)
+        return shared + output
 
     def forward_rows(
         self,

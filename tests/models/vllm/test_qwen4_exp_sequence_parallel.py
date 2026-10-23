@@ -139,6 +139,39 @@ class RowwiseMoE(nn.Module):
         return torch.tanh(block.float() @ self.weight.T).to(block.dtype)
 
 
+class SplitMoE(nn.Module):
+    """Routed experts on any rows + a TP-sliced shared expert, like MoERunner."""
+
+    def __init__(self, tp, weight):
+        super().__init__()
+        self.tp, self.weight = tp, weight
+        self.replicate_shared_expert = False
+        self.gate = lambda x: (x.float() @ weight[:4].T, None)
+        method = NS(_adaptive_fused_moe_op_sp=object())
+        self.experts = NS(
+            routed_experts=NS(
+                quant_method=method,
+                w13_weight=None,
+                w2_weight=None,
+                w13_weight_scale_inv=None,
+                w2_weight_scale_inv=None,
+            )
+        )
+        self.shared_expert = self._shared_partial
+
+    def routed(self, block, logits):
+        scale = torch.sigmoid(logits[:, :1])
+        return (torch.tanh(block.float() @ self.weight.T) * scale).to(block.dtype)
+
+    def _shared_partial(self, block):
+        share = (self.tp.rank + 1) / (self.tp.size * (self.tp.size + 1) / 2)
+        return (torch.sin(block.float() @ self.weight) * share).to(block.dtype)
+
+    def forward(self, block):
+        logits, _ = self.gate(block)
+        return self.tp.total(self._shared_partial(block)) + self.routed(block, logits)
+
+
 def make_layer(tp, layer_type, attn_hc, mlp_hc, attn_weight, moe_weight):
     from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpDecoderLayer
 
@@ -157,8 +190,24 @@ def make_layer(tp, layer_type, attn_hc, mlp_hc, attn_weight, moe_weight):
     return layer
 
 
+@pytest.mark.parametrize("split_moe", [False, True])
 @pytest.mark.parametrize("layer_type", ["linear_attention", "full_attention"])
-def test_decoder_layer_sequence_parallel_matches_tp(tp2, layer_type):
+def test_decoder_layer_sequence_parallel_matches_tp(
+    tp2, monkeypatch, layer_type, split_moe
+):
+    from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import (
+        vllm_adapter as adaptive_moe,
+    )
+
+    monkeypatch.setattr(sp.envs, "QWEN4_EXP_PREFILL_SP_MOE", split_moe, raising=False)
+    calls = []
+
+    def fake_adaptive(method, block, w1, w2, s1, s2, logits, attr):
+        calls.append((attr, block.shape[0]))
+        return layers[tp2.rank].mlp.routed(block, logits)
+
+    monkeypatch.setattr(adaptive_moe, "run_adaptive_fused_moe", fake_adaptive)
+    layers = {}
     torch.random.default_generator.manual_seed(0)
     attn_hc, mlp_hc = hc_module(), hc_module()
     attn_w = torch.randn(HIDDEN, HIDDEN) / HIDDEN**0.5
@@ -171,6 +220,8 @@ def test_decoder_layer_sequence_parallel_matches_tp(tp2, layer_type):
 
     def run(rank, sequence_parallel):
         layer = make_layer(tp2, layer_type, attn_hc, mlp_hc, attn_w, moe_w)
+        layer.mlp = SplitMoE(tp2, moe_w)
+        layers[rank] = layer
         x = tp2.shard(hidden) if sequence_parallel else hidden
         return layer(
             x,
@@ -195,6 +246,8 @@ def test_decoder_layer_sequence_parallel_matches_tp(tp2, layer_type):
     assert joined.shape == replicated[0].shape
     rows = valid
     torch.testing.assert_close(joined[rows], replicated[0][rows], rtol=0, atol=0)
+    expected_calls = [("_adaptive_fused_moe_op_sp", TOKENS // 2)] * 2
+    assert calls == (expected_calls if split_moe else [])
 
 
 def test_ple_gate_sequence_parallel_matches_tp(tp2):

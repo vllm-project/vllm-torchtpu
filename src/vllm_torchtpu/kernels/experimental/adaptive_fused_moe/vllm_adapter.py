@@ -87,12 +87,15 @@ def prebuild_adaptive_fused_moe(
     *,
     weights: PreparedWeights | None = None,
     rhs_qb: int | None = None,
+    sequence_parallel: bool | None = None,
 ) -> torch.library.CustomOpDef:
     """Build the selected experimental path, raising on every refusal.
 
     Weights must already be in the K-major runtime layout. FP4 format and
     contraction block size are inferred from their dtype and scale shapes.
     No W4A8 opt-in or routing-plan environment variable is read here.
+    ``sequence_parallel`` overrides the layer's MoE sequence parallelism:
+    True builds the variant whose rows are each rank's own tokens.
     """
     layer = cast("TpuRoutedExperts", layer)
     parallel = layer.moe_config.moe_parallel_config
@@ -167,7 +170,11 @@ def prebuild_adaptive_fused_moe(
     _RANK_BUFFER = torch.tensor(
         [[ep_mesh_index()]], dtype=torch.int32, device=layer.w13_weight.device
     )
-    groups = ep_token_replica_groups(is_sequence_parallel=parallel.is_sequence_parallel)
+    groups = ep_token_replica_groups(
+        is_sequence_parallel=parallel.is_sequence_parallel
+        if sequence_parallel is None
+        else sequence_parallel
+    )
     op = _build_op(
         mesh,
         topk,
@@ -554,9 +561,12 @@ def run_adaptive_fused_moe(
     w1_scale: torch.Tensor,
     w2_scale: torch.Tensor,
     router_logits: torch.Tensor,
+    attr: str = FUSED_MOE_EP_OP_ATTR,
 ) -> torch.Tensor:
-    """Execute a successfully prebuilt experimental op, or raise."""
-    op = getattr(owner, FUSED_MOE_EP_OP_ATTR, None)
+    """Execute a successfully prebuilt experimental op, or raise.
+
+    ``attr`` names the op on ``owner``; the default is the layer's own."""
+    op = getattr(owner, attr, None)
     if op is None:
         raise RuntimeError("adaptive fused MoE was not prebuilt for this layer")
     if w1.dtype == torch.float4_e2m1fn_x2:

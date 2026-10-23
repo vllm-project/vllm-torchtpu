@@ -782,6 +782,9 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
 
     _use_adaptive_fused_moe: bool = False
     _adaptive_fused_moe_op: torch.library.CustomOpDef | None = None
+    # Token-sharded variant for models that run sequence-parallel prefill
+    # (qwen4_exp, QWEN4_EXP_PREFILL_SP_MOE=1); see qwen4_exp.sequence_parallel.
+    _adaptive_fused_moe_op_sp: torch.library.CustomOpDef | None = None
 
     def __init__(
         self,
@@ -1076,6 +1079,20 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
                 renormalize=layer.renormalize,
                 activation=activation_str,
             )
+            if (
+                envs.QWEN4_EXP_PREFILL_SP
+                and envs.QWEN4_EXP_PREFILL_SP_MOE
+                and not layer.moe_config.moe_parallel_config.is_sequence_parallel
+            ):
+                self._adaptive_fused_moe_op_sp = (
+                    adaptive_moe.prebuild_adaptive_fused_moe(
+                        layer,
+                        topk=layer.moe_config.experts_per_token,
+                        renormalize=layer.renormalize,
+                        activation=activation_str,
+                        sequence_parallel=True,
+                    )
+                )
             adaptive_moe.cache_channel_scales_2d(
                 layer, layer.w13_weight_scale_inv, layer.w2_weight_scale_inv
             )
