@@ -222,7 +222,9 @@ class QSASparseAttnBlock(QSAOutBlock):
         for c in qg:
             c.wait()
 
-        def row(r: Any, carry: Any) -> Any:
+        rows = jax.lax.broadcasted_iota(I32, (ex.MB, 1), 0)
+
+        def row(r: Any, outs: Any) -> Any:
             out = attend_row(
                 r,
                 pool=ctx.extra[POOL],
@@ -238,10 +240,16 @@ class QSASparseAttnBlock(QSAOutBlock):
                 sm_scale=g.HD**-0.5,
                 interpret=ex.interpret,
             )
-            scr["xb2"][pl.ds(r, 1), pl.ds(0, K)] = out.reshape(1, nh * g.HD).astype(BF16)
-            return carry
+            # Row r of each head's [MB, HD] output by a mask, not a store at a
+            # dynamic row (a bf16 row store must be 16-row aligned in Mosaic).
+            return tuple(
+                jnp.where(rows == r, out[h : h + 1], o) for h, o in enumerate(outs)
+            )
 
-        jax.lax.fori_loop(0, ex.MB, row, 0)
+        zeros = tuple(jnp.zeros((ex.MB, g.HD), F32) for _ in range(nh))
+        outs = jax.lax.fori_loop(0, ex.MB, row, zeros)
+        for h, o in enumerate(outs):
+            scr["xb2"][:, pl.ds(h * g.HD, g.HD)] = o.astype(BF16)
         with ctx.stream.segment(lazy=False):
             return ctx.stream.dmatmul("o_proj", scr["xb2"], g.H)
 
