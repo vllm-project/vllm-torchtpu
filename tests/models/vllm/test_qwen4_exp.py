@@ -286,7 +286,7 @@ class _FakeLMHead(nn.Module):
 @pytest.fixture
 def fake_sublayers(monkeypatch):
     for name in (
-        "QwenGatedDeltaNetAttention",
+        "Qwen4ExpGatedDeltaNetAttention",
         "Qwen3NextAttention",
         "Qwen3NextSparseMoeBlock",
     ):
