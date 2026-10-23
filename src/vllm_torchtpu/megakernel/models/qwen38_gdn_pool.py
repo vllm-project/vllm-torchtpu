@@ -58,15 +58,19 @@ class _LayerView:
         return self.ref.at[rest] if rest else self.ref
 
 
-def _typed_f32(block_ref: Any) -> Any:
-    """`[rows, 1, 4, lanes]` FP8 bytes -> `(rows, lanes)` f32 (4 pack rows per word).
+def _typed_f32(block_ref: Any, interpret: bool) -> Any:
+    """Whole `[rows, 1, 4, lanes]` FP8 scratch ref -> `(rows, lanes)` f32 values.
 
-    The array bitcast groups 4 consecutive second-minor rows into one 32-bit
-    word per lane, as the model's typed ref view does.
+    4 consecutive pack rows form one 32-bit word per lane. On TPU this is the
+    ref bitcast the model's GDN kernel uses (`kernels/typed_ldst.py`); the
+    Pallas TPU interpreter has no ref bitcast, so interpret mode bitcasts the
+    loaded bytes, which groups the same rows.
     """
-    raw = block_ref[...]
-    raw = raw.reshape(-1, raw.shape[-1])
-    return pltpu.bitcast(raw, jnp.float32)
+    if interpret:
+        raw = block_ref[...]
+        return pltpu.bitcast(raw.reshape(-1, raw.shape[-1]), jnp.float32)
+    view = block_ref.bitcast(jnp.float32)
+    return view.reshape(-1, view.shape[-1])[...]
 
 
 class Qwen38PoolGDN(Qwen38GDN):
@@ -87,27 +91,36 @@ class Qwen38PoolGDN(Qwen38GDN):
         scr = dict(super().scratch(g, ex, plan))
         lay = self.lin_in_layout(g, ex)
         f8 = jnp.float8_e4m3fn
+        # One whole ref per staged block: a typed view of a sliced ref is not
+        # supported everywhere, a view of a whole scratch ref is.
+        for b in range(2):
+            for j in range(SSM_BLOCKS):
+                scr[f"pg_raw{b}{j}"] = pltpu.VMEM((128, 1, 4, 256), f8)
+            scr[f"pg_craw{b}"] = pltpu.VMEM((CONV_ROWS, 1, 4, 256), f8)
         scr.update(
-            pg_raw=pltpu.VMEM((2, SSM_BLOCKS, 128, 1, 4, 256), f8),
-            pg_craw=pltpu.VMEM((2, CONV_ROWS, 1, 4, 256), f8),
-            pg_sem=pltpu.SemaphoreType.DMA((2, 2)),
+            pg_sem=pltpu.SemaphoreType.DMA((2, SSM_BLOCKS + 1)),
             pg_rec=pltpu.VMEM((ex.NS * lay.vh, lay.KD, lay.VD), BF16),
             pg_conv=pltpu.VMEM((ex.NS, rup(3 + ex.T, 8), lay.QKV), F32),
         )
         return scr
 
-    def _copies(self, ctx: Any, o: Any, s: int, buf: int) -> tuple[Any, Any]:
+    def _copies(self, ctx: Any, o: Any, s: int, buf: int) -> list[Any]:
         pool, scr = ctx.extra[POOL], ctx.scr
         m = ctx.extra[READ_BLOCKS][o, s]
-        ssm = pltpu.make_async_copy(
-            pool.at[pl.ds(m * SPLIT, SSM_BLOCKS)], scr["pg_raw"].at[buf], scr["pg_sem"].at[buf, 0]
+        cps = [
+            pltpu.make_async_copy(
+                pool.at[m * SPLIT + j], scr[f"pg_raw{buf}{j}"], scr["pg_sem"].at[buf, j]
+            )
+            for j in range(SSM_BLOCKS)
+        ]
+        cps.append(
+            pltpu.make_async_copy(
+                pool.at[m * SPLIT + SSM_BLOCKS, pl.ds(0, CONV_ROWS)],
+                scr[f"pg_craw{buf}"],
+                scr["pg_sem"].at[buf, SSM_BLOCKS],
+            )
         )
-        conv = pltpu.make_async_copy(
-            pool.at[m * SPLIT + SSM_BLOCKS, pl.ds(0, CONV_ROWS)],
-            scr["pg_craw"].at[buf],
-            scr["pg_sem"].at[buf, 1],
-        )
-        return ssm, conv
+        return cps
 
     def _gather(self, ctx: Any, o: Any) -> None:
         """Layer `o`'s pool states -> `pg_rec` (bf16) / `pg_conv` (f32 history rows)."""
@@ -115,6 +128,7 @@ class Qwen38PoolGDN(Qwen38GDN):
         lay = self.lin_in_layout(ctx.g, ex)
         vh, KD, VD, QKV = lay.vh, lay.KD, lay.VD, lay.QKV
         NS = ex.NS
+        interp = bool(ex.interpret)
         scr["pg_conv"][...] = jnp.zeros(scr["pg_conv"].shape, F32)
         pending = self._copies(ctx, o, 0, 0)
         for c in pending:
@@ -129,10 +143,12 @@ class Qwen38PoolGDN(Qwen38GDN):
                 c.wait()
             keep = ctx.extra[HAS_STATE][o, s] != 0
             ssm = jnp.concatenate(
-                [_typed_f32(scr["pg_raw"].at[buf, j]) for j in range(SSM_BLOCKS)], axis=0
+                [_typed_f32(scr[f"pg_raw{buf}{j}"], interp) for j in range(SSM_BLOCKS)],
+                axis=0,
             ).reshape(vh, KD, VD)
             scr["pg_rec"][s * vh : (s + 1) * vh] = jnp.where(keep, ssm, 0.0).astype(BF16)
-            conv = _typed_f32(scr["pg_craw"].at[buf]).reshape(-1)[: 3 * QKV].reshape(3, QKV)
+            conv = _typed_f32(scr[f"pg_craw{buf}"], interp).reshape(-1)[: 3 * QKV]
+            conv = conv.reshape(3, QKV)
             scr["pg_conv"][s, 0:3, :] = jnp.where(keep, conv, 0.0)
             if s + 1 < NS:
                 pending = nxt
