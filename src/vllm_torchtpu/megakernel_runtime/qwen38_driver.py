@@ -60,7 +60,7 @@ def segment_tiles(B: int, hier: int | None = None) -> Tiles:
     bank sizes (hence every weight's tiling) are the same for all buckets.
     """
     nbe, nbd = (12, 10) if B <= 16 else ((6, 10) if B <= 32 else (3, 6))
-    h = (1 if B > 32 else 0) if hier is None else hier
+    h = 1 if hier is None else hier
     return Tiles(ebank=2 << 20, nbe=nbe, nbd=nbd, vmem_mib=62, hier=h).with_blocks(
         {"moe": {"pipe_ep": True, "moe_unroll": True}}
     )
