@@ -205,6 +205,9 @@ class _Core:
     def _attach_iteration_details(self, outputs, iteration_details):
         pass
 
+    def _attach_weight_version(self, outputs):
+        pass
+
 
 def _stepper(monkeypatch, *steps, estimate_ms=125.0):
     executor = _executor(monkeypatch)

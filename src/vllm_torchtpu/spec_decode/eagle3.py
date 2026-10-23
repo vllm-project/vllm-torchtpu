@@ -309,6 +309,8 @@ class Eagle3Proposer:
             self.vllm_config, AttentionLayerBase
         )
         draft_attn_layer_names = set(all_attn_layers.keys()) - target_attn_layer_names
+        for name in draft_attn_layer_names:
+            all_attn_layers[name].is_draft_layer = True
         self._draft_attn_layer_names = draft_attn_layer_names
 
         if self.runner._mtp_prefill_only:

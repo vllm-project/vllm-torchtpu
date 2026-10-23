@@ -237,7 +237,7 @@ def test_dsv4_forward_lets_vllm_runner_apply_gate_once():
         model.experts = MoERunner(
             layer_name="model.layers.0.ffn.experts",
             moe_config=moe_config,
-            router=None,
+            router=SimpleNamespace(prepare_monolithic_logits=lambda logits: logits),
             routed_experts=CPUExperts(),
             gate=model.gate,
         )

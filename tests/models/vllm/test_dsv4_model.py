@@ -20,6 +20,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn as nn
+from transformers import DeepseekV4Config
 from vllm.config import (
     CacheConfig,
     CompilationMode,
@@ -29,7 +30,6 @@ from vllm.config import (
 )
 from vllm.model_executor.models import ModelRegistry
 from vllm.model_executor.models.utils import WeightsMapper
-from vllm.transformers_utils.configs.deepseek_v4 import DeepseekV4Config
 
 import vllm_torchtpu.models.vllm.deepseek_v4.model as model_mod
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_attention_op import (  # noqa: E501
@@ -159,13 +159,13 @@ def _tiny_hf_config():
         hc_eps=1e-5,
         rms_norm_eps=1e-6,
         num_hidden_layers=N_LAYERS,
-        num_hash_layers=1,
+        mlp_layer_types=["hash_moe"] + ["moe"] * (N_LAYERS - 1),
         index_topk=4,
         vocab_size=VOCAB,
     )
 
 
-@pytest.mark.parametrize("compress_ratio", [1, 4, 128])
+@pytest.mark.parametrize("compress_ratio", [0, 4, 128])
 def test_attention_constructs_tpu_swa_cache(monkeypatch, request, compress_ratio):
     """Exercise upstream construction, including its SWA backend argument."""
     from vllm.platforms import current_platform
@@ -229,6 +229,10 @@ def test_attention_constructs_tpu_swa_cache(monkeypatch, request, compress_ratio
 @pytest.fixture()
 def tiny_fc(dist_ctx, monkeypatch):
     """A real DeepseekV4ForCausalLM at toy scale, kernels stubbed."""
+    from vllm.platforms import current_platform
+
+    monkeypatch.setattr(current_platform, "device_name", "cpu")
+    monkeypatch.setattr(current_platform, "device_type", "cpu")
     monkeypatch.setattr(model_mod, "DeepseekV4DecoderLayer", _StubDecoderLayer)
     monkeypatch.setattr(model_mod, "mhc_collapse_head", _fake_collapse_head)
     vllm_config = VllmConfig()

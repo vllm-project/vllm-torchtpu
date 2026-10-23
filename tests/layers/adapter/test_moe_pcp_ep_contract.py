@@ -163,7 +163,7 @@ def _make_rank_zero_runner():
     runner = VllmMoERunner.__new__(VllmMoERunner)
     torch.nn.Module.__init__(runner)
     runner.moe_config = moe_config
-    runner.router = object()
+    runner.router = SimpleNamespace(prepare_monolithic_logits=lambda logits: logits)
     runner.routed_experts = _RankZeroExperts()
     runner._shared_experts = None
     runner.gate = None

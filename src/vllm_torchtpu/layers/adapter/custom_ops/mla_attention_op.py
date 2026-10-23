@@ -975,7 +975,7 @@ class VllmTPUMLAAttention(MLAAttention):
         flipped = getattr(self.kv_b_proj, WEIGHT_FLIPPED_ATTR, False)
         kv_b_weight = None
         if flipped:
-            kv_b_weight = cast(torch.Tensor, self.kv_b_proj.weight)
+            kv_b_weight = cast(Parameter, self.kv_b_proj.weight)
             self.kv_b_proj.weight = Parameter(
                 kv_b_weight.transpose(0, 1).contiguous(), requires_grad=False
             )
@@ -984,7 +984,7 @@ class VllmTPUMLAAttention(MLAAttention):
         finally:
             if flipped:
                 assert kv_b_weight is not None
-                self.kv_b_proj.weight = Parameter(kv_b_weight, requires_grad=False)
+                self.kv_b_proj.weight = kv_b_weight
 
         device = torch.device("tpu")
 
