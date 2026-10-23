@@ -267,6 +267,86 @@ def test_smem_caps_refresh_after_placeholder_table_rebuild(monkeypatch):
     assert real_runner.num_reqs_most_model_len is None
 
 
+def test_smem_caps_refresh_after_backend_block_size_update():
+    runner = SimpleNamespace(
+        max_model_len=32768,
+        max_num_reqs=256,
+        max_num_tokens=8192,
+        block_size=16,
+        max_num_blocks_per_req=2048,
+        most_model_len=16384,
+        num_blocks_per_most_len_req=1024,
+        num_reqs_max_model_len=64,
+        num_reqs_most_model_len=128,
+        cache_config=SimpleNamespace(block_size=264),
+        kv_cache_config=None,
+        _attention_capacity={"stale": object()},
+        _decode_device_cache_key=("stale",),
+    )
+    runner._refresh_smem_request_caps = (
+        TPUModelRunner._refresh_smem_request_caps.__get__(runner)
+    )
+    runner._refresh_smem_request_caps()
+    assert runner.block_size == 264
+    assert runner.max_num_blocks_per_req == 125
+    assert runner.num_reqs_max_model_len == 256
+    assert runner.num_blocks_per_most_len_req == 63
+    assert runner.num_reqs_most_model_len == 256
+    assert runner._attention_capacity == {}
+    assert runner._decode_device_cache_key is None
+
+
+def test_smem_caps_refresh_keeps_block_table_width_when_block_size_unchanged():
+    """With no final cache groups yet and an unchanged block size, the refresh
+    must keep `max_num_blocks_per_req` as synced from the placeholder block
+    table in `__init__` (which may be wider than `cdiv(max_model_len,
+    block_size)`), not re-derive it."""
+    runner = SimpleNamespace(
+        max_model_len=1000,
+        max_num_reqs=256,
+        max_num_tokens=8192,
+        block_size=16,
+        max_num_blocks_per_req=64,  # placeholder table width, > cdiv(1000, 16)
+        most_model_len=None,
+        num_blocks_per_most_len_req=None,
+        num_reqs_max_model_len=0,
+        num_reqs_most_model_len=None,
+        cache_config=SimpleNamespace(block_size=16),
+        kv_cache_config=None,
+        _attention_capacity={},
+        _decode_device_cache_key=None,
+    )
+    TPUModelRunner._refresh_smem_request_caps(runner)
+    assert runner.block_size == 16
+    assert runner.max_num_blocks_per_req == 64
+    assert runner.num_reqs_max_model_len == min(
+        PallasAttentionBackend.get_max_num_seqs_for_pages(64), 256, 8192
+    )
+
+
+def test_smem_caps_refresh_keeps_block_size_until_platform_finalizes_it():
+    """`cache_config.block_size` is unset until the platform picks one (and
+    lightweight harnesses omit it); the runner must keep its own value."""
+    runner = SimpleNamespace(
+        max_model_len=32768,
+        max_num_reqs=256,
+        max_num_tokens=8192,
+        block_size=384,
+        max_num_blocks_per_req=86,
+        most_model_len=None,
+        num_blocks_per_most_len_req=None,
+        num_reqs_max_model_len=0,
+        num_reqs_most_model_len=None,
+        cache_config=SimpleNamespace(block_size=None),
+        kv_cache_config=None,
+        _attention_capacity={},
+        _decode_device_cache_key=None,
+    )
+    TPUModelRunner._refresh_smem_request_caps(runner)
+    assert runner.block_size == 384
+    assert runner.max_num_blocks_per_req == 86
+
+
 def test_may_reinitialize_input_batch_requires_kernel_block_sizes():
     # Without them, split groups would hand manager block ids to the kernels.
     runner = object.__new__(TPUModelRunner)

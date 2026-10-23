@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Generic raw-pool layout, packing, and pool backend checks.
+"""Generic raw-pool layout, packing, and Pallas gather kernel.
 
 Framework-free (jax + numpy only) and model-agnostic: everything is driven by a
 `PoolLayout` (see `pool/layout.py`). Models build their layout and wrap it in a
@@ -41,6 +41,7 @@ from .config import (
     resolved_max_pages_per_seq,
     with_cache,
 )
+from .gather import gather_gdn_states
 from .layout import PoolLayout
 from .pack import (
     allocate_test_layout,
@@ -73,6 +74,7 @@ __all__ = [
     "can_pool_gather",
     "check_ckpt_bounds",
     "conv_to_raw_page",
+    "gather_gdn_states",
     "kv_to_raw_page",
     "make_pool_backend",
     "pool_to_states",
