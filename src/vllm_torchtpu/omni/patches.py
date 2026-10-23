@@ -431,6 +431,9 @@ def _patch_sdpa_fallback_dispatch() -> None:
     logger.info("Applied TPU patch: SDPAImpl.forward routes to TpuSDPAImpl.")
 
 
+_VOCODER_CPU_INIT_PATCHED = "_tpu_vocoder_cpu_init_patched"
+
+
 def _patch_ltx2_vocoder_cpu_init() -> None:
     # -------------------------------------------------------------------------
     # TODO: Remove once torch_tpu implements kaiser_window or vLLM-Omni builds
@@ -451,9 +454,9 @@ def _patch_ltx2_vocoder_cpu_init() -> None:
     # -------------------------------------------------------------------------
     from vllm_omni.diffusion.models.ltx2 import ltx2_components
 
-    if hasattr(ltx2_components, "_tpu_orig_load_component"):
+    if getattr(ltx2_components._load_component, _VOCODER_CPU_INIT_PATCHED, False):
         return
-    ltx2_components._tpu_orig_load_component = ltx2_components._load_component
+    orig_load_component = ltx2_components._load_component
 
     def _cpu_vocoder_load_component(
         component_cls: Any,
@@ -462,7 +465,6 @@ def _patch_ltx2_vocoder_cpu_init() -> None:
         *args: Any,
         **kwargs: Any,
     ) -> Any:
-        orig_load_component = ltx2_components._tpu_orig_load_component
         if subfolder == "vocoder":
             with torch.device("cpu"):
                 return orig_load_component(
@@ -470,5 +472,6 @@ def _patch_ltx2_vocoder_cpu_init() -> None:
                 )
         return orig_load_component(component_cls, model, subfolder, *args, **kwargs)
 
+    setattr(_cpu_vocoder_load_component, _VOCODER_CPU_INIT_PATCHED, True)
     ltx2_components._load_component = _cpu_vocoder_load_component
     logger.info("Applied TPU patch: CPU-context init for LTX-2 vocoder.")
