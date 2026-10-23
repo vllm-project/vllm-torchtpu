@@ -29,6 +29,7 @@ from collections.abc import Mapping, Sequence
 from typing import TYPE_CHECKING, cast
 
 import torch
+from vllm.lora.layers import LogitsProcessorWithLoRA
 
 from vllm_torchtpu.logger import init_logger
 
@@ -86,8 +87,15 @@ def resolve_head_owner(model: torch.nn.Module, dp_lockstep: bool) -> torch.nn.Mo
 def top_tokens(owner: torch.nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
     """The greedy token of each row, ``[rows, 1]`` int64 like
     ``torch.argmax(logits, dim=-1, keepdim=True)``."""
-    processor = cast("LogitsProcessor", owner.logits_processor)
+    processor = cast(
+        "LogitsProcessor | LogitsProcessorWithLoRA", owner.logits_processor
+    )
     head = cast("VocabParallelEmbedding", owner.lm_head)
+    if isinstance(processor, LogitsProcessorWithLoRA):
+        # The LoRA wrapper has no get_top_tokens, so the call would reach the
+        # base layer and drop the lm_head LoRA delta. Take the argmax of the
+        # wrapper's logits, which include the delta.
+        return torch.argmax(processor(head, hidden_states), dim=-1, keepdim=True)
     tokens = processor.get_top_tokens(head, hidden_states)
     return tokens.to(torch.int64).view(-1, 1)
 

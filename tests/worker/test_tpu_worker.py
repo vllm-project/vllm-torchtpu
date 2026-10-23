@@ -318,6 +318,8 @@ def _ep_dp_worker(monkeypatch, dp_size, expert_parallel, local, peer):
     worker.vllm_config = SimpleNamespace(kv_transfer_config=None)
     worker.devices = []
     worker.model_runner = MagicMock(is_pooling_model=False)
+    # No LoRA, so adapter swaps reserve no HBM.
+    worker.model_runner.lora_slot_write_hbm_bytes.return_value = 0
     return worker
 
 
@@ -344,6 +346,21 @@ def test_determine_available_memory_fails_on_every_ep_dp_engine(monkeypatch):
 
     with pytest.raises(ValueError, match="gpu-memory-utilization"):
         worker.determine_available_memory()
+
+
+def test_determine_available_memory_leaves_room_for_lora_slot_write(monkeypatch):
+    """An adapter swap holds HBM only while it runs, so profile_run misses it
+    and the KV cache budget must leave it free."""
+    worker = _ep_dp_worker(
+        monkeypatch,
+        dp_size=1,
+        expert_parallel=False,
+        local=7 * utils.GBYTES,
+        peer=7 * utils.GBYTES,
+    )
+    worker.model_runner.lora_slot_write_hbm_bytes.return_value = utils.GBYTES
+
+    assert worker.determine_available_memory() == 6 * utils.GBYTES
 
 
 @patch("vllm_torchtpu.worker.tpu_worker.get_pp_group")
