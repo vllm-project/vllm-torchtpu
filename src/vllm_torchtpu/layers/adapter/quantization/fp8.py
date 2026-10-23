@@ -31,7 +31,9 @@ The checkpoint stores FP8 weights with either block scales or tensor/channel
 scales. At load time we dequantize those weights to float32, then requantize
 them into the runtime FP8 layout consumed by the Pallas matmul bridge in
 `vllm_torchtpu/layers/adapter/linear_common.py`. Activations are quantized
-dynamically inside the bridge. By default the bridge dispatches to a pure-JAX
+dynamically inside the bridge, except that TPU_FP8_LINEAR_W8A16_MAX_ROWS (off
+by default) keeps bf16 activations (W8A16) for small token buckets on the
+per-channel path with FP8 weights. By default the bridge dispatches to a pure-JAX
 `dot_general`-based per-channel FP8 matmul (`xla_quantized_matmul`); setting
 ENABLE_QUANTIZED_MATMUL_KERNEL=1 together with REQUANTIZE_BLOCK_SIZE selects
 the blockwise Pallas kernel path instead.
@@ -1341,12 +1343,13 @@ def _wrap_block_scale_weight_loader(weight_loader: Callable) -> Callable:
 class VllmFp8LinearMethodTPU(Fp8LinearMethod):
     """
     TPU FP8 linear method that keeps weights in FP8 at runtime and quantizes
-    activations dynamically inside a Pallas matmul bridge.
+    activations dynamically inside a Pallas matmul bridge, unless
+    TPU_FP8_LINEAR_W8A16_MAX_ROWS is opted in for small token buckets.
 
     Reuses vLLM's Fp8LinearMethod.create_weights() for correct FP8 weight and
     scale parameter allocation (needed by the weight loader). After loading,
     checkpoint FP8 weights are converted to the runtime FP8 layout and applied
-    with dynamically quantized activations through `quantized_matmul`.
+    through `quantized_matmul`.
 
     Inherits from Fp8LinearMethod but skips GPU-specific __init__. Only
     sets attributes needed by create_weights().

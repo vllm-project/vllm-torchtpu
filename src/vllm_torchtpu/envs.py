@@ -43,6 +43,7 @@ if TYPE_CHECKING:
     ENABLE_QUANTIZED_MATMUL_KERNEL: bool = False
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
+    TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_BLOCK_SIZE: int | None = None
     TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL: bool | None = None
@@ -107,7 +108,6 @@ if TYPE_CHECKING:
     TPU_PP_CHUNK_SLACK: float = 0.1
     TPU_PP_LAZY_PUSH: bool = False
     TPU_ROPE_CACHE_TRUNCATE: bool = False
-    TPU_FP8_LINEAR_W8A16_MAX_ROWS: int = 0
     TPU_ROPE_CACHE_ROW_MAJOR: bool = False
     TPU_MOE_HASH_TABLE_ROW_MAJOR: bool = False
     TPU_PARALLEL_PRECOMPILE: bool = False
@@ -513,6 +513,19 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(
         "REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"
     ),
+    # Opt-in W8A16 for small FP8 dense-linear steps. A step whose padded token
+    # bucket (from compile_sizes, not the number of live requests) has at most
+    # this many rows keeps bf16 activations against the FP8 weights instead of
+    # quantizing them per call: small decode steps are weight-bandwidth bound,
+    # so the per-call quantization (an abs-max reduction and a cast) costs
+    # more than FP8 activations save. Measured on v7x only. Applies only to
+    # the per-channel path with FP8 weights; the blockwise kernel path
+    # (ENABLE_QUANTIZED_MATMUL_KERNEL=1) and int8 weights always quantize.
+    # With compile_sizes [256] and a threshold below 256, no bucket qualifies.
+    # 0 (default) keeps W8A8 everywhere.
+    "TPU_FP8_LINEAR_W8A16_MAX_ROWS": env_nonnegative_int(
+        "TPU_FP8_LINEAR_W8A16_MAX_ROWS", 0
+    ),
     # Specify dtype for quantized MoE weights
     "MOE_REQUANTIZE_WEIGHT_DTYPE": lambda: os.getenv(
         "MOE_REQUANTIZE_WEIGHT_DTYPE", "float8_e4m3fn"
@@ -778,14 +791,6 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Slice the rotary cos_sin caches to max model len at load to
     # minimize xla layout data copy overhead. Text-only.
     "TPU_ROPE_CACHE_TRUNCATE": env_bool("TPU_ROPE_CACHE_TRUNCATE"),
-    # FP8 dense linears on the per-channel path: a step with at most this many
-    # rows keeps bf16 activations against the FP8 weights (W8A16) instead of
-    # quantizing them per call. Small decode steps are weight-bandwidth bound,
-    # so the per-call activation quantization (an abs-max reduction and a
-    # cast) costs more than FP8 activations save. 0 keeps W8A8 everywhere.
-    "TPU_FP8_LINEAR_W8A16_MAX_ROWS": env_nonnegative_int(
-        "TPU_FP8_LINEAR_W8A16_MAX_ROWS", 0
-    ),
     # Materialize the rotary cos_sin caches with a row-major ({1,0}) device
     # layout at load, May cost more HBM due to padding.
     "TPU_ROPE_CACHE_ROW_MAJOR": env_bool("TPU_ROPE_CACHE_ROW_MAJOR", default=False),
