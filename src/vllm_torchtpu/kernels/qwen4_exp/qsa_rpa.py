@@ -86,6 +86,7 @@ def _rpa_attention_batch(
     v_scale=1.0,
     kv_head_offset=0,
     decode_only=False,
+    lean_fetch=False,
 ):
     from vllm_torchtpu.kernels.experimental.batched_rpa import configs, wrapper
 
@@ -134,6 +135,7 @@ def _rpa_attention_batch(
         prefill_block_sizes=prefill,
         # virtual_page_metadata makes every row a decode row.
         decode_only=decode_only,
+        lean_kv_fetch=lean_fetch,
     )
     out = out[jnp.minimum(cu_q_lens[:-1], len(q) - 1), :, : q.shape[-1]]
     if kv_head_offset:
@@ -168,6 +170,7 @@ def rpa_attention(
     v_scale=1.0,
     kv_head_offset=0,
     decode_only=False,
+    lean_fetch=False,
 ):
     batch_size = rpa_query_batch_size(blocks.shape[1] + 1)
     attend = functools.partial(
@@ -177,6 +180,7 @@ def rpa_attention(
         k_scale=k_scale,
         v_scale=v_scale,
         **({"decode_only": True} if decode_only else {}),
+        **({"lean_fetch": True} if lean_fetch else {}),
         **({"kv_head_offset": kv_head_offset} if kv_head_offset else {}),
     )
     if len(q) <= batch_size:
@@ -347,6 +351,8 @@ def _decode_attention(
             return result
     if decode_only:
         options["decode_only"] = True
+    if envs.VLLM_TPU_QSA_DECODE_LEAN_FETCH:
+        options["lean_fetch"] = True
     return rpa_attention(q, gate, blocks, lengths, table, cache, **options)
 
 

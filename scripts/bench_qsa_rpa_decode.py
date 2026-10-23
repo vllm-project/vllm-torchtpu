@@ -33,9 +33,38 @@ D = 256
 ITERS = int(os.environ.get("BENCH_ITERS", "20"))
 
 
-def make_inputs(rng, *, requests, rows, overlap, pages=4096, max_ctx=65536):
+def clustered_pick(rng, visible, recent=128, mean_run=4):
+    """A recent window plus geometric-length runs at random positions."""
+    picked = set(range(max(visible - recent, 0), visible))
+    while len(picked) < min(TOPK_GROUPS, visible):
+        start = int(rng.integers(0, visible))
+        for g in range(start, min(start + int(rng.geometric(1 / mean_run)), visible)):
+            picked.add(g)
+    out = np.fromiter(picked, np.int32)[:TOPK_GROUPS]
+    return rng.permutation(out)
+
+
+def pick_blocks(rng, lengths, pattern):
+    blocks = np.full((len(lengths), TOPK_GROUPS), -1, np.int32)
+    for i, length in enumerate(lengths):
+        visible = int(length) // RATIO
+        if not visible:
+            continue
+        if pattern == "clustered":
+            pick = clustered_pick(rng, visible)
+        else:
+            pick = rng.choice(visible, min(TOPK_GROUPS, visible), replace=False)
+        blocks[i, : len(pick)] = pick
+    return blocks
+
+
+def make_inputs(
+    rng, *, requests, rows, overlap, pages=4096, max_ctx=65536, pattern="random"
+):
     """``requests`` x 4 verify rows padded to ``rows``; ``overlap`` is the share
-    of each verify row's groups taken from its request's first row."""
+    of each verify row's groups taken from its request's first row. ``pattern``
+    "clustered" draws a recent window plus short runs (unsorted, as the
+    indexer returns them)."""
     cols = max_ctx // PAGE
     contexts = rng.integers(max_ctx // 4, max_ctx - 8, size=requests)
     table = np.zeros((rows, cols), np.int32)
@@ -54,6 +83,9 @@ def make_inputs(rng, *, requests, rows, overlap, pages=4096, max_ctx=65536):
             table[i, :n_pages] = own
             lengths[i] = contexts[r] + t + 1
             visible = lengths[i] // RATIO
+            if pattern == "clustered":
+                blocks[i] = clustered_pick(rng, visible)
+                continue
             pick = rng.choice(visible, TOPK_GROUPS, replace=False)
             if base is None:
                 base = pick
@@ -145,20 +177,30 @@ def main_step(cache, results):
     """Per-step attention time for the serving routes (decode_attention)."""
     rng = np.random.default_rng(1)
     cases = os.environ.get("BENCH_CASES", "2x64,4x64,6x24,8x32").split(",")
-    for reqs, rows in (map(int, c.split("x")) for c in cases):
+    patterns = os.environ.get("BENCH_PATTERNS", "random").split(",")
+    arms = [
+        tuple(map(int, a))
+        for a in os.environ.get("BENCH_ARMS", "000,010,100,110").split(",")
+    ]
+    for (reqs, rows), pattern in itertools.product(
+        [tuple(map(int, c.split("x"))) for c in cases], patterns
+    ):
         base = make_inputs(rng, requests=reqs, rows=rows, overlap=0.0)
+        lengths = np.asarray(base[3])
         layers = []
         for _ in range(12):
-            x = make_inputs(rng, requests=reqs, rows=rows, overlap=0.0)
-            layers.append((x[0], x[1], x[2], base[3], base[4]))
-        # Same lengths for every layer; regenerate blocks within them.
-        layers = [
-            (q, g, jnp.where(b * RATIO + RATIO <= base[3][:, None], b, -1), lens, t)
-            for q, g, b, lens, t in layers
-        ]
-        for fused, shared in itertools.product((False, True), (False, True)):
+            q = rng.standard_normal((rows, Q_HEADS, D)).astype(np.float32)
+            g = rng.standard_normal((rows, Q_HEADS, D)).astype(np.float32)
+            layers.append((
+                jnp.asarray(q, jnp.bfloat16), jnp.asarray(g, jnp.bfloat16),
+                jnp.asarray(pick_blocks(rng, lengths, pattern)), base[3], base[4],
+            ))
+        for fused, shared, kv_fetch in arms:
+            fused, shared = bool(fused), bool(shared)
 
-            def attend(q, g, b, lens, t, cache, offset, fused=fused, shared=shared):
+            def attend(q, g, b, lens, t, cache, offset, fused=fused, shared=shared,
+                       kv_fetch=kv_fetch):
+                os.environ["VLLM_TPU_QSA_DECODE_LEAN_FETCH"] = str(kv_fetch)
                 return qsa_rpa.decode_attention(
                     q, g, b, lens, t, cache, kv_heads=1, ratio=RATIO,
                     k_scale=1.0, v_scale=1.0, fused=fused, shared_schedule=shared,
@@ -169,14 +211,16 @@ def main_step(cache, results):
             if os.environ.get("BENCH_XPROF"):
                 trace = os.path.join(
                     os.environ.get("CDK_OUTPUT_DIR", "/tmp"), "xprof",
-                    f"r{reqs}x{rows}_f{int(fused)}_s{int(shared)}",
+                    f"r{reqs}x{rows}_{pattern}_f{int(fused)}_s{int(shared)}"
+                    f"_k{kv_fetch}",
                 )
             try:
                 us, cache = bench_step(attend, layers, cache, trace)
             except Exception as e:  # noqa: BLE001
                 us = repr(e)[:200]
-            row = dict(mode="step", requests=reqs, rows=rows, fused=fused,
-                       shared=shared, us_per_step=us)
+            row = dict(mode="step", requests=reqs, rows=rows, pattern=pattern,
+                       fused=fused, shared=shared, kv_fetch=kv_fetch,
+                       us_per_step=us)
             print("STEP", json.dumps(row), flush=True)
             results.append(row)
     return cache
@@ -242,6 +286,56 @@ def test_bench():
 
 if __name__ == "__main__":
     main()
+
+
+def check_exact(cache):
+    """Lean vs schedule per-page fetch: identical DMAs, so outputs must match."""
+    rng = np.random.default_rng(7)
+    results = []
+    for pattern, (reqs, rows), offset in itertools.product(
+        ("random", "clustered"), ((6, 24), (2, 64), (8, 32)), (0, 1)
+    ):
+        q, gate, blocks, lengths, table = make_inputs(
+            rng, requests=reqs, rows=rows, overlap=0.0, pattern=pattern
+        )
+        outs = []
+        for kv_fetch in (0, 1):
+            attend = jax.jit(
+                functools.partial(
+                    qsa_rpa.rpa_attention, kv_heads=1, ratio=RATIO, k_scale=0.375,
+                    v_scale=2.5, lean_fetch=bool(kv_fetch), decode_only=True,
+                    **({"kv_head_offset": 1} if offset else {}),
+                ),
+                donate_argnums=(5,),
+            )
+            out, cache = attend(q, gate, blocks, lengths, table, cache)
+            outs.append(np.asarray(out.astype(jnp.float32)))
+        row = dict(mode="exact", pattern=pattern, rows=rows, offset=offset,
+                   max_abs=max(float(np.max(np.abs(outs[0] - o))) for o in outs),
+                   nonzero=float(np.abs(outs[0]).max()))
+        print("EXACT", json.dumps(row), flush=True)
+        results.append(row)
+        assert row["max_abs"] == 0 and row["nonzero"] > 0
+    return cache, results
+
+
+def test_lean_fetch(monkeypatch):
+    monkeypatch.setenv("BENCH_CASES", "6x24,8x32,2x64")
+    monkeypatch.setenv("BENCH_PATTERNS", "random,clustered")
+    monkeypatch.setenv("BENCH_ARMS", "010,011,110")
+    cache = make_cache()
+    cache, results = check_exact(cache)
+    main_step(cache, results)
+    out_dir = os.environ.get("CDK_OUTPUT_DIR", "/tmp")
+    Path(out_dir, "bench_qsa_lean_fetch.json").write_text(json.dumps(results, indent=1))
+
+
+def test_lean_fetch_xprof(monkeypatch):
+    monkeypatch.setenv("BENCH_XPROF", "1")
+    monkeypatch.setenv("BENCH_CASES", "6x24")
+    monkeypatch.setenv("BENCH_PATTERNS", "random,clustered")
+    monkeypatch.setenv("BENCH_ARMS", "010,011")
+    main_step(make_cache(), [])
 
 
 def test_bench_xprof(monkeypatch):

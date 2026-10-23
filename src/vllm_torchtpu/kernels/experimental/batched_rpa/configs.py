@@ -174,6 +174,10 @@ class ServingConfigs:
     return_lse: bool = False
     skip_kv_update: bool = False
     mask_invalid_v: bool | None = None
+    # HEAD_ALONG_SUBLANE cache fetch with two SMEM loads per page instead of
+    # three: a tile's pages land at i * page_size, so only each entry's
+    # physical page id and size are read.
+    lean_kv_fetch: bool = False
 
     def __post_init__(self):
         if self.mask_invalid_v is None:

@@ -104,6 +104,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
     VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE: bool = False
+    VLLM_TPU_QSA_DECODE_LEAN_FETCH: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -541,6 +542,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # schedule once per step; RPA also skips its empty mixed pass.
     "VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE": env_bool(
         "VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE", default=False
+    ),
+    # Qwen4-exp QSA decode/verify attention on RPA: fetch each KV page with
+    # one scalar load instead of three (the decode KV fetch issues one DMA
+    # per 4-token group and is scalar-issue bound). Same DMAs and results.
+    "VLLM_TPU_QSA_DECODE_LEAN_FETCH": env_bool(
+        "VLLM_TPU_QSA_DECODE_LEAN_FETCH", default=False
     ),
     # Qwen4-exp QSA prefill: build the per-query selection bitset with a
     # compare-and-accumulate Pallas kernel. Off falls back to the vmapped
