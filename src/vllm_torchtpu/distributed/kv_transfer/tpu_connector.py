@@ -3179,16 +3179,20 @@ class TPURaidenConnectorWorker:
                 self._validate_glm_dcp_destination(supported)
             return f"tp{tp_size}_prefill"
         dcp_size = int(parallel_config.decode_context_parallel_size or 1)
-        if _raiden_glm_dcp_identity() and not (
-            tp_size > 1 and dcp_size == tp_size and dp_size == 1
-        ):
-            raise ValueError(
-                "TPU_RAIDEN_GLM_DCP_IDENTITY needs a decode with "
-                "tensor_parallel_size == decode_context_parallel_size > 1, "
-                f"got tensor_parallel_size={tp_size}, "
-                f"decode_context_parallel_size={dcp_size}, "
-                f"data_parallel_size={dp_size}"
-            )
+        if _raiden_glm_dcp_identity():
+            if not (dcp_size > 1 and tp_size % dcp_size == 0 and dp_size == 1):
+                raise ValueError(
+                    "TPU_RAIDEN_GLM_DCP_IDENTITY needs a decode with "
+                    "decode_context_parallel_size > 1 dividing "
+                    "tensor_parallel_size and data_parallel_size == 1, "
+                    f"got tensor_parallel_size={tp_size}, "
+                    f"decode_context_parallel_size={dcp_size}, "
+                    f"data_parallel_size={dp_size}"
+                )
+            # Rank k loads producer rank k's pages, so both legs must place
+            # rank k on the same token shard; _check_identity_dcp_rank pins it.
+            self._check_identity_dcp_rank(dcp_size)
+            return f"tp{tp_size}dcp{dcp_size}_decode"
         if tp_size > 1 and dcp_size == tp_size and dp_size == 1:
             # Every TP worker holds one DCP shard of the token positions, so
             # it must be the DCP rank its producer spans are routed to.
@@ -3212,20 +3216,23 @@ class TPURaidenConnectorWorker:
     def _glm_dcp_identity_producer_topology(self) -> str:
         """Validates a TPU_RAIDEN_GLM_DCP_IDENTITY producer.
 
-        Its TP workers are its DCP ranks, and the destination runs the same DCP
-        size and interleave over as many shards, so producer rank k holds
-        exactly the tokens of destination rank k. Equal page sizes are checked
-        by the layout fingerprint, which carries page_tokens.
+        Its TP workers each hold one DCP shard of the token positions (TP / DCP
+        workers per shard), and the destination runs the same TP, DCP and
+        interleave, so producer rank k holds exactly the tokens of destination
+        rank k. Equal page sizes are checked by the layout fingerprint, which
+        carries page_tokens.
         """
         parallel_config = self.vllm_config.parallel_config
         tp_size = int(self.tp_size)
         dcp_size = int(parallel_config.decode_context_parallel_size or 1)
         interleave = int(parallel_config.cp_kv_cache_interleave_size)
-        if _engine_is_pipeline(self.vllm_config) or not (1 < tp_size == dcp_size):
+        if _engine_is_pipeline(self.vllm_config) or not (
+            dcp_size > 1 and tp_size % dcp_size == 0
+        ):
             raise ValueError(
                 "TPU_RAIDEN_GLM_DCP_IDENTITY needs a producer with "
-                "tensor_parallel_size == decode_context_parallel_size > 1 and "
-                "no pipeline parallelism, got pipeline_parallel_size="
+                "decode_context_parallel_size > 1 dividing tensor_parallel_size "
+                "and no pipeline parallelism, got pipeline_parallel_size="
                 f"{_pipeline_parallel_size(self.vllm_config)}, "
                 f"tensor_parallel_size={tp_size}, "
                 f"decode_context_parallel_size={dcp_size}"
@@ -3234,7 +3241,7 @@ class TPURaidenConnectorWorker:
         dst_interleave = _raiden_dst_interleave_tokens(self.vllm_config)
         if (
             dst_dcp_size != dcp_size
-            or _raiden_dst_shards() != dcp_size
+            or _raiden_dst_shards() != tp_size
             or dst_interleave != interleave
         ):
             raise ValueError(
@@ -3243,16 +3250,24 @@ class TPURaidenConnectorWorker:
                 f"destination_decode_context_parallel_size={dst_dcp_size}, "
                 f"TPU_RAIDEN_DST_SHARDS={_raiden_dst_shards()}, "
                 f"destination_cp_kv_cache_interleave_size={dst_interleave}; "
-                f"producer dcp={dcp_size}, interleave={interleave}"
+                f"producer tp={tp_size}, dcp={dcp_size}, interleave={interleave}"
             )
+        self._check_identity_dcp_rank(dcp_size)
+        return f"tp{tp_size}dcp{dcp_size}_prefill"
+
+    def _check_identity_dcp_rank(self, dcp_size: int) -> None:
+        """Rank k ships to (or loads from) the peer's rank k, so rank k must
+        hold the same token shard on both legs. vLLM forms DCP groups from
+        consecutive TP ranks, so tp_rank % dcp_size is the shard; checking it
+        on each leg pins the rank -> shard map both legs share."""
         from vllm_torchtpu.distributed.dcp import get_dcp_rank
 
-        if get_dcp_rank() != self.tp_rank:
+        if get_dcp_rank() != self.tp_rank % dcp_size:
             raise ValueError(
-                "Raiden GLM DCP identity requires dcp_rank == tp_rank: "
-                f"dcp_rank={get_dcp_rank()}, tp_rank={self.tp_rank}"
+                "Raiden GLM DCP identity requires dcp_rank == tp_rank % "
+                f"dcp_size: dcp_rank={get_dcp_rank()}, tp_rank={self.tp_rank}, "
+                f"dcp_size={dcp_size}"
             )
-        return f"tp{tp_size}dcp{dcp_size}_prefill"
 
     def _validate_glm_dcp_destination(self, supported: str) -> None:
         dst_dcp_size = _raiden_dst_dcp_size(self.vllm_config)
@@ -4564,8 +4579,9 @@ class TPURaidenConnectorWorker:
         parallelism = self._raiden_transfer_parallelism()
         transfer_rank = self._local_raiden_transfer_rank()
         self._maybe_delay_stage3_registration_for_test(metadata)
-        # A DCP identity producer's transfer rank is its DCP rank (admission
-        # checks dcp_rank == tp_rank) and it ships its own pages whole.
+        # A DCP identity producer's transfer rank is its TP rank; it ships its
+        # own pages whole to the destination's same TP rank, whose DCP shard
+        # (tp_rank % dcp, checked at admission on both legs) is its own.
         dcp_identity = _raiden_glm_dcp_identity()
 
         now = time.time()
@@ -4615,7 +4631,8 @@ class TPURaidenConnectorWorker:
                         num_tokens=num_tokens,
                         page_tokens=page_tokens,
                         dcp_size=dst_dcp_size,
-                        dcp_rank=transfer_rank,
+                        dcp_rank=transfer_rank % dst_dcp_size,
+                        dst_unit=transfer_rank,
                         live_bytes_per_block=tag_geometry[tag][0],
                         block_ids=list(scheduler_ids),
                     )

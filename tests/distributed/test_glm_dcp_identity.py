@@ -143,6 +143,34 @@ def test_identity_spans_land_where_the_decode_writer_puts_each_token(
         np.testing.assert_array_equal(landed, _token_bytes(tokens, 0))
 
 
+@pytest.mark.parametrize("num_tokens", [1, 2047, 2048, 2049, 5000, 9999])
+def test_identity_spans_address_tp_ranks_when_tp_exceeds_dcp(num_tokens):
+    # TP16 / DCP8: TP rank r holds DCP shard r % 8, and ships it whole to the
+    # destination's TP rank r, which holds the same shard.
+    kwargs = dict(
+        tag="mla.nope",
+        num_tokens=num_tokens,
+        page_tokens=256,
+        dcp_size=8,
+        live_bytes_per_block=512 * 256,
+        block_ids=list(range(math.ceil(num_tokens / (256 * 8)))),
+    )
+    for tp_rank in range(16):
+        shard = lower_glm_dcp_identity_spans(dcp_rank=tp_rank % 8, **kwargs)
+        unit = lower_glm_dcp_identity_spans(
+            dcp_rank=tp_rank % 8, dst_unit=tp_rank, **kwargs
+        )
+        assert unit.declared_bytes == shard.declared_bytes
+        assert len(unit.spans) == len(shard.spans) == len(kwargs["block_ids"])
+        for got, want in zip(unit.spans, shard.spans, strict=True):
+            assert got.dst_unit_ordinal == tp_rank
+            assert (got.src_block_ordinal, got.dst_offset_bytes, got.size_bytes) == (
+                want.src_block_ordinal,
+                want.dst_offset_bytes,
+                want.size_bytes,
+            )
+
+
 @pytest.mark.parametrize(
     ("overrides", "message"),
     [
@@ -150,6 +178,9 @@ def test_identity_spans_land_where_the_decode_writer_puts_each_token(
         (dict(block_ids=[7]), "expected 2"),
         (dict(dcp_rank=16), "outside dcp_size"),
         (dict(num_tokens=0), "num_tokens must be positive"),
+        # A destination unit must hold the shard it receives.
+        (dict(dst_unit=20), "does not hold DCP shard"),
+        (dict(dst_unit=-1), "does not hold DCP shard"),
     ],
 )
 def test_identity_lowering_fails_closed(overrides, message):
@@ -330,6 +361,19 @@ def test_identity_topology_admits_matching_dcp_peers():
     assert _topology(_dcp_worker(is_producer=False)) == "tp16dcp16_decode"
 
 
+@pytest.mark.parametrize("is_producer", [True, False])
+def test_identity_topology_admits_tp_over_dcp(is_producer):
+    # TP rank 11 at DCP8 holds shard 3.
+    worker = _dcp_worker(is_producer=is_producer, tp_rank=11, dcp=8, dst_dcp=8)
+    role = "prefill" if is_producer else "decode"
+    assert _topology(worker, dcp_rank=3) == f"tp16dcp8_{role}"
+    with pytest.raises(ValueError, match="dcp_rank == tp_rank % dcp_size"):
+        _topology(
+            _dcp_worker(is_producer=is_producer, tp_rank=11, dcp=8, dst_dcp=8),
+            dcp_rank=11 // 2,
+        )
+
+
 @pytest.mark.parametrize(
     ("worker_kwargs", "topology_kwargs", "message"),
     [
@@ -337,7 +381,9 @@ def test_identity_topology_admits_matching_dcp_peers():
         (dict(dst_interleave=1024), {}, "destination's DCP size"),
         # _raiden_dst_dcp_size already refuses fewer shards than DCP ranks.
         ({}, dict(dst_shards=8), "destination DCP size must divide"),
-        (dict(dcp=8, dst_dcp=8), {}, r"tensor_parallel_size == decode_context"),
+        (dict(dcp=32, dst_dcp=16), {}, "dividing tensor_parallel_size"),
+        # TP16 / DCP8 ships to as many destination units as TP ranks.
+        (dict(dcp=8, dst_dcp=8), dict(dst_shards=8), "shard count"),
         ({}, dict(dcp_rank=4), "dcp_rank == tp_rank"),
         # Without the identity mode a DCP producer fails closed.
         ({}, dict(identity=False), "needs TPU_RAIDEN_GLM_DCP_IDENTITY"),
@@ -351,8 +397,10 @@ def test_identity_producer_topology_fails_closed(
 
 
 def test_identity_decode_must_be_tp_dcp():
-    with pytest.raises(ValueError, match="decode with tensor_parallel_size"):
+    with pytest.raises(ValueError, match="needs a decode with"):
         _topology(_dcp_worker(is_producer=False, tp_rank=0, tp_size=1, dcp=1))
+    with pytest.raises(ValueError, match="dividing tensor_parallel_size"):
+        _topology(_dcp_worker(is_producer=False, dcp=32, dst_dcp=16))
 
 
 # ---------------------------------------------------------------------------
@@ -360,16 +408,46 @@ def test_identity_decode_must_be_tp_dcp():
 # ---------------------------------------------------------------------------
 
 
-def _identity_producer():
+def _identity_producer(dcp=16):
     producer = _make_raiden_scheduler(is_producer=True, block_size=256, tp_size=16)
     parallel = producer.vllm_config.parallel_config
-    parallel.decode_context_parallel_size = 16
+    parallel.decode_context_parallel_size = dcp
     parallel.cp_kv_cache_interleave_size = 4
     producer.vllm_config.kv_transfer_config.kv_connector_extra_config = {
-        "destination_decode_context_parallel_size": 16,
+        "destination_decode_context_parallel_size": dcp,
         "destination_cp_kv_cache_interleave_size": 4,
     }
     return producer
+
+
+def test_tp_over_dcp_producer_publishes_its_dcp_geometry():
+    producer = _identity_producer(dcp=8)
+    prompt_tokens = 10_000
+    req = SimpleNamespace(
+        request_id="identity-dcp8",
+        num_prompt_tokens=prompt_tokens,
+        num_computed_tokens=prompt_tokens,
+        status=RequestStatus.FINISHED_LENGTH_CAPPED,
+        kv_transfer_params=None,
+    )
+    # 9999 transfer tokens over 256-token pages at DCP8: five 2048-token
+    # scheduler blocks.
+    block_ids = [100, 101, 102, 103, 104]
+    with (
+        patch(f"{_MOD}._use_raiden_stage3_transport", return_value=True),
+        patch(f"{_MOD}._use_raiden_glm_admission", return_value=True),
+        patch(f"{_MOD}._raiden_glm_dcp_identity", return_value=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS", "p:27000"),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_ENGINE_ID", "producer"),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 16),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_MAX_TRANSFER_TOKENS", None),
+        patch(f"{_MOD}._raiden_dst_shards", return_value=16),
+    ):
+        delay, params = producer.request_finished(req, block_ids)
+    assert delay
+    assert (params["dst_tp_size"], params["dst_dcp_size"]) == (16, 8)
+    assert (params["src_dcp_size"], params["src_interleave_size"]) == (8, 4)
+    assert producer.reqs_to_send["identity-dcp8"].local_block_ids == block_ids
 
 
 @pytest.mark.parametrize("identity", [True, False])
@@ -450,6 +528,32 @@ def test_decode_requires_matching_identity_producer(identity, overrides, accepte
         patch(f"{_MOD}._use_raiden_stage3_transport", return_value=True),
         patch(f"{_MOD}._use_raiden_glm_admission", return_value=True),
         patch(f"{_MOD}._raiden_glm_dcp_identity", return_value=identity),
+    ):
+        error = decode._validate_load_params(request, _load_params(**overrides))
+    if accepted:
+        assert error is None
+    else:
+        assert "DCP identity" in error
+
+
+@pytest.mark.parametrize(
+    ("overrides", "accepted"),
+    [
+        (dict(dst_dcp_size=8, src_dcp_size=8), True),
+        # A DCP16 producer's pages hold another shard of each block.
+        (dict(dst_dcp_size=8, src_dcp_size=16), False),
+    ],
+)
+def test_tp_over_dcp_decode_requires_matching_identity_producer(overrides, accepted):
+    decode = _make_raiden_scheduler(is_producer=False, tp_size=16)
+    parallel = decode.vllm_config.parallel_config
+    parallel.decode_context_parallel_size = 8
+    parallel.cp_kv_cache_interleave_size = 4
+    request = SimpleNamespace(request_id="dst-req", num_prompt_tokens=10_000)
+    with (
+        patch(f"{_MOD}._use_raiden_stage3_transport", return_value=True),
+        patch(f"{_MOD}._use_raiden_glm_admission", return_value=True),
+        patch(f"{_MOD}._raiden_glm_dcp_identity", return_value=True),
     ):
         error = decode._validate_load_params(request, _load_params(**overrides))
     if accepted:
