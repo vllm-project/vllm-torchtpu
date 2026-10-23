@@ -102,6 +102,8 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
     VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK: int = 256
     VLLM_TPU_MTP_DRAFT_TOP_TOKENS: bool = False
+    VLLM_TPU_QSA_RING_SELECT: bool = False
+    VLLM_TPU_QSA_RING_DMA_BATCH: int = 0
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
@@ -546,6 +548,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # pairs exchanged) instead of all-gathering the draft logits. Same tokens.
     "VLLM_TPU_MTP_DRAFT_TOP_TOKENS": env_bool(
         "VLLM_TPU_MTP_DRAFT_TOP_TOKENS", default=False
+    ),
+    # Qwen4-exp pooled QSA: request row r owns ring row r, so the indexer
+    # update's whole-row ring/tag gathers and final scatter become selects.
+    "VLLM_TPU_QSA_RING_SELECT": env_bool("VLLM_TPU_QSA_RING_SELECT", default=False),
+    # Qwen4-exp QSA ring/tag state I/O: concurrent row DMAs per tile. 0 uses
+    # the measured table (pool pages without an entry, e.g. 512-token FP8
+    # pages, fall back to one serial DMA per request); N > 0 uses the largest
+    # power of two <= N that divides the request rows.
+    "VLLM_TPU_QSA_RING_DMA_BATCH": env_nonnegative_int(
+        "VLLM_TPU_QSA_RING_DMA_BATCH", 0
     ),
     # Qwen4-exp QSA decode/verify attention: run the decode rows (and the
     # decode prefix of mixed steps) on the fused sparse GQA decode kernel

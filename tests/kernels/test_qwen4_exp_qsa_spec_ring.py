@@ -79,3 +79,48 @@ def test_rejected_drafts_do_not_corrupt_compressed_groups(num_spec, prompt):
     expected = _reference(context)
     for group in range(context // RATIO):
         np.testing.assert_allclose(groups[group], expected[group], rtol=0, atol=0)
+
+
+@pytest.mark.parametrize("seed", range(3))
+def test_rows_are_slots_matches_scatter(seed):
+    """Pooled layout (request row r owns ring row r; idle rows have slot -1):
+    the select form gives the same ring, tags and completed groups."""
+    rng = np.random.default_rng(seed)
+    requests, spec = 8, 4
+    lengths = rng.integers(0, spec + 1, requests)
+    lengths[rng.integers(0, requests)] = 0
+    starts = np.concatenate([[0], np.cumsum(lengths)]).astype(np.int32)
+    tokens = int(starts[-1]) + 3  # padded rows
+    context = np.where(lengths > 0, rng.integers(0, 40, requests), 0).astype(np.int32)
+    slots = np.where(lengths > 0, np.arange(requests), -1).astype(np.int32)
+    raw = jnp.asarray(rng.normal(0, 1, (tokens, DIM)), jnp.bfloat16)
+    positions = np.zeros(tokens, np.int32)
+    for r in range(requests):
+        positions[starts[r] : starts[r + 1]] = context[r] + np.arange(lengths[r])
+    ring = jnp.asarray(rng.normal(0, 1, (requests, ROWS, DIM)), jnp.bfloat16)
+    tags = jnp.asarray(rng.integers(-1, 60, (requests, ROWS, 2)), jnp.int32)
+    trig = jnp.asarray(np.random.default_rng(5).normal(0, 1, (256, 128)), jnp.bfloat16)
+    args = (
+        raw,
+        jnp.asarray(positions),
+        ring,
+        tags,
+        jnp.zeros((DIM,), jnp.bfloat16),
+        trig,
+        jnp.asarray(starts),
+        jnp.asarray(context),
+        jnp.asarray(slots),
+        RATIO,
+        1e-6,
+        ROTARY,
+    )
+    ref = _indexer_updates(*args)
+    new = _indexer_updates(*args, rows_are_slots=True)
+    done = np.asarray(ref[1])
+    np.testing.assert_array_equal(done, np.asarray(new[1]))
+    assert done.any()
+    np.testing.assert_array_equal(
+        np.asarray(ref[0], np.float32)[done], np.asarray(new[0], np.float32)[done]
+    )
+    for a, b in zip(ref[2:], new[2:]):
+        np.testing.assert_array_equal(np.asarray(a), np.asarray(b))

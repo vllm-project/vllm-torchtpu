@@ -950,6 +950,8 @@ def _pooled_qsa(
         compress_ratio,
         norm_eps,
         rotary_dim,
+        # Request row r reads and writes ring row r (slots is r or -1).
+        rows_are_slots=envs.VLLM_TPU_QSA_RING_SELECT,
     )
     pool = write_compressed(
         pool,

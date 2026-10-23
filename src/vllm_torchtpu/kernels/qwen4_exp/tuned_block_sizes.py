@@ -5,6 +5,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
@@ -69,6 +70,13 @@ def get_ring_tag_dma_batch(
         ring_elements,
         tag_elements,
     )
+    override = envs.VLLM_TPU_QSA_RING_DMA_BATCH
+    if override:
+        # The largest power-of-two divisor of the request rows up to it.
+        batch = 1 << (override.bit_length() - 1)
+        while requests % batch:
+            batch //= 2
+        return batch
     if key not in RING_TAG_DMA_BATCHES:
         logger.warning_once("QSA uses single-request state DMA tiles for key: %s", key)
         return 1
