@@ -55,7 +55,7 @@ def _inputs(seed: int):
     return pool, jnp.asarray(pages), jnp.asarray(LENGTHS, jnp.int32), q, gate
 
 
-def _kernel_rows(pool, pages, kv_len, q, gate, *, off, tile_cut=0):
+def _kernel_rows(pool, pages, kv_len, q, gate, *, off, tile_cut=0, fold=False):
     n = q.shape[0]
 
     def kernel(pages_ref, len_ref, q_ref, g_ref, pool_ref, out_ref, ring, sems):
@@ -74,6 +74,7 @@ def _kernel_rows(pool, pages, kv_len, q, gate, *, off, tile_cut=0):
                 scale_v=SV,
                 sm_scale=SM,
                 interpret=True,
+                fold=fold,
             )
             return carry
 
@@ -101,10 +102,10 @@ def _kernel_rows(pool, pages, kv_len, q, gate, *, off, tile_cut=0):
     )(pages, lens, q, gate, pool)
 
 
-@pytest.mark.parametrize("off", [0, 1])
-def test_attend_row_matches_reference(off):
+@pytest.mark.parametrize("off,fold", [(0, False), (1, False), (1, True)])
+def test_attend_row_matches_reference(off, fold):
     pool, pages, kv_len, q, gate = _inputs(3 + off)
-    got = np.asarray(_kernel_rows(pool, pages, kv_len, q, gate, off=off))
+    got = np.asarray(_kernel_rows(pool, pages, kv_len, q, gate, off=off, fold=fold))
     want = np.asarray(
         reference_rows(q, gate, pool, pages, kv_len, off=off, scale_k=SK, scale_v=SV, sm_scale=SM)
     )

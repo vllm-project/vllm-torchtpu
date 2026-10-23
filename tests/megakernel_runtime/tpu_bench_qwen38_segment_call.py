@@ -158,10 +158,7 @@ def run(
     if QSA_ATTN:
         # Same segment with the QSA sparse attention in-kernel: every live row
         # attends the full 2051-token budget from a shuffled paged FP8 pool.
-        spec_q = qwen38.segment_spec(g, R, L=L, qsa_attn=dict(budget=512, kv_head_offset=0))
         ex_q = ExecSpec(R=R, B=B, T=T_VERIFY, ctx=128, tiles=segment_tiles(B, rings=rings))
-        fn_q, _, _, _ = make_flat_segment_step(mesh, spec_q, ex_q)
-        assert fn_q.extra_names == ("qsa_pool", "qsa_q", "qsa_gate", "qsa_pages", "qsa_kvlen")
         nh, npages = g.NH // R, 1024
         rng = np.random.default_rng(B)
         pool_q = jax.device_put(
@@ -176,13 +173,20 @@ def run(
             jnp.asarray(rng.permutation(npages * 32)[: ex.M * 513].reshape(ex.M, 513), jnp.int32), rep
         )
         kvlen_q = jax.device_put(jnp.asarray([2051] * B + [0] * (ex.M - B), jnp.int32), rep)
-        out["kernel_qsa_attn_us"] = _slope(
-            lambda h, p_, *a: fn_q(p_, h, *a)[0],
-            hid_m,
-            (pos, pool_q, q_q, g_q, pages_q, kvlen_q, *flat, *st),
-            chains,
-        )
-        out["in_kernel_attention_us"] = round(out["kernel_qsa_attn_us"] - t_kernel, 1)
+        arms = (("", dict()), ("fold", dict(fold=True)), ("no_unpack", dict(ablate="unpack")),
+                ("no_matmul", dict(ablate="matmul")), ("no_dma", dict(ablate="dma")))
+        for label, opts in arms:
+            spec_q = qwen38.segment_spec(
+                g, R, L=L, qsa_attn=dict(budget=512, kv_head_offset=0, **opts)
+            )
+            fn_q, _, _, _ = make_flat_segment_step(mesh, spec_q, ex_q)
+            us = _slope(
+                lambda h, p_, *a, fn_q=fn_q: fn_q(p_, h, *a)[0],
+                hid_m,
+                (pos, pool_q, q_q, g_q, pages_q, kvlen_q, *flat, *st),
+                chains,
+            )
+            out["attn_us" + ("_" + label if label else "")] = round(us - t_kernel, 1)
     return out
 
 

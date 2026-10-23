@@ -83,8 +83,14 @@ def attend_row(
     scale_v: float,
     sm_scale: float,
     interpret: bool,
+    fold: bool = False,
+    ablate: str = "",
 ) -> jax.Array:
     """Gated sparse attention of row `r`: `[nh, 256]` F32 (zero for an empty row).
+
+    `fold`: apply `scale_k * sm_scale` to q and `scale_v` to the result instead
+    of to every K / V tile. `ablate` (timing only, wrong results): "dma" skips
+    the copies, "unpack" uses zero K / V, "matmul" skips QK and PV.
 
     `q`, `gate`: `[nh, 256]`. `ring`: `[2, TILE, 1, 4, 256]` FP8 VMEM; `sems`: DMA
     semaphores `[2]`. `pages` / `kv_len`: SMEM refs.
@@ -118,10 +124,14 @@ def attend_row(
         return out
 
     def start(t: Any, s: Any) -> None:
+        if ablate == "dma":
+            return
         for cp in copies(t, s):
             cp.start()
 
     def wait(t: Any, s: Any) -> None:
+        if ablate == "dma":
+            return
         if interpret:
             for cp in copies(t, s):
                 cp.wait()
@@ -133,7 +143,8 @@ def attend_row(
     def _():
         start(0, 0)
 
-    qf = q.astype(F32)
+    qf = q.astype(F32) * (scale_k * sm_scale if fold else 1.0)
+    k_mul, v_mul, s_mul = (1.0, 1.0, 1.0) if fold else (scale_k, scale_v, sm_scale)
 
     def tile(t: Any, carry: Any) -> Any:
         m, l, acc = carry
@@ -144,22 +155,36 @@ def attend_row(
         def _():
             start(t + 1, 1 - s)
 
-        k8, v8 = _unpack_kv(ring.at[s], off, interpret)
+        if ablate == "unpack":
+            k8 = v8 = jnp.zeros((TILE, dim), BF16)
+        else:
+            k8, v8 = _unpack_kv(ring.at[s], off, interpret)
         tok = t * TILE + jax.lax.broadcasted_iota(I32, (1, TILE), 1)
         valid = tok < length
-        key = k8.astype(F32) * scale_k
+        key = k8.astype(F32) * k_mul if k_mul != 1.0 else k8.astype(F32)
         # A column iota, not `valid.reshape`: Mosaic has no i1 shape cast.
         tok_col = t * TILE + jax.lax.broadcasted_iota(I32, (TILE, 1), 0)
-        value = jnp.where(tok_col < length, v8.astype(F32) * scale_v, 0.0)
-        score = jax.lax.dot_general(
-            qf, key, (((1,), (1,)), ((), ())), preferred_element_type=F32
-        ) * sm_scale
+        vf = v8.astype(F32) * v_mul if v_mul != 1.0 else v8.astype(F32)
+        value = jnp.where(tok_col < length, vf, 0.0)
+        if ablate == "matmul":
+            score = jnp.zeros((nh, TILE), F32)
+        else:
+            score = jax.lax.dot_general(
+                qf, key, (((1,), (1,)), ((), ())), preferred_element_type=F32
+            )
+            if s_mul != 1.0:
+                score = score * s_mul
         score = jnp.where(valid, score, -jnp.inf)
         m_new = jnp.maximum(m, jnp.max(score, axis=-1, keepdims=True))
         p = jnp.where(valid, jnp.exp(score - m_new), 0.0)
         alpha = jnp.exp(m - m_new)
         l_new = l * alpha + jnp.sum(p, axis=-1, keepdims=True)
-        acc_new = acc * alpha + jnp.dot(p, value, preferred_element_type=F32)
+        pv = (
+            jnp.zeros((nh, dim), F32)
+            if ablate == "matmul"
+            else jnp.dot(p, value, preferred_element_type=F32)
+        )
+        acc_new = acc * alpha + pv
         return m_new, l_new, acc_new
 
     init = (
@@ -168,7 +193,7 @@ def attend_row(
         jnp.zeros((nh, dim), F32),
     )
     _, l, acc = jax.lax.fori_loop(0, ntiles, tile, init)
-    attn = acc / jnp.where(l > 0, l, 1.0)
+    attn = acc / jnp.where(l > 0, l, 1.0) * (scale_v if fold else 1.0)
     gated = (
         attn.astype(BF16).astype(F32) * jax.nn.sigmoid(gate.astype(F32)).astype(BF16).astype(F32)
     ).astype(BF16).astype(F32)
@@ -193,9 +218,12 @@ class QSASparseAttnBlock(QSAOutBlock):
         kv_head_offset: int = 0,
         scale_k: float = 1.0,
         scale_v: float = 1.0,
+        fold: bool = False,
+        ablate: str = "",
         prefix: str = "self_attn",
     ) -> None:
         super().__init__(prefix=prefix)
+        self.fold, self.ablate = fold, ablate
         self.budget = budget
         self.off = kv_head_offset
         self.scale_k, self.scale_v = scale_k, scale_v
@@ -252,6 +280,8 @@ class QSASparseAttnBlock(QSAOutBlock):
                 scale_v=self.scale_v,
                 sm_scale=g.HD**-0.5,
                 interpret=ex.interpret,
+                fold=self.fold,
+                ablate=self.ablate,
             )
             # Row r of each head's [MB, HD] output by a mask, not a store at a
             # dynamic row (a bf16 row store must be 16-row aligned in Mosaic).
