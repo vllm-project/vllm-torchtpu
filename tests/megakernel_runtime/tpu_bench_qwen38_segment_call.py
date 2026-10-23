@@ -120,19 +120,24 @@ def run(B: int, L: int, chains: list[int]) -> dict:
         wb_seed = jnp.broadcast_to(jnp.asarray(ck[:NL, :, :1]), (NL, NS, T_VERIFY))
         pool = jax.jit(seed)(pool, jax.device_put(conv_r, tp), jax.device_put(rec_r, tp), jax.device_put(wb_seed, rep))
         results = {}
-        for pg in (False, True):
-            full, _, _, _ = build_segment_call(mesh, g, L, B, layout, pool_gdn=pg)
+        for pg, fs in ((False, False), (True, False), (True, True)):
+            full, _, _, _ = build_segment_call(mesh, g, L, B, layout, pool_gdn=pg, fast_scatter=fs)
             res_, pool_ = jax.jit(full)(hidden, attn_b, *flat, pool, *meta)
-            results[pg] = (np.asarray(res_, np.float32), np.asarray(jax.lax.bitcast_convert_type(pool_, jnp.uint8)))
+            results[(pg, fs)] = (np.asarray(res_, np.float32), np.asarray(jax.lax.bitcast_convert_type(pool_, jnp.uint8)))
             # The pool is part of the carry, so the scatter is live work.
-            out["composed_us" + ("_poolgdn" if pg else "_gather")] = _slope(
+            out["composed_us" + ("_poolgdn" if pg else "_gather") + ("_fast" if fs else "")] = _slope(
                 lambda c, at, *a, full=full: tuple(full(c[0], at, *a[:nf], c[1], *a[nf:])),
                 (hidden, pool),
                 (attn_b, *flat, *meta),
                 chains,
             )
-        out["poolgdn_res_maxdiff"] = float(np.abs(results[True][0] - results[False][0]).max())
-        out["poolgdn_pool_bytes_differ"] = int((results[True][1] != results[False][1]).sum())
+        base_ = results[(False, False)]
+        for key, name in (((True, False), "poolgdn"), ((True, True), "poolgdn_fast")):
+            out[name + "_res_maxdiff"] = float(np.abs(results[key][0] - base_[0]).max())
+            # block 0 is the null block (padded requests); compare the rest
+            nb = pool_shape[0]
+            diff = (results[key][1] != base_[1]).reshape(R, nb, -1)[:, 4:]
+            out[name + "_pool_bytes_differ"] = int(diff.sum())
     else:
         full, _, _, _ = build_segment_call(mesh, g, L, B, layout)
         out["composed_us"] = _slope(lambda h, at, *a: full(h, at, *a)[0], hidden, (attn_b, *flat), chains)

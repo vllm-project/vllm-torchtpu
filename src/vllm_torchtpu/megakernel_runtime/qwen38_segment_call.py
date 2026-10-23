@@ -35,6 +35,7 @@ from vllm_torchtpu.megakernel.models import qwen38
 from vllm_torchtpu.megakernel.models.qwen38_step import make_flat_segment_step
 
 from .qwen38_gdn_state import gather_gdn_states, scatter_gdn_ckpts
+from .qwen38_scatter import scatter_gdn_ckpts_fast
 
 T_VERIFY = 4
 
@@ -100,6 +101,7 @@ def build_segment_call(
     tiles: Tiles | None = None,
     head: bool = False,
     pool_gdn: bool = True,
+    fast_scatter: bool = True,
 ) -> tuple[Any, tuple, tuple, tuple]:
     """`(fn, in_specs, out_specs, donate_argnums)` of segment kind `L` at `B` rows.
 
@@ -107,7 +109,9 @@ def build_segment_call(
     (`head=True`); `pool` / `meta` when the segment has GDN layers. With
     `pool_gdn` the kernel reads the GDN states from the pool itself; otherwise
     they are gathered into per-layer arrays first. The per-token checkpoints
-    are scattered into the (donated) pool after the kernel either way.
+    are scattered into the (donated) pool after the kernel either way, with
+    `qwen38_scatter` (only the changed bytes) or, `fast_scatter=False`, the
+    region adapter.
     `interpret` / `tiles` are for CPU tests.
     """
     R = mesh.size
@@ -146,10 +150,9 @@ def build_segment_call(
         out_specs=(tp, tp),
         check_vma=False,
     )
+    scatter_fn = scatter_gdn_ckpts_fast if fast_scatter else scatter_gdn_ckpts
     scatter = jax.shard_map(
-        lambda pool, c, r, wb: scatter_gdn_ckpts(
-            pool, c, r, wb, layout=layout, interpret=interpret
-        ),
+        lambda pool, c, r, wb: scatter_fn(pool, c, r, wb, layout=layout, interpret=interpret),
         mesh=mesh,
         in_specs=(tp, tp, tp, rep),
         out_specs=tp,
