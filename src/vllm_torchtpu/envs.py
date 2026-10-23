@@ -235,6 +235,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     VLLM_TPU_FUSED_ASYNC_DRAFT_SEED: bool = True
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
+    VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE: bool = True
     VLLM_TPU_MTP_DRAFT_ROWS: bool = False
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
     MM_ENCODER_FRAME_CHUNK_PATCH_SIZE: int = 0
@@ -1448,6 +1449,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (tpu_runner.py _update_read_offsets_impl).
     "VLLM_TPU_FUSED_READ_OFFSET_UPDATE": env_bool(
         "VLLM_TPU_FUSED_READ_OFFSET_UPDATE", default=True
+    ),
+    # Metadata walk: reuse the previous step's staged block-table upload when
+    # its geometry and contents are unchanged (layers/core/attention_metadata.py
+    # stage_block_table_uploads).
+    "VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE": env_bool(
+        "VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE", default=True
     ),
     # MTP draft step 0 on a draft declaring `supports_draft_rows` (Qwen4Exp):
     # write the draft layer's caches for every token of the target's step but
