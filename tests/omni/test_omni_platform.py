@@ -38,6 +38,7 @@ from vllm_torchtpu.omni.attention import (
     TpuSDPAImpl,
 )
 from vllm_torchtpu.omni.patches import (
+    _SDPA_FALLBACK_PATCHED,
     _patch_diffusion_startup_warmup_sync,
     _patch_sdpa_fallback_dispatch,
     apply_omni_model_specific_patches,
@@ -557,8 +558,6 @@ def test_sdpa_fallback_routes_to_tpu_sdpa(monkeypatch):
     def _raise_oot(self, query, key, value, attn_metadata=None):
         raise NotImplementedError("No forward implementation for platform: oot")
 
-    monkeypatch.setattr(SDPAImpl, "_tpu_orig_forward", None, raising=False)
-    monkeypatch.delattr(SDPAImpl, "_tpu_orig_forward", raising=False)
     monkeypatch.setattr(SDPAImpl, "forward", _raise_oot)
     fallback = SDPAImpl(num_heads=2, head_size=8, softmax_scale=0.3)
     torch.manual_seed(0)
@@ -568,7 +567,7 @@ def test_sdpa_fallback_routes_to_tpu_sdpa(monkeypatch):
 
     apply_omni_model_specific_patches.cache_clear()
     apply_omni_model_specific_patches()
-    assert SDPAImpl._tpu_orig_forward is _raise_oot
+    assert getattr(SDPAImpl.forward, _SDPA_FALLBACK_PATCHED, False)
     assert SDPAImpl.forward is TpuSDPAImpl.forward
 
     keep = torch.tensor([[1, 1, 1, 1, 1], [1, 1, 1, 0, 0]])
@@ -582,6 +581,9 @@ def test_sdpa_fallback_routes_to_tpu_sdpa(monkeypatch):
             fallback.forward(q, k, v, meta), want.float(), rtol=1e-5, atol=1e-5
         )
 
+    # Installing again returns at the flag check, before the info log.
+    infos = []
+    monkeypatch.setattr("vllm_torchtpu.omni.patches.logger.info", infos.append)
     _patch_sdpa_fallback_dispatch()
-    assert SDPAImpl._tpu_orig_forward is _raise_oot
+    assert infos == []
     assert SDPAImpl.forward is TpuSDPAImpl.forward

@@ -343,6 +343,9 @@ def _wrap_fresh_timestep(cls: type) -> None:
     cls.forward = _fresh_timestep_forward
 
 
+_SDPA_FALLBACK_PATCHED = "_tpu_sdpa_fallback_patched"
+
+
 def _patch_sdpa_fallback_dispatch() -> None:
     # -------------------------------------------------------------------------
     # TODO: Remove once vLLM-Omni's AttentionImpl.forward dispatches
@@ -365,8 +368,9 @@ def _patch_sdpa_fallback_dispatch() -> None:
 
     from vllm_torchtpu.omni.attention import TpuSDPAImpl
 
-    if hasattr(SDPAImpl, "_tpu_orig_forward"):
+    if getattr(SDPAImpl.forward, _SDPA_FALLBACK_PATCHED, False):
         return
-    SDPAImpl._tpu_orig_forward = SDPAImpl.forward
+    # The flag lands on TpuSDPAImpl.forward, the function shared by both classes.
+    setattr(TpuSDPAImpl.forward, _SDPA_FALLBACK_PATCHED, True)
     SDPAImpl.forward = TpuSDPAImpl.forward
     logger.info("Applied TPU patch: SDPAImpl.forward routes to TpuSDPAImpl.")
