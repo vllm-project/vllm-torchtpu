@@ -771,6 +771,7 @@ def test_generation_config_is_not_declared_when_the_checkpoint_has_none(
     hf_dir = tmp_path / "hf_ckpt"
     hf_dir.mkdir()
     (hf_dir / "config.json").write_text(json.dumps({"eos_token_id": 2}))
+    (hf_dir / "tokenizer.json").write_text(json.dumps({"version": "1.0"}))
     out_dir = tmp_path / "artifact"
     out_dir.mkdir()
     cfg = api.TextOnlyLLMExportConfig(
@@ -880,11 +881,15 @@ def test_params_read_by_forward_drops_unread_forward_weights() -> None:
 def test_resolve_hf_checkpoint_dir_uses_cached_hub_snapshot(tmp_path: Path) -> None:
     snapshot = tmp_path / "snapshots" / "main"
     snapshot.mkdir(parents=True)
+    fetched = []
 
-    def fake_cached_file(repo: str, filename: str, **kwargs: Any) -> str:
-        assert kwargs["local_files_only"] is True
+    def fake_cached_file(repo: str, filename: str, **kwargs: Any) -> str | None:
         if repo != "org/tiny":
-            raise OSError(f"{repo} is not cached")
+            raise OSError(f"{repo} is not on the Hub")
+        fetched.append((filename, kwargs.get("local_files_only", False)))
+        if filename == "generation_config.json":
+            assert kwargs["_raise_exceptions_for_missing_entries"] is False
+            return None
         return str(snapshot / filename)
 
     resolve = universal_adapter.resolve_hf_checkpoint_dir
@@ -894,6 +899,26 @@ def test_resolve_hf_checkpoint_dir_uses_cached_hub_snapshot(tmp_path: Path) -> N
         assert resolve("org/tiny") == str(snapshot)
         with pytest.raises(FileNotFoundError, match="org/missing"):
             resolve("org/missing")
+    # The companion files are fetched, not only looked up in the cache: a dummy
+    # weight load caches config.json alone.
+    assert fetched == [
+        ("config.json", False),
+        ("tokenizer.json", False),
+        ("generation_config.json", False),
+    ]
+
+
+def test_companion_files_require_a_tokenizer(tmp_path: Path) -> None:
+    hf_dir = tmp_path / "hf_ckpt"
+    hf_dir.mkdir()
+    (hf_dir / "config.json").write_text(json.dumps({"eos_token_id": 2}))
+    out_dir = tmp_path / "artifact"
+    out_dir.mkdir()
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny", vocab_size=64, hf_checkpoint_dir=str(hf_dir)
+    )
+    with pytest.raises(FileNotFoundError, match="tokenizer.json"):
+        exporter._emit_model_companion_files(cfg, str(out_dir))
 
 
 def _tp2_model(constant_values: Mapping[str, list[Any]]) -> Any:
