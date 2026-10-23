@@ -160,8 +160,11 @@ def _rpa_attention_batch(
 def slot_readable(cache, kv_heads, kv_head_offset):
     """RPA can attend head slot ``kv_head_offset`` of a packed row directly:
     one KV head and rows of one packed sublane (FP8 paired pages)."""
-    return kv_heads == 1 and cache.shape[2] == 1 and (
-        kv_head_offset < cache.shape[3] // 2
+    return (
+        kv_heads == 1
+        and cache.ndim == 5
+        and cache.shape[2] == 1
+        and kv_head_offset < cache.shape[3] // 2
     )
 
 
@@ -336,7 +339,9 @@ def decode_attention(
         if shared_schedule is None
         else shared_schedule
     )
-    trailing = cache.shape[2] * cache.shape[3] // 2 - kv_head_offset - kv_heads
+    trailing = 0
+    if shared and cache.ndim == 5:
+        trailing = cache.shape[2] * cache.shape[3] // 2 - kv_head_offset - kv_heads
     use_fused = envs.VLLM_TPU_QSA_FUSED_SPARSE_DECODE if fused is None else fused
     if envs.VLLM_TPU_QSA_DECODE_SLOT_READ and not use_fused and slot_readable(
         cache, kv_heads, kv_head_offset
