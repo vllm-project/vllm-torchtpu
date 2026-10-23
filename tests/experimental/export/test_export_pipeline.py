@@ -1081,7 +1081,7 @@ def test_launch_options_read_the_dispatch_flags() -> None:
     assert launch.tensor_parallel_size == 4
     assert launch.output_dir == "o"
     assert not launch.export_worker
-    assert cli._launch_options(["--output-dir", "o"]).export_mode == "model"
+    assert cli._launch_options(["--output-dir", "o"]).export_mode == "all"
 
 
 def test_main_checkpoint_mode_runs_on_cpu_without_parsing_engine_args(

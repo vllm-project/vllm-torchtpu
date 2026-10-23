@@ -106,9 +106,9 @@ dtype. They are saved as an Orbax checkpoint (Zarr v2 arrays `array_{i}`, one pe
 
 | `--export-mode` | Runs on | Weights loaded | Writes |
 |---|---|---|---|
-| `model` (default) | TPU | dummy | artifact, without weights |
+| `model` | TPU | dummy | artifact, without weights |
 | `checkpoint` | CPU | real | Orbax checkpoint into the existing artifact at `--output-dir` |
-| `all` | TPU | real, once | artifact + Orbax checkpoint |
+| `all` (default) | TPU | real, once | artifact + Orbax checkpoint |
 
 ```bash
 python -m vllm_torchtpu.experimental.export --export-mode all \

@@ -34,9 +34,9 @@ from vllm_torchtpu.experimental.export import (
 )
 from vllm_torchtpu.experimental.export.trace import trace
 
-# What `--export-mode` writes: the serving artifact with declarative weights read
-# from the HF checkpoint (`model`), the weights of an existing artifact as an
-# Orbax checkpoint (`checkpoint`), or both from one load (`all`).
+# What `--export-mode` writes: the serving artifact without weights (`model`), the
+# weights of an existing artifact as an Orbax checkpoint (`checkpoint`), or both
+# from one load (`all`, the default).
 EXPORT_MODES = ("model", "checkpoint", "all")
 
 
@@ -172,13 +172,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     export_group.add_argument(
         "--export-mode",
         choices=EXPORT_MODES,
-        default="model",
+        default="all",
         help=(
-            "'model' (default): export the artifact, traced with dummy weights, "
-            "and save no weights. 'checkpoint': on CPU, load the real weights "
-            "through vLLM and save them as an Orbax checkpoint in the existing "
-            "artifact at --output-dir. 'all': on TPU, load the real weights once, "
-            "export the artifact and save them as an Orbax checkpoint."
+            "'all' (default): on TPU, load the real weights once, export the "
+            "artifact and save them as an Orbax checkpoint. 'model': export the "
+            "artifact, traced with dummy weights, and save no weights. "
+            "'checkpoint': on CPU, load the real weights through vLLM and save "
+            "them as an Orbax checkpoint in the existing artifact at --output-dir."
         ),
     )
     # Internal: marks a worker process started by `main`.
@@ -389,7 +389,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 def _launch_options(argv: Sequence[str]) -> argparse.Namespace:
     """The options `main` dispatches on, read without vLLM's argument parser."""
     parser = argparse.ArgumentParser(add_help=False)
-    parser.add_argument("--export-mode", choices=EXPORT_MODES, default="model")
+    parser.add_argument("--export-mode", choices=EXPORT_MODES, default="all")
     parser.add_argument("--output-dir")
     parser.add_argument("-tp", "--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--export-worker", action="store_true")
