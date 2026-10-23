@@ -338,6 +338,57 @@ def _validate_phased_profiling_config(vllm_config: "VllmConfig") -> None:
         )
 
 
+def _validate_lora_config(vllm_config: "VllmConfig") -> None:
+    """Rejects LoRA settings that the TPU LoRA path does not support yet.
+
+    LoRA runs on a single chip with a dense model without speculative decoding.
+    Other settings fail here with the reason.
+    """
+    lora_config = vllm_config.lora_config
+    if lora_config is None:
+        return
+    model_config = vllm_config.model_config
+    parallel_config = vllm_config.parallel_config
+    unsupported = {
+        # RowParallelLinearWithLoRA adds the bias on rank 0 only, so the ranks
+        # would compile different graphs.
+        "tensor_parallel_size > 1": parallel_config.tensor_parallel_size > 1,
+        # Untested; each DP engine has its own LoRA manager.
+        "data_parallel_size > 1": parallel_config.data_parallel_size > 1,
+        # Untested.
+        "pipeline_parallel_size > 1": parallel_config.pipeline_parallel_size > 1,
+        # The LoRA mapping covers every token of the step, but the forward
+        # runs on a local slice of them.
+        "prefill_context_parallel_size > 1": (
+            parallel_config.prefill_context_parallel_size > 1
+        ),
+        # Untested.
+        "decode_context_parallel_size > 1": (
+            parallel_config.decode_context_parallel_size > 1
+        ),
+        # Verify steps sample several tokens per request, which the sampler
+        # mapping does not cover, and the drafter shares the target's
+        # embed_tokens, which LoRA wraps.
+        "speculative decoding": vllm_config.speculative_config is not None,
+        # FusedMoEWithLoRA requires a non-monolithic MoE; every TPU MoE method
+        # is monolithic.
+        "MoE models": model_config.is_moe,
+        # Only meaningful with tensor parallelism.
+        "fully_sharded_loras": lora_config.fully_sharded_loras,
+        # The TPU runner never sets the tower or connector mappings.
+        "enable_tower_connector_lora": lora_config.enable_tower_connector_lora,
+        # The LoRA ops multiply activations by LoRA weights without a cast.
+        f"lora_dtype {lora_config.lora_dtype} differing from the model dtype "
+        f"{model_config.dtype}": lora_config.lora_dtype != model_config.dtype,
+    }
+    rejected = [setting for setting, hit in unsupported.items() if hit]
+    if rejected:
+        raise ValueError(
+            f"LoRA on TPU does not support {'; '.join(rejected)}. Change these "
+            "settings or disable LoRA."
+        )
+
+
 def _register_tpu_kv_connectors() -> None:
     """Register TPU-specific KV connectors in vLLM's factory name registry.
 
@@ -839,7 +890,15 @@ class TpuPlatform(Platform):
                 "Using bfloat16 instead.",
                 model_config.dtype,
             )
+            lora_config = vllm_config.lora_config
+            if lora_config is not None and lora_config.lora_dtype == model_config.dtype:
+                # vLLM set lora_dtype "auto" to this dtype before this hook;
+                # the LoRA weights must stay in the dtype the model runs in.
+                lora_config.lora_dtype = torch.bfloat16
             model_config.dtype = torch.bfloat16
+        # After the bfloat16 switch, so lora_dtype is checked against the
+        # dtype the model runs in.
+        _validate_lora_config(vllm_config)
 
         scheduler_config = vllm_config.scheduler_config
         cache_config = vllm_config.cache_config
