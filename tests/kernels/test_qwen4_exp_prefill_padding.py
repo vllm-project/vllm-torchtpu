@@ -172,7 +172,7 @@ def test_mixed_step_routes_short_requests_to_rpa(
     monkeypatch.setattr(
         prefill_tiles,
         "get_sparse_prefill_tiles",
-        lambda *a, **k: (QUERY_BLOCK, 128),
+        lambda *a, **k: (QUERY_BLOCK, 128, None),
     )
     real = real + [0] * (16 - len(real))
     query, gate, blocks, lengths, table, starts = _inputs(real, 64, seed=1)

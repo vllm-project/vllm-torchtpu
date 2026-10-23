@@ -20,6 +20,19 @@ from vllm_torchtpu.kernels.qwen4_exp.rounding import bf16
 SPARE_QUERY_BLOCKS = 4
 
 
+# A Q24 Q256 block keeps 256 x 24 query-head rows of state resident; fewer
+# query heads per rank (tensor-parallel shards) afford proportionally longer
+# query blocks for the same online-softmax state.
+PAIRED_PAGE_MAX_QUERY_ROWS = 256 * 24
+# KV tiles spanning several 128-token FP8 mask segments (selection words).
+PAIRED_KV_TILES = (256, 512, 1024)
+
+
+def default_query_tile(query_block):
+    """Query subtile used when the tile table does not choose one."""
+    return min(query_block, 256)
+
+
 def _compact_active(active):
     """Indices of true entries along the last axis, zero filled.
 
@@ -210,6 +223,7 @@ def _kernel(
     v_scale: float,
     kv_head_offset: int = 0,
     bf16_mxu: bool = False,
+    query_tile: int = 256,
 ):
     block = pl.program_id(0)
     # The model produces BF16 queries.  A BF16 call boundary can avoid a large
@@ -224,6 +238,11 @@ def _kernel(
     # pass with FP32 accumulation forms the same QK products as an FP32 dot,
     # which Mosaic runs as a multi-pass FP32 matmul.
     q16 = q.astype(jnp.bfloat16) if bf16_mxu else None
+    # The FP32 path folds the softmax and key scales into the queries once per
+    # block instead of scaling every score of every visited KV tile.
+    score_scale = sm_scale * k_scale
+    if not bf16_mxu:
+        q = q * score_scale
     positions = lengths_ref[:, 0] - 1
     row = jnp.arange(kv_tile, dtype=jnp.int32)
     count = active_counts_ref[block]
@@ -287,10 +306,7 @@ def _kernel(
             )
         return pairs
 
-    # B64 is the largest production query tile that fits the full-model v7
-    # scoped-VMEM limit while retaining FP32 online-softmax state. Larger
-    # query blocks reuse one resident KV tile across multiple B64 subtiles.
-    query_tile = min(query_block, 256)
+    # Larger query blocks reuse one resident KV tile across query subtiles.
     num_query_tiles = query_block // query_tile
     # Preserve -inf initialization and all-masked-row guards exactly.
     max_ref[...] = jnp.full(max_ref.shape, -jnp.inf, jnp.float32)
@@ -301,34 +317,51 @@ def _kernel(
         logical = tile * kv_tile
         # Dynamic scalar indexing must address a native 128-wide row.  Keep
         # query bits on that row and slice the statically known live prefix.
-        if kv_tile // ratio == 64:
-            low = bitset_ref[0, 2 * tile, :query_block]
-            high = bitset_ref[0, 2 * tile + 1, :query_block]
-            # Select integer words before extracting bits. A select between
-            # two bool matrices forces an unsupported Mosaic i1->i8 layout.
-            word = jnp.where(row[None, :] < ratio * 32, low[:, None], high[:, None])
-            visible = ((word >> ((row // ratio) % 32)[None, :]) & 1) != 0
-        else:
-            word = bitset_ref[0, tile, :query_block]
-            group_in_tile = row // ratio
-            visible = ((word[:, None] >> group_in_tile[None, :]) & 1) != 0
+        # Query blocks longer than 256 rows store one bitset per 256 rows.
+        parts = bitset_ref.shape[0]
+        live = query_block // parts
+        pieces = []
+        for part in range(parts):
+            tile_words = kv_tile // (ratio * 32)
+            if tile_words > 1:
+                # Select integer words before extracting bits. A select between
+                # two bool matrices forces an unsupported Mosaic i1->i8 layout.
+                word = bitset_ref[part, tile_words * tile, :live][:, None]
+                for index in range(1, tile_words):
+                    word = jnp.where(
+                        row[None, :] < index * ratio * 32,
+                        word,
+                        bitset_ref[part, tile_words * tile + index, :live][:, None],
+                    )
+                pieces.append(((word >> ((row // ratio) % 32)[None, :]) & 1) != 0)
+            else:
+                word = bitset_ref[part, tile, :live]
+                group_in_tile = row // ratio
+                pieces.append(((word[:, None] >> group_in_tile[None, :]) & 1) != 0)
+        visible = pieces[0] if parts == 1 else jnp.concatenate(pieces, axis=0)
         visible &= logical + row[None, :] <= positions[:, None]
         written = logical + lax.broadcasted_iota(
             jnp.int32, (kv_tile, head_dim), 0
         ) < jnp.max(lengths_ref[:, 0])
-        key_values = split_kv(kv_ref)[kv_head_offset : kv_head_offset + kv_heads]
+        # Decode each KV head once per tile; every query subtile reuses it.
+        key_values = []
+        for key, value in split_kv(kv_ref)[kv_head_offset : kv_head_offset + kv_heads]:
+            if kv_ref.dtype == jnp.float8_e4m3fn:
+                key = key.astype(jnp.float32)
+                value = value.astype(jnp.float32)
+                key = jnp.where(jnp.isfinite(key) & written, key, 0)
+                value = jnp.where(jnp.isfinite(value) & written, value, 0)
+            else:
+                key = jnp.where(written, key, 0)
+                value = jnp.where(written, value, 0)
+            if bf16_mxu:
+                key = key.astype(jnp.bfloat16)
+                value = value.astype(jnp.bfloat16)
+            key_values.append((key, value))
         for query_tile_index in range(num_query_tiles):
             start = query_tile_index * query_tile
             tile_visible = visible[start : start + query_tile]
             for head, (key, value) in enumerate(key_values):
-                if kv_ref.dtype == jnp.float8_e4m3fn:
-                    key = key.astype(jnp.float32)
-                    value = value.astype(jnp.float32)
-                    key = jnp.where(jnp.isfinite(key) & written, key, 0)
-                    value = jnp.where(jnp.isfinite(value) & written, value, 0)
-                else:
-                    key = jnp.where(written, key, 0)
-                    value = jnp.where(written, value, 0)
                 m = max_ref[query_tile_index, head, :]
                 mass = mass_ref[query_tile_index, head, :]
                 acc = accumulator_ref[query_tile_index, head, :, :]
@@ -337,7 +370,6 @@ def _kernel(
                     query = q16[head, :, start : start + query_tile].reshape(
                         rows, head_dim
                     )
-                    key = key.astype(jnp.bfloat16)
                 else:
                     query = q[head, :, start : start + query_tile].reshape(
                         rows, head_dim
@@ -354,7 +386,7 @@ def _kernel(
                 ).reshape(rows, kv_tile)
                 score = jnp.where(
                     row_visible,
-                    score * (sm_scale * k_scale),
+                    score * score_scale if bf16_mxu else score,
                     -jnp.inf,
                 )
                 next_m = jnp.maximum(m, jnp.max(score, axis=1))
@@ -365,7 +397,7 @@ def _kernel(
                     # Values are exact in BF16; split the FP32 probabilities
                     # into two BF16 terms (about 16 mantissa bits), i.e. the
                     # BF16x3 product without its zero value-residual pass.
-                    value16 = value.astype(jnp.bfloat16)
+                    value16 = value
                     high = prob.astype(jnp.bfloat16)
                     low = (prob - high.astype(jnp.float32)).astype(jnp.bfloat16)
                     weighted = lax.dot(
@@ -391,7 +423,7 @@ def _kernel(
                     prob, axis=1
                 )
                 accumulator_ref[query_tile_index, head, :, :] = (
-                    acc * alpha[:, None] + weighted * v_scale
+                    acc * alpha[:, None] + weighted
                 )
 
     @pl.when(count > 0)
@@ -437,7 +469,8 @@ def _kernel(
             mass = mass_ref[query_tile_index, head, :]
             acc = accumulator_ref[query_tile_index, head, :, :]
             heads.append(
-                (acc / jnp.where(mass == 0, 1, mass)[:, None])
+                # The value scale is applied once here, not per KV tile.
+                (acc * (v_scale / jnp.where(mass == 0, 1, mass))[:, None])
                 .reshape(q_heads_per_kv, query_tile, head_dim)
                 .transpose(1, 0, 2)
             )
@@ -456,6 +489,7 @@ def _kernel(
         "v_scale",
         "bf16_io",
         "kv_head_offset",
+        "query_tile",
     ),
 )
 def block_sparse_gqa_prefill(
@@ -473,27 +507,34 @@ def block_sparse_gqa_prefill(
     v_scale: float = 1.0,
     bf16_io: bool = False,
     kv_head_offset: int = 0,
+    query_tile: int | None = None,
 ):
     """Run exact selected-group attention with query-block KV reuse.
 
     ``kv_head_offset`` skips that many KV heads of each cache row: a paired
     main KV page stores a second layer's head after the first layer's.
+    ``query_tile`` is the query subtile that shares one decoded KV tile; it
+    defaults to ``default_query_tile``.
     """
     tokens, query_heads, head_dim = query.shape
     pages, physical_page_size, head_axis, packing, cache_dim = cache.shape
     if tokens % query_block or query_block % 8:
         raise ValueError("Token rows must form aligned query blocks")
-    paired_pages = kv_tile == 256 and physical_page_size % 128 == 0 and ratio == 4
+    paired_pages = (
+        kv_tile in PAIRED_KV_TILES and physical_page_size % 128 == 0 and ratio == 4
+    )
     if paired_pages:
         if (
-            query_heads != 24
-            or kv_heads != 2
-            or head_dim != 256
+            head_dim != 256
             or cache.dtype != jnp.float8_e4m3fn
-            or query_block not in PAIRED_PAGE_VMEM_MIB
+            or query_block % 128
+            or query_block * query_heads > PAIRED_PAGE_MAX_QUERY_ROWS
             or not bf16_io
         ):
-            raise ValueError("Paired pages require BF16 Q24/KV2/D256 with FP8 cache")
+            raise ValueError(
+                "Paired pages require BF16 D256 queries, an FP8 cache and a "
+                "128-aligned query block within the measured state footprint"
+            )
     elif kv_tile // ratio != 32 or max(physical_page_size, kv_tile) % min(
         physical_page_size, kv_tile
     ):
@@ -518,6 +559,12 @@ def block_sparse_gqa_prefill(
     words = ((num_kv_tiles * words_per_tile + 127) // 128) * 128
     nblocks = tokens // query_block
     native_query_width = ((query_block + 127) // 128) * 128
+    # Blocks longer than 256 rows keep one [words, 256] bitset per 256 rows,
+    # bounding the bitset kernel's lane width and VMEM windows.
+    if query_block > 256 and query_block % 256:
+        raise ValueError("Query blocks above 256 rows must be 256-aligned")
+    parts = max(1, query_block // 256)
+    part_width = native_query_width // parts
     if envs.VLLM_TPU_QSA_PREFILL_BITSET_KERNEL:
         block_bits_native = _selection_bitset(
             blocks,
@@ -525,19 +572,20 @@ def block_sparse_gqa_prefill(
             ratio=ratio,
             groups=groups,
             words=words,
-            query_block=query_block,
-            width=native_query_width,
+            query_block=query_block // parts,
+            width=part_width,
         )
+        part_bits = block_bits_native.reshape(nblocks, parts, words, part_width)
         if paired_pages:
             active = jnp.any(
-                block_bits_native[:, : 2 * num_kv_tiles].reshape(
-                    nblocks, num_kv_tiles, 2 * native_query_width
+                part_bits[:, :, : words_per_tile * num_kv_tiles].reshape(
+                    nblocks, parts, num_kv_tiles, words_per_tile * part_width
                 )
                 != 0,
-                axis=2,
+                axis=(1, 3),
             )
         else:
-            active = jnp.any(block_bits_native[:, :num_kv_tiles] != 0, axis=2)
+            active = jnp.any(part_bits[:, :, :num_kv_tiles] != 0, axis=(1, 3))
         active_tiles = _compact_active(active)
         active_counts = jnp.sum(active, axis=1, dtype=jnp.int32)
         table = page_table.reshape(nblocks, query_block, -1)[:, 0]
@@ -566,8 +614,8 @@ def block_sparse_gqa_prefill(
         block_bits = bitset.reshape(nblocks, query_block, words)
         if paired_pages:
             active = jnp.any(
-                block_bits[:, :, : 2 * num_kv_tiles].reshape(
-                    nblocks, query_block, num_kv_tiles, 2
+                block_bits[:, :, : words_per_tile * num_kv_tiles].reshape(
+                    nblocks, query_block, num_kv_tiles, words_per_tile
                 )
                 != 0,
                 axis=(1, 3),
@@ -582,8 +630,17 @@ def block_sparse_gqa_prefill(
         active_tiles = _compact_active(active)
         active_counts = jnp.sum(active, axis=1, dtype=jnp.int32)
         table = page_table.reshape(nblocks, query_block, -1)[:, 0]
+    if parts > 1 and not envs.VLLM_TPU_QSA_PREFILL_BITSET_KERNEL:
+        block_bits_native = (
+            block_bits_native.reshape(nblocks, words, parts, part_width)
+            .transpose(0, 2, 1, 3)
+            .reshape(nblocks * parts, words, part_width)
+        )
 
-    query_tile = min(query_block, 256)
+    if query_tile is None:
+        query_tile = default_query_tile(query_block)
+    if query_block % query_tile or query_tile % 8:
+        raise ValueError("Query subtiles must evenly split the query block")
     bf16_mxu = (
         envs.VLLM_TPU_QSA_PREFILL_BF16_MXU
         and bf16_io
@@ -613,6 +670,7 @@ def block_sparse_gqa_prefill(
             v_scale=v_scale,
             **({"kv_head_offset": kv_head_offset} if kv_head_offset else {}),
             **({"bf16_mxu": True} if bf16_mxu else {}),
+            query_tile=query_tile,
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
@@ -623,7 +681,7 @@ def block_sparse_gqa_prefill(
                     lambda b, *_: (b, 0, 0),
                 ),
                 pl.BlockSpec(
-                    (1, words, native_query_width),
+                    (parts, words, part_width),
                     lambda b, *_: (b, 0, 0),
                 ),
                 pl.BlockSpec((query_block, 1), lambda b, *_: (b, 0)),
@@ -652,7 +710,9 @@ def block_sparse_gqa_prefill(
         compiler_params=pltpu.CompilerParams(
             dimension_semantics=("arbitrary",),
             vmem_limit_bytes=(
-                PAIRED_PAGE_VMEM_MIB[query_block]
+                PAIRED_PAGE_VMEM_MIB.get(
+                    query_block, max(PAIRED_PAGE_VMEM_MIB.values())
+                )
                 if paired_pages
                 else 61
                 if query_block > 128
@@ -699,10 +759,13 @@ def block_sparse_gqa_attention(
     query_block: int = 32,
     kv_tile: int = 128,
     kv_head_offset: int = 0,
+    query_tile: int | None = None,
 ):
     """Align requests, share KV tiles, then restore the original token order."""
     real = starts[1:] - starts[:-1]
     offset = {"kv_head_offset": kv_head_offset} if kv_head_offset else {}
+    if query_tile is not None:
+        offset["query_tile"] = query_tile
 
     def run_aligned(_):
         return block_sparse_gqa_prefill(
@@ -815,7 +878,9 @@ def _prepare_metadata_bounded(
     num_kv_tiles = (groups * ratio + kv_tile - 1) // kv_tile
     words_per_tile = kv_tile // (ratio * 32)
     words = ((num_kv_tiles * words_per_tile + 127) // 128) * 128
-    paired_pages = kv_tile == 256 and physical_page_size % 128 == 0 and ratio == 4
+    paired_pages = (
+        kv_tile in PAIRED_KV_TILES and physical_page_size % 128 == 0 and ratio == 4
+    )
     native_query_width = ((query_block + 127) // 128) * 128
     nblocks = tokens // query_block
 
@@ -842,7 +907,10 @@ def _prepare_metadata_bounded(
         )(indices, weights)
         if paired_pages:
             active = jnp.any(
-                bits[:, : 2 * num_kv_tiles].reshape(query_block, num_kv_tiles, 2) != 0,
+                bits[:, : words_per_tile * num_kv_tiles].reshape(
+                    query_block, num_kv_tiles, words_per_tile
+                )
+                != 0,
                 axis=(0, 2),
             )
         else:

@@ -310,8 +310,8 @@ def _prefill_attention(
         get_sparse_prefill_tiles,
     )
 
-    query_block, kv_tile = get_sparse_prefill_tiles(
-        query, cache, kv_heads=kv_heads, ratio=ratio
+    query_block, kv_tile, query_tile = get_sparse_prefill_tiles(
+        query, cache, kv_heads=kv_heads, ratio=ratio, with_query_tile=True
     )
     return block_sparse_gqa_attention(
         query,
@@ -328,6 +328,7 @@ def _prefill_attention(
         k_scale=k_scale,
         v_scale=v_scale,
         **({"kv_head_offset": kv_head_offset} if kv_head_offset else {}),
+        **({"query_tile": query_tile} if query_tile else {}),
     )
 
 
