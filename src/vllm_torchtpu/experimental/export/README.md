@@ -1,7 +1,8 @@
 # Experimental AOT export
 
 `python -m vllm_torchtpu.experimental.export` exports a vLLM model to a StableHLO
-serving directory (`metadata.json`, per-bucket MLIR modules, `serving_checkpoint/`).
+serving directory (`metadata.json`, per-bucket MLIR modules and, with
+`--export-mode checkpoint|all`, the weights in `serving_checkpoint/`).
 It takes the `vllm serve` engine arguments plus a few export options:
 
 ```bash
@@ -88,16 +89,15 @@ To export the same KV capacity, pass `--block-size 128 --num-blocks 8813`
 
 ## Real weights: `--export-mode`
 
-`weight.json` can only slice, transpose and concatenate checkpoint tensors, so it
-cannot express what vLLM does to some weights while loading them: FP8 checkpoints
-are dequantized and requantized to the runtime format, and checkpoint tensors are
-cast to the model dtype. For such models, save the weights vLLM actually serves
-with as an Orbax checkpoint (Zarr v2 arrays `array_{i}`, one per `abstract_params`
-input, without OCDBT) in `serving_checkpoint/data/`, in place of `weight.json`:
+The artifact's weights are the ones vLLM actually serves with, including what it
+does to some weights while loading them: FP8 checkpoints are dequantized and
+requantized to the runtime format, and checkpoint tensors are cast to the model
+dtype. They are saved as an Orbax checkpoint (Zarr v2 arrays `array_{i}`, one per
+`abstract_params` input, without OCDBT) in `serving_checkpoint/data/`:
 
 | `--export-mode` | Runs on | Weights loaded | Writes |
 |---|---|---|---|
-| `model` (default) | TPU | dummy | artifact + `weight.json` |
+| `model` (default) | TPU | dummy | artifact, without weights |
 | `checkpoint` | CPU | real | Orbax checkpoint into the existing artifact at `--output-dir` |
 | `all` | TPU | real, once | artifact + Orbax checkpoint |
 

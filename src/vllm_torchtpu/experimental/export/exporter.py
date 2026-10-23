@@ -117,16 +117,11 @@ def _state_sharding(shape: Sequence[int], tp_size: int) -> Sharding:
 class _TensorLayout:
     """How a weight or constant appears globally and in the lowered modules."""
 
-    shape: list[int]  # Global shape, as declared in metadata.json and weight.json.
+    shape: list[int]  # Global shape, as declared in metadata.json.
     sharding: Sharding
     lowered_shape: tuple[int, ...]  # Shard-local `@main` argument shape.
     # Shape `model.forward` reads, when it differs from `lowered_shape`.
     reshape: tuple[int, ...] | None = None
-    value: Any = None  # Inline global value of a constant.
-
-
-def _flatten(values: Sequence[Any]) -> list[Any]:
-    return [x for v in values for x in (v if isinstance(v, list) else [v])]
 
 
 def _tensor_layouts(
@@ -154,14 +149,12 @@ def _tensor_layouts(
                     sharding=["model", *_replicated(len(local))],
                     lowered_shape=(1, *local),
                     reshape=local,
-                    value=_flatten(values),
                 )
             else:
                 layouts[name] = _TensorLayout(
                     shape=list(local),
                     sharding=_replicated(len(local)),
                     lowered_shape=local,
-                    value=values[0],
                 )
             continue
         sharding = _mesh_sharding(
@@ -643,184 +636,6 @@ def _export_text_only_llm_functions(
     }
 
 
-def _sharded_dim(sharding: Sharding, axis_sizes: Mapping[str, int]) -> tuple[int, int]:
-    """`(dim, num_shards)` of the one dimension split over more than one device."""
-    split = [
-        (d, _axes_size(e, axis_sizes))
-        for d, e in enumerate(sharding)
-        if _axes_size(e, axis_sizes) > 1
-    ]
-    if len(split) > 1:
-        raise NotImplementedError(f"sharding {sharding} splits more than one dim")
-    return split[0] if split else (-1, 1)
-
-
-def _global_sources(
-    name: str,
-    sources: Sequence[dict[str, Any]],
-    local_shape: Sequence[int],
-    layout: _TensorLayout,
-    axis_sizes: Mapping[str, int],
-) -> list[dict[str, Any]]:
-    """Rewrites rank-local `sources` to assemble the slot's global array.
-
-    `sources` place full checkpoint tensors into one device's shard, each device
-    reading its own part. Device `c`'s part of a source is its `c`-th slice along
-    the sharded dimension, or, for a part held by `r` devices (KV heads replicated
-    over tensor parallel ranks), its `c // r`-th slice. A single source that is
-    already the whole global array is kept as is.
-    """
-    dim, num_shards = _sharded_dim(layout.sharding, axis_sizes)
-    if num_shards == 1:
-        return list(sources)
-    if len(sources) == 1 and not sources[0].get("dst_slices"):
-        src = sources[0]
-        perm = src.get("transpose")
-        full = list(src["source_shape"])
-        if not src.get("src_slices") and (
-            [full[p] for p in perm] if perm else full
-        ) == list(layout.shape):
-            return [src]
-
-    expanded: list[dict[str, Any]] = []
-    for c in range(num_shards):
-        for src in sources:
-            perm = src.get("transpose")
-            src_dim = perm[dim] if perm else dim
-            dst_slices = [dict(s) for s in src.get("dst_slices", [])]
-            dst = next((s for s in dst_slices if s["dim"] == dim), None)
-            if dst is None:
-                dst = {"dim": dim, "start": 0, "length": int(local_shape[dim])}
-                dst_slices.append(dst)
-            length = int(dst["length"])
-            full_len = int(src["source_shape"][src_dim])
-            if any(s["dim"] == src_dim for s in src.get("src_slices", [])):
-                raise NotImplementedError(
-                    f"{name}: source {src['source_tensor']} is already sliced along "
-                    f"its sharded dim {src_dim}"
-                )
-            if full_len == length * num_shards:
-                src_start = c * length
-            elif full_len % length == 0 and (length * num_shards) % full_len == 0:
-                src_start = (c // (length * num_shards // full_len)) * length
-            else:
-                raise ValueError(
-                    f"{name}: source {src['source_tensor']} dim {src_dim} of length "
-                    f"{full_len} does not split into {num_shards} shards of {length}"
-                )
-            entry = dict(src)
-            src_slices = [dict(s) for s in src.get("src_slices", [])]
-            if length != full_len:
-                src_slices.append(
-                    {"dim": src_dim, "start": src_start, "length": length}
-                )
-            if src_slices:
-                entry["src_slices"] = sorted(src_slices, key=lambda s: s["dim"])
-            dst["start"] = c * int(local_shape[dim]) + int(dst["start"])
-            entry["dst_slices"] = sorted(dst_slices, key=lambda s: s["dim"])
-            expanded.append(entry)
-    return expanded
-
-
-def _scale_unresolved_source(
-    src: dict[str, Any],
-    local_shape: Sequence[int],
-    layout: _TensorLayout,
-    axis_sizes: Mapping[str, int],
-) -> None:
-    """Scales a source missing from the checkpoint index up to its full shape.
-
-    Without the checkpoint, `source_shape` is this device's part; its full shape
-    is that part repeated once per shard along the sharded dimension.
-    """
-    dim, num_shards = _sharded_dim(layout.sharding, axis_sizes)
-    if num_shards == 1:
-        return
-    perm = src.get("transpose")
-    src_dim = perm[dim] if perm else dim
-    dst = next((s for s in src.get("dst_slices", []) if s["dim"] == dim), None)
-    length = int(dst["length"]) if dst else int(local_shape[dim])
-    shape = list(src["source_shape"])
-    shape[src_dim] = length * num_shards
-    src["source_shape"] = shape
-
-
-@trace("export.weight_json")
-def _emit_declarative_weight_json(
-    model: api.ExportableTextOnlyLLM,
-    params_map: Mapping[str, Any],
-    layouts: Mapping[str, _TensorLayout],
-    weight_slots: Mapping[str, int],
-    output_dir: str,
-    *,
-    constants: frozenset[str] = frozenset(),
-) -> None:
-    """Emits `serving_checkpoint/weight.json` from HF metadata; loads no tensors.
-
-    Every entry declares its slot's global `shape`, `dtype`, and `sharding`.
-    Weights assemble the global array from checkpoint tensors (`sources`, with
-    the checkpoint's full `source_shape`); constants carry it inline (`value`).
-    """
-    cfg = model.export_config
-    axis_sizes = _axis_sizes(cfg)
-    ckpt_dir = os.path.join(output_dir, "serving_checkpoint")
-    os.makedirs(ckpt_dir, exist_ok=True)
-
-    hf_meta: Mapping[str, Any] = {}
-    default_st = "model.safetensors"
-    if cfg.hf_checkpoint_dir:
-        hf_meta, default_st = weight_mapper.read_hf_safetensors_metadata(
-            cfg.hf_checkpoint_dir
-        )
-    checkpoint_shapes = weight_mapper.read_hf_safetensors_shapes(
-        cfg.hf_checkpoint_dir, hf_meta
-    )
-    torch_model = getattr(model, "model", None)
-
-    weight_map: dict[str, Any] = {}
-    # Source paths are relative to the checkpoint; record where it lives so a
-    # runtime can find the safetensors files without being told.
-    if cfg.hf_checkpoint_dir and os.path.isdir(cfg.hf_checkpoint_dir):
-        weight_map["hf_checkpoint_path"] = os.path.abspath(cfg.hf_checkpoint_dir)
-    for name, spec in params_map.items():
-        layout = layouts[name]
-        entry: dict[str, Any] = {
-            "index": weight_slots[name],
-            "shape": list(layout.shape),
-            "dtype": tpu_lowering.dtype_name(spec.dtype),
-            "sharding": list(layout.sharding),
-        }
-        if name in constants:
-            entry["value"] = layout.value
-            weight_map[name] = entry
-            continue
-        local_shape = [int(d) for d in spec.shape]
-        sources = weight_mapper.build_generic_weight_sources(
-            name,
-            local_shape,
-            model=torch_model,
-        )
-        resolved_sources = weight_mapper.expand_or_resolve_weight_sources(
-            name,
-            {"shape": local_shape, "sources": sources},
-            dict(hf_meta),
-            default_st,
-        )
-        for src in resolved_sources:
-            full_shape = checkpoint_shapes.get(src.get("source_tensor", ""))
-            if full_shape is not None:
-                src["source_shape"] = full_shape
-            else:
-                _scale_unresolved_source(src, local_shape, layout, axis_sizes)
-        entry["sources"] = _global_sources(
-            name, resolved_sources, local_shape, layout, axis_sizes
-        )
-        weight_map[name] = entry
-
-    with open(os.path.join(ckpt_dir, "weight.json"), "w") as f:
-        json.dump(weight_map, f, indent=2)
-
-
 def _emit_model_companion_files(
     cfg: api.TextOnlyLLMExportConfig, output_dir: str
 ) -> dict[str, Any]:
@@ -890,7 +705,6 @@ def export(
     output_dir: str,
     *,
     subdir: str = "subgraphs",
-    emit_weight_json: bool = True,
 ) -> None:
     """Exports an `ExportableTextOnlyLLM` to a serving artifact directory.
 
@@ -898,8 +712,6 @@ def export(
         model: The model to export.
         output_dir: Artifact directory; created if missing.
         subdir: Subdirectory of `output_dir` for `.mlir` files (default `'subgraphs'`).
-        emit_weight_json: When True, emits declarative `serving_checkpoint/weight.json`
-            from HF metadata without loading tensor data.
     """
     if not isinstance(model, api.ExportableTextOnlyLLM):
         raise TypeError(
@@ -984,13 +796,3 @@ def export(
         json.dump(metadata_doc, f, indent=2)
 
     validator.validate_exported_model_dir(output_dir)
-
-    if emit_weight_json:
-        _emit_declarative_weight_json(
-            model,
-            params_map,
-            layouts,
-            weight_slots,
-            output_dir,
-            constants=constants,
-        )

@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import json
 import os
-import struct
 from collections.abc import Mapping, Sequence
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,7 +36,6 @@ from vllm_torchtpu.experimental.export import (
     tpu_lowering,
     universal_adapter,
     validator,
-    weight_mapper,
 )
 
 
@@ -297,7 +295,7 @@ def test_exportable_protocol_completeness() -> None:
     assert int(pen[0, 0].item()) == 3
 
 
-def test_end_to_end_export_declarative_weights_only(tmp_path) -> None:
+def test_end_to_end_export_writes_no_weights(tmp_path) -> None:
     cfg = api.TextOnlyLLMExportConfig(
         model_name="tiny-torch",
         vocab_size=32,
@@ -341,11 +339,8 @@ def test_end_to_end_export_declarative_weights_only(tmp_path) -> None:
     assert os.path.isfile(
         os.path.join(out_dir, "subgraphs", "sample_tokens_penalized_req4.mlir")
     )
-    # Only declarative weight.json is emitted; no constants.safetensors is written
-    assert os.path.isfile(os.path.join(out_dir, "serving_checkpoint", "weight.json"))
-    assert not os.path.exists(
-        os.path.join(out_dir, "serving_checkpoint", "constants.safetensors")
-    )
+    # Weights ship only as the checkpoint of `--export-mode checkpoint|all`.
+    assert not os.path.exists(os.path.join(out_dir, "serving_checkpoint"))
 
 
 @pytest.fixture
@@ -379,39 +374,6 @@ def test_universal_adapter_1d_and_2d_mrope_export_and_cli(tmp_path) -> None:
             },
             f,
         )
-    header = {
-        "model.embed_tokens.weight": {
-            "dtype": "BF16",
-            "shape": [64, 32],
-            "data_offsets": [0, 4096],
-        },
-        "model.layers.0.weight": {
-            "dtype": "BF16",
-            "shape": [32, 32],
-            "data_offsets": [4096, 6144],
-        },
-        "model.layers.1.weight": {
-            "dtype": "BF16",
-            "shape": [32, 32],
-            "data_offsets": [6144, 8192],
-        },
-        "lm_head.weight": {
-            "dtype": "BF16",
-            "shape": [64, 32],
-            "data_offsets": [8192, 12288],
-        },
-    }
-    hb = json.dumps(header).encode("utf-8")
-    with open(hf_dir / "model.safetensors", "wb") as f:
-        f.write(struct.pack("<Q", len(hb)))
-        f.write(hb)
-
-    hf_meta, default_st = weight_mapper.read_hf_safetensors_metadata(str(hf_dir))
-    assert default_st == "model.safetensors"
-    assert hf_meta["model.embed_tokens.weight"] == "model.safetensors"
-    st_header = weight_mapper.read_safetensors_header(hf_dir / "model.safetensors")
-    assert st_header["model.embed_tokens.weight"]["shape"] == [64, 32]
-
     pt_model = _TinyPyTorchCausalLM(
         vocab_size=64,
         hidden_size=32,
@@ -482,13 +444,9 @@ def test_universal_adapter_1d_and_2d_mrope_export_and_cli(tmp_path) -> None:
     pos_entry = next(inp for inp in fwd8_inputs if inp["name"] == "positions")
     assert pos_entry["shape"] == [3, 8]
 
-    with open(os.path.join(out_dir, "serving_checkpoint", "weight.json")) as f:
-        wjson = json.load(f)
-    assert "mesh" not in wjson
     assert meta["mlir_shapes"] == "shard_local"
     assert meta["mesh"] == {"mesh_shape": [1, 1], "axis_names": ["data", "model"]}
-    assert wjson["lm_head.weight"]["sources"][0]["path"] == "model.safetensors"
-    assert wjson["hf_checkpoint_path"] == os.path.abspath(hf_dir)
+    assert not os.path.exists(os.path.join(out_dir, "serving_checkpoint"))
 
 
 def test_build_export_config_raises_block_size_to_fit_smem(tmp_path: Path) -> None:
@@ -571,35 +529,6 @@ def test_fit_num_blocks_to_hbm_rejects_a_budget_without_room_for_a_block() -> No
         pytest.raises(ValueError, match="gpu-memory-utilization"),
     ):
         adapter.fit_num_blocks_to_hbm(0.9, devices=["tpu:0"])
-
-
-def test_module_derived_gate_up_sources_beat_name_heuristic() -> None:
-    # Qwen3-0.6B: gate_up_proj is stored `[in=1024, 2*inter=6144]`, so the
-    # shape-only rule would mistake it for `[2*half, in]` and skip the transpose.
-    tensor_to_file = {
-        "model.layers.0.mlp.gate_proj.weight": "model.safetensors",
-        "model.layers.0.mlp.up_proj.weight": "model.safetensors",
-    }
-    module_sources = [
-        {
-            "path": "",
-            "source_tensor": f"model.layers.0.mlp.{sub}.weight",
-            "source_shape": [3072, 1024],
-            "transpose": [1, 0],
-            "dst_slices": [{"dim": 1, "start": start, "length": 3072}],
-        }
-        for sub, start in (("gate_proj", 0), ("up_proj", 3072))
-    ]
-    sources = weight_mapper.expand_or_resolve_weight_sources(
-        "model.layers.0.mlp.gate_up_proj.weight",
-        {"shape": [1024, 6144], "sources": module_sources},
-        tensor_to_file,
-        "model.safetensors",
-    )
-    assert [s["source_shape"] for s in sources] == [[3072, 1024], [3072, 1024]]
-    assert all(s["transpose"] == [1, 0] for s in sources)
-    assert [s["dst_slices"][0]["start"] for s in sources] == [0, 3072]
-    assert all(s["path"] == "model.safetensors" for s in sources)
 
 
 def test_companion_files_are_copied_and_declared_in_serving_config(tmp_path) -> None:
@@ -758,12 +687,9 @@ def test_resolve_hf_checkpoint_dir_uses_cached_hub_snapshot(tmp_path: Path) -> N
             resolve("org/missing")
 
 
-def _tp2_model(hf_dir: Path, constant_values: Mapping[str, list[Any]]) -> Any:
+def _tp2_model(constant_values: Mapping[str, list[Any]]) -> Any:
     cfg = api.TextOnlyLLMExportConfig(
-        model_name="tiny",
-        vocab_size=64,
-        hf_checkpoint_dir=str(hf_dir),
-        num_partitions=2,
+        model_name="tiny", vocab_size=64, num_partitions=2
     )
     return SimpleNamespace(
         export_config=cfg,
@@ -772,28 +698,12 @@ def _tp2_model(hf_dir: Path, constant_values: Mapping[str, list[Any]]) -> Any:
     )
 
 
-def _write_safetensors_header(hf_dir: Path, shapes: Mapping[str, list[int]]) -> None:
-    hf_dir.mkdir()
-    header = {
-        name: {"dtype": "BF16", "shape": shape, "data_offsets": [0, 0]}
-        for name, shape in shapes.items()
-    }
-    hb = json.dumps(header).encode("utf-8")
-    with open(hf_dir / "model.safetensors", "wb") as f:
-        f.write(struct.pack("<Q", len(hb)))
-        f.write(hb)
-
-
-def test_weight_json_declares_global_shapes_and_inline_constants(
-    tmp_path: Path,
-) -> None:
-    hf_dir = tmp_path / "hf"
-    _write_safetensors_header(hf_dir, {"model.embed_tokens.weight": [64, 8]})
+def test_tensor_layouts_declare_global_shapes_of_weights_and_constants() -> None:
     values = {
         "model.embed_tokens.org_vocab_start_index": [0, 32],
         "model.embed_tokens.added_vocab_start_index": [64, 64],
     }
-    model = _tp2_model(hf_dir, values)
+    model = _tp2_model(values)
     # Rank-local shapes of a tensor-parallel size 2 export.
     params = {
         "model.embed_tokens.weight": api.ShapeDtypeStruct(
@@ -802,139 +712,23 @@ def test_weight_json_declares_global_shapes_and_inline_constants(
         "model.embed_tokens.org_vocab_start_index": api.ShapeDtypeStruct((), "i64"),
         "model.embed_tokens.added_vocab_start_index": api.ShapeDtypeStruct((), "i64"),
     }
-    constants = frozenset(values)
     layouts = exporter._tensor_layouts(
-        model, params, constants, exporter._axis_sizes(model.export_config)
-    )
-    out_dir = tmp_path / "artifact"
-    exporter._emit_declarative_weight_json(
-        model,
-        params,
-        layouts,
-        {n: 6 + i for i, n in enumerate(params)},
-        str(out_dir),
-        constants=constants,
+        model, params, frozenset(values), exporter._axis_sizes(model.export_config)
     )
 
-    wjson = json.loads((out_dir / "serving_checkpoint" / "weight.json").read_text())
-    assert "mesh" not in wjson
-    # The checkpoint tensor is the whole global array, so one source suffices.
-    assert wjson["model.embed_tokens.weight"] == {
-        "index": 6,
-        "shape": [64, 8],
-        "dtype": "bf16",
-        "sharding": ["model", None],
-        "sources": [
-            {
-                "path": "model.safetensors",
-                "source_tensor": "model.embed_tokens.weight",
-                "source_shape": [64, 8],
-            }
-        ],
-    }
+    assert layouts["model.embed_tokens.weight"] == exporter._TensorLayout(
+        shape=[64, 8], sharding=["model", None], lowered_shape=(32, 8)
+    )
     # A per-device value is a sharded global array; each device holds `[1]`.
-    assert wjson["model.embed_tokens.org_vocab_start_index"] == {
-        "index": 7,
-        "shape": [2],
-        "dtype": "i64",
-        "sharding": ["model"],
-        "value": [0, 32],
-    }
-    assert layouts["model.embed_tokens.org_vocab_start_index"].lowered_shape == (1,)
-    assert layouts["model.embed_tokens.org_vocab_start_index"].reshape == ()
+    assert layouts["model.embed_tokens.org_vocab_start_index"] == (
+        exporter._TensorLayout(
+            shape=[2], sharding=["model"], lowered_shape=(1,), reshape=()
+        )
+    )
     # A value shared by every device stays a replicated scalar.
-    assert wjson["model.embed_tokens.added_vocab_start_index"] == {
-        "index": 8,
-        "shape": [],
-        "dtype": "i64",
-        "sharding": [],
-        "value": 64,
-    }
-
-
-def _qkv_sources(q: int, kv: int, in_dim: int) -> list[dict[str, Any]]:
-    """Rank-local fused QKV sources, as `build_generic_weight_sources` emits."""
-    sources, start = [], 0
-    for proj, length, full in (("q", q, 2 * q), ("k", kv, 1024), ("v", kv, 1024)):
-        sources.append(
-            {
-                "path": "model.safetensors",
-                "source_tensor": f"model.layers.0.self_attn.{proj}_proj.weight",
-                "source_shape": [full, in_dim],
-                "transpose": [1, 0],
-                "dst_slices": [{"dim": 1, "start": start, "length": length}],
-            }
-        )
-        start += length
-    return sources
-
-
-def test_global_sources_concatenate_fused_qkv_shards() -> None:
-    # Qwen3-0.6B at tensor parallel size 2 (the RFC 0001 weight.json example).
-    layout = exporter._TensorLayout(
-        shape=[1024, 4096], sharding=[None, "model"], lowered_shape=(1024, 2048)
+    assert layouts["model.embed_tokens.added_vocab_start_index"] == (
+        exporter._TensorLayout(shape=[], sharding=[], lowered_shape=())
     )
-    sources = exporter._global_sources(
-        "model.layers.0.self_attn.qkv_proj.weight",
-        _qkv_sources(1024, 512, 1024),
-        [1024, 2048],
-        layout,
-        {"data": 1, "model": 2},
-    )
-    got = [
-        (
-            s["source_tensor"].split(".")[-2],
-            s["src_slices"][0]["start"],
-            s["dst_slices"][0]["start"],
-        )
-        for s in sources
-    ]
-    assert got == [
-        ("q_proj", 0, 0),
-        ("k_proj", 0, 1024),
-        ("v_proj", 0, 1536),
-        ("q_proj", 1024, 2048),
-        ("k_proj", 512, 3072),
-        ("v_proj", 512, 3584),
-    ]
-    assert all(s["src_slices"][0]["dim"] == 0 for s in sources)
-    assert all(s["dst_slices"][0]["dim"] == 1 for s in sources)
-
-
-def test_global_sources_repeat_kv_heads_shared_by_several_ranks() -> None:
-    # 2 KV heads of 256 rows over 4 ranks: ranks 0-1 hold head 0, ranks 2-3 head 1.
-    kv_sources = [
-        {
-            "path": "model.safetensors",
-            "source_tensor": "model.layers.0.self_attn.k_proj.weight",
-            "source_shape": [512, 64],
-            "transpose": [1, 0],
-            "dst_slices": [{"dim": 1, "start": 0, "length": 256}],
-        }
-    ]
-    layout = exporter._TensorLayout(
-        shape=[64, 1024], sharding=[None, "model"], lowered_shape=(64, 256)
-    )
-    sources = exporter._global_sources(
-        "k", kv_sources, [64, 256], layout, {"data": 1, "model": 4}
-    )
-    assert [s["src_slices"][0]["start"] for s in sources] == [0, 0, 256, 256]
-    assert [s["dst_slices"][0]["start"] for s in sources] == [0, 256, 512, 768]
-
-
-def test_global_sources_reject_a_source_that_does_not_split_evenly() -> None:
-    layout = exporter._TensorLayout(
-        shape=[64, 96], sharding=[None, "model"], lowered_shape=(64, 32)
-    )
-    src = {
-        "path": "model.safetensors",
-        "source_tensor": "w",
-        "source_shape": [100, 64],
-        "transpose": [1, 0],
-        "dst_slices": [{"dim": 1, "start": 0, "length": 32}],
-    }
-    with pytest.raises(ValueError, match="does not split into 3 shards"):
-        exporter._global_sources("w", [src], [64, 32], layout, {"model": 3})
 
 
 def test_set_aliasing_outputs_pairs_each_donor_with_its_result() -> None:
@@ -1155,7 +949,6 @@ def test_launch_workers_all_mode_saves_into_the_output_dir(tmp_path: Path) -> No
     out_dir = tmp_path / "out"
     stale = out_dir / "serving_checkpoint" / "data"
     stale.mkdir(parents=True)
-    (out_dir / "serving_checkpoint" / "weight.json").write_text("{}")
     envs: list[Mapping[str, str]] = []
 
     class Recording(_FakeWorker):
@@ -1170,4 +963,3 @@ def test_launch_workers_all_mode_saves_into_the_output_dir(tmp_path: Path) -> No
         cli._launch_workers(["--model", "m"], 2, str(out_dir), save_checkpoint=True)
     assert {e[checkpoint.DATA_DIR_ENV] for e in envs} == {os.path.abspath(stale)}
     assert not stale.exists()
-    assert not (out_dir / "serving_checkpoint" / "weight.json").exists()

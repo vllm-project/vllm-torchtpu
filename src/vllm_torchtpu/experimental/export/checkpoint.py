@@ -13,11 +13,11 @@
 # limitations under the License.
 """Saves the weights vLLM serves with as an Orbax checkpoint of an artifact.
 
-`weight.json` can only slice, transpose and concatenate checkpoint tensors, so it
-cannot describe weights that vLLM computes while loading (FP8 requantization,
-dtype casts). The `checkpoint` and `all` export modes instead save every
-`abstract_params` input `i` as array `array_{i}` of an Orbax checkpoint (Zarr v2,
-no OCDBT) in `serving_checkpoint/data`, from the weights of the loaded model:
+An artifact's weights are the ones vLLM serves with, including any it computes
+while loading (FP8 requantization, dtype casts). The `checkpoint` and `all`
+export modes save every `abstract_params` input `i` as array `array_{i}` of an
+Orbax checkpoint (Zarr v2, no OCDBT) in `serving_checkpoint/data`, from the
+weights of the loaded model:
 one process per tensor-parallel rank (a CPU process for `checkpoint`, the TPU
 export worker for `all`) saves its rank's shards. The processes join a JAX
 distributed runtime before any JAX use, and the arrays are laid out on a mesh of
@@ -281,13 +281,6 @@ def run_cpu_load_worker(args: argparse.Namespace) -> None:
     )
 
 
-def remove_weight_json(artifact_dir: str) -> None:
-    """Removes `weight.json`, which a checkpoint's arrays replace."""
-    path = os.path.join(artifact_dir, "serving_checkpoint", "weight.json")
-    if os.path.exists(path):
-        os.remove(path)
-
-
 def launch_cpu_workers(
     argv: Sequence[str],
     tp_size: int,
@@ -329,4 +322,3 @@ def export_checkpoint(argv: Sequence[str], tp_size: int, output_dir: str) -> Non
         )
     shutil.rmtree(os.path.join(output_dir, CHECKPOINT_DATA_DIR), ignore_errors=True)
     launch_cpu_workers(argv, tp_size, "--export-worker")
-    remove_weight_json(output_dir)

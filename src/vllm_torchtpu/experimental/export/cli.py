@@ -174,13 +174,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
         choices=EXPORT_MODES,
         default="model",
         help=(
-            "'model' (default): export the artifact with dummy weights and a "
-            "declarative serving_checkpoint/weight.json. 'checkpoint': on CPU, load "
-            "the real weights through vLLM and save them as an Orbax checkpoint in "
-            "the existing artifact at --output-dir. 'all': on TPU, load the real "
-            "weights once, export the artifact and save them as an Orbax checkpoint. "
-            "Use 'checkpoint' or 'all' when vLLM changes weights while loading them "
-            "(e.g. FP8 requantization), which weight.json cannot express."
+            "'model' (default): export the artifact, traced with dummy weights, "
+            "and save no weights. 'checkpoint': on CPU, load the real weights "
+            "through vLLM and save them as an Orbax checkpoint in the existing "
+            "artifact at --output-dir. 'all': on TPU, load the real weights once, "
+            "export the artifact and save them as an Orbax checkpoint."
         ),
     )
     # Internal: marks a worker process started by `main`.
@@ -272,9 +270,7 @@ def run_export_from_args(
 
     if export_mode == "all":
         weights = checkpoint.host_tensors(getattr(exportable, "model", exportable))
-    exporter.export(
-        exportable, args.output_dir, emit_weight_json=export_mode == "model"
-    )
+    exporter.export(exportable, args.output_dir)
     if export_mode == "all":
         checkpoint.save_model_checkpoint(
             weights,
@@ -348,8 +344,6 @@ def _launch_workers(
         shutil.copytree(
             os.path.join(rank_root, "rank0"), output_dir, dirs_exist_ok=True
         )
-        if save_checkpoint:
-            checkpoint.remove_weight_json(output_dir)
     finally:
         for proc in procs:
             if proc.poll() is None:

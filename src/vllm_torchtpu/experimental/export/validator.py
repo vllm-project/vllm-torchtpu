@@ -82,7 +82,7 @@ _DTYPE_ALIASES = {
 }
 
 
-# Element type names `metadata.json` and `weight.json` spell dtypes with.
+# Element type names `metadata.json` spells dtypes with.
 STABLEHLO_DTYPES = frozenset(
     {
         "i1",

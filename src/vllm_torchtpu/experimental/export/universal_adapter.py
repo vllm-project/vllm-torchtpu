@@ -413,7 +413,8 @@ def load_vllm_model(vllm_config: Any, *, load_format: str) -> nn.Module:
             return model
 
 
-# Constants are written inline into weight.json, so only small buffers qualify.
+# Constant values are gathered from every rank to lay them out, so only small
+# buffers qualify.
 _MAX_CONSTANT_ELEMENTS = 4096
 
 
@@ -612,8 +613,8 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         buf = dict(self._model.named_buffers())[name]
         if buf.numel() > _MAX_CONSTANT_ELEMENTS:
             raise ValueError(
-                f"buffer {name} has {buf.numel()} elements; constants are declared "
-                f"inline in weight.json and are limited to {_MAX_CONSTANT_ELEMENTS}"
+                f"buffer {name} has {buf.numel()} elements; constants are limited "
+                f"to {_MAX_CONSTANT_ELEMENTS}"
             )
         local = buf.detach().cpu().flatten().tolist()
         value = local[0] if buf.dim() == 0 else local

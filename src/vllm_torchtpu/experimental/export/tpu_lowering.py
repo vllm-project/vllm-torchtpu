@@ -30,7 +30,7 @@ from vllm_torchtpu.experimental.export.trace import trace
 
 @dataclasses.dataclass(frozen=True)
 class _DtypeSpec:
-    # StableHLO element type name: the spelling of `metadata.json` and `weight.json`.
+    # StableHLO element type name: the spelling of `metadata.json`.
     canonical: str
     torch_dtype: torch.dtype | None
     torch_name: str
