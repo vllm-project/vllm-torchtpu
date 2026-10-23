@@ -9,6 +9,7 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.experimental.batched_rpa import utils
 from vllm_torchtpu.kernels.qwen4_exp.prefill_tiles import PAIRED_PAGE_VMEM_MIB
 from vllm_torchtpu.kernels.qwen4_exp.rounding import bf16
@@ -44,6 +45,139 @@ def _compact_active(active):
     return compact[..., :size]
 
 
+def _selection_words(blocks, lengths, *, ratio, groups):
+    """Per-selection mask word index and bit; invalid entries get -1 and 0.
+
+    The selected groups are the indexer's blocks plus the partial tail group
+    of a query whose length is not a multiple of ``ratio``.
+    """
+    tail = lengths // ratio
+    selected = jnp.concatenate((blocks, tail[:, None]), axis=1)
+    valid = jnp.concatenate(
+        (
+            (blocks >= 0) & (blocks < groups),
+            ((lengths > 0) & (lengths % ratio != 0) & (tail < groups))[:, None],
+        ),
+        axis=1,
+    )
+    word = jnp.where(valid, selected // 32, -1)
+    bit = jnp.where(valid, jnp.int32(1) << (selected % 32), 0)
+    return word, bit
+
+
+def _scatter_bitset(blocks, lengths, *, ratio, groups, words):
+    """int32[tokens, words] selection bitset by a per-row scatter-add.
+
+    XLA:TPU sorts every (row, word) index of this scatter because the
+    indices repeat; this is the reference for ``_selection_bitset``.
+    """
+    word, bit = _selection_words(blocks, lengths, ratio=ratio, groups=groups)
+    invalid = words + jnp.arange(word.shape[1], dtype=jnp.int32)
+    indices = jnp.where(word >= 0, word, invalid[None, :])
+    return jax.vmap(
+        lambda row, weight: (
+            jnp.zeros((words,), jnp.int32).at[row].add(weight, mode="drop")
+        )
+    )(indices, bit)
+
+
+def _bitset_kernel(first_ref, end_ref, word_ref, bit_ref, out_ref):
+    """Fill one query block's ``[words, width]`` bitset, eight words a step.
+
+    Each step compares every selection of the block against eight word
+    indices. Selections sit on sublanes and queries on lanes, so the
+    selection reduction is elementwise until one final sublane all-reduce.
+    Adding the bits reproduces the scatter-add exactly, duplicates included.
+    """
+    block = pl.program_id(0)
+    rows, width = word_ref.shape[1:]
+    out_ref[...] = jnp.zeros(out_ref.shape, jnp.int32)
+    sublane = lax.broadcasted_iota(jnp.int32, (8, width), 0)
+
+    def group(index, _):
+        base = index * 8
+
+        def accumulate(chunk, accs):
+            start = pl.multiple_of(chunk * 8, 8)
+            word = word_ref[0, pl.ds(start, 8), :]
+            bit = bit_ref[0, pl.ds(start, 8), :]
+            return tuple(
+                acc + jnp.where(word == base + k, bit, 0) for k, acc in enumerate(accs)
+            )
+
+        accs = lax.fori_loop(
+            0,
+            rows // 8,
+            accumulate,
+            tuple(jnp.zeros((8, width), jnp.int32) for _ in range(8)),
+            unroll=5 if (rows // 8) % 5 == 0 else 1,
+        )
+        slab = jnp.zeros((8, width), jnp.int32)
+        for k, acc in enumerate(accs):
+            for shift in (4, 2, 1):
+                acc = acc + pltpu.roll(acc, shift, 0)
+            slab = jnp.where(sublane == k, acc, slab)
+        out_ref[0, pl.ds(pl.multiple_of(base, 8), 8), :] = slab
+        return None
+
+    lax.fori_loop(first_ref[block], end_ref[block], group, None)
+
+
+def _selection_bitset(
+    blocks,
+    lengths,
+    *,
+    ratio,
+    groups,
+    words,
+    query_block,
+    width,
+    interpret=False,
+):
+    """int32[blocks, words, width] selection bitset without a scatter.
+
+    Equals ``_scatter_bitset`` reshaped to query blocks, transposed to
+    word-major rows and zero padded to ``width`` query lanes. Each block only
+    visits the eight-word groups between its smallest and largest selected
+    word, so the cost follows the context length instead of a global sort
+    over every selection.
+    """
+    tokens = blocks.shape[0]
+    nblocks = tokens // query_block
+    word, bit = _selection_words(blocks, lengths, ratio=ratio, groups=groups)
+    rows = (word.shape[1] + 7) // 8 * 8
+
+    def layout(array, fill):
+        array = array.reshape(nblocks, query_block, -1).transpose(0, 2, 1)
+        return jnp.pad(
+            array,
+            ((0, 0), (0, rows - array.shape[1]), (0, width - query_block)),
+            constant_values=fill,
+        )
+
+    per_block = word.reshape(nblocks, -1)
+    lowest = jnp.min(jnp.where(per_block >= 0, per_block, words), axis=1)
+    highest = jnp.max(per_block, axis=1)
+    first = lowest // 8
+    end = jnp.where(highest >= 0, highest // 8 + 1, 0)
+    return pl.pallas_call(
+        _bitset_kernel,
+        grid_spec=pltpu.PrefetchScalarGridSpec(
+            num_scalar_prefetch=2,
+            grid=(nblocks,),
+            in_specs=[
+                pl.BlockSpec((1, rows, width), lambda b, *_: (b, 0, 0)),
+                pl.BlockSpec((1, rows, width), lambda b, *_: (b, 0, 0)),
+            ],
+            out_specs=pl.BlockSpec((1, words, width), lambda b, *_: (b, 0, 0)),
+        ),
+        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        out_shape=jax.ShapeDtypeStruct((nblocks, words, width), jnp.int32),
+        interpret=interpret,
+        name="qsa_prefill_selection_bitset",
+    )(first, end, layout(word, -1), layout(bit, 0))
+
+
 def _kernel(
     table_ref,
     active_tiles_ref,
@@ -75,6 +209,7 @@ def _kernel(
     k_scale: float,
     v_scale: float,
     kv_head_offset: int = 0,
+    bf16_mxu: bool = False,
 ):
     block = pl.program_id(0)
     # The model produces BF16 queries.  A BF16 call boundary can avoid a large
@@ -85,6 +220,10 @@ def _kernel(
         .reshape(query_block, kv_heads, q_heads_per_kv, head_dim)
         .transpose(1, 2, 0, 3)
     )
+    # BF16 queries and BF16/FP8 KV values are exact in BF16, so one BF16 MXU
+    # pass with FP32 accumulation forms the same QK products as an FP32 dot,
+    # which Mosaic runs as a multi-pass FP32 matmul.
+    q16 = q.astype(jnp.bfloat16) if bf16_mxu else None
     positions = lengths_ref[:, 0] - 1
     row = jnp.arange(kv_tile, dtype=jnp.int32)
     count = active_counts_ref[block]
@@ -194,7 +333,15 @@ def _kernel(
                 mass = mass_ref[query_tile_index, head, :]
                 acc = accumulator_ref[query_tile_index, head, :, :]
                 rows = query_tile * q_heads_per_kv
-                query = q[head, :, start : start + query_tile].reshape(rows, head_dim)
+                if bf16_mxu:
+                    query = q16[head, :, start : start + query_tile].reshape(
+                        rows, head_dim
+                    )
+                    key = key.astype(jnp.bfloat16)
+                else:
+                    query = q[head, :, start : start + query_tile].reshape(
+                        rows, head_dim
+                    )
                 score = lax.dot(
                     query,
                     key,
@@ -214,12 +361,31 @@ def _kernel(
                 finite_m = jnp.where(jnp.isneginf(next_m), 0.0, next_m)
                 prob = jnp.exp(score - finite_m[:, None])
                 alpha = jnp.where(jnp.isneginf(next_m), 1.0, jnp.exp(m - next_m))
-                weighted = lax.dot(
-                    prob,
-                    value,
-                    dimension_numbers=(([1], [0]), ([], [])),
-                    preferred_element_type=jnp.float32,
-                )
+                if bf16_mxu:
+                    # Values are exact in BF16; split the FP32 probabilities
+                    # into two BF16 terms (about 16 mantissa bits), i.e. the
+                    # BF16x3 product without its zero value-residual pass.
+                    value16 = value.astype(jnp.bfloat16)
+                    high = prob.astype(jnp.bfloat16)
+                    low = (prob - high.astype(jnp.float32)).astype(jnp.bfloat16)
+                    weighted = lax.dot(
+                        high,
+                        value16,
+                        dimension_numbers=(([1], [0]), ([], [])),
+                        preferred_element_type=jnp.float32,
+                    ) + lax.dot(
+                        low,
+                        value16,
+                        dimension_numbers=(([1], [0]), ([], [])),
+                        preferred_element_type=jnp.float32,
+                    )
+                else:
+                    weighted = lax.dot(
+                        prob,
+                        value,
+                        dimension_numbers=(([1], [0]), ([], [])),
+                        preferred_element_type=jnp.float32,
+                    )
                 max_ref[query_tile_index, head, :] = next_m
                 mass_ref[query_tile_index, head, :] = mass * alpha + jnp.sum(
                     prob, axis=1
@@ -352,7 +518,30 @@ def block_sparse_gqa_prefill(
     words = ((num_kv_tiles * words_per_tile + 127) // 128) * 128
     nblocks = tokens // query_block
     native_query_width = ((query_block + 127) // 128) * 128
-    if paired_pages and query_block == 256 and tokens * words * 4 >= 16 * 1024**2:
+    if envs.VLLM_TPU_QSA_PREFILL_BITSET_KERNEL:
+        block_bits_native = _selection_bitset(
+            blocks,
+            lengths,
+            ratio=ratio,
+            groups=groups,
+            words=words,
+            query_block=query_block,
+            width=native_query_width,
+        )
+        if paired_pages:
+            active = jnp.any(
+                block_bits_native[:, : 2 * num_kv_tiles].reshape(
+                    nblocks, num_kv_tiles, 2 * native_query_width
+                )
+                != 0,
+                axis=2,
+            )
+        else:
+            active = jnp.any(block_bits_native[:, :num_kv_tiles] != 0, axis=2)
+        active_tiles = _compact_active(active)
+        active_counts = jnp.sum(active, axis=1, dtype=jnp.int32)
+        table = page_table.reshape(nblocks, query_block, -1)[:, 0]
+    elif paired_pages and query_block == 256 and tokens * words * 4 >= 16 * 1024**2:
         batch = 8
         while batch > 1 and batch * query_block * words * 4 >= 16 * 1024**2:
             batch //= 2
@@ -369,23 +558,9 @@ def block_sparse_gqa_prefill(
             )
         )
     else:
-        tail = lengths // ratio
-        selected = jnp.concatenate((blocks, tail[:, None]), axis=1)
-        valid = jnp.concatenate(
-            (
-                (blocks >= 0) & (blocks < groups),
-                ((lengths > 0) & (lengths % ratio != 0) & (tail < groups))[:, None],
-            ),
-            axis=1,
+        bitset = _scatter_bitset(
+            blocks, lengths, ratio=ratio, groups=groups, words=words
         )
-        invalid = words + jnp.arange(blocks.shape[1] + 1, dtype=jnp.int32)
-        indices = jnp.where(valid, selected // 32, invalid[None, :])
-        weights = jnp.where(valid, jnp.int32(1) << (selected % 32), 0)
-        bitset = jax.vmap(
-            lambda row, weight: (
-                jnp.zeros((words,), jnp.int32).at[row].add(weight, mode="drop")
-            )
-        )(indices, weights)
 
         nblocks = tokens // query_block
         block_bits = bitset.reshape(nblocks, query_block, words)
@@ -409,6 +584,12 @@ def block_sparse_gqa_prefill(
         table = page_table.reshape(nblocks, query_block, -1)[:, 0]
 
     query_tile = min(query_block, 256)
+    bf16_mxu = (
+        envs.VLLM_TPU_QSA_PREFILL_BF16_MXU
+        and bf16_io
+        and query_tile % 16 == 0
+        and cache.dtype in (jnp.float8_e4m3fn, jnp.bfloat16)
+    )
     state_shape = (
         query_block // query_tile,
         kv_heads,
@@ -431,6 +612,7 @@ def block_sparse_gqa_prefill(
             k_scale=k_scale,
             v_scale=v_scale,
             **({"kv_head_offset": kv_head_offset} if kv_head_offset else {}),
+            **({"bf16_mxu": True} if bf16_mxu else {}),
         ),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=3,
