@@ -89,7 +89,9 @@ def _prefill_kernel(
         non_causal=non_causal,
     )
     read_start = jnp.minimum(t0, positions_ref.shape[0] - bq)
-    position_start -= t0 - read_start
+    row_offset = t0 - read_start
+    valid_count = tiles_ref[tile, 2]
+    position_start -= row_offset
     t0 = read_start
     active = request < swa_page_ref.shape[0]
     request = jnp.minimum(request, swa_page_ref.shape[0] - 1)
@@ -306,10 +308,11 @@ def _prefill_kernel(
                 mode="promise_in_bounds",
             )
             rotated = tail * rope_ref[i, 0][None, :] + partner * rope_ref[i, 1][None, :]
-            output_ref[i, :, :384] = jnp.where(active, output[:, :384], 0).astype(
+            valid = active & (i >= row_offset) & (i < row_offset + valid_count)
+            output_ref[i, :, :384] = jnp.where(valid, output[:, :384], 0).astype(
                 jnp.bfloat16
             )
-            output_ref[i, :, 384:] = jnp.where(active, rotated, 0).astype(jnp.bfloat16)
+            output_ref[i, :, 384:] = jnp.where(valid, rotated, 0).astype(jnp.bfloat16)
 
     for first in range(0, bq, swa_capacity):
         size = min(swa_capacity, bq - first)
@@ -517,7 +520,16 @@ def csa2_prefill(
             scale,
         )
     bq = min(bq, tokens)
-    tiles, num_tiles = _tile_plan(starts, tokens, bq)
+    direct_output = batch == 1 and tokens % bq == 0
+    if direct_output:
+        offsets = jnp.arange(tokens // bq, dtype=jnp.int32) * bq
+        counts = jnp.clip(starts[-1] - offsets, 0, bq)
+        tiles = jnp.stack(
+            ((offsets >= starts[-1]).astype(jnp.int32), offsets, counts), 1
+        )
+        num_tiles = tokens // bq
+    else:
+        tiles, num_tiles = _tile_plan(starts, tokens, bq)
     non_causal = swa_bounds is not None
     bounds = swa_bounds if non_causal else jnp.zeros((batch, 2), jnp.int32)
     scalars = (tiles, positions, main_lengths, swa_metadata, bounds)
@@ -638,6 +650,8 @@ def csa2_prefill(
         sink[:, None],
         rope_cache,
     )
+    if direct_output:
+        return tiled_output
     # Fixed output windows avoid overlapping writes at ragged request tails.
     # Compact only attention outputs; the much larger main KV stays in place.
     boundaries = jnp.concatenate((starts, jnp.array([tokens], jnp.int32)))

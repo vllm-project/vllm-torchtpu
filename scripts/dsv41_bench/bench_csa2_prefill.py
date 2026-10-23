@@ -78,13 +78,32 @@ def main() -> None:
         with jax.profiler.trace(str(directory), create_perfetto_link=False):
             outputs = [compiled(*inputs, **kwargs) for _ in range(90)]
             jax.block_until_ready(outputs)
+        device_times = []
+        for path in directory.rglob("*.xplane.pb"):
+            for plane in jax.profiler.ProfileData.from_file(str(path)).planes:
+                if (
+                    not plane.name.startswith("/device:TPU:")
+                    or "SparseCore" in plane.name
+                ):
+                    continue
+                for line in plane.lines:
+                    if line.name == "XLA Modules":
+                        for event in line.events:
+                            if "jit_csa2_prefill(" in event.name:
+                                device_times.append(float(event.duration_ns) / 1000)
+        assert len(device_times) == 90, len(device_times)
         row = dict(
             tokens=tokens,
             heads=args.heads,
             bq=args.bq,
             host_continuous_mean_us=float(np.mean(host_times)),
+            device_module_median_us=float(np.median(device_times)),
+            device_module_p10_us=float(np.percentile(device_times, 10)),
+            device_module_p90_us=float(np.percentile(device_times, 90)),
             correctness=correctness,
-            timing_basis="Host queued-call average includes planning and compaction",
+            timing_basis=(
+                "Full XLA module and host averages include planning and compaction"
+            ),
         )
         with (args.out / "metrics.jsonl").open("a") as file:
             file.write(json.dumps(row) + "\n")
