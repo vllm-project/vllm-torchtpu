@@ -772,6 +772,8 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
             from vllm_torchtpu.layers.adapter.attention import (
                 PallasAttentionBackend,
                 PallasAttentionBackendImpl,
+                PallasMLAttentionBackend,
+                PallasMLAttentionBackendImpl,
             )
         except Exception:
             return None
@@ -789,6 +791,26 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                     impl.num_kv_heads,
                     impl.head_size,
                     kv_dtype,
+                )
+                per_layer.append(
+                    [
+                        api.ShapeDtypeStruct(
+                            shape=tuple(int(d) for d in kv_shape),
+                            dtype=tpu_lowering.dtype_name(kv_dtype),
+                        )
+                    ]
+                )
+            elif isinstance(impl, PallasMLAttentionBackendImpl) and not getattr(
+                layer, "use_sparse", False
+            ):
+                # MLA keeps one latent KV head of `head_size` (kv_lora_rank +
+                # qk_rope_head_dim), packed the way the MLA kernel reads it and
+                # replicated on every TP rank.
+                kv_dtype = getattr(
+                    layer, "kv_cache_quantized_dtype", None
+                ) or tpu_lowering.torch_dtype(act_dtype_str)
+                kv_shape = PallasMLAttentionBackend.get_kv_cache_shape(
+                    cfg.num_blocks, cfg.block_size, 1, layer.head_size, kv_dtype
                 )
                 per_layer.append(
                     [
