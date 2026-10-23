@@ -117,9 +117,6 @@ def main() -> None:
     )
     parser.add_argument("--rounds", type=int)
     parser.add_argument("--profile", action="store_true")
-    parser.add_argument(
-        "--engram-transfer", choices=["copy", "raw_dma"], default="copy"
-    )
     args = parser.parse_args()
     if args.rounds is None:
         args.rounds = 1 if args.scenario == "decode" else 5
@@ -194,19 +191,6 @@ def main() -> None:
         "--compilation-config",
         json.dumps({"compile_sizes": buckets}),
     ]
-    if args.engram_transfer != "copy":
-        server_command += [
-            "--additional-config",
-            json.dumps(
-                {
-                    "deepseek_v41": {
-                        "execution": "ced",
-                        "moe": "fused_ep_w4a8",
-                        "engram_transfer": args.engram_transfer,
-                    }
-                }
-            ),
-        ]
     if args.profile:
         server_command += [
             "--profiler-config",
@@ -222,7 +206,7 @@ def main() -> None:
         "compile_sizes": buckets,
         "cache_mode": "disabled",
         "serialization": "enabled",
-        "engram_transfer": args.engram_transfer,
+        "engram_transfer": "raw_dma",
         "tier2": "disabled (public and internal)",
         "packages": {
             name: importlib.metadata.version(name)
@@ -235,7 +219,7 @@ def main() -> None:
     model = Path(env["MODEL_PATH"])
     identity = {
         "scenario": args.scenario,
-        "engram_transfer": args.engram_transfer,
+        "engram_transfer": "raw_dma",
         "compile_sizes": buckets,
         "packages": manifest["packages"],
         "torchtpu": source_identity(

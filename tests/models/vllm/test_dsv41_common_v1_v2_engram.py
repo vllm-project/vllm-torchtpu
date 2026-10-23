@@ -20,6 +20,8 @@ from vllm_torchtpu.models.vllm.deepseek_v41.common import engram as common_engra
 from vllm_torchtpu.models.vllm.deepseek_v41.v1 import engram as v1_engram
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import engram as v2_engram
 
+pytestmark = pytest.mark.usefixtures("cpu_engram_transfer")
+
 
 @pytest.fixture(autouse=True)
 def setup_torch_accelerator(monkeypatch: pytest.MonkeyPatch):
@@ -644,15 +646,15 @@ class TestEngramModule:
         engram.prepare_embeddings(hash_ids_partial)
         assert torch.all(engram._host_scale[:3] == 129)
         assert engram._host_scale_buf[3].item() == common_engram._INVALID_SCALE
-        staged_raw_3 = engram._staged_tensors(3)
+        staged_raw_3 = engram._staged_by_tokens[3]
         assert staged_raw_3.shape == (3 * (cols * dim // 4 + 1),)
         assert engram._active_raw.shape == (3, cols * dim // 4 + 1)
 
-        # Calling again with num_tokens=3 reuses the cached staging tensor and view
+        # Repeated calls alternate the two immutable DMA destinations.
         engram.prepare_embeddings(hash_ids_partial)
-        assert engram._staged_tensors(3) is staged_raw_3
+        assert engram._staged_by_tokens[3] is not staged_raw_3
         assert engram._staged_views(3) is engram._active_raw
-        assert engram._staged_tensors(max_tokens) is engram._staged_raw
+        assert engram._staged_by_tokens[max_tokens] is engram._staged_raw
 
         # 1b. Single token (num_tokens=1 < 2 skips mark_dynamic)
         engram.prepare_embeddings(torch.zeros(1, cols, dtype=torch.int32))

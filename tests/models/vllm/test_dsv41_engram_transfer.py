@@ -12,11 +12,13 @@ import types
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import cached_property
+from itertools import islice
 from pathlib import Path
 from typing import Any, cast
 
 import pytest
 import torch
+from torch.utils._pytree import tree_leaves
 
 ROOT = Path(__file__).resolve().parents[3]
 SOURCE = ROOT / "src/vllm_torchtpu/models/vllm/deepseek_v41"
@@ -155,6 +157,51 @@ def test_failed_dma_preserves_pending_handle(transport):
     assert slot.pending is pending
 
 
+@pytest.mark.parametrize("version", ["v1", "v2"])
+def test_model_records_device_consumers_before_slot_reuse(transport, version):
+    module, events, _ = transport
+    slot = module.PreparedEngramUpload(4, torch.device("cpu"))
+    slot.acquire().fill_(17)
+    slot.start()
+    slot.activate()
+    tree = ast.parse((SOURCE / version / "model.py").read_text())
+    cls = next(
+        node for node in tree.body if getattr(node, "name", None) == "DeepseekV41Model"
+    )
+    method = next(
+        node
+        for node in cls.body
+        if getattr(node, "name", None) == "_record_engram_consumers"
+    )
+    engram_type = type("Engram", (), {})
+    layer = engram_type()
+    layer._active_upload = slot
+    owner = types.SimpleNamespace(
+        _raw_dma_enabled=True, layers=[types.SimpleNamespace(engram=layer)]
+    )
+    namespace = dict(
+        torch=torch,
+        islice=islice,
+        tree_leaves=tree_leaves,
+        Engram=engram_type,
+        upstream=types.SimpleNamespace(
+            IntermediateTensors=type("Intermediate", (), {})
+        ),
+        synchronize_tensors=lambda tensors, wait: events.append(("dispatch", tensors)),
+    )
+    exec(
+        compile(ast.Module(body=[method], type_ignores=[]), "<consumer>", "exec"),
+        namespace,
+    )
+    output = torch.tensor([23])
+    namespace["_record_engram_consumers"](owner, 0, 1, {"output": output})
+    assert not slot.needs_consumer
+    assert slot.consumers == [output]
+    slot.acquire().fill_(29)
+    slot.start()
+    assert events[-2:] == [("sync", True, [output]), "upload-start"]
+
+
 @pytest.mark.parametrize(
     "value",
     [None, ([1, 0], [], 32), ([0], [[2, 2]], 32), ([0], [[0]], 32), ([0], [], 16)],
@@ -245,7 +292,6 @@ def staging(transport, monkeypatch):
         "_reserve_upload",
         "start_prepared_embeddings",
         "activate_prepared_embeddings",
-        "_staged_tensors",
         "_staged_views",
         "_ready_rows",
         "prepare_embeddings",
@@ -303,7 +349,6 @@ def staging(transport, monkeypatch):
         gather_raw=gather,
     )
     layer._init_staging(4, 32)
-    layer._prepared_uploads = {}
     return layer, events, weight, scales, namespace["dequant_fp8_rows"]
 
 
@@ -330,6 +375,21 @@ def test_prefetch_alternates_slots_preserving_current_chunk(staging):
         )
         == 4
     )
+
+
+def test_direct_host_staging_uses_dma_and_handles_empty_tokens(staging):
+    layer, events, weight, scales, dequant = staging
+    for step in range(6):
+        ids = torch.full((3, 2), step + 1)
+        layer.prepare_embeddings(ids)
+        result = layer._ready_rows(3)
+        assert torch.equal(result, dequant(weight[ids], scales[ids], 32))
+        layer._active_upload.record_consumers([result])
+    assert events.count("upload-start") == 6
+    layer.prepare_embeddings(torch.empty((0, 2), dtype=torch.int32))
+    assert layer._active_raw.shape == (0, 17)
+    assert layer._active_upload is None
+    assert events.count("upload-start") == 6
 
 
 def test_bucket_switch_and_prefetch_miss_do_not_reuse_pending_host_data(staging):

@@ -10,7 +10,6 @@ import pytest
 
 from vllm_torchtpu.models.vllm.deepseek_v41.config import (
     DeepseekV41Config,
-    EngramTransfer,
     ExecutionMode,
     MoEBackend,
     verify_and_update_config,
@@ -58,7 +57,14 @@ def test_policy_round_trips_to_worker_and_config_hash_input(execution, moe):
 
 @pytest.mark.parametrize(
     "policy",
-    [{"moe": "adaptive"}, {"tile": 48}, {"execution": True}, {"engram": "gpu"}],
+    [
+        {"moe": "adaptive"},
+        {"tile": 48},
+        {"execution": True},
+        {"engram": "gpu"},
+        {"engram_transfer": "copy"},
+        {"engram_transfer": "raw_dma"},
+    ],
 )
 def test_rejects_unknown_or_mistyped_options(policy):
     with pytest.raises((ValueError, TypeError)):
@@ -71,20 +77,7 @@ def test_defaults_are_explicit_and_do_not_enable_approximation():
     assert cfg.additional_config["deepseek_v41"] == {
         "execution": "full",
         "moe": "gmm",
-        "engram_transfer": "copy",
     }
-
-
-def test_raw_dma_requires_host_offload_and_changes_worker_policy():
-    cfg = config(engram_transfer="raw_dma")
-    verify_and_update_config(cfg)
-    assert (
-        DeepseekV41Config.from_vllm_config(cfg).engram_transfer
-        == EngramTransfer.RAW_DMA
-    )
-    cfg.engram_config.cpu_offload = False
-    with pytest.raises(ValueError, match="cpu_offload"):
-        verify_and_update_config(cfg)
 
 
 def test_legacy_values_are_frozen_before_worker_env_changes(monkeypatch):

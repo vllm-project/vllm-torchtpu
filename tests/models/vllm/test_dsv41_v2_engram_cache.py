@@ -31,6 +31,8 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
     uses_fp8_rope_companion,
 )
 
+pytestmark = pytest.mark.usefixtures("cpu_engram_transfer")
+
 
 @pytest.fixture(autouse=True)
 def setup_torch_accelerator(monkeypatch: pytest.MonkeyPatch):
@@ -473,7 +475,7 @@ def test_engram_prepare_embeddings_branching(monkeypatch: pytest.MonkeyPatch):
         engram._host_scale_buf.data_ptr()
         == engram._host_packed_buf.data_ptr() + 5 * cols * dim
     )
-    staged_5 = engram._staged_tensors(5)
+    staged_5 = engram._staged_by_tokens[5]
     assert torch.equal(staged_5[:60], engram._host_raw[:5].view(-1).view(torch.int32))
     assert torch.equal(staged_5[60:], engram._host_scale_buf[:40].view(torch.int32))
     rows = Engram._ready_rows(engram, 5)
@@ -509,7 +511,7 @@ def test_engram_prepare_embeddings_branching(monkeypatch: pytest.MonkeyPatch):
                 ),
             )
         )
-        assert torch.equal(engram._staged_tensors(tokens), expected.view(torch.int32))
+        assert torch.equal(engram._active_raw.view(-1), expected.view(torch.int32))
 
     # Case C/D: Exceeding max_tokens, or no offload staging -> upstream path.
     fallback_calls = []

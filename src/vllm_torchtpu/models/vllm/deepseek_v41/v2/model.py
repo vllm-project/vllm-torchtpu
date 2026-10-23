@@ -3,7 +3,7 @@
 """Upstream V4.1 model assembly with TPU device operations."""
 
 from dataclasses import dataclass, replace
-from functools import partial
+from functools import cached_property, partial
 from itertools import islice
 from typing import TYPE_CHECKING, cast
 
@@ -32,7 +32,6 @@ from ..common.mhc import (
 )
 from ..config import (
     DeepseekV41Config,
-    EngramTransfer,
     ExecutionMode,
     engram_cpu_offload,
 )
@@ -330,7 +329,12 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
     _engram_prefetch: _EngramPrefetch | None = None
     _current_host_inputs: HostEngramInputs | None = None
     _prefetched_uploads: dict[int, "PreparedEngramUpload"] | None = None
-    _hash_download: "EngramHashDownload | None" = None
+
+    @cached_property
+    def _hash_download(self) -> "EngramHashDownload":
+        from ..common.host_transfer import EngramHashDownload
+
+        return EngramHashDownload()
 
     def _has_cpu_offloaded_engram(self) -> bool:
         for layer in islice(self.layers, self.start_layer, self.end_layer):
@@ -465,11 +469,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 if self._has_cpu_offloaded_engram():
                     # Idle/decode replicas may hash on device while a prefill
                     # replica hashes on host. All must use the CPU collective.
-                    engram_hashes = (
-                        self._hash_download.copy_to_host(engram_hashes)
-                        if self._hash_download is not None
-                        else engram_hashes.to("cpu")
-                    )
+                    engram_hashes = self._hash_download.copy_to_host(engram_hashes)
                 gathered_hashes = gather_host_engram_hashes(
                     engram_hashes,
                     dp_shared_memory=self.engram_dp_shared_memory,
@@ -503,7 +503,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 if engram is not None:
                     if (
                         isinstance(engram, Engram)
-                        and engram._prepared_uploads is not None
+                        and engram.embed_tokens.host_offload
                         and engram.embed_tokens.dp_size == 1
                     ):
                         upload = (
@@ -586,10 +586,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             and layer.engram.embed_tokens.host_offload
         ]
         # Predicting work must never introduce an unmatched DP collective.
-        if not engrams or any(
-            engram._prepared_uploads is None or engram.embed_tokens.dp_size != 1
-            for engram in engrams
-        ):
+        if not engrams or any(engram.embed_tokens.dp_size != 1 for engram in engrams):
             return
         following = current.next_prompt(current)
         if following is None:
@@ -1134,14 +1131,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
 
     def __init__(self, *, vllm_config, prefix=""):
         self.prefix = prefix
-        self._raw_dma_enabled = (
-            DeepseekV41Config.from_vllm_config(vllm_config).engram_transfer
-            == EngramTransfer.RAW_DMA
-        )
-        if self._raw_dma_enabled:
-            from ..common.host_transfer import EngramHashDownload
-
-            self._hash_download = EngramHashDownload()
+        self._raw_dma_enabled = engram_cpu_offload(vllm_config)
         initialize_cache_ops()
         initialize_delayed_mhc()
         initialize_shifted_mhc()

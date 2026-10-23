@@ -77,7 +77,7 @@ class PreparedEngramUpload:
         self.host_words = _host_words(self.host_buffer, num_words)
         self.transfer.d2h()
         if not torch.equal(self.host_words, probe):
-            raise RuntimeError("Engram raw layout validation failed; select copy")
+            raise RuntimeError("Engram raw layout validation failed")
         self.pending: Any = None
         self.consumers: list[torch.Tensor] = []
         self.needs_consumer = False
@@ -146,8 +146,10 @@ class EngramHashDownload:
         self._buffers: dict[tuple[torch.device, tuple[int, ...]], _DownloadBuffer] = {}
 
     def copy_to_host(self, hashes: torch.Tensor) -> torch.Tensor:
-        if hashes.device.type == "cpu" or hashes.numel() == 0:
-            return hashes.to("cpu")
+        if hashes.device.type == "cpu":
+            return hashes
+        if hashes.numel() == 0:
+            return torch.empty(hashes.shape, dtype=hashes.dtype, device="cpu")
         if hashes.dtype != torch.int32:
             raise TypeError("Engram raw hash download requires int32 hashes")
         sync.synchronize(tensors=[hashes], wait=True)

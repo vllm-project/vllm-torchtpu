@@ -43,6 +43,8 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import (
 )
 from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
+pytestmark = pytest.mark.usefixtures("cpu_engram_transfer")
+
 # ==============================================================================
 # 1. host_engram.py Tests
 # ==============================================================================

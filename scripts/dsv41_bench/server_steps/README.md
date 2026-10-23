@@ -88,6 +88,9 @@ For native GCS weight streaming, also set `MODEL_URI=gs://bucket/model-prefix`.
 The target and DSpark models use that URI; `MODEL_PATH` remains the local
 checkpoint metadata and tokenizer path. CI sets both paths and omits `--profile`.
 
+CPU-offloaded Engram tables use prepared raw DMA transfers automatically.
+The selected backend is passed to the server and recorded in the result manifest.
+
 `run.py` starts the server, waits for HTTP health readiness,
 runs a separate warmup and five formal rounds, optionally collects a separate
 profile wave, and stops its server process group. The startup timeout defaults

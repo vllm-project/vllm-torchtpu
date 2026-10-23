@@ -9,6 +9,7 @@ import pytest
 import torch
 import torch.distributed as dist
 import torch.multiprocessing as mp
+from engram_test_utils import install_cpu_engram_transfer
 
 from vllm_torchtpu.models.vllm.deepseek_v41.common import engram as common_engram
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import host_engram
@@ -102,6 +103,8 @@ def _worker(
     upstream.get_tensor_model_parallel_world_size = lambda: 1
     upstream.get_tensor_model_parallel_rank = lambda: 0
     torch.accelerator.current_device_index = lambda: 0
+    transport = pytest.MonkeyPatch()
+    install_cpu_engram_transfer(transport)
     try:
         emb = common_engram.ParallelEngramEmbedding(
             sum(_HEAD_SIZES),
@@ -175,6 +178,7 @@ def _worker(
             )
             assert torch.equal(actual, expected)
     finally:
+        transport.undo()
         dist.destroy_process_group()
 
 

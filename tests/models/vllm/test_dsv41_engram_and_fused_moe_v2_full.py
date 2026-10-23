@@ -113,6 +113,8 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.host_engram import (
 )
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.model import DeepseekV41Model
 
+pytestmark = pytest.mark.usefixtures("cpu_engram_transfer")
+
 # ==============================================================================
 # Helper Mock Objects
 # ==============================================================================

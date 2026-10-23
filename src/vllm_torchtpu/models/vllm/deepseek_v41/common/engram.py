@@ -24,7 +24,7 @@ from vllm_torchtpu.layers.adapter.upstream_bindings import (
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.model_loader_patches import register_row_slice
 
-from ..config import DeepseekV41Config, EngramTransfer, engram_cpu_offload
+from ..config import engram_cpu_offload
 from .host_exchange import start_exchange_rows
 from .host_gather import gather_weight_scale
 
@@ -662,12 +662,7 @@ class Engram(upstream.Engram):
             self._staged_raw[max_tokens * raw_words_per_tok :].fill_(-1)
             self._staged_by_tokens[max_tokens] = self._staged_raw
             self._active_raw = self._staged_views(max_tokens)
-            config = get_current_vllm_config_or_none()
-            if config is not None and (
-                DeepseekV41Config.from_vllm_config(config).engram_transfer
-                == EngramTransfer.RAW_DMA
-            ):
-                self._prepared_uploads = {}
+            self._prepared_uploads = {}
 
     def _reserve_upload(self, num_tokens: int) -> "PreparedEngramUpload":
         from .host_transfer import PreparedEngramUpload
@@ -723,20 +718,6 @@ class Engram(upstream.Engram):
         self._staged_views_by_tokens.pop(num_tokens, None)
         self._active_raw = self._staged_views(num_tokens)
 
-    def _staged_tensors(self, num_tokens: int) -> torch.Tensor:
-        assert self._staged_raw is not None
-        staged = self._staged_by_tokens.get(num_tokens)
-        if staged is None:
-            _, cols, head_dim = self._host_raw.shape
-            blocks = self._host_scale.shape[-1]
-            raw_words = num_tokens * ((cols * head_dim) // 4)
-            scale_words = num_tokens * (-(-(cols * blocks) // 4))
-            dev = self._staged_raw.device
-            staged = torch.zeros(raw_words + scale_words, dtype=torch.int32, device=dev)
-            staged[raw_words:].fill_(-1)
-            self._staged_by_tokens[num_tokens] = staged
-        return staged
-
     def _staged_views(self, num_tokens: int) -> torch.Tensor:
         view = self._staged_views_by_tokens.get(num_tokens)
         if view is None:
@@ -744,7 +725,7 @@ class Engram(upstream.Engram):
             blocks = self._host_scale.shape[-1]
             raw_words_per_tok = (cols * head_dim) // 4
             scale_words_per_tok = -(-(cols * blocks) // 4)
-            staged = self._staged_tensors(num_tokens)
+            staged = self._staged_by_tokens[num_tokens]
             view = staged.view(num_tokens, raw_words_per_tok + scale_words_per_tok)
             if num_tokens >= 2:
                 torch._dynamo.mark_dynamic(view, 0)
@@ -765,6 +746,12 @@ class Engram(upstream.Engram):
         raw_words = num_tokens * ((cols * head_dim) // 4)
         scale_bytes = num_tokens * cols * blocks
         scale_words = num_tokens * (-(-(cols * blocks) // 4))
+        if not num_tokens:
+            self._active_upload = None
+            self._active_raw = self._staged_raw[:0].view(
+                0, cols * head_dim // 4 + -(-(cols * blocks) // 4)
+            )
+            return
         # Scale rows follow this call's raw prefix, not the maximum-capacity raw region.
         self._host_scale_buf = self._host_packed_buf[
             raw_words * 4 : (raw_words + scale_words) * 4
@@ -799,18 +786,10 @@ class Engram(upstream.Engram):
             )
         if scale_words * 4 > scale_bytes:
             self._host_scale_buf[scale_bytes : scale_words * 4].fill_(_INVALID_SCALE)
-        # On TorchTPU, `copy_()` into a slice/view of a materialized device
-        # tensor allocates a fresh buffer per call instead of overwriting in
-        # place, whereas a whole-tensor `copy_()` overwrites in place (see
-        # `deepseek_v4/model.py:_HostStagedParams`). Allocate and reuse one
-        # exact-size whole 1-D packed device tensor per `num_tokens` bucket
-        # so each Engram layer issues a single fast 1-D H2D transfer, while
-        # exposing a 2-D `[num_tokens, words_per_tok]` dynamic-dim0 view to
-        # `torch.compile` (`create_concrete_args`).
         host_words = self._host_packed_buf.view(torch.int32)
-        staged = self._staged_tensors(num_tokens)
-        staged.copy_(host_words[: raw_words + scale_words])
-        self._active_raw = self._staged_views(num_tokens)
+        upload = self._reserve_upload(num_tokens)
+        upload.copy_from(host_words[: raw_words + scale_words])
+        self.activate_prepared_embeddings(num_tokens, upload)
 
     def _ready_rows(self, num_tokens: int) -> torch.Tensor:
         if self._staged_raw is None:

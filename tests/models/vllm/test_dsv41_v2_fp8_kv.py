@@ -15,6 +15,8 @@ from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
     scatter_cache_values,
 )
 
+pytestmark = pytest.mark.usefixtures("cpu_engram_transfer")
+
 
 def _latent(n, seed=0):
     rng = np.random.default_rng(seed)

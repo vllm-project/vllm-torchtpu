@@ -25,7 +25,6 @@ pytestmark = pytest.mark.cpu_test
 )
 @pytest.mark.parametrize("profile", ["disabled", "passed", "failed"])
 @pytest.mark.parametrize("model_uri", [None, "gs://test-bucket/checkpoint"])
-@pytest.mark.parametrize("engram_transfer", ["copy", "raw_dma"])
 def test_ci_launch_and_optional_profile_share_one_server(
     tmp_path,
     monkeypatch,
@@ -34,7 +33,6 @@ def test_ci_launch_and_optional_profile_share_one_server(
     buckets,
     profile,
     model_uri,
-    engram_transfer,
 ):
     monkeypatch.chdir(tmp_path)
     (tmp_path / "config.json").write_text("{}")
@@ -59,8 +57,6 @@ def test_ci_launch_and_optional_profile_share_one_server(
             "results",
             "--startup-timeout",
             "7200",
-            "--engram-transfer",
-            engram_transfer,
             *(["--profile"] if profile != "disabled" else []),
         ],
     )
@@ -124,20 +120,10 @@ def test_ci_launch_and_optional_profile_share_one_server(
     manifest = json.loads((tmp_path / "results/manifest.json").read_text())
     assert manifest["cache_mode"] == "disabled"
     assert manifest["serialization"] == "enabled"
-    assert manifest["engram_transfer"] == engram_transfer
-    assert manifest["identity"]["engram_transfer"] == engram_transfer
+    assert manifest["engram_transfer"] == "raw_dma"
+    assert manifest["identity"]["engram_transfer"] == "raw_dma"
     assert manifest["identity"]["model_weights"] == (model_uri or str(tmp_path))
     command = starts[0]
-    if engram_transfer == "raw_dma":
-        assert json.loads(command[command.index("--additional-config") + 1]) == {
-            "deepseek_v41": {
-                "execution": "ced",
-                "moe": "fused_ep_w4a8",
-                "engram_transfer": "raw_dma",
-            }
-        }
-    else:
-        assert "--additional-config" not in command
     assert json.loads(command[command.index("--compilation-config") + 1]) == {
         "compile_sizes": buckets
     }
