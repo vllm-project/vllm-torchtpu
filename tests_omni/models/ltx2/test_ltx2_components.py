@@ -15,7 +15,7 @@
 
 Each vllm-omni component is exercised directly on TPU (without end-to-end
 pipeline orchestration) and compared in the same process against its
-HuggingFace diffusers counterpart on CPU:
+HuggingFace diffusers / transformers counterpart on CPU:
 
 - ``LTX2AudioVideoRotaryPosEmbed`` and coordinate builders
   (``prepare_video_coords``, ``prepare_audio_coords``) for video and audio.
@@ -23,18 +23,32 @@ HuggingFace diffusers counterpart on CPU:
   ``modality`` forward variants.
 - Tiny ``LTX2TextConnectors`` with ``_install_connector_attention`` on
   left-padded prompts.
-
-Total runtime on TPU v7x: ~33s (6 test items).
+- Tiny ``DistributedAutoencoderKLLTX2Video`` encode (posterior mode:
+  observed fp32/bf16 ratios 0.753 / 1.420) and decode (whole video:
+  0.577 / 1.103; per-frame max: 0.590 / 1.150) against
+  ``AutoencoderKLLTX2Video``.
+- Tiny ``AutoencoderKLLTX2Audio`` causal mel-spectrogram decode
+  (observed fp32/bf16 ratios 0.559 / 1.199).
+- Tiny ``LTX2Vocoder`` stereo waveform synthesis via ``_run_ltx_vocoder``
+  (observed fp32/bf16 ratios 0.208 / 1.034).
+- Tiny ``Gemma3ForConditionalGeneration`` ``from_pretrained`` load path and
+  multi-layer hidden-state stacking on left-padded prompts (observed
+  fp32/bf16 ratios 0.658 / 0.990).
 """
 
 import copy
 import os
+from pathlib import Path
 
 import pytest
 import torch
 
 pytest.importorskip("vllm_omni", reason="vllm_omni is required for LTX-2 tests")
 
+from diffusers import AutoencoderKLLTX2Video
+from diffusers.models.autoencoders.autoencoder_kl_ltx2_audio import (
+    AutoencoderKLLTX2Audio,
+)
 from diffusers.models.transformers.transformer_ltx2 import (
     LTX2AudioVideoRotaryPosEmbed as RefLTX2RotaryPosEmbed,
 )
@@ -42,8 +56,18 @@ from diffusers.models.transformers.transformer_ltx2 import (
     LTX2VideoTransformer3DModel as RefLTX2Transformer3DModel,
 )
 from diffusers.pipelines.ltx2.connectors import LTX2TextConnectors
+from diffusers.pipelines.ltx2.vocoder import LTX2Vocoder
+from transformers import (
+    Gemma3Config,
+    Gemma3ForConditionalGeneration,
+    Gemma3TextConfig,
+    SiglipVisionConfig,
+)
 from vllm.utils.torch_utils import set_default_torch_dtype
 from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.autoencoders.autoencoder_kl_ltx2 import (
+    DistributedAutoencoderKLLTX2Video,
+)
 from vllm_omni.diffusion.distributed.parallel_state import (
     destroy_distributed_environment,
     destroy_model_parallel,
@@ -55,6 +79,7 @@ from vllm_omni.diffusion.forward_context import set_forward_context
 from vllm_omni.diffusion.models.ltx2.ltx2_components import (
     _install_connector_attention,
 )
+from vllm_omni.diffusion.models.ltx2.ltx2_runtime import _run_ltx_vocoder
 from vllm_omni.diffusion.models.ltx2.ltx2_transformer import (
     LTX2AudioVideoRotaryPosEmbed,
     LTX2VideoTransformer3DModel,
@@ -90,6 +115,14 @@ CONNECTOR_RATIO_GATES: dict[str, tuple[float, float]] = {
     "video": (0.65, 1.10),
     "audio": (0.67, 1.09),
 }
+VIDEO_VAE_RATIO_GATES: dict[str, tuple[float, float]] = {
+    "mode": (0.78, 1.47),
+    "decode": (0.60, 1.14),
+    "decode-frame": (0.61, 1.19),
+}
+AUDIO_VAE_RATIO_GATE: tuple[float, float] = (0.58, 1.24)
+VOCODER_RATIO_GATE: tuple[float, float] = (0.22, 1.07)
+GEMMA3_RATIO_GATE: tuple[float, float] = (0.68, 1.02)
 
 
 @pytest.fixture(scope="module")
@@ -550,3 +583,333 @@ def test_ltx2_tiny_connectors_parity(
             fp32_ratio=fp32_ratio,
             bf16_ratio=bf16_ratio,
         )
+
+
+# --------------------------------------------------------------------------- #
+# 4. Tiny random-weight DistributedAutoencoderKLLTX2Video (encode + decode)
+# --------------------------------------------------------------------------- #
+TINY_VIDEO_VAE_CONFIG: dict[str, object] = {
+    "in_channels": 3,
+    "out_channels": 3,
+    "latent_channels": 8,
+    "block_out_channels": (16, 32, 64, 128),
+    "decoder_block_out_channels": (16, 32, 64),
+    "layers_per_block": (1, 1, 1, 1, 1),
+    "decoder_layers_per_block": (1, 1, 1, 1),
+    "down_block_types": (
+        "LTX2VideoDownBlock3D",
+        "LTX2VideoDownBlock3D",
+        "LTX2VideoDownBlock3D",
+        "LTX2VideoDownBlock3D",
+    ),
+    "downsample_type": ("spatial", "temporal", "spatiotemporal", "spatiotemporal"),
+    "upsample_type": ("spatiotemporal", "spatiotemporal", "spatiotemporal"),
+    "upsample_factor": (2, 2, 2),
+    "upsample_residual": (True, True, True),
+    "spatio_temporal_scaling": (True, True, True, True),
+    "decoder_spatio_temporal_scaling": (True, True, True),
+    "decoder_inject_noise": (False, False, False, False),
+    "patch_size": 4,
+    "patch_size_t": 1,
+    "resnet_norm_eps": 1e-6,
+    "scaling_factor": 1.0,
+    "spatial_compression_ratio": 32,
+    "temporal_compression_ratio": 8,
+    "timestep_conditioning": False,
+    "encoder_causal": True,
+    "decoder_causal": False,
+    "encoder_spatial_padding_mode": "zeros",
+    "decoder_spatial_padding_mode": "reflect",
+}
+
+
+@torch.no_grad()
+def test_ltx2_tiny_video_vae_parity(
+    omni_ctx: None,
+) -> None:
+    """DistributedAutoencoderKLLTX2Video on TPU matches diffusers on CPU."""
+    torch.manual_seed(0)
+    ref_vae = AutoencoderKLLTX2Video(**TINY_VIDEO_VAE_CONFIG).eval()
+    ref_vae_bf16 = copy.deepcopy(ref_vae).to(torch.bfloat16).eval()
+
+    # 9 = 8 * 1 + 1 pixel frames -> 2 latent frames; 64x64 -> 2x2 latents (32x).
+    gen = torch.Generator(device="cpu").manual_seed(1)
+    video = torch.randn(1, 3, 9, 64, 64, generator=gen)
+    latents = torch.randn(1, 8, 2, 2, 2, generator=gen)
+
+    ref_mode = ref_vae.encode(video).latent_dist.mode()
+    ref_decode = ref_vae.decode(latents, None, return_dict=False)[0]
+    ref_bf16_mode = (
+        ref_vae_bf16.encode(video.to(torch.bfloat16)).latent_dist.mode().float()
+    )
+    ref_bf16_decode = ref_vae_bf16.decode(
+        latents.to(torch.bfloat16), None, return_dict=False
+    )[0].float()
+
+    tpu_outputs: dict[torch.dtype, dict[str, torch.Tensor]] = {}
+    for dtype in (torch.float32, torch.bfloat16):
+        omni_vae = DistributedAutoencoderKLLTX2Video(**TINY_VIDEO_VAE_CONFIG)
+        omni_vae.init_distributed()
+        omni_vae.load_state_dict(ref_vae.state_dict())
+        omni_vae = omni_vae.to(device="tpu", dtype=dtype).eval()
+        mode_out = omni_vae.encode(
+            video.to(device="tpu", dtype=dtype)
+        ).latent_dist.mode()
+        decode_out = omni_vae.decode(
+            latents.to(device="tpu", dtype=dtype), None, return_dict=False
+        )[0]
+        assert mode_out.shape == (1, 8, 2, 2, 2)
+        assert decode_out.shape == (1, 3, 9, 64, 64)
+        tpu_outputs[dtype] = {
+            "mode": mode_out.float().cpu(),
+            "decode": decode_out.float().cpu(),
+        }
+
+    for output, ref_out, ref_bf16_out in (
+        ("mode", ref_mode, ref_bf16_mode),
+        ("decode", ref_decode, ref_bf16_decode),
+    ):
+        fp32_ratio, bf16_ratio = VIDEO_VAE_RATIO_GATES[output]
+        assert_parity(
+            ref=ref_out,
+            ref_bf16=ref_bf16_out,
+            tpu_fp32=tpu_outputs[torch.float32][output],
+            tpu_bf16=tpu_outputs[torch.bfloat16][output],
+            fp32_ratio=fp32_ratio,
+            bf16_ratio=bf16_ratio,
+        )
+
+    frame_fp32_ratio, frame_bf16_ratio = VIDEO_VAE_RATIO_GATES["decode-frame"]
+    for frame in range(ref_decode.shape[2]):
+        assert_parity(
+            ref=ref_decode[:, :, frame],
+            ref_bf16=ref_bf16_decode[:, :, frame],
+            tpu_fp32=tpu_outputs[torch.float32]["decode"][:, :, frame],
+            tpu_bf16=tpu_outputs[torch.bfloat16]["decode"][:, :, frame],
+            fp32_ratio=frame_fp32_ratio,
+            bf16_ratio=frame_bf16_ratio,
+        )
+
+
+# --------------------------------------------------------------------------- #
+# 5. Tiny random-weight AutoencoderKLLTX2Audio decode
+# --------------------------------------------------------------------------- #
+TINY_AUDIO_VAE_CONFIG: dict[str, object] = {
+    "base_channels": 16,
+    "output_channels": 2,
+    "ch_mult": (1, 2, 4),
+    "num_res_blocks": 1,
+    "attn_resolutions": None,
+    "in_channels": 2,
+    "resolution": 256,
+    "latent_channels": 8,
+    "norm_type": "pixel",
+    "causality_axis": "height",
+    "dropout": 0.0,
+    "mid_block_add_attention": False,
+    "sample_rate": 16000,
+    "mel_hop_length": 160,
+    "is_causal": True,
+    "mel_bins": 64,
+    "double_z": True,
+}
+
+
+@torch.no_grad()
+def test_ltx2_tiny_audio_vae_parity(
+    omni_ctx: None,
+) -> None:
+    """AutoencoderKLLTX2Audio decode on TPU matches CPU."""
+    assert torch.nn.functional.interpolate.__name__ == "_safe_interpolate"
+    torch.manual_seed(0)
+    ref_audio_vae = AutoencoderKLLTX2Audio(**TINY_AUDIO_VAE_CONFIG).eval()
+    ref_audio_vae_bf16 = copy.deepcopy(ref_audio_vae).to(torch.bfloat16).eval()
+
+    audio_latents = torch.randn(
+        1, 8, 26, 16, generator=torch.Generator(device="cpu").manual_seed(2)
+    )
+    ref_mel = ref_audio_vae.decode(audio_latents, return_dict=False)[0]
+    ref_bf16_mel = ref_audio_vae_bf16.decode(
+        audio_latents.to(torch.bfloat16), return_dict=False
+    )[0].float()
+
+    tpu_outputs: dict[torch.dtype, torch.Tensor] = {}
+    for dtype in (torch.float32, torch.bfloat16):
+        tpu_audio_vae = (
+            copy.deepcopy(ref_audio_vae).to(device="tpu", dtype=dtype).eval()
+        )
+        mel_out = tpu_audio_vae.decode(
+            audio_latents.to(device="tpu", dtype=dtype), return_dict=False
+        )[0]
+        assert mel_out.shape == (1, 2, 101, 64)
+        tpu_outputs[dtype] = mel_out.float().cpu()
+
+    fp32_ratio, bf16_ratio = AUDIO_VAE_RATIO_GATE
+    assert_parity(
+        ref=ref_mel,
+        ref_bf16=ref_bf16_mel,
+        tpu_fp32=tpu_outputs[torch.float32],
+        tpu_bf16=tpu_outputs[torch.bfloat16],
+        fp32_ratio=fp32_ratio,
+        bf16_ratio=bf16_ratio,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 6. Tiny random-weight LTX2Vocoder via _run_ltx_vocoder
+# --------------------------------------------------------------------------- #
+TINY_VOCODER_CONFIG: dict[str, object] = {
+    "in_channels": 128,
+    "hidden_channels": 64,
+    "out_channels": 2,
+    "upsample_kernel_sizes": [16, 15, 8, 4, 4],
+    "upsample_factors": [6, 5, 2, 2, 2],
+    "resnet_kernel_sizes": [3, 7, 11],
+    "resnet_dilations": [[1, 3, 5], [1, 3, 5], [1, 3, 5]],
+    "leaky_relu_negative_slope": 0.1,
+    "output_sampling_rate": 24000,
+}
+
+
+@torch.no_grad()
+def test_ltx2_tiny_vocoder_parity(
+    omni_ctx: None,
+) -> None:
+    """LTX2Vocoder via _run_ltx_vocoder on TPU matches vocoder(mel) on CPU."""
+    assert torch.nn.functional.interpolate.__name__ == "_safe_interpolate"
+    torch.manual_seed(0)
+    ref_vocoder = LTX2Vocoder(**TINY_VOCODER_CONFIG).eval()
+    ref_vocoder_bf16 = copy.deepcopy(ref_vocoder).to(torch.bfloat16).eval()
+
+    mel = torch.randn(
+        1, 2, 16, 64, generator=torch.Generator(device="cpu").manual_seed(3)
+    )
+    ref_wav = ref_vocoder(mel)
+    ref_bf16_wav = ref_vocoder_bf16(mel.to(torch.bfloat16)).float()
+    assert (ref_wav.abs() < 0.999).float().mean() > 0.9
+
+    tpu_outputs: dict[torch.dtype, torch.Tensor] = {}
+    for dtype in (torch.float32, torch.bfloat16):
+        tpu_vocoder = copy.deepcopy(ref_vocoder).to(device="tpu", dtype=dtype).eval()
+        wav_out = _run_ltx_vocoder(tpu_vocoder, mel.to(device="tpu", dtype=dtype))
+        assert wav_out.shape == (1, 2, 3840)
+        tpu_outputs[dtype] = wav_out.float().cpu()
+
+    fp32_ratio, bf16_ratio = VOCODER_RATIO_GATE
+    assert_parity(
+        ref=ref_wav,
+        ref_bf16=ref_bf16_wav,
+        tpu_fp32=tpu_outputs[torch.float32],
+        tpu_bf16=tpu_outputs[torch.bfloat16],
+        fp32_ratio=fp32_ratio,
+        bf16_ratio=bf16_ratio,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# 7. Tiny random-weight Gemma3ForConditionalGeneration hidden-state stack
+# --------------------------------------------------------------------------- #
+TINY_GEMMA3_CONFIG = Gemma3Config(
+    text_config=Gemma3TextConfig(
+        vocab_size=1024,
+        hidden_size=128,
+        intermediate_size=256,
+        num_hidden_layers=2,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        hidden_activation="gelu_pytorch_tanh",
+        query_pre_attn_scalar=32,
+        rms_norm_eps=1e-6,
+        sliding_window=8,
+        layer_types=["sliding_attention", "full_attention"],
+        rope_theta=1_000_000.0,
+        rope_local_base_freq=10_000.0,
+        rope_scaling={"factor": 8.0, "rope_type": "linear"},
+        attention_bias=False,
+        bos_token_id=2,
+        eos_token_id=1,
+        pad_token_id=1,
+    ),
+    vision_config=SiglipVisionConfig(
+        hidden_size=32,
+        intermediate_size=64,
+        num_hidden_layers=1,
+        num_attention_heads=2,
+        image_size=28,
+        patch_size=14,
+    ),
+)
+
+
+@torch.no_grad()
+def test_ltx2_tiny_gemma3_parity(
+    tmp_path: Path,
+    omni_ctx: None,
+) -> None:
+    """Gemma 3 production load path and hidden-state stacking on TPU match CPU."""
+    torch.manual_seed(0)
+    Gemma3ForConditionalGeneration(TINY_GEMMA3_CONFIG).save_pretrained(tmp_path)
+
+    # Two left-padded prompts: 7 and 20 real tokens out of 32, BOS=2 prepended,
+    # pad=EOS=1.
+    seq_len = 32
+    real_lens = (7, 20)
+    gen = torch.Generator(device="cpu").manual_seed(4)
+    input_ids = torch.full((len(real_lens), seq_len), 1, dtype=torch.long)
+    attention_mask = torch.zeros_like(input_ids)
+    for row, n_real in enumerate(real_lens):
+        tokens = torch.randint(3, 1024, (n_real - 1,), generator=gen)
+        input_ids[row, seq_len - n_real :] = torch.cat([torch.tensor([2]), tokens])
+        attention_mask[row, seq_len - n_real :] = 1
+
+    with torch.device("cpu"):
+        ref_gemma = Gemma3ForConditionalGeneration.from_pretrained(
+            tmp_path, dtype=torch.float32
+        ).eval()
+        ref_gemma_bf16 = Gemma3ForConditionalGeneration.from_pretrained(
+            tmp_path, dtype=torch.bfloat16
+        ).eval()
+
+    ref_hs = ref_gemma(
+        input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True
+    ).hidden_states
+    ref_stacked = torch.stack(ref_hs, dim=-1).flatten(2, 3)
+    ref_bf16_hs = ref_gemma_bf16(
+        input_ids=input_ids, attention_mask=attention_mask, output_hidden_states=True
+    ).hidden_states
+    ref_bf16_stacked = torch.stack(ref_bf16_hs, dim=-1).flatten(2, 3).float()
+    ref_real = torch.cat(
+        [ref_stacked[r, seq_len - n :] for r, n in enumerate(real_lens)], dim=0
+    )
+    ref_bf16_real = torch.cat(
+        [ref_bf16_stacked[r, seq_len - n :] for r, n in enumerate(real_lens)], dim=0
+    )
+
+    tpu_outputs: dict[torch.dtype, torch.Tensor] = {}
+    for dtype in (torch.float32, torch.bfloat16):
+        with torch.device("cpu"):
+            tpu_gemma = Gemma3ForConditionalGeneration.from_pretrained(
+                tmp_path, dtype=dtype
+            )
+        tpu_gemma = tpu_gemma.to(device="tpu").eval()
+        tpu_hs = tpu_gemma(
+            input_ids=input_ids.to("tpu"),
+            attention_mask=attention_mask.to("tpu"),
+            output_hidden_states=True,
+        ).hidden_states
+        stacked = torch.stack(tpu_hs, dim=-1).flatten(2, 3).float().cpu()
+        assert stacked.shape == (len(real_lens), seq_len, 128 * 3)
+        tpu_outputs[dtype] = torch.cat(
+            [stacked[r, seq_len - n :] for r, n in enumerate(real_lens)], dim=0
+        )
+
+    fp32_ratio, bf16_ratio = GEMMA3_RATIO_GATE
+    assert_parity(
+        ref=ref_real,
+        ref_bf16=ref_bf16_real,
+        tpu_fp32=tpu_outputs[torch.float32],
+        tpu_bf16=tpu_outputs[torch.bfloat16],
+        fp32_ratio=fp32_ratio,
+        bf16_ratio=bf16_ratio,
+    )
