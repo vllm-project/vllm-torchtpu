@@ -1304,6 +1304,55 @@ class TestFp8LinearRuntimeQuant:
         with pytest.raises(ValueError, match="divisible by block scale count"):
             _quantized_matmul_jax(x, w_q, w_scale)
 
+    @pytest.mark.parametrize(
+        "min_m,m,expected",
+        [
+            (-1, 16384, "xla"),  # negative: never use gmm
+            (2048, 64, "xla"),  # decode bucket stays on XLA
+            (2048, 2047, "xla"),  # one row short of the threshold
+            (2048, 2048, "gmm"),  # threshold is inclusive
+            (2048, 16384, "gmm"),  # prefill chunk takes the kernel
+            (0, 64, "gmm"),  # 0: every bucket through gmm
+        ],
+    )
+    def test_per_channel_backend_threshold(self, monkeypatch, min_m, m, expected):
+        """DENSE_GMM_MIN_M picks the per-channel backend per (static) token count."""
+        from vllm_torchtpu.layers.adapter import linear_common
+
+        monkeypatch.setenv("DENSE_GMM_MIN_M", str(min_m))
+        calls = []
+        monkeypatch.setattr(
+            linear_common, "xla_quantized_matmul", lambda *a, **k: calls.append("xla")
+        )
+        monkeypatch.setattr(
+            linear_common, "gmm_v2", lambda *a, **k: calls.append("gmm")
+        )
+        x = jnp.ones((m, 8), dtype=jnp.bfloat16)
+        w_q = jnp.ones((8, 16), dtype=jnp.float8_e4m3fn)  # (k, n)
+        w_scale = jnp.ones((16,), dtype=jnp.float32)  # per-channel [n]
+
+        _quantized_matmul_jax(x, w_q, w_scale)
+
+        assert calls == [expected]
+
+    def test_per_channel_backend_default_threshold(self, monkeypatch):
+        """Unset, the threshold is the measured crossover bucket (4096)."""
+        from vllm_torchtpu import envs
+
+        monkeypatch.delenv("DENSE_GMM_MIN_M", raising=False)
+
+        assert envs.DENSE_GMM_MIN_M == 4096
+
+    def test_per_channel_gmm_scale_shape_validated(self, monkeypatch):
+        """The gmm route rejects a per-channel scale that is not [n_out]."""
+        monkeypatch.setenv("DENSE_GMM_MIN_M", "0")
+        x = jnp.ones((2, 4), dtype=jnp.bfloat16)
+        w_q = jnp.ones((4, 3), dtype=jnp.float8_e4m3fn)  # (k, n), n=3
+        w_scale = jnp.ones((2,), dtype=jnp.float32)  # n=2 != 3
+
+        with pytest.raises(ValueError, match="Per-channel weight scale"):
+            _quantized_matmul_jax(x, w_q, w_scale)
+
 
 @pytest.mark.tpu_test
 class TestFp8WeightTranspose:

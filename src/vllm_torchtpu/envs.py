@@ -41,6 +41,7 @@ if TYPE_CHECKING:
     RAY_USAGE_STATS_ENABLED: str = "0"
     VLLM_USE_RAY_COMPILED_DAG_CHANNEL_TYPE: str = "shm"
     ENABLE_QUANTIZED_MATMUL_KERNEL: bool = False
+    DENSE_GMM_MIN_M: int = 4096
     REQUANTIZE_BLOCK_SIZE: int | None = None
     REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
     MOE_REQUANTIZE_WEIGHT_DTYPE: str = "float8_e4m3fn"
@@ -504,6 +505,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     # Enable the blockwise Pallas quantized matmul kernel for dense linears.
     "ENABLE_QUANTIZED_MATMUL_KERNEL": env_bool("ENABLE_QUANTIZED_MATMUL_KERNEL"),
+    # Smallest (padded) token count at which a dense per-channel FP8 linear
+    # runs through gmm_v2 instead of the XLA dot, 0 routes every bucket through
+    # gmm_v2; a negative value never uses it.
+    "DENSE_GMM_MIN_M": lambda: int(os.getenv("DENSE_GMM_MIN_M", "4096")),
     # Runtime block size for dense linear weight requantization.
     "REQUANTIZE_BLOCK_SIZE": lambda: int(block_size)
     if (block_size := os.getenv("REQUANTIZE_BLOCK_SIZE")) is not None

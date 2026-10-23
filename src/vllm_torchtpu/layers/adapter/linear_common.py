@@ -22,6 +22,7 @@ from jax.sharding import Mesh, NamedSharding
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.megablox.gmm_v2 import gmm_v2
 from vllm_torchtpu.kernels.quantized_matmul.util import xla_quantized_matmul
 
@@ -70,7 +71,11 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.A
     rather than the `(m, k) @ (n, k).T` the N-major layout forced. The
     blockwise path routes through `gmm_v2` (single group), which consumes a
     K-major rhs natively; the per-channel path uses the shared
-    `xla_quantized_matmul`, which takes the same (k, n) layout.
+    `xla_quantized_matmul`, which takes the same (k, n) layout, except at
+    token counts of at least `DENSE_GMM_MIN_M`, where it also goes through
+    `gmm_v2`. `m` is static per compiled token bucket, so that is a
+    trace-time choice: decode-sized buckets keep the XLA dot and prefill
+    chunks take the kernel.
     """
     if x.shape[1] != w_q.shape[0]:
         raise ValueError(
@@ -104,7 +109,34 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.A
             maybe_quantize_lhs=True,
             zero_initialize=True,
         )
+    min_m = envs.DENSE_GMM_MIN_M
+    if min_m >= 0 and x.shape[0] >= min_m:
+        return _per_channel_gmm(x, w_q, w_s)
     return xla_quantized_matmul(x, w_q, w_s)
+
+
+def _per_channel_gmm(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.Array:
+    """Per-channel FP8 dense matmul through `gmm_v2` (single group).
+
+    The kernel absorbs the per-token activation quantization (amax + cast)
+    that the XLA path runs as separate fusions. The per-channel scale
+    `[n_out]` is the single-block case of the kernel's blockwise scale
+    layout `[1, num_blocks, 1, n_out]`.
+    """
+    if w_s.ndim != 1 or w_s.shape[0] != w_q.shape[1]:
+        raise ValueError(
+            f"Per-channel weight scale must be [n_out]={w_q.shape[1]}, got {w_s.shape=}"
+        )
+    return gmm_v2(
+        lhs=x,
+        rhs=w_q[None],  # [n_in, n_out] -> [1, n_in, n_out]
+        group_sizes=jnp.array([x.shape[0]], dtype=jnp.int32),
+        rhs_scale=w_s.reshape(1, 1, 1, w_s.shape[0]),
+        group_offset=jnp.array([0], dtype=jnp.int32),
+        preferred_element_type=x.dtype,
+        maybe_quantize_lhs=True,
+        zero_initialize=True,
+    )
 
 
 _quantized_matmul_kernel_op: Callable | None = None
