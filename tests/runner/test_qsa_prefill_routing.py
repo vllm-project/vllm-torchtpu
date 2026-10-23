@@ -120,7 +120,7 @@ def test_runner_adapter_to_pooled_qsa_bridge_executes_prefill(
 ):
     from vllm_torchtpu.kernels.qwen4_exp.pooled_qsa import compact_pooled_qsa_step
     from vllm_torchtpu.kernels.qwen4_exp.qsa import produce
-    from vllm_torchtpu.kernels.sparse_gqa_prefill.cost_model import select_sc
+    from vllm_torchtpu.kernels.sparse_gqa_prefill.selector import select_sc
     from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
         build_compact_pooled_qsa_op,
     )
