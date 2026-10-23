@@ -354,9 +354,10 @@ def _patch_sdpa_fallback_dispatch() -> None:
     #   on TPU, so every sdpa_fallback call fails there.
     # Fix: SDPAImpl.forward is replaced by TpuSDPAImpl.forward, which runs
     #   SDPAImpl._forward_impl with broadcast key masks, as forward_cuda does.
-    # Effect: LTX-2's _LTX2ParallelAttention sends masked calls to
-    #   sdpa_fallback: with sequence parallelism the audio latents are padded
-    #   to a multiple of the SP size, so audio self-attention and
+    # Effect: sdpa_fallback calls run on TPU instead of raising
+    #   NotImplementedError. LTX-2's _LTX2ParallelAttention sends masked calls
+    #   to sdpa_fallback: with sequence parallelism the audio latents are
+    #   padded to a multiple of the SP size, so audio self-attention and
     #   audio-to-video cross-attention carry a key-padding mask. SANA-Video,
     #   LingBot-Video and SenseNova-U1 also call sdpa_fallback.
     # -------------------------------------------------------------------------
