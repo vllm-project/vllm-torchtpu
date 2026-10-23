@@ -43,16 +43,21 @@ from vllm_torchtpu.megakernel_runtime.qwen38_segment_call import (
 )
 
 
-def _slope(step, carry, chains):
-    """Per-call seconds of `carry = step(carry)` chained `n` times on device."""
+def _slope(step, carry, args, chains):
+    """Per-call seconds of `carry = step(carry, *args)` chained `n` times on device.
+
+    Operands are jit arguments, never closure constants (constants get copied).
+    """
     best = {}
     for n in chains:
-        f = jax.jit(lambda c, n=n: jax.lax.fori_loop(0, n, lambda _, x: step(x), c))
-        jax.block_until_ready(f(carry))
+        f = jax.jit(
+            lambda c, a, n=n: jax.lax.fori_loop(0, n, lambda _, x: step(x, *a), c)
+        )
+        jax.block_until_ready(f(carry, args))
         ts = []
         for _ in range(5):
             t = time.perf_counter()
-            jax.block_until_ready(f(carry))
+            jax.block_until_ready(f(carry, args))
             ts.append(time.perf_counter() - t)
         best[n] = min(ts)
     k, _ = np.polyfit(np.array(list(best), float), np.array(list(best.values()), float), 1)
@@ -99,18 +104,26 @@ def run(B: int, L: int, chains: list[int]) -> dict:
     meta = [jax.device_put(m, rep) for m in meta]
 
     full, _, _, _ = build_segment_call(mesh, g, L, B, layout)
+    nf = len(flat)
     if NL:
         # The pool is part of the carry, so the scatter is live work.
-        t_full = _slope(lambda c: tuple(full(c[0], attn_b, *flat, c[1], *meta)), (hidden, pool), chains)
+        t_full = _slope(
+            lambda c, at, *a: tuple(full(c[0], at, *a[:nf], c[1], *a[nf:])),
+            (hidden, pool),
+            (attn_b, *flat, *meta),
+            chains,
+        )
     else:
-        t_full = _slope(lambda h: full(h, attn_b, *flat)[0], hidden, chains)
+        t_full = _slope(lambda h, at, *a: full(h, at, *a)[0], hidden, (attn_b, *flat), chains)
 
     fn, _, _, _ = make_flat_segment_step(mesh, spec, ex)
     pos = jnp.zeros((B,), jnp.int32)
     hid_m = jax.device_put(jnp.tile(jnp.pad(inp.x, ((0, ex.M - B), (0, 0))), (R, 1)), tp)
     att_m = jax.device_put(jnp.pad(inp.attn, ((0, 0), (0, ex.M - B), (0, 0))).reshape(R * ex.M, -1), tp)
     st = [jax.device_put(kernel.fold(states[k]), tp) for k in ("conv", "rec")] if NL else []
-    t_kernel = _slope(lambda h: fn(pos, h, att_m, *flat, *st)[0], hid_m, chains)
+    t_kernel = _slope(
+        lambda h, p_, at, *a: fn(p_, h, at, *a)[0], hid_m, (pos, att_m, *flat, *st), chains
+    )
     return {"rows": B, "L": L, "composed_us": t_full, "kernel_us": t_kernel,
             "overhead_us": round(t_full - t_kernel, 1)}
 
