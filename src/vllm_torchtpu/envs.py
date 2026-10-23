@@ -74,6 +74,8 @@ if TYPE_CHECKING:
     ONEHOT_MOE_PERMUTE_THRESHOLD: int | None = None
     TPU_MOE_SEQUENCE_PARALLEL: bool = False
     TPU_QWEN4_HC_DECODE_FUSED: bool = False
+    QWEN4_EXP_PREFILL_SP: bool = False
+    QWEN4_EXP_PREFILL_SP_MIN_TOKENS: int = 1024
     TPU_MOE_OWNER_OUTPUT_MODE: str = "off"
     TPU_MOE_DENSE_EXPERT_THRESHOLD: int = 0
     FUSED_MOE_DECODE_KERNEL: bool = False
@@ -864,6 +866,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # gate, branch mean and the combine's injection gate) at <= 512 tokens as
     # one Pallas call, with the attn combine fused ahead of the mlp mix.
     "TPU_QWEN4_HC_DECODE_FUSED": env_bool("TPU_QWEN4_HC_DECODE_FUSED"),
+    # qwen4_exp: shard prefill-sized steps across TP ranks between attention
+    # blocks (reduce-scatter instead of all-reduce), so the hyper-connection
+    # streams, PLE gate and residual math run on 1/TP of the tokens. Steps
+    # below QWEN4_EXP_PREFILL_SP_MIN_TOKENS keep the replicated TP path.
+    "QWEN4_EXP_PREFILL_SP": env_bool("QWEN4_EXP_PREFILL_SP"),
+    "QWEN4_EXP_PREFILL_SP_MIN_TOKENS": env_int(
+        "QWEN4_EXP_PREFILL_SP_MIN_TOKENS", 1024
+    ),
     # Select the blockwise owner-output kernel after the outer one-hot MoE
     # threshold has selected the TensorCore path. "off" keeps the dense
     # one-hot combine; "on" enables the kernel for every shape that passes

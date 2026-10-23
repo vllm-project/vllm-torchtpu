@@ -150,9 +150,18 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
         valid_tokens: torch.Tensor,
         raw_embeddings: torch.Tensor | None = None,
         speculative: tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
+        sequence_parallel: bool = False,
     ) -> torch.Tensor:
         """``speculative`` is (read_ids, ckpt_ids, windowed) on the unified pool
-        with speculative decoding; see ``pooled_short_conv_speculative``."""
+        with speculative decoding; see ``pooled_short_conv_speculative``.
+
+        With ``sequence_parallel`` the hidden states and the returned rows are
+        this TP rank's token shard (see ``sequence_parallel``); the lookup,
+        values and the convolution still cover every token of the step.
+        """
+        num_tokens = (
+            inputs.input_ids.shape[0] if sequence_parallel else hidden_states.shape[0]
+        )
         assert self._finalized and self._conv is not None
         assert len(self.cache_owners) == 1
         if self.cpu_offload:
@@ -166,8 +175,12 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
             ).clone()
         else:
             raw = self.storage.lookup_raw(self._lookup_ids(inputs, valid_tokens))
-        raw = self.parallel.combine(raw, hidden_states.shape[0])
-        gated = self.gated_values(hidden_states, self.storage.decode(raw))
+        raw = self.parallel.combine(raw, num_tokens)
+        gated = self.gated_values(
+            hidden_states,
+            self.storage.decode(raw),
+            num_tokens if sequence_parallel else None,
+        )
         if speculative is None:
             conv = self._conv(
                 self.norm_conv(gated),
@@ -193,9 +206,13 @@ class Qwen4ExpPooledPLE(Qwen4ExpPLELayer):
             )
         if state_indices.shape[0] == 0:
             return torch.zeros_like(hidden_states)
-        request, _ = token_requests(inputs.query_start_loc, hidden_states.shape[0])
+        request, _ = token_requests(inputs.query_start_loc, num_tokens)
         valid = (
-            torch.arange(hidden_states.shape[0], device=hidden_states.device)
-            < valid_tokens
+            torch.arange(num_tokens, device=hidden_states.device) < valid_tokens
         ) & (state_indices[request] >= 0)
-        return torch.where(valid[:, None], gated + conv, 0)
+        output = torch.where(valid[:, None], gated + conv, 0)
+        if sequence_parallel:
+            from . import sequence_parallel as sp
+
+            output = sp.shard(output)
+        return output

@@ -593,10 +593,25 @@ class Qwen4ExpPLELayer(nn.Module):
         return gated_value + F.silu(conv_output), new_windows
 
     def gated_values(
-        self, hidden_states: torch.Tensor, embeddings: torch.Tensor
+        self,
+        hidden_states: torch.Tensor,
+        embeddings: torch.Tensor,
+        sequence_parallel_tokens=None,
     ) -> torch.Tensor:
-        """PLE values before convolution; storage and history remain caller-owned."""
-        key, _ = self.key_proj(embeddings)
+        """PLE values before convolution; storage and history remain caller-owned.
+
+        With ``sequence_parallel_tokens`` (the step's token count),
+        ``hidden_states`` holds only this TP rank's rows while ``embeddings``
+        covers every token: the key and the gate dot product run on this
+        rank's rows and only the [tokens, hc] dot is all-gathered, so the
+        values (and the convolution after them) stay complete on every rank.
+        """
+        if sequence_parallel_tokens is not None:
+            from . import sequence_parallel as sp
+
+            key, _ = self.key_proj(sp.shard(embeddings))
+        else:
+            key, _ = self.key_proj(embeddings)
         value, _ = self.value_proj(embeddings)
         streams = (self.hc_count, self.hidden_size)
         key = self.norm_key(key).unflatten(-1, streams)
@@ -604,6 +619,8 @@ class Qwen4ExpPLELayer(nn.Module):
         # As in upstream's gate kernel, the products are rounded to the
         # activation dtype and then summed in fp32.
         dot = (key * query).float().sum(dim=-1, keepdim=True).to(key.dtype)
+        if sequence_parallel_tokens is not None:
+            dot = sp.gather(dot.flatten(-2), sequence_parallel_tokens).unsqueeze(-1)
         gate = dot / math.sqrt(self.hidden_size)
         gate = gate.abs().clamp_min(1e-6).sqrt() * gate.sign()
         gated_value = (torch.sigmoid(gate) * value.unsqueeze(-2)).flatten(-2)

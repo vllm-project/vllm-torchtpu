@@ -520,9 +520,12 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             raise ValueError(f"Missing QSA checkpoint tensors: {sorted(missing)}")
 
     def forward_with_indices(
-        self, hidden, positions, metadata: QSAMetadata, rows=None
+        self, hidden, positions, metadata: QSAMetadata, rows=None, reduce=True
     ):
         """Attention output and selected tokens.
+
+        ``reduce=False`` returns this TP rank's partial output projection;
+        the caller sums it across TP.
 
         ``rows`` (int, -1 for none) limits both to those token rows; the
         caches are still written for every token. Pooled QSA attends only
@@ -530,7 +533,7 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
         """
         output, selected = self.attend_with_indices(hidden, positions, metadata, rows)
         output = self.o_proj(output)
-        if self.tp_size > 1:
+        if reduce and self.tp_size > 1:
             output = tensor_model_parallel_all_reduce(output)
         return output, selected
 
