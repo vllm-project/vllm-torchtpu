@@ -1235,6 +1235,44 @@ def test_layer_state_specs_declare_kv_and_recurrent_state(
     assert kv.shape == PallasAttentionBackend.get_kv_cache_shape(16, 32, 2, 128, stored)
 
 
+@pytest.mark.parametrize("kv_dtype", [None, torch.float8_e4m3fn])
+def test_layer_state_specs_declare_the_mla_latent_cache(
+    kv_dtype: torch.dtype | None,
+) -> None:
+    from vllm_torchtpu.layers.adapter.attention import (
+        PallasMLAttentionBackend,
+        PallasMLAttentionBackendImpl,
+    )
+
+    # One latent KV head of kv_lora_rank + qk_rope_head_dim = 576, which the
+    # MLA kernel stores packed: [blocks, block_size / packing, packing, 640].
+    mla = SimpleNamespace(
+        impl=object.__new__(PallasMLAttentionBackendImpl),
+        head_size=576,
+        num_kv_heads=1,
+        kv_cache_quantized_dtype=kv_dtype,
+        use_sparse=False,
+    )
+    exportable = SimpleNamespace(
+        _export_config=SimpleNamespace(
+            dtype="bf16", num_blocks=16, block_size=1024, tensor_parallel_size=1
+        ),
+        _attention_layers=lambda: [mla],
+    )
+    per_layer = universal_adapter.UniversalVllmExportableLLM._layer_state_specs(
+        exportable
+    )
+    assert per_layer is not None
+    ((kv,),) = per_layer
+    stored = kv_dtype or torch.bfloat16
+    assert kv.dtype == tpu_lowering.dtype_name(stored)
+    assert kv.shape == PallasMLAttentionBackend.get_kv_cache_shape(
+        16, 1024, 1, 576, stored
+    )
+    packing = 4 if kv_dtype else 2
+    assert kv.shape == (16, 1024 // packing, packing, 640)
+
+
 @pytest.fixture
 def clean_launch_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in (
