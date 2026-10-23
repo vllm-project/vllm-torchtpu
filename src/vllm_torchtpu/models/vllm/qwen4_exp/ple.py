@@ -116,8 +116,11 @@ def token_requests(
     num_reqs = query_start_loc.numel() - 1
     query_start_loc = query_start_loc.to(torch.int32)
     starts = query_start_loc[1:num_reqs].clamp(max=num_tokens)
-    marks = torch.zeros(
-        num_tokens + 1, dtype=torch.int32, device=query_start_loc.device
+    # Keep the overflow slot inside a tensor op: a symbolic `num_tokens + 1`
+    # would otherwise escape as a scalar output across the host PLE boundary.
+    marks = F.pad(
+        torch.zeros(num_tokens, dtype=torch.int32, device=query_start_loc.device),
+        (0, 1),
     )
     marks.index_add_(0, starts, torch.ones_like(starts))
     request = marks[:num_tokens].cumsum(0, dtype=torch.int32).clamp(max=num_reqs - 1)
