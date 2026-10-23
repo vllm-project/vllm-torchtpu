@@ -343,6 +343,9 @@ def _wrap_fresh_timestep(cls: type) -> None:
     cls.forward = _fresh_timestep_forward
 
 
+_SPLIT_ROPE_PATCHED = "_tpu_split_rope_patched"
+
+
 def _patch_ltx2_split_rope() -> None:
     # -------------------------------------------------------------------------
     # TODO: Remove this patch once vLLM-Omni's LTX-2 split RoPE rotates q and
@@ -385,10 +388,9 @@ def _patch_ltx2_split_rope() -> None:
     from vllm_torchtpu.utils import synchronize_tensors
 
     rope_cls = ltx2_transformer.LTX2AudioVideoRotaryPosEmbed
-    if hasattr(rope_cls, "_tpu_orig_forward"):
+    if getattr(rope_cls.forward, _SPLIT_ROPE_PATCHED, False):
         return
     orig_rope_forward = rope_cls.forward
-    rope_cls._tpu_orig_forward = orig_rope_forward
     orig_apply_split_rotary_emb = ltx2_transformer.apply_split_rotary_emb
 
     def _cached_rope_forward(
@@ -435,6 +437,7 @@ def _patch_ltx2_split_rope() -> None:
             sin = sin[..., start : start + width]
         return apply_split_rotary_half_swap(x, cos, sin, head_dim)
 
+    setattr(_cached_rope_forward, _SPLIT_ROPE_PATCHED, True)
     rope_cls.forward = _cached_rope_forward
     ltx2_transformer.apply_split_rotary_emb = _apply_split_rotary_emb
     logger.info("Applied TPU patch: cached LTX-2 split RoPE on the q/k layout.")
