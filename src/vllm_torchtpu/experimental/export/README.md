@@ -110,6 +110,9 @@ python -m vllm_torchtpu.experimental.export --export-mode all \
 ```
 
 `all` saves exactly the weights serving computes on TPU, from a single load.
+`checkpoint` requantizes on CPU, where a few FP8 values that sit on a rounding
+boundary round the other way (for Qwen3-30B-A3B-FP8, 0.002-0.004% of the FP8
+weights differ by one FP8 ULP; scales and unquantized weights are identical).
 `checkpoint` needs no TPU: pass the model arguments of the export that produced
 `--output-dir`, and it loads every tensor-parallel rank's weights through vLLM on
 CPU, one process per rank. Either way, one process per rank saves that rank's

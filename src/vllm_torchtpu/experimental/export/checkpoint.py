@@ -89,6 +89,19 @@ def local_tensors(model: Any) -> dict[str, Any]:
     return tensors
 
 
+def host_tensors(model: Any) -> dict[str, Any]:
+    """CPU copies of `local_tensors(model)`; tied names keep sharing one copy.
+
+    Taken before lowering: tracing on TPU can leave placeholder tensors in the
+    model (e.g. a MoE router weight), which cannot be copied to host afterwards.
+    """
+    copies: dict[int, Any] = {}
+    return {
+        name: copies.setdefault(id(t), t.detach().cpu())
+        for name, t in local_tensors(model).items()
+    }
+
+
 def to_numpy(tensor: Any) -> Any:
     """A CPU numpy view of `tensor`, with `ml_dtypes` types for bf16 and FP8."""
     import ml_dtypes
@@ -129,7 +142,10 @@ def iter_checkpoint_shards(
                 f"{name}: loaded dtype {dtype}, artifact declares {spec['dtype']}"
             )
         expected = shard_shape(spec, axis_sizes)
-        array = to_numpy(tensor)
+        try:
+            array = to_numpy(tensor)
+        except RuntimeError as e:
+            raise RuntimeError(f"{name}: cannot copy the loaded tensor to host") from e
         if list(array.shape) != expected:
             if [1, *array.shape] != expected:
                 raise ValueError(
@@ -158,8 +174,26 @@ def save_checkpoint(
     """Saves the global arrays assembled from every process's `shards` with Orbax.
 
     Each process contributes one CPU device, the mesh position of its rank; Orbax
-    writes each array's chunks from the processes that hold them.
+    writes each array's chunks from the processes that hold them. 64-bit types are
+    enabled only while saving, so i64 constants keep their width without changing
+    how the process's other JAX code (e.g. Pallas kernels) traces.
     """
+    import jax
+
+    x64 = jax.config.jax_enable_x64
+    jax.config.update("jax_enable_x64", True)
+    try:
+        _save_checkpoint(inputs, shards, axis_sizes, data_dir)
+    finally:
+        jax.config.update("jax_enable_x64", x64)
+
+
+def _save_checkpoint(
+    inputs: Sequence[Mapping[str, Any]],
+    shards: Iterable[Any],
+    axis_sizes: Mapping[str, int],
+    data_dir: str,
+) -> None:
     import jax
     import numpy as np
     import orbax.checkpoint as ocp
@@ -191,7 +225,6 @@ def init_jax(rank: int, world_size: int) -> None:
     """
     import jax
 
-    jax.config.update("jax_enable_x64", True)  # Keep i64 constants 64-bit.
     if world_size > 1:
         jax.distributed.initialize(
             f"{os.environ['MASTER_ADDR']}:{os.environ[JAX_PORT_ENV]}",
@@ -200,11 +233,13 @@ def init_jax(rank: int, world_size: int) -> None:
         )
 
 
-def save_model_checkpoint(model: Any, artifact_dir: str, data_dir: str) -> None:
-    """Saves this rank's weights of `model` for the artifact in `artifact_dir`."""
+def save_model_checkpoint(
+    tensors: Mapping[str, Any], artifact_dir: str, data_dir: str
+) -> None:
+    """Saves this rank's `tensors`, by name, for the artifact in `artifact_dir`."""
     inputs = abstract_params_inputs(artifact_dir)
     sizes = mesh_axis_sizes(artifact_dir)
-    shards = iter_checkpoint_shards(inputs, local_tensors(model), sizes)
+    shards = iter_checkpoint_shards(inputs, tensors, sizes)
     save_checkpoint(inputs, shards, sizes, data_dir)
 
 
@@ -240,7 +275,9 @@ def run_cpu_load_worker(args: argparse.Namespace) -> None:
         model = universal_adapter.load_vllm_model(vllm_config, load_format="auto")
 
     save_model_checkpoint(
-        model, args.output_dir, os.path.join(args.output_dir, CHECKPOINT_DATA_DIR)
+        local_tensors(model),
+        args.output_dir,
+        os.path.join(args.output_dir, CHECKPOINT_DATA_DIR),
     )
 
 

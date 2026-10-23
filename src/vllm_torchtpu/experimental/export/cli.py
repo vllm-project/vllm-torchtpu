@@ -270,12 +270,14 @@ def run_export_from_args(
                 cache_cfg.gpu_memory_utilization, kv_cache_memory_bytes
             )
 
+    if export_mode == "all":
+        weights = checkpoint.host_tensors(getattr(exportable, "model", exportable))
     exporter.export(
         exportable, args.output_dir, emit_weight_json=export_mode == "model"
     )
     if export_mode == "all":
         checkpoint.save_model_checkpoint(
-            getattr(exportable, "model", exportable),
+            weights,
             args.output_dir,
             os.environ.get(
                 checkpoint.DATA_DIR_ENV,
