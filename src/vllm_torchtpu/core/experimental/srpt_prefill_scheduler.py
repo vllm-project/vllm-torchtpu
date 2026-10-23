@@ -530,3 +530,25 @@ class SrptPrefillScheduler(AsyncScheduler):
         )
         free = self.kv_cache_manager.block_pool.get_num_free_blocks()
         return free - reserved >= needed
+
+
+from vllm_torchtpu.core.prefix_aware_scheduler import (  # noqa: E402
+    PrefixAwareScheduler,
+)
+
+
+class PrefixAwareSrptScheduler(PrefixAwareScheduler, SrptPrefillScheduler):
+    """PrefixAwareScheduler admission (warmest-first) over SRPT handling of
+    running prefill chunks.
+
+    Fixes the "requests wait with free seats" case: upstream schedules
+    RUNNING before WAITING, so one in-progress long prefill takes the whole
+    token budget every step and a short (or warm) waiting request cannot be
+    admitted although seats are free. The SRPT layer orders running prefill
+    chunks shortest-first and holds back the longest ones for a shorter
+    waiting request. PrefixAwareScheduler.schedule() reorders the waiting
+    queue first, then SrptPrefillScheduler.schedule() runs on that order.
+
+    Select with ``--scheduler-cls``
+    ``vllm_torchtpu.core.experimental.srpt_prefill_scheduler.PrefixAwareSrptScheduler``.
+    """

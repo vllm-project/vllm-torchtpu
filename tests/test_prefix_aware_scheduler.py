@@ -208,3 +208,25 @@ def test_coordinator_failure_falls_back_to_fcfs():
     assert q is not None
     assert [r.request_id for r in q] == ["r1", "r2"]
     assert s._paw_scoring_broken is True
+
+
+def test_prefix_aware_srpt_scheduler_chains_both_layers():
+    from vllm_torchtpu.core.experimental.srpt_prefill_scheduler import (
+        PrefixAwareSrptScheduler,
+        SrptPrefillScheduler,
+    )
+
+    mro = PrefixAwareSrptScheduler.__mro__
+    assert mro.index(PrefixAwareScheduler) < mro.index(SrptPrefillScheduler)
+    assert mro.index(SrptPrefillScheduler) < mro.index(AsyncScheduler)
+    calls = []
+
+    def srpt_schedule(self, throttle_prefills=False):
+        calls.append(("srpt", throttle_prefills))
+
+    s = _make_scheduler([], {})
+    s.__class__ = PrefixAwareSrptScheduler
+    with patch.object(SrptPrefillScheduler, "schedule", srpt_schedule):
+        s.schedule()
+    # PAW reorders the waiting queue, then forwards to the SRPT layer.
+    assert calls == [("srpt", False)]
