@@ -199,25 +199,47 @@ def _staged_walk_products(
     outs = []
     for off, n, t in table_geom:
         outs.append(staged_dev[off : off + n * t].clone())
-    states = []
-    ckpts = []
+    states: list = [None] * len(mamba_geom)
+    ckpts: list = [None] * len(mamba_geom)
     if mamba_geom:
         active = seq_lens > 0
-        for ti, t, bs in mamba_geom:
-            off, n, _ = table_geom[ti]
-            tbl = staged_dev[off : off + n * t].view(n, t)
+        device = seq_lens.device
+        # Groups sharing (num_blocks, block_size) share every row offset, so
+        # each such class is one gather over the flat staged buffer instead
+        # of one small gather per group (~1.5 us each, ~70 per step).
+        classes: dict[tuple[int, int], list[int]] = {}
+        for j, (_, t, bs) in enumerate(mamba_geom):
+            classes.setdefault((t, bs), []).append(j)
+        for (t, bs), members in classes.items():
+            n = table_geom[mamba_geom[members[0]][0]][1]
+            # Flat offset of row r of member g: table offset + r * t.
+            bases = torch.tensor(
+                [table_geom[mamba_geom[j][0]][0] for j in members],
+                device=device,
+                dtype=torch.int64,
+            ).unsqueeze(1) + (
+                torch.arange(n, device=device, dtype=torch.int64) * t
+            ).unsqueeze(0)
             state_offsets = torch.clamp((seq_lens - 1) // bs, min=0, max=t - 1).to(
                 torch.int64
             )
-            gathered = torch.gather(tbl, 1, state_offsets.unsqueeze(1)).squeeze(1)
-            states.append(torch.where(active, gathered, torch.zeros_like(gathered)))
+            gathered = staged_dev[bases + state_offsets.unsqueeze(0)]
+            gathered = torch.where(
+                active.unsqueeze(0), gathered, torch.zeros_like(gathered)
+            )
             if ckpt_window > 1:
                 ckpt_offsets = state_offsets.unsqueeze(1) + torch.arange(
-                    ckpt_window, device=seq_lens.device, dtype=torch.int64
+                    ckpt_window, device=device, dtype=torch.int64
                 ).unsqueeze(0)
                 in_row = (ckpt_offsets < t) & active.unsqueeze(1)
                 safe = torch.where(in_row, ckpt_offsets, torch.zeros_like(ckpt_offsets))
-                ckpts.append(torch.gather(tbl, 1, safe) * in_row)
+                ck = staged_dev[bases.unsqueeze(2) + safe.unsqueeze(0)] * in_row
+            for k, j in enumerate(members):
+                states[j] = gathered[k]
+                if ckpt_window > 1:
+                    ckpts[j] = ck[k]
+    if ckpt_window <= 1:
+        ckpts = []
     return tuple(outs) + tuple(states) + tuple(ckpts)
 
 
