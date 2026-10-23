@@ -1204,6 +1204,17 @@ def test_launch_workers_keeps_rank0_output(tmp_path: Path) -> None:
     assert not list(tmp_path.glob(".export_ranks_*"))
 
 
+def test_launch_workers_creates_the_output_parent_dir(tmp_path: Path) -> None:
+    out_dir = tmp_path / "new" / "out"
+    with (
+        mock.patch.object(cli, "_worker_env", lambda tp: {}),
+        mock.patch.object(cli.subprocess, "Popen", _FakeWorker),
+    ):
+        cli._launch_workers(["--model", "m"], 1, str(out_dir))
+    assert json.loads((out_dir / "metadata.json").read_text()) == {"rank": 0}
+    assert not list((tmp_path / "new").glob(".export_ranks_*"))
+
+
 def test_launch_workers_fails_when_a_worker_fails(tmp_path: Path) -> None:
     class Failing(_FakeWorker):
         fail_ranks = (1,)
