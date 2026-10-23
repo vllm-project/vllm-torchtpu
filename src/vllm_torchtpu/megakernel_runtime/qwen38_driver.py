@@ -75,6 +75,16 @@ def _parse_check(raw: str) -> int:
     return 0
 
 
+def pool_layout_of(pool: torch.Tensor) -> Any:
+    """`Qwen38GdnPoolLayout` of a torch pool tensor (shape and dtype name only)."""
+    from .qwen38_gdn_state import Qwen38GdnPoolLayout
+
+    return Qwen38GdnPoolLayout(
+        pool_shape=tuple(int(d) for d in pool.shape),
+        pool_dtype=str(pool.dtype).removeprefix("torch."),
+    )
+
+
 class _SegmentKind:
     """One torch op for a segment kind (`L` layers); buckets resolve on the concrete rows.
 
@@ -202,7 +212,7 @@ class Qwen38Segments(nn.Module):
             if getattr(self.layers[0].linear_attn, "_bm_kernel", False):
                 raise RuntimeError("Qwen3.8 megakernel does not support block-major pools yet")
             self.pool = base
-            self.layout = Qwen38GdnPoolLayout.from_pool(base)
+            self.layout = pool_layout_of(base)
         for L in sorted({len(segment_layers(self.g, s)) for s in range(self.n_seg)}):
             self.kinds[(L, False)] = _SegmentKind(
                 self.mesh, self.g, L, self.layout, self.write_ckpts
