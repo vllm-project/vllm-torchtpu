@@ -2211,6 +2211,61 @@ class TestMambaSlotReadOffsets:
         runner._update_mamba_slot_read_offsets([], torch.tensor([[1, 2]]), 1)
         assert int(runner.mamba_slot_read_offsets.sum()) == 0
 
+    @pytest.mark.parametrize("num_groups", [1, 2])
+    @pytest.mark.parametrize(
+        "width,rows,num_reqs",
+        [
+            (4, 2, 2),  # rows < width, num_reqs < width
+            (4, 3, 2),  # rows < width, extra row past num_reqs
+            (4, 4, 4),  # rows == width, full batch
+            (4, 6, 3),  # rows > width, num_reqs < width
+        ],
+    )
+    def test_update_read_offsets_impl_matches_eager(
+        self, num_groups, width, rows, num_reqs
+    ):
+        """Fused _update_read_offsets_impl matches the eager scatter across
+        1 vs 2 groups, rows < / == / > width, and num_reqs < width."""
+        num_blocks = 24
+        # Distinct active slots per group; positions >= num_reqs use slot 0.
+        raw_slots = [[2, 5, 8, 11], [14, 17, 19, 22]]
+        groups = []
+        for g in range(num_groups):
+            slots = [raw_slots[g][i] if i < num_reqs else 0 for i in range(width)]
+            groups.append(torch.tensor(slots, dtype=torch.int32))
+
+        token_rows = [
+            [10, 11, 12, 13],  # 4 valid -> offset 3
+            [20, INVALID_TOKEN_ID, INVALID_TOKEN_ID, INVALID_TOKEN_ID],  # -> 0
+            [30, 31, INVALID_TOKEN_ID, INVALID_TOKEN_ID],  # -> 1
+            [40, 41, 42, INVALID_TOKEN_ID],  # -> 2
+            [50, 51, 52, 53],  # truncated when rows > width
+            [INVALID_TOKEN_ID] * 4,
+        ]
+        next_tokens = torch.tensor(token_rows[:rows], dtype=torch.int32)
+
+        runner = self._make_runner(num_blocks=num_blocks)
+        runner.mamba_slot_read_offsets.fill_(7)
+        runner.mamba_slot_read_offsets[0] = 0
+        runner._update_mamba_slot_read_offsets(groups, next_tokens, num_reqs)
+        expected = runner.mamba_slot_read_offsets.clone()
+
+        for fn in (
+            tpu_runner._update_read_offsets_impl,
+            torch.compile(
+                tpu_runner._update_read_offsets_impl, backend="eager", fullgraph=True
+            ),
+        ):
+            actual = torch.full((num_blocks,), 7, dtype=torch.int32)
+            actual[0] = 0
+            fn(
+                actual,
+                groups,
+                next_tokens,
+                torch.tensor(num_reqs, dtype=torch.int64),
+            )
+            assert torch.equal(actual, expected)
+
 
 class TestReadOffsetsClearedOnReallocation:
     """A recycled slot/block must not carry a read offset into its next owner.

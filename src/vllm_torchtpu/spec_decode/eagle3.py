@@ -124,6 +124,68 @@ def _maybe_pad_dim1(t: torch.Tensor, target_len: int) -> torch.Tensor:
     return torch.nn.functional.pad(t, (0, target_len - n))
 
 
+def _async_draft_seed_impl(
+    next_tokens: torch.Tensor,
+    num_draft: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_reqs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Async draft seed from the on-device rejection-sampler output, as one
+    program per request-padding bucket instead of ~15 eager ones.
+
+    `next_tokens` is `[width, K+1]` (accepted prefix + bonus, padded with
+    INVALID_TOKEN_ID); `num_draft` the per-row draft counts (>= width rows);
+    `query_start_loc` the chunk's query starts, whose ends may cover fewer
+    than `width` rows (the rows past them take the last end); `num_reqs` a
+    0-d int64 tensor, so it enters as a value, not a shape. Returns
+    `(last_token_indices int64, next_token_ids int32, num_rejected int32)`,
+    all `[width]`; padding rows repeat the last real request's seed position
+    and token and report no rejections.
+    """
+    width = next_tokens.shape[0]
+    num_valid = (next_tokens != INVALID_TOKEN_ID).sum(dim=1).clamp(min=1)
+    next_token_ids = (
+        next_tokens.gather(1, (num_valid - 1).unsqueeze(1)).squeeze(1).to(torch.int32)
+    )
+    num_draft = num_draft[:width].to(torch.int64)
+    accepted_drafts = torch.minimum((num_valid - 1).clamp(min=0), num_draft)
+    num_rejected = (num_draft - accepted_drafts).to(torch.int32)
+    qsl_end = query_start_loc[1 : width + 1].to(torch.int64)
+    if qsl_end.shape[0] < width:
+        qsl_end = torch.cat([qsl_end, qsl_end[-1:].expand(width - qsl_end.shape[0])])
+    last_token_indices = qsl_end - 1 - num_rejected.to(torch.int64)
+    valid = torch.arange(width, device=next_tokens.device) < num_reqs
+    last = (num_reqs - 1).view(1)
+    last_token_indices = torch.where(
+        valid, last_token_indices, last_token_indices.index_select(0, last)
+    )
+    next_token_ids = torch.where(
+        valid, next_token_ids, next_token_ids.index_select(0, last)
+    )
+    num_rejected = torch.where(valid, num_rejected, torch.zeros_like(num_rejected))
+    return last_token_indices, next_token_ids, num_rejected
+
+
+_async_draft_seed_compiled = _static_shape_args(
+    torch.compile(backend="tpu", fullgraph=True, dynamic=False)(_async_draft_seed_impl)
+)
+
+
+def _async_draft_seed(
+    next_tokens: torch.Tensor,
+    num_draft: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    num_reqs: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    # The tpu backend cannot trace CPU tensors (unit tests).
+    fn = (
+        _async_draft_seed_compiled
+        if next_tokens.device.type == "tpu"
+        else _async_draft_seed_impl
+    )
+    return fn(next_tokens, num_draft, query_start_loc, num_reqs)
+
+
 if TYPE_CHECKING:
     from vllm_torchtpu.runner.tpu_runner import TPUModelRunner
 
@@ -1597,69 +1659,90 @@ class Eagle3Proposer:
             # on num_reqs; the rows past num_reqs are masked below.
             width = next_tokens_device.shape[0]
             nt = next_tokens_device
-            num_valid = (nt != INVALID_TOKEN_ID).sum(dim=1).clamp(min=1)
-            last_valid_col = num_valid - 1
-            next_token_ids = (
-                nt.gather(1, last_valid_col.unsqueeze(1)).squeeze(1).to(torch.int32)
-            )
-            # Anchor the seed position at qsl_end-1 (like the sync path) using
-            # the REAL per-request draft count.
-            # num_draft is read on-device from the chunk's draft_lengths snapshot
-            # draft_lengths is None for a chunk with no spec metadata.
+            # Partial-prefill (discard) requests have no sampled token; the
+            # eager path below seeds them from the host request state.
+            ov_i = [i for i in range(num_reqs) if start + i in discard_set]
+            # num_draft is read on-device from the chunk's draft_lengths
+            # snapshot; draft_lengths is None for a chunk with no spec metadata.
             if chunk.draft_lengths is not None:
-                num_draft_dev = chunk.draft_lengths[:width].to(torch.int64)
+                num_draft_full = chunk.draft_lengths
             else:
                 num_draft_np = np.zeros(width, dtype=np.int64)
                 num_draft_np[:num_reqs] = [
                     len(scheduler_output.scheduled_spec_decode_tokens.get(rid, ()))
                     for rid in req_ids
                 ]
-                num_draft_dev = torch.from_numpy(num_draft_np).to(runner.device)
-            accepted_drafts = torch.minimum((num_valid - 1).clamp(min=0), num_draft_dev)
-            num_rejected_out = (num_draft_dev - accepted_drafts).to(torch.int32)
-            # qsl_end already lives on-device in the chunk's attn context (the
-            # same tensor _build_draft_attn_metadata reads at step_idx=0); slice
-            # it instead of a fresh H2D of query_start_loc_np. The upload is
-            # sized by the chunk's request cap, which can sit below the
-            # request-padding bucket; the rows past it take the last end.
-            qsl_end = chunk.attn_ctx.query_start_loc[1 : width + 1].to(torch.int64)
-            if qsl_end.shape[0] < width:
-                qsl_end = torch.cat(
-                    [qsl_end, qsl_end[-1:].expand(width - qsl_end.shape[0])]
-                )
-            last_token_indices = qsl_end - 1 - num_rejected_out.to(torch.int64)
-            # Partial-prefill (discard) requests have no sampled token; seed
-            # them from the host request state (same value as the sync path).
-            ov_i = [i for i in range(num_reqs) if start + i in discard_set]
-            if ov_i:
-                ov_v = []
-                for i in ov_i:
-                    req_state = runner.requests[req_ids[i]]
-                    seq_len = (
-                        req_state.num_computed_tokens
-                        + scheduler_output.num_scheduled_tokens[req_ids[i]]
+                num_draft_full = torch.from_numpy(num_draft_np).to(runner.device)
+            if not ov_i and envs.VLLM_TPU_FUSED_ASYNC_DRAFT_SEED:
+                # Unsliced inputs: slicing inside the program keeps the views
+                # from materializing as their own eager programs.
+                last_token_indices, next_token_ids, num_rejected_out = (
+                    _async_draft_seed(
+                        nt,
+                        num_draft_full,
+                        chunk.attn_ctx.query_start_loc,
+                        torch.tensor(num_reqs, dtype=torch.int64, device=runner.device),
                     )
-                    ov_v.append(req_state.get_token_id(seq_len))
-                next_token_ids[
-                    torch.tensor(ov_i, dtype=torch.long, device=runner.device)
-                ] = torch.tensor(ov_v, dtype=next_token_ids.dtype, device=runner.device)
-            if width > num_reqs:
-                # Padding rows repeat the last real request's seed position and
-                # token (after its partial-prefill override, so the duplicate
-                # scatter writes the same value), and report no rejections.
-                # num_reqs enters as a value, not a shape.
-                n_dev = torch.tensor(num_reqs, dtype=torch.int64, device=runner.device)
-                valid = torch.arange(width, device=runner.device) < n_dev
-                last = (n_dev - 1).view(1)
-                last_token_indices = torch.where(
-                    valid, last_token_indices, last_token_indices.index_select(0, last)
                 )
-                next_token_ids = torch.where(
-                    valid, next_token_ids, next_token_ids.index_select(0, last)
+            else:
+                num_draft_dev = num_draft_full[:width].to(torch.int64)
+                num_valid = (nt != INVALID_TOKEN_ID).sum(dim=1).clamp(min=1)
+                last_valid_col = num_valid - 1
+                next_token_ids = (
+                    nt.gather(1, last_valid_col.unsqueeze(1)).squeeze(1).to(torch.int32)
                 )
-                num_rejected_out = torch.where(
-                    valid, num_rejected_out, torch.zeros_like(num_rejected_out)
+                # Anchor the seed position at qsl_end-1 (like the sync path) using
+                # the REAL per-request draft count (num_draft_dev above).
+                accepted_drafts = torch.minimum(
+                    (num_valid - 1).clamp(min=0), num_draft_dev
                 )
+                num_rejected_out = (num_draft_dev - accepted_drafts).to(torch.int32)
+                # qsl_end already lives on-device in the chunk's attn context (the
+                # same tensor _build_draft_attn_metadata reads at step_idx=0); slice
+                # it instead of a fresh H2D of query_start_loc_np. The upload is
+                # sized by the chunk's request cap, which can sit below the
+                # request-padding bucket; the rows past it take the last end.
+                qsl_end = chunk.attn_ctx.query_start_loc[1 : width + 1].to(torch.int64)
+                if qsl_end.shape[0] < width:
+                    qsl_end = torch.cat(
+                        [qsl_end, qsl_end[-1:].expand(width - qsl_end.shape[0])]
+                    )
+                last_token_indices = qsl_end - 1 - num_rejected_out.to(torch.int64)
+                if ov_i:
+                    ov_v = []
+                    for i in ov_i:
+                        req_state = runner.requests[req_ids[i]]
+                        seq_len = (
+                            req_state.num_computed_tokens
+                            + scheduler_output.num_scheduled_tokens[req_ids[i]]
+                        )
+                        ov_v.append(req_state.get_token_id(seq_len))
+                    next_token_ids[
+                        torch.tensor(ov_i, dtype=torch.long, device=runner.device)
+                    ] = torch.tensor(
+                        ov_v, dtype=next_token_ids.dtype, device=runner.device
+                    )
+                if width > num_reqs:
+                    # Padding rows repeat the last real request's seed position and
+                    # token (after its partial-prefill override, so the duplicate
+                    # scatter writes the same value), and report no rejections.
+                    # num_reqs enters as a value, not a shape.
+                    n_dev = torch.tensor(
+                        num_reqs, dtype=torch.int64, device=runner.device
+                    )
+                    valid = torch.arange(width, device=runner.device) < n_dev
+                    last = (n_dev - 1).view(1)
+                    last_token_indices = torch.where(
+                        valid,
+                        last_token_indices,
+                        last_token_indices.index_select(0, last),
+                    )
+                    next_token_ids = torch.where(
+                        valid, next_token_ids, next_token_ids.index_select(0, last)
+                    )
+                    num_rejected_out = torch.where(
+                        valid, num_rejected_out, torch.zeros_like(num_rejected_out)
+                    )
         elif device_seed is not None:
             # On-device prefill bootstrap: seed from the device sampled tokens
             # (no D2H). num_rejected stays 0 (num_rejected_tokens_np is None ->
