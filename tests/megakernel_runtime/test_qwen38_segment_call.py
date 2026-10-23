@@ -149,7 +149,11 @@ def test_segment_call_matches_reference_and_writes_checkpoints(L, head, pool_gdn
     lead = (hidden,) if head else (hidden, attn)
     assert len(in_specs) == len(lead) + len(flat) + 1 + len(meta)
     assert donate == (len(lead) + len(flat),)
-    res, new_pool = jax.jit(fn)(*lead, *flat, pool, *meta)
+    # Through the fixed-arity wrapper the TPU bridge needs (no *args signature).
+    from vllm_torchtpu.megakernel_runtime.exported_bridge import make_typed_step_wrapper
+
+    typed = make_typed_step_wrapper("seg_call_test", fn, len(in_specs), len(out_specs))
+    res, new_pool = jax.jit(typed)(*lead, *flat, pool, *meta)
 
     res0 = np.asarray(res.reshape(R, B, -1)[0], np.float32)
     refn = np.asarray(ref, np.float32)
