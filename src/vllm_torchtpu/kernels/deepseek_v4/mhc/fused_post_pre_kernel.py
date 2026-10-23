@@ -23,6 +23,10 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu.kernels.deepseek_v4.mhc import utils
 from vllm_torchtpu.kernels.deepseek_v4.mhc.utils import DEFAULT_VMEM_LIMIT_BYTES
 
+# Smallest block min_grid_steps may shrink to: the default block, whose MXU
+# accumulation pattern every larger block repeats per 32 rows.
+MIN_TOKEN_BLOCK = 32
+
 
 def _fused_kernel(
     x_ref,
@@ -120,6 +124,7 @@ def _fused_kernel(
         "hc_pre_eps",
         "routed_scale",
         "token_block_size",
+        "min_grid_steps",
         "gemm_precision",
         "vmem_limit_bytes",
     ),
@@ -138,6 +143,7 @@ def fused_post_pre_mixes(
     shared2d: jax.Array | None = None,
     routed_scale: float = 1.0,
     token_block_size: int = 32,
+    min_grid_steps: int = 1,
     gemm_precision: str = "highest",
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
@@ -166,7 +172,10 @@ def fused_post_pre_mixes(
         token_block_size: tokens per grid step. Default 32 keeps the
             worst-case VMEM footprint (f32 old streams + bf16 blocks +
             the three resident bf16 fn chunks) near 12 MB at DeepSeek-V4
-            shapes; 64 also fits.
+            shapes; 64 and 128 also fit.
+        min_grid_steps: static; shrink the block (to no less than 32
+            tokens) until the grid has at least this many steps, so the
+            pipeline's exposed first-block DMA stays small at short batches.
         gemm_precision: "highest" (3-pass exact decomposition, the
             default) or "default" (hi-chunk pass only; pre_mix and the
             collapse then also see the hi-only mixes).
@@ -195,7 +204,10 @@ def fused_post_pre_mixes(
 
     # This kernel keeps a fixed block: its default (32) already fits the
     # budget at DeepSeek-V4 shapes, so there is no vmem_need to shrink by.
-    tb, padded_tokens = utils.select_token_block(num_tokens, token_block_size)
+    per_step = utils.round_up(-(-num_tokens // min_grid_steps), MIN_TOKEN_BLOCK)
+    tb, padded_tokens = utils.select_token_block(
+        num_tokens, min(token_block_size, max(MIN_TOKEN_BLOCK, per_step))
+    )
     x2d, res2d, post2d, comb2d = utils.pad_to(padded_tokens, x2d, res2d, post2d, comb2d)
     x_inputs = [x2d]
     x_specs = [pl.BlockSpec((tb, hidden_size), lambda i: (i, 0))]
@@ -278,6 +290,7 @@ def mhc_fused_post_pre(
     shared: jax.Array | None = None,
     routed_scale: float = 1.0,
     token_block_size: int = 32,
+    min_grid_steps: int = 1,
     gemm_precision: str = "highest",
     vmem_limit_bytes: int = DEFAULT_VMEM_LIMIT_BYTES,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
@@ -313,6 +326,7 @@ def mhc_fused_post_pre(
         shared2d=None if shared is None else shared.reshape(-1, hidden_size),
         routed_scale=routed_scale,
         token_block_size=token_block_size,
+        min_grid_steps=min_grid_steps,
         gemm_precision=gemm_precision,
         vmem_limit_bytes=vmem_limit_bytes,
     )

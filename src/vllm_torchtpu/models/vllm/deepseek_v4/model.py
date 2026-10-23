@@ -67,6 +67,11 @@ from vllm_torchtpu.models.vllm.deepseek_v4.moe import DeepseekV4MoE
 
 logger = init_logger(__name__)
 
+# The mHC seam kernel's tokens per grid step, and the fewest grid steps it
+# shrinks the block for at short batches (see fused_post_pre_mixes).
+MHC_SEAM_TOKEN_BLOCK = 32
+MHC_SEAM_MIN_GRID_STEPS = 1
+
 
 class DeepseekV4DecoderLayer(nn.Module):
     """Single transformer decoder layer for DeepSeek-V4 with MHC residual stream."""
@@ -149,6 +154,8 @@ class DeepseekV4DecoderLayer(nn.Module):
                 self.hc_post_alpha,
                 self.hc_sinkhorn_iters,
                 self.ffn.routed_scaling_factor,
+                seam_token_block=MHC_SEAM_TOKEN_BLOCK,
+                seam_min_grid_steps=MHC_SEAM_MIN_GRID_STEPS,
             )
             object.__setattr__(self, "_mhc_ops_instance", ops)
         return ops

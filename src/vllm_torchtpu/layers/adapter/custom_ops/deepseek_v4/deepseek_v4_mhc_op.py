@@ -64,6 +64,11 @@ def _gate_suffix(
     )
 
 
+def _block_suffix(token_block_size: int, min_grid_steps: int) -> str:
+    """The seam kernel's token block settings are baked in too."""
+    return f"_tb{token_block_size}_g{min_grid_steps}"
+
+
 # Module-level so `pallas.jax_op` can trace and register them as torch ops.
 def _mhc_pre_jax(
     residual: jax.Array,
@@ -199,6 +204,8 @@ def _mhc_fused_post_pre_shared_jax(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     routed_scale: float,
+    token_block_size: int,
+    min_grid_steps: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """The seam op on an MoE output given as (routed, shared)."""
     return fused_post_pre_kernel.mhc_fused_post_pre(
@@ -216,6 +223,8 @@ def _mhc_fused_post_pre_shared_jax(
         sinkhorn_repeat,
         shared=shared,
         routed_scale=routed_scale,
+        token_block_size=token_block_size,
+        min_grid_steps=min_grid_steps,
     )
 
 
@@ -233,6 +242,8 @@ def _mhc_fused_post_pre_jax(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    token_block_size: int,
+    min_grid_steps: int,
 ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """One layer's post and the next layer's pre as a single kernel."""
     return fused_post_pre_kernel.mhc_fused_post_pre(
@@ -248,6 +259,8 @@ def _mhc_fused_post_pre_jax(
         hc_sinkhorn_eps,
         hc_post_mult_value,
         sinkhorn_repeat,
+        token_block_size=token_block_size,
+        min_grid_steps=min_grid_steps,
     )
 
 
@@ -490,6 +503,8 @@ def _mhc_fused_post_pre_shared_op(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     routed_scale: float,
+    token_block_size: int,
+    min_grid_steps: int,
 ):
     op_name = (
         "pallas::deepseek_v4_mhc_fused_post_pre_shared_v1"
@@ -497,6 +512,7 @@ def _mhc_fused_post_pre_shared_op(
             rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
         )
         + f"_rs{_name_float(routed_scale)}"
+        + _block_suffix(token_block_size, min_grid_steps)
     )
     op = _mhc_op_cache.get(op_name)
     if op is None:
@@ -510,6 +526,8 @@ def _mhc_fused_post_pre_shared_op(
                 hc_post_mult_value=hc_post_mult_value,
                 sinkhorn_repeat=sinkhorn_repeat,
                 routed_scale=routed_scale,
+                token_block_size=token_block_size,
+                min_grid_steps=min_grid_steps,
             ),
             mesh=get_pallas_op_mesh(),
             input_partition_specs=(
@@ -534,12 +552,18 @@ def _mhc_fused_post_pre_op(
     hc_sinkhorn_eps: float,
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
+    token_block_size: int,
+    min_grid_steps: int,
     *,
     single_stream_residual: bool = False,
 ):
     variant = "_res1" if single_stream_residual else ""
-    op_name = f"pallas::deepseek_v4_mhc_fused_post_pre{variant}_v1" + _gate_suffix(
-        rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+    op_name = (
+        f"pallas::deepseek_v4_mhc_fused_post_pre{variant}_v1"
+        + _gate_suffix(
+            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+        )
+        + _block_suffix(token_block_size, min_grid_steps)
     )
     residual_spec = (
         P(ATTN_DATA_AXIS, None)
@@ -557,6 +581,8 @@ def _mhc_fused_post_pre_op(
                 hc_sinkhorn_eps=hc_sinkhorn_eps,
                 hc_post_mult_value=hc_post_mult_value,
                 sinkhorn_repeat=sinkhorn_repeat,
+                token_block_size=token_block_size,
+                min_grid_steps=min_grid_steps,
             ),
             mesh=get_pallas_op_mesh(),
             input_partition_specs=(
@@ -613,6 +639,9 @@ def get_mhc_ops(
     hc_post_mult_value: float,
     sinkhorn_repeat: int,
     routed_scale: float = 1.0,
+    *,
+    seam_token_block: int,
+    seam_min_grid_steps: int,
 ) -> MHCOps:
     """Build (or fetch) every mHC op for these gate constants.
 
@@ -620,14 +649,22 @@ def get_mhc_ops(
     ``PartitionSpec``s, which Dynamo cannot trace, so a cold cache inside a
     compiled forward is a hard error rather than a graph break. Callers hold
     the returned ops and invoke them directly, keeping the op lookup out of
-    the traced graph entirely.
+    the traced graph entirely. ``seam_token_block`` and
+    ``seam_min_grid_steps`` set the seam kernel's grid (see
+    ``fused_post_pre_mixes``).
     """
+    seam_grid = (seam_token_block, seam_min_grid_steps)
     return MHCOps(
         pre=_mhc_pre_op(
             rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
         ),
         fused=_mhc_fused_post_pre_op(
-            rms_eps, hc_pre_eps, hc_sinkhorn_eps, hc_post_mult_value, sinkhorn_repeat
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            *seam_grid,
         ),
         post=get_mhc_post_op(),
         pre_single_stream=_mhc_pre_single_stream_op(
@@ -639,6 +676,7 @@ def get_mhc_ops(
             hc_sinkhorn_eps,
             hc_post_mult_value,
             sinkhorn_repeat,
+            *seam_grid,
             single_stream_residual=True,
         ),
         fused_with_shared=_mhc_fused_post_pre_shared_op(
@@ -648,5 +686,6 @@ def get_mhc_ops(
             hc_post_mult_value,
             sinkhorn_repeat,
             routed_scale,
+            *seam_grid,
         ),
     )
