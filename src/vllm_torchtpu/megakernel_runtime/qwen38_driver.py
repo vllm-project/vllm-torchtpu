@@ -44,7 +44,7 @@ from .driver import (
     _resolve_tp_size,
     register_megakernel_driver,
 )
-from .exported_bridge import sharded_jax_callable
+from .exported_bridge import make_typed_step_wrapper, sharded_jax_callable
 from .qwen38_segment_call import T_VERIFY, build_segment_call, segment_tiles
 from .qwen38_weights import head_groups, pack_segment_operands, segment_layers
 
@@ -131,9 +131,13 @@ class _SegmentKind:
             full, in_specs, outs, donate = build_segment_call(
                 self.mesh, self.g, self.L, B, self.layout, self.write, head=self.head
             )
+            # JaxCallable needs explicit, jax.Array-annotated positional parameters.
+            typed = make_typed_step_wrapper(
+                f"qwen38_mk_{self.tag}_b{B}", full, len(in_specs), len(outs)
+            )
             self._calls[B] = sharded_jax_callable(
                 f"qwen38_mk::{self.tag}_b{B}",
-                full,
+                typed,
                 mesh=self.mesh,
                 input_partition_specs=in_specs,
                 output_partition_specs=outs,
@@ -402,11 +406,18 @@ class Qwen38SegmentDriver:
             return False, None
         self._note(f"mk_b{rows}")
         kw = dict(model_kwargs or {})
-        if self.check_left > 0 and self.shadow is not None:
-            out = self._shadow_step(runner, input_ids, positions, kw)
-        else:
-            with self._contexts(runner, "model_mk_segments"):
-                out = self.program(input_ids=input_ids, positions=positions, **kw)
+        try:
+            if self.check_left > 0 and self.shadow is not None:
+                out = self._shadow_step(runner, input_ids, positions, kw)
+            else:
+                with self._contexts(runner, "model_mk_segments"):
+                    out = self.program(input_ids=input_ids, positions=positions, **kw)
+        except Exception:
+            # Fail closed: one failure disables the megakernel for this server;
+            # this step and all later ones run the stock model.
+            logger.exception("Qwen3.8 megakernel failed; disabling it, stock path from now on")
+            self.program = self.shadow = None
+            return False, None
         if isinstance(out, (list, tuple)):
             out = tuple(out)
         return True, out
