@@ -25,7 +25,10 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa import wrapper as pcp_
 from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
     build_pcp_rank_major_token_order,
 )
-from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import TilePlanField
+from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.schedule import (
+    TilePlanField,
+    build_pcp_streaming_schedule_inputs_from_metadata_jax,
+)
 
 pytestmark = pytest.mark.multichip
 
@@ -183,47 +186,30 @@ def _run_real_pallas(
         cu_q_lens_local,
         distribution_local,
     ):
-        rank_major_query_rows = (
-            pcp_wrapper._compute_pcp_rank_major_query_row_mapping_from_metadata(
-                kv_lens_local,
-                cu_q_lens_local,
-                distribution_local,
-                local_padded_tokens=q_local.shape[0],
-                pcp_size=PCP_SIZE,
-                interleave_size=INTERLEAVE_SIZE,
-            )
-        )
-        block_tables = pcp_wrapper._reshape_metadata_page_indices_jax(
-            page_indices_local, kv_lens_local.shape[0]
-        )
-        writeback_mapping = pcp_wrapper._compute_pcp_kv_writeback_mapping(
-            rank_major_query_rows,
-            block_tables,
+        local_stage_plan = pcp_wrapper._stage_plan_mod.build_pcp_local_stage_plan(
+            kv_lens_local,
+            page_indices_local,
+            cu_q_lens_local,
+            distribution_local,
+            local_tokens=q_local.shape[0],
             local_kv_cache_num_blocks=kv_cache_local.shape[0],
             page_size=kv_cache_local.shape[1],
             pcp_size=PCP_SIZE,
             interleave_size=INTERLEAVE_SIZE,
-        )
-        cache_rank = jax.lax.axis_index(AXIS)
-        compact_slot_ids = pcp_wrapper._compact_writeback_slot_ids_for_cache_rank(
-            writeback_mapping, cache_rank
-        )
-        segment_descriptors, num_segments = (
-            pcp_wrapper._build_writeback_segment_descriptors(
-                compact_slot_ids,
-                writeback_mapping.writeback_counts[cache_rank],
-            )
+            vpage_group_size=kernel.PCP_STREAMING_RPA_VPAGE_GROUP_SIZE,
+            pcp_axis_name=AXIS,
         )
         return pallas_attention(
             q_local,
             current_kv_local,
             kv_cache_local,
             kv_lens_local,
-            page_indices_local,
             cu_q_lens_local,
             distribution_local,
-            segment_descriptors,
-            num_segments,
+            local_stage_plan.segment_descriptors,
+            local_stage_plan.num_segments,
+            stage_plan=local_stage_plan,
+            vpage_group_size=kernel.PCP_STREAMING_RPA_VPAGE_GROUP_SIZE,
             pcp_size=PCP_SIZE,
             interleave_size=INTERLEAVE_SIZE,
             q_block_size=Q_BLOCK_SIZE,
@@ -286,7 +272,7 @@ def test_real_pallas_uses_batch_flat_owner_with_long_history_and_padding(
     num_local_pages = (kv_len + PCP_SIZE * PAGE_SIZE - 1) // (PCP_SIZE * PAGE_SIZE)
     kv_cache = _pack_kv_cache(k_request, v_request, num_local_pages)
 
-    schedule_inputs = kernel.build_pcp_streaming_schedule_inputs_from_metadata_jax(
+    schedule_inputs = build_pcp_streaming_schedule_inputs_from_metadata_jax(
         kv_lens=np.array([kv_len], dtype=np.int32),
         page_indices=np.arange(num_local_pages, dtype=np.int32),
         cu_q_lens=np.array([0, q_len], dtype=np.int32),

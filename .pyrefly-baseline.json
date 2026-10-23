@@ -176,11 +176,6 @@
       "concise_description": "`capture_active` may be uninitialized"
     },
     {
-      "path": "src/vllm_torchtpu/kernels/experimental/pcp_streaming_rpa/vllm_adapter.py",
-      "name": "bad-argument-type",
-      "concise_description": "Argument `float | None` is not assignable to parameter `sm_scale` with type `float` in function `vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.wrapper.sharded_pcp_ragged_paged_attention`"
-    },
-    {
       "path": "src/vllm_torchtpu/kernels/gdn/v3/pcp_wrapper.py",
       "name": "missing-attribute",
       "concise_description": "Object of class `NoneType` has no attribute `shape`"
