@@ -390,6 +390,19 @@ class KVCacheManager:
             exempt_layers=ds_v4_layers,
             attention_backend=backend_cls,
         )
+        native_swa_layers = frozenset(
+            name
+            for name, module in (
+                self.runner.vllm_config.compilation_config.static_forward_context.items()
+            )
+            if getattr(module, "_tpu_native_swa", False) is True
+        )
+        if native_swa_layers:
+            from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import (
+                budget_native_swa,
+            )
+
+            kv_cache_spec = budget_native_swa(kv_cache_spec, native_swa_layers)
         if (
             hma_enabled
             and has_attention
@@ -1381,6 +1394,13 @@ class KVCacheManager:
                     self.runner.device,
                     self.runner.cache_config.get_resolved_kv_cache_layout(),
                     word_rows=True,
+                    native_swa_layers=frozenset(
+                        name
+                        for name, module in (
+                            self.runner.vllm_config.compilation_config.static_forward_context.items()  # noqa: E501
+                        )
+                        if getattr(module, "_tpu_native_swa", False) is True
+                    ),
                     csa2_layers=frozenset(
                         name
                         for name, module in (
