@@ -731,6 +731,18 @@ class PackedRopeTest(parameterized.TestCase):
                 packed_rope=True,
             )
 
+    def test_packed_rope_rejects_non_64b_head_dim(self):
+        with self.assertRaisesRegex(ValueError, "expects unpadded head_dim == 64B"):
+            SparseMLAKVCacheSpec.create(
+                KVCacheType.ROPE,
+                KVCacheLayout.SPARSECORE,
+                TOTAL_PAGES,
+                PAGE_SIZE,
+                32,
+                KV_PACKING,
+                packed_rope=True,
+            )
+
     def test_packed_writer_matches_the_host_layout(self):
         """The jnp writer lays tokens out exactly as `pack_rope_packed`, the
         byte contract the native gather is tested against on TPU."""

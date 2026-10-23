@@ -466,7 +466,10 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # 128-byte row (eight tokens per 128-word row), cutting the sparse MLA
     # latent cache from 640 to 576 B/token. SparseCore layouts only; the
     # gather expands the rows back to the padded format the attention kernel
-    # reads. Changes the cache layout: a disagg pair must agree on it.
+    # reads. Changes the cache layout: a disagg pair must agree on it. On the
+    # Raiden pipeline->DCP path, rope tokens per row become 8, so
+    # glm_dcp_chunk_bytes rejects cp_kv_cache_interleave_size=4 at registration
+    # (requires a multiple of 8).
     "TPU_SPARSE_MLA_PACKED_ROPE": env_bool("TPU_SPARSE_MLA_PACKED_ROPE", default=False),
     # JAX platform selection (e.g., "tpu", "cpu", "proxy")
     "JAX_PLATFORMS": lambda: os.getenv("JAX_PLATFORMS", "").lower(),

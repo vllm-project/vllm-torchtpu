@@ -727,7 +727,9 @@ class KVCacheManager:
                 "Pure-attention hybrid KV cache: padding every layer "
                 "spec to %d bytes (max of native sizes %s). Avoids "
                 "vLLM's unify_kv_cache_spec_page_size leaving a stale "
-                "page_size_padded behind when layer head_dims differ.",
+                "page_size_padded behind when layer head_dims differ. "
+                "Note: A model mixing sparse and dense MLA layers pads "
+                "to the dense size, neutralizing packed rope savings.",
                 uniform_page_size_bytes,
                 sorted(attn_page_sizes),
             )

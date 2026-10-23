@@ -24,10 +24,11 @@ import numpy as np
 
 NOPE_SUBROWS = 4
 LANE_BYTES = 128
-ROPE_WORDS = LANE_BYTES // np.dtype(np.uint32).itemsize
+WORD_BYTES = np.dtype(np.uint32).itemsize
+ROPE_WORDS = LANE_BYTES // WORD_BYTES
 # Packed rope (`TPU_SPARSE_MLA_PACKED_ROPE`): the 64 fp8 bytes alone.
 PACKED_ROPE_BYTES = 64
-PACKED_ROPE_WORDS = PACKED_ROPE_BYTES // np.dtype(np.uint32).itemsize
+PACKED_ROPE_WORDS = PACKED_ROPE_BYTES // WORD_BYTES
 
 
 def _require_u8(name: str, value: np.ndarray, suffix: tuple[int, ...]) -> np.ndarray:
@@ -116,7 +117,7 @@ def pack_rope_packed(rope_u8: np.ndarray) -> np.ndarray:
     if tokens % tokens_per_row:
         raise ValueError(f"{tokens} tokens do not fill {tokens_per_row}-token rows")
     banded = np.ascontiguousarray(
-        rope_u8.reshape(*rope_u8.shape[:-1], NOPE_SUBROWS, PACKED_ROPE_WORDS).swapaxes(
+        rope_u8.reshape(*rope_u8.shape[:-1], WORD_BYTES, PACKED_ROPE_WORDS).swapaxes(
             -2, -1
         )
     )

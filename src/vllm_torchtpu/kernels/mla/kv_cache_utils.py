@@ -30,6 +30,7 @@ from torch_tpu._internal.pallas import pallas
 # `ref.bitcast(jnp.int32)` folds into one word row inside the kernel.
 WORD_BYTES = 4
 TILE_LANE_BYTES = 128  # lane width of a TensorCore tile, in bytes
+PACKED_ROPE_BYTES = 64  # fp8 bytes per token under TPU_SPARSE_MLA_PACKED_ROPE
 
 # Sentinels for tokens that must not be written. JAX drops out-of-bounds
 # scatters; the Pallas writers predicate on the sign instead.
@@ -135,8 +136,12 @@ class SparseMLAKVCacheSpec:
                     "packed rope needs a ROPE cache in the SparseCore layout, got "
                     f"{cache_type.value}/{layout.value}"
                 )
-            # Word-aligned only: the token is not padded to a lane row.
-            head_dim = align_to(unpadded_head_dim, WORD_BYTES)
+            if unpadded_head_dim != PACKED_ROPE_BYTES:
+                raise ValueError(
+                    f"packed rope expects unpadded head_dim == {PACKED_ROPE_BYTES}B, "
+                    f"got {unpadded_head_dim}B"
+                )
+            head_dim = unpadded_head_dim
             row_bytes = WORD_BYTES * TILE_LANE_BYTES
             if row_bytes % head_dim or page_size % (row_bytes // head_dim):
                 raise ValueError(
