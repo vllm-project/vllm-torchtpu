@@ -158,3 +158,40 @@ def test_prefill_traces_dynamic_tile_grid(bq, banked, non_causal):
     with jax.sharding.use_abstract_mesh(mesh):
         traced = jax.make_jaxpr(lambda *x: csa2_prefill(*x, **kwargs, bq=bq))(*args)
     assert traced.out_avals[0].shape == args[0].shape
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("non_causal", [False, True])
+@pytest.mark.parametrize("valid_tokens", [0, 17])
+def test_single_request_direct_output_preserves_padding(non_causal, valid_tokens):
+    args, kwargs = prefill_inputs(non_causal=non_causal)
+    q, words, scales, swa, _, positions, sink, rope = args
+
+    def padded(x):
+        return jnp.pad(x[:17], ((0, 15), *[(0, 0)] * (x.ndim - 1)))
+
+    args = (
+        padded(q),
+        padded(words),
+        padded(scales),
+        swa,
+        jnp.array([0, valid_tokens], jnp.int32),
+        padded(positions),
+        sink,
+        padded(rope),
+    )
+    kwargs = dict(
+        swa_metadata=kwargs["swa_metadata"][1:2],
+        main_lengths=padded(kwargs["main_lengths"]),
+        swa_bounds=kwargs["swa_bounds"][1:2] if non_causal else None,
+    )
+    actual = csa2_prefill(
+        *args, **kwargs, bq=16, interpret=jax.default_backend() != "tpu"
+    )
+    np.testing.assert_allclose(
+        np.asarray(actual, np.float32),
+        numpy_reference(args, kwargs),
+        atol=3e-3,
+        rtol=3e-2,
+    )
+    np.testing.assert_array_equal(actual[valid_tokens:], 0)
