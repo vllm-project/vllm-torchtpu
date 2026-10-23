@@ -565,6 +565,7 @@ class PrefixAwareScheduler(AsyncScheduler):
         return cached
 
     def _inflight_prefill_reserved_blocks(self) -> int:
+        reserved = self._decode_inflight_reserved_blocks()
         if (
             getattr(self, "_kv_prefetch_in_waiting", False)
             and self._kv_prefetch_at_cap()
@@ -576,6 +577,23 @@ class PrefixAwareScheduler(AsyncScheduler):
                 return 1 << 30
             return reserved + self._kv_prefetch_reserve
         return reserved
+
+    def _decode_inflight_reserved_blocks(self) -> int:
+        base = int(super()._inflight_prefill_reserved_blocks() or 0)
+        on = getattr(self, "_decode_throttle_switch", None)
+        if on is None:
+            self._decode_throttle_switch = on
+        if not on or not getattr(self, "_is_kv_consumer", False):
+            return base
+        num_inflight = len(getattr(self, "_inflight_prefills", ()))
+        num_running = len(getattr(self, "running", ()))
+        max_running = int(getattr(self, "max_num_running_reqs", 32) or 32)
+        if (max_stage3_inflight > 0 and num_inflight >= max_stage3_inflight) or (
+            stage3_overprovision >= 0
+            and (num_running + num_inflight) >= (max_running + stage3_overprovision)
+        ):
+            return 1 << 30
+        )
 
     def _get_paw_aging_rate(self) -> float:
         """Uncached prompt tokens credited per second a request has waited.
