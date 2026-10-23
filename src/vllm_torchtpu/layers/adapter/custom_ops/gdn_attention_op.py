@@ -208,6 +208,7 @@ def gdn_attention_pooled_core_tpu(
     recurrent_state_dtype: jnp.dtype,
     conv_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
+    conv_weight_kmajor: bool = False,
 ) -> tuple[jax.Array, jax.Array]:
     return run_jax_gdn_attention_pooled(
         mixed_qkv,
@@ -236,6 +237,7 @@ def gdn_attention_pooled_core_tpu(
         conv_state_dtype=conv_state_dtype,
         mesh=mesh,
         num_spec_tokens=num_spec_tokens,
+        conv_weight_kmajor=conv_weight_kmajor,
     )
 
 
@@ -584,6 +586,12 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         conv_state_dtype = torch.float32
         return conv_state_dtype, temporal_state_dtype
 
+    def _pooled_conv_weight(self) -> torch.Tensor:
+        """The conv weight in the layout the pooled GDN op was built for."""
+        if envs.VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR:
+            return self.conv_weight_kmajor
+        return self.conv1d.weight
+
     def process_weights_after_loading(self, act_dtype: torch.dtype) -> None:
         """Back the conv weight with a buffer of its own 3-D shape.
 
@@ -598,6 +606,15 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         del act_dtype
         w = self.conv1d.weight
         self.conv1d.weight.data = fresh_buffer(w)
+        if envs.VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR:
+            # The pooled kernel's float32 [kernel_size, 1, dim] weight, so the
+            # swap and cast run once here instead of in every forward. The
+            # other GDN paths keep reading `conv1d.weight`.
+            self.register_buffer(
+                "conv_weight_kmajor",
+                fresh_buffer(w.detach().permute(2, 1, 0).to(torch.float32)),
+                persistent=False,
+            )
 
     def get_state_shape(
         self,
@@ -794,6 +811,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
         # the request's state block; rejected drafts are rolled back by
         # checkpoint selection (see TPUModelRunner.mamba_slot_read_offsets).
         num_spec_tokens = self.num_spec
+        conv_weight_kmajor = envs.VLLM_TPU_GDN_CONV_WEIGHT_KMAJOR
 
         # Written out rather than functools.partial so pool_block_tokens is
         # read per call instead of at build time; pallas.jax_op requires a
@@ -854,6 +872,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 recurrent_state_dtype=recurrent_state_dtype,
                 conv_state_dtype=conv_state_dtype,
                 num_spec_tokens=num_spec_tokens,
+                conv_weight_kmajor=conv_weight_kmajor,
             )
             if not block_major:
                 return result
@@ -890,6 +909,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 recurrent_state_dtype,
                 conv_state_dtype,
                 num_spec_tokens,
+                conv_weight_kmajor,
             ),
             build_op,
         )
@@ -1322,7 +1342,7 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     b,
                     a,
                     recurrent_state,
-                    self.conv1d.weight,
+                    self._pooled_conv_weight(),
                     self.conv1d.bias,
                     self.A_log,
                     self.dt_bias,

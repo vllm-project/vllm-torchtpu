@@ -850,6 +850,7 @@ def run_jax_gdn_attention_pooled_local(
     recurrent_state_dtype: jnp.dtype = jnp.float32,
     conv_state_dtype: jnp.dtype = jnp.float32,
     num_spec_tokens: int = 0,
+    conv_weight_kmajor: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """GDN attention over the unified block pool.
 
@@ -888,6 +889,7 @@ def run_jax_gdn_attention_pooled_local(
         num_spec_tokens=num_spec_tokens,
         prefill_ckpt_offsets=prefill_ckpt_offsets,
         prefill_ckpt_indices=prefill_ckpt_indices,
+        conv_weight_kmajor=conv_weight_kmajor,
     )
     return pool.reshape(pool_shape), output
 
@@ -920,6 +922,7 @@ def run_jax_gdn_attention_pooled(
     num_spec_tokens: int = 0,
     prefill_ckpt_offsets: jnp.ndarray | None = None,
     prefill_ckpt_indices: jnp.ndarray | None = None,
+    conv_weight_kmajor: bool = False,
 ) -> tuple[jnp.ndarray, jnp.ndarray]:
     """Runs GDN attention over the unified block pool, sharded on the mesh.
 
@@ -933,7 +936,8 @@ def run_jax_gdn_attention_pooled(
           configured Conv region as token-ranges of each state block. Block 0
           is the null block, only used for padded / invalid tokens.
         j_conv_weight: Convolutional weight tensor of shape `(dim, 1,
-          kernel_size)`.
+          kernel_size)`, or float32 `(kernel_size, 1, dim)` with
+          ``conv_weight_kmajor``.
         j_conv_bias: Optional convolutional bias tensor of shape `(dim,)`.
         j_A_log: Log of A parameter tensor of shape `(n_v,)`.
         j_dt_bias: Delta T bias tensor of shape `(n_v,)`.
@@ -972,7 +976,9 @@ def run_jax_gdn_attention_pooled(
         P(None, "model"),  # j_b
         P(None, "model"),  # j_a
         pool_spec,  # recurrent_state (attention-shaped pool)
-        P("model", None, None),  # j_conv_weight
+        (
+            P(None, None, "model") if conv_weight_kmajor else P("model", None, None)
+        ),  # j_conv_weight
         P("model") if j_conv_bias is not None else None,  # j_conv_bias
         P("model"),  # j_A_log
         P("model"),  # j_dt_bias
@@ -1034,6 +1040,7 @@ def run_jax_gdn_attention_pooled(
         num_spec_tokens=num_spec_tokens,
         recurrent_state_dtype=recurrent_state_dtype,
         conv_state_dtype=conv_state_dtype,
+        conv_weight_kmajor=conv_weight_kmajor,
     )
     mapped_fn = jax.shard_map(
         p_run_jax_gdn_attention_pooled_local,
