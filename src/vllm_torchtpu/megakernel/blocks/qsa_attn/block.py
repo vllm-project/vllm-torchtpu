@@ -47,7 +47,7 @@ PAGES = "qsa_pages"
 KV_LEN = "qsa_kvlen"
 MICRO = 4  # tokens per micro-page (the compression ratio)
 TILE = 256  # tokens per ring slot
-SLOTS = 4  # ring slots: SLOTS - 1 tiles in flight ahead of the one being read
+SLOTS = 8  # ring slots: SLOTS - 1 tiles in flight ahead of the one being read
 
 
 def _unpack_kv(slot_ref: Any, off: int, interpret: bool) -> tuple[jax.Array, jax.Array]:
@@ -71,7 +71,10 @@ def _unpack_kv(slot_ref: Any, off: int, interpret: bool) -> tuple[jax.Array, jax
 
 def attend_row(
     r: Any,
+    g0: Any = 0,
+    pre: Any = 0,
     *,
+    nrows: int | None = None,
     pool: Any,
     ring: Any,
     sems: Any,
@@ -86,8 +89,14 @@ def attend_row(
     interpret: bool,
     fold: bool = False,
     ablate: str = "",
-) -> jax.Array:
-    """Gated sparse attention of row `r`: `[nh, 256]` F32 (zero for an empty row).
+) -> tuple[jax.Array, Any, Any]:
+    """Gated sparse attention of row `r`: `([nh, 256]` F32, next `g0`, next `pre`).
+
+    Ring slots follow a tile counter carried across rows (`g0`: this row's
+    first tile), so the ring never drains at a row boundary: once a row has
+    issued its own tiles, its last iterations issue row `r + 1`'s first tiles
+    into the slots that row will read. `pre` is how many of this row's tiles a
+    previous row already issued. Rows run in order `0 .. nrows - 1`.
 
     `fold`: apply `scale_k * sm_scale` to q and `scale_v` to the result instead
     of to every K / V tile. `ablate` (timing only, wrong results): "dma" skips
@@ -97,16 +106,27 @@ def attend_row(
     semaphores `[2]`. `pages` / `kv_len`: SMEM refs.
     """
     per_page = pool.shape[1] // MICRO
+    nrows = pages.shape[0] if nrows is None else nrows
+    nslots = ring.shape[0]
+
+    def n_tiles(length: Any) -> Any:
+        return (length + TILE - 1) // TILE
+
     length = kv_len[r]
-    ntiles = (length + TILE - 1) // TILE
+    ntiles = n_tiles(length)
+    rn = jnp.minimum(r + 1, nrows - 1)
+    ntiles_next = jnp.where(r + 1 < nrows, n_tiles(kv_len[rn]), 0)
+    # Cross-row prefetch only when this row covers the ring, so the next row's
+    # pre-issued tiles are always its first ones, contiguous from 0.
+    cross = ntiles >= nslots - 1
     nh, dim = q.shape
 
     ncols = pages.shape[1]
     assert per_page & (per_page - 1) == 0, per_page
     shift = per_page.bit_length() - 1
 
-    def copies(t: Any, s: Any) -> list[Any]:
-        """The tile's `TILE // MICRO` micro-page copies, issued unconditionally.
+    def copies(row: Any, t: Any, s: Any) -> list[Any]:
+        """Tile `t` of `row`: `TILE // MICRO` micro-page copies, issued unconditionally.
 
         No per-copy branch: a straight-line issue loop costs a few ns per DMA,
         a `pl.when` per copy several times that. Columns past `budget + 1` clamp
@@ -114,7 +134,7 @@ def attend_row(
         """
         out = []
         for j in range(TILE // MICRO):
-            v = pages[r, jnp.minimum(t * (TILE // MICRO) + j, ncols - 1)]
+            v = pages[row, jnp.minimum(t * (TILE // MICRO) + j, ncols - 1)]
             out.append(
                 pltpu.make_async_copy(
                     pool.at[v >> shift, pl.ds((v & (per_page - 1)) * MICRO, MICRO)],
@@ -124,41 +144,49 @@ def attend_row(
             )
         return out
 
-    def start(t: Any, s: Any) -> None:
+    def start(row: Any, t: Any, s: Any) -> None:
         if ablate == "dma":
             return
-        for cp in copies(t, s):
+        for cp in copies(row, t, s):
             cp.start()
 
     def wait(t: Any, s: Any) -> None:
         if ablate == "dma":
             return
         if interpret:
-            for cp in copies(t, s):
+            for cp in copies(r, t, s):
                 cp.wait()
         else:
             # One wait for the whole slot: the copies above add up to its bytes.
             pltpu.make_async_copy(ring.at[s], ring.at[s], sems.at[s]).wait()
 
-    nslots = ring.shape[0]
-    for k in range(nslots - 1):  # prime the ring: tiles 0 .. S-2
+    def slot(t: Any) -> Any:
+        return lax_rem(g0 + t, nslots)
 
-        @pl.when(k < ntiles)
+    for k in range(nslots - 1):  # this row's first S-1 tiles not yet in flight
+
+        @pl.when((k >= pre) & (k < ntiles))
         def _(k=k):
-            start(k, k)
+            start(r, k, slot(k))
 
     qf = q.astype(F32) * (scale_k * sm_scale if fold else 1.0)
     k_mul, v_mul, s_mul = (1.0, 1.0, 1.0) if fold else (scale_k, scale_v, sm_scale)
 
     def tile(t: Any, carry: Any) -> Any:
         m, l, acc = carry
-        s = lax_rem(t, nslots)
+        s = slot(t)
         wait(t, s)
         ahead = t + nslots - 1  # into the slot tile t - 1 has freed
 
         @pl.when(ahead < ntiles)
         def _():
-            start(ahead, lax_rem(ahead, nslots))
+            start(r, ahead, slot(ahead))
+
+        k_next = ahead - ntiles  # the next row's tile k lands in slot(ahead)
+
+        @pl.when(cross & (k_next >= 0) & (k_next < ntiles_next))
+        def _():
+            start(rn, k_next, slot(ahead))
 
         if ablate == "unpack":
             k8 = v8 = jnp.zeros((TILE, dim), BF16)
@@ -202,7 +230,8 @@ def attend_row(
     gated = (
         attn.astype(BF16).astype(F32) * jax.nn.sigmoid(gate.astype(F32)).astype(BF16).astype(F32)
     ).astype(BF16).astype(F32)
-    return jnp.where(length > 0, gated, 0.0)
+    pre_next = jnp.where(cross, jnp.minimum(nslots - 1, ntiles_next), 0)
+    return jnp.where(length > 0, gated, 0.0), g0 + ntiles, pre_next
 
 
 def lax_rem(a: Any, b: int) -> Any:
@@ -271,9 +300,13 @@ class QSASparseAttnBlock(QSAOutBlock):
 
         rows = jax.lax.broadcasted_iota(I32, (ex.MB, 1), 0)
 
-        def row(r: Any, outs: Any) -> Any:
-            out = attend_row(
+        def row(r: Any, carry: Any) -> Any:
+            *outs, g0, pre = carry
+            out, g0, pre = attend_row(
                 r,
+                g0,
+                pre,
+                nrows=ex.MB,
                 pool=ctx.extra[POOL],
                 ring=scr["qa_ring"],
                 sems=scr["qa_ring_sem"],
@@ -291,12 +324,14 @@ class QSASparseAttnBlock(QSAOutBlock):
             )
             # Row r of each head's [MB, HD] output by a mask, not a store at a
             # dynamic row (a bf16 row store must be 16-row aligned in Mosaic).
-            return tuple(
-                jnp.where(rows == r, out[h : h + 1], o) for h, o in enumerate(outs)
+            return (
+                *(jnp.where(rows == r, out[h : h + 1], o) for h, o in enumerate(outs)),
+                g0,
+                pre,
             )
 
         zeros = tuple(jnp.zeros((ex.MB, g.HD), F32) for _ in range(nh))
-        outs = jax.lax.fori_loop(0, ex.MB, row, zeros)
+        *outs, _, _ = jax.lax.fori_loop(0, ex.MB, row, (*zeros, jnp.int32(0), jnp.int32(0)))
         for h, o in enumerate(outs):
             scr["xb2"][:, pl.ds(h * g.HD, g.HD)] = o.astype(BF16)
         with ctx.stream.segment(lazy=False):

@@ -39,8 +39,9 @@ from vllm_torchtpu.megakernel.blocks.qsa_attn.block import (
 NH, DIM, BUDGET, PAGES = 3, 256, 512, 24
 SM = DIM**-0.5
 SK, SV = 0.5, 0.25
-# empty, 1 token, partial micro-page, one exact tile, 2 tiles + partial, long
-LENGTHS = [0, 1, 7, TILE, 2 * TILE + 3, 1500]
+# empty, 1 token, partial micro-page, one exact tile, 2 tiles + partial, long,
+# full budget (9 tiles: crosses into the next row even with 8 slots), short, full
+LENGTHS = [0, 1, 7, TILE, 2 * TILE + 3, 1500, 2051, 300, 2051]
 
 
 def _inputs(seed: int):
@@ -60,8 +61,12 @@ def _kernel_rows(pool, pages, kv_len, q, gate, *, off, tile_cut=0, fold=False, s
 
     def kernel(pages_ref, len_ref, q_ref, g_ref, pool_ref, out_ref, ring, sems):
         def row(r, carry):
-            out_ref[r] = attend_row(
+            g0, pre = carry
+            out, g0, pre = attend_row(
                 r,
+                g0,
+                pre,
+                nrows=n,
                 pool=pool_ref,
                 ring=ring,
                 sems=sems,
@@ -76,9 +81,10 @@ def _kernel_rows(pool, pages, kv_len, q, gate, *, off, tile_cut=0, fold=False, s
                 interpret=True,
                 fold=fold,
             )
-            return carry
+            out_ref[r] = out
+            return g0, pre
 
-        jax.lax.fori_loop(0, n, row, 0)
+        jax.lax.fori_loop(0, n, row, (jnp.int32(0), jnp.int32(0)))
 
     lens = jnp.maximum(kv_len - tile_cut, jnp.minimum(kv_len, 1)) if tile_cut else kv_len
     return pl.pallas_call(
@@ -102,7 +108,7 @@ def _kernel_rows(pool, pages, kv_len, q, gate, *, off, tile_cut=0, fold=False, s
     )(pages, lens, q, gate, pool)
 
 
-@pytest.mark.parametrize("off,fold,slots", [(0, False, 2), (1, False, 4), (1, True, 3)])
+@pytest.mark.parametrize("off,fold,slots", [(0, False, 2), (1, False, 4), (1, True, 3), (0, False, 8)])
 def test_attend_row_matches_reference(off, fold, slots):
     pool, pages, kv_len, q, gate = _inputs(3 + off)
     got = np.asarray(_kernel_rows(pool, pages, kv_len, q, gate, off=off, fold=fold, slots=slots))
