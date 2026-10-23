@@ -135,7 +135,9 @@ def attend_row(
         tok = t * TILE + jax.lax.broadcasted_iota(I32, (1, TILE), 1)
         valid = tok < length
         key = k8.astype(F32) * scale_k
-        value = jnp.where(valid.reshape(TILE, 1), v8.astype(F32) * scale_v, 0.0)
+        # A column iota, not `valid.reshape`: Mosaic has no i1 shape cast.
+        tok_col = t * TILE + jax.lax.broadcasted_iota(I32, (TILE, 1), 0)
+        value = jnp.where(tok_col < length, v8.astype(F32) * scale_v, 0.0)
         score = jax.lax.dot_general(
             qf, key, (((1,), (1,)), ((), ())), preferred_element_type=F32
         ) * sm_scale
