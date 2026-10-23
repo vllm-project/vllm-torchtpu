@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import inspect
 import math
 import os
 from collections.abc import Mapping, Sequence
@@ -431,6 +432,31 @@ def load_vllm_model(vllm_config: Any, *, load_format: str) -> nn.Module:
 # Constant values are gathered from every rank to lay them out, so only small
 # buffers qualify.
 _MAX_CONSTANT_ELEMENTS = 4096
+
+
+def _backbone_kwargs(
+    backbone: nn.Module,
+    *,
+    input_ids: Any,
+    positions: Any,
+    kv_caches: Sequence[Any],
+    attn_metadata: Any,
+) -> dict[str, Any]:
+    """Keyword arguments for `backbone.forward`, chosen from its signature.
+
+    vLLM backbones take `intermediate_tensors` (positionally, often with no
+    default) and read the KV caches and metadata from the forward context; the
+    caches and metadata are passed directly only to a forward that declares them.
+    """
+    params = inspect.signature(backbone.forward).parameters
+    kwargs: dict[str, Any] = {"input_ids": input_ids, "positions": positions}
+    if "intermediate_tensors" in params:
+        kwargs["intermediate_tensors"] = None
+    if "kv_caches" in params:
+        kwargs["kv_caches"] = kv_caches
+    if "attn_metadata" in params:
+        kwargs["attn_metadata"] = attn_metadata
+    return kwargs
 
 
 def _is_recurrent_layer(layer: Any) -> bool:
@@ -865,17 +891,15 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                         )
                     return backbone(**kw)
 
-                try:
-                    out = _call(
-                        {
-                            "input_ids": input_ids,
-                            "positions": positions,
-                            "kv_caches": working_kvs,
-                            "attn_metadata": forward_metadata,
-                        }
+                out = _call(
+                    _backbone_kwargs(
+                        backbone,
+                        input_ids=input_ids,
+                        positions=positions,
+                        kv_caches=working_kvs,
+                        attn_metadata=forward_metadata,
                     )
-                except TypeError:
-                    out = _call({"input_ids": input_ids, "positions": positions})
+                )
             finally:
                 if prev_do_not_compile is not None:
                     backbone.do_not_compile = prev_do_not_compile
