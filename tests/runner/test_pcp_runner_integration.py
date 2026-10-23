@@ -239,6 +239,7 @@ def _make_runner(
             sequence_layout_kind=ctx.sequence_layout_descriptor.kind.value,
             sequence_layout_protocol=ctx.sequence_layout_descriptor.protocol,
             sequence_layout_version=ctx.sequence_layout_descriptor.version,
+            pcp=ctx.pcp,
         )
         return {"layer.0": md}, None
 
@@ -963,3 +964,145 @@ def test_pcp_streaming_does_not_use_batched_smem_capacity(
     # compact streaming schedule for every request distribution.
     assert runner._attention_schedule_capacity() is None
     assert runner._attention_runs_batched_kernel is False
+
+
+@pytest.mark.cpu_test
+def test_pcp_zigzag_mixed_decode_and_prefill_splits_into_pure_chunks(monkeypatch):
+    """Under zigzag PCP, mixed decode+prefill splits into pure chunks and shifts mrope."""
+    from vllm_torchtpu.runner.tpu_runner import _sync_zigzag_pcp_planner
+
+    monkeypatch.setenv("VLLM_TPU_PCP_LAYOUT", "zigzag")
+    monkeypatch.setattr(_PCP_LAYOUT_RANK, lambda: 0)
+    monkeypatch.setattr(_PCP_LAYOUT_WORLD_SIZE, lambda: 2)
+
+    # req0: 64-tok prefill, req1: 1-tok decode (computed=16),
+    # req2: 1-tok prompt (computed=0 -> must go to prefill!), req3: 1-tok decode.
+    scheduled = [64, 1, 1, 1]
+    runner = _make_runner(
+        num_computed_tokens=[0, 16, 0, 32],
+        prompt_tokens=[64, 32, 1, 48],
+        scheduled_tokens=scheduled,
+        token_paddings=[16, 64, 128, 256],
+        uses_mrope=True,
+        pcp_size=2,
+    )
+    _sync_zigzag_pcp_planner(runner)
+    sched = _scheduler_output(scheduled)
+    batch = runner.input_batch
+
+    def swap_states(i, j):
+        batch.req_ids[i], batch.req_ids[j] = batch.req_ids[j], batch.req_ids[i]
+        batch.req_id_to_index[batch.req_ids[i]] = i
+        batch.req_id_to_index[batch.req_ids[j]] = j
+        for array in (
+            batch.num_computed_tokens_cpu,
+            batch.num_prompt_tokens,
+            batch.token_ids_cpu,
+        ):
+            array[[i, j]] = array[[j, i]]
+        table = batch.block_table[0]._table
+        table[[i, j]] = table[[j, i]]
+
+    batch.swap_states = swap_states
+    num_decode, num_windowed = TPUModelRunner._reorder_batch_for_rpa(runner, sched)
+    assert (num_decode, num_windowed) == (2, 2)
+    # First 2 requests are genuine decodes (computed > 0); last 2 are prefill.
+    assert set(batch.num_computed_tokens_cpu[:2].tolist()) == {16, 32}
+    assert set(batch.req_ids[2:]) == {"req0", "req2"}
+
+    expected_chunks, expected_max_reqs = TPUModelRunner._count_input_chunks(
+        runner, sched, num_decode
+    )
+    assert (expected_chunks, expected_max_reqs) == (2, 2)
+
+    chunks = []
+    start = 0
+    while start < batch.num_reqs:
+        prepared = TPUModelRunner._prepare_inputs(
+            runner, sched, start, num_decode, num_windowed
+        )
+        md = prepared[0]["layer.0"]
+        end = prepared[4]
+        chunks.append(
+            (
+                start,
+                end,
+                md,
+                md.request_distribution.tolist(),
+                runner.input_ids.shape[0],
+            )
+        )
+        if start > 0:
+            # Second chunk starts after 2 decode tokens -> mrope shifted by +2
+            # before zigzag repacks request-major tokens via gdn_rm_to_packed.
+            prefill_tokens = sum(
+                sched.num_scheduled_tokens[r] for r in batch.req_ids[start:end]
+            )
+            rm_to_packed = md.pcp.gdn_rm_to_packed[:prefill_tokens].cpu().long()
+            assert runner.mrope_positions.cpu[0, rm_to_packed].tolist() == list(
+                range(2, 2 + prefill_tokens)
+            )
+        start = end
+
+    assert len(chunks) == expected_chunks
+    # Chunk 0: pure decode [0, 2) -> is_decode=True, bucket 16 < 2 * 16.
+    assert chunks[0][0:2] == (0, 2)
+    assert chunks[0][2].pcp.is_decode is True
+    assert chunks[0][3] == [4, 4, 4]
+    assert chunks[0][4] == 16
+    # Chunk 1: pure prefill [2, 4) -> is_decode=False, bucket >= 2 * 16.
+    assert chunks[1][0:2] == (2, 4)
+    assert chunks[1][2].pcp.is_decode is False
+    assert chunks[1][3] == [0, 0, 4]
+    assert chunks[1][4] >= 32
+
+
+@pytest.mark.cpu_test
+def test_pcp_zigzag_large_decode_batch_splits_below_prefill_bucket(monkeypatch):
+    """A 200-request HND decode batch splits at 128 so it never pads into bucket 256."""
+    from vllm_torchtpu.runner.tpu_runner import _sync_zigzag_pcp_planner
+
+    monkeypatch.setenv("VLLM_TPU_PCP_LAYOUT", "zigzag")
+    monkeypatch.setattr(_PCP_LAYOUT_RANK, lambda: 0)
+    monkeypatch.setattr(_PCP_LAYOUT_WORLD_SIZE, lambda: 2)
+
+    num_reqs = 200
+    scheduled = [1] * num_reqs
+    runner = _make_runner(
+        num_computed_tokens=[240] * num_reqs,
+        prompt_tokens=[256] * num_reqs,
+        scheduled_tokens=scheduled,
+        token_paddings=[16, 32, 64, 128, 256, 512],
+        pcp_size=2,
+    )
+    runner.block_size = 2176
+    runner.max_num_reqs = 256
+    runner.num_reqs_max_model_len = 256
+    runner.cache_config = SimpleNamespace(
+        num_gpu_blocks=64,
+        num_gpu_blocks_override=None,
+        get_resolved_kv_cache_layout=lambda: "LBHNC",
+    )
+    _sync_zigzag_pcp_planner(runner)
+
+    sched = _scheduler_output(scheduled)
+    num_chunks, max_chunk_reqs = TPUModelRunner._count_input_chunks(
+        runner, sched, num_reqs
+    )
+    assert (num_chunks, max_chunk_reqs) == (2, 128)
+
+    chunk_bounds = []
+    start = 0
+    while start < num_reqs:
+        prepared = TPUModelRunner._prepare_inputs(
+            runner, sched, start, num_reqs, num_reqs
+        )
+        md = prepared[0]["layer.0"]
+        end = prepared[4]
+        chunk_bounds.append((start, end))
+        assert md.pcp.is_decode is True
+        assert md.pcp.page_size == 128
+        assert runner.input_ids.shape[0] < 256
+        start = end
+
+    assert chunk_bounds == [(0, 128), (128, 200)]

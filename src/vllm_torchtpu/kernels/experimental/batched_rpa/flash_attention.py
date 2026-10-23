@@ -115,7 +115,9 @@ def flash_attention_qk_softmax(
   l_next_list = []
   for b_idx in range(cfgs.block.batch_size):
     lane_valid = is_valid[b_idx] if is_valid is not None else True
-    term_prev = jnp.where(m_prev == -jnp.inf, 0.0, alpha_list[b_idx] * l_prev)
+    term_prev = jnp.where(
+        alpha_list[b_idx] == 0.0, 0.0, alpha_list[b_idx] * l_prev
+    )
     l_next_b = term_prev + p_rowsum[b_idx]
     l_next_list.append(l_next_b)
     l_prev_next = jnp.where(is_last_k[step, b_idx] == 1, 0.0, l_next_b)

@@ -116,8 +116,7 @@ class KVBufferedRefSeqAlongLane(_BypassRef):
           dma_entry = schedule_ref.dma_kv_new[block_idx, b, i]
           src_new_off = dma_entry.fetch_hbm[...]
           dst_vmem_off = dma_entry.fetch_vmem[...]
-          dma_valid = dma_entry.fetch_val
-          sz = dma_valid * self.cfgs.serve.page_size
+          sz = dma_entry.fetch_val
           page = jnp.minimum(
               src_new_off >> self.cfgs.serve.page_size_log2, pages_per_seq - 1
           )
@@ -619,8 +618,7 @@ class BatchingLSERef(pltpu.BufferedRef):
     wait_lanes = schedule_ref.total_wait_lse_out[block_idx]
     wait_lanes = pl.multiple_of(wait_lanes, 8)
 
-    ref_u32 = lse_hbm.bitcast(jnp.uint32)
-    flat_ref = ref_u32.reshape((-1, 128))
+    flat_ref = lse_hbm.reshape((-1, 128))
     pltpu.make_async_copy(
         flat_ref.at[pl.ds(0, wait_lanes), :],
         flat_ref.at[pl.ds(0, wait_lanes), :],

@@ -58,6 +58,21 @@ def all_reduce_sum(tensor: torch.Tensor) -> torch.Tensor:
     return group.all_reduce(tensor)
 
 
+def all_to_all_single(tensor: torch.Tensor) -> torch.Tensor:
+    """All-to-all exchange along the leading dimension across the PCP group."""
+    group = get_pcp_group()
+    if group is None or int(group.world_size) == 1:
+        return tensor
+    if not tensor.is_contiguous():
+        tensor = tensor.contiguous()
+    if hasattr(group, "all_to_all_single"):
+        return group.all_to_all_single(tensor)
+    from torch.distributed import _functional_collectives as funcol
+
+    out = funcol.all_to_all_single(tensor, None, None, group.device_group)
+    return funcol.wait_tensor(out)
+
+
 def get_pcp_cache_rank() -> int:
     """
     Index of the PCP chunk whose KV this worker's device physically holds.

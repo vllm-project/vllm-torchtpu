@@ -1047,6 +1047,19 @@ class KVCacheManager:
                         self.runner._attention_kv_cache_group_id = (
                             group.kv_cache_group_id
                         )
+                        planner = getattr(self.runner, "sequence_layout_planner", None)
+                        eligibility = getattr(planner, "eligibility", None)
+                        if eligibility is not None and hasattr(
+                            eligibility, "sync_runner_config"
+                        ):
+                            eligibility.sync_runner_config(
+                                block_size=getattr(self.runner, "block_size", None),
+                                kernel_block_size=kernel_block_size,
+                                max_num_tokens=getattr(
+                                    self.runner, "max_num_tokens", None
+                                ),
+                                cache_config=getattr(self.runner, "cache_config", None),
+                            )
                 builder = AttentionMetadataBuilder(
                     kv_cache_spec,
                     group.layer_names,

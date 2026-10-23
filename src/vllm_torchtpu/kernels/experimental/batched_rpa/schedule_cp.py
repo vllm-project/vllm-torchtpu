@@ -343,7 +343,9 @@ class CPMetadataComputer(schedule.BaseMetadataComputer):
               (new_tok_offset + new_sz - 1) // cfgs.serve.page_size + 1,
               0,
           )
-          fetch_val = jnp.where(i < num_pages_to_fetch, 1, 0)
+          fetch_val = jnp.where(
+              i < num_pages_to_fetch, cfgs.serve.page_size, 0
+          )
           new_page_start = (
               hbm_token_idx_base - new_tok_offset
           ) + i * cfgs.serve.page_size

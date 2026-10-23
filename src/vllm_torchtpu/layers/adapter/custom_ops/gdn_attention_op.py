@@ -54,6 +54,7 @@ from vllm_torchtpu.layers.adapter.gdn_linear import (
     GdnInterleavedColumnParallelLinear,
 )
 from vllm_torchtpu.layers.adapter.linear_common import KEEP_VLLM_LAYOUT_ATTR
+from vllm_torchtpu.layers.core.attention_metadata import PCPMetadata
 from vllm_torchtpu.layers.core.gdn_attention import (
     run_jax_gdn_attention,
     run_jax_gdn_attention_pcp_tp_prefill,
@@ -1052,23 +1053,26 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
             attn_metadata = get_forward_context().attn_metadata[self.prefix]
             pcp_meta = getattr(attn_metadata, "pcp", None)
             is_pcp_zigzag = (
-                pcp_meta is not None and pcp_meta.gdn_rm_to_packed is not None
+                isinstance(pcp_meta, PCPMetadata)
+                and pcp_meta.gdn_rm_to_packed is not None
             )
             if is_pcp_zigzag:
+                mixed_qkv_ag = all_gather_equal_tokens(mixed_qkv, dim=0)
+                rm_to_packed = pcp_meta.gdn_rm_to_packed[: mixed_qkv_ag.size(0)]
                 mixed_qkv_gdn = torch.index_select(
-                    all_gather_equal_tokens(mixed_qkv, dim=0),
+                    mixed_qkv_ag,
                     0,
-                    pcp_meta.gdn_rm_to_packed,
+                    rm_to_packed,
                 )
                 b_gdn = torch.index_select(
                     all_gather_equal_tokens(b, dim=0),
                     0,
-                    pcp_meta.gdn_rm_to_packed,
+                    rm_to_packed,
                 )
                 a_gdn = torch.index_select(
                     all_gather_equal_tokens(a, dim=0),
                     0,
-                    pcp_meta.gdn_rm_to_packed,
+                    rm_to_packed,
                 )
                 gdn_qsl = pcp_meta.gdn_query_start_loc
             else:
@@ -1122,7 +1126,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                 )
                 if is_pcp_zigzag:
                     core_attn_out = torch.index_select(
-                        core_attn_out, 0, pcp_meta.gdn_packed_to_local
+                        core_attn_out,
+                        0,
+                        pcp_meta.gdn_packed_to_local[:num_tokens],
                     )
                 if core_attn_out.shape[0] != num_tokens:
                     raise RuntimeError("GDN op returned an incompatible output shape.")
@@ -1209,7 +1215,9 @@ class VllmGatedDeltaNetAttention(QwenGatedDeltaNetAttention):
                     )
                 if is_pcp_zigzag:
                     core_attn_out = torch.index_select(
-                        core_attn_out, 0, pcp_meta.gdn_packed_to_local
+                        core_attn_out,
+                        0,
+                        pcp_meta.gdn_packed_to_local[:num_tokens],
                     )
                 if core_attn_out.shape[0] != num_tokens:
                     if not use_pcp_streaming:

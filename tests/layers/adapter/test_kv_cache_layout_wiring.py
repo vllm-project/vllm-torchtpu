@@ -203,6 +203,35 @@ def test_batched_kernel_pages_under_hnd_without_pcp(hnd):
     assert BATCHED.get_supported_kernel_block_sizes() == KERNEL_BLOCK_SIZES
 
 
+@pytest.mark.parametrize(
+    "pcp_size,pcp_layout,expected",
+    [
+        (1, "zigzag", [128, 256]),
+        (2, "streaming", [128, 256, 512, 1024, 2048, 4096]),
+        (2, "zigzag", [128]),
+    ],
+)
+def test_batched_kernel_pages_under_hnd_pcp_modes(
+    monkeypatch, pcp_size, pcp_layout, expected
+):
+    from vllm.config import DeviceConfig, VllmConfig, set_current_vllm_config
+    from vllm.config.attention import AttentionConfig
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+    from vllm.v1.attention.backends.utils import resolve_kv_cache_layout
+
+    monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", "HND")
+    monkeypatch.setenv("VLLM_TPU_PCP_LAYOUT", pcp_layout)
+    config = VllmConfig(
+        device_config=DeviceConfig(device="cpu"),
+        attention_config=AttentionConfig(backend=AttentionBackendEnum.CUSTOM),
+    )
+    config.parallel_config.prefill_context_parallel_size = pcp_size
+    config.parallel_config.cp_kv_cache_interleave_size = 128
+    resolve_kv_cache_layout(config, [["LBNHC", "LBHNC"]])
+    with set_current_vllm_config(config):
+        assert BATCHED.get_supported_kernel_block_sizes() == expected
+
+
 # The fix itself
 
 

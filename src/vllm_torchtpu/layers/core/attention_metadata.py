@@ -34,7 +34,7 @@ from vllm_torchtpu.layers.core.sequence_layout import (
         "gdn_packed_to_local",
         "gdn_query_start_loc",
     ],
-    meta_fields=["cache_pages", "is_decode"],
+    meta_fields=["cache_pages", "is_decode", "page_size"],
 )
 @dataclass
 class PCPMetadata:
@@ -60,6 +60,7 @@ class PCPMetadata:
     # (max_num_reqs+1,) int32 — cumulative query lengths across 2*num_reqs virtual sequences for GDN.
     gdn_query_start_loc: jax.Array | None = None
     is_decode: bool = False
+    page_size: int | None = None
 
 
 @functools.partial(
@@ -400,9 +401,9 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
                             ctx.start_index + i, :target_num_blocks
                         ]
                     if not self.is_mamba_group and 2 * i + 1 < target_num_reqs:
-                        block_tables[2 * i + 1, :target_num_blocks] = source_block_tables[
-                            ctx.start_index + i, :target_num_blocks
-                        ]
+                        block_tables[2 * i + 1, :target_num_blocks] = (
+                            source_block_tables[ctx.start_index + i, :target_num_blocks]
+                        )
             else:
                 block_tables[: ctx.num_reqs, :target_num_blocks] = source_block_tables[
                     ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks
@@ -557,7 +558,9 @@ def stage_block_table_uploads(
                     if 2 * i < num_reqs_padded:
                         rows[2 * i] = source[ctx.start_index + i, :target_num_blocks]
                     if not is_mamba and 2 * i + 1 < num_reqs_padded:
-                        rows[2 * i + 1] = source[ctx.start_index + i, :target_num_blocks]
+                        rows[2 * i + 1] = source[
+                            ctx.start_index + i, :target_num_blocks
+                        ]
             else:
                 rows[: ctx.num_reqs] = source[
                     ctx.start_index : ctx.start_index + ctx.num_reqs, :target_num_blocks

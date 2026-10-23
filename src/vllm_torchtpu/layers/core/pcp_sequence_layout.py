@@ -30,7 +30,6 @@ from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.pcp_layout import (
 from vllm_torchtpu.layers.core.sequence_layout import (
     PCP_STREAMING_SEQUENCE_LAYOUT_PROTOCOL,
     PCP_ZIGZAG_SEQUENCE_LAYOUT_DESCRIPTOR,
-    PCP_ZIGZAG_SEQUENCE_LAYOUT_PROTOCOL,
     AllSequenceLayoutPlanner,
     SequenceLayoutDescriptor,
     SequenceLayoutKind,
@@ -97,20 +96,49 @@ class PcpSequenceLayoutDecision:
         return self.mode is not PcpSequenceLayoutMode.DISABLED
 
 
-def resolve_pcp_zigzag_page_size(
-    block_size: int, kernel_block_size: int | None = None
-) -> int:
-    """Return the attention kernel page size used by batched RPA under zigzag PCP.
+def _resolve_is_hnd_kv_layout(cache_config: Any = None) -> bool:
+    """Resolve whether the KV cache uses HND (LBHNC) layout."""
+    if cache_config is not None:
+        get_resolved = getattr(cache_config, "get_resolved_kv_cache_layout", None)
+        if callable(get_resolved):
+            resolved = get_resolved()
+            name = getattr(resolved, "name", str(resolved)).upper()
+            return name in ("LBHNC", "HND")
+        raw_layout = getattr(cache_config, "kv_cache_layout", None)
+        if raw_layout:
+            return str(raw_layout).upper() in ("LBHNC", "HND")
+    try:
+        from vllm import envs as vllm_envs
 
-    On hybrid models with a unified KV block pool, `cache_config.block_size` is
-    sized to fit the Mamba state (e.g. 640 or 4096), while `prepare_kernel_block_sizes`
-    splits each manager block into attention kernel pages of size 256 or 128.
-    In all cases, the returned page size must exactly match the attention KV cache
-    page size (kv_cache.shape[1]).
-    """
+        return (vllm_envs.VLLM_KV_CACHE_LAYOUT or "").upper() in ("LBHNC", "HND")
+    except ImportError:
+        return False
+
+
+def resolve_pcp_zigzag_page_size(
+    block_size: int,
+    kernel_block_size: int | None = None,
+    *,
+    is_hnd_kv_layout: bool | None = None,
+    cache_config: Any = None,
+) -> int:
+    """Return the attention kernel page size (128 for HND, up to 256 for NHD)."""
     if kernel_block_size is not None and kernel_block_size > 0:
         return int(kernel_block_size)
-    return int(block_size)
+    block_size = int(block_size)
+    is_hnd = (
+        bool(is_hnd_kv_layout)
+        if is_hnd_kv_layout is not None
+        else _resolve_is_hnd_kv_layout(cache_config)
+    )
+    if is_hnd and block_size > 128 and block_size % 128 == 0:
+        return 128
+    if block_size > 256:
+        if block_size % 256 == 0:
+            return 256
+        if block_size % 128 == 0:
+            return 128
+    return block_size
 
 
 class PcpSequenceLayoutEligibility:
@@ -129,6 +157,9 @@ class PcpSequenceLayoutEligibility:
         async_scheduling: bool = False,
         is_zigzag: bool = False,
         block_size: int = 16,
+        max_num_tokens: int = 4096,
+        is_hnd_kv_layout: bool | None = None,
+        cache_config: Any = None,
     ):
         self.pcp_size = pcp_size
         self.interleave_size = interleave_size
@@ -136,11 +167,50 @@ class PcpSequenceLayoutEligibility:
         self.pipeline_parallel_size = pipeline_parallel_size
         self.async_scheduling = bool(async_scheduling)
         self.is_zigzag = bool(is_zigzag)
+        self.is_hnd_kv_layout = (
+            bool(is_hnd_kv_layout)
+            if is_hnd_kv_layout is not None
+            else (
+                _resolve_is_hnd_kv_layout(cache_config)
+                if cache_config is not None
+                else None
+            )
+        )
         self.block_size = (
-            resolve_pcp_zigzag_page_size(block_size)
+            resolve_pcp_zigzag_page_size(
+                block_size,
+                is_hnd_kv_layout=self.is_hnd_kv_layout,
+                cache_config=cache_config,
+            )
             if self.is_zigzag
             else int(block_size)
         )
+        self.max_num_tokens = int(max_num_tokens)
+
+    def sync_runner_config(
+        self,
+        *,
+        block_size: int | None = None,
+        kernel_block_size: int | None = None,
+        max_num_tokens: int | None = None,
+        cache_config: Any = None,
+    ) -> None:
+        if cache_config is not None:
+            self.is_hnd_kv_layout = _resolve_is_hnd_kv_layout(cache_config)
+        if self.is_zigzag:
+            base_block_size = (
+                int(block_size) if block_size is not None else self.block_size
+            )
+            self.block_size = resolve_pcp_zigzag_page_size(
+                base_block_size,
+                kernel_block_size,
+                is_hnd_kv_layout=self.is_hnd_kv_layout,
+                cache_config=cache_config,
+            )
+        elif block_size is not None:
+            self.block_size = int(block_size)
+        if max_num_tokens is not None:
+            self.max_num_tokens = int(max_num_tokens)
 
     @classmethod
     def from_vllm_config(cls, vllm_config: Any) -> "PcpSequenceLayoutEligibility":
@@ -149,9 +219,11 @@ class PcpSequenceLayoutEligibility:
 
         parallel_config = vllm_config.parallel_config
         scheduler_config = vllm_config.scheduler_config
-        attention_config = getattr(vllm_config, "attention_config", None)
-        attention_backend = getattr(attention_config, "backend", None)
-        block_size = getattr(getattr(vllm_config, "cache_config", None), "block_size", 16)
+        cache_config = getattr(vllm_config, "cache_config", None)
+        block_size = getattr(cache_config, "block_size", 16)
+        max_num_tokens = int(
+            getattr(scheduler_config, "max_num_batched_tokens", 4096) or 4096
+        )
 
         env_layout = envs.VLLM_TPU_PCP_LAYOUT.lower()
         is_zigzag = env_layout == "zigzag"
@@ -164,6 +236,8 @@ class PcpSequenceLayoutEligibility:
             async_scheduling=bool(scheduler_config.async_scheduling),
             is_zigzag=is_zigzag,
             block_size=block_size,
+            max_num_tokens=max_num_tokens,
+            cache_config=cache_config,
         )
 
     @property
@@ -182,6 +256,9 @@ class PcpSequenceLayoutEligibility:
         num_tokens_paddings: Sequence[int] | None = None,
         max_num_tokens: int | None = None,
         dp_target_bucket: int | None = None,
+        block_size: int | None = None,
+        kernel_block_size: int | None = None,
+        cache_config: Any = None,
     ) -> PcpSequenceLayoutDecision:
         spans = self._build_request_spans(
             input_batch=input_batch,
@@ -210,6 +287,9 @@ class PcpSequenceLayoutEligibility:
                 num_tokens_paddings=num_tokens_paddings,
                 max_num_tokens=max_num_tokens,
                 dp_target_bucket=dp_target_bucket,
+                block_size=block_size,
+                kernel_block_size=kernel_block_size,
+                cache_config=cache_config,
             )
         return self._evaluate_streaming_query(
             spans,
@@ -305,29 +385,35 @@ class PcpSequenceLayoutEligibility:
         num_tokens_paddings: Sequence[int] | None,
         max_num_tokens: int | None,
         dp_target_bucket: int | None,
+        block_size: int | None = None,
+        kernel_block_size: int | None = None,
+        cache_config: Any = None,
     ) -> PcpSequenceLayoutDecision:
         has_decode = any(
-            span.scheduled_tokens == 1 and span.computed_tokens > 0
-            for span in spans
+            span.scheduled_tokens == 1 and span.computed_tokens > 0 for span in spans
         )
         has_prefill = any(
-            span.scheduled_tokens > 1 or span.computed_tokens == 0
-            for span in spans
+            span.scheduled_tokens > 1 or span.computed_tokens == 0 for span in spans
         )
         if has_decode and has_prefill:
             raise NotImplementedError(
                 "PCP batched RPA zigzag layout does not support mixed decode and prefill batches."
             )
 
-        local_quantum = 2 * self.block_size
+        effective_block_size = resolve_pcp_zigzag_page_size(
+            block_size if block_size is not None else self.block_size,
+            kernel_block_size,
+            is_hnd_kv_layout=self.is_hnd_kv_layout,
+            cache_config=cache_config,
+        )
+        local_quantum = 2 * effective_block_size
         if has_decode:
             s_live = len(spans)
         else:
             q_lens = [span.scheduled_tokens for span in spans]
             chunk, off, s_live = pcp_zigzag_token_layout(
-                q_lens, self.pcp_size, self.block_size
+                q_lens, self.pcp_size, effective_block_size
             )
-        global_required_tokens = s_live * self.pcp_size
 
         local_padded_tokens = None
         global_padded_tokens = None
@@ -336,9 +422,15 @@ class PcpSequenceLayoutEligibility:
             local_padded_tokens = _first_ge(paddings, s_live)
             if dp_target_bucket is not None and dp_target_bucket > local_padded_tokens:
                 local_padded_tokens = int(dp_target_bucket)
-            local_padded_tokens = (
-                (local_padded_tokens + local_quantum - 1) // local_quantum
-            ) * local_quantum
+            if not has_decode:
+                local_padded_tokens = (
+                    (local_padded_tokens + local_quantum - 1) // local_quantum
+                ) * local_quantum
+            if (local_padded_tokens < local_quantum) != has_decode:
+                raise ValueError(
+                    f"PCP zigzag padded token bucket {local_padded_tokens} "
+                    f"disagrees with batch mode ({has_decode=}, {local_quantum=})."
+                )
             if max_num_tokens is not None and local_padded_tokens > int(max_num_tokens):
                 raise ValueError(
                     f"PCP local padded token length exceeds runner max token buffer: "
@@ -502,6 +594,9 @@ class PcpSequenceLayoutPlanner:
             num_tokens_paddings=runner.num_tokens_paddings,
             max_num_tokens=runner.max_num_tokens,
             dp_target_bucket=runner._dp_target_bucket,
+            block_size=getattr(runner, "block_size", None),
+            kernel_block_size=getattr(runner, "_attention_kernel_block_size", None),
+            cache_config=getattr(runner, "cache_config", None),
         )
         if decision.mode is PcpSequenceLayoutMode.DISABLED:
             return self._all_planner.prepare_real(
@@ -534,7 +629,9 @@ class PcpSequenceLayoutPlanner:
                 global_num_tokens=int(total_num_scheduled_tokens),
                 global_padded_num_tokens=(prepared.padded_total_num_scheduled_tokens),
                 local_num_tokens=prepared.local_total_num_scheduled_tokens,
-                local_padded_num_tokens=(prepared.local_padded_total_num_scheduled_tokens),
+                local_padded_num_tokens=(
+                    prepared.local_padded_total_num_scheduled_tokens
+                ),
                 logits_indices_cpu=prepared.logits_indices_cpu,
                 logits_local_indices_cpu=prepared.logits_local_indices_cpu,
                 logits_owner_mask_cpu=prepared.logits_owner_mask_cpu,
@@ -599,20 +696,46 @@ class PcpSequenceLayoutPlanner:
             two_p = 2 * self.eligibility.pcp_size
             n_off = max(num_reqs, 2)
             block_size = getattr(self.eligibility, "block_size", 16)
-            c_i = (num_tokens * self.eligibility.pcp_size) // two_p
-            req_pages = max(1, c_i // block_size)
-            dev = "tpu" if torch.cuda.is_available() or hasattr(torch, "tpu") else "cpu"
+            max_tokens_cap = max(
+                int(
+                    getattr(self.eligibility, "max_num_tokens", num_tokens)
+                    or num_tokens
+                ),
+                num_tokens,
+            )
+            c_i_max = (max_tokens_cap * self.eligibility.pcp_size) // two_p
+            req_pages = max(1, c_i_max // block_size)
+            dev = "tpu" if hasattr(torch, "tpu") and torch.tpu.is_available() else "cpu"
             dummy_pcp = PCPMetadata(
-                query_start_loc=torch.zeros((self.eligibility.pcp_size, n_off + 1), dtype=torch.int32, device=dev),
+                query_start_loc=torch.zeros(
+                    (self.eligibility.pcp_size, n_off + 1),
+                    dtype=torch.int32,
+                    device=dev,
+                ),
                 kv_cache_lens=torch.zeros((n_off,), dtype=torch.int32, device=dev),
-                q_pos_offsets=torch.zeros((self.eligibility.pcp_size, n_off), dtype=torch.int32, device=dev),
-                new_kv_page_indices=torch.zeros((n_off * two_p * req_pages,), dtype=torch.int32, device=dev),
-                update_kv_cache=torch.zeros((self.eligibility.pcp_size, n_off), dtype=torch.bool, device=dev),
-                gdn_rm_to_packed=torch.zeros((num_tokens * self.eligibility.pcp_size,), dtype=torch.int32, device=dev),
-                gdn_packed_to_local=torch.zeros((num_tokens,), dtype=torch.int32, device=dev),
-                gdn_query_start_loc=torch.zeros((n_off + 1,), dtype=torch.int32, device=dev),
+                q_pos_offsets=torch.zeros(
+                    (self.eligibility.pcp_size, n_off), dtype=torch.int32, device=dev
+                ),
+                new_kv_page_indices=torch.zeros(
+                    (n_off * two_p * req_pages,), dtype=torch.int32, device=dev
+                ),
+                update_kv_cache=torch.zeros(
+                    (self.eligibility.pcp_size, n_off), dtype=torch.bool, device=dev
+                ),
+                gdn_rm_to_packed=torch.zeros(
+                    (max_tokens_cap * self.eligibility.pcp_size,),
+                    dtype=torch.int32,
+                    device=dev,
+                ),
+                gdn_packed_to_local=torch.zeros(
+                    (max_tokens_cap,), dtype=torch.int32, device=dev
+                ),
+                gdn_query_start_loc=torch.zeros(
+                    (n_off + 1,), dtype=torch.int32, device=dev
+                ),
                 cache_pages=0,
                 is_decode=False,
+                page_size=int(block_size),
             )
             return SequenceLayoutPlan(
                 descriptor=PCP_ZIGZAG_SEQUENCE_LAYOUT_DESCRIPTOR,
@@ -662,33 +785,6 @@ class PcpSequenceLayoutPlanner:
             hidden_states.device, non_blocking=True
         )
         selected = torch.index_select(hidden_states, 0, local_indices)
-        is_owner = bool(plan.logits_owner_mask_cpu.any().item())
-        try:
-            rank = _get_native_pcp_rank()
-            n_tokens = hidden_states.shape[0]
-            # Log first token, last real token (e.g. 117), and padding tokens
-            hs_0_nan = bool(torch.isnan(hidden_states[0]).any().item()) if n_tokens > 0 else None
-            hs_0_max = float(hidden_states[0].max().item()) if n_tokens > 0 else 0.0
-            last_idx = int(local_indices[0].item()) if local_indices.numel() > 0 else 0
-            hs_last_nan = bool(torch.isnan(hidden_states[last_idx]).any().item()) if n_tokens > last_idx else None
-            hs_last_max = float(hidden_states[last_idx].max().item()) if n_tokens > last_idx else 0.0
-            sel_nan = bool(torch.isnan(selected).any().item())
-            sel_max = float(selected.max().item())
-            logger.info(
-                "[PCP_HS_TRACE] rank=%d is_owner=%s last_idx=%d hs_shape=%s hs0_nan=%s hs0_max=%.4f hslast_nan=%s hslast_max=%.4f sel_nan=%s sel_max=%.4f",
-                rank,
-                is_owner,
-                last_idx,
-                list(hidden_states.shape),
-                hs_0_nan,
-                hs_0_max,
-                hs_last_nan,
-                hs_last_max,
-                sel_nan,
-                sel_max,
-            )
-        except Exception as e:
-            logger.warning("[PCP_HS_TRACE] logging error: %s", e)
         selected = torch.where(
             owner_mask.unsqueeze(1), selected, torch.zeros_like(selected)
         )
@@ -1000,24 +1096,21 @@ def pcp_zigzag_seq_arrays(
         for i in range(n_reqs):
             c_i = chunk[i]
             o_i = off[i]
-            head_off = r * c_i
-            head_real = int(np.clip(counts[i] - head_off, 0, c_i))
             tail_off = (two_p - 1 - r) * c_i
             tail_real = int(np.clip(counts[i] - tail_off, 0, c_i))
 
+            # Keep full c_i on non-last tail slots so cu_q_lens stays contiguous up
+            # to off[i + 1]; causal masking and kv_lens mask padded query positions.
             cu_q_lens[r, 2 * i] = o_i
-            if head_real < c_i:
-                cu_q_lens[r, 2 * i + 1] = o_i + head_real
-                cu_q_lens[r, 2 * i + 2] = o_i + head_real
-            else:
-                cu_q_lens[r, 2 * i + 1] = o_i + c_i
-                cu_q_lens[r, 2 * i + 2] = o_i + c_i + tail_real
+            cu_q_lens[r, 2 * i + 1] = o_i + c_i
+            cu_q_lens[r, 2 * i + 2] = (
+                o_i + c_i + (tail_real if i == n_reqs - 1 else c_i)
+            )
 
-            q_pos_offsets[r, 2 * i] = head_off
+            q_pos_offsets[r, 2 * i] = r * c_i
             q_pos_offsets[r, 2 * i + 1] = tail_off
 
-            pcp_write_flags[r, 2 * i] = (head_real > 0)
-            pcp_write_flags[r, 2 * i + 1] = (tail_real > 0)
+            pcp_write_flags[r, 2 * i + (1 if tail_real > 0 else 0)] = True
 
         if 2 * n_reqs < n_off:
             cu_q_lens[r, 2 * n_reqs + 1 :] = cu_q_lens[r, 2 * n_reqs]
@@ -1033,17 +1126,21 @@ def pcp_zigzag_page_table(
     off: list[int] | None = None,
     s_pad: int | None = None,
     counts: list[int] | None = None,
-    source_block_tables: list[np.ndarray] | np.ndarray | None = None,
+    max_s_pad: int | None = None,
 ) -> np.ndarray:
     """Page table for the all-gathered current KV under zigzag sharding."""
+    del counts
     two_p = 2 * pcp_size
     n_reqs = len(chunk)
-    if s_pad is not None:
-        max_req_pages = max(1, (s_pad // 2) // block_size)
-        s_pad_val = s_pad
+    cap_s_pad = max_s_pad if max_s_pad is not None else s_pad
+    if cap_s_pad is not None:
+        max_req_pages = max(1, (cap_s_pad // 2) // block_size)
     else:
         max_req_pages = max(c // block_size for c in chunk) if chunk else 1
         max_req_pages = max(1, max_req_pages)
+    if s_pad is not None:
+        s_pad_val = s_pad
+    else:
         s_pad_val = sum(2 * c for c in chunk)
     pcp_table_np = np.zeros((n_off, two_p * max_req_pages), dtype=np.int32)
     for i in range(n_reqs):
@@ -1052,21 +1149,12 @@ def pcp_zigzag_page_table(
         o_i = off[i] if off is not None else sum(2 * c for c in chunk[:i])
         for c in range(two_p):
             cols = slice(c * req_pages, (c + 1) * req_pages)
-            if source_block_tables is not None and i < len(source_block_tables):
-                bt = source_block_tables[i]
-                if isinstance(bt, torch.Tensor):
-                    bt = bt.cpu().numpy()
-                n_copy = min(max(0, len(bt) - c * req_pages), req_pages)
-                if n_copy > 0:
-                    pcp_table_np[2 * i, c * req_pages : c * req_pages + n_copy] = bt[c * req_pages : c * req_pages + n_copy]
-                    pcp_table_np[2 * i + 1, c * req_pages : c * req_pages + n_copy] = bt[c * req_pages : c * req_pages + n_copy]
-            else:
-                rank = c if c < pcp_size else two_p - 1 - c
-                base = (
-                    rank * s_pad_val + o_i + (c_i if c >= pcp_size else 0)
-                ) // block_size
-                pcp_table_np[2 * i, cols] = base + np.arange(req_pages)
-                pcp_table_np[2 * i + 1, cols] = base + np.arange(req_pages)
+            rank = c if c < pcp_size else two_p - 1 - c
+            base = (
+                rank * s_pad_val + o_i + (c_i if c >= pcp_size else 0)
+            ) // block_size
+            pcp_table_np[2 * i, cols] = base + np.arange(req_pages)
+            pcp_table_np[2 * i + 1, cols] = base + np.arange(req_pages)
     return pcp_table_np
 
 
@@ -1146,6 +1234,9 @@ def prepare_pcp_zigzag_sequence_layout(
             num_tokens_paddings=runner.num_tokens_paddings,
             max_num_tokens=runner.max_num_tokens,
             dp_target_bucket=runner._dp_target_bucket,
+            block_size=getattr(runner, "block_size", None),
+            kernel_block_size=getattr(runner, "_attention_kernel_block_size", None),
+            cache_config=getattr(runner, "cache_config", None),
         )
     PcpSequenceLayoutEligibility.require_mode(decision, PcpSequenceLayoutMode.ZIGZAG)
 
@@ -1177,6 +1268,11 @@ def prepare_pcp_zigzag_sequence_layout(
     block_size = resolve_pcp_zigzag_page_size(
         getattr(runner, "block_size", 16),
         getattr(runner, "_attention_kernel_block_size", None),
+        cache_config=getattr(runner, "cache_config", None),
+    )
+    max_tokens_cap = max(
+        int(getattr(runner, "max_num_tokens", s_pad) or s_pad),
+        s_pad,
     )
 
     is_decode = any(
@@ -1222,7 +1318,7 @@ def prepare_pcp_zigzag_sequence_layout(
         for i in range(num_reqs):
             logits_indices_cpu[i] = i
             logits_local_indices_cpu[i] = i
-            logits_owner_mask_cpu[i] = (pcp_rank == 0)
+            logits_owner_mask_cpu[i] = pcp_rank == 0
         if num_reqs < padded_num_reqs:
             logits_indices_cpu[num_reqs:] = (
                 logits_indices_cpu[num_reqs - 1] if num_reqs > 0 else 0
@@ -1246,13 +1342,17 @@ def prepare_pcp_zigzag_sequence_layout(
             if 2 * num_reqs < n_off:
                 cu_q_lens_np[r, 2 * num_reqs + 1 :] = num_reqs
 
-        max_req_pages = max(1, (s_pad // 2) // block_size)
+        max_req_pages = max(1, (max_tokens_cap // 2) // block_size)
         pcp_table_np = np.zeros((n_off, two_p * max_req_pages), dtype=np.int32)
         max_computed = max(computed) if computed else 0
         cache_pages = max(1, (max_computed + block_size - 1) // block_size)
 
-        gdn_rm_to_packed_np = np.arange(padded_total_num_tokens, dtype=np.int32)
-        gdn_packed_to_local_np = np.arange(s_pad, dtype=np.int32)
+        gdn_rm_to_packed_np = np.zeros(max_tokens_cap * pcp_size, dtype=np.int32)
+        gdn_rm_to_packed_np[:padded_total_num_tokens] = np.arange(
+            padded_total_num_tokens, dtype=np.int32
+        )
+        gdn_packed_to_local_np = np.zeros(max_tokens_cap, dtype=np.int32)
+        gdn_packed_to_local_np[:s_pad] = np.arange(s_pad, dtype=np.int32)
         gdn_qsl_np = np.zeros(n_off + 1, dtype=np.int32)
         for i in range(num_reqs):
             gdn_qsl_np[2 * i + 1] = i + 1
@@ -1314,18 +1414,6 @@ def prepare_pcp_zigzag_sequence_layout(
             logits_local_indices_cpu[num_reqs:] = 0
             logits_owner_mask_cpu[num_reqs:] = False
 
-        source_block_tables = None
-        if hasattr(runner, "input_batch") and runner.input_batch is not None:
-            if hasattr(runner.input_batch, "block_table") and runner.input_batch.block_table:
-                try:
-                    bt_cpu = runner.input_batch.block_table[0].get_cpu_tensor()
-                    source_block_tables = [
-                        bt_cpu[start_index + i].clone().numpy()
-                        for i in range(num_reqs)
-                    ]
-                except Exception as e:
-                    logger.warning("Failed to extract source_block_tables: %s", e)
-
         cu_q_lens_np, q_pos_offsets_np, pcp_write_np = pcp_zigzag_seq_arrays(
             chunk, off, pcp_size, n_off, counts
         )
@@ -1337,19 +1425,28 @@ def prepare_pcp_zigzag_sequence_layout(
             off=off,
             s_pad=s_pad,
             counts=counts,
-            source_block_tables=source_block_tables,
+            max_s_pad=max_tokens_cap,
         )
 
         max_computed = max(computed) if computed else 0
-        cache_pages = max(1, (max_computed + block_size - 1) // block_size) if max_computed > 0 else 0
+        cache_pages = (
+            max(1, (max_computed + block_size - 1) // block_size)
+            if max_computed > 0
+            else 0
+        )
 
-        gdn_rm_to_packed_np = np.where(
+        gdn_rm_to_packed_raw = np.where(
             request_major_to_packed >= 0, request_major_to_packed, 0
         ).astype(np.int32)
+        gdn_rm_to_packed_np = np.zeros(max_tokens_cap * pcp_size, dtype=np.int32)
+        gdn_rm_to_packed_np[: len(gdn_rm_to_packed_raw)] = gdn_rm_to_packed_raw
+
         local_packed_to_rm = packed_to_request_major[local_start:local_end]
-        gdn_packed_to_local_np = np.where(
+        gdn_packed_to_local_raw = np.where(
             local_packed_to_rm >= 0, local_packed_to_rm, 0
         ).astype(np.int32)
+        gdn_packed_to_local_np = np.zeros(max_tokens_cap, dtype=np.int32)
+        gdn_packed_to_local_np[: len(gdn_packed_to_local_raw)] = gdn_packed_to_local_raw
         gdn_qsl_np = np.zeros(n_off + 1, dtype=np.int32)
         acc_q = 0
         for i in range(num_reqs):
@@ -1380,6 +1477,7 @@ def prepare_pcp_zigzag_sequence_layout(
         gdn_query_start_loc=torch.from_numpy(gdn_qsl_np).to(dev, non_blocking=True),
         cache_pages=cache_pages,
         is_decode=is_decode,
+        page_size=int(block_size),
     )
 
     for i in range(num_reqs):

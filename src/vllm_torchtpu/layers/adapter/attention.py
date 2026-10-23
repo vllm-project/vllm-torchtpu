@@ -730,12 +730,14 @@ class PallasBatchedRPAAttentionBackend(PallasAttentionBackend):
 
     @staticmethod
     def get_supported_kernel_block_sizes():
+        vllm_config = get_current_vllm_config()
         if (
-            get_current_vllm_config().cache_config.get_resolved_kv_cache_layout()
+            vllm_config.cache_config.get_resolved_kv_cache_layout()
             is VllmKVCacheLayout.LBHNC
-            and get_current_vllm_config().parallel_config.prefill_context_parallel_size
-            > 1
+            and vllm_config.parallel_config.prefill_context_parallel_size > 1
         ):
+            if envs.VLLM_TPU_PCP_LAYOUT.lower() == "zigzag":
+                return [128]
             return [128, 256, 512, 1024, 2048, 4096]
         return [128, 256]
 
@@ -1093,6 +1095,7 @@ class PallasAttentionBackendImpl(AttentionImpl):
             pcp_world_size=pcp_world_size,
             pcp_rank=pcp_rank,
             kv_layout=self.kv_layout,
+            use_causal_mask=self.use_causal_mask,
         )
 
     def _validate_pcp_streaming_support(self, skip_kv_update: bool) -> None:
@@ -1269,9 +1272,8 @@ class PallasAttentionBackendImpl(AttentionImpl):
             and parallel_config.prefill_context_parallel_size > 1
         )
         if pcp_configured:
-            if (
-                envs.VLLM_TPU_PCP_LAYOUT == "zigzag"
-                and isinstance(self, PallasBatchedRPAAttentionBackendImpl)
+            if envs.VLLM_TPU_PCP_LAYOUT.lower() == "zigzag" and isinstance(
+                self, PallasBatchedRPAAttentionBackendImpl
             ):
                 from vllm_torchtpu.distributed.pcp import (
                     get_pcp_rank,
@@ -1280,18 +1282,26 @@ class PallasAttentionBackendImpl(AttentionImpl):
 
                 self.decode_query_size = 1
                 self._pcp_streaming = False
-                _build_pcp_kernels(
-                    sliding_window=self.sliding_window,
-                    sm_scale=self.scale,
-                    logits_soft_cap=self.logits_soft_cap,
-                    q_scale=q_scale,
-                    k_scale=k_scale,
-                    v_scale=v_scale,
-                    cp_group_size=get_pcp_world_size(),
-                    cp_rank=get_pcp_rank(),
-                    use_causal_mask=self.use_causal_mask,
-                    kv_layout=self.kv_layout,
-                )
+                if self.kv_cache_quantized_dtype and (
+                    k_scale is None or v_scale is None
+                ):
+                    raise ValueError("k_scale_float and v_scale_float must be non-zero")
+                pcp_world_size = get_pcp_world_size()
+                pcp_rank = get_pcp_rank()
+                for is_decode in (False, True):
+                    _build_pcp_kernels(
+                        sliding_window=self.sliding_window,
+                        sm_scale=self.scale,
+                        logits_soft_cap=self.logits_soft_cap,
+                        q_scale=q_scale,
+                        k_scale=k_scale,
+                        v_scale=v_scale,
+                        cp_group_size=pcp_world_size,
+                        cp_rank=pcp_rank,
+                        use_causal_mask=self.use_causal_mask,
+                        kv_layout=self.kv_layout,
+                        is_decode=is_decode,
+                    )
                 return
 
             self._validate_pcp_streaming_support(skip_kv_update)

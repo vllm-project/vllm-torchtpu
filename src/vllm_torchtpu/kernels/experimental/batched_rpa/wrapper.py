@@ -377,7 +377,6 @@ class BaseBlockSizeCalculator:
     larger half of the budget.
     """
     num_lanes = self.tpu_info.num_lanes
-    num_sublanes = self.tpu_info.num_sublanes
     num_kv_heads = self.model_cfgs.num_kv_heads
     aligned_q_per_kv = self.aligned_num_q_heads // num_kv_heads
 
@@ -923,8 +922,9 @@ def ragged_paged_attention(
         num_q_heads_per_kv_head, q_packing
     )
     if serve_cfgs.is_packed_lse:
-      # Even token count: `wait_out` bitcasts the (bf16) LSE to uint32.
-      alloc_tokens = utils.align_to(queries.shape[0], 2)
+      # Align to native sublane * packing rows (16 for bf16, 8 for fp32) for wait_out.
+      lse_packing = utils.get_dtype_packing(out_dtype)
+      alloc_tokens = utils.align_to(queries.shape[0], num_sublanes * lse_packing)
       lse_hbm_init = jnp.full(
           [num_kv_heads, alloc_tokens, num_lanes], -jnp.inf, dtype=out_dtype
       )

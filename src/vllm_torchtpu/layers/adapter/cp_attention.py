@@ -40,10 +40,8 @@ from torch_tpu._internal import pallas
 from vllm_torchtpu.distributed.dcp import get_dcp_group
 from vllm_torchtpu.distributed.pcp import (
     all_gather_equal_tokens,
-    get_or_create_pcp_mesh,
+    all_to_all_single,
     get_pcp_group,
-    get_pcp_rank,
-    get_pcp_world_size,
 )
 from vllm_torchtpu.kernels.experimental.batched_rpa import (
     configs as _batched_rpa_configs,
@@ -112,6 +110,29 @@ def dcp_allgather_lse_combine(
     lse_chunks = all_lses.chunk(dcp_world_size, dim=0)
     out_combined, lse_combined = out_chunks[0], lse_chunks[0]
     for i in range(1, dcp_world_size):
+        out_combined, lse_combined = lse_weighted_combine(
+            out_combined, lse_combined, out_chunks[i], lse_chunks[i]
+        )
+    return out_combined, lse_combined
+
+
+def pcp_alltoall_lse_combine(
+    out_all_local: torch.Tensor,
+    lse_all_local: torch.Tensor,
+    pcp_world_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Exchange partial cache outputs/LSEs via all-to-all and fold across PCP ranks.
+
+    Chunk ``src`` of ``out_all_local`` (``[P * T, H, D]``) holds rank ``src``'s Q
+    attending against this rank's KV shard; ``all_to_all_single`` delivers all ``P``
+    KV-shard partials for this rank's own Q with ``P``x less traffic than all-gather.
+    """
+    recv_out = all_to_all_single(out_all_local)
+    recv_lse = all_to_all_single(lse_all_local)
+    out_chunks = recv_out.chunk(pcp_world_size, dim=0)
+    lse_chunks = recv_lse.chunk(pcp_world_size, dim=0)
+    out_combined, lse_combined = out_chunks[0], lse_chunks[0]
+    for i in range(1, pcp_world_size):
         out_combined, lse_combined = lse_weighted_combine(
             out_combined, lse_combined, out_chunks[i], lse_chunks[i]
         )
@@ -396,24 +417,6 @@ def forward_with_dcp(
 # ---------------------------------------------------------------------------
 
 
-_PCP_CACHE_INPUT_PARTITION_SPECS = (
-    jax.sharding.PartitionSpec("pcp"),  # kv_cache
-    jax.sharding.PartitionSpec("pcp"),  # query
-    jax.sharding.PartitionSpec("pcp"),  # key
-    jax.sharding.PartitionSpec("pcp"),  # value
-    jax.sharding.PartitionSpec(),  # seq_lens
-    jax.sharding.PartitionSpec(),  # block_tables
-    jax.sharding.PartitionSpec(),  # cu_q_lens
-    jax.sharding.PartitionSpec(),  # distribution
-    jax.sharding.PartitionSpec(),  # kv_new_lens
-)
-_PCP_CACHE_OUTPUT_PARTITION_SPECS = (
-    jax.sharding.PartitionSpec("pcp"),  # new_kv_cache
-    jax.sharding.PartitionSpec("pcp"),  # output
-    jax.sharding.PartitionSpec("pcp"),  # lse
-)
-
-
 def _pallas_rpa_kernel_pcp_cache(
     kv_cache: jax.Array,
     query: jax.Array,
@@ -433,79 +436,9 @@ def _pallas_rpa_kernel_pcp_cache(
     soft_cap: float | None = None,
     cp_group_size: int,
     cp_rank_val: int,
-    pcp_ring_axis_name: str | None = "pcp",
-    pcp_ring_mesh_axis_names: tuple[str, ...] | None = None,
-    mesh: Any = None,
     kv_layout: _batched_rpa_configs.KVLayout = _batched_rpa_configs.KVLayout.HEAD_ALONG_SUBLANE,
 ) -> tuple[jax.Array, jax.Array, jax.Array]:
     import jax.numpy as jnp
-    from jax import lax
-
-    if mesh is not None and getattr(mesh, "size", 1) > 1 and pcp_ring_axis_name is not None:
-        mesh_axis_names = (
-            pcp_ring_mesh_axis_names
-            if pcp_ring_mesh_axis_names is not None
-            else tuple(mesh.axis_names)
-        )
-
-        def _shard_fn(
-            kv_cache_local,
-            query_local,
-            key_local,
-            value_local,
-            seq_lens_local,
-            block_tables_local,
-            cu_q_lens_local,
-            distribution_local,
-            kv_new_lens_local,
-        ):
-            cp_rank_arr = jnp.reshape(
-                lax.axis_index(pcp_ring_axis_name), (1,)
-            ).astype(jnp.int32)
-            output, new_kv_cache, lse = _batched_rpa_wrapper.ragged_paged_attention(
-                queries=query_local,
-                keys=key_local,
-                values=value_local,
-                kv_cache=kv_cache_local,
-                kv_lens=seq_lens_local,
-                page_indices=block_tables_local,
-                cu_q_lens=cu_q_lens_local,
-                distribution=distribution_local,
-                sm_scale=sm_scale,
-                sliding_window=sliding_window,
-                soft_cap=soft_cap,
-                q_scale=q_scale,
-                k_scale=k_scale,
-                v_scale=v_scale,
-                cp_group_size=cp_group_size,
-                cp_rank=cp_rank_arr,
-                kv_new_lens=kv_new_lens_local,
-                attention_scope=_batched_rpa_configs.AttentionScope.CACHE_ONLY,
-                pcp_ring_axis_name=pcp_ring_axis_name,
-                pcp_ring_mesh_axis_names=mesh_axis_names,
-                update_kv_cache=False,
-                return_lse=True,
-                kv_layout=kv_layout,
-            )
-            return new_kv_cache, output, lse
-
-        return jax.shard_map(
-            _shard_fn,
-            mesh=mesh,
-            in_specs=_PCP_CACHE_INPUT_PARTITION_SPECS,
-            out_specs=_PCP_CACHE_OUTPUT_PARTITION_SPECS,
-            check_vma=False,
-        )(
-            kv_cache,
-            query,
-            key,
-            value,
-            seq_lens,
-            block_tables,
-            cu_q_lens,
-            distribution,
-            kv_new_lens,
-        )
 
     cp_rank_arr = jnp.array([cp_rank_val], dtype=jnp.int32)
     output, new_kv_cache, lse = _batched_rpa_wrapper.ragged_paged_attention(
@@ -608,34 +541,10 @@ def _alloc_pcp_instance_id() -> int:
     return i
 
 
-def _build_pcp_kernel_op(
-    op_name: str,
-    fn,
-    mesh: Any = None,
-    input_partition_specs: tuple | None = None,
-    output_partition_specs: tuple | None = None,
-):
-    if (
-        mesh is not None
-        and getattr(mesh, "size", 1) > 1
-        and input_partition_specs is not None
-    ):
-        from vllm_torchtpu.kernels.experimental.pcp_streaming_rpa.vllm_adapter import (
-            pcp_streaming_jax_op,
-        )
-
-        op = pcp_streaming_jax_op(
-            op_name,
-            fn,
-            donate_argnums=(0,),
-            mesh=mesh,
-            input_partition_specs=input_partition_specs,
-            output_partition_specs=output_partition_specs,
-        )
-    else:
-        op = pallas.jax_op(
-            op_name, fn, donate_argnums=(0,), mesh=None, input_partition_specs=None
-        )
+def _build_pcp_kernel_op(op_name: str, fn):
+    op = pallas.jax_op(
+        op_name, fn, donate_argnums=(0,), mesh=None, input_partition_specs=None
+    )
     op.register_fake(_fake_dcp)
 
     def kernel_impl(kv_cache, *args, **kwargs):
@@ -682,13 +591,6 @@ def build_pcp_kernels(
     if cached_cache is not None and cached_new is not None:
         return cached_cache, cached_new
 
-    try:
-        mesh = get_or_create_pcp_mesh(axis_name="pcp")
-    except Exception:
-        mesh = None
-
-    mesh_axis_names = tuple(mesh.axis_names) if mesh is not None else None
-
     if cached_cache is None:
         fn = functools.partial(
             _pallas_rpa_kernel_pcp_cache,
@@ -700,17 +602,10 @@ def build_pcp_kernels(
             soft_cap=logits_soft_cap,
             cp_group_size=cp_group_size,
             cp_rank_val=cp_rank,
-            pcp_ring_axis_name="pcp",
-            pcp_ring_mesh_axis_names=mesh_axis_names,
-            mesh=mesh,
             kv_layout=kv_layout,
         )
         cached_cache = _PCP_KERNEL_REGISTRY[cache_key] = _build_pcp_kernel_op(
-            f"pallas::rpa_pcp_cache_{_alloc_pcp_instance_id()}",
-            fn,
-            mesh=mesh,
-            input_partition_specs=_PCP_CACHE_INPUT_PARTITION_SPECS,
-            output_partition_specs=_PCP_CACHE_OUTPUT_PARTITION_SPECS,
+            f"pallas::rpa_pcp_cache_{_alloc_pcp_instance_id()}", fn
         )
 
     if cached_new is None:
@@ -729,7 +624,7 @@ def build_pcp_kernels(
             kv_layout=kv_layout,
         )
         cached_new = _PCP_KERNEL_REGISTRY[new_key] = _build_pcp_kernel_op(
-            f"pallas::rpa_pcp_new_{_alloc_pcp_instance_id()}", fn, mesh=None
+            f"pallas::rpa_pcp_new_{_alloc_pcp_instance_id()}", fn
         )
 
     return cached_cache, cached_new
@@ -759,7 +654,9 @@ def _per_request_pages(block_tables: torch.Tensor, num_seqs: int) -> torch.Tenso
     heads = bt_2d[::2]
     if heads.shape[0] < num_seqs:
         pad_rows = num_seqs - heads.shape[0]
-        zeros = torch.zeros((pad_rows, heads.shape[1]), dtype=heads.dtype, device=heads.device)
+        zeros = torch.zeros(
+            (pad_rows, heads.shape[1]), dtype=heads.dtype, device=heads.device
+        )
         heads = torch.cat([heads, zeros], dim=0)
     return heads.reshape(orig_shape)
 
@@ -793,11 +690,36 @@ def forward_with_pcp(
     if pcp_meta is None:
         raise ValueError("forward_with_pcp requires attn_metadata.pcp to be set.")
 
-    q_scale = None
-    k_scale = layer._k_scale_float if kv_cache_quantized_dtype else None
-    v_scale = layer._v_scale_float if kv_cache_quantized_dtype else None
+    q_scale = k_scale = v_scale = None
+    if kv_cache_quantized_dtype:
+        k_scale_value = layer._k_scale_float
+        v_scale_value = layer._v_scale_float
+        if k_scale_value in (None, 0.0) or v_scale_value in (None, 0.0):
+            raise ValueError("k_scale_float and v_scale_float must be non-zero")
+        k_scale = k_scale_value
+        v_scale = v_scale_value
 
-    is_decode = bool(getattr(pcp_meta, "is_decode", False))
+    page_size = int(
+        kv_cache.shape[4]
+        if kv_layout == _batched_rpa_configs.KVLayout.SEQ_ALONG_LANE
+        else kv_cache.shape[1]
+    )
+    shape_is_decode = bool(query.shape[0] < (2 * page_size))
+    if torch.compiler.is_compiling():
+        is_decode = shape_is_decode
+    else:
+        meta_page_size = getattr(pcp_meta, "page_size", None)
+        if meta_page_size is not None and int(meta_page_size) != page_size:
+            raise ValueError(
+                f"PCP metadata page_size ({meta_page_size}) does not match "
+                f"kv_cache page dimension ({page_size})."
+            )
+        is_decode = bool(getattr(pcp_meta, "is_decode", False))
+        if is_decode != shape_is_decode:
+            raise ValueError(
+                f"PCP metadata is_decode ({is_decode}) disagrees with query "
+                f"bucket shape ({query.shape[0]}, 2 * page_size={2 * page_size})."
+            )
 
     cache_kernel, new_kernel = build_pcp_kernels(
         sliding_window=sliding_window,
@@ -847,9 +769,7 @@ def forward_with_pcp(
 
     kv_new_lens = attn_metadata.seq_lens - pcp_cache_lens
 
-    idx = torch.arange(
-        query.shape[0], device=query.device, dtype=cu_q_lens_local.dtype
-    )
+    idx = torch.arange(query.shape[0], device=query.device, dtype=cu_q_lens_local.dtype)
     starts = cu_q_lens_local[:-1]
     ends = cu_q_lens_local[1:]
     valid_q_mask = (
@@ -863,69 +783,128 @@ def forward_with_pcp(
     value = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
 
     # ---- 1. CACHE_ONLY pass ----
+    cu_cache = _make_cu_cache(cu_q_lens_local, num_seqs)
+    dist_cache = attn_metadata.request_distribution.clone()
+    if is_decode:
+        dist_cache[0] = torch.maximum(
+            torch.tensor(1, dtype=dist_cache.dtype, device=dist_cache.device),
+            attn_metadata.request_distribution[0] // 2,
+        )
+        dist_cache[1] = dist_cache[0]
+        dist_cache[2] = dist_cache[0]
+    else:
+        dist_cache[0] = 0
+        dist_cache[1] = 0
+        dist_cache[2] = attn_metadata.request_distribution[2] // 2
+
+    seq_lens_req = _per_request_1d(attn_metadata.seq_lens, num_seqs)
+    block_tables_req = _per_request_pages(attn_metadata.block_tables, num_seqs)
+    kv_new_lens_req = _per_request_1d(kv_new_lens, num_seqs)
+
     cache_pages = pcp_meta.cache_pages
-    if cache_pages == 0:
+    run_cache_pass = torch.compiler.is_compiling() or (cache_pages > 0)
+    if not run_cache_pass:
         ctx_output = ctx_lse = None
     else:
-        cu_cache = _make_cu_cache(cu_q_lens_local, num_seqs)
-        dist_cache = attn_metadata.request_distribution.clone()
-        if is_decode:
-            dist_cache[0] = torch.maximum(
-                torch.tensor(1, dtype=dist_cache.dtype, device=dist_cache.device),
-                attn_metadata.request_distribution[0] // 2,
-            )
-            dist_cache[1] = dist_cache[0]
-            dist_cache[2] = dist_cache[0]
+        pcp_group = get_pcp_group()
+        if pcp_group is not None and pcp_world_size > 1:
+            if is_decode:
+                ctx_output, ctx_lse = cache_kernel(
+                    kv_cache,
+                    query,
+                    key,
+                    value,
+                    seq_lens_req,
+                    block_tables_req,
+                    cu_cache,
+                    dist_cache,
+                    kv_new_lens_req,
+                )
+                ctx_output, ctx_lse = dcp_allgather_lse_combine(
+                    ctx_output, ctx_lse, pcp_group, pcp_world_size
+                )
+            else:
+                q_all = all_gather_equal_tokens(query, dim=0)
+                q_all = torch.nan_to_num(q_all, nan=0.0, posinf=0.0, neginf=0.0)
+                q_chunks = q_all.chunk(pcp_world_size, dim=0)
+                out_chunks_local = []
+                lse_chunks_local = []
+                # Launch per source chunk because each chunk can have trailing
+                # bucket padding before the next rank's offset in q_all.
+                for src, q_chunk in enumerate(q_chunks):
+                    cu_src = (
+                        _make_cu_cache(pcp_cu[src], num_seqs)
+                        if pcp_cu.ndim == 2
+                        else cu_cache
+                    )
+                    c_out, c_lse = cache_kernel(
+                        kv_cache,
+                        q_chunk.contiguous(),
+                        key,
+                        value,
+                        seq_lens_req,
+                        block_tables_req,
+                        cu_src,
+                        dist_cache,
+                        kv_new_lens_req,
+                    )
+                    out_chunks_local.append(c_out)
+                    lse_chunks_local.append(c_lse)
+                out_all_local = torch.cat(out_chunks_local, dim=0)
+                lse_all_local = torch.cat(lse_chunks_local, dim=0)
+                ctx_output, ctx_lse = pcp_alltoall_lse_combine(
+                    out_all_local, lse_all_local, pcp_world_size
+                )
         else:
-            dist_cache[0] = 0
-            dist_cache[1] = 0
-            dist_cache[2] = attn_metadata.request_distribution[2] // 2
-
-        seq_lens_req = _per_request_1d(attn_metadata.seq_lens, num_seqs)
-        block_tables_req = _per_request_pages(attn_metadata.block_tables, num_seqs)
-        kv_new_lens_req = _per_request_1d(kv_new_lens, num_seqs)
-
-        ctx_output, ctx_lse = cache_kernel(
-            kv_cache,
-            query,
-            key,
-            value,
-            seq_lens_req,
-            block_tables_req,
-            cu_cache,
-            dist_cache,
-            kv_new_lens_req,
-        )
-        if is_decode:
-            pcp_group = get_pcp_group()
-            ctx_output, ctx_lse = dcp_allgather_lse_combine(
-                ctx_output, ctx_lse, pcp_group, pcp_world_size
+            ctx_output, ctx_lse = cache_kernel(
+                kv_cache,
+                query,
+                key,
+                value,
+                seq_lens_req,
+                block_tables_req,
+                cu_cache,
+                dist_cache,
+                kv_new_lens_req,
             )
 
     # ---- 2. NEW_TOKENS_ONLY pass ----
+    q_positions = pcp_cache_lens + q_pos_offsets_local
     if is_decode:
         k_curr = key
         v_curr = value
+        new_seq_lens = seq_lens_req
+        new_block_tables = block_tables_req
+        new_cu_q_lens = cu_cache
+        new_dist = dist_cache
+        new_kv_new_lens = kv_new_lens_req
+        new_q_positions = _per_request_1d(q_positions, num_seqs)
+        new_update_kv_cache = _per_request_1d(update_kv_cache_local, num_seqs)
     else:
         k_curr = all_gather_equal_tokens(key, dim=0)
         v_curr = all_gather_equal_tokens(value, dim=0)
         k_curr = torch.nan_to_num(k_curr, nan=0.0, posinf=0.0, neginf=0.0)
         v_curr = torch.nan_to_num(v_curr, nan=0.0, posinf=0.0, neginf=0.0)
-
-    q_positions = pcp_cache_lens + q_pos_offsets_local
+        new_seq_lens = attn_metadata.seq_lens
+        new_block_tables = attn_metadata.block_tables
+        new_cu_q_lens = cu_q_lens_local
+        new_dist = attn_metadata.request_distribution
+        new_kv_new_lens = kv_new_lens
+        new_q_positions = q_positions
+        new_update_kv_cache = update_kv_cache_local
 
     curr_output, curr_lse = new_kernel(
         kv_cache,
         query,
         k_curr,
         v_curr,
-        attn_metadata.seq_lens,
-        attn_metadata.block_tables,
-        cu_q_lens_local,
-        attn_metadata.request_distribution,
-        kv_new_lens,
-        q_positions,
-        update_kv_cache_local,
+        new_seq_lens,
+        new_block_tables,
+        new_cu_q_lens,
+        new_dist,
+        new_kv_new_lens,
+        new_q_positions,
+        new_update_kv_cache,
         pcp_new_pages,
     )
 
@@ -961,9 +940,7 @@ def merge_attn_states(
     merged_out = (
         cache_out * exp_cache[..., None] + query_out * exp_query[..., None]
     ) / denom[..., None]
-    merged_lse = jnp.where(
-        sum_exp == 0.0, -jnp.inf, max_lse_safe + jnp.log(denom)
-    )
+    merged_lse = jnp.where(sum_exp == 0.0, -jnp.inf, max_lse_safe + jnp.log(denom))
     return merged_out, merged_lse
 
 
@@ -994,8 +971,7 @@ def pcp_forward_batched(
     num_seqs = md.seq_lens.shape[0]
     if md.pcp.new_kv_page_indices is None or md.pcp.update_kv_cache is None:
         raise ValueError(
-            "pcp_forward_batched needs pcp.new_kv_page_indices and "
-            "pcp.update_kv_cache."
+            "pcp_forward_batched needs pcp.new_kv_page_indices and pcp.update_kv_cache."
         )
 
     q_spec = P(None, None, None)
@@ -1031,7 +1007,12 @@ def pcp_forward_batched(
         pcp_q_pos_offsets_local,
         pcp_update_kv_cache_local,
     ):
-        cp_rank = jnp.reshape(lax.axis_index(pcp_axis), (1,)).astype(jnp.int32)
+        # Derive per-shard rank via all_to_all to avoid stablehlo.partition_id on sub-meshes.
+        ranks = jnp.arange(pcp_size, dtype=jnp.int32)
+        exchanged = lax.all_to_all(
+            ranks, pcp_axis, split_axis=0, concat_axis=0, tiled=True
+        )
+        cp_rank = lax.dynamic_slice_in_dim(exchanged, 0, 1, axis=0)
         kv_new_lens = kv_lens_local - kv_cache_lens_local
 
         def all_gather_tokens(x):
@@ -1043,11 +1024,9 @@ def pcp_forward_batched(
             return jnp.pad(heads, pad)
 
         cu_cache = pcp_cu_q_lens_local[0][::2]
-        cu_cache = jnp.pad(
-            cu_cache, (0, num_seqs + 1 - cu_cache.shape[0]), mode="edge"
-        )
-        dist_cache = jnp.array([0, 0, 0], jnp.int32).at[2].set(
-            distribution_local[2] // 2
+        cu_cache = jnp.pad(cu_cache, (0, num_seqs + 1 - cu_cache.shape[0]), mode="edge")
+        dist_cache = (
+            jnp.array([0, 0, 0], jnp.int32).at[2].set(distribution_local[2] // 2)
         )
 
         if cache_pages == 0:
@@ -1059,9 +1038,7 @@ def pcp_forward_batched(
                 v_local,
                 kv_cache_local,
                 _per_request(kv_lens_local),
-                _per_request(page_indices_local.reshape(num_seqs, -1)).reshape(
-                    -1
-                ),
+                _per_request(page_indices_local.reshape(num_seqs, -1)).reshape(-1),
                 cu_cache,
                 dist_cache,
                 cp_rank=cp_rank,
@@ -1143,4 +1120,3 @@ def pcp_forward_batched(
         md.pcp.q_pos_offsets,
         md.pcp.update_kv_cache,
     )
-

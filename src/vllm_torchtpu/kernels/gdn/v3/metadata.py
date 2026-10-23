@@ -44,8 +44,8 @@ def compute_batched_seq_metadata(
     # i < end_seq. This must be guaranteed by the function caller.
     # TODO(kyuyeunk): Add error handling when above condition is not met.
     query_lens = query_start_loc[1:] - query_start_loc[:-1]
-    is_valid_seqs = jnp.where(all_seqs < end_seq, True, False)
-    has_initial_state = (seq_lens - query_lens) > 0
+    is_valid_seqs = jnp.logical_and(all_seqs < end_seq, query_lens > 0)
+    has_initial_state = jnp.logical_and(query_lens > 0, (seq_lens - query_lens) > 0)
     all_valid_seqs = jnp.where(is_valid_seqs, all_seqs, 0)
 
     return memory_ref.MetadataRef.create(

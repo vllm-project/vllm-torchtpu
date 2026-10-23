@@ -13,12 +13,11 @@
 # limitations under the License.
 
 from types import SimpleNamespace
+
 import numpy as np
 import pytest
-import torch
 
 from vllm_torchtpu.layers.core.pcp_sequence_layout import (
-    PCP_ZIGZAG_SEQUENCE_LAYOUT_DESCRIPTOR,
     PcpSequenceLayoutEligibility,
     PcpSequenceLayoutMode,
     PcpSequenceLayoutPlanner,
@@ -26,7 +25,7 @@ from vllm_torchtpu.layers.core.pcp_sequence_layout import (
     pcp_zigzag_page_table,
     pcp_zigzag_seq_arrays,
     pcp_zigzag_token_layout,
-    prepare_pcp_zigzag_sequence_layout,
+    resolve_pcp_zigzag_page_size,
 )
 from vllm_torchtpu.layers.core.sequence_layout import (
     PCP_ZIGZAG_SEQUENCE_LAYOUT_PROTOCOL,
@@ -77,7 +76,6 @@ def test_pcp_zigzag_token_layout_multi_request():
 
 def test_pcp_zigzag_seq_arrays():
     pcp_size = 2
-    two_p = 4
     n_off = 4
     chunk = [32]
     off = [0]
@@ -110,7 +108,6 @@ def test_pcp_zigzag_seq_arrays():
 
 def test_pcp_zigzag_seq_arrays_writer_fallback():
     pcp_size = 2
-    two_p = 4
     n_off = 4
     chunk = [32]
     off = [0]
@@ -233,11 +230,12 @@ def test_pcp_zigzag_decode_single_request():
         start_index=0,
         num_reqs=1,
         num_scheduled_tokens_per_req=np.array([1], dtype=np.int32),
-        num_tokens_paddings=[128, 256, 512],
+        num_tokens_paddings=[16, 128, 256, 512],
         max_num_tokens=512,
     )
     assert decision.mode is PcpSequenceLayoutMode.ZIGZAG
-    assert decision.local_required_tokens == 32
+    assert decision.local_required_tokens == 1
+    assert decision.local_padded_tokens == 16
 
 
 def test_pcp_zigzag_decode_multi_request():
@@ -253,10 +251,111 @@ def test_pcp_zigzag_decode_multi_request():
         start_index=0,
         num_reqs=2,
         num_scheduled_tokens_per_req=np.array([1, 1], dtype=np.int32),
-        num_tokens_paddings=[128, 256, 512],
+        num_tokens_paddings=[16, 128, 256, 512],
         max_num_tokens=512,
     )
     assert decision.mode is PcpSequenceLayoutMode.ZIGZAG
+    assert decision.local_padded_tokens == 16
+
+
+def test_pcp_zigzag_decode_rejects_prefill_token_bucket():
+    eligibility = PcpSequenceLayoutEligibility(
+        pcp_size=2,
+        interleave_size=128,
+        is_zigzag=True,
+        block_size=128,
+        is_hnd_kv_layout=True,
+    )
+    with pytest.raises(ValueError, match="disagrees with batch mode"):
+        eligibility.evaluate_runner_chunk(
+            input_batch=_input_batch(computed=[256] * 129, prompt=[256] * 129),
+            scheduler_output=_scheduler_output([1] * 129),
+            start_index=0,
+            num_reqs=129,
+            num_scheduled_tokens_per_req=np.ones(129, dtype=np.int32),
+            num_tokens_paddings=[16, 128, 256, 512],
+            max_num_tokens=512,
+        )
+
+
+@pytest.mark.parametrize(
+    "resolved_layout,env_layout,block_size,kernel_block_size,expected",
+    [
+        ("LBHNC", None, 16, None, 16),
+        ("LBHNC", None, 128, None, 128),
+        ("LBHNC", None, 256, None, 128),
+        ("LBHNC", None, 2048, None, 128),
+        ("LBHNC", None, 2176, None, 128),
+        ("LBNHC", None, 16, None, 16),
+        ("LBNHC", None, 128, None, 128),
+        ("LBNHC", None, 256, None, 256),
+        ("LBNHC", None, 2048, None, 256),
+        ("LBNHC", None, 2176, None, 128),
+        ("LBNHC", None, 2304, None, 256),
+        ("LBNHC", None, 256, 128, 128),
+        (None, "HND", 2304, None, 128),
+        (None, "NHD", 2304, None, 256),
+    ],
+)
+def test_resolve_pcp_zigzag_page_size_table(
+    monkeypatch,
+    resolved_layout,
+    env_layout,
+    block_size,
+    kernel_block_size,
+    expected,
+):
+    import vllm.envs as vllm_envs
+
+    was_cached = vllm_envs._is_envs_cache_enabled()
+    vllm_envs.disable_envs_cache()
+    try:
+        if env_layout is None:
+            monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
+        else:
+            monkeypatch.setenv("VLLM_KV_CACHE_LAYOUT", env_layout)
+        cache_cfg = (
+            None
+            if resolved_layout is None
+            else SimpleNamespace(get_resolved_kv_cache_layout=lambda: resolved_layout)
+        )
+        assert (
+            resolve_pcp_zigzag_page_size(
+                block_size,
+                kernel_block_size,
+                cache_config=cache_cfg,
+            )
+            == expected
+        )
+    finally:
+        if was_cached:
+            vllm_envs.enable_envs_cache()
+
+
+def test_sync_runner_config_updates_eligibility_and_dummy_page_size(monkeypatch):
+    monkeypatch.delenv("VLLM_KV_CACHE_LAYOUT", raising=False)
+    eligibility = PcpSequenceLayoutEligibility(
+        pcp_size=2,
+        interleave_size=128,
+        is_zigzag=True,
+        block_size=2176,
+    )
+    cache_cfg = SimpleNamespace(get_resolved_kv_cache_layout=lambda: "LBHNC")
+    eligibility.sync_runner_config(
+        block_size=2176,
+        max_num_tokens=4096,
+        cache_config=cache_cfg,
+    )
+    assert eligibility.is_hnd_kv_layout is True
+    assert eligibility.max_num_tokens == 4096
+    plan = PcpSequenceLayoutPlanner(eligibility).prepare_dummy(
+        num_tokens=512,
+        num_reqs=1,
+        kv_cache_initialized=True,
+    )
+    assert plan.pcp_metadata is not None
+    assert plan.pcp_metadata.page_size == 128
+    assert plan.pcp_metadata.is_decode is False
 
 
 def test_pcp_zigzag_rejects_mixed_decode_prefill():
@@ -299,7 +398,9 @@ def test_pcp_zigzag_page_table_multi_request():
     block_size = 16
     n_off = 4
     counts = [64, 64]
-    chunk, off, s_live = pcp_zigzag_token_layout(counts, pcp_size, block_size=block_size)
+    chunk, off, s_live = pcp_zigzag_token_layout(
+        counts, pcp_size, block_size=block_size
+    )
     s_pad = 128
     table = pcp_zigzag_page_table(
         chunk, pcp_size, block_size, n_off, off=off, s_pad=s_pad
@@ -310,4 +411,3 @@ def test_pcp_zigzag_page_table_multi_request():
     req0_pages = set(table[0, :4].tolist())
     req1_pages = set(table[2, :4].tolist())
     assert req0_pages.isdisjoint(req1_pages)
-
