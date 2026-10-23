@@ -198,7 +198,7 @@ def _sharded_runai_weights_iterator(
         def _flush(path: str) -> None:
             nonlocal run_start, run_sizes, run_tensors
             if run_sizes:
-                requests.append(FileChunks(len(requests), path, run_start, run_sizes))
+                requests.append(getattr(FileChunks, "contiguous", FileChunks)(len(requests), path, run_start, run_sizes))
                 tensors_by_request.append(run_tensors)
             run_start, run_sizes, run_tensors = None, [], []
 
