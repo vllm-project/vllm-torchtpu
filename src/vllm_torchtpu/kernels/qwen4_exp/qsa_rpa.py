@@ -24,6 +24,34 @@ from vllm_torchtpu.kernels.qwen4_exp.qsa import (
 from vllm_torchtpu.kernels.qwen4_exp.request_types import (
     short_request_prefix_tokens,
 )
+from vllm_torchtpu.logger import init_logger
+
+logger = init_logger(__name__)
+
+# The largest RPA call treated as a decode program under TPU_RPA_DECODE_BATCHED.
+DECODE_PROGRAM_MAX_ROWS = 64
+
+
+def decode_vmem_limit_bytes(num_q_rows):
+    """Scoped VMEM for a batched RPA decode call, or None for the default.
+
+    With TPU_RPA_DECODE_BATCHED, calls of at most ``DECODE_PROGRAM_MAX_ROWS``
+    query rows take half the chip's VMEM; the decode block sizes here need far
+    less, and the remainder lets the compiler prefetch the following layers'
+    weights across the kernel. Larger calls keep the whole VMEM.
+    """
+    if not envs.TPU_RPA_DECODE_BATCHED or num_q_rows > DECODE_PROGRAM_MAX_ROWS:
+        return None
+    from jax.experimental.pallas import tpu as pltpu
+
+    limit = pltpu.get_tpu_info().vmem_capacity_bytes // 2
+    logger.info_once(
+        "[Attention] TPU_RPA_DECODE_BATCHED: QSA batched RPA decode calls of "
+        "<= %d rows run with %d MiB of VMEM.",
+        DECODE_PROGRAM_MAX_ROWS,
+        limit >> 20,
+    )
+    return limit
 
 
 def pack_rows(key, value, *, fp8, k_scale=1.0, v_scale=1.0):
@@ -147,6 +175,7 @@ def _rpa_attention_batch(
         fast_kv_fetch=fast_fetch,
         kv_slot=kv_slot,
         compact_kv_schedule=compact,
+        vmem_limit_bytes=decode_vmem_limit_bytes(len(q)),
     )
     out = out[jnp.minimum(cu_q_lens[:-1], len(q) - 1), :, : q.shape[-1]]
     if kv_head_offset:
