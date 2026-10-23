@@ -289,10 +289,14 @@ def _staged_walk_products(
                 in_row = (ckpt_offsets < t) & active.unsqueeze(1)
                 safe = torch.where(in_row, ckpt_offsets, torch.zeros_like(ckpt_offsets))
                 ck = staged_dev[bases.unsqueeze(2) + safe.unsqueeze(0)] * in_row
+            # Clone each slice: a sliced graph output is a view into the
+            # class's [G, ...] buffer, and the model programs compiled for a
+            # standalone [n] input reject the larger backing buffer
+            # (RuntimeProgramInputMismatch).
             for k, j in enumerate(members):
-                states[j] = gathered[k]
+                states[j] = gathered[k].clone()
                 if ckpt_window > 1:
-                    ckpts[j] = ck[k]
+                    ckpts[j] = ck[k].clone()
         # Prefill checkpoints stay per group, in group order: only groups
         # that declare prefill checkpoint blocks have one.
         if prefill_ckpt_offsets is not None:
