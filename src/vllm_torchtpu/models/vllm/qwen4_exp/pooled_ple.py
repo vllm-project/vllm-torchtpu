@@ -8,7 +8,7 @@ import torch
 from vllm.distributed import GroupCoordinator
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.models.utils import AutoWeightsLoader
-from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
+from transformers import Qwen4ExpTextConfig
 
 from vllm_torchtpu.layers.adapter.custom_ops.ple_op import (
     build_pooled_short_conv_op,
