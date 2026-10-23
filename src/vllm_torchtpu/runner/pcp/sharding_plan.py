@@ -99,8 +99,7 @@ class PcpShardingPlan(ABC):
 
     @property
     @abstractmethod
-    def max_local_num_tokens(self) -> int:
-        ...
+    def max_local_num_tokens(self) -> int: ...
 
     def set_page_size(self, page_size: int) -> None:
         self.page_size = int(page_size)
@@ -137,8 +136,7 @@ class PcpShardingPlan(ABC):
         target_num_reqs: int,
         target_num_blocks: int,
         split_block_tables: torch.Tensor | None = None,
-    ) -> PcpMetadata | None:
-        ...
+    ) -> PcpMetadata | None: ...
 
     def num_reqs_in_chunk(self, is_prefilling: Any, capacity: int) -> int:
         """Requests that fit `capacity` local requests, given whether each is

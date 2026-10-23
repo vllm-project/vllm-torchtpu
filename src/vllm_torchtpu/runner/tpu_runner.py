@@ -3260,9 +3260,9 @@ class TPUModelRunner(GPUModelRunner):
                 padded_total_num_scheduled_tokens,
                 dtype=request_major_input_ids_cpu.dtype,
             )
-            request_major_input_ids_cpu_padded.narrow(
-                0, 0, global_num_tokens
-            ).copy_(request_major_input_ids_cpu)
+            request_major_input_ids_cpu_padded.narrow(0, 0, global_num_tokens).copy_(
+                request_major_input_ids_cpu
+            )
             request_major_input_ids = request_major_input_ids_cpu_padded.to(
                 self.device, non_blocking=True
             )
@@ -4278,6 +4278,9 @@ class TPUModelRunner(GPUModelRunner):
             if is_draft_model:
                 assert isinstance(hidden_states, torch.Tensor)
                 # Capture this chunk's draft inputs while they are valid.
+                assert draft_sequence_layout_plan is not None, (
+                    "the PCP manager does not support speculative decoding"
+                )
                 draft_chunk = DraftChunkInputs(
                     input_ids=(
                         request_major_input_ids

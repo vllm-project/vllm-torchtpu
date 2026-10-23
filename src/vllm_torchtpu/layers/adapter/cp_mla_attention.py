@@ -57,21 +57,13 @@ def _get_tp_group() -> Any | None:
 
 
 def dcp_spans_pcp() -> bool:
-    """True when the DCP group covers TP x PCP rather than borrowing from TP."""
-    dcp_group = get_dcp_group()
-    pcp_group = get_pcp_group()
-    if dcp_group is None or pcp_group is None or int(pcp_group.world_size) == 1:
-        return False
-    dcp_size = int(dcp_group.world_size)
-    pcp_size = int(pcp_group.world_size)
-    tp_group = _get_tp_group()
-    tp_size = 1 if tp_group is None else int(tp_group.world_size)
-    if dcp_size != tp_size * pcp_size:
-        raise NotImplementedError(
-            f"DCP spanning PCP needs dcp_size == tp_size * pcp_size, got "
-            f"dcp_size={dcp_size}, tp_size={tp_size}, pcp_size={pcp_size}."
-        )
-    return True
+    """True when the DCP group covers TP x PCP rather than borrowing from TP.
+
+    That is the PCP manager's layout (`validate_pcp_manager_config` enforces
+    it). Decided from the flag rather than the groups: looking a group up can
+    fail an assert, which `torch.compile` cannot trace.
+    """
+    return bool(envs.USE_TPU_PCP_MANAGER)
 
 
 def _head_group() -> Any | None:

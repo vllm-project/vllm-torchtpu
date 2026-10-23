@@ -23,6 +23,7 @@ import functools
 from dataclasses import dataclass
 
 import jax
+import torch
 
 
 @functools.partial(
@@ -55,22 +56,22 @@ class PcpMetadata:
     # --- HeadTailPcpShardingPlan, KV-gather (sparse MLA) ---
     # The split prefills, request-major: block tables, seq_lens,
     # query_start_loc, and each split token's PCP-gathered row.
-    split_block_tables: jax.Array | None = None
-    split_seq_lens: jax.Array | None = None
-    split_query_start_loc: jax.Array | None = None
-    hidden_restore_idx: jax.Array | None = None
+    split_block_tables: jax.Array | torch.Tensor | None = None
+    split_seq_lens: jax.Array | torch.Tensor | None = None
+    split_query_start_loc: jax.Array | torch.Tensor | None = None
+    hidden_restore_idx: jax.Array | torch.Tensor | None = None
     # The replicated decodes as their own request window: local rows, block
     # tables, seq_lens, query_start_loc, request_distribution.
-    rep_row_idx: jax.Array | None = None
-    rep_block_tables: jax.Array | None = None
-    rep_seq_lens: jax.Array | None = None
-    rep_query_start_loc: jax.Array | None = None
-    rep_request_distribution: jax.Array | None = None
+    rep_row_idx: jax.Array | torch.Tensor | None = None
+    rep_block_tables: jax.Array | torch.Tensor | None = None
+    rep_seq_lens: jax.Array | torch.Tensor | None = None
+    rep_query_start_loc: jax.Array | torch.Tensor | None = None
+    rep_request_distribution: jax.Array | torch.Tensor | None = None
     # KV workspace: request and virtual page of each workspace page, first
     # workspace page of each local split segment, split request count (1,),
     # pages in use (1,).
-    ws_req: jax.Array | None = None
-    ws_vpage: jax.Array | None = None
-    ws_page_offset: jax.Array | None = None
-    num_split_reqs: jax.Array | None = None
-    ws_used_pages: jax.Array | None = None
+    ws_req: jax.Array | torch.Tensor | None = None
+    ws_vpage: jax.Array | torch.Tensor | None = None
+    ws_page_offset: jax.Array | torch.Tensor | None = None
+    num_split_reqs: jax.Array | torch.Tensor | None = None
+    ws_used_pages: jax.Array | torch.Tensor | None = None
