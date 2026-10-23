@@ -142,7 +142,7 @@ def test_qwen38_flat_segment_step_matches_make_step():
     for name in kernel.build(spec, ex)[1]["plan"].w_names:
         v = w_mk[name]
         flat.extend(v if isinstance(v, tuple) else (v,))
-    assert len(flat) == n_w and len(in_specs) == 3 + n_w + 2
+    assert len(flat) == n_w and len(in_specs) == 3 + n_w + 2 and fn.extra_names == ("qsa_attn",)
     res = jax.jit(fn)(pos_mk, hid_mk, attn_mk, *flat, st_mk["conv"], st_mk["rec"])
     assert len(res) == len(out_specs) == 3
     np.testing.assert_array_equal(np.asarray(res[0]), np.asarray(outs[RESIDUAL_OUT]))

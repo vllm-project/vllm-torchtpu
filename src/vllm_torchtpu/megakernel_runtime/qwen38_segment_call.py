@@ -99,11 +99,16 @@ def build_segment_call(
     interpret: bool = False,
     tiles: Tiles | None = None,
     head: bool = False,
+    pool_gdn: bool = True,
 ) -> tuple[Any, tuple, tuple, tuple]:
     """`(fn, in_specs, out_specs, donate_argnums)` of segment kind `L` at `B` rows.
 
-    `head=True`: an all-GDN head segment; `fn(hidden, *weights, pool, *meta)`
-    (no attention input). `interpret` / `tiles` are for CPU tests.
+    `fn(hidden[, attn], *weights[, pool, *meta])`: no `attn` for a head segment
+    (`head=True`); `pool` / `meta` when the segment has GDN layers. With
+    `pool_gdn` the kernel reads the GDN states from the pool itself; otherwise
+    they are gathered into per-layer arrays first. The per-token checkpoints
+    are scattered into the (donated) pool after the kernel either way.
+    `interpret` / `tiles` are for CPU tests.
     """
     R = mesh.size
     ex = ExecSpec(
@@ -114,30 +119,23 @@ def build_segment_call(
         tiles=segment_tiles(B) if tiles is None else tiles,
         interpret=interpret,
     )
-    fn, _, _, n_w = make_flat_segment_step(
-        mesh, qwen38.segment_spec(g, R, L=L, head=head), ex
-    )
+    has_gdn = head or L > 1
+    pool_gdn = pool_gdn and has_gdn
+    spec = qwen38.segment_spec(g, R, L=L, head=head, pool_gdn=pool_gdn)
+    fn, _, _, n_w = make_flat_segment_step(mesh, spec, ex)
     M, NS = ex.M, B // T_VERIFY
     tp, rep = P("tp"), P()
     pad = jax.shard_map(
-        lambda h, a: (
-            jnp.pad(h, ((0, M - B), (0, 0))),
-            jnp.pad(a, ((0, M - B), (0, 0))),
-        ),
+        lambda h: jnp.pad(h, ((0, M - B), (0, 0))),
         mesh=mesh,
-        in_specs=(tp, tp),
-        out_specs=(tp, tp),
+        in_specs=tp,
+        out_specs=tp,
         check_vma=False,
     )
     unpad = jax.shard_map(lambda r: r[:B], mesh=mesh, in_specs=tp, out_specs=tp, check_vma=False)
     pos = jnp.zeros((B,), jnp.int32)
-    if L == 1 and not head:
-
-        def tail(hidden, attn, *w):
-            x, at = pad(hidden, attn)
-            return (unpad(fn(pos, x, at, *w)[0]),)
-
-        return tail, (tp, tp) + (tp,) * n_w, (tp,), ()
+    n_lead = 1 if head else 2
+    n_meta = GDN_META * (L if head else L - 1) if has_gdn else 0
 
     gather = jax.shard_map(
         lambda pool, rb, hi: gather_gdn_states(
@@ -158,21 +156,29 @@ def build_segment_call(
         check_vma=False,
     )
 
-    def segment(hidden, attn, *rest):
-        w, pool, meta = rest[:n_w], rest[n_w], rest[n_w + 1 :]
-        x, at = pad(hidden, attn)
-        rb, wb, hi = gdn_blocks(meta, NS, write)
-        conv, rec = gather(pool, rb, hi)
-        res, conv_ck, rec_ck = fn(pos, x, at, *w, conv, rec)
+    def call(*args):
+        hidden = args[0]
+        attn = None if head else args[1]
+        w = args[n_lead : n_lead + n_w]
+        x = pad(hidden)
+        named = {} if head else {"qsa_attn": pad(attn)}
+        states: tuple = ()
+        if has_gdn:
+            pool, meta = args[n_lead + n_w], args[n_lead + n_w + 1 :]
+            rb, wb, hi = gdn_blocks(meta, NS, write)
+            if pool_gdn:
+                named.update(gdn_pool=pool, gdn_rb=rb, gdn_hi=hi.astype(jnp.int32))
+            else:
+                states = gather(pool, rb, hi)
+        xs = tuple(named[k] for k in fn.extra_names)
+        outs = fn(pos, x, *xs, *w, *states)
+        if not has_gdn:
+            return (unpad(outs[0]),)
+        res, conv_ck, rec_ck = outs
         return unpad(res), scatter(pool, conv_ck, rec_ck, wb)
 
-    n_meta = GDN_META * (L if head else L - 1)
-    if head:
-
-        def head_segment(hidden, *rest):
-            return segment(hidden, hidden, *rest)
-
-        in_specs = (tp,) + (tp,) * n_w + (tp,) + (rep,) * n_meta
-        return head_segment, in_specs, (tp, tp), (1 + n_w,)
-    in_specs = (tp, tp) + (tp,) * n_w + (tp,) + (rep,) * n_meta
-    return segment, in_specs, (tp, tp), (2 + n_w,)
+    in_specs = (tp,) * n_lead + (tp,) * n_w
+    if has_gdn:
+        in_specs += (tp,) + (rep,) * n_meta
+        return call, in_specs, (tp, tp), (n_lead + n_w,)
+    return call, in_specs, (tp,), ()

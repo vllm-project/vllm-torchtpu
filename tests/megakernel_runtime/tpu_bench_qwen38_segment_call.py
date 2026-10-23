@@ -103,18 +103,39 @@ def run(B: int, L: int, chains: list[int]) -> dict:
         ]
     meta = [jax.device_put(m, rep) for m in meta]
 
-    full, _, _, _ = build_segment_call(mesh, g, L, B, layout)
     nf = len(flat)
+    out: dict = {"rows": B, "L": L}
     if NL:
-        # The pool is part of the carry, so the scatter is live work.
-        t_full = _slope(
-            lambda c, at, *a: tuple(full(c[0], at, *a[:nf], c[1], *a[nf:])),
-            (hidden, pool),
-            (attn_b, *flat, *meta),
-            chains,
+        # Seed every read block with valid random f32 states through the scatter.
+        seed = jax.shard_map(
+            lambda p_, c, r, wb: gs.scatter_gdn_ckpts(p_, c, r, wb, layout=layout),
+            mesh=mesh,
+            in_specs=(P("tp"), P("tp"), P("tp"), P()),
+            out_specs=P("tp"),
+            check_vma=False,
         )
+        k1, k2 = jax.random.split(jax.random.PRNGKey(7))
+        conv_r = jax.random.normal(k1, (R * NL, NS, 8, 1280), jnp.float32) * 0.05
+        rec_r = (jax.random.normal(k2, (R * NL, NS * T_VERIFY * 6, 128, 128), jnp.float32) * 0.05).astype(jnp.bfloat16)
+        wb_seed = jnp.broadcast_to(jnp.asarray(ck[:NL, :, :1]), (NL, NS, T_VERIFY))
+        pool = jax.jit(seed)(pool, jax.device_put(conv_r, tp), jax.device_put(rec_r, tp), jax.device_put(wb_seed, rep))
+        results = {}
+        for pg in (False, True):
+            full, _, _, _ = build_segment_call(mesh, g, L, B, layout, pool_gdn=pg)
+            res_, pool_ = jax.jit(full)(hidden, attn_b, *flat, pool, *meta)
+            results[pg] = (np.asarray(res_, np.float32), np.asarray(jax.lax.bitcast_convert_type(pool_, jnp.uint8)))
+            # The pool is part of the carry, so the scatter is live work.
+            out["composed_us" + ("_poolgdn" if pg else "_gather")] = _slope(
+                lambda c, at, *a, full=full: tuple(full(c[0], at, *a[:nf], c[1], *a[nf:])),
+                (hidden, pool),
+                (attn_b, *flat, *meta),
+                chains,
+            )
+        out["poolgdn_res_maxdiff"] = float(np.abs(results[True][0] - results[False][0]).max())
+        out["poolgdn_pool_bytes_differ"] = int((results[True][1] != results[False][1]).sum())
     else:
-        t_full = _slope(lambda h, at, *a: full(h, at, *a)[0], hidden, (attn_b, *flat), chains)
+        full, _, _, _ = build_segment_call(mesh, g, L, B, layout)
+        out["composed_us"] = _slope(lambda h, at, *a: full(h, at, *a)[0], hidden, (attn_b, *flat), chains)
 
     fn, _, _, _ = make_flat_segment_step(mesh, spec, ex)
     pos = jnp.zeros((B,), jnp.int32)
@@ -124,8 +145,8 @@ def run(B: int, L: int, chains: list[int]) -> dict:
     t_kernel = _slope(
         lambda h, p_, at, *a: fn(p_, h, at, *a)[0], hid_m, (pos, att_m, *flat, *st), chains
     )
-    return {"rows": B, "L": L, "composed_us": t_full, "kernel_us": t_kernel,
-            "overhead_us": round(t_full - t_kernel, 1)}
+    out["kernel_us"] = t_kernel
+    return out
 
 
 def main() -> None:

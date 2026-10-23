@@ -182,13 +182,23 @@ class Qwen38MoE(MoEBlock):
 
 
 def segment_spec(
-    g: Qwen38Geometry, R: int, *, L: int = SEGMENT_LAYERS, head: bool = False
+    g: Qwen38Geometry,
+    R: int,
+    *,
+    L: int = SEGMENT_LAYERS,
+    head: bool = False,
+    pool_gdn: bool = False,
 ) -> ModelSpec:
     """`ModelSpec` of one segment kernel (`L` kernel layers, QSA o_proj first).
 
     `head=True`: `L` linear-attention layers and no QSA output projection (the
-    layers before the first QSA layer).
+    layers before the first QSA layer). `pool_gdn=True`: the GDN layers read
+    their states from the model's unified pool (`qwen38_gdn_pool`).
     """
+    if pool_gdn:
+        from .qwen38_gdn_pool import Qwen38PoolGDN as gdn_cls
+    else:
+        gdn_cls = Qwen38GDN
     gi = g.inner(R, L, head)
     hc = dict(inner_geometry=gi, nhc=g.NHC, lowrank=g.LOWRANK)
     qsa = HCSublayer(QSAOutBlock(), mix=False, ar_slot=0, **hc)
@@ -196,11 +206,11 @@ def segment_spec(
         Qwen38MoE(geometry=gi, moe_tp=False), ar_slot=1, emit_residual=True, **hc
     )
     if head:
-        mixer: Any = HCSublayer(Qwen38GDN(geometry=gi), ar_slot=0, **hc)
+        mixer: Any = HCSublayer(gdn_cls(geometry=gi), ar_slot=0, **hc)
     elif L == 1:
         mixer: Any = qsa
     else:
-        gdn = HCSublayer(Qwen38GDN(geometry=gi), ar_slot=0, **hc)
+        gdn = HCSublayer(gdn_cls(geometry=gi), ar_slot=0, **hc)
         mixer = SwitchSlot("mixer", branches=(qsa, gdn), branch_counts=(1, L - 1))
     return ModelSpec(
         name=QWEN38_SEGMENT,

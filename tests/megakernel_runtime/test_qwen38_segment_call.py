@@ -84,8 +84,8 @@ def _blocks(NL):
     return ck, off
 
 
-@pytest.mark.parametrize("L,head", [(4, False), (2, True)])
-def test_segment_call_matches_reference_and_writes_checkpoints(L, head):
+@pytest.mark.parametrize("L,head,pool_gdn", [(4, False, False), (4, False, True), (2, True, True)])
+def test_segment_call_matches_reference_and_writes_checkpoints(L, head, pool_gdn):
     NL = L if head else L - 1
     rng = np.random.default_rng(0)
     ck, off = _blocks(NL)
@@ -120,6 +120,7 @@ def test_segment_call_matches_reference_and_writes_checkpoints(L, head):
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
     tp, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
     w_mk, _, _ = pack_segment(spec, G, ex, inp, head=head)
+    spec = qwen38.segment_spec(G, R, L=L, head=head, pool_gdn=pool_gdn)
     flat = []
     for name in kernel.build(spec, ex)[1]["plan"].w_names:
         v = w_mk[name]
@@ -143,7 +144,7 @@ def test_segment_call_matches_reference_and_writes_checkpoints(L, head):
 
     layout = gs.Qwen38GdnPoolLayout(pool_shape=POOL_SHAPE, pool_dtype="float8_e4m3fn")
     fn, in_specs, out_specs, donate = build_segment_call(
-        mesh, G, L, B, layout, interpret=True, tiles=TILES, head=head
+        mesh, G, L, B, layout, interpret=True, tiles=TILES, head=head, pool_gdn=pool_gdn
     )
     lead = (hidden,) if head else (hidden, attn)
     assert len(in_specs) == len(lead) + len(flat) + 1 + len(meta)
