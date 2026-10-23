@@ -672,6 +672,49 @@ class TestAttentionMetadataBuilderPlumbing:
         stage_block_table_uploads(runner, ctx(num_reqs=1), 4)  # new window
         assert source.call_count == calls + 2
 
+    def test_reused_upload_reuses_tables_and_rederives_mamba_indices(self):
+        """A reused upload keeps the previous walk's table outputs but must
+        re-derive the mamba indices from the new seq_lens."""
+        window = 3
+        runner = self._make_runner_mock(num_groups=3, max_num_blocks_per_req=6)
+        runner._unified_kv_layout = True
+        runner._block_table_stage_cpu = None
+        attn = self._make_builder(runner, kv_cache_group_id=0)
+        mambas = [
+            self._make_mamba_builder(runner, kv_cache_group_id=gid) for gid in (1, 2)
+        ]
+        self._make_attn_groups(runner, [attn] + mambas)
+
+        def walk(seq_lens, staged):
+            ctx = AttentionMetadataBuilderContext(
+                num_reqs=4,
+                start_index=0,
+                use_max_model_len=True,
+                seq_lens=torch.tensor(seq_lens, dtype=torch.int32),
+                query_start_loc=torch.arange(5, dtype=torch.int32),
+                request_distribution=torch.tensor([4, 4, 4], dtype=torch.int32),
+                mamba_ckpt_window=window,
+                unified_mamba_state_indices=[],
+            )
+            runner._attn_metadata_builder_ctx = ctx
+            if staged:
+                stage_block_table_uploads(runner, ctx, 4)
+            metas = [
+                b.build(common_prefix_len=0, common_attn_metadata=self._make_cm(4))
+                for b in [attn] + mambas
+            ]
+            return ctx, metas
+
+        ctx1, _ = walk([0, 17, 33, 33], staged=True)
+        ctx2, metas2 = walk([0, 18, 49, 33], staged=True)  # 49 crosses a block
+        assert ctx2.staged_block_tables is ctx1.staged_block_tables
+        _, plain = walk([0, 18, 49, 33], staged=False)
+        for a, b in zip(metas2, plain):
+            assert torch.equal(a.block_tables, b.block_tables)
+            if b.mamba_state_indices is not None:
+                assert torch.equal(a.mamba_state_indices, b.mamba_state_indices)
+                assert torch.equal(a.mamba_ckpt_indices, b.mamba_ckpt_indices)
+
     def test_block_table_mutations_bump_the_version(self):
         import numpy as np
         from types import SimpleNamespace

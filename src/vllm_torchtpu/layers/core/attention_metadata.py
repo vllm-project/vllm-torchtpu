@@ -193,12 +193,16 @@ def _staged_walk_products(
     table_geom: tuple,
     mamba_geom: tuple,
     ckpt_window: int,
+    include_tables: bool = True,
 ) -> tuple:
     """Splits the staged flat block-table buffer into per-group tables and
-    derives unified-pool mamba state and checkpoint indices."""
+    derives unified-pool mamba state and checkpoint indices. Without
+    `include_tables` only the mamba indices are returned (the caller still
+    holds the tables of an identical earlier upload)."""
     outs = []
-    for off, n, t in table_geom:
-        outs.append(staged_dev[off : off + n * t].clone())
+    if include_tables:
+        for off, n, t in table_geom:
+            outs.append(staged_dev[off : off + n * t].clone())
     states: list = [None] * len(mamba_geom)
     ckpts: list = [None] * len(mamba_geom)
     if mamba_geom:
@@ -250,6 +254,7 @@ def _staged_walk_products_compiled(
     table_geom: tuple,
     mamba_geom: tuple,
     ckpt_window: int,
+    include_tables: bool = True,
 ) -> tuple:
     """One device program for everything the metadata walk consumes:
     per-group block-table splits (graph outputs are distinct buffers, so no
@@ -262,7 +267,7 @@ def _staged_walk_products_compiled(
     program sequence.
     """
     return _staged_walk_products(
-        staged_dev, seq_lens, table_geom, mamba_geom, ckpt_window
+        staged_dev, seq_lens, table_geom, mamba_geom, ckpt_window, include_tables
     )
 
 
@@ -674,7 +679,7 @@ def stage_block_table_uploads(
         tuple(table_geom),
     )
     prev = runner.__dict__.get("_block_table_stage_prev")
-    staged_dev = None
+    reused_key = None
     if (
         envs.VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE
         and ctx.position_ids_override is None
@@ -682,12 +687,20 @@ def stage_block_table_uploads(
         and prev[3] == stage_key
     ):
         staged_dev = prev[2]
+        reused_key = stage_key
     else:
         staged_dev = _pack_and_upload(
             runner, ctx, entries, num_reqs_padded, table_geom, stage_key
         )
     _issue_walk_products(
-        runner, ctx, entries, entry_builders, num_reqs_padded, table_geom, staged_dev
+        runner,
+        ctx,
+        entries,
+        entry_builders,
+        num_reqs_padded,
+        table_geom,
+        staged_dev,
+        reused_key,
     )
 
 
@@ -740,7 +753,14 @@ def _pack_and_upload(runner, ctx, entries, num_reqs_padded, table_geom, stage_ke
 
 
 def _issue_walk_products(
-    runner, ctx, entries, entry_builders, num_reqs_padded, table_geom, staged_dev
+    runner,
+    ctx,
+    entries,
+    entry_builders,
+    num_reqs_padded,
+    table_geom,
+    staged_dev,
+    reused_key=None,
 ):
     # One compiled program splits the staged tensor into per-group tables
     # and derives every unified-pool mamba group's state/checkpoint indices
@@ -766,28 +786,45 @@ def _issue_walk_products(
         ctx.staged_block_tables = {gid: staged_dev[:length]}
         return
 
-    if staged_dev.device.type == "tpu":
-        products = _staged_walk_products_compiled(
-            staged_dev,
-            ctx.seq_lens,
-            tuple(table_geom),
-            tuple(mamba_geom),
-            ctx.mamba_ckpt_window,
-        )
+    walk = (
+        _staged_walk_products_compiled
+        if staged_dev.device.type == "tpu"
+        else _staged_walk_products
+    )
+    args = (
+        staged_dev,
+        ctx.seq_lens,
+        tuple(table_geom),
+        tuple(mamba_geom),
+        ctx.mamba_ckpt_window,
+    )
+    # The upload was reused outright, so the previous walk's table outputs
+    # (read-only device tensors) are still exact: derive only the mamba
+    # indices, which follow seq_lens, instead of re-emitting every table.
+    cached = runner.__dict__.get("_block_table_stage_tables")
+    if (
+        reused_key is not None
+        and mamba_geom
+        and cached is not None
+        and cached[0] == reused_key
+    ):
+        ctx.staged_block_tables = cached[1]
+        products = walk(*args, False)
+        n_tables = 0
     else:
-        products = _staged_walk_products(
-            staged_dev,
-            ctx.seq_lens,
-            tuple(table_geom),
-            tuple(mamba_geom),
-            ctx.mamba_ckpt_window,
-        )
-
-    n_tables = len(entries)
+        products = walk(*args)
+        n_tables = len(entries)
+        ctx.staged_block_tables = {
+            gid: products[i] for i, (gid, _, _) in enumerate(entries)
+        }
+        if envs.VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE:
+            prev = runner.__dict__.get("_block_table_stage_prev")
+            if ctx.position_ids_override is None and prev is not None:
+                runner._block_table_stage_tables = (prev[3], ctx.staged_block_tables)
+            elif mamba_geom:
+                # Dummy runs warm the tables-free variant serving reuses.
+                walk(*args, False)
     n_mamba = len(mamba_geom)
-    ctx.staged_block_tables = {
-        gid: products[i] for i, (gid, _, _) in enumerate(entries)
-    }
     if n_mamba:
         states = products[n_tables : n_tables + n_mamba]
         has_ckpt = ctx.mamba_ckpt_window > 1
