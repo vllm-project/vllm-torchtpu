@@ -582,6 +582,44 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         )
 
 
+# Bumped by every BlockTable mutation that can change a row's contents, so
+# `stage_block_table_uploads` can tell an unchanged table set without
+# re-packing it (see `_install_block_table_version`).
+_BLOCK_TABLE_VERSION = [0]
+
+
+def _install_block_table_version() -> None:
+    from vllm.v1.worker.block_table import BlockTable
+
+    if getattr(BlockTable, "_tpu_version_patch", False):
+        return
+
+    def bump_if_blocks(orig):
+        @functools.wraps(orig)
+        def append_row(self, block_ids, row_idx):
+            if len(block_ids):
+                _BLOCK_TABLE_VERSION[0] += 1
+            return orig(self, block_ids, row_idx)
+
+        return append_row
+
+    def bump(orig):
+        @functools.wraps(orig)
+        def wrapper(self, *args, **kwargs):
+            _BLOCK_TABLE_VERSION[0] += 1
+            return orig(self, *args, **kwargs)
+
+        return wrapper
+
+    BlockTable.append_row = bump_if_blocks(BlockTable.append_row)
+    for name in ("add_row", "clear_row", "move_row", "swap_row", "clear"):
+        setattr(BlockTable, name, bump(getattr(BlockTable, name)))
+    BlockTable._tpu_version_patch = True
+
+
+_install_block_table_version()
+
+
 def stage_block_table_uploads(
     runner: Any,
     ctx: AttentionMetadataBuilderContext,
@@ -619,6 +657,41 @@ def stage_block_table_uploads(
     if not entries:
         return
 
+    # In steady decode most steps change no table at all. When no BlockTable
+    # was mutated since the last staged walk and the walk's geometry is the
+    # same, the previous upload is still exact: skip re-packing (a zero fill
+    # plus one sliced copy per group, 59 groups for Qwen4Exp) and the H2D.
+    table_geom: list[tuple[int, int, int]] = []
+    offset = 0
+    for _, _, target_num_blocks in entries:
+        table_geom.append((offset, num_reqs_padded, target_num_blocks))
+        offset += num_reqs_padded * target_num_blocks
+    stage_key = (
+        _BLOCK_TABLE_VERSION[0],
+        tuple(id(bt) for _, bt, _ in entries),
+        ctx.start_index,
+        ctx.num_reqs,
+        tuple(table_geom),
+    )
+    prev = runner.__dict__.get("_block_table_stage_prev")
+    staged_dev = None
+    if (
+        envs.VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE
+        and ctx.position_ids_override is None
+        and prev is not None
+        and prev[3] == stage_key
+    ):
+        staged_dev = prev[2]
+    else:
+        staged_dev = _pack_and_upload(
+            runner, ctx, entries, num_reqs_padded, table_geom, stage_key
+        )
+    _issue_walk_products(
+        runner, ctx, entries, entry_builders, num_reqs_padded, table_geom, staged_dev
+    )
+
+
+def _pack_and_upload(runner, ctx, entries, num_reqs_padded, table_geom, stage_key):
     total = sum(num_reqs_padded * tnb for _, _, tnb in entries)
     # Per-walk buffer: TorchTPU reads the CPU source until the async H2D
     # drains, so a later chunk or draft walk must not refill a shared scratch
@@ -637,15 +710,6 @@ def stage_block_table_uploads(
             ]
             offset += num_reqs_padded * target_num_blocks
     # Dummy runs keep the zeroed buffer: same staged layout, null blocks.
-
-    # One compiled program splits the staged tensor into per-group tables
-    # and derives every unified-pool mamba group's state/checkpoint indices
-    # (replaces one micro-program per group per step).
-    table_geom: list[tuple[int, int, int]] = []
-    offset = 0
-    for _, _, target_num_blocks in entries:
-        table_geom.append((offset, num_reqs_padded, target_num_blocks))
-        offset += num_reqs_padded * target_num_blocks
 
     # In steady decode the tables change only when a request crosses a block,
     # so most steps would re-upload the same few MB (59 groups x requests x
@@ -668,9 +732,19 @@ def stage_block_table_uploads(
             runner._free_h2d_sources[key] = free
     else:
         staged_dev = stage_h2d_upload(runner, flat)
-        if envs.VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE:
-            runner._block_table_stage_prev = (table_geom, flat.clone(), staged_dev)
+    if envs.VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE:
+        # Dummy runs (zero-filled) never key a reuse.
+        key = stage_key if ctx.position_ids_override is None else None
+        runner._block_table_stage_prev = (table_geom, flat.clone(), staged_dev, key)
+    return staged_dev
 
+
+def _issue_walk_products(
+    runner, ctx, entries, entry_builders, num_reqs_padded, table_geom, staged_dev
+):
+    # One compiled program splits the staged tensor into per-group tables
+    # and derives every unified-pool mamba group's state/checkpoint indices
+    # (replaces one micro-program per group per step).
     # Mirror of build()'s branch order: the compact path
     # (ctx.mamba_state_indices) wins, otherwise the unified layout derives
     # per-group indices — which is what this precompute batches.
