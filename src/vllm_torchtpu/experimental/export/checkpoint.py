@@ -40,11 +40,11 @@ import portpicker
 
 # vLLM picks its platform when imported, so CPU workers start with this env.
 CPU_ENV = {"VLLM_TARGET_DEVICE": "cpu", "JAX_PLATFORMS": "cpu", "PJRT_DEVICE": "CPU"}
-# Port of the JAX distributed coordinator the launcher reserves for its workers.
-JAX_PORT_ENV = "EXPORT_CHECKPOINT_JAX_PORT"
-# Where `all`-mode export workers, each exporting to its own directory, save the
-# checkpoint: the final artifact's `CHECKPOINT_DATA_DIR`.
-DATA_DIR_ENV = "EXPORT_CHECKPOINT_DATA_DIR"
+# Worker-only flags the launchers add: the `host:port` of the JAX distributed
+# coordinator, and where `all`-mode export workers, each exporting to its own
+# directory, save the checkpoint (the final artifact's `CHECKPOINT_DATA_DIR`).
+JAX_COORDINATOR_FLAG = "--jax-coordinator"
+DATA_DIR_FLAG = "--checkpoint-data-dir"
 _AXIS_NAMES = ("data", "model")
 # Checkpoint arrays `array_{i}` live here, relative to the artifact directory.
 CHECKPOINT_DATA_DIR = os.path.join("serving_checkpoint", "data")
@@ -104,7 +104,7 @@ def host_tensors(model: Any) -> dict[str, Any]:
 
 def to_numpy(tensor: Any) -> Any:
     """A CPU numpy view of `tensor`, with `ml_dtypes` types for bf16 and FP8."""
-    import ml_dtypes
+    import ml_dtypes  # pyrefly: ignore[missing-import]
     import torch
 
     views = {
@@ -196,7 +196,7 @@ def _save_checkpoint(
 ) -> None:
     import jax
     import numpy as np
-    import orbax.checkpoint as ocp
+    import orbax.checkpoint as ocp  # pyrefly: ignore[missing-import]
     from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
     devices = sorted(jax.devices("cpu"), key=lambda d: (d.process_index, d.id))
@@ -218,18 +218,20 @@ def _save_checkpoint(
     )
 
 
-def init_jax(rank: int, world_size: int) -> None:
-    """Joins this rank to the launcher's JAX distributed runtime.
+def init_jax(rank: int, world_size: int, coordinator: str | None) -> None:
+    """Joins this rank to the launcher's JAX distributed runtime at `coordinator`.
 
-    Must run before any JAX use in the process.
+    Must run before any JAX use in the process. A single process needs none.
     """
     import jax
 
     if world_size > 1:
+        if not coordinator:
+            raise ValueError(
+                f"{world_size} export workers need {JAX_COORDINATOR_FLAG} host:port"
+            )
         jax.distributed.initialize(
-            f"{os.environ['MASTER_ADDR']}:{os.environ[JAX_PORT_ENV]}",
-            num_processes=world_size,
-            process_id=rank,
+            coordinator, num_processes=world_size, process_id=rank
         )
 
 
@@ -254,7 +256,7 @@ def run_cpu_load_worker(args: argparse.Namespace) -> None:
 
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    init_jax(rank, world_size)
+    init_jax(rank, world_size, getattr(args, "jax_coordinator", None))
 
     vllm_config = universal_adapter.create_export_vllm_config(args)
     # vLLM runs on its CPU platform here, which skips the TPU platform's patches;
@@ -292,12 +294,12 @@ def launch_cpu_workers(
         WORLD_SIZE=str(tp_size),
         MASTER_ADDR="127.0.0.1",
         MASTER_PORT=str(portpicker.pick_unused_port()),
-        **{JAX_PORT_ENV: str(portpicker.pick_unused_port())},
     )
+    coordinator = f"127.0.0.1:{portpicker.pick_unused_port()}"
     procs = [
         subprocess.Popen(
             [sys.executable, "-m", "vllm_torchtpu.experimental.export"]
-            + [*argv, worker_flag],
+            + [*argv, JAX_COORDINATOR_FLAG, coordinator, worker_flag],
             env=dict(env, RANK=str(rank), LOCAL_RANK=str(rank)),
         )
         for rank in range(tp_size)

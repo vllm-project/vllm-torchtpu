@@ -183,6 +183,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     # Internal: marks a worker process started by `main`.
     parser.add_argument("--export-worker", action="store_true", help=argparse.SUPPRESS)
+    # Internal: set by the launchers on the workers they start.
+    parser.add_argument(
+        checkpoint.JAX_COORDINATOR_FLAG, dest="jax_coordinator", help=argparse.SUPPRESS
+    )
+    parser.add_argument(
+        checkpoint.DATA_DIR_FLAG, dest="checkpoint_data_dir", help=argparse.SUPPRESS
+    )
     return parser
 
 
@@ -218,7 +225,9 @@ def run_export_from_args(
     if export_mode == "all":
         # Before any JAX use: the Pallas kernels the model loads with use JAX.
         checkpoint.init_jax(
-            int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
+            int(os.environ.get("RANK", 0)),
+            int(os.environ.get("WORLD_SIZE", 1)),
+            getattr(args, "jax_coordinator", None),
         )
     loaded_on_device = model is None
     if loaded_on_device:
@@ -265,17 +274,18 @@ def run_export_from_args(
                 cache_cfg.gpu_memory_utilization, kv_cache_memory_bytes
             )
 
-    if export_mode == "all":
-        weights = checkpoint.host_tensors(getattr(exportable, "model", exportable))
+    weights = (
+        checkpoint.host_tensors(getattr(exportable, "model", exportable))
+        if export_mode == "all"
+        else None
+    )
     exporter.export(exportable, args.output_dir)
-    if export_mode == "all":
+    if weights is not None:
         checkpoint.save_model_checkpoint(
             weights,
             args.output_dir,
-            os.environ.get(
-                checkpoint.DATA_DIR_ENV,
-                os.path.join(args.output_dir, checkpoint.CHECKPOINT_DATA_DIR),
-            ),
+            getattr(args, "checkpoint_data_dir", None)
+            or os.path.join(args.output_dir, checkpoint.CHECKPOINT_DATA_DIR),
         )
     return exportable.export_config
 
@@ -297,9 +307,6 @@ def _worker_env(tp_size: int) -> dict[str, str]:
         os.environ["WORLD_SIZE"] = str(tp_size)
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
         os.environ.setdefault("MASTER_PORT", str(portpicker.pick_unused_port()))
-        os.environ.setdefault(
-            checkpoint.JAX_PORT_ENV, str(portpicker.pick_unused_port())
-        )
         # Recurrent (GDN) layers keep per-layer `[conv, recurrent]` state rather
         # than byte regions of the attention-shaped unified block pool.
         os.environ.setdefault(UNIFIED_BLOCK_POOL_ENV, "0")
@@ -321,12 +328,16 @@ def _launch_workers(
     the workers also save their weights as the Orbax checkpoint of `output_dir`.
     """
     env = _worker_env(tp_size)
+    coordinator = (
+        f"{env.get('MASTER_ADDR', '127.0.0.1')}:{portpicker.pick_unused_port()}"
+    )
+    worker_flags = [checkpoint.JAX_COORDINATOR_FLAG, coordinator]
     if save_checkpoint:
         data_dir = os.path.join(
             os.path.abspath(output_dir), checkpoint.CHECKPOINT_DATA_DIR
         )
         shutil.rmtree(data_dir, ignore_errors=True)
-        env[checkpoint.DATA_DIR_ENV] = data_dir
+        worker_flags += [checkpoint.DATA_DIR_FLAG, data_dir]
     rank_root = tempfile.mkdtemp(
         prefix=".export_ranks_", dir=os.path.dirname(os.path.abspath(output_dir))
     )
@@ -338,7 +349,13 @@ def _launch_workers(
             procs.append(
                 subprocess.Popen(
                     [sys.executable, "-m", "vllm_torchtpu.experimental.export"]
-                    + [*argv, "--output-dir", rank_dir, "--export-worker"],
+                    + [
+                        *argv,
+                        *worker_flags,
+                        "--output-dir",
+                        rank_dir,
+                        "--export-worker",
+                    ],
                     env=rank_env,
                 )
             )

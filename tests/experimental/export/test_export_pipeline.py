@@ -549,6 +549,8 @@ def test_universal_adapter_1d_and_2d_mrope_export_and_cli(tmp_path) -> None:
             "8,16",
             "--req-buckets",
             "4,8",
+            "--export-mode",
+            "model",
         ]
     )
     with mock.patch.object(
@@ -1120,17 +1122,22 @@ def test_launch_workers_all_mode_saves_into_the_output_dir(tmp_path: Path) -> No
     out_dir = tmp_path / "out"
     stale = out_dir / "serving_checkpoint" / "data"
     stale.mkdir(parents=True)
-    envs: list[Mapping[str, str]] = []
+    cmds: list[Sequence[str]] = []
 
     class Recording(_FakeWorker):
         def __init__(self, cmd: Sequence[str], env: Mapping[str, str]) -> None:
-            envs.append(env)
+            cmds.append(cmd)
             super().__init__(cmd, env)
+
+    def flag(cmd: Sequence[str], name: str) -> str:
+        return cmd[list(cmd).index(name) + 1]
 
     with (
         mock.patch.object(cli, "_worker_env", lambda tp: {}),
         mock.patch.object(cli.subprocess, "Popen", Recording),
     ):
         cli._launch_workers(["--model", "m"], 2, str(out_dir), save_checkpoint=True)
-    assert {e[checkpoint.DATA_DIR_ENV] for e in envs} == {os.path.abspath(stale)}
+    assert {flag(c, checkpoint.DATA_DIR_FLAG) for c in cmds} == {os.path.abspath(stale)}
+    # Every rank joins the same JAX coordinator.
+    assert len({flag(c, checkpoint.JAX_COORDINATOR_FLAG) for c in cmds}) == 1
     assert not stale.exists()
