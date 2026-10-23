@@ -27,6 +27,7 @@ from vllm.v1.kv_cache_interface import (
     get_kv_quant_mode,
 )
 
+from vllm_torchtpu import envs
 from vllm_torchtpu import envs as vllm_torchtpu_envs
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import build_qsa_op
@@ -225,7 +226,10 @@ _KV_SCALE_NAMES = {
 
 
 class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
-    """Config-derived gated attention with a fully replicated MQA indexer.
+    """Config-derived gated attention with a replicated MQA indexer.
+
+    With VLLM_TPU_QSA_INDEXER_SHARD (pooled only) each TP rank scores 1/TP of
+    the compressed keys and the ranks merge their candidates.
 
     Checkpoint names are relative to ``...self_attn.``. No quant_config enters
     these BF16 projections. Typed cache tensors stay owned by Task4's manager;
@@ -402,6 +406,24 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
 
             self._select_op = partial(build_pooled_qsa_select_op(), **keywords)
         self.main_slot = max(main_slot, 0)
+        self._shard_op = None
+        if envs.VLLM_TPU_QSA_INDEXER_SHARD and self.tp_size > 1:
+            from vllm.distributed import get_tp_group
+
+            from vllm_torchtpu.layers.adapter.custom_ops.qsa_op import (
+                build_pooled_qsa_shard_op,
+            )
+
+            group = get_tp_group()
+            assert int(group.world_size) == self.tp_size
+            assert int(group.rank_in_group) == self.tp_rank
+            self._shard_op = partial(
+                build_pooled_qsa_shard_op(
+                    group, envs.VLLM_TPU_QSA_INDEXER_SHARD_A2A_MIN_TOKENS
+                ),
+                kv_heads=self.num_kv_heads,
+                **keywords,
+            )
 
     def get_kv_cache_spec(self, vllm_config):
         return get_qsa_cache_specs(self.config, self.tp_size, self.cache_dtype)[0]
@@ -574,6 +596,9 @@ class Qwen4ExpQSA(nn.Module, AttentionLayerBase):
             )
         pick_rows = rows is not None and not self.pooled
         op = self._op if rows is None or pick_rows else self._rows_op
+        if self.pooled and getattr(self, "_shard_op", None) is not None:
+            # The TP-sharded indexer; it also takes an optional rows operand.
+            op = self._shard_op
         output, selected = op(
             self.q_proj(hidden),
             self.k_proj(hidden),

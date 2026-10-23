@@ -124,6 +124,8 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_RPA_BKV: int = 256
     VLLM_TPU_QSA_DECODE_RPA_LANES: int = 8
     VLLM_TPU_QSA_FUSED_KV_WRITE: bool = False
+    VLLM_TPU_QSA_INDEXER_SHARD: bool = False
+    VLLM_TPU_QSA_INDEXER_SHARD_A2A_MIN_TOKENS: int = 0
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -669,6 +671,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # request's DMA outstanding. Prefill-sized steps keep the tiled writers.
     "VLLM_TPU_QSA_FUSED_KV_WRITE": env_bool(
         "VLLM_TPU_QSA_FUSED_KV_WRITE", default=False
+    ),
+    # Qwen4-exp pooled QSA: split the lightning indexer across the TP group.
+    # Each rank scores an interleaved 1/TP of every request's compressed keys,
+    # the local top-k candidates are gathered, and every rank merges the exact
+    # global top-k. Off: every rank scores every key (replicated indexer).
+    "VLLM_TPU_QSA_INDEXER_SHARD": env_bool("VLLM_TPU_QSA_INDEXER_SHARD", default=False),
+    # With VLLM_TPU_QSA_INDEXER_SHARD: steps of at least this many tokens merge
+    # a 1/TP token block per rank after an all-to-all and all-gather the merged
+    # blocks, instead of all-gathering every rank's candidates. 0: never.
+    "VLLM_TPU_QSA_INDEXER_SHARD_A2A_MIN_TOKENS": env_nonnegative_int(
+        "VLLM_TPU_QSA_INDEXER_SHARD_A2A_MIN_TOKENS", 0
     ),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4

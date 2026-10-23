@@ -9,7 +9,11 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 from vllm_torchtpu import envs
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
+from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import BITS_NEG_INF
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    cp_local_to_global,
+    streamindex_topk,
+)
 from vllm_torchtpu.kernels.qwen4_exp.decode_indexer import decode_query_chunk_size
 from vllm_torchtpu.kernels.qwen4_exp.fused_kv_write import (
     fused_layer_write,
@@ -726,12 +730,127 @@ def _select_shared_stream(query, starts, context, table, *, chunk_size, score):
         )
 
     _, selected = jax.lax.scan(window, None, (windows, t0s))
-    return selected.reshape(-1, selected.shape[-1])[: len(query)]
+    return selected.reshape(-1, *selected.shape[2:])[: len(query)]
 
 
 def _shared_stream_operands(t0, size, starts, context, table):
     ids, seq_lens, cu_q_lens, distribution = _request_window(t0, size, starts, context)
     return seq_lens, table[ids], cu_q_lens, distribution
+
+
+def _shard_pages(pages, shard, align):
+    """This rank's kernel pages of each row: columns ``rank, rank + size, ...``.
+
+    ``pages`` is ``[rows, pages_per_row]`` of 128-token kernel pages. Rank
+    ``r`` of ``size`` owns kernel page ``j`` of every request when
+    ``j % size == r``, which is StreamIndex's context-parallel layout with a
+    one-page interleave: local compressed index ``l`` is global
+    ``cp_local_to_global(l, r, size, page_rows)``. The local width is padded
+    to ``align`` pages (the widest KV block) with page 0; lengths mask it.
+    """
+    rank, size = shard
+    width = pages.shape[1]
+    local = -(-width // size)
+    local += (-local) % align
+    pages = jnp.pad(pages, ((0, 0), (0, local * size - width)))
+    return pages.reshape(len(pages), local, size)[:, :, rank]
+
+
+def _sharded_topk(
+    q, weights, cache, seq_lens, pages, cu, distribution, *, shard, rows, **kw
+):
+    """``streamindex_topk`` over this rank's key slice, as merge candidates.
+
+    Returns int32 ``[tokens, k, 2]``: f32 score bits and the *global*
+    compressed position of each local winner; unfilled slots are ``-1`` with
+    score ``-inf``. ``pages`` is the full ``[seqs, pages_per_seq]`` table.
+    """
+    align = max(
+        kw["num_kv_pages_per_block"]
+        if isinstance(kw["num_kv_pages_per_block"], tuple)
+        else (kw["num_kv_pages_per_block"],)
+    )
+    rank, size = shard
+    kw.pop("enable_early_exit", None)
+    idx, bits = streamindex_topk(
+        q,
+        weights,
+        cache,
+        seq_lens,
+        _shard_pages(pages, shard, align).reshape(-1),
+        cu,
+        distribution,
+        enable_early_exit=False,
+        cp_size=size,
+        cp_rank=rank,
+        interleave_size=rows * kw["compression_ratio"],
+        return_scores=True,
+        **kw,
+    )
+    filled = idx >= 0
+    position = jnp.where(filled, cp_local_to_global(idx, rank, size, rows), -1)
+    bits = jnp.where(filled, bits.astype(jnp.int32), BITS_NEG_INF)
+    return jnp.stack([bits, position.astype(jnp.int32)], axis=-1)
+
+
+def merge_candidates(candidates, k, *, topk=None):
+    """Exact top-``k`` of all ranks' candidates, lower position first on ties.
+
+    ``candidates`` is int32 ``[tokens, n, 2]`` (f32 score bits, global
+    position; position ``-1`` is empty). Every global winner is in its owner
+    rank's local top-``k``: that rank ranks it with the same (score, lower
+    position) order, so at most ``k - 1`` of its own keys precede it. A
+    SparseCore top-``k`` over the gathered scores finds the threshold score;
+    only rows with more threshold ties than free slots are re-selected, taking
+    the lowest-position ties as the replicated indexer does. Returns int32
+    ``[tokens, k]`` positions with a ``-1`` suffix.
+    """
+    if topk is None:
+        from vllm_torchtpu.kernels.deepseek_v4.sparsecore_topk import (
+            sparsecore_topk,
+        )
+
+        def topk(bits, k):
+            return sparsecore_topk(bits, k, write_empty_rows=True)
+
+    bits, position = candidates[..., 0], candidates[..., 1]
+    filled = position >= 0
+    bits = jnp.where(filled, bits, BITS_NEG_INF)
+    slots = topk(bits, k)
+    taken = slots >= 0
+    safe = jnp.maximum(slots, 0)
+    blocks = jnp.where(taken, jnp.take_along_axis(position, safe, axis=1), -1)
+
+    scores = jax.lax.bitcast_convert_type(bits, jnp.float32)
+    threshold = jnp.min(
+        jnp.where(taken, jnp.take_along_axis(scores, safe, axis=1), jnp.inf),
+        axis=1,
+        keepdims=True,
+    )
+    strict = filled & (scores > threshold)
+    tied = filled & (scores == threshold)
+    quota = jnp.sum(taken, axis=1) - jnp.sum(strict, axis=1)
+    ambiguous = jnp.sum(tied, axis=1) > quota
+
+    def reselect(blocks):
+        # The quota-th smallest tied position, one bit at a time.
+        def bit(i, cut):
+            trial = cut + jnp.left_shift(1, 30 - i)
+            below = jnp.sum(tied & (position < trial[:, None]), axis=1)
+            return jnp.where(below < quota, trial, cut)
+
+        cut = jax.lax.fori_loop(0, 31, bit, jnp.zeros_like(quota))
+        won = strict | (tied & (position <= cut[:, None]))
+        slot = jnp.where(won, jnp.cumsum(won, axis=1) - 1, k)
+        rows = jnp.broadcast_to(jnp.arange(len(won))[:, None], won.shape)
+        exact = (
+            jnp.full(blocks.shape, -1, jnp.int32)
+            .at[rows, slot]
+            .set(position, mode="drop")
+        )
+        return jnp.where(ambiguous[:, None], exact, blocks)
+
+    return jax.lax.cond(jnp.any(ambiguous), reselect, lambda b: b, blocks)
 
 
 def select_blocks(
@@ -747,6 +866,7 @@ def select_blocks(
     block_topk,
     slot=0,
     max_query_len=1,
+    shard=None,
 ):
     """Read BF16 key tiles directly from the carrier, without a cache conversion.
 
@@ -755,6 +875,10 @@ def select_blocks(
 
     ``slot`` selects this layer's kernel pages in a packed page, as in
     ``write_compressed``.
+
+    ``shard=(rank, size)`` scores only this rank's interleaved 1/size of every
+    request's compressed keys (``_shard_pages``) and returns merge candidates
+    ``[tokens, block_topk, 2]`` for ``merge_candidates`` instead of blocks.
     """
     width = pool.shape[-1]
     rows = 128 // ratio
@@ -775,6 +899,25 @@ def select_blocks(
             first = first + slot * logical_pages
         return (scaled + first).reshape(-1)
 
+    def topk(q, weights, cache, seq_lens, pages, cu, distribution, **kw):
+        """``pages``: [seqs, kernel pages per seq]."""
+        if shard is None:
+            return streamindex_topk(
+                q, weights, cache, seq_lens, pages.reshape(-1), cu, distribution, **kw
+            )
+        return _sharded_topk(
+            q,
+            weights,
+            cache,
+            seq_lens,
+            pages,
+            cu,
+            distribution,
+            shard=shard,
+            rows=rows,
+            **kw,
+        )
+
     def select_chunk(q, lens, pages):
         batch = len(q)
         expanded = expand_pages(pages).reshape(batch, -1)
@@ -783,12 +926,12 @@ def select_blocks(
             if pool.dtype == jnp.bfloat16
             else q
         )
-        return streamindex_topk(
+        return topk(
             index_query,
             jnp.full(q.shape[:2], q.shape[-1] ** -0.5, jnp.float32),
             cache,
             lens,
-            expanded.reshape(-1),
+            expanded,
             jnp.arange(batch + 1, dtype=jnp.int32),
             jnp.full((3,), batch, jnp.int32),
             k=block_topk,
@@ -813,12 +956,12 @@ def select_blocks(
         num_decodes = decode_prefix(starts)
         seq_lens = context + query_lens
         chunk_tokens = 512 if len(query) % 512 == 0 else None
-        return streamindex_topk(
+        return topk(
             jnp.pad(query, ((0, 0), (0, 0), (0, width - query.shape[-1]))),
             jnp.full(query.shape[:2], query.shape[-1] ** -0.5, jnp.float32),
             cache,
             seq_lens,
-            expand_pages(table),
+            expand_pages(table).reshape(len(table), -1),
             starts,
             jnp.asarray([num_decodes, num_decodes, num_seqs], dtype=jnp.int32),
             k=block_topk,
@@ -832,6 +975,8 @@ def select_blocks(
         )
 
     pages_per_query = table.shape[1] * logical_pages
+    if shard is not None:
+        pages_per_query = -(-pages_per_query // shard[1])
     chunk_size = min(len(query), decode_query_chunk_size(pages_per_query))
     query_block = envs.VLLM_TPU_QSA_DECODE_QUERY_BLOCK
     if query_block:
@@ -855,20 +1000,24 @@ def select_blocks(
                     f"and of {rows} compressed keys per page, got {block}"
                 )
         mixed_only = envs.VLLM_TPU_QSA_INDEXER_MIXED_ONLY
+        if shard is not None:
+            # Room for the local table padded to the widest KV block.
+            pages_per_query += max(256, kv_block, decode_kv_block) // rows
+            chunk_size = min(len(query), decode_query_chunk_size(pages_per_query))
         return _select_shared_stream(
             query,
             starts,
             context,
             table,
             chunk_size=chunk_size,
-            score=lambda q, seq_lens, pages, cu, distribution: streamindex_topk(
+            score=lambda q, seq_lens, pages, cu, distribution: topk(
                 jnp.pad(q, ((0, 0), (0, 0), (0, width - q.shape[-1])))
                 if pool.dtype == jnp.bfloat16
                 else q,
                 jnp.full(q.shape[:2], q.shape[-1] ** -0.5, jnp.float32),
                 cache,
                 seq_lens,
-                expand_pages(pages),
+                expand_pages(pages).reshape(len(pages), -1),
                 cu,
                 # VLLM_TPU_QSA_INDEXER_MIXED_ONLY: every sequence through the
                 # mixed pass. With per-token scores it scores a 1-token request
@@ -887,6 +1036,9 @@ def select_blocks(
                 hoist_step_metadata=envs.VLLM_TPU_QSA_INDEXER_HOIST_META,
             ),
         )
+    if shard is not None:
+        pages_per_query += 256 // rows
+        chunk_size = min(len(query), decode_query_chunk_size(pages_per_query))
     if len(query) <= chunk_size:
         return select_chunk(query, lengths, table[req])
 
@@ -907,7 +1059,7 @@ def select_blocks(
         None,
         chunks,
     )
-    return selected.reshape(-1, block_topk)[: len(query)]
+    return selected.reshape(-1, *selected.shape[2:])[: len(query)]
 
 
 def _pooled_qsa(
@@ -938,6 +1090,7 @@ def _pooled_qsa(
     max_query_len: int = 1,
     rows: jax.Array | None = None,
     select_only: bool = False,
+    shard: tuple[int, int] | None = None,
 ) -> tuple[jax.Array, ...]:
     """One QSA layer over the unified pool.
 
@@ -949,6 +1102,11 @@ def _pooled_qsa(
     ``main_slot`` >= 0 selects this layer's KV head pair in main KV pages
     shared by two layers (``pool_layout.pooled_cache_specs``); the default -1
     keeps the layer's whole-row pages.
+
+    ``shard=(rank, size)`` stops after this rank's slice of the indexer and
+    returns ``(pool, q, gate, lengths, req, starts, candidates)`` for
+    ``pooled_qsa_shard_attend``; ``req`` then indexes the per-request main
+    table rows and ``starts`` is the attended token layout.
     """
     # Keep the Runner's flat group tables at the Torch boundary. Static JAX
     # shapes reconstruct their per-request rows inside the operator.
@@ -1081,10 +1239,44 @@ def _pooled_qsa(
         # requests through starts/context, not req/lengths; the step's token
         # layout would hand row i the i-th token of the step's first requests.
         main_table, compressed_table = main_table[req], compressed_table[req]
+        req_rows = req
         req = jnp.arange(len(rows), dtype=jnp.int32)
         starts = jnp.arange(len(rows) + 1, dtype=jnp.int32)
         context = jnp.maximum(lengths - 1, 0)
         keep = picked = None
+    if shard is not None:
+        block_topk = token_topk // compress_ratio
+
+        def everything_visible(_):
+            # Every visible block wins; the merge never runs on these rows.
+            return jnp.full((len(iq), block_topk, 2), -1, jnp.int32)
+
+        def score(_):
+            return select_blocks(
+                iq,
+                pool,
+                lengths,
+                compressed_table,
+                req,
+                starts,
+                context,
+                ratio=compress_ratio,
+                block_topk=block_topk,
+                slot=compressed_slot,
+                max_query_len=max_query_len,
+                shard=shard,
+            )
+
+        candidates = jax.lax.cond(
+            jnp.max(lengths) // compress_ratio <= block_topk,
+            everything_visible,
+            score,
+            None,
+        )
+        if picked is None and rows is not None:
+            # The rows' own decode batch: row i owns main table row req[i].
+            req = req_rows
+        return pool, q, gate, lengths, req, starts, candidates
     blocks = select_blocks(
         iq,
         pool,
@@ -1115,18 +1307,57 @@ def _pooled_qsa(
             pages.astype(jnp.int32),
             kv_lens.astype(jnp.int32),
         )
-    output, pool = qsa_attention(
+    return _attend(
+        pool,
         q,
         gate,
         blocks,
         lengths,
         main_table[req],
-        pool,
         starts,
+        keep,
+        picked,
         kv_heads=k.shape[1],
-        ratio=compress_ratio,
+        compress_ratio=compress_ratio,
+        token_topk=token_topk,
         k_scale=k_scale if fp8 else 1.0,
         v_scale=v_scale if fp8 else 1.0,
+        main_slot=main_slot,
+        max_query_len=max_query_len,
+    )
+
+
+def _attend(
+    pool,
+    q,
+    gate,
+    blocks,
+    lengths,
+    table,
+    starts,
+    keep,
+    picked,
+    *,
+    kv_heads,
+    compress_ratio,
+    token_topk,
+    k_scale,
+    v_scale,
+    main_slot,
+    max_query_len,
+):
+    output, pool = qsa_attention(
+        q,
+        gate,
+        blocks,
+        lengths,
+        table,
+        pool,
+        starts,
+        kv_heads=kv_heads,
+        ratio=compress_ratio,
+        k_scale=k_scale,
+        v_scale=v_scale,
         **({"kv_head_offset": main_slot} if main_slot > 0 else {}),
         max_query_len=max_query_len,
     )
@@ -1137,6 +1368,300 @@ def _pooled_qsa(
         output = jnp.where(keep[:, None], output[picked], 0)
         selected = jnp.where(keep[:, None], selected[picked], -1)
     return pool, output, selected
+
+
+def visible_blocks(lengths, compress_ratio, block_topk):
+    """Every completed group of each row: the selection when all fit."""
+    count = lengths // compress_ratio
+    ids = jnp.arange(block_topk, dtype=jnp.int32)
+    return jnp.where(ids < count[:, None], ids, -1)
+
+
+def pooled_qsa_shard_select_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    shard_rank: int,
+    shard_size: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """Cache writes and this TP rank's indexer slice of ``pooled_qsa_step``.
+
+    Returns ``(pool, q, gate, lengths, req, starts, candidates)``; gather
+    ``candidates`` over the TP group and finish with
+    ``pooled_qsa_shard_attend_step``.
+    """
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        rows=None,
+        shard=(shard_rank, shard_size),
+    )
+
+
+def pooled_qsa_shard_select_rows_step(
+    qgate: jax.Array,
+    key: jax.Array,
+    value: jax.Array,
+    index_qk: jax.Array,
+    nq: jax.Array,
+    nk: jax.Array,
+    niq: jax.Array,
+    nik: jax.Array,
+    positions: jax.Array,
+    trig: jax.Array,
+    pool: jax.Array,
+    starts: jax.Array,
+    context: jax.Array,
+    ring_ids: jax.Array,
+    main_table: jax.Array,
+    compressed_table: jax.Array,
+    rows: jax.Array,
+    compress_ratio: int,
+    token_topk: int,
+    norm_eps: float,
+    rotary_dim: int,
+    shard_rank: int,
+    shard_size: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    compressed_slot: int = 0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_shard_select_step`` for ``pooled_qsa_rows_step``'s rows."""
+    return _pooled_qsa(
+        qgate,
+        key,
+        value,
+        index_qk,
+        nq,
+        nk,
+        niq,
+        nik,
+        positions,
+        trig,
+        pool,
+        starts,
+        context,
+        ring_ids,
+        main_table,
+        compressed_table,
+        compress_ratio,
+        token_topk,
+        norm_eps,
+        rotary_dim,
+        k_scale,
+        v_scale,
+        compressed_slot,
+        main_slot,
+        max_query_len=max_query_len,
+        rows=rows,
+        shard=(shard_rank, shard_size),
+    )
+
+
+def pooled_qsa_shard_merge(
+    received: jax.Array, compress_ratio: int, token_topk: int
+) -> jax.Array:
+    """Merge ``[ranks, tokens, k, 2]`` candidates into ``[tokens, k]`` blocks."""
+    ranks, tokens, block_topk, _ = received.shape
+    candidates = jnp.moveaxis(received, 0, 1).reshape(tokens, ranks * block_topk, 2)
+    return merge_candidates(candidates, token_topk // compress_ratio)
+
+
+def _shard_attend(
+    q,
+    gate,
+    lengths,
+    req,
+    starts,
+    main_table,
+    context,
+    pool,
+    gathered,
+    rows,
+    *,
+    kv_heads,
+    compress_ratio,
+    token_topk,
+    k_scale,
+    v_scale,
+    main_slot,
+    max_query_len,
+    merged,
+):
+    """Merge the gathered candidates, attend, and pick ``rows`` if given.
+
+    ``gathered`` is ``[ranks, tokens, k, 2]`` candidates, or ``[tokens, k]``
+    already merged blocks when ``merged``. ``k_scale``/``v_scale`` are the
+    FP8 scales (1.0 for BF16 KV).
+    """
+    block_topk = token_topk // compress_ratio
+    main_table = main_table.reshape(len(context), -1)
+
+    def merge(_):
+        if merged:
+            return gathered
+        return pooled_qsa_shard_merge(gathered, compress_ratio, token_topk)
+
+    blocks = jax.lax.cond(
+        jnp.max(lengths) // compress_ratio <= block_topk,
+        lambda _: visible_blocks(lengths, compress_ratio, block_topk),
+        merge,
+        None,
+    )
+    keep = picked = None
+    if rows is not None and len(rows) > len(context):
+        keep = rows >= 0
+        picked = jnp.clip(rows, 0, len(q) - 1)
+    return _attend(
+        pool,
+        q,
+        gate,
+        blocks,
+        lengths,
+        main_table[req],
+        starts,
+        keep,
+        picked,
+        kv_heads=kv_heads,
+        compress_ratio=compress_ratio,
+        token_topk=token_topk,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        main_slot=main_slot,
+        max_query_len=max_query_len,
+    )
+
+
+def pooled_qsa_shard_attend_step(
+    q: jax.Array,
+    gate: jax.Array,
+    lengths: jax.Array,
+    req: jax.Array,
+    starts: jax.Array,
+    main_table: jax.Array,
+    context: jax.Array,
+    pool: jax.Array,
+    gathered: jax.Array,
+    kv_heads: int,
+    compress_ratio: int,
+    token_topk: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+    merged: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Finish ``pooled_qsa_shard_select_step``: merge, attend, select."""
+    return _shard_attend(
+        q,
+        gate,
+        lengths,
+        req,
+        starts,
+        main_table,
+        context,
+        pool,
+        gathered,
+        None,
+        kv_heads=kv_heads,
+        compress_ratio=compress_ratio,
+        token_topk=token_topk,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        main_slot=main_slot,
+        max_query_len=max_query_len,
+        merged=merged,
+    )
+
+
+def pooled_qsa_shard_attend_rows_step(
+    q: jax.Array,
+    gate: jax.Array,
+    lengths: jax.Array,
+    req: jax.Array,
+    starts: jax.Array,
+    main_table: jax.Array,
+    context: jax.Array,
+    pool: jax.Array,
+    gathered: jax.Array,
+    rows: jax.Array,
+    kv_heads: int,
+    compress_ratio: int,
+    token_topk: int,
+    k_scale: float = 1.0,
+    v_scale: float = 1.0,
+    main_slot: int = -1,
+    max_query_len: int = 1,
+    merged: bool = False,
+) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """``pooled_qsa_shard_attend_step`` picking ``rows`` as the rows step."""
+    return _shard_attend(
+        q,
+        gate,
+        lengths,
+        req,
+        starts,
+        main_table,
+        context,
+        pool,
+        gathered,
+        rows,
+        kv_heads=kv_heads,
+        compress_ratio=compress_ratio,
+        token_topk=token_topk,
+        k_scale=k_scale,
+        v_scale=v_scale,
+        main_slot=main_slot,
+        max_query_len=max_query_len,
+        merged=merged,
+    )
 
 
 def pooled_qsa_step(
