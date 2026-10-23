@@ -63,3 +63,16 @@ def test_throttle_on_dcp1_defaults_and_overrides(monkeypatch, base7):
     monkeypatch.setenv("TPU_SCHED_DECODE_MAX_STAGE3_INFLIGHT", "0")
     monkeypatch.setenv("TPU_SCHED_DECODE_RESERVED_BLOCKS", "3")
     assert _pas(inflight=9, running=0, max_running=64, dcp=1)._decode_inflight_reserved_blocks() == 144
+
+
+def test_throttle_reaches_the_vllm_hook(monkeypatch, base7):
+    # vLLM 0.31 calls _inflight_prefill_reserved_blocks() for every async KV load; the throttle
+    # must act through it, not only through the helper.
+    _clear(monkeypatch)
+    monkeypatch.setenv("TPU_SCHED_DECODE_INFLIGHT_THROTTLE", "1")
+    s = _pas(inflight=16, running=0)
+    s._kv_prefetch_in_waiting = False
+    assert s._inflight_prefill_reserved_blocks() == 1 << 30
+    s = _pas(inflight=2, running=3)
+    s._kv_prefetch_in_waiting = False
+    assert s._inflight_prefill_reserved_blocks() == 128
