@@ -543,9 +543,11 @@ def _patch_ltx2_split_rope() -> None:
     #   elementwise. Each rope module keeps the tables of its last split-RoPE
     #   call and returns them while the key matches, until a call with
     #   another key replaces them.
-    # Effect: LTX-2 T2V 704x1280x121 on TPU v7x: 0.770 -> 0.482 s/step.
+    # Effect: LTX-2 T2V 704x1280x121, 40 steps, on TPU v7x: 0.770 -> 0.482
+    #   s/step (-37%).
     # Scope:
-    #   - T stays at dim 2, where the split-RoPE SP plan shards the tables.
+    #   - T stays at dim 2, where the split-RoPE sequence-parallel (SP) plan
+    #     shards the tables.
     #   - TP: _slice_rope_for_tp slices 4-D tables by heads on dim 1 and so
     #     passes these (B, 1, T, H * D) tables through whole; the rotation
     #     takes the lanes of the local heads.
