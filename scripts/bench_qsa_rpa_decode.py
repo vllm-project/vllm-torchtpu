@@ -178,9 +178,14 @@ def main_step(cache, results):
     rng = np.random.default_rng(1)
     cases = os.environ.get("BENCH_CASES", "2x64,4x64,6x24,8x32").split(",")
     patterns = os.environ.get("BENCH_PATTERNS", "random").split(",")
+    def parse(arm):
+        # "fslr[/bkv/lanes]": fused, shared, lean, slot read digits, then an
+        # optional compact schedule with that KV block and lanes.
+        flags, *compact = arm.split("/")
+        return (*map(int, flags), *(map(int, compact) if compact else ()))
+
     arms = [
-        tuple(map(int, a))
-        for a in os.environ.get("BENCH_ARMS", "000,010,100,110").split(",")
+        parse(a) for a in os.environ.get("BENCH_ARMS", "000,010,100,110").split(",")
     ]
     for (reqs, rows), pattern in itertools.product(
         [tuple(map(int, c.split("x"))) for c in cases], patterns
@@ -195,12 +200,19 @@ def main_step(cache, results):
                 jnp.asarray(q, jnp.bfloat16), jnp.asarray(g, jnp.bfloat16),
                 jnp.asarray(pick_blocks(rng, lengths, pattern)), base[3], base[4],
             ))
-        for fused, shared, kv_fetch in arms:
+        for fused, shared, kv_fetch, *rest in arms:
             fused, shared = bool(fused), bool(shared)
+            slot = rest[0] if rest else 0
+            bkv, lanes = rest[1:3] if len(rest) >= 3 else (0, 0)
 
             def attend(q, g, b, lens, t, cache, offset, fused=fused, shared=shared,
-                       kv_fetch=kv_fetch):
+                       kv_fetch=kv_fetch, slot=slot, bkv=bkv, lanes=lanes):
                 os.environ["VLLM_TPU_QSA_DECODE_LEAN_FETCH"] = str(kv_fetch)
+                os.environ["VLLM_TPU_QSA_DECODE_SLOT_READ"] = str(slot)
+                os.environ["VLLM_TPU_QSA_DECODE_COMPACT_SCHEDULE"] = str(int(bkv > 0))
+                if bkv:
+                    os.environ["VLLM_TPU_QSA_DECODE_RPA_BKV"] = str(bkv)
+                    os.environ["VLLM_TPU_QSA_DECODE_RPA_LANES"] = str(lanes)
                 return qsa_rpa.decode_attention(
                     q, g, b, lens, t, cache, kv_heads=1, ratio=RATIO,
                     k_scale=1.0, v_scale=1.0, fused=fused, shared_schedule=shared,
@@ -212,14 +224,15 @@ def main_step(cache, results):
                 trace = os.path.join(
                     os.environ.get("CDK_OUTPUT_DIR", "/tmp"), "xprof",
                     f"r{reqs}x{rows}_{pattern}_f{int(fused)}_s{int(shared)}"
-                    f"_k{kv_fetch}",
+                    f"_k{kv_fetch}_r{slot}_b{bkv}x{lanes}",
                 )
             try:
                 us, cache = bench_step(attend, layers, cache, trace)
             except Exception as e:  # noqa: BLE001
                 us = repr(e)[:200]
             row = dict(mode="step", requests=reqs, rows=rows, pattern=pattern,
-                       fused=fused, shared=shared, kv_fetch=kv_fetch,
+                       fused=fused, shared=shared, kv_fetch=kv_fetch, slot=slot,
+                       bkv=bkv, lanes=lanes,
                        us_per_step=us)
             print("STEP", json.dumps(row), flush=True)
             results.append(row)
@@ -317,6 +330,167 @@ def check_exact(cache):
         results.append(row)
         assert row["max_abs"] == 0 and row["nonzero"] > 0
     return cache, results
+
+
+def check_slot_exact(cache):
+    """Slot read vs both heads with zero queries: same math, same order."""
+    rng = np.random.default_rng(11)
+    results = []
+    for pattern, (reqs, rows), offset in itertools.product(
+        ("random", "clustered"), ((6, 24), (2, 64), (8, 32)), (0, 1)
+    ):
+        q, gate, blocks, lengths, table = make_inputs(
+            rng, requests=reqs, rows=rows, overlap=0.0, pattern=pattern
+        )
+        outs = []
+        for slot_read in (False, True):
+            attend = jax.jit(
+                functools.partial(
+                    qsa_rpa.rpa_attention, kv_heads=1, ratio=RATIO, k_scale=0.375,
+                    v_scale=2.5, lean_fetch=True, decode_only=True,
+                    slot_read=slot_read,
+                    **({"kv_head_offset": 1} if offset else {}),
+                ),
+                donate_argnums=(5,),
+            )
+            out, cache = attend(q, gate, blocks, lengths, table, cache)
+            outs.append(np.asarray(out.astype(jnp.float32)))
+        row = dict(mode="slot_exact", pattern=pattern, rows=rows, offset=offset,
+                   max_abs=float(np.max(np.abs(outs[0] - outs[1]))),
+                   nonzero=float(np.abs(outs[0]).max()))
+        print("EXACT", json.dumps(row), flush=True)
+        results.append(row)
+        assert row["max_abs"] == 0 and row["nonzero"] > 0
+    return cache, results
+
+
+def test_slot_read(monkeypatch):
+    monkeypatch.setenv("BENCH_CASES", "6x24,8x32,2x64")
+    monkeypatch.setenv("BENCH_PATTERNS", "random")
+    monkeypatch.setenv("BENCH_ARMS", "0000,0100,0110,0111,0011")
+    cache = make_cache()
+    cache, results = check_slot_exact(cache)
+    main_step(cache, results)
+    out_dir = os.environ.get("CDK_OUTPUT_DIR", "/tmp")
+    Path(out_dir, "bench_qsa_slot_read.json").write_text(json.dumps(results, indent=1))
+
+
+def test_slot_read_xprof(monkeypatch):
+    monkeypatch.setenv("BENCH_XPROF", "1")
+    monkeypatch.setenv("BENCH_CASES", "6x24")
+    monkeypatch.setenv("BENCH_PATTERNS", "random")
+    monkeypatch.setenv("BENCH_ARMS", "0110,0111")
+    main_step(make_cache(), [])
+
+
+def _one_dma_copy_in(self, step, slot, total_steps):
+    """Diagnostic only (wrong data): each lane's tile moves the same bytes as
+    the per-page fetch in ONE contiguous DMA, isolating descriptor issue."""
+    from jax.experimental import pallas as pl
+    from jax.experimental.pallas import tpu as pltpu
+
+    from vllm_torchtpu.kernels.experimental.batched_rpa import bref_override
+
+    is_no_op, block_idx = bref_override._step_guard(step, total_steps)
+    kv_cache_hbm, new_kv_hbm, schedule_ref, page_indices_ref = self.src_ref
+    sem = self.sem_recvs.at[slot]
+    vmem_dst = self.window_ref.at[slot, :, :, : self.cfgs.kv_hbm_stride]
+    flat = kv_cache_hbm.reshape(-1, *kv_cache_hbm.shape[2:])
+    page_size = self.cfgs.serve.page_size
+    for b in range(self.cfgs.batch_size):
+        total = 0
+        for i in range(self.cfgs.bkv_p_cache):
+            total += schedule_ref.dma_kv_cache[block_idx, b, i, 2]
+        total = jnp.where(is_no_op, 0, total)
+        p0 = schedule_ref.dma_kv_cache[block_idx, b, 0, 0]
+        src = page_indices_ref[p0] * page_size
+        pltpu.make_async_copy(
+            flat.at[pl.ds(src, total)], vmem_dst.at[b, pl.ds(0, total)], sem
+        ).start()
+        entry = schedule_ref.dma_kv_new[block_idx, b, 0]
+        new_total = 0
+        for i in range(self.cfgs.bkv_p_new):
+            new_total += schedule_ref.dma_kv_new[block_idx, b, i].fetch_val
+        new_total = jnp.where(is_no_op, 0, new_total)
+        pltpu.make_async_copy(
+            new_kv_hbm.at[pl.ds(entry.fetch_hbm[...], new_total)],
+            vmem_dst.at[b, pl.ds(entry.fetch_vmem[...], new_total)],
+            sem,
+        ).start()
+
+
+def check_compact_exact(cache):
+    """Compact vs per-page schedule. At the same KV block the kernel sees the
+    same data in the same order (bit for bit); other blocks change the online
+    softmax partition, so their difference is reported, not asserted."""
+    rng = np.random.default_rng(13)
+    results = []
+    for (reqs, rows), offset in itertools.product(((6, 24), (2, 64)), (0, 1)):
+        q, gate, blocks, lengths, table = make_inputs(
+            rng, requests=reqs, rows=rows, overlap=0.0
+        )
+        outs = {}
+        for name, kw in (
+            ("base", {}),
+            ("c256x8", dict(compact=True, bkv_size=256, batch_size=8)),
+            ("c512x8", dict(compact=True, bkv_size=512, batch_size=8)),
+            ("c1024x8", dict(compact=True, bkv_size=1024, batch_size=8)),
+            ("c1024x4", dict(compact=True, bkv_size=1024, batch_size=4)),
+        ):
+            attend = jax.jit(
+                functools.partial(
+                    qsa_rpa._rpa_attention_batch, kv_heads=1, ratio=RATIO,
+                    k_scale=0.375, v_scale=2.5, lean_fetch=True, decode_only=True,
+                    slot_read=True, **kw,
+                    **({"kv_head_offset": 1} if offset else {}),
+                ),
+                donate_argnums=(5,),
+            )
+            try:
+                out, cache = attend(q, gate, blocks, lengths, table, cache)
+                outs[name] = np.asarray(out.astype(jnp.float32))
+            except Exception as e:  # noqa: BLE001
+                print("COMPACT_FAIL", name, repr(e)[:300], flush=True)
+        base = outs["base"]
+        row = dict(mode="compact_exact", rows=rows, offset=offset,
+                   nonzero=float(np.abs(base).max()),
+                   **{k: float(np.max(np.abs(v - base))) for k, v in outs.items()})
+        print("EXACT", json.dumps(row), flush=True)
+        results.append(row)
+        assert row.get("c256x8", 1) == 0
+    return cache, results
+
+
+def test_compact(monkeypatch):
+    monkeypatch.setenv("BENCH_CASES", "6x24,8x32,2x64")
+    monkeypatch.setenv("BENCH_PATTERNS", "random")
+    monkeypatch.setenv(
+        "BENCH_ARMS",
+        "0111,0111/256/8,0111/512/8,0111/512/4,0111/1024/8,0111/1024/4,"
+        "0111/1152/4,0111/2176/2",
+    )
+    cache = make_cache()
+    cache, results = check_compact_exact(cache)
+    main_step(cache, results)
+    out_dir = os.environ.get("CDK_OUTPUT_DIR", "/tmp")
+    Path(out_dir, "bench_qsa_compact.json").write_text(json.dumps(results, indent=1))
+
+
+def test_diag_one_dma(monkeypatch):
+    """Lean per-page fetch vs one DMA per lane-tile (same bytes)."""
+    from vllm_torchtpu.kernels.experimental.batched_rpa import bref_override
+
+    monkeypatch.setenv("BENCH_CASES", "6x24,8x32")
+    monkeypatch.setenv("BENCH_PATTERNS", "random")
+    monkeypatch.setenv("BENCH_ARMS", "0111")
+    cache = make_cache()
+    results = []
+    cache = main_step(cache, results)
+    monkeypatch.setattr(
+        bref_override.KVBufferedRefHeadAlongSublane, "copy_in", _one_dma_copy_in
+    )
+    print("DIAG one DMA per lane-tile:", flush=True)
+    main_step(cache, results)
 
 
 def test_lean_fetch(monkeypatch):

@@ -105,6 +105,10 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
     VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE: bool = False
     VLLM_TPU_QSA_DECODE_LEAN_FETCH: bool = False
+    VLLM_TPU_QSA_DECODE_SLOT_READ: bool = False
+    VLLM_TPU_QSA_DECODE_COMPACT_SCHEDULE: bool = False
+    VLLM_TPU_QSA_DECODE_RPA_BKV: int = 256
+    VLLM_TPU_QSA_DECODE_RPA_LANES: int = 8
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -548,6 +552,28 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # per 4-token group and is scalar-issue bound). Same DMAs and results.
     "VLLM_TPU_QSA_DECODE_LEAN_FETCH": env_bool(
         "VLLM_TPU_QSA_DECODE_LEAN_FETCH", default=False
+    ),
+    # Qwen4-exp QSA decode/verify attention on RPA with FP8 main KV rows:
+    # each layer attends its own head slot of the packed row (one KV head,
+    # only its K/V pair unpacked) instead of unpacking every slot and, for a
+    # paired page's second layer, presenting both heads with zero queries.
+    "VLLM_TPU_QSA_DECODE_SLOT_READ": env_bool(
+        "VLLM_TPU_QSA_DECODE_SLOT_READ", default=False
+    ),
+    # Qwen4-exp QSA decode/verify attention on RPA: compact KV schedule (one
+    # entry per lane-tile instead of one per 4-token page), which lets the
+    # decode KV block grow past 256 tokens within the SMEM schedule budget.
+    # The RPA body has a fixed cost per step, so fewer, larger steps help.
+    "VLLM_TPU_QSA_DECODE_COMPACT_SCHEDULE": env_bool(
+        "VLLM_TPU_QSA_DECODE_COMPACT_SCHEDULE", default=False
+    ),
+    # Decode KV tokens per RPA step and lanes (requests) per step with the
+    # compact schedule; only read when it is on.
+    "VLLM_TPU_QSA_DECODE_RPA_BKV": env_nonnegative_int(
+        "VLLM_TPU_QSA_DECODE_RPA_BKV", 256
+    ),
+    "VLLM_TPU_QSA_DECODE_RPA_LANES": env_nonnegative_int(
+        "VLLM_TPU_QSA_DECODE_RPA_LANES", 8
     ),
     # Qwen4-exp QSA prefill: build the per-query selection bitset with a
     # compare-and-accumulate Pallas kernel. Off falls back to the vmapped

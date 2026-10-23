@@ -178,6 +178,16 @@ class ServingConfigs:
     # three: a tile's pages land at i * page_size, so only each entry's
     # physical page id and size are read.
     lean_kv_fetch: bool = False
+    # HEAD_ALONG_SUBLANE with one KV head: attend the K/V pair at this head
+    # slot of each packed cache row (either layer of a paired page) and unpack
+    # only that pair. None unpacks every pair and attends the leading heads.
+    # The fetch still moves whole rows.
+    kv_slot: int | None = None
+    # Read-only HEAD_ALONG_SUBLANE decode: the schedule keeps one KV-cache entry
+    # per lane-tile (first page-table index, tokens) instead of one per page;
+    # the fetch derives each page's size. Shrinks the SMEM schedule by the
+    # pages per KV block, which admits larger KV blocks.
+    compact_kv_schedule: bool = False
 
     def __post_init__(self):
         if self.mask_invalid_v is None:
@@ -286,10 +296,12 @@ class RpaConfigs:
         # Per step per batch item:
         # s_idx, q_idx, k_idx, is_last_k, do_writeback: 5 * 4 = 20
         # dma_q: 2 * 4 = 8
-        # dma_kv_cache: bkv_p_cache * 3 * 4 = 12 * bkv_p_cache
+        # dma_kv_cache: kv_schedule_entries * 3 * 4
         # dma_kv_new: bkv_p_new * self.dma_kv_new_size * 4
         bytes_per_step = (
-            28 + 12 * self.bkv_p_cache + 4 * self.dma_kv_new_size * self.bkv_p_new
+            28
+            + 12 * self.kv_schedule_entries
+            + 4 * self.dma_kv_new_size * self.bkv_p_new
         )
         bytes_per_step *= self.block.batch_size
         # Add 20 bytes for the 5 total_wait fields (total_wait_kv_in,
@@ -335,6 +347,13 @@ class RpaConfigs:
         if self.mode == RpaCase.PREFILL:
             return 0
         return self.bkv_p
+
+    @property
+    def kv_schedule_entries(self) -> int:
+        """KV-cache DMA entries per lane-step in the schedule."""
+        if self.serve.compact_kv_schedule and self.bkv_p_cache:
+            return 1
+        return self.bkv_p_cache
 
     @property
     def bkv_p_new(self) -> int:

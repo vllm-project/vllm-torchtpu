@@ -13,6 +13,7 @@
 # limitations under the License.
 """Wrapper for RPA kernel to match expected interface."""
 
+import dataclasses
 from typing import cast
 
 import jax
@@ -511,6 +512,8 @@ def calculate_block_sizes(
         "mask_invalid_v",
         "decode_only",
         "lean_kv_fetch",
+        "kv_slot",
+        "compact_kv_schedule",
     ),
     # Donation of transient inputs can fail for some runtime buffer layouts in
     # the experimental tuning path. Keep donation only for kv_cache, which is
@@ -556,6 +559,8 @@ def ragged_paged_attention(
     mask_invalid_v: bool | None = None,
     decode_only: bool = False,
     lean_kv_fetch: bool = False,
+    kv_slot: int | None = None,
+    compact_kv_schedule: bool = False,
 ) -> tuple[jax.Array, jax.Array] | tuple[jax.Array, jax.Array, jax.Array]:
     """Perform batched ragged paged attention.
 
@@ -623,6 +628,13 @@ def ragged_paged_attention(
         lean_kv_fetch: Fetch HEAD_ALONG_SUBLANE cache pages with two scalar
             loads per page (the decode KV fetch is scalar-issue bound). Same
             DMAs and results. Defaults to False.
+        kv_slot: With one KV head and HEAD_ALONG_SUBLANE packed rows, attend
+            the K/V pair at this head slot of each row (either layer of a
+            paired page) and unpack only that pair. Read-only KV only. None
+            (default) unpacks every pair and attends the leading heads.
+        compact_kv_schedule: Keep one KV-cache schedule entry per lane-tile
+            (read-only HEAD_ALONG_SUBLANE only); admits larger decode KV
+            blocks within the SMEM schedule budget. Defaults to False.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -710,9 +722,26 @@ def ragged_paged_attention(
         skip_kv_update=skip_kv_update,
         mask_invalid_v=mask_invalid_v,
         lean_kv_fetch=lean_kv_fetch,
+        kv_slot=kv_slot,
+        compact_kv_schedule=compact_kv_schedule,
     )
+    if compact_kv_schedule and not (
+        kv_layout == configs.KVLayout.HEAD_ALONG_SUBLANE and skip_kv_update
+    ):
+        raise ValueError("compact_kv_schedule needs read-only HEAD_ALONG_SUBLANE")
     if lean_kv_fetch and kv_layout != configs.KVLayout.HEAD_ALONG_SUBLANE:
         raise ValueError("lean_kv_fetch needs HEAD_ALONG_SUBLANE")
+    if kv_slot is not None and not (
+        kv_layout == configs.KVLayout.HEAD_ALONG_SUBLANE
+        and skip_kv_update
+        and keys.shape[1] == 1
+        and kv_cache.shape[2] == 1
+        and 0 <= kv_slot < kv_cache.shape[3] // 2
+    ):
+        raise ValueError(
+            "kv_slot needs one KV head, read-only HEAD_ALONG_SUBLANE rows of "
+            f"one packed sublane and a slot within it, got {kv_slot=}"
+        )
 
     q_hbm, new_kv_hbm = prepare_inputs(
         queries,
@@ -820,7 +849,11 @@ def ragged_paged_attention(
             kv_new_lens,
             distribution,
             page_indices,
-            cfgs=cfgs,
+            # The slot only changes which pair the kernel unpacks; one schedule
+            # serves both layers of a paired page.
+            cfgs=dataclasses.replace(
+                cfgs, serve=dataclasses.replace(cfgs.serve, kv_slot=None)
+            ),
             computer_cls=computer_cls,
             extra_scalars=extra_scalars,
         )
@@ -836,6 +869,9 @@ def ragged_paged_attention(
             lse_hbm_in,
             cfgs=cfgs,
             computer_cls=computer_cls,
+            # The compact schedule names page-table entries, not physical
+            # pages, so its fetch reads the table.
+            page_indices=page_indices if compact_kv_schedule else None,
         )
         if return_lse:
             o_out, kv_out, lse_out = result

@@ -244,7 +244,7 @@ class RpaSchedule:
                 (effective_max_steps, cfgs.batch_size, 2)
             ),
             dma_kv_cache=SmemWrapper.create_shape_dtype(
-                (effective_max_steps, cfgs.batch_size, cfgs.bkv_p_cache, 3)
+                (effective_max_steps, cfgs.batch_size, cfgs.kv_schedule_entries, 3)
             ),
             dma_kv_new=SmemArrayOfStructs.create_shape_dtype(
                 (
@@ -331,7 +331,7 @@ def _mask_out_steps(
     schedule_smem.dma_q[step, b_idx, 0] = 0
     schedule_smem.dma_q[step, b_idx, 1] = 0
 
-    for i in range(schedule_smem.cfgs.bkv_p_cache):
+    for i in range(schedule_smem.cfgs.kv_schedule_entries):
         schedule_smem.dma_kv_cache[step, b_idx, i, 0] = 0
         schedule_smem.dma_kv_cache[step, b_idx, i, 1] = 0
         schedule_smem.dma_kv_cache[step, b_idx, i, 2] = 0
@@ -412,7 +412,7 @@ def _compute_waits(
         # KV IN
         kv_in_tokens = 0
         for b in range(cfgs.batch_size):
-            for i in range(cfgs.bkv_p_cache):
+            for i in range(cfgs.kv_schedule_entries):
                 _, _, sz = schedule.get_dma_kv_cache(step, b, i)
                 kv_in_tokens += sz
             for i in range(cfgs.bkv_p_new):
@@ -625,7 +625,19 @@ class BaseMetadataComputer:
             kv_left_frm_cache = kv_left
         else:
             kv_left_frm_cache = jnp.maximum(kv_cache_len - kv_len_start, 0)
-        for i in range(cfgs.bkv_p_cache):
+        if cfgs.serve.compact_kv_schedule and cfgs.bkv_p_cache:
+            # One entry per lane-tile: its first global page-table index and
+            # tokens. The kernel then reads the page table itself, which it is
+            # given only in this mode (see kernel.rpa_kernel).
+            schedule.dma_kv_cache[step, target_lane, 0, 0] = jnp.minimum(
+                s_idx * cfgs.serve.pages_per_seq + kv_p_start,
+                cfgs.serve.num_page_indices - 1,
+            )
+            schedule.dma_kv_cache[step, target_lane, 0, 1] = 0
+            schedule.dma_kv_cache[step, target_lane, 0, 2] = jnp.clip(
+                kv_left_frm_cache, 0, cfgs.bkv_p_cache * cfgs.serve.page_size
+            )
+        for i in range(0 if cfgs.serve.compact_kv_schedule else cfgs.bkv_p_cache):
             dst_vmem = i << cfgs.serve.page_size_log2
             dma_sz = kv_left_frm_cache - dst_vmem
             dma_sz = jnp.clip(dma_sz, 0, cfgs.serve.page_size)

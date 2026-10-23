@@ -77,6 +77,14 @@ def strided_load_bkv(
         kv = jnp.where(valid_mask, kv, jnp.zeros_like(kv))
     bitwidth = jax.dtypes.itemsize_bits(cfgs.serve.dtype_kv)
 
+    if cfgs.serve.kv_slot is not None:
+        # Only this slot's (K, V) pair: its 2 * bitwidth bits of each word.
+        pair_bits = 2 * bitwidth
+        shifted = kv >> (cfgs.serve.kv_slot * pair_bits)
+        pair = shifted.astype(jnp.dtype(f"uint{pair_bits}"))
+        return utils.convert_to_target_bitwidth(
+            pair, target_bitwidth=bitwidth, kv_dtype=cfgs.serve.dtype_kv
+        )
     return utils.convert_to_target_bitwidth(
         kv, target_bitwidth=bitwidth, kv_dtype=cfgs.serve.dtype_kv
     )
@@ -831,6 +839,7 @@ def rpa_kernel(
     *,
     cfgs: configs.RpaConfigs,
     computer_cls: type[schedule.BaseMetadataComputer] = schedule.BaseMetadataComputer,
+    page_indices: jax.Array | None = None,
 ) -> tuple[jax.Array, jax.Array, jax.Array | None]:
     """Perform batched ragged paged attention with scheduler data.
 
@@ -854,6 +863,10 @@ def rpa_kernel(
             concatenated along num kv heads dim.
         lse_hbm: pre-allocated buffer for LSE output. None when return_lse=False.
         cfgs: Configuration of the kernel.
+        page_indices: [max_num_seqs * pages_per_seq] page table, scalar-prefetched
+            for the KV fetch. Required with (and only used by)
+            `cfgs.serve.compact_kv_schedule`, whose schedule names page-table
+            entries instead of physical pages.
 
     Returns:
         out: [max_num_tokens, num_q_heads, head_dim]. Output of self attention.
@@ -862,8 +875,30 @@ def rpa_kernel(
         lse_out: [max_num_tokens, num_q_heads] LSE values, or None.
     """
     return_lse = cfgs.serve.return_lse
+    table_fetch = cfgs.serve.compact_kv_schedule
+    if table_fetch != (page_indices is not None):
+        raise ValueError("page_indices is required exactly for compact_kv_schedule")
 
     def ragged_paged_attention_pipeline(
+        cu_q_lens_ref: jax.Ref,
+        q_offsets_ref: jax.Ref,
+        kv_cache_lens_ref: jax.Ref,
+        kv_new_lens_ref: jax.Ref,
+        *refs,
+    ):
+        page_indices_ref = None
+        if table_fetch:
+            page_indices_ref, *refs = refs
+        return _pipeline(
+            cu_q_lens_ref,
+            q_offsets_ref,
+            kv_cache_lens_ref,
+            kv_new_lens_ref,
+            *refs,
+            page_indices_ref=page_indices_ref,
+        )
+
+    def _pipeline(
         # Scalar prefetch.
         cu_q_lens_ref: jax.Ref,
         q_offsets_ref: jax.Ref,
@@ -879,6 +914,8 @@ def rpa_kernel(
         o_hbm_ref: jax.Ref,
         o_kv_cache_hbm_ref: jax.Ref,
         o_lse_hbm_ref: jax.Ref | None = None,
+        *,
+        page_indices_ref: jax.Ref | None = None,
     ):
         del o_kv_cache_hbm_ref
         if o_lse_hbm_ref is not None:
@@ -973,7 +1010,8 @@ def rpa_kernel(
 
                 total_steps = num_steps + prefix_steps
                 kv_bound = kv_cache_alloc.bind(
-                    src_ref=(kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref),
+                    src_ref=(kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref)
+                    + ((page_indices_ref,) if table_fetch else ()),
                     dst_ref=(kv_cache_hbm_ref, new_kv_hbm_ref, schedule_ref),
                 )
                 q_bound = q_alloc.bind(src_ref=(q_hbm_ref, schedule_ref))
@@ -1039,7 +1077,7 @@ def rpa_kernel(
         q_offsets,
         kv_cache_lens,
         kv_new_lens,
-    )
+    ) + ((page_indices,) if table_fetch else ())
     num_scalar_prefetch = len(scalar_prefetches)
     num_active_scalers = len(scalar_prefetches)
 
@@ -1084,10 +1122,7 @@ def rpa_kernel(
         name=get_kernel_name(cfgs),
         metadata=get_kernel_metadata(cfgs),
     )(
-        cu_q_lens,
-        q_offsets,
-        kv_cache_lens,
-        kv_new_lens,
+        *scalar_prefetches,
         schedule_hbm,
         q_hbm,
         new_kv_hbm,

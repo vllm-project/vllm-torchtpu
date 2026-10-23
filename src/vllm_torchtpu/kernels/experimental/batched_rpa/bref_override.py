@@ -324,7 +324,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
     ):
         # src_ref: (kv_cache_hbm, new_kv_hbm, schedule_ref)
         is_no_op, block_idx = _step_guard(step, total_steps)
-        kv_cache_hbm, new_kv_hbm, schedule_ref = self.src_ref
+        kv_cache_hbm, new_kv_hbm, schedule_ref, *table = self.src_ref
         assert self.sem_recvs is not None
         assert self.window_ref is not None
         sem = self.sem_recvs.at[slot]
@@ -338,8 +338,26 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         kv_cache_hbm_flat = kv_cache_hbm.reshape(-1, *kv_cache_hbm.shape[2:])
 
         page_size = self.cfgs.serve.page_size
+        last_index = self.cfgs.serve.num_page_indices - 1
         for b in range(self.cfgs.batch_size):
-            if not self.cfgs.serve.lean_kv_fetch:
+            if self.cfgs.serve.compact_kv_schedule:
+                # Compact schedule: the lane-tile's first page-table index and
+                # token count; pages are full except the last nonempty one. The
+                # kernel scalar-prefetches the page table only in this mode.
+                (page_indices_ref,) = table
+                p0 = schedule_ref.dma_kv_cache[block_idx, b, 0, 0]
+                tokens = schedule_ref.dma_kv_cache[block_idx, b, 0, 2]
+                tokens = jnp.where(is_no_op, 0, tokens)
+                for i in range(self.cfgs.bkv_p_cache):
+                    sz = jnp.clip(tokens - i * page_size, 0, page_size)
+                    p_idx = jnp.minimum(p0 + i, last_index) if i else p0
+                    src_off = page_indices_ref[p_idx] * page_size
+                    pltpu.make_async_copy(
+                        kv_cache_hbm_flat.at[pl.ds(src_off, sz)],
+                        vmem_dst.at[b, pl.ds(i * page_size, sz)],
+                        sem,
+                    ).start()
+            elif not self.cfgs.serve.lean_kv_fetch:
                 for i in range(self.cfgs.bkv_p_cache):
                     p_idx, dst_off, sz = schedule_ref.get_dma_kv_cache(block_idx, b, i)
                     sz = jnp.where(is_no_op, 0, sz)
@@ -418,7 +436,7 @@ class KVBufferedRefHeadAlongSublane(_BypassRef):
         total_steps: int | jax.Array,
     ):
         is_no_op, block_idx = _step_guard(step, total_steps)
-        _, _, schedule_ref = self.src_ref
+        _, _, schedule_ref = self.src_ref[:3]
         assert self.sem_recvs is not None
         sem = self.sem_recvs.at[slot]
         wait_lanes = schedule_ref.total_wait_kv_in[block_idx]
