@@ -103,6 +103,45 @@ def test_abstract_params_inputs_are_in_argument_order(tmp_path: Path) -> None:
     assert names == ["a", "b"]
 
 
+def test_check_replicas_rejects_per_rank_values_declared_replicated() -> None:
+    dp2_tp2 = {"data": 2, "model": 2}
+    inputs = [
+        _spec("norm", [4], "bf16", [None]),
+        _spec("a_log", [4], "bf16", [None]),
+        _spec("wq", [8, 4], "bf16", ["model", None]),
+    ]
+    # Processes 0..3 sit at (data, model) = (0,0), (0,1), (1,0), (1,1).
+    same = [[7, 1, 10], [7, 1, 11], [7, 1, 10], [7, 1, 11]]
+    checkpoint.check_replicas(inputs, same, dp2_tp2)
+
+    per_rank = [[7, 1, 10], [7, 2, 11], [7, 3, 10], [7, 4, 11]]
+    with pytest.raises(ValueError, match=r"^1 tensors .*: a_log \[None\]$"):
+        checkpoint.check_replicas(inputs, per_rank, dp2_tp2)
+    # A tensor sharded over `model` is copied across `data` only.
+    both = [[7, 1, 10], [7, 2, 11], [7, 3, 12], [7, 4, 11]]
+    two = r"^2 tensors .*: a_log \[None\], wq \['model', None\]$"
+    with pytest.raises(ValueError, match=two):
+        checkpoint.check_replicas(inputs, both, dp2_tp2)
+
+
+@pytest.mark.parametrize(
+    "name,shape",
+    [
+        ("language_model.model.layers.0.linear_attn.A_log", [8]),
+        ("model.layers.0.self_attn.o_proj.weight_scale", [2048]),
+        ("model.layers.0.linear_attn.out_proj.weight_scale", [2048]),
+        ("model.layers.0.mlp.shared_expert.down_proj.weight_scale", [1, 2048]),
+    ],
+)
+def test_per_rank_tensors_are_sharded_over_tensor_parallel_ranks(
+    name: str, shape: list[int]
+) -> None:
+    from vllm_torchtpu.experimental.export import weight_mapper
+
+    sharding = weight_mapper.infer_weight_sharding(name, shape, tp_size_hint=4)
+    assert sharding == ["tp"] + [None] * (len(shape) - 1)
+
+
 def test_save_checkpoint_writes_zarr_v2_arrays(tmp_path: Path) -> None:
     pytest.importorskip("orbax.checkpoint")
     ts = pytest.importorskip("tensorstore")

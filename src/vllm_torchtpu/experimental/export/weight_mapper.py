@@ -125,6 +125,19 @@ def infer_weight_sharding(
     if tp_size <= 1:
         return [None] * rank
 
+    # FP8 requantization replaces a layer's parameters, dropping their shard
+    # attributes. A row-parallel layer's scales are computed over the rank's own
+    # input slice, so they differ per rank and must not be declared replicated.
+    if weight_name.endswith(
+        (
+            "o_proj.weight_scale",
+            "down_proj.weight_scale",
+            "out_proj.weight_scale",
+            "wo_b.weight_scale",
+        )
+    ):
+        return ["tp"] + [None] * (rank - 1)
+
     if rank == 1:
         if any(
             k in weight_name
@@ -142,20 +155,13 @@ def infer_weight_sharding(
                 "in_proj_qkvz",
                 "in_proj_ba",
                 "a_log",
+                "A_log",
                 "dt_bias",
                 "fused_qkvb_proj",
                 "fused_fa_ga_proj",
                 "f_b_proj",
                 "g_b_proj",
                 "attn_sink",
-            )
-        ) and not any(
-            weight_name.endswith(s)
-            for s in (
-                "o_proj.weight_scale",
-                "down_proj.weight_scale",
-                "out_proj.weight_scale",
-                "wo_b.weight_scale",
             )
         ):
             return ["tp"]

@@ -33,6 +33,7 @@ import os
 import shutil
 import subprocess
 import sys
+import zlib
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from typing import Any
 
@@ -205,10 +206,22 @@ def _save_checkpoint(
     )
     (local,) = jax.local_devices(backend="cpu")
     tree = {}
+    digests = []
     for i, (spec, shard) in enumerate(zip(inputs, shards, strict=True)):
         sharding = NamedSharding(mesh, PartitionSpec(*spec["sharding"]))
         tree[f"array_{i}"] = jax.make_array_from_single_device_arrays(
             tuple(spec["shape"]), sharding, [jax.device_put(shard, local)]
+        )
+        digests.append(
+            zlib.crc32(shard.tobytes()) if _has_replicas(spec, axis_sizes) else 0
+        )
+    if jax.process_count() > 1:
+        from jax.experimental import multihost_utils
+
+        check_replicas(
+            inputs,
+            np.asarray(multihost_utils.process_allgather(np.asarray(digests))),
+            axis_sizes,
         )
     checkpointer = ocp.Checkpointer(
         ocp.PyTreeCheckpointHandler(use_ocdbt=False, use_zarr3=False)
@@ -216,6 +229,58 @@ def _save_checkpoint(
     checkpointer.save(
         os.path.abspath(data_dir), args=ocp.args.PyTreeSave(tree), force=True
     )
+
+
+def _sharded_axes(spec: Mapping[str, Any]) -> set[str]:
+    axes: set[str] = set()
+    for entry in spec["sharding"]:
+        if entry is not None:
+            axes.update([entry] if isinstance(entry, str) else entry)
+    return axes
+
+
+def _has_replicas(spec: Mapping[str, Any], axis_sizes: Mapping[str, int]) -> bool:
+    """Whether more than one process holds a copy of the same shard of `spec`."""
+    sharded = _sharded_axes(spec)
+    return any(axis_sizes[a] > 1 for a in _AXIS_NAMES if a not in sharded)
+
+
+def check_replicas(
+    inputs: Sequence[Mapping[str, Any]],
+    digests: Any,
+    axis_sizes: Mapping[str, int],
+) -> None:
+    """Fails if processes holding copies of one shard saved different values.
+
+    `digests[p][i]` is process `p`'s digest of its shard of input `i`; process `p`
+    is the `p`-th device of the mesh. Orbax writes a replicated array's chunks
+    from several processes, so a tensor that really differs per rank but is
+    declared replicated would be saved as a mix of the ranks' values.
+    """
+    import numpy as np
+
+    sizes = [axis_sizes[a] for a in _AXIS_NAMES]
+    coords = [
+        dict(zip(_AXIS_NAMES, (int(c) for c in coord), strict=True))
+        for coord in zip(*np.unravel_index(range(len(digests)), sizes), strict=True)
+    ]
+    mixed = []
+    for i, spec in enumerate(inputs):
+        if not _has_replicas(spec, axis_sizes):
+            continue
+        sharded = sorted(_sharded_axes(spec))
+        groups: dict[tuple[int, ...], set[int]] = {}
+        for p, coord in enumerate(coords):
+            groups.setdefault(tuple(coord[a] for a in sharded), set()).add(
+                int(digests[p][i])
+            )
+        if any(len(g) > 1 for g in groups.values()):
+            mixed.append(f"{spec['name']} {spec['sharding']}")
+    if mixed:
+        raise ValueError(
+            f"{len(mixed)} tensors are declared replicated along an axis whose ranks "
+            "hold different values; they need a sharded axis: " + ", ".join(mixed)
+        )
 
 
 def init_jax(rank: int, world_size: int, coordinator: str | None) -> None:
