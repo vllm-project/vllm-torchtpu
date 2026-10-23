@@ -87,6 +87,7 @@ class _PrefixAffinityRouter:
         self.resident: list[OrderedDict[int, float]] = [OrderedDict() for _ in range(n)]
         self.evicted = 0
         self.rerouted = 0
+        self.rebound = 0
         self._next_session = 0
 
     @staticmethod
@@ -214,6 +215,18 @@ class _PrefixAffinityRouter:
                 self.session_rank[old_sid] = None
                 self.evicted += 1
 
+    def rebind(self, old: int, new: int) -> None:
+        """Moves a routed request that is not running yet from ``old`` to
+        ``new`` (a decode admitted after its prefill, to whichever leg has
+        room). The conversation's chunks keep their owner."""
+        if old == new:
+            return
+        with self._lock:
+            self.inflight[old] = max(0, self.inflight[old] - 1)
+            self.inflight[new] += 1
+            self.placed[new] += 1
+            self.rebound += 1
+
     def start_running(self, rank: int) -> None:
         """Counts a request routed to ``rank`` as running there."""
         with self._lock:
@@ -236,11 +249,46 @@ class _PrefixAffinityRouter:
                 "sticky_saturated": self.sticky_saturated,
                 "cold": self.cold,
                 "rerouted": self.rerouted,
+                "rebound": self.rebound,
                 "unique_chunks": len(self.owners),
                 "sessions": self._next_session,
                 "resident": [len(r) for r in self.resident],
                 "evicted": self.evicted,
             }
+
+
+async def _acquire_any_budget(
+    budgets: list["_AdmissionBudget"], preferred: int, n_tokens: int
+) -> tuple[int, float]:
+    """Waits until any of ``budgets`` (sharing one condition) has room, takes
+    it and returns (its index, the wait in milliseconds): ``preferred`` while
+    it has room, else the leg holding the fewest requests, then tokens."""
+    t0 = time.perf_counter()
+    cond = budgets[preferred]._cond
+    chosen = preferred
+
+    def pick() -> bool:
+        nonlocal chosen
+        if budgets[preferred]._fits(n_tokens):
+            chosen = preferred
+            return True
+        room = [i for i, budget in enumerate(budgets) if budget._fits(n_tokens)]
+        if not room:
+            return False
+        chosen = min(room, key=lambda i: (budgets[i].count, budgets[i].tokens, i))
+        return True
+
+    async with cond:
+        budgets[preferred].waiting += 1
+        try:
+            await cond.wait_for(pick)
+        finally:
+            budgets[preferred].waiting -= 1
+        budget = budgets[chosen]
+        budget.count += 1
+        budget.tokens += n_tokens
+        budget.admitted += 1
+    return chosen, (time.perf_counter() - t0) * 1000.0
 
 
 class _AdmissionBudget:
@@ -253,7 +301,13 @@ class _AdmissionBudget:
     long context never deadlocks the leg.
     """
 
-    def __init__(self, name: str, max_count: int, max_tokens: int) -> None:
+    def __init__(
+        self,
+        name: str,
+        max_count: int,
+        max_tokens: int,
+        cond: asyncio.Condition | None = None,
+    ) -> None:
         self.name = name
         self.max_count = max(0, max_count)
         self.max_tokens = max(0, max_tokens)
@@ -261,7 +315,9 @@ class _AdmissionBudget:
         self.tokens = 0
         self.waiting = 0
         self.admitted = 0
-        self._cond = asyncio.Condition()
+        # Budgets sharing one condition can be waited on together
+        # (_acquire_any_budget).
+        self._cond = cond if cond is not None else asyncio.Condition()
 
     @property
     def enabled(self) -> bool:
@@ -682,8 +738,13 @@ async def lifespan(app: FastAPI):
             f"got {admit_point!r}"
         )
     app.state.decode_admit_point = admit_point
+    # One condition over every decode's budget: a request admitted after its
+    # prefill waits for whichever decode has room first (_acquire_any_budget).
+    decode_budget_cond = asyncio.Condition()
     app.state.decode_budgets = [
-        _AdmissionBudget(f"decode[{i}]", decode_cap, decode_cap_tokens)
+        _AdmissionBudget(
+            f"decode[{i}]", decode_cap, decode_cap_tokens, decode_budget_cond
+        )
         for i in range(len(app.state.decode_clients))
     ]
     # Bound on the requests a prefill leg has in prefill or has finished
@@ -1010,10 +1071,30 @@ async def _handle_completions(api: str, request: Request):
                     )
 
         async def admit_decode(point: str) -> None:
-            nonlocal decode_held
+            nonlocal decode_held, decode_idx, decode_client_info, decode_budget
             if not decode_budget.enabled:
                 return
-            wait_ms = await decode_budget.acquire(decode_tokens)
+            if point == "after_prefill" and len(state.decode_budgets) > 1:
+                # Admitted after its prefill, a request holds no decode yet:
+                # it takes whichever decode has room first instead of queueing
+                # behind the one routed at arrival. Decodes cache nothing
+                # (--no-enable-prefix-caching), so no affinity is lost.
+                routed = decode_idx
+                decode_idx, wait_ms = await _acquire_any_budget(
+                    state.decode_budgets, decode_idx, decode_tokens
+                )
+                decode_budget = state.decode_budgets[decode_idx]
+                decode_client_info = request.app.state.decode_clients[decode_idx]
+                if decode_idx != routed:
+                    if decode_router is not None:
+                        decode_router.rebind(routed, decode_idx)
+                    print(
+                        f"PERF PROXY decode_rebind req_id={request_id} "
+                        f"from={routed} to={decode_idx} ts={time.time():.6f}",
+                        flush=True,
+                    )
+            else:
+                wait_ms = await decode_budget.acquire(decode_tokens)
             decode_held = True
             _PROXY_LATENCY.record("decode_admit", wait_ms)
             print(

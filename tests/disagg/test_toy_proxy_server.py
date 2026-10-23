@@ -93,3 +93,71 @@ def test_replace_prompt_with_rendered_token_ids_rejects_bad_response() -> None:
         assert "token_ids" in str(exc)
     else:
         raise AssertionError("malformed render response should fail")
+
+
+def _decode_budgets(n: int, cap: int):
+    import asyncio
+
+    cond = asyncio.Condition()
+    return [
+        _toy_proxy_server._AdmissionBudget(f"decode[{i}]", cap, 0, cond)
+        for i in range(n)
+    ]
+
+
+def test_acquire_any_budget_prefers_the_routed_decode_while_it_has_room() -> None:
+    import asyncio
+
+    async def run():
+        budgets = _decode_budgets(2, 1)
+        idx, _ = await _toy_proxy_server._acquire_any_budget(budgets, 1, 100)
+        assert idx == 1 and [b.count for b in budgets] == [0, 1]
+
+    asyncio.run(run())
+
+
+def test_acquire_any_budget_takes_the_decode_that_frees_first() -> None:
+    import asyncio
+
+    async def run():
+        budgets = _decode_budgets(2, 1)
+        # Both decodes busy; the request was routed to decode 0 at arrival.
+        for budget in budgets:
+            await budget.acquire(100)
+        waiter = asyncio.create_task(
+            _toy_proxy_server._acquire_any_budget(budgets, 0, 100)
+        )
+        await asyncio.sleep(0)
+        assert not waiter.done() and budgets[0].waiting == 1
+        await budgets[1].release(100)
+        idx, _ = await asyncio.wait_for(waiter, timeout=1)
+        assert idx == 1 and [b.count for b in budgets] == [1, 1]
+        assert budgets[0].waiting == 0
+
+    asyncio.run(run())
+
+
+def test_acquire_any_budget_picks_the_least_loaded_decode_with_room() -> None:
+    import asyncio
+
+    async def run():
+        budgets = _decode_budgets(3, 2)
+        await budgets[0].acquire(100)
+        await budgets[0].acquire(100)
+        await budgets[1].acquire(100)
+        idx, _ = await _toy_proxy_server._acquire_any_budget(budgets, 0, 100)
+        assert idx == 2
+
+    asyncio.run(run())
+
+
+def test_router_rebind_moves_inflight_to_the_admitted_decode() -> None:
+    router = _toy_proxy_server._PrefixAffinityRouter(n=2, load_metric="running")
+    rank, _ = router.route([b"a", b"b"])
+    other = 1 - rank
+    router.rebind(rank, other)
+    assert router.inflight[rank] == 0 and router.inflight[other] == 1
+    assert router.stats()["rebound"] == 1
+    router.start_running(other)
+    router.done(other, was_running=True)
+    assert router.inflight == [0, 0] and router.running == [0, 0]
