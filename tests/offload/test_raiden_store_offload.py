@@ -3401,6 +3401,10 @@ class TestLazyOffload(unittest.TestCase):
         sched._current_batch_load_jobs = {}
         sched._chunks_being_loaded = set()
         sched._sliding_window_groups = ()
+        # The lookup state upstream's __init__ derives from the config.
+        sched._lookup_groups = (0,)
+        sched._mamba_align_size = None
+        sched._partial_tail_block_size = 0
         sched._connector_stats = MagicMock()
         sched._events_tracker = MagicMock()
         sched._lazy = _LazyOffload(
@@ -3564,6 +3568,84 @@ class TestLazyOffload(unittest.TestCase):
         # The eviction path still admits the key.
         out = self.manager.prepare_evicting_store([_key(0)])
         self.assertEqual(out.keys_to_store, [_key(0)])
+
+    def _waiting_request(self, sched, num_chunks):
+        """A request of `num_chunks` chunks whose keys all sit in the tier, as
+        the scheduler's lookup sees it; returns it and its chunk keys."""
+        from vllm.distributed.kv_transfer.kv_connector.v1.offloading.scheduler import (  # noqa: E501
+            RequestOffloadState,
+        )
+        from vllm.v1.kv_offload.base import RequestOffloadingContext
+
+        hashes = [b"q%03d" % i for i in range(num_chunks)]
+        num_tokens = num_chunks * self.TPC + 1
+        req = SimpleNamespace(
+            request_id="q",
+            block_hashes=hashes,
+            kv_transfer_params=None,
+            num_tokens=num_tokens,
+            num_prompt_tokens=num_tokens,
+            skip_reading_prefix_cache=False,
+        )
+        sched._req_status["q"] = RequestOffloadState(
+            config=sched.config,
+            req=req,
+            req_context=_ctx("q"),
+            offloading_context=RequestOffloadingContext(),
+        )
+        keys = [self._okey(h) for h in hashes]
+        for key in keys:
+            seed_host_entries(self.store, key)
+        self.store.calls.clear()
+        return req, keys
+
+    def _refreshed(self):
+        """The keys refreshed so far: a touch pins each resident key's
+        sub-hashes and releases them, which moves them to the MRU end."""
+        return [list(call.args[0]) for call in self.store.calls_named("release")]
+
+    def test_lookup_refreshes_only_chunks_past_the_hbm_hit(self):
+        sched = self._make()
+        req, keys = self._waiting_request(sched, 4)
+
+        # HBM serves the first two chunks; the tier serves the other two.
+        hit, load_async = sched.get_num_new_matched_tokens(req, 2 * self.TPC)
+
+        self.assertEqual((hit, load_async), (2 * self.TPC, True))
+        # Only the tier-served chunks move, tail first (touch's order), and
+        # nothing stays pinned.
+        self.assertEqual(self._refreshed(), [sub_hashes(keys[3]), sub_hashes(keys[2])])
+        self.assertEqual(self.store.pinned_hashes(), {})
+
+    def test_lookup_after_a_full_hbm_hit_refreshes_nothing(self):
+        sched = self._make()
+        req, _ = self._waiting_request(sched, 4)
+
+        hit, load_async = sched.get_num_new_matched_tokens(req, 4 * self.TPC)
+
+        self.assertEqual((hit, load_async), (0, False))
+        self.assertEqual(self._refreshed(), [])
+
+    def test_lookup_without_an_hbm_hit_refreshes_every_chunk(self):
+        sched = self._make()
+        req, keys = self._waiting_request(sched, 4)
+
+        hit, _ = sched.get_num_new_matched_tokens(req, 0)
+
+        self.assertEqual(hit, 4 * self.TPC)
+        self.assertEqual(self._refreshed(), [sub_hashes(key) for key in reversed(keys)])
+
+    def test_eager_lookup_still_refreshes_every_chunk(self):
+        # Without lazy offload the tier mirrors HBM: the stock touch keeps the
+        # whole request warm, the prefix HBM serves included.
+        sched = self._make()
+        sched._lazy = None
+        req, keys = self._waiting_request(sched, 4)
+
+        hit, _ = sched.get_num_new_matched_tokens(req, 2 * self.TPC)
+
+        self.assertEqual(hit, 2 * self.TPC)
+        self.assertEqual(self._refreshed(), [sub_hashes(key) for key in reversed(keys)])
 
     def test_store_lifecycle_without_a_request(self):
         sched = self._make()
