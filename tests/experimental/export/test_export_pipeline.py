@@ -1019,6 +1019,67 @@ def test_compute_logits_returns_the_vocabulary_without_padding() -> None:
     assert torch.equal(logits, torch.matmul(hidden, lm_head.T)[:, :10])
 
 
+class _LlamaLikeBackbone(nn.Module):
+    """Backbone whose `forward` takes `intermediate_tensors` with no default."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.embed_tokens = nn.Embedding(8, 4)
+
+    def forward(
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        intermediate_tensors: Any,
+        inputs_embeds: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        assert intermediate_tensors is None
+        return self.embed_tokens(input_ids)
+
+
+class _KvCacheArgBackbone(_LlamaLikeBackbone):
+    """Backbone that takes the KV caches and fails inside its forward."""
+
+    def forward(  # type: ignore[override]
+        self,
+        input_ids: torch.Tensor,
+        positions: torch.Tensor,
+        kv_caches: Sequence[torch.Tensor] | None = None,
+        attn_metadata: Any = None,
+    ) -> torch.Tensor:
+        if kv_caches is not None:
+            raise TypeError("bug inside the model")
+        return self.embed_tokens(input_ids)
+
+
+def _run_backbone_forward(backbone: nn.Module) -> tuple[Sequence[Any], Any]:
+    cfg = api.TextOnlyLLMExportConfig(model_name="tiny", num_layers=0)
+    adapter = _adapter_without_model(cfg)
+    adapter._model = nn.Module()
+    adapter._model.model = backbone
+    weight = torch.arange(32.0).reshape(8, 4)
+    return adapter.forward(
+        {"model.embed_tokens.weight": weight},
+        [],
+        input_ids=torch.tensor([1, 2, 3]),
+        positions=torch.tensor([0, 1, 2]),
+        kv_lens=torch.tensor([3]),
+        block_tables=torch.zeros(1, 1, dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 3]),
+        req_dist=torch.tensor([0, 0, 1]),
+    )
+
+
+def test_forward_passes_intermediate_tensors_to_the_backbone() -> None:
+    _, hidden = _run_backbone_forward(_LlamaLikeBackbone())
+    assert torch.equal(hidden, torch.arange(32.0).reshape(8, 4)[[1, 2, 3]])
+
+
+def test_forward_propagates_type_errors_raised_inside_the_backbone() -> None:
+    with pytest.raises(TypeError, match="bug inside the model"):
+        _run_backbone_forward(_KvCacheArgBackbone())
+
+
 def _pallas_impl(kv_dtype: torch.dtype | None) -> Any:
     from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
 
