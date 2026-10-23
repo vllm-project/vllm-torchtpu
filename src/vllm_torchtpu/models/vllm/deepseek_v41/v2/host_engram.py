@@ -15,6 +15,7 @@ editing the shared runner: ``forward_model`` calls
 
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import partial
 from typing import Any
 
 import numpy as np
@@ -50,10 +51,73 @@ class HostEngramInputs:
     lookback_token_ids: torch.Tensor
     all_prompt: bool
     host_ready: bool | None = None
+    next_prompt: Callable[["HostEngramInputs"], "HostEngramInputs | None"] | None = None
 
     @property
     def can_hash_on_host(self) -> bool:
         return self.all_prompt if self.host_ready is None else self.host_ready
+
+    def snapshot(
+        self, tokens: int, requests: int, query_starts: int
+    ) -> "HostEngramInputs":
+        return HostEngramInputs(
+            self.input_ids[:tokens].clone(),
+            self.positions[:tokens].clone(),
+            self.query_start_loc[:query_starts].clone(),
+            self.lookback_token_ids[:requests].clone(),
+            self.all_prompt,
+            self.host_ready,
+            self.next_prompt,
+        )
+
+    def matches(self, other: "HostEngramInputs") -> bool:
+        return (
+            self.all_prompt
+            and other.all_prompt
+            and all(
+                torch.equal(left, right)
+                for left, right in (
+                    (self.input_ids, other.input_ids),
+                    (self.positions, other.positions),
+                    (self.query_start_loc, other.query_start_loc),
+                    (self.lookback_token_ids, other.lookback_token_ids),
+                )
+            )
+        )
+
+
+def next_prompt_inputs(runner, num_reqs: int, current: HostEngramInputs):
+    """Predict a same-size prompt chunk; never advance the scheduler.
+
+    Adapted from vllm-project/vllm-torchtpu PR #2256, v2/host_engram.py.
+    """
+    if not current.all_prompt or num_reqs == 0:
+        return None
+    candidate = current.snapshot(
+        current.input_ids.numel(),
+        current.lookback_token_ids.shape[0],
+        current.query_start_loc.numel(),
+    )
+    depth = current.lookback_token_ids.shape[1]
+    for row in range(num_reqs):
+        begin, end = (int(value) for value in current.query_start_loc[row : row + 2])
+        count = end - begin
+        if count <= 0:
+            return None
+        start = int(current.positions[begin]) + count
+        stop = start + count
+        if stop > int(runner.input_batch.num_prompt_tokens[row]):
+            return None
+        prompt = torch.as_tensor(runner.input_batch.token_ids_cpu[row])
+        candidate.input_ids[begin:end].copy_(prompt[start:stop])
+        candidate.positions[begin:end] = torch.arange(
+            start, stop, dtype=current.positions.dtype
+        )
+        past = start - torch.arange(1, depth + 1)
+        candidate.lookback_token_ids[row] = torch.where(
+            past >= 0, prompt[past.clamp(min=0)], -1
+        )
+    return candidate
 
 
 def _async_source_tokens_cpu(pre_async: Any) -> torch.Tensor | None:
@@ -125,6 +189,7 @@ def capture_host_engram_inputs(runner, num_reqs: int) -> HostEngramInputs | None
             lookback_token_ids=runner.lookback_token_ids.cpu,
             all_prompt=True,
             host_ready=True,
+            next_prompt=partial(next_prompt_inputs, runner, chunk_num_reqs),
         )
 
     pre_async = getattr(runner, "_pre_async_results", None)

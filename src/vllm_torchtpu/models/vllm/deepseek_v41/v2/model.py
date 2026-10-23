@@ -2,12 +2,13 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Upstream V4.1 model assembly with TPU device operations."""
 
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from functools import partial
 from itertools import islice
-from typing import cast
+from typing import TYPE_CHECKING, cast
 
 import torch
+from torch.utils._pytree import tree_leaves
 from vllm.compilation.backends import set_model_tag
 from vllm.compilation.decorators import support_torch_compile
 from vllm.forward_context import override_forward_context
@@ -29,7 +30,12 @@ from ..common.mhc import (
     pre,
     shifted_post_pre,
 )
-from ..config import DeepseekV41Config, ExecutionMode, engram_cpu_offload
+from ..config import (
+    DeepseekV41Config,
+    EngramTransfer,
+    ExecutionMode,
+    engram_cpu_offload,
+)
 from .attention import (
     DeepseekV41Attention,
     _block_table,
@@ -46,12 +52,23 @@ from .ced import (
 from .engram import Engram, NgramHashState
 from .host_engram import (
     HOST_ENGRAM_KEY,
+    HostEngramInputs,
     gather_host_engram_hashes,
     install_host_engram_inputs,
 )
 from .ops import bind_device_ops, compact_rope_caches, device_hooks
 
 logger = init_logger(__name__)
+
+if TYPE_CHECKING:
+    from ..common.host_transfer import EngramHashDownload, PreparedEngramUpload
+
+
+@dataclass
+class _EngramPrefetch:
+    inputs: HostEngramInputs
+    hashes: torch.Tensor
+    uploads: dict[int, "PreparedEngramUpload"]
 
 
 def _ced_config(
@@ -309,6 +326,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
     _engram_split_layer: int | None = None
     _engram_first_split_layer: int | None = None
     _gathered_engram_hashes: torch.Tensor | None = None
+    _raw_dma_enabled = False
+    _engram_prefetch: _EngramPrefetch | None = None
+    _current_host_inputs: HostEngramInputs | None = None
+    _prefetched_uploads: dict[int, "PreparedEngramUpload"] | None = None
+    _hash_download: "EngramHashDownload | None" = None
 
     def _has_cpu_offloaded_engram(self) -> bool:
         for layer in islice(self.layers, self.start_layer, self.end_layer):
@@ -336,6 +358,12 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
         host = upstream.get_forward_context().additional_kwargs.get(HOST_ENGRAM_KEY)
         if host is None or not host.can_hash_on_host:
             return None
+        if self._raw_dma_enabled and host.all_prompt:
+            self._current_host_inputs = host.snapshot(
+                input_ids.shape[0],
+                lookback_token_ids.shape[0],
+                swa_metadata.query_start_loc.shape[0],
+            )
         ids = host.input_ids[: input_ids.shape[0]]
         lookback = host.lookback_token_ids[: lookback_token_ids.shape[0]]
         return (
@@ -396,7 +424,19 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                     input_ids, swa_metadata, lookback_token_ids
                 )
                 if host is not None:
-                    engram_hashes = self.engram_hash.hash_on_host(*host)
+                    prefetched = self._engram_prefetch
+                    self._engram_prefetch = None
+                    current = self._current_host_inputs
+                    if (
+                        prefetched is not None
+                        and current is not None
+                        and prefetched.inputs.matches(current)
+                    ):
+                        engram_hashes = prefetched.hashes
+                        self._prefetched_uploads = prefetched.uploads
+                        logger.info_once("[DSV41] Engram next-prompt prefetch matched")
+                    else:
+                        engram_hashes = self.engram_hash.hash_on_host(*host)
                     engram_mask = ~upstream.image_sentinel_mask(host[0])
                 else:
                     image_mask = upstream.image_sentinel_mask(input_ids)
@@ -425,7 +465,11 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                 if self._has_cpu_offloaded_engram():
                     # Idle/decode replicas may hash on device while a prefill
                     # replica hashes on host. All must use the CPU collective.
-                    engram_hashes = engram_hashes.to("cpu")
+                    engram_hashes = (
+                        self._hash_download.copy_to_host(engram_hashes)
+                        if self._hash_download is not None
+                        else engram_hashes.to("cpu")
+                    )
                 gathered_hashes = gather_host_engram_hashes(
                     engram_hashes,
                     dp_shared_memory=self.engram_dp_shared_memory,
@@ -457,11 +501,117 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             for layer in islice(self.layers, start_layer, end_layer):
                 engram = getattr(layer, "engram", None)
                 if engram is not None:
-                    engram.prepare_embeddings(
-                        gathered_hashes[:, engram.layer_hash_index]
-                    )
+                    if (
+                        isinstance(engram, Engram)
+                        and engram._prepared_uploads is not None
+                        and engram.embed_tokens.dp_size == 1
+                    ):
+                        upload = (
+                            self._prefetched_uploads.pop(engram.layer_hash_index, None)
+                            if self._prefetched_uploads is not None
+                            else None
+                        )
+                        if upload is None:
+                            upload = engram.start_prepared_embeddings(
+                                gathered_hashes[:, engram.layer_hash_index]
+                            )
+                        engram.activate_prepared_embeddings(
+                            gathered_hashes.shape[0], upload
+                        )
+                    else:
+                        engram.prepare_embeddings(
+                            gathered_hashes[:, engram.layer_hash_index]
+                        )
 
     def forward(
+        self,
+        input_ids,
+        positions,
+        intermediate_tensors=None,
+        inputs_embeds=None,
+        lookback_token_ids=None,
+    ):
+        if not self._raw_dma_enabled:
+            return self._forward_impl(
+                input_ids,
+                positions,
+                intermediate_tensors,
+                inputs_embeds,
+                lookback_token_ids,
+            )
+        self._current_host_inputs = None
+        self._prefetched_uploads = None
+        output = self._forward_impl(
+            input_ids,
+            positions,
+            intermediate_tensors,
+            inputs_embeds,
+            lookback_token_ids,
+        )
+        self._record_engram_consumers(self.start_layer, self.end_layer, output)
+        self._prefetch_next_prompt()
+        return output
+
+    def _record_engram_consumers(self, start: int, end: int, output) -> None:
+        if not self._raw_dma_enabled:
+            return
+        uploads = [
+            layer.engram._active_upload
+            for layer in islice(self.layers, start, end)
+            if isinstance(layer.engram, Engram)
+            and layer.engram._active_upload is not None
+            and layer.engram._active_upload.needs_consumer
+        ]
+        if not uploads:
+            return
+        if isinstance(output, upstream.IntermediateTensors):
+            output = output.tensors
+        tensors = [
+            value for value in tree_leaves(output) if isinstance(value, torch.Tensor)
+        ]
+        synchronize_tensors(tensors, wait=False)
+        for upload in uploads:
+            upload.record_consumers(tensors)
+
+    def _prefetch_next_prompt(self) -> None:
+        current = self._current_host_inputs
+        self._engram_prefetch = None
+        if current is None or not current.all_prompt or current.next_prompt is None:
+            return
+        end = self._ced_boundary if self._ced_enabled else self.end_layer
+        engrams = [
+            layer.engram
+            for layer in islice(self.layers, self.start_layer, end)
+            if isinstance(layer.engram, Engram)
+            and layer.engram.embed_tokens.host_offload
+        ]
+        # Predicting work must never introduce an unmatched DP collective.
+        if not engrams or any(
+            engram._prepared_uploads is None or engram.embed_tokens.dp_size != 1
+            for engram in engrams
+        ):
+            return
+        following = current.next_prompt(current)
+        if following is None:
+            return
+        assert self.engram_hash is not None
+        hashes = self.engram_hash.hash_on_host(
+            following.input_ids,
+            following.positions,
+            following.query_start_loc,
+            upstream.image_sentinel_mask(following.input_ids),
+            following.lookback_token_ids,
+            upstream.image_sentinel_mask(following.lookback_token_ids),
+        )
+        uploads = {
+            engram.layer_hash_index: engram.start_prepared_embeddings(
+                hashes[:, engram.layer_hash_index]
+            )
+            for engram in engrams
+        }
+        self._engram_prefetch = _EngramPrefetch(following, hashes, uploads)
+
+    def _forward_impl(
         self,
         input_ids,
         positions,
@@ -545,6 +695,7 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
                         inputs_embeds,
                         lookback_token_ids,
                     )
+            self._record_engram_consumers(self.start_layer, self._ced_boundary, encoded)
         finally:
             self._engram_prepared_outside_stage = False
             self._gathered_engram_hashes = None
@@ -712,14 +863,16 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             lookback_token_ids,
         )
         synchronize_tensors(carry, wait=False)
+        self._record_engram_consumers(self.start_layer, first_split, carry)
         self._stage_engram_layers(first_split, split, self._gathered_engram_hashes)
         carry = self.encoder_middle_stage(input_ids, positions, *carry)
         synchronize_tensors(carry, wait=False)
+        self._record_engram_consumers(first_split, split, carry)
         hidden, residual, post_mix, res_mix, pre_mix = carry
         self._stage_engram_layers(
             split, self._ced_boundary, self._gathered_engram_hashes
         )
-        return self.encoder_tail_stage(
+        output = self.encoder_tail_stage(
             input_ids,
             positions,
             hidden,
@@ -728,6 +881,8 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
             res_mix,
             pre_mix,
         )
+        self._record_engram_consumers(split, self._ced_boundary, output)
+        return output
 
     def _select_engram_first_split_layer(self) -> int | None:
         """Split before the first host Engram when an earlier layer can run."""
@@ -979,6 +1134,14 @@ class DeepseekV41Model(upstream.DeepseekV4Model):
 
     def __init__(self, *, vllm_config, prefix=""):
         self.prefix = prefix
+        self._raw_dma_enabled = (
+            DeepseekV41Config.from_vllm_config(vllm_config).engram_transfer
+            == EngramTransfer.RAW_DMA
+        )
+        if self._raw_dma_enabled:
+            from ..common.host_transfer import EngramHashDownload
+
+            self._hash_download = EngramHashDownload()
         initialize_cache_ops()
         initialize_delayed_mhc()
         initialize_shifted_mhc()

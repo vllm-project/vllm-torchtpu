@@ -26,19 +26,28 @@ class MoEBackend(StrEnum):
     FUSED_EP_W4A8 = "fused_ep_w4a8"
 
 
+class EngramTransfer(StrEnum):
+    """Experimental DMA backend; remove the selector after matched TPU validation."""
+
+    COPY = "copy"
+    RAW_DMA = "raw_dma"
+
+
 @dataclass(frozen=True)
 class DeepseekV41Config:
     execution: ExecutionMode = ExecutionMode.FULL
     moe: MoEBackend = MoEBackend.GMM
+    engram_transfer: EngramTransfer = EngramTransfer.COPY
 
     @classmethod
     def parse(cls, value: dict) -> "DeepseekV41Config":
-        unknown = value.keys() - {"execution", "moe"}
+        unknown = value.keys() - {"execution", "moe", "engram_transfer"}
         if unknown:
             raise ValueError(f"Unknown deepseek_v41 config fields: {sorted(unknown)}")
         return cls(
             execution=ExecutionMode(value.get("execution", "full")),
             moe=MoEBackend(value.get("moe", "gmm")),
+            engram_transfer=EngramTransfer(value.get("engram_transfer", "copy")),
         )
 
     @classmethod
@@ -154,6 +163,11 @@ def verify_and_update_config(config: "VllmConfig") -> None:
             "deprecated; use --engram-config instead"
         )
     parallel = config.parallel_config
+    if (
+        policy.engram_transfer == EngramTransfer.RAW_DMA
+        and not config.engram_config.cpu_offload
+    ):
+        raise ValueError("raw_dma requires --engram-config cpu_offload=true")
     if envs.TPU_DEEPSEEK_V41_IMPL != "v2":
         raise ValueError("DSV41 serving uses v2; remove TPU_DEEPSEEK_V41_IMPL")
     if config.kernel_config.moe_backend != "auto":

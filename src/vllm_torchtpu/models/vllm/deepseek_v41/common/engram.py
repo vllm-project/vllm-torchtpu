@@ -9,6 +9,7 @@ import mmap
 import tempfile
 from contextlib import ExitStack
 from types import SimpleNamespace
+from typing import TYPE_CHECKING, cast
 
 import numpy as np
 import torch
@@ -20,11 +21,17 @@ from vllm_torchtpu.layers.adapter.upstream_bindings import (
     bind_device_ops,
     device_hooks,
 )
+from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.model_loader_patches import register_row_slice
 
-from ..config import engram_cpu_offload
+from ..config import DeepseekV41Config, EngramTransfer, engram_cpu_offload
 from .host_exchange import start_exchange_rows
 from .host_gather import gather_weight_scale
+
+if TYPE_CHECKING:
+    from .host_transfer import PreparedEngramUpload
+
+logger = init_logger(__name__)
 
 
 class NgramHashState(upstream.NgramHashState):
@@ -616,6 +623,8 @@ class Engram(upstream.Engram):
         self._active_raw: torch.Tensor | None = None
         self._staged_by_tokens: dict[int, torch.Tensor] = {}
         self._staged_views_by_tokens: dict[int, torch.Tensor] = {}
+        self._prepared_uploads: dict[int, list[PreparedEngramUpload]] | None = None
+        self._active_upload: PreparedEngramUpload | None = None
         if getattr(self.embed_tokens, "host_offload", False):
             # Host DRAM tables: the host only gathers raw FP8 bytes and scale
             # bytes (a memcpy-bound index_select); dequantization runs inside
@@ -653,6 +662,66 @@ class Engram(upstream.Engram):
             self._staged_raw[max_tokens * raw_words_per_tok :].fill_(-1)
             self._staged_by_tokens[max_tokens] = self._staged_raw
             self._active_raw = self._staged_views(max_tokens)
+            config = get_current_vllm_config_or_none()
+            if config is not None and (
+                DeepseekV41Config.from_vllm_config(config).engram_transfer
+                == EngramTransfer.RAW_DMA
+            ):
+                self._prepared_uploads = {}
+
+    def _reserve_upload(self, num_tokens: int) -> "PreparedEngramUpload":
+        from .host_transfer import PreparedEngramUpload
+
+        uploads = cast(dict[int, list[PreparedEngramUpload]], self._prepared_uploads)
+        for tokens, slots in uploads.items():
+            if tokens != num_tokens:
+                for slot in slots:
+                    slot.release_consumers()
+        slots = uploads.get(num_tokens)
+        if slots is None:
+            cols, dim = self._host_raw.shape[1:]
+            blocks = dim // self.embed_tokens.block_size
+            words = num_tokens * (cols * dim // 4 + -(-(cols * blocks) // 4))
+            device = cast(torch.Tensor, self._staged_raw).device
+            slots = [PreparedEngramUpload(words, device) for _ in range(2)]
+            uploads[num_tokens] = slots
+            logger.info(
+                "[DSV41] raw_dma Engram: layer=%d tokens=%d slots=2 bytes=%d",
+                self.layer_hash_index,
+                num_tokens,
+                slots[0].host_buffer.size_bytes,
+            )
+        return next(slot for slot in slots if slot is not self._active_upload)
+
+    def start_prepared_embeddings(
+        self, hash_ids: torch.Tensor
+    ) -> "PreparedEngramUpload":
+        num_tokens = hash_ids.shape[0]
+        if num_tokens > self._host_raw.shape[0]:
+            raise ValueError("Engram hashes exceed the configured staging capacity")
+        upload = self._reserve_upload(num_tokens)
+        packed = upload.acquire().view(torch.uint8)
+        cols, dim = self._host_raw.shape[1:]
+        blocks = dim // self.embed_tokens.block_size
+        raw_bytes = num_tokens * cols * dim
+        scale_bytes = num_tokens * cols * blocks
+        raw = packed[:raw_bytes].view(num_tokens, cols, dim)
+        scales = packed[raw_bytes : raw_bytes + scale_bytes].view(
+            num_tokens, cols, blocks
+        )
+        packed[raw_bytes + scale_bytes :].fill_(_INVALID_SCALE)
+        self.embed_tokens.gather_raw(hash_ids, raw, scales)
+        upload.start()
+        return upload
+
+    def activate_prepared_embeddings(
+        self, num_tokens: int, upload: "PreparedEngramUpload"
+    ) -> None:
+        upload.activate()
+        self._active_upload = upload
+        self._staged_by_tokens[num_tokens] = upload.device
+        self._staged_views_by_tokens.pop(num_tokens, None)
+        self._active_raw = self._staged_views(num_tokens)
 
     def _staged_tensors(self, num_tokens: int) -> torch.Tensor:
         assert self._staged_raw is not None
@@ -755,7 +824,6 @@ class Engram(upstream.Engram):
         scale_words_per_tok = -(-(cols * blocks) // 4)
         raw_bytes = num_tokens * cols * head_dim
         scale_bytes = num_tokens * cols * blocks
-        assert self._active_raw is not None
         by_word = self._active_raw.view(
             raw_words_per_tok + scale_words_per_tok, num_tokens
         )
