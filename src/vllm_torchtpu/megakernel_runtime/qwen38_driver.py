@@ -50,12 +50,18 @@ from .qwen38_weights import pack_segment_operands, segment_layers
 logger = init_logger(__name__)
 
 T_VERIFY = 4
-DEFAULT_BUCKETS = (4, 8, 16, 32)
+DEFAULT_BUCKETS = (4, 8, 16, 32, 64)
 
 
-def segment_tiles(B: int) -> Tiles:
-    """Expert ring on the software-pipelined EP path (e13 in 2 tiles, e2 in 1)."""
-    return Tiles(ebank=2 << 20, nbe=12 if B <= 16 else 6, nbd=10, vmem_mib=62).with_blocks(
+def segment_tiles(B: int, hier: int | None = None) -> Tiles:
+    """Expert ring on the software-pipelined EP path (e13 in 2 tiles, e2 in 1).
+
+    Ring depths shrink with the bucket so the 64-row scratch fits VMEM; the
+    bank sizes (hence every weight's tiling) are the same for all buckets.
+    """
+    nbe, nbd = (12, 10) if B <= 16 else ((6, 10) if B <= 32 else (3, 6))
+    h = (1 if B > 32 else 0) if hier is None else hier
+    return Tiles(ebank=2 << 20, nbe=nbe, nbd=nbd, vmem_mib=62, hier=h).with_blocks(
         {"moe": {"pipe_ep": True, "moe_unroll": True}}
     )
 
@@ -226,18 +232,25 @@ class Qwen38Segments(nn.Module):
     def _gdn_blocks(self, s: int, NS: int) -> tuple[torch.Tensor, ...]:
         from vllm.forward_context import get_forward_context
 
+        def fit(t: torch.Tensor, n: int) -> torch.Tensor:
+            """First `n` rows of `t`, zero-padded when the runner's array is shorter."""
+            t = t[:n]
+            if t.shape[0] < n:
+                t = F.pad(t, (0, 0) * (t.dim() - 1) + (0, n - t.shape[0]))
+            return t
+
         md_all = get_forward_context().attn_metadata
         rbs, wbs, his = [], [], []
         for i in segment_layers(self.g, s)[1:]:
             la = self.layers[i].linear_attn
             md = md_all[la.prefix]
-            st = la._bm_state_ids(md.mamba_state_indices.to(torch.int32))[:NS]
-            ck = md.mamba_ckpt_indices.to(torch.int32)[:NS, :T_VERIFY]
+            st = fit(la._bm_state_ids(md.mamba_state_indices.to(torch.int32)), NS)
+            ck = fit(md.mamba_ckpt_indices.to(torch.int32)[:, :T_VERIFY], NS)
             off = md.mamba_slot_read_offsets.to(torch.int64)[st.to(torch.int64)]
-            qsl = md.query_start_loc.to(torch.int32)
-            q_len = (qsl[1 : NS + 1] - qsl[:NS])[:NS]
+            qsl = fit(md.query_start_loc.to(torch.int32), NS + 1)
+            q_len = qsl[1:] - qsl[:-1]
             live = q_len > 0
-            hi = live & ((md.seq_lens.to(torch.int32)[:NS] - q_len) > 0)
+            hi = live & ((fit(md.seq_lens.to(torch.int32), NS) - q_len) > 0)
             rb = torch.gather(ck, 1, off[:, None]).squeeze(1)
             rbs.append(torch.where(live, rb, 0))
             write = live[:, None] if self.write_ckpts else torch.zeros_like(live)[:, None]
