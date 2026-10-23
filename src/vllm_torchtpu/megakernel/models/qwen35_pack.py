@@ -24,6 +24,7 @@ from jax.sharding import PartitionSpec as P
 
 from .. import kernel, planner
 from ..blocks.gdn import GDNBlock
+from ..blocks.moe.reference import random_nvfp4_weight
 from ..exec_spec import ExecSpec
 from ..ops import BF16, F32, FP8, I32, rup
 from ..pool.config import POOL_STATE_NAME, cache_exec, resolved_max_pages_per_seq
@@ -48,7 +49,7 @@ def random_logical_inputs(
     vh, KD, VD = lay_gdn.vh, lay_gdn.KD, lay_gdn.VD
     qkv, z, nli = lay_gdn.QKV, lay_gdn.Z, lay_gdn.NLI
     natt, ngdn = g.NATT, g.NGDN
-    it = iter(jax.random.split(key, 36))
+    it = iter(jax.random.split(key, 50))
     base_pos = jnp.arange(1, NS + 1, dtype=I32) * min(16, ctx // 4)
     pos = (
         base_pos
@@ -80,10 +81,13 @@ def random_logical_inputs(
         (jax.random.normal(next(it), (L, H), dtype=F32) * 0.1)[None, :, :], (R, L, H)
     )
 
-    e13 = rfp8((R, L, ew, H, 2 * ir))
-    e13_s = rscale((R, L, ew, 2 * ir))
-    e2 = rfp8((R, L, ew, ir, H))
-    e2_s = rscale((R, L, ew, H))
+    def rexp(k_dim: int, n_dim: int) -> jax.Array:
+        if g.expert_quant == "nvfp4":
+            return random_nvfp4_weight(next(it), (R, L, ew), k_dim, n_dim)
+        return rfp8((R, L, ew, k_dim, n_dim))
+
+    e13, e13_s = rexp(H, 2 * ir), rscale((R, L, ew, 2 * ir))
+    e2, e2_s = rexp(ir, H), rscale((R, L, ew, H))
 
     logical_weights: dict[str, Any] = {
         "in_norm": jax.random.normal(next(it), (L, H), dtype=F32) * 0.05,

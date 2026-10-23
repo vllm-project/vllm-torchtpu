@@ -440,6 +440,89 @@ def test_qwen38_decode_with_32_ranks():
     assert out.returncode == 0, out.stdout[-2000:] + out.stderr[-4000:]
 
 
+def test_moe_block_with_nvfp4_routed_experts_in_process():
+    """Verify MoEBlock expert_quant='nvfp4' numerical dequantization and step parity."""
+    from dataclasses import replace as dc_replace
+
+    from vllm_torchtpu.megakernel.blocks.moe import MoEBlock
+    from vllm_torchtpu.megakernel.blocks.moe.experts import unpack_nvfp4_tile
+    from vllm_torchtpu.megakernel.blocks.moe.reference import dequant_nvfp4_weight
+
+    mb_default = MoEBlock(prefix="mlp")
+    mb_bound = MoEBlock.bind(prefix="mlp")
+    assert mb_default.options == mb_bound.options
+    mb_nv = MoEBlock(prefix="mlp", expert_quant="nvfp4")
+    assert mb_nv.options["expert_quant"] == "nvfp4"
+    g_from_hf = qwen38.Qwen38.derive_geometry(
+        {**QWEN38_FULL_HF_CONFIG, "quantization_config": {"quant_algo": "NVFP4"}}
+    )
+    assert g_from_hf.expert_quant == "nvfp4"
+    with pytest.raises(ValueError, match="unpack_nvfp4_tile requires"):
+        unpack_nvfp4_tile(jnp.zeros((4, 256), dtype=jnp.uint8), 128)
+
+    g_base = dc_replace(_tiny_qwen38_geometry(), I=256)  # e2 tile K = I // 2 >= 128
+    ex8 = ExecSpec(
+        B=2,
+        T=1,
+        R=8,
+        ctx=CTX,
+        tiles=dc_replace(TINY_TILES, bank=256 << 10, hier=0, mb8=1, inplace=False),
+        interpret=True,
+    )
+    g_nv = dc_replace(g_base, expert_quant="nvfp4")
+    _, hid_l, w_l, st_l = qwen35.random_logical_inputs(
+        jax.random.PRNGKey(91), g_nv, ex8
+    )
+    assert w_l["e13"].dtype == jnp.uint8
+    n_log = 2 * g_nv.IR(ex8.R)
+    w_tile = w_l["e13"][0, 0, 0]
+    unp_got = unpack_nvfp4_tile(w_tile, n_log, interpret=True).astype(F32)
+    deq_ref = dequant_nvfp4_weight(w_tile, n_log)
+    w_bad = w_tile.at[:, n_log:].set(jnp.uint8(0))
+    deq_bad = dequant_nvfp4_weight(w_bad, n_log)
+    _check(
+        "nvfp4 unpack vs dequant_ref",
+        unp_got,
+        deq_ref,
+        [("zeroed block scale", deq_bad)],
+    )
+
+    w_f32_eq = dict(w_l)
+    w_f32_eq["e13"] = jax.vmap(
+        jax.vmap(jax.vmap(lambda t: dequant_nvfp4_weight(t, n_log)))
+    )(w_l["e13"])
+    w_f32_eq["e2"] = jax.vmap(
+        jax.vmap(jax.vmap(lambda t: dequant_nvfp4_weight(t, g_nv.H)))
+    )(w_l["e2"])
+    pos = POS0 + jnp.arange(ex8.NS, dtype=I32)
+    ref_hid_nv, _ = qwen35.reference_step(g_nv, ex8, pos, hid_l, w_l, st_l)
+    assert ref_hid_nv.shape == (ex8.B, g_nv.H)
+    ref_hid_f32, _ = qwen35.reference_step(g_base, ex8, pos, hid_l, w_f32_eq, st_l)
+    w_bad_s = dict(w_l, e13_s=jnp.zeros_like(w_l["e13_s"]))
+    ref_hid_bad, _ = qwen35.reference_step(g_nv, ex8, pos, hid_l, w_bad_s, st_l)
+    _check(
+        "nvfp4 reference_step vs f32 dequant control",
+        ref_hid_nv,
+        ref_hid_f32,
+        [("zeroed e13_s", ref_hid_bad), ("input hidden", hid_l)],
+    )
+    devs = jax.devices("cpu")
+    if len(devs) >= ex8.R:
+        mesh = Mesh(devs[: ex8.R], ("tp",))
+        pos_mk, hid_mk, w_mk, st_mk = qwen35.pack_inputs(
+            pos, hid_l, w_l, st_l, g_nv, ex8, mesh=mesh
+        )
+        step_nv, _ = qwen35.make_step(mesh, g_nv, ex8, donate_states=True)
+        out_hid_nv, _ = step_nv(pos_mk, hid_mk, w_mk, st_mk)
+        hid_nv_r = kernel.unfold(out_hid_nv, ex8.R)[:, : ex8.B]
+        _check(
+            "nvfp4 make_step vs reference_step",
+            hid_nv_r[0],
+            ref_hid_nv,
+            [("zeroed e13_s", ref_hid_bad), ("input hidden", hid_l)],
+        )
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "qwen38_r32":
         _step_qwen38_32_ranks_in_process()

@@ -572,28 +572,88 @@ def pack_expert_views_layer(
         "expert weights must be contiguous for zero-copy views",
     )
 
-    if not ex.stack_e:
-        e13_view = w13
-        e2_view = w2
-    else:
-        t13 = g.H // tk_e13
-        t2 = ir // tk_e2
-        e13_view = w13.view(ew, t13, tk_e13, 2 * ir)
-        e2_view = w2.view(ew, t2, tk_e2, g.H)
-    _need(
-        e13_view.data_ptr() == w13.data_ptr() and e2_view.data_ptr() == w2.data_ptr(),
-        "expert views must share storage with w13_weight / w2_weight",
+    is_nvfp4 = (
+        str(g.expert_quant) == "nvfp4"
+        or getattr(experts, "w13_weight_scale_2", None) is not None
     )
+    if is_nvfp4:
 
-    s13_raw = getattr(experts, "w13_weight_scale_inv", None)
-    if s13_raw is None:
-        s13_raw = experts.w13_weight_scale
-    s2_raw = getattr(experts, "w2_weight_scale_inv", None)
-    if s2_raw is None:
-        s2_raw = experts.w2_weight_scale
+        def _pack_nvfp4_w(
+            w_raw: torch.Tensor,
+            bscale_raw: torch.Tensor,
+            k_dim: int,
+            n_dim: int,
+            tk_raw: int,
+        ) -> torch.Tensor:
+            k_half = k_dim // 2
+            n_raw = n_dim + rup(n_dim // 8, 128)
+            w_u8 = w_raw.data.view(torch.uint8)
+            if tuple(w_u8.shape) == (ew, k_half, n_raw):
+                fused = w_u8.contiguous()
+            else:
+                if tuple(w_u8.shape) == (ew, n_dim, k_half):
+                    w_kn = w_u8.transpose(1, 2).contiguous()
+                else:
+                    w_kn = w_u8.reshape(ew, k_half, n_dim).contiguous()
+                bs_u8 = bscale_raw.data.view(torch.uint8)
+                if tuple(bs_u8.shape) == (ew, n_dim, k_dim // 16):
+                    bs_kn = bs_u8.transpose(1, 2).contiguous()
+                else:
+                    bs_kn = bs_u8.reshape(ew, k_dim // 16, n_dim).contiguous()
+                bs_cols = bs_kn.reshape(ew, k_half, n_dim // 8)
+                pad_cols = n_raw - n_dim - (n_dim // 8)
+                parts = [w_kn, bs_cols]
+                if pad_cols > 0:
+                    parts.append(
+                        torch.zeros(
+                            (ew, k_half, pad_cols),
+                            dtype=torch.uint8,
+                            device=w_u8.device,
+                        )
+                    )
+                fused = _own(torch.cat(parts, dim=-1))
+            if not ex.stack_e:
+                return fused
+            return fused.view(ew, k_half // tk_raw, tk_raw, n_raw)
 
-    s13 = s13_raw.data.float().reshape(ew, 2 * ir)
-    s2 = s2_raw.data.float().reshape(ew, g.H)
+        e13_view = _pack_nvfp4_w(w13, experts.w13_weight_scale, g.H, 2 * ir, tk_e13)
+        e2_view = _pack_nvfp4_w(w2, experts.w2_weight_scale, ir, g.H, tk_e2)
+        g13 = getattr(experts, "w13_weight_scale_2", None)
+        g2 = getattr(experts, "w2_weight_scale_2", None)
+        s13 = (
+            g13.data.float().reshape(ew, -1).expand(ew, 2 * ir).contiguous()
+            if g13 is not None
+            else torch.ones((ew, 2 * ir), dtype=torch.float32, device=w13.device)
+        )
+        s2 = (
+            g2.data.float().reshape(ew, -1).expand(ew, g.H).contiguous()
+            if g2 is not None
+            else torch.ones((ew, g.H), dtype=torch.float32, device=w2.device)
+        )
+    else:
+        if not ex.stack_e:
+            e13_view = w13
+            e2_view = w2
+        else:
+            t13 = g.H // tk_e13
+            t2 = ir // tk_e2
+            e13_view = w13.view(ew, t13, tk_e13, 2 * ir)
+            e2_view = w2.view(ew, t2, tk_e2, g.H)
+        _need(
+            e13_view.data_ptr() == w13.data_ptr()
+            and e2_view.data_ptr() == w2.data_ptr(),
+            "expert views must share storage with w13_weight / w2_weight",
+        )
+
+        s13_raw = getattr(experts, "w13_weight_scale_inv", None)
+        if s13_raw is None:
+            s13_raw = experts.w13_weight_scale
+        s2_raw = getattr(experts, "w2_weight_scale_inv", None)
+        if s2_raw is None:
+            s2_raw = experts.w2_weight_scale
+
+        s13 = s13_raw.data.float().reshape(ew, 2 * ir)
+        s2 = s2_raw.data.float().reshape(ew, g.H)
     es_cat = torch.cat([s13, s2], dim=-1).contiguous()
     es_mk = es_cat.unsqueeze(1).contiguous()
     return e13_view, e2_view, es_mk

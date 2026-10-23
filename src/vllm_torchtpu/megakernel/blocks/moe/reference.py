@@ -23,7 +23,56 @@ import jax.numpy as jnp
 from jax import lax
 
 from ...exec_spec import ExecSpec
-from ...ops import BF16, F32, rnd
+from ...ops import BF16, F32, FP8, I32, U8, rnd, rup
+
+
+def dequant_nvfp4_weight(w_u8: jax.Array, n_logical: int) -> jax.Array:
+    """Dequantize a `[K // 2, n_raw] uint8` NVFP4 matrix to `[K, n_logical] f32`."""
+    k_half = w_u8.shape[0]
+    packed = w_u8[:, :n_logical]
+    scale_cols = n_logical // 8
+    bscale_u8 = w_u8[:, n_logical : n_logical + scale_cols]
+    bscale = (
+        lax.bitcast_convert_type(bscale_u8, jnp.float8_e4m3fn)
+        .astype(BF16)
+        .reshape(k_half // 8, n_logical)
+    )
+
+    def _dec(nib):
+        nib_i = nib.astype(I32)
+        sign = jnp.where((nib_i & 8) != 0, jnp.bfloat16(-1.0), jnp.bfloat16(1.0))
+        exp = (nib_i >> 1) & 3
+        mant = (nib_i & 1).astype(BF16) * jnp.bfloat16(0.5)
+        pow2 = jnp.left_shift(jnp.int32(1), jnp.maximum(exp - 1, 0)).astype(BF16)
+        mag = jnp.where(exp == 0, mant, pow2 * (jnp.bfloat16(1.0) + mant))
+        return sign * mag
+
+    lo = _dec(packed & U8(0x0F))
+    hi = _dec((packed >> U8(4)) & U8(0x0F))
+    w_bf16 = jnp.stack([lo, hi], axis=1).reshape(2 * k_half, n_logical)
+    return (w_bf16 * jnp.repeat(bscale, 16, axis=0)).astype(F32)
+
+
+def random_nvfp4_weight(
+    key: jax.Array, lead_shape: tuple[int, ...], k_dim: int, n_dim: int
+) -> jax.Array:
+    """Random `[*lead, K // 2, n_raw] uint8` NVFP4 matrix for `dequant_nvfp4_weight`."""
+    k_half, (k_lo, k_hi, k_s) = k_dim // 2, jax.random.split(key, 3)
+    nib_shape = (*lead_shape, k_half, n_dim)
+    lo = jax.random.randint(k_lo, nib_shape, 0, 8, dtype=U8)
+    hi = jax.random.randint(k_hi, nib_shape, 0, 8, dtype=U8)
+    s_shape = (*lead_shape, k_dim // 16, n_dim)
+    bscale = (jnp.abs(jax.random.normal(k_s, s_shape, dtype=F32)) * 0.1 + 0.05).astype(
+        FP8
+    )
+    bscale_u8 = lax.bitcast_convert_type(bscale, U8).reshape(
+        *lead_shape, k_half, n_dim // 8
+    )
+    pad = rup(n_dim // 8, 128) - n_dim // 8
+    return jnp.concatenate(
+        [lo | (hi << U8(4)), bscale_u8, jnp.zeros((*lead_shape, k_half, pad), U8)],
+        axis=-1,
+    )
 
 
 def moe_reference(
@@ -116,8 +165,16 @@ def moe_reference(
                 if not is_tp and (e // ER) != r:
                     continue
                 w_slot = e if is_tp else (e - r * ER)
-                w13_e = e13_l[w_slot].astype(F32)
-                w2_e = e2_l[w_slot].astype(F32)
+                w13_e = (
+                    dequant_nvfp4_weight(e13_l[w_slot], 2 * IR)
+                    if e13_l.dtype == U8
+                    else e13_l[w_slot].astype(F32)
+                )
+                w2_e = (
+                    dequant_nvfp4_weight(e2_l[w_slot], H)
+                    if e2_l.dtype == U8
+                    else e2_l[w_slot].astype(F32)
+                )
                 s13 = e13_s_l[w_slot]
                 s2 = e2_s_r[w_slot]
                 h_e = (xb_moe[b : b + 1] @ w13_e) * s13

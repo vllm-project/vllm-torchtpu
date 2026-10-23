@@ -147,6 +147,20 @@ def derive_model_geometry(
     moe_g = moe_b.resolve(merged)
     eff_tp = bool(moe_g.moe_tp) if moe_tp is None else bool(moe_tp)
     eff_slots = int(moe_g.e_slots) if e_slots is None else int(e_slots)
+    qcfg = merged.get("quantization_config")
+    if not isinstance(qcfg, Mapping) and isinstance(hf_config, Mapping):
+        qcfg = hf_config.get("quantization_config")
+    hf_qalgo = (
+        str(qcfg.get("quant_algo", "")).strip().upper()
+        if isinstance(qcfg, Mapping)
+        else ""
+    )
+    explicit_eq = moe_b.options.get("expert_quant")
+    eff_quant = (
+        str(explicit_eq)
+        if explicit_eq is not None
+        else ("nvfp4" if hf_qalgo == "NVFP4" else str(moe_g.expert_quant))
+    )
     zc = _validate_norms(cls, sched, merged, eps, model_name=mname)
     g = cls.geometry_cls(
         L=L,
@@ -166,6 +180,7 @@ def derive_model_geometry(
         IS=int(moe_g.IS),
         moe_tp=eff_tp,
         e_slots=eff_slots,
+        expert_quant=eff_quant,
         eps=eps,
         gdn_l2_eps=gdn_l2_eps,
         theta=theta,

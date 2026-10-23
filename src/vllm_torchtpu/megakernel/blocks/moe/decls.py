@@ -28,7 +28,7 @@ from ...decls import (
     apply_decl_overrides,
 )
 from ...errors import MegakernelConfigError
-from ...ops import BF16, F32, FP8
+from ...ops import BF16, F32, FP8, rup
 
 MOE_PARAM_NAMES: frozenset[str] = frozenset(
     {
@@ -72,7 +72,17 @@ MOE_FIELD_ALIASES: dict[str, str] = {
     "rms_norm_eps": "eps",
 }
 
-MOE_OPTIONS: dict[str, Any] = {"shared_gate": True, "moe_tp": None, "e_slots": None}
+MOE_OPTIONS: dict[str, Any] = {
+    "shared_gate": True,
+    "moe_tp": None,
+    "e_slots": None,
+    "expert_quant": None,
+}
+
+
+def nvfp4_raw_n(n_logical: int) -> int:
+    """Physical uint8 columns for `n_logical` NVFP4 channels: `n + rup(n // 8, 128)`."""
+    return int(n_logical) + rup(int(n_logical) // 8, 128)
 
 
 def _moe_ew(g: Any, R: int) -> int:
@@ -106,6 +116,11 @@ def validate_moe_options(options: Mapping[str, Any]) -> None:
             "MoEBlock requires shared_gate=True (the kernel always gates the "
             "shared expert with sh_gate)"
         )
+    eq = options.get("expert_quant")
+    if eq is not None and str(eq) not in ("fp8", "nvfp4"):
+        raise MegakernelConfigError(
+            f"MoEBlock requires expert_quant in ('fp8', 'nvfp4'), got {eq!r}"
+        )
 
 
 def resolve_moe_binding(
@@ -123,6 +138,7 @@ def resolve_moe_binding(
             "eps": float(vals["eps"]),
             "moe_tp": bool(opts.get("moe_tp", True)),
             "e_slots": int(opts.get("e_slots", 0)),
+            "expert_quant": str(opts.get("expert_quant", "fp8")),
         }
     )
     return ResolvedBlockGeometry(

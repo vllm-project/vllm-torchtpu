@@ -62,6 +62,7 @@ class MoEParams:
     eps: float
     zero_centered_norm: bool
     sh_rep: int = 1
+    expert_quant: str = "fp8"
 
 
 @dataclass(frozen=True)
@@ -124,6 +125,7 @@ def derive_moe_params(
     *,
     moe_tp: bool,
     e_slots: int,
+    expert_quant: str = "fp8",
 ) -> MoEParams:
     """Resolve `MoEParams` from model geometry, `ExecSpec`, and `StreamPlan`."""
     tiles = ex.resolve_tiles(g)
@@ -193,4 +195,5 @@ def derive_moe_params(
         eps=g.eps,
         zero_centered_norm=bool(getattr(g, "zero_centered_norm", True)),
         sh_rep=sh_rep,
+        expert_quant=str(expert_quant),
     )

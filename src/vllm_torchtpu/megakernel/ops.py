@@ -25,6 +25,7 @@ BF16 = jnp.bfloat16
 F32 = jnp.float32
 I32 = jnp.int32
 U32 = jnp.uint32
+U8 = jnp.uint8
 FP8 = jnp.float8_e4m3fn
 
 

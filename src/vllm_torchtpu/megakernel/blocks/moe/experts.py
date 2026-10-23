@@ -15,20 +15,93 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 import jax
 import jax.numpy as jnp
 from jax import lax
 from jax.experimental import pallas as pl
+from jax.experimental.pallas import tpu as pltpu
 
 from ...ops import BF16, F32, rnd
 from .context import MoEEmit
 from .ring import egive, egive_group, es_wait, etake
 
 
+def unpack_nvfp4_tile(
+    w_u8: jax.Array, n_logical: int, *, interpret: bool = False
+) -> jax.Array:
+    """Unpack `[tk_raw, n_raw] uint8` tile into `[2 * tk_raw, n_logical] bf16`."""
+    tk_raw = w_u8.shape[0]
+    if tk_raw % 8 != 0 or n_logical % 8 != 0:
+        raise ValueError(
+            f"unpack_nvfp4_tile requires tk_raw % 8 == 0 and n_logical % 8 == 0, "
+            f"got tk_raw={tk_raw}, n_logical={n_logical}"
+        )
+    packed = w_u8[:, :n_logical]
+    scale_cols = n_logical // 8
+    bscale_u8 = w_u8[:, n_logical : n_logical + scale_cols]
+    bscale = (
+        lax.bitcast_convert_type(bscale_u8, jnp.float8_e4m3fn)
+        .astype(BF16)
+        .reshape(tk_raw // 8, 1, n_logical)
+    )
+    # Interpret mode has no `pltpu.bitcast` rule; the low nibble is the even K row.
+    w4 = (
+        lax.bitcast_convert_type(packed, jnp.float4_e2m1fn).transpose(0, 2, 1)
+        if interpret
+        else pltpu.bitcast(packed, jnp.float4_e2m1fn)
+    )
+    w_bf16 = w4.astype(BF16).reshape(tk_raw // 8, 16, n_logical)
+    return (w_bf16 * bscale).reshape(2 * tk_raw, n_logical)
+
+
+def _etake_w(m: MoEEmit, kind: str, u, n_logical: int) -> jax.Array:
+    w_ref = etake(m, kind, u)
+    if m.mp.expert_quant == "nvfp4":
+        return unpack_nvfp4_tile(w_ref[...], n_logical, interpret=bool(m.ex.interpret))
+    return w_ref[...]
+
+
+def _mm_etake_w(
+    m: MoEEmit,
+    kind: str,
+    u,
+    x_ref: Any,
+    k0_logical: Any,
+    tk_logical: int,
+    n_logical: int,
+    acc_ref: Any,
+) -> None:
+    """Accumulate `x_ref[:, k0:k0+tk_logical] @ tile(u)` into `acc_ref[:, :n]`."""
+    w_ref = etake(m, kind, u)
+    if m.mp.expert_quant != "nvfp4":
+        acc_ref[:, :n_logical] += m.stream.mm(
+            x_ref[:, pl.ds(k0_logical, tk_logical)], w_ref[...]
+        )
+        return
+    tk_raw = tk_logical // 2
+    if tk_raw > 64 and tk_raw % 64 == 0:
+
+        def _sub(s, cc):
+            r0 = pl.multiple_of(s * 64, 64)
+            k_sub = pl.multiple_of(k0_logical + s * 128, 128)
+            w_sub = unpack_nvfp4_tile(w_ref[pl.ds(r0, 64), :], n_logical)
+            acc_ref[:, :n_logical] += m.stream.mm(x_ref[:, pl.ds(k_sub, 128)], w_sub)
+            return cc
+
+        lax.fori_loop(0, tk_raw // 64, _sub, 0)
+    else:
+        w = unpack_nvfp4_tile(w_ref[...], n_logical)
+        acc_ref[:, :n_logical] += m.stream.mm(
+            x_ref[:, pl.ds(k0_logical, tk_logical)], w
+        )
+
+
 def gate_up(m: MoEEmit, i, w13):
     mp, scr, stream = m.mp, m.scr, m.stream
     IR, NSS = mp.IR, mp.NSS
-    h = stream.mm(scr["xb"][...], w13[...]) * scr["es"][i % NSS, :, : 2 * IR]
+    h = stream.mm(scr["xb"][...], w13) * scr["es"][i % NSS, :, : 2 * IR]
     return rnd(rnd(jax.nn.silu(rnd(h[:, :IR]))) * rnd(h[:, IR:])).astype(BF16)
 
 
@@ -54,8 +127,10 @@ def expert(m: MoEEmit, l_idx, i, carry):
     base = i * TE
     acc, xb, xb2, part = scr["acc"], scr["xb"], scr["xb2"], scr["part"]
     DIRECT0 = mp.r2_direct_store
+    tk13_l = (2 * tk["e13"]) if mp.expert_quant == "nvfp4" else tk["e13"]
+    tk2_l = (2 * tk["e2"]) if mp.expert_quant == "nvfp4" else tk["e2"]
     if T13 == 1:
-        h = stream.mm(xb[...], etake(m, "e13", base)[...])
+        h = stream.mm(xb[...], _etake_w(m, "e13", base, 2 * IR))
         egive(m, base, l_idx)
     elif not mp.unroll:
         # Default path: rolled tile loop with per-tile refill.
@@ -63,22 +138,21 @@ def expert(m: MoEEmit, l_idx, i, carry):
 
         def b13(t, cc):
             u = base + t
-            w = etake(m, "e13", u)
-            k0 = pl.multiple_of(t * tk["e13"], tk["e13"])
-            acc[:, : 2 * IR] += stream.mm(xb[:, pl.ds(k0, tk["e13"])], w[...])
+            k0 = pl.multiple_of(t * tk13_l, tk13_l)
+            _mm_etake_w(m, "e13", u, xb, k0, tk13_l, 2 * IR, acc)
             egive(m, u, l_idx)
             return cc
 
         lax.fori_loop(0, T13, b13, 0)
         h = acc[:, : 2 * IR]
     else:
-        TK13 = tk["e13"]
+        TK13 = tk13_l
         if not DIRECT0:
             acc[:, : 2 * IR] = jnp.zeros((MB, 2 * IR), F32)
         for t in range(T13):
             u = base + t
-            w = etake(m, "e13", u)
-            m13 = stream.mm(xb[:, t * TK13 : (t + 1) * TK13], w[...])
+            w = _etake_w(m, "e13", u, 2 * IR)
+            m13 = stream.mm(xb[:, t * TK13 : (t + 1) * TK13], w)
             if DIRECT0 and t == 0:
                 acc[:, : 2 * IR] = m13
             else:
@@ -98,7 +172,7 @@ def expert(m: MoEEmit, l_idx, i, carry):
     wcol = jnp.sum(jnp.where(lane_e8 == e, scr["wn"][...], 0.0), axis=1, keepdims=True)
     u2 = base + T13
     if T2 == 1:
-        w2 = etake(m, "e2", u2)[...]
+        w2 = _etake_w(m, "e2", u2, H)
         xm = xb2[:, :IR]
         for j in range(H // CH):
             lo = 2 * IR + j * CH
@@ -111,9 +185,8 @@ def expert(m: MoEEmit, l_idx, i, carry):
 
         def b2(t, cc):
             u = u2 + t
-            w = etake(m, "e2", u)
-            k0 = pl.multiple_of(t * tk["e2"], tk["e2"])
-            acc[:, :H] += stream.mm(xb2[:, pl.ds(k0, tk["e2"])], w[...])
+            k0 = pl.multiple_of(t * tk2_l, tk2_l)
+            _mm_etake_w(m, "e2", u, xb2, k0, tk2_l, H, acc)
             egive(m, u, l_idx)
             return cc
 
@@ -121,13 +194,13 @@ def expert(m: MoEEmit, l_idx, i, carry):
         y = rnd(acc[0:MR, :H] * scr["es"][s, :, 2 * IR :])
         part[0:MR, :] += wcol * y
     else:
-        TK2 = tk["e2"]
+        TK2 = tk2_l
         if not DIRECT0:
             acc[:, :H] = jnp.zeros((MB, H), F32)
         for t in range(T2):
             u = u2 + t
-            w = etake(m, "e2", u)
-            m2 = stream.mm(xb2[:, t * TK2 : (t + 1) * TK2], w[...])
+            w = _etake_w(m, "e2", u, H)
+            m2 = stream.mm(xb2[:, t * TK2 : (t + 1) * TK2], w)
             if DIRECT0 and t == 0:
                 acc[:, :H] = m2
             else:
@@ -151,16 +224,16 @@ def experts_piped(m: MoEEmit, l_idx, n_hit):
 
     @pl.when(n_hit > 0)
     def _():
-        w13 = etake(m, "e13", 0)
+        w13 = _etake_w(m, "e13", 0, 2 * IR)
         es_wait(m, 0)
         xb2[:, :IR] = gate_up(m, 0, w13)
         egive(m, 0, l_idx, 0)
 
         def body(i, carry):
             u13, u2 = (i + 1) * TE, i * TE + T13
-            w13 = etake(m, "e13", u13)
+            w13 = _etake_w(m, "e13", u13, 2 * IR)
             es_wait(m, i + 1)
-            w2 = etake(m, "e2", u2)[...]
+            w2 = _etake_w(m, "e2", u2, mp.H)
             mid = xb2[:, :IR]
             nxt = gate_up(m, i + 1, w13)
             down(m, i, mid, w2)
@@ -172,7 +245,7 @@ def experts_piped(m: MoEEmit, l_idx, n_hit):
         lax.fori_loop(0, n_hit - 1, body, 0)
         last = n_hit - 1
         u2 = last * TE + T13
-        down(m, last, xb2[:, :IR], etake(m, "e2", u2)[...])
+        down(m, last, xb2[:, :IR], _etake_w(m, "e2", u2, mp.H))
         egive(m, u2, l_idx, T13)
 
 
@@ -186,15 +259,16 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
         acc, acc13 = scr["acc"], scr["acc13"]
         xb, xb2, part = scr["xb"], scr["xb2"], scr["part"]
         BN = 2 * IR
-        TK13, TK2 = tk["e13"], tk["e2"]
+        TK13 = (2 * tk["e13"]) if mp.expert_quant == "nvfp4" else tk["e13"]
+        TK2 = (2 * tk["e2"]) if mp.expert_quant == "nvfp4" else tk["e2"]
         DIRECT0 = mp.r2_direct_store
 
         if not DIRECT0:
             acc13[...] = jnp.zeros((MB, BN), F32)
         for t in range(T13):
-            w13 = etake(m, "e13", t)
+            w13 = _etake_w(m, "e13", t, BN)
             k0 = t * TK13
-            mm13 = stream.mm(xb[:, k0 : k0 + TK13], w13[...])
+            mm13 = stream.mm(xb[:, k0 : k0 + TK13], w13)
             if DIRECT0 and t == 0:
                 acc13[:, :BN] = mm13
             else:
@@ -229,12 +303,12 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
                 u13_0 = base_nxt13 + t0
                 u13_1 = base_nxt13 + t1
 
-                w2 = etake(m, "e2", u2)
-                w13_0 = etake(m, "e13", u13_0)
+                w2 = _etake_w(m, "e2", u2, H)
+                w13_0 = _etake_w(m, "e13", u13_0, BN)
                 k2 = s_step * TK2
                 k13_0 = t0 * TK13
-                mm2 = stream.mm(xb2[:, k2 : k2 + TK2], w2[...])
-                mm13_0 = stream.mm(xb[:, k13_0 : k13_0 + TK13], w13_0[...])
+                mm2 = stream.mm(xb2[:, k2 : k2 + TK2], w2)
+                mm13_0 = stream.mm(xb[:, k13_0 : k13_0 + TK13], w13_0)
                 if DIRECT0 and s_step == 0:
                     acc[:, :H] = mm2
                     acc13[:, :BN] = mm13_0
@@ -247,9 +321,9 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
                     egive(m, u2, l_idx, T13 + s_step)
                     egive(m, u13_0, l_idx, t0)
 
-                w13_1 = etake(m, "e13", u13_1)
+                w13_1 = _etake_w(m, "e13", u13_1, BN)
                 k13_1 = t1 * TK13
-                acc13[:, :BN] += stream.mm(xb[:, k13_1 : k13_1 + TK13], w13_1[...])
+                acc13[:, :BN] += stream.mm(xb[:, k13_1 : k13_1 + TK13], w13_1)
                 egive(m, u13_1, l_idx, t1)
 
             wcol = jnp.sum(
@@ -276,9 +350,9 @@ def experts_piped_ep(m: MoEEmit, l_idx, n_hit):
             acc[:, :H] = jnp.zeros((MB, H), F32)
         for s_step in range(T2):
             u2 = base_last_w2 + s_step
-            w2 = etake(m, "e2", u2)
+            w2 = _etake_w(m, "e2", u2, H)
             k2 = s_step * TK2
-            mm2 = stream.mm(xb2[:, k2 : k2 + TK2], w2[...])
+            mm2 = stream.mm(xb2[:, k2 : k2 + TK2], w2)
             if DIRECT0 and s_step == 0:
                 acc[:, :H] = mm2
             else:
