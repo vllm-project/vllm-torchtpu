@@ -510,6 +510,12 @@ ATT_KVDEFER = True
 ATT_QSWAP = True
 FLUSH_IN_AR1 = True
 SH2_PRE_ROUTE = True
+# Where the shared expert (SH_PRE path) runs relative to routing. 0: before route() (default,
+# unchanged). 1: inside route(), between starting the hit-list VMEM->SMEM copy and waiting on it.
+# 2: after route() has issued the first expert DMAs (under the first tile's latency). Same ops,
+# same order within the shared expert. Ported from the hostov stack (a83d4ad9f); serving knob
+# VLLM_TPU_QWEN35_MK_SH_AT (see MKBuildContext).
+SH_AT = 0
 ARPIPE_ON = True
 ARPIPE_OFF_B = (20, 24, 32)
 ARPIPE_H1_ON = True
