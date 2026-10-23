@@ -567,3 +567,42 @@ def test_native_tag_planes_are_donated_and_written_to_the_same_owner(monkeypatch
             assert torch.all(tags == -1)
     finally:
         qsa_op.build_qsa_op.cache_clear()
+
+
+@torch.inference_mode()
+def test_output_projection_tp2_partial_sum_matches_tp1(monkeypatch):
+    config = attention_config(
+        hidden_size=32,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=128,
+        indexer_n_heads=2,
+        indexer_head_dim=128,
+    )
+    checkpoint = torch.zeros(32, 512, dtype=torch.bfloat16)
+    rows = torch.arange(32)
+    checkpoint[rows, rows] = 0.5
+    checkpoint[rows, rows + 256] = 0.25
+    attended = ((torch.arange(3 * 512).reshape(3, 512) % 7) / 4).to(torch.bfloat16)
+    partials = []
+    for size, rank in [(1, 0), (2, 0), (2, 1)]:
+        monkeypatch.setattr(
+            "vllm.model_executor.parameter.get_tensor_model_parallel_rank",
+            lambda rank=rank: rank,
+        )
+        monkeypatch.setattr(
+            "vllm.model_executor.parameter.get_tensor_model_parallel_world_size",
+            lambda size=size: size,
+        )
+        layer = Qwen4ExpQSA(
+            config=config, tp_rank=rank, tp_size=size, max_model_len=128, device="cpu"
+        )
+        layer.load_weights([("o_proj.weight", checkpoint)])
+        width = attended.shape[-1] // size
+        output = layer.o_proj(attended[:, rank * width : (rank + 1) * width])
+        if size == 1:
+            expected = output
+        else:
+            partials.append(output)
+    # Binary-exact inputs isolate rank slicing/reduction from BF16 sum rounding.
+    torch.testing.assert_close(partials[0] + partials[1], expected, rtol=0, atol=0)
