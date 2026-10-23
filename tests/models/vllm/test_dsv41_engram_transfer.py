@@ -11,6 +11,7 @@ import sys
 import types
 from collections.abc import Callable
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 from typing import Any, cast
 
@@ -37,13 +38,18 @@ def transport():
     class HostBuffer:
         def __init__(self, size):
             self.size_bytes = size
-            self.memory = (ctypes.c_uint8 * size)()
-            self.data_ptr = ctypes.addressof(self.memory)
+            self.memory = None
+
+        @property
+        def data_ptr(self):
+            return ctypes.addressof(self.memory) if self.memory is not None else 0
 
     class Transfer:
         def __init__(self, device, host, unsafe_skip_buffer_lock):
             assert not unsafe_skip_buffer_lock
             self.device = device
+            if host.memory is None:
+                host.memory = (ctypes.c_uint8 * host.size_bytes)()
             self.host = torch.frombuffer(host.memory, dtype=torch.uint8)
             events.append(("bind", device, host))
 
@@ -95,6 +101,7 @@ def transport():
             math=math,
             Any=Any,
             dataclass=dataclass,
+            cached_property=cached_property,
             sync=sync,
             tpu_torch_compile=layout,
             raw_transfer=types.SimpleNamespace(
@@ -102,6 +109,13 @@ def transport():
             ),
         ),
     )
+    original_host_words = module._host_words
+
+    def host_words(buffer, num_words):
+        assert buffer.data_ptr != 0, "Bind the lazy host buffer before viewing it"
+        return original_host_words(buffer, num_words)
+
+    original_host_words.__globals__["_host_words"] = host_words
     return module, events, layout
 
 

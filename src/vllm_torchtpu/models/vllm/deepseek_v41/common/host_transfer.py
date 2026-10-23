@@ -9,6 +9,7 @@ common/host_transfer.py. Downloads rebind each producer's PJRT buffer.
 import ctypes
 import math
 from dataclasses import dataclass
+from functools import cached_property
 from typing import Any
 
 import torch
@@ -126,9 +127,12 @@ class PreparedEngramUpload:
 @dataclass
 class _DownloadBuffer:
     buffer: Any
-    words: torch.Tensor
     physical_words: int
     layout: Any
+
+    @cached_property
+    def words(self) -> torch.Tensor:
+        return _host_words(self.buffer, self.physical_words)
 
 
 class EngramHashDownload:
@@ -159,11 +163,10 @@ class EngramHashDownload:
         storage = self._buffers.get(key)
         if storage is None or storage.layout != layout:
             buffer = raw_transfer.RawHostBuffer(physical_words * 4)
-            storage = _DownloadBuffer(
-                buffer, _host_words(buffer, physical_words), physical_words, layout
-            )
+            storage = _DownloadBuffer(buffer, physical_words, layout)
             self._buffers[key] = storage
         # Rebind each step: compiled hashes may use a new device allocation.
+        # Binding allocates RawHostBuffer before storage.words creates its view.
         transfer = raw_transfer.PreparedTorchRawTransfer(
             hashes, storage.buffer, unsafe_skip_buffer_lock=False
         )
