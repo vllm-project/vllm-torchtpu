@@ -3895,7 +3895,7 @@ class TPUModelRunner(GPUModelRunner):
                 if has_encoder_inputs:
                     synchronize_tensors()
 
-        step_ngram_context = (
+        step_context = (
             self.model_adapter.begin_step() if self.model_adapter is not None else None
         )
 
@@ -4116,11 +4116,10 @@ class TPUModelRunner(GPUModelRunner):
             if self.model_adapter is not None:
                 from vllm_torchtpu.runner.model_adapters import ModelInputSnapshot
 
-                assert step_ngram_context is not None
                 assert input_ids is not None
                 model_kwargs = self.model_adapter.prepare_inputs(
                     ModelInputSnapshot(
-                        step_ngram_context,
+                        step_context,
                         start_index,
                         num_reqs,
                         num_tokens_padded,
@@ -5472,11 +5471,11 @@ class TPUModelRunner(GPUModelRunner):
     def load_model(self) -> None:
         from vllm_torchtpu.runner.model_adapters import select_model_adapter
 
-        self.model_adapter = select_model_adapter(self)
-        self.kv_cache_manager.model_adapter = self.model_adapter
         self.device_config.device = torch.device("tpu")
         self.device = self.device_config.device
         self.vllm_config.device_config = self.device_config
+        self.model_adapter = select_model_adapter(self)
+        self.kv_cache_manager.model_adapter = self.model_adapter
 
         # Set TPU-specific quantization config before model loading.
         # This ensures that TPU-compatible quantization methods are used
