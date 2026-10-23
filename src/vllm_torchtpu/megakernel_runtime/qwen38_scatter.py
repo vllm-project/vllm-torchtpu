@@ -57,8 +57,14 @@ def scatter_gdn_ckpts_fast(
     *,
     layout: Qwen38GdnPoolLayout,
     interpret: bool = False,
+    ring: int = RING,
 ) -> Any:
-    """Same contract as `scatter_gdn_ckpts` (per-rank arrays); returns the pool."""
+    """Same contract as `scatter_gdn_ckpts` (per-rank arrays); returns the pool.
+
+    `ring` staging slots: checkpoint `i + 1` is loaded while `i` is converted,
+    and up to `ring` pool writes are in flight.
+    """
+    RING_ = ring
     NL, NS, T = write_blocks.shape
     n = NL * NS * T
     vh, KD, VD, QKV = layout.n_v, layout.d_k, layout.d_v, layout.conv_dim
@@ -88,20 +94,33 @@ def scatter_gdn_ckpts_fast(
             )
             return cps
 
-        def body(i, carry):
-            slot = lax.rem(i, RING)
+        def in_copies(i, slot):
+            return (
+                pltpu.make_async_copy(rec_ref.at[i], vin.at[slot], sin.at[slot, 0]),
+                pltpu.make_async_copy(win_ref.at[i], cin.at[slot], sin.at[slot, 1]),
+            )
 
-            @pl.when(i >= RING)
+        for c in in_copies(0, 0):
+            c.start()
+
+        def body(i, carry):
+            slot = lax.rem(i, RING_)
+            nslot = lax.rem(i + 1, RING_)
+
+            # Slot `nslot` is reused by checkpoint i + 1: its write from
+            # i + 1 - RING must have landed before the prefetch overwrites it.
+            @pl.when(i + 1 >= RING_)
             def _():
-                for c in out_copies(slot, ids_ref[i - RING]):
+                for c in out_copies(nslot, ids_ref[jnp.maximum(i + 1 - RING_, 0)]):
                     c.wait()
 
-            a = pltpu.make_async_copy(rec_ref.at[i], vin.at[slot], sin.at[slot, 0])
-            b = pltpu.make_async_copy(win_ref.at[i], cin.at[slot], sin.at[slot, 1])
-            a.start()
-            b.start()
-            a.wait()
-            b.wait()
+            @pl.when(i + 1 < n)
+            def _():
+                for c in in_copies(jnp.minimum(i + 1, n - 1), nslot):
+                    c.start()
+
+            for c in in_copies(i, slot):
+                c.wait()
             vals = vin[slot].astype(jnp.float32).reshape(vh * KD, VD)
             rows = vals.shape[0] // SSM_BLOCKS
             for j in range(SSM_BLOCKS):
@@ -119,9 +138,10 @@ def scatter_gdn_ckpts_fast(
             return carry
 
         lax.fori_loop(0, n, body, 0)
-        for k in range(min(RING, n)):
-            i = n - min(RING, n) + k
-            for c in out_copies(i % RING, ids_ref[i]):
+        # Writes not yet waited on: the last RING - 1 checkpoints (the loop waits
+        # for i + 1 - RING when it reuses a slot).
+        for k in range(max(0, n - RING_ + 1), n):
+            for c in out_copies(k % RING_, ids_ref[k]):
                 c.wait()
 
     any_ = pltpu.HBM
@@ -137,12 +157,12 @@ def scatter_gdn_ckpts_fast(
             ],
             out_specs=pl.BlockSpec(memory_space=any_),
             scratch_shapes=[
-                pltpu.VMEM((RING, vh, KD, VD), rec.dtype),
-                pltpu.VMEM((RING, 3, QKV), jnp.float32),
-                pltpu.VMEM((RING, SSM_BLOCKS) + tuple(pool.shape[1:]), f8),
-                pltpu.VMEM((RING, CONV_ROWS) + tuple(pool.shape[2:]), f8),
-                pltpu.SemaphoreType.DMA((RING, 2)),
-                pltpu.SemaphoreType.DMA((RING, SSM_BLOCKS + 1)),
+                pltpu.VMEM((RING_, vh, KD, VD), rec.dtype),
+                pltpu.VMEM((RING_, 3, QKV), jnp.float32),
+                pltpu.VMEM((RING_, SSM_BLOCKS) + tuple(pool.shape[1:]), f8),
+                pltpu.VMEM((RING_, CONV_ROWS) + tuple(pool.shape[2:]), f8),
+                pltpu.SemaphoreType.DMA((RING_, 2)),
+                pltpu.SemaphoreType.DMA((RING_, SSM_BLOCKS + 1)),
             ],
         ),
         out_shape=jax.ShapeDtypeStruct(pool.shape, pool.dtype),

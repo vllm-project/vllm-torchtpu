@@ -45,8 +45,8 @@ SHAPE = (NMB * 4, 128, 1, 4, 256)
 LAYOUT = gs.Qwen38GdnPoolLayout(pool_shape=SHAPE, pool_dtype="float8_e4m3fn")
 
 
-@pytest.mark.parametrize("pad_requests", [False, True])
-def test_fast_scatter_matches_region_scatter(pad_requests: bool):
+@pytest.mark.parametrize("pad_requests,ring", [(False, 4), (True, 4), (False, 2), (False, 8)])
+def test_fast_scatter_matches_region_scatter(pad_requests: bool, ring: int):
     rng = np.random.default_rng(0)
     raw = rng.integers(0, 256, size=SHAPE, dtype=np.uint8)
     pool = jax.lax.bitcast_convert_type(jnp.asarray(raw), jnp.float8_e4m3fn)
@@ -57,7 +57,7 @@ def test_fast_scatter_matches_region_scatter(pad_requests: bool):
         wb[:, -1] = 0  # a padded request writes the null block only
     wb = jnp.asarray(wb)
     ref = gs.scatter_gdn_ckpts(pool, conv, rec, wb, layout=LAYOUT, interpret=True)
-    got = scatter_gdn_ckpts_fast(pool, conv, rec, wb, layout=LAYOUT, interpret=True)
+    got = scatter_gdn_ckpts_fast(pool, conv, rec, wb, layout=LAYOUT, interpret=True, ring=ring)
     a = np.asarray(jax.lax.bitcast_convert_type(ref, jnp.uint8))
     b = np.asarray(jax.lax.bitcast_convert_type(got, jnp.uint8))
     # Manager blocks other than the written ones must be untouched by both.
