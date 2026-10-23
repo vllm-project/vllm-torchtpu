@@ -1016,6 +1016,10 @@ def _pooled_qsa(
         slot=compressed_slot,
         max_query_len=max_query_len,
     )
+    if envs.VLLM_TPU_QSA_TOPK_STATS:
+        from vllm_torchtpu.kernels.qwen4_exp import topk_stats
+
+        topk_stats.record(blocks, lengths, starts, envs.VLLM_TPU_QSA_TOPK_STATS)
     output, pool = qsa_attention(
         q,
         gate,
