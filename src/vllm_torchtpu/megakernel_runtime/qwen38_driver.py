@@ -29,14 +29,12 @@ from __future__ import annotations
 from typing import Any
 
 import torch
-import torch.nn.functional as F
 from torch import nn
 
 from vllm_torchtpu import envs
 from vllm_torchtpu.logger import init_logger
-from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
+from vllm_torchtpu.megakernel.exec_spec import ExecSpec
 from vllm_torchtpu.megakernel.models import qwen38
-from vllm_torchtpu.megakernel.models.qwen38_step import make_flat_segment_step
 
 from .driver import (
     MegakernelDriver,
@@ -45,25 +43,12 @@ from .driver import (
     register_megakernel_driver,
 )
 from .exported_bridge import sharded_jax_callable
+from .qwen38_segment_call import T_VERIFY, build_segment_call, segment_tiles
 from .qwen38_weights import pack_segment_operands, segment_layers
 
 logger = init_logger(__name__)
 
-T_VERIFY = 4
 DEFAULT_BUCKETS = (4, 8, 16, 32, 64)
-
-
-def segment_tiles(B: int, hier: int | None = None) -> Tiles:
-    """Expert ring on the software-pipelined EP path (e13 in 2 tiles, e2 in 1).
-
-    Ring depths shrink with the bucket so the 64-row scratch fits VMEM; the
-    bank sizes (hence every weight's tiling) are the same for all buckets.
-    """
-    nbe, nbd = (12, 10) if B <= 16 else ((6, 10) if B <= 32 else (3, 6))
-    h = 1 if hier is None else hier
-    return Tiles(ebank=2 << 20, nbe=nbe, nbd=nbd, vmem_mib=62, hier=h).with_blocks(
-        {"moe": {"pipe_ep": True, "moe_unroll": True}}
-    )
 
 
 def _parse_buckets(raw: str) -> tuple[int, ...]:
@@ -81,87 +66,55 @@ def _parse_check(raw: str) -> int:
     return 0
 
 
-class _BucketOp:
-    """SPMD gather -> segment kernel -> scatter for one `(kind, rows)` bucket."""
+class _SegmentKind:
+    """One torch op for a segment kind (`L` layers); buckets resolve on the concrete rows.
 
-    def __init__(self, mesh: Any, g: Any, L: int, B: int, layout: Any) -> None:
-        import jax
-        from jax.sharding import PartitionSpec as P
+    The torch side passes the runner-padded `hidden` / `attention` and the raw
+    GDN metadata; padding to the kernel's `M` rows, the block-id arithmetic,
+    the pool gather / scatter and the kernel run in one SPMD JAX call per rows
+    count, so the compiled torch program never branches on the token count.
+    """
 
-        from .qwen38_gdn_state import gather_gdn_states, scatter_gdn_ckpts
-
-        R = mesh.size
-        self.ex = ExecSpec(R=R, B=B, T=T_VERIFY, ctx=128, tiles=segment_tiles(B))
-        spec = qwen38.segment_spec(g, R, L=L)
-        fn, _, out_specs, self.n_w = make_flat_segment_step(mesh, spec, self.ex)
-        self.has_gdn = len(out_specs) == 3
-        self.M = self.ex.M
-        tp, rep = P("tp"), P()
-
-        if self.has_gdn:
-            gather = jax.shard_map(
-                lambda pool, rb, hi: gather_gdn_states(
-                    pool, rb, layout=layout, T=T_VERIFY, has_initial_state=hi
-                ),
-                mesh=mesh,
-                in_specs=(tp, rep, rep),
-                out_specs=(tp, tp),
-                check_vma=False,
-            )
-            scatter = jax.shard_map(
-                lambda pool, c, r, wb: scatter_gdn_ckpts(pool, c, r, wb, layout=layout),
-                mesh=mesh,
-                in_specs=(tp, tp, tp, rep),
-                out_specs=tp,
-                check_vma=False,
-            )
-
-            def full(pos, hidden, attn, *rest):
-                w, (pool, rb, wb, hi) = rest[: self.n_w], rest[self.n_w :]
-                conv, rec = gather(pool, rb, hi)
-                res, conv_ck, rec_ck = fn(pos, hidden, attn, *w, conv, rec)
-                return res, scatter(pool, conv_ck, rec_ck, wb)
-
-            in_specs = (rep, tp, tp) + (tp,) * self.n_w + (tp, rep, rep, rep)
-            outs = (tp, tp)
-            donate = (3 + self.n_w,)
-        else:
-
-            def full(pos, hidden, attn, *w):
-                return fn(pos, hidden, attn, *w)
-
-            in_specs = (rep, tp, tp) + (tp,) * self.n_w
-            outs = (tp,)
-            donate = ()
-        name = f"qwen38_mk::seg_l{L}_b{B}"
-        call = sharded_jax_callable(
-            name,
-            full,
-            mesh=mesh,
-            input_partition_specs=in_specs,
-            output_partition_specs=outs,
-            donate_argnums=donate,
-        )
+    def __init__(self, mesh: Any, g: Any, L: int, layout: Any, write: bool) -> None:
+        self.mesh, self.g, self.L, self.layout, self.write = mesh, g, L, layout, write
+        self.has_gdn = L > 1
+        self._calls: dict[int, Any] = {}
+        name = f"qwen38_mk::seg_l{L}" + ("" if write else "_shadow")
         has_gdn = self.has_gdn
 
         @torch.library.custom_op(name, mutates_args=())
         def op(
-            pos: torch.Tensor,
             hidden: torch.Tensor,
             attn: torch.Tensor,
             weights: list[torch.Tensor],
-            pool_io: list[torch.Tensor],
+            gdn_io: list[torch.Tensor],
         ) -> list[torch.Tensor]:
-            return list(call(pos, hidden, attn, *weights, *pool_io))
+            call = self.callable_for(int(hidden.shape[0]))
+            return list(call(hidden, attn, *weights, *gdn_io))
 
         @op.register_fake
-        def _(pos, hidden, attn, weights, pool_io):
+        def _(hidden, attn, weights, gdn_io):
             out = [torch.empty_like(hidden)]
             if has_gdn:
-                out.append(torch.empty_like(pool_io[0]))
+                out.append(torch.empty_like(gdn_io[0]))
             return out
 
         self.op = op
+
+    def callable_for(self, B: int) -> Any:
+        if B not in self._calls:
+            full, in_specs, outs, donate = build_segment_call(
+                self.mesh, self.g, self.L, B, self.layout, self.write
+            )
+            self._calls[B] = sharded_jax_callable(
+                f"qwen38_mk::seg_l{self.L}_b{B}" + ("" if self.write else "_shadow"),
+                full,
+                mesh=self.mesh,
+                input_partition_specs=in_specs,
+                output_partition_specs=outs,
+                donate_argnums=donate,
+            )
+        return self._calls[B]
 
 
 class Qwen38Segments(nn.Module):
@@ -183,17 +136,18 @@ class Qwen38Segments(nn.Module):
         self.buckets = buckets
         self.layers = model.model.layers
         self.n_seg = g.L // g.att_every
-        R = mesh.size
-        self.n_w: list[int] = []
+        self.kinds: dict[int, _SegmentKind] = {}
         if shared is not None:
-            # A shadow view: same operands and ops, GDN checkpoints not written.
+            # A shadow view: same operands, GDN checkpoints not written.
             self.n_w = shared.n_w
             for name, buf in shared.named_buffers():
                 self.register_buffer(name, buf, persistent=False)
-            self.pool, self.layout, self._ops = None, None, shared._ops
             self._shared = shared
+            self.pool = self.layout = None
             return
         self._shared = None
+        R = mesh.size
+        self.n_w: list[int] = []
         for s in range(self.n_seg):
             L = len(segment_layers(g, s))
             ex = ExecSpec(R=R, B=buckets[0], T=T_VERIFY, ctx=128, tiles=segment_tiles(buckets[0]))
@@ -203,77 +157,55 @@ class Qwen38Segments(nn.Module):
                 self.register_buffer(f"w{s}_{i}", t, persistent=False)
         self.pool = None
         self.layout = None
-        self._ops: dict[tuple[int, int], _BucketOp] = {}
 
     def bind_pool(self) -> None:
         from .qwen38_gdn_state import Qwen38GdnPoolLayout
 
         if self._shared is not None:
             self.pool, self.layout = self._shared.pool, self._shared.layout
-            return
+        else:
+            pools = [
+                layer.linear_attn.kv_cache[0]
+                for layer in self.layers
+                if layer.layer_type == "linear_attention"
+            ]
+            base = pools[0]
+            for p in pools:
+                if p.data_ptr() != base.data_ptr():
+                    raise RuntimeError("Qwen3.8 megakernel needs one unified GDN pool tensor")
+            if getattr(self.layers[0].linear_attn, "_bm_kernel", False):
+                raise RuntimeError("Qwen3.8 megakernel does not support block-major pools yet")
+            self.pool = base
+            self.layout = Qwen38GdnPoolLayout.from_pool(base)
+        for L in sorted({len(segment_layers(self.g, s)) for s in range(self.n_seg)}):
+            self.kinds[L] = _SegmentKind(self.mesh, self.g, L, self.layout, self.write_ckpts)
 
-        pools = [self.layers[i].linear_attn.kv_cache[0] for i in range(len(self.layers))
-                 if self.layers[i].layer_type == "linear_attention"]
-        base = pools[0]
-        for p in pools:
-            if p.data_ptr() != base.data_ptr():
-                raise RuntimeError("Qwen3.8 megakernel needs one unified GDN pool tensor")
-        if getattr(self.layers[0].linear_attn, "_bm_kernel", False):
-            raise RuntimeError("Qwen3.8 megakernel does not support block-major pools yet")
-        self.pool = base
-        self.layout = Qwen38GdnPoolLayout.from_pool(base)
-
-    def _op(self, L: int, B: int) -> _BucketOp:
-        key = (L, B)
-        if key not in self._ops:
-            self._ops[key] = _BucketOp(self.mesh, self.g, L, B, self.layout)
-        return self._ops[key]
-
-    def _gdn_blocks(self, s: int, NS: int) -> tuple[torch.Tensor, ...]:
+    def _gdn_meta(self, s: int) -> list[torch.Tensor]:
         from vllm.forward_context import get_forward_context
 
-        def fit(t: torch.Tensor, n: int) -> torch.Tensor:
-            """First `n` rows of `t`, zero-padded when the runner's array is shorter."""
-            t = t[:n]
-            if t.shape[0] < n:
-                t = F.pad(t, (0, 0) * (t.dim() - 1) + (0, n - t.shape[0]))
-            return t
-
         md_all = get_forward_context().attn_metadata
-        rbs, wbs, his = [], [], []
+        meta: list[torch.Tensor] = []
         for i in segment_layers(self.g, s)[1:]:
-            la = self.layers[i].linear_attn
-            md = md_all[la.prefix]
-            st = fit(la._bm_state_ids(md.mamba_state_indices.to(torch.int32)), NS)
-            ck = fit(md.mamba_ckpt_indices.to(torch.int32)[:, :T_VERIFY], NS)
-            off = md.mamba_slot_read_offsets.to(torch.int64)[st.to(torch.int64)]
-            qsl = fit(md.query_start_loc.to(torch.int32), NS + 1)
-            q_len = qsl[1:] - qsl[:-1]
-            live = q_len > 0
-            hi = live & ((fit(md.seq_lens.to(torch.int32), NS) - q_len) > 0)
-            rb = torch.gather(ck, 1, off[:, None]).squeeze(1)
-            rbs.append(torch.where(live, rb, 0))
-            write = live[:, None] if self.write_ckpts else torch.zeros_like(live)[:, None]
-            wbs.append(torch.where(write, ck, 0))
-            his.append(hi)
-        return torch.stack(rbs), torch.stack(wbs), torch.stack(his)
+            md = md_all[self.layers[i].linear_attn.prefix]
+            meta += [
+                md.mamba_state_indices.to(torch.int32),
+                md.mamba_slot_read_offsets.to(torch.int32),
+                md.mamba_ckpt_indices.to(torch.int32),
+                md.query_start_loc.to(torch.int32),
+                md.seq_lens.to(torch.int32),
+            ]
+        return meta
 
     def forward(self, s: int, hidden: torch.Tensor, attention: torch.Tensor) -> torch.Tensor:
-        B = hidden.shape[0]
         L = len(segment_layers(self.g, s))
-        op = self._op(L, B)
-        M = op.M
-        pos = torch.zeros((B,), dtype=torch.int32, device=hidden.device)
-        x = F.pad(hidden, (0, 0, 0, M - B)) if M > B else hidden
-        att = F.pad(attention, (0, 0, 0, M - B)) if M > B else attention
+        kind = self.kinds[L]
         w = [getattr(self, f"w{s}_{i}") for i in range(self.n_w[s])]
-        if op.has_gdn:
-            rb, wb, hi = self._gdn_blocks(s, B // T_VERIFY)
-            res, pool = op.op(pos, x, att, w, [self.pool, rb, wb, hi])
+        if kind.has_gdn:
+            res, pool = kind.op(hidden, attention, w, [self.pool, *self._gdn_meta(s)])
             self.pool.copy_(pool)
         else:
-            (res,) = op.op(pos, x, att, w, [])
-        return res[:B]
+            (res,) = kind.op(hidden, attention, w, [])
+        return res
 
 
 class Qwen38SegmentDriver:

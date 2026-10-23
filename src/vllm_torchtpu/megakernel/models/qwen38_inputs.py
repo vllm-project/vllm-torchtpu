@@ -67,6 +67,7 @@ def random_segment_inputs(
     *,
     gain: float = 1.0,
     zero: tuple[str, ...] = (),
+    router_gain: float = 1.0,
 ) -> SegmentInputs:
     """Random inputs whose sublayers each move the residual visibly.
 
@@ -83,6 +84,9 @@ def random_segment_inputs(
     for k in {"gdn": ("lin_out_s",), "moe": ("e2_s", "sh2_s")}.get(zero[0], ()) if zero else ():
         gains[k] = 0.0
     w_l = {k: v * gains[k] if k in gains else v for k, v in w_l.items()}
+    # A larger router spreads the top-k logits so rounding drift upstream of the
+    # router cannot flip a selection (`router_gain`); the library default is 1.
+    w_l["router"] = (w_l["router"].astype(F32) * router_gain).astype(w_l["router"].dtype)
     hc = {
         "qsa_out": _hc_params(keys[1], g, 1),
         "gdn": _hc_params(keys[2], g, L - 1),

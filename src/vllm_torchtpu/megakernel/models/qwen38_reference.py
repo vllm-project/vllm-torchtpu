@@ -50,8 +50,12 @@ def segment_reference(
     o_proj: jax.Array,
     *,
     L: int,
+    moe_inputs: list | None = None,
 ) -> tuple[jax.Array, dict[str, Any]]:
-    """Return `(new residual [B, NHC*H], {gdn_idx: new GDN states})`."""
+    """Return `(new residual [B, NHC*H], {gdn_idx: new GDN states})`.
+
+    `moe_inputs`, when a list, receives each layer's MoE input `[B, H]`.
+    """
     gi = g.inner(ex.R, L)
     nhc, eps = g.NHC, g.eps
     x = x[: ex.B]
@@ -70,6 +74,8 @@ def segment_reference(
         x = hc_combine(delta, x, xn, p, nhc=nhc)
         p = _layer(hc["moe"], j)
         mixed, xn = hc_mix(x, p, nhc=nhc, eps=eps)
+        if moe_inputs is not None:
+            moe_inputs.append(mixed)
         delta, _ = moe_reference(w_l, mixed, None, g=gi, ex=ex, layer_idx=j)
         x = hc_combine(delta, x, xn, p, nhc=nhc)
     return x, gdn_states

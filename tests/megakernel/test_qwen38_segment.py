@@ -109,3 +109,31 @@ def test_qwen38_segment_budget_catches_a_dropped_layer(monkeypatch):
     res, ref, _ = _run(1)
     with pytest.raises(AssertionError):
         _assert_within_budget(res, ref)
+
+
+def test_qwen38_flat_segment_step_matches_make_step():
+    """The positional bridge form returns the same residual as `make_step`."""
+    from vllm_torchtpu.megakernel.models.qwen38_step import make_flat_segment_step
+
+    T, L, R = 4, qwen38.SEGMENT_LAYERS, 2
+    B = 2 * T
+    ex = ExecSpec(R=R, B=B, T=T, ctx=128, interpret=True, tiles=_TILES)
+    spec = qwen38.segment_spec(G, R, L=L)
+    inp = random_segment_inputs(jax.random.PRNGKey(7), G, ex, L)
+    w_mk, states, attn = pack_segment(spec, G, ex, inp)
+    mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
+    pos_mk, hid_mk, w_mk, st_mk = shard_step_inputs(mesh, ex, inp.pos, inp.x, w_mk, states)
+    attn_mk = jax.device_put(kernel.fold(attn), NamedSharding(mesh, P("tp")))
+    step, _ = kernel.make_step(mesh, spec, ex)
+    _, outs = step(pos_mk, hid_mk, w_mk, st_mk, attn_mk)
+
+    fn, in_specs, out_specs, n_w = make_flat_segment_step(mesh, spec, ex)
+    flat = []
+    for name in kernel.build(spec, ex)[1]["plan"].w_names:
+        v = w_mk[name]
+        flat.extend(v if isinstance(v, tuple) else (v,))
+    assert len(flat) == n_w and len(in_specs) == 3 + n_w + 2
+    res = jax.jit(fn)(pos_mk, hid_mk, attn_mk, *flat, st_mk["conv"], st_mk["rec"])
+    assert len(res) == len(out_specs) == 3
+    np.testing.assert_array_equal(np.asarray(res[0]), np.asarray(outs[RESIDUAL_OUT]))
+    np.testing.assert_array_equal(np.asarray(res[2]), np.asarray(outs["rec_ckpt"]))
