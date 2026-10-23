@@ -69,7 +69,6 @@ import pytest  # noqa: E402
 R, NS = 2, 2
 B = NS * T_VERIFY
 NMB = 1 + 3 * NS * T_VERIFY  # block 0 = null; up to 3 GDN layers
-POOL_SHAPE = (NMB * 4, 128, 1, 4, 256)
 G = qwen38.TINY
 TILES = Tiles(bank=1 << 20, nbd=10, nbe=8, ebank=512 << 10, vmem_mib=64)
 
@@ -84,8 +83,12 @@ def _blocks(NL):
     return ck, off
 
 
-@pytest.mark.parametrize("L,head,pool_gdn", [(4, False, False), (4, False, True), (2, True, True)])
-def test_segment_call_matches_reference_and_writes_checkpoints(L, head, pool_gdn):
+@pytest.mark.parametrize(
+    "L,head,pool_gdn,kb",
+    [(4, False, False, 128), (4, False, True, 128), (2, True, True, 128), (4, False, True, 512), (2, True, True, 512)],
+)
+def test_segment_call_matches_reference_and_writes_checkpoints(L, head, pool_gdn, kb):
+    POOL_SHAPE = (NMB * (512 // kb), kb, 1, 4, 256)  # served: 128- or 512-row blocks
     NL = L if head else L - 1
     rng = np.random.default_rng(0)
     ck, off = _blocks(NL)

@@ -41,12 +41,16 @@ from vllm_torchtpu.megakernel_runtime.qwen38_scatter import scatter_gdn_ckpts_fa
 
 NL, NS, T = 2, 3, 4
 NMB = 1 + NL * NS * T
-SHAPE = (NMB * 4, 128, 1, 4, 256)
-LAYOUT = gs.Qwen38GdnPoolLayout(pool_shape=SHAPE, pool_dtype="float8_e4m3fn")
 
 
-@pytest.mark.parametrize("pad_requests,ring", [(False, 4), (True, 4), (False, 2), (False, 8)])
-def test_fast_scatter_matches_region_scatter(pad_requests: bool, ring: int):
+@pytest.mark.parametrize(
+    "pad_requests,ring,kb",
+    [(False, 4, 128), (True, 4, 128), (False, 2, 128), (False, 8, 128), (False, 4, 512), (True, 4, 512)],
+)
+def test_fast_scatter_matches_region_scatter(pad_requests: bool, ring: int, kb: int):
+    """Served pools use 128-row (QSA kernel) or 512-row (one per manager block) blocks."""
+    SHAPE = (NMB * (512 // kb), kb, 1, 4, 256)
+    LAYOUT = gs.Qwen38GdnPoolLayout(pool_shape=SHAPE, pool_dtype="float8_e4m3fn")
     rng = np.random.default_rng(0)
     raw = rng.integers(0, 256, size=SHAPE, dtype=np.uint8)
     pool = jax.lax.bitcast_convert_type(jnp.asarray(raw), jnp.float8_e4m3fn)
@@ -56,18 +60,26 @@ def test_fast_scatter_matches_region_scatter(pad_requests: bool, ring: int):
     if pad_requests:
         wb[:, -1] = 0  # a padded request writes the null block only
     wb = jnp.asarray(wb)
-    ref = gs.scatter_gdn_ckpts(pool, conv, rec, wb, layout=LAYOUT, interpret=True)
+    if kb == 128:
+        ref = gs.scatter_gdn_ckpts(pool, conv, rec, wb, layout=LAYOUT, interpret=True)
+    else:
+        # The region adapters do not run under the CPU interpreter at kb=512;
+        # the reference is the kb=128 fast scatter (checked against them above)
+        # on the same bytes, which are the same rows per manager block.
+        shape128 = (NMB * 4, 128, 1, 4, 256)
+        ref = scatter_gdn_ckpts_fast(
+            pool.reshape(shape128), conv, rec, wb, interpret=True,
+            layout=gs.Qwen38GdnPoolLayout(pool_shape=shape128, pool_dtype="float8_e4m3fn"),
+        )
     got = scatter_gdn_ckpts_fast(pool, conv, rec, wb, layout=LAYOUT, interpret=True, ring=ring)
     a = np.asarray(jax.lax.bitcast_convert_type(ref, jnp.uint8))
     b = np.asarray(jax.lax.bitcast_convert_type(got, jnp.uint8))
     # Manager blocks other than the written ones must be untouched by both.
     live = sorted(set(np.asarray(wb).reshape(-1).tolist()) - {0})
-    for m in range(NMB):
-        blk = slice(4 * m, 4 * m + 4)
-        if m == 0:
-            continue  # null block: last writer wins, order differs
+    a, b, r = (x.reshape(NMB, 512, -1) for x in (a, b, raw))
+    for m in range(1, NMB):  # null block 0: last writer wins, order differs
         if m in live:
-            np.testing.assert_array_equal(b[4 * m : 4 * m + 3], a[4 * m : 4 * m + 3], err_msg=f"ssm {m}")
-            np.testing.assert_array_equal(b[4 * m + 3, :15], a[4 * m + 3, :15], err_msg=f"conv {m}")
+            np.testing.assert_array_equal(b[m, :384], a[m, :384], err_msg=f"ssm {m}")
+            np.testing.assert_array_equal(b[m, 384:399], a[m, 384:399], err_msg=f"conv {m}")
         else:
-            np.testing.assert_array_equal(b[blk], raw[blk], err_msg=f"untouched {m}")
+            np.testing.assert_array_equal(b[m], r[m], err_msg=f"untouched {m}")

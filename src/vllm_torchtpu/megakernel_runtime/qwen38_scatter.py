@@ -14,8 +14,8 @@
 """Write Qwen3.8 GDN verify checkpoints into the unified pool with manual DMAs.
 
 `scatter_gdn_ckpts_fast` has the contract of `qwen38_gdn_state.scatter_gdn_ckpts`
-but writes only the bytes that change: per checkpoint the 3 kernel blocks of
-the f32 recurrent state and the 16 conv rows of the 4th block, into the
+but writes only the bytes that change: per checkpoint the 384 rows of the f32
+recurrent state and the 16 conv rows after them (any kernel block size), into the
 aliased pool (HBM refs, no BlockSpec windows), through a ring of VMEM
 staging buffers so several copies are in flight. The region adapters instead
 rewrite whole 512-token manager blocks once per region (full-write rule).
@@ -31,11 +31,16 @@ from jax import lax
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
+from vllm_torchtpu.megakernel.models.qwen38_gdn_pool import (
+    CONV_ROWS,
+    SSM_BLOCKS,
+    SSM_ROWS,
+    pool_rows,
+)
+
 from .qwen38_gdn_state import Qwen38GdnPoolLayout, _conv_windows
 
 RING = 4
-SSM_BLOCKS = 3
-CONV_ROWS = 16
 
 
 def _store_typed(ref: Any, vals: Any, interpret: bool) -> None:
@@ -68,7 +73,6 @@ def scatter_gdn_ckpts_fast(
     NL, NS, T = write_blocks.shape
     n = NL * NS * T
     vh, KD, VD, QKV = layout.n_v, layout.d_k, layout.d_v, layout.conv_dim
-    split = layout.split
     rec = rec_ckpt.reshape(n, vh, KD, VD)  # row block (l, s, t), [layout: (s*T+t)*vh]
     win = _conv_windows(conv_ckpt.astype(jnp.float32), T).reshape(n, 3, QKV)
     ids = write_blocks.reshape(-1).astype(jnp.int32)
@@ -81,14 +85,16 @@ def scatter_gdn_ckpts_fast(
         def out_copies(slot, m):
             cps = [
                 pltpu.make_async_copy(
-                    vout.at[slot, j], pool_out.at[m * split + j], sout.at[slot, j]
+                    vout.at[slot, j],
+                    pool_rows(pool_out, m, j * SSM_ROWS, SSM_ROWS),
+                    sout.at[slot, j],
                 )
                 for j in range(SSM_BLOCKS)
             ]
             cps.append(
                 pltpu.make_async_copy(
                     cout.at[slot],
-                    pool_out.at[m * split + SSM_BLOCKS, pl.ds(0, CONV_ROWS)],
+                    pool_rows(pool_out, m, SSM_BLOCKS * SSM_ROWS, CONV_ROWS),
                     sout.at[slot, SSM_BLOCKS],
                 )
             )
@@ -159,7 +165,7 @@ def scatter_gdn_ckpts_fast(
             scratch_shapes=[
                 pltpu.VMEM((RING_, vh, KD, VD), rec.dtype),
                 pltpu.VMEM((RING_, 3, QKV), jnp.float32),
-                pltpu.VMEM((RING_, SSM_BLOCKS) + tuple(pool.shape[1:]), f8),
+                pltpu.VMEM((RING_, SSM_BLOCKS, SSM_ROWS) + tuple(pool.shape[2:]), f8),
                 pltpu.VMEM((RING_, CONV_ROWS) + tuple(pool.shape[2:]), f8),
                 pltpu.SemaphoreType.DMA((RING_, 2)),
                 pltpu.SemaphoreType.DMA((RING_, SSM_BLOCKS + 1)),

@@ -82,26 +82,29 @@ def _write_f32_rows(raw_block: np.ndarray, rows: np.ndarray, row0: int) -> None:
     raw_block[...] = np.moveaxis(b, -1, 3).reshape(kb, h2p, pack, lanes)
 
 
+def _manager_view(raw: np.ndarray) -> np.ndarray:
+    """[blocks * split, kb, ...] -> [blocks, 512, ...]: the same bytes, row-major per manager block."""
+    return raw.reshape(-1, 512, *raw.shape[2:])
+
+
 def ref_read(raw: np.ndarray, mgr: int) -> tuple[np.ndarray, np.ndarray]:
-    """(ssm [VH, KD, VD] f32, conv [3, QKV] f32) of manager block `mgr`."""
-    base = mgr * SPLIT
-    ssm_rows = np.concatenate([_f32_rows(raw[base + j]) for j in range(3)], axis=0)
-    ssm = ssm_rows.reshape(-1)[: VH * KD * VD].view(np.float32).reshape(VH, KD, VD)
-    conv_rows = _f32_rows(raw[base + 3])[:16]  # conv region: kernel block 3, rows 0..15
-    conv = conv_rows.reshape(-1)[: 3 * QKV].view(np.float32).reshape(3, QKV)
+    """(ssm [VH, KD, VD] f32, conv [3, QKV] f32) of manager block `mgr` (any kernel block)."""
+    rows = _f32_rows(_manager_view(raw)[mgr])
+    ssm = rows[:384].reshape(-1)[: VH * KD * VD].view(np.float32).reshape(VH, KD, VD)
+    conv = rows[384:400].reshape(-1)[: 3 * QKV].view(np.float32).reshape(3, QKV)
     return ssm, conv
 
 
 def ref_conv_pad_row(raw: np.ndarray, mgr: int) -> np.ndarray:
-    return _f32_rows(raw[mgr * SPLIT + 3])[15]
+    return _f32_rows(_manager_view(raw)[mgr])[399]
 
 
 def ref_write(raw: np.ndarray, mgr: int, ssm: np.ndarray, conv: np.ndarray) -> None:
-    base = mgr * SPLIT
-    flat = ssm.astype(np.float32).reshape(3, -1, LANES)
-    for j in range(3):
-        _write_f32_rows(raw[base + j], flat[j], 0)
-    _write_f32_rows(raw[base + 3], conv.astype(np.float32).reshape(15, LANES), 0)
+    view = _manager_view(raw)  # a view: writes land in `raw`
+    flat = np.concatenate(
+        [ssm.astype(np.float32).reshape(-1, LANES), conv.astype(np.float32).reshape(15, LANES)]
+    )
+    _write_f32_rows(view[mgr], flat, 0)
 
 
 def _bf16_round(x: np.ndarray) -> np.ndarray:

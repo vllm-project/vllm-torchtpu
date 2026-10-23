@@ -15,9 +15,10 @@
 
 The base `GDNBlock` takes per-layer `conv` / `rec` state arrays. Here the
 kernel reads them itself from the model's pool (extra input `gdn_pool`, one
-per-rank pool `[blocks * 4, 128, 1, 4, 256]` FP8 bytes): manager block `m`
-holds the f32 recurrent state `[vh, KD, VD]` in kernel blocks `4m .. 4m+2`
-and the f32 conv history `[3, QKV]` in the first rows of kernel block `4m+3`.
+per-rank pool `[blocks * split, kb, 1, 4, 256]` FP8 bytes, `kb * split = 512`):
+manager block `m` holds the f32 recurrent state `[vh, KD, VD]` in its rows
+`0 .. 383` and the f32 conv history `[3, QKV]` in rows `384 .. 399`, whatever
+the kernel block size `kb` (128 or 512 in served configs).
 `gdn_rb [NGDN, NS]` (SMEM) names each request's read block and `gdn_hi`
 whether it has a prior state (0 = start from zero). Bytes are reinterpreted
 with the same typed view as the model's own GDN kernel (`ref.bitcast` to f32,
@@ -41,9 +42,17 @@ from .qwen38 import Qwen38GDN
 POOL = "gdn_pool"
 READ_BLOCKS = "gdn_rb"
 HAS_STATE = "gdn_hi"
-SPLIT = 4  # kernel blocks per manager block
-SSM_BLOCKS = 3  # kernel blocks holding the recurrent state
+MANAGER_ROWS = 512  # pool rows (tokens) per manager block
+SSM_ROWS = 128  # pool rows per staged recurrent-state chunk
+SSM_BLOCKS = 3  # chunks holding the recurrent state (rows 0 .. 383)
 CONV_ROWS = 16  # pool rows holding the conv history (rounded to a power of two)
+
+
+def pool_rows(pool: Any, m: Any, row: int, n: int) -> Any:
+    """Rows `[row, row + n)` of manager block `m` of a `[blocks, kb, ...]` pool ref."""
+    kb = pool.shape[1]
+    assert MANAGER_ROWS % kb == 0 and row % kb + n <= kb, (kb, row, n)
+    return pool.at[m * (MANAGER_ROWS // kb) + row // kb, pl.ds(row % kb, n)]
 
 
 class _LayerView:
@@ -96,7 +105,7 @@ class Qwen38PoolGDN(Qwen38GDN):
         # supported everywhere, a view of a whole scratch ref is.
         for b in range(2):
             for j in range(SSM_BLOCKS):
-                scr[f"pg_raw{b}{j}"] = pltpu.VMEM((128, 1, 4, 256), f8)
+                scr[f"pg_raw{b}{j}"] = pltpu.VMEM((SSM_ROWS, 1, 4, 256), f8)
             scr[f"pg_craw{b}"] = pltpu.VMEM((CONV_ROWS, 1, 4, 256), f8)
         scr.update(
             pg_sem=pltpu.SemaphoreType.DMA((2, SSM_BLOCKS + 1)),
@@ -110,13 +119,15 @@ class Qwen38PoolGDN(Qwen38GDN):
         m = ctx.extra[READ_BLOCKS][o, s]
         cps = [
             pltpu.make_async_copy(
-                pool.at[m * SPLIT + j], scr[f"pg_raw{buf}{j}"], scr["pg_sem"].at[buf, j]
+                pool_rows(pool, m, j * SSM_ROWS, SSM_ROWS),
+                scr[f"pg_raw{buf}{j}"],
+                scr["pg_sem"].at[buf, j],
             )
             for j in range(SSM_BLOCKS)
         ]
         cps.append(
             pltpu.make_async_copy(
-                pool.at[m * SPLIT + SSM_BLOCKS, pl.ds(0, CONV_ROWS)],
+                pool_rows(pool, m, SSM_BLOCKS * SSM_ROWS, CONV_ROWS),
                 scr[f"pg_craw{buf}"],
                 scr["pg_sem"].at[buf, SSM_BLOCKS],
             )
