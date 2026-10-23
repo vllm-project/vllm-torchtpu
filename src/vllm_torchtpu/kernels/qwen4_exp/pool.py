@@ -173,6 +173,22 @@ def pooled_short_conv_speculative(
         dilation=dilation,
         request_owned_history=True,
     )
+    if x.shape[0] <= count * window:
+        values, targets = token_checkpoints(
+            x, history, starts, initial, active, ckpt_ids, windowed
+        )
+    else:
+        values, targets = request_checkpoints(
+            x, history, final, starts, initial, active, ckpt_ids, windowed
+        )
+    pool = write_region(pool, values, targets)
+    return pool, output
+
+
+def request_checkpoints(x, history, final, starts, initial, active, ckpt_ids, windowed):
+    """(values, targets) for every (request, window position) pair."""
+    count, window = ckpt_ids.shape
+    lengths = starts[1:] - starts[:-1]
     per_token = speculative_history_windows(x, history, starts, initial, window)
     steps = jnp.arange(window, dtype=jnp.int32)[None]
     # Non-windowed requests keep only their final history, in checkpoint 0.
@@ -185,5 +201,35 @@ def pooled_short_conv_speculative(
         windowed[:, None], steps < lengths[:, None], steps == 0
     )
     targets = jnp.where(write, ckpt_ids, 0).reshape(-1)
-    pool = write_region(pool, values.reshape(count * window, -1), targets)
-    return pool, output
+    return values.reshape(count * window, -1), targets
+
+
+def token_checkpoints(x, history, starts, initial, active, ckpt_ids, windowed):
+    """The same written (target, value) pairs as `request_checkpoints`, one row per token.
+
+    A checkpoint is the window ending at one chunk token, so decode and verify
+    buckets (T <= count * window) build T rows instead of count * window.
+    Windowed tokens past the window are dropped as before; a non-windowed
+    request writes its last token's window (its final history) to column 0.
+    """
+    token_count = x.shape[0]
+    count, window = ckpt_ids.shape
+    state_len = history.shape[1]
+    lengths = starts[1:] - starts[:-1]
+    t = jnp.arange(token_count, dtype=jnp.int32)
+    req = jnp.minimum(jnp.sum(t[:, None] >= starts[None, 1:], axis=1), count - 1)
+    rel = t - starts[req]
+    positions = rel[:, None] + 1 - state_len + jnp.arange(state_len, dtype=jnp.int32)[None]
+    past = history[req[:, None], jnp.clip(positions + state_len, 0, state_len - 1)]
+    past = jnp.where(initial[req][:, None, None], past, 0)
+    current = x[jnp.clip(starts[req][:, None] + positions, 0, max(token_count - 1, 0))]
+    values = jnp.where((positions >= 0)[..., None], current, past.astype(x.dtype))
+    win = windowed[req]
+    write = (
+        (t < starts[-1])
+        & active[req]
+        & jnp.where(win, rel < window, rel == lengths[req] - 1)
+    )
+    column = jnp.where(win, jnp.clip(rel, 0, window - 1), 0)
+    targets = jnp.where(write, ckpt_ids[req, column], 0)
+    return values.reshape(token_count, -1), targets
