@@ -1033,6 +1033,9 @@ def _pooled_qsa(
             ring=ring.reshape(len(ids), -1),
             tags=tags.reshape(len(ids), -1),
             ring_ids=ids,
+            run_starts=starts[:-1],
+            run_lengths=starts[1:] - starts[:-1],
+            run_length=max_query_len,
         )
     else:
         pool = write_compressed(
