@@ -50,8 +50,9 @@ from .qwen38_weights import head_groups, pack_segment_operands, segment_layers
 
 logger = init_logger(__name__)
 
-# The composed call beats stock only up to ~52-55 rows (mk/stock-segment-vs-rows.md).
-DEFAULT_BUCKETS = (4, 8, 16, 32)
+# With the C1 tiles the kernel beats stock through 64 rows (mk/kernel_work/
+# mk-row-slope/report.md vs mk/stock-segment-vs-rows.md); 64 is the margin case.
+DEFAULT_BUCKETS = (4, 8, 16, 32, 64)
 
 
 def _parse_buckets(raw: str) -> tuple[int, ...]:

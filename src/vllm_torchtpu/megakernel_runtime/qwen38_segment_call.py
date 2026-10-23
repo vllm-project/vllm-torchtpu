@@ -41,12 +41,18 @@ T_VERIFY = 4
 
 
 def ring_depths(B: int) -> tuple[int, int]:
-    """(expert, dense) ring slots per bucket: shallower rings leave VMEM for row scratch."""
+    """(expert, dense) ring slots per bucket.
+
+    The expert ring must hold more than one expert or expert streaming and
+    compute run serially (2.55 vs 1.49 us per expert measured at 48 rows); with
+    the HC all-reduce on `hier=2` the deeper rings below fit VMEM up to 64 rows
+    (mk/kernel_work/mk-row-slope/report.md, cut C1).
+    """
     if B <= 16:
         return 12, 10
-    if B <= 32:
+    if B <= 48:
         return 6, 10
-    return (3, 4) if B <= 64 else (2, 3)
+    return (6, 4) if B <= 64 else (2, 3)
 
 
 def segment_tiles(
@@ -54,11 +60,12 @@ def segment_tiles(
 ) -> Tiles:
     """Expert ring on the software-pipelined EP path (e13 in 2 tiles, e2 in 1).
 
-    Ring depths shrink with the bucket so the row scratch fits VMEM; the
-    bank sizes (hence every weight's tiling) are the same for all buckets.
+    Ring depths follow `ring_depths`; the bank sizes (hence every weight's
+    tiling) are the same for all buckets. `hier=2` by default (C1: lower
+    all-reduce growth per row, frees VMEM for the expert ring).
     """
     nbe, nbd = rings or ring_depths(B)
-    h = 1 if hier is None else hier
+    h = 2 if hier is None else hier
     return Tiles(ebank=2 << 20, nbe=nbe, nbd=nbd, vmem_mib=62, hier=h).with_blocks(
         {"moe": {"pipe_ep": True, "moe_unroll": True}}
     )
