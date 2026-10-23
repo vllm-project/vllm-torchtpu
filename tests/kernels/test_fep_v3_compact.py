@@ -11,7 +11,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Config.compact_message: the routing message's 64-token slots.
+"""Config.compact_message (the routing message's 64-token slots) and Config.reorder_chain.
 
 Why no token can be dropped: a top-k slot of a shard's message holds exactly one pair per token
 of the shard (slot k = every token's k-th choice), so a slot's entry count is the shard's row
@@ -20,7 +20,7 @@ shard's (padded) rows are <= COMPACT_MESSAGE_TOKENS, so every token keeps its pa
 Expert skew changes how many pairs land on a shard (the routed-rows tables, sized to the no-drop
 bound, untouched by the flag), not the message layout.
 
-test_geometry runs anywhere. The device tests (P3_BENCH=1, a v7x host) compare the layer with and
+test_geometry runs anywhere jax imports. The device tests (P3_BENCH=1, a v7x host) compare the layer with and
 without the flag on the same input: the outputs must be bit-identical, under standard-normal
 routing and under the adversarial "hot" routing where every token picks the same top_k experts
 (all on shard 0), from 384 to 2048 global rows (the flag is inactive above 64 rows per shard).
@@ -56,8 +56,8 @@ def test_geometry(per_shard):
         assert (tokens, pairs) == (tokens0, pairs0)  # inactive: the uncompacted geometry
 
 
-if not os.environ.get("P3_BENCH"):
-    pytest.skip("device tests: set P3_BENCH=1", allow_module_level=True)
+DEVICE = bool(os.environ.get("P3_BENCH"))
+device_only = pytest.mark.skipif(not DEVICE, reason="device tests: set P3_BENCH=1")
 
 import jax  # noqa: E402
 import jax.numpy as jnp  # noqa: E402
@@ -65,9 +65,10 @@ from jax.sharding import PartitionSpec as P  # noqa: E402
 
 from vllm_torchtpu.kernels.fused_moe.v3 import MESH_AXIS, Config, fused_ep_moe  # noqa: E402
 
-import sys  # noqa: E402
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import test_p3_fused_ep_scale as S  # noqa: E402
+if DEVICE:  # the device world (mesh, weights) of the fused EP scale test; it skips itself without P3_BENCH
+    import sys
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    import test_p3_fused_ep_scale as S
 
 BRIDGE = os.environ.get("P3_FEP_BRIDGE") == "1"
 if BRIDGE:
@@ -100,9 +101,16 @@ def _gating(kind, tokens):
     return g
 
 
+FLAGS = {"cm": {"compact_message": True}, "ro": {"reorder_chain": True},
+         "cmro": {"compact_message": True, "reorder_chain": True}}
+FLAG_SETS = [f for f in os.environ.get("P3_FEP_COMPACT_FLAGS", "cm,ro,cmro").split(",") if f]
+
+
+@device_only
+@pytest.mark.parametrize("flags", FLAG_SETS)
 @pytest.mark.parametrize("routing", ["normal", "hot"])
 @pytest.mark.parametrize("tokens", TOKENS)
-def test_compact_is_bit_identical(tokens, routing):
+def test_compact_is_bit_identical(tokens, routing, flags):
     mesh = S._mesh()
     n = S._shards(mesh)
     base = dataclasses.replace(
@@ -115,11 +123,11 @@ def test_compact_is_bit_identical(tokens, routing):
         assert (np.argsort(-g, axis=1)[:, :S.TOPK] == np.arange(S.TOPK)).all()
     gating = S._put(mesh, g, P(MESH_AXIS))
     want = _fn(mesh, base, n)(x, gating, w1, w2, s1, s2)
-    got_fn = _fn(mesh, dataclasses.replace(base, compact_message=True), n)
+    got_fn = _fn(mesh, dataclasses.replace(base, **FLAGS[flags]), n)
     got = got_fn(x, gating, w1, w2, s1, s2)
     same = bool(S._scalar(jnp.all(got == want)))
     num = S._check(mesh, got_fn, x, w1, w2, s1, s2, gating, S.TOPK)
-    print(f"FEP_COMPACT tokens={tokens} per_shard={tokens // n} routing={routing} "
+    print(f"FEP_COMPACT flags={flags} tokens={tokens} per_shard={tokens // n} routing={routing} "
           f"bit_identical={same} {num}", flush=True)
-    assert same, "compact_message changed the layer's output"
+    assert same, f"{flags} changed the layer's output"
     assert num["numerics_pass"], num
