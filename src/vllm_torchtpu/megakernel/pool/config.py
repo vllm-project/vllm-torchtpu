@@ -75,6 +75,8 @@ class CacheExec:
     # Host-side ckpt_indices bounds validation on every eager pooled-step call
     # (device-to-host sync + Python loop). In-kernel clamps always apply.
     check_ckpt_bounds: bool = False
+    dcp_kv_sharded: bool = False
+    dcp_size: int = 1  # Ranks sharing one KV head group (`R // NKV`)
 
     def __post_init__(self) -> None:
         if not any(
@@ -178,3 +180,9 @@ __all__ = [
     "resolved_max_pages_per_seq",
     "with_cache",
 ]
+
+
+def dcp_group(ex: ExecSpec) -> int:
+    """Ranks that token-shard one KV head group's pages (1 when unsharded)."""
+    cx = cache_exec(ex)
+    return cx.dcp_size if cx.dcp_kv_sharded else 1

@@ -28,7 +28,7 @@ import numpy as np
 from ..exec_spec import ExecSpec
 from ..ops import BF16, F32, FP8
 from .backend import check_ckpt_bounds
-from .config import cache_exec, resolved_max_pages_per_seq
+from .config import cache_exec, dcp_group, resolved_max_pages_per_seq
 from .layout import LANES, PoolLayout
 
 _DEFAULT_LAYOUT = PoolLayout()
@@ -274,10 +274,15 @@ def states_to_pool(
         )
         kc_g = np.asarray(jnp.clip(kc[:, g_idx], -448.0, 448.0).astype(FP8))
         vc_g = np.asarray(jnp.clip(vc[:, g_idx], -448.0, 448.0).astype(FP8))
+        dcp_g = dcp_group(ex)
         for r in range(R):
+            gi = r % dcp_g
             for s in range(NS):
                 for p in range(pages_per_seq):
-                    kp = int(pt[s, p])
+                    if dcp_g > 1 and (p % dcp_g) != gi:
+                        continue
+                    lp = (p // dcp_g) if dcp_g > 1 else p
+                    kp = int(pt[r, s, lp] if pt.ndim == 3 else pt[s, lp])
                     t0 = p * cache_exec(ex).page_size
                     k_sl = kc_g[r, s, t0 : t0 + cache_exec(ex).page_size]
                     v_sl = vc_g[r, s, t0 : t0 + cache_exec(ex).page_size]
@@ -358,12 +363,16 @@ def pool_to_states(
         pool_g = np.asarray(raw_pools[g_idx]).reshape(
             R, cache_exec(ex).num_pages, *page_shape
         )
+        dcp_g = dcp_group(ex)
         for r in range(R):
+            gi = r % dcp_g
             for s in range(NS):
                 for p in range(pages_per_seq):
-                    kp = int(pt[s, p])
+                    src_r = ((r - gi) + (p % dcp_g)) if dcp_g > 1 else r
+                    lp = (p // dcp_g) if dcp_g > 1 else p
+                    kp = int(pt[src_r, s, lp] if pt.ndim == 3 else pt[s, lp])
                     t0 = p * cache_exec(ex).page_size
-                    k_sl, v_sl = raw_page_to_kv(pool_g[r, kp])
+                    k_sl, v_sl = raw_page_to_kv(pool_g[src_r, kp])
                     kc_out[r, g_idx, s, t0 : t0 + cache_exec(ex).page_size] = (
                         np.asarray(k_sl)
                     )

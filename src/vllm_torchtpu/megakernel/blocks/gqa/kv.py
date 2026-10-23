@@ -61,7 +61,11 @@ def build_worklist(ctx: Any, ap: GQAParams) -> None:
     n = jnp.int32(0)
     for b in range(NS):
         nb = jnp.minimum(jnp.maximum((pos_ref[b * T] + BLK - 1) // BLK, 0), max_nb)
-        t0 = lax.rem(gi + (TS - b % TS), TS) if SPLIT else jnp.int32(0)
+        t0 = (
+            gi
+            if ap.DCP_SHARDED
+            else (lax.rem(gi + (TS - b % TS), TS) if SPLIT else jnp.int32(0))
+        )
         cnt = jnp.maximum(nb - t0 + TS - 1, 0) // TS
 
         def put(j, carry, b=b, t0=t0, n=n):
@@ -70,7 +74,7 @@ def build_worklist(ctx: Any, ap: GQAParams) -> None:
             if cache_exec(ex).paged_kv:
                 pt_ref_ = ST["page_table"]
                 pb = BLK // cache_exec(ex).page_size
-                p0 = (t0 + j * TS) * pb
+                p0 = (j if ap.DCP_SHARDED else (t0 + j * TS)) * pb
                 k0 = (n + j) * pb
                 for p in range(pb):
                     col = jnp.minimum(p0 + p, max_p - 1)

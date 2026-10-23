@@ -79,6 +79,7 @@ class GQAParams:
     theta: float
     zero_centered_norm: bool
     rope_fp32: bool = False
+    DCP_SHARDED: bool = False
 
     def qrow(self, b: int) -> tuple[int, int]:
         return b // self.PB, (b % self.PB) * self.nh
@@ -126,7 +127,15 @@ def derive_params(g: Any, ex: ExecSpec, plan: Any, tt: GQATunables) -> GQAParams
     nh = g.NH // ex.R
     nai = (2 * nh + 2) * g.HD
     G = max(1, ex.R // g.NKV)
-    BLK = tt.kv_blk
+    DCP_SHARDED = bool(
+        tt.split and G > 1 and cache_exec(ex).paged_kv and cache_exec(ex).dcp_kv_sharded
+    )
+    if DCP_SHARDED and cache_exec(ex).dcp_size != G:
+        raise MegakernelConfigError(
+            f"dcp_kv_sharded needs CacheExec.dcp_size == R // NKV = {G}, "
+            f"got {cache_exec(ex).dcp_size}"
+        )
+    BLK = cache_exec(ex).page_size if DCP_SHARDED else tt.kv_blk
     PAIR_KV = tt.pair_kv
     NKV = max(tt.nkv, 4) if PAIR_KV else tt.nkv
     assert ex.ctx % BLK == 0 and BLK % 128 == 0, (ex.ctx, BLK)
@@ -143,7 +152,8 @@ def derive_params(g: Any, ex: ExecSpec, plan: Any, tt: GQATunables) -> GQAParams
         assert (
             ex.ctx % cache_exec(ex).page_size == 0
             and cache_exec(ex).num_pages >= 1
-            and resolved_max_pages_per_seq(ex) >= ex.ctx // cache_exec(ex).page_size
+            and resolved_max_pages_per_seq(ex) * (G if DCP_SHARDED else 1)
+            >= ex.ctx // cache_exec(ex).page_size
         ), (
             cache_exec(ex).page_size,
             ex.ctx,
@@ -168,7 +178,7 @@ def derive_params(g: Any, ex: ExecSpec, plan: Any, tt: GQATunables) -> GQAParams
         and g.HD == KVE_HD
     )
     NKVR = tiles.nbe if KVE else NKV
-    SUB = tt.kv_sub or BLK
+    SUB = min(tt.kv_sub, BLK) if tt.kv_sub else BLK
     assert BLK % SUB == 0 and SUB % 128 == 0, (BLK, SUB)
     SPLIT = tt.split and G > 1
     assert not SPLIT or (G & (G - 1) == 0), G
@@ -251,6 +261,7 @@ def derive_params(g: Any, ex: ExecSpec, plan: Any, tt: GQATunables) -> GQAParams
         theta=g.theta,
         zero_centered_norm=bool(g.zero_centered_norm),
         rope_fp32=bool(tt.rope_fp32),
+        DCP_SHARDED=DCP_SHARDED,
     )
 
 

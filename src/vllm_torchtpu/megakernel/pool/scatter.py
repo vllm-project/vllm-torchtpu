@@ -26,7 +26,7 @@ from jax.experimental.pallas import tpu as pltpu
 from ..exec_spec import ExecSpec
 from ..ops import BF16, FP8, I32
 from .backend import check_ckpt_bounds, resolve_active_seqs
-from .config import cache_exec
+from .config import cache_exec, dcp_group
 from .layout import PoolLayout
 from .scatter_ckpt import prepare_ckpt
 from .scatter_ctx import ScatterGeom, ScatterKernel
@@ -133,11 +133,23 @@ def scatter_pool_states(
     # Pre-gather and clamp only the (NS, T) active KV page indices for SMEM
     pt_cols = page_table.shape[1]
     pos_st = pos[: NS * T].reshape(NS, T)
-    lp_idx = jnp.clip(lax.div(pos_st, page_size), 0, pt_cols - 1)
     s_idx_arr = jnp.arange(NS, dtype=I32)[:, None]
-    kv_pages = jnp.clip(
-        page_table[s_idx_arr, lp_idx], 0, cache_exec(ex).num_pages - 1
-    ).astype(I32)
+    dcp_g = dcp_group(ex)
+    if dcp_g > 1:
+        gi = lax.rem(lax.axis_index("tp"), dcp_g)
+        blk_g = lax.div(pos_st, page_size)
+        lp_idx = jnp.clip(lax.div(blk_g, dcp_g), 0, pt_cols - 1)
+        raw_kp = jnp.clip(
+            page_table[s_idx_arr, lp_idx], 0, cache_exec(ex).num_pages - 1
+        ).astype(I32)
+        valid_kv = jnp.logical_and(pos_st >= 0, lax.rem(blk_g, dcp_g) == gi)
+        kv_pages = jnp.where(valid_kv, raw_kp, jnp.int32(-1))
+    else:
+        lp_idx = jnp.clip(lax.div(pos_st, page_size), 0, pt_cols - 1)
+        raw_kp = jnp.clip(
+            page_table[s_idx_arr, lp_idx], 0, cache_exec(ex).num_pages - 1
+        ).astype(I32)
+        kv_pages = jnp.where(pos_st >= 0, raw_kp, jnp.int32(-1))
 
     conv_in, conv_buf_shape, conv_buf_dt, ckpt_geom = prepare_ckpt(
         layout,

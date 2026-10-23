@@ -79,7 +79,8 @@ def baseline_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
     `nbe=6` for `B > 48` so 64-row MoE scratch fits VMEM). Every opt-in
     performance flag stays at its `Tiles` default (off). `moe_tp` is accepted
     for the tile-rule signature and ignored. Hierarchical all-reduce (`hier`
-    1/2) is v7x-8 specific, so `R` outside `{1, 8}` falls back to the flat ring.
+    1/2) is v7x-8 specific; power-of-2 meshes with `R > 8` use recursive
+    doubling (`hier=3`, `rsag=False`), and smaller non-8 meshes use `hier=0`.
     """
     del moe_tp
     if B > 48:
@@ -99,7 +100,10 @@ def baseline_tiles(B: int, *, moe_tp: bool = False, R: int = 8) -> Tiles:
     else:
         t = DECODE_TILES
     if R not in (1, 8) and t.hier != 0:
-        t = dataclasses.replace(t, hier=0)
+        if R > 8 and (R & (R - 1)) == 0:
+            t = dataclasses.replace(t, hier=3, rsag=False)
+        else:
+            t = dataclasses.replace(t, hier=0)
     return t
 
 
