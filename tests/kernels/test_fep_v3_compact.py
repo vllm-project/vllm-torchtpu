@@ -20,7 +20,7 @@ shard's (padded) rows are <= COMPACT_MESSAGE_TOKENS, so every token keeps its pa
 Expert skew changes how many pairs land on a shard (the routed-rows tables, sized to the no-drop
 bound, untouched by the flag), not the message layout.
 
-test_geometry runs anywhere jax imports. The device tests (P3_BENCH=1, a v7x host) compare the layer with and
+test_geometry runs anywhere jax imports (off a TPU it uses TPU7x's published sparse-core info). The device tests (P3_BENCH=1, a v7x host) compare the layer with and
 without the flag on the same input: the outputs must be bit-identical, under standard-normal
 routing and under the adversarial "hot" routing where every token picks the same top_k experts
 (all on shard 0), from 384 to 2048 global rows (the flag is inactive above 64 rows per shard).
@@ -41,8 +41,29 @@ TOP_K = 10
 SHARDS = 8
 
 
+@pytest.fixture
+def tpu_info_off_device(monkeypatch):
+    """Off a TPU (CPU CI), the geometry's sparse-core count comes from the
+    published TPU7x info, the chip the layer serves on; on a TPU, from the
+    device as in serving."""
+    import jax
+    from jax.experimental.pallas import tpu as pltpu
+    if jax.default_backend() != "tpu":
+        import importlib
+        info = pltpu.get_tpu_info_for_chip(pltpu.ChipVersion.TPU_7X, 1)
+        monkeypatch.setattr(pltpu, "get_tpu_info", lambda: info)
+        # plsc.VectorSubcoreMesh reads the info through jax's own modules.
+        for name in ("jax._src.pallas.mosaic.tpu_info", "jax._src.tpu_info"):
+            try:
+                mod = importlib.import_module(name)
+            except ImportError:
+                continue
+            if hasattr(mod, "get_tpu_info"):
+                monkeypatch.setattr(mod, "get_tpu_info", lambda: info)
+
+
 @pytest.mark.parametrize("per_shard", [8, 48, 56, 64, 72, 112, 128, 256, 1024])
-def test_geometry(per_shard):
+def test_geometry(per_shard, tpu_info_off_device):
     bps = 8
     rows, tokens, pairs = L.pallas_geometry(per_shard, TOP_K, SHARDS, bps, compact=True)
     rows0, tokens0, pairs0 = L.pallas_geometry(per_shard, TOP_K, SHARDS, bps)
