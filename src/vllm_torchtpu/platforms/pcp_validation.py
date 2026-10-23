@@ -97,7 +97,7 @@ class PcpStaticSupportValidator:
             return config
 
         if envs.USE_TPU_PCP_MANAGER:
-            from vllm_torchtpu.runner.pcp_manager import validate_pcp_manager_config
+            from vllm_torchtpu.runner.pcp import validate_pcp_manager_config
 
             validate_pcp_manager_config(vllm_config)
             return config

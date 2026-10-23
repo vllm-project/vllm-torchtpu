@@ -13,8 +13,9 @@
 # limitations under the License.
 """PCP manager sparse MLA (`USE_TPU_PCP_MANAGER=1`) vs a numpy reference.
 
-One layer on 8 chips, DCP 8 x PCP {2, 4, 8}: `PcpManager.prepare_real` plans
-every PCP rank's step, `sparse_mla_pcp_write_split` writes the split rows into
+One layer on 8 chips, DCP 8 x PCP {2, 4, 8}:
+`HeadTailPcpShardingPlan.prepare_real` plans every PCP rank's step,
+`sparse_mla_pcp_write_split` writes the split rows into
 the DCP-sharded cache and `sparse_mla_attention_pcp_prefill` attends each
 local query's top-k (global positions) through the gathered workspace. The
 reference is f32 MLA over the same fp8-rounded latents, request by request,
@@ -55,7 +56,7 @@ from vllm_torchtpu.kernels.mla.kv_cache_utils import (
 from vllm_torchtpu.kernels.mla.sparse import kernel as sparse_mla_kernel
 from vllm_torchtpu.layers.adapter.pcp_kv_gather import pcp_chunk_pages
 from vllm_torchtpu.layers.core import attention_interface
-from vllm_torchtpu.runner.pcp_manager import PcpManager
+from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import HeadTailPcpShardingPlan
 
 pytestmark = [pytest.mark.tpu_test, pytest.mark.multichip]
 
@@ -121,7 +122,7 @@ def _plan_step(pcp, num_computed, num_prompt, q_lens):
     seq_lens = [c + q for c, q in zip(num_computed, q_lens)]
     plans = []
     for rank in range(pcp):
-        manager = PcpManager(
+        manager = HeadTailPcpShardingPlan(
             pcp_size=pcp,
             pcp_rank=rank,
             dcp_size=DCP,
@@ -132,7 +133,7 @@ def _plan_step(pcp, num_computed, num_prompt, q_lens):
         )
         assert MAX_REQS * manager.local_reqs_per_req == LOCAL_REQS
         runner = _fake_runner(num_computed, num_prompt, q_lens, seq_lens)
-        plan = manager.prepare_real(
+        manager.prepare_real(
             runner=runner,
             scheduler_output=None,
             start_index=0,
@@ -145,7 +146,7 @@ def _plan_step(pcp, num_computed, num_prompt, q_lens):
         )
         plans.append(
             SimpleNamespace(
-                plan=plan,
+                plan=manager,
                 qsl=runner.query_start_loc_np.copy(),
                 seq_lens=runner.seq_lens_np.copy(),
                 num_ws_pages=manager.num_ws_pages,
@@ -357,10 +358,10 @@ def test_pcp_prefill_matches_numpy(monkeypatch, scenario, pcp, layout):
             *caches,
             jnp.asarray(_by_dcp_rank(pcp, kv_rows)),
             jnp.asarray(_by_dcp_rank(pcp, pe_rows)),
-            _rep(plan0.hidden_restore_idx.numpy()),
-            _rep(plan0.split_seq_lens_cpu.numpy()),
+            _rep(plan0.host_metadata["hidden_restore_idx"]),
+            _rep(plan0.host_metadata["split_seq_lens"]),
             _rep(st.split_tables.reshape(-1)),
-            _rep(plan0.split_query_start_loc_cpu.numpy()),
+            _rep(plan0.host_metadata["split_query_start_loc"]),
             mesh,
             nope_spec,
             rope_spec,
@@ -374,15 +375,15 @@ def test_pcp_prefill_matches_numpy(monkeypatch, scenario, pcp, layout):
             jnp.asarray(q_global[..., LKV_DIM:], jnp.bfloat16),
             _shard(pcp, topk_rows),
             _rep(st.split_tables),
-            _rep(plan0.ws_req),
-            _rep(plan0.ws_vpage),
-            _shard(pcp, [r.plan.local_ws_page_offset for r in st.ranks]),
+            _rep(plan0.host_metadata["ws_req"]),
+            _rep(plan0.host_metadata["ws_vpage"]),
+            _shard(pcp, [r.plan.host_metadata["ws_page_offset"] for r in st.ranks]),
             _shard(pcp, [r.qsl for r in st.ranks]),
             _shard(
                 pcp, [np.array([0, 0, r.plan.local_num_split_reqs]) for r in st.ranks]
             ),
-            _rep([plan0.num_split_reqs]),
-            _rep([plan0.ws_used_pages]),
+            _rep(plan0.host_metadata["num_split_reqs"]),
+            _rep(plan0.host_metadata["ws_used_pages"]),
             mesh,
             nope_spec,
             rope_spec,
@@ -553,20 +554,20 @@ def test_pcp_indexer_topk_matches_numpy(monkeypatch, scenario, pcp):
             jnp.asarray(_by_dcp_rank(pcp, q_rows)).view(jnp.uint8),
             jnp.asarray(_by_dcp_rank(pcp, w_rows)),
             jnp.asarray(_by_dcp_rank(pcp, k_rows)),
-            _rep(plan0.hidden_restore_idx.numpy()),
-            _rep(plan0.split_seq_lens_cpu.numpy()),
+            _rep(plan0.host_metadata["hidden_restore_idx"]),
+            _rep(plan0.host_metadata["split_seq_lens"]),
             _rep(st.split_tables.reshape(-1)),
-            _rep(plan0.split_query_start_loc_cpu.numpy()),
-            _rep(plan0.ws_req),
-            _rep(plan0.ws_vpage),
-            _shard(pcp, [r.plan.local_ws_page_offset for r in st.ranks]),
+            _rep(plan0.host_metadata["split_query_start_loc"]),
+            _rep(plan0.host_metadata["ws_req"]),
+            _rep(plan0.host_metadata["ws_vpage"]),
+            _shard(pcp, [r.plan.host_metadata["ws_page_offset"] for r in st.ranks]),
             _shard(pcp, [r.seq_lens for r in st.ranks]),
             _shard(pcp, [r.qsl for r in st.ranks]),
             _shard(
                 pcp, [np.array([0, 0, r.plan.local_num_split_reqs]) for r in st.ranks]
             ),
-            _rep([plan0.num_split_reqs]),
-            _rep([plan0.ws_used_pages]),
+            _rep(plan0.host_metadata["num_split_reqs"]),
+            _rep(plan0.host_metadata["ws_used_pages"]),
         )
         topk = np.asarray(topk).reshape(DCP, local_padded, IDX_TOPK)
 

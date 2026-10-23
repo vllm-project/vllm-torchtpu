@@ -27,6 +27,7 @@ if TYPE_CHECKING:
     TPU_DCP_RS_OUT_PRECISION: bool = True
     TPU_MLA_SPARSE_SPLIT_Q: bool = False
     USE_TPU_PCP_MANAGER: bool = False
+    TPU_PCP_SHARDING_PLAN: str = "headtail"
     TPU_PCP_KV_WORKSPACE_TOKENS: int = 1048576
     TPU_PCP_KV_CHUNK_TOKENS: int = 65536
     JAX_PLATFORMS: str = ""
@@ -435,8 +436,14 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # lane-padded tiles cost a broadcast init, a relayout copy and padded
     # copies through the LSE merge. Bit-identical outputs.
     "TPU_MLA_SPARSE_SPLIT_Q": env_bool("TPU_MLA_SPARSE_SPLIT_Q", default=False),
-    # Run PCP through `runner/pcp_manager.py` (PCP x DCP KV gather).
+    # Run PCP through `runner/pcp/manager.py` (PCP x DCP KV gather).
     "USE_TPU_PCP_MANAGER": env_bool("USE_TPU_PCP_MANAGER", default=False),
+    "TPU_PCP_SHARDING_PLAN": env_with_choices(
+        "TPU_PCP_SHARDING_PLAN",
+        "headtail",
+        ["headtail", "interleaved"],
+        case_sensitive=False,
+    ),
     # PCP manager: max context tokens one step's split prefills may gather.
     "TPU_PCP_KV_WORKSPACE_TOKENS": env_int("TPU_PCP_KV_WORKSPACE_TOKENS", 1048576),
     # PCP manager: context tokens gathered per all-gather chunk.

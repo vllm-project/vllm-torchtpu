@@ -25,11 +25,14 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_torchtpu.layers.adapter.pcp_kv_gather import pcp_chunk_pages
-from vllm_torchtpu.runner.pcp_manager import PcpManager, mla_kv_page_size
+from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import (
+    HeadTailPcpShardingPlan,
+    mla_kv_page_size,
+)
 
 
 def _manager(page_size, workspace_tokens=262144, dcp_size=8):
-    return PcpManager(
+    return HeadTailPcpShardingPlan(
         pcp_size=4,
         pcp_rank=0,
         dcp_size=dcp_size,

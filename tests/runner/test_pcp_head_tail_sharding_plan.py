@@ -11,16 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Host-side PCP batch partitioning (`runner/pcp_partition.py`)."""
+"""Host-side head-tail PCP partitioning (`runner/pcp/head_tail_sharding_plan.py`)."""
 
 import itertools
 import random
 
 import pytest
 
-from vllm_torchtpu.runner.pcp_partition import (
-    build_pcp_batch_plan,
-    build_workspace_plan,
+from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import (
+    PcpBatchPlan,
+    PcpWorkspacePlan,
     pcp_max_local_tokens,
     pcp_rank_token_counts,
 )
@@ -68,7 +68,7 @@ def _check_invariants(plan, num_scheduled_tokens):
 
 
 def test_single_prefill_dual_chunk_swap():
-    plan = build_pcp_batch_plan([16], [True], pcp_size=4)
+    plan = PcpBatchPlan.from_schedule([16], [True], pcp_size=4)
     assert plan.replicated == [False]
     # 8 chunks of 2: rank r takes chunk r and chunk 7 - r.
     assert _spans(plan.local_segments(0)) == [(0, 0, 2), (0, 14, 16)]
@@ -80,7 +80,7 @@ def test_single_prefill_dual_chunk_swap():
 
 def test_decode_is_replicated_and_ordered_last():
     # A decode listed before a prefill still lands after the split segments.
-    plan = build_pcp_batch_plan([1, 8], [False, True], pcp_size=2)
+    plan = PcpBatchPlan.from_schedule([1, 8], [False, True], pcp_size=2)
     assert plan.replicated == [True, False]
     assert _spans(plan.local_segments(0)) == [(1, 1, 3), (1, 7, 9), (0, 0, 1)]
     assert _spans(plan.local_segments(1)) == [(1, 3, 5), (1, 5, 7), (0, 0, 1)]
@@ -91,7 +91,7 @@ def test_decode_is_replicated_and_ordered_last():
 
 
 def test_short_prefill_is_split():
-    plan = build_pcp_batch_plan([3], [True], pcp_size=2)
+    plan = PcpBatchPlan.from_schedule([3], [True], pcp_size=2)
     # 4 chunks of 1: rank 0 takes chunk 0 (chunk 3 is empty), rank 1 chunks 1, 2.
     assert _spans(plan.local_segments(0)) == [(0, 0, 1)]
     assert _spans(plan.local_segments(1)) == [(0, 1, 2), (0, 2, 3)]
@@ -99,7 +99,7 @@ def test_short_prefill_is_split():
 
 
 def test_only_decodes_replicate():
-    plan = build_pcp_batch_plan([3, 1, 63], [True, False, True], pcp_size=4)
+    plan = PcpBatchPlan.from_schedule([3, 1, 63], [True, False, True], pcp_size=4)
     assert plan.replicated == [False, True, False]
     for rank in range(4):
         segments = plan.local_segments(rank)
@@ -109,7 +109,7 @@ def test_only_decodes_replicate():
 
 
 def test_uneven_prefill_and_padding():
-    plan = build_pcp_batch_plan(
+    plan = PcpBatchPlan.from_schedule(
         [10, 1, 7],
         [True, False, True],
         pcp_size=2,
@@ -127,7 +127,7 @@ def test_uneven_prefill_and_padding():
 
 def test_padding_smaller_than_largest_rank_rejected():
     with pytest.raises(ValueError):
-        build_pcp_batch_plan([16], [True], pcp_size=4, num_local_tokens_padded=3)
+        PcpBatchPlan.from_schedule([16], [True], pcp_size=4, num_local_tokens_padded=3)
 
 
 @pytest.mark.parametrize("pcp_size", [1, 2, 4])
@@ -140,7 +140,7 @@ def test_random_batches_keep_invariants(pcp_size):
         ([4, 4], [False, False]),  # speculative verifies stay replicated
     ]
     for q_lens, prefilling in cases:
-        plan = build_pcp_batch_plan(q_lens, prefilling, pcp_size)
+        plan = PcpBatchPlan.from_schedule(q_lens, prefilling, pcp_size)
         _check_invariants(plan, q_lens)
         assert (
             pcp_rank_token_counts(q_lens, prefilling, pcp_size)
@@ -172,7 +172,9 @@ def test_max_local_tokens_bounds_every_schedulable_step(pcp_size):
 
 def test_workspace_plan_lays_requests_back_to_back():
     # virtual page = 64 tokens; req 1 is a decode and is left out.
-    plan = build_workspace_plan([0, 2], [100, 7, 64], virtual_page_size=64, num_pages=4)
+    plan = PcpWorkspacePlan.from_requests(
+        [0, 2], [100, 7, 64], virtual_page_size=64, num_pages=4
+    )
     assert plan.page_offset == {0: 0, 2: 2}
     assert plan.ws_req == [0, 0, 2, 0]
     assert plan.ws_vpage == [0, 1, 0, 0]
@@ -181,4 +183,4 @@ def test_workspace_plan_lays_requests_back_to_back():
 
 def test_workspace_plan_overflow_rejected():
     with pytest.raises(ValueError):
-        build_workspace_plan([0], [129], virtual_page_size=64, num_pages=2)
+        PcpWorkspacePlan.from_requests([0], [129], virtual_page_size=64, num_pages=2)

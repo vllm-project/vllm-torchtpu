@@ -14,7 +14,7 @@
 """Out-of-tree (OOT) custom operator layers and wrappers for
 Multi-Head Latent Attention (MLA)."""
 
-from typing import Any, cast
+from typing import Any, ClassVar, cast
 
 import jax
 import jax.numpy as jnp
@@ -1246,6 +1246,10 @@ class TPUDummyMLAPrefillBackend:
 
 class VllmTPUMLAAttention(MLAAttention):
     """TPU-optimized out-of-tree wrapper for Multi-Head Latent Attention."""
+
+    # PCP x DCP runs the PCP manager's KV-gather path
+    # (USE_TPU_PCP_MANAGER=1); `pcp_validation` rejects it otherwise.
+    supports_pcp_dcp: ClassVar[bool] = True
 
     def __init__(
         self,

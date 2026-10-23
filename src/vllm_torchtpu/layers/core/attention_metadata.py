@@ -32,6 +32,7 @@ from vllm.v1.kv_cache_interface import (
     UniformTypeKVCacheSpecs,
 )
 
+from vllm_torchtpu.layers.core.pcp_metadata import PcpMetadata
 from vllm_torchtpu.layers.core.sequence_layout import (
     DEFAULT_SEQUENCE_LAYOUT_DESCRIPTOR,
     DEFAULT_SEQUENCE_LAYOUT_PROTOCOL,
@@ -54,53 +55,6 @@ def attention_block_table_width(
         pages * getattr(block_table, "blocks_per_kv_block", 1),
         block_table.max_num_blocks_per_req,
     )
-
-
-@functools.partial(
-    jax.tree_util.register_dataclass,
-    data_fields=[
-        "split_block_tables",
-        "split_seq_lens",
-        "split_query_start_loc",
-        "hidden_restore_idx",
-        "rep_row_idx",
-        "rep_block_tables",
-        "rep_seq_lens",
-        "rep_query_start_loc",
-        "rep_request_distribution",
-        "ws_req",
-        "ws_vpage",
-        "ws_page_offset",
-        "num_split_reqs",
-        "ws_used_pages",
-    ],
-    meta_fields=[],
-)
-@dataclass
-class PcpMetadata:
-    """PCP manager attention metadata (see `runner/pcp_manager.py`)."""
-
-    # The split prefills, request-major: block tables, seq_lens,
-    # query_start_loc, and each split token's PCP-gathered row.
-    split_block_tables: jax.Array | None = None
-    split_seq_lens: jax.Array | None = None
-    split_query_start_loc: jax.Array | None = None
-    hidden_restore_idx: jax.Array | None = None
-    # The replicated decodes as their own request window: local rows, block
-    # tables, seq_lens, query_start_loc, request_distribution.
-    rep_row_idx: jax.Array | None = None
-    rep_block_tables: jax.Array | None = None
-    rep_seq_lens: jax.Array | None = None
-    rep_query_start_loc: jax.Array | None = None
-    rep_request_distribution: jax.Array | None = None
-    # KV workspace: request and virtual page of each workspace page, first
-    # workspace page of each local split segment, split request count (1,),
-    # pages in use (1,).
-    ws_req: jax.Array | None = None
-    ws_vpage: jax.Array | None = None
-    ws_page_offset: jax.Array | None = None
-    num_split_reqs: jax.Array | None = None
-    ws_used_pages: jax.Array | None = None
 
 
 @functools.partial(
@@ -167,7 +121,7 @@ class AttentionMetadata:
     # the first two groups. None unless the model has mamba layers and spec
     # decoding is enabled.
     mamba_request_distribution: jax.Array | torch.Tensor | None = None
-    # PCP manager only (see `runner/pcp_manager.py`); None elsewhere.
+    # PCP manager only (see `runner/pcp/manager.py`); None elsewhere.
     pcp_metadata: PcpMetadata | None = None
     sequence_layout_kind: str = SequenceLayoutKind.ALL.value
     sequence_layout_protocol: str = DEFAULT_SEQUENCE_LAYOUT_PROTOCOL
@@ -237,8 +191,7 @@ class AttentionMetadataBuilderContext:
     # Persistent-batch row of each request (None: rows [start_index,
     # start_index + num_reqs)). Set by the PCP manager.
     block_table_rows: Any = None
-    # PCP manager device fields (`PcpKvGatherFields`).
-    pcp_kv_gather: Any = None
+    use_pcp_manager: bool = False
 
 
 def _staged_walk_products(
@@ -601,28 +554,14 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
             mamba_slot_read_offsets = None
             mamba_request_distribution = None
 
-        pcp_fields = ctx.pcp_kv_gather
         pcp_metadata = (
             None
-            if pcp_fields is None
-            else build_pcp_metadata(
-                pcp_fields,
-                split_block_tables=_pcp_block_tables_for_rows(
-                    runner,
-                    ctx,
-                    block_table_obj,
-                    pcp_fields.split_block_rows,
-                    target_num_reqs,
-                    target_num_blocks,
-                ),
-                rep_block_tables=_pcp_block_tables_for_rows(
-                    runner,
-                    ctx,
-                    block_table_obj,
-                    pcp_fields.rep_block_rows,
-                    pcp_fields.rep_window,
-                    target_num_blocks,
-                ),
+            if not ctx.use_pcp_manager
+            else runner.pcp_manager.build_metadata(
+                runner=runner,
+                block_table_obj=block_table_obj,
+                target_num_reqs=target_num_reqs,
+                target_num_blocks=target_num_blocks,
             )
         )
 
@@ -643,28 +582,6 @@ class AttentionMetadataBuilder(BaseAttentionMetadataBuilder):
         )
 
 
-def build_pcp_metadata(
-    fields: Any, *, split_block_tables: Any, rep_block_tables: Any
-) -> PcpMetadata:
-    """Build `PcpMetadata` from the PCP manager's `PcpKvGatherFields`."""
-    return PcpMetadata(
-        split_block_tables=split_block_tables,
-        split_seq_lens=fields.split_seq_lens,
-        split_query_start_loc=fields.split_query_start_loc,
-        hidden_restore_idx=fields.hidden_restore_idx,
-        rep_row_idx=fields.rep_row_idx,
-        rep_block_tables=rep_block_tables,
-        rep_seq_lens=fields.rep_seq_lens,
-        rep_query_start_loc=fields.rep_query_start_loc,
-        rep_request_distribution=fields.rep_request_distribution,
-        ws_req=fields.ws_req,
-        ws_vpage=fields.ws_vpage,
-        ws_page_offset=fields.ws_page_offset,
-        num_split_reqs=fields.num_split_reqs,
-        ws_used_pages=fields.ws_used_pages,
-    )
-
-
 def _copy_block_table_rows(
     dst: torch.Tensor,
     source: torch.Tensor,
@@ -679,26 +596,6 @@ def _copy_block_table_rows(
     else:
         rows = torch.as_tensor(ctx.block_table_rows, dtype=torch.long)
         dst[: ctx.num_reqs] = source[:, :target_num_blocks].index_select(0, rows)
-
-
-def _pcp_block_tables_for_rows(
-    runner: Any,
-    ctx: AttentionMetadataBuilderContext,
-    block_table_obj: Any,
-    rows: Any,
-    target_num_reqs: int,
-    target_num_blocks: int,
-) -> torch.Tensor:
-    """Block tables of the given persistent-batch rows, zero-padded."""
-    fields = ctx.pcp_kv_gather
-    table = torch.zeros((target_num_reqs, target_num_blocks), dtype=torch.int32)
-    if rows is not None and len(rows):
-        source = block_table_obj.get_cpu_tensor()
-        table[: len(rows)] = source[:, :target_num_blocks].index_select(
-            0, torch.as_tensor(rows, dtype=torch.long)
-        )
-    fields.keepalive.append(table)  # outlive the non-blocking upload
-    return table.reshape(-1).to(runner.device, non_blocking=True)
 
 
 def stage_block_table_uploads(

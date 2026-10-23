@@ -25,14 +25,14 @@ import numpy as np
 import pytest
 import torch
 
-from vllm_torchtpu.runner.pcp_manager import PcpManager
+from vllm_torchtpu.runner.pcp.head_tail_sharding_plan import HeadTailPcpShardingPlan
 
 MAX_NUM_SEQS = 8
 TOKEN_PADDINGS = [16, 32, 64, 128, 256, 512, 1024, 2048, 4096]
 
 
 def _manager(pcp_size, pcp_rank=0):
-    return PcpManager(
+    return HeadTailPcpShardingPlan(
         pcp_size=pcp_size,
         pcp_rank=pcp_rank,
         dcp_size=8,
@@ -73,7 +73,7 @@ def _prepare(manager, num_prefills, target_num_reqs):
     num_computed = [0] * num_prefills + [500] * num_decodes
     num_prompt = [q + 100 for q in q_lens[:num_prefills]] + [500] * num_decodes
     runner = _runner(num_computed, num_prompt, q_lens, target_num_reqs)
-    return manager.prepare_real(
+    manager.prepare_real(
         runner=runner,
         scheduler_output=None,
         start_index=0,
@@ -84,6 +84,7 @@ def _prepare(manager, num_prefills, target_num_reqs):
         target_num_reqs=target_num_reqs,
         padded_num_reqs=MAX_NUM_SEQS,
     )
+    return manager
 
 
 def test_pcp_manager_needs_two_local_reqs_per_req():
@@ -105,4 +106,4 @@ def test_local_reqs_fit_the_scaled_bucket(pcp_size, num_prefills):
         assert plan.local_num_reqs <= target
         assert plan.local_num_split_reqs == 2 * num_prefills
         assert plan.rep_num_reqs == MAX_NUM_SEQS - num_prefills
-        assert len(plan.local_ws_page_offset) == target
+        assert len(plan.host_metadata["ws_page_offset"]) == target
