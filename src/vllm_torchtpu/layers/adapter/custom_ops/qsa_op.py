@@ -526,6 +526,10 @@ def build_pooled_qsa_shard_op(tp_group, a2a_min_tokens: int = 0):
     """
     world = int(tp_group.world_size)
     rank = int(tp_group.rank_in_group)
+    # Build the Pallas ops now, at layer construction: jax_op inspects the
+    # step function's signature, which Dynamo cannot trace inside forward.
+    shard_ops = {with_rows: _shard_ops(with_rows) for with_rows in (False, True)}
+    merge_op = _merge_op()
 
     def run(*args, kv_heads, **kwargs):
         args = list(args)
@@ -533,7 +537,7 @@ def build_pooled_qsa_shard_op(tp_group, a2a_min_tokens: int = 0):
             if index < len(args):
                 args[index] = args[index].to(torch.int32)
         with_rows = len(args) == 17
-        select, attend = _shard_ops(with_rows)
+        select, attend = shard_ops[with_rows]
         pool = args[10]
         updated, q, gate, lengths, req, starts, candidates = select(
             *args, shard_rank=rank, shard_size=world, **kwargs
@@ -547,7 +551,7 @@ def build_pooled_qsa_shard_op(tp_group, a2a_min_tokens: int = 0):
                 candidates.reshape(world, tokens // world, *candidates.shape[1:]),
                 tp_group,
             )
-            blocks = _merge_op()(received, ratio, topk)
+            blocks = merge_op(received, ratio, topk)
             gathered = _all_gather_ranks(blocks, tp_group).reshape(tokens, -1)
             merged = True
         else:
