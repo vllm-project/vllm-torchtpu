@@ -244,25 +244,53 @@ class Qwen38Segments(nn.Module):
             ]
         return meta
 
+    def chunks(self, rows: int) -> list[tuple[int, int]]:
+        """`(first row, rows)` per kernel call: one call, or equal halves above the
+        largest bucket (each half is whole requests, `T_VERIFY` rows each)."""
+        if rows in self.buckets:
+            return [(0, rows)]
+        half = rows // 2
+        assert rows % 2 == 0 and half % T_VERIFY == 0 and half in self.buckets, rows
+        return [(0, half), (half, half)]
+
+    @staticmethod
+    def _slice_meta(meta: list[torch.Tensor], r0: int, n: int) -> list[torch.Tensor]:
+        """GDN metadata of requests `[r0, r0 + n)`: per-request rows sliced, block-
+        indexed read offsets kept, query starts rebased."""
+        out: list[torch.Tensor] = []
+        for i in range(0, len(meta), 5):
+            st, off, ck, qsl, seq = meta[i : i + 5]
+            out += [st[r0 : r0 + n], off, ck[r0 : r0 + n], qsl[r0 : r0 + n + 1] - qsl[r0], seq[r0 : r0 + n]]
+        return out
+
+    def _run(self, kind, hidden, lead, w, meta):
+        """`kind.op` over row chunks; the pool is written back after every chunk."""
+        outs = []
+        for row0, n in self.chunks(int(hidden.shape[0])):
+            h = hidden[row0 : row0 + n]
+            a = lead[row0 : row0 + n]
+            if kind.has_gdn:
+                m = meta if n == hidden.shape[0] else self._slice_meta(meta, row0 // T_VERIFY, n // T_VERIFY)
+                res, pool = kind.op(h, a, w, [self.pool, *m])
+                self.pool.copy_(pool)
+            else:
+                (res,) = kind.op(h, a, w, [])
+            outs.append(res)
+        return outs[0] if len(outs) == 1 else torch.cat(outs)
+
     def forward(self, s: int, hidden: torch.Tensor, attention: torch.Tensor) -> torch.Tensor:
         ids = segment_layers(self.g, s)
         kind = self.kinds[(len(ids), False)]
         w = [getattr(self, f"w{s}_{i}") for i in range(self.n_w[s])]
-        if kind.has_gdn:
-            res, pool = kind.op(hidden, attention, w, [self.pool, *self._gdn_meta(ids[1:])])
-            self.pool.copy_(pool)
-        else:
-            (res,) = kind.op(hidden, attention, w, [])
-        return res
+        meta = self._gdn_meta(ids[1:]) if kind.has_gdn else []
+        return self._run(kind, hidden, attention, w, meta)
 
     def head(self, h: int, hidden: torch.Tensor) -> torch.Tensor:
         """Head group `h` (layers before the first QSA layer) in one kernel call."""
         ids = self.head_groups[h]
         kind = self.kinds[(len(ids), True)]
         w = [getattr(self, f"h{h}_{i}") for i in range(self.n_hw[h])]
-        res, pool = kind.op(hidden, hidden, w, [self.pool, *self._gdn_meta(ids)])
-        self.pool.copy_(pool)
-        return res
+        return self._run(kind, hidden, hidden, w, self._gdn_meta(ids))
 
 
 class MtpTail(nn.Module):
@@ -304,6 +332,7 @@ class Qwen38SegmentDriver:
         self.shadow = None
         self.stats: dict[str, int] = {}
         self.mtp = False
+        self.split = False
 
     @classmethod
     def maybe_create(cls, runner: Any) -> Qwen38SegmentDriver | None:
@@ -326,6 +355,8 @@ class Qwen38SegmentDriver:
         drv = cls(runner, _parse_buckets(raw), head=_parse_flag(raw, "head", True))
         drv.check_left = _parse_check(raw)
         drv.mtp = _parse_flag(raw, "mtp", False)
+        # `split=1`: verify steps of twice the largest bucket run as two calls.
+        drv.split = _parse_flag(raw, "split", False)
         logger.info(
             "Qwen3.8 segment megakernel enabled, verify buckets %s, shadow checks %d",
             drv.buckets,
@@ -453,7 +484,8 @@ class Qwen38SegmentDriver:
         if not ok or t_seq != T_VERIFY:
             self._note(reason if not ok else f"stock_t{t_seq}")
             return False, None
-        if rows not in self.buckets or n_req * T_VERIFY > rows:
+        split = self.split and rows == 2 * max(self.buckets)
+        if (rows not in self.buckets and not split) or n_req * T_VERIFY > rows:
             self._note(f"stock_rows{rows}_n{n_req}")
             return False, None
         self._note(f"mk_b{rows}")
