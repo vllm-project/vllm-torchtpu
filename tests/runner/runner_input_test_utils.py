@@ -89,7 +89,7 @@ def _make_runner(
     )
     runner.sequence_layout_planner = create_sequence_layout_planner(runner.vllm_config)
     runner.cache_config = SimpleNamespace(
-        num_gpu_blocks=8, num_gpu_blocks_override=None
+        block_size=block_size, num_gpu_blocks=8, num_gpu_blocks_override=None
     )
     runner.mesh = SimpleNamespace(
         shape={
