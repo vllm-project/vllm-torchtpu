@@ -5,6 +5,9 @@ The adapters own only transport response state. Scheduling, asynchronous token
 accounting, and KV cleanup remain with Scheduler / AsyncScheduler.
 """
 
+import inspect
+import linecache
+import textwrap
 from collections.abc import Iterable
 from dataclasses import dataclass
 from functools import wraps
@@ -29,6 +32,49 @@ from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
 from vllm_torchtpu.logger import init_logger
 
 logger = init_logger(__name__)
+
+
+def patch_output_processor() -> None:
+    """Keep pending KV transfers open after frontend stop-string checks."""
+    from vllm.v1.engine.output_processor import OutputProcessor
+
+    original = OutputProcessor.process_outputs
+    marker = "_tpu_raiden_pd_completion_patch"
+    if original.__dict__.get(marker, False):
+        return
+
+    # vLLM 0.29 has no hook between detokenization and request completion.
+    # Adapt that boundary, as in core/abort_on_preemption.py, without copying
+    # the upstream output loop or changing normal stop handling.
+    source = textwrap.dedent(inspect.getsource(original))
+    before = "        # 4) Create and handle RequestOutput objects."
+    after = (
+        "        if (\n"
+        "            kv_transfer_params\n"
+        '            and kv_transfer_params.get("kv_transfer_pending")\n'
+        "            and req_state.output_kind is not RequestOutputKind.FINAL_ONLY\n"
+        "        ):\n"
+        "            finish_reason = None\n"
+        "            stop_reason = None\n\n" + before
+    )
+    if source.count(before) != 1:
+        raise RuntimeError(
+            "Raiden KV completion requires the vLLM 0.29 output loop; "
+            "expected one RequestOutput creation boundary"
+        )
+    source = "from __future__ import annotations\n" + source.replace(before, after, 1)
+    filename = f"<{__name__}.process_outputs>"
+    namespace = original.__globals__.copy()
+    exec(compile(source, filename, "exec"), namespace)
+    linecache.cache[filename] = (
+        len(source),
+        None,
+        source.splitlines(keepends=True),
+        filename,
+    )
+    patched = wraps(original)(namespace[original.__name__])
+    patched.__dict__[marker] = True
+    OutputProcessor.process_outputs = patched
 
 
 @dataclass

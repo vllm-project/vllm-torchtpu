@@ -47,9 +47,13 @@ def _patch_vllm_compact_mamba_streaming_input() -> None:
 
 
 def _patch_vllm_raiden_pd_completion() -> None:
-    from vllm_torchtpu.core.raiden_pd import patch_scheduler_init
+    from vllm_torchtpu.core.raiden_pd import (
+        patch_output_processor,
+        patch_scheduler_init,
+    )
 
     patch_scheduler_init()
+    patch_output_processor()
 
 
 def _patch_vllm_abort_on_preemption() -> None:

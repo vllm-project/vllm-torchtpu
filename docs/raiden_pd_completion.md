@@ -33,7 +33,7 @@ Raiden 子 connector 为 producer 的默认组合；旧配置字段不再读取�
 `KVOutputAggregator` 汇聚该 engine 内的发送完成，不增加跨 DP engine 的屏障。
 
 P 前端必须在收到首个 token/KV handle 后启动 D，并继续读 P 的响应流。
-沿用当前 DashLLM 契约：`n=1`、`max_tokens=1`、DELTA 输出、无 stop strings，
+沿用当前 DashLLM 契约：`n=1`、`max_tokens=1`、DELTA 输出，
 `DS_LLM_ENABLE_DISAGGREGATED_PREFILL_ABORT=0`。不能先等 P 整条响应结束再启动 D。
 完成桥延后 vLLM `RequestOutputKind.DELTA` / `CUMULATIVE` 请求，两者都能提前交付
 pending 输出和 KV handle。CUMULATIVE 的调用方应在中间输出到达时启动 D，
@@ -59,6 +59,8 @@ KV consumer 的 `kv_load_failure_policy="fail"` 同时启用容量抢占终止�
   屏障后发送一次无新增 token 的引擎终态，累计输出由 vLLM OutputProcessor 保留。
   成功为 STOP + `kv_transfer_done=True`，
   失败为 ERROR + `kv_transfer_error`。
+  DELTA / CUMULATIVE 的 pending 输出即使命中前端 stop strings 也保持未结束，
+  避免前端提前 abort 并取消 KV 注册；`FINAL_ONLY` 仍直接返回原模型终态。
 - DP 的 `EngineCoreOutputs.finished_requests` 对等待发送的 P 请求延后到发送终态，
   保留 vLLM DP client 的 abort 路由与 inflight 记账；成功、失败及缺失发送结果均只归还一次。
   worker 使用的 `SchedulerOutput.finished_req_ids` 保持原时序。
@@ -72,7 +74,8 @@ KV consumer 的 `kv_load_failure_policy="fail"` 同时启用容量抢占终止�
 - 其他 connector 的原生 invalid-block 错误仍经上游处理，只为对应 ERROR 追加原有
   `model.KVTDecodeLoadFailure` metadata。普通 grammar/model 错误不被重新分类。
 
-`core/raiden_pd.py` 只包装 `Scheduler.__init__`，按配置给实例绑定必要方法。
+`core/raiden_pd.py` 包装 `Scheduler.__init__`，按配置给实例绑定必要方法，
+并在前端 `OutputProcessor` 的 stop 检查之后保留上述 pending 响应。
 官方 `_update_after_schedule()`、`_update_request_with_output()` 和调度算法保持原实现。
 worker 与 scheduler 使用同一个配置解析函数决定是否收集/消费 Raiden metadata，
 不再通过类名推断能力。不符合上述角色与 connector 条件的实例不绑定响应适配器。

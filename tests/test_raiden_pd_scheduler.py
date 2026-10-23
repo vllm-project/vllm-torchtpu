@@ -22,11 +22,13 @@ from vllm.v1.engine import (
     FinishReason,
 )
 from vllm.v1.engine.core_client import DPLBAsyncMPClient
+from vllm.v1.engine.detokenizer import BaseIncrementalDetokenizer
 from vllm.v1.engine.output_processor import OutputProcessor
 from vllm.v1.metrics.stats import PrefillStats
 from vllm.v1.outputs import KVConnectorOutput
 from vllm.v1.request import Request, RequestStatus
 
+from vllm_torchtpu import _patch_vllm_raiden_pd_completion
 from vllm_torchtpu.core.raiden_pd import _ProducerCompletion
 from vllm_torchtpu.distributed.kv_transfer.raiden_pd_completion import (
     RaidenSendOutcome,
@@ -134,7 +136,38 @@ def _prefill(scheduler):
     return outputs[3].outputs[0]
 
 
-def test_final_only_prefill_returns_handle_without_waiting_for_decode(scheduler_cls):
+class _NewlineDetokenizer(BaseIncrementalDetokenizer):
+    def decode_next(self, next_token_id: int) -> str:
+        return {271: "\n\n"}[next_token_id]
+
+
+def _output_processor(output_kind, stop=None):
+    _patch_vllm_raiden_pd_completion()
+    processor = OutputProcessor(tokenizer=None, log_stats=False)
+    request = EngineCoreRequest(
+        request_id="p-request",
+        external_req_id="client-request",
+        prompt_token_ids=[1] * 20000,
+        mm_features=None,
+        sampling_params=SamplingParams(
+            max_tokens=1, stop=stop, output_kind=output_kind
+        ),
+        pooling_params=None,
+        arrival_time=0,
+        lora_request=None,
+        cache_salt=None,
+        data_parallel_rank=None,
+    )
+    processor.add_request(request, prompt=None)
+    if stop:
+        processor.request_states["p-request"].detokenizer = _NewlineDetokenizer(request)
+    return processor
+
+
+@pytest.mark.parametrize("stop", [None, "\n\n"])
+def test_final_only_prefill_returns_handle_without_waiting_for_decode(
+    scheduler_cls, stop
+):
     scheduler, state = _scheduler(
         scheduler_cls,
         include_finished_set=True,
@@ -145,6 +178,13 @@ def test_final_only_prefill_returns_handle_without_waiting_for_decode(scheduler_
     assert output.kv_transfer_params["uuid"] == 7
     assert scheduler._next_outputs[3].finished_requests == {"p-request"}
     assert state.pending_responses == {}
+    processor = _output_processor(RequestOutputKind.FINAL_ONLY, stop)
+    output.new_token_ids = [271]
+    processed = processor.process_outputs([output], engine_core_timestamp=0)
+    assert processed.request_outputs[0].finished
+    assert processed.request_outputs[0].kv_transfer_params["uuid"] == 7
+    assert processed.reqs_to_abort == []
+    assert not processor.has_unfinished_requests()
     assert (
         _step(
             scheduler,
@@ -497,33 +537,33 @@ def test_prefill_and_send_completion_in_same_step(scheduler_cls, include_finishe
     assert state.pending_responses == {}
 
 
-def test_output_processor_keeps_cached_stats_until_pkg2(scheduler_cls, output_kind):
+@pytest.mark.parametrize(
+    ("stop", "pending"), [(None, True), ("\n\n", True), ("\n\n", False)]
+)
+def test_output_processor_keeps_cached_stats_until_pkg2(
+    scheduler_cls, output_kind, stop, pending
+):
     # Regression: finishing pkg1 deletes OutputProcessor's state, so a later
     # kv_transfer_done is silently dropped. Exercise the real processor.
-    processor = OutputProcessor(tokenizer=None, log_stats=False)
-    processor.add_request(
-        EngineCoreRequest(
-            request_id="p-request",
-            external_req_id="client-request",
-            prompt_token_ids=[1] * 20000,
-            mm_features=None,
-            sampling_params=SamplingParams(
-                max_tokens=1, detokenize=False, output_kind=output_kind
-            ),
-            pooling_params=None,
-            arrival_time=0,
-            lora_request=None,
-            cache_salt=None,
-            data_parallel_rank=None,
-        ),
-        prompt=None,
-    )
+    processor = _output_processor(output_kind, stop)
     scheduler, _ = _scheduler(scheduler_cls, output_kind=output_kind)
-    first = processor.process_outputs(
-        [_prefill(scheduler)], engine_core_timestamp=0
-    ).request_outputs[0]
+    prefill = _prefill(scheduler)
+    prefill.new_token_ids = [271]
+    if not pending:
+        prefill.kv_transfer_params.pop("kv_transfer_pending")
+    processed = processor.process_outputs([prefill], engine_core_timestamp=0)
+    first = processed.request_outputs[0]
+    if not pending:
+        assert first.finished
+        assert first.outputs[0].stop_reason == stop
+        assert processed.reqs_to_abort == ["p-request"]
+        assert not processor.has_unfinished_requests()
+        return
     assert not first.finished
-    assert first.outputs[0].token_ids == [42]
+    assert first.outputs[0].token_ids == [271]
+    assert first.outputs[0].finish_reason is None
+    assert first.outputs[0].stop_reason is None
+    assert processed.reqs_to_abort == []
     assert first.kv_transfer_params["uuid"] == 7
     assert first.kv_transfer_params["kv_transfer_pending"]
     assert first.num_cached_tokens == 16384
@@ -541,7 +581,7 @@ def test_output_processor_keeps_cached_stats_until_pkg2(scheduler_cls, output_ki
     assert final.request_id == "client-request"
     assert final.finished
     assert final.outputs[0].token_ids == (
-        [] if output_kind is RequestOutputKind.DELTA else [42]
+        [] if output_kind is RequestOutputKind.DELTA else [271]
     )
     assert final.num_cached_tokens == 16384
     assert final.kv_transfer_params == {"kv_transfer_done": True}
