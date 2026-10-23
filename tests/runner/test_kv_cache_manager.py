@@ -297,7 +297,6 @@ class TestKVCacheManager:
 
         self.runner.kv_cache_manager._update_mamba_page_size_padded(layers)
 
-        assert self.runner.block_size == 264
         mock_get_page_size.assert_called_once_with(264, 2, 128, torch.bfloat16)
 
     def test_available_kv_cache_hbm_is_min_across_ep_dp(self, monkeypatch):

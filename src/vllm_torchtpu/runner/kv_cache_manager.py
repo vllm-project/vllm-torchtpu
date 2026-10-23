@@ -225,7 +225,6 @@ class KVCacheManager:
         )
         backend_cls = TpuPlatform._find_non_ssm_backend(self.runner.vllm_config)
         block_size = self.runner.vllm_config.cache_config.block_size
-        self.runner.block_size = block_size
         cache_dtype_str = self.runner.vllm_config.cache_config.cache_dtype
 
         has_attention = any(
@@ -732,7 +731,6 @@ class KVCacheManager:
         if block_size is None:
             block_size = self.runner.vllm_config.cache_config.block_size
         assert block_size is not None
-        self.runner.block_size = block_size
         attn_page_size_bytes = attention_backend.get_kv_cache_page_size_bytes(
             block_size,
             num_kv_heads,
