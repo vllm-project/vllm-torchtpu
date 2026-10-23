@@ -5,7 +5,7 @@
 
 Main visibility uses framework gather counts. Matrix operations use kernel-local
 accumulator refs allocated with JAX 0.11.2.
-Sixteen-row FP8 decode is shared by QK/PV; paired sequences use 6 and 4+2 Qs.
+Sixteen-row FP8 decode is shared by QK/PV; long sequences use fixed 8-Q tiles.
 """
 
 import functools
@@ -43,12 +43,16 @@ def _decode_kernel(
     block_seq: int,
     block_q: int,
     scale: float,
+    tokens_per_seq: int | None = None,
+    decoder_prefill: bool = False,
 ) -> None:
     log2_e = math.log2(math.e)
     seq_start = pl.program_id(0) * block_seq
+    query_offset = 0 if tokens_per_seq is None else pl.program_id(1) * num_tokens
+    sequence_stride = num_tokens if tokens_per_seq is None else tokens_per_seq
     page_size = swa_kv_ref[0].shape[1]
     num_pages = len(swa_kv_ref) // block_seq
-    num_heads = q_ref.shape[1]
+    num_heads = q_ref.shape[-2]
     mxu_heads = pl.cdiv(num_heads, 16) * 16
     mrb_stride = mxu_heads // 4
     # Separate QK/PV ranges let the next QK overlap the preceding PV.
@@ -58,16 +62,20 @@ def _decode_kernel(
     accumulator_slots = max(2 * block_q, block_seq * min(num_tokens, swa_capacity))
 
     accumulators = tuple(
-        jax.empty_ref(
-            jax.ShapeDtypeStruct((mxu_heads, 256), jnp.float32),
-            memory_space=pltpu.ACC(mxu),
+        tuple(
+            jax.empty_ref(
+                jax.ShapeDtypeStruct((mxu_heads, 256), jnp.float32),
+                memory_space=pltpu.ACC(mxu),
+            )
+            for _ in range(accumulator_slots)
         )
         for mxu in range(2)
-        for _ in range(accumulator_slots)
     )
 
-    def accumulator(mxu, address):
-        return accumulators[mxu * accumulator_slots + address // mrb_stride]
+    def token_ref(ref, i):
+        if tokens_per_seq is None:
+            return ref.at[i]
+        return ref.at[i // num_tokens, i % num_tokens]
 
     groups = []
     for seq in range(block_seq):
@@ -83,7 +91,20 @@ def _decode_kernel(
                 )
             )
 
-    def swa_qk_compute(seq, first, size, acc_base):
+    # Each group needs KV until its PV RHS is pushed. Adjacent groups occupy
+    # separate banks; the preceding PV has consumed a bank before it is reused.
+    kv_slots = {
+        i: (group % 2) * block_q + r if tokens_per_seq is not None else i
+        for group, indices in enumerate(groups)
+        for r, i in enumerate(indices)
+    }
+    probability_slots = {
+        i: r if tokens_per_seq is not None else i
+        for indices in groups
+        for r, i in enumerate(indices)
+    }
+
+    def swa_qk_compute(seq, first, size, slot_base):
         pages = swa_kv_ref[seq * num_pages : (seq + 1) * num_pages]
         for mxu in range(2):
             ks = pl.ds(mxu * 256, 256)
@@ -92,17 +113,17 @@ def _decode_kernel(
 
             for r in range(size):
                 lhs = jnp.pad(
-                    q_ref[seq * num_tokens + first + r, :, ks],
+                    token_ref(q_ref, seq * num_tokens + first + r)[:, ks],
                     ((0, mxu_heads - num_heads), (0, 0)),
                 )
                 pltpu.matmul_acc_lhs(
-                    accumulator(mxu, acc_base + r * mrb_stride),
+                    accumulators[mxu][slot_base + r],
                     lhs,
                     load_staged_rhs=0 if r == 0 else None,
                 )
 
-    def swa_qk_pop(seq, first, size, acc_base):
-        position_start = positions_ref[seq_start + seq]
+    def swa_qk_pop(seq, first, size, slot_base):
+        position_start = positions_ref[seq_start + seq] + query_offset
         window_start = jnp.maximum(0, position_start - 127)
         page_start = window_start // page_size * page_size
         key_positions = page_start + jnp.arange(num_pages * page_size)
@@ -110,9 +131,7 @@ def _decode_kernel(
 
         for r in range(size):
             halves = [
-                pltpu.matmul_pop(accumulator(mxu, acc_base + r * mrb_stride))[
-                    :num_heads
-                ]
+                pltpu.matmul_pop(accumulators[mxu][slot_base + r])[:num_heads]
                 for mxu in range(2)
             ]
             qk_scores = halves[0] + halves[1]
@@ -130,13 +149,13 @@ def _decode_kernel(
         for i in indices:
             for row in range(0, 512, 16):
                 rows = pl.ds(row, 16)
-                words = main_cache_ref[i, rows, :]
+                words = token_ref(main_cache_ref, i)[rows, :]
                 for group in range(4):
                     shifted = lax.shift_right_logical(words, 8 * group)
                     bits = shifted.astype(jnp.uint8)
                     fp8 = lax.bitcast_convert_type(bits, jnp.float8_e4m3fn)
                     values = fp8.astype(jnp.bfloat16)
-                    main_kv_ref[i, rows, pl.ds(group * 128, 128)] = values
+                    main_kv_ref[kv_slots[i], rows, pl.ds(group * 128, 128)] = values
 
     def main_qk_compute(indices):
         tiles = [(r, i, block) for r, i in enumerate(indices) for block in range(2)]
@@ -147,7 +166,10 @@ def _decode_kernel(
             for mxu in range(2):
                 ns = pl.ds(mxu * 256, 256)
                 pltpu.matmul_push_rhs(
-                    main_kv_ref[i, ns, ks], tile_index % 2, mxu, transpose=True
+                    main_kv_ref[kv_slots[i], ns, ks],
+                    tile_index % 2,
+                    mxu,
+                    transpose=True,
                 )
 
         # Alternate two RHS staging slots across tile and token boundaries.
@@ -157,9 +179,11 @@ def _decode_kernel(
                 push(tile_index + 1)
             ks = pl.ds(block * 256, 256)
             for mxu in range(2):
-                lhs = jnp.pad(q_ref[i, :, ks], ((0, mxu_heads - num_heads), (0, 0)))
+                lhs = jnp.pad(
+                    token_ref(q_ref, i)[:, ks], ((0, mxu_heads - num_heads), (0, 0))
+                )
                 pltpu.matmul_acc_lhs(
-                    accumulator(mxu, r * mrb_stride),
+                    accumulators[mxu][r],
                     lhs,
                     load_staged_rhs=tile_index % 2,
                 )
@@ -169,7 +193,7 @@ def _decode_kernel(
         for r, i in enumerate(indices):
             main_logits = jnp.concatenate(
                 [
-                    pltpu.matmul_pop(accumulator(mxu, r * mrb_stride))[:num_heads]
+                    pltpu.matmul_pop(accumulators[mxu][r])[:num_heads]
                     for mxu in range(2)
                 ],
                 axis=1,
@@ -180,12 +204,20 @@ def _decode_kernel(
     def softmax(indices, qk_values):
         for r, i in enumerate(indices):
             main_logits = qk_values[r]
-            # Scale each key column after QK, using BF16-effective KV scales.
-            kv_scales = main_scale_ref[i].astype(jnp.bfloat16).astype(jnp.float32)
+            kv_scales = token_ref(main_scale_ref, i)[...]
+            if not decoder_prefill:
+                kv_scales = kv_scales.astype(jnp.bfloat16).astype(jnp.float32)
             main_logits = main_logits * (kv_scales * (scale * log2_e))
 
             sink = sink_ref[...] * log2_e
-            main_count = main_lengths_ref[seq_start * num_tokens + i]
+            if tokens_per_seq is None:
+                main_count = main_lengths_ref[seq_start * num_tokens + i]
+            else:
+                main_count = main_lengths_ref[
+                    (seq_start + i // num_tokens) * sequence_stride
+                    + query_offset
+                    + i % num_tokens
+                ]
             main_logits = main_logits + jnp.where(
                 jnp.arange(512)[None, :] < main_count, 0.0, -jnp.inf
             )
@@ -200,9 +232,13 @@ def _decode_kernel(
             exponentials = exponentials / denominator
             # The denominator uses unscaled weights; fold KV scales into
             # main PV weights and round once to BF16.
-            kv_scales = main_scale_ref[i].astype(jnp.bfloat16)
-            main_p_ref[i] = (exponentials[:, :512] * kv_scales).astype(jnp.bfloat16)
-            swa_p_ref[i] = exponentials[:, 512:].astype(jnp.bfloat16)
+            kv_scales = token_ref(main_scale_ref, i)[...]
+            if not decoder_prefill:
+                kv_scales = kv_scales.astype(jnp.bfloat16)
+            main_p_ref[probability_slots[i]] = (
+                exponentials[:, :512] * kv_scales
+            ).astype(jnp.bfloat16)
+            swa_p_ref[probability_slots[i]] = exponentials[:, 512:].astype(jnp.bfloat16)
 
     def fused_pv(indices):
         tiles = [(r, i, block) for r, i in enumerate(indices) for block in range(2)]
@@ -213,7 +249,10 @@ def _decode_kernel(
             for mxu in range(2):
                 ns = pl.ds(mxu * 256, 256)
                 pltpu.matmul_push_rhs(
-                    main_kv_ref[i, ks, ns], tile_index % 2, mxu, transpose=False
+                    main_kv_ref[kv_slots[i], ks, ns],
+                    tile_index % 2,
+                    mxu,
+                    transpose=False,
                 )
 
         # Alternate two RHS staging slots across tile and token boundaries.
@@ -224,10 +263,11 @@ def _decode_kernel(
             ks = pl.ds(block * 256, 256)
             for mxu in range(2):
                 lhs = jnp.pad(
-                    main_p_ref[i, :, ks], ((0, mxu_heads - num_heads), (0, 0))
+                    main_p_ref[probability_slots[i], :, ks],
+                    ((0, mxu_heads - num_heads), (0, 0)),
                 )
                 pltpu.matmul_acc_lhs(
-                    accumulator(mxu, (block_q + r) * mrb_stride),
+                    accumulators[mxu][block_q + r],
                     lhs,
                     load_staged_rhs=tile_index % 2,
                 )
@@ -244,9 +284,12 @@ def _decode_kernel(
                 mxu,
             )
             for r, i in enumerate(indices):
-                lhs = jnp.pad(swa_p_ref[i], ((0, mxu_heads - num_heads), (0, 0)))
+                lhs = jnp.pad(
+                    swa_p_ref[probability_slots[i]],
+                    ((0, mxu_heads - num_heads), (0, 0)),
+                )
                 pltpu.matmul_acc_lhs(
-                    accumulator(mxu, (block_q + r) * mrb_stride),
+                    accumulators[mxu][block_q + r],
                     lhs,
                     load_staged_rhs=0 if r == 0 else None,
                 )
@@ -255,9 +298,7 @@ def _decode_kernel(
         for r, i in enumerate(indices):
             output = jnp.concatenate(
                 [
-                    pltpu.matmul_pop(accumulator(mxu, (block_q + r) * mrb_stride))[
-                        :num_heads
-                    ]
+                    pltpu.matmul_pop(accumulators[mxu][block_q + r])[:num_heads]
                     for mxu in range(2)
                 ],
                 axis=1,
@@ -269,18 +310,21 @@ def _decode_kernel(
                 axis=1,
                 mode="promise_in_bounds",
             )
-            rotated = tail * rope_ref[i, 0][None, :] + partner * rope_ref[i, 1][None, :]
-            output_ref[i, :, :384] = output[:, :384].astype(jnp.bfloat16)
-            output_ref[i, :, 384:] = rotated.astype(jnp.bfloat16)
+            rotated = (
+                tail * token_ref(rope_ref, i)[0][None, :]
+                + partner * token_ref(rope_ref, i)[1][None, :]
+            )
+            token_ref(output_ref, i)[:, :384] = output[:, :384].astype(jnp.bfloat16)
+            token_ref(output_ref, i)[:, 384:] = rotated.astype(jnp.bfloat16)
 
     for first in range(0, num_tokens, swa_capacity):
         size = min(swa_capacity, num_tokens - first)
         for seq in range(block_seq):
-            swa_qk_compute(seq, first, size, seq * size * mrb_stride)
+            swa_qk_compute(seq, first, size, seq * size)
         if first == 0:
             main_unpack(groups[0])
         for seq in range(block_seq):
-            swa_qk_pop(seq, first, size, seq * size * mrb_stride)
+            swa_qk_pop(seq, first, size, seq * size)
     main_qk_compute(groups[0])
     for step, indices in enumerate(groups):
         logits = main_qk_pop(indices)
@@ -298,8 +342,8 @@ def _decode_kernel(
     jax.jit,
     static_argnames=(
         "num_tokens",
-        "block_q",
         "scale",
+        "decoder_prefill",
     ),
 )
 def csa2_decode(
@@ -313,34 +357,20 @@ def csa2_decode(
     *,
     swa_page: jax.Array,  # [B, 2 + page_columns], int32
     num_tokens: int = 6,
-    block_q: int | None = None,
     scale: float = 512**-0.5,
     main_lengths: jax.Array,
+    decoder_prefill: bool = False,
 ) -> jax.Array:
-    """Decode SWA + CSA + inverse RoPE with a static query count per sequence.
+    """Causal CSA2 for consecutive, equal-length sequences.
 
-    Queries are packed as q[num_tokens * b + i], with position positions[b] + i
-    for i in range(num_tokens). q is [num_tokens * B, H, 512]; positions is [B].
-    Different query counts within a batch, prefill, and padding are unsupported;
-    an empty batch is allowed. Q positions within each sequence are consecutive.
-    Start positions must be nonnegative and leave room for the exclusive window
-    end positions[b] + num_tokens in INT32.
-    The aligned union must fit 256 SWA rows:
-    127 + num_tokens + min(page_size, 64) - 1 <= 256.
-
-    block_q bounds the number of Qs processed together. None selects
-    min(6, num_tokens, MRB capacity). The second sequence uses groups of at most
-    four Qs to shorten the final PV drain (6 then 4+2 in the default paired tile).
-    Explicit values must fit both num_tokens and the QK/PV accumulator ranges.
-
-    Main visibility uses the authoritative compacted prefix in main_lengths.
-    Counts may differ from position-derived lengths during cache replay.
-
-    SWA is paged, with required metadata [page_base, minimum_visible, page_ids...]
-    prefetched into SMEM. SWA uses one BF16 [pages, page_size, 512] array.
-    All loaded SWA KV values, including padding, must be finite BF16 values.
-    Main uses INT32 [T,512,128] packed FP8 plus FP32 [T,512] scales.
-    Byte g of word [t,k,lane] holds FP8 value [t,k,128*g+lane].
+    Q is BF16 [B*num_tokens,H,512]; positions [B] holds each first Q position.
+    Long sequences use fixed eight-query tiles and must be divisible by eight.
+    Short sequences use a single tile. Main KV is packed FP8 INT32 [T,512,128]
+    with FP32 scales [T,512] and authoritative valid counts [T].
+    SWA is finite BF16 [pages,page_size,512], including a reserved zero page.
+    swa_page [B,2+C] stores page base, minimum visibility and physical page IDs.
+    decoder_prefill reuses this pipeline for the model's decoder-layer prefill,
+    retaining that path's FP32 KV scales. It does not change SWA visibility.
     """
     if q.ndim != 3 or q.shape[2] != 512:
         raise ValueError("CSA2 q must have shape [T,H,512]")
@@ -352,13 +382,11 @@ def csa2_decode(
     batch_size = total_tokens // num_tokens
     if num_heads < 8 or num_heads > 128 or num_heads % 8:
         raise NotImplementedError("CSA2 requires H divisible by 8, with 8 <= H <= 128")
-    max_block_q = min(num_tokens, 256 // (2 * (pl.cdiv(num_heads, 16) * 4)))
-    if block_q is None:
-        block_q = min(6, max_block_q)
-    if type(block_q) is not int or not 1 <= block_q <= max_block_q:
-        raise ValueError(
-            f"CSA2 block_q must be a static Python int in [1, {max_block_q}]"
-        )
+    query_tile = min(num_tokens, 8)
+    if num_tokens % query_tile:
+        raise ValueError("Long CSA2 sequences must have a query count divisible by 8")
+    tiled = num_tokens > 8
+    block_q = min(6, query_tile, 256 // (2 * (pl.cdiv(num_heads, 16) * 4)))
     if (
         swa_page is None
         or swa_page.ndim != 2
@@ -380,10 +408,6 @@ def csa2_decode(
         raise ValueError(
             "SWA page size must be 8,16,32,64 or a positive multiple of 128"
         )
-    if 127 + num_tokens + min(page_size, 64) - 1 > 256:
-        raise ValueError(
-            "CSA2 num_tokens and page size exceed the aligned 256-row SWA window"
-        )
     specs = (
         ("q", q, (total_tokens, num_heads, 512), jnp.bfloat16),
         ("main_kv", main_kv, (total_tokens, 512, 128), jnp.int32),
@@ -399,18 +423,18 @@ def csa2_decode(
     if total_tokens == 0:
         return jnp.zeros(q.shape, q.dtype)
     block_seq = 2 if batch_size % 2 == 0 else 1
-    query_count = num_tokens * block_seq
-    shared_window_size = 256
-    scalars = (positions, swa_page, main_lengths)
+    query_count = query_tile * block_seq
     cache_page_size = page_size
     page_size = min(page_size, 64)
-    swa_blocks = shared_window_size // page_size
+    swa_blocks = 256 // page_size
 
-    def swa_map(b, positions_ref, swa_page_ref, main_lengths_ref, *, block, seq):
+    def swa_map(b, tile, positions_ref, swa_page_ref, main_lengths_ref, *, block, seq):
         seq_idx = b * block_seq + seq
         first_position = positions_ref[seq_idx]
+        if tiled:
+            first_position += tile * query_tile
         window_start = jnp.maximum(0, first_position - 127)
-        window_end = first_position + num_tokens
+        window_end = first_position + query_tile
         page_start = window_start // page_size * page_size
         position = page_start + block * page_size
         column = (position - swa_page_ref[seq_idx, 0]) // cache_page_size
@@ -419,43 +443,55 @@ def csa2_decode(
         visible_start = jnp.maximum(window_start, swa_page_ref[seq_idx, 1])
         needed = (position < window_end) & (position + page_size > visible_start)
         valid = needed & (column >= 0) & (column < swa_page_ref.shape[1] - 2)
-        # Inactive blocks map to the reserved zero page, without out-of-range indices.
         return (
             jnp.where(valid, page, 0),
             jnp.where(valid, position % cache_page_size // page_size, 0),
             0,
         )
 
+    def query_spec(trailing):
+        if tiled:
+            shape = (block_seq, query_tile, *trailing)
+
+            def index_map(seq, tile, *_):
+                return seq, tile, *([0] * len(trailing))
+        else:
+            shape = (query_count, *trailing)
+
+            def index_map(seq, *_):
+                return seq, *([0] * len(trailing))
+
+        return pl.BlockSpec(
+            shape,
+            index_map,
+            pipeline_mode=pl.Buffered(2),
+            memory_space=pltpu.VMEM,
+        )
+
     kernel = functools.partial(
         _decode_kernel,
-        num_tokens=num_tokens,
+        num_tokens=query_tile,
         block_seq=block_seq,
         block_q=block_q,
         scale=scale,
+        tokens_per_seq=num_tokens if tiled else None,
+        decoder_prefill=decoder_prefill,
     )
-    in_specs = [
-        pl.BlockSpec(
-            (query_count, num_heads, 512),
-            lambda b, *_: (b, 0, 0),
-            pipeline_mode=pl.Buffered(2),
-            memory_space=pltpu.VMEM,
-        ),
-        pl.BlockSpec(
-            (query_count, 512, 128),
-            lambda b, *_: (b, 0, 0),
-            pipeline_mode=pl.Buffered(2),
-            memory_space=pltpu.VMEM,
-        ),
-        pl.BlockSpec(
-            (query_count, 1, 512),
-            lambda b, *_: (b, 0, 0),
-            pipeline_mode=pl.Buffered(2),
-            memory_space=pltpu.VMEM,
-        ),
+    page_map = swa_map
+    # The untiled grid supplies only its sequence ID before prefetched metadata.
+    if not tiled:
+
+        def page_map(b, *refs, block, seq):
+            return swa_map(b, 0, *refs, block=block, seq=seq)
+
+    in_specs = (
+        query_spec((num_heads, 512)),
+        query_spec((512, 128)),
+        query_spec((1, 512)),
         tuple(
             pl.BlockSpec(
                 (1, page_size, 512),
-                functools.partial(swa_map, block=block, seq=seq),
+                functools.partial(page_map, block=block, seq=seq),
                 pipeline_mode=pl.Buffered(2),
                 memory_space=pltpu.VMEM,
             )
@@ -464,47 +500,48 @@ def csa2_decode(
         ),
         pl.BlockSpec(
             (num_heads, 1),
-            lambda b, *_: (0, 0),
+            lambda *_: (0, 0),
             pipeline_mode=pl.Buffered(1),
             memory_space=pltpu.VMEM,
         ),
-        pl.BlockSpec(
-            (query_count, 2, 128),
-            lambda b, *_: (b, 0, 0),
-            pipeline_mode=pl.Buffered(2),
-            memory_space=pltpu.VMEM,
-        ),
-    ]
-    out_spec = pl.BlockSpec(
-        (query_count, num_heads, 512),
-        lambda b, *_: (b, 0, 0),
-        pipeline_mode=pl.Buffered(2),
-        memory_space=pltpu.VMEM,
+        query_spec((2, 128)),
     )
-    scratch_shapes = (
-        pltpu.VMEM((query_count, 512, 512), jnp.bfloat16),
-        pltpu.VMEM((query_count, num_heads, shared_window_size), jnp.float32),
-        pltpu.VMEM((query_count, num_heads, 512), jnp.bfloat16),
-        pltpu.VMEM((query_count, num_heads, shared_window_size), jnp.bfloat16),
+    kv_count = 2 * block_q if tiled else query_count
+    p_count = block_q if tiled else query_count
+    grid = (
+        (batch_size // block_seq, num_tokens // query_tile)
+        if tiled
+        else (batch_size // block_seq,)
     )
-    return pl.pallas_call(
+    prefix = (batch_size, num_tokens) if tiled else (total_tokens,)
+    output = pl.pallas_call(
         kernel,
-        out_shape=jax.ShapeDtypeStruct(q.shape, jnp.bfloat16),
+        out_shape=jax.ShapeDtypeStruct((*prefix, num_heads, 512), q.dtype),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=len(scalars),
-            grid=(batch_size // block_seq,),
+            num_scalar_prefetch=3,
+            grid=grid,
             in_specs=in_specs,
-            out_specs=out_spec,
-            scratch_shapes=scratch_shapes,
+            out_specs=query_spec((num_heads, 512)),
+            scratch_shapes=(
+                pltpu.VMEM((kv_count, 512, 512), jnp.bfloat16),
+                pltpu.VMEM((query_count, num_heads, 256), jnp.float32),
+                pltpu.VMEM((p_count, num_heads, 512), jnp.bfloat16),
+                pltpu.VMEM((p_count, num_heads, 256), jnp.bfloat16),
+            ),
         ),
-        compiler_params=pltpu.CompilerParams(dimension_semantics=("parallel",)),
+        compiler_params=pltpu.CompilerParams(
+            dimension_semantics=("parallel",) * len(grid)
+        ),
         name="csa2_decode",
     )(
-        *scalars,
-        q,
-        main_kv,
-        main_kv_scale[:, None, :],
+        positions,
+        swa_page,
+        main_lengths,
+        q.reshape(*prefix, num_heads, 512),
+        main_kv.reshape(*prefix, 512, 128),
+        main_kv_scale.reshape(*prefix, 1, 512),
         (swa_kv,) * (block_seq * swa_blocks),
         sink[:, None],
-        rope_cache,
+        rope_cache.reshape(*prefix, 2, 128),
     )
+    return output.reshape(q.shape)
