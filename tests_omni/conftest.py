@@ -42,6 +42,7 @@ from typing import Any
 
 import psutil
 import pytest
+import torch
 
 from tests.tpu_release import wait_for_tpu_release
 
@@ -202,6 +203,17 @@ def omni_runner(
 ) -> Generator[OmniRunner, None, None]:
     """Function-scoped :class:`OmniRunner` that spins up each model as needed."""
     yield _omni_runner_manager.get_or_create(request.param)
+
+
+@pytest.fixture(autouse=True)
+def _sync_tpu(request: pytest.FixtureRequest) -> Generator[None, None, None]:
+    """Flush deferred torch_tpu ops between in-process TPU tests."""
+    if request.node.get_closest_marker("spawns_tpu_workers"):
+        yield
+        return
+    torch.accelerator.synchronize()
+    yield
+    torch.accelerator.synchronize()
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:

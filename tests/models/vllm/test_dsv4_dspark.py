@@ -128,31 +128,6 @@ def _tiny_vllm_config():
     return vllm_config
 
 
-@pytest.fixture(scope="module")
-def dist_ctx():
-    import torch.distributed as dist
-    from vllm.distributed import (
-        ensure_model_parallel_initialized,
-        init_distributed_environment,
-    )
-
-    if not dist.is_initialized():
-        import portpicker
-
-        port = portpicker.pick_unused_port()
-        init_distributed_environment(
-            world_size=1,
-            rank=0,
-            local_rank=0,
-            distributed_init_method=f"tcp://127.0.0.1:{port}",
-            backend="gloo",
-        )
-    # GroupCoordinator construction consults the current vLLM config.
-    with set_current_vllm_config(VllmConfig()):
-        ensure_model_parallel_initialized(1, 1)
-    yield
-
-
 def _use_cpu_platform(monkeypatch, request):
     from vllm.platforms import current_platform
 

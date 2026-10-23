@@ -17,7 +17,8 @@ steps:
     depends_on:
       # --- Integration Tests ---
       - "integration_qwen35_pcp4_dp4_disagg_correctness"
-      - "integration_qwen35_pcp8_dp8_disagg_correctness"
+      - "integration_qwen35_pcp4_2tp2dp_disagg_correctness"
+      - "integration_qwen35_pcp8_2tp4dp_disagg_correctness"
       - "integration_qwen35_gpc_correctness"
       - "integration_qwen35_apc_correctness"
       - "integration_qwen35_gpc_global_dram_pool"

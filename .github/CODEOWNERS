@@ -7,11 +7,18 @@
 # Analysis includes full history from tpu_commons, tpu_inference, and vllm-torchtpu paths.
 
 # Default owners for everything in the repo (fallback)
-* @qizzzh @angelayi @colin2328 @QiliangCui @caojx-google @Nanfang-Li @yinlin09 @mrjunwan-lang
+* @qizzzh @angelayi @colin2328 @QiliangCui @caojx-google @Nanfang-Li @yinlin09 @mrjunwan-lang @maxwillzq
 
 # CI/CD and Build Configuration
 /.buildkite/ @QiliangCui @theminghuang
 /.github/ @QiliangCui @theminghuang
+
+# Release tooling: vllm-torchtpu-release runs it with the Docker Hub token and
+# PyPI publishing rights (.buildkite/release/README.md).
+/.buildkite/release/ @QiliangCui @CienetStingLin @theminghuang @charlesli640
+/.buildkite/scripts/publish_wheel.sh @QiliangCui @CienetStingLin @theminghuang @charlesli640
+/.buildkite/scripts/wheel_utils.py @QiliangCui @CienetStingLin @theminghuang @charlesli640
+/.buildkite/scripts/publish_nightly_images.sh @QiliangCui @CienetStingLin @theminghuang @charlesli640
 
 # Documentation
 /docs/ @bvrockwell @RobMulla @qizzzh @maxwillzq @Nanfang-Li
@@ -20,7 +27,7 @@
 /mkdocs.yml @bvrockwell @RobMulla @qizzzh @Nanfang-Li
 
 # Kernel Implementations
-/src/vllm_torchtpu/kernels/ @kyuyeunk @qizzzh
+/src/vllm_torchtpu/kernels/ @kyuyeunk @qizzzh @bigeye
 /src/vllm_torchtpu/kernels/experimental/batched_rpa/ @kwang3939 @a1yssan13
 /src/vllm_torchtpu/kernels/gdn/v3/ @brianseung-google @mhhuang-machine
 
@@ -45,7 +52,8 @@
 /tests/kernels/deepseek_v4/ @kyuyeunk @qizzzh @gxd3 @patemotter @gpolovets1
 
 # Platform Support
-/src/vllm_torchtpu/platforms/ @sixiang-google @mrjunwan-lang @Lumosis
+/src/vllm_torchtpu/platforms/ @sixiang-google @mrjunwan-lang @Lumosis @yinlin09 @benliangw
+/tests/platforms/ @sixiang-google @mrjunwan-lang @Lumosis @yinlin09 @benliangw
 
 # Structured Decoding
 /src/vllm_torchtpu/structured_decoding/ @maxwillzq @silkyarora

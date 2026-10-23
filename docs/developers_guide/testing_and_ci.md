@@ -59,7 +59,7 @@ pytest tests/entrypoints/llm/test_speculative_decoding.py -sv --timeout=3600 \
 
 ### 5. Omni Multimodal & Diffusion TPU Tests (`tests_omni/`)
 
-With `--extra omni` installed, run the `vllm-omni` test suite:
+With `--extra omni` installed (plus `--group omni-git` until vllm-omni 0.32.0rc1 is on PyPI), run the `vllm-omni` test suite:
 
 ```bash
 pytest tests_omni/ -sv --timeout=1200 -m "not nightly and omni"

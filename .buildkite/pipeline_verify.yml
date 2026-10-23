@@ -19,7 +19,7 @@
 # nothing until the kube nightly's schedule sets KUBE_OWNS_NIGHTLY=1.
 
 x-run-condition: &run-on-nightly-or-tag
-  if: build.env("NIGHTLY") == "1" || build.tag =~ /^v?[0-9]+(\.[a-zA-Z0-9]+)*([a-zA-Z]+[0-9]*)?$/
+  if: 'build.env("NIGHTLY") == "1" || build.tag =~ /^v?[0-9]+(\.[a-zA-Z0-9]+)*([a-zA-Z]+[0-9]*)?$/'
 
 steps:
   - label: "Upload Tests for Models & Features"

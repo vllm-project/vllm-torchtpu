@@ -94,7 +94,6 @@ def make_runner(device, monkeypatch, k):
         device=torch.device("cpu"),
         vocab_size=512,
         block_sizes=[256],
-        kernel_block_sizes=[256],
         max_num_blocks_per_req=[8],
         num_spec_tokens=k,
     )

@@ -11,7 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""TPU runtime patches for vLLM-Omni diffusion models."""
+"""TPU runtime patches for vLLM-Omni diffusion models.
+
+vLLM-Omni diffusion workers run in separate worker processes spawned by
+vLLM-Omni's DiffusionEngine rather than through TPUWorker's worker_init /
+model_load lifecycle stages, so OmniTpuPlatform applies the Omni patches
+itself: apply_omni_tpu_patches() when the platform is constructed, and
+apply_omni_model_specific_patches() at attention backend selection
+(get_diffusion_attn_backend_cls). Tracked in #1862 for unification with
+patch_registry.py.
+"""
 
 from functools import cache as run_once
 from typing import Any
@@ -70,6 +79,7 @@ def apply_omni_model_specific_patches() -> None:
     _patch_wan_ffn_gelu_fence()
     _patch_diffusion_startup_warmup_sync()
     _patch_wan_fused_qk_norm_rope()
+    _patch_wan_fresh_timestep()
 
 
 def _patch_diffusion_ipc_cpu_pack() -> None:
@@ -268,3 +278,65 @@ def _patch_wan_fused_qk_norm_rope() -> None:
 
     WanSelfAttention.forward = _fused_self_attention_forward
     logger.info("Applied TPU patch: fused q/k RMSNorm + RoPE for Wan attention.")
+
+
+def _patch_wan_fresh_timestep() -> None:
+    # Wan: give the transformer its own copy of the timestep.
+    #
+    # Problem: Wan pipelines pass `t.expand(batch)`, a view into
+    #   scheduler.timesteps. torch_tpu bakes a view's offset into every graph
+    #   that reads it, so the transformer recompiles at every denoising step.
+    # Fix: clone the timestep on entry and flush the clone right away, so only
+    #   a tiny copy graph sees the view.
+    # Effect (v7x, 480x832x81, 8 cores): first 12-step request 53.0 s -> 26.9 s
+    #   (warm: 15.3 s); output is bit-identical.
+    # Scope: WanTransformer3DModel (T2V, I2V, TI2V, both A14B experts),
+    #   WanVACETransformer3DModel (overrides forward) and
+    #   WanS2VTransformer3DModel (separate class). The numbers above are T2V;
+    #   the VACE and S2V classes are covered but not measured on TPU.
+    # TODO: remove once torch_tpu passes view offsets as runtime inputs.
+    from vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer import (
+        WanS2VTransformer3DModel,
+    )
+    from vllm_omni.diffusion.models.wan2_2.wan2_2_transformer import (
+        WanTransformer3DModel,
+    )
+    from vllm_omni.diffusion.models.wan2_2.wan2_2_vace_transformer import (
+        WanVACETransformer3DModel,
+    )
+
+    for cls in (
+        WanTransformer3DModel,
+        WanVACETransformer3DModel,
+        WanS2VTransformer3DModel,
+    ):
+        _wrap_fresh_timestep(cls)
+    logger.info(
+        "Applied TPU patch: fresh timestep buffer for WanTransformer3DModel, "
+        "WanVACETransformer3DModel and WanS2VTransformer3DModel."
+    )
+
+
+_FRESH_TIMESTEP_PATCHED = "_tpu_fresh_timestep_patched"
+
+
+def _wrap_fresh_timestep(cls: type) -> None:
+    # The flag lives on the forward function, not the class:
+    # WanVACETransformer3DModel subclasses WanTransformer3DModel but has its
+    # own forward, which still needs the wrapper.
+    if getattr(cls.forward, _FRESH_TIMESTEP_PATCHED, False):
+        return
+    forward = cls.forward
+
+    def _fresh_timestep_forward(
+        self: Any, hidden_states: Any, timestep: Any, *args: Any, **kwargs: Any
+    ) -> Any:
+        if isinstance(timestep, torch.Tensor):
+            from vllm_torchtpu.utils import synchronize_tensors
+
+            timestep = timestep.clone()
+            synchronize_tensors(timestep, wait=False)
+        return forward(self, hidden_states, timestep, *args, **kwargs)
+
+    setattr(_fresh_timestep_forward, _FRESH_TIMESTEP_PATCHED, True)
+    cls.forward = _fresh_timestep_forward
