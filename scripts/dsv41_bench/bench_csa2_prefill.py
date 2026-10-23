@@ -3,7 +3,6 @@
 """Measure ragged CSA2 prefill, including tile planning and output compaction."""
 
 import argparse
-import importlib.util
 import json
 import time
 from pathlib import Path
@@ -11,6 +10,8 @@ from pathlib import Path
 import jax
 import numpy as np
 from bench_csa2_decode import make_inputs, verify
+
+from vllm_torchtpu.kernels.deepseek_v41.csa2.prefill import csa2_prefill
 
 
 def main() -> None:
@@ -22,14 +23,6 @@ def main() -> None:
     args = parser.parse_args()
     if any(tokens < 6 for tokens in args.tokens):
         parser.error("--tokens must be at least 6")
-    source = (
-        Path(__file__).resolve().parents[2]
-        / "src/vllm_torchtpu/kernels/deepseek_v41/csa2_prefill.py"
-    )
-    spec = importlib.util.spec_from_file_location("prefill_benchmark_kernel", source)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
     args.out.mkdir(parents=True, exist_ok=True)
     device = jax.devices("tpu")[0]
     for tokens in args.tokens:
@@ -60,7 +53,7 @@ def main() -> None:
             (inputs, dict(swa_metadata=metadata, main_lengths=host["main_lengths"])),
             device,
         )
-        compiled = module.csa2_prefill.lower(*inputs, **kwargs, bq=args.bq).compile()
+        compiled = csa2_prefill.lower(*inputs, **kwargs, bq=args.bq).compile()
         output = np.asarray(compiled(*inputs, **kwargs))
         assert np.isfinite(output.astype(np.float32)).all()
         host["positions"] = 2048 + np.arange(batch, dtype=np.int32) * 6

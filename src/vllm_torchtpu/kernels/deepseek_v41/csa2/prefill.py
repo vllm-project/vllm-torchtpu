@@ -1,9 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # Copyright 2026 Google LLC
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""Ragged prefill with query-tile grids and compiler-managed DMA buffering."""
+"""CSA2 ragged prefill with causal or explicit SWA visibility."""
 
 import functools
+import math
 from typing import Any
 
 import jax
@@ -13,7 +14,9 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import tpu as pltpu
 
 
-def _tile_plan(starts: jax.Array, total_tokens: int, bq: int):
+def build_query_tiles(
+    starts: jax.Array, total_tokens: int, bq: int
+) -> tuple[jax.Array, jax.Array]:
     # A final synthetic request covers output padding without an HBM clear pass.
     boundaries = jnp.concatenate((starts, jnp.array([total_tokens], jnp.int32)))
     sizes = boundaries[1:] - boundaries[:-1]
@@ -32,7 +35,7 @@ def _tile_plan(starts: jax.Array, total_tokens: int, bq: int):
     return jnp.stack((requests, offsets, lengths), axis=1), ends[-1]
 
 
-def _window(tile, tiles, positions, pages, bounds, *, page_size, non_causal):
+def swa_window(tile, tiles, positions, pages, bounds, *, page_size, non_causal):
     request, start, count = tiles[tile, 0], tiles[tile, 1], tiles[tile, 2]
     active = request < pages.shape[0]
     request = jnp.minimum(request, pages.shape[0] - 1)
@@ -76,10 +79,11 @@ def _prefill_kernel(
     scale: float,
     non_causal: bool,
 ) -> None:
+    log2_e = math.log2(math.e)
     num_pages = 256 // page_size
     tile = pl.program_id(0)
     request, t0 = tiles_ref[tile, 0], tiles_ref[tile, 1]
-    position_start, left, right, anchor = _window(
+    position_start, left, right, anchor = swa_window(
         tile,
         tiles_ref,
         positions_ref,
@@ -96,6 +100,9 @@ def _prefill_kernel(
     active = request < swa_page_ref.shape[0]
     request = jnp.minimum(request, swa_page_ref.shape[0] - 1)
     key_positions = anchor + jnp.arange(256)
+    bf16_bits = jnp.dtype(jnp.bfloat16).itemsize * 8
+    low_mask = (1 << bf16_bits) - 1
+    high_mask = ~low_mask
     for block in range(num_pages):
         column = (
             anchor + block * page_size - swa_page_ref[request, 0]
@@ -113,7 +120,7 @@ def _prefill_kernel(
         high = active & (positions + 1 >= left) & (positions + 1 < right)
         # A BF16 select triggers an invalid predicate layout on the pinned
         # compiler. Mask pairs of rows through their zero-copy INT32 view.
-        mask = jnp.where(low, 0xFFFF, 0) | jnp.where(high, -65536, 0)
+        mask = jnp.where(low, low_mask, 0) | jnp.where(high, high_mask, 0)
         words = pltpu.bitcast(values, jnp.int32) & mask[:, None]
         swa_ref[rows] = pltpu.bitcast(words, jnp.bfloat16)
     num_heads = q_ref.shape[1]
@@ -126,22 +133,21 @@ def _prefill_kernel(
     accumulator_slots = max(2 * block_q, min(bq, swa_capacity))
 
     accumulators = tuple(
-        jax.empty_ref(
-            jax.ShapeDtypeStruct((mxu_heads, 256), jnp.float32),
-            memory_space=pltpu.ACC(mxu),
+        tuple(
+            jax.empty_ref(
+                jax.ShapeDtypeStruct((mxu_heads, 256), jnp.float32),
+                memory_space=pltpu.ACC(mxu),
+            )
+            for _ in range(accumulator_slots)
         )
         for mxu in range(2)
-        for _ in range(accumulator_slots)
     )
-
-    def accumulator(mxu, address):
-        return accumulators[mxu * accumulator_slots + address // mrb_stride]
 
     groups = [
         tuple(range(first, min(first + block_q, bq))) for first in range(0, bq, block_q)
     ]
 
-    def swa_launch(first, size):
+    def swa_qk_compute(first, size):
         for mxu in range(2):
             ks = pl.ds(mxu * 256, 256)
             pltpu.matmul_push_rhs(swa_ref[:, ks], 0, mxu, transpose=True)
@@ -150,23 +156,25 @@ def _prefill_kernel(
                     q_ref[first + r, :, ks], ((0, mxu_heads - num_heads), (0, 0))
                 )
                 pltpu.matmul_acc_lhs(
-                    accumulator(mxu, r * mrb_stride),
+                    accumulators[mxu][r],
                     lhs,
                     load_staged_rhs=0 if r == 0 else None,
                 )
 
-    def swa_pop(first, size):
+    def swa_qk_pop(first, size):
         for r in range(size):
             halves = [
-                pltpu.matmul_pop(accumulator(mxu, r * mrb_stride))[:num_heads]
-                for mxu in range(2)
+                pltpu.matmul_pop(accumulators[mxu][r])[:num_heads] for mxu in range(2)
             ]
-            position = position_start + first + r
-            start = left if non_causal else jnp.maximum(left, position - 127)
-            end = right if non_causal else jnp.minimum(right, position + 1)
+            if non_causal:
+                start, end = left, right
+            else:
+                position = position_start + first + r
+                start = jnp.maximum(left, position - 127)
+                end = jnp.minimum(right, position + 1)
             valid = (key_positions >= start) & (key_positions < end)
             swa_score_ref[first + r] = (halves[0] + halves[1]) * (
-                scale * 1.4426950408889634
+                scale * log2_e
             ) + jnp.where(valid[None, :], 0.0, -jnp.inf)
 
     def main_unpack(indices):
@@ -183,7 +191,7 @@ def _prefill_kernel(
                     values = fp8.astype(jnp.bfloat16)
                     main_kv_ref[i, rows, pl.ds(group * 128, 128)] = values
 
-    def main_qk(indices):
+    def main_qk_compute(indices):
         tiles = [(r, i, block) for r, i in enumerate(indices) for block in range(2)]
 
         def push(tile_index):
@@ -204,17 +212,17 @@ def _prefill_kernel(
             for mxu in range(2):
                 lhs = jnp.pad(q_ref[i, :, ks], ((0, mxu_heads - num_heads), (0, 0)))
                 pltpu.matmul_acc_lhs(
-                    accumulator(mxu, r * mrb_stride),
+                    accumulators[mxu][r],
                     lhs,
                     load_staged_rhs=tile_index % 2,
                 )
 
-    def pop_qk(indices):
+    def main_qk_pop(indices):
         logits = []
         for r, i in enumerate(indices):
             main_logits = jnp.concatenate(
                 [
-                    pltpu.matmul_pop(accumulator(mxu, r * mrb_stride))[:num_heads]
+                    pltpu.matmul_pop(accumulators[mxu][r])[:num_heads]
                     for mxu in range(2)
                 ],
                 axis=1,
@@ -227,9 +235,9 @@ def _prefill_kernel(
             main_logits = qk_values[r]
             # Scale each key column after QK, using FP32 KV scales.
             kv_scales = main_scale_ref[i]
-            main_logits = main_logits * (kv_scales * (scale * 1.4426950408889634))
+            main_logits = main_logits * (kv_scales * (scale * log2_e))
 
-            sink = sink_ref[...] * 1.4426950408889634
+            sink = sink_ref[...] * log2_e
             main_count = main_lengths_ref[
                 jnp.minimum(t0 + i, main_lengths_ref.shape[0] - 1)
             ]
@@ -274,7 +282,7 @@ def _prefill_kernel(
                     main_p_ref[i, :, ks], ((0, mxu_heads - num_heads), (0, 0))
                 )
                 pltpu.matmul_acc_lhs(
-                    accumulator(mxu, (block_q + r) * mrb_stride),
+                    accumulators[mxu][block_q + r],
                     lhs,
                     load_staged_rhs=tile_index % 2,
                 )
@@ -284,7 +292,7 @@ def _prefill_kernel(
             for r, i in enumerate(indices):
                 lhs = jnp.pad(swa_p_ref[i], ((0, mxu_heads - num_heads), (0, 0)))
                 pltpu.matmul_acc_lhs(
-                    accumulator(mxu, (block_q + r) * mrb_stride),
+                    accumulators[mxu][block_q + r],
                     lhs,
                     load_staged_rhs=0 if r == 0 else None,
                 )
@@ -293,9 +301,7 @@ def _prefill_kernel(
         for r, i in enumerate(indices):
             output = jnp.concatenate(
                 [
-                    pltpu.matmul_pop(accumulator(mxu, (block_q + r) * mrb_stride))[
-                        :num_heads
-                    ]
+                    pltpu.matmul_pop(accumulators[mxu][block_q + r])[:num_heads]
                     for mxu in range(2)
                 ],
                 axis=1,
@@ -316,16 +322,16 @@ def _prefill_kernel(
 
     for first in range(0, bq, swa_capacity):
         size = min(swa_capacity, bq - first)
-        swa_launch(first, size)
+        swa_qk_compute(first, size)
         if first == 0:
             main_unpack(groups[0])
-        swa_pop(first, size)
-    main_qk(groups[0])
+        swa_qk_pop(first, size)
+    main_qk_compute(groups[0])
     for step, indices in enumerate(groups):
-        logits = pop_qk(indices)
+        logits = main_qk_pop(indices)
         if step + 1 < len(groups):
             main_unpack(groups[step + 1])
-            main_qk(groups[step + 1])
+            main_qk_compute(groups[step + 1])
         softmax(indices, logits)
         if step:
             inverse_rope(groups[step - 1])
@@ -333,82 +339,7 @@ def _prefill_kernel(
     inverse_rope(groups[-1])
 
 
-def _reference(
-    q,
-    words,
-    scales,
-    banks,
-    starts,
-    positions,
-    sink,
-    rope,
-    pages,
-    bounds,
-    lengths,
-    scale,
-):
-    tokens = q.shape[0]
-    request = jnp.minimum(
-        jnp.searchsorted(starts[1:], jnp.arange(tokens), side="right"),
-        pages.shape[0] - 1,
-    )
-    page_size = banks[0].shape[1]
-    left = jnp.maximum(0, positions - 127) if bounds is None else bounds[request, 0]
-    right = positions + 1 if bounds is None else bounds[request, 1]
-    keys = left[:, None] + jnp.arange(128 if bounds is None else 192)
-    columns = (keys - pages[request, 0, None]) // page_size
-    valid = (keys < right[:, None]) & (keys >= pages[request, 1, None])
-    valid &= (columns >= 0) & (columns < pages.shape[1] - 2)
-    columns = jnp.clip(columns, 0, pages.shape[1] - 3)
-    page_ids = pages[request[:, None], columns + 2]
-    swa = banks[0][jnp.clip(page_ids, 0, banks[0].shape[0] - 1), keys % page_size]
-    if len(banks) == 2:
-        high = banks[1][
-            jnp.clip(page_ids - banks[0].shape[0], 0, banks[1].shape[0] - 1),
-            keys % page_size,
-        ]
-        swa = jnp.where((page_ids < banks[0].shape[0])[..., None], swa, high)
-    swa = jnp.where(valid[..., None], swa, 0)
-    bits = (words[:, :, None, :] >> (8 * jnp.arange(4))[None, None, :, None]).astype(
-        jnp.uint8
-    )
-    main = lax.bitcast_convert_type(bits, jnp.float8_e4m3fn).astype(jnp.bfloat16)
-    main = main.reshape(tokens, 512, 512)
-    main_logits = jnp.einsum(
-        "thd,tkd->thk", q, main, preferred_element_type=jnp.float32
-    )
-    main_logits *= scales[:, None, :] * scale
-    main_logits = jnp.where(
-        jnp.arange(512) < lengths[:, None, None], main_logits, -jnp.inf
-    )
-    swa_logits = (
-        jnp.einsum("thd,tkd->thk", q, swa, preferred_element_type=jnp.float32) * scale
-    )
-    swa_logits = jnp.where(valid[:, None, :], swa_logits, -jnp.inf)
-    logits = jnp.concatenate((main_logits, swa_logits), axis=-1)
-    maximum = jnp.maximum(logits.max(axis=-1, keepdims=True), sink[None, :, None])
-    weights = jnp.exp(logits - maximum)
-    weights /= weights.sum(axis=-1, keepdims=True) + jnp.exp(
-        sink[None, :, None] - maximum
-    )
-    main_p = (weights[:, :, :512] * scales[:, None, :]).astype(jnp.bfloat16)
-    swa_p = weights[:, :, 512:].astype(jnp.bfloat16)
-    output = jnp.einsum(
-        "thk,tkd->thd", main_p, main, preferred_element_type=jnp.float32
-    )
-    output += jnp.einsum("thk,tkd->thd", swa_p, swa, preferred_element_type=jnp.float32)
-    tail = output[:, :, 384:]
-    tail = (
-        tail * rope[:, None, 0, :]
-        + tail[:, :, jnp.arange(128) ^ 1] * rope[:, None, 1, :]
-    )
-    output = jnp.concatenate((output[:, :, :384], tail), axis=-1).astype(jnp.bfloat16)
-    return jnp.where((jnp.arange(tokens) < starts[-1])[:, None, None], output, 0)
-
-
-@functools.partial(
-    jax.jit, static_argnames=("scale", "compress_ratio", "bq", "interpret")
-)
+@functools.partial(jax.jit, static_argnames=("scale", "compress_ratio", "bq"))
 def csa2_prefill(
     q: jax.Array,
     main_kv: jax.Array,
@@ -425,7 +356,6 @@ def csa2_prefill(
     scale: float = 512**-0.5,
     compress_ratio: int = 2,
     bq: int = 16,
-    interpret: bool = False,
 ) -> jax.Array:
     """Paged ragged attention with one request-local query tile per program.
 
@@ -442,8 +372,8 @@ def csa2_prefill(
 
     XLA pipelines fixed query windows and paged SWA through two VMEM buffers.
     Ragged tails may read extra queries; only valid output rows are compacted.
-    interpret selects an independent JAX math reference, without MXU operations.
     """
+    non_causal = swa_bounds is not None
     if q.ndim != 3 or q.shape[2] != 512:
         raise ValueError("CSA2 prefill q must be [T,H,512]")
     tokens, heads, _ = q.shape
@@ -504,21 +434,6 @@ def csa2_prefill(
         raise ValueError("SWA bounds must be INT32 [B,2]")
     if not tokens:
         return jnp.zeros_like(q)
-    if interpret:
-        return _reference(
-            q,
-            main_kv,
-            main_kv_scale,
-            banks,
-            starts,
-            positions,
-            sink,
-            rope_cache,
-            swa_metadata,
-            swa_bounds,
-            main_lengths,
-            scale,
-        )
     bq = min(bq, tokens)
     direct_output = batch == 1 and tokens % bq == 0
     if direct_output:
@@ -529,8 +444,7 @@ def csa2_prefill(
         )
         num_tiles = tokens // bq
     else:
-        tiles, num_tiles = _tile_plan(starts, tokens, bq)
-    non_causal = swa_bounds is not None
+        tiles, num_tiles = build_query_tiles(starts, tokens, bq)
     bounds = swa_bounds if non_causal else jnp.zeros((batch, 2), jnp.int32)
     scalars = (tiles, positions, main_lengths, swa_metadata, bounds)
     page_size = min(cache_page_size, 64)
@@ -548,7 +462,7 @@ def csa2_prefill(
         bank,
     ):
         request = jnp.minimum(tiles_ref[tile, 0], batch - 1)
-        _, left, right, anchor = _window(
+        _, left, right, anchor = swa_window(
             tile,
             tiles_ref,
             positions_ref,
@@ -574,8 +488,9 @@ def csa2_prefill(
             0,
         )
 
-    kernel = functools.partial(
+    kernel_fn = functools.partial(
         _prefill_kernel,
+        non_causal=non_causal,
         bq=bq,
         block_q=min(6, bq, 128 // (pl.cdiv(heads, 16) * 4)),
         page_size=page_size,
@@ -583,7 +498,6 @@ def csa2_prefill(
         num_banks=len(banks),
         low_pages=banks[0].shape[0],
         scale=scale,
-        non_causal=non_causal,
     )
 
     def query_map(tile, tiles_ref, *_):
@@ -598,7 +512,7 @@ def csa2_prefill(
         )
 
     tiled_output = pl.pallas_call(
-        kernel,
+        kernel_fn,
         out_shape=jax.ShapeDtypeStruct((tiles.shape[0] * bq, heads, 512), jnp.bfloat16),
         grid_spec=pltpu.PrefetchScalarGridSpec(
             num_scalar_prefetch=len(scalars),

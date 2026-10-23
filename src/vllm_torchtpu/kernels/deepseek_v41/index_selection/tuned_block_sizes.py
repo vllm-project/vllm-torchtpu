@@ -13,6 +13,12 @@ SCORE_WINDOW = 32768
 QUERY_TILE = 128
 KEY_TILE = 2048
 
+# Full-context paged indexer: (key columns, query rows). Two 32K SparseCore
+# slices cover up to 128K uncompressed tokens at compression ratio 2. On v7x,
+# 128 and 256 query rows have comparable latency; 128 uses half the score HBM
+# (32 MiB). Longer contexts retain the bounded 32-row pipeline.
+PAGED_INDEXER_PREFILL_BUCKET = (65536, 128)
+
 # Measured candidate-union and gather policies. Keep these separate from
 # hardware lane widths and the packed-key format.
 CANDIDATE_DENSE_UNION_MAX_BLOCKS = 16384

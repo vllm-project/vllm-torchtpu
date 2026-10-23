@@ -7,11 +7,13 @@ import numpy as np
 import pytest
 from jax.experimental.pallas import tpu as pltpu
 
-from vllm_torchtpu.kernels.deepseek_v41 import csa2_pipeline as pipeline_module
-from vllm_torchtpu.kernels.deepseek_v41.csa2_cache import encode_csa2_kv
-from vllm_torchtpu.kernels.deepseek_v41.csa2_metadata import prepare_swa_metadata
-from vllm_torchtpu.kernels.deepseek_v41.csa2_pipeline import csa2_pipeline
-from vllm_torchtpu.kernels.deepseek_v41.csa2_prefill import csa2_prefill
+from vllm_torchtpu.kernels.deepseek_v41.csa2 import pipeline as pipeline_module
+from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import (
+    encode_csa2_kv,
+    prepare_swa_metadata,
+)
+from vllm_torchtpu.kernels.deepseek_v41.csa2.pipeline import csa2_pipeline
+from vllm_torchtpu.kernels.deepseek_v41.csa2.prefill import csa2_prefill
 from vllm_torchtpu.kernels.mla.paged_swa import write_swa_pages
 
 
@@ -286,3 +288,61 @@ def test_chunked_attention_preserves_requests_and_reusable_kv(
     np.testing.assert_allclose(
         reused, attend(next_q, expected_words, expected_scales), atol=2e-3, rtol=2e-2
     )
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize(
+    "decoder,non_causal,starts,banked,use_decode",
+    [
+        (False, False, [0, 16, 32], False, False),
+        (False, True, [0, 16, 32], False, False),
+        (True, False, [0, 16, 32], False, True),
+        (True, True, [0, 16, 32], False, False),
+        (True, False, [0, 8, 32], False, False),
+        (True, False, [0, 16, 31], False, False),
+        (True, False, [0, 16, 32], True, False),
+    ],
+)
+def test_decoder_layer_prefill_dispatch(
+    monkeypatch, decoder, non_causal, starts, banked, use_decode
+):
+    def decoded(q, words, scales, swa, positions, sink, rope, **kwargs):
+        assert kwargs["num_tokens"] == 16
+        assert kwargs["decoder_prefill"] is True
+        return jnp.broadcast_to(
+            (jnp.repeat(positions, 16) + kwargs["main_lengths"])[:, None, None],
+            q.shape,
+        ).astype(q.dtype)
+
+    monkeypatch.setattr(pipeline_module, "csa2_decode", decoded)
+    monkeypatch.setattr(
+        pipeline_module, "csa2_prefill", lambda q, *args, **kwargs: -jnp.ones_like(q)
+    )
+    positions = jnp.concatenate((jnp.arange(128, 144), jnp.arange(512, 528)))
+    counts = jnp.arange(32, dtype=jnp.int32)
+    swa = jnp.zeros((2, 64, 512), jnp.bfloat16)
+    result = jax.jit(
+        lambda boundaries, pos: pipeline_module.csa2_attention(
+            jnp.zeros((32, 8, 512), jnp.bfloat16),
+            jnp.zeros((32, 512, 128), jnp.int32),
+            jnp.ones((32, 512), jnp.float32),
+            (swa, swa) if banked else swa,
+            boundaries,
+            pos,
+            jnp.zeros(8, jnp.float32),
+            jnp.zeros((32, 2, 128), jnp.float32),
+            swa_metadata=jnp.zeros((2, 6), jnp.int32),
+            swa_bounds=jnp.zeros((2, 2), jnp.int32) if non_causal else None,
+            main_lengths=counts,
+            scale=512**-0.5,
+            compress_ratio=2,
+            bq=16,
+            decoder=decoder,
+        )
+    )(jnp.array(starts, jnp.int32), positions)
+    expected = (
+        (jnp.repeat(positions[::16], 16) + counts).astype(jnp.bfloat16)
+        if use_decode
+        else -jnp.ones(32, jnp.bfloat16)
+    )
+    np.testing.assert_array_equal(result[:, 0, 0], expected)

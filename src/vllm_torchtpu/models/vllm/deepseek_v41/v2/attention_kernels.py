@@ -14,7 +14,6 @@ import torch
 from vllm_torchtpu.kernels.deepseek_v41 import (
     index_key_layout,
     indexer,
-    tuned_block_sizes,
 )
 from vllm_torchtpu.kernels.deepseek_v41.index_selection import (
     decode as decode_index_selection,
@@ -3193,7 +3192,7 @@ def paged_indexer_jax(
             # across its queries and would gather every row's context again.
             # The untiled score buffer is small here; keep one query tile.
             return score_context(records, rows)
-        columns, query_tile = tuned_block_sizes.PAGED_INDEXER_PREFILL_BUCKET
+        columns, query_tile = prefill_tuning.PAGED_INDEXER_PREFILL_BUCKET
         if (
             not candidate_write
             and not candidate_filter

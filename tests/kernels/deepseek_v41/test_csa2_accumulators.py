@@ -7,13 +7,14 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from vllm_torchtpu.kernels.deepseek_v41.csa2_cache import encode_csa2_kv
-from vllm_torchtpu.kernels.deepseek_v41.csa2_decode import csa2_decode
-from vllm_torchtpu.kernels.deepseek_v41.csa2_pipeline import (
+from vllm_torchtpu.kernels.deepseek_v41.csa2.cache import encode_csa2_kv
+from vllm_torchtpu.kernels.deepseek_v41.csa2.decode import csa2_decode
+from vllm_torchtpu.kernels.deepseek_v41.csa2.pipeline import (
     csa2_attention,
     csa2_pipeline,
 )
-from vllm_torchtpu.kernels.deepseek_v41.csa2_prefill import csa2_prefill
+from vllm_torchtpu.kernels.deepseek_v41.csa2.prefill import csa2_prefill
+from vllm_torchtpu.kernels.deepseek_v41.csa2.reference import prefill_reference
 
 
 def _decode_inputs(batch, heads, page_size):
@@ -100,7 +101,13 @@ def test_decode_matches_ragged_reference_with_authoritative_counts(
     if jax.default_backend() != "tpu":
         pytest.skip("Compiled decode accumulator operations require TPU")
     args, kwargs = _decode_inputs(batch, heads, page_size)
-    expected = csa2_prefill(*args, **kwargs, interpret=True)
+    expected = prefill_reference(
+        *args,
+        swa_metadata=kwargs["swa_metadata"],
+        main_lengths=kwargs["main_lengths"],
+        swa_bounds=kwargs["swa_bounds"],
+        scale=kwargs["scale"],
+    )
     actual = csa2_attention(*args, **kwargs)
     np.testing.assert_allclose(
         np.asarray(actual, np.float32),
@@ -147,7 +154,7 @@ def test_decode_gather_and_reuse_preserve_valid_counts():
 
 
 @pytest.mark.parametrize("heads", [8, 16, 32, 64, 96, 104, 128])
-def test_csa2_accumulator_pipeline_matches_interpret(heads: int) -> None:
+def test_csa2_accumulator_pipeline_matches_reference(heads: int) -> None:
     """Cover both accumulator layouts and every one-to-six-query tail."""
     if jax.default_backend() != "tpu":
         pytest.skip("Compiled accumulator operations require TPU")
@@ -190,9 +197,7 @@ def test_csa2_accumulator_pipeline_matches_interpret(heads: int) -> None:
         jnp.linspace(-1, 1, heads, dtype=jnp.float32),
         rope,
     )
-    expected = csa2_prefill(
-        *args, bq=6, main_lengths=lengths, swa_metadata=metadata, interpret=True
-    )
+    expected = prefill_reference(*args, main_lengths=lengths, swa_metadata=metadata)
     actual = csa2_prefill(*args, bq=6, main_lengths=lengths, swa_metadata=metadata)
     np.testing.assert_allclose(
         np.asarray(actual, np.float32),
