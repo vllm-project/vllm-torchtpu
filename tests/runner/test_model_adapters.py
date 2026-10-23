@@ -35,14 +35,20 @@ def test_unregistered_model_uses_default_runner(architecture):
     )
 
 
-def test_snapshot_field_contract_is_frozen():
-    context, ids = torch.zeros(2, 2), torch.arange(4)
+@pytest.mark.parametrize("payload", ["tensor", "mapping", "none"])
+def test_snapshot_field_contract_is_frozen(payload):
+    context = {"tensor": torch.zeros(2, 2), "mapping": {"rows": (3, 4)}, "none": None}[
+        payload
+    ]
+    ids = torch.arange(4)
     metadata = {"layer": object()}
     snapshot = ModelInputSnapshot(context, 3, 2, 4, metadata, ids)
-    assert snapshot.ngram_context is context
+    assert snapshot.step_context is context
     assert snapshot.attention_metadata is metadata and snapshot.input_ids is ids
     with pytest.raises(FrozenInstanceError):
         snapshot.row_start = 0
+    with pytest.raises(FrozenInstanceError):
+        snapshot.step_context = object()
 
 
 @pytest.mark.parametrize("kwargs", [None, {}, {"model_input": 7}])
@@ -143,40 +149,93 @@ def test_dummy_run_delegates_before_generic_device_work():
 
 
 @pytest.mark.parametrize("enabled", [False, True])
-def test_load_selects_adapter_once_before_loading_weights(monkeypatch, enabled):
-    class ReachedDeviceSetup(Exception):
-        pass
-
-    class Runner:
-        kv_cache_manager = NS()
-
-        @property
-        def device_config(self):
-            raise ReachedDeviceSetup
-
-    # Stop at device setup without requiring the native TPU device registration.
-    monkeypatch.setattr(
-        tpu_runner, "torch", NS(device=Mock(return_value=torch.device("cpu")))
+def test_load_selects_adapter_after_device_setup_before_weights(monkeypatch, enabled):
+    events = []
+    device = torch.device("cpu")
+    model = torch.nn.Identity()
+    runner = NS(
+        kv_cache_manager=NS(),
+        device_config=NS(),
+        vllm_config=NS(),
+        model_config=NS(quantization=None),
+        load_config=object(),
+        mesh=None,
+        is_pooling_model=False,
+        parallel_config=NS(pipeline_parallel_size=1),
+        _pp_is_last=False,
+        _is_async_drafter=False,
+        _initialize_pallas_kernels=Mock(),
     )
-    adapter = object() if enabled else None
-    select = Mock(return_value=adapter)
-    monkeypatch.setattr(model_adapters, "select_model_adapter", select)
-    runner = Runner()
-    with pytest.raises(ReachedDeviceSetup):
-        tpu_runner.TPUModelRunner.load_model(runner)
-    select.assert_called_once_with(runner)
+
+    def bind(loaded):
+        assert loaded is model and runner.model is model
+        events.append("bind")
+
+    adapter = NS(bind_model=Mock(side_effect=bind)) if enabled else None
+
+    def select(actual):
+        assert actual is runner
+        assert runner.device is runner.device_config.device is device
+        assert runner.vllm_config.device_config is runner.device_config
+        events.append("select")
+        return adapter
+
+    def load(**kwargs):
+        assert runner.model_adapter is runner.kv_cache_manager.model_adapter is adapter
+        assert kwargs == dict(
+            vllm_config=runner.vllm_config, model_config=runner.model_config
+        )
+        events.append("load")
+        return model
+
+    # Exercise the real orchestration with CPU device/model collaborators.
+    monkeypatch.setattr(
+        tpu_runner, "torch", NS(device=Mock(return_value=device), nn=torch.nn)
+    )
+    monkeypatch.setattr(
+        model_adapters, "select_model_adapter", Mock(side_effect=select)
+    )
+    loader = NS(load_model=Mock(side_effect=load))
+    monkeypatch.setattr(tpu_runner, "get_model_loader", Mock(return_value=loader))
+    monkeypatch.setattr(tpu_runner, "get_tpu_quantization_config", lambda cfg: None)
+    monkeypatch.setattr(tpu_runner, "validate_online_fp8", Mock())
+    for name in ("set_vllm_model_wrapper_context", "set_current_vllm_config"):
+        monkeypatch.setattr(tpu_runner, name, lambda *a, **kw: nullcontext())
+    for name in (
+        "TPU_ROPE_CACHE_TRUNCATE",
+        "TPU_ROPE_CACHE_ROW_MAJOR",
+        "TPU_MOE_HASH_TABLE_ROW_MAJOR",
+        "TPU_GREEDY_TOP_TOKENS",
+        "FUSED_MOE_DECODE_KERNEL",
+        "TPU_MOE_SKIP_PADDED_TOKENS",
+        "USE_MOE_TP_DECODE_KERNEL",
+    ):
+        monkeypatch.setattr(tpu_runner.envs, name, False)
+    monkeypatch.setattr(
+        "vllm_torchtpu.model_loader_patches.evict_loaded_weights_page_cache", Mock()
+    )
+    tpu_runner.TPUModelRunner.load_model(runner)
+    model_adapters.select_model_adapter.assert_called_once_with(runner)
+    tpu_runner.get_model_loader.assert_called_once_with(runner.load_config)
+    loader.load_model.assert_called_once()
+    runner._initialize_pallas_kernels.assert_called_once()
     assert runner.model_adapter is runner.kv_cache_manager.model_adapter is adapter
+    assert events == (["select", "load", "bind"] if enabled else ["select", "load"])
 
 
 @pytest.mark.parametrize("enabled", [False, True])
+@pytest.mark.parametrize("payload", ["tensor", "mapping", "none"])
 def test_execute_step_snapshots_after_reorder_and_forwards_substituted_ids(
-    monkeypatch, enabled
+    monkeypatch, enabled, payload
 ):
     class ForwardReached(Exception):
         pass
 
     events, snapshots, forwards = [], [], []
-    context, input_ids = torch.zeros(2, 2), torch.arange(4, dtype=torch.int32)
+    context = {"tensor": torch.zeros(2, 2), "mapping": {"rows": (3, 4)}, "none": None}[
+        payload
+    ]
+    input_ids = torch.arange(4, dtype=torch.int32)
     substituted = input_ids + 10
     metadata = {"layer": object()}
     kwargs = {"model_input": object()}
@@ -244,7 +303,7 @@ def test_execute_step_snapshots_after_reorder_and_forwards_substituted_ids(
     assert forwards[0]["model_kwargs"] is (kwargs if enabled else None)
     if enabled:
         (snapshot,) = snapshots
-        assert snapshot.ngram_context is context and snapshot.input_ids is substituted
+        assert snapshot.step_context is context and snapshot.input_ids is substituted
         assert snapshot.attention_metadata is metadata
         assert (snapshot.row_start, snapshot.num_requests, snapshot.num_tokens) == (
             0,
