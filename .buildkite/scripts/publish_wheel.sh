@@ -54,10 +54,8 @@ INDEX_BASE="${PYPI_BASE_URL:-https://pypi.org}"
 INDEX_BASE="${INDEX_BASE%/}"
 UPLOAD_URL="${INDEX_BASE/https:\/\/pypi.org/https:\/\/upload.pypi.org}/legacy/"
 
-die() {
-    echo "ERROR: $*" >&2
-    exit 1
-}
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/../release/lib.sh"
 
 # --- Pick the release --------------------------------------------------------
 # Hardcoded here (not derived from PUBLISH_PYPI) so the name check below
@@ -67,15 +65,11 @@ case "${TARGET}" in
     core)
         WHEEL_GLOB="vllm_torchtpu_core-*.whl"
         SDIST_GLOB=""   # The core build makes no sdist.
-        BUILD_STEP="build_core_wheel"
-        VERSION_KEY="CORE_RELEASE_VERSION"
         PUBLISHED_KEY="CORE_PUBLISHED_VERSION"
         ;;
     vllm-torchtpu)
         WHEEL_GLOB="vllm_torchtpu-*.whl"
         SDIST_GLOB="vllm_torchtpu-*.tar.gz"
-        BUILD_STEP="build_vllm_torchtpu"
-        VERSION_KEY="VLLM_TORCHTPU_RELEASE_VERSION"
         PUBLISHED_KEY="VLLM_TORCHTPU_PUBLISHED_VERSION"
         ;;
     *)
@@ -90,8 +84,7 @@ command -v buildkite-agent >/dev/null 2>&1 \
 # --- Download the built files ------------------------------------------------
 # Publish exactly what was built and tested, never a rebuild.
 echo "--- :inbox_tray: Fetching the files built in this build"
-VERSION="$(buildkite-agent meta-data get "${VERSION_KEY}" 2>/dev/null)" \
-    || die "no meta-data ${VERSION_KEY}: did the ${BUILD_STEP} step run?"
+VERSION="$(release_version)"
 
 WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/${TARGET}-publish.XXXXXX")"
 trap 'rm -rf "${WORK_DIR}"' EXIT

@@ -80,11 +80,10 @@ steps:
     commands:
       - |
         set -euo pipefail
-        CORE_VERSION="$$(buildkite-agent meta-data get CORE_RELEASE_VERSION)"
-        bash .buildkite/scripts/build_vllm_torchtpu.sh "$$CORE_VERSION"
+        VERSION="$$(buildkite-agent meta-data get release-version)"
+        bash .buildkite/scripts/build_vllm_torchtpu.sh "$$VERSION"
         buildkite-agent artifact upload "dist/vllm_torchtpu-*.whl"
         buildkite-agent artifact upload "dist/vllm_torchtpu-*.tar.gz"
-        buildkite-agent meta-data set VLLM_TORCHTPU_RELEASE_VERSION "$$CORE_VERSION"
 
   - label: ":mag: Check the wheels install from PyPI"
     key: check_wheels

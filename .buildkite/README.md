@@ -12,7 +12,9 @@ JAX does not look for a TPU.
 
 `pipeline_perf.yml` holds the perf/eval
 steps. Post-merge builds do not run them, and PR builds run them only when the
-PR has the `run-perf-eval` label; adding that label to a PR that already has
+PR has the `run-perf-eval` label (or `run-full-ci`, which sets `NIGHTLY=1` and
+runs the full nightly suite across every lane: `tests`, `integration`, `perf`
+and `verify`); adding either label to a PR that already has
 `ready` starts a build that includes them. The 02:00 PT nightly runs
 all of them. Between nightlies, schedules on `vllm-torchtpu-ci` that set
 `CI_LANES=perf` run the perf lane alone; without `NIGHTLY` that is only the

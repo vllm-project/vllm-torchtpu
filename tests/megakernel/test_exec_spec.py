@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pytest
 
-from vllm_torchtpu.megakernel import exec_spec
+from vllm_torchtpu.megakernel import block_options, exec_spec
 from vllm_torchtpu.megakernel.errors import MegakernelConfigError
 from vllm_torchtpu.megakernel.exec_spec import ExecSpec, Tiles
 from vllm_torchtpu.megakernel.profiles import default as default_profile
@@ -49,10 +49,21 @@ class _TestTunables:
 _TEST_BLOCK = "test_exec_spec_block"
 
 
+@dataclasses.dataclass(frozen=True)
+class _OtherOptions:
+    width: int = 128
+
+
+@dataclasses.dataclass
+class _MutableOptions:
+    width: int = 128
+
+
 @pytest.fixture(autouse=True)
 def _test_tunables(monkeypatch):
-    """Register `_TestTunables` for one test; the registry is restored after."""
-    monkeypatch.setitem(exec_spec._TUNABLES, _TEST_BLOCK, _TestTunables)
+    """Register `_TestTunables` and `_OtherOptions` for one test; restored after."""
+    monkeypatch.setitem(block_options._TUNABLES, _TEST_BLOCK, _TestTunables)
+    monkeypatch.setitem(block_options._DEBUG, _TEST_BLOCK, _OtherOptions)
 
 
 def test_core_tile_numerics_cover_every_core_field():
@@ -102,36 +113,30 @@ def test_tiles_block_tunables_are_canonical_and_hashable():
 
 
 def test_exec_spec_imports_only_ops_and_profiles():
-    """`exec_spec.py` depends only on Python stdlib, `ops`, and `profiles`."""
-    path = Path(exec_spec.__file__)
-    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            for alias in node.names:
-                assert alias.name.split(".")[0] in sys.stdlib_module_names
-        elif isinstance(node, ast.ImportFrom):
-            mod = node.module or ""
-            if node.level == 0:
-                assert mod.split(".")[0] in sys.stdlib_module_names
-            else:
-                assert node.level == 1
-                roots = [mod.split(".")[0]] if mod else [a.name for a in node.names]
-                assert set(roots) <= {"ops", "profiles"}, roots
-
-
-@dataclasses.dataclass(frozen=True)
-class _OtherOptions:
-    width: int = 128
-
-
-@dataclasses.dataclass
-class _MutableOptions:
-    width: int = 128
+    """`exec_spec` and `block_options` depend only on stdlib, `ops` and `profiles`."""
+    for mod_obj, allowed_rel in (
+        (block_options, set()),
+        (exec_spec, {"block_options", "ops", "profiles"}),
+    ):
+        path = Path(mod_obj.__file__)
+        tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert alias.name.split(".")[0] in sys.stdlib_module_names
+            elif isinstance(node, ast.ImportFrom):
+                mod = node.module or ""
+                if node.level == 0:
+                    assert mod.split(".")[0] in sys.stdlib_module_names
+                else:
+                    assert node.level == 1
+                    roots = [mod.split(".")[0]] if mod else [a.name for a in node.names]
+                    assert set(roots) <= allowed_rel, (path.name, roots)
 
 
 def test_block_maps_check_entry_types():
     """`Tiles.blocks` takes only the block's registered `Tunables` class;
-    `DebugOptions.blocks` any frozen dataclass, both canonical."""
+    `DebugOptions.blocks` takes only the block's registered `Debug` class."""
     with pytest.raises(TypeError, match="_TestTunables"):
         Tiles(blocks={_TEST_BLOCK: _OtherOptions(width=256)})
     with pytest.raises(TypeError, match="with_blocks"):
@@ -144,6 +149,10 @@ def test_block_maps_check_entry_types():
     )
     with pytest.raises(TypeError, match="DebugOptions.blocks"):
         exec_spec.DebugOptions(blocks={_TEST_BLOCK: {"width": 256}})
+    with pytest.raises(TypeError, match="_OtherOptions"):
+        exec_spec.DebugOptions(blocks={_TEST_BLOCK: _TestTunables(width=256)})
+    with pytest.raises(KeyError, match="no Debug class registered"):
+        exec_spec.DebugOptions(blocks={"no_such_block": _OtherOptions(width=256)})
     # A mutable dataclass would make `ExecSpec` unhashable.
     with pytest.raises(TypeError, match="frozen"):
         exec_spec.DebugOptions(blocks={_TEST_BLOCK: _MutableOptions(width=256)})

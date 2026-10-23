@@ -52,15 +52,11 @@ esac
 echo "--- :package: PyPI"
 WORK="$(mktemp -d)"
 trap 'rm -rf "${WORK}"' EXIT
-curl -LsSf --retry 3 https://astral.sh/uv/install.sh \
-    | env UV_INSTALL_DIR="${WORK}/uv" UV_NO_MODIFY_PATH=1 sh >/dev/null
-echo "vllm-torchtpu==${VERSION}" > "${WORK}/req.in"
+UV="$(install_uv "${WORK}/uv")"
 # publish_wheel.sh already waited for each file, but the simple index can
 # still lag a little behind the upload.
 for attempt in $(seq 1 10); do
-    if "${WORK}/uv/uv" pip compile "${WORK}/req.in" --no-config --quiet --refresh \
-        --python-version 3.12 --python-platform x86_64-manylinux_2_31 \
-        --index-url https://pypi.org/simple -o "${WORK}/resolved.txt" 2>"${WORK}/err.txt"; then
+    if resolve_vllm_torchtpu "${UV}" "${VERSION}" "${WORK}/resolved.txt" --refresh 2>"${WORK}/err.txt"; then
         break
     fi
     [[ "${attempt}" == 10 ]] && { cat "${WORK}/err.txt" >&2; die "vllm-torchtpu==${VERSION} does not resolve from pypi.org."; }

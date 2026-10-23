@@ -30,6 +30,9 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../../" && pwd)"
 # releases/vX.Y.Z pushes prod as vX.Y.Z, or under RELEASE_VERSION for a
 # pre-release. The approver chooses whether to move latest (never for a
 # pre-release) and whether an existing tag may be overwritten.
+# shellcheck source=/dev/null
+source "${SCRIPT_DIR}/../release/lib.sh"
+
 BRANCH="${BUILDKITE_BRANCH:-$(git -C "${REPO_ROOT}" rev-parse --abbrev-ref HEAD)}"
 DATE="$(date +%Y%m%d)"
 PUBLISH_DOCKERHUB="${PUBLISH_DOCKERHUB:-0}"
@@ -39,18 +42,15 @@ case "${BRANCH}" in
     LATEST_TAG="latest"
     ;;
   releases/v*)
-    VERSION="${BRANCH#releases/v}"
-    # Starting with a digit keeps it from colliding with latest or nightly-*.
-    if [[ ! "${VERSION}" =~ ^[0-9][A-Za-z0-9_.-]*$ ]]; then
-      echo "ERROR: branch '${BRANCH}' does not name a version usable as an image tag; expected releases/vX.Y.Z." >&2
-      exit 1
+    if [[ ! "${BRANCH}" =~ ${RELEASE_BRANCH_REGEX} ]]; then
+      die "branch '${BRANCH}' does not name a version usable as an image tag; expected releases/vX.Y.Z."
     fi
+    VERSION="${BASH_REMATCH[1]}"
     DATE_TAG="${DATE}-${VERSION}"
     LATEST_TAG="${VERSION}"
     ;;
   *)
-    echo "ERROR: nightly images are published from main or releases/vX.Y.Z, not '${BRANCH}'." >&2
-    exit 1
+    die "nightly images are published from main or releases/vX.Y.Z, not '${BRANCH}'."
     ;;
 esac
 
@@ -71,16 +71,15 @@ if [[ "${PUBLISH_DOCKERHUB}" == "1" ]]; then
     # version, and a pre-release never moves latest.
     DOCKERHUB_VERSION="${RELEASE_VERSION:-${VERSION}}"
     DOCKERHUB_VERSION="${DOCKERHUB_VERSION#v}"
-    if [[ ! "${DOCKERHUB_VERSION}" =~ ^[0-9][A-Za-z0-9_.-]*$ ]]; then
-      echo "ERROR: RELEASE_VERSION '${RELEASE_VERSION}' is not usable as an image tag; expected e.g. v0.29.0rc1." >&2
-      exit 1
+    if ! is_valid_release_version "${DOCKERHUB_VERSION}"; then
+      die "RELEASE_VERSION '${RELEASE_VERSION}' is not usable as an image tag; expected e.g. v0.29.0rc1."
     fi
     DOCKERHUB_TAG="v${DOCKERHUB_VERSION}"
     DOCKERHUB_LATEST_TAG="latest"
     # The approver's choices in the block step of pipeline_nightly_image.yml.
     MOVE_LATEST="$(buildkite-agent meta-data get dockerhub_move_latest --default no)"
     OVERWRITE="$(buildkite-agent meta-data get dockerhub_overwrite --default no)"
-    if [[ -n "${RELEASE_VERSION:-}" ]]; then
+    if [[ -n "${RELEASE_VERSION:-}" ]] || is_prerelease "${DOCKERHUB_VERSION}"; then
       MOVE_LATEST="no"
     fi
   else
@@ -101,8 +100,6 @@ if [[ "${PUBLISH_DOCKERHUB}" == "1" ]]; then
   # commands below use: the image builds still pull the base image
   # anonymously, the token never reaches the agent's shared config, and the
   # trap logs out however the script ends.
-  { set +x; } 2>/dev/null # Never trace the token into the build log.
-  : "${DOCKERHUB_TOKEN_VLLM_TORCHTPU:?DOCKERHUB_TOKEN_VLLM_TORCHTPU must be set when PUBLISH_DOCKERHUB=1}"
   DOCKERHUB_CONFIG="$(mktemp -d)"
   cleanup_dockerhub() {
     DOCKER_CONFIG="${DOCKERHUB_CONFIG}" docker logout >/dev/null 2>&1 || true
@@ -111,13 +108,7 @@ if [[ "${PUBLISH_DOCKERHUB}" == "1" ]]; then
   trap cleanup_dockerhub EXIT
   trap 'exit 130' INT
   trap 'exit 143' TERM
-  # printf is a shell builtin, so the token reaches docker only through the
-  # pipe and never appears on a command line.
-  printf '%s' "${DOCKERHUB_TOKEN_VLLM_TORCHTPU}" \
-    | DOCKER_CONFIG="${DOCKERHUB_CONFIG}" docker login -u "${DOCKERHUB_USERNAME}" --password-stdin >/dev/null 2>&1 \
-    || { echo "ERROR: Docker Hub login failed; check DOCKERHUB_TOKEN_VLLM_TORCHTPU and DOCKERHUB_USERNAME." >&2; exit 1; }
-  # Nothing else needs the token, so no later process inherits it.
-  unset DOCKERHUB_TOKEN_VLLM_TORCHTPU
+  dockerhub_login "${DOCKERHUB_CONFIG}" "${DOCKERHUB_USERNAME}"
 
   # Released tags are immutable unless the approver chose to overwrite.
   # Checked before the build, so a refused release builds nothing.
