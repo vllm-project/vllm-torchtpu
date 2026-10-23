@@ -256,7 +256,12 @@ def test_a_program_that_is_no_pipeline_stage_refuses_a_pipeline(monkeypatch):
 
     def vllm_config(pp):
         return SimpleNamespace(
-            parallel_config=SimpleNamespace(pipeline_parallel_size=pp)
+            model_config=SimpleNamespace(
+                hf_config=SimpleNamespace(
+                    architectures=["KimiK3ForConditionalGeneration"]
+                )
+            ),
+            parallel_config=SimpleNamespace(pipeline_parallel_size=pp),
         )
 
     assert backend.capabilities(vllm_config(1)).pipeline is False

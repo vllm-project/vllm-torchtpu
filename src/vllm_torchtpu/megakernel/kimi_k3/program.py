@@ -14,8 +14,8 @@
 """Kimi-K3 as a megakernel program: the prefill role's :class:`KimiPrefiller`
 or the decode role's :class:`KimiDecoder`, and what they support.
 
-The K3 programs have no vLLM dependencies; ``megakernel.runner`` builds them
-from vLLM's configuration and the standalone tools build them directly.
+The K3 programs have no vLLM dependencies; :func:`from_vllm` builds them from
+vLLM's configuration and the standalone tools build them directly.
 """
 
 from __future__ import annotations
@@ -42,6 +42,13 @@ STAGE_CORES = 8
 # Sampling parameters the ops implement (beyond greedy): temperature, top-p,
 # top-k and a per-request seed, on both roles.
 SAMPLING = frozenset({"temperature", "top_p", "top_k", "seed"})
+# --model-loader-extra-config keys, by role.
+LOADER_KEYS = {
+    "prefill": frozenset({"presharded", "draft"}),
+    "decode": frozenset(
+        {"presharded", "attention_dp", "shared_blocks", "synthetic_acceptance_lengths"}
+    ),
+}
 
 _SPEC_SUPPORT = (
     f"3 or {DRAFT_TOKENS} drafts at batches 1-8, and 3 at batches "
@@ -366,3 +373,71 @@ def build_stage(
     return KimiPrefillStage(
         config, presharded, stage=stage, mesh=mesh, core=core, draft=draft
     )
+
+
+def from_vllm(vllm_config: Any, tp_rank: int):
+    """The program for the role ``vllm_config`` selects, on TP rank
+    ``tp_rank`` (under pipeline parallelism, this worker's prefill stage)."""
+    from vllm_torchtpu import envs as tpu_envs
+    from vllm_torchtpu.megakernel import backend
+    from vllm_torchtpu.megakernel.kimi_k3.layout import NUM_LAYERS
+
+    hf_config = vllm_config.model_config.hf_text_config
+    if (
+        int(hf_config.num_hidden_layers) != NUM_LAYERS
+        or int(hf_config.hidden_size) != HIDDEN_SIZE
+    ):
+        raise NotImplementedError("the K3 megakernel implements full Kimi K3 only")
+    spec = vllm_config.speculative_config
+    if spec is not None and spec.method != "dspark":
+        raise NotImplementedError("the K3 decoder speculates with DSpark only")
+    config = MegakernelEngineConfig.from_vllm_config(vllm_config)
+    moe_reduce_dtype = tpu_envs.TPU_K3_MOE_REDUCE_DTYPE
+    if config.attention_dp > 1:
+        check(config)
+    if config.attention_dp > 1 or moe_reduce_dtype != "float32":
+        from vllm_torchtpu.megakernel.kimi_k3 import config as kernel_config
+
+        # Kernel modules read the config at import: install it before the
+        # program imports them.
+        kernel_config.install(
+            kernel_config.KernelConfig(
+                attention_dp=config.attention_dp,
+                dcp_group=config.decode_context_parallel_size,
+                moe_reduce_dtype=moe_reduce_dtype,
+            )
+        )
+    if config.pipeline_parallel_size > 1:
+        from vllm.distributed import get_pp_group
+        from vllm.distributed.parallel_state import get_pcp_group
+        from vllm.distributed.utils import get_pp_indices
+
+        from vllm_torchtpu.distributed.pcp import get_or_create_pcp_mesh
+        from vllm_torchtpu.megakernel.kimi_k3.kernels.prefill_stage import STAGE_LAYERS
+        from vllm_torchtpu.megakernel.kimi_k3.stage import AXIS
+
+        stage = get_pp_group().rank_in_group
+        if get_pp_indices(NUM_LAYERS, stage, config.pipeline_parallel_size) != tuple(
+            STAGE_LAYERS[stage]
+        ):
+            raise NotImplementedError(
+                "the K3 prefill stages hold layers "
+                f"{', '.join(f'{a}-{b - 1}' for a, b in STAGE_LAYERS)}: set "
+                "VLLM_PP_LAYER_PARTITION="
+                + ",".join(str(b - a) for a, b in STAGE_LAYERS)
+            )
+        return build_stage(
+            config,
+            backend.presharded(vllm_config),
+            stage=stage,
+            mesh=get_or_create_pcp_mesh(AXIS),
+            core=get_pcp_group().rank_in_group,
+            draft=backend.draft(vllm_config),
+        )
+    # The prefill computes the rings of its loader config's draft; the
+    # decoder drafts with the speculative config's model (and imports rings).
+    if config.role == "prefill":
+        draft = backend.draft(vllm_config)
+    else:
+        draft = Path(str(spec.model)) if spec is not None else None
+    return build(config, backend.presharded(vllm_config), draft, tp_rank=tp_rank)

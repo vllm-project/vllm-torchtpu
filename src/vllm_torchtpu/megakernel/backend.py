@@ -25,22 +25,34 @@ patches call it.
 
 from __future__ import annotations
 
+import importlib
 from pathlib import Path
+from types import ModuleType
 from typing import Any
 
 LOAD_FORMAT = "megakernel"
-# Model architectures with a megakernel program.
-ARCHITECTURES = ("KimiK3ForConditionalGeneration", "KimiLinearForCausalLM")
-# --model-loader-extra-config keys, by role.
-_LOADER_KEYS = {
-    "prefill": {"presharded", "draft"},
-    "decode": {
-        "presharded",
-        "attention_dp",
-        "shared_blocks",
-        "synthetic_acceptance_lengths",
-    },
+# Model architectures with a megakernel program: the package under
+# ``vllm_torchtpu.megakernel`` whose ``program`` module checks, describes and
+# builds it (``LOADER_KEYS``, the ``--model-loader-extra-config`` keys by role;
+# ``capabilities``; ``from_vllm``).
+PROGRAMS = {
+    "KimiK3ForConditionalGeneration": "kimi_k3",
+    "KimiLinearForCausalLM": "kimi_k3",
 }
+
+
+def program(vllm_config: Any) -> ModuleType:
+    """The ``program`` module of the model ``vllm_config`` serves."""
+    hf_config = getattr(vllm_config.model_config, "hf_config", None)
+    architectures = getattr(hf_config, "architectures", None) or []
+    for architecture in architectures:
+        if architecture in PROGRAMS:
+            return importlib.import_module(
+                f"vllm_torchtpu.megakernel.{PROGRAMS[architecture]}.program"
+            )
+    raise ValueError(
+        f"no megakernel program for {architectures}; supported: {list(PROGRAMS)}"
+    )
 
 
 def role(vllm_config: Any) -> str | None:
@@ -57,15 +69,6 @@ def role(vllm_config: Any) -> str | None:
             "a KV transfer config with "
             "kv_role kv_producer (prefill) or kv_consumer (decode)"
         )
-    model_config = getattr(vllm_config, "model_config", None)
-    architectures = (
-        getattr(getattr(model_config, "hf_config", None), "architectures", None) or []
-    )
-    if model_config is not None and not any(a in ARCHITECTURES for a in architectures):
-        raise ValueError(
-            f"no megakernel program for {architectures}; "
-            f"supported: {list(ARCHITECTURES)}"
-        )
     selected = "prefill" if kv.is_kv_producer else "decode"
     _loader_config(vllm_config, selected)
     return selected
@@ -79,7 +82,8 @@ def _loader_config(vllm_config: Any, selected: str) -> dict:
             "--load-format megakernel takes --model-loader-extra-config as a "
             'dict, e.g. {"presharded": "<dir>"}'
         )
-    unknown = set(value) - _LOADER_KEYS[selected]
+    keys = program(vllm_config).LOADER_KEYS[selected]
+    unknown = set(value) - keys
     if unknown:
         hint = (
             " (the decoder drafts with --speculative-config's model and imports "
@@ -89,7 +93,7 @@ def _loader_config(vllm_config: Any, selected: str) -> dict:
         )
         raise ValueError(
             f"--model-loader-extra-config for the megakernel {selected} role "
-            f"takes {sorted(_LOADER_KEYS[selected])}, not {sorted(unknown)}{hint}"
+            f"takes {sorted(keys)}, not {sorted(unknown)}{hint}"
         )
     if not value.get("presharded"):
         raise ValueError(
@@ -204,9 +208,8 @@ def capabilities(vllm_config: Any):
     if role(vllm_config) is None:
         return None
     from vllm_torchtpu.megakernel.config import MegakernelEngineConfig
-    from vllm_torchtpu.megakernel.kimi_k3 import program
 
-    selected = program.capabilities(
+    selected = program(vllm_config).capabilities(
         MegakernelEngineConfig.from_vllm_config(vllm_config)
     )
     pipeline = vllm_config.parallel_config.pipeline_parallel_size > 1

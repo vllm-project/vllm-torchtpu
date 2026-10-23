@@ -42,7 +42,6 @@ just their KV-connector progress.
 from __future__ import annotations
 
 import dataclasses
-from pathlib import Path
 from typing import Any, cast
 
 import numpy as np
@@ -56,16 +55,12 @@ from vllm.v1.kv_cache_interface import KVCacheSpec, MambaSpec
 from vllm.v1.outputs import EMPTY_MODEL_RUNNER_OUTPUT, ModelRunnerOutput
 
 import vllm_torchtpu.distributed.utils as dist_utils
-from vllm_torchtpu import envs as tpu_envs
 from vllm_torchtpu.distributed.pp_wave import PPWave
 from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.megakernel import (
     backend,
     loader,  # noqa: F401  (registers the load format)
 )
-from vllm_torchtpu.megakernel.config import MegakernelEngineConfig
-from vllm_torchtpu.megakernel.kimi_k3 import program as k3
-from vllm_torchtpu.megakernel.kimi_k3.layout import NUM_LAYERS
 from vllm_torchtpu.megakernel.program import (
     KVGroup,
     MegakernelProgram,
@@ -125,67 +120,9 @@ def grammar_bitmask_rows(
 
 
 def build_program(vllm_config: Any, tp_rank: int) -> MegakernelProgram:
-    """The Kimi-K3 program for the role ``vllm_config`` selects, on TP rank
-    ``tp_rank`` (under pipeline parallelism, this worker's prefill stage)."""
-    hf_config = vllm_config.model_config.hf_text_config
-    if (
-        int(hf_config.num_hidden_layers) != NUM_LAYERS
-        or int(hf_config.hidden_size) != k3.HIDDEN_SIZE
-    ):
-        raise NotImplementedError("the K3 megakernel implements full Kimi K3 only")
-    spec = vllm_config.speculative_config
-    if spec is not None and spec.method != "dspark":
-        raise NotImplementedError("the K3 decoder speculates with DSpark only")
-    config = MegakernelEngineConfig.from_vllm_config(vllm_config)
-    moe_reduce_dtype = tpu_envs.TPU_K3_MOE_REDUCE_DTYPE
-    if config.attention_dp > 1:
-        k3.check(config)
-    if config.attention_dp > 1 or moe_reduce_dtype != "float32":
-        from vllm_torchtpu.megakernel.kimi_k3 import config as kernel_config
-
-        # Kernel modules read the config at import: install it before the
-        # program imports them.
-        kernel_config.install(
-            kernel_config.KernelConfig(
-                attention_dp=config.attention_dp,
-                dcp_group=config.decode_context_parallel_size,
-                moe_reduce_dtype=moe_reduce_dtype,
-            )
-        )
-    if config.pipeline_parallel_size > 1:
-        from vllm.distributed import get_pp_group
-        from vllm.distributed.parallel_state import get_pcp_group
-        from vllm.distributed.utils import get_pp_indices
-
-        from vllm_torchtpu.distributed.pcp import get_or_create_pcp_mesh
-        from vllm_torchtpu.megakernel.kimi_k3.kernels.prefill_stage import STAGE_LAYERS
-        from vllm_torchtpu.megakernel.kimi_k3.stage import AXIS
-
-        stage = get_pp_group().rank_in_group
-        if get_pp_indices(NUM_LAYERS, stage, config.pipeline_parallel_size) != tuple(
-            STAGE_LAYERS[stage]
-        ):
-            raise NotImplementedError(
-                "the K3 prefill stages hold layers "
-                f"{', '.join(f'{a}-{b - 1}' for a, b in STAGE_LAYERS)}: set "
-                "VLLM_PP_LAYER_PARTITION="
-                + ",".join(str(b - a) for a, b in STAGE_LAYERS)
-            )
-        return k3.build_stage(
-            config,
-            backend.presharded(vllm_config),
-            stage=stage,
-            mesh=get_or_create_pcp_mesh(AXIS),
-            core=get_pcp_group().rank_in_group,
-            draft=backend.draft(vllm_config),
-        )
-    # The prefill computes the rings of its loader config's draft; the
-    # decoder drafts with the speculative config's model (and imports rings).
-    if config.role == "prefill":
-        draft = backend.draft(vllm_config)
-    else:
-        draft = Path(str(spec.model)) if spec is not None else None
-    return k3.build(config, backend.presharded(vllm_config), draft, tp_rank=tp_rank)
+    """The served model's program for the role ``vllm_config`` selects, on
+    TP rank ``tp_rank``."""
+    return backend.program(vllm_config).from_vllm(vllm_config, tp_rank)
 
 
 class MegakernelModelRunner(TPUModelRunner):
