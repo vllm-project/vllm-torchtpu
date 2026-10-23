@@ -57,30 +57,20 @@ def _bf16(x):
 def resident_lookup_raw(
     table, ids, *, vocab_start: int, local_rows: int, head_dim: int
 ):
-    """Owner-masked integer bits [T,heads*head_dim]: INT8/FP8 or INT16/BF16.
-
-    Use the validated eight-token chunks: unbounded full-table gathers failed
-    in the original FP8 lowering probes. Pad/crop only the queries, keeping
-    the persistent table unchanged.
-    """
+    """Owner-masked integer bits [T,heads*head_dim]: INT8/FP8 or INT16/BF16."""
     token_count, heads = ids.shape
     embedding_dim = heads * head_dim
     carrier = jnp.int16 if table.dtype == jnp.int16 else jnp.int8
     if token_count == 0:
         return jnp.zeros((0, embedding_dim), carrier)
-    padded = jnp.pad(
-        ids.astype(jnp.int32), ((0, (-token_count) % 8), (0, 0)), constant_values=-1
+    ids = ids.astype(jnp.int32)
+    owned = (ids >= vocab_start) & (ids < vocab_start + local_rows)
+    local = jnp.where(owned, ids - vocab_start, 0)
+    bits = compact_rows(table, local, head_dim=head_dim)
+    bits = jnp.where(owned[..., None], bits, jnp.zeros((), table.dtype))
+    return jax.lax.bitcast_convert_type(bits, carrier).reshape(
+        token_count, embedding_dim
     )
-
-    def gather(chunk):
-        owned = (chunk >= vocab_start) & (chunk < vocab_start + local_rows)
-        local = jnp.where(owned, chunk - vocab_start, 0)
-        bits = compact_rows(table, local, head_dim=head_dim)
-        bits = jnp.where(owned[..., None], bits, jnp.zeros((), table.dtype))
-        return jax.lax.bitcast_convert_type(bits, carrier)
-
-    result = jax.lax.map(gather, padded.reshape(-1, 8, heads))
-    return result.reshape(-1, embedding_dim)[:token_count]
 
 
 def decode_embeddings(raw_embeddings, scale):
