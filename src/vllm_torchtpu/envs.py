@@ -103,6 +103,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
+    VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -533,6 +534,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # kernel's static envelope (non-TPU7x, unsupported shapes) still use RPA.
     "VLLM_TPU_QSA_FUSED_SPARSE_DECODE": env_bool(
         "VLLM_TPU_QSA_FUSED_SPARSE_DECODE", default=False
+    ),
+    # Qwen4-exp QSA decode/verify attention: present every head slot of the
+    # main KV row (zero queries for the other layer's head) so all QSA layers
+    # share one decode kernel configuration and XLA computes the decode
+    # schedule once per step; RPA also skips its empty mixed pass.
+    "VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE": env_bool(
+        "VLLM_TPU_QSA_DECODE_SHARED_SCHEDULE", default=False
     ),
     # Qwen4-exp QSA prefill: build the per-query selection bitset with a
     # compare-and-accumulate Pallas kernel. Off falls back to the vmapped
