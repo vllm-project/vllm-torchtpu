@@ -12,7 +12,9 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """TPULoRAModelManager writes each adapter through a host buffer. These tests
-guard that every slot still ends up exactly as vLLM's own manager writes it."""
+guard that every slot still ends up exactly as vLLM's own manager writes it,
+and, on the chip, that the write compiles once, holds at most one extra slot,
+and leaves the stacked tensors' device layout alone."""
 
 from types import SimpleNamespace
 
@@ -20,8 +22,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 import torch
+import torch._dynamo.utils
 import vllm.lora.layers
 from torch import nn
+from torch_tpu._internal import execution_mode
 from vllm.config.lora import LoRAConfig
 from vllm.lora.layers import (
     BaseLayerWithLoRA,
@@ -49,6 +53,7 @@ from vllm.lora.model_manager import AdapterLRUCache, LRUCacheLoRAModelManager
 from vllm.lora.request import LoRARequest
 from vllm.lora.worker_manager import LRUCacheWorkerLoRAManager
 
+from tests.distributed.tpu_test_utils import run_in_isolated_process
 from vllm_torchtpu.layers.adapter.custom_ops import lora_slot_update_op
 from vllm_torchtpu.lora import lora_manager
 from vllm_torchtpu.lora.lora_manager import (
@@ -60,6 +65,9 @@ from vllm_torchtpu.lora.lora_manager import (
 NUM_SLOTS, MAX_RANK, MAX_CPU_LORAS = 3, 8, 8
 HIDDEN, Q, KV, INTERMEDIATE, VOCAB = 16, 32, 8, 24, 40
 CPU = torch.device("cpu")
+# The tpu device type exists only once torch_tpu loads in full, which CPU-only
+# runs skip.
+TPU = "tpu"
 
 
 @pytest.fixture(autouse=True)
@@ -529,3 +537,162 @@ def test_vllm_writes_reserve_two_copies_and_one_slot():
     assert tpu_manager.slot_write_hbm_bytes() == sum(
         2 * weights.nbytes + weights[0].nbytes for weights in _all_stacked(tpu_manager)
     )
+
+
+# The tests below run on the chip, each in a spawned child. The child imports
+# the real slot write, not the host stand-in that slot_writes installs here,
+# and spawns_tpu_workers runs them before tests that hold the chip in-process.
+
+
+def _tpu_layers():
+    return _layers(TPU, torch.bfloat16)
+
+
+def _large_logits_layer():
+    """A layer whose slot is 128 MiB: its upload outlasts writing the next
+    adapter on the host, and a second copy of all its slots would show in the
+    peak memory."""
+    return {
+        "logits": _vocab_layer(
+            LogitsProcessorWithLoRA,
+            (1, MAX_RANK, HIDDEN),
+            (1, 1 << 23, MAX_RANK),
+            TPU,
+            torch.bfloat16,
+        )
+    }
+
+
+def _tpu_managers(make_layers=_tpu_layers):
+    # The engine runs eager ops in this mode.
+    execution_mode.eager_mode = execution_mode.EagerMode.DEFER_AND_FUSE
+    torch.default_generator.manual_seed(0)
+    return _managers(make_layers, torch.device(TPU))
+
+
+def _dynamo_graphs():
+    return torch._dynamo.utils.counters["stats"]["unique_graphs"]
+
+
+def _slot_write_matches_vllm_writes_on_tpu():
+    tpu_manager, vllm_manager = _tpu_managers()
+    layers = vllm_manager.modules
+    for adapter in (
+        _adapter(1, layers),
+        _adapter(2, layers, rank=4, drop_second_slice=True),
+        _adapter(3, layers, skip=("embed", "logits")),
+        _adapter(4, layers),  # Evicts 1 and overwrites slot 0.
+    ):
+        _activate((tpu_manager, vllm_manager), adapter)
+        _assert_same_slots(tpu_manager, vllm_manager)
+    expected = vllm_manager.modules["embed"].lora_a_stacked
+    assert torch.equal(
+        tpu_manager.modules["embed"].lora_a_stacked_2d.cpu(),
+        expected.reshape(NUM_SLOTS * VOCAB, MAX_RANK).cpu(),
+    )
+
+
+@pytest.mark.tpu_test
+@pytest.mark.spawns_tpu_workers
+def test_slot_write_matches_vllm_writes_on_tpu():
+    """The real program writes what vLLM's eager writes do, including through
+    the embedding's 2D view."""
+    run_in_isolated_process(_slot_write_matches_vllm_writes_on_tpu)
+
+
+def _back_to_back_adapters_both_land_on_tpu():
+    tpu_manager, vllm_manager = _tpu_managers(_large_logits_layer)
+    # As at startup, so the first write does not compile while its upload runs.
+    tpu_manager.precompile_activation()
+    layers = vllm_manager.modules
+    first, second = _adapter(1, layers), _adapter(2, layers)
+    # Nothing syncs between the two, so the second rewrites the host buffer
+    # right after the first upload returns.
+    _activate((tpu_manager,), first)
+    _activate((tpu_manager,), second)
+    _activate((vllm_manager,), first)
+    _activate((vllm_manager,), second)
+    _assert_same_slots(tpu_manager, vllm_manager)
+
+
+@pytest.mark.tpu_test
+@pytest.mark.spawns_tpu_workers
+def test_back_to_back_adapters_both_land_on_tpu():
+    """One step can bring in two adapters. The first upload must be done
+    reading the host buffer before the second adapter is written into it."""
+    run_in_isolated_process(_back_to_back_adapters_both_land_on_tpu)
+
+
+def _slot_write_compiles_once_for_every_slot():
+    tpu_manager, _ = _tpu_managers()
+    layers = tpu_manager.modules
+    tpu_manager.precompile_activation()
+    torch.accelerator.synchronize()
+    graphs, programs = _dynamo_graphs(), torch.tpu._get_cache_requests()
+    # 1, 2 and 3 use each slot for the first time and 4 overwrites slot 0.
+    # Grad mode alternates, since the add_lora RPC runs with grad enabled.
+    for lora_id in range(1, NUM_SLOTS + 2):
+        with torch.set_grad_enabled(lora_id % 2 == 0):
+            _activate((tpu_manager,), _adapter(lora_id, layers))
+    torch.accelerator.synchronize()
+    assert _dynamo_graphs() == graphs
+    assert torch.tpu._get_cache_requests() == programs
+
+
+@pytest.mark.tpu_test
+@pytest.mark.spawns_tpu_workers
+def test_slot_write_compiles_once_for_every_slot():
+    """After the startup precompile, no adapter swap traces again or runs an
+    eager program."""
+    run_in_isolated_process(_slot_write_compiles_once_for_every_slot)
+
+
+def _slot_write_holds_at_most_one_extra_slot():
+    tpu_manager, _ = _tpu_managers(_large_logits_layer)
+    writer = tpu_manager._slot_writer
+    assert writer is not None
+    tpu_manager.precompile_activation()
+    adapter = _adapter(1, tpu_manager.modules)
+    torch.accelerator.synchronize()
+    before = torch.accelerator.memory_allocated(TPU)
+    torch.accelerator.reset_peak_memory_stats(TPU)
+    _activate((tpu_manager,), adapter)
+    torch.accelerator.synchronize()
+    extra = torch.accelerator.max_memory_allocated(TPU) - before
+    assert extra <= writer._host_slot_weights.nbytes + 16 * 2**20, extra
+
+
+@pytest.mark.tpu_test
+@pytest.mark.spawns_tpu_workers
+def test_slot_write_holds_at_most_one_extra_slot():
+    """A swap may hold the uploaded slot, but not a second copy of the stacked
+    tensors, which a compiled torch write without donation would."""
+    run_in_isolated_process(_slot_write_holds_at_most_one_extra_slot)
+
+
+def _compiled_reader_runs_no_fixups_after_activation():
+    tpu_manager, _ = _tpu_managers()
+    stacked = [
+        weights for layer in tpu_manager.modules.values() for weights in _stacked(layer)
+    ]
+
+    @torch.compile(backend="tpu", fullgraph=True, dynamic=False)
+    def read(stacked):
+        return torch.stack([weights.float().sum() for weights in stacked]).sum()
+
+    # Compiled before any adapter is loaded, as the backbone is at startup.
+    read(stacked).cpu()
+    for lora_id in range(1, NUM_SLOTS + 2):
+        _activate((tpu_manager,), _adapter(lora_id, tpu_manager.modules))
+    torch.accelerator.synchronize()
+    programs = torch.tpu._get_cache_requests()
+    read(stacked).cpu()
+    assert torch.tpu._get_cache_requests() == programs
+
+
+@pytest.mark.tpu_test
+@pytest.mark.spawns_tpu_workers
+def test_compiled_reader_runs_no_fixups_after_activation():
+    """Writes that change the stacked tensors' device layout make every later
+    compiled program relayout them first; the slot write keeps the layout."""
+    run_in_isolated_process(_compiled_reader_runs_no_fixups_after_activation)
