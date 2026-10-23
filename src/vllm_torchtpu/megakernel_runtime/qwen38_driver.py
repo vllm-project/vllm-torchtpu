@@ -50,7 +50,8 @@ from .qwen38_weights import head_groups, pack_segment_operands, segment_layers
 
 logger = init_logger(__name__)
 
-DEFAULT_BUCKETS = (4, 8, 16, 32, 64)
+# The composed call beats stock only up to ~52-55 rows (mk/stock-segment-vs-rows.md).
+DEFAULT_BUCKETS = (4, 8, 16, 32)
 
 
 def _parse_buckets(raw: str) -> tuple[int, ...]:
