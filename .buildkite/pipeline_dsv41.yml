@@ -126,6 +126,7 @@ steps:
         tests/kernels/test_dsv41_decode_tuning.py
         tests/kernels/test_dsv41_decode_index_scores.py
         tests/models/vllm/test_dsv41_decode_indexer_route.py
+        tests/models/vllm/test_csa2_chunk_cache.py
         -q --junitxml=/perf_eval_results/dsv41-kernel-config.xml
     artifact_paths:
       - "perf_eval_results/**/*"
@@ -133,6 +134,25 @@ steps:
   - group: "DeepSeek-V4.1-Flash on TPU"
     depends_on: "build_docker"
     steps:
+      - label: "DeepSeek-V4.1: CSA2 decode, prefill and cache kernels"
+        key: "dsv41_csa2_kernels"
+        timeout_in_minutes: 30
+        agents:
+          queue: "tpu_v7x_8_queue"
+        env:
+          TPU_ACCELERATOR_TYPE: "tpu7x"
+        commands:
+          - >-
+            bash .buildkite/scripts/run_in_docker.sh
+            python -m pytest
+            tests/kernels/deepseek_v41/test_csa2_accumulators.py
+            tests/kernels/deepseek_v41/test_csa2_decode.py
+            tests/kernels/deepseek_v41/test_csa2_pipeline.py
+            tests/kernels/deepseek_v41/test_csa2_prefill.py
+            -q --junitxml=/perf_eval_results/dsv41-csa2-kernels.xml
+        artifact_paths:
+          - "perf_eval_results/**/*"
+
       - label: "DeepSeek-V4.1-Flash: DP8 C384 DSpark + full GSM8K"
         key: "dsv41_flash_dp8_ep_gsm8k"
         timeout_in_minutes: 180
