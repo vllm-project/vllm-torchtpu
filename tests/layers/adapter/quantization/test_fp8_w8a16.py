@@ -39,7 +39,7 @@ def _weights(seed=0):
 @pytest.mark.parametrize(
     "rows,max_rows,expect_quantized",
     [
-        (16, 0, True),  # 0: W8A8 everywhere
+        (16, 0, True),  # default: W8A8 everywhere
         (16, 16, False),
         (17, 16, True),
         (64, 64, False),
@@ -82,7 +82,7 @@ def test_direct_jax_bridge_defaults_to_w8a8(monkeypatch):
 
 
 @pytest.mark.cpu_test
-@pytest.mark.parametrize("env_val,expected", [(None, 64), ("0", 0), ("16", 16)])
+@pytest.mark.parametrize("env_val,expected", [(None, 0), ("0", 0), ("16", 16)])
 def test_fp8_linear_method_forwards_w8a16_max_rows(monkeypatch, env_val, expected):
     if env_val is None:
         monkeypatch.delenv("TPU_FP8_LINEAR_W8A16_MAX_ROWS", raising=False)
