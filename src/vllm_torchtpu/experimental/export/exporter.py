@@ -329,10 +329,16 @@ def _export_abstract_params(
 
 
 def _lm_head_name(params_map: Mapping[str, Any]) -> str:
-    """The weight `compute_logits` projects with (tied embeddings fall back)."""
+    """The weight `compute_logits` projects with (tied embeddings fall back).
+
+    Multimodal models nest the language model, e.g. `language_model.lm_head.weight`.
+    """
     for cand in ("lm_head.weight", "model.embed_tokens.weight"):
         if cand in params_map:
             return cand
+        nested = [n for n in params_map if n.endswith(f".{cand}")]
+        if len(nested) == 1:
+            return nested[0]
     return next(iter(params_map))
 
 
@@ -364,19 +370,28 @@ def _state_specs(model: api.ExportableTextOnlyLLM) -> list[api.ShapeDtypeStruct]
             for _ in range(cfg.num_layers)
         ]
     raw_states = list(abstract_states_fn())
-    if len(raw_states) != cfg.num_layers:
-        raise ValueError(
-            f"{type(model).__name__}.abstract_states() returned "
-            f"{len(raw_states)} state specs, expected cfg.num_layers == "
-            f"{cfg.num_layers}"
-        )
+    if not raw_states:
+        raise ValueError(f"{type(model).__name__}.abstract_states() returned no state")
     return [
         api.ShapeDtypeStruct(
             shape=tuple(int(d) for d in s.shape),
             dtype=tpu_lowering.dtype_name(s.dtype),
+            sharding=s.sharding,
         )
         for s in raw_states
     ]
+
+
+def _extra_user_inputs(
+    model: api.ExportableTextOnlyLLM,
+) -> list[tuple[str, tuple[int, ...]]]:
+    """`(name, shape)` of the int32 control inputs the model takes after its state.
+
+    Recurrent models take `mamba_state_indices`; they follow the state arguments
+    so that the weight and state arguments keep their indices.
+    """
+    extra_fn = getattr(model, "extra_user_inputs", None)
+    return list(extra_fn()) if callable(extra_fn) else []
 
 
 def _main_args_read(mlir_text: str) -> set[int]:
@@ -414,6 +429,7 @@ def _params_read_by_forward(
         params_map=_norm_params(params_map),
         state_specs=_state_specs(model),
         bucket_size=bucket,
+        trailing_user_inputs=_extra_user_inputs(model),
     )
     read = _main_args_read(mlir_text)
     kept = {n for i, n in enumerate(names) if _NUM_USER_INPUTS + i in read}
@@ -451,14 +467,15 @@ def _export_text_only_llm_functions(
         buffer_donor=False,
     )
     state_specs = _state_specs(model)
-    state_entries = [
-        (
-            _global_shape(s.shape, _state_sharding(s.shape, tp_size), axis_sizes),
-            _state_sharding(s.shape, tp_size),
-            s.dtype,
-        )
+    state_shardings = [
+        _state_sharding(s.shape, tp_size) if s.sharding is None else list(s.sharding)
         for s in state_specs
     ]
+    state_entries = [
+        (_global_shape(s.shape, sharding, axis_sizes), sharding, s.dtype)
+        for s, sharding in zip(state_specs, state_shardings, strict=True)
+    ]
+    extra_inputs = _extra_user_inputs(model)
 
     num_fwd_weights = len(forward_names)
     state_start = _NUM_USER_INPUTS + num_fwd_weights
@@ -477,6 +494,7 @@ def _export_text_only_llm_functions(
             state_specs=state_specs,
             bucket_size=bucket_size,
             weight_reshapes=reshapes,
+            trailing_user_inputs=extra_inputs,
         )
         fwd_file = f"forward_bucket{bucket_size}.mlir"
         fwd_rel = f"{subdir}/{fwd_file}" if subdir else fwd_file
@@ -519,6 +537,18 @@ def _export_text_only_llm_functions(
                     buffer_donor=True,
                 )
             )
+        extra_start = state_start + len(state_entries)
+        for e_i, (e_name, e_shape) in enumerate(extra_inputs):
+            fwd_inputs.append(
+                _io_entry(
+                    arg_index=extra_start + e_i,
+                    index=extra_start + e_i,
+                    name=e_name,
+                    shape=e_shape,
+                    dtype="i32",
+                    argument_type="user_io",
+                )
+            )
 
         fwd_outputs: list[dict[str, Any]] = [
             _io_entry(
@@ -535,7 +565,7 @@ def _export_text_only_llm_functions(
         ]
         fwd_outputs.append(
             _io_entry(
-                arg_index=cfg.num_layers,
+                arg_index=len(state_entries),
                 index=0,
                 name="hidden_states",
                 shape=[bucket_size, cfg.hidden_size],

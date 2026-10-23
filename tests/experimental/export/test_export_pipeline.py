@@ -343,6 +343,130 @@ def test_end_to_end_export_writes_no_weights(tmp_path) -> None:
     assert not os.path.exists(os.path.join(out_dir, "serving_checkpoint"))
 
 
+class _TinyRecurrentExportableLLM(_TinyTorchExportableLLM):
+    """A tiny hybrid model: one paged attention layer and one recurrent layer."""
+
+    def abstract_states(self) -> Sequence[api.ShapeDtypeStruct]:
+        cfg = self._cfg
+        return [
+            api.ShapeDtypeStruct(
+                (cfg.num_blocks, cfg.block_size, 2 * cfg.num_kv_heads, cfg.head_dim),
+                cfg.dtype,
+            ),
+            api.ShapeDtypeStruct(
+                (cfg.num_blocks, 3, 1, 8), "f32", sharding=[None, None, None, "model"]
+            ),
+            api.ShapeDtypeStruct(
+                (cfg.num_blocks, 2, 4, 4), "f32", sharding=[None, "model", None, None]
+            ),
+        ]
+
+    def extra_user_inputs(self) -> list[tuple[str, tuple[int, ...]]]:
+        return [("mamba_state_indices", (self._cfg.max_num_seqs,))]
+
+    def forward(  # type: ignore[override]
+        self,
+        weights: Mapping[str, torch.Tensor],
+        kv_caches: Sequence[torch.Tensor],
+        *,
+        mamba_state_indices: torch.Tensor,
+        **controls: torch.Tensor,
+    ) -> tuple[Sequence[torch.Tensor], torch.Tensor]:
+        kvs, hidden = super().forward(weights, kv_caches, **controls)
+        kv, conv, recurrent = kvs
+        rows = mamba_state_indices.to(torch.int64)
+        return [kv, conv.index_fill(0, rows, 1.0), recurrent], hidden
+
+
+def test_end_to_end_export_of_a_recurrent_model(tmp_path: Path) -> None:
+    cfg = api.TextOnlyLLMExportConfig(
+        model_name="tiny-hybrid",
+        vocab_size=32,
+        hidden_size=16,
+        num_layers=2,
+        num_q_heads=2,
+        num_kv_heads=2,
+        head_dim=8,
+        block_size=8,
+        num_blocks=16,
+        max_num_seqs=8,
+        max_model_len=64,
+        token_buckets=(8,),
+        req_buckets=(4, 8),
+        emit_byte_tokenizer=True,
+    )
+    out_dir = str(tmp_path / "exported_hybrid")
+    with mock.patch.object(
+        tpu_lowering,
+        "lower_torch_callable_to_mlir",
+        side_effect=_mock_lower_torch_callable_to_mlir,
+    ):
+        exporter.export(_TinyRecurrentExportableLLM(cfg), out_dir)
+    validator.validate_exported_model_dir(out_dir)
+
+    meta = json.loads(Path(out_dir, "metadata.json").read_text())
+    forward = meta["functions"]["forward"]["8"]
+    states = [t for t in forward["inputs"] if t["argument_type"] == "state"]
+    assert [(t["shape"], t["dtype"], t["sharding"]) for t in states] == [
+        ([16, 8, 4, 8], "bf16", [None, None, None, None]),
+        ([16, 3, 1, 8], "f32", [None, None, None, "model"]),
+        ([16, 2, 4, 4], "f32", [None, "model", None, None]),
+    ]
+    # The recurrent control input follows the state, which keeps its indices.
+    last = forward["inputs"][-1]
+    assert last["name"] == "mamba_state_indices"
+    assert last["argument_type"] == "user_io" and last["shape"] == [8]
+    assert last["arg_index"] == states[-1]["arg_index"] + 1
+    outputs = forward["outputs"]
+    assert [t["argument_type"] for t in outputs] == ["state"] * 3 + ["intermediate"]
+    assert outputs[-1]["name"] == "hidden_states" and outputs[-1]["arg_index"] == 3
+    mlir = Path(out_dir, forward["file_path"]).read_text()
+    assert f"%arg{last['arg_index']}: tensor<8xi32>" in mlir
+
+
+def test_lm_head_name_finds_a_nested_language_model_head() -> None:
+    params = {
+        "visual.blocks.0.attn.qkv.weight": None,
+        "language_model.model.embed_tokens.weight": None,
+        "language_model.lm_head.weight": None,
+    }
+    assert exporter._lm_head_name(params) == "language_model.lm_head.weight"
+    del params["language_model.lm_head.weight"]
+    assert exporter._lm_head_name(params) == "language_model.model.embed_tokens.weight"
+
+
+class _FakeRecurrentLayer:
+    def get_state_shape(self) -> tuple[tuple[int, ...], tuple[int, ...]]:
+        return (3, 1, 64), (4, 16, 16)
+
+    def get_state_dtype(self) -> tuple[torch.dtype, ...]:
+        return torch.float32, torch.bfloat16
+
+
+@pytest.mark.parametrize("tp_size", [1, 2])
+def test_recurrent_state_specs_split_conv_channels_and_value_heads(
+    tp_size: int,
+) -> None:
+    with mock.patch(
+        "vllm.model_executor.layers.mamba.mamba_utils.is_conv_state_dim_first",
+        return_value=False,
+    ):
+        conv, recurrent = universal_adapter._recurrent_state_specs(
+            _FakeRecurrentLayer(), num_blocks=32, tp_size=tp_size
+        )
+    split = "model" if tp_size > 1 else None
+    assert (conv.shape, conv.dtype, conv.sharding) == (
+        (32, 3, 1, 64),
+        "f32",
+        [None, None, None, split],
+    )
+    assert (recurrent.shape, recurrent.dtype, recurrent.sharding) == (
+        (32, 4, 16, 16),
+        "bf16",
+        [None, split, None, None],
+    )
+
+
 @pytest.fixture
 def single_rank_tp_group() -> Any:
     """A one-rank tensor-parallel group: gathering over it returns the input.
@@ -810,6 +934,51 @@ def test_compute_logits_returns_the_vocabulary_without_padding() -> None:
     assert torch.equal(logits, torch.matmul(hidden, lm_head.T)[:, :10])
 
 
+def _pallas_impl(kv_dtype: torch.dtype | None) -> Any:
+    from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackendImpl
+
+    impl = object.__new__(PallasAttentionBackendImpl)
+    impl.num_kv_heads, impl.head_size = 2, 128
+    impl.kv_cache_quantized_dtype = kv_dtype
+    return impl
+
+
+@pytest.mark.parametrize("kv_dtype", [None, torch.float8_e4m3fn])
+def test_layer_state_specs_declare_kv_and_recurrent_state(
+    kv_dtype: torch.dtype | None,
+) -> None:
+    from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
+
+    attention = SimpleNamespace(impl=_pallas_impl(kv_dtype))
+    recurrent = _FakeRecurrentLayer()
+    exportable = SimpleNamespace(
+        _export_config=SimpleNamespace(
+            dtype="bf16", num_blocks=16, block_size=32, tensor_parallel_size=1
+        ),
+        _attention_layers=lambda: [recurrent, attention],
+    )
+    with (
+        mock.patch.object(
+            universal_adapter,
+            "_is_recurrent_layer",
+            side_effect=lambda m: m is recurrent,
+        ),
+        mock.patch(
+            "vllm.model_executor.layers.mamba.mamba_utils.is_conv_state_dim_first",
+            return_value=False,
+        ),
+    ):
+        recurrent_states, kv_states = (
+            universal_adapter.UniversalVllmExportableLLM._layer_state_specs(exportable)
+        )
+    assert [s.shape for s in recurrent_states] == [(16, 3, 1, 64), (16, 4, 16, 16)]
+    # An fp8 KV cache is declared in fp8, with fp8's packing.
+    stored = kv_dtype or torch.bfloat16
+    (kv,) = kv_states
+    assert kv.dtype == tpu_lowering.dtype_name(stored)
+    assert kv.shape == PallasAttentionBackend.get_kv_cache_shape(16, 32, 2, 128, stored)
+
+
 @pytest.fixture
 def clean_launch_env(monkeypatch: pytest.MonkeyPatch) -> None:
     for key in (
@@ -818,6 +987,7 @@ def clean_launch_env(monkeypatch: pytest.MonkeyPatch) -> None:
         "MASTER_PORT",
         "TORCH_TPU_SLICEBUILDER_ADDRESSES",
         "TORCH_TPU_TOPOLOGY",
+        cli.UNIFIED_BLOCK_POOL_ENV,
     ):
         monkeypatch.delenv(key, raising=False)
 
@@ -839,6 +1009,7 @@ def test_worker_env_bootstraps_a_tp_slice() -> None:
 @pytest.mark.usefixtures("clean_launch_env")
 def test_worker_env_single_device_skips_the_tpu_bootstrap() -> None:
     env = cli._worker_env(1)
+    assert env[cli.UNIFIED_BLOCK_POOL_ENV] == "0"
     assert "WORLD_SIZE" not in env
     assert "TORCH_TPU_TOPOLOGY" not in env
     assert env["MASTER_ADDR"] and env["MASTER_PORT"]

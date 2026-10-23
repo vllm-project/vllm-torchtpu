@@ -248,7 +248,6 @@ def run_cpu_load_worker(args: argparse.Namespace) -> None:
     import torch.distributed as dist
     from vllm.config import set_current_vllm_config
     from vllm.distributed import init_distributed_environment
-    from vllm.engine.arg_utils import EngineArgs
 
     from vllm_torchtpu import patch_registry
     from vllm_torchtpu.experimental.export import universal_adapter
@@ -257,7 +256,7 @@ def run_cpu_load_worker(args: argparse.Namespace) -> None:
     world_size = int(os.environ["WORLD_SIZE"])
     init_jax(rank, world_size)
 
-    vllm_config = EngineArgs.from_cli_args(args).create_engine_config()
+    vllm_config = universal_adapter.create_export_vllm_config(args)
     # vLLM runs on its CPU platform here, which skips the TPU platform's patches;
     # apply them so the model has the parameters and buffers it has on TPU.
     patch_registry.apply("platform_activation", model_config=vllm_config.model_config)

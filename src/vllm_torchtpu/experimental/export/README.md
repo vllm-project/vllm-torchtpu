@@ -67,10 +67,19 @@ make the default less faithful than an explicit value:
 - The device is measured at export time. An artifact exported on one chip
   type, or at one utilization, keeps that `num_blocks` wherever it is served.
 
-The exported KV states use the model's activation dtype; `--kv-cache-dtype` is
-not reflected in them. Bytes per block can therefore differ from `vllm serve`,
-which is why `--num-blocks` (same token capacity) and `--kv-cache-memory-bytes`
-(same bytes) are not interchangeable when the dtypes differ.
+The exported KV states use `--kv-cache-dtype` (an fp8 KV cache is declared in
+fp8, with fp8's packing), or the model's activation dtype when it is `auto`.
+
+### Hybrid recurrent models
+
+Models with recurrent layers, such as the Gated DeltaNet layers of Qwen3.5 and
+Qwen3-Next, export each such layer's state as two `[num_blocks, ...]` tensors:
+its conv state and its recurrent state, split over the model axis along the
+conv channels and the value heads. The forward graphs take one more `user_io`
+input after the states, `mamba_state_indices[max_num_seqs]`: the block holding
+each request's recurrent state. These layers keep this per-layer layout rather
+than vLLM's unified KV block pool, and the export runs with prefix caching off.
+Bytes per KV block include the recurrent states.
 
 ### Example: match a `vllm serve` run
 

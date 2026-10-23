@@ -290,12 +290,15 @@ def lower_torch_forward_to_mlir(
     state_specs: Sequence[api.ShapeDtypeStruct],
     bucket_size: int,
     weight_reshapes: Mapping[str, tuple[int, ...]] | None = None,
+    trailing_user_inputs: Sequence[tuple[str, tuple[int, ...] | int]] = (),
 ) -> str:
     """Lowers `model.forward` for `bucket_size` to StableHLO MLIR text via TorchTPU.
 
-    `weight_reshapes` gives the shape `model.forward` expects for weights whose
-    argument is lowered with another shape (a per-device constant is a `[1, ...]`
-    shard of its global array). State `i` is donated to result `i`.
+    `@main` takes the user inputs, the weights, the states, and then the
+    `trailing_user_inputs`, which are passed to `model.forward` by name like the
+    user inputs. `weight_reshapes` gives the shape `model.forward` expects for
+    weights whose argument is lowered with another shape (a per-device constant
+    is a `[1, ...]` shard of its global array). State `i` is donated to result `i`.
     """
     reshapes = dict(weight_reshapes or {})
     num_user = len(user_inputs)
@@ -303,13 +306,23 @@ def lower_torch_forward_to_mlir(
     state_start = num_user + num_weights
     donate_argnums = tuple(range(state_start, state_start + len(state_specs)))
 
-    user_specs = [
-        api.ShapeDtypeStruct(
-            (shape_or_len,) if isinstance(shape_or_len, int) else tuple(shape_or_len),
-            "i32",
-        )
-        for _, shape_or_len in user_inputs
-    ]
+    num_states = len(state_specs)
+    trailing_start = state_start + num_states
+
+    def _i32_specs(
+        inputs: Sequence[tuple[str, tuple[int, ...] | int]],
+    ) -> list[api.ShapeDtypeStruct]:
+        return [
+            api.ShapeDtypeStruct(
+                (shape_or_len,)
+                if isinstance(shape_or_len, int)
+                else tuple(shape_or_len),
+                "i32",
+            )
+            for _, shape_or_len in inputs
+        ]
+
+    user_specs = _i32_specs(user_inputs)
     weight_specs = [
         api.ShapeDtypeStruct(
             tuple(int(d) for d in params_map[n].shape),
@@ -317,15 +330,22 @@ def lower_torch_forward_to_mlir(
         )
         for n in forward_names
     ]
-    all_specs = [*user_specs, *weight_specs, *state_specs]
+    all_specs = [
+        *user_specs,
+        *weight_specs,
+        *state_specs,
+        *_i32_specs(trailing_user_inputs),
+    ]
 
     def _torch_forward_entry(*args: torch.Tensor) -> tuple[torch.Tensor, ...]:
         user_args = {name: args[i] for i, (name, _) in enumerate(user_inputs)}
+        for i, (name, _) in enumerate(trailing_user_inputs):
+            user_args[name] = args[trailing_start + i]
         w_dict = {forward_names[i]: args[num_user + i] for i in range(num_weights)}
         for name, shape in reshapes.items():
             if name in w_dict:
                 w_dict[name] = w_dict[name].reshape(shape)
-        kv_caches = list(args[state_start:])
+        kv_caches = list(args[state_start:trailing_start])
         updated_kvs, hidden_states = model.forward(
             w_dict,
             kv_caches,

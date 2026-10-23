@@ -340,6 +340,21 @@ def load_dummy_vllm_model(vllm_config: Any) -> nn.Module:
 
 
 @trace("export.load_model")
+def create_export_vllm_config(args: Any) -> Any:
+    """Creates the `VllmConfig` an export runs with from parsed `EngineArgs`.
+
+    Prefix caching is off for hybrid recurrent models: the artifact keeps their
+    recurrent state per layer, which vLLM only prefix-caches in its unified KV
+    pool, and the serving runtime does its own prefix caching.
+    """
+    from vllm.engine.arg_utils import EngineArgs
+
+    engine_args = EngineArgs.from_cli_args(args)
+    if engine_args.create_model_config().is_hybrid:
+        engine_args.enable_prefix_caching = False
+    return engine_args.create_engine_config()
+
+
 def load_vllm_model(vllm_config: Any, *, load_format: str) -> nn.Module:
     """Loads a vLLM model with `load_format`, running vLLM's weight processing.
 
@@ -416,6 +431,47 @@ def load_vllm_model(vllm_config: Any, *, load_format: str) -> nn.Module:
 # Constant values are gathered from every rank to lay them out, so only small
 # buffers qualify.
 _MAX_CONSTANT_ELEMENTS = 4096
+
+
+def _is_recurrent_layer(layer: Any) -> bool:
+    """Whether `layer` keeps fixed-size recurrent state (e.g. GDN linear attention)."""
+    try:
+        from vllm.model_executor.layers.mamba.abstract import MambaBase
+    except ImportError:
+        return False
+    return isinstance(layer, MambaBase)
+
+
+def _recurrent_state_specs(
+    layer: Any, num_blocks: int, tp_size: int
+) -> list[api.ShapeDtypeStruct]:
+    """Device-local `[num_blocks, ...]` specs of a recurrent layer's two states.
+
+    `get_state_shape` gives one block's device-local shapes. The conv state is
+    split over the model axis along its channel dimension and the recurrent
+    state along its value heads, its first dimension.
+    """
+    from vllm.model_executor.layers.mamba.mamba_utils import is_conv_state_dim_first
+
+    conv_shape, recurrent_shape = layer.get_state_shape()
+    conv_dtype, recurrent_dtype = layer.get_state_dtype()
+    conv_channel_dim = 0 if is_conv_state_dim_first() else len(conv_shape) - 1
+    specs = []
+    for shape, dtype, split_dim in (
+        (conv_shape, conv_dtype, conv_channel_dim),
+        (recurrent_shape, recurrent_dtype, 0),
+    ):
+        sharding: list[str | None] = [None] * (len(shape) + 1)
+        if tp_size > 1:
+            sharding[split_dim + 1] = "model"
+        specs.append(
+            api.ShapeDtypeStruct(
+                shape=[num_blocks, *(int(d) for d in shape)],
+                dtype=tpu_lowering.dtype_name(dtype),
+                sharding=sharding,
+            )
+        )
+    return specs
 
 
 class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
@@ -623,8 +679,8 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
         torch.distributed.all_gather_object(values, value, group=group.cpu_group)
         return values
 
-    def _attention_layers(self) -> list[Any]:
-        """Returns the ordered attention layers of the wrapped model."""
+    def _named_attention_layers(self) -> list[tuple[str, Any]]:
+        """Returns the ordered `(layer name, layer)` attention layers of the model."""
         if self._vllm_config is not None:
             with contextlib.suppress(Exception):
                 from vllm.model_executor.layers.attention_layer_base import (
@@ -632,46 +688,93 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 )
 
                 ctx = self._vllm_config.compilation_config.static_forward_context
-                layers = [m for m in ctx.values() if isinstance(m, AttentionLayerBase)]
+                layers = [
+                    (n, m) for n, m in ctx.items() if isinstance(m, AttentionLayerBase)
+                ]
                 if layers:
                     return layers
         return [
-            m
-            for _, m in self._model.named_modules()
+            (n, m)
+            for n, m in self._model.named_modules()
             if hasattr(m, "kv_cache") and isinstance(m.kv_cache, list)
         ]
 
-    def abstract_states(self) -> Sequence[api.ShapeDtypeStruct]:
-        """Returns per-layer KV cache specs matching the active attention backend."""
+    def _attention_layers(self) -> list[Any]:
+        """Returns the ordered attention layers of the wrapped model."""
+        return [m for _, m in self._named_attention_layers()]
+
+    def _has_recurrent_layers(self) -> bool:
+        return any(_is_recurrent_layer(m) for m in self._attention_layers())
+
+    def _layer_state_specs(self) -> list[list[api.ShapeDtypeStruct]] | None:
+        """The state tensors of each attention layer, or None if any is unknown.
+
+        A paged attention layer holds one KV cache; a recurrent (GDN) layer holds
+        its conv and recurrent states, `[num_blocks, ...]` each and indexed by the
+        `mamba_state_indices` block of each request.
+        """
         cfg = self._export_config
         act_dtype_str = tpu_lowering.dtype_name(cfg.dtype)
         attn_layers = self._attention_layers()
-        if attn_layers:
-            with contextlib.suppress(Exception):
-                from vllm_torchtpu.layers.adapter.attention import (
-                    PallasAttentionBackend,
-                    PallasAttentionBackendImpl,
+        if not attn_layers:
+            return None
+        try:
+            from vllm_torchtpu.layers.adapter.attention import (
+                PallasAttentionBackend,
+                PallasAttentionBackendImpl,
+            )
+        except Exception:
+            return None
+        per_layer: list[list[api.ShapeDtypeStruct]] = []
+        for layer in attn_layers:
+            impl = getattr(layer, "impl", None)
+            if isinstance(impl, PallasAttentionBackendImpl):
+                # An fp8 KV cache (`--kv-cache-dtype fp8`) stores quantized KV.
+                kv_dtype = getattr(
+                    impl, "kv_cache_quantized_dtype", None
+                ) or tpu_lowering.torch_dtype(act_dtype_str)
+                kv_shape = PallasAttentionBackend.get_kv_cache_shape(
+                    cfg.num_blocks,
+                    cfg.block_size,
+                    impl.num_kv_heads,
+                    impl.head_size,
+                    kv_dtype,
                 )
+                per_layer.append(
+                    [
+                        api.ShapeDtypeStruct(
+                            shape=tuple(int(d) for d in kv_shape),
+                            dtype=tpu_lowering.dtype_name(kv_dtype),
+                        )
+                    ]
+                )
+            elif _is_recurrent_layer(layer):
+                per_layer.append(
+                    _recurrent_state_specs(
+                        layer, cfg.num_blocks, cfg.tensor_parallel_size
+                    )
+                )
+            else:
+                return None
+        return per_layer
 
-                specs: list[api.ShapeDtypeStruct] = []
-                for layer in attn_layers:
-                    impl = getattr(layer, "impl", None)
-                    if isinstance(impl, PallasAttentionBackendImpl):
-                        kv_shape = PallasAttentionBackend.get_kv_cache_shape(
-                            cfg.num_blocks,
-                            cfg.block_size,
-                            impl.num_kv_heads,
-                            impl.head_size,
-                            tpu_lowering.torch_dtype(act_dtype_str),
-                        )
-                        specs.append(
-                            api.ShapeDtypeStruct(
-                                shape=tuple(int(d) for d in kv_shape),
-                                dtype=act_dtype_str,
-                            )
-                        )
-                if len(specs) == cfg.num_layers:
-                    return specs
+    def extra_user_inputs(self) -> list[tuple[str, tuple[int, ...]]]:
+        """Control inputs beyond the standard six that `forward` takes.
+
+        Recurrent layers read each request's state block from
+        `mamba_state_indices`.
+        """
+        if self._has_recurrent_layers():
+            return [("mamba_state_indices", (self._export_config.max_num_seqs,))]
+        return []
+
+    def abstract_states(self) -> Sequence[api.ShapeDtypeStruct]:
+        """Returns the state tensors of every attention layer, in layer order."""
+        cfg = self._export_config
+        act_dtype_str = tpu_lowering.dtype_name(cfg.dtype)
+        per_layer = self._layer_state_specs()
+        if per_layer is not None:
+            return [spec for specs in per_layer for spec in specs]
 
         default_kv_shape = (
             cfg.num_blocks,
@@ -725,11 +828,25 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 k: v for k, v in weights.items() if not k.startswith("lm_head.")
             }
 
-        attn_layers = self._attention_layers()
+        named_layers = self._named_attention_layers()
+        attn_layers = [m for _, m in named_layers]
         working_kvs = list(kv_caches)
-        if len(attn_layers) == len(working_kvs):
+        per_layer = self._layer_state_specs()
+        # Each recurrent layer binds its `[conv_state, recurrent_state]` list.
+        layer_kvs: list[list[Any]] | None = None
+        if per_layer is not None and sum(map(len, per_layer)) == len(working_kvs):
+            it = iter(working_kvs)
+            layer_kvs = [[next(it) for _ in specs] for specs in per_layer]
+            for layer, bufs in zip(attn_layers, layer_kvs, strict=True):
+                layer.kv_cache = bufs if _is_recurrent_layer(layer) else bufs[0]
+        elif len(attn_layers) == len(working_kvs):
             for layer, kv_buf in zip(attn_layers, working_kvs, strict=True):
                 layer.kv_cache = kv_buf
+        forward_metadata: Any = attn_metadata
+        if any(_is_recurrent_layer(m) for m in attn_layers):
+            # Recurrent layers look their metadata up by layer name, as the
+            # runner's per-layer metadata provides it.
+            forward_metadata = {name: attn_metadata for name, _ in named_layers}
 
         def _invoke_backbone() -> tuple[Sequence[Any], Any]:
             use_func = bool(call_weights) and all(
@@ -754,7 +871,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                             "input_ids": input_ids,
                             "positions": positions,
                             "kv_caches": working_kvs,
-                            "attn_metadata": attn_metadata,
+                            "attn_metadata": forward_metadata,
                         }
                     )
                 except TypeError:
@@ -763,16 +880,29 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                 if prev_do_not_compile is not None:
                     backbone.do_not_compile = prev_do_not_compile
 
-            updated_kvs = (
-                [
+            if layer_kvs is not None:
+                updated_kvs = [
+                    buf
+                    for layer in attn_layers
+                    for buf in (
+                        layer.kv_cache
+                        if _is_recurrent_layer(layer)
+                        else [
+                            layer.kv_cache[0]
+                            if isinstance(layer.kv_cache, list)
+                            else layer.kv_cache
+                        ]
+                    )
+                ]
+            elif len(attn_layers) == len(working_kvs):
+                updated_kvs = [
                     layer.kv_cache[0]
                     if isinstance(layer.kv_cache, list)
                     else layer.kv_cache
                     for layer in attn_layers
                 ]
-                if len(attn_layers) == len(working_kvs)
-                else working_kvs
-            )
+            else:
+                updated_kvs = working_kvs
             if (
                 isinstance(out, tuple)
                 and len(out) == 2
@@ -801,7 +931,7 @@ class UniversalVllmExportableLLM(api.ExportableTextOnlyLLM):
                         )
                 stack.enter_context(
                     set_forward_context(
-                        attn_metadata, self._vllm_config, num_tokens=num_tokens
+                        forward_metadata, self._vllm_config, num_tokens=num_tokens
                     )
                 )
                 return _invoke_backbone()

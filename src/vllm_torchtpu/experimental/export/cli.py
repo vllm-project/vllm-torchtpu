@@ -197,11 +197,8 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 
 def create_vllm_config_from_args(args: argparse.Namespace) -> Any:
     """Creates a `VllmConfig` from parsed CLI `EngineArgs`."""
-    from vllm.engine.arg_utils import EngineArgs
-
-    engine_args = EngineArgs.from_cli_args(args)
-    engine_args.load_format = "dummy"
-    return engine_args.create_engine_config()
+    args.load_format = "dummy"
+    return universal_adapter.create_export_vllm_config(args)
 
 
 @trace("export.run")
@@ -283,6 +280,10 @@ def run_export_from_args(
     return exportable.export_config
 
 
+# vllm_torchtpu.envs switch of the unified KV block pool.
+UNIFIED_BLOCK_POOL_ENV = "TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL"
+
+
 def _worker_env(tp_size: int) -> dict[str, str]:
     """Environment shared by the workers of a `tp_size`-device export.
 
@@ -299,6 +300,9 @@ def _worker_env(tp_size: int) -> dict[str, str]:
         os.environ.setdefault(
             checkpoint.JAX_PORT_ENV, str(portpicker.pick_unused_port())
         )
+        # Recurrent (GDN) layers keep per-layer `[conv, recurrent]` state rather
+        # than byte regions of the attention-shaped unified block pool.
+        os.environ.setdefault(UNIFIED_BLOCK_POOL_ENV, "0")
         TpuPlatform._prepare_singlehost_tpu_env(tp_size)
         return dict(os.environ)
     finally:
