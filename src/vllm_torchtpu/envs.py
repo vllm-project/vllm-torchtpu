@@ -172,6 +172,7 @@ if TYPE_CHECKING:
     TPU_PRECOMPILE_TRACE_FIRST: bool = False
     TPU_STREAMIDX_CHUNK_TOKENS: int | None = None
     TPU_DCP_INDEXER_A2A_MERGE: bool = True
+    TPU_DCP_INDEXER_HIST_MERGE: bool = False
     TPU_DCP_INDEXER_A2A_MIN_TOKENS: int = 64
     TPU_STREAMIDX_SMALL_BUCKET_BQ: int | None = 4
     TPU_STREAMIDX_SMALL_BUCKET_BKVP: int | None = None
@@ -1444,6 +1445,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Merge the DCP indexer candidates with an all-to-all over the token axis
     # instead of an all-gather over the candidate axis. Same result.
     "TPU_DCP_INDEXER_A2A_MERGE": env_bool("TPU_DCP_INDEXER_A2A_MERGE", default=True),
+    # Find the DCP indexer's global top-k in each chunk's SparseCore pass by
+    # summing its radix histograms over the ranks, instead of a local top-k,
+    # a candidate exchange and a merge, on the buckets that would take the
+    # all-to-all merge (TPU_DCP_INDEXER_A2A_MIN_TOKENS). Decode-sized buckets
+    # keep the all-gather merge: there the exchange rounds' latency outweighs
+    # the merge they save.
+    "TPU_DCP_INDEXER_HIST_MERGE": env_bool("TPU_DCP_INDEXER_HIST_MERGE", default=False),
     # Smallest padded token bucket that takes the all-to-all merge when
     # TPU_DCP_INDEXER_A2A_MERGE is on. The bucket is static, so each compiled
     # variant picks one merge with no runtime cost.
