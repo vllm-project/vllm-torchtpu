@@ -1858,3 +1858,154 @@ def test_pooled_preparation_rejects_instance_method(cpu_vllm_config_context):
     ):
         layer._build_pooled_gdn_op()
     build.assert_not_called()
+
+
+def test_qwen_model_preparation_is_shared_without_retaining_layer(
+    cpu_vllm_config_context,
+):
+    import inspect
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import gdn
+
+    cls = gdn.Qwen4ExpGatedDeltaNetAttention
+    preparation = inspect.getattr_static(cls, "_prepare_pooled_gdn_input")
+    assert isinstance(preparation, staticmethod)
+    captured = []
+
+    def register(name, function, **kwargs):
+        captured.append(function)
+        return MagicMock()
+
+    mesh, config = _mesh(), _vllm_config()
+    with (
+        patch.dict(gdn_attention_op._shared_gdn_ops, {}, clear=True),
+        set_vllm_model_wrapper_context(mesh=mesh, vllm_config=config),
+        patch.object(gdn_attention_op.pallas, "jax_op", side_effect=register),
+    ):
+        first = _qwen38_gdn_attn("model.layers.0.linear_attn")
+        first.__class__ = cls
+        torch.nn.Module.__init__(first)
+        first._build_pooled_gdn_op()
+        first_ref = weakref.ref(first)
+        second = _qwen38_gdn_attn("model.layers.1.linear_attn")
+        second.__class__ = cls
+        second._build_pooled_gdn_op()
+        assert len(captured) == 1
+        callback = captured[0]
+        assert (
+            inspect.getclosurevars(callback).nonlocals["prepare_input"]
+            is preparation.__func__
+        )
+        assert any(
+            preparation.__func__ in key[1] for key in gdn_attention_op._shared_gdn_ops
+        )
+        del first
+        gc.collect()
+        assert first_ref() is None
+
+        operands = [torch.zeros((1, 1)) for _ in range(12)]
+        operands[5] = None
+        operands[11] = torch.zeros((3,), dtype=torch.int32)
+        prepared = object()
+        # The cached callback must read the resolved block size at invocation.
+        config.cache_config.block_size = 1664
+        with (
+            patch.object(gdn, "prepare_gdn_input", return_value=prepared) as prepare,
+            patch.object(
+                gdn_attention_op,
+                "gdn_attention_pooled_core_tpu",
+                return_value=(operands[3], operands[0]),
+            ) as dispatch,
+        ):
+            callback(*operands)
+        prepare.assert_called_once_with(operands[0], 3, mesh)
+        assert dispatch.call_args.args[0] is prepared
+        assert dispatch.call_args.kwargs["pool_block_tokens"] == 1664
+
+
+def test_qwen_model_instance_preparation_rejected_before_registration(
+    cpu_vllm_config_context, monkeypatch
+):
+    from vllm_torchtpu.models.vllm.qwen4_exp import gdn
+
+    # Reproduce the former production override, rather than a surrogate class.
+    def instance_preparation(self, mixed_qkv, seq_lens, mesh):
+        return gdn.prepare_gdn_input(mixed_qkv, seq_lens.shape[0], mesh)
+
+    cls = gdn.Qwen4ExpGatedDeltaNetAttention
+    monkeypatch.setattr(cls, "_prepare_pooled_gdn_input", instance_preparation)
+    layer = _qwen38_gdn_attn("model.layers.0.linear_attn")
+    layer.__class__ = cls
+    with (
+        set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=_vllm_config()),
+        patch.object(gdn_attention_op.pallas, "jax_op") as register,
+        pytest.raises(TypeError, match="stateless staticmethod"),
+    ):
+        layer._build_pooled_gdn_op()
+    register.assert_not_called()
+
+
+def test_qwen_decoder_constructs_real_static_preparation_layer(
+    cpu_vllm_config_context, monkeypatch
+):
+    """Keep the real decoder and GDN constructor; avoid weight/kernel allocation."""
+    import inspect
+
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        QwenGatedDeltaNetAttention,
+    )
+
+    from vllm_torchtpu.models.vllm.qwen4_exp import gdn, model
+
+    def initialize_projection_metadata(self, config, **kwargs):
+        torch.nn.Module.__init__(self)
+        prototype = _qwen38_gdn_attn(kwargs["prefix"])
+        self.__dict__.update(prototype.__dict__)
+
+    # Projection/weight allocation is orthogonal to the constructor's static
+    # callback binding. The real pooled builder and shared key are exercised.
+    monkeypatch.setattr(
+        QwenGatedDeltaNetAttention, "__init__", initialize_projection_metadata
+    )
+    monkeypatch.setattr(VllmGatedDeltaNetAttention, "_create_conv1d", lambda self: None)
+    monkeypatch.setattr(VllmGatedDeltaNetAttention, "_build_gdn_op", lambda self: None)
+    monkeypatch.setattr(model, "_hc_config", lambda cfg: object())
+    monkeypatch.setattr(model, "GatedResidual", lambda *a, **kw: torch.nn.Identity())
+    monkeypatch.setattr(
+        model, "Qwen3NextSparseMoeBlock", lambda *a, **kw: torch.nn.Identity()
+    )
+    monkeypatch.setenv("VLLM_TPU_BLOCK_MAJOR_KV", "1")
+    text = SimpleNamespace(layer_types=["linear_attention"], ple_layer_ids=[])
+    cfg = SimpleNamespace(
+        model_config=SimpleNamespace(hf_text_config=text),
+        quant_config=None,
+        additional_config={},
+    )
+    kernel_config = _vllm_config()
+    kernel_config.model_config = SimpleNamespace(
+        architecture="Qwen4ExpForCausalLM",
+        is_hybrid=True,
+    )
+    callbacks = []
+
+    def register(name, function, **kwargs):
+        callbacks.append(function)
+        return MagicMock()
+
+    with (
+        patch.dict(gdn_attention_op._shared_gdn_ops, {}, clear=True),
+        set_vllm_model_wrapper_context(mesh=_mesh(), vllm_config=kernel_config),
+        patch.object(gdn_attention_op.pallas, "jax_op", side_effect=register),
+    ):
+        layer = model.Qwen4ExpDecoderLayer(cfg, "model.layers.0")
+    attention = layer.linear_attn
+    assert type(attention) is gdn.Qwen4ExpGatedDeltaNetAttention
+    assert attention._bm_kernel
+    assert len(callbacks) == 1
+    preparation = inspect.getattr_static(type(attention), "_prepare_pooled_gdn_input")
+    assert isinstance(preparation, staticmethod)
+    assert (
+        inspect.getclosurevars(callbacks[0]).nonlocals["prepare_input"]
+        is preparation.__func__
+    )
+    assert attention.kv_cache is None
