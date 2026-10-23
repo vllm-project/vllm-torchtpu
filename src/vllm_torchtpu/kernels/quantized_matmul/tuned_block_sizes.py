@@ -613,3 +613,8 @@ def get_tuned_block_sizes(
         return TunedValue(128, 128, 128)
     else:
         return tuned_value
+
+
+# Single-token W8A16 MXU: (TPU generation, K, N) -> output tile.
+# 8192 balances four N tiles with two 8 MiB FP8 weight buffers.
+SINGLE_TOKEN_MXU_TILES = {(7, 1024, 32768): 8192}

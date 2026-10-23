@@ -104,6 +104,24 @@ def _quantized_matmul_jax(x: jax.Array, w_q: jax.Array, w_s: jax.Array) -> jax.A
             maybe_quantize_lhs=True,
             zero_initialize=True,
         )
+    # Use the tuned single-token MXU path for the supported projection.
+    # Keep the existing torch op signature and all other shape/dtype paths.
+    if (
+        x.shape == (1, 1024)
+        and w_q.shape == (1024, 32768)
+        and w_s.shape == (32768,)
+        and x.dtype == jnp.bfloat16
+        and w_q.dtype == jnp.float8_e4m3fn
+        and w_s.dtype == jnp.float32
+    ):
+        from jax.experimental.pallas import tpu as pltpu
+
+        if pltpu.get_tpu_info().generation == 7:
+            from vllm_torchtpu.kernels.quantized_matmul.single_token import (
+                single_token_mxu,
+            )
+
+            return single_token_mxu(x, w_q, w_s)
     return xla_quantized_matmul(x, w_q, w_s)
 
 
