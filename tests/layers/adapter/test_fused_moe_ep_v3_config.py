@@ -51,3 +51,16 @@ def test_refuses(monkeypatch, bad):
     monkeypatch.setenv("TPU_MOE_FUSED_EP_V3_CONFIG", bad)
     with pytest.raises(ValueError):
         A.served_config(**SHAPE)
+
+
+def test_opt_in_kernel_flags_default_off():
+    """The TP8 layouts serve the fused EP v3 kernel with these flags unset:
+    each changes the kernel's programs, so each must stay opt-in (through
+    TPU_MOE_FUSED_EP_V3_CONFIG), and an empty override keeps them off."""
+    flags = ("combine_real_tokens", "sort_index_compare", "compact_message",
+             "reorder_chain")
+    for config in (Config(), A.apply_config_overrides(Config(), "")):
+        assert {f: getattr(config, f) for f in flags} == dict.fromkeys(flags, False)
+    on = A.apply_config_overrides(
+        Config(), '{"compact_message":true,"reorder_chain":true}')
+    assert on.compact_message is True and on.reorder_chain is True
