@@ -293,6 +293,7 @@ if TYPE_CHECKING:
     TPU_FUSED_ADD_RMSNORM_QUANT_MOE: bool = False
     TPU_MTP_EH_PROJ_TP: bool = False
     TPU_MTP_ONEHOT_AR: bool = True
+    TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS: int = 0
     TPU_SAMPLER_BSEARCH_RADIX_BITS: int = 0
     TPU_SAMPLER_FAST_TOP_P: bool = True
     TPU_SAMPLER_FUSED_CHAIN: bool = True
@@ -1953,6 +1954,16 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # (~8 us) instead of XLA's all-gather (~14 us at 16 cores). Bitwise the
     # gather up to the sign of a zero: each element sums one block and 15 +0.
     "TPU_MTP_ONEHOT_AR": env_bool("TPU_MTP_ONEHOT_AR", default=True),
+    # MTP draft (DeepSeek-V3.2 / GLM-5.2 DSA): draft step 0 of a chunk with at
+    # least this many (padded) tokens runs in two passes. Pass 1 only writes the
+    # MTP layer's KV and indexer-K caches for every row; pass 2 runs the full
+    # layer on one row per request, the only rows a draft token is read from.
+    # Same draft tokens and caches, without the indexer, sparse attention, MoE
+    # and DCP merge of every other prefill row (spec_decode/mtp_kv_only.py).
+    # 0 (default) keeps the single full pass.
+    "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS": env_nonnegative_int(
+        "TPU_MTP_PREFILL_KV_ONLY_MIN_TOKENS", 0
+    ),
     # Bits of the float32 threshold bisection resolved per vocab pass in
     # top-k/top-p masking (2**bits - 1 candidate thresholds per pass, same
     # result as 1 bit/pass since the predicate is monotonic). 0 = 1. Measured
