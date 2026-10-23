@@ -11,6 +11,11 @@ from jax.experimental.pallas import tpu as pltpu
 from vllm_torchtpu import envs
 from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
 from vllm_torchtpu.kernels.qwen4_exp.decode_indexer import decode_query_chunk_size
+from vllm_torchtpu.kernels.qwen4_exp.fused_kv_write import (
+    fused_layer_write,
+    fused_write_supported,
+    read_ring_and_tags_concurrent,
+)
 from vllm_torchtpu.kernels.qwen4_exp.indexer_components import qsa_indexing
 from vllm_torchtpu.kernels.qwen4_exp.qsa import (
     _indexer_updates,
@@ -424,23 +429,19 @@ def write_main_cache(
     )
 
 
-def write_compressed(
+def compressed_pairs(
     pool, keys, complete, req, logical, starts, context, table, ratio, slot=0
 ):
-    """One writer per BF16 pair, preserving the other half of partial pairs.
+    """Pair destinations, writers, half masks and values of ``write_compressed``.
 
-    An FP8 carrier packs two BF16 rows in one 32-bit sublane. Writing a lone
-    BF16 row needs a read/modify/write; the last completion in each pair owns
-    that write and includes both new rows when both completed this step.
-
-    ``slot`` selects this layer's region of a page shared by packed layers:
-    each layer's keys for one manager page occupy ``pool.shape[1] // (2 *
-    ratio)`` consecutive pairs (see ``pool_layout.pooled_cache_specs``).
+    Returns ``(pair, write, mask, values)``: ``pair`` indexes
+    ``pool.reshape(-1, packing, width)``, ``write`` marks the one writer of
+    each touched pair, ``mask[:, h]`` marks the BF16 halves it fills from
+    ``values[:, h]`` (padded to the carrier width).
     """
     packing = 4 if pool.dtype == jnp.float8_e4m3fn else 2
     width = pool.shape[-1]
     pairs_per_page = math.prod(pool.shape[1:-1]) // packing
-    view = pool.reshape(-1, packing, width)
     group = logical // ratio
     end = context[req] + starts[req + 1] - starts[req]
     write = complete & ((group % 2 == 1) | (logical + ratio >= end))
@@ -463,7 +464,28 @@ def write_compressed(
     mask = (local >= starts[req, None]) & (local < starts[req + 1, None])
     values = keys[jnp.clip(local, 0, len(keys) - 1)]
     values = jnp.pad(values, ((0, 0), (0, 0), (0, width - keys.shape[-1])))
+    return pair, write, mask, values
 
+
+def write_compressed(
+    pool, keys, complete, req, logical, starts, context, table, ratio, slot=0
+):
+    """One writer per BF16 pair, preserving the other half of partial pairs.
+
+    An FP8 carrier packs two BF16 rows in one 32-bit sublane. Writing a lone
+    BF16 row needs a read/modify/write; the last completion in each pair owns
+    that write and includes both new rows when both completed this step.
+
+    ``slot`` selects this layer's region of a page shared by packed layers:
+    each layer's keys for one manager page occupy ``pool.shape[1] // (2 *
+    ratio)`` consecutive pairs (see ``pool_layout.pooled_cache_specs``).
+    """
+    packing = 4 if pool.dtype == jnp.float8_e4m3fn else 2
+    width = pool.shape[-1]
+    view = pool.reshape(-1, packing, width)
+    pair, write, mask, values = compressed_pairs(
+        pool, keys, complete, req, logical, starts, context, table, ratio, slot
+    )
     tile = 128
     if len(keys) >= tile and len(keys) % tile == 0:
         # A complete ratio-4 prefill page contains sixteen adjacent carrier
@@ -946,19 +968,25 @@ def _pooled_qsa(
     req, logical, valid = _token_metadata(len(q), starts, context, slots)
     page = jnp.where(valid, main_table[req, logical // pool.shape[1]], len(pool))
     fp8 = pool.dtype == jnp.float8_e4m3fn
-    pool = write_main_cache(
-        pool,
-        pack_rows(k, v, fp8=fp8, k_scale=k_scale, v_scale=v_scale),
-        page,
-        logical,
-        valid,
-        **({"slot": main_slot} if main_slot >= 0 else {}),
+    rows_packed = pack_rows(k, v, fp8=fp8, k_scale=k_scale, v_scale=v_scale)
+    slot_kw = {"slot": main_slot} if main_slot >= 0 else {}
+    # Decode/verify-sized steps only; prefill keeps the bulk tile writers.
+    fused = (
+        envs.VLLM_TPU_QSA_FUSED_KV_WRITE
+        and len(q) <= len(context) * max_query_len
+        and fused_write_supported(
+            pool, len(q), len(ring_ids), main_slot if main_slot >= 0 else None
+        )
     )
+    if not fused:
+        pool = write_main_cache(pool, rows_packed, page, logical, valid, **slot_kw)
     ring_rows = math.ceil(compress_ratio / 8) * 8
     ring_elements = ring_rows * raw.shape[-1]
-    ring, tags = read_ring_and_tags(pool, ring_ids, ring_elements, ring_rows * 2)
+    read_state = read_ring_and_tags_concurrent if fused else read_ring_and_tags
+    ring, tags = read_state(pool, ring_ids, ring_elements, ring_rows * 2)
     ring = ring.reshape(len(ring_ids), ring_rows, -1)
     tags = tags.reshape(len(ring_ids), ring_rows, 2)
+    main_logical = logical
     completed, complete, req, logical, ring, tags = _indexer_updates(
         raw,
         positions,
@@ -973,24 +1001,55 @@ def _pooled_qsa(
         norm_eps,
         rotary_dim,
         # Request row r reads and writes ring row r (slots is r or -1).
-        rows_are_slots=envs.VLLM_TPU_QSA_RING_SELECT,
-    )
-    pool = write_compressed(
-        pool,
-        completed,
-        complete,
-        req,
-        logical,
-        starts,
-        context,
-        compressed_table,
-        compress_ratio,
-        compressed_slot,
+        rows_are_slots=fused or envs.VLLM_TPU_QSA_RING_SELECT,
     )
     ids = jnp.where(active, ring_ids, 0)
-    pool = write_ring_and_tags(
-        pool, ring.reshape(len(ids), -1), tags.reshape(len(ids), -1), ids
-    )
+    if fused:
+        pair, write, mask, values = compressed_pairs(
+            pool,
+            completed,
+            complete,
+            req,
+            logical,
+            starts,
+            context,
+            compressed_table,
+            compress_ratio,
+            compressed_slot,
+        )
+        pool = fused_layer_write(
+            pool,
+            main_rows=main_slot_rows(rows_packed, main_slot)
+            if main_slot > 0
+            else rows_packed,
+            main_page=page,
+            main_offset=main_logical,
+            main_valid=valid,
+            main_slot=main_slot if main_slot >= 0 else None,
+            comp_pair=pair,
+            comp_write=write,
+            comp_mask=mask,
+            comp_values=values,
+            ring=ring.reshape(len(ids), -1),
+            tags=tags.reshape(len(ids), -1),
+            ring_ids=ids,
+        )
+    else:
+        pool = write_compressed(
+            pool,
+            completed,
+            complete,
+            req,
+            logical,
+            starts,
+            context,
+            compressed_table,
+            compress_ratio,
+            compressed_slot,
+        )
+        pool = write_ring_and_tags(
+            pool, ring.reshape(len(ids), -1), tags.reshape(len(ids), -1), ids
+        )
     lengths = jnp.where(valid, logical + 1, 0).astype(jnp.int32)
     # Attend only the requested rows; every token above still wrote its KV,
     # compressed key and ring state. Up to one row per request slot, the

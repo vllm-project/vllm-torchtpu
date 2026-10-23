@@ -123,6 +123,7 @@ if TYPE_CHECKING:
     VLLM_TPU_QSA_DECODE_COMPACT_SCHEDULE: bool = False
     VLLM_TPU_QSA_DECODE_RPA_BKV: int = 256
     VLLM_TPU_QSA_DECODE_RPA_LANES: int = 8
+    VLLM_TPU_QSA_FUSED_KV_WRITE: bool = False
     TPU_MOE_SKIP_PADDED_TOKENS: bool = False
     TPU_MOE_HIERARCHICAL_EP: bool = False
     TPU_MOE_ROUTER_TOPK: str = "rowmax"
@@ -661,6 +662,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # FP32 operands, which Mosaic multiplies at full FP32 precision.
     "VLLM_TPU_QSA_PREFILL_BF16_MXU": env_bool(
         "VLLM_TPU_QSA_PREFILL_BF16_MXU", default=False
+    ),
+    # Qwen4-exp pooled QSA decode/verify steps: write main KV, compressed
+    # indexer keys and the raw ring/tags of a layer with one Pallas kernel
+    # whose row DMAs are all in flight together, and read the ring with every
+    # request's DMA outstanding. Prefill-sized steps keep the tiled writers.
+    "VLLM_TPU_QSA_FUSED_KV_WRITE": env_bool(
+        "VLLM_TPU_QSA_FUSED_KV_WRITE", default=False
     ),
     # Register the DeepSeek-V4 tokenizer that honors continue_final_message.
     # Off by default so tokenizer behavior matches stock vLLM; the DSv4
