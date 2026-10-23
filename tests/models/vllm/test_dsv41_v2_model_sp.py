@@ -16,6 +16,15 @@ from vllm_torchtpu import envs
 from vllm_torchtpu.models.vllm.deepseek_v41.common import mhc as v2_mhc
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import model as v2_model
 
+
+def _model_stub(**attributes):
+    model = v2_model.DeepseekV41Model.__new__(v2_model.DeepseekV41Model)
+    torch.nn.Module.__init__(model)
+    for name, value in attributes.items():
+        setattr(model, name, value)
+    return model
+
+
 # ---------------------------------------------------------------------------
 # 1. v2/mhc.py:162 - _flat_pre_sums Pallas kernel assertion and computation
 # ---------------------------------------------------------------------------
@@ -285,10 +294,7 @@ def test_prepare_engram_full_path(monkeypatch: pytest.MonkeyPatch):
         def __call__(self, *args: Any) -> torch.Tensor:
             return torch.ones((4, 3, 1), dtype=torch.int32)
 
-    class _FakeModel(SimpleNamespace):
-        _stage_engram_layers = v2_model.DeepseekV41Model._stage_engram_layers
-
-    model = _FakeModel(
+    model = _model_stub(
         engram_hash=_FakeEngramHash(),
         engram_swa_prefix="swa",
         engram_dp_shared_memory=False,
@@ -439,7 +445,9 @@ def test_ced_dispatches_encoder_before_host_bucket_coordination(monkeypatch):
     monkeypatch.setattr(v2_model.upstream, "get_forward_context", Context)
     monkeypatch.setattr(v2_model, "synchronize_tensors", dispatch)
     monkeypatch.setattr(v2_model, "coordinate_decoder_replay", coordinate)
-    model = SimpleNamespace(
+    model = _model_stub(
+        start_layer=0,
+        _ced_boundary=1,
         _ced_enabled=True,
         _has_cpu_offloaded_engram=lambda: False,
         _stage_uses_sequence_parallel=lambda stage: False,
@@ -468,8 +476,11 @@ def test_model_forward_full_and_ced_paths(monkeypatch: pytest.MonkeyPatch):
         is_padding: Any = None
         additional_kwargs: dict[str, Any] = field(default_factory=dict)
 
-    class _FakeModel:
+    class _FakeModel(v2_model.DeepseekV41Model):
         def __init__(self):
+            torch.nn.Module.__init__(self)
+            self.start_layer = 0
+            self._ced_boundary = 1
             self._ced_enabled = False
             self.use_native_mega_moe = False
             self.use_sequence_parallel = False
@@ -1126,7 +1137,8 @@ def test_split_encoder_stages_tail_engram_after_head_dispatch(monkeypatch):
         return "encoded"
 
     monkeypatch.setattr(v2_model, "synchronize_tensors", dispatch)
-    model = SimpleNamespace(
+    model = _model_stub(
+        start_layer=0,
         encoder_head_stage=head,
         encoder_middle_stage=middle,
         encoder_tail_stage=tail,
@@ -1293,7 +1305,8 @@ def test_early_split_enqueues_before_host_lookup(monkeypatch):
         assert (start, end) in ((1, 14), (14, 20))
         order.append("l1 lookup" if start == 1 else "l14 lookup")
 
-    model = SimpleNamespace(
+    model = _model_stub(
+        start_layer=0,
         _engram_first_split_layer=1,
         _engram_split_layer=14,
         _ced_boundary=20,

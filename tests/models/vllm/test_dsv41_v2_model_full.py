@@ -1946,15 +1946,15 @@ def test_dp_embeddings_materialized_before_stage(monkeypatch, dp_size, supplied)
         events.append("stage")
         return inputs_embeds
 
-    owner = SimpleNamespace(
-        additional_config={},
-        engram_config=None,
-        parallel_config=SimpleNamespace(data_parallel_size=dp_size),
-        embed_input_ids=lookup,
-        _has_cpu_offloaded_engram=lambda: False,
-        _ced_enabled=False,
-        full_stage=stage,
-    )
+    owner = DeepseekV41Model.__new__(DeepseekV41Model)
+    torch.nn.Module.__init__(owner)
+    owner.additional_config = {}
+    owner.engram_config = None
+    owner.parallel_config = SimpleNamespace(data_parallel_size=dp_size)
+    owner.embed_input_ids = lookup
+    owner._has_cpu_offloaded_engram = lambda: False
+    owner._ced_enabled = False
+    owner.full_stage = stage
     monkeypatch.setattr(module, "synchronize_tensors", synchronize)
     DeepseekV41Model.forward(
         owner,
