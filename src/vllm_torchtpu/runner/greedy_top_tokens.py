@@ -50,7 +50,12 @@ def resolve_head_owner(model: torch.nn.Module, dp_lockstep: bool) -> torch.nn.Mo
     cannot be served by the vocabulary-parallel argmax.
     """
     compute_logits = getattr(type(model), "compute_logits", None)
-    if getattr(compute_logits, "__module__", "").startswith("vllm_torchtpu."):
+    # A TPU-specific compute_logits may do more than LM head + logits
+    # processor; models whose override is exactly that opt in explicitly.
+    plain_logits = getattr(type(model), "plain_compute_logits", False)
+    if not plain_logits and getattr(compute_logits, "__module__", "").startswith(
+        "vllm_torchtpu."
+    ):
         raise NotImplementedError(
             f"TPU_GREEDY_TOP_TOKENS: {type(model).__name__} computes its logits "
             "in a TPU-specific compute_logits that get_top_tokens does not "

@@ -494,6 +494,10 @@ class Qwen4ExpForCausalLM(nn.Module, HasInnerState, IsHybrid):
     def embed_input_ids(self, input_ids):
         return self.model.embed_tokens(input_ids)
 
+    # compute_logits is exactly lm_head + logits_processor, so the
+    # vocabulary-parallel greedy argmax (TPU_GREEDY_TOP_TOKENS) reproduces it.
+    plain_compute_logits = True
+
     def compute_logits(self, hidden_states):
         return self.logits_processor(self.lm_head, hidden_states)
 
