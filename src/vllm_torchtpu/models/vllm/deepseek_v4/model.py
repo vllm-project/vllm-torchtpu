@@ -69,8 +69,8 @@ logger = init_logger(__name__)
 
 # The mHC seam kernel's tokens per grid step, and the fewest grid steps it
 # shrinks the block for at short batches (see fused_post_pre_mixes).
-MHC_SEAM_TOKEN_BLOCK = 32
-MHC_SEAM_MIN_GRID_STEPS = 1
+MHC_SEAM_TOKEN_BLOCK = 128
+MHC_SEAM_MIN_GRID_STEPS = 4
 
 
 class DeepseekV4DecoderLayer(nn.Module):
