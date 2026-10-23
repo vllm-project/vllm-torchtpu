@@ -2848,6 +2848,46 @@ class TestTPURaidenConnectorWorker:
 
         assert hints == [fa_pages + 3] * 7 + [fa_pages] + [0, 0]
 
+    def test_raiden_staging_hints_bound_glm_pools_under_dcp_identity(self):
+        groups = (SimpleNamespace(layer_names=("layers.0", "layers.1")),)
+
+        def pool(tag, layer_name, storage_index):
+            return SimpleNamespace(
+                tag=tag, layer_name=layer_name, storage_index=storage_index
+            )
+
+        # GLM registers one pool per storage; the MTP drafter's layer sits
+        # outside the target's kv-cache groups.
+        manifest = SimpleNamespace(
+            pools=[
+                pool("mla.nope", "layers.0", 0),
+                pool("mla.rope", "layers.0", 1),
+                pool("dsa.idx", "layers.0", 2),
+                pool("mla.nope", "layers.1", 3),
+                pool("mla.rope", "layers.1", 4),
+                pool("mla.nope", "mtp.0", 5),
+                # An unknown pool kind keeps its whole storage on the full
+                # host mirror.
+                pool("dsa.idx", "layers.1", 6),
+                pool("opaque", "layers.1", 6),
+            ]
+        )
+        for is_producer in (True, False):
+            worker = _make_raiden_worker(tp_rank=0, tp_size=1, is_producer=is_producer)
+            worker.vllm_config.cache_config.block_size = 256
+            worker.vllm_config.parallel_config.decode_context_parallel_size = 16
+            for max_model_len, pages in ((1_048_576, 256), (5000, 2)):
+                worker.vllm_config.model_config.max_model_len = max_model_len
+                with patch(f"{_MOD}._raiden_glm_dcp_identity", return_value=True):
+                    hints = worker._raiden_staging_blocks_per_pool(manifest, groups)
+                # One page per 256 x 16 = 4096-token scheduler block.
+                assert hints == [pages] * 6 + [0, 0]
+
+            # Every other GLM transfer keeps the full host mirror.
+            with patch(f"{_MOD}._raiden_glm_dcp_identity", return_value=False):
+                hints = worker._raiden_staging_blocks_per_pool(manifest, groups)
+            assert hints == [0] * 8
+
     def test_v2_stage3_startup_registration_payload_golden(self):
         cases = (
             # role, dp rank, transfer rank, unit replica, data/listener hosts

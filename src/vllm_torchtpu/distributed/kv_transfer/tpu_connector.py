@@ -7032,8 +7032,12 @@ class TPURaidenConnectorWorker:
         disjoint ids. Every pool therefore reports the union for its whole
         storage: pages per max-length request for each full-attention group
         present plus one per GDN group present (a group's conv and ssm pools
-        address the same block). A storage holding a pool of unknown kind
-        reports 0, which keeps it on the full host mirror (see
+        address the same block). Under the GLM DCP identity transfer
+        (lower_glm_dcp_identity_spans) a request ships one page per scheduler
+        block of block_size * dcp tokens from every GLM pool, so those pools
+        report the pages of a max-length request at that block size. A storage
+        holding a pool of unknown kind, or a GLM pool under any other GLM
+        transfer, reports 0, which keeps it on the full host mirror (see
         RESHARD_BOUNDED_STAGING_DESIGN.md).
         """
         from vllm_torchtpu.distributed.kv_transfer.raiden import pool_manifest as rpm
@@ -7043,6 +7047,17 @@ class TPURaidenConnectorWorker:
             for layer_name in getattr(group, "layer_names", ()):
                 group_of_layer[str(layer_name)] = index
         fa_pages = int(self._max_request_blocks())
+        glm_pages = 0
+        if _raiden_glm_dcp_identity():
+            dcp_size = int(
+                self.vllm_config.parallel_config.decode_context_parallel_size
+            )
+            block_tokens = int(self.vllm_config.cache_config.block_size) * max(
+                dcp_size, 1
+            )
+            max_model_len = int(self.vllm_config.model_config.max_model_len)
+            glm_pages = max(1, (max_model_len + block_tokens - 1) // block_tokens)
+        glm_tags = (rpm.TAG_MLA_NOPE, rpm.TAG_MLA_ROPE, rpm.TAG_DSA_IDX)
         # storage -> {block table: blocks one transfer touches from it}
         tables_by_storage: dict[int, dict[Any, int]] = {}
         full_mirror: set[int] = set()
@@ -7053,6 +7068,8 @@ class TPURaidenConnectorWorker:
                 blocks = fa_pages
             elif tag.startswith(rpm.TAG_GDN_CONV) or tag.startswith(rpm.TAG_GDN_SSM):
                 blocks = 1
+            elif glm_pages and tag.startswith(glm_tags):
+                blocks = glm_pages
             else:
                 full_mirror.add(storage)
                 continue
