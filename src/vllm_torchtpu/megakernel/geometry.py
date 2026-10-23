@@ -267,7 +267,10 @@ class ModelGeometry:
                 f"NH={self.NH} and NKV={self.NKV} incompatible with R={R}",
             ),
             (
-                self.E % R == 0 and B * self.TOPK <= 640 and 1 <= B <= M <= 64,
+                # Routing tables are sized from B and MR; the hard walls are the
+                # 128-lane rows-on-lanes top-k and hits table (TOPK <= 128) and
+                # the paged scatter's `page_size >= MR` (asserted there).
+                self.E % R == 0 and self.TOPK <= 128 and 1 <= B <= M <= 128,
                 f"Invalid E={self.E}, R={R}, B={B}, M={M}, TOPK={self.TOPK}",
             ),
             (

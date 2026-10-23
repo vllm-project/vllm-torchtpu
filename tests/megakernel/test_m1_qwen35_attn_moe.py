@@ -153,6 +153,50 @@ def test_m1_qwen35_pack_and_step_vs_logical_reference(
     )
 
 
+@pytest.mark.parametrize("B", [96, 128])
+def test_m1_qwen35_rows_above_64_vs_logical_reference(B: int):
+    """Above the former 64-row / 640-routing cap: B rows x TOPK=10 routings."""
+    T, R = 4, 1
+    devs = jax.devices("cpu")
+    g = qwen35.Qwen35Geometry(
+        L=2,
+        att_every=1,
+        H=256,
+        NH=2,
+        NKV=1,
+        HD=128,
+        ROT=32,
+        KH=2,
+        VH=2,
+        KD=128,
+        VD=128,
+        E=128,
+        TOPK=10,
+        I=256,
+        IS=256,
+    )
+    assert B * g.TOPK > 640
+    tiles = dataclasses.replace(TINY_TILES, bank=256 << 10).with_modules(
+        {"gqa": {"split": True}}
+    )
+    ex = ExecSpec(B=B, T=T, R=R, ctx=256, tiles=tiles, interpret=True)
+
+    key = jax.random.PRNGKey(7 + B)
+    pos, hid_l, w_l, st_l = qwen35.random_logical_inputs(key, g, ex)
+    ref_hid, _ = qwen35.reference_step(g, ex, pos, hid_l, w_l, st_l)
+    # The layer must move the rows, or a pass-through would match too.
+    assert float(jnp.abs(ref_hid.astype(F32) - hid_l.astype(F32)).mean()) > 1e-2
+
+    mesh = Mesh(devs[:R], ("tp",))
+    pos_mk, hid_mk, w_mk, st_mk = qwen35.pack_inputs(
+        pos, hid_l, w_l, st_l, g, ex, mesh=mesh
+    )
+    step, _ = qwen35.make_step(mesh, g, ex)
+    out_hid, _ = step(pos_mk, hid_mk, w_mk, st_mk)
+    out = kernel.unfold(out_hid, R)[0, :B].astype(F32)
+    assert jnp.allclose(out, ref_hid.astype(F32), atol=2e-2, rtol=2e-2)
+
+
 @pytest.mark.slow
 def test_m1_qwen35_r8_multi_rank_interpret():
     """Verify 2-layer, 8-rank EP + `G=4` split GQA + `HIER=1` AR in `interpret=True`."""
