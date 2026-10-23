@@ -546,3 +546,31 @@ def test_wan_self_attention_patch_falls_back_on_f32():
 
     apply_omni_model_specific_patches()
     assert WanSelfAttention()(torch.ones(1, 3, 8)) == "native"
+
+
+def test_enable_async_collective_fusion(monkeypatch):
+    monkeypatch.delenv("LIBTPU_INIT_ARGS", raising=False)
+    OmniTpuPlatform._enable_async_collective_fusion()
+    args = os.environ["LIBTPU_INIT_ARGS"]
+    assert "--xla_tpu_enable_async_collective_fusion=true" in args
+    assert "--xla_tpu_enable_async_collective_fusion_fuse_all_gather=true" in args
+    assert "--xla_tpu_enable_async_collective_fusion_multiple_steps=true" in args
+    assert "--xla_tpu_overlap_compute_collective_tc=true" in args
+
+
+def test_set_device_sets_node_local_store_env(monkeypatch):
+    monkeypatch.setenv("WORLD_SIZE", "4")
+    monkeypatch.setenv("RANK", "2")
+    monkeypatch.setenv("MASTER_PORT", "29500")
+    monkeypatch.delenv("TORCH_TPU_DEVICES_PER_HOST", raising=False)
+    monkeypatch.delenv("LOCAL_RANK", raising=False)
+    monkeypatch.setattr(
+        OmniTpuPlatform,
+        "_prepare_singlehost_tpu_env",
+        staticmethod(lambda world_size: None),
+    )
+    monkeypatch.setattr(torch, "accelerator", MagicMock(), raising=False)
+    with patch("torch.empty"), patch("torch.device"):
+        OmniTpuPlatform.set_device(None)
+    assert os.environ["TORCH_TPU_DEVICES_PER_HOST"] == "4"
+    assert os.environ["LOCAL_RANK"] == "2"

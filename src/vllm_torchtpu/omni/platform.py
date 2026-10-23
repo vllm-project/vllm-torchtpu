@@ -99,6 +99,9 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         world_size = int(os.environ.get("WORLD_SIZE", "1") or "1")
         if world_size > 1:
             cls._worker_world_size = world_size
+            os.environ.setdefault("TORCH_TPU_DEVICES_PER_HOST", str(world_size))
+            if "RANK" in os.environ:
+                os.environ.setdefault("LOCAL_RANK", os.environ["RANK"])
             chips = os.environ.get("TPU_VISIBLE_CHIPS")
             if chips and [int(c) for c in chips.split(",")] != list(range(world_size)):
                 logger.warning(
@@ -112,6 +115,7 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
                 )
             cls._set_shared_slicebuilder_addresses(world_size)
             cls._offload_dense_all_to_all()
+            cls._enable_async_collective_fusion()
         cls._prepare_singlehost_tpu_env(world_size)
         torch.accelerator.set_device_index(0)
         _ = torch.empty(1, device=torch.device("tpu"))
@@ -133,6 +137,18 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
         set_libtpu_flag_default(
             "--xla_tpu_enable_sparse_core_collective_offload_dense_all_to_all", "true"
         )
+
+    @staticmethod
+    def _enable_async_collective_fusion() -> None:
+        """Overlap XLA collective operations with TensorCore compute."""
+        set_libtpu_flag_default("--xla_tpu_enable_async_collective_fusion", "true")
+        set_libtpu_flag_default(
+            "--xla_tpu_enable_async_collective_fusion_fuse_all_gather", "true"
+        )
+        set_libtpu_flag_default(
+            "--xla_tpu_enable_async_collective_fusion_multiple_steps", "true"
+        )
+        set_libtpu_flag_default("--xla_tpu_overlap_compute_collective_tc", "true")
 
     @staticmethod
     def _set_shared_slicebuilder_addresses(world_size: int) -> None:
