@@ -55,7 +55,7 @@ def _inputs(seed: int):
     return pool, jnp.asarray(pages), jnp.asarray(LENGTHS, jnp.int32), q, gate
 
 
-def _kernel_rows(pool, pages, kv_len, q, gate, *, off, tile_cut=0, fold=False):
+def _kernel_rows(pool, pages, kv_len, q, gate, *, off, tile_cut=0, fold=False, slots=2):
     n = q.shape[0]
 
     def kernel(pages_ref, len_ref, q_ref, g_ref, pool_ref, out_ref, ring, sems):
@@ -93,8 +93,8 @@ def _kernel_rows(pool, pages, kv_len, q, gate, *, off, tile_cut=0, fold=False):
             ],
             out_specs=pl.BlockSpec(memory_space=pltpu.VMEM),
             scratch_shapes=[
-                pltpu.VMEM((2, TILE, 1, 4, DIM), jnp.float8_e4m3fn),
-                pltpu.SemaphoreType.DMA((2,)),
+                pltpu.VMEM((slots, TILE, 1, 4, DIM), jnp.float8_e4m3fn),
+                pltpu.SemaphoreType.DMA((slots,)),
             ],
         ),
         out_shape=jax.ShapeDtypeStruct((n, NH, DIM), jnp.float32),
@@ -102,10 +102,10 @@ def _kernel_rows(pool, pages, kv_len, q, gate, *, off, tile_cut=0, fold=False):
     )(pages, lens, q, gate, pool)
 
 
-@pytest.mark.parametrize("off,fold", [(0, False), (1, False), (1, True)])
-def test_attend_row_matches_reference(off, fold):
+@pytest.mark.parametrize("off,fold,slots", [(0, False, 2), (1, False, 4), (1, True, 3)])
+def test_attend_row_matches_reference(off, fold, slots):
     pool, pages, kv_len, q, gate = _inputs(3 + off)
-    got = np.asarray(_kernel_rows(pool, pages, kv_len, q, gate, off=off, fold=fold))
+    got = np.asarray(_kernel_rows(pool, pages, kv_len, q, gate, off=off, fold=fold, slots=slots))
     want = np.asarray(
         reference_rows(q, gate, pool, pages, kv_len, off=off, scale_k=SK, scale_v=SV, sm_scale=SM)
     )

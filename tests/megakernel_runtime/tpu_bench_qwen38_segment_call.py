@@ -173,8 +173,8 @@ def run(
             jnp.asarray(rng.permutation(npages * 32)[: ex.M * 513].reshape(ex.M, 513), jnp.int32), rep
         )
         kvlen_q = jax.device_put(jnp.asarray([2051] * B + [0] * (ex.M - B), jnp.int32), rep)
-        arms = (("", dict()), ("fold", dict(fold=True)), ("no_unpack", dict(ablate="unpack")),
-                ("no_matmul", dict(ablate="matmul")), ("no_dma", dict(ablate="dma")))
+        arms = (("s2", dict(slots=2)), ("s4", dict(slots=4)), ("s8", dict(slots=8)),
+                ("s4_no_dma", dict(slots=4, ablate="dma")))
         for label, opts in arms:
             spec_q = qwen38.segment_spec(
                 g, R, L=L, qsa_attn=dict(budget=512, kv_head_offset=0, **opts)

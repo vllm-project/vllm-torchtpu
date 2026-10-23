@@ -47,6 +47,7 @@ PAGES = "qsa_pages"
 KV_LEN = "qsa_kvlen"
 MICRO = 4  # tokens per micro-page (the compression ratio)
 TILE = 256  # tokens per ring slot
+SLOTS = 4  # ring slots: SLOTS - 1 tiles in flight ahead of the one being read
 
 
 def _unpack_kv(slot_ref: Any, off: int, interpret: bool) -> tuple[jax.Array, jax.Array]:
@@ -139,21 +140,25 @@ def attend_row(
             # One wait for the whole slot: the copies above add up to its bytes.
             pltpu.make_async_copy(ring.at[s], ring.at[s], sems.at[s]).wait()
 
-    @pl.when(ntiles > 0)
-    def _():
-        start(0, 0)
+    nslots = ring.shape[0]
+    for k in range(nslots - 1):  # prime the ring: tiles 0 .. S-2
+
+        @pl.when(k < ntiles)
+        def _(k=k):
+            start(k, k)
 
     qf = q.astype(F32) * (scale_k * sm_scale if fold else 1.0)
     k_mul, v_mul, s_mul = (1.0, 1.0, 1.0) if fold else (scale_k, scale_v, sm_scale)
 
     def tile(t: Any, carry: Any) -> Any:
         m, l, acc = carry
-        s = lax_rem(t, 2)
+        s = lax_rem(t, nslots)
         wait(t, s)
+        ahead = t + nslots - 1  # into the slot tile t - 1 has freed
 
-        @pl.when(t + 1 < ntiles)
+        @pl.when(ahead < ntiles)
         def _():
-            start(t + 1, 1 - s)
+            start(ahead, lax_rem(ahead, nslots))
 
         if ablate == "unpack":
             k8 = v8 = jnp.zeros((TILE, dim), BF16)
@@ -220,10 +225,11 @@ class QSASparseAttnBlock(QSAOutBlock):
         scale_v: float = 1.0,
         fold: bool = False,
         ablate: str = "",
+        slots: int = SLOTS,
         prefix: str = "self_attn",
     ) -> None:
         super().__init__(prefix=prefix)
-        self.fold, self.ablate = fold, ablate
+        self.fold, self.ablate, self.slots = fold, ablate, slots
         self.budget = budget
         self.off = kv_head_offset
         self.scale_k, self.scale_v = scale_k, scale_v
@@ -242,8 +248,8 @@ class QSASparseAttnBlock(QSAOutBlock):
         nh = g.NH // ex.R
         f8 = jnp.float8_e4m3fn
         return [
-            ScratchReq("qa_ring", pltpu.VMEM((2, TILE, 1, 4, 256), f8)),
-            ScratchReq("qa_ring_sem", pltpu.SemaphoreType.DMA((2,))),
+            ScratchReq("qa_ring", pltpu.VMEM((self.slots, TILE, 1, 4, 256), f8)),
+            ScratchReq("qa_ring_sem", pltpu.SemaphoreType.DMA((self.slots,))),
             ScratchReq("qa_q", pltpu.VMEM((ex.MB, nh, g.HD), BF16)),
             ScratchReq("qa_g", pltpu.VMEM((ex.MB, nh, g.HD), BF16)),
             ScratchReq("qa_qg_sem", pltpu.SemaphoreType.DMA((2,))),
