@@ -53,11 +53,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--out", required=True, type=Path)
     parser.add_argument("--baseline", required=True, type=Path)
-    parser.add_argument("--prefill-tokens", nargs="+", type=int, default=[128, 2048])
-    parser.add_argument("--page-size", type=int, default=64)
     args = parser.parse_args()
-    if args.page_size != 64:
-        parser.error("the input fixture currently requires page size 64")
     root = Path(__file__).resolve().parents[2]
     prefill, decode = load_kernels(root)
     spec = importlib.util.spec_from_file_location("csa2_baseline", args.baseline)
@@ -86,20 +82,24 @@ def main() -> None:
         )
     )
     cases = [
-        (stage, 1, tokens)
-        for tokens in args.prefill_tokens
-        for stage in ("prefill_encoder", "prefill_decoder")
-    ] + [("decode", 48, 6)]
+        ("prefill_encoder", 1, 2048),
+        ("prefill_decoder", 48, 128),
+        ("decode", 48, 6),
+    ]
     for stage, batch, num_tokens in cases:
         host = make_inputs(batch, num_tokens, 64)
         selected = sorted(
             {
                 seq * num_tokens + offset
-                for seq in {0, batch - 1}
+                for seq in {0, min(1, batch - 1), batch - 1}
                 for offset in {
                     0,
                     min(7, num_tokens - 1),
                     min(8, num_tokens - 1),
+                    min(15, num_tokens - 1),
+                    min(16, num_tokens - 1),
+                    min(63, num_tokens - 1),
+                    min(64, num_tokens - 1),
                     num_tokens - 1,
                 }
             }
@@ -194,7 +194,7 @@ def main() -> None:
                         num_tokens=num_tokens,
                         tokens=batch * num_tokens,
                         heads=64,
-                        page_size=args.page_size,
+                        page_size=64,
                         main_rows=512,
                         latency_ms=float(np.median(samples["module"])) / 1000,
                         kernel_median_us=float(np.median(samples["kernel"])),
