@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any
 
 from ...decls import (
@@ -80,6 +81,33 @@ GDN_FIELD_ALIASES: dict[str, str] = {
     "rms_norm_eps": "eps",
 }
 
+GDN_OPTIONS: dict[str, Any] = {
+    "decay_type": "head",
+    "decay_law": "softplus",
+    "gate_type": "silu",
+    "decay_bound": 5.0,
+}
+
+
+def validate_gdn_options(options: Mapping[str, Any]) -> None:
+    dt = str(options.get("decay_type", "head"))
+    if dt not in ("head", "key"):
+        raise MegakernelConfigError(
+            f"GDNBlock requires decay_type in ('head', 'key'), got {dt!r}"
+        )
+    dl = str(options.get("decay_law", "softplus"))
+    if dl not in ("softplus", "bounded_sigmoid"):
+        raise MegakernelConfigError(
+            "GDNBlock requires decay_law in ('softplus', 'bounded_sigmoid'), "
+            f"got {dl!r}"
+        )
+    gt = str(options.get("gate_type", "silu"))
+    if gt not in ("silu", "sigmoid"):
+        raise MegakernelConfigError(
+            f"GDNBlock requires gate_type in ('silu', 'sigmoid'), got {gt!r}"
+        )
+
+
 GDN_GEOMETRY_METHODS: dict[str, Any] = {
     "kh_rep": lambda g, R: max(1, R // int(g.KH)) if int(g.KH) > 0 else 1,
     "kh": lambda g, R: gdn_lin_in_layout(g, R).kh,
@@ -104,6 +132,11 @@ def resolve_gdn_binding(
     cls: Any, binding: BlockBinding, resolved: ResolvedBlockGeometry
 ) -> ResolvedBlockGeometry:
     vals = dict(resolved.values)
+    opts = dict(GDN_OPTIONS)
+    for k, v in binding.options.items():
+        if v is not None:
+            opts[k] = v
+    validate_gdn_options(opts)
     conv_k = _check_conv_kernel(int(vals.get("conv_kernel", 4)))
     vals.update(
         {
@@ -116,13 +149,17 @@ def resolve_gdn_binding(
             "conv_taps": conv_k - 1,
             "eps": float(vals["eps"]),
             "gdn_l2_eps": float(vals["gdn_l2_eps"]),
+            "decay_type": str(opts["decay_type"]),
+            "decay_law": str(opts["decay_law"]),
+            "gate_type": str(opts["gate_type"]),
+            "decay_bound": float(opts["decay_bound"]),
         }
     )
     return ResolvedBlockGeometry(
         block_cls=cls,
         prefix=binding.prefix,
         values=vals,
-        options=binding.options,
+        options=opts,
         rename=binding.rename,
         transforms=binding.transforms,
     )
@@ -198,14 +235,15 @@ def gdn_hf_params(prefix: str, geom: Any) -> list[HFParamDecl]:
         order: int,
         slot_w: int,
         aliases: tuple[VLLMAlias, ...] = (),
+        out_dim: int = VH,
     ) -> list[HFParamDecl]:
         w_n, s_n = _n(canon), _n(f"{canon}_s")
         return [
             HFParamDecl(
                 name=w_n,
                 hf_name=f"{p}{hf_stem}.weight",
-                shape=(H, VH),
-                hf_shape=(VH, H),
+                shape=(H, out_dim),
+                hf_shape=(out_dim, H),
                 dtype=FP8,
                 transform=ParamTransform(
                     fuse_into="lin_in",
@@ -221,8 +259,8 @@ def gdn_hf_params(prefix: str, geom: Any) -> list[HFParamDecl]:
             HFParamDecl(
                 name=s_n,
                 hf_name=f"{p}{hf_stem}.weight_scale_inv",
-                shape=(VH,),
-                hf_shape=(VH,),
+                shape=(out_dim,),
+                hf_shape=(out_dim,),
                 dtype=F32,
                 transform=ParamTransform(
                     fuse_into="lin_in_s",

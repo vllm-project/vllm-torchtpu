@@ -38,6 +38,7 @@ class GDNLinInLayout:
     A_OFF: int
     BA_PAD: int
     NLI: int
+    A_DIM: int = 0
 
 
 @dataclass(frozen=True)
@@ -89,6 +90,11 @@ class GDNParams:
     # Pool layout of the model's pool backend (set only for pool I/O: GPR or
     # fused); the slot geometry above and `page_base` come from it.
     pool_layout: Any = None
+    A_DIM: int = 0
+    decay_type: str = "head"
+    decay_law: str = "softplus"
+    gate_type: str = "silu"
+    decay_bound: float = 5.0
 
 
 @dataclass(frozen=True)
@@ -112,7 +118,9 @@ class GDNTunables:
     }
 
 
-def gdn_lin_in_layout(g: Any, ex_or_r: ExecSpec | int) -> GDNLinInLayout:
+def gdn_lin_in_layout(
+    g: Any, ex_or_r: ExecSpec | int, *, decay_type: str | None = None
+) -> GDNLinInLayout:
     """Return shared column offsets for `lin_in` (`[qkv | z | b | a]`)."""
     R = ex_or_r.R if isinstance(ex_or_r, ExecSpec) else int(ex_or_r)
     kh = max(1, g.KH // R) if g.KH > 0 else 0
@@ -121,7 +129,19 @@ def gdn_lin_in_layout(g: Any, ex_or_r: ExecSpec | int) -> GDNLinInLayout:
     qkv = 2 * kh * KD + vh * VD
     z = vh * VD
     ba = qkv + z
-    ba_pad = 128
+    dt = (
+        str(decay_type)
+        if decay_type is not None
+        else str(getattr(g, "decay_type", "head"))
+    )
+    if dt == "key":
+        a_off = ba + 128
+        a_dim = vh * KD
+        ba_pad = 128 + a_dim
+    else:
+        a_off = ba + 64
+        a_dim = vh
+        ba_pad = 128
     return GDNLinInLayout(
         kh=kh,
         vh=vh,
@@ -130,14 +150,21 @@ def gdn_lin_in_layout(g: Any, ex_or_r: ExecSpec | int) -> GDNLinInLayout:
         QKV=qkv,
         Z=z,
         BA=ba,
-        A_OFF=ba + 64,
+        A_OFF=a_off,
         BA_PAD=ba_pad,
         NLI=ba + ba_pad,
+        A_DIM=a_dim,
     )
 
 
 def derive_params(
-    g: Any, ex: ExecSpec, plan: Any, tt: GDNTunables, name: str
+    g: Any,
+    ex: ExecSpec,
+    plan: Any,
+    tt: GDNTunables,
+    name: str,
+    *,
+    options: dict[str, Any] | None = None,
 ) -> GDNParams:
     """`GDNParams` for geometry `g` under `ex` and the block's tunables `tt`."""
     tiles = ex.resolve_tiles(g)
@@ -151,7 +178,8 @@ def derive_params(
         R,
     )
     assert g.VH % g.KH == 0, (g.VH, g.KH)
-    lay = gdn_lin_in_layout(g, ex)
+    eff_dt = str((options or {}).get("decay_type", getattr(g, "decay_type", "head")))
+    lay = gdn_lin_in_layout(g, ex, decay_type=eff_dt)
     assert lay.vh <= 64, ("b|a gate lanes require vh <= 64", lay.vh)
     for dim_name, dim_val in (
         ("H", g.H),
@@ -266,6 +294,17 @@ def derive_params(
         conv_stage=bool(tt.conv_stage),
         head_major=bool(tt.gdn_head_major),
         pool_layout=pool_layout,
+        A_DIM=lay.A_DIM,
+        decay_type=eff_dt,
+        decay_law=str(
+            (options or {}).get("decay_law", getattr(g, "decay_law", "softplus"))
+        ),
+        gate_type=str(
+            (options or {}).get("gate_type", getattr(g, "gate_type", "silu"))
+        ),
+        decay_bound=float(
+            (options or {}).get("decay_bound", getattr(g, "decay_bound", 5.0))
+        ),
     )
 
 

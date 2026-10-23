@@ -157,8 +157,13 @@ def gdn_reference(
                 us.append(u_s)
             u = jnp.concatenate(us, axis=0)
 
-        alog = alog_l[r, :vh]
-        dtb = dtb_l[r, :vh]
+        is_key_decay = str(getattr(g, "decay_type", "head")) == "key"
+        decay_law = str(getattr(g, "decay_law", "softplus"))
+        gate_type = str(getattr(g, "gate_type", "silu"))
+        decay_bound = float(getattr(g, "decay_bound", 5.0))
+        a_dim = vh * KD if is_key_decay else vh
+        alog = alog_l[r, :a_dim]
+        dtb = dtb_l[r, :a_dim]
         gnw = gnorm_l[r, :VD].astype(BF16)
         mix_r = []
         rec_r_list = []
@@ -180,9 +185,19 @@ def gdn_reference(
             qc = jnp.repeat(q, expand, axis=0)[:, :, None]
             kc_ = jnp.repeat(k, expand, axis=0)[:, :, None]
             beta = rnd(jax.nn.sigmoid(ybuf[b, BA : BA + vh]))
-            a_val = ybuf[b, A_OFF : A_OFF + vh]
-            decay = -jnp.exp(alog) * jax.nn.softplus(a_val + dtb)
-            st_cur = st_cur * jnp.exp(decay)[:, None, None]
+            a_val = ybuf[b, A_OFF : A_OFF + a_dim]
+            if decay_law == "bounded_sigmoid":
+                decay_flat = -F32(decay_bound) * jax.nn.sigmoid(
+                    jnp.exp(alog) * (a_val + dtb)
+                )
+            else:
+                decay_flat = -jnp.exp(alog) * jax.nn.softplus(a_val + dtb)
+            eg = (
+                jnp.exp(decay_flat.reshape(vh, KD))[:, :, None]
+                if is_key_decay
+                else jnp.exp(decay_flat)[:, None, None]
+            )
+            st_cur = st_cur * eg
             pred = jnp.sum(st_cur * kc_, axis=1)
             delta = (v - pred) * beta[:, None]
             st_cur = st_cur + kc_ * delta[:, None, :]
@@ -194,7 +209,8 @@ def gdn_reference(
             )
             val = (gnw[None, :] * val.astype(BF16)).astype(F32)
             zz = ybuf[b, QKV : QKV + Z].reshape(vh, VD)
-            mix_r.append(rnd(val * jax.nn.silu(zz)).reshape(Z))
+            gate_val = jax.nn.sigmoid(zz) if gate_type == "sigmoid" else jax.nn.silu(zz)
+            mix_r.append(rnd(val * gate_val).reshape(Z))
 
         rec_cat = jnp.concatenate(rec_r_list, axis=0)
         if has_multi_out:

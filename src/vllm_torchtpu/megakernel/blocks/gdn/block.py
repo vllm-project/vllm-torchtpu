@@ -15,6 +15,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from typing import Any, ClassVar
 
 import jax
@@ -39,10 +40,12 @@ from .decls import (
     GDN_FIELD_ALIASES,
     GDN_GEOMETRY_FIELDS,
     GDN_GEOMETRY_METHODS,
+    GDN_OPTIONS,
     GDN_PARAM_NAMES,
     gdn_cache_decl,
     gdn_hf_params,
     resolve_gdn_binding,
+    validate_gdn_options,
 )
 from .params import (
     GDNLinInLayout,
@@ -66,7 +69,7 @@ class GDNBlock(Block):
     PARAM_NAMES = GDN_PARAM_NAMES
     GEOMETRY_FIELDS = GDN_GEOMETRY_FIELDS
     FIELD_ALIASES = GDN_FIELD_ALIASES
-    OPTIONS: ClassVar[dict[str, Any]] = {}
+    OPTIONS: ClassVar[dict[str, Any]] = GDN_OPTIONS
     GEOMETRY_METHODS = GDN_GEOMETRY_METHODS
 
     def __init__(
@@ -74,10 +77,40 @@ class GDNBlock(Block):
         *,
         geometry: Any = None,
         prefix: str = "linear_attn",
+        decay_type: str | None = None,
+        decay_law: str | None = None,
+        gate_type: str | None = None,
+        decay_bound: float | None = None,
     ) -> None:
         self.geometry = geometry
         self.prefix = prefix
-        self.options = FrozenDict()
+        given = {
+            "decay_type": decay_type,
+            "decay_law": decay_law,
+            "gate_type": gate_type,
+            "decay_bound": decay_bound,
+        }
+        opts: dict[str, Any] = {
+            k: type(d)(v if v is not None else getattr(geometry, k, d))
+            for (k, d), v in zip(self.OPTIONS.items(), given.values(), strict=True)
+        }
+        self._validate_options(opts)
+        self.decay_type = opts["decay_type"]
+        self.decay_law = opts["decay_law"]
+        self.gate_type = opts["gate_type"]
+        self.decay_bound = opts["decay_bound"]
+        self.options = FrozenDict(opts)
+
+    def _effective_options(self, g: Any) -> dict[str, Any]:
+        # `bind()` passes every default, so only a non-default option overrides `g`.
+        return {
+            k: v if v != self.OPTIONS[k] else type(v)(getattr(g, k, v))
+            for k, v in self.options.items()
+        }
+
+    @classmethod
+    def _validate_options(cls, options: Mapping[str, Any]) -> None:
+        validate_gdn_options(options)
 
     @classmethod
     def _resolve_binding(
@@ -94,9 +127,11 @@ class GDNBlock(Block):
         return tt.gdn_rows, tt.gdn_bufs
 
     @staticmethod
-    def lin_in_layout(g: Any, ex_or_r: ExecSpec | int) -> GDNLinInLayout:
+    def lin_in_layout(
+        g: Any, ex_or_r: ExecSpec | int, *, decay_type: str | None = None
+    ) -> GDNLinInLayout:
         """Return shared column offsets for `lin_in` (`[qkv | z | b | a]`)."""
-        return gdn_lin_in_layout(g, ex_or_r)
+        return gdn_lin_in_layout(g, ex_or_r, decay_type=decay_type)
 
     @staticmethod
     def accept(
@@ -141,7 +176,8 @@ class GDNBlock(Block):
         return out
 
     def weights(self, g: Any, ex: ExecSpec) -> list[WeightDecl]:
-        lay = self.lin_in_layout(g, ex)
+        dt = self._effective_options(g)["decay_type"]
+        lay = self.lin_in_layout(g, ex, decay_type=dt)
         return [
             WeightDecl("lin_in", K=g.H, N=lay.NLI, dtype=FP8, stream_ring="static"),
             WeightDecl("lin_out", K=lay.Z, N=g.H, dtype=FP8, stream_ring="static"),
@@ -187,7 +223,8 @@ class GDNBlock(Block):
                     )
                 )
             return st
-        lay = self.lin_in_layout(g, ex)
+        dt = self._effective_options(g)["decay_type"]
+        lay = self.lin_in_layout(g, ex, decay_type=dt)
         conv_shape = (
             (rup(3 * ex.B, 8), lay.QKV)
             if ex.T == 1
@@ -203,7 +240,8 @@ class GDNBlock(Block):
     def outputs(self, g: Any, ex: ExecSpec) -> list[StateDecl]:
         if cache_exec(ex).FUSED:
             return []
-        lay = self.lin_in_layout(g, ex)
+        dt = self._effective_options(g)["decay_type"]
+        lay = self.lin_in_layout(g, ex, decay_type=dt)
         if ex.VER:
             return [
                 StateDecl(
@@ -227,23 +265,33 @@ class GDNBlock(Block):
         ]
 
     def smalls(self, g: Any, ex: ExecSpec) -> list[SmallField]:
-        lay = self.lin_in_layout(g, ex)
+        dt = self._effective_options(g)["decay_type"]
+        lay = self.lin_in_layout(g, ex, decay_type=dt)
+        a_cols = lay.vh * lay.KD if dt == "key" else 128
         return [
             SmallField("in_norm", g.H),
             SmallField("in_s", lay.NLI),
             SmallField("out_s", g.H),
             SmallField("conv", 4 * lay.QKV),
-            SmallField("alog", 128),
-            SmallField("dtb", 128),
+            SmallField("alog", a_cols),
+            SmallField("dtb", a_cols),
             SmallField("gnorm", lay.VD),
         ]
 
     def shared_widths(self, g: Any, ex: ExecSpec) -> dict[str, int]:
-        lay = self.lin_in_layout(g, ex)
+        dt = self._effective_options(g)["decay_type"]
+        lay = self.lin_in_layout(g, ex, decay_type=dt)
         return {"acc": lay.NLI, "ybuf": lay.NLI, "xb2": lay.Z, "mix": lay.Z}
 
     def plan_params(self, g: Any, ex: ExecSpec, plan: Any) -> GDNParams:
-        return derive_params(g, ex, plan, self.tunables(ex), self.name)
+        return derive_params(
+            g,
+            ex,
+            plan,
+            self.tunables(ex),
+            self.name,
+            options=self._effective_options(g),
+        )
 
     def scratch(self, g: Any, ex: ExecSpec, plan: Any) -> dict[str, Any]:
         gp: GDNParams = plan.block_params[self.name]

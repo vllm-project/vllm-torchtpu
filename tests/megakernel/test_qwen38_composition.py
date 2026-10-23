@@ -523,6 +523,113 @@ def test_moe_block_with_nvfp4_routed_experts_in_process():
         )
 
 
+def test_gdn_block_with_kda_key_decay_and_gate_in_process():
+    """Verify GDNBlock KDA per-key decay and sigmoid gate numerical parity."""
+    from dataclasses import replace as dc_replace
+
+    from vllm_torchtpu.megakernel.blocks.gdn import GDNBlock
+    from vllm_torchtpu.megakernel.blocks.gdn.reference import gdn_reference
+
+    gb_default = GDNBlock(prefix="linear_attn")
+    gb_bound = GDNBlock.bind(prefix="linear_attn")
+    assert dict(gb_default.options) == dict(gb_bound.options)
+    gb_kda = GDNBlock(
+        prefix="linear_attn",
+        decay_type="key",
+        decay_law="bounded_sigmoid",
+        gate_type="sigmoid",
+        decay_bound=5.0,
+    )
+    assert gb_kda.options["decay_type"] == "key"
+
+    g_base = _tiny_qwen38_geometry()
+    ex8 = ExecSpec(
+        B=2,
+        T=1,
+        R=8,
+        ctx=CTX,
+        tiles=dc_replace(TINY_TILES, bank=512 << 10, hier=0, mb8=1, inplace=False),
+        interpret=True,
+    )
+
+    class _KDAGeom(qwen35.Qwen35Geometry):
+        decay_type: str = "key"
+        decay_law: str = "bounded_sigmoid"
+        gate_type: str = "sigmoid"
+        decay_bound: float = 5.0
+
+    class _HeadBSigGeom(qwen35.Qwen35Geometry):
+        decay_type: str = "head"
+        decay_law: str = "bounded_sigmoid"
+        gate_type: str = "sigmoid"
+        decay_bound: float = 5.0
+
+    base_fields = {
+        f.name: getattr(g_base, f.name) for f in g_base.__dataclass_fields__.values()
+    }
+    g_kda = _KDAGeom(**base_fields)
+    g_head_bsig = _HeadBSigGeom(**base_fields)
+    lay_kda = GDNBlock.lin_in_layout(g_kda, ex8)
+    assert lay_kda.vh * lay_kda.KD == lay_kda.A_DIM
+    assert gb_kda.weights(g_base, ex8)[0].N == lay_kda.NLI
+    assert gb_kda.smalls(g_base, ex8)[4].width == lay_kda.A_DIM
+    lay_sc = GDNBlock.lin_in_layout(g_base, ex8)
+    _, hid_l, w_sc, st_l = qwen35.random_logical_inputs(
+        jax.random.PRNGKey(92), g_base, ex8
+    )
+    out_sc, _ = gdn_reference(w_sc, hid_l, st_l, g=g_base, ex=ex8, gdn_idx=0)
+    out_head_bsig, _ = gdn_reference(
+        w_sc, hid_l, st_l, g=g_head_bsig, ex=ex8, gdn_idx=0
+    )
+
+    a_off = lay_sc.A_OFF
+    vh = lay_sc.vh
+    kd = lay_kda.KD
+    w_in_prefix = w_sc["lin_in"][..., :a_off]
+    w_in_a_rep = jnp.repeat(w_sc["lin_in"][..., a_off : a_off + vh], kd, axis=-1)
+    w_in_cat = jnp.concatenate([w_in_prefix, w_in_a_rep], axis=-1)
+    pad_cols = lay_kda.NLI - w_in_cat.shape[-1]
+    s_prefix = w_sc["lin_in_s"][..., :a_off]
+    s_a_rep = jnp.repeat(w_sc["lin_in_s"][..., a_off : a_off + vh], kd, axis=-1)
+    s_cat = jnp.concatenate([s_prefix, s_a_rep], axis=-1)
+    w_kda = dict(w_sc)
+    w_kda["lin_in"] = jnp.pad(w_in_cat, ((0, 0), (0, 0), (0, 0), (0, pad_cols)))
+    w_kda["lin_in_s"] = jnp.pad(
+        s_cat, ((0, 0), (0, 0), (0, pad_cols)), constant_values=0.01
+    )
+    w_kda["alog"] = jnp.repeat(w_sc["alog"], kd, axis=-1)
+    w_kda["dtb"] = jnp.repeat(w_sc["dtb"], kd, axis=-1)
+    out_kda, _ = gdn_reference(w_kda, hid_l, st_l, g=g_kda, ex=ex8, gdn_idx=0)
+    w_bad_kda = dict(w_kda, alog=w_kda["alog"] + 3.0)
+    out_bad_kda, _ = gdn_reference(w_bad_kda, hid_l, st_l, g=g_kda, ex=ex8, gdn_idx=0)
+    _check(
+        "kda gdn_reference vs head bounded_sigmoid",
+        out_kda,
+        out_head_bsig,
+        [("softplus/silu control", out_sc), ("perturbed alog", out_bad_kda)],
+    )
+    devs = jax.devices("cpu")
+    if len(devs) >= ex8.R:
+        pos = POS0 + jnp.arange(ex8.NS, dtype=I32)
+        ref_hid_kda, _ = qwen35.reference_step(g_kda, ex8, pos, hid_l, w_kda, st_l)
+        ref_hid_bad_kda, _ = qwen35.reference_step(
+            g_kda, ex8, pos, hid_l, w_bad_kda, st_l
+        )
+        mesh = Mesh(devs[: ex8.R], ("tp",))
+        pos_mk, hid_mk, w_mk, st_mk = qwen35.pack_inputs(
+            pos, hid_l, w_kda, st_l, g_kda, ex8, mesh=mesh
+        )
+        step_kda, _ = qwen35.make_step(mesh, g_kda, ex8, donate_states=True)
+        out_hid_kda, _ = step_kda(pos_mk, hid_mk, w_mk, st_mk)
+        hid_kda_r = kernel.unfold(out_hid_kda, ex8.R)[:, : ex8.B]
+        _check(
+            "kda make_step vs reference_step",
+            hid_kda_r[0],
+            ref_hid_kda,
+            [("perturbed alog", ref_hid_bad_kda), ("input hidden", hid_l)],
+        )
+
+
 if __name__ == "__main__":
     if sys.argv[1] == "qwen38_r32":
         _step_qwen38_32_ranks_in_process()
