@@ -26,7 +26,11 @@ from unittest.mock import patch
 
 import pytest
 
-pytestmark = [pytest.mark.tpu_test, pytest.mark.spawns_tpu_workers]
+pytestmark = [
+    pytest.mark.tpu_test,
+    pytest.mark.multichip,
+    pytest.mark.spawns_tpu_workers,
+]
 
 
 def _publish(path: Path, value: dict) -> None:
