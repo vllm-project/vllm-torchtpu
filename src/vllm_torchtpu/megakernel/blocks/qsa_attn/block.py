@@ -95,25 +95,39 @@ def attend_row(
     nh, dim = q.shape
 
     ncols = pages.shape[1]
+    assert per_page & (per_page - 1) == 0, per_page
+    shift = per_page.bit_length() - 1
 
-    def copies(t: Any, s: Any) -> list[tuple[Any, Any]]:
-        """`(live, copy)` per micro-page of tile `t`; micro-pages at or past the
-        row's length are not fetched (their column may be past `budget + 1`)."""
+    def copies(t: Any, s: Any) -> list[Any]:
+        """The tile's `TILE // MICRO` micro-page copies, issued unconditionally.
+
+        No per-copy branch: a straight-line issue loop costs a few ns per DMA,
+        a `pl.when` per copy several times that. Columns past `budget + 1` clamp
+        to the last one; tokens past the row's length are masked below.
+        """
         out = []
         for j in range(TILE // MICRO):
-            col = t * (TILE // MICRO) + j
-            v = pages[r, jnp.minimum(col, ncols - 1)]
-            cp = pltpu.make_async_copy(
-                pool.at[v // per_page, pl.ds((v % per_page) * MICRO, MICRO)],
-                ring.at[s, pl.ds(j * MICRO, MICRO)],
-                sems.at[s],
+            v = pages[r, jnp.minimum(t * (TILE // MICRO) + j, ncols - 1)]
+            out.append(
+                pltpu.make_async_copy(
+                    pool.at[v >> shift, pl.ds((v & (per_page - 1)) * MICRO, MICRO)],
+                    ring.at[s, pl.ds(j * MICRO, MICRO)],
+                    sems.at[s],
+                )
             )
-            out.append((col * MICRO < length, cp))
         return out
 
     def start(t: Any, s: Any) -> None:
-        for live, cp in copies(t, s):
-            pl.when(live)(cp.start)
+        for cp in copies(t, s):
+            cp.start()
+
+    def wait(t: Any, s: Any) -> None:
+        if interpret:
+            for cp in copies(t, s):
+                cp.wait()
+        else:
+            # One wait for the whole slot: the copies above add up to its bytes.
+            pltpu.make_async_copy(ring.at[s], ring.at[s], sems.at[s]).wait()
 
     @pl.when(ntiles > 0)
     def _():
@@ -124,8 +138,7 @@ def attend_row(
     def tile(t: Any, carry: Any) -> Any:
         m, l, acc = carry
         s = lax_rem(t, 2)
-        for live, cp in copies(t, s):
-            pl.when(live)(cp.wait)
+        wait(t, s)
 
         @pl.when(t + 1 < ntiles)
         def _():
