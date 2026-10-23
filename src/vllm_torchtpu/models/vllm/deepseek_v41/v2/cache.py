@@ -1,11 +1,12 @@
 """V4.1 paged cache allocation, row addressing and mutation."""
 
 import math
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any, Protocol, cast
 
 import jax
 import torch
+from vllm.v1.kv_cache_interface import AttentionSpec, KVCacheSpec
 from vllm.v1.worker.utils import allocate_kv_cache as allocate_upstream_kv_cache
 
 from vllm_torchtpu.kernels.deepseek_v4.csa_cache_layout import ROW_WORDS
@@ -82,6 +83,131 @@ def native_cache_view(raw, shape, dtype, block_stride_bytes, offset_bytes):
     return pages[:, page_offset : page_offset + page_bytes].view(dtype).reshape(shape)
 
 
+def budget_native_swa(
+    specs: dict[str, KVCacheSpec], swa_layers: frozenset[str]
+) -> dict[str, KVCacheSpec]:
+    """Budget separate typed owners before the scheduler chooses block count."""
+    swa_layers = swa_layers.intersection(specs)
+    if not swa_layers:
+        return specs
+    assert all(isinstance(spec, AttentionSpec) for spec in specs.values())
+    attention_specs = cast(dict[str, AttentionSpec], specs)
+    # Cache groups may overlay the same block IDs. Different native layouts
+    # need separate storage, even though the scheduler still shares those IDs.
+    swa_bytes = {
+        (
+            attention_specs[name].num_states,
+            attention_specs[name].state_content_size_bytes,
+            attention_specs[name].dtype,
+        ): attention_specs[name].unpadded_page_size_bytes
+        for name in swa_layers
+    }
+    word_bytes = max(
+        (
+            spec.unpadded_page_size_bytes
+            for name, spec in attention_specs.items()
+            if name not in swa_layers
+        ),
+        default=0,
+    )
+    page_bytes = max(
+        word_bytes + sum(swa_bytes.values()),
+        max(spec.page_size_bytes for spec in specs.values()),
+    )
+    return {
+        name: replace(spec, page_size_padded=page_bytes)
+        for name, spec in attention_specs.items()
+    }
+
+
+def _materialize_native_swa(
+    config, device, views, swa_layers, csa2_layers
+) -> MaterializedNativeKVCache:
+    """Split each allocator region into typed owners without unbudgeted HBM."""
+    from vllm_torchtpu.kv_cache_materializer import layer_to_pool_index
+
+    fp8_layers = {name for name, view in views.items() if view.dtype == torch.uint8}
+    if csa2_layers.intersection(views) != fp8_layers:
+        raise ValueError("Native SWA allocation requires CSA2 for all FP8 consumers")
+    regions = layer_to_pool_index(config)
+    groups: dict[tuple, list[str]] = {}
+    for name, view in views.items():
+        if view.ndim != 4 or view.shape[1] != 1 or view.shape[0] != config.num_blocks:
+            raise ValueError("Native cache requires [blocks,1,page_size,features]")
+        geometry = tuple(view.shape[2:]) if name in swa_layers else None
+        groups.setdefault((regions[name], geometry), []).append(name)
+    result = MaterializedNativeKVCache({}, [])
+    for (_, geometry), names in groups.items():
+        page_bytes = max(
+            views[name][0].numel() * views[name].element_size() for name in names
+        )
+        if geometry is not None:
+            if geometry[-1] != 512 or any(
+                views[name].dtype != torch.bfloat16 for name in names
+            ):
+                raise ValueError("Native SWA requires BF16 [pages,page_size,512]")
+        elif page_bytes % ROW_BYTES:
+            raise ValueError("Native word pool pages must align to 512 bytes")
+        blocks_per_bank = SPARSECORE_MAX_POOL_BYTES // page_bytes
+        if blocks_per_bank < 1 or config.num_blocks > 2 * blocks_per_bank:
+            raise ValueError("Native cache exceeds the two-bank addressing limit")
+        counts = [min(config.num_blocks, blocks_per_bank)]
+        if config.num_blocks > blocks_per_bank:
+            counts.append(config.num_blocks - blocks_per_bank)
+        banks = [
+            torch.zeros(
+                (count, *geometry)
+                if geometry is not None
+                else (count * page_bytes // ROW_BYTES, ROW_WORDS),
+                dtype=torch.bfloat16 if geometry is not None else torch.int32,
+                device=device,
+            )
+            for count in counts
+        ]
+        owner = banks[0] if len(banks) == 1 else (banks[0], banks[1])
+        result.raw_tensors.extend(banks)
+        scale = None
+        if fp8_layers.intersection(names):
+            scales = [
+                torch.zeros(bank.shape[0], dtype=torch.float32, device=device)
+                for bank in banks
+            ]
+            scale = scales[0] if len(scales) == 1 else (scales[0], scales[1])
+            result.raw_tensors.extend(scales)
+        for name in names:
+            view = views[name]
+            shape = (view.shape[0], *view.shape[2:])
+            result.native_raw_cache[name] = owner
+            result.native_cache_layouts[name] = (shape, view.dtype, page_bytes, 0)
+            if geometry is not None:
+                cache = banks[0][:1, None] if len(banks) == 2 else banks[0][:, None]
+            else:
+                cache = native_cache_view(
+                    banks[0].view(torch.int8).flatten(),
+                    (1 if len(banks) == 2 else view.shape[0], *view.shape[1:]),
+                    view.dtype,
+                    page_bytes,
+                    0,
+                )
+            result.kv_caches[name] = cache.expand(tuple(view.shape))
+            if name in fp8_layers:
+                assert scale is not None
+                result.scale_pools[name] = scale
+    # Scales use the existing companion reservation; typed page owners must
+    # fit the scheduler's allocation independently of that reservation.
+    owners = {
+        id(bank): bank
+        for raw in result.native_raw_cache.values()
+        for bank in (raw if isinstance(raw, tuple) else (raw,))
+    }
+    budget = max(tensor.size for tensor in config.kv_cache_tensors)
+    if sum(bank.nbytes for bank in owners.values()) > budget:
+        raise ValueError(
+            "Native SWA owners exceed budget; apply budget_native_swa first"
+        )
+    return result
+
+
 def materialize_upstream_kv_cache(
     kv_cache_config,
     device,
@@ -89,6 +215,7 @@ def materialize_upstream_kv_cache(
     *,
     word_rows=False,
     csa2_layers: frozenset[str] = frozenset(),
+    native_swa_layers: frozenset[str] = frozenset(),
 ) -> MaterializedNativeKVCache:
     """Keep upstream placements, with one TPU input per shared physical region."""
     from vllm_torchtpu.kv_cache_materializer import layer_to_pool_index
@@ -96,6 +223,10 @@ def materialize_upstream_kv_cache(
     views = allocate_upstream_kv_cache(kv_cache_config, torch.device("meta"), layout)
     if not views:
         return MaterializedNativeKVCache({}, [])
+    if native_swa_layers.intersection(views):
+        return _materialize_native_swa(
+            kv_cache_config, device, views, native_swa_layers, csa2_layers
+        )
     sizes = {tensor.size for tensor in kv_cache_config.kv_cache_tensors}
     assert len(sizes) == 1
     backing_bytes = sizes.pop()
@@ -276,9 +407,8 @@ class _CacheBinding(Protocol):
 class PagedCacheRows:
     """Map upstream pages to physical record indices, as in DSV4.
 
-    The shared owner stays in DSV4's native int32[..., 128] layout. Only
-    gathered records are reinterpreted. Byte geometry is converted once to
-    record units, before any device arithmetic or int32 index conversion.
+    CSA2 SWA owners are BF16 pages; other owners use int32[..., 128] rows.
+    Byte geometry is converted once to record units before device arithmetic.
     """
 
     def __init__(
@@ -287,10 +417,8 @@ class PagedCacheRows:
         layout,
         rope=None,
         scale=None,
-        swa_words=False,
     ):
         self.scale, self.scale_hi = scale if isinstance(scale, tuple) else (scale, None)
-        self.swa_words = swa_words
         if isinstance(raw, tuple):
             if len(raw) != 2:
                 raise ValueError("Split native cache requires exactly two banks")
@@ -306,7 +434,21 @@ class PagedCacheRows:
         self.shape, self.dtype, stride_bytes, offset_bytes = layout
         self.row_bytes = math.prod(self.shape[2:]) * self.dtype.itemsize
         banks = (self.raw,) if self.raw_hi is None else (self.raw, self.raw_hi)
-        if any(
+        self.native_swa = self.raw.dtype == torch.bfloat16
+        if self.native_swa:
+            if (
+                self.dtype != torch.bfloat16
+                or self.shape[2:] != (512,)
+                or stride_bytes != self.shape[1] * self.row_bytes
+                or offset_bytes != 0
+                or sum(bank.shape[0] for bank in banks) != self.shape[0]
+                or any(
+                    bank.dtype != torch.bfloat16 or bank.shape[1:] != self.shape[1:]
+                    for bank in banks
+                )
+            ):
+                raise ValueError("Native SWA owners require compact BF16 pages")
+        elif any(
             bank.dtype != torch.int32 or bank.ndim != 2 or bank.shape[1] != ROW_WORDS
             for bank in banks
         ):
@@ -347,6 +489,8 @@ class PagedCacheRows:
         total_bytes = self.raw.nbytes + (
             0 if self.raw_hi is None else self.raw_hi.nbytes
         )
+        if self.native_swa:
+            self.total_rows = total_bytes // self.row_bytes
         if (
             max(self.total_rows, total_bytes // self.row_bytes)
             > torch.iinfo(torch.int32).max
@@ -366,14 +510,6 @@ class PagedCacheRows:
                 for b, s in zip(banks, scale_banks)
             ):
                 raise ValueError("CSA2 scales must match each physical main owner")
-        if self.swa_words and (
-            self.dtype != torch.bfloat16
-            or self.row_bytes != 1024
-            or self.row_offset % self.shape[1]
-            or self.page_stride % self.shape[1]
-            or any(bank.shape[0] % (2 * self.shape[1]) for bank in banks)
-        ):
-            raise ValueError("CSA2 SWA owners must preserve whole plane-major pages")
 
     def numel(self):
         return math.prod(self.shape)
@@ -391,6 +527,8 @@ class PagedCacheRows:
         Page ``p`` is raw rows ``[p * shape[1], (p + 1) * shape[1])``, and its
         RoPE companion rows ``[p * shape[1] / 4, ...)``.
         """
+        if self.native_swa:
+            return block_table
         rows = self.shape[1]
         if (
             rows % 4
@@ -413,6 +551,17 @@ class PagedCacheRows:
     def __getitem__(self, indices):
         blocks, rows = indices
         records = self.row_indices(blocks * self.shape[1] + rows)
+        if self.native_swa:
+            low = self.raw.flatten(0, 1)
+            if self.raw_hi is None:
+                return low[records.long()]
+            high = self.raw_hi.flatten(0, 1)
+            in_high = records >= self.bank_records
+            return torch.where(
+                in_high[..., None],
+                high[(records - self.bank_records).masked_fill(~in_high, 0).long()],
+                low[records.masked_fill(in_high, 0).long()],
+            )
         if self.raw.device.type == "cpu":
             pool = self.raw.view(torch.int8).reshape(-1, self.row_bytes)
             if self.raw_hi is None:
@@ -455,7 +604,7 @@ class PagedCacheRows:
     def write(self, slots, values, after=None):
         """``after`` (optional) must be computed before the in-place write."""
         records = self.row_indices(slots.clamp(min=0)).masked_fill(slots < 0, -1)
-        if self.swa_words:
+        if self.native_swa:
             if after is not None:
                 raise NotImplementedError(
                     "CSA2 SWA publication does not accept deferred-write dependencies"
@@ -674,7 +823,6 @@ class NativeCacheView:
                 self._tpu_cache_layout,
                 getattr(self, "_tpu_rope_pool", None),
                 getattr(self, "_tpu_scale_pool", None),
-                getattr(self, "_tpu_swa_words", False),
             )
         return self._bound_cache
 

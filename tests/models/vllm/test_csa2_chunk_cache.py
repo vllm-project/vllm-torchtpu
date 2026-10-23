@@ -1,11 +1,95 @@
 # SPDX-License-Identifier: Apache-2.0
 """Serving reuses the pipeline's gathered KV with one attention launch per layer."""
 
+from types import SimpleNamespace
+
 import pytest
 import torch
+from vllm.v1.kv_cache_interface import MLAAttentionSpec
 
 from vllm_torchtpu.models.vllm.deepseek_v41.v2 import attention_kernels, csa2_adapter
+from vllm_torchtpu.models.vllm.deepseek_v41.v2 import cache as cache_module
 from vllm_torchtpu.models.vllm.deepseek_v41.v2.cache import PagedCacheRows
+
+
+@pytest.mark.cpu_test
+@pytest.mark.parametrize("split", [False, True])
+def test_native_swa_allocation_budgets_overlaid_groups_and_binds_pages(
+    monkeypatch, split
+):
+    blocks, page_size = 4, 32
+    specs = {
+        name: MLAAttentionSpec(
+            block_size=page_size, num_kv_heads=1, head_size=512, dtype=dtype
+        )
+        for name, dtype in (
+            ("swa", torch.bfloat16),
+            ("swa_alias", torch.bfloat16),
+            ("main", torch.uint8),
+        )
+    }
+    swa_layers = frozenset(("swa", "swa_alias"))
+    specs = cache_module.budget_native_swa(specs, swa_layers)
+    assert cache_module.budget_native_swa(specs, swa_layers) == specs
+    page_bytes = (1024 + 512) * page_size
+    assert {spec.page_size_bytes for spec in specs.values()} == {page_bytes}
+    views = {
+        name: torch.empty((blocks, 1, page_size, 512), dtype=spec.dtype, device="meta")
+        for name, spec in specs.items()
+    }
+    monkeypatch.setattr(cache_module, "allocate_upstream_kv_cache", lambda *a: views)
+    if split:
+        monkeypatch.setattr(
+            cache_module, "SPARSECORE_MAX_POOL_BYTES", 2 * page_size * 1024
+        )
+    config = SimpleNamespace(
+        num_blocks=blocks,
+        kv_cache_groups=[
+            SimpleNamespace(kv_cache_spec=spec) for spec in specs.values()
+        ],
+        kv_cache_tensors=[
+            SimpleNamespace(
+                size=blocks * page_bytes,
+                block_stride=page_bytes,
+                offset=0,
+                layer_stride=0,
+                layers=[name],
+            )
+            for name in specs
+        ],
+    )
+    materialized = cache_module.materialize_upstream_kv_cache(
+        config,
+        "cpu",
+        SimpleNamespace(is_layer_compact=True),
+        word_rows=True,
+        csa2_layers=frozenset(("main",)),
+        native_swa_layers=swa_layers,
+    )
+    raw = materialized.native_raw_cache["swa"]
+    assert raw is materialized.native_raw_cache["swa_alias"]
+    banks = raw if isinstance(raw, tuple) else (raw,)
+    assert len(banks) == (2 if split else 1)
+    assert all(
+        bank.dtype == torch.bfloat16 and bank.shape[1:] == (page_size, 512)
+        for bank in banks
+    )
+    assert sum(bank.nbytes for bank in materialized.raw_tensors) == (
+        blocks * page_bytes + blocks * page_size * 4
+    )
+    assert materialized.native_raw_cache["main"].dtype == torch.int32
+    cache = PagedCacheRows(raw, materialized.native_cache_layouts["swa"])
+    for i, bank in enumerate(banks):
+        bank.fill_(i + 1)
+    indices = torch.tensor([1, 2, 3])
+    expected = torch.tensor([1, 2, 2] if split else [1, 1, 1], dtype=torch.bfloat16)
+    torch.testing.assert_close(
+        cache[indices, torch.zeros_like(indices)][:, 0], expected
+    )
+    torch.testing.assert_close(
+        cache.row_indices(indices * page_size), indices * page_size
+    )
+    torch.testing.assert_close(cache.pages(indices), indices)
 
 
 @pytest.mark.cpu_test
@@ -34,7 +118,8 @@ def test_chunk_cache_reuse_and_stage_invalidation(monkeypatch, tokens):
         raw, ((4, 32, 512), torch.uint8, 32 * 512, 0), scale=torch.ones(128)
     )
     swa = PagedCacheRows(
-        raw, ((2, 32, 512), torch.bfloat16, 32 * 1024, 0), swa_words=True
+        torch.zeros((2, 32, 512), dtype=torch.bfloat16),
+        ((2, 32, 512), torch.bfloat16, 32 * 1024, 0),
     )
     q = torch.ones((tokens, 8, 512), dtype=torch.bfloat16)
     records = torch.zeros((tokens, 512), dtype=torch.int32)
