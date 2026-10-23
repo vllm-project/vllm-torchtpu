@@ -11,17 +11,18 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Writes the real weights of an exported artifact as an Orbax checkpoint.
+"""Saves the weights vLLM serves with as an Orbax checkpoint of an artifact.
 
-`python -m vllm_torchtpu.experimental.export.checkpoint --artifact-dir DIR ...`
-takes the same model arguments as the export that produced `DIR`. It loads the
-checkpoint through vLLM on CPU, one process per tensor-parallel rank, so every
-weight goes through vLLM's processing (fused projections, FP8 requantization,
-stacked experts) exactly as when serving. It then saves each `abstract_params`
-input `i` as array `array_{i}` of an Orbax checkpoint (Zarr v2, no OCDBT) in
-`DIR/serving_checkpoint/data`, each rank writing its own shards, and removes
-`DIR/serving_checkpoint/weight.json`, whose sources cannot express that
-processing.
+`weight.json` can only slice, transpose and concatenate checkpoint tensors, so it
+cannot describe weights that vLLM computes while loading (FP8 requantization,
+dtype casts). The `checkpoint` and `all` export modes instead save every
+`abstract_params` input `i` as array `array_{i}` of an Orbax checkpoint (Zarr v2,
+no OCDBT) in `serving_checkpoint/data`, from the weights of the loaded model:
+one process per tensor-parallel rank (a CPU process for `checkpoint`, the TPU
+export worker for `all`) saves its rank's shards. The processes join a JAX
+distributed runtime before any JAX use, and the arrays are laid out on a mesh of
+their CPU devices, so Orbax writes each array's chunks from the processes that
+hold them without copying weights to TPU memory.
 """
 
 from __future__ import annotations
@@ -32,40 +33,21 @@ import os
 import shutil
 import subprocess
 import sys
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterable, Iterator, Mapping, Sequence
 from typing import Any
 
 import portpicker
 
-_CPU_ENV = {"VLLM_TARGET_DEVICE": "cpu", "JAX_PLATFORMS": "cpu", "PJRT_DEVICE": "CPU"}
-_JAX_PORT_ENV = "EXPORT_CHECKPOINT_JAX_PORT"
+# vLLM picks its platform when imported, so CPU workers start with this env.
+CPU_ENV = {"VLLM_TARGET_DEVICE": "cpu", "JAX_PLATFORMS": "cpu", "PJRT_DEVICE": "CPU"}
+# Port of the JAX distributed coordinator the launcher reserves for its workers.
+JAX_PORT_ENV = "EXPORT_CHECKPOINT_JAX_PORT"
+# Where `all`-mode export workers, each exporting to its own directory, save the
+# checkpoint: the final artifact's `CHECKPOINT_DATA_DIR`.
+DATA_DIR_ENV = "EXPORT_CHECKPOINT_DATA_DIR"
 _AXIS_NAMES = ("data", "model")
 # Checkpoint arrays `array_{i}` live here, relative to the artifact directory.
 CHECKPOINT_DATA_DIR = os.path.join("serving_checkpoint", "data")
-
-
-def build_arg_parser() -> argparse.ArgumentParser:
-    """`EngineArgs` plus `--artifact-dir`."""
-    from vllm.engine.arg_utils import EngineArgs
-    from vllm.utils.argparse_utils import FlexibleArgumentParser
-
-    parser = FlexibleArgumentParser(
-        prog="python -m vllm_torchtpu.experimental.export.checkpoint",
-        description=(
-            "Save the real weights of an exported artifact as an Orbax checkpoint."
-        ),
-    )
-    parser = EngineArgs.add_cli_args(parser)
-    parser.add_argument(
-        "--artifact-dir",
-        type=str,
-        required=True,
-        help="Exported artifact whose abstract_params the checkpoint fills.",
-    )
-    parser.add_argument(
-        "--checkpoint-worker", action="store_true", help=argparse.SUPPRESS
-    )
-    return parser
 
 
 def abstract_params_inputs(artifact_dir: str) -> list[dict[str, Any]]:
@@ -76,7 +58,8 @@ def abstract_params_inputs(artifact_dir: str) -> list[dict[str, Any]]:
     return sorted(inputs, key=lambda t: t["arg_index"])
 
 
-def _axis_sizes(artifact_dir: str) -> dict[str, int]:
+def mesh_axis_sizes(artifact_dir: str) -> dict[str, int]:
+    """Size of each mesh axis of the artifact."""
     with open(os.path.join(artifact_dir, "metadata.json")) as f:
         mesh = json.load(f)["mesh"]
     return dict(zip(mesh["axis_names"], mesh["mesh_shape"], strict=True))
@@ -123,19 +106,18 @@ def to_numpy(tensor: Any) -> Any:
     return t.numpy()
 
 
-def checkpoint_shards(
+def iter_checkpoint_shards(
     inputs: Sequence[Mapping[str, Any]],
     tensors: Mapping[str, Any],
     axis_sizes: Mapping[str, int],
-) -> list[Any]:
-    """This rank's shard of every `abstract_params` input, as numpy arrays.
+) -> Iterator[Any]:
+    """Yields this rank's shard of every `abstract_params` input as a numpy array.
 
     A tensor's shard is the rank's own tensor. A per-device constant, declared as
     a global `[tp, ...]` array, has a `[1, ...]` shard holding the rank's value.
     """
     from vllm_torchtpu.experimental.export import tpu_lowering
 
-    shards = []
     for spec in inputs:
         name = spec["name"]
         if name not in tensors:
@@ -155,31 +137,39 @@ def checkpoint_shards(
                     f"artifact shard shape {expected}"
                 )
             array = array.reshape(expected)
-        shards.append(array)
-    return shards
+        yield array
+
+
+def checkpoint_shards(
+    inputs: Sequence[Mapping[str, Any]],
+    tensors: Mapping[str, Any],
+    axis_sizes: Mapping[str, int],
+) -> list[Any]:
+    """This rank's shard of every `abstract_params` input (`iter_checkpoint_shards`)."""
+    return list(iter_checkpoint_shards(inputs, tensors, axis_sizes))
 
 
 def save_checkpoint(
     inputs: Sequence[Mapping[str, Any]],
-    shards: Sequence[Any],
+    shards: Iterable[Any],
     axis_sizes: Mapping[str, int],
     data_dir: str,
 ) -> None:
     """Saves the global arrays assembled from every process's `shards` with Orbax.
 
-    Each process holds one CPU device, the mesh position of its rank; Orbax writes
-    each array's chunks from the processes that hold them.
+    Each process contributes one CPU device, the mesh position of its rank; Orbax
+    writes each array's chunks from the processes that hold them.
     """
     import jax
     import numpy as np
     import orbax.checkpoint as ocp
     from jax.sharding import Mesh, NamedSharding, PartitionSpec
 
-    devices = sorted(jax.devices(), key=lambda d: (d.process_index, d.id))
+    devices = sorted(jax.devices("cpu"), key=lambda d: (d.process_index, d.id))
     mesh = Mesh(
         np.asarray(devices).reshape([axis_sizes[a] for a in _AXIS_NAMES]), _AXIS_NAMES
     )
-    (local,) = jax.local_devices()
+    (local,) = jax.local_devices(backend="cpu")
     tree = {}
     for i, (spec, shard) in enumerate(zip(inputs, shards, strict=True)):
         sharding = NamedSharding(mesh, PartitionSpec(*spec["sharding"]))
@@ -194,34 +184,49 @@ def save_checkpoint(
     )
 
 
-def run_worker(args: argparse.Namespace) -> None:
-    """Loads this rank's weights on CPU and saves its shards."""
+def init_jax(rank: int, world_size: int) -> None:
+    """Joins this rank to the launcher's JAX distributed runtime.
+
+    Must run before any JAX use in the process.
+    """
     import jax
+
+    jax.config.update("jax_enable_x64", True)  # Keep i64 constants 64-bit.
+    if world_size > 1:
+        jax.distributed.initialize(
+            f"{os.environ['MASTER_ADDR']}:{os.environ[JAX_PORT_ENV]}",
+            num_processes=world_size,
+            process_id=rank,
+        )
+
+
+def save_model_checkpoint(model: Any, artifact_dir: str, data_dir: str) -> None:
+    """Saves this rank's weights of `model` for the artifact in `artifact_dir`."""
+    inputs = abstract_params_inputs(artifact_dir)
+    sizes = mesh_axis_sizes(artifact_dir)
+    shards = iter_checkpoint_shards(inputs, local_tensors(model), sizes)
+    save_checkpoint(inputs, shards, sizes, data_dir)
+
+
+def run_cpu_load_worker(args: argparse.Namespace) -> None:
+    """`checkpoint` mode: loads this rank's weights on CPU and saves its shards."""
     import torch.distributed as dist
     from vllm.config import set_current_vllm_config
     from vllm.distributed import init_distributed_environment
     from vllm.engine.arg_utils import EngineArgs
 
+    from vllm_torchtpu import patch_registry
     from vllm_torchtpu.experimental.export import universal_adapter
 
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
-    jax.config.update("jax_enable_x64", True)  # Keep i64 constants 64-bit.
-    if world_size > 1:
-        jax.distributed.initialize(
-            f"{os.environ['MASTER_ADDR']}:{os.environ[_JAX_PORT_ENV]}",
-            num_processes=world_size,
-            process_id=rank,
-        )
-
-    from vllm_torchtpu import patch_registry
+    init_jax(rank, world_size)
 
     vllm_config = EngineArgs.from_cli_args(args).create_engine_config()
     # vLLM runs on its CPU platform here, which skips the TPU platform's patches;
     # apply them so the model has the parameters and buffers it has on TPU.
     patch_registry.apply("platform_activation", model_config=vllm_config.model_config)
     universal_adapter.check_supported_parallelism(vllm_config.parallel_config)
-    load_format = "auto" if args.load_format == "dummy" else args.load_format
     with set_current_vllm_config(vllm_config):
         if not dist.is_initialized():
             # TPU collectives are unavailable on CPU; loading only needs gloo.
@@ -232,36 +237,38 @@ def run_worker(args: argparse.Namespace) -> None:
                 distributed_init_method="env://",
                 backend="gloo",
             )
-        model = universal_adapter.load_vllm_model(vllm_config, load_format=load_format)
+        model = universal_adapter.load_vllm_model(vllm_config, load_format="auto")
 
-    inputs = abstract_params_inputs(args.artifact_dir)
-    axis_sizes = _axis_sizes(args.artifact_dir)
-    shards = checkpoint_shards(inputs, local_tensors(model), axis_sizes)
-    save_checkpoint(
-        inputs, shards, axis_sizes, os.path.join(args.artifact_dir, CHECKPOINT_DATA_DIR)
+    save_model_checkpoint(
+        model, args.output_dir, os.path.join(args.output_dir, CHECKPOINT_DATA_DIR)
     )
-    if rank == 0:
-        weight_json = os.path.join(
-            args.artifact_dir, "serving_checkpoint", "weight.json"
-        )
-        if os.path.exists(weight_json):
-            os.remove(weight_json)
 
 
-def _launch_workers(argv: Sequence[str], tp_size: int) -> None:
-    """Runs one CPU worker per tensor-parallel rank."""
+def remove_weight_json(artifact_dir: str) -> None:
+    """Removes `weight.json`, which a checkpoint's arrays replace."""
+    path = os.path.join(artifact_dir, "serving_checkpoint", "weight.json")
+    if os.path.exists(path):
+        os.remove(path)
+
+
+def launch_cpu_workers(
+    argv: Sequence[str],
+    tp_size: int,
+    worker_flag: str,
+) -> None:
+    """Runs `python -m vllm_torchtpu.experimental.export` once per rank on CPU."""
     env = dict(
         os.environ,
-        **_CPU_ENV,
+        **CPU_ENV,
         WORLD_SIZE=str(tp_size),
         MASTER_ADDR="127.0.0.1",
         MASTER_PORT=str(portpicker.pick_unused_port()),
-        **{_JAX_PORT_ENV: str(portpicker.pick_unused_port())},
+        **{JAX_PORT_ENV: str(portpicker.pick_unused_port())},
     )
     procs = [
         subprocess.Popen(
-            [sys.executable, "-m", "vllm_torchtpu.experimental.export.checkpoint"]
-            + [*argv, "--checkpoint-worker"],
+            [sys.executable, "-m", "vllm_torchtpu.experimental.export"]
+            + [*argv, worker_flag],
             env=dict(env, RANK=str(rank), LOCAL_RANK=str(rank)),
         )
         for rank in range(tp_size)
@@ -276,25 +283,13 @@ def _launch_workers(argv: Sequence[str], tp_size: int) -> None:
                 proc.kill()
 
 
-def main(argv: Sequence[str] | None = None) -> int:
-    """CLI entrypoint for `python -m vllm_torchtpu.experimental.export.checkpoint`."""
-    argv = list(sys.argv[1:] if argv is None else argv)
-    if "--checkpoint-worker" in argv:
-        run_worker(build_arg_parser().parse_args(argv))
-        return 0
-    # vLLM picks its device when imported, so only the workers, started with
-    # `_CPU_ENV`, parse the full engine arguments.
-    launcher = argparse.ArgumentParser(add_help=False)
-    launcher.add_argument("--artifact-dir", required=True)
-    launcher.add_argument("-tp", "--tensor-parallel-size", type=int, default=1)
-    args, _ = launcher.parse_known_args(argv)
-    if not os.path.isfile(os.path.join(args.artifact_dir, "metadata.json")):
-        raise FileNotFoundError(f"{args.artifact_dir} has no metadata.json")
-    data_dir = os.path.join(args.artifact_dir, CHECKPOINT_DATA_DIR)
-    shutil.rmtree(data_dir, ignore_errors=True)
-    _launch_workers(argv, int(args.tensor_parallel_size or 1))
-    return 0
-
-
-if __name__ == "__main__":
-    sys.exit(main())
+def export_checkpoint(argv: Sequence[str], tp_size: int, output_dir: str) -> None:
+    """`checkpoint` mode: fills the existing artifact in `output_dir` on CPU."""
+    if not os.path.isfile(os.path.join(output_dir, "metadata.json")):
+        raise FileNotFoundError(
+            f"--export-mode checkpoint needs an exported artifact; {output_dir} has "
+            "no metadata.json"
+        )
+    shutil.rmtree(os.path.join(output_dir, CHECKPOINT_DATA_DIR), ignore_errors=True)
+    launch_cpu_workers(argv, tp_size, "--export-worker")
+    remove_weight_json(output_dir)

@@ -30,6 +30,7 @@ import torch.nn as nn
 
 from vllm_torchtpu.experimental.export import (
     api,
+    checkpoint,
     cli,
     exporter,
     sampling,
@@ -1105,3 +1106,68 @@ def test_launch_workers_fails_when_a_worker_fails(tmp_path: Path) -> None:
         cli._launch_workers(["--model", "m"], 2, str(out_dir))
     assert not out_dir.exists()
     assert not list(tmp_path.glob(".export_ranks_*"))
+
+
+def test_launch_options_read_the_dispatch_flags() -> None:
+    launch = cli._launch_options(
+        ["--model", "m", "--export-mode=checkpoint", "-tp", "4", "--output-dir", "o"]
+    )
+    assert launch.export_mode == "checkpoint"
+    assert launch.tensor_parallel_size == 4
+    assert launch.output_dir == "o"
+    assert not launch.export_worker
+    assert cli._launch_options(["--output-dir", "o"]).export_mode == "model"
+
+
+def test_main_checkpoint_mode_runs_on_cpu_without_parsing_engine_args(
+    tmp_path: Path,
+) -> None:
+    argv = [
+        "--model",
+        "m",
+        "--output-dir",
+        str(tmp_path),
+        "--export-mode",
+        "checkpoint",
+    ]
+    with (
+        mock.patch.object(cli, "parse_args") as parse,
+        mock.patch.object(checkpoint, "export_checkpoint") as export_ckpt,
+    ):
+        cli.main([*argv, "-tp", "2"])
+    parse.assert_not_called()
+    export_ckpt.assert_called_once_with([*argv, "-tp", "2"], 2, str(tmp_path))
+
+    with (
+        mock.patch.object(cli, "parse_args", return_value="args"),
+        mock.patch.object(checkpoint, "run_cpu_load_worker") as worker,
+    ):
+        cli.main([*argv, "--export-worker"])
+    worker.assert_called_once_with("args")
+
+
+def test_export_checkpoint_needs_an_exported_artifact(tmp_path: Path) -> None:
+    with pytest.raises(FileNotFoundError, match="no metadata.json"):
+        checkpoint.export_checkpoint(["--model", "m"], 1, str(tmp_path))
+
+
+def test_launch_workers_all_mode_saves_into_the_output_dir(tmp_path: Path) -> None:
+    out_dir = tmp_path / "out"
+    stale = out_dir / "serving_checkpoint" / "data"
+    stale.mkdir(parents=True)
+    (out_dir / "serving_checkpoint" / "weight.json").write_text("{}")
+    envs: list[Mapping[str, str]] = []
+
+    class Recording(_FakeWorker):
+        def __init__(self, cmd: Sequence[str], env: Mapping[str, str]) -> None:
+            envs.append(env)
+            super().__init__(cmd, env)
+
+    with (
+        mock.patch.object(cli, "_worker_env", lambda tp: {}),
+        mock.patch.object(cli.subprocess, "Popen", Recording),
+    ):
+        cli._launch_workers(["--model", "m"], 2, str(out_dir), save_checkpoint=True)
+    assert {e[checkpoint.DATA_DIR_ENV] for e in envs} == {os.path.abspath(stale)}
+    assert not stale.exists()
+    assert not (out_dir / "serving_checkpoint" / "weight.json").exists()

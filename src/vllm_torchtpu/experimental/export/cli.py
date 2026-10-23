@@ -28,10 +28,16 @@ import portpicker
 
 from vllm_torchtpu.experimental.export import (
     api,
+    checkpoint,
     exporter,
     universal_adapter,
 )
 from vllm_torchtpu.experimental.export.trace import trace
+
+# What `--export-mode` writes: the serving artifact with declarative weights read
+# from the HF checkpoint (`model`), the weights of an existing artifact as an
+# Orbax checkpoint (`checkpoint`), or both from one load (`all`).
+EXPORT_MODES = ("model", "checkpoint", "all")
 
 
 def _parse_int_list(raw: str | Sequence[int] | None) -> tuple[int, ...] | None:
@@ -163,6 +169,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
             "--gpu-memory-utilization."
         ),
     )
+    export_group.add_argument(
+        "--export-mode",
+        choices=EXPORT_MODES,
+        default="model",
+        help=(
+            "'model' (default): export the artifact with dummy weights and a "
+            "declarative serving_checkpoint/weight.json. 'checkpoint': on CPU, load "
+            "the real weights through vLLM and save them as an Orbax checkpoint in "
+            "the existing artifact at --output-dir. 'all': on TPU, load the real "
+            "weights once, export the artifact and save them as an Orbax checkpoint. "
+            "Use 'checkpoint' or 'all' when vLLM changes weights while loading them "
+            "(e.g. FP8 requantization), which weight.json cannot express."
+        ),
+    )
     # Internal: marks a worker process started by `main`.
     parser.add_argument("--export-worker", action="store_true", help=argparse.SUPPRESS)
     return parser
@@ -199,9 +219,17 @@ def run_export_from_args(
     if vllm_config is not None:
         universal_adapter.check_supported_parallelism(vllm_config.parallel_config)
     # Load before building the export config: loading finalizes the KV block size.
+    export_mode = getattr(args, "export_mode", "model")
+    if export_mode == "all":
+        # Before any JAX use: the Pallas kernels the model loads with use JAX.
+        checkpoint.init_jax(
+            int(os.environ.get("RANK", 0)), int(os.environ.get("WORLD_SIZE", 1))
+        )
     loaded_on_device = model is None
     if loaded_on_device:
-        model = universal_adapter.load_dummy_vllm_model(vllm_config)
+        model = universal_adapter.load_vllm_model(
+            vllm_config, load_format="auto" if export_mode == "all" else "dummy"
+        )
 
     token_buckets = _parse_int_list(getattr(args, "token_buckets", None))
     req_buckets = _parse_int_list(getattr(args, "req_buckets", None))
@@ -242,7 +270,18 @@ def run_export_from_args(
                 cache_cfg.gpu_memory_utilization, kv_cache_memory_bytes
             )
 
-    exporter.export(exportable, args.output_dir)
+    exporter.export(
+        exportable, args.output_dir, emit_weight_json=export_mode == "model"
+    )
+    if export_mode == "all":
+        checkpoint.save_model_checkpoint(
+            getattr(exportable, "model", exportable),
+            args.output_dir,
+            os.environ.get(
+                checkpoint.DATA_DIR_ENV,
+                os.path.join(args.output_dir, checkpoint.CHECKPOINT_DATA_DIR),
+            ),
+        )
     return exportable.export_config
 
 
@@ -259,6 +298,9 @@ def _worker_env(tp_size: int) -> dict[str, str]:
         os.environ["WORLD_SIZE"] = str(tp_size)
         os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
         os.environ.setdefault("MASTER_PORT", str(portpicker.pick_unused_port()))
+        os.environ.setdefault(
+            checkpoint.JAX_PORT_ENV, str(portpicker.pick_unused_port())
+        )
         TpuPlatform._prepare_singlehost_tpu_env(tp_size)
         return dict(os.environ)
     finally:
@@ -267,13 +309,22 @@ def _worker_env(tp_size: int) -> dict[str, str]:
 
 
 @trace("export.launch_workers")
-def _launch_workers(argv: Sequence[str], tp_size: int, output_dir: str) -> None:
+def _launch_workers(
+    argv: Sequence[str], tp_size: int, output_dir: str, *, save_checkpoint: bool = False
+) -> None:
     """Runs one export worker per tensor-parallel rank and keeps rank 0's output.
 
     Every rank traces the same per-device programs (collectives need all of
-    them); rank 0's artifact is copied to `output_dir`.
+    them); rank 0's artifact is copied to `output_dir`. With `save_checkpoint`,
+    the workers also save their weights as the Orbax checkpoint of `output_dir`.
     """
     env = _worker_env(tp_size)
+    if save_checkpoint:
+        data_dir = os.path.join(
+            os.path.abspath(output_dir), checkpoint.CHECKPOINT_DATA_DIR
+        )
+        shutil.rmtree(data_dir, ignore_errors=True)
+        env[checkpoint.DATA_DIR_ENV] = data_dir
     rank_root = tempfile.mkdtemp(
         prefix=".export_ranks_", dir=os.path.dirname(os.path.abspath(output_dir))
     )
@@ -295,6 +346,8 @@ def _launch_workers(argv: Sequence[str], tp_size: int, output_dir: str) -> None:
         shutil.copytree(
             os.path.join(rank_root, "rank0"), output_dir, dirs_exist_ok=True
         )
+        if save_checkpoint:
+            checkpoint.remove_weight_json(output_dir)
     finally:
         for proc in procs:
             if proc.poll() is None:
@@ -309,6 +362,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     export); each worker runs `run_export_from_args`.
     """
     argv = list(sys.argv[1:] if argv is None else argv)
+    launch = _launch_options(argv)
+    if launch.export_mode == "checkpoint":
+        # CPU workers parse the engine arguments: vLLM picks its platform when
+        # imported, so only processes started with `checkpoint.CPU_ENV` run on CPU.
+        if launch.export_worker:
+            checkpoint.run_cpu_load_worker(parse_args(argv))
+        else:
+            checkpoint.export_checkpoint(
+                argv, launch.tensor_parallel_size, launch.output_dir
+            )
+        return 0
     args = parse_args(argv)
     # Reject before starting workers, each of which would load the model first.
     universal_adapter.check_supported_parallelism(args)
@@ -316,5 +380,17 @@ def main(argv: Sequence[str] | None = None) -> int:
         run_export_from_args(args)
         return 0
     tp_size = int(getattr(args, "tensor_parallel_size", 1) or 1)
-    _launch_workers(argv, tp_size, args.output_dir)
+    _launch_workers(
+        argv, tp_size, args.output_dir, save_checkpoint=args.export_mode == "all"
+    )
     return 0
+
+
+def _launch_options(argv: Sequence[str]) -> argparse.Namespace:
+    """The options `main` dispatches on, read without vLLM's argument parser."""
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--export-mode", choices=EXPORT_MODES, default="model")
+    parser.add_argument("--output-dir")
+    parser.add_argument("-tp", "--tensor-parallel-size", type=int, default=1)
+    parser.add_argument("--export-worker", action="store_true")
+    return parser.parse_known_args(argv)[0]
