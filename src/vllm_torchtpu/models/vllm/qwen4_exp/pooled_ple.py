@@ -1,14 +1,26 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Native history and encoded-table transport around the common PLE layer."""
 
 from collections.abc import Callable, Iterable
 from functools import partial
 
 import torch
+from transformers import Qwen4ExpTextConfig
 from vllm.distributed import GroupCoordinator
 from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 from vllm.model_executor.models.utils import AutoWeightsLoader
-from transformers import Qwen4ExpTextConfig
 
 from vllm_torchtpu.layers.adapter.custom_ops.ple_op import (
     build_pooled_short_conv_op,
