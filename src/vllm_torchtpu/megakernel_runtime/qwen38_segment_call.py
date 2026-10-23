@@ -40,13 +40,24 @@ from .qwen38_scatter import scatter_gdn_ckpts_fast
 T_VERIFY = 4
 
 
-def segment_tiles(B: int, hier: int | None = None) -> Tiles:
+def ring_depths(B: int) -> tuple[int, int]:
+    """(expert, dense) ring slots per bucket: shallower rings leave VMEM for row scratch."""
+    if B <= 16:
+        return 12, 10
+    if B <= 32:
+        return 6, 10
+    return (3, 4) if B <= 64 else (2, 3)
+
+
+def segment_tiles(
+    B: int, hier: int | None = None, rings: tuple[int, int] | None = None
+) -> Tiles:
     """Expert ring on the software-pipelined EP path (e13 in 2 tiles, e2 in 1).
 
-    Ring depths shrink with the bucket so the 64-row scratch fits VMEM; the
+    Ring depths shrink with the bucket so the row scratch fits VMEM; the
     bank sizes (hence every weight's tiling) are the same for all buckets.
     """
-    nbe, nbd = (12, 10) if B <= 16 else ((6, 10) if B <= 32 else (3, 4))
+    nbe, nbd = rings or ring_depths(B)
     h = 1 if hier is None else hier
     return Tiles(ebank=2 << 20, nbe=nbe, nbd=nbd, vmem_mib=62, hier=h).with_blocks(
         {"moe": {"pipe_ep": True, "moe_unroll": True}}

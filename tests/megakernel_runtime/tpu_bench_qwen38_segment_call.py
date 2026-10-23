@@ -64,12 +64,14 @@ def _slope(step, carry, args, chains):
     return round(k * 1e6, 1)
 
 
-def run(B: int, L: int, chains: list[int]) -> dict:
+def run(
+    B: int, L: int, chains: list[int], rings: tuple[int, int] | None = None, kernel_only: bool = False
+) -> dict:
     g, R = qwen38.FULL, 8
     mesh = Mesh(np.array(jax.devices()[:R]), ("tp",))
     tp, rep = NamedSharding(mesh, P("tp")), NamedSharding(mesh, P())
     NS, NL = B // T_VERIFY, L - 1
-    ex = ExecSpec(R=R, B=B, T=T_VERIFY, ctx=128, tiles=segment_tiles(B))
+    ex = ExecSpec(R=R, B=B, T=T_VERIFY, ctx=128, tiles=segment_tiles(B, rings=rings))
     spec = qwen38.segment_spec(g, R, L=L)
 
     def gen(key):
@@ -104,8 +106,10 @@ def run(B: int, L: int, chains: list[int]) -> dict:
     meta = [jax.device_put(m, rep) for m in meta]
 
     nf = len(flat)
-    out: dict = {"rows": B, "L": L}
-    if NL:
+    out: dict = {"rows": B, "L": L, "rings": list(rings) if rings else None}
+    if kernel_only:
+        pass
+    elif NL:
         # Seed every read block with valid random f32 states through the scatter.
         seed = jax.shard_map(
             lambda p_, c, r, wb: gs.scatter_gdn_ckpts(p_, c, r, wb, layout=layout),
@@ -121,7 +125,7 @@ def run(B: int, L: int, chains: list[int]) -> dict:
         pool = jax.jit(seed)(pool, jax.device_put(conv_r, tp), jax.device_put(rec_r, tp), jax.device_put(wb_seed, rep))
         results = {}
         for pg, fs in ((False, False), (True, False), (True, True)):
-            full, _, _, _ = build_segment_call(mesh, g, L, B, layout, pool_gdn=pg, fast_scatter=fs)
+            full, _, _, _ = build_segment_call(mesh, g, L, B, layout, pool_gdn=pg, fast_scatter=fs, tiles=ex.tiles)
             res_, pool_ = jax.jit(full)(hidden, attn_b, *flat, pool, *meta)
             results[(pg, fs)] = (np.asarray(res_, np.float32), np.asarray(jax.lax.bitcast_convert_type(pool_, jnp.uint8)))
             # The pool is part of the carry, so the scatter is live work.
@@ -139,7 +143,7 @@ def run(B: int, L: int, chains: list[int]) -> dict:
             diff = (results[key][1] != base_[1]).reshape(R, nb, -1)[:, 4:]
             out[name + "_pool_bytes_differ"] = int(diff.sum())
     else:
-        full, _, _, _ = build_segment_call(mesh, g, L, B, layout)
+        full, _, _, _ = build_segment_call(mesh, g, L, B, layout, tiles=ex.tiles)
         out["composed_us"] = _slope(lambda h, at, *a: full(h, at, *a)[0], hidden, (attn_b, *flat), chains)
 
     fn, _, _, _ = make_flat_segment_step(mesh, spec, ex)
@@ -159,11 +163,14 @@ def main() -> None:
     ap.add_argument("--rows", type=int, nargs="+", default=[4, 8, 16, 32, 64])
     ap.add_argument("--layers", type=int, nargs="+", default=[4, 1])
     ap.add_argument("--chains", type=int, nargs="+", default=[8, 32])
+    ap.add_argument("--rings", nargs="*", default=[], help="nbe:nbd overrides to sweep")
+    ap.add_argument("--kernel-only", action="store_true", help="time the bare kernel only")
     a = ap.parse_args()
-    for L in a.layers:
-        for B in a.rows:
+    sweep = [tuple(int(v) for v in r.split(":")) for r in a.rings] or [None]
+    for L, B, rings in ((L, B, r) for L in a.layers for B in a.rows for r in sweep):
+        if True:
             try:
-                r = run(B, L, a.chains)
+                r = run(B, L, a.chains, rings, a.kernel_only)
             except Exception as e:  # noqa: BLE001
                 r = {"rows": B, "L": L, "error": f"{type(e).__name__}: {e}"[:1500]}
             print("RESULT", json.dumps(r), flush=True)
