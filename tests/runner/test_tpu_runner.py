@@ -456,11 +456,13 @@ def test_spec_decode_warmup_sweeps_batches_at_the_shortest_and_longest_prompt(
     ]
 
 
-def _runner(K: int, block: int, max_reqs: int, budget: int, paddings: list[int]):
+def _runner(K: int, block: int, max_seqs: int, budget: int, paddings: list[int]):
     return SimpleNamespace(
         speculative_config=SimpleNamespace(num_speculative_tokens=K),
         drafter=SimpleNamespace(block_size=block),
-        max_num_reqs=max_reqs,
+        scheduler_config=SimpleNamespace(max_num_seqs=max_seqs),
+        # As in TPUModelRunner.__init__: raised to MIN_NUM_SEQS for padding.
+        max_num_reqs=max(max_seqs, tpu_runner.MIN_NUM_SEQS),
         max_num_tokens=budget,
         num_tokens_paddings=paddings,
     )
@@ -472,6 +474,7 @@ def _step_keys(runner, R: int, mixed: bool) -> set[tuple]:
     K = runner.speculative_config.num_speculative_tokens
     block = runner.drafter.block_size
     pads = runner.num_tokens_paddings
+    max_seqs = runner.scheduler_config.max_num_seqs
     max_reqs = runner.max_num_reqs
 
     def tok_bucket(n: int) -> int:
@@ -487,7 +490,7 @@ def _step_keys(runner, R: int, mixed: bool) -> set[tuple]:
                 tok_bucket(R * block),
             )
         )
-    if mixed and max_reqs >= R + 1 and runner.max_num_tokens >= R * (1 + K) + 1:
+    if mixed and max_seqs >= R + 1 and runner.max_num_tokens >= R * (1 + K) + 1:
         keys.add(
             (
                 "mixed",
@@ -500,15 +503,20 @@ def _step_keys(runner, R: int, mixed: bool) -> set[tuple]:
 
 
 FLASH = dict(
-    K=5, block=5, max_reqs=64, budget=1024, paddings=[16, 32, 64, 128, 256, 512, 1024]
+    K=5, block=5, max_seqs=64, budget=1024, paddings=[16, 32, 64, 128, 256, 512, 1024]
 )
-AGENTX = dict(K=5, block=5, max_reqs=8, budget=256, paddings=[16, 32, 64, 128, 256])
+AGENTX = dict(K=5, block=5, max_seqs=8, budget=256, paddings=[16, 32, 64, 128, 256])
 # 8 decoders x 6 rows = 48 > a 32-token budget: counts above 5 have no step.
-TIGHT = dict(K=5, block=5, max_reqs=8, budget=32, paddings=[16, 32])
+TIGHT = dict(K=5, block=5, max_seqs=8, budget=32, paddings=[16, 32])
+# The nightly DSpark bs4 engine: max_num_seqs sits below MIN_NUM_SEQS, so the
+# runner's padded request bound (8) is above any count a step can hold.
+DSPARK_BS4 = dict(K=7, block=7, max_seqs=4, budget=256, paddings=[16, 32, 64, 128, 256])
 
 
 @pytest.mark.parametrize(
-    "cfg", [FLASH, AGENTX, TIGHT], ids=["flash", "agentx", "tight"]
+    "cfg",
+    [FLASH, AGENTX, TIGHT, DSPARK_BS4],
+    ids=["flash", "agentx", "tight", "dspark-bs4"],
 )
 @pytest.mark.parametrize("mixed", [False, True])
 def test_grid_covers_every_bucket_combination_once(cfg, mixed):
@@ -516,11 +524,11 @@ def test_grid_covers_every_bucket_combination_once(cfg, mixed):
     grid = TPUModelRunner._spec_warmup_bucket_grid(runner, mixed=mixed)
 
     assert grid == sorted(set(grid))
-    assert all(1 <= R <= cfg["max_reqs"] for R in grid)
+    assert all(1 <= R <= cfg["max_seqs"] for R in grid)
     # Every bucket combination a serving step can take is warmed ...
     covered = set().union(*(_step_keys(runner, R, mixed) for R in grid))
     needed = set().union(
-        *(_step_keys(runner, R, mixed) for R in range(1, cfg["max_reqs"] + 1))
+        *(_step_keys(runner, R, mixed) for R in range(1, cfg["max_seqs"] + 1))
     )
     assert covered == needed
     # ... by one count each: every grid entry brings a bucket no earlier one had.
@@ -529,6 +537,47 @@ def test_grid_covers_every_bucket_combination_once(cfg, mixed):
         keys = _step_keys(runner, R, mixed)
         assert keys - seen, f"count {R} adds no new bucket"
         seen |= keys
+
+
+@pytest.mark.parametrize("R", [1, 2, 3])
+def test_spec_batch_warmup_holds_at_most_max_num_seqs_requests(R):
+    # The input batch holds max_num_seqs requests, below the runner's padded
+    # max_num_reqs here. The mixed steps add one, then two, prefill requests
+    # beside the R decoders; a step past max_num_seqs fails add_request.
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    live: set[str] = set()
+    sizes: list[int] = []
+
+    def execute_model(so):
+        live.difference_update(so.finished_req_ids)
+        live.update(r.req_id for r in so.scheduled_new_reqs)
+        sizes.append(len(live))
+
+    runner = SimpleNamespace(
+        max_model_len=256,
+        max_num_tokens=256,
+        max_num_reqs=tpu_runner.MIN_NUM_SEQS,
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        speculative_config=SimpleNamespace(num_speculative_tokens=7),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=4096, kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+        ),
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(decode_context_parallel_size=1)
+        ),
+        execute_model=execute_model,
+        sample_tokens=lambda _: None,
+        take_draft_token_ids=lambda: None,
+        _warmup_spec_decode_cleanup=lambda rids: True,
+    )
+
+    TPUModelRunner._warmup_spec_batch(runner, R, 16, short=True, mixed=True)
+
+    # Each mixed variant that fits ran: the peak is R decoders plus two
+    # prefills, capped at max_num_seqs, so a swallowed failure shows here too.
+    assert max(sizes) == min(R + 2, 4)
 
 
 def test_mtp_prefill_warmup_retries_each_bucket_without_a_pipeline():

@@ -6997,6 +6997,10 @@ class TPUModelRunner(GPUModelRunner):
         K = self.speculative_config.num_speculative_tokens
         drafter = self.drafter
         block = int(getattr(drafter, "block_size", K + 1))
+        # A step holds at most max_num_seqs requests, and the input batch may
+        # hold no more. self.max_num_reqs is raised to MIN_NUM_SEQS for request
+        # padding, so it caps the pad, as in serving, but not the count.
+        max_seqs = int(self.scheduler_config.max_num_seqs)
         max_reqs = int(self.max_num_reqs)
         budget = int(self.max_num_tokens)
         pads = list(self.num_tokens_paddings)
@@ -7006,7 +7010,7 @@ class TPUModelRunner(GPUModelRunner):
 
         seen: set[tuple] = set()
         grid: list[int] = []
-        for R in range(1, max_reqs + 1):
+        for R in range(1, max_seqs + 1):
             keys = []
             if budget >= R * (1 + K):
                 keys.append(
@@ -7017,7 +7021,7 @@ class TPUModelRunner(GPUModelRunner):
                         tok_bucket(R * block),
                     )
                 )
-            if mixed and max_reqs >= R + 1 and budget >= R * (1 + K) + 1:
+            if mixed and max_seqs >= R + 1 and budget >= R * (1 + K) + 1:
                 keys.append(
                     (
                         "mixed",
@@ -7056,6 +7060,8 @@ class TPUModelRunner(GPUModelRunner):
         assert self.speculative_config is not None
         assert self.kv_cache_config is not None
         K = self.speculative_config.num_speculative_tokens
+        # The most requests one step may hold (see _spec_warmup_bucket_grid).
+        max_seqs = int(self.scheduler_config.max_num_seqs)
         room = self.max_model_len - P
         n_decode = min(3 if short else max(5, K + 2), max(0, room // (1 + K) - 1))
         max_pos = min(self.max_model_len, P + n_decode * (1 + K))
@@ -7137,7 +7143,7 @@ class TPUModelRunner(GPUModelRunner):
                 nct = [x + 1 for x in nct]
             if (
                 mixed
-                and self.max_num_reqs >= R + 1
+                and max_seqs >= R + 1
                 and int(self.max_num_tokens) - R * (1 + K) >= P
             ):
                 # Mixed verify+prefill steps at the full step budget: R verify
@@ -7156,7 +7162,7 @@ class TPUModelRunner(GPUModelRunner):
                 ]
                 mix_nblk = max(mix_nblks)
                 variants = [[P_mix]]
-                if self.max_num_reqs >= R + 2 and P_mix >= 2 * P:
+                if max_seqs >= R + 2 and P_mix >= 2 * P:
                     variants.append([P_mix // 2, P_mix - P_mix // 2])
                 prev_ids: list[str] = []
                 base_lo = 1 + R * nblk

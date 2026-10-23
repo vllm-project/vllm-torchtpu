@@ -28,19 +28,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "${SCRIPT_DIR}/lib.sh"
 
 echo "--- :label: Release version"
-if [[ -n "${RELEASE_VERSION:-}" ]]; then
-    VERSION="${RELEASE_VERSION#v}"
-    SOURCE="RELEASE_VERSION=${RELEASE_VERSION}"
-else
-    [[ "${BUILDKITE_BRANCH}" =~ ^releases/v([0-9]+\.[0-9]+\.[0-9]+)$ ]] \
-        || die "not a release branch: '${BUILDKITE_BRANCH}'."
-    VERSION="${BASH_REMATCH[1]}"
-    SOURCE="branch ${BUILDKITE_BRANCH}"
-fi
-# A public PEP 440 version: PyPI rejects local (+...) parts.
-[[ "${VERSION}" =~ ^[0-9]+(\.[0-9]+)*((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?$ ]] \
-    || die "version '${VERSION}' from ${SOURCE} is not a public PEP 440 version."
-echo "vllm-torchtpu ${VERSION} (from ${SOURCE}) at ${BUILDKITE_COMMIT}"
+VERSION="$(resolve_release_version)"
+echo "vllm-torchtpu ${VERSION} at ${BUILDKITE_COMMIT}"
 
 echo "--- :white_check_mark: vllm-torchtpu-ci on ${BUILDKITE_COMMIT:0:12}"
 if [[ "${RELEASE_SKIP_CI_GATE:-0}" == "1" ]]; then
@@ -54,18 +43,13 @@ fi
 
 echo "--- :package: PyPI"
 for project in vllm-torchtpu-core vllm-torchtpu; do
-    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 30 \
-        "https://pypi.org/pypi/${project}/${VERSION}/json")"
-    case "${code}" in
-        404) echo "${project} ${VERSION}: not on PyPI yet" ;;
-        200) die "${project} ${VERSION} is already on PyPI; a release can't replace it." ;;
-        *) die "PyPI answered ${code} for ${project} ${VERSION}." ;;
-    esac
+    check_not_published "${project}" "${VERSION}"
 done
 
 buildkite-agent meta-data set release-version "${VERSION}"
 PRE="no"
 is_prerelease "${VERSION}" && PRE="yes"
+buildkite-agent meta-data set release-prerelease "${PRE}"
 buildkite-agent annotate --style info --context release-plan <<EOF
 **vllm-torchtpu ${VERSION}** from \`${BUILDKITE_BRANCH}\` at \`${BUILDKITE_COMMIT:0:12}\` (pre-release: ${PRE})
 

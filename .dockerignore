@@ -45,11 +45,13 @@ docs/
 .buildkite/
 # ...except what the kube pods exec at runtime: the engine and benchmark
 # scripts, and parse_gke_results.py, which the benchmark calls to load its
-# results into BigQuery. The release tooling is kept for its unit tests in
-# tests/scripts, which load it from the image.
+# results into BigQuery. The release tooling and the lane files are kept for
+# their unit tests in tests/scripts, which load them from the image:
+# test_bootstrap.py runs bootstrap.sh, which uploads .buildkite/pipeline_*.yml.
 !.buildkite/kubernetes/
 !.buildkite/scripts/
 !.buildkite/release/
+!.buildkite/pipeline_*.yml
 .github/
 mkdocs.yml
 .readthedocs.yaml
