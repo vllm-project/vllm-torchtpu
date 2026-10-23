@@ -1,4 +1,17 @@
 #!/usr/bin/env bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 set -euo pipefail
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -84,7 +97,7 @@ VLLM_SRC="${VLLM_SRC:-/mnt/data/vllm}"
 TORCHTPU_VLLM_SRC="${TORCHTPU_VLLM_SRC:-${repo_root}}"
 MODEL_PATH="${MODEL_PATH:-Qwen/Qwen3.5-35B-A3B-FP8}"
 SERVED_MODEL_NAME="${SERVED_MODEL_NAME:-Qwen3.5-35B-A3B-FP8}"
-EXPECTED_VLLM_VERSION="${EXPECTED_VLLM_VERSION:-0.31.0}"
+EXPECTED_VLLM_VERSION="${EXPECTED_VLLM_VERSION:-0.32.0}"
 USE_CURRENT_PY_ENV="${USE_CURRENT_PY_ENV:-0}"
 
 SERVE_HOST="${P4D2_BIND_HOST:-127.0.0.1}"
@@ -107,6 +120,7 @@ DECODE_DP_MASTER_PORT="${DECODE_DP_MASTER_PORT:-29520}"
 
 PREFILL_TP="${PREFILL_TP:-4}"
 PREFILL_PCP="${PREFILL_PCP:-1}"
+PREFILL_PP="${PREFILL_PP:-1}"
 PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE="${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE:-1}"
 DECODE_TP="${DECODE_TP:-2}"
 DECODE_DP="${DECODE_DP:-1}"
@@ -114,7 +128,7 @@ DECODE_DP="${DECODE_DP:-1}"
 # One slicebuilder address per worker in each instance's TorchTPU slice.
 # The count must equal the instance's TorchTPU world size, or
 # _prepare_singlehost_tpu_env falls back to random ports.
-prefill_sb_workers=$((PREFILL_TP * PREFILL_PCP))
+prefill_sb_workers=$((PREFILL_PP * PREFILL_TP * PREFILL_PCP))
 decode_sb_workers=$((DECODE_TP * DECODE_DP))
 prefill_sb_addresses=""
 for ((i = 0; i < prefill_sb_workers; i++)); do
@@ -158,6 +172,8 @@ TPUMISC_HMA_CHECKSUM_TRACE="${TPUMISC_HMA_CHECKSUM_TRACE:-0}"
 USE_MOE_SPARSE_CORE="${USE_MOE_SPARSE_CORE:-0}"
 TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL="${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL:-1}"
 RESTART_EXISTING="${RESTART_EXISTING:-1}"
+# Prefill-only; decode keeps the default MoE path.
+PREFILL_MOE_FUSED_EP_KERNEL_IMPL="${PREFILL_MOE_FUSED_EP_KERNEL_IMPL:-}"
 
 mkdir -p "${RUN_DIR}/logs"
 if [[ "${USE_CURRENT_PY_ENV}" == "1" ]]; then
@@ -329,6 +345,7 @@ CONNECTOR=TPUMultiConnector
 CONNECTOR_MODULE=vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector
 PREFILL_TP=${PREFILL_TP}
 PREFILL_PCP=${PREFILL_PCP}
+PREFILL_PP=${PREFILL_PP}
 PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE=${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE}
 DECODE_TP=${DECODE_TP}
 DECODE_DP=${DECODE_DP}
@@ -361,6 +378,7 @@ PREFILL_CPU_BYTES_TO_USE=${PREFILL_CPU_BYTES_TO_USE}
 DECODE_CPU_BYTES_TO_USE=${DECODE_CPU_BYTES_TO_USE}
 TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL=${TPU_VLLM_ENABLE_UNIFIED_BLOCK_POOL}
 ATTENTION_BACKEND=${ATTENTION_BACKEND}
+PREFILL_MOE_FUSED_EP_KERNEL_IMPL=${PREFILL_MOE_FUSED_EP_KERNEL_IMPL}
 EOF
 
 printf '%q ' "${common_args[@]}" >"${RUN_DIR}/vllm_args.quoted"
@@ -395,7 +413,7 @@ export TPU_HMA_MAX_INFLIGHT_D2H_SENDS=1 TPU_HMA_MAX_INFLIGHT_PULLS=8;
 export TPU_MAX_HOST_KV_BUFFER_SIZE=64 TPU_P2P_WAIT_PULL_TIMEOUT=600;
 export TPU_KV_SHM_POOL_GB="${TPU_KV_SHM_POOL_GB}";
 export TPU_SIDE_CHANNEL_PORT="${TPU_SIDE_CHANNEL_PORT}";
-export ONEHOT_MOE_PERMUTE_THRESHOLD=1024;
+export ONEHOT_MOE_PERMUTE_THRESHOLD="${ONEHOT_MOE_PERMUTE_THRESHOLD:-1024}";
 export TPU_RAGGED_GATHER_REDUCE_IMPL=fallback TPU_RAGGED_GATHER_IMPL=fallback;
 export DP_SCHED_BATCH_PREFILL_MAX_ADMIT_PER_FLUSH=0;
 export TPU_RAIDEN_PLAN_DUMP_DIR=$(shell_quote "${plan_dump_dir}");
@@ -409,6 +427,9 @@ EOF
 )
 
 prefill_args=(--port "${PREFILL_PORT}" "${common_args[@]}" --compilation-config "${prefill_compilation_config}" --tensor-parallel-size "${PREFILL_TP}" --prefill-context-parallel-size "${PREFILL_PCP}" --kv-transfer-config "${p_kv}")
+if [[ "${PREFILL_PP}" -gt 1 ]]; then
+  prefill_args+=(--pipeline-parallel-size "${PREFILL_PP}")
+fi
 if [[ "${PREFILL_PCP}" -gt 1 ]]; then
   prefill_args+=(--cp-kv-cache-interleave-size "${PREFILL_CP_KV_CACHE_INTERLEAVE_SIZE}")
 fi
@@ -431,7 +452,11 @@ fi
 printf '%q ' "${prefill_args[@]}" >"${RUN_DIR}/prefill_vllm_args.quoted"
 printf '%q ' "${decode_args[@]}" >"${RUN_DIR}/decode_vllm_args.quoted"
 
-prefill_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; export TPU_RAIDEN_JOB_NAME=prefill; export TPU_RAIDEN_ENGINE_ID=prefill-engine; export TPU_RAIDEN_RESHARD_IMPL=store; export TPU_RAIDEN_ADVERTISE_HOST='${SERVE_HOST}'; export TPU_RAIDEN_RESHARD_PORT_BASE='${PREFILL_CTRL_PORT}'; export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE='$((PREFILL_CTRL_PORT + 100))'; export TPU_KV_TRANSFER_PORT=${PREFILL_TPU_KV_TRANSFER_PORT}; export TORCH_TPU_SLICEBUILDER_ADDRESSES='${prefill_sb_addresses}'; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
+prefill_moe_env=""
+if [[ -n "${PREFILL_MOE_FUSED_EP_KERNEL_IMPL}" ]]; then
+  prefill_moe_env="export MOE_FUSED_EP_KERNEL_IMPL=${PREFILL_MOE_FUSED_EP_KERNEL_IMPL}; "
+fi
+prefill_cmd="${common_env}"$'\n'"${prefill_moe_env}export DEBUG_TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${PREFILL_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${prefill_namespace}'; export TPU_RAIDEN_JOB_NAME=prefill; export TPU_RAIDEN_ENGINE_ID=prefill-engine; export TPU_RAIDEN_RESHARD_IMPL=store; export TPU_RAIDEN_ADVERTISE_HOST='${SERVE_HOST}'; export TPU_RAIDEN_RESHARD_PORT_BASE='${PREFILL_CTRL_PORT}'; export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE='$((PREFILL_CTRL_PORT + 100))'; export TPU_KV_TRANSFER_PORT=${PREFILL_TPU_KV_TRANSFER_PORT}; export TORCH_TPU_SLICEBUILDER_ADDRESSES='${prefill_sb_addresses}'; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${prefill_args[@]}")"
 decode_cmd="${common_env}"$'\n'"export DEBUG_TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_LOCAL_RANK_OFFSET='${DECODE_DEBUG_TPU_LOCAL_RANK_OFFSET}'; export TPU_KV_TRANSFER_NAMESPACE='${decode_namespace}'; export TPU_RAIDEN_JOB_NAME=decode; export TPU_RAIDEN_ENGINE_ID=decode-engine; export TPU_RAIDEN_RESHARD_IMPL=store; export TPU_RAIDEN_ADVERTISE_HOST='${SERVE_HOST}'; export TPU_RAIDEN_RESHARD_PORT_BASE='${DECODE_CTRL_PORT}'; export TPU_RAIDEN_STORE_DISPATCH_PORT_BASE='$((DECODE_CTRL_PORT + 100))'; export TPU_KV_TRANSFER_PORT=${DECODE_TPU_KV_TRANSFER_PORT}; export TORCH_TPU_SLICEBUILDER_ADDRESSES='${decode_sb_addresses}'; export TORCH_TPU_DP_MASTER_PORT='${DECODE_DP_MASTER_PORT}'; $(shell_quote "${python_bin}") -m vllm.entrypoints.openai.api_server $(printf '%q ' "${decode_args[@]}")"
 
 printf '%s\n' "${prefill_cmd}" >"${RUN_DIR}/prefill_cmd.sh"

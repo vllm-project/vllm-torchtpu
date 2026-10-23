@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """TPU platform plugin for vllm-omni."""
 
 import os
@@ -69,6 +81,10 @@ class OmniTpuPlatform(OmniPlatform, TpuPlatform):
     @classmethod
     def supports_diffusion_dense_flash_attention(cls) -> bool:
         return False
+
+    @classmethod
+    def get_profiler_cls(cls) -> str:
+        return "vllm_torchtpu.omni.profiler.TpuOmniTorchProfilerWrapper"
 
     @classmethod
     def supports_float64(cls) -> bool:

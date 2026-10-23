@@ -27,9 +27,9 @@
 # (infx/evals/EVALS.md). AGENTX_EVAL_JOB=0: the replay ladder, then the
 # config's AGENTX_POST_EVAL_SUITES (the Kimi tool-call schema suite) on the same
 # pair, InferenceX's post-eval of every K3 point. AGENTX_EVAL_JOB=1: no
-# replay, GSM8K at the top of the ladder, the eval-only job every agentic row
-# gets. Both evals run against the proxy on this pod, the loopback address
-# InferenceX's run_eval expects.
+# replay; the config's AGENTX_EVAL_JOB_SUITES (default gsm8k) at the top of
+# the ladder, the eval-only job every agentic row gets. Both evals run against
+# the proxy on this pod, the loopback address InferenceX's run_eval expects.
 #
 # The AGENTX_* knobs are passed only when set, so agentx_client.sh keeps one
 # default per value. A second default here is how build 245 ran against
@@ -43,7 +43,8 @@
 #   ARTIFACTS_DIR   where results go, uploaded as the step's artifacts
 #   AGENTX_CHIPS    physical TPU chips serving the pair; no default
 # The config states the cases and labels: AGENTX_CONC_LIST, AGENTX_MODEL_PREFIX,
-#   AGENTX_PRECISION, and optionally AGENTX_POST_EVAL_SUITES, AGENTX_PROXY,
+#   AGENTX_PRECISION, and optionally AGENTX_POST_EVAL_SUITES,
+#   AGENTX_EVAL_JOB_SUITES, AGENTX_PROXY,
 #   AGENTX_SPEC_METHOD (the row's speculation; default none),
 #   AGENTX_GSM8K_LIMIT (the probe's size when the env does not set it; 0
 #   skips it), AGENTX_ALLOW_SEQS_BELOW_CONC=1, and the decode topology when
@@ -98,6 +99,7 @@ _cfg=$(
     # shellcheck source=/dev/null
     source "$CONFIG_FILE" >/dev/null || exit 3
     _post=$(printf '%s' "${AGENTX_POST_EVAL_SUITES:-}" | tr -s ' ' ',')
+    _evaljob=$(printf '%s' "${AGENTX_EVAL_JOB_SUITES:-gsm8k}" | tr -s ' ' ',')
     printf '%s\n' \
         "MAX_NUM_SEQS=${MAX_NUM_SEQS:-0}" \
         "TP=${TENSOR_PARALLELISM:-0}" \
@@ -106,6 +108,7 @@ _cfg=$(
         "MODEL_PREFIX=${AGENTX_MODEL_PREFIX:-}" \
         "PRECISION=${AGENTX_PRECISION:-}" \
         "POST_EVAL_SUITES=${_post:--}" \
+        "EVAL_JOB_SUITES=${_evaljob}" \
         "PROXY=${AGENTX_PROXY:-toy}" \
         "CONC_LIST=${AGENTX_CONC_LIST:-}" \
         "SPEC_METHOD=${AGENTX_SPEC_METHOD:-none}" \
@@ -177,7 +180,7 @@ ix_export_topology "$CFG_TP" "$CFG_DP" "$EP" 1
 # The probe's size: the step's, else the config's, else agentx_client.sh's.
 GSM8K_LIMIT="${AGENTX_GSM8K_LIMIT:-$CFG_GSM8K_LIMIT}"
 # The replay's length and fast mode: the environment's, else the config's (the
-# Oct 13 recipe points ask for the doc's one-hour run).
+# Oct 13 and Oct 16 recipe points run for one hour).
 DURATION="${AGENTX_DURATION:-$CFG_DURATION}"
 FAST="${AGENTX_FAST:-$CFG_FAST}"
 
@@ -189,10 +192,12 @@ POST_EVAL_SUITES="$CFG_POST_EVAL_SUITES"
 # verifier's two-case suite.
 SMOKE="${AGENTX_EVAL_SMOKE:-0}"
 case "$SMOKE" in 0|1) ;; *) log "FATAL: AGENTX_EVAL_SMOKE must be 0 or 1, not '$SMOKE'"; exit 2 ;; esac
+EVAL_JOB_SUITES="$CFG_EVAL_JOB_SUITES"
 GSM8K_LIMIT_ARG=""
 if [ "$SMOKE" = 1 ]; then
     GSM8K_LIMIT_ARG=20
     POST_EVAL_SUITES="${POST_EVAL_SUITES//kimi_tool_call_schema_full/kimi_tool_call_schema}"
+    EVAL_JOB_SUITES="${EVAL_JOB_SUITES//kimi_tool_call_schema_full/kimi_tool_call_schema}"
 fi
 
 log "config=$CONFIG concs=${CONCS[*]} max_num_seqs=$CFG_MAX_NUM_SEQS chips=$CHIPS ranks=$RANKS spec=$CFG_SPEC_METHOD" \
@@ -282,11 +287,11 @@ fi
 if [ "$EVAL_ONLY" = 1 ]; then
     # At the top of the ladder: InferenceX evaluates a multi-node deployment at
     # its highest concurrency of 16 or more, else its highest.
-    log "running the AgentX GSM8K eval against the proxy"
+    log "running the AgentX evals ($EVAL_JOB_SUITES) against the proxy"
     bash "$IX_DIR/agentx_eval_client.sh" \
         --server-url "http://127.0.0.1:$PROXY_PORT" \
         --engine-url "http://${DECODE_HOST}:${PORT}" \
-        --suites gsm8k \
+        --suites "$EVAL_JOB_SUITES" \
         --eval-conc "$MAX_CONC" \
         --chips "$CHIPS" \
         --results-dir "$RESULTS_DIR" \

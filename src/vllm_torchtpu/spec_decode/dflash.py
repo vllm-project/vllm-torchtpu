@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 from __future__ import annotations
 
 import contextlib
@@ -261,11 +273,44 @@ class DFlashProposer:
                 model_config=draft_model_config,
             )
 
+    def _max_chunk_reqs(self) -> int:
+        """Most requests one draft chunk holds.
+
+        A most-model-len chunk holds up to num_reqs_most_model_len requests
+        (> num_reqs_max_model_len), and the EP-DP lockstep bucket is sized
+        from the DP-wide max of the same per-chunk counts.
+        """
+        runner = self.runner
+        return max(runner.num_reqs_max_model_len, runner.num_reqs_most_model_len or 0)
+
+    def _draft_token_paddings(self) -> list[int]:
+        """Draft-forward buckets: the runner's token buckets, doubled past
+        the largest until a full chunk of `block_size` blocks fits.
+
+        The target's buckets stop at max_num_batched_tokens, but the draft
+        forward is num_reqs * block_size tokens: the scheduler does not
+        charge drafting slots for these methods
+        (vllm_torchtpu._patch_dflash_drafting_slot_budget), so a request
+        scheduled fewer than block_size tokens still drafts a full block,
+        and a step's draft can outgrow the largest target bucket.
+        """
+        paddings = list(self.runner.num_tokens_paddings)
+        max_draft_tokens = self._max_chunk_reqs() * self.block_size
+        while paddings[-1] < max_draft_tokens:
+            paddings.append(min(paddings[-1] * 2, max_draft_tokens))
+        return paddings
+
     def _get_padded_len(self, target_len: int) -> int:
-        for p in self.runner.num_tokens_paddings:
+        paddings = self._draft_token_paddings()
+        for p in paddings:
             if p >= target_len:
                 return p
-        return target_len
+        # A chunk never holds more than _max_chunk_reqs requests; an
+        # unpadded length would compile a new draft program mid-serving.
+        raise RuntimeError(
+            f"DFlash draft forward of {target_len} tokens exceeds the largest "
+            f"draft bucket {paddings[-1]}"
+        )
 
     def _build_attn_metadata_for_draft(
         self,
@@ -642,34 +687,32 @@ class DFlashProposer:
 
         runner = self.runner
         block_size = self.block_size
-        # A most-model-len chunk holds up to num_reqs_most_model_len
-        # requests (> num_reqs_max_model_len), and under EP-DP lockstep the
-        # coordinated bucket is sized from the DP-wide max chunk request
-        # count — so warm draft forwards up to the larger bound, or the
-        # first such step compiles XLA mid-serving.
-        max_chunk_reqs = max(
-            runner.num_reqs_max_model_len, runner.num_reqs_most_model_len or 0
-        )
-        max_draft_tokens = self._get_padded_len(max_chunk_reqs * block_size)
+        # Warm draft forwards up to a full chunk (see _max_chunk_reqs), or
+        # the first such step compiles XLA mid-serving.
+        max_draft_tokens = self._get_padded_len(self._max_chunk_reqs() * block_size)
+        target_buckets = set(runner.num_tokens_paddings)
 
         with runner._precompile_timed("drafter first pass"):
-            for num_tokens in runner.num_tokens_paddings:
-                # Precompile KV Cache Update Graph (used in both prefill and decode)
-                self._dummy_precompute_and_update_kv_cache(
-                    num_tokens=num_tokens,
-                    num_reqs=runner.num_reqs_max_model_len,
-                    num_blocks=runner.max_num_blocks_per_req,
-                    sync=True,
-                )
-                if runner.most_model_len is not None:
-                    assert runner.num_reqs_most_model_len is not None
-                    assert runner.num_blocks_per_most_len_req is not None
+            for num_tokens in self._draft_token_paddings():
+                # Precompile KV Cache Update Graph (used in both prefill and
+                # decode). It runs at the target's bucket, so the draft-only
+                # buckets past the largest target bucket skip it.
+                if num_tokens in target_buckets:
                     self._dummy_precompute_and_update_kv_cache(
                         num_tokens=num_tokens,
-                        num_reqs=runner.num_reqs_most_model_len,
-                        num_blocks=runner.num_blocks_per_most_len_req,
+                        num_reqs=runner.num_reqs_max_model_len,
+                        num_blocks=runner.max_num_blocks_per_req,
                         sync=True,
                     )
+                    if runner.most_model_len is not None:
+                        assert runner.num_reqs_most_model_len is not None
+                        assert runner.num_blocks_per_most_len_req is not None
+                        self._dummy_precompute_and_update_kv_cache(
+                            num_tokens=num_tokens,
+                            num_reqs=runner.num_reqs_most_model_len,
+                            num_blocks=runner.num_blocks_per_most_len_req,
+                            sync=True,
+                        )
 
                 # Context-KV updates allow short chunks;
                 # draft forward needs a full block.

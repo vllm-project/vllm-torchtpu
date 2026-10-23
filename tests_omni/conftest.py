@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Shared pytest configuration for the Omni tests.
 
 tests_omni/ holds tests that need the real vllm-omni package, which only the
@@ -20,18 +32,6 @@ os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
 os.environ.setdefault("VLLM_NO_USAGE_STATS", "1")
 os.environ.setdefault("VLLM_DO_NOT_TRACK", "1")
 
-from typing import NamedTuple
-
-import vllm.v1.outputs
-
-if not hasattr(vllm.v1.outputs, "RoutedExpertsLists"):
-
-    class RoutedExpertsLists(NamedTuple):
-        pass
-
-    vllm.v1.outputs.RoutedExpertsLists = RoutedExpertsLists  # type: ignore[attr-defined]
-# isort: split
-
 import contextlib
 import copy
 import gc
@@ -42,6 +42,7 @@ from typing import Any
 
 import psutil
 import pytest
+import torch
 
 from tests.tpu_release import wait_for_tpu_release
 
@@ -202,6 +203,17 @@ def omni_runner(
 ) -> Generator[OmniRunner, None, None]:
     """Function-scoped :class:`OmniRunner` that spins up each model as needed."""
     yield _omni_runner_manager.get_or_create(request.param)
+
+
+@pytest.fixture(autouse=True)
+def _sync_tpu(request: pytest.FixtureRequest) -> Generator[None, None, None]:
+    """Flush deferred torch_tpu ops between in-process TPU tests."""
+    if request.node.get_closest_marker("spawns_tpu_workers"):
+        yield
+        return
+    torch.accelerator.synchronize()
+    yield
+    torch.accelerator.synchronize()
 
 
 def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:

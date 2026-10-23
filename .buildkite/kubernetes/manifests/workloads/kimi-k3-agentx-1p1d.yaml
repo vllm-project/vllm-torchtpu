@@ -158,6 +158,9 @@ spec:
                     - name: k3-dspark
                       mountPath: /cache/hf/hub/models--RedHatAI--Kimi-K3-speculator.dspark
                       readOnly: true
+                    - name: k3-dspark-mla
+                      mountPath: /cache/hf/hub/models--Inferact--Kimi-K3-DSpark
+                      readOnly: true
               volumes:
                 - name: vllm-profile-cache
                   emptyDir:
@@ -178,8 +181,9 @@ spec:
                 # What the megakernel configs read from the model bucket the
                 # fleet mounts at /cache/hf/hub (us-central1's, the only cluster
                 # with 2x2x4 pools), each mounted on its own: the TP32 pre-shard,
-                # with the DSpark kernel shards, and the DSpark speculator, of
-                # which they read only the config. Their own mounts because
+                # with the DSpark kernel shards, and the two drafts' snapshots
+                # (RedHatAI's speculator and Inferact's MLA draft), of which
+                # they read only the config. Their own mounts because
                 # without the fleet's caches nothing else puts them at those
                 # paths, and with them the pre-shard would fill the fleet
                 # mount's file cache. With no fileCacheCapacity these have no
@@ -200,6 +204,14 @@ spec:
                     volumeAttributes:
                       bucketName: tpu-ci-models-60b4c3c7
                       mountOptions: "implicit-dirs,only-dir=models--RedHatAI--Kimi-K3-speculator.dspark"
+                      skipCSIBucketAccessCheck: "true"
+                - name: k3-dspark-mla
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    readOnly: true
+                    volumeAttributes:
+                      bucketName: tpu-ci-models-60b4c3c7
+                      mountOptions: "implicit-dirs,only-dir=models--Inferact--Kimi-K3-DSpark"
                       skipCSIBucketAccessCheck: "true"
 
     - name: decode
@@ -286,6 +298,9 @@ spec:
                     - name: k3-dspark
                       mountPath: /cache/hf/hub/models--RedHatAI--Kimi-K3-speculator.dspark
                       readOnly: true
+                    - name: k3-dspark-mla
+                      mountPath: /cache/hf/hub/models--Inferact--Kimi-K3-DSpark
+                      readOnly: true
               volumes:
                 - name: vllm-profile-cache
                   emptyDir:
@@ -319,6 +334,14 @@ spec:
                     volumeAttributes:
                       bucketName: tpu-ci-models-60b4c3c7
                       mountOptions: "implicit-dirs,only-dir=models--RedHatAI--Kimi-K3-speculator.dspark"
+                      skipCSIBucketAccessCheck: "true"
+                - name: k3-dspark-mla
+                  csi:
+                    driver: gcsfuse.csi.storage.gke.io
+                    readOnly: true
+                    volumeAttributes:
+                      bucketName: tpu-ci-models-60b4c3c7
+                      mountOptions: "implicit-dirs,only-dir=models--Inferact--Kimi-K3-DSpark"
                       skipCSIBucketAccessCheck: "true"
 
     # Chipless, so it is scheduled by its requests onto a worker-cpu node rather

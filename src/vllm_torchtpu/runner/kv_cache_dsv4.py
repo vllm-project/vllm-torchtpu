@@ -1,5 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """DeepSeek-V4 KV-cache allocation: layer classification and cache arrays.
 
 Moved verbatim out of `TPUModelRunner`; see vllm-project/vllm-torchtpu#713.
@@ -20,6 +31,9 @@ from vllm.v1.kv_cache_interface import (
 )
 
 from vllm_torchtpu.kernels.deepseek_v4 import csa_cache_layout
+from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
+    config as compressor_config,
+)
 from vllm_torchtpu.layers.adapter.attention import PallasAttentionBackend
 from vllm_torchtpu.layers.core.attention_metadata import attention_block_table_width
 from vllm_torchtpu.logger import init_logger
@@ -189,9 +203,17 @@ class DsV4KVCacheAllocator:
             spec = per_layer_spec(layer_name)
             page_size = spec.num_states
             if layer_name.endswith(self._DS_V4_INDEXER_CACHE_SUFFIX):
-                # Lightning indexer: 128 fp8 values + 1 e8m0 scale per token,
-                # padded to a 256B record; 4 tokens per row.
-                shape = (num_blocks, page_size // packing, packing, 256)
+                # SEQ_ALONG_LANE: token t is lane t of 32 fp8 groups + 1
+                # e8m0 scale group (132B/token of key traffic); the
+                # compressor state still addresses the page as
+                # (33, 4, 256) rows, hence exactly 256 tokens per page.
+                compressor_config.check_seq_along_lane_page_size(page_size)
+                shape = (
+                    num_blocks,
+                    compressor_config.SAL_SUBLANE_GROUPS,
+                    packing,
+                    page_size,
+                )
                 kv_caches[layer_name] = _create_cache(shape, layer_name)
             elif spec.tokens_per_state == self._DS_V4_CSA_COMPRESS_RATIO:
                 # CSA is split across two arrays, for NoPE and RoPE.

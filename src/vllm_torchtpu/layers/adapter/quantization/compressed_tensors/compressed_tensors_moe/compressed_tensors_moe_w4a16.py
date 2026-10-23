@@ -84,23 +84,51 @@ class VllmCompressedTensorsW4A16MoEMethod(CompressedTensorsWNA16MoEMethod):
         # pyrefly: ignore[bad-assignment]
         self.packed_factor = 32 // self.num_bits
         self.strategy = getattr(weight_quant, "strategy", "group")
+        self.symmetric = bool(getattr(weight_quant, "symmetric", True))
+        self.actorder = getattr(weight_quant, "actorder", None)
         group_size = getattr(weight_quant, "group_size", None)
         self.group_size = -1 if group_size is None else int(group_size)
         self.is_transposed = True
+
+        # State the skipped upstream __init__ would have produced by selecting
+        # a GPU/CPU WNA16 backend. The TPU path runs its own GMM kernel and has
+        # no upstream backend, but several inherited members
+        # (get_fused_moe_quant_config, supports_eplb, _setup_kernel,
+        # process_weights_after_loading, ...) read these unconditionally.
+        # Leaving them unset surfaces as
+        #   AttributeError: ... has no attribute 'wna16_backend'
+        # as soon as vLLM calls any inherited hook we do not override (seen
+        # with Kimi-K2.x on vLLM 0.29, whose MoERunner calls
+        # get_fused_moe_quant_config on the first forward).
+        # vLLM types wna16_backend and experts_cls as non-optional because the
+        # upstream __init__ always picks a GPU/CPU backend; TPU uses neither.
+        # pyrefly: ignore[bad-assignment]
+        self.wna16_backend = None
+        # pyrefly: ignore[bad-assignment]
+        self.experts_cls = None
+        self.is_marlin = False
+        self.input_dtype = torch.bfloat16
+        self.moe_kernel = None
 
     @property
     def is_monolithic(self) -> bool:
         return True
 
-    # The inherited version reads self.wna16_backend, which only the upstream
-    # __init__ skipped above sets. RoutedExperts.__init__ asks when EPLB is
-    # enabled, outside VllmMoERunner's reach, and the TPU path has no upstream
-    # MoE backend that could rebalance experts. The inherited
-    # get_fused_moe_quant_config reads it too, but VllmMoERunner never calls
-    # that hook on a monolithic method.
+    # The TPU path has no upstream MoE backend that could rebalance experts.
+    # RoutedExperts.__init__ asks this when EPLB is enabled.
     @property
     def supports_eplb(self) -> bool:
         return False
+
+    def get_fused_moe_quant_config(self, layer: torch.nn.Module):
+        # vLLM 0.29's MoERunner._forward_impl calls
+        # RoutedExperts._ensure_moe_quant_config_init -> this hook on the first
+        # forward. The inherited version keys on self.wna16_backend to pick a
+        # Humming vs. WNA16 config for an upstream modular kernel. The
+        # monolithic TPU path consumes no FusedMoEQuantConfig (apply_monolithic
+        # passes the packed weights and scales straight to fused_moe_gmm), so
+        # mirror the other TPU MoE methods (fp8, nvfp4) and report none.
+        return None
 
     @property
     def supports_internal_mk(self) -> bool:

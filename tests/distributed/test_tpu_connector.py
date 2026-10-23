@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2025 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """
 Unit tests for TPUConnector, TPUConnectorScheduler, and TPUConnectorWorker.
 
@@ -396,7 +408,10 @@ class TestTPUConnector:
             ("kv_consumer", "raiden", True, False, "direct", False),
             ("kv_consumer", "zmq", True, True, "direct", False),
             ("kv_consumer", "raiden", True, True, "multi", True),
-            ("kv_consumer", "raiden", True, True, "offloading", False),
+            ("kv_consumer", "raiden", True, True, "offloading", True),
+            ("kv_consumer", "raiden", False, True, "offloading", False),
+            ("kv_consumer", "raiden", True, False, "offloading", False),
+            ("kv_producer", "raiden", True, True, "offloading", False),
         ],
     )
     def test_upstream_prefix_lookup_uses_connector_capability(
@@ -456,6 +471,27 @@ class TestTPUConnector:
             else (("common",), 3072, 6144, False)
         )
         assert result == expected
+
+    @pytest.mark.parametrize(
+        ("prefix_aware", "suffix_supported", "expected"),
+        [(True, True, True), (False, True, False), (True, False, False)],
+    )
+    def test_offloading_connector_capability_follows_prefix_aware_flag(
+        self, prefix_aware, suffix_supported, expected, monkeypatch
+    ):
+        # Standalone offload must keep the common-boundary lookup unless the
+        # Stage-3 suffix loads it is composed with are on.
+        from vllm_torchtpu.distributed.kv_transfer import tpu_connector
+        from vllm_torchtpu.offload.raiden_connector import TPURaidenOffloadingConnector
+
+        monkeypatch.setenv("TPU_RAIDEN_PREFIX_AWARE_LOAD", "1" if prefix_aware else "0")
+        monkeypatch.setattr(
+            tpu_connector, "_prefix_aware_load_supported", lambda: suffix_supported
+        )
+        # Capability lookup needs no store or worker resources.
+        connector = object.__new__(TPURaidenOffloadingConnector)
+
+        assert connector.supports_divergent_local_hybrid_hits is expected
 
     @patch(f"{_MOD}.TPUConnectorWorker")
     @patch(f"{_MOD}.TPUConnectorScheduler")
@@ -2811,6 +2847,25 @@ class TestTPURaidenConnectorWorker:
             assert worker._stage3_inflight_submits == set()
             assert worker._stage3_controller_accepted == {"dst"}
 
+    @pytest.mark.parametrize(
+        "pcp,dcp,block_size,max_model_len,expected",
+        [
+            (8, 1, 768, 262144, 43),
+            (8, 1, 768, 6144, 1),
+            (8, 1, 768, 6145, 2),
+            (1, 4, 16, 127, 2),
+            (1, 1, 2304, 262144, 114),
+            (1, 1, 768, 262144, 342),
+        ],
+    )
+    def test_raiden_request_capacity_uses_context_parallel_pages(
+        self, pcp, dcp, block_size, max_model_len, expected
+    ):
+        worker = _make_raiden_worker(pcp_size=pcp, block_size=block_size)
+        worker.vllm_config.parallel_config.decode_context_parallel_size = dcp
+        worker.vllm_config.model_config.max_model_len = max_model_len
+        assert worker._max_request_blocks() == expected
+
     def test_raiden_staging_hints_cover_every_block_table_on_a_storage(self):
         worker = _make_raiden_worker(tp_rank=0, tp_size=1, is_producer=True)
         fa_pages = worker._max_request_blocks()
@@ -3026,7 +3081,7 @@ class TestTPURaidenConnectorWorker:
             kv_caches=[storage],
             node_id=3,
             local_control_port=9106,
-            max_blocks=4,
+            max_blocks=1,
             num_slots=1,
             timeout_s=12.0,
             listener_port=0,
@@ -6175,6 +6230,112 @@ def test_glm_admission_topology_rejects_unsupported_shapes(
 
 
 # ---------------------------------------------------------------------------
+# GLM-5.2 DCP producer -> DCP decode: each rank ships its own pages whole.
+# ---------------------------------------------------------------------------
+
+
+def _glm_dcp_config(cfg, *, dst_interleave=4):
+    cfg.parallel_config.decode_context_parallel_size = 16
+    cfg.parallel_config.cp_kv_cache_interleave_size = 4
+    cfg.kv_transfer_config.kv_connector_extra_config = {
+        "destination_decode_context_parallel_size": 16,
+        "destination_cp_kv_cache_interleave_size": dst_interleave,
+    }
+
+
+def _glm_dcp_worker(*, dst_interleave=4):
+    worker = _make_raiden_worker(tp_rank=3, tp_size=16, block_size=256)
+    _glm_dcp_config(worker.vllm_config, dst_interleave=dst_interleave)
+    return worker
+
+
+def test_glm_admission_topology_admits_dcp_producer_of_same_geometry():
+    with (
+        patch(f"{_MOD}._raiden_dst_shards", return_value=16),
+        patch("vllm_torchtpu.distributed.dcp.get_dcp_rank", return_value=3),
+    ):
+        topology = _glm_dcp_worker()._raiden_glm_admission_topology()
+        with pytest.raises(ValueError, match="TP size and interleave to equal"):
+            _glm_dcp_worker(dst_interleave=256)._raiden_glm_admission_topology()
+
+    assert topology == "tp16dcp16_prefill"
+
+
+def test_glm_dcp_producer_publishes_whole_scheduler_blocks():
+    producer = _make_raiden_scheduler(is_producer=True, block_size=256, tp_size=16)
+    _glm_dcp_config(producer.vllm_config)
+    req = SimpleNamespace(
+        request_id="dcp",
+        num_prompt_tokens=10_000,
+        num_computed_tokens=10_000,
+        status=RequestStatus.FINISHED_LENGTH_CAPPED,
+        kv_transfer_params=None,
+    )
+    with (
+        patch(f"{_MOD}._use_raiden_stage3_transport", return_value=True),
+        patch(f"{_MOD}._use_raiden_glm_admission", return_value=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_CONTROLLER_ADDRESS", "p:27000"),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_ENGINE_ID", "producer"),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 16),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_MAX_TRANSFER_TOKENS", None),
+        patch(f"{_MOD}._raiden_dst_shards", return_value=16),
+    ):
+        # 9999 transfer tokens over 256-token pages at DCP16: three 4096-token
+        # scheduler blocks.
+        delay, params = producer.request_finished(req, [100, 101, 102])
+
+    assert delay
+    assert params["num_tokens"] == 9999
+    assert producer.reqs_to_send["dcp"].local_block_ids == [100, 101, 102]
+
+
+# The producer's own DCP size fixes its pages; the destination's, equal by
+# admission (bypassed at 8), does not.
+@pytest.mark.parametrize("dst_dcp", [16, 8])
+def test_glm_dcp_producer_registers_its_pages_whole_to_its_dcp_rank(dst_dcp):
+    worker = _glm_dcp_worker()
+    extra = worker.vllm_config.kv_transfer_config.kv_connector_extra_config
+    extra["destination_decode_context_parallel_size"] = dst_dcp
+    geometry = {
+        "mla.nope": (256 * 512, 512),
+        "mla.rope": (64 * 512, 512),
+        "dsa.idx": (64 * 1024, 1024),
+    }
+    worker._stage3_row_geometry = geometry
+    facade = _FakeRaidenControllerFacade()
+    worker._raiden_controller_facade = facade
+    worker._raiden_controller_address = "localhost:27000"
+    worker._raiden_work_unit = SimpleNamespace(job_name="prefill", rank=3)
+    meta = TPUConnectorMetadata()
+    meta.reqs_to_send["request"] = SimpleNamespace(
+        uuid=123, local_block_ids=[40, 7, 19], num_tokens=9999, expiration_time=1e20
+    )
+
+    with (
+        patch(f"{_MOD}._use_raiden_glm_admission", return_value=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 16),
+        patch(f"{_MOD}._raiden_dst_shards", return_value=16),
+    ):
+        worker._register_stage3_request_row_spans(meta)
+
+    (call,) = facade.register_request_blocks_calls
+    assert call["block_ids"] == [40, 7, 19]
+    assert [registration.tag for registration in call["pool_spans"]] == list(geometry)
+    for registration in call["pool_spans"]:
+        live = geometry[registration.tag][0]
+        assert [
+            (
+                span.src_block_ordinal,
+                span.src_offset_bytes,
+                span.dst_offset_bytes,
+                span.size_bytes,
+                span.dst_unit_ordinal,
+            )
+            for span in registration.spans
+        ] == [(page, 0, page * live, live, 3) for page in range(3)]
+
+
+# ---------------------------------------------------------------------------
 # DeepSeek-V4 worker plan and per-group span registration
 # ---------------------------------------------------------------------------
 
@@ -6205,11 +6366,11 @@ def test_dsv4_pool_plan_binds_each_tag_to_its_groups_page_geometry():
     ] == [
         ("dsv4.csa.nope.g0", 0, 1024, 131072, 512),
         ("dsv4.csa.rope.g0", 0, 1024, 32768, 512),
-        ("dsv4.idx.g1", 1, 1024, 65536, 1024),
+        ("dsv4.idx.g1", 1, 1024, 33792, 1024),
         ("dsv4.hca.g2", 2, 256, 262144, 512),
         ("dsv4.swa.g3", 3, 128, 131072, 512),
         ("dsv4.state.csa.g4", 4, 1024, 131072, 512),
-        ("dsv4.state.idx.g5", 5, 1024, 65536, 1024),
+        ("dsv4.state.idx.g5", 5, 1024, 33792, 1024),
         ("dsv4.state.hca.g6", 6, 256, 131072, 512),
     ]
     # Trim geometry lives on the groups instead, one entry per block table the
@@ -6692,6 +6853,88 @@ def test_maybe_host_reshard_store_passes_registry_ttl_from_lease():
         "data_name": "reshard_store",
         "data_replica_idx": 0,
     }
+
+
+def test_store_mode_peer_rank_waits_past_30s_for_dispatch_controller_ready():
+    """Peer ranks constructing the Raiden transfer engine in store mode must
+    tolerate >30s initialization skew while rank-0 brings up ReshardStore."""
+    worker = _make_raiden_worker(
+        tp_rank=0, tp_size=1, is_producer=True, dp_size=1, pcp_size=8
+    )
+    worker._local_raiden_transfer_rank = MagicMock(return_value=3)
+    engine = _FakeAdmissionRaidenEngine()
+    worker._new_raiden_manager = MagicMock(return_value=engine)
+    storage = object()
+
+    now = [1_700_000_000.0]
+    ready_at = now[0] + 45.0
+    dialed_addresses: list[tuple[str, int]] = []
+
+    def fake_create_connection(address: tuple[str, int], timeout: float = 0.5):
+        dialed_addresses.append(address)
+        if now[0] < ready_at:
+            raise ConnectionRefusedError("rank-0 dispatch controller not ready")
+        return MagicMock()
+
+    with (
+        patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 8, create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_RESHARD_IMPL", "store", create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_ADVERTISE_HOST", "10.0.0.1", create=True),
+        patch(
+            f"{_MOD}.tpu_envs.TPU_RAIDEN_STORE_DISPATCH_PORT_BASE", 27100, create=True
+        ),
+        patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=12.0),
+        patch(f"{_MOD}.time.time", side_effect=lambda: now[0]),
+        patch(
+            f"{_MOD}.time.sleep",
+            side_effect=lambda _dt: now.__setitem__(0, now[0] + 15.0),
+        ),
+        patch("socket.create_connection", side_effect=fake_create_connection),
+    ):
+        result = worker._construct_raiden_transfer_engine([storage], num_slots=1)
+
+    assert result is engine
+    assert len(dialed_addresses) == 4
+    assert set(dialed_addresses) == {("10.0.0.1", 27100)}
+    worker._new_raiden_manager.assert_called_once_with(
+        kv_caches=[storage],
+        node_id=3,
+        local_control_port=9106,
+        max_blocks=worker._max_request_blocks(),
+        num_slots=1,
+        timeout_s=12.0,
+        listener_port=0,
+        parallelism=8,
+        raiden_worker_port=0,
+        raiden_controller_address="10.0.0.1:27100",
+        worker_id="worker_3",
+    )
+
+    # Exceeding the 300s deadline still raises TimeoutError.
+    now[0] = 1_700_000_000.0
+    ready_at = now[0] + 305.0
+    with (
+        patch(f"{_MOD}.tpu_envs.TPU_KV_RESHARD_TRANSPORT", "raiden", create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_TRANSFER_PARALLELISM", 8, create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_RESHARD_IMPL", "store", create=True),
+        patch(f"{_MOD}.tpu_envs.TPU_RAIDEN_ADVERTISE_HOST", "10.0.0.1", create=True),
+        patch(
+            f"{_MOD}.tpu_envs.TPU_RAIDEN_STORE_DISPATCH_PORT_BASE", 27100, create=True
+        ),
+        patch(f"{_MOD}.dist_utils.get_p2p_wait_pull_timeout", return_value=12.0),
+        patch(f"{_MOD}.time.time", side_effect=lambda: now[0]),
+        patch(
+            f"{_MOD}.time.sleep",
+            side_effect=lambda _dt: now.__setitem__(0, now[0] + 60.0),
+        ),
+        patch("socket.create_connection", side_effect=fake_create_connection),
+        pytest.raises(
+            TimeoutError,
+            match="Timed out waiting for address 10.0.0.1:27100 to be ready",
+        ),
+    ):
+        worker._construct_raiden_transfer_engine([storage], num_slots=1)
 
 
 # ---------------------------------------------------------------------------

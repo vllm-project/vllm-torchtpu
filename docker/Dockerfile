@@ -68,22 +68,12 @@ RUN if [ -n "$VLLM_COMMIT_HASH" ]; then \
 ENV CXX=g++
 ENV CC=gcc
 ENV VLLM_TARGET_DEVICE=empty
+ENV UV_TORCH_BACKEND=cpu
 
-# Install all dependencies from pyproject.toml. We mount the gcloud token secret
-# to authenticate with the private torch-tpu registry, falling back to PyPI for other packages.
+# Install all dependencies from pyproject.toml.
 # vLLM comes from the `vllm` dependency group (see pyproject.toml).
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=type=secret,id=gcloud_token \
-    set -eu; \
-    TOKEN=""; \
-    if [ -f /run/secrets/gcloud_token ]; then TOKEN="$(cat /run/secrets/gcloud_token)"; fi; \
-    if [ -z "${TOKEN}" ]; then echo "Missing BuildKit secret gcloud_token for registry mode" >&2; exit 1; fi; \
-    export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken; \
-    export UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD="${TOKEN}"; \
     uv pip install --system \
-      --index https://us-python.pkg.dev/ml-oss-artifacts-published/torch-tpu-release-virtual-registry/simple/ \
-      --extra-index-url https://pypi.org/simple \
-      --index-strategy unsafe-best-match \
       -r pyproject.toml \
       --group vllm
 
@@ -184,12 +174,14 @@ FROM dev AS omni
 RUN apt-get update && apt-get install -y --no-install-recommends libgl1 libglib2.0-0 && rm -rf /var/lib/apt/lists/*
 
 # --group vllm keeps vLLM's source pin in this resolution, so vllm-omni cannot
-# replace it with a PyPI vllm.
+# replace it with a PyPI vllm. --group omni-git supplies the omni extra's
+# vllm-omni from its git tag until the release is on PyPI (see pyproject.toml).
 RUN --mount=type=cache,target=/root/.cache/uv \
     uv pip install --system \
       -r pyproject.toml \
       --group vllm \
-      --extra omni
+      --extra omni \
+      --group omni-git
 
 
 # Variant 5: Production/Full Image (Production/Minimal Variant)

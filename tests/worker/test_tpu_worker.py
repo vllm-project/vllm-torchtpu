@@ -361,18 +361,22 @@ def test_kv_connector_handshake_metadata_uses_pp_tp_rank_key(
     assert worker.get_kv_connector_handshake_metadata() == {(2, 3): metadata}
 
 
-def test_model_load_stage_precedes_runner(monkeypatch):
+def test_load_model_patches_loads_then_releases_free_host_heap(monkeypatch):
     events = []
     config = object()
     monkeypatch.setattr(
         patch_registry, "apply", lambda stage, **kwargs: events.append((stage, kwargs))
+    )
+    monkeypatch.setattr(
+        "vllm_torchtpu.worker.tpu_worker._release_free_host_heap",
+        lambda: events.append("release"),
     )
     worker = SimpleNamespace(
         model_config=config,
         model_runner=SimpleNamespace(load_model=lambda: events.append("load")),
     )
     TPUWorker.load_model(worker)
-    assert events == [("model_load", {"model_config": config}), "load"]
+    assert events == [("model_load", {"model_config": config}), "load", "release"]
 
 
 @pytest.mark.parametrize("managed_by_vllm, runtime_threads", [(True, 1), (False, 2)])
@@ -505,6 +509,37 @@ def _worker_entry(connection):
             rank=0,
             distributed_init_method="tcp://127.0.0.1:29500",
         )
+
+
+def test_release_free_host_heap_prefers_tcmalloc(monkeypatch):
+    from vllm_torchtpu.worker import tpu_worker
+
+    calls = []
+
+    class FakeProcess:
+        def MallocExtension_ReleaseFreeMemory(self):  # noqa: N802
+            calls.append("tcmalloc")
+
+        def malloc_trim(self, pad):
+            calls.append("glibc")
+
+    monkeypatch.setattr(tpu_worker.ctypes, "CDLL", lambda name: FakeProcess())
+    tpu_worker._release_free_host_heap()
+    assert calls == ["tcmalloc"]
+
+
+def test_release_free_host_heap_falls_back_to_malloc_trim(monkeypatch):
+    from vllm_torchtpu.worker import tpu_worker
+
+    calls = []
+
+    class FakeProcess:
+        def malloc_trim(self, pad):
+            calls.append(pad)
+
+    monkeypatch.setattr(tpu_worker.ctypes, "CDLL", lambda name: FakeProcess())
+    tpu_worker._release_free_host_heap()
+    assert calls == [0]
 
 
 if __name__ == "__mp_main__":

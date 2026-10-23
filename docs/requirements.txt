@@ -1,9 +1,21 @@
-mkdocs>=1.6.1
-mkdocs-material>=9.5.0
-mkdocs-same-dir>=0.1.5
-mkdocs-glightbox>=0.4.0
-mkdocs-open-in-new-tab>=1.0.8
-mkdocs-table-reader-plugin>=3.1.0
-markdown-callouts>=0.4.0
-python-markdown-math>=0.9
-pyyaml-env-tag>=1.0
+# Documentation build dependencies (Read the Docs and local `mkdocs build`).
+#
+# Pinned on purpose. Read the Docs resolves this file fresh on every build, so
+# unpinned ranges mean a release upstream can silently change the published
+# site. These are the versions verified with `mkdocs build --strict`.
+# Bump deliberately and re-check the rendered site, in particular the
+# landing-page banner image.
+mkdocs==1.6.1
+mkdocs-material==9.7.7
+mkdocs-same-dir==0.1.5
+mkdocs-glightbox==0.5.2
+mkdocs-open-in-new-tab==1.0.8
+mkdocs-table-reader-plugin==4.0.2
+markdown-callouts==0.4.0
+python-markdown-math==0.9
+pyyaml-env-tag==1.1
+# selectolax is the HTML parser mkdocs-glightbox uses to wrap <img> tags.
+# 1.0.1 (2026-10-17) changed fragment handling so that glightbox 0.5.2 drops
+# the images it rewrites, which removed the banner from the docs home page.
+# Keep below 1.0.1 until glightbox ships a release that works with it.
+selectolax==1.0.0

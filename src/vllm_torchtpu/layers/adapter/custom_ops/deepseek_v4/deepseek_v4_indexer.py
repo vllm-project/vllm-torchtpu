@@ -13,7 +13,7 @@
 # limitations under the License.
 
 import functools
-from typing import TYPE_CHECKING, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import jax
 import jax.numpy as jnp
@@ -21,15 +21,22 @@ import torch
 import torch.nn as nn
 from jax.sharding import PartitionSpec as P
 from torch_tpu._internal import pallas
-from vllm.config import VllmConfig
+from vllm.config import VllmConfig, get_current_vllm_config
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4 import attention as dsv4_attention
 from vllm.models.deepseek_v4.attention import DeepseekV4Indexer, DeepseekV4IndexerCache
 from vllm.v1.kv_cache_interface import KVCacheSpec, MLAAttentionSpec
 
 from vllm_torchtpu import envs
+from vllm_torchtpu.kernels.deepseek_v4.compress_and_store import (
+    config as compressor_config,
+)
 from vllm_torchtpu.kernels.deepseek_v4.rope import rope_quant
-from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import streamindex_topk
+from vllm_torchtpu.kernels.deepseek_v4.streamindex_topk import (
+    KVLayout,
+    get_kv_cache_shape,
+    streamindex_topk,
+)
 from vllm_torchtpu.layers.adapter.custom_ops.deepseek_v4.deepseek_v4_compressor import (
     VllmDeepseekCompressor,
 )
@@ -37,7 +44,6 @@ from vllm_torchtpu.logger import init_logger
 from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
     get_pallas_op_mesh,
 )
-from vllm_torchtpu.utils import align_to
 
 if TYPE_CHECKING:
     from vllm_torchtpu.layers.core.attention_metadata import AttentionMetadata
@@ -45,6 +51,43 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 _indexer_op_cache = {}
+
+# Models whose attention and indexer ops score the request distribution's
+# middle segment as speculative verify windows in a static query-length pass.
+STATIC_VERIFY_MODEL_TYPES = frozenset({"deepseek_v4"})
+
+
+def static_verify_q_len(vllm_config: VllmConfig | Any | None) -> int | None:
+    """Query length of a full speculative verify window, 1 + K, or None.
+
+    The runner leads the verify segment with the windows of exactly this
+    length and writes their count into ``request_distribution[1]``;
+    DeepSeek-V4's attention and indexer ops read that segment as verify
+    windows and score them in one static query-length pass. Every other
+    attention backend reads the same segment as the prefill-only bucket,
+    which the ragged-paged-attention kernels skip when no chunk prefill size
+    is set, so the length exists only for models whose ops implement the
+    pass. The runner and both ops call this one function so the gate and the
+    ``+ 1`` cannot drift apart. ``TPU_SPEC_STATIC_VERIFY=0`` turns the pass
+    off (every window stays on the mixed pass); it cannot turn it on for a
+    model whose ops do not implement it.
+
+    Draft layers are built under a copy of the target's config
+    (``DFlashProposer._load_draft_model``) and need the same length: their
+    context-KV insert runs on the target's verify metadata. The gate therefore
+    looks at the target model, never at the model being built.
+    """
+    spec = getattr(vllm_config, "speculative_config", None)
+    if spec is None or not envs.TPU_SPEC_STATIC_VERIFY:
+        return None
+    model_config = getattr(spec, "target_model_config", None) or getattr(
+        vllm_config, "model_config", None
+    )
+    hf_config = getattr(model_config, "hf_config", None)
+    if getattr(hf_config, "model_type", None) not in STATIC_VERIFY_MODEL_TYPES:
+        return None
+    return spec.num_speculative_tokens + 1
+
 
 BATCH_AXIS = None
 
@@ -65,11 +108,18 @@ def _indexer_jax(
     compression_ratio: int,
     softmax_scale: float,
     n_head: int,
+    verify_q_len: int | None = None,
 ) -> jax.Array:
     if cache_kv.shape[0] == 0:
         # Profiling-shape trace: the kernel is skipped. Unused inputs stay in
         # the compiled signature because torch_tpu jits with keep_unused=True.
         return jnp.zeros((q.shape[0], k), dtype=jnp.int32)
+    if cache_kv.shape[1] != compressor_config.SAL_SUBLANE_GROUPS:
+        raise ValueError(
+            f"DeepSeek-V4 indexer cache {cache_kv.shape} does not match the "
+            "SEQ_ALONG_LANE layout "
+            f"(expected {compressor_config.SAL_SUBLANE_GROUPS} rows)."
+        )
 
     def _indexer_local(
         q,
@@ -108,6 +158,8 @@ def _indexer_jax(
             num_queries_per_block=(1, 128, 128),
             decode_req_batch_size=4,
             chunk_tokens=envs.TPU_STREAMIDX_CHUNK_TOKENS,
+            kv_layout=KVLayout.SEQ_ALONG_LANE,
+            uniform_q_len=verify_q_len,
         )
 
     return _indexer_local(
@@ -128,10 +180,16 @@ class VllmDeepseekV4IndexerCache(DeepseekV4IndexerCache):
 
     def get_kv_cache_spec(self, vllm_config: VllmConfig) -> KVCacheSpec:
         block_size = self.cache_config.block_size
+        _, sublane_groups, packing, _ = get_kv_cache_shape(
+            1,
+            compressor_config.SAL_PAGE_SIZE,
+            128,
+            KVLayout.SEQ_ALONG_LANE,
+        )
         return MLAAttentionSpec(
             block_size=block_size,
             num_kv_heads=1,
-            head_size=align_to(128 + 1, 128),
+            head_size=sublane_groups * packing,
             dtype=torch.uint8,
             tokens_per_state=min(self.compress_ratio, block_size),
             alignment=None,
@@ -156,6 +214,9 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
 
     def _build_indexer_op(self):
         mesh = get_pallas_op_mesh()
+        # Speculative verify windows all hold K + 1 tokens; the runner puts
+        # them in `[distribution[0], distribution[1])`.
+        verify_q_len = static_verify_q_len(get_current_vllm_config())
 
         wrapped_fn = functools.partial(
             _indexer_jax,
@@ -163,6 +224,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
             compression_ratio=self.compress_ratio,
             softmax_scale=self.softmax_scale,
             n_head=self.n_head,
+            verify_q_len=verify_q_len,
         )
 
         _scale = (
@@ -173,6 +235,7 @@ class VllmDeepseekV4Indexer(DeepseekV4Indexer):
         op_name = (
             f"pallas::deepseek_v4_indexer_k{self.topk_tokens}"
             f"_c{self.compress_ratio}_h{self.n_head}_s{_scale}"
+            f"{'' if verify_q_len is None else f'_vq{verify_q_len}'}"
         )
         global _indexer_op_cache
         if op_name in _indexer_op_cache:

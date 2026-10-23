@@ -1,5 +1,16 @@
 # Copyright 2026 Google LLC
-# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Fused MoE decode kernel: routed experts, shared expert and all-reduce in one call.
 
 Under MoE tensor parallelism every rank holds all experts with the
@@ -31,7 +42,9 @@ per block in blocked mode). Both matmuls are FP8 x FP8; each 512-column block's
 partial is scaled and summed in FP32, into an FP32 VMEM accumulator.
 Router top-k stays with the caller.
 
-Derived from moe_dense_expert.py, which targets i % 512 == 0 (EP layouts).
+Derived from moe_dense_expert.py, which admits 128-aligned intermediate widths
+at least the hardware MXU column width, including TP slices, when native FP8
+support and the remaining admission requirements hold.
 """
 
 import functools

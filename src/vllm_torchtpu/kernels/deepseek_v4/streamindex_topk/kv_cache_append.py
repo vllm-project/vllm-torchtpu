@@ -355,6 +355,7 @@ def _find_runs(
     run_dst_ref: Any,
     *,
     num_rows: int,
+    num_tokens: jax.Array | None = None,
 ) -> jax.Array:
     """Walks `dst_rows` once, compacting writable tokens and recording runs.
 
@@ -372,14 +373,23 @@ def _find_runs(
         a `num_valid` sentinel after the last run.
       run_dst_ref: `[T + 1]` SMEM output: first cache row of each run.
       num_rows: `num_pages * page_size`.
+      num_tokens: How many leading entries of `dst_rows` to process. May be a
+        runtime (traced) value. Entries from `num_tokens` on are skipped, as
+        if their row were -1. If None, all `T` entries are processed.
 
     Returns:
       The number of runs.
     """
+    max_tokens = dst_ref.shape[0]
 
     def _step(tok, carry):
         num_runs, num_valid, next_row = carry
-        row = dst_ref[tok]
+        if num_tokens is None:
+            row = dst_ref[tok]
+        else:
+            row = jnp.where(
+                tok < num_tokens, dst_ref[jnp.minimum(tok, max_tokens - 1)], -1
+            )
         valid = (row >= 0) & (row < num_rows)
         starts = valid & ((row != next_row) | (row % ops.granule == 0))
         # Branch-free: slot `num_runs` is only kept if this token starts a run.
@@ -397,9 +407,20 @@ def _find_runs(
         )
 
     zero = jnp.int32(0)
-    num_runs, num_valid, _ = lax.fori_loop(
-        0, dst_ref.shape[0], _step, (zero, zero, jnp.int32(-1)), unroll=8
-    )
+    init = (zero, zero, jnp.int32(-1))
+    if num_tokens is None:
+        num_runs, num_valid, _ = lax.fori_loop(0, max_tokens, _step, init, unroll=8)
+    else:
+        # `fori_loop` can only unroll a loop whose length is known when the
+        # kernel is traced. Here the length depends on `num_tokens`, a runtime
+        # value, so unroll by hand: each iteration handles 8 tokens (tokens
+        # past `num_tokens` are skipped inside `_step`).
+        def _chunk(c, carry):
+            for j in range(8):
+                carry = _step(c * 8 + j, carry)
+            return carry
+
+        num_runs, num_valid, _ = lax.fori_loop(0, (num_tokens + 7) // 8, _chunk, init)
     run_src_ref[num_runs] = num_valid
     return num_runs
 

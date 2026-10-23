@@ -715,3 +715,22 @@ class TestTpuCompilerCache:
         assert not os.path.samefile(path, os.path.join(a.cache_dir, key))
         with open(path, "rb") as f:
             assert pickle.load(f).fingerprint is None
+
+
+def test_deserialize_entry_does_not_copy_the_entry():
+    """Replay rebuilds the runnable from the entry itself: a deepcopy would load
+    a second TPU executable."""
+    from vllm_torchtpu.compilation.tpu_compiler import _deserialize_entry
+
+    class Entry:
+        def __init__(self):
+            self.guards_expr = "guards"
+            self.sanitized_aot_config = object()
+
+        def wrap_post_compile(self, example_inputs, aot_config, options):
+            return lambda boxed_args: sum(boxed_args)
+
+        def __deepcopy__(self, memo):
+            raise AssertionError("replay must not deepcopy the entry")
+
+    assert _deserialize_entry(Entry())(2, 3, 7) == 12

@@ -46,12 +46,15 @@
 # ─────
 # * The build step tags the image with $BUILDKITE_COMMIT and every TPU step
 #   pulls that exact tag, so all steps must depend_on `build_docker`.
-# * run_in_docker.sh runs your command inside the image at
-#   /workspace/vllm-torchtpu — that is a COPY of the repo at this commit, not the
+# * .buildkite/kubernetes/run.sh runs your command in a pod from that image, at
+#   /workspace/vllm-torchtpu — a COPY of the repo at this commit, not the
 #   agent's checkout. Reference paths like `examples/...` / `tests/...`
 #   relative to the repo root.
-# * Anything written to /perf_eval_results inside the container is copied back
-#   out and uploaded as a Buildkite artifact.
+# * SHAPE picks the slice: tpu7x-standard-1t/1x1x1 (1 chip) or
+#   tpu7x-standard-4t/2x2x1 (4 chips). Multi-host slices go through
+#   .buildkite/kubernetes/run_multihost.sh instead.
+# * Set ARTIFACTS_DIR (e.g. perf_eval_results) and write under it; everything
+#   there is uploaded as the step's artifacts.
 #
 # LANES
 # ─────
@@ -63,7 +66,9 @@ steps:
   # -----------------------------------------------------------------
   # Build step (required by every demo below)
   # Builds docker/Dockerfile --target dev and pushes it tagged with this
-  # commit. Same script the CI pipeline_build.yml uses.
+  # commit. Same script the CI pipeline_build.yml uses. A commit whose image
+  # is already in the registry reuses it (CI_IMAGE_REBUILD=1 builds anyway),
+  # and a build that sets CI_IMAGE=<image> uses that image as it is.
   # -----------------------------------------------------------------
   - label: ":docker: Build and Push Dev Image"
     key: build_docker
@@ -90,13 +95,18 @@ steps:
     if: 'build.env("K3_PD_CONFIG") == null'
     depends_on: build_docker
     agents:
-      queue: tpu_v7x_2_queue
+      queue: "kube"
+    plugins:
+      - kubernetes:
+          podTemplate: tpu-launcher
+    env:
+      SHAPE: "tpu7x-standard-1t/1x1x1"
     commands:
       - |
         # Customize --model / --max-model-len / --max-tokens as needed.
-        # Add --tensor_parallel_size=N for TP/EP runs, and move the step to
-        # tpu_v7x_8_queue / tpu_v7x_16_queue when it needs more than 2 chips.
-        .buildkite/scripts/run_in_docker.sh bash -c '
+        # Add --tensor_parallel_size=N for TP/EP runs, and set SHAPE to
+        # tpu7x-standard-4t/2x2x1 when it needs more than one chip.
+        .buildkite/kubernetes/run.sh bash -c '
           python3 examples/offline_inference.py \
             --model Qwen/Qwen3-0.6B \
             --max-model-len 256 \
@@ -113,12 +123,17 @@ steps:
     if: 'build.env("K3_PD_CONFIG") == null'
     depends_on: build_docker
     agents:
-      queue: tpu_v7x_2_queue
+      queue: "kube"
+    plugins:
+      - kubernetes:
+          podTemplate: tpu-launcher
+    env:
+      SHAPE: "tpu7x-standard-1t/1x1x1"
     commands:
       - |
         # Swap in your own file / -k selector. `-m 'not nightly'` mirrors what
         # CI runs on PRs; drop it to include nightly-marked tests.
-        .buildkite/scripts/run_in_docker.sh bash -c '
+        .buildkite/kubernetes/run.sh bash -c '
           pytest -sv --timeout=600 -m "not nightly" \
             tests/runner/test_tpu_runner.py'
 
@@ -134,11 +149,16 @@ steps:
     if: 'build.env("K3_PD_CONFIG") == null'
     depends_on: build_docker
     agents:
-      queue: tpu_v7x_2_queue
+      queue: "kube"
+    plugins:
+      - kubernetes:
+          podTemplate: tpu-launcher
+    env:
+      SHAPE: "tpu7x-standard-1t/1x1x1"
     matrix: ["1", "2", "3", "4", "5"]
     commands:
       - |
-        .buildkite/scripts/run_in_docker.sh bash -c '
+        .buildkite/kubernetes/run.sh bash -c '
           pytest -sv --timeout=600 -m "not nightly" \
             tests/runner/test_tpu_runner.py'
 
@@ -153,13 +173,18 @@ steps:
   #   K3_PD_CONFIG     the point: kimi-k3-megakernel/p1-c1 ...
   #                    kimi-k3-megakernel/p7-c16 (p6, p7 experimental), or a
   #                    pruned point of the doc's Oct 13 set,
-  #                    kimi-k3-megakernel-1013/a-c1 ... kimi-k3-megakernel-1013/h-c48
+  #                    kimi-k3-megakernel-1013/a-c1 ... kimi-k3-megakernel-1013/h-c48,
+  #                    or a point of its Oct 16 set,
+  #                    kimi-k3-megakernel-1016/p1-c1 ... kimi-k3-megakernel-1016/p9-c48
   #   K3_ENGINE_REF    the ref of this repository the engine image is built
   #                    from: a branch name, a tag, a full 40-character commit
   #                    SHA (not a short one, which cannot be fetched) or
   #                    refs/pull/<N>/head; default
-  #                    inferact/megakernel-integration-1015
+  #                    inferact/megakernel-integration-1016
   #   K3_ENGINE_IMAGE  an engine image to use as it is, instead of building one
+  #   CI_IMAGE         the same for the client's image (Build and Push Dev
+  #                    Image), e.g. to rerun a point on an earlier build's
+  #                    images
   # One point per build, since each needs its own decode server. Point 1 took
   # ~45 min from admission. The step passes even when every request fails,
   # because the client exits 0 after writing what it has: read "requests ok"
@@ -175,7 +200,7 @@ steps:
       - bash .buildkite/scripts/build_k3_engine_image.sh
     retry: *image_build_retry
 
-  - label: ":kubernetes: :tpu: Perf: Kimi-K3 AgentX 1P1D ${K3_PD_CONFIG} (TPU v7x 2x2x4 x2)"
+  - label: ":tpu: Perf: Kimi-K3 AgentX 1P1D ${K3_PD_CONFIG} (TPU v7x 2x2x4 x2)"
     key: k3_mk_agentx_1p1d
     if: 'build.env("K3_PD_CONFIG") != null'
     depends_on:
@@ -186,12 +211,12 @@ steps:
     # each role a slice of its own, so two pairs cannot split slices. A second
     # pair borrows 32 chips from the tpu7x cohort when they are idle (the
     # lending queues never reclaim) and otherwise waits in Kueue, for up to the
-    # launcher's queue_max_seconds. The nightly pairs in pipeline_perf_kube.yml
+    # launcher's queue_max_seconds. The nightly pairs in pipeline_perf.yml
     # keep their group, so they still run one at a time among themselves.
     timeout_in_minutes: 1440
     env:
       # The kube launcher uploads whatever the workload leaves here as the
-      # step's artifacts, as pipeline_perf_kube.yml declares it.
+      # step's artifacts, as pipeline_perf.yml declares it.
       ARTIFACTS_DIR: "perf_eval_results"
       # bootstrap_dev.sh leaves its builds unclassed: Kueue priority 0, ahead of
       # the nightlies and behind every other kind of build. post-merge queues

@@ -18,22 +18,22 @@
 
 const COMMAND_DATA = {
     "uv_pip": {
-        cmd: `# 1. Authenticate with GCP Artifact Registry (for torch_tpu wheels):\ngcloud auth application-default login\n\n# 2. Clone the repository and install with uv:\ngit clone https://github.com/vllm-project/vllm-torchtpu.git\ncd vllm-torchtpu\nuv sync --group vllm\nsource .venv/bin/activate`,
-        inst: "Install <code>vllm-torchtpu</code> and its pinned <code>vllm</code> and <code>torch_tpu</code> dependencies into a managed virtual environment using <code>uv</code>."
+        cmd: `# Install vllm-torchtpu from PyPI (https://pypi.org/project/vllm-torchtpu/):\nuv venv --python 3.12 ~/uv_venv\nsource ~/uv_venv/bin/activate\nexport UV_TORCH_BACKEND=cpu\nuv pip install vllm-torchtpu`,
+        inst: "Install the pre-built <a href=\"https://pypi.org/project/vllm-torchtpu/\"><code>vllm-torchtpu</code></a> package and its dependencies from PyPI into a Python 3.12 virtual environment."
     },
     "docker": {
         "latest": {
-            cmd: `export DOCKER_URI=us-central1-docker.pkg.dev/tpu-pytorch-releases/docker/development:tpu7x_20260405\ngcloud auth configure-docker us-central1-docker.pkg.dev --quiet\nsudo docker run -it --rm --name $USER-vllm --privileged --net=host \\\n  -v /dev/shm:/dev/shm \\\n  --shm-size 150gb \\\n  -p 8000:8000 \\\n  --entrypoint /bin/bash \${DOCKER_URI}`,
-            inst: "Run the pre-built <strong>TPU development</strong> container with <code>torch_tpu</code>, <code>libtpu</code>, and <code>jax</code> pre-installed. Include <code>--privileged</code>, <code>--net=host</code>, and <code>--shm-size=150gb</code> to enable TPU access and shared memory."
+            cmd: `export DOCKER_URI=vllm/vllm-torchtpu:latest\nsudo docker pull \${DOCKER_URI}\nsudo docker run -it --rm --name $USER-vllm --privileged --net=host \\\n  -v /dev/shm:/dev/shm \\\n  --shm-size 150gb \\\n  -p 8000:8000 \\\n  --entrypoint /bin/bash \${DOCKER_URI}`,
+            inst: "Pull and run the latest stable release container (<a href=\"https://hub.docker.com/r/vllm/vllm-torchtpu/tags\"><code>vllm/vllm-torchtpu:latest</code></a>) from Docker Hub. Include <code>--privileged</code>, <code>--net=host</code>, and <code>--shm-size=150gb</code> to enable TPU access and shared memory."
         },
         "nightly": {
-            cmd: `git clone https://github.com/vllm-project/vllm-torchtpu.git\ncd vllm-torchtpu\ndocker build -f docker/Dockerfile -t vllm-torchtpu:dev .\nsudo docker run -it --rm --name $USER-vllm --privileged --net=host \\\n  -v /dev/shm:/dev/shm \\\n  --shm-size 150gb \\\n  -p 8000:8000 \\\n  --entrypoint /bin/bash vllm-torchtpu:dev`,
-            inst: "Build and run the <strong>vllm-torchtpu</strong> image from <code>docker/Dockerfile</code> containing the latest repository source."
+            cmd: `export DOCKER_URI=vllm/vllm-torchtpu:nightly\nsudo docker pull \${DOCKER_URI}\nsudo docker run -it --rm --name $USER-vllm --privileged --net=host \\\n  -v /dev/shm:/dev/shm \\\n  --shm-size 150gb \\\n  -p 8000:8000 \\\n  --entrypoint /bin/bash \${DOCKER_URI}`,
+            inst: "Pull and run the pre-built nightly developer container (<a href=\"https://hub.docker.com/r/vllm/vllm-torchtpu/tags\"><code>vllm/vllm-torchtpu:nightly</code></a>) from Docker Hub containing the latest <code>main</code> branch build."
         }
     },
     "source": {
-        cmd: `# 1. Authenticate with GCP Artifact Registry:\ngcloud auth application-default login\n\n# 2. Clone vllm-torchtpu and create a virtual environment:\ngit clone https://github.com/vllm-project/vllm-torchtpu.git\ncd vllm-torchtpu\nuv venv --python 3.12 --seed\nsource .venv/bin/activate\n\n# 3. Install in editable mode with vllm and dev dependencies:\nuv pip install --prerelease=allow -e . --group vllm --group dev\n\n# 4. (Optional) Editable vllm checkout for cross-repo development:\ngit clone --branch v0.29.0 --depth 1 https://github.com/vllm-project/vllm.git ../vllm\nVLLM_TARGET_DEVICE=empty uv pip install -e ../vllm --no-deps`,
-        inst: "For development or debugging, install <code>vllm-torchtpu</code> in editable mode with <code>--group vllm --group dev</code>. Optionally mount an editable <code>vllm</code> checkout."
+        cmd: `# 1. Clone vllm-torchtpu and create a virtual environment:\ngit clone https://github.com/vllm-project/vllm-torchtpu.git\ncd vllm-torchtpu\nuv venv --python 3.12 --seed\nsource .venv/bin/activate\nexport UV_TORCH_BACKEND=cpu\n\n# 2. Install in editable mode with vllm and test dependencies:\nVLLM_TARGET_DEVICE=empty uv pip install -e . --group vllm --group test\n\n# 3. (Optional) Editable vllm checkout for cross-repo development:\ngit clone --branch v0.32.0 --depth 1 https://github.com/vllm-project/vllm.git ../vllm\nVLLM_TARGET_DEVICE=empty uv pip install -e ../vllm --no-deps`,
+        inst: "For development or debugging, install <code>vllm-torchtpu</code> in editable mode with <code>--group vllm --group test</code>. Optionally mount an editable <code>vllm</code> checkout."
     }
 };
 
@@ -45,7 +45,7 @@ function highlightShell(code) {
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;');
-    const tokenRegex = /("[^"]*"|'[^']*'|\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*|--[a-zA-Z0-9_-]+|-[a-zA-Z0-9]+|&&|\|\||\||\\|\b(?:export|source|sudo|cd|mkdir|git|uv|pip|curl|gcloud|docker|apt-get|python|python3\.12)\b|\b(?:install|run|clone|checkout|update|venv|create|compute|tpus|queued-resources|tpu-vm|ssh|alpha|sync|auth|build)\b)/g;
+    const tokenRegex = /("[^"]*"|'[^']*'|\$\{[^}]*\}|\$[A-Za-z_][A-Za-z0-9_]*|--[a-zA-Z0-9_-]+|-[a-zA-Z0-9]+|&&|\|\||\||\\|\b(?:export|source|sudo|cd|mkdir|git|uv|pip|curl|gcloud|docker|apt-get|python|python3\.12)\b|\b(?:install|pull|run|clone|checkout|update|venv|create|compute|tpus|queued-resources|tpu-vm|ssh|alpha|sync|auth|build)\b)/g;
     return escaped.split('\n').map(line => {
         if (/^\s*#/.test(line)) {
             return '<span class="c1">' + line + '</span>';

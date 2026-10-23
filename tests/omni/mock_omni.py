@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Mocks for vllm-omni modules for unit testing."""
 
 import sys
@@ -92,13 +104,6 @@ class _MockOmniPlatformEnum:
     MUSA = "musa"
 
 
-class _MockLTXRuntime:
-    output = (None, None)
-
-    def _decode_output(self, *args, **kwargs):
-        return MagicMock(output=self.output)
-
-
 def _init_mock_qwen_rope(self):
     self.pos_freqs = torch.polar(
         torch.ones(8, 4), torch.arange(32, dtype=torch.float32).view(8, 4)
@@ -176,7 +181,6 @@ vllm_omni_mock.diffusion.attention.backends.sdpa.SDPAImpl = _MockSDPAImpl
 vllm_omni_mock.diffusion.attention.backends.registry.register_diffusion_backend = (
     lambda *args, **kwargs: None
 )
-vllm_omni_mock.diffusion.models.ltx2.ltx2_runtime.LTXRuntime = _MockLTXRuntime
 qwen_transformer_mock = (
     vllm_omni_mock.diffusion.models.qwen_image.qwen_image_transformer
 )
@@ -207,10 +211,6 @@ sys.modules["vllm_omni.diffusion.attention.backends.sdpa"] = (
     vllm_omni_mock.diffusion.attention.backends.sdpa
 )
 sys.modules["vllm_omni.diffusion.models"] = vllm_omni_mock.diffusion.models
-sys.modules["vllm_omni.diffusion.models.ltx2"] = vllm_omni_mock.diffusion.models.ltx2
-sys.modules["vllm_omni.diffusion.models.ltx2.ltx2_runtime"] = (
-    vllm_omni_mock.diffusion.models.ltx2.ltx2_runtime
-)
 sys.modules["vllm_omni.diffusion.models.qwen_image"] = (
     vllm_omni_mock.diffusion.models.qwen_image
 )
@@ -220,6 +220,12 @@ sys.modules["vllm_omni.diffusion.models.qwen_image.qwen_image_transformer"] = (
 sys.modules["vllm_omni.diffusion.models.wan2_2"] = _wan2_2
 sys.modules["vllm_omni.diffusion.models.wan2_2.wan2_2_transformer"] = (
     _wan2_2.wan2_2_transformer
+)
+sys.modules["vllm_omni.diffusion.models.wan2_2.wan2_2_vace_transformer"] = (
+    _wan2_2.wan2_2_vace_transformer
+)
+sys.modules["vllm_omni.diffusion.models.wan2_2.wan2_2_s2v_transformer"] = (
+    _wan2_2.wan2_2_s2v_transformer
 )
 sys.modules["vllm_omni.diffusion.layers"] = vllm_omni_mock.diffusion.layers
 sys.modules["vllm_omni.diffusion.layers.rope"] = vllm_omni_mock.diffusion.layers.rope

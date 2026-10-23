@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Deviceless duck-typed tensor fakes for the Raiden pool-manifest tests.
 
 Moved out of tpu_connector_v2_test_utils.py so that collecting the live
@@ -257,7 +269,7 @@ def dsv4_materialization(*, num_blocks=16, tokens_per_page=256):
     # allocates them; everything overlaid on NoPE inherits that.
     csa_nope = [words(tokens) for _ in range(2)]
     csa_rope = [words(tokens // 4) for _ in range(2)]
-    indexer = [cache(tokens // 4, 256) for _ in range(2)]
+    indexer = [cache(33, 256) for _ in range(2)]
     hca = cache(tokens * 2, 128)
 
     csa_names = [f"model.layers.{i}.self_attn.attn" for i in range(2)]

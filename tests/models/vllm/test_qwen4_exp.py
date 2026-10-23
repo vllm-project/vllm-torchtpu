@@ -22,6 +22,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from torch import nn
+from transformers import Qwen4ExpTextConfig
 from vllm.config import CompilationMode
 from vllm.model_executor import parameter as vllm_parameter
 from vllm.model_executor.layers import linear as vllm_linear
@@ -36,7 +37,6 @@ from vllm.models.qwen4_exp.common.ngram_embedding import (
     Qwen4ExpPLEEmbeddingMethod,
     Qwen4ExpPLEFp8EmbeddingMethod,
 )
-from vllm.transformers_utils.configs.qwen4_exp import Qwen4ExpTextConfig
 
 import vllm_torchtpu.models.vllm.qwen4_exp.model as qwen4_model
 from vllm_torchtpu.gdn_pool_layout import QWEN_GDN_ARCHITECTURES
@@ -57,6 +57,8 @@ from vllm_torchtpu.models.vllm.qwen4_exp.ple import (
 HIDDEN = 16
 HC = 4
 VOCAB = 32
+# The checkpoint's spelling; transformers relabels full_attention as a QSA
+# layer type on load. PLE may only sit on linear_attention layers.
 LAYER_TYPES = ["linear_attention", "full_attention"]
 
 
@@ -184,19 +186,17 @@ def test_config_accepts_qsa_within_indexer_budget() -> None:
     TPUQwen4ExpConfig.verify_and_update_config(vllm_config)
 
 
-def test_config_rejects_qsa_layer_type() -> None:
-    text_config = _text_config(**_QSA)
-    # Set after construction: the pinned transformers does not know this
-    # layer type, but newer versions accept it.
-    text_config.layer_types = ["linear_attention", "qwen_sparse_attention"]
-    with pytest.raises(NotImplementedError, match="qwen_sparse_attention"):
+def test_config_rejects_unknown_layer_type() -> None:
+    text_config = _text_config()
+    text_config.layer_types = ["linear_attention", "sliding_attention"]
+    with pytest.raises(NotImplementedError, match="sliding_attention"):
         TPUQwen4ExpConfig.verify_and_update_config(_vllm_config_for_checks(text_config))
 
 
 @pytest.mark.parametrize(
     "text_overrides,config_overrides,match",
     [
-        ({"ple_layer_ids": [2]}, {}, "PLE"),
+        ({"ple_layer_ids": [1], "eos_token_id": 3}, {}, "PLE"),
         (_QSA, {"max_model_len": 4096}, "indexer_budget=2048"),
         (
             {},
@@ -229,7 +229,7 @@ def test_config_rejects_unsupported_features(
     ids=["text_only", "vision_language"],
 )
 def test_config_ple_error_names_override(nested, override) -> None:
-    text_config = _text_config(ple_layer_ids=[2])
+    text_config = _text_config(ple_layer_ids=[1], eos_token_id=3)
     vllm_config = _vllm_config_for_checks(text_config)
     if nested:
         vllm_config.model_config.hf_config = SimpleNamespace(text_config=text_config)
@@ -470,19 +470,19 @@ _LM = "model.language_model"
         ),
         (f"{_LM}.layers.3.self_attn.indexer.index_qk_proj.weight", None),
         (
-            f"{_LM}.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight",
-            ("model.layers.1.ple.ple_embedding.ngram_embedding.shard_0.weight", None),
+            f"{_LM}.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight",
+            ("model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight", None),
         ),
         (
-            f"{_LM}.layers.1.ple.key_proj.weight",
-            ("model.layers.1.ple.key_proj.weight", None),
+            f"{_LM}.layers.0.ple.key_proj.weight",
+            ("model.layers.0.ple.key_proj.weight", None),
         ),
         (
-            f"{_LM}.layers.1.ple.conv1d.weight",
-            ("model.layers.1.ple.conv1d.weight", None),
+            f"{_LM}.layers.0.ple.conv1d.weight",
+            ("model.layers.0.ple.conv1d.weight", None),
         ),
-        (f"{_LM}.layers.1.ple.ple_embedding.hashstats_ngram_counts", None),
-        (f"{_LM}.layers.1.ple.ple_embedding.token_lookup", None),
+        (f"{_LM}.layers.0.ple.ple_embedding.hashstats_ngram_counts", None),
+        (f"{_LM}.layers.0.ple.ple_embedding.token_lookup", None),
         ("model.visual.blocks.0.attn.qkv.weight", None),
         ("mtp.layers.0.mlp.experts.0.gate_proj.weight", None),
     ],
@@ -519,7 +519,7 @@ def test_fp8_checkpoint_quantizes_routed_experts_and_ple_table() -> None:
             for name in ("gate_proj", "up_proj", "down_proj")
         ),
         *(
-            f"{_LM}.layers.1.ple.{name}"
+            f"{_LM}.layers.0.ple.{name}"
             for name in ("conv1d", "key_proj", "value_proj")
         ),
     ]
@@ -548,13 +548,13 @@ def test_fp8_checkpoint_quantizes_routed_experts_and_ple_table() -> None:
         "model.layers.1.self_attn.o_proj",
         "model.layers.0.mlp.shared_expert.gate_up_proj",
         "model.layers.1.mlp.shared_expert.down_proj",
-        "model.layers.1.ple.key_proj",
-        "model.layers.1.ple.value_proj",
+        "model.layers.0.ple.key_proj",
+        "model.layers.0.ple.value_proj",
     ):
         assert skipped(prefix), prefix
     assert not skipped("model.layers.0.mlp.experts")
     table_method = Qwen4ExpPLEEmbeddingMethod.from_quant_config(
-        quant_config, "model.layers.1.ple.ple_embedding.ngram_embedding"
+        quant_config, "model.layers.0.ple.ple_embedding.ngram_embedding"
     )
     assert isinstance(table_method, Qwen4ExpPLEFp8EmbeddingMethod)
 
@@ -563,7 +563,7 @@ def test_fp8_checkpoint_quantizes_routed_experts_and_ple_table() -> None:
 # N-gram PLE
 # ---------------------------------------------------------------------------
 _PLE = dict(
-    ple_layer_ids=[2],
+    ple_layer_ids=[1],
     ngram_size=3,
     heads_per_ngram=2,
     # The 4 heads hash into 11, 13, 17 and 19 rows: 60 rows, padded to 64.
@@ -814,7 +814,7 @@ def test_ple_layer_matches_reference_for_any_chunking(monkeypatch, chunks) -> No
     steps match the reference run over each whole sequence."""
     _set_tp(monkeypatch, 0, 1)
     torch.manual_seed(0)
-    ple = Qwen4ExpPLELayer(_text_config(**_PLE), 0, None, prefix="model.layers.1.ple")
+    ple = Qwen4ExpPLELayer(_text_config(**_PLE), 0, None, prefix="model.layers.0.ple")
     _randomize_ple(ple)
     eos = _PLE["eos_token_id"]
     sequences = _sequences(VOCAB, eos)
@@ -886,7 +886,7 @@ def test_ple_table_shards_load_across_tp_ranks(monkeypatch, fp8: bool) -> None:
             _PLE["ple_embed_dim"],
             0,
             quant_config,
-            prefix="model.layers.1.ple.ple_embedding",
+            prefix="model.layers.0.ple.ple_embedding",
         )
         assert embedding.load_weights(iter(weights.items())) == expected_loaded
         rank_table = embedding.ngram_embedding
@@ -899,14 +899,14 @@ def test_ple_table_shards_load_across_tp_ranks(monkeypatch, fp8: bool) -> None:
     torch.testing.assert_close(rows, expected[ids])
 
 
-@pytest.mark.parametrize("ple_layer_ids", [[2], []], ids=["ple", "ple_disabled"])
+@pytest.mark.parametrize("ple_layer_ids", [[1], []], ids=["ple", "ple_disabled"])
 def test_load_weights_loads_ple_or_drops_it_when_disabled(
     fake_sublayers, monkeypatch, ple_layer_ids
 ) -> None:
     _set_tp(monkeypatch, 0, 1)
     text_config = _text_config(**{**_PLE, "ple_layer_ids": ple_layer_ids})
     model = Qwen4ExpForCausalLM(vllm_config=_model_vllm_config(text_config))
-    prefix = f"{_LM}.layers.1.ple"
+    prefix = f"{_LM}.layers.0.ple"
     weights = {
         f"{prefix}.key_proj.weight": torch.randn(HC * HIDDEN, _PLE["ple_embed_dim"]),
         f"{prefix}.conv1d.weight": torch.randn(
@@ -927,7 +927,7 @@ def test_load_weights_loads_ple_or_drops_it_when_disabled(
     expected = {
         name.replace(f"{_LM}.", "model."): tensor for name, tensor in weights.items()
     }
-    table = "model.layers.1.ple.ple_embedding.ngram_embedding"
+    table = "model.layers.0.ple.ple_embedding.ngram_embedding"
     last_shard = expected.pop(f"{table}.shard_2.weight")
     assert loaded == {*expected, f"{table}.weight"}
     state = model.state_dict()
@@ -975,7 +975,7 @@ def test_ngram_embedding_rejects_malformed_checkpoint_tensors(
         _PLE["ple_embed_dim"],
         0,
         None,
-        prefix="model.layers.1.ple.ple_embedding",
+        prefix="model.layers.0.ple.ple_embedding",
     )
     with pytest.raises(ValueError, match=match):
         embedding.load_weights(iter(weights.items()))
@@ -994,7 +994,7 @@ def test_ple_layer_rejects_inconsistent_inputs(
     monkeypatch, num_ids: int, context_delta: int, window_delta: int, match: str
 ) -> None:
     _set_tp(monkeypatch, 0, 1)
-    ple = Qwen4ExpPLELayer(_text_config(**_PLE), 0, None, prefix="model.layers.1.ple")
+    ple = Qwen4ExpPLELayer(_text_config(**_PLE), 0, None, prefix="model.layers.0.ple")
     inputs = PLEInputs(
         input_ids=torch.arange(num_ids) + 5,
         query_start_loc=torch.tensor([0, 3]),
@@ -1011,4 +1011,4 @@ def test_ple_layer_rejects_kernel_size_one(monkeypatch) -> None:
     _set_tp(monkeypatch, 0, 1)
     config = _text_config(**{**_PLE, "ple_conv_kernel_size": 1})
     with pytest.raises(NotImplementedError, match="ple_conv_kernel_size"):
-        Qwen4ExpPLELayer(config, 0, None, prefix="model.layers.1.ple")
+        Qwen4ExpPLELayer(config, 0, None, prefix="model.layers.0.ple")

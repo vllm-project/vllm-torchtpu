@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Native byte-span declarations for Stage-3 resharding.
 
 The producer lowers the PCP kernel's token ownership directly to the byte
@@ -581,6 +593,66 @@ def lower_glm_dcp_row_spans(
     )
 
 
+def lower_glm_dcp_identity_spans(
+    *,
+    tag: str,
+    num_tokens: int,
+    page_tokens: int,
+    dcp_size: int,
+    dcp_rank: int,
+    live_bytes_per_block: int,
+    block_ids: Sequence[int],
+) -> PoolSpanRegistration:
+    """Lower one DCP rank's GLM cache to the same DCP rank of the destination.
+
+    Producer and destination run the same DCP size, interleave and page size,
+    so rank k holds the same tokens of every scheduler block on both sides and
+    each page ships whole to the same page slot. Unlike lower_glm_row_spans,
+    which trims the tail, the last page ships whole too: its slots past the
+    rank's local token count (the whole page on a rank that owns no token of
+    the tail block) carry stale bytes from the page's previous occupant. That
+    is safe because the consumer reads no slot past its local token count and
+    decode overwrites those slots as it appends.
+    """
+    if not tag:
+        raise ValueError("pool tag must not be empty")
+    if num_tokens <= 0:
+        raise ValueError("num_tokens must be positive")
+    if page_tokens <= 0 or live_bytes_per_block <= 0:
+        raise ValueError("page_tokens and live_bytes_per_block must be positive")
+    if dcp_size <= 1 or not 0 <= dcp_rank < dcp_size:
+        raise ValueError(
+            "dcp_rank must be in [0, dcp_size) with dcp_size > 1, got "
+            f"dcp_rank={dcp_rank}, dcp_size={dcp_size}"
+        )
+    scheduler_block_tokens = page_tokens * dcp_size
+    num_pages = (num_tokens + scheduler_block_tokens - 1) // scheduler_block_tokens
+    if len(block_ids) != num_pages:
+        raise ValueError(
+            "block_ids must cover the complete request scheduler block set: "
+            f"got {len(block_ids)}, expected {num_pages} for {num_tokens} "
+            f"tokens at {page_tokens} per page and DCP {dcp_size}"
+        )
+    spans = tuple(
+        PoolByteSpan(
+            src_block_ordinal=page,
+            src_offset_bytes=0,
+            dst_block_index=0,
+            dst_offset_bytes=page * live_bytes_per_block,
+            size_bytes=live_bytes_per_block,
+            dst_unit_ordinal=dcp_rank,
+        )
+        for page in range(num_pages)
+    )
+    return PoolSpanRegistration(
+        tag=tag,
+        block_ids=tuple(int(block_id) for block_id in block_ids),
+        spans=spans,
+        declared_bytes=num_pages * live_bytes_per_block,
+        dst_space_version=1,
+    )
+
+
 def lower_dsv4_row_spans(
     *,
     tag: str,
@@ -622,7 +694,14 @@ def lower_dsv4_row_spans(
             f"{num_tokens} tokens at {page_tokens} per page"
         )
     tail_tokens = num_tokens - (num_pages - 1) * page_tokens
-    tail_rows = -(-tail_tokens * rows_per_page // page_tokens)
+    # The SAL indexer cache puts tokens along the lane axis and spreads each
+    # token's head-dim + scale across all 33 rows, so a partial page still
+    # needs every row.
+    tail_rows = (
+        rows_per_page
+        if tag.startswith("dsv4.idx")
+        else -(-tail_tokens * rows_per_page // page_tokens)
+    )
     tail_bytes = tail_rows * row_bytes
     spans = tuple(
         PoolByteSpan(

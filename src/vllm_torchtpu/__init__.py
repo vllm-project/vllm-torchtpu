@@ -741,6 +741,47 @@ def _patch_vllm_offloading_config_build() -> None:
     logger.info("Applied TPU patch: PCP-aware OffloadingConfig build.")
 
 
+def _patch_vllm_offload_all_ranks_kv_bytes() -> None:
+    """Record every worker's KV bytes per block where the per-worker configs
+    pass by.
+
+    The engine core turns the per-worker KV cache configs into the scheduler's
+    config and keeps only that one; each worker is handed the whole list and
+    keeps its own entry. The Raiden offloading spec sizes the host capacity
+    from the bytes behind one block on all ranks, which under pipeline
+    parallelism differ between stages, so both places record the sum first.
+    """
+    from vllm.v1.engine import core as engine_core_module
+    from vllm.v1.worker.worker_base import WorkerWrapperBase
+
+    from vllm_torchtpu.offload.raiden_store import record_all_ranks_kv_bytes_per_block
+
+    marker = "_tpu_all_ranks_kv_bytes_patch"
+    original_generate = engine_core_module.generate_scheduler_kv_cache_config
+    if not original_generate.__dict__.get(marker, False):
+
+        def generate_scheduler_kv_cache_config_tpu(kv_cache_configs):
+            record_all_ranks_kv_bytes_per_block(kv_cache_configs)
+            return original_generate(kv_cache_configs)
+
+        generate_scheduler_kv_cache_config_tpu.__dict__[marker] = True
+        engine_core_module.generate_scheduler_kv_cache_config = (
+            generate_scheduler_kv_cache_config_tpu
+        )
+
+    original_initialize = WorkerWrapperBase.initialize_from_config
+    if not original_initialize.__dict__.get(marker, False):
+
+        def initialize_from_config_tpu(self, kv_cache_configs):
+            record_all_ranks_kv_bytes_per_block(kv_cache_configs)
+            return original_initialize(self, kv_cache_configs)
+
+        initialize_from_config_tpu.__dict__[marker] = True
+        WorkerWrapperBase.initialize_from_config = initialize_from_config_tpu
+
+    logger.info("Applied TPU patch: all-ranks KV bytes per block for offloading.")
+
+
 def _patch_vllm_kimi_kda_layer_counts() -> None:
     """Patch ModelConfig.get_num_layers_by_block_type to report accurate counts
     for Kimi models with KDA using linear_attn_config (e.g. Kimi-K3).
@@ -1627,6 +1668,47 @@ def _patch_dflash_bypass_v2_runner_check() -> None:
     qwen3_dflash._resolve_layer_attention = patched_resolve
     qwen3_dflash._tpu_bypass_v2_runner_patch = True
     logger.info("Applied TPU patch: bypass DFlash V2 runner check on TPU.")
+
+
+def _patch_dflash_drafting_slot_budget() -> None:
+    """Stop charging DFlash/DSpark drafting slots against the token budget.
+
+    vLLM's scheduler charges every scheduled request
+    ``SpeculativeConfig.max_num_new_slots_for_drafting`` tokens (K for DFlash,
+    K - 1 for DSpark) against ``max_num_batched_tokens``, for drafters that
+    append those slots to the target's tokens in one forward. The TPU
+    DFlashProposer drafts ``num_reqs * block_size`` tokens in a separate
+    forward, so the charge only takes tokens away from prefill; return 0 for
+    these methods. Other methods keep the upstream value.
+
+    Without the charge, a request scheduled fewer than ``block_size`` tokens
+    still drafts a full block, so a step's draft can outgrow the largest
+    target bucket; ``DFlashProposer._draft_token_paddings`` covers that.
+    """
+    # TODO: let the platform declare the per-request drafting slots upstream
+    # instead of overriding the SpeculativeConfig property here.
+    from functools import wraps
+
+    from vllm.config.speculative import SpeculativeConfig
+
+    upstream = SpeculativeConfig.__dict__["max_num_new_slots_for_drafting"]
+    assert isinstance(upstream, property) and upstream.fget is not None
+    if getattr(upstream.fget, "_tpu_drafting_slots_patch", False):
+        return
+    upstream_fget = upstream.fget
+
+    @wraps(upstream_fget)
+    def max_num_new_slots_for_drafting(self) -> int:
+        # Methods tpu_runner serves with DFlashProposer or its DSpark subclass.
+        if self.method in ("dflash", "dspark"):
+            return 0
+        return upstream_fget(self)
+
+    setattr(max_num_new_slots_for_drafting, "_tpu_drafting_slots_patch", True)  # noqa: B010
+    SpeculativeConfig.max_num_new_slots_for_drafting = property(
+        max_num_new_slots_for_drafting
+    )
+    logger.info("Applied TPU patch: DFlash/DSpark drafting slots are not charged.")
 
 
 def _patch_vllm_config_triton_tpu() -> None:

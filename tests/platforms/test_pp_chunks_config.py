@@ -1,4 +1,16 @@
-# SPDX-License-Identifier: Apache-2.0
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Platform gates for the pipeline chunk scheduler."""
 
 from types import SimpleNamespace
@@ -68,6 +80,18 @@ def test_the_dp_scheduler_with_one_dp_rank_does_not_gate(monkeypatch):
     config = _config(dp=1)
     _configure(config)
     assert config.scheduler_config.scheduler_cls == SCHEDULER_CLS
+
+
+def test_custom_scheduler_logs_configured_scheduler_when_dp_sched_env_set(
+    monkeypatch, caplog
+):
+    _env(monkeypatch, dp_sched=True)
+    config = _config(dp=2, cls="x.Y")
+    hook = _configure(config)
+    assert config.scheduler_config.scheduler_cls == "x.Y"
+    hook.assert_not_called()
+    assert "scheduler x.Y is configured" in caplog.text
+    assert "the DP scheduler is enabled" not in caplog.text
 
 
 def test_negative_slack_fails_at_config_time(monkeypatch):

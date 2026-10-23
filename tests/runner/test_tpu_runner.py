@@ -125,6 +125,14 @@ def test_spec_warmup_request_counts_blocks_in_block_table_units(
     assert len(block_ids) <= spec.max_num_blocks_per_req(config, 40960)
 
 
+class _BlockTables(list):
+    """A list of block tables with `MultiGroupBlockTable.block_tables`."""
+
+    @property
+    def block_tables(self):
+        return self
+
+
 def _smem_runner(dcp_size=8, kernel_page_size=384, most_model_len=65536):
     spec = FullAttentionSpec(
         block_size=384, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
@@ -135,6 +143,7 @@ def _smem_runner(dcp_size=8, kernel_page_size=384, most_model_len=65536):
     split = 384 // kernel_page_size
     pages = spec.max_num_blocks_per_req(config, 1048576) * split
     table = SimpleNamespace(
+        block_size=384,
         max_num_blocks_per_req=pages,
         blocks_per_kv_block=split,
         get_cpu_tensor=lambda: torch.zeros((64, pages), dtype=torch.int32),
@@ -146,7 +155,7 @@ def _smem_runner(dcp_size=8, kernel_page_size=384, most_model_len=65536):
         block_size=384,
         max_num_blocks_per_req=pages,
         most_model_len=most_model_len,
-        input_batch=SimpleNamespace(block_table=[table]),
+        input_batch=SimpleNamespace(block_table=_BlockTables([table])),
         kv_cache_config=SimpleNamespace(
             kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
         ),
@@ -231,13 +240,15 @@ def test_smem_caps_follow_widest_attention_group():
 def test_smem_caps_refresh_after_placeholder_table_rebuild(monkeypatch):
     runner = _smem_runner(most_model_len=None)
     final_table = runner.input_batch.block_table[0]
-    runner.input_batch.block_table[0] = SimpleNamespace(max_num_blocks_per_req=2731)
+    runner.input_batch.block_table[0] = SimpleNamespace(
+        block_size=384, max_num_blocks_per_req=2731
+    )
     runner.max_num_blocks_per_req = 2731
     runner.block_table_cpu = torch.zeros((64, 2731), dtype=torch.int32)
     runner._refresh_smem_request_caps()
     assert runner.num_reqs_max_model_len == 47
 
-    def rebuild(_self, _config, _sizes):
+    def rebuild(_self, _config):
         runner.input_batch.block_table[0] = final_table
 
     monkeypatch.setattr(GPUModelRunner, "may_reinitialize_input_batch", rebuild)
@@ -254,6 +265,13 @@ def test_smem_caps_refresh_after_placeholder_table_rebuild(monkeypatch):
     assert real_runner.max_num_blocks_per_req == 342
     assert real_runner.block_table_cpu.shape == (64, 342)
     assert real_runner.num_reqs_most_model_len is None
+
+
+def test_may_reinitialize_input_batch_requires_kernel_block_sizes():
+    # Without them, split groups would hand manager block ids to the kernels.
+    runner = object.__new__(TPUModelRunner)
+    with pytest.raises(ValueError, match="kernel_block_sizes is required"):
+        TPUModelRunner.may_reinitialize_input_batch(runner, SimpleNamespace())
 
 
 def test_suspend_kv_transfer_group_restores_agent_after_failure():
@@ -438,11 +456,13 @@ def test_spec_decode_warmup_sweeps_batches_at_the_shortest_and_longest_prompt(
     ]
 
 
-def _runner(K: int, block: int, max_reqs: int, budget: int, paddings: list[int]):
+def _runner(K: int, block: int, max_seqs: int, budget: int, paddings: list[int]):
     return SimpleNamespace(
         speculative_config=SimpleNamespace(num_speculative_tokens=K),
         drafter=SimpleNamespace(block_size=block),
-        max_num_reqs=max_reqs,
+        scheduler_config=SimpleNamespace(max_num_seqs=max_seqs),
+        # As in TPUModelRunner.__init__: raised to MIN_NUM_SEQS for padding.
+        max_num_reqs=max(max_seqs, tpu_runner.MIN_NUM_SEQS),
         max_num_tokens=budget,
         num_tokens_paddings=paddings,
     )
@@ -454,6 +474,7 @@ def _step_keys(runner, R: int, mixed: bool) -> set[tuple]:
     K = runner.speculative_config.num_speculative_tokens
     block = runner.drafter.block_size
     pads = runner.num_tokens_paddings
+    max_seqs = runner.scheduler_config.max_num_seqs
     max_reqs = runner.max_num_reqs
 
     def tok_bucket(n: int) -> int:
@@ -469,7 +490,7 @@ def _step_keys(runner, R: int, mixed: bool) -> set[tuple]:
                 tok_bucket(R * block),
             )
         )
-    if mixed and max_reqs >= R + 1 and runner.max_num_tokens >= R * (1 + K) + 1:
+    if mixed and max_seqs >= R + 1 and runner.max_num_tokens >= R * (1 + K) + 1:
         keys.add(
             (
                 "mixed",
@@ -482,15 +503,20 @@ def _step_keys(runner, R: int, mixed: bool) -> set[tuple]:
 
 
 FLASH = dict(
-    K=5, block=5, max_reqs=64, budget=1024, paddings=[16, 32, 64, 128, 256, 512, 1024]
+    K=5, block=5, max_seqs=64, budget=1024, paddings=[16, 32, 64, 128, 256, 512, 1024]
 )
-AGENTX = dict(K=5, block=5, max_reqs=8, budget=256, paddings=[16, 32, 64, 128, 256])
+AGENTX = dict(K=5, block=5, max_seqs=8, budget=256, paddings=[16, 32, 64, 128, 256])
 # 8 decoders x 6 rows = 48 > a 32-token budget: counts above 5 have no step.
-TIGHT = dict(K=5, block=5, max_reqs=8, budget=32, paddings=[16, 32])
+TIGHT = dict(K=5, block=5, max_seqs=8, budget=32, paddings=[16, 32])
+# The nightly DSpark bs4 engine: max_num_seqs sits below MIN_NUM_SEQS, so the
+# runner's padded request bound (8) is above any count a step can hold.
+DSPARK_BS4 = dict(K=7, block=7, max_seqs=4, budget=256, paddings=[16, 32, 64, 128, 256])
 
 
 @pytest.mark.parametrize(
-    "cfg", [FLASH, AGENTX, TIGHT], ids=["flash", "agentx", "tight"]
+    "cfg",
+    [FLASH, AGENTX, TIGHT, DSPARK_BS4],
+    ids=["flash", "agentx", "tight", "dspark-bs4"],
 )
 @pytest.mark.parametrize("mixed", [False, True])
 def test_grid_covers_every_bucket_combination_once(cfg, mixed):
@@ -498,11 +524,11 @@ def test_grid_covers_every_bucket_combination_once(cfg, mixed):
     grid = TPUModelRunner._spec_warmup_bucket_grid(runner, mixed=mixed)
 
     assert grid == sorted(set(grid))
-    assert all(1 <= R <= cfg["max_reqs"] for R in grid)
+    assert all(1 <= R <= cfg["max_seqs"] for R in grid)
     # Every bucket combination a serving step can take is warmed ...
     covered = set().union(*(_step_keys(runner, R, mixed) for R in grid))
     needed = set().union(
-        *(_step_keys(runner, R, mixed) for R in range(1, cfg["max_reqs"] + 1))
+        *(_step_keys(runner, R, mixed) for R in range(1, cfg["max_seqs"] + 1))
     )
     assert covered == needed
     # ... by one count each: every grid entry brings a bucket no earlier one had.
@@ -511,6 +537,47 @@ def test_grid_covers_every_bucket_combination_once(cfg, mixed):
         keys = _step_keys(runner, R, mixed)
         assert keys - seen, f"count {R} adds no new bucket"
         seen |= keys
+
+
+@pytest.mark.parametrize("R", [1, 2, 3])
+def test_spec_batch_warmup_holds_at_most_max_num_seqs_requests(R):
+    # The input batch holds max_num_seqs requests, below the runner's padded
+    # max_num_reqs here. The mixed steps add one, then two, prefill requests
+    # beside the R decoders; a step past max_num_seqs fails add_request.
+    spec = FullAttentionSpec(
+        block_size=16, num_kv_heads=1, head_size=128, dtype=torch.bfloat16
+    )
+    live: set[str] = set()
+    sizes: list[int] = []
+
+    def execute_model(so):
+        live.difference_update(so.finished_req_ids)
+        live.update(r.req_id for r in so.scheduled_new_reqs)
+        sizes.append(len(live))
+
+    runner = SimpleNamespace(
+        max_model_len=256,
+        max_num_tokens=256,
+        max_num_reqs=tpu_runner.MIN_NUM_SEQS,
+        scheduler_config=SimpleNamespace(max_num_seqs=4),
+        speculative_config=SimpleNamespace(num_speculative_tokens=7),
+        kv_cache_config=SimpleNamespace(
+            num_blocks=4096, kv_cache_groups=[SimpleNamespace(kv_cache_spec=spec)]
+        ),
+        vllm_config=SimpleNamespace(
+            parallel_config=SimpleNamespace(decode_context_parallel_size=1)
+        ),
+        execute_model=execute_model,
+        sample_tokens=lambda _: None,
+        take_draft_token_ids=lambda: None,
+        _warmup_spec_decode_cleanup=lambda rids: True,
+    )
+
+    TPUModelRunner._warmup_spec_batch(runner, R, 16, short=True, mixed=True)
+
+    # Each mixed variant that fits ran: the peak is R decoders plus two
+    # prefills, capped at max_num_seqs, so a swallowed failure shows here too.
+    assert max(sizes) == min(R + 2, 4)
 
 
 def test_mtp_prefill_warmup_retries_each_bucket_without_a_pipeline():
@@ -562,13 +629,19 @@ def test_prefill_only_mtp_follows_context_or_pipeline_parallelism(
 
 
 def test_only_the_last_pipeline_stage_hosts_a_drafter():
-    last = SimpleNamespace(speculative_config=_spec(), _pp_is_last=True)
-    middle = SimpleNamespace(speculative_config=_spec(), _pp_is_last=False)
+    spec = _spec()
+    # A non-DSv4 model: the static verify length stays None either way.
+    vllm_config = SimpleNamespace(speculative_config=spec, model_config=None)
+    last = SimpleNamespace(speculative_config=spec, _pp_is_last=True)
+    middle = SimpleNamespace(
+        speculative_config=spec, _pp_is_last=False, vllm_config=vllm_config
+    )
     assert TPUModelRunner._is_async_drafter.fget(last) is True
     assert TPUModelRunner._is_async_drafter.fget(middle) is False
 
     TPUModelRunner._init_speculative_decoding(middle)
     assert middle.drafter is None and middle.rejection_sampler is None
+    assert middle._static_verify_q_len is None
 
 
 def test_dp_idle_pairing_replays_the_draft_only_where_a_drafter_lives():
@@ -1703,6 +1776,33 @@ class TestReorderBatchForRpa:
         assert num_windowed == 2
         assert set(runner.input_batch.req_ids[:2]) == {"vr", "vr2"}
         assert runner.input_batch.req_ids[2] == "pf"
+
+    def test_static_verify_windows_lead_verify_segment(self):
+        """With a static verify length (DeepSeek-V4, 1 + K), full-length
+        windows lead the verify segment and are counted; a short window
+        (fewer drafts scheduled) stays behind them."""
+        runner = self._make_runner()
+        runner._static_verify_q_len = 4
+        self._batch(runner, ["pf", "short", "dc", "full", "full2"])
+        sched = self._sched(
+            {"pf": 16, "short": 2, "dc": 1, "full": 4, "full2": 4},
+            spec_reqs=("short", "full", "full2"),
+        )
+        num_decode, num_windowed = runner._reorder_batch_for_rpa(sched)
+        assert (num_decode, num_windowed) == (1, 4)
+        assert runner._num_static_verify_reqs == 2
+        ids = runner.input_batch.req_ids
+        assert ids[0] == "dc"
+        assert set(ids[1:3]) == {"full", "full2"}
+        assert ids[3] == "short"
+        assert ids[4] == "pf"
+
+    def test_no_static_verify_without_static_length(self):
+        runner = self._make_runner()
+        self._batch(runner, ["vr", "dc"])
+        sched = self._sched({"vr": 4, "dc": 1}, spec_reqs=("vr",))
+        assert runner._reorder_batch_for_rpa(sched) == (1, 2)
+        assert runner._num_static_verify_reqs == 0
 
     def test_masked_dense_orders_by_kv_length(self):
         runner = self._make_runner(groups_requests=True)
@@ -3015,6 +3115,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         top_p,
         all_greedy=False,
         topk_candidates=0,
+        apply_topk_topp=True,
     ):
         seen_u_dtypes.append(u.dtype)
         return torch.zeros((logits.shape[0], 1), dtype=torch.int32)
@@ -3026,19 +3127,22 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         torch.ones((2, 1), dtype=torch.float32),
     )
 
-    # 1. _precompile_sample_from_logits
-    precompile_runner = SimpleNamespace(
-        num_reqs_paddings=[2],
-        _hidden_states_dtype=torch.bfloat16,
-        device=torch.device("cpu"),
-        _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
-        _topk_candidate_blocks=lambda: 0,
-        _precompile_timed=lambda _name: contextlib.nullcontext(),
-        sample_from_logits_func=fake_sample_from_logits,
-    )
-    TPUModelRunner._precompile_sample_from_logits(precompile_runner)
-    assert seen_u_dtypes == [torch.float32, torch.float32]
-    seen_u_dtypes.clear()
+    # 1. _precompile_sample_from_logits: two graphs without speculative
+    # decoding, plus the no-top-k/top-p graph with it.
+    for speculative_config, num_graphs in ((None, 2), (SimpleNamespace(), 3)):
+        precompile_runner = SimpleNamespace(
+            num_reqs_paddings=[2],
+            _hidden_states_dtype=torch.bfloat16,
+            device=torch.device("cpu"),
+            _dummy_logits=lambda n: torch.zeros((n, 16), dtype=torch.bfloat16),
+            _topk_candidate_blocks=lambda: 0,
+            _precompile_timed=lambda _name: contextlib.nullcontext(),
+            sample_from_logits_func=fake_sample_from_logits,
+            speculative_config=speculative_config,
+        )
+        TPUModelRunner._precompile_sample_from_logits(precompile_runner)
+        assert seen_u_dtypes == [torch.float32] * num_graphs
+        seen_u_dtypes.clear()
 
     # 2. _sample_spec_verify_chunk (bonus_u and recover_u)
     seen_recover_dtypes: list[torch.dtype] = []
@@ -3054,6 +3158,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
         ),
         _build_padded_sampling_params=lambda start, end, logits: sampling_params,
         _sampler_topk_candidates=lambda start, end, grammar: 0,
+        _sampler_applies_topk_topp=lambda: True,
         sample_from_logits_func=fake_sample_from_logits,
         speculative_config=SimpleNamespace(num_speculative_tokens=1),
     )
@@ -3090,6 +3195,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             has_structured_output_requests=False,
         )
         runner = SimpleNamespace(
+            _pp_wave=None,
             execute_model_state=SimpleNamespace(
                 scheduler_output=scheduler_output,
                 draft_chunks=[],
@@ -3134,6 +3240,7 @@ def test_runner_sampling_paths_draw_float32_uniform_noise(monkeypatch):
             _get_sampling_generator=lambda: None,
             _build_padded_sampling_params=lambda start, end, logits: sampling_params,
             _sampler_topk_candidates=lambda start, end, grammar: 0,
+            _sampler_applies_topk_topp=lambda: True,
             sample_from_logits_func=fake_sample_from_logits,
             _update_mamba_slot_read_offsets=lambda *_args: None,
             _update_num_xla_graphs=lambda *_args: None,

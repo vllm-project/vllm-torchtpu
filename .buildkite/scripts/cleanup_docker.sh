@@ -16,8 +16,8 @@
 set -euo pipefail
 
 # Every docker removal below is best-effort and tolerates failure. An agent
-# runs one job at a time, but run_in_docker.sh starts the test container with
-# `docker run --rm`, and the daemon removes it asynchronously -- after
+# runs one job at a time, but a container started with `docker run --rm` is
+# removed by the daemon asynchronously -- after
 # `docker run` has already returned and the job has finished. So the next job
 # on that agent can reach this cleanup while the previous container is still
 # being torn down: `docker ps -a` still lists it, and `docker rm -f` then

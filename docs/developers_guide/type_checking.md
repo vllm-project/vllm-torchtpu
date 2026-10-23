@@ -9,6 +9,12 @@ Two pyrefly checks gate every PR:
   in the CI image, where calls into torch, jax and vllm are checked against
   their real signatures. Its baseline is `.pyrefly-baseline-full.json`.
 
+Both checks run pyrefly through `tools/check_pyrefly_baseline.py`, which
+counts: each error needs its own baseline entry, and each entry needs its own
+error, matched on file, error kind and message. pyrefly's own baseline
+matching lets one entry cover every repeat of its message in a file, so on its
+own it would not notice a fixed error coming back.
+
 Run ruff and pyrefly through pre-commit, not from `PATH`: a `ruff` or
 `pyrefly` on `PATH` may differ from the pinned version and report different
 results.
@@ -23,22 +29,23 @@ bash tools/typecheck_full.sh
 ```
 
 Other package versions report different errors, so `tools/typecheck_full.sh`
-reruns itself inside the nightly `vllm-torchtpu-dev` image when started outside
-a container. It needs Docker, read access to the image's Artifact Registry
-project (`cloud-ullm-inference-ci-cd`) and a one-time
-`gcloud auth configure-docker us-central1-docker.pkg.dev`, but no TPU.
+reruns itself inside the nightly [`vllm/vllm-torchtpu:nightly`](https://hub.docker.com/r/vllm/vllm-torchtpu/tags)
+image (built from the `--target dev` stage, which includes `--group test`
+dependencies; do not use `:latest`, which is built from `--target prod` without
+test dependencies) when started outside a container. It needs Docker, but no
+TPU.
 
-Without access to that registry, build the same image locally and point the
-script at it:
+To check against a locally built image instead (for example, when your PR
+changes dependencies), build the `dev` target locally and point the script at
+it:
 
 ```bash
 ./docker/build_image.sh --target dev -t vllm-torchtpu-dev-local
 TYPECHECK_IMAGE=vllm-torchtpu-dev-local bash tools/typecheck_full.sh
 ```
 
-The build needs only the torch-tpu registry access that installing
-`vllm-torchtpu` already requires (see the README). The script uses a local
-image as it is, so rebuild it after `main` or your PR changes dependencies.
+The script uses a local image as it is, so rebuild it after `main` or your PR
+changes dependencies.
 
 ## When Buildkite disagrees with a local run
 
@@ -53,18 +60,21 @@ it:
 - Dependencies without a pinned version can resolve to a newer release in a
   later build.
 
-If Buildkite's check fails but the local run passes, rerun locally in the
-exact image Buildkite used. The ":docker: Build and Push CI Image" step
-prints its tag:
+If Buildkite's check fails but the local run passes, build the `dev` image
+locally from your branch or point `TYPECHECK_IMAGE` at a specific nightly tag
+from [Docker Hub](https://hub.docker.com/r/vllm/vllm-torchtpu/tags):
 
 ```bash
-TYPECHECK_IMAGE=us-central1-docker.pkg.dev/cloud-ullm-inference-ci-cd/vllm-torchtpu-ci/vllm-torchtpu:<commit>-<vllm-ref> \
+TYPECHECK_IMAGE=vllm/vllm-torchtpu:nightly-<YYYYMMDD>-<commit>-<vllm-ref> \
   bash tools/typecheck_full.sh
 ```
 
 ## Fixing a new error
 
-When either check reports a new error:
+When either check reports a new error, it prints the file, the error kind
+and message, how many times the baseline lists that message, how many times
+pyrefly found it, and the lines. If the message was already listed, any of
+those lines can be the new one.
 
 - Fix the code. Do not add new errors to either baseline.
 - Keep runtime behavior unchanged. Do not add `try`/`except` or fallback
@@ -84,10 +94,11 @@ When either check reports a new error:
 ## Regenerating the baselines
 
 Regenerate the baselines only to remove entries for errors your change fixed.
-A stale entry does not fail the checks, but it can hide a later error with the
-same message in the same file. Regenerating records every current error, so
-first make both checks pass without it. Then regenerate and run pre-commit
-(pyrefly writes the files without a trailing newline):
+A change that fixes an error must delete its entry: an entry with no matching
+error fails the check, because it would hide the next error with the same
+message in that file. Regenerating records every current error, so first fix
+every error the checks report as not covered. Then regenerate and run
+pre-commit (pyrefly writes the files without a trailing newline):
 
 ```bash
 uvx pyrefly@1.3.0 check --update-baseline

@@ -6,7 +6,7 @@
 </p>
 
 <p align="center">
-| <a href="docs/README.md"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://discuss.vllm.ai/c/hardware-support/google-tpu-support/27"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> (#sig-tpu) |
+| <a href="https://vllm-torchtpu.readthedocs.io/en/latest/"><b>Documentation</b></a> | <a href="https://blog.vllm.ai/"><b>Blog</b></a> | <a href="https://discuss.vllm.ai/c/hardware-support/google-tpu-support/27"><b>User Forum</b></a> | <a href="https://slack.vllm.ai"><b>Developer Slack</b></a> (#sig-tpu) |
 </p>
 
 ---
@@ -32,9 +32,10 @@ The goal is simple: **the same vLLM you already use — same CLI, same OpenAI-co
 | TPU generation | Status |
 | :--- | :--- |
 | **TPU v7x (Ironwood)** | Recommended — validated in CI on every pull request and nightly |
-| TPU v6e / v5e / v5p | Experimental — not covered by CI |
+| **TPU v6e (Trillium)** | Supported — not covered by CI |
+| TPU v5e / v5p | Experimental — not covered by CI |
 
-See [Cloud TPU Setup](docs/getting_started/tpu_setup.md) for project setup, quota, and provisioning commands.
+See [Cloud TPU Setup](https://vllm-torchtpu.readthedocs.io/en/latest/getting_started/tpu_setup/) for project setup, quota, and provisioning commands.
 
 <br>
 
@@ -42,13 +43,21 @@ See [Cloud TPU Setup](docs/getting_started/tpu_setup.md) for project setup, quot
 
 ### Install
 
-`vllm-torchtpu` requires **Python 3.12** on a Cloud TPU VM. Install the plugin and a matching vLLM with a single command:
+`vllm-torchtpu` requires **Python 3.12** on a Cloud TPU VM. Install [`vllm-torchtpu` from PyPI](https://pypi.org/project/vllm-torchtpu/) and a matching vLLM with a single command:
 
 ```bash
-pip install vllm-torchtpu
+pip install \
+  --extra-index-url https://download.pytorch.org/whl/cpu \
+  vllm-torchtpu
 ```
 
-For `uv`, editable source installs, cross-repo development against a local `vllm` checkout, and Docker images, see the full [Installation guide](docs/getting_started/installation.md) and [Docker guide](docs/getting_started/docker.md).
+Or pull the pre-built container from [Docker Hub (`vllm/vllm-torchtpu`)](https://hub.docker.com/r/vllm/vllm-torchtpu/tags):
+
+```bash
+docker pull vllm/vllm-torchtpu:latest
+```
+
+For `uv`, editable source installs, cross-repo development against a local `vllm` checkout, and Docker images, see the full [Installation guide](https://vllm-torchtpu.readthedocs.io/en/latest/getting_started/installation/) and [Docker guide](https://vllm-torchtpu.readthedocs.io/en/latest/getting_started/docker/).
 
 ### Serve a model
 
@@ -62,16 +71,6 @@ vllm serve meta-llama/Llama-3.2-1B-Instruct \
 
 Then send a request:
 
-A stage may instead span a prefill context-parallel group
-(`--prefill-context-parallel-size`), which splits each chunk's attention over
-the stage's cores; MoE models then need `--enable-expert-parallel`. This needs
-a torch_tpu that compiles a stage's kernels and collectives for the stage's
-devices only (the 2026-09-28 build of google-pytorch/torch_tpu#4387); on a
-torch_tpu that builds world-size meshes only, the platform refuses such stages.
-A two-core stage must not be the two cores of one chip: set
-`VLLM_TPU_DEVICE_ORDER` to the device each local rank binds, e.g.
-`0,2,1,3,4,6,5,7` for four stages of two cores on one host.
-
 ```bash
 curl http://localhost:8000/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -83,9 +82,9 @@ curl http://localhost:8000/v1/chat/completions \
 ```
 
 > [!TIP]
-> The first startup compiles TPU graphs for the configured shapes and can take several minutes. Set `VLLM_XLA_CACHE_PATH` to persist compiled artifacts across restarts — see [Compilation & Warmup Cache](docs/user_guide/compilation_cache.md).
+> The first startup compiles TPU graphs for the configured shapes and can take several minutes. Set `VLLM_XLA_CACHE_PATH` to persist compiled artifacts across restarts — see [Compilation & Warmup Cache](https://vllm-torchtpu.readthedocs.io/en/latest/user_guide/compilation_cache/).
 
-The [Quickstart](docs/getting_started/quickstart.md) covers offline batch inference with `vllm.LLM`, multi-device serving with TP/EP, and multimodal examples.
+The [Quickstart](https://vllm-torchtpu.readthedocs.io/en/latest/getting_started/quickstart/) covers offline batch inference with `vllm.LLM`, multi-device serving with TP/EP, and multimodal examples.
 
 <br>
 
@@ -93,18 +92,18 @@ The [Quickstart](docs/getting_started/quickstart.md) covers offline batch infere
 
 `vllm-torchtpu` can serve most PyTorch models supported by vLLM, with first-class TPU kernel, quantization, and parallelism support for Qwen3 / Qwen3.5, DeepSeek-V3 / R1 / V4, Kimi-K2.5 / K3, GLM-5, Llama 3 / 4, GPT-OSS, Gemma 3 / 4, Mixtral, Qwen-VL and Gemma VL families, and diffusion models via `vllm-omni`.
 
-- **[Supported Models & Features](docs/user_guide/supported_models.md)** — validated model families, feature status, and quantization formats.
+- **[Supported Models & Features](https://vllm-torchtpu.readthedocs.io/en/latest/user_guide/supported_models/)** — validated model families, feature status, and quantization formats.
 - **[Nightly support matrices](support_matrices/nightly/)** — TPU v7x unit, correctness, and benchmark status, updated automatically from nightly CI.
 
 <br>
 
 ## Recipes and deployment
 
-- [TPU v7x (Ironwood) serving recipes](docs/deployment/v7x_recipes.md)
-- [TPU v6e (Trillium) serving recipes](docs/deployment/v6e_recipes.md)
-- [Kubernetes deployment](docs/deployment/kubernetes.md)
-- [Multi-host serving](docs/user_guide/multihost.md) · [Parallelism & scaling](docs/user_guide/parallelism.md) · [Disaggregated serving (P/D)](docs/user_guide/disaggregated_serving.md)
-- [Quantization](docs/user_guide/quantization.md) · [Speculative decoding](docs/user_guide/speculative_decoding.md)
+- [TPU v7x (Ironwood) serving recipes](https://vllm-torchtpu.readthedocs.io/en/latest/deployment/v7x_recipes/)
+- [TPU v6e (Trillium) serving recipes](https://vllm-torchtpu.readthedocs.io/en/latest/deployment/v6e_recipes/)
+- [Kubernetes deployment](https://vllm-torchtpu.readthedocs.io/en/latest/deployment/kubernetes/)
+- [Multi-host serving](https://vllm-torchtpu.readthedocs.io/en/latest/user_guide/multihost/) · [Parallelism & scaling](https://vllm-torchtpu.readthedocs.io/en/latest/user_guide/parallelism/) · [Disaggregated serving (P/D)](https://vllm-torchtpu.readthedocs.io/en/latest/user_guide/disaggregated_serving/)
+- [Quantization](https://vllm-torchtpu.readthedocs.io/en/latest/user_guide/quantization/) · [Speculative decoding](https://vllm-torchtpu.readthedocs.io/en/latest/user_guide/speculative_decoding/)
 
 <br>
 
@@ -116,7 +115,7 @@ We welcome contributions of all kinds — bug reports, model and feature request
 - **👀 Review pull requests:** help us keep quality high by reviewing [open PRs](https://github.com/vllm-project/vllm-torchtpu/pulls).
 - **💻 Write code:** start with the **[Contributing Guide](CONTRIBUTING.md)**, which covers environment setup, DCO sign-off, the `ready`-label CI gate, and the PR lifecycle. [Good first issues](https://github.com/vllm-project/vllm-torchtpu/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22) are a great place to begin.
 
-Developer references: [Testing & CI](docs/developers_guide/testing_and_ci.md) · [Profiling](docs/developers_guide/profiling/index.md) · [Benchmarking](docs/developers_guide/benchmarking.md) · [Coding guidance](docs/developers_guide/coding_guidance.md) · [Optimization best practices](docs/developers_guide/optimization_best_practices.md)
+Developer references: [Testing & CI](https://vllm-torchtpu.readthedocs.io/en/latest/developers_guide/testing_and_ci/) · [Profiling](https://vllm-torchtpu.readthedocs.io/en/latest/developers_guide/profiling/) · [Benchmarking](https://vllm-torchtpu.readthedocs.io/en/latest/developers_guide/benchmarking/) · [Coding guidance](https://vllm-torchtpu.readthedocs.io/en/latest/developers_guide/coding_guidance/) · [Optimization best practices](https://vllm-torchtpu.readthedocs.io/en/latest/developers_guide/optimization_best_practices/)
 
 <br>
 

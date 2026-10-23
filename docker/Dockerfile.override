@@ -1,18 +1,42 @@
+# syntax=docker/dockerfile:1.4
 # Dockerfile.override for vllm-torchtpu.
-# This Dockerfile builds a local-wheel-override variant image that overrides the pre-installed
-# torch-tpu with a local wheel from an override source.
+# Fast delta layer installing override wheels on top of the prebuilt base image.
 
 ARG BASE_IMAGE
-ARG OVERRIDE_SOURCE="us-docker.pkg.dev/ml-oss-artifacts-transient/torch-tpu-docker-container/torch-tpu:nightly-latest"
+FROM ${BASE_IMAGE} AS override-variant
 
-# Step 1: The Siphon (extract local wheels from override source image)
-FROM $OVERRIDE_SOURCE AS override-source
+ARG OVERRIDE_PACKAGE
+ARG OVERRIDE_VERSION
+ARG TORCH_TPU_VERSION
+ARG TPU_SYNC_TORCH_VERSION
+ARG REGISTRY_URL="https://us-python.pkg.dev/ml-oss-artifacts-transient/torch-tpu-virtual-registry/simple"
 
-# Step 2: The Override Variant (reinstall torch-tpu wheel without dependencies)
-FROM $BASE_IMAGE AS override-variant
 RUN --mount=type=cache,target=/root/.cache/uv \
-    --mount=from=override-source,source=/,target=/override-source,ro \
+    --mount=type=secret,id=gcloud_token \
     set -eu; \
-    set -- /override-source/opt/wheels/*.whl; \
-    if [ ! -e "$1" ]; then echo "No torch-tpu wheels found in OVERRIDE_SOURCE" >&2; exit 1; fi; \
-    uv pip install --system --force-reinstall --no-deps "$@";
+    TOKEN=""; \
+    if [ -f /run/secrets/gcloud_token ]; then TOKEN="$(cat /run/secrets/gcloud_token)"; fi; \
+    EXTRA_INDEX="${REGISTRY_URL}"; \
+    if [ -n "${TOKEN}" ]; then \
+      export UV_INDEX_TORCH_TPU_REGISTRY_USERNAME=oauth2accesstoken; \
+      export UV_INDEX_TORCH_TPU_REGISTRY_PASSWORD="${TOKEN}"; \
+      EXTRA_INDEX="https://oauth2accesstoken:${TOKEN}@${REGISTRY_URL#https://}"; \
+    fi; \
+    PACKAGES=(); \
+    if [ -n "${OVERRIDE_PACKAGE:-}" ] && [ -n "${OVERRIDE_VERSION:-}" ]; then \
+      PACKAGES+=("${OVERRIDE_PACKAGE}==${OVERRIDE_VERSION}"); \
+    fi; \
+    if [ -n "${TORCH_TPU_VERSION:-}" ]; then \
+      PACKAGES+=("torch-tpu==${TORCH_TPU_VERSION}"); \
+    fi; \
+    if [ -n "${TPU_SYNC_TORCH_VERSION:-}" ]; then \
+      PACKAGES+=("tpu-sync-torch==${TPU_SYNC_TORCH_VERSION}"); \
+    fi; \
+    if [ ${#PACKAGES[@]} -eq 0 ]; then \
+      echo "No override packages specified" >&2; \
+      exit 1; \
+    fi; \
+    uv pip install --system --force-reinstall --no-deps \
+      --extra-index-url "${EXTRA_INDEX}" \
+      --extra-index-url https://pypi.org/simple \
+      "${PACKAGES[@]}"

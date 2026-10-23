@@ -1,4 +1,18 @@
 #!/bin/bash
+# Copyright 2026 Google LLC
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 # shellcheck disable=SC2034  # Variables are sourced by k3_1p1d.sh
 # One engine of the Kimi-K3 1P1D pair: TP8 x DP4 x EP32 on a 2x2x4 slice, one
 # DP replica per host, over vLLM's own multi-node DP. The nightly
@@ -91,4 +105,13 @@ case "${K3_1P1D_ROLE:-}" in
         ;;
 esac
 # No spaces in the JSON: k3_1p1d.sh word-splits the command it builds.
-EXTRA_SERVE_ARGS="$EXTRA_SERVE_ARGS --kv-transfer-config {\"kv_connector\":\"TPURaidenConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"${_kv_role}\",\"kv_port\":14579}"
+_kv_transfer_config="{\"kv_connector\":\"TPURaidenConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_connector\",\"kv_role\":\"${_kv_role}\",\"kv_port\":14579}"
+# Decode also offloads to host memory, behind TPUMultiConnector as in the
+# Qwen3.5 p4d2 pair. Every child must accept a decode-local prefix hit that the
+# recurrent state lags, or prefix-aware loads turn off for the whole engine,
+# so the counters stage (decode local_cache_hit > 0) guards that too.
+if [ "$_kv_role" = kv_consumer ]; then
+    _offload_config="{\"kv_connector\":\"TPURaidenOffloadingConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.offload.raiden_connector\",\"kv_role\":\"kv_both\",\"kv_connector_extra_config\":{\"cpu_bytes_to_use\":${K3_1P1D_DECODE_CPU_BYTES_TO_USE:-68719476736},\"raiden_controller_port\":48800}}"
+    _kv_transfer_config="{\"kv_connector\":\"TPUMultiConnector\",\"kv_connector_module_path\":\"vllm_torchtpu.distributed.kv_transfer.tpu_multi_connector\",\"kv_role\":\"kv_consumer\",\"kv_connector_extra_config\":{\"connectors\":[${_kv_transfer_config},${_offload_config}]}}"
+fi
+EXTRA_SERVE_ARGS="$EXTRA_SERVE_ARGS --kv-transfer-config ${_kv_transfer_config}"

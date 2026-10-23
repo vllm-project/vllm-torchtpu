@@ -39,7 +39,6 @@ the blockwise Pallas kernel path instead.
 
 from __future__ import annotations
 
-import copy
 from collections.abc import Callable
 from math import gcd
 from typing import TYPE_CHECKING, cast
@@ -47,7 +46,6 @@ from typing import TYPE_CHECKING, cast
 import torch
 from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.fused_moe import FusedMoEMethodBase, RoutedExperts
-from vllm.model_executor.layers.fused_moe.oracle.fp8 import refine_fp8_moe_block_shape
 from vllm.model_executor.layers.linear import (
     LinearBase,
     UnquantizedLinearMethod,
@@ -516,7 +514,8 @@ def _process_fp8_moe_weights(
     needs_padding = padded_intermediate != unpadded_intermediate
     local_real = padded_intermediate
     if needs_padding:
-        local_real = int(unpadded_intermediate or 0)
+        assert unpadded_intermediate is not None
+        local_real = unpadded_intermediate
 
     if weight_block_size is not None:
         # Validate block alignment
@@ -848,50 +847,42 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         if self.quant_config.is_checkpoint_fp8_serialized and self.block_quant:
             assert self.weight_block_size is not None
             block_n, block_k = self.weight_block_size
-            full_inter = intermediate_size_per_partition * (moe_parallel_config.tp_size)
-            if hidden_size % block_n or hidden_size % block_k:
+            # Both dimensions occur as N and K across w13 and w2. A partial
+            # final checkpoint block cannot be evenly TP-sharded by the
+            # upstream scale loader. Without MoE TP, retain the existing
+            # padded allocation and zero the unused tail after dequantizing.
+            partial_block = any(
+                self.moe.intermediate_size % block for block in (block_n, block_k)
+            )
+            if (
+                hidden_size % block_n
+                or hidden_size % block_k
+                or (partial_block and moe_parallel_config.tp_size > 1)
+            ):
                 raise ValueError(
-                    f"Weight dimensions ({hidden_size=}, {full_inter=}) "
-                    f"must be divisible by block sizes ({block_n=}, {block_k=})."
+                    "FP8 MoE checkpoint dimensions must be divisible by "
+                    f"block size {self.weight_block_size}; got hidden={hidden_size}, "
+                    f"intermediate={self.moe.intermediate_size}"
                 )
-            if moe_parallel_config.tp_size == 1:
+            if partial_block:
                 block_size = max(block_n, block_k)
                 intermediate_size_per_partition = (
                     (intermediate_size_per_partition + block_size - 1)
                     // block_size
                     * block_size
                 )
-                return hidden_size, intermediate_size_per_partition
-            if full_inter % block_n or full_inter % block_k:
-                raise ValueError(
-                    f"Weight dimensions ({hidden_size=}, {full_inter=}) "
-                    f"must be divisible by block sizes ({block_n=}, {block_k=})."
-                )
-            # Upstream's helper puts hidden_dim in the gcd and refuses blocks
-            # under 32. RoutedExperts writes the rounded sizes back onto
-            # moe_config only after this returns, so hand it a shallow copy
-            # (no __post_init__ rerun) carrying the sizes just computed.
-            moe = copy.copy(self.moe)
-            moe.hidden_dim = hidden_size
-            moe.intermediate_size_per_partition = intermediate_size_per_partition
-            refined = refine_fp8_moe_block_shape(moe, self.weight_block_size)
-            if refined is not None:
-                self.moe_block_shape = refined
-                self.weight_scale_refine = (
-                    block_n // refined[0],
-                    block_k // refined[1],
-                )
             elif (
                 intermediate_size_per_partition % block_n
                 or intermediate_size_per_partition % block_k
             ):
-                raise ValueError(
-                    f"{intermediate_size_per_partition=} does not fit the "
-                    f"checkpoint's {block_n}x{block_k} blocks, and no common "
-                    f"block >= 32 divides it together with {hidden_size=}. "
-                    f"Choose a tensor-parallel size whose shard is a multiple "
-                    f"of 32."
-                )
+                # Reuse RoutedExperts' lossless scale refinement before TP
+                # slicing. The CUDA oracle requires blocks >=32; here these
+                # blocks only serve load-time dequantization, so smaller grids
+                # are valid too. Runtime formatting pads each logical shard
+                # to 128 after dequantization, never before checkpoint slicing.
+                block = gcd(block_n, block_k, intermediate_size_per_partition)
+                self.moe_block_shape = [block, block]
+                self.weight_scale_refine = (block_n // block, block_k // block)
         return hidden_size, intermediate_size_per_partition
 
     def create_weights(

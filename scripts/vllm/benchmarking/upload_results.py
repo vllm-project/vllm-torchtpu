@@ -163,7 +163,6 @@ def main():
 
     device = os.getenv("TPU_NAME")
     if not device:
-        queue = os.getenv("BUILDKITE_AGENT_META_DATA_QUEUE")
         accelerator = os.getenv("TPU_ACCELERATOR_TYPE")
         topology = os.getenv("TPU_TOPOLOGY")
         if os.getenv("CI_RUNNER") == "kube" and accelerator and topology:
@@ -173,10 +172,6 @@ def main():
             # its own "tpu7x" over it; only the generation is taken, so both
             # give tpu7x-2x2x1.
             device = f"{accelerator.split('-')[0]}-{topology}"
-        elif queue:
-            # map tpu_v7x_8_queue -> tpu7x-8
-            m = re.match(r"tpu_v(\d+x)_(\d+)_queue", queue)
-            device = f"tpu{m.group(1)}-{m.group(2)}" if m else queue
         else:
             device = "unknown-device"
 
@@ -233,7 +228,7 @@ def main():
         # Populate column dictionary with required fields
         columns = {
             "RecordId": f"'{record_id}'",
-            # run_in_docker.sh exports these as empty strings when unset
+            # CI can pass these through as empty strings when unset
             # upstream; `or` falls back on empty too, unlike os.getenv's
             # unset-only default.
             "RunType": f"'{sql_escape(os.getenv('RUN_TYPE') or 'DAILY')}'",
