@@ -1040,7 +1040,11 @@ def calculate_tiling(
 
     # TODO(alynie, kyuyeunk): max number of bucket was choosen empiirically.
     # Revisit the value to be based on number of instruction memory size.
-    max_num_buckets = 4
+    max_num_buckets = (
+        2
+        if (dims.size_group > 64 and dims.size_m // max(dims.size_group, 1) < 64)
+        else 4
+    )
     bucket_base = tile_m
     for _ in range(1, max_num_buckets):
         new_tile_m = tile_m + bucket_base
