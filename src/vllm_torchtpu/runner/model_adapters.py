@@ -26,7 +26,7 @@ import torch
 
 @dataclass(frozen=True)
 class ModelInputSnapshot:
-    ngram_context: torch.Tensor
+    step_context: Any
     row_start: int
     num_requests: int
     num_tokens: int
@@ -37,7 +37,7 @@ class ModelInputSnapshot:
 class ModelAdapter(Protocol):
     def bind_model(self, model): ...
 
-    def begin_step(self) -> torch.Tensor: ...
+    def begin_step(self) -> Any: ...
 
     def prepare_inputs(self, snapshot: ModelInputSnapshot) -> dict[str, Any]: ...
 
