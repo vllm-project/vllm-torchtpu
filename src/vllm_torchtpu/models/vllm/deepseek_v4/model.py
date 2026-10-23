@@ -73,6 +73,19 @@ MHC_SEAM_TOKEN_BLOCK = 128
 MHC_SEAM_MIN_GRID_STEPS = 4
 
 
+def _split_hc_fn(fn: torch.Tensor) -> torch.Tensor:
+    """fn's (hi, mid, lo) bf16 chunks, bit for bit the mHC kernels'
+    ``utils.split_fn3``: round-to-nearest-even bf16 casts of fn and of its
+    exact f32 remainders, done in eager CPU ops, where nothing folds the
+    f32 -> bf16 -> f32 round trip away."""
+    fn = fn.detach().to("cpu", torch.float32)
+    hi = fn.to(torch.bfloat16)
+    rem = fn - hi.float()
+    mid = rem.to(torch.bfloat16)
+    lo = (rem - mid.float()).to(torch.bfloat16)
+    return torch.stack((hi, mid, lo))
+
+
 class DeepseekV4DecoderLayer(nn.Module):
     """Single transformer decoder layer for DeepSeek-V4 with MHC residual stream."""
 
@@ -137,6 +150,19 @@ class DeepseekV4DecoderLayer(nn.Module):
             torch.empty(3, dtype=torch.float32),
             requires_grad=False,
         )
+        # The mHC kernels' bf16 split of hc_attn_fn / hc_ffn_fn, made once per
+        # weight load by `split_hc_fns` instead of on every forward.
+        for name in ("hc_attn_fn_chunks", "hc_ffn_fn_chunks"):
+            self.register_buffer(
+                name,
+                torch.zeros(3, mix_hc, hc_dim, dtype=torch.bfloat16),
+                persistent=False,
+            )
+
+    def split_hc_fns(self) -> None:
+        """Refresh the fn chunks from the loaded fn weights."""
+        self.hc_attn_fn_chunks.copy_(_split_hc_fn(self.hc_attn_fn))
+        self.hc_ffn_fn_chunks.copy_(_split_hc_fn(self.hc_ffn_fn))
 
     @property
     def mhc_ops(self) -> MHCOps:
@@ -206,20 +232,20 @@ class DeepseekV4DecoderLayer(nn.Module):
             # of x, so the pre (and the seam below) read x once.
             residual = x
             post_mix, res_mix, x = self.mhc_ops.pre_single_stream(
-                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+                x, self.hc_attn_fn_chunks, self.hc_attn_scale, self.hc_attn_base
             )
         elif residual is None:
             # Chain start: a standalone pre, nothing to fuse it with.
             residual = x
             x, post_mix, res_mix = self.hc_pre(
-                x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base
+                x, self.hc_attn_fn_chunks, self.hc_attn_scale, self.hc_attn_base
             )
         else:
             seam_args = (
                 residual,
                 post_mix,
                 res_mix,
-                self.hc_attn_fn,
+                self.hc_attn_fn_chunks,
                 self.hc_attn_scale,
                 self.hc_attn_base,
             )
@@ -243,7 +269,7 @@ class DeepseekV4DecoderLayer(nn.Module):
             residual,
             post_mix,
             res_mix,
-            self.hc_ffn_fn,
+            self.hc_ffn_fn_chunks,
             self.hc_ffn_scale,
             self.hc_ffn_base,
         )
@@ -702,6 +728,9 @@ class DeepseekV4Model(nn.Module):
                         continue
         finally:
             staged.flush_all()
+        for module in self.modules():
+            if isinstance(module, DeepseekV4DecoderLayer):
+                module.split_hc_fns()
 
         return loaded_params
 

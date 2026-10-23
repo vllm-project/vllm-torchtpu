@@ -159,7 +159,8 @@ def fused_post_pre_mixes(
         post2d: (num_tokens, hc_mult), float32.
         comb2d: (num_tokens, hc_mult * hc_mult), float32, row-major (i, j).
         fn: (hc_mult3, hc_mult * hidden_size), float32 — next sublayer's
-            gate projection.
+            gate projection; or its (3, hc_mult3, hc_mult * hidden_size)
+            bf16 ``utils.split_fn3`` chunks.
         hc_scale: (3,), float32 — pre/post/comb logit scales (the kernel
             uses only the pre entry; the rest feed the XLA gates).
         hc_base: (hc_mult3,), float32 — logit biases, pre entries first.
@@ -191,10 +192,9 @@ def fused_post_pre_mixes(
     assert res2d.dtype == jnp.bfloat16, res2d.dtype
     assert post2d.dtype == jnp.float32, post2d.dtype
     assert comb2d.dtype == jnp.float32, comb2d.dtype
-    assert fn.dtype == jnp.float32, fn.dtype
 
     num_tokens, hidden_size = x2d.shape
-    hc_mult3, hc_hidden = fn.shape
+    hc_mult3, hc_hidden = fn.shape[-2:]
     hc_mult = hc_hidden // hidden_size
     assert hc_mult * (hc_mult + 2) == hc_mult3, (fn.shape, x2d.shape)
     res_width = res2d.shape[1]
@@ -218,7 +218,7 @@ def fused_post_pre_mixes(
         x_inputs.append(shared2d)
         x_specs.append(pl.BlockSpec((tb, hidden_size), lambda i: (i, 0)))
 
-    fn_hi, fn_mid, fn_lo = utils.split_fn3(fn)
+    fn_chunks, fn_specs = utils.fn_chunk_operands(fn)
     sc2d = hc_scale.reshape(1, 3).astype(jnp.float32)
     hb2d = hc_base.reshape(1, hc_mult3).astype(jnp.float32)
 
@@ -228,7 +228,6 @@ def fused_post_pre_mixes(
         disable_bounds_checks=True,
     )
 
-    resident = pl.BlockSpec((hc_mult3, hc_hidden), lambda i: (0, 0))
     kernel = functools.partial(
         _fused_kernel,
         hc_mult=hc_mult,
@@ -246,9 +245,7 @@ def fused_post_pre_mixes(
             pl.BlockSpec((tb, res_width), lambda i: (i, 0)),
             pl.BlockSpec((tb, hc_mult), lambda i: (i, 0)),
             pl.BlockSpec((tb, hc_mult * hc_mult), lambda i: (i, 0)),
-            resident,
-            resident,
-            resident,
+            *fn_specs,
             pl.BlockSpec((1, 3), lambda i: (0, 0)),
             pl.BlockSpec((1, hc_mult3), lambda i: (0, 0)),
         ],
@@ -265,7 +262,7 @@ def fused_post_pre_mixes(
             jax.ShapeDtypeStruct((padded_tokens, hidden_size), jnp.bfloat16),
         ],
         compiler_params=compiler_params,
-    )(*x_inputs, res2d, post2d, comb2d, fn_hi, fn_mid, fn_lo, sc2d, hb2d)
+    )(*x_inputs, res2d, post2d, comb2d, *fn_chunks, sc2d, hb2d)
 
     return cast(
         tuple[jax.Array, jax.Array, jax.Array, jax.Array],
@@ -306,7 +303,7 @@ def mhc_fused_post_pre(
 
     hidden_size = x.shape[-1]
     outer_shape = x.shape[:-1]
-    hc_mult = fn.shape[1] // hidden_size
+    hc_mult = fn.shape[-1] // hidden_size
 
     x2d = x.reshape(-1, hidden_size).astype(jnp.bfloat16)
     res2d = residual.reshape(x2d.shape[0], -1)

@@ -17,6 +17,7 @@ from typing import cast
 
 import jax
 import jax.numpy as jnp
+from jax.experimental import pallas as pl
 
 # bf16 tiles are (16, 128); keep token blocks sublane-aligned.
 SUBLANE = 16
@@ -96,6 +97,24 @@ def split_fn3(fn: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
         tuple[jax.Array, jax.Array, jax.Array],
         tuple(t.astype(jnp.bfloat16) for t in (fn_hi, fn_mid, fn_lo)),
     )
+
+
+def fn_chunk_operands(fn: jax.Array) -> tuple[list[jax.Array], list[pl.BlockSpec]]:
+    """fn's three bf16 chunks as VMEM-resident operands of a 1-D grid.
+
+    ``fn`` is the f32 (hc_mult3, K) projection, split here by
+    ``split_fn3``, or its chunks already split that way, (3, hc_mult3, K)
+    bf16, which are passed as they are. Returns (operands, block specs).
+    """
+    if fn.ndim == 2:
+        assert fn.dtype == jnp.float32, fn.dtype
+        resident = pl.BlockSpec(fn.shape, lambda i: (0, 0))
+        return list(split_fn3(fn)), [resident] * 3
+    assert fn.dtype == jnp.bfloat16 and fn.shape[0] == 3, (fn.dtype, fn.shape)
+    specs = [
+        pl.BlockSpec((None, *fn.shape[1:]), lambda i, c=c: (c, 0, 0)) for c in range(3)
+    ]
+    return [fn] * 3, specs
 
 
 def mhc_pre_gates(
