@@ -114,26 +114,32 @@ def check_supported_parallelism(parallel_cfg: Any) -> tuple[int, int]:
 
 
 def resolve_hf_checkpoint_dir(model: str | None) -> str | None:
-    """Returns the local checkpoint directory for a path or a cached Hub repo id.
+    """Returns the local checkpoint directory for a path or a Hub repo id.
 
     The companion files (`config.json`, `tokenizer.json`, `generation_config.json`)
-    and the safetensors metadata are read from this directory, so a repo id that is
-    not in the local Hub cache is an error rather than a silently thinner artifact.
+    and the safetensors metadata are read from this directory. For a repo id the
+    companion files are fetched into the Hub cache first: loading dummy weights
+    caches `config.json` alone, so the tokenizer would otherwise be missing. A
+    repo without `config.json` is an error rather than a silently thinner
+    artifact.
     """
     if not model or os.path.isdir(model):
         return model
     from transformers.utils import cached_file
 
     hint = (
-        f"--model {model!r} is neither a local directory nor a repo in the "
-        "HuggingFace cache; download it first or pass the checkpoint directory"
+        f"--model {model!r} is neither a local directory nor a HuggingFace Hub "
+        "repo with a config.json; pass the checkpoint directory"
     )
     try:
-        config_path = cached_file(model, "config.json", local_files_only=True)
+        config_path = cached_file(model, "config.json")
     except OSError as e:
         raise FileNotFoundError(hint) from e
     if config_path is None:
         raise FileNotFoundError(hint)
+    # A missing tokenizer.json is reported by the exporter, which requires it.
+    for name in ("tokenizer.json", "generation_config.json"):
+        cached_file(model, name, _raise_exceptions_for_missing_entries=False)
     return os.path.dirname(config_path)
 
 

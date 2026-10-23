@@ -568,6 +568,7 @@ def single_rank_tp_group() -> Any:
 def test_universal_adapter_1d_and_2d_mrope_export_and_cli(tmp_path) -> None:
     hf_dir = tmp_path / "hf_ckpt"
     hf_dir.mkdir()
+    (hf_dir / "tokenizer.json").write_text(json.dumps({"version": "1.0"}))
     with open(hf_dir / "config.json", "w") as f:
         json.dump(
             {

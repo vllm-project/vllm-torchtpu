@@ -672,8 +672,9 @@ def _emit_model_companion_files(
 ) -> dict[str, Any]:
     """Copies companion files into the artifact; returns their `serving_config` entries.
 
-    `tokenizer.json` and `generation_config.json` are copied when the checkpoint has
-    them and declared in `serving_config` by path; the runtime reads no other file.
+    `tokenizer.json` (required unless a byte tokenizer is emitted) and
+    `generation_config.json` (when the checkpoint has one) are copied and declared
+    in `serving_config` by path; the runtime reads no other file.
     """
     serving_config: dict[str, Any] = {}
 
@@ -712,6 +713,12 @@ def _emit_model_companion_files(
         serving_config["tokenizer_config"] = {
             "source": {"TokenizerPath": {"path": "tokenizer.json"}}
         }
+    else:
+        # The serving runtime reads the tokenizer only from this record.
+        raise FileNotFoundError(
+            f"no tokenizer.json in the checkpoint directory "
+            f"{cfg.hf_checkpoint_dir!r}; the serving artifact requires one"
+        )
 
     if cfg.hf_checkpoint_dir and os.path.isdir(cfg.hf_checkpoint_dir):
         src_gen = os.path.join(cfg.hf_checkpoint_dir, "generation_config.json")
