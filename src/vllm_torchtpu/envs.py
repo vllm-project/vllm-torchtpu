@@ -191,6 +191,7 @@ if TYPE_CHECKING:
     VLLM_TPU_FAST_TOKEN_SUBSTITUTION: bool = False
     VLLM_TPU_FUSED_DRAFT_LOOP: bool = False
     VLLM_TPU_FUSED_ASYNC_DRAFT_SEED: bool = True
+    VLLM_TPU_DEFER_PREV_RESULTS_WAIT: bool = True
     VLLM_TPU_FUSED_READ_OFFSET_UPDATE: bool = True
     VLLM_TPU_BLOCK_TABLE_UPLOAD_REUSE: bool = True
     TPU_SAMPLER_TOPK_CANDIDATES: int = 0
@@ -1127,6 +1128,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     #   - EP-DP lockstep: run_dp_dummy_draft only replays the per-step
     #     collective trace.
     "VLLM_TPU_FUSED_DRAFT_LOOP": env_bool("VLLM_TPU_FUSED_DRAFT_LOOP"),
+    # Async scheduling: wait for the previous step's sampled-token copy after
+    # launching this step's draft rather than before it (sample_tokens).
+    "VLLM_TPU_DEFER_PREV_RESULTS_WAIT": env_bool(
+        "VLLM_TPU_DEFER_PREV_RESULTS_WAIT", default=True
+    ),
     # Async spec decode: derive the draft seed (token, position, rejected
     # count) from the rejection-sampler output in one compiled program per
     # request-padding bucket instead of ~15 eager ones (eagle3.py

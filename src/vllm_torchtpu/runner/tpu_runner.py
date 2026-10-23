@@ -5182,7 +5182,19 @@ class TPUModelRunner(GPUModelRunner):
                     spec_logprobs=spec_logprobs_chunks,
                 )
 
-        if self.scheduler_config.async_scheduling:
+        # The previous step's sampled-token copy completes only behind this
+        # step's forward, so waiting on it here holds the draft's host-side
+        # preparation and launch until the forward finishes. Nothing the
+        # draft reads depends on the rollback it feeds (the draft seeds on
+        # device; host tokens are read for partial prefills only, i.e. from
+        # the prompt), so wait after the launch instead. With a KV connector
+        # keep the early wait: the save below relies on it.
+        defer_prev_wait = (
+            self.scheduler_config.async_scheduling
+            and envs.VLLM_TPU_DEFER_PREV_RESULTS_WAIT
+            and not has_kv_transfer_group()
+        )
+        if self.scheduler_config.async_scheduling and not defer_prev_wait:
             self._modify_prev_results()
 
         # Unified eagle3 draft propose -- ONE call serving both sync and async
@@ -5250,6 +5262,9 @@ class TPUModelRunner(GPUModelRunner):
                         return_device=is_async,
                         device_seed=device_seed,
                     )
+
+        if defer_prev_wait:
+            self._modify_prev_results()
 
         if self._is_dspark_pd_producer:
             assert isinstance(self.drafter, DFlashProposer)
