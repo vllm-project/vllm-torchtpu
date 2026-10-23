@@ -21,6 +21,7 @@ experimental path always builds sharded routing and never returns a GMM fallback
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Any, cast
 
 import jax
@@ -41,6 +42,7 @@ from vllm_torchtpu.distributed.ep_mesh import (
 )
 from vllm_torchtpu.kernels.experimental import adaptive_fused_moe as adaptive_kernel
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import host
+from vllm_torchtpu.kernels.experimental.adaptive_fused_moe import layer as adaptive_layer
 from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.host import (
     PACK4,
     U32_SUBLANE_TILE,
@@ -197,7 +199,35 @@ def prebuild_adaptive_fused_moe(
         rhs_qb,
         plan.vmem_bytes,
     )
+    _log_async_row_gather()
     return op
+
+
+# The libtpu flags that let the row all-gather overlap routing.
+ASYNC_ROW_GATHER_FLAGS = (
+    "--xla_enable_async_all_gather=true",
+    "--xla_tpu_enable_sparse_core_collective_offload_all_gather=true",
+)
+
+
+def _log_async_row_gather() -> None:
+    """Say whether TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER's overlap is in effect."""
+    if not envs.TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER:
+        return
+    libtpu_args = os.environ.get("LIBTPU_INIT_ARGS", "").split()
+    missing = [f for f in ASYNC_ROW_GATHER_FLAGS if f not in libtpu_args]
+    if missing:
+        logger.warning_once(
+            "TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER=1 but LIBTPU_INIT_ARGS lacks %s; "
+            "the fused EP row all-gather stays synchronous.",
+            " ".join(missing),
+        )
+    else:
+        logger.info_once(
+            "TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER: fused EP row all-gather (scope "
+            "%s) is async and SparseCore-offloaded, overlapping routing.",
+            adaptive_layer.ROW_GATHER_SCOPE,
+        )
 
 
 def adaptive_fused_moe_supported(owner: Any) -> bool:

@@ -114,6 +114,7 @@ if TYPE_CHECKING:
     MOE_FUSED_EP_KERNEL_IMPL: str | None = None
     MOE_FUSED_EP_ENABLE_W4A8: bool = False
     MOE_FUSED_EP_KERNEL_MIN_TOKENS: int = 1024
+    TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER: bool = False
     MOE_FUSED_EP_V2_SHARDED_PLAN: bool = False
     MOE_FUSED_EP_SORTED_GATHER: bool = False
     MOE_ADAPTIVE_2D_CHANNEL_SCALES: bool = False
@@ -930,6 +931,13 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Opt in to NVFP4 W4A8 in fused EP MoE v2. Requires the fused EP switch
     # above; defaults off so enabling fused EP alone preserves NVFP4 W4A16.
     "MOE_FUSED_EP_ENABLE_W4A8": env_bool("MOE_FUSED_EP_ENABLE_W4A8"),
+    # Overlap the fused EP activation-row all-gather with routing. The kernels
+    # already issue that gather ahead of routing; the overlap itself comes
+    # from the async, SparseCore-offloaded all-gather libtpu flags the serving
+    # recipe adds to LIBTPU_INIT_ARGS when this is set. Here it names the
+    # gather's scope (visible in profiles) and logs at arming whether those
+    # flags are present.
+    "TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER": env_bool("TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER"),
     # Largest node-wide token count, out of the scheduler's cap, at or above
     # which the fused kernel is armed for the whole deployment. Decided once at
     # weight load, not per step: a per-step choice would need the token count

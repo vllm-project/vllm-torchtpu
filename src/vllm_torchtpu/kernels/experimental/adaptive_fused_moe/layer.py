@@ -64,6 +64,10 @@ from vllm_torchtpu.kernels.experimental.adaptive_fused_moe.token_parallel import
 )
 
 
+# Profile scope of the activation-row all-gather that routing can overlap.
+ROW_GATHER_SCOPE = "fused_ep_row_all_gather_overlap"
+
+
 def _combine_arrivals(
     arrivals, arrival_scales, pos, mirror_pos, topk_weights, out_dtype
 ):
@@ -453,12 +457,15 @@ def adaptive_fused_moe(
             # The rows go on the wire as they arrived. There is no scale to
             # carry, so nothing downstream builds or ships one.
             q_l, row_scale_l = rows_bf16, None
-        q_g = lax.all_gather(
-            q_l.reshape(t_local, hidden // HIDDEN_LANE_BLOCK, HIDDEN_LANE_BLOCK),
-            ax,
-            axis=0,
-            tiled=True,
-        )
+        # Issued ahead of routing so it can overlap it; the overlap is the
+        # async all-gather of TPU_MOE_FUSED_EP_ASYNC_ROW_GATHER's libtpu flags.
+        with jax.named_scope(ROW_GATHER_SCOPE):
+            q_g = lax.all_gather(
+                q_l.reshape(t_local, hidden // HIDDEN_LANE_BLOCK, HIDDEN_LANE_BLOCK),
+                ax,
+                axis=0,
+                tiled=True,
+            )
 
         scores = jax.nn.softmax(gate_l, axis=-1)
         select_rows = MAX_ROUTING_BLOCK
