@@ -813,11 +813,16 @@ def select_blocks(
     query_block = envs.VLLM_TPU_QSA_DECODE_QUERY_BLOCK
     if query_block:
         kv_block = envs.VLLM_TPU_QSA_DECODE_KV_BLOCK
-        if kv_block < rows or kv_block % 128 or kv_block % rows:
-            raise ValueError(
-                "VLLM_TPU_QSA_DECODE_KV_BLOCK must be a positive multiple of 128 "
-                f"and of {rows} compressed keys per page, got {kv_block}"
-            )
+        decode_kv_block = envs.VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK
+        for name, block in (
+            ("VLLM_TPU_QSA_DECODE_KV_BLOCK", kv_block),
+            ("VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK", decode_kv_block),
+        ):
+            if block < rows or block % 128 or block % rows:
+                raise ValueError(
+                    f"{name} must be a positive multiple of 128 "
+                    f"and of {rows} compressed keys per page, got {block}"
+                )
         return _select_shared_stream(
             query,
             starts,
@@ -836,7 +841,8 @@ def select_blocks(
                 distribution,
                 k=block_topk,
                 compression_ratio=ratio,
-                num_kv_pages_per_block=(256 // rows,) + (kv_block // rows,) * 2,
+                num_kv_pages_per_block=(decode_kv_block // rows,)
+                + (kv_block // rows,) * 2,
                 num_queries_per_block=(1, query_block, query_block),
                 decode_req_batch_size=8 if len(q) >= 8 else 4,
                 enable_early_exit=True,

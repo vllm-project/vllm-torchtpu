@@ -100,6 +100,8 @@ if TYPE_CHECKING:
     TPU_GDN_PREFILL_CHECKPOINT: bool = True
     VLLM_TPU_QSA_DECODE_QUERY_BLOCK: int = 0
     VLLM_TPU_QSA_DECODE_KV_BLOCK: int = 1024
+    VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK: int = 256
+    VLLM_TPU_MTP_DRAFT_TOP_TOKENS: bool = False
     VLLM_TPU_QSA_FUSED_SPARSE_DECODE: bool = False
     VLLM_TPU_QSA_PREFILL_BITSET_KERNEL: bool = True
     VLLM_TPU_QSA_PREFILL_BF16_MXU: bool = False
@@ -532,6 +534,18 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # of 128). Only read when VLLM_TPU_QSA_DECODE_QUERY_BLOCK > 0.
     "VLLM_TPU_QSA_DECODE_KV_BLOCK": env_nonnegative_int(
         "VLLM_TPU_QSA_DECODE_KV_BLOCK", 1024
+    ),
+    # Compressed keys per KV block for the one-token requests of that pass
+    # (decode rows, MTP draft rows); exact selection at any block size. Only
+    # read when VLLM_TPU_QSA_DECODE_QUERY_BLOCK > 0.
+    "VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK": env_nonnegative_int(
+        "VLLM_TPU_QSA_DECODE_SINGLE_KV_BLOCK", 256
+    ),
+    # MTP/Eagle drafts: greedy draft tokens from the vocabulary-parallel
+    # argmax (LogitsProcessor.get_top_tokens: per-rank argmax, (value, index)
+    # pairs exchanged) instead of all-gathering the draft logits. Same tokens.
+    "VLLM_TPU_MTP_DRAFT_TOP_TOKENS": env_bool(
+        "VLLM_TPU_MTP_DRAFT_TOP_TOKENS", default=False
     ),
     # Qwen4-exp QSA decode/verify attention: run the decode rows (and the
     # decode prefix of mixed steps) on the fused sparse GQA decode kernel

@@ -27,6 +27,7 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
 )
 from vllm.model_executor.models.utils import PPMissingLayer
 
+from vllm_torchtpu import envs
 from vllm_torchtpu.layers.core.sequence_layout import (
     AllSequenceLayoutPlanner,
     SequenceLayoutPlan,
@@ -328,6 +329,29 @@ def resolve_draft_logits_processor(draft_model: torch.nn.Module):
         inner = getattr(draft_model, "model", None)
         lp = getattr(inner, "logits_processor", None)
     return lp
+
+
+def draft_greedy_tokens(draft_model: torch.nn.Module, hidden: torch.Tensor):
+    """The draft's greedy tokens, ``[rows]`` int32.
+
+    With ``VLLM_TPU_MTP_DRAFT_TOP_TOKENS`` a vocabulary-parallel head takes
+    ``LogitsProcessor.get_top_tokens``: each rank argmaxes its slice and only
+    (value, index) pairs are exchanged instead of the full logits. Ties keep
+    the lowest token id, as ``argmax`` over the gathered logits does. Drafts
+    whose processor gathers differently (replicated drafts override
+    ``_gather_logits``) keep the full-logits argmax.
+    """
+    lp = resolve_draft_logits_processor(draft_model)
+    head = getattr(draft_model, "lm_head", None)
+    if (
+        envs.VLLM_TPU_MTP_DRAFT_TOP_TOKENS
+        and hasattr(lp, "get_top_tokens")
+        and hasattr(head, "shard_indices")
+        and "_gather_logits" not in vars(lp)
+        and lp.scale > 0.0
+    ):
+        return lp.get_top_tokens(head, hidden).to(torch.int32)
+    return draft_model.compute_logits(hidden).argmax(dim=-1).to(torch.int32)
 
 
 def populate_draft_lm_head_from_target(
