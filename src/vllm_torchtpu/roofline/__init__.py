@@ -11,10 +11,16 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Standalone decode roofline package for vLLM TorchTPU."""
+"""TPU v7x decode roofline model and serving ceiling calculator."""
 
 from __future__ import annotations
 
+from .adapter import (
+    PlanReconciliation,
+    floor_for_profile,
+    floor_from_plan,
+    reconcile_plan_vs_standalone,
+)
 from .chips import CHIPS, ChipSpec
 from .collectives import Collective
 from .geometry import ModelGeometry, from_hf_config
@@ -34,18 +40,22 @@ __all__ = [
     "CHIPS",
     "ChipSpec",
     "Collective",
-    "ConcurrencyRow",
     "Dtypes",
     "ModelGeometry",
     "ModuleCost",
     "Parallel",
+    "PlanReconciliation",
+    "ConcurrencyRow",
     "StepFloor",
     "StepShape",
     "ep_busiest_experts",
     "experts_touched",
+    "floor_for_profile",
+    "floor_from_plan",
     "from_hf_config",
     "pass_costs",
     "plan",
+    "reconcile_plan_vs_standalone",
     "spec_cycle_floor",
     "step_floor",
 ]
