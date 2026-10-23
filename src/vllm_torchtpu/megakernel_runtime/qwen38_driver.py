@@ -301,16 +301,36 @@ class Qwen38SegmentDriver:
         )
         return drv
 
+    def _contexts(self, runner: Any, tag: str) -> Any:
+        """The contexts the runner builds its main model under (config, mesh, tag)."""
+        import contextlib
+
+        from vllm.compilation.backends import set_model_tag
+        from vllm.config import set_current_vllm_config
+
+        from vllm_torchtpu.models.vllm.vllm_model_wrapper_context import (
+            set_vllm_model_wrapper_context,
+        )
+
+        stack = contextlib.ExitStack()
+        stack.enter_context(set_model_tag(tag))
+        stack.enter_context(
+            set_vllm_model_wrapper_context(mesh=runner.mesh, vllm_config=runner.vllm_config)
+        )
+        stack.enter_context(set_current_vllm_config(runner.vllm_config))
+        return stack
+
     def bind_and_warmup(self, runner: Any) -> None:
         from vllm_torchtpu.models.vllm.qwen4_exp.model import Qwen4ExpSegmentModel
 
         self.segments.bind_pool()
-        self.program = Qwen4ExpSegmentModel(
-            vllm_config=runner.vllm_config,
-            prefix="model_mk_segments",
-            backbone=runner.model.model,
-            segments=self.segments,
-        )
+        with self._contexts(runner, "model_mk_segments"):
+            self.program = Qwen4ExpSegmentModel(
+                vllm_config=runner.vllm_config,
+                prefix="model_mk_segments",
+                backbone=runner.model.model,
+                segments=self.segments,
+            )
         if self.check_left > 0:
             shadow_seg = Qwen38Segments(
                 runner.model,
@@ -321,16 +341,18 @@ class Qwen38SegmentDriver:
                 head=bool(self.segments.head_groups),
             )
             shadow_seg.bind_pool()
-            self.shadow = Qwen4ExpSegmentModel(
-                vllm_config=runner.vllm_config,
-                prefix="model_mk_segments_shadow",
-                backbone=runner.model.model,
-                segments=shadow_seg,
-            )
+            with self._contexts(runner, "model_mk_segments_shadow"):
+                self.shadow = Qwen4ExpSegmentModel(
+                    vllm_config=runner.vllm_config,
+                    prefix="model_mk_segments_shadow",
+                    backbone=runner.model.model,
+                    segments=shadow_seg,
+                )
 
     def _shadow_step(self, runner: Any, input_ids: Any, positions: Any, kw: dict) -> Any:
         """Run the kernel program (no GDN writes) then the stock model; log, return stock."""
-        mk = self.shadow(input_ids=input_ids, positions=positions, **kw)
+        with self._contexts(runner, "model_mk_segments_shadow"):
+            mk = self.shadow(input_ids=input_ids, positions=positions, **kw)
         stock = runner.model(input_ids=input_ids, positions=positions, **kw)
         mk_h = mk[0] if isinstance(mk, (tuple, list)) else mk
         st_h = stock[0] if isinstance(stock, (tuple, list)) else stock
@@ -381,7 +403,8 @@ class Qwen38SegmentDriver:
         if self.check_left > 0 and self.shadow is not None:
             out = self._shadow_step(runner, input_ids, positions, kw)
         else:
-            out = self.program(input_ids=input_ids, positions=positions, **kw)
+            with self._contexts(runner, "model_mk_segments"):
+                out = self.program(input_ids=input_ids, positions=positions, **kw)
         if isinstance(out, (list, tuple)):
             out = tuple(out)
         return True, out
