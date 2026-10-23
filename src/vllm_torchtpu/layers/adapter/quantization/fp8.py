@@ -1118,6 +1118,22 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         assert activation_str is not None, (
             "[moe] process_weights_after_loading did not run for this layer"
         )
+        from vllm_torchtpu.layers.adapter.fused_moe_decode import (
+            fused_moe_decode,
+            fused_moe_decode_supported,
+        )
+
+        if fused_moe_decode_supported(self):
+            # Armed layer (arm_fused_moe_decode, which also takes precedence
+            # over the adaptive fused EP kernel): replicated tokens in, the
+            # all-reduced shared + routed sum out; above the token cap the
+            # same op runs the GMM MoE.
+            topk_weights, topk_ids = moe_routing.route(layer, x, router_logits)
+            if envs.TPU_MOE_SKIP_PADDED_TOKENS:
+                topk_ids, topk_weights = token_padding.zero_routing_weights_for_padding(
+                    topk_ids, topk_weights, is_local_tensor=False
+                )
+            return fused_moe_decode(self, layer, x, topk_weights, topk_ids)
         # The fused EP kernel takes this rank's own tokens and returns this
         # rank's own tokens: it routes, exchanges, computes and combines inside
         # one program. Keyed on the same predicate `supports_internal_mk` uses,
@@ -1208,17 +1224,6 @@ class VllmFp8MoEMethodTPU(TpuMoEActivationMixin, Fp8MoEMethod):
         }
         if owns_collectives:
             return pipelined_fused_moe_gmm(**kwargs)
-
-        from vllm_torchtpu.layers.adapter.fused_moe_decode import (
-            fused_moe_decode,
-            fused_moe_decode_supported,
-        )
-
-        if fused_moe_decode_supported(self):
-            # Armed layer: the runner no longer runs the shared expert or the
-            # all-reduce, so this returns the reduced shared + routed sum.
-            return fused_moe_decode(self, layer, x, topk_weights, topk_ids)
-
         return fused_moe_gmm(**kwargs)
 
 

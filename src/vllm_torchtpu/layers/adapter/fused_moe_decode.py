@@ -40,7 +40,13 @@ with the kernel off: a shared expert gated by sigmoid(x . w_g) (Qwen3.5,
 ``runner.routed_scaling_factor`` (GLM-5.2: 2.5) scales the ROUTED output only,
 before the shared output is added (``_maybe_apply_routed_scale_to_output``);
 the op applies it the same way, and arming sets the runner's factor to 1.0,
-since the runner would otherwise scale the op's shared + routed sum.
+since the runner would otherwise scale the op's shared + routed sum. A shared
+expert the checkpoint leaves unquantized (Qwen3.8-Flash: BF16, TP slice of 80)
+is served in BF16, its slice zero-padded to 128 at arming.
+
+An armed layer takes precedence over the adaptive fused EP kernel
+(MOE_FUSED_EP_KERNEL_IMPL=adaptive) in VllmFp8MoEMethodTPU.apply_monolithic.
+Arming logs, per model, how many layers it declined and why.
 
 Every rank must arm the same layers: the kernel's collectives start at entry,
 and a rank serving a layer with the GMM path leaves its peers waiting. Arming
@@ -145,15 +151,23 @@ def _gmm_layer(
     )
     if routed_scale != 1.0:
         routed = routed * routed_scale
-    # Qwen2MoeMLP.forward: FP8 gate_up / down linears, SiluAndMul, and the
-    # sigmoid of the replicated expert_gate linear (DeepseekV2MLP: no gate).
+    # Qwen2MoeMLP.forward: FP8 (or, unquantized in the checkpoint, BF16)
+    # gate_up / down linears, SiluAndMul, and the sigmoid of the replicated
+    # expert_gate linear (DeepseekV2MLP: no gate).
     i_s = shared_w2.shape[0]
-    gate_up = _quantized_matmul_jax(x, shared_w1, shared_w1_scale.reshape(-1))
-    shared = _quantized_matmul_jax(
-        jax.nn.silu(gate_up[:, :i_s]) * gate_up[:, i_s:],
-        shared_w2,
-        shared_w2_scale.reshape(-1),
-    )
+    if shared_w1.dtype == jnp.bfloat16:
+        gate_up = jnp.dot(x, shared_w1)
+        shared = jnp.dot(
+            (jax.nn.silu(gate_up[:, :i_s]) * gate_up[:, i_s:]).astype(x.dtype),
+            shared_w2,
+        )
+    else:
+        gate_up = _quantized_matmul_jax(x, shared_w1, shared_w1_scale.reshape(-1))
+        shared = _quantized_matmul_jax(
+            jax.nn.silu(gate_up[:, :i_s]) * gate_up[:, i_s:],
+            shared_w2,
+            shared_w2_scale.reshape(-1),
+        )
     if shared_gated:
         shared = (
             jax.nn.sigmoid(
@@ -350,20 +364,91 @@ def _shared_mlp_is_ungated_silu(mlp) -> bool:
     )
 
 
-def _shared_slice(runner) -> tuple | None:
-    """This rank's shared-expert tensors in the kernel's layout, or None. The
-    last entry, the gate weight, is None for an ungated shared expert."""
+def pad_shared_intermediate(
+    w1: torch.Tensor, w2: torch.Tensor, i_pad: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Zero-pad a shared-expert slice's intermediate size to i_pad: w1 [h, 2 i_s]
+    (gate | up) to [h, 2 i_pad] (gate | 0 | up | 0), w2 [i_s, h] to [i_pad, h].
+    Exact: a padded column has gate = up = 0, so SiLU(0) * 0 = 0 meets a zero
+    row of w2. The kernel slices gate and up at lane-aligned offsets only
+    (Qwen3.8-Flash at TP8: i_s = 640 / 8 = 80, padded to 128)."""
+    h, two_i_s = w1.shape
+    i_s = two_i_s // 2
+    if i_pad == i_s:
+        return w1, w2
+    pad1 = w1.new_zeros((h, i_pad - i_s))
+    w1 = torch.cat([w1[:, :i_s], pad1, w1[:, i_s:], pad1], dim=1).contiguous()
+    w2 = torch.cat([w2, w2.new_zeros((i_pad - i_s, w2.shape[1]))], dim=0)
+    return w1, w2.contiguous()
+
+
+def _is_flipped_bf16_linear(linear) -> bool:
+    """An unquantized linear stored K-major ([in, out]) by
+    VllmUnquantizedLinearMethod: BF16 weight, no scale, no bias."""
+    from vllm_torchtpu.layers.adapter.linear_common import WEIGHT_FLIPPED_ATTR
+
+    weight = getattr(linear, "weight", None)
+    return (
+        weight is not None
+        and weight.dtype == torch.bfloat16
+        and weight.dim() == 2
+        and getattr(linear, WEIGHT_FLIPPED_ATTR, False)
+        and getattr(linear, "weight_scale", None) is None
+        and getattr(linear, "weight_scale_inv", None) is None
+        and getattr(linear, "bias", None) is None
+    )
+
+
+def _shared_slice(runner, why: list | None = None) -> tuple | None:
+    """This rank's shared-expert tensors in the kernel's layout, or None (with
+    the reason appended to `why`). The last entry, the gate weight, is None for
+    an ungated shared expert.
+
+    Two storage layouts: FP8 per-channel (K-major weight, 1-D scale), handed
+    over as stored; or BF16 (unquantized in the checkpoint, Qwen3.8-Flash),
+    copied with its intermediate zero-padded to a multiple of 128 and unit
+    scales the kernel ignores."""
+    why = [] if why is None else why
     shared = getattr(runner, "_shared_experts", None)
     mlp = getattr(shared, "_layer", None)
     if mlp is None:
+        why.append("no shared expert module")
         return None
     gate_up = getattr(mlp, "gate_up_proj", None)
     down = getattr(mlp, "down_proj", None)
     gate = getattr(mlp, "expert_gate", None)
     if gate_up is None or down is None:
+        why.append(f"shared expert {type(mlp).__name__} has no gate_up/down_proj")
         return None
     if gate is None and not _shared_mlp_is_ungated_silu(mlp):
+        why.append(f"ungated shared expert {type(mlp).__name__} not DeepseekV2MLP")
         return None
+    shared_gate_weight = None if gate is None else getattr(gate, "weight", None)
+    if gate is not None and (
+        shared_gate_weight is None
+        or getattr(gate, "bias", None) is not None
+        or shared_gate_weight.dim() != 2
+        or 1 not in tuple(shared_gate_weight.shape)
+    ):
+        why.append(
+            "shared expert gate not a bias-free [1, h] / [h, 1] linear: "
+            f"{None if shared_gate_weight is None else tuple(shared_gate_weight.shape)}"
+        )
+        return None
+    if _is_flipped_bf16_linear(gate_up) and _is_flipped_bf16_linear(down):
+        w1, w2 = gate_up.weight.data, down.weight.data
+        i_s = w2.shape[0]
+        if tuple(w1.shape) != (w2.shape[1], 2 * i_s):
+            why.append(f"BF16 shared expert shapes {tuple(w1.shape)} {tuple(w2.shape)}")
+            return None
+        w1, w2 = pad_shared_intermediate(w1, w2, -(-i_s // 128) * 128)
+        return (
+            w1,
+            torch.ones(w1.shape[1], dtype=torch.float32, device=w1.device),
+            w2,
+            torch.ones(w2.shape[1], dtype=torch.float32, device=w1.device),
+            None if shared_gate_weight is None else shared_gate_weight.data,
+        )
     shared_w1, shared_w1_scale = (
         getattr(gate_up, "weight", None),
         getattr(gate_up, "weight_scale", None),
@@ -378,6 +463,10 @@ def _shared_slice(runner) -> tuple | None:
         or shared_w2 is None
         or shared_w2_scale is None
     ):
+        why.append(
+            "shared expert neither FP8 with weight_scale nor flipped BF16 "
+            f"(gate_up {getattr(shared_w1, 'dtype', None)})"
+        )
         return None
     # Per-channel FP8 linears are stored K-major ([in, out]) with a 1-D scale.
     if (
@@ -385,14 +474,10 @@ def _shared_slice(runner) -> tuple | None:
         or shared_w2_scale.dim() != 1
         or shared_w1.dtype != torch.float8_e4m3fn
     ):
-        return None
-    shared_gate_weight = None if gate is None else getattr(gate, "weight", None)
-    if gate is not None and (
-        shared_gate_weight is None
-        or getattr(gate, "bias", None) is not None
-        or shared_gate_weight.dim() != 2
-        or shared_gate_weight.shape[0] != 1
-    ):
+        why.append(
+            f"shared expert FP8 scales not per-channel ({shared_w1.dtype}, "
+            f"scale {tuple(shared_w1_scale.shape)} / {tuple(shared_w2_scale.shape)})"
+        )
         return None
     # Hand over the parameters themselves, never torch views of them: a view
     # passed to the op is re-materialized by an eager as_strided program on
@@ -407,9 +492,19 @@ def _shared_slice(runner) -> tuple | None:
     )
 
 
-def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
+def _admit(
+    runner, n_ranks: int, why: list | None = None
+) -> tuple[tuple, bool, float] | None:
     """(shared-expert tensors, expert_parallel, routed scale) for an eligible
-    layer, else None."""
+    layer, else None, with the reason appended to `why`."""
+    why = [] if why is None else why
+    result = _admit_checked(runner, n_ranks, why)
+    if result is None and not why:
+        why.append("unknown")
+    return result
+
+
+def _admit_checked(runner, n_ranks: int, why: list) -> tuple[tuple, bool, float] | None:
     from vllm.distributed import get_tensor_model_parallel_world_size
 
     from vllm_torchtpu.layers.adapter.quantization.fp8 import VllmFp8MoEMethodTPU
@@ -425,31 +520,48 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
         sharded_ok = par.tp_size == n_ranks
     # TP attention over the whole mesh: every rank holds every token and one
     # shared-expert slice, and MoERunner runs no DP/PCP collective after the op.
-    sharded_ok = sharded_ok and get_tensor_model_parallel_world_size() == n_ranks
-    if not isinstance(qm, VllmFp8MoEMethodTPU) or not sharded_ok:
+    tp_world = get_tensor_model_parallel_world_size()
+    sharded_ok = sharded_ok and tp_world == n_ranks
+    if not isinstance(qm, VllmFp8MoEMethodTPU):
+        why.append(f"quant method {type(qm).__name__}")
+        return None
+    if not sharded_ok:
+        why.append(
+            f"parallelism (use_ep {expert_parallel}, ep {par.ep_size}, dp "
+            f"{par.dp_size}, moe tp {par.tp_size}, tp world {tp_world}, mesh "
+            f"{n_ranks})"
+        )
         return None
     if qm._tpu_activation_str != "silu":
+        why.append(f"activation {qm._tpu_activation_str}")
         return None
     if getattr(layer, "w13_bias", None) is not None or (
         getattr(layer, "w2_bias", None) is not None
     ):
+        why.append("expert bias")
         return None
     if getattr(cfg, "is_sequence_parallel", False) or getattr(
         cfg, "skip_final_all_reduce", False
     ):
+        why.append("sequence parallel / skip_final_all_reduce")
         return None
     if (
         runner.routed_input_transform is not None
         or runner.routed_output_transform is not None
     ):
+        why.append("routed input/output transform")
         return None
     if runner.shared_expert_gate is not None:
+        # The gate lives on the runner only when the model fuses or replicates
+        # its shared expert outside the runner; not served.
+        why.append("runner-level shared_expert_gate")
         return None
     routed_scale = float(getattr(runner, "routed_scaling_factor", 1.0))
     if routed_scale != 1.0 and getattr(cfg, "in_dtype", None) == torch.float16:
         # FP16: vLLM divides the shared output instead; not mirrored here.
+        why.append("routed scale under FP16")
         return None
-    shared = _shared_slice(runner)
+    shared = _shared_slice(runner, why)
     if shared is None:
         return None
     shared_w1, _, shared_w2, _, shared_gate_weight = shared
@@ -458,18 +570,24 @@ def _admit(runner, n_ranks: int) -> tuple[tuple, bool, float] | None:
     e, h, two_i = w1.shape
     i = two_i // 2
     i_s = shared_w2.shape[0]  # the shared expert is a TP slice, even under EP
+    # The kernel pads the all-reduce chunk (h / n_ranks) to whole lanes itself.
     if (
         w1.dtype != torch.float8_e4m3fn
         or tuple(w2.shape) != (e, i, h)
         or tuple(w1_scale.shape) != (e, 1, 1, two_i)
         or tuple(w2_scale.shape) != (e, 1, 1, h)
         or i % 128
-        or h % (n_ranks * 128)
+        or h % 512
         or i_s % 128
         or i_s > i
         or tuple(shared_w1.shape) != (h, 2 * i_s)
         or (shared_gate_weight is not None and shared_gate_weight.numel() != h)
     ):
+        why.append(
+            f"shapes (w13 {tuple(w1.shape)} {w1.dtype}, w2 {tuple(w2.shape)}, "
+            f"scales {tuple(w1_scale.shape)} / {tuple(w2_scale.shape)}, shared w1 "
+            f"{tuple(shared_w1.shape)}, i_s {i_s})"
+        )
         return None
     return shared, expert_parallel, routed_scale
 
@@ -536,10 +654,27 @@ def arm_fused_moe_decode(model: torch.nn.Module, what: str = "model") -> int:
             f"FUSED_MOE_DECODE_KERNEL_MAX_TOKENS={max_tokens}: must be >= 1."
         )
     plan = []
+    rejected: dict[str, int] = {}
     for runner in runners if mesh is not None else ():
-        admitted = _admit(runner, n_ranks)
+        why: list = []
+        admitted = _admit(runner, n_ranks, why)
         if admitted is not None:
             plan.append((runner, *admitted))
+        else:
+            reason = "; ".join(why)
+            rejected[reason] = rejected.get(reason, 0) + 1
+            logger.debug(
+                "Fused MoE decode kernel: %s not armed: %s",
+                getattr(runner, "layer_name", "?"),
+                reason,
+            )
+    for reason, count in rejected.items():
+        logger.info(
+            "Fused MoE decode kernel declined %d MoE layer(s) of the %s: %s",
+            count,
+            what,
+            reason,
+        )
     signature = (
         n_ranks,
         tuple(
