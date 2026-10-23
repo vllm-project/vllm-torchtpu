@@ -30,9 +30,6 @@ from transformers import Qwen3NextConfig, Qwen4ExpTextConfig
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
-from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-    QwenGatedDeltaNetAttention,
-)
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
     MambaStateCopyFuncCalculator,
@@ -61,6 +58,8 @@ from vllm_torchtpu.models.vllm.qwen4_exp.hyperconnection import (
     HyperConnectionConfig,
 )
 from vllm_torchtpu.models.vllm.qwen4_exp.ple import Qwen4ExpPLELayer
+
+from .gdn import Qwen4ExpGatedDeltaNetAttention
 
 
 def _hc_config(vllm_config: VllmConfig) -> HyperConnectionConfig:
@@ -110,7 +109,7 @@ class Qwen4ExpDecoderLayer(nn.Module):
         # has; the transformers class just does not subclass Qwen3NextConfig.
         layer_config = cast(Qwen3NextConfig, config)
         if self.layer_type == "linear_attention":
-            self.linear_attn = QwenGatedDeltaNetAttention(
+            self.linear_attn = Qwen4ExpGatedDeltaNetAttention(
                 layer_config,
                 vllm_config=vllm_config,
                 prefix=f"{prefix}.linear_attn",
